@@ -873,6 +873,8 @@ struct RouterSshHostView {
     #[serde(skip_serializing_if = "Option::is_none")]
     provider_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    market_provider_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     ip: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     port: Option<u16>,
@@ -1112,6 +1114,7 @@ async fn list_hosts(
             RouterSshHostView {
                 id: host.id,
                 provider_id: host.provider_id,
+                market_provider_id: host.market_provider_id,
                 ip: Some(host.ip.clone()),
                 port: reveal_operations.then_some(host.port),
                 host_owner_email: host.host_owner_email,
@@ -5527,6 +5530,7 @@ fn host_to_view(host: RouterSshHostRecord, reveal: bool) -> RouterSshHostView {
     RouterSshHostView {
         id: host.id,
         provider_id: host.provider_id,
+        market_provider_id: host.market_provider_id,
         ip: Some(host.ip.clone()),
         port: reveal.then_some(host.port),
         host_owner_email: host.host_owner_email,
@@ -5593,6 +5597,7 @@ async fn extract_optional_session(
 pub struct RouterSshHostRecord {
     pub id: String,
     pub provider_id: Option<String>,
+    pub market_provider_id: Option<String>,
     pub ip: String,
     pub port: u16,
     pub host_owner_email: String,
@@ -6073,12 +6078,14 @@ impl AppStore {
                               WHERE p.user_id = h.provider_id), '[]'),
                     NULLIF(TRIM(h.currency), ''), h.free_duration_days,
                     t.enabled, ns.last_heartbeat_at, h.pricing_model,
-                    h.cycle_price_minor, h.billing_interval
+                    h.cycle_price_minor, h.billing_interval,
+                    provider.market_provider_id
              FROM router_ssh_hosts h
              LEFT JOIN installation_client_tunnels t ON t.installation_id = h.installation_id
              LEFT JOIN installations i ON i.id = h.installation_id
              LEFT JOIN installation_notification_state ns ON ns.installation_id = h.installation_id
              LEFT JOIN client_market_subscriptions s ON s.installation_id = h.installation_id
+             LEFT JOIN host_provider_profiles provider ON provider.provider_id = h.provider_id
              WHERE 1=1",
         );
         let mut binds: Vec<String> = Vec::new();
@@ -7337,12 +7344,14 @@ impl AppStore {
                                   WHERE p.user_id = h.provider_id), '[]'),
                         NULLIF(TRIM(h.currency), ''), h.free_duration_days,
                         t.enabled, ns.last_heartbeat_at, h.pricing_model,
-                        h.cycle_price_minor, h.billing_interval
+                        h.cycle_price_minor, h.billing_interval,
+                        provider.market_provider_id
                  FROM router_ssh_hosts h
                  LEFT JOIN installation_client_tunnels t ON t.installation_id = h.installation_id
                  LEFT JOIN installations i ON i.id = h.installation_id
                  LEFT JOIN installation_notification_state ns ON ns.installation_id = h.installation_id
                  LEFT JOIN client_market_subscriptions s ON s.installation_id = h.installation_id
+                 LEFT JOIN host_provider_profiles provider ON provider.provider_id = h.provider_id
                  WHERE h.status = ?1
                  ORDER BY h.updated_at ASC",
             )
@@ -8975,12 +8984,14 @@ fn get_router_ssh_host(
                           WHERE p.user_id = h.provider_id), '[]'),
                 NULLIF(TRIM(h.currency), ''), h.free_duration_days,
                 t.enabled, ns.last_heartbeat_at, h.pricing_model,
-                h.cycle_price_minor, h.billing_interval
+                h.cycle_price_minor, h.billing_interval,
+                provider.market_provider_id
          FROM router_ssh_hosts h
          LEFT JOIN installation_client_tunnels t ON t.installation_id = h.installation_id
          LEFT JOIN installations i ON i.id = h.installation_id
          LEFT JOIN installation_notification_state ns ON ns.installation_id = h.installation_id
          LEFT JOIN client_market_subscriptions s ON s.installation_id = h.installation_id
+         LEFT JOIN host_provider_profiles provider ON provider.provider_id = h.provider_id
          WHERE h.id = ?1",
         params![id],
         map_router_ssh_host_row,
@@ -9049,6 +9060,7 @@ fn map_router_ssh_host_row(row: &crate::db::Row<'_>) -> crate::db::Result<Router
         cycle_price_minor: row.get(28)?,
         billing_interval: row.get(29)?,
         provider_id: row.get(18)?,
+        market_provider_id: row.get(30)?,
         daily_rate_minor: row.get(19)?,
         offer_revision: row.get(20)?,
         payment_method_kinds,
@@ -9164,6 +9176,8 @@ mod tests {
             ip_blacklist: String::new(),
             free_share_ip_parallel_limit: 1,
             market_usd_cny_rate_micros: crate::market_billing::DEFAULT_USD_CNY_RATE_MICROS,
+            market_provider_recommendation_mode:
+                crate::config::MarketProviderRecommendationMode::Shadow,
             ip_intel_endpoints: Vec::new(),
             verification_service_base_url: "https://tokenswitch.org".into(),
             verification_service_api_key: None,
@@ -11226,6 +11240,7 @@ mod tests {
         let host = RouterSshHostRecord {
             id: "host-id".into(),
             provider_id: Some("provider-id".into()),
+            market_provider_id: Some("mp_public".into()),
             ip: "203.0.113.9".into(),
             port: 2222,
             host_owner_email: "host@example.com".into(),

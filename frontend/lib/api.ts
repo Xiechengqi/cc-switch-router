@@ -84,6 +84,9 @@ import type {
   ClientMarketPaymentMethod,
   PaymentContact,
   ClientMarketProviderSupply,
+  MarketProviderList,
+  MarketProviderDetail,
+  MyMarketProviderFundingResponse,
   ClientMarketAllocationQuote,
   ClientMarketCommitQuoteResponse,
   ClientMarketBatch,
@@ -1872,6 +1875,30 @@ export async function cancelMarketAccessRequest(id: string, expectedRevision: nu
 export async function getClientMarketProviderSupply() {
   return parseJson<ClientMarketProviderSupply>(
     await authFetch("/v1/client-market/providers", { cache: "no-store" }),
+  );
+}
+
+export async function getMarketProviders(signal?: AbortSignal) {
+  return parseJson<MarketProviderList>(
+    await fetch("/v1/market-providers", { cache: "no-cache", signal }),
+  );
+}
+
+export async function getMarketProvider(id: string, signal?: AbortSignal) {
+  return parseJson<MarketProviderDetail>(
+    await fetch(`/v1/market-providers/${encodeURIComponent(id)}`, {
+      cache: "no-cache",
+      signal,
+    }),
+  );
+}
+
+export async function getMyMarketProviderFunding(signal?: AbortSignal) {
+  return parseJson<MyMarketProviderFundingResponse>(
+    await authFetch("/v1/market-providers/me/funding", {
+      cache: "no-store",
+      signal,
+    }),
   );
 }
 

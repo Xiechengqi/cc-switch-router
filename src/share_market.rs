@@ -101,6 +101,7 @@ pub struct ShareMarketCatalog {
     #[serde(skip)]
     pub my_subscriptions: Vec<SubscriptionView>,
     pub trial_hours: i64,
+    pub recommendation_mode: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -273,6 +274,13 @@ pub struct ShareMarketReliability {
 #[serde(rename_all = "camelCase")]
 pub struct ListingView {
     pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub market_provider_id: Option<String>,
+    pub rank_state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rank_position: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_score_bps: Option<i64>,
     pub share_id: String,
     pub installation_id: String,
     pub share_name: String,
@@ -5698,7 +5706,8 @@ impl AppStore {
                     COALESCE(s.enabled_claude, 0), COALESCE(s.enabled_codex, 0),
                     COALESCE(s.enabled_gemini, 0), s.app_runtimes_json,
                     s.app_providers_json, s.token_limit, s.parallel_limit,
-                    COALESCE(s.tokens_used, 0), listing.installation_id
+                    COALESCE(s.tokens_used, 0), listing.installation_id,
+                    listing.market_provider_id
              FROM share_market_listings listing
              LEFT JOIN shares s ON s.share_id = listing.share_id
              WHERE listing.deleted_at IS NULL
@@ -5736,6 +5745,7 @@ impl AppStore {
                     row.get::<_, Option<i64>>(21)?,
                     row.get::<_, i64>(22)?,
                     row.get::<_, String>(23)?,
+                    row.get::<_, Option<String>>(24)?,
                 ))
             })
             .map_err(map_db("query Share Market catalog"))?
@@ -5769,6 +5779,7 @@ impl AppStore {
         let mut performance_by_share = share_market_performance(&conn, &catalog_share_ids)?;
         let reliability_by_share = share_market_reliability(&conn, &catalog_share_ids)?;
         let viewer_active_share_ids = active_rented_share_ids(&conn, viewer_user_id)?;
+        let rank_projections = crate::market_provider_rank::latest_rank_projections(&conn)?;
         let mut eligibility_by_supplier_pricing = HashMap::<
             (String, String, Option<String>),
             crate::market_access::MarketEligibilityView,
@@ -5799,6 +5810,7 @@ impl AppStore {
             parallel_limit,
             tokens_used,
             installation_id,
+            market_provider_id,
         ) in listing_rows
         {
             let is_owner = viewer.is_some_and(|value| value.user_id == owner_user_id);
@@ -6036,8 +6048,20 @@ impl AppStore {
             let reliability = reliability_view(reliability_by_share.get(&share_id).copied());
             let delete_capability = listing_delete_capability_tx(&conn, &id, &status, is_owner)?;
             let reopen_capability = listing_reopen_capability_tx(&conn, &id, &status, is_owner)?;
+            let rank = market_provider_id
+                .as_ref()
+                .and_then(|id| rank_projections.get(id));
+            let rank_state = rank
+                .map(|projection| projection.rank_state.clone())
+                .unwrap_or_else(|| "unranked".into());
+            let rank_position = rank.and_then(|projection| projection.rank_position);
+            let provider_score_bps = rank.and_then(|projection| projection.score_bps);
             listings.push(ListingView {
                 id,
+                market_provider_id,
+                rank_state,
+                rank_position,
+                provider_score_bps,
                 share_id,
                 installation_id,
                 share_name,
@@ -6114,6 +6138,7 @@ impl AppStore {
             listings,
             my_subscriptions,
             trial_hours: DEFAULT_TRIAL_HOURS,
+            recommendation_mode: "off".into(),
         })
     }
 }
@@ -6216,6 +6241,62 @@ fn decode_descending_cursor(value: Option<&str>) -> Result<Option<DescendingCurs
     Ok(Some(cursor))
 }
 
+fn provider_rank_listing_order(left: &ListingView, right: &ListingView) -> std::cmp::Ordering {
+    provider_rank_order_values(
+        &left.rank_state,
+        left.rank_position,
+        &right.rank_state,
+        right.rank_position,
+    )
+}
+
+fn provider_rank_order_values(
+    left_state: &str,
+    left_position: Option<i64>,
+    right_state: &str,
+    right_position: Option<i64>,
+) -> std::cmp::Ordering {
+    let left_ranked = left_state == "ranked";
+    let right_ranked = right_state == "ranked";
+    right_ranked.cmp(&left_ranked).then_with(|| {
+        if left_ranked && right_ranked {
+            left_position
+                .unwrap_or(i64::MAX)
+                .cmp(&right_position.unwrap_or(i64::MAX))
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    })
+}
+
+fn apply_listing_recommendation_mode(
+    catalog: &mut ShareMarketCatalog,
+    mode: crate::config::MarketProviderRecommendationMode,
+) {
+    catalog.recommendation_mode = mode.as_str().to_string();
+    match mode {
+        crate::config::MarketProviderRecommendationMode::Off => {}
+        crate::config::MarketProviderRecommendationMode::Shadow => {
+            let mut projected = catalog.listings.clone();
+            projected.sort_by(provider_rank_listing_order);
+            let moved = projected
+                .iter()
+                .zip(&catalog.listings)
+                .filter(|(projected, current)| projected.id != current.id)
+                .count();
+            tracing::debug!(
+                market = "share",
+                listings = catalog.listings.len(),
+                moved,
+                "Market Provider recommendation shadow evaluated"
+            );
+        }
+        crate::config::MarketProviderRecommendationMode::On => {
+            catalog.listings.sort_by(provider_rank_listing_order);
+        }
+    }
+}
+
 async fn list_catalog(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -6231,6 +6312,12 @@ async fn list_catalog(
         )
         .await?;
     retain_public_catalog(&mut catalog);
+    let mode = state
+        .dynamic
+        .read()
+        .await
+        .market_provider_recommendation_mode;
+    apply_listing_recommendation_mode(&mut catalog, mode);
     private_etag_json(&headers, &catalog)
 }
 
@@ -6429,6 +6516,17 @@ fn close_reclaimable_stale_listings_tx(
         params![share_id, current_owner_email, now],
     )
     .map_err(map_db("close stale Share listings"))?;
+    tx.execute(
+        "UPDATE market_provider_share_windows
+         SET ends_at = ?3
+         WHERE ends_at IS NULL AND listing_id IN (
+             SELECT id FROM share_market_listings
+             WHERE share_id = ?1 AND lower(owner_email) != lower(?2)
+               AND status = 'closed'
+         )",
+        params![share_id, current_owner_email, now],
+    )
+    .map_err(map_db("close stale Market Provider Share windows"))?;
     tx.execute(
         "UPDATE share_market_seats
          SET status = 'disabled', offer_revision = offer_revision + 1, updated_at = ?3
@@ -6863,19 +6961,43 @@ impl AppStore {
                     .into(),
             ));
         }
+        let market_provider_id =
+            match crate::market_provider_identity::ensure_market_provider_identity_tx(
+                &tx,
+                Some(&session.user_id),
+                &session.email,
+                &now,
+            )? {
+                crate::market_provider_identity::MarketProviderIdentityResolution::Resolved(id) => {
+                    id
+                }
+                crate::market_provider_identity::MarketProviderIdentityResolution::Conflict(
+                    conflict,
+                ) => {
+                    drop(tx);
+                    crate::market_provider_identity::persist_market_provider_identity_conflict(
+                        &conn, &conflict, &now,
+                    )?;
+                    return Err(AppError::Conflict(
+                        "the Share owner identity conflicts with an existing Market Provider"
+                            .into(),
+                    ));
+                }
+            };
         let listing_id = Uuid::new_v4().to_string();
         tx.execute(
             "INSERT INTO share_market_listings (
                 id, share_id, installation_id, owner_user_id, owner_email,
-                status, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6)",
+                status, created_at, updated_at, market_provider_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6, ?7)",
             params![
                 listing_id,
                 share_id,
                 installation_id,
                 session.user_id,
                 session.email,
-                now
+                now,
+                market_provider_id,
             ],
         )
         .map_err(|error| {
@@ -6889,6 +7011,7 @@ impl AppStore {
                 AppError::Internal(format!("insert Share Market listing failed: {error}"))
             }
         })?;
+        crate::market_provider_identity::open_share_window_tx(&tx, &listing_id, &now)?;
         for (position, seat) in seats.iter().enumerate() {
             insert_seat_tx(&tx, &listing_id, position as i64 + 1, seat, &now)?;
         }
@@ -6965,6 +7088,7 @@ impl AppStore {
                     serde_json::json!({ "listingId": listing_id }),
                 ));
             }
+            crate::market_provider_identity::open_share_window_tx(&tx, listing_id, &now)?;
             expire_listing_rent_quotes_tx(&tx, listing_id, &now)?;
         }
         let position: i64 = tx
@@ -7210,6 +7334,7 @@ impl AppStore {
                 serde_json::json!({ "listingId": listing_id }),
             ));
         }
+        crate::market_provider_identity::open_share_window_tx(&tx, listing_id, &now)?;
         event_tx(
             &tx,
             Some(listing_id),
@@ -7885,6 +8010,7 @@ impl AppStore {
                 "listing state changed while stopping it".into(),
             ));
         }
+        crate::market_provider_identity::close_share_window_tx(&tx, listing_id, &now)?;
         event_tx(
             &tx,
             Some(listing_id),
@@ -7959,6 +8085,7 @@ impl AppStore {
             params![listing_id, now],
         )
         .map_err(map_db("soft-delete Share listing"))?;
+        crate::market_provider_identity::close_share_window_tx(&tx, listing_id, &now)?;
         event_tx(
             &tx,
             Some(listing_id),
@@ -11726,6 +11853,15 @@ pub(crate) fn terminate_installation_for_takeover_tx(
         params![installation_id, now],
     )
     .map_err(map_db("close takeover Share listings"))?;
+    tx.execute(
+        "UPDATE market_provider_share_windows
+         SET ends_at = ?2
+         WHERE ends_at IS NULL AND listing_id IN (
+             SELECT id FROM share_market_listings WHERE installation_id = ?1
+         )",
+        params![installation_id, now],
+    )
+    .map_err(map_db("close takeover Market Provider Share windows"))?;
     Ok(())
 }
 
@@ -11824,6 +11960,15 @@ pub(crate) fn retire_deleted_share_market_tx(
         params![share_id, now],
     )
     .map_err(map_db("close deleted Share listings"))?;
+    conn.execute(
+        "UPDATE market_provider_share_windows
+         SET ends_at = ?2
+         WHERE ends_at IS NULL AND listing_id IN (
+             SELECT id FROM share_market_listings WHERE share_id = ?1
+         )",
+        params![share_id, now],
+    )
+    .map_err(map_db("close deleted Market Provider Share windows"))?;
     Ok(())
 }
 
@@ -11833,22 +11978,50 @@ pub(crate) fn rebind_share_market_owner_tx(
     new_owner_user_id: &str,
     new_owner_email: &str,
     now: &str,
+    identity_conflict: &mut Option<crate::market_provider_identity::MarketProviderIdentityConflict>,
 ) -> Result<(), AppError> {
     let listings = {
         let mut statement = conn
             .prepare(
-                "SELECT id FROM share_market_listings
+                "SELECT id, status, market_provider_id FROM share_market_listings
                  WHERE share_id = ?1 AND deleted_at IS NULL",
             )
             .map_err(map_db("prepare transferred Share listings"))?;
         statement
-            .query_map(params![share_id], |row| row.get::<_, String>(0))
+            .query_map(params![share_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
             .map_err(map_db("query transferred Share listings"))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(map_db("read transferred Share listings"))?
     };
     if listings.is_empty() {
         return Ok(());
+    }
+    let market_provider_id =
+        match crate::market_provider_identity::ensure_market_provider_identity_tx(
+            conn,
+            Some(new_owner_user_id),
+            new_owner_email,
+            now,
+        )? {
+            crate::market_provider_identity::MarketProviderIdentityResolution::Resolved(id) => id,
+            crate::market_provider_identity::MarketProviderIdentityResolution::Conflict(
+                conflict,
+            ) => {
+                *identity_conflict = Some(conflict);
+                return Err(AppError::Conflict(
+                    "the new Share owner conflicts with an existing Market Provider identity"
+                        .into(),
+                ));
+            }
+        };
+    for (listing_id, _, _) in &listings {
+        crate::market_provider_identity::close_share_window_tx(conn, listing_id, now)?;
     }
 
     conn.execute(
@@ -11866,11 +12039,23 @@ pub(crate) fn rebind_share_market_owner_tx(
     .map_err(map_db("cancel transferred Share access requests"))?;
     conn.execute(
         "UPDATE share_market_listings
-         SET owner_user_id = ?2, owner_email = ?3, updated_at = ?4
+         SET owner_user_id = ?2, owner_email = ?3, updated_at = ?4,
+             market_provider_id = ?5
          WHERE share_id = ?1 AND deleted_at IS NULL",
-        params![share_id, new_owner_user_id, new_owner_email, now],
+        params![
+            share_id,
+            new_owner_user_id,
+            new_owner_email,
+            now,
+            market_provider_id,
+        ],
     )
     .map_err(map_db("rebind transferred Share listings"))?;
+    for (listing_id, status, _) in &listings {
+        if status == "active" {
+            crate::market_provider_identity::open_share_window_tx(conn, listing_id, now)?;
+        }
+    }
 
     let grants_json = conn
         .query_row(
@@ -11952,7 +12137,7 @@ pub(crate) fn rebind_share_market_owner_tx(
         params![share_id, new_owner_user_id, new_owner_email, now],
     )
     .map_err(map_db("rebind transferred Share subscriptions"))?;
-    for listing_id in listings {
+    for (listing_id, _, previous_market_provider_id) in listings {
         event_tx(
             conn,
             Some(&listing_id),
@@ -11963,6 +12148,8 @@ pub(crate) fn rebind_share_market_owner_tx(
             serde_json::json!({
                 "newOwnerUserId": new_owner_user_id,
                 "newOwnerEmail": new_owner_email,
+                "previousMarketProviderId": previous_market_provider_id,
+                "marketProviderId": market_provider_id,
             }),
             now,
         )?;
@@ -13826,6 +14013,22 @@ pub async fn run_service(state: ServerState) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn provider_rank_order_is_stable_for_legacy_peers() {
+        assert_eq!(
+            provider_rank_order_values("ranked", Some(1), "collecting", None),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            provider_rank_order_values("ranked", Some(2), "ranked", Some(1)),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            provider_rank_order_values("collecting", None, "unranked", None),
+            std::cmp::Ordering::Equal
+        );
+    }
+
     #[tokio::test]
     async fn paid_share_requires_payment_profile_with_stable_error_code() {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
@@ -14072,6 +14275,21 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .expect("read stopped listing state")
+    }
+
+    async fn provider_share_window_counts(store: &AppStore, listing_id: &str) -> (i64, i64) {
+        store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT COUNT(*),
+                        COALESCE(SUM(CASE WHEN ends_at IS NULL THEN 1 ELSE 0 END), 0)
+                 FROM market_provider_share_windows WHERE listing_id = ?1",
+                params![listing_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read Provider publication windows")
     }
 
     async fn subscription_entitlement(store: &AppStore, subscription_id: &str) -> String {
@@ -20485,6 +20703,14 @@ mod tests {
         assert_eq!(old_status, "closed");
         assert_eq!(old_seat_status, SEAT_DISABLED);
         assert_eq!(active_listings, 1);
+        assert_eq!(
+            provider_share_window_counts(&store, &listing_id).await,
+            (1, 0)
+        );
+        assert_eq!(
+            provider_share_window_counts(&store, &replacement_listing).await,
+            (1, 1)
+        );
     }
 
     #[tokio::test]
@@ -20657,6 +20883,10 @@ mod tests {
             )
             .expect("count close events");
         assert_eq!(close_events, 1);
+        assert_eq!(
+            provider_share_window_counts(&store, &listing_id).await,
+            (1, 0)
+        );
     }
 
     #[tokio::test]
@@ -20726,6 +20956,10 @@ mod tests {
             .expect("read active rental after reopen");
         assert_eq!((after.0, after.1), before);
         assert_eq!((after.2.as_str(), after.3), (SEAT_AVAILABLE, 3));
+        assert_eq!(
+            provider_share_window_counts(&store, &listing_id).await,
+            (2, 1)
+        );
     }
 
     #[tokio::test]
@@ -22119,6 +22353,10 @@ mod tests {
             .expect("read terminated Share contract refund");
         assert_eq!(contract_state.0, "terminated");
         assert_eq!(contract_state.1, 10_000);
+        assert_eq!(
+            provider_share_window_counts(&store, &listing_id).await,
+            (1, 0)
+        );
     }
 
     #[tokio::test]
@@ -22185,6 +22423,20 @@ mod tests {
         assert_eq!(state.2, "terminated");
         assert_eq!(state.3, 10_000);
         assert_eq!(state.4, 1);
+        let listing_id: String = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT listing_id FROM share_market_seats WHERE id = ?1",
+                params![seat_id],
+                |row| row.get(0),
+            )
+            .expect("read takeover listing");
+        assert_eq!(
+            provider_share_window_counts(&store, &listing_id).await,
+            (1, 0)
+        );
     }
 
     #[tokio::test]
@@ -22209,9 +22461,20 @@ mod tests {
             .await
             .expect("rent Share before owner transfer");
         activate_subscription(&store, &subscription_id, Utc::now()).await;
+        let previous_market_provider_id: String = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT market_provider_id FROM share_market_listings WHERE id = ?1",
+                params![listing_id],
+                |row| row.get(0),
+            )
+            .expect("read original Share Market Provider");
         let now = Utc::now().to_rfc3339();
         {
             let conn = store.conn.lock().await;
+            let mut identity_conflict = None;
             conn.execute(
                 "UPDATE shares SET owner_email = ?2 WHERE share_id = ?1",
                 params!["share-transfer", new_owner.email],
@@ -22223,16 +22486,19 @@ mod tests {
                 &new_owner.user_id,
                 &new_owner.email,
                 &now,
+                &mut identity_conflict,
             )
             .expect("rebind Share market owner");
+            assert!(identity_conflict.is_none());
         }
-        let state: (String, String, String, String, String, i64) = store
+        let state: (String, String, String, String, String, i64, String) = store
             .conn
             .lock()
             .await
             .query_row(
                 "SELECT listing.owner_user_id, listing.owner_email, sub.owner_user_id,
-                        sub.status, contract.status, adjustment.refund_bps
+                        sub.status, contract.status, adjustment.refund_bps,
+                        listing.market_provider_id
                  FROM share_market_listings listing
                  INNER JOIN share_market_subscriptions sub ON sub.listing_id = listing.id
                  INNER JOIN market_service_contracts contract
@@ -22250,6 +22516,7 @@ mod tests {
                         row.get(3)?,
                         row.get(4)?,
                         row.get(5)?,
+                        row.get(6)?,
                     ))
                 },
             )
@@ -22260,6 +22527,26 @@ mod tests {
         assert_eq!(state.3, SUB_REVOKE_PENDING);
         assert_eq!(state.4, "terminated");
         assert_eq!(state.5, 10_000);
+        assert_ne!(state.6, previous_market_provider_id);
+        let windows: Vec<(String, Option<String>)> = store
+            .conn
+            .lock()
+            .await
+            .prepare(
+                "SELECT market_provider_id, ends_at
+                 FROM market_provider_share_windows
+                 WHERE listing_id = ?1 ORDER BY starts_at, id",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map(params![listing_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .expect("read transferred Share Provider windows");
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].0, previous_market_provider_id);
+        assert!(windows[0].1.is_some());
+        assert_eq!(windows[1], (state.6, None));
     }
 
     #[tokio::test]

@@ -187,6 +187,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         51,
         include_str!("../schema/0051_market_recurring_billing.sql"),
     ),
+    (
+        52,
+        include_str!("../schema/0052_market_provider_registry.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -714,7 +718,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count baseline tables");
-        assert_eq!(table_count, 157);
+        assert_eq!(table_count, 164);
         let removed_client_recovery_table_count = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -1156,7 +1160,7 @@ mod tests {
     }
 
     #[test]
-    fn migrations_27_through_51_upgrade_a_version_26_database() {
+    fn migrations_27_through_52_upgrade_a_version_26_database() {
         let conn = memory_connection();
         install_schema_through(&conn, 26);
 
@@ -1285,8 +1289,8 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 51);
-        check_compatibility(&conn).expect("upgraded version 51 is compatible");
+        assert_eq!(latest_version, 52);
+        check_compatibility(&conn).expect("upgraded version 52 is compatible");
         let price_catalog_tables = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -1316,6 +1320,140 @@ mod tests {
             .map(|(name, _)| name.as_str())
             .collect();
         assert_eq!(pk_columns, vec!["pattern", "match_kind"]);
+    }
+
+    #[test]
+    fn migration_52_unifies_market_sources_and_keeps_public_ids_stable() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 51);
+        conn.execute_batch(
+            "INSERT INTO host_provider_profiles
+                (provider_id, owner_email, created_at, updated_at)
+             VALUES ('legacy-host-provider', 'shared@example.com',
+                     '2026-02-01T00:00:00Z', '2026-03-01T00:00:00Z');
+             INSERT INTO share_market_listings
+                (id, share_id, installation_id, owner_user_id, owner_email,
+                 status, created_at, updated_at)
+             VALUES ('listing-shared', 'share-shared', 'installation-shared',
+                     'unclaimed-owner', 'SHARED@example.com', 'active',
+                     '2026-01-01T00:00:00Z', '2026-04-01T00:00:00Z');
+
+             INSERT INTO users
+                (id, email_normalized, status, created_at, last_login_at)
+             VALUES ('funding-supplier', 'funding@example.com', 'active',
+                     '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z');
+             INSERT INTO market_prepaid_accounts
+                (id, buyer_user_id, buyer_email, supplier_user_id,
+                 supplier_email, currency, status, posted_balance_units,
+                 held_balance_units, version, created_at, updated_at)
+             VALUES ('prepaid-only', 'buyer', 'buyer@example.com',
+                     'funding-supplier', 'funding@example.com', 'USD', 'open',
+                     1000, 0, 1, '2026-02-01T00:00:00Z', '2026-02-01T00:00:00Z');",
+        )
+        .expect("seed version 51 Market Provider sources");
+
+        apply(&conn).expect("upgrade version 51 through Market Provider registry");
+
+        let shared: (String, String, String) = conn
+            .query_row(
+                "SELECT id, created_at, updated_at FROM market_provider_profiles
+                 WHERE canonical_email = 'shared@example.com'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read unified unclaimed Provider");
+        assert!(shared.0.starts_with("mp_"));
+        assert_eq!(shared.1, "2026-01-01T00:00:00Z");
+        assert_eq!(shared.2, "2026-04-01T00:00:00Z");
+        let source_ids: (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT
+                    (SELECT market_provider_id FROM host_provider_profiles
+                     WHERE provider_id = 'legacy-host-provider'),
+                    (SELECT market_provider_id FROM share_market_listings
+                     WHERE id = 'listing-shared')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read Market Provider source bindings");
+        assert_eq!(source_ids.0.as_deref(), Some(shared.0.as_str()));
+        assert_eq!(source_ids.1.as_deref(), Some(shared.0.as_str()));
+        let seeded_window: (String, Option<String>) = conn
+            .query_row(
+                "SELECT market_provider_id, ends_at
+                 FROM market_provider_share_windows
+                 WHERE listing_id = 'listing-shared'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read seeded Share Provider window");
+        assert_eq!(seeded_window, (shared.0.clone(), None));
+
+        assert!(
+            conn.execute(
+                "INSERT INTO market_provider_share_windows (
+                    id, listing_id, market_provider_id, starts_at, ends_at, created_at
+                 ) VALUES (
+                    'invalid-window', 'listing-shared', ?1,
+                    'not-a-timestamp', '2026-05-01T00:00:00Z',
+                    '2026-05-01T00:00:00Z'
+                 )",
+                params![shared.0],
+            )
+            .is_err(),
+            "invalid Provider window timestamps must fail closed",
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO market_provider_share_windows (
+                    id, listing_id, market_provider_id, starts_at, ends_at, created_at
+                 ) VALUES (
+                    'reversed-window', 'listing-shared', ?1,
+                    '2026-06-01T00:00:00Z', '2026-05-01T00:00:00Z',
+                    '2026-05-01T00:00:00Z'
+                 )",
+                params![shared.0],
+            )
+            .is_err(),
+            "reversed Provider windows must fail closed",
+        );
+        assert!(
+            conn.execute(
+                "UPDATE market_provider_share_windows
+                 SET ends_at = 'not-a-timestamp'
+                 WHERE listing_id = 'listing-shared'",
+                [],
+            )
+            .is_err(),
+            "Provider window timestamp updates must fail closed",
+        );
+
+        let funding_identity: (String, Option<String>) = conn
+            .query_row(
+                "SELECT id, user_id FROM market_provider_profiles
+                 WHERE canonical_email = 'funding@example.com'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("funding-only supplier receives an identity");
+        assert_eq!(funding_identity.1.as_deref(), Some("funding-supplier"));
+
+        apply(&conn).expect("reapply current schema");
+        let repeated_id: String = conn
+            .query_row(
+                "SELECT id FROM market_provider_profiles
+                 WHERE canonical_email = 'shared@example.com'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read stable public id after repeated apply");
+        assert_eq!(repeated_id, shared.0);
+        let latest_version: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("read latest schema version");
+        assert_eq!(latest_version, 52);
     }
 
     #[test]
@@ -2031,7 +2169,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 51);
+        assert_eq!(latest_version, 52);
     }
 
     #[test]
@@ -2055,7 +2193,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 51);
+        assert_eq!(latest_version, 52);
     }
 
     #[test]
@@ -2235,7 +2373,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 51);
+        assert_eq!(latest_version, 52);
     }
 
     #[test]

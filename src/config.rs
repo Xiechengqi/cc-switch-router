@@ -46,6 +46,35 @@ pub const DEFAULT_CLOCK_SOURCES: &[&str] = &[
     "https://checkip.amazonaws.com/",
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MarketProviderRecommendationMode {
+    Off,
+    #[default]
+    Shadow,
+    On,
+}
+
+impl MarketProviderRecommendationMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Shadow => "shadow",
+            Self::On => "on",
+        }
+    }
+
+    pub fn parse(value: &str) -> std::result::Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "shadow" => Ok(Self::Shadow),
+            "on" => Ok(Self::On),
+            _ => Err(format!(
+                "CC_SWITCH_ROUTER_MARKET_PROVIDER_RECOMMENDATION_MODE must be off, shadow, or on, got: {value}"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DatabaseMode {
     Local,
@@ -763,6 +792,7 @@ pub struct Config {
     pub ip_blacklist: String,
     pub free_share_ip_parallel_limit: i64,
     pub market_usd_cny_rate_micros: i64,
+    pub market_provider_recommendation_mode: MarketProviderRecommendationMode,
     /// Base URLs of the IP-intelligence service, tried in order. Every registered
     /// Client Market Host IP is sent to these endpoints, so they should be operated
     /// by the Router operator or a party trusted with the full Host inventory.
@@ -1041,6 +1071,12 @@ impl Config {
             market_usd_cny_rate_micros: env_var("CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE")
                 .and_then(|value| crate::market_billing::parse_usd_cny_rate_micros(&value).ok())
                 .unwrap_or(crate::market_billing::DEFAULT_USD_CNY_RATE_MICROS),
+            market_provider_recommendation_mode: MarketProviderRecommendationMode::parse(
+                env_var("CC_SWITCH_ROUTER_MARKET_PROVIDER_RECOMMENDATION_MODE")
+                    .as_deref()
+                    .unwrap_or("shadow"),
+            )
+            .unwrap_or_else(|message| panic!("{message}")),
             ip_intel_endpoints: parse_ip_intel_endpoints(
                 env_var("CC_SWITCH_ROUTER_IP_INTEL_ENDPOINTS").as_deref(),
             ),
@@ -1489,6 +1525,7 @@ CC_SWITCH_ROUTER_AUTH_SOURCE_HOURLY_LIMIT=10
 CC_SWITCH_ROUTER_IP_BLACKLIST=
 CC_SWITCH_ROUTER_FREE_SHARE_IP_PARALLEL_LIMIT=1
 CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE=7
+CC_SWITCH_ROUTER_MARKET_PROVIDER_RECOMMENDATION_MODE=shadow
 CC_SWITCH_ROUTER_BINANCE_AUTO_SETTLEMENT_MODE=disabled
 CC_SWITCH_ROUTER_BINANCE_SOCKS_PROXY_URL=
 CC_SWITCH_ROUTER_IP_INTEL_ENDPOINTS=http://3.0.3.0,http://3.0.2.1,http://3.0.2.9
@@ -1826,6 +1863,7 @@ mod tests {
             ip_blacklist: String::new(),
             free_share_ip_parallel_limit: 1,
             market_usd_cny_rate_micros: crate::market_billing::DEFAULT_USD_CNY_RATE_MICROS,
+            market_provider_recommendation_mode: MarketProviderRecommendationMode::Shadow,
             ip_intel_endpoints: Vec::new(),
             verification_service_base_url: "https://example.com".into(),
             verification_service_api_key: None,

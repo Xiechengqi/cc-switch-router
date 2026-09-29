@@ -3,6 +3,7 @@
 import * as React from "react";
 import { Button, Checkbox, Chip, Modal, toast, Tooltip } from "@heroui/react";
 import { CheckSquare, ChevronLeft, ChevronRight, Download, Loader2, Plus, RefreshCw, Trash2, Upload } from "lucide-react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useAuth } from "@/components/auth/auth-provider";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
@@ -57,6 +58,7 @@ import {
   hostDisplayLabel,
   hostExportKey,
   hostMatchesListTab,
+  hostMatchesMarketProvider,
   hostStatusTabTone,
   hostSupportsPaymentKind,
   mapPool,
@@ -75,9 +77,13 @@ import {
 export function ClientMarketPage() {
   const { locale, t } = useLocaleText();
   const { session } = useAuth();
+  const pathname = usePathname();
+  const router = useRouter();
+  const searchParams = useSearchParams();
   const authed = !!session?.authenticated;
   const viewerUserId = session?.user?.id;
   const viewerEmail = session?.user?.email;
+  const marketProviderId = searchParams.get("provider") || undefined;
 
   const [hosts, setHosts] = React.useState<ClientMarketHost[]>([]);
   const [rentals, setRentals] = React.useState<ClientMarketRental[]>([]);
@@ -93,9 +99,13 @@ export function ClientMarketPage() {
   const [regionFilters, setRegionFilters] = usePersistentState<string[]>(REGION_FILTER_KEY, []);
   const [paymentFilters, setPaymentFilters] = usePersistentState<string[]>(PAYMENT_FILTER_KEY, []);
   const [listTabRaw, setListTab] = usePersistentState<HostListTab>(STATUS_FILTER_KEY, "mine");
+  const [providerScopedTab, setProviderScopedTab] = React.useState<HostListTab | null>(
+    () => (marketProviderId ? "all" : null),
+  );
   const [sortPrefsRaw, setSortPrefs] = usePersistentState<HostSortPrefs>(SORT_PREFS_KEY, DEFAULT_HOST_SORT);
   const sortPrefs = React.useMemo(() => normalizeHostSortPrefs(sortPrefsRaw), [sortPrefsRaw]);
-  const listTab = normalizeHostListTab(listTabRaw, authed);
+  const persistedListTab = normalizeHostListTab(listTabRaw, authed);
+  const listTab = marketProviderId ? (providerScopedTab ?? "all") : persistedListTab;
   const viewingMine = listTab === "mine";
   const [page, setPage] = React.useState(1);
   const [error, setError] = React.useState("");
@@ -242,6 +252,7 @@ export function ClientMarketPage() {
     const ownerSet = new Set(ownerFilters.map((email) => email.toLowerCase()));
     const regionSet = new Set(regionFilters.map((code) => code.toUpperCase()));
     return hosts.filter((host) => {
+      if (!hostMatchesMarketProvider(host, marketProviderId)) return false;
       if (ownerSet.size > 0 && !ownerSet.has(host.hostOwnerEmail.toLowerCase())) return false;
       if (regionSet.size > 0) {
         const code = (host.countryCode || "").trim().toUpperCase();
@@ -255,7 +266,22 @@ export function ClientMarketPage() {
       }
       return true;
     });
-  }, [hosts, ownerFilters, paymentFilters, regionFilters]);
+  }, [hosts, marketProviderId, ownerFilters, paymentFilters, regionFilters]);
+
+  const clearMarketProvider = React.useCallback(() => {
+    const params = new URLSearchParams(searchParams.toString());
+    params.delete("provider");
+    const query = params.toString();
+    router.replace(`${pathname}${query ? `?${query}` : ""}`, { scroll: false });
+  }, [pathname, router, searchParams]);
+
+  const handleListTabChange = React.useCallback((next: HostListTab) => {
+    if (marketProviderId) {
+      setProviderScopedTab(next);
+    } else {
+      setListTab(next);
+    }
+  }, [marketProviderId, setListTab]);
 
   const mineHosts = React.useMemo(
     () => (authed ? scopedHosts.filter(hostBelongsToViewer) : []),
@@ -349,7 +375,11 @@ export function ClientMarketPage() {
 
   React.useEffect(() => {
     setPage(1);
-  }, [ownerFilters, paymentFilters, regionFilters, sortPrefs.key, sortPrefs.dir, listTab]);
+  }, [listTab, marketProviderId, ownerFilters, paymentFilters, regionFilters, sortPrefs.dir, sortPrefs.key]);
+
+  React.useEffect(() => {
+    setProviderScopedTab(marketProviderId ? "all" : null);
+  }, [marketProviderId]);
 
   React.useEffect(() => {
     if (!authed && listTabRaw === "mine") setListTab("all");
@@ -483,11 +513,24 @@ export function ClientMarketPage() {
   return (
     <main className="mx-auto grid min-w-0 w-[calc(100%-2rem)] max-w-7xl grid-cols-[minmax(0,1fr)] gap-5 pb-10">
       <h1 className="sr-only">{t("clientMarket.title")}</h1>
+      {marketProviderId ? (
+        <div className="flex min-h-11 min-w-0 flex-wrap items-center justify-between gap-2 rounded-lg bg-slate-100 px-3 py-2 text-sm">
+          <span className="min-w-0 text-slate-700">{t("providers.marketFilter.client")}</span>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="min-h-11 shrink-0 whitespace-nowrap"
+            onClick={clearMarketProvider}
+          >
+            {t("providers.marketFilter.clear")}
+          </Button>
+        </div>
+      ) : null}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
           <SegmentedControl
             value={listTab}
-            onChange={setListTab}
+            onChange={handleListTabChange}
             ariaLabel={t("clientMarket.title")}
             size="sm"
             items={statusTabs.map((tab) => ({
@@ -665,10 +708,10 @@ export function ClientMarketPage() {
         <div className="grid justify-items-center gap-2 rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">
           <span>
             {viewingMine
-              ? !ownerFilters.length && !regionFilters.length && !paymentFilters.length
+              ? !ownerFilters.length && !regionFilters.length && !paymentFilters.length && !marketProviderId
                 ? t("clientMarket.scopeMineEmpty")
                 : t("dashboard.noFilterResults")
-              : scopedHosts.length || ownerFilters.length || regionFilters.length || paymentFilters.length
+              : scopedHosts.length || ownerFilters.length || regionFilters.length || paymentFilters.length || marketProviderId
                 ? t("dashboard.noFilterResults")
                 : t("clientMarket.noHosts")}
           </span>
@@ -676,7 +719,8 @@ export function ClientMarketPage() {
           !mineHosts.length &&
           !ownerFilters.length &&
           !regionFilters.length &&
-          !paymentFilters.length ? (
+          !paymentFilters.length &&
+          !marketProviderId ? (
             <button
               type="button"
               className="text-xs font-medium text-primary hover:underline"
@@ -688,6 +732,7 @@ export function ClientMarketPage() {
           {ownerFilters.length ||
           regionFilters.length ||
           paymentFilters.length ||
+          marketProviderId ||
           listTab !== (authed ? "mine" : "all") ? (
             <button
               type="button"
@@ -697,6 +742,7 @@ export function ClientMarketPage() {
                 setOwnerFilters([]);
                 setRegionFilters([]);
                 setPaymentFilters([]);
+                if (marketProviderId) clearMarketProvider();
               }}
             >
               {t("dashboard.clearFilters")}

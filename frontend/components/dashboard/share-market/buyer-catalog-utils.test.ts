@@ -22,6 +22,7 @@ import {
   rentConfirmPrimaryAction,
   rentedShareIdsFromSubscriptions,
   showRentQuoteCountdown,
+  sortCatalogListings,
   sortMergedCatalogListings,
 } from "./buyer-catalog-utils";
 import {
@@ -631,6 +632,30 @@ test("mine filter is orthogonal to family and search", () => {
   );
 });
 
+test("public Market Provider filter is independent from owner and family filters", () => {
+  const selected = listing("selected-provider", {
+    marketProviderId: "mp_selected",
+    ownerEmail: "alice@example.com",
+    providerFamily: "openai",
+  });
+  const other = listing("other-provider", {
+    marketProviderId: "mp_other",
+    ownerEmail: "alice@example.com",
+    providerFamily: "openai",
+  });
+  assert.deepEqual(
+    filterMergedCatalogListings([selected, other], {
+      mine: false,
+      family: "openai",
+      query: "",
+      owner: ["alice@example.com"],
+      marketProviderId: "mp_selected",
+      rentedShareIds: new Set(),
+    }).map((item) => item.id),
+    ["selected-provider"],
+  );
+});
+
 test("rented listings sort ahead of public catalog and attention stays first", () => {
   const publicNew = listing("public-new", { shareId: "share-public", createdAt: "2026-03-01T00:00:00Z" });
   const rentedHealthy = listing("rented-healthy", { shareId: "share-healthy", createdAt: "2026-01-01T00:00:00Z" });
@@ -643,6 +668,37 @@ test("rented listings sort ahead of public catalog and attention stays first", (
     ],
   );
   assert.deepEqual(sorted.map((item) => item.id), ["rented-failed", "rented-healthy", "public-new"]);
+});
+
+test("Provider rank changes only the enabled recommended order", () => {
+  const legacyFirst = listing("legacy-first", {
+    createdAt: "2026-03-01T00:00:00Z",
+    rankState: "ranked",
+    rankPosition: 2,
+    seats: [seat("legacy-a"), seat("legacy-b")] as ShareMarketListing["seats"],
+  });
+  const rankFirst = listing("rank-first", {
+    createdAt: "2026-01-01T00:00:00Z",
+    rankState: "ranked",
+    rankPosition: 1,
+    seats: [seat("rank-a")] as ShareMarketListing["seats"],
+  });
+  const listings = [legacyFirst, rankFirst];
+
+  for (const mode of ["off", "shadow"]) {
+    assert.deepEqual(
+      sortCatalogListings(listings, [], "recommended", mode).map((item) => item.id),
+      ["legacy-first", "rank-first"],
+    );
+  }
+  assert.deepEqual(
+    sortCatalogListings(listings, [], "recommended", "on").map((item) => item.id),
+    ["rank-first", "legacy-first"],
+  );
+  assert.deepEqual(
+    sortCatalogListings(listings, [], "idle", "on").map((item) => item.id),
+    ["legacy-first", "rank-first"],
+  );
 });
 
 test("catalog pagination clamps and can locate a focused share", () => {

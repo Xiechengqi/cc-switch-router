@@ -2,7 +2,8 @@ use std::collections::HashSet;
 use std::net::IpAddr;
 
 use crate::config::{
-    AlertingSettings, BarkSettings, ClientNotificationSettings, Config, TelegramBotSettings,
+    AlertingSettings, BarkSettings, ClientNotificationSettings, Config,
+    MarketProviderRecommendationMode, TelegramBotSettings,
 };
 
 /// Settings that can change at runtime without restarting the process.
@@ -25,6 +26,7 @@ pub struct DynamicSettings {
     /// at boot; other fields can be changed without restarting the worker.
     pub bark: BarkSettings,
     pub market_usd_cny_rate_micros: i64,
+    pub market_provider_recommendation_mode: MarketProviderRecommendationMode,
     pub footer_telegram_url: String,
     pub server_log_public_enabled: bool,
     /// GitHub Release tag rendered into newly downloaded Client installers.
@@ -54,6 +56,7 @@ impl DynamicSettings {
             telegram_bot: config.telegram_bot.clone(),
             bark: config.bark.clone(),
             market_usd_cny_rate_micros: config.market_usd_cny_rate_micros,
+            market_provider_recommendation_mode: config.market_provider_recommendation_mode,
             footer_telegram_url: config.footer_telegram_url.clone(),
             server_log_public_enabled: crate::server_logs::public_enabled_from_env(),
             client_server_release: crate::client_server_release::client_server_release_from_env(),

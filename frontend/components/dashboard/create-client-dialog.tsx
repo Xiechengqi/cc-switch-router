@@ -16,6 +16,10 @@ import {
   MarketFundingTopupDialog,
 } from "@/components/dashboard/market-funding-topup-dialog";
 import { ProvisionJobLog } from "@/components/dashboard/provision-job-log";
+import {
+  persistedClientMarketProviderSelection,
+  recommendedClientMarketProviderId,
+} from "@/components/dashboard/client-market/host-utils";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   cancelClientMarketQuote,
@@ -40,6 +44,7 @@ import type {
   ClientMarketProvider,
   CreateClientRegionsPersist,
   CreateClientSelectionPersist,
+  MarketProviderRecommendationMode,
   ProvisioningJob,
 } from "@/lib/types";
 import { formatUsdMoney } from "@/lib/market-money";
@@ -151,6 +156,9 @@ export function CreateClientDialog({
   const [providers, setProviders] = React.useState<ClientMarketProvider[]>([]);
   const [providerSupplyLoaded, setProviderSupplyLoaded] = React.useState(false);
   const [officialProviderId, setOfficialProviderId] = React.useState<string>();
+  const [recommendationMode, setRecommendationMode] = React.useState<
+    MarketProviderRecommendationMode | string
+  >("off");
   const [providerPersist, setProviderPersist] = usePersistentState<CreateClientSelectionPersist>(
     PROVIDERS_KEY,
     { mode: "official_default", providerIds: [] },
@@ -182,13 +190,17 @@ export function CreateClientDialog({
   /** Clients-page pool create only allocates free Hosts; Client Market fixed Host may be paid. */
   const freeOnly = !fixedHost;
   const availableProviderIds = React.useMemo(() => new Set(providers.map((provider) => provider.providerId)), [providers]);
+  const defaultProviderId = React.useMemo(
+    () => recommendedClientMarketProviderId(providers, officialProviderId, recommendationMode),
+    [officialProviderId, providers, recommendationMode],
+  );
   const selectedProviderIds = React.useMemo(() => {
     if (fixedHost?.providerId) return [fixedHost.providerId];
     if (safeProviders.mode === "official_default") {
-      return officialProviderId && availableProviderIds.has(officialProviderId) ? [officialProviderId] : [];
+      return defaultProviderId && availableProviderIds.has(defaultProviderId) ? [defaultProviderId] : [];
     }
     return safeProviders.providerIds.filter((id) => availableProviderIds.has(id));
-  }, [availableProviderIds, fixedHost?.providerId, officialProviderId, safeProviders]);
+  }, [availableProviderIds, defaultProviderId, fixedHost?.providerId, safeProviders]);
   const selectedProviders = React.useMemo(
     () => providers.filter((provider) => selectedProviderIds.includes(provider.providerId)),
     [providers, selectedProviderIds],
@@ -236,20 +248,12 @@ export function CreateClientDialog({
   }, [providers, selectedProviderIds]);
   const setSelectedProviders = React.useCallback(
     (ids: string[]) => {
-      if (ids.length === 0) {
-        setProviderPersist({
-          mode: "custom",
-          providerIds: providers.map((provider) => provider.providerId),
-        });
-        return;
-      }
-      if (officialProviderId && ids.length === 1 && ids[0] === officialProviderId) {
-        setProviderPersist({ mode: "official_default", providerIds: [] });
-        return;
-      }
-      setProviderPersist({ mode: "custom", providerIds: ids });
+      setProviderPersist(persistedClientMarketProviderSelection(
+        ids,
+        providers,
+      ));
     },
-    [officialProviderId, providers, setProviderPersist],
+    [providers, setProviderPersist],
   );
   const regionOptions = React.useMemo(() => {
     const counts = new Map<string, { idle: number; total: number }>();
@@ -301,10 +305,12 @@ export function CreateClientDialog({
     setError("");
     setLoading(true);
     setProviderSupplyLoaded(false);
+    setRecommendationMode("off");
     getClientMarketProviderSupply()
       .then((response) => {
         setProviders(response.providers);
         setOfficialProviderId(response.officialProviderId);
+        setRecommendationMode(response.recommendationMode || "off");
         setProviderSupplyLoaded(true);
       })
       .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)))
@@ -323,16 +329,17 @@ export function CreateClientDialog({
 
   React.useEffect(() => {
     if (!providerSupplyLoaded || safeProviders.mode !== "official_default") return;
-    if (officialProviderId && availableProviderIds.has(officialProviderId)) return;
+    if (defaultProviderId && availableProviderIds.has(defaultProviderId)) return;
     if (!providers.length) return;
-    // No official Provider configured — fall back to every host owner so non-official supply is reachable.
+    // No compatible default Provider is available — fall back to every host
+    // owner so non-official supply remains reachable.
     setProviderPersist({
       mode: "custom",
       providerIds: providers.map((provider) => provider.providerId),
     });
   }, [
     availableProviderIds,
-    officialProviderId,
+    defaultProviderId,
     providerSupplyLoaded,
     providers,
     safeProviders.mode,

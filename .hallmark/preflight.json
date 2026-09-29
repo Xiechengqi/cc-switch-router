@@ -1,0 +1,9 @@
+{
+  "scanned_at": "2026-09-28",
+  "font_stack": "Router display/body sans with Noto Sans SC locale face and JetBrains-compatible mono",
+  "palette": "Router CSS custom properties with a cold-white surface and electric-blue accent",
+  "motion": "motion-cut; no dedicated motion library",
+  "spacing": "Tailwind default 4px-based spacing",
+  "framework": "Next.js App Router with Tailwind CSS and HeroUI",
+  "preserved": ["font stack", "palette", "spacing", "application shell"]
+}

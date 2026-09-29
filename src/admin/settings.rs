@@ -137,6 +137,7 @@ pub enum DynamicGroup {
     TelegramBot,
     Bark,
     MarketBilling,
+    MarketProviderRecommendation,
     ServerLogs,
     ClientDistribution,
 }
@@ -1392,6 +1393,18 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         placeholder: Some("7"),
         dynamic_group: Some(DynamicGroup::MarketBilling),
     },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_MARKET_PROVIDER_RECOMMENDATION_MODE",
+        label: "Market Provider recommendations",
+        group: "Market billing",
+        field_type: FieldType::Select,
+        required: false,
+        restart_required: false,
+        default: Some("shadow"),
+        description: "off keeps legacy market ordering; shadow evaluates Provider rank without changing buyer-visible order; on applies Provider rank to each market's default recommended order. Rank metadata remains available for transparency in every mode, and explicit buyer sorts are never changed.",
+        placeholder: None,
+        dynamic_group: Some(DynamicGroup::MarketProviderRecommendation),
+    },
     // ── Binance settlement ──
     SettingsField {
         key: "CC_SWITCH_ROUTER_BINANCE_AUTO_SETTLEMENT_MODE",
@@ -2028,6 +2041,9 @@ fn field_to_view(field: &SettingsField) -> SettingsFieldView {
             "CC_SWITCH_ROUTER_BINANCE_AUTO_SETTLEMENT_MODE" => {
                 vec!["disabled".into(), "shadow".into(), "enabled".into()]
             }
+            "CC_SWITCH_ROUTER_MARKET_PROVIDER_RECOMMENDATION_MODE" => {
+                vec!["off".into(), "shadow".into(), "on".into()]
+            }
             "CC_SWITCH_ROUTER_ALERT_TELEGRAM_MIN_SEVERITY"
             | "CC_SWITCH_ROUTER_ALERT_BARK_MIN_SEVERITY" => {
                 vec!["info".into(), "warning".into(), "critical".into()]
@@ -2532,6 +2548,12 @@ fn dynamic_effective_value(
         "CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE" => Some(crate::market_billing::format_usd_cny_rate(
             dynamic.market_usd_cny_rate_micros,
         )),
+        "CC_SWITCH_ROUTER_MARKET_PROVIDER_RECOMMENDATION_MODE" => Some(
+            dynamic
+                .market_provider_recommendation_mode
+                .as_str()
+                .to_string(),
+        ),
         "CC_SWITCH_ROUTER_ADMIN_EMAILS" => {
             let default_admin = config.default_admin_email();
             let mut emails = dynamic
@@ -3100,6 +3122,11 @@ fn normalize_value(field: &SettingsField, raw: &str) -> Result<Option<String>, A
                 crate::binance_settlement::GlobalMode::parse(trimmed)
                     .map(|mode| Some(mode.as_str().to_string()))
                     .map_err(|error| AppError::BadRequest(error.to_string()))
+            }
+            "CC_SWITCH_ROUTER_MARKET_PROVIDER_RECOMMENDATION_MODE" => {
+                crate::config::MarketProviderRecommendationMode::parse(trimmed)
+                    .map(|mode| Some(mode.as_str().to_string()))
+                    .map_err(AppError::BadRequest)
             }
             "CC_SWITCH_ROUTER_ALERT_TELEGRAM_MIN_SEVERITY"
             | "CC_SWITCH_ROUTER_ALERT_BARK_MIN_SEVERITY" => {
@@ -4362,6 +4389,13 @@ pub fn apply_updates_to_dynamic(
                     .and_then(|value| crate::market_billing::parse_usd_cny_rate_micros(value).ok())
                     .unwrap_or(crate::market_billing::DEFAULT_USD_CNY_RATE_MICROS);
             }
+            "CC_SWITCH_ROUTER_MARKET_PROVIDER_RECOMMENDATION_MODE" => {
+                current.market_provider_recommendation_mode = value
+                    .and_then(|value| {
+                        crate::config::MarketProviderRecommendationMode::parse(value).ok()
+                    })
+                    .unwrap_or(crate::config::MarketProviderRecommendationMode::Shadow);
+            }
             "CC_SWITCH_ROUTER_SERVER_LOG_PUBLIC_ENABLED" => {
                 current.server_log_public_enabled = value.map(parse_bool_truthy).unwrap_or(true);
             }
@@ -4448,6 +4482,51 @@ mod tests {
         )]);
         apply_updates_to_dynamic(&mut dynamic, &updates, &config);
         assert_eq!(dynamic.market_usd_cny_rate_micros, 7_250_000);
+    }
+
+    #[test]
+    fn market_provider_recommendation_mode_is_dynamic_and_canonical() {
+        let field = field_by_key("CC_SWITCH_ROUTER_MARKET_PROVIDER_RECOMMENDATION_MODE").unwrap();
+        assert_eq!(normalize_value(field, " On ").unwrap(), Some("on".into()));
+        assert_eq!(
+            normalize_value(field, " SHADOW ").unwrap(),
+            Some("shadow".into())
+        );
+        assert!(normalize_value(field, "ranked").is_err());
+        assert!(!field.restart_required);
+        assert!(matches!(
+            field.dynamic_group,
+            Some(DynamicGroup::MarketProviderRecommendation)
+        ));
+        assert_eq!(field_to_view(field).options, vec!["off", "shadow", "on"]);
+
+        let config = test_static_config();
+        let mut dynamic = DynamicSettings::from_config(&config);
+        apply_updates_to_dynamic(
+            &mut dynamic,
+            &BTreeMap::from([(
+                "CC_SWITCH_ROUTER_MARKET_PROVIDER_RECOMMENDATION_MODE".into(),
+                Some("on".into()),
+            )]),
+            &config,
+        );
+        assert_eq!(
+            dynamic.market_provider_recommendation_mode,
+            crate::config::MarketProviderRecommendationMode::On
+        );
+
+        apply_updates_to_dynamic(
+            &mut dynamic,
+            &BTreeMap::from([(
+                "CC_SWITCH_ROUTER_MARKET_PROVIDER_RECOMMENDATION_MODE".into(),
+                None,
+            )]),
+            &config,
+        );
+        assert_eq!(
+            dynamic.market_provider_recommendation_mode,
+            crate::config::MarketProviderRecommendationMode::Shadow
+        );
     }
 
     #[test]
@@ -5422,8 +5501,8 @@ mod tests {
     #[test]
     fn settings_contract_exposes_all_fields_in_seven_domains() {
         let schema = schema_response();
-        assert_eq!(SETTINGS_FIELDS.len(), 131);
-        assert_eq!(schema.fields.len(), 131);
+        assert_eq!(SETTINGS_FIELDS.len(), 132);
+        assert_eq!(schema.fields.len(), 132);
         assert_eq!(schema.categories.len(), 7);
         assert!(
             SETTINGS_FIELDS
@@ -5437,7 +5516,7 @@ mod tests {
                 .iter()
                 .map(|category| category.field_count)
                 .sum::<usize>(),
-            131
+            132
         );
         assert!(schema.fields.iter().all(|field| !field.group.is_empty()));
         let webhook = schema
@@ -5859,6 +5938,8 @@ mod tests {
             ip_blacklist: String::new(),
             free_share_ip_parallel_limit: 1,
             market_usd_cny_rate_micros: crate::market_billing::DEFAULT_USD_CNY_RATE_MICROS,
+            market_provider_recommendation_mode:
+                crate::config::MarketProviderRecommendationMode::Shadow,
             ip_intel_endpoints: Vec::new(),
             verification_service_base_url: "https://example.com".into(),
             verification_service_api_key: None,

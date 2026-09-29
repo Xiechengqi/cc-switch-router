@@ -240,6 +240,7 @@ export function listingCreatedAtMs(listing: Pick<ShareMarketListing, "createdAt"
 export function sortMergedCatalogListings(
   listings: ShareMarketListing[],
   subscriptions: ShareMarketSubscription[],
+  providerRanking = false,
 ) {
   const groups = new Map(
     groupActiveRentalsByShare(subscriptions).map((group) => [group.shareId, group]),
@@ -251,6 +252,16 @@ export function sortMergedCatalogListings(
     if (leftGroup && rightGroup) {
       return Number(rightGroup.attention) - Number(leftGroup.attention)
         || sortShareMarketSubscriptions(leftGroup.subscription, rightGroup.subscription);
+    }
+    if (providerRanking) {
+      const leftRanked = left.rankState === "ranked";
+      const rightRanked = right.rankState === "ranked";
+      if (leftRanked !== rightRanked) return leftRanked ? -1 : 1;
+      if (leftRanked && rightRanked) {
+        const rankOrder = (left.rankPosition ?? Number.MAX_SAFE_INTEGER)
+          - (right.rankPosition ?? Number.MAX_SAFE_INTEGER);
+        if (rankOrder) return rankOrder;
+      }
     }
     return listingCreatedAtMs(right) - listingCreatedAtMs(left)
       || right.id.localeCompare(left.id);
@@ -286,13 +297,18 @@ export function sortCatalogListings(
   listings: ShareMarketListing[],
   subscriptions: ShareMarketSubscription[],
   sort: MarketCatalogSort = "recommended",
+  recommendationMode: "off" | "shadow" | "on" | string = "off",
 ) {
-  const recommended = sortMergedCatalogListings(listings, subscriptions);
-  if (sort === "recommended") return recommended;
+  const legacyRecommended = sortMergedCatalogListings(listings, subscriptions);
+  if (sort === "recommended") {
+    return recommendationMode === "on"
+      ? sortMergedCatalogListings(listings, subscriptions, true)
+      : legacyRecommended;
+  }
   const rentedShareIds = rentedShareIdsFromSubscriptions(subscriptions);
-  const rank = new Map(recommended.map((listing, index) => [listing.shareId, index]));
+  const rank = new Map(legacyRecommended.map((listing, index) => [listing.shareId, index]));
   const rankOf = (listing: ShareMarketListing) => rank.get(listing.shareId) ?? 0;
-  return [...recommended].sort((left, right) => {
+  return [...legacyRecommended].sort((left, right) => {
     const leftRented = rentedShareIds.has(left.shareId);
     const rightRented = rentedShareIds.has(right.shareId);
     if (leftRented !== rightRented) return leftRented ? -1 : 1;
@@ -310,6 +326,7 @@ export function filterMergedCatalogListings(
     family,
     query,
     owner = [],
+    marketProviderId,
     rentedShareIds,
   }: {
     mine: boolean;
@@ -317,12 +334,14 @@ export function filterMergedCatalogListings(
     family: ShareMarketProviderFamily | "all";
     query: string;
     owner?: string | string[];
+    marketProviderId?: string;
     rentedShareIds: Set<string>;
   },
 ) {
   return listings.filter((listing) => {
     if (mine && !rentedShareIds.has(listing.shareId)) return false;
     if (idleOnly && !listingIdleCount(listing)) return false;
+    if (marketProviderId && listing.marketProviderId !== marketProviderId) return false;
     return listingMatchesFamily(listing, family)
       && listingMatchesQuery(listing, query)
       && listingMatchesOwner(listing, owner);

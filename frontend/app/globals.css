@@ -1,6 +1,7 @@
 /* Hallmark · pre-emit critique: P4 H4 E4 S5 R5 V3 */
 @import "tailwindcss";
 @import "@heroui/styles";
+@import "../tokens.css";
 
 @custom-variant dark (&:is(.dark *));
 
@@ -507,8 +508,9 @@ textarea:-webkit-autofill:focus {
   --button-bg-hover: transparent;
   --button-bg-pressed: transparent;
   --button-fg: rgb(100 116 139);
-  height: 2.25rem;
-  min-height: 2.25rem;
+  height: 2.75rem;
+  min-height: 2.75rem;
+  min-width: 2.75rem;
   border: 0 !important;
   background: transparent !important;
   box-shadow: none !important;

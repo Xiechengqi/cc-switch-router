@@ -4,7 +4,7 @@ import Image from "next/image";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { Button, Dropdown, Toast } from "@heroui/react";
-import { Activity, ChevronDown, KeyRound, LogOut, Monitor, Network, ServerCog, Settings, Share2, UserRound } from "lucide-react";
+import { Activity, ChevronDown, KeyRound, LogOut, Monitor, Network, ServerCog, Settings, Share2, Trophy, UserRound } from "lucide-react";
 import * as React from "react";
 import { LoginDialog } from "@/components/auth/login-dialog";
 import { useAuth } from "@/components/auth/auth-provider";
@@ -18,6 +18,7 @@ import {
   DASHBOARD_CLIENTS_PATH,
   DASHBOARD_SHARE_MARKET_PATH,
   DASHBOARD_CLIENT_MARKET_PATH,
+  DASHBOARD_PROVIDERS_PATH,
   type DashboardShellActive,
 } from "@/lib/dashboard-nav";
 import { getMarketAccessInboxSummary } from "@/lib/api";
@@ -106,7 +107,7 @@ function RouterSwitcher() {
     <Dropdown>
       <Dropdown.Trigger
         aria-label={t("nav.router")}
-        className="region-switcher-trigger inline-flex max-w-[11rem] shrink-0 items-center gap-1 outline-none"
+        className="region-switcher-trigger inline-flex min-w-0 max-w-[11rem] items-center gap-1 outline-none"
       >
         <span className="min-w-0 truncate">{selected || t("nav.router")}</span>
         <ChevronDown className="h-4 w-4 shrink-0 text-slate-500" aria-hidden />
@@ -140,7 +141,7 @@ function LanguageSwitcher() {
     <button
       type="button"
       aria-label={t("common.language")}
-      className="inline-flex h-9 shrink-0 items-center justify-center rounded-md px-2 text-sm font-medium text-slate-500 transition-colors hover:text-slate-700"
+      className="inline-flex h-11 shrink-0 items-center justify-center rounded-md px-2 text-sm font-medium text-slate-500 transition-colors hover:text-slate-700 active:bg-slate-100"
       onClick={() => setLocale(showEnglish ? "en" : "zh-CN")}
     >
       {showEnglish ? "EN" : "中"}
@@ -153,7 +154,7 @@ function DashboardNav({
   authed,
   pendingAccessRequests,
 }: {
-  active: "clients" | "share-market" | "client-market" | "account";
+  active: "clients" | "share-market" | "client-market" | "providers" | "account";
   authed: boolean;
   pendingAccessRequests: number;
 }) {
@@ -162,6 +163,8 @@ function DashboardNav({
   const selectedKey =
     authed && (active === "account" || pathname.startsWith("/account"))
       ? "account"
+      : active === "providers" || pathname.startsWith("/providers")
+        ? "providers"
       : active === "client-market" || pathname.startsWith("/client-market")
         ? "client-market"
         : active === "share-market" || pathname.startsWith("/share-market")
@@ -182,13 +185,19 @@ function DashboardNav({
       icon: Network,
       label: t("nav.clientMarketTab"),
     },
+    {
+      id: "providers" as const,
+      href: DASHBOARD_PROVIDERS_PATH,
+      icon: Trophy,
+      label: t("nav.providersTab"),
+    },
     ...(authed
       ? [{ id: "account" as const, href: DASHBOARD_ACCOUNT_PATH, icon: UserRound, label: t("nav.accountTab"), pending: pendingAccessRequests }]
       : []),
   ];
 
   return (
-    <nav aria-label={t("nav.dashboardSections")} className="flex w-max max-w-full items-center gap-0.5">
+    <nav aria-label={t("nav.dashboardSections")} className="flex w-max items-center gap-0.5">
       {items.map((item) => {
         const selected = selectedKey === item.id;
         const Icon = item.icon;
@@ -198,7 +207,7 @@ function DashboardNav({
             href={item.href}
             aria-current={selected ? "page" : undefined}
             className={cn(
-              "inline-flex h-9 min-w-0 items-center gap-1.5 rounded-md px-2.5 text-sm transition-colors",
+              "inline-flex h-11 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md px-2.5 text-sm transition-colors active:bg-slate-100",
               selected
                 ? "font-semibold text-foreground"
                 : "font-medium text-slate-500 hover:text-slate-700",
@@ -241,7 +250,7 @@ function Topbar({ active }: { active: DashboardShellActive }) {
   const authed = !!session?.authenticated;
   const showAuthedChrome = authed || (loading && !!lastAuthedEmailRef.current);
   const displayEmail = session?.user?.email || lastAuthedEmailRef.current || "";
-  const showDashboardNav = active === "clients" || active === "share-market" || active === "client-market" || active === "account";
+  const showDashboardNav = active === "clients" || active === "share-market" || active === "client-market" || active === "providers" || active === "account";
 
   React.useEffect(() => {
     if (!authed || active === "account") {
@@ -296,30 +305,30 @@ function Topbar({ active }: { active: DashboardShellActive }) {
       */}
       <div className="sticky top-0 z-40 bg-background/85 backdrop-blur-md">
         <header className="mx-auto w-[calc(100%-2rem)] max-w-7xl py-3.5">
-        <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 gap-y-2 md:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)]">
+        <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 gap-y-2 lg:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)]">
           <div className="flex min-w-0 items-center gap-2.5 justify-self-start">
-            <Link href={DASHBOARD_CLIENTS_PATH} className="flex shrink-0 items-center" aria-label="CC-Switch Router">
+            <Link href={DASHBOARD_CLIENTS_PATH} className="flex h-11 w-11 shrink-0 items-center justify-center rounded-md active:bg-slate-100" aria-label="CC-Switch Router">
               <Image src="/router-logo.svg" alt="" width={32} height={32} className="h-8 w-8 shrink-0" priority />
             </Link>
             <RouterSwitcher />
           </div>
 
           {showDashboardNav ? (
-            <div className="col-span-2 row-start-2 min-w-0 max-w-full justify-self-stretch overflow-x-auto [-ms-overflow-style:none] [scrollbar-width:none] md:col-span-1 md:col-start-2 md:row-start-1 md:justify-self-center [&::-webkit-scrollbar]:hidden">
+            <div className="col-span-2 row-start-2 min-w-0 max-w-full justify-self-stretch overflow-x-auto [-ms-overflow-style:none] [scrollbar-width:none] lg:col-span-1 lg:col-start-2 lg:row-start-1 lg:justify-self-center [&::-webkit-scrollbar]:hidden">
               <DashboardNav active={active} authed={showAuthedChrome} pendingAccessRequests={pendingAccessRequests} />
             </div>
           ) : (
             <div />
           )}
 
-          <div className="col-start-2 row-start-1 flex flex-nowrap items-center justify-end gap-2 justify-self-end md:col-start-3">
+          <div className="col-start-2 row-start-1 flex flex-nowrap items-center justify-end gap-2 justify-self-end lg:col-start-3">
             <LanguageSwitcher />
             {showAuthedChrome ? (
               <Dropdown>
                 <Dropdown.Trigger
                   aria-label={displayEmail || t("nav.userMenu")}
                   isDisabled={loading && !authed}
-                  className="inline-flex h-9 max-w-[12rem] shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md px-2.5 text-sm font-medium text-slate-500 outline-none hover:bg-slate-100 hover:text-slate-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+                  className="inline-flex h-11 max-w-[12rem] shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md px-2.5 text-sm font-medium text-slate-500 outline-none hover:bg-slate-100 hover:text-slate-700 active:bg-slate-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
                 >
                   <UserRound className="h-4 w-4 shrink-0 text-slate-500" />
                   <span className="hidden min-w-0 truncate sm:inline">{displayEmail}</span>
@@ -362,7 +371,7 @@ function Topbar({ active }: { active: DashboardShellActive }) {
               <Button
                 variant="ghost"
                 size="sm"
-                className="h-9 shrink-0 px-2.5 text-sm font-medium text-slate-500 hover:text-slate-700"
+                className="h-11 shrink-0 px-2.5 text-sm font-medium text-slate-500 hover:text-slate-700 active:bg-slate-100"
                 onClick={() => setLoginOpen(true)}
                 isDisabled={loading}
               >

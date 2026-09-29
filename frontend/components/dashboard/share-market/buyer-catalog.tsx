@@ -281,6 +281,8 @@ export function ShareMarketBuyerCatalog({
   rentedListings = [],
   authed,
   focusedShareId,
+  marketProviderId,
+  onClearMarketProvider,
   initialMine = false,
   onChanged,
   onInteractionChange,
@@ -295,6 +297,8 @@ export function ShareMarketBuyerCatalog({
   rentedListings?: ShareMarketListing[];
   authed: boolean;
   focusedShareId?: string;
+  marketProviderId?: string;
+  onClearMarketProvider?: () => void;
   initialMine?: boolean;
   onChanged: () => Promise<void> | void;
   onInteractionChange?: (active: boolean) => void;
@@ -358,12 +362,14 @@ export function ShareMarketBuyerCatalog({
         family,
         query,
         owner: owners,
+        marketProviderId,
         rentedShareIds,
       }),
       subscriptions,
       sort,
+      catalog.recommendationMode,
     ),
-    [authed, family, idleOnly, mergedListings, mine, owners, query, rentedShareIds, sort, subscriptions],
+    [authed, catalog.recommendationMode, family, idleOnly, marketProviderId, mergedListings, mine, owners, query, rentedShareIds, sort, subscriptions],
   );
   const paged = React.useMemo(
     () => paginateListings(filteredListings, page, MARKET_CATALOG_PAGE_SIZE),
@@ -384,7 +390,7 @@ export function ShareMarketBuyerCatalog({
       return;
     }
     setPage(1);
-  }, [family, idleOnly, mine, owners, query, sort]);
+  }, [family, idleOnly, marketProviderId, mine, owners, query, sort]);
 
   React.useEffect(() => {
     if (!selected) return;
@@ -679,6 +685,21 @@ export function ShareMarketBuyerCatalog({
 
   return (
     <div className="grid min-w-0 gap-4">
+      {marketProviderId ? (
+        <div className="flex min-h-11 min-w-0 flex-wrap items-center justify-between gap-2 rounded-lg bg-slate-100 px-3 py-2 text-sm">
+          <span className="min-w-0 text-slate-700">
+            {t("providers.marketFilter.share")}
+          </span>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="min-h-11 shrink-0 whitespace-nowrap"
+            onClick={onClearMarketProvider}
+          >
+            {t("providers.marketFilter.clear")}
+          </Button>
+        </div>
+      ) : null}
       <MarketListingFilters
         listings={mergedListings}
         family={family}

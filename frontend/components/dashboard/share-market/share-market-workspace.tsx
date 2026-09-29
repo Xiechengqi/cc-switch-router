@@ -3,7 +3,7 @@
 import * as React from "react";
 import { Button } from "@heroui/react";
 import { Loader2, RefreshCw } from "lucide-react";
-import { useSearchParams } from "next/navigation";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useAuth } from "@/components/auth/auth-provider";
 import { SegmentedControl } from "@/components/common/segmented-control";
 import { ShareMarketBuyerCatalog } from "@/components/dashboard/share-market/buyer-catalog";
@@ -61,6 +61,8 @@ export function ShareMarketWorkspace() {
   const { t } = useLocaleText();
   const { session, loading: authLoading } = useAuth();
   const searchParams = useSearchParams();
+  const pathname = usePathname();
+  const router = useRouter();
   const authed = !!session?.authenticated;
   const actorKey = authed
     ? session?.user?.id || session?.user?.email?.toLowerCase() || "authenticated"
@@ -87,7 +89,15 @@ export function ShareMarketWorkspace() {
   const expandedSubscriptionHistoryRef = React.useRef(false);
   const subscriptionHistoryGenerationRef = React.useRef(0);
   const focusedShareId = searchParams.get("focus") || undefined;
+  const marketProviderId = searchParams.get("provider") || undefined;
   const initialMine = mineFromQuery(searchParams.get("view") || searchParams.get("tab"));
+
+  const clearMarketProvider = React.useCallback(() => {
+    const params = new URLSearchParams(searchParams.toString());
+    params.delete("provider");
+    const query = params.toString();
+    router.replace(`${pathname}${query ? `?${query}` : ""}`, { scroll: false });
+  }, [pathname, router, searchParams]);
 
   React.useEffect(() => {
     consumeRentalsQuery();
@@ -340,6 +350,8 @@ export function ShareMarketWorkspace() {
           rentedListings={visibleRentedListings}
           authed={authed}
           focusedShareId={focusedShareId}
+          marketProviderId={marketProviderId}
+          onClearMarketProvider={clearMarketProvider}
           initialMine={authed && initialMine}
           onChanged={() => load({ scope: "catalog", silent: true })}
           onInteractionChange={setPausePolling}

@@ -105,6 +105,13 @@ pub struct UpdatePaymentProfileRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ProviderSummary {
     pub provider_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub market_provider_id: Option<String>,
+    pub rank_state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rank_position: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_score_bps: Option<i64>,
     pub owner_email: String,
     pub official: bool,
     pub joined_at: String,
@@ -146,7 +153,77 @@ pub struct ProviderCountrySummary {
 pub struct ProviderSupplyResponse {
     pub router_owner_email: Option<String>,
     pub official_provider_id: Option<String>,
+    pub recommendation_mode: String,
     pub providers: Vec<ProviderSummary>,
+}
+
+fn legacy_provider_order(left: &ProviderSummary, right: &ProviderSummary) -> std::cmp::Ordering {
+    right
+        .official
+        .cmp(&left.official)
+        .then_with(|| neutral_provider_order(left, right))
+}
+
+fn neutral_provider_order(left: &ProviderSummary, right: &ProviderSummary) -> std::cmp::Ordering {
+    right
+        .external_clients_over_30_days
+        .cmp(&left.external_clients_over_30_days)
+        .then_with(|| {
+            right
+                .external_clients_over_3_days
+                .cmp(&left.external_clients_over_3_days)
+        })
+        .then_with(|| {
+            right
+                .online_rate_30d
+                .partial_cmp(&left.online_rate_30d)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .then_with(|| left.joined_at.cmp(&right.joined_at))
+        .then_with(|| left.provider_id.cmp(&right.provider_id))
+}
+
+fn ranked_provider_order(left: &ProviderSummary, right: &ProviderSummary) -> std::cmp::Ordering {
+    let left_ranked = left.rank_state == "ranked";
+    let right_ranked = right.rank_state == "ranked";
+    right_ranked
+        .cmp(&left_ranked)
+        .then_with(|| {
+            left.rank_position
+                .unwrap_or(i64::MAX)
+                .cmp(&right.rank_position.unwrap_or(i64::MAX))
+        })
+        // Official identity is informative only. It retains the historical
+        // position in off/shadow mode, but never breaks a ranked-mode tie.
+        .then_with(|| neutral_provider_order(left, right))
+}
+
+fn apply_provider_recommendation_mode(
+    response: &mut ProviderSupplyResponse,
+    mode: crate::config::MarketProviderRecommendationMode,
+) {
+    response.recommendation_mode = mode.as_str().to_string();
+    match mode {
+        crate::config::MarketProviderRecommendationMode::Off => {}
+        crate::config::MarketProviderRecommendationMode::Shadow => {
+            let mut projected = response.providers.clone();
+            projected.sort_by(ranked_provider_order);
+            let moved = projected
+                .iter()
+                .zip(&response.providers)
+                .filter(|(projected, current)| projected.provider_id != current.provider_id)
+                .count();
+            tracing::debug!(
+                market = "client",
+                providers = response.providers.len(),
+                moved,
+                "Market Provider recommendation shadow evaluated"
+            );
+        }
+        crate::config::MarketProviderRecommendationMode::On => {
+            response.providers.sort_by(ranked_provider_order);
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1254,22 +1331,33 @@ async fn get_payment_asset(
 async fn get_provider_supply(
     State(state): State<ServerState>,
 ) -> Result<Json<ProviderSupplyResponse>, AppError> {
-    Ok(Json(
-        state
-            .store
-            .client_market_provider_supply(state.config.official_provider_email())
-            .await?,
-    ))
+    let mode = state
+        .dynamic
+        .read()
+        .await
+        .market_provider_recommendation_mode;
+    let mut response = state
+        .store
+        .client_market_provider_supply(state.config.official_provider_email())
+        .await?;
+    apply_provider_recommendation_mode(&mut response, mode);
+    Ok(Json(response))
 }
 
 async fn get_provider(
     State(state): State<ServerState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<ProviderSummary>, AppError> {
-    let supply = state
+    let mode = state
+        .dynamic
+        .read()
+        .await
+        .market_provider_recommendation_mode;
+    let mut supply = state
         .store
         .client_market_provider_supply(state.config.official_provider_email())
         .await?;
+    apply_provider_recommendation_mode(&mut supply, mode);
     supply
         .providers
         .into_iter()
@@ -1974,6 +2062,25 @@ impl AppStore {
         .map_err(|error| {
             AppError::Internal(format!("sync subscription Provider email failed: {error}"))
         })?;
+        match crate::market_provider_identity::ensure_market_provider_identity_tx(
+            &tx,
+            Some(user_id),
+            &email,
+            &now,
+        )? {
+            crate::market_provider_identity::MarketProviderIdentityResolution::Resolved(_) => {}
+            crate::market_provider_identity::MarketProviderIdentityResolution::Conflict(
+                conflict,
+            ) => {
+                drop(tx);
+                crate::market_provider_identity::persist_market_provider_identity_conflict(
+                    &conn, &conflict, &now,
+                )?;
+                return Err(AppError::Conflict(
+                    "the Host Provider identity conflicts with an existing Market Provider".into(),
+                ));
+            }
+        }
         tx.commit()
             .map_err(|error| AppError::Internal(format!("commit Provider sync failed: {error}")))?;
         Ok(user_id.to_string())
@@ -2162,6 +2269,26 @@ impl AppStore {
         .map_err(|error| {
             AppError::Internal(format!("sync subscription Provider email failed: {error}"))
         })?;
+        match crate::market_provider_identity::ensure_market_provider_identity_tx(
+            &tx,
+            Some(&session.user_id),
+            &email,
+            &now,
+        )? {
+            crate::market_provider_identity::MarketProviderIdentityResolution::Resolved(_) => {}
+            crate::market_provider_identity::MarketProviderIdentityResolution::Conflict(
+                conflict,
+            ) => {
+                drop(tx);
+                crate::market_provider_identity::persist_market_provider_identity_conflict(
+                    &conn, &conflict, &now,
+                )?;
+                return Err(AppError::Conflict(
+                    "the payment Provider identity conflicts with an existing Market Provider"
+                        .into(),
+                ));
+            }
+        }
         tx.commit().map_err(|error| {
             AppError::Internal(format!("commit payment profile update failed: {error}"))
         })?;
@@ -2287,6 +2414,7 @@ impl AppStore {
                 AppError::Internal(format!("commit Provider supply heal failed: {error}"))
             })?;
         }
+        let rank_projections = crate::market_provider_rank::latest_rank_projections(&conn)?;
         let mut statement = conn
             .prepare(
                 "SELECT p.provider_id, p.owner_email, p.created_at,
@@ -2309,7 +2437,8 @@ impl AppStore {
                           (SELECT MAX(e.created_at) FROM client_market_audit_events e
                            WHERE e.event_type = 'host_offer_updated'
                              AND e.host_id IN (SELECT id FROM router_ssh_hosts WHERE provider_id = p.provider_id)),
-                          MIN(h.created_at), p.created_at)
+                          MIN(h.created_at), p.created_at),
+                        p.market_provider_id
                  FROM host_provider_profiles p
                  LEFT JOIN router_ssh_hosts h ON h.provider_id = p.provider_id
                  GROUP BY p.provider_id, p.owner_email, p.created_at
@@ -2337,6 +2466,7 @@ impl AppStore {
                     row.get::<_, i64>(15)?,
                     row.get::<_, String>(16)?,
                     row.get::<_, String>(17)?,
+                    row.get::<_, Option<String>>(18)?,
                 ))
             })
             .map_err(|error| {
@@ -2363,6 +2493,7 @@ impl AppStore {
                 successful,
                 methods_json,
                 offer_stable_since,
+                market_provider_id,
             ) = row.map_err(|error| {
                 AppError::Internal(format!("read Provider supply failed: {error}"))
             })?;
@@ -2446,9 +2577,18 @@ impl AppStore {
                 .map_err(|error| {
                     AppError::Internal(format!("read Provider uptime observations failed: {error}"))
                 })?;
+            let rank = market_provider_id
+                .as_ref()
+                .and_then(|id| rank_projections.get(id));
             providers.push(ProviderSummary {
                 official: official_email.as_deref() == Some(owner_email.as_str()),
                 provider_id,
+                market_provider_id,
+                rank_state: rank
+                    .map(|projection| projection.rank_state.clone())
+                    .unwrap_or_else(|| "unranked".into()),
+                rank_position: rank.and_then(|projection| projection.rank_position),
+                provider_score_bps: rank.and_then(|projection| projection.score_bps),
                 owner_email,
                 joined_at,
                 offer_stable_since,
@@ -2475,29 +2615,7 @@ impl AppStore {
                 countries,
             });
         }
-        providers.sort_by(|left, right| {
-            right
-                .official
-                .cmp(&left.official)
-                .then_with(|| {
-                    right
-                        .external_clients_over_30_days
-                        .cmp(&left.external_clients_over_30_days)
-                })
-                .then_with(|| {
-                    right
-                        .external_clients_over_3_days
-                        .cmp(&left.external_clients_over_3_days)
-                })
-                .then_with(|| {
-                    right
-                        .online_rate_30d
-                        .partial_cmp(&left.online_rate_30d)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .then_with(|| left.joined_at.cmp(&right.joined_at))
-                .then_with(|| left.provider_id.cmp(&right.provider_id))
-        });
+        providers.sort_by(legacy_provider_order);
         let official_provider_id = providers
             .iter()
             .find(|provider| provider.official)
@@ -2505,6 +2623,7 @@ impl AppStore {
         Ok(ProviderSupplyResponse {
             router_owner_email: official_email,
             official_provider_id,
+            recommendation_mode: "off".into(),
             providers,
         })
     }
@@ -5873,6 +5992,110 @@ mod tests {
         }
     }
 
+    fn recommendation_provider(
+        provider_id: &str,
+        official: bool,
+        rank_position: Option<i64>,
+        external_clients_over_30_days: i64,
+    ) -> ProviderSummary {
+        ProviderSummary {
+            provider_id: provider_id.into(),
+            market_provider_id: Some(format!("mp_{provider_id}")),
+            rank_state: if rank_position.is_some() {
+                "ranked".into()
+            } else {
+                "collecting".into()
+            },
+            rank_position,
+            provider_score_bps: rank_position.map(|position| 10_000 - position),
+            owner_email: format!("{provider_id}@example.com"),
+            official,
+            joined_at: "2026-01-01T00:00:00Z".into(),
+            offer_stable_since: "2026-01-01T00:00:00Z".into(),
+            host_total: 1,
+            idle_total: 1,
+            allocated_total: 0,
+            allocation_rate: 0.0,
+            free_host_total: 0,
+            free_allocated_total: 0,
+            paid_host_total: 1,
+            paid_allocated_total: 0,
+            external_client_owner_total: external_clients_over_30_days,
+            external_clients_over_3_days: external_clients_over_30_days,
+            external_clients_over_30_days,
+            online_rate_30d: Some(1.0),
+            anomalous_host_rate: 0.0,
+            min_daily_rate_minor: Some(100),
+            max_daily_rate_minor: Some(100),
+            min_cycle_price_minor: None,
+            max_cycle_price_minor: None,
+            successful_allocations: 0,
+            payment_method_kinds: Vec::new(),
+            countries: Vec::new(),
+        }
+    }
+
+    fn recommendation_response() -> ProviderSupplyResponse {
+        ProviderSupplyResponse {
+            router_owner_email: Some("official@example.com".into()),
+            official_provider_id: Some("official".into()),
+            recommendation_mode: "off".into(),
+            // This is the legacy order: official first, even though the ranked
+            // Provider has more historical clients.
+            providers: vec![
+                recommendation_provider("official", true, None, 0),
+                recommendation_provider("ranked", false, Some(1), 20),
+            ],
+        }
+    }
+
+    #[test]
+    fn recommendation_modes_preserve_legacy_order_until_explicitly_enabled() {
+        for mode in [
+            crate::config::MarketProviderRecommendationMode::Off,
+            crate::config::MarketProviderRecommendationMode::Shadow,
+        ] {
+            let mut response = recommendation_response();
+            apply_provider_recommendation_mode(&mut response, mode);
+            assert_eq!(
+                response
+                    .providers
+                    .iter()
+                    .map(|provider| provider.provider_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["official", "ranked"]
+            );
+            assert_eq!(response.recommendation_mode, mode.as_str());
+        }
+
+        let mut response = recommendation_response();
+        apply_provider_recommendation_mode(
+            &mut response,
+            crate::config::MarketProviderRecommendationMode::On,
+        );
+        assert_eq!(
+            response
+                .providers
+                .iter()
+                .map(|provider| provider.provider_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ranked", "official"]
+        );
+    }
+
+    #[test]
+    fn official_identity_does_not_break_ranked_mode_ties() {
+        let mut providers = [
+            recommendation_provider("official", true, Some(1), 0),
+            recommendation_provider("chosen", false, Some(1), 20),
+        ];
+        providers.sort_by(ranked_provider_order);
+        assert_eq!(providers[0].provider_id, "chosen");
+
+        providers.sort_by(legacy_provider_order);
+        assert_eq!(providers[0].provider_id, "official");
+    }
+
     #[tokio::test]
     async fn paid_host_requires_payment_profile_with_stable_error_code() {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
@@ -5897,6 +6120,118 @@ mod tests {
             error.code(),
             Some(crate::market_billing::ERROR_MARKET_SUPPLIER_SETTLEMENT_PROFILE_REQUIRED)
         );
+    }
+
+    #[tokio::test]
+    async fn client_market_update_payment_profile_binds_market_provider_immediately() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let supplier = session("payment-identity", "payment-identity@example.com");
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "INSERT INTO users (id, email_normalized, status, created_at, last_login_at)
+                 VALUES (?1, ?2, 'active', 'now', 'now')",
+                params![supplier.user_id, supplier.email],
+            )
+            .expect("insert payment Provider user");
+
+        store
+            .client_market_update_payment_profile(&supplier, &[custom_payment_method()], None)
+            .await
+            .expect("configure payment Provider profile");
+
+        let conn = store.conn.lock().await;
+        let (host_market_provider_id, profile_user_id): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT host.market_provider_id, profile.user_id
+                 FROM host_provider_profiles host
+                 LEFT JOIN market_provider_profiles profile
+                   ON profile.id = host.market_provider_id
+                 WHERE host.provider_id = ?1",
+                params![supplier.user_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read immediate Market Provider binding");
+        assert!(host_market_provider_id.is_some());
+        assert_eq!(profile_user_id.as_deref(), Some(supplier.user_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn client_market_update_payment_profile_rolls_back_on_identity_conflict() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let supplier = session("conflicted-payment", "conflicted-payment@example.com");
+        {
+            let conn = store.conn.lock().await;
+            conn.execute_batch(
+                "INSERT INTO users (id, email_normalized, status, created_at, last_login_at)
+                 VALUES ('conflicted-payment', 'conflicted-payment@example.com',
+                         'active', 'now', 'now');
+                 INSERT INTO market_provider_profiles (
+                    id, user_id, canonical_email, display_name, claim_state,
+                    status, created_at, updated_at, claimed_at
+                 ) VALUES (
+                    'mp_conflicted_user', 'conflicted-payment', 'former@example.com',
+                    'Former identity', 'claimed', 'active', 'now', 'now', 'now'
+                 ), (
+                    'mp_conflicted_email', NULL, 'conflicted-payment@example.com',
+                    'Email identity', 'unclaimed', 'active', 'now', 'now', NULL
+                 );
+                 INSERT INTO market_provider_aliases (
+                    market_provider_id, alias_kind, alias_value, created_at
+                 ) VALUES (
+                    'mp_conflicted_user', 'user_id', 'conflicted-payment', 'now'
+                 ), (
+                    'mp_conflicted_email', 'email', 'conflicted-payment@example.com', 'now'
+                 );",
+            )
+            .expect("seed conflicting Market Provider identities");
+        }
+
+        assert!(matches!(
+            store
+                .client_market_update_payment_profile(&supplier, &[custom_payment_method()], None)
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+
+        let conn = store.conn.lock().await;
+        let payment_profiles: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM account_payment_profiles WHERE user_id = ?1",
+                params![supplier.user_id],
+                |row| row.get(0),
+            )
+            .expect("count rolled-back payment profiles");
+        let host_profiles: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM host_provider_profiles WHERE provider_id = ?1",
+                params![supplier.user_id],
+                |row| row.get(0),
+            )
+            .expect("count rolled-back Host Provider profiles");
+        let fenced_profiles: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM market_provider_profiles
+                 WHERE id IN ('mp_conflicted_user', 'mp_conflicted_email')
+                   AND status = 'identity_conflict'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count durably fenced Market Provider identities");
+        let conflict_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM market_provider_identity_events
+                 WHERE event_kind = 'identity_conflict'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count durable Market Provider conflict events");
+        assert_eq!(payment_profiles, 0);
+        assert_eq!(host_profiles, 0);
+        assert_eq!(fenced_profiles, 2);
+        assert_eq!(conflict_events, 2);
     }
 
     #[tokio::test]

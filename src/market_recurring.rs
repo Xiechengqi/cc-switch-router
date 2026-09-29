@@ -73,6 +73,15 @@ pub struct RecurringFundingSummaryView {
     pub topup_unavailable_reason: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct RecurringRelationshipSummary {
+    pub active_contract_count: i64,
+    pub monthly_commitment_minor: i64,
+    pub next_renewal_at: Option<String>,
+    pub next_renewal_minor: i64,
+    pub next_funding_required_minor: i64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecurringContractView {
@@ -137,6 +146,71 @@ pub(crate) fn router() -> Router<ServerState> {
 
 fn map_db(context: &'static str) -> impl FnOnce(crate::db::Error) -> AppError {
     move |error| AppError::Internal(format!("{context} failed: {error}"))
+}
+
+pub(crate) fn recurring_relationship_summary(
+    conn: &Connection,
+    buyer_user_id: &str,
+    supplier_user_id: &str,
+) -> Result<RecurringRelationshipSummary, AppError> {
+    let (active_contract_count, monthly_commitment_minor, next_renewal_at) = conn
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(cycle_price_minor), 0),
+                    MIN(CASE WHEN renewal_status NOT IN ('cancel_at_period_end', 'ended')
+                             THEN current_period_end END)
+             FROM market_recurring_contracts
+             WHERE buyer_user_id = ?1 AND supplier_user_id = ?2
+               AND status NOT IN ('ended', 'activation_failed')",
+            params![buyer_user_id, supplier_user_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .map_err(map_db("read recurring relationship summary"))?;
+    let next_renewal_minor = if let Some(next_at) = next_renewal_at.as_deref() {
+        conn.query_row(
+            "SELECT COALESCE(SUM(cycle_price_minor), 0)
+             FROM market_recurring_contracts
+             WHERE buyer_user_id = ?1 AND supplier_user_id = ?2
+               AND status NOT IN ('ended', 'activation_failed')
+               AND renewal_status NOT IN ('cancel_at_period_end', 'ended')
+               AND current_period_end = ?3",
+            params![buyer_user_id, supplier_user_id, next_at],
+            |row| row.get(0),
+        )
+        .map_err(map_db("read next recurring renewal amount"))?
+    } else {
+        0
+    };
+    let next_funding_required_minor = conn
+        .query_row(
+            "SELECT COALESCE(SUM(cycle_price_minor), 0)
+             FROM market_recurring_contracts
+             WHERE buyer_user_id = ?1 AND supplier_user_id = ?2
+               AND status NOT IN ('ended', 'activation_failed')
+               AND renewal_status = 'funding_required'
+               AND current_period_end = (
+                   SELECT MIN(current_period_end)
+                   FROM market_recurring_contracts
+                   WHERE buyer_user_id = ?1 AND supplier_user_id = ?2
+                     AND status NOT IN ('ended', 'activation_failed')
+                     AND renewal_status = 'funding_required'
+               )",
+            params![buyer_user_id, supplier_user_id],
+            |row| row.get(0),
+        )
+        .map_err(map_db("read next unfunded recurring renewal amount"))?;
+    Ok(RecurringRelationshipSummary {
+        active_contract_count,
+        monthly_commitment_minor,
+        next_renewal_at,
+        next_renewal_minor,
+        next_funding_required_minor,
+    })
 }
 
 fn parse_time(value: &str) -> Result<DateTime<Utc>, AppError> {
@@ -2699,6 +2773,35 @@ mod tests {
         let next = next_calendar_month_at(at("2025-12-30T01:02:03.123Z"), 30).unwrap();
         assert_eq!(next, at("2026-01-30T01:02:03.123Z"));
         assert_eq!(next.nanosecond(), 123_000_000);
+    }
+
+    #[tokio::test]
+    async fn relationship_summary_distinguishes_funded_and_unfunded_renewals() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let starts_at = at("2026-09-01T12:00:00Z");
+        create_test_contract(&store, "manual-summary", RENEWAL_MANUAL, 1, starts_at).await;
+        create_test_contract(&store, "automatic-summary", RENEWAL_AUTOMATIC, 2, starts_at).await;
+
+        let conn = store.conn.lock().await;
+        let manual = recurring_relationship_summary(
+            &conn,
+            "buyer-manual-summary",
+            "supplier-manual-summary",
+        )
+        .expect("summarize manual renewal");
+        assert_eq!(manual.active_contract_count, 1);
+        assert_eq!(manual.next_renewal_minor, 1_000);
+        assert_eq!(manual.next_funding_required_minor, 1_000);
+
+        let automatic = recurring_relationship_summary(
+            &conn,
+            "buyer-automatic-summary",
+            "supplier-automatic-summary",
+        )
+        .expect("summarize funded automatic renewal");
+        assert_eq!(automatic.active_contract_count, 1);
+        assert_eq!(automatic.next_renewal_minor, 1_000);
+        assert_eq!(automatic.next_funding_required_minor, 0);
     }
 
     #[tokio::test]

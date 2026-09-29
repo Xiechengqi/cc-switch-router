@@ -8044,6 +8044,8 @@ mod tests {
             ip_blacklist: String::new(),
             free_share_ip_parallel_limit: 1,
             market_usd_cny_rate_micros: crate::market_billing::DEFAULT_USD_CNY_RATE_MICROS,
+            market_provider_recommendation_mode:
+                crate::config::MarketProviderRecommendationMode::Shadow,
             ip_intel_endpoints: Vec::new(),
             verification_service_base_url: "https://tokenswitch.org".into(),
             verification_service_api_key: None,

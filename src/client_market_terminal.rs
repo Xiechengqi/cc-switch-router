@@ -683,6 +683,7 @@ mod tests {
         RouterSshHostRecord {
             id: "host-1".into(),
             provider_id: Some("provider-1".into()),
+            market_provider_id: Some("mp_provider_1".into()),
             ip: "203.0.113.10".into(),
             port: 22,
             host_owner_email: "host@example.com".into(),

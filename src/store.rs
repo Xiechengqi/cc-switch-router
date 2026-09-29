@@ -1702,6 +1702,10 @@ impl AppStore {
                 .map_err(|e| AppError::Internal(format!("enable sqlite WAL failed: {e}")))?;
         }
         crate::schema::apply(&conn)?;
+        // Provider reconciliation and rank generation can scan years of market
+        // history. They run immediately in the supervised background task so a
+        // large marketplace cannot delay Router startup; public rank endpoints
+        // remain fail-closed until the first complete generation is published.
         // Fail-closed, like the baseline checksum: a half-loaded price catalog
         // would render plausible numbers that are wrong (§5.4).
         let pricing_catalog = crate::model_price_catalog::load(&conn, Utc::now().timestamp())?;
@@ -6720,13 +6724,28 @@ impl AppStore {
             .transaction()
             .map_err(|e| AppError::Internal(format!("begin owner email change failed: {e}")))?;
         let new_owner = upsert_user_by_email(&tx, &new_email, now)?;
-        let updated_shares = rebind_installation_shares_to_owner(
+        let mut market_provider_identity_conflict = None;
+        let updated_shares = match rebind_installation_shares_to_owner(
             &tx,
             &input.installation_id,
             &new_owner.id,
             &new_email,
             now,
-        )?;
+            &mut market_provider_identity_conflict,
+        ) {
+            Ok(updated) => updated,
+            Err(error) => {
+                drop(tx);
+                if let Some(conflict) = market_provider_identity_conflict {
+                    crate::market_provider_identity::persist_market_provider_identity_conflict(
+                        &conn,
+                        &conflict,
+                        &now.to_rfc3339(),
+                    )?;
+                }
+                return Err(error);
+            }
+        };
         tx.execute(
             "UPDATE installations
                  SET owner_email = ?2, owner_verified_at = ?3
@@ -24530,6 +24549,9 @@ fn rebind_installation_shares_to_owner(
     new_owner_user_id: &str,
     new_owner: &str,
     now: DateTime<Utc>,
+    market_provider_identity_conflict: &mut Option<
+        crate::market_provider_identity::MarketProviderIdentityConflict,
+    >,
 ) -> Result<usize, AppError> {
     let mut statement = conn
         .prepare(
@@ -24601,6 +24623,7 @@ fn rebind_installation_shares_to_owner(
                 new_owner_user_id,
                 new_owner,
                 &now.to_rfc3339(),
+                market_provider_identity_conflict,
             )?;
         }
         updated += changed;
@@ -28856,6 +28879,8 @@ mod tests {
             ip_blacklist: String::new(),
             free_share_ip_parallel_limit: 1,
             market_usd_cny_rate_micros: crate::market_billing::DEFAULT_USD_CNY_RATE_MICROS,
+            market_provider_recommendation_mode:
+                crate::config::MarketProviderRecommendationMode::Shadow,
             ip_intel_endpoints: Vec::new(),
             verification_service_base_url: "https://tokenswitch.org".into(),
             verification_service_api_key: None,

@@ -2,8 +2,69 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   encodeHostTransferDocument,
+  hostMatchesMarketProvider,
   parseHostTransferLines,
+  persistedClientMarketProviderSelection,
+  recommendedClientMarketProviderId,
 } from "./host-utils";
+import type { ClientMarketProvider } from "@/lib/types";
+
+function provider(providerId: string, freeIdle: number): ClientMarketProvider {
+  return {
+    providerId,
+    rankState: "ranked",
+    ownerEmail: `${providerId}@example.com`,
+    official: providerId === "official",
+    joinedAt: "2026-01-01T00:00:00Z",
+    offerStableSince: "2026-01-01T00:00:00Z",
+    hostTotal: freeIdle,
+    idleTotal: freeIdle,
+    allocatedTotal: 0,
+    allocationRate: 0,
+    freeHostTotal: freeIdle,
+    freeAllocatedTotal: 0,
+    paidHostTotal: 0,
+    paidAllocatedTotal: 0,
+    externalClientOwnerTotal: 0,
+    externalClientsOver3Days: 0,
+    externalClientsOver30Days: 0,
+    anomalousHostRate: 0,
+    successfulAllocations: 0,
+    paymentMethodKinds: [],
+    countries: [],
+  };
+}
+
+test("Client creation applies Provider rank only in on mode", () => {
+  const ranked = provider("ranked", 1);
+  const official = provider("official", 1);
+  const ordered = [ranked, official];
+  assert.equal(recommendedClientMarketProviderId(ordered, "official", "off"), "official");
+  assert.equal(recommendedClientMarketProviderId(ordered, "official", "shadow"), "official");
+  assert.equal(recommendedClientMarketProviderId(ordered, "official", "on"), "ranked");
+
+  assert.equal(
+    recommendedClientMarketProviderId([provider("full", 0), ranked], "official", "on"),
+    "ranked",
+  );
+  assert.equal(recommendedClientMarketProviderId([provider("full", 0)], undefined, "on"), undefined);
+
+  assert.deepEqual(
+    persistedClientMarketProviderSelection(["ranked"], ordered),
+    { mode: "custom", providerIds: ["ranked"] },
+  );
+  assert.deepEqual(
+    persistedClientMarketProviderSelection(["official"], ordered),
+    { mode: "custom", providerIds: ["official"] },
+  );
+});
+
+test("Client Market Provider deep-link filter fails closed for unbound hosts", () => {
+  assert.equal(hostMatchesMarketProvider({ marketProviderId: "mp_selected" }, "mp_selected"), true);
+  assert.equal(hostMatchesMarketProvider({ marketProviderId: "mp_other" }, "mp_selected"), false);
+  assert.equal(hostMatchesMarketProvider({}, "mp_selected"), false);
+  assert.equal(hostMatchesMarketProvider({}, undefined), true);
+});
 
 test("host transfer text preserves legacy and calendar-month pricing", () => {
   const parsed = parseHostTransferLines([

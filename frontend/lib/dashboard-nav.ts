@@ -1,6 +1,7 @@
 export const DASHBOARD_CLIENTS_PATH = "/clients/";
 export const DASHBOARD_SHARE_MARKET_PATH = "/share-market/";
 export const DASHBOARD_CLIENT_MARKET_PATH = "/client-market/";
+export const DASHBOARD_PROVIDERS_PATH = "/providers/";
 export const DASHBOARD_ACCOUNT_PATH = "/account/";
 export const DASHBOARD_ACCOUNT_API_KEYS_PATH = "/account/api-keys/";
 export const DASHBOARD_ACCOUNT_NOTIFICATIONS_PATH = "/account/notifications/";
@@ -19,6 +20,7 @@ export type DashboardRoute =
   | typeof DASHBOARD_CLIENTS_PATH
   | typeof DASHBOARD_SHARE_MARKET_PATH
   | typeof DASHBOARD_CLIENT_MARKET_PATH
+  | typeof DASHBOARD_PROVIDERS_PATH
   | typeof DASHBOARD_ACCOUNT_PATH
   | typeof DASHBOARD_ACCOUNT_API_KEYS_PATH
   | typeof DASHBOARD_ACCOUNT_NOTIFICATIONS_PATH
@@ -31,7 +33,7 @@ export type DashboardRoute =
   | typeof DASHBOARD_ACCOUNT_SHARE_PATH
   | typeof DASHBOARD_ACCOUNT_CLIENT_PATH
   | typeof DASHBOARD_ACCOUNT_RENTALS_PATH;
-export type DashboardShellActive = "clients" | "share-market" | "client-market" | "account" | "settings" | "operations" | "metrics";
+export type DashboardShellActive = "clients" | "share-market" | "client-market" | "providers" | "account" | "settings" | "operations" | "metrics";
 
 export function normalizeDashboardPath(pathname: string): DashboardRoute | null {
   if (pathname.startsWith("/account/rentals")) return DASHBOARD_ACCOUNT_RENTALS_PATH;
@@ -47,6 +49,7 @@ export function normalizeDashboardPath(pathname: string): DashboardRoute | null 
   if (pathname.startsWith("/account/notifications")) return DASHBOARD_ACCOUNT_NOTIFICATIONS_PATH;
   if (pathname.startsWith("/account")) return DASHBOARD_ACCOUNT_PATH;
   if (pathname.startsWith("/client-market")) return DASHBOARD_CLIENT_MARKET_PATH;
+  if (pathname.startsWith("/providers")) return DASHBOARD_PROVIDERS_PATH;
   if (pathname.startsWith("/share-market")) return DASHBOARD_SHARE_MARKET_PATH;
   // Keep old Token Market bookmarks safe, but land them on the built-in
   // Share Market rather than exposing a retired registry state.
@@ -79,6 +82,7 @@ export function buildDashboardHref(route: DashboardRoute, params?: URLSearchPara
 export function pathnameForDashboardShell(pathname: string): DashboardShellActive {
   if (pathname.startsWith("/account")) return "account";
   if (pathname.startsWith("/client-market")) return "client-market";
+  if (pathname.startsWith("/providers")) return "providers";
   if (pathname.startsWith("/share-market")) return "share-market";
   if (pathname.startsWith("/markets")) return "share-market";
   if (pathname.startsWith("/clients")) return "clients";
@@ -98,6 +102,10 @@ export function isClientMarketRoute(pathname: string) {
 
 export function isShareMarketRoute(pathname: string) {
   return pathname.startsWith("/share-market");
+}
+
+export function isProvidersRoute(pathname: string) {
+  return pathname.startsWith("/providers");
 }
 
 export const ACCOUNT_NAV_STORAGE_KEY = "cc_switch_router_account_nav_v1";
@@ -158,14 +166,26 @@ export function clientMarketMineHref(installationId?: string) {
   return buildDashboardHref(DASHBOARD_CLIENT_MARKET_PATH, params);
 }
 
+/** Deep-link into Client Market, optionally filtering to one public Market Provider. */
+export function clientMarketHref(options?: { providerId?: string }) {
+  const params = new URLSearchParams();
+  if (options?.providerId) params.set("provider", options.providerId);
+  return buildDashboardHref(DASHBOARD_CLIENT_MARKET_PATH, params);
+}
+
 export type ShareMarketWorkspaceParam = "catalog" | "rentals" | "selling";
 
 /** Deep-link into Share Market, optionally selecting a workspace and focusing a share. */
-export function shareMarketHref(options?: { workspace?: ShareMarketWorkspaceParam; shareId?: string }) {
+export function shareMarketHref(options?: {
+  workspace?: ShareMarketWorkspaceParam;
+  shareId?: string;
+  providerId?: string;
+}) {
   const params = new URLSearchParams();
   if (options?.workspace && options.workspace !== "catalog") {
     params.set("view", options.workspace);
   }
   if (options?.shareId) params.set("focus", options.shareId);
+  if (options?.providerId) params.set("provider", options.providerId);
   return buildDashboardHref(DASHBOARD_SHARE_MARKET_PATH, params);
 }

@@ -1,4 +1,11 @@
-import type { ClientMarketHost, ClientMarketHostTransferDocument, HostIpIntel } from "@/lib/types";
+import type {
+  ClientMarketHost,
+  ClientMarketHostTransferDocument,
+  ClientMarketProvider,
+  CreateClientSelectionPersist,
+  HostIpIntel,
+  MarketProviderRecommendationMode,
+} from "@/lib/types";
 import type { MessageKey } from "@/lib/i18n";
 import { ApiError } from "@/lib/api";
 import { formatUsdMoney, MARKET_CURRENCY } from "@/lib/market-money";
@@ -76,6 +83,49 @@ export function containsCjk(value: string) {
 
 export function hostDisplayLabel(host: ClientMarketHost) {
   return host.hostname || host.ip || host.id.slice(0, 8);
+}
+
+export function hostMatchesMarketProvider(
+  host: Pick<ClientMarketHost, "marketProviderId">,
+  marketProviderId?: string,
+) {
+  return !marketProviderId || host.marketProviderId === marketProviderId;
+}
+
+function providerFreeIdle(provider: ClientMarketProvider) {
+  if (typeof provider.countries?.[0]?.freeIdle === "number") {
+    return provider.countries.reduce((sum, country) => sum + (country.freeIdle || 0), 0);
+  }
+  return Math.max(0, (provider.freeHostTotal || 0) - (provider.freeAllocatedTotal || 0));
+}
+
+export function recommendedClientMarketProviderId(
+  providers: ClientMarketProvider[],
+  officialProviderId: string | undefined,
+  recommendationMode: MarketProviderRecommendationMode | string | undefined,
+) {
+  if (recommendationMode === "on") {
+    return providers.find((provider) => providerFreeIdle(provider) > 0)?.providerId;
+  }
+  return officialProviderId && providers.some((provider) => provider.providerId === officialProviderId)
+    ? officialProviderId
+    : undefined;
+}
+
+export function persistedClientMarketProviderSelection(
+  providerIds: string[],
+  providers: Pick<ClientMarketProvider, "providerId">[],
+): CreateClientSelectionPersist {
+  if (providerIds.length === 0) {
+    return {
+      mode: "custom",
+      providerIds: providers.map((provider) => provider.providerId),
+    };
+  }
+  // Every interaction is durable user intent. `official_default` is reserved
+  // for an untouched preference so a later off/shadow -> on rollout cannot
+  // silently replace a Provider the user explicitly selected beforehand.
+  return { mode: "custom", providerIds };
 }
 
 export function hostCanManage(host: ClientMarketHost, viewerEmail?: string | null) {

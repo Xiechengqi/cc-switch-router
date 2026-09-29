@@ -27,6 +27,9 @@ mod ip_blacklist_stats;
 mod ip_iq;
 mod market_access;
 mod market_billing;
+mod market_provider_identity;
+mod market_provider_rank;
+mod market_providers;
 mod market_recurring;
 mod metrics;
 mod model_price_catalog;
@@ -364,6 +367,7 @@ async fn main() -> Result<()> {
     let client_market_trade_state = state.clone();
     let share_market_state = state.clone();
     let market_billing_state = state.clone();
+    let market_provider_rank_store = state.store.clone();
     let binance_settlement_state = state.clone();
     let database_sync_store = state.store.clone();
     let shutdown_database_sync_store = state.store.clone();
@@ -625,6 +629,38 @@ async fn main() -> Result<()> {
             Ok::<_, anyhow::Error>(())
         },
     );
+    let market_provider_rank_task = spawn_background_task(
+        "Market Provider rank",
+        background_shutdown_rx.clone(),
+        async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(
+                crate::market_provider_rank::REFRESH_INTERVAL_SECS,
+            ));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Consume Tokio's immediate first tick, then publish once before
+            // waiting for the normal refresh interval.
+            interval.tick().await;
+            loop {
+                match market_provider_rank_store
+                    .refresh_market_provider_rank(chrono::Utc::now())
+                    .await
+                {
+                    Ok(providers) => tracing::debug!(
+                        providers,
+                        algorithm = crate::market_provider_rank::ALGORITHM_VERSION,
+                        "published Market Provider rank"
+                    ),
+                    Err(error) => tracing::warn!(
+                        error = %error,
+                        "Market Provider rank refresh failed; retaining last published generation"
+                    ),
+                }
+                interval.tick().await;
+            }
+            #[allow(unreachable_code)]
+            Ok::<_, anyhow::Error>(())
+        },
+    );
     let request_log_recovery_task = spawn_background_task(
         "Share request log recovery",
         background_shutdown_rx.clone(),
@@ -879,6 +915,7 @@ async fn main() -> Result<()> {
         ("Share model health", model_health_task),
         ("Share request log recovery", request_log_recovery_task),
         ("Share listing usage rollup", usage_rollup_task),
+        ("Market Provider rank", market_provider_rank_task),
         ("Resend usage refresh", resend_usage_task),
         ("metrics collector", metrics_task),
         ("clock health", clock_health_task),

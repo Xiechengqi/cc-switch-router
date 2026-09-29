@@ -140,6 +140,12 @@ idle ──► locked ──► allocated ──► draining ──► idle
 
 **准入与支付均和 Share Market 共用统一机制**:免费 Host 使用独立的 `client_host/free` 作用域，默认黑名单；可配置 1–365 天固定期限或永久，期限在 Client provisioning 成功后才开始，到期复用安全 cleanup。付费 Host 使用默认白名单的 `client_host/paid` 作用域，还要求买家获得 USD 私有额度，或在该付费作用域切为黑名单后使用有限公共额度。付费 Host 以固定 USD 每日价格提供,先享受 12 小时健康服务时长试用,之后只按 Router 观测到的健康区间累计费用。同一买家和 Host Provider 下的 Host 与 Share 共用 USD 余额,按买家额度出账。Router 只记录链下付款声明,供应商独立核验到账后确认；只有确认到账或管理员作废账单才会解除对应逾期限制。Provider 租用自己的付费 Host 时按免费处理,不会形成自债务。
 
+### ④ Provider Rank —— 跨市场供应商发现
+
+Market Provider 是 Share owner、Host Provider 与其资金/合同关系的稳定市场身份，不等同于 Server 的 Claude/OpenAI 等 upstream Provider type。Migration 52 以 opaque `mp_*` ID 和 alias ledger 归并两个市场；冲突身份 fail closed，不向公开 API 暴露邮箱、Router user ID 或资金。
+
+Provider Rank v1 每 15 分钟把服务质量、有效买家选择、履约和供给广度按 `45/30/15/10` 生成一个原子代次。3 个不同 Router 买家账户和 7 个观测日是正式排名门槛（账户去重不是 KYC 证明）；TTFT/TPS 仅展示，官方身份和探索插入均不改变正式分数或名次。生成失败继续读取 last-good，超过两个刷新周期标记 stale。推荐使用 `off/shadow/on` 渐进发布，默认 `shadow`。完整身份、评分、API、资金去重和发布契约见 [docs/provider-ranking.md](docs/provider-ranking.md)。
+
 ### Router 联邦 —— 横向扩展
 
 未来外部容量消费者将以 Gateway 身份按 Router 分别注册，并通过版本化 grant 读取该 Router 的 Share capacity、查询已授权 headroom、反馈已授权 Share 的运行状态或使用签名 proxy。当前 grant contract 尚未形成，普通 Share 可见集为空并整体 fail-closed。observation 只允许保存 Gateway principal、已授权 Share/model、状态、延迟、token 数和地域；不保存下游用户/API key、USD 价格、余额或 settlement。Gateway 不跨 Router 共享 Router-local session。
@@ -233,7 +239,7 @@ Router 转发到 Client 时,会在签名头旁再写一个**不参与签名**的
 
 ## 5. 数据层
 
-业务库与 metrics 库分离。最终 schema 当前有 128 张非 SQLite 内部表（包含 `schema_migrations`）；数量由 fresh-schema 测试固定。
+业务库与 metrics 库分离。业务 schema 由冻结 baseline 与顺序 migration 管理；当前最新版本为 52。
 
 **数据库模式**:
 
@@ -259,6 +265,7 @@ Router 转发到 Client 时,会在签名头旁再写一个**不参与签名**的
 | 统一市场账务 | `supplier_billing_profiles`、`market_credit_accounts`、`market_service_contracts`、`market_service_intervals`、`market_accrual_entries`、`market_invoices`、`market_invoice_lines`、`market_payment_*`、`market_billing_*`、`market_credit_restrictions` |
 | 主机市场 | `router_ssh_hosts`、`client_market_subscriptions`、`account_payment_*` |
 | 联邦与市场 | `router_gateways`、`share_market_listings`、`share_market_seats`、`share_market_subscriptions`；旧 registry/live/archive 表均已由 migration 21 物理删除 |
+| 市场供应商身份与排名 | `market_provider_profiles`、`market_provider_aliases`、`market_provider_identity_events`、`market_provider_share_windows`、`market_provider_effective_selections`、`market_provider_rank_generations`、`market_provider_rank_entries` |
 | 通知 | `installation_notification_state`、`client_notification_events`、`client_notification_runtime`、`notification_deliveries`、`notification_delivery_items`、`notification_delivery_attempts`、`user_notification_channels`、`telegram_bot_runtime`、`telegram_bind_tokens`、`telegram_inbound_updates`、`telegram_poll_cursors`、`bark_binding_attempts`、`bark_provider_runtime` |
 | 运维告警信号 | `operator_alert_signal_outbox` |
 | 聊天 | `chat_rooms`、`chat_messages`、`chat_visits`、`share_presence_state`、`client_chat_system_outbox`、`chat_public_payment_assets`、`chat_rate_limit`、`chat_email_events`、`chat_email_deliveries`、`chat_email_delivery_items` |
@@ -325,6 +332,7 @@ Router 从不改写 Server 返回的 descriptor,只做校验;若客户端只部�
 | `client_market_trade_task` | 20s | Client Market 报价、免费期限、释放与清理状态对账 |
 | `share_market_task` | 5s | managed grant、免费期限与 Share 租约状态对账 |
 | `market_billing_task` | 5s | 健康时长计费、阈值出账、最终账单、逾期限制和控制动作重试 |
+| `Market Provider rank` | 启动后立即，随后 15min | 跨 Share/Client/资金关系归并 Provider 身份，原子发布排名代次；失败保留 last-good |
 | `ip_blacklist_log_task` | 600s | 黑名单统计落日志 |
 
 **关停**:收到 SIGTERM 后先停 HTTP 接入并排空最多 30 秒,再关 SSH listener(5 秒)。

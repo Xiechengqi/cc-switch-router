@@ -2108,6 +2108,7 @@ export type MarketBillingInterval = "calendar_month" | string;
 export type ClientMarketHost = {
   id: string;
   providerId?: string;
+  marketProviderId?: string;
   ip?: string;
   port?: number;
   hostOwnerEmail: string;
@@ -2842,8 +2843,14 @@ export type ClientMarketProviderCountry = {
   freeTotal: number;
 };
 
+export type MarketProviderRecommendationMode = "off" | "shadow" | "on";
+
 export type ClientMarketProvider = {
   providerId: string;
+  marketProviderId?: string;
+  rankState?: "ranked" | "collecting" | "unranked" | string;
+  rankPosition?: number;
+  providerScoreBps?: number;
   ownerEmail: string;
   official: boolean;
   joinedAt: string;
@@ -2873,7 +2880,125 @@ export type ClientMarketProvider = {
 export type ClientMarketProviderSupply = {
   routerOwnerEmail?: string;
   officialProviderId?: string;
+  recommendationMode?: MarketProviderRecommendationMode | string;
   providers: ClientMarketProvider[];
+};
+
+export type MarketProviderRankGeneration = {
+  id: string;
+  algorithmVersion: string;
+  publishedAt: string;
+  stale: boolean;
+  weights: {
+    serviceQuality: number;
+    effectiveChoice: number;
+    fulfillment: number;
+    supplyBreadth: number;
+  };
+  minimumIndependentBuyers: number;
+  minimumObservationDays: number;
+};
+
+export type MarketProvider = {
+  id: string;
+  displayName: string;
+  official: boolean;
+  status: string;
+  rankState: "ranked" | "collecting" | string;
+  rankPosition?: number;
+  scoreBps?: number;
+  components: {
+    serviceQualityBps: number;
+    effectiveChoiceBps: number;
+    fulfillmentBps: number;
+    supplyBreadthBps: number;
+  };
+  independentBuyerCount: number;
+  observationDays: number;
+  inventory: {
+    activeShareCount: number;
+    availableShareSeats: number;
+    hostTotal: number;
+    idleHostTotal: number;
+    countryCount: number;
+    appCount: number;
+    hasShareMarket: boolean;
+    hasClientMarket: boolean;
+  };
+  quality: {
+    shareProbeSuccesses: number;
+    shareProbeTotal: number;
+    hostOnlineSamples: number;
+    hostObservedSamples: number;
+    fulfillmentSuccesses: number;
+    fulfillmentTotal: number;
+  };
+  performance: {
+    averageTtftMs?: number;
+    averageTps?: number;
+    displayOnly: boolean;
+  };
+  paymentMethodKinds: string[];
+  exploration: boolean;
+  joinedAt: string;
+};
+
+export type MarketProviderList = {
+  generation: MarketProviderRankGeneration;
+  providers: MarketProvider[];
+};
+
+export type MarketProviderDetail = MarketProvider & {
+  shareSupply: Array<{
+    listingId: string;
+    shareName: string;
+    apps: string[];
+    availableSeats: number;
+    totalSeats: number;
+  }>;
+  clientSupply: Array<{
+    countryCode: string;
+    idleHosts: number;
+    totalHosts: number;
+  }>;
+};
+
+export type MyMarketProviderFunding = {
+  marketProviderId: string;
+  displayName: string;
+  official: boolean;
+  supplierUserId: string;
+  supplierEmail: string;
+  currency: "USD" | string;
+  shareFunding: MarketFundingSummary;
+  clientFunding: MarketFundingSummary;
+  shareLegacyDailyRateMinor: number;
+  clientLegacyDailyRateMinor: number;
+  recurring: {
+    activeContractCount: number;
+    monthlyCommitmentMinor: number;
+    nextRenewalAt?: string;
+    nextRenewalMinor: number;
+    topupFunding?: MarketRecurringFundingSummary;
+  };
+};
+
+export type MyMarketProviderFundingResponse = {
+  totals: {
+    currency: "USD" | string;
+    providerCount: number;
+    prepaidBalanceMinor: number;
+    prepaidHeldMinor: number;
+    prepaidAvailableMinor: number;
+    creditOutstandingMinor: number;
+    finiteCreditAvailableMinor: number;
+    unlimitedCreditProviderCount: number;
+    legacyDailyRateMinor: number;
+    monthlyCommitmentMinor: number;
+    nextRenewalAt?: string;
+    nextRenewalMinor: number;
+  };
+  providers: MyMarketProviderFunding[];
 };
 
 export type ClientMarketQuoteItem = {
@@ -3243,6 +3368,10 @@ export type ShareMarketReliability = {
 
 export type ShareMarketListing = {
   id: string;
+  marketProviderId?: string;
+  rankState?: "ranked" | "collecting" | "unranked" | string;
+  rankPosition?: number;
+  providerScoreBps?: number;
   shareId: string;
   installationId: string;
   shareName: string;
@@ -3281,6 +3410,7 @@ export type ShareMarketListing = {
 export type ShareMarketCatalog = {
   listings: ShareMarketListing[];
   trialHours: number;
+  recommendationMode?: MarketProviderRecommendationMode | string;
 };
 
 export type ShareMarketRentAppService = {

@@ -367,6 +367,22 @@ Share 与 Client Host 的新租用都执行供应商准入，但策略按「产�
 
 Client Host 继续使用独立的免费期限契约：Host 创建、编辑与导入接口接受 `freeDurationDays=1..365` 或 `null`（永久），付费 Host 拒绝该字段。Allocation Quote 冻结期限和 `offerRevision`；倒计时从 Client provisioning 成功、订阅写入 `activatedAt` 时开始。到期前 24 小时只产生一次临期事件，到期后 Router 以 `free_period_expired` 调用现有安全 cleanup。清理失败时租约保持 `release_failed` 且 Host 继续隔离，不会错误回到 `idle`。
 
+### 7.2.1 Market Provider identity 与排名 API
+
+这里的 Market Provider 是 Router 市场供应商主体，不是 Share descriptor 中的 upstream Provider 配置。公开身份使用稳定 opaque `mp_*` ID；Host/Share/资金 alias 只在 Router 内部归并。身份冲突不得按邮箱或显示名猜测，公开 wire 不得返回 canonical email、Router user ID、supplier user ID、余额、信用或合同金额。
+
+| 方法 | 路径 | 契约 |
+|---|---|---|
+| `GET` | `/v1/market-providers` | 公开当前 last-good generation 和 Provider 排名列表；strong ETag，允许 public cache |
+| `GET` | `/v1/market-providers/:id` | 公开 Provider 详情、Share listing 与 Client Host 国家供给 |
+| `GET` | `/v1/market-providers/me/funding` | 必须有 Router 用户 Session；只返回当前买家的 Provider 资金关系，`private, no-store` |
+
+v1 权重固定为服务质量 45%、有效选择 30%、履约 15%、供给广度 10%；正式名次要求至少 3 个不同 Router 买家账户和 7 个观测日。免费选择权重为付费选择的 0.25；pending Share grant、自租和一天内释放不算有效选择，`grant_failed` 进入履约失败分母。自租按用户 ID 和双方 canonical email 双重排除；Share 历史质量、选择、履约和性能按显式的 listing Provider 半开时间窗归属，关闭、重开或换主不会移动旧证据；当前供给只统计与公开 catalog 一致的 active Share/可见 seat。这里的账户去重不是 KYC 或完整反女巫证明。TTFT/TPS 明确为 display-only。官方身份没有 score boost，探索展示不改写 `rankPosition`。
+
+一个 generation 只有在完整 entries 与 `published` 状态同事务提交后才可见。`building` 或 `failed` generation 不得替换 last-good；超过 30 分钟只标记 `stale`，不能用不完整新数据覆盖。没有任何已发布代次时端点返回 503。推荐模式由 `CC_SWITCH_ROUTER_MARKET_PROVIDER_RECOMMENDATION_MODE=off|shadow|on` 控制，默认 `shadow`；Share/Client 响应携带 `recommendationMode`，只有 `on` 改变推荐顺序，显式价格/空闲/在线率排序不受影响。
+
+私有资金汇总按「买家 + Market Provider」去重共享的预付余额和信用；Share/Client daily rate 分别相加，calendar-month contract 按合同汇总。无限信用返回 Provider 数，不转换为虚构金额。完整算法和运维边界见 [docs/provider-ranking.md](docs/provider-ranking.md)。
+
 ### 7.3 Share / Client Market 统一后付费
 
 付费 Share 与 Client Host 不再按单个商品预付或续费。Router 按「买家 + 供应商」维护唯一 USD 赊账账户；每个服务独立享受 12 小时健康时长试用,之后按固定 USD 每日价格和实际健康秒数累计。有限额度使用达到 80% 时向买卖双方各发送一次预警,用满后自动生成聚合账单。买家主动清账、供应商要求清账、供应商永久关闭赊账账户或最后一个服务结束时也会生成聚合账单。
