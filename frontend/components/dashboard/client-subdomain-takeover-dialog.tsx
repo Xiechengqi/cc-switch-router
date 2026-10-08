@@ -31,13 +31,21 @@ export function ClientSubdomainTakeoverDialog({
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
   const [confirmation, setConfirmation] = React.useState("");
+  const activeTargetId = React.useRef<string | null>(null);
 
   React.useEffect(() => {
-    if (!open) return;
-    setSourceId(sources[0]?.installation.id || "");
-    setConfirmation("");
-    setError("");
-  }, [open, sources]);
+    if (!open || !target) {
+      activeTargetId.current = null;
+      return;
+    }
+    const targetChanged = activeTargetId.current !== target.installation.id;
+    activeTargetId.current = target.installation.id;
+    if (targetChanged || !sources.some((client) => client.installation.id === sourceId)) {
+      setSourceId(sources[0]?.installation.id || "");
+      setConfirmation("");
+      setError("");
+    }
+  }, [open, sourceId, sources, target]);
 
   const source = sources.find((client) => client.installation.id === sourceId) || null;
   const submit = async () => {
@@ -84,7 +92,11 @@ export function ClientSubdomainTakeoverDialog({
               {t("dashboard.subdomainTakeover.source")}
               <CompactSelect
                 value={sourceId}
-                onChange={setSourceId}
+                onChange={(next) => {
+                  setSourceId(next);
+                  setConfirmation("");
+                  setError("");
+                }}
                 options={sources.map((client) => ({
                   value: client.installation.id,
                   label: clientLabel(client),

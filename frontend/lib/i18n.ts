@@ -3129,6 +3129,7 @@ export const messages = {
     "dashboard.ttftTpsHint":
       "Latest 10 requests · valid TTFT samples: {ttftSamples} · valid TPS samples: {tpsSamples}",
     "dashboard.region": "Region",
+    "dashboard.copyClientIp": "Copy Client IP {ip}",
     "dashboard.runningDuration": "Running",
     "dashboard.totalTokens": "Tokens",
     "dashboard.clientRunningSince": "Registered at {date}",
@@ -6883,6 +6884,7 @@ export const messages = {
     "dashboard.ttftTpsHint":
       "最近 10 次请求 · TTFT 有效样本：{ttftSamples} · TPS 有效样本：{tpsSamples}",
     "dashboard.region": "地区",
+    "dashboard.copyClientIp": "复制 Client IP {ip}",
     "dashboard.runningDuration": "运行时长",
     "dashboard.totalTokens": "Token 总量",
     "dashboard.clientRunningSince": "自 {date} 注册",

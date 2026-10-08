@@ -442,6 +442,7 @@ function ClientCard({
   const sharesMetricTone = !enabledShareCount ? "default" : issueCount ? "danger" : degradedCount ? "warning" : "success";
   const subdomain = client.clientTunnel?.subdomain || "";
   const hasSubdomain = Boolean(subdomain.trim());
+  const clientIp = client.installation.publicIp?.trim();
   const identity = hasSubdomain ? subdomain : client.installation.id;
   const versionLabel = clientPlatformLabel(client);
   const showRemoval = state === "offline" && !!client.removalAt;
@@ -537,6 +538,13 @@ function ClientCard({
               label={t("dashboard.region")}
               value={clientRegionLabel(client.installation)}
               title={clientRegionIpTitle(client.installation)}
+              actionLabel={clientIp ? t("dashboard.copyClientIp", { ip: clientIp }) : undefined}
+              onValueClick={clientIp ? () => {
+                void navigator.clipboard.writeText(clientIp).then(
+                  () => toast.success(t("common.copySuccess")),
+                  () => toast.danger(t("common.copyFailed")),
+                );
+              } : undefined}
             />
             <Metric
               label={t("dashboard.runningDuration")}
@@ -589,12 +597,28 @@ function ClientCard({
   );
 }
 
-function Metric({ label, value, title, tone = "default", preserveValue = false }: { label: string; value: string; title?: string; tone?: "default" | "success" | "warning" | "danger"; preserveValue?: boolean }) {
+function Metric({ label, value, title, tone = "default", preserveValue = false, actionLabel, onValueClick }: { label: string; value: string; title?: string; tone?: "default" | "success" | "warning" | "danger"; preserveValue?: boolean; actionLabel?: string; onValueClick?: () => void }) {
   const color = tone === "success" ? "text-emerald-700" : tone === "warning" ? "text-amber-700" : tone === "danger" ? "text-rose-700" : "text-foreground";
+  const valueClassName = `text-xs font-semibold ${preserveValue ? "font-mono whitespace-nowrap tabular-nums" : "truncate"} ${color}`;
   return (
     <div className="grid min-w-0 gap-1" title={title}>
       <span className="font-mono text-[9px] uppercase tracking-[0.12em] text-slate-400">{label}</span>
-      <strong className={`text-xs font-semibold ${preserveValue ? "font-mono whitespace-nowrap tabular-nums" : "truncate"} ${color}`}>{value}</strong>
+      {onValueClick ? (
+        <button
+          type="button"
+          data-no-row-drawer
+          aria-label={actionLabel}
+          title={actionLabel}
+          onClick={(event) => {
+            event.stopPropagation();
+            onValueClick();
+          }}
+          className="inline-flex min-w-0 items-center justify-self-start gap-1 rounded text-left hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
+        >
+          <strong className={valueClassName}>{value}</strong>
+          <Copy className="h-3 w-3 shrink-0 text-slate-400" aria-hidden />
+        </button>
+      ) : <strong className={valueClassName}>{value}</strong>}
     </div>
   );
 }
