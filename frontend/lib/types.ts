@@ -992,9 +992,9 @@ export type AdminModelPriceListItem = {
   modelKey: string;
   displayName: string;
   priced: boolean;
-  source?: "derived" | "admin";
+  source?: "derived" | "admin" | null;
   discoveredFrom: Array<"catalog" | "share" | "usage" | "admin">;
-  effectiveFrom?: number;
+  effectiveFrom?: number | null;
   ratesMicrosPer1m?: AdminModelPriceRates;
 };
 
@@ -1009,7 +1009,7 @@ export type AdminModelPriceList = {
 
 export type AdminModelPriceHistoryItem = {
   effectiveFrom: number;
-  effectiveTo?: number;
+  effectiveTo?: number | null;
   displayName: string;
   source: "derived" | "admin";
   current: boolean;
