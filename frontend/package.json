@@ -13,6 +13,7 @@
     "typecheck": "tsc --noEmit",
     "test:operational-status": "tsx --test components/dashboard/operational-status.test.ts",
     "test:share-dashboard-utils": "tsx --test components/dashboard/share-dashboard-utils.test.ts",
+    "test:share-email-usage": "tsx --test components/dashboard/share-email-usage.test.tsx",
     "test:share-market": "tsx --test components/dashboard/share-market/buyer-catalog-utils.test.ts components/dashboard/share-market/owner-workspace-utils.test.ts components/dashboard/share-market/subscription-utils.test.ts",
     "test:token-units": "tsx --test lib/token-units.test.ts",
     "test:usd-micros": "tsx --test lib/usd-micros.test.ts",

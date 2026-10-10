@@ -8877,6 +8877,7 @@ impl AppStore {
         share_id: &str,
         period: &str,
     ) -> Result<ShareUsageByEmailResponse, AppError> {
+        let catalog = self.pricing_catalog();
         let window = normalize_usage_period(period)?;
         let period = window.period.clone();
         let bucket_granularity = window.bucket_granularity.clone();
@@ -8946,6 +8947,8 @@ impl AppStore {
             cache_creation_tokens: 0,
             total_tokens: 0,
             percent: 0.0,
+            equivalent_usd_micros: None,
+            priced_coverage_percent: 0.0,
             daily: bucket_keys
                 .iter()
                 .map(|bucket| ShareUsageDailyBucket {
@@ -9116,13 +9119,39 @@ impl AppStore {
             .values()
             .map(|row| row.total_tokens)
             .sum::<u64>();
+        // Price the same two disjoint request sources and the same window as
+        // the token table. The quota-window breakdown cannot be reused here.
+        let price_summaries = if total_tokens > 0 {
+            price_share_email_usage(
+                &conn,
+                &catalog,
+                share_id,
+                &start_rfc3339,
+                start_ts,
+                Utc::now().timestamp(),
+            )?
+        } else {
+            HashMap::new()
+        };
         let mut rows = rows_by_email.into_values().collect::<Vec<_>>();
+        let mut total_priced_tokens = 0_u64;
+        let mut total_equivalent_micros = 0_i128;
         for row in &mut rows {
             row.percent = if total_tokens > 0 {
                 (row.total_tokens as f64 / total_tokens as f64) * 100.0
             } else {
                 0.0
             };
+            if let Some(priced) = price_summaries.get(&row.email) {
+                let covered = priced.priced_tokens.min(row.total_tokens);
+                total_priced_tokens = total_priced_tokens.saturating_add(covered);
+                total_equivalent_micros =
+                    total_equivalent_micros.saturating_add(priced.amount_micros);
+                if covered > 0 {
+                    row.equivalent_usd_micros = Some(priced.amount_micros.to_string());
+                }
+                row.priced_coverage_percent = usage_priced_coverage(covered, row.total_tokens);
+            }
         }
         rows.sort_by(|a, b| {
             b.total_tokens
@@ -9137,6 +9166,9 @@ impl AppStore {
             bucket_granularity,
             days,
             total_tokens,
+            equivalent_usd_micros: (total_priced_tokens > 0)
+                .then(|| total_equivalent_micros.to_string()),
+            priced_coverage_percent: usage_priced_coverage(total_priced_tokens, total_tokens),
             rows,
         })
     }
@@ -20765,6 +20797,134 @@ struct UsageBreakdownGroup {
     unattributed: u64,
     request_count: u64,
     estimated_count: u64,
+}
+
+#[derive(Default)]
+struct ShareEmailPriceSummary {
+    amount_micros: i128,
+    priced_tokens: u64,
+}
+
+fn usage_priced_coverage(priced_tokens: u64, total_tokens: u64) -> f64 {
+    if total_tokens == 0 {
+        0.0
+    } else {
+        (priced_tokens.min(total_tokens) as f64 / total_tokens as f64) * 100.0
+    }
+}
+
+/// Price only tokens actually included in `share_usage_by_email`. Capacity
+/// observations supersede their matching Share logs; direct logs are included
+/// only when no capacity observation exists. The SQL deliberately mirrors the
+/// token endpoint's source selection and token-split fallback.
+fn price_share_email_usage(
+    conn: &Connection,
+    catalog: &crate::model_price_catalog::PricingCatalog,
+    share_id: &str,
+    start_rfc3339: &str,
+    start_ts: i64,
+    pricing_at: i64,
+) -> Result<HashMap<String, ShareEmailPriceSummary>, AppError> {
+    use crate::model_pricing::{ContextTier, ServiceTier, TokenSplit, price_usage_in_tier};
+
+    let capacity_input = capacity_log_input_tokens_expr("ml");
+    let capacity_total = capacity_log_total_tokens_expr("ml");
+    let sql = format!(
+        "SELECT email, model_key, tier_raw, input_tokens, output_tokens,
+                cache_read_tokens, cache_write_tokens FROM (
+           SELECT lower(trim(ml.user_email)) AS email,
+                  lower(COALESCE(NULLIF(trim(sl.actual_model), ''), NULLIF(trim(sl.model), ''), '')) AS model_key,
+                  lower(COALESCE(NULLIF(trim(sl.effective_service_tier), ''),
+                                 NULLIF(trim(sl.client_service_tier), ''), 'standard')) AS tier_raw,
+                  CASE WHEN ({capacity_total}) > 0 OR sl.request_id IS NULL
+                       THEN {capacity_input} ELSE COALESCE(sl.input_tokens, 0) END AS input_tokens,
+                  CASE WHEN ({capacity_total}) > 0 OR sl.request_id IS NULL
+                       THEN COALESCE(ml.output_tokens, 0) ELSE COALESCE(sl.output_tokens, 0) END AS output_tokens,
+                  CASE WHEN ({capacity_total}) > 0 OR sl.request_id IS NULL
+                       THEN COALESCE(ml.cache_read_tokens, 0) ELSE COALESCE(sl.cache_read_tokens, 0) END AS cache_read_tokens,
+                  CASE WHEN ({capacity_total}) > 0 OR sl.request_id IS NULL
+                       THEN COALESCE(ml.cache_creation_tokens, 0) ELSE COALESCE(sl.cache_creation_tokens, 0) END AS cache_write_tokens
+             FROM capacity_request_observations ml
+             LEFT JOIN share_request_logs sl
+               ON sl.request_id = ml.request_id
+              AND sl.share_id = ml.share_id
+              AND sl.is_health_check = 0
+              AND lower(CASE WHEN COALESCE(sl.request_agent, '') != '' THEN sl.request_agent ELSE sl.app_type END) = lower(ml.request_agent)
+            WHERE ml.share_id = ?1 AND ml.created_at >= ?2
+              AND ml.user_email IS NOT NULL AND trim(ml.user_email) != ''
+           UNION ALL
+           SELECT lower(trim(sr.user_email)) AS email,
+                  lower(COALESCE(NULLIF(trim(sr.actual_model), ''), NULLIF(trim(sr.model), ''), '')) AS model_key,
+                  lower(COALESCE(NULLIF(trim(sr.effective_service_tier), ''),
+                                 NULLIF(trim(sr.client_service_tier), ''), 'standard')) AS tier_raw,
+                  COALESCE(sr.input_tokens, 0) AS input_tokens,
+                  COALESCE(sr.output_tokens, 0) AS output_tokens,
+                  COALESCE(sr.cache_read_tokens, 0) AS cache_read_tokens,
+                  COALESCE(sr.cache_creation_tokens, 0) AS cache_write_tokens
+             FROM share_request_logs sr
+            WHERE sr.share_id = ?1 AND sr.created_at >= ?3
+              AND sr.is_health_check = 0
+              AND sr.user_email IS NOT NULL AND trim(sr.user_email) != ''
+              AND NOT EXISTS (
+                  SELECT 1 FROM capacity_request_observations ml
+                   WHERE ml.request_id = sr.request_id
+                     AND COALESCE(ml.share_id, '') = sr.share_id
+              )
+         )"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| AppError::Internal(format!("prepare share email pricing failed: {e}")))?;
+    let entries = stmt
+        .query_map(params![share_id, start_rfc3339, start_ts], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                TokenSplit {
+                    input: row.get::<_, i64>(3)?.max(0) as u64,
+                    output: row.get::<_, i64>(4)?.max(0) as u64,
+                    cache_read: row.get::<_, i64>(5)?.max(0) as u64,
+                    cache_write: row.get::<_, i64>(6)?.max(0) as u64,
+                },
+            ))
+        })
+        .map_err(|e| AppError::Internal(format!("query share email pricing failed: {e}")))?;
+    let mut groups = HashMap::<(String, String, ServiceTier, ContextTier), TokenSplit>::new();
+    for entry in entries {
+        let (email, model_key, tier_raw, split) = entry
+            .map_err(|e| AppError::Internal(format!("read share email pricing failed: {e}")))?;
+        if split.is_empty() || model_key.is_empty() {
+            continue;
+        }
+        let Some((_, price)) = catalog.lookup(&model_key, pricing_at) else {
+            continue;
+        };
+        let tier = ServiceTier::parse(&tier_raw).unwrap_or(ServiceTier::Standard);
+        let context = if price.is_long_context(split.input) {
+            ContextTier::Long
+        } else {
+            ContextTier::Base
+        };
+        let group = groups.entry((email, model_key, tier, context)).or_default();
+        group.input = group.input.saturating_add(split.input);
+        group.output = group.output.saturating_add(split.output);
+        group.cache_read = group.cache_read.saturating_add(split.cache_read);
+        group.cache_write = group.cache_write.saturating_add(split.cache_write);
+    }
+    let mut summaries = HashMap::<String, ShareEmailPriceSummary>::new();
+    for ((email, model_key, tier, context), split) in groups {
+        let Some((_, price)) = catalog.lookup(&model_key, pricing_at) else {
+            continue;
+        };
+        let Some(priced) = price_usage_in_tier(price, tier, context, &split) else {
+            continue;
+        };
+        let summary = summaries.entry(email).or_default();
+        summary.amount_micros = summary.amount_micros.saturating_add(priced.total_micros);
+        summary.priced_tokens = summary.priced_tokens.saturating_add(split.total());
+    }
+    Ok(summaries)
 }
 
 /// Whether the quota column for this grant carries a rebase offset (§10).
@@ -34110,6 +34270,166 @@ mod tests {
                 .map(|row| (row.role.as_str(), row.total_tokens)),
             Some(("gateway", 999))
         );
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn share_usage_by_email_prices_the_selected_period_and_discloses_partial_coverage() {
+        use crate::model_pricing::{ContextTier, ServiceTier, TokenSplit, price_usage_in_tier};
+
+        let (store, config) = setup_store("share-email-equivalent-usd").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-usd", "usd-sub", "active").await;
+        let now = Utc::now().timestamp();
+        {
+            let conn = store.conn.lock().await;
+            for (id, email, days_ago, model, tier, input, output) in [
+                (
+                    "recent-priced",
+                    "owner@example.com",
+                    0,
+                    "claude-4-sonnet-20250514",
+                    "standard",
+                    100,
+                    20,
+                ),
+                (
+                    "recent-unknown",
+                    "owner@example.com",
+                    0,
+                    "totally-unknown-model",
+                    "standard",
+                    20,
+                    5,
+                ),
+                (
+                    "recent-unpriced-only",
+                    "other@example.com",
+                    0,
+                    "totally-unknown-model",
+                    "standard",
+                    10,
+                    5,
+                ),
+                (
+                    "week-priority",
+                    "owner@example.com",
+                    2,
+                    "claude-4-sonnet-20250514",
+                    "priority",
+                    200,
+                    40,
+                ),
+                (
+                    "month-standard",
+                    "owner@example.com",
+                    10,
+                    "claude-4-sonnet-20250514",
+                    "standard",
+                    300,
+                    60,
+                ),
+                (
+                    "month-long-context",
+                    "owner@example.com",
+                    10,
+                    "claude-4-sonnet-20250514",
+                    "standard",
+                    200_001,
+                    1,
+                ),
+            ] {
+                let mut log = test_share_request_log_entry(
+                    id,
+                    "share-usd",
+                    now - i64::from(days_ago) * 86_400,
+                );
+                log.user_email = Some(email.into());
+                log.model = model.into();
+                log.actual_model = model.into();
+                log.effective_service_tier = Some(tier.into());
+                log.input_tokens = input;
+                log.output_tokens = output;
+                upsert_share_request_log_tx(&conn, "inst-1", log).expect("insert usage");
+            }
+        }
+
+        let catalog = store.pricing_catalog();
+        let (_, price) = catalog
+            .lookup("claude-4-sonnet-20250514", now)
+            .expect("known official price");
+        let expected = |tier, input, output| {
+            price_usage_in_tier(
+                price,
+                tier,
+                ContextTier::Base,
+                &TokenSplit {
+                    input,
+                    output,
+                    cache_read: 0,
+                    cache_write: 0,
+                },
+            )
+            .expect("priced usage")
+            .total_micros
+        };
+        let recent_amount = expected(ServiceTier::Standard, 100, 20);
+        let week_amount = expected(ServiceTier::Priority, 200, 40);
+        let month_amount = expected(ServiceTier::Standard, 300, 60);
+        assert!(price.is_long_context(200_001));
+        let long_context_amount = price_usage_in_tier(
+            price,
+            ServiceTier::Standard,
+            ContextTier::Long,
+            &TokenSplit {
+                input: 200_001,
+                output: 1,
+                cache_read: 0,
+                cache_write: 0,
+            },
+        )
+        .expect("long-context price")
+        .total_micros;
+        for (period, expected_tokens, expected_amount) in [
+            ("24h", 160, recent_amount),
+            ("1w", 400, recent_amount + week_amount),
+            (
+                "30d",
+                200_762,
+                recent_amount + week_amount + month_amount + long_context_amount,
+            ),
+        ] {
+            let usage = store
+                .share_usage_by_email("share-usd", period)
+                .await
+                .expect("period usage");
+            assert_eq!(usage.total_tokens, expected_tokens, "{period}");
+            assert_eq!(
+                usage.equivalent_usd_micros.as_deref(),
+                Some(expected_amount.to_string().as_str()),
+                "{period}"
+            );
+            let owner = usage
+                .rows
+                .iter()
+                .find(|row| row.email == "owner@example.com")
+                .unwrap();
+            assert_eq!(
+                owner.equivalent_usd_micros.as_deref(),
+                Some(expected_amount.to_string().as_str()),
+                "{period}"
+            );
+            assert!(owner.priced_coverage_percent > 0.0 && owner.priced_coverage_percent < 100.0);
+            let unpriced = usage
+                .rows
+                .iter()
+                .find(|row| row.email == "other@example.com")
+                .unwrap();
+            assert_eq!(unpriced.equivalent_usd_micros, None);
+            assert_eq!(unpriced.priced_coverage_percent, 0.0);
+            assert!(usage.priced_coverage_percent < owner.priced_coverage_percent);
+        }
 
         let _ = std::fs::remove_file(&config.database.path);
     }

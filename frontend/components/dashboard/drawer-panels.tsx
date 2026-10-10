@@ -19,6 +19,7 @@ import {
   upsertAdminModelPrice,
 } from "@/lib/api";
 import { useShareUserUsageBreakdown } from "@/lib/use-share-user-usage-breakdown";
+import { ShareUsageEquivalent, ShareUsageTable, visibleShareEmailUsage } from "@/components/dashboard/share-email-usage-table";
 import type { AppLocale } from "@/lib/i18n";
 import type {
   DashboardClient,
@@ -799,7 +800,7 @@ export function ShareEmailUsagePanel({
 }: {
   share: ShareView;
 }) {
-  const { t } = useLocaleText();
+  const { t, locale } = useLocaleText();
   const [period, setPeriod] = React.useState<ShareUsagePeriod>("24h");
   const [mode, setMode] = React.useState<ShareUsageViewMode>("table");
   const [usage, setUsage] = React.useState<ShareUsageByEmailResponse | null>(
@@ -886,7 +887,11 @@ export function ShareEmailUsagePanel({
     };
   }, [share.shareId, showLimits]);
 
-  const total = usage?.totalTokens ?? 0;
+  const displayedUsage = showUsage
+    ? visibleShareEmailUsage(usage, share.shareId, period, loading, error)
+    : null;
+  const total = displayedUsage?.totalTokens ?? 0;
+  const equivalent = formatUsdMicros(displayedUsage?.equivalentUsdMicros, locale);
   const modeLabel = (item: ShareUsageViewMode) => {
     if (item === "limits") return t("dashboard.usageView.limits");
     if (item === "trend") return t("dashboard.usageView.trend");
@@ -894,44 +899,52 @@ export function ShareEmailUsagePanel({
   };
   return (
     <div className="grid gap-3 rounded-lg border bg-background p-3">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div>
+      <div className="grid gap-1">
+        <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="text-sm font-semibold">
             {mode === "limits"
               ? t("dashboard.userLimit.title")
               : t("dashboard.emailTokenUsage")}
           </div>
-          <div className="text-xs text-muted-foreground">
-            {mode === "limits"
-              ? t("dashboard.userLimit.hint")
-              : t("dashboard.emailTokenUsageSubtitle", {
-                  total: compactTokens(total),
-                })}
+          <div className="flex flex-wrap items-center gap-1">
+            {showUsage
+              ? SHARE_USAGE_PERIODS.map((item) => (
+                  <button
+                    key={item}
+                    type="button"
+                    className={`rounded-md border px-2 py-1 text-xs transition-colors ${period === item ? "border-primary/40 bg-primary/10 text-primary" : "border-border bg-muted/20 text-muted-foreground hover:bg-muted/40"}`}
+                    onClick={() => setPeriod(item)}
+                  >
+                    {t(`dashboard.usagePeriod.${item}`)}
+                  </button>
+                ))
+              : null}
+            {SHARE_USAGE_VIEW_MODES.map((item) => (
+              <button
+                key={item}
+                type="button"
+                className={`rounded-md border px-2 py-1 text-xs transition-colors ${mode === item ? "border-primary/40 bg-primary/10 text-primary" : "border-border bg-muted/20 text-muted-foreground hover:bg-muted/40"}`}
+                onClick={() => setMode(item)}
+              >
+                {modeLabel(item)}
+              </button>
+            ))}
           </div>
         </div>
-        <div className="flex flex-wrap items-center gap-1">
-          {showUsage
-            ? SHARE_USAGE_PERIODS.map((item) => (
-                <button
-                  key={item}
-                  type="button"
-                  className={`rounded-md border px-2 py-1 text-xs transition-colors ${period === item ? "border-primary/40 bg-primary/10 text-primary" : "border-border bg-muted/20 text-muted-foreground hover:bg-muted/40"}`}
-                  onClick={() => setPeriod(item)}
-                >
-                  {t(`dashboard.usagePeriod.${item}`)}
-                </button>
-              ))
-            : null}
-          {SHARE_USAGE_VIEW_MODES.map((item) => (
-            <button
-              key={item}
-              type="button"
-              className={`rounded-md border px-2 py-1 text-xs transition-colors ${mode === item ? "border-primary/40 bg-primary/10 text-primary" : "border-border bg-muted/20 text-muted-foreground hover:bg-muted/40"}`}
-              onClick={() => setMode(item)}
-            >
-              {modeLabel(item)}
-            </button>
-          ))}
+        <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1 text-xs text-muted-foreground">
+          <span>
+            {mode === "limits"
+              ? t("dashboard.userLimit.hint")
+              : t("dashboard.emailTokenUsageSubtitle", { total: compactTokens(total) })}
+          </span>
+          {showUsage ? (
+            <ShareUsageEquivalent
+              amount={equivalent}
+              coverage={displayedUsage?.pricedCoveragePercent ?? 0}
+              t={t}
+              summary
+            />
+          ) : null}
         </div>
       </div>
       {showLimits && (limitRows?.length || limitGrants.length) ? (
@@ -960,12 +973,12 @@ export function ShareEmailUsagePanel({
         <EmptyBlock>{t("dashboard.usageEmail.loading")}</EmptyBlock>
       ) : null}
       {showUsage && error ? <EmptyBlock>{error}</EmptyBlock> : null}
-      {showUsage && !loading && !error && usage ? (
-        usage.rows.length ? (
+      {displayedUsage ? (
+        displayedUsage.rows.length ? (
           mode === "table" ? (
-            <ShareUsageTable usage={usage} t={t} />
+            <ShareUsageTable usage={displayedUsage} t={t} locale={locale} />
           ) : (
-            <ShareUsageTrend usage={usage} t={t} />
+            <ShareUsageTrend usage={displayedUsage} t={t} />
           )
         ) : (
           <EmptyBlock>{t("dashboard.usageEmail.noAclEmails")}</EmptyBlock>
@@ -1653,92 +1666,6 @@ export function ShareUserLimitsTable({
               </React.Fragment>
             );
           })}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-export function ShareUsageTable({
-  usage,
-  t,
-}: {
-  usage: ShareUsageByEmailResponse;
-  t: TFn;
-}) {
-  const roleLabel = (role: string) => {
-    if (role === "owner") return t("dashboard.usageEmail.role.owner");
-    if (role === "shareto") return t("dashboard.usageEmail.role.shareto");
-    if (role === "gateway") return t("dashboard.usageEmail.role.gateway");
-    if (role === "deprecated") return t("dashboard.usageEmail.role.deprecated");
-    return role || "-";
-  };
-  return (
-    <div className="overflow-hidden rounded-md border">
-      <table className="w-full table-fixed border-collapse text-[11px]">
-        <colgroup>
-          <col className="w-[31%]" />
-          <col className="w-[13%]" />
-          <col className="w-[9%]" />
-          <col className="w-[9%]" />
-          <col className="w-[10%]" />
-          <col className="w-[10%]" />
-          <col className="w-[10%]" />
-          <col className="w-[8%]" />
-        </colgroup>
-        <thead className="bg-muted/50 text-left font-mono uppercase tracking-[0.08em] text-muted-foreground">
-          <tr>
-            <th className="px-1.5 py-2">{t("dashboard.usageEmail.email")}</th>
-            <th className="px-1.5 py-2">{t("dashboard.usageEmail.role")}</th>
-            <th className="px-1.5 py-2 text-right">
-              {t("dashboard.usageEmail.input")}
-            </th>
-            <th className="px-1.5 py-2 text-right">
-              {t("dashboard.usageEmail.output")}
-            </th>
-            <th className="px-1.5 py-2 text-right">
-              {t("dashboard.usageEmail.cacheRead")}
-            </th>
-            <th className="px-1.5 py-2 text-right">
-              {t("dashboard.usageEmail.cacheWrite")}
-            </th>
-            <th className="px-1.5 py-2 text-right">
-              {t("dashboard.usageEmail.total")}
-            </th>
-            <th className="px-1.5 py-2 text-right">
-              {t("dashboard.usageEmail.percent")}
-            </th>
-          </tr>
-        </thead>
-        <tbody>
-          {usage.rows.map((row) => (
-            <tr key={row.email} className="border-t">
-              <td className="whitespace-normal break-all px-1.5 py-2 font-medium leading-4">
-                {row.email}
-              </td>
-              <td className="break-words px-1.5 py-2 text-muted-foreground">
-                {roleLabel(row.role)}
-              </td>
-              <td className="overflow-hidden px-1.5 py-2 text-right font-mono">
-                {compactTokens(row.inputTokens)}
-              </td>
-              <td className="overflow-hidden px-1.5 py-2 text-right font-mono">
-                {compactTokens(row.outputTokens)}
-              </td>
-              <td className="overflow-hidden px-1.5 py-2 text-right font-mono">
-                {compactTokens(row.cacheReadTokens)}
-              </td>
-              <td className="overflow-hidden px-1.5 py-2 text-right font-mono">
-                {compactTokens(row.cacheCreationTokens)}
-              </td>
-              <td className="overflow-hidden px-1.5 py-2 text-right font-mono font-semibold">
-                {compactTokens(row.totalTokens)}
-              </td>
-              <td className="overflow-hidden px-1.5 py-2 text-right font-mono">
-                {Math.round(row.percent)}%
-              </td>
-            </tr>
-          ))}
         </tbody>
       </table>
     </div>

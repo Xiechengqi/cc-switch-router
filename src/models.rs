@@ -1866,6 +1866,9 @@ pub struct ShareUsageEmailRow {
     pub cache_creation_tokens: u64,
     pub total_tokens: u64,
     pub percent: f64,
+    /// Official-price equivalent for the priced portion only; display-only.
+    pub equivalent_usd_micros: Option<String>,
+    pub priced_coverage_percent: f64,
     pub daily: Vec<ShareUsageDailyBucket>,
 }
 
@@ -1877,6 +1880,9 @@ pub struct ShareUsageByEmailResponse {
     pub bucket_granularity: String,
     pub days: u32,
     pub total_tokens: u64,
+    /// Sum of priced email amounts, never an invoice or settlement amount.
+    pub equivalent_usd_micros: Option<String>,
+    pub priced_coverage_percent: f64,
     pub rows: Vec<ShareUsageEmailRow>,
 }
 

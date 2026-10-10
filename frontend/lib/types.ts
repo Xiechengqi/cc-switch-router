@@ -869,6 +869,8 @@ export type ShareUsageEmailRow = {
   cacheCreationTokens: number;
   totalTokens: number;
   percent: number;
+  equivalentUsdMicros: string | null;
+  pricedCoveragePercent: number;
   daily: ShareUsageDailyBucket[];
 };
 
@@ -878,6 +880,8 @@ export type ShareUsageByEmailResponse = {
   bucketGranularity?: "hour" | "day" | string;
   days: number;
   totalTokens: number;
+  equivalentUsdMicros: string | null;
+  pricedCoveragePercent: number;
   rows: ShareUsageEmailRow[];
 };
 
