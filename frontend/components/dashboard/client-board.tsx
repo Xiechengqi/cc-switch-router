@@ -5,6 +5,7 @@ import { ArrowRightLeft, ChevronDown, Copy, ListFilter, MessageCircle, Plus, Scr
 import * as React from "react";
 import { CreateClientDialog } from "@/components/dashboard/create-client-dialog";
 import { ClientMarketRentalBanner } from "@/components/dashboard/client-market-rental-banner";
+import { MarketClientBadge, MarketClientStatusLine } from "@/components/dashboard/client-market-client-context";
 import { ShareConnectDialog } from "@/components/dashboard/share-connect-dialog";
 import { ClientOnlineHeatmap } from "@/components/dashboard/client-online-heatmap";
 import { ShareModelHealthHeatmap } from "@/components/dashboard/share-model-health-heatmap";
@@ -47,7 +48,7 @@ import { clientWebTerminalUrl } from "@/lib/client-web-view";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
 import { useClientChat } from "@/components/chat/client-chat";
 import { useAuth } from "@/components/auth/auth-provider";
-import { clientMarketMineHref } from "@/lib/dashboard-nav";
+import { marketClientContext } from "@/lib/client-market-client-status";
 import { SubdomainCopyButton } from "@/components/dashboard/subdomain-copy-button";
 import { ClientSubdomainTakeoverDialog } from "@/components/dashboard/client-subdomain-takeover-dialog";
 import { ClientLogsDialog } from "@/components/dashboard/client-logs-dialog";
@@ -445,7 +446,13 @@ function ClientCard({
   const clientIp = client.installation.publicIp?.trim();
   const identity = hasSubdomain ? subdomain : client.installation.id;
   const versionLabel = clientPlatformLabel(client);
-  const showRemoval = state === "offline" && !!client.removalAt;
+  const marketContext = marketClientContext(
+    client.installation.provisionSource,
+    rental,
+    state === "offline",
+    client.installation.lastSeenAt,
+  );
+  const showRemoval = state === "offline" && !!client.removalAt && !marketContext;
   const borderTone = state === "offline" ? "border-l-rose-500" : state === "reconnecting" ? "border-l-sky-500" : state === "degraded" ? "border-l-amber-400" : "border-l-slate-200";
   const headerPointerDownRef = React.useRef<{ x: number; y: number } | null>(null);
 
@@ -498,6 +505,7 @@ function ClientCard({
                 aria-label={operationalStateLabel(state, t)}
               />
               <strong className="min-w-0 truncate text-sm font-semibold text-foreground" title={identity}>{identity}</strong>
+              <MarketClientBadge context={marketContext} />
               {hasSubdomain ? <SubdomainCopyButton subdomain={subdomain} /> : null}
               {owner && owner !== "-" ? (
                 <span className="min-w-0 truncate text-xs text-muted-foreground" title={owner}>
@@ -516,13 +524,14 @@ function ClientCard({
               {showRemoval ? <ClientRemovalSchedule removalAt={client.removalAt} className="text-[11px]" /> : null}
             </div>
             <div className="flex min-w-0 flex-wrap items-center gap-2 pl-4">
+              <MarketClientStatusLine context={marketContext} installationId={client.installation.id} />
               <ClientMarketRentalBanner
                 rental={rental}
                 onChanged={onRentalChanged}
                 readOnly
                 resumeRelease={false}
+                showManageLink={false}
                 showSchedule={false}
-                manageHref={rental ? clientMarketMineHref(rental.installationId) : undefined}
               />
               {tunnelUrl ? <ClientConsoleButton client={client} /> : null}
               {tunnelUrl ? <ClientTerminalButton client={client} /> : null}
@@ -684,7 +693,8 @@ export function ClientBoard({
       const records = await getMyClientMarketRentals();
       setMarketRentals(new Map(records.map((record) => [record.installationId, record])));
     } catch {
-      // Rental metadata is supplementary; authorization/API errors must not hide Clients.
+      // Fail closed on lifecycle details while keeping the public market-origin badge.
+      setMarketRentals(new Map());
     }
   }, [authed]);
 
@@ -969,6 +979,14 @@ export function ClientBoard({
   const selectedClientSummary = selectedClient
     ? clientOperationalSummary(selectedClient, sharesForClient(selectedClient))
     : null;
+  const selectedMarketContext = selectedClient
+    ? marketClientContext(
+        selectedClient.installation.provisionSource,
+        marketRentals.get(selectedClient.installation.id),
+        selectedClientSummary?.state === "offline",
+        selectedClient.installation.lastSeenAt,
+      )
+    : null;
   const selectedApi = shareApiParts(selectedShare ?? undefined);
 
   React.useEffect(() => {
@@ -1250,7 +1268,13 @@ export function ClientBoard({
                 {selectedClient ? (
                   <div className="grid gap-5">
                     {selectedClientSummary && !["online", "available"].includes(selectedClientSummary.state) ? (
-                      <OperationalDiagnosis summary={selectedClientSummary} kind="client" removalAt={selectedClient.removalAt} />
+                      <OperationalDiagnosis summary={selectedClientSummary} kind="client" removalAt={selectedMarketContext ? undefined : selectedClient.removalAt} />
+                    ) : null}
+                    {selectedMarketContext ? (
+                      <div className="flex flex-wrap items-center gap-2">
+                        <MarketClientBadge context={selectedMarketContext} />
+                        <MarketClientStatusLine context={selectedMarketContext} installationId={selectedClient.installation.id} />
+                      </div>
                     ) : null}
                     <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1.5 text-xs">
                       <dt className="text-slate-500">URL</dt>
@@ -1281,7 +1305,7 @@ export function ClientBoard({
                       <dd className="min-w-0 font-mono font-medium text-slate-900">{clientPlatformLabel(selectedClient)}</dd>
                       <dt className="text-slate-500">{t("dashboard.online")}</dt>
                       <dd className="min-w-0 font-medium text-slate-900">{(selectedClient.onlineRate24h || 0).toFixed(1)}% / {formatAgeDaysOrHours(selectedClient.installation.createdAt, locale)}</dd>
-                      {selectedClient.removalAt ? (
+                      {selectedClient.removalAt && !selectedMarketContext ? (
                         <>
                           <dt className="text-rose-700">{t("dashboard.removalAt")}</dt>
                           <dd className="min-w-0 font-medium text-rose-700" title={formatDateTime(selectedClient.removalAt)}>
@@ -1296,7 +1320,7 @@ export function ClientBoard({
                       onChanged={refreshRentalsAndDashboard}
                       readOnly
                       resumeRelease={false}
-                      manageHref={clientMarketMineHref(selectedClient.installation.id)}
+                      showManageLink={false}
                     />
                     <ClientOnlineHeatmap installationId={selectedClient.installation.id} />
                     <DrawerSection label={t("dashboard.linkedShares")}>

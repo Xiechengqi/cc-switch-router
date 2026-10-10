@@ -31,6 +31,7 @@ export function ClientMarketRentalBanner({
   resumeRelease = true,
   readOnly = false,
   manageHref,
+  showManageLink = true,
   showSchedule = true,
 }: {
   rental?: ClientMarketRental;
@@ -39,6 +40,7 @@ export function ClientMarketRentalBanner({
   resumeRelease?: boolean;
   readOnly?: boolean;
   manageHref?: string;
+  showManageLink?: boolean;
   /** Free-duration schedule is verbose; list rows hide it and surface it in the client drawer instead. */
   showSchedule?: boolean;
 }) {
@@ -63,7 +65,7 @@ export function ClientMarketRentalBanner({
         <span className="text-[11px] text-rose-700">{t("clientMarket.release.failedHint")}</span>
         {!readOnly ? (
           <ReleaseRentalAction rental={rental} onChanged={onChanged} label={t("clientMarket.release.retry")} className="h-6 px-2 text-[11px] text-rose-700" />
-        ) : manageHref ? (
+        ) : showManageLink && manageHref ? (
           <a href={manageHref} className="text-[11px] font-medium text-accent hover:underline">{t("clientMarket.release.manageInMarket")}</a>
         ) : null}
         {!readOnly ? <FinalizeFailedRentalAction rental={rental} onChanged={onChanged} /> : null}
@@ -101,12 +103,14 @@ export function ClientMarketRentalBanner({
           {formatUsdMoney(contract.cyclePriceMinor, locale)} / {t("marketBilling.month")}
         </strong>
         <span>{lifecycle}</span>
-        <a
-          href={manageHref || DASHBOARD_ACCOUNT_BILLING_PATH}
-          className="font-medium text-accent hover:underline"
-        >
-          {manageHref ? t("clientMarket.release.manageInMarket") : t("marketBilling.open")}
-        </a>
+        {showManageLink ? (
+          <a
+            href={manageHref || DASHBOARD_ACCOUNT_BILLING_PATH}
+            className="font-medium text-accent hover:underline"
+          >
+            {manageHref ? t("clientMarket.release.manageInMarket") : t("marketBilling.open")}
+          </a>
+        ) : null}
       </span>
     );
   }

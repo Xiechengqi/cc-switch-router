@@ -11922,21 +11922,24 @@ impl AppStore {
         );
         let installation_cleanup_at = installations
             .iter()
-            .map(|installation| {
-                (
-                    installation.id.clone(),
-                    installation.last_seen_at + Duration::seconds(config.client_stale_secs),
+            .filter_map(|installation| {
+                automatic_client_cleanup_at(
+                    installation.last_seen_at,
+                    installation.provision_source.as_deref(),
+                    config.client_stale_secs,
                 )
+                .map(|cleanup_at| (installation.id.clone(), cleanup_at))
             })
             .collect::<HashMap<_, _>>();
         let installation_removal_at = installations
             .iter()
-            .map(|installation| {
-                (
-                    installation.id.clone(),
-                    installation.last_seen_at
-                        + Duration::seconds(config.client_installation_retention_secs),
+            .filter_map(|installation| {
+                automatic_client_cleanup_at(
+                    installation.last_seen_at,
+                    installation.provision_source.as_deref(),
+                    config.client_installation_retention_secs,
                 )
+                .map(|removal_at| (installation.id.clone(), removal_at))
             })
             .collect::<HashMap<_, _>>();
 
@@ -19618,6 +19621,18 @@ fn issue_lease_response(config: &Config, lease: &TunnelLease) -> IssueLeaseRespo
         subdomain: lease.subdomain.clone(),
         ssh_host_fingerprint: None,
     }
+}
+
+fn automatic_client_cleanup_at(
+    last_seen_at: DateTime<Utc>,
+    provision_source: Option<&str>,
+    retention_secs: i64,
+) -> Option<DateTime<Utc>> {
+    // Market installations are governed by their rental lifecycle, not by the
+    // ordinary stale-Client cleanup window. Never advertise a deadline that
+    // cleanup_expired_data deliberately will not enforce.
+    (provision_source != Some(crate::client_market::PROVISION_SOURCE_ROUTER_MARKET))
+        .then(|| last_seen_at + Duration::seconds(retention_secs))
 }
 
 fn list_installations(conn: &Connection) -> Result<Vec<Installation>, AppError> {
@@ -50509,6 +50524,99 @@ mod tests {
 
         assert_eq!(installations_after, 0);
         assert_eq!(shares_after, 0);
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[test]
+    fn market_installations_have_no_automatic_stale_cleanup_deadline() {
+        let last_seen_at = Utc::now();
+        assert_eq!(
+            automatic_client_cleanup_at(last_seen_at, None, 3_600),
+            Some(last_seen_at + Duration::hours(1))
+        );
+        assert_eq!(
+            automatic_client_cleanup_at(last_seen_at, Some("manual"), 21_600),
+            Some(last_seen_at + Duration::hours(6))
+        );
+        assert_eq!(
+            automatic_client_cleanup_at(
+                last_seen_at,
+                Some(crate::client_market::PROVISION_SOURCE_ROUTER_MARKET),
+                3_600,
+            ),
+            None
+        );
+        assert_eq!(
+            automatic_client_cleanup_at(
+                last_seen_at,
+                Some(crate::client_market::PROVISION_SOURCE_ROUTER_MARKET),
+                21_600,
+            ),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn dashboard_does_not_advertise_stale_cleanup_for_market_client_or_share() {
+        let (store, config) = setup_store("dashboard-market-cleanup-deadline").await;
+        insert_installation(&store, "market-client").await;
+        insert_client_tunnel(
+            &store,
+            "market-client",
+            "owner@example.com",
+            "market-client-sub",
+        )
+        .await;
+        insert_share(
+            &store,
+            "market-client",
+            "market-share",
+            "market-share-sub",
+            "active",
+        )
+        .await;
+        mark_installation_last_seen(&store, "market-client", Utc::now() - Duration::days(10)).await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE installations SET provision_source = 'router_market' WHERE id = 'market-client'",
+                [],
+            )
+            .expect("mark market installation");
+        }
+
+        let server_geo = ServerGeo {
+            lat: None,
+            lon: None,
+        };
+        let proxy = ProxyRegistry::default();
+        let market = store
+            .dashboard_snapshot(&config, &server_geo, &proxy, None)
+            .await
+            .expect("market dashboard snapshot");
+        assert_eq!(market.clients[0].operational_summary.state, "offline");
+        assert_eq!(
+            market.clients[0].installation.provision_source.as_deref(),
+            Some("router_market")
+        );
+        assert_eq!(market.clients[0].removal_at, None);
+        assert_eq!(market.shares[0].cleanup_at, None);
+
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE installations SET provision_source = NULL WHERE id = 'market-client'",
+                [],
+            )
+            .expect("restore ordinary installation");
+        }
+        let ordinary = store
+            .dashboard_snapshot(&config, &server_geo, &proxy, None)
+            .await
+            .expect("ordinary dashboard snapshot");
+        assert!(ordinary.clients[0].removal_at.is_some());
+        assert!(ordinary.shares[0].cleanup_at.is_some());
 
         let _ = std::fs::remove_file(&config.database.path);
     }
