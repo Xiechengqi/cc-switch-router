@@ -14014,6 +14014,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn banked_reset_is_accepted_in_share_contract_but_not_public_market_quota() {
+        let quota: crate::models::ShareUpstreamQuota = serde_json::from_value(serde_json::json!({
+            "status": "ok",
+            "bankedReset": {"availableCount": 3, "detailsAvailable": true, "expiresAt": ["2026-10-30T00:00:00Z"]}
+        })).unwrap();
+        assert_eq!(quota.banked_reset.as_ref().unwrap().available_count, 3);
+        let public = public_provider_quota(Some(&quota), None).unwrap();
+        assert!(
+            serde_json::to_value(public)
+                .unwrap()
+                .get("bankedReset")
+                .is_none()
+        );
+        assert!(serde_json::from_value::<crate::models::ShareUpstreamQuota>(serde_json::json!({
+            "status": "ok", "bankedReset": {"availableCount": 3, "detailsAvailable": true, "creditId": "secret"}
+        })).is_err());
+    }
+
+    #[test]
     fn provider_rank_order_is_stable_for_legacy_peers() {
         assert_eq!(
             provider_rank_order_values("ranked", Some(1), "collecting", None),

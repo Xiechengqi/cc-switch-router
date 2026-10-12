@@ -1209,6 +1209,11 @@ export type ShareUpstreamProvider = {
       source?: string;
     }>;
     unobservedTiers?: ShareUpstreamQuotaTierHint[];
+    bankedReset?: {
+      availableCount: number;
+      detailsAvailable: boolean;
+      expiresAt?: string[];
+    };
   };
   models?: Array<{
     slot?: string;

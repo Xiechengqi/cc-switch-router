@@ -167,6 +167,37 @@ test("Ollama display-only windows keep one-decimal percents without a second sca
   assert.match(line, /Weekly 0\.1%/);
 });
 
+test("Codex Banked Reset summary is read-only, localized, and suppresses unavailable evidence", () => {
+  const originalNow = Date.now;
+  Date.now = () => Date.parse("2026-08-28T00:00:00Z");
+  try {
+    const runtime: ShareUpstreamProvider = {
+      app: "codex", providerType: "codex_oauth", kind: "official_oauth",
+      quota: {
+        status: "ok", plan: "ChatGPT Pro 20x", tiers: [],
+        bankedReset: {
+          availableCount: 3, detailsAvailable: true,
+          expiresAt: ["2026-08-29T00:00:00Z", "2026-08-30T00:00:00Z", "2026-08-29T00:00:00Z", "2026-08-27T00:00:00Z"],
+        },
+      },
+    };
+    assert.match(quotaSummary(runtime, "zh-CN"), /Banked Reset 3 次 · 24h0m \/ 2d0h 后到期/);
+    assert.match(quotaSummary(runtime, "en"), /Banked Reset 3 · 24h0m \/ 2d0h until expiry/);
+    runtime.quota!.bankedReset!.detailsAvailable = false;
+    assert.match(quotaSummary(runtime, "zh-CN"), /Banked Reset 3 次 · 明细暂不可用/);
+    runtime.quota!.bankedReset!.detailsAvailable = true;
+    runtime.quota!.bankedReset!.expiresAt = ["2026-08-27T00:00:00Z"];
+    assert.match(quotaSummary(runtime, "zh-CN"), /Banked Reset 3 次$/);
+    runtime.quota!.bankedReset!.availableCount = 0;
+    assert.doesNotMatch(quotaSummary(runtime, "zh-CN"), /Banked Reset/);
+    runtime.quota!.bankedReset!.availableCount = 3;
+    runtime.providerType = "claude_oauth";
+    assert.doesNotMatch(quotaSummary(runtime, "zh-CN"), /Banked Reset/);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
 test("Claude quota summary keeps the scoped Fable weekly pool", () => {
   const line = quotaSummary(
     {

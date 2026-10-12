@@ -2683,6 +2683,18 @@ pub struct ShareUpstreamQuota {
     pub tiers: Vec<ShareUpstreamQuotaTier>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unobserved_tiers: Vec<ShareUpstreamQuotaTierHint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub banked_reset: Option<ShareBankedResetSummary>,
+}
+
+/// Read-only display evidence; deliberately separate from quota tiers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShareBankedResetSummary {
+    pub available_count: u32,
+    pub details_available: bool,
+    #[serde(default)]
+    pub expires_at: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

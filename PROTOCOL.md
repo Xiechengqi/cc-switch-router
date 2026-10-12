@@ -179,6 +179,7 @@ Router 不接受长效 SSH 凭据。每次建链前 Server 申请一次性 lease
 
 - 当前写出版本是 **Share Contract v7**。Router 为滚动升级仍可读取 v2..v7。v5 引入本节定义的 `modelProbe` 和 Grok 媒体权限；v6 增加 scoped quota metadata；v7 在 quota 中增加独立的 `unobservedTiers`，用于展示套餐已确认但尚无真实数值观测的容量池。`unobservedTiers` 不参与调度、限流、可用性或容量评分。连接测试与半小时模型健康检查要求当前写出版本；Share Market 发布的最低版本是 `MIN_SHARE_MARKET_CONTRACT_VERSION`（v5），以便 Server/Router 滚动升级时继续接受已同步的 v5 记录。
 - quota 的 `tiers` 只承载真实上游数值；`unobservedTiers` 每项携带 `name`、`label`、`scope`、`capacityPool`、可选 `modelFamily` / `relativeWeeklyCapacity`、`source` 与 `reason`，不包含 utilization/reset。相同 `capacityPool` 或规范化 tier 身份的真实 `tiers` 项必须覆盖展示提示，不得把未观测状态渲染为 `0%`。
+- v7 quota 可选携带 `bankedReset`（仅 Codex OAuth）：`availableCount` 为已知且大于零的可用次数，`detailsAvailable` 标识到期明细是否可信，`expiresAt` 至多三个去重后的未来到期时间。该字段只供 Share 私有额度摘要显示，不属于 `tiers`，不得影响调度、限流、容量评分或公开 Share Market DTO；不得传 credit ID、workspace ID 或消费操作。Router 的 quota 解析拒绝未知字段，部署时须先升级 Router，再升级写出该字段的 Server。
 - `capacityPoolId` 是非空匿名标识。同一 Router 下复用相同物理账号或 API key 的不同 Share URL 使用同一值,用于容量与故障域去重；该值在凭据源不变期间稳定，账号绑定或 API key 改变时必须重新派生并同步。
 - `bindings` 必须包含 1 到 3 个不同 app 的 `{ app: providerId }` 绑定,app 仅允许 `claude`、`codex`、`gemini`;顶层 `appType` / `providerId` 必须对应其中一个绑定。
 - `support` 表示当前对外开启的 App API。关闭某个 API 不会删除对应 binding；至少保留一个已绑定 app 为开启。未开启的 app 不接受直连、Share Market 或 Gateway 请求。

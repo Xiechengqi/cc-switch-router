@@ -23274,6 +23274,7 @@ mod quota_runtime_filter_tests {
                 blocked_scope: Some("five_hour".to_string()),
                 tiers: Vec::new(),
                 unobserved_tiers: Vec::new(),
+                banked_reset: None,
             }),
             models: Vec::new(),
             ..Default::default()
@@ -23308,6 +23309,7 @@ mod quota_runtime_filter_tests {
                     ..Default::default()
                 }],
                 unobserved_tiers: Vec::new(),
+                banked_reset: None,
             }),
             models: Vec::new(),
             ..Default::default()
@@ -23345,6 +23347,7 @@ mod quota_runtime_filter_tests {
                     })
                     .collect(),
                 unobserved_tiers: Vec::new(),
+                banked_reset: None,
             }),
             models: Vec::new(),
             ..Default::default()
@@ -37655,6 +37658,7 @@ mod tests {
                 blocked_scope: None,
                 tiers: vec![],
                 unobserved_tiers: Vec::new(),
+                banked_reset: None,
             }),
             api_url: Some("https://example.com".into()),
             models: vec![ShareUpstreamModel {

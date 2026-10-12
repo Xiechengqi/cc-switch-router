@@ -1100,6 +1100,31 @@ function ollamaActivityCost(value?: string, locale: AppLocale = "en") {
   return `${label} $${parsed.toFixed(1)}`;
 }
 
+function bankedResetSummary(
+  reset: NonNullable<ShareUpstreamProvider["quota"]>["bankedReset"],
+  locale: AppLocale,
+) {
+  const count = reset?.availableCount;
+  if (typeof count !== "number" || !Number.isInteger(count) || count <= 0)
+    return "";
+  const chinese = locale.startsWith("zh");
+  const countText = chinese ? `Banked Reset ${count} 次` : `Banked Reset ${count}`;
+  if (!reset?.detailsAvailable)
+    return `${countText} · ${chinese ? "明细暂不可用" : "details unavailable"}`;
+
+  const now = Date.now();
+  const expiries = [...new Set((reset.expiresAt || [])
+    .map((value) => Date.parse(value))
+    .filter((timestamp) => Number.isFinite(timestamp) && timestamp > now))]
+    .sort((left, right) => left - right)
+    .slice(0, 3)
+    .map((timestamp) => countdownStr(new Date(timestamp).toISOString()))
+    .filter(Boolean);
+  return expiries.length
+    ? `${countText} · ${expiries.join(" / ")} ${chinese ? "后到期" : "until expiry"}`
+    : countText;
+}
+
 export function quotaSummary(
   runtime?: ShareUpstreamProvider,
   locale: AppLocale = "en",
@@ -1149,11 +1174,15 @@ export function quotaSummary(
   const activityText = isOllamaCloudRuntime(runtime)
     ? ollamaActivityCost(quota.activityCost, locale)
     : "";
+  const resetText = runtime.providerType === "codex_oauth"
+    ? bankedResetSummary(quota.bankedReset, locale)
+    : "";
   return [
     quotaPlanLabel(runtime, quota.plan || quota.credentialMessage),
     expireText,
     [...tierText, ...unobservedTierText].join(" · "),
     activityText,
+    resetText,
   ]
     .filter(Boolean)
     .join(" · ");
