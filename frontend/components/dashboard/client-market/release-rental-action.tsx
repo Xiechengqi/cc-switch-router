@@ -138,10 +138,7 @@ export function ReleaseRentalAction({
           } catch {
             /* ignore */
           }
-          const detail = latest.failureCode || latest.log.split("\n").filter(Boolean).at(-1) || "";
-          toast.danger(
-            detail ? `${t("clientMarket.release.failedToast")}: ${detail}` : t("clientMarket.release.failedToast"),
-          );
+          toast.danger(t(cleanupFailureGuidanceKey(latest.failureCode || latest.log)));
           await onChanged();
           return;
         }
@@ -178,13 +175,7 @@ export function ReleaseRentalAction({
             } catch {
               /* ignore */
             }
-            const detail =
-              latest.failureCode || latest.log.split("\n").filter(Boolean).at(-1) || "";
-            toast.danger(
-              detail
-                ? `${t("clientMarket.release.failedToast")}: ${detail}`
-                : t("clientMarket.release.failedToast"),
-            );
+            toast.danger(t(cleanupFailureGuidanceKey(latest.failureCode || latest.log)));
             await onChanged();
             return;
           }

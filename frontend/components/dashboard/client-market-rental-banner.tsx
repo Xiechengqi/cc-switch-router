@@ -8,20 +8,9 @@ import {
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { DASHBOARD_ACCOUNT_BILLING_PATH } from "@/lib/dashboard-nav";
 import { formatUsdMoney } from "@/lib/market-money";
+import { clientMarketCleanupReasonKey, clientMarketRentalHasBanner } from "@/lib/client-market-rental-state";
+import { cleanupFailureGuidanceKey } from "@/components/dashboard/client-market/host-utils";
 import type { ClientMarketRental } from "@/lib/types";
-
-/** True when the banner would show non-redundant lifecycle info (not just "Free · permanent"). */
-export function clientMarketRentalHasBanner(rental?: ClientMarketRental | null): boolean {
-  if (!rental || !rental.isClientOwner || rental.status === "released") return false;
-  if (rental.status === "releasing" || rental.status === "release_failed") return true;
-  if (rental.pricingModel === "prepaid_calendar_month" || rental.recurring) return true;
-  if (rental.pricingModel === "free" || (rental.dailyRateMinor == null && rental.cyclePriceMinor == null)) {
-    if (!rental.activatedAt) return true;
-    if (rental.expiresAt) return true;
-    return false;
-  }
-  return true;
-}
 
 /** Client lifecycle status plus a single link to supplier-level postpaid billing. */
 export function ClientMarketRentalBanner({
@@ -47,6 +36,22 @@ export function ClientMarketRentalBanner({
   const { locale, t } = useLocaleText();
   if (!clientMarketRentalHasBanner(rental)) return null;
   if (!rental) return null;
+  const nextProbe = rental.nextCleanupProbeAt
+    ? new Intl.DateTimeFormat(locale, { dateStyle: "short", timeStyle: "short" }).format(new Date(rental.nextCleanupProbeAt))
+    : null;
+  const probeStopped = !nextProbe && (rental.cleanupProbeAttempts ?? 0) >= 5;
+
+  if (rental.status === "released" && rental.hostCleanupPending) {
+    return (
+      <span className="inline-flex flex-wrap items-center gap-1.5 text-[11px] text-amber-800" data-no-row-drawer onClick={(event) => event.stopPropagation()}>
+        {rental.activeCleanupJobId ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+        <span>{t(rental.activeCleanupJobId ? "clientMarket.release.hostCleaning" : "clientMarket.release.hostPending")}</span>
+        {!rental.activeCleanupJobId && rental.cleanupFailureKind ? <span>{t(clientMarketCleanupReasonKey(rental.cleanupFailureKind))}</span> : null}
+        {nextProbe ? <span>{t("clientMarket.release.nextProbe", { time: nextProbe })}</span> : null}
+        {probeStopped ? <span>{t("clientMarket.release.probeStopped")}</span> : null}
+      </span>
+    );
+  }
 
   if (rental.status === "releasing") {
     return (
@@ -62,7 +67,13 @@ export function ClientMarketRentalBanner({
   if (rental.status === "release_failed") {
     return (
       <span className="inline-flex flex-wrap items-center gap-1.5" data-no-row-drawer onClick={(event) => event.stopPropagation()}>
-        <span className="text-[11px] text-rose-700">{t("clientMarket.release.failedHint")}</span>
+        <span className="text-[11px] text-rose-700">
+          {rental.cleanupFailureKind
+            ? t(cleanupFailureGuidanceKey(rental.cleanupFailureKind))
+            : t("clientMarket.release.failedHint")}
+        </span>
+        {nextProbe ? <span className="text-[11px] text-muted-foreground">{t("clientMarket.release.nextProbe", { time: nextProbe })}</span> : null}
+        {probeStopped ? <span className="text-[11px] text-muted-foreground">{t("clientMarket.release.probeStopped")}</span> : null}
         {!readOnly ? (
           <ReleaseRentalAction rental={rental} onChanged={onChanged} label={t("clientMarket.release.retry")} className="h-6 px-2 text-[11px] text-rose-700" />
         ) : showManageLink && manageHref ? (

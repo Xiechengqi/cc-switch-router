@@ -2508,6 +2508,13 @@ pub async fn reconcile_interrupted_host_import_jobs(state: ServerState) -> Resul
 /// Periodic repair for stuck draining / remotely-clean unreachable hosts.
 pub async fn reconcile_stale_market_hosts(state: ServerState) -> Result<(), AppError> {
     reconcile_expired_job_leases(&state, Utc::now()).await?;
+    let finalized = state.store.client_market_finalize_failed_rentals().await?;
+    if finalized > 0 {
+        info!(
+            count = finalized,
+            "ended legacy failed rentals while keeping Hosts quarantined"
+        );
+    }
     let draining = state
         .store
         .client_market_list_hosts_by_status(HOST_STATUS_DRAINING)
@@ -2774,10 +2781,31 @@ async fn reconcile_cleanup_retry_claim(
             }
         }
         Ok(false) => {
-            state
+            // A prior cleanup was authorized and left this Host quarantined.
+            // Once the pinned Host is reachable, resume only after the remote
+            // installation binding is verified by run_cleanup_job_inner.
+            let job_id = match state
                 .store
-                .client_market_finish_cleanup_retry_attempt(&claim, "remote_not_clean", Utc::now())
+                .client_market_begin_system_cleanup_job(
+                    &claim.installation_id,
+                    "auto_cleanup_retry",
+                )
                 .await
+            {
+                Ok(job_id) => job_id,
+                Err(error) => {
+                    state
+                        .store
+                        .client_market_finish_cleanup_retry_attempt(
+                            &claim,
+                            "auto_cleanup_start_failed",
+                            Utc::now(),
+                        )
+                        .await?;
+                    return Err(error);
+                }
+            };
+            run_cleanup_job(state.clone(), job_id).await
         }
         Err(error) => {
             let outcome = format!("probe_failed:{}", classify_cleanup_failure(&error));
@@ -3371,6 +3399,19 @@ async fn run_cleanup_job_inner(state: &ServerState, job_id: &str) -> Result<(), 
                 "cleanup host subdomain binding mismatch".into(),
             ));
         }
+    }
+    if matches!(
+        state
+            .store
+            .client_market_cleanup_reason(job_id)
+            .await?
+            .as_deref(),
+        Some("auto_cleanup_retry" | "stale_draining_recovery")
+    ) {
+        let subdomain = job.subdomain.as_deref().ok_or_else(|| {
+            AppError::Conflict("cleanup host binding mismatch: job has no subdomain".into())
+        })?;
+        ssh_verify_remote_installation_binding(state, &host, &installation_id, subdomain).await?;
     }
 
     // Drop the public route before touching the remote box. Previously this happened
@@ -4480,6 +4521,7 @@ async fn ssh_remote_is_market_clean(
         ));
     };
     let known_hosts = known_hosts_path(&state.config);
+    require_pinned_host_fingerprint(host, &known_hosts).await?;
     let command = format!(
         "{helpers}\
          set -eu; \
@@ -4500,6 +4542,69 @@ async fn ssh_remote_is_market_clean(
     )
     .await?;
     Ok(output.lines().any(|line| line.trim() == "clean"))
+}
+
+/// An unattended retry may wipe only the Client installation that authorized
+/// the original release. The remote script emits only two identity fields;
+/// never transfer or log the full server.json because it contains keys.
+async fn ssh_verify_remote_installation_binding(
+    state: &ServerState,
+    host: &RouterSshHostRecord,
+    installation_id: &str,
+    subdomain: &str,
+) -> Result<(), AppError> {
+    let known_hosts = known_hosts_path(&state.config);
+    require_pinned_host_fingerprint(host, &known_hosts).await?;
+    let parser = "import json,sys; c=json.load(open(sys.argv[1], encoding=\"utf-8\")); r=c.get(\"router\") or {}; i=r.get(\"identity\") or {}; a=c.get(\"client\") or {}; print(json.dumps({\"installationId\":i.get(\"installationId\"),\"subdomain\":a.get(\"tunnelSubdomain\")}))";
+    let command = format!(
+        "{helpers}\
+         set -eu; \
+         home=$(cc_switch_server_home); \
+         config=\"$home/.cc-switch-server/server.json\"; \
+         if [ -r \"$config\" ] && command -v python3 >/dev/null 2>&1; then \
+           python3 -c {parser} \"$config\" 2>/dev/null || printf '{{}}\\n'; \
+         else \
+           printf '{{}}\\n'; \
+         fi",
+        helpers = REMOTE_CC_SWITCH_SERVER_HELPERS,
+        parser = shell_quote(parser),
+    );
+    let output = ssh_run_remote_with_input(
+        &state.provision_ssh_key_path,
+        &known_hosts,
+        &host.ip,
+        host.port,
+        &command,
+        None,
+        SSH_VERIFY_TIMEOUT,
+        SshHostKeyPolicy::RequireKnown,
+    )
+    .await?;
+    remote_server_config_matches_installation(&output, installation_id, subdomain)
+}
+
+fn remote_server_config_matches_installation(
+    config_json: &str,
+    installation_id: &str,
+    subdomain: &str,
+) -> Result<(), AppError> {
+    let config: serde_json::Value = serde_json::from_str(config_json).map_err(|_| {
+        AppError::Conflict("cleanup host binding mismatch: remote config is unreadable".into())
+    })?;
+    let remote_id = config
+        .pointer("/installationId")
+        .and_then(serde_json::Value::as_str);
+    let remote_subdomain = config
+        .pointer("/subdomain")
+        .and_then(serde_json::Value::as_str);
+    if remote_id != Some(installation_id)
+        || !remote_subdomain.is_some_and(|actual| actual.eq_ignore_ascii_case(subdomain))
+    {
+        return Err(AppError::Conflict(
+            "cleanup host binding mismatch: remote installation differs".into(),
+        ));
+    }
+    Ok(())
 }
 
 async fn ssh_cleanup_remote(
@@ -6757,6 +6862,18 @@ impl AppStore {
         .map_err(|e| AppError::Internal(format!("query job failed: {e}")))
     }
 
+    async fn client_market_cleanup_reason(&self, job_id: &str) -> Result<Option<String>, AppError> {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "SELECT cleanup_reason FROM provisioning_jobs WHERE id = ?1 AND type = 'cleanup'",
+            params![job_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map(|value| value.flatten())
+        .map_err(|error| AppError::Internal(format!("read cleanup reason failed: {error}")))
+    }
+
     pub async fn client_market_interrupted_jobs(
         &self,
     ) -> Result<Vec<ProvisioningJobRecord>, AppError> {
@@ -8591,16 +8708,20 @@ impl AppStore {
             ));
         }
         let now = Utc::now().to_rfc3339();
-        tx.execute(
-            "DELETE FROM client_market_cleanup_retry_state
-             WHERE installation_id = ?1 AND host_id = ?2",
-            params![installation_id, host.0],
-        )
-        .map_err(|error| {
-            AppError::Internal(format!(
-                "clear cleanup retry state before retry failed: {error}"
-            ))
-        })?;
+        // An unattended retry owns the existing claim and must keep its attempt
+        // count. Manual retries deliberately reset the bounded retry schedule.
+        if reason != "auto_cleanup_retry" {
+            tx.execute(
+                "DELETE FROM client_market_cleanup_retry_state
+                 WHERE installation_id = ?1 AND host_id = ?2",
+                params![installation_id, host.0],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "clear cleanup retry state before retry failed: {error}"
+                ))
+            })?;
+        }
         if host.3 == HOST_STATUS_DRAINING {
             let active: i64 = tx
                 .query_row(
@@ -8923,22 +9044,35 @@ impl AppStore {
                 "cleanup job changed concurrently".into(),
             ));
         }
+        let previous_attempts: u32 = tx
+            .query_row(
+                "SELECT attempt_count FROM client_market_cleanup_retry_state
+                 WHERE host_id = ?1 AND installation_id = ?2",
+                params![host_id, installation_id],
+                |row| row.get::<_, u32>(0),
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!("read cleanup retry count failed: {error}"))
+            })?
+            .unwrap_or(0);
         let requires_manual = cleanup_retry_requires_manual_intervention(failure_code);
         let next_attempt_at = (!requires_manual)
-            .then(|| cleanup_retry_next_at(now_at, 0))
+            .then(|| cleanup_retry_next_at(now_at, previous_attempts))
             .flatten()
             .map(|value| value.to_rfc3339());
-        let stopped_at = requires_manual.then(|| now.clone());
+        let stopped_at = next_attempt_at.is_none().then(|| now.clone());
         tx.execute(
             "INSERT INTO client_market_cleanup_retry_state (
                 host_id, installation_id, attempt_count, next_attempt_at,
                 last_attempt_at, last_outcome, stopped_at, updated_at
-             ) VALUES (?1, ?2, 0, ?3, NULL, ?4, ?5, ?6)
+             ) VALUES (?1, ?2, ?7, ?3, NULL, ?4, ?5, ?6)
              ON CONFLICT(host_id) DO UPDATE SET
                 installation_id = excluded.installation_id,
-                attempt_count = 0,
+                attempt_count = excluded.attempt_count,
                 next_attempt_at = excluded.next_attempt_at,
-                last_attempt_at = NULL,
+                last_attempt_at = CASE WHEN excluded.attempt_count > 0
+                    THEN client_market_cleanup_retry_state.last_attempt_at ELSE NULL END,
                 last_outcome = excluded.last_outcome,
                 stopped_at = excluded.stopped_at,
                 updated_at = excluded.updated_at",
@@ -8949,6 +9083,7 @@ impl AppStore {
                 failure_code,
                 stopped_at,
                 now,
+                previous_attempts,
             ],
         )
         .map_err(|error| {
@@ -9281,6 +9416,32 @@ mod tests {
                 "fingerprint should be rejected: {invalid}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn cleanup_probe_requires_the_registered_host_fingerprint() {
+        let (store, config, root) = test_store("cleanup-probe-fingerprint");
+        let mut host = add_host(&store, "host@example.com", "198.18.44.9", "US").await;
+        let known_hosts = known_hosts_path(&config);
+        let entry = format!(
+            "{} ssh-ed25519 {TEST_ED25519_KEY_OLD}\n",
+            ssh_known_hosts_target(&host.ip, host.port)
+        );
+        atomic_write_known_hosts(&known_hosts, entry.as_bytes()).unwrap();
+        host.ssh_host_key_fingerprint = Some(test_ssh_fingerprint(TEST_ED25519_KEY_OLD));
+        require_pinned_host_fingerprint(&host, &known_hosts)
+            .await
+            .expect("registered Host key remains valid");
+        host.ssh_host_key_fingerprint = Some(test_ssh_fingerprint(TEST_ED25519_KEY_NEW));
+        let error = require_pinned_host_fingerprint(&host, &known_hosts)
+            .await
+            .expect_err("stale known_hosts entry must not authorize cleanup");
+        assert_eq!(
+            classify_cleanup_failure(&error),
+            CLEANUP_FAILURE_FINGERPRINT
+        );
+        drop(store);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -13333,6 +13494,37 @@ mod tests {
     }
 
     #[test]
+    fn unattended_cleanup_requires_matching_remote_identity_without_leaking_config() {
+        let config = serde_json::json!({
+            "installationId": "installation-a",
+            "subdomain": "client-a",
+            "privateKey": "do-not-print-this-key"
+        })
+        .to_string();
+        assert!(
+            remote_server_config_matches_installation(&config, "installation-a", "client-a")
+                .is_ok()
+        );
+        for (expected_id, expected_subdomain) in [
+            ("installation-b", "client-a"),
+            ("installation-a", "client-b"),
+        ] {
+            let error =
+                remote_server_config_matches_installation(&config, expected_id, expected_subdomain)
+                    .expect_err("mismatched remote installation must block unattended wipe");
+            assert_eq!(classify_cleanup_failure(&error), CLEANUP_FAILURE_BINDING);
+            assert!(!error.to_string().contains("do-not-print-this-key"));
+        }
+        assert!(
+            remote_server_config_matches_installation("{}", "installation-a", "client-a").is_err()
+        );
+        assert!(
+            remote_server_config_matches_installation("{invalid", "installation-a", "client-a")
+                .is_err()
+        );
+    }
+
+    #[test]
     fn cleanup_retry_backoff_is_bounded_and_terminal() {
         let now = Utc::now();
         let expected_seconds = [5 * 60, 15 * 60, 60 * 60, 6 * 60 * 60, 24 * 60 * 60];
@@ -13563,15 +13755,135 @@ mod tests {
             )
             .unwrap();
         }
+        let ssh_failure = "cleanup_ssh_unreachable: ssh connect to 198.18.30.3 timed out";
         store
             .client_market_fail_cleanup_job(
                 "cleanup-backoff-job",
                 &host.id,
-                CLEANUP_FAILURE_SSH_UNREACHABLE,
+                ssh_failure,
                 "connection refused",
             )
             .await
             .expect("persist failed cleanup and initial retry");
+
+        let owner = market_session("client-backoff", "client@example.com");
+        let rental = store
+            .client_market_rental_for_viewer("cleanup-backoff-client", &owner)
+            .await
+            .expect("load quarantined rental");
+        assert_eq!(rental.status, "released");
+        assert!(rental.host_cleanup_pending);
+        assert_eq!(
+            rental.cleanup_failure_kind.as_deref(),
+            Some(CLEANUP_FAILURE_SSH_UNREACHABLE)
+        );
+        assert!(
+            !serde_json::to_string(&rental)
+                .unwrap()
+                .contains("198.18.30.3"),
+            "rental API must not expose the raw SSH failure detail"
+        );
+        assert!(rental.next_cleanup_probe_at.is_some());
+        store
+            .client_market_assert_creation_allowed(&owner)
+            .await
+            .expect("unreachable Host must not block a new Client rental");
+        assert_eq!(
+            store
+                .client_market_get_host(&host.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            HOST_STATUS_UNREACHABLE,
+            "ending the rental cannot return an unclean Host to supply"
+        );
+        let legacy_failed_at = {
+            let conn = store.conn.lock().await;
+            let failed_at: String = conn
+                .query_row(
+                    "SELECT updated_at FROM client_market_subscriptions
+                     WHERE installation_id = 'cleanup-backoff-client'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "UPDATE client_market_subscriptions
+                 SET status = 'release_failed', released_at = NULL
+                 WHERE installation_id = 'cleanup-backoff-client'",
+                [],
+            )
+            .unwrap();
+            failed_at
+        };
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE installation_client_tunnels SET enabled = 1
+                 WHERE installation_id = 'cleanup-backoff-client'",
+                [],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            store.client_market_finalize_failed_rentals().await.unwrap(),
+            0,
+            "a still-enabled tunnel must block legacy finalization"
+        );
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE installation_client_tunnels SET enabled = 0
+                 WHERE installation_id = 'cleanup-backoff-client'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO provisioning_jobs
+                    (id, type, host_id, host_owner_email, client_owner_email, subdomain,
+                     installation_id, status, phase, log_blob, created_at, updated_at)
+                 VALUES ('cleanup-backoff-pending', 'cleanup', ?1, 'provider@example.com',
+                         'client@example.com', 'cleanup-backoff-client',
+                         'cleanup-backoff-client', 'pending', 'cleanup_stop', '', ?2, ?2)",
+                params![host.id, now],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            store.client_market_finalize_failed_rentals().await.unwrap(),
+            0,
+            "an active cleanup job must block legacy finalization"
+        );
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "DELETE FROM provisioning_jobs WHERE id = 'cleanup-backoff-pending'",
+                [],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            store.client_market_finalize_failed_rentals().await.unwrap(),
+            1,
+            "legacy unreachable rental is finalized without touching its Host"
+        );
+        assert_eq!(
+            store.client_market_finalize_failed_rentals().await.unwrap(),
+            0
+        );
+        {
+            let conn = store.conn.lock().await;
+            let released_at: String = conn
+                .query_row(
+                    "SELECT released_at FROM client_market_subscriptions
+                     WHERE installation_id = 'cleanup-backoff-client'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(released_at, legacy_failed_at);
+        }
 
         let mut due_at = {
             let conn = store.conn.lock().await;
@@ -13603,14 +13915,48 @@ mod tests {
                 .expect("claim due cleanup retry");
             assert_eq!(claims.len(), 1);
             assert_eq!(claims[0].attempt_count, expected_attempt);
-            store
-                .client_market_finish_cleanup_retry_attempt(
-                    &claims[0],
-                    "probe_failed:cleanup_ssh_unreachable",
-                    due_at,
-                )
-                .await
-                .expect("finish cleanup retry attempt");
+            if expected_attempt == 5 {
+                let probing = store
+                    .client_market_rental_for_viewer("cleanup-backoff-client", &owner)
+                    .await
+                    .unwrap();
+                assert!(probing.next_cleanup_probe_at.is_none());
+                assert!(
+                    probing.cleanup_probe_attempts.is_none(),
+                    "an in-progress last probe must not look terminal"
+                );
+            }
+            if expected_attempt == 1 {
+                let retry_job = store
+                    .client_market_begin_system_cleanup_job(
+                        "cleanup-backoff-client",
+                        "auto_cleanup_retry",
+                    )
+                    .await
+                    .expect("resume authorized cleanup without resetting retry count");
+                store
+                    .client_market_start_job(&retry_job, JOB_TYPE_CLEANUP)
+                    .await
+                    .unwrap();
+                store
+                    .client_market_fail_cleanup_job(
+                        &retry_job,
+                        &host.id,
+                        CLEANUP_FAILURE_SSH_UNREACHABLE,
+                        "connection refused again",
+                    )
+                    .await
+                    .expect("failed automatic cleanup keeps its attempt count");
+            } else {
+                store
+                    .client_market_finish_cleanup_retry_attempt(
+                        &claims[0],
+                        "probe_failed:cleanup_ssh_unreachable",
+                        due_at,
+                    )
+                    .await
+                    .expect("finish cleanup retry attempt");
+            }
             store
                 .client_market_finish_cleanup_retry_attempt(
                     &claims[0],
@@ -13628,7 +13974,14 @@ mod tests {
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .unwrap();
-            assert_eq!(outcome, "probe_failed:cleanup_ssh_unreachable");
+            assert_eq!(
+                outcome,
+                if expected_attempt == 1 {
+                    CLEANUP_FAILURE_SSH_UNREACHABLE
+                } else {
+                    "probe_failed:cleanup_ssh_unreachable"
+                }
+            );
             if expected_attempt < 5 {
                 assert!(stopped.is_none());
                 due_at = DateTime::parse_from_rfc3339(next.as_deref().unwrap())
@@ -13640,7 +13993,7 @@ mod tests {
             }
         }
 
-        store
+        let manual_job = store
             .client_market_begin_cleanup_job(
                 "cleanup-backoff-client",
                 "provider@example.com",
@@ -13658,6 +14011,51 @@ mod tests {
             .unwrap();
         assert_eq!(recovery_rows, 0);
         drop(conn);
+        // A non-connectivity failure must also end a releasing rental while
+        // leaving the Host quarantined and requiring manual intervention.
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE client_market_subscriptions
+                 SET status = 'releasing', released_at = NULL
+                 WHERE installation_id = 'cleanup-backoff-client'",
+                [],
+            )
+            .unwrap();
+        }
+        store
+            .client_market_start_job(&manual_job, JOB_TYPE_CLEANUP)
+            .await
+            .unwrap();
+        store
+            .client_market_fail_cleanup_job(
+                &manual_job,
+                &host.id,
+                CLEANUP_FAILURE_FINGERPRINT,
+                "SSH identity changed",
+            )
+            .await
+            .expect("safety failure is fenced without retaining the rental lock");
+        let rental = store
+            .client_market_rental_for_viewer("cleanup-backoff-client", &owner)
+            .await
+            .unwrap();
+        assert_eq!(rental.status, "released");
+        assert!(rental.host_cleanup_pending);
+        assert_eq!(
+            rental.cleanup_failure_kind.as_deref(),
+            Some(CLEANUP_FAILURE_FINGERPRINT)
+        );
+        assert!(rental.next_cleanup_probe_at.is_none());
+        assert_eq!(
+            store
+                .client_market_get_host(&host.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            HOST_STATUS_UNREACHABLE
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

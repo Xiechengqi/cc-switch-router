@@ -73,7 +73,7 @@ export function RentalsPage() {
   const myRentals = React.useMemo(
     () =>
       Array.from(rentalByInstallation.values()).filter(
-        (rental) => rental.isClientOwner && rental.status !== "released",
+        (rental) => rental.isClientOwner && (rental.status !== "released" || rental.hostCleanupPending),
       ),
     [rentalByInstallation],
   );

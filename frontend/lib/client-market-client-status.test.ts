@@ -22,6 +22,7 @@ function rental(overrides: Partial<ClientMarketRental> = {}): ClientMarketRental
     isClientOwner: true,
     canRelease: true,
     canFinalizeRelease: false,
+    hostCleanupPending: false,
     providerTerminalAccessActive: false,
     canManageProviderTerminal: false,
     updatedAt: recent,
@@ -68,6 +69,9 @@ test("scheduled, releasing, failed, and ended rentals do not promise a manual re
   assert.equal(marketClientContext("router_market", rental({ status: "release_failed" }), true, longAgo, now)?.hint, null);
   assert.deepEqual(marketClientContext("router_market", rental({ status: "released" }), true, longAgo, now), {
     hint: "released", manageAs: null,
+  });
+  assert.deepEqual(marketClientContext("router_market", rental({ status: "released", hostCleanupPending: true }), true, longAgo, now), {
+    hint: "released", manageAs: "client",
   });
 });
 

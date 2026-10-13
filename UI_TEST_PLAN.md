@@ -355,7 +355,7 @@ location.reload();
 | H-51 | 已登录买家不在 Host owner 白名单,主机 idle | 点「新建」 | 弹出中性授权引导而非红色英文错误，明确只有白名单用户可使用；显示 owner 邮箱及其 WeChat/Telegram/自定义联系方式，邮件按钮打开 `mailto:`；quote 或 commit 阶段撤销准入也回到同一弹窗 |
 | H-52 | 免费 Host 获取 Quote 后 Owner 修改期限 | 提交原 Quote | Client 使用 Quote 冻结的旧期限；Host 新期限只影响后续 Quote，`offerRevision` 已递增 |
 | H-53 | 免费 Client provisioning 成功 | 查看租约与 Account Client | 激活/到期从开通成功时计算并展示；永久租约无到期时间 |
-| H-54 | 免费 Client 到期 | 等待 20 秒对账 | 产生一次临期/到期事件并启动 `free_period_expired` cleanup；失败时为 `release_failed` 且 Host 不回 idle，重试成功后才释放 |
+| H-54 | 免费 Client 到期 | 等待 20 秒对账 | 产生一次临期/到期事件并启动 `free_period_expired` cleanup；失败时租用结束、Host 保持隔离，只有远端清理验证成功后 Host 才回 idle |
 | H-55 | Quote 同时含免费和付费 Host | 进入最终确认阶段 | 每台显示 Owner 与冻结报价；统一说明免费期限从激活开始、付费 Host 独立享受 12 小时健康试用，并按各供应商账户分别聚合 Share/Host 费用 |
 
 **操作可用性矩阵**(行=主机状态,列=菜单项;均需 host owner):
@@ -431,13 +431,14 @@ location.reload();
 | R-26 | 承 R-25 | 观察阶段推进 | 依次经过 stop → wipe → purge,阶段 chip 随之更新 |
 | R-27 | 承 R-25 | 清理进行中尝试关闭弹窗 | 关闭按钮 **disabled**,点遮罩也不关 |
 | R-28 | 承 R-25 | 清理成功 | 绿色完成文案 + 成功 toast;关闭按钮可用;列表中该租用消失 |
-| R-29 | 承 R-25 | 清理失败 | 红色失败指引(按 `failureCode` 给出可操作建议)+ 失败 toast;关闭按钮可用 |
-| R-30 | 承 R-29 | 状态变 release_failed | 卡片显示错误文案 + 「重试释放」按钮 |
-| R-31 | 承 R-30 | 点重试释放 | 与 R-23 相同的确认文案与进度弹窗 |
+| R-29 | 承 R-25 | 清理失败 | 红色失败指引按安全的错误类别展示，不在 toast 中暴露原始 SSH 输出；关闭按钮可用 |
+| R-30 | 承 R-29 | 查看租用列表 | 租用已结束且不会阻止新租用；Host 仍隔离并留在列表显示清理原因与下次检查时间，未验证干净前不回 idle |
+| R-31 | Host 恢复可达且仍有原安装 | 等待自动检查 | 仅当固定 SSH 指纹、远端安装 ID 和域名均匹配时继续 stop → wipe → purge；失败次数沿用原退避预算，不会无限重试；绑定不符交由 Provider 处理 |
 | R-32 | 状态 releasing | 观察 | 显示释放中;**卡片不再显示释放入口**(已有作业在跑) |
 | R-33 | 清理超时(>3.6 分钟无终态) | 观察 | 超时 toast,不无限转圈 |
 | R-34 | 释放进行中 | 直接刷新页面 | 不崩溃;后台作业继续,状态由轮询反映 |
 | R-35 | Account Billing 中查看该服务明细 | 释放 Client | 只能返回租用页发起释放；账单对话框不提供商品生命周期操作 |
+| R-36 | 旧记录为 `release_failed`、Host 隔离且隧道已禁用 | 运行后台对账 | 无活动清理任务时租用变为已结束，保留原失败时间，Host 仍隔离；重复对账不产生重复迁移 |
 
 ---
 

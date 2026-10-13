@@ -114,6 +114,7 @@ function isAnomalous(status: string) {
 
 function isRecentReleased(rental: ClientMarketRental, now = Date.now()) {
   if (rental.status !== "released") return false;
+  if (rental.hostCleanupPending) return true;
   const updated = Date.parse(rental.updatedAt);
   if (!Number.isFinite(updated)) return true;
   return now - updated <= RECENT_RELEASED_MS;
@@ -143,6 +144,7 @@ function synthesizeRentalFromHost(
     isClientOwner,
     canRelease: !!host.installationId,
     canFinalizeRelease: false,
+    hostCleanupPending: false,
     providerTerminalAccessActive: false,
     canManageProviderTerminal: false,
     updatedAt: host.updatedAt || host.createdAt || new Date(0).toISOString(),
@@ -184,7 +186,7 @@ function MonitorCard({
       : rental?.installationId.slice(0, 12)) ||
     host?.id.slice(0, 12) ||
     "—";
-  const anomalous = isAnomalous(status);
+  const anomalous = isAnomalous(status) || rental?.hostCleanupPending === true;
   const providerEmail = rental?.hostOwnerEmail || host?.hostOwnerEmail || "—";
   const renterEmail = rental?.clientOwnerEmail || host?.clientOwnerEmail || "";
   const marketHref = host?.installationId
@@ -231,7 +233,8 @@ function MonitorCard({
         </div>
         <div className="grid gap-0.5">
           <dt className="text-xs text-muted-foreground">{t("account.nav.billing")}</dt>
-          <dd className="font-medium">{isFreeOffer(pricingModel, dailyRateMinor, cyclePriceMinor) ? t("shareMarket.free") : t("marketBilling.status.active")}</dd>
+          <dd className="font-medium">{status === "released" ? t("account.client.billing.ended") : isFreeOffer(pricingModel, dailyRateMinor, cyclePriceMinor) ? t("shareMarket.free") : t("marketBilling.status.active")}</dd>
+          {rental?.hostCleanupPending ? <dd className="text-xs text-amber-800">{t("clientMarket.release.hostPending")}</dd> : null}
         </div>
         <div className="grid gap-0.5 sm:col-span-2">
           <dt className="text-xs text-muted-foreground">{t("account.client.updated")}</dt>

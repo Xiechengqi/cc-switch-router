@@ -177,7 +177,7 @@ export function MyRentalsPanel({
   const activeRentals = React.useMemo(
     () =>
       rentals
-        .filter((rental) => rental.isClientOwner && rental.status !== "released")
+        .filter((rental) => rental.isClientOwner && (rental.status !== "released" || rental.hostCleanupPending))
         .sort((left, right) => left.installationId.localeCompare(right.installationId)),
     [rentals],
   );

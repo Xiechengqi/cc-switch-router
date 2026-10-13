@@ -14,10 +14,8 @@ import { useWebTerminal } from "@/components/dashboard/web-terminal";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { HostOfferDialog } from "@/components/dashboard/client-market/host-offer-dialog";
 import { HostKeyRotationDialog } from "@/components/dashboard/client-market/host-key-rotation-dialog";
-import {
-  ClientMarketRentalBanner,
-  clientMarketRentalHasBanner,
-} from "@/components/dashboard/client-market-rental-banner";
+import { ClientMarketRentalBanner } from "@/components/dashboard/client-market-rental-banner";
+import { clientMarketRentalHasBanner } from "@/lib/client-market-rental-state";
 import { ProviderContactButton } from "@/components/common/provider-contacts";
 import { ReleaseRentalAction } from "@/components/dashboard/client-market/release-rental-action";
 import {

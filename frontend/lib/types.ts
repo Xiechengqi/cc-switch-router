@@ -3078,6 +3078,11 @@ export type ClientMarketRental = {
   isClientOwner: boolean;
   canRelease: boolean;
   canFinalizeRelease: boolean;
+  /** Rental may already be ended while its Host remains quarantined. */
+  hostCleanupPending: boolean;
+  cleanupFailureKind?: string;
+  nextCleanupProbeAt?: string;
+  cleanupProbeAttempts?: number;
   /** Pending/running cleanup job — used to resume progress UI after refresh. */
   activeCleanupJobId?: string;
   providerTerminalAuthorizedUntil?: string;

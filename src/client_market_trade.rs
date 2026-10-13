@@ -385,6 +385,15 @@ pub struct RentalView {
     pub can_release: bool,
     /// The renter may end a wedged release without changing the Host disposition.
     pub can_finalize_release: bool,
+    /// The contract is ended (or ending) while its Host remains quarantined.
+    pub host_cleanup_pending: bool,
+    /// A stable, detail-free failure category; never expose raw SSH output here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup_failure_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cleanup_probe_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup_probe_attempts: Option<i64>,
     /// Latest pending/running cleanup job for this installation (page-refresh resume).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_cleanup_job_id: Option<String>,
@@ -1770,6 +1779,95 @@ impl AppStore {
             "subscription_release_finalized",
         )
         .await
+    }
+
+    /// Bring pre-existing cleanup failures onto the split rental/Host
+    /// lifecycle. The original cleanup already terminated billing and disabled
+    /// the tunnel; this only removes the renter's creation lock. The Host stays
+    /// bound and quarantined until a separate verified cleanup succeeds.
+    pub async fn client_market_finalize_failed_rentals(&self) -> Result<usize, AppError> {
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AppError::Internal(format!("begin failed rental reconcile failed: {error}"))
+            })?;
+        let candidates = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT s.installation_id, s.host_id
+                 FROM client_market_subscriptions s
+                 JOIN router_ssh_hosts h ON h.id = s.host_id
+                   AND h.installation_id = s.installation_id
+                   AND h.status IN ('unreachable', 'abnormal')
+                 JOIN installation_client_tunnels t ON t.installation_id = s.installation_id
+                   AND t.enabled = 0
+                 WHERE s.status = 'release_failed'
+                   AND EXISTS (
+                     SELECT 1 FROM provisioning_jobs j
+                     WHERE j.installation_id = s.installation_id
+                       AND j.host_id = s.host_id AND j.type = 'cleanup'
+                       AND j.status = 'failed'
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1 FROM provisioning_jobs j
+                     WHERE j.installation_id = s.installation_id
+                       AND j.type = 'cleanup' AND j.status IN ('pending', 'running')
+                   )
+                 LIMIT 100",
+                )
+                .map_err(|error| {
+                    AppError::Internal(format!("prepare failed rental reconcile failed: {error}"))
+                })?;
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|error| {
+                    AppError::Internal(format!("query failed rentals failed: {error}"))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    AppError::Internal(format!("read failed rentals failed: {error}"))
+                })?
+        };
+        let now = Utc::now();
+        let mut finalized = 0;
+        for (installation_id, host_id) in candidates {
+            let changed = tx
+                .execute(
+                    "UPDATE client_market_subscriptions
+                 SET status = 'released',
+                     released_at = COALESCE(released_at, updated_at, ?2),
+                     updated_at = ?2
+                 WHERE installation_id = ?1 AND status = 'release_failed'",
+                    params![installation_id, now.to_rfc3339()],
+                )
+                .map_err(|error| {
+                    AppError::Internal(format!("finalize failed rental failed: {error}"))
+                })?;
+            if changed == 1 {
+                insert_audit_tx(
+                    &tx,
+                    Some(&installation_id),
+                    Some(&host_id),
+                    None,
+                    None,
+                    "subscription_release_finalized",
+                    serde_json::json!({
+                        "reason": "cleanup_failure_reconcile",
+                        "remoteCleanupBypassed": true,
+                        "hostRemainsQuarantined": true,
+                    }),
+                    now,
+                )?;
+                finalized += 1;
+            }
+        }
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!("commit failed rental reconcile failed: {error}"))
+        })?;
+        Ok(finalized)
     }
 
     async fn client_market_finalize_stuck_subscription(
@@ -4841,6 +4939,10 @@ struct RentalRow {
     methods_json: String,
     contacts_json: String,
     active_cleanup_job_id: Option<String>,
+    latest_cleanup_failure_code: Option<String>,
+    next_cleanup_probe_at: Option<String>,
+    cleanup_probe_attempts: Option<i64>,
+    bound_host_status: Option<String>,
     provider_terminal_expires_at: Option<String>,
     provider_terminal_revoked_at: Option<String>,
     updated_at: String,
@@ -4868,7 +4970,22 @@ fn load_rental_views(
                 a.expires_at,
                 a.revoked_at,
                 s.updated_at, s.pricing_model, s.cycle_price_minor,
-                s.billing_interval
+                s.billing_interval,
+                (SELECT j.failure_code FROM provisioning_jobs j
+                 WHERE j.installation_id = s.installation_id
+                   AND j.host_id = s.host_id
+                   AND j.type = 'cleanup' AND j.status = 'failed'
+                 ORDER BY j.updated_at DESC, j.created_at DESC LIMIT 1),
+                (SELECT CASE WHEN r.last_outcome = 'probing' THEN NULL
+                             ELSE r.next_attempt_at END
+                 FROM client_market_cleanup_retry_state r
+                 WHERE r.host_id = s.host_id AND r.installation_id = s.installation_id),
+                (SELECT CASE WHEN r.last_outcome = 'probing' THEN NULL
+                             ELSE r.attempt_count END
+                 FROM client_market_cleanup_retry_state r
+                 WHERE r.host_id = s.host_id AND r.installation_id = s.installation_id),
+                (SELECT h.status FROM router_ssh_hosts h
+                 WHERE h.id = s.host_id AND h.installation_id = s.installation_id)
          FROM client_market_subscriptions s
          LEFT JOIN client_market_provider_terminal_authorizations a
            ON a.installation_id = s.installation_id
@@ -4909,6 +5026,10 @@ fn load_rental_views(
             pricing_model: row.get(19)?,
             cycle_price_minor: row.get(20)?,
             billing_interval: row.get(21)?,
+            latest_cleanup_failure_code: row.get(22)?,
+            next_cleanup_probe_at: row.get(23)?,
+            cleanup_probe_attempts: row.get(24)?,
+            bound_host_status: row.get(25)?,
         })
     };
     let rows = if let Some(installation_id) = installation_id {
@@ -4954,6 +5075,25 @@ fn load_rental_views(
             } else {
                 None
             };
+        let host_cleanup_pending = row
+            .bound_host_status
+            .as_deref()
+            .is_some_and(|status| matches!(status, "unreachable" | "draining" | "abnormal"));
+        let cleanup_failure_kind = row
+            .latest_cleanup_failure_code
+            .as_deref()
+            .filter(|_| host_cleanup_pending)
+            .map(|code| code.split(':').next().unwrap_or(code))
+            .map(|kind| match kind {
+                "cleanup_ssh_unreachable"
+                | "cleanup_ssh_timeout"
+                | "cleanup_stop_failed"
+                | "cleanup_wipe_failed"
+                | "cleanup_purge_failed"
+                | "cleanup_fingerprint_mismatch"
+                | "cleanup_host_binding_mismatch" => kind.to_string(),
+                _ => "cleanup_failed".to_string(),
+            });
         output.push(RentalView {
             installation_id: row.installation_id,
             host_id: row.host_id,
@@ -4983,6 +5123,10 @@ fn load_rental_views(
                     SUBSCRIPTION_RELEASING | SUBSCRIPTION_RELEASE_FAILED
                 )
                 && row.active_cleanup_job_id.is_none(),
+            host_cleanup_pending,
+            cleanup_failure_kind,
+            next_cleanup_probe_at: row.next_cleanup_probe_at,
+            cleanup_probe_attempts: row.cleanup_probe_attempts,
             active_cleanup_job_id: row.active_cleanup_job_id,
             provider_terminal_authorized_until: provider_terminal_access_active
                 .then_some(row.provider_terminal_expires_at)
@@ -5035,7 +5179,8 @@ fn client_market_event_fallback_status(event_type: &str) -> &'static str {
         "cleanup_finished" | "subscription_force_released" | "subscription_release_finalized" => {
             SUBSCRIPTION_RELEASED
         }
-        "cleanup_failed" => SUBSCRIPTION_RELEASE_FAILED,
+        // Cleanup failure now quarantines the Host without reopening the rental.
+        "cleanup_failed" => SUBSCRIPTION_RELEASED,
         _ => "unknown",
     }
 }
@@ -5858,7 +6003,7 @@ pub(crate) fn cleanup_finished_tx(
 ) -> Result<(), AppError> {
     tx.execute(
         "UPDATE client_market_subscriptions
-         SET status = ?2, released_at = ?3, updated_at = ?3
+         SET status = ?2, released_at = COALESCE(released_at, ?3), updated_at = ?3
          WHERE installation_id = ?1",
         params![installation_id, SUBSCRIPTION_RELEASED, now.to_rfc3339()],
     )
@@ -5883,16 +6028,35 @@ pub(crate) fn cleanup_failed_tx(
     failure_code: &str,
     now: DateTime<Utc>,
 ) -> Result<(), AppError> {
-    tx.execute(
-        "UPDATE client_market_subscriptions
-         SET status = ?2, updated_at = ?3 WHERE installation_id = ?1 AND status != 'released'",
-        params![
-            installation_id,
-            SUBSCRIPTION_RELEASE_FAILED,
-            now.to_rfc3339()
-        ],
-    )
-    .map_err(|error| AppError::Internal(format!("mark subscription release failed: {error}")))?;
+    // Billing and the Client tunnel were already stopped when cleanup began.
+    // A remote, network, or safety failure cannot keep the renter locked to an
+    // ended contract. The Host remains bound and quarantined until verified clean.
+    let changed = tx
+        .execute(
+            "UPDATE client_market_subscriptions
+         SET status = ?2, released_at = ?3, updated_at = ?3
+         WHERE installation_id = ?1 AND status != 'released'",
+            params![installation_id, SUBSCRIPTION_RELEASED, now.to_rfc3339()],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("mark subscription release failed: {error}"))
+        })?;
+    if changed == 1 {
+        insert_audit_tx(
+            tx,
+            Some(installation_id),
+            Some(host_id),
+            None,
+            None,
+            "subscription_release_finalized",
+            serde_json::json!({
+                "reason": "cleanup_failed",
+                "remoteCleanupBypassed": true,
+                "hostRemainsQuarantined": true,
+            }),
+            now,
+        )?;
+    }
     insert_audit_tx(
         tx,
         Some(installation_id),

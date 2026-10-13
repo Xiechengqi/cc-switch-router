@@ -27,7 +27,7 @@ export function marketClientContext(
 ): MarketClientContext | null {
   if (provisionSource !== "router_market" && !rental) return null;
 
-  const manageAs = !rental || rental.status === "released"
+  const manageAs = !rental || (rental.status === "released" && !rental.hostCleanupPending)
     ? null
     : rental.isClientOwner ? "client" : "provider";
   if (!offline) return { hint: null, manageAs };

@@ -95,6 +95,11 @@ const RENTAL_SCALAR_KEYS = [
   "offerRevision",
   "isClientOwner",
   "canRelease",
+  "canFinalizeRelease",
+  "hostCleanupPending",
+  "cleanupFailureKind",
+  "nextCleanupProbeAt",
+  "cleanupProbeAttempts",
   "activeCleanupJobId",
   "updatedAt",
 ] as const satisfies readonly (keyof ClientMarketRental)[];
