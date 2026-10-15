@@ -14,6 +14,9 @@ export type MessageKey = keyof typeof messages.en;
 export const messages = {
   en: {
     "common.language": "Language",
+    "common.currencySwitch": "Show prices in {currency}",
+    "common.currencyRate": "Display conversion only · 1 USD ≈ {rate} CNY · charges remain in USD",
+    "common.currencyUnavailable": "CNY display is unavailable until a verified rate is received",
     "common.english": "English",
     "common.chinese": "中文",
     "common.loadingSession": "Loading session...",
@@ -702,6 +705,7 @@ export const messages = {
     "account.nav.consumerUsage": "Consumer usage",
     "account.nav.marketReadiness": "Market readiness",
     "account.nav.billing": "Market billing",
+    "account.nav.wallet": "Platform balance",
     "account.nav.marketAccess": "Market access",
     "account.nav.payments": "Payment details",
     "account.nav.share": "Share Market",
@@ -931,7 +935,9 @@ export const messages = {
     "account.visibilityHint":
       "Market listings expose only payment method types and contact handles. Full payment details are frozen into invoices and shown only to the invoiced buyer.",
     "market.currencyNotice":
-      "The USD/CNY exchange rate is 1:{rate}. USD payment channels are recommended.",
+      "USD/CNY reference rate: 1:{rate}, refreshed from the external feed when available. Invoice amounts freeze their issue-time rate; USD payment channels are recommended.",
+    "market.currencyUnavailable":
+      "The verified USD/CNY rate is temporarily unavailable. New CNY invoices wait for a fresh quote; existing invoices keep their original amounts.",
     "account.contact.title": "Contact info",
     "account.contact.hint":
       "Shown in the Market and on invoices so renters can reach you.",
@@ -1817,7 +1823,10 @@ export const messages = {
     "marketReadiness.policies.mode": "Access mode",
     "marketReadiness.policies.revision": "Revision",
     "marketWallet.title": "Platform wallet",
-    "marketWallet.subtitle": "One balance for Share Market and Client Market.",
+    "marketWallet.subtitle": "A shared balance for Share Market and Client Market once platform payments open.",
+    "marketWallet.displayOnly": "Display estimate · actual balance {amount} USD",
+    "marketWallet.notOpen": "Platform deposits are not open yet. Current rentals still use provider-specific balances and credit.",
+    "marketWallet.legacyBilling": "View current Market billing",
     "marketWallet.available": "Available balance",
     "marketWallet.held": "Reserved",
     "marketWallet.topup": "Add funds",
@@ -3962,6 +3971,9 @@ export const messages = {
   },
   "zh-CN": {
     "common.language": "语言",
+    "common.currencySwitch": "以{currency}显示价格",
+    "common.currencyRate": "仅切换显示 · 1 美元≈{rate}元人民币 · 实际仍按美元结算",
+    "common.currencyUnavailable": "尚未取得可信汇率，暂不能切换人民币显示",
     "common.english": "English",
     "common.chinese": "中文",
     "common.loadingSession": "正在加载会话...",
@@ -4637,6 +4649,7 @@ export const messages = {
     "account.nav.consumerUsage": "我使用的",
     "account.nav.marketReadiness": "市场准备",
     "account.nav.billing": "市场账务",
+    "account.nav.wallet": "平台余额",
     "account.nav.marketAccess": "市场准入",
     "account.nav.payments": "收款信息",
     "account.nav.share": "Share 市场",
@@ -4861,7 +4874,9 @@ export const messages = {
     "account.visibilityHint":
       "Market 商品只展示收款方式种类和联系账号；完整收款资料会冻结到聚合账单，且仅向该账单买方展示。",
     "market.currencyNotice":
-      "美元人民币汇率采用 1:{rate}，推荐使用美元渠道付款",
+      "美元兑人民币参考汇率为 1:{rate}；外部汇率可用时自动更新，账单按开票时汇率冻结。推荐使用美元渠道付款。",
+    "market.currencyUnavailable":
+      "可信美元兑人民币汇率暂不可用。新人民币账单等待汇率恢复；已有账单金额不变。",
     "account.contact.title": "联系信息",
     "account.contact.hint": "会在 Market 与聚合账单中展示，方便租户联系你。",
     "account.contact.add": "添加",
@@ -5708,7 +5723,10 @@ export const messages = {
     "marketReadiness.policies.mode": "准入模式",
     "marketReadiness.policies.revision": "版本",
     "marketWallet.title": "平台钱包",
-    "marketWallet.subtitle": "Share Market 和 Client Market 共用一份余额。",
+    "marketWallet.subtitle": "平台支付开放后，Share Market 和 Client Market 将共用一份余额。",
+    "marketWallet.displayOnly": "仅为显示估算 · 实际余额为 {amount} 美元",
+    "marketWallet.notOpen": "平台充值暂未开放。当前租用仍使用供应商预存与授信。",
+    "marketWallet.legacyBilling": "查看当前市场账务",
     "marketWallet.available": "可用余额",
     "marketWallet.held": "已预留",
     "marketWallet.topup": "充值",

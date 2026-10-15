@@ -12,8 +12,8 @@ import type { ShareListingPricingResponse, ShareListingUsageMix } from "@/lib/ty
 const MIX_KEYS = ["input", "output", "cacheRead", "cacheWrite"] as const;
 type MixKey = (typeof MIX_KEYS)[number];
 
-function formatRate(value: string, locale: string) {
-  return formatUsdMicrosPerMillion(value, locale) ?? "—";
+function formatRate(value: string, locale: string, currency: "USD" | "CNY", rateMicros: number) {
+  return formatUsdMicrosPerMillion(value, locale, { currency, rateMicros }) ?? "—";
 }
 
 function MixBar({
@@ -65,7 +65,7 @@ function MixBar({
 }
 
 export function ListingPricingCard({ listingId }: { listingId: string }) {
-  const { t, locale } = useLocaleText();
+  const { t, locale, displayCurrency, fxRateMicros } = useLocaleText();
   const [pricing, setPricing] = React.useState<ShareListingPricingResponse | null>(
     null,
   );
@@ -119,16 +119,16 @@ export function ListingPricingCard({ listingId }: { listingId: string }) {
               <div className="text-sm font-medium text-slate-900">{model.displayName}</div>
               <div className="flex flex-wrap gap-x-3 gap-y-0.5 font-mono text-[11px] leading-4 text-slate-600">
                 <span>
-                  {t("shareMarket.pricing.input")} {formatRate(model.rates.input, locale)}
+                  {t("shareMarket.pricing.input")} {formatRate(model.rates.input, locale, displayCurrency, fxRateMicros)}
                 </span>
                 <span>
-                  {t("shareMarket.pricing.output")} {formatRate(model.rates.output, locale)}
+                  {t("shareMarket.pricing.output")} {formatRate(model.rates.output, locale, displayCurrency, fxRateMicros)}
                 </span>
                 <span>
-                  {t("shareMarket.pricing.cacheRead")} {formatRate(model.rates.cacheRead, locale)}
+                  {t("shareMarket.pricing.cacheRead")} {formatRate(model.rates.cacheRead, locale, displayCurrency, fxRateMicros)}
                 </span>
                 <span>
-                  {t("shareMarket.pricing.cacheWrite")} {formatRate(model.rates.cacheWrite5m, locale)}
+                  {t("shareMarket.pricing.cacheWrite")} {formatRate(model.rates.cacheWrite5m, locale, displayCurrency, fxRateMicros)}
                 </span>
               </div>
               <div className="text-[11px] text-slate-400">

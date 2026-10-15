@@ -45,7 +45,7 @@ function splitMicros(micros: bigint) {
 export function formatUsdMicros(
   value: string | bigint | null | undefined,
   locale?: string,
-  options: { maximumFractionDigits?: number } = {},
+  options: { maximumFractionDigits?: number; currencySymbol?: string } = {},
 ): string | null {
   const micros = typeof value === "bigint" ? value : parseUsdMicros(value);
   if (micros == null) return null;
@@ -78,7 +78,7 @@ export function formatUsdMicros(
       .find((part) => part.type === "decimal")?.value || ".";
   const fractionText = digits > 0 ? String(remainder).padStart(digits, "0") : "";
   const body = fractionText ? `${wholeText}${decimalSeparator}${fractionText}` : wholeText;
-  return `${negative ? "-" : ""}$${body}`;
+  return `${negative ? "-" : ""}${options.currencySymbol ?? "$"}${body}`;
 }
 
 /**
@@ -89,6 +89,7 @@ export function formatUsdMicros(
 export function formatUsdMicrosPerMillion(
   ratePerMillion: number | string | null | undefined,
   locale?: string,
+  display?: { currency: "USD" | "CNY"; rateMicros: number },
 ): string | null {
   if (ratePerMillion == null) return null;
   const text =
@@ -98,6 +99,16 @@ export function formatUsdMicrosPerMillion(
         : null
       : ratePerMillion;
   if (text == null) return null;
+  if (display?.currency === "CNY" && Number.isSafeInteger(display.rateMicros)) {
+    const micros = parseUsdMicros(text);
+    if (micros == null) return null;
+    const scaled = micros * BigInt(display.rateMicros);
+    const converted = scaled >= 0n
+      ? (scaled + 500_000n) / 1_000_000n
+      : (scaled - 500_000n) / 1_000_000n;
+    const formatted = formatUsdMicros(converted, locale, { currencySymbol: "¥" });
+    return formatted == null ? null : `≈${formatted}`;
+  }
   return formatUsdMicros(text, locale);
 }
 

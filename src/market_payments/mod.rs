@@ -128,6 +128,11 @@ fn no_store() -> [(header::HeaderName, &'static str); 1] {
     [(header::CACHE_CONTROL, "private, no-store")]
 }
 
+fn topup_return_urls(base: &str, order_id: &str) -> (String, String) {
+    let wallet_url = format!("{base}/account/wallet/?topup={order_id}");
+    (wallet_url.clone(), format!("{wallet_url}&cancelled=1"))
+}
+
 /// The Owner API is the only supported way to enter enabled mode; its
 /// readiness gate remains closed until every purchase and control path is
 /// integrated. Existing contracts must still dispatch by their own rail.
@@ -1405,8 +1410,7 @@ async fn create_topup(
         "{scheme}://{}",
         state.config.tunnel_domain.trim_end_matches('/')
     );
-    let success_url = format!("{base}/account/billing?topup={order_id}");
-    let cancel_url = format!("{base}/account/billing?topup={order_id}&cancelled=1");
+    let (success_url, cancel_url) = topup_return_urls(&base, &order_id);
     let created = state
         .market_payments
         .client
@@ -1882,6 +1886,7 @@ async fn reconcile_one_topup(state: &ServerState, pending: PendingTopup) -> Resu
             "{scheme}://{}",
             state.config.tunnel_domain.trim_end_matches('/')
         );
+        let (success_url, cancel_url) = topup_return_urls(&base, &pending.id);
         let created = state
             .market_payments
             .client
@@ -1890,8 +1895,8 @@ async fn reconcile_one_topup(state: &ServerState, pending: PendingTopup) -> Resu
                 &pending.merchant_order_id,
                 pending.amount_minor,
                 &loaded.allowed_methods,
-                &format!("{base}/account/billing?topup={}", pending.id),
-                &format!("{base}/account/billing?topup={}&cancelled=1", pending.id),
+                &success_url,
+                &cancel_url,
             )
             .await?;
         let conn = state.store.conn.lock().await;
@@ -2072,6 +2077,17 @@ mod tests {
             wallet_purchase_mode_tx(&conn),
             Err(AppError::ServiceUnavailable(_))
         ));
+    }
+
+    #[test]
+    fn topup_return_urls_land_on_wallet_for_create_and_recovery() {
+        assert_eq!(
+            topup_return_urls("https://router.example", "order-1"),
+            (
+                "https://router.example/account/wallet/?topup=order-1".to_owned(),
+                "https://router.example/account/wallet/?topup=order-1&cancelled=1".to_owned(),
+            )
+        );
     }
 
     #[test]

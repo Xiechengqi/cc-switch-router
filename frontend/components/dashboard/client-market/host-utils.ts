@@ -8,7 +8,7 @@ import type {
 } from "@/lib/types";
 import type { MessageKey } from "@/lib/i18n";
 import { ApiError } from "@/lib/api";
-import { formatUsdMoney, MARKET_CURRENCY } from "@/lib/market-money";
+import { formatMarketPrice as formatUsdMoney, MARKET_CURRENCY } from "@/lib/market-money";
 
 /**
  * Pure helpers, constants and types shared by the Client Market surfaces.

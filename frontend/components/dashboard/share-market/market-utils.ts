@@ -1,6 +1,6 @@
 import type { AppLocale, MessageKey } from "@/lib/i18n";
 import { ApiError } from "@/lib/api";
-import { formatUsdMoney } from "@/lib/market-money";
+import { formatMarketPrice as formatUsdMoney } from "@/lib/market-money";
 import {
   isApiProviderRuntime,
   providerQuotaStatusLine,

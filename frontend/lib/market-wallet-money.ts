@@ -1,5 +1,14 @@
 const UNITS_PER_DOLLAR = 8_640_000n;
 
+export function formatWalletUnitsAsCny(raw: string, rateMicros: number, locale = "en-US") {
+  const units = BigInt(raw);
+  const scaled = units * BigInt(rateMicros);
+  const converted = scaled >= 0n
+    ? (scaled + 500_000n) / 1_000_000n
+    : (scaled - 500_000n) / 1_000_000n;
+  return `≈${formatWalletUnits(converted.toString(), "¥", locale)}`;
+}
+
 export function formatWalletUnits(raw: string, currencySymbol = "$", locale = "en-US") {
   const units = BigInt(raw);
   const negative = units < 0n;

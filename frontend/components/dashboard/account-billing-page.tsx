@@ -78,7 +78,6 @@ import type {
   ShareMarketRefundObligation,
 } from "@/lib/types";
 import {
-  DEFAULT_USD_CNY_RATE_MICROS,
   formatUsdCnyMoney,
   formatUsdCnyRate,
   MARKET_CURRENCY,
@@ -89,8 +88,6 @@ import {
   marketFundingTopupUnavailableKey,
 } from "@/lib/market-funding";
 import { preferredScrollBehavior } from "@/lib/utils";
-import { getMarketWallet, type MarketWallet } from "@/lib/market-wallet-api";
-import { PlatformWalletPanel } from "@/components/dashboard/platform-wallet-panel";
 
 type Currency = typeof MARKET_CURRENCY;
 type BillingTab = "todo" | "payables" | "receivables" | "history" | "admin";
@@ -993,8 +990,8 @@ function CreditAccountPanel({
   );
 }
 
-function LegacyAccountBillingPage() {
-  const { locale, t } = useLocaleText();
+export function AccountBillingPage() {
+  const { locale, t, fxRateFresh, fxRateLabel } = useLocaleText();
   const { session, loading: authLoading } = useAuth();
   const authed = !!session?.authenticated;
   const isAdmin = !!session?.isAdmin;
@@ -1686,11 +1683,9 @@ function LegacyAccountBillingPage() {
             <h2 className="text-lg font-semibold text-foreground">{t("marketBilling.title")}</h2>
           </div>
           <p className="mt-1 max-w-3xl text-sm text-muted-foreground">{t("marketBilling.subtitle", { hours: dashboard?.trialHours || 12 })}</p>
-          <p className="mt-1 max-w-3xl text-xs font-medium text-amber-700">{t("market.currencyNotice", {
-            rate: formatUsdCnyRate(
-              dashboard?.usdCnyRateMicros || DEFAULT_USD_CNY_RATE_MICROS,
-            ),
-          })}</p>
+          <p className="mt-1 max-w-3xl text-xs font-medium text-amber-700">{fxRateFresh
+            ? t("market.currencyNotice", { rate: fxRateLabel })
+            : t("market.currencyUnavailable")}</p>
         </div>
         <Button isIconOnly variant="outline" aria-label={t("common.reload")} isDisabled={refreshing} onClick={() => void load(true)}>
           <RefreshCw className={`h-4 w-4 ${refreshing ? "animate-spin" : ""}`} />
@@ -2355,47 +2350,4 @@ function LegacyAccountBillingPage() {
       </Modal.Backdrop>
     </div>
   );
-}
-
-export function AccountBillingPage() {
-  const { t } = useLocaleText();
-  const { session, loading } = useAuth();
-  const [wallet, setWallet] = React.useState<MarketWallet | null>(null);
-  const [error, setError] = React.useState("");
-  const actorId = session?.user?.id || session?.user?.email || "";
-
-  const reloadMode = React.useCallback(async () => {
-    setError("");
-    try {
-      setWallet(await getMarketWallet());
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
-    }
-  }, []);
-
-  React.useEffect(() => {
-    if (!session?.authenticated) return;
-    let active = true;
-    getMarketWallet().then((view) => {
-      if (active) { setWallet(view); setError(""); }
-    }).catch((cause) => {
-      if (active) setError(cause instanceof Error ? cause.message : String(cause));
-    });
-    return () => { active = false; };
-  }, [actorId, session?.authenticated]);
-
-  if (loading || !session?.authenticated) return <LegacyAccountBillingPage />;
-  if (error) {
-    return (
-      <div className="mx-auto grid max-w-3xl gap-4 p-6">
-        <p role="alert" className="text-sm text-destructive">{error}</p>
-        <Button variant="outline" onPress={() => void reloadMode()}>{t("common.retry")}</Button>
-      </div>
-    );
-  }
-  if (!wallet) return <div className="mx-auto max-w-3xl p-6 text-sm text-muted-foreground">{t("common.loading")}</div>;
-  if (wallet.canTopup || wallet.hasWalletActivity) {
-    return <PlatformWalletPanel initialWallet={wallet} />;
-  }
-  return <LegacyAccountBillingPage />;
 }

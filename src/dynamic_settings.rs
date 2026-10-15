@@ -25,7 +25,6 @@ pub struct DynamicSettings {
     /// User-facing Bark delivery provider. The credential master key is loaded
     /// at boot; other fields can be changed without restarting the worker.
     pub bark: BarkSettings,
-    pub market_usd_cny_rate_micros: i64,
     pub market_provider_recommendation_mode: MarketProviderRecommendationMode,
     pub footer_telegram_url: String,
     pub server_log_public_enabled: bool,
@@ -55,7 +54,6 @@ impl DynamicSettings {
             alerting: config.metrics.alerting.clone(),
             telegram_bot: config.telegram_bot.clone(),
             bark: config.bark.clone(),
-            market_usd_cny_rate_micros: config.market_usd_cny_rate_micros,
             market_provider_recommendation_mode: config.market_provider_recommendation_mode,
             footer_telegram_url: config.footer_telegram_url.clone(),
             server_log_public_enabled: crate::server_logs::public_enabled_from_env(),

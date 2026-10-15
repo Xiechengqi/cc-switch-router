@@ -30,3 +30,8 @@ test("Provider Rank is a first-class dashboard destination", () => {
   assert.equal(normalizeDashboardPath("/providers/"), "/providers/");
   assert.equal(pathnameForDashboardShell("/providers/?provider=mp_public"), "providers");
 });
+
+test("platform balance has a permanent account destination", () => {
+  assert.equal(normalizeDashboardPath("/account/wallet/"), "/account/wallet/");
+  assert.equal(pathnameForDashboardShell("/account/wallet/"), "account");
+});

@@ -2,10 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::Entry};
 use std::net::IpAddr;
 use std::path::{Component, PathBuf};
-use std::sync::{
-    Arc, RwLock as StdRwLock, Weak,
-    atomic::{AtomicI64, Ordering as AtomicOrdering},
-};
+use std::sync::{Arc, RwLock as StdRwLock, Weak};
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use crate::db::{
@@ -916,7 +913,7 @@ pub struct AppStore {
     auth_email_send_locks: Arc<Mutex<HashMap<(String, String), Weak<Mutex<()>>>>>,
     ip_hash_salt: Arc<String>,
     geo_lookup_base_url: Arc<String>,
-    market_usd_cny_rate_micros: Arc<AtomicI64>,
+    market_fx_rate: Arc<StdRwLock<crate::market_fx::MarketFxSnapshot>>,
     /// Snapshot of the model price catalog (§5.4). Instance-scoped rather than
     /// process-global so it always matches this store's database.
     pricing_catalog: Arc<StdRwLock<Arc<crate::model_price_catalog::PricingCatalog>>>,
@@ -1702,6 +1699,8 @@ impl AppStore {
                 .map_err(|e| AppError::Internal(format!("enable sqlite WAL failed: {e}")))?;
         }
         crate::schema::apply(&conn)?;
+        let market_fx_rate =
+            crate::market_fx::load_snapshot(&conn, config.market_usd_cny_rate_micros)?;
         // Provider reconciliation and rank generation can scan years of market
         // history. They run immediately in the supervised background task so a
         // large marketplace cannot delay Router startup; public rank endpoints
@@ -1729,7 +1728,7 @@ impl AppStore {
             auth_email_send_locks: Arc::new(Mutex::new(HashMap::new())),
             ip_hash_salt: Arc::new(salt),
             geo_lookup_base_url: Arc::new("https://ip.im".to_string()),
-            market_usd_cny_rate_micros: Arc::new(AtomicI64::new(config.market_usd_cny_rate_micros)),
+            market_fx_rate: Arc::new(StdRwLock::new(market_fx_rate)),
             pricing_catalog: Arc::new(StdRwLock::new(pricing_catalog)),
             requested_model_blocks: Arc::new(StdRwLock::new(Arc::new(requested_model_blocks))),
         })
@@ -1987,9 +1986,11 @@ impl AppStore {
             auth_email_send_locks: Arc::new(Mutex::new(HashMap::new())),
             ip_hash_salt: Arc::new(salt),
             geo_lookup_base_url: Arc::new("https://ip.im".to_string()),
-            market_usd_cny_rate_micros: Arc::new(AtomicI64::new(
-                crate::market_billing::DEFAULT_USD_CNY_RATE_MICROS,
-            )),
+            market_fx_rate: Arc::new(StdRwLock::new(crate::market_fx::MarketFxSnapshot {
+                rate_micros: crate::market_billing::DEFAULT_USD_CNY_RATE_MICROS,
+                source_timestamp: Some(Utc::now().timestamp()),
+                fetched_at: Some(Utc::now().timestamp()),
+            })),
             // Left empty on purpose: loading ~170 models per test constructor
             // costs more than it buys. Pricing tests call
             // `reload_pricing_catalog()` explicitly.
@@ -2203,13 +2204,61 @@ impl AppStore {
     }
 
     pub(crate) fn market_usd_cny_rate_micros(&self) -> i64 {
-        self.market_usd_cny_rate_micros
-            .load(AtomicOrdering::Acquire)
+        self.market_fx_snapshot().rate_micros
     }
 
+    pub(crate) fn market_fx_snapshot(&self) -> crate::market_fx::MarketFxSnapshot {
+        match self.market_fx_rate.read() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+
+    pub(crate) async fn publish_market_fx_rate(
+        &self,
+        snapshot: crate::market_fx::MarketFxSnapshot,
+    ) -> Result<(), AppError> {
+        let source_timestamp = snapshot
+            .source_timestamp
+            .ok_or_else(|| AppError::Internal("verified FX rate has no source timestamp".into()))?;
+        let fetched_at = snapshot
+            .fetched_at
+            .ok_or_else(|| AppError::Internal("verified FX rate has no fetch timestamp".into()))?;
+        let conn = self.conn.lock().await;
+        let changed = conn
+            .execute(
+                "INSERT INTO market_fx_rate_cache (id, rate_micros, source_timestamp, fetched_at)
+                 VALUES (1, ?1, ?2, ?3)
+                 ON CONFLICT(id) DO UPDATE SET
+                   rate_micros = excluded.rate_micros,
+                   source_timestamp = excluded.source_timestamp,
+                   fetched_at = excluded.fetched_at
+                 WHERE excluded.source_timestamp >= market_fx_rate_cache.source_timestamp",
+                params![snapshot.rate_micros, source_timestamp, fetched_at],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("persist market FX rate failed: {error}"))
+            })?;
+        if changed != 0 {
+            match self.market_fx_rate.write() {
+                Ok(mut guard) => *guard = snapshot,
+                Err(poisoned) => *poisoned.into_inner() = snapshot,
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_market_usd_cny_rate_micros(&self, rate_micros: i64) {
-        self.market_usd_cny_rate_micros
-            .store(rate_micros, AtomicOrdering::Release);
+        let snapshot = crate::market_fx::MarketFxSnapshot {
+            rate_micros,
+            source_timestamp: Some(Utc::now().timestamp()),
+            fetched_at: Some(Utc::now().timestamp()),
+        };
+        match self.market_fx_rate.write() {
+            Ok(mut guard) => *guard = snapshot,
+            Err(poisoned) => *poisoned.into_inner() = snapshot,
+        }
     }
 
     pub fn sync_database(&self) -> Result<DatabaseHealthSnapshot, AppError> {

@@ -20,7 +20,6 @@ pub enum FieldType {
     Text,
     Select,
     Int,
-    Decimal,
     Bool,
     Path,
     Url,
@@ -136,7 +135,6 @@ pub enum DynamicGroup {
     ClientNotifications,
     TelegramBot,
     Bark,
-    MarketBilling,
     MarketProviderRecommendation,
     ServerLogs,
     ClientDistribution,
@@ -1382,18 +1380,6 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
     },
     // ── Market billing ──
     SettingsField {
-        key: "CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE",
-        label: "USD/CNY exchange rate",
-        group: "Market billing",
-        field_type: FieldType::Decimal,
-        required: false,
-        restart_required: false,
-        default: Some("7"),
-        description: "CNY received for 1 USD. Applies immediately to unbilled estimates and is frozen when each invoice opens (0.01-100, up to 6 decimal places).",
-        placeholder: Some("7"),
-        dynamic_group: Some(DynamicGroup::MarketBilling),
-    },
-    SettingsField {
         key: "CC_SWITCH_ROUTER_MARKET_PROVIDER_RECOMMENDATION_MODE",
         label: "Market Provider recommendations",
         group: "Market billing",
@@ -2218,14 +2204,6 @@ fn constraints_for_field(key: &str) -> FieldConstraints {
         "CC_SWITCH_ROUTER_BARK_GLOBAL_HOURLY_LIMIT" => Some((1.0, 10_000.0)),
         _ => None,
     };
-    if key == "CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE" {
-        return FieldConstraints {
-            min: Some(0.01),
-            max: Some(100.0),
-            step: Some(0.000001),
-            ..FieldConstraints::default()
-        };
-    }
     if key == "CC_SWITCH_ROUTER_CLOCK_SOURCES" {
         return FieldConstraints {
             min_items: Some(3),
@@ -2545,9 +2523,6 @@ fn dynamic_effective_value(
                 .collect::<Vec<_>>()
                 .join(","),
         ),
-        "CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE" => Some(crate::market_billing::format_usd_cny_rate(
-            dynamic.market_usd_cny_rate_micros,
-        )),
         "CC_SWITCH_ROUTER_MARKET_PROVIDER_RECOMMENDATION_MODE" => Some(
             dynamic
                 .market_provider_recommendation_mode
@@ -3152,19 +3127,6 @@ fn normalize_value(field: &SettingsField, raw: &str) -> Result<Option<String>, A
                 field.key
             ))),
         },
-        FieldType::Decimal => {
-            if field.key != "CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE" {
-                return Err(AppError::Internal(format!(
-                    "unsupported decimal settings field: {}",
-                    field.key
-                )));
-            }
-            let rate_micros = crate::market_billing::parse_usd_cny_rate_micros(trimmed)
-                .map_err(|message| AppError::BadRequest(format!("{}: {message}", field.key)))?;
-            Ok(Some(crate::market_billing::format_usd_cny_rate(
-                rate_micros,
-            )))
-        }
         FieldType::Bool => match trimmed.to_ascii_lowercase().as_str() {
             "1" | "true" | "yes" | "on" => Ok(Some("true".to_string())),
             "0" | "false" | "no" | "off" => Ok(Some("false".to_string())),
@@ -4384,11 +4346,6 @@ pub fn apply_updates_to_dynamic(
             "CC_SWITCH_ROUTER_BARK_GLOBAL_HOURLY_LIMIT" => {
                 current.bark.global_hourly_limit = value.and_then(|v| v.parse().ok()).unwrap_or(50);
             }
-            "CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE" => {
-                current.market_usd_cny_rate_micros = value
-                    .and_then(|value| crate::market_billing::parse_usd_cny_rate_micros(value).ok())
-                    .unwrap_or(crate::market_billing::DEFAULT_USD_CNY_RATE_MICROS);
-            }
             "CC_SWITCH_ROUTER_MARKET_PROVIDER_RECOMMENDATION_MODE" => {
                 current.market_provider_recommendation_mode = value
                     .and_then(|value| {
@@ -4460,28 +4417,8 @@ mod tests {
     }
 
     #[test]
-    fn market_exchange_rate_is_dynamic_and_canonical() {
-        let field = field_by_key("CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE").unwrap();
-        assert_eq!(
-            normalize_value(field, " 7.120000 ").unwrap(),
-            Some("7.12".into())
-        );
-        assert!(normalize_value(field, "0").is_err());
-        assert!(normalize_value(field, "7.1234567").is_err());
-        assert!(!field.restart_required);
-        assert!(matches!(
-            field.dynamic_group,
-            Some(DynamicGroup::MarketBilling)
-        ));
-
-        let config = test_static_config();
-        let mut dynamic = DynamicSettings::from_config(&config);
-        let updates = BTreeMap::from([(
-            "CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE".into(),
-            Some("7.25".into()),
-        )]);
-        apply_updates_to_dynamic(&mut dynamic, &updates, &config);
-        assert_eq!(dynamic.market_usd_cny_rate_micros, 7_250_000);
+    fn market_exchange_rate_is_not_owner_editable() {
+        assert!(field_by_key("CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE").is_none());
     }
 
     #[test]
@@ -5297,11 +5234,14 @@ mod tests {
     #[test]
     fn validate_returns_diff_and_dynamic_groups() {
         let mut existing = HashMap::new();
-        existing.insert("CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE".into(), "7".into());
+        existing.insert(
+            "CC_SWITCH_ROUTER_MARKET_PROVIDER_RECOMMENDATION_MODE".into(),
+            "shadow".into(),
+        );
         let mut updates = BTreeMap::new();
         updates.insert(
-            "CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE".into(),
-            Some("7.2".into()),
+            "CC_SWITCH_ROUTER_MARKET_PROVIDER_RECOMMENDATION_MODE".into(),
+            Some("on".into()),
         );
         updates.insert(
             "CC_SWITCH_ROUTER_ADMIN_EMAILS".into(),
@@ -5501,8 +5441,8 @@ mod tests {
     #[test]
     fn settings_contract_exposes_all_fields_in_seven_domains() {
         let schema = schema_response();
-        assert_eq!(SETTINGS_FIELDS.len(), 132);
-        assert_eq!(schema.fields.len(), 132);
+        assert_eq!(SETTINGS_FIELDS.len(), 131);
+        assert_eq!(schema.fields.len(), 131);
         assert_eq!(schema.categories.len(), 7);
         assert!(
             SETTINGS_FIELDS
@@ -5516,7 +5456,7 @@ mod tests {
                 .iter()
                 .map(|category| category.field_count)
                 .sum::<usize>(),
-            132
+            131
         );
         assert!(schema.fields.iter().all(|field| !field.group.is_empty()));
         let webhook = schema

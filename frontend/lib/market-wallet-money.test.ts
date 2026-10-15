@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { formatWalletUnits, parseUsdMinor, safeCheckoutUrl } from "./market-wallet-money";
+import { formatWalletUnits, formatWalletUnitsAsCny, parseUsdMinor, safeCheckoutUrl } from "./market-wallet-money";
 
 test("wallet money display uses integer units even above the JS safe-integer range", () => {
   assert.equal(formatWalletUnits("8640000"), "$1.00");
@@ -8,6 +8,7 @@ test("wallet money display uses integer units even above the JS safe-integer ran
   assert.equal(formatWalletUnits("1"), "<$0.000001");
   assert.equal(formatWalletUnits("-8640000"), "−$1.00");
   assert.equal(formatWalletUnits("90071992547409930"), "$10,424,999,137.431704");
+  assert.equal(formatWalletUnitsAsCny("8640000", 6_693_100), "≈¥6.6931");
 });
 
 test("top-up amount accepts only exact supported cents", () => {

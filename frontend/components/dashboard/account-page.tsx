@@ -28,14 +28,9 @@ import {
   enableBinanceAutoSettlement,
   getAccountPaymentProfile,
   getBinanceAutoSettlementStatus,
-  getMarketBillingConfig,
   updateAccountPaymentProfile,
   verifyBinanceAutoSettlement,
 } from "@/lib/api";
-import {
-  DEFAULT_USD_CNY_RATE_MICROS,
-  formatUsdCnyRate,
-} from "@/lib/market-money";
 import { binanceAutoSettlementUiState } from "@/lib/binance-auto-settlement";
 import type {
   BinanceAutoSettlementStatus,
@@ -118,7 +113,7 @@ function chainLabel(chain: CryptoDraft["chain"]) {
 
 /** Payment details (Account → 收款信息). Blocked renters live on Client Market. */
 export function AccountPaymentsPanel() {
-  const { t } = useLocaleText();
+  const { t, fxRateFresh, fxRateLabel } = useLocaleText();
   const { session, loading: authLoading } = useAuth();
   const authed = !!session?.authenticated;
   const actorKey = authed
@@ -129,9 +124,6 @@ export function AccountPaymentsPanel() {
   const [draft, setDraft] = React.useState<PaymentDraft>(emptyPaymentDraft);
   const [baseline, setBaseline] = React.useState(() => serializePaymentDraft(emptyPaymentDraft()));
   const [previews, setPreviews] = React.useState<Record<string, string>>({});
-  const [usdCnyRateMicros, setUsdCnyRateMicros] = React.useState(
-    DEFAULT_USD_CNY_RATE_MICROS,
-  );
   const [binanceStatus, setBinanceStatus] = React.useState<BinanceAutoSettlementStatus | null>(null);
   const [binanceDiscovery, setBinanceDiscovery] = React.useState<DiscoverBinanceAccountResponse | null>(null);
   const [binanceCredentialDraft, setBinanceCredentialDraft] = React.useState(() => ({
@@ -243,7 +235,6 @@ export function AccountPaymentsPanel() {
     setLoading(true);
     Promise.all([
       getAccountPaymentProfile(),
-      getMarketBillingConfig(),
       getBinanceAutoSettlementStatus().catch((error) => {
         if (active) {
           setBinanceStatusError(error instanceof Error ? error.message : String(error));
@@ -251,10 +242,9 @@ export function AccountPaymentsPanel() {
         return null;
       }),
     ])
-      .then(([profile, billingConfig, nextBinanceStatus]) => {
+      .then(([profile, nextBinanceStatus]) => {
         if (!active) return;
         applyProfile(profile.methods, profile.contacts || []);
-        setUsdCnyRateMicros(billingConfig.usdCnyRateMicros);
         if (nextBinanceStatus) setBinanceStatus(nextBinanceStatus);
       })
       .catch((error) => {
@@ -516,9 +506,9 @@ export function AccountPaymentsPanel() {
               <h2 className="text-base font-semibold">{t("account.paymentDetails")}</h2>
             </div>
             <p className="mt-1 text-sm text-muted-foreground">{t("account.visibilityHint")}</p>
-            <p className="mt-1 text-xs font-medium text-amber-700">{t("market.currencyNotice", {
-              rate: formatUsdCnyRate(usdCnyRateMicros),
-            })}</p>
+            <p className="mt-1 text-xs font-medium text-amber-700">{fxRateFresh
+              ? t("market.currencyNotice", { rate: fxRateLabel })
+              : t("market.currencyUnavailable")}</p>
           </div>
           <Button variant="primary" isDisabled={!dirty || saving} onClick={() => void save()}>
             {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}

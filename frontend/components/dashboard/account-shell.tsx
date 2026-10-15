@@ -12,6 +12,7 @@ import {
   DASHBOARD_ACCOUNT_API_KEYS_PATH,
   DASHBOARD_ACCOUNT_CLIENT_PATH,
   DASHBOARD_ACCOUNT_BILLING_PATH,
+  DASHBOARD_ACCOUNT_WALLET_PATH,
   DASHBOARD_ACCOUNT_MARKET_ACCESS_PATH,
   DASHBOARD_ACCOUNT_MARKET_READINESS_PATH,
   DASHBOARD_ACCOUNT_CONSUMER_USAGE_PATH,
@@ -39,6 +40,7 @@ const NAV_ITEMS: {
     | "account.nav.providerUsage"
     | "account.nav.consumerUsage"
     | "account.nav.billing"
+    | "account.nav.wallet"
     | "account.nav.marketReadiness"
     | "account.nav.marketAccess"
     | "account.nav.payments"
@@ -103,6 +105,14 @@ const NAV_ITEMS: {
     labelKey: "account.nav.payments",
     icon: WalletCards,
     match: (pathname: string) => pathname.startsWith("/account/payments"),
+  },
+  {
+    id: "wallet",
+    href: DASHBOARD_ACCOUNT_WALLET_PATH,
+    groupLabelKey: "account.nav.group.market",
+    labelKey: "account.nav.wallet",
+    icon: WalletCards,
+    match: (pathname: string) => pathname.startsWith("/account/wallet"),
   },
   {
     id: "billing",

@@ -9,6 +9,7 @@ export const DASHBOARD_ACCOUNT_PROVIDER_USAGE_PATH = "/account/provider-usage/";
 export const DASHBOARD_ACCOUNT_CONSUMER_USAGE_PATH = "/account/consumer-usage/";
 export const DASHBOARD_ACCOUNT_MARKET_READINESS_PATH = "/account/market-readiness/";
 export const DASHBOARD_ACCOUNT_BILLING_PATH = "/account/billing/";
+export const DASHBOARD_ACCOUNT_WALLET_PATH = "/account/wallet/";
 export const DASHBOARD_ACCOUNT_MARKET_ACCESS_PATH = "/account/market-access/";
 export const DASHBOARD_ACCOUNT_PAYMENTS_PATH = "/account/payments/";
 export const DASHBOARD_ACCOUNT_SHARE_PATH = "/account/share/";
@@ -28,6 +29,7 @@ export type DashboardRoute =
   | typeof DASHBOARD_ACCOUNT_CONSUMER_USAGE_PATH
   | typeof DASHBOARD_ACCOUNT_MARKET_READINESS_PATH
   | typeof DASHBOARD_ACCOUNT_BILLING_PATH
+  | typeof DASHBOARD_ACCOUNT_WALLET_PATH
   | typeof DASHBOARD_ACCOUNT_MARKET_ACCESS_PATH
   | typeof DASHBOARD_ACCOUNT_PAYMENTS_PATH
   | typeof DASHBOARD_ACCOUNT_SHARE_PATH
@@ -41,6 +43,7 @@ export function normalizeDashboardPath(pathname: string): DashboardRoute | null 
   if (pathname.startsWith("/account/share")) return DASHBOARD_ACCOUNT_SHARE_PATH;
   if (pathname.startsWith("/account/market-readiness")) return DASHBOARD_ACCOUNT_MARKET_READINESS_PATH;
   if (pathname.startsWith("/account/billing")) return DASHBOARD_ACCOUNT_BILLING_PATH;
+  if (pathname.startsWith("/account/wallet")) return DASHBOARD_ACCOUNT_WALLET_PATH;
   if (pathname.startsWith("/account/market-access")) return DASHBOARD_ACCOUNT_MARKET_ACCESS_PATH;
   if (pathname.startsWith("/account/payments")) return DASHBOARD_ACCOUNT_PAYMENTS_PATH;
   if (pathname.startsWith("/account/provider-usage")) return DASHBOARD_ACCOUNT_PROVIDER_USAGE_PATH;
@@ -117,6 +120,7 @@ const ACCOUNT_NAV_HREFS = [
   DASHBOARD_ACCOUNT_CONSUMER_USAGE_PATH,
   DASHBOARD_ACCOUNT_MARKET_READINESS_PATH,
   DASHBOARD_ACCOUNT_BILLING_PATH,
+  DASHBOARD_ACCOUNT_WALLET_PATH,
   DASHBOARD_ACCOUNT_MARKET_ACCESS_PATH,
   DASHBOARD_ACCOUNT_PAYMENTS_PATH,
   DASHBOARD_ACCOUNT_SHARE_PATH,

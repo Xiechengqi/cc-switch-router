@@ -2715,6 +2715,10 @@ export type MarketBillingDashboard = {
 export type MarketBillingConfig = {
   currency: "USD";
   usdCnyRateMicros: number;
+  fxRateSource: "api.exchangerate.fun" | "stale_cache" | "legacy_fallback";
+  fxRateSourceTimestamp: number | null;
+  fxRateFetchedAt: number | null;
+  fxRateFresh: boolean;
   binanceAutoSettlementEnabled: boolean;
   binanceServiceAvailability?: string;
 };

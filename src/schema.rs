@@ -199,6 +199,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         54,
         include_str!("../schema/0054_market_platform_contracts.sql"),
     ),
+    (55, include_str!("../schema/0055_market_fx_rate.sql")),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -726,7 +727,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count baseline tables");
-        assert_eq!(table_count, 191);
+        assert_eq!(table_count, 193);
         let removed_client_recovery_table_count = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master

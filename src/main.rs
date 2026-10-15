@@ -28,6 +28,7 @@ mod ip_iq;
 mod market_access;
 mod market_billing;
 mod market_finance;
+mod market_fx;
 mod market_payments;
 mod market_payouts;
 mod market_platform_contracts;
@@ -247,6 +248,9 @@ async fn main() -> Result<()> {
             .context("configure platform wallet payments failed")?,
     );
     let store = AppStore::new(&config)?;
+    if let Err(error) = market_fx::refresh_on_startup(&store).await {
+        tracing::warn!(error = %error, "initial USD/CNY rate refresh failed; using verified cache if fresh");
+    }
     let share_abuse = Arc::new(ShareAbuseTracker::new(
         store.load_active_share_client_bans().await?,
     ));
@@ -381,6 +385,7 @@ async fn main() -> Result<()> {
     let market_provider_rank_store = state.store.clone();
     let binance_settlement_state = state.clone();
     let market_payments_state = state.clone();
+    let market_fx_store = state.store.clone();
     let database_sync_store = state.store.clone();
     let shutdown_database_sync_store = state.store.clone();
     let database_sync_interval_secs = config.database.sync_interval_secs;
@@ -852,6 +857,12 @@ async fn main() -> Result<()> {
         },
     );
     let market_payments_shutdown_rx = background_shutdown_rx.clone();
+    let market_fx_shutdown_rx = background_shutdown_rx.clone();
+    let market_fx_task = spawn_background_task(
+        "USD/CNY market FX",
+        background_shutdown_rx.clone(),
+        async move { crate::market_fx::run_service(market_fx_store, market_fx_shutdown_rx).await },
+    );
     let binance_settlement_task = tokio::spawn(async move {
         let result = crate::binance_settlement::run_service(
             binance_settlement_state,
@@ -943,6 +954,7 @@ async fn main() -> Result<()> {
         ("Client Market trade", client_market_trade_task),
         ("Share Market", share_market_task),
         ("Market billing", market_billing_task),
+        ("USD/CNY market FX", market_fx_task),
         ("Binance auto-settlement", binance_settlement_task),
         ("Market payments", market_payments_task),
     ];

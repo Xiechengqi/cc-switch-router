@@ -6,10 +6,12 @@
  */
 
 import * as React from "react";
+import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { Button } from "@heroui/react";
 import { ArrowUpRight, CheckCircle2, Clock3, CreditCard, Loader2, RefreshCw, WalletCards } from "lucide-react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
+import { DASHBOARD_ACCOUNT_BILLING_PATH } from "@/lib/dashboard-nav";
 import {
   createMarketWalletTopup,
   getMarketWallet,
@@ -22,7 +24,7 @@ import {
   type MarketWalletTopup,
   type MarketWalletTransaction,
 } from "@/lib/market-wallet-api";
-import { formatWalletUnits, parseUsdMinor, safeCheckoutUrl } from "@/lib/market-wallet-money";
+import { formatWalletUnits, formatWalletUnitsAsCny, parseUsdMinor, safeCheckoutUrl } from "@/lib/market-wallet-money";
 
 const FINAL_TOPUP_STATUS = new Set(["credited", "review_required", "expired", "cancelled"]);
 
@@ -65,7 +67,7 @@ export function WalletActionButton({
 }
 
 export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWallet }) {
-  const { locale, t } = useLocaleText();
+  const { locale, t, displayCurrency, fxRateFresh, fxRateMicros } = useLocaleText();
   const searchParams = useSearchParams();
   const returnedTopupId = searchParams.get("topup");
   const [wallet, setWallet] = React.useState(initialWallet);
@@ -221,10 +223,11 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
       <section className="grid min-w-0 gap-5 rounded-xl border border-border bg-card p-5 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] sm:p-6">
         <div className="min-w-0">
           <p className="flex items-center gap-2 text-sm text-muted-foreground"><WalletCards className="size-4" aria-hidden="true" />{t("marketWallet.available")}</p>
-          <p className="mt-2 break-all text-3xl font-semibold tabular-nums tracking-tight sm:text-4xl">{formatWalletUnits(wallet.availableUnits)}</p>
-          <p className="mt-2 text-sm text-muted-foreground">{t("marketWallet.held")}: {formatWalletUnits(wallet.heldUnits)}</p>
+          <p className="mt-2 break-all text-3xl font-semibold tabular-nums tracking-tight sm:text-4xl">{displayCurrency === "CNY" && fxRateFresh ? formatWalletUnitsAsCny(wallet.availableUnits, fxRateMicros, locale) : formatWalletUnits(wallet.availableUnits)}</p>
+          {displayCurrency === "CNY" && fxRateFresh ? <p className="mt-1 text-xs text-muted-foreground">{t("marketWallet.displayOnly", { amount: formatWalletUnits(wallet.availableUnits) })}</p> : null}
+          <p className="mt-2 text-sm text-muted-foreground">{t("marketWallet.held")}: {displayCurrency === "CNY" && fxRateFresh ? formatWalletUnitsAsCny(wallet.heldUnits, fxRateMicros, locale) : formatWalletUnits(wallet.heldUnits)}</p>
         </div>
-        <form className="grid min-w-0 content-start gap-3" onSubmit={(event) => void submitTopup(event)}>
+        {wallet.canTopup ? <form className="grid min-w-0 content-start gap-3" onSubmit={(event) => void submitTopup(event)}>
           <p className="text-sm font-semibold">{t("marketWallet.topup")}</p>
           <label className="grid min-w-0 gap-1 text-sm">
             <span>{t("marketWallet.channel")}</span>
@@ -257,11 +260,14 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
             disabled={!wallet.canTopup || !channels.length || parsedAmount == null || !!busy}
           />
           {!channels.length ? <p className="text-xs text-muted-foreground">{t("marketWallet.noChannelHelp")}</p> : null}
-        </form>
+        </form> : <div className="grid content-start gap-3 rounded-lg bg-muted/50 p-4 text-sm text-muted-foreground">
+          <p>{t("marketWallet.notOpen")}</p>
+          <Link href={DASHBOARD_ACCOUNT_BILLING_PATH} className="font-medium text-foreground underline underline-offset-2">{t("marketWallet.legacyBilling")}</Link>
+        </div>}
       </section>
 
-      {!loaded ? <p className="text-sm text-muted-foreground">{t("common.loading")}</p> : null}
-      <div className="grid min-w-0 gap-6 lg:grid-cols-2">
+      {(wallet.canTopup || wallet.hasWalletActivity) && !loaded ? <p className="text-sm text-muted-foreground">{t("common.loading")}</p> : null}
+      {wallet.canTopup || wallet.hasWalletActivity ? <div className="grid min-w-0 gap-6 lg:grid-cols-2">
         <section className="min-w-0 rounded-xl border border-border bg-card p-5" aria-label={t("marketWallet.topups")}>
           <h2 className="text-base font-semibold">{t("marketWallet.topups")}</h2>
           <ul className="mt-3 grid gap-2">
@@ -299,7 +305,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
           </ul>
           {transactionCursor ? <Button size="sm" variant="ghost" isDisabled={!!busy} onPress={() => void loadMore("transactions")}>{t("marketWallet.more")}</Button> : null}
         </section>
-      </div>
+      </div> : null}
     </main>
   );
 }

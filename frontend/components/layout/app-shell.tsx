@@ -149,6 +149,25 @@ function LanguageSwitcher() {
   );
 }
 
+function CurrencySwitcher() {
+  const { displayCurrency, setDisplayCurrency, fxRateFresh, fxRateLabel, t } = useLocaleText();
+  const next = displayCurrency === "USD" ? "CNY" : "USD";
+  return (
+    <button
+      type="button"
+      aria-label={t("common.currencySwitch", { currency: next })}
+      title={fxRateFresh
+        ? t("common.currencyRate", { rate: fxRateLabel })
+        : t("common.currencyUnavailable")}
+      disabled={next === "CNY" && !fxRateFresh}
+      className="inline-flex h-11 shrink-0 items-center justify-center rounded-md px-2 text-sm font-medium text-slate-500 transition-colors hover:text-slate-700 active:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-40"
+      onClick={() => setDisplayCurrency(next)}
+    >
+      {next}
+    </button>
+  );
+}
+
 function DashboardNav({
   active,
   authed,
@@ -322,6 +341,7 @@ function Topbar({ active }: { active: DashboardShellActive }) {
           )}
 
           <div className="col-start-2 row-start-1 flex flex-nowrap items-center justify-end gap-2 justify-self-end lg:col-start-3">
+            <CurrencySwitcher />
             <LanguageSwitcher />
             {showAuthedChrome ? (
               <Dropdown>

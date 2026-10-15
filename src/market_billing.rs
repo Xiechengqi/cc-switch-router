@@ -5,7 +5,7 @@ use crate::db::{
     Connection, OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter,
 };
 use axum::extract::{Path, Query, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, header};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chrono::{DateTime, Duration, Utc};
@@ -435,6 +435,10 @@ pub struct BillingDashboardView {
 pub struct MarketBillingConfigView {
     pub currency: &'static str,
     pub usd_cny_rate_micros: i64,
+    pub fx_rate_source: &'static str,
+    pub fx_rate_source_timestamp: Option<i64>,
+    pub fx_rate_fetched_at: Option<i64>,
+    pub fx_rate_fresh: bool,
     pub binance_auto_settlement_enabled: bool,
     pub binance_service_availability: &'static str,
 }
@@ -873,17 +877,32 @@ async fn get_dashboard(
     ))
 }
 
-async fn get_billing_config(State(state): State<ServerState>) -> Json<MarketBillingConfigView> {
+async fn get_billing_config(State(state): State<ServerState>) -> impl axum::response::IntoResponse {
     let availability = state.binance_settlement.service_availability(false).await;
-    Json(MarketBillingConfigView {
-        currency: MARKET_CURRENCY,
-        usd_cny_rate_micros: state.store.market_usd_cny_rate_micros(),
-        binance_auto_settlement_enabled: state.binance_settlement.mode()
-            == crate::binance_settlement::GlobalMode::Enabled
-            && availability.status
-                == crate::binance_settlement::BinanceServiceAvailability::Available,
-        binance_service_availability: availability.status.as_str(),
-    })
+    let fx = state.store.market_fx_snapshot();
+    let fresh = fx.is_fresh_at(Utc::now().timestamp());
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(MarketBillingConfigView {
+            currency: MARKET_CURRENCY,
+            usd_cny_rate_micros: fx.rate_micros,
+            fx_rate_source: if fresh {
+                "api.exchangerate.fun"
+            } else if fx.source_timestamp.is_some() {
+                "stale_cache"
+            } else {
+                "legacy_fallback"
+            },
+            fx_rate_source_timestamp: fx.source_timestamp,
+            fx_rate_fetched_at: fx.fetched_at,
+            fx_rate_fresh: fresh,
+            binance_auto_settlement_enabled: state.binance_settlement.mode()
+                == crate::binance_settlement::GlobalMode::Enabled
+                && availability.status
+                    == crate::binance_settlement::BinanceServiceAvailability::Available,
+            binance_service_availability: availability.status.as_str(),
+        }),
+    )
 }
 
 async fn update_supplier_profile(
@@ -6603,7 +6622,8 @@ impl AppStore {
     ) -> Result<Vec<BillingAction>, AppError> {
         let now = Utc::now();
         let now_text = now.to_rfc3339();
-        let usd_cny_rate_micros = self.market_usd_cny_rate_micros();
+        let fx = self.market_fx_snapshot();
+        let usd_cny_rate_micros = fx.rate_micros;
         let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -6723,6 +6743,11 @@ impl AppStore {
                 &now_text,
             )?;
         } else {
+            if !fx.is_fresh_at(Utc::now().timestamp()) {
+                return Err(AppError::ServiceUnavailable(
+                    "verified USD/CNY rate is temporarily unavailable".into(),
+                ));
+            }
             open_invoice_tx(
                 &tx,
                 &account,
@@ -9425,6 +9450,11 @@ fn open_invoice_tx(
         &format!("invoice-opened:{invoice_id}"),
         &opened_at,
     )?;
+    tx.execute(
+        "DELETE FROM market_fx_deferred_invoices WHERE account_id = ?1",
+        params![account.id],
+    )
+    .map_err(map_db("clear settled FX deferral"))?;
     Ok(invoice_id)
 }
 
@@ -9625,14 +9655,9 @@ fn mark_overdue_refund_obligations_tx(
     Ok(())
 }
 
-fn open_final_invoices_tx(
-    tx: &Transaction<'_>,
-    now: DateTime<Utc>,
-    usd_cny_rate_micros: i64,
-) -> Result<(), AppError> {
-    let account_ids = tx
-        .prepare(
-            "SELECT account.id
+fn pending_final_invoice_account_ids_tx(tx: &Transaction<'_>) -> Result<Vec<String>, AppError> {
+    tx.prepare(
+        "SELECT account.id
              FROM market_credit_accounts account
              WHERE account.status IN ('active', 'near_credit_limit')
                AND account.balance_units > 0
@@ -9642,16 +9667,23 @@ fn open_final_invoices_tx(
                      AND contract.status IN ('trial', 'active')
                )
              ORDER BY account.updated_at, account.id LIMIT ?1",
-        )
-        .and_then(|mut statement| {
-            statement
-                .query_map(params![MAX_MAINTENANCE_ROWS_PER_RECONCILE], |row| {
-                    row.get::<_, String>(0)
-                })?
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .map_err(map_db("load final market settlements"))?;
-    for account_id in account_ids {
+    )
+    .and_then(|mut statement| {
+        statement
+            .query_map(params![MAX_MAINTENANCE_ROWS_PER_RECONCILE], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()
+    })
+    .map_err(map_db("load final market settlements"))
+}
+
+fn open_final_invoices_tx(
+    tx: &Transaction<'_>,
+    now: DateTime<Utc>,
+    usd_cny_rate_micros: i64,
+) -> Result<(), AppError> {
+    for account_id in pending_final_invoice_account_ids_tx(tx)? {
         let account = load_account_row_tx(tx, &account_id)?;
         open_invoice_tx(
             tx,
@@ -9661,6 +9693,68 @@ fn open_final_invoices_tx(
             None,
             usd_cny_rate_micros,
         )?;
+    }
+    Ok(())
+}
+
+fn defer_final_invoices_tx(tx: &Transaction<'_>, now: DateTime<Utc>) -> Result<(), AppError> {
+    let now_text = now.to_rfc3339();
+    for account_id in pending_final_invoice_account_ids_tx(tx)? {
+        tx.execute(
+            "UPDATE market_credit_accounts
+             SET status = 'settlement_due', version = version + 1, updated_at = ?2
+             WHERE id = ?1",
+            params![account_id, now_text],
+        )
+        .map_err(map_db("defer final market settlement"))?;
+        tx.execute(
+            "INSERT INTO market_fx_deferred_invoices (account_id, reason, created_at)
+             VALUES (?1, 'final_service_ended', ?2) ON CONFLICT(account_id) DO NOTHING",
+            params![account_id, now_text],
+        )
+        .map_err(map_db("record deferred final market settlement"))?;
+    }
+    Ok(())
+}
+
+fn open_fx_deferred_invoices_tx(
+    tx: &Transaction<'_>,
+    now: DateTime<Utc>,
+    usd_cny_rate_micros: i64,
+) -> Result<(), AppError> {
+    tx.execute(
+        "DELETE FROM market_fx_deferred_invoices
+         WHERE NOT EXISTS (
+             SELECT 1 FROM market_credit_accounts account
+             WHERE account.id = market_fx_deferred_invoices.account_id
+               AND account.status = 'settlement_due' AND account.balance_units > 0
+         )",
+        [],
+    )
+    .map_err(map_db("prune obsolete FX deferrals"))?;
+    let deferred_accounts = tx
+        .prepare(
+            "SELECT account.id, deferred.reason FROM market_fx_deferred_invoices deferred
+             JOIN market_credit_accounts account ON account.id = deferred.account_id
+             WHERE account.status = 'settlement_due' AND account.balance_units > 0
+               AND NOT EXISTS (
+                   SELECT 1 FROM market_invoices invoice
+                   WHERE invoice.account_id = account.id
+                     AND invoice.status IN ('open', 'payment_declared', 'overdue', 'disputed')
+               )
+             ORDER BY account.updated_at, account.id LIMIT ?1",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map(params![MAX_MAINTENANCE_ROWS_PER_RECONCILE], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(map_db("load FX-deferred market invoices"))?;
+    for (account_id, reason) in deferred_accounts {
+        let account = load_account_row_tx(tx, &account_id)?;
+        open_invoice_tx(tx, &account, now, &reason, None, usd_cny_rate_micros)?;
     }
     Ok(())
 }
@@ -9796,7 +9890,9 @@ impl AppStore {
         &self,
         now: DateTime<Utc>,
     ) -> Result<Vec<BillingAction>, AppError> {
-        let usd_cny_rate_micros = self.market_usd_cny_rate_micros();
+        let fx = self.market_fx_snapshot();
+        let usd_cny_rate_micros = fx.rate_micros;
+        let fx_fresh = fx.is_fresh_at(Utc::now().timestamp());
         let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -9901,18 +9997,35 @@ impl AppStore {
                     params![account.id, account.balance_units, now_text],
                 )
                 .map_err(map_db("mark market credit limit reached"))?;
-                open_invoice_tx(
-                    &tx,
-                    &account,
-                    now,
-                    if credit_limit_reached {
-                        "credit_limit_reached"
-                    } else {
-                        "funding_exhausted"
-                    },
-                    None,
-                    usd_cny_rate_micros,
-                )?;
+                if fx_fresh {
+                    open_invoice_tx(
+                        &tx,
+                        &account,
+                        now,
+                        if credit_limit_reached {
+                            "credit_limit_reached"
+                        } else {
+                            "funding_exhausted"
+                        },
+                        None,
+                        usd_cny_rate_micros,
+                    )?;
+                } else {
+                    tx.execute(
+                        "INSERT INTO market_fx_deferred_invoices (account_id, reason, created_at)
+                         VALUES (?1, ?2, ?3) ON CONFLICT(account_id) DO NOTHING",
+                        params![
+                            account.id,
+                            if credit_limit_reached {
+                                "credit_limit_reached"
+                            } else {
+                                "funding_exhausted"
+                            },
+                            now_text,
+                        ],
+                    )
+                    .map_err(map_db("defer market invoice until FX rate recovers"))?;
+                }
             } else {
                 if funding_exhausted {
                     tx.execute(
@@ -9977,7 +10090,12 @@ impl AppStore {
         crate::share_market::apply_accepted_price_changes_tx(&tx, &now_text)?;
         sync_suspended_funding_runway_alerts_tx(&tx, &now_text)?;
         recover_inactive_funding_runway_alerts_tx(&tx, &now_text)?;
-        open_final_invoices_tx(&tx, now, usd_cny_rate_micros)?;
+        if fx_fresh {
+            open_fx_deferred_invoices_tx(&tx, now, usd_cny_rate_micros)?;
+            open_final_invoices_tx(&tx, now, usd_cny_rate_micros)?;
+        } else {
+            defer_final_invoices_tx(&tx, now)?;
+        }
         mark_overdue_invoices_tx(&tx, &now_text)?;
         mark_overdue_refund_obligations_tx(&tx, now)?;
         crate::market_recurring::reconcile_tx(&tx, now)?;
@@ -13294,6 +13412,134 @@ mod tests {
             Some("Test payment instructions")
         );
         assert_eq!(invoice.payment_profile_updated_at, snapshot_updated_at);
+    }
+
+    #[tokio::test]
+    async fn stale_fx_defers_new_cny_invoice_until_a_verified_quote_returns() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let buyer = session("buyer-stale-fx", "buyer-stale-fx@example.com");
+        let supplier = session("supplier-stale-fx", "supplier-stale-fx@example.com");
+        configure_supplier(&store, &supplier, 1).await;
+        let started_at = Utc::now();
+        let contract_id = add_client_contract(
+            &store,
+            &buyer,
+            &supplier,
+            "client-stale-fx",
+            MONEY_UNITS_PER_MINOR,
+            started_at,
+        )
+        .await;
+        force_contract_out_of_trial(&store, &contract_id, started_at).await;
+        let observed_at = started_at + Duration::seconds(1);
+        record_client_health(&store, "client-stale-fx", observed_at, "healthy").await;
+        store
+            .publish_market_fx_rate(crate::market_fx::MarketFxSnapshot {
+                rate_micros: 7_000_000,
+                source_timestamp: Some(Utc::now().timestamp() - 3 * 86_400),
+                fetched_at: Some(Utc::now().timestamp() - 3 * 86_400),
+            })
+            .await
+            .unwrap();
+        store.market_billing_reconcile(observed_at).await.unwrap();
+        let deferred = store.market_billing_dashboard(&buyer).await.unwrap();
+        assert_eq!(deferred.accounts[0].status, ACCOUNT_SETTLEMENT_DUE);
+        assert!(deferred.accounts[0].open_invoice.is_none());
+
+        store
+            .publish_market_fx_rate(crate::market_fx::MarketFxSnapshot {
+                rate_micros: 6_693_100,
+                source_timestamp: Some(Utc::now().timestamp()),
+                fetched_at: Some(Utc::now().timestamp()),
+            })
+            .await
+            .unwrap();
+        store
+            .market_billing_reconcile(observed_at + Duration::seconds(1))
+            .await
+            .unwrap();
+        let recovered = store.market_billing_dashboard(&buyer).await.unwrap();
+        let invoice = recovered.accounts[0]
+            .open_invoice
+            .as_ref()
+            .expect("invoice after FX recovery");
+        assert_eq!(invoice.usd_cny_rate_micros, 6_693_100);
+        let conn = store.conn.lock().await;
+        let deferred_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM market_fx_deferred_invoices",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(deferred_count, 0);
+    }
+
+    #[tokio::test]
+    async fn stale_fx_also_defers_final_settlement_after_the_last_service_ends() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let buyer = session("buyer-final-fx", "buyer-final-fx@example.com");
+        let supplier = session("supplier-final-fx", "supplier-final-fx@example.com");
+        configure_supplier(&store, &supplier, 100).await;
+        let started_at = Utc::now();
+        let contract_id = add_client_contract(
+            &store,
+            &buyer,
+            &supplier,
+            "client-final-fx",
+            MONEY_UNITS_PER_MINOR,
+            started_at,
+        )
+        .await;
+        force_contract_out_of_trial(&store, &contract_id, started_at).await;
+        let observed_at = started_at + Duration::seconds(1);
+        record_client_health(&store, "client-final-fx", observed_at, "healthy").await;
+        store.market_billing_reconcile(observed_at).await.unwrap();
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE market_service_contracts SET status = 'terminated' WHERE id = ?1",
+                params![contract_id],
+            )
+            .unwrap();
+        }
+        store
+            .publish_market_fx_rate(crate::market_fx::MarketFxSnapshot {
+                rate_micros: 7_000_000,
+                source_timestamp: Some(Utc::now().timestamp() - 3 * 86_400),
+                fetched_at: Some(Utc::now().timestamp() - 3 * 86_400),
+            })
+            .await
+            .unwrap();
+        store
+            .market_billing_reconcile(observed_at + Duration::seconds(1))
+            .await
+            .unwrap();
+        let deferred = store.market_billing_dashboard(&buyer).await.unwrap();
+        assert_eq!(deferred.accounts[0].status, ACCOUNT_SETTLEMENT_DUE);
+        assert!(deferred.accounts[0].open_invoice.is_none());
+
+        store
+            .publish_market_fx_rate(crate::market_fx::MarketFxSnapshot {
+                rate_micros: 6_693_100,
+                source_timestamp: Some(Utc::now().timestamp()),
+                fetched_at: Some(Utc::now().timestamp()),
+            })
+            .await
+            .unwrap();
+        store
+            .market_billing_reconcile(observed_at + Duration::seconds(2))
+            .await
+            .unwrap();
+        let recovered = store.market_billing_dashboard(&buyer).await.unwrap();
+        assert_eq!(
+            recovered.accounts[0]
+                .open_invoice
+                .as_ref()
+                .unwrap()
+                .usd_cny_rate_micros,
+            6_693_100
+        );
     }
 
     #[tokio::test]

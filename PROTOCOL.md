@@ -388,7 +388,7 @@ v1 权重固定为服务质量 45%、有效选择 30%、履约 15%、供给广�
 
 付费 Share 与 Client Host 不再按单个商品预付或续费。Router 按「买家 + 供应商」维护唯一 USD 赊账账户；每个服务独立享受 12 小时健康时长试用,之后按固定 USD 每日价格和实际健康秒数累计。有限额度使用达到 80% 时向买卖双方各发送一次预警,用满后自动生成聚合账单。买家主动清账、供应商要求清账、供应商永久关闭赊账账户或最后一个服务结束时也会生成聚合账单。
 
-USD 是唯一报价、授信、记账和结算币种。账单总额与每条账单明细同时返回 `amountUsdMinor` 和 `amountCnyMinor`，其中 `amountMinor` 继续作为 USD 兼容字段。美元兑人民币汇率由 `CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE` 控制，默认 `1:7`，可在 Settings 热更新；未出账估算使用当前汇率，账单通过 `usdCnyRateMicros`（百万分之一精度）冻结出账汇率及人民币金额，后续设置变更不影响历史账单。人民币金额四舍五入到分且仅用于展示。`/v1/market-billing/supplier-profiles/:currency` 的路径参数只接受 `USD`。
+USD 是唯一报价、授信、记账和结算币种。账单总额与每条账单明细同时返回 `amountUsdMinor` 和 `amountCnyMinor`，其中 `amountMinor` 继续作为 USD 兼容字段。Router 每 15 分钟从 `https://api.exchangerate.fun/latest` 获取并验证 USD/CNY，持久化最近可信汇率；`CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE` 只作为首次获取失败时的历史展示回退，不能再通过 Settings 热更新。可信汇率超过 48 小时未更新时，暂缓新人民币账单开具，恢复后补开；未出账估算只在可信汇率新鲜时提供人民币显示。账单通过 `usdCnyRateMicros`（百万分之一精度）冻结出账汇率及人民币金额，后续汇率变更不影响历史账单。人民币金额四舍五入到分且仅用于展示。`/v1/market-billing/supplier-profiles/:currency` 的路径参数只接受 `USD`。
 
 | 方法 | 路径 | 用途 |
 |---|---|---|

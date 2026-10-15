@@ -47,6 +47,7 @@ test("rounds half away from zero at the display scale only", () => {
 
 test("formats per-1M rates through the same rounding as amounts", () => {
   assert.equal(formatUsdMicrosPerMillion(3_000_000, "en-US"), "$3.00");
+  assert.equal(formatUsdMicrosPerMillion(3_000_000, "en-US", { currency: "CNY", rateMicros: 6_693_100 }), "≈¥20.08");
   assert.equal(formatUsdMicrosPerMillion("300000", "en-US"), "$0.30");
   assert.equal(formatUsdMicrosPerMillion(null, "en-US"), null);
 });
