@@ -191,6 +191,14 @@ const MIGRATIONS: &[(i64, &str)] = &[
         52,
         include_str!("../schema/0052_market_provider_registry.sql"),
     ),
+    (
+        53,
+        include_str!("../schema/0053_market_platform_wallet.sql"),
+    ),
+    (
+        54,
+        include_str!("../schema/0054_market_platform_contracts.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -718,7 +726,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count baseline tables");
-        assert_eq!(table_count, 164);
+        assert_eq!(table_count, 191);
         let removed_client_recovery_table_count = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -1289,8 +1297,11 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 52);
-        check_compatibility(&conn).expect("upgraded version 52 is compatible");
+        assert_eq!(
+            latest_version,
+            MIGRATIONS.last().expect("latest migration").0
+        );
+        check_compatibility(&conn).expect("upgraded schema is compatible");
         let price_catalog_tables = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -1453,7 +1464,10 @@ mod tests {
                 row.get(0)
             })
             .expect("read latest schema version");
-        assert_eq!(latest_version, 52);
+        assert_eq!(
+            latest_version,
+            MIGRATIONS.last().expect("latest migration").0
+        );
     }
 
     #[test]
@@ -2169,7 +2183,10 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 52);
+        assert_eq!(
+            latest_version,
+            MIGRATIONS.last().expect("latest migration").0
+        );
     }
 
     #[test]
@@ -2193,7 +2210,10 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 52);
+        assert_eq!(
+            latest_version,
+            MIGRATIONS.last().expect("latest migration").0
+        );
     }
 
     #[test]
@@ -2373,7 +2393,10 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("read upgraded schema version");
-        assert_eq!(latest_version, 52);
+        assert_eq!(
+            latest_version,
+            MIGRATIONS.last().expect("latest migration").0
+        );
     }
 
     #[test]

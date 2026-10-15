@@ -7969,6 +7969,7 @@ mod tests {
             binance_settlement: Arc::new(
                 crate::binance_settlement::BinanceSettlementRuntime::disabled_for_tests(),
             ),
+            market_payments: Arc::new(crate::market_payments::MarketPaymentsRuntime::for_test()),
             recent_traffic: RecentTraffic::new(),
             abuse: Arc::new(crate::abuse::AbuseTracker::new()),
             share_abuse: Arc::new(crate::abuse::ShareAbuseTracker::new([])),

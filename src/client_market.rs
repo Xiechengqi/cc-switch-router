@@ -7268,6 +7268,13 @@ impl AppStore {
             "provisioning_failed",
             &now,
         )?;
+        if let Some(contract_id) =
+            crate::market_platform_contracts::contract_for_product_tx(&tx, "client_host", job_id)?
+        {
+            // This generic failure path has no verified Host-cleanup receipt.
+            // Preserve the hold until rollback or Owner review can prove it.
+            crate::market_platform_contracts::fail_activation_tx(&tx, &contract_id, false, &now)?;
+        }
         tx.commit().map_err(|error| {
             AppError::Internal(format!("commit failed provisioning job failed: {error}"))
         })?;
@@ -8141,6 +8148,29 @@ impl AppStore {
                 )?;
             }
         }
+        // Both owner-driven reverify and the quarantined-Host probe reach this
+        // method only after an independent remote-clean result. A failed
+        // provisioning job may therefore release its retained activation hold;
+        // successful jobs are deliberately excluded because their delivered
+        // service requires a separate financial settlement.
+        let failed_wallet_contracts = tx
+            .prepare(
+                "SELECT contract.id FROM market_platform_contracts contract
+                 JOIN provisioning_jobs job ON job.id = contract.product_ref
+                 WHERE contract.product_kind = 'client_host' AND job.host_id = ?1
+                   AND job.status = 'failed' AND contract.status = 'review_required'",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map(params![id], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(|error| {
+                AppError::Internal(format!("read failed Host wallet holds failed: {error}"))
+            })?;
+        for contract_id in failed_wallet_contracts {
+            crate::market_platform_contracts::fail_activation_tx(&tx, &contract_id, true, &now)?;
+        }
         tx.commit().map_err(|e| {
             AppError::Internal(format!("commit complete host reverify failed: {e}"))
         })?;
@@ -8401,6 +8431,16 @@ impl AppStore {
             failure_code,
             &now,
         )?;
+        if let Some(contract_id) =
+            crate::market_platform_contracts::contract_for_product_tx(&tx, "client_host", job_id)?
+        {
+            crate::market_platform_contracts::fail_activation_tx(
+                &tx,
+                &contract_id,
+                release_to_idle,
+                &now,
+            )?;
+        }
         tx.commit().map_err(|e| {
             AppError::Internal(format!("commit create failure transaction failed: {e}"))
         })?;
@@ -11772,6 +11812,284 @@ mod tests {
                 .status,
             HOST_STATUS_LOCKED
         );
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn wallet_client_provisioning_activates_only_its_quoted_contract() {
+        use crate::client_market_trade::CreateQuoteRequest;
+
+        let (store, _config, root) = test_store("wallet-client-provisioning");
+        let host = add_provider_host(
+            &store,
+            "provider-wallet",
+            "provider-wallet@example.com",
+            "198.18.21.10",
+            "US",
+            Some(500),
+        )
+        .await;
+        let buyer = market_session("wallet-client-buyer", "wallet-client-buyer@example.com");
+        let quote = store
+            .client_market_create_quote(
+                &buyer,
+                CreateQuoteRequest {
+                    provider_ids: Vec::new(),
+                    country_codes: Vec::new(),
+                    count: 1,
+                    host_id: Some(host.id.clone()),
+                },
+            )
+            .await
+            .expect("quote a paid Host");
+        let job_id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        let contract_id = {
+            let conn = store.conn.lock().await;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            tx.execute(
+                "UPDATE client_market_allocation_quotes
+                 SET funding_rail = 'platform_wallet' WHERE id = ?1",
+                params![quote.id],
+            )
+            .unwrap();
+            tx.execute(
+                "UPDATE router_ssh_hosts SET status = 'locked' WHERE id = ?1",
+                params![host.id],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO provisioning_jobs (
+                    id, type, host_id, host_owner_email, client_owner_email,
+                    selection_owners_json, selection_regions_json, subdomain,
+                    status, phase, log_blob, created_at, updated_at, quote_id,
+                    client_owner_user_id
+                 ) VALUES (?1, 'create', ?2, ?3, ?4, '[]', '[]', 'wallet-provisioned',
+                           'running', 'locked', '', ?5, ?5, ?6, ?7)",
+                params![
+                    job_id,
+                    host.id,
+                    "provider-wallet@example.com",
+                    buyer.email,
+                    now,
+                    quote.id,
+                    buyer.user_id,
+                ],
+            )
+            .unwrap();
+            crate::market_wallet::credit_verified_topup_tx(
+                &tx,
+                &buyer.user_id,
+                "wallet-client-topup",
+                500,
+                "verified-receipt",
+                &now,
+            )
+            .unwrap();
+            let contract_id = crate::market_platform_contracts::prepare_contract_tx(
+                &tx,
+                &crate::market_platform_contracts::PrepareContract {
+                    product_kind: "client_host",
+                    product_ref: &job_id,
+                    trial_scope_ref: &host.id,
+                    quote_id: &quote.id,
+                    buyer_user_id: &buyer.user_id,
+                    provider_user_id: "provider-wallet",
+                    offer_revision: quote.items[0].offer_revision,
+                    billing_model: crate::market_platform_contracts::BillingModel::Metered,
+                    price_minor: 500,
+                    auto_renew: false,
+                    trial_seconds: 0,
+                },
+                &now,
+            )
+            .unwrap();
+            let snapshot = crate::market_wallet::wallet_snapshot_tx(&tx, &buyer.user_id).unwrap();
+            assert_eq!(snapshot.posted_units, 500 * 86_400);
+            assert_eq!(snapshot.held_units, 500 * 86_400);
+            tx.commit().unwrap();
+            contract_id
+        };
+        {
+            let conn = store.conn.lock().await;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            crate::client_market_trade::complete_provisioning_tx(
+                &tx,
+                &job_id,
+                &host.id,
+                "wallet-provisioned-installation",
+                "https://wallet-provisioned.router.test",
+                Utc::now(),
+            )
+            .expect("bind and activate the wallet contract");
+            let state: (String, String, String, String) = tx
+                .query_row(
+                    "SELECT c.status, c.service_ref, s.platform_contract_id,
+                            COALESCE(s.recurring_contract_id, '')
+                     FROM market_platform_contracts c
+                     JOIN client_market_subscriptions s ON s.platform_contract_id = c.id
+                     WHERE c.id = ?1",
+                    params![contract_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                state,
+                (
+                    "active".into(),
+                    "wallet-provisioned-installation".into(),
+                    contract_id.clone(),
+                    "".into(),
+                )
+            );
+            let legacy_count: i64 = tx
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM market_service_contracts
+                             WHERE product_kind = 'client_host' AND product_ref = ?1)
+                          + (SELECT COUNT(*) FROM market_funding_reservations
+                             WHERE product_kind = 'client_host' AND product_ref = ?2)",
+                    params!["wallet-provisioned-installation", job_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(legacy_count, 0);
+            crate::client_market_trade::cleanup_started_tx(
+                &tx,
+                "wallet-provisioned-installation",
+                &host.id,
+                None,
+                None,
+                "test_cleanup",
+                false,
+                Utc::now(),
+            )
+            .expect("isolate wallet funds before remote cleanup");
+            let isolated: (String, i64) = tx
+                .query_row(
+                    "SELECT c.status, (SELECT COUNT(*) FROM market_finance_reconciliation_cases
+                                      WHERE code = 'wallet_cleanup_uncertain'
+                                        AND object_id = c.id AND status = 'open')
+                     FROM market_platform_contracts c WHERE c.id = ?1",
+                    params![contract_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(isolated, ("review_required".into(), 1));
+            assert_eq!(
+                crate::market_wallet::wallet_snapshot_tx(&tx, &buyer.user_id)
+                    .unwrap()
+                    .held_units,
+                500 * 86_400
+            );
+            crate::market_wallet::reconcile_wallet_tx(&tx, &buyer.user_id).unwrap();
+            tx.commit().unwrap();
+        }
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn clean_host_reverify_releases_failed_wallet_activation_hold() {
+        let (store, _config, root) = test_store("wallet-failed-host-reverify");
+        let host = add_provider_host(
+            &store,
+            "provider-reverify",
+            "provider-reverify@example.com",
+            "198.18.21.11",
+            "US",
+            Some(500),
+        )
+        .await;
+        let job_id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        {
+            let conn = store.conn.lock().await;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            tx.execute(
+                "UPDATE router_ssh_hosts SET status = 'unreachable' WHERE id = ?1",
+                params![host.id],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO provisioning_jobs (
+                    id, type, host_id, host_owner_email, client_owner_email,
+                    selection_owners_json, selection_regions_json, subdomain,
+                    status, phase, log_blob, created_at, updated_at,
+                    client_owner_user_id
+                 ) VALUES (?1, 'create', ?2, ?3, ?4, '[]', '[]', 'failed-wallet',
+                           'failed', 'complete', '', ?5, ?5, 'buyer-reverify')",
+                params![
+                    job_id,
+                    host.id,
+                    "provider-reverify@example.com",
+                    "buyer-reverify@example.com",
+                    now,
+                ],
+            )
+            .unwrap();
+            crate::market_wallet::credit_verified_topup_tx(
+                &tx,
+                "buyer-reverify",
+                "reverify-topup",
+                500,
+                "verified-receipt",
+                &now,
+            )
+            .unwrap();
+            let contract_id = crate::market_platform_contracts::prepare_contract_tx(
+                &tx,
+                &crate::market_platform_contracts::PrepareContract {
+                    product_kind: "client_host",
+                    product_ref: &job_id,
+                    trial_scope_ref: &host.id,
+                    quote_id: "reverify-quote",
+                    buyer_user_id: "buyer-reverify",
+                    provider_user_id: "provider-reverify",
+                    offer_revision: 1,
+                    billing_model: crate::market_platform_contracts::BillingModel::Metered,
+                    price_minor: 500,
+                    auto_renew: false,
+                    trial_seconds: 0,
+                },
+                &now,
+            )
+            .unwrap();
+            crate::market_platform_contracts::fail_activation_tx(&tx, &contract_id, false, &now)
+                .unwrap();
+            assert_eq!(
+                crate::market_wallet::wallet_snapshot_tx(&tx, "buyer-reverify")
+                    .unwrap()
+                    .held_units,
+                500 * 86_400
+            );
+            tx.commit().unwrap();
+        }
+        store
+            .client_market_complete_host_reverify(&host.id, None, None)
+            .await
+            .expect("verified clean Host releases pending activation hold");
+        let conn = store.conn.lock().await;
+        let wallet = crate::market_wallet::wallet_snapshot_tx(&conn, "buyer-reverify").unwrap();
+        assert_eq!(wallet.held_units, 0);
+        assert_eq!(wallet.available_units, 500 * 86_400);
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM market_platform_contracts
+                 WHERE product_kind = 'client_host' AND product_ref = ?1",
+                params![job_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "activation_failed");
+        crate::market_wallet::reconcile_wallet_tx(&conn, "buyer-reverify").unwrap();
+        drop(conn);
         drop(store);
         let _ = std::fs::remove_dir_all(root);
     }

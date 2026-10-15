@@ -302,6 +302,9 @@ pub struct AllocationQuoteView {
     pub items: Vec<QuoteItemView>,
     pub funding: Vec<crate::market_billing::MarketFundingSummaryView>,
     pub recurring_funding: Vec<crate::market_recurring::RecurringFundingSummaryView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wallet_funding: Option<crate::market_wallet::WalletQuoteFunding>,
+    pub funding_rail: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -702,6 +705,18 @@ pub(crate) fn require_paid_offer_setup(
     provider_id: &str,
     currency: &str,
 ) -> Result<(), AppError> {
+    if crate::market_payments::wallet_purchase_mode_tx(conn)? {
+        if currency != "USD" {
+            return Err(AppError::Conflict(
+                "wallet-funded Hosts must be priced in USD".into(),
+            ));
+        }
+        return crate::market_payouts::require_payout_setup_tx(
+            conn,
+            provider_id,
+            &Utc::now().to_rfc3339(),
+        );
+    }
     require_payment_profile_for_offer(conn, provider_id)?;
     crate::market_billing::require_supplier_profile_tx(conn, provider_id, currency)?;
     Ok(())
@@ -3346,6 +3361,7 @@ impl AppStore {
                 "not enough idle free Hosts match the selected Providers and regions".into(),
             ));
         }
+        let wallet_mode = crate::market_payments::wallet_purchase_mode_tx(&tx)?;
         for candidate in &mut candidates {
             let price_minor = candidate.cycle_price_minor.or(candidate.daily_rate_minor);
             let pricing_kind = crate::market_access::pricing_kind_for_rate(price_minor);
@@ -3364,7 +3380,18 @@ impl AppStore {
                 crate::market_access::PRODUCT_CLIENT_HOST,
                 pricing_kind,
             )?;
-            if candidate.daily_rate_minor.is_some() {
+            if wallet_mode && price_minor.is_some() && candidate.provider_id != session.user_id {
+                candidate.wallet_trial_seconds =
+                    crate::market_platform_contracts::trial_seconds_remaining_tx(
+                        &tx,
+                        &session.user_id,
+                        &candidate.provider_id,
+                        "client_host",
+                        &candidate.host_id,
+                        crate::market_billing::TRIAL_SECONDS,
+                    )?;
+            }
+            if candidate.daily_rate_minor.is_some() && !wallet_mode {
                 crate::market_billing::ensure_credit_allowed_tx(
                     &tx,
                     &session.user_id,
@@ -3392,9 +3419,28 @@ impl AppStore {
                 ));
             }
         }
+        let mut wallet_price_minor = 0_i64;
+        let mut wallet_paid_items = false;
         let mut funding_rates = BTreeMap::<(String, String), (String, i64)>::new();
         let mut recurring_prices = BTreeMap::<(String, String), (String, i64)>::new();
         for candidate in &candidates {
+            if wallet_mode {
+                if let Some(price) = candidate.cycle_price_minor.or(candidate.daily_rate_minor) {
+                    wallet_paid_items = true;
+                    if candidate.currency.as_deref() != Some("USD") {
+                        return Err(AppError::Conflict(
+                            "wallet-funded Hosts must be priced in USD".into(),
+                        ));
+                    }
+                    if candidate.wallet_trial_seconds == 0 {
+                        wallet_price_minor =
+                            wallet_price_minor.checked_add(price).ok_or_else(|| {
+                                AppError::BadRequest("quoted wallet price is too large".into())
+                            })?;
+                    }
+                }
+                continue;
+            }
             if let Some(daily_rate_minor) = candidate.daily_rate_minor {
                 let currency = candidate.currency.as_deref().ok_or_else(|| {
                     AppError::Internal("paid quoted Host currency is missing".into())
@@ -3454,14 +3500,29 @@ impl AppStore {
                 },
             )
             .collect::<Result<Vec<_>, AppError>>()?;
+        let wallet_funding = if wallet_mode && wallet_paid_items {
+            Some(crate::market_wallet::wallet_quote_funding_tx(
+                &tx,
+                &session.user_id,
+                wallet_price_minor,
+                0,
+            )?)
+        } else {
+            None
+        };
+        let funding_rail = if wallet_funding.is_some() {
+            "platform_wallet"
+        } else {
+            "legacy_provider"
+        };
         let quote_id = Uuid::new_v4().to_string();
         let expires_at = now + Duration::seconds(QUOTE_TTL_SECS);
         let client_owner_email = normalize_email(&session.email)?;
         tx.execute(
             "INSERT INTO client_market_allocation_quotes
                 (id, client_user_id, client_owner_email, status, fixed_host_id,
-                 expires_at, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?6, ?6)",
+                 expires_at, created_at, updated_at, funding_rail)
+             VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?6, ?6, ?7)",
             params![
                 quote_id,
                 session.user_id,
@@ -3469,6 +3530,7 @@ impl AppStore {
                 input.host_id,
                 expires_at.to_rfc3339(),
                 now.to_rfc3339(),
+                funding_rail,
             ],
         )
         .map_err(|error| AppError::Internal(format!("insert allocation quote failed: {error}")))?;
@@ -3494,9 +3556,9 @@ impl AppStore {
                     (id, quote_id, position, host_id, provider_id, host_owner_email,
                      country_code, hostname, daily_rate_minor, currency,
                      free_duration_days, offer_revision, pricing_model,
-                     cycle_price_minor, billing_interval)
+                     cycle_price_minor, billing_interval, wallet_trial_seconds)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                         ?13, ?14, ?15)",
+                         ?13, ?14, ?15, ?16)",
                 params![
                     item_id,
                     quote_id,
@@ -3513,6 +3575,7 @@ impl AppStore {
                     candidate.pricing_model,
                     candidate.cycle_price_minor,
                     candidate.billing_interval,
+                    candidate.wallet_trial_seconds,
                 ],
             )
             .map_err(|error| AppError::Internal(format!("insert quote item failed: {error}")))?;
@@ -3553,6 +3616,8 @@ impl AppStore {
             items,
             funding,
             recurring_funding,
+            wallet_funding,
+            funding_rail: funding_rail.into(),
         })
     }
 
@@ -3617,16 +3682,16 @@ impl AppStore {
             .transaction()
             .map_err(|error| AppError::Internal(format!("begin quote commit failed: {error}")))?;
         expire_quotes_tx(&tx, now)?;
-        let quote: Option<(String, String, String)> = tx
+        let quote: Option<(String, String, String, String)> = tx
             .query_row(
-                "SELECT client_user_id, status, expires_at
+                "SELECT client_user_id, status, expires_at, funding_rail
                  FROM client_market_allocation_quotes WHERE id = ?1",
                 params![quote_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
             .map_err(|error| AppError::Internal(format!("read quote failed: {error}")))?;
-        let (owner_user_id, status, expires_at) =
+        let (owner_user_id, status, expires_at, funding_rail) =
             quote.ok_or_else(|| AppError::NotFound("allocation quote not found".into()))?;
         if owner_user_id != session.user_id {
             return Err(AppError::Forbidden(
@@ -3685,6 +3750,23 @@ impl AppStore {
         if status != "active" || parse_time(&expires_at)? <= now {
             return Err(AppError::Gone(
                 "allocation quote expired; request a new quote".into(),
+            ));
+        }
+        let wallet_mode = crate::market_payments::wallet_purchase_mode_tx(&tx)?;
+        if !matches!(funding_rail.as_str(), "legacy_provider" | "platform_wallet") {
+            return Err(AppError::Internal(
+                "stored Client funding rail is invalid".into(),
+            ));
+        }
+        let paid_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM client_market_allocation_quote_items
+             WHERE quote_id = ?1 AND (daily_rate_minor IS NOT NULL OR cycle_price_minor IS NOT NULL)",
+            params![quote_id],
+            |row| row.get(0),
+        ).map_err(|error| AppError::Internal(format!("check Client quote funding rail failed: {error}")))?;
+        if paid_count > 0 && (funding_rail == "platform_wallet") != wallet_mode {
+            return Err(AppError::Gone(
+                "Client payment mode changed; request a new quote".into(),
             ));
         }
         ensure_creation_allowed_tx(&tx, &session.user_id, &session.email)?;
@@ -3789,7 +3871,8 @@ impl AppStore {
                 .query_row(
                     "SELECT host_id, provider_id, host_owner_email, country_code,
                             daily_rate_minor, pricing_model, cycle_price_minor,
-                            billing_interval, currency, offer_revision
+                            billing_interval, currency, offer_revision,
+                            wallet_trial_seconds
                      FROM client_market_allocation_quote_items
                      WHERE id = ?1 AND quote_id = ?2",
                     params![item_id, quote_id],
@@ -3805,6 +3888,7 @@ impl AppStore {
                             row.get::<_, Option<String>>(7)?,
                             row.get::<_, Option<String>>(8)?,
                             row.get::<_, i64>(9)?,
+                            row.get::<_, i64>(10)?,
                         ))
                     },
                 )
@@ -3827,7 +3911,7 @@ impl AppStore {
                 crate::market_access::PRODUCT_CLIENT_HOST,
                 crate::market_access::pricing_kind_for_rate(item.6.or(item.4)),
             )?;
-            if item.4.is_some() {
+            if item.4.is_some() && funding_rail != "platform_wallet" {
                 crate::market_billing::ensure_credit_allowed_tx(
                     &tx,
                     &session.user_id,
@@ -3842,8 +3926,15 @@ impl AppStore {
             let changed = tx
                 .execute(
                     "UPDATE router_ssh_hosts SET status = 'locked', updated_at = ?2
-                     WHERE id = ?1 AND status = ?3 AND offer_revision = ?4",
-                    params![item.0, now.to_rfc3339(), HOST_STATUS_RESERVED, item.9],
+                     WHERE id = ?1 AND status = ?3 AND offer_revision = ?4
+                       AND provider_id = ?5",
+                    params![
+                        item.0,
+                        now.to_rfc3339(),
+                        HOST_STATUS_RESERVED,
+                        item.9,
+                        item.1
+                    ],
                 )
                 .map_err(|error| AppError::Internal(format!("lock quoted Host failed: {error}")))?;
             if changed != 1 {
@@ -3883,7 +3974,36 @@ impl AppStore {
             .map_err(|error| {
                 AppError::Internal(format!("insert quoted provisioning job failed: {error}"))
             })?;
-            if let Some(cycle_price_minor) = item.6 {
+            if funding_rail == "platform_wallet"
+                && let Some(price_minor) = item.6.or(item.4)
+            {
+                if item.8.as_deref() != Some("USD") {
+                    return Err(AppError::Conflict(
+                        "wallet-funded Hosts must be priced in USD".into(),
+                    ));
+                }
+                crate::market_platform_contracts::prepare_contract_tx(
+                    &tx,
+                    &crate::market_platform_contracts::PrepareContract {
+                        product_kind: "client_host",
+                        product_ref: &job_id,
+                        trial_scope_ref: &item.0,
+                        quote_id,
+                        buyer_user_id: &session.user_id,
+                        provider_user_id: &item.1,
+                        offer_revision: item.9,
+                        billing_model: if item.6.is_some() {
+                            crate::market_platform_contracts::BillingModel::CalendarMonth
+                        } else {
+                            crate::market_platform_contracts::BillingModel::Metered
+                        },
+                        price_minor,
+                        auto_renew: item.6.is_some() && *auto_renew,
+                        trial_seconds: item.10,
+                    },
+                    &now.to_rfc3339(),
+                )?;
+            } else if let Some(cycle_price_minor) = item.6 {
                 let currency = item.8.as_deref().ok_or_else(|| {
                     AppError::Internal("monthly quote item currency is missing".into())
                 })?;
@@ -4758,6 +4878,7 @@ struct QuoteCandidate {
     currency: Option<String>,
     free_duration_days: Option<u32>,
     offer_revision: i64,
+    wallet_trial_seconds: i64,
 }
 
 fn map_quote_candidate(row: &crate::db::Row<'_>) -> crate::db::Result<QuoteCandidate> {
@@ -4777,6 +4898,7 @@ fn map_quote_candidate(row: &crate::db::Row<'_>) -> crate::db::Result<QuoteCandi
             .get::<_, Option<i64>>(11)?
             .and_then(|value| u32::try_from(value).ok()),
         offer_revision: row.get(12)?,
+        wallet_trial_seconds: 0,
     })
 }
 
@@ -5557,6 +5679,7 @@ pub(crate) fn complete_provisioning_tx(
         Option<String>,
         Option<i64>,
         i64,
+        String,
     )> = tx
         .query_row(
             "SELECT h.provider_id, h.host_owner_email, j.client_owner_email,
@@ -5577,19 +5700,23 @@ pub(crate) fn complete_provisioning_tx(
                     CASE WHEN j.quote_id IS NOT NULL THEN qi.free_duration_days
                          ELSE h.free_duration_days END,
                     CASE WHEN j.quote_id IS NOT NULL THEN qi.offer_revision
-                         ELSE h.offer_revision END
+                         ELSE h.offer_revision END,
+                    COALESCE(q.funding_rail, 'legacy_provider')
              FROM provisioning_jobs j
              JOIN router_ssh_hosts h ON h.id = j.host_id
+             LEFT JOIN client_market_allocation_quotes q ON q.id = j.quote_id
              LEFT JOIN client_market_allocation_quote_items qi
                ON qi.quote_id = j.quote_id AND qi.host_id = j.host_id
              WHERE j.id = ?1 AND h.id = ?2 AND h.provider_id IS NOT NULL
-               AND (j.quote_id IS NULL OR qi.id IS NOT NULL)",
+               AND (j.quote_id IS NULL OR
+                    (qi.id IS NOT NULL AND q.id IS NOT NULL
+                     AND qi.provider_id = h.provider_id))",
             params![job_id, host_id],
             |row| {
                 Ok((
                     row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
                     row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?,
-                    row.get(8)?, row.get(9)?, row.get(10)?,
+                    row.get(8)?, row.get(9)?, row.get(10)?, row.get(11)?,
                 ))
             },
         )
@@ -5607,6 +5734,7 @@ pub(crate) fn complete_provisioning_tx(
         currency,
         free_duration_days,
         revision,
+        funding_rail,
     )) = context
     else {
         return Err(AppError::Internal(
@@ -5639,6 +5767,16 @@ pub(crate) fn complete_provisioning_tx(
             free_duration_days,
         )
     };
+    let wallet_contract_id =
+        crate::market_platform_contracts::contract_for_product_tx(tx, "client_host", job_id)?;
+    let is_paid = cycle_price_minor.or(daily_rate_minor).is_some();
+    if (funding_rail == "platform_wallet" && is_paid) != wallet_contract_id.is_some()
+        || (funding_rail != "platform_wallet" && wallet_contract_id.is_some())
+    {
+        return Err(AppError::Conflict(
+            "Client provisioning funding rail does not match its contract".into(),
+        ));
+    }
     let free_usage_seconds = if daily_rate_minor.is_none() && cycle_price_minor.is_none() {
         match free_duration_days {
             Some(days) if provider_id != client_user_id => {
@@ -5705,7 +5843,41 @@ pub(crate) fn complete_provisioning_tx(
     })?;
     persist_subscription_client_subdomain_tx(tx, installation_id)?;
     let label = client_label_tx(tx, installation_id)?;
-    if let Some(cycle_price_minor) = cycle_price_minor {
+    if funding_rail == "platform_wallet"
+        && let Some(_price_minor) = cycle_price_minor.or(daily_rate_minor)
+    {
+        if currency.as_deref() != Some("USD") {
+            return Err(AppError::Conflict(
+                "wallet-funded Client installation is not priced in USD".into(),
+            ));
+        }
+        let contract_id = wallet_contract_id.ok_or_else(|| {
+            AppError::Conflict("Client provisioning has no wallet reservation".into())
+        })?;
+        crate::market_platform_contracts::bind_client_installation_tx(
+            tx,
+            &contract_id,
+            job_id,
+            installation_id,
+            &client_user_id,
+            &provider_id,
+            &now.to_rfc3339(),
+        )?;
+        crate::market_platform_contracts::activate_contract_tx(
+            tx,
+            &contract_id,
+            &now.to_rfc3339(),
+            &now.to_rfc3339(),
+        )?;
+        tx.execute(
+            "UPDATE client_market_subscriptions
+             SET platform_contract_id = ?2 WHERE installation_id = ?1",
+            params![installation_id, contract_id],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("link Client wallet contract failed: {error}"))
+        })?;
+    } else if let Some(cycle_price_minor) = cycle_price_minor {
         if pricing_model != crate::market_recurring::PRICING_PREPAID_CALENDAR_MONTH
             || billing_interval.as_deref()
                 != Some(crate::market_recurring::BILLING_INTERVAL_CALENDAR_MONTH)
@@ -5909,6 +6081,24 @@ pub(crate) fn cleanup_started_tx(
         cycle_price_minor,
     )) = subscription
     {
+        let wallet_contract_id: Option<String> = tx
+            .query_row(
+                "SELECT platform_contract_id FROM client_market_subscriptions
+                 WHERE installation_id = ?1",
+                params![installation_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("read Client wallet contract failed: {error}"))
+            })?;
+        if let Some(contract_id) = wallet_contract_id {
+            crate::market_platform_contracts::terminate_after_cleanup_tx(
+                tx,
+                &contract_id,
+                false,
+                &now.to_rfc3339(),
+            )?;
+        }
         if pricing_model == crate::market_recurring::PRICING_PREPAID_CALENDAR_MONTH
             && actor_user_id == Some(provider_id.as_str())
         {

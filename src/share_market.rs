@@ -727,7 +727,13 @@ pub struct RentQuoteSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trial_token_limit: Option<u64>,
     pub offer_revision: i64,
+    #[serde(default = "default_legacy_funding_rail")]
+    pub funding_rail: String,
     pub service: RentServiceSnapshot,
+}
+
+fn default_legacy_funding_rail() -> String {
+    "legacy_provider".into()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -777,6 +783,8 @@ pub struct RentQuoteView {
     pub funding: Option<crate::market_billing::MarketFundingSummaryView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recurring_funding: Option<crate::market_recurring::RecurringFundingSummaryView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wallet_funding: Option<crate::market_wallet::WalletQuoteFunding>,
     pub offer: RentQuoteSnapshot,
 }
 
@@ -4147,6 +4155,10 @@ fn subscription_record(
                     SELECT 1 FROM market_recurring_contracts contract
                     WHERE contract.product_kind = 'share' AND contract.product_ref = sub.id
                       AND contract.status NOT IN ('ended', 'activation_failed')
+                ) OR EXISTS (
+                    SELECT 1 FROM market_platform_contracts contract
+                    WHERE contract.product_kind = 'share' AND contract.product_ref = sub.id
+                      AND contract.status NOT IN ('ended', 'activation_failed')
                 ),
                 COALESCE((SELECT position FROM share_market_seats WHERE id = sub.seat_id), 0),
                 sub.parallel_limit, sub.token_limit, sub.token_period_json,
@@ -4206,7 +4218,12 @@ fn subscription_record(
                      FROM market_recurring_contracts contract
                      WHERE contract.product_kind = 'share' AND contract.product_ref = sub.id
                        AND contract.status NOT IN ('ended', 'activation_failed')
-                     ORDER BY contract.created_at DESC, contract.id DESC LIMIT 1)
+                     ORDER BY contract.created_at DESC, contract.id DESC LIMIT 1),
+                    (SELECT contract.trial_seconds_remaining
+                     FROM market_platform_contracts contract
+                     WHERE contract.product_kind = 'share' AND contract.product_ref = sub.id
+                       AND contract.status NOT IN ('ended', 'activation_failed')
+                     LIMIT 1)
                 ),
                 sub.pricing_model, sub.cycle_price_minor, sub.billing_interval,
                 sub.recurring_contract_id
@@ -4400,6 +4417,10 @@ fn catalog_subscription_records(
                     SELECT 1 FROM market_recurring_contracts contract
                     WHERE contract.product_kind = 'share' AND contract.product_ref = sub.id
                       AND contract.status NOT IN ('ended', 'activation_failed')
+                ) OR EXISTS (
+                    SELECT 1 FROM market_platform_contracts contract
+                    WHERE contract.product_kind = 'share' AND contract.product_ref = sub.id
+                      AND contract.status NOT IN ('ended', 'activation_failed')
                 ),
                 COALESCE((SELECT position FROM share_market_seats WHERE id = sub.seat_id), 0),
                 sub.parallel_limit, sub.token_limit, sub.token_period_json,
@@ -4459,7 +4480,12 @@ fn catalog_subscription_records(
                      FROM market_recurring_contracts contract
                      WHERE contract.product_kind = 'share' AND contract.product_ref = sub.id
                        AND contract.status NOT IN ('ended', 'activation_failed')
-                     ORDER BY contract.created_at DESC, contract.id DESC LIMIT 1)
+                     ORDER BY contract.created_at DESC, contract.id DESC LIMIT 1),
+                    (SELECT contract.trial_seconds_remaining
+                     FROM market_platform_contracts contract
+                     WHERE contract.product_kind = 'share' AND contract.product_ref = sub.id
+                       AND contract.status NOT IN ('ended', 'activation_failed')
+                     LIMIT 1)
                 ),
                 sub.pricing_model, sub.cycle_price_minor, sub.billing_interval,
                 sub.recurring_contract_id
@@ -6423,6 +6449,13 @@ async fn list_owned_shares(
 }
 
 fn ensure_payment_profile_tx(tx: &Transaction<'_>, owner_user_id: &str) -> Result<(), AppError> {
+    if crate::market_payments::wallet_purchase_mode_tx(tx)? {
+        return crate::market_payouts::require_payout_setup_tx(
+            tx,
+            owner_user_id,
+            &Utc::now().to_rfc3339(),
+        );
+    }
     let methods_json: Option<String> = tx
         .query_row(
             "SELECT methods_json FROM account_payment_profiles WHERE user_id = ?1",
@@ -8824,8 +8857,30 @@ impl AppStore {
         } else {
             None
         };
-        let (trial_seconds_remaining, funding, recurring_funding) =
-            if let Some(cycle_price_minor) = cycle_price_minor {
+        let wallet_mode = crate::market_payments::wallet_purchase_mode_tx(&tx)?;
+        let (trial_seconds_remaining, funding, recurring_funding, wallet_funding) =
+            if wallet_mode && offer_price_minor.is_some() {
+                if currency.as_deref() != Some("USD") {
+                    return Err(AppError::Conflict(
+                        "wallet-funded Share seats must be priced in USD".into(),
+                    ));
+                }
+                let trial = crate::market_platform_contracts::trial_seconds_remaining_tx(
+                    &tx,
+                    &session.user_id,
+                    &owner_user_id,
+                    "share",
+                    &share_id,
+                    trial_seconds_from_hours(quoted_trial_hours.unwrap_or(0))?,
+                )?;
+                let wallet = crate::market_wallet::wallet_quote_funding_tx(
+                    &tx,
+                    &session.user_id,
+                    offer_price_minor.unwrap(),
+                    trial,
+                )?;
+                (trial, None, None, Some(wallet))
+            } else if let Some(cycle_price_minor) = cycle_price_minor {
                 let quote_currency = currency
                     .as_deref()
                     .ok_or_else(|| AppError::Internal("paid Share currency is missing".into()))?;
@@ -8847,7 +8902,7 @@ impl AppStore {
                     cycle_price_minor,
                     crate::market_recurring::RENEWAL_MANUAL,
                 )?;
-                (trial_seconds_remaining, None, Some(recurring_funding))
+                (trial_seconds_remaining, None, Some(recurring_funding), None)
             } else if let Some(daily_rate_minor) = daily_rate_minor {
                 let quote_currency = currency
                     .as_deref()
@@ -8880,9 +8935,9 @@ impl AppStore {
                     daily_rate_minor,
                     &now,
                 )?;
-                (trial_seconds_remaining, Some(funding), None)
+                (trial_seconds_remaining, Some(funding), None, None)
             } else {
-                (0, None, None)
+                (0, None, None, None)
             };
         let service = build_rent_service_snapshot(
             &bindings_json,
@@ -8955,6 +9010,11 @@ impl AppStore {
             trial_hours: quoted_trial_hours,
             trial_token_limit: quoted_trial_token_limit,
             offer_revision,
+            funding_rail: if wallet_mode && offer_price_minor.is_some() {
+                "platform_wallet".into()
+            } else {
+                default_legacy_funding_rail()
+            },
             service: service.clone(),
         };
         let quote_id = Uuid::new_v4().to_string();
@@ -8978,9 +9038,10 @@ impl AppStore {
                 offer_revision, snapshot_json, trial_seconds_remaining, status,
                 required_app, contract_apps_json, pricing_model,
                 cycle_price_minor, billing_interval,
-                expires_at, consumed_subscription_id, created_at, updated_at
+                expires_at, consumed_subscription_id, created_at, updated_at,
+                provider_user_id
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'active', ?10, ?11,
-                       ?12, ?13, ?14, ?15, NULL, ?16, ?16)",
+                       ?12, ?13, ?14, ?15, NULL, ?16, ?16, ?17)",
             params![
                 quote_id,
                 seat_id,
@@ -8998,6 +9059,7 @@ impl AppStore {
                 billing_interval,
                 expires_at,
                 now,
+                owner_user_id,
             ],
         )
         .map_err(map_db("insert Share rent quote"))?;
@@ -9014,6 +9076,7 @@ impl AppStore {
             trial_seconds_remaining,
             funding,
             recurring_funding,
+            wallet_funding,
             offer: public_snapshot,
         })
     }
@@ -9131,11 +9194,12 @@ impl AppStore {
             trial_seconds_remaining,
             required_app,
             contract_apps_json,
+            quoted_provider_user_id,
         ) = tx
             .query_row(
                 "SELECT seat_id, offer_revision, status, expires_at, renter_user_id,
                         snapshot_json, trial_seconds_remaining, required_app,
-                        contract_apps_json
+                        contract_apps_json, provider_user_id
                  FROM share_market_rent_quotes WHERE id = ?1",
                 params![quote_id],
                 |row| {
@@ -9149,6 +9213,7 @@ impl AppStore {
                         row.get::<_, i64>(6)?,
                         row.get::<_, Option<String>>(7)?,
                         row.get::<_, String>(8)?,
+                        row.get::<_, Option<String>>(9)?,
                     ))
                 },
             )
@@ -9172,6 +9237,39 @@ impl AppStore {
         }
         let snapshot: RentQuoteSnapshot = serde_json::from_str(&snapshot_json)
             .map_err(|_| AppError::Internal("stored Share rent quote is invalid".into()))?;
+        if let Some(provider_user_id) = quoted_provider_user_id.as_deref() {
+            let current_provider_user_id: String = tx
+                .query_row(
+                    "SELECT owner_user_id FROM share_market_listings WHERE id = ?1",
+                    params![snapshot.listing_id],
+                    |row| row.get(0),
+                )
+                .map_err(map_db("read current Share quote Provider identity"))?;
+            if current_provider_user_id != provider_user_id {
+                return Err(AppError::Gone(
+                    "Share Provider identity changed; request a new quote".into(),
+                ));
+            }
+        }
+        let wallet_mode = crate::market_payments::wallet_purchase_mode_tx(&tx)?;
+        if snapshot
+            .cycle_price_minor
+            .or(snapshot.daily_rate_minor)
+            .is_some()
+            && (snapshot.funding_rail == "platform_wallet") != wallet_mode
+        {
+            return Err(AppError::Gone(
+                "Share payment mode changed; request a new quote".into(),
+            ));
+        }
+        if !matches!(
+            snapshot.funding_rail.as_str(),
+            "legacy_provider" | "platform_wallet"
+        ) {
+            return Err(AppError::Internal(
+                "stored Share funding rail is invalid".into(),
+            ));
+        }
         if snapshot.service.schema_version < 2 {
             return Err(AppError::Gone(
                 "Share rent quote uses retired single-App terms; request a new quote".into(),
@@ -9204,6 +9302,7 @@ impl AppStore {
             Some(&snapshot),
             Some(trial_seconds_remaining),
             auto_renew,
+            wallet_mode,
             &now,
         )?;
         consume_share_rent_quote_tx(&tx, quote_id, &subscription_id, &session.user_id, &now)?;
@@ -9263,8 +9362,18 @@ impl AppStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin rent Share seat"))?;
+        let wallet_mode = crate::market_payments::wallet_purchase_mode_tx(&tx)?;
         let subscription_id = self.share_market_rent_seat_tx(
-            &tx, session, seat_id, input, metadata, None, None, false, &now,
+            &tx,
+            session,
+            seat_id,
+            input,
+            metadata,
+            None,
+            None,
+            false,
+            wallet_mode,
+            &now,
         )?;
         tx.commit().map_err(map_db("commit Share seat rental"))?;
         Ok(subscription_id)
@@ -9314,6 +9423,13 @@ impl AppStore {
         if record.status != SUB_GRANT_FAILED {
             return Err(AppError::Conflict(
                 "only a failed initial Share grant can be retried".into(),
+            ));
+        }
+        if crate::market_platform_contracts::contract_for_product_tx(&tx, "share", subscription_id)?
+            .is_some()
+        {
+            return Err(AppError::Gone(
+                "wallet-funded Share grant failed; request a new quote".into(),
             ));
         }
         if record.failure_code.as_deref() == Some(SHARE_GRANT_CONTRACT_VIOLATION_CODE) {
@@ -9602,6 +9718,7 @@ impl AppStore {
         quote_snapshot: Option<&RentQuoteSnapshot>,
         quoted_trial_seconds: Option<i64>,
         auto_renew: bool,
+        wallet_mode: bool,
         now: &str,
     ) -> Result<String, AppError> {
         #[allow(clippy::type_complexity)]
@@ -9788,7 +9905,22 @@ impl AppStore {
                 "this account already has direct Share access".into(),
             ));
         }
-        if cycle_price_minor.is_some() || daily_rate_minor.is_some() {
+        if (cycle_price_minor.is_some() || daily_rate_minor.is_some()) && wallet_mode {
+            // The quote and identity fence are mandatory for wallet purchases;
+            // direct legacy calls cannot bypass it.
+            if quote_snapshot.is_none_or(|snapshot| snapshot.funding_rail != "platform_wallet")
+                || metadata.is_none()
+            {
+                return Err(AppError::Gone(
+                    "platform wallet purchase requires a fresh quote".into(),
+                ));
+            }
+            if currency.as_deref() != Some("USD") {
+                return Err(AppError::Conflict(
+                    "wallet-funded Share seats must be priced in USD".into(),
+                ));
+            }
+        } else if cycle_price_minor.is_some() || daily_rate_minor.is_some() {
             ensure_payment_profile_tx(&tx, &owner_user_id)?;
             let currency = currency
                 .as_deref()
@@ -9996,7 +10128,32 @@ impl AppStore {
                 AppError::Internal(format!("create Share subscription failed: {error}"))
             }
         })?;
-        if let Some(cycle_price_minor) = cycle_price_minor {
+        if wallet_mode && let Some(price_minor) = offer_price_minor {
+            let quote_id = metadata
+                .map(|value| value.quote_id.as_str())
+                .ok_or_else(|| AppError::Gone("wallet quote is missing".into()))?;
+            crate::market_platform_contracts::prepare_contract_tx(
+                tx,
+                &crate::market_platform_contracts::PrepareContract {
+                    product_kind: "share",
+                    product_ref: &subscription_id,
+                    trial_scope_ref: &share_id,
+                    quote_id,
+                    buyer_user_id: &session.user_id,
+                    provider_user_id: &owner_user_id,
+                    offer_revision,
+                    billing_model: if cycle_price_minor.is_some() {
+                        crate::market_platform_contracts::BillingModel::CalendarMonth
+                    } else {
+                        crate::market_platform_contracts::BillingModel::Metered
+                    },
+                    price_minor,
+                    auto_renew: cycle_price_minor.is_some() && auto_renew,
+                    trial_seconds: quoted_trial_seconds.unwrap_or(0),
+                },
+                now,
+            )?;
+        } else if let Some(cycle_price_minor) = cycle_price_minor {
             let currency = currency
                 .as_deref()
                 .ok_or_else(|| AppError::Internal("paid Share currency is missing".into()))?;
@@ -11310,7 +11467,19 @@ fn activate_granted_subscription_tx(
             return Ok(());
         }
     }
-    if record.cycle_price_minor.is_some()
+    if let Some(contract_id) =
+        crate::market_platform_contracts::contract_for_product_tx(conn, "share", &record.id)?
+    {
+        // Propagate any capture error so the surrounding ACK transaction rolls
+        // back. In particular, never commit a partial journal after a later
+        // period insert fails. The grant stays pending for recovery/revoke.
+        crate::market_platform_contracts::activate_contract_tx(
+            conn,
+            &contract_id,
+            &service_started_at,
+            now,
+        )?;
+    } else if record.cycle_price_minor.is_some()
         && crate::market_recurring::activate_contract_tx(
             conn,
             "share",
@@ -11335,7 +11504,9 @@ fn activate_granted_subscription_tx(
         )?;
         return Ok(());
     }
-    if record.daily_rate_minor.is_some()
+    if crate::market_platform_contracts::contract_for_product_tx(conn, "share", &record.id)?
+        .is_none()
+        && record.daily_rate_minor.is_some()
         && !crate::market_billing::activate_reserved_contract_tx(
             conn,
             "share",
@@ -11687,6 +11858,21 @@ fn finish_release_tx(
     reason: &str,
     now: &str,
 ) -> Result<(), AppError> {
+    if let Some(contract_id) =
+        crate::market_platform_contracts::contract_for_product_tx(tx, "share", subscription_id)?
+    {
+        let settlement = crate::market_platform_contracts::terminate_after_cleanup_tx(
+            tx,
+            &contract_id,
+            true,
+            now,
+        )?;
+        if !settlement.finalized {
+            // The bounded metered pass committed some verified usage; leave
+            // the seat revoking and let reconciliation finish the next pass.
+            return Ok(());
+        }
+    }
     crate::market_billing::terminate_contract_tx(tx, "share", subscription_id, reason, now)?;
     crate::market_recurring::terminate_contract_tx(tx, "share", subscription_id, reason, now)?;
     let released = tx
@@ -13377,6 +13563,30 @@ pub(crate) fn handle_control_edit_ack_with_effect(
     )
     .map_err(map_db("reject Share control operation"))?;
     if action == "upsert" {
+        if let Some(record) = subscription_record(conn, &subscription_id)?
+            && record.status == SUB_GRANT_PENDING
+            && let Some(contract_id) = crate::market_platform_contracts::contract_for_product_tx(
+                conn,
+                "share",
+                &subscription_id,
+            )?
+        {
+            // A rejected ACK does not prove that a dispatched entitlement
+            // cannot still exist. Keep the buyer's hold and insist on a
+            // confirmed revoke before the subscription becomes terminal.
+            crate::market_platform_contracts::fail_activation_tx(conn, &contract_id, false, now)?;
+            request_revoke_tx(
+                conn,
+                &subscription_id,
+                &record.share_id,
+                &record.seat_id,
+                &record.entitlement_id,
+                &record.renter_email,
+                "wallet_grant_failed_cleanup",
+                now,
+            )?;
+            return Ok(());
+        }
         let seat_id: Option<String> = conn
             .query_row(
                 "SELECT seat_id FROM share_market_subscriptions WHERE id = ?1",
@@ -16071,6 +16281,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rent_quote_rejects_financial_provider_identity_change() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-finance-drift", "owner-finance-drift@example.com");
+        let renter = session("renter-finance-drift", "renter-finance-drift@example.com");
+        insert_share(
+            &store,
+            "share-finance-drift",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let (listing_id, seat_id) =
+            create_listing(&store, &owner, "share-finance-drift", free_seat()).await;
+        let quote = store
+            .share_market_create_rent_quote(&renter, &seat_id, Some("codex"))
+            .await
+            .expect("quote original Provider");
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE share_market_listings SET owner_user_id = 'different-user' WHERE id = ?1",
+                params![listing_id],
+            )
+            .unwrap();
+        assert!(matches!(
+            store
+                .share_market_commit_rent_quote(&renter, &seat_id, &quote.id, "owner-changed")
+                .await,
+            Err(AppError::Gone(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn wallet_share_monthly_grant_captures_only_after_control_confirmation() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-wallet-share", "owner-wallet-share@example.com");
+        let renter = session("renter-wallet-share", "renter-wallet-share@example.com");
+        configure_payment_profile(&store, &owner, "legacy-profile", "2026-01-01").await;
+        insert_share(
+            &store,
+            "share-wallet-monthly",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let (_, seat_id) =
+            create_listing(&store, &owner, "share-wallet-monthly", monthly_seat()).await;
+        let quote = store
+            .share_market_create_rent_quote(&renter, &seat_id, Some("codex"))
+            .await
+            .expect("create quote fixture");
+        let now = Utc::now();
+        let subscription_id = {
+            let conn = store.conn.lock().await;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            crate::market_wallet::credit_verified_topup_tx(
+                &tx,
+                &renter.user_id,
+                "wallet-share-topup",
+                1_200,
+                "wallet-share-receipt",
+                &now.to_rfc3339(),
+            )
+            .unwrap();
+            let snapshot_json: String = tx
+                .query_row(
+                    "SELECT snapshot_json FROM share_market_rent_quotes WHERE id = ?1",
+                    params![quote.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let mut snapshot: RentQuoteSnapshot = serde_json::from_str(&snapshot_json).unwrap();
+            snapshot.funding_rail = "platform_wallet".into();
+            let metadata = RentCommitMetadata {
+                quote_id: quote.id.clone(),
+                idempotency_key: "wallet-share-commit".into(),
+                request_fingerprint: "wallet-share-terms".into(),
+            };
+            let id = store
+                .share_market_rent_seat_tx(
+                    &tx,
+                    &renter,
+                    &seat_id,
+                    RentSeatRequest {
+                        offer_revision: snapshot.offer_revision,
+                    },
+                    Some(&metadata),
+                    Some(&snapshot),
+                    Some(0),
+                    false,
+                    true,
+                    &now.to_rfc3339(),
+                )
+                .unwrap();
+            let (status, old_contracts): (String, i64) = tx
+                .query_row(
+                    "SELECT contract.status,
+                        (SELECT COUNT(*) FROM market_recurring_contracts
+                         WHERE product_kind = 'share' AND product_ref = ?1)
+                     FROM market_platform_contracts contract
+                     WHERE contract.product_kind = 'share' AND contract.product_ref = ?1",
+                    params![id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(status, "pending_activation");
+            assert_eq!(old_contracts, 0);
+            assert_eq!(
+                crate::market_wallet::wallet_snapshot_tx(&tx, &renter.user_id)
+                    .unwrap()
+                    .held_units,
+                103_680_000
+            );
+            tx.commit().unwrap();
+            id
+        };
+        activate_subscription(&store, &subscription_id, Utc::now()).await;
+        let conn = store.conn.lock().await;
+        let (status, periods): (String, i64) = conn
+            .query_row(
+                "SELECT contract.status,
+                    (SELECT COUNT(*) FROM market_platform_periods WHERE contract_id = contract.id)
+                 FROM market_platform_contracts contract WHERE product_ref = ?1",
+                params![subscription_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "active");
+        assert_eq!(periods, 1);
+        assert_eq!(
+            crate::market_wallet::wallet_snapshot_tx(&conn, &renter.user_id)
+                .unwrap()
+                .posted_units,
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn rent_quote_commit_binds_seat_expires_and_replays_idempotently() {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
         let owner = session("owner-quote", "owner-quote@example.com");
@@ -16491,6 +16843,7 @@ mod tests {
             trial_hours: Some(12),
             trial_token_limit: Some(1_000_000),
             offer_revision: 7,
+            funding_rail: default_legacy_funding_rail(),
             service: RentServiceSnapshot {
                 schema_version: 1,
                 required_app: "codex".into(),
@@ -16508,6 +16861,10 @@ mod tests {
             },
         };
         let current = RentOfferTerms::from_snapshot(&quoted);
+        let mut old_json = serde_json::to_value(&quoted).unwrap();
+        old_json.as_object_mut().unwrap().remove("fundingRail");
+        let old_quote: RentQuoteSnapshot = serde_json::from_value(old_json).unwrap();
+        assert_eq!(old_quote.funding_rail, "legacy_provider");
         validate_offer_terms_unchanged(&quoted, &current).expect("matching terms");
 
         macro_rules! assert_changed {

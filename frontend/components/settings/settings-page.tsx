@@ -28,6 +28,7 @@ import { EmailChannelPanel } from "@/components/settings/email-channel-panel";
 import { AnnouncementPanel } from "@/components/settings/announcement-panel";
 import { MapDisplayPanel } from "@/components/settings/map-display-panel";
 import { ModelPricesPanel } from "@/components/settings/model-prices-panel";
+import { MarketPaymentChannelsPanel } from "@/components/settings/market-payment-channels-panel";
 import {
   settingsCategoryDescription,
   settingsCategoryLabel,
@@ -67,7 +68,7 @@ import type {
 type DirtyValue = string | boolean | null;
 type ActiveSection = "overview" | "model_prices" | SettingsCategoryId;
 type Banner = { kind: "default" | "success" | "destructive" | "warning"; text: string };
-type SettingsPanel = "map" | "announcement" | "channel_health" | "provision_key";
+type SettingsPanel = "map" | "announcement" | "channel_health" | "provision_key" | "market_finance";
 type SettingsSubsection = {
   id: string;
   label: string;
@@ -106,6 +107,7 @@ const PANEL_SUBSECTION_IDS: Record<SettingsPanel, string> = {
   announcement: "panel:announcement",
   channel_health: "panel:channel_health",
   provision_key: "panel:provision_key",
+  market_finance: "panel:market_finance",
 };
 
 const NOTIFICATION_SUBSECTION_IDS = {
@@ -510,6 +512,12 @@ export function SettingsPage() {
                 {keepProvisionKeyMounted ? (
                   <div hidden={!!normalizedQuery || activeSubsection?.panel !== "provision_key"}>
                     <ProvisionKeyPanel value={provisionSshKey} error={provisionError} />
+                  </div>
+                ) : null}
+
+                {keepProvisionKeyMounted ? (
+                  <div hidden={!!normalizedQuery || activeSubsection?.panel !== "market_finance"}>
+                    <MarketPaymentChannelsPanel />
                   </div>
                 ) : null}
 
@@ -1183,12 +1191,20 @@ function buildSettingsSubsections(
       },
     );
   } else if (category === "marketplace") {
-    items.push({
-      id: PANEL_SUBSECTION_IDS.provision_key,
-      label: t("settings.provisionSshKeyTitle"),
-      panel: "provision_key",
-      dirtyCount: 0,
-    });
+    items.push(
+      {
+        id: PANEL_SUBSECTION_IDS.provision_key,
+        label: t("settings.provisionSshKeyTitle"),
+        panel: "provision_key",
+        dirtyCount: 0,
+      },
+      {
+        id: PANEL_SUBSECTION_IDS.market_finance,
+        label: t("settings.marketFinance.title"),
+        panel: "market_finance",
+        dirtyCount: 0,
+      },
+    );
   }
 
   return items;

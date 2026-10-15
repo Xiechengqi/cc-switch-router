@@ -64,6 +64,8 @@ pub struct ServerState {
     pub market_billing_controls: Arc<Mutex<()>>,
     /// Private credential vault, Binance API adapter, and global settlement kill switch.
     pub binance_settlement: Arc<crate::binance_settlement::BinanceSettlementRuntime>,
+    /// Independent encrypted DujiaoPay credentials and signed API client.
+    pub market_payments: Arc<crate::market_payments::MarketPaymentsRuntime>,
     /// In-memory rolling tracker of proxy traffic by user origin. Drives the dashboard
     /// "demand" overlay and burst-arc animation; not persisted across restarts.
     pub recent_traffic: RecentTraffic,

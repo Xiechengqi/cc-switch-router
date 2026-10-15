@@ -27,10 +27,16 @@ mod ip_blacklist_stats;
 mod ip_iq;
 mod market_access;
 mod market_billing;
+mod market_finance;
+mod market_payments;
+mod market_payouts;
+mod market_platform_contracts;
 mod market_provider_identity;
 mod market_provider_rank;
 mod market_providers;
+mod market_reconcile;
 mod market_recurring;
+mod market_wallet;
 mod metrics;
 mod model_price_catalog;
 mod model_pricing;
@@ -236,6 +242,10 @@ async fn main() -> Result<()> {
         )
         .context("configure Binance auto-settlement failed")?,
     );
+    let market_payments = Arc::new(
+        crate::market_payments::MarketPaymentsRuntime::from_data_dir(&config.data_dir)
+            .context("configure platform wallet payments failed")?,
+    );
     let store = AppStore::new(&config)?;
     let share_abuse = Arc::new(ShareAbuseTracker::new(
         store.load_active_share_client_bans().await?,
@@ -268,6 +278,7 @@ async fn main() -> Result<()> {
         )),
         market_billing_controls: Arc::new(Mutex::new(())),
         binance_settlement,
+        market_payments,
         recent_traffic: RecentTraffic::new(),
         abuse: Arc::new(AbuseTracker::new()),
         share_abuse,
@@ -369,6 +380,7 @@ async fn main() -> Result<()> {
     let market_billing_state = state.clone();
     let market_provider_rank_store = state.store.clone();
     let binance_settlement_state = state.clone();
+    let market_payments_state = state.clone();
     let database_sync_store = state.store.clone();
     let shutdown_database_sync_store = state.store.clone();
     let database_sync_interval_secs = config.database.sync_interval_secs;
@@ -839,6 +851,7 @@ async fn main() -> Result<()> {
             result
         },
     );
+    let market_payments_shutdown_rx = background_shutdown_rx.clone();
     let binance_settlement_task = tokio::spawn(async move {
         let result = crate::binance_settlement::run_service(
             binance_settlement_state,
@@ -849,6 +862,10 @@ async fn main() -> Result<()> {
             tracing::error!(error = %error, "Binance auto-settlement service stopped");
         }
         result.context("Binance auto-settlement background service stopped")
+    });
+    let market_payments_task = tokio::spawn({
+        let shutdown = market_payments_shutdown_rx;
+        async move { crate::market_payments::run_service(market_payments_state, shutdown).await }
     });
     let (http_shutdown_tx, http_shutdown_rx) = watch::channel(false);
     let (ssh_shutdown_tx, ssh_shutdown_rx) = watch::channel(false);
@@ -927,6 +944,7 @@ async fn main() -> Result<()> {
         ("Share Market", share_market_task),
         ("Market billing", market_billing_task),
         ("Binance auto-settlement", binance_settlement_task),
+        ("Market payments", market_payments_task),
     ];
     if let Some(task) = database_sync_task {
         background_tasks.push(("database sync", task));

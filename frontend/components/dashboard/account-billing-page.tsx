@@ -89,6 +89,8 @@ import {
   marketFundingTopupUnavailableKey,
 } from "@/lib/market-funding";
 import { preferredScrollBehavior } from "@/lib/utils";
+import { getMarketWallet, type MarketWallet } from "@/lib/market-wallet-api";
+import { PlatformWalletPanel } from "@/components/dashboard/platform-wallet-panel";
 
 type Currency = typeof MARKET_CURRENCY;
 type BillingTab = "todo" | "payables" | "receivables" | "history" | "admin";
@@ -991,7 +993,7 @@ function CreditAccountPanel({
   );
 }
 
-export function AccountBillingPage() {
+function LegacyAccountBillingPage() {
   const { locale, t } = useLocaleText();
   const { session, loading: authLoading } = useAuth();
   const authed = !!session?.authenticated;
@@ -2353,4 +2355,47 @@ export function AccountBillingPage() {
       </Modal.Backdrop>
     </div>
   );
+}
+
+export function AccountBillingPage() {
+  const { t } = useLocaleText();
+  const { session, loading } = useAuth();
+  const [wallet, setWallet] = React.useState<MarketWallet | null>(null);
+  const [error, setError] = React.useState("");
+  const actorId = session?.user?.id || session?.user?.email || "";
+
+  const reloadMode = React.useCallback(async () => {
+    setError("");
+    try {
+      setWallet(await getMarketWallet());
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }, []);
+
+  React.useEffect(() => {
+    if (!session?.authenticated) return;
+    let active = true;
+    getMarketWallet().then((view) => {
+      if (active) { setWallet(view); setError(""); }
+    }).catch((cause) => {
+      if (active) setError(cause instanceof Error ? cause.message : String(cause));
+    });
+    return () => { active = false; };
+  }, [actorId, session?.authenticated]);
+
+  if (loading || !session?.authenticated) return <LegacyAccountBillingPage />;
+  if (error) {
+    return (
+      <div className="mx-auto grid max-w-3xl gap-4 p-6">
+        <p role="alert" className="text-sm text-destructive">{error}</p>
+        <Button variant="outline" onPress={() => void reloadMode()}>{t("common.retry")}</Button>
+      </div>
+    );
+  }
+  if (!wallet) return <div className="mx-auto max-w-3xl p-6 text-sm text-muted-foreground">{t("common.loading")}</div>;
+  if (wallet.canTopup || wallet.hasWalletActivity) {
+    return <PlatformWalletPanel initialWallet={wallet} />;
+  }
+  return <LegacyAccountBillingPage />;
 }

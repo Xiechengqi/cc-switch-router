@@ -286,6 +286,8 @@ pub fn router(state: ServerState) -> Router {
         .merge(crate::share_market::router())
         .merge(crate::market_access::router())
         .merge(crate::market_billing::router())
+        .merge(crate::market_payments::router())
+        .merge(crate::market_payouts::router())
         .merge(crate::market_providers::router())
         .merge(crate::market_recurring::router())
         .merge(crate::binance_settlement::router())
@@ -655,6 +657,20 @@ async fn ip_blacklist_middleware(
     // break account binding silently. The route carries its own authentication
     // (the `setWebhook` secret header), so exempting it costs nothing.
     if !is_user_model_api && req.uri().path() == crate::telegram::service::WEBHOOK_PATH {
+        return next.run(req).await;
+    }
+    if !is_user_model_api
+        && req
+            .uri()
+            .path()
+            .strip_prefix("/v1/payment-webhooks/dujiaopay/")
+            .is_some_and(|id| !id.is_empty() && id.len() <= 80 && !id.contains('/'))
+    {
+        if let Some(ip) = source_ip_from_request(&req)
+            && !state.market_payments.allow_webhook_ip(ip)
+        {
+            return (StatusCode::TOO_MANY_REQUESTS, "webhook rate limited").into_response();
+        }
         return next.run(req).await;
     }
     if let Some(ip) = source_ip_from_request(&req)
