@@ -1,5 +1,6 @@
 "use client";
 
+/* Hallmark · pre-emit critique: P4 H4 E4 S5 R4 V4 */
 /* Hallmark · component: finance settings panel · genre: modern-minimal · theme: existing Router system
  * states: default · hover · focus · active · disabled · loading · error · success
  * contrast: inherited Router tokens
@@ -7,9 +8,10 @@
 
 import * as React from "react";
 import { AlertTriangle, CheckCircle2, Loader2, Plus, RefreshCw } from "lucide-react";
-import { Alert, Button } from "@heroui/react";
+import { Alert, Button, Modal } from "@heroui/react";
 import { CopyableCodeField } from "@/components/common/copyable-code-field";
 import { useLocaleText } from "@/components/i18n/locale-provider";
+import { ApiError } from "@/lib/api";
 import {
   createMarketPaymentChannel,
   getMarketFinanceCases,
@@ -17,6 +19,11 @@ import {
   getMarketPaymentChannels,
   setMarketFinanceMode,
   setMarketPaymentChannelEnabled,
+  setMarketPaymentChannelArchived,
+  updateMarketPaymentChannelDetails,
+  verifyMarketPaymentChannelApi,
+  rotateMarketPaymentChannelApi,
+  rotateMarketPaymentChannelWebhook,
   type MarketFinanceCase,
   type MarketFinanceReadiness,
   type MarketPaymentChannel,
@@ -24,20 +31,39 @@ import {
 
 type FormState = {
   displayName: string;
+  sortOrder: string;
   apiKeyId: string;
   apiSecret: string;
   webhookSecret: string;
+  webhookMode: "signed" | "poll_only";
+  emergencyRevokePrevious: boolean;
 };
+
+type DialogState = { kind: "create" | "details" | "api" | "webhook" | "archive"; channel?: MarketPaymentChannel };
 
 const EMPTY_FORM: FormState = {
   displayName: "DujiaoPay",
+  sortOrder: "0",
   apiKeyId: "",
   apiSecret: "",
   webhookSecret: "",
+  webhookMode: "signed",
+  emergencyRevokePrevious: false,
 };
 
 function message(error: unknown) {
   return error instanceof Error ? error.message : String(error);
+}
+
+function channelBlockerKey(code: string) {
+  switch (code) {
+    case "channel_none_enabled": return "settings.marketFinance.blocker.channel_none_enabled" as const;
+    case "channel_api_unverified": return "settings.marketFinance.blocker.channel_api_unverified" as const;
+    case "channel_not_signed": return "settings.marketFinance.blocker.channel_not_signed" as const;
+    case "channel_webhook_unverified": return "settings.marketFinance.blocker.channel_webhook_unverified" as const;
+    case "channel_no_current_live_topup": return "settings.marketFinance.blocker.channel_no_current_live_topup" as const;
+    default: return null;
+  }
 }
 
 export function MarketPaymentChannelsPanel() {
@@ -46,9 +72,11 @@ export function MarketPaymentChannelsPanel() {
   const [channels, setChannels] = React.useState<MarketPaymentChannel[]>([]);
   const [cases, setCases] = React.useState<MarketFinanceCase[]>([]);
   const [form, setForm] = React.useState<FormState>(EMPTY_FORM);
+  const [dialog, setDialog] = React.useState<DialogState | null>(null);
+  const [showArchived, setShowArchived] = React.useState(false);
+  const [manageChannelId, setManageChannelId] = React.useState<string | null>(null);
   const [busy, setBusy] = React.useState("");
   const [error, setError] = React.useState("");
-  const [notice, setNotice] = React.useState("");
   const [loaded, setLoaded] = React.useState(false);
   const busyRef = React.useRef(false);
 
@@ -84,39 +112,90 @@ export function MarketPaymentChannelsPanel() {
     return () => { active = false; };
   }, []);
 
-  const perform = async (name: string, action: () => Promise<unknown>, success = "") => {
+  const perform = async (name: string, action: () => Promise<unknown>) => {
     if (busyRef.current) return;
     busyRef.current = true;
     setBusy(name);
     setError("");
-    setNotice("");
     try {
       await action();
       await reload();
-      if (success) setNotice(success);
     } catch (cause) {
-      setError(message(cause));
+      if (cause instanceof ApiError && cause.status === 409 && cause.message.includes("version changed")) {
+        await reload().catch(() => {});
+        setDialog(null);
+        setForm(EMPTY_FORM);
+        setError(t("settings.marketFinance.versionChanged"));
+      } else if (cause instanceof ApiError && cause.status === 409 && cause.message.includes("has not passed verification")) {
+        setError(t("settings.marketFinance.channelNeedsVerification"));
+      } else {
+        setError(message(cause));
+      }
     } finally {
       busyRef.current = false;
       setBusy("");
     }
   };
 
-  const createChannel = async (event: React.FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    await perform("create", async () => {
-      await createMarketPaymentChannel({
-        displayName: form.displayName.trim(),
-        sortOrder: channels.length,
-        apiKeyId: form.apiKeyId.trim(),
-        apiSecret: form.apiSecret,
-        webhookSecret: form.webhookSecret || undefined,
-        webhookMode: form.webhookSecret ? "signed" : "poll_only",
-        allowedMethods: [],
-      });
-      setForm(EMPTY_FORM);
-    }, t("settings.marketFinance.channelCreated"));
+  const openDialog = (kind: DialogState["kind"], channel?: MarketPaymentChannel) => {
+    setError("");
+    setDialog({ kind, channel });
+    setForm({
+      ...EMPTY_FORM,
+      displayName: channel?.displayName ?? "DujiaoPay",
+      sortOrder: String(channel?.sortOrder ?? channels.length),
+      webhookMode: kind === "webhook" ? "signed" : channel?.webhookMode ?? "signed",
+    });
   };
+
+  const closeDialog = () => {
+    setDialog(null);
+    setForm(EMPTY_FORM);
+    setError("");
+  };
+
+  const submitDialog = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!dialog) return;
+    const channel = dialog.channel;
+    await perform(dialog.kind, async () => {
+      if (dialog.kind === "create") {
+        await createMarketPaymentChannel({
+          displayName: form.displayName.trim(), sortOrder: Number(form.sortOrder),
+          apiKeyId: form.apiKeyId.trim(), apiSecret: form.apiSecret,
+          webhookSecret: form.webhookMode === "signed" ? form.webhookSecret : undefined,
+          webhookMode: form.webhookMode, allowedMethods: [],
+        });
+      } else if (channel && dialog.kind === "details") {
+        await updateMarketPaymentChannelDetails(channel.id, {
+          displayName: form.displayName.trim(), sortOrder: Number(form.sortOrder), expectedVersion: channel.version,
+        });
+      } else if (channel && dialog.kind === "api") {
+        await rotateMarketPaymentChannelApi(channel.id, {
+          apiKeyId: form.apiKeyId.trim(), apiSecret: form.apiSecret, expectedVersion: channel.version,
+        });
+      } else if (channel && dialog.kind === "webhook") {
+        await rotateMarketPaymentChannelWebhook(channel.id, {
+          webhookMode: form.webhookMode,
+          webhookSecret: form.webhookMode === "signed" ? form.webhookSecret : undefined,
+          emergencyRevokePrevious: form.emergencyRevokePrevious,
+          expectedVersion: channel.version,
+        });
+      } else if (channel && dialog.kind === "archive") {
+        await setMarketPaymentChannelArchived(channel.id, !channel.archivedAt, channel.version);
+      }
+      closeDialog();
+    });
+  };
+
+  const activeChannels = channels.filter((channel) => !channel.archivedAt);
+  const archivedChannels = channels.filter((channel) => !!channel.archivedAt);
+  const dialogValid = !!dialog && (dialog.kind === "archive" || (
+    (dialog.kind !== "create" && dialog.kind !== "details" || (!!form.displayName.trim() && Number.isSafeInteger(Number(form.sortOrder))))
+    && (dialog.kind !== "create" && dialog.kind !== "api" || (!!form.apiKeyId.trim() && form.apiSecret.length >= 16))
+    && (dialog.kind !== "create" && dialog.kind !== "webhook" || form.webhookMode === "poll_only" || form.webhookSecret.length >= 16)
+    && !(dialog.kind === "webhook" && dialog.channel?.webhookMode === "poll_only" && form.webhookMode === "poll_only")
+  ));
 
   return (
     <section className="grid min-w-0 gap-6" aria-label={t("settings.marketFinance.title")}>
@@ -139,8 +218,7 @@ export function MarketPaymentChannelsPanel() {
       </div>
 
       {!loaded ? <p className="flex items-center gap-2 text-sm text-muted-foreground"><Loader2 className="size-4 animate-spin" />{t("common.loading")}</p> : null}
-      {error ? <Alert status="danger" role="alert">{error}</Alert> : null}
-      {notice ? <Alert status="success" role="status">{notice}</Alert> : null}
+      {error && !dialog ? <Alert status="danger" role="alert">{error}</Alert> : null}
 
       {readiness ? (
         <div className="grid min-w-0 gap-4 rounded-lg border border-border bg-card p-4 sm:p-5">
@@ -172,6 +250,7 @@ export function MarketPaymentChannelsPanel() {
           <div className="grid gap-1 text-sm text-muted-foreground sm:grid-cols-2">
             <p>{t("settings.marketFinance.verifiedTopups", { count: readiness.verifiedLiveTopups })}</p>
             <p>{t("settings.marketFinance.blockers", { count: readiness.legacyBlockers.length })}</p>
+            <p>{t("settings.marketFinance.channelBlockers", { count: readiness.paymentChannelBlockers.length })}</p>
           </div>
           {!readiness.canEnable ? (
             <p className="flex items-start gap-2 text-sm text-muted-foreground">
@@ -189,11 +268,27 @@ export function MarketPaymentChannelsPanel() {
               ))}
             </ul>
           ) : null}
+          {readiness.paymentChannelBlockers.length ? (
+            <ul className="grid gap-1 text-xs text-muted-foreground">
+              {readiness.paymentChannelBlockers.map((blocker) => {
+                const key = channelBlockerKey(blocker.code);
+                return <li key={blocker.code} className="flex justify-between gap-3">
+                  <span>{key ? t(key) : blocker.code}</span>
+                  <span className="tabular-nums">{blocker.count}</span>
+                </li>;
+              })}
+            </ul>
+          ) : null}
         </div>
       ) : null}
 
       <div className="grid min-w-0 gap-4">
-        <h4 className="text-sm font-semibold">{t("settings.marketFinance.channels")}</h4>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <h4 className="text-sm font-semibold">{t("settings.marketFinance.channels")}</h4>
+          <Button size="sm" isDisabled={!!busy} onPress={() => openDialog("create")}>
+            <Plus className="size-4" />{t("settings.marketFinance.addChannel")}
+          </Button>
+        </div>
         {readiness?.webhookUrl ? (
           <div className="grid gap-1">
             <CopyableCodeField
@@ -205,47 +300,95 @@ export function MarketPaymentChannelsPanel() {
             <p className="text-xs text-muted-foreground">{t("settings.marketFinance.webhookUrlNote")}</p>
           </div>
         ) : null}
-        {channels.length ? (
-          <ul className="grid gap-2">
-            {channels.map((channel) => (
-              <li key={channel.id} className="flex min-w-0 flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-card px-4 py-3">
-                <div className="min-w-0">
-                  <p className="truncate text-sm font-medium">{channel.displayName}</p>
-                  <p className="flex flex-wrap items-center gap-x-1 gap-y-0.5 text-xs text-muted-foreground">
-                    {channel.verified ? <CheckCircle2 className="size-3.5" aria-hidden="true" /> : <AlertTriangle className="size-3.5" aria-hidden="true" />}
-                    {channel.verified ? t("settings.marketFinance.verified") : t("settings.marketFinance.unverified")}
-                    <span aria-hidden="true">·</span> {t(`settings.marketFinance.webhookMode.${channel.webhookMode}`)}
-                    <span aria-hidden="true">·</span> {t("settings.marketFinance.channelLiveTopups", { count: channel.verifiedLiveTopups })}
-                  </p>
+        {activeChannels.length ? (
+          <ul className="grid gap-3">
+            {activeChannels.map((channel) => (
+              <li key={channel.id} className="grid min-w-0 gap-3 rounded-lg border border-border bg-card p-4">
+                <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
+                  <p className="min-w-0 truncate text-sm font-semibold">{channel.displayName}</p>
+                  <span className="rounded-full bg-muted px-2.5 py-1 text-xs font-medium">
+                    {t(channel.enabled ? "settings.marketFinance.channelActive" : "settings.marketFinance.channelStopped")}
+                  </span>
                 </div>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  isDisabled={!!busy || !channel.verified}
-                  onPress={() => void perform(channel.id, () => setMarketPaymentChannelEnabled(channel.id, !channel.enabled))}
-                >
-                  {channel.enabled ? t("settings.marketFinance.stopChannel") : t("settings.marketFinance.startChannel")}
-                </Button>
+                <div className="grid gap-1 text-xs text-muted-foreground sm:grid-cols-3">
+                  <span className="flex items-center gap-1.5">{channel.verified ? <CheckCircle2 className="size-3.5" /> : <AlertTriangle className="size-3.5" />}{t(channel.verified ? "settings.marketFinance.verified" : "settings.marketFinance.unverified")}</span>
+                  <span className="flex items-center gap-1.5">{channel.webhookVerified ? <CheckCircle2 className="size-3.5" /> : <AlertTriangle className="size-3.5" />}{t(channel.webhookMode === "poll_only" ? "settings.marketFinance.webhookMode.poll_only" : channel.webhookVerified ? "settings.marketFinance.webhookVerified" : "settings.marketFinance.webhookPending")}</span>
+                  <span>{t("settings.marketFinance.channelCurrentTopups", { count: channel.verifiedLiveTopupsCurrentRevision })}</span>
+                </div>
+                {channel.unresolvedTopups > 0 ? <p className="text-xs text-muted-foreground">{t("settings.marketFinance.unresolvedTopups", { count: channel.unresolvedTopups })}</p> : null}
+                <div className="flex flex-wrap gap-2">
+                  <Button size="sm" variant="outline" isDisabled={!!busy || !channel.verified} onPress={() => void perform(channel.id, () => setMarketPaymentChannelEnabled(channel.id, !channel.enabled, channel.version))}>
+                    {channel.enabled ? t("settings.marketFinance.stopChannel") : t("settings.marketFinance.startChannel")}
+                  </Button>
+                  <Button size="sm" variant="ghost" aria-expanded={manageChannelId === channel.id} isDisabled={!!busy} onPress={() => setManageChannelId((current) => current === channel.id ? null : channel.id)}>{t("settings.marketFinance.manageChannel")}</Button>
+                </div>
+                {manageChannelId === channel.id ? <div className="flex flex-wrap gap-2 rounded-md bg-muted/60 p-2">
+                  {!channel.verified ? <Button size="sm" variant="ghost" isDisabled={!!busy} onPress={() => void perform(channel.id, () => verifyMarketPaymentChannelApi(channel.id, channel.version))}>{t("settings.marketFinance.reverifyApi")}</Button> : null}
+                  <Button size="sm" variant="ghost" isDisabled={!!busy} onPress={() => openDialog("details", channel)}>{t("settings.marketFinance.editDetails")}</Button>
+                  <Button size="sm" variant="ghost" isDisabled={!!busy} onPress={() => openDialog("api", channel)}>{t("settings.marketFinance.rotateApi")}</Button>
+                  <Button size="sm" variant="ghost" isDisabled={!!busy} onPress={() => openDialog("webhook", channel)}>{t("settings.marketFinance.rotateWebhook")}</Button>
+                  <Button size="sm" variant="ghost" isDisabled={!!busy} onPress={() => openDialog("archive", channel)}>{t("settings.marketFinance.archive")}</Button>
+                </div> : null}
               </li>
             ))}
           </ul>
-        ) : loaded ? <p className="text-sm text-muted-foreground">{t("settings.marketFinance.noChannels")}</p> : null}
-
-        <form onSubmit={(event) => void createChannel(event)} className="grid min-w-0 gap-3 rounded-lg border border-border bg-card p-4 sm:grid-cols-2 sm:p-5">
-          <h5 className="sm:col-span-2 text-sm font-semibold">{t("settings.marketFinance.addChannel")}</h5>
-          <Field label={t("settings.marketFinance.displayName")} value={form.displayName} onChange={(value) => setForm((current) => ({ ...current, displayName: value }))} required />
-          <Field label={t("settings.marketFinance.keyId")} value={form.apiKeyId} onChange={(value) => setForm((current) => ({ ...current, apiKeyId: value }))} required />
-          <Field label={t("settings.marketFinance.apiSecret")} value={form.apiSecret} onChange={(value) => setForm((current) => ({ ...current, apiSecret: value }))} type="password" minLength={16} required />
-          <Field label={t("settings.marketFinance.webhookSecret")} value={form.webhookSecret} onChange={(value) => setForm((current) => ({ ...current, webhookSecret: value }))} type="password" minLength={16} />
-          <p className="sm:col-span-2 text-xs text-muted-foreground">{t("settings.marketFinance.keyNote")}</p>
-          <div className="sm:col-span-2 flex justify-start">
-            <Button type="submit" isDisabled={!!busy || !form.displayName.trim() || !form.apiKeyId.trim() || form.apiSecret.length < 16 || (form.webhookSecret.length > 0 && form.webhookSecret.length < 16)}>
-              {busy === "create" ? <Loader2 className="size-4 animate-spin" /> : <Plus className="size-4" />}
-              {busy === "create" ? t("settings.marketFinance.saving") : t("settings.marketFinance.saveChannel")}
+        ) : loaded ? <p className="text-sm text-muted-foreground">{t(channels.length ? "settings.marketFinance.allArchived" : "settings.marketFinance.noChannels")}</p> : null}
+        {archivedChannels.length ? (
+          <div className="grid gap-2">
+            <Button size="sm" variant="ghost" className="justify-self-start" onPress={() => setShowArchived((value) => !value)}>
+              {t("settings.marketFinance.archivedChannels", { count: archivedChannels.length })}
             </Button>
+            {showArchived ? <ul className="grid gap-2">{archivedChannels.map((channel) => (
+              <li key={channel.id} className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border bg-card px-4 py-3">
+                <div className="min-w-0"><p className="truncate text-sm font-medium">{channel.displayName}</p><p className="text-xs text-muted-foreground">{t("settings.marketFinance.unresolvedTopups", { count: channel.unresolvedTopups })}</p></div>
+                <Button size="sm" variant="outline" isDisabled={!!busy} onPress={() => openDialog("archive", channel)}>{t("settings.marketFinance.restore")}</Button>
+              </li>
+            ))}</ul> : null}
           </div>
-        </form>
+        ) : null}
       </div>
+
+      <Modal.Backdrop isOpen={!!dialog} onOpenChange={(open) => { if (!open && !busy) closeDialog(); }}>
+        <Modal.Container placement="center">
+          <Modal.Dialog className="light w-[min(560px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
+            <Modal.CloseTrigger />
+            <Modal.Header><Modal.Heading>{dialog ? t(`settings.marketFinance.dialog.${dialog.kind}`) : ""}</Modal.Heading></Modal.Header>
+            <form onSubmit={(event) => void submitDialog(event)}>
+              <Modal.Body className="grid max-h-[65vh] gap-3 overflow-y-auto">
+                {dialog?.kind === "create" || dialog?.kind === "details" ? <>
+                  <Field label={t("settings.marketFinance.displayName")} value={form.displayName} onChange={(value) => setForm((current) => ({ ...current, displayName: value }))} maxLength={80} required />
+                  <Field label={t("settings.marketFinance.sortOrder")} value={form.sortOrder} onChange={(value) => setForm((current) => ({ ...current, sortOrder: value }))} type="number" required />
+                </> : null}
+                {dialog?.kind === "create" || dialog?.kind === "api" ? <>
+                  <Field label={t("settings.marketFinance.keyId")} value={form.apiKeyId} onChange={(value) => setForm((current) => ({ ...current, apiKeyId: value }))} maxLength={200} required />
+                  <Field label={t("settings.marketFinance.apiSecret")} value={form.apiSecret} onChange={(value) => setForm((current) => ({ ...current, apiSecret: value }))} type="password" minLength={16} maxLength={4096} required />
+                </> : null}
+                {dialog?.kind === "create" || dialog?.kind === "webhook" ? <>
+                  <label className="grid gap-1 text-sm font-medium"><span>{t("settings.marketFinance.webhookMode")}</span>
+                    <select className="h-11 rounded-md border border-input bg-background px-3 text-sm focus-visible:outline-2 focus-visible:outline-ring" value={form.webhookMode} onChange={(event) => setForm((current) => ({ ...current, webhookMode: event.target.value as FormState["webhookMode"], webhookSecret: "" }))}>
+                      <option value="signed">{t("settings.marketFinance.webhookMode.signed")}</option>
+                      <option value="poll_only">{t("settings.marketFinance.webhookMode.poll_only")}</option>
+                    </select>
+                  </label>
+                  {form.webhookMode === "signed" ? <Field label={t("settings.marketFinance.webhookSecret")} value={form.webhookSecret} onChange={(value) => setForm((current) => ({ ...current, webhookSecret: value }))} type="password" minLength={16} maxLength={4096} required /> : null}
+                  <p className="text-xs text-muted-foreground">{t(form.webhookMode === "signed" ? "settings.marketFinance.signedNote" : "settings.marketFinance.pollOnlyNote")}</p>
+                  {dialog.kind === "webhook" && dialog.channel?.webhookMode === "signed" && form.webhookMode === "signed" ? <label className="flex items-start gap-2 text-xs"><input type="checkbox" checked={form.emergencyRevokePrevious} onChange={(event) => setForm((current) => ({ ...current, emergencyRevokePrevious: event.target.checked }))} />{t("settings.marketFinance.emergencyRevoke")}</label> : null}
+                </> : null}
+                {dialog?.kind === "api" ? <p className="text-xs text-muted-foreground">{t("settings.marketFinance.apiRotationNote")}</p> : null}
+                {dialog?.kind === "archive" ? <p className="text-sm text-muted-foreground">{t(dialog.channel?.archivedAt ? "settings.marketFinance.restoreNote" : "settings.marketFinance.archiveNote", { count: dialog.channel?.unresolvedTopups ?? 0 })}</p> : null}
+                {error ? <Alert status="danger" role="alert">{error}</Alert> : null}
+              </Modal.Body>
+              <Modal.Footer>
+                <Button type="button" variant="outline" isDisabled={!!busy} onPress={closeDialog}>{t("common.cancel")}</Button>
+                <Button type="submit" isDisabled={!!busy || !dialogValid}>
+                  {busy ? <Loader2 className="size-4 animate-spin" /> : null}
+                  {t(dialog?.kind === "archive" ? dialog.channel?.archivedAt ? "settings.marketFinance.restore" : "settings.marketFinance.archive" : "common.save")}
+                </Button>
+              </Modal.Footer>
+            </form>
+          </Modal.Dialog>
+        </Modal.Container>
+      </Modal.Backdrop>
 
       {cases.length ? (
         <div className="grid min-w-0 gap-3">
@@ -265,12 +408,13 @@ export function MarketPaymentChannelsPanel() {
   );
 }
 
-function Field({ label, value, onChange, type = "text", minLength, required }: {
+function Field({ label, value, onChange, type = "text", minLength, maxLength, required }: {
   label: string;
   value: string;
   onChange: (value: string) => void;
-  type?: "text" | "password";
+  type?: "text" | "password" | "number";
   minLength?: number;
+  maxLength?: number;
   required?: boolean;
 }) {
   return (
@@ -282,6 +426,7 @@ function Field({ label, value, onChange, type = "text", minLength, required }: {
         onChange={(event) => onChange(event.target.value)}
         type={type}
         minLength={minLength}
+        maxLength={maxLength}
         required={required}
         autoComplete="off"
       />

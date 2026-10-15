@@ -129,7 +129,12 @@ impl Client {
             .map_err(|_| AppError::ServiceUnavailable("DujiaoPay request unavailable".into()))?;
         if !response.status().is_success() {
             return Err(AppError::ServiceUnavailable(
-                "DujiaoPay rejected request".into(),
+                if response.status().is_client_error() {
+                    "DujiaoPay rejected request"
+                } else {
+                    "DujiaoPay request unavailable"
+                }
+                .into(),
             ));
         }
         if response
@@ -230,6 +235,10 @@ impl Client {
             .await?;
         parse_gateway_order(payload(&value))
     }
+}
+
+pub(super) fn may_be_key_scoped_order(error: &AppError) -> bool {
+    matches!(error, AppError::ServiceUnavailable(message) if message == "DujiaoPay rejected request")
 }
 
 fn payload(value: &Value) -> &Value {

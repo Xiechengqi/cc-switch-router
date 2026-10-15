@@ -204,6 +204,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         56,
         include_str!("../schema/0056_market_dujiaopay_callback.sql"),
     ),
+    (
+        57,
+        include_str!("../schema/0057_market_payment_channel_lifecycle.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -1198,6 +1202,57 @@ mod tests {
             )
             .unwrap();
         assert_eq!(schedule, ("2026-10-02".into(), 0));
+    }
+
+    #[test]
+    fn migration_57_keeps_existing_channels_and_bound_orders() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 56);
+        conn.execute(
+            "INSERT INTO market_payment_channels
+             (id, gateway_kind, display_name, enabled, current_revision, created_at, updated_at)
+             VALUES ('channel', 'dujiaopay', 'Gateway', 1, 1, '2026-10-01', '2026-10-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO market_payment_channel_revisions
+             (channel_id, revision, merchant_id, merchant_fingerprint, api_key_id,
+              api_secret_ciphertext, api_secret_nonce, webhook_secret_ciphertext,
+              webhook_secret_nonce, key_version, verified_at, created_at)
+             VALUES ('channel', 1, 'merchant', 'fingerprint', 'key', 'api-cipher',
+                     'api-nonce', 'webhook-cipher', 'webhook-nonce', 1,
+                     '2026-10-01', '2026-10-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO market_topup_orders
+             (id, user_id, channel_id, channel_revision, merchant_fingerprint,
+              merchant_order_id, idempotency_key, request_fingerprint, amount_minor,
+              status, created_at, updated_at)
+             VALUES ('order', 'buyer', 'channel', 1, 'fingerprint',
+                     'router-00000000000000000000000000000001', 'request-key',
+                     'channel:100', 100, 'pending', '2026-10-01', '2026-10-02')",
+            [],
+        )
+        .unwrap();
+        apply(&conn).unwrap();
+        let (version, archived_at, verified_at, reverify_required): (i64, Option<String>, Option<String>, i64) = conn
+            .query_row("SELECT version, archived_at, webhook_verified_at, api_reverify_required FROM market_payment_channels WHERE id = 'channel'",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).unwrap();
+        assert_eq!(version, 1);
+        assert!(archived_at.is_none());
+        assert!(verified_at.is_none());
+        assert_eq!(reverify_required, 0);
+        let revision: i64 = conn
+            .query_row(
+                "SELECT channel_revision FROM market_topup_orders WHERE id = 'order'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(revision, 1);
     }
 
     fn install_schema_through(conn: &Connection, version: i64) {

@@ -8,6 +8,7 @@ export type MarketFinanceReadiness = {
   legacyBlockers: { code: string; count: number }[];
   criticalCases: number;
   verifiedLiveTopups: number;
+  paymentChannelBlockers: { code: string; count: number }[];
   canEnable: boolean;
   webhookUrl?: string;
 };
@@ -49,9 +50,15 @@ export type MarketPaymentChannel = {
   enabled: boolean;
   sortOrder: number;
   currentRevision: number;
+  version: number;
+  archivedAt: string | null;
   verified: boolean;
   webhookMode: "signed" | "poll_only";
+  webhookVerifiedAt: string | null;
+  webhookVerified: boolean;
+  unresolvedTopups: number;
   verifiedLiveTopups: number;
+  verifiedLiveTopupsCurrentRevision: number;
   gatewayKind: "dujiaopay";
 };
 
@@ -76,6 +83,7 @@ export type MarketPaymentChannelInput = {
   webhookSecret?: string;
   webhookMode?: "signed" | "poll_only";
   allowedMethods: string[];
+  expectedVersion?: number;
 };
 
 export async function getMarketWallet() {
@@ -158,12 +166,55 @@ export async function createMarketPaymentChannel(input: MarketPaymentChannelInpu
   );
 }
 
-export async function setMarketPaymentChannelEnabled(id: string, enabled: boolean) {
+export async function setMarketPaymentChannelEnabled(id: string, enabled: boolean, expectedVersion: number) {
   return parseJson<{ enabled: boolean }>(
     await authFetch(`/v1/admin/market-payment-channels/${encodeURIComponent(id)}/enabled`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ enabled }),
+      body: JSON.stringify({ enabled, expectedVersion }),
     }),
   );
+}
+
+function channelUrl(id: string, action: string) {
+  return `/v1/admin/market-payment-channels/${encodeURIComponent(id)}/${action}`;
+}
+
+export async function updateMarketPaymentChannelDetails(id: string, input: {
+  displayName: string; sortOrder: number; expectedVersion: number;
+}) {
+  return parseJson<MarketPaymentChannel>(await authFetch(channelUrl(id, "details"), {
+    method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input),
+  }));
+}
+
+export async function verifyMarketPaymentChannelApi(id: string, expectedVersion: number) {
+  return parseJson<MarketPaymentChannel>(await authFetch(channelUrl(id, "verify"), {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ expectedVersion }),
+  }));
+}
+
+export async function rotateMarketPaymentChannelApi(id: string, input: {
+  apiKeyId: string; apiSecret: string; expectedVersion: number;
+}) {
+  return parseJson<MarketPaymentChannel>(await authFetch(channelUrl(id, "api-credentials"), {
+    method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input),
+  }));
+}
+
+export async function rotateMarketPaymentChannelWebhook(id: string, input: {
+  webhookMode: "signed" | "poll_only"; webhookSecret?: string;
+  emergencyRevokePrevious?: boolean; expectedVersion: number;
+}) {
+  return parseJson<MarketPaymentChannel>(await authFetch(channelUrl(id, "webhook-secret"), {
+    method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input),
+  }));
+}
+
+export async function setMarketPaymentChannelArchived(id: string, archived: boolean, expectedVersion: number) {
+  return parseJson<MarketPaymentChannel>(await authFetch(channelUrl(id, "archive"), {
+    method: "PUT", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ archived, expectedVersion }),
+  }));
 }

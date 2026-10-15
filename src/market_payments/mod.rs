@@ -34,10 +34,12 @@ const MIN_TOPUP_MINOR: i64 = 100;
 const MAX_PENDING_ORDERS: i64 = 3;
 const MAX_TOPUPS_PER_HOUR: i64 = 12;
 const MAX_TOPUPS_PER_IP_HOUR: u32 = 60;
+const MAX_PAYMENT_SECRET_BYTES: usize = 4_096;
 const WEBHOOK_HINT_COOLDOWN_SECS: i64 = 300;
 const WEBHOOK_HINT_RECOVERY_SECS: i64 = 21_600;
 const RECONCILE_LEASE_SECS: i64 = 300;
 const TERMINAL_RECONCILE_DAYS: i64 = 90;
+const WEBHOOK_KEY_GRACE_MINUTES: i64 = 10;
 // Keep this false until Share and Client purchases, reconcile, renewal,
 // failure release, refunds, and UI have all moved to the same wallet rail.
 const MARKET_WALLET_CUTOVER_IMPLEMENTED: bool = false;
@@ -189,6 +191,26 @@ pub fn router() -> Router<ServerState> {
             put(replace_channel),
         )
         .route(
+            "/v1/admin/market-payment-channels/:id/details",
+            put(update_channel_details),
+        )
+        .route(
+            "/v1/admin/market-payment-channels/:id/verify",
+            post(verify_channel_api),
+        )
+        .route(
+            "/v1/admin/market-payment-channels/:id/api-credentials",
+            put(rotate_channel_api),
+        )
+        .route(
+            "/v1/admin/market-payment-channels/:id/webhook-secret",
+            put(rotate_channel_webhook),
+        )
+        .route(
+            "/v1/admin/market-payment-channels/:id/archive",
+            put(set_channel_archived),
+        )
+        .route(
             "/v1/admin/market-payment-channels/:id/enabled",
             put(set_channel_enabled),
         )
@@ -229,6 +251,7 @@ struct FinanceReadinessView {
     legacy_blockers: Vec<ReadinessBlocker>,
     critical_cases: i64,
     verified_live_topups: i64,
+    payment_channel_blockers: Vec<ReadinessBlocker>,
     can_enable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     webhook_url: Option<String>,
@@ -331,10 +354,42 @@ fn finance_readiness_tx(conn: &Connection) -> Result<FinanceReadinessView, AppEr
         )
         .map_err(db_error("count verified top-ups"))?;
     let critical_cases = crate::market_reconcile::critical_case_count_tx(conn)?;
+    let channel_checks: [(&'static str, &'static str); 5] = [
+        (
+            "channel_none_enabled",
+            "SELECT CASE WHEN EXISTS (SELECT 1 FROM market_payment_channels c JOIN market_payment_channel_revisions r ON r.channel_id = c.id AND r.revision = c.current_revision WHERE c.enabled = 1 AND c.archived_at IS NULL AND c.api_reverify_required = 0 AND r.verified_at IS NOT NULL) THEN 0 ELSE 1 END",
+        ),
+        (
+            "channel_api_unverified",
+            "SELECT COUNT(*) FROM market_payment_channels c LEFT JOIN market_payment_channel_revisions r ON r.channel_id = c.id AND r.revision = c.current_revision WHERE c.enabled = 1 AND c.archived_at IS NULL AND (c.api_reverify_required = 1 OR r.verified_at IS NULL)",
+        ),
+        (
+            "channel_not_signed",
+            "SELECT COUNT(*) FROM market_payment_channels c JOIN market_payment_channel_revisions r ON r.channel_id = c.id AND r.revision = c.current_revision WHERE c.enabled = 1 AND c.archived_at IS NULL AND r.webhook_mode != 'signed'",
+        ),
+        (
+            "channel_webhook_unverified",
+            "SELECT COUNT(*) FROM market_payment_channels c JOIN market_payment_channel_revisions r ON r.channel_id = c.id AND r.revision = c.current_revision WHERE c.enabled = 1 AND c.archived_at IS NULL AND r.webhook_mode = 'signed' AND (c.webhook_verified_at IS NULL OR c.webhook_verified_revision IS NOT c.current_revision)",
+        ),
+        (
+            "channel_no_current_live_topup",
+            "SELECT COUNT(*) FROM market_payment_channels c WHERE c.enabled = 1 AND c.archived_at IS NULL AND NOT EXISTS (SELECT 1 FROM market_topup_orders t WHERE t.channel_id = c.id AND t.channel_revision = c.current_revision AND t.status = 'credited')",
+        ),
+    ];
+    let mut payment_channel_blockers = Vec::new();
+    for (code, sql) in channel_checks {
+        let count: i64 = conn
+            .query_row(sql, [], |row| row.get(0))
+            .map_err(db_error("read payment channel readiness"))?;
+        if count > 0 {
+            payment_channel_blockers.push(ReadinessBlocker { code, count });
+        }
+    }
     let can_enable = MARKET_WALLET_CUTOVER_IMPLEMENTED
         && legacy_blockers.is_empty()
         && critical_cases == 0
-        && verified_live_topups > 0;
+        && verified_live_topups > 0
+        && payment_channel_blockers.is_empty();
     Ok(FinanceReadinessView {
         mode,
         version,
@@ -342,6 +397,7 @@ fn finance_readiness_tx(conn: &Connection) -> Result<FinanceReadinessView, AppEr
         legacy_blockers,
         critical_cases,
         verified_live_topups,
+        payment_channel_blockers,
         can_enable,
         webhook_url: None,
     })
@@ -362,7 +418,7 @@ async fn get_finance_readiness(
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ModeRequest {
     mode: String,
     expected_version: i64,
@@ -567,9 +623,15 @@ struct ChannelView {
     enabled: bool,
     sort_order: i64,
     current_revision: i64,
+    version: i64,
+    archived_at: Option<String>,
     verified: bool,
     webhook_mode: String,
+    webhook_verified_at: Option<String>,
+    webhook_verified: bool,
+    unresolved_topups: i64,
     verified_live_topups: i64,
+    verified_live_topups_current_revision: i64,
     gateway_kind: &'static str,
 }
 
@@ -594,23 +656,35 @@ impl From<ChannelView> for BuyerChannelView {
 fn channel_views(conn: &Connection, only_enabled: bool) -> Result<Vec<ChannelView>, AppError> {
     let sql = if only_enabled {
         "SELECT c.id, c.display_name, c.enabled, c.sort_order, c.current_revision,
-                r.verified_at IS NOT NULL, r.webhook_mode,
+                c.version, c.archived_at, (r.verified_at IS NOT NULL AND c.api_reverify_required = 0), r.webhook_mode,
+                c.webhook_verified_at,
+                (c.webhook_verified_at IS NOT NULL AND c.webhook_verified_revision IS c.current_revision),
                 (SELECT COUNT(*) FROM market_topup_orders t
-                 WHERE t.channel_id = c.id AND t.status = 'credited')
+                 WHERE t.channel_id = c.id AND t.status NOT IN ('credited', 'expired', 'cancelled')),
+                (SELECT COUNT(*) FROM market_topup_orders t
+                 WHERE t.channel_id = c.id AND t.status = 'credited'),
+                (SELECT COUNT(*) FROM market_topup_orders t
+                 WHERE t.channel_id = c.id AND t.channel_revision = c.current_revision AND t.status = 'credited')
          FROM market_payment_channels c
          JOIN market_payment_channel_revisions r
            ON r.channel_id = c.id AND r.revision = c.current_revision
-         WHERE c.enabled = 1 AND r.verified_at IS NOT NULL
+         WHERE c.enabled = 1 AND c.archived_at IS NULL AND c.api_reverify_required = 0 AND r.verified_at IS NOT NULL
          ORDER BY c.sort_order, c.id"
     } else {
         "SELECT c.id, c.display_name, c.enabled, c.sort_order, c.current_revision,
-                r.verified_at IS NOT NULL, r.webhook_mode,
+                c.version, c.archived_at, (r.verified_at IS NOT NULL AND c.api_reverify_required = 0), r.webhook_mode,
+                c.webhook_verified_at,
+                (c.webhook_verified_at IS NOT NULL AND c.webhook_verified_revision IS c.current_revision),
                 (SELECT COUNT(*) FROM market_topup_orders t
-                 WHERE t.channel_id = c.id AND t.status = 'credited')
+                 WHERE t.channel_id = c.id AND t.status NOT IN ('credited', 'expired', 'cancelled')),
+                (SELECT COUNT(*) FROM market_topup_orders t
+                 WHERE t.channel_id = c.id AND t.status = 'credited'),
+                (SELECT COUNT(*) FROM market_topup_orders t
+                 WHERE t.channel_id = c.id AND t.channel_revision = c.current_revision AND t.status = 'credited')
          FROM market_payment_channels c
          LEFT JOIN market_payment_channel_revisions r
            ON r.channel_id = c.id AND r.revision = c.current_revision
-         ORDER BY c.sort_order, c.id"
+         ORDER BY c.archived_at IS NOT NULL, c.sort_order, c.id"
     };
     let mut statement = conn
         .prepare(sql)
@@ -623,9 +697,15 @@ fn channel_views(conn: &Connection, only_enabled: bool) -> Result<Vec<ChannelVie
                 enabled: row.get::<_, i64>(2)? == 1,
                 sort_order: row.get(3)?,
                 current_revision: row.get(4)?,
-                verified: row.get::<_, i64>(5)? == 1,
-                webhook_mode: row.get(6)?,
-                verified_live_topups: row.get(7)?,
+                version: row.get(5)?,
+                archived_at: row.get(6)?,
+                verified: row.get::<_, i64>(7)? == 1,
+                webhook_mode: row.get(8)?,
+                webhook_verified_at: row.get(9)?,
+                webhook_verified: row.get::<_, i64>(10)? == 1,
+                unresolved_topups: row.get(11)?,
+                verified_live_topups: row.get(12)?,
+                verified_live_topups_current_revision: row.get(13)?,
                 gateway_kind: "dujiaopay",
             })
         })
@@ -683,6 +763,8 @@ struct UpsertChannelRequest {
     webhook_mode: Option<String>,
     #[serde(default)]
     allowed_methods: Vec<String>,
+    #[serde(default)]
+    expected_version: Option<i64>,
 }
 
 fn validate_channel_input(input: &UpsertChannelRequest) -> Result<(), AppError> {
@@ -696,14 +778,16 @@ fn validate_channel_input(input: &UpsertChannelRequest) -> Result<(), AppError> 
         || input.api_key_id.trim().is_empty()
         || input.api_key_id.len() > 200
         || input.api_secret.len() < 16
+        || input.api_secret.len() > MAX_PAYMENT_SECRET_BYTES
         || input
             .webhook_secret
             .as_ref()
-            .is_some_and(|secret| secret.len() < 16)
+            .is_some_and(|secret| !(16..=MAX_PAYMENT_SECRET_BYTES).contains(&secret.len()))
         || input
             .webhook_mode
             .as_deref()
             .is_some_and(|mode| mode != inferred_mode)
+        || (input.webhook_secret.is_none() && input.webhook_mode.as_deref() != Some("poll_only"))
         || input.allowed_methods.len() > 32
         || input.allowed_methods.iter().any(|method| {
             method.len() > 80
@@ -743,6 +827,11 @@ async fn save_channel(
     input: UpsertChannelRequest,
 ) -> Result<ChannelView, AppError> {
     validate_channel_input(&input)?;
+    if channel_id.is_some() != input.expected_version.is_some() {
+        return Err(AppError::BadRequest(
+            "expectedVersion is required only when replacing a channel".into(),
+        ));
+    }
     let webhook_mode = if input.webhook_secret.is_some() {
         "signed"
     } else {
@@ -763,18 +852,52 @@ async fn save_channel(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin payment channel update"))?;
-    let current_revision = tx
+    let current_state = tx
         .query_row(
-            "SELECT current_revision FROM market_payment_channels WHERE id = ?1",
+            "SELECT current_revision, version, archived_at FROM market_payment_channels WHERE id = ?1",
             params![id],
-            |row| row.get::<_, i64>(0),
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<String>>(2)?)),
         )
         .optional()
         .map_err(db_error("read payment channel revision"))?;
-    if replacing && current_revision.is_none() {
+    if replacing && current_state.is_none() {
         return Err(AppError::NotFound("payment channel not found".into()));
     }
-    if let Some(current_revision) = current_revision {
+    let current_revision = current_state.as_ref().map(|state| state.0);
+    let mut preserve_webhook_verification = false;
+    let mut previous_webhook_revision = None;
+    let mut previous_webhook_valid_until = None;
+    if let Some((current_revision, version, archived_at)) = &current_state {
+        if archived_at.is_some() {
+            return Err(AppError::Conflict(
+                "archived payment channel must be restored first".into(),
+            ));
+        }
+        if input.expected_version != Some(*version) {
+            return Err(AppError::Conflict("payment channel version changed".into()));
+        }
+        let old = load_revision(&tx, &state.market_payments, &id, *current_revision)?;
+        if old.merchant_fingerprint != merchant_fingerprint {
+            return Err(AppError::Conflict(
+                "payment merchant changed; create a new channel".into(),
+            ));
+        }
+        let same_webhook_key = old
+            .credentials
+            .webhook_secret
+            .as_ref()
+            .map(|secret| secret.as_str())
+            == input.webhook_secret.as_deref();
+        preserve_webhook_verification = same_webhook_key;
+        if !same_webhook_key
+            && old.credentials.webhook_secret.is_some()
+            && credentials.webhook_secret.is_some()
+        {
+            previous_webhook_revision = Some(*current_revision);
+            previous_webhook_valid_until = Some(
+                (Utc::now() + chrono::Duration::minutes(WEBHOOK_KEY_GRACE_MINUTES)).to_rfc3339(),
+            );
+        }
         let current_mode: String = tx
             .query_row(
                 "SELECT webhook_mode FROM market_payment_channel_revisions
@@ -808,18 +931,30 @@ async fn save_channel(
             params![id, input.display_name.trim(), input.sort_order, revision, time],
         ).map_err(db_error("insert payment channel"))?;
     } else {
-        tx.execute(
+        let changed = tx.execute(
             "UPDATE market_payment_channels SET display_name = ?2, enabled = 0, sort_order = ?3,
-                    current_revision = ?4, updated_at = ?5 WHERE id = ?1",
+                    current_revision = ?4, updated_at = ?5, version = version + 1,
+                    api_reverify_required = 0,
+                    previous_webhook_revision = ?7, previous_webhook_valid_until = ?8,
+                    webhook_verified_revision = CASE WHEN ?9 THEN ?4 ELSE NULL END,
+                    webhook_verified_at = CASE WHEN ?9 THEN webhook_verified_at ELSE NULL END
+             WHERE id = ?1 AND version = ?6 AND archived_at IS NULL",
             params![
                 id,
                 input.display_name.trim(),
                 input.sort_order,
                 revision,
-                time
+                time,
+                input.expected_version,
+                previous_webhook_revision,
+                previous_webhook_valid_until,
+                preserve_webhook_verification,
             ],
         )
         .map_err(db_error("update payment channel"))?;
+        if changed != 1 {
+            return Err(AppError::Conflict("payment channel version changed".into()));
+        }
     }
     let allowed_methods_json = serde_json::to_string(&input.allowed_methods)
         .map_err(|_| AppError::Internal("encode allowed methods failed".into()))?;
@@ -857,17 +992,10 @@ async fn save_channel(
         &time,
     )?;
     tx.commit().map_err(db_error("commit payment channel"))?;
-    Ok(ChannelView {
-        id,
-        display_name: input.display_name.trim().into(),
-        enabled: false,
-        sort_order: input.sort_order,
-        current_revision: revision,
-        verified: true,
-        webhook_mode: webhook_mode.into(),
-        verified_live_topups: 0,
-        gateway_kind: "dujiaopay",
-    })
+    channel_views(&conn, false)?
+        .into_iter()
+        .find(|view| view.id == id)
+        .ok_or_else(|| AppError::Internal("saved payment channel missing".into()))
 }
 
 async fn create_channel(
@@ -889,18 +1017,10 @@ async fn replace_channel(
     let session = crate::api::require_admin_session(&state, &headers).await?;
     {
         let conn = state.store.conn.lock().await;
-        let exists = conn
-            .query_row(
-                "SELECT 1 FROM market_payment_channels WHERE id = ?1",
-                params![id],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(db_error("check payment channel"))?
-            .is_some();
-        if !exists {
-            return Err(AppError::NotFound("payment channel not found".into()));
-        }
+        let expected_version = input.expected_version.ok_or_else(|| {
+            AppError::BadRequest("expectedVersion is required when replacing a channel".into())
+        })?;
+        editable_revision_tx(&conn, &id, expected_version)?;
     }
     let view = save_channel(&state, &session, Some(id), input).await?;
     Ok((no_store(), Json(view)))
@@ -908,8 +1028,523 @@ async fn replace_channel(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ChannelDetailsRequest {
+    display_name: String,
+    sort_order: i64,
+    expected_version: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct VerifyChannelRequest {
+    expected_version: i64,
+}
+
+#[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RotateApiRequest {
+    api_key_id: String,
+    api_secret: String,
+    expected_version: i64,
+}
+
+#[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RotateWebhookRequest {
+    webhook_mode: String,
+    webhook_secret: Option<String>,
+    #[serde(default)]
+    emergency_revoke_previous: bool,
+    expected_version: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ArchiveChannelRequest {
+    archived: bool,
+    expected_version: i64,
+}
+
+fn channel_edit_state_tx(
+    conn: &Connection,
+    id: &str,
+) -> Result<(i64, i64, Option<String>), AppError> {
+    conn.query_row(
+        "SELECT current_revision, version, archived_at FROM market_payment_channels WHERE id = ?1",
+        params![id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .optional()
+    .map_err(db_error("read payment channel edit state"))?
+    .ok_or_else(|| AppError::NotFound("payment channel not found".into()))
+}
+
+fn editable_revision_tx(conn: &Connection, id: &str, version: i64) -> Result<i64, AppError> {
+    let (revision, current_version, archived_at) = channel_edit_state_tx(conn, id)?;
+    if current_version != version {
+        return Err(AppError::Conflict("payment channel version changed".into()));
+    }
+    if archived_at.is_some() {
+        return Err(AppError::Conflict(
+            "archived payment channel must be restored first".into(),
+        ));
+    }
+    Ok(revision)
+}
+
+fn channel_view_tx(conn: &Connection, id: &str) -> Result<ChannelView, AppError> {
+    channel_views(conn, false)?
+        .into_iter()
+        .find(|view| view.id == id)
+        .ok_or_else(|| AppError::Internal("payment channel view missing".into()))
+}
+
+async fn update_channel_details(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<ChannelDetailsRequest>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let session = crate::api::require_admin_session(&state, &headers).await?;
+    if input.display_name.trim().is_empty() || input.display_name.len() > 80 {
+        return Err(AppError::BadRequest(
+            "invalid payment channel display name".into(),
+        ));
+    }
+    let conn = state.store.conn.lock().await;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_error("begin payment channel details update"))?;
+    editable_revision_tx(&tx, &id, input.expected_version)?;
+    let changed = tx.execute(
+        "UPDATE market_payment_channels SET display_name = ?2, sort_order = ?3, version = version + 1, updated_at = ?4
+         WHERE id = ?1 AND version = ?5 AND archived_at IS NULL",
+        params![id, input.display_name.trim(), input.sort_order, now(), input.expected_version],
+    ).map_err(db_error("update payment channel details"))?;
+    if changed != 1 {
+        return Err(AppError::Conflict("payment channel version changed".into()));
+    }
+    audit_tx(
+        &tx,
+        &session.user_id,
+        "channel_details_updated",
+        "payment_channel",
+        &id,
+        None,
+        &now(),
+    )?;
+    tx.commit()
+        .map_err(db_error("commit payment channel details"))?;
+    Ok((no_store(), Json(channel_view_tx(&conn, &id)?)))
+}
+
+async fn verify_channel_api(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<VerifyChannelRequest>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let session = crate::api::require_admin_session(&state, &headers).await?;
+    let current_credentials = {
+        let conn = state.store.conn.lock().await;
+        let revision = editable_revision_tx(&conn, &id, input.expected_version)?;
+        load_revision(&conn, &state.market_payments, &id, revision)?.credentials
+    };
+    let merchant_id = state
+        .market_payments
+        .client
+        .whoami(&current_credentials)
+        .await?;
+    let conn = state.store.conn.lock().await;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_error("begin payment merchant reverification"))?;
+    let revision = editable_revision_tx(&tx, &id, input.expected_version)?;
+    let current = load_revision(&tx, &state.market_payments, &id, revision)?;
+    if merchant_id != current.merchant_id {
+        return Err(AppError::Conflict(
+            "payment merchant identity changed".into(),
+        ));
+    }
+    let time = now();
+    mark_channel_api_reverified_tx(&tx, &id, input.expected_version, &time)?;
+    audit_tx(
+        &tx,
+        &session.user_id,
+        "channel_api_reverified",
+        "payment_channel",
+        &id,
+        None,
+        &time,
+    )?;
+    tx.commit()
+        .map_err(db_error("commit payment merchant reverification"))?;
+    Ok((no_store(), Json(channel_view_tx(&conn, &id)?)))
+}
+
+fn mark_channel_api_reverified_tx(
+    conn: &Connection,
+    id: &str,
+    expected_version: i64,
+    time: &str,
+) -> Result<(), AppError> {
+    editable_revision_tx(conn, id, expected_version)?;
+    let changed = conn
+        .execute(
+            "UPDATE market_payment_channels SET api_reverify_required = 0, version = version + 1,
+         updated_at = ?2 WHERE id = ?1 AND version = ?3 AND archived_at IS NULL",
+            params![id, time, expected_version],
+        )
+        .map_err(db_error("reverify payment merchant API"))?;
+    if changed != 1 {
+        return Err(AppError::Conflict("payment channel version changed".into()));
+    }
+    Ok(())
+}
+
+fn insert_rotated_revision_tx(
+    conn: &Connection,
+    runtime: &MarketPaymentsRuntime,
+    id: &str,
+    revision: i64,
+    loaded: &LoadedRevision,
+    credentials: &Credentials,
+    time: &str,
+) -> Result<(), AppError> {
+    let (api_ciphertext, api_nonce) = runtime.cipher.seal(
+        credentials.api_secret.as_str(),
+        &aad(id, revision, &loaded.merchant_fingerprint, "api"),
+    )?;
+    let (webhook_ciphertext, webhook_nonce) =
+        if let Some(secret) = credentials.webhook_secret.as_ref() {
+            runtime.cipher.seal(
+                secret.as_str(),
+                &aad(id, revision, &loaded.merchant_fingerprint, "webhook"),
+            )?
+        } else {
+            (String::new(), String::new())
+        };
+    let methods = serde_json::to_string(&loaded.allowed_methods)
+        .map_err(|_| AppError::Internal("encode allowed methods failed".into()))?;
+    let webhook_mode = if credentials.webhook_secret.is_some() {
+        "signed"
+    } else {
+        "poll_only"
+    };
+    conn.execute(
+        "INSERT INTO market_payment_channel_revisions (
+            channel_id, revision, merchant_id, merchant_fingerprint, api_key_id,
+            api_secret_ciphertext, api_secret_nonce, webhook_secret_ciphertext,
+            webhook_secret_nonce, key_version, allowed_methods_json, verified_at,
+            created_at, webhook_mode
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13)",
+        params![
+            id,
+            revision,
+            loaded.merchant_id,
+            loaded.merchant_fingerprint,
+            credentials.key_id,
+            api_ciphertext,
+            api_nonce,
+            webhook_ciphertext,
+            webhook_nonce,
+            runtime.cipher.version,
+            methods,
+            time,
+            webhook_mode
+        ],
+    )
+    .map_err(db_error("insert rotated payment credential revision"))?;
+    Ok(())
+}
+
+async fn rotate_channel_api(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<RotateApiRequest>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let session = crate::api::require_admin_session(&state, &headers).await?;
+    if input.api_key_id.trim().is_empty()
+        || input.api_key_id.len() > 200
+        || input.api_secret.len() < 16
+        || input.api_secret.len() > MAX_PAYMENT_SECRET_BYTES
+    {
+        return Err(AppError::BadRequest(
+            "invalid DujiaoPay API credentials".into(),
+        ));
+    }
+    {
+        let conn = state.store.conn.lock().await;
+        editable_revision_tx(&conn, &id, input.expected_version)?;
+    }
+    let credentials = Credentials {
+        key_id: input.api_key_id.trim().into(),
+        api_secret: Zeroizing::new(input.api_secret.clone()),
+        webhook_secret: None,
+    };
+    let merchant_id = state.market_payments.client.whoami(&credentials).await?;
+    let conn = state.store.conn.lock().await;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_error("begin payment API rotation"))?;
+    let old_revision = editable_revision_tx(&tx, &id, input.expected_version)?;
+    let old = load_revision(&tx, &state.market_payments, &id, old_revision)?;
+    if merchant_id != old.merchant_id {
+        return Err(AppError::Conflict(
+            "payment merchant changed; create a new channel".into(),
+        ));
+    }
+    let credentials = Credentials {
+        webhook_secret: old.credentials.webhook_secret.clone(),
+        ..credentials
+    };
+    let time = now();
+    let revision = old_revision + 1;
+    insert_rotated_revision_tx(
+        &tx,
+        &state.market_payments,
+        &id,
+        revision,
+        &old,
+        &credentials,
+        &time,
+    )?;
+    let changed = tx.execute(
+        "UPDATE market_payment_channels SET current_revision = ?2, enabled = 0,
+            version = version + 1, updated_at = ?3, api_reverify_required = 0,
+            webhook_verified_at = CASE WHEN webhook_verified_revision = ?4 THEN webhook_verified_at ELSE NULL END,
+            webhook_verified_revision = CASE WHEN webhook_verified_revision = ?4 THEN ?2 ELSE NULL END
+         WHERE id = ?1 AND version = ?5 AND archived_at IS NULL",
+        params![id, revision, time, old_revision, input.expected_version],
+    ).map_err(db_error("rotate payment API credentials"))?;
+    if changed != 1 {
+        return Err(AppError::Conflict("payment channel version changed".into()));
+    }
+    audit_tx(
+        &tx,
+        &session.user_id,
+        "channel_api_rotated",
+        "payment_channel",
+        &id,
+        None,
+        &time,
+    )?;
+    tx.commit()
+        .map_err(db_error("commit payment API rotation"))?;
+    Ok((no_store(), Json(channel_view_tx(&conn, &id)?)))
+}
+
+async fn rotate_channel_webhook(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<RotateWebhookRequest>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let session = crate::api::require_admin_session(&state, &headers).await?;
+    if !matches!(input.webhook_mode.as_str(), "signed" | "poll_only")
+        || (input.webhook_mode == "signed"
+            && input
+                .webhook_secret
+                .as_ref()
+                .is_none_or(|s| !(16..=MAX_PAYMENT_SECRET_BYTES).contains(&s.len())))
+        || (input.webhook_mode == "poll_only" && input.webhook_secret.is_some())
+    {
+        return Err(AppError::BadRequest(
+            "invalid DujiaoPay webhook configuration".into(),
+        ));
+    }
+    let current_credentials = {
+        let conn = state.store.conn.lock().await;
+        let revision = editable_revision_tx(&conn, &id, input.expected_version)?;
+        let current = load_revision(&conn, &state.market_payments, &id, revision)?;
+        // No network request while holding the database lock.
+        current.credentials
+    };
+    let verified_merchant_id = state
+        .market_payments
+        .client
+        .whoami(&current_credentials)
+        .await?;
+    let conn = state.store.conn.lock().await;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_error("begin payment webhook rotation"))?;
+    let old_revision = editable_revision_tx(&tx, &id, input.expected_version)?;
+    let old = load_revision(&tx, &state.market_payments, &id, old_revision)?;
+    if verified_merchant_id != old.merchant_id {
+        return Err(AppError::Conflict(
+            "payment merchant identity changed".into(),
+        ));
+    }
+    let old_signed = old.credentials.webhook_secret.is_some();
+    let credentials = Credentials {
+        key_id: old.credentials.key_id.clone(),
+        api_secret: old.credentials.api_secret.clone(),
+        webhook_secret: input.webhook_secret.clone().map(Zeroizing::new),
+    };
+    let same_secret = old.credentials.webhook_secret.as_ref().map(|s| s.as_str())
+        == credentials.webhook_secret.as_ref().map(|s| s.as_str());
+    if same_secret {
+        return Err(AppError::BadRequest(
+            "webhook credential is unchanged".into(),
+        ));
+    }
+    let time = now();
+    let revision = old_revision + 1;
+    insert_rotated_revision_tx(
+        &tx,
+        &state.market_payments,
+        &id,
+        revision,
+        &old,
+        &credentials,
+        &time,
+    )?;
+    let graceful = old_signed && input.webhook_mode == "signed" && !input.emergency_revoke_previous;
+    let previous_revision = graceful.then_some(old_revision);
+    let valid_until = graceful
+        .then(|| (Utc::now() + chrono::Duration::minutes(WEBHOOK_KEY_GRACE_MINUTES)).to_rfc3339());
+    let changed = tx
+        .execute(
+        "UPDATE market_payment_channels SET current_revision = ?2, enabled = 0,
+            version = version + 1, updated_at = ?3, api_reverify_required = 0, webhook_verified_at = NULL,
+            webhook_verified_revision = NULL, previous_webhook_revision = ?4,
+            previous_webhook_valid_until = ?5
+         WHERE id = ?1 AND version = ?6 AND archived_at IS NULL",
+            params![
+                id,
+                revision,
+                time,
+                previous_revision,
+                valid_until,
+                input.expected_version
+            ],
+        )
+        .map_err(db_error("rotate payment webhook secret"))?;
+    if changed != 1 {
+        return Err(AppError::Conflict("payment channel version changed".into()));
+    }
+    audit_tx(
+        &tx,
+        &session.user_id,
+        if input.emergency_revoke_previous {
+            "channel_webhook_emergency_rotated"
+        } else {
+            "channel_webhook_rotated"
+        },
+        "payment_channel",
+        &id,
+        Some(&input.webhook_mode),
+        &time,
+    )?;
+    tx.commit()
+        .map_err(db_error("commit payment webhook rotation"))?;
+    Ok((no_store(), Json(channel_view_tx(&conn, &id)?)))
+}
+
+fn update_channel_archive_tx(
+    conn: &Connection,
+    id: &str,
+    archived: bool,
+    expected_version: i64,
+    time: &str,
+) -> Result<(), AppError> {
+    let (_, version, archived_at) = channel_edit_state_tx(conn, id)?;
+    if version != expected_version {
+        return Err(AppError::Conflict("payment channel version changed".into()));
+    }
+    if archived == archived_at.is_some() {
+        return Err(AppError::Conflict(
+            "payment channel archive state unchanged".into(),
+        ));
+    }
+    let changed = conn
+        .execute(
+            "UPDATE market_payment_channels SET archived_at = ?2, enabled = 0,
+            api_reverify_required = 1, webhook_verified_at = NULL,
+            webhook_verified_revision = NULL, previous_webhook_revision = NULL,
+            previous_webhook_valid_until = NULL,
+            version = version + 1, updated_at = ?3 WHERE id = ?1 AND version = ?4",
+            params![id, archived.then_some(time), time, expected_version],
+        )
+        .map_err(db_error("archive payment channel"))?;
+    if changed != 1 {
+        return Err(AppError::Conflict("payment channel version changed".into()));
+    }
+    Ok(())
+}
+
+async fn set_channel_archived(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<ArchiveChannelRequest>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let session = crate::api::require_admin_session(&state, &headers).await?;
+    let conn = state.store.conn.lock().await;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_error("begin payment channel archive"))?;
+    let time = now();
+    update_channel_archive_tx(&tx, &id, input.archived, input.expected_version, &time)?;
+    audit_tx(
+        &tx,
+        &session.user_id,
+        if input.archived {
+            "channel_archived"
+        } else {
+            "channel_restored"
+        },
+        "payment_channel",
+        &id,
+        None,
+        &time,
+    )?;
+    tx.commit()
+        .map_err(db_error("commit payment channel archive"))?;
+    Ok((no_store(), Json(channel_view_tx(&conn, &id)?)))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SetEnabledRequest {
     enabled: bool,
+    expected_version: i64,
+}
+
+fn set_channel_enabled_tx(
+    conn: &Connection,
+    id: &str,
+    enabled: bool,
+    expected_version: i64,
+    time: &str,
+) -> Result<(), AppError> {
+    editable_revision_tx(conn, id, expected_version)?;
+    let changed = conn
+        .execute(
+            "UPDATE market_payment_channels SET enabled = ?2, updated_at = ?3, version = version + 1
+         WHERE id = ?1 AND version = ?4 AND archived_at IS NULL
+           AND (?2 = 0 OR api_reverify_required = 0)
+           AND (?2 = 0 OR (SELECT verified_at FROM market_payment_channel_revisions
+                WHERE channel_id = ?1 AND revision = current_revision) IS NOT NULL)
+           AND (?2 = 0 OR (SELECT mode FROM market_finance_control WHERE id = 1) != 'enabled'
+                OR (webhook_verified_at IS NOT NULL
+                    AND webhook_verified_revision = current_revision
+                    AND (SELECT webhook_mode FROM market_payment_channel_revisions
+                         WHERE channel_id = ?1 AND revision = current_revision) = 'signed'
+                    AND EXISTS (SELECT 1 FROM market_topup_orders t
+                                WHERE t.channel_id = ?1 AND t.channel_revision = current_revision
+                                  AND t.status = 'credited')))",
+            params![id, i64::from(enabled), time, expected_version],
+        )
+        .map_err(db_error("toggle payment channel"))?;
+    if changed != 1 {
+        return Err(AppError::Conflict(
+            "payment channel has not passed verification for this finance mode".into(),
+        ));
+    }
+    Ok(())
 }
 
 async fn set_channel_enabled(
@@ -923,19 +1558,7 @@ async fn set_channel_enabled(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin payment channel toggle"))?;
-    let changed = tx
-        .execute(
-            "UPDATE market_payment_channels SET enabled = ?2, updated_at = ?3
-         WHERE id = ?1 AND (SELECT verified_at FROM market_payment_channel_revisions
-                            WHERE channel_id = ?1 AND revision = current_revision) IS NOT NULL",
-            params![id, i64::from(input.enabled), now()],
-        )
-        .map_err(db_error("toggle payment channel"))?;
-    if changed != 1 {
-        return Err(AppError::NotFound(
-            "verified payment channel not found".into(),
-        ));
-    }
+    set_channel_enabled_tx(&tx, &id, input.enabled, input.expected_version, &now())?;
     audit_tx(
         &tx,
         &session.user_id,
@@ -1123,6 +1746,7 @@ async fn list_admin_topups(
 }
 
 struct LoadedRevision {
+    merchant_id: String,
     merchant_fingerprint: String,
     allowed_methods: Vec<String>,
     credentials: Credentials,
@@ -1207,6 +1831,7 @@ fn load_revision(
         ));
     }
     Ok(LoadedRevision {
+        merchant_id,
         merchant_fingerprint,
         allowed_methods,
         credentials: Credentials {
@@ -1215,6 +1840,143 @@ fn load_revision(
             webhook_secret,
         },
     })
+}
+
+/// Old orders keep their amount, merchant identity, and allowed methods from
+/// the bound revision. A merchant's current API key may replace the old key
+/// for authenticated recovery after the old key has been revoked.
+fn load_order_revision(
+    conn: &Connection,
+    runtime: &MarketPaymentsRuntime,
+    channel_id: &str,
+    revision: i64,
+) -> Result<LoadedRevision, AppError> {
+    let mut bound = load_revision(conn, runtime, channel_id, revision)?;
+    let current_revision: i64 = conn
+        .query_row(
+            "SELECT current_revision FROM market_payment_channels WHERE id = ?1",
+            params![channel_id],
+            |row| row.get(0),
+        )
+        .map_err(db_error("read current payment credentials"))?;
+    if current_revision != revision {
+        let current = load_revision(conn, runtime, channel_id, current_revision)?;
+        if current.merchant_fingerprint == bound.merchant_fingerprint {
+            bound.credentials.key_id = current.credentials.key_id;
+            bound.credentials.api_secret = current.credentials.api_secret;
+        }
+    }
+    Ok(bound)
+}
+
+async fn get_bound_gateway_order(
+    state: &ServerState,
+    channel_id: &str,
+    revision: i64,
+    loaded: &LoadedRevision,
+    gateway_order_id: &str,
+) -> Result<GatewayOrder, AppError> {
+    let primary = state
+        .market_payments
+        .client
+        .get_order(&loaded.credentials, gateway_order_id)
+        .await;
+    let Err(primary_error) = primary else {
+        return primary;
+    };
+    if !dujiaopay::may_be_key_scoped_order(&primary_error) {
+        return Err(primary_error);
+    }
+    let legacy = {
+        let conn = state.store.conn.lock().await;
+        load_revision(&conn, &state.market_payments, channel_id, revision)?
+    };
+    if legacy.merchant_fingerprint == loaded.merchant_fingerprint
+        && (legacy.credentials.key_id != loaded.credentials.key_id
+            || legacy.credentials.api_secret != loaded.credentials.api_secret)
+    {
+        // Read-only fallback for gateways that scope historical orders to
+        // the original API key. Never use the old key for a new order.
+        if let Ok(order) = state
+            .market_payments
+            .client
+            .get_order(&legacy.credentials, gateway_order_id)
+            .await
+        {
+            return Ok(order);
+        }
+    }
+    Err(primary_error)
+}
+
+/// The current merchant Webhook secret signs all order revisions. Only the
+/// immediately prior secret may be accepted, and only during a short explicit
+/// grace period. An emergency rotation clears that grace atomically.
+fn verify_bound_webhook_tx(
+    conn: &Connection,
+    runtime: &MarketPaymentsRuntime,
+    channel_id: &str,
+    bound_revision: i64,
+    headers: &HeaderMap,
+    body: &[u8],
+    now_unix: i64,
+) -> Result<(LoadedRevision, WebhookEvent, Option<i64>), AppError> {
+    let (current_revision, previous_revision, valid_until): (i64, Option<i64>, Option<String>) =
+        conn.query_row(
+            "SELECT current_revision, previous_webhook_revision, previous_webhook_valid_until
+         FROM market_payment_channels WHERE id = ?1",
+            params![channel_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(db_error("read payment webhook key state"))?;
+    let mut bound = load_order_revision(conn, runtime, channel_id, bound_revision)?;
+    let current = load_revision(conn, runtime, channel_id, current_revision)?;
+    if current.merchant_fingerprint != bound.merchant_fingerprint {
+        // Historical configurations could replace a channel with a different
+        // merchant. The new API refuses that, but their already-bound orders
+        // must continue using the original merchant's credentials.
+        let event = dujiaopay::verify_webhook(&bound.credentials, headers, body, now_unix)?;
+        return Ok((bound, event, None));
+    }
+    let current_result = dujiaopay::verify_webhook(&current.credentials, headers, body, now_unix);
+    if let Ok(event) = current_result {
+        return Ok((bound, event, Some(current_revision)));
+    }
+    let current_error = current_result.unwrap_err();
+    if !matches!(current_error, AppError::Unauthorized(_)) {
+        return Err(current_error);
+    }
+    if let (Some(previous_revision), Some(valid_until)) = (previous_revision, valid_until)
+        && chrono::DateTime::parse_from_rfc3339(&valid_until)
+            .is_ok_and(|until| until.timestamp() >= now_unix)
+    {
+        let previous = load_revision(conn, runtime, channel_id, previous_revision)?;
+        if previous.merchant_fingerprint == bound.merchant_fingerprint {
+            let event = dujiaopay::verify_webhook(&previous.credentials, headers, body, now_unix)?;
+            // The API call below still uses the current merchant key. A
+            // previous Webhook secret is never a payment authority.
+            bound.credentials.webhook_secret = None;
+            return Ok((bound, event, None));
+        }
+    }
+    Err(current_error)
+}
+
+fn mark_channel_webhook_verified_tx(
+    conn: &Connection,
+    channel_id: &str,
+    revision: i64,
+    time: &str,
+) -> Result<bool, AppError> {
+    let changed = conn
+        .execute(
+            "UPDATE market_payment_channels
+             SET webhook_verified_at = ?3, webhook_verified_revision = ?2
+             WHERE id = ?1 AND current_revision = ?2 AND archived_at IS NULL",
+            params![channel_id, revision, time],
+        )
+        .map_err(db_error("mark payment webhook signature verified"))?;
+    Ok(changed == 1)
 }
 
 #[derive(Deserialize)]
@@ -1444,7 +2206,7 @@ async fn create_topup(
         } else {
             crate::market_reconcile::ensure_new_finance_writes_safe_tx(&tx)?;
             let revision = tx.query_row(
-                "SELECT current_revision FROM market_payment_channels WHERE id = ?1 AND enabled = 1",
+                "SELECT current_revision FROM market_payment_channels WHERE id = ?1 AND enabled = 1 AND archived_at IS NULL AND api_reverify_required = 0",
                 params![input.channel_id], |row| row.get::<_, i64>(0),
             ).optional().map_err(db_error("read enabled payment channel"))?
                 .ok_or_else(|| AppError::BadRequest("payment channel unavailable".into()))?;
@@ -1828,15 +2590,27 @@ async fn dujiaopay_webhook_hint(
         .optional()
         .map_err(db_error("bind DujiaoPay callback hint"))?
     };
-    let Some((order_id, channel_id, revision)) = bound else {
+    let Some((order_id, channel_id, bound_revision)) = bound else {
         // A valid-shaped unknown order is indistinguishable from a duplicate
         // hint. The merchant order ID is a random, unguessable 128-bit value.
         return Ok(Json(serde_json::json!({ "accepted": true })));
     };
     let signed = {
         let conn = state.store.conn.lock().await;
-        let loaded = load_revision(&conn, &state.market_payments, &channel_id, revision)?;
-        loaded.credentials.webhook_secret.is_some()
+        let current_revision: i64 = conn
+            .query_row(
+                "SELECT current_revision FROM market_payment_channels WHERE id = ?1",
+                params![channel_id],
+                |row| row.get(0),
+            )
+            .map_err(db_error("read callback channel"))?;
+        let loaded = load_revision(&conn, &state.market_payments, &channel_id, current_revision)?;
+        let bound = load_revision(&conn, &state.market_payments, &channel_id, bound_revision)?;
+        if loaded.merchant_fingerprint == bound.merchant_fingerprint {
+            loaded.credentials.webhook_secret.is_some()
+        } else {
+            bound.credentials.webhook_secret.is_some()
+        }
     };
     if signed {
         // Old signed revisions retain their full event handling and audit,
@@ -1866,17 +2640,41 @@ async fn dujiaopay_webhook(
     {
         return Err(AppError::BadRequest("invalid payment channel".into()));
     }
-    // The untrusted body is used only to choose the already-bound order key.
-    // No field is acted on until the HMAC over the original bytes succeeds.
-    // This also avoids silently dropping late payments when a merchant has
-    // accumulated more than an arbitrary number of key revisions.
+    // The untrusted order hint only locates an already-bound order. In
+    // poll-only mode it may schedule a bounded authenticated lookup; signed
+    // mode acts on no payment field until the raw body HMAC is verified.
     let merchant_order_hint = dujiaopay::merchant_order_hint(&body)?;
-    let (revision, loaded, event, order_id) = {
+    let (revision, loaded, event, order_id, verified_current_revision) = {
         let conn = state.store.conn.lock().await;
         let bound = bound_webhook_order_tx(&conn, &channel_id, &merchant_order_hint)?;
-        let loaded = load_revision(&conn, &state.market_payments, &channel_id, bound.1)?;
-        let event = dujiaopay::verify_webhook(
-            &loaded.credentials,
+        let current_revision: i64 = conn
+            .query_row(
+                "SELECT current_revision FROM market_payment_channels WHERE id = ?1",
+                params![channel_id],
+                |row| row.get(0),
+            )
+            .map_err(db_error("read callback channel"))?;
+        let current = load_revision(&conn, &state.market_payments, &channel_id, current_revision)?;
+        let historical = load_revision(&conn, &state.market_payments, &channel_id, bound.1)?;
+        let has_signed_key = if current.merchant_fingerprint == historical.merchant_fingerprint {
+            current.credentials.webhook_secret.is_some()
+        } else {
+            historical.credentials.webhook_secret.is_some()
+        };
+        if !has_signed_key {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(db_error("begin callback lookup hint"))?;
+            queue_webhook_hint_tx(&tx, &bound.0, &now())?;
+            tx.commit()
+                .map_err(db_error("commit callback lookup hint"))?;
+            return Ok(Json(serde_json::json!({ "accepted": true })));
+        }
+        let (loaded, event, verified_current_revision) = verify_bound_webhook_tx(
+            &conn,
+            &state.market_payments,
+            &channel_id,
+            bound.1,
             &headers,
             &body,
             Utc::now().timestamp(),
@@ -1886,7 +2684,7 @@ async fn dujiaopay_webhook(
                 "DujiaoPay webhook not recognized".into(),
             ));
         }
-        (bound.1, loaded, event, bound.0)
+        (bound.1, loaded, event, bound.0, verified_current_revision)
     };
     {
         let conn = state.store.conn.lock().await;
@@ -1909,6 +2707,9 @@ async fn dujiaopay_webhook(
             ],
         )
         .map_err(db_error("persist DujiaoPay webhook"))?;
+        if let Some(current_revision) = verified_current_revision {
+            mark_channel_webhook_verified_tx(&tx, &channel_id, current_revision, &now())?;
+        }
         // Signed events also need a persisted recovery window: the immediate
         // authenticated lookup may fail, including for an order older than the
         // regular polling horizon.
@@ -1948,11 +2749,8 @@ async fn dujiaopay_webhook(
             serde_json::json!({ "accepted": true, "reviewRequired": true }),
         ));
     }
-    let gateway = state
-        .market_payments
-        .client
-        .get_order(&loaded.credentials, &event.order_id)
-        .await?;
+    let gateway =
+        get_bound_gateway_order(&state, &channel_id, revision, &loaded, &event.order_id).await?;
     let conn = state.store.conn.lock().await;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -2187,14 +2985,21 @@ fn finish_reconciliation_tx(
 }
 
 async fn reconcile_one_topup(state: &ServerState, pending: PendingTopup) -> Result<(), AppError> {
-    let loaded = {
+    let (loaded, creation_credentials) = {
         let conn = state.store.conn.lock().await;
-        load_revision(
+        let loaded = load_order_revision(
             &conn,
             &state.market_payments,
             &pending.channel_id,
             pending.revision,
-        )?
+        )?;
+        let original = load_revision(
+            &conn,
+            &state.market_payments,
+            &pending.channel_id,
+            pending.revision,
+        )?;
+        (loaded, original.credentials)
     };
     let gateway_id = if let Some(id) = pending.gateway_order_id.clone() {
         id
@@ -2213,7 +3018,7 @@ async fn reconcile_one_topup(state: &ServerState, pending: PendingTopup) -> Resu
             .market_payments
             .client
             .create_order(
-                &loaded.credentials,
+                &creation_credentials,
                 &pending.merchant_order_id,
                 pending.amount_minor,
                 &loaded.allowed_methods,
@@ -2229,11 +3034,14 @@ async fn reconcile_one_topup(state: &ServerState, pending: PendingTopup) -> Resu
         tx.commit().map_err(db_error("commit top-up recovery"))?;
         created.order_id
     };
-    let gateway = state
-        .market_payments
-        .client
-        .get_order(&loaded.credentials, &gateway_id)
-        .await?;
+    let gateway = get_bound_gateway_order(
+        state,
+        &pending.channel_id,
+        pending.revision,
+        &loaded,
+        &gateway_id,
+    )
+    .await?;
     let event = WebhookEvent {
         event_id: format!("reconcile-{}", pending.id),
         event_type: "order.paid".into(),
@@ -2434,6 +3242,22 @@ mod tests {
     }
 
     #[test]
+    fn finance_mode_request_uses_frontend_camel_case_and_rejects_stale_shape() {
+        let request: ModeRequest = serde_json::from_value(serde_json::json!({
+            "mode": "shadow", "expectedVersion": 3
+        }))
+        .unwrap();
+        assert_eq!(request.mode, "shadow");
+        assert_eq!(request.expected_version, 3);
+        assert!(
+            serde_json::from_value::<ModeRequest>(serde_json::json!({
+                "mode": "shadow", "expected_version": 3
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn merchant_configuration_accepts_poll_only_but_not_a_short_secret() {
         let mut input = UpsertChannelRequest {
             display_name: "Gateway".into(),
@@ -2443,12 +3267,19 @@ mod tests {
             webhook_secret: None,
             webhook_mode: None,
             allowed_methods: Vec::new(),
+            expected_version: None,
         };
+        assert!(validate_channel_input(&input).is_err());
+        input.webhook_mode = Some("poll_only".into());
         assert!(validate_channel_input(&input).is_ok());
         input.webhook_secret = Some("short".into());
         assert!(validate_channel_input(&input).is_err());
         input.webhook_secret = Some("0123456789abcdef".into());
+        input.webhook_mode = Some("signed".into());
         assert!(validate_channel_input(&input).is_ok());
+        input.webhook_secret = Some("x".repeat(MAX_PAYMENT_SECRET_BYTES + 1));
+        assert!(validate_channel_input(&input).is_err());
+        input.webhook_secret = Some("0123456789abcdef".into());
         assert!(validate_webhook_mode_change("signed", "poll_only", false).is_err());
         assert!(validate_webhook_mode_change("signed", "poll_only", true).is_ok());
         assert!(validate_webhook_mode_change("signed", "signed", false).is_ok());
@@ -2466,9 +3297,15 @@ mod tests {
             enabled: true,
             sort_order: 0,
             current_revision: 7,
+            version: 1,
+            archived_at: None,
             verified: true,
             webhook_mode: "poll_only".into(),
+            webhook_verified_at: None,
+            webhook_verified: false,
+            unresolved_topups: 0,
             verified_live_topups: 42,
+            verified_live_topups_current_revision: 0,
             gateway_kind: "dujiaopay",
         };
         let value = serde_json::to_value(BuyerChannelView::from(channel)).unwrap();
@@ -2603,6 +3440,382 @@ mod tests {
         assert!(new.credentials.webhook_secret.is_none());
     }
 
+    fn seed_live_revision(
+        conn: &Connection,
+        runtime: &MarketPaymentsRuntime,
+        revision: i64,
+        api_key: &str,
+        api_secret: &str,
+        webhook_secret: Option<&str>,
+    ) {
+        let fingerprint = hex::encode(Sha256::digest(b"merchant"));
+        if revision == 1 {
+            conn.execute(
+                "INSERT INTO market_payment_channels (id, gateway_kind, display_name, enabled,
+                 current_revision, created_at, updated_at)
+                 VALUES ('channel', 'dujiaopay', 'Gateway', 1, 1, '2026-10-01', '2026-10-01')",
+                [],
+            )
+            .unwrap();
+        }
+        let (api_ciphertext, api_nonce) = runtime
+            .cipher
+            .seal(api_secret, &aad("channel", revision, &fingerprint, "api"))
+            .unwrap();
+        let (webhook_ciphertext, webhook_nonce) = if let Some(secret) = webhook_secret {
+            runtime
+                .cipher
+                .seal(secret, &aad("channel", revision, &fingerprint, "webhook"))
+                .unwrap()
+        } else {
+            (String::new(), String::new())
+        };
+        conn.execute(
+            "INSERT INTO market_payment_channel_revisions (
+                channel_id, revision, merchant_id, merchant_fingerprint, api_key_id,
+                api_secret_ciphertext, api_secret_nonce, webhook_secret_ciphertext,
+                webhook_secret_nonce, key_version, allowed_methods_json, verified_at,
+                created_at, webhook_mode
+             ) VALUES ('channel', ?1, 'merchant', ?2, ?3, ?4, ?5, ?6, ?7, 1, '[]',
+                       '2026-10-01', '2026-10-01', ?8)",
+            params![
+                revision,
+                fingerprint,
+                api_key,
+                api_ciphertext,
+                api_nonce,
+                webhook_ciphertext,
+                webhook_nonce,
+                if webhook_secret.is_some() {
+                    "signed"
+                } else {
+                    "poll_only"
+                }
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE market_payment_channels SET current_revision = ?1 WHERE id = 'channel'",
+            params![revision],
+        )
+        .unwrap();
+    }
+
+    fn signed_webhook_headers(secret: &str, body: &[u8], timestamp: i64) -> HeaderMap {
+        use hmac::{Hmac, Mac};
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(timestamp.to_string().as_bytes());
+        mac.update(b".");
+        mac.update(body);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "DJP-Webhook-Timestamp",
+            timestamp.to_string().parse().unwrap(),
+        );
+        headers.insert(
+            "DJP-Webhook-Signature",
+            hex::encode(mac.finalize().into_bytes()).parse().unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn channel_archive_and_versions_leave_historical_orders_visible() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        fixture_topup(
+            &conn,
+            "order-1",
+            &format!("router-{}", "a".repeat(32)),
+            "pending",
+            1,
+        );
+        conn.execute(
+            "UPDATE market_payment_channels SET previous_webhook_revision = 1,
+             previous_webhook_valid_until = '2026-10-03' WHERE id = 'channel'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(editable_revision_tx(&conn, "channel", 1).unwrap(), 1);
+        update_channel_archive_tx(&conn, "channel", true, 1, "2026-10-02").unwrap();
+        assert!(matches!(
+            editable_revision_tx(&conn, "channel", 1),
+            Err(AppError::Conflict(_))
+        ));
+        assert!(matches!(
+            editable_revision_tx(&conn, "channel", 2),
+            Err(AppError::Conflict(_))
+        ));
+        let view = channel_view_tx(&conn, "channel").unwrap();
+        assert!(view.archived_at.is_some());
+        assert!(!view.verified);
+        assert_eq!(view.unresolved_topups, 1);
+        let previous_key: Option<i64> = conn
+            .query_row(
+                "SELECT previous_webhook_revision FROM market_payment_channels WHERE id = 'channel'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(previous_key.is_none());
+        assert!(!mark_channel_webhook_verified_tx(&conn, "channel", 1, "2026-10-02").unwrap());
+        assert!(!channel_view_tx(&conn, "channel").unwrap().webhook_verified);
+        assert!(channel_views(&conn, true).unwrap().is_empty());
+        update_channel_archive_tx(&conn, "channel", false, 2, "2026-10-03").unwrap();
+        let restored = channel_view_tx(&conn, "channel").unwrap();
+        assert!(restored.archived_at.is_none());
+        assert!(!restored.verified);
+        assert!(!restored.enabled);
+        conn.execute(
+            "UPDATE market_payment_channels SET enabled = 1 WHERE id = 'channel'",
+            [],
+        )
+        .unwrap();
+        assert!(channel_views(&conn, true).unwrap().is_empty());
+        mark_channel_api_reverified_tx(&conn, "channel", 3, "2026-10-04").unwrap();
+        assert!(matches!(
+            mark_channel_api_reverified_tx(&conn, "channel", 3, "2026-10-05"),
+            Err(AppError::Conflict(_))
+        ));
+        assert!(channel_view_tx(&conn, "channel").unwrap().verified);
+        assert_eq!(channel_views(&conn, true).unwrap().len(), 1);
+        assert_eq!(
+            bound_webhook_order_tx(&conn, "channel", &format!("router-{}", "a".repeat(32)))
+                .unwrap()
+                .0,
+            "order-1"
+        );
+    }
+
+    #[test]
+    fn current_merchant_keys_recover_old_orders_and_emergency_revokes_old_webhook_key() {
+        let conn = memory();
+        let runtime = MarketPaymentsRuntime::for_test();
+        seed_live_revision(
+            &conn,
+            &runtime,
+            1,
+            "old-key",
+            "old-api-secret-16",
+            Some("old-webhook-secret"),
+        );
+        seed_live_revision(
+            &conn,
+            &runtime,
+            2,
+            "new-key",
+            "new-api-secret-16",
+            Some("new-webhook-secret"),
+        );
+        let expiry = (Utc::now() + chrono::Duration::minutes(10)).to_rfc3339();
+        conn.execute(
+            "UPDATE market_payment_channels SET previous_webhook_revision = 1,
+            previous_webhook_valid_until = ?1 WHERE id = 'channel'",
+            params![expiry],
+        )
+        .unwrap();
+        let old_order = load_order_revision(&conn, &runtime, "channel", 1).unwrap();
+        assert_eq!(old_order.credentials.key_id, "new-key");
+        assert_eq!(
+            old_order.credentials.api_secret.as_str(),
+            "new-api-secret-16"
+        );
+        let body = format!(
+            r#"{{"event_type":"order.paid","data":{{"order_id":"gateway-1","merchant_order_id":"router-{}"}}}}"#,
+            "a".repeat(32)
+        );
+        let timestamp = Utc::now().timestamp();
+        let old_headers = signed_webhook_headers("old-webhook-secret", body.as_bytes(), timestamp);
+        let new_headers = signed_webhook_headers("new-webhook-secret", body.as_bytes(), timestamp);
+        assert_eq!(
+            verify_bound_webhook_tx(
+                &conn,
+                &runtime,
+                "channel",
+                1,
+                &old_headers,
+                body.as_bytes(),
+                timestamp
+            )
+            .unwrap()
+            .2,
+            None
+        );
+        assert_eq!(
+            verify_bound_webhook_tx(
+                &conn,
+                &runtime,
+                "channel",
+                1,
+                &new_headers,
+                body.as_bytes(),
+                timestamp
+            )
+            .unwrap()
+            .2,
+            Some(2)
+        );
+        conn.execute(
+            "UPDATE market_payment_channels SET previous_webhook_revision = NULL,
+            previous_webhook_valid_until = NULL, archived_at = '2026-10-02', enabled = 0
+            WHERE id = 'channel'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            verify_bound_webhook_tx(
+                &conn,
+                &runtime,
+                "channel",
+                1,
+                &old_headers,
+                body.as_bytes(),
+                timestamp
+            )
+            .is_err()
+        );
+        assert!(
+            verify_bound_webhook_tx(
+                &conn,
+                &runtime,
+                "channel",
+                1,
+                &new_headers,
+                body.as_bytes(),
+                timestamp
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn channel_readiness_does_not_confuse_api_verification_with_callback_or_live_credit() {
+        let conn = memory();
+        let runtime = MarketPaymentsRuntime::for_test();
+        seed_live_revision(
+            &conn,
+            &runtime,
+            1,
+            "key",
+            "api-secret-16chars",
+            Some("webhook-secret-16chars"),
+        );
+        let view = channel_view_tx(&conn, "channel").unwrap();
+        assert!(view.verified);
+        assert!(!view.webhook_verified);
+        assert_eq!(view.verified_live_topups_current_revision, 0);
+        let readiness = finance_readiness_tx(&conn).unwrap();
+        assert!(
+            readiness
+                .payment_channel_blockers
+                .iter()
+                .any(|blocker| blocker.code == "channel_webhook_unverified")
+        );
+        assert!(
+            readiness
+                .payment_channel_blockers
+                .iter()
+                .any(|blocker| blocker.code == "channel_no_current_live_topup")
+        );
+        assert!(!readiness.can_enable);
+
+        conn.execute(
+            "UPDATE market_payment_channels SET webhook_verified_at = '2026-10-02',
+             webhook_verified_revision = NULL WHERE id = 'channel'",
+            [],
+        )
+        .unwrap();
+        assert!(!channel_view_tx(&conn, "channel").unwrap().webhook_verified);
+        assert!(
+            finance_readiness_tx(&conn)
+                .unwrap()
+                .payment_channel_blockers
+                .iter()
+                .any(|blocker| blocker.code == "channel_webhook_unverified")
+        );
+        conn.execute(
+            "UPDATE market_payment_channel_revisions SET verified_at = NULL
+             WHERE channel_id = 'channel' AND revision = 1",
+            [],
+        )
+        .unwrap();
+        let blockers = finance_readiness_tx(&conn)
+            .unwrap()
+            .payment_channel_blockers;
+        assert!(
+            blockers
+                .iter()
+                .any(|blocker| blocker.code == "channel_api_unverified")
+        );
+        assert!(
+            blockers
+                .iter()
+                .any(|blocker| blocker.code == "channel_none_enabled")
+        );
+    }
+
+    #[test]
+    fn production_channel_reenable_requires_current_signed_live_evidence() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        conn.execute(
+            "UPDATE market_payment_channels SET enabled = 0 WHERE id = 'channel'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE market_finance_control SET mode = 'shadow' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        set_channel_enabled_tx(&conn, "channel", true, 1, "2026-10-02").unwrap();
+        set_channel_enabled_tx(&conn, "channel", false, 2, "2026-10-03").unwrap();
+        conn.execute(
+            "UPDATE market_finance_control SET mode = 'enabled' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        assert!(set_channel_enabled_tx(&conn, "channel", true, 3, "2026-10-04").is_err());
+        conn.execute(
+            "UPDATE market_payment_channels SET webhook_verified_at = '2026-10-04',
+             webhook_verified_revision = 1 WHERE id = 'channel'",
+            [],
+        )
+        .unwrap();
+        assert!(set_channel_enabled_tx(&conn, "channel", true, 3, "2026-10-04").is_err());
+        fixture_topup(
+            &conn,
+            "credited-1",
+            &format!("router-{}", "a".repeat(32)),
+            "credited",
+            1,
+        );
+        set_channel_enabled_tx(&conn, "channel", true, 3, "2026-10-04").unwrap();
+        set_channel_enabled_tx(&conn, "channel", false, 4, "2026-10-05").unwrap();
+
+        fixture_revision(&conn, 2);
+        conn.execute(
+            "UPDATE market_payment_channel_revisions SET webhook_mode = 'poll_only'
+             WHERE channel_id = 'channel' AND revision = 2",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE market_payment_channels SET current_revision = 2,
+             webhook_verified_revision = 2 WHERE id = 'channel'",
+            [],
+        )
+        .unwrap();
+        fixture_topup(
+            &conn,
+            "credited-2",
+            &format!("router-{}", "b".repeat(32)),
+            "credited",
+            2,
+        );
+        assert!(set_channel_enabled_tx(&conn, "channel", true, 5, "2026-10-06").is_err());
+    }
+
     fn fixture_topup(
         conn: &Connection,
         id: &str,
@@ -2624,6 +3837,7 @@ mod tests {
 
     fn loaded() -> LoadedRevision {
         LoadedRevision {
+            merchant_id: "merchant".into(),
             merchant_fingerprint: "merchant-fingerprint".into(),
             allowed_methods: Vec::new(),
             credentials: Credentials {
