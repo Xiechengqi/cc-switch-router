@@ -4,6 +4,8 @@
 
 当前实现进度：迁移 `0053`、`0054`，USD 整数复式账本、钱包冻结／捕获、DujiaoPay 渠道密钥修订与回调核验、充值补偿、七天收入成熟、线下提现／余额退款基础状态机及只读财务 API 已加入。Settings 提供 Owner 的影子测试配置与切换阻塞清单。Share／Client 报价已记录资金轨道；钱包轨道的付费商品发布要求已认领 Provider 身份及过了冷静期的 USDT/TRON 提现地址，而不要求面向买家的旧收款方式。Client 多 Host 报价按商品分别冻结试用额度和建立合同，Provisioning 成功时绑定 installation 并激活钱包合同，确认回滚前不释放冻结；清理不确定时冻结该合同已有收入，失败开通的 Host 经可信重验为干净后才释放钱包 hold。Share 新合同的预冻结、Grant ACK 捕获和确认清理后的释放已有局部接线及定向测试。**这不是可开放的购买流程**：Client／Share 的可信健康证据、试用转换、按秒批次与月租逐段履约、暂停与续费、确认清理后的 Client 结算、争议退款及旧入口退役仍未完成。`MARKET_WALLET_CUTOVER_IMPLEMENTED` 固定为 `false`，数据库即使被手工设为 `enabled`，新购买与用户充值也会 fail closed。没有真实 USD 商户收款联调凭据，DujiaoPay 也未完成真实验收。以上不得视为本计划完成或可生产切换。
 
+> 2026-10 配置修订：新增迁移 `0056`、固定 DujiaoPay 回调 URL、可选 Webhook Secret 和持久化查单时间表。此项只解除配置死循环，不改变未完成的钱包购买切换门禁，也不代表真实商户联调通过。
+
 ## 1. 目标、决策与边界
 
 目标是把 Share Market、Client Market 的付费流统一为「用户向平台充值 → 全站钱包支付 → Provider 按履约获得收入 → 沉淀至少七天 → Provider 申请提现 → Router Owner 线下付款」。用户不再给每个 Provider 单独充值，也不再为了租用一项服务配置某个 Provider 的收款信息。
@@ -78,7 +80,7 @@
 | `market_wallet_accounts` | `user_id, asset_code` 唯一；`posted_units, held_units, version` 非负；首版只允许 `USD`。 |
 | `market_journal_transactions`、`market_journal_postings` | 全局唯一 `source_kind, source_id, action` 或等价幂等键；posting 含逻辑账户、主体、资产、带符号整数单位、创建时间；journal 提交前验证同资产净额为零。 |
 | `market_wallet_holds` | 用户、合同／报价／退款来源、金额、用途、状态、到期时间、版本；同一业务来源只允许一个活动 hold。 |
-| `market_payment_channels`、`market_payment_channel_revisions` | Owner 配置、排序、启用状态、网关类型、商户身份指纹、配置代次；API/Webhook Secret 以密文、nonce、key version 保存，读 API 只返回已配置标志。 |
+| `market_payment_channels`、`market_payment_channel_revisions` | Owner 配置、排序、启用状态、网关类型、商户身份指纹、配置代次；API Secret 加密保存，Webhook Secret 可选，revision 明确记录 `signed` 或 `poll_only`。读 API 不回显密钥。 |
 | `market_topup_orders`、`market_topup_events` | 用户、渠道与配置代次、商户单号、网关订单号、USD 面额、状态、过期／到账时间；商户单号全局唯一、`商户身份 + 网关订单号` 唯一、`商户身份 + 网关事件 ID` 唯一。链上回执的网络、币种、交易 ID、确认数和结算金额须有可核对快照；同一真实收款证明不能被两笔订单复用。事件保存必要审计字段和原始 body 摘要，不向普通日志复制原文。 |
 | `market_delivery_slices`、`market_provider_earning_lots` | 合同、服务有效时间段、原始计费来源、扣款 journal、Provider `user_id`、收入单位、冲正单位、`fulfilled_at`、`unlock_at`；来源片段唯一。月租片段另引用期间 ID。 |
 | `market_usage_posting_batches` | 按合同和有界时间窗归并已持久化的按秒 accrual；起止游标、总单位、journal ID 唯一，便于补偿重放。 |
@@ -94,11 +96,13 @@ Provider 金融归属固定为交易发生时的 `supplier_user_id`，公开 `ma
 
 ### 5.1 配置与启用
 
-Settings 的 Marketplace 分类增加独立「充值渠道」面板及专用 Owner API，而不是把多个商户密钥拼进现有单值 env 字段。每条渠道可启用／停用、排序、设置展示名、设置 API Key ID、API Secret、Webhook Secret，以及选择收银台允许的支付方式。API Base 在正式环境固定为受信任的 HTTPS 官方主机；仅测试允许 loopback。回跳 URL 和 Webhook URL 由 Router 可信公开域名生成，不接收浏览器传入的任意外部 URL。
+Settings 的 Marketplace 分类提供独立「充值渠道」面板及专用 Owner API。每条渠道可设置展示名、API Key ID、API Secret 和可选的 Webhook Secret；保存时先用 `whoami` 验证商户 API，渠道初始关闭。固定回调地址 `https://<Router 公共域名>/v1/payment-webhooks/dujiaopay` 在建渠道之前即可复制并配置；不能要求先取得渠道 ID。实际地址由 Router 可信域名配置生成，不接收浏览器提供的目标 URL。API Base 在正式环境固定为受信任的 HTTPS 官方主机，仅测试允许 loopback。
 
-首版适配器需实现并测试：`GET /v1/whoami` 商户身份验证、`POST /v1/orders` 建单、`GET /v1/orders/{id}` 查单、Webhook 原始 body 验签。API 请求的 HMAC canonical string、`DJP-Key-ID`、`DJP-Timestamp`、`DJP-Nonce`、`DJP-Signature` 和 `Idempotency-Key` 应按当前官方契约构造；Webhook 使用 `DJP-Webhook-Timestamp` 与 `DJP-Webhook-Signature` 对 `<timestamp>.<raw_body>` 验签，使用常量时间比较和时间窗校验。具体字段、`paid_source` 枚举、USD 商户支持与允许的回跳 URL 必须以实施时的真实商户契约和受控联调再次锁定，不能只凭 `dujiao-next` 的测试 fixture 声称已验证。
+适配器实现 `GET /v1/whoami` 商户身份验证、`POST /v1/orders` 建单及 `GET /v1/orders/{id}` 查单。API 请求使用独立 API Secret 签名。当前无法证实 DujiaoPay 商户后台提供独立 Webhook Secret；不得填假值，也不得未经证实地复用 API Secret。未提供 Secret 的新 revision 明确记为 `poll_only`：无签名回调只可按已存在的随机商户单号唤醒查单，不能直接改变订单状态或入账。提供了经商户契约确认的 Secret 才记为 `signed`，使用原始 body HMAC 验签。既有 revision 迁移后默认保持 `signed`，原带渠道 ID 的回调地址继续有效；替换既有签名渠道时不允许默默清空 Secret 或降级。具体字段、`paid_source` 枚举、USD 商户支持及回跳 URL 仍须以真实商户受控联调锁定，不能只凭参考项目 fixture 声称已验证。
 
-启用顺序：保存加密配置 → `whoami` 校验并冻结商户身份 → 模拟签名和回调 fixture 测试 → 受控最小金额真实 USD 收款、查单和回调测试 → Owner 明确启用。商户身份、密钥或配置变化产生新 revision；未终结订单仍绑定原 revision 和原商户，旧密钥保留到订单及迟到保护期结束，不因 UI 停用而丢弃真实到账。无法解密旧 revision 时停止自动入账并告警，不降级明文或信任浏览器状态。
+启用顺序：先在商户后台设置固定回调 URL → 保存加密的 API 配置并通过 `whoami` 冻结商户身份 → 用受控最小金额真实 USD 收款验证建单、查单、链上回执及钱包入账 → Owner 明确启用。`whoami` 成功只代表 API 凭据有效，不代表 Webhook 或真实充值已验收。商户身份、密钥或配置变化产生新 revision；未终结订单仍绑定旧 revision 和原商户。无法解密旧 revision 时停止自动入账并告警，不降级明文或信任浏览器状态。
+
+Owner 若确需把既有签名渠道改为仅查单，须使用更新渠道 API 显式提交 `webhookMode: "poll_only"` 并重新验证 API 凭据；只省略 Secret 会被拒绝。恢复签名模式须提供新 Secret 和 `webhookMode: "signed"`。新 revision 仅影响新订单，旧订单仍按原 revision 处理。固定地址可接受不含订单号的商户后台测试通知，但不会将其视为支付证据。
 
 ### 5.2 充值状态机
 
@@ -111,9 +115,13 @@ Settings 的 Marketplace 分类增加独立「充值渠道」面板及专用 Own
 3. 若网关调用超时或更新本地订单失败，保留 `create_unknown`，由补偿任务用同一商户单号重试／查单。Webhook 可能先于建单响应到达，因此应能先按已存在的 `merchant_order_id + channel_revision` 定位本地订单，待网关 ID 补齐后再次核对。
 4. 浏览器回跳只显示「付款核对中」；状态由 Router 私有查询 API 获取，绝不由 `success_url`、前端轮询次数或截图决定入账。
 
-Webhook 处理顺序：限制 body 大小 → 按 URL 渠道加载当前及仍关联未完成订单的有限个密钥 revision → 对原始 body 验签、校验时间戳和事件 ID → 用商户单号唯一确定订单绑定的 revision → 持久化去重事件 → 事务外向 DujiaoPay 查单 → 在 `IMMEDIATE` 事务内同时核对渠道／商户、`merchant_order_id`、网关 `order_id`、状态、USD 币种、精确面额、`paid_source`、链上回执字段及订单归属 → 仅当查单为 `paid`、`paid_source=chain` 且交易 ID／网络／币种／结算金额／确认数形成唯一有效收款证明时插入唯一入账 journal、更新钱包与订单。查无唯一 revision、查询暂时失败或收款证明不完整时不能自动入账；前两者保留事件并重试，证明不完整进入 Owner 复核。数据库持久化失败时返回可重试的非 2xx。签名正确但 `paid_source` 是 `merchant_claim`、`platform_manual`、缺失或未知时，不自动充值，进入 Owner 复核。`refund.recorded` 只作为外部记录信号，不自动扣除钱包或认定线下退款完成。
+固定 URL 对无签名渠道只解析格式受限的 `merchant_order_id`，用本地唯一订单绑定找到原渠道 revision，并在持久化的单订单五分钟冷却下提前安排一次查单；不保存通知宣称的支付状态、金额或网关订单 ID，也不由请求线程直接查询网关或记账。签名渠道使用原有 HMAC 校验和事件审计，固定 URL 与旧带渠道 ID 的 URL 均可使用。两种模式真正入账均依赖事务外 `GET /v1/orders/{id}` 的认证响应，并在 `IMMEDIATE` 事务内核对渠道／商户、双重订单 ID、USD 面额、`paid_source=chain`、链上回执和唯一性。网关暂不可用时保留持久化重试时间，不能把通知当作收款证明；证据冲突则进入 Owner 复核。`refund.recorded` 只作为外部记录信号，不自动扣除钱包或认定线下退款完成。
 
-Webhook 路由无用户 Session，但只接受签名请求。`src/api.rs` 的全局 IP blacklist 中应对该精确路径采用与 Telegram Webhook 类似的豁免，避免配置中的宽泛网段误拦截网关；豁免不是跳过签名、限流或 body 校验。不得在日志、前端错误或告警正文中输出 Secret、签名头、原始失败 body 或用户完整支付资料。
+回调路由无用户 Session；固定 URL 的无签名内容始终不可信，限流、64 KiB body 上限、单订单冷却和最多 24 单／轮查单预算是其资源边界。所有未入账状态按年龄退避，并在创建后 90 天内定期查单；窗口结束后仍可被回调唤醒。超过窗口且没有回调的迟到付款不能自动发现，须以 Owner 对账处理，不能宣称零漏账。全局 IP blacklist 对两个精确回调路径豁免，但不豁免限流或签名渠道验签。不得在日志、前端错误或告警正文输出 Secret、签名头、原始失败 body 或完整支付资料。
+
+无签名通知中的退款字段同样不能直接认定为退款，也不会生成可信退款审计；Owner 必须用商户后台与外部收款流水独立对账。
+
+超过 90 天的旧订单收到通知后仍会开启最长六小时的持久化查单恢复窗：网关暂不可用时五分钟后重试，未付款则限频复查，窗口结束后停止。无通知且无外部对账时无法证明“绝无漏账”。
 
 ## 6. Market 扣费、履约与退款
 
@@ -157,7 +165,7 @@ Owner 收到的是 DujiaoPay 商户实际入金资产，Router 给出的却是 U
 | --- | --- | --- |
 | 用户钱包 | `GET /v1/market-wallet`；`GET /v1/market-wallet/transactions` | Session 归属，游标分页，私有禁缓存。 |
 | 充值 | `GET /v1/market-wallet/channels`；`POST /v1/market-wallet/topups`；`GET /v1/market-wallet/topups/:id` | 创建使用 `Idempotency-Key`；只返回必要的安全收银台 URL 和状态。 |
-| Webhook | `POST /v1/payment-webhooks/dujiaopay/:channel_id` | 无 Session，原始 body 验签，精确限流及入账幂等。 |
+| Webhook | `POST /v1/payment-webhooks/dujiaopay`；旧 `/:channel_id` | 固定 URL 无签名渠道只唤醒查单；旧 URL 和签名渠道保持原始 body 验签，入账始终以认证查单为准。 |
 | 用户退款 | `POST /v1/market-wallet/refund-requests`；`GET /v1/market-wallet/refund-requests` | 仅可用余额，冻结地址和金额快照。 |
 | Provider 收入 | `GET /v1/market-provider-finance/me`；`GET /v1/market-provider-finance/earnings` | 待解锁、可提现、提现中分别展示；不得混作用户钱包。 |
 | Provider 提现 | `PUT /v1/market-provider-finance/destination`；`POST /v1/market-provider-finance/withdrawals`；`GET /v1/market-provider-finance/withdrawals` | 收款资料版本化，提交幂等。 |
@@ -171,7 +179,7 @@ Owner 收到的是 DujiaoPay 商户实际入金资产，Router 给出的却是 U
 - DujiaoPay API/Webhook 密钥使用独立于 Binance 的主密钥和 AEAD 加密，AAD 绑定渠道 ID、商户身份和 revision；密钥文件／环境 Secret 与数据库分开备份。错 key 或 key version 必须 fail closed，不回退明文。参考 `src/binance_settlement/crypto.rs` 的封装思想，但新支付模块使用独立密钥域。
 - 只有 Owner 可改渠道、审批出款或处理人工入账；「人工确认已付款」必须写明外部证据、金额、来源和理由，不能仅凭签名 `order.paid` 中的人工 `paid_source` 自动记账。审计可以记录摘要／稳定错误码，不记录签名头、API Secret 和原始失败 body。
 - 渠道有 `disabled / shadow / enabled` 全局状态及单渠道开关。`disabled` 阻止新建单；`shadow` 允许配置和协议验证但不允许真实用户发起充值；`enabled` 才展示给用户。停用渠道不抹掉 pending 订单或关闭旧 Webhook revision，已经付的钱仍须查单和核对。
-- 支付网关或 Turso 不可达时停止新建单／扣费的相应写入，已持久化的 Webhook 事件和履约片段可恢复重放。数据库事务内不发外部 HTTP。Router 当前 Turso 模式仅支持一个可写实例，本计划不引入多主写入或离线写。
+- 支付网关或 Turso 不可达时停止新建单／扣费的相应写入；签名 Webhook 事件和无签名回调唤醒的查单时间表持久化，网关恢复后重试。数据库事务内不发外部 HTTP。Router 当前 Turso 模式仅支持一个可写实例，本计划不引入多主写入或离线写。
 - 设定金额上下限、用户及 IP 建单速率、单用户 pending 订单上限、Webhook body 上限、外部 HTTP 超时与退避、健康告警和补偿任务预算。无渠道可用时明确提示，不能退回旧商家直付链接。
 - 对账异常、Secret 解密失败、网关身份变化、连续查单失败、零和不变量破坏、重复外部转账参考号等需要可观测的 Owner 告警。资金不变量失败时冻结受影响资金路径，而不是尝试用调整 SQL 自动修复。
 - 投产前冻结每个渠道经真实商户验证的最小／最大充值额、同时待付订单数、建单节流和提现最低额；不得把网关不支持的低额订单开放给用户，也不得以默默提高付款额的方式满足渠道下限。地址冷静期和七天收入沉淀是独立计时器，不能互相替代。
@@ -207,8 +215,8 @@ Owner 收到的是 DujiaoPay 商户实际入金资产，Router 给出的却是 U
 
 | 类别 | 必测结果 |
 | --- | --- |
-| 网关协议 | 正确／错误 HMAC、时间窗、原始 body 字节差异、不同渠道和旧 revision、错误商户、错误 USD 面额、未知 `paid_source`、官方查单超时与非 2xx。 |
-| 充值竞态 | 重复／乱序／迟到事件、回调早于建单响应、创建超时重试、相同和冲突幂等键、取消后到账、查单暂不可用、两个 Webhook 并发都只入账一次。 |
+| 网关协议 | 正确／错误 HMAC、时间窗、原始 body 字节差异、无签名通知不入账、不同渠道和旧 revision、错误商户、错误 USD 面额、未知 `paid_source`、官方查单超时与非 2xx。 |
+| 充值竞态 | 重复／乱序／迟到事件、超过七天迟到付款、单订单通知冷却、回调早于建单响应、创建超时重试、相同和冲突幂等键、取消后到账、查单暂不可用、两个 Webhook 并发都只入账一次。 |
 | 钱包并发 | 多个 Provider 同时开通、老服务预算与新单竞争、扣款与余额退款竞争、Turso 不可用、账本重算与缓存一致、零和与非负约束。 |
 | Share／Client | 试用不扣费、开通成功一次捕获、授权／Provisioning 失败完全释放、报价过期或商品变价重新确认、健康停服不生成虚假履约。 |
 | 固定月租 | 长短月、闰年、到期取消、余额不足 recovery、自动续期优先级、提前终止退未履约款、尾数守恒、同一期间不重复扣款或确认收入。 |

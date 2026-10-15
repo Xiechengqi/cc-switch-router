@@ -8,6 +8,7 @@
 import * as React from "react";
 import { AlertTriangle, CheckCircle2, Loader2, Plus, RefreshCw } from "lucide-react";
 import { Alert, Button } from "@heroui/react";
+import { CopyableCodeField } from "@/components/common/copyable-code-field";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   createMarketPaymentChannel,
@@ -109,7 +110,8 @@ export function MarketPaymentChannelsPanel() {
         sortOrder: channels.length,
         apiKeyId: form.apiKeyId.trim(),
         apiSecret: form.apiSecret,
-        webhookSecret: form.webhookSecret,
+        webhookSecret: form.webhookSecret || undefined,
+        webhookMode: form.webhookSecret ? "signed" : "poll_only",
         allowedMethods: [],
       });
       setForm(EMPTY_FORM);
@@ -192,16 +194,28 @@ export function MarketPaymentChannelsPanel() {
 
       <div className="grid min-w-0 gap-4">
         <h4 className="text-sm font-semibold">{t("settings.marketFinance.channels")}</h4>
+        {readiness?.webhookUrl ? (
+          <div className="grid gap-1">
+            <CopyableCodeField
+              label={t("settings.marketFinance.webhookUrl")}
+              value={readiness.webhookUrl}
+              copyLabel={t("clientMarket.copy")}
+              copiedLabel={t("clientMarket.copied")}
+            />
+            <p className="text-xs text-muted-foreground">{t("settings.marketFinance.webhookUrlNote")}</p>
+          </div>
+        ) : null}
         {channels.length ? (
           <ul className="grid gap-2">
             {channels.map((channel) => (
               <li key={channel.id} className="flex min-w-0 flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-card px-4 py-3">
                 <div className="min-w-0">
                   <p className="truncate text-sm font-medium">{channel.displayName}</p>
-                  <p className="flex items-center gap-1 text-xs text-muted-foreground">
+                  <p className="flex flex-wrap items-center gap-x-1 gap-y-0.5 text-xs text-muted-foreground">
                     {channel.verified ? <CheckCircle2 className="size-3.5" aria-hidden="true" /> : <AlertTriangle className="size-3.5" aria-hidden="true" />}
                     {channel.verified ? t("settings.marketFinance.verified") : t("settings.marketFinance.unverified")}
-                    <span aria-hidden="true">·</span> v{channel.currentRevision}
+                    <span aria-hidden="true">·</span> {t(`settings.marketFinance.webhookMode.${channel.webhookMode}`)}
+                    <span aria-hidden="true">·</span> {t("settings.marketFinance.channelLiveTopups", { count: channel.verifiedLiveTopups })}
                   </p>
                 </div>
                 <Button
@@ -222,10 +236,10 @@ export function MarketPaymentChannelsPanel() {
           <Field label={t("settings.marketFinance.displayName")} value={form.displayName} onChange={(value) => setForm((current) => ({ ...current, displayName: value }))} required />
           <Field label={t("settings.marketFinance.keyId")} value={form.apiKeyId} onChange={(value) => setForm((current) => ({ ...current, apiKeyId: value }))} required />
           <Field label={t("settings.marketFinance.apiSecret")} value={form.apiSecret} onChange={(value) => setForm((current) => ({ ...current, apiSecret: value }))} type="password" minLength={16} required />
-          <Field label={t("settings.marketFinance.webhookSecret")} value={form.webhookSecret} onChange={(value) => setForm((current) => ({ ...current, webhookSecret: value }))} type="password" minLength={16} required />
+          <Field label={t("settings.marketFinance.webhookSecret")} value={form.webhookSecret} onChange={(value) => setForm((current) => ({ ...current, webhookSecret: value }))} type="password" minLength={16} />
           <p className="sm:col-span-2 text-xs text-muted-foreground">{t("settings.marketFinance.keyNote")}</p>
           <div className="sm:col-span-2 flex justify-start">
-            <Button type="submit" isDisabled={!!busy || !form.displayName.trim() || !form.apiKeyId.trim() || form.apiSecret.length < 16 || form.webhookSecret.length < 16}>
+            <Button type="submit" isDisabled={!!busy || !form.displayName.trim() || !form.apiKeyId.trim() || form.apiSecret.length < 16 || (form.webhookSecret.length > 0 && form.webhookSecret.length < 16)}>
               {busy === "create" ? <Loader2 className="size-4 animate-spin" /> : <Plus className="size-4" />}
               {busy === "create" ? t("settings.marketFinance.saving") : t("settings.marketFinance.saveChannel")}
             </Button>

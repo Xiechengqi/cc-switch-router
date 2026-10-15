@@ -9,6 +9,7 @@ export type MarketFinanceReadiness = {
   criticalCases: number;
   verifiedLiveTopups: number;
   canEnable: boolean;
+  webhookUrl?: string;
 };
 
 export type MarketWallet = {
@@ -49,8 +50,12 @@ export type MarketPaymentChannel = {
   sortOrder: number;
   currentRevision: number;
   verified: boolean;
+  webhookMode: "signed" | "poll_only";
+  verifiedLiveTopups: number;
   gatewayKind: "dujiaopay";
 };
+
+export type MarketWalletChannel = Pick<MarketPaymentChannel, "id" | "displayName" | "gatewayKind">;
 
 export type MarketFinanceCase = {
   id: string;
@@ -68,7 +73,8 @@ export type MarketPaymentChannelInput = {
   sortOrder: number;
   apiKeyId: string;
   apiSecret: string;
-  webhookSecret: string;
+  webhookSecret?: string;
+  webhookMode?: "signed" | "poll_only";
   allowedMethods: string[];
 };
 
@@ -86,7 +92,7 @@ export async function getMarketWalletTransactions(cursor?: string) {
 }
 
 export async function getMarketWalletChannels() {
-  return parseJson<MarketPaymentChannel[]>(
+  return parseJson<MarketWalletChannel[]>(
     await authFetch("/v1/market-wallet/channels", { cache: "no-store" }),
   );
 }

@@ -659,15 +659,15 @@ async fn ip_blacklist_middleware(
     if !is_user_model_api && req.uri().path() == crate::telegram::service::WEBHOOK_PATH {
         return next.run(req).await;
     }
-    if !is_user_model_api
-        && req
+    let payment_webhook_path = req.uri().path() == "/v1/payment-webhooks/dujiaopay"
+        || req
             .uri()
             .path()
             .strip_prefix("/v1/payment-webhooks/dujiaopay/")
-            .is_some_and(|id| !id.is_empty() && id.len() <= 80 && !id.contains('/'))
-    {
-        if let Some(ip) = source_ip_from_request(&req)
-            && !state.market_payments.allow_webhook_ip(ip)
+            .is_some_and(|id| !id.is_empty() && id.len() <= 80 && !id.contains('/'));
+    if !is_user_model_api && payment_webhook_path {
+        if !source_ip_from_request(&req)
+            .is_some_and(|ip| state.market_payments.allow_webhook_ip(ip))
         {
             return (StatusCode::TOO_MANY_REQUESTS, "webhook rate limited").into_response();
         }

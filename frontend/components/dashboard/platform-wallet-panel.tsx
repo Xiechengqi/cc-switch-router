@@ -19,7 +19,7 @@ import {
   getMarketWalletTopup,
   getMarketWalletTopups,
   getMarketWalletTransactions,
-  type MarketPaymentChannel,
+  type MarketWalletChannel,
   type MarketWallet,
   type MarketWalletTopup,
   type MarketWalletTransaction,
@@ -71,7 +71,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
   const searchParams = useSearchParams();
   const returnedTopupId = searchParams.get("topup");
   const [wallet, setWallet] = React.useState(initialWallet);
-  const [channels, setChannels] = React.useState<MarketPaymentChannel[]>([]);
+  const [channels, setChannels] = React.useState<MarketWalletChannel[]>([]);
   const [topups, setTopups] = React.useState<MarketWalletTopup[]>([]);
   const [transactions, setTransactions] = React.useState<MarketWalletTransaction[]>([]);
   const [topupCursor, setTopupCursor] = React.useState<string | null>(null);

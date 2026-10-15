@@ -20,7 +20,7 @@ const WEBHOOK_TOLERANCE_SECS: i64 = 300;
 pub(super) struct Credentials {
     pub key_id: String,
     pub api_secret: Zeroizing<String>,
-    pub webhook_secret: Zeroizing<String>,
+    pub webhook_secret: Option<Zeroizing<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -307,7 +307,10 @@ pub(super) fn verify_webhook(
         .unwrap_or(signature.trim());
     let decoded = hex::decode(signature)
         .map_err(|_| AppError::Unauthorized("DujiaoPay webhook signature invalid".into()))?;
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(credentials.webhook_secret.as_bytes())
+    let webhook_secret = credentials.webhook_secret.as_ref().ok_or_else(|| {
+        AppError::Unauthorized("DujiaoPay webhook signature not configured".into())
+    })?;
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(webhook_secret.as_bytes())
         .map_err(|_| AppError::Internal("DujiaoPay webhook verifier failed".into()))?;
     mac.update(timestamp.as_bytes());
     mac.update(b".");
@@ -333,16 +336,30 @@ pub(super) fn verify_webhook(
 /// An unauthenticated hint is permitted solely for finding the original key
 /// revision. Callers must verify the HMAC before using any parsed field.
 pub(super) fn merchant_order_hint(raw_body: &[u8]) -> Result<String, AppError> {
+    optional_merchant_order_hint(raw_body)?
+        .ok_or_else(|| AppError::BadRequest("DujiaoPay merchant order missing".into()))
+}
+
+/// Dashboard test callbacks may have no order. They are acknowledged by the
+/// fixed endpoint without reading or changing any payment state.
+pub(super) fn optional_merchant_order_hint(raw_body: &[u8]) -> Result<Option<String>, AppError> {
     if raw_body.len() > MAX_WEBHOOK_BYTES {
         return Err(AppError::BadRequest("DujiaoPay webhook too large".into()));
     }
     let value: Value = serde_json::from_slice(raw_body)
         .map_err(|_| AppError::BadRequest("DujiaoPay webhook JSON invalid".into()))?;
-    let hint = value
+    if !value.is_object() {
+        return Err(AppError::BadRequest(
+            "DujiaoPay webhook JSON invalid".into(),
+        ));
+    }
+    let Some(hint) = value
         .get("data")
         .and_then(|data| data.get("merchant_order_id"))
         .and_then(Value::as_str)
-        .ok_or_else(|| AppError::BadRequest("DujiaoPay merchant order missing".into()))?;
+    else {
+        return Ok(None);
+    };
     if hint.len() != 39
         || !hint.starts_with("router-")
         || !hint[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -351,7 +368,7 @@ pub(super) fn merchant_order_hint(raw_body: &[u8]) -> Result<String, AppError> {
             "DujiaoPay merchant order invalid".into(),
         ));
     }
-    Ok(hint.to_string())
+    Ok(Some(hint.to_string()))
 }
 
 fn sign_request(
@@ -496,7 +513,7 @@ mod tests {
         Credentials {
             key_id: "key".into(),
             api_secret: Zeroizing::new("api-secret".into()),
-            webhook_secret: Zeroizing::new("webhook-secret".into()),
+            webhook_secret: Some(Zeroizing::new("webhook-secret".into())),
         }
     }
 
@@ -539,6 +556,9 @@ mod tests {
         );
         assert!(verify_webhook(&credentials(), &headers, b"{}", 1_750_000_000).is_err());
         assert!(verify_webhook(&credentials(), &headers, raw, 1_750_000_301).is_err());
+        let mut poll_only = credentials();
+        poll_only.webhook_secret = None;
+        assert!(verify_webhook(&poll_only, &headers, raw, 1_750_000_000).is_err());
     }
 
     #[test]
@@ -550,6 +570,11 @@ mod tests {
         );
         assert!(merchant_order_hint(br#"{"data":{"merchant_order_id":"other"}}"#).is_err());
         assert!(verify_webhook(&credentials(), &HeaderMap::new(), raw, 1_750_000_000).is_err());
+        assert_eq!(
+            optional_merchant_order_hint(br#"{"event_type":"webhook.test"}"#).unwrap(),
+            None
+        );
+        assert!(optional_merchant_order_hint(b"not-json").is_err());
     }
 
     #[test]

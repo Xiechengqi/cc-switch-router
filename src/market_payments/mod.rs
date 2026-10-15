@@ -34,6 +34,10 @@ const MIN_TOPUP_MINOR: i64 = 100;
 const MAX_PENDING_ORDERS: i64 = 3;
 const MAX_TOPUPS_PER_HOUR: i64 = 12;
 const MAX_TOPUPS_PER_IP_HOUR: u32 = 60;
+const WEBHOOK_HINT_COOLDOWN_SECS: i64 = 300;
+const WEBHOOK_HINT_RECOVERY_SECS: i64 = 21_600;
+const RECONCILE_LEASE_SECS: i64 = 300;
+const TERMINAL_RECONCILE_DAYS: i64 = 90;
 // Keep this false until Share and Client purchases, reconcile, renewal,
 // failure release, refunds, and UI have all moved to the same wallet rail.
 const MARKET_WALLET_CUTOVER_IMPLEMENTED: bool = false;
@@ -133,6 +137,14 @@ fn topup_return_urls(base: &str, order_id: &str) -> (String, String) {
     (wallet_url.clone(), format!("{wallet_url}&cancelled=1"))
 }
 
+fn payment_webhook_url(domain: &str, use_localhost: bool) -> String {
+    let scheme = if use_localhost { "http" } else { "https" };
+    format!(
+        "{scheme}://{}/v1/payment-webhooks/dujiaopay",
+        domain.trim_end_matches('/')
+    )
+}
+
 /// The Owner API is the only supported way to enter enabled mode; its
 /// readiness gate remains closed until every purchase and control path is
 /// integrated. Existing contracts must still dispatch by their own rail.
@@ -192,6 +204,10 @@ pub fn router() -> Router<ServerState> {
         .route("/v1/admin/market-finance/topups", get(list_admin_topups))
         .route("/v1/admin/market-finance/mode", put(set_finance_mode))
         .route(
+            "/v1/payment-webhooks/dujiaopay",
+            post(dujiaopay_webhook_hint).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route(
             "/v1/payment-webhooks/dujiaopay/:channel_id",
             post(dujiaopay_webhook).layer(DefaultBodyLimit::max(64 * 1024)),
         )
@@ -214,6 +230,8 @@ struct FinanceReadinessView {
     critical_cases: i64,
     verified_live_topups: i64,
     can_enable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    webhook_url: Option<String>,
 }
 
 fn finance_readiness_tx(conn: &Connection) -> Result<FinanceReadinessView, AppError> {
@@ -325,6 +343,7 @@ fn finance_readiness_tx(conn: &Connection) -> Result<FinanceReadinessView, AppEr
         critical_cases,
         verified_live_topups,
         can_enable,
+        webhook_url: None,
     })
 }
 
@@ -334,7 +353,12 @@ async fn get_finance_readiness(
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     crate::api::require_admin_session(&state, &headers).await?;
     let conn = state.store.conn.lock().await;
-    Ok((no_store(), Json(finance_readiness_tx(&conn)?)))
+    let mut readiness = finance_readiness_tx(&conn)?;
+    readiness.webhook_url = Some(payment_webhook_url(
+        &state.config.tunnel_domain,
+        state.config.use_localhost,
+    ));
+    Ok((no_store(), Json(readiness)))
 }
 
 #[derive(Deserialize)]
@@ -544,13 +568,35 @@ struct ChannelView {
     sort_order: i64,
     current_revision: i64,
     verified: bool,
+    webhook_mode: String,
+    verified_live_topups: i64,
     gateway_kind: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BuyerChannelView {
+    id: String,
+    display_name: String,
+    gateway_kind: &'static str,
+}
+
+impl From<ChannelView> for BuyerChannelView {
+    fn from(channel: ChannelView) -> Self {
+        Self {
+            id: channel.id,
+            display_name: channel.display_name,
+            gateway_kind: channel.gateway_kind,
+        }
+    }
 }
 
 fn channel_views(conn: &Connection, only_enabled: bool) -> Result<Vec<ChannelView>, AppError> {
     let sql = if only_enabled {
         "SELECT c.id, c.display_name, c.enabled, c.sort_order, c.current_revision,
-                r.verified_at IS NOT NULL
+                r.verified_at IS NOT NULL, r.webhook_mode,
+                (SELECT COUNT(*) FROM market_topup_orders t
+                 WHERE t.channel_id = c.id AND t.status = 'credited')
          FROM market_payment_channels c
          JOIN market_payment_channel_revisions r
            ON r.channel_id = c.id AND r.revision = c.current_revision
@@ -558,7 +604,9 @@ fn channel_views(conn: &Connection, only_enabled: bool) -> Result<Vec<ChannelVie
          ORDER BY c.sort_order, c.id"
     } else {
         "SELECT c.id, c.display_name, c.enabled, c.sort_order, c.current_revision,
-                r.verified_at IS NOT NULL
+                r.verified_at IS NOT NULL, r.webhook_mode,
+                (SELECT COUNT(*) FROM market_topup_orders t
+                 WHERE t.channel_id = c.id AND t.status = 'credited')
          FROM market_payment_channels c
          LEFT JOIN market_payment_channel_revisions r
            ON r.channel_id = c.id AND r.revision = c.current_revision
@@ -576,6 +624,8 @@ fn channel_views(conn: &Connection, only_enabled: bool) -> Result<Vec<ChannelVie
                 sort_order: row.get(3)?,
                 current_revision: row.get(4)?,
                 verified: row.get::<_, i64>(5)? == 1,
+                webhook_mode: row.get(6)?,
+                verified_live_topups: row.get(7)?,
                 gateway_kind: "dujiaopay",
             })
         })
@@ -602,6 +652,9 @@ async fn list_enabled_channels(
     let conn = state.store.conn.lock().await;
     let channels = if user_topup_allowed(&mode, shadow_admin) {
         channel_views(&conn, true)?
+            .into_iter()
+            .map(BuyerChannelView::from)
+            .collect()
     } else {
         Vec::new()
     };
@@ -624,18 +677,33 @@ struct UpsertChannelRequest {
     sort_order: i64,
     api_key_id: String,
     api_secret: String,
-    webhook_secret: String,
+    #[serde(default)]
+    webhook_secret: Option<String>,
+    #[serde(default)]
+    webhook_mode: Option<String>,
     #[serde(default)]
     allowed_methods: Vec<String>,
 }
 
 fn validate_channel_input(input: &UpsertChannelRequest) -> Result<(), AppError> {
+    let inferred_mode = if input.webhook_secret.is_some() {
+        "signed"
+    } else {
+        "poll_only"
+    };
     if input.display_name.trim().is_empty()
         || input.display_name.len() > 80
         || input.api_key_id.trim().is_empty()
         || input.api_key_id.len() > 200
         || input.api_secret.len() < 16
-        || input.webhook_secret.len() < 16
+        || input
+            .webhook_secret
+            .as_ref()
+            .is_some_and(|secret| secret.len() < 16)
+        || input
+            .webhook_mode
+            .as_deref()
+            .is_some_and(|mode| mode != inferred_mode)
         || input.allowed_methods.len() > 32
         || input.allowed_methods.iter().any(|method| {
             method.len() > 80
@@ -652,6 +720,22 @@ fn validate_channel_input(input: &UpsertChannelRequest) -> Result<(), AppError> 
     Ok(())
 }
 
+fn validate_webhook_mode_change(
+    current_mode: &str,
+    next_mode: &str,
+    explicit_next_mode: bool,
+) -> Result<(), AppError> {
+    match (current_mode, next_mode, explicit_next_mode) {
+        ("signed", "poll_only", false) => Err(AppError::Conflict(
+            "signed webhook channel cannot be replaced without a signature secret".into(),
+        )),
+        ("signed" | "poll_only", "signed" | "poll_only", _) => Ok(()),
+        _ => Err(AppError::Internal(
+            "invalid stored payment webhook mode".into(),
+        )),
+    }
+}
+
 async fn save_channel(
     state: &ServerState,
     session: &AuthSession,
@@ -659,10 +743,15 @@ async fn save_channel(
     input: UpsertChannelRequest,
 ) -> Result<ChannelView, AppError> {
     validate_channel_input(&input)?;
+    let webhook_mode = if input.webhook_secret.is_some() {
+        "signed"
+    } else {
+        "poll_only"
+    };
     let credentials = Credentials {
         key_id: input.api_key_id.trim().into(),
         api_secret: Zeroizing::new(input.api_secret.clone()),
-        webhook_secret: Zeroizing::new(input.webhook_secret.clone()),
+        webhook_secret: input.webhook_secret.clone().map(Zeroizing::new),
     };
     // HMAC self-check is outside the database lock. A successful response
     // binds all future orders to the merchant identity observed here.
@@ -685,15 +774,32 @@ async fn save_channel(
     if replacing && current_revision.is_none() {
         return Err(AppError::NotFound("payment channel not found".into()));
     }
+    if let Some(current_revision) = current_revision {
+        let current_mode: String = tx
+            .query_row(
+                "SELECT webhook_mode FROM market_payment_channel_revisions
+             WHERE channel_id = ?1 AND revision = ?2",
+                params![id, current_revision],
+                |row| row.get(0),
+            )
+            .map_err(db_error("read payment webhook mode"))?;
+        validate_webhook_mode_change(&current_mode, webhook_mode, input.webhook_mode.is_some())?;
+    }
     let revision = current_revision.unwrap_or(0) + 1;
     let (api_ciphertext, api_nonce) = state.market_payments.cipher.seal(
         &input.api_secret,
         &aad(&id, revision, &merchant_fingerprint, "api"),
     )?;
-    let (webhook_ciphertext, webhook_nonce) = state.market_payments.cipher.seal(
-        &input.webhook_secret,
-        &aad(&id, revision, &merchant_fingerprint, "webhook"),
-    )?;
+    let (webhook_ciphertext, webhook_nonce) = if let Some(secret) = input.webhook_secret.as_deref()
+    {
+        let (ciphertext, nonce) = state.market_payments.cipher.seal(
+            secret,
+            &aad(&id, revision, &merchant_fingerprint, "webhook"),
+        )?;
+        (ciphertext, nonce)
+    } else {
+        (String::new(), String::new())
+    };
     let time = now();
     if current_revision.is_none() {
         tx.execute(
@@ -721,8 +827,9 @@ async fn save_channel(
         "INSERT INTO market_payment_channel_revisions (
             channel_id, revision, merchant_id, merchant_fingerprint, api_key_id,
             api_secret_ciphertext, api_secret_nonce, webhook_secret_ciphertext,
-            webhook_secret_nonce, key_version, allowed_methods_json, verified_at, created_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
+            webhook_secret_nonce, key_version, allowed_methods_json, verified_at, created_at,
+            webhook_mode
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13)",
         params![
             id,
             revision,
@@ -735,7 +842,8 @@ async fn save_channel(
             webhook_nonce,
             state.market_payments.cipher.version,
             allowed_methods_json,
-            time
+            time,
+            webhook_mode
         ],
     )
     .map_err(db_error("insert payment channel revision"))?;
@@ -756,6 +864,8 @@ async fn save_channel(
         sort_order: input.sort_order,
         current_revision: revision,
         verified: true,
+        webhook_mode: webhook_mode.into(),
+        verified_live_topups: 0,
         gateway_kind: "dujiaopay",
     })
 }
@@ -1034,6 +1144,7 @@ fn load_revision(
         webhook_nonce,
         key_version,
         methods_json,
+        webhook_mode,
     ): (
         String,
         String,
@@ -1044,11 +1155,12 @@ fn load_revision(
         String,
         i64,
         String,
+        String,
     ) = conn
         .query_row(
             "SELECT merchant_id, merchant_fingerprint, api_key_id, api_secret_ciphertext,
                 api_secret_nonce, webhook_secret_ciphertext, webhook_secret_nonce,
-                key_version, allowed_methods_json
+                key_version, allowed_methods_json, webhook_mode
          FROM market_payment_channel_revisions WHERE channel_id = ?1 AND revision = ?2",
             params![channel_id, revision],
             |row| {
@@ -1062,6 +1174,7 @@ fn load_revision(
                     row.get(6)?,
                     row.get(7)?,
                     row.get(8)?,
+                    row.get(9)?,
                 ))
             },
         )
@@ -1072,12 +1185,20 @@ fn load_revision(
         &aad(channel_id, revision, &merchant_fingerprint, "api"),
         key_version,
     )?;
-    let webhook_secret = runtime.cipher.open(
-        &webhook_ciphertext,
-        &webhook_nonce,
-        &aad(channel_id, revision, &merchant_fingerprint, "webhook"),
-        key_version,
-    )?;
+    let webhook_secret = match webhook_mode.as_str() {
+        "signed" => Some(runtime.cipher.open(
+            &webhook_ciphertext,
+            &webhook_nonce,
+            &aad(channel_id, revision, &merchant_fingerprint, "webhook"),
+            key_version,
+        )?),
+        "poll_only" if webhook_ciphertext.is_empty() && webhook_nonce.is_empty() => None,
+        _ => {
+            return Err(AppError::Internal(
+                "invalid stored payment webhook mode".into(),
+            ));
+        }
+    };
     let allowed_methods = serde_json::from_str(&methods_json)
         .map_err(|_| AppError::Internal("stored payment methods invalid".into()))?;
     if hex::encode(Sha256::digest(merchant_id.as_bytes())) != merchant_fingerprint {
@@ -1373,8 +1494,8 @@ async fn create_topup(
                 "INSERT INTO market_topup_orders (
                     id, user_id, channel_id, channel_revision, merchant_fingerprint,
                     merchant_order_id, idempotency_key, request_fingerprint, amount_minor,
-                    status, created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'creating', ?10, ?10)",
+                    status, created_at, updated_at, next_reconcile_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'creating', ?10, ?10, ?11)",
                 params![
                     id,
                     session.user_id,
@@ -1385,7 +1506,8 @@ async fn create_topup(
                     idem,
                     request_fingerprint,
                     input.amount_minor,
-                    time
+                    time,
+                    (Utc::now() + chrono::Duration::seconds(30)).to_rfc3339()
                 ],
             )
             .map_err(db_error("insert top-up order"))?;
@@ -1579,6 +1701,11 @@ fn apply_paid_order_tx(
     else {
         return Ok(());
     };
+    if topup_has_manual_hold_tx(conn, order_id)? {
+        return Err(AppError::Conflict(
+            "top-up is held for manual reconciliation".into(),
+        ));
+    }
     let time = now();
     conn.execute(
         "INSERT INTO market_topup_receipts (
@@ -1626,6 +1753,17 @@ fn apply_paid_order_tx(
     Ok(())
 }
 
+fn topup_has_manual_hold_tx(conn: &Connection, order_id: &str) -> Result<bool, AppError> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM market_finance_reconciliation_cases
+         WHERE object_kind = 'topup' AND object_id = ?1 AND status = 'open'
+           AND code IN ('external_refund_recorded', 'unknown_gateway_event'))",
+        params![order_id],
+        |row| row.get(0),
+    )
+    .map_err(db_error("read top-up review hold"))
+}
+
 fn bound_webhook_order_tx(
     conn: &Connection,
     channel_id: &str,
@@ -1642,12 +1780,85 @@ fn bound_webhook_order_tx(
     .ok_or_else(|| AppError::Unauthorized("DujiaoPay webhook not recognized".into()))
 }
 
+fn queue_webhook_hint_tx(conn: &Connection, order_id: &str, time: &str) -> Result<bool, AppError> {
+    let next_hint =
+        (Utc::now() + chrono::Duration::seconds(WEBHOOK_HINT_COOLDOWN_SECS)).to_rfc3339();
+    let recovery_until =
+        (Utc::now() + chrono::Duration::seconds(WEBHOOK_HINT_RECOVERY_SECS)).to_rfc3339();
+    let changed = conn
+        .execute(
+            "UPDATE market_topup_orders
+         SET next_reconcile_at = ?2, next_hint_at = ?3,
+             hint_reconcile_until = ?4, reconcile_hint_pending = 1
+         WHERE id = ?1 AND status != 'credited'
+           AND (next_hint_at IS NULL OR next_hint_at <= ?2)",
+            params![order_id, time, next_hint, recovery_until],
+        )
+        .map_err(db_error("queue DujiaoPay webhook hint"))?;
+    Ok(changed == 1)
+}
+
+/// The fixed URL is suitable for a merchant dashboard before a channel exists.
+/// Its body is never payment evidence: it may only wake a bounded authenticated
+/// API lookup of an order already created by this Router.
+async fn dujiaopay_webhook_hint(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let Some(merchant_order_hint) = dujiaopay::optional_merchant_order_hint(&body)? else {
+        return Ok(Json(
+            serde_json::json!({ "accepted": true, "ignored": true }),
+        ));
+    };
+    let bound = {
+        let conn = state.store.conn.lock().await;
+        conn.query_row(
+            "SELECT id, channel_id, channel_revision FROM market_topup_orders
+             WHERE merchant_order_id = ?1",
+            params![merchant_order_hint],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(db_error("bind DujiaoPay callback hint"))?
+    };
+    let Some((order_id, channel_id, revision)) = bound else {
+        // A valid-shaped unknown order is indistinguishable from a duplicate
+        // hint. The merchant order ID is a random, unguessable 128-bit value.
+        return Ok(Json(serde_json::json!({ "accepted": true })));
+    };
+    let signed = {
+        let conn = state.store.conn.lock().await;
+        let loaded = load_revision(&conn, &state.market_payments, &channel_id, revision)?;
+        loaded.credentials.webhook_secret.is_some()
+    };
+    if signed {
+        // Old signed revisions retain their full event handling and audit,
+        // whether the merchant uses the fixed or legacy URL.
+        return dujiaopay_webhook(State(state), Path(channel_id), headers, body).await;
+    }
+    let conn = state.store.conn.lock().await;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_error("begin DujiaoPay callback hint"))?;
+    queue_webhook_hint_tx(&tx, &order_id, &now())?;
+    tx.commit()
+        .map_err(db_error("commit DujiaoPay callback hint"))?;
+    Ok(Json(serde_json::json!({ "accepted": true })))
+}
+
 async fn dujiaopay_webhook(
     State(state): State<ServerState>,
     Path(channel_id): Path<String>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<impl axum::response::IntoResponse, AppError> {
+) -> Result<Json<serde_json::Value>, AppError> {
     if channel_id.len() > 80
         || !channel_id
             .bytes()
@@ -1698,6 +1909,10 @@ async fn dujiaopay_webhook(
             ],
         )
         .map_err(db_error("persist DujiaoPay webhook"))?;
+        // Signed events also need a persisted recovery window: the immediate
+        // authenticated lookup may fail, including for an order older than the
+        // regular polling horizon.
+        queue_webhook_hint_tx(&tx, &order_id, &now())?;
         tx.commit().map_err(db_error("commit DujiaoPay webhook"))?;
     }
     if !matches!(
@@ -1742,6 +1957,26 @@ async fn dujiaopay_webhook(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin verified top-up"))?;
+    if gateway.status == "paid" && topup_has_manual_hold_tx(&tx, &order_id)? {
+        let time = now();
+        tx.execute(
+            "UPDATE market_topup_orders SET status = 'review_required', updated_at = ?2
+             WHERE id = ?1 AND status != 'credited'",
+            params![order_id, time],
+        )
+        .map_err(db_error("hold disputed webhook top-up"))?;
+        tx.execute(
+            "UPDATE market_topup_events SET status = 'review_required', processed_at = ?3
+             WHERE merchant_fingerprint = ?1 AND gateway_event_id = ?2",
+            params![loaded.merchant_fingerprint, event.event_id, time],
+        )
+        .map_err(db_error("mark disputed webhook for review"))?;
+        tx.commit()
+            .map_err(db_error("commit disputed webhook review"))?;
+        return Ok(Json(
+            serde_json::json!({ "accepted": true, "reviewRequired": true }),
+        ));
+    }
     if gateway.status != "paid" {
         let (merchant_order_id, stored_gateway_id, amount_minor, merchant_fingerprint): (
             String,
@@ -1830,23 +2065,28 @@ struct PendingTopup {
     merchant_order_id: String,
     gateway_order_id: Option<String>,
     amount_minor: i64,
+    had_hint: bool,
 }
 
 fn pending_topups_tx(conn: &Connection) -> Result<Vec<PendingTopup>, AppError> {
-    let mut statement = conn.prepare(
-        "SELECT id, channel_id, channel_revision, merchant_order_id, gateway_order_id, amount_minor
+    let mut statement = conn
+        .prepare(
+            "SELECT id, channel_id, channel_revision, merchant_order_id, gateway_order_id,
+                amount_minor, reconcile_hint_pending
          FROM market_topup_orders
-         WHERE updated_at <= ?2 AND (
-             status IN ('created', 'creating', 'create_unknown', 'pending', 'verifying')
-             OR (status IN ('expired', 'cancelled') AND created_at >= ?1)
-         )
-         ORDER BY updated_at, id LIMIT 24",
-    ).map_err(db_error("prepare pending top-ups"))?;
+         WHERE COALESCE(next_reconcile_at, updated_at) <= ?1
+           AND status IN ('created', 'creating', 'create_unknown', 'pending', 'verifying',
+                          'expired', 'cancelled', 'review_required')
+           AND (created_at >= ?2 OR reconcile_hint_pending = 1
+                OR hint_reconcile_until >= ?1)
+         ORDER BY COALESCE(next_reconcile_at, updated_at), id LIMIT 24",
+        )
+        .map_err(db_error("prepare pending top-ups"))?;
     statement
         .query_map(
             params![
-                (Utc::now() - chrono::Duration::days(7)).to_rfc3339(),
-                (Utc::now() - chrono::Duration::seconds(30)).to_rfc3339()
+                Utc::now().to_rfc3339(),
+                (Utc::now() - chrono::Duration::days(TERMINAL_RECONCILE_DAYS)).to_rfc3339()
             ],
             |row| {
                 Ok(PendingTopup {
@@ -1856,12 +2096,94 @@ fn pending_topups_tx(conn: &Connection) -> Result<Vec<PendingTopup>, AppError> {
                     merchant_order_id: row.get(3)?,
                     gateway_order_id: row.get(4)?,
                     amount_minor: row.get(5)?,
+                    had_hint: row.get::<_, i64>(6)? == 1,
                 })
             },
         )
         .map_err(db_error("query pending top-ups"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(db_error("read pending top-ups"))
+}
+
+fn claim_reconciliation_tx(conn: &Connection, order_id: &str) -> Result<bool, AppError> {
+    let time = now();
+    let leased_until = (Utc::now() + chrono::Duration::seconds(RECONCILE_LEASE_SECS)).to_rfc3339();
+    let changed = conn
+        .execute(
+            "UPDATE market_topup_orders
+         SET next_reconcile_at = ?3, reconcile_hint_pending = 0
+         WHERE id = ?1 AND status != 'credited'
+           AND COALESCE(next_reconcile_at, updated_at) <= ?2",
+            params![order_id, time, leased_until],
+        )
+        .map_err(db_error("claim top-up reconciliation"))?;
+    Ok(changed == 1)
+}
+
+fn finish_reconciliation_tx(
+    conn: &Connection,
+    order_id: &str,
+    had_hint: bool,
+) -> Result<(), AppError> {
+    let (status, created_at, hint_reconcile_until): (String, String, Option<String>) = conn
+        .query_row(
+            "SELECT status, created_at, hint_reconcile_until
+             FROM market_topup_orders WHERE id = ?1",
+            params![order_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(db_error("read reconciled top-up state"))?;
+    if status == "credited" {
+        conn.execute(
+            "UPDATE market_topup_orders SET next_reconcile_at = NULL,
+             reconcile_hint_pending = 0 WHERE id = ?1",
+            params![order_id],
+        )
+        .map_err(db_error("finish credited top-up reconciliation"))?;
+        return Ok(());
+    }
+    let age = chrono::DateTime::parse_from_rfc3339(&created_at)
+        .map(|created| Utc::now().signed_duration_since(created).num_seconds())
+        .unwrap_or(i64::MAX);
+    let delay_secs = if matches!(status.as_str(), "expired" | "cancelled") {
+        if age < 86_400 {
+            300
+        } else if age < 604_800 {
+            3_600
+        } else {
+            86_400
+        }
+    } else if status == "review_required" {
+        86_400
+    } else if age < 3_600 {
+        30
+    } else if age < 86_400 {
+        300
+    } else if age < 604_800 {
+        3_600
+    } else {
+        86_400
+    };
+    let time = now();
+    let recovery_active = hint_reconcile_until
+        .as_deref()
+        .is_some_and(|until| until >= time.as_str());
+    let delay_secs = if had_hint {
+        delay_secs.min(300)
+    } else if age >= TERMINAL_RECONCILE_DAYS * 86_400 && recovery_active {
+        delay_secs.min(1_800)
+    } else {
+        delay_secs
+    };
+    let next = (Utc::now() + chrono::Duration::seconds(delay_secs)).to_rfc3339();
+    conn.execute(
+        "UPDATE market_topup_orders SET next_reconcile_at =
+         CASE WHEN reconcile_hint_pending = 1 THEN ?2 ELSE ?3 END
+         WHERE id = ?1",
+        params![order_id, time, next],
+    )
+    .map_err(db_error("schedule next top-up reconciliation"))?;
+    Ok(())
 }
 
 async fn reconcile_one_topup(state: &ServerState, pending: PendingTopup) -> Result<(), AppError> {
@@ -1923,7 +2245,8 @@ async fn reconcile_one_topup(state: &ServerState, pending: PendingTopup) -> Resu
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin top-up reconciliation"))?;
-    if gateway.status == "paid" {
+    let manual_hold = topup_has_manual_hold_tx(&tx, &pending.id)?;
+    if gateway.status == "paid" && !manual_hold {
         let validation = validate_paid_order_tx(
             &tx,
             &pending.id,
@@ -1961,6 +2284,13 @@ async fn reconcile_one_topup(state: &ServerState, pending: PendingTopup) -> Resu
             }
             Err(error) => return Err(error),
         }
+    } else if gateway.status == "paid" {
+        tx.execute(
+            "UPDATE market_topup_orders SET status = 'review_required', updated_at = ?2
+             WHERE id = ?1 AND status != 'credited'",
+            params![pending.id, now()],
+        )
+        .map_err(db_error("hold externally disputed top-up"))?;
     } else if matches!(
         gateway.status.as_str(),
         "expired" | "canceled" | "cancelled"
@@ -1983,6 +2313,7 @@ async fn reconcile_one_topup(state: &ServerState, pending: PendingTopup) -> Resu
             params![pending.id, now()],
         ).map_err(db_error("touch pending top-up"))?;
     }
+    finish_reconciliation_tx(&tx, &pending.id, pending.had_hint)?;
     tx.commit()
         .map_err(db_error("commit top-up reconciliation"))?;
     Ok(())
@@ -2022,6 +2353,14 @@ pub async fn run_service(
                 };
                 match pending {
                     Ok(orders) => for order in orders {
+                        let claimed = {
+                            let conn = state.store.conn.lock().await;
+                            claim_reconciliation_tx(&conn, &order.id)
+                        };
+                        if !matches!(claimed, Ok(true)) {
+                            if claimed.is_err() { tracing::warn!("market top-up reconciliation claim failed"); }
+                            continue;
+                        }
                         if let Err(error) = reconcile_one_topup(&state, order).await {
                             tracing::warn!(error_code = error.code().unwrap_or("MARKET_TOPUP_RETRY"),
                                 "market top-up recovery deferred");
@@ -2038,7 +2377,7 @@ pub async fn run_service(
                             Ok(count)
                         })
                 };
-                if let Err(_) = result { tracing::warn!("market earning maturity deferred"); }
+                if result.is_err() { tracing::warn!("market earning maturity deferred"); }
             }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() { break; }
@@ -2088,6 +2427,57 @@ mod tests {
                 "https://router.example/account/wallet/?topup=order-1&cancelled=1".to_owned(),
             )
         );
+        assert_eq!(
+            payment_webhook_url("sgptokenswitch.cc", false),
+            "https://sgptokenswitch.cc/v1/payment-webhooks/dujiaopay"
+        );
+    }
+
+    #[test]
+    fn merchant_configuration_accepts_poll_only_but_not_a_short_secret() {
+        let mut input = UpsertChannelRequest {
+            display_name: "Gateway".into(),
+            sort_order: 0,
+            api_key_id: "key".into(),
+            api_secret: "0123456789abcdef".into(),
+            webhook_secret: None,
+            webhook_mode: None,
+            allowed_methods: Vec::new(),
+        };
+        assert!(validate_channel_input(&input).is_ok());
+        input.webhook_secret = Some("short".into());
+        assert!(validate_channel_input(&input).is_err());
+        input.webhook_secret = Some("0123456789abcdef".into());
+        assert!(validate_channel_input(&input).is_ok());
+        assert!(validate_webhook_mode_change("signed", "poll_only", false).is_err());
+        assert!(validate_webhook_mode_change("signed", "poll_only", true).is_ok());
+        assert!(validate_webhook_mode_change("signed", "signed", false).is_ok());
+        assert!(validate_webhook_mode_change("poll_only", "poll_only", false).is_ok());
+        input.webhook_secret = None;
+        input.webhook_mode = Some("signed".into());
+        assert!(validate_channel_input(&input).is_err());
+    }
+
+    #[test]
+    fn buyer_channel_projection_hides_webhook_and_finance_state() {
+        let channel = ChannelView {
+            id: "channel".into(),
+            display_name: "Gateway".into(),
+            enabled: true,
+            sort_order: 0,
+            current_revision: 7,
+            verified: true,
+            webhook_mode: "poll_only".into(),
+            verified_live_topups: 42,
+            gateway_kind: "dujiaopay",
+        };
+        let value = serde_json::to_value(BuyerChannelView::from(channel)).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "id": "channel", "displayName": "Gateway", "gatewayKind": "dujiaopay"
+            })
+        );
     }
 
     #[test]
@@ -2124,6 +2514,95 @@ mod tests {
         .unwrap();
     }
 
+    #[test]
+    fn migrated_legacy_revisions_remain_signed_and_poll_only_is_explicit() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        let old_mode: String = conn
+            .query_row(
+                "SELECT webhook_mode FROM market_payment_channel_revisions
+             WHERE channel_id = 'channel' AND revision = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_mode, "signed");
+        conn.execute(
+            "INSERT INTO market_payment_channel_revisions
+             (channel_id, revision, merchant_id, merchant_fingerprint, api_key_id,
+              api_secret_ciphertext, api_secret_nonce, webhook_secret_ciphertext,
+              webhook_secret_nonce, key_version, webhook_mode, verified_at, created_at)
+             VALUES ('channel', 2, 'merchant', 'merchant-fingerprint', 'key',
+                     'encrypted', 'nonce', '', '', 1, 'poll_only', '2026-10-01', '2026-10-01')",
+            [],
+        )
+        .unwrap();
+        let new_mode: String = conn
+            .query_row(
+                "SELECT webhook_mode FROM market_payment_channel_revisions
+             WHERE channel_id = 'channel' AND revision = 2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_mode, "poll_only");
+    }
+
+    #[test]
+    fn old_signed_and_new_poll_only_revisions_load_independently() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        fixture_revision(&conn, 2);
+        let runtime = MarketPaymentsRuntime::for_test();
+        let fingerprint = hex::encode(Sha256::digest(b"merchant"));
+        for revision in [1, 2] {
+            let (api_ciphertext, api_nonce) = runtime
+                .cipher
+                .seal(
+                    &format!("api-secret-{revision}"),
+                    &aad("channel", revision, &fingerprint, "api"),
+                )
+                .unwrap();
+            let (webhook_ciphertext, webhook_nonce, mode) = if revision == 1 {
+                let (ciphertext, nonce) = runtime
+                    .cipher
+                    .seal(
+                        "legacy-webhook-secret",
+                        &aad("channel", revision, &fingerprint, "webhook"),
+                    )
+                    .unwrap();
+                (ciphertext, nonce, "signed")
+            } else {
+                (String::new(), String::new(), "poll_only")
+            };
+            conn.execute(
+                "UPDATE market_payment_channel_revisions
+                 SET merchant_fingerprint = ?3, api_secret_ciphertext = ?4,
+                     api_secret_nonce = ?5, webhook_secret_ciphertext = ?6,
+                     webhook_secret_nonce = ?7, key_version = ?8, webhook_mode = ?9
+                 WHERE channel_id = ?1 AND revision = ?2",
+                params![
+                    "channel",
+                    revision,
+                    fingerprint,
+                    api_ciphertext,
+                    api_nonce,
+                    webhook_ciphertext,
+                    webhook_nonce,
+                    runtime.cipher.version,
+                    mode
+                ],
+            )
+            .unwrap();
+        }
+        let old = load_revision(&conn, &runtime, "channel", 1).unwrap();
+        let new = load_revision(&conn, &runtime, "channel", 2).unwrap();
+        assert_eq!(old.credentials.api_secret.as_str(), "api-secret-1");
+        assert!(old.credentials.webhook_secret.is_some());
+        assert_eq!(new.credentials.api_secret.as_str(), "api-secret-2");
+        assert!(new.credentials.webhook_secret.is_none());
+    }
+
     fn fixture_topup(
         conn: &Connection,
         id: &str,
@@ -2150,7 +2629,7 @@ mod tests {
             credentials: Credentials {
                 key_id: "key".into(),
                 api_secret: Zeroizing::new("api-secret".into()),
-                webhook_secret: Zeroizing::new("webhook-secret".into()),
+                webhook_secret: Some(Zeroizing::new("webhook-secret".into())),
             },
         }
     }
@@ -2344,6 +2823,37 @@ mod tests {
     }
 
     #[test]
+    fn external_refund_review_blocks_even_a_matching_paid_receipt() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        let merchant_order_id = "router-00000000000000000000000000000001";
+        fixture_topup(&conn, "order-1", merchant_order_id, "review_required", 1);
+        open_reconciliation_case_tx(
+            &conn,
+            "external_refund_recorded",
+            "topup",
+            "order-1",
+            &now(),
+        )
+        .unwrap();
+        let paid = paid_order(merchant_order_id, "refund-reviewed-chain-tx");
+        assert!(topup_has_manual_hold_tx(&conn, "order-1").unwrap());
+        assert!(matches!(
+            apply_paid_order_tx(
+                &conn,
+                "order-1",
+                "channel",
+                1,
+                &loaded(),
+                &event(&paid),
+                &paid
+            ),
+            Err(AppError::Conflict(_))
+        ));
+        assert_eq!(wallet_snapshot_tx(&conn, "buyer").unwrap().posted_units, 0);
+    }
+
+    #[test]
     fn webhook_binding_preserves_early_revisions_after_many_key_rotations() {
         let conn = memory();
         let tx = conn
@@ -2359,6 +2869,96 @@ mod tests {
             ("order-1".into(), 1)
         );
         assert!(bound_webhook_order_tx(&tx, "other", merchant_order_id).is_err());
+    }
+
+    #[test]
+    fn unsigned_hints_only_schedule_bounded_lookups_even_after_seven_days() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        let merchant_order_id = "router-00000000000000000000000000000001";
+        fixture_topup(&conn, "order-1", merchant_order_id, "cancelled", 1);
+        let two_weeks_ago = (Utc::now() - chrono::Duration::days(14)).to_rfc3339();
+        conn.execute(
+            "UPDATE market_topup_orders SET created_at = ?2, updated_at = ?2,
+             gateway_order_id = 'gateway-1', next_reconcile_at = ?2 WHERE id = ?1",
+            params!["order-1", two_weeks_ago],
+        )
+        .unwrap();
+        assert_eq!(pending_topups_tx(&conn).unwrap().len(), 1);
+        assert!(claim_reconciliation_tx(&conn, "order-1").unwrap());
+        assert!(pending_topups_tx(&conn).unwrap().is_empty());
+        assert!(queue_webhook_hint_tx(&conn, "order-1", &now()).unwrap());
+        assert!(!queue_webhook_hint_tx(&conn, "order-1", &now()).unwrap());
+        let due = pending_topups_tx(&conn).unwrap();
+        assert_eq!(due.len(), 1);
+        assert!(due[0].had_hint);
+        assert!(claim_reconciliation_tx(&conn, "order-1").unwrap());
+        finish_reconciliation_tx(&conn, "order-1", due[0].had_hint).unwrap();
+        let follow_up: String = conn
+            .query_row(
+                "SELECT next_reconcile_at FROM market_topup_orders WHERE id = 'order-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let wait = chrono::DateTime::parse_from_rfc3339(&follow_up)
+            .unwrap()
+            .signed_duration_since(Utc::now())
+            .num_seconds();
+        assert!((0..=300).contains(&wait));
+        assert_eq!(wallet_snapshot_tx(&conn, "buyer").unwrap().posted_units, 0);
+
+        let long_ago = (Utc::now() - chrono::Duration::days(100)).to_rfc3339();
+        conn.execute(
+            "UPDATE market_topup_orders SET created_at = ?2, next_reconcile_at = ?2,
+             next_hint_at = NULL, hint_reconcile_until = ?2,
+             reconcile_hint_pending = 0 WHERE id = ?1",
+            params!["order-1", long_ago],
+        )
+        .unwrap();
+        assert!(pending_topups_tx(&conn).unwrap().is_empty());
+        assert!(queue_webhook_hint_tx(&conn, "order-1", &now()).unwrap());
+        assert_eq!(pending_topups_tx(&conn).unwrap().len(), 1);
+        assert!(claim_reconciliation_tx(&conn, "order-1").unwrap());
+        conn.execute(
+            "UPDATE market_topup_orders SET next_reconcile_at = ?2 WHERE id = ?1",
+            params!["order-1", long_ago],
+        )
+        .unwrap();
+        assert_eq!(pending_topups_tx(&conn).unwrap().len(), 1);
+        conn.execute(
+            "UPDATE market_topup_orders SET hint_reconcile_until = ?2 WHERE id = ?1",
+            params!["order-1", long_ago],
+        )
+        .unwrap();
+        assert!(pending_topups_tx(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_gateway_lookup_keeps_a_persisted_retry_lease() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        fixture_topup(
+            &conn,
+            "order-1",
+            "router-00000000000000000000000000000001",
+            "review_required",
+            1,
+        );
+        assert_eq!(pending_topups_tx(&conn).unwrap().len(), 1);
+        assert!(claim_reconciliation_tx(&conn, "order-1").unwrap());
+        // A network error after claim cannot consume the work permanently or
+        // cause a 30-second hot loop. The lease survives process restarts.
+        assert!(pending_topups_tx(&conn).unwrap().is_empty());
+        let next: String = conn
+            .query_row(
+                "SELECT next_reconcile_at FROM market_topup_orders WHERE id = 'order-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(next > now());
+        assert_eq!(wallet_snapshot_tx(&conn, "buyer").unwrap().posted_units, 0);
     }
 
     #[test]
