@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 
 readonly LITELLM_PRICE_URL="https://raw.githubusercontent.com/BerriAI/litellm/refs/heads/main/model_prices_and_context_window.json"
+readonly LITELLM_API_URL="https://api.github.com/repos/BerriAI/litellm/contents/model_prices_and_context_window.json?ref=main"
 readonly LITELLM_SOURCE_URL="https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json"
 readonly PRICE_CATALOG="pricing/model-prices.json"
 readonly DERIVE_SCRIPT="scripts/pricing/derive-model-prices.mjs"
@@ -39,17 +40,26 @@ downloaded_source="$temporary_directory/model_prices_and_context_window.json"
 derived_catalog="$temporary_directory/model-prices.json"
 
 echo "Checking the latest LiteLLM model prices..."
-curl \
-  --fail \
-  --silent \
-  --show-error \
-  --location \
-  --retry 3 \
-  --retry-all-errors \
-  --connect-timeout 15 \
-  --max-time 120 \
-  --output "$downloaded_source" \
-  "$LITELLM_PRICE_URL"
+download_litellm_source() {
+  curl \
+    --fail \
+    --silent \
+    --show-error \
+    --location \
+    --retry 3 \
+    --retry-all-errors \
+    --connect-timeout 15 \
+    --max-time 120 \
+    --output "$downloaded_source" \
+    "$@"
+}
+
+if ! download_litellm_source "$LITELLM_PRICE_URL"; then
+  echo "Raw GitHub source unavailable; retrying the same file through GitHub API..."
+  download_litellm_source \
+    --header 'Accept: application/vnd.github.raw+json' \
+    "$LITELLM_API_URL"
+fi
 
 node -e '
   const fs = require("node:fs");
