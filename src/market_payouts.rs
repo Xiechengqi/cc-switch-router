@@ -432,6 +432,7 @@ fn create_payout_tx(
 
 fn require_new_provider_payouts_open_tx(conn: &Connection) -> Result<(), AppError> {
     if crate::market_payments::wallet_purchase_mode_tx(conn)? {
+        crate::market_payments::require_new_wallet_withdrawals_open_tx(conn)?;
         return Ok(());
     }
     Err(AppError::ServiceUnavailable(
@@ -1640,6 +1641,30 @@ mod tests {
         let replay = create_payout_tx(&tx, "provider", 100, "idem-key-one", &time).unwrap();
         assert_eq!(replay.id, request.id);
         assert_eq!(replay.address, valid_address());
+        tx.execute(
+            "UPDATE market_finance_control SET new_withdrawals_paused = 1 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        assert!(matches!(
+            create_payout_tx(&tx, "provider", 100, "new-paused-key", &time),
+            Err(AppError::ServiceUnavailable(_))
+        ));
+        assert_eq!(
+            create_payout_tx(&tx, "provider", 100, "idem-key-one", &time)
+                .unwrap()
+                .id,
+            request.id
+        );
+        assert!(matches!(
+            transition_payout_tx(&tx, &request.id, "owner", "approve", 1, None, None, &time),
+            Err(AppError::ServiceUnavailable(_))
+        ));
+        tx.execute(
+            "UPDATE market_finance_control SET new_withdrawals_paused = 0 WHERE id = 1",
+            [],
+        )
+        .unwrap();
         assert_eq!(
             provider_summary_tx(&tx, "provider")
                 .unwrap()

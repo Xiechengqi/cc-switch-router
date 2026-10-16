@@ -1550,14 +1550,16 @@ fn approve_access_request_tx(
                 now,
             )?;
         }
-        effective_credit_grant_tx(
-            tx,
-            &request.supplier_user_id,
-            &request.buyer_user_id,
-            &request.buyer_email,
-            &request.product_kind,
-            &currency,
-        )?;
+        if !crate::market_payments::wallet_purchase_mode_tx(tx)? {
+            effective_credit_grant_tx(
+                tx,
+                &request.supplier_user_id,
+                &request.buyer_user_id,
+                &request.buyer_email,
+                &request.product_kind,
+                &currency,
+            )?;
+        }
     }
     record_event_tx(
         tx,
@@ -1946,6 +1948,11 @@ fn upsert_credit_line_tx(
     expected_revision: Option<i64>,
     now: &str,
 ) -> Result<(), AppError> {
+    if crate::market_payments::wallet_purchase_mode_tx(tx)? {
+        return Err(AppError::Gone(
+            "Provider-scoped credit lines are retired; use the platform wallet".into(),
+        ));
+    }
     let currency = normalize_currency(&input.currency)?;
     let (kind, limit_minor) =
         validate_credit_line(&input.kind, input.limit_minor, input.risk_acknowledged)?;
@@ -2610,7 +2617,9 @@ pub(crate) fn market_eligibility_tx(
             )?,
         });
     }
-    if daily_rate_minor.is_none() {
+    // Wallet-funded offers use the shared buyer balance. Provider-scoped
+    // settlement profiles and credit lines are not eligibility requirements.
+    if daily_rate_minor.is_none() || crate::market_payments::wallet_purchase_mode_tx(conn)? {
         return Ok(MarketEligibilityView::allowed());
     }
     let currency = currency
@@ -3371,6 +3380,73 @@ mod tests {
         .expect("read prepaid-only eligibility");
         assert!(eligibility.allowed);
         assert_eq!(eligibility.status, "allowed");
+    }
+
+    #[test]
+    fn wallet_paid_access_needs_product_permission_but_not_legacy_credit_or_settlement() {
+        let conn = access_request_connection();
+        insert_paid_share_target(&conn, "seat-wallet-access");
+        let buyer = test_actor("buyer", "buyer@example.com");
+        let supplier = test_actor("supplier", "supplier@example.com");
+        let now = test_request_time();
+        conn.execute(
+            "UPDATE market_finance_control SET mode = 'enabled',
+             cutover_approved_at = ?1 WHERE id = 1",
+            params![now.to_rfc3339()],
+        )
+        .unwrap();
+        let before = market_eligibility_tx(
+            &conn,
+            &supplier.user_id,
+            &buyer.user_id,
+            &buyer.email,
+            PRODUCT_SHARE,
+            Some(1_000),
+            Some("USD"),
+        )
+        .unwrap();
+        assert_eq!(before.status, "access_required");
+        let request = create_access_request_tx(
+            &conn,
+            &buyer,
+            &share_request_input("seat-wallet-access"),
+            now,
+        )
+        .unwrap();
+        approve_access_request_for_actor_tx(
+            &conn,
+            &supplier,
+            &request.id,
+            request.revision,
+            None,
+            &now.to_rfc3339(),
+        )
+        .unwrap();
+        let after = market_eligibility_tx(
+            &conn,
+            &supplier.user_id,
+            &buyer.user_id,
+            &buyer.email,
+            PRODUCT_SHARE,
+            Some(1_000),
+            Some("USD"),
+        )
+        .unwrap();
+        assert!(after.allowed);
+        assert_eq!(after.status, "allowed");
+        let credit = upsert_credit_line_tx(
+            &conn,
+            &request.id,
+            &CreditLineInput {
+                currency: "USD".into(),
+                kind: CREDIT_LIMITED.into(),
+                limit_minor: Some(1_000),
+                risk_acknowledged: false,
+            },
+            None,
+            &now.to_rfc3339(),
+        );
+        assert!(matches!(credit, Err(AppError::Gone(_))));
     }
 
     #[test]

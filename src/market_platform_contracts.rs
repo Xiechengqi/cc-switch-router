@@ -3,15 +3,22 @@
 //! service interval twice. Callers supply observed control-plane evidence and
 //! run every transition inside an IMMEDIATE database transaction.
 
+use axum::extract::{Path, State};
+use axum::http::{HeaderMap, header};
+use axum::routing::get;
+use axum::{Json, Router};
 use chrono::{DateTime, Datelike, Utc};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::db::{Connection, OptionalExtension, params};
+use crate::ServerState;
+use crate::db::{Connection, OptionalExtension, TransactionBehavior, params};
 use crate::error::AppError;
 use crate::market_wallet::{
     capture_hold_tx, credit_wallet_from_liability_tx, debit_available_tx, release_hold_tx,
     reserve_wallet_tx, units_from_minor,
 };
+use crate::models::AuthSession;
 
 fn db_error(context: &'static str) -> impl FnOnce(crate::db::Error) -> AppError {
     move |error| AppError::Internal(format!("{context} failed: {error}"))
@@ -21,6 +28,152 @@ fn parse_time(value: &str) -> Result<DateTime<Utc>, AppError> {
     DateTime::parse_from_rfc3339(value)
         .map(|value| value.with_timezone(&Utc))
         .map_err(|_| AppError::BadRequest("invalid market service timestamp".into()))
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WalletRenewalView {
+    id: String,
+    product_kind: String,
+    billing_model: String,
+    cycle_price_minor: i64,
+    renewal_policy: String,
+    status: String,
+    period_end: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UpdateWalletRenewalRequest {
+    auto_renew: bool,
+    expected_policy: String,
+}
+
+fn wallet_renewal_view_tx(
+    conn: &Connection,
+    contract_id: &str,
+    buyer: &str,
+) -> Result<WalletRenewalView, AppError> {
+    conn.query_row(
+        "SELECT id, product_kind, billing_model, cycle_price_minor, renewal_policy, status,
+                (SELECT period_end FROM market_platform_periods
+                 WHERE contract_id = contract.id AND sequence = contract.current_period_sequence)
+         FROM market_platform_contracts contract WHERE id = ?1 AND buyer_user_id = ?2
+           AND billing_model = 'calendar_month'",
+        params![contract_id, buyer],
+        |row| {
+            Ok(WalletRenewalView {
+                id: row.get(0)?,
+                product_kind: row.get(1)?,
+                billing_model: row.get(2)?,
+                cycle_price_minor: row.get(3)?,
+                renewal_policy: row.get(4)?,
+                status: row.get(5)?,
+                period_end: row.get(6)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(db_error("read wallet renewal policy"))?
+    .ok_or_else(|| AppError::NotFound("monthly wallet contract not found".into()))
+}
+
+fn set_wallet_renewal_tx(
+    conn: &Connection,
+    contract_id: &str,
+    buyer: &str,
+    request: &UpdateWalletRenewalRequest,
+    at: &str,
+) -> Result<WalletRenewalView, AppError> {
+    if !matches!(request.expected_policy.as_str(), "manual" | "automatic") {
+        return Err(AppError::BadRequest(
+            "invalid expected renewal policy".into(),
+        ));
+    }
+    let current = wallet_renewal_view_tx(conn, contract_id, buyer)?;
+    if current.renewal_policy != request.expected_policy {
+        return Err(AppError::Conflict(
+            "renewal policy changed; reload before saving".into(),
+        ));
+    }
+    if !matches!(current.status.as_str(), "trialing" | "active") {
+        return Err(AppError::Conflict(
+            "this contract cannot change renewal policy".into(),
+        ));
+    }
+    if request.auto_renew {
+        if let Some(end) = current.period_end.as_deref() {
+            if parse_time(end)? <= parse_time(at)? {
+                return Err(AppError::Conflict(
+                    "the current month has ended; renew from a fresh offer".into(),
+                ));
+            }
+        }
+    }
+    let policy = if request.auto_renew {
+        "automatic"
+    } else {
+        "manual"
+    };
+    if policy != current.renewal_policy {
+        let changed = conn
+            .execute(
+                "UPDATE market_platform_contracts SET renewal_policy = ?3, updated_at = ?4
+             WHERE id = ?1 AND buyer_user_id = ?2 AND renewal_policy = ?5
+               AND status IN ('trialing', 'active')",
+                params![contract_id, buyer, policy, at, request.expected_policy],
+            )
+            .map_err(db_error("update wallet renewal policy"))?;
+        if changed != 1 {
+            return Err(AppError::Conflict(
+                "renewal policy changed; reload before saving".into(),
+            ));
+        }
+    }
+    wallet_renewal_view_tx(conn, contract_id, buyer)
+}
+
+async fn require_buyer(state: &ServerState, headers: &HeaderMap) -> Result<AuthSession, AppError> {
+    crate::api::resolve_router_session(state, headers)
+        .await?
+        .ok_or_else(|| AppError::Unauthorized("login required".into()))
+}
+
+async fn get_wallet_renewal(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let buyer = require_buyer(&state, &headers).await?;
+    let conn = state.store.conn.lock().await;
+    Ok((
+        [(header::CACHE_CONTROL, "private, no-store")],
+        Json(wallet_renewal_view_tx(&conn, &id, &buyer.user_id)?),
+    ))
+}
+
+async fn update_wallet_renewal(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<UpdateWalletRenewalRequest>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let buyer = require_buyer(&state, &headers).await?;
+    let conn = state.store.conn.lock().await;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_error("begin wallet renewal update"))?;
+    let view = set_wallet_renewal_tx(&tx, &id, &buyer.user_id, &request, &Utc::now().to_rfc3339())?;
+    tx.commit()
+        .map_err(db_error("commit wallet renewal update"))?;
+    Ok(([(header::CACHE_CONTROL, "private, no-store")], Json(view)))
+}
+
+pub fn router() -> Router<ServerState> {
+    Router::new().route(
+        "/v1/market-wallet/contracts/:id/renewal",
+        get(get_wallet_renewal).put(update_wallet_renewal),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -351,6 +504,8 @@ pub(crate) fn prepare_contract_tx(
         }
         return Ok(id);
     }
+    crate::market_payments::require_new_wallet_orders_open_tx(conn)?;
+    crate::market_reconcile::ensure_new_finance_writes_safe_tx(conn)?;
     let legacy_rail_present: i64 = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM market_service_contracts
@@ -2910,6 +3065,56 @@ mod tests {
     }
 
     #[test]
+    fn monthly_wallet_renewal_is_buyer_scoped_and_cannot_change_a_terminal_contract() {
+        let conn = memory();
+        let at = "2026-10-16T00:00:00Z";
+        conn.execute(
+            "INSERT INTO market_platform_contracts (
+                id, product_kind, product_ref, trial_scope_ref, quote_id,
+                request_fingerprint, buyer_user_id, provider_user_id,
+                offer_revision, billing_model, cycle_price_minor,
+                renewal_policy, status, created_at, updated_at
+             ) VALUES ('monthly', 'share', 'subscription', 'share', 'quote',
+                       'request', 'buyer', 'provider', 1, 'calendar_month', 100,
+                       'manual', 'trialing', ?1, ?1)",
+            params![at],
+        )
+        .unwrap();
+        let enable = UpdateWalletRenewalRequest {
+            auto_renew: true,
+            expected_policy: "manual".into(),
+        };
+        assert!(matches!(
+            set_wallet_renewal_tx(&conn, "monthly", "other", &enable, at),
+            Err(AppError::NotFound(_))
+        ));
+        let current = set_wallet_renewal_tx(&conn, "monthly", "buyer", &enable, at).unwrap();
+        assert_eq!(current.renewal_policy, "automatic");
+        assert!(matches!(
+            set_wallet_renewal_tx(&conn, "monthly", "buyer", &enable, at),
+            Err(AppError::Conflict(_))
+        ));
+        conn.execute(
+            "UPDATE market_platform_contracts SET status = 'ended' WHERE id = 'monthly'",
+            [],
+        )
+        .unwrap();
+        assert!(matches!(
+            set_wallet_renewal_tx(
+                &conn,
+                "monthly",
+                "buyer",
+                &UpdateWalletRenewalRequest {
+                    auto_renew: false,
+                    expected_policy: "automatic".into(),
+                },
+                at,
+            ),
+            Err(AppError::Conflict(_))
+        ));
+    }
+
+    #[test]
     fn existing_due_services_precede_new_wallet_orders_and_sort_stably() {
         let conn = memory();
         let time = "2026-10-03T00:00:00+00:00";
@@ -3801,6 +4006,29 @@ mod tests {
             id
         );
         assert!(prepare_contract_tx(&tx, &monthly("quote-1", true), start).is_err());
+        tx.execute(
+            "UPDATE market_finance_control SET new_orders_paused = 1 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            prepare_contract_tx(&tx, &monthly("quote-1", false), start).unwrap(),
+            id
+        );
+        let mut another = monthly("quote-2", false);
+        another.product_ref = "subscription-2";
+        assert!(matches!(
+            prepare_contract_tx(&tx, &another, start),
+            Err(AppError::ServiceUnavailable(_))
+        ));
+        let contract_count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM market_platform_contracts",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(contract_count, 1);
         assert_eq!(
             wallet_snapshot_tx(&tx, "buyer").unwrap().held_units,
             86_400_000

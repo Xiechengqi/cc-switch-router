@@ -12,7 +12,7 @@ import { CLIENT_MARKET_POLL_MS } from "@/components/dashboard/client-market/host
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getClientMarketHosts, getMyClientMarketRentals } from "@/lib/api";
 import { mergeHosts, mergeRentalMap } from "@/lib/client-market-refresh";
-import { clientMarketMineHref, DASHBOARD_ACCOUNT_BILLING_PATH, DASHBOARD_ACCOUNT_CLIENT_PATH } from "@/lib/dashboard-nav";
+import { clientMarketMineHref, DASHBOARD_ACCOUNT_BILLING_PATH, DASHBOARD_ACCOUNT_CLIENT_PATH, DASHBOARD_ACCOUNT_WALLET_PATH } from "@/lib/dashboard-nav";
 import type { MessageKey } from "@/lib/i18n";
 import { formatUsdMoney } from "@/lib/market-money";
 import type { ClientMarketHost, ClientMarketRental } from "@/lib/types";
@@ -232,7 +232,7 @@ function MonitorCard({
           {freeTiming ? <dd className="text-xs text-muted-foreground">{freeTiming}</dd> : null}
         </div>
         <div className="grid gap-0.5">
-          <dt className="text-xs text-muted-foreground">{t("account.nav.billing")}</dt>
+          <dt className="text-xs text-muted-foreground">{t(rental?.walletContractId ? "account.nav.wallet" : "account.nav.billing")}</dt>
           <dd className="font-medium">{status === "released" ? t("account.client.billing.ended") : isFreeOffer(pricingModel, dailyRateMinor, cyclePriceMinor) ? t("shareMarket.free") : t("marketBilling.status.active")}</dd>
           {rental?.hostCleanupPending ? <dd className="text-xs text-amber-800">{t("clientMarket.release.hostPending")}</dd> : null}
         </div>
@@ -247,7 +247,7 @@ function MonitorCard({
       <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border/70 pt-3">
         <p className="text-xs text-muted-foreground">{t("account.client.readOnlyHint")}</p>
         <div className="flex flex-wrap gap-2">
-          {!isFreeOffer(pricingModel, dailyRateMinor, cyclePriceMinor) ? <Link href={DASHBOARD_ACCOUNT_BILLING_PATH} className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-border bg-background px-3 text-sm font-medium text-foreground transition-colors hover:border-accent/30 hover:bg-muted">{t("marketBilling.open")}<ArrowUpRight className="h-3.5 w-3.5" aria-hidden /></Link> : null}
+          {!isFreeOffer(pricingModel, dailyRateMinor, cyclePriceMinor) ? <Link href={rental?.walletContractId ? DASHBOARD_ACCOUNT_WALLET_PATH : DASHBOARD_ACCOUNT_BILLING_PATH} className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-border bg-background px-3 text-sm font-medium text-foreground transition-colors hover:border-accent/30 hover:bg-muted">{t(rental?.walletContractId ? "account.nav.wallet" : "marketBilling.open")}<ArrowUpRight className="h-3.5 w-3.5" aria-hidden /></Link> : null}
           <Link href={marketHref} className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-border bg-background px-3 text-sm font-medium text-foreground transition-colors hover:border-accent/30 hover:bg-muted">{t("account.client.manageInMarket")}<ArrowUpRight className="h-3.5 w-3.5" aria-hidden /></Link>
         </div>
       </div>

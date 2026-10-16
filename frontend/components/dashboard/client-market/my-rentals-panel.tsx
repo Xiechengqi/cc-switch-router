@@ -8,6 +8,7 @@ import { CompactSelect } from "@/components/common/compact-select";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { ClientMarketRentalBanner } from "@/components/dashboard/client-market-rental-banner";
 import { MarketRecurringContractCard } from "@/components/dashboard/market-recurring-contract-card";
+import { MarketWalletRenewalCard } from "@/components/dashboard/market-wallet-renewal-card";
 import { MarketServiceDisputeControl } from "@/components/dashboard/market-service-dispute-control";
 import { CountryFlag } from "@/components/common/country-flag";
 import { ReleaseRentalAction } from "@/components/dashboard/client-market/release-rental-action";
@@ -251,6 +252,9 @@ export function MyRentalsPanel({
               resumeRelease={false}
             />
             <MarketServiceDisputeControl contractId={rental.walletContractId} initiallyOpen={rental.openWalletDispute} onChanged={onChanged} />
+            {rental.walletContractId && rental.cyclePriceMinor != null ? (
+              <MarketWalletRenewalCard contractId={rental.walletContractId} onChanged={onChanged} />
+            ) : null}
             {rental.recurring ? (
               <MarketRecurringContractCard
                 contract={rental.recurring}

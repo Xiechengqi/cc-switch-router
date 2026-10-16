@@ -1,20 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type {
-  MarketFundingSummary,
-  MarketProvider,
-  MarketRecurringFundingSummary,
-  MyMarketProviderFunding,
-} from "@/lib/types";
+import type { MarketProvider } from "@/lib/types";
 import {
   actorBoundValue,
   basisPointsScore,
   filterMarketProviders,
   formatBasisPointScore,
   isFormallyRanked,
-  legacyProviderFundingVisible,
-  preferredProviderTopupFunding,
-  providerCreditSummary,
 } from "./providers-page-utils";
 
 test("private snapshots are hidden synchronously when the authenticated actor changes", () => {
@@ -22,13 +14,6 @@ test("private snapshots are hidden synchronously when the authenticated actor ch
   assert.deepEqual(actorBoundValue(snapshot, "buyer-a"), { balance: 100 });
   assert.equal(actorBoundValue(snapshot, "buyer-b"), null);
   assert.equal(actorBoundValue(null, "buyer-a"), null);
-});
-
-test("Provider-specific funding stays hidden until the finance mode is known and after wallet cutover", () => {
-  assert.equal(legacyProviderFundingVisible(undefined), false);
-  assert.equal(legacyProviderFundingVisible("disabled"), true);
-  assert.equal(legacyProviderFundingVisible("shadow"), true);
-  assert.equal(legacyProviderFundingVisible("enabled"), false);
 });
 
 function provider(
@@ -72,31 +57,6 @@ function provider(
     exploration: false,
     joinedAt: "2026-01-01T00:00:00Z",
     ...overrides,
-  };
-}
-
-function funding(projectedDailyRateMinor: number, requiredTopupMinor = 0): MarketFundingSummary {
-  return {
-    supplierUserId: "supplier",
-    supplierEmail: "supplier@example.com",
-    currency: "USD",
-    fundingMode: "prepaid",
-    prepaidBalanceMinor: 1_000,
-    prepaidHeldMinor: 0,
-    prepaidAvailableMinor: 1_000,
-    creditKind: "none",
-    creditOutstandingMinor: 0,
-    creditReservedMinor: 0,
-    activeDailyRateMinor: projectedDailyRateMinor,
-    additionalDailyRateMinor: 0,
-    projectedDailyRateMinor,
-    requiredCoverageMinor: 0,
-    prepaidCoverageMinor: 0,
-    creditCoverageMinor: 0,
-    requiredTopupMinor,
-    recommendedTopupMinor: projectedDailyRateMinor * 7,
-    recommendedCoverageDays: 7,
-    topupAvailable: true,
   };
 }
 
@@ -160,82 +120,4 @@ test("formal rank presentation fails closed when rank fields disagree", () => {
     rankPosition: 1,
     scoreBps: 10_001,
   })), false);
-});
-
-test("top-up defaults to the higher-demand Provider relationship", () => {
-  const shareFunding = funding(100);
-  const clientFunding = funding(300);
-  const item: MyMarketProviderFunding = {
-    marketProviderId: "mp_1",
-    displayName: "Provider",
-    official: false,
-    supplierUserId: "supplier",
-    supplierEmail: "supplier@example.com",
-    currency: "USD",
-    shareFunding,
-    clientFunding,
-    shareLegacyDailyRateMinor: 100,
-    clientLegacyDailyRateMinor: 300,
-    recurring: {
-      activeContractCount: 0,
-      monthlyCommitmentMinor: 0,
-      nextRenewalMinor: 0,
-    },
-  };
-  assert.equal(preferredProviderTopupFunding(item), clientFunding);
-
-  const urgentShare = funding(100, 500);
-  assert.equal(
-    preferredProviderTopupFunding({ ...item, shareFunding: urgentShare }),
-    urgentShare,
-  );
-
-  const recurring: MarketRecurringFundingSummary = {
-    supplierUserId: "supplier",
-    supplierEmail: "supplier@example.com",
-    currency: "USD",
-    pricingModel: "prepaid_calendar_month",
-    billingInterval: "calendar_month",
-    cyclePriceMinor: 2_000,
-    renewalPolicy: "manual",
-    prepaidBalanceMinor: 1_000,
-    prepaidHeldMinor: 0,
-    prepaidAvailableMinor: 1_000,
-    initialHoldMinor: 2_000,
-    renewalHoldMinor: 0,
-    totalRequiredHoldMinor: 2_000,
-    requiredTopupMinor: 1_000,
-    topupAvailable: true,
-  };
-  assert.equal(
-    preferredProviderTopupFunding({
-      ...item,
-      recurring: { ...item.recurring, topupFunding: recurring },
-    }),
-    recurring,
-  );
-});
-
-test("Provider credit summary covers both product grants without double-counting", () => {
-  const shareFunding = funding(100);
-  const clientFunding = {
-    ...funding(200),
-    creditKind: "limited" as const,
-    creditAvailableMinor: 750,
-  };
-  assert.deepEqual(
-    providerCreditSummary({ shareFunding, clientFunding }),
-    { kind: "limited", availableMinor: 750 },
-  );
-  assert.deepEqual(
-    providerCreditSummary({
-      shareFunding: { ...shareFunding, creditKind: "unlimited" },
-      clientFunding,
-    }),
-    { kind: "unlimited" },
-  );
-  assert.deepEqual(
-    providerCreditSummary({ shareFunding, clientFunding: funding(200) }),
-    { kind: "none" },
-  );
 });

@@ -1,10 +1,4 @@
-import type {
-  MarketFundingSummary,
-  MarketProvider,
-  MyMarketProviderFunding,
-} from "@/lib/types";
-import type { MarketTopupFunding } from "@/lib/market-funding";
-import type { MarketWallet } from "@/lib/market-wallet-api";
+import type { MarketProvider } from "@/lib/types";
 
 export type ProviderMarketFilter = "all" | "share" | "client";
 
@@ -13,10 +7,6 @@ export function actorBoundValue<T>(
   actorKey: string,
 ) {
   return snapshot?.actorKey === actorKey ? snapshot.value : null;
-}
-
-export function legacyProviderFundingVisible(mode: MarketWallet["mode"] | undefined) {
-  return mode === "disabled" || mode === "shadow";
 }
 
 export function filterMarketProviders(
@@ -62,63 +52,4 @@ export function isFormallyRanked(
     && Number.isFinite(provider.scoreBps)
     && provider.scoreBps >= 0
     && provider.scoreBps <= 10_000;
-}
-
-function fundingDemand(funding: MarketTopupFunding) {
-  if ("totalRequiredHoldMinor" in funding) {
-    return [
-      funding.requiredTopupMinor,
-      funding.totalRequiredHoldMinor,
-      funding.cyclePriceMinor,
-      0,
-    ] as const;
-  }
-  return [
-    funding.requiredTopupMinor,
-    funding.recommendedTopupMinor,
-    funding.projectedDailyRateMinor,
-    funding.activeDailyRateMinor,
-  ] as const;
-}
-
-/**
- * Share and Client summaries point at the same Provider-scoped prepaid account.
- * Pick the relationship with the higher immediate demand so the shared top-up
- * dialog starts from the safer amount without double-counting the balance.
- */
-export function preferredProviderTopupFunding(provider: MyMarketProviderFunding) {
-  const candidates: MarketTopupFunding[] = [
-    provider.shareFunding,
-    provider.clientFunding,
-    ...(provider.recurring.topupFunding ? [provider.recurring.topupFunding] : []),
-  ];
-  return candidates.reduce((preferred, candidate) => {
-    const current = fundingDemand(preferred);
-    const next = fundingDemand(candidate);
-    for (let index = 0; index < current.length; index += 1) {
-      if (current[index] !== next[index]) {
-        return next[index] > current[index] ? candidate : preferred;
-      }
-    }
-    return preferred;
-  });
-}
-
-/** Credit exposure is shared by Provider, while grants can differ by product. */
-export function providerCreditSummary(
-  provider: Pick<MyMarketProviderFunding, "shareFunding" | "clientFunding">,
-) {
-  const fundings = [provider.shareFunding, provider.clientFunding];
-  if (fundings.some((funding) => funding.creditKind === "unlimited")) {
-    return { kind: "unlimited" as const };
-  }
-  const availableMinor = fundings
-    .filter((funding) => funding.creditKind === "limited")
-    .reduce(
-      (available, funding) => Math.max(available, funding.creditAvailableMinor ?? 0),
-      0,
-    );
-  return fundings.some((funding) => funding.creditKind === "limited")
-    ? { kind: "limited" as const, availableMinor }
-    : { kind: "none" as const };
 }

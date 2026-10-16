@@ -86,7 +86,6 @@ import type {
   ClientMarketProviderSupply,
   MarketProviderList,
   MarketProviderDetail,
-  MyMarketProviderFundingResponse,
   ClientMarketAllocationQuote,
   ClientMarketCommitQuoteResponse,
   ClientMarketBatch,
@@ -1324,6 +1323,16 @@ export async function updateAccountPaymentProfile(
   );
 }
 
+export async function updateAccountPaymentContacts(contacts: PaymentContact[]) {
+  return parseJson<AccountPaymentProfile>(
+    await authFetch("/v1/account/payment-contacts", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ contacts }),
+    }),
+  );
+}
+
 export async function getBinanceAutoSettlementStatus() {
   return parseJson<BinanceAutoSettlementStatus>(
     await authFetch("/v1/account/binance-auto-settlement", { cache: "no-store" }),
@@ -1888,15 +1897,6 @@ export async function getMarketProvider(id: string, signal?: AbortSignal) {
   return parseJson<MarketProviderDetail>(
     await fetch(`/v1/market-providers/${encodeURIComponent(id)}`, {
       cache: "no-cache",
-      signal,
-    }),
-  );
-}
-
-export async function getMyMarketProviderFunding(signal?: AbortSignal) {
-  return parseJson<MyMarketProviderFundingResponse>(
-    await authFetch("/v1/market-providers/me/funding", {
-      cache: "no-store",
       signal,
     }),
   );

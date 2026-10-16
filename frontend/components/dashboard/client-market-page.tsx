@@ -41,8 +41,6 @@ import {
   HostSortKey,
   HostSortPrefs,
   OWNER_FILTER_KEY,
-  PAYMENT_FILTER_KEY,
-  PAYMENT_FILTER_KINDS,
   REGION_FILTER_KEY,
   ROUTER_OPEN_LOGIN_EVENT,
   SORT_PREFS_KEY,
@@ -61,13 +59,11 @@ import {
   hostMatchesListTab,
   hostMatchesMarketProvider,
   hostStatusTabTone,
-  hostSupportsPaymentKind,
   mapPool,
   normalizeHostListTab,
   normalizeHostSortPrefs,
   normalizeOwnerFilters,
   parseHostTransferLines,
-  paymentKindLabelKey,
   prioritizeMineClientOwned,
   sortHosts,
   statusGroupForHost,
@@ -99,7 +95,6 @@ export function ClientMarketPage() {
     [setOwnerFiltersRaw],
   );
   const [regionFilters, setRegionFilters] = usePersistentState<string[]>(REGION_FILTER_KEY, []);
-  const [paymentFilters, setPaymentFilters] = usePersistentState<string[]>(PAYMENT_FILTER_KEY, []);
   const [listTabRaw, setListTab] = usePersistentState<HostListTab>(STATUS_FILTER_KEY, "mine");
   const [providerScopedTab, setProviderScopedTab] = React.useState<HostListTab | null>(
     () => (marketProviderId ? "all" : null),
@@ -242,15 +237,6 @@ export function ClientMarketPage() {
     }));
   }, [hosts, locale]);
 
-  const paymentOptions = React.useMemo(
-    () =>
-      PAYMENT_FILTER_KINDS.map((kind) => ({
-        value: kind,
-        label: t(paymentKindLabelKey(kind)),
-      })),
-    [t],
-  );
-
   const scopedHosts = React.useMemo(() => {
     const ownerSet = new Set(ownerFilters.map((email) => email.toLowerCase()));
     const regionSet = new Set(regionFilters.map((code) => code.toUpperCase()));
@@ -261,15 +247,9 @@ export function ClientMarketPage() {
         const code = (host.countryCode || "").trim().toUpperCase();
         if (!code || !regionSet.has(code)) return false;
       }
-      if (
-        paymentFilters.length > 0 &&
-        !paymentFilters.every((kind) => hostSupportsPaymentKind(host.paymentMethodKinds, kind))
-      ) {
-        return false;
-      }
       return true;
     });
-  }, [hosts, marketProviderId, ownerFilters, paymentFilters, regionFilters]);
+  }, [hosts, marketProviderId, ownerFilters, regionFilters]);
 
   const clearMarketProvider = React.useCallback(() => {
     const params = new URLSearchParams(searchParams.toString());
@@ -378,7 +358,7 @@ export function ClientMarketPage() {
 
   React.useEffect(() => {
     setPage(1);
-  }, [listTab, marketProviderId, ownerFilters, paymentFilters, regionFilters, sortPrefs.dir, sortPrefs.key]);
+  }, [listTab, marketProviderId, ownerFilters, regionFilters, sortPrefs.dir, sortPrefs.key]);
 
   React.useEffect(() => {
     setProviderScopedTab(marketProviderId ? "all" : null);
@@ -720,10 +700,10 @@ export function ClientMarketPage() {
         <div className="grid justify-items-center gap-2 rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">
           <span>
             {viewingMine
-              ? !ownerFilters.length && !regionFilters.length && !paymentFilters.length && !marketProviderId
+              ? !ownerFilters.length && !regionFilters.length && !marketProviderId
                 ? t("clientMarket.scopeMineEmpty")
                 : t("dashboard.noFilterResults")
-              : scopedHosts.length || ownerFilters.length || regionFilters.length || paymentFilters.length || marketProviderId
+              : scopedHosts.length || ownerFilters.length || regionFilters.length || marketProviderId
                 ? t("dashboard.noFilterResults")
                 : t("clientMarket.noHosts")}
           </span>
@@ -731,7 +711,6 @@ export function ClientMarketPage() {
           !mineHosts.length &&
           !ownerFilters.length &&
           !regionFilters.length &&
-          !paymentFilters.length &&
           !marketProviderId ? (
             <button
               type="button"
@@ -743,7 +722,6 @@ export function ClientMarketPage() {
           ) : null}
           {ownerFilters.length ||
           regionFilters.length ||
-          paymentFilters.length ||
           marketProviderId ||
           listTab !== (authed ? "mine" : "all") ? (
             <button
@@ -753,7 +731,6 @@ export function ClientMarketPage() {
                 setListTab(authed ? "mine" : "all");
                 setOwnerFilters([]);
                 setRegionFilters([]);
-                setPaymentFilters([]);
                 if (marketProviderId) clearMarketProvider();
               }}
             >
@@ -838,20 +815,6 @@ export function ClientMarketPage() {
                     columnKey="offer"
                     sortPrefs={sortPrefs}
                     onSort={toggleHostSort}
-                    filter={
-                      <CompactRegionMultiSelect
-                        variant="header"
-                        columnLabel={t("clientMarket.col.offer")}
-                        values={paymentFilters}
-                        onChange={setPaymentFilters}
-                        options={paymentOptions}
-                        allLabel={t("clientMarket.allPayments")}
-                        moreLabel={(count) => t("clientMarket.paymentsMore", { count })}
-                        clearLabel={t("clientMarket.clearPaymentSelection")}
-                        ariaLabel={t("clientMarket.filterPayments")}
-                        className="w-full max-w-[10.5rem]"
-                      />
-                    }
                   />
                   <HostSortHeader columnKey="subdomain" sortPrefs={sortPrefs} onSort={toggleHostSort} />
                   <HostSortHeader columnKey="ip" sortPrefs={sortPrefs} onSort={toggleHostSort} />

@@ -22,7 +22,6 @@ import {
 } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useClientChat } from "@/components/chat/client-chat";
-import { PaymentMethodIcons } from "@/components/common/payment-method-icons";
 import { ProviderContactsList } from "@/components/common/provider-contacts";
 import {
   MarketAccessDialog,
@@ -808,7 +807,7 @@ export function ShareMarketBuyerCatalog({
                   </section>
                   <section className="grid gap-3">
                     <h3 className="text-xs font-semibold uppercase text-slate-500">{t("shareMarket.catalog.seller")}</h3>
-                    <div className="flex min-w-0 items-center gap-2 text-sm"><UserRound className="h-4 w-4 text-slate-400" /><span className="min-w-0 break-all font-medium">{selected.listing.ownerEmail}</span><PaymentMethodIcons kinds={selected.listing.paymentMethodKinds} /></div>
+                    <div className="flex min-w-0 items-center gap-2 text-sm"><UserRound className="h-4 w-4 text-slate-400" /><span className="min-w-0 break-all font-medium">{selected.listing.ownerEmail}</span></div>
                     <ProviderContactsList contacts={selected.listing.contacts} />
                     <Button variant="outline" onClick={() => void chat.openClientChat(selected.listing.installationId)}><MessageCircle className="h-4 w-4" />{t("marketApproval.openChat")}</Button>
                   </section>

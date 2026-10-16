@@ -163,7 +163,46 @@ pub(crate) fn wallet_purchase_mode_tx(conn: &Connection) -> Result<bool, AppErro
             "platform wallet cutover has not been approved".into(),
         ));
     }
+    if approved && !enabled {
+        return Err(AppError::ServiceUnavailable(
+            "platform wallet cutover cannot return to the legacy payment rail".into(),
+        ));
+    }
     Ok(enabled)
+}
+
+/// A pause fences only new obligations. Call this after checking for an
+/// idempotent replay, so an already committed order can finish activation.
+pub(crate) fn require_new_wallet_orders_open_tx(conn: &Connection) -> Result<(), AppError> {
+    let paused: bool = conn
+        .query_row(
+            "SELECT new_orders_paused FROM market_finance_control WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error("read wallet order pause"))?;
+    if paused {
+        return Err(AppError::ServiceUnavailable(
+            "new platform wallet orders are paused by the Router owner".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn require_new_wallet_withdrawals_open_tx(conn: &Connection) -> Result<(), AppError> {
+    let paused: bool = conn
+        .query_row(
+            "SELECT new_withdrawals_paused FROM market_finance_control WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error("read wallet withdrawal pause"))?;
+    if paused {
+        return Err(AppError::ServiceUnavailable(
+            "new Provider withdrawals are paused by the Router owner".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// An offer's publication rail is immutable until the Provider explicitly
@@ -242,6 +281,7 @@ pub fn router() -> Router<ServerState> {
         )
         .route("/v1/admin/market-finance/topups", get(list_admin_topups))
         .route("/v1/admin/market-finance/mode", put(set_finance_mode))
+        .route("/v1/admin/market-finance/pause", put(set_finance_pause))
         .route(
             "/v1/payment-webhooks/dujiaopay",
             post(dujiaopay_webhook_hint).layer(DefaultBodyLimit::max(64 * 1024)),
@@ -264,6 +304,8 @@ struct ReadinessBlocker {
 struct FinanceReadinessView {
     mode: String,
     version: i64,
+    new_orders_paused: bool,
+    new_withdrawals_paused: bool,
     code_integrated: bool,
     legacy_blockers: Vec<ReadinessBlocker>,
     critical_cases: i64,
@@ -275,11 +317,12 @@ struct FinanceReadinessView {
 }
 
 fn finance_readiness_tx(conn: &Connection) -> Result<FinanceReadinessView, AppError> {
-    let (mode, version): (String, i64) = conn
-        .query_row(
-            "SELECT mode, version FROM market_finance_control WHERE id = 1",
+    let (mode, version, new_orders_paused, new_withdrawals_paused): (String, i64, bool, bool) =
+        conn.query_row(
+            "SELECT mode, version, new_orders_paused, new_withdrawals_paused
+             FROM market_finance_control WHERE id = 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .map_err(db_error("read market finance mode"))?;
     let checks: [(&'static str, &'static str); 15] = [
@@ -424,6 +467,8 @@ fn finance_readiness_tx(conn: &Connection) -> Result<FinanceReadinessView, AppEr
     Ok(FinanceReadinessView {
         mode,
         version,
+        new_orders_paused,
+        new_withdrawals_paused,
         code_integrated: MARKET_WALLET_CUTOVER_IMPLEMENTED,
         legacy_blockers,
         critical_cases,
@@ -463,9 +508,22 @@ fn set_finance_mode_tx(
     if !matches!(request.mode.as_str(), "disabled" | "shadow" | "enabled") {
         return Err(AppError::BadRequest("invalid market finance mode".into()));
     }
+    let (current_mode, was_approved): (String, bool) = conn
+        .query_row(
+            "SELECT mode, cutover_approved_at IS NOT NULL FROM market_finance_control WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(db_error("read market finance mode"))?;
+    if was_approved && (request.mode != "enabled" || current_mode != "enabled") {
+        return Err(AppError::Conflict(
+            "platform wallet cutover is permanent; disable payment channels to pause top-ups"
+                .into(),
+        ));
+    }
     if request.mode == "enabled" {
         let readiness = finance_readiness_tx(conn)?;
-        if readiness.mode != "shadow" || !readiness.can_enable {
+        if !was_approved && (readiness.mode != "shadow" || !readiness.can_enable) {
             return Err(AppError::Conflict(
                 "market wallet cutover gates have not passed".into(),
             ));
@@ -475,7 +533,8 @@ fn set_finance_mode_tx(
         .execute(
             "UPDATE market_finance_control SET mode = ?2, version = version + 1,
                 updated_at = ?3,
-                cutover_approved_at = CASE WHEN ?2 = 'enabled' THEN ?3 ELSE NULL END
+                cutover_approved_at = CASE WHEN ?2 = 'enabled'
+                    THEN COALESCE(cutover_approved_at, ?3) ELSE NULL END
              WHERE id = 1 AND version = ?1",
             params![request.expected_version, request.mode, changed_at],
         )
@@ -511,6 +570,84 @@ async fn set_finance_mode(
     Ok((
         no_store(),
         Json(serde_json::json!({ "mode": request.mode })),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FinancePauseRequest {
+    new_orders_paused: bool,
+    new_withdrawals_paused: bool,
+    expected_version: i64,
+}
+
+fn set_finance_pause_tx(
+    conn: &Connection,
+    request: &FinancePauseRequest,
+    changed_at: &str,
+) -> Result<(), AppError> {
+    let changed = conn
+        .execute(
+            "UPDATE market_finance_control
+             SET new_orders_paused = ?2, new_withdrawals_paused = ?3,
+                 version = version + 1, updated_at = ?4
+             WHERE id = 1 AND version = ?1 AND mode = 'enabled'
+               AND cutover_approved_at IS NOT NULL",
+            params![
+                request.expected_version,
+                request.new_orders_paused,
+                request.new_withdrawals_paused,
+                changed_at
+            ],
+        )
+        .map_err(db_error("update finance pause"))?;
+    if changed != 1 {
+        return Err(AppError::Conflict(
+            "finance pause requires an enabled wallet and current version".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn set_finance_pause(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<FinancePauseRequest>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let session = crate::api::require_admin_session(&state, &headers).await?;
+    let conn = state.store.conn.lock().await;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_error("begin finance pause update"))?;
+    let changed_at = now();
+    set_finance_pause_tx(&tx, &request, &changed_at)?;
+    audit_tx(
+        &tx,
+        &session.user_id,
+        "finance_pause_changed",
+        "finance_control",
+        "1",
+        Some(
+            if request.new_orders_paused && request.new_withdrawals_paused {
+                "orders_and_withdrawals_paused"
+            } else if request.new_orders_paused {
+                "orders_paused"
+            } else if request.new_withdrawals_paused {
+                "withdrawals_paused"
+            } else {
+                "resumed"
+            },
+        ),
+        &changed_at,
+    )?;
+    tx.commit()
+        .map_err(db_error("commit finance pause update"))?;
+    Ok((
+        no_store(),
+        Json(serde_json::json!({
+            "newOrdersPaused": request.new_orders_paused,
+            "newWithdrawalsPaused": request.new_withdrawals_paused,
+        })),
     ))
 }
 
@@ -3286,7 +3423,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_cutover_requires_live_gates_and_revokes_approval_when_disabled() {
+    fn owner_cutover_requires_live_gates_and_never_reopens_legacy_money() {
         let conn = memory();
         let enable = ModeRequest {
             mode: "enabled".into(),
@@ -3325,15 +3462,17 @@ mod tests {
         set_finance_mode_tx(&conn, &enable, "2026-10-16T00:00:00Z").unwrap();
         assert!(wallet_purchase_mode_tx(&conn).unwrap());
 
-        set_finance_mode_tx(
-            &conn,
-            &ModeRequest {
-                mode: "disabled".into(),
-                expected_version: 3,
-            },
-            "2026-10-16T01:00:00Z",
-        )
-        .unwrap();
+        assert!(matches!(
+            set_finance_mode_tx(
+                &conn,
+                &ModeRequest {
+                    mode: "disabled".into(),
+                    expected_version: 3,
+                },
+                "2026-10-16T01:00:00Z",
+            ),
+            Err(AppError::Conflict(_))
+        ));
         let approved: Option<String> = conn
             .query_row(
                 "SELECT cutover_approved_at FROM market_finance_control WHERE id = 1",
@@ -3341,14 +3480,62 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(approved.is_none());
-        assert!(!wallet_purchase_mode_tx(&conn).unwrap());
+        assert_eq!(approved.as_deref(), Some("2026-10-16T00:00:00Z"));
+        assert!(wallet_purchase_mode_tx(&conn).unwrap());
         conn.execute(
-            "UPDATE market_finance_control SET mode = 'enabled' WHERE id = 1",
+            "UPDATE market_finance_control SET mode = 'disabled' WHERE id = 1",
             [],
         )
         .unwrap();
-        assert!(wallet_purchase_mode_tx(&conn).is_err());
+        assert!(matches!(
+            wallet_purchase_mode_tx(&conn),
+            Err(AppError::ServiceUnavailable(_))
+        ));
+    }
+
+    #[test]
+    fn owner_can_pause_new_wallet_obligations_without_changing_the_funding_rail() {
+        let conn = memory();
+        let at = "2026-10-16T00:00:00Z";
+        conn.execute(
+            "UPDATE market_finance_control
+             SET mode = 'enabled', cutover_approved_at = ?1 WHERE id = 1",
+            params![at],
+        )
+        .unwrap();
+        let request = FinancePauseRequest {
+            new_orders_paused: true,
+            new_withdrawals_paused: true,
+            expected_version: 1,
+        };
+        set_finance_pause_tx(&conn, &request, at).unwrap();
+        assert!(wallet_purchase_mode_tx(&conn).unwrap());
+        assert!(finance_readiness_tx(&conn).unwrap().new_orders_paused);
+        assert!(finance_readiness_tx(&conn).unwrap().new_withdrawals_paused);
+        assert!(matches!(
+            require_new_wallet_orders_open_tx(&conn),
+            Err(AppError::ServiceUnavailable(_))
+        ));
+        assert!(matches!(
+            require_new_wallet_withdrawals_open_tx(&conn),
+            Err(AppError::ServiceUnavailable(_))
+        ));
+        assert!(matches!(
+            set_finance_pause_tx(&conn, &request, at),
+            Err(AppError::Conflict(_))
+        ));
+        set_finance_pause_tx(
+            &conn,
+            &FinancePauseRequest {
+                new_orders_paused: false,
+                new_withdrawals_paused: false,
+                expected_version: 2,
+            },
+            at,
+        )
+        .unwrap();
+        require_new_wallet_orders_open_tx(&conn).unwrap();
+        require_new_wallet_withdrawals_open_tx(&conn).unwrap();
     }
 
     #[test]

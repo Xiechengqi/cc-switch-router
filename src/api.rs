@@ -296,6 +296,7 @@ pub fn router(state: ServerState) -> Router {
         .merge(legacy_finance_routes)
         .merge(crate::market_payments::router())
         .merge(crate::market_payouts::router())
+        .merge(crate::market_platform_contracts::router())
         .merge(crate::market_service_disputes::router())
         .merge(crate::market_providers::router())
         .merge(crate::client_logs::router())
@@ -659,6 +660,7 @@ fn is_retired_legacy_finance_write(method: &Method, path: &str) -> bool {
     !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
         && (path.starts_with("/v1/market-billing/")
             || path.starts_with("/v1/account/binance-auto-settlement")
+            || path == "/v1/account/payment-profile"
             || (path.starts_with("/v1/market-access/")
                 && (path.contains("/credit-lines")
                     || path.starts_with("/v1/market-access/public-credit-lines/"))))
@@ -675,13 +677,14 @@ async fn retired_legacy_finance_write_middleware(
         let mode = {
             let conn = state.store.conn.lock().await;
             conn.query_row(
-                "SELECT mode FROM market_finance_control WHERE id = 1",
+                "SELECT mode = 'enabled' OR cutover_approved_at IS NOT NULL
+                 FROM market_finance_control WHERE id = 1",
                 [],
-                |row| row.get::<_, String>(0),
+                |row| row.get::<_, bool>(0),
             )
         };
         match mode {
-            Ok(mode) if mode == "enabled" => {
+            Ok(true) => {
                 let mut response = AppError::Gone(
                     "legacy Provider-funded payment writes are retired; use the platform wallet"
                         .into(),
@@ -3927,6 +3930,7 @@ mod tests {
             "/v1/market-billing/funding-intents",
             "/v1/market-billing/recurring-contracts/contract/reserve-next",
             "/v1/account/binance-auto-settlement/enable",
+            "/v1/account/payment-profile",
             "/v1/market-access/counterparties/party/credit-lines/USD",
             "/v1/market-access/public-credit-lines/USD",
         ] {
@@ -3946,6 +3950,10 @@ mod tests {
         assert!(!is_retired_legacy_finance_write(
             &Method::POST,
             "/v1/market-wallet/topups"
+        ));
+        assert!(!is_retired_legacy_finance_write(
+            &Method::PUT,
+            "/v1/account/payment-contacts"
         ));
     }
 

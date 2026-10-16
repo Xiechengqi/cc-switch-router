@@ -20,6 +20,7 @@ import {
   getMarketFinanceReadiness,
   getMarketPaymentChannels,
   setMarketFinanceMode,
+  setMarketFinancePause,
   setMarketPaymentChannelEnabled,
   setMarketPaymentChannelArchived,
   updateMarketPaymentChannelDetails,
@@ -233,7 +234,7 @@ export function MarketPaymentChannelsPanel() {
               </span>
             </div>
             <div className="flex flex-wrap gap-2">
-              {readiness.mode !== "disabled" ? (
+              {readiness.mode === "shadow" ? (
                 <Button size="sm" variant="outline" isDisabled={!!busy} onPress={() => void perform("mode", () => setMarketFinanceMode("disabled", readiness.version))}>
                   {t("settings.marketFinance.disable")}
                 </Button>
@@ -256,7 +257,32 @@ export function MarketPaymentChannelsPanel() {
             <p>{t("settings.marketFinance.channelBlockers", { count: readiness.paymentChannelBlockers.length })}</p>
             <p>{t("settings.marketFinance.criticalCases", { count: readiness.criticalCases })}</p>
           </div>
-          {!readiness.canEnable ? (
+          {readiness.mode === "enabled" ? (
+            <div className="grid gap-3 rounded-md border border-border p-3 sm:grid-cols-2">
+              <div className="flex items-center justify-between gap-3">
+                <span className="flex flex-wrap items-center gap-2 text-sm">{t("settings.marketFinance.newOrders")}
+                  <span className={readiness.newOrdersPaused ? "rounded-full bg-amber-100 px-2 py-0.5 text-xs text-amber-900" : "rounded-full bg-emerald-100 px-2 py-0.5 text-xs text-emerald-900"}>
+                    {t(readiness.newOrdersPaused ? "settings.marketFinance.statusPaused" : "settings.marketFinance.statusOpen")}
+                  </span>
+                </span>
+                <Button size="sm" variant="outline" isDisabled={!!busy} onPress={() => void perform("pause-orders", () => setMarketFinancePause(!readiness.newOrdersPaused, readiness.newWithdrawalsPaused, readiness.version))}>
+                  {t(readiness.newOrdersPaused ? "settings.marketFinance.resume" : "settings.marketFinance.pause")}
+                </Button>
+              </div>
+              <div className="flex items-center justify-between gap-3">
+                <span className="flex flex-wrap items-center gap-2 text-sm">{t("settings.marketFinance.newWithdrawals")}
+                  <span className={readiness.newWithdrawalsPaused ? "rounded-full bg-amber-100 px-2 py-0.5 text-xs text-amber-900" : "rounded-full bg-emerald-100 px-2 py-0.5 text-xs text-emerald-900"}>
+                    {t(readiness.newWithdrawalsPaused ? "settings.marketFinance.statusPaused" : "settings.marketFinance.statusOpen")}
+                  </span>
+                </span>
+                <Button size="sm" variant="outline" isDisabled={!!busy} onPress={() => void perform("pause-withdrawals", () => setMarketFinancePause(readiness.newOrdersPaused, !readiness.newWithdrawalsPaused, readiness.version))}>
+                  {t(readiness.newWithdrawalsPaused ? "settings.marketFinance.resume" : "settings.marketFinance.pause")}
+                </Button>
+              </div>
+              <p className="text-xs text-muted-foreground sm:col-span-2">{t("settings.marketFinance.pauseNote")}</p>
+            </div>
+          ) : null}
+          {readiness.mode !== "enabled" && !readiness.canEnable ? (
             <div className="grid gap-1 text-sm text-muted-foreground">
               <p className="flex items-start gap-2">
               <AlertTriangle className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
@@ -412,7 +438,7 @@ export function MarketPaymentChannelsPanel() {
           <p className="text-xs text-muted-foreground">{t("settings.marketFinance.caseNote")}</p>
         </div>
       ) : null}
-      <MarketFinanceTransfersPanel financeMode={readiness?.mode ?? "disabled"} />
+      <MarketFinanceTransfersPanel financeMode={readiness?.mode ?? "disabled"} withdrawalsPaused={readiness?.newWithdrawalsPaused ?? false} />
       <MarketFinanceDisputesPanel />
     </section>
   );

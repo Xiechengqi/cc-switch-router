@@ -1,5 +1,5 @@
-import { AccountPaymentsPanel } from "@/components/dashboard/account-page";
+import { AccountPaymentsGate } from "@/components/dashboard/account-contact-panel";
 
 export default function Page() {
-  return <AccountPaymentsPanel />;
+  return <AccountPaymentsGate />;
 }

@@ -7,7 +7,7 @@ import { SegmentedControl } from "@/components/common/segmented-control";
 import { usePaidOfferReadiness } from "@/components/dashboard/share-market/paid-offer-readiness";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { updateClientMarketHostOffer } from "@/lib/api";
-import { DASHBOARD_ACCOUNT_BILLING_PATH, DASHBOARD_ACCOUNT_PAYMENTS_PATH } from "@/lib/dashboard-nav";
+import { DASHBOARD_ACCOUNT_BILLING_PATH, DASHBOARD_ACCOUNT_PAYMENTS_PATH, DASHBOARD_ACCOUNT_WALLET_PATH } from "@/lib/dashboard-nav";
 import { MARKET_CURRENCY } from "@/lib/market-money";
 import type { ClientMarketHost } from "@/lib/types";
 import {
@@ -136,11 +136,16 @@ export function HostOfferDialog({
             ) : null}
             {pricing === "paid" && paidReadiness.status === "loaded" && !paidOfferReady ? (
               <div role="alert" className="grid gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-3 text-sm text-amber-950">
-                <p>{t("clientMarket.offerRequiresBilling")}</p>
-                <div className="flex flex-wrap gap-3">
-                  {!paidReadiness.settlementReady ? <a href={`${DASHBOARD_ACCOUNT_BILLING_PATH}?tab=receivables`} className="whitespace-nowrap font-medium text-foreground underline underline-offset-2">{t("clientMarket.goToBilling")}</a> : null}
-                  {!paidReadiness.paymentReady ? <a href={DASHBOARD_ACCOUNT_PAYMENTS_PATH} className="whitespace-nowrap font-medium text-foreground underline underline-offset-2">{t("clientMarket.goToAccountPayment")}</a> : null}
-                </div>
+                {paidReadiness.rail === "wallet" ? <>
+                  <p>{t(`shareMarket.paidReadiness.wallet.${paidReadiness.walletSetup || "destination"}`)}</p>
+                  <a href={DASHBOARD_ACCOUNT_WALLET_PATH} className="whitespace-nowrap font-medium text-foreground underline underline-offset-2">{t("shareMarket.paidReadiness.goWallet")}</a>
+                </> : <>
+                  <p>{t("clientMarket.offerRequiresBilling")}</p>
+                  <div className="flex flex-wrap gap-3">
+                    {!paidReadiness.settlementReady ? <a href={`${DASHBOARD_ACCOUNT_BILLING_PATH}?tab=receivables`} className="whitespace-nowrap font-medium text-foreground underline underline-offset-2">{t("clientMarket.goToBilling")}</a> : null}
+                    {!paidReadiness.paymentReady ? <a href={DASHBOARD_ACCOUNT_PAYMENTS_PATH} className="whitespace-nowrap font-medium text-foreground underline underline-offset-2">{t("clientMarket.goToAccountPayment")}</a> : null}
+                  </div>
+                </>}
               </div>
             ) : null}
             <SegmentedControl

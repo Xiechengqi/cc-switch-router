@@ -306,8 +306,8 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
           />
           {!channels.length ? <p className="text-xs text-muted-foreground">{t("marketWallet.noChannelHelp")}</p> : null}
         </form> : <div className="grid content-start gap-3 rounded-lg bg-muted/50 p-4 text-sm text-muted-foreground">
-          <p>{t("marketWallet.notOpen")}</p>
-          <Link href={DASHBOARD_ACCOUNT_BILLING_PATH} className="font-medium text-foreground underline underline-offset-2">{t("marketWallet.legacyBilling")}</Link>
+          <p>{t(wallet.mode === "enabled" ? "marketWallet.topupUnavailable" : "marketWallet.notOpen")}</p>
+          {wallet.mode !== "enabled" ? <Link href={DASHBOARD_ACCOUNT_BILLING_PATH} className="font-medium text-foreground underline underline-offset-2">{t("marketWallet.legacyBilling")}</Link> : null}
         </div>}
       </section>
 

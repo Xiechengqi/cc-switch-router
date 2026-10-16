@@ -20,7 +20,7 @@ import { formatWalletUnits } from "@/lib/market-wallet-money";
 type TransferKind = "withdrawals" | "refunds";
 type Selection = { kind: TransferKind; transfer: MarketFinanceTransfer };
 
-export function MarketFinanceTransfersPanel({ financeMode }: { financeMode: "disabled" | "shadow" | "enabled" }) {
+export function MarketFinanceTransfersPanel({ financeMode, withdrawalsPaused = false }: { financeMode: "disabled" | "shadow" | "enabled"; withdrawalsPaused?: boolean }) {
   const { locale, t } = useLocaleText();
   const [withdrawals, setWithdrawals] = React.useState<MarketFinanceTransfer[]>([]);
   const [refunds, setRefunds] = React.useState<MarketFinanceTransfer[]>([]);
@@ -54,7 +54,7 @@ export function MarketFinanceTransfersPanel({ financeMode }: { financeMode: "dis
   }, []);
 
   const open = (kind: TransferKind, transfer: MarketFinanceTransfer) => {
-    const first = marketFinanceActionsForMode(transfer.status, kind, financeMode)[0];
+    const first = marketFinanceActionsForMode(transfer.status, kind, financeMode, withdrawalsPaused)[0];
     if (!first) return;
     setSelection({ kind, transfer });
     setAction(first);
@@ -70,7 +70,7 @@ export function MarketFinanceTransfersPanel({ financeMode }: { financeMode: "dis
   const amountMinor = selection ? exactTransferMinor(selection.transfer.amountUnits) : null;
   const referenceReady = action !== "mark_paid" || validTronTransactionId(reference);
   const canSubmit = !!selection && !busy && amountMinor != null
-    && marketFinanceActionsForMode(selection.transfer.status, selection.kind, financeMode).includes(action)
+    && marketFinanceActionsForMode(selection.transfer.status, selection.kind, financeMode, withdrawalsPaused).includes(action)
     && reasonReady && referenceReady && (!needsAttestation || confirmed);
 
   const submit = async (event: React.FormEvent<HTMLFormElement>) => {
@@ -107,7 +107,7 @@ export function MarketFinanceTransfersPanel({ financeMode }: { financeMode: "dis
         <span className="text-xs text-muted-foreground">{t(`marketProviderFinance.status.${item.status}` as Parameters<typeof t>[0])}</span>
       </div>
       <p className="min-w-0 break-all font-mono text-xs text-muted-foreground">{item.providerUserId ?? item.userId} · {item.address}</p>
-      <Button size="sm" variant="outline" className="min-h-11 justify-self-start whitespace-nowrap" isDisabled={busy || !marketFinanceActionsForMode(item.status, kind, financeMode).length} onPress={() => open(kind, item)}>
+      <Button size="sm" variant="outline" className="min-h-11 justify-self-start whitespace-nowrap" isDisabled={busy || !marketFinanceActionsForMode(item.status, kind, financeMode, withdrawalsPaused).length} onPress={() => open(kind, item)}>
         {t("settings.marketFinance.processTransfer")}
       </Button>
     </li>)}</ul> : <p className="text-sm text-muted-foreground">{t("settings.marketFinance.noPendingTransfers")}</p>}
@@ -143,7 +143,7 @@ export function MarketFinanceTransfersPanel({ financeMode }: { financeMode: "dis
                   <span>{t("settings.marketFinance.transferAction")}</span>
                   <select value={action} onChange={(event) => { setAction(event.target.value as MarketFinanceTransferAction); setConfirmed(false); }}
                     className="h-11 min-w-0 rounded-md border border-input bg-background px-3 focus-visible:outline-2 focus-visible:outline-ring">
-                    {marketFinanceActionsForMode(selection.transfer.status, selection.kind, financeMode).map((choice) => <option key={choice} value={choice}>{t(`settings.marketFinance.transferAction.${choice}`)}</option>)}
+                    {marketFinanceActionsForMode(selection.transfer.status, selection.kind, financeMode, withdrawalsPaused).map((choice) => <option key={choice} value={choice}>{t(`settings.marketFinance.transferAction.${choice}`)}</option>)}
                   </select>
                 </label>
                 {action === "mark_paid" ? <label className="grid gap-1">

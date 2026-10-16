@@ -7,7 +7,6 @@ import { Check, Clock3, Copy, Dices, Loader2, LogIn, Minus, Plus, RotateCcw, Ser
 import { useAuth } from "@/components/auth/auth-provider";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
 import { CountryFlag } from "@/components/common/country-flag";
-import { PaymentMethodIcons } from "@/components/common/payment-method-icons";
 import { SegmentedControl } from "@/components/common/segmented-control";
 import { marketEligibilityFromError } from "@/components/common/seller-approval-dialog";
 import { buildClientInstallCommand } from "@/components/dashboard/install-guide-dialog";
@@ -759,7 +758,7 @@ export function CreateClientDialog({
                 {fixedHost ? (
                   <section className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-2 rounded-md border p-3">
                     <div className="flex flex-wrap items-center gap-2"><Server className="h-4 w-4" /><strong className="text-sm">{fixedHost.hostname || fixedHost.ip}</strong><Chip size="sm" variant="soft">{fixedHost.countryCode || "-"}</Chip></div>
-                    <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-2 text-xs text-muted-foreground"><span className="min-w-0 truncate" title={fixedHost.hostOwnerEmail}>{fixedHost.hostOwnerEmail}</span><span className="font-medium text-foreground">{formatOffer(fixedHost.dailyRateMinor, locale, fixedHost.currency, fixedHost.freeDurationDays, fixedHost.cyclePriceMinor)}</span><PaymentMethodIcons kinds={fixedHost.paymentMethodKinds || []} className="col-span-2" /></div>
+                    <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-2 text-xs text-muted-foreground"><span className="min-w-0 truncate" title={fixedHost.hostOwnerEmail}>{fixedHost.hostOwnerEmail}</span><span className="font-medium text-foreground">{formatOffer(fixedHost.dailyRateMinor, locale, fixedHost.currency, fixedHost.freeDurationDays, fixedHost.cyclePriceMinor)}</span></div>
                   </section>
                 ) : (
                   <>

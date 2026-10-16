@@ -7,6 +7,7 @@ import * as React from "react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getMarketAccessInboxSummary } from "@/lib/api";
+import { getMarketWallet } from "@/lib/market-wallet-api";
 import {
   accountNavHrefFromPathname,
   DASHBOARD_ACCOUNT_API_KEYS_PATH,
@@ -151,8 +152,24 @@ export function AccountShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname() || DASHBOARD_ACCOUNT_API_KEYS_PATH;
   const router = useRouter();
   const [pendingAccessRequests, setPendingAccessRequests] = React.useState(0);
+  const [walletMode, setWalletMode] = React.useState<string | null>(null);
   const authed = !!session?.authenticated;
+  const actor = session?.user?.id || session?.user?.email || "anonymous";
   const activeItem = NAV_ITEMS.find((item) => item.match(pathname));
+  const visibleNavItems = NAV_ITEMS.filter((item) => item.id !== "billing" || walletMode === "disabled" || walletMode === "shadow");
+
+  React.useEffect(() => {
+    if (!authed) {
+      setWalletMode(null);
+      return;
+    }
+    let active = true;
+    setWalletMode(null);
+    void getMarketWallet().then((wallet) => {
+      if (active) setWalletMode(wallet.mode);
+    }).catch(() => { if (active) setWalletMode(null); });
+    return () => { active = false; };
+  }, [actor, authed, pathname]);
 
   React.useEffect(() => {
     if (isAccountIndexPath(pathname)) {
@@ -187,12 +204,12 @@ export function AccountShell({ children }: { children: React.ReactNode }) {
         className="min-w-0 md:sticky md:top-4 md:self-start"
       >
         <div className="flex gap-1 overflow-x-auto rounded-lg bg-slate-100/90 p-1 ring-1 ring-inset ring-slate-200/80 md:grid md:grid-cols-1 md:overflow-visible">
-          {NAV_ITEMS.map((item, index) => {
+          {visibleNavItems.map((item, index) => {
             const active = item.match(pathname);
             const Icon = item.icon;
             return (
               <React.Fragment key={item.id}>
-                {index === 0 || NAV_ITEMS[index - 1].groupLabelKey !== item.groupLabelKey ? (
+                {index === 0 || visibleNavItems[index - 1].groupLabelKey !== item.groupLabelKey ? (
                   <div className="hidden px-3 pb-1 pt-3 text-xs font-semibold text-slate-500 first:pt-1 md:block">
                     {t(item.groupLabelKey)}
                   </div>
@@ -209,7 +226,7 @@ export function AccountShell({ children }: { children: React.ReactNode }) {
                   aria-current={active ? "page" : undefined}
                 >
                   <Icon className="h-4 w-4 shrink-0" aria-hidden />
-                  <span className="whitespace-nowrap">{t(item.labelKey)}</span>
+                  <span className="whitespace-nowrap">{item.id === "payments" && walletMode !== "disabled" && walletMode !== "shadow" ? t("account.nav.contacts") : t(item.labelKey)}</span>
                   {(item.id === "market-readiness" || item.id === "market-access") && pendingAccessRequests > 0 ? (
                     <span className="inline-flex min-w-5 items-center justify-center rounded-full bg-rose-100 px-1.5 text-[10px] font-semibold text-rose-700">
                       {pendingAccessRequests > 99 ? "99+" : pendingAccessRequests}

@@ -698,40 +698,9 @@ export function normalizeOwnerFilters(value: unknown): string[] {
 }
 
 export const REGION_FILTER_KEY = "cc_switch_router_client_market_region_filter_v1";
-export const PAYMENT_FILTER_KEY = "cc_switch_router_client_market_payment_filter_v1";
 export const STATUS_FILTER_KEY = "cc_switch_router_client_market_status_filter_v3";
 export const SORT_PREFS_KEY = "cc_switch_router_client_market_sort_v2";
 export const HOST_PAGE_SIZE = 10;
-
-export const PAYMENT_FILTER_KINDS = ["alipay", "wechat", "binance", "crypto", "custom"] as const;
-
-export function paymentKindLabelKey(kind: string): MessageKey {
-  switch (kind) {
-    case "alipay":
-      return "billing.payment.alipay";
-    case "wechat":
-      return "billing.payment.wechat";
-    case "binance":
-      return "billing.payment.binance";
-    case "crypto":
-      return "billing.payment.crypto";
-    case "custom":
-      return "billing.payment.custom";
-    default:
-      return "billing.payment.custom";
-  }
-}
-
-export function hostSupportsPaymentKind(hostKinds: string[] | undefined, required: string): boolean {
-  const kinds = new Set((hostKinds || []).map((kind) => kind.toLowerCase()));
-  if (required === "crypto") {
-    return kinds.has("crypto") || kinds.has("usdt") || kinds.has("usdc");
-  }
-  if (required === "usdt" || required === "usdc") {
-    return kinds.has(required) || kinds.has("crypto");
-  }
-  return kinds.has(required);
-}
 
 /** Compact page list: 1 … 4 5 6 … 12 */
 export function buildHostPageItems(current: number, total: number): Array<number | "ellipsis"> {

@@ -101,6 +101,12 @@ pub struct UpdatePaymentProfileRequest {
     pub contacts: Option<Vec<PaymentContact>>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UpdatePaymentContactsRequest {
+    contacts: Vec<PaymentContact>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderSummary {
@@ -456,6 +462,7 @@ pub fn router() -> Router<ServerState> {
             "/v1/account/payment-profile",
             get(get_payment_profile).put(update_payment_profile),
         )
+        .route("/v1/account/payment-contacts", put(update_payment_contacts))
         .route("/v1/account/payment-assets/:id", get(get_payment_asset))
         .route("/v1/client-market/providers", get(get_provider_supply))
         .route("/v1/client-market/providers/:id", get(get_provider))
@@ -1171,6 +1178,21 @@ async fn update_payment_profile(
         state
             .store
             .client_market_update_payment_profile(&session, &methods, contacts.as_deref())
+            .await?,
+    ))
+}
+
+async fn update_payment_contacts(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<UpdatePaymentContactsRequest>,
+) -> Result<Json<PaymentProfileView>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    let contacts = normalize_payment_contacts(input.contacts)?;
+    Ok(Json(
+        state
+            .store
+            .client_market_update_payment_contacts(&session, &contacts)
             .await?,
     ))
 }
@@ -2238,6 +2260,32 @@ impl AppStore {
         })
     }
 
+    pub async fn client_market_update_payment_contacts(
+        &self,
+        session: &AuthSession,
+        contacts: &[PaymentContact],
+    ) -> Result<PaymentProfileView, AppError> {
+        let email = normalize_email(&session.email)?;
+        let now = Utc::now().to_rfc3339();
+        let contacts_json = serde_json::to_string(contacts).map_err(|error| {
+            AppError::Internal(format!("encode payment contacts failed: {error}"))
+        })?;
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO account_payment_profiles (user_id, owner_email, methods_json, contacts_json, updated_at)
+             VALUES (?1, ?2, '[]', ?3, ?4)
+             ON CONFLICT(user_id) DO UPDATE SET
+                owner_email = excluded.owner_email,
+                contacts_json = excluded.contacts_json,
+                updated_at = excluded.updated_at",
+            params![session.user_id, email, contacts_json, now],
+        )
+        .map_err(|error| AppError::Internal(format!("save payment contacts failed: {error}")))?;
+        drop(conn);
+        self.client_market_payment_profile(&session.user_id, &session.email)
+            .await
+    }
+
     pub async fn client_market_update_payment_profile(
         &self,
         session: &AuthSession,
@@ -2250,6 +2298,11 @@ impl AppStore {
         let tx = conn.transaction().map_err(|error| {
             AppError::Internal(format!("begin payment profile update failed: {error}"))
         })?;
+        if crate::market_payments::wallet_purchase_mode_tx(&tx)? {
+            return Err(AppError::Gone(
+                "direct Provider payment methods are retired; use the platform wallet".into(),
+            ));
+        }
         let canonical_binance_uid = tx
             .query_row(
                 "SELECT binance_uid FROM binance_payment_accounts
@@ -6500,6 +6553,38 @@ mod tests {
         let error = require_payment_profile_for_offer(&conn, "missing-provider")
             .expect_err("missing payment profile must block a paid Host offer");
         assert_eq!(error.code(), Some(ERROR_MARKET_PAYMENT_PROFILE_REQUIRED));
+    }
+
+    #[tokio::test]
+    async fn wallet_contacts_can_change_without_rewriting_legacy_payment_methods() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let supplier = session("contact-provider", "contact@example.com");
+        store
+            .client_market_update_payment_profile(&supplier, &[custom_payment_method()], None)
+            .await
+            .expect("save legacy method before cutover");
+        store.conn.lock().await.execute(
+            "UPDATE market_finance_control SET mode = 'enabled', cutover_approved_at = '2026-10-16T00:00:00Z' WHERE id = 1",
+            [],
+        ).unwrap();
+        let updated = store
+            .client_market_update_payment_contacts(
+                &supplier,
+                &[PaymentContact {
+                    channel: "telegram".into(),
+                    handle: "@contact".into(),
+                }],
+            )
+            .await
+            .expect("update contacts on wallet rail");
+        assert_eq!(updated.methods, vec![custom_payment_method()]);
+        assert_eq!(updated.contacts[0].handle, "@contact");
+        assert!(matches!(
+            store
+                .client_market_update_payment_profile(&supplier, &[], None)
+                .await,
+            Err(AppError::Gone(_))
+        ));
     }
 
     #[tokio::test]

@@ -10,19 +10,25 @@ import { getAccountPaymentProfile, getMarketBillingDashboard } from "@/lib/api";
 import {
   DASHBOARD_ACCOUNT_BILLING_PATH,
   DASHBOARD_ACCOUNT_PAYMENTS_PATH,
+  DASHBOARD_ACCOUNT_WALLET_PATH,
 } from "@/lib/dashboard-nav";
 import { MARKET_CURRENCY } from "@/lib/market-money";
+import { getMarketProviderFinance, getMarketWallet } from "@/lib/market-wallet-api";
 
 export type PaidOfferReadiness = {
   status: "idle" | "loading" | "loaded" | "error";
   paymentReady: boolean;
   settlementReady: boolean;
+  rail: "legacy" | "wallet" | null;
+  walletSetup: "ready" | "provider" | "destination" | "cooling" | null;
 };
 
 const INITIAL_READINESS: PaidOfferReadiness = {
   status: "idle",
   paymentReady: false,
   settlementReady: false,
+  rail: null,
+  walletSetup: null,
 };
 
 export function usePaidOfferReadiness(enabled: boolean) {
@@ -33,9 +39,25 @@ export function usePaidOfferReadiness(enabled: boolean) {
     const request = ++requestRef.current;
     setReadiness((current) => ({ ...current, status: "loading" }));
     try {
+      const wallet = await getMarketWallet();
+      if (wallet.mode === "enabled") {
+        const finance = await getMarketProviderFinance();
+        if (request !== requestRef.current) return;
+        const walletSetup = !finance.isProvider ? "provider"
+          : !finance.destination ? "destination"
+            : !Number.isFinite(Date.parse(finance.destination.usableAt))
+              || Date.parse(finance.destination.usableAt) > Date.now() ? "cooling" : "ready";
+        setReadiness({
+          status: "loaded",
+          rail: "wallet",
+          walletSetup,
+          paymentReady: true,
+          settlementReady: walletSetup === "ready",
+        });
+        return;
+      }
       const [payment, billing] = await Promise.all([
-        getAccountPaymentProfile(),
-        getMarketBillingDashboard(),
+        getAccountPaymentProfile(), getMarketBillingDashboard(),
       ]);
       if (request !== requestRef.current) return;
       setReadiness({
@@ -44,6 +66,8 @@ export function usePaidOfferReadiness(enabled: boolean) {
         settlementReady: billing.supplierProfiles.some(
           (profile) => profile.currency === MARKET_CURRENCY,
         ),
+        rail: "legacy",
+        walletSetup: null,
       });
     } catch {
       if (request !== requestRef.current) return;
@@ -51,6 +75,8 @@ export function usePaidOfferReadiness(enabled: boolean) {
         status: "error",
         paymentReady: false,
         settlementReady: false,
+        rail: null,
+        walletSetup: null,
       });
     }
   }, []);
@@ -127,6 +153,16 @@ export function PaidOfferReadinessNotice({
         <>
           <CircleCheck className="h-4 w-4 shrink-0" />
           {t("shareMarket.paidReadiness.ready")}
+        </>
+      ) : readiness.rail === "wallet" ? (
+        <>
+          <strong>{t("shareMarket.paidReadiness.title")}</strong>
+          <ReadinessLine ready={false}>
+            {t(`shareMarket.paidReadiness.wallet.${readiness.walletSetup || "destination"}`)}
+          </ReadinessLine>
+          <Link className="whitespace-nowrap font-medium underline underline-offset-2" href={DASHBOARD_ACCOUNT_WALLET_PATH}>
+            {t("shareMarket.paidReadiness.goWallet")}
+          </Link>
         </>
       ) : (
         <>

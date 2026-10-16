@@ -2985,44 +2985,6 @@ export type MarketProviderDetail = MarketProvider & {
   }>;
 };
 
-export type MyMarketProviderFunding = {
-  marketProviderId: string;
-  displayName: string;
-  official: boolean;
-  supplierUserId: string;
-  supplierEmail: string;
-  currency: "USD" | string;
-  shareFunding: MarketFundingSummary;
-  clientFunding: MarketFundingSummary;
-  shareLegacyDailyRateMinor: number;
-  clientLegacyDailyRateMinor: number;
-  recurring: {
-    activeContractCount: number;
-    monthlyCommitmentMinor: number;
-    nextRenewalAt?: string;
-    nextRenewalMinor: number;
-    topupFunding?: MarketRecurringFundingSummary;
-  };
-};
-
-export type MyMarketProviderFundingResponse = {
-  totals: {
-    currency: "USD" | string;
-    providerCount: number;
-    prepaidBalanceMinor: number;
-    prepaidHeldMinor: number;
-    prepaidAvailableMinor: number;
-    creditOutstandingMinor: number;
-    finiteCreditAvailableMinor: number;
-    unlimitedCreditProviderCount: number;
-    legacyDailyRateMinor: number;
-    monthlyCommitmentMinor: number;
-    nextRenewalAt?: string;
-    nextRenewalMinor: number;
-  };
-  providers: MyMarketProviderFunding[];
-};
-
 export type ClientMarketQuoteItem = {
   id: string;
   hostId: string;

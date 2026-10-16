@@ -49,6 +49,7 @@ import {
   usdMinorToCnyMinor,
 } from "@/lib/market-money";
 import { cn } from "@/lib/utils";
+import { getMarketWallet } from "@/lib/market-wallet-api";
 
 type Currency = typeof MARKET_CURRENCY;
 type ScopeKey = `${MarketAccessProductKind}:${MarketAccessPricingKind}`;
@@ -393,6 +394,7 @@ export function AccountMarketAccessPage() {
   const { session, loading: authLoading } = useAuth();
   const authed = !!session?.authenticated;
   const [dashboard, setDashboard] = React.useState<MarketAccessDashboard | null>(null);
+  const [walletMode, setWalletMode] = React.useState(false);
   const [usdCnyRateMicros, setUsdCnyRateMicros] = React.useState(
     DEFAULT_USD_CNY_RATE_MICROS,
   );
@@ -434,12 +436,14 @@ export function AccountMarketAccessPage() {
     if (silent) setRefreshing(true);
     else setLoading(true);
     try {
+      const wallet = await getMarketWallet();
       const [nextDashboard, billingConfig] = await Promise.all([
         getMarketAccessDashboard(),
-        getMarketBillingConfig(),
+        wallet.mode === "enabled" ? Promise.resolve(null) : getMarketBillingConfig(),
       ]);
       setDashboard(nextDashboard);
-      setUsdCnyRateMicros(billingConfig.usdCnyRateMicros);
+      setWalletMode(wallet.mode === "enabled");
+      if (billingConfig) setUsdCnyRateMicros(billingConfig.usdCnyRateMicros);
       setCounterpartyDrafts(buildCounterpartyDrafts(nextDashboard.counterparties));
     } catch (error) {
       toast.danger(error instanceof Error ? error.message : String(error));
@@ -673,11 +677,11 @@ export function AccountMarketAccessPage() {
     const creditLimitMinor = newBuyerCredit.kind === "limited"
       ? parseLimitMinor(newBuyerCredit.limit)
       : undefined;
-    if (paidScopeSelected && newBuyerCredit.kind === "limited" && creditLimitMinor == null) {
+    if (!walletMode && paidScopeSelected && newBuyerCredit.kind === "limited" && creditLimitMinor == null) {
       toast.danger(t("marketAccess.invalidLimit"));
       return;
     }
-    if (paidScopeSelected && newBuyerCredit.kind === "unlimited" && !newBuyerCredit.unlimitedAcknowledged) {
+    if (!walletMode && paidScopeSelected && newBuyerCredit.kind === "unlimited" && !newBuyerCredit.unlimitedAcknowledged) {
       toast.danger(t("marketAccess.unlimitedConfirmRequired"));
       return;
     }
@@ -690,7 +694,7 @@ export function AccountMarketAccessPage() {
             .filter((pricingKind) => allowedScopes[`${productKind}:${pricingKind}`])
             .map((pricingKind) => ({ productKind, pricingKind, decision: "allow" as const })),
         ),
-        creditLines: paidScopeSelected ? [{
+        creditLines: !walletMode && paidScopeSelected ? [{
           currency: MARKET_CURRENCY,
           kind: newBuyerCredit.kind,
           limitMinor: creditLimitMinor ?? undefined,
@@ -792,6 +796,7 @@ export function AccountMarketAccessPage() {
     } | undefined;
     if (
       kind === "approve"
+      && !walletMode
       && request.pricingKind === "paid"
       && request.pricingModel !== "prepaid_calendar_month"
     ) {
@@ -917,7 +922,7 @@ export function AccountMarketAccessPage() {
     if (!dashboard || changedCounterparties.length === 0) return;
     for (const { counterparty, draft, change } of changedCounterparties) {
       if (!draft) continue;
-      for (const currency of change.creditCurrencies) {
+      for (const currency of walletMode ? [] : change.creditCurrencies) {
         const credit = draft.credits[currency];
         if (credit.kind === "limited" && parseLimitMinor(credit.limit) == null) {
           toast.danger(
@@ -955,7 +960,7 @@ export function AccountMarketAccessPage() {
           expectedRevision: counterparty.revision,
           accessRules: change.accessRules,
           status: change.statusChanged ? draft.status : undefined,
-          creditLines: change.creditCurrencies.map((currency) => {
+          creditLines: (walletMode ? [] : change.creditCurrencies).map((currency) => {
             const credit = draft.credits[currency];
             const line = counterpartyCreditLine(counterparty, currency);
             return {
@@ -994,7 +999,7 @@ export function AccountMarketAccessPage() {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="flex items-center gap-2">
           <ShieldCheck className="h-5 w-5 text-muted-foreground" />
-          <h2 className="text-lg font-semibold">{t("marketAccess.title")}</h2>
+          <h2 className="text-lg font-semibold">{t(walletMode ? "marketAccess.walletTitle" : "marketAccess.title")}</h2>
         </div>
         <Button
           isIconOnly
@@ -1007,7 +1012,7 @@ export function AccountMarketAccessPage() {
         </Button>
       </div>
 
-      {publicCreditEnabled ? (
+      {!walletMode && publicCreditEnabled ? (
         <section className="flex gap-3 border-y border-amber-300 bg-amber-50 px-4 py-3 text-amber-950">
           <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0" />
           <div>
@@ -1066,7 +1071,7 @@ export function AccountMarketAccessPage() {
         </div>
       </section>
 
-      {publicCreditEnabled ? (
+      {!walletMode && publicCreditEnabled ? (
         <section className="grid gap-4 border-b border-border pb-5">
           <div>
             <h3 className="text-sm font-semibold">{t("marketAccess.publicCreditTitle")}</h3>
@@ -1126,7 +1131,7 @@ export function AccountMarketAccessPage() {
               {busy === "add" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
               {t("common.add")}
             </Button>
-            {paidScopeSelected ? (
+            {!walletMode && paidScopeSelected ? (
               <section className="grid gap-3 rounded-md border border-sky-200 bg-sky-50/40 p-3 sm:col-span-3 sm:grid-cols-[minmax(12rem,1fr)_minmax(14rem,2fr)] sm:items-start">
                 <div>
                   <strong className="text-sm text-foreground">{t("marketAccess.addCreditTitle")}</strong>
@@ -1236,8 +1241,8 @@ export function AccountMarketAccessPage() {
                         {rowChanged ? <Chip size="sm" variant="soft" className="bg-blue-50 text-blue-700">{t("marketAccess.unsaved")}</Chip> : null}
                       </div>
                       <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
-                        <span>{t("marketAccess.creditSummary", { value: credit?.kind === "limited" && credit.limitMinor != null ? formatUsdCnyMoney(credit.limitMinor, locale, usdMinorToCnyMinor(credit.limitMinor, usdCnyRateMicros)) : credit?.kind === "unlimited" ? t("marketBilling.creditUnlimited") : t("marketBilling.creditNone") })}</span>
-                        {counterparty.exposures.map((exposure) => <span key={exposure.currency}>{t("marketAccess.exposureSummary", { amount: formatUsdCnyMoney(exposure.balanceMinor, locale, usdMinorToCnyMinor(exposure.balanceMinor, usdCnyRateMicros)), count: exposure.activeServiceCount })}</span>)}
+                        {!walletMode ? <span>{t("marketAccess.creditSummary", { value: credit?.kind === "limited" && credit.limitMinor != null ? formatUsdCnyMoney(credit.limitMinor, locale, usdMinorToCnyMinor(credit.limitMinor, usdCnyRateMicros)) : credit?.kind === "unlimited" ? t("marketBilling.creditUnlimited") : t("marketBilling.creditNone") })}</span> : null}
+                        {!walletMode ? counterparty.exposures.map((exposure) => <span key={exposure.currency}>{t("marketAccess.exposureSummary", { amount: formatUsdCnyMoney(exposure.balanceMinor, locale, usdMinorToCnyMinor(exposure.balanceMinor, usdCnyRateMicros)), count: exposure.activeServiceCount })}</span>) : null}
                       </div>
                     </div>
                     <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" />
@@ -1295,7 +1300,7 @@ export function AccountMarketAccessPage() {
                       ))}
                     </div>
 
-                    <div className="grid gap-4 border-t border-border pt-4 md:grid-cols-2">
+                    {!walletMode ? <div className="grid gap-4 border-t border-border pt-4 md:grid-cols-2">
                       <section className="grid gap-2">
                         <strong className="text-sm">USD {t("marketAccess.creditType")}</strong>
                         <CounterpartyCreditCell
@@ -1315,7 +1320,7 @@ export function AccountMarketAccessPage() {
                           </div>
                         )) : <span className="text-sm text-muted-foreground">-</span>}
                       </section>
-                    </div>
+                    </div> : null}
                   </div>
                 </details>
               );
@@ -1376,6 +1381,7 @@ export function AccountMarketAccessPage() {
               ) : null}
 
               {requestAction?.kind === "approve"
+              && !walletMode
               && requestAction.request.pricingKind === "paid"
               && requestAction.request.pricingModel !== "prepaid_calendar_month" ? (
                 <section className="grid gap-3">

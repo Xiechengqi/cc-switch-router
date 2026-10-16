@@ -1,7 +1,7 @@
 "use client";
 
 /* Hallmark · genre: modern-minimal · macrostructure: Workbench · theme: existing router system · enrichment: none · nav: existing app shell · footer: none
- * audience: Router market users · task: compare Provider trust, then open a market or top up · tone: technical
+ * audience: Router market users · task: compare Provider trust, then open a market · tone: technical
  * pre-emit critique: P5 H5 E4 S5 R5 V4
  */
 
@@ -15,43 +15,30 @@ import {
   BadgeCheck,
   BarChart3,
   ChevronRight,
-  CircleDollarSign,
   Gauge,
   Loader2,
   RefreshCw,
   Search,
-  WalletCards,
 } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { SegmentedControl } from "@/components/common/segmented-control";
-import { MarketFundingTopupDialog } from "@/components/dashboard/market-funding-topup-dialog";
 import { MarketWalletShortcut } from "@/components/dashboard/market-wallet-shortcut";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   getMarketProvider,
   getMarketProviders,
-  getMyMarketProviderFunding,
 } from "@/lib/api";
 import { clientMarketHref, shareMarketHref } from "@/lib/dashboard-nav";
-import { marketFundingTopupUnavailableKey } from "@/lib/market-funding";
-import { formatUsdMoney } from "@/lib/market-money";
-import { getMarketWallet, type MarketWallet } from "@/lib/market-wallet-api";
 import type {
-  BinanceFundingIntent,
   MarketProvider,
   MarketProviderDetail,
   MarketProviderList,
-  MyMarketProviderFunding,
-  MyMarketProviderFundingResponse,
 } from "@/lib/types";
 import {
   actorBoundValue,
   filterMarketProviders,
   formatBasisPointScore,
   isFormallyRanked,
-  legacyProviderFundingVisible,
-  preferredProviderTopupFunding,
-  providerCreditSummary,
   type ProviderMarketFilter,
 } from "@/components/dashboard/providers-page-utils";
 
@@ -246,137 +233,6 @@ function LoadingRows() {
         </div>
       ))}
     </div>
-  );
-}
-
-function FundingTotals({ funding }: { funding: MyMarketProviderFundingResponse }) {
-  const { locale, t } = useLocaleText();
-  const totals = funding.totals;
-  const cells = [
-    [t("providers.funding.providerCount"), String(totals.providerCount)],
-    [t("providers.funding.prepaidAvailable"), formatUsdMoney(totals.prepaidAvailableMinor, locale)],
-    [t("providers.funding.prepaidHeld"), formatUsdMoney(totals.prepaidHeldMinor, locale)],
-    [t("providers.funding.finiteCredit"), formatUsdMoney(totals.finiteCreditAvailableMinor, locale)],
-    [t("providers.funding.creditOutstanding"), formatUsdMoney(totals.creditOutstandingMinor, locale)],
-    [t("providers.funding.unlimitedCredit"), String(totals.unlimitedCreditProviderCount)],
-    [t("providers.funding.legacyDailyRate"), formatUsdMoney(totals.legacyDailyRateMinor, locale)],
-    [t("providers.funding.monthlyCommitment"), formatUsdMoney(totals.monthlyCommitmentMinor, locale)],
-    [t("providers.funding.nextRenewal"), totals.nextRenewalAt
-      ? `${formatDate(totals.nextRenewalAt, locale)} · ${formatUsdMoney(totals.nextRenewalMinor, locale)}`
-      : "—"],
-  ] as const;
-  return (
-    <dl className="grid grid-cols-2 gap-x-5 gap-y-4 bg-slate-50 px-4 py-4 sm:grid-cols-3 lg:grid-cols-5">
-      {cells.map(([label, value]) => (
-        <div key={label} className="min-w-0">
-          <dt className="text-[11px] leading-4 text-slate-500">{label}</dt>
-          <dd className="mt-1 truncate font-mono text-sm font-semibold tabular-nums text-slate-950" title={value}>
-            {value}
-          </dd>
-        </div>
-      ))}
-    </dl>
-  );
-}
-
-function creditValue(
-  credit: ReturnType<typeof providerCreditSummary>,
-  locale: string,
-  unlimited: string,
-) {
-  if (credit.kind === "unlimited") return unlimited;
-  if (credit.kind === "none") return "—";
-  return formatUsdMoney(credit.availableMinor, locale);
-}
-
-function FundingRow({
-  provider,
-  onTopup,
-}: {
-  provider: MyMarketProviderFunding;
-  onTopup: (provider: MyMarketProviderFunding) => void;
-}) {
-  const { locale, t } = useLocaleText();
-  const topupFunding = preferredProviderTopupFunding(provider);
-  const credit = providerCreditSummary(provider);
-  return (
-    <article className="grid min-w-0 gap-4 border-t border-slate-100 px-4 py-4 first:border-t-0 lg:grid-cols-[minmax(11rem,0.7fr)_minmax(0,1.6fr)_auto] lg:items-center">
-      <div className="min-w-0">
-        <div className="flex min-w-0 flex-wrap items-center gap-2">
-          <h3 className="min-w-0 break-words text-sm font-semibold text-slate-950">
-            {provider.displayName}
-          </h3>
-          {provider.official ? (
-            <span className="inline-flex h-6 items-center gap-1 whitespace-nowrap rounded-full bg-blue-50 px-2 text-[11px] font-semibold text-blue-700">
-              <BadgeCheck className="h-3.5 w-3.5" aria-hidden="true" />
-              {t("providers.official")}
-            </span>
-          ) : null}
-        </div>
-        <p className="mt-1 truncate text-xs text-slate-500" title={provider.supplierEmail}>
-          {provider.supplierEmail}
-        </p>
-      </div>
-      <dl className="grid min-w-0 grid-cols-2 gap-x-4 gap-y-3 sm:grid-cols-3 xl:grid-cols-6">
-        <div className="min-w-0">
-          <dt className="text-[11px] text-slate-500">{t("providers.funding.prepaidAvailable")}</dt>
-          <dd className="mt-0.5 truncate font-mono text-xs font-semibold tabular-nums">
-            {formatUsdMoney(provider.shareFunding.prepaidAvailableMinor, locale)}
-          </dd>
-        </div>
-        <div className="min-w-0">
-          <dt className="text-[11px] text-slate-500">{t("providers.funding.prepaidHeld")}</dt>
-          <dd className="mt-0.5 truncate font-mono text-xs font-semibold tabular-nums">
-            {formatUsdMoney(provider.shareFunding.prepaidHeldMinor, locale)}
-          </dd>
-        </div>
-        <div className="min-w-0">
-          <dt className="text-[11px] text-slate-500">{t("providers.funding.creditAvailable")}</dt>
-          <dd className="mt-0.5 truncate font-mono text-xs font-semibold tabular-nums">
-            {creditValue(credit, locale, t("common.unlimited"))}
-          </dd>
-        </div>
-        <div className="min-w-0">
-          <dt className="text-[11px] text-slate-500">{t("providers.funding.shareRate")}</dt>
-          <dd className="mt-0.5 truncate font-mono text-xs font-semibold tabular-nums">
-            {formatUsdMoney(provider.shareLegacyDailyRateMinor, locale)}
-          </dd>
-        </div>
-        <div className="min-w-0">
-          <dt className="text-[11px] text-slate-500">{t("providers.funding.clientRate")}</dt>
-          <dd className="mt-0.5 truncate font-mono text-xs font-semibold tabular-nums">
-            {formatUsdMoney(provider.clientLegacyDailyRateMinor, locale)}
-          </dd>
-        </div>
-        <div className="min-w-0">
-          <dt className="text-[11px] text-slate-500">{t("providers.funding.monthlyCommitment")}</dt>
-          <dd className="mt-0.5 truncate font-mono text-xs font-semibold tabular-nums">
-            {formatUsdMoney(provider.recurring.monthlyCommitmentMinor, locale)}
-          </dd>
-        </div>
-      </dl>
-      <div className="grid min-w-0 justify-items-start gap-1 lg:justify-items-end">
-        <Button
-          size="sm"
-          variant="outline"
-          className="min-h-11 shrink-0 whitespace-nowrap"
-          isDisabled={!topupFunding.topupAvailable}
-          aria-describedby={topupFunding.topupAvailable ? undefined : `provider-topup-${provider.marketProviderId}`}
-          onClick={() => onTopup(provider)}
-        >
-          <CircleDollarSign className="h-4 w-4" aria-hidden="true" />
-          {t("providers.funding.topup")}
-        </Button>
-        {!topupFunding.topupAvailable ? (
-          <p
-            id={`provider-topup-${provider.marketProviderId}`}
-            className="max-w-56 text-xs leading-5 text-slate-500 lg:text-right"
-          >
-            {t(marketFundingTopupUnavailableKey(topupFunding.topupUnavailableReason))}
-          </p>
-        ) : null}
-      </div>
-    </article>
   );
 }
 
@@ -619,120 +475,13 @@ function RankingMethodDrawer({
   );
 }
 
-function ProviderFundingDrawer({
-  open,
-  authLoading,
-  authed,
-  funding,
-  loading,
-  error,
-  onClose,
-  onLogin,
-  onReload,
-  onTopup,
-}: {
-  open: boolean;
-  authLoading: boolean;
-  authed: boolean;
-  funding: MyMarketProviderFundingResponse | null;
-  loading: boolean;
-  error: string;
-  onClose: () => void;
-  onLogin: () => void;
-  onReload: () => void;
-  onTopup: (provider: MyMarketProviderFunding) => void;
-}) {
-  const { t } = useLocaleText();
-  return (
-    <Drawer.Backdrop isOpen={open} onOpenChange={(nextOpen) => !nextOpen && onClose()}>
-      <Drawer.Content placement="right">
-        <Drawer.Dialog className="light h-full w-[min(900px,calc(100vw-0.5rem))] max-w-none !bg-white !text-slate-900">
-          <Drawer.CloseTrigger className="!h-11 !w-11 !bg-slate-100 !text-slate-700 hover:!bg-slate-200 active:!bg-slate-300" />
-          <Drawer.Header>
-            <div className="min-w-0 pr-10">
-              <Drawer.Heading className="flex items-center gap-2 text-lg">
-                <WalletCards className="h-4 w-4 text-slate-500" aria-hidden="true" />
-                {t("providers.funding.title")}
-              </Drawer.Heading>
-              <p className="mt-1 max-w-2xl text-xs leading-5 text-slate-500">
-                {t("providers.funding.subtitle")}
-              </p>
-            </div>
-          </Drawer.Header>
-          <Drawer.Body className="grid content-start gap-4 overflow-y-auto pb-8">
-            {authLoading ? (
-              <div className="flex min-h-40 items-center justify-center gap-2 text-sm text-slate-500">
-                <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
-                {t("common.loading")}
-              </div>
-            ) : null}
-
-            {!authLoading && !authed ? (
-              <div className="grid min-h-40 place-items-center gap-4 rounded-xl bg-slate-50 px-5 py-8 text-center">
-                <div className="max-w-md">
-                  <strong className="block text-sm text-slate-950">
-                    {t("providers.funding.loginTitle")}
-                  </strong>
-                  <span className="mt-1 block text-sm leading-6 text-slate-600">
-                    {t("providers.funding.loginPrompt")}
-                  </span>
-                </div>
-                <Button variant="primary" className="min-h-11 whitespace-nowrap" onClick={onLogin}>
-                  {t("providers.funding.loginAction")}
-                </Button>
-              </div>
-            ) : null}
-
-            {authed ? (
-              <div className="min-w-0 overflow-hidden rounded-xl border border-slate-200 bg-white" aria-busy={loading}>
-                {funding ? <FundingTotals funding={funding} /> : null}
-                {loading && !funding ? <LoadingRows /> : null}
-                {error ? (
-                  <div className="grid min-h-32 place-items-center gap-3 px-4 py-8 text-center">
-                    <p role="alert" className="max-w-xl text-sm text-rose-700">{error}</p>
-                    <Button variant="outline" size="sm" className="min-h-11 whitespace-nowrap" onClick={onReload}>
-                      {t("common.retry")}
-                    </Button>
-                  </div>
-                ) : null}
-                {!loading && !error && funding?.providers.length === 0 ? (
-                  <div className="grid min-h-32 place-items-center px-4 py-8 text-center text-sm text-slate-500">
-                    {t("providers.funding.empty")}
-                  </div>
-                ) : null}
-                {funding?.providers.map((provider) => (
-                  <FundingRow key={provider.marketProviderId} provider={provider} onTopup={onTopup} />
-                ))}
-              </div>
-            ) : null}
-
-            {authed && funding ? (
-              <Button
-                variant="ghost"
-                size="sm"
-                className="min-h-11 justify-self-start whitespace-nowrap"
-                isDisabled={loading}
-                onClick={onReload}
-              >
-                {loading ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" /> : <RefreshCw className="h-4 w-4" aria-hidden="true" />}
-                {t("common.reload")}
-              </Button>
-            ) : null}
-          </Drawer.Body>
-        </Drawer.Dialog>
-      </Drawer.Content>
-    </Drawer.Backdrop>
-  );
-}
-
 export function ProvidersPage() {
   const { locale, t } = useLocaleText();
-  const { session, loading: authLoading } = useAuth();
+  const { session } = useAuth();
   const pathname = usePathname();
   const router = useRouter();
   const searchParams = useSearchParams();
   const authed = !!session?.authenticated;
-  const actorKey = session?.user?.id || session?.user?.email || "anonymous";
   const providerId = searchParams.get("provider") || "";
 
   const [providerList, setProviderList] = React.useState<MarketProviderList | null>(null);
@@ -747,45 +496,13 @@ export function ProvidersPage() {
     actorKey: string;
     value: string;
   } | null>(null);
-  const [fundingSnapshot, setFundingSnapshot] = React.useState<{
-    actorKey: string;
-    value: MyMarketProviderFundingResponse;
-  } | null>(null);
-  const [fundingLoading, setFundingLoading] = React.useState(false);
-  const [fundingErrorSnapshot, setFundingErrorSnapshot] = React.useState<{
-    actorKey: string;
-    value: string;
-  } | null>(null);
-  const [fundingOpen, setFundingOpen] = React.useState(false);
-  const [walletSnapshot, setWalletSnapshot] = React.useState<{
-    actorKey: string;
-    value: MarketWallet;
-  } | null>(null);
   const [methodOpen, setMethodOpen] = React.useState(false);
-  const [topupProvider, setTopupProvider] = React.useState<MyMarketProviderFunding | null>(null);
   const [query, setQuery] = React.useState("");
   const [marketFilter, setMarketFilter] = React.useState<ProviderMarketFilter>("all");
   const listAbortRef = React.useRef<AbortController | null>(null);
-  const fundingAbortRef = React.useRef<AbortController | null>(null);
-  // Session effects run after render. Bind private data to the actor in state
-  // as well, so an account switch cannot paint the previous actor's balances
-  // or leave their top-up dialog visible for even one frame.
-  const funding = actorBoundValue(fundingSnapshot, actorKey);
-  const wallet = actorBoundValue(walletSnapshot, actorKey);
-  // The old Provider-scoped money view remains available only while old
-  // obligations are being cleared. It must never offer a parallel top-up
-  // path after the shared wallet becomes the paid Market rail.
-  const legacyFundingVisible = legacyProviderFundingVisible(wallet?.mode);
-  const fundingError = actorBoundValue(fundingErrorSnapshot, actorKey) || "";
   const detail = actorBoundValue(detailSnapshot, providerId);
   const detailError = actorBoundValue(detailErrorSnapshot, providerId) || "";
   const detailLoading = detailLoadingFor === providerId;
-  const visibleTopupProvider = funding && topupProvider
-    && legacyFundingVisible
-    ? funding.providers.find(
-      (provider) => provider.marketProviderId === topupProvider.marketProviderId,
-    ) ?? null
-    : null;
 
   const loadProviders = React.useCallback(async () => {
     listAbortRef.current?.abort();
@@ -808,82 +525,10 @@ export function ProvidersPage() {
     }
   }, []);
 
-  const loadFunding = React.useCallback(async () => {
-    if (!authed || !legacyFundingVisible) return;
-    fundingAbortRef.current?.abort();
-    const controller = new AbortController();
-    fundingAbortRef.current = controller;
-    setFundingLoading(true);
-    setFundingErrorSnapshot(null);
-    try {
-      const next = await getMyMarketProviderFunding(controller.signal);
-      if (!controller.signal.aborted) {
-        setFundingSnapshot({ actorKey, value: next });
-      }
-    } catch (reason) {
-      if (!controller.signal.aborted) {
-        setFundingErrorSnapshot({
-          actorKey,
-          value: reason instanceof Error ? reason.message : String(reason),
-        });
-      }
-    } finally {
-      if (fundingAbortRef.current === controller) {
-        fundingAbortRef.current = null;
-        setFundingLoading(false);
-      }
-    }
-  }, [actorKey, authed, legacyFundingVisible]);
-
-  React.useEffect(() => {
-    if (authLoading || !authed) return;
-    let active = true;
-    let inFlight = false;
-    setWalletSnapshot(null);
-    const refresh = () => {
-      if (inFlight || document.visibilityState !== "visible") return;
-      inFlight = true;
-      void getMarketWallet().then((value) => {
-        if (active) setWalletSnapshot({ actorKey, value });
-      }).catch(() => {
-        // Fail closed if the mode becomes unreadable while this page is open.
-        if (active) setWalletSnapshot(null);
-      }).finally(() => { inFlight = false; });
-    };
-    refresh();
-    const timer = window.setInterval(refresh, 30_000);
-    document.addEventListener("visibilitychange", refresh);
-    return () => {
-      active = false;
-      window.clearInterval(timer);
-      document.removeEventListener("visibilitychange", refresh);
-    };
-  }, [actorKey, authed, authLoading]);
-
   React.useEffect(() => {
     void loadProviders();
     return () => listAbortRef.current?.abort();
   }, [loadProviders]);
-
-  React.useEffect(() => {
-    if (authLoading) return;
-    // Never leave one authenticated actor's balances visible while another
-    // actor's private request is in flight. Funding loads lazily when opened.
-    fundingAbortRef.current?.abort();
-    fundingAbortRef.current = null;
-    setFundingSnapshot(null);
-    setFundingErrorSnapshot(null);
-    setFundingLoading(false);
-    setTopupProvider(null);
-    return () => fundingAbortRef.current?.abort();
-  }, [actorKey, authed, authLoading]);
-
-  React.useEffect(() => {
-    if (!fundingOpen || authLoading || !authed || !legacyFundingVisible || funding || fundingLoading || fundingError) {
-      return;
-    }
-    void loadFunding();
-  }, [authed, authLoading, legacyFundingVisible, funding, fundingError, fundingLoading, fundingOpen, loadFunding]);
 
   React.useEffect(() => {
     if (!providerId) {
@@ -939,21 +584,6 @@ export function ProvidersPage() {
     setMarketFilter("all");
   };
 
-  const openLogin = () => window.dispatchEvent(new Event("router-open-login"));
-  const handleCredited = async (_intent: BinanceFundingIntent) => {
-    setTopupProvider(null);
-    await loadFunding();
-    setFundingOpen(true);
-  };
-  const handleTopup = (provider: MyMarketProviderFunding) => {
-    setTopupProvider(provider);
-    setFundingOpen(false);
-  };
-  const closeTopup = () => {
-    setTopupProvider(null);
-    setFundingOpen(true);
-  };
-
   return (
     <main className="mx-auto grid w-[calc(100%-2rem)] min-w-0 max-w-7xl gap-8 pb-12">
       <header className="grid min-w-0 gap-4 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
@@ -966,15 +596,6 @@ export function ProvidersPage() {
           </p>
         </div>
         <div className="flex min-w-0 flex-wrap items-center gap-2 sm:justify-end">
-          {legacyFundingVisible ? <Button
-            variant="outline"
-            size="sm"
-            className="min-h-11 whitespace-nowrap"
-            onClick={() => setFundingOpen(true)}
-          >
-            <WalletCards className="h-4 w-4" aria-hidden="true" />
-            {t("providers.funding.title")}
-          </Button> : null}
           <Button
             variant="ghost"
             size="sm"
@@ -1101,25 +722,6 @@ export function ProvidersPage() {
         onClose={() => setMethodOpen(false)}
       />
 
-      <ProviderFundingDrawer
-        open={legacyFundingVisible && fundingOpen}
-        authLoading={authLoading}
-        authed={authed}
-        funding={funding}
-        loading={fundingLoading}
-        error={fundingError}
-        onClose={() => setFundingOpen(false)}
-        onLogin={openLogin}
-        onReload={() => void loadFunding()}
-        onTopup={handleTopup}
-      />
-
-      <MarketFundingTopupDialog
-        open={!!visibleTopupProvider}
-        funding={visibleTopupProvider ? preferredProviderTopupFunding(visibleTopupProvider) : undefined}
-        onClose={closeTopup}
-        onCredited={handleCredited}
-      />
     </main>
   );
 }

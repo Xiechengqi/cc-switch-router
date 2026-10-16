@@ -25,7 +25,10 @@ import {
   DASHBOARD_ACCOUNT_BILLING_PATH,
   DASHBOARD_ACCOUNT_MARKET_ACCESS_PATH,
   DASHBOARD_ACCOUNT_PAYMENTS_PATH,
+  DASHBOARD_ACCOUNT_WALLET_PATH,
 } from "@/lib/dashboard-nav";
+import { getMarketProviderFinance, getMarketWallet, type MarketProviderFinance, type MarketWallet } from "@/lib/market-wallet-api";
+import { formatWalletUnits } from "@/lib/market-wallet-money";
 import type {
   AccountPaymentProfile,
   MarketAccessDashboard,
@@ -55,6 +58,8 @@ export function AccountMarketReadinessPage() {
   const [payment, setPayment] = React.useState<AccountPaymentProfile | null>(null);
   const [access, setAccess] = React.useState<MarketAccessDashboard | null>(null);
   const [billing, setBilling] = React.useState<MarketBillingDashboard | null>(null);
+  const [wallet, setWallet] = React.useState<MarketWallet | null>(null);
+  const [providerFinance, setProviderFinance] = React.useState<MarketProviderFinance | null>(null);
   const [loading, setLoading] = React.useState(true);
   const [refreshing, setRefreshing] = React.useState(false);
   const [error, setError] = React.useState("");
@@ -64,14 +69,25 @@ export function AccountMarketReadinessPage() {
     if (silent) setRefreshing(true);
     else setLoading(true);
     try {
-      const [nextPayment, nextAccess, nextBilling] = await Promise.all([
-        getAccountPaymentProfile(),
-        getMarketAccessDashboard(),
-        getMarketBillingDashboard(),
-      ]);
-      setPayment(nextPayment);
-      setAccess(nextAccess);
-      setBilling(nextBilling);
+      const nextWallet = await getMarketWallet();
+      if (nextWallet.mode === "enabled") {
+        const [nextAccess, nextFinance] = await Promise.all([
+          getMarketAccessDashboard(), getMarketProviderFinance(),
+        ]);
+        setAccess(nextAccess);
+        setProviderFinance(nextFinance);
+        setPayment(null);
+        setBilling(null);
+      } else {
+        const [nextPayment, nextAccess, nextBilling] = await Promise.all([
+          getAccountPaymentProfile(), getMarketAccessDashboard(), getMarketBillingDashboard(),
+        ]);
+        setPayment(nextPayment);
+        setAccess(nextAccess);
+        setBilling(nextBilling);
+        setProviderFinance(null);
+      }
+      setWallet(nextWallet);
       setError("");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
@@ -103,7 +119,12 @@ export function AccountMarketReadinessPage() {
   const payableCount = billing?.accounts.filter((account) => account.isBuyer && ["open", "overdue"].includes(account.openInvoice?.status || "")).length || 0;
   const reviewCount = billing?.accounts.filter((account) => account.isSupplier && account.openInvoice?.status === "payment_declared").length || 0;
   const overdueCount = billing?.accounts.filter((account) => account.openInvoice?.status === "overdue").length || 0;
-  const hasSnapshot = payment != null && access != null && billing != null;
+  const isWallet = wallet?.mode === "enabled";
+  const destinationReady = !!providerFinance?.isProvider
+    && !!providerFinance.destination
+    && Number.isFinite(Date.parse(providerFinance.destination.usableAt))
+    && Date.parse(providerFinance.destination.usableAt) <= Date.now();
+  const hasSnapshot = access != null && (isWallet ? providerFinance != null : payment != null && billing != null);
   const policies = [...(access?.policies || [])].sort((left, right) => (
     `${left.productKind}:${left.pricingKind}`.localeCompare(`${right.productKind}:${right.pricingKind}`)
   ));
@@ -137,12 +158,19 @@ export function AccountMarketReadinessPage() {
       ) : null}
 
       {hasSnapshot ? <><section className="grid grid-cols-2 gap-x-5 gap-y-4 border-y border-border py-4 sm:grid-cols-4">
-        {[
+        {(isWallet ? [
+          [t("marketReadiness.wallet.balance"), formatWalletUnits(wallet!.availableUnits)],
+          [t("marketReadiness.summary.pendingAccess"), pendingRequests],
+          ...(providerFinance?.isProvider ? [
+            [t("marketReadiness.wallet.providerAvailable"), formatWalletUnits(providerFinance.summary.availableUnits)],
+            [t("marketReadiness.wallet.withdrawable"), formatWalletUnits(providerFinance.summary.withdrawableUnits)],
+          ] : []),
+        ] : [
           [t("marketReadiness.summary.paymentMethods"), payment?.methods.length || 0],
           [t("marketReadiness.summary.pendingAccess"), pendingRequests],
           [t("marketReadiness.summary.billingActions"), payableCount + reviewCount],
           [t("marketReadiness.summary.overdue"), overdueCount],
-        ].map(([label, value]) => (
+        ]).map(([label, value]) => (
           <div key={String(label)} className="min-w-0">
             <span className="block truncate text-xs text-muted-foreground">{label}</span>
             <strong className="mt-0.5 block text-xl tabular-nums">{value}</strong>
@@ -151,6 +179,26 @@ export function AccountMarketReadinessPage() {
       </section>
 
       <section className="divide-y divide-border border-y border-border">
+        {isWallet ? <>
+        {providerFinance?.isProvider ? <div className="flex flex-wrap items-center gap-4 py-4">
+          <CircleDollarSign className="h-5 w-5 shrink-0 text-muted-foreground" />
+          <div className="min-w-[12rem] flex-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <strong className="text-sm">{t("marketReadiness.wallet.payoutTitle")}</strong>
+              <Chip size="sm" variant="soft" className={destinationReady ? "bg-emerald-100 text-emerald-700" : "bg-amber-100 text-amber-800"}>
+                {destinationReady ? t("marketReadiness.ready") : t("marketReadiness.needsSetup")}
+              </Chip>
+            </div>
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">{t("marketReadiness.wallet.payoutDetail")}</p>
+          </div>
+          <Link href={DASHBOARD_ACCOUNT_WALLET_PATH} className={ACTION_LINK_CLASS}>{t("marketReadiness.wallet.payoutAction")}<ArrowRight className="h-4 w-4" /></Link>
+        </div> : null}
+        <div className="flex flex-wrap items-center gap-4 py-4">
+          <WalletCards className="h-5 w-5 shrink-0 text-muted-foreground" />
+          <div className="min-w-[12rem] flex-1"><strong className="text-sm">{t("account.contact.title")}</strong><p className="mt-1 text-xs leading-5 text-muted-foreground">{t("account.contact.hint")}</p></div>
+          <Link href={DASHBOARD_ACCOUNT_PAYMENTS_PATH} className={ACTION_LINK_CLASS}>{t("marketReadiness.wallet.contactsAction")}<ArrowRight className="h-4 w-4" /></Link>
+        </div>
+        </> : <>
         <div className="flex flex-wrap items-center gap-4 py-4">
           <WalletCards className="h-5 w-5 shrink-0 text-muted-foreground" />
           <div className="min-w-[12rem] flex-1">
@@ -183,12 +231,13 @@ export function AccountMarketReadinessPage() {
           </div>
           <Link href={`${DASHBOARD_ACCOUNT_BILLING_PATH}?tab=receivables`} className={ACTION_LINK_CLASS}>{t("marketReadiness.settlement.action")}<ArrowRight className="h-4 w-4" /></Link>
         </div>
+        </>}
 
         <div className="flex flex-wrap items-center gap-4 py-4">
           <ShieldCheck className="h-5 w-5 shrink-0 text-muted-foreground" />
           <div className="min-w-[12rem] flex-1">
             <div className="flex flex-wrap items-center gap-2">
-              <strong className="text-sm">{t("marketReadiness.access.title")}</strong>
+              <strong className="text-sm">{t(isWallet ? "marketReadiness.access.walletTitle" : "marketReadiness.access.title")}</strong>
               {pendingRequests ? <Chip size="sm" variant="soft" className="bg-rose-100 text-rose-700">{t("marketReadiness.pending", { count: pendingRequests })}</Chip> : null}
             </div>
             <p className="mt-1 text-xs leading-5 text-muted-foreground">{t("marketReadiness.access.detail", { buyers: activeBuyers })}</p>
@@ -196,7 +245,7 @@ export function AccountMarketReadinessPage() {
           <Link href={DASHBOARD_ACCOUNT_MARKET_ACCESS_PATH} className={ACTION_LINK_CLASS}>{t("marketReadiness.access.action")}<ArrowRight className="h-4 w-4" /></Link>
         </div>
 
-        <div className="flex flex-wrap items-center gap-4 py-4">
+        {!isWallet ? <div className="flex flex-wrap items-center gap-4 py-4">
           <HandCoins className="h-5 w-5 shrink-0 text-muted-foreground" />
           <div className="min-w-[12rem] flex-1">
             <strong className="text-sm">{t("marketReadiness.billing.title")}</strong>
@@ -207,7 +256,7 @@ export function AccountMarketReadinessPage() {
             })}</p>
           </div>
           <Link href={DASHBOARD_ACCOUNT_BILLING_PATH} className={ACTION_LINK_CLASS}>{t("marketReadiness.billing.action")}<ArrowRight className="h-4 w-4" /></Link>
-        </div>
+        </div> : null}
       </section>
 
       <section className="grid gap-3">

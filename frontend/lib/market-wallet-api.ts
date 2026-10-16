@@ -4,6 +4,8 @@ import { parseJson } from "@/lib/api";
 export type MarketFinanceReadiness = {
   mode: "disabled" | "shadow" | "enabled";
   version: number;
+  newOrdersPaused: boolean;
+  newWithdrawalsPaused: boolean;
   codeIntegrated: boolean;
   legacyBlockers: { code: string; count: number }[];
   criticalCases: number;
@@ -93,6 +95,32 @@ export type MarketProviderWithdrawal = {
   createdAt: string;
   externalReference: string | null;
 };
+
+export type MarketWalletRenewal = {
+  id: string;
+  productKind: "share" | "client_host";
+  billingModel: "calendar_month";
+  cyclePriceMinor: number;
+  renewalPolicy: "manual" | "automatic";
+  status: string;
+  periodEnd: string | null;
+};
+
+export async function getMarketWalletRenewal(contractId: string) {
+  return parseJson<MarketWalletRenewal>(
+    await authFetch(`/v1/market-wallet/contracts/${encodeURIComponent(contractId)}/renewal`, { cache: "no-store" }),
+  );
+}
+
+export async function updateMarketWalletRenewal(contractId: string, autoRenew: boolean, expectedPolicy: MarketWalletRenewal["renewalPolicy"]) {
+  return parseJson<MarketWalletRenewal>(
+    await authFetch(`/v1/market-wallet/contracts/${encodeURIComponent(contractId)}/renewal`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ autoRenew, expectedPolicy }),
+    }),
+  );
+}
 
 export type MarketBuyerRefund = {
   id: string;
@@ -327,6 +355,20 @@ export async function setMarketFinanceMode(mode: MarketFinanceReadiness["mode"],
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ mode, expectedVersion }),
+    }),
+  );
+}
+
+export async function setMarketFinancePause(
+  newOrdersPaused: boolean,
+  newWithdrawalsPaused: boolean,
+  expectedVersion: number,
+) {
+  return parseJson<{ newOrdersPaused: boolean; newWithdrawalsPaused: boolean }>(
+    await authFetch("/v1/admin/market-finance/pause", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ newOrdersPaused, newWithdrawalsPaused, expectedVersion }),
     }),
   );
 }

@@ -172,7 +172,7 @@ Owner 收到的是 DujiaoPay 商户实际入金资产，Router 给出的却是 U
 | Provider 收入 | `GET /v1/market-provider-finance/me`；`GET /v1/market-provider-finance/earnings` | 待解锁、可提现、提现中分别展示；不得混作用户钱包。 |
 | Provider 提现 | `PUT /v1/market-provider-finance/destination`；`POST /v1/market-provider-finance/withdrawals`；`GET /v1/market-provider-finance/withdrawals` | 收款资料版本化，提交幂等。 |
 | Owner 渠道 | `/v1/admin/market-payment-channels` 下创建、资料编辑、现有 API 复验、API／Webhook 密钥轮换、启停、归档／恢复接口 | Owner-only；修改使用 `expectedVersion` 乐观锁，读响应不回显 Secret；归档后旧订单仍可对账。 |
-| Owner 财务 | `/v1/admin/market-finance` 下充值异常、提现、用户退款、对账 case 查询与处置接口 | 所有操作有操作者、理由、版本 CAS 和审计事件。 |
+| Owner 财务 | `/v1/admin/market-finance` 下模式、暂停、充值异常、提现、用户退款、对账 case 查询与处置接口 | `PUT /pause` 独立控制新钱包订单和新提现；所有操作有操作者、理由、版本 CAS 和审计事件。 |
 
 用户界面只有四个购买重点：商品与周期价格、全站可用余额、需充值差额、主操作「确认租用／充值差额」。不显示 Provider UID、尾差、账单声明或多个分割区。充值结束返回原商品卡并刷新报价；未成功就保持「等待到账／人工核对」，不显示假成功。账户新增全站钱包和充值流水；Provider 收入／提现独立面板；Settings 的 Marketplace 分类增加 Owner 充值渠道与财务状态面板。原 Provider 页中预存／信用汇总与按 Provider 充值入口删除或替换，Provider 排名算法及公开质量数据不受钱包改造影响。
 
@@ -180,7 +180,7 @@ Owner 收到的是 DujiaoPay 商户实际入金资产，Router 给出的却是 U
 
 - DujiaoPay API/Webhook 密钥使用独立于 Binance 的主密钥和 AEAD 加密，AAD 绑定渠道 ID、商户身份和 revision；密钥文件／环境 Secret 与数据库分开备份。错 key 或 key version 必须 fail closed，不回退明文。参考 `src/binance_settlement/crypto.rs` 的封装思想，但新支付模块使用独立密钥域。
 - 只有 Owner 可改渠道、审批出款或处理人工入账；「人工确认已付款」必须写明外部证据、金额、来源和理由，不能仅凭签名 `order.paid` 中的人工 `paid_source` 自动记账。审计可以记录摘要／稳定错误码，不记录签名头、API Secret 和原始失败 body。
-- 渠道有 `disabled / shadow / enabled` 全局状态及单渠道开关。`disabled` 阻止新建单及新的 Provider 提现申请／外部转账启动；`shadow` 仅允许 Owner 测试充值；`enabled` 仅在 Owner API 通过真实入账和切换门禁后开放。暂停不阻止已发起转账的结果登记或用户余额退款处理，也不抹掉 pending 充值订单；已经付的钱仍须查单和核对。配置页明确区分 API 验证、签名回调验证及当前 revision 的真实入账，不能把空订单号测试投递误记为通过。
+- 财务模式有 `disabled / shadow / enabled` 切换门禁及单渠道开关。`shadow` 仅允许 Owner 测试充值；`enabled` 仅在 Owner API 通过真实入账和切换门禁后开放，批准后不可退回旧支付轨道。生产异常使用独立的「暂停新钱包订单／新提现」开关；关闭渠道可停止新充值。暂停不阻止既有合同履行、已发起转账的结果登记、用户余额退款、Webhook 或对账，也不抹掉 pending 充值订单；已经付的钱仍须查单和核对。配置页明确区分 API 验证、签名回调验证及当前 revision 的真实入账，不能把空订单号测试投递误记为通过。
 - 支付网关或 Turso 不可达时停止新建单／扣费的相应写入；签名 Webhook 事件和无签名回调唤醒的查单时间表持久化，网关恢复后重试。数据库事务内不发外部 HTTP。Router 当前 Turso 模式仅支持一个可写实例，本计划不引入多主写入或离线写。
 - 设定金额上下限、用户及 IP 建单速率、单用户 pending 订单上限、Webhook body 上限、外部 HTTP 超时与退避、健康告警和补偿任务预算。无渠道可用时明确提示，不能退回旧商家直付链接。
 - 对账异常、Secret 解密失败、网关身份变化、连续查单失败、零和不变量破坏、重复外部转账参考号等需要可观测的 Owner 告警。资金不变量失败时冻结受影响资金路径，而不是尝试用调整 SQL 自动修复。
@@ -234,8 +234,8 @@ Owner 收到的是 DujiaoPay 商户实际入金资产，Router 给出的却是 U
 
 ## 13. Owner 影子验收与切换清单
 
-1. 先备份 Router 数据库及支付密钥，部署迁移但保持 `disabled`。确认 `/v1/admin/market-finance/readiness` 的 `codeIntegrated`、旧域 blocker、严重对账 case 与渠道 blocker；不可用手改数据库模式替代 Owner API。切回 `shadow`／`disabled` 会清除先前的切换批准，再次启用必须重新通过门禁。
+1. 先备份 Router 数据库及支付密钥，部署迁移但保持 `disabled`。确认 `/v1/admin/market-finance/readiness` 的 `codeIntegrated`、旧域 blocker、严重对账 case 与渠道 blocker；不可用手改数据库模式替代 Owner API。首次启用后切换批准永久保留，不能再切回 `shadow`／`disabled`；应使用独立的暂停开关处置事故。
 2. 在 DujiaoPay 官方商户后台配置 Router 固定 Webhook URL，保存只显示一次的 Webhook 签名密钥。Router 渠道 API 验证、Webhook 验签和真实入账是三个独立证据；`whoami` 通过不等于后两者通过。商户必须实际支持以 USD 两位小数建单和可认证的支付来源。
 3. 切到 `shadow`，仅由 Owner 以受控最小 USD 金额完成一次真实支付，保留脱敏订单号、官方查单状态、签名回调时间、链上回执和 journal 对账结果。另验证重复／迟到 Webhook、查单短暂失败和回跳不会重复入账。不能把 fixture、测试通知或浏览器成功页计作真实收款。
 4. 在旧路径清结并撤下所有付费旧商品和活动报价，核对旧合同、余额、hold、欠款、退款、争议、待确认充值均为零。保持 `shadow` 且 `readiness.canEnable` 为真时，Owner 才可通过 API 切到 `enabled`；不能从 `disabled` 跳过影子验收。之后 Provider 按钱包规则逐项重新发布付费 Share seat 与 Client Host。
-5. 小范围验收充值→报价→冻结→开通→履约→争议／退款、资金不足暂停、七天后提现申请→Owner 线下转账登记。每一步对比钱包、未履约、Provider 待解锁／可提现／提现中与 journal 零和。发现严重不变量或网关身份异常，立即停新单与新提现，继续收取并核对已发生支付的回调；已有真实入账时只能向前修复，不能回滚旧二进制。
+5. 小范围验收充值→报价→冻结→开通→履约→争议／退款、资金不足暂停、七天后提现申请→Owner 线下转账登记。每一步对比钱包、未履约、Provider 待解锁／可提现／提现中与 journal 零和。发现严重不变量或网关身份异常，使用 Owner 暂停开关立即停新钱包单与新提现，必要时关闭渠道停止新充值；继续收取并核对已发生支付的回调，已有合同照常履行。已有真实入账时只能向前修复，不能回滚旧二进制。

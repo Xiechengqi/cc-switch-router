@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import { subdomainTunnelUrl } from "@/components/dashboard/share-dashboard-utils";
 import { MarketRecurringContractCard } from "@/components/dashboard/market-recurring-contract-card";
+import { MarketWalletRenewalCard } from "@/components/dashboard/market-wallet-renewal-card";
 import { MarketServiceDisputeControl } from "@/components/dashboard/market-service-dispute-control";
 import { filterMarketListings } from "@/components/dashboard/share-market/buyer-catalog-utils";
 import { MarketListingFilters } from "@/components/dashboard/share-market/market-listing-filters";
@@ -398,6 +399,11 @@ export function ShareMarketBuyerRentals({
                       />
                     </div>
                   ) : null}
+                  {subscription.walletContractId && subscription.cyclePriceMinor != null ? (
+                    <div className="mt-2" data-no-card-open>
+                      <MarketWalletRenewalCard contractId={subscription.walletContractId} compact onChanged={onChanged} />
+                    </div>
+                  ) : null}
                   <div data-no-card-open>
                     <RentalActions subscription={subscription} t={t} busy={rentals.busyId === subscription.id} onRelease={actions.onRelease} onAcceptPrice={actions.onAcceptPrice} onRejectPrice={actions.onRejectPrice} />
                   </div>
@@ -412,6 +418,11 @@ export function ShareMarketBuyerRentals({
                         onChanged={onChanged}
                         compact
                       />
+                    </div>
+                  ) : null}
+                  {subscription.walletContractId && subscription.cyclePriceMinor != null ? (
+                    <div className="mt-2" data-no-card-open>
+                      <MarketWalletRenewalCard contractId={subscription.walletContractId} compact onChanged={onChanged} />
                     </div>
                   ) : null}
                   <p className="min-w-0 truncate px-1.5 text-[10px] leading-4 text-slate-500">

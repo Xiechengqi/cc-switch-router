@@ -910,6 +910,11 @@ async fn my_market_provider_funding(
     // and credential availability checks happen only after the guard is gone.
     let mut providers = {
         let conn = state.store.conn.lock().await;
+        if crate::market_payments::wallet_purchase_mode_tx(&conn)? {
+            return Err(AppError::Gone(
+                "Provider-specific funding is retired; use the platform wallet".into(),
+            ));
+        }
         let counterparties = funding_counterparties(&conn, &session)?;
         let mut providers = Vec::with_capacity(counterparties.len());
         let mut resolved_provider_ids = BTreeSet::new();

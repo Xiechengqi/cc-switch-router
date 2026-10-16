@@ -228,6 +228,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         62,
         include_str!("../schema/0062_market_wallet_cutover_approval.sql"),
     ),
+    (
+        63,
+        include_str!("../schema/0063_market_finance_emergency_pause.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -3687,5 +3691,30 @@ mod tests {
             )
             .expect("archive remains available after rejected retirement");
         assert_eq!(archived_rows, 1);
+    }
+
+    #[test]
+    fn migration_63_preserves_approved_wallet_cutover_and_opens_new_trading_by_default() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 62);
+        let approved_at = "2026-10-16T00:00:00Z";
+        conn.execute(
+            "UPDATE market_finance_control SET mode = 'enabled', cutover_approved_at = ?1
+             WHERE id = 1",
+            params![approved_at],
+        )
+        .unwrap();
+
+        apply(&conn).unwrap();
+        let state: (String, String, bool, bool) = conn
+            .query_row(
+                "SELECT mode, cutover_approved_at, new_orders_paused,
+                        new_withdrawals_paused FROM market_finance_control WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("enabled".into(), approved_at.into(), false, false));
+        check_compatibility(&conn).unwrap();
     }
 }
