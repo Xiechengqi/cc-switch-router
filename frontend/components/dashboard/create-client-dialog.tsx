@@ -1,20 +1,17 @@
 "use client";
 
 import * as React from "react";
-import Link from "next/link";
+import { useRouter, useSearchParams } from "next/navigation";
 import { Button, Chip, Modal } from "@heroui/react";
-import { Check, Clock3, Copy, Dices, Loader2, LogIn, Minus, Plus, RotateCcw, Server, ShieldCheck } from "lucide-react";
+import { Check, Copy, Loader2, LogIn, Minus, Plus, RotateCcw, Server } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
 import { CountryFlag } from "@/components/common/country-flag";
 import { SegmentedControl } from "@/components/common/segmented-control";
 import { marketEligibilityFromError } from "@/components/common/seller-approval-dialog";
 import { buildClientInstallCommand } from "@/components/dashboard/install-guide-dialog";
-import {
-  MarketRecurringFundingSummaryCard,
-  MarketFundingSummaryCard,
-  MarketFundingTopupDialog,
-} from "@/components/dashboard/market-funding-topup-dialog";
+import { ClientCheckoutForm } from "@/components/dashboard/client-market/client-checkout-form";
+import { clientCheckoutState, preserveClientDrafts, type ClientDraft as Draft, type ClientSubdomainCheck as SubdomainCheck } from "@/lib/client-checkout";
 import { ProvisionJobLog } from "@/components/dashboard/provision-job-log";
 import {
   persistedClientMarketProviderSelection,
@@ -22,6 +19,7 @@ import {
 } from "@/components/dashboard/client-market/host-utils";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
+  ApiError,
   cancelClientMarketQuote,
   checkClientTunnelSubdomainAvailability,
   commitClientMarketQuote,
@@ -29,15 +27,6 @@ import {
   getClientMarketBatch,
   getClientMarketProviderSupply,
 } from "@/lib/api";
-import {
-  applyMarketFundingConflict,
-  applyRecurringFundingConflict,
-  marketFundingAfterRecurringHolds,
-  marketFundingConflictFromError,
-  marketFundingTopupUnavailableKey,
-  recurringFundingForRenewal,
-  type MarketTopupFunding,
-} from "@/lib/market-funding";
 import type {
   ClientMarketAllocationQuote,
   ClientMarketHost,
@@ -48,7 +37,7 @@ import type {
   ProvisioningJob,
 } from "@/lib/types";
 import { formatUsdMoney } from "@/lib/market-money";
-import { formatWalletUnits, walletTopupHref } from "@/lib/market-wallet-money";
+import { walletTopupHref } from "@/lib/market-wallet-money";
 import { usePersistentState } from "@/lib/use-persistent-state";
 
 const PROVIDERS_KEY = "cc_switch_router_create_client_providers_v2";
@@ -56,12 +45,6 @@ const REGIONS_KEY = "cc_switch_router_create_client_regions_v2";
 
 type Phase = "form" | "quote" | "running" | "complete";
 type CreateMode = "manual" | "online";
-type Draft = { subdomain: string; password: string; autoRenew: boolean };
-type SubdomainCheck = {
-  value: string;
-  status: "checking" | "available" | "unavailable" | "error";
-  message?: string;
-};
 
 function randomSubdomain() {
   const letters = "abcdefghijklmnopqrstuvwxyz";
@@ -149,6 +132,8 @@ export function CreateClientDialog({
   onMarketEligibilityRequired?: (host: ClientMarketHost, eligibility: ClientMarketHost["eligibility"]) => void;
 }) {
   const { locale, t } = useLocaleText();
+  const router = useRouter();
+  const searchParams = useSearchParams();
   const { session, loading: authLoading } = useAuth();
   const authed = !!session?.authenticated;
   const ownerEmail = session?.user?.email?.trim() || t("dashboard.installClientCommandOwnerPlaceholder");
@@ -170,7 +155,6 @@ export function CreateClientDialog({
   );
   const [quantity, setQuantity] = React.useState(1);
   const [quote, setQuote] = React.useState<ClientMarketAllocationQuote | null>(null);
-  const [topupFunding, setTopupFunding] = React.useState<MarketTopupFunding>();
   const [drafts, setDrafts] = React.useState<Record<string, Draft>>({});
   /** Drafts rescued from an expired quote, keyed by hostId so they survive the new
    *  quote's fresh item ids. Losing a filled-in subdomain and password on a 120s
@@ -183,6 +167,11 @@ export function CreateClientDialog({
   const [copied, setCopied] = React.useState(false);
   const [clock, setClock] = React.useState(0);
   const pollGeneration = React.useRef(0);
+  const quoteRequestGeneration = React.useRef(0);
+  const liveQuote = React.useRef<ClientMarketAllocationQuote | null>(null);
+  const [expired, setExpired] = React.useState(false);
+  const [submissionUncertain, setSubmissionUncertain] = React.useState(false);
+
   const commitKeyRef = React.useRef<{ quoteId: string; key: string } | null>(null);
   const subdomainCheckGeneration = React.useRef(0);
 
@@ -293,10 +282,14 @@ export function CreateClientDialog({
   React.useEffect(() => {
     if (!open) return;
     pollGeneration.current += 1;
+    if (liveQuote.current) void cancelClientMarketQuote(liveQuote.current.id).catch(() => undefined);
+    liveQuote.current = null;
     setPhase("form");
+    setSubmissionUncertain(false);
+    setExpired(false);
+    preservedDrafts.current = {};
     setMode("online");
     setQuote(null);
-    setTopupFunding(undefined);
     commitKeyRef.current = null;
     setDrafts({});
     setSubdomainChecks({});
@@ -307,16 +300,20 @@ export function CreateClientDialog({
     setLoading(true);
     setProviderSupplyLoaded(false);
     setRecommendationMode("off");
+    if (fixedHost) { setLoading(false); return; }
+    let active = true;
     getClientMarketProviderSupply()
       .then((response) => {
+        if (!active) return;
         setProviders(response.providers);
         setOfficialProviderId(response.officialProviderId);
         setRecommendationMode(response.recommendationMode || "off");
         setProviderSupplyLoaded(true);
       })
-      .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)))
-      .finally(() => setLoading(false));
-  }, [open]);
+      .catch((reason) => { if (active) setError(reason instanceof Error ? reason.message : String(reason)); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [open, fixedHost?.id]);
 
   React.useEffect(() => {
     if (!providerSupplyLoaded || safeProviders.mode !== "custom") return;
@@ -366,25 +363,17 @@ export function CreateClientDialog({
   }, [open, phase]);
 
   React.useEffect(() => {
-    if (!quote || phase !== "quote" || secondsRemaining(quote.expiresAt) > 0) return;
-    const rescued: Record<string, Draft> = {};
-    for (const item of quote.items) {
-      const draft = drafts[item.id];
-      if (draft && (draft.subdomain || draft.password)) rescued[item.hostId] = draft;
-    }
-    preservedDrafts.current = rescued;
+    if (!quote || phase !== "quote" || loading || submissionUncertain || expired || secondsRemaining(quote.expiresAt) > 0) return;
+    preservedDrafts.current = preserveClientDrafts(quote, drafts);
     void cancelClientMarketQuote(quote.id).catch(() => undefined);
-    setQuote(null);
-    setDrafts({});
-    setSubdomainChecks({});
-    subdomainCheckGeneration.current += 1;
-    setError(
-      Object.keys(rescued).length
-        ? t("createClient.quoteExpiredDraftsKept")
-        : t("createClient.quoteExpired"),
-    );
-    setPhase("form");
-  }, [clock, drafts, phase, quote, t]);
+    setExpired(true);
+  }, [clock, drafts, expired, loading, phase, quote, submissionUncertain]);
+
+  React.useEffect(() => () => {
+    quoteRequestGeneration.current += 1;
+    pollGeneration.current += 1;
+    if (liveQuote.current) void cancelClientMarketQuote(liveQuote.current.id).catch(() => undefined);
+  }, []);
 
   React.useEffect(() => {
     if (!open || phase !== "quote" || !quote) return;
@@ -456,6 +445,7 @@ export function CreateClientDialog({
   };
 
   const requestQuote = async () => {
+    if (loading) return;
     if (!authed) {
       window.dispatchEvent(new Event("router-open-login"));
       return;
@@ -469,24 +459,35 @@ export function CreateClientDialog({
       setError(capacity < quantity ? t("createClient.noCapacity") : t("createClient.selectionRequired"));
       return;
     }
+    const generation = ++quoteRequestGeneration.current;
+    if (quote) preservedDrafts.current = preserveClientDrafts(quote, drafts);
     setLoading(true);
     setError("");
     try {
+      if (quote) await cancelClientMarketQuote(quote.id);
       const next = await createClientMarketQuote({
         providerIds: selectedProviderIds,
         countryCodes: selectedCountryCodes,
         count: fixedHost ? 1 : quantity,
         hostId: fixedHost?.id,
       });
+      if (generation !== quoteRequestGeneration.current) {
+        void cancelClientMarketQuote(next.id).catch(() => undefined);
+        return;
+      }
+      liveQuote.current = next;
+      setExpired(false);
+      commitKeyRef.current = null;
       setQuote(next);
       setDrafts(
         Object.fromEntries(
           next.items.map((item) => [
             item.id,
             preservedDrafts.current[item.hostId] ?? {
-              subdomain: randomSubdomain(),
+              subdomain: searchParams.get("focusHost") === item.hostId && isValidDraftSubdomain(searchParams.get("draftSubdomain") || "")
+                ? searchParams.get("draftSubdomain")! : randomSubdomain(),
               password: "",
-              autoRenew: false,
+              autoRenew: searchParams.get("focusHost") === item.hostId && searchParams.get("draftAutoRenew") === "1",
             },
           ]),
         ),
@@ -495,13 +496,22 @@ export function CreateClientDialog({
       setSubdomainChecks({});
       setPhase("quote");
     } catch (reason) {
-      if (!routeMarketEligibilityError(reason)) {
-        setError(reason instanceof Error ? reason.message : String(reason));
+      if (generation === quoteRequestGeneration.current && !routeMarketEligibilityError(reason)) {
+        setError(t("clientCheckout.loadFailed"));
       }
     } finally {
-      setLoading(false);
+      if (generation === quoteRequestGeneration.current) setLoading(false);
     }
   };
+
+  // Defer one tick so development Strict Mode can cancel its probe mount.
+  const requestQuoteRef = React.useRef(requestQuote);
+  requestQuoteRef.current = requestQuote;
+  React.useEffect(() => {
+    if (!open || !fixedHost || !authed) return;
+    const timer = window.setTimeout(() => void requestQuoteRef.current(), 0);
+    return () => { window.clearTimeout(timer); quoteRequestGeneration.current += 1; };
+  }, [open, fixedHost?.id, authed]);
 
   const pollBatch = async (batchId: string, generation: number) => {
     for (let attempt = 0; attempt < 1_000; attempt += 1) {
@@ -522,13 +532,9 @@ export function CreateClientDialog({
 
   const commit = async () => {
     if (!quote) return;
-    if (
-      effectiveFunding.some((funding) => funding.requiredTopupMinor > 0)
-      || effectiveRecurringFunding.some((funding) => funding.requiredTopupMinor > 0)
-    ) {
-      setError(t("marketFunding.blocked"));
-      return;
-    }
+    if (loading || (!submissionUncertain && (expired || secondsRemaining(quote.expiresAt) <= 0))) return;
+    const checkout = clientCheckoutState(quote);
+    if (checkout.unsupported || checkout.shortfall) return;
     const items = quote.items.map((item) => ({
       quoteItemId: item.id,
       offerRevision: item.offerRevision,
@@ -556,31 +562,33 @@ export function CreateClientDialog({
     setLoading(true);
     setError("");
     try {
-      setSubdomainChecks(Object.fromEntries(items.map((item) => [item.quoteItemId, { value: item.subdomain, status: "checking" }])));
-      const availability = await Promise.all(
-        items.map(async (item) => {
-          try {
-            return { item, result: await checkClientTunnelSubdomainAvailability(item.subdomain) };
-          } catch {
-            return { item, error: true as const };
-          }
-        }),
-      );
-      setSubdomainChecks(Object.fromEntries(availability.map(({ item, ...entry }) => [
-        item.quoteItemId,
-        "error" in entry
-          ? { value: item.subdomain, status: "error", message: t("createClient.subdomainCheckFailed") }
-          : entry.result.available
-            ? { value: item.subdomain, status: "available" }
-            : { value: item.subdomain, status: "unavailable", message: t("createClient.subdomainTaken") },
-      ])) as Record<string, SubdomainCheck>);
-      if (availability.some((entry) => "error" in entry)) {
-        setError(t("createClient.subdomainCheckFailed"));
-        return;
-      }
-      if (availability.some((entry) => entry.result?.available === false)) {
-        setError(t("createClient.subdomainTaken"));
-        return;
+      if (!submissionUncertain) {
+        setSubdomainChecks(Object.fromEntries(items.map((item) => [item.quoteItemId, { value: item.subdomain, status: "checking" }])));
+        const availability = await Promise.all(
+          items.map(async (item) => {
+            try {
+              return { item, result: await checkClientTunnelSubdomainAvailability(item.subdomain) };
+            } catch {
+              return { item, error: true as const };
+            }
+          }),
+        );
+        setSubdomainChecks(Object.fromEntries(availability.map(({ item, ...entry }) => [
+          item.quoteItemId,
+          "error" in entry
+            ? { value: item.subdomain, status: "error", message: t("createClient.subdomainCheckFailed") }
+            : entry.result.available
+              ? { value: item.subdomain, status: "available" }
+              : { value: item.subdomain, status: "unavailable", message: t("createClient.subdomainTaken") },
+        ])) as Record<string, SubdomainCheck>);
+        if (availability.some((entry) => "error" in entry)) {
+          setError(t("createClient.subdomainCheckFailed"));
+          return;
+        }
+        if (availability.some((entry) => entry.result?.available === false)) {
+          setError(t("createClient.subdomainTaken"));
+          return;
+        }
       }
       if (commitKeyRef.current?.quoteId !== quote.id) {
         commitKeyRef.current = {
@@ -588,11 +596,16 @@ export function CreateClientDialog({
           key: globalThis.crypto?.randomUUID?.() || `${quote.id}:${Date.now()}`,
         };
       }
+      setSubmissionUncertain(true);
+      liveQuote.current = null;
       const response = await commitClientMarketQuote(
         quote.id,
         items,
         commitKeyRef.current.key,
       );
+      setSubmissionUncertain(false);
+      liveQuote.current = null;
+      preservedDrafts.current = {};
       setDrafts({});
       setSubdomainChecks({});
       setJobs(Object.fromEntries(response.jobIds.map((id) => [id, { id, status: "pending", jobType: "create", phase: "pending", log: "", createdAt: "", updatedAt: "" } as ProvisioningJob])));
@@ -600,23 +613,15 @@ export function CreateClientDialog({
       const generation = pollGeneration.current;
       void pollBatch(response.batchId, generation);
     } catch (reason) {
+      if (reason instanceof ApiError && reason.status < 500) setSubmissionUncertain(false);
       if (!routeMarketEligibilityError(reason)) {
-        const fundingConflict = marketFundingConflictFromError(reason);
-        if (fundingConflict) {
-          setQuote((current) => current ? {
-            ...current,
-            funding: current.funding.map((funding) =>
-              applyMarketFundingConflict(
-                funding,
-                fundingConflict,
-                recurringHoldBySupplier.get(`${funding.supplierUserId}:${funding.currency}`) || 0,
-              )),
-            recurringFunding: current.recurringFunding.map((funding) =>
-              applyRecurringFundingConflict(funding, fundingConflict)),
-          } : current);
-          setError(t("marketFunding.blocked"));
+        if (reason instanceof ApiError && (reason.code === "MARKET_WALLET_REQUIRED" || reason.status === 410 || reason.status === 409)) {
+          // The rejected transaction created no batch. Keep the form and explicitly requote.
+          preservedDrafts.current = preserveClientDrafts(quote, drafts);
+          setExpired(true);
+          setError(t(reason.code === "MARKET_WALLET_REQUIRED" ? "clientCheckout.fundingChanged" : "clientCheckout.expired"));
         } else {
-          setError(reason instanceof Error ? reason.message : String(reason));
+          setError(t("clientCheckout.commitFailed"));
         }
       }
     } finally {
@@ -626,8 +631,9 @@ export function CreateClientDialog({
 
   const cancelQuote = async () => {
     if (quote) await cancelClientMarketQuote(quote.id).catch(() => undefined);
+    liveQuote.current = null;
+    setExpired(false);
     setQuote(null);
-    setTopupFunding(undefined);
     setDrafts({});
     setSubdomainChecks({});
     subdomainCheckGeneration.current += 1;
@@ -635,11 +641,12 @@ export function CreateClientDialog({
   };
 
   const close = (nextOpen: boolean) => {
-    if (!nextOpen && phase === "running") return;
-    if (!nextOpen && phase === "quote" && quote) void cancelClientMarketQuote(quote.id).catch(() => undefined);
+    if (!nextOpen && (phase === "running" || (loading && submissionUncertain))) return;
+    if (!nextOpen) { quoteRequestGeneration.current += 1; preservedDrafts.current = {}; }
+    if (!nextOpen && phase === "quote" && quote && !submissionUncertain) void cancelClientMarketQuote(quote.id).catch(() => undefined);
     if (!nextOpen) subdomainCheckGeneration.current += 1;
-    if (!nextOpen) setTopupFunding(undefined);
     pollGeneration.current += 1;
+    if (!nextOpen) { liveQuote.current = null; setDrafts({}); }
     onOpenChange(nextOpen);
   };
 
@@ -652,61 +659,27 @@ export function CreateClientDialog({
     [ownerEmail, t],
   );
   const quoteSeconds = secondsRemaining(quote?.expiresAt);
-  const paidQuoteCount = quote?.items.filter((item) =>
-    item.dailyRateMinor != null || item.cyclePriceMinor != null).length || 0;
-  const recurringQuoteCount = quote?.walletFunding ? 0 : quote?.items.filter((item) =>
-    item.pricingModel === "prepaid_calendar_month").length || 0;
-  const legacyPaidQuoteCount = quote?.walletFunding ? 0 : paidQuoteCount - recurringQuoteCount;
-  const freeQuoteCount = (quote?.items.length || 0) - paidQuoteCount;
-  const recurringSupplierCount = new Set(
-    quote?.items
-      .filter((item) => item.pricingModel === "prepaid_calendar_month")
-      .map((item) => item.providerId) || [],
-  ).size;
-  const legacySupplierCount = new Set(
-    quote?.items
-      .filter((item) => item.dailyRateMinor != null)
-      .map((item) => item.providerId) || [],
-  ).size;
-  const recurringRenewalBySupplier = React.useMemo(() => {
-    const totals = new Map<string, number>();
-    for (const item of quote?.items || []) {
-      if (
-        item.pricingModel !== "prepaid_calendar_month"
-        || item.cyclePriceMinor == null
-        || drafts[item.id]?.autoRenew !== true
-      ) continue;
-      totals.set(item.providerId, (totals.get(item.providerId) || 0) + item.cyclePriceMinor);
-    }
-    return totals;
-  }, [drafts, quote?.items]);
-  const effectiveRecurringFunding = React.useMemo(
-    () => (quote?.walletFunding ? [] : quote?.recurringFunding || []).map((funding) => {
-      const renewal = recurringRenewalBySupplier.get(funding.supplierUserId) || 0;
-      return recurringFundingForRenewal(funding, renewal > 0, renewal);
-    }),
-    [quote?.walletFunding, quote?.recurringFunding, recurringRenewalBySupplier],
-  );
-  const recurringHoldBySupplier = React.useMemo(() => {
-    const totals = new Map<string, number>();
-    for (const funding of effectiveRecurringFunding) {
-      const key = `${funding.supplierUserId}:${funding.currency}`;
-      totals.set(key, (totals.get(key) || 0) + funding.totalRequiredHoldMinor);
-    }
-    return totals;
-  }, [effectiveRecurringFunding]);
-  const effectiveFunding = React.useMemo(
-    () => (quote?.walletFunding ? [] : quote?.funding || []).map((funding) => marketFundingAfterRecurringHolds(
-      funding,
-      recurringHoldBySupplier.get(`${funding.supplierUserId}:${funding.currency}`) || 0,
-    )),
-    [quote?.walletFunding, quote?.funding, recurringHoldBySupplier],
-  );
-  const hasFundingShortfall = !!quote && (
-    effectiveFunding.some((funding) => funding.requiredTopupMinor > 0)
-    || effectiveRecurringFunding.some((funding) => funding.requiredTopupMinor > 0)
-    || (quote.walletFunding != null && BigInt(quote.walletFunding.shortfallUnits) > 0n)
-  );
+  const checkout = quote ? clientCheckoutState(quote) : null;
+  const topup = async () => {
+    if (!quote?.walletFunding || loading) return;
+    setLoading(true);
+    try {
+      await cancelClientMarketQuote(quote.id);
+      // Only non-sensitive configuration crosses navigation; passwords never leave memory.
+      const returnTo = new URLSearchParams();
+      if (fixedHost) {
+        returnTo.set("focusHost", fixedHost.id);
+        const draft = drafts[quote.items[0]?.id];
+        if (draft?.subdomain) returnTo.set("draftSubdomain", draft.subdomain);
+        if (draft?.autoRenew) returnTo.set("draftAutoRenew", "1");
+      }
+      liveQuote.current = null;
+      const href = walletTopupHref(quote.walletFunding.shortfallUnits, `/client-market/?${returnTo}`);
+      close(false);
+      router.push(href);
+    } catch { setError(t("clientCheckout.loadFailed")); }
+    finally { setLoading(false); }
+  };
   const subdomainsCanCommit = !!quote && quote.items.every((item) => {
     const value = normalizeDraftSubdomain(drafts[item.id]?.subdomain || "");
     const check = subdomainChecks[item.id];
@@ -724,10 +697,10 @@ export function CreateClientDialog({
 
   return (
     <>
-    <Modal.Backdrop isOpen={open} onOpenChange={close} isDismissable={phase !== "running"}>
+    <Modal.Backdrop isOpen={open} onOpenChange={close} isDismissable={!loading && phase !== "running"}>
       <Modal.Container placement="center">
-        <Modal.Dialog className="light min-w-0 w-[min(720px,calc(100vw-2rem))] max-w-none overflow-hidden !bg-white !text-slate-900">
-          <Modal.Header><Modal.Heading>{fixedHost ? t("createClient.fixedTitle", { host: fixedHost.hostname || fixedHost.ip || fixedHost.id.slice(0, 8) }) : t("createClient.title")}</Modal.Heading></Modal.Header>
+        <Modal.Dialog className="light min-w-0 w-[min(560px,calc(100vw-2rem))] max-w-none overflow-hidden !bg-white !text-slate-900">
+          <Modal.Header><Modal.Heading>{phase === "quote" ? t("clientCheckout.confirmTitle") : t("createClient.title")}</Modal.Heading></Modal.Header>
           <Modal.Body className="grid min-w-0 max-h-[min(76vh,680px)] grid-cols-[minmax(0,1fr)] gap-4 overflow-y-auto">
             {phase === "form" && !fixedHost ? (
               <SegmentedControl
@@ -751,7 +724,7 @@ export function CreateClientDialog({
               <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-5">
                 {loading ? <div className="flex items-center gap-2 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />{t("createClient.loadingSupply")}</div> : null}
                 {freeOnly ? (
-                  <p className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-900">
+                  <p className="text-xs leading-relaxed text-muted-foreground">
                     {t("createClient.freeOnlyHint")}
                   </p>
                 ) : null}
@@ -821,150 +794,38 @@ export function CreateClientDialog({
             ) : null}
 
             {phase === "quote" && quote ? (
-              <div className="grid gap-4">
-                <div className="flex flex-wrap items-center justify-between gap-2 pb-1"><div><strong className="text-sm">{t("createClient.reservedHosts")}</strong></div><Chip
-                  size="sm"
-                  variant={quoteSeconds <= 30 ? "soft" : "tertiary"}
-                  className={
-                    quoteSeconds <= 30
-                      ? "bg-rose-100 text-rose-700"
-                      : quoteSeconds <= 60
-                        ? "bg-amber-100 text-amber-800"
-                        : undefined
-                  }
-                  aria-live={quoteSeconds <= 30 ? "assertive" : "polite"}
-                >
-                  {t("createClient.quoteCountdown", { seconds: quoteSeconds })}
-                </Chip></div>
-                {quote.walletFunding ? (
-                  <section className="grid gap-2 rounded-lg bg-muted/50 p-3 text-sm" aria-live="polite">
-                    <h3 className="font-semibold">{t("marketWallet.title")}</h3>
-                    <div className="flex items-center justify-between gap-3">
-                      <span className="text-muted-foreground">{t("marketWallet.available")}</span>
-                      <strong className="min-w-0 break-all text-right tabular-nums">{formatWalletUnits(quote.walletFunding.availableUnits, "$", locale)}</strong>
-                    </div>
-                    {BigInt(quote.walletFunding.committedUnits ?? "0") > 0n ? <div className="flex items-center justify-between gap-3">
-                      <span className="text-muted-foreground">{t("marketWallet.existingCommitments")}</span>
-                      <strong className="min-w-0 break-all text-right tabular-nums">{formatWalletUnits(quote.walletFunding.committedUnits, "$", locale)}</strong>
-                    </div> : null}
-                    <div className="flex items-center justify-between gap-3">
-                      <span className="text-muted-foreground">{t("marketWallet.requiredNow")}</span>
-                      <strong className="min-w-0 break-all text-right tabular-nums">{formatWalletUnits(quote.walletFunding.requiredUnits, "$", locale)}</strong>
-                    </div>
-                    {BigInt(quote.walletFunding.shortfallUnits) > 0n ? (
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <span role="alert" className="font-medium text-destructive">{t("marketWallet.shortfall", { amount: formatWalletUnits(quote.walletFunding.shortfallUnits, "$", locale) })}</span>
-                        <Link
-                          href={walletTopupHref(quote.walletFunding.shortfallUnits, fixedHost ? `/client-market/?focusHost=${encodeURIComponent(fixedHost.id)}` : "/client-market/")}
-                          className="inline-flex min-h-11 items-center whitespace-nowrap font-semibold text-primary underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring active:opacity-70"
-                        >{t("marketWallet.topupShortfall")}</Link>
-                      </div>
-                    ) : null}
-                    <p className="text-xs text-muted-foreground">{t("marketWallet.serviceBilling")}</p>
-                  </section>
-                ) : null}
-                {recurringQuoteCount ? (
-                  <div className="flex gap-3 rounded-md border border-emerald-200 bg-emerald-50 p-3 text-sm leading-6 text-emerald-950">
-                    <ShieldCheck className="mt-1 h-4 w-4 shrink-0" />
-                    <div>
-                      <strong>{t("createClient.quoteTerms.prepaidMonthlyTitle")}</strong>
-                      <p>{t("createClient.quoteTerms.prepaidMonthly", {
-                        count: recurringQuoteCount,
-                        suppliers: recurringSupplierCount,
-                      })}</p>
-                    </div>
-                  </div>
-                ) : null}
-                {legacyPaidQuoteCount ? (
-                  <div className="flex gap-3 rounded-md border border-sky-200 bg-sky-50 p-3 text-sm leading-6 text-sky-950">
-                    <Clock3 className="mt-1 h-4 w-4 shrink-0" />
-                    <div>
-                      <strong>{t("createClient.quoteTerms.postpaidTitle")}</strong>
-                      <p>{t("createClient.quoteTerms.postpaid", {
-                        count: legacyPaidQuoteCount,
-                        suppliers: legacySupplierCount,
-                        hours: 12,
-                      })}</p>
-                    </div>
-                  </div>
-                ) : null}
-                {effectiveFunding.map((funding) => (
-                  <div key={`${funding.supplierUserId}:${funding.currency}`} className="grid gap-2">
-                    <MarketFundingSummaryCard funding={funding} />
-                    {funding.topupAvailable ? (
-                      <Button size="sm" variant="outline" className="justify-self-start" onClick={() => setTopupFunding(funding)}>
-                        {t(funding.requiredTopupMinor > 0 ? "marketFunding.topup.requiredAction" : "marketFunding.topup.optionalAction")}
-                      </Button>
-                    ) : funding.requiredTopupMinor > 0 ? (
-                      <p className="border-l-2 border-rose-400 bg-rose-50 px-3 py-2 text-xs leading-5 text-rose-800">{t(marketFundingTopupUnavailableKey(funding.topupUnavailableReason))}</p>
-                    ) : null}
-                  </div>
-                ))}
-                {effectiveRecurringFunding.map((funding) => (
-                  <div key={`recurring:${funding.supplierUserId}:${funding.currency}`} className="grid gap-2">
-                    <MarketRecurringFundingSummaryCard funding={funding} />
-                    {funding.topupAvailable ? (
-                      <Button size="sm" variant="outline" className="justify-self-start" onClick={() => setTopupFunding(funding)}>
-                        {t(funding.requiredTopupMinor > 0 ? "marketFunding.topup.requiredAction" : "marketFunding.topup.optionalAction")}
-                      </Button>
-                    ) : funding.requiredTopupMinor > 0 ? (
-                      <p className="border-l-2 border-rose-400 bg-rose-50 px-3 py-2 text-xs leading-5 text-rose-800">{t(marketFundingTopupUnavailableKey(funding.topupUnavailableReason))}</p>
-                    ) : null}
-                  </div>
-                ))}
-                {freeQuoteCount ? (
-                  <div className="flex gap-3 rounded-md border border-emerald-200 bg-emerald-50 p-3 text-sm leading-6 text-emerald-950">
-                    <ShieldCheck className="mt-1 h-4 w-4 shrink-0" />
-                    <p>{t("createClient.quoteTerms.free", { count: freeQuoteCount })}</p>
-                  </div>
-                ) : null}
-                {quote.items.map((item, index) => {
-                  const draft = drafts[item.id] || { subdomain: "", password: "", autoRenew: false };
-                  const subdomainValue = normalizeDraftSubdomain(draft.subdomain);
-                  const subdomainCheck = subdomainChecks[item.id]?.value === subdomainValue ? subdomainChecks[item.id] : undefined;
-                  return <section key={item.id} className="grid gap-3 rounded-md border p-3"><div className="flex flex-wrap items-center gap-2"><span className="font-mono text-xs text-muted-foreground">#{index + 1}</span><strong className="font-mono text-sm">{item.ip || "—"}</strong>{item.countryCode ? <CountryFlag className="text-sm" code={item.countryCode} /> : null}<span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">{item.hostOwnerEmail}</span><span className="text-sm font-semibold">{formatOffer(item.dailyRateMinor, locale, item.currency, item.freeDurationDays, item.cyclePriceMinor)}</span></div>{item.pricingModel === "prepaid_calendar_month" ? <label className="flex cursor-pointer items-start gap-2 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-sm"><input type="checkbox" className="mt-1 h-4 w-4 accent-emerald-600" checked={draft.autoRenew} onChange={(event) => setDrafts((current) => ({ ...current, [item.id]: { ...draft, autoRenew: event.target.checked } }))} /><span><strong className="block">{t("marketRecurring.autoRenew")}</strong><span className="block text-xs leading-5 text-muted-foreground">{quote.walletFunding ? t("marketWallet.autoRenewAtDue") : t("marketRecurring.autoRenewAtCheckout", { amount: formatOffer(undefined, locale, item.currency, undefined, item.cyclePriceMinor) })}</span></span></label> : null}<label className="grid gap-1 text-sm"><span className="text-muted-foreground">{t("createClient.subdomain")}</span><div className="flex gap-2"><input value={draft.subdomain} onChange={(event) => setDrafts((current) => ({ ...current, [item.id]: { ...draft, subdomain: event.target.value } }))} className={`h-10 min-w-0 flex-1 rounded-md border px-3 font-mono ${subdomainCheck?.status === "unavailable" ? "border-rose-400" : subdomainCheck?.status === "available" ? "border-emerald-400" : ""}`} /><Button isIconOnly variant="outline" aria-label={t("createClient.randomSubdomain")} onClick={() => setDrafts((current) => ({ ...current, [item.id]: { ...draft, subdomain: randomSubdomain() } }))}><Dices className="h-4 w-4" /></Button></div>{subdomainCheck ? <span className={`flex items-center gap-1 text-xs ${subdomainCheck.status === "available" ? "text-emerald-700" : subdomainCheck.status === "unavailable" ? "text-rose-600" : "text-muted-foreground"}`}>{subdomainCheck.status === "checking" ? <Loader2 className="h-3 w-3 animate-spin" /> : subdomainCheck.status === "available" ? <Check className="h-3 w-3" /> : null}{subdomainCheck.status === "checking" ? t("createClient.subdomainChecking") : subdomainCheck.status === "available" ? t("createClient.subdomainAvailable") : subdomainCheck.message}</span> : null}</label><label className="grid gap-1 text-sm"><span className="text-muted-foreground">{t("createClient.password")}</span><input type="password" value={draft.password} onChange={(event) => setDrafts((current) => ({ ...current, [item.id]: { ...draft, password: event.target.value } }))} autoComplete="new-password" className="h-10 rounded-md border px-3" /></label></section>;
-                })}
-              </div>
+              <ClientCheckoutForm quote={quote} drafts={drafts} checks={subdomainChecks} seconds={expired ? 0 : quoteSeconds} busy={loading || submissionUncertain}
+                onDraft={(id, patch) => setDrafts((current) => ({ ...current, [id]: { ...current[id], ...patch } }))}
+                onRandom={(id) => setDrafts((current) => ({ ...current, [id]: { ...current[id], subdomain: randomSubdomain() } }))} />
             ) : null}
 
             {(phase === "running" || phase === "complete") ? (
-              <div className="grid gap-4">{phase === "complete" ? <div className={`rounded-md border p-3 text-sm ${failures ? "border-amber-200 bg-amber-50" : "border-emerald-200 bg-emerald-50"}`}><strong>{t("createClient.resultSummary", { successes, failures })}</strong>{failures ? <p className="mt-1 text-xs text-muted-foreground">{t("createClient.partialRollback")}</p> : null}</div> : null}{jobList.map((job, index) => <section key={job.id} className="grid gap-2"><div className="flex items-center justify-between text-xs"><span className="font-mono">#{index + 1} · {job.subdomain || job.id.slice(0, 8)}</span><Chip size="sm" variant="soft">{job.status}</Chip></div><ProvisionJobLog log={job.log || ""} phase={job.status === "failed" ? "failed" : job.status === "succeeded" ? "success" : "running"} /></section>)}</div>
+              <div className="grid min-w-0 gap-4">
+                {phase === "complete" ? <p role="status" className="text-sm font-medium">{t("createClient.resultSummary", { successes, failures })}</p> : null}
+                {jobList.map((job) => <section key={job.id} className="grid min-w-0 gap-2 border-b border-border pb-4 last:border-0">
+                  <strong className="break-all text-sm">{job.subdomain || t("createClient.title")}</strong>
+                  <p role="status" className="text-sm text-muted-foreground">{t(job.status === "failed" ? "createClient.failed" : job.status === "succeeded" ? "createClient.successTitle" : job.phase === "waiting_for_client" ? "clientCheckout.waiting" : job.status === "pending" ? "clientCheckout.queued" : "clientCheckout.installing")}</p>
+                  {job.status === "failed" ? <p className="text-xs text-muted-foreground">{t("clientCheckout.failedHint")}</p> : null}
+                  {job.status === "succeeded" && job.clientUrl && /^https?:\/\//.test(job.clientUrl) ? <a href={job.clientUrl} target="_blank" rel="noopener noreferrer" className="justify-self-start text-sm font-medium text-primary hover:underline">{t("clientCheckout.openClient")}</a> : null}
+                  <details className="min-w-0 text-xs text-muted-foreground"><summary className="cursor-pointer">{t("clientCheckout.logs")}</summary><ProvisionJobLog log={job.log || ""} phase={job.status === "failed" ? "failed" : job.status === "succeeded" ? "success" : "running"} /></details>
+                </section>)}
+              </div>
             ) : null}
-            {error ? <p className="text-sm text-rose-600">{error}</p> : null}
+            {checkout?.shortfall && !checkout.unsupported ? <p className="text-xs text-muted-foreground">{t("clientCheckout.topupHint")}</p> : null}
+            {error ? <p role="alert" className="text-sm text-destructive">{error}</p> : null}
           </Modal.Body>
           <Modal.Footer>
-            {phase === "quote" ? <Button variant="ghost" isDisabled={loading} onClick={() => void cancelQuote()}><RotateCcw className="h-4 w-4" />{t("clientMarket.back")}</Button> : <Button variant="ghost" isDisabled={phase === "running"} onClick={() => close(false)}>{t("common.close")}</Button>}
+            {phase === "quote" && !fixedHost && !submissionUncertain ? <Button variant="ghost" isDisabled={loading} onClick={() => void cancelQuote()}><RotateCcw className="h-4 w-4" />{t("clientMarket.back")}</Button> : <Button variant="ghost" isDisabled={phase === "running" || loading} onClick={() => close(false)}>{t("common.close")}</Button>}
             {phase === "form" && mode === "manual" && !fixedHost ? <Button variant="outline" onClick={() => void navigator.clipboard.writeText(installCommand).then(() => { setCopied(true); window.setTimeout(() => setCopied(false), 1500); })}>{copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}{copied ? t("dashboard.connectDialog.copyOk") : t("dashboard.connectDialog.copy")}</Button> : null}
-            {phase === "form" && (mode === "online" || fixedHost) ? <Button variant="primary" isDisabled={loading || authLoading || (authed && capacity < quantity)} onClick={() => void requestQuote()}>{!authed ? <LogIn className="h-4 w-4" /> : loading ? <Loader2 className="h-4 w-4 animate-spin" /> : null}{!authed ? t("createClient.login") : !fixedHost && safeProviders.mode === "official_default" && capacity === 0 ? t("createClient.officialNoCapacityButton") : t("createClient.selectHosts")}</Button> : null}
-            {phase === "quote" ? <Button variant="primary" isDisabled={loading || quoteSeconds <= 0 || !subdomainsCanCommit || hasFundingShortfall} onClick={() => void commit()}>{loading ? <Loader2 className="h-4 w-4 animate-spin" /> : null}{t("createClient.confirmCreate")}</Button> : null}
+            {phase === "form" && (mode === "online" || fixedHost) ? <Button variant="primary" isDisabled={loading || authLoading || (authed && capacity < quantity)} onClick={() => void requestQuote()}>{!authed ? <LogIn className="h-4 w-4" /> : loading ? <Loader2 className="h-4 w-4 animate-spin" /> : null}{!authed ? t("createClient.login") : !fixedHost && safeProviders.mode === "official_default" && capacity === 0 ? t("createClient.officialNoCapacityButton") : t(fixedHost ? "clientCheckout.requote" : "createClient.selectHosts")}</Button> : null}
+            {phase === "quote" && submissionUncertain ? <Button variant="primary" isDisabled={loading} onPress={() => void commit()}>{loading ? <Loader2 className="h-4 w-4 animate-spin" /> : null}{t("common.retry")}</Button>
+              : phase === "quote" && (expired || quoteSeconds <= 0) ? <Button variant="primary" isDisabled={loading} onPress={() => void requestQuote()}>{loading ? <Loader2 className="h-4 w-4 animate-spin" /> : null}{t("clientCheckout.requote")}</Button>
+              : phase === "quote" && checkout?.shortfall && !checkout.unsupported ? <Button variant="primary" isDisabled={loading} onPress={() => void topup()}>{t("clientCheckout.topup")}</Button>
+              : phase === "quote" ? <Button variant="primary" isDisabled={loading || !subdomainsCanCommit || checkout?.unsupported} onPress={() => void commit()}>{loading ? <Loader2 className="h-4 w-4 animate-spin" /> : null}{t(checkout?.trial ? "clientCheckout.trialAction" : checkout?.paid ? "clientCheckout.paidAction" : "createClient.create")}</Button> : null}
           </Modal.Footer>
         </Modal.Dialog>
       </Modal.Container>
     </Modal.Backdrop>
-    <MarketFundingTopupDialog
-      open={!!topupFunding}
-      funding={topupFunding}
-      onClose={() => setTopupFunding(undefined)}
-      onCredited={async () => {
-        setTopupFunding(undefined);
-        setPhase("form");
-        if (quote) {
-          setLoading(true);
-          const rescued: Record<string, Draft> = {};
-          for (const item of quote.items) {
-            const draft = drafts[item.id];
-            if (draft && (draft.subdomain || draft.password)) rescued[item.hostId] = draft;
-          }
-          preservedDrafts.current = rescued;
-          setQuote(null);
-          setDrafts({});
-          setSubdomainChecks({});
-          await cancelClientMarketQuote(quote.id).catch(() => undefined);
-          setLoading(false);
-        }
-        await requestQuote();
-      }}
-    />
     </>
   );
 }

@@ -1,5 +1,6 @@
 "use client";
 
+import { walletLifecycleKey, trialHours } from "@/lib/client-checkout";
 import * as React from "react";
 import Link from "next/link";
 import { Button } from "@heroui/react";
@@ -17,10 +18,12 @@ export function MarketWalletRenewalCard({
   contractId,
   onChanged,
   compact = false,
+  refreshKey,
 }: {
   contractId: string;
   onChanged?: () => Promise<void> | void;
   compact?: boolean;
+  refreshKey?: string;
 }) {
   const { locale, t } = useLocaleText();
   const [contract, setContract] = React.useState<MarketWalletRenewal | null>(null);
@@ -38,7 +41,7 @@ export function MarketWalletRenewalCard({
       if (active) setError(cause instanceof Error ? cause.message : String(cause));
     });
     return () => { active = false; };
-  }, [contractId, attempt]);
+  }, [contractId, attempt, refreshKey]);
 
   const toggle = async () => {
     if (!contract || busy) return;
@@ -67,8 +70,9 @@ export function MarketWalletRenewalCard({
     <span className="inline-flex items-center gap-1.5"><CalendarClock className="h-4 w-4 text-muted-foreground" />
       <strong>{formatUsdMoney(contract.cyclePriceMinor, locale)} / {t("marketBilling.month")}</strong>
     </span>
+    <span className="text-muted-foreground">{t(walletLifecycleKey(contract), { hours: trialHours(contract.trialSecondsRemaining, locale), date: nextDate || "—" })}</span>
     <span className="text-muted-foreground">{contract.renewalPolicy === "automatic"
-      ? t("marketWallet.renewal.auto") : t("marketWallet.renewal.manual")}{nextDate ? ` · ${nextDate}` : ""}</span>
+      ? t("marketWallet.renewal.auto") : t("marketWallet.renewal.manual")}</span>
     {canChange ? <Button size="sm" variant="outline" isDisabled={busy} onPress={() => void toggle()}>
       {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
       {t(contract.renewalPolicy === "automatic" ? "marketWallet.renewal.stop" : "marketWallet.renewal.start")}

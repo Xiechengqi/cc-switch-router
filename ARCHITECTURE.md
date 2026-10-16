@@ -138,7 +138,11 @@ idle ──► locked ──► allocated ──► draining ──► idle
 
 这里的后台重试仅覆盖 Router 自身的首次开通 job 和显式 cleanup job。首次开通脚本只启动一次 Client 进程，安装的 systemd/OpenRC 服务不启用开机启动、失败重启或 respawn。开通完成后，Router 不会因 tunnel 离线而通过 provision SSH 启动或重启 `cc-switch-server`；只记录 `online`、`reconnecting`、`offline`、`disabled` 连接状态并继续心跳、告警和 UI 提示。Client 进程生命周期完全由 Client owner 管理。
 
-**准入与支付均和 Share Market 共用统一机制**:免费 Host 使用独立的 `client_host/free` 作用域，默认黑名单；可配置 1–365 天固定期限或永久，期限在 Client provisioning 成功后才开始，到期复用安全 cleanup。付费 Host 使用默认白名单的 `client_host/paid` 作用域，还要求买家获得 USD 私有额度，或在该付费作用域切为黑名单后使用有限公共额度。付费 Host 以固定 USD 每日价格提供,先享受 12 小时健康服务时长试用,之后只按 Router 观测到的健康区间累计费用。同一买家和 Host Provider 下的 Host 与 Share 共用 USD 余额,按买家额度出账。Router 只记录链下付款声明,供应商独立核验到账后确认；只有确认到账或管理员作废账单才会解除对应逾期限制。Provider 租用自己的付费 Host 时按免费处理,不会形成自债务。
+**准入与支付**：免费和付费 Host 分别执行 `client_host/free`、`client_host/paid` 准入。平台钱包启用后，付费租用从用户全站 USD 余额支付，Provider 的收款方式不再作为商品支付渠道或筛选项；供应商提现资料仅供发布准备与提现使用。新付费报价采用日历月租，历史按日合同按原资金路径处理。Provider 自用按免费处理。
+
+**购买确认**：指定 Host 直接获取 120 秒预留报价并进入配置确认；通用新建先选择免费资源池，最多两台。报价项返回真实剩余 `trialSecondsRemaining`，试用按健康服务时长消耗，不冻结用户资金；试用结束从平台钱包支付首期，无余额则暂停 Client tunnel。无试用时提交预留当期资金，开通成功后扣款。自动续费仅在下一期到期时扣款。报价过期保留内存草稿并要求重新确认；充值只携带 Host、子域名和续费选择，密码不持久化。新购买界面不会降级到商家直付。
+
+**租后状态**：租约返回买家可见的 `walletContract`（合同状态、剩余试用、续费策略、当期结束时间），不从旧月租表推断钱包账期。Host、租约、钱包合同和 Client 在线状态分别展示。免费期限从开通成功后开始计算。释放失败可以结束租约，但 Host 保持隔离；资金是否已退回取决于确认清理后的账本处理，不根据安装失败或租约结束直接宣称退款成功。
 
 ### ④ Provider Rank —— 跨市场供应商发现
 

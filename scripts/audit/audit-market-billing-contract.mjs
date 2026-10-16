@@ -488,7 +488,7 @@ function main() {
     ],
     [
       "frontend/components/dashboard/create-client-dialog.tsx",
-      ["createClient.quoteTerms.postpaid", "createClient.quoteTerms.free", "offerRevision: item.offerRevision"],
+      ["ClientCheckoutForm", "clientCheckoutState", "offerRevision: item.offerRevision"],
     ],
     [
       "frontend/components/dashboard/account-billing-page.tsx",

@@ -3000,6 +3000,7 @@ export type ClientMarketQuoteItem = {
   currency?: string;
   freeDurationDays?: number;
   offerRevision: number;
+  trialSecondsRemaining: number;
 };
 
 export type ClientMarketAllocationQuote = {
@@ -3027,6 +3028,14 @@ export type ClientMarketBatch = {
   jobs: ProvisioningJob[];
 };
 
+export type WalletLifecycle = {
+  id?: string;
+  status: string;
+  trialSecondsRemaining: number;
+  renewalPolicy: string;
+  periodEnd?: string | null;
+};
+
 export type ClientMarketRental = {
   installationId: string;
   hostId: string;
@@ -3046,6 +3055,7 @@ export type ClientMarketRental = {
   billingInterval?: MarketBillingInterval;
   recurring?: MarketRecurringContract;
   walletContractId?: string;
+  walletContract?: WalletLifecycle;
   openWalletDispute?: boolean;
   currency?: "USD";
   freeDurationDays?: number;

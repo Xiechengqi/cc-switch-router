@@ -423,6 +423,16 @@ function HostRowImpl({
                 {t("clientMarket.connection.ownerActionRequired")}
               </span>
             ) : null}
+            {showRenterRental && rental ? (
+              <div className="mt-0.5 min-w-0" onClick={(event) => event.stopPropagation()}>
+                <ClientMarketRentalBanner
+                  rental={rental}
+                  onChanged={onChanged}
+                  compact
+                  resumeRelease
+                />
+              </div>
+            ) : null}
             {statusGuidanceSubtitle ? (
               <span className="mt-0.5 block truncate text-[11px] leading-4 text-muted-foreground">
                 {statusGuidanceSubtitle}
@@ -460,16 +470,6 @@ function HostRowImpl({
             >
               {formatHostOffer(host.dailyRateMinor, locale, host.freeDurationDays, host.cyclePriceMinor)}
             </span>
-            {showRenterRental && rental ? (
-              <div className="mt-0.5 min-w-0" onClick={(event) => event.stopPropagation()}>
-                <ClientMarketRentalBanner
-                  rental={rental}
-                  onChanged={onChanged}
-                  compact
-                  resumeRelease
-                />
-              </div>
-            ) : null}
           </div>
         </td>
         <td className="max-w-[12rem] px-2 py-2 align-middle">

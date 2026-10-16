@@ -297,6 +297,7 @@ pub struct QuoteItemView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub free_duration_days: Option<u32>,
     pub offer_revision: i64,
+    pub trial_seconds_remaining: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -380,6 +381,8 @@ pub struct RentalView {
     pub recurring: Option<crate::market_recurring::RecurringContractView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wallet_contract_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wallet_contract: Option<crate::market_platform_contracts::WalletLifecycleView>,
     pub open_wallet_dispute: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub currency: Option<String>,
@@ -3660,6 +3663,7 @@ impl AppStore {
                 currency: candidate.currency,
                 free_duration_days: candidate.free_duration_days,
                 offer_revision: candidate.offer_revision,
+                trial_seconds_remaining: candidate.wallet_trial_seconds,
             });
         }
         insert_audit_tx(
@@ -5150,6 +5154,7 @@ struct RentalRow {
     cleanup_probe_attempts: Option<i64>,
     bound_host_status: Option<String>,
     wallet_contract_id: Option<String>,
+    wallet_lifecycle_id: Option<String>,
     open_wallet_dispute: bool,
     provider_terminal_expires_at: Option<String>,
     provider_terminal_revoked_at: Option<String>,
@@ -5199,7 +5204,8 @@ fn load_rental_views(
                    AND contract.paid_started_at IS NOT NULL),
                 EXISTS(SELECT 1 FROM market_service_disputes dispute
                        WHERE dispute.contract_id = s.platform_contract_id
-                         AND dispute.status = 'open')
+                         AND dispute.status = 'open'),
+                s.platform_contract_id
          FROM client_market_subscriptions s
          LEFT JOIN client_market_provider_terminal_authorizations a
            ON a.installation_id = s.installation_id
@@ -5245,6 +5251,7 @@ fn load_rental_views(
             cleanup_probe_attempts: row.get(24)?,
             bound_host_status: row.get(25)?,
             wallet_contract_id: row.get(26)?,
+            wallet_lifecycle_id: row.get(28)?,
             open_wallet_dispute: row.get::<_, i64>(27)? != 0,
         })
     };
@@ -5322,6 +5329,21 @@ fn load_rental_views(
             cycle_price_minor: row.cycle_price_minor,
             billing_interval: row.billing_interval,
             recurring,
+            wallet_contract: if client_role {
+                row.wallet_lifecycle_id
+                    .as_deref()
+                    .map(|id| {
+                        crate::market_platform_contracts::wallet_lifecycle_view_tx(
+                            conn,
+                            id,
+                            &session.user_id,
+                        )
+                    })
+                    .transpose()?
+                    .flatten()
+            } else {
+                None
+            },
             wallet_contract_id: client_role.then_some(row.wallet_contract_id).flatten(),
             open_wallet_dispute: client_role && row.open_wallet_dispute,
             currency: row.currency,

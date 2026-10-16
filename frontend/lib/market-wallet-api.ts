@@ -104,6 +104,7 @@ export type MarketWalletRenewal = {
   renewalPolicy: "manual" | "automatic";
   status: string;
   periodEnd: string | null;
+  trialSecondsRemaining: number;
 };
 
 export async function getMarketWalletRenewal(contractId: string) {

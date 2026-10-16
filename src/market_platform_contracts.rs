@@ -40,6 +40,43 @@ struct WalletRenewalView {
     renewal_policy: String,
     status: String,
     period_end: Option<String>,
+    trial_seconds_remaining: i64,
+}
+
+/// Buyer-only lifecycle projection shared by rental details and wallet controls.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WalletLifecycleView {
+    pub id: String,
+    pub status: String,
+    pub trial_seconds_remaining: i64,
+    pub renewal_policy: String,
+    pub period_end: Option<String>,
+}
+
+pub(crate) fn wallet_lifecycle_view_tx(
+    conn: &Connection,
+    id: &str,
+    buyer: &str,
+) -> Result<Option<WalletLifecycleView>, AppError> {
+    conn.query_row(
+        "SELECT status, trial_seconds_remaining, renewal_policy,
+                (SELECT period_end FROM market_platform_periods
+                 WHERE contract_id = contract.id AND sequence = contract.current_period_sequence)
+         FROM market_platform_contracts contract WHERE id = ?1 AND buyer_user_id = ?2",
+        params![id, buyer],
+        |row| {
+            Ok(WalletLifecycleView {
+                id: id.to_string(),
+                status: row.get(0)?,
+                trial_seconds_remaining: row.get(1)?,
+                renewal_policy: row.get(2)?,
+                period_end: row.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(db_error("read wallet service lifecycle"))
 }
 
 #[derive(Deserialize)]
@@ -57,7 +94,8 @@ fn wallet_renewal_view_tx(
     conn.query_row(
         "SELECT id, product_kind, billing_model, cycle_price_minor, renewal_policy, status,
                 (SELECT period_end FROM market_platform_periods
-                 WHERE contract_id = contract.id AND sequence = contract.current_period_sequence)
+                 WHERE contract_id = contract.id AND sequence = contract.current_period_sequence),
+                trial_seconds_remaining
          FROM market_platform_contracts contract WHERE id = ?1 AND buyer_user_id = ?2
            AND billing_model = 'calendar_month'",
         params![contract_id, buyer],
@@ -70,6 +108,7 @@ fn wallet_renewal_view_tx(
                 renewal_policy: row.get(4)?,
                 status: row.get(5)?,
                 period_end: row.get(6)?,
+                trial_seconds_remaining: row.get(7)?,
             })
         },
     )
@@ -569,8 +608,17 @@ pub(crate) fn prepare_contract_tx(
         if crate::market_wallet::wallet_snapshot_tx(conn, input.buyer_user_id)?.available_units
             < needed
         {
-            return Err(AppError::Conflict(
-                "existing wallet services have first claim on the available balance".into(),
+            return Err(AppError::coded_conflict(
+                "MARKET_WALLET_REQUIRED",
+                "wallet balance changed; refresh the quote",
+                serde_json::to_value(crate::market_wallet::wallet_quote_funding_tx(
+                    conn,
+                    input.buyer_user_id,
+                    input.price_minor,
+                    0,
+                    now,
+                )?)
+                .map_err(|error| AppError::Internal(error.to_string()))?,
             ));
         }
     }
@@ -3080,6 +3128,24 @@ mod tests {
             params![at],
         )
         .unwrap();
+        assert!(
+            wallet_lifecycle_view_tx(&conn, "monthly", "other")
+                .unwrap()
+                .is_none()
+        );
+        conn.execute("UPDATE market_platform_contracts SET trial_seconds_remaining = 1234 WHERE id = 'monthly'", []).unwrap();
+        let lifecycle = wallet_lifecycle_view_tx(&conn, "monthly", "buyer")
+            .unwrap()
+            .unwrap();
+        assert_eq!(lifecycle.status, "trialing");
+        assert_eq!(lifecycle.trial_seconds_remaining, 1234);
+        assert!(lifecycle.period_end.is_none());
+        assert_eq!(
+            wallet_renewal_view_tx(&conn, "monthly", "buyer")
+                .unwrap()
+                .trial_seconds_remaining,
+            1234
+        );
         let enable = UpdateWalletRenewalRequest {
             auto_renew: true,
             expected_policy: "manual".into(),
@@ -3175,10 +3241,14 @@ mod tests {
             auto_renew: false,
             trial_seconds: 0,
         };
-        assert!(matches!(
-            prepare_contract_tx(&conn, &order, time),
-            Err(AppError::Conflict(_))
-        ));
+        let error = prepare_contract_tx(&conn, &order, time).unwrap_err();
+        assert_eq!(error.code(), Some("MARKET_WALLET_REQUIRED"));
+        if let AppError::Coded { details, .. } = error {
+            assert_eq!(
+                details["shortfallUnits"],
+                units_from_minor(50).unwrap().to_string()
+            );
+        }
         crate::market_wallet::credit_verified_topup_tx(
             &conn,
             "buyer",

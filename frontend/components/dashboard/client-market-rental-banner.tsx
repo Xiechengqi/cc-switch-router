@@ -1,5 +1,6 @@
 "use client";
 
+import { trialHours, walletLifecycleKey } from "@/lib/client-checkout";
 import { CalendarClock, Clock3, HandCoins, Loader2 } from "lucide-react";
 import {
   FinalizeFailedRentalAction,
@@ -12,7 +13,7 @@ import { clientMarketCleanupReasonKey, clientMarketRentalHasBanner } from "@/lib
 import { cleanupFailureGuidanceKey } from "@/components/dashboard/client-market/host-utils";
 import type { ClientMarketRental } from "@/lib/types";
 
-/** Client lifecycle status plus a single link to supplier-level postpaid billing. */
+/** Rental and wallet lifecycle are separate from Client connection health. */
 export function ClientMarketRentalBanner({
   rental,
   onChanged,
@@ -49,6 +50,7 @@ export function ClientMarketRentalBanner({
         {!rental.activeCleanupJobId && rental.cleanupFailureKind ? <span>{t(clientMarketCleanupReasonKey(rental.cleanupFailureKind))}</span> : null}
         {nextProbe ? <span>{t("clientMarket.release.nextProbe", { time: nextProbe })}</span> : null}
         {probeStopped ? <span>{t("clientMarket.release.probeStopped")}</span> : null}
+        {rental.walletContract ? <span>{t(walletLifecycleKey(rental.walletContract), { hours: trialHours(rental.walletContract.trialSecondsRemaining, locale), date: "—" })}</span> : null}
       </span>
     );
   }
@@ -82,6 +84,17 @@ export function ClientMarketRentalBanner({
         {!readOnly ? <FinalizeFailedRentalAction rental={rental} onChanged={onChanged} /> : null}
       </span>
     );
+  }
+
+  if (rental.walletContract) {
+    const contract = rental.walletContract;
+    const date = contract.periodEnd && Number.isFinite(Date.parse(contract.periodEnd))
+      ? new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(contract.periodEnd)) : "—";
+    return <span className={`inline-flex min-w-0 flex-wrap items-center gap-1.5 text-muted-foreground ${compact ? "text-[11px]" : "text-xs"}`}>
+      <CalendarClock className="h-3 w-3 shrink-0" />
+      <span>{t(walletLifecycleKey(contract), { hours: trialHours(contract.trialSecondsRemaining, locale), date })}</span>
+      {showManageLink ? <a href={manageHref || DASHBOARD_ACCOUNT_WALLET_PATH} className="font-medium text-primary hover:underline">{t(manageHref ? "clientMarket.release.manageInMarket" : "account.nav.wallet")}</a> : null}
+    </span>;
   }
 
   if (rental.pricingModel === "prepaid_calendar_month" && rental.recurring) {

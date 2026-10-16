@@ -321,7 +321,17 @@ Server 要求:
 
 免费和付费拼车位都可通过 `serviceDurationDays` 设置 `1..=365` 天固定服务期限；省略或传 `null` 表示无固定期限。`tokenLimit` 省略时 Router 忽略提交的 `tokenPeriod` 并归一为 `lifetime`；只有设置 Token 限额时才校验该 Server 支持的周期。报价参数在租用时冻结到 Subscription，固定期限从租用事务提交成功时计算，并以同一绝对 `expiresAt` 写入 managed grant policy，授权延迟和账单暂停均不顺延。Router 在到期前 24 小时写入一次 `service_term_expiring`，到期后终止付费合约并根据控制操作是否可能已送达选择直接释放或安全 revoke；付费尾段会精确结算到 `expiresAt`，账务与 Share worker 的先后顺序既不会漏计也不会越界计费。`grant_pending`、活跃、账单暂停、恢复中及控制失败状态均不得在到期后重新获得访问，回收失败时也不会把座位提前恢复为可租。
 
-### 7.2 Share / Client Market 统一准入与授信
+### Client Market 钱包购买与展示契约
+
+- `POST /v1/client-market/quotes` 的每项返回 `trialSecondsRemaining`（实际剩余健康服务秒数）；`walletFunding` 的金额字段使用整数单位字符串，`fundingRail=platform_wallet` 才可进入新的付费购买界面。免费报价可无钱包字段。报价只预留资源，不冻结用户资金。
+- `POST /v1/client-market/quotes/:id/commit` 保留报价修订校验与幂等键；试用不预留资金，非试用在提交事务中预留当期金额。资金竞争返回 `409 / MARKET_WALLET_REQUIRED` 及资金摘要，调用方保留草稿、重新报价并由用户确认。网络错误或结果未知时重试同一请求及幂等键，不能换单重建。
+- Client 租约读取接口向租客返回可选 `walletContract`：`id`、`status`、`trialSecondsRemaining`、`renewalPolicy`、`periodEnd`；不向 Host Provider 暴露买家私有合同投影。试用没有确定的墙钟结束时间。独立的 `walletContractId` 仍仅用于已开始付费的争议入口，不用于判断试用合同是否存在。
+- `GET/PUT /v1/market-wallet/contracts/:id/renewal` 为买家专属月租管理接口，读取包含剩余试用；更新携带 `expectedPolicy` 防止覆盖其他会话的修改。
+- 商品页不展示 Provider 收款方式；平台充值渠道只在钱包充值流程出现。充值返回时重新报价，不自动购买；密码不得通过 URL 或持久化草稿传递。
+
+### 7.2 Share / Client Market 统一准入与历史授信
+
+平台钱包启用后，下述授信、公共额度及供应商结算规则仅用于旧资金路径；新的付费租用仍执行供应商准入，但不要求供应商授信。
 
 Share 与 Client Host 的新租用都执行供应商准入，但策略按「产品 + 价格类型」拆成四个独立作用域：`share/free`、`share/paid`、`client_host/free`、`client_host/paid`。免费作用域隐式默认 `blacklist`，便于未知用户先体验；付费作用域隐式默认 `whitelist`，必须先建立信任和授信。供应商可按规范化邮箱添加买家，买家尚未注册时可预授权；首次租用时 Router 按已验证邮箱绑定 `buyer_user_id`。每个关系可对四个作用域分别设置 `inherit`、`allow` 或 `deny`。
 
@@ -384,7 +394,9 @@ v1 权重固定为服务质量 45%、有效选择 30%、履约 15%、供给广�
 
 私有资金汇总按「买家 + Market Provider」去重共享的预付余额和信用；Share/Client daily rate 分别相加，calendar-month contract 按合同汇总。无限信用返回 Provider 数，不转换为虚构金额。完整算法和运维边界见 [docs/provider-ranking.md](docs/provider-ranking.md)。
 
-### 7.3 Share / Client Market 统一后付费
+### 7.3 Share / Client Market 历史后付费
+
+本节描述旧资金路径。新的平台钱包租用遵循上文钱包购买契约，不使用商家直付与付款声明。
 
 付费 Share 与 Client Host 不再按单个商品预付或续费。Router 按「买家 + 供应商」维护唯一 USD 赊账账户；每个服务独立享受 12 小时健康时长试用,之后按固定 USD 每日价格和实际健康秒数累计。有限额度使用达到 80% 时向买卖双方各发送一次预警,用满后自动生成聚合账单。买家主动清账、供应商要求清账、供应商永久关闭赊账账户或最后一个服务结束时也会生成聚合账单。
 

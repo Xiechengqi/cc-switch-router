@@ -11898,6 +11898,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wallet_client_quote_exposes_trial_without_holding_buyer_funds() {
+        use crate::client_market_trade::CreateQuoteRequest;
+        let (store, _config, root) = test_store("wallet-client-quote-trial");
+        let host = add_provider_host(
+            &store,
+            "trial-provider",
+            "trial-provider@example.com",
+            "198.18.21.11",
+            "JP",
+            None,
+        )
+        .await;
+        let buyer = market_session("trial-buyer", "trial-buyer@example.com");
+        {
+            let conn = store.conn.lock().await;
+            conn.execute("UPDATE market_finance_control SET mode = 'enabled', cutover_approved_at = ?1 WHERE id = 1", params![Utc::now().to_rfc3339()]).unwrap();
+            conn.execute("UPDATE router_ssh_hosts SET funding_rail = 'platform_wallet', pricing_model = 'prepaid_calendar_month', cycle_price_minor = 1000, billing_interval = 'calendar_month', currency = 'USD' WHERE id = ?1", params![host.id]).unwrap();
+        }
+        let quote = store
+            .client_market_create_quote(
+                &buyer,
+                CreateQuoteRequest {
+                    provider_ids: vec![],
+                    country_codes: vec![],
+                    count: 1,
+                    host_id: Some(host.id.clone()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(quote.funding_rail, "platform_wallet");
+        assert_eq!(
+            quote.items[0].trial_seconds_remaining,
+            crate::market_billing::TRIAL_SECONDS
+        );
+        let funding = quote.wallet_funding.as_ref().unwrap();
+        assert_eq!(funding.required_units, 0);
+        assert_eq!(funding.held_units, 0);
+        assert_eq!(funding.shortfall_units, 0);
+        let json = serde_json::to_value(&quote).unwrap();
+        assert_eq!(
+            json["items"][0]["trialSecondsRemaining"],
+            crate::market_billing::TRIAL_SECONDS
+        );
+        assert_eq!(json["walletFunding"]["requiredUnits"], "0");
+        store
+            .client_market_cancel_quote(&quote.id, &buyer)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .client_market_get_host(&host.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            HOST_STATUS_IDLE
+        );
+        let quote = store
+            .client_market_create_quote(
+                &buyer,
+                CreateQuoteRequest {
+                    provider_ids: vec![],
+                    country_codes: vec![],
+                    count: 1,
+                    host_id: Some(host.id.clone()),
+                },
+            )
+            .await
+            .unwrap();
+        let committed = store
+            .client_market_commit_quote(
+                &quote.id,
+                &buyer,
+                &[(
+                    quote.items[0].id.clone(),
+                    "trial-wallet-client".into(),
+                    "trial-password".into(),
+                    quote.items[0].offer_revision,
+                )],
+            )
+            .await
+            .unwrap();
+        {
+            let conn = store.conn.lock().await;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            crate::client_market_trade::complete_provisioning_tx(
+                &tx,
+                &committed.job_ids[0],
+                &host.id,
+                "trial-wallet-installation",
+                "https://trial-wallet-client.router.test",
+                Utc::now(),
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let rental = store
+            .client_market_rental_for_viewer("trial-wallet-installation", &buyer)
+            .await
+            .unwrap();
+        assert!(
+            rental.wallet_contract_id.is_none(),
+            "unpaid trials do not expose paid dispute eligibility"
+        );
+        let lifecycle = rental.wallet_contract.unwrap();
+        assert_eq!(lifecycle.status, "trialing");
+        assert_eq!(
+            lifecycle.trial_seconds_remaining,
+            crate::market_billing::TRIAL_SECONDS
+        );
+        assert!(
+            !lifecycle.id.is_empty(),
+            "trial renewal management has a contract ID"
+        );
+        assert!(lifecycle.period_end.is_none());
+        let provider = market_session("trial-provider", "trial-provider@example.com");
+        let provider_view = store
+            .client_market_rental_for_viewer("trial-wallet-installation", &provider)
+            .await
+            .unwrap();
+        assert!(provider_view.wallet_contract.is_none());
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn wallet_client_provisioning_activates_only_its_quoted_contract() {
         use crate::client_market_trade::CreateQuoteRequest;
 

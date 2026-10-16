@@ -1,4 +1,5 @@
 import type { ClientMarketRental } from "@/lib/types";
+import { clientMarketRentalNeedsFollowup } from "./client-market-rental-state";
 
 export type MarketClientHint =
   | "unknown"
@@ -27,7 +28,7 @@ export function marketClientContext(
 ): MarketClientContext | null {
   if (provisionSource !== "router_market" && !rental) return null;
 
-  const manageAs = !rental || (rental.status === "released" && !rental.hostCleanupPending)
+  const manageAs = !rental || (rental.status === "released" && !clientMarketRentalNeedsFollowup(rental))
     ? null
     : rental.isClientOwner ? "client" : "provider";
   if (!offline) return { hint: null, manageAs };

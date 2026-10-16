@@ -73,6 +73,12 @@ test("scheduled, releasing, failed, and ended rentals do not promise a manual re
   assert.deepEqual(marketClientContext("router_market", rental({ status: "released", hostCleanupPending: true }), true, longAgo, now), {
     hint: "released", manageAs: "client",
   });
+  assert.deepEqual(marketClientContext("router_market", rental({
+    status: "released",
+    walletContract: { status: "review_required", trialSecondsRemaining: 0, renewalPolicy: "manual" },
+  }), true, longAgo, now), {
+    hint: "released", manageAs: "client",
+  });
 });
 
 test("paid long-offline reminder is display-only and invalid dates do not trigger it", () => {

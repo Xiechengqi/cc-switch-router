@@ -18,6 +18,7 @@ import {
   grantClientMarketProviderTerminalAccess,
   revokeClientMarketProviderTerminalAccess,
 } from "@/lib/api";
+import { clientMarketRentalNeedsFollowup } from "@/lib/client-market-rental-state";
 import type { ClientMarketHost, ClientMarketRental } from "@/lib/types";
 
 function ProviderTerminalAccessControl({
@@ -179,7 +180,7 @@ export function MyRentalsPanel({
   const activeRentals = React.useMemo(
     () =>
       rentals
-        .filter((rental) => rental.isClientOwner && (rental.status !== "released" || rental.hostCleanupPending))
+        .filter((rental) => rental.isClientOwner && (rental.status !== "released" || clientMarketRentalNeedsFollowup(rental)))
         .sort((left, right) => left.installationId.localeCompare(right.installationId)),
     [rentals],
   );
@@ -252,8 +253,8 @@ export function MyRentalsPanel({
               resumeRelease={false}
             />
             <MarketServiceDisputeControl contractId={rental.walletContractId} initiallyOpen={rental.openWalletDispute} onChanged={onChanged} />
-            {rental.walletContractId && rental.cyclePriceMinor != null ? (
-              <MarketWalletRenewalCard contractId={rental.walletContractId} onChanged={onChanged} />
+            {(rental.walletContract?.id || rental.walletContractId) && rental.cyclePriceMinor != null ? (
+              <MarketWalletRenewalCard contractId={(rental.walletContract?.id || rental.walletContractId)!} refreshKey={JSON.stringify([rental.walletContract?.status, rental.walletContract?.renewalPolicy, rental.walletContract?.periodEnd, rental.walletContract?.trialSecondsRemaining])} onChanged={onChanged} />
             ) : null}
             {rental.recurring ? (
               <MarketRecurringContractCard

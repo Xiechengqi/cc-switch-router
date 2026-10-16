@@ -37,3 +37,10 @@ test("quarantined Host reason stays a safe, compact category", () => {
   assert.equal(clientMarketCleanupReasonKey("cleanup_fingerprint_mismatch"), "clientMarket.release.reason.safety");
   assert.equal(clientMarketCleanupReasonKey("cleanup_purge_failed"), "clientMarket.release.reason.purge");
 });
+
+
+test("ended rentals with unsettled wallet funds remain visible after Host cleanup", () => {
+  const rental = { ...ended, hostCleanupPending: false, walletContract: { status: "review_required", trialSecondsRemaining: 0, renewalPolicy: "manual" } };
+  assert.equal(clientMarketRentalHasBanner(rental), true);
+  assert.equal(clientMarketRentalHasBanner({ ...rental, walletContract: { ...rental.walletContract, status: "ended" } }), false);
+});

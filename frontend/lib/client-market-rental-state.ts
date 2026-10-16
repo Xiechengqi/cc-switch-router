@@ -11,10 +11,14 @@ export function clientMarketCleanupReasonKey(kind?: string): MessageKey {
   return "clientMarket.release.reason.remote";
 }
 
-/** Show ended rentals only while a quarantined Host still needs follow-up. */
+/** Ended services stay visible while either remote cleanup or funds need follow-up. */
+export function clientMarketRentalNeedsFollowup(rental: ClientMarketRental): boolean {
+  return rental.hostCleanupPending || rental.walletContract?.status === "ending" || rental.walletContract?.status === "review_required";
+}
+
 export function clientMarketRentalHasBanner(rental?: ClientMarketRental | null): boolean {
   if (!rental || !rental.isClientOwner) return false;
-  if (rental.status === "released") return rental.hostCleanupPending;
+  if (rental.status === "released") return clientMarketRentalNeedsFollowup(rental);
   if (rental.status === "releasing" || rental.status === "release_failed") return true;
   if (rental.pricingModel === "prepaid_calendar_month" || rental.recurring) return true;
   if (rental.pricingModel === "free" || (rental.dailyRateMinor == null && rental.cyclePriceMinor == null)) {
