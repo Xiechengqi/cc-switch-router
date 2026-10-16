@@ -254,6 +254,15 @@ struct ForceReleaseShareRequestsResponse {
 
 pub fn router(state: ServerState) -> Router {
     let middleware_state = state.clone();
+    let legacy_finance_routes = Router::new()
+        .merge(crate::market_access::router())
+        .merge(crate::market_billing::router())
+        .merge(crate::market_recurring::router())
+        .merge(crate::binance_settlement::router())
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            retired_legacy_finance_write_middleware,
+        ));
     let public_api = Router::new()
         .route("/v1/healthz", get(health))
         .route("/v1/public/map-points", get(public_map_points))
@@ -284,13 +293,11 @@ pub fn router(state: ServerState) -> Router {
         .merge(crate::client_market_trade::router())
         .merge(crate::client_market_terminal::router())
         .merge(crate::share_market::router())
-        .merge(crate::market_access::router())
-        .merge(crate::market_billing::router())
+        .merge(legacy_finance_routes)
         .merge(crate::market_payments::router())
         .merge(crate::market_payouts::router())
+        .merge(crate::market_service_disputes::router())
         .merge(crate::market_providers::router())
-        .merge(crate::market_recurring::router())
-        .merge(crate::binance_settlement::router())
         .merge(crate::client_logs::router())
         .merge(crate::server_logs::router())
         .merge(retired_token_market_routes())
@@ -643,6 +650,59 @@ pub fn router(state: ServerState) -> Router {
             ip_blacklist_middleware,
         ))
         .with_state(state)
+}
+
+/// Legacy financial obligations remain writable during disabled/shadow
+/// cleanup. Once the platform wallet is enabled, every old paid write is a
+/// deliberate 410 rather than a fallback to Provider-specific money.
+fn is_retired_legacy_finance_write(method: &Method, path: &str) -> bool {
+    !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
+        && (path.starts_with("/v1/market-billing/")
+            || path.starts_with("/v1/account/binance-auto-settlement")
+            || (path.starts_with("/v1/market-access/")
+                && (path.contains("/credit-lines")
+                    || path.starts_with("/v1/market-access/public-credit-lines/"))))
+}
+
+async fn retired_legacy_finance_write_middleware(
+    State(state): State<ServerState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let path = req.uri().path();
+    let old_finance_write = is_retired_legacy_finance_write(req.method(), path);
+    if old_finance_write {
+        let mode = {
+            let conn = state.store.conn.lock().await;
+            conn.query_row(
+                "SELECT mode FROM market_finance_control WHERE id = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+        };
+        match mode {
+            Ok(mode) if mode == "enabled" => {
+                let mut response = AppError::Gone(
+                    "legacy Provider-funded payment writes are retired; use the platform wallet"
+                        .into(),
+                )
+                .into_response();
+                response.headers_mut().insert(
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static("private, no-store"),
+                );
+                return response;
+            }
+            Err(error) => {
+                return AppError::Internal(format!(
+                    "read market finance cutover mode failed: {error}"
+                ))
+                .into_response();
+            }
+            _ => {}
+        }
+    }
+    next.run(req).await
 }
 
 async fn ip_blacklist_middleware(
@@ -3859,6 +3919,34 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         server.abort();
+    }
+
+    #[test]
+    fn wallet_cutover_retires_only_old_finance_writes() {
+        for path in [
+            "/v1/market-billing/funding-intents",
+            "/v1/market-billing/recurring-contracts/contract/reserve-next",
+            "/v1/account/binance-auto-settlement/enable",
+            "/v1/market-access/counterparties/party/credit-lines/USD",
+            "/v1/market-access/public-credit-lines/USD",
+        ] {
+            assert!(
+                is_retired_legacy_finance_write(&Method::POST, path),
+                "{path}"
+            );
+        }
+        assert!(!is_retired_legacy_finance_write(
+            &Method::GET,
+            "/v1/market-billing/dashboard"
+        ));
+        assert!(!is_retired_legacy_finance_write(
+            &Method::POST,
+            "/v1/market-access/requests"
+        ));
+        assert!(!is_retired_legacy_finance_write(
+            &Method::POST,
+            "/v1/market-wallet/topups"
+        ));
     }
 
     #[tokio::test]

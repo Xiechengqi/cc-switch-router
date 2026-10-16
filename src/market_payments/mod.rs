@@ -40,12 +40,12 @@ const WEBHOOK_HINT_RECOVERY_SECS: i64 = 21_600;
 const RECONCILE_LEASE_SECS: i64 = 300;
 const TERMINAL_RECONCILE_DAYS: i64 = 90;
 const WEBHOOK_KEY_GRACE_MINUTES: i64 = 10;
-// Keep this false until Share and Client purchases, reconcile, renewal,
-// failure release, refunds, and UI have all moved to the same wallet rail.
-const MARKET_WALLET_CUTOVER_IMPLEMENTED: bool = false;
+// Code integration is separate from the Owner's live merchant acceptance.
+// The latter is recorded only by the guarded cutover API, never by a fixture.
+const MARKET_WALLET_CUTOVER_IMPLEMENTED: bool = true;
 
-fn user_topup_allowed(mode: &str, is_shadow_owner: bool) -> bool {
-    (mode == "enabled" && MARKET_WALLET_CUTOVER_IMPLEMENTED)
+fn user_topup_allowed(mode: &str, is_shadow_owner: bool, cutover_approved: bool) -> bool {
+    (mode == "enabled" && MARKET_WALLET_CUTOVER_IMPLEMENTED && cutover_approved)
         || (mode == "shadow" && is_shadow_owner)
 }
 
@@ -147,26 +147,43 @@ fn payment_webhook_url(domain: &str, use_localhost: bool) -> String {
     )
 }
 
-/// The Owner API is the only supported way to enter enabled mode; its
-/// readiness gate remains closed until every purchase and control path is
-/// integrated. Existing contracts must still dispatch by their own rail.
+/// A raw mode edit cannot authorize wallet purchases. Existing contracts
+/// still dispatch by their own funding rail.
 pub(crate) fn wallet_purchase_mode_tx(conn: &Connection) -> Result<bool, AppError> {
-    let enabled = conn
+    let (enabled, approved): (bool, bool) = conn
         .query_row(
-            "SELECT mode = 'enabled' FROM market_finance_control WHERE id = 1",
+            "SELECT mode = 'enabled', cutover_approved_at IS NOT NULL
+             FROM market_finance_control WHERE id = 1",
             [],
-            |row| row.get::<_, bool>(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(db_error("read market finance purchase mode"))?;
-    // The Owner endpoint enforces readiness, but an imported database or a
-    // manual SQL update can still contain `enabled`. Never let that turn a
-    // partially integrated wallet quote into a purchase on the legacy rail.
-    if enabled && !MARKET_WALLET_CUTOVER_IMPLEMENTED {
+    if enabled && (!MARKET_WALLET_CUTOVER_IMPLEMENTED || !approved) {
         return Err(AppError::ServiceUnavailable(
-            "platform wallet purchase integration is not complete".into(),
+            "platform wallet cutover has not been approved".into(),
         ));
     }
     Ok(enabled)
+}
+
+/// An offer's publication rail is immutable until the Provider explicitly
+/// edits its paid terms. A mode switch must not reinterpret an old offer.
+pub(crate) fn require_current_offer_rail(
+    funding_rail: &str,
+    wallet_mode: bool,
+    product: &str,
+) -> Result<(), AppError> {
+    if !matches!(funding_rail, "legacy_provider" | "platform_wallet") {
+        return Err(AppError::Internal(format!(
+            "stored {product} offer funding rail is invalid"
+        )));
+    }
+    if (funding_rail == "platform_wallet") != wallet_mode {
+        return Err(AppError::Gone(format!(
+            "{product} offer was published under another payment mode; ask the Provider to republish it"
+        )));
+    }
+    Ok(())
 }
 
 pub fn router() -> Router<ServerState> {
@@ -272,24 +289,31 @@ fn finance_readiness_tx(conn: &Connection) -> Result<FinanceReadinessView, AppEr
              JOIN share_market_listings listing ON listing.id = seat.listing_id
              WHERE listing.status = 'active' AND listing.deleted_at IS NULL
                AND seat.status = 'available'
-               AND (seat.daily_rate_minor IS NOT NULL OR seat.cycle_price_minor IS NOT NULL)",
+               AND (seat.daily_rate_minor IS NOT NULL OR seat.cycle_price_minor IS NOT NULL)
+               AND seat.funding_rail = 'legacy_provider'",
         ),
         (
             "legacy_client_paid_offers",
             "SELECT COUNT(*) FROM router_ssh_hosts
              WHERE status = 'idle'
-               AND (daily_rate_minor IS NOT NULL OR cycle_price_minor IS NOT NULL)",
+               AND (daily_rate_minor IS NOT NULL OR cycle_price_minor IS NOT NULL)
+               AND funding_rail = 'legacy_provider'",
         ),
         (
             "legacy_active_share_quotes",
             "SELECT COUNT(*) FROM share_market_rent_quotes
-             WHERE status = 'active' AND pricing_model != 'free'",
+             WHERE status = 'active' AND pricing_model != 'free'
+               AND CASE WHEN json_valid(snapshot_json)
+                        THEN COALESCE(json_extract(snapshot_json, '$.fundingRail'),
+                                      'legacy_provider')
+                        ELSE 'legacy_provider' END = 'legacy_provider'",
         ),
         (
             "legacy_active_client_quotes",
             "SELECT COUNT(*) FROM client_market_allocation_quotes quote
              JOIN client_market_allocation_quote_items item ON item.quote_id = quote.id
              WHERE quote.status = 'active'
+               AND quote.funding_rail = 'legacy_provider'
                AND (item.daily_rate_minor IS NOT NULL OR item.cycle_price_minor IS NOT NULL)",
         ),
         (
@@ -348,13 +372,20 @@ fn finance_readiness_tx(conn: &Connection) -> Result<FinanceReadinessView, AppEr
     }
     let verified_live_topups: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM market_topup_orders WHERE status = 'credited'",
+            "SELECT COUNT(*) FROM market_verified_topup_evidence",
             [],
             |row| row.get(0),
         )
         .map_err(db_error("count verified top-ups"))?;
     let critical_cases = crate::market_reconcile::critical_case_count_tx(conn)?;
-    let channel_checks: [(&'static str, &'static str); 5] = [
+    let channel_checks: [(&'static str, &'static str); 6] = [
+        (
+            "credited_topup_missing_evidence",
+            "SELECT COUNT(*) FROM market_topup_orders topup
+             WHERE topup.status = 'credited'
+               AND NOT EXISTS (SELECT 1 FROM market_verified_topup_evidence evidence
+                               WHERE evidence.id = topup.id)",
+        ),
         (
             "channel_none_enabled",
             "SELECT CASE WHEN EXISTS (SELECT 1 FROM market_payment_channels c JOIN market_payment_channel_revisions r ON r.channel_id = c.id AND r.revision = c.current_revision WHERE c.enabled = 1 AND c.archived_at IS NULL AND c.api_reverify_required = 0 AND r.verified_at IS NOT NULL) THEN 0 ELSE 1 END",
@@ -373,7 +404,7 @@ fn finance_readiness_tx(conn: &Connection) -> Result<FinanceReadinessView, AppEr
         ),
         (
             "channel_no_current_live_topup",
-            "SELECT COUNT(*) FROM market_payment_channels c WHERE c.enabled = 1 AND c.archived_at IS NULL AND NOT EXISTS (SELECT 1 FROM market_topup_orders t WHERE t.channel_id = c.id AND t.channel_revision = c.current_revision AND t.status = 'credited')",
+            "SELECT COUNT(*) FROM market_payment_channels c WHERE c.enabled = 1 AND c.archived_at IS NULL AND NOT EXISTS (SELECT 1 FROM market_verified_topup_evidence t WHERE t.channel_id = c.id AND t.channel_revision = c.current_revision)",
         ),
     ];
     let mut payment_channel_blockers = Vec::new();
@@ -424,35 +455,49 @@ struct ModeRequest {
     expected_version: i64,
 }
 
+fn set_finance_mode_tx(
+    conn: &Connection,
+    request: &ModeRequest,
+    changed_at: &str,
+) -> Result<(), AppError> {
+    if !matches!(request.mode.as_str(), "disabled" | "shadow" | "enabled") {
+        return Err(AppError::BadRequest("invalid market finance mode".into()));
+    }
+    if request.mode == "enabled" {
+        let readiness = finance_readiness_tx(conn)?;
+        if readiness.mode != "shadow" || !readiness.can_enable {
+            return Err(AppError::Conflict(
+                "market wallet cutover gates have not passed".into(),
+            ));
+        }
+    }
+    let changed = conn
+        .execute(
+            "UPDATE market_finance_control SET mode = ?2, version = version + 1,
+                updated_at = ?3,
+                cutover_approved_at = CASE WHEN ?2 = 'enabled' THEN ?3 ELSE NULL END
+             WHERE id = 1 AND version = ?1",
+            params![request.expected_version, request.mode, changed_at],
+        )
+        .map_err(db_error("update finance mode"))?;
+    if changed != 1 {
+        return Err(AppError::Conflict("finance mode version changed".into()));
+    }
+    Ok(())
+}
+
 async fn set_finance_mode(
     State(state): State<ServerState>,
     headers: HeaderMap,
     Json(request): Json<ModeRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let session = crate::api::require_admin_session(&state, &headers).await?;
-    if !matches!(request.mode.as_str(), "disabled" | "shadow" | "enabled") {
-        return Err(AppError::BadRequest("invalid market finance mode".into()));
-    }
     let conn = state.store.conn.lock().await;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin finance mode update"))?;
-    let readiness = finance_readiness_tx(&tx)?;
-    if request.mode == "enabled" && !readiness.can_enable {
-        return Err(AppError::Conflict(
-            "market wallet cutover gates have not passed".into(),
-        ));
-    }
-    let changed = tx
-        .execute(
-            "UPDATE market_finance_control SET mode = ?2, version = version + 1, updated_at = ?3
-         WHERE id = 1 AND version = ?1",
-            params![request.expected_version, request.mode, now()],
-        )
-        .map_err(db_error("update finance mode"))?;
-    if changed != 1 {
-        return Err(AppError::Conflict("finance mode version changed".into()));
-    }
+    let changed_at = now();
+    set_finance_mode_tx(&tx, &request, &changed_at)?;
     audit_tx(
         &tx,
         &session.user_id,
@@ -474,14 +519,15 @@ async fn get_wallet(
     headers: HeaderMap,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let session = require_session(&state, &headers).await?;
-    let (snapshot, mode, has_wallet_activity) = {
+    let (snapshot, mode, cutover_approved, has_wallet_activity) = {
         let conn = state.store.conn.lock().await;
         let snapshot = wallet_snapshot_tx(&conn, &session.user_id)?;
-        let mode: String = conn
+        let (mode, cutover_approved): (String, bool) = conn
             .query_row(
-                "SELECT mode FROM market_finance_control WHERE id = 1",
+                "SELECT mode, cutover_approved_at IS NOT NULL
+                 FROM market_finance_control WHERE id = 1",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(db_error("read wallet mode"))?;
         let has_wallet_activity: bool = conn
@@ -492,9 +538,13 @@ async fn get_wallet(
                 |row| row.get(0),
             )
             .map_err(db_error("read wallet activity"))?;
-        (snapshot, mode, has_wallet_activity)
+        (snapshot, mode, cutover_approved, has_wallet_activity)
     };
-    let can_topup = user_topup_allowed(&mode, state.dynamic.read().await.is_admin(&session.email));
+    let can_topup = user_topup_allowed(
+        &mode,
+        state.dynamic.read().await.is_admin(&session.email),
+        cutover_approved,
+    );
     Ok((
         no_store(),
         Json(serde_json::json!({
@@ -661,10 +711,10 @@ fn channel_views(conn: &Connection, only_enabled: bool) -> Result<Vec<ChannelVie
                 (c.webhook_verified_at IS NOT NULL AND c.webhook_verified_revision IS c.current_revision),
                 (SELECT COUNT(*) FROM market_topup_orders t
                  WHERE t.channel_id = c.id AND t.status NOT IN ('credited', 'expired', 'cancelled')),
-                (SELECT COUNT(*) FROM market_topup_orders t
-                 WHERE t.channel_id = c.id AND t.status = 'credited'),
-                (SELECT COUNT(*) FROM market_topup_orders t
-                 WHERE t.channel_id = c.id AND t.channel_revision = c.current_revision AND t.status = 'credited')
+                (SELECT COUNT(*) FROM market_verified_topup_evidence t
+                 WHERE t.channel_id = c.id),
+                (SELECT COUNT(*) FROM market_verified_topup_evidence t
+                 WHERE t.channel_id = c.id AND t.channel_revision = c.current_revision)
          FROM market_payment_channels c
          JOIN market_payment_channel_revisions r
            ON r.channel_id = c.id AND r.revision = c.current_revision
@@ -677,10 +727,10 @@ fn channel_views(conn: &Connection, only_enabled: bool) -> Result<Vec<ChannelVie
                 (c.webhook_verified_at IS NOT NULL AND c.webhook_verified_revision IS c.current_revision),
                 (SELECT COUNT(*) FROM market_topup_orders t
                  WHERE t.channel_id = c.id AND t.status NOT IN ('credited', 'expired', 'cancelled')),
-                (SELECT COUNT(*) FROM market_topup_orders t
-                 WHERE t.channel_id = c.id AND t.status = 'credited'),
-                (SELECT COUNT(*) FROM market_topup_orders t
-                 WHERE t.channel_id = c.id AND t.channel_revision = c.current_revision AND t.status = 'credited')
+                (SELECT COUNT(*) FROM market_verified_topup_evidence t
+                 WHERE t.channel_id = c.id),
+                (SELECT COUNT(*) FROM market_verified_topup_evidence t
+                 WHERE t.channel_id = c.id AND t.channel_revision = c.current_revision)
          FROM market_payment_channels c
          LEFT JOIN market_payment_channel_revisions r
            ON r.channel_id = c.id AND r.revision = c.current_revision
@@ -719,18 +769,19 @@ async fn list_enabled_channels(
     headers: HeaderMap,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let session = require_session(&state, &headers).await?;
-    let mode: String = {
+    let (mode, cutover_approved): (String, bool) = {
         let conn = state.store.conn.lock().await;
         conn.query_row(
-            "SELECT mode FROM market_finance_control WHERE id = 1",
+            "SELECT mode, cutover_approved_at IS NOT NULL
+             FROM market_finance_control WHERE id = 1",
             [],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(db_error("read market finance mode"))?
     };
     let shadow_admin = mode == "shadow" && state.dynamic.read().await.is_admin(&session.email);
     let conn = state.store.conn.lock().await;
-    let channels = if user_topup_allowed(&mode, shadow_admin) {
+    let channels = if user_topup_allowed(&mode, shadow_admin, cutover_approved) {
         channel_views(&conn, true)?
             .into_iter()
             .map(BuyerChannelView::from)
@@ -1533,9 +1584,8 @@ fn set_channel_enabled_tx(
                     AND webhook_verified_revision = current_revision
                     AND (SELECT webhook_mode FROM market_payment_channel_revisions
                          WHERE channel_id = ?1 AND revision = current_revision) = 'signed'
-                    AND EXISTS (SELECT 1 FROM market_topup_orders t
-                                WHERE t.channel_id = ?1 AND t.channel_revision = current_revision
-                                  AND t.status = 'credited')))",
+                    AND EXISTS (SELECT 1 FROM market_verified_topup_evidence t
+                                WHERE t.channel_id = ?1 AND t.channel_revision = current_revision)))",
             params![id, i64::from(enabled), time, expected_version],
         )
         .map_err(db_error("toggle payment channel"))?;
@@ -2159,19 +2209,20 @@ async fn create_topup(
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db_error("begin top-up"))?;
-        let mode: String = tx
+        let (mode, cutover_approved): (String, bool) = tx
             .query_row(
-                "SELECT mode FROM market_finance_control WHERE id = 1",
+                "SELECT mode, cutover_approved_at IS NOT NULL
+                 FROM market_finance_control WHERE id = 1",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(db_error("read market finance mode"))?;
-        if mode == "enabled" && !MARKET_WALLET_CUTOVER_IMPLEMENTED {
+        if mode == "enabled" && (!MARKET_WALLET_CUTOVER_IMPLEMENTED || !cutover_approved) {
             return Err(AppError::ServiceUnavailable(
-                "platform wallet purchase integration is not complete".into(),
+                "platform wallet cutover has not been approved".into(),
             ));
         }
-        if !user_topup_allowed(&mode, shadow_admin) {
+        if !user_topup_allowed(&mode, shadow_admin, cutover_approved) {
             return Err(AppError::ServiceUnavailable(
                 "platform wallet top-up is not enabled".into(),
             ));
@@ -3207,14 +3258,14 @@ mod tests {
     }
 
     #[test]
-    fn manually_enabled_mode_cannot_bypass_unfinished_purchase_cutover() {
+    fn manually_enabled_mode_cannot_bypass_live_cutover_approval() {
         let conn = memory();
         assert!(!wallet_purchase_mode_tx(&conn).unwrap());
-        assert!(!user_topup_allowed("disabled", true));
-        assert!(user_topup_allowed("shadow", true));
-        assert!(!user_topup_allowed("shadow", false));
-        assert!(!user_topup_allowed("enabled", false));
-        assert!(!user_topup_allowed("enabled", true));
+        assert!(!user_topup_allowed("disabled", true, false));
+        assert!(user_topup_allowed("shadow", true, false));
+        assert!(!user_topup_allowed("shadow", false, false));
+        assert!(!user_topup_allowed("enabled", false, false));
+        assert!(!user_topup_allowed("enabled", true, false));
         conn.execute(
             "UPDATE market_finance_control SET mode = 'enabled' WHERE id = 1",
             [],
@@ -3224,6 +3275,114 @@ mod tests {
             wallet_purchase_mode_tx(&conn),
             Err(AppError::ServiceUnavailable(_))
         ));
+        conn.execute(
+            "UPDATE market_finance_control SET cutover_approved_at = '2026-10-16T00:00:00Z'
+             WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        assert!(wallet_purchase_mode_tx(&conn).unwrap());
+        assert!(user_topup_allowed("enabled", false, true));
+    }
+
+    #[test]
+    fn owner_cutover_requires_live_gates_and_revokes_approval_when_disabled() {
+        let conn = memory();
+        let enable = ModeRequest {
+            mode: "enabled".into(),
+            expected_version: 2,
+        };
+        assert!(matches!(
+            set_finance_mode_tx(&conn, &enable, "2026-10-16T00:00:00Z"),
+            Err(AppError::Conflict(_))
+        ));
+        fixture_revision(&conn, 1);
+        fixture_topup(
+            &conn,
+            "credited-1",
+            &format!("router-{}", "a".repeat(32)),
+            "credited",
+            1,
+        );
+        conn.execute(
+            "UPDATE market_payment_channels
+             SET webhook_verified_at = '2026-10-16T00:00:00Z', webhook_verified_revision = 1
+             WHERE id = 'channel'",
+            [],
+        )
+        .unwrap();
+        assert!(finance_readiness_tx(&conn).unwrap().can_enable);
+        assert!(set_finance_mode_tx(&conn, &enable, "2026-10-16T00:00:00Z").is_err());
+        set_finance_mode_tx(
+            &conn,
+            &ModeRequest {
+                mode: "shadow".into(),
+                expected_version: 1,
+            },
+            "2026-10-16T00:00:00Z",
+        )
+        .unwrap();
+        set_finance_mode_tx(&conn, &enable, "2026-10-16T00:00:00Z").unwrap();
+        assert!(wallet_purchase_mode_tx(&conn).unwrap());
+
+        set_finance_mode_tx(
+            &conn,
+            &ModeRequest {
+                mode: "disabled".into(),
+                expected_version: 3,
+            },
+            "2026-10-16T01:00:00Z",
+        )
+        .unwrap();
+        let approved: Option<String> = conn
+            .query_row(
+                "SELECT cutover_approved_at FROM market_finance_control WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(approved.is_none());
+        assert!(!wallet_purchase_mode_tx(&conn).unwrap());
+        conn.execute(
+            "UPDATE market_finance_control SET mode = 'enabled' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        assert!(wallet_purchase_mode_tx(&conn).is_err());
+    }
+
+    #[test]
+    fn credited_status_without_receipt_and_wallet_posting_is_not_cutover_evidence() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        fixture_topup(
+            &conn,
+            "incomplete",
+            &format!("router-{}", "c".repeat(32)),
+            "pending",
+            1,
+        );
+        conn.execute(
+            "UPDATE market_topup_orders SET status = 'credited' WHERE id = 'incomplete'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE market_payment_channels
+             SET webhook_verified_at = '2026-10-16T00:00:00Z', webhook_verified_revision = 1
+             WHERE id = 'channel'",
+            [],
+        )
+        .unwrap();
+        let readiness = finance_readiness_tx(&conn).unwrap();
+        assert_eq!(readiness.verified_live_topups, 0);
+        assert!(!readiness.can_enable);
+        assert!(readiness.payment_channel_blockers.iter().any(|blocker| {
+            blocker.code == "credited_topup_missing_evidence" && blocker.count == 1
+        }));
+        assert!(readiness.payment_channel_blockers.iter().any(|blocker| {
+            blocker.code == "channel_no_current_live_topup" && blocker.count == 1
+        }));
     }
 
     #[test]
@@ -3833,6 +3992,33 @@ mod tests {
             params![id, revision, merchant_order_id, status],
         )
         .unwrap();
+        if status == "credited" {
+            let receipt_fingerprint = format!("fixture-{id}");
+            conn.execute(
+                "INSERT INTO market_topup_receipts
+                 (order_id, chain, token_id, tx_id, settled_amount, confirmations,
+                  receipt_fingerprint, observed_at)
+                 VALUES (?1, 'tron', 'tron-usdt', ?1, '1.00', 1, ?2, '2026-10-01')",
+                params![id, receipt_fingerprint],
+            )
+            .unwrap();
+            let journal = credit_verified_topup_tx(
+                conn,
+                "buyer",
+                id,
+                100,
+                &receipt_fingerprint,
+                "2026-10-01",
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE market_topup_orders
+                 SET gateway_order_id = ?2, credited_journal_id = ?3, paid_at = '2026-10-01'
+                 WHERE id = ?1",
+                params![id, format!("gateway-{id}"), journal.id],
+            )
+            .unwrap();
+        }
     }
 
     fn loaded() -> LoadedRevision {
@@ -4195,6 +4381,139 @@ mod tests {
                 .iter()
                 .any(|blocker| blocker.code == "legacy_client_paid_offers" && blocker.count == 1)
         );
+    }
+
+    #[test]
+    fn paid_supply_only_changes_rail_on_explicit_price_republication() {
+        let conn = memory();
+        conn.execute(
+            "INSERT INTO share_market_listings
+             (id, share_id, installation_id, owner_user_id, owner_email, status, created_at, updated_at)
+             VALUES ('listing', 'share', 'installation', 'provider', 'provider@example.com',
+                     'active', '2026-10-01', '2026-10-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO share_market_seats
+             (id, listing_id, position, status, token_period_json, daily_rate_minor,
+              currency, created_at, updated_at)
+             VALUES ('seat', 'listing', 1, 'available', '\"day\"', 100,
+                     'USD', '2026-10-01', '2026-10-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO router_ssh_hosts
+             (id, ip, port, host_owner_email, status, created_at, updated_at,
+              daily_rate_minor, currency)
+             VALUES ('host', '192.0.2.10', 22, 'provider@example.com', 'idle',
+                     '2026-10-01', '2026-10-01', 100, 'USD')",
+            [],
+        )
+        .unwrap();
+        let rails = || -> (String, String) {
+            (
+                conn.query_row(
+                    "SELECT funding_rail FROM share_market_seats WHERE id = 'seat'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+                conn.query_row(
+                    "SELECT funding_rail FROM router_ssh_hosts WHERE id = 'host'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            )
+        };
+        assert_eq!(
+            rails(),
+            ("legacy_provider".into(), "legacy_provider".into())
+        );
+        conn.execute(
+            "UPDATE market_finance_control SET mode = 'enabled' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE share_market_seats SET status = 'reserved' WHERE id = 'seat'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE router_ssh_hosts SET status = 'locked' WHERE id = 'host'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE share_market_seats SET status = 'available' WHERE id = 'seat'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE router_ssh_hosts SET status = 'idle' WHERE id = 'host'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            rails(),
+            ("legacy_provider".into(), "legacy_provider".into())
+        );
+        assert_eq!(
+            finance_readiness_tx(&conn)
+                .unwrap()
+                .legacy_blockers
+                .iter()
+                .filter(|blocker| blocker.code.ends_with("paid_offers"))
+                .map(|blocker| blocker.count)
+                .sum::<i64>(),
+            2
+        );
+        conn.execute(
+            "UPDATE share_market_seats SET daily_rate_minor = 200, offer_revision = offer_revision + 1
+             WHERE id = 'seat'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE router_ssh_hosts SET daily_rate_minor = 200, offer_revision = offer_revision + 1
+             WHERE id = 'host'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            rails(),
+            ("platform_wallet".into(), "platform_wallet".into())
+        );
+        assert!(
+            !finance_readiness_tx(&conn)
+                .unwrap()
+                .legacy_blockers
+                .iter()
+                .any(|blocker| blocker.code.ends_with("paid_offers"))
+        );
+    }
+
+    #[test]
+    fn paid_offer_cannot_cross_payment_rails_without_republication() {
+        for product in ["Share", "Client Host"] {
+            assert!(require_current_offer_rail("legacy_provider", false, product).is_ok());
+            assert!(require_current_offer_rail("platform_wallet", true, product).is_ok());
+            assert!(matches!(
+                require_current_offer_rail("legacy_provider", true, product),
+                Err(AppError::Gone(_))
+            ));
+            assert!(matches!(
+                require_current_offer_rail("platform_wallet", false, product),
+                Err(AppError::Gone(_))
+            ));
+            assert!(matches!(
+                require_current_offer_rail("unknown", false, product),
+                Err(AppError::Internal(_))
+            ));
+        }
     }
 
     #[test]

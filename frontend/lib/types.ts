@@ -2671,6 +2671,15 @@ export type MarketRecurringFundingSummary = {
   topupUnavailableReason?: string;
 };
 
+export type MarketWalletQuoteFunding = {
+  assetCode: "USD";
+  availableUnits: string;
+  heldUnits: string;
+  committedUnits: string;
+  requiredUnits: string;
+  shortfallUnits: string;
+};
+
 export type MarketRecurringContract = {
   id: string;
   productKind: "share" | "client_host" | string;
@@ -3038,6 +3047,8 @@ export type ClientMarketAllocationQuote = {
   items: ClientMarketQuoteItem[];
   funding: MarketFundingSummary[];
   recurringFunding: MarketRecurringFundingSummary[];
+  walletFunding?: MarketWalletQuoteFunding;
+  fundingRail?: "legacy_provider" | "platform_wallet";
 };
 
 export type ClientMarketCommitQuoteResponse = {
@@ -3072,6 +3083,8 @@ export type ClientMarketRental = {
   cyclePriceMinor?: number;
   billingInterval?: MarketBillingInterval;
   recurring?: MarketRecurringContract;
+  walletContractId?: string;
+  openWalletDispute?: boolean;
   currency?: "USD";
   freeDurationDays?: number;
   offerRevision: number;
@@ -3198,6 +3211,8 @@ export type ShareMarketSubscription = {
   cyclePriceMinor?: number;
   billingInterval?: MarketBillingInterval;
   recurring?: MarketRecurringContract;
+  walletContractId?: string;
+  openWalletDispute?: boolean;
   currency?: "USD";
   serviceDurationDays?: number;
   trialHours?: number;
@@ -3456,6 +3471,7 @@ export type ShareMarketRentQuote = {
   trialSecondsRemaining: number;
   funding?: MarketFundingSummary;
   recurringFunding?: MarketRecurringFundingSummary;
+  walletFunding?: MarketWalletQuoteFunding;
   offer: {
     seatId: string;
     listingId: string;

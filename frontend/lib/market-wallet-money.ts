@@ -32,6 +32,22 @@ export function parseUsdMinor(raw: string): number | null {
   return minor >= 100 && minor <= 100_000 ? minor : null;
 }
 
+export function parseWithdrawalMinor(raw: string): number | null {
+  const value = raw.trim();
+  if (!/^(?:0|[1-9]\d{0,12})(?:\.\d{1,2})?$/.test(value)) return null;
+  const [dollars, fraction = ""] = value.split(".");
+  const minor = BigInt(dollars) * 100n + BigInt(fraction.padEnd(2, "0") || "0");
+  return minor >= 100n && minor <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(minor) : null;
+}
+
+export function parseNonNegativeUsdMinor(raw: string): number | null {
+  const value = raw.trim();
+  if (!/^(?:0|[1-9]\d{0,12})(?:\.\d{1,2})?$/.test(value)) return null;
+  const [dollars, fraction = ""] = value.split(".");
+  const minor = BigInt(dollars) * 100n + BigInt(fraction.padEnd(2, "0") || "0");
+  return minor <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(minor) : null;
+}
+
 export function safeCheckoutUrl(raw: string | null) {
   if (!raw) return null;
   try {
@@ -41,4 +57,30 @@ export function safeCheckoutUrl(raw: string | null) {
   } catch {
     return null;
   }
+}
+
+export function safeMarketReturnPath(raw: string | null): string | null {
+  if (!raw || !raw.startsWith("/") || raw.startsWith("//") || raw.includes("\\")) return null;
+  try {
+    const url = new URL(raw, "https://router.invalid");
+    if (url.origin !== "https://router.invalid") return null;
+    if (url.pathname !== "/share-market/" && url.pathname !== "/client-market/") return null;
+    return `${url.pathname}${url.search}`;
+  } catch {
+    return null;
+  }
+}
+
+export function walletTopupHref(shortfallUnits: string, returnTo: string): string {
+  const params = new URLSearchParams();
+  const shortfall = BigInt(shortfallUnits);
+  if (shortfall > 0n) {
+    const minor = (shortfall + 86_399n) / 86_400n;
+    const capped = minor < 100n ? 100n : minor > 100_000n ? 100_000n : minor;
+    params.set("amount", `${capped / 100n}.${(capped % 100n).toString().padStart(2, "0")}`);
+  }
+  const path = safeMarketReturnPath(returnTo);
+  if (path) params.set("returnTo", path);
+  const query = params.toString();
+  return `/account/wallet/${query ? `?${query}` : ""}`;
 }

@@ -208,6 +208,26 @@ const MIGRATIONS: &[(i64, &str)] = &[
         57,
         include_str!("../schema/0057_market_payment_channel_lifecycle.sql"),
     ),
+    (
+        58,
+        include_str!("../schema/0058_market_platform_delivery.sql"),
+    ),
+    (
+        59,
+        include_str!("../schema/0059_market_platform_health_fence.sql"),
+    ),
+    (
+        60,
+        include_str!("../schema/0060_market_service_disputes.sql"),
+    ),
+    (
+        61,
+        include_str!("../schema/0061_market_wallet_service_priority.sql"),
+    ),
+    (
+        62,
+        include_str!("../schema/0062_market_wallet_cutover_approval.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -735,7 +755,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count baseline tables");
-        assert_eq!(table_count, 193);
+        assert_eq!(table_count, 196);
         let removed_client_recovery_table_count = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master

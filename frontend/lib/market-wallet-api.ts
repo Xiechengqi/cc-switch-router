@@ -64,6 +64,78 @@ export type MarketPaymentChannel = {
 
 export type MarketWalletChannel = Pick<MarketPaymentChannel, "id" | "displayName" | "gatewayKind">;
 
+export type MarketProviderFinance = {
+  isProvider: boolean;
+  summary: {
+    pendingUnits: string;
+    availableUnits: string;
+    withdrawableUnits: string;
+    withdrawalHeldUnits: string;
+    paidUnits: string;
+  };
+  destination: {
+    id: string;
+    version: number;
+    assetCode: "USDT";
+    network: "tron";
+    address: string;
+    usableAt: string;
+  } | null;
+};
+
+export type MarketProviderWithdrawal = {
+  id: string;
+  amountUnits: string;
+  status: string;
+  network: "tron";
+  address: string;
+  version: number;
+  createdAt: string;
+  externalReference: string | null;
+};
+
+export type MarketBuyerRefund = {
+  id: string;
+  amountUnits: string;
+  status: string;
+  network: "tron";
+  address: string;
+  version: number;
+  createdAt: string;
+  externalReference: string | null;
+};
+
+export type MarketFinanceTransfer = {
+  id: string;
+  userId?: string;
+  providerUserId?: string;
+  amountUnits: string;
+  status: string;
+  version: number;
+  createdAt: string;
+  network: "tron";
+  address: string;
+  destinationVersion?: number;
+};
+
+export type MarketFinanceTransferAction =
+  "approve" | "begin_transfer" | "mark_paid" | "reject" | "mark_failed" | "review";
+
+export type MarketServiceDispute = {
+  id: string;
+  contractId: string;
+  buyerUserId: string;
+  providerUserId: string;
+  reasonCode: string;
+  status: "open" | "resolved";
+  resolutionCode: string | null;
+  refundedUnits: string;
+  refundableUnits: string;
+  version: number;
+  createdAt: string;
+  resolvedAt: string | null;
+};
+
 export type MarketFinanceCase = {
   id: string;
   code: string;
@@ -90,6 +162,109 @@ export async function getMarketWallet() {
   return parseJson<MarketWallet>(
     await authFetch("/v1/market-wallet", { cache: "no-store" }),
   );
+}
+
+export async function getMarketProviderFinance() {
+  return parseJson<MarketProviderFinance>(
+    await authFetch("/v1/market-provider-finance/me", { cache: "no-store" }),
+  );
+}
+
+export async function getMarketProviderWithdrawals(cursor?: string) {
+  const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
+  return parseJson<MarketWalletPage<MarketProviderWithdrawal>>(
+    await authFetch(`/v1/market-provider-finance/withdrawals${query}`, { cache: "no-store" }),
+  );
+}
+
+export async function saveMarketProviderDestination(address: string) {
+  return parseJson<NonNullable<MarketProviderFinance["destination"]>>(
+    await authFetch("/v1/market-provider-finance/destination", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ network: "tron", address, confirmation: "CHANGE_WITHDRAWAL_ADDRESS" }),
+    }),
+  );
+}
+
+export async function requestMarketProviderWithdrawal(amountMinor: number, idempotencyKey: string) {
+  return parseJson<MarketProviderWithdrawal>(
+    await authFetch("/v1/market-provider-finance/withdrawals", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey },
+      body: JSON.stringify({ amountMinor }),
+    }),
+  );
+}
+
+export async function getMarketBuyerRefunds(cursor?: string) {
+  const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
+  return parseJson<MarketWalletPage<MarketBuyerRefund>>(
+    await authFetch(`/v1/market-wallet/refund-requests${query}`, { cache: "no-store" }),
+  );
+}
+
+export async function requestMarketBuyerRefund(amountMinor: number, address: string, idempotencyKey: string) {
+  return parseJson<MarketBuyerRefund>(
+    await authFetch("/v1/market-wallet/refund-requests", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey },
+      body: JSON.stringify({ amountMinor, network: "tron", address }),
+    }),
+  );
+}
+
+export async function getMarketFinanceTransfers(kind: "withdrawals" | "refunds") {
+  return parseJson<MarketFinanceTransfer[]>(
+    await authFetch(`/v1/admin/market-finance/${kind}`, { cache: "no-store" }),
+  );
+}
+
+export async function transitionMarketFinanceTransfer(
+  kind: "withdrawals" | "refunds",
+  id: string,
+  action: MarketFinanceTransferAction,
+  expectedVersion: number,
+  options: { externalReference?: string; reason?: string; actualAmountMinor?: number } = {},
+) {
+  return parseJson<MarketProviderWithdrawal | MarketBuyerRefund>(
+    await authFetch(`/v1/admin/market-finance/${kind}/${encodeURIComponent(id)}/transition`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action, expectedVersion, ...options }),
+    }),
+  );
+}
+
+export async function openMarketServiceDispute(contractId: string, reasonCode: string) {
+  return parseJson<MarketServiceDispute>(await authFetch(
+    `/v1/market-wallet/contracts/${encodeURIComponent(contractId)}/disputes`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reasonCode }),
+    },
+  ));
+}
+
+export async function getMarketServiceDisputes() {
+  return parseJson<MarketServiceDispute[]>(
+    await authFetch("/v1/market-wallet/service-disputes", { cache: "no-store" }),
+  );
+}
+
+export async function getAdminMarketServiceDisputes() {
+  return parseJson<MarketServiceDispute[]>(
+    await authFetch("/v1/admin/market-finance/service-disputes", { cache: "no-store" }),
+  );
+}
+
+export async function resolveMarketServiceDispute(id: string, expectedVersion: number,
+  resolutionCode: string, refundAmountMinor: number) {
+  return parseJson<MarketServiceDispute>(await authFetch(
+    `/v1/admin/market-finance/service-disputes/${encodeURIComponent(id)}/resolve`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expectedVersion, resolutionCode, refundAmountMinor }),
+    },
+  ));
 }
 
 export async function getMarketWalletTransactions(cursor?: string) {

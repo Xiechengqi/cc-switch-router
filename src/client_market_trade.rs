@@ -373,6 +373,9 @@ pub struct RentalView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recurring: Option<crate::market_recurring::RecurringContractView>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub wallet_contract_id: Option<String>,
+    pub open_wallet_dispute: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub currency: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub free_duration_days: Option<u32>,
@@ -732,6 +735,7 @@ fn ensure_payment_profile_can_be_cleared(
                 EXISTS(
                     SELECT 1 FROM router_ssh_hosts
                     WHERE provider_id = ?1
+                      AND funding_rail = 'legacy_provider'
                       AND (daily_rate_minor IS NOT NULL OR cycle_price_minor IS NOT NULL)
                 ) OR EXISTS(
                     SELECT 1
@@ -739,6 +743,7 @@ fn ensure_payment_profile_can_be_cleared(
                     JOIN share_market_listings listing ON listing.id = seat.listing_id
                     WHERE listing.owner_user_id = ?1
                       AND listing.status = 'active' AND listing.deleted_at IS NULL
+                      AND seat.funding_rail = 'legacy_provider'
                       AND (seat.daily_rate_minor IS NOT NULL OR seat.cycle_price_minor IS NOT NULL)
                       AND seat.retired_at IS NULL
                       AND seat.status != 'deleted'
@@ -3261,7 +3266,7 @@ impl AppStore {
                             h.cycle_price_minor, h.billing_interval,
                             CASE WHEN h.daily_rate_minor IS NULL AND h.cycle_price_minor IS NULL THEN NULL
                                  ELSE COALESCE(NULLIF(TRIM(h.currency), ''), 'USD') END,
-                            h.free_duration_days, h.offer_revision
+                            h.free_duration_days, h.offer_revision, h.funding_rail
                      FROM router_ssh_hosts h
                      WHERE h.id = ?1 AND h.status = 'idle' AND h.provider_id IS NOT NULL",
                     params![host_id],
@@ -3287,7 +3292,7 @@ impl AppStore {
                         h.cycle_price_minor, h.billing_interval,
                         CASE WHEN h.daily_rate_minor IS NULL AND h.cycle_price_minor IS NULL THEN NULL
                              ELSE COALESCE(NULLIF(TRIM(h.currency), ''), 'USD') END,
-                        h.free_duration_days, h.offer_revision
+                        h.free_duration_days, h.offer_revision, h.funding_rail
                  FROM router_ssh_hosts h
                  WHERE h.status = 'idle'
                    AND h.daily_rate_minor IS NULL AND h.cycle_price_minor IS NULL
@@ -3365,6 +3370,13 @@ impl AppStore {
         for candidate in &mut candidates {
             let price_minor = candidate.cycle_price_minor.or(candidate.daily_rate_minor);
             let pricing_kind = crate::market_access::pricing_kind_for_rate(price_minor);
+            if price_minor.is_some() && candidate.provider_id != session.user_id {
+                crate::market_payments::require_current_offer_rail(
+                    &candidate.funding_rail,
+                    wallet_mode,
+                    "Client Host",
+                )?;
+            }
             if candidate.provider_id == session.user_id {
                 candidate.daily_rate_minor = None;
                 candidate.pricing_model = crate::market_recurring::PRICING_FREE.into();
@@ -3506,6 +3518,7 @@ impl AppStore {
                 &session.user_id,
                 wallet_price_minor,
                 0,
+                &now_rfc,
             )?)
         } else {
             None
@@ -3902,6 +3915,22 @@ impl AppStore {
                     "the confirmed Host offer revision does not match the allocation quote; review the current offer"
                         .into(),
                 ));
+            }
+            if item.6.or(item.4).is_some() {
+                let current_rail: String = tx
+                    .query_row(
+                        "SELECT funding_rail FROM router_ssh_hosts WHERE id = ?1",
+                        params![item.0],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| {
+                        AppError::Internal(format!("read quoted Host funding rail failed: {error}"))
+                    })?;
+                crate::market_payments::require_current_offer_rail(
+                    &current_rail,
+                    wallet_mode,
+                    "Client Host",
+                )?;
             }
             crate::market_access::ensure_product_access_tx(
                 &tx,
@@ -4878,6 +4907,7 @@ struct QuoteCandidate {
     currency: Option<String>,
     free_duration_days: Option<u32>,
     offer_revision: i64,
+    funding_rail: String,
     wallet_trial_seconds: i64,
 }
 
@@ -4898,6 +4928,7 @@ fn map_quote_candidate(row: &crate::db::Row<'_>) -> crate::db::Result<QuoteCandi
             .get::<_, Option<i64>>(11)?
             .and_then(|value| u32::try_from(value).ok()),
         offer_revision: row.get(12)?,
+        funding_rail: row.get(13)?,
         wallet_trial_seconds: 0,
     })
 }
@@ -5065,6 +5096,8 @@ struct RentalRow {
     next_cleanup_probe_at: Option<String>,
     cleanup_probe_attempts: Option<i64>,
     bound_host_status: Option<String>,
+    wallet_contract_id: Option<String>,
+    open_wallet_dispute: bool,
     provider_terminal_expires_at: Option<String>,
     provider_terminal_revoked_at: Option<String>,
     updated_at: String,
@@ -5107,7 +5140,13 @@ fn load_rental_views(
                  FROM client_market_cleanup_retry_state r
                  WHERE r.host_id = s.host_id AND r.installation_id = s.installation_id),
                 (SELECT h.status FROM router_ssh_hosts h
-                 WHERE h.id = s.host_id AND h.installation_id = s.installation_id)
+                 WHERE h.id = s.host_id AND h.installation_id = s.installation_id),
+                (SELECT contract.id FROM market_platform_contracts contract
+                 WHERE contract.id = s.platform_contract_id
+                   AND contract.paid_started_at IS NOT NULL),
+                EXISTS(SELECT 1 FROM market_service_disputes dispute
+                       WHERE dispute.contract_id = s.platform_contract_id
+                         AND dispute.status = 'open')
          FROM client_market_subscriptions s
          LEFT JOIN client_market_provider_terminal_authorizations a
            ON a.installation_id = s.installation_id
@@ -5152,6 +5191,8 @@ fn load_rental_views(
             next_cleanup_probe_at: row.get(23)?,
             cleanup_probe_attempts: row.get(24)?,
             bound_host_status: row.get(25)?,
+            wallet_contract_id: row.get(26)?,
+            open_wallet_dispute: row.get::<_, i64>(27)? != 0,
         })
     };
     let rows = if let Some(installation_id) = installation_id {
@@ -5228,6 +5269,8 @@ fn load_rental_views(
             cycle_price_minor: row.cycle_price_minor,
             billing_interval: row.billing_interval,
             recurring,
+            wallet_contract_id: client_role.then_some(row.wallet_contract_id).flatten(),
+            open_wallet_dispute: client_role && row.open_wallet_dispute,
             currency: row.currency,
             free_duration_days: row.free_duration_days,
             offer_revision: row.offer_revision,
@@ -7157,6 +7200,36 @@ mod tests {
             Some("USD".into())
         );
         assert!(normalize_offer_currency(Some(500), Some("CNY".into())).is_err());
+    }
+
+    #[test]
+    fn wallet_paid_offers_do_not_require_legacy_provider_payment_methods() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::schema::apply(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO router_ssh_hosts
+             (id, ip, port, host_owner_email, provider_id, status,
+              daily_rate_minor, currency, funding_rail, created_at, updated_at)
+             VALUES ('wallet-host', '192.0.2.10', 22, 'provider@example.com',
+                     'provider', 'idle', 100, 'USD', 'platform_wallet',
+                     '2026-10-01', '2026-10-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE router_ssh_hosts SET funding_rail = 'platform_wallet'
+             WHERE id = 'wallet-host'",
+            [],
+        )
+        .unwrap();
+        assert!(ensure_payment_profile_can_be_cleared(&conn, "provider").is_ok());
+        conn.execute(
+            "UPDATE router_ssh_hosts SET funding_rail = 'legacy_provider'
+             WHERE id = 'wallet-host'",
+            [],
+        )
+        .unwrap();
+        assert!(ensure_payment_profile_can_be_cleared(&conn, "provider").is_err());
     }
 
     #[test]

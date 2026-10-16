@@ -4,6 +4,7 @@ import type {
   MyMarketProviderFunding,
 } from "@/lib/types";
 import type { MarketTopupFunding } from "@/lib/market-funding";
+import type { MarketWallet } from "@/lib/market-wallet-api";
 
 export type ProviderMarketFilter = "all" | "share" | "client";
 
@@ -12,6 +13,10 @@ export function actorBoundValue<T>(
   actorKey: string,
 ) {
   return snapshot?.actorKey === actorKey ? snapshot.value : null;
+}
+
+export function legacyProviderFundingVisible(mode: MarketWallet["mode"] | undefined) {
+  return mode === "disabled" || mode === "shadow";
 }
 
 export function filterMarketProviders(

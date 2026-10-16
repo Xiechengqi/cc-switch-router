@@ -11,6 +11,8 @@ import { useSearchParams } from "next/navigation";
 import { Button } from "@heroui/react";
 import { ArrowUpRight, CheckCircle2, Clock3, CreditCard, Loader2, RefreshCw, WalletCards } from "lucide-react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
+import { MarketWalletRefundPanel } from "@/components/dashboard/market-wallet-refund-panel";
+import { ApiError } from "@/lib/api";
 import { DASHBOARD_ACCOUNT_BILLING_PATH } from "@/lib/dashboard-nav";
 import {
   createMarketWalletTopup,
@@ -24,7 +26,7 @@ import {
   type MarketWalletTopup,
   type MarketWalletTransaction,
 } from "@/lib/market-wallet-api";
-import { formatWalletUnits, formatWalletUnitsAsCny, parseUsdMinor, safeCheckoutUrl } from "@/lib/market-wallet-money";
+import { formatWalletUnits, formatWalletUnitsAsCny, parseUsdMinor, safeCheckoutUrl, safeMarketReturnPath } from "@/lib/market-wallet-money";
 
 const FINAL_TOPUP_STATUS = new Set(["credited", "review_required", "expired", "cancelled"]);
 
@@ -70,6 +72,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
   const { locale, t, displayCurrency, fxRateFresh, fxRateMicros } = useLocaleText();
   const searchParams = useSearchParams();
   const returnedTopupId = searchParams.get("topup");
+  const [returnPath, setReturnPath] = React.useState<string | null>(null);
   const [wallet, setWallet] = React.useState(initialWallet);
   const [channels, setChannels] = React.useState<MarketWalletChannel[]>([]);
   const [topups, setTopups] = React.useState<MarketWalletTopup[]>([]);
@@ -85,6 +88,23 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
   const [loaded, setLoaded] = React.useState(false);
   const idempotencyRef = React.useRef<{ fingerprint: string; key: string } | null>(null);
   const busyRef = React.useRef(false);
+
+  React.useEffect(() => {
+    const requested = safeMarketReturnPath(searchParams.get("returnTo"));
+    let saved: string | null = null;
+    try {
+      if (returnedTopupId) {
+        saved = safeMarketReturnPath(window.sessionStorage.getItem(`marketWalletReturnTo:${returnedTopupId}`));
+      }
+    } catch {
+      // Storage is optional; the wallet and checkout remain usable without it.
+    }
+    setReturnPath(requested ?? saved);
+    const suggested = searchParams.get("amount");
+    if (suggested && parseUsdMinor(suggested) != null) {
+      setAmount((current) => current || suggested);
+    }
+  }, [returnedTopupId, searchParams]);
 
   const reload = React.useCallback(async () => {
     const [nextWallet, nextChannels, nextTopups, nextTransactions] = await Promise.all([
@@ -128,15 +148,26 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
     if (!returnedTopupId) return;
     let active = true;
     let timeout: ReturnType<typeof setTimeout> | undefined;
+    const retry = () => {
+      if (active) timeout = setTimeout(poll, 5_000);
+    };
     const poll = async () => {
+      let credited = false;
       try {
         const current = await getMarketWalletTopup(returnedTopupId);
         if (!active) return;
         setReturnedTopup(current);
-        if (current.status === "credited") await reload();
-        if (!FINAL_TOPUP_STATUS.has(current.status)) timeout = setTimeout(poll, 5_000);
+        credited = current.status === "credited";
+        if (credited) await reload();
+        setError("");
+        if (!FINAL_TOPUP_STATUS.has(current.status)) retry();
       } catch (cause) {
-        if (active) setError(errorText(cause));
+        if (!active) return;
+        setError(errorText(cause));
+        // A temporary API failure (including one during the balance refresh)
+        // must not strand a paid order on a stale balance. A rejected order ID
+        // is terminal and should not spin forever.
+        if (credited || !(cause instanceof ApiError) || cause.status >= 500 || cause.status === 429) retry();
       }
     };
     void poll();
@@ -159,6 +190,13 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
     try {
       const order = await createMarketWalletTopup(channelId, parsedAmount, idempotencyRef.current.key);
       setTopups((current) => [order, ...current.filter((item) => item.id !== order.id)]);
+      if (returnPath) {
+        try {
+          window.sessionStorage.setItem(`marketWalletReturnTo:${order.id}`, returnPath);
+        } catch {
+          // A blocked storage API must not block payment.
+        }
+      }
       const checkoutUrl = safeCheckoutUrl(order.checkoutUrl);
       if (checkoutUrl) {
         window.location.assign(checkoutUrl);
@@ -214,10 +252,17 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
       {error ? <p role="alert" className="rounded-md border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">{error}</p> : null}
       {wallet.mode === "shadow" ? <p className="rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">{t("marketWallet.shadow")}</p> : null}
       {returnedTopup ? (
-        <p role="status" aria-live="polite" className="flex items-center gap-2 rounded-md border border-border bg-card px-4 py-3 text-sm">
-          {returnedTopup.status === "credited" ? <CheckCircle2 className="size-4 text-emerald-700" aria-hidden="true" /> : <Clock3 className="size-4 text-muted-foreground" aria-hidden="true" />}
-          {t(`marketWallet.status.${returnedTopup.status}` as Parameters<typeof t>[0])}
-        </p>
+        <div role="status" aria-live="polite" className="flex min-w-0 flex-wrap items-center justify-between gap-3 rounded-md border border-border bg-card px-4 py-3 text-sm">
+          <span className="flex items-center gap-2">
+            {returnedTopup.status === "credited" ? <CheckCircle2 className="size-4 text-emerald-700" aria-hidden="true" /> : <Clock3 className="size-4 text-muted-foreground" aria-hidden="true" />}
+            {t(`marketWallet.status.${returnedTopup.status}` as Parameters<typeof t>[0])}
+          </span>
+          {returnedTopup.status === "credited" && returnPath ? (
+            <Link href={returnPath} className="inline-flex min-h-11 items-center whitespace-nowrap font-medium text-primary underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring">
+              {t("marketWallet.returnToMarket")}<ArrowUpRight className="ml-1 size-4" aria-hidden="true" />
+            </Link>
+          ) : null}
+        </div>
       ) : null}
 
       <section className="grid min-w-0 gap-5 rounded-xl border border-border bg-card p-5 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] sm:p-6">
@@ -306,6 +351,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
           {transactionCursor ? <Button size="sm" variant="ghost" isDisabled={!!busy} onPress={() => void loadMore("transactions")}>{t("marketWallet.more")}</Button> : null}
         </section>
       </div> : null}
+      {wallet.hasWalletActivity ? <MarketWalletRefundPanel availableUnits={wallet.availableUnits} onSubmitted={reload} /> : null}
     </main>
   );
 }

@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import { subdomainTunnelUrl } from "@/components/dashboard/share-dashboard-utils";
 import { MarketRecurringContractCard } from "@/components/dashboard/market-recurring-contract-card";
+import { MarketServiceDisputeControl } from "@/components/dashboard/market-service-dispute-control";
 import { filterMarketListings } from "@/components/dashboard/share-market/buyer-catalog-utils";
 import { MarketListingFilters } from "@/components/dashboard/share-market/market-listing-filters";
 import {
@@ -245,6 +246,7 @@ export function ShareMarketSubscriptionCard({
       </dl>
 
       <StatusDetails subscription={subscription} locale={locale} t={t} />
+      {perspective === "user" ? <MarketServiceDisputeControl contractId={subscription.walletContractId} initiallyOpen={subscription.openWalletDispute} /> : null}
       <PriceChangeDetails
         subscription={subscription}
         locale={locale}

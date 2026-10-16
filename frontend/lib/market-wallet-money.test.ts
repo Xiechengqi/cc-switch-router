@@ -1,6 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { formatWalletUnits, formatWalletUnitsAsCny, parseUsdMinor, safeCheckoutUrl } from "./market-wallet-money";
+import {
+  formatWalletUnits,
+  formatWalletUnitsAsCny,
+  parseUsdMinor,
+  parseWithdrawalMinor,
+  parseNonNegativeUsdMinor,
+  safeCheckoutUrl,
+  safeMarketReturnPath,
+  walletTopupHref,
+} from "./market-wallet-money";
 
 test("wallet money display uses integer units even above the JS safe-integer range", () => {
   assert.equal(formatWalletUnits("8640000"), "$1.00");
@@ -19,9 +28,42 @@ test("top-up amount accepts only exact supported cents", () => {
   }
 });
 
+test("Provider withdrawal parses exact cents beyond the top-up per-order limit", () => {
+  assert.equal(parseWithdrawalMinor("1.00"), 100);
+  assert.equal(parseWithdrawalMinor("10000.75"), 1_000_075);
+  for (const invalid of ["0.99", "1.001", "1e5", "-1", "90071992547409.92"]) {
+    assert.equal(parseWithdrawalMinor(invalid), null, invalid);
+  }
+});
+
+test("service dispute resolution can record zero or exact cent refunds", () => {
+  assert.equal(parseNonNegativeUsdMinor("0.00"), 0);
+  assert.equal(parseNonNegativeUsdMinor("0.01"), 1);
+  assert.equal(parseNonNegativeUsdMinor("100.25"), 10_025);
+  for (const invalid of ["-0.01", "0.001", "1e2", "90071992547409.92"]) {
+    assert.equal(parseNonNegativeUsdMinor(invalid), null, invalid);
+  }
+});
+
 test("only the official DujiaoPay checkout origin is followed", () => {
   assert.equal(safeCheckoutUrl("https://www.dujiaopay.com/c/order"), "https://www.dujiaopay.com/c/order");
   for (const invalid of ["http://www.dujiaopay.com/c/order", "https://www.dujiaopay.com.evil/c/order", "https://evil@www.dujiaopay.com/c/order", "javascript:alert(1)"]) {
     assert.equal(safeCheckoutUrl(invalid), null, invalid);
   }
+});
+
+test("wallet recharge links preserve only local Market context", () => {
+  assert.equal(
+    walletTopupHref("86400", "/share-market/?focus=share-1"),
+    "/account/wallet/?amount=1.00&returnTo=%2Fshare-market%2F%3Ffocus%3Dshare-1",
+  );
+  assert.equal(safeMarketReturnPath("//evil.example/share-market/"), null);
+  assert.equal(safeMarketReturnPath("https://evil.example/client-market/"), null);
+  assert.equal(safeMarketReturnPath("/admin/"), null);
+  assert.equal(safeMarketReturnPath("/client-market/?focusHost=host-1"), "/client-market/?focusHost=host-1");
+});
+
+test("wallet recharge amounts round up to cents and respect merchant limits", () => {
+  assert.match(walletTopupHref("8640001", "/client-market/"), /amount=1\.01/);
+  assert.match(walletTopupHref("864000000000000", "/client-market/"), /amount=1000\.00/);
 });

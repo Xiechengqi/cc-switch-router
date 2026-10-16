@@ -8,6 +8,7 @@ import { CompactSelect } from "@/components/common/compact-select";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { ClientMarketRentalBanner } from "@/components/dashboard/client-market-rental-banner";
 import { MarketRecurringContractCard } from "@/components/dashboard/market-recurring-contract-card";
+import { MarketServiceDisputeControl } from "@/components/dashboard/market-service-dispute-control";
 import { CountryFlag } from "@/components/common/country-flag";
 import { ReleaseRentalAction } from "@/components/dashboard/client-market/release-rental-action";
 import { useLocaleText } from "@/components/i18n/locale-provider";
@@ -249,6 +250,7 @@ export function MyRentalsPanel({
               onChanged={onChanged}
               resumeRelease={false}
             />
+            <MarketServiceDisputeControl contractId={rental.walletContractId} initiallyOpen={rental.openWalletDispute} onChanged={onChanged} />
             {rental.recurring ? (
               <MarketRecurringContractCard
                 contract={rental.recurring}

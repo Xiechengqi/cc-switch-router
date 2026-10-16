@@ -8147,7 +8147,7 @@ fn latest_health_observation_tx(
         "share" => tx
             .query_row(
                 "SELECT 1 FROM share_market_subscriptions
-                 WHERE id = ?1 AND status IN ('active_postpaid', 'active_prepaid')",
+                 WHERE id = ?1 AND status IN ('active_free', 'active_postpaid', 'active_prepaid')",
                 params![product_ref],
                 |row| row.get::<_, i64>(0),
             )

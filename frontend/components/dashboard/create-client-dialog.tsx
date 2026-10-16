@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import Link from "next/link";
 import { Button, Chip, Modal } from "@heroui/react";
 import { Check, Clock3, Copy, Dices, Loader2, LogIn, Minus, Plus, RotateCcw, Server, ShieldCheck } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
@@ -48,6 +49,7 @@ import type {
   ProvisioningJob,
 } from "@/lib/types";
 import { formatUsdMoney } from "@/lib/market-money";
+import { formatWalletUnits, walletTopupHref } from "@/lib/market-wallet-money";
 import { usePersistentState } from "@/lib/use-persistent-state";
 
 const PROVIDERS_KEY = "cc_switch_router_create_client_providers_v2";
@@ -653,9 +655,9 @@ export function CreateClientDialog({
   const quoteSeconds = secondsRemaining(quote?.expiresAt);
   const paidQuoteCount = quote?.items.filter((item) =>
     item.dailyRateMinor != null || item.cyclePriceMinor != null).length || 0;
-  const recurringQuoteCount = quote?.items.filter((item) =>
+  const recurringQuoteCount = quote?.walletFunding ? 0 : quote?.items.filter((item) =>
     item.pricingModel === "prepaid_calendar_month").length || 0;
-  const legacyPaidQuoteCount = paidQuoteCount - recurringQuoteCount;
+  const legacyPaidQuoteCount = quote?.walletFunding ? 0 : paidQuoteCount - recurringQuoteCount;
   const freeQuoteCount = (quote?.items.length || 0) - paidQuoteCount;
   const recurringSupplierCount = new Set(
     quote?.items
@@ -680,11 +682,11 @@ export function CreateClientDialog({
     return totals;
   }, [drafts, quote?.items]);
   const effectiveRecurringFunding = React.useMemo(
-    () => (quote?.recurringFunding || []).map((funding) => {
+    () => (quote?.walletFunding ? [] : quote?.recurringFunding || []).map((funding) => {
       const renewal = recurringRenewalBySupplier.get(funding.supplierUserId) || 0;
       return recurringFundingForRenewal(funding, renewal > 0, renewal);
     }),
-    [quote?.recurringFunding, recurringRenewalBySupplier],
+    [quote?.walletFunding, quote?.recurringFunding, recurringRenewalBySupplier],
   );
   const recurringHoldBySupplier = React.useMemo(() => {
     const totals = new Map<string, number>();
@@ -695,15 +697,16 @@ export function CreateClientDialog({
     return totals;
   }, [effectiveRecurringFunding]);
   const effectiveFunding = React.useMemo(
-    () => (quote?.funding || []).map((funding) => marketFundingAfterRecurringHolds(
+    () => (quote?.walletFunding ? [] : quote?.funding || []).map((funding) => marketFundingAfterRecurringHolds(
       funding,
       recurringHoldBySupplier.get(`${funding.supplierUserId}:${funding.currency}`) || 0,
     )),
-    [quote?.funding, recurringHoldBySupplier],
+    [quote?.walletFunding, quote?.funding, recurringHoldBySupplier],
   );
   const hasFundingShortfall = !!quote && (
     effectiveFunding.some((funding) => funding.requiredTopupMinor > 0)
     || effectiveRecurringFunding.some((funding) => funding.requiredTopupMinor > 0)
+    || (quote.walletFunding != null && BigInt(quote.walletFunding.shortfallUnits) > 0n)
   );
   const subdomainsCanCommit = !!quote && quote.items.every((item) => {
     const value = normalizeDraftSubdomain(drafts[item.id]?.subdomain || "");
@@ -834,6 +837,33 @@ export function CreateClientDialog({
                 >
                   {t("createClient.quoteCountdown", { seconds: quoteSeconds })}
                 </Chip></div>
+                {quote.walletFunding ? (
+                  <section className="grid gap-2 rounded-lg bg-muted/50 p-3 text-sm" aria-live="polite">
+                    <h3 className="font-semibold">{t("marketWallet.title")}</h3>
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-muted-foreground">{t("marketWallet.available")}</span>
+                      <strong className="min-w-0 break-all text-right tabular-nums">{formatWalletUnits(quote.walletFunding.availableUnits, "$", locale)}</strong>
+                    </div>
+                    {BigInt(quote.walletFunding.committedUnits ?? "0") > 0n ? <div className="flex items-center justify-between gap-3">
+                      <span className="text-muted-foreground">{t("marketWallet.existingCommitments")}</span>
+                      <strong className="min-w-0 break-all text-right tabular-nums">{formatWalletUnits(quote.walletFunding.committedUnits, "$", locale)}</strong>
+                    </div> : null}
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-muted-foreground">{t("marketWallet.requiredNow")}</span>
+                      <strong className="min-w-0 break-all text-right tabular-nums">{formatWalletUnits(quote.walletFunding.requiredUnits, "$", locale)}</strong>
+                    </div>
+                    {BigInt(quote.walletFunding.shortfallUnits) > 0n ? (
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span role="alert" className="font-medium text-destructive">{t("marketWallet.shortfall", { amount: formatWalletUnits(quote.walletFunding.shortfallUnits, "$", locale) })}</span>
+                        <Link
+                          href={walletTopupHref(quote.walletFunding.shortfallUnits, fixedHost ? `/client-market/?focusHost=${encodeURIComponent(fixedHost.id)}` : "/client-market/")}
+                          className="inline-flex min-h-11 items-center whitespace-nowrap font-semibold text-primary underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring active:opacity-70"
+                        >{t("marketWallet.topupShortfall")}</Link>
+                      </div>
+                    ) : null}
+                    <p className="text-xs text-muted-foreground">{t("marketWallet.serviceBilling")}</p>
+                  </section>
+                ) : null}
                 {recurringQuoteCount ? (
                   <div className="flex gap-3 rounded-md border border-emerald-200 bg-emerald-50 p-3 text-sm leading-6 text-emerald-950">
                     <ShieldCheck className="mt-1 h-4 w-4 shrink-0" />
@@ -893,7 +923,7 @@ export function CreateClientDialog({
                   const draft = drafts[item.id] || { subdomain: "", password: "", autoRenew: false };
                   const subdomainValue = normalizeDraftSubdomain(draft.subdomain);
                   const subdomainCheck = subdomainChecks[item.id]?.value === subdomainValue ? subdomainChecks[item.id] : undefined;
-                  return <section key={item.id} className="grid gap-3 rounded-md border p-3"><div className="flex flex-wrap items-center gap-2"><span className="font-mono text-xs text-muted-foreground">#{index + 1}</span><strong className="font-mono text-sm">{item.ip || "—"}</strong>{item.countryCode ? <CountryFlag className="text-sm" code={item.countryCode} /> : null}<span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">{item.hostOwnerEmail}</span><span className="text-sm font-semibold">{formatOffer(item.dailyRateMinor, locale, item.currency, item.freeDurationDays, item.cyclePriceMinor)}</span></div>{item.pricingModel === "prepaid_calendar_month" ? <label className="flex cursor-pointer items-start gap-2 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-sm"><input type="checkbox" className="mt-1 h-4 w-4 accent-emerald-600" checked={draft.autoRenew} onChange={(event) => setDrafts((current) => ({ ...current, [item.id]: { ...draft, autoRenew: event.target.checked } }))} /><span><strong className="block">{t("marketRecurring.autoRenew")}</strong><span className="block text-xs leading-5 text-muted-foreground">{t("marketRecurring.autoRenewAtCheckout", { amount: formatOffer(undefined, locale, item.currency, undefined, item.cyclePriceMinor) })}</span></span></label> : null}<label className="grid gap-1 text-sm"><span className="text-muted-foreground">{t("createClient.subdomain")}</span><div className="flex gap-2"><input value={draft.subdomain} onChange={(event) => setDrafts((current) => ({ ...current, [item.id]: { ...draft, subdomain: event.target.value } }))} className={`h-10 min-w-0 flex-1 rounded-md border px-3 font-mono ${subdomainCheck?.status === "unavailable" ? "border-rose-400" : subdomainCheck?.status === "available" ? "border-emerald-400" : ""}`} /><Button isIconOnly variant="outline" aria-label={t("createClient.randomSubdomain")} onClick={() => setDrafts((current) => ({ ...current, [item.id]: { ...draft, subdomain: randomSubdomain() } }))}><Dices className="h-4 w-4" /></Button></div>{subdomainCheck ? <span className={`flex items-center gap-1 text-xs ${subdomainCheck.status === "available" ? "text-emerald-700" : subdomainCheck.status === "unavailable" ? "text-rose-600" : "text-muted-foreground"}`}>{subdomainCheck.status === "checking" ? <Loader2 className="h-3 w-3 animate-spin" /> : subdomainCheck.status === "available" ? <Check className="h-3 w-3" /> : null}{subdomainCheck.status === "checking" ? t("createClient.subdomainChecking") : subdomainCheck.status === "available" ? t("createClient.subdomainAvailable") : subdomainCheck.message}</span> : null}</label><label className="grid gap-1 text-sm"><span className="text-muted-foreground">{t("createClient.password")}</span><input type="password" value={draft.password} onChange={(event) => setDrafts((current) => ({ ...current, [item.id]: { ...draft, password: event.target.value } }))} autoComplete="new-password" className="h-10 rounded-md border px-3" /></label></section>;
+                  return <section key={item.id} className="grid gap-3 rounded-md border p-3"><div className="flex flex-wrap items-center gap-2"><span className="font-mono text-xs text-muted-foreground">#{index + 1}</span><strong className="font-mono text-sm">{item.ip || "—"}</strong>{item.countryCode ? <CountryFlag className="text-sm" code={item.countryCode} /> : null}<span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">{item.hostOwnerEmail}</span><span className="text-sm font-semibold">{formatOffer(item.dailyRateMinor, locale, item.currency, item.freeDurationDays, item.cyclePriceMinor)}</span></div>{item.pricingModel === "prepaid_calendar_month" ? <label className="flex cursor-pointer items-start gap-2 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-sm"><input type="checkbox" className="mt-1 h-4 w-4 accent-emerald-600" checked={draft.autoRenew} onChange={(event) => setDrafts((current) => ({ ...current, [item.id]: { ...draft, autoRenew: event.target.checked } }))} /><span><strong className="block">{t("marketRecurring.autoRenew")}</strong><span className="block text-xs leading-5 text-muted-foreground">{quote.walletFunding ? t("marketWallet.autoRenewAtDue") : t("marketRecurring.autoRenewAtCheckout", { amount: formatOffer(undefined, locale, item.currency, undefined, item.cyclePriceMinor) })}</span></span></label> : null}<label className="grid gap-1 text-sm"><span className="text-muted-foreground">{t("createClient.subdomain")}</span><div className="flex gap-2"><input value={draft.subdomain} onChange={(event) => setDrafts((current) => ({ ...current, [item.id]: { ...draft, subdomain: event.target.value } }))} className={`h-10 min-w-0 flex-1 rounded-md border px-3 font-mono ${subdomainCheck?.status === "unavailable" ? "border-rose-400" : subdomainCheck?.status === "available" ? "border-emerald-400" : ""}`} /><Button isIconOnly variant="outline" aria-label={t("createClient.randomSubdomain")} onClick={() => setDrafts((current) => ({ ...current, [item.id]: { ...draft, subdomain: randomSubdomain() } }))}><Dices className="h-4 w-4" /></Button></div>{subdomainCheck ? <span className={`flex items-center gap-1 text-xs ${subdomainCheck.status === "available" ? "text-emerald-700" : subdomainCheck.status === "unavailable" ? "text-rose-600" : "text-muted-foreground"}`}>{subdomainCheck.status === "checking" ? <Loader2 className="h-3 w-3 animate-spin" /> : subdomainCheck.status === "available" ? <Check className="h-3 w-3" /> : null}{subdomainCheck.status === "checking" ? t("createClient.subdomainChecking") : subdomainCheck.status === "available" ? t("createClient.subdomainAvailable") : subdomainCheck.message}</span> : null}</label><label className="grid gap-1 text-sm"><span className="text-muted-foreground">{t("createClient.password")}</span><input type="password" value={draft.password} onChange={(event) => setDrafts((current) => ({ ...current, [item.id]: { ...draft, password: event.target.value } }))} autoComplete="new-password" className="h-10 rounded-md border px-3" /></label></section>;
                 })}
               </div>
             ) : null}

@@ -12,6 +12,7 @@ import {
   filterMarketProviders,
   formatBasisPointScore,
   isFormallyRanked,
+  legacyProviderFundingVisible,
   preferredProviderTopupFunding,
   providerCreditSummary,
 } from "./providers-page-utils";
@@ -21,6 +22,13 @@ test("private snapshots are hidden synchronously when the authenticated actor ch
   assert.deepEqual(actorBoundValue(snapshot, "buyer-a"), { balance: 100 });
   assert.equal(actorBoundValue(snapshot, "buyer-b"), null);
   assert.equal(actorBoundValue(null, "buyer-a"), null);
+});
+
+test("Provider-specific funding stays hidden until the finance mode is known and after wallet cutover", () => {
+  assert.equal(legacyProviderFundingVisible(undefined), false);
+  assert.equal(legacyProviderFundingVisible("disabled"), true);
+  assert.equal(legacyProviderFundingVisible("shadow"), true);
+  assert.equal(legacyProviderFundingVisible("enabled"), false);
 });
 
 function provider(

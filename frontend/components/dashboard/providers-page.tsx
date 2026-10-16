@@ -25,6 +25,7 @@ import {
 import { useAuth } from "@/components/auth/auth-provider";
 import { SegmentedControl } from "@/components/common/segmented-control";
 import { MarketFundingTopupDialog } from "@/components/dashboard/market-funding-topup-dialog";
+import { MarketWalletShortcut } from "@/components/dashboard/market-wallet-shortcut";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   getMarketProvider,
@@ -34,6 +35,7 @@ import {
 import { clientMarketHref, shareMarketHref } from "@/lib/dashboard-nav";
 import { marketFundingTopupUnavailableKey } from "@/lib/market-funding";
 import { formatUsdMoney } from "@/lib/market-money";
+import { getMarketWallet, type MarketWallet } from "@/lib/market-wallet-api";
 import type {
   BinanceFundingIntent,
   MarketProvider,
@@ -47,6 +49,7 @@ import {
   filterMarketProviders,
   formatBasisPointScore,
   isFormallyRanked,
+  legacyProviderFundingVisible,
   preferredProviderTopupFunding,
   providerCreditSummary,
   type ProviderMarketFilter,
@@ -754,6 +757,10 @@ export function ProvidersPage() {
     value: string;
   } | null>(null);
   const [fundingOpen, setFundingOpen] = React.useState(false);
+  const [walletSnapshot, setWalletSnapshot] = React.useState<{
+    actorKey: string;
+    value: MarketWallet;
+  } | null>(null);
   const [methodOpen, setMethodOpen] = React.useState(false);
   const [topupProvider, setTopupProvider] = React.useState<MyMarketProviderFunding | null>(null);
   const [query, setQuery] = React.useState("");
@@ -764,11 +771,17 @@ export function ProvidersPage() {
   // as well, so an account switch cannot paint the previous actor's balances
   // or leave their top-up dialog visible for even one frame.
   const funding = actorBoundValue(fundingSnapshot, actorKey);
+  const wallet = actorBoundValue(walletSnapshot, actorKey);
+  // The old Provider-scoped money view remains available only while old
+  // obligations are being cleared. It must never offer a parallel top-up
+  // path after the shared wallet becomes the paid Market rail.
+  const legacyFundingVisible = legacyProviderFundingVisible(wallet?.mode);
   const fundingError = actorBoundValue(fundingErrorSnapshot, actorKey) || "";
   const detail = actorBoundValue(detailSnapshot, providerId);
   const detailError = actorBoundValue(detailErrorSnapshot, providerId) || "";
   const detailLoading = detailLoadingFor === providerId;
   const visibleTopupProvider = funding && topupProvider
+    && legacyFundingVisible
     ? funding.providers.find(
       (provider) => provider.marketProviderId === topupProvider.marketProviderId,
     ) ?? null
@@ -796,7 +809,7 @@ export function ProvidersPage() {
   }, []);
 
   const loadFunding = React.useCallback(async () => {
-    if (!authed) return;
+    if (!authed || !legacyFundingVisible) return;
     fundingAbortRef.current?.abort();
     const controller = new AbortController();
     fundingAbortRef.current = controller;
@@ -820,7 +833,32 @@ export function ProvidersPage() {
         setFundingLoading(false);
       }
     }
-  }, [actorKey, authed]);
+  }, [actorKey, authed, legacyFundingVisible]);
+
+  React.useEffect(() => {
+    if (authLoading || !authed) return;
+    let active = true;
+    let inFlight = false;
+    setWalletSnapshot(null);
+    const refresh = () => {
+      if (inFlight || document.visibilityState !== "visible") return;
+      inFlight = true;
+      void getMarketWallet().then((value) => {
+        if (active) setWalletSnapshot({ actorKey, value });
+      }).catch(() => {
+        // Fail closed if the mode becomes unreadable while this page is open.
+        if (active) setWalletSnapshot(null);
+      }).finally(() => { inFlight = false; });
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 30_000);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", refresh);
+    };
+  }, [actorKey, authed, authLoading]);
 
   React.useEffect(() => {
     void loadProviders();
@@ -841,11 +879,11 @@ export function ProvidersPage() {
   }, [actorKey, authed, authLoading]);
 
   React.useEffect(() => {
-    if (!fundingOpen || authLoading || !authed || funding || fundingLoading || fundingError) {
+    if (!fundingOpen || authLoading || !authed || !legacyFundingVisible || funding || fundingLoading || fundingError) {
       return;
     }
     void loadFunding();
-  }, [authed, authLoading, funding, fundingError, fundingLoading, fundingOpen, loadFunding]);
+  }, [authed, authLoading, legacyFundingVisible, funding, fundingError, fundingLoading, fundingOpen, loadFunding]);
 
   React.useEffect(() => {
     if (!providerId) {
@@ -928,7 +966,7 @@ export function ProvidersPage() {
           </p>
         </div>
         <div className="flex min-w-0 flex-wrap items-center gap-2 sm:justify-end">
-          <Button
+          {legacyFundingVisible ? <Button
             variant="outline"
             size="sm"
             className="min-h-11 whitespace-nowrap"
@@ -936,7 +974,7 @@ export function ProvidersPage() {
           >
             <WalletCards className="h-4 w-4" aria-hidden="true" />
             {t("providers.funding.title")}
-          </Button>
+          </Button> : null}
           <Button
             variant="ghost"
             size="sm"
@@ -949,6 +987,8 @@ export function ProvidersPage() {
           </Button>
         </div>
       </header>
+
+      {authed ? <MarketWalletShortcut /> : null}
 
       {providerList?.generation.stale ? (
         <div className="flex min-w-0 items-start gap-2 rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-900" role="status">
@@ -1062,7 +1102,7 @@ export function ProvidersPage() {
       />
 
       <ProviderFundingDrawer
-        open={fundingOpen}
+        open={legacyFundingVisible && fundingOpen}
         authLoading={authLoading}
         authed={authed}
         funding={funding}

@@ -188,6 +188,8 @@ pub struct WalletQuoteFunding {
     #[serde(serialize_with = "serialize_units")]
     pub held_units: i64,
     #[serde(serialize_with = "serialize_units")]
+    pub committed_units: i64,
+    #[serde(serialize_with = "serialize_units")]
     pub required_units: i64,
     #[serde(serialize_with = "serialize_units")]
     pub shortfall_units: i64,
@@ -198,6 +200,7 @@ pub(crate) fn wallet_quote_funding_tx(
     user_id: &str,
     price_minor: i64,
     trial_seconds_remaining: i64,
+    now: &str,
 ) -> Result<WalletQuoteFunding, AppError> {
     if price_minor < 0 || trial_seconds_remaining < 0 {
         return Err(AppError::BadRequest("invalid wallet quote amount".into()));
@@ -208,12 +211,21 @@ pub(crate) fn wallet_quote_funding_tx(
     } else {
         units_from_minor(price_minor)?
     };
+    let committed_units = if required_units > 0 {
+        crate::market_platform_contracts::prior_due_funding_units_tx(conn, user_id, None, now)?
+    } else {
+        0
+    };
+    let total_required = required_units
+        .checked_add(committed_units)
+        .ok_or_else(|| AppError::Internal("wallet quote commitments overflow".into()))?;
     Ok(WalletQuoteFunding {
         asset_code: ASSET,
         available_units: snapshot.available_units,
         held_units: snapshot.held_units,
+        committed_units,
         required_units,
-        shortfall_units: required_units.saturating_sub(snapshot.available_units),
+        shortfall_units: total_required.saturating_sub(snapshot.available_units),
     })
 }
 

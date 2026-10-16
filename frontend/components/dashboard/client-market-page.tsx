@@ -10,6 +10,7 @@ import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { SegmentedControl } from "@/components/common/segmented-control";
 import { MarketAccessDialog } from "@/components/common/seller-approval-dialog";
 import { CreateClientDialog } from "@/components/dashboard/create-client-dialog";
+import { MarketWalletShortcut } from "@/components/dashboard/market-wallet-shortcut";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   deleteClientMarketHost,
@@ -84,6 +85,7 @@ export function ClientMarketPage() {
   const viewerUserId = session?.user?.id;
   const viewerEmail = session?.user?.email;
   const marketProviderId = searchParams.get("provider") || undefined;
+  const returnedHostId = searchParams.get("focusHost") || undefined;
 
   const [hosts, setHosts] = React.useState<ClientMarketHost[]>([]);
   const [rentals, setRentals] = React.useState<ClientMarketRental[]>([]);
@@ -125,6 +127,7 @@ export function ClientMarketPage() {
   const refreshAbortRef = React.useRef<AbortController | null>(null);
   const rowBusyIdsRef = React.useRef<Set<string>>(new Set());
   const focusAppliedRef = React.useRef(false);
+  const returnedHostAppliedRef = React.useRef<string | null>(null);
 
   const setRowUiBusy = React.useCallback((hostId: string, busy: boolean) => {
     const ids = rowBusyIdsRef.current;
@@ -386,6 +389,14 @@ export function ClientMarketPage() {
   }, [authed, listTabRaw, setListTab]);
 
   React.useEffect(() => {
+    if (!authed || loading || !returnedHostId || returnedHostAppliedRef.current === returnedHostId) return;
+    const host = hosts.find((item) => item.id === returnedHostId);
+    if (!host) return;
+    returnedHostAppliedRef.current = returnedHostId;
+    openCreateForHost(host); // Opens a fresh quote; the saved pre-top-up quote is never reused.
+  }, [authed, hosts, loading, openCreateForHost, returnedHostId]);
+
+  React.useEffect(() => {
     if (typeof window === "undefined" || focusAppliedRef.current) return;
     const params = new URLSearchParams(window.location.search);
     const tab = params.get("tab");
@@ -513,6 +524,7 @@ export function ClientMarketPage() {
   return (
     <main className="mx-auto grid min-w-0 w-[calc(100%-2rem)] max-w-7xl grid-cols-[minmax(0,1fr)] gap-5 pb-10">
       <h1 className="sr-only">{t("clientMarket.title")}</h1>
+      {authed ? <MarketWalletShortcut /> : null}
       {marketProviderId ? (
         <div className="flex min-h-11 min-w-0 flex-wrap items-center justify-between gap-2 rounded-lg bg-slate-100 px-3 py-2 text-sm">
           <span className="min-w-0 text-slate-700">{t("providers.marketFilter.client")}</span>

@@ -2,7 +2,9 @@
 
 use crate::db::{Connection, OptionalExtension, params};
 use crate::error::AppError;
-use crate::market_wallet::{Posting, capture_hold_tx, debit_available_tx, post_journal_tx};
+use crate::market_wallet::{
+    Posting, capture_hold_tx, debit_available_tx, post_journal_tx, serialize_units,
+};
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use uuid::Uuid;
@@ -115,13 +117,22 @@ fn insert_slice_and_lot_tx(
         ],
     )
     .map_err(db_error("insert delivery slice"))?;
+    let lot_id = Uuid::new_v4().to_string();
+    let disputed_by_open_case: i64 = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM market_service_disputes
+             WHERE contract_id = ?1 AND status = 'open')",
+            params![contract_id],
+            |row| row.get(0),
+        )
+        .map_err(db_error("check ongoing service dispute"))?;
     conn.execute(
         "INSERT INTO market_provider_earning_lots (
             id, delivery_slice_id, provider_user_id, buyer_user_id, amount_units,
-            buyer_debited_at, fulfilled_at, unlock_at, created_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            buyer_debited_at, fulfilled_at, unlock_at, disputed, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
-            Uuid::new_v4().to_string(),
+            lot_id,
             id,
             provider,
             buyer,
@@ -129,10 +140,20 @@ fn insert_slice_and_lot_tx(
             buyer_debited_at,
             ended_at,
             unlock_at(buyer_debited_at, ended_at)?,
+            disputed_by_open_case,
             now
         ],
     )
     .map_err(db_error("insert Provider earning lot"))?;
+    if disputed_by_open_case != 0 {
+        conn.execute(
+            "INSERT INTO market_service_dispute_lots (dispute_id, earning_lot_id)
+             SELECT id, ?2 FROM market_service_disputes
+             WHERE contract_id = ?1 AND status = 'open'",
+            params![contract_id, lot_id],
+        )
+        .map_err(db_error("record earning frozen by ongoing dispute"))?;
+    }
     Ok(id)
 }
 
@@ -358,10 +379,15 @@ pub(crate) fn record_monthly_delivery_tx(
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ProviderFinanceSummary {
+    #[serde(serialize_with = "serialize_units")]
     pub pending_units: i64,
+    #[serde(serialize_with = "serialize_units")]
     pub available_units: i64,
+    #[serde(serialize_with = "serialize_units")]
     pub withdrawable_units: i64,
+    #[serde(serialize_with = "serialize_units")]
     pub withdrawal_held_units: i64,
+    #[serde(serialize_with = "serialize_units")]
     pub paid_units: i64,
 }
 

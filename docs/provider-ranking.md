@@ -97,7 +97,7 @@ Share 页的价格、空闲量和在线率等显式排序始终使用原语义�
 
 预付与信用账户按「买家 + 供应商」共享，Share/Client 两个 funding projection 中的余额和信用只汇总一次。funding projection 的 active rate 本身是跨产品共享口径，因此 Provider 页面另按合同 `product_kind` 计算 Share/Client legacy daily run rate，避免把同一总额重复相加；calendar-month commitment 按合同相加。最近续费金额只合计最早同一续费时间的合同。无限信用显示为 Provider 数量，不伪装成金额。
 
-Provider 页面仅在用户已登录后请求私有资金端点。即使 Provider 当前没有公开供给，只要与当前买家存在预付、信用或合同关系，仍会出现在资金区。Provider 级充值入口复用既有 Binance funding 流程，并在 Share/Client 即时覆盖需求与最早一批尚未备资的 calendar-month 续费之间选择更高的资金需求；已被 hold 覆盖的自动续费不会再次建议充值。
+Provider 页面仅在用户已登录后请求私有资金端点。即使 Provider 当前没有公开供给，只要与当前买家存在预付、信用或合同关系，仍会出现在旧资金清理区。Provider 级 Binance 充值只在旧财务模式 `disabled`／`shadow` 中可见；平台钱包 `enabled` 后，页面只显示全站钱包入口，不再向买家展示按 Provider 的预存／授信数据或旧充值操作。旧财务清理区仍按 Share/Client 即时覆盖需求与最早一批尚未备资的 calendar-month 续费选择更高的需求；已被 hold 覆盖的自动续费不会再次建议充值。旧资金和债务须在启用钱包前清结，不能自动转换为新钱包余额。
 
 ## 前端导航
 

@@ -6,6 +6,7 @@
  */
 
 import * as React from "react";
+import Link from "next/link";
 import { Button, Drawer, Modal } from "@heroui/react";
 import {
   Check,
@@ -43,6 +44,7 @@ import { drawerDialogClassName } from "@/components/dashboard/share-dashboard-ut
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ApiError, quoteShareMarketSeat, rentShareMarketSeat } from "@/lib/api";
 import { DASHBOARD_ACCOUNT_BILLING_PATH } from "@/lib/dashboard-nav";
+import { formatWalletUnits, walletTopupHref } from "@/lib/market-wallet-money";
 import type { MessageKey } from "@/lib/i18n";
 import {
   marketFundingConflictFromError,
@@ -536,14 +538,18 @@ export function ShareMarketBuyerCatalog({
   const quoteExpired = !!rentTarget && quoteRemainingSeconds <= 0;
   const quoteRequiresRefresh = quoteExpired || rentQuoteInvalidated;
   const rentFunding = rentTarget?.quote.funding;
+  const rentWalletFunding = rentTarget?.quote.walletFunding;
+  const rentWalletShortfall = rentWalletFunding ? BigInt(rentWalletFunding.shortfallUnits) > 0n : false;
   const rentRecurringFunding = React.useMemo(
     () => rentTarget?.quote.recurringFunding
       ? recurringFundingForRenewal(rentTarget.quote.recurringFunding, rentAutoRenew)
       : undefined,
     [rentAutoRenew, rentTarget?.quote.recurringFunding],
   );
-  const effectiveRentFunding = rentRecurringFunding ?? rentFunding;
-  const rentPrimaryAction = rentConfirmPrimaryAction(quoteRequiresRefresh, effectiveRentFunding);
+  const effectiveRentFunding = rentWalletFunding ? undefined : (rentRecurringFunding ?? rentFunding);
+  const rentPrimaryAction = rentWalletFunding
+    ? quoteRequiresRefresh ? "refresh" : rentWalletShortfall ? "topup" : "confirm"
+    : rentConfirmPrimaryAction(quoteRequiresRefresh, effectiveRentFunding);
   const showQuoteCountdown = showRentQuoteCountdown(quoteRequiresRefresh, quoteRemainingSeconds);
   const rentQuoteStatusDetails = !rentTarget
     ? ""
@@ -931,7 +937,30 @@ export function ShareMarketBuyerCatalog({
                         </section>
                       ) : null}
 
-                      {rentRecurringFunding ? (
+                      {rentWalletFunding ? (
+                        <section className="grid gap-2 rounded-lg bg-muted/50 px-3 py-3 text-sm" aria-live="polite">
+                          <h3 className="font-semibold">{t("marketWallet.title")}</h3>
+                          <div className="flex min-w-0 items-center justify-between gap-3">
+                            <span className="text-muted-foreground">{t("marketWallet.available")}</span>
+                            <strong className="min-w-0 break-all text-right tabular-nums">{formatWalletUnits(rentWalletFunding.availableUnits, "$", locale)}</strong>
+                          </div>
+                          {BigInt(rentWalletFunding.committedUnits ?? "0") > 0n ? <div className="flex min-w-0 items-center justify-between gap-3">
+                            <span className="text-muted-foreground">{t("marketWallet.existingCommitments")}</span>
+                            <strong className="min-w-0 break-all text-right tabular-nums">{formatWalletUnits(rentWalletFunding.committedUnits, "$", locale)}</strong>
+                          </div> : null}
+                          <div className="flex min-w-0 items-center justify-between gap-3">
+                            <span className="text-muted-foreground">{t("marketWallet.requiredNow")}</span>
+                            <strong className="min-w-0 break-all text-right tabular-nums">{formatWalletUnits(rentWalletFunding.requiredUnits, "$", locale)}</strong>
+                          </div>
+                          {rentWalletShortfall ? (
+                            <p role="alert" className="font-medium text-destructive">
+                              {t("marketWallet.shortfall", { amount: formatWalletUnits(rentWalletFunding.shortfallUnits, "$", locale) })}
+                            </p>
+                          ) : null}
+                        </section>
+                      ) : null}
+
+                      {rentRecurringFunding || (rentWalletFunding && rentOffer?.pricingModel === "prepaid_calendar_month") ? (
                         <label className={cn(
                           "flex min-h-11 items-center justify-between gap-3 rounded-lg bg-slate-50 px-3 py-3 text-sm",
                           busySeatId || quoteRequiresRefresh
@@ -940,7 +969,9 @@ export function ShareMarketBuyerCatalog({
                         )}>
                           <span className="min-w-0">
                             <strong className="block text-slate-900">{t("marketRecurring.autoRenew")}</strong>
-                            <span className="block truncate text-xs text-slate-500">{t("shareMarket.rentConfirm.autoRenewHold", { amount: formatUsdMoney(rentAutoRenewHoldMinor, locale) })}</span>
+                            <span className="block truncate text-xs text-slate-500">{rentWalletFunding
+                              ? t("marketWallet.autoRenewAtDue")
+                              : t("shareMarket.rentConfirm.autoRenewHold", { amount: formatUsdMoney(rentAutoRenewHoldMinor, locale) })}</span>
                           </span>
                           <span className="relative shrink-0">
                             <input
@@ -971,7 +1002,7 @@ export function ShareMarketBuyerCatalog({
                           <section className="grid gap-2">
                             <h3 className="text-sm font-semibold text-slate-900">{t("shareMarket.rentConfirm.billingDetails")}</h3>
                             <div className="grid gap-2 text-xs leading-5 text-slate-600">
-                              <p>{rentBillingDetails}</p>
+                              <p>{rentWalletFunding ? t("marketWallet.serviceBilling") : rentBillingDetails}</p>
                               <p>{rentServiceDetails}</p>
                             </div>
                           </section>
@@ -1016,6 +1047,17 @@ export function ShareMarketBuyerCatalog({
                         amount: formatUsdMoney(effectiveRentFunding.requiredTopupMinor, locale),
                       })}
                     </Button>
+                  ) : null}
+                  {rentPrimaryAction === "topup" && rentWalletFunding && rentTarget ? (
+                    <Link
+                      href={walletTopupHref(rentWalletFunding.shortfallUnits, `/share-market/?focus=${encodeURIComponent(rentTarget.quote.offer.shareId)}`)}
+                      aria-disabled={!!busySeatId}
+                      tabIndex={busySeatId ? -1 : undefined}
+                      onClick={(event) => { if (busySeatId) event.preventDefault(); }}
+                      className="inline-flex min-h-11 items-center justify-center rounded-lg bg-primary px-4 font-semibold text-primary-foreground whitespace-nowrap transition-opacity hover:opacity-90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring active:opacity-80 aria-disabled:pointer-events-none aria-disabled:opacity-50"
+                    >
+                      {t("marketWallet.topupShortfall")}
+                    </Link>
                   ) : null}
                   {rentPrimaryAction === "confirm" ? (
                     <Button className="min-h-11 whitespace-nowrap" variant="primary" isDisabled={!!busySeatId} onClick={() => void confirmRent()}>

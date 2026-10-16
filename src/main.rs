@@ -37,6 +37,7 @@ mod market_provider_rank;
 mod market_providers;
 mod market_reconcile;
 mod market_recurring;
+mod market_service_disputes;
 mod market_wallet;
 mod metrics;
 mod model_price_catalog;
@@ -382,6 +383,7 @@ async fn main() -> Result<()> {
     let client_market_trade_state = state.clone();
     let share_market_state = state.clone();
     let market_billing_state = state.clone();
+    let market_platform_state = state.clone();
     let market_provider_rank_store = state.store.clone();
     let binance_settlement_state = state.clone();
     let market_payments_state = state.clone();
@@ -856,6 +858,11 @@ async fn main() -> Result<()> {
             result
         },
     );
+    let market_platform_task = spawn_background_task(
+        "Market wallet delivery",
+        background_shutdown_rx.clone(),
+        async move { crate::market_platform_contracts::run_service(market_platform_state).await },
+    );
     let market_payments_shutdown_rx = background_shutdown_rx.clone();
     let market_fx_shutdown_rx = background_shutdown_rx.clone();
     let market_fx_task = spawn_background_task(
@@ -954,6 +961,7 @@ async fn main() -> Result<()> {
         ("Client Market trade", client_market_trade_task),
         ("Share Market", share_market_task),
         ("Market billing", market_billing_task),
+        ("Market wallet delivery", market_platform_task),
         ("USD/CNY market FX", market_fx_task),
         ("Binance auto-settlement", binance_settlement_task),
         ("Market payments", market_payments_task),

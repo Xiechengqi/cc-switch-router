@@ -954,6 +954,27 @@ fn host_seller_approval_required(
         })
 }
 
+fn unavailable_paid_host_ids(conn: &Connection) -> Result<HashSet<String>, AppError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT id FROM router_ssh_hosts
+             WHERE status = 'idle'
+               AND (daily_rate_minor IS NOT NULL OR cycle_price_minor IS NOT NULL)
+               AND (funding_rail = 'platform_wallet') !=
+                   (SELECT mode = 'enabled' FROM market_finance_control WHERE id = 1)",
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("prepare unavailable paid Hosts failed: {error}"))
+        })?;
+    statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| {
+            AppError::Internal(format!("query unavailable paid Hosts failed: {error}"))
+        })?
+        .collect::<Result<HashSet<_>, _>>()
+        .map_err(|error| AppError::Internal(format!("read unavailable paid Hosts failed: {error}")))
+}
+
 async fn list_hosts(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -973,6 +994,20 @@ async fn list_hosts(
             query.status.as_deref(),
         )
         .await?;
+    let hidden_paid_host_ids = {
+        let conn = state.store.conn.lock().await;
+        unavailable_paid_host_ids(&conn)?
+    };
+    let hosts = hosts
+        .into_iter()
+        .filter(|host| {
+            !hidden_paid_host_ids.contains(&host.id)
+                || viewer_is_admin
+                || viewer.as_ref().is_some_and(|session| {
+                    session_is_host_owner(session, host.provider_id.as_deref())
+                })
+        })
+        .collect::<Vec<_>>();
     let reconnect_grace = {
         let dynamic = state.dynamic.read().await;
         crate::notifications::route_reconnect_grace(&dynamic.client_notifications)
@@ -6225,7 +6260,11 @@ impl AppStore {
         let mut stmt = conn
             .prepare(
                 "SELECT host_owner_email, country_code,
-                        SUM(CASE WHEN status = 'idle' THEN 1 ELSE 0 END) AS idle_count,
+                        SUM(CASE WHEN status = 'idle'
+                                  AND ((daily_rate_minor IS NULL AND cycle_price_minor IS NULL)
+                                    OR (funding_rail = 'platform_wallet') =
+                                       (SELECT mode = 'enabled' FROM market_finance_control WHERE id = 1))
+                                 THEN 1 ELSE 0 END) AS idle_count,
                         COUNT(*) AS total_count
                  FROM router_ssh_hosts
                  GROUP BY host_owner_email, country_code
@@ -9306,6 +9345,48 @@ mod tests {
         "AAAAC3NzaC1lZDI1NTE5AAAAIGjWI8jfRRbxMZjdFDfgRlaHpRZPf7qs4odSbL41WQ1n";
     const TEST_ED25519_KEY_OTHER: &str =
         "AAAAC3NzaC1lZDI1NTE5AAAAIGjWI8jfRRbxMZjdFDfgRlaHpRZPf7qs4odSbL41WQ1o";
+
+    #[tokio::test]
+    async fn public_host_supply_hides_paid_offers_from_another_payment_rail() {
+        let store = AppStore::new_in_memory_for_tests().unwrap();
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO router_ssh_hosts
+                 (id, ip, port, host_owner_email, status, created_at, updated_at,
+                  daily_rate_minor, currency)
+                 VALUES ('old-paid-host', '192.0.2.10', 22, 'owner@example.com', 'idle',
+                         '2026-10-01', '2026-10-01', 100, 'USD')",
+                [],
+            )
+            .unwrap();
+            assert!(unavailable_paid_host_ids(&conn).unwrap().is_empty());
+            conn.execute(
+                "UPDATE market_finance_control SET mode = 'enabled' WHERE id = 1",
+                [],
+            )
+            .unwrap();
+            assert!(
+                unavailable_paid_host_ids(&conn)
+                    .unwrap()
+                    .contains("old-paid-host")
+            );
+        }
+        let supply = store.client_market_supply_summary().await.unwrap();
+        assert_eq!(supply[0].idle_count, 0);
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE router_ssh_hosts SET daily_rate_minor = 200,
+                 offer_revision = offer_revision + 1 WHERE id = 'old-paid-host'",
+                [],
+            )
+            .unwrap();
+            assert!(unavailable_paid_host_ids(&conn).unwrap().is_empty());
+        }
+        let supply = store.client_market_supply_summary().await.unwrap();
+        assert_eq!(supply[0].idle_count, 1);
+    }
 
     fn test_config(name: &str) -> (Config, PathBuf) {
         let root = std::env::temp_dir().join(format!(

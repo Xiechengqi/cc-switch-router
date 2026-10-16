@@ -10,6 +10,8 @@ import * as React from "react";
 import { AlertTriangle, CheckCircle2, Loader2, Plus, RefreshCw } from "lucide-react";
 import { Alert, Button, Modal } from "@heroui/react";
 import { CopyableCodeField } from "@/components/common/copyable-code-field";
+import { MarketFinanceTransfersPanel } from "@/components/settings/market-finance-transfers-panel";
+import { MarketFinanceDisputesPanel } from "@/components/settings/market-finance-disputes-panel";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ApiError } from "@/lib/api";
 import {
@@ -57,6 +59,7 @@ function message(error: unknown) {
 
 function channelBlockerKey(code: string) {
   switch (code) {
+    case "credited_topup_missing_evidence": return "settings.marketFinance.blocker.credited_topup_missing_evidence" as const;
     case "channel_none_enabled": return "settings.marketFinance.blocker.channel_none_enabled" as const;
     case "channel_api_unverified": return "settings.marketFinance.blocker.channel_api_unverified" as const;
     case "channel_not_signed": return "settings.marketFinance.blocker.channel_not_signed" as const;
@@ -251,12 +254,17 @@ export function MarketPaymentChannelsPanel() {
             <p>{t("settings.marketFinance.verifiedTopups", { count: readiness.verifiedLiveTopups })}</p>
             <p>{t("settings.marketFinance.blockers", { count: readiness.legacyBlockers.length })}</p>
             <p>{t("settings.marketFinance.channelBlockers", { count: readiness.paymentChannelBlockers.length })}</p>
+            <p>{t("settings.marketFinance.criticalCases", { count: readiness.criticalCases })}</p>
           </div>
           {!readiness.canEnable ? (
-            <p className="flex items-start gap-2 text-sm text-muted-foreground">
+            <div className="grid gap-1 text-sm text-muted-foreground">
+              <p className="flex items-start gap-2">
               <AlertTriangle className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
               {t("settings.marketFinance.cutoverBlocked")}
-            </p>
+              </p>
+              {!readiness.codeIntegrated ? <p>{t("settings.marketFinance.codePending")}</p> : null}
+              {!readiness.verifiedLiveTopups ? <p>{t("settings.marketFinance.liveTopupMissing")}</p> : null}
+            </div>
           ) : null}
           {readiness.legacyBlockers.length ? (
             <ul className="grid gap-1 text-xs text-muted-foreground">
@@ -404,6 +412,8 @@ export function MarketPaymentChannelsPanel() {
           <p className="text-xs text-muted-foreground">{t("settings.marketFinance.caseNote")}</p>
         </div>
       ) : null}
+      <MarketFinanceTransfersPanel financeMode={readiness?.mode ?? "disabled"} />
+      <MarketFinanceDisputesPanel />
     </section>
   );
 }

@@ -16,7 +16,7 @@ use crate::error::AppError;
 use crate::market_finance::{ProviderFinanceSummary, provider_summary_tx};
 use crate::market_wallet::{
     Posting, capture_hold_tx, credit_wallet_from_liability_tx, now, post_journal_tx,
-    reserve_wallet_tx, units_from_minor,
+    reserve_wallet_tx, serialize_units, units_from_minor,
 };
 use crate::models::AuthSession;
 
@@ -246,6 +246,7 @@ fn save_destination_tx(
 #[serde(rename_all = "camelCase")]
 struct PayoutView {
     id: String,
+    #[serde(serialize_with = "serialize_units")]
     amount_units: i64,
     status: String,
     network: String,
@@ -317,6 +318,7 @@ fn create_payout_tx(
         }
         return payout_view_tx(conn, &id, provider);
     }
+    require_new_provider_payouts_open_tx(conn)?;
     crate::market_reconcile::ensure_new_finance_writes_safe_tx(conn)?;
     let destination = latest_destination_tx(conn, provider)?
         .ok_or_else(|| AppError::Conflict("withdrawal destination required".into()))?;
@@ -428,6 +430,15 @@ fn create_payout_tx(
     payout_view_tx(conn, &request_id, provider)
 }
 
+fn require_new_provider_payouts_open_tx(conn: &Connection) -> Result<(), AppError> {
+    if crate::market_payments::wallet_purchase_mode_tx(conn)? {
+        return Ok(());
+    }
+    Err(AppError::ServiceUnavailable(
+        "Provider withdrawals are paused while market finance is not enabled".into(),
+    ))
+}
+
 fn audit_tx(
     conn: &Connection,
     actor: &str,
@@ -463,6 +474,7 @@ fn transition_payout_tx(
         return Err(AppError::Conflict("withdrawal version changed".into()));
     }
     if matches!(action, "approve" | "begin_transfer") {
+        require_new_provider_payouts_open_tx(conn)?;
         crate::market_reconcile::ensure_new_finance_writes_safe_tx(conn)?;
         let disputed: i64 = conn
             .query_row(
@@ -651,6 +663,7 @@ struct BuyerRefundRequest {
 #[serde(rename_all = "camelCase")]
 struct BuyerRefundView {
     id: String,
+    #[serde(serialize_with = "serialize_units")]
     amount_units: i64,
     status: String,
     network: String,
@@ -965,10 +978,15 @@ struct ListPage<T> {
 #[serde(rename_all = "camelCase")]
 struct EarningView {
     id: String,
+    #[serde(serialize_with = "serialize_units")]
     amount_units: i64,
+    #[serde(serialize_with = "serialize_units")]
     reversed_units: i64,
+    #[serde(serialize_with = "serialize_units")]
     unlocked_units: i64,
+    #[serde(serialize_with = "serialize_units")]
     held_units: i64,
+    #[serde(serialize_with = "serialize_units")]
     paid_units: i64,
     fulfilled_at: String,
     unlock_at: String,
@@ -1205,7 +1223,7 @@ async fn admin_list_withdrawals(
         .query_map([], |row| {
             Ok(serde_json::json!({
                 "id": row.get::<_, String>(0)?, "providerUserId": row.get::<_, String>(1)?,
-                "amountUnits": row.get::<_, i64>(2)?, "status": row.get::<_, String>(3)?,
+                "amountUnits": row.get::<_, i64>(2)?.to_string(), "status": row.get::<_, String>(3)?,
                 "version": row.get::<_, i64>(4)?, "createdAt": row.get::<_, String>(5)?,
                 "network": row.get::<_, String>(6)?, "address": row.get::<_, String>(7)?,
                 "destinationVersion": row.get::<_, i64>(8)?,
@@ -1234,7 +1252,7 @@ async fn admin_list_refunds(
         .query_map([], |row| {
             Ok(serde_json::json!({
                 "id": row.get::<_, String>(0)?, "userId": row.get::<_, String>(1)?,
-                "amountUnits": row.get::<_, i64>(2)?, "status": row.get::<_, String>(3)?,
+                "amountUnits": row.get::<_, i64>(2)?.to_string(), "status": row.get::<_, String>(3)?,
                 "version": row.get::<_, i64>(4)?, "createdAt": row.get::<_, String>(5)?,
                 "network": row.get::<_, String>(6)?, "address": row.get::<_, String>(7)?,
             }))
@@ -1319,12 +1337,22 @@ async fn get_provider_finance(
     struct View {
         summary: ProviderFinanceSummary,
         destination: Option<DestinationView>,
+        is_provider: bool,
     }
+    let is_provider = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM market_provider_profiles
+             WHERE user_id = ?1 AND status = 'active' AND claim_state = 'claimed')",
+            params![session.user_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(db_error("read claimed Provider identity"))?;
     Ok((
         no_store(),
         Json(View {
             summary: provider_summary_tx(&conn, &session.user_id)?,
             destination: latest_destination_tx(&conn, &session.user_id)?,
+            is_provider,
         }),
     ))
 }
@@ -1498,6 +1526,12 @@ mod tests {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .unwrap();
         let earlier = "2026-09-01T00:00:00+00:00";
+        tx.execute(
+            "UPDATE market_finance_control
+             SET mode = 'enabled', cutover_approved_at = ?1 WHERE id = 1",
+            params![earlier],
+        )
+        .unwrap();
         // Provider identity is a product prerequisite, not a payout destination.
         tx.execute(
             "INSERT INTO users (id, email_normalized, created_at, last_login_at)
@@ -1551,6 +1585,22 @@ mod tests {
             [],
         )
         .unwrap();
+        tx.execute(
+            "UPDATE market_finance_control
+             SET mode = 'disabled', cutover_approved_at = NULL WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        assert!(matches!(
+            create_payout_tx(&tx, "provider", 100, "paused-key", &time),
+            Err(AppError::ServiceUnavailable(_))
+        ));
+        tx.execute(
+            "UPDATE market_finance_control
+             SET mode = 'enabled', cutover_approved_at = ?1 WHERE id = 1",
+            params![time],
+        )
+        .unwrap();
         let request = create_payout_tx(&tx, "provider", 100, "idem-key-one", &time).unwrap();
         assert_eq!(
             list_earnings_tx(&tx, "provider", None).unwrap().items.len(),
@@ -1597,6 +1647,22 @@ mod tests {
             0
         );
         tx.execute(
+            "UPDATE market_finance_control
+             SET mode = 'disabled', cutover_approved_at = NULL WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        assert!(matches!(
+            transition_payout_tx(&tx, &request.id, "owner", "approve", 1, None, None, &time),
+            Err(AppError::ServiceUnavailable(_))
+        ));
+        tx.execute(
+            "UPDATE market_finance_control
+             SET mode = 'enabled', cutover_approved_at = ?1 WHERE id = 1",
+            params![time],
+        )
+        .unwrap();
+        tx.execute(
             "UPDATE market_provider_earning_lots SET disputed = 1 WHERE provider_user_id = 'provider'",
             [],
         )
@@ -1613,6 +1679,31 @@ mod tests {
         let approved =
             transition_payout_tx(&tx, &request.id, "owner", "approve", 1, None, None, &time)
                 .unwrap();
+        tx.execute(
+            "UPDATE market_finance_control
+             SET mode = 'disabled', cutover_approved_at = NULL WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        assert!(matches!(
+            transition_payout_tx(
+                &tx,
+                &request.id,
+                "owner",
+                "begin_transfer",
+                approved.version,
+                None,
+                None,
+                &time,
+            ),
+            Err(AppError::ServiceUnavailable(_))
+        ));
+        tx.execute(
+            "UPDATE market_finance_control
+             SET mode = 'enabled', cutover_approved_at = ?1 WHERE id = 1",
+            params![time],
+        )
+        .unwrap();
         let sending = transition_payout_tx(
             &tx,
             &request.id,
@@ -1649,6 +1740,12 @@ mod tests {
             )
             .is_err()
         );
+        tx.execute(
+            "UPDATE market_finance_control
+             SET mode = 'disabled', cutover_approved_at = NULL WHERE id = 1",
+            [],
+        )
+        .unwrap();
         transition_payout_tx(
             &tx,
             &request.id,
