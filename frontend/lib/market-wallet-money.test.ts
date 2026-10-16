@@ -6,6 +6,7 @@ import {
   parseUsdMinor,
   parseWithdrawalMinor,
   parseNonNegativeUsdMinor,
+  payableCheckoutUrl,
   safeCheckoutUrl,
   safeMarketReturnPath,
   walletTopupHref,
@@ -46,9 +47,17 @@ test("service dispute resolution can record zero or exact cent refunds", () => {
 });
 
 test("only the official DujiaoPay checkout origin is followed", () => {
-  assert.equal(safeCheckoutUrl("https://www.dujiaopay.com/c/order"), "https://www.dujiaopay.com/c/order");
-  for (const invalid of ["http://www.dujiaopay.com/c/order", "https://www.dujiaopay.com.evil/c/order", "https://evil@www.dujiaopay.com/c/order", "javascript:alert(1)"]) {
+  assert.equal(safeCheckoutUrl("https://www.dujiaopay.com/checkout/order"), "https://www.dujiaopay.com/checkout/order");
+  for (const invalid of ["http://www.dujiaopay.com/checkout/order", "https://www.dujiaopay.com.evil/checkout/order", "https://dujiaopay.com/checkout/order", "https://pay.dujiaopay.com/checkout/order", "https://evil@www.dujiaopay.com/checkout/order", "https://www.dujiaopay.com:444/checkout/order", "https://www.dujiaopay.com/", "https://www.dujiaopay.com/c/order", "https://www.dujiaopay.com/checkout/order#redirect", "https://www.dujiaopay.com/checkout/order?next=evil", "https://www.dujiaopay.com/checkout/order/other", "https://www.dujiaopay.com/checkout/%2f%2fevil.example", "https://www.dujiaopay.com\\checkout\\order", "javascript:alert(1)"]) {
     assert.equal(safeCheckoutUrl(invalid), null, invalid);
+  }
+});
+
+test("only a pending order exposes its checkout link", () => {
+  const url = "https://www.dujiaopay.com/checkout/ct_once";
+  assert.equal(payableCheckoutUrl("pending", url), url);
+  for (const status of ["creating", "create_unknown", "verifying", "credited", "expired", "cancelled", "review_required"]) {
+    assert.equal(payableCheckoutUrl(status, url), null, status);
   }
 });
 

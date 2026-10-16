@@ -26,7 +26,7 @@ import {
   type MarketWalletTopup,
   type MarketWalletTransaction,
 } from "@/lib/market-wallet-api";
-import { formatWalletUnits, formatWalletUnitsAsCny, parseUsdMinor, safeCheckoutUrl, safeMarketReturnPath } from "@/lib/market-wallet-money";
+import { formatWalletUnits, formatWalletUnitsAsCny, parseUsdMinor, payableCheckoutUrl, safeMarketReturnPath } from "@/lib/market-wallet-money";
 
 const FINAL_TOPUP_STATUS = new Set(["credited", "review_required", "expired", "cancelled"]);
 
@@ -197,14 +197,18 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
           // A blocked storage API must not block payment.
         }
       }
-      const checkoutUrl = safeCheckoutUrl(order.checkoutUrl);
+      const checkoutUrl = payableCheckoutUrl(order.status, order.checkoutUrl);
       if (checkoutUrl) {
         window.location.assign(checkoutUrl);
       } else if (order.status !== "credited") {
-        setError(t("marketWallet.checkoutPending"));
+        setError(t(order.status === "review_required" ? "marketWallet.reviewHelp" : "marketWallet.checkoutPending"));
       }
     } catch (cause) {
-      setError(errorText(cause));
+      setError(cause instanceof ApiError && cause.code === "MARKET_TOPUP_PENDING_LIMIT"
+        ? t("marketWallet.pendingLimit")
+        : cause instanceof ApiError && cause.code === "MARKET_TOPUP_CHECKOUT_UNAVAILABLE"
+          ? t("marketWallet.checkoutUnavailable")
+          : errorText(cause));
       void reload().catch(() => {});
     } finally {
       busyRef.current = false;
@@ -321,10 +325,11 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
                 <div className="min-w-0">
                   <p className="font-medium tabular-nums">${(order.amountMinor / 100).toFixed(2)}</p>
                   <p className="text-xs text-muted-foreground">{dateText(order.createdAt, locale)}</p>
+                  {order.status === "review_required" ? <p className="mt-1 text-xs text-amber-700">{t("marketWallet.reviewHelp")}</p> : null}
                 </div>
                 <span className="text-xs text-muted-foreground">{t(`marketWallet.status.${order.status}` as Parameters<typeof t>[0])}</span>
-                {safeCheckoutUrl(order.checkoutUrl) && !FINAL_TOPUP_STATUS.has(order.status) ? (
-                  <a className="inline-flex min-h-11 items-center gap-1 whitespace-nowrap text-xs font-medium text-primary underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring" href={safeCheckoutUrl(order.checkoutUrl)!}>
+                {payableCheckoutUrl(order.status, order.checkoutUrl) ? (
+                  <a className="inline-flex min-h-11 items-center gap-1 whitespace-nowrap text-xs font-medium text-primary underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring" href={payableCheckoutUrl(order.status, order.checkoutUrl)!}>
                     {t("marketWallet.continuePay")}<ArrowUpRight className="size-3" aria-hidden="true" />
                   </a>
                 ) : null}

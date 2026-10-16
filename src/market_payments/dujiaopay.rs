@@ -37,12 +37,13 @@ pub(super) struct GatewayOrder {
     pub settled_amount: Option<String>,
     pub confirmations: Option<i64>,
     pub paid_at: Option<String>,
+    pub checkout_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub(super) struct CreatedOrder {
     pub order_id: String,
-    pub checkout_url: String,
+    pub checkout_url: Option<String>,
     pub expires_at: Option<String>,
 }
 
@@ -208,8 +209,10 @@ impl Client {
             .await?;
         let source = payload(&value);
         let order_id = required_string(source, "order_id")?;
-        let checkout_url = required_string(source, "checkout_url")?;
-        validate_checkout_url(&checkout_url)?;
+        // The gateway may have committed an order even when its checkout URL
+        // is missing or unusable. Keep the order ID so that authenticated
+        // reconciliation can recover it without creating another payment.
+        let checkout_url = safe_checkout_url(optional_string(source, "checkout_url"));
         Ok(CreatedOrder {
             order_id,
             checkout_url,
@@ -282,6 +285,7 @@ fn parse_gateway_order(value: &Value) -> Result<GatewayOrder, AppError> {
         settled_amount: optional_string(value, "settled_amount"),
         confirmations: value.get("confirmations").and_then(Value::as_i64),
         paid_at: optional_string(value, "paid_at"),
+        checkout_url: safe_checkout_url(optional_string(value, "checkout_url")),
     })
 }
 
@@ -403,21 +407,48 @@ fn sign_request(
     hex::encode(mac.finalize().into_bytes())
 }
 
-fn validate_checkout_url(raw: &str) -> Result<(), AppError> {
+fn safe_checkout_url(raw: Option<String>) -> Option<String> {
+    let raw = raw?;
+    match validate_checkout_url(&raw) {
+        Ok(url) => Some(url),
+        Err(_) => {
+            // Never log the URL: its path or query may contain a checkout token.
+            tracing::warn!("DujiaoPay checkout URL rejected; order remains recoverable");
+            None
+        }
+    }
+}
+
+fn validate_checkout_url(raw: &str) -> Result<String, AppError> {
+    if raw.contains('\\') || raw.bytes().any(|byte| byte <= b' ') {
+        return Err(AppError::ServiceUnavailable(
+            "DujiaoPay checkout URL invalid".into(),
+        ));
+    }
     let url = url::Url::parse(raw)
         .map_err(|_| AppError::ServiceUnavailable("DujiaoPay checkout URL invalid".into()))?;
+    // DujiaoPay's current hosted-checkout contract documents this exact
+    // origin and /checkout/{token} path. The token must never be logged.
+    let token = url.path().strip_prefix("/checkout/");
     if url.scheme() != "https"
         || url.host_str() != Some("www.dujiaopay.com")
         || url.port().is_some()
-        || !url.path().starts_with("/c/")
+        || !token.is_some_and(|token| {
+            !token.is_empty()
+                && token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
         || !url.username().is_empty()
         || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
     {
         return Err(AppError::ServiceUnavailable(
             "DujiaoPay checkout URL invalid".into(),
         ));
     }
-    Ok(())
+    Ok(url.into())
 }
 
 #[cfg(test)]
@@ -462,7 +493,7 @@ mod tests {
         assert_eq!(request["allowed_methods"][0]["chain"], "tron");
         Json(json!({ "data": {
             "order_id": "gateway_1",
-            "checkout_url": "https://www.dujiaopay.com/c/gateway_1",
+            "checkout_url": "https://www.dujiaopay.com/checkout/ct_1",
             "expires_at": "2026-10-01T01:00:00Z"
         } }))
     }
@@ -508,6 +539,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(created.order_id, "gateway_1");
+        assert_eq!(
+            created.checkout_url.as_deref(),
+            Some("https://www.dujiaopay.com/checkout/ct_1")
+        );
         let order = client
             .get_order(&credentials, &created.order_id)
             .await
@@ -515,6 +550,34 @@ mod tests {
         assert_eq!(order.fiat_amount_minor, 123);
         assert_eq!(order.paid_source.as_deref(), Some("chain"));
         assert_eq!(order.confirmations, Some(12));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn create_keeps_gateway_identity_when_checkout_link_is_rejected() {
+        async fn invalid_checkout() -> Json<Value> {
+            Json(json!({ "data": {
+                "order_id": "gateway_1",
+                "checkout_url": "https://evil.example/checkout/ct_1"
+            } }))
+        }
+        let app = Router::new().route("/v1/orders", post(invalid_checkout));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let created = Client::with_base_url(&origin)
+            .create_order(
+                &credentials(),
+                "router-order",
+                100,
+                &[],
+                "https://router.example/success",
+                "https://router.example/cancel",
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.order_id, "gateway_1");
+        assert!(created.checkout_url.is_none());
         server.abort();
     }
 
@@ -588,12 +651,26 @@ mod tests {
 
     #[test]
     fn checkout_url_cannot_redirect_to_another_origin() {
-        assert!(validate_checkout_url("https://www.dujiaopay.com/c/ct_1").is_ok());
+        assert_eq!(
+            validate_checkout_url("https://www.dujiaopay.com/checkout/ct_1").unwrap(),
+            "https://www.dujiaopay.com/checkout/ct_1"
+        );
         for bad in [
-            "http://www.dujiaopay.com/c/ct_1",
-            "https://www.dujiaopay.com.evil/c/ct_1",
-            "https://evil@www.dujiaopay.com/c/ct_1",
-            "https://www.dujiaopay.com:444/c/ct_1",
+            "http://www.dujiaopay.com/checkout/ct_1",
+            "https://www.dujiaopay.com.evil/checkout/ct_1",
+            "https://dujiaopay.com/checkout/ct_1",
+            "https://pay.dujiaopay.com/checkout/ct_1",
+            "https://evil@www.dujiaopay.com/checkout/ct_1",
+            "https://www.dujiaopay.com:444/checkout/ct_1",
+            "https://www.dujiaopay.com/",
+            "https://www.dujiaopay.com/c/ct_1",
+            "/checkout/ct_1",
+            "//evil.example/checkout/ct_1",
+            "https://www.dujiaopay.com/checkout/ct_1#redirect",
+            "https://www.dujiaopay.com/checkout/ct_1?next=https://evil.example",
+            "https://www.dujiaopay.com/checkout/ct_1/other",
+            "https://www.dujiaopay.com/checkout/%2f%2fevil.example",
+            "https://www.dujiaopay.com\\checkout\\ct_1",
         ] {
             assert!(validate_checkout_url(bad).is_err(), "{bad}");
         }

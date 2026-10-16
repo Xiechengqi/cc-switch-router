@@ -12,6 +12,7 @@ import { Alert, Button, Modal } from "@heroui/react";
 import { CopyableCodeField } from "@/components/common/copyable-code-field";
 import { MarketFinanceTransfersPanel } from "@/components/settings/market-finance-transfers-panel";
 import { MarketFinanceDisputesPanel } from "@/components/settings/market-finance-disputes-panel";
+import { MarketFinanceTopupRecoveryPanel } from "@/components/settings/market-finance-topup-recovery-panel";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ApiError } from "@/lib/api";
 import {
@@ -438,6 +439,7 @@ export function MarketPaymentChannelsPanel() {
           <p className="text-xs text-muted-foreground">{t("settings.marketFinance.caseNote")}</p>
         </div>
       ) : null}
+      <MarketFinanceTopupRecoveryPanel onRecovered={reload} />
       <MarketFinanceTransfersPanel financeMode={readiness?.mode ?? "disabled"} withdrawalsPaused={readiness?.newWithdrawalsPaused ?? false} />
       <MarketFinanceDisputesPanel />
     </section>

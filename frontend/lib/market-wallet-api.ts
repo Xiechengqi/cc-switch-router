@@ -176,6 +176,25 @@ export type MarketFinanceCase = {
   resolvedAt: string | null;
 };
 
+export type MarketFinanceTopup = {
+  id: string;
+  userId: string;
+  channelId: string;
+  merchantOrderId: string;
+  gatewayOrderId: string | null;
+  amountMinor: number;
+  status: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type MarketFinanceTopupRecovery = {
+  orderId: string;
+  gatewayStatus: string;
+  canRecover: boolean;
+  recovered: boolean;
+};
+
 export type MarketPaymentChannelInput = {
   displayName: string;
   sortOrder: number;
@@ -347,6 +366,31 @@ export async function getMarketPaymentChannels() {
 export async function getMarketFinanceCases() {
   return parseJson<MarketFinanceCase[]>(
     await authFetch("/v1/admin/market-finance/cases", { cache: "no-store" }),
+  );
+}
+
+export async function getMarketFinanceTopups() {
+  return parseJson<MarketFinanceTopup[]>(
+    await authFetch("/v1/admin/market-finance/topups", { cache: "no-store" }),
+  );
+}
+
+export async function recoverMarketFinanceTopup(
+  id: string,
+  input: {
+    expectedStatus: string;
+    expectedUpdatedAt: string;
+    gatewayOrderId?: string;
+    reasonCode: string;
+    dryRun: boolean;
+  },
+) {
+  return parseJson<MarketFinanceTopupRecovery>(
+    await authFetch(`/v1/admin/market-finance/topups/${encodeURIComponent(id)}/recover`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input),
+    }),
   );
 }
 

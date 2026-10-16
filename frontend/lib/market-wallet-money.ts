@@ -52,11 +52,18 @@ export function safeCheckoutUrl(raw: string | null) {
   if (!raw) return null;
   try {
     const url = new URL(raw);
-    if (url.origin !== "https://www.dujiaopay.com" || url.username || url.password) return null;
+    if (raw.includes("\\") || /\s/.test(raw)
+      || url.origin !== "https://www.dujiaopay.com"
+      || !/^\/checkout\/[A-Za-z0-9_-]+$/.test(url.pathname)
+      || url.username || url.password || raw.includes("?") || raw.includes("#")) return null;
     return url.href;
   } catch {
     return null;
   }
+}
+
+export function payableCheckoutUrl(status: string, raw: string | null) {
+  return status === "pending" ? safeCheckoutUrl(raw) : null;
 }
 
 export function safeMarketReturnPath(raw: string | null): string | null {
