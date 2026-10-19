@@ -76,6 +76,9 @@ export function MarketPaymentChannelsPanel() {
   const [readiness, setReadiness] = React.useState<MarketFinanceReadiness | null>(null);
   const [channels, setChannels] = React.useState<MarketPaymentChannel[]>([]);
   const [cases, setCases] = React.useState<MarketFinanceCase[]>([]);
+  const [casesNextCursor, setCasesNextCursor] = React.useState<string | null>(null);
+  const [casesLoadingMore, setCasesLoadingMore] = React.useState(false);
+  const casesListVersion = React.useRef(0);
   const [form, setForm] = React.useState<FormState>(EMPTY_FORM);
   const [dialog, setDialog] = React.useState<DialogState | null>(null);
   const [showArchived, setShowArchived] = React.useState(false);
@@ -86,28 +89,33 @@ export function MarketPaymentChannelsPanel() {
   const busyRef = React.useRef(false);
 
   const reload = React.useCallback(async () => {
+    const casesVersion = ++casesListVersion.current;
     const [nextReadiness, nextChannels, nextCases] = await Promise.all([
       getMarketFinanceReadiness(),
       getMarketPaymentChannels(),
       getMarketFinanceCases(),
     ]);
+    if (casesVersion !== casesListVersion.current) return;
     setReadiness(nextReadiness);
     setChannels(nextChannels);
-    setCases(nextCases);
+    setCases(nextCases.items);
+    setCasesNextCursor(nextCases.nextCursor);
     setLoaded(true);
   }, []);
 
   React.useEffect(() => {
     let active = true;
+    const casesVersion = ++casesListVersion.current;
     Promise.all([
       getMarketFinanceReadiness(),
       getMarketPaymentChannels(),
       getMarketFinanceCases(),
     ]).then(([nextReadiness, nextChannels, nextCases]) => {
-      if (!active) return;
+      if (!active || casesVersion !== casesListVersion.current) return;
       setReadiness(nextReadiness);
       setChannels(nextChannels);
-      setCases(nextCases);
+      setCases(nextCases.items);
+      setCasesNextCursor(nextCases.nextCursor);
       setLoaded(true);
     }).catch((cause) => {
       if (!active) return;
@@ -116,6 +124,26 @@ export function MarketPaymentChannelsPanel() {
     });
     return () => { active = false; };
   }, []);
+
+  const loadMoreCases = async () => {
+    if (!casesNextCursor || casesLoadingMore) return;
+    const version = casesListVersion.current;
+    setCasesLoadingMore(true);
+    setError("");
+    try {
+      const page = await getMarketFinanceCases(casesNextCursor);
+      if (version !== casesListVersion.current) return;
+      setCases((current) => {
+        const seen = new Set(current.map((item) => item.id));
+        return [...current, ...page.items.filter((item) => !seen.has(item.id))];
+      });
+      setCasesNextCursor(page.nextCursor);
+    } catch (cause) {
+      if (version === casesListVersion.current) setError(message(cause));
+    } finally {
+      setCasesLoadingMore(false);
+    }
+  };
 
   const perform = async (name: string, action: () => Promise<unknown>) => {
     if (busyRef.current) return;
@@ -436,6 +464,10 @@ export function MarketPaymentChannelsPanel() {
               </li>
             ))}
           </ul>
+          {casesNextCursor ? <Button size="sm" variant="outline" isDisabled={!!busy || casesLoadingMore} onPress={() => void loadMoreCases()}>
+            {casesLoadingMore ? <Loader2 className="size-4 animate-spin" aria-hidden="true" /> : null}
+            {t("settings.marketFinance.casesLoadMore")}
+          </Button> : null}
           <p className="text-xs text-muted-foreground">{t("settings.marketFinance.caseNote")}</p>
         </div>
       ) : null}

@@ -268,6 +268,31 @@ fn optional_string(value: &Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn optional_payment_string(value: &Value, key: &str) -> Result<Option<String>, AppError> {
+    match value.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => {
+            Ok(Some(text.trim().to_string()).filter(|text| !text.is_empty()))
+        }
+        _ => Err(AppError::ServiceUnavailable(
+            "DujiaoPay payment evidence invalid".into(),
+        )),
+    }
+}
+
+fn optional_confirmations(value: &Value) -> Result<Option<i64>, AppError> {
+    let confirmations = match value.get("confirmations") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Number(number)) => number.as_i64(),
+        Some(Value::String(text)) => text.trim().parse::<i64>().ok(),
+        _ => None,
+    };
+    confirmations
+        .filter(|count| *count >= 0)
+        .map(Some)
+        .ok_or_else(|| AppError::ServiceUnavailable("DujiaoPay payment evidence invalid".into()))
+}
+
 fn parse_gateway_order(value: &Value) -> Result<GatewayOrder, AppError> {
     let fiat_amount = required_string(value, "fiat_amount")?;
     let fiat_amount_minor = parse_usd_minor(&fiat_amount)
@@ -278,13 +303,14 @@ fn parse_gateway_order(value: &Value) -> Result<GatewayOrder, AppError> {
         status: required_string(value, "status")?,
         fiat_currency: required_string(value, "fiat_currency")?.to_ascii_uppercase(),
         fiat_amount_minor,
-        paid_source: optional_string(value, "paid_source"),
-        chain: optional_string(value, "chain"),
-        token_id: optional_string(value, "token_id"),
-        tx_id: optional_string(value, "tx_hash").or_else(|| optional_string(value, "tx_id")),
-        settled_amount: optional_string(value, "settled_amount"),
-        confirmations: value.get("confirmations").and_then(Value::as_i64),
-        paid_at: optional_string(value, "paid_at"),
+        paid_source: optional_payment_string(value, "paid_source")?,
+        chain: optional_payment_string(value, "chain")?,
+        token_id: optional_payment_string(value, "token_id")?,
+        tx_id: optional_payment_string(value, "tx_hash")?
+            .or(optional_payment_string(value, "tx_id")?),
+        settled_amount: optional_payment_string(value, "settled_amount")?,
+        confirmations: optional_confirmations(value)?,
+        paid_at: optional_payment_string(value, "paid_at")?,
         checkout_url: safe_checkout_url(optional_string(value, "checkout_url")),
     })
 }
@@ -687,5 +713,32 @@ mod tests {
         .unwrap();
         assert_eq!(order.fiat_amount_minor, 2000);
         assert_eq!(order.paid_source.as_deref(), Some("chain"));
+    }
+
+    #[test]
+    fn gateway_payment_evidence_with_unexpected_types_fails_closed() {
+        let base = json!({
+            "order_id": "do_1", "merchant_order_id": "mo_1", "status": "expired",
+            "fiat_currency": "USD", "fiat_amount": "20.00"
+        });
+        for (field, invalid) in [
+            ("paid_source", json!(true)),
+            ("tx_hash", json!(123)),
+            ("tx_id", json!({"hash": "tx1"})),
+            ("settled_amount", json!(0.01)),
+            ("paid_at", json!(123)),
+            ("confirmations", json!({"count": 1})),
+            ("confirmations", json!(-1)),
+            ("confirmations", json!("not-a-number")),
+        ] {
+            let mut value = base.clone();
+            value[field] = invalid;
+            assert!(parse_gateway_order(&value).is_err(), "{field}");
+        }
+        let mut value = base;
+        value["confirmations"] = json!("0");
+        assert_eq!(parse_gateway_order(&value).unwrap().confirmations, Some(0));
+        value["confirmations"] = json!("1");
+        assert_eq!(parse_gateway_order(&value).unwrap().confirmations, Some(1));
     }
 }

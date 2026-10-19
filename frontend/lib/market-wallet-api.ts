@@ -193,6 +193,9 @@ export type MarketFinanceTopupRecovery = {
   gatewayStatus: string;
   canRecover: boolean;
   recovered: boolean;
+  requiresManualReference: boolean;
+  blockers: string[];
+  reviewCaseCodes: string[];
 };
 
 export type MarketPaymentChannelInput = {
@@ -363,15 +366,17 @@ export async function getMarketPaymentChannels() {
   );
 }
 
-export async function getMarketFinanceCases() {
-  return parseJson<MarketFinanceCase[]>(
-    await authFetch("/v1/admin/market-finance/cases", { cache: "no-store" }),
+export async function getMarketFinanceCases(cursor?: string) {
+  const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
+  return parseJson<MarketWalletPage<MarketFinanceCase>>(
+    await authFetch(`/v1/admin/market-finance/cases${query}`, { cache: "no-store" }),
   );
 }
 
-export async function getMarketFinanceTopups() {
-  return parseJson<MarketFinanceTopup[]>(
-    await authFetch("/v1/admin/market-finance/topups", { cache: "no-store" }),
+export async function getMarketFinanceTopups(cursor?: string) {
+  const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
+  return parseJson<MarketWalletPage<MarketFinanceTopup>>(
+    await authFetch(`/v1/admin/market-finance/topups${query}`, { cache: "no-store" }),
   );
 }
 
@@ -382,6 +387,8 @@ export async function recoverMarketFinanceTopup(
     expectedUpdatedAt: string;
     gatewayOrderId?: string;
     reasonCode: string;
+    manualReference?: string;
+    manualConfirmed?: boolean;
     dryRun: boolean;
   },
 ) {

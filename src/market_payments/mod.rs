@@ -1795,19 +1795,44 @@ fn open_reconciliation_case_tx(
     object_id: &str,
     time: &str,
 ) -> Result<(), AppError> {
+    open_reconciliation_case_detail_tx(conn, code, object_kind, object_id, None, time)
+}
+
+fn open_reconciliation_case_detail_tx(
+    conn: &Connection,
+    code: &str,
+    object_kind: &str,
+    object_id: &str,
+    detail_code: Option<&str>,
+    time: &str,
+) -> Result<(), AppError> {
     conn.execute(
         "INSERT OR IGNORE INTO market_finance_reconciliation_cases
-         (id, code, object_kind, object_id, status, created_at)
-         VALUES (?1, ?2, ?3, ?4, 'open', ?5)",
+         (id, code, object_kind, object_id, status, detail_code, created_at)
+         VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?6)",
         params![
             Uuid::new_v4().to_string(),
             code,
             object_kind,
             object_id,
+            detail_code,
             time
         ],
     )
     .map_err(db_error("open market finance reconciliation case"))?;
+    if let Some(detail_code) = detail_code {
+        conn.execute(
+            "UPDATE market_finance_reconciliation_cases SET detail_code = ?4
+             WHERE code = ?1 AND object_kind = ?2 AND object_id = ?3
+               AND status = 'open'
+               AND (detail_code IS NULL
+                    OR detail_code = ''
+                    OR (detail_code = 'gateway_status_unknown'
+                        AND ?4 != 'gateway_status_unknown'))",
+            params![code, object_kind, object_id, detail_code],
+        )
+        .map_err(db_error("classify market finance reconciliation case"))?;
+    }
     Ok(())
 }
 
@@ -1827,18 +1852,43 @@ struct FinanceCaseView {
 async fn list_finance_cases(
     State(state): State<ServerState>,
     headers: HeaderMap,
+    Query(query): Query<PageQuery>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     crate::api::require_admin_session(&state, &headers).await?;
     let conn = state.store.conn.lock().await;
+    Ok((
+        no_store(),
+        Json(finance_cases_tx(&conn, query.cursor.as_deref())?),
+    ))
+}
+
+fn finance_cases_tx(
+    conn: &Connection,
+    cursor: Option<&str>,
+) -> Result<Page<FinanceCaseView>, AppError> {
+    let cursor_at = cursor
+        .map(|id| {
+            conn.query_row(
+                "SELECT created_at FROM market_finance_reconciliation_cases WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(db_error("read finance case cursor"))?
+            .ok_or_else(|| AppError::BadRequest("invalid finance case cursor".into()))
+        })
+        .transpose()?;
     let mut statement = conn
         .prepare(
             "SELECT id, code, object_kind, object_id, status, detail_code, created_at, resolved_at
              FROM market_finance_reconciliation_cases
-             WHERE status = 'open' ORDER BY created_at, id LIMIT 200",
+             WHERE status = 'open'
+               AND (?1 IS NULL OR created_at < ?1 OR (created_at = ?1 AND id < ?2))
+             ORDER BY created_at DESC, id DESC LIMIT 51",
         )
         .map_err(db_error("prepare market finance cases"))?;
-    let cases = statement
-        .query_map([], |row| {
+    let mut items = statement
+        .query_map(params![cursor_at, cursor], |row| {
             Ok(FinanceCaseView {
                 id: row.get(0)?,
                 code: row.get(1)?,
@@ -1853,7 +1903,10 @@ async fn list_finance_cases(
         .map_err(db_error("query market finance cases"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(db_error("read market finance cases"))?;
-    Ok((no_store(), Json(cases)))
+    let has_more = items.len() > 50;
+    items.truncate(50);
+    let next_cursor = has_more.then(|| items.last().unwrap().id.clone());
+    Ok(Page { items, next_cursor })
 }
 
 #[derive(Deserialize)]
@@ -1902,22 +1955,46 @@ struct AdminTopupView {
 async fn list_admin_topups(
     State(state): State<ServerState>,
     headers: HeaderMap,
+    Query(query): Query<PageQuery>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     crate::api::require_admin_session(&state, &headers).await?;
     let conn = state.store.conn.lock().await;
+    Ok((
+        no_store(),
+        Json(admin_topups_tx(&conn, query.cursor.as_deref())?),
+    ))
+}
+
+fn admin_topups_tx(
+    conn: &Connection,
+    cursor: Option<&str>,
+) -> Result<Page<AdminTopupView>, AppError> {
+    let cursor_at = cursor
+        .map(|id| {
+            conn.query_row(
+                "SELECT created_at FROM market_topup_orders WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(db_error("read admin top-up cursor"))?
+            .ok_or_else(|| AppError::BadRequest("invalid admin top-up cursor".into()))
+        })
+        .transpose()?;
     let mut statement = conn
         .prepare(
             "SELECT id, user_id, channel_id, merchant_order_id, gateway_order_id,
                     amount_minor, status, created_at, updated_at
              FROM market_topup_orders
-             WHERE status IN ('review_required', 'create_unknown')
-                OR (status IN ('creating', 'pending', 'verifying') AND updated_at < ?1)
-             ORDER BY updated_at, id LIMIT 200",
+             WHERE (status IN ('review_required', 'create_unknown')
+                OR (status IN ('created', 'creating', 'pending', 'verifying') AND updated_at < ?1))
+               AND (?2 IS NULL OR created_at > ?2 OR (created_at = ?2 AND id > ?3))
+             ORDER BY created_at, id LIMIT 51",
         )
         .map_err(db_error("prepare unresolved top-ups"))?;
     let cutoff = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
-    let items = statement
-        .query_map(params![cutoff], |row| {
+    let mut items = statement
+        .query_map(params![cutoff, cursor_at, cursor], |row| {
             Ok(AdminTopupView {
                 id: row.get(0)?,
                 user_id: row.get(1)?,
@@ -1933,7 +2010,10 @@ async fn list_admin_topups(
         .map_err(db_error("query unresolved top-ups"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(db_error("read unresolved top-ups"))?;
-    Ok((no_store(), Json(items)))
+    let has_more = items.len() > 50;
+    items.truncate(50);
+    let next_cursor = has_more.then(|| items.last().unwrap().id.clone());
+    Ok(Page { items, next_cursor })
 }
 
 #[derive(Deserialize)]
@@ -1943,6 +2023,9 @@ struct RecoverTopupRequest {
     expected_updated_at: String,
     gateway_order_id: Option<String>,
     reason_code: String,
+    manual_reference: Option<String>,
+    #[serde(default)]
+    manual_confirmed: bool,
     dry_run: bool,
 }
 
@@ -1953,6 +2036,29 @@ struct RecoverTopupView {
     gateway_status: String,
     can_recover: bool,
     recovered: bool,
+    requires_manual_reference: bool,
+    blockers: Vec<&'static str>,
+    review_case_codes: Vec<String>,
+}
+
+struct RecoveryAssessment {
+    blockers: Vec<&'static str>,
+    review_case_codes: Vec<String>,
+    open_case_ids: Vec<String>,
+    requires_manual_reference: bool,
+}
+
+impl RecoveryAssessment {
+    fn can_recover(&self) -> bool {
+        self.blockers.is_empty()
+    }
+}
+
+fn valid_manual_reference(reference: &str) -> bool {
+    (8..=128).contains(&reference.len())
+        && reference.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':' | b'/')
+        })
 }
 
 struct RecoverTopupSnapshot {
@@ -1998,7 +2104,7 @@ fn recovery_gateway_id(
     }
     if !matches!(
         snapshot.status.as_str(),
-        "review_required" | "create_unknown"
+        "created" | "creating" | "create_unknown" | "pending" | "verifying" | "review_required"
     ) {
         return Err(AppError::Conflict(
             "top-up is not eligible for manual recovery".into(),
@@ -2016,30 +2122,124 @@ fn recovery_gateway_id(
     }
 }
 
-fn recoverable_unpaid_topup_tx(
+fn recovery_assessment_tx(
     conn: &Connection,
     order_id: &str,
     status: &str,
-) -> Result<bool, AppError> {
-    if status == "review_required" {
-        return Ok(benign_progress_review_case_tx(conn, order_id)?.is_some());
+    gateway: &GatewayOrder,
+) -> Result<RecoveryAssessment, AppError> {
+    let mut assessment = RecoveryAssessment {
+        blockers: gateway_recovery_blockers(gateway),
+        review_case_codes: Vec::new(),
+        open_case_ids: Vec::new(),
+        requires_manual_reference: false,
+    };
+    let (has_receipt, has_journal): (bool, bool) = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM market_topup_receipts WHERE order_id = ?1),
+                    EXISTS(SELECT 1 FROM market_journal_transactions
+                           WHERE source_kind = 'topup' AND source_id = ?1)",
+            params![order_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(db_error("check top-up accounting evidence"))?;
+    if has_receipt {
+        assessment.blockers.push("local_receipt_present");
     }
-    if status != "create_unknown" {
-        return Ok(false);
+    if has_journal {
+        assessment.blockers.push("local_journal_present");
     }
-    conn.query_row(
-        "SELECT NOT EXISTS (SELECT 1 FROM market_finance_reconciliation_cases c
-                            WHERE c.object_kind = 'topup' AND c.object_id = ?1 AND c.status = 'open')
-            AND NOT EXISTS (SELECT 1 FROM market_topup_events e WHERE e.order_id = ?1
-                            AND (e.status = 'review_required' OR e.event_type NOT IN
-                                 ('order.created', 'order.method_selected', 'order.confirming',
-                                  'order.expired', 'order.cancelled', 'order.canceled')))
-            AND NOT EXISTS (SELECT 1 FROM market_topup_receipts r WHERE r.order_id = ?1)
-            AND NOT EXISTS (SELECT 1 FROM market_journal_transactions j
-                            WHERE j.source_kind = 'topup' AND j.source_id = ?1)",
-        params![order_id],
-        |row| row.get(0),
-    ).map_err(db_error("check top-up recovery evidence"))
+
+    let mut events = conn
+        .prepare("SELECT event_type, status FROM market_topup_events WHERE order_id = ?1")
+        .map_err(db_error("prepare top-up recovery events"))?;
+    let event_rows = events
+        .query_map(params![order_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(db_error("query top-up recovery events"))?;
+    let mut has_progress_review = false;
+    for event in event_rows {
+        let (event_type, event_status) = event.map_err(db_error("read top-up recovery event"))?;
+        let progress = is_non_payment_lifecycle_event(&event_type);
+        has_progress_review |= progress && event_status == "review_required";
+        if !progress
+            && !matches!(
+                event_type.as_str(),
+                "order.expired" | "order.cancelled" | "order.canceled"
+            )
+        {
+            assessment.blockers.push("payment_or_unknown_event");
+        } else if event_status == "pending" || (event_status == "review_required" && !progress) {
+            assessment.blockers.push("unprocessed_or_disputed_event");
+        }
+    }
+
+    let mut cases = conn
+        .prepare(
+            "SELECT id, code, status, COALESCE(detail_code, '')
+             FROM market_finance_reconciliation_cases
+             WHERE object_kind = 'topup' AND object_id = ?1 ORDER BY created_at, id",
+        )
+        .map_err(db_error("prepare top-up recovery cases"))?;
+    let case_rows = cases
+        .query_map(params![order_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(db_error("query top-up recovery cases"))?;
+    let mut has_review_case = false;
+    for case in case_rows {
+        let (id, code, case_status, detail) =
+            case.map_err(db_error("read top-up recovery case"))?;
+        assessment.review_case_codes.push(code.clone());
+        if case_status == "open" {
+            assessment.open_case_ids.push(id);
+        }
+        match code.as_str() {
+            "unknown_gateway_event" if has_progress_review && case_status == "open" => {
+                has_review_case = true;
+            }
+            "unknown_gateway_event" if has_progress_review => {}
+            "unknown_gateway_event" => assessment.blockers.push("unclassified_review_case"),
+            "topup_verification_failed"
+                if detail.is_empty() || detail == "gateway_status_unknown" =>
+            {
+                if case_status == "open" {
+                    has_review_case = true;
+                }
+                if case_status == "open" || status == "review_required" {
+                    assessment.requires_manual_reference = true;
+                }
+            }
+            "topup_verification_failed"
+                if matches!(
+                    detail.as_str(),
+                    "gateway_terminal_payment_evidence" | "paid_receipt_invalid"
+                ) =>
+            {
+                assessment.blockers.push("verification_payment_evidence");
+            }
+            "topup_verification_failed" => assessment
+                .blockers
+                .push("verification_identity_or_create_conflict"),
+            _ => assessment.blockers.push("other_review_case"),
+        }
+    }
+    assessment.review_case_codes.sort();
+    assessment.review_case_codes.dedup();
+    if status == "review_required" && !has_review_case {
+        assessment.blockers.push("review_cause_unclassified");
+    } else if status != "review_required" && !assessment.open_case_ids.is_empty() {
+        assessment.blockers.push("other_review_case");
+    }
+    assessment.blockers.sort();
+    assessment.blockers.dedup();
+    Ok(assessment)
 }
 
 fn apply_owner_verified_recovery_tx(
@@ -2050,10 +2250,10 @@ fn apply_owner_verified_recovery_tx(
     gateway: &GatewayOrder,
     actor: &str,
     time: &str,
-) -> Result<bool, AppError> {
+) -> Result<RecoveryAssessment, AppError> {
     let current = recovery_snapshot_tx(conn, order_id)?;
     let gateway_id = recovery_gateway_id(&current, input)?;
-    validate_gateway_identity_tx(
+    let identity_conflict = match validate_gateway_identity_tx(
         conn,
         order_id,
         &current.channel_id,
@@ -2061,33 +2261,99 @@ fn apply_owner_verified_recovery_tx(
         loaded,
         &gateway_id,
         gateway,
-    )?;
-    let can_recover = gateway_terminal_without_payment_evidence(gateway)
-        && recoverable_unpaid_topup_tx(conn, order_id, &current.status)?;
-    if input.dry_run {
-        return Ok(can_recover);
+    ) {
+        Ok(()) => false,
+        Err(AppError::Conflict(_)) => true,
+        Err(error) => return Err(error),
+    };
+    let mut assessment = recovery_assessment_tx(conn, order_id, &current.status, gateway)?;
+    if identity_conflict {
+        assessment.blockers.push("gateway_identity_mismatch");
     }
-    if !can_recover {
+    if input.dry_run {
+        return Ok(assessment);
+    }
+    if !assessment.can_recover() {
         return Err(AppError::Conflict(
             "gateway payment or review evidence prevents recovery".into(),
         ));
     }
+    if assessment.requires_manual_reference
+        && (!input.manual_confirmed
+            || !input
+                .manual_reference
+                .as_deref()
+                .is_some_and(valid_manual_reference))
+    {
+        return Err(AppError::BadRequest(
+            "merchant review confirmation and reference are required for an unclassified historical hold".into(),
+        ));
+    }
+    let status = verified_unpaid_status(&gateway.status)?;
     let changed = conn
         .execute(
-            "UPDATE market_topup_orders SET gateway_order_id = COALESCE(gateway_order_id, ?2)
-         WHERE id = ?1 AND (gateway_order_id IS NULL OR gateway_order_id = ?2)",
-            params![order_id, gateway_id],
+            "UPDATE market_topup_orders
+             SET gateway_order_id = COALESCE(gateway_order_id, ?2), status = ?3,
+                 checkout_url = NULL, updated_at = ?4, next_reconcile_at = ?4
+             WHERE id = ?1 AND status = ?5 AND updated_at = ?6
+               AND (gateway_order_id IS NULL OR gateway_order_id = ?2)",
+            params![
+                order_id,
+                gateway_id,
+                status,
+                time,
+                current.status,
+                current.updated_at
+            ],
         )
-        .map_err(db_error("bind owner-verified gateway identity"))?;
+        .map_err(db_error("close owner-verified unpaid top-up"))?;
     if changed != 1 {
-        return Err(AppError::Conflict("top-up gateway identity changed".into()));
+        return Err(AppError::Conflict("top-up changed during recovery".into()));
     }
-    apply_verified_unpaid_status_tx(
-        conn,
-        order_id,
-        verified_unpaid_status(&gateway.status)?,
-        time,
-    )?;
+    for case_id in &assessment.open_case_ids {
+        crate::market_reconcile::resolve_case_tx(conn, case_id, actor, &input.reason_code, time)?;
+    }
+    let evidence = serde_json::json!({
+        "orderId": order_id,
+        "gatewayOrderId": gateway.order_id,
+        "merchantOrderId": gateway.merchant_order_id,
+        "gatewayStatus": gateway.status,
+        "fiatCurrency": gateway.fiat_currency,
+        "fiatAmountMinor": gateway.fiat_amount_minor,
+        "paidSource": gateway.paid_source,
+        "transactionId": gateway.tx_id,
+        "paidAt": gateway.paid_at,
+        "confirmations": gateway.confirmations,
+        "settledAmount": gateway.settled_amount,
+        "reviewCaseCodes": assessment.review_case_codes,
+        "paymentEvidenceBlockers": gateway_recovery_blockers(gateway),
+        "manualConfirmed": input.manual_confirmed,
+    });
+    let evidence_sha256 = hex::encode(Sha256::digest(evidence.to_string().as_bytes()));
+    let cases_json = serde_json::to_string(&assessment.review_case_codes)
+        .map_err(|_| AppError::Internal("encode top-up recovery case codes failed".into()))?;
+    conn.execute(
+        "INSERT INTO market_topup_recovery_decisions
+         (id, order_id, actor_user_id, gateway_order_id, gateway_status,
+          gateway_checked_at, evidence_sha256, review_case_codes_json,
+          manual_reference, manual_confirmed, reason_code, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            Uuid::new_v4().to_string(),
+            order_id,
+            actor,
+            gateway_id,
+            gateway.status,
+            time,
+            evidence_sha256,
+            cases_json,
+            input.manual_reference,
+            input.manual_confirmed,
+            input.reason_code,
+            time
+        ],
+    )
+    .map_err(db_error("record top-up recovery evidence"))?;
     audit_tx(
         conn,
         actor,
@@ -2097,7 +2363,7 @@ fn apply_owner_verified_recovery_tx(
         Some(&input.reason_code),
         time,
     )?;
-    Ok(true)
+    Ok(assessment)
 }
 
 async fn recover_admin_topup(
@@ -2115,6 +2381,15 @@ async fn recover_admin_topup(
     {
         return Err(AppError::BadRequest(
             "a short audit reason code is required".into(),
+        ));
+    }
+    if input
+        .manual_reference
+        .as_deref()
+        .is_some_and(|reference| !valid_manual_reference(reference))
+    {
+        return Err(AppError::BadRequest(
+            "a merchant review reference of 8-128 safe characters is required".into(),
         ));
     }
     let (snapshot, loaded) = {
@@ -2142,7 +2417,7 @@ async fn recover_admin_topup(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin owner top-up recovery"))?;
-    let can_recover = apply_owner_verified_recovery_tx(
+    let assessment = apply_owner_verified_recovery_tx(
         &tx,
         &order_id,
         &input,
@@ -2153,6 +2428,7 @@ async fn recover_admin_topup(
     )?;
     tx.commit()
         .map_err(db_error("commit owner top-up recovery"))?;
+    let can_recover = assessment.can_recover();
     Ok((
         no_store(),
         Json(RecoverTopupView {
@@ -2160,6 +2436,9 @@ async fn recover_admin_topup(
             gateway_status: gateway.status,
             can_recover,
             recovered: !input.dry_run && can_recover,
+            requires_manual_reference: assessment.requires_manual_reference,
+            blockers: assessment.blockers,
+            review_case_codes: assessment.review_case_codes,
         }),
     ))
 }
@@ -2785,7 +3064,12 @@ async fn create_topup(
         Ok(created) => {
             if let Err(error) = save_created_order_tx(&tx, &order_id, revision, &created, &now()) {
                 if matches!(error, AppError::Conflict(_)) {
-                    hold_topup_verification_failure_tx(&tx, &order_id, &now())?;
+                    hold_topup_verification_failure_tx(
+                        &tx,
+                        &order_id,
+                        "created_order_conflict",
+                        &now(),
+                    )?;
                     tx.commit()
                         .map_err(db_error("commit conflicting DujiaoPay create result"))?;
                 }
@@ -3136,9 +3420,17 @@ fn bind_signed_gateway_order_tx(
 fn hold_topup_verification_failure_tx(
     conn: &Connection,
     order_id: &str,
+    detail_code: &str,
     time: &str,
 ) -> Result<(), AppError> {
-    open_reconciliation_case_tx(conn, "topup_verification_failed", "topup", order_id, time)?;
+    open_reconciliation_case_detail_tx(
+        conn,
+        "topup_verification_failed",
+        "topup",
+        order_id,
+        Some(detail_code),
+        time,
+    )?;
     conn.execute(
         "UPDATE market_topup_orders SET status = 'review_required', updated_at = ?2
          WHERE id = ?1 AND status != 'credited'",
@@ -3281,17 +3573,44 @@ fn verified_unpaid_status(gateway_status: &str) -> Result<&'static str, AppError
     }
 }
 
-fn gateway_terminal_without_payment_evidence(gateway: &GatewayOrder) -> bool {
-    matches!(
+fn exact_decimal_zero(value: &str) -> bool {
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    !whole.is_empty()
+        && whole.bytes().all(|byte| byte == b'0')
+        && (fraction.is_empty() && !value.contains('.')
+            || !fraction.is_empty() && fraction.bytes().all(|byte| byte == b'0'))
+}
+
+fn gateway_recovery_blockers(gateway: &GatewayOrder) -> Vec<&'static str> {
+    let mut blockers = Vec::new();
+    if !matches!(
         gateway.status.as_str(),
         "expired" | "canceled" | "cancelled"
-    ) && gateway.paid_source.is_none()
-        && gateway.tx_id.is_none()
-        && gateway.paid_at.is_none()
-        && gateway.confirmations.unwrap_or(0) == 0
-        && gateway.settled_amount.as_deref().is_none_or(|amount| {
-            crate::market_wallet::parse_usd_minor(amount).is_ok_and(|value| value == 0)
-        })
+    ) {
+        blockers.push("gateway_not_terminal");
+    }
+    if gateway.paid_source.is_some() {
+        blockers.push("gateway_paid_source");
+    }
+    if gateway.tx_id.is_some() {
+        blockers.push("gateway_transaction");
+    }
+    if gateway.paid_at.is_some() {
+        blockers.push("gateway_paid_at");
+    }
+    if gateway.confirmations.unwrap_or(0) != 0 {
+        blockers.push("gateway_confirmations");
+    }
+    if let Some(amount) = gateway.settled_amount.as_deref()
+        && !exact_decimal_zero(amount)
+    {
+        blockers.push("gateway_settled_amount");
+    }
+    blockers
+}
+
+fn gateway_terminal_without_payment_evidence(gateway: &GatewayOrder) -> bool {
+    gateway_recovery_blockers(gateway).is_empty()
 }
 
 fn is_non_payment_lifecycle_event(event_type: &str) -> bool {
@@ -3494,7 +3813,12 @@ async fn dujiaopay_webhook(
         ) {
             Ok(()) => false,
             Err(AppError::Conflict(_)) => {
-                hold_topup_verification_failure_tx(&tx, &order_id, &time)?;
+                hold_topup_verification_failure_tx(
+                    &tx,
+                    &order_id,
+                    "signed_gateway_order_conflict",
+                    &time,
+                )?;
                 true
             }
             Err(error) => return Err(error),
@@ -3592,7 +3916,12 @@ async fn dujiaopay_webhook(
         ) {
             if matches!(error, AppError::Conflict(_)) {
                 let time = now();
-                hold_topup_verification_failure_tx(&tx, &order_id, &time)?;
+                hold_topup_verification_failure_tx(
+                    &tx,
+                    &order_id,
+                    "gateway_identity_mismatch",
+                    &time,
+                )?;
                 tx.execute("UPDATE market_topup_events SET status = 'review_required', processed_at = ?3 WHERE merchant_fingerprint = ?1 AND gateway_event_id = ?2", params![loaded.merchant_fingerprint, event.event_id, time])
                     .map_err(db_error("hold mismatched gateway identity event"))?;
                 tx.commit()
@@ -3607,7 +3936,12 @@ async fn dujiaopay_webhook(
             Ok(status) => status,
             Err(AppError::Conflict(_)) => {
                 let time = now();
-                hold_topup_verification_failure_tx(&tx, &order_id, &time)?;
+                hold_topup_verification_failure_tx(
+                    &tx,
+                    &order_id,
+                    "gateway_status_unknown",
+                    &time,
+                )?;
                 tx.execute("UPDATE market_topup_events SET status = 'review_required', processed_at = ?3 WHERE merchant_fingerprint = ?1 AND gateway_event_id = ?2", params![loaded.merchant_fingerprint, event.event_id, time])
                     .map_err(db_error("hold unknown gateway status event"))?;
                 tx.commit()
@@ -3622,7 +3956,12 @@ async fn dujiaopay_webhook(
             && !gateway_terminal_without_payment_evidence(&gateway)
         {
             let time = now();
-            hold_topup_verification_failure_tx(&tx, &order_id, &time)?;
+            hold_topup_verification_failure_tx(
+                &tx,
+                &order_id,
+                "gateway_terminal_payment_evidence",
+                &time,
+            )?;
             tx.execute("UPDATE market_topup_events SET status = 'review_required', processed_at = ?3 WHERE merchant_fingerprint = ?1 AND gateway_event_id = ?2", params![loaded.merchant_fingerprint, event.event_id, time])
                 .map_err(db_error("hold terminal gateway payment evidence"))?;
             tx.commit()
@@ -3651,11 +3990,12 @@ async fn dujiaopay_webhook(
     ) {
         if matches!(error, AppError::Conflict(_)) {
             let time = now();
-            open_reconciliation_case_tx(
+            open_reconciliation_case_detail_tx(
                 &tx,
                 "topup_verification_failed",
                 "topup",
                 &order_id,
+                Some("paid_receipt_invalid"),
                 &time,
             )?;
             tx.execute("UPDATE market_topup_orders SET status = 'review_required', updated_at = ?2 WHERE id = ?1 AND status != 'credited'", params![order_id, time])
@@ -3854,7 +4194,12 @@ async fn reconcile_one_topup(state: &ServerState, pending: PendingTopup) -> Resu
             save_created_order_tx(&tx, &pending.id, pending.revision, &created, &now())
         {
             if matches!(error, AppError::Conflict(_)) {
-                hold_topup_verification_failure_tx(&tx, &pending.id, &now())?;
+                hold_topup_verification_failure_tx(
+                    &tx,
+                    &pending.id,
+                    "created_order_conflict",
+                    &now(),
+                )?;
                 finish_reconciliation_tx(&tx, &pending.id, pending.had_hint)?;
                 tx.commit()
                     .map_err(db_error("commit conflicting top-up recovery"))?;
@@ -3894,7 +4239,12 @@ async fn reconcile_one_topup(state: &ServerState, pending: PendingTopup) -> Resu
         &gateway,
     ) {
         if matches!(error, AppError::Conflict(_)) {
-            hold_topup_verification_failure_tx(&tx, &pending.id, &now())?;
+            hold_topup_verification_failure_tx(
+                &tx,
+                &pending.id,
+                "gateway_identity_mismatch",
+                &now(),
+            )?;
             finish_reconciliation_tx(&tx, &pending.id, pending.had_hint)?;
             tx.commit()
                 .map_err(db_error("commit mismatched gateway review"))?;
@@ -3925,7 +4275,12 @@ async fn reconcile_one_topup(state: &ServerState, pending: PendingTopup) -> Resu
                 &gateway,
             )?,
             Err(AppError::Conflict(_)) => {
-                hold_topup_verification_failure_tx(&tx, &pending.id, &now())?;
+                hold_topup_verification_failure_tx(
+                    &tx,
+                    &pending.id,
+                    "paid_receipt_invalid",
+                    &now(),
+                )?;
             }
             Err(error) => return Err(error),
         }
@@ -3942,11 +4297,21 @@ async fn reconcile_one_topup(state: &ServerState, pending: PendingTopup) -> Resu
                 if matches!(status, "expired" | "cancelled")
                     && !gateway_terminal_without_payment_evidence(&gateway) =>
             {
-                hold_topup_verification_failure_tx(&tx, &pending.id, &now())?;
+                hold_topup_verification_failure_tx(
+                    &tx,
+                    &pending.id,
+                    "gateway_terminal_payment_evidence",
+                    &now(),
+                )?;
             }
             Ok(status) => apply_verified_unpaid_status_tx(&tx, &pending.id, status, &now())?,
             Err(AppError::Conflict(_)) => {
-                hold_topup_verification_failure_tx(&tx, &pending.id, &now())?;
+                hold_topup_verification_failure_tx(
+                    &tx,
+                    &pending.id,
+                    "gateway_status_unknown",
+                    &now(),
+                )?;
             }
             Err(error) => return Err(error),
         }
@@ -5341,7 +5706,8 @@ mod tests {
         ));
         assert_eq!(verified_unpaid_status("confirming").unwrap(), "verifying");
         assert!(verified_unpaid_status("refunded").is_err());
-        hold_topup_verification_failure_tx(&conn, "order-1", &now()).unwrap();
+        hold_topup_verification_failure_tx(&conn, "order-1", "gateway_identity_mismatch", &now())
+            .unwrap();
         assert!(topup_has_manual_hold_tx(&conn, "order-1").unwrap());
         assert_eq!(wallet_snapshot_tx(&conn, "buyer").unwrap().posted_units, 0);
     }
@@ -5358,6 +5724,8 @@ mod tests {
             expected_updated_at: snapshot.updated_at,
             gateway_order_id: Some("gateway-1".into()),
             reason_code: "gateway_terminal_verified".into(),
+            manual_reference: None,
+            manual_confirmed: false,
             dry_run: true,
         };
         let gateway = unpaid_order(merchant_order_id, "expired");
@@ -5372,6 +5740,7 @@ mod tests {
                 &now()
             )
             .unwrap()
+            .can_recover()
         );
         assert_eq!(
             read_topup(&conn, "order-1", "buyer").unwrap().status,
@@ -5425,6 +5794,749 @@ mod tests {
     }
 
     #[test]
+    fn historical_double_review_needs_merchant_reference_and_keeps_late_payment_reconciliation() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        let merchant_order_id = "router-00000000000000000000000000000001";
+        fixture_topup(&conn, "order-1", merchant_order_id, "review_required", 1);
+        let mut created = event(&unpaid_order(merchant_order_id, "pending"));
+        created.event_type = "order.created".into();
+        persist_signed_event_tx(
+            &conn,
+            "order-1",
+            &loaded().merchant_fingerprint,
+            &created,
+            &now(),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE market_topup_events SET status = 'review_required' WHERE order_id = 'order-1'",
+            [],
+        )
+        .unwrap();
+        let mut expired_event = created.clone();
+        expired_event.event_id = "expired-event".into();
+        expired_event.event_type = "order.expired".into();
+        persist_signed_event_tx(
+            &conn,
+            "order-1",
+            &loaded().merchant_fingerprint,
+            &expired_event,
+            &now(),
+        )
+        .unwrap();
+        conn.execute("UPDATE market_topup_events SET status = 'processed' WHERE gateway_event_id = 'expired-event'", []).unwrap();
+        open_reconciliation_case_tx(&conn, "unknown_gateway_event", "topup", "order-1", &now())
+            .unwrap();
+        open_reconciliation_case_tx(
+            &conn,
+            "topup_verification_failed",
+            "topup",
+            "order-1",
+            &now(),
+        )
+        .unwrap();
+        let snapshot = recovery_snapshot_tx(&conn, "order-1").unwrap();
+        let mut input = RecoverTopupRequest {
+            expected_status: snapshot.status,
+            expected_updated_at: snapshot.updated_at,
+            gateway_order_id: Some("gateway-1".into()),
+            reason_code: "historical_merchant_review".into(),
+            manual_reference: None,
+            manual_confirmed: false,
+            dry_run: true,
+        };
+        let mut gateway = unpaid_order(merchant_order_id, "expired");
+        gateway.settled_amount = Some("0.00000000".into());
+        let preview = apply_owner_verified_recovery_tx(
+            &conn,
+            "order-1",
+            &input,
+            &loaded(),
+            &gateway,
+            "owner",
+            &now(),
+        )
+        .unwrap();
+        assert!(preview.can_recover());
+        assert!(preview.requires_manual_reference);
+        assert_eq!(preview.review_case_codes.len(), 2);
+        assert_eq!(
+            read_topup(&conn, "order-1", "buyer").unwrap().status,
+            "review_required"
+        );
+
+        input.dry_run = false;
+        assert!(matches!(
+            apply_owner_verified_recovery_tx(
+                &conn,
+                "order-1",
+                &input,
+                &loaded(),
+                &gateway,
+                "owner",
+                &now()
+            ),
+            Err(AppError::BadRequest(_))
+        ));
+        input.manual_reference = Some("merchant-case-1234".into());
+        assert!(matches!(
+            apply_owner_verified_recovery_tx(
+                &conn,
+                "order-1",
+                &input,
+                &loaded(),
+                &gateway,
+                "owner",
+                &now()
+            ),
+            Err(AppError::BadRequest(_))
+        ));
+        input.manual_confirmed = true;
+        let released = apply_owner_verified_recovery_tx(
+            &conn,
+            "order-1",
+            &input,
+            &loaded(),
+            &gateway,
+            "owner",
+            &now(),
+        )
+        .unwrap();
+        assert!(released.can_recover());
+        assert_eq!(
+            read_topup(&conn, "order-1", "buyer").unwrap().status,
+            "expired"
+        );
+        let open_cases: i64 = conn.query_row("SELECT COUNT(*) FROM market_finance_reconciliation_cases WHERE object_id = 'order-1' AND status = 'open'", [], |row| row.get(0)).unwrap();
+        assert_eq!(open_cases, 0);
+        let recorded: (String, String, String, bool) = conn.query_row(
+            "SELECT actor_user_id, manual_reference, gateway_status, manual_confirmed FROM market_topup_recovery_decisions WHERE order_id = 'order-1'",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).unwrap();
+        assert_eq!(
+            recorded,
+            (
+                "owner".into(),
+                "merchant-case-1234".into(),
+                "expired".into(),
+                true
+            )
+        );
+        assert_eq!(wallet_snapshot_tx(&conn, "buyer").unwrap().posted_units, 0);
+        ensure_pending_topup_capacity_tx(&conn, "buyer").unwrap();
+
+        // A terminal unpaid order is retained, so a later authenticated paid
+        // order still credits exactly once through the ordinary receipt path.
+        let paid = paid_order(merchant_order_id, "late-chain-tx");
+        apply_paid_order_tx(
+            &conn,
+            "order-1",
+            "channel",
+            1,
+            &loaded(),
+            &event(&paid),
+            &paid,
+        )
+        .unwrap();
+        assert_eq!(
+            read_topup(&conn, "order-1", "buyer").unwrap().status,
+            "credited"
+        );
+        assert!(wallet_snapshot_tx(&conn, "buyer").unwrap().posted_units > 0);
+        apply_paid_order_tx(
+            &conn,
+            "order-1",
+            "channel",
+            1,
+            &loaded(),
+            &event(&paid),
+            &paid,
+        )
+        .unwrap();
+        let receipts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM market_topup_receipts WHERE order_id = 'order-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(receipts, 1);
+    }
+
+    #[test]
+    fn resolved_historical_case_cannot_explain_a_new_manual_hold() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        let merchant_order_id = "router-00000000000000000000000000000001";
+        fixture_topup(&conn, "order-1", merchant_order_id, "review_required", 1);
+        let mut created = event(&unpaid_order(merchant_order_id, "pending"));
+        created.event_type = "order.created".into();
+        persist_signed_event_tx(
+            &conn,
+            "order-1",
+            &loaded().merchant_fingerprint,
+            &created,
+            &now(),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE market_topup_events SET status = 'review_required' WHERE order_id = 'order-1'",
+            [],
+        )
+        .unwrap();
+        open_reconciliation_case_tx(&conn, "unknown_gateway_event", "topup", "order-1", &now())
+            .unwrap();
+        let case_id: String = conn
+            .query_row(
+                "SELECT id FROM market_finance_reconciliation_cases WHERE object_id = 'order-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        crate::market_reconcile::resolve_case_tx(
+            &conn,
+            &case_id,
+            "owner",
+            "older_case_checked",
+            &now(),
+        )
+        .unwrap();
+        let snapshot = recovery_snapshot_tx(&conn, "order-1").unwrap();
+        let input = RecoverTopupRequest {
+            expected_status: snapshot.status,
+            expected_updated_at: snapshot.updated_at,
+            gateway_order_id: Some("gateway-1".into()),
+            reason_code: "gateway_terminal_verified".into(),
+            manual_reference: None,
+            manual_confirmed: false,
+            dry_run: true,
+        };
+        let gateway = unpaid_order(merchant_order_id, "expired");
+        let preview = apply_owner_verified_recovery_tx(
+            &conn,
+            "order-1",
+            &input,
+            &loaded(),
+            &gateway,
+            "owner",
+            &now(),
+        )
+        .unwrap();
+        assert!(!preview.can_recover());
+        assert!(preview.blockers.contains(&"review_cause_unclassified"));
+    }
+
+    #[test]
+    fn resolving_an_unclassified_failure_does_not_erase_manual_review_requirement() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        let merchant_order_id = "router-00000000000000000000000000000001";
+        fixture_topup(&conn, "order-1", merchant_order_id, "review_required", 1);
+        let mut created = event(&unpaid_order(merchant_order_id, "pending"));
+        created.event_type = "order.created".into();
+        persist_signed_event_tx(
+            &conn,
+            "order-1",
+            &loaded().merchant_fingerprint,
+            &created,
+            &now(),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE market_topup_events SET status = 'review_required' WHERE order_id = 'order-1'",
+            [],
+        )
+        .unwrap();
+        open_reconciliation_case_tx(&conn, "unknown_gateway_event", "topup", "order-1", &now())
+            .unwrap();
+        open_reconciliation_case_tx(
+            &conn,
+            "topup_verification_failed",
+            "topup",
+            "order-1",
+            &now(),
+        )
+        .unwrap();
+        let failure_case_id: String = conn
+            .query_row(
+                "SELECT id FROM market_finance_reconciliation_cases
+                 WHERE object_id = 'order-1' AND code = 'topup_verification_failed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        crate::market_reconcile::resolve_case_tx(
+            &conn,
+            &failure_case_id,
+            "owner",
+            "manual_acknowledgement",
+            &now(),
+        )
+        .unwrap();
+        let snapshot = recovery_snapshot_tx(&conn, "order-1").unwrap();
+        let input = RecoverTopupRequest {
+            expected_status: snapshot.status,
+            expected_updated_at: snapshot.updated_at,
+            gateway_order_id: Some("gateway-1".into()),
+            reason_code: "gateway_terminal_verified".into(),
+            manual_reference: None,
+            manual_confirmed: false,
+            dry_run: true,
+        };
+        let gateway = unpaid_order(merchant_order_id, "expired");
+        let preview = apply_owner_verified_recovery_tx(
+            &conn,
+            "order-1",
+            &input,
+            &loaded(),
+            &gateway,
+            "owner",
+            &now(),
+        )
+        .unwrap();
+        assert!(preview.can_recover());
+        assert!(preview.requires_manual_reference);
+    }
+
+    #[test]
+    fn gateway_terminal_zero_decimal_is_precision_independent_but_other_evidence_blocks() {
+        let mut gateway = unpaid_order("merchant-order", "expired");
+        for zero in ["0", "00.0", "0.00000000"] {
+            gateway.settled_amount = Some(zero.into());
+            assert!(
+                gateway_terminal_without_payment_evidence(&gateway),
+                "{zero}"
+            );
+        }
+        for unsafe_amount in ["0.00000001", "1.00", "0.", "not-a-number"] {
+            gateway.settled_amount = Some(unsafe_amount.into());
+            assert!(
+                !gateway_terminal_without_payment_evidence(&gateway),
+                "{unsafe_amount}"
+            );
+        }
+        gateway.settled_amount = None;
+        gateway.confirmations = Some(1);
+        assert!(!gateway_terminal_without_payment_evidence(&gateway));
+    }
+
+    #[test]
+    fn stale_pending_order_can_close_only_after_terminal_gateway_check() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        let merchant_order_id = "router-00000000000000000000000000000001";
+        fixture_topup(&conn, "order-1", merchant_order_id, "pending", 1);
+        let snapshot = recovery_snapshot_tx(&conn, "order-1").unwrap();
+        let mut input = RecoverTopupRequest {
+            expected_status: snapshot.status,
+            expected_updated_at: snapshot.updated_at,
+            gateway_order_id: Some("gateway-1".into()),
+            reason_code: "gateway_terminal_verified".into(),
+            manual_reference: None,
+            manual_confirmed: false,
+            dry_run: true,
+        };
+        let pending = unpaid_order(merchant_order_id, "pending");
+        let preview = apply_owner_verified_recovery_tx(
+            &conn,
+            "order-1",
+            &input,
+            &loaded(),
+            &pending,
+            "owner",
+            &now(),
+        )
+        .unwrap();
+        assert!(!preview.can_recover());
+        assert!(preview.blockers.contains(&"gateway_not_terminal"));
+        input.dry_run = false;
+        assert!(matches!(
+            apply_owner_verified_recovery_tx(
+                &conn,
+                "order-1",
+                &input,
+                &loaded(),
+                &pending,
+                "owner",
+                &now()
+            ),
+            Err(AppError::Conflict(_))
+        ));
+        let expired = unpaid_order(merchant_order_id, "expired");
+        assert!(
+            apply_owner_verified_recovery_tx(
+                &conn,
+                "order-1",
+                &input,
+                &loaded(),
+                &expired,
+                "owner",
+                &now()
+            )
+            .unwrap()
+            .can_recover()
+        );
+        assert_eq!(
+            read_topup(&conn, "order-1", "buyer").unwrap().status,
+            "expired"
+        );
+    }
+
+    #[test]
+    fn known_payment_and_identity_failures_are_not_legacy_manual_release_candidates() {
+        for detail_code in [
+            "gateway_terminal_payment_evidence",
+            "paid_receipt_invalid",
+            "gateway_identity_mismatch",
+            "created_order_conflict",
+        ] {
+            let conn = memory();
+            fixture_revision(&conn, 1);
+            let merchant_order_id = "router-00000000000000000000000000000001";
+            fixture_topup(&conn, "order-1", merchant_order_id, "review_required", 1);
+            open_reconciliation_case_detail_tx(
+                &conn,
+                "topup_verification_failed",
+                "topup",
+                "order-1",
+                Some(detail_code),
+                &now(),
+            )
+            .unwrap();
+            let snapshot = recovery_snapshot_tx(&conn, "order-1").unwrap();
+            let input = RecoverTopupRequest {
+                expected_status: snapshot.status,
+                expected_updated_at: snapshot.updated_at,
+                gateway_order_id: Some("gateway-1".into()),
+                reason_code: "gateway_terminal_verified".into(),
+                manual_reference: Some("merchant-case-1234".into()),
+                manual_confirmed: true,
+                dry_run: true,
+            };
+            let gateway = unpaid_order(merchant_order_id, "expired");
+            let preview = apply_owner_verified_recovery_tx(
+                &conn,
+                "order-1",
+                &input,
+                &loaded(),
+                &gateway,
+                "owner",
+                &now(),
+            )
+            .unwrap();
+            assert!(!preview.can_recover(), "{detail_code}");
+            assert!(!preview.requires_manual_reference, "{detail_code}");
+            assert_eq!(
+                read_topup(&conn, "order-1", "buyer").unwrap().status,
+                "review_required"
+            );
+        }
+    }
+
+    #[test]
+    fn owner_recovery_preview_rejects_gateway_identity_and_stale_order_version() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        let merchant_order_id = "router-00000000000000000000000000000001";
+        fixture_topup(&conn, "order-1", merchant_order_id, "pending", 1);
+        let snapshot = recovery_snapshot_tx(&conn, "order-1").unwrap();
+        let mut input = RecoverTopupRequest {
+            expected_status: snapshot.status,
+            expected_updated_at: snapshot.updated_at,
+            gateway_order_id: Some("gateway-1".into()),
+            reason_code: "gateway_terminal_verified".into(),
+            manual_reference: None,
+            manual_confirmed: false,
+            dry_run: true,
+        };
+        let mut gateway = unpaid_order(merchant_order_id, "expired");
+        gateway.fiat_amount_minor = 101;
+        let preview = apply_owner_verified_recovery_tx(
+            &conn,
+            "order-1",
+            &input,
+            &loaded(),
+            &gateway,
+            "owner",
+            &now(),
+        )
+        .unwrap();
+        assert!(!preview.can_recover());
+        assert!(preview.blockers.contains(&"gateway_identity_mismatch"));
+
+        gateway.fiat_amount_minor = 100;
+        assert!(
+            apply_owner_verified_recovery_tx(
+                &conn,
+                "order-1",
+                &input,
+                &loaded(),
+                &gateway,
+                "owner",
+                &now(),
+            )
+            .unwrap()
+            .can_recover()
+        );
+        conn.execute(
+            "UPDATE market_topup_orders SET updated_at = '2026-10-02' WHERE id = 'order-1'",
+            [],
+        )
+        .unwrap();
+        input.dry_run = false;
+        assert!(matches!(
+            apply_owner_verified_recovery_tx(
+                &conn,
+                "order-1",
+                &input,
+                &loaded(),
+                &gateway,
+                "owner",
+                &now(),
+            ),
+            Err(AppError::Conflict(_))
+        ));
+        assert_eq!(
+            read_topup(&conn, "order-1", "buyer").unwrap().status,
+            "pending"
+        );
+    }
+
+    #[test]
+    fn owner_recovery_never_ignores_local_payment_or_refund_evidence() {
+        for evidence in ["paid_event", "refund_event", "receipt", "journal"] {
+            let conn = memory();
+            fixture_revision(&conn, 1);
+            let merchant_order_id = "router-00000000000000000000000000000001";
+            fixture_topup(&conn, "order-1", merchant_order_id, "pending", 1);
+            match evidence {
+                "paid_event" | "refund_event" => {
+                    let mut signed = event(&paid_order(merchant_order_id, "chain-tx"));
+                    if evidence == "refund_event" {
+                        signed.event_type = "refund.recorded".into();
+                    }
+                    persist_signed_event_tx(
+                        &conn,
+                        "order-1",
+                        &loaded().merchant_fingerprint,
+                        &signed,
+                        &now(),
+                    )
+                    .unwrap();
+                    conn.execute(
+                        "UPDATE market_topup_events SET status = 'processed' WHERE order_id = 'order-1'",
+                        [],
+                    )
+                    .unwrap();
+                }
+                "receipt" => {
+                    conn.execute(
+                        "INSERT INTO market_topup_receipts
+                         (order_id, chain, token_id, tx_id, settled_amount, confirmations,
+                          receipt_fingerprint, observed_at)
+                         VALUES ('order-1', 'tron', 'tron-usdt', 'chain-tx', '1.00', 1,
+                                 'receipt', '2026-10-01')",
+                        [],
+                    )
+                    .unwrap();
+                }
+                "journal" => {
+                    credit_verified_topup_tx(&conn, "buyer", "order-1", 100, "receipt", &now())
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let snapshot = recovery_snapshot_tx(&conn, "order-1").unwrap();
+            let input = RecoverTopupRequest {
+                expected_status: snapshot.status,
+                expected_updated_at: snapshot.updated_at,
+                gateway_order_id: Some("gateway-1".into()),
+                reason_code: "gateway_terminal_verified".into(),
+                manual_reference: None,
+                manual_confirmed: false,
+                dry_run: true,
+            };
+            let gateway = unpaid_order(merchant_order_id, "expired");
+            let preview = apply_owner_verified_recovery_tx(
+                &conn,
+                "order-1",
+                &input,
+                &loaded(),
+                &gateway,
+                "owner",
+                &now(),
+            )
+            .unwrap();
+            assert!(!preview.can_recover(), "{evidence}");
+            assert!(preview.blockers.iter().any(|blocker| matches!(
+                *blocker,
+                "payment_or_unknown_event" | "local_receipt_present" | "local_journal_present"
+            )));
+        }
+    }
+
+    #[test]
+    fn admin_topup_pages_reach_every_order_after_the_first_fifty() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        for index in 0..55 {
+            fixture_topup(
+                &conn,
+                &format!("review-{index:03}"),
+                &format!("router-{index:032}"),
+                "review_required",
+                1,
+            );
+        }
+        fixture_topup(
+            &conn,
+            "fresh-pending",
+            "router-ffffffffffffffffffffffffffffffff",
+            "pending",
+            1,
+        );
+        conn.execute(
+            "UPDATE market_topup_orders SET updated_at = ?1 WHERE id = 'fresh-pending'",
+            params![now()],
+        )
+        .unwrap();
+        fixture_topup(
+            &conn,
+            "stale-pending",
+            "router-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "pending",
+            1,
+        );
+        let first = admin_topups_tx(&conn, None).unwrap();
+        assert_eq!(first.items.len(), 50);
+        assert!(first.next_cursor.is_some());
+        conn.execute(
+            "UPDATE market_topup_orders SET status = 'expired' WHERE id = ?1",
+            params![first.next_cursor.as_deref()],
+        )
+        .unwrap();
+        let second = admin_topups_tx(&conn, first.next_cursor.as_deref()).unwrap();
+        assert_eq!(second.items.len(), 6);
+        assert!(second.next_cursor.is_none());
+        assert_eq!(first.items[0].id, "review-000");
+        assert!(second.items.iter().any(|item| item.id == "stale-pending"));
+        assert!(
+            !first
+                .items
+                .iter()
+                .chain(&second.items)
+                .any(|item| item.id == "fresh-pending")
+        );
+        assert!(admin_topups_tx(&conn, Some("unknown-cursor")).is_err());
+    }
+
+    #[test]
+    fn finance_case_pages_do_not_hide_cases_after_the_first_fifty() {
+        let conn = memory();
+        for index in 0..56 {
+            open_reconciliation_case_tx(
+                &conn,
+                "test_case",
+                "test_object",
+                &format!("object-{index:03}"),
+                "2026-10-01",
+            )
+            .unwrap();
+        }
+        let first = finance_cases_tx(&conn, None).unwrap();
+        assert_eq!(first.items.len(), 50);
+        crate::market_reconcile::resolve_case_tx(
+            &conn,
+            first.next_cursor.as_deref().unwrap(),
+            "owner",
+            "case_checked",
+            &now(),
+        )
+        .unwrap();
+        let second = finance_cases_tx(&conn, first.next_cursor.as_deref()).unwrap();
+        assert_eq!(second.items.len(), 6);
+        assert!(second.next_cursor.is_none());
+        let ids = first
+            .items
+            .iter()
+            .chain(&second.items)
+            .map(|item| item.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(ids.len(), 56);
+        assert!(finance_cases_tx(&conn, Some("unknown-cursor")).is_err());
+    }
+
+    #[test]
+    fn later_payment_evidence_promotes_a_weaker_verification_case() {
+        let conn = memory();
+        open_reconciliation_case_detail_tx(
+            &conn,
+            "topup_verification_failed",
+            "topup",
+            "order-1",
+            Some("gateway_status_unknown"),
+            &now(),
+        )
+        .unwrap();
+        open_reconciliation_case_detail_tx(
+            &conn,
+            "topup_verification_failed",
+            "topup",
+            "order-1",
+            Some("gateway_terminal_payment_evidence"),
+            &now(),
+        )
+        .unwrap();
+        open_reconciliation_case_detail_tx(
+            &conn,
+            "topup_verification_failed",
+            "topup",
+            "order-1",
+            Some("gateway_status_unknown"),
+            &now(),
+        )
+        .unwrap();
+        let detail: String = conn.query_row(
+            "SELECT detail_code FROM market_finance_reconciliation_cases WHERE object_id = 'order-1'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(detail, "gateway_terminal_payment_evidence");
+        open_reconciliation_case_tx(
+            &conn,
+            "topup_verification_failed",
+            "topup",
+            "order-2",
+            &now(),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE market_finance_reconciliation_cases SET detail_code = ''
+             WHERE object_id = 'order-2'",
+            [],
+        )
+        .unwrap();
+        open_reconciliation_case_detail_tx(
+            &conn,
+            "topup_verification_failed",
+            "topup",
+            "order-2",
+            Some("gateway_terminal_payment_evidence"),
+            &now(),
+        )
+        .unwrap();
+        let promoted: String = conn
+            .query_row(
+                "SELECT detail_code FROM market_finance_reconciliation_cases
+                 WHERE object_id = 'order-2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(promoted, "gateway_terminal_payment_evidence");
+    }
+
+    #[test]
     fn owner_recovery_rejects_paid_mismatched_and_disputed_orders() {
         let conn = memory();
         fixture_revision(&conn, 1);
@@ -5436,6 +6548,8 @@ mod tests {
             expected_updated_at: snapshot.updated_at,
             gateway_order_id: Some("gateway-1".into()),
             reason_code: "merchant_terminal_checked".into(),
+            manual_reference: None,
+            manual_confirmed: false,
             dry_run: false,
         };
         let mut gateway = paid_order(merchant_order_id, "chain-tx");
@@ -5522,6 +6636,7 @@ mod tests {
                 &now()
             )
             .unwrap()
+            .can_recover()
         );
         assert_eq!(
             read_topup(&conn, "order-1", "buyer").unwrap().status,

@@ -232,6 +232,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         63,
         include_str!("../schema/0063_market_finance_emergency_pause.sql"),
     ),
+    (
+        64,
+        include_str!("../schema/0064_market_topup_recovery_evidence.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -759,7 +763,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count baseline tables");
-        assert_eq!(table_count, 196);
+        assert_eq!(table_count, 197);
         let removed_client_recovery_table_count = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -3715,6 +3719,62 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, ("enabled".into(), approved_at.into(), false, false));
+        check_compatibility(&conn).unwrap();
+    }
+
+    #[test]
+    fn migration_64_adds_recovery_evidence_without_changing_existing_topups() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 63);
+        conn.execute(
+            "INSERT INTO market_payment_channels
+             (id, gateway_kind, display_name, enabled, current_revision, created_at, updated_at)
+             VALUES ('channel', 'dujiaopay', 'Gateway', 1, 1, '2026-10-01', '2026-10-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO market_payment_channel_revisions
+             (channel_id, revision, merchant_id, merchant_fingerprint, api_key_id,
+              api_secret_ciphertext, api_secret_nonce, webhook_secret_ciphertext,
+              webhook_secret_nonce, key_version, verified_at, created_at)
+             VALUES ('channel', 1, 'merchant', 'fingerprint', 'key',
+                     'api-cipher', 'api-nonce', 'webhook-cipher', 'webhook-nonce',
+                     1, '2026-10-01', '2026-10-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO market_topup_orders
+             (id, user_id, channel_id, channel_revision, merchant_fingerprint,
+              merchant_order_id, idempotency_key, request_fingerprint, amount_minor,
+              status, created_at, updated_at)
+             VALUES ('order', 'buyer', 'channel', 1, 'fingerprint',
+                     'router-00000000000000000000000000000001', 'request-key',
+                     'channel:100', 100, 'review_required', '2026-10-01', '2026-10-02')",
+            [],
+        )
+        .unwrap();
+        apply(&conn).unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM market_topup_orders WHERE id = 'order'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "review_required");
+        conn.execute(
+            "INSERT INTO market_topup_recovery_decisions
+             (id, order_id, actor_user_id, gateway_order_id, gateway_status,
+              gateway_checked_at, evidence_sha256, review_case_codes_json,
+              manual_reference, manual_confirmed, reason_code, created_at)
+             VALUES ('decision', 'order', 'owner', 'gateway', 'expired',
+                     '2026-10-03', 'sha256', '[]', 'merchant-case-1234', 1,
+                     'historical_merchant_review', '2026-10-03')",
+            [],
+        )
+        .unwrap();
         check_compatibility(&conn).unwrap();
     }
 }
