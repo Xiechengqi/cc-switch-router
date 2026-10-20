@@ -9,24 +9,28 @@ import * as React from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { Button } from "@heroui/react";
-import { ArrowUpRight, CheckCircle2, Clock3, CreditCard, Loader2, RefreshCw, WalletCards } from "lucide-react";
+import { ArrowUpRight, Ban, CheckCircle2, Clock3, CreditCard, Loader2, RefreshCw, WalletCards } from "lucide-react";
+import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { MarketWalletRefundPanel } from "@/components/dashboard/market-wallet-refund-panel";
 import { ApiError } from "@/lib/api";
 import { DASHBOARD_ACCOUNT_BILLING_PATH } from "@/lib/dashboard-nav";
 import {
   createMarketWalletTopup,
+  cancelMarketWalletTopup,
   getMarketWallet,
   getMarketWalletChannels,
   getMarketWalletTopup,
+  getMarketWalletTopupGatewayStatus,
   getMarketWalletTopups,
   getMarketWalletTransactions,
   type MarketWalletChannel,
   type MarketWallet,
   type MarketWalletTopup,
+  type MarketTopupGatewayStatus,
   type MarketWalletTransaction,
 } from "@/lib/market-wallet-api";
-import { formatWalletUnits, formatWalletUnitsAsCny, parseUsdMinor, payableCheckoutUrl, safeMarketReturnPath } from "@/lib/market-wallet-money";
+import { formatWalletUnits, formatWalletUnitsAsCny, parseUsdMinor, payableCheckoutUrl, safeMarketReturnPath, topupDisplayStatus } from "@/lib/market-wallet-money";
 
 const FINAL_TOPUP_STATUS = new Set(["credited", "review_required", "expired", "cancelled"]);
 
@@ -76,6 +80,9 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
   const [wallet, setWallet] = React.useState(initialWallet);
   const [channels, setChannels] = React.useState<MarketWalletChannel[]>([]);
   const [topups, setTopups] = React.useState<MarketWalletTopup[]>([]);
+  const [gatewayStatuses, setGatewayStatuses] = React.useState<Record<string, MarketTopupGatewayStatus | null>>({});
+  const [statusBusyId, setStatusBusyId] = React.useState<string | null>(null);
+  const [cancelConfirmId, setCancelConfirmId] = React.useState<string | null>(null);
   const [transactions, setTransactions] = React.useState<MarketWalletTransaction[]>([]);
   const [topupCursor, setTopupCursor] = React.useState<string | null>(null);
   const [transactionCursor, setTransactionCursor] = React.useState<string | null>(null);
@@ -88,6 +95,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
   const [loaded, setLoaded] = React.useState(false);
   const idempotencyRef = React.useRef<{ fingerprint: string; key: string } | null>(null);
   const busyRef = React.useRef(false);
+  const statusRequestVersionRef = React.useRef<Record<string, number>>({});
 
   React.useEffect(() => {
     const requested = safeMarketReturnPath(searchParams.get("returnTo"));
@@ -106,6 +114,33 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
     }
   }, [returnedTopupId, searchParams]);
 
+  React.useEffect(() => {
+    const pendingIds = topups.filter((order) => order.status === "pending").map((order) => order.id);
+    if (!pendingIds.length) return;
+    let active = true;
+    const requests = pendingIds.map((id) => {
+      const version = (statusRequestVersionRef.current[id] ?? 0) + 1;
+      statusRequestVersionRef.current[id] = version;
+      return { id, version };
+    });
+    void Promise.all(requests.map(async ({ id, version }) => {
+      try {
+        return { id, version, status: await getMarketWalletTopupGatewayStatus(id) };
+      } catch {
+        return { id, version, status: null };
+      }
+    })).then((results) => {
+      if (!active) return;
+      setGatewayStatuses((current) => ({
+        ...current,
+        ...Object.fromEntries(results
+          .filter(({ id, version }) => statusRequestVersionRef.current[id] === version)
+          .map(({ id, status }) => [id, status])),
+      }));
+    });
+    return () => { active = false; };
+  }, [topups]);
+
   const reload = React.useCallback(async () => {
     const [nextWallet, nextChannels, nextTopups, nextTransactions] = await Promise.all([
       getMarketWallet(), getMarketWalletChannels(),
@@ -113,6 +148,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
     ]);
     setWallet(nextWallet);
     setChannels(nextChannels);
+    setGatewayStatuses({});
     setTopups(nextTopups.items);
     setTopupCursor(nextTopups.nextCursor);
     setTransactions(nextTransactions.items);
@@ -210,6 +246,54 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
           ? t("marketWallet.checkoutUnavailable")
           : errorText(cause));
       void reload().catch(() => {});
+    } finally {
+      busyRef.current = false;
+      setBusy("");
+    }
+  };
+
+  const refreshGatewayStatus = async (id: string) => {
+    if (statusBusyId) return;
+    const version = (statusRequestVersionRef.current[id] ?? 0) + 1;
+    statusRequestVersionRef.current[id] = version;
+    setStatusBusyId(id);
+    try {
+      const status = await getMarketWalletTopupGatewayStatus(id);
+      if (statusRequestVersionRef.current[id] === version) {
+        setGatewayStatuses((current) => ({ ...current, [id]: status }));
+      }
+      setError("");
+    } catch {
+      if (statusRequestVersionRef.current[id] === version) {
+        setGatewayStatuses((current) => ({ ...current, [id]: null }));
+      }
+      setError(t("marketWallet.gatewayStatusUnavailable"));
+    } finally {
+      setStatusBusyId(null);
+    }
+  };
+
+  const cancelSelectedTopup = async () => {
+    const id = cancelConfirmId;
+    if (!id || busyRef.current) return;
+    busyRef.current = true;
+    setBusy("cancelTopup");
+    setError("");
+    try {
+      const updated = await cancelMarketWalletTopup(id);
+      setTopups((current) => current.map((order) => order.id === id ? updated : order));
+      setCancelConfirmId(null);
+      try {
+        await reload();
+      } catch {
+        setError(t("marketWallet.cancelRefreshFailed"));
+      }
+    } catch (cause) {
+      setCancelConfirmId(null);
+      setError(cause instanceof ApiError && cause.status === 409
+        ? t("marketWallet.cancelChanged")
+        : errorText(cause));
+      await reload().catch(() => {});
     } finally {
       busyRef.current = false;
       setBusy("");
@@ -320,21 +404,39 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
         <section className="min-w-0 rounded-xl border border-border bg-card p-5" aria-label={t("marketWallet.topups")}>
           <h2 className="text-base font-semibold">{t("marketWallet.topups")}</h2>
           <ul className="mt-3 grid gap-2">
-            {topups.map((order) => (
-              <li key={order.id} className="flex min-w-0 flex-wrap items-center justify-between gap-2 rounded-md bg-muted/50 px-3 py-2 text-sm">
+            {topups.map((order) => {
+              const gateway = gatewayStatuses[order.id];
+              const shownStatus = order.status === "pending" && gateway === undefined
+                ? "gateway_checking"
+                : order.status === "pending" && gateway === null
+                  ? "gateway_unavailable"
+                  : topupDisplayStatus(order.status, gateway?.gatewayStatus);
+              const deadline = gateway?.gatewayStatus === "awaiting_payment"
+                ? gateway.selectionDeadline
+                : gateway?.expiresAt;
+              const checkoutUrl = payableCheckoutUrl(order.status, order.checkoutUrl, gateway?.gatewayStatus ?? null);
+              return <li key={order.id} className="flex min-w-0 flex-wrap items-center justify-between gap-2 rounded-md bg-muted/50 px-3 py-2 text-sm">
                 <div className="min-w-0">
                   <p className="font-medium tabular-nums">${(order.amountMinor / 100).toFixed(2)}</p>
                   <p className="text-xs text-muted-foreground">{dateText(order.createdAt, locale)}</p>
+                  {deadline && order.status === "pending" ? <p className="text-xs text-muted-foreground">{t("marketWallet.gatewayDeadline", { time: dateText(deadline, locale) })}</p> : null}
+                  {gateway?.gatewayStatus === "awaiting_payment" && order.status === "pending" ? <p className="text-xs text-muted-foreground">{t("marketWallet.awaitingMethodHelp")}</p> : null}
                   {order.status === "review_required" ? <p className="mt-1 text-xs text-amber-700">{t("marketWallet.reviewHelp")}</p> : null}
                 </div>
-                <span className="text-xs text-muted-foreground">{t(`marketWallet.status.${order.status}` as Parameters<typeof t>[0])}</span>
-                {payableCheckoutUrl(order.status, order.checkoutUrl) ? (
-                  <a className="inline-flex min-h-11 items-center gap-1 whitespace-nowrap text-xs font-medium text-primary underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring" href={payableCheckoutUrl(order.status, order.checkoutUrl)!}>
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-xs text-muted-foreground">{t(`marketWallet.status.${shownStatus}` as Parameters<typeof t>[0])}</span>
+                  {order.status === "pending" ? <Button size="sm" variant="ghost" isIconOnly aria-label={t("marketWallet.refreshGatewayStatus")} isDisabled={statusBusyId === order.id || !!busy} onPress={() => void refreshGatewayStatus(order.id)}>
+                    <RefreshCw className={`size-4 ${statusBusyId === order.id ? "animate-spin" : ""}`} aria-hidden="true" />
+                  </Button> : null}
+                  {gateway?.canCancel && order.status === "pending" ? <Button size="sm" variant="outline" isDisabled={!!busy || statusBusyId === order.id} onPress={() => setCancelConfirmId(order.id)}>
+                    <Ban className="size-4" aria-hidden="true" />{t("marketWallet.cancelPayment")}
+                  </Button> : null}
+                  {checkoutUrl ? <a className="inline-flex min-h-11 items-center gap-1 whitespace-nowrap text-xs font-medium text-primary underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring" href={checkoutUrl}>
                     {t("marketWallet.continuePay")}<ArrowUpRight className="size-3" aria-hidden="true" />
-                  </a>
-                ) : null}
-              </li>
-            ))}
+                  </a> : null}
+                </div>
+              </li>;
+            })}
             {loaded && !topups.length ? <li className="text-sm text-muted-foreground">{t("marketWallet.noTopups")}</li> : null}
           </ul>
           {topupCursor ? <Button size="sm" variant="ghost" isDisabled={!!busy} onPress={() => void loadMore("topups")}>{t("marketWallet.more")}</Button> : null}
@@ -357,6 +459,17 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
         </section>
       </div> : null}
       {wallet.hasWalletActivity ? <MarketWalletRefundPanel availableUnits={wallet.availableUnits} onSubmitted={reload} /> : null}
+      <ConfirmAlertDialog
+        open={!!cancelConfirmId}
+        title={t("marketWallet.cancelPaymentTitle")}
+        description={t("marketWallet.cancelPaymentNote")}
+        confirmLabel={t("marketWallet.cancelPayment")}
+        cancelLabel={t("common.cancel")}
+        tone="warning"
+        busy={busy === "cancelTopup"}
+        onConfirm={() => void cancelSelectedTopup()}
+        onOpenChange={(open) => { if (busy !== "cancelTopup" && !open) setCancelConfirmId(null); }}
+      />
     </main>
   );
 }

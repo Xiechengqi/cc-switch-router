@@ -9,6 +9,7 @@ import {
   payableCheckoutUrl,
   safeCheckoutUrl,
   safeMarketReturnPath,
+  topupDisplayStatus,
   walletTopupHref,
 } from "./market-wallet-money";
 
@@ -59,6 +60,20 @@ test("only a pending order exposes its checkout link", () => {
   for (const status of ["creating", "create_unknown", "verifying", "credited", "expired", "cancelled", "review_required"]) {
     assert.equal(payableCheckoutUrl(status, url), null, status);
   }
+  for (const gatewayStatus of ["confirming", "paid", "expired", "canceled", "cancelled", "unknown_gateway_state"]) {
+    assert.equal(payableCheckoutUrl("pending", url, gatewayStatus), null, gatewayStatus);
+  }
+  assert.equal(payableCheckoutUrl("pending", url, "awaiting_payment"), url);
+  assert.equal(payableCheckoutUrl("pending", url, "pending"), url);
+  assert.equal(payableCheckoutUrl("pending", url, null), null);
+});
+
+test("gateway payment states do not collapse to a cancelable local pending label", () => {
+  assert.equal(topupDisplayStatus("pending", "awaiting_payment"), "awaiting_payment");
+  assert.equal(topupDisplayStatus("pending", "pending"), "gateway_pending");
+  assert.equal(topupDisplayStatus("pending", "confirming"), "gateway_confirming");
+  assert.equal(topupDisplayStatus("pending", "canceled"), "gateway_canceled");
+  assert.equal(topupDisplayStatus("review_required", "pending"), "review_required");
 });
 
 test("wallet recharge links preserve only local Market context", () => {

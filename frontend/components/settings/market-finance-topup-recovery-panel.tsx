@@ -3,17 +3,26 @@
 import * as React from "react";
 import { Alert, Button, Modal } from "@heroui/react";
 import { Loader2, RefreshCw } from "lucide-react";
+import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ApiError } from "@/lib/api";
 import {
   getMarketFinanceTopups,
+  cancelMarketFinanceTopup,
   recoverMarketFinanceTopup,
   type MarketFinanceTopup,
   type MarketFinanceTopupRecovery,
 } from "@/lib/market-wallet-api";
 
+function dateText(value: string, locale: string) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime())
+    ? value
+    : new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(date);
+}
+
 export function MarketFinanceTopupRecoveryPanel({ onRecovered }: { onRecovered: () => Promise<unknown> }) {
-  const { t } = useLocaleText();
+  const { locale, t } = useLocaleText();
   const [topups, setTopups] = React.useState<MarketFinanceTopup[]>([]);
   const [nextCursor, setNextCursor] = React.useState<string | null>(null);
   const [loadingMore, setLoadingMore] = React.useState(false);
@@ -23,13 +32,16 @@ export function MarketFinanceTopupRecoveryPanel({ onRecovered }: { onRecovered: 
   const [manualReference, setManualReference] = React.useState("");
   const [manualChecked, setManualChecked] = React.useState(false);
   const [confirmOpen, setConfirmOpen] = React.useState(false);
+  const [cancelConfirmOpen, setCancelConfirmOpen] = React.useState(false);
   const [preview, setPreview] = React.useState<MarketFinanceTopupRecovery | null>(null);
   const [loading, setLoading] = React.useState(true);
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
+  const [notice, setNotice] = React.useState("");
   const selected = topups.find((item) => item.id === selectedId) ?? null;
   const manualReferenceValid = /^[A-Za-z0-9_.:/-]{8,128}$/.test(manualReference.trim());
   const canSubmit = !!preview?.canRecover && (!preview.requiresManualReference || (manualReferenceValid && manualChecked));
+  const previewDeadline = preview?.gatewayStatus === "awaiting_payment" ? preview.selectionDeadline : preview?.expiresAt;
   const statusLabel = (status: string) => t(`marketWallet.status.${status}` as Parameters<typeof t>[0]);
   const blockerLabel = (code: string) => {
     const known = new Set([
@@ -100,6 +112,7 @@ export function MarketFinanceTopupRecoveryPanel({ onRecovered }: { onRecovered: 
     setManualChecked(false);
     setPreview(null);
     setError("");
+    setNotice("");
   };
 
   const run = async (dryRun: boolean) => {
@@ -142,6 +155,37 @@ export function MarketFinanceTopupRecoveryPanel({ onRecovered }: { onRecovered: 
     }
   };
 
+  const cancelSelected = async () => {
+    if (!selected || !preview?.canCancel || busy) return;
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      const result = await cancelMarketFinanceTopup(selected.id);
+      setCancelConfirmOpen(false);
+      setPreview(null);
+      setNotice(t(result.status === "review_required"
+        ? "settings.marketFinance.topupRecovery.cancelReviewHeld"
+        : result.status === "expired"
+          ? "settings.marketFinance.topupRecovery.expiredDone"
+          : "settings.marketFinance.topupRecovery.cancelDone"));
+      try {
+        await Promise.all([reload(), onRecovered()]);
+      } catch {
+        setError(t("settings.marketFinance.topupRecovery.closedRefreshFailed"));
+      }
+    } catch (cause) {
+      setCancelConfirmOpen(false);
+      setPreview(null);
+      setError(cause instanceof ApiError && cause.status === 409
+        ? t("settings.marketFinance.topupRecovery.conflict")
+        : cause instanceof Error ? cause.message : String(cause));
+      await reload().catch(() => {});
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <section className="grid min-w-0 gap-3" aria-label={t("settings.marketFinance.topupRecovery.title")}>
       <div className="flex items-center justify-between gap-3">
@@ -155,6 +199,7 @@ export function MarketFinanceTopupRecoveryPanel({ onRecovered }: { onRecovered: 
       </div>
       {loading ? <p className="flex items-center gap-2 text-sm text-muted-foreground"><Loader2 className="size-4 animate-spin" />{t("common.loading")}</p> : null}
       {error ? <Alert status="danger" role="alert">{error}</Alert> : null}
+      {notice ? <Alert status="success" role="status">{notice}</Alert> : null}
       {!loading && !topups.length ? <p className="text-sm text-muted-foreground">{t("settings.marketFinance.topupRecovery.empty")}</p> : null}
       {topups.length ? <ul className="grid gap-2">
         {topups.map((item) => <li key={item.id} className="flex min-w-0 flex-wrap items-center justify-between gap-2 rounded-md border border-border px-3 py-2 text-sm">
@@ -193,6 +238,8 @@ export function MarketFinanceTopupRecoveryPanel({ onRecovered }: { onRecovered: 
           <Alert status={preview.canRecover ? "success" : "warning"}>
             {t(preview.canRecover ? "settings.marketFinance.topupRecovery.ready" : "settings.marketFinance.topupRecovery.blocked", { status: preview.gatewayStatus })}
           </Alert>
+          {preview.gatewayStatus === "awaiting_payment" ? <p className="text-xs text-muted-foreground">{t("settings.marketFinance.topupRecovery.awaitingMethod")}</p> : null}
+          {previewDeadline ? <p className="text-xs text-muted-foreground">{t("settings.marketFinance.topupRecovery.gatewayDeadline", { time: dateText(previewDeadline, locale) })}</p> : null}
           {preview.blockers.length ? <ul className="list-disc pl-5 text-xs text-muted-foreground">
             {preview.blockers.map((code) => <li key={code}>{blockerLabel(code)}</li>)}
           </ul> : null}
@@ -224,6 +271,9 @@ export function MarketFinanceTopupRecoveryPanel({ onRecovered }: { onRecovered: 
           <Button size="sm" isDisabled={busy || !canSubmit} onPress={() => setConfirmOpen(true)}>
             {t("settings.marketFinance.topupRecovery.recover")}
           </Button>
+          {preview?.canCancel ? <Button size="sm" variant="outline" isDisabled={busy} onPress={() => setCancelConfirmOpen(true)}>
+            {t("settings.marketFinance.topupRecovery.cancelGateway")}
+          </Button> : null}
         </div>
       </div> : null}
       <Modal.Backdrop isOpen={confirmOpen} onOpenChange={(open) => { if (!busy) setConfirmOpen(open); }}>
@@ -244,6 +294,17 @@ export function MarketFinanceTopupRecoveryPanel({ onRecovered }: { onRecovered: 
           </Modal.Dialog>
         </Modal.Container>
       </Modal.Backdrop>
+      <ConfirmAlertDialog
+        open={cancelConfirmOpen}
+        title={t("settings.marketFinance.topupRecovery.cancelTitle")}
+        description={t("settings.marketFinance.topupRecovery.cancelNote")}
+        confirmLabel={t("settings.marketFinance.topupRecovery.cancelGateway")}
+        cancelLabel={t("common.cancel")}
+        tone="warning"
+        busy={busy}
+        onConfirm={() => void cancelSelected()}
+        onOpenChange={(open) => { if (!busy) setCancelConfirmOpen(open); }}
+      />
     </section>
   );
 }

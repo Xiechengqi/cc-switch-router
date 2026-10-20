@@ -62,8 +62,22 @@ export function safeCheckoutUrl(raw: string | null) {
   }
 }
 
-export function payableCheckoutUrl(status: string, raw: string | null) {
-  return status === "pending" ? safeCheckoutUrl(raw) : null;
+// Omitted status is only for a freshly created order; null means a history
+// lookup could not confirm that the checkout is still payable.
+export function payableCheckoutUrl(status: string, raw: string | null, gatewayStatus?: string | null) {
+  if (status !== "pending" || (gatewayStatus !== undefined && !["awaiting_payment", "pending"].includes(gatewayStatus ?? ""))) return null;
+  return safeCheckoutUrl(raw);
+}
+
+export function topupDisplayStatus(status: string, gatewayStatus?: string | null) {
+  if (status !== "pending" || !gatewayStatus) return status;
+  if (gatewayStatus === "awaiting_payment") return "awaiting_payment";
+  if (gatewayStatus === "pending") return "gateway_pending";
+  if (gatewayStatus === "confirming") return "gateway_confirming";
+  if (gatewayStatus === "paid") return "gateway_paid";
+  if (["canceled", "cancelled"].includes(gatewayStatus)) return "gateway_canceled";
+  if (gatewayStatus === "expired") return "gateway_expired";
+  return "gateway_unknown";
 }
 
 export function safeMarketReturnPath(raw: string | null): string | null {

@@ -38,6 +38,8 @@ pub(super) struct GatewayOrder {
     pub confirmations: Option<i64>,
     pub paid_at: Option<String>,
     pub checkout_url: Option<String>,
+    pub expires_at: Option<String>,
+    pub selection_deadline: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +109,7 @@ impl Client {
             timestamp,
             &nonce,
         );
+        let empty_cancel_response = method == Method::POST && path.ends_with("/cancel");
         let url = format!("{}{path}", self.base_url);
         let mut request = self
             .http
@@ -154,6 +157,9 @@ impl Client {
             return Err(AppError::ServiceUnavailable(
                 "DujiaoPay response too large".into(),
             ));
+        }
+        if bytes.is_empty() && empty_cancel_response {
+            return Ok(Value::Null);
         }
         serde_json::from_slice::<Value>(&bytes)
             .map_err(|_| AppError::ServiceUnavailable("DujiaoPay response invalid".into()))
@@ -225,11 +231,7 @@ impl Client {
         credentials: &Credentials,
         order_id: &str,
     ) -> Result<GatewayOrder, AppError> {
-        if order_id.is_empty()
-            || !order_id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-        {
+        if !valid_order_id(order_id) {
             return Err(AppError::BadRequest("invalid DujiaoPay order ID".into()));
         }
         let path = format!("/v1/orders/{order_id}");
@@ -238,6 +240,27 @@ impl Client {
             .await?;
         parse_gateway_order(payload(&value))
     }
+
+    pub async fn cancel_order(
+        &self,
+        credentials: &Credentials,
+        order_id: &str,
+    ) -> Result<(), AppError> {
+        if !valid_order_id(order_id) {
+            return Err(AppError::BadRequest("invalid DujiaoPay order ID".into()));
+        }
+        let path = format!("/v1/orders/{order_id}/cancel");
+        self.request(credentials, Method::POST, &path, None, None)
+            .await?;
+        Ok(())
+    }
+}
+
+fn valid_order_id(order_id: &str) -> bool {
+    !order_id.is_empty()
+        && order_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 pub(super) fn may_be_key_scoped_order(error: &AppError) -> bool {
@@ -312,6 +335,8 @@ fn parse_gateway_order(value: &Value) -> Result<GatewayOrder, AppError> {
         confirmations: optional_confirmations(value)?,
         paid_at: optional_payment_string(value, "paid_at")?,
         checkout_url: safe_checkout_url(optional_string(value, "checkout_url")),
+        expires_at: optional_string(value, "expires_at"),
+        selection_deadline: optional_string(value, "selection_deadline"),
     })
 }
 
@@ -481,6 +506,7 @@ fn validate_checkout_url(raw: &str) -> Result<String, AppError> {
 mod tests {
     use super::*;
     use axum::body::Bytes;
+    use axum::http::StatusCode;
     use axum::routing::{get, post};
     use axum::{Json, Router};
     use hmac::Mac;
@@ -541,12 +567,39 @@ mod tests {
         } }))
     }
 
+    async fn mock_cancel(headers: HeaderMap, body: Bytes) -> StatusCode {
+        assert_signed_request(&headers, "POST", "/v1/orders/gateway_1/cancel", &body);
+        assert!(body.is_empty());
+        assert!(headers.get("Idempotency-Key").is_none());
+        StatusCode::NO_CONTENT
+    }
+
+    async fn mock_cancel_conflict(headers: HeaderMap, body: Bytes) -> StatusCode {
+        assert_signed_request(&headers, "POST", "/v1/orders/gateway_1/cancel", &body);
+        assert!(body.is_empty());
+        StatusCode::CONFLICT
+    }
+
+    async fn mock_terminal_get(headers: HeaderMap) -> Json<Value> {
+        assert_signed_request(&headers, "GET", "/v1/orders/gateway_1", &[]);
+        Json(json!({ "data": {
+            "order_id": "gateway_1",
+            "merchant_order_id": "router-00000000000000000000000000000001",
+            "status": "canceled",
+            "fiat_currency": "USD",
+            "fiat_amount": "1.23",
+            "selection_deadline": "2026-10-01T00:30:00Z",
+            "expires_at": "2026-10-01T01:00:00Z"
+        } }))
+    }
+
     #[tokio::test]
     async fn mock_gateway_roundtrip_checks_signed_creation_and_verified_shape() {
         let app = Router::new()
             .route("/v1/whoami", get(mock_whoami))
             .route("/v1/orders", post(mock_create))
-            .route("/v1/orders/gateway_1", get(mock_get));
+            .route("/v1/orders/gateway_1", get(mock_get))
+            .route("/v1/orders/gateway_1/cancel", post(mock_cancel));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -576,6 +629,37 @@ mod tests {
         assert_eq!(order.fiat_amount_minor, 123);
         assert_eq!(order.paid_source.as_deref(), Some("chain"));
         assert_eq!(order.confirmations, Some(12));
+        client
+            .cancel_order(&credentials, &created.order_id)
+            .await
+            .unwrap();
+        assert!(client.cancel_order(&credentials, "../other").await.is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn rejected_cancel_is_not_terminal_evidence_and_get_remains_available() {
+        let app = Router::new()
+            .route("/v1/orders/gateway_1", get(mock_terminal_get))
+            .route("/v1/orders/gateway_1/cancel", post(mock_cancel_conflict));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = Client::with_base_url(&origin);
+        let credentials = credentials();
+        assert!(
+            client
+                .cancel_order(&credentials, "gateway_1")
+                .await
+                .is_err()
+        );
+        let checked = client.get_order(&credentials, "gateway_1").await.unwrap();
+        assert_eq!(checked.status, "canceled");
+        assert_eq!(
+            checked.selection_deadline.as_deref(),
+            Some("2026-10-01T00:30:00Z")
+        );
+        assert_eq!(checked.expires_at.as_deref(), Some("2026-10-01T01:00:00Z"));
         server.abort();
     }
 

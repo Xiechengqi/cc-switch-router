@@ -46,6 +46,13 @@ export type MarketWalletTopup = {
   createdAt: string;
 };
 
+export type MarketTopupGatewayStatus = {
+  gatewayStatus: string;
+  canCancel: boolean;
+  selectionDeadline: string | null;
+  expiresAt: string | null;
+};
+
 export type MarketPaymentChannel = {
   id: string;
   displayName: string;
@@ -191,7 +198,10 @@ export type MarketFinanceTopup = {
 export type MarketFinanceTopupRecovery = {
   orderId: string;
   gatewayStatus: string;
+  selectionDeadline: string | null;
+  expiresAt: string | null;
   canRecover: boolean;
+  canCancel: boolean;
   recovered: boolean;
   requiresManualReference: boolean;
   blockers: string[];
@@ -344,6 +354,18 @@ export async function getMarketWalletTopup(id: string) {
   );
 }
 
+export async function getMarketWalletTopupGatewayStatus(id: string) {
+  return parseJson<MarketTopupGatewayStatus>(
+    await authFetch(`/v1/market-wallet/topups/${encodeURIComponent(id)}/gateway-status`, { cache: "no-store" }),
+  );
+}
+
+export async function cancelMarketWalletTopup(id: string) {
+  return parseJson<MarketWalletTopup>(
+    await authFetch(`/v1/market-wallet/topups/${encodeURIComponent(id)}/cancel`, { method: "POST" }),
+  );
+}
+
 export async function createMarketWalletTopup(channelId: string, amountMinor: number, idempotencyKey: string) {
   return parseJson<MarketWalletTopup>(
     await authFetch("/v1/market-wallet/topups", {
@@ -398,6 +420,12 @@ export async function recoverMarketFinanceTopup(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(input),
     }),
+  );
+}
+
+export async function cancelMarketFinanceTopup(id: string) {
+  return parseJson<MarketWalletTopup>(
+    await authFetch(`/v1/admin/market-finance/topups/${encodeURIComponent(id)}/cancel`, { method: "POST" }),
   );
 }
 
