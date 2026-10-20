@@ -285,6 +285,7 @@ export function MarketPaymentChannelsPanel() {
             <p>{t("settings.marketFinance.blockers", { count: readiness.legacyBlockers.length })}</p>
             <p>{t("settings.marketFinance.channelBlockers", { count: readiness.paymentChannelBlockers.length })}</p>
             <p>{t("settings.marketFinance.criticalCases", { count: readiness.criticalCases })}</p>
+            {readiness.staleTopupReviews > 0 ? <p className="font-medium text-amber-800">{t("settings.marketFinance.staleTopupReviews", { count: readiness.staleTopupReviews })}</p> : null}
           </div>
           {readiness.mode === "enabled" ? (
             <div className="grid gap-3 rounded-md border border-border p-3 sm:grid-cols-2">

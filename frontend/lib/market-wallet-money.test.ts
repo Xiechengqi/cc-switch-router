@@ -9,8 +9,11 @@ import {
   payableCheckoutUrl,
   safeCheckoutUrl,
   safeMarketReturnPath,
+  shouldResetTopupIdempotency,
   topupDisplayStatus,
   topupCancelAction,
+  verifiedPayableCheckoutUrl,
+  walletTopupCheckoutHref,
   topupAutoCheckCountdown,
   formatTopupCountdown,
   walletTopupHref,
@@ -71,6 +74,33 @@ test("only a pending order exposes its checkout link", () => {
   assert.equal(payableCheckoutUrl("pending", url, null), null);
   assert.equal(payableCheckoutUrl("pending", url, "awaiting_payment", true), null);
   assert.equal(payableCheckoutUrl("pending", url, "pending", true), null);
+});
+
+test("checkout requires a fresh authenticated payable capability", () => {
+  const checkout = "https://www.dujiaopay.com/checkout/ct_valid";
+  const now = Date.parse("2026-10-20T00:00:00Z");
+  const gateway = { gatewayStatus: "pending", canPay: true, selectionDeadline: null, expiresAt: "2026-10-20T00:01:00Z" };
+  assert.equal(verifiedPayableCheckoutUrl("pending", checkout, gateway, false, now), checkout);
+  assert.equal(verifiedPayableCheckoutUrl("pending", checkout, { ...gateway, canPay: false }, false, now), null);
+  assert.equal(verifiedPayableCheckoutUrl("pending", checkout, null, false, now), null);
+  assert.equal(verifiedPayableCheckoutUrl("pending", checkout, gateway, false, now + 60_000), null);
+  assert.equal(verifiedPayableCheckoutUrl("review_required", checkout, gateway, false, now), null);
+  assert.equal(verifiedPayableCheckoutUrl("pending", checkout, gateway, true, now), null);
+});
+
+test("checkout navigation stays local and encodes the order ID", () => {
+  assert.equal(walletTopupCheckoutHref("order/one?two"), "/wallet-checkout/?topup=order%2Fone%3Ftwo");
+});
+
+test("a closed or nonpayable attempt uses a new browser idempotency key", () => {
+  const order = { status: "pending", checkoutUrl: "https://www.dujiaopay.com/checkout/ct_old", buyerAbandonedAt: null };
+  assert.equal(shouldResetTopupIdempotency(order), false);
+  assert.equal(shouldResetTopupIdempotency({ ...order, status: "creating", checkoutUrl: null }), false);
+  assert.equal(shouldResetTopupIdempotency({ ...order, checkoutUrl: null }), true);
+  assert.equal(shouldResetTopupIdempotency({ ...order, buyerAbandonedAt: "2026-10-20T00:00:00Z" }), true);
+  for (const status of ["verifying", "review_required", "credited", "expired", "cancelled"]) {
+    assert.equal(shouldResetTopupIdempotency({ ...order, status }), true, status);
+  }
 });
 
 test("gateway payment states do not collapse to a cancelable local pending label", () => {

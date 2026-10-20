@@ -8,10 +8,12 @@ import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ApiError } from "@/lib/api";
 import {
   getMarketFinanceTopups,
+  getMarketFinanceTopupObservations,
   cancelMarketFinanceTopup,
   recoverMarketFinanceTopup,
   type MarketFinanceTopup,
   type MarketFinanceTopupRecovery,
+  type MarketTopupGatewayObservation,
 } from "@/lib/market-wallet-api";
 
 function dateText(value: string, locale: string) {
@@ -34,6 +36,10 @@ export function MarketFinanceTopupRecoveryPanel({ onRecovered }: { onRecovered: 
   const [confirmOpen, setConfirmOpen] = React.useState(false);
   const [cancelConfirmOpen, setCancelConfirmOpen] = React.useState(false);
   const [preview, setPreview] = React.useState<MarketFinanceTopupRecovery | null>(null);
+  const [observations, setObservations] = React.useState<MarketTopupGatewayObservation[]>([]);
+  const [observationCursor, setObservationCursor] = React.useState<string | null>(null);
+  const [observationsLoading, setObservationsLoading] = React.useState(false);
+  const observationVersion = React.useRef(0);
   const [loading, setLoading] = React.useState(true);
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
@@ -113,6 +119,27 @@ export function MarketFinanceTopupRecoveryPanel({ onRecovered }: { onRecovered: 
     setPreview(null);
     setError("");
     setNotice("");
+    void loadObservations(item.id);
+  };
+
+  const loadObservations = async (id: string, cursor?: string) => {
+    const version = ++observationVersion.current;
+    if (!cursor) {
+      setObservations([]);
+      setObservationCursor(null);
+    }
+    setObservationsLoading(true);
+    try {
+      const page = await getMarketFinanceTopupObservations(id, cursor);
+      if (version === observationVersion.current) {
+        setObservations((current) => cursor ? [...current, ...page.items] : page.items);
+        setObservationCursor(page.nextCursor);
+      }
+    } catch (cause) {
+      if (version === observationVersion.current) setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      if (version === observationVersion.current) setObservationsLoading(false);
+    }
   };
 
   const run = async (dryRun: boolean) => {
@@ -133,6 +160,7 @@ export function MarketFinanceTopupRecoveryPanel({ onRecovered }: { onRecovered: 
       });
       if (dryRun) {
         setPreview(result);
+        void loadObservations(selected.id);
       } else {
         setConfirmOpen(false);
         setPreview(null);
@@ -219,7 +247,7 @@ export function MarketFinanceTopupRecoveryPanel({ onRecovered }: { onRecovered: 
       {selected ? <div className="grid gap-3 rounded-md bg-muted/50 p-3">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <p className="text-sm font-semibold">${(selected.amountMinor / 100).toFixed(2)} · {statusLabel(selected.status)}{selected.buyerAbandonedAt ? ` · ${t("settings.marketFinance.topupRecovery.buyerAbandoned")}` : ""}</p>
-          <Button size="sm" variant="ghost" isDisabled={busy} onPress={() => { setSelectedId(null); setPreview(null); }}>
+          <Button size="sm" variant="ghost" isDisabled={busy} onPress={() => { observationVersion.current += 1; setSelectedId(null); setPreview(null); setObservationCursor(null); }}>
             {t("settings.marketFinance.topupRecovery.close")}
           </Button>
         </div>
@@ -228,6 +256,23 @@ export function MarketFinanceTopupRecoveryPanel({ onRecovered }: { onRecovered: 
           <p className="mt-2 break-all font-mono">Router: {selected.id}</p>
           <p className="break-all font-mono">Merchant: {selected.merchantOrderId}</p>
         </details>
+        <div className="grid gap-1 text-xs text-muted-foreground">
+          <p className="font-medium text-foreground">{t("settings.marketFinance.topupRecovery.observations")}</p>
+          {observations.length ? observations.map((observation) => (
+            <p key={observation.id} className="break-words">
+              {observation.observationCount > 1
+                ? t("settings.marketFinance.topupRecovery.observedRange", { first: dateText(observation.firstObservedAt, locale), last: dateText(observation.lastObservedAt, locale) })
+                : dateText(observation.firstObservedAt, locale)} · {t(`settings.marketFinance.topupRecovery.source.${observation.source}` as Parameters<typeof t>[0])} · {observation.gatewayStatus} · {observation.evidenceFlags.length
+                ? observation.evidenceFlags.map(blockerLabel).join(" · ")
+                : t("settings.marketFinance.topupRecovery.noPaymentMarkers")}
+              {observation.observationCount > 1 ? ` · ×${observation.observationCount}` : ""}
+            </p>
+          )) : !observationsLoading ? <p>{t("settings.marketFinance.topupRecovery.noObservations")}</p> : null}
+          {observationsLoading ? <p>{t("common.loading")}</p> : null}
+          {observationCursor ? <Button size="sm" variant="ghost" isDisabled={observationsLoading || busy} onPress={() => void loadObservations(selected.id, observationCursor)}>
+            {t("settings.marketFinance.topupRecovery.moreObservations")}
+          </Button> : null}
+        </div>
         <label className="grid gap-1 text-xs font-medium">
           {t("settings.marketFinance.topupRecovery.gatewayId")}
           <input className="h-11 min-w-0 rounded-md border border-border bg-background px-3 font-mono text-sm"

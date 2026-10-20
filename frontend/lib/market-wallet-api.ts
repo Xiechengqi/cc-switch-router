@@ -9,6 +9,7 @@ export type MarketFinanceReadiness = {
   codeIntegrated: boolean;
   legacyBlockers: { code: string; count: number }[];
   criticalCases: number;
+  staleTopupReviews: number;
   verifiedLiveTopups: number;
   paymentChannelBlockers: { code: string; count: number }[];
   canEnable: boolean;
@@ -46,11 +47,17 @@ export type MarketWalletTopup = {
   createdAt: string;
   autoCloseAt: string | null;
   buyerAbandonedAt: string | null;
-  reviewReason: "possible_payment" | null;
+  reviewReason: "terminal_payment_marker" | "paid_receipt_invalid" | null;
+  buyerRecheckRequestedAt: string | null;
+  buyerRecheckCompletedAt: string | null;
+  buyerRecheckResult: "queued" | "retrying" | "pending" | "verifying" | "review_required" | "credited" | "expired" | "cancelled" | null;
+  lastGatewayStatus: string | null;
+  lastGatewayCheckedAt: string | null;
 };
 
 export type MarketTopupGatewayStatus = {
   gatewayStatus: string;
+  canPay: boolean;
   canCancel: boolean;
   canAbandon: boolean;
   selectionDeadline: string | null;
@@ -214,6 +221,17 @@ export type MarketFinanceTopupRecovery = {
   reviewCaseCodes: string[];
 };
 
+export type MarketTopupGatewayObservation = {
+  id: string;
+  source: "webhook" | "reconcile" | "owner_review";
+  gatewayStatus: string;
+  evidenceFlags: string[];
+  evidenceSha256: string;
+  firstObservedAt: string;
+  lastObservedAt: string;
+  observationCount: number;
+};
+
 export type MarketPaymentChannelInput = {
   displayName: string;
   sortOrder: number;
@@ -367,8 +385,14 @@ export async function getMarketWalletTopupGatewayStatus(id: string) {
 }
 
 export async function recheckMarketWalletTopup(id: string) {
-  return parseJson<{ queued: boolean }>(
+  return parseJson<{ queued: boolean; order: MarketWalletTopup }>(
     await authFetch(`/v1/market-wallet/topups/${encodeURIComponent(id)}/recheck`, { method: "POST" }),
+  );
+}
+
+export async function stopMarketWalletTopup(id: string) {
+  return parseJson<MarketWalletTopup>(
+    await authFetch(`/v1/market-wallet/topups/${encodeURIComponent(id)}/stop`, { method: "POST" }),
   );
 }
 
@@ -417,6 +441,13 @@ export async function getMarketFinanceTopups(cursor?: string) {
   const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
   return parseJson<MarketWalletPage<MarketFinanceTopup>>(
     await authFetch(`/v1/admin/market-finance/topups${query}`, { cache: "no-store" }),
+  );
+}
+
+export async function getMarketFinanceTopupObservations(id: string, cursor?: string) {
+  const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
+  return parseJson<MarketWalletPage<MarketTopupGatewayObservation>>(
+    await authFetch(`/v1/admin/market-finance/topups/${encodeURIComponent(id)}/observations${query}`, { cache: "no-store" }),
   );
 }
 

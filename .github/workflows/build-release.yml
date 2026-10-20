@@ -47,6 +47,7 @@ jobs:
           npm run test:flags
           npm run test:token-units
           npm run test:usd-micros
+          npm run test:market-wallet
           npm run test:share-model-probe
           npm run test:share-model-health-heatmap
           npm run audit:settings-i18n
@@ -55,6 +56,14 @@ jobs:
           npm run audit:share-model-health-contract
           npm run audit:model-prices
           npm run build
+          npm run test:wallet-checkout-browser
+
+      - name: Test DujiaoPay wallet and migration contracts
+        run: |
+          cargo test market_payments::tests
+          cargo test schema::tests::migration_67_adds_redacted_gateway_observations_without_rewriting_orders
+          cargo test schema::tests::migration_68_adds_buyer_check_progress_without_rewriting_orders
+          cargo test schema::tests::installs_and_reopens_fresh_baseline
 
       - name: Get version from Cargo.toml
         id: version

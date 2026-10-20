@@ -261,6 +261,7 @@ pub fn router() -> Router<ServerState> {
             "/v1/market-wallet/topups/:id/abandon",
             post(abandon_buyer_topup),
         )
+        .route("/v1/market-wallet/topups/:id/stop", post(stop_buyer_topup))
         .route(
             "/v1/admin/market-payment-channels",
             get(list_admin_channels).post(create_channel),
@@ -304,6 +305,10 @@ pub fn router() -> Router<ServerState> {
         )
         .route("/v1/admin/market-finance/topups", get(list_admin_topups))
         .route(
+            "/v1/admin/market-finance/topups/:id/observations",
+            get(list_admin_topup_observations),
+        )
+        .route(
             "/v1/admin/market-finance/topups/:id/recover",
             post(recover_admin_topup),
         )
@@ -340,11 +345,25 @@ struct FinanceReadinessView {
     code_integrated: bool,
     legacy_blockers: Vec<ReadinessBlocker>,
     critical_cases: i64,
+    stale_topup_reviews: i64,
     verified_live_topups: i64,
     payment_channel_blockers: Vec<ReadinessBlocker>,
     can_enable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     webhook_url: Option<String>,
+}
+
+fn stale_topup_review_count_tx(conn: &Connection) -> Result<i64, AppError> {
+    conn.query_row(
+        "SELECT COUNT(DISTINCT topup.id) FROM market_topup_orders topup
+         JOIN market_finance_reconciliation_cases review
+           ON review.object_kind = 'topup' AND review.object_id = topup.id
+         WHERE topup.status = 'review_required' AND review.status = 'open'
+           AND review.created_at <= ?1",
+        params![(Utc::now() - chrono::Duration::hours(24)).to_rfc3339()],
+        |row| row.get(0),
+    )
+    .map_err(db_error("count stale top-up reviews"))
 }
 
 fn finance_readiness_tx(conn: &Connection) -> Result<FinanceReadinessView, AppError> {
@@ -452,6 +471,7 @@ fn finance_readiness_tx(conn: &Connection) -> Result<FinanceReadinessView, AppEr
         )
         .map_err(db_error("count verified top-ups"))?;
     let critical_cases = crate::market_reconcile::critical_case_count_tx(conn)?;
+    let stale_topup_reviews = stale_topup_review_count_tx(conn)?;
     let channel_checks: [(&'static str, &'static str); 6] = [
         (
             "credited_topup_missing_evidence",
@@ -503,6 +523,7 @@ fn finance_readiness_tx(conn: &Connection) -> Result<FinanceReadinessView, AppEr
         code_integrated: MARKET_WALLET_CUTOVER_IMPLEMENTED,
         legacy_blockers,
         critical_cases,
+        stale_topup_reviews,
         verified_live_topups,
         payment_channel_blockers,
         can_enable,
@@ -1953,6 +1974,7 @@ async fn resolve_finance_case(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin finance case resolution"))?;
+    ensure_general_case_can_resolve_tx(&tx, &id)?;
     crate::market_reconcile::resolve_case_tx(
         &tx,
         &id,
@@ -1963,6 +1985,23 @@ async fn resolve_finance_case(
     tx.commit()
         .map_err(db_error("commit finance case resolution"))?;
     Ok((no_store(), Json(serde_json::json!({ "ok": true }))))
+}
+
+fn ensure_general_case_can_resolve_tx(conn: &Connection, id: &str) -> Result<(), AppError> {
+    let topup_case: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM market_finance_reconciliation_cases
+             WHERE id = ?1 AND object_kind = 'topup')",
+            params![id],
+            |row| row.get(0),
+        )
+        .map_err(db_error("check finance case kind"))?;
+    if topup_case {
+        return Err(AppError::Conflict(
+            "top-up cases require a verified payment or unpaid recovery decision".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -1978,6 +2017,120 @@ struct AdminTopupView {
     created_at: String,
     updated_at: String,
     buyer_abandoned_at: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TopupGatewayObservationView {
+    id: String,
+    source: String,
+    gateway_status: String,
+    evidence_flags: Vec<String>,
+    evidence_sha256: String,
+    first_observed_at: String,
+    last_observed_at: String,
+    observation_count: i64,
+}
+
+async fn list_admin_topup_observations(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(order_id): Path<String>,
+    Query(query): Query<PageQuery>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    crate::api::require_admin_session(&state, &headers).await?;
+    let conn = state.store.conn.lock().await;
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM market_topup_orders WHERE id = ?1)",
+            params![order_id],
+            |row| row.get(0),
+        )
+        .map_err(db_error("find top-up observations target"))?;
+    if !exists {
+        return Err(AppError::NotFound("top-up order not found".into()));
+    }
+    Ok((
+        no_store(),
+        Json(admin_topup_observations_tx(
+            &conn,
+            &order_id,
+            query.cursor.as_deref(),
+        )?),
+    ))
+}
+
+fn admin_topup_observations_tx(
+    conn: &Connection,
+    order_id: &str,
+    cursor: Option<&str>,
+) -> Result<Page<TopupGatewayObservationView>, AppError> {
+    let cursor_at = cursor
+        .map(|id| {
+            conn.query_row(
+                "SELECT first_observed_at FROM market_topup_gateway_observations
+                 WHERE id = ?1 AND order_id = ?2",
+                params![id, order_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(db_error("read top-up observation cursor"))?
+            .ok_or_else(|| AppError::BadRequest("invalid top-up observation cursor".into()))
+        })
+        .transpose()?;
+    let mut statement = conn
+        .prepare(
+            "SELECT id, source, gateway_status, evidence_flags_json, evidence_sha256,
+                first_observed_at, last_observed_at, observation_count
+         FROM market_topup_gateway_observations WHERE order_id = ?1
+           AND (?2 IS NULL OR first_observed_at < ?2
+                OR (first_observed_at = ?2 AND id < ?3))
+         ORDER BY first_observed_at DESC, id DESC LIMIT 51",
+        )
+        .map_err(db_error("prepare top-up observations"))?;
+    let mut items = statement
+        .query_map(params![order_id, cursor_at, cursor], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, i64>(7)?,
+            ))
+        })
+        .map_err(db_error("query top-up observations"))?
+        .map(|row| {
+            let (
+                id,
+                source,
+                gateway_status,
+                flags_json,
+                evidence_sha256,
+                first_observed_at,
+                last_observed_at,
+                observation_count,
+            ) = row.map_err(db_error("read top-up observation"))?;
+            let evidence_flags = serde_json::from_str(&flags_json)
+                .map_err(|_| AppError::Internal("invalid redacted top-up observation".into()))?;
+            Ok(TopupGatewayObservationView {
+                id,
+                source,
+                gateway_status,
+                evidence_flags,
+                evidence_sha256,
+                first_observed_at,
+                last_observed_at,
+                observation_count,
+            })
+        })
+        .collect::<Result<Vec<_>, AppError>>()?;
+    let has_more = items.len() > 50;
+    items.truncate(50);
+    let next_cursor = has_more.then(|| items.last().unwrap().id.clone());
+    Ok(Page { items, next_cursor })
 }
 
 async fn list_admin_topups(
@@ -2098,6 +2251,31 @@ fn can_cancel_gateway_topup(
         && assessment.blockers.as_slice() == ["gateway_not_terminal"]
 }
 
+fn can_pay_gateway_topup(
+    local_status: &str,
+    gateway: &GatewayOrder,
+    assessment: &RecoveryAssessment,
+    abandoned: bool,
+    cancel_requested: bool,
+    time: chrono::DateTime<Utc>,
+) -> bool {
+    if local_status != "pending"
+        || abandoned
+        || cancel_requested
+        || !matches!(gateway.status.as_str(), "awaiting_payment" | "pending")
+        || assessment.blockers.as_slice() != ["gateway_not_terminal"]
+    {
+        return false;
+    }
+    let deadline = if gateway.status == "awaiting_payment" {
+        gateway.selection_deadline.as_deref()
+    } else {
+        gateway.expires_at.as_deref()
+    };
+    deadline
+        .is_none_or(|value| chrono::DateTime::parse_from_rfc3339(value).is_ok_and(|end| end > time))
+}
+
 fn gateway_cancel_was_requested_tx(conn: &Connection, order_id: &str) -> Result<bool, AppError> {
     conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM market_finance_audit_events
@@ -2107,27 +2285,6 @@ fn gateway_cancel_was_requested_tx(conn: &Connection, order_id: &str) -> Result<
         |row| row.get(0),
     )
     .map_err(db_error("check earlier gateway cancellation request"))
-}
-
-fn automatic_cancel_recently_requested_tx(
-    conn: &Connection,
-    order_id: &str,
-) -> Result<bool, AppError> {
-    let requested_at: Option<String> = conn
-        .query_row(
-            "SELECT created_at FROM market_finance_audit_events
-             WHERE object_kind = 'topup' AND object_id = ?1
-               AND action = 'topup_gateway_cancel_requested' AND actor_user_id = 'system'
-             ORDER BY created_at DESC LIMIT 1",
-            params![order_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(db_error("read automatic gateway cancellation request"))?;
-    Ok(requested_at.is_some_and(|value| {
-        chrono::DateTime::parse_from_rfc3339(&value)
-            .is_ok_and(|time| time > Utc::now() - chrono::Duration::seconds(60))
-    }))
 }
 
 fn valid_manual_reference(reference: &str) -> bool {
@@ -2379,6 +2536,7 @@ fn apply_owner_verified_recovery_tx(
     if identity_conflict {
         assessment.blockers.push("gateway_identity_mismatch");
     }
+    record_gateway_observation_tx(conn, order_id, "owner_review", gateway, time)?;
     if input.dry_run {
         return Ok(assessment);
     }
@@ -2472,6 +2630,7 @@ fn apply_owner_verified_recovery_tx(
         Some(&input.reason_code),
         time,
     )?;
+    finish_buyer_recheck_tx(conn, order_id, Some(status))?;
     Ok(assessment)
 }
 
@@ -2535,11 +2694,12 @@ async fn recover_admin_topup(
         &actor.user_id,
         &now(),
     )?;
+    let can_cancel = input.dry_run
+        && can_cancel_gateway_topup(&snapshot.status, &gateway.status, &assessment, true)
+        && !gateway_cancel_was_requested_tx(&tx, &order_id)?;
     tx.commit()
         .map_err(db_error("commit owner top-up recovery"))?;
     let can_recover = assessment.can_recover();
-    let can_cancel = input.dry_run
-        && can_cancel_gateway_topup(&snapshot.status, &gateway.status, &assessment, true);
     Ok((
         no_store(),
         Json(RecoverTopupView {
@@ -2830,19 +2990,51 @@ struct TopupView {
     auto_close_at: Option<String>,
     buyer_abandoned_at: Option<String>,
     review_reason: Option<String>,
+    buyer_recheck_requested_at: Option<String>,
+    buyer_recheck_completed_at: Option<String>,
+    buyer_recheck_result: Option<String>,
+    last_gateway_status: Option<String>,
+    last_gateway_checked_at: Option<String>,
 }
 
 fn read_topup(conn: &Connection, order_id: &str, user_id: &str) -> Result<TopupView, AppError> {
     conn.query_row(
-        "SELECT id, channel_id, amount_minor, status, checkout_url, created_at, auto_close_at,
+        "SELECT id, channel_id, amount_minor, status,
+                CASE WHEN status = 'pending' AND buyer_abandoned_at IS NULL
+                    AND NOT EXISTS (
+                        SELECT 1 FROM market_finance_audit_events audit
+                        WHERE audit.object_kind = 'topup'
+                          AND audit.object_id = market_topup_orders.id
+                          AND audit.action = 'topup_gateway_cancel_requested'
+                    ) AND NOT EXISTS (
+                        SELECT 1 FROM market_finance_reconciliation_cases review
+                        WHERE review.object_kind = 'topup'
+                          AND review.object_id = market_topup_orders.id
+                          AND review.status = 'open'
+                    ) THEN checkout_url ELSE NULL END,
+                created_at, auto_close_at,
                 buyer_abandoned_at,
                 CASE WHEN status = 'review_required' AND EXISTS (
                     SELECT 1 FROM market_finance_reconciliation_cases review
                     WHERE review.object_kind = 'topup' AND review.object_id = market_topup_orders.id
                       AND review.code = 'topup_verification_failed'
                       AND review.status = 'open'
-                      AND review.detail_code IN ('gateway_terminal_payment_evidence', 'paid_receipt_invalid')
-                ) THEN 'possible_payment' ELSE NULL END
+                      AND review.detail_code = 'paid_receipt_invalid'
+                ) THEN 'paid_receipt_invalid'
+                WHEN status = 'review_required' AND EXISTS (
+                    SELECT 1 FROM market_finance_reconciliation_cases review
+                    WHERE review.object_kind = 'topup' AND review.object_id = market_topup_orders.id
+                      AND review.code = 'topup_verification_failed'
+                      AND review.status = 'open'
+                      AND review.detail_code = 'gateway_terminal_payment_evidence'
+                ) THEN 'terminal_payment_marker' ELSE NULL END,
+                buyer_recheck_requested_at, buyer_recheck_completed_at, buyer_recheck_result,
+                (SELECT observation.gateway_status FROM market_topup_gateway_observations observation
+                 WHERE observation.order_id = market_topup_orders.id
+                 ORDER BY observation.last_observed_at DESC, observation.id DESC LIMIT 1),
+                (SELECT observation.last_observed_at FROM market_topup_gateway_observations observation
+                 WHERE observation.order_id = market_topup_orders.id
+                 ORDER BY observation.last_observed_at DESC, observation.id DESC LIMIT 1)
          FROM market_topup_orders WHERE id = ?1 AND user_id = ?2",
         params![order_id, user_id],
         |row| {
@@ -2862,6 +3054,11 @@ fn read_topup(conn: &Connection, order_id: &str, user_id: &str) -> Result<TopupV
                 auto_close_at: row.get(6)?,
                 buyer_abandoned_at,
                 review_reason: row.get(8)?,
+                buyer_recheck_requested_at: row.get(9)?,
+                buyer_recheck_completed_at: row.get(10)?,
+                buyer_recheck_result: row.get(11)?,
+                last_gateway_status: row.get(12)?,
+                last_gateway_checked_at: row.get(13)?,
             })
         },
     )
@@ -2928,8 +3125,17 @@ async fn recheck_buyer_topup(
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let session = require_session(&state, &headers).await?;
     let conn = state.store.conn.lock().await;
-    let queued = queue_buyer_recheck_tx(&conn, &order_id, &session.user_id)?;
-    Ok((no_store(), Json(serde_json::json!({ "queued": queued }))))
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_error("begin buyer top-up recheck"))?;
+    let queued = queue_buyer_recheck_tx(&tx, &order_id, &session.user_id)?;
+    let order = read_topup(&tx, &order_id, &session.user_id)?;
+    tx.commit()
+        .map_err(db_error("commit buyer top-up recheck"))?;
+    Ok((
+        no_store(),
+        Json(serde_json::json!({ "queued": queued, "order": order })),
+    ))
 }
 
 fn queue_buyer_recheck_tx(
@@ -2944,7 +3150,19 @@ fn queue_buyer_recheck_tx(
     ) {
         return Err(AppError::Conflict("top-up is already final".into()));
     }
-    queue_webhook_hint_tx(conn, order_id, &now())
+    let time = now();
+    let queued = queue_webhook_hint_tx(conn, order_id, &time)?;
+    if queued {
+        conn.execute(
+            "UPDATE market_topup_orders
+             SET buyer_recheck_requested_at = ?2, buyer_recheck_completed_at = NULL,
+                 buyer_recheck_result = 'queued'
+             WHERE id = ?1 AND user_id = ?3",
+            params![order_id, time, user_id],
+        )
+        .map_err(db_error("record buyer top-up recheck request"))?;
+    }
+    Ok(queued)
 }
 
 struct CancelTopupSnapshot {
@@ -3003,6 +3221,7 @@ fn topup_buyer_abandoned_tx(conn: &Connection, order_id: &str) -> Result<bool, A
 #[serde(rename_all = "camelCase")]
 struct TopupGatewayStatusView {
     gateway_status: String,
+    can_pay: bool,
     can_cancel: bool,
     can_abandon: bool,
     selection_deadline: Option<String>,
@@ -3038,7 +3257,7 @@ async fn get_topup_gateway_status(
         &snapshot.gateway_order_id,
     )
     .await?;
-    let (can_cancel, can_abandon) = {
+    let (can_pay, can_cancel, can_abandon) = {
         let conn = state.store.conn.lock().await;
         let current = cancel_topup_snapshot_tx(&conn, &order_id, Some(&session.user_id))?;
         validate_gateway_identity_tx(
@@ -3051,19 +3270,31 @@ async fn get_topup_gateway_status(
             &gateway,
         )?;
         let assessment = recovery_assessment_tx(&conn, &order_id, &current.status, &gateway)?;
+        let abandoned = topup_buyer_abandoned_tx(&conn, &order_id)?;
+        let cancel_requested = gateway_cancel_was_requested_tx(&conn, &order_id)?;
         (
+            can_pay_gateway_topup(
+                &current.status,
+                &gateway,
+                &assessment,
+                abandoned,
+                cancel_requested,
+                Utc::now(),
+            ),
             can_cancel_gateway_topup(&current.status, &gateway.status, &assessment, false)
-                && !automatic_cancel_recently_requested_tx(&conn, &order_id)?,
+                && !cancel_requested,
             current.status == "pending"
                 && gateway.status == "awaiting_payment"
                 && assessment.blockers.as_slice() == ["gateway_not_terminal"]
-                && !topup_buyer_abandoned_tx(&conn, &order_id)?,
+                && !abandoned
+                && !cancel_requested,
         )
     };
     Ok((
         no_store(),
         Json(TopupGatewayStatusView {
             gateway_status: gateway.status,
+            can_pay,
             can_cancel,
             can_abandon,
             selection_deadline: gateway.selection_deadline,
@@ -3124,6 +3355,66 @@ async fn abandon_buyer_topup(
     tx.commit()
         .map_err(db_error("commit buyer top-up abandonment"))?;
     Ok((no_store(), Json(view)))
+}
+
+async fn stop_buyer_topup(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(order_id): Path<String>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let session = require_session(&state, &headers).await?;
+    let conn = state.store.conn.lock().await;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_error("begin buyer stop-payment request"))?;
+    let view = stop_buyer_topup_tx(&tx, &order_id, &session.user_id)?;
+    tx.commit()
+        .map_err(db_error("commit buyer stop-payment request"))?;
+    Ok((no_store(), Json(view)))
+}
+
+fn stop_buyer_topup_tx(
+    conn: &Connection,
+    order_id: &str,
+    buyer_id: &str,
+) -> Result<TopupView, AppError> {
+    let current = read_topup(conn, order_id, buyer_id)?;
+    if current.buyer_abandoned_at.is_some() {
+        return Ok(current);
+    }
+    if !matches!(
+        current.status.as_str(),
+        "created" | "creating" | "create_unknown" | "pending" | "verifying" | "review_required"
+    ) {
+        return Err(AppError::Conflict("top-up is already final".into()));
+    }
+    let time = now();
+    let changed = conn
+        .execute(
+            "UPDATE market_topup_orders
+             SET buyer_abandoned_at = ?2, checkout_url = NULL,
+                 updated_at = ?2, next_reconcile_at = ?2
+             WHERE id = ?1 AND user_id = ?3 AND buyer_abandoned_at IS NULL
+               AND status IN ('created', 'creating', 'create_unknown', 'pending',
+                              'verifying', 'review_required')",
+            params![order_id, time, buyer_id],
+        )
+        .map_err(db_error("record buyer stop-payment request"))?;
+    if changed != 1 {
+        return Err(AppError::Conflict(
+            "top-up changed; refresh before stopping payment".into(),
+        ));
+    }
+    audit_tx(
+        conn,
+        buyer_id,
+        "topup_buyer_stopped_payment",
+        "topup",
+        order_id,
+        None,
+        &time,
+    )?;
+    read_topup(conn, order_id, buyer_id)
 }
 
 fn mark_buyer_abandoned_tx(
@@ -3277,6 +3568,7 @@ fn finish_gateway_cancel_tx(
             ));
         }
     }
+    finish_buyer_recheck_from_order_tx(conn, order_id)?;
     read_topup(conn, order_id, &snapshot.user_id)
 }
 
@@ -3366,16 +3658,11 @@ async fn cancel_topup_for_actor(
                 .into(),
             ));
         }
-        if actor == "system" && gateway_cancel_was_requested_tx(&tx, order_id)? {
+        if gateway_cancel_was_requested_tx(&tx, order_id)? {
             // A prior POST may have reached the gateway even if its response
-            // was lost. Poll for its terminal state; never repeat it silently.
+            // was lost. Poll for its terminal state; never repeat it.
             return Err(AppError::Conflict(
-                "automatic gateway cancellation was already requested".into(),
-            ));
-        }
-        if automatic_cancel_recently_requested_tx(&tx, order_id)? {
-            return Err(AppError::Conflict(
-                "automatic gateway cancellation is being verified".into(),
+                "gateway cancellation was already requested; verify its current status".into(),
             ));
         }
         audit_tx(
@@ -3387,6 +3674,11 @@ async fn cancel_topup_for_actor(
             None,
             &now(),
         )?;
+        tx.execute(
+            "UPDATE market_topup_orders SET checkout_url = NULL WHERE id = ?1",
+            params![order_id],
+        )
+        .map_err(db_error("hide checkout after gateway cancellation request"))?;
         // Persist a near-term authenticated lookup before the external call.
         // If this process dies after the gateway commits the cancellation,
         // reconciliation can still observe its terminal state.
@@ -3503,15 +3795,42 @@ fn topups_tx(
         .transpose()?;
     let mut statement = conn
         .prepare(
-            "SELECT id, channel_id, amount_minor, status, checkout_url, created_at, auto_close_at,
+            "SELECT id, channel_id, amount_minor, status,
+                    CASE WHEN status = 'pending' AND buyer_abandoned_at IS NULL
+                        AND NOT EXISTS (
+                            SELECT 1 FROM market_finance_audit_events audit
+                            WHERE audit.object_kind = 'topup'
+                              AND audit.object_id = market_topup_orders.id
+                              AND audit.action = 'topup_gateway_cancel_requested'
+                        ) AND NOT EXISTS (
+                            SELECT 1 FROM market_finance_reconciliation_cases review
+                            WHERE review.object_kind = 'topup'
+                              AND review.object_id = market_topup_orders.id
+                              AND review.status = 'open'
+                        ) THEN checkout_url ELSE NULL END,
+                    created_at, auto_close_at,
                     buyer_abandoned_at,
                     CASE WHEN status = 'review_required' AND EXISTS (
                         SELECT 1 FROM market_finance_reconciliation_cases review
                         WHERE review.object_kind = 'topup' AND review.object_id = market_topup_orders.id
                           AND review.code = 'topup_verification_failed'
                           AND review.status = 'open'
-                          AND review.detail_code IN ('gateway_terminal_payment_evidence', 'paid_receipt_invalid')
-                    ) THEN 'possible_payment' ELSE NULL END
+                          AND review.detail_code = 'paid_receipt_invalid'
+                    ) THEN 'paid_receipt_invalid'
+                    WHEN status = 'review_required' AND EXISTS (
+                        SELECT 1 FROM market_finance_reconciliation_cases review
+                        WHERE review.object_kind = 'topup' AND review.object_id = market_topup_orders.id
+                          AND review.code = 'topup_verification_failed'
+                          AND review.status = 'open'
+                          AND review.detail_code = 'gateway_terminal_payment_evidence'
+                    ) THEN 'terminal_payment_marker' ELSE NULL END,
+                    buyer_recheck_requested_at, buyer_recheck_completed_at, buyer_recheck_result,
+                    (SELECT observation.gateway_status FROM market_topup_gateway_observations observation
+                     WHERE observation.order_id = market_topup_orders.id
+                     ORDER BY observation.last_observed_at DESC, observation.id DESC LIMIT 1),
+                    (SELECT observation.last_observed_at FROM market_topup_gateway_observations observation
+                     WHERE observation.order_id = market_topup_orders.id
+                     ORDER BY observation.last_observed_at DESC, observation.id DESC LIMIT 1)
              FROM market_topup_orders WHERE user_id = ?1
                AND (?2 IS NULL OR created_at < ?2 OR (created_at = ?2 AND id < ?3))
              ORDER BY created_at DESC, id DESC LIMIT 51",
@@ -3535,6 +3854,11 @@ fn topups_tx(
                 auto_close_at: row.get(6)?,
                 buyer_abandoned_at,
                 review_reason: row.get(8)?,
+                buyer_recheck_requested_at: row.get(9)?,
+                buyer_recheck_completed_at: row.get(10)?,
+                buyer_recheck_result: row.get(11)?,
+                last_gateway_status: row.get(12)?,
+                last_gateway_checked_at: row.get(13)?,
             })
         })
         .map_err(db_error("query top-up history"))?
@@ -3569,8 +3893,19 @@ fn active_matching_topup_tx(
          FROM market_topup_orders
          WHERE user_id = ?1 AND request_fingerprint = ?2
            AND buyer_abandoned_at IS NULL
-           AND status IN ('created', 'creating', 'create_unknown',
-                          'pending', 'verifying', 'review_required')
+           AND status IN ('created', 'creating', 'create_unknown', 'pending')
+           AND NOT EXISTS (
+               SELECT 1 FROM market_finance_audit_events audit
+               WHERE audit.object_kind = 'topup'
+                 AND audit.object_id = market_topup_orders.id
+                 AND audit.action = 'topup_gateway_cancel_requested'
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM market_finance_reconciliation_cases review
+               WHERE review.object_kind = 'topup'
+                 AND review.object_id = market_topup_orders.id
+                 AND review.status = 'open'
+           )
          ORDER BY created_at DESC, id DESC LIMIT 1",
         params![user_id, request_fingerprint],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
@@ -3601,8 +3936,12 @@ fn ensure_pending_topup_capacity_tx(conn: &Connection, user_id: &str) -> Result<
         .query_row(
             "SELECT COUNT(*) FROM market_topup_orders WHERE user_id = ?1
              AND buyer_abandoned_at IS NOT NULL
-             AND status IN ('created', 'creating', 'create_unknown', 'pending', 'verifying')",
-            params![user_id],
+             AND status IN ('created', 'creating', 'create_unknown', 'pending', 'verifying')
+             AND created_at >= ?2",
+            params![
+                user_id,
+                (Utc::now() - chrono::Duration::hours(24)).to_rfc3339()
+            ],
             |row| row.get(0),
         )
         .map_err(db_error("count abandoned but payable top-ups"))?;
@@ -3617,8 +3956,11 @@ fn ensure_pending_topup_capacity_tx(conn: &Connection, user_id: &str) -> Result<
     let review: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM market_topup_orders
-             WHERE user_id = ?1 AND status = 'review_required'",
-            params![user_id],
+             WHERE user_id = ?1 AND status = 'review_required' AND created_at >= ?2",
+            params![
+                user_id,
+                (Utc::now() - chrono::Duration::hours(24)).to_rfc3339()
+            ],
             |row| row.get(0),
         )
         .map_err(db_error("count review top-ups"))?;
@@ -3982,8 +4324,14 @@ fn restore_verified_checkout_tx(
         "UPDATE market_topup_orders
          SET checkout_url = ?2,
              status = CASE WHEN status = 'create_unknown' THEN 'pending' ELSE status END
-         WHERE id = ?1 AND status IN ('created', 'creating', 'create_unknown',
-                                      'pending', 'verifying')",
+         WHERE id = ?1 AND status IN ('created', 'creating', 'create_unknown', 'pending')
+           AND buyer_abandoned_at IS NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM market_finance_audit_events audit
+               WHERE audit.object_kind = 'topup'
+                 AND audit.object_id = market_topup_orders.id
+                 AND audit.action = 'topup_gateway_cancel_requested'
+           )",
         params![order_id, checkout_url],
     )
     .map_err(db_error("restore verified checkout URL"))?;
@@ -4085,6 +4433,7 @@ fn apply_paid_order_tx(
     else {
         return Ok(());
     };
+    resolve_compatible_paid_holds_tx(conn, order_id, &now())?;
     if topup_has_manual_hold_tx(conn, order_id)? {
         return Err(AppError::Conflict(
             "top-up is held for manual reconciliation".into(),
@@ -4134,6 +4483,7 @@ fn apply_paid_order_tx(
         ],
     )
     .map_err(db_error("mark top-up credited"))?;
+    finish_buyer_recheck_tx(conn, order_id, Some("credited"))?;
     Ok(())
 }
 
@@ -4145,6 +4495,57 @@ fn topup_has_manual_hold_tx(conn: &Connection, order_id: &str) -> Result<bool, A
         |row| row.get(0),
     )
     .map_err(db_error("read top-up review hold"))
+}
+
+fn compatible_paid_hold_ids_tx(
+    conn: &Connection,
+    order_id: &str,
+) -> Result<Option<Vec<String>>, AppError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT id, code, COALESCE(detail_code, '')
+             FROM market_finance_reconciliation_cases
+             WHERE object_kind = 'topup' AND object_id = ?1 AND status = 'open'
+             ORDER BY id",
+        )
+        .map_err(db_error("prepare paid top-up holds"))?;
+    let cases = statement
+        .query_map(params![order_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(db_error("query paid top-up holds"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_error("read paid top-up holds"))?;
+    if cases.iter().any(|(_, code, detail)| {
+        code != "topup_verification_failed" || detail != "gateway_terminal_payment_evidence"
+    }) {
+        return Ok(None);
+    }
+    Ok(Some(cases.into_iter().map(|(id, _, _)| id).collect()))
+}
+
+fn resolve_compatible_paid_holds_tx(
+    conn: &Connection,
+    order_id: &str,
+    time: &str,
+) -> Result<(), AppError> {
+    let Some(case_ids) = compatible_paid_hold_ids_tx(conn, order_id)? else {
+        return Ok(());
+    };
+    for case_id in case_ids {
+        crate::market_reconcile::resolve_case_tx(
+            conn,
+            &case_id,
+            "system",
+            "verified_gateway_paid",
+            time,
+        )?;
+    }
+    Ok(())
 }
 
 fn bind_signed_gateway_order_tx(
@@ -4321,6 +4722,7 @@ fn apply_verified_unpaid_status_tx(
             time,
         )?;
     }
+    finish_buyer_recheck_from_order_tx(conn, order_id)?;
     Ok(())
 }
 
@@ -4342,6 +4744,50 @@ fn exact_decimal_zero(value: &str) -> bool {
         && whole.bytes().all(|byte| byte == b'0')
         && (fraction.is_empty() && !value.contains('.')
             || !fraction.is_empty() && fraction.bytes().all(|byte| byte == b'0'))
+}
+
+fn record_gateway_observation_tx(
+    conn: &Connection,
+    order_id: &str,
+    source: &'static str,
+    gateway: &GatewayOrder,
+    time: &str,
+) -> Result<(), AppError> {
+    let flags = gateway_recovery_blockers(gateway)
+        .into_iter()
+        .filter(|flag| *flag != "gateway_not_terminal")
+        .collect::<Vec<_>>();
+    let flags_json = serde_json::to_string(&flags)
+        .map_err(|_| AppError::Internal("encode redacted gateway observation failed".into()))?;
+    let fingerprint = serde_json::json!({
+        "status": gateway.status,
+        "paidSource": gateway.paid_source,
+        "txId": gateway.tx_id,
+        "paidAt": gateway.paid_at,
+        "confirmations": gateway.confirmations,
+        "settledAmount": gateway.settled_amount,
+    });
+    let evidence_sha256 = hex::encode(Sha256::digest(fingerprint.to_string().as_bytes()));
+    conn.execute(
+        "INSERT INTO market_topup_gateway_observations
+         (id, order_id, source, gateway_status, evidence_flags_json, evidence_sha256,
+          first_observed_at, last_observed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+         ON CONFLICT(order_id, source, gateway_status, evidence_sha256)
+         DO UPDATE SET last_observed_at = excluded.last_observed_at,
+                       observation_count = observation_count + 1",
+        params![
+            Uuid::new_v4().to_string(),
+            order_id,
+            source,
+            gateway.status,
+            flags_json,
+            evidence_sha256,
+            time
+        ],
+    )
+    .map_err(db_error("record redacted gateway observation"))?;
+    Ok(())
 }
 
 fn gateway_recovery_blockers(gateway: &GatewayOrder) -> Vec<&'static str> {
@@ -4647,7 +5093,27 @@ async fn dujiaopay_webhook(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin verified top-up"))?;
-    if gateway.status == "paid" && topup_has_manual_hold_tx(&tx, &order_id)? {
+    if gateway.status == "paid" {
+        match validate_gateway_identity_tx(
+            &tx,
+            &order_id,
+            &channel_id,
+            revision,
+            &loaded,
+            &event.order_id,
+            &gateway,
+        ) {
+            Ok(()) => record_gateway_observation_tx(&tx, &order_id, "webhook", &gateway, &now())?,
+            // A foreign or mismatched gateway order is not evidence for this
+            // Router top-up and must not enter its observation history.
+            Err(AppError::Conflict(_)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if gateway.status == "paid"
+        && topup_has_manual_hold_tx(&tx, &order_id)?
+        && compatible_paid_hold_ids_tx(&tx, &order_id)?.is_none()
+    {
         let time = now();
         tx.execute(
             "UPDATE market_topup_orders SET status = 'review_required', updated_at = ?2
@@ -4661,6 +5127,7 @@ async fn dujiaopay_webhook(
             params![loaded.merchant_fingerprint, event.event_id, time],
         )
         .map_err(db_error("mark disputed webhook for review"))?;
+        finish_buyer_recheck_tx(&tx, &order_id, Some("review_required"))?;
         tx.commit()
             .map_err(db_error("commit disputed webhook review"))?;
         return Ok(Json(
@@ -4687,6 +5154,7 @@ async fn dujiaopay_webhook(
                 )?;
                 tx.execute("UPDATE market_topup_events SET status = 'review_required', processed_at = ?3 WHERE merchant_fingerprint = ?1 AND gateway_event_id = ?2", params![loaded.merchant_fingerprint, event.event_id, time])
                     .map_err(db_error("hold mismatched gateway identity event"))?;
+                finish_buyer_recheck_tx(&tx, &order_id, Some("review_required"))?;
                 tx.commit()
                     .map_err(db_error("commit gateway identity review"))?;
                 return Ok(Json(
@@ -4695,6 +5163,7 @@ async fn dujiaopay_webhook(
             }
             return Err(error);
         }
+        record_gateway_observation_tx(&tx, &order_id, "webhook", &gateway, &now())?;
         let status = match verified_unpaid_status(&gateway.status) {
             Ok(status) => status,
             Err(AppError::Conflict(_)) => {
@@ -4707,6 +5176,7 @@ async fn dujiaopay_webhook(
                 )?;
                 tx.execute("UPDATE market_topup_events SET status = 'review_required', processed_at = ?3 WHERE merchant_fingerprint = ?1 AND gateway_event_id = ?2", params![loaded.merchant_fingerprint, event.event_id, time])
                     .map_err(db_error("hold unknown gateway status event"))?;
+                finish_buyer_recheck_tx(&tx, &order_id, Some("review_required"))?;
                 tx.commit()
                     .map_err(db_error("commit unknown gateway status review"))?;
                 return Ok(Json(
@@ -4727,6 +5197,7 @@ async fn dujiaopay_webhook(
             )?;
             tx.execute("UPDATE market_topup_events SET status = 'review_required', processed_at = ?3 WHERE merchant_fingerprint = ?1 AND gateway_event_id = ?2", params![loaded.merchant_fingerprint, event.event_id, time])
                 .map_err(db_error("hold terminal gateway payment evidence"))?;
+            finish_buyer_recheck_tx(&tx, &order_id, Some("review_required"))?;
             tx.commit()
                 .map_err(db_error("commit terminal gateway evidence review"))?;
             return Ok(Json(
@@ -4765,6 +5236,7 @@ async fn dujiaopay_webhook(
                 .map_err(db_error("mark top-up for review"))?;
             tx.execute("UPDATE market_topup_events SET status = 'review_required', processed_at = ?3 WHERE merchant_fingerprint = ?1 AND gateway_event_id = ?2", params![loaded.merchant_fingerprint, event.event_id, time])
                 .map_err(db_error("mark webhook for review"))?;
+            finish_buyer_recheck_tx(&tx, &order_id, Some("review_required"))?;
             tx.commit().map_err(db_error("commit top-up review"))?;
             return Ok(Json(
                 serde_json::json!({ "accepted": true, "reviewRequired": true }),
@@ -4840,7 +5312,8 @@ fn pending_topups_tx(conn: &Connection) -> Result<Vec<PendingTopup>, AppError> {
          WHERE COALESCE(next_reconcile_at, updated_at) <= ?1
            AND status IN ('created', 'creating', 'create_unknown', 'pending', 'verifying',
                           'expired', 'cancelled', 'review_required')
-           AND (created_at >= ?2 OR reconcile_hint_pending = 1
+           AND (created_at >= ?2 OR status NOT IN ('expired', 'cancelled')
+                OR reconcile_hint_pending = 1
                 OR hint_reconcile_until >= ?1
                 OR (buyer_abandoned_at IS NOT NULL
                     AND status IN ('created', 'creating', 'create_unknown',
@@ -4954,6 +5427,44 @@ fn finish_reconciliation_tx(
     Ok(())
 }
 
+fn finish_buyer_recheck_tx(
+    conn: &Connection,
+    order_id: &str,
+    result: Option<&str>,
+) -> Result<(), AppError> {
+    let result = match result {
+        Some(
+            result @ ("pending" | "verifying" | "review_required" | "credited" | "expired"
+            | "cancelled"),
+        ) => result,
+        _ => "retrying",
+    };
+    conn.execute(
+        "UPDATE market_topup_orders
+         SET buyer_recheck_completed_at = ?2, buyer_recheck_result = ?3
+         WHERE id = ?1 AND buyer_recheck_requested_at IS NOT NULL
+           AND buyer_recheck_result IN ('queued', 'retrying')",
+        params![order_id, now(), result],
+    )
+    .map_err(db_error("finish buyer top-up recheck"))?;
+    Ok(())
+}
+
+fn finish_buyer_recheck_from_order_tx(conn: &Connection, order_id: &str) -> Result<(), AppError> {
+    let status: String = conn
+        .query_row(
+            "SELECT status FROM market_topup_orders WHERE id = ?1",
+            params![order_id],
+            |row| row.get(0),
+        )
+        .map_err(db_error("read checked buyer top-up status"))?;
+    let result = match status.as_str() {
+        "created" | "creating" | "create_unknown" => "pending",
+        _ => &status,
+    };
+    finish_buyer_recheck_tx(conn, order_id, Some(result))
+}
+
 async fn reconcile_one_topup(state: &ServerState, pending: PendingTopup) -> Result<(), AppError> {
     let (loaded, creation_credentials) = {
         let conn = state.store.conn.lock().await;
@@ -5062,9 +5573,12 @@ async fn reconcile_one_topup(state: &ServerState, pending: PendingTopup) -> Resu
         }
         return Err(error);
     }
+    record_gateway_observation_tx(&tx, &pending.id, "reconcile", &gateway, &now())?;
     restore_verified_checkout_tx(&tx, &pending.id, &gateway)?;
     let manual_hold = topup_has_manual_hold_tx(&tx, &pending.id)?;
-    if gateway.status == "paid" && !manual_hold {
+    if gateway.status == "paid"
+        && (!manual_hold || compatible_paid_hold_ids_tx(&tx, &pending.id)?.is_some())
+    {
         let validation = validate_paid_order_tx(
             &tx,
             &pending.id,
@@ -5127,6 +5641,14 @@ async fn reconcile_one_topup(state: &ServerState, pending: PendingTopup) -> Resu
         }
     }
     finish_reconciliation_tx(&tx, &pending.id, pending.had_hint)?;
+    let current_status: String = tx
+        .query_row(
+            "SELECT status FROM market_topup_orders WHERE id = ?1",
+            params![pending.id],
+            |row| row.get(0),
+        )
+        .map_err(db_error("read reconciled buyer top-up status"))?;
+    finish_buyer_recheck_tx(&tx, &pending.id, Some(&current_status))?;
     let can_auto_close = should_auto_cancel_tx(&tx, &pending, &gateway, Utc::now())?;
     tx.commit()
         .map_err(db_error("commit top-up reconciliation"))?;
@@ -5165,6 +5687,15 @@ pub async fn run_service(
                     Err(_) => tracing::error!("market finance audit unavailable"),
                     _ => {}
                 }
+                let stale_reviews = {
+                    let conn = state.store.conn.lock().await;
+                    stale_topup_review_count_tx(&conn)
+                };
+                match stale_reviews {
+                    Ok(count) if count > 0 => tracing::warn!(count, "market top-ups need owner review for over 24 hours"),
+                    Err(_) => tracing::warn!("market top-up review age check unavailable"),
+                    _ => {}
+                }
             }
             _ = interval.tick() => {
                 let pending = {
@@ -5173,6 +5704,7 @@ pub async fn run_service(
                 };
                 match pending {
                     Ok(orders) => for order in orders {
+                        let order_id = order.id.clone();
                         let claimed = {
                             let conn = state.store.conn.lock().await;
                             claim_reconciliation_tx(&conn, &order.id)
@@ -5182,6 +5714,11 @@ pub async fn run_service(
                             continue;
                         }
                         if let Err(error) = reconcile_one_topup(&state, order).await {
+                            let result = {
+                                let conn = state.store.conn.lock().await;
+                                finish_buyer_recheck_tx(&conn, &order_id, None)
+                            };
+                            if result.is_err() { tracing::warn!("buyer top-up recheck status unavailable"); }
                             tracing::warn!(error_code = error.code().unwrap_or("MARKET_TOPUP_RETRY"),
                                 "market top-up recovery deferred");
                         }
@@ -5395,7 +5932,7 @@ mod tests {
             );
             conn.execute(
                 "UPDATE market_topup_orders
-                 SET buyer_abandoned_at = '2025-01-01', created_at = '2025-01-01',
+                 SET buyer_abandoned_at = '2025-01-01', created_at = ?2,
                      updated_at = ?2, next_reconcile_at = '2025-01-01'
                  WHERE id = ?1",
                 params![format!("abandoned-{index}"), now()],
@@ -5417,6 +5954,13 @@ mod tests {
                 .iter()
                 .all(|order| order.buyer_abandoned_at.is_some())
         );
+        conn.execute(
+            "UPDATE market_topup_orders SET created_at = '2025-01-01'
+             WHERE id = 'abandoned-0'",
+            [],
+        )
+        .unwrap();
+        ensure_pending_topup_capacity_tx(&conn, "buyer").unwrap();
         conn.execute(
             "UPDATE market_topup_orders SET status = 'expired' WHERE id = 'abandoned-0'",
             [],
@@ -5484,14 +6028,6 @@ mod tests {
         .unwrap();
         assert!(!should_auto_cancel_tx(&conn, &pending, &gateway, time).unwrap());
         assert!(gateway_cancel_was_requested_tx(&conn, "order-1").unwrap());
-        assert!(automatic_cancel_recently_requested_tx(&conn, "order-1").unwrap());
-        conn.execute(
-            "UPDATE market_finance_audit_events SET created_at = '2026-10-01T00:00:00+00:00'
-             WHERE object_id = 'order-1' AND action = 'topup_gateway_cancel_requested'",
-            [],
-        )
-        .unwrap();
-        assert!(!automatic_cancel_recently_requested_tx(&conn, "order-1").unwrap());
     }
 
     #[test]
@@ -5520,11 +6056,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             read_topup(&conn, "order-1", "buyer").unwrap().review_reason,
-            Some("possible_payment".into())
+            Some("terminal_payment_marker".into())
         );
         assert_eq!(
             topups_tx(&conn, "buyer", None).unwrap().items[0].review_reason,
-            Some("possible_payment".into())
+            Some("terminal_payment_marker".into())
         );
         assert!(read_topup(&conn, "order-1", "other").is_err());
         let case_id: String = conn
@@ -5569,7 +6105,31 @@ mod tests {
             Err(AppError::NotFound(_))
         ));
         assert!(queue_buyer_recheck_tx(&conn, "order-1", "buyer").unwrap());
+        let queued = read_topup(&conn, "order-1", "buyer").unwrap();
+        assert_eq!(queued.buyer_recheck_result.as_deref(), Some("queued"));
+        assert!(queued.buyer_recheck_completed_at.is_none());
         assert!(!queue_buyer_recheck_tx(&conn, "order-1", "buyer").unwrap());
+        finish_buyer_recheck_tx(&conn, "order-1", Some("review_required")).unwrap();
+        let completed = read_topup(&conn, "order-1", "buyer").unwrap();
+        assert_eq!(
+            completed.buyer_recheck_result.as_deref(),
+            Some("review_required")
+        );
+        assert!(completed.buyer_recheck_completed_at.is_some());
+        conn.execute(
+            "UPDATE market_topup_orders SET buyer_recheck_result = 'queued'
+             WHERE id = 'order-1'",
+            [],
+        )
+        .unwrap();
+        finish_buyer_recheck_tx(&conn, "order-1", None).unwrap();
+        assert_eq!(
+            read_topup(&conn, "order-1", "buyer")
+                .unwrap()
+                .buyer_recheck_result
+                .as_deref(),
+            Some("retrying")
+        );
         conn.execute(
             "UPDATE market_topup_orders SET status = 'expired' WHERE id = 'order-1'",
             [],
@@ -5579,6 +6139,246 @@ mod tests {
             queue_buyer_recheck_tx(&conn, "order-1", "buyer"),
             Err(AppError::Conflict(_))
         ));
+    }
+
+    #[test]
+    fn buyer_can_stop_payment_without_erasing_reconciliation_or_another_buyers_order() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        let merchant_order_id = "router-00000000000000000000000000000001";
+        fixture_topup(&conn, "order-1", merchant_order_id, "pending", 1);
+        conn.execute(
+            "UPDATE market_topup_orders SET gateway_order_id = 'gateway-1',
+             checkout_url = 'https://www.dujiaopay.com/checkout/ct_one',
+             created_at = ?1 WHERE id = 'order-1'",
+            params![now()],
+        )
+        .unwrap();
+        assert!(matches!(
+            stop_buyer_topup_tx(&conn, "order-1", "other"),
+            Err(AppError::NotFound(_))
+        ));
+        let stopped = stop_buyer_topup_tx(&conn, "order-1", "buyer").unwrap();
+        assert_eq!(stopped.status, "pending");
+        assert!(stopped.checkout_url.is_none());
+        assert!(stopped.buyer_abandoned_at.is_some());
+        assert!(
+            active_matching_topup_tx(&conn, "buyer", "channel:100")
+                .unwrap()
+                .is_none()
+        );
+        let repeated = stop_buyer_topup_tx(&conn, "order-1", "buyer").unwrap();
+        assert_eq!(repeated.buyer_abandoned_at, stopped.buyer_abandoned_at);
+        let audits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM market_finance_audit_events
+             WHERE object_id = 'order-1' AND action = 'topup_buyer_stopped_payment'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(audits, 1);
+        assert!(
+            pending_topups_tx(&conn)
+                .unwrap()
+                .iter()
+                .any(|order| order.id == "order-1")
+        );
+        let mut gateway = unpaid_order(merchant_order_id, "pending");
+        gateway.checkout_url = Some("https://www.dujiaopay.com/checkout/ct_old".into());
+        restore_verified_checkout_tx(&conn, "order-1", &gateway).unwrap();
+        assert!(
+            read_topup(&conn, "order-1", "buyer")
+                .unwrap()
+                .checkout_url
+                .is_none()
+        );
+        let stored_checkout: Option<String> = conn
+            .query_row(
+                "SELECT checkout_url FROM market_topup_orders WHERE id = 'order-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(stored_checkout.is_none());
+        assert_eq!(wallet_snapshot_tx(&conn, "buyer").unwrap().posted_units, 0);
+    }
+
+    #[test]
+    fn general_case_resolution_rejects_topup_holds() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        fixture_topup(
+            &conn,
+            "order-1",
+            "router-00000000000000000000000000000001",
+            "review_required",
+            1,
+        );
+        open_reconciliation_case_detail_tx(
+            &conn,
+            "topup_verification_failed",
+            "topup",
+            "order-1",
+            Some("gateway_terminal_payment_evidence"),
+            &now(),
+        )
+        .unwrap();
+        let case_id: String = conn
+            .query_row(
+                "SELECT id FROM market_finance_reconciliation_cases WHERE object_id = 'order-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(matches!(
+            ensure_general_case_can_resolve_tx(&conn, &case_id),
+            Err(AppError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn stale_review_alert_uses_case_age_not_original_order_age() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        fixture_topup(
+            &conn,
+            "order-1",
+            "router-00000000000000000000000000000001",
+            "review_required",
+            1,
+        );
+        open_reconciliation_case_detail_tx(
+            &conn,
+            "topup_verification_failed",
+            "topup",
+            "order-1",
+            Some("gateway_terminal_payment_evidence"),
+            &now(),
+        )
+        .unwrap();
+        assert_eq!(stale_topup_review_count_tx(&conn).unwrap(), 0);
+        conn.execute(
+            "UPDATE market_finance_reconciliation_cases SET created_at = '2025-01-01'
+             WHERE object_id = 'order-1'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(stale_topup_review_count_tx(&conn).unwrap(), 1);
+    }
+
+    #[test]
+    fn strict_late_payment_credits_a_terminal_marker_review_once() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        let merchant_order_id = "router-00000000000000000000000000000001";
+        fixture_topup(&conn, "order-1", merchant_order_id, "review_required", 1);
+        open_reconciliation_case_detail_tx(
+            &conn,
+            "topup_verification_failed",
+            "topup",
+            "order-1",
+            Some("gateway_terminal_payment_evidence"),
+            &now(),
+        )
+        .unwrap();
+        assert!(queue_buyer_recheck_tx(&conn, "order-1", "buyer").unwrap());
+        stop_buyer_topup_tx(&conn, "order-1", "buyer").unwrap();
+        let gateway = paid_order(merchant_order_id, "verified-late-transaction");
+        let paid_event = event(&gateway);
+        apply_paid_order_tx(
+            &conn,
+            "order-1",
+            "channel",
+            1,
+            &loaded(),
+            &paid_event,
+            &gateway,
+        )
+        .unwrap();
+        assert_eq!(
+            read_topup(&conn, "order-1", "buyer").unwrap().status,
+            "credited"
+        );
+        assert_eq!(
+            read_topup(&conn, "order-1", "buyer")
+                .unwrap()
+                .buyer_recheck_result
+                .as_deref(),
+            Some("credited")
+        );
+        let first_balance = wallet_snapshot_tx(&conn, "buyer").unwrap().posted_units;
+        assert!(first_balance > 0);
+        apply_paid_order_tx(
+            &conn,
+            "order-1",
+            "channel",
+            1,
+            &loaded(),
+            &paid_event,
+            &gateway,
+        )
+        .unwrap();
+        assert_eq!(
+            wallet_snapshot_tx(&conn, "buyer").unwrap().posted_units,
+            first_balance
+        );
+        let cases: (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), SUM(status = 'resolved') FROM market_finance_reconciliation_cases
+             WHERE object_kind = 'topup' AND object_id = 'order-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(cases, (1, 1));
+    }
+
+    #[test]
+    fn unrelated_review_or_invalid_paid_receipt_never_auto_credits() {
+        for extra_detail in ["paid_receipt_invalid", "gateway_identity_mismatch"] {
+            let conn = memory();
+            fixture_revision(&conn, 1);
+            let merchant_order_id = "router-00000000000000000000000000000001";
+            fixture_topup(&conn, "order-1", merchant_order_id, "review_required", 1);
+            open_reconciliation_case_detail_tx(
+                &conn,
+                "topup_verification_failed",
+                "topup",
+                "order-1",
+                Some("gateway_terminal_payment_evidence"),
+                &now(),
+            )
+            .unwrap();
+            open_reconciliation_case_detail_tx(
+                &conn,
+                "unknown_gateway_event",
+                "topup",
+                "order-1",
+                Some(extra_detail),
+                &now(),
+            )
+            .unwrap();
+            let gateway = paid_order(merchant_order_id, "verified-late-transaction");
+            let paid_event = event(&gateway);
+            assert!(matches!(
+                apply_paid_order_tx(
+                    &conn,
+                    "order-1",
+                    "channel",
+                    1,
+                    &loaded(),
+                    &paid_event,
+                    &gateway
+                ),
+                Err(AppError::Conflict(_))
+            ));
+            assert_eq!(wallet_snapshot_tx(&conn, "buyer").unwrap().posted_units, 0);
+            assert_eq!(
+                read_topup(&conn, "order-1", "buyer").unwrap().status,
+                "review_required"
+            );
+        }
     }
 
     #[test]
@@ -5593,6 +6393,11 @@ mod tests {
                 "review_required",
                 1,
             );
+            conn.execute(
+                "UPDATE market_topup_orders SET created_at = ?2 WHERE id = ?1",
+                params![format!("review-{index}"), now()],
+            )
+            .unwrap();
             if index == MAX_REVIEW_ORDERS - 2 {
                 ensure_pending_topup_capacity_tx(&conn, "buyer").unwrap();
             }
@@ -5604,6 +6409,13 @@ mod tests {
                 ..
             })
         ));
+        conn.execute(
+            "UPDATE market_topup_orders SET created_at = '2025-01-01'
+             WHERE id = 'review-0'",
+            [],
+        )
+        .unwrap();
+        ensure_pending_topup_capacity_tx(&conn, "buyer").unwrap();
         conn.execute(
             "UPDATE market_topup_orders SET status = 'expired' WHERE id = 'review-0'",
             [],
@@ -5625,6 +6437,94 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn a_new_attempt_never_reuses_a_nonpayable_topup_of_the_same_amount() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        fixture_topup(
+            &conn,
+            "order-1",
+            "router-00000000000000000000000000000001",
+            "review_required",
+            1,
+        );
+        assert!(
+            active_matching_topup_tx(&conn, "buyer", "channel:100")
+                .unwrap()
+                .is_none()
+        );
+        for status in ["verifying", "credited", "expired", "cancelled"] {
+            conn.execute(
+                "UPDATE market_topup_orders SET status = ?2 WHERE id = ?1",
+                params!["order-1", status],
+            )
+            .unwrap();
+            assert!(
+                active_matching_topup_tx(&conn, "buyer", "channel:100")
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        conn.execute(
+            "UPDATE market_topup_orders SET status = 'pending' WHERE id = 'order-1'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            active_matching_topup_tx(&conn, "buyer", "channel:100")
+                .unwrap()
+                .unwrap()
+                .0,
+            "order-1"
+        );
+        conn.execute(
+            "UPDATE market_topup_orders SET checkout_url =
+             'https://www.dujiaopay.com/checkout/ct_old' WHERE id = 'order-1'",
+            [],
+        )
+        .unwrap();
+        audit_tx(
+            &conn,
+            "buyer",
+            "topup_gateway_cancel_requested",
+            "topup",
+            "order-1",
+            None,
+            &now(),
+        )
+        .unwrap();
+        assert!(
+            active_matching_topup_tx(&conn, "buyer", "channel:100")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            read_topup(&conn, "order-1", "buyer")
+                .unwrap()
+                .checkout_url
+                .is_none()
+        );
+        assert!(
+            topups_tx(&conn, "buyer", None).unwrap().items[0]
+                .checkout_url
+                .is_none()
+        );
+        let mut gateway = unpaid_order("router-00000000000000000000000000000001", "pending");
+        gateway.checkout_url = Some("https://www.dujiaopay.com/checkout/ct_restored".into());
+        restore_verified_checkout_tx(&conn, "order-1", &gateway).unwrap();
+        let checkout_url: Option<String> = conn
+            .query_row(
+                "SELECT checkout_url FROM market_topup_orders WHERE id = 'order-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            checkout_url.as_deref(),
+            Some("https://www.dujiaopay.com/checkout/ct_old")
+        );
     }
 
     #[test]
@@ -7346,12 +8246,105 @@ mod tests {
     }
 
     #[test]
+    fn gateway_observations_preserve_redacted_payment_markers_without_transaction_ids() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        let merchant_order_id = "router-00000000000000000000000000000001";
+        fixture_topup(&conn, "order-1", merchant_order_id, "review_required", 1);
+        let mut gateway = unpaid_order(merchant_order_id, "expired");
+        gateway.tx_id = Some("sensitive-chain-transaction".into());
+        record_gateway_observation_tx(&conn, "order-1", "reconcile", &gateway, &now()).unwrap();
+        record_gateway_observation_tx(&conn, "order-1", "reconcile", &gateway, &now()).unwrap();
+        let (flags, count, hash): (String, i64, String) = conn
+            .query_row(
+                "SELECT evidence_flags_json, observation_count, evidence_sha256
+             FROM market_topup_gateway_observations WHERE order_id = 'order-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(flags, "[\"gateway_transaction\"]");
+        assert_eq!(count, 2);
+        assert_eq!(hash.len(), 64);
+        assert!(!flags.contains("sensitive-chain-transaction"));
+        assert!(!hash.contains("sensitive-chain-transaction"));
+    }
+
+    #[test]
+    fn gateway_observations_page_without_hiding_older_evidence_or_crossing_orders() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        let merchant_order_id = "router-00000000000000000000000000000001";
+        fixture_topup(&conn, "order-1", merchant_order_id, "review_required", 1);
+        fixture_topup(
+            &conn,
+            "order-2",
+            "router-00000000000000000000000000000002",
+            "review_required",
+            1,
+        );
+        for index in 0..52 {
+            let mut gateway = unpaid_order(merchant_order_id, "expired");
+            gateway.tx_id = Some(format!("transaction-{index}"));
+            record_gateway_observation_tx(&conn, "order-1", "reconcile", &gateway, &now()).unwrap();
+        }
+        let first = admin_topup_observations_tx(&conn, "order-1", None).unwrap();
+        assert_eq!(first.items.len(), 50);
+        let cursor = first.next_cursor.expect("older observations available");
+        let mut repeated = unpaid_order(merchant_order_id, "expired");
+        repeated.tx_id = Some("transaction-0".into());
+        let later = (Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+        record_gateway_observation_tx(&conn, "order-1", "reconcile", &repeated, &later).unwrap();
+        let second = admin_topup_observations_tx(&conn, "order-1", Some(&cursor)).unwrap();
+        assert_eq!(second.items.len(), 2);
+        assert!(second.next_cursor.is_none());
+        let ids = first
+            .items
+            .into_iter()
+            .chain(second.items)
+            .map(|item| item.id)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(ids.len(), 52);
+        assert!(matches!(
+            admin_topup_observations_tx(&conn, "order-2", Some(&cursor)),
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn unresolved_topups_remain_in_reconciliation_after_the_terminal_history_window() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        fixture_topup(
+            &conn,
+            "old-review",
+            "router-00000000000000000000000000000001",
+            "review_required",
+            1,
+        );
+        conn.execute(
+            "UPDATE market_topup_orders SET created_at = '2020-01-01',
+             updated_at = '2020-01-01', next_reconcile_at = '2020-01-01'
+             WHERE id = 'old-review'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            pending_topups_tx(&conn)
+                .unwrap()
+                .iter()
+                .any(|order| order.id == "old-review")
+        );
+    }
+
+    #[test]
     fn stale_pending_order_can_close_only_after_terminal_gateway_check() {
         let conn = memory();
         fixture_revision(&conn, 1);
         let merchant_order_id = "router-00000000000000000000000000000001";
         fixture_topup(&conn, "order-1", merchant_order_id, "pending", 1);
         let snapshot = recovery_snapshot_tx(&conn, "order-1").unwrap();
+        assert!(queue_buyer_recheck_tx(&conn, "order-1", "buyer").unwrap());
         let mut input = RecoverTopupRequest {
             expected_status: snapshot.status,
             expected_updated_at: snapshot.updated_at,
@@ -7404,6 +8397,13 @@ mod tests {
         assert_eq!(
             read_topup(&conn, "order-1", "buyer").unwrap().status,
             "expired"
+        );
+        assert_eq!(
+            read_topup(&conn, "order-1", "buyer")
+                .unwrap()
+                .buyer_recheck_result
+                .as_deref(),
+            Some("expired")
         );
     }
 
@@ -8558,6 +9558,64 @@ mod tests {
             "pending",
             &assessment,
             false
+        ));
+    }
+
+    #[test]
+    fn checkout_capability_requires_clean_payable_gateway_evidence_and_a_live_deadline() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        let merchant_order_id = "router-00000000000000000000000000000001";
+        fixture_topup(&conn, "order-1", merchant_order_id, "pending", 1);
+        let mut gateway = unpaid_order(merchant_order_id, "pending");
+        let assessment = recovery_assessment_tx(&conn, "order-1", "pending", &gateway).unwrap();
+        let time = Utc::now();
+        assert!(can_pay_gateway_topup(
+            "pending",
+            &gateway,
+            &assessment,
+            false,
+            false,
+            time
+        ));
+        assert!(!can_pay_gateway_topup(
+            "pending",
+            &gateway,
+            &assessment,
+            false,
+            true,
+            time
+        ));
+        assert!(!can_pay_gateway_topup(
+            "pending",
+            &gateway,
+            &assessment,
+            true,
+            false,
+            time
+        ));
+        assert!(!can_pay_gateway_topup(
+            "review_required",
+            &gateway,
+            &assessment,
+            false,
+            false,
+            time
+        ));
+        gateway.expires_at = Some((time - chrono::Duration::seconds(1)).to_rfc3339());
+        assert!(!can_pay_gateway_topup(
+            "pending",
+            &gateway,
+            &assessment,
+            false,
+            false,
+            time
+        ));
+        gateway.expires_at = None;
+        gateway.tx_id = Some("observed-transfer".into());
+        let disputed = recovery_assessment_tx(&conn, "order-1", "pending", &gateway).unwrap();
+        assert!(!can_pay_gateway_topup(
+            "pending", &gateway, &disputed, false, false, time
         ));
     }
 

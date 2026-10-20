@@ -16,7 +16,6 @@ import { MarketWalletRefundPanel } from "@/components/dashboard/market-wallet-re
 import { ApiError } from "@/lib/api";
 import { DASHBOARD_ACCOUNT_BILLING_PATH } from "@/lib/dashboard-nav";
 import {
-  abandonMarketWalletTopup,
   createMarketWalletTopup,
   cancelMarketWalletTopup,
   getMarketWallet,
@@ -26,18 +25,23 @@ import {
   getMarketWalletTopups,
   getMarketWalletTransactions,
   recheckMarketWalletTopup,
+  stopMarketWalletTopup,
   type MarketWalletChannel,
   type MarketWallet,
   type MarketWalletTopup,
   type MarketTopupGatewayStatus,
   type MarketWalletTransaction,
 } from "@/lib/market-wallet-api";
-import { formatTopupCountdown, formatWalletUnits, formatWalletUnitsAsCny, parseUsdMinor, payableCheckoutUrl, safeMarketReturnPath, topupAutoCheckCountdown, topupCancelAction, topupDisplayStatus } from "@/lib/market-wallet-money";
+import { formatTopupCountdown, formatWalletUnits, formatWalletUnitsAsCny, parseUsdMinor, payableCheckoutUrl, safeMarketReturnPath, shouldResetTopupIdempotency, topupAutoCheckCountdown, topupCancelAction, topupDisplayStatus, verifiedPayableCheckoutUrl, walletTopupCheckoutHref } from "@/lib/market-wallet-money";
 
-const FINAL_TOPUP_STATUS = new Set(["credited", "review_required", "expired", "cancelled"]);
+const CLOSED_TOPUP_STATUS = new Set(["credited", "expired", "cancelled"]);
 
 function errorText(cause: unknown) {
   return cause instanceof Error ? cause.message : String(cause);
+}
+
+function closePaymentWindow(paymentWindow: Window | null) {
+  try { paymentWindow?.close(); } catch { /* The payment tab may have navigated away. */ }
 }
 
 function dateText(value: string, locale: string) {
@@ -78,6 +82,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
   const { locale, t, displayCurrency, fxRateFresh, fxRateMicros } = useLocaleText();
   const searchParams = useSearchParams();
   const returnedTopupId = searchParams.get("topup");
+  const returnedFromCheckoutExit = searchParams.get("cancelled") === "1";
   const [returnPath, setReturnPath] = React.useState<string | null>(null);
   const [wallet, setWallet] = React.useState(initialWallet);
   const [channels, setChannels] = React.useState<MarketWalletChannel[]>([]);
@@ -87,6 +92,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
   const [cancelConfirmId, setCancelConfirmId] = React.useState<string | null>(null);
   const [abandonConfirmId, setAbandonConfirmId] = React.useState<string | null>(null);
   const [cancelUnavailableId, setCancelUnavailableId] = React.useState<string | null>(null);
+  const [reviewRetryConfirm, setReviewRetryConfirm] = React.useState(false);
   const [checkoutFallbackUrl, setCheckoutFallbackUrl] = React.useState<string | null>(null);
   const [transactions, setTransactions] = React.useState<MarketWalletTransaction[]>([]);
   const [topupCursor, setTopupCursor] = React.useState<string | null>(null);
@@ -107,6 +113,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
   const reloadVersionRef = React.useRef(0);
   const hasUnresolvedTopups = topups.some((order) =>
     ["created", "creating", "create_unknown", "pending", "verifying", "review_required"].includes(order.status));
+  const hasQueuedRecheck = topups.some((order) => order.buyerRecheckResult === "queued");
 
   React.useEffect(() => {
     const timer = window.setInterval(() => setNowMs(Date.now()), 1_000);
@@ -116,7 +123,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
   React.useEffect(() => {
     const attemptedOrderId = idempotencyRef.current?.orderId;
     if (attemptedOrderId && topups.some((order) =>
-      order.id === attemptedOrderId && ["expired", "cancelled"].includes(order.status))) {
+      order.id === attemptedOrderId && shouldResetTopupIdempotency(order))) {
       idempotencyRef.current = null;
     }
   }, [topups]);
@@ -192,7 +199,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
     if (!hasUnresolvedTopups) return;
     const timer = window.setInterval(() => {
       if (document.visibilityState === "visible") void reload().catch(() => {});
-    }, 30_000);
+    }, hasQueuedRecheck ? 5_000 : 30_000);
     const onVisible = () => {
       if (document.visibilityState === "visible") void reload().catch(() => {});
     };
@@ -201,7 +208,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, [hasUnresolvedTopups, reload]);
+  }, [hasUnresolvedTopups, hasQueuedRecheck, reload]);
 
   React.useEffect(() => {
     let active = true;
@@ -231,8 +238,8 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
     if (!returnedTopupId) return;
     let active = true;
     let timeout: ReturnType<typeof setTimeout> | undefined;
-    const retry = () => {
-      if (active) timeout = setTimeout(poll, 5_000);
+    const retry = (delayMs = 5_000) => {
+      if (active) timeout = setTimeout(poll, delayMs);
     };
     const poll = async () => {
       let credited = false;
@@ -241,12 +248,15 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
         if (!active) return;
         setReturnedTopup(current);
         credited = current.status === "credited";
-        if (credited) {
+        if (CLOSED_TOPUP_STATUS.has(current.status)) {
           try { window.localStorage.removeItem(`marketWalletReturnTo:${returnedTopupId}`); } catch { /* Optional storage. */ }
+        }
+        if (credited) {
           await reload();
         }
         setError("");
-        if (!FINAL_TOPUP_STATUS.has(current.status)) retry();
+        if (current.status === "review_required") retry(60_000);
+        else if (!CLOSED_TOPUP_STATUS.has(current.status)) retry();
       } catch (cause) {
         if (!active) return;
         setError(errorText(cause));
@@ -262,10 +272,18 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
 
   const parsedAmount = parseUsdMinor(amount);
   const amountError = amountTouched && amount && parsedAmount == null;
-  const submitTopup = async (event: React.FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    setAmountTouched(true);
+  const matchingUnsettled = topups.find((order) =>
+    order.amountMinor === parsedAmount
+      && (["verifying", "review_required"].includes(order.status)
+        || (!!order.buyerAbandonedAt && !CLOSED_TOPUP_STATUS.has(order.status))));
+  const startTopup = async () => {
     if (busyRef.current || !wallet.canTopup || !channelId || parsedAmount == null) return;
+    const attemptedOrderId = idempotencyRef.current?.orderId;
+    if (attemptedOrderId && topups.some((order) => order.id === attemptedOrderId
+      && shouldResetTopupIdempotency(order))) {
+      idempotencyRef.current = null;
+    }
+    setReviewRetryConfirm(false);
     busyRef.current = true;
     setBusy("topup");
     setError("");
@@ -293,6 +311,8 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
     try {
       const order = await createMarketWalletTopup(channelId, parsedAmount, attempt.key);
       if (idempotencyRef.current === attempt) attempt.orderId = order.id;
+      if (shouldResetTopupIdempotency(order)) idempotencyRef.current = null;
+      reloadVersionRef.current += 1;
       setTopups((current) => [order, ...current.filter((item) => item.id !== order.id)]);
       if (returnPath) {
         const key = `marketWalletReturnTo:${order.id}`;
@@ -318,25 +338,46 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
       const checkoutUrl = payableCheckoutUrl(order.status, order.checkoutUrl, undefined, !!order.buyerAbandonedAt);
       if (checkoutUrl) {
         try {
-          if (!paymentWindow || paymentWindow.closed) throw new Error("payment window unavailable");
-          paymentWindow.location.replace(checkoutUrl);
-          setNotice(t("marketWallet.openedPaymentTab"));
+          const gateway = await getMarketWalletTopupGatewayStatus(order.id);
+          setGatewayStatuses((current) => ({ ...current, [order.id]: gateway }));
+          const offset = Date.parse(gateway.serverNow) - Date.now();
+          if (Number.isFinite(offset)) setServerOffsetMs(offset);
+          const verifiedCheckout = verifiedPayableCheckoutUrl(order.status, checkoutUrl, gateway, !!order.buyerAbandonedAt, Date.now() + (Number.isFinite(offset) ? offset : 0));
+          if (!verifiedCheckout) {
+            closePaymentWindow(paymentWindow);
+            setNotice(t("marketWallet.paymentNoLongerOpen"));
+            void reload().catch(() => {});
+            return;
+          }
+          const localCheckout = walletTopupCheckoutHref(order.id);
+          if (!paymentWindow || paymentWindow.closed) {
+            setCheckoutFallbackUrl(localCheckout);
+          } else {
+            try {
+              paymentWindow.location.replace(localCheckout);
+              setNotice(t("marketWallet.openedPaymentTab"));
+            } catch {
+              closePaymentWindow(paymentWindow);
+              setCheckoutFallbackUrl(localCheckout);
+            }
+          }
         } catch {
-          paymentWindow?.close();
-          setCheckoutFallbackUrl(checkoutUrl);
+          closePaymentWindow(paymentWindow);
+          setError(t("marketWallet.checkoutPending"));
+          void reload().catch(() => {});
         }
       } else if (order.buyerAbandonedAt) {
-        paymentWindow?.close();
+        closePaymentWindow(paymentWindow);
         idempotencyRef.current = null;
         setNotice(t("marketWallet.abandonedHelp"));
       } else if (order.status !== "credited") {
-        paymentWindow?.close();
+        closePaymentWindow(paymentWindow);
         setError(t(order.status === "review_required" ? "marketWallet.reviewHelp" : "marketWallet.checkoutPending"));
       } else {
-        paymentWindow?.close();
+        closePaymentWindow(paymentWindow);
       }
     } catch (cause) {
-      paymentWindow?.close();
+      closePaymentWindow(paymentWindow);
       setError(cause instanceof ApiError && cause.code === "MARKET_TOPUP_PENDING_LIMIT"
         ? t("marketWallet.pendingLimit")
         : cause instanceof ApiError && cause.code === "MARKET_TOPUP_ABANDONED_LIMIT"
@@ -351,6 +392,14 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
       busyRef.current = false;
       setBusy("");
     }
+  };
+
+  const submitTopup = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setAmountTouched(true);
+    if (busyRef.current || !loaded || !wallet.canTopup || !channelId || parsedAmount == null) return;
+    if (matchingUnsettled) setReviewRetryConfirm(true);
+    else void startTopup();
   };
 
   const refreshGatewayStatus = async (id: string) => {
@@ -378,10 +427,6 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
 
   const chooseCancelAction = async (order: MarketWalletTopup) => {
     if (statusBusyId || busyRef.current) return;
-    if (order.status === "review_required") {
-      setCancelUnavailableId(order.id);
-      return;
-    }
     const version = (statusRequestVersionRef.current[order.id] ?? 0) + 1;
     statusRequestVersionRef.current[order.id] = version;
     setStatusBusyId(order.id);
@@ -413,8 +458,9 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
     setNotice("");
     try {
       const result = await recheckMarketWalletTopup(id);
-      setNotice(t(result.queued ? "marketWallet.recheckQueued" : "marketWallet.recheckAlreadyQueued"));
-      await reload();
+      reloadVersionRef.current += 1;
+      setTopups((current) => current.map((order) => order.id === id ? result.order : order));
+      if (!result.queued) setNotice(t("marketWallet.recheckAlreadyQueued"));
     } catch (cause) {
       setError(errorText(cause));
     } finally {
@@ -427,7 +473,10 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
     if (!id || busyRef.current) return;
     busyRef.current = true;
     setBusy("cancelTopup");
+    if (idempotencyRef.current?.orderId === id) idempotencyRef.current = null;
     setError("");
+    setGatewayStatuses((current) => ({ ...current, [id]: null }));
+    setCheckoutFallbackUrl(null);
     try {
       const updated = await cancelMarketWalletTopup(id);
       setTopups((current) => current.map((order) => order.id === id ? updated : order));
@@ -454,11 +503,13 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
     if (!id || busyRef.current) return;
     busyRef.current = true;
     setBusy("abandonTopup");
+    if (idempotencyRef.current?.orderId === id) idempotencyRef.current = null;
     setError("");
     setNotice("");
+    setGatewayStatuses((current) => ({ ...current, [id]: null }));
+    setCheckoutFallbackUrl(null);
     try {
-      const updated = await abandonMarketWalletTopup(id);
-      idempotencyRef.current = null;
+      const updated = await stopMarketWalletTopup(id);
       setTopups((current) => current.map((order) => order.id === id ? updated : order));
       setAbandonConfirmId(null);
       setNotice(t("marketWallet.abandonedHelp"));
@@ -503,17 +554,14 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
     }
   };
 
-  const cancelUnavailableOrder = topups.find((order) => order.id === cancelUnavailableId);
   const cancelUnavailableGateway = cancelUnavailableId ? gatewayStatuses[cancelUnavailableId] : null;
-  const cancelUnavailableDescription = cancelUnavailableOrder?.status === "review_required"
-    ? t("marketWallet.cancelReviewRequired")
-    : ["confirming", "paid"].includes(cancelUnavailableGateway?.gatewayStatus ?? "")
-      ? t("marketWallet.cancelPaymentStarted")
-      : ["expired", "canceled", "cancelled"].includes(cancelUnavailableGateway?.gatewayStatus ?? "")
-        ? t("marketWallet.cancelGatewayEnding")
-        : cancelUnavailableGateway?.gatewayStatus === "pending" || cancelUnavailableGateway?.gatewayStatus === "awaiting_payment"
-          ? t("marketWallet.cancelSafetyHold")
-          : t("marketWallet.gatewayStatusUnavailable");
+  const cancelUnavailableDescription = ["confirming", "paid"].includes(cancelUnavailableGateway?.gatewayStatus ?? "")
+    ? t("marketWallet.cancelPaymentStarted")
+    : ["expired", "canceled", "cancelled"].includes(cancelUnavailableGateway?.gatewayStatus ?? "")
+      ? t("marketWallet.cancelGatewayEnding")
+      : cancelUnavailableGateway?.gatewayStatus === "pending" || cancelUnavailableGateway?.gatewayStatus === "awaiting_payment"
+        ? t("marketWallet.cancelSafetyHold")
+        : t("marketWallet.gatewayStatusUnavailable");
 
   return (
     <main className="mx-auto grid w-full max-w-5xl min-w-0 gap-6 px-4 py-6 sm:px-6" aria-label={t("marketWallet.title")}>
@@ -535,10 +583,13 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
       {wallet.mode === "shadow" ? <p className="rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">{t("marketWallet.shadow")}</p> : null}
       {returnedTopup ? (
         <div role="status" aria-live="polite" className="flex min-w-0 flex-wrap items-center justify-between gap-3 rounded-md border border-border bg-card px-4 py-3 text-sm">
-          <span className="flex items-center gap-2">
-            {returnedTopup.status === "credited" ? <CheckCircle2 className="size-4 text-emerald-700" aria-hidden="true" /> : <Clock3 className="size-4 text-muted-foreground" aria-hidden="true" />}
-            {t(`marketWallet.status.${topupDisplayStatus(returnedTopup.status, undefined, !!returnedTopup.buyerAbandonedAt)}` as Parameters<typeof t>[0])}
-          </span>
+          <div className="grid gap-1">
+            <span className="flex items-center gap-2">
+              {returnedTopup.status === "credited" ? <CheckCircle2 className="size-4 text-emerald-700" aria-hidden="true" /> : <Clock3 className="size-4 text-muted-foreground" aria-hidden="true" />}
+              {t(`marketWallet.status.${topupDisplayStatus(returnedTopup.status, undefined, !!returnedTopup.buyerAbandonedAt)}` as Parameters<typeof t>[0])}
+            </span>
+            {returnedFromCheckoutExit && !CLOSED_TOPUP_STATUS.has(returnedTopup.status) ? <span className="text-xs text-amber-700">{t("marketWallet.checkoutExitIsNotCancellation")}</span> : null}
+          </div>
           {returnedTopup.status === "credited" && returnPath ? (
             <Link href={returnPath} className="inline-flex min-h-11 items-center whitespace-nowrap font-medium text-primary underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring">
               {t("marketWallet.returnToMarket")}<ArrowUpRight className="ml-1 size-4" aria-hidden="true" />
@@ -585,8 +636,9 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
           <WalletActionButton
             label={busy === "topup" ? t("marketWallet.creating") : t("marketWallet.pay")}
             phase={busy === "topup" ? "loading" : error ? "error" : "default"}
-            disabled={!wallet.canTopup || !channels.length || parsedAmount == null || !!busy}
+            disabled={!loaded || !wallet.canTopup || !channels.length || parsedAmount == null || !!busy}
           />
+          {matchingUnsettled ? <p className="text-xs text-amber-700">{t("marketWallet.reviewRetryNotice")}</p> : null}
           {!channels.length ? <p className="text-xs text-muted-foreground">{t("marketWallet.noChannelHelp")}</p> : null}
         </form> : <div className="grid content-start gap-3 rounded-lg bg-muted/50 p-4 text-sm text-muted-foreground">
           <p>{t(wallet.mode === "enabled" ? "marketWallet.topupUnavailable" : "marketWallet.notOpen")}</p>
@@ -615,11 +667,19 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
               const activePayment = !abandoned && order.status === "pending"
                 && !["confirming", "paid", "expired", "canceled", "cancelled"].includes(gateway?.gatewayStatus ?? "");
               const countdown = activePayment ? topupAutoCheckCountdown(order.autoCloseAt, nowMs + serverOffsetMs) : null;
-              const gatewayDeadlineMs = deadline ? Date.parse(deadline) : NaN;
-              const gatewayDeadlinePassed = Number.isFinite(gatewayDeadlineMs)
-                && gatewayDeadlineMs <= nowMs + serverOffsetMs;
-              const checkoutUrl = gatewayDeadlinePassed ? null
-                : payableCheckoutUrl(order.status, order.checkoutUrl, gateway?.gatewayStatus ?? null, abandoned);
+              const checkoutUrl = verifiedPayableCheckoutUrl(order.status, order.checkoutUrl, gateway, abandoned, nowMs + serverOffsetMs);
+              const pendingVerification = order.status === "pending" && gateway
+                && !gateway.canPay && !gateway.canCancel && !gateway.canAbandon;
+              const canStopPayment = !abandoned && ["created", "creating", "create_unknown", "pending", "verifying", "review_required"].includes(order.status);
+              const recheckResultIsCurrent = order.buyerRecheckResult === order.status
+                || (order.status === "create_unknown" && order.buyerRecheckResult === "pending");
+              const lastGatewayLabel = order.lastGatewayStatus === "expired" ? t("marketWallet.status.expired")
+                : ["canceled", "cancelled"].includes(order.lastGatewayStatus ?? "") ? t("marketWallet.status.cancelled")
+                  : order.lastGatewayStatus === "paid" ? t("marketWallet.status.gateway_paid")
+                    : order.lastGatewayStatus === "confirming" ? t("marketWallet.status.verifying")
+                      : order.lastGatewayStatus === "pending" ? t("marketWallet.status.gateway_pending")
+                        : order.lastGatewayStatus === "awaiting_payment" ? t("marketWallet.status.awaiting_payment")
+                          : t("marketWallet.status.gateway_unknown");
               return <li key={order.id} className="flex min-w-0 flex-wrap items-center justify-between gap-2 rounded-md bg-muted/50 px-3 py-2 text-sm">
                 <div className="min-w-0">
                   <p className="font-medium tabular-nums">${(order.amountMinor / 100).toFixed(2)}</p>
@@ -632,24 +692,32 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
                   </p> : null}
                   {countdown?.phase === "soon" ? <p className="text-xs text-amber-700">{t("marketWallet.autoCheckSoon")}</p> : null}
                   {gateway?.gatewayStatus === "awaiting_payment" && order.status === "pending" && !abandoned ? <p className="text-xs text-muted-foreground">{t("marketWallet.awaitingMethodHelp")}</p> : null}
-                  {abandoned && order.status === "pending" ? <p className="text-xs text-muted-foreground">{t("marketWallet.abandonedHelp")}</p> : null}
-                  {order.status === "review_required" ? <p className="mt-1 text-xs text-amber-700">{t(order.reviewReason === "possible_payment" ? "marketWallet.reviewPossiblePayment" : "marketWallet.reviewHelp")}</p> : null}
+                  {pendingVerification && !abandoned ? <p className="text-xs text-amber-700">{t("marketWallet.pendingVerificationHelp")}</p> : null}
+                  {abandoned && !CLOSED_TOPUP_STATUS.has(order.status) ? <p className="text-xs text-muted-foreground">{t("marketWallet.abandonedHelp")}</p> : null}
+                  {order.status === "review_required" ? <p className="mt-1 text-xs text-amber-700">{t(order.reviewReason === "terminal_payment_marker" ? "marketWallet.reviewTerminalMarker" : order.reviewReason === "paid_receipt_invalid" ? "marketWallet.reviewInvalidReceipt" : "marketWallet.reviewHelp")}</p> : null}
+                  {order.buyerRecheckResult === "queued" ? <p role="status" className="mt-1 text-xs font-medium text-primary">{t("marketWallet.recheckQueued")}</p>
+                    : order.buyerRecheckResult === "retrying" ? <p role="status" className="mt-1 text-xs text-amber-700">{t("marketWallet.recheckRetrying")}</p>
+                      : order.buyerRecheckCompletedAt && order.buyerRecheckResult && recheckResultIsCurrent ? <p role="status" className="mt-1 text-xs text-muted-foreground">{t(`marketWallet.recheckResult.${order.buyerRecheckResult}` as Parameters<typeof t>[0], { time: dateText(order.buyerRecheckCompletedAt, locale) })}</p> : null}
+                  {order.lastGatewayCheckedAt ? <p className="text-xs text-muted-foreground">{t("marketWallet.lastGatewayCheck", { time: dateText(order.lastGatewayCheckedAt, locale), status: lastGatewayLabel })}</p> : null}
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="text-xs text-muted-foreground">{t(`marketWallet.status.${shownStatus}` as Parameters<typeof t>[0])}</span>
                   {order.status === "pending" ? <Button size="sm" variant="ghost" isIconOnly aria-label={t("marketWallet.refreshGatewayStatus")} isDisabled={statusBusyId === order.id || !!busy} onPress={() => void refreshGatewayStatus(order.id)}>
                     <RefreshCw className={`size-4 ${statusBusyId === order.id ? "animate-spin" : ""}`} aria-hidden="true" />
                   </Button> : null}
-                  {["pending", "review_required"].includes(order.status) ? <Button size="sm" variant="outline" isDisabled={!!busy || statusBusyId === order.id} onPress={() => void chooseCancelAction(order)}>
-                    <Ban className="size-4" aria-hidden="true" />{t("marketWallet.cancelTopup")}
+                  {order.status === "pending" && gateway?.canCancel ? <Button size="sm" variant="outline" isDisabled={!!busy || statusBusyId === order.id} onPress={() => void chooseCancelAction(order)}>
+                    <Ban className="size-4" aria-hidden="true" />{t("marketWallet.cancelPayment")}
                   </Button> : null}
-                  {(order.status === "review_required" || countdown?.phase === "checking" || (abandoned && order.status === "pending")) ? <Button size="sm" variant="outline" isDisabled={!!busy || statusBusyId === order.id} onPress={() => void requestRecheck(order.id)}>
+                  {canStopPayment && !(order.status === "pending" && gateway?.canCancel) ? <Button size="sm" variant="outline" isDisabled={!!busy || statusBusyId === order.id} onPress={() => setAbandonConfirmId(order.id)}>
+                    {t("marketWallet.abandonTopup")}
+                  </Button> : null}
+                  {(order.status === "review_required" || countdown?.phase === "checking" || pendingVerification || (abandoned && order.status === "pending") || order.buyerRecheckResult === "retrying") ? <Button size="sm" variant="outline" isDisabled={!!busy || statusBusyId === order.id} onPress={() => void requestRecheck(order.id)}>
                     <RefreshCw className={`size-4 ${statusBusyId === order.id ? "animate-spin" : ""}`} aria-hidden="true" />{t("marketWallet.recheck")}
                   </Button> : null}
-                  {checkoutUrl ? <a className="inline-flex min-h-11 items-center gap-1 whitespace-nowrap text-xs font-medium text-primary underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring" href={checkoutUrl} target="_blank" rel="noopener noreferrer">
+                  {checkoutUrl ? <a className="inline-flex min-h-11 items-center gap-1 whitespace-nowrap text-xs font-medium text-primary underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring" href={walletTopupCheckoutHref(order.id)} target="_blank" rel="noopener noreferrer">
                     {t("marketWallet.continuePay")}<ArrowUpRight className="size-3" aria-hidden="true" />
                   </a> : null}
-                  {wallet.canTopup && (["expired", "cancelled"].includes(order.status) || (abandoned && order.status === "pending")) ? <Button size="sm" variant="outline" isDisabled={!!busy} onPress={() => {
+                  {wallet.canTopup && ["expired", "cancelled"].includes(order.status) ? <Button size="sm" variant="outline" isDisabled={!!busy} onPress={() => {
                     idempotencyRef.current = null;
                     setAmount((order.amountMinor / 100).toFixed(2));
                     setAmountTouched(false);
@@ -683,6 +751,17 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
         </section>
       </div> : null}
       {wallet.hasWalletActivity ? <MarketWalletRefundPanel availableUnits={wallet.availableUnits} onSubmitted={reload} /> : null}
+      <ConfirmAlertDialog
+        open={reviewRetryConfirm}
+        title={t("marketWallet.reviewRetryTitle")}
+        description={t("marketWallet.reviewRetryWarning")}
+        confirmLabel={t("marketWallet.startSeparateTopup")}
+        cancelLabel={t("common.cancel")}
+        tone="warning"
+        busy={busy === "topup"}
+        onConfirm={() => void startTopup()}
+        onOpenChange={(open) => { if (busy !== "topup") setReviewRetryConfirm(open); }}
+      />
       <ConfirmAlertDialog
         open={!!cancelConfirmId}
         title={t("marketWallet.cancelPaymentTitle")}

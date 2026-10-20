@@ -244,6 +244,14 @@ const MIGRATIONS: &[(i64, &str)] = &[
         66,
         include_str!("../schema/0066_market_topup_buyer_abandon.sql"),
     ),
+    (
+        67,
+        include_str!("../schema/0067_market_topup_gateway_observations.sql"),
+    ),
+    (
+        68,
+        include_str!("../schema/0068_market_topup_check_progress.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -771,7 +779,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count baseline tables");
-        assert_eq!(table_count, 197);
+        assert_eq!(table_count, 198);
         let removed_client_recovery_table_count = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -3878,6 +3886,70 @@ mod tests {
         assert_eq!(migrated.0, "pending");
         assert!(migrated.1.ends_with("/ct_old"));
         assert!(migrated.2.is_none());
+        check_compatibility(&conn).unwrap();
+    }
+
+    #[test]
+    fn migration_67_adds_redacted_gateway_observations_without_rewriting_orders() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 66);
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM market_topup_orders", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        apply(&conn).unwrap();
+        let table_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'market_topup_gateway_observations')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM market_topup_orders", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(table_exists);
+        assert_eq!(after, before);
+        check_compatibility(&conn).unwrap();
+    }
+
+    #[test]
+    fn migration_68_adds_buyer_check_progress_without_rewriting_orders() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 67);
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM market_topup_orders", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        apply(&conn).unwrap();
+        let columns = conn
+            .prepare("PRAGMA table_info(market_topup_orders)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for expected in [
+            "buyer_recheck_requested_at",
+            "buyer_recheck_completed_at",
+            "buyer_recheck_result",
+        ] {
+            assert!(
+                columns.iter().any(|column| column == expected),
+                "{expected}"
+            );
+        }
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM market_topup_orders", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(after, before);
         check_compatibility(&conn).unwrap();
     }
 }

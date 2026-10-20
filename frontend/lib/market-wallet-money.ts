@@ -69,6 +69,36 @@ export function payableCheckoutUrl(status: string, raw: string | null, gatewaySt
   return safeCheckoutUrl(raw);
 }
 
+export function verifiedPayableCheckoutUrl(
+  status: string,
+  raw: string | null,
+  gateway: { gatewayStatus: string; canPay: boolean; selectionDeadline: string | null; expiresAt: string | null } | null | undefined,
+  abandoned = false,
+  nowMs = Date.now(),
+) {
+  if (!gateway?.canPay) return null;
+  const deadline = gateway.gatewayStatus === "awaiting_payment" ? gateway.selectionDeadline : gateway.expiresAt;
+  if (deadline) {
+    const deadlineMs = Date.parse(deadline);
+    if (!Number.isFinite(deadlineMs) || deadlineMs <= nowMs) return null;
+  }
+  return payableCheckoutUrl(status, raw, gateway.gatewayStatus, abandoned);
+}
+
+export function walletTopupCheckoutHref(orderId: string) {
+  return `/wallet-checkout/?topup=${encodeURIComponent(orderId)}`;
+}
+
+export function shouldResetTopupIdempotency(order: {
+  status: string;
+  checkoutUrl: string | null;
+  buyerAbandonedAt: string | null;
+}) {
+  return !!order.buyerAbandonedAt
+    || ["credited", "review_required", "expired", "cancelled", "verifying"].includes(order.status)
+    || (order.status === "pending" && !order.checkoutUrl);
+}
+
 export function topupDisplayStatus(status: string, gatewayStatus?: string | null, abandoned = false) {
   if (abandoned && status === "pending" && (!gatewayStatus || ["awaiting_payment", "pending"].includes(gatewayStatus))) return "buyer_abandoned";
   if (status !== "pending" || !gatewayStatus) return status;
