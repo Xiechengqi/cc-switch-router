@@ -204,7 +204,7 @@ export function MarketFinanceTopupRecoveryPanel({ onRecovered }: { onRecovered: 
       {topups.length ? <ul className="grid gap-2">
         {topups.map((item) => <li key={item.id} className="flex min-w-0 flex-wrap items-center justify-between gap-2 rounded-md border border-border px-3 py-2 text-sm">
           <div className="min-w-0">
-            <p className="font-medium">${(item.amountMinor / 100).toFixed(2)} · {statusLabel(item.status)}</p>
+            <p className="font-medium">${(item.amountMinor / 100).toFixed(2)} · {statusLabel(item.status)}{item.buyerAbandonedAt ? ` · ${t("settings.marketFinance.topupRecovery.buyerAbandoned")}` : ""}</p>
             <p className="break-all text-xs text-muted-foreground">{t("settings.marketFinance.topupRecovery.user")}: {item.userId}</p>
           </div>
           <Button size="sm" variant="outline" isDisabled={busy} onPress={() => select(item)}>
@@ -218,7 +218,7 @@ export function MarketFinanceTopupRecoveryPanel({ onRecovered }: { onRecovered: 
       </Button> : null}
       {selected ? <div className="grid gap-3 rounded-md bg-muted/50 p-3">
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <p className="text-sm font-semibold">${(selected.amountMinor / 100).toFixed(2)} · {statusLabel(selected.status)}</p>
+          <p className="text-sm font-semibold">${(selected.amountMinor / 100).toFixed(2)} · {statusLabel(selected.status)}{selected.buyerAbandonedAt ? ` · ${t("settings.marketFinance.topupRecovery.buyerAbandoned")}` : ""}</p>
           <Button size="sm" variant="ghost" isDisabled={busy} onPress={() => { setSelectedId(null); setPreview(null); }}>
             {t("settings.marketFinance.topupRecovery.close")}
           </Button>

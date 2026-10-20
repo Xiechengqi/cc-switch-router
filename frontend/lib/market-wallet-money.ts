@@ -64,12 +64,13 @@ export function safeCheckoutUrl(raw: string | null) {
 
 // Omitted status is only for a freshly created order; null means a history
 // lookup could not confirm that the checkout is still payable.
-export function payableCheckoutUrl(status: string, raw: string | null, gatewayStatus?: string | null) {
-  if (status !== "pending" || (gatewayStatus !== undefined && !["awaiting_payment", "pending"].includes(gatewayStatus ?? ""))) return null;
+export function payableCheckoutUrl(status: string, raw: string | null, gatewayStatus?: string | null, abandoned = false) {
+  if (abandoned || status !== "pending" || (gatewayStatus !== undefined && !["awaiting_payment", "pending"].includes(gatewayStatus ?? ""))) return null;
   return safeCheckoutUrl(raw);
 }
 
-export function topupDisplayStatus(status: string, gatewayStatus?: string | null) {
+export function topupDisplayStatus(status: string, gatewayStatus?: string | null, abandoned = false) {
+  if (abandoned && status === "pending" && (!gatewayStatus || ["awaiting_payment", "pending"].includes(gatewayStatus))) return "buyer_abandoned";
   if (status !== "pending" || !gatewayStatus) return status;
   if (gatewayStatus === "awaiting_payment") return "awaiting_payment";
   if (gatewayStatus === "pending") return "gateway_pending";
@@ -78,6 +79,24 @@ export function topupDisplayStatus(status: string, gatewayStatus?: string | null
   if (["canceled", "cancelled"].includes(gatewayStatus)) return "gateway_canceled";
   if (gatewayStatus === "expired") return "gateway_expired";
   return "gateway_unknown";
+}
+
+export function topupAutoCheckCountdown(autoCloseAt: string | null, nowMs: number) {
+  if (!autoCloseAt) return null;
+  const deadlineMs = Date.parse(autoCloseAt);
+  if (!Number.isFinite(deadlineMs) || !Number.isFinite(nowMs)) return null;
+  const remainingSeconds = Math.max(0, Math.ceil((deadlineMs - nowMs) / 1000));
+  return {
+    remainingSeconds,
+    phase: remainingSeconds === 0 ? "checking" as const
+      : remainingSeconds <= 300 ? "soon" as const : "active" as const,
+  };
+}
+
+export function formatTopupCountdown(seconds: number) {
+  const whole = Math.max(0, Math.floor(seconds));
+  const minutes = Math.floor(whole / 60);
+  return `${String(minutes).padStart(2, "0")}:${String(whole % 60).padStart(2, "0")}`;
 }
 
 export function safeMarketReturnPath(raw: string | null): string | null {

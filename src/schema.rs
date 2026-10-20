@@ -236,6 +236,14 @@ const MIGRATIONS: &[(i64, &str)] = &[
         64,
         include_str!("../schema/0064_market_topup_recovery_evidence.sql"),
     ),
+    (
+        65,
+        include_str!("../schema/0065_market_topup_auto_close.sql"),
+    ),
+    (
+        66,
+        include_str!("../schema/0066_market_topup_buyer_abandon.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -3775,6 +3783,101 @@ mod tests {
             [],
         )
         .unwrap();
+        check_compatibility(&conn).unwrap();
+    }
+
+    #[test]
+    fn migration_65_does_not_arm_existing_topups_for_automatic_cancellation() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 64);
+        conn.execute(
+            "INSERT INTO market_payment_channels
+             (id, gateway_kind, display_name, enabled, current_revision, created_at, updated_at)
+             VALUES ('channel', 'dujiaopay', 'Gateway', 1, 1, '2026-10-01', '2026-10-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO market_payment_channel_revisions
+             (channel_id, revision, merchant_id, merchant_fingerprint, api_key_id,
+              api_secret_ciphertext, api_secret_nonce, webhook_secret_ciphertext,
+              webhook_secret_nonce, key_version, verified_at, created_at)
+             VALUES ('channel', 1, 'merchant', 'fingerprint', 'key',
+                     'api-cipher', 'api-nonce', 'webhook-cipher', 'webhook-nonce',
+                     1, '2026-10-01', '2026-10-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO market_topup_orders
+             (id, user_id, channel_id, channel_revision, merchant_fingerprint,
+              merchant_order_id, idempotency_key, request_fingerprint, amount_minor,
+              status, created_at, updated_at)
+             VALUES ('old-order', 'buyer', 'channel', 1, 'fingerprint',
+                     'router-00000000000000000000000000000001', 'request-key',
+                     'channel:100', 100, 'pending', '2026-10-01', '2026-10-02')",
+            [],
+        )
+        .unwrap();
+
+        apply(&conn).unwrap();
+        let migrated: (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, auto_close_at FROM market_topup_orders WHERE id = 'old-order'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(migrated, ("pending".into(), None));
+        check_compatibility(&conn).unwrap();
+    }
+
+    #[test]
+    fn migration_66_preserves_existing_topups_without_marking_them_abandoned() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 65);
+        conn.execute(
+            "INSERT INTO market_payment_channels
+             (id, gateway_kind, display_name, enabled, current_revision, created_at, updated_at)
+             VALUES ('channel', 'dujiaopay', 'Gateway', 1, 1, '2026-10-01', '2026-10-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO market_payment_channel_revisions
+             (channel_id, revision, merchant_id, merchant_fingerprint, api_key_id,
+              api_secret_ciphertext, api_secret_nonce, webhook_secret_ciphertext,
+              webhook_secret_nonce, key_version, verified_at, created_at)
+             VALUES ('channel', 1, 'merchant', 'fingerprint', 'key',
+                     'api-cipher', 'api-nonce', 'webhook-cipher', 'webhook-nonce',
+                     1, '2026-10-01', '2026-10-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO market_topup_orders
+             (id, user_id, channel_id, channel_revision, merchant_fingerprint,
+              merchant_order_id, idempotency_key, request_fingerprint, amount_minor,
+              status, checkout_url, created_at, updated_at)
+             VALUES ('old-order', 'buyer', 'channel', 1, 'fingerprint',
+                     'router-00000000000000000000000000000001', 'request-key',
+                     'channel:100', 100, 'pending',
+                     'https://www.dujiaopay.com/checkout/ct_old', '2026-10-01', '2026-10-02')",
+            [],
+        )
+        .unwrap();
+        apply(&conn).unwrap();
+        let migrated: (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT status, checkout_url, buyer_abandoned_at
+                 FROM market_topup_orders WHERE id = 'old-order'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(migrated.0, "pending");
+        assert!(migrated.1.ends_with("/ct_old"));
+        assert!(migrated.2.is_none());
         check_compatibility(&conn).unwrap();
     }
 }

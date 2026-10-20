@@ -44,13 +44,18 @@ export type MarketWalletTopup = {
   status: string;
   checkoutUrl: string | null;
   createdAt: string;
+  autoCloseAt: string | null;
+  buyerAbandonedAt: string | null;
+  reviewReason: "possible_payment" | null;
 };
 
 export type MarketTopupGatewayStatus = {
   gatewayStatus: string;
   canCancel: boolean;
+  canAbandon: boolean;
   selectionDeadline: string | null;
   expiresAt: string | null;
+  serverNow: string;
 };
 
 export type MarketPaymentChannel = {
@@ -193,6 +198,7 @@ export type MarketFinanceTopup = {
   status: string;
   createdAt: string;
   updatedAt: string;
+  buyerAbandonedAt: string | null;
 };
 
 export type MarketFinanceTopupRecovery = {
@@ -360,9 +366,21 @@ export async function getMarketWalletTopupGatewayStatus(id: string) {
   );
 }
 
+export async function recheckMarketWalletTopup(id: string) {
+  return parseJson<{ queued: boolean }>(
+    await authFetch(`/v1/market-wallet/topups/${encodeURIComponent(id)}/recheck`, { method: "POST" }),
+  );
+}
+
 export async function cancelMarketWalletTopup(id: string) {
   return parseJson<MarketWalletTopup>(
     await authFetch(`/v1/market-wallet/topups/${encodeURIComponent(id)}/cancel`, { method: "POST" }),
+  );
+}
+
+export async function abandonMarketWalletTopup(id: string) {
+  return parseJson<MarketWalletTopup>(
+    await authFetch(`/v1/market-wallet/topups/${encodeURIComponent(id)}/abandon`, { method: "POST" }),
   );
 }
 

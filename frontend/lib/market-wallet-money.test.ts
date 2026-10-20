@@ -10,6 +10,8 @@ import {
   safeCheckoutUrl,
   safeMarketReturnPath,
   topupDisplayStatus,
+  topupAutoCheckCountdown,
+  formatTopupCountdown,
   walletTopupHref,
 } from "./market-wallet-money";
 
@@ -66,6 +68,8 @@ test("only a pending order exposes its checkout link", () => {
   assert.equal(payableCheckoutUrl("pending", url, "awaiting_payment"), url);
   assert.equal(payableCheckoutUrl("pending", url, "pending"), url);
   assert.equal(payableCheckoutUrl("pending", url, null), null);
+  assert.equal(payableCheckoutUrl("pending", url, "awaiting_payment", true), null);
+  assert.equal(payableCheckoutUrl("pending", url, "pending", true), null);
 });
 
 test("gateway payment states do not collapse to a cancelable local pending label", () => {
@@ -74,6 +78,20 @@ test("gateway payment states do not collapse to a cancelable local pending label
   assert.equal(topupDisplayStatus("pending", "confirming"), "gateway_confirming");
   assert.equal(topupDisplayStatus("pending", "canceled"), "gateway_canceled");
   assert.equal(topupDisplayStatus("review_required", "pending"), "review_required");
+  assert.equal(topupDisplayStatus("pending", "awaiting_payment", true), "buyer_abandoned");
+  assert.equal(topupDisplayStatus("pending", "paid", true), "gateway_paid");
+});
+
+test("auto-check countdown warns before the durable deadline without claiming closure", () => {
+  const deadline = "2026-10-20T00:30:00Z";
+  const start = Date.parse("2026-10-20T00:00:00Z");
+  assert.deepEqual(topupAutoCheckCountdown(deadline, start), { remainingSeconds: 1800, phase: "active" });
+  assert.deepEqual(topupAutoCheckCountdown(deadline, start + 25 * 60_000), { remainingSeconds: 300, phase: "soon" });
+  assert.deepEqual(topupAutoCheckCountdown(deadline, start + 30 * 60_000), { remainingSeconds: 0, phase: "checking" });
+  assert.equal(formatTopupCountdown(300), "05:00");
+  assert.equal(formatTopupCountdown(0), "00:00");
+  assert.equal(topupAutoCheckCountdown(null, start), null);
+  assert.equal(topupAutoCheckCountdown("invalid", start), null);
 });
 
 test("wallet recharge links preserve only local Market context", () => {
