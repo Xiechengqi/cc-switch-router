@@ -10,6 +10,7 @@ import {
   safeCheckoutUrl,
   safeMarketReturnPath,
   topupDisplayStatus,
+  topupCancelAction,
   topupAutoCheckCountdown,
   formatTopupCountdown,
   walletTopupHref,
@@ -80,6 +81,15 @@ test("gateway payment states do not collapse to a cancelable local pending label
   assert.equal(topupDisplayStatus("review_required", "pending"), "review_required");
   assert.equal(topupDisplayStatus("pending", "awaiting_payment", true), "buyer_abandoned");
   assert.equal(topupDisplayStatus("pending", "paid", true), "gateway_paid");
+});
+
+test("cancel action chooses a verified gateway cancel, local abandon, or an explanation", () => {
+  assert.equal(topupCancelAction("pending", { canCancel: true, canAbandon: false }), "gateway_cancel");
+  assert.equal(topupCancelAction("pending", { canCancel: false, canAbandon: true }), "abandon");
+  assert.equal(topupCancelAction("pending", { canCancel: false, canAbandon: true }, true), "unavailable");
+  assert.equal(topupCancelAction("pending", { canCancel: false, canAbandon: false }), "unavailable");
+  assert.equal(topupCancelAction("pending", null), "unavailable");
+  assert.equal(topupCancelAction("review_required", { canCancel: true, canAbandon: true }), "unavailable");
 });
 
 test("auto-check countdown warns before the durable deadline without claiming closure", () => {

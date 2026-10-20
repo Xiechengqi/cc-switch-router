@@ -81,6 +81,17 @@ export function topupDisplayStatus(status: string, gatewayStatus?: string | null
   return "gateway_unknown";
 }
 
+export function topupCancelAction(
+  status: string,
+  gateway: { canCancel: boolean; canAbandon: boolean } | null,
+  abandoned = false,
+): "gateway_cancel" | "abandon" | "unavailable" {
+  if (status !== "pending" || !gateway) return "unavailable";
+  if (gateway.canCancel) return "gateway_cancel";
+  if (gateway.canAbandon && !abandoned) return "abandon";
+  return "unavailable";
+}
+
 export function topupAutoCheckCountdown(autoCloseAt: string | null, nowMs: number) {
   if (!autoCloseAt) return null;
   const deadlineMs = Date.parse(autoCloseAt);
