@@ -8998,26 +8998,9 @@ async fn get_share_model_health_calendar(
 
 async fn get_client_online_calendar(
     State(state): State<ServerState>,
-    headers: HeaderMap,
     Path(installation_id): Path<String>,
     Query(query): Query<ClientOnlineCalendarQuery>,
 ) -> Result<Json<ClientOnlineCalendarResponse>, AppError> {
-    let viewer_email = extract_session_email(&state, &headers).await?;
-    let is_admin = {
-        let dynamic = state.dynamic.read().await;
-        viewer_email
-            .as_deref()
-            .is_some_and(|email| dynamic.is_admin(email))
-    };
-    if !state
-        .store
-        .can_view_client_online_calendar(&installation_id, viewer_email.as_deref(), is_admin)
-        .await?
-    {
-        return Err(AppError::NotFound(
-            "Client online calendar not found".into(),
-        ));
-    }
     let calendar = state
         .store
         .client_online_calendar(&installation_id, query.days.unwrap_or(365), Utc::now())

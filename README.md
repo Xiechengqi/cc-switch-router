@@ -6,12 +6,13 @@ TokenSwitch 的公共汇聚层。为 `cc-switch-server` 实例提供公网子域
 
 | Region | 24h usage |
 | --- | --- |
+| [free](https://freetokenswitch.cc) | ![free 24h](https://freetokenswitch.cc/v1/public/embed/global.svg?period=24h&theme=light) |
 | [japan](https://jptokenswitch.cc) | ![japan 24h](https://jptokenswitch.cc/v1/public/embed/global.svg?period=24h&theme=light) |
 | [singapore](https://sgptokenswitch.cc) | ![singapore 24h](https://sgptokenswitch.cc/v1/public/embed/global.svg?period=24h&theme=light) |
 | [hongkong](https://hktokenswitch.cc) | ![hongkong 24h](https://hktokenswitch.cc/v1/public/embed/global.svg?period=24h&theme=light) |
 | [usa](https://ustokenswitch.cc) | ![usa 24h](https://ustokenswitch.cc/v1/public/embed/global.svg?period=24h&theme=light) |
 
-同一份数据的 JSON 出口是 `GET /v1/public/usage/global?period=24h`（另有 `7d` / `30d`），给需要跨区域汇总的调用方使用 —— 例如官网把四个 Region 的 24h 用量相加并展开各模型。响应是纯聚合量：总量、输入/输出/缓存分项、逐模型明细、逐桶趋势、活跃 Share 与 Client 数，不含邮箱、Share、账号或金额。默认返回**全部**模型行；`?models=N` 才截断。跨区域汇总必须先合并再截断，否则每个 Region 的长尾模型会被静默丢掉，明细之和不再等于总量。
+同一份数据的 JSON 出口是 `GET /v1/public/usage/global?period=24h`（另有 `7d` / `30d`），给需要跨区域汇总的调用方使用 —— 例如官网把五个 Region 的 24h 用量相加并展开各模型。响应是纯聚合量：总量、输入/输出/缓存分项、逐模型明细、逐桶趋势、活跃 Share 与 Client 数，不含邮箱、Share、账号或金额。默认返回**全部**模型行；`?models=N` 才截断。跨区域汇总必须先合并再截断，否则每个 Region 的长尾模型会被静默丢掉，明细之和不再等于总量。
 
 - 架构与实现现状 → [ARCHITECTURE.md](ARCHITECTURE.md)
 - 与客户端的接口契约 → [PROTOCOL.md](PROTOCOL.md)
@@ -83,6 +84,7 @@ API 路由按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
 | `/v1/installations/*` | 12 | Ed25519 签名 / bearer | `register`、`heartbeat`、`audit-events/batch`、`setup-completed`、`report-status`、`client-tunnel`、`client-tunnel/claim`、`bind-owner-email` |
 | `/v1/server-logs/*` | 4 | 公开读 / 用户 Session / Router owner | `meta`、`events`、`export`、`clients/:installation_id/live-tail`；匿名只读最近 5 分钟公开投影，用户读取自有 Client，Router owner 读取全部 Client 并可按需拉取在线诊断 |
 | `/v1/clients/:installation_id/logs` | 1 | 公开读 / 已验证 Client owner | 从在线 Client 拉取脱敏进程日志；Client owner 最多 100 行，匿名、非 owner 用户和非 owner 管理员最多 10 行 |
+| `/v1/clients/:installation_id/online-calendar` | 1 | 公开读 | 仅返回 Clients 列表中已激活 Client 的按日在线率，匿名可查看 |
 | `/v1/chat/*` | 9 | 公开读 / Session 写 | `clients/:installation_id/room`、`rooms/:room_id/messages`、`rooms/:room_id/stream`；不存在 Share 独立房间 |
 | `/v1/markets*`、`/v1/market/*`、`/_market/proxy/*` | 退役 | 无 | 统一返回 `410 Gone`；不会创建旧 Market session、host 或 proxy |
 | `/v1/share-market/*` | 9 | 公开 catalog / 用户 Session | `listings`、`owned-shares`、`seats/:id/rent`、`subscriptions/:id/release`、`force-revoke`；停止挂售后无活跃租约可再次 `POST listings` |

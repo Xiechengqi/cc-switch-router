@@ -14156,120 +14156,6 @@ impl AppStore {
         Ok(())
     }
 
-    pub async fn can_view_client_online_calendar(
-        &self,
-        installation_id: &str,
-        viewer_email: Option<&str>,
-        is_admin: bool,
-    ) -> Result<bool, AppError> {
-        if is_admin {
-            return Ok(self.installation_exists(installation_id).await?);
-        }
-        let Some(viewer_email) = viewer_email
-            .map(str::trim)
-            .filter(|email| !email.is_empty())
-        else {
-            return Ok(false);
-        };
-        let conn = self.conn.lock().await;
-        let owns_installation = conn
-            .query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM installations
-                    WHERE id = ?1
-                      AND owner_email IS NOT NULL
-                      AND LOWER(TRIM(owner_email)) = LOWER(?2)
-                      AND owner_verified_at IS NOT NULL
-                 )",
-                params![installation_id, viewer_email],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(|error| {
-                AppError::Internal(format!("read Client online calendar owner failed: {error}"))
-            })?;
-        if owns_installation != 0 {
-            return Ok(true);
-        }
-        let owns_tunnel = conn
-            .query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM installation_client_tunnels
-                    WHERE installation_id = ?1
-                      AND LOWER(TRIM(owner_email)) = LOWER(?2)
-                 )",
-                params![installation_id, viewer_email],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(|error| {
-                AppError::Internal(format!(
-                    "read Client online calendar tunnel failed: {error}"
-                ))
-            })?;
-        if owns_tunnel != 0 {
-            return Ok(true);
-        }
-        let shares_exist = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM shares WHERE installation_id = ?1)",
-                params![installation_id],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(|error| {
-                AppError::Internal(format!(
-                    "read Client online calendar shares failed: {error}"
-                ))
-            })?;
-        if shares_exist == 0 {
-            return Ok(false);
-        }
-        let now_ms = Utc::now().timestamp_millis();
-        let mut statement = conn
-            .prepare(
-                "SELECT COALESCE(owner_email, ''), COALESCE(user_grants_json, '{}')
-                 FROM shares WHERE installation_id = ?1",
-            )
-            .map_err(|error| {
-                AppError::Internal(format!(
-                    "prepare Client online calendar grants failed: {error}"
-                ))
-            })?;
-        let rows = statement
-            .query_map(params![installation_id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|error| {
-                AppError::Internal(format!(
-                    "query Client online calendar grants failed: {error}"
-                ))
-            })?;
-        for row in rows {
-            let (owner_email, grants_json) = row.map_err(|error| {
-                AppError::Internal(format!("read Client online calendar grant failed: {error}"))
-            })?;
-            let grants = parse_share_user_grants(Some(grants_json)).map_err(|error| {
-                AppError::Internal(format!(
-                    "parse Client online calendar grants failed: {error}"
-                ))
-            })?;
-            if owner_email.eq_ignore_ascii_case(viewer_email) {
-                return Ok(true);
-            }
-            if grants.iter().any(|(email, grant)| {
-                grant.active
-                    && grant.role == "shareto"
-                    && grant
-                        .policy
-                        .expires_at
-                        .is_none_or(|expires_at| expires_at > now_ms)
-                    && (email.eq_ignore_ascii_case(viewer_email)
-                        || grant.email.eq_ignore_ascii_case(viewer_email))
-            }) {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
     pub async fn client_online_calendar(
         &self,
         installation_id: &str,
@@ -14284,7 +14170,11 @@ impl AppStore {
         let conn = self.conn.lock().await;
         let created_at = conn
             .query_row(
-                "SELECT created_at FROM installations WHERE id = ?1",
+                // Keep anonymous calendar visibility aligned with the public Clients list.
+                "SELECT created_at FROM installations
+                 WHERE id = ?1
+                   AND lifecycle = 'active'
+                   AND client_activated_at IS NOT NULL",
                 params![installation_id],
                 |row| row.get::<_, String>(0),
             )
@@ -14405,17 +14295,6 @@ impl AppStore {
             end_date: end_day,
             days: calendar_days,
         }))
-    }
-
-    async fn installation_exists(&self, installation_id: &str) -> Result<bool, AppError> {
-        let conn = self.conn.lock().await;
-        conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM installations WHERE id = ?1)",
-            params![installation_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .map(|value| value != 0)
-        .map_err(|error| AppError::Internal(format!("read installation existence failed: {error}")))
     }
 
     pub async fn record_share_model_health_check(
@@ -51723,24 +51602,52 @@ mod tests {
         assert_eq!(today.observed_minutes, 1);
         assert_eq!(today.online_minutes, 1);
         assert_eq!(today.online_rate, Some(100.0));
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn client_online_calendar_matches_public_dashboard_client_visibility() {
+        let (store, config) = setup_store("client-online-calendar-public-visibility").await;
+        for installation_id in ["inst-public", "inst-unactivated", "inst-fenced"] {
+            insert_installation(&store, installation_id).await;
+        }
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE installations SET owner_verified_at = NULL WHERE id = 'inst-public'",
+                [],
+            )
+            .expect("public Client does not need a verified owner");
+            conn.execute(
+                "UPDATE installations SET client_activated_at = NULL WHERE id = 'inst-unactivated'",
+                [],
+            )
+            .expect("hide unactivated Client");
+            conn.execute(
+                "UPDATE installations SET lifecycle = 'fenced' WHERE id = 'inst-fenced'",
+                [],
+            )
+            .expect("hide fenced Client");
+        }
+
+        let now = Utc::now();
         assert!(
             store
-                .can_view_client_online_calendar("inst-online", Some("owner@example.com"), false)
+                .client_online_calendar("inst-public", 1, now)
                 .await
-                .expect("owner can view")
+                .expect("public calendar query")
+                .is_some()
         );
-        assert!(
-            !store
-                .can_view_client_online_calendar("inst-online", Some("stranger@example.com"), false)
-                .await
-                .expect("stranger cannot view")
-        );
-        assert!(
-            store
-                .can_view_client_online_calendar("inst-online", Some("stranger@example.com"), true)
-                .await
-                .expect("admin can view")
-        );
+        for installation_id in ["inst-unactivated", "inst-fenced", "inst-missing"] {
+            assert!(
+                store
+                    .client_online_calendar(installation_id, 1, now)
+                    .await
+                    .expect("hidden calendar query")
+                    .is_none()
+            );
+        }
 
         let _ = std::fs::remove_file(&config.database.path);
     }
