@@ -58,6 +58,9 @@ export type MarketWalletTopup = {
 export type MarketTopupGatewayStatus = {
   gatewayStatus: string;
   canPay: boolean;
+  payabilityReason?: "payable" | "buyer_stopped" | "cancel_pending" | "order_changed"
+    | "gateway_closed" | "payment_processing" | "gateway_unknown" | "payment_evidence"
+    | "deadline_passed" | "checkout_unavailable";
   canCancel: boolean;
   canAbandon: boolean;
   selectionDeadline: string | null;

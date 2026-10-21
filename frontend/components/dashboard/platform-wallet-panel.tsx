@@ -32,7 +32,7 @@ import {
   type MarketTopupGatewayStatus,
   type MarketWalletTransaction,
 } from "@/lib/market-wallet-api";
-import { formatTopupCountdown, formatWalletUnits, formatWalletUnitsAsCny, parseUsdMinor, payableCheckoutUrl, safeMarketReturnPath, shouldResetTopupIdempotency, topupAutoCheckCountdown, topupCancelAction, topupDisplayStatus, verifiedPayableCheckoutUrl, walletTopupCheckoutHref } from "@/lib/market-wallet-money";
+import { formatTopupCountdown, formatWalletUnits, formatWalletUnitsAsCny, parseUsdMinor, safeMarketReturnPath, shouldResetTopupIdempotency, topupAutoCheckCountdown, topupCancelAction, topupDisplayStatus, verifiedPayableCheckoutUrl, walletTopupCheckoutHref } from "@/lib/market-wallet-money";
 
 const CLOSED_TOPUP_STATUS = new Set(["credited", "expired", "cancelled"]);
 
@@ -335,46 +335,29 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
           // A blocked storage API must not block payment.
         }
       }
-      const checkoutUrl = payableCheckoutUrl(order.status, order.checkoutUrl, undefined, !!order.buyerAbandonedAt);
-      if (checkoutUrl) {
-        try {
-          const gateway = await getMarketWalletTopupGatewayStatus(order.id);
-          setGatewayStatuses((current) => ({ ...current, [order.id]: gateway }));
-          const offset = Date.parse(gateway.serverNow) - Date.now();
-          if (Number.isFinite(offset)) setServerOffsetMs(offset);
-          const verifiedCheckout = verifiedPayableCheckoutUrl(order.status, checkoutUrl, gateway, !!order.buyerAbandonedAt, Date.now() + (Number.isFinite(offset) ? offset : 0));
-          if (!verifiedCheckout) {
-            closePaymentWindow(paymentWindow);
-            setNotice(t("marketWallet.paymentNoLongerOpen"));
-            void reload().catch(() => {});
-            return;
-          }
-          const localCheckout = walletTopupCheckoutHref(order.id);
-          if (!paymentWindow || paymentWindow.closed) {
-            setCheckoutFallbackUrl(localCheckout);
-          } else {
-            try {
-              paymentWindow.location.replace(localCheckout);
-              setNotice(t("marketWallet.openedPaymentTab"));
-            } catch {
-              closePaymentWindow(paymentWindow);
-              setCheckoutFallbackUrl(localCheckout);
-            }
-          }
-        } catch {
-          closePaymentWindow(paymentWindow);
-          setError(t("marketWallet.checkoutPending"));
-          void reload().catch(() => {});
-        }
-      } else if (order.buyerAbandonedAt) {
+      if (order.buyerAbandonedAt) {
         closePaymentWindow(paymentWindow);
         idempotencyRef.current = null;
         setNotice(t("marketWallet.abandonedHelp"));
-      } else if (order.status !== "credited") {
+      } else if (order.status === "credited") {
         closePaymentWindow(paymentWindow);
-        setError(t(order.status === "review_required" ? "marketWallet.reviewHelp" : "marketWallet.checkoutPending"));
+        void reload().catch(() => {});
       } else {
-        closePaymentWindow(paymentWindow);
+        // The same-origin checkout page owns the one fresh gateway preflight.
+        // Do not close a newly opened tab merely because payment is unavailable:
+        // it must show the buyer why the existing order cannot be paid.
+        const localCheckout = walletTopupCheckoutHref(order.id);
+        if (!paymentWindow || paymentWindow.closed) {
+          setCheckoutFallbackUrl(localCheckout);
+        } else {
+          try {
+            paymentWindow.location.replace(localCheckout);
+            setNotice(t("marketWallet.openedPaymentTab"));
+          } catch {
+            closePaymentWindow(paymentWindow);
+            setCheckoutFallbackUrl(localCheckout);
+          }
+        }
       }
     } catch (cause) {
       closePaymentWindow(paymentWindow);
@@ -660,6 +643,9 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
                 ? "gateway_checking"
                 : order.status === "pending" && gateway === null
                   ? "gateway_unavailable"
+                  : order.status === "pending" && gateway && !gateway.canPay
+                    && ["awaiting_payment", "pending"].includes(gateway.gatewayStatus)
+                    ? "payment_unavailable"
                   : topupDisplayStatus(order.status, gateway?.gatewayStatus, abandoned);
               const deadline = gateway?.gatewayStatus === "awaiting_payment"
                 ? gateway.selectionDeadline
@@ -691,8 +677,8 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
                       : t("marketWallet.autoCheckCountdown", { time: formatTopupCountdown(countdown.remainingSeconds) })}
                   </p> : null}
                   {countdown?.phase === "soon" ? <p className="text-xs text-amber-700">{t("marketWallet.autoCheckSoon")}</p> : null}
-                  {gateway?.gatewayStatus === "awaiting_payment" && order.status === "pending" && !abandoned ? <p className="text-xs text-muted-foreground">{t("marketWallet.awaitingMethodHelp")}</p> : null}
-                  {pendingVerification && !abandoned ? <p className="text-xs text-amber-700">{t("marketWallet.pendingVerificationHelp")}</p> : null}
+                  {gateway?.gatewayStatus === "awaiting_payment" && gateway.canPay && order.status === "pending" && !abandoned ? <p className="text-xs text-muted-foreground">{t("marketWallet.awaitingMethodHelp")}</p> : null}
+                  {order.status === "pending" && gateway && !gateway.canPay && !abandoned ? <p className="text-xs text-amber-700">{t(`marketWallet.payability.${gateway.payabilityReason ?? "gateway_unknown"}` as Parameters<typeof t>[0])}</p> : null}
                   {abandoned && !CLOSED_TOPUP_STATUS.has(order.status) ? <p className="text-xs text-muted-foreground">{t("marketWallet.abandonedHelp")}</p> : null}
                   {order.status === "review_required" ? <p className="mt-1 text-xs text-amber-700">{t(order.reviewReason === "terminal_payment_marker" ? "marketWallet.reviewTerminalMarker" : order.reviewReason === "paid_receipt_invalid" ? "marketWallet.reviewInvalidReceipt" : "marketWallet.reviewHelp")}</p> : null}
                   {order.buyerRecheckResult === "queued" ? <p role="status" className="mt-1 text-xs font-medium text-primary">{t("marketWallet.recheckQueued")}</p>

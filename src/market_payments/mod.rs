@@ -2276,6 +2276,55 @@ fn can_pay_gateway_topup(
         .is_none_or(|value| chrono::DateTime::parse_from_rfc3339(value).is_ok_and(|end| end > time))
 }
 
+fn topup_payability_reason(
+    local_status: &str,
+    gateway: &GatewayOrder,
+    assessment: &RecoveryAssessment,
+    abandoned: bool,
+    cancel_requested: bool,
+    has_checkout: bool,
+    time: chrono::DateTime<Utc>,
+) -> &'static str {
+    if local_status != "pending" {
+        return "order_changed";
+    }
+    if matches!(
+        gateway.status.as_str(),
+        "expired" | "canceled" | "cancelled"
+    ) {
+        return "gateway_closed";
+    }
+    if matches!(gateway.status.as_str(), "confirming" | "paid") {
+        return "payment_processing";
+    }
+    if !matches!(gateway.status.as_str(), "awaiting_payment" | "pending") {
+        return "gateway_unknown";
+    }
+    if assessment.blockers.as_slice() != ["gateway_not_terminal"] {
+        return "payment_evidence";
+    }
+    if abandoned {
+        return "buyer_stopped";
+    }
+    if cancel_requested {
+        return "cancel_pending";
+    }
+    if !can_pay_gateway_topup(
+        local_status,
+        gateway,
+        assessment,
+        abandoned,
+        cancel_requested,
+        time,
+    ) {
+        return "deadline_passed";
+    }
+    if !has_checkout {
+        return "checkout_unavailable";
+    }
+    "payable"
+}
+
 fn gateway_cancel_was_requested_tx(conn: &Connection, order_id: &str) -> Result<bool, AppError> {
     conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM market_finance_audit_events
@@ -3222,6 +3271,7 @@ fn topup_buyer_abandoned_tx(conn: &Connection, order_id: &str) -> Result<bool, A
 struct TopupGatewayStatusView {
     gateway_status: String,
     can_pay: bool,
+    payability_reason: &'static str,
     can_cancel: bool,
     can_abandon: bool,
     selection_deadline: Option<String>,
@@ -3257,7 +3307,7 @@ async fn get_topup_gateway_status(
         &snapshot.gateway_order_id,
     )
     .await?;
-    let (can_pay, can_cancel, can_abandon) = {
+    let (payability_reason, can_cancel, can_abandon) = {
         let conn = state.store.conn.lock().await;
         let current = cancel_topup_snapshot_tx(&conn, &order_id, Some(&session.user_id))?;
         validate_gateway_identity_tx(
@@ -3272,13 +3322,17 @@ async fn get_topup_gateway_status(
         let assessment = recovery_assessment_tx(&conn, &order_id, &current.status, &gateway)?;
         let abandoned = topup_buyer_abandoned_tx(&conn, &order_id)?;
         let cancel_requested = gateway_cancel_was_requested_tx(&conn, &order_id)?;
+        let has_checkout = read_topup(&conn, &order_id, &session.user_id)?
+            .checkout_url
+            .is_some();
         (
-            can_pay_gateway_topup(
+            topup_payability_reason(
                 &current.status,
                 &gateway,
                 &assessment,
                 abandoned,
                 cancel_requested,
+                has_checkout,
                 Utc::now(),
             ),
             can_cancel_gateway_topup(&current.status, &gateway.status, &assessment, false)
@@ -3294,7 +3348,8 @@ async fn get_topup_gateway_status(
         no_store(),
         Json(TopupGatewayStatusView {
             gateway_status: gateway.status,
-            can_pay,
+            can_pay: payability_reason == "payable",
+            payability_reason,
             can_cancel,
             can_abandon,
             selection_deadline: gateway.selection_deadline,
@@ -4689,6 +4744,168 @@ fn benign_progress_review_case_tx(
     .map_err(db_error("check benign created-event review"))
 }
 
+fn chain_only_observation_hash(
+    status: &str,
+    rule_version: Option<i64>,
+    confirmations: Option<i64>,
+) -> String {
+    let mut evidence = serde_json::json!({
+        "status": status,
+        "paidSource": "chain",
+        "txId": null,
+        "paidAt": null,
+        "confirmations": confirmations,
+        "settledAmount": null,
+    });
+    if let Some(version) = rule_version {
+        evidence["evidenceRuleVersion"] = serde_json::json!(version);
+    }
+    hex::encode(Sha256::digest(evidence.to_string().as_bytes()))
+}
+
+fn historical_chain_only_observations_tx(
+    conn: &Connection,
+    order_id: &str,
+) -> Result<bool, AppError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT source, gateway_status, evidence_flags_json, evidence_sha256
+                  FROM market_topup_gateway_observations WHERE order_id = ?1",
+        )
+        .map_err(db_error("prepare historic top-up observations"))?;
+    let rows = statement
+        .query_map(params![order_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(db_error("query historic top-up observations"))?;
+    let mut saw_legacy_marker = false;
+    for row in rows {
+        let (source, status, flags_json, digest) =
+            row.map_err(db_error("read historic top-up observation"))?;
+        // Owner previews can record an unbound gateway response during an
+        // identity-mismatch dry run. Only normal bound data-plane observations
+        // may support automatic release of an old review hold.
+        if !matches!(source.as_str(), "reconcile" | "webhook")
+            || !matches!(
+                status.as_str(),
+                "awaiting_payment" | "pending" | "expired" | "canceled" | "cancelled"
+            )
+        {
+            return Ok(false);
+        }
+        let Ok(flags): Result<Vec<String>, _> = serde_json::from_str(&flags_json) else {
+            return Ok(false);
+        };
+        let version = if flags == ["gateway_paid_source"] {
+            saw_legacy_marker = true;
+            None
+        } else if flags.is_empty() {
+            Some(2)
+        } else {
+            return Ok(false);
+        };
+        if ![None, Some(0)].into_iter().any(|confirmations| {
+            chain_only_observation_hash(&status, version, confirmations) == digest
+        }) {
+            return Ok(false);
+        }
+    }
+    Ok(saw_legacy_marker)
+}
+
+fn recover_benign_chain_metadata_review_tx(
+    conn: &Connection,
+    order_id: &str,
+    gateway: &GatewayOrder,
+    status: &str,
+    time: &str,
+) -> Result<bool, AppError> {
+    if !matches!(status, "expired" | "cancelled") || !unpaid_chain_rail_marker(gateway) {
+        return Ok(false);
+    }
+    let current: String = conn
+        .query_row(
+            "SELECT status FROM market_topup_orders WHERE id = ?1",
+            params![order_id],
+            |row| row.get(0),
+        )
+        .map_err(db_error("read historic top-up review status"))?;
+    if current != "review_required" {
+        return Ok(false);
+    }
+    let mut cases = conn
+        .prepare(
+            "SELECT id, code, COALESCE(detail_code, ''), status
+                  FROM market_finance_reconciliation_cases
+                  WHERE object_kind = 'topup' AND object_id = ?1",
+        )
+        .map_err(db_error("prepare historic top-up review case"))?;
+    let cases = cases
+        .query_map(params![order_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(db_error("query historic top-up review case"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_error("read historic top-up review case"))?;
+    let [(case_id, code, detail, case_status)] = cases.as_slice() else {
+        return Ok(false);
+    };
+    if code != "topup_verification_failed"
+        || detail != "gateway_terminal_payment_evidence"
+        || case_status != "open"
+        || !historical_chain_only_observations_tx(conn, order_id)?
+    {
+        return Ok(false);
+    }
+    let assessment = recovery_assessment_tx(conn, order_id, &current, gateway)?;
+    if !assessment.can_recover()
+        || assessment.open_case_ids.len() != 1
+        || assessment.open_case_ids[0] != *case_id
+    {
+        return Ok(false);
+    }
+    let changed = conn
+        .execute(
+            "UPDATE market_topup_orders SET status = ?2, checkout_url = NULL,
+             updated_at = ?3 WHERE id = ?1 AND status = 'review_required'",
+            params![order_id, status, time],
+        )
+        .map_err(db_error("recover benign chain metadata review"))?;
+    if changed != 1 {
+        return Err(AppError::Conflict(
+            "top-up changed during benign metadata recovery".into(),
+        ));
+    }
+    crate::market_reconcile::resolve_case_tx(
+        conn,
+        case_id,
+        "system",
+        "verified_chain_rail_metadata",
+        time,
+    )?;
+    audit_tx(
+        conn,
+        "system",
+        "topup_chain_metadata_review_recovered",
+        "topup",
+        order_id,
+        Some("verified_chain_rail_metadata"),
+        time,
+    )?;
+    finish_buyer_recheck_from_order_tx(conn, order_id)?;
+    Ok(true)
+}
+
 fn apply_verified_unpaid_status_tx(
     conn: &Connection,
     order_id: &str,
@@ -4760,6 +4977,10 @@ fn record_gateway_observation_tx(
     let flags_json = serde_json::to_string(&flags)
         .map_err(|_| AppError::Internal("encode redacted gateway observation failed".into()))?;
     let fingerprint = serde_json::json!({
+        // Evidence classification changed after a live merchant response
+        // showed paid_source=chain on an unpaid awaiting_payment order. Keep
+        // the original observation immutable and write a new v2 observation.
+        "evidenceRuleVersion": 2,
         "status": gateway.status,
         "paidSource": gateway.paid_source,
         "txId": gateway.tx_id,
@@ -4798,7 +5019,7 @@ fn gateway_recovery_blockers(gateway: &GatewayOrder) -> Vec<&'static str> {
     ) {
         blockers.push("gateway_not_terminal");
     }
-    if gateway.paid_source.is_some() {
+    if gateway.paid_source.is_some() && !unpaid_chain_rail_marker(gateway) {
         blockers.push("gateway_paid_source");
     }
     if gateway.tx_id.is_some() {
@@ -4816,6 +5037,26 @@ fn gateway_recovery_blockers(gateway: &GatewayOrder) -> Vec<&'static str> {
         blockers.push("gateway_settled_amount");
     }
     blockers
+}
+
+fn unpaid_chain_rail_marker(gateway: &GatewayOrder) -> bool {
+    // An authenticated DujiaoPay merchant response contains paid_source=chain
+    // even for awaiting_payment and expired orders with no transfer. Treat
+    // that exact value as rail metadata only in known unpaid lifecycle states.
+    // Every other source and every independent payment clue still blocks an
+    // unpaid conclusion; paid orders retain the strict chain receipt gate.
+    gateway.paid_source.as_deref() == Some("chain")
+        && matches!(
+            gateway.status.as_str(),
+            "awaiting_payment" | "pending" | "expired" | "canceled" | "cancelled"
+        )
+        && gateway.tx_id.is_none()
+        && gateway.paid_at.is_none()
+        && gateway.confirmations.unwrap_or(0) == 0
+        && gateway
+            .settled_amount
+            .as_deref()
+            .is_none_or(exact_decimal_zero)
 }
 
 fn gateway_terminal_without_payment_evidence(gateway: &GatewayOrder) -> bool {
@@ -5628,7 +5869,17 @@ async fn reconcile_one_topup(state: &ServerState, pending: PendingTopup) -> Resu
                     &now(),
                 )?;
             }
-            Ok(status) => apply_verified_unpaid_status_tx(&tx, &pending.id, status, &now())?,
+            Ok(status) => {
+                if !recover_benign_chain_metadata_review_tx(
+                    &tx,
+                    &pending.id,
+                    &gateway,
+                    status,
+                    &now(),
+                )? {
+                    apply_verified_unpaid_status_tx(&tx, &pending.id, status, &now())?;
+                }
+            }
             Err(AppError::Conflict(_)) => {
                 hold_topup_verification_failure_tx(
                     &tx,
@@ -9617,6 +9868,197 @@ mod tests {
         assert!(!can_pay_gateway_topup(
             "pending", &gateway, &disputed, false, false, time
         ));
+    }
+
+    #[test]
+    fn live_unpaid_chain_source_is_rail_metadata_but_other_payment_clues_still_block() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        let merchant_order_id = "router-00000000000000000000000000000001";
+        fixture_topup(&conn, "order-1", merchant_order_id, "pending", 1);
+        let mut gateway = unpaid_order(merchant_order_id, "awaiting_payment");
+        gateway.paid_source = Some("chain".into());
+        gateway.confirmations = Some(0);
+        let assessment = recovery_assessment_tx(&conn, "order-1", "pending", &gateway).unwrap();
+        assert_eq!(assessment.blockers, ["gateway_not_terminal"]);
+        assert_eq!(
+            topup_payability_reason(
+                "pending",
+                &gateway,
+                &assessment,
+                false,
+                false,
+                true,
+                Utc::now()
+            ),
+            "payable"
+        );
+        assert_eq!(
+            topup_payability_reason(
+                "pending",
+                &gateway,
+                &assessment,
+                false,
+                false,
+                false,
+                Utc::now()
+            ),
+            "checkout_unavailable"
+        );
+        gateway.status = "expired".into();
+        assert!(gateway_terminal_without_payment_evidence(&gateway));
+        gateway.status = "awaiting_payment".into();
+        gateway.paid_source = Some("merchant_claim".into());
+        assert!(gateway_recovery_blockers(&gateway).contains(&"gateway_paid_source"));
+        gateway.paid_source = Some("chain".into());
+        gateway.tx_id = Some("possible-transfer".into());
+        let blockers = gateway_recovery_blockers(&gateway);
+        assert!(blockers.contains(&"gateway_paid_source"));
+        assert!(blockers.contains(&"gateway_transaction"));
+        gateway.tx_id = None;
+        gateway.status = "confirming".into();
+        assert!(gateway_recovery_blockers(&gateway).contains(&"gateway_paid_source"));
+        let processing = recovery_assessment_tx(&conn, "order-1", "pending", &gateway).unwrap();
+        assert_eq!(
+            topup_payability_reason(
+                "pending",
+                &gateway,
+                &processing,
+                false,
+                true,
+                true,
+                Utc::now()
+            ),
+            "payment_processing"
+        );
+        gateway.status = "expired".into();
+        let closed = recovery_assessment_tx(&conn, "order-1", "pending", &gateway).unwrap();
+        assert_eq!(
+            topup_payability_reason("pending", &gateway, &closed, false, true, true, Utc::now()),
+            "gateway_closed"
+        );
+    }
+
+    #[test]
+    fn only_digest_proven_historical_chain_metadata_review_auto_recovers() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        let merchant_order_id = "router-00000000000000000000000000000001";
+        fixture_topup(&conn, "order-1", merchant_order_id, "review_required", 1);
+        open_reconciliation_case_detail_tx(
+            &conn,
+            "topup_verification_failed",
+            "topup",
+            "order-1",
+            Some("gateway_terminal_payment_evidence"),
+            &now(),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO market_topup_gateway_observations
+             (id, order_id, source, gateway_status, evidence_flags_json, evidence_sha256,
+              first_observed_at, last_observed_at)
+             VALUES ('old-observation', 'order-1', 'reconcile', 'awaiting_payment',
+                     '[\"gateway_paid_source\"]', ?1, ?2, ?2)",
+            params![
+                chain_only_observation_hash("awaiting_payment", None, Some(0)),
+                now()
+            ],
+        )
+        .unwrap();
+        let mut gateway = unpaid_order(merchant_order_id, "expired");
+        gateway.paid_source = Some("chain".into());
+        gateway.confirmations = Some(0);
+        record_gateway_observation_tx(&conn, "order-1", "reconcile", &gateway, &now()).unwrap();
+        assert!(
+            recover_benign_chain_metadata_review_tx(&conn, "order-1", &gateway, "expired", &now(),)
+                .unwrap()
+        );
+        assert_eq!(
+            read_topup(&conn, "order-1", "buyer").unwrap().status,
+            "expired"
+        );
+        let open_cases: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM market_finance_reconciliation_cases
+             WHERE object_id = 'order-1' AND status = 'open'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(open_cases, 0);
+        assert_eq!(wallet_snapshot_tx(&conn, "buyer").unwrap().posted_units, 0);
+        assert!(!recover_benign_chain_metadata_review_tx(
+            &conn, "order-1", &gateway, "expired", &now(),
+        ).unwrap());
+    }
+
+    #[test]
+    fn historical_review_with_unexplained_or_unbound_evidence_keeps_its_hold() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        let merchant_order_id = "router-00000000000000000000000000000001";
+        fixture_topup(&conn, "order-1", merchant_order_id, "review_required", 1);
+        open_reconciliation_case_detail_tx(
+            &conn,
+            "topup_verification_failed",
+            "topup",
+            "order-1",
+            Some("gateway_terminal_payment_evidence"),
+            &now(),
+        )
+        .unwrap();
+        let unexplained_digest = hex::encode(Sha256::digest(
+            serde_json::json!({
+                "status": "expired", "paidSource": "merchant_claim", "txId": null,
+                "paidAt": null, "confirmations": 0, "settledAmount": null,
+            })
+            .to_string()
+            .as_bytes(),
+        ));
+        conn.execute(
+            "INSERT INTO market_topup_gateway_observations
+             (id, order_id, source, gateway_status, evidence_flags_json, evidence_sha256,
+              first_observed_at, last_observed_at)
+             VALUES ('old-observation', 'order-1', 'reconcile', 'expired',
+                     '[\"gateway_paid_source\"]', ?1, ?2, ?2)",
+            params![unexplained_digest, now()],
+        )
+        .unwrap();
+        let mut gateway = unpaid_order(merchant_order_id, "expired");
+        gateway.paid_source = Some("chain".into());
+        gateway.confirmations = Some(0);
+        assert!(!recover_benign_chain_metadata_review_tx(
+            &conn, "order-1", &gateway, "expired", &now(),
+        ).unwrap());
+        gateway.tx_id = Some("possible-transfer".into());
+        assert!(!recover_benign_chain_metadata_review_tx(
+            &conn, "order-1", &gateway, "expired", &now(),
+        ).unwrap());
+        gateway.tx_id = None;
+        conn.execute(
+            "UPDATE market_topup_gateway_observations
+             SET source = 'owner_review', evidence_sha256 = ?1 WHERE id = 'old-observation'",
+            params![chain_only_observation_hash("expired", None, Some(0))],
+        )
+        .unwrap();
+        assert!(!recover_benign_chain_metadata_review_tx(
+            &conn, "order-1", &gateway, "expired", &now(),
+        ).unwrap());
+        conn.execute(
+            "UPDATE market_topup_gateway_observations
+             SET source = 'reconcile', evidence_flags_json = 'not-json'
+             WHERE id = 'old-observation'",
+            [],
+        )
+        .unwrap();
+        assert!(!recover_benign_chain_metadata_review_tx(
+            &conn, "order-1", &gateway, "expired", &now(),
+        ).unwrap());
+        assert_eq!(
+            read_topup(&conn, "order-1", "buyer").unwrap().status,
+            "review_required"
+        );
     }
 
     #[test]

@@ -71,10 +71,12 @@ try {
   let expiresAt = new Date(Date.now() + 60_000).toISOString();
   let gatewayCalls = 0;
   let externalVisits = 0;
-  await page.route("**/v1/**", async (route) => {
+  // Context routes also cover the newly opened checkout tab. Page routes
+  // cannot reliably intercept a popup's first navigation.
+  await page.context().route("**/v1/**", async (route) => {
     await route.fulfill({ contentType: "application/json", body: "{}" });
   });
-  await page.route("**/v1/market-wallet/topups/**", async (route) => {
+  await page.context().route("**/v1/market-wallet/topups/**", async (route) => {
     const path = new URL(route.request().url()).pathname;
     assert.equal(route.request().headers().authorization, "Bearer test-wallet-checkout");
     if (path.endsWith("/gateway-status")) {
@@ -82,6 +84,7 @@ try {
       await route.fulfill({ contentType: "application/json", body: JSON.stringify({
         gatewayStatus: "pending",
         canPay,
+        payabilityReason: canPay ? "payable" : "payment_evidence",
         canCancel: false,
         canAbandon: false,
         selectionDeadline: null,
@@ -102,7 +105,7 @@ try {
       reviewReason: null,
     }) });
   });
-  await page.route("https://www.dujiaopay.com/checkout/**", async (route) => {
+  await page.context().route("https://www.dujiaopay.com/checkout/**", async (route) => {
     externalVisits += 1;
     await route.fulfill({ contentType: "text/html", body: "<title>Mock checkout</title>" });
   });
@@ -150,38 +153,42 @@ try {
   };
   let recheckCalls = 0;
   let stopCalls = 0;
-  await page.route("**/v1/auth/session/me", async (route) => {
+  await page.context().route("**/v1/auth/session/me", async (route) => {
     await route.fulfill({ contentType: "application/json", body: JSON.stringify({
       authenticated: true, user: { id: "buyer", email: "buyer@example.invalid" }, isAdmin: false,
     }) });
   });
-  await page.route("**/v1/market-wallet", async (route) => {
+  await page.context().route("**/v1/market-wallet", async (route) => {
     await route.fulfill({ contentType: "application/json", body: JSON.stringify({
       assetCode: "USD", postedUnits: "0", heldUnits: "0", availableUnits: "0",
       version: 1, mode: "enabled", canTopup: true, hasWalletActivity: false,
     }) });
   });
-  await page.route("**/v1/market-wallet/channels", async (route) => {
+  await page.context().route("**/v1/market-wallet/channels", async (route) => {
     await route.fulfill({ contentType: "application/json", body: JSON.stringify([{ id: "channel-1", displayName: "DujiaoPay", gatewayKind: "dujiaopay" }]) });
   });
-  await page.route("**/v1/market-wallet/topups", async (route) => {
+  await page.context().route("**/v1/market-wallet/topups", async (route) => {
+    if (route.request().method() === "POST") {
+      await route.fulfill({ contentType: "application/json", body: JSON.stringify(topup) });
+      return;
+    }
     await route.fulfill({ contentType: "application/json", body: JSON.stringify({ items: [topup], nextCursor: null }) });
   });
-  await page.route("**/v1/market-wallet/transactions", async (route) => {
+  await page.context().route("**/v1/market-wallet/transactions", async (route) => {
     await route.fulfill({ contentType: "application/json", body: JSON.stringify({ items: [], nextCursor: null }) });
   });
-  await page.route("**/v1/market-provider-finance/me", async (route) => {
+  await page.context().route("**/v1/market-provider-finance/me", async (route) => {
     await route.fulfill({ contentType: "application/json", body: JSON.stringify({ isProvider: false }) });
   });
-  await page.route("**/v1/market-provider-finance/withdrawals", async (route) => {
+  await page.context().route("**/v1/market-provider-finance/withdrawals", async (route) => {
     await route.fulfill({ contentType: "application/json", body: JSON.stringify({ items: [], nextCursor: null }) });
   });
-  await page.route("**/v1/market-wallet/topups/order-2/recheck", async (route) => {
+  await page.context().route("**/v1/market-wallet/topups/order-2/recheck", async (route) => {
     recheckCalls += 1;
     topup = { ...topup, buyerRecheckRequestedAt: new Date().toISOString(), buyerRecheckResult: "queued" };
     await route.fulfill({ contentType: "application/json", body: JSON.stringify({ queued: true, order: topup }) });
   });
-  await page.route("**/v1/market-wallet/topups/order-2/stop", async (route) => {
+  await page.context().route("**/v1/market-wallet/topups/order-2/stop", async (route) => {
     stopCalls += 1;
     topup = { ...topup, buyerAbandonedAt: new Date().toISOString(), checkoutUrl: null };
     await route.fulfill({ contentType: "application/json", body: JSON.stringify(topup) });
@@ -201,6 +208,42 @@ try {
   await page.getByRole("status").filter({ hasText: /You stopped paying in Router/i }).first().waitFor();
   assert.equal(stopCalls, 1);
   assert.equal(topup.status, "review_required");
+
+  // A committed order with no payable capability stays visible in the new
+  // tab. The wallet must not pretend it is ready to choose a payment method.
+  topup = {
+    id: "order-1", channelId: "channel-1", amountMinor: 100,
+    status: "pending", checkoutUrl,
+    createdAt: new Date().toISOString(), autoCloseAt: null,
+    buyerAbandonedAt: null, reviewReason: null,
+    buyerRecheckRequestedAt: null, buyerRecheckCompletedAt: null,
+    buyerRecheckResult: null, lastGatewayStatus: "pending",
+    lastGatewayCheckedAt: new Date().toISOString(),
+  };
+  canPay = false;
+  expiresAt = new Date(Date.now() + 60_000).toISOString();
+  await page.goto(`${baseUrl}/account/wallet/`);
+  await page.getByLabel("Amount (USD)").fill("1.00");
+  const blockedTabPromise = page.waitForEvent("popup");
+  await page.getByRole("button", { name: "Continue to payment" }).click();
+  const blockedTab = await blockedTabPromise;
+  await blockedTab.getByText(/Payment or review evidence needs checking/i).waitFor();
+  assert.match(blockedTab.url(), /\/wallet-checkout\/\?topup=order-1$/);
+  await page.getByText("Payment unavailable").waitFor();
+  assert.equal(await page.getByRole("link", { name: "Continue payment" }).count(), 0);
+  assert.equal(externalVisits, 1);
+  await blockedTab.close();
+
+  canPay = true;
+  await page.getByRole("button", { name: "Refresh gateway status" }).click();
+  const resumeLink = page.getByRole("link", { name: "Continue payment" });
+  await resumeLink.waitFor();
+  const resumedTabPromise = page.waitForEvent("popup");
+  await resumeLink.click();
+  const resumedTab = await resumedTabPromise;
+  await resumedTab.waitForURL(checkoutUrl);
+  assert.equal(externalVisits, 2);
+  await resumedTab.close();
 } finally {
   await browser?.close();
   if (server) await new Promise((resolveStop, rejectStop) => {
