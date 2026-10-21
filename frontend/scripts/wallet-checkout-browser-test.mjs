@@ -177,6 +177,11 @@ try {
   await page.context().route("**/v1/market-wallet/transactions", async (route) => {
     await route.fulfill({ contentType: "application/json", body: JSON.stringify({ items: [], nextCursor: null }) });
   });
+  await page.context().route("**/v1/market-notifications**", async (route) => {
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify({
+      items: [], nextCursor: null, unread: 0,
+    }) });
+  });
   await page.context().route("**/v1/market-provider-finance/me", async (route) => {
     await route.fulfill({ contentType: "application/json", body: JSON.stringify({ isProvider: false }) });
   });

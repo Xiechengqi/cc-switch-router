@@ -51,9 +51,11 @@ export function MarketNotificationsBell() {
     try {
       const page = await getMarketNotifications();
       if (version !== versionRef.current) return;
-      setItems(page.items);
-      setCursor(page.nextCursor);
-      setUnread(page.unread);
+      // The bell sits beside wallet content; a malformed feed must leave it
+      // empty rather than take the whole wallet page down.
+      setItems(Array.isArray(page?.items) ? page.items : []);
+      setCursor(typeof page?.nextCursor === "string" ? page.nextCursor : null);
+      setUnread(Number.isSafeInteger(page?.unread) ? Math.max(0, page.unread) : 0);
       setError("");
     } catch (cause) {
       if (version === versionRef.current) setError(cause instanceof Error ? cause.message : String(cause));
@@ -117,8 +119,9 @@ export function MarketNotificationsBell() {
     try {
       const page = await getMarketNotifications(cursor);
       if (version !== versionRef.current) return;
-      setItems((current) => [...current, ...page.items.filter((item) => !current.some((prior) => prior.id === item.id))]);
-      setCursor(page.nextCursor);
+      const more = Array.isArray(page?.items) ? page.items : [];
+      setItems((current) => [...current, ...more.filter((item) => !current.some((prior) => prior.id === item.id))]);
+      setCursor(typeof page?.nextCursor === "string" ? page.nextCursor : null);
       setUnread(page.unread);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));

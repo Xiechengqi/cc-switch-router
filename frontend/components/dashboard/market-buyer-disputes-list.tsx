@@ -21,7 +21,7 @@ export function MarketBuyerDisputesList() {
   React.useEffect(() => {
     let active = true;
     getMarketServiceDisputes()
-      .then((next) => { if (active) setItems(next); })
+      .then((next) => { if (active) setItems(Array.isArray(next) ? next : []); })
       .catch((cause) => { if (active) setError(cause instanceof Error ? cause.message : String(cause)); });
     return () => { active = false; };
   }, []);
