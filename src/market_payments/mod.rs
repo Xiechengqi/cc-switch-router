@@ -8022,7 +8022,12 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(stored_checkout.is_none());
+        // Stopping hides the checkout but keeps the stored link, and a later
+        // gateway lookup cannot swap a stopped order's link either.
+        assert_eq!(
+            stored_checkout.as_deref(),
+            Some("https://www.dujiaopay.com/checkout/ct_one")
+        );
         assert_eq!(wallet_snapshot_tx(&conn, "buyer").unwrap().posted_units, 0);
     }
 
