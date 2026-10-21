@@ -135,7 +135,11 @@ fn set_wallet_renewal_tx(
             "renewal policy changed; reload before saving".into(),
         ));
     }
-    if !matches!(current.status.as_str(), "trialing" | "active") {
+    // A suspended buyer may still turn automatic renewal off; turning it on
+    // waits until the service is running again.
+    if !(matches!(current.status.as_str(), "trialing" | "active")
+        || (current.status == "suspended" && !request.auto_renew))
+    {
         return Err(AppError::Conflict(
             "this contract cannot change renewal policy".into(),
         ));
@@ -544,7 +548,13 @@ pub(crate) fn prepare_contract_tx(
         return Ok(id);
     }
     crate::market_payments::require_new_wallet_orders_open_tx(conn)?;
-    crate::market_reconcile::ensure_new_finance_writes_safe_tx(conn)?;
+    crate::market_reconcile::ensure_finance_scopes_safe_tx(
+        conn,
+        &[
+            crate::market_reconcile::FinanceScope::User(&input.buyer_user_id),
+            crate::market_reconcile::FinanceScope::Provider(&input.provider_user_id),
+        ],
+    )?;
     let legacy_rail_present: i64 = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM market_service_contracts
@@ -898,7 +908,7 @@ fn start_paid_trial_tx(
             "wallet trial is not ready to convert".into(),
         ));
     }
-    crate::market_reconcile::ensure_new_finance_writes_safe_tx(conn)?;
+    crate::market_reconcile::ensure_contract_finance_safe_tx(conn, contract_id)?;
     let units = units_from_minor(price)?;
     let prior = prior_due_funding_units_tx(conn, &buyer, Some(contract_id), now)?;
     if crate::market_wallet::wallet_snapshot_tx(conn, &buyer)?.available_units
@@ -906,12 +916,16 @@ fn start_paid_trial_tx(
             .checked_add(units)
             .ok_or_else(|| AppError::Internal("wallet funding commitments overflow".into()))?
     {
-        conn.execute(
+        if conn.execute(
             "UPDATE market_platform_contracts SET status = 'suspended', updated_at = ?2
              WHERE id = ?1 AND status = 'trialing' AND trial_seconds_remaining = 0",
             params![contract_id, now],
         )
-        .map_err(db_error("suspend unfunded trial conversion"))?;
+        .map_err(db_error("suspend unfunded trial conversion"))?
+            == 1
+        {
+            notify_contract_tx(conn, contract_id, "contract_suspended", "insufficient_funds", now)?;
+        }
         return Ok(false);
     }
     let hold_id = reserve_wallet_tx(
@@ -1357,7 +1371,7 @@ pub(crate) fn settle_metered_batch_tx(
             needs_pause: false,
         });
     }
-    crate::market_reconcile::ensure_new_finance_writes_safe_tx(conn)?;
+    crate::market_reconcile::ensure_contract_finance_safe_tx(conn, contract_id)?;
     let mut remaining_hold: i64 = conn
         .query_row(
             "SELECT remaining_units FROM market_wallet_holds
@@ -1381,12 +1395,16 @@ pub(crate) fn settle_metered_batch_tx(
                 )
                 .map_err(db_error("read replenished metered budget"))?;
         } else {
-            conn.execute(
+            if conn.execute(
                 "UPDATE market_platform_contracts SET status = 'suspended', updated_at = ?2
                  WHERE id = ?1 AND status = 'active'",
                 params![contract_id, now],
             )
-            .map_err(db_error("suspend unfunded metered service"))?;
+            .map_err(db_error("suspend unfunded metered service"))?
+                == 1
+            {
+                notify_contract_tx(conn, contract_id, "contract_suspended", "insufficient_funds", now)?;
+            }
             let pending = pending_metered_count_tx(conn, contract_id)?;
             // A later top-up must never debit service delivered without a
             // reserved budget while remote suspension was still in flight.
@@ -1566,6 +1584,28 @@ pub(crate) fn terminate_after_cleanup_tx(
     cleanup_confirmed: bool,
     now: &str,
 ) -> Result<ContractTermination, AppError> {
+    let was_ended: bool = conn
+        .query_row(
+            "SELECT status = 'ended' FROM market_platform_contracts WHERE id = ?1",
+            params![contract_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db_error("read contract before termination"))?
+        .unwrap_or(true);
+    let result = terminate_after_cleanup_inner_tx(conn, contract_id, cleanup_confirmed, now)?;
+    if result.finalized && !was_ended {
+        notify_contract_tx(conn, contract_id, "contract_terminated", "ended", now)?;
+    }
+    Ok(result)
+}
+
+fn terminate_after_cleanup_inner_tx(
+    conn: &Connection,
+    contract_id: &str,
+    cleanup_confirmed: bool,
+    now: &str,
+) -> Result<ContractTermination, AppError> {
     parse_time(now)?;
     let (buyer, model, status, hold_id, sequence, paid_started_at, activation_hold_id): (
         String,
@@ -1612,15 +1652,12 @@ pub(crate) fn terminate_after_cleanup_tx(
         // An uncertain remote revoke also disputes earnings from earlier
         // observed slices. Otherwise the seven-day worker could make them
         // withdrawable while access and refund liability are unresolved.
-        conn.execute(
-            "UPDATE market_provider_earning_lots SET disputed = 1
-             WHERE delivery_slice_id IN (
-                 SELECT id FROM market_delivery_slices
-                 WHERE contract_id = ?1
-             ) AND disputed = 0",
-            params![contract_id],
-        )
-        .map_err(db_error("freeze earnings for uncertain cleanup"))?;
+        crate::market_finance::hold_contract_earnings_tx(
+            conn,
+            contract_id,
+            "cleanup_uncertain",
+            now,
+        )?;
         conn.execute(
             "INSERT OR IGNORE INTO market_finance_reconciliation_cases
                 (id, code, object_kind, object_id, status, detail_code, created_at)
@@ -1973,7 +2010,7 @@ pub(crate) fn settle_monthly_segment_tx(
         ));
     }
     if amount > 0 {
-        crate::market_reconcile::ensure_new_finance_writes_safe_tx(conn)?;
+        crate::market_reconcile::ensure_contract_finance_safe_tx(conn, contract_id)?;
     }
     let segment_id = Uuid::new_v4().to_string();
     let journal_id = if amount == 0 {
@@ -2134,18 +2171,22 @@ pub(crate) fn renew_monthly_contract_tx(
     let next_sequence = sequence + 1;
     let next_id = Uuid::new_v4().to_string();
     let amount = units_from_minor(price)?;
-    crate::market_reconcile::ensure_new_finance_writes_safe_tx(conn)?;
+    crate::market_reconcile::ensure_contract_finance_safe_tx(conn, contract_id)?;
     let prior = prior_due_funding_units_tx(conn, &buyer, Some(contract_id), now)?;
     let needed = prior
         .checked_add(amount)
         .ok_or_else(|| AppError::Internal("wallet funding commitments overflow".into()))?;
     if crate::market_wallet::wallet_snapshot_tx(conn, &buyer)?.available_units < needed {
-        conn.execute(
+        if conn.execute(
             "UPDATE market_platform_contracts SET status = 'suspended', updated_at = ?2
              WHERE id = ?1 AND status = 'active'",
             params![contract_id, now],
         )
-        .map_err(db_error("suspend lower-priority wallet renewal"))?;
+        .map_err(db_error("suspend lower-priority wallet renewal"))?
+            == 1
+        {
+            notify_contract_tx(conn, contract_id, "contract_suspended", "insufficient_funds", now)?;
+        }
         return Ok(false);
     }
     let debit = match debit_available_tx(
@@ -2161,12 +2202,16 @@ pub(crate) fn renew_monthly_contract_tx(
     ) {
         Ok(journal) => journal,
         Err(AppError::Conflict(_)) => {
-            conn.execute(
+            if conn.execute(
                 "UPDATE market_platform_contracts SET status = 'suspended', updated_at = ?2
                  WHERE id = ?1 AND status = 'active'",
                 params![contract_id, now],
             )
-            .map_err(db_error("suspend unfunded monthly renewal"))?;
+            .map_err(db_error("suspend unfunded monthly renewal"))?
+                == 1
+            {
+                notify_contract_tx(conn, contract_id, "contract_suspended", "insufficient_funds", now)?;
+            }
             return Ok(false);
         }
         Err(error) => return Err(error),
@@ -2214,7 +2259,168 @@ pub(crate) fn renew_monthly_contract_tx(
 /// A credited wallet top-up can restart an already suspended service, but
 /// never pays for the unfunded gap. The external entitlement remains paused
 /// until the caller successfully reapplies its control-plane grant.
+/// Hourly reminders: automatic monthly renewals due within 72 hours that the
+/// free balance cannot cover, and metered services with less than a day of
+/// funded runway. Dedupe keys allow one reminder per window and period.
+pub(crate) fn queue_funding_reminders_tx(conn: &Connection, now: DateTime<Utc>) -> Result<usize, AppError> {
+    let now_text = now.to_rfc3339();
+    let mut queued = 0;
+    let renewals = {
+        let mut statement = conn
+            .prepare(
+                "SELECT c.id, c.buyer_user_id, c.cycle_price_minor, p.period_end
+                 FROM market_platform_contracts c
+                 JOIN market_platform_periods p
+                   ON p.contract_id = c.id AND p.sequence = c.current_period_sequence
+                 WHERE c.status = 'active' AND c.billing_model = 'calendar_month'
+                   AND c.renewal_policy = 'automatic' AND c.cycle_price_minor IS NOT NULL
+                   AND p.period_end > ?1 AND p.period_end <= ?2",
+            )
+            .map_err(db_error("prepare renewal reminders"))?;
+        statement
+            .query_map(
+                params![now_text, (now + chrono::Duration::hours(72)).to_rfc3339()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .map_err(db_error("query renewal reminders"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_error("read renewal reminders"))?
+    };
+    for (contract_id, buyer, price_minor, period_end) in renewals {
+        let needed = units_from_minor(price_minor)?
+            + prior_due_funding_units_tx(conn, &buyer, Some(&contract_id), &period_end)?;
+        let available = crate::market_wallet::wallet_snapshot_tx(conn, &buyer)?.available_units;
+        if available >= needed {
+            continue;
+        }
+        let window = if parse_time(&period_end)? - now <= chrono::Duration::hours(24) {
+            "24h"
+        } else {
+            "72h"
+        };
+        crate::market_notifications::enqueue_user_notification_tx(
+            conn,
+            "buyer",
+            &buyer,
+            "renewal_upcoming_shortfall",
+            "platform_contract",
+            &contract_id,
+            &format!("renewal_upcoming_shortfall:{contract_id}:{period_end}:{window}"),
+            serde_json::json!({
+                "contractId": contract_id,
+                "renewsAt": period_end,
+                "amountMinor": (needed - available.max(0)) / crate::market_billing::MONEY_UNITS_PER_MINOR,
+            }),
+            &now_text,
+        )?;
+        queued += 1;
+    }
+    let metered = {
+        let mut statement = conn
+            .prepare(
+                "SELECT c.id, c.buyer_user_id, c.daily_rate_minor,
+                        COALESCE((SELECT remaining_units FROM market_wallet_holds h
+                                  WHERE h.id = c.budget_hold_id AND h.status = 'active'), 0)
+                 FROM market_platform_contracts c
+                 WHERE c.status = 'active' AND c.billing_model = 'metered'
+                   AND c.daily_rate_minor IS NOT NULL AND c.daily_rate_minor > 0",
+            )
+            .map_err(db_error("prepare runway reminders"))?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(db_error("query runway reminders"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_error("read runway reminders"))?
+    };
+    for (contract_id, buyer, rate_minor, budget) in metered {
+        let per_day = units_from_minor(rate_minor)?;
+        let available = crate::market_wallet::wallet_snapshot_tx(conn, &buyer)?
+            .available_units
+            .max(0);
+        if budget + available >= per_day {
+            continue;
+        }
+        crate::market_notifications::enqueue_user_notification_tx(
+            conn,
+            "buyer",
+            &buyer,
+            "wallet_low_runway",
+            "platform_contract",
+            &contract_id,
+            &format!("wallet_low_runway:{contract_id}:{}", now.format("%Y-%m-%d")),
+            serde_json::json!({
+                "contractId": contract_id,
+                "runwaySeconds": (budget + available) / rate_minor.max(1),
+            }),
+            &now_text,
+        )?;
+        queued += 1;
+    }
+    Ok(queued)
+}
+
+/// Queue a buyer notice for a contract state change. `reason` is a short
+/// machine code (for example `insufficient_funds`, `finance_hold`).
+pub(crate) fn notify_contract_tx(
+    conn: &Connection,
+    contract_id: &str,
+    kind: &str,
+    reason: &str,
+    now: &str,
+) -> Result<(), AppError> {
+    let (buyer, product_kind, status, updated_at): (String, String, String, String) = conn
+        .query_row(
+            "SELECT buyer_user_id, product_kind, status, updated_at
+             FROM market_platform_contracts WHERE id = ?1",
+            params![contract_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(db_error("read contract for notification"))?;
+    crate::market_notifications::enqueue_user_notification_tx(
+        conn,
+        "buyer",
+        &buyer,
+        kind,
+        "platform_contract",
+        contract_id,
+        &format!("{kind}:{contract_id}:{updated_at}"),
+        serde_json::json!({
+            "contractId": contract_id,
+            "productKind": product_kind,
+            "status": status,
+            "reason": reason,
+        }),
+        now,
+    )
+}
+
 pub(crate) fn resume_suspended_contract_tx(
+    conn: &Connection,
+    contract_id: &str,
+    now: &str,
+) -> Result<bool, AppError> {
+    let resumed = resume_suspended_contract_inner_tx(conn, contract_id, now)?;
+    if resumed {
+        notify_contract_tx(conn, contract_id, "contract_resumed", "funded", now)?;
+    }
+    Ok(resumed)
+}
+
+fn resume_suspended_contract_inner_tx(
     conn: &Connection,
     contract_id: &str,
     now: &str,
@@ -2250,6 +2456,9 @@ pub(crate) fn resume_suspended_contract_tx(
         )
         .map_err(db_error("read suspended wallet contract"))?;
     if status != "suspended" {
+        return Ok(false);
+    }
+    if crate::market_reconcile::ensure_contract_finance_safe_tx(conn, contract_id).is_err() {
         return Ok(false);
     }
     if paid_started.is_none() && trial_remaining == 0 {
@@ -2384,6 +2593,77 @@ fn record_service_evidence_tx(
         return Err(AppError::Conflict("wallet service evidence changed".into()));
     }
     Ok(id)
+}
+
+const SUSPENSION_WARNING_DAYS: i64 = 5;
+
+fn suspension_terminate_days() -> i64 {
+    std::env::var("CC_SWITCH_ROUTER_MARKET_SUSPENDED_TERMINATE_DAYS")
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|days| (1..=90).contains(days))
+        .unwrap_or(7)
+}
+
+/// End a service the buyer has left unfunded for too long, after a warning.
+/// A suspension caused by a finance hold is the Router's problem, not the
+/// buyer's, and never times out. Returns whether the contract was marked for
+/// cleanup.
+fn enforce_suspension_timeout_tx(
+    conn: &Connection,
+    contract_id: &str,
+    now: DateTime<Utc>,
+) -> Result<bool, AppError> {
+    let (suspended_at, cause, buyer): (Option<String>, Option<String>, String) = conn
+        .query_row(
+            "SELECT suspended_at, suspension_cause, buyer_user_id
+             FROM market_platform_contracts WHERE id = ?1",
+            params![contract_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(db_error("read contract suspension"))?;
+    let Some(suspended_at) = suspended_at else {
+        return Ok(false);
+    };
+    if crate::market_reconcile::ensure_contract_finance_safe_tx(conn, contract_id).is_err() {
+        return Ok(false);
+    }
+    if cause.as_deref() == Some("finance_hold") {
+        // The hold has cleared but the service is still suspended, so it now
+        // waits on funding. The buyer's window starts only from this moment.
+        conn.execute(
+            "UPDATE market_platform_contracts
+             SET suspension_cause = NULL, suspended_at = ?2
+             WHERE id = ?1 AND status = 'suspended'",
+            params![contract_id, now.to_rfc3339()],
+        )
+        .map_err(db_error("restart contract suspension clock"))?;
+        return Ok(false);
+    }
+    let age = now - parse_time(&suspended_at)?;
+    let terminate_days = suspension_terminate_days();
+    let now_text = now.to_rfc3339();
+    if age >= chrono::Duration::days(terminate_days) {
+        mark_for_confirmed_cleanup_tx(conn, contract_id, &now_text)?;
+        return Ok(true);
+    }
+    if age >= chrono::Duration::days(SUSPENSION_WARNING_DAYS.min(terminate_days - 1).max(0)) {
+        crate::market_notifications::enqueue_user_notification_tx(
+            conn,
+            "buyer",
+            &buyer,
+            "contract_terminating_soon",
+            "platform_contract",
+            contract_id,
+            &format!("contract_terminating_soon:{contract_id}:{suspended_at}"),
+            serde_json::json!({
+                "contractId": contract_id,
+                "terminatesAt": (parse_time(&suspended_at)? + chrono::Duration::days(terminate_days)).to_rfc3339(),
+            }),
+            &now_text,
+        )?;
+    }
+    Ok(false)
 }
 
 fn mark_for_confirmed_cleanup_tx(
@@ -2555,7 +2835,7 @@ fn reconcile_service_interval_tx(
             .map_err(db_error("read remaining metered wallet budget"))?
             .unwrap_or(0);
         if remaining < rate {
-            crate::market_reconcile::ensure_new_finance_writes_safe_tx(conn)?;
+            crate::market_reconcile::ensure_contract_finance_safe_tx(conn, contract_id)?;
             release_hold_tx(conn, &hold_id, &now.to_rfc3339())?;
             if replenish_metered_budget_tx(
                 conn,
@@ -2585,13 +2865,17 @@ fn reconcile_service_interval_tx(
                     "budget_not_reserved",
                     &now.to_rfc3339(),
                 )?;
-                conn.execute(
+                if conn.execute(
                     "UPDATE market_platform_contracts
                      SET status = 'suspended', last_evaluated_at = ?2, updated_at = ?3
                      WHERE id = ?1 AND status = 'active' AND last_evaluated_at = ?4",
                     params![contract_id, end.to_rfc3339(), now.to_rfc3339(), cursor_text],
                 )
-                .map_err(db_error("suspend metered service before unfunded delivery"))?;
+                .map_err(db_error("suspend metered service before unfunded delivery"))?
+                    == 1
+                {
+                    notify_contract_tx(conn, contract_id, "contract_suspended", "insufficient_funds", &now.to_rfc3339())?;
+                }
                 conn.execute(
                     "UPDATE market_platform_metered_observations
                      SET unfunded_seconds = billable_seconds - captured_seconds
@@ -2812,14 +3096,12 @@ fn reconcile_platform_contracts_tx(
             }
             .map_err(db_error("verify wallet service subscription"))?;
             if subscription_exists == 0 {
-                conn.execute(
-                    "UPDATE market_provider_earning_lots SET disputed = 1
-                     WHERE delivery_slice_id IN (
-                        SELECT id FROM market_delivery_slices WHERE contract_id = ?1
-                     ) AND disputed = 0",
-                    params![id],
-                )
-                .map_err(db_error("freeze earnings for missing wallet service"))?;
+                crate::market_finance::hold_contract_earnings_tx(
+                    conn,
+                    &id,
+                    "service_missing",
+                    &now_text,
+                )?;
                 conn.execute(
                     "UPDATE market_platform_contracts
                      SET status = 'review_required', updated_at = ?2
@@ -2835,6 +3117,15 @@ fn reconcile_platform_contracts_tx(
                     params![Uuid::new_v4().to_string(), id, now_text],
                 )
                 .map_err(db_error("record missing wallet service"))?;
+                return Ok(None);
+            }
+            if status == "suspended" && enforce_suspension_timeout_tx(conn, &id, now)? {
+                // Marked for cleanup; the next pass dispatches termination.
+                conn.execute(
+                    "UPDATE market_platform_contracts SET updated_at = ?2 WHERE id = ?1",
+                    params![id, now_text],
+                )
+                .map_err(db_error("rotate expired suspension"))?;
                 return Ok(None);
             }
             let expiry = service_expiry_tx(conn, &kind, &product_ref, &service_ref)?;
@@ -2962,6 +3253,35 @@ fn reconcile_platform_contracts_tx(
                 if let Some(control) = control {
                     actions.push(control);
                 }
+            }
+            Err(error) if crate::market_reconcile::is_finance_hold(&error) => {
+                // A scoped finance hold is not a broken contract. Suspend the
+                // service so it cannot keep running unbilled; the regular
+                // resume path restarts it once the hold is cleared.
+                conn.execute_batch(
+                    "ROLLBACK TO SAVEPOINT wallet_service_contract;
+                     RELEASE SAVEPOINT wallet_service_contract",
+                )
+                .map_err(db_error("rollback wallet contract savepoint"))?;
+                let suspended = conn
+                    .execute(
+                        "UPDATE market_platform_contracts
+                         SET status = 'suspended', suspension_cause = 'finance_hold', updated_at = ?2
+                         WHERE id = ?1 AND status IN ('active', 'trialing')",
+                        params![id, now_text],
+                    )
+                    .map_err(db_error("suspend held wallet contract"))?;
+                if suspended == 1 {
+                    notify_contract_tx(conn, &id, "contract_suspended", "finance_hold", &now_text)?;
+                    actions.push(PlatformControlAction {
+                        contract_id: id.clone(),
+                        product_kind: kind.clone(),
+                        product_ref: product_ref.clone(),
+                        service_ref: service_ref.clone(),
+                        kind: PlatformControlKind::Suspend,
+                    });
+                }
+                tracing::warn!(contract_id = %id, "wallet contract suspended by finance hold");
             }
             Err(error) => {
                 conn.execute_batch(
@@ -3831,6 +4151,40 @@ mod tests {
             )
             .unwrap(),
             1,
+        );
+    }
+
+    #[test]
+    fn finance_hold_suspension_restarts_the_buyer_clock_once_the_hold_clears() {
+        let conn = memory();
+        let start = "2026-01-01T00:00:00+00:00";
+        let id = client_monthly_fixture(&conn, start, 0);
+        conn.execute(
+            "UPDATE market_platform_contracts
+             SET status = 'suspended', suspension_cause = 'finance_hold', updated_at = ?2
+             WHERE id = ?1",
+            params![id, start],
+        )
+        .unwrap();
+        let cleared = parse_time(start).unwrap() + chrono::Duration::days(30);
+        // A month under a Router hold is not the buyer's unfunded time.
+        assert!(!enforce_suspension_timeout_tx(&conn, &id, cleared).unwrap());
+        let (cause, suspended_at): (Option<String>, String) = conn
+            .query_row(
+                "SELECT suspension_cause, suspended_at FROM market_platform_contracts WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(cause, None);
+        assert_eq!(parse_time(&suspended_at).unwrap(), cleared);
+        assert!(
+            !enforce_suspension_timeout_tx(&conn, &id, cleared + chrono::Duration::days(6))
+                .unwrap()
+        );
+        assert!(
+            enforce_suspension_timeout_tx(&conn, &id, cleared + chrono::Duration::days(7))
+                .unwrap()
         );
     }
 

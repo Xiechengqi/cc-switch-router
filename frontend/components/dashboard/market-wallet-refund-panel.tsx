@@ -7,8 +7,12 @@
 
 import * as React from "react";
 import { Button } from "@heroui/react";
+import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
+import { CopyTextButton, TronTransactionLink } from "@/components/market/wallet-primitives";
+import { ApiError } from "@/lib/api";
 import {
+  cancelMarketBuyerRefund,
   getMarketBuyerRefunds,
   requestMarketBuyerRefund,
   type MarketBuyerRefund,
@@ -30,6 +34,7 @@ export function MarketWalletRefundPanel({ availableUnits, onSubmitted }: {
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
   const [notice, setNotice] = React.useState("");
+  const [cancelTarget, setCancelTarget] = React.useState<MarketBuyerRefund | null>(null);
   const idempotencyRef = React.useRef<{ fingerprint: string; key: string } | null>(null);
 
   React.useEffect(() => {
@@ -69,7 +74,42 @@ export function MarketWalletRefundPanel({ availableUnits, onSubmitted }: {
       setNotice(t("marketWallet.refundRequested"));
       await onSubmitted();
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      setError(refundErrorText(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const refundErrorText = (cause: unknown) => {
+    if (cause instanceof ApiError && cause.code === "MARKET_REFUND_EXCEEDS_FREE_BALANCE") {
+      const free = typeof cause.details?.freeUnits === "string" ? cause.details.freeUnits : "0";
+      const committed = typeof cause.details?.committedUnits === "string" ? cause.details.committedUnits : "0";
+      return t("marketWallet.refundExceedsFree", {
+        free: formatWalletUnits(free, "$", locale),
+        committed: formatWalletUnits(committed, "$", locale),
+      });
+    }
+    if (cause instanceof ApiError && cause.status === 503) return t("marketWallet.refundWalletClosed");
+    return cause instanceof Error ? cause.message : String(cause);
+  };
+
+  const cancelRefund = async () => {
+    const target = cancelTarget;
+    if (!target || busy) return;
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      const updated = await cancelMarketBuyerRefund(target.id, target.version);
+      setRefunds((current) => current.map((item) => item.id === updated.id ? updated : item));
+      setCancelTarget(null);
+      setNotice(t("marketWallet.refundCancelled"));
+      await onSubmitted();
+    } catch (cause) {
+      setCancelTarget(null);
+      setError(cause instanceof ApiError && cause.status === 409 ? t("marketWallet.refundCancelChanged") : refundErrorText(cause));
+      const page = await getMarketBuyerRefunds().catch(() => null);
+      if (page) { setRefunds(page.items); setNextCursor(page.nextCursor); }
     } finally {
       setBusy(false);
     }
@@ -122,11 +162,34 @@ export function MarketWalletRefundPanel({ availableUnits, onSubmitted }: {
     </form>
     {refunds.length ? <div className="grid gap-2">
       <h3 className="text-sm font-semibold">{t("marketWallet.refundHistory")}</h3>
-      <ul className="grid gap-2">{refunds.map((item) => <li key={item.id} className="flex min-w-0 flex-wrap items-center justify-between gap-2 rounded-md bg-muted/50 px-3 py-2 text-xs">
-        <span className="tabular-nums">{formatWalletUnits(item.amountUnits, "$", locale)}</span>
-        <span>{t(`marketProviderFinance.status.${item.status}` as Parameters<typeof t>[0])}</span>
+      <ul className="grid gap-2">{refunds.map((item) => <li key={item.id} className="grid min-w-0 gap-1 rounded-md bg-muted/50 px-3 py-2 text-xs">
+        <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
+          <span className="font-medium tabular-nums">{formatWalletUnits(item.amountUnits, "$", locale)}</span>
+          <span className="flex items-center gap-2">
+            <span>{t(`marketProviderFinance.status.${item.status}` as Parameters<typeof t>[0])}</span>
+            {item.status === "requested" ? <Button size="sm" variant="outline" className="min-h-11 whitespace-nowrap" isDisabled={busy} onPress={() => setCancelTarget(item)}>
+              {t("marketWallet.refundCancel")}
+            </Button> : null}
+          </span>
+        </div>
+        <span className="flex min-w-0 items-center gap-1 text-muted-foreground">
+          <span className="min-w-0 truncate font-mono" title={item.address}>{item.address}</span>
+          <CopyTextButton value={item.address} size="sm" label={t("marketWallet.copyAddress")} />
+        </span>
+        {item.externalReference ? <TronTransactionLink hash={item.externalReference} /> : null}
       </li>)}</ul>
       {nextCursor ? <Button size="sm" variant="ghost" isDisabled={busy} onPress={() => void loadMore()}>{t("marketWallet.more")}</Button> : null}
     </div> : null}
+    <ConfirmAlertDialog
+      open={!!cancelTarget}
+      title={t("marketWallet.refundCancelTitle")}
+      description={t("marketWallet.refundCancelNote", { amount: cancelTarget ? formatWalletUnits(cancelTarget.amountUnits, "$", locale) : "" })}
+      confirmLabel={t("marketWallet.refundCancel")}
+      cancelLabel={t("common.close")}
+      tone="warning"
+      busy={busy}
+      onConfirm={() => void cancelRefund()}
+      onOpenChange={(open) => { if (!open && !busy) setCancelTarget(null); }}
+    />
   </section>;
 }

@@ -165,3 +165,29 @@ export function walletTopupHref(shortfallUnits: string, returnTo: string): strin
   const query = params.toString();
   return `/account/wallet/${query ? `?${query}` : ""}`;
 }
+
+export const TOPUP_PRESET_MINOR = [500, 1_000, 2_000, 5_000, 10_000] as const;
+const DEFAULT_TOPUP_MIN_MINOR = 100;
+const DEFAULT_TOPUP_MAX_MINOR = 100_000;
+
+/** Effective per-channel bounds; older channel views omit them. */
+export function topupBounds(channel: { minTopupMinor?: number; maxTopupMinor?: number } | null | undefined) {
+  const min = Number.isSafeInteger(channel?.minTopupMinor) ? Math.max(1, channel!.minTopupMinor!) : DEFAULT_TOPUP_MIN_MINOR;
+  const max = Number.isSafeInteger(channel?.maxTopupMinor) ? channel!.maxTopupMinor! : DEFAULT_TOPUP_MAX_MINOR;
+  return { min, max: Math.max(min, max) };
+}
+
+/** Parses a dollar amount (≤2 decimals) and checks it against channel bounds. */
+export function parseTopupMinor(raw: string, bounds: { min: number; max: number }): number | null {
+  const value = raw.trim().replace(/^\$/, "");
+  if (!/^(?:0|[1-9]\d{0,6})(?:\.\d{1,2})?$/.test(value)) return null;
+  const [dollars, fraction = ""] = value.split(".");
+  const minor = Number(dollars) * 100 + Number(fraction.padEnd(2, "0"));
+  return minor >= bounds.min && minor <= bounds.max ? minor : null;
+}
+
+export function formatMinorUsd(minor: number) {
+  const whole = Math.trunc(Math.abs(minor) / 100);
+  const cents = Math.abs(minor) % 100;
+  return `${minor < 0 ? "−" : ""}$${whole.toLocaleString("en-US")}.${String(cents).padStart(2, "0")}`;
+}

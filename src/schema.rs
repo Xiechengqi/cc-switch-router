@@ -252,6 +252,30 @@ const MIGRATIONS: &[(i64, &str)] = &[
         68,
         include_str!("../schema/0068_market_topup_check_progress.sql"),
     ),
+    (
+        69,
+        include_str!("../schema/0069_market_topup_state_v2.sql"),
+    ),
+    (
+        70,
+        include_str!("../schema/0070_market_channel_rollout_settings.sql"),
+    ),
+    (
+        71,
+        include_str!("../schema/0071_market_notifications.sql"),
+    ),
+    (
+        72,
+        include_str!("../schema/0072_market_earning_holds.sql"),
+    ),
+    (
+        73,
+        include_str!("../schema/0073_market_owner_actions.sql"),
+    ),
+    (
+        74,
+        include_str!("../schema/0074_market_payout_v2.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {

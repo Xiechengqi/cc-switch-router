@@ -7,9 +7,18 @@
  */
 
 import * as React from "react";
-import { AlertTriangle, CheckCircle2, Loader2, Plus, RefreshCw } from "lucide-react";
+import { AlertTriangle, CheckCircle2, KeyRound, Loader2, Plus, RefreshCw, SlidersHorizontal } from "lucide-react";
 import { Alert, Button, Modal } from "@heroui/react";
+import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { CopyableCodeField } from "@/components/common/copyable-code-field";
+import { WalletBadge } from "@/components/market/wallet-primitives";
+import { MarketFinanceOverviewSection } from "@/components/settings/market-finance-overview";
+import { MarketFinanceCaseDesk } from "@/components/settings/market-finance-case-desk";
+import { MarketFinanceEnableDialog } from "@/components/settings/market-finance-enable-dialog";
+import { MarketChannelSettingsDialog, channelSettingsSummary } from "@/components/settings/market-channel-settings-dialog";
+import { MarketFinanceUserLookup } from "@/components/settings/market-finance-user-lookup";
+import { MarketFinanceEarningHolds } from "@/components/settings/market-finance-earning-holds";
+import { codeLabel, ownerDateText, ownerErrorText } from "@/components/settings/market-finance-shared";
 import { MarketFinanceTransfersPanel } from "@/components/settings/market-finance-transfers-panel";
 import { MarketFinanceDisputesPanel } from "@/components/settings/market-finance-disputes-panel";
 import { MarketFinanceTopupRecoveryPanel } from "@/components/settings/market-finance-topup-recovery-panel";
@@ -17,7 +26,6 @@ import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ApiError } from "@/lib/api";
 import {
   createMarketPaymentChannel,
-  getMarketFinanceCases,
   getMarketFinanceReadiness,
   getMarketPaymentChannels,
   setMarketFinanceMode,
@@ -28,7 +36,7 @@ import {
   verifyMarketPaymentChannelApi,
   rotateMarketPaymentChannelApi,
   rotateMarketPaymentChannelWebhook,
-  type MarketFinanceCase,
+  rewrapMarketPaymentChannelSecrets,
   type MarketFinanceReadiness,
   type MarketPaymentChannel,
 } from "@/lib/market-wallet-api";
@@ -59,26 +67,17 @@ function message(error: unknown) {
   return error instanceof Error ? error.message : String(error);
 }
 
-function channelBlockerKey(code: string) {
-  switch (code) {
-    case "credited_topup_missing_evidence": return "settings.marketFinance.blocker.credited_topup_missing_evidence" as const;
-    case "channel_none_enabled": return "settings.marketFinance.blocker.channel_none_enabled" as const;
-    case "channel_api_unverified": return "settings.marketFinance.blocker.channel_api_unverified" as const;
-    case "channel_not_signed": return "settings.marketFinance.blocker.channel_not_signed" as const;
-    case "channel_webhook_unverified": return "settings.marketFinance.blocker.channel_webhook_unverified" as const;
-    case "channel_no_current_live_topup": return "settings.marketFinance.blocker.channel_no_current_live_topup" as const;
-    default: return null;
-  }
-}
-
 export function MarketPaymentChannelsPanel() {
-  const { t } = useLocaleText();
+  const { locale, t } = useLocaleText();
   const [readiness, setReadiness] = React.useState<MarketFinanceReadiness | null>(null);
   const [channels, setChannels] = React.useState<MarketPaymentChannel[]>([]);
-  const [cases, setCases] = React.useState<MarketFinanceCase[]>([]);
-  const [casesNextCursor, setCasesNextCursor] = React.useState<string | null>(null);
-  const [casesLoadingMore, setCasesLoadingMore] = React.useState(false);
-  const casesListVersion = React.useRef(0);
+  const [refreshKey, setRefreshKey] = React.useState(0);
+  const [enableOpen, setEnableOpen] = React.useState(false);
+  const [enableError, setEnableError] = React.useState("");
+  const [settingsChannel, setSettingsChannel] = React.useState<MarketPaymentChannel | null>(null);
+  const [rewrapOpen, setRewrapOpen] = React.useState(false);
+  const [notice, setNotice] = React.useState("");
+  const loadVersion = React.useRef(0);
   const [form, setForm] = React.useState<FormState>(EMPTY_FORM);
   const [dialog, setDialog] = React.useState<DialogState | null>(null);
   const [showArchived, setShowArchived] = React.useState(false);
@@ -88,68 +87,41 @@ export function MarketPaymentChannelsPanel() {
   const [loaded, setLoaded] = React.useState(false);
   const busyRef = React.useRef(false);
 
-  const reload = React.useCallback(async () => {
-    const casesVersion = ++casesListVersion.current;
-    const [nextReadiness, nextChannels, nextCases] = await Promise.all([
+  // Readiness and channels drive this panel; the overview, case desk and
+  // holds reload themselves whenever `refreshKey` changes.
+  const reloadCore = React.useCallback(async () => {
+    const version = ++loadVersion.current;
+    const [nextReadiness, nextChannels] = await Promise.all([
       getMarketFinanceReadiness(),
       getMarketPaymentChannels(),
-      getMarketFinanceCases(),
     ]);
-    if (casesVersion !== casesListVersion.current) return;
+    if (version !== loadVersion.current) return;
     setReadiness(nextReadiness);
     setChannels(nextChannels);
-    setCases(nextCases.items);
-    setCasesNextCursor(nextCases.nextCursor);
     setLoaded(true);
   }, []);
 
+  const reload = React.useCallback(async () => {
+    setRefreshKey((value) => value + 1);
+    await reloadCore();
+  }, [reloadCore]);
+
   React.useEffect(() => {
     let active = true;
-    const casesVersion = ++casesListVersion.current;
-    Promise.all([
-      getMarketFinanceReadiness(),
-      getMarketPaymentChannels(),
-      getMarketFinanceCases(),
-    ]).then(([nextReadiness, nextChannels, nextCases]) => {
-      if (!active || casesVersion !== casesListVersion.current) return;
-      setReadiness(nextReadiness);
-      setChannels(nextChannels);
-      setCases(nextCases.items);
-      setCasesNextCursor(nextCases.nextCursor);
-      setLoaded(true);
-    }).catch((cause) => {
+    reloadCore().catch((cause) => {
       if (!active) return;
       setError(message(cause));
       setLoaded(true);
     });
     return () => { active = false; };
-  }, []);
-
-  const loadMoreCases = async () => {
-    if (!casesNextCursor || casesLoadingMore) return;
-    const version = casesListVersion.current;
-    setCasesLoadingMore(true);
-    setError("");
-    try {
-      const page = await getMarketFinanceCases(casesNextCursor);
-      if (version !== casesListVersion.current) return;
-      setCases((current) => {
-        const seen = new Set(current.map((item) => item.id));
-        return [...current, ...page.items.filter((item) => !seen.has(item.id))];
-      });
-      setCasesNextCursor(page.nextCursor);
-    } catch (cause) {
-      if (version === casesListVersion.current) setError(message(cause));
-    } finally {
-      setCasesLoadingMore(false);
-    }
-  };
+  }, [reloadCore]);
 
   const perform = async (name: string, action: () => Promise<unknown>) => {
     if (busyRef.current) return;
     busyRef.current = true;
     setBusy(name);
     setError("");
+    setNotice("");
     try {
       await action();
       await reload();
@@ -162,13 +134,48 @@ export function MarketPaymentChannelsPanel() {
       } else if (cause instanceof ApiError && cause.status === 409 && cause.message.includes("has not passed verification")) {
         setError(t("settings.marketFinance.channelNeedsVerification"));
       } else {
-        setError(message(cause));
+        setError(ownerErrorText(t, cause));
       }
     } finally {
       busyRef.current = false;
       setBusy("");
     }
   };
+
+  const confirmEnable = async () => {
+    if (!readiness || busyRef.current) return;
+    busyRef.current = true;
+    setBusy("enable");
+    setEnableError("");
+    try {
+      await setMarketFinanceMode("enabled", readiness.version);
+      setEnableOpen(false);
+      await reload().catch(() => {});
+    } catch (cause) {
+      setEnableError(ownerErrorText(t, cause));
+      await reloadCore().catch(() => {});
+    } finally {
+      busyRef.current = false;
+      setBusy("");
+    }
+  };
+
+  const setPause = (patch: Partial<Pick<MarketFinanceReadiness, "newOrdersPaused" | "newWithdrawalsPaused" | "newTopupsPaused">>) => {
+    if (!readiness) return;
+    const next = {
+      newOrdersPaused: readiness.newOrdersPaused,
+      newWithdrawalsPaused: readiness.newWithdrawalsPaused,
+      newTopupsPaused: readiness.newTopupsPaused ?? false,
+      ...patch,
+    };
+    void perform("pause", () => setMarketFinancePause(next.newOrdersPaused, next.newWithdrawalsPaused, readiness.version, next.newTopupsPaused));
+  };
+
+  const confirmRewrap = () => void perform("rewrap", async () => {
+    const result = await rewrapMarketPaymentChannelSecrets();
+    setRewrapOpen(false);
+    setNotice(t("settings.marketFinance.rewrap.done", { count: result.rewrapped, version: result.keyVersion }));
+  }).finally(() => setRewrapOpen(false));
 
   const openDialog = (kind: DialogState["kind"], channel?: MarketPaymentChannel) => {
     setError("");
@@ -251,7 +258,9 @@ export function MarketPaymentChannelsPanel() {
       </div>
 
       {!loaded ? <p className="flex items-center gap-2 text-sm text-muted-foreground"><Loader2 className="size-4 animate-spin" />{t("common.loading")}</p> : null}
-      {error && !dialog ? <Alert status="danger" role="alert">{error}</Alert> : null}
+      {error && !dialog && !settingsChannel ? <Alert status="danger" role="alert">{error}</Alert> : null}
+      <div aria-live="polite">{notice ? <Alert status="success">{notice}</Alert> : null}</div>
+      <MarketFinanceOverviewSection refreshKey={refreshKey} />
 
       {readiness ? (
         <div className="grid min-w-0 gap-4 rounded-lg border border-border bg-card p-4 sm:p-5">
@@ -274,7 +283,7 @@ export function MarketPaymentChannelsPanel() {
                 </Button>
               ) : null}
               {readiness.mode === "shadow" ? (
-                <Button size="sm" isDisabled={!!busy || !readiness.canEnable} onPress={() => void perform("mode", () => setMarketFinanceMode("enabled", readiness.version))}>
+                <Button size="sm" isDisabled={!!busy || !readiness.canEnable} onPress={() => { setEnableError(""); setEnableOpen(true); }}>
                   {t("settings.marketFinance.enable")}
                 </Button>
               ) : null}
@@ -287,29 +296,29 @@ export function MarketPaymentChannelsPanel() {
             <p>{t("settings.marketFinance.criticalCases", { count: readiness.criticalCases })}</p>
             {readiness.staleTopupReviews > 0 ? <p className="font-medium text-amber-800">{t("settings.marketFinance.staleTopupReviews", { count: readiness.staleTopupReviews })}</p> : null}
           </div>
-          {readiness.mode === "enabled" ? (
-            <div className="grid gap-3 rounded-md border border-border p-3 sm:grid-cols-2">
-              <div className="flex items-center justify-between gap-3">
-                <span className="flex flex-wrap items-center gap-2 text-sm">{t("settings.marketFinance.newOrders")}
-                  <span className={readiness.newOrdersPaused ? "rounded-full bg-amber-100 px-2 py-0.5 text-xs text-amber-900" : "rounded-full bg-emerald-100 px-2 py-0.5 text-xs text-emerald-900"}>
-                    {t(readiness.newOrdersPaused ? "settings.marketFinance.statusPaused" : "settings.marketFinance.statusOpen")}
-                  </span>
-                </span>
-                <Button size="sm" variant="outline" isDisabled={!!busy} onPress={() => void perform("pause-orders", () => setMarketFinancePause(!readiness.newOrdersPaused, readiness.newWithdrawalsPaused, readiness.version))}>
-                  {t(readiness.newOrdersPaused ? "settings.marketFinance.resume" : "settings.marketFinance.pause")}
-                </Button>
-              </div>
-              <div className="flex items-center justify-between gap-3">
-                <span className="flex flex-wrap items-center gap-2 text-sm">{t("settings.marketFinance.newWithdrawals")}
-                  <span className={readiness.newWithdrawalsPaused ? "rounded-full bg-amber-100 px-2 py-0.5 text-xs text-amber-900" : "rounded-full bg-emerald-100 px-2 py-0.5 text-xs text-emerald-900"}>
-                    {t(readiness.newWithdrawalsPaused ? "settings.marketFinance.statusPaused" : "settings.marketFinance.statusOpen")}
-                  </span>
-                </span>
-                <Button size="sm" variant="outline" isDisabled={!!busy} onPress={() => void perform("pause-withdrawals", () => setMarketFinancePause(readiness.newOrdersPaused, !readiness.newWithdrawalsPaused, readiness.version))}>
-                  {t(readiness.newWithdrawalsPaused ? "settings.marketFinance.resume" : "settings.marketFinance.pause")}
-                </Button>
-              </div>
-              <p className="text-xs text-muted-foreground sm:col-span-2">{t("settings.marketFinance.pauseNote")}</p>
+          {readiness.mode !== "disabled" ? (
+            <div className="grid gap-3 rounded-xl border border-border p-3 sm:grid-cols-2">
+              {([
+                ["newTopupsPaused", "settings.marketFinance.pause.newTopups", true],
+                ["newOrdersPaused", "settings.marketFinance.newOrders", readiness.mode === "enabled"],
+                ["newWithdrawalsPaused", "settings.marketFinance.newWithdrawals", readiness.mode === "enabled"],
+              ] as const).filter(([, , shown]) => shown).map(([field, label]) => {
+                const paused = !!readiness[field];
+                return (
+                  <div key={field} className="flex items-center justify-between gap-3">
+                    <span className="flex flex-wrap items-center gap-2 text-sm">{t(label)}
+                      <WalletBadge tone={paused ? "warning" : "success"}>
+                        {t(paused ? "settings.marketFinance.statusPaused" : "settings.marketFinance.statusOpen")}
+                      </WalletBadge>
+                    </span>
+                    <Button size="sm" variant="outline" className="min-h-11" isDisabled={!!busy} aria-pressed={paused} onPress={() => setPause({ [field]: !paused })}>
+                      {t(paused ? "settings.marketFinance.resume" : "settings.marketFinance.pause")}
+                    </Button>
+                  </div>
+                );
+              })}
+              <p className="text-xs text-muted-foreground sm:col-span-2">{t("settings.marketFinance.pause.topupNote")}</p>
+              {readiness.mode === "enabled" ? <p className="text-xs text-muted-foreground sm:col-span-2">{t("settings.marketFinance.pauseNote")}</p> : null}
             </div>
           ) : null}
           {readiness.mode !== "enabled" && !readiness.canEnable ? (
@@ -334,13 +343,12 @@ export function MarketPaymentChannelsPanel() {
           ) : null}
           {readiness.paymentChannelBlockers.length ? (
             <ul className="grid gap-1 text-xs text-muted-foreground">
-              {readiness.paymentChannelBlockers.map((blocker) => {
-                const key = channelBlockerKey(blocker.code);
-                return <li key={blocker.code} className="flex justify-between gap-3">
-                  <span>{key ? t(key) : blocker.code}</span>
+              {readiness.paymentChannelBlockers.map((blocker) => (
+                <li key={blocker.code} className="flex justify-between gap-3">
+                  <span>{codeLabel(t, "settings.marketFinance.blocker.", blocker.code)}</span>
                   <span className="tabular-nums">{blocker.count}</span>
-                </li>;
-              })}
+                </li>
+              ))}
             </ul>
           ) : null}
         </div>
@@ -349,10 +357,16 @@ export function MarketPaymentChannelsPanel() {
       <div className="grid min-w-0 gap-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <h4 className="text-sm font-semibold">{t("settings.marketFinance.channels")}</h4>
-          <Button size="sm" isDisabled={!!busy} onPress={() => openDialog("create")}>
-            <Plus className="size-4" />{t("settings.marketFinance.addChannel")}
-          </Button>
+          <div className="flex flex-wrap gap-2">
+            <Button size="sm" variant="outline" isDisabled={!!busy} onPress={() => setRewrapOpen(true)}>
+              <KeyRound className="size-4" aria-hidden="true" />{t("settings.marketFinance.rewrap.button")}
+            </Button>
+            <Button size="sm" isDisabled={!!busy} onPress={() => openDialog("create")}>
+              <Plus className="size-4" />{t("settings.marketFinance.addChannel")}
+            </Button>
+          </div>
         </div>
+        <p className="text-xs text-muted-foreground">{t("settings.marketFinance.channel.canaryNote")}</p>
         {readiness?.webhookUrl ? (
           <div className="grid gap-1">
             <CopyableCodeField
@@ -370,10 +384,20 @@ export function MarketPaymentChannelsPanel() {
               <li key={channel.id} className="grid min-w-0 gap-3 rounded-lg border border-border bg-card p-4">
                 <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
                   <p className="min-w-0 truncate text-sm font-semibold">{channel.displayName}</p>
-                  <span className="rounded-full bg-muted px-2.5 py-1 text-xs font-medium">
-                    {t(channel.enabled ? "settings.marketFinance.channelActive" : "settings.marketFinance.channelStopped")}
-                  </span>
+                  <div className="flex flex-wrap items-center gap-2">
+                    {(() => {
+                      const rollout = channel.rolloutState ?? (channel.enabled ? "live" : "off");
+                      return <WalletBadge tone={rollout === "live" ? "success" : rollout === "canary" ? "accent" : "neutral"} pulse={rollout === "canary"}>
+                        {t(`settings.marketFinance.channel.rollout.${rollout}`)}
+                      </WalletBadge>;
+                    })()}
+                    <span className="rounded-full bg-muted px-2.5 py-1 text-xs font-medium">
+                      {t(channel.enabled ? "settings.marketFinance.channelActive" : "settings.marketFinance.channelStopped")}
+                    </span>
+                  </div>
                 </div>
+                {channel.promotedAt ? <p className="text-xs text-muted-foreground">{t("settings.marketFinance.channel.promotedAt", { time: ownerDateText(channel.promotedAt, locale) })}</p> : null}
+                {channel.settings ? <p className="text-xs text-muted-foreground">{channelSettingsSummary(channel, t)}</p> : null}
                 <div className="grid gap-1 text-xs text-muted-foreground sm:grid-cols-3">
                   <span className="flex items-center gap-1.5">{channel.verified ? <CheckCircle2 className="size-3.5" /> : <AlertTriangle className="size-3.5" />}{t(channel.verified ? "settings.marketFinance.verified" : "settings.marketFinance.unverified")}</span>
                   <span className="flex items-center gap-1.5">{channel.webhookVerified ? <CheckCircle2 className="size-3.5" /> : <AlertTriangle className="size-3.5" />}{t(channel.webhookMode === "poll_only" ? "settings.marketFinance.webhookMode.poll_only" : channel.webhookVerified ? "settings.marketFinance.webhookVerified" : "settings.marketFinance.webhookPending")}</span>
@@ -384,6 +408,9 @@ export function MarketPaymentChannelsPanel() {
                   <Button size="sm" variant="outline" isDisabled={!!busy || !channel.verified} onPress={() => void perform(channel.id, () => setMarketPaymentChannelEnabled(channel.id, !channel.enabled, channel.version))}>
                     {channel.enabled ? t("settings.marketFinance.stopChannel") : t("settings.marketFinance.startChannel")}
                   </Button>
+                  {channel.settings ? <Button size="sm" variant="outline" isDisabled={!!busy} onPress={() => { setError(""); setSettingsChannel(channel); }}>
+                    <SlidersHorizontal className="size-4" aria-hidden="true" />{t("settings.marketFinance.channel.settings")}
+                  </Button> : null}
                   <Button size="sm" variant="ghost" aria-expanded={manageChannelId === channel.id} isDisabled={!!busy} onPress={() => setManageChannelId((current) => current === channel.id ? null : channel.id)}>{t("settings.marketFinance.manageChannel")}</Button>
                 </div>
                 {manageChannelId === channel.id ? <div className="flex flex-wrap gap-2 rounded-md bg-muted/60 p-2">
@@ -454,24 +481,29 @@ export function MarketPaymentChannelsPanel() {
         </Modal.Container>
       </Modal.Backdrop>
 
-      {cases.length ? (
-        <div className="grid min-w-0 gap-3">
-          <h4 className="text-sm font-semibold">{t("settings.marketFinance.cases", { count: cases.length })}</h4>
-          <ul className="grid gap-2">
-            {cases.map((item) => (
-              <li key={item.id} className="flex min-w-0 flex-wrap items-center justify-between gap-2 rounded-md border border-border px-3 py-2 text-sm">
-                <span className="min-w-0 break-all font-medium">{item.code}</span>
-                <span className="min-w-0 break-all font-mono text-xs text-muted-foreground">{item.objectKind}:{item.objectId}</span>
-              </li>
-            ))}
-          </ul>
-          {casesNextCursor ? <Button size="sm" variant="outline" isDisabled={!!busy || casesLoadingMore} onPress={() => void loadMoreCases()}>
-            {casesLoadingMore ? <Loader2 className="size-4 animate-spin" aria-hidden="true" /> : null}
-            {t("settings.marketFinance.casesLoadMore")}
-          </Button> : null}
-          <p className="text-xs text-muted-foreground">{t("settings.marketFinance.caseNote")}</p>
-        </div>
-      ) : null}
+      <MarketChannelSettingsDialog channel={settingsChannel} onClose={() => setSettingsChannel(null)} onSaved={() => reloadCore().then(() => setNotice(t("settings.marketFinance.channel.settingsSaved")))} />
+      <ConfirmAlertDialog
+        open={rewrapOpen}
+        title={t("settings.marketFinance.rewrap.title")}
+        description={t("settings.marketFinance.rewrap.note")}
+        confirmLabel={t("settings.marketFinance.rewrap.button")}
+        cancelLabel={t("common.cancel")}
+        busy={busy === "rewrap"}
+        onConfirm={confirmRewrap}
+        onOpenChange={(open) => { if (busy !== "rewrap") setRewrapOpen(open); }}
+      />
+      {readiness ? <MarketFinanceEnableDialog
+        open={enableOpen}
+        readiness={readiness}
+        busy={busy === "enable"}
+        error={enableError}
+        onConfirm={() => void confirmEnable()}
+        onClose={() => setEnableOpen(false)}
+      /> : null}
+
+      <MarketFinanceCaseDesk refreshKey={refreshKey} onChanged={reloadCore} />
+      <MarketFinanceUserLookup />
+      <MarketFinanceEarningHolds refreshKey={refreshKey} onChanged={reloadCore} />
       <MarketFinanceTopupRecoveryPanel onRecovered={reload} />
       <MarketFinanceTransfersPanel financeMode={readiness?.mode ?? "disabled"} withdrawalsPaused={readiness?.newWithdrawalsPaused ?? false} />
       <MarketFinanceDisputesPanel />

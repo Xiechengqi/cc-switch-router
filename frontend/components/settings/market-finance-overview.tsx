@@ -1,0 +1,80 @@
+"use client";
+
+/* Owner finance overview: inverted slate stat section with dot texture and
+ * an accent glow — the console's one high-contrast moment. */
+
+import * as React from "react";
+import { WalletSectionLabel } from "@/components/market/wallet-primitives";
+import { useLocaleText } from "@/components/i18n/locale-provider";
+import { getMarketFinanceOverview, type MarketFinanceOverview } from "@/lib/market-wallet-api";
+import { formatMinorUsd, formatWalletUnits } from "@/lib/market-wallet-money";
+import type { MessageKey } from "@/lib/i18n";
+import { cn } from "@/lib/utils";
+
+type Stat = { key: MessageKey; value: string; alert?: boolean };
+
+export function MarketFinanceOverviewSection({ refreshKey }: { refreshKey: number }) {
+  const { locale, t } = useLocaleText();
+  const [overview, setOverview] = React.useState<MarketFinanceOverview | null>(null);
+  const [error, setError] = React.useState("");
+
+  React.useEffect(() => {
+    let active = true;
+    getMarketFinanceOverview()
+      .then((value) => { if (active) { setOverview(value); setError(""); } })
+      .catch((cause) => { if (active) setError(cause instanceof Error ? cause.message : String(cause)); });
+    return () => { active = false; };
+  }, [refreshKey]);
+
+  if (!overview) {
+    return error ? <p role="alert" className="text-sm text-destructive">{t("settings.marketFinance.overview.unavailable", { message: error })}</p> : null;
+  }
+
+  const units = (raw: string) => formatWalletUnits(raw, "$", locale);
+  const positive = (raw: string) => { try { return BigInt(raw) > 0n; } catch { return false; } };
+  const stats: Stat[] = [
+    { key: "settings.marketFinance.overview.walletPosted", value: units(overview.walletPostedUnits) },
+    { key: "settings.marketFinance.overview.walletHeld", value: units(overview.walletHeldUnits) },
+    { key: "settings.marketFinance.overview.unfulfilled", value: units(overview.unfulfilledUnits) },
+    { key: "settings.marketFinance.overview.buyerRefundHeld", value: units(overview.buyerRefundHeldUnits) },
+    { key: "settings.marketFinance.overview.providerPending", value: units(overview.providerPendingUnits) },
+    { key: "settings.marketFinance.overview.providerAvailable", value: units(overview.providerAvailableUnits) },
+    { key: "settings.marketFinance.overview.providerHeld", value: units(overview.providerHeldUnits) },
+    { key: "settings.marketFinance.overview.ownerLoss", value: units(overview.ownerLossUnits), alert: positive(overview.ownerLossUnits) },
+    { key: "settings.marketFinance.overview.creditedTopups", value: formatMinorUsd(overview.creditedTopupMinor) },
+    { key: "settings.marketFinance.overview.gatewayCost", value: formatMinorUsd(overview.estimatedGatewayCostMinor) },
+    { key: "settings.marketFinance.overview.openCases", value: overview.openCases.toLocaleString(locale) },
+    { key: "settings.marketFinance.overview.criticalCases", value: overview.openCriticalCases.toLocaleString(locale), alert: overview.openCriticalCases > 0 },
+    { key: "settings.marketFinance.overview.heldLots", value: overview.heldEarningLots.toLocaleString(locale) },
+  ];
+
+  return (
+    <section
+      aria-labelledby="market-finance-overview-title"
+      className="relative isolate overflow-hidden rounded-2xl bg-slate-900 p-5 text-white shadow-xl sm:p-7"
+    >
+      <div
+        aria-hidden="true"
+        className="pointer-events-none absolute inset-0 -z-10 opacity-[0.04]"
+        style={{ backgroundImage: "radial-gradient(circle, white 1px, transparent 1px)", backgroundSize: "32px 32px" }}
+      />
+      <div aria-hidden="true" className="pointer-events-none absolute -right-24 -top-24 -z-10 size-72 rounded-full bg-[#0052FF] opacity-25 blur-[120px]" />
+      <div className="grid gap-2">
+        <WalletSectionLabel tone="inverted">{t("settings.marketFinance.overview.label")}</WalletSectionLabel>
+        <h4 id="market-finance-overview-title" className="font-display text-xl font-semibold tracking-tight sm:text-2xl">
+          {t("settings.marketFinance.overview.title")}
+        </h4>
+      </div>
+      <dl className="mt-5 grid grid-cols-2 gap-x-4 gap-y-5 lg:grid-cols-4">
+        {stats.map((stat) => (
+          <div key={stat.key} className="min-w-0 border-l border-white/10 pl-3">
+            <dt className="text-xs text-white/60">{t(stat.key)}</dt>
+            <dd className={cn("mt-1 break-all text-lg font-semibold tabular-nums tracking-tight sm:text-xl", stat.alert && "text-amber-300")}>
+              {stat.value}
+            </dd>
+          </div>
+        ))}
+      </dl>
+    </section>
+  );
+}

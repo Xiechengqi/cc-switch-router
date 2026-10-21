@@ -12,12 +12,17 @@ import { exactTransferMinor, marketFinanceActionsForMode, validTronTransactionId
 import {
   getMarketFinanceTransfers,
   transitionMarketFinanceTransfer,
+  validMarketReasonCode,
   type MarketFinanceTransfer,
   type MarketFinanceTransferAction,
 } from "@/lib/market-wallet-api";
-import { formatWalletUnits } from "@/lib/market-wallet-money";
+import { formatMinorUsd, formatWalletUnits, parseNonNegativeUsdMinor } from "@/lib/market-wallet-money";
+import { localDateTimeToIso } from "@/lib/market-explorer";
+import { CopyTextButton, TronTransactionLink } from "@/components/market/wallet-primitives";
+import { OwnerField, ownerErrorText } from "@/components/settings/market-finance-shared";
 
 type TransferKind = "withdrawals" | "refunds";
+// Admin rows may carry the recorded transfer hash once one exists.
 type Selection = { kind: TransferKind; transfer: MarketFinanceTransfer };
 
 export function MarketFinanceTransfersPanel({ financeMode, withdrawalsPaused = false }: { financeMode: "disabled" | "shadow" | "enabled"; withdrawalsPaused?: boolean }) {
@@ -29,6 +34,10 @@ export function MarketFinanceTransfersPanel({ financeMode, withdrawalsPaused = f
   const [reference, setReference] = React.useState("");
   const [reason, setReason] = React.useState("");
   const [confirmed, setConfirmed] = React.useState(false);
+  const [actualAmount, setActualAmount] = React.useState("");
+  const [transferredAt, setTransferredAt] = React.useState("");
+  const [networkFee, setNetworkFee] = React.useState("");
+  const [varianceReason, setVarianceReason] = React.useState("");
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
   const [notice, setNotice] = React.useState("");
@@ -61,6 +70,11 @@ export function MarketFinanceTransfersPanel({ financeMode, withdrawalsPaused = f
     setReference("");
     setReason("");
     setConfirmed(false);
+    // The Owner types what was actually sent; never prefill the request.
+    setActualAmount("");
+    setTransferredAt("");
+    setNetworkFee("");
+    setVarianceReason("");
     setError("");
   };
 
@@ -69,9 +83,18 @@ export function MarketFinanceTransfersPanel({ financeMode, withdrawalsPaused = f
   const reasonReady = !needsReason || /^[a-z0-9_]{1,80}$/.test(reason.trim());
   const amountMinor = selection ? exactTransferMinor(selection.transfer.amountUnits) : null;
   const referenceReady = action !== "mark_paid" || validTronTransactionId(reference);
+  const actualMinor = parseNonNegativeUsdMinor(actualAmount);
+  const actualReady = actualMinor != null && actualMinor > 0;
+  const transferredAtIso = localDateTimeToIso(transferredAt);
+  const transferredAtReady = !!transferredAtIso && Date.parse(transferredAtIso) <= Date.now() + 5 * 60_000;
+  const feeMinor = networkFee.trim() ? parseNonNegativeUsdMinor(networkFee) : null;
+  const feeReady = !networkFee.trim() || feeMinor != null;
+  const hasVariance = actualReady && amountMinor != null && actualMinor !== amountMinor;
+  const varianceReady = !hasVariance || validMarketReasonCode(varianceReason);
+  const paidDetailsReady = action !== "mark_paid" || (actualReady && transferredAtReady && feeReady && varianceReady);
   const canSubmit = !!selection && !busy && amountMinor != null
     && marketFinanceActionsForMode(selection.transfer.status, selection.kind, financeMode, withdrawalsPaused).includes(action)
-    && reasonReady && referenceReady && (!needsAttestation || confirmed);
+    && reasonReady && referenceReady && paidDetailsReady && (!needsAttestation || confirmed);
 
   const submit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -81,14 +104,20 @@ export function MarketFinanceTransfersPanel({ financeMode, withdrawalsPaused = f
     setNotice("");
     try {
       await transitionMarketFinanceTransfer(selection.kind, selection.transfer.id, action, selection.transfer.version, {
-        ...(action === "mark_paid" ? { externalReference: reference.trim(), actualAmountMinor: amountMinor } : {}),
+        ...(action === "mark_paid" && actualMinor != null && transferredAtIso ? {
+          externalReference: reference.trim(),
+          actualAmountMinor: actualMinor,
+          transferredAt: transferredAtIso,
+          ...(feeMinor != null ? { networkFeeMinor: feeMinor } : {}),
+          ...(hasVariance ? { varianceReason: varianceReason.trim() } : {}),
+        } : {}),
         ...(needsReason ? { reason: reason.trim() } : {}),
       });
       await reload();
       setSelection(null);
       setNotice(t("settings.marketFinance.transferUpdated"));
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      setError(ownerErrorText(t, cause));
       // On a version conflict the Owner must refresh the current transfer
       // before choosing another transition. Never retry an offline payment
       // action against a stale snapshot.
@@ -106,7 +135,11 @@ export function MarketFinanceTransfersPanel({ financeMode, withdrawalsPaused = f
         <span className="font-semibold tabular-nums">{formatWalletUnits(item.amountUnits, "$", locale)}</span>
         <span className="text-xs text-muted-foreground">{t(`marketProviderFinance.status.${item.status}` as Parameters<typeof t>[0])}</span>
       </div>
-      <p className="min-w-0 break-all font-mono text-xs text-muted-foreground">{item.providerUserId ?? item.userId} · {item.address}</p>
+      <div className="flex min-w-0 items-center gap-2">
+        <p className="min-w-0 flex-1 break-all font-mono text-xs text-muted-foreground">{item.providerUserId ?? item.userId} · {item.address}</p>
+        <CopyTextButton value={item.address} label={t("settings.marketFinance.transfer.copyAddress")} />
+      </div>
+      {item.externalReference ? <p className="flex flex-wrap items-center gap-1 text-xs text-muted-foreground">{t("settings.marketFinance.transfer.reference")}: <TronTransactionLink hash={item.externalReference} /></p> : null}
       <Button size="sm" variant="outline" className="min-h-11 justify-self-start whitespace-nowrap" isDisabled={busy || !marketFinanceActionsForMode(item.status, kind, financeMode, withdrawalsPaused).length} onPress={() => open(kind, item)}>
         {t("settings.marketFinance.processTransfer")}
       </Button>
@@ -137,7 +170,10 @@ export function MarketFinanceTransfersPanel({ financeMode, withdrawalsPaused = f
             <Modal.Body className="grid max-h-[65vh] min-w-0 gap-3 overflow-y-auto text-sm">
               {selection ? <>
                 <p className="font-semibold tabular-nums">{formatWalletUnits(selection.transfer.amountUnits, "$", locale)}</p>
-                <p className="break-all font-mono text-xs">USDT / TRON · {selection.transfer.address}</p>
+                <div className="flex min-w-0 items-center gap-2">
+                  <p className="min-w-0 flex-1 break-all font-mono text-xs">USDT / TRON · {selection.transfer.address}</p>
+                  <CopyTextButton value={selection.transfer.address} label={t("settings.marketFinance.transfer.copyAddress")} />
+                </div>
                 <p className="text-xs text-muted-foreground">{t("settings.marketFinance.transferStatus")}: {t(`marketProviderFinance.status.${selection.transfer.status}` as Parameters<typeof t>[0])}</p>
                 <label className="grid gap-1">
                   <span>{t("settings.marketFinance.transferAction")}</span>
@@ -152,7 +188,15 @@ export function MarketFinanceTransfersPanel({ financeMode, withdrawalsPaused = f
                     aria-invalid={!!reference && !referenceReady} minLength={64} maxLength={64}
                     className="h-11 min-w-0 rounded-md border border-input bg-background px-3 font-mono text-xs focus-visible:outline-2 focus-visible:outline-ring aria-invalid:border-destructive" />
                   <span className="text-xs text-muted-foreground">{t("settings.marketFinance.transactionIdHelp")}</span>
+                  {referenceReady && reference ? <TronTransactionLink hash={reference} /> : null}
                 </label> : null}
+                {action === "mark_paid" ? <div className="grid gap-3 rounded-xl border border-border p-3">
+                  <p className="text-xs font-medium">{t("settings.marketFinance.transfer.requested", { amount: amountMinor != null ? formatMinorUsd(amountMinor) : formatWalletUnits(selection.transfer.amountUnits, "$", locale) })}</p>
+                  <OwnerField label={t("settings.marketFinance.transfer.actualAmount")} help={t("settings.marketFinance.transfer.actualHelp")} inputMode="decimal" value={actualAmount} onChange={(event) => setActualAmount(event.target.value)} invalid={!!actualAmount && !actualReady} placeholder="0.00" />
+                  <OwnerField type="datetime-local" label={t("settings.marketFinance.transfer.transferredAt")} value={transferredAt} onChange={(event) => setTransferredAt(event.target.value)} invalid={!!transferredAt && !transferredAtReady} />
+                  <OwnerField label={t("settings.marketFinance.transfer.networkFee")} inputMode="decimal" value={networkFee} onChange={(event) => setNetworkFee(event.target.value)} invalid={!feeReady} placeholder="0.00" />
+                  {hasVariance ? <OwnerField label={t("settings.marketFinance.transfer.varianceReason")} help={t("settings.marketFinance.transfer.varianceHelp")} value={varianceReason} onChange={(event) => setVarianceReason(event.target.value)} invalid={!!varianceReason && !varianceReady} maxLength={64} placeholder="network_fee_deducted" inputClassName="font-mono" /> : null}
+                </div> : null}
                 {needsReason ? <label className="grid gap-1">
                   <span>{t("settings.marketFinance.transferReason")}</span>
                   <input value={reason} onChange={(event) => setReason(event.target.value)} placeholder="no_external_transfer"

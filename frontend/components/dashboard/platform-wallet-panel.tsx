@@ -13,7 +13,12 @@ import { ArrowUpRight, Ban, CheckCircle2, Clock3, CreditCard, Loader2, RefreshCw
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { MarketWalletRefundPanel } from "@/components/dashboard/market-wallet-refund-panel";
+import { MarketBuyerDisputesList } from "@/components/dashboard/market-buyer-disputes-list";
+import { MarketNotificationsBell } from "@/components/dashboard/market-notifications-bell";
+import { WalletBadge } from "@/components/market/wallet-primitives";
 import { ApiError } from "@/lib/api";
+import { messages, type MessageKey } from "@/lib/i18n";
+import { paymentTokenLabel } from "@/lib/market-payment-tokens";
 import { DASHBOARD_ACCOUNT_BILLING_PATH } from "@/lib/dashboard-nav";
 import {
   createMarketWalletTopup,
@@ -32,7 +37,7 @@ import {
   type MarketTopupGatewayStatus,
   type MarketWalletTransaction,
 } from "@/lib/market-wallet-api";
-import { formatTopupCountdown, formatWalletUnits, formatWalletUnitsAsCny, parseUsdMinor, safeMarketReturnPath, shouldResetTopupIdempotency, topupAutoCheckCountdown, topupCancelAction, topupDisplayStatus, verifiedPayableCheckoutUrl, walletTopupCheckoutHref } from "@/lib/market-wallet-money";
+import { TOPUP_PRESET_MINOR, formatMinorUsd, formatTopupCountdown, formatWalletUnits, formatWalletUnitsAsCny, parseTopupMinor, parseUsdMinor, safeMarketReturnPath, shouldResetTopupIdempotency, topupAutoCheckCountdown, topupBounds, topupCancelAction, topupDisplayStatus, verifiedPayableCheckoutUrl, walletTopupCheckoutHref } from "@/lib/market-wallet-money";
 
 const CLOSED_TOPUP_STATUS = new Set(["credited", "expired", "cancelled"]);
 
@@ -40,8 +45,40 @@ function errorText(cause: unknown) {
   return cause instanceof Error ? cause.message : String(cause);
 }
 
+function walletEntryKey(sourceKind: string): MessageKey {
+  const key = `marketWallet.entry.${sourceKind}`;
+  return (key in messages.en ? key : "marketWallet.entry.other") as MessageKey;
+}
+
+function detailMinor(details: Record<string, unknown> | undefined, name: string) {
+  const value = details?.[name];
+  return typeof value === "number" && Number.isSafeInteger(value) ? value : null;
+}
+
+/** Localized message for a failed top-up creation. */
+function topupErrorKey(cause: unknown): MessageKey | null {
+  if (!(cause instanceof ApiError)) return null;
+  switch (cause.code) {
+    case "MARKET_TOPUP_PENDING_LIMIT": return "marketWallet.pendingLimit";
+    case "MARKET_TOPUP_ABANDONED_LIMIT": return "marketWallet.abandonedLimit";
+    case "MARKET_TOPUP_REVIEW_LIMIT": return "marketWallet.reviewLimit";
+    case "MARKET_TOPUP_CHECKOUT_UNAVAILABLE": return "marketWallet.checkoutUnavailable";
+    case "MARKET_TOPUP_PAUSED": return "marketWallet.error.topupPaused";
+    case "DUJIAOPAY_RATE_LIMITED": return "marketWallet.error.gatewayRateLimited";
+    case "DUJIAOPAY_NO_CAPACITY": return "marketWallet.error.gatewayNoCapacity";
+    case "DUJIAOPAY_UNAVAILABLE": return "marketWallet.error.gatewayUnavailable";
+    case "DUJIAOPAY_REJECTED": return "marketWallet.error.gatewayRejected";
+    case "DUJIAOPAY_AUTH_FAILED": return "marketWallet.error.gatewayAuthFailed";
+    default: return null;
+  }
+}
+
 function closePaymentWindow(paymentWindow: Window | null) {
   try { paymentWindow?.close(); } catch { /* The payment tab may have navigated away. */ }
+}
+
+function safeBigInt(raw: string) {
+  try { return BigInt(raw); } catch { return 0n; }
 }
 
 function dateText(value: string, locale: string) {
@@ -99,6 +136,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
   const [transactionCursor, setTransactionCursor] = React.useState<string | null>(null);
   const [returnedTopup, setReturnedTopup] = React.useState<MarketWalletTopup | null>(null);
   const [channelId, setChannelId] = React.useState("");
+  const [tokenId, setTokenId] = React.useState("");
   const [amount, setAmount] = React.useState("");
   const [amountTouched, setAmountTouched] = React.useState(false);
   const [busy, setBusy] = React.useState("");
@@ -270,14 +308,27 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
     return () => { active = false; if (timeout) clearTimeout(timeout); };
   }, [returnedTopupId, reload]);
 
-  const parsedAmount = parseUsdMinor(amount);
+  const selectedChannel = channels.find((channel) => channel.id === channelId) ?? null;
+  const directChannel = selectedChannel?.orderMode === "direct";
+  const channelMethods = React.useMemo(() => directChannel ? selectedChannel?.methods ?? [] : [], [directChannel, selectedChannel]);
+  const bounds = topupBounds(selectedChannel);
+  const parsedAmount = parseTopupMinor(amount, bounds);
   const amountError = amountTouched && amount && parsedAmount == null;
+  const methodReady = !directChannel || channelMethods.some((method) => method.tokenId === tokenId);
+
+  React.useEffect(() => {
+    // A payment method belongs to one channel; a single method is preselected,
+    // several require an explicit choice because they settle on different chains.
+    setTokenId((current) => channelMethods.some((method) => method.tokenId === current)
+      ? current
+      : channelMethods.length === 1 ? channelMethods[0].tokenId : "");
+  }, [channelMethods]);
   const matchingUnsettled = topups.find((order) =>
     order.amountMinor === parsedAmount
       && (["verifying", "review_required"].includes(order.status)
         || (!!order.buyerAbandonedAt && !CLOSED_TOPUP_STATUS.has(order.status))));
   const startTopup = async () => {
-    if (busyRef.current || !wallet.canTopup || !channelId || parsedAmount == null) return;
+    if (busyRef.current || !wallet.canTopup || !channelId || parsedAmount == null || !methodReady) return;
     const attemptedOrderId = idempotencyRef.current?.orderId;
     if (attemptedOrderId && topups.some((order) => order.id === attemptedOrderId
       && shouldResetTopupIdempotency(order))) {
@@ -303,13 +354,13 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
       try { paymentWindow?.close(); } catch { /* The manual payment link remains available. */ }
       paymentWindow = null;
     }
-    const fingerprint = `${channelId}:${parsedAmount}`;
+    const fingerprint = `${channelId}:${parsedAmount}:${directChannel ? tokenId : ""}`;
     if (idempotencyRef.current?.fingerprint !== fingerprint) {
       idempotencyRef.current = { fingerprint, key: crypto.randomUUID() };
     }
     const attempt = idempotencyRef.current;
     try {
-      const order = await createMarketWalletTopup(channelId, parsedAmount, attempt.key);
+      const order = await createMarketWalletTopup(channelId, parsedAmount, attempt.key, directChannel ? tokenId : undefined);
       if (idempotencyRef.current === attempt) attempt.orderId = order.id;
       if (shouldResetTopupIdempotency(order)) idempotencyRef.current = null;
       reloadVersionRef.current += 1;
@@ -361,15 +412,14 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
       }
     } catch (cause) {
       closePaymentWindow(paymentWindow);
-      setError(cause instanceof ApiError && cause.code === "MARKET_TOPUP_PENDING_LIMIT"
-        ? t("marketWallet.pendingLimit")
-        : cause instanceof ApiError && cause.code === "MARKET_TOPUP_ABANDONED_LIMIT"
-          ? t("marketWallet.abandonedLimit")
-        : cause instanceof ApiError && cause.code === "MARKET_TOPUP_REVIEW_LIMIT"
-          ? t("marketWallet.reviewLimit")
-        : cause instanceof ApiError && cause.code === "MARKET_TOPUP_CHECKOUT_UNAVAILABLE"
-          ? t("marketWallet.checkoutUnavailable")
-          : errorText(cause));
+      const rangeMin = cause instanceof ApiError ? detailMinor(cause.details, "minTopupMinor") : null;
+      const rangeMax = cause instanceof ApiError ? detailMinor(cause.details, "maxTopupMinor") : null;
+      const key = topupErrorKey(cause);
+      setError(cause instanceof ApiError && cause.code === "MARKET_TOPUP_AMOUNT_OUT_OF_RANGE"
+        ? t("marketWallet.error.amountOutOfRange", {
+          min: formatMinorUsd(rangeMin ?? bounds.min), max: formatMinorUsd(rangeMax ?? bounds.max),
+        })
+        : key ? t(key) : errorText(cause));
       void reload().catch(() => {});
     } finally {
       busyRef.current = false;
@@ -380,7 +430,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
   const submitTopup = (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setAmountTouched(true);
-    if (busyRef.current || !loaded || !wallet.canTopup || !channelId || parsedAmount == null) return;
+    if (busyRef.current || !loaded || !wallet.canTopup || !channelId || parsedAmount == null || !methodReady) return;
     if (matchingUnsettled) setReviewRetryConfirm(true);
     else void startTopup();
   };
@@ -553,9 +603,12 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
           <h1 className="break-words text-2xl font-semibold tracking-tight">{t("marketWallet.title")}</h1>
           <p className="mt-1 text-sm text-muted-foreground">{t("marketWallet.subtitle")}</p>
         </div>
-        <Button variant="outline" size="sm" isDisabled={!!busy} onPress={() => void reload().catch((cause) => setError(errorText(cause)))}>
-          <RefreshCw className="size-4" aria-hidden="true" />{t("common.reload")}
-        </Button>
+        <div className="flex items-center gap-2">
+          <MarketNotificationsBell />
+          <Button variant="outline" size="sm" isDisabled={!!busy} onPress={() => void reload().catch((cause) => setError(errorText(cause)))}>
+            <RefreshCw className="size-4" aria-hidden="true" />{t("common.reload")}
+          </Button>
+        </div>
       </header>
 
       {error ? <p role="alert" className="rounded-md border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">{error}</p> : null}
@@ -587,11 +640,14 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
           <p className="mt-2 break-all text-3xl font-semibold tabular-nums tracking-tight sm:text-4xl">{displayCurrency === "CNY" && fxRateFresh ? formatWalletUnitsAsCny(wallet.availableUnits, fxRateMicros, locale) : formatWalletUnits(wallet.availableUnits)}</p>
           {displayCurrency === "CNY" && fxRateFresh ? <p className="mt-1 text-xs text-muted-foreground">{t("marketWallet.displayOnly", { amount: formatWalletUnits(wallet.availableUnits) })}</p> : null}
           <p className="mt-2 text-sm text-muted-foreground">{t("marketWallet.held")}: {displayCurrency === "CNY" && fxRateFresh ? formatWalletUnitsAsCny(wallet.heldUnits, fxRateMicros, locale) : formatWalletUnits(wallet.heldUnits)}</p>
+          {wallet.committedUnits && wallet.committedUnits !== "0" ? <p className="mt-1 text-sm text-muted-foreground">{t("marketWallet.committed")}: {formatWalletUnits(wallet.committedUnits)}</p> : null}
         </div>
         {wallet.canTopup ? <form className="grid min-w-0 content-start gap-3" onSubmit={(event) => void submitTopup(event)}>
           <p className="text-sm font-semibold">{t("marketWallet.topup")}</p>
           <label className="grid min-w-0 gap-1 text-sm">
-            <span>{t("marketWallet.channel")}</span>
+            <span className="flex flex-wrap items-center gap-2">{t("marketWallet.channel")}
+              {selectedChannel?.canary ? <WalletBadge tone="warning" pulse>{t("marketWallet.canaryBadge")}</WalletBadge> : null}
+            </span>
             <select
               className="h-11 min-w-0 rounded-md border border-input bg-background px-3 outline-2 outline-transparent focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-50"
               value={channelId} onChange={(event) => { setChannelId(event.target.value); idempotencyRef.current = null; }}
@@ -601,25 +657,70 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
               {channels.map((channel) => <option key={channel.id} value={channel.id}>{channel.displayName}</option>)}
             </select>
           </label>
-          <label className="grid min-w-0 gap-1 text-sm">
-            <span>{t("marketWallet.amount")}</span>
-            <input
-              id="market-wallet-topup-amount"
-              inputMode="decimal" autoComplete="off" value={amount}
-              onChange={(event) => { setAmount(event.target.value); idempotencyRef.current = null; }}
-              onBlur={() => setAmountTouched(true)}
-              aria-invalid={!!amountError} aria-describedby="wallet-amount-help"
-              className="h-11 min-w-0 rounded-md border border-input bg-background px-3 outline-2 outline-transparent focus-visible:outline-ring aria-invalid:border-destructive disabled:cursor-not-allowed disabled:opacity-50"
-              placeholder="10.00" disabled={!wallet.canTopup || !!busy}
-            />
+          {selectedChannel?.canary ? <p className="text-xs text-amber-800">{t("marketWallet.canaryHelp")}</p> : null}
+          <fieldset className="grid min-w-0 gap-2 text-sm" aria-describedby="wallet-amount-help">
+            <legend className="mb-1">{t("marketWallet.amount")}</legend>
+            <div className="grid grid-cols-3 gap-2 sm:grid-cols-5">
+              {TOPUP_PRESET_MINOR.map((minor) => {
+                const allowed = minor >= bounds.min && minor <= bounds.max;
+                const pressed = parsedAmount === minor;
+                return <button
+                  key={minor} type="button" aria-pressed={pressed}
+                  disabled={!allowed || !wallet.canTopup || !!busy}
+                  onClick={() => { setAmount((minor / 100).toFixed(2)); setAmountTouched(true); idempotencyRef.current = null; }}
+                  className={`min-h-11 rounded-xl border text-sm font-semibold tabular-nums transition-all duration-200 ease-out focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-40 motion-reduce:transition-none ${pressed
+                    ? "border-transparent bg-gradient-to-r from-[#0052FF] to-[#4D7CFF] text-white shadow-[0_4px_14px_rgba(0,82,255,0.25)]"
+                    : "border-border bg-background hover:-translate-y-0.5 hover:border-accent/30 hover:shadow-sm motion-reduce:hover:translate-y-0"}`}
+                >
+                  ${minor / 100}
+                </button>;
+              })}
+            </div>
+            <label className="grid min-w-0 gap-1">
+              <span className="text-xs text-muted-foreground">{t("marketWallet.customAmount")}</span>
+              <span className="relative grid">
+                <span className="pointer-events-none absolute inset-y-0 left-3 flex items-center text-muted-foreground" aria-hidden="true">$</span>
+                <input
+                  id="market-wallet-topup-amount"
+                  inputMode="decimal" autoComplete="off" value={amount}
+                  onChange={(event) => { setAmount(event.target.value); idempotencyRef.current = null; }}
+                  onBlur={() => setAmountTouched(true)}
+                  aria-invalid={!!amountError} aria-describedby="wallet-amount-help"
+                  className="h-11 min-w-0 rounded-md border border-input bg-background pl-7 pr-3 tabular-nums outline-2 outline-transparent focus-visible:outline-ring aria-invalid:border-destructive disabled:cursor-not-allowed disabled:opacity-50"
+                  placeholder="10.00" disabled={!wallet.canTopup || !!busy}
+                />
+              </span>
+            </label>
             <span id="wallet-amount-help" className={`min-h-[1lh] text-xs ${amountError ? "text-destructive" : "text-muted-foreground"}`}>
-              {amountError ? t("marketWallet.amountError") : t("marketWallet.amountHelp")}
+              {amountError
+                ? t("marketWallet.amountRangeError", { min: formatMinorUsd(bounds.min), max: formatMinorUsd(bounds.max) })
+                : t("marketWallet.amountRangeHelp", { min: formatMinorUsd(bounds.min), max: formatMinorUsd(bounds.max) })}
             </span>
-          </label>
+          </fieldset>
+          {directChannel ? <fieldset className="grid min-w-0 gap-2 text-sm">
+            <legend className="mb-1">{t("marketWallet.paymentMethod")}</legend>
+            {channelMethods.length ? <div role="radiogroup" aria-label={t("marketWallet.paymentMethod")} className="grid gap-2 sm:grid-cols-2">
+              {channelMethods.map((method) => (
+                <label key={method.tokenId} className="flex min-h-11 cursor-pointer items-center gap-3 rounded-xl border border-border bg-background px-3 py-2 transition-all duration-200 ease-out hover:border-accent/30 has-[:checked]:border-accent has-[:checked]:bg-accent/5 has-[:checked]:shadow-[0_4px_14px_rgba(0,82,255,0.12)] has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-2 has-[:focus-visible]:outline-ring has-[:disabled]:cursor-not-allowed has-[:disabled]:opacity-50 motion-reduce:transition-none">
+                  <input
+                    type="radio" name="market-wallet-topup-method" value={method.tokenId}
+                    checked={tokenId === method.tokenId} disabled={!!busy}
+                    onChange={() => { setTokenId(method.tokenId); idempotencyRef.current = null; }}
+                    className="size-4 accent-[#0052FF]"
+                  />
+                  <span className="grid min-w-0">
+                    <span className="font-semibold">{method.symbol || paymentTokenLabel(method.tokenId).symbol}</span>
+                    <span className="truncate text-xs text-muted-foreground">{method.chainName || paymentTokenLabel(method.tokenId).chainName}</span>
+                  </span>
+                </label>
+              ))}
+            </div> : <p className="text-xs text-muted-foreground">{t("marketWallet.noPaymentMethods")}</p>}
+            <p className="text-xs text-muted-foreground">{t("marketWallet.directMethodHelp")}</p>
+          </fieldset> : null}
           <WalletActionButton
             label={busy === "topup" ? t("marketWallet.creating") : t("marketWallet.pay")}
             phase={busy === "topup" ? "loading" : error ? "error" : "default"}
-            disabled={!loaded || !wallet.canTopup || !channels.length || parsedAmount == null || !!busy}
+            disabled={!loaded || !wallet.canTopup || !channels.length || parsedAmount == null || !methodReady || !!busy}
           />
           {matchingUnsettled ? <p className="text-xs text-amber-700">{t("marketWallet.reviewRetryNotice")}</p> : null}
           {!channels.length ? <p className="text-xs text-muted-foreground">{t("marketWallet.noChannelHelp")}</p> : null}
@@ -653,7 +754,11 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
               const activePayment = !abandoned && order.status === "pending"
                 && !["confirming", "paid", "expired", "canceled", "cancelled"].includes(gateway?.gatewayStatus ?? "");
               const countdown = activePayment ? topupAutoCheckCountdown(order.autoCloseAt, nowMs + serverOffsetMs) : null;
-              const checkoutUrl = verifiedPayableCheckoutUrl(order.status, order.checkoutUrl, gateway, abandoned, nowMs + serverOffsetMs);
+              const directOrder = order.orderMode === "direct";
+              const checkoutUrl = directOrder
+                ? (order.status === "pending" && !abandoned && order.hasPaymentInstructions ? walletTopupCheckoutHref(order.id) : null)
+                : verifiedPayableCheckoutUrl(order.status, order.checkoutUrl, gateway, abandoned, nowMs + serverOffsetMs);
+              const neverCreated = order.localCloseReason === "never_created";
               const pendingVerification = order.status === "pending" && gateway
                 && !gateway.canPay && !gateway.canCancel && !gateway.canAbandon;
               const canStopPayment = !abandoned && ["created", "creating", "create_unknown", "pending", "verifying", "review_required"].includes(order.status);
@@ -668,8 +773,12 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
                           : t("marketWallet.status.gateway_unknown");
               return <li key={order.id} className="flex min-w-0 flex-wrap items-center justify-between gap-2 rounded-md bg-muted/50 px-3 py-2 text-sm">
                 <div className="min-w-0">
-                  <p className="font-medium tabular-nums">${(order.amountMinor / 100).toFixed(2)}</p>
+                  <p className="flex flex-wrap items-center gap-2 font-medium tabular-nums">${(order.amountMinor / 100).toFixed(2)}
+                    {directOrder && order.paymentTokenId ? <span className="rounded-full bg-accent/10 px-2 py-0.5 text-[0.7rem] font-medium text-accent">{paymentTokenLabel(order.paymentTokenId).label}</span> : null}
+                  </p>
                   <p className="text-xs text-muted-foreground">{dateText(order.createdAt, locale)}</p>
+                  {neverCreated ? <p className="text-xs text-muted-foreground">{t("marketWallet.neverCreatedHelp")}</p> : null}
+                  {order.paidAt ? <p className="text-xs text-muted-foreground">{t("marketWallet.paidAt", { time: dateText(order.paidAt, locale) })}</p> : null}
                   {deadline && order.status === "pending" && !abandoned ? <p className="text-xs text-muted-foreground">{t("marketWallet.gatewayDeadline", { time: dateText(deadline, locale) })}</p> : null}
                   {countdown ? <p className={`mt-1 text-xs font-medium tabular-nums ${countdown.phase === "soon" ? "text-amber-700" : "text-muted-foreground"}`}>
                     {countdown.phase === "checking"
@@ -680,14 +789,14 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
                   {gateway?.gatewayStatus === "awaiting_payment" && gateway.canPay && order.status === "pending" && !abandoned ? <p className="text-xs text-muted-foreground">{t("marketWallet.awaitingMethodHelp")}</p> : null}
                   {order.status === "pending" && gateway && !gateway.canPay && !abandoned ? <p className="text-xs text-amber-700">{t(`marketWallet.payability.${gateway.payabilityReason ?? "gateway_unknown"}` as Parameters<typeof t>[0])}</p> : null}
                   {abandoned && !CLOSED_TOPUP_STATUS.has(order.status) ? <p className="text-xs text-muted-foreground">{t("marketWallet.abandonedHelp")}</p> : null}
-                  {order.status === "review_required" ? <p className="mt-1 text-xs text-amber-700">{t(order.reviewReason === "terminal_payment_marker" ? "marketWallet.reviewTerminalMarker" : order.reviewReason === "paid_receipt_invalid" ? "marketWallet.reviewInvalidReceipt" : "marketWallet.reviewHelp")}</p> : null}
+                  {order.status === "review_required" ? <p className="mt-1 text-xs text-amber-700">{t(order.reviewReason === "terminal_payment_marker" ? "marketWallet.reviewTerminalMarker" : order.reviewReason === "paid_receipt_invalid" ? "marketWallet.reviewInvalidReceipt" : order.reviewReason === "paid_terms_review" ? "marketWallet.reviewPaidTerms" : "marketWallet.reviewHelp")}</p> : null}
                   {order.buyerRecheckResult === "queued" ? <p role="status" className="mt-1 text-xs font-medium text-primary">{t("marketWallet.recheckQueued")}</p>
                     : order.buyerRecheckResult === "retrying" ? <p role="status" className="mt-1 text-xs text-amber-700">{t("marketWallet.recheckRetrying")}</p>
                       : order.buyerRecheckCompletedAt && order.buyerRecheckResult && recheckResultIsCurrent ? <p role="status" className="mt-1 text-xs text-muted-foreground">{t(`marketWallet.recheckResult.${order.buyerRecheckResult}` as Parameters<typeof t>[0], { time: dateText(order.buyerRecheckCompletedAt, locale) })}</p> : null}
                   {order.lastGatewayCheckedAt ? <p className="text-xs text-muted-foreground">{t("marketWallet.lastGatewayCheck", { time: dateText(order.lastGatewayCheckedAt, locale), status: lastGatewayLabel })}</p> : null}
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
-                  <span className="text-xs text-muted-foreground">{t(`marketWallet.status.${shownStatus}` as Parameters<typeof t>[0])}</span>
+                  <span className="text-xs text-muted-foreground">{neverCreated ? t("marketWallet.status.never_created") : t(`marketWallet.status.${shownStatus}` as Parameters<typeof t>[0])}</span>
                   {order.status === "pending" ? <Button size="sm" variant="ghost" isIconOnly aria-label={t("marketWallet.refreshGatewayStatus")} isDisabled={statusBusyId === order.id || !!busy} onPress={() => void refreshGatewayStatus(order.id)}>
                     <RefreshCw className={`size-4 ${statusBusyId === order.id ? "animate-spin" : ""}`} aria-hidden="true" />
                   </Button> : null}
@@ -722,21 +831,30 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
         <section className="min-w-0 rounded-xl border border-border bg-card p-5" aria-label={t("marketWallet.transactions")}>
           <h2 className="text-base font-semibold">{t("marketWallet.transactions")}</h2>
           <ul className="mt-3 grid gap-2">
-            {transactions.map((entry) => (
-              <li key={entry.id} className="flex min-w-0 items-center justify-between gap-2 rounded-md bg-muted/50 px-3 py-2 text-sm">
+            {transactions.map((entry) => {
+              const delta = safeBigInt(entry.deltaUnits);
+              const heldDelta = safeBigInt(entry.heldDeltaUnits);
+              // A hold or release moves money between available and held without
+              // changing the posted balance; show that movement instead of $0.00.
+              const holdOnly = delta === 0n && heldDelta !== 0n;
+              return <li key={entry.id} className="flex min-w-0 items-center justify-between gap-2 rounded-md bg-muted/50 px-3 py-2 text-sm">
                 <div className="min-w-0">
-                  <p className="truncate font-medium">{t(`marketWallet.entry.${entry.sourceKind}` as Parameters<typeof t>[0])}</p>
+                  <p className="truncate font-medium">{t(walletEntryKey(entry.sourceKind))}</p>
                   <p className="text-xs text-muted-foreground">{dateText(entry.createdAt, locale)}</p>
                 </div>
-                <span className="shrink-0 tabular-nums">{formatWalletUnits(entry.deltaUnits)}</span>
-              </li>
-            ))}
+                {holdOnly ? <span className="grid shrink-0 justify-items-end">
+                  <span className="tabular-nums text-muted-foreground">{formatWalletUnits((heldDelta < 0n ? -heldDelta : heldDelta).toString())}</span>
+                  <span className="text-[0.7rem] text-muted-foreground">{t(heldDelta > 0n ? "marketWallet.entryHeld" : "marketWallet.entryReleased")}</span>
+                </span> : <span className="shrink-0 tabular-nums">{formatWalletUnits(entry.deltaUnits)}</span>}
+              </li>;
+            })}
             {loaded && !transactions.length ? <li className="text-sm text-muted-foreground">{t("marketWallet.noTransactions")}</li> : null}
           </ul>
           {transactionCursor ? <Button size="sm" variant="ghost" isDisabled={!!busy} onPress={() => void loadMore("transactions")}>{t("marketWallet.more")}</Button> : null}
         </section>
       </div> : null}
       {wallet.hasWalletActivity ? <MarketWalletRefundPanel availableUnits={wallet.availableUnits} onSubmitted={reload} /> : null}
+      {wallet.hasWalletActivity ? <MarketBuyerDisputesList /> : null}
       <ConfirmAlertDialog
         open={reviewRetryConfirm}
         title={t("marketWallet.reviewRetryTitle")}

@@ -58,13 +58,124 @@ pub(crate) fn critical_case_count_tx(conn: &Connection) -> Result<i64, AppError>
         .map_err(db_error("count critical finance cases"))
 }
 
-pub(crate) fn ensure_new_finance_writes_safe_tx(conn: &Connection) -> Result<(), AppError> {
-    if critical_case_count_tx(conn)? > 0 {
-        return Err(AppError::ServiceUnavailable(
-            "market finance reconciliation is required".into(),
-        ));
+pub(crate) fn case_is_critical_tx(conn: &Connection, case_id: &str) -> Result<bool, AppError> {
+    let code: Option<String> = conn
+        .query_row(
+            "SELECT code FROM market_finance_reconciliation_cases WHERE id = ?1",
+            params![case_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db_error("read finance case code"))?;
+    Ok(code.is_some_and(|code| CRITICAL_CODES.contains(&code.as_str())))
+}
+
+/// A money path touched by a new financial write. A critical case freezes
+/// only the scopes whose invariant it protects; a broken journal seal still
+/// freezes everything.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum FinanceScope<'a> {
+    /// A buyer wallet (top-ups, holds, debits, refunds).
+    User(&'a str),
+    /// A Provider's earnings and withdrawals.
+    Provider(&'a str),
+    /// One platform contract and its periods.
+    Contract(&'a str),
+    /// External transfers: withdrawals and balance refunds.
+    Payouts,
+}
+
+pub(crate) const FINANCE_HOLD_CODE: &str = "MARKET_FINANCE_HOLD";
+
+pub(crate) fn is_finance_hold(error: &AppError) -> bool {
+    error.code() == Some(FINANCE_HOLD_CODE)
+}
+
+fn scope_blocked_tx(conn: &Connection, scope: FinanceScope<'_>) -> Result<bool, AppError> {
+    let (sql, subject): (&str, Option<&str>) = match scope {
+        FinanceScope::User(user) => (
+            "SELECT EXISTS(SELECT 1 FROM market_finance_reconciliation_cases c
+             WHERE c.status = 'open' AND (
+                 (c.code = 'wallet_projection_mismatch' AND c.object_id = ?1)
+                 OR (c.code = 'credited_topup_missing_evidence' AND c.object_id IN
+                     (SELECT id FROM market_topup_orders WHERE user_id = ?1))))",
+            Some(user),
+        ),
+        FinanceScope::Provider(provider) => (
+            "SELECT EXISTS(SELECT 1 FROM market_finance_reconciliation_cases c
+             WHERE c.status = 'open' AND c.code = 'provider_liability_mismatch'
+               AND c.object_id = ?1)",
+            Some(provider),
+        ),
+        FinanceScope::Contract(contract) => (
+            "SELECT EXISTS(SELECT 1 FROM market_finance_reconciliation_cases c
+             WHERE c.status = 'open' AND c.code = 'period_unfulfilled_mismatch'
+               AND c.object_id IN (SELECT id FROM market_platform_periods WHERE contract_id = ?1))",
+            Some(contract),
+        ),
+        FinanceScope::Payouts => (
+            "SELECT EXISTS(SELECT 1 FROM market_finance_reconciliation_cases c
+             WHERE c.status = 'open' AND c.code = 'paid_payout_missing_evidence'
+               AND ?1 IS NULL)",
+            None,
+        ),
+    };
+    conn.query_row(sql, params![subject], |row| row.get(0))
+        .map_err(db_error("check scoped finance hold"))
+}
+
+/// Reject a new financial write when a critical case freezes one of its
+/// scopes. Ledger-integrity cases (`journal_unsealed`) freeze all scopes.
+pub(crate) fn ensure_finance_scopes_safe_tx(
+    conn: &Connection,
+    scopes: &[FinanceScope<'_>],
+) -> Result<(), AppError> {
+    let global: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM market_finance_reconciliation_cases
+             WHERE status = 'open' AND code = 'journal_unsealed')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error("check global finance hold"))?;
+    let mut blocked = global;
+    for scope in scopes {
+        if blocked {
+            break;
+        }
+        blocked = scope_blocked_tx(conn, *scope)?;
+    }
+    if blocked {
+        return Err(AppError::Coded {
+            status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            code: FINANCE_HOLD_CODE,
+            message: "market finance reconciliation is required".into(),
+            details: serde_json::json!({}),
+        });
     }
     Ok(())
+}
+
+/// Scopes of one platform contract: its buyer, Provider and periods.
+pub(crate) fn ensure_contract_finance_safe_tx(
+    conn: &Connection,
+    contract_id: &str,
+) -> Result<(), AppError> {
+    let (buyer, provider): (String, String) = conn
+        .query_row(
+            "SELECT buyer_user_id, provider_user_id FROM market_platform_contracts WHERE id = ?1",
+            params![contract_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(db_error("read contract finance scopes"))?;
+    ensure_finance_scopes_safe_tx(
+        conn,
+        &[
+            FinanceScope::User(&buyer),
+            FinanceScope::Provider(&provider),
+            FinanceScope::Contract(contract_id),
+        ],
+    )
 }
 
 fn critical_case_still_failed_tx(
@@ -308,6 +419,26 @@ pub(crate) fn resolve_case_tx(
         params![Uuid::new_v4().to_string(), actor, case_id, reason, now],
     )
     .map_err(db_error("audit market finance case resolution"))?;
+    // A case that froze contract earnings releases exactly the holds it
+    // placed. Holds from other causes on the same lots remain.
+    if kind == "platform_contract"
+        && let Some(hold_kind) = crate::market_finance::hold_kind_for_case(&code)
+    {
+        crate::market_finance::release_earning_holds_tx(conn, hold_kind, &object_id, actor, reason, now)?;
+    }
+    if code == "earning_unlock_failed" && kind == "earning_lot" {
+        crate::market_finance::release_earning_holds_tx(conn, "manual", &object_id, actor, reason, now)?;
+    }
+    if code == "earning_hold_legacy" && kind == "provider" {
+        crate::market_finance::release_earning_holds_tx(
+            conn,
+            "legacy_unknown",
+            &object_id,
+            actor,
+            reason,
+            now,
+        )?;
+    }
     Ok(())
 }
 
@@ -519,7 +650,11 @@ mod tests {
         ).unwrap();
         assert_eq!(audit_finance_tx(&tx, at).unwrap(), 1);
         assert_eq!(critical_case_count_tx(&tx).unwrap(), 1);
-        assert!(ensure_new_finance_writes_safe_tx(&tx).is_err());
+        let buyer = [FinanceScope::User("buyer")];
+        assert!(is_finance_hold(&ensure_finance_scopes_safe_tx(&tx, &buyer).unwrap_err()));
+        // The hold is scoped: another buyer and an unrelated Provider proceed.
+        ensure_finance_scopes_safe_tx(&tx, &[FinanceScope::User("other")]).unwrap();
+        ensure_finance_scopes_safe_tx(&tx, &[FinanceScope::Provider("provider")]).unwrap();
         let case_id: String = tx
             .query_row(
                 "SELECT id FROM market_finance_reconciliation_cases
@@ -536,9 +671,33 @@ mod tests {
         .unwrap();
         resolve_case_tx(&tx, &case_id, "owner", "projection_checked", at).unwrap();
         assert_eq!(critical_case_count_tx(&tx).unwrap(), 0);
-        ensure_new_finance_writes_safe_tx(&tx).unwrap();
+        ensure_finance_scopes_safe_tx(&tx, &buyer).unwrap();
         assert!(resolve_case_tx(&tx, &case_id, "owner", "projection_checked", at).is_err());
         tx.commit().unwrap();
+    }
+
+    #[test]
+    fn broken_journal_seal_still_freezes_every_scope() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::schema::apply(&conn).unwrap();
+        case_tx(&conn, "journal_unsealed", "journal", "j1", "2026-01-01").unwrap();
+        for scope in [
+            FinanceScope::User("u"),
+            FinanceScope::Provider("p"),
+            FinanceScope::Contract("c"),
+            FinanceScope::Payouts,
+        ] {
+            assert!(ensure_finance_scopes_safe_tx(&conn, &[scope]).is_err());
+        }
+        case_tx(&conn, "paid_payout_missing_evidence", "buyer_refund", "r1", "2026-01-01").unwrap();
+        conn.execute(
+            "UPDATE market_finance_reconciliation_cases SET status = 'resolved'
+             WHERE code = 'journal_unsealed'",
+            [],
+        )
+        .unwrap();
+        ensure_finance_scopes_safe_tx(&conn, &[FinanceScope::User("u")]).unwrap();
+        assert!(ensure_finance_scopes_safe_tx(&conn, &[FinanceScope::Payouts]).is_err());
     }
 
     #[test]

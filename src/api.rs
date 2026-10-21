@@ -295,6 +295,7 @@ pub fn router(state: ServerState) -> Router {
         .merge(crate::share_market::router())
         .merge(legacy_finance_routes)
         .merge(crate::market_payments::router())
+        .merge(crate::market_notifications::router())
         .merge(crate::market_payouts::router())
         .merge(crate::market_platform_contracts::router())
         .merge(crate::market_service_disputes::router())
@@ -6346,6 +6347,36 @@ pub(crate) async fn require_admin_session(
         .ok_or_else(|| AppError::Unauthorized("login required".into()))?;
     if !state.dynamic.read().await.is_admin(&session.email) {
         return Err(AppError::Forbidden("admin privilege required".into()));
+    }
+    Ok(session)
+}
+
+/// The Router owner (CC_SWITCH_ROUTER_OWNER_EMAIL, or the tunnel-domain
+/// default admin when unset) holds irreversible finance authority. Other
+/// admins may triage, approve and inspect but not move money or flip modes.
+pub(crate) fn is_finance_owner(config: &crate::config::Config, email: &str) -> bool {
+    let normalized = email.trim().to_ascii_lowercase();
+    !normalized.is_empty()
+        && config
+            .router_owner_email
+            .as_deref()
+            .is_some_and(|owner| owner == normalized)
+}
+
+pub(crate) async fn require_owner_session(
+    state: &ServerState,
+    headers: &HeaderMap,
+) -> Result<AuthSession, AppError> {
+    if dev_auth_bypass_enabled() && extract_bearer_token(headers).is_none() {
+        return Ok(dev_auth_session());
+    }
+    let session = resolve_router_session(state, headers)
+        .await?
+        .ok_or_else(|| AppError::Unauthorized("login required".into()))?;
+    if !is_finance_owner(&state.config, &session.email) {
+        return Err(AppError::Forbidden(
+            "Router owner privilege required".into(),
+        ));
     }
     Ok(session)
 }

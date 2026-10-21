@@ -5,6 +5,7 @@ import { Button, Input } from "@heroui/react";
 import { AlertTriangle, Bell, Check, ExternalLink, Loader2, Mail, RefreshCw, Send, Smartphone, Unlink } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
+import { MarketNotificationPreferences } from "@/components/dashboard/market-notification-preferences";
 import { CompactSelect } from "@/components/common/compact-select";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
@@ -663,6 +664,8 @@ export function AccountNotificationsPanel() {
           </div>
         ) : null}
       </section>
+
+      <MarketNotificationPreferences />
 
       <AccountNotificationHistory accountKey={session?.user?.email || ""} />
 

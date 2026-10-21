@@ -29,6 +29,7 @@ mod market_access;
 mod market_billing;
 mod market_finance;
 mod market_fx;
+mod market_notifications;
 mod market_payments;
 mod market_payouts;
 mod market_platform_contracts;
@@ -244,11 +245,26 @@ async fn main() -> Result<()> {
         )
         .context("configure Binance auto-settlement failed")?,
     );
-    let market_payments = Arc::new(
-        crate::market_payments::MarketPaymentsRuntime::from_data_dir(&config.data_dir)
-            .context("configure platform wallet payments failed")?,
-    );
     let store = AppStore::new(&config)?;
+    // A missing master key may be generated only for a database that has never
+    // stored payment credentials; otherwise every stored secret would become
+    // unreadable without any visible error.
+    let market_payment_secrets_exist = {
+        let conn = store.conn.lock().await;
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM market_payment_channel_revisions)",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(true)
+    };
+    let market_payments = Arc::new(
+        crate::market_payments::MarketPaymentsRuntime::from_data_dir(
+            &config.data_dir,
+            market_payment_secrets_exist,
+        )
+        .context("configure platform wallet payments failed")?,
+    );
     if let Err(error) = market_fx::refresh_on_startup(&store).await {
         tracing::warn!(error = %error, "initial USD/CNY rate refresh failed; using verified cache if fresh");
     }
@@ -387,6 +403,7 @@ async fn main() -> Result<()> {
     let market_provider_rank_store = state.store.clone();
     let binance_settlement_state = state.clone();
     let market_payments_state = state.clone();
+    let market_notifications_state = state.clone();
     let market_fx_store = state.store.clone();
     let database_sync_store = state.store.clone();
     let shutdown_database_sync_store = state.store.clone();
@@ -864,6 +881,7 @@ async fn main() -> Result<()> {
         async move { crate::market_platform_contracts::run_service(market_platform_state).await },
     );
     let market_payments_shutdown_rx = background_shutdown_rx.clone();
+    let market_notifications_shutdown_rx = background_shutdown_rx.clone();
     let market_fx_shutdown_rx = background_shutdown_rx.clone();
     let market_fx_task = spawn_background_task(
         "USD/CNY market FX",
@@ -884,6 +902,12 @@ async fn main() -> Result<()> {
     let market_payments_task = tokio::spawn({
         let shutdown = market_payments_shutdown_rx;
         async move { crate::market_payments::run_service(market_payments_state, shutdown).await }
+    });
+    let market_notifications_task = tokio::spawn({
+        let shutdown = market_notifications_shutdown_rx;
+        async move {
+            crate::market_notifications::run_service(market_notifications_state, shutdown).await
+        }
     });
     let (http_shutdown_tx, http_shutdown_rx) = watch::channel(false);
     let (ssh_shutdown_tx, ssh_shutdown_rx) = watch::channel(false);
@@ -965,6 +989,7 @@ async fn main() -> Result<()> {
         ("USD/CNY market FX", market_fx_task),
         ("Binance auto-settlement", binance_settlement_task),
         ("Market payments", market_payments_task),
+        ("Market notifications", market_notifications_task),
     ];
     if let Some(task) = database_sync_task {
         background_tasks.push(("database sync", task));

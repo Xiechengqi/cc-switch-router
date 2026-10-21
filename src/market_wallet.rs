@@ -22,6 +22,7 @@ fn db_error(context: &'static str) -> impl FnOnce(crate::db::Error) -> AppError 
     move |error| AppError::Internal(format!("{context} failed: {error}"))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn parse_usd_minor(raw: &str) -> Result<i64, AppError> {
     let (whole, fractional) = raw.split_once('.').unwrap_or((raw, ""));
     if whole.is_empty()
@@ -315,6 +316,117 @@ pub(crate) fn credit_verified_topup_tx(
         }
     }
     Ok(result)
+}
+
+/// Credit a top-up the Owner settled from merchant evidence. It posts like a
+/// verified credit but under its own action, so it never counts as on-chain
+/// proof for channel promotion or cutover readiness.
+pub(crate) fn credit_manual_topup_tx(
+    conn: &Connection,
+    user_id: &str,
+    order_id: &str,
+    amount_minor: i64,
+    receipt_fingerprint: &str,
+    now: &str,
+) -> Result<JournalResult, AppError> {
+    let units = units_from_minor(amount_minor)?;
+    ensure_wallet_tx(conn, user_id, now)?;
+    let result = post_journal_tx(
+        conn,
+        "topup",
+        order_id,
+        "credit_manual",
+        &format!("manual:{user_id}:{amount_minor}:{receipt_fingerprint}"),
+        &[
+            Posting {
+                kind: "owner_clearing",
+                subject_id: "owner",
+                signed_units: units,
+            },
+            Posting {
+                kind: "wallet_available",
+                subject_id: user_id,
+                signed_units: -units,
+            },
+        ],
+        now,
+    )?;
+    if result.inserted
+        && conn
+            .execute(
+                "UPDATE market_wallet_accounts
+                 SET posted_units = posted_units + ?2, version = version + 1, updated_at = ?3
+                 WHERE user_id = ?1 AND asset_code = 'USD' AND posted_units <= ?4",
+                params![user_id, units, now, i64::MAX - units],
+            )
+            .map_err(db_error("credit market wallet"))?
+            != 1
+    {
+        return Err(AppError::Internal("market wallet credit overflow".into()));
+    }
+    Ok(result)
+}
+
+/// Reverse part or all of a credited top-up after an external refund. The
+/// buyer's available balance covers what it can; the Owner absorbs the rest.
+/// Returns the journal and the shortfall in minor units.
+pub(crate) fn reverse_topup_credit_tx(
+    conn: &Connection,
+    user_id: &str,
+    order_id: &str,
+    amount_minor: i64,
+    evidence_reference: &str,
+    now: &str,
+) -> Result<(JournalResult, i64), AppError> {
+    let total = units_from_minor(amount_minor)?;
+    let available = wallet_snapshot_tx(conn, user_id)?.available_units.max(0);
+    // Debit whole cents only, so the shortfall stays an exact cent amount.
+    let per_minor = crate::market_billing::MONEY_UNITS_PER_MINOR;
+    let from_wallet = total.min(available / per_minor * per_minor);
+    let shortfall = total - from_wallet;
+    let mut postings = vec![Posting {
+        kind: "owner_clearing",
+        subject_id: "owner",
+        signed_units: -total,
+    }];
+    if from_wallet > 0 {
+        postings.push(Posting {
+            kind: "wallet_available",
+            subject_id: user_id,
+            signed_units: from_wallet,
+        });
+    }
+    if shortfall > 0 {
+        postings.push(Posting {
+            kind: "owner_loss",
+            subject_id: "owner",
+            signed_units: shortfall,
+        });
+    }
+    let result = post_journal_tx(
+        conn,
+        "topup",
+        order_id,
+        "reverse",
+        &format!("reverse:{user_id}:{amount_minor}:{from_wallet}:{evidence_reference}"),
+        &postings,
+        now,
+    )?;
+    if result.inserted
+        && from_wallet > 0
+        && conn
+            .execute(
+                "UPDATE market_wallet_accounts
+                 SET posted_units = posted_units - ?2, version = version + 1, updated_at = ?3
+                 WHERE user_id = ?1 AND asset_code = 'USD' AND posted_units - held_units >= ?2",
+                params![user_id, from_wallet, now],
+            )
+            .map_err(db_error("reverse market wallet credit"))?
+            != 1
+    {
+        return Err(AppError::Conflict("wallet balance changed during reversal".into()));
+    }
+    Ok((result, shortfall / per_minor))
 }
 
 pub(crate) fn reserve_wallet_tx(

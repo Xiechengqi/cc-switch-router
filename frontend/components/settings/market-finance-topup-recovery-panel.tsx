@@ -4,6 +4,9 @@ import * as React from "react";
 import { Alert, Button, Modal } from "@heroui/react";
 import { Loader2, RefreshCw } from "lucide-react";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
+import { WalletBadge } from "@/components/market/wallet-primitives";
+import { TOPUP_RECOVERY_SECTION_ID } from "@/components/settings/market-finance-case-desk";
+import { MarketFinanceTopupOwnerActionDialog, type TopupOwnerAction } from "@/components/settings/market-finance-topup-owner-actions";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ApiError } from "@/lib/api";
 import {
@@ -44,6 +47,7 @@ export function MarketFinanceTopupRecoveryPanel({ onRecovered }: { onRecovered: 
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
   const [notice, setNotice] = React.useState("");
+  const [ownerAction, setOwnerAction] = React.useState<TopupOwnerAction | null>(null);
   const selected = topups.find((item) => item.id === selectedId) ?? null;
   const manualReferenceValid = /^[A-Za-z0-9_.:/-]{8,128}$/.test(manualReference.trim());
   const canSubmit = !!preview?.canRecover && (!preview.requiresManualReference || (manualReferenceValid && manualChecked));
@@ -215,7 +219,7 @@ export function MarketFinanceTopupRecoveryPanel({ onRecovered }: { onRecovered: 
   };
 
   return (
-    <section className="grid min-w-0 gap-3" aria-label={t("settings.marketFinance.topupRecovery.title")}>
+    <section id={TOPUP_RECOVERY_SECTION_ID} tabIndex={-1} className="grid min-w-0 scroll-mt-6 gap-3 rounded-xl outline-none focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-ring" aria-label={t("settings.marketFinance.topupRecovery.title")}>
       <div className="flex items-center justify-between gap-3">
         <div>
           <h4 className="text-sm font-semibold">{t("settings.marketFinance.topupRecovery.title")}</h4>
@@ -232,8 +236,17 @@ export function MarketFinanceTopupRecoveryPanel({ onRecovered }: { onRecovered: 
       {topups.length ? <ul className="grid gap-2">
         {topups.map((item) => <li key={item.id} className="flex min-w-0 flex-wrap items-center justify-between gap-2 rounded-md border border-border px-3 py-2 text-sm">
           <div className="min-w-0">
-            <p className="font-medium">${(item.amountMinor / 100).toFixed(2)} · {statusLabel(item.status)}{item.buyerAbandonedAt ? ` · ${t("settings.marketFinance.topupRecovery.buyerAbandoned")}` : ""}</p>
-            <p className="break-all text-xs text-muted-foreground">{t("settings.marketFinance.topupRecovery.user")}: {item.userId}</p>
+            <p className="flex flex-wrap items-center gap-x-2 gap-y-1 font-medium">
+              <span>${(item.amountMinor / 100).toFixed(2)} · {statusLabel(item.status)}{item.buyerAbandonedAt ? ` · ${t("settings.marketFinance.topupRecovery.buyerAbandoned")}` : ""}</span>
+              {item.orderMode ? <WalletBadge tone={item.orderMode === "direct" ? "accent" : "neutral"}>{t(`settings.marketFinance.topupRecovery.mode.${item.orderMode}`)}</WalletBadge> : null}
+            </p>
+            <p className="break-all text-xs text-muted-foreground">{t("settings.marketFinance.topupRecovery.user")}: {item.userEmail || item.userId}</p>
+            {item.createLastErrorCode || (item.reconcileFailures ?? 0) > 0 ? <p className="break-all text-xs text-amber-800">
+              {[
+                item.createLastErrorCode ? t("settings.marketFinance.topupRecovery.createError", { code: item.createLastErrorCode }) : null,
+                (item.reconcileFailures ?? 0) > 0 ? t("settings.marketFinance.topupRecovery.reconcileFailures", { count: item.reconcileFailures ?? 0 }) : null,
+              ].filter(Boolean).join(" · ")}
+            </p> : null}
           </div>
           <Button size="sm" variant="outline" isDisabled={busy} onPress={() => select(item)}>
             {t("settings.marketFinance.topupRecovery.inspect")}
@@ -255,7 +268,19 @@ export function MarketFinanceTopupRecoveryPanel({ onRecovered }: { onRecovered: 
           <summary className="cursor-pointer">{t("settings.marketFinance.topupRecovery.identifiers")}</summary>
           <p className="mt-2 break-all font-mono">Router: {selected.id}</p>
           <p className="break-all font-mono">Merchant: {selected.merchantOrderId}</p>
+          <p className="break-all font-mono">User: {selected.userId}</p>
         </details>
+        <div className="grid gap-2 rounded-lg border border-border bg-card p-3">
+          <p className="font-mono text-[0.68rem] uppercase tracking-[0.15em] text-accent">{t("settings.marketFinance.topupRecovery.ownerActions")}</p>
+          <div className="flex flex-wrap gap-2">
+            {selected.status !== "credited" ? <Button size="sm" variant="outline" className="min-h-11" isDisabled={busy} onPress={() => { setNotice(""); setOwnerAction("credit"); }}>
+              {t("settings.marketFinance.topupRecovery.manualCredit")}
+            </Button> : null}
+            {selected.status === "credited" ? <Button size="sm" variant="outline" className="min-h-11" isDisabled={busy} onPress={() => { setNotice(""); setOwnerAction("reverse"); }}>
+              {t("settings.marketFinance.topupRecovery.reverse")}
+            </Button> : null}
+          </div>
+        </div>
         <div className="grid gap-1 text-xs text-muted-foreground">
           <p className="font-medium text-foreground">{t("settings.marketFinance.topupRecovery.observations")}</p>
           {observations.length ? observations.map((observation) => (
@@ -339,6 +364,21 @@ export function MarketFinanceTopupRecoveryPanel({ onRecovered }: { onRecovered: 
           </Modal.Dialog>
         </Modal.Container>
       </Modal.Backdrop>
+      <MarketFinanceTopupOwnerActionDialog
+        action={ownerAction}
+        topup={selected}
+        onClose={() => setOwnerAction(null)}
+        onDone={async (message) => {
+          setNotice(message);
+          setSelectedId(null);
+          setPreview(null);
+          try {
+            await Promise.all([reload(), onRecovered()]);
+          } catch {
+            setError(t("settings.marketFinance.topupRecovery.closedRefreshFailed"));
+          }
+        }}
+      />
       <ConfirmAlertDialog
         open={cancelConfirmOpen}
         title={t("settings.marketFinance.topupRecovery.cancelTitle")}

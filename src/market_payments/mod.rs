@@ -1,5 +1,12 @@
+mod chains;
 mod crypto;
+mod channel_settings;
+mod admin_finance;
 mod dujiaopay;
+mod owner_actions;
+mod sweep;
+
+pub(crate) use self::chains::token_rail;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -62,6 +69,8 @@ pub struct MarketPaymentsRuntime {
     client: DujiaoPayClient,
     webhook_limiter: Arc<WebhookLimiter>,
     topup_limiter: Arc<WebhookLimiter>,
+    reconcile_wakeup: Arc<tokio::sync::Notify>,
+    instruction_lookups: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 #[derive(Default)]
@@ -94,12 +103,17 @@ impl WebhookLimiter {
 }
 
 impl MarketPaymentsRuntime {
-    pub fn from_data_dir(data_dir: &std::path::Path) -> anyhow::Result<Self> {
+    pub fn from_data_dir(
+        data_dir: &std::path::Path,
+        secrets_exist: bool,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
-            cipher: PaymentCipher::load(data_dir)?,
+            cipher: PaymentCipher::load(data_dir, secrets_exist)?,
             client: DujiaoPayClient::production()?,
             webhook_limiter: Arc::new(WebhookLimiter::default()),
             topup_limiter: Arc::new(WebhookLimiter::default()),
+            reconcile_wakeup: Arc::new(tokio::sync::Notify::new()),
+            instruction_lookups: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -110,12 +124,41 @@ impl MarketPaymentsRuntime {
             client: DujiaoPayClient::production().unwrap(),
             webhook_limiter: Arc::new(WebhookLimiter::default()),
             topup_limiter: Arc::new(WebhookLimiter::default()),
+            reconcile_wakeup: Arc::new(tokio::sync::Notify::new()),
+            instruction_lookups: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
+    /// The gateway delivers from a small set of egress addresses, often in
+    /// bursts after an outage. Signed events are cheap to verify, so the
+    /// bucket is generous; it exists only to cap abusive unsigned traffic.
     pub fn allow_webhook_ip(&self, ip: IpAddr) -> bool {
         self.webhook_limiter
-            .allow(ip, StdDuration::from_secs(60), 60)
+            .allow(ip, StdDuration::from_secs(60), 600)
+    }
+
+    /// At most one authenticated instruction lookup per order every five
+    /// seconds, the polling interval DujiaoPay asks merchants to respect.
+    fn allow_instruction_lookup(&self, order_id: &str) -> bool {
+        let Ok(mut lookups) = self.instruction_lookups.lock() else {
+            return false;
+        };
+        let now = Instant::now();
+        if lookups.len() > 4_096 {
+            lookups.retain(|_, at| now.duration_since(*at) < StdDuration::from_secs(5));
+        }
+        match lookups.get(order_id) {
+            Some(at) if now.duration_since(*at) < StdDuration::from_secs(5) => false,
+            _ => {
+                lookups.insert(order_id.to_string(), now);
+                true
+            }
+        }
+    }
+
+    /// Ask the reconciliation loop to run now instead of at its next tick.
+    pub fn wake_reconciler(&self) {
+        self.reconcile_wakeup.notify_one();
     }
 
     fn allow_topup_ip(&self, ip: IpAddr) -> bool {
@@ -254,6 +297,10 @@ pub fn router() -> Router<ServerState> {
             get(get_topup_gateway_status),
         )
         .route(
+            "/v1/market-wallet/topups/:id/payment-instructions",
+            get(get_payment_instructions),
+        )
+        .route(
             "/v1/market-wallet/topups/:id/cancel",
             post(cancel_buyer_topup),
         )
@@ -295,6 +342,14 @@ pub fn router() -> Router<ServerState> {
             put(set_channel_enabled),
         )
         .route(
+            "/v1/admin/market-payment-channels/:id/settings",
+            put(channel_settings::update_channel_settings),
+        )
+        .route(
+            "/v1/admin/market-payment-channels/rewrap",
+            post(rewrap_channel_secrets),
+        )
+        .route(
             "/v1/admin/market-finance/readiness",
             get(get_finance_readiness),
         )
@@ -302,6 +357,30 @@ pub fn router() -> Router<ServerState> {
         .route(
             "/v1/admin/market-finance/cases/:id/resolve",
             post(resolve_finance_case),
+        )
+        .route(
+            "/v1/admin/market-finance/earning-holds",
+            get(list_earning_holds).post(place_manual_earning_hold),
+        )
+        .route(
+            "/v1/admin/market-finance/earning-holds/release",
+            post(release_manual_earning_hold),
+        )
+        .route(
+            "/v1/admin/market-finance/topups/:id/manual-credit",
+            post(owner_actions::credit_manual_claim),
+        )
+        .route(
+            "/v1/admin/market-finance/topups/:id/reverse",
+            post(owner_actions::reverse_external_refund),
+        )
+        .route(
+            "/v1/admin/market-finance/overview",
+            get(admin_finance::finance_overview),
+        )
+        .route(
+            "/v1/admin/market-finance/users",
+            get(admin_finance::user_finance_lookup),
         )
         .route("/v1/admin/market-finance/topups", get(list_admin_topups))
         .route(
@@ -342,6 +421,7 @@ struct FinanceReadinessView {
     version: i64,
     new_orders_paused: bool,
     new_withdrawals_paused: bool,
+    new_topups_paused: bool,
     code_integrated: bool,
     legacy_blockers: Vec<ReadinessBlocker>,
     critical_cases: i64,
@@ -367,12 +447,18 @@ fn stale_topup_review_count_tx(conn: &Connection) -> Result<i64, AppError> {
 }
 
 fn finance_readiness_tx(conn: &Connection) -> Result<FinanceReadinessView, AppError> {
-    let (mode, version, new_orders_paused, new_withdrawals_paused): (String, i64, bool, bool) =
-        conn.query_row(
-            "SELECT mode, version, new_orders_paused, new_withdrawals_paused
+    let (mode, version, new_orders_paused, new_withdrawals_paused, new_topups_paused): (
+        String,
+        i64,
+        bool,
+        bool,
+        bool,
+    ) = conn
+        .query_row(
+            "SELECT mode, version, new_orders_paused, new_withdrawals_paused, new_topups_paused
              FROM market_finance_control WHERE id = 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .map_err(db_error("read market finance mode"))?;
     let checks: [(&'static str, &'static str); 15] = [
@@ -478,7 +564,10 @@ fn finance_readiness_tx(conn: &Connection) -> Result<FinanceReadinessView, AppEr
             "SELECT COUNT(*) FROM market_topup_orders topup
              WHERE topup.status = 'credited'
                AND NOT EXISTS (SELECT 1 FROM market_verified_topup_evidence evidence
-                               WHERE evidence.id = topup.id)",
+                               WHERE evidence.id = topup.id)
+               AND NOT EXISTS (SELECT 1 FROM market_topup_owner_actions action
+                               WHERE action.order_id = topup.id
+                                 AND action.action = 'credit_manual_claim')",
         ),
         (
             "channel_none_enabled",
@@ -497,8 +586,8 @@ fn finance_readiness_tx(conn: &Connection) -> Result<FinanceReadinessView, AppEr
             "SELECT COUNT(*) FROM market_payment_channels c JOIN market_payment_channel_revisions r ON r.channel_id = c.id AND r.revision = c.current_revision WHERE c.enabled = 1 AND c.archived_at IS NULL AND r.webhook_mode = 'signed' AND (c.webhook_verified_at IS NULL OR c.webhook_verified_revision IS NOT c.current_revision)",
         ),
         (
-            "channel_no_current_live_topup",
-            "SELECT COUNT(*) FROM market_payment_channels c WHERE c.enabled = 1 AND c.archived_at IS NULL AND NOT EXISTS (SELECT 1 FROM market_verified_topup_evidence t WHERE t.channel_id = c.id AND t.channel_revision = c.current_revision)",
+            "channel_none_live",
+            "SELECT CASE WHEN EXISTS (SELECT 1 FROM market_payment_channels c WHERE c.rollout_state = 'live' AND c.archived_at IS NULL AND EXISTS (SELECT 1 FROM market_verified_topup_evidence t WHERE t.channel_id = c.id AND t.channel_revision = c.current_revision)) THEN 0 ELSE 1 END",
         ),
     ];
     let mut payment_channel_blockers = Vec::new();
@@ -520,6 +609,7 @@ fn finance_readiness_tx(conn: &Connection) -> Result<FinanceReadinessView, AppEr
         version,
         new_orders_paused,
         new_withdrawals_paused,
+        new_topups_paused,
         code_integrated: MARKET_WALLET_CUTOVER_IMPLEMENTED,
         legacy_blockers,
         critical_cases,
@@ -602,7 +692,7 @@ async fn set_finance_mode(
     headers: HeaderMap,
     Json(request): Json<ModeRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let session = crate::api::require_admin_session(&state, &headers).await?;
+    let session = crate::api::require_owner_session(&state, &headers).await?;
     let conn = state.store.conn.lock().await;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -630,35 +720,75 @@ async fn set_finance_mode(
 struct FinancePauseRequest {
     new_orders_paused: bool,
     new_withdrawals_paused: bool,
+    #[serde(default)]
+    new_topups_paused: Option<bool>,
     expected_version: i64,
 }
 
+/// Purchase and withdrawal pauses exist only on the production wallet. The
+/// top-up pause also works in shadow mode, where it fences Owner test orders.
 fn set_finance_pause_tx(
     conn: &Connection,
     request: &FinancePauseRequest,
     changed_at: &str,
 ) -> Result<(), AppError> {
+    let (mode, approved, orders, withdrawals): (String, bool, bool, bool) = conn
+        .query_row(
+            "SELECT mode, cutover_approved_at IS NOT NULL, new_orders_paused,
+                    new_withdrawals_paused
+             FROM market_finance_control WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(db_error("read finance pause"))?;
+    let production = mode == "enabled" && approved;
+    if !production
+        && (request.new_orders_paused != orders || request.new_withdrawals_paused != withdrawals)
+    {
+        return Err(AppError::Conflict(
+            "purchase and withdrawal pauses require an enabled wallet".into(),
+        ));
+    }
+    if !production && mode != "shadow" && request.new_topups_paused.is_some() {
+        return Err(AppError::Conflict(
+            "top-up pause requires a shadow or enabled wallet".into(),
+        ));
+    }
     let changed = conn
         .execute(
             "UPDATE market_finance_control
              SET new_orders_paused = ?2, new_withdrawals_paused = ?3,
+                 new_topups_paused = COALESCE(?5, new_topups_paused),
                  version = version + 1, updated_at = ?4
-             WHERE id = 1 AND version = ?1 AND mode = 'enabled'
-               AND cutover_approved_at IS NOT NULL",
+             WHERE id = 1 AND version = ?1",
             params![
                 request.expected_version,
                 request.new_orders_paused,
                 request.new_withdrawals_paused,
-                changed_at
+                changed_at,
+                request.new_topups_paused
             ],
         )
         .map_err(db_error("update finance pause"))?;
     if changed != 1 {
         return Err(AppError::Conflict(
-            "finance pause requires an enabled wallet and current version".into(),
+            "finance pause requires the current version".into(),
         ));
     }
     Ok(())
+}
+
+/// `orders_paused`, `orders_and_topups_paused`, ... or `resumed`.
+fn finance_pause_reason((orders, withdrawals, topups): (bool, bool, bool)) -> String {
+    let paused = [(orders, "orders"), (withdrawals, "withdrawals"), (topups, "topups")]
+        .into_iter()
+        .filter_map(|(paused, name)| paused.then_some(name))
+        .collect::<Vec<_>>();
+    if paused.is_empty() {
+        "resumed".into()
+    } else {
+        format!("{}_paused", paused.join("_and_"))
+    }
 }
 
 async fn set_finance_pause(
@@ -666,30 +796,30 @@ async fn set_finance_pause(
     headers: HeaderMap,
     Json(request): Json<FinancePauseRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let session = crate::api::require_admin_session(&state, &headers).await?;
+    let session = crate::api::require_owner_session(&state, &headers).await?;
     let conn = state.store.conn.lock().await;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin finance pause update"))?;
     let changed_at = now();
     set_finance_pause_tx(&tx, &request, &changed_at)?;
+    // Describe the resulting state, not one flag of the request: the top-up
+    // pause is optional in the request and may be unchanged.
+    let flags: (bool, bool, bool) = tx
+        .query_row(
+            "SELECT new_orders_paused, new_withdrawals_paused, new_topups_paused
+             FROM market_finance_control WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(db_error("read finance pause"))?;
     audit_tx(
         &tx,
         &session.user_id,
         "finance_pause_changed",
         "finance_control",
         "1",
-        Some(
-            if request.new_orders_paused && request.new_withdrawals_paused {
-                "orders_and_withdrawals_paused"
-            } else if request.new_orders_paused {
-                "orders_paused"
-            } else if request.new_withdrawals_paused {
-                "withdrawals_paused"
-            } else {
-                "resumed"
-            },
-        ),
+        Some(&finance_pause_reason(flags)),
         &changed_at,
     )?;
     tx.commit()
@@ -699,6 +829,7 @@ async fn set_finance_pause(
         Json(serde_json::json!({
             "newOrdersPaused": request.new_orders_paused,
             "newWithdrawalsPaused": request.new_withdrawals_paused,
+            "newTopupsPaused": request.new_topups_paused,
         })),
     ))
 }
@@ -731,9 +862,18 @@ async fn get_wallet(
     };
     let can_topup = user_topup_allowed(
         &mode,
-        state.dynamic.read().await.is_admin(&session.email),
+        crate::api::is_finance_owner(&state.config, &session.email),
         cutover_approved,
     );
+    let committed_units = {
+        let conn = state.store.conn.lock().await;
+        crate::market_platform_contracts::prior_due_funding_units_tx(
+            &conn,
+            &session.user_id,
+            None,
+            &now(),
+        )?
+    };
     Ok((
         no_store(),
         Json(serde_json::json!({
@@ -741,6 +881,7 @@ async fn get_wallet(
             "postedUnits": snapshot.posted_units.to_string(),
             "heldUnits": snapshot.held_units.to_string(),
             "availableUnits": snapshot.available_units.to_string(),
+            "committedUnits": committed_units.to_string(),
             "version": snapshot.version,
             "mode": mode,
             "canTopup": can_topup,
@@ -860,6 +1001,8 @@ struct ChannelView {
     id: String,
     display_name: String,
     enabled: bool,
+    rollout_state: String,
+    promoted_at: Option<String>,
     sort_order: i64,
     current_revision: i64,
     version: i64,
@@ -872,6 +1015,29 @@ struct ChannelView {
     verified_live_topups: i64,
     verified_live_topups_current_revision: i64,
     gateway_kind: &'static str,
+    settings: ChannelSettingsView,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ChannelSettingsView {
+    order_mode: String,
+    allowed_methods: Vec<String>,
+    min_topup_minor: Option<i64>,
+    max_topup_minor: Option<i64>,
+    fee_rate_bps: i64,
+    fixed_fee_minor: i64,
+    version: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BuyerMethodView {
+    token_id: String,
+    chain: &'static str,
+    chain_name: &'static str,
+    symbol: &'static str,
+    min_confirmations: i64,
 }
 
 #[derive(Serialize)]
@@ -880,77 +1046,151 @@ struct BuyerChannelView {
     id: String,
     display_name: String,
     gateway_kind: &'static str,
+    order_mode: String,
+    methods: Vec<BuyerMethodView>,
+    min_topup_minor: i64,
+    max_topup_minor: i64,
+    canary: bool,
+}
+
+/// The effective per-order bounds: the global range intersected with the
+/// channel's own merchant-verified range.
+fn effective_topup_bounds(settings: &ChannelSettingsView) -> (i64, i64) {
+    let min = settings
+        .min_topup_minor
+        .unwrap_or(MIN_TOPUP_MINOR)
+        .max(MIN_TOPUP_MINOR);
+    let max = settings
+        .max_topup_minor
+        .unwrap_or(MAX_TOPUP_MINOR)
+        .min(MAX_TOPUP_MINOR);
+    (min, max)
 }
 
 impl From<ChannelView> for BuyerChannelView {
     fn from(channel: ChannelView) -> Self {
+        let (min_topup_minor, max_topup_minor) = effective_topup_bounds(&channel.settings);
         Self {
             id: channel.id,
             display_name: channel.display_name,
             gateway_kind: channel.gateway_kind,
+            order_mode: channel.settings.order_mode.clone(),
+            methods: channel
+                .settings
+                .allowed_methods
+                .iter()
+                .filter_map(|token| token_rail(token))
+                .map(|rail| BuyerMethodView {
+                    token_id: rail.token_id.into(),
+                    chain: rail.chain,
+                    chain_name: rail.chain_name,
+                    symbol: rail.symbol,
+                    min_confirmations: rail.min_confirmations,
+                })
+                .collect(),
+            min_topup_minor,
+            max_topup_minor,
+            canary: channel.rollout_state == "canary",
         }
     }
 }
 
+const CHANNEL_VIEW_COLUMNS: &str = "c.id, c.display_name, c.enabled, c.sort_order, c.current_revision,
+        c.version, c.archived_at, (r.verified_at IS NOT NULL AND c.api_reverify_required = 0), r.webhook_mode,
+        c.webhook_verified_at,
+        (c.webhook_verified_at IS NOT NULL AND c.webhook_verified_revision IS c.current_revision),
+        (SELECT COUNT(*) FROM market_topup_orders t
+         WHERE t.channel_id = c.id AND t.status NOT IN ('credited', 'expired', 'cancelled')),
+        (SELECT COUNT(*) FROM market_verified_topup_evidence t
+         WHERE t.channel_id = c.id),
+        (SELECT COUNT(*) FROM market_verified_topup_evidence t
+         WHERE t.channel_id = c.id AND t.channel_revision = c.current_revision),
+        c.rollout_state, c.promoted_at,
+        COALESCE(s.order_mode, 'cashier'), COALESCE(s.allowed_methods_json, '[]'),
+        s.min_topup_minor, s.max_topup_minor, COALESCE(s.fee_rate_bps, 0),
+        COALESCE(s.fixed_fee_minor, 0), COALESCE(s.version, 0)";
+
+fn channel_view_row(row: &crate::db::Row<'_>) -> crate::db::Result<ChannelView> {
+    let methods_json: String = row.get(17)?;
+    Ok(ChannelView {
+        id: row.get(0)?,
+        display_name: row.get(1)?,
+        enabled: row.get::<_, i64>(2)? == 1,
+        sort_order: row.get(3)?,
+        current_revision: row.get(4)?,
+        version: row.get(5)?,
+        archived_at: row.get(6)?,
+        verified: row.get::<_, i64>(7)? == 1,
+        webhook_mode: row.get(8)?,
+        webhook_verified_at: row.get(9)?,
+        webhook_verified: row.get::<_, i64>(10)? == 1,
+        unresolved_topups: row.get(11)?,
+        verified_live_topups: row.get(12)?,
+        verified_live_topups_current_revision: row.get(13)?,
+        rollout_state: row.get(14)?,
+        promoted_at: row.get(15)?,
+        gateway_kind: "dujiaopay",
+        settings: ChannelSettingsView {
+            order_mode: row.get(16)?,
+            allowed_methods: serde_json::from_str(&methods_json).unwrap_or_default(),
+            min_topup_minor: row.get(18)?,
+            max_topup_minor: row.get(19)?,
+            fee_rate_bps: row.get(20)?,
+            fixed_fee_minor: row.get(21)?,
+            version: row.get(22)?,
+        },
+    })
+}
+
+/// `only_enabled` lists channels that accept new orders from every eligible
+/// buyer (live). The Owner additionally sees canary channels through
+/// [`buyer_channel_views`].
 fn channel_views(conn: &Connection, only_enabled: bool) -> Result<Vec<ChannelView>, AppError> {
     let sql = if only_enabled {
-        "SELECT c.id, c.display_name, c.enabled, c.sort_order, c.current_revision,
-                c.version, c.archived_at, (r.verified_at IS NOT NULL AND c.api_reverify_required = 0), r.webhook_mode,
-                c.webhook_verified_at,
-                (c.webhook_verified_at IS NOT NULL AND c.webhook_verified_revision IS c.current_revision),
-                (SELECT COUNT(*) FROM market_topup_orders t
-                 WHERE t.channel_id = c.id AND t.status NOT IN ('credited', 'expired', 'cancelled')),
-                (SELECT COUNT(*) FROM market_verified_topup_evidence t
-                 WHERE t.channel_id = c.id),
-                (SELECT COUNT(*) FROM market_verified_topup_evidence t
-                 WHERE t.channel_id = c.id AND t.channel_revision = c.current_revision)
-         FROM market_payment_channels c
-         JOIN market_payment_channel_revisions r
-           ON r.channel_id = c.id AND r.revision = c.current_revision
-         WHERE c.enabled = 1 AND c.archived_at IS NULL AND c.api_reverify_required = 0 AND r.verified_at IS NOT NULL
-         ORDER BY c.sort_order, c.id"
+        format!(
+            "SELECT {CHANNEL_VIEW_COLUMNS}
+             FROM market_payment_channels c
+             JOIN market_payment_channel_revisions r
+               ON r.channel_id = c.id AND r.revision = c.current_revision
+             LEFT JOIN market_payment_channel_settings s ON s.channel_id = c.id
+             WHERE c.rollout_state = 'live' AND c.archived_at IS NULL
+               AND c.api_reverify_required = 0 AND r.verified_at IS NOT NULL
+             ORDER BY c.sort_order, c.id"
+        )
     } else {
-        "SELECT c.id, c.display_name, c.enabled, c.sort_order, c.current_revision,
-                c.version, c.archived_at, (r.verified_at IS NOT NULL AND c.api_reverify_required = 0), r.webhook_mode,
-                c.webhook_verified_at,
-                (c.webhook_verified_at IS NOT NULL AND c.webhook_verified_revision IS c.current_revision),
-                (SELECT COUNT(*) FROM market_topup_orders t
-                 WHERE t.channel_id = c.id AND t.status NOT IN ('credited', 'expired', 'cancelled')),
-                (SELECT COUNT(*) FROM market_verified_topup_evidence t
-                 WHERE t.channel_id = c.id),
-                (SELECT COUNT(*) FROM market_verified_topup_evidence t
-                 WHERE t.channel_id = c.id AND t.channel_revision = c.current_revision)
-         FROM market_payment_channels c
-         LEFT JOIN market_payment_channel_revisions r
-           ON r.channel_id = c.id AND r.revision = c.current_revision
-         ORDER BY c.archived_at IS NOT NULL, c.sort_order, c.id"
+        format!(
+            "SELECT {CHANNEL_VIEW_COLUMNS}
+             FROM market_payment_channels c
+             LEFT JOIN market_payment_channel_revisions r
+               ON r.channel_id = c.id AND r.revision = c.current_revision
+             LEFT JOIN market_payment_channel_settings s ON s.channel_id = c.id
+             ORDER BY c.archived_at IS NOT NULL, c.sort_order, c.id"
+        )
     };
     let mut statement = conn
-        .prepare(sql)
+        .prepare(&sql)
         .map_err(db_error("prepare payment channels"))?;
     statement
-        .query_map([], |row| {
-            Ok(ChannelView {
-                id: row.get(0)?,
-                display_name: row.get(1)?,
-                enabled: row.get::<_, i64>(2)? == 1,
-                sort_order: row.get(3)?,
-                current_revision: row.get(4)?,
-                version: row.get(5)?,
-                archived_at: row.get(6)?,
-                verified: row.get::<_, i64>(7)? == 1,
-                webhook_mode: row.get(8)?,
-                webhook_verified_at: row.get(9)?,
-                webhook_verified: row.get::<_, i64>(10)? == 1,
-                unresolved_topups: row.get(11)?,
-                verified_live_topups: row.get(12)?,
-                verified_live_topups_current_revision: row.get(13)?,
-                gateway_kind: "dujiaopay",
-            })
-        })
+        .query_map([], channel_view_row)
         .map_err(db_error("query payment channels"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(db_error("read payment channels"))
+}
+
+fn buyer_channel_views(
+    conn: &Connection,
+    include_canary: bool,
+) -> Result<Vec<BuyerChannelView>, AppError> {
+    Ok(channel_views(conn, false)?
+        .into_iter()
+        .filter(|channel| {
+            channel.archived_at.is_none()
+                && channel.verified
+                && (channel.rollout_state == "live"
+                    || (include_canary && channel.rollout_state == "canary"))
+        })
+        .map(BuyerChannelView::from)
+        .collect())
 }
 
 async fn list_enabled_channels(
@@ -968,13 +1208,10 @@ async fn list_enabled_channels(
         )
         .map_err(db_error("read market finance mode"))?
     };
-    let shadow_admin = mode == "shadow" && state.dynamic.read().await.is_admin(&session.email);
+    let owner = crate::api::is_finance_owner(&state.config, &session.email);
     let conn = state.store.conn.lock().await;
-    let channels = if user_topup_allowed(&mode, shadow_admin, cutover_approved) {
-        channel_views(&conn, true)?
-            .into_iter()
-            .map(BuyerChannelView::from)
-            .collect()
+    let channels = if user_topup_allowed(&mode, owner, cutover_approved) {
+        buyer_channel_views(&conn, owner)?
     } else {
         Vec::new()
     };
@@ -1049,11 +1286,14 @@ fn validate_webhook_mode_change(
     next_mode: &str,
     explicit_next_mode: bool,
 ) -> Result<(), AppError> {
-    match (current_mode, next_mode, explicit_next_mode) {
-        ("signed", "poll_only", false) => Err(AppError::Conflict(
-            "signed webhook channel cannot be replaced without a signature secret".into(),
+    let _ = explicit_next_mode;
+    match (current_mode, next_mode) {
+        // A downgrade drops callback authentication and must go through the
+        // dedicated Webhook-secret rotation, which audits it explicitly.
+        ("signed", "poll_only") => Err(AppError::Conflict(
+            "use the Webhook secret rotation to stop signed callbacks".into(),
         )),
-        ("signed" | "poll_only", "signed" | "poll_only", _) => Ok(()),
+        ("signed" | "poll_only", "signed" | "poll_only") => Ok(()),
         _ => Err(AppError::Internal(
             "invalid stored payment webhook mode".into(),
         )),
@@ -1196,8 +1436,30 @@ async fn save_channel(
             return Err(AppError::Conflict("payment channel version changed".into()));
         }
     }
-    let allowed_methods_json = serde_json::to_string(&input.allowed_methods)
-        .map_err(|_| AppError::Internal("encode allowed methods failed".into()))?;
+    // Channel settings are the single authority for allowed methods. The
+    // request value only seeds a new channel; a replaced revision copies the
+    // current settings, so the per-revision snapshot that legacy orders read
+    // can never disagree with them.
+    let allowed_methods_json = if current_revision.is_none() {
+        let encoded = serde_json::to_string(&input.allowed_methods)
+            .map_err(|_| AppError::Internal("encode allowed methods failed".into()))?;
+        tx.execute(
+            "UPDATE market_payment_channel_settings SET allowed_methods_json = ?2, updated_at = ?3
+             WHERE channel_id = ?1",
+            params![id, encoded, time],
+        )
+        .map_err(db_error("initialize payment channel settings"))?;
+        encoded
+    } else {
+        tx.query_row(
+            "SELECT allowed_methods_json FROM market_payment_channel_settings WHERE channel_id = ?1",
+            params![id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(db_error("read payment channel settings"))?
+        .unwrap_or_else(|| "[]".into())
+    };
     tx.execute(
         "INSERT INTO market_payment_channel_revisions (
             channel_id, revision, merchant_id, merchant_fingerprint, api_key_id,
@@ -1243,7 +1505,7 @@ async fn create_channel(
     headers: HeaderMap,
     Json(input): Json<UpsertChannelRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let session = crate::api::require_admin_session(&state, &headers).await?;
+    let session = crate::api::require_owner_session(&state, &headers).await?;
     let view = save_channel(&state, &session, None, input).await?;
     Ok((no_store(), Json(view)))
 }
@@ -1254,7 +1516,7 @@ async fn replace_channel(
     Path(id): Path<String>,
     Json(input): Json<UpsertChannelRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let session = crate::api::require_admin_session(&state, &headers).await?;
+    let session = crate::api::require_owner_session(&state, &headers).await?;
     {
         let conn = state.store.conn.lock().await;
         let expected_version = input.expected_version.ok_or_else(|| {
@@ -1504,7 +1766,7 @@ async fn rotate_channel_api(
     Path(id): Path<String>,
     Json(input): Json<RotateApiRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let session = crate::api::require_admin_session(&state, &headers).await?;
+    let session = crate::api::require_owner_session(&state, &headers).await?;
     if input.api_key_id.trim().is_empty()
         || input.api_key_id.len() > 200
         || input.api_secret.len() < 16
@@ -1581,7 +1843,7 @@ async fn rotate_channel_webhook(
     Path(id): Path<String>,
     Json(input): Json<RotateWebhookRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let session = crate::api::require_admin_session(&state, &headers).await?;
+    let session = crate::api::require_owner_session(&state, &headers).await?;
     if !matches!(input.webhook_mode.as_str(), "signed" | "poll_only")
         || (input.webhook_mode == "signed"
             && input
@@ -1721,7 +1983,7 @@ async fn set_channel_archived(
     Path(id): Path<String>,
     Json(input): Json<ArchiveChannelRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let session = crate::api::require_admin_session(&state, &headers).await?;
+    let session = crate::api::require_owner_session(&state, &headers).await?;
     let conn = state.store.conn.lock().await;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1753,6 +2015,12 @@ struct SetEnabledRequest {
     expected_version: i64,
 }
 
+/// Enabling a channel puts its current revision into canary unless that
+/// revision already holds strictly verified live credit. A canary accepts
+/// orders only from the Router owner; the first verified credit (with a
+/// verified signed Webhook when the wallet is in production) promotes it.
+/// Disabling always returns it to `off`. This replaces the earlier rule that
+/// demanded live evidence *before* enabling, which no new revision could meet.
 fn set_channel_enabled_tx(
     conn: &Connection,
     id: &str,
@@ -1763,18 +2031,24 @@ fn set_channel_enabled_tx(
     editable_revision_tx(conn, id, expected_version)?;
     let changed = conn
         .execute(
-            "UPDATE market_payment_channels SET enabled = ?2, updated_at = ?3, version = version + 1
-         WHERE id = ?1 AND version = ?4 AND archived_at IS NULL
-           AND (?2 = 0 OR api_reverify_required = 0)
-           AND (?2 = 0 OR (SELECT verified_at FROM market_payment_channel_revisions
-                WHERE channel_id = ?1 AND revision = current_revision) IS NOT NULL)
-           AND (?2 = 0 OR (SELECT mode FROM market_finance_control WHERE id = 1) != 'enabled'
-                OR (webhook_verified_at IS NOT NULL
-                    AND webhook_verified_revision = current_revision
-                    AND (SELECT webhook_mode FROM market_payment_channel_revisions
-                         WHERE channel_id = ?1 AND revision = current_revision) = 'signed'
-                    AND EXISTS (SELECT 1 FROM market_verified_topup_evidence t
-                                WHERE t.channel_id = ?1 AND t.channel_revision = current_revision)))",
+            "UPDATE market_payment_channels
+             SET rollout_state = CASE
+                     WHEN ?2 = 0 THEN 'off'
+                     WHEN rollout_state != 'off' THEN rollout_state
+                     WHEN EXISTS (SELECT 1 FROM market_verified_topup_evidence t
+                                  WHERE t.channel_id = ?1 AND t.channel_revision = current_revision)
+                          AND ((SELECT mode FROM market_finance_control WHERE id = 1) != 'enabled'
+                               OR (webhook_verified_at IS NOT NULL
+                                   AND webhook_verified_revision = current_revision))
+                     THEN 'live' ELSE 'canary' END,
+                 updated_at = ?3, version = version + 1
+             WHERE id = ?1 AND version = ?4 AND archived_at IS NULL
+               AND (?2 = 0 OR api_reverify_required = 0)
+               AND (?2 = 0 OR (SELECT verified_at FROM market_payment_channel_revisions
+                    WHERE channel_id = ?1 AND revision = current_revision) IS NOT NULL)
+               AND (?2 = 0 OR (SELECT mode FROM market_finance_control WHERE id = 1) != 'enabled'
+                    OR (SELECT webhook_mode FROM market_payment_channel_revisions
+                        WHERE channel_id = ?1 AND revision = current_revision) = 'signed')",
             params![id, i64::from(enabled), time, expected_version],
         )
         .map_err(db_error("toggle payment channel"))?;
@@ -1786,13 +2060,50 @@ fn set_channel_enabled_tx(
     Ok(())
 }
 
+/// Promote a canary revision after its first strictly verified credit.
+/// Returns whether a promotion happened.
+fn promote_channel_if_proven_tx(
+    conn: &Connection,
+    channel_id: &str,
+    time: &str,
+) -> Result<bool, AppError> {
+    let changed = conn
+        .execute(
+            "UPDATE market_payment_channels
+             SET rollout_state = 'live', promoted_at = ?2, updated_at = ?2,
+                 version = version + 1
+             WHERE id = ?1 AND rollout_state = 'canary' AND archived_at IS NULL
+               AND EXISTS (SELECT 1 FROM market_verified_topup_evidence t
+                           WHERE t.channel_id = ?1 AND t.channel_revision = current_revision)
+               AND ((SELECT mode FROM market_finance_control WHERE id = 1) != 'enabled'
+                    OR (webhook_verified_at IS NOT NULL
+                        AND webhook_verified_revision = current_revision
+                        AND (SELECT webhook_mode FROM market_payment_channel_revisions
+                             WHERE channel_id = ?1 AND revision = current_revision) = 'signed'))",
+            params![channel_id, time],
+        )
+        .map_err(db_error("promote canary payment channel"))?;
+    if changed == 1 {
+        audit_tx(
+            conn,
+            "system",
+            "channel_promoted_live",
+            "payment_channel",
+            channel_id,
+            Some("verified_canary_credit"),
+            time,
+        )?;
+    }
+    Ok(changed == 1)
+}
+
 async fn set_channel_enabled(
     State(state): State<ServerState>,
     headers: HeaderMap,
     Path(id): Path<String>,
     Json(input): Json<SetEnabledRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let session = crate::api::require_admin_session(&state, &headers).await?;
+    let session = crate::api::require_owner_session(&state, &headers).await?;
     let conn = state.store.conn.lock().await;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1817,6 +2128,215 @@ async fn set_channel_enabled(
         no_store(),
         Json(serde_json::json!({ "enabled": input.enabled })),
     ))
+}
+
+/// Re-encrypt every stored credential revision with the newest master key
+/// version so an older key can be retired. Idempotent.
+fn rewrap_channel_secrets_tx(
+    conn: &Connection,
+    runtime: &MarketPaymentsRuntime,
+) -> Result<usize, AppError> {
+    let revisions = {
+        let mut statement = conn
+            .prepare(
+                "SELECT channel_id, revision, merchant_fingerprint, webhook_mode
+                 FROM market_payment_channel_revisions WHERE key_version != ?1",
+            )
+            .map_err(db_error("prepare payment secret rewrap"))?;
+        statement
+            .query_map(params![runtime.cipher.version], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(db_error("query payment secret rewrap"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_error("read payment secret rewrap"))?
+    };
+    let mut count = 0;
+    for (channel_id, revision, fingerprint, webhook_mode) in revisions {
+        let loaded = load_revision(conn, runtime, &channel_id, revision)?;
+        let (api_ciphertext, api_nonce) = runtime.cipher.seal(
+            loaded.credentials.api_secret.as_str(),
+            &aad(&channel_id, revision, &fingerprint, "api"),
+        )?;
+        let (webhook_ciphertext, webhook_nonce) = match (
+            webhook_mode.as_str(),
+            loaded.credentials.webhook_secret.as_ref(),
+        ) {
+            ("signed", Some(secret)) => runtime.cipher.seal(
+                secret.as_str(),
+                &aad(&channel_id, revision, &fingerprint, "webhook"),
+            )?,
+            _ => (String::new(), String::new()),
+        };
+        conn.execute(
+            "UPDATE market_payment_channel_revisions
+             SET api_secret_ciphertext = ?3, api_secret_nonce = ?4,
+                 webhook_secret_ciphertext = ?5, webhook_secret_nonce = ?6, key_version = ?7
+             WHERE channel_id = ?1 AND revision = ?2",
+            params![
+                channel_id,
+                revision,
+                api_ciphertext,
+                api_nonce,
+                webhook_ciphertext,
+                webhook_nonce,
+                runtime.cipher.version
+            ],
+        )
+        .map_err(db_error("rewrap payment secret"))?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+async fn rewrap_channel_secrets(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let session = crate::api::require_owner_session(&state, &headers).await?;
+    let conn = state.store.conn.lock().await;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_error("begin payment secret rewrap"))?;
+    let count = rewrap_channel_secrets_tx(&tx, &state.market_payments)?;
+    audit_tx(
+        &tx,
+        &session.user_id,
+        "channel_secrets_rewrapped",
+        "finance_control",
+        "1",
+        None,
+        &now(),
+    )?;
+    tx.commit()
+        .map_err(db_error("commit payment secret rewrap"))?;
+    Ok((
+        no_store(),
+        Json(serde_json::json!({
+            "rewrapped": count,
+            "keyVersion": state.market_payments.cipher.version,
+        })),
+    ))
+}
+
+async fn list_earning_holds(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    crate::api::require_admin_session(&state, &headers).await?;
+    let conn = state.store.conn.lock().await;
+    Ok((
+        no_store(),
+        Json(crate::market_finance::active_earning_holds_tx(&conn, None)?),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManualHoldRequest {
+    contract_id: String,
+    reason_code: String,
+}
+
+fn valid_reason_code(reason: &str) -> bool {
+    (3..=64).contains(&reason.len())
+        && reason
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+/// The Owner may freeze a contract's earnings, for example while a Provider
+/// identity conflict is investigated.
+async fn place_manual_earning_hold(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<ManualHoldRequest>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let session = crate::api::require_owner_session(&state, &headers).await?;
+    if !valid_reason_code(&input.reason_code) {
+        return Err(AppError::BadRequest("a short audit reason code is required".into()));
+    }
+    let conn = state.store.conn.lock().await;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_error("begin manual earning hold"))?;
+    let time = now();
+    crate::market_finance::hold_contract_earnings_tx(&tx, &input.contract_id, "manual", &time)?;
+    audit_tx(
+        &tx,
+        &session.user_id,
+        "earning_hold_placed",
+        "platform_contract",
+        &input.contract_id,
+        Some(&input.reason_code),
+        &time,
+    )?;
+    tx.commit().map_err(db_error("commit manual earning hold"))?;
+    Ok((no_store(), Json(serde_json::json!({ "held": true }))))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReleaseHoldRequest {
+    reason_kind: String,
+    reason_ref: String,
+    reason_code: String,
+}
+
+/// Holds that belong to a case or dispute are released by closing that case
+/// or dispute; only manual and unexplained legacy holds are released here.
+async fn release_manual_earning_hold(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<ReleaseHoldRequest>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let session = crate::api::require_owner_session(&state, &headers).await?;
+    if !valid_reason_code(&input.reason_code) {
+        return Err(AppError::BadRequest("a short audit reason code is required".into()));
+    }
+    if !matches!(input.reason_kind.as_str(), "manual" | "legacy_unknown") {
+        return Err(AppError::Conflict(
+            "close the linked dispute or finance case to release this hold".into(),
+        ));
+    }
+    let conn = state.store.conn.lock().await;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_error("begin earning hold release"))?;
+    let time = now();
+    let released = crate::market_finance::release_earning_holds_tx(
+        &tx,
+        &input.reason_kind,
+        &input.reason_ref,
+        &session.user_id,
+        &input.reason_code,
+        &time,
+    )?;
+    if input.reason_kind == "legacy_unknown" {
+        tx.execute(
+            "UPDATE market_finance_reconciliation_cases SET status = 'resolved', resolved_at = ?2
+             WHERE code = 'earning_hold_legacy' AND object_kind = 'provider'
+               AND object_id = ?1 AND status = 'open'",
+            params![input.reason_ref, time],
+        )
+        .map_err(db_error("close legacy earning hold case"))?;
+    }
+    audit_tx(
+        &tx,
+        &session.user_id,
+        "earning_hold_released",
+        &input.reason_kind,
+        &input.reason_ref,
+        Some(&input.reason_code),
+        &time,
+    )?;
+    tx.commit().map_err(db_error("commit earning hold release"))?;
+    Ok((no_store(), Json(serde_json::json!({ "released": released }))))
 }
 
 fn audit_tx(
@@ -1970,11 +2490,17 @@ async fn resolve_finance_case(
     Json(request): Json<ResolveFinanceCaseRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let actor = crate::api::require_admin_session(&state, &headers).await?;
+    let owner = crate::api::is_finance_owner(&state.config, &actor.email);
     let conn = state.store.conn.lock().await;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin finance case resolution"))?;
     ensure_general_case_can_resolve_tx(&tx, &id)?;
+    if !owner && crate::market_reconcile::case_is_critical_tx(&tx, &id)? {
+        return Err(AppError::Forbidden(
+            "only the Router owner may close a critical finance case".into(),
+        ));
+    }
     crate::market_reconcile::resolve_case_tx(
         &tx,
         &id,
@@ -2017,6 +2543,10 @@ struct AdminTopupView {
     created_at: String,
     updated_at: String,
     buyer_abandoned_at: Option<String>,
+    user_email: Option<String>,
+    order_mode: String,
+    create_last_error_code: Option<String>,
+    reconcile_failures: i64,
 }
 
 #[derive(Serialize)]
@@ -2165,7 +2695,9 @@ fn admin_topups_tx(
     let mut statement = conn
         .prepare(
             "SELECT id, user_id, channel_id, merchant_order_id, gateway_order_id,
-                    amount_minor, status, created_at, updated_at, buyer_abandoned_at
+                    amount_minor, status, created_at, updated_at, buyer_abandoned_at,
+                    (SELECT email_normalized FROM users WHERE users.id = market_topup_orders.user_id),
+                    order_mode, create_last_error_code, reconcile_failures
              FROM market_topup_orders
              WHERE (status IN ('review_required', 'create_unknown')
                 OR (status IN ('created', 'creating', 'pending', 'verifying')
@@ -2188,6 +2720,10 @@ fn admin_topups_tx(
                 created_at: row.get(7)?,
                 updated_at: row.get(8)?,
                 buyer_abandoned_at: row.get(9)?,
+                user_email: row.get(10)?,
+                order_mode: row.get(11)?,
+                create_last_error_code: row.get(12)?,
+                reconcile_failures: row.get(13)?,
             })
         })
         .map_err(db_error("query unresolved top-ups"))?
@@ -2327,13 +2863,40 @@ fn topup_payability_reason(
 
 fn gateway_cancel_was_requested_tx(conn: &Connection, order_id: &str) -> Result<bool, AppError> {
     conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM market_finance_audit_events
-         WHERE object_kind = 'topup' AND object_id = ?1
-           AND action = 'topup_gateway_cancel_requested')",
+        "SELECT cancel_requested_at IS NOT NULL FROM market_topup_orders WHERE id = ?1",
         params![order_id],
         |row| row.get(0),
     )
+    .optional()
+    .map(|requested| requested.unwrap_or(false))
     .map_err(db_error("check earlier gateway cancellation request"))
+}
+
+/// Record the one permitted gateway cancellation POST. The marker hides the
+/// checkout from every Router surface; the stored URL itself is kept so that
+/// "no URL" continues to mean only "create result unknown".
+fn mark_gateway_cancel_requested_tx(
+    conn: &Connection,
+    actor: &str,
+    order_id: &str,
+    time: &str,
+) -> Result<(), AppError> {
+    audit_tx(
+        conn,
+        actor,
+        "topup_gateway_cancel_requested",
+        "topup",
+        order_id,
+        None,
+        time,
+    )?;
+    conn.execute(
+        "UPDATE market_topup_orders SET cancel_requested_at = COALESCE(cancel_requested_at, ?2)
+         WHERE id = ?1",
+        params![order_id, time],
+    )
+    .map_err(db_error("record gateway cancellation request"))?;
+    Ok(())
 }
 
 fn valid_manual_reference(reference: &str) -> bool {
@@ -2534,7 +3097,12 @@ fn recovery_assessment_tx(
             "topup_verification_failed"
                 if matches!(
                     detail.as_str(),
-                    "gateway_terminal_payment_evidence" | "paid_receipt_invalid"
+                    "gateway_terminal_payment_evidence"
+                        | "paid_receipt_invalid"
+                        | "paid_amount_short"
+                        | "paid_method_not_allowed"
+                        | "paid_confirmations_low"
+                        | "paid_source_manual"
                 ) =>
             {
                 assessment.blockers.push("verification_payment_evidence");
@@ -3017,6 +3585,9 @@ fn mark_channel_webhook_verified_tx(
             params![channel_id, revision, time],
         )
         .map_err(db_error("mark payment webhook signature verified"))?;
+    if changed == 1 {
+        promote_channel_if_proven_tx(conn, channel_id, time)?;
+    }
     Ok(changed == 1)
 }
 
@@ -3025,9 +3596,12 @@ fn mark_channel_webhook_verified_tx(
 struct CreateTopupRequest {
     channel_id: String,
     amount_minor: i64,
+    /// Required for a direct (in-site) channel; forbidden for a hosted one.
+    #[serde(default)]
+    token_id: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct TopupView {
     id: String,
@@ -3044,72 +3618,101 @@ struct TopupView {
     buyer_recheck_result: Option<String>,
     last_gateway_status: Option<String>,
     last_gateway_checked_at: Option<String>,
+    order_mode: String,
+    payment_token_id: Option<String>,
+    has_payment_instructions: bool,
+    local_close_reason: Option<String>,
+    paid_at: Option<String>,
+}
+
+/// One projection for every buyer top-up surface. A payment handle (hosted
+/// checkout URL or direct instructions) is exposed only while the order is
+/// pending, not stopped, not cancel-requested and free of review holds.
+const TOPUP_VIEW_SQL: &str = "SELECT id, channel_id, amount_minor, status,
+        CASE WHEN status = 'pending' AND buyer_abandoned_at IS NULL
+            AND cancel_requested_at IS NULL AND NOT EXISTS (
+                SELECT 1 FROM market_finance_reconciliation_cases review
+                WHERE review.object_kind = 'topup'
+                  AND review.object_id = market_topup_orders.id
+                  AND review.status = 'open'
+            ) THEN checkout_url ELSE NULL END,
+        created_at, auto_close_at,
+        buyer_abandoned_at,
+        CASE WHEN status = 'review_required' AND EXISTS (
+            SELECT 1 FROM market_finance_reconciliation_cases review
+            WHERE review.object_kind = 'topup' AND review.object_id = market_topup_orders.id
+              AND review.code = 'topup_verification_failed'
+              AND review.status = 'open'
+              AND review.detail_code = 'paid_receipt_invalid'
+        ) THEN 'paid_receipt_invalid'
+        WHEN status = 'review_required' AND EXISTS (
+            SELECT 1 FROM market_finance_reconciliation_cases review
+            WHERE review.object_kind = 'topup' AND review.object_id = market_topup_orders.id
+              AND review.code = 'topup_verification_failed'
+              AND review.status = 'open'
+              AND review.detail_code = 'gateway_terminal_payment_evidence'
+        ) THEN 'terminal_payment_marker'
+        WHEN status = 'review_required' AND EXISTS (
+            SELECT 1 FROM market_finance_reconciliation_cases review
+            WHERE review.object_kind = 'topup' AND review.object_id = market_topup_orders.id
+              AND review.code = 'topup_verification_failed'
+              AND review.status = 'open'
+              AND review.detail_code IN ('paid_amount_short', 'paid_method_not_allowed',
+                                         'paid_confirmations_low', 'paid_source_manual')
+        ) THEN 'paid_terms_review' ELSE NULL END,
+        buyer_recheck_requested_at, buyer_recheck_completed_at, buyer_recheck_result,
+        (SELECT observation.gateway_status FROM market_topup_gateway_observations observation
+         WHERE observation.order_id = market_topup_orders.id
+         ORDER BY observation.last_observed_at DESC, observation.id DESC LIMIT 1),
+        (SELECT observation.last_observed_at FROM market_topup_gateway_observations observation
+         WHERE observation.order_id = market_topup_orders.id
+         ORDER BY observation.last_observed_at DESC, observation.id DESC LIMIT 1),
+        order_mode, gateway_token_id,
+        (status = 'pending' AND buyer_abandoned_at IS NULL AND cancel_requested_at IS NULL
+         AND order_mode = 'direct' AND pay_address IS NOT NULL AND payable_amount IS NOT NULL
+         AND NOT EXISTS (
+             SELECT 1 FROM market_finance_reconciliation_cases review
+             WHERE review.object_kind = 'topup'
+               AND review.object_id = market_topup_orders.id
+               AND review.status = 'open')),
+        local_close_reason, paid_at
+     FROM market_topup_orders";
+
+fn topup_view_row(row: &crate::db::Row<'_>) -> crate::db::Result<TopupView> {
+    let status: String = row.get(3)?;
+    let buyer_abandoned_at: Option<String> = row.get(7)?;
+    Ok(TopupView {
+        id: row.get(0)?,
+        channel_id: row.get(1)?,
+        amount_minor: row.get(2)?,
+        checkout_url: if status == "pending" && buyer_abandoned_at.is_none() {
+            row.get(4)?
+        } else {
+            None
+        },
+        status,
+        created_at: row.get(5)?,
+        auto_close_at: row.get(6)?,
+        buyer_abandoned_at,
+        review_reason: row.get(8)?,
+        buyer_recheck_requested_at: row.get(9)?,
+        buyer_recheck_completed_at: row.get(10)?,
+        buyer_recheck_result: row.get(11)?,
+        last_gateway_status: row.get(12)?,
+        last_gateway_checked_at: row.get(13)?,
+        order_mode: row.get(14)?,
+        payment_token_id: row.get(15)?,
+        has_payment_instructions: row.get::<_, i64>(16)? == 1,
+        local_close_reason: row.get(17)?,
+        paid_at: row.get(18)?,
+    })
 }
 
 fn read_topup(conn: &Connection, order_id: &str, user_id: &str) -> Result<TopupView, AppError> {
     conn.query_row(
-        "SELECT id, channel_id, amount_minor, status,
-                CASE WHEN status = 'pending' AND buyer_abandoned_at IS NULL
-                    AND NOT EXISTS (
-                        SELECT 1 FROM market_finance_audit_events audit
-                        WHERE audit.object_kind = 'topup'
-                          AND audit.object_id = market_topup_orders.id
-                          AND audit.action = 'topup_gateway_cancel_requested'
-                    ) AND NOT EXISTS (
-                        SELECT 1 FROM market_finance_reconciliation_cases review
-                        WHERE review.object_kind = 'topup'
-                          AND review.object_id = market_topup_orders.id
-                          AND review.status = 'open'
-                    ) THEN checkout_url ELSE NULL END,
-                created_at, auto_close_at,
-                buyer_abandoned_at,
-                CASE WHEN status = 'review_required' AND EXISTS (
-                    SELECT 1 FROM market_finance_reconciliation_cases review
-                    WHERE review.object_kind = 'topup' AND review.object_id = market_topup_orders.id
-                      AND review.code = 'topup_verification_failed'
-                      AND review.status = 'open'
-                      AND review.detail_code = 'paid_receipt_invalid'
-                ) THEN 'paid_receipt_invalid'
-                WHEN status = 'review_required' AND EXISTS (
-                    SELECT 1 FROM market_finance_reconciliation_cases review
-                    WHERE review.object_kind = 'topup' AND review.object_id = market_topup_orders.id
-                      AND review.code = 'topup_verification_failed'
-                      AND review.status = 'open'
-                      AND review.detail_code = 'gateway_terminal_payment_evidence'
-                ) THEN 'terminal_payment_marker' ELSE NULL END,
-                buyer_recheck_requested_at, buyer_recheck_completed_at, buyer_recheck_result,
-                (SELECT observation.gateway_status FROM market_topup_gateway_observations observation
-                 WHERE observation.order_id = market_topup_orders.id
-                 ORDER BY observation.last_observed_at DESC, observation.id DESC LIMIT 1),
-                (SELECT observation.last_observed_at FROM market_topup_gateway_observations observation
-                 WHERE observation.order_id = market_topup_orders.id
-                 ORDER BY observation.last_observed_at DESC, observation.id DESC LIMIT 1)
-         FROM market_topup_orders WHERE id = ?1 AND user_id = ?2",
+        &format!("{TOPUP_VIEW_SQL} WHERE id = ?1 AND user_id = ?2"),
         params![order_id, user_id],
-        |row| {
-            let status: String = row.get(3)?;
-            let buyer_abandoned_at: Option<String> = row.get(7)?;
-            Ok(TopupView {
-                id: row.get(0)?,
-                channel_id: row.get(1)?,
-                amount_minor: row.get(2)?,
-                checkout_url: if status == "pending" && buyer_abandoned_at.is_none() {
-                    row.get(4)?
-                } else {
-                    None
-                },
-                status,
-                created_at: row.get(5)?,
-                auto_close_at: row.get(6)?,
-                buyer_abandoned_at,
-                review_reason: row.get(8)?,
-                buyer_recheck_requested_at: row.get(9)?,
-                buyer_recheck_completed_at: row.get(10)?,
-                buyer_recheck_result: row.get(11)?,
-                last_gateway_status: row.get(12)?,
-                last_gateway_checked_at: row.get(13)?,
-            })
-        },
+        topup_view_row,
     )
     .map_err(|error| {
         if matches!(error, crate::db::Error::QueryReturnedNoRows) {
@@ -3120,6 +3723,9 @@ fn read_topup(conn: &Connection, order_id: &str, user_id: &str) -> Result<TopupV
     })
 }
 
+/// Bind a create result. A stopped or cancel-requested order still records
+/// the gateway identity and terms; its checkout stays hidden by the marker,
+/// and it is never reported as "create unknown" once the gateway ID exists.
 fn save_created_order_tx(
     conn: &Connection,
     order_id: &str,
@@ -3132,9 +3738,18 @@ fn save_created_order_tx(
             "UPDATE market_topup_orders
              SET gateway_order_id = COALESCE(gateway_order_id, ?2),
                  checkout_url = COALESCE(?3, checkout_url),
-                 expires_at = COALESCE(?4, expires_at), status = CASE
+                 expires_at = COALESCE(?4, expires_at),
+                 gateway_expires_at = COALESCE(?4, gateway_expires_at),
+                 pay_address = COALESCE(?7, pay_address),
+                 payable_amount = COALESCE(?8, payable_amount),
+                 gateway_chain = COALESCE(?9, gateway_chain),
+                 gateway_token_id = COALESCE(?10, gateway_token_id),
+                 create_last_error_code = NULL,
+                 status = CASE
                      WHEN status IN ('credited', 'expired', 'cancelled', 'review_required')
-                     THEN status WHEN ?3 IS NULL AND checkout_url IS NULL
+                     THEN status
+                     WHEN ?3 IS NULL AND checkout_url IS NULL AND ?7 IS NULL AND pay_address IS NULL
+                          AND buyer_abandoned_at IS NULL AND cancel_requested_at IS NULL
                      THEN 'create_unknown' ELSE 'pending' END,
                  updated_at = ?5
              WHERE id = ?1 AND channel_revision = ?6
@@ -3145,7 +3760,11 @@ fn save_created_order_tx(
                 created.checkout_url,
                 created.expires_at,
                 time,
-                revision
+                revision,
+                created.pay_address,
+                created.payable_amount,
+                created.chain,
+                created.token_id
             ],
         )
         .map_err(db_error("save DujiaoPay order"))?;
@@ -3279,15 +3898,23 @@ struct TopupGatewayStatusView {
     server_now: String,
 }
 
-async fn get_topup_gateway_status(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Path(order_id): Path<String>,
-) -> Result<impl axum::response::IntoResponse, AppError> {
-    let session = require_session(&state, &headers).await?;
+struct TopupGatewaySnapshot {
+    gateway: GatewayOrder,
+    payability_reason: &'static str,
+    can_cancel: bool,
+    can_abandon: bool,
+}
+
+/// One fresh authenticated lookup plus the local payability decision, shared
+/// by the hosted-checkout status endpoint and the direct-payment instructions.
+async fn topup_gateway_snapshot(
+    state: &ServerState,
+    order_id: &str,
+    user_id: &str,
+) -> Result<TopupGatewaySnapshot, AppError> {
     let (snapshot, loaded) = {
         let conn = state.store.conn.lock().await;
-        let snapshot = cancel_topup_snapshot_tx(&conn, &order_id, Some(&session.user_id))?;
+        let snapshot = cancel_topup_snapshot_tx(&conn, order_id, Some(user_id))?;
         if snapshot.status != "pending" {
             return Err(AppError::Conflict("top-up is not awaiting payment".into()));
         }
@@ -3300,59 +3927,150 @@ async fn get_topup_gateway_status(
         (snapshot, loaded)
     };
     let gateway = get_bound_gateway_order(
-        &state,
+        state,
         &snapshot.channel_id,
         snapshot.revision,
         &loaded,
         &snapshot.gateway_order_id,
     )
     .await?;
-    let (payability_reason, can_cancel, can_abandon) = {
-        let conn = state.store.conn.lock().await;
-        let current = cancel_topup_snapshot_tx(&conn, &order_id, Some(&session.user_id))?;
-        validate_gateway_identity_tx(
-            &conn,
-            &order_id,
-            &current.channel_id,
-            current.revision,
-            &loaded,
-            &current.gateway_order_id,
+    let conn = state.store.conn.lock().await;
+    let current = cancel_topup_snapshot_tx(&conn, order_id, Some(user_id))?;
+    validate_gateway_identity_tx(
+        &conn,
+        order_id,
+        &current.channel_id,
+        current.revision,
+        &loaded,
+        &current.gateway_order_id,
+        &gateway,
+    )?;
+    record_gateway_terms_tx(&conn, order_id, &gateway)?;
+    let assessment = recovery_assessment_tx(&conn, order_id, &current.status, &gateway)?;
+    let abandoned = topup_buyer_abandoned_tx(&conn, order_id)?;
+    let cancel_requested = gateway_cancel_was_requested_tx(&conn, order_id)?;
+    let view = read_topup(&conn, order_id, user_id)?;
+    let has_handle = view.checkout_url.is_some() || view.has_payment_instructions;
+    Ok(TopupGatewaySnapshot {
+        payability_reason: topup_payability_reason(
+            &current.status,
             &gateway,
-        )?;
-        let assessment = recovery_assessment_tx(&conn, &order_id, &current.status, &gateway)?;
-        let abandoned = topup_buyer_abandoned_tx(&conn, &order_id)?;
-        let cancel_requested = gateway_cancel_was_requested_tx(&conn, &order_id)?;
-        let has_checkout = read_topup(&conn, &order_id, &session.user_id)?
-            .checkout_url
-            .is_some();
-        (
-            topup_payability_reason(
-                &current.status,
-                &gateway,
-                &assessment,
-                abandoned,
-                cancel_requested,
-                has_checkout,
-                Utc::now(),
-            ),
-            can_cancel_gateway_topup(&current.status, &gateway.status, &assessment, false)
-                && !cancel_requested,
-            current.status == "pending"
-                && gateway.status == "awaiting_payment"
-                && assessment.blockers.as_slice() == ["gateway_not_terminal"]
-                && !abandoned
-                && !cancel_requested,
-        )
-    };
+            &assessment,
+            abandoned,
+            cancel_requested,
+            has_handle,
+            Utc::now(),
+        ),
+        can_cancel: can_cancel_gateway_topup(&current.status, &gateway.status, &assessment, false)
+            && !cancel_requested,
+        can_abandon: current.status == "pending"
+            && gateway.status == "awaiting_payment"
+            && assessment.blockers.as_slice() == ["gateway_not_terminal"]
+            && !abandoned
+            && !cancel_requested,
+        gateway,
+    })
+}
+
+async fn get_topup_gateway_status(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(order_id): Path<String>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let session = require_session(&state, &headers).await?;
+    let snapshot = topup_gateway_snapshot(&state, &order_id, &session.user_id).await?;
     Ok((
         no_store(),
         Json(TopupGatewayStatusView {
+            gateway_status: snapshot.gateway.status,
+            can_pay: snapshot.payability_reason == "payable",
+            payability_reason: snapshot.payability_reason,
+            can_cancel: snapshot.can_cancel,
+            can_abandon: snapshot.can_abandon,
+            selection_deadline: snapshot.gateway.selection_deadline,
+            expires_at: snapshot.gateway.expires_at,
+            server_now: now(),
+        }),
+    ))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PaymentInstructionsView {
+    gateway_status: String,
+    can_pay: bool,
+    payability_reason: &'static str,
+    can_cancel: bool,
+    chain: Option<String>,
+    chain_name: Option<&'static str>,
+    token_id: Option<String>,
+    token_symbol: Option<&'static str>,
+    min_confirmations: Option<i64>,
+    confirmations: Option<i64>,
+    /// Present only while the order can be paid.
+    pay_address: Option<String>,
+    payable_amount: Option<String>,
+    fiat_amount_minor: i64,
+    expires_at: Option<String>,
+    server_now: String,
+}
+
+/// In-site payment instructions for a direct (QR) top-up. The address and the
+/// exact on-chain amount come from a fresh authenticated lookup and are only
+/// returned while the order is payable. Clients must poll at most every five
+/// seconds, matching the gateway's lookup guidance.
+async fn get_payment_instructions(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(order_id): Path<String>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let session = require_session(&state, &headers).await?;
+    {
+        let conn = state.store.conn.lock().await;
+        let mode: String = conn
+            .query_row(
+                "SELECT order_mode FROM market_topup_orders WHERE id = ?1 AND user_id = ?2",
+                params![order_id, session.user_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_error("read top-up mode"))?
+            .ok_or_else(|| AppError::NotFound("top-up order not found".into()))?;
+        if mode != "direct" {
+            return Err(AppError::Conflict(
+                "this top-up uses the hosted checkout".into(),
+            ));
+        }
+    }
+    if !state
+        .market_payments
+        .allow_instruction_lookup(&order_id)
+    {
+        return Err(AppError::RateLimited {
+            message: "payment status was checked moments ago".into(),
+            retry_after_secs: 5,
+        });
+    }
+    let snapshot = topup_gateway_snapshot(&state, &order_id, &session.user_id).await?;
+    let gateway = snapshot.gateway;
+    let rail = gateway.token_id.as_deref().and_then(token_rail);
+    let payable = snapshot.payability_reason == "payable";
+    Ok((
+        no_store(),
+        Json(PaymentInstructionsView {
             gateway_status: gateway.status,
-            can_pay: payability_reason == "payable",
-            payability_reason,
-            can_cancel,
-            can_abandon,
-            selection_deadline: gateway.selection_deadline,
+            can_pay: payable,
+            payability_reason: snapshot.payability_reason,
+            can_cancel: snapshot.can_cancel,
+            chain: gateway.chain,
+            chain_name: rail.map(|rail| rail.chain_name),
+            token_id: gateway.token_id,
+            token_symbol: rail.map(|rail| rail.symbol),
+            min_confirmations: rail.map(|rail| rail.min_confirmations),
+            confirmations: gateway.confirmations,
+            pay_address: gateway.pay_address.filter(|_| payable),
+            payable_amount: gateway.payable_amount.filter(|_| payable),
+            fiat_amount_minor: gateway.fiat_amount_minor,
             expires_at: gateway.expires_at,
             server_now: now(),
         }),
@@ -3447,7 +4165,7 @@ fn stop_buyer_topup_tx(
     let changed = conn
         .execute(
             "UPDATE market_topup_orders
-             SET buyer_abandoned_at = ?2, checkout_url = NULL,
+             SET buyer_abandoned_at = ?2,
                  updated_at = ?2, next_reconcile_at = ?2
              WHERE id = ?1 AND user_id = ?3 AND buyer_abandoned_at IS NULL
                AND status IN ('created', 'creating', 'create_unknown', 'pending',
@@ -3720,20 +4438,7 @@ async fn cancel_topup_for_actor(
                 "gateway cancellation was already requested; verify its current status".into(),
             ));
         }
-        audit_tx(
-            &tx,
-            actor,
-            "topup_gateway_cancel_requested",
-            "topup",
-            order_id,
-            None,
-            &now(),
-        )?;
-        tx.execute(
-            "UPDATE market_topup_orders SET checkout_url = NULL WHERE id = ?1",
-            params![order_id],
-        )
-        .map_err(db_error("hide checkout after gateway cancellation request"))?;
+        mark_gateway_cancel_requested_tx(&tx, actor, order_id, &now())?;
         // Persist a near-term authenticated lookup before the external call.
         // If this process dies after the gateway commits the cancellation,
         // reconciliation can still observe its terminal state.
@@ -3849,73 +4554,14 @@ fn topups_tx(
         })
         .transpose()?;
     let mut statement = conn
-        .prepare(
-            "SELECT id, channel_id, amount_minor, status,
-                    CASE WHEN status = 'pending' AND buyer_abandoned_at IS NULL
-                        AND NOT EXISTS (
-                            SELECT 1 FROM market_finance_audit_events audit
-                            WHERE audit.object_kind = 'topup'
-                              AND audit.object_id = market_topup_orders.id
-                              AND audit.action = 'topup_gateway_cancel_requested'
-                        ) AND NOT EXISTS (
-                            SELECT 1 FROM market_finance_reconciliation_cases review
-                            WHERE review.object_kind = 'topup'
-                              AND review.object_id = market_topup_orders.id
-                              AND review.status = 'open'
-                        ) THEN checkout_url ELSE NULL END,
-                    created_at, auto_close_at,
-                    buyer_abandoned_at,
-                    CASE WHEN status = 'review_required' AND EXISTS (
-                        SELECT 1 FROM market_finance_reconciliation_cases review
-                        WHERE review.object_kind = 'topup' AND review.object_id = market_topup_orders.id
-                          AND review.code = 'topup_verification_failed'
-                          AND review.status = 'open'
-                          AND review.detail_code = 'paid_receipt_invalid'
-                    ) THEN 'paid_receipt_invalid'
-                    WHEN status = 'review_required' AND EXISTS (
-                        SELECT 1 FROM market_finance_reconciliation_cases review
-                        WHERE review.object_kind = 'topup' AND review.object_id = market_topup_orders.id
-                          AND review.code = 'topup_verification_failed'
-                          AND review.status = 'open'
-                          AND review.detail_code = 'gateway_terminal_payment_evidence'
-                    ) THEN 'terminal_payment_marker' ELSE NULL END,
-                    buyer_recheck_requested_at, buyer_recheck_completed_at, buyer_recheck_result,
-                    (SELECT observation.gateway_status FROM market_topup_gateway_observations observation
-                     WHERE observation.order_id = market_topup_orders.id
-                     ORDER BY observation.last_observed_at DESC, observation.id DESC LIMIT 1),
-                    (SELECT observation.last_observed_at FROM market_topup_gateway_observations observation
-                     WHERE observation.order_id = market_topup_orders.id
-                     ORDER BY observation.last_observed_at DESC, observation.id DESC LIMIT 1)
-             FROM market_topup_orders WHERE user_id = ?1
+        .prepare(&format!(
+            "{TOPUP_VIEW_SQL} WHERE user_id = ?1
                AND (?2 IS NULL OR created_at < ?2 OR (created_at = ?2 AND id < ?3))
-             ORDER BY created_at DESC, id DESC LIMIT 51",
-        )
+             ORDER BY created_at DESC, id DESC LIMIT 51"
+        ))
         .map_err(db_error("prepare top-up history"))?;
     let mut items = statement
-        .query_map(params![user_id, cursor_at, cursor], |row| {
-            let status: String = row.get(3)?;
-            let buyer_abandoned_at: Option<String> = row.get(7)?;
-            Ok(TopupView {
-                id: row.get(0)?,
-                channel_id: row.get(1)?,
-                amount_minor: row.get(2)?,
-                checkout_url: if status == "pending" && buyer_abandoned_at.is_none() {
-                    row.get(4)?
-                } else {
-                    None
-                },
-                status,
-                created_at: row.get(5)?,
-                auto_close_at: row.get(6)?,
-                buyer_abandoned_at,
-                review_reason: row.get(8)?,
-                buyer_recheck_requested_at: row.get(9)?,
-                buyer_recheck_completed_at: row.get(10)?,
-                buyer_recheck_result: row.get(11)?,
-                last_gateway_status: row.get(12)?,
-                last_gateway_checked_at: row.get(13)?,
-            })
-        })
+        .query_map(params![user_id, cursor_at, cursor], topup_view_row)
         .map_err(db_error("query top-up history"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(db_error("read top-up history"))?;
@@ -3949,12 +4595,7 @@ fn active_matching_topup_tx(
          WHERE user_id = ?1 AND request_fingerprint = ?2
            AND buyer_abandoned_at IS NULL
            AND status IN ('created', 'creating', 'create_unknown', 'pending')
-           AND NOT EXISTS (
-               SELECT 1 FROM market_finance_audit_events audit
-               WHERE audit.object_kind = 'topup'
-                 AND audit.object_id = market_topup_orders.id
-                 AND audit.action = 'topup_gateway_cancel_requested'
-           )
+           AND cancel_requested_at IS NULL
            AND NOT EXISTS (
                SELECT 1 FROM market_finance_reconciliation_cases review
                WHERE review.object_kind = 'topup'
@@ -4030,6 +4671,211 @@ fn ensure_pending_topup_capacity_tx(conn: &Connection, user_id: &str) -> Result<
     Ok(())
 }
 
+struct TopupChannelSettings {
+    revision: i64,
+    order_mode: String,
+    allowed_methods: Vec<String>,
+    min_topup_minor: i64,
+    max_topup_minor: i64,
+}
+
+/// The channel and its settings for a *new* order. A canary accepts only the
+/// Router owner; `off`, archived or re-verification-pending channels accept
+/// nobody.
+fn topup_channel_tx(
+    conn: &Connection,
+    channel_id: &str,
+    owner: bool,
+) -> Result<TopupChannelSettings, AppError> {
+    let row = conn
+        .query_row(
+            "SELECT c.current_revision, COALESCE(s.order_mode, 'cashier'),
+                    COALESCE(s.allowed_methods_json, '[]'), s.min_topup_minor, s.max_topup_minor
+             FROM market_payment_channels c
+             LEFT JOIN market_payment_channel_settings s ON s.channel_id = c.id
+             WHERE c.id = ?1 AND c.archived_at IS NULL AND c.api_reverify_required = 0
+               AND (c.rollout_state = 'live' OR (c.rollout_state = 'canary' AND ?2 = 1))",
+            params![channel_id, owner],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(db_error("read enabled payment channel"))?
+        .ok_or_else(|| AppError::BadRequest("payment channel unavailable".into()))?;
+    let settings = ChannelSettingsView {
+        order_mode: row.1.clone(),
+        allowed_methods: serde_json::from_str(&row.2)
+            .map_err(|_| AppError::Internal("stored payment methods invalid".into()))?,
+        min_topup_minor: row.3,
+        max_topup_minor: row.4,
+        fee_rate_bps: 0,
+        fixed_fee_minor: 0,
+        version: 0,
+    };
+    let (min_topup_minor, max_topup_minor) = effective_topup_bounds(&settings);
+    Ok(TopupChannelSettings {
+        revision: row.0,
+        order_mode: settings.order_mode,
+        allowed_methods: settings.allowed_methods,
+        min_topup_minor,
+        max_topup_minor,
+    })
+}
+
+fn require_new_topups_open_tx(conn: &Connection) -> Result<(), AppError> {
+    let paused: bool = conn
+        .query_row(
+            "SELECT new_topups_paused FROM market_finance_control WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error("read top-up pause"))?;
+    if paused {
+        return Err(AppError::Coded {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "MARKET_TOPUP_PAUSED",
+            message: "new top-ups are paused by the Router owner".into(),
+            details: serde_json::json!({}),
+        });
+    }
+    Ok(())
+}
+
+fn topup_base_url(state: &ServerState) -> String {
+    let scheme = if state.config.use_localhost {
+        "http"
+    } else {
+        "https"
+    };
+    format!(
+        "{scheme}://{}",
+        state.config.tunnel_domain.trim_end_matches('/')
+    )
+}
+
+fn user_reference(user_id: &str) -> String {
+    hex::encode(Sha256::digest(format!("market-topup-user:{user_id}").as_bytes()))[..16].into()
+}
+
+/// The create body for an order that predates frozen request bodies. It is
+/// rebuilt exactly as the original code did (no metadata, revision methods).
+fn legacy_create_body(
+    state: &ServerState,
+    order_id: &str,
+    merchant_order_id: &str,
+    amount_minor: i64,
+    allowed_methods: &[String],
+) -> Result<Vec<u8>, AppError> {
+    let (success_url, cancel_url) = topup_return_urls(&topup_base_url(state), order_id);
+    dujiaopay::create_order_body(&dujiaopay::CreateOrderInput {
+        merchant_order_id,
+        amount_minor,
+        allowed_methods,
+        fixed_token_id: None,
+        success_url: &success_url,
+        cancel_url: &cancel_url,
+        metadata: None,
+    })
+}
+
+/// Persist the outcome of a failed create attempt. Throttling and capacity
+/// errors push the next attempt out; an authentication failure takes the
+/// channel offline because no order on it can be created or verified.
+fn record_create_failure_tx(
+    conn: &Connection,
+    order_id: &str,
+    channel_id: &str,
+    error: &AppError,
+    time: &str,
+) -> Result<(), AppError> {
+    let kind = dujiaopay::error_kind(error);
+    let code = dujiaopay::gateway_error_code(error)
+        .or_else(|| error.code().map(str::to_string))
+        .unwrap_or_else(|| "unavailable".into());
+    let backoff_secs = match kind {
+        Some(dujiaopay::GatewayErrorKind::RateLimited) => 90,
+        Some(dujiaopay::GatewayErrorKind::Capacity) => 120,
+        _ => 0,
+    };
+    let next = (Utc::now() + chrono::Duration::seconds(backoff_secs.max(30))).to_rfc3339();
+    conn.execute(
+        "UPDATE market_topup_orders
+         SET create_attempts = create_attempts + 1, create_last_error_code = ?2,
+             status = CASE WHEN status IN ('created', 'creating') THEN 'create_unknown' ELSE status END,
+             updated_at = ?3,
+             next_reconcile_at = CASE WHEN ?5 > 0 THEN ?4 ELSE next_reconcile_at END
+         WHERE id = ?1",
+        params![order_id, code, time, next, backoff_secs],
+    )
+    .map_err(db_error("record top-up create failure"))?;
+    if kind == Some(dujiaopay::GatewayErrorKind::Auth) {
+        disable_channel_for_auth_failure_tx(conn, channel_id, time)?;
+    }
+    Ok(())
+}
+
+fn disable_channel_for_auth_failure_tx(
+    conn: &Connection,
+    channel_id: &str,
+    time: &str,
+) -> Result<(), AppError> {
+    let changed = conn
+        .execute(
+            "UPDATE market_payment_channels SET rollout_state = 'off', updated_at = ?2,
+                    version = version + 1
+             WHERE id = ?1 AND rollout_state != 'off'",
+            params![channel_id, time],
+        )
+        .map_err(db_error("disable rejected payment channel"))?;
+    if changed == 1 {
+        open_reconciliation_case_tx(conn, "payment_channel_auth_failed", "payment_channel", channel_id, time)?;
+        audit_tx(
+            conn,
+            "system",
+            "channel_disabled_auth_failed",
+            "payment_channel",
+            channel_id,
+            Some("gateway_auth_rejected"),
+            time,
+        )?;
+        enqueue_owner_signal_tx(
+            conn,
+            "payment_channel_auth_failed",
+            "payment_channel",
+            channel_id,
+            serde_json::json!({ "channelId": channel_id }),
+            time,
+        )?;
+    }
+    Ok(())
+}
+
+fn enqueue_owner_signal_tx(
+    conn: &Connection,
+    kind: &str,
+    entity_kind: &str,
+    entity_id: &str,
+    details: serde_json::Value,
+    time: &str,
+) -> Result<(), AppError> {
+    crate::market_notifications::owner_signal_tx(
+        conn,
+        kind,
+        entity_kind,
+        entity_id,
+        details,
+        time,
+        false,
+    )
+}
+
 async fn create_topup(
     State(state): State<ServerState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -4041,7 +4887,7 @@ async fn create_topup(
         .ip
         .and_then(|value| value.parse::<IpAddr>().ok())
         .unwrap_or_else(|| peer.ip());
-    let shadow_admin = state.dynamic.read().await.is_admin(&session.email);
+    let owner = crate::api::is_finance_owner(&state.config, &session.email);
     let idem = headers
         .get("Idempotency-Key")
         .and_then(|value| value.to_str().ok())
@@ -4058,8 +4904,18 @@ async fn create_topup(
             "top-up amount outside supported range".into(),
         ));
     }
-    let request_fingerprint = format!("{}:{}", input.channel_id, input.amount_minor);
-    let (order_id, merchant_order_id, revision, loaded, existing_view) = {
+    if input
+        .token_id
+        .as_deref()
+        .is_some_and(|token| token_rail(token).is_none())
+    {
+        return Err(AppError::BadRequest("unsupported payment method".into()));
+    }
+    let request_fingerprint = match input.token_id.as_deref() {
+        Some(token) => format!("{}:{}:{token}", input.channel_id, input.amount_minor),
+        None => format!("{}:{}", input.channel_id, input.amount_minor),
+    };
+    let (order_id, merchant_order_id, revision, channel_id, loaded, existing_view, body) = {
         let conn = state.store.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -4077,7 +4933,7 @@ async fn create_topup(
                 "platform wallet cutover has not been approved".into(),
             ));
         }
-        if !user_topup_allowed(&mode, shadow_admin, cutover_approved) {
+        if !user_topup_allowed(&mode, owner, cutover_approved) {
             return Err(AppError::ServiceUnavailable(
                 "platform wallet top-up is not enabled".into(),
             ));
@@ -4106,7 +4962,7 @@ async fn create_topup(
         } else {
             active_matching_topup_tx(&tx, &session.user_id, &request_fingerprint)?
         };
-        let (id, merchant_order_id, revision, already_created) = if let Some((
+        let (id, merchant_order_id, revision, already_created, body) = if let Some((
             id,
             fingerprint,
             merchant_order_id,
@@ -4116,14 +4972,48 @@ async fn create_topup(
             if fingerprint != request_fingerprint {
                 return Err(AppError::Conflict("top-up idempotency conflict".into()));
             }
-            (id, merchant_order_id, revision, true)
+            let body: Option<String> = tx
+                .query_row(
+                    "SELECT create_request_body FROM market_topup_orders WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .map_err(db_error("read frozen top-up request"))?;
+            (id, merchant_order_id, revision, true, body.map(String::into_bytes))
         } else {
-            crate::market_reconcile::ensure_new_finance_writes_safe_tx(&tx)?;
-            let revision = tx.query_row(
-                "SELECT current_revision FROM market_payment_channels WHERE id = ?1 AND enabled = 1 AND archived_at IS NULL AND api_reverify_required = 0",
-                params![input.channel_id], |row| row.get::<_, i64>(0),
-            ).optional().map_err(db_error("read enabled payment channel"))?
-                .ok_or_else(|| AppError::BadRequest("payment channel unavailable".into()))?;
+            crate::market_reconcile::ensure_finance_scopes_safe_tx(
+                &tx,
+                &[crate::market_reconcile::FinanceScope::User(&session.user_id)],
+            )?;
+            require_new_topups_open_tx(&tx)?;
+            let channel = topup_channel_tx(&tx, &input.channel_id, owner)?;
+            if !(channel.min_topup_minor..=channel.max_topup_minor).contains(&input.amount_minor) {
+                return Err(AppError::Coded {
+                    status: StatusCode::BAD_REQUEST,
+                    code: "MARKET_TOPUP_AMOUNT_OUT_OF_RANGE",
+                    message: "top-up amount outside this channel's range".into(),
+                    details: serde_json::json!({
+                        "minTopupMinor": channel.min_topup_minor,
+                        "maxTopupMinor": channel.max_topup_minor,
+                    }),
+                });
+            }
+            match (channel.order_mode.as_str(), input.token_id.as_deref()) {
+                ("direct", Some(token))
+                    if channel.allowed_methods.is_empty()
+                        || channel.allowed_methods.iter().any(|method| method == token) => {}
+                ("direct", _) => {
+                    return Err(AppError::BadRequest(
+                        "choose an allowed payment method".into(),
+                    ));
+                }
+                (_, Some(_)) => {
+                    return Err(AppError::BadRequest(
+                        "this channel selects the payment method at checkout".into(),
+                    ));
+                }
+                _ => {}
+            }
             ensure_pending_topup_capacity_tx(&tx, &session.user_id)?;
             let recent: i64 = tx
                 .query_row(
@@ -4146,31 +5036,38 @@ async fn create_topup(
                     "top-up IP rate limit reached".into(),
                 ));
             }
-            (
-                Uuid::new_v4().to_string(),
-                format!("router-{}", Uuid::new_v4().simple()),
-                revision,
-                false,
-            )
-        };
-        let loaded = load_revision(&tx, &state.market_payments, &input.channel_id, revision)?;
-        let existing_view = already_created
-            .then(|| read_topup(&tx, &id, &session.user_id))
-            .transpose()?;
-        if !already_created {
+            let id = Uuid::new_v4().to_string();
+            let merchant_order_id = format!("router-{}", Uuid::new_v4().simple());
+            let (success_url, cancel_url) = topup_return_urls(&topup_base_url(&state), &id);
+            let body = dujiaopay::create_order_body(&dujiaopay::CreateOrderInput {
+                merchant_order_id: &merchant_order_id,
+                amount_minor: input.amount_minor,
+                allowed_methods: &channel.allowed_methods,
+                fixed_token_id: input.token_id.as_deref(),
+                success_url: &success_url,
+                cancel_url: &cancel_url,
+                metadata: Some(serde_json::json!({
+                    "router_order_id": id,
+                    "user_ref": user_reference(&session.user_id),
+                })),
+            })?;
+            let loaded = load_revision(&tx, &state.market_payments, &input.channel_id, channel.revision)?;
             let created_at = Utc::now();
             let time = created_at.to_rfc3339();
+            let fixed_rail = input.token_id.as_deref().and_then(token_rail);
             tx.execute(
                 "INSERT INTO market_topup_orders (
                     id, user_id, channel_id, channel_revision, merchant_fingerprint,
                     merchant_order_id, idempotency_key, request_fingerprint, amount_minor,
-                    status, created_at, updated_at, next_reconcile_at, auto_close_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'creating', ?10, ?10, ?11, ?12)",
+                    status, created_at, updated_at, next_reconcile_at, auto_close_at,
+                    create_request_body, order_mode, gateway_token_id, gateway_chain
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'creating', ?10, ?10, ?11, ?12,
+                           ?13, ?14, ?15, ?16)",
                 params![
                     id,
                     session.user_id,
                     input.channel_id,
-                    revision,
+                    channel.revision,
                     loaded.merchant_fingerprint,
                     merchant_order_id,
                     idem,
@@ -4178,13 +5075,49 @@ async fn create_topup(
                     input.amount_minor,
                     time,
                     (created_at + chrono::Duration::seconds(30)).to_rfc3339(),
-                    topup_auto_close_deadline(created_at)
+                    topup_auto_close_deadline(created_at),
+                    String::from_utf8(body.clone())
+                        .map_err(|_| AppError::Internal("encode top-up request failed".into()))?,
+                    channel.order_mode,
+                    fixed_rail.map(|rail| rail.token_id),
+                    fixed_rail.map(|rail| rail.chain)
                 ],
             )
             .map_err(db_error("insert top-up order"))?;
+            (id, merchant_order_id, channel.revision, false, Some(body))
+        };
+        let loaded = load_revision(&tx, &state.market_payments, &input.channel_id, revision)?;
+        let existing_view = already_created
+            .then(|| read_topup(&tx, &id, &session.user_id))
+            .transpose()?;
+        if let Some(view) = &existing_view
+            && matches!(view.status.as_str(), "created" | "creating" | "create_unknown")
+        {
+            // A replay may only re-submit the frozen body of an order that is
+            // still eligible for a fresh gateway attempt.
+            let stopped: bool = tx
+                .query_row(
+                    "SELECT buyer_abandoned_at IS NOT NULL OR cancel_requested_at IS NOT NULL
+                     FROM market_topup_orders WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .map_err(db_error("read top-up stop marker"))?;
+            if stopped {
+                tx.commit().map_err(db_error("commit top-up replay"))?;
+                return Ok((no_store(), Json(view.clone())));
+            }
         }
         tx.commit().map_err(db_error("commit top-up order"))?;
-        (id, merchant_order_id, revision, loaded, existing_view)
+        (
+            id,
+            merchant_order_id,
+            revision,
+            input.channel_id.clone(),
+            loaded,
+            existing_view,
+            body,
+        )
     };
     if let Some(view) = existing_view
         && !matches!(
@@ -4194,27 +5127,28 @@ async fn create_topup(
     {
         return Ok((no_store(), Json(view)));
     }
-    let scheme = if state.config.use_localhost {
-        "http"
-    } else {
-        "https"
+    let body = match body {
+        Some(body) => body,
+        None => legacy_create_body(
+            &state,
+            &order_id,
+            &merchant_order_id,
+            {
+                let conn = state.store.conn.lock().await;
+                conn.query_row(
+                    "SELECT amount_minor FROM market_topup_orders WHERE id = ?1",
+                    params![order_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(db_error("read legacy top-up amount"))?
+            },
+            &loaded.allowed_methods,
+        )?,
     };
-    let base = format!(
-        "{scheme}://{}",
-        state.config.tunnel_domain.trim_end_matches('/')
-    );
-    let (success_url, cancel_url) = topup_return_urls(&base, &order_id);
     let created = state
         .market_payments
         .client
-        .create_order(
-            &loaded.credentials,
-            &merchant_order_id,
-            input.amount_minor,
-            &loaded.allowed_methods,
-            &success_url,
-            &cancel_url,
-        )
+        .create_order_with_body(&loaded.credentials, &merchant_order_id, &body)
         .await;
     let conn = state.store.conn.lock().await;
     let tx = conn
@@ -4222,6 +5156,11 @@ async fn create_topup(
         .map_err(db_error("begin top-up create result"))?;
     let view = match created {
         Ok(created) => {
+            tx.execute(
+                "UPDATE market_topup_orders SET create_attempts = create_attempts + 1 WHERE id = ?1",
+                params![order_id],
+            )
+            .map_err(db_error("count top-up create attempt"))?;
             if let Err(error) = save_created_order_tx(&tx, &order_id, revision, &created, &now()) {
                 if matches!(error, AppError::Conflict(_)) {
                     hold_topup_verification_failure_tx(
@@ -4238,12 +5177,7 @@ async fn create_topup(
             read_topup(&tx, &order_id, &session.user_id)?
         }
         Err(error) => {
-            tx.execute(
-                "UPDATE market_topup_orders SET status = 'create_unknown', updated_at = ?2
-                 WHERE id = ?1 AND status IN ('created', 'creating', 'create_unknown')",
-                params![order_id, now()],
-            )
-            .map_err(db_error("mark uncertain top-up"))?;
+            record_create_failure_tx(&tx, &order_id, &channel_id, &error, &now())?;
             tx.commit().map_err(db_error("commit uncertain top-up"))?;
             return Err(error);
         }
@@ -4253,6 +5187,7 @@ async fn create_topup(
         view.status.as_str(),
         "created" | "creating" | "create_unknown" | "pending"
     ) && view.checkout_url.is_none()
+        && !view.has_payment_instructions
     {
         return Err(AppError::Coded {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -4264,6 +5199,7 @@ async fn create_topup(
     }
     Ok((no_store(), Json(view)))
 }
+
 
 fn receipt_fingerprint(merchant: &str, order: &GatewayOrder) -> Result<String, AppError> {
     let chain = order.chain.as_deref().filter(|value| !value.is_empty());
@@ -4303,6 +5239,145 @@ fn valid_positive_decimal(value: &str) -> bool {
         })
         && pieces.next().is_none()
         && value.bytes().any(|byte| (b'1'..=b'9').contains(&byte))
+}
+
+const PAID_TERMS_CODE: &str = "MARKET_TOPUP_PAID_TERMS";
+
+fn paid_terms_error(detail: &'static str) -> AppError {
+    AppError::Coded {
+        status: StatusCode::CONFLICT,
+        code: PAID_TERMS_CODE,
+        message: "DujiaoPay payment terms need review".into(),
+        details: serde_json::json!({ "detail": detail }),
+    }
+}
+
+/// The review detail for a paid-order validation failure, or `None` when the
+/// error is not a payment-evidence conflict.
+fn paid_review_detail(error: &AppError) -> Option<&'static str> {
+    match error {
+        AppError::Conflict(_) => Some("paid_receipt_invalid"),
+        AppError::Coded { code, details, .. } if *code == PAID_TERMS_CODE => {
+            match details.get("detail").and_then(serde_json::Value::as_str) {
+                Some("paid_amount_short") => Some("paid_amount_short"),
+                Some("paid_method_not_allowed") => Some("paid_method_not_allowed"),
+                Some("paid_confirmations_low") => Some("paid_confirmations_low"),
+                Some("paid_source_manual") => Some("paid_source_manual"),
+                _ => Some("paid_receipt_invalid"),
+            }
+        }
+        _ => None,
+    }
+}
+
+struct OrderPaymentTerms {
+    allowed_methods: Vec<String>,
+    fixed_token_id: Option<String>,
+    payable_amount: Option<String>,
+}
+
+/// The payment methods this order was created with: from its frozen create
+/// body, or for a legacy order from its bound credential revision.
+fn order_payment_terms_tx(
+    conn: &Connection,
+    order_id: &str,
+    loaded: &LoadedRevision,
+) -> Result<OrderPaymentTerms, AppError> {
+    let (body, payable_amount): (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT create_request_body, payable_amount FROM market_topup_orders WHERE id = ?1",
+            params![order_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(db_error("read top-up payment terms"))?;
+    let Some(body) = body else {
+        return Ok(OrderPaymentTerms {
+            allowed_methods: loaded.allowed_methods.clone(),
+            fixed_token_id: None,
+            payable_amount,
+        });
+    };
+    let value: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|_| AppError::Internal("stored top-up request invalid".into()))?;
+    let allowed_methods = value
+        .get("allowed_methods")
+        .and_then(serde_json::Value::as_array)
+        .map(|methods| {
+            methods
+                .iter()
+                .filter_map(|method| method.get("token_id").and_then(serde_json::Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(OrderPaymentTerms {
+        allowed_methods,
+        fixed_token_id: value
+            .get("token_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        payable_amount,
+    })
+}
+
+/// Payment-term checks beyond the gateway's own `paid` verdict: the source
+/// must be an on-chain receipt, the rail must be one this order allowed, the
+/// confirmations must reach the rail's documented minimum, and the settled
+/// amount may not fall short of the locked payable amount.
+fn validate_paid_terms_tx(
+    conn: &Connection,
+    order_id: &str,
+    loaded: &LoadedRevision,
+    gateway: &GatewayOrder,
+) -> Result<(), AppError> {
+    match gateway.paid_source.as_deref() {
+        Some("chain") => {}
+        Some("merchant_claim" | "platform_manual" | "merchant_manual") => {
+            return Err(paid_terms_error("paid_source_manual"));
+        }
+        _ => return Err(AppError::Conflict("DujiaoPay payment needs review".into())),
+    }
+    let terms = order_payment_terms_tx(conn, order_id, loaded)?;
+    let token = gateway.token_id.as_deref().unwrap_or_default();
+    let allowed = match terms.fixed_token_id.as_deref() {
+        Some(fixed) => fixed == token,
+        None => terms.allowed_methods.is_empty() || terms.allowed_methods.iter().any(|m| m == token),
+    };
+    // A token outside the rail table has no known chain or confirmation
+    // floor, so nothing about its receipt can be checked: hold it for review.
+    let Some(rail) = token_rail(token) else {
+        return Err(paid_terms_error("paid_method_not_allowed"));
+    };
+    if !allowed || gateway.chain.as_deref() != Some(rail.chain) {
+        return Err(paid_terms_error("paid_method_not_allowed"));
+    }
+    if gateway.confirmations.unwrap_or(0) < rail.min_confirmations {
+        return Err(paid_terms_error("paid_confirmations_low"));
+    }
+    let payable = gateway
+        .payable_amount
+        .as_deref()
+        .or(terms.payable_amount.as_deref());
+    if let (Some(payable), Some(settled)) = (payable, gateway.settled_amount.as_deref()) {
+        let fiat = format!(
+            "{}.{:02}",
+            gateway.fiat_amount_minor / 100,
+            gateway.fiat_amount_minor % 100
+        );
+        // `settled_amount` is compared with the locked on-chain amount. On a
+        // USD stablecoin a value exactly equal to the fiat amount is the
+        // gateway reporting in fiat terms and is accepted. On any other token
+        // the fiat figure is a different unit, so it never excuses a short
+        // payment.
+        let short = dujiaopay::compare_decimal(settled, payable)
+            .is_none_or(|ordering| ordering == std::cmp::Ordering::Less);
+        let fiat_terms = rail.usd_stable()
+            && dujiaopay::compare_decimal(settled, &fiat) == Some(std::cmp::Ordering::Equal);
+        if short && !fiat_terms {
+            return Err(paid_terms_error("paid_amount_short"));
+        }
+    }
+    Ok(())
 }
 
 struct ValidatedTopup {
@@ -4381,12 +5456,7 @@ fn restore_verified_checkout_tx(
              status = CASE WHEN status = 'create_unknown' THEN 'pending' ELSE status END
          WHERE id = ?1 AND status IN ('created', 'creating', 'create_unknown', 'pending')
            AND buyer_abandoned_at IS NULL
-           AND NOT EXISTS (
-               SELECT 1 FROM market_finance_audit_events audit
-               WHERE audit.object_kind = 'topup'
-                 AND audit.object_id = market_topup_orders.id
-                 AND audit.action = 'topup_gateway_cancel_requested'
-           )",
+           AND cancel_requested_at IS NULL",
         params![order_id, checkout_url],
     )
     .map_err(db_error("restore verified checkout URL"))?;
@@ -4434,6 +5504,7 @@ fn validate_paid_order_tx(
     if status == "credited" {
         return Ok(None);
     }
+    validate_paid_terms_tx(conn, order_id, loaded, gateway)?;
     let fingerprint = receipt_fingerprint(&loaded.merchant_fingerprint, gateway)?;
     let existing_receipt = conn
         .query_row(
@@ -4539,6 +5610,17 @@ fn apply_paid_order_tx(
     )
     .map_err(db_error("mark top-up credited"))?;
     finish_buyer_recheck_tx(conn, order_id, Some("credited"))?;
+    notify_topup_tx(conn, order_id, "topup_credited", &time)?;
+    if promote_channel_if_proven_tx(conn, channel_id, &time)? {
+        enqueue_owner_signal_tx(
+            conn,
+            "channel_promoted_live",
+            "payment_channel",
+            channel_id,
+            serde_json::json!({ "channelId": channel_id }),
+            &time,
+        )?;
+    }
     Ok(())
 }
 
@@ -4920,7 +6002,8 @@ fn apply_verified_unpaid_status_tx(
     };
     conn.execute(
         "UPDATE market_topup_orders
-         SET status = CASE WHEN ?2 = 'pending' AND checkout_url IS NULL
+         SET status = CASE WHEN ?2 = 'pending' AND checkout_url IS NULL AND pay_address IS NULL
+                                AND buyer_abandoned_at IS NULL AND cancel_requested_at IS NULL
                            THEN 'create_unknown' ELSE ?2 END,
              updated_at = ?3
          WHERE id = ?1 AND (status IN ('created', 'creating', 'create_unknown',
@@ -5074,7 +6157,7 @@ fn bound_webhook_order_tx(
     conn: &Connection,
     channel_id: &str,
     merchant_order_hint: &str,
-) -> Result<(String, i64), AppError> {
+) -> Result<Option<(String, i64)>, AppError> {
     conn.query_row(
         "SELECT id, channel_revision FROM market_topup_orders
          WHERE merchant_order_id = ?1 AND channel_id = ?2",
@@ -5082,8 +6165,7 @@ fn bound_webhook_order_tx(
         |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
     )
     .optional()
-    .map_err(db_error("bind DujiaoPay webhook"))?
-    .ok_or_else(|| AppError::Unauthorized("DujiaoPay webhook not recognized".into()))
+    .map_err(db_error("bind DujiaoPay webhook"))
 }
 
 fn queue_webhook_hint_tx(conn: &Connection, order_id: &str, time: &str) -> Result<bool, AppError> {
@@ -5104,6 +6186,190 @@ fn queue_webhook_hint_tx(conn: &Connection, order_id: &str, time: &str) -> Resul
     Ok(changed == 1)
 }
 
+/// A verified signed event always schedules an immediate authenticated
+/// lookup. Unlike an unsigned hint it is not subject to the cooldown.
+fn queue_signed_event_reconcile_tx(
+    conn: &Connection,
+    order_id: &str,
+    time: &str,
+) -> Result<(), AppError> {
+    let recovery_until =
+        (Utc::now() + chrono::Duration::seconds(WEBHOOK_HINT_RECOVERY_SECS)).to_rfc3339();
+    conn.execute(
+        "UPDATE market_topup_orders
+         SET next_reconcile_at = ?2, reconcile_hint_pending = 1,
+             hint_reconcile_until = CASE WHEN hint_reconcile_until IS NULL
+                 OR hint_reconcile_until < ?3 THEN ?3 ELSE hint_reconcile_until END
+         WHERE id = ?1 AND status != 'credited'",
+        params![order_id, time, recovery_until],
+    )
+    .map_err(db_error("queue signed DujiaoPay event"))?;
+    Ok(())
+}
+
+/// Record verified `order.method_selected` terms. Values only fill blanks; an
+/// authenticated lookup remains the authority that may overwrite them.
+fn record_selected_terms_tx(
+    conn: &Connection,
+    order_id: &str,
+    terms: &dujiaopay::SelectedTerms,
+) -> Result<(), AppError> {
+    conn.execute(
+        "UPDATE market_topup_orders
+         SET gateway_chain = COALESCE(gateway_chain, ?2),
+             gateway_token_id = COALESCE(gateway_token_id, ?3),
+             pay_address = COALESCE(pay_address, ?4),
+             payable_amount = COALESCE(payable_amount, ?5),
+             gateway_expires_at = COALESCE(gateway_expires_at, ?6)
+         WHERE id = ?1",
+        params![
+            order_id,
+            terms.chain,
+            terms.token_id,
+            terms.pay_address,
+            terms.payable_amount,
+            terms.expires_at
+        ],
+    )
+    .map_err(db_error("record selected payment terms"))?;
+    Ok(())
+}
+
+/// Authenticated lookups refresh the order's gateway terms.
+fn record_gateway_terms_tx(
+    conn: &Connection,
+    order_id: &str,
+    gateway: &GatewayOrder,
+) -> Result<(), AppError> {
+    conn.execute(
+        "UPDATE market_topup_orders
+         SET gateway_chain = COALESCE(?2, gateway_chain),
+             gateway_token_id = COALESCE(?3, gateway_token_id),
+             pay_address = COALESCE(?4, pay_address),
+             payable_amount = COALESCE(?5, payable_amount),
+             fx_rate = COALESCE(?6, fx_rate),
+             gateway_expires_at = COALESCE(?7, gateway_expires_at)
+         WHERE id = ?1",
+        params![
+            order_id,
+            gateway.chain.as_deref().filter(|_| gateway.token_id.is_some()),
+            gateway.token_id.as_deref().filter(|token| token_rail(token).is_some()),
+            gateway.pay_address,
+            gateway.payable_amount,
+            gateway.fx_rate,
+            gateway.expires_at
+        ],
+    )
+    .map_err(db_error("record gateway payment terms"))?;
+    Ok(())
+}
+
+/// Signed events that are not bound to a Router order: `webhook.test` proves
+/// the current Webhook secret, `unmatched_claim.claimed` schedules a lookup or
+/// opens an Owner case. Nothing here moves money.
+async fn handle_unbound_webhook(
+    state: &ServerState,
+    only_channel: Option<&str>,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<bool, AppError> {
+    let conn = state.store.conn.lock().await;
+    let candidates = {
+        let mut statement = conn
+            .prepare(
+                "SELECT c.id, c.current_revision FROM market_payment_channels c
+                 JOIN market_payment_channel_revisions r
+                   ON r.channel_id = c.id AND r.revision = c.current_revision
+                 WHERE c.archived_at IS NULL AND r.webhook_mode = 'signed'
+                   AND (?1 IS NULL OR c.id = ?1)
+                 ORDER BY c.rollout_state = 'off', c.sort_order, c.id LIMIT 16",
+            )
+            .map_err(db_error("prepare signed webhook channels"))?;
+        statement
+            .query_map(params![only_channel], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(db_error("query signed webhook channels"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_error("read signed webhook channels"))?
+    };
+    let now_unix = Utc::now().timestamp();
+    for (channel_id, revision) in candidates {
+        let Ok(loaded) = load_revision(&conn, &state.market_payments, &channel_id, revision) else {
+            continue;
+        };
+        let Ok(event) =
+            dujiaopay::verify_unbound_webhook(&loaded.credentials, headers, body, now_unix)
+        else {
+            continue;
+        };
+        tracing::info!(
+            channel_id = %channel_id,
+            event_id = %event.event_id,
+            event_type = %event.event_type,
+            "verified unbound DujiaoPay event"
+        );
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error("begin unbound webhook"))?;
+        let time = now();
+        match event.event_type.as_str() {
+            "webhook.test" => {
+                if mark_channel_webhook_verified_tx(&tx, &channel_id, revision, &time)? {
+                    audit_tx(
+                        &tx,
+                        "system",
+                        "channel_webhook_test_verified",
+                        "payment_channel",
+                        &channel_id,
+                        None,
+                        &time,
+                    )?;
+                }
+            }
+            "unmatched_claim.claimed" => {
+                let order = match event.order_id.as_deref() {
+                    Some(gateway_order_id) => tx
+                        .query_row(
+                            "SELECT id FROM market_topup_orders
+                             WHERE merchant_fingerprint = ?1 AND gateway_order_id = ?2",
+                            params![loaded.merchant_fingerprint, gateway_order_id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()
+                        .map_err(db_error("locate claimed gateway order"))?,
+                    None => None,
+                };
+                match order {
+                    Some(order_id) => queue_signed_event_reconcile_tx(&tx, &order_id, &time)?,
+                    None => {
+                        open_reconciliation_case_tx(
+                            &tx,
+                            "gateway_unmatched_claim",
+                            "payment_channel",
+                            &channel_id,
+                            &time,
+                        )?;
+                        enqueue_owner_signal_tx(
+                            &tx,
+                            "gateway_orphan_paid_order",
+                            "payment_channel",
+                            &channel_id,
+                            serde_json::json!({ "eventType": event.event_type }),
+                            &time,
+                        )?;
+                    }
+                }
+            }
+            _ => {}
+        }
+        tx.commit().map_err(db_error("commit unbound webhook"))?;
+        state.market_payments.wake_reconciler();
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 /// The fixed URL is suitable for a merchant dashboard before a channel exists.
 /// Its body is never payment evidence: it may only wake a bounded authenticated
 /// API lookup of an order already created by this Router.
@@ -5113,9 +6379,11 @@ async fn dujiaopay_webhook_hint(
     body: Bytes,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let Some(merchant_order_hint) = dujiaopay::optional_merchant_order_hint(&body)? else {
-        return Ok(Json(
-            serde_json::json!({ "accepted": true, "ignored": true }),
-        ));
+        let verified = handle_unbound_webhook(&state, None, &headers, &body).await?;
+        return Ok(Json(serde_json::json!({
+            "accepted": true,
+            "ignored": !verified
+        })));
     };
     let bound = {
         let conn = state.store.conn.lock().await;
@@ -5159,7 +6427,9 @@ async fn dujiaopay_webhook_hint(
     if signed {
         // Old signed revisions retain their full event handling and audit,
         // whether the merchant uses the fixed or legacy URL.
-        return dujiaopay_webhook(State(state), Path(channel_id), headers, body).await;
+        return dujiaopay_webhook(State(state), Path(channel_id), headers, body)
+            .await
+            .map(|Json(value)| Json(value));
     }
     let conn = state.store.conn.lock().await;
     let tx = conn
@@ -5168,9 +6438,31 @@ async fn dujiaopay_webhook_hint(
     queue_webhook_hint_tx(&tx, &order_id, &now())?;
     tx.commit()
         .map_err(db_error("commit DujiaoPay callback hint"))?;
+    state.market_payments.wake_reconciler();
     Ok(Json(serde_json::json!({ "accepted": true })))
 }
 
+fn mark_event_tx(
+    conn: &Connection,
+    merchant_fingerprint: &str,
+    event_id: &str,
+    status: &str,
+    time: &str,
+) -> Result<(), AppError> {
+    conn.execute(
+        "UPDATE market_topup_events SET status = ?3, processed_at = ?4,
+                processed_by = CASE WHEN ?3 = 'processed' THEN 'webhook' ELSE processed_by END
+         WHERE merchant_fingerprint = ?1 AND gateway_event_id = ?2",
+        params![merchant_fingerprint, event_id, status, time],
+    )
+    .map_err(db_error("finish payment event"))?;
+    Ok(())
+}
+
+/// Signed DujiaoPay events. The handler verifies, persists and binds the
+/// event, schedules an immediate authenticated lookup and returns 2xx at
+/// once; payment state changes only in reconciliation, from `GET
+/// /v1/orders/{id}`. Lookups therefore never hold the gateway's request open.
 async fn dujiaopay_webhook(
     State(state): State<ServerState>,
     Path(channel_id): Path<String>,
@@ -5187,308 +6479,150 @@ async fn dujiaopay_webhook(
     // The untrusted order hint only locates an already-bound order. In
     // poll-only mode it may schedule a bounded authenticated lookup; signed
     // mode acts on no payment field until the raw body HMAC is verified.
-    let merchant_order_hint = dujiaopay::merchant_order_hint(&body)?;
-    let (revision, loaded, event, order_id, verified_current_revision) = {
-        let conn = state.store.conn.lock().await;
-        let bound = bound_webhook_order_tx(&conn, &channel_id, &merchant_order_hint)?;
-        let current_revision: i64 = conn
-            .query_row(
-                "SELECT current_revision FROM market_payment_channels WHERE id = ?1",
-                params![channel_id],
-                |row| row.get(0),
-            )
-            .map_err(db_error("read callback channel"))?;
-        let current = load_revision(&conn, &state.market_payments, &channel_id, current_revision)?;
-        let historical = load_revision(&conn, &state.market_payments, &channel_id, bound.1)?;
-        let has_signed_key = if current.merchant_fingerprint == historical.merchant_fingerprint {
-            current.credentials.webhook_secret.is_some()
-        } else {
-            historical.credentials.webhook_secret.is_some()
-        };
-        if !has_signed_key {
-            let tx = conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(db_error("begin callback lookup hint"))?;
-            queue_webhook_hint_tx(&tx, &bound.0, &now())?;
-            tx.commit()
-                .map_err(db_error("commit callback lookup hint"))?;
-            return Ok(Json(serde_json::json!({ "accepted": true })));
-        }
-        let (loaded, event, verified_current_revision) = verify_bound_webhook_tx(
-            &conn,
-            &state.market_payments,
-            &channel_id,
-            bound.1,
-            &headers,
-            &body,
-            Utc::now().timestamp(),
-        )?;
-        if event.merchant_order_id != merchant_order_hint {
-            return Err(AppError::Unauthorized(
-                "DujiaoPay webhook not recognized".into(),
-            ));
-        }
-        (bound.1, loaded, event, bound.0, verified_current_revision)
-    };
-    {
-        let conn = state.store.conn.lock().await;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(db_error("begin webhook event"))?;
-        persist_signed_event_tx(&tx, &order_id, &loaded.merchant_fingerprint, &event, &now())?;
-        if let Some(current_revision) = verified_current_revision {
-            mark_channel_webhook_verified_tx(&tx, &channel_id, current_revision, &now())?;
-        }
-        // Signed events also need a persisted recovery window: the immediate
-        // authenticated lookup may fail, including for an order older than the
-        // regular polling horizon.
-        queue_webhook_hint_tx(&tx, &order_id, &now())?;
-        tx.commit().map_err(db_error("commit DujiaoPay webhook"))?;
-    }
-    if is_non_payment_lifecycle_event(&event.event_type) {
-        // Signed lifecycle callbacks can arrive before the create API returns.
-        // Their order ID is a recovery locator, never evidence of payment.
-        let conn = state.store.conn.lock().await;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(db_error("begin created-event binding"))?;
-        let time = now();
-        let review_required = match bind_signed_gateway_order_tx(
-            &tx,
-            &order_id,
-            &channel_id,
-            revision,
-            &loaded,
-            &event,
-        ) {
-            Ok(()) => false,
-            Err(AppError::Conflict(_)) => {
-                hold_topup_verification_failure_tx(
-                    &tx,
-                    &order_id,
-                    "signed_gateway_order_conflict",
-                    &time,
-                )?;
-                true
-            }
-            Err(error) => return Err(error),
-        };
-        tx.execute(
-            "UPDATE market_topup_events SET status = ?3, processed_at = ?4
-             WHERE merchant_fingerprint = ?1 AND gateway_event_id = ?2",
-            params![
-                loaded.merchant_fingerprint,
-                event.event_id,
-                if review_required {
-                    "review_required"
-                } else {
-                    "processed"
-                },
-                time
-            ],
-        )
-        .map_err(db_error("finish created payment event"))?;
-        tx.commit()
-            .map_err(db_error("commit created-event binding"))?;
+    let Some(merchant_order_hint) = dujiaopay::optional_merchant_order_hint(&body)? else {
+        let verified = handle_unbound_webhook(&state, Some(&channel_id), &headers, &body).await?;
         return Ok(Json(serde_json::json!({
             "accepted": true,
-            "reviewRequired": review_required
+            "ignored": !verified
         })));
-    }
-    if !matches!(
-        event.event_type.as_str(),
-        "order.paid" | "order.expired" | "order.cancelled" | "order.canceled"
-    ) {
-        let conn = state.store.conn.lock().await;
+    };
+    let conn = state.store.conn.lock().await;
+    let Some(bound) = bound_webhook_order_tx(&conn, &channel_id, &merchant_order_hint)? else {
+        // Unknown orders are acknowledged so the gateway does not retry an
+        // event this Router can never act on.
+        return Ok(Json(serde_json::json!({ "accepted": true, "ignored": true })));
+    };
+    let current_revision: i64 = conn
+        .query_row(
+            "SELECT current_revision FROM market_payment_channels WHERE id = ?1",
+            params![channel_id],
+            |row| row.get(0),
+        )
+        .map_err(db_error("read callback channel"))?;
+    let current = load_revision(&conn, &state.market_payments, &channel_id, current_revision)?;
+    let historical = load_revision(&conn, &state.market_payments, &channel_id, bound.1)?;
+    let has_signed_key = if current.merchant_fingerprint == historical.merchant_fingerprint {
+        current.credentials.webhook_secret.is_some()
+    } else {
+        historical.credentials.webhook_secret.is_some()
+    };
+    if !has_signed_key {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(db_error("begin unsupported payment event review"))?;
-        let time = now();
-        let code = if event.event_type == "refund.recorded" {
-            "external_refund_recorded"
-        } else {
-            "unknown_gateway_event"
-        };
-        open_reconciliation_case_tx(&tx, code, "topup", &order_id, &time)?;
-        tx.execute(
-            "UPDATE market_topup_orders SET status = 'review_required', updated_at = ?2
-             WHERE id = ?1 AND status != 'credited'",
-            params![order_id, time],
-        )
-        .map_err(db_error("hold top-up for event review"))?;
-        tx.execute(
-            "UPDATE market_topup_events SET status = 'review_required', processed_at = ?3
-             WHERE merchant_fingerprint = ?1 AND gateway_event_id = ?2",
-            params![loaded.merchant_fingerprint, event.event_id, time],
-        )
-        .map_err(db_error("mark payment event for review"))?;
+            .map_err(db_error("begin callback lookup hint"))?;
+        queue_webhook_hint_tx(&tx, &bound.0, &now())?;
         tx.commit()
-            .map_err(db_error("commit payment event review"))?;
-        return Ok(Json(
-            serde_json::json!({ "accepted": true, "reviewRequired": true }),
-        ));
-    }
-    let gateway =
-        get_bound_gateway_order(&state, &channel_id, revision, &loaded, &event.order_id).await?;
-    let conn = state.store.conn.lock().await;
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(db_error("begin verified top-up"))?;
-    if gateway.status == "paid" {
-        match validate_gateway_identity_tx(
-            &tx,
-            &order_id,
-            &channel_id,
-            revision,
-            &loaded,
-            &event.order_id,
-            &gateway,
-        ) {
-            Ok(()) => record_gateway_observation_tx(&tx, &order_id, "webhook", &gateway, &now())?,
-            // A foreign or mismatched gateway order is not evidence for this
-            // Router top-up and must not enter its observation history.
-            Err(AppError::Conflict(_)) => {}
-            Err(error) => return Err(error),
-        }
-    }
-    if gateway.status == "paid"
-        && topup_has_manual_hold_tx(&tx, &order_id)?
-        && compatible_paid_hold_ids_tx(&tx, &order_id)?.is_none()
-    {
-        let time = now();
-        tx.execute(
-            "UPDATE market_topup_orders SET status = 'review_required', updated_at = ?2
-             WHERE id = ?1 AND status != 'credited'",
-            params![order_id, time],
-        )
-        .map_err(db_error("hold disputed webhook top-up"))?;
-        tx.execute(
-            "UPDATE market_topup_events SET status = 'review_required', processed_at = ?3
-             WHERE merchant_fingerprint = ?1 AND gateway_event_id = ?2",
-            params![loaded.merchant_fingerprint, event.event_id, time],
-        )
-        .map_err(db_error("mark disputed webhook for review"))?;
-        finish_buyer_recheck_tx(&tx, &order_id, Some("review_required"))?;
-        tx.commit()
-            .map_err(db_error("commit disputed webhook review"))?;
-        return Ok(Json(
-            serde_json::json!({ "accepted": true, "reviewRequired": true }),
-        ));
-    }
-    if gateway.status != "paid" {
-        if let Err(error) = validate_gateway_identity_tx(
-            &tx,
-            &order_id,
-            &channel_id,
-            revision,
-            &loaded,
-            &event.order_id,
-            &gateway,
-        ) {
-            if matches!(error, AppError::Conflict(_)) {
-                let time = now();
-                hold_topup_verification_failure_tx(
-                    &tx,
-                    &order_id,
-                    "gateway_identity_mismatch",
-                    &time,
-                )?;
-                tx.execute("UPDATE market_topup_events SET status = 'review_required', processed_at = ?3 WHERE merchant_fingerprint = ?1 AND gateway_event_id = ?2", params![loaded.merchant_fingerprint, event.event_id, time])
-                    .map_err(db_error("hold mismatched gateway identity event"))?;
-                finish_buyer_recheck_tx(&tx, &order_id, Some("review_required"))?;
-                tx.commit()
-                    .map_err(db_error("commit gateway identity review"))?;
-                return Ok(Json(
-                    serde_json::json!({ "accepted": true, "reviewRequired": true }),
-                ));
-            }
-            return Err(error);
-        }
-        record_gateway_observation_tx(&tx, &order_id, "webhook", &gateway, &now())?;
-        let status = match verified_unpaid_status(&gateway.status) {
-            Ok(status) => status,
-            Err(AppError::Conflict(_)) => {
-                let time = now();
-                hold_topup_verification_failure_tx(
-                    &tx,
-                    &order_id,
-                    "gateway_status_unknown",
-                    &time,
-                )?;
-                tx.execute("UPDATE market_topup_events SET status = 'review_required', processed_at = ?3 WHERE merchant_fingerprint = ?1 AND gateway_event_id = ?2", params![loaded.merchant_fingerprint, event.event_id, time])
-                    .map_err(db_error("hold unknown gateway status event"))?;
-                finish_buyer_recheck_tx(&tx, &order_id, Some("review_required"))?;
-                tx.commit()
-                    .map_err(db_error("commit unknown gateway status review"))?;
-                return Ok(Json(
-                    serde_json::json!({ "accepted": true, "reviewRequired": true }),
-                ));
-            }
-            Err(error) => return Err(error),
-        };
-        if matches!(status, "expired" | "cancelled")
-            && !gateway_terminal_without_payment_evidence(&gateway)
-        {
-            let time = now();
-            hold_topup_verification_failure_tx(
-                &tx,
-                &order_id,
-                "gateway_terminal_payment_evidence",
-                &time,
-            )?;
-            tx.execute("UPDATE market_topup_events SET status = 'review_required', processed_at = ?3 WHERE merchant_fingerprint = ?1 AND gateway_event_id = ?2", params![loaded.merchant_fingerprint, event.event_id, time])
-                .map_err(db_error("hold terminal gateway payment evidence"))?;
-            finish_buyer_recheck_tx(&tx, &order_id, Some("review_required"))?;
-            tx.commit()
-                .map_err(db_error("commit terminal gateway evidence review"))?;
-            return Ok(Json(
-                serde_json::json!({ "accepted": true, "reviewRequired": true }),
-            ));
-        }
-        bind_signed_gateway_order_tx(&tx, &order_id, &channel_id, revision, &loaded, &event)?;
-        restore_verified_checkout_tx(&tx, &order_id, &gateway)?;
-        apply_verified_unpaid_status_tx(&tx, &order_id, status, &now())?;
-        tx.execute("UPDATE market_topup_events SET status = 'processed', processed_at = ?3 WHERE merchant_fingerprint = ?1 AND gateway_event_id = ?2", params![loaded.merchant_fingerprint, event.event_id, now()])
-            .map_err(db_error("mark webhook processed"))?;
-        tx.commit()
-            .map_err(db_error("commit DujiaoPay order status"))?;
+            .map_err(db_error("commit callback lookup hint"))?;
+        state.market_payments.wake_reconciler();
         return Ok(Json(serde_json::json!({ "accepted": true })));
     }
-    if let Err(error) = apply_paid_order_tx(
-        &tx,
-        &order_id,
+    let (loaded, event, verified_current_revision) = verify_bound_webhook_tx(
+        &conn,
+        &state.market_payments,
         &channel_id,
-        revision,
-        &loaded,
-        &event,
-        &gateway,
-    ) {
-        if matches!(error, AppError::Conflict(_)) {
-            let time = now();
-            open_reconciliation_case_detail_tx(
+        bound.1,
+        &headers,
+        &body,
+        Utc::now().timestamp(),
+    )?;
+    if event.merchant_order_id != merchant_order_hint {
+        return Err(AppError::Unauthorized(
+            "DujiaoPay webhook not recognized".into(),
+        ));
+    }
+    let (order_id, revision) = bound;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_error("begin webhook event"))?;
+    let time = now();
+    persist_signed_event_tx(&tx, &order_id, &loaded.merchant_fingerprint, &event, &time)?;
+    if let Some(current_revision) = verified_current_revision {
+        mark_channel_webhook_verified_tx(&tx, &channel_id, current_revision, &time)?;
+    }
+    let mut review_required = false;
+    match event.event_type.as_str() {
+        "order.created" | "order.method_selected" | "order.confirming" | "order.paid"
+        | "order.expired" | "order.cancelled" | "order.canceled" => {
+            // Signed callbacks can arrive before the create API returns. Their
+            // order ID is a recovery locator, never evidence of payment.
+            match bind_signed_gateway_order_tx(&tx, &order_id, &channel_id, revision, &loaded, &event)
+            {
+                Ok(()) => {
+                    if event.event_type == "order.method_selected" {
+                        record_selected_terms_tx(
+                            &tx,
+                            &order_id,
+                            &dujiaopay::verified_selected_terms(&body),
+                        )?;
+                    }
+                    if is_non_payment_lifecycle_event(&event.event_type) {
+                        mark_event_tx(&tx, &loaded.merchant_fingerprint, &event.event_id, "processed", &time)?;
+                    }
+                    queue_signed_event_reconcile_tx(&tx, &order_id, &time)?;
+                }
+                Err(AppError::Conflict(_)) => {
+                    hold_topup_verification_failure_tx(
+                        &tx,
+                        &order_id,
+                        "signed_gateway_order_conflict",
+                        &time,
+                    )?;
+                    mark_event_tx(&tx, &loaded.merchant_fingerprint, &event.event_id, "review_required", &time)?;
+                    enqueue_owner_signal_tx(
+                        &tx,
+                        "gateway_identity_conflict",
+                        "topup",
+                        &order_id,
+                        serde_json::json!({ "eventType": event.event_type }),
+                        &time,
+                    )?;
+                    review_required = true;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        "refund.recorded" => {
+            open_reconciliation_case_tx(&tx, "external_refund_recorded", "topup", &order_id, &time)?;
+            tx.execute(
+                "UPDATE market_topup_orders SET status = 'review_required', updated_at = ?2
+                 WHERE id = ?1 AND status != 'credited'",
+                params![order_id, time],
+            )
+            .map_err(db_error("hold top-up for refund review"))?;
+            mark_event_tx(&tx, &loaded.merchant_fingerprint, &event.event_id, "review_required", &time)?;
+            enqueue_owner_signal_tx(
                 &tx,
-                "topup_verification_failed",
+                "gateway_external_refund",
                 "topup",
                 &order_id,
-                Some("paid_receipt_invalid"),
+                serde_json::json!({ "orderId": order_id }),
                 &time,
             )?;
-            tx.execute("UPDATE market_topup_orders SET status = 'review_required', updated_at = ?2 WHERE id = ?1 AND status != 'credited'", params![order_id, time])
-                .map_err(db_error("mark top-up for review"))?;
-            tx.execute("UPDATE market_topup_events SET status = 'review_required', processed_at = ?3 WHERE merchant_fingerprint = ?1 AND gateway_event_id = ?2", params![loaded.merchant_fingerprint, event.event_id, time])
-                .map_err(db_error("mark webhook for review"))?;
-            finish_buyer_recheck_tx(&tx, &order_id, Some("review_required"))?;
-            tx.commit().map_err(db_error("commit top-up review"))?;
-            return Ok(Json(
-                serde_json::json!({ "accepted": true, "reviewRequired": true }),
-            ));
+            review_required = true;
         }
-        return Err(error);
+        _ => {
+            // An unrecognized signed event is kept as evidence (it still
+            // blocks cancellation and checkout in the recovery assessment) and
+            // the Owner is told, but the order is not moved to review on a
+            // type this Router cannot interpret.
+            mark_event_tx(&tx, &loaded.merchant_fingerprint, &event.event_id, "processed", &time)?;
+            open_reconciliation_case_tx(
+                &tx,
+                "gateway_event_unrecognized",
+                "payment_channel",
+                &channel_id,
+                &time,
+            )?;
+            queue_signed_event_reconcile_tx(&tx, &order_id, &time)?;
+        }
     }
-    tx.execute("UPDATE market_topup_events SET status = 'processed', processed_at = ?3 WHERE merchant_fingerprint = ?1 AND gateway_event_id = ?2", params![loaded.merchant_fingerprint, event.event_id, now()])
-        .map_err(db_error("mark webhook processed"))?;
-    tx.commit().map_err(db_error("commit verified top-up"))?;
-    Ok(Json(serde_json::json!({ "accepted": true })))
+    tx.commit().map_err(db_error("commit DujiaoPay webhook"))?;
+    drop(conn);
+    state.market_payments.wake_reconciler();
+    Ok(Json(serde_json::json!({
+        "accepted": true,
+        "reviewRequired": review_required
+    })))
 }
 
 #[derive(Clone)]
@@ -5502,6 +6636,10 @@ struct PendingTopup {
     amount_minor: i64,
     had_hint: bool,
     auto_close_at: Option<String>,
+    created_at: String,
+    /// Stopped by the buyer or cancel-requested: a gateway order bound for
+    /// the first time by this pass must not stay payable.
+    stopped: bool,
 }
 
 fn auto_close_due(
@@ -5548,9 +6686,11 @@ fn pending_topups_tx(conn: &Connection) -> Result<Vec<PendingTopup>, AppError> {
     let mut statement = conn
         .prepare(
             "SELECT id, user_id, channel_id, channel_revision, merchant_order_id, gateway_order_id,
-                amount_minor, reconcile_hint_pending, auto_close_at
+                amount_minor, reconcile_hint_pending, auto_close_at, created_at,
+                (buyer_abandoned_at IS NOT NULL OR cancel_requested_at IS NOT NULL)
          FROM market_topup_orders
          WHERE COALESCE(next_reconcile_at, updated_at) <= ?1
+           AND local_close_reason IS NULL
            AND status IN ('created', 'creating', 'create_unknown', 'pending', 'verifying',
                           'expired', 'cancelled', 'review_required')
            AND (created_at >= ?2 OR status NOT IN ('expired', 'cancelled')
@@ -5579,6 +6719,8 @@ fn pending_topups_tx(conn: &Connection) -> Result<Vec<PendingTopup>, AppError> {
                     amount_minor: row.get(6)?,
                     had_hint: row.get::<_, i64>(7)? == 1,
                     auto_close_at: row.get(8)?,
+                    created_at: row.get(9)?,
+                    stopped: row.get::<_, i64>(10)? == 1,
                 })
             },
         )
@@ -5618,7 +6760,7 @@ fn finish_reconciliation_tx(
     if status == "credited" {
         conn.execute(
             "UPDATE market_topup_orders SET next_reconcile_at = NULL,
-             reconcile_hint_pending = 0 WHERE id = ?1",
+             reconcile_hint_pending = 0, reconcile_failures = 0 WHERE id = ?1",
             params![order_id],
         )
         .map_err(db_error("finish credited top-up reconciliation"))?;
@@ -5706,6 +6848,309 @@ fn finish_buyer_recheck_from_order_tx(conn: &Connection, order_id: &str) -> Resu
     finish_buyer_recheck_tx(conn, order_id, Some(result))
 }
 
+/// Outcome of looking for a gateway order by merchant order ID in the
+/// authenticated order list.
+enum GatewaySearch {
+    Found(String),
+    ProvenAbsent,
+    Inconclusive,
+}
+
+const SEARCH_MAX_PAGES: u32 = 10;
+
+/// Scan the gateway's order list from shortly before the local order was
+/// created until now. Absence is proven only when the whole window fits in
+/// the scanned pages.
+async fn find_gateway_order_by_merchant_id(
+    state: &ServerState,
+    credentials: &Credentials,
+    merchant_order_id: &str,
+    created_at: &str,
+) -> GatewaySearch {
+    let Ok(created) = chrono::DateTime::parse_from_rfc3339(created_at) else {
+        return GatewaySearch::Inconclusive;
+    };
+    let after = (created.with_timezone(&Utc) - chrono::Duration::minutes(10))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    for page in 0..SEARCH_MAX_PAGES {
+        let result = state
+            .market_payments
+            .client
+            .list_orders(
+                credentials,
+                &dujiaopay::ListOrdersQuery {
+                    created_after: Some(after.clone()),
+                    limit: dujiaopay::LIST_PAGE_LIMIT,
+                    offset: page * dujiaopay::LIST_PAGE_LIMIT,
+                    ..Default::default()
+                },
+            )
+            .await;
+        let Ok(orders) = result else {
+            return GatewaySearch::Inconclusive;
+        };
+        if let Some(found) = orders
+            .orders
+            .iter()
+            .find(|order| order.merchant_order_id.as_deref() == Some(merchant_order_id))
+        {
+            return GatewaySearch::Found(found.order_id.clone());
+        }
+        // A malformed entry might be the order searched for, and a missing
+        // total says nothing about further pages: neither proves absence.
+        if !orders.complete() {
+            return GatewaySearch::Inconclusive;
+        }
+        let scanned = u64::from(page * dujiaopay::LIST_PAGE_LIMIT) + u64::from(orders.returned);
+        if orders.is_last(scanned) {
+            return GatewaySearch::ProvenAbsent;
+        }
+    }
+    GatewaySearch::Inconclusive
+}
+
+/// Close an order whose identical create request was rejected twice and
+/// whose merchant order ID is absent from the gateway's order list. No status
+/// is added: it becomes `cancelled` with `local_close_reason = never_created`.
+fn close_never_created_tx(conn: &Connection, order_id: &str, time: &str) -> Result<bool, AppError> {
+    let changed = conn
+        .execute(
+            "UPDATE market_topup_orders
+             SET status = 'cancelled', local_close_reason = 'never_created',
+                 next_reconcile_at = NULL, reconcile_hint_pending = 0, updated_at = ?2
+             WHERE id = ?1 AND gateway_order_id IS NULL
+               AND status IN ('created', 'creating', 'create_unknown')
+               AND NOT EXISTS (SELECT 1 FROM market_topup_events e WHERE e.order_id = ?1)
+               AND NOT EXISTS (SELECT 1 FROM market_topup_receipts r WHERE r.order_id = ?1)",
+            params![order_id, time],
+        )
+        .map_err(db_error("close never-created top-up"))?;
+    if changed == 1 {
+        audit_tx(
+            conn,
+            "system",
+            "topup_closed_never_created",
+            "topup",
+            order_id,
+            Some("gateway_rejected_identical_request"),
+            time,
+        )?;
+        notify_topup_tx(conn, order_id, "topup_closed_unpaid", time)?;
+        finish_buyer_recheck_tx(conn, order_id, Some("cancelled"))?;
+    }
+    Ok(changed == 1)
+}
+
+/// Queue a buyer notification for a top-up state change.
+fn notify_topup_tx(conn: &Connection, order_id: &str, kind: &str, time: &str) -> Result<(), AppError> {
+    let (user_id, amount_minor, status): (String, i64, String) = conn
+        .query_row(
+            "SELECT user_id, amount_minor, status FROM market_topup_orders WHERE id = ?1",
+            params![order_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(db_error("read top-up for notification"))?;
+    crate::market_notifications::enqueue_user_notification_tx(
+        conn,
+        "buyer",
+        &user_id,
+        kind,
+        "topup",
+        order_id,
+        &format!("{kind}:{order_id}"),
+        serde_json::json!({ "amountMinor": amount_minor, "status": status, "orderId": order_id }),
+        time,
+    )
+}
+
+/// Create (or idempotently replay) the gateway order for a top-up whose
+/// create result is unknown. Returns the bound gateway order ID, or `None`
+/// when this pass recorded a failure or closed the order.
+async fn recover_gateway_order(
+    state: &ServerState,
+    pending: &PendingTopup,
+    loaded: &LoadedRevision,
+    creation_credentials: &Credentials,
+) -> Result<Option<String>, AppError> {
+    let (status, frozen_body): (String, Option<String>) = {
+        let conn = state.store.conn.lock().await;
+        conn.query_row(
+            "SELECT status, create_request_body FROM market_topup_orders WHERE id = ?1",
+            params![pending.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(db_error("read top-up create request"))?
+    };
+    if !matches!(status.as_str(), "created" | "creating" | "create_unknown") {
+        // Never create a gateway order for a closed or held order that has
+        // no gateway identity.
+        let conn = state.store.conn.lock().await;
+        finish_reconciliation_tx(&conn, &pending.id, pending.had_hint)?;
+        return Ok(None);
+    }
+    let body = match frozen_body {
+        Some(body) => body.into_bytes(),
+        None => legacy_create_body(
+            state,
+            &pending.id,
+            &pending.merchant_order_id,
+            pending.amount_minor,
+            &loaded.allowed_methods,
+        )?,
+    };
+    let result = state
+        .market_payments
+        .client
+        .create_order_with_body(creation_credentials, &pending.merchant_order_id, &body)
+        .await;
+    let bind = |order_id: String| CreatedOrder {
+        order_id,
+        ..Default::default()
+    };
+    let created = match result {
+        Ok(created) => created,
+        Err(error) => {
+            let kind = dujiaopay::error_kind(&error);
+            {
+                let conn = state.store.conn.lock().await;
+                let tx = conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(db_error("begin top-up create failure"))?;
+                finish_reconciliation_tx(&tx, &pending.id, pending.had_hint)?;
+                record_create_failure_tx(&tx, &pending.id, &pending.channel_id, &error, &now())?;
+                tx.commit()
+                    .map_err(db_error("commit top-up create failure"))?;
+            }
+            let attempts: i64 = {
+                let conn = state.store.conn.lock().await;
+                conn.query_row(
+                    "SELECT create_attempts FROM market_topup_orders WHERE id = ?1",
+                    params![pending.id],
+                    |row| row.get(0),
+                )
+                .map_err(db_error("read top-up create attempts"))?
+            };
+            match kind {
+                // The merchant order exists with another body (for example a
+                // legacy order whose return URL changed). Find and bind it.
+                Some(dujiaopay::GatewayErrorKind::Idempotency) => {
+                    match find_gateway_order_by_merchant_id(
+                        state,
+                        creation_credentials,
+                        &pending.merchant_order_id,
+                        &pending.created_at,
+                    )
+                    .await
+                    {
+                        GatewaySearch::Found(order_id) => bind(order_id),
+                        _ => {
+                            let conn = state.store.conn.lock().await;
+                            let tx = conn
+                                .transaction_with_behavior(TransactionBehavior::Immediate)
+                                .map_err(db_error("begin create conflict review"))?;
+                            hold_topup_verification_failure_tx(
+                                &tx,
+                                &pending.id,
+                                "created_order_conflict",
+                                &now(),
+                            )?;
+                            tx.commit()
+                                .map_err(db_error("commit create conflict review"))?;
+                            return Ok(None);
+                        }
+                    }
+                }
+                // An identical replay was rejected by validation. After the
+                // second such answer, confirm absence in the order list and
+                // close the order locally.
+                Some(dujiaopay::GatewayErrorKind::Rejected) if attempts >= 2 => {
+                    match find_gateway_order_by_merchant_id(
+                        state,
+                        creation_credentials,
+                        &pending.merchant_order_id,
+                        &pending.created_at,
+                    )
+                    .await
+                    {
+                        GatewaySearch::Found(order_id) => bind(order_id),
+                        GatewaySearch::ProvenAbsent => {
+                            let conn = state.store.conn.lock().await;
+                            let tx = conn
+                                .transaction_with_behavior(TransactionBehavior::Immediate)
+                                .map_err(db_error("begin never-created close"))?;
+                            close_never_created_tx(&tx, &pending.id, &now())?;
+                            tx.commit()
+                                .map_err(db_error("commit never-created close"))?;
+                            return Ok(None);
+                        }
+                        GatewaySearch::Inconclusive => return Ok(None),
+                    }
+                }
+                Some(
+                    dujiaopay::GatewayErrorKind::Rejected
+                    | dujiaopay::GatewayErrorKind::RateLimited
+                    | dujiaopay::GatewayErrorKind::Capacity,
+                ) => return Ok(None),
+                _ => return Err(error),
+            }
+        }
+    };
+    let conn = state.store.conn.lock().await;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_error("begin top-up recovery"))?;
+    tx.execute(
+        "UPDATE market_topup_orders SET create_attempts = create_attempts + 1 WHERE id = ?1",
+        params![pending.id],
+    )
+    .map_err(db_error("count top-up create attempt"))?;
+    if let Err(error) = save_created_order_tx(&tx, &pending.id, pending.revision, &created, &now()) {
+        if matches!(error, AppError::Conflict(_)) {
+            hold_topup_verification_failure_tx(&tx, &pending.id, "created_order_conflict", &now())?;
+            finish_reconciliation_tx(&tx, &pending.id, pending.had_hint)?;
+            tx.commit()
+                .map_err(db_error("commit conflicting top-up recovery"))?;
+            return Ok(None);
+        }
+        return Err(error);
+    }
+    tx.commit().map_err(db_error("commit top-up recovery"))?;
+    Ok(Some(created.order_id))
+}
+
+/// Whether a channel still accepts new orders for this order's audience.
+fn channel_accepts_orders_tx(conn: &Connection, channel_id: &str) -> Result<bool, AppError> {
+    conn.query_row(
+        "SELECT rollout_state != 'off' AND archived_at IS NULL
+         FROM market_payment_channels WHERE id = ?1",
+        params![channel_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map(|open| open.unwrap_or(false))
+    .map_err(db_error("read payment channel availability"))
+}
+
+fn hold_paid_review_tx(
+    conn: &Connection,
+    order_id: &str,
+    detail: &str,
+    time: &str,
+) -> Result<(), AppError> {
+    hold_topup_verification_failure_tx(conn, order_id, detail, time)?;
+    if matches!(detail, "paid_source_manual" | "paid_amount_short") {
+        enqueue_owner_signal_tx(
+            conn,
+            "topup_review_stale",
+            "topup",
+            order_id,
+            serde_json::json!({ "detail": detail }),
+            time,
+        )?;
+    }
+    notify_topup_tx(conn, order_id, "topup_review_required", time)
+}
+
 async fn reconcile_one_topup(state: &ServerState, pending: PendingTopup) -> Result<(), AppError> {
     let (loaded, creation_credentials) = {
         let conn = state.store.conn.lock().await;
@@ -5723,55 +7168,15 @@ async fn reconcile_one_topup(state: &ServerState, pending: PendingTopup) -> Resu
         )?;
         (loaded, original.credentials)
     };
-    let gateway_id = if let Some(id) = pending.gateway_order_id.clone() {
-        id
+    let (gateway_id, newly_bound) = if let Some(id) = pending.gateway_order_id.clone() {
+        (id, false)
     } else {
-        let scheme = if state.config.use_localhost {
-            "http"
-        } else {
-            "https"
-        };
-        let base = format!(
-            "{scheme}://{}",
-            state.config.tunnel_domain.trim_end_matches('/')
-        );
-        let (success_url, cancel_url) = topup_return_urls(&base, &pending.id);
-        let created = state
-            .market_payments
-            .client
-            .create_order(
-                &creation_credentials,
-                &pending.merchant_order_id,
-                pending.amount_minor,
-                &loaded.allowed_methods,
-                &success_url,
-                &cancel_url,
-            )
-            .await?;
-        let conn = state.store.conn.lock().await;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(db_error("begin top-up recovery"))?;
-        if let Err(error) =
-            save_created_order_tx(&tx, &pending.id, pending.revision, &created, &now())
-        {
-            if matches!(error, AppError::Conflict(_)) {
-                hold_topup_verification_failure_tx(
-                    &tx,
-                    &pending.id,
-                    "created_order_conflict",
-                    &now(),
-                )?;
-                finish_reconciliation_tx(&tx, &pending.id, pending.had_hint)?;
-                tx.commit()
-                    .map_err(db_error("commit conflicting top-up recovery"))?;
-                return Ok(());
-            }
-            return Err(error);
+        match recover_gateway_order(state, &pending, &loaded, &creation_credentials).await? {
+            Some(id) => (id, true),
+            None => return Ok(()),
         }
-        tx.commit().map_err(db_error("commit top-up recovery"))?;
-        created.order_id
     };
+    let lookup_started = now();
     let gateway = get_bound_gateway_order(
         state,
         &pending.channel_id,
@@ -5807,6 +7212,14 @@ async fn reconcile_one_topup(state: &ServerState, pending: PendingTopup) -> Resu
                 "gateway_identity_mismatch",
                 &now(),
             )?;
+            enqueue_owner_signal_tx(
+                &tx,
+                "gateway_identity_conflict",
+                "topup",
+                &pending.id,
+                serde_json::json!({ "orderId": pending.id }),
+                &now(),
+            )?;
             finish_reconciliation_tx(&tx, &pending.id, pending.had_hint)?;
             tx.commit()
                 .map_err(db_error("commit mismatched gateway review"))?;
@@ -5815,12 +7228,25 @@ async fn reconcile_one_topup(state: &ServerState, pending: PendingTopup) -> Resu
         return Err(error);
     }
     record_gateway_observation_tx(&tx, &pending.id, "reconcile", &gateway, &now())?;
+    record_gateway_terms_tx(&tx, &pending.id, &gateway)?;
+    tx.execute(
+        "UPDATE market_topup_orders SET reconcile_failures = 0 WHERE id = ?1",
+        params![pending.id],
+    )
+    .map_err(db_error("reset top-up reconciliation failures"))?;
     restore_verified_checkout_tx(&tx, &pending.id, &gateway)?;
+    let status_before: String = tx
+        .query_row(
+            "SELECT status FROM market_topup_orders WHERE id = ?1",
+            params![pending.id],
+            |row| row.get(0),
+        )
+        .map_err(db_error("read top-up status before reconciliation"))?;
     let manual_hold = topup_has_manual_hold_tx(&tx, &pending.id)?;
     if gateway.status == "paid"
         && (!manual_hold || compatible_paid_hold_ids_tx(&tx, &pending.id)?.is_some())
     {
-        let validation = validate_paid_order_tx(
+        match apply_paid_order_tx(
             &tx,
             &pending.id,
             &pending.channel_id,
@@ -5828,26 +7254,12 @@ async fn reconcile_one_topup(state: &ServerState, pending: PendingTopup) -> Resu
             &loaded,
             &event,
             &gateway,
-        );
-        match validation {
-            Ok(_) => apply_paid_order_tx(
-                &tx,
-                &pending.id,
-                &pending.channel_id,
-                pending.revision,
-                &loaded,
-                &event,
-                &gateway,
-            )?,
-            Err(AppError::Conflict(_)) => {
-                hold_topup_verification_failure_tx(
-                    &tx,
-                    &pending.id,
-                    "paid_receipt_invalid",
-                    &now(),
-                )?;
-            }
-            Err(error) => return Err(error),
+        ) {
+            Ok(()) => {}
+            Err(error) => match paid_review_detail(&error) {
+                Some(detail) => hold_paid_review_tx(&tx, &pending.id, detail, &now())?,
+                None => return Err(error),
+            },
         }
     } else if gateway.status == "paid" {
         tx.execute(
@@ -5891,6 +7303,15 @@ async fn reconcile_one_topup(state: &ServerState, pending: PendingTopup) -> Resu
             Err(error) => return Err(error),
         }
     }
+    // Every signed event received before this authenticated lookup is now
+    // accounted for. A pending event no longer blocks recovery or checkout.
+    tx.execute(
+        "UPDATE market_topup_events
+         SET status = 'processed', processed_at = ?2, processed_by = 'reconcile'
+         WHERE order_id = ?1 AND status = 'pending' AND created_at <= ?3",
+        params![pending.id, now(), lookup_started],
+    )
+    .map_err(db_error("close events covered by lookup"))?;
     finish_reconciliation_tx(&tx, &pending.id, pending.had_hint)?;
     let current_status: String = tx
         .query_row(
@@ -5899,8 +7320,20 @@ async fn reconcile_one_topup(state: &ServerState, pending: PendingTopup) -> Resu
             |row| row.get(0),
         )
         .map_err(db_error("read reconciled buyer top-up status"))?;
+    if current_status != status_before
+        && matches!(current_status.as_str(), "expired" | "cancelled")
+    {
+        notify_topup_tx(&tx, &pending.id, "topup_closed_unpaid", &now())?;
+    }
     finish_buyer_recheck_tx(&tx, &pending.id, Some(&current_status))?;
-    let can_auto_close = should_auto_cancel_tx(&tx, &pending, &gateway, Utc::now())?;
+    // A gateway order first bound now for a stopped order, or on a channel
+    // that no longer accepts orders, was never shown to the buyer. Cancel it
+    // at once rather than leave a fresh payable order behind.
+    let suppress = newly_bound
+        && gateway.status == "pending"
+        && (pending.stopped || !channel_accepts_orders_tx(&tx, &pending.channel_id)?)
+        && !gateway_cancel_was_requested_tx(&tx, &pending.id)?;
+    let can_auto_close = suppress || should_auto_cancel_tx(&tx, &pending, &gateway, Utc::now())?;
     tx.commit()
         .map_err(db_error("commit top-up reconciliation"))?;
     drop(conn);
@@ -5912,85 +7345,230 @@ async fn reconcile_one_topup(state: &ServerState, pending: PendingTopup) -> Resu
     Ok(())
 }
 
+/// Count consecutive reconciliation failures and alert the Owner once an
+/// order has failed five times in a row.
+fn note_reconcile_failure_tx(conn: &Connection, order_id: &str, code: &str) -> Result<(), AppError> {
+    conn.execute(
+        "UPDATE market_topup_orders SET reconcile_failures = reconcile_failures + 1 WHERE id = ?1",
+        params![order_id],
+    )
+    .map_err(db_error("count top-up reconciliation failure"))?;
+    let failures: i64 = conn
+        .query_row(
+            "SELECT reconcile_failures FROM market_topup_orders WHERE id = ?1",
+            params![order_id],
+            |row| row.get(0),
+        )
+        .map_err(db_error("read top-up reconciliation failures"))?;
+    if failures == 5 {
+        enqueue_owner_signal_tx(
+            conn,
+            "topup_reconcile_failing",
+            "topup",
+            order_id,
+            serde_json::json!({ "failures": failures, "errorCode": code }),
+            &now(),
+        )?;
+    }
+    Ok(())
+}
+
 pub async fn run_service(
     state: ServerState,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
+    if let Err(error) = verify_channel_secrets_on_start(&state).await {
+        tracing::error!(error = %error, "payment channel secret self-check failed");
+    }
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut audit_interval = tokio::time::interval(std::time::Duration::from_secs(3_600));
     audit_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        tokio::select! {
-            _ = audit_interval.tick() => {
-                let result = {
-                    let conn = state.store.conn.lock().await;
-                    conn.transaction_with_behavior(TransactionBehavior::Immediate)
-                        .map_err(db_error("begin market finance audit"))
-                        .and_then(|tx| {
-                            let findings = crate::market_reconcile::audit_finance_tx(&tx, &now())?;
-                            tx.commit().map_err(db_error("commit market finance audit"))?;
-                            Ok(findings)
-                        })
-                };
-                match result {
-                    Ok(findings) if findings > 0 => tracing::error!(findings, "market finance audit found mismatches"),
-                    Err(_) => tracing::error!("market finance audit unavailable"),
-                    _ => {}
+    // Sweeps page through the gateway with deliberate pauses. They run on
+    // their own task so that a long sweep never delays top-up reconciliation
+    // or a webhook wakeup.
+    let sweep_task = tokio::spawn({
+        let state = state.clone();
+        let mut shutdown = shutdown.clone();
+        async move {
+            let mut sweep_interval = tokio::time::interval(std::time::Duration::from_secs(600));
+            sweep_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = sweep_interval.tick() => sweep::run_due_sweeps(&state).await,
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() { break; }
+                    }
                 }
-                let stale_reviews = {
-                    let conn = state.store.conn.lock().await;
-                    stale_topup_review_count_tx(&conn)
-                };
-                match stale_reviews {
-                    Ok(count) if count > 0 => tracing::warn!(count, "market top-ups need owner review for over 24 hours"),
-                    Err(_) => tracing::warn!("market top-up review age check unavailable"),
-                    _ => {}
-                }
-            }
-            _ = interval.tick() => {
-                let pending = {
-                    let conn = state.store.conn.lock().await;
-                    pending_topups_tx(&conn)
-                };
-                match pending {
-                    Ok(orders) => for order in orders {
-                        let order_id = order.id.clone();
-                        let claimed = {
-                            let conn = state.store.conn.lock().await;
-                            claim_reconciliation_tx(&conn, &order.id)
-                        };
-                        if !matches!(claimed, Ok(true)) {
-                            if claimed.is_err() { tracing::warn!("market top-up reconciliation claim failed"); }
-                            continue;
-                        }
-                        if let Err(error) = reconcile_one_topup(&state, order).await {
-                            let result = {
-                                let conn = state.store.conn.lock().await;
-                                finish_buyer_recheck_tx(&conn, &order_id, None)
-                            };
-                            if result.is_err() { tracing::warn!("buyer top-up recheck status unavailable"); }
-                            tracing::warn!(error_code = error.code().unwrap_or("MARKET_TOPUP_RETRY"),
-                                "market top-up recovery deferred");
-                        }
-                    },
-                    Err(_) => tracing::warn!("market top-up queue unavailable"),
-                }
-                let result = {
-                    let conn = state.store.conn.lock().await;
-                    conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_error("begin earning maturity"))
-                        .and_then(|tx| {
-                            let count = crate::market_finance::unlock_due_earnings_tx(&tx, &now(), 100)?;
-                            tx.commit().map_err(db_error("commit earning maturity"))?;
-                            Ok(count)
-                        })
-                };
-                if result.is_err() { tracing::warn!("market earning maturity deferred"); }
-            }
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() { break; }
             }
         }
+    });
+    let wakeup = state.market_payments.reconcile_wakeup.clone();
+    loop {
+        let reconcile_now = tokio::select! {
+            _ = audit_interval.tick() => {
+                run_finance_audit(&state).await;
+                false
+            }
+            _ = interval.tick() => true,
+            _ = wakeup.notified() => true,
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() { break; }
+                false
+            }
+        };
+        if !reconcile_now {
+            continue;
+        }
+        let pending = {
+            let conn = state.store.conn.lock().await;
+            pending_topups_tx(&conn)
+        };
+        match pending {
+            Ok(orders) => {
+                for order in orders {
+                    let order_id = order.id.clone();
+                    let claimed = {
+                        let conn = state.store.conn.lock().await;
+                        claim_reconciliation_tx(&conn, &order.id)
+                    };
+                    if !matches!(claimed, Ok(true)) {
+                        if claimed.is_err() {
+                            tracing::warn!("market top-up reconciliation claim failed");
+                        }
+                        continue;
+                    }
+                    if let Err(error) = reconcile_one_topup(&state, order).await {
+                        let code = error.code().unwrap_or("MARKET_TOPUP_RETRY");
+                        let result = {
+                            let conn = state.store.conn.lock().await;
+                            finish_buyer_recheck_tx(&conn, &order_id, None)
+                                .and_then(|()| note_reconcile_failure_tx(&conn, &order_id, code))
+                        };
+                        if result.is_err() {
+                            tracing::warn!("buyer top-up recheck status unavailable");
+                        }
+                        tracing::warn!(error_code = code, "market top-up recovery deferred");
+                    }
+                }
+            }
+            Err(_) => tracing::warn!("market top-up queue unavailable"),
+        }
+        unlock_due_earnings(&state).await;
+    }
+    // A sweep page in flight finishes its own transaction; anything left is
+    // resumed from its saved offset on the next start.
+    sweep_task.abort();
+    let _ = sweep_task.await;
+    Ok(())
+}
+
+async fn run_finance_audit(state: &ServerState) {
+    let result = {
+        let conn = state.store.conn.lock().await;
+        conn.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error("begin market finance audit"))
+            .and_then(|tx| {
+                let findings = crate::market_reconcile::audit_finance_tx(&tx, &now())?;
+                if findings > 0 {
+                    enqueue_owner_signal_tx(
+                        &tx,
+                        "finance_audit_mismatch",
+                        "finance_control",
+                        "1",
+                        serde_json::json!({ "findings": findings }),
+                        &now(),
+                    )?;
+                }
+                tx.commit().map_err(db_error("commit market finance audit"))?;
+                Ok(findings)
+            })
+    };
+    match result {
+        Ok(findings) if findings > 0 => {
+            tracing::error!(findings, "market finance audit found mismatches")
+        }
+        Err(_) => tracing::error!("market finance audit unavailable"),
+        _ => {}
+    }
+    let stale_reviews = {
+        let conn = state.store.conn.lock().await;
+        stale_topup_review_count_tx(&conn).and_then(|count| {
+            if count > 0 {
+                enqueue_owner_signal_tx(
+                    &conn,
+                    "topup_review_stale",
+                    "finance_control",
+                    "topups",
+                    serde_json::json!({ "count": count }),
+                    &now(),
+                )?;
+            }
+            Ok(count)
+        })
+    };
+    match stale_reviews {
+        Ok(count) if count > 0 => {
+            tracing::warn!(count, "market top-ups need owner review for over 24 hours")
+        }
+        Err(_) => tracing::warn!("market top-up review age check unavailable"),
+        _ => {}
+    }
+}
+
+/// Mature Provider earnings. Each lot settles in its own savepoint so one bad
+/// lot cannot hold back the rest of the batch.
+async fn unlock_due_earnings(state: &ServerState) {
+    let conn = state.store.conn.lock().await;
+    let result = crate::market_finance::unlock_due_earnings_isolated(&conn, &now(), 200);
+    if result.is_err() {
+        tracing::warn!("market earning maturity deferred");
+    }
+}
+
+/// Decrypt every current credential revision at startup. A channel whose
+/// secrets cannot be read is switched off and the Owner is alerted, instead of
+/// failing later inside reconciliation or a buyer request.
+async fn verify_channel_secrets_on_start(state: &ServerState) -> Result<(), AppError> {
+    let conn = state.store.conn.lock().await;
+    let channels = {
+        let mut statement = conn
+            .prepare(
+                "SELECT id, current_revision FROM market_payment_channels
+                 WHERE archived_at IS NULL",
+            )
+            .map_err(db_error("prepare channel secret check"))?;
+        statement
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+            .map_err(db_error("query channel secret check"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_error("read channel secret check"))?
+    };
+    for (channel_id, revision) in channels {
+        if load_revision(&conn, &state.market_payments, &channel_id, revision).is_ok() {
+            continue;
+        }
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error("begin unreadable channel"))?;
+        let time = now();
+        tx.execute(
+            "UPDATE market_payment_channels SET rollout_state = 'off', updated_at = ?2,
+                    version = version + 1
+             WHERE id = ?1 AND rollout_state != 'off'",
+            params![channel_id, time],
+        )
+        .map_err(db_error("disable unreadable channel"))?;
+        enqueue_owner_signal_tx(
+            &tx,
+            "payment_secret_unreadable",
+            "payment_channel",
+            &channel_id,
+            serde_json::json!({ "revision": revision }),
+            &time,
+        )?;
+        tx.commit().map_err(db_error("commit unreadable channel"))?;
+        tracing::error!(channel_id, revision, "payment channel secrets cannot be decrypted");
     }
     Ok(())
 }
@@ -6255,6 +7833,8 @@ mod tests {
             amount_minor: 100,
             had_hint: false,
             auto_close_at: Some("2026-10-20T00:30:00Z".into()),
+            created_at: "2026-10-20T00:00:00Z".into(),
+            stopped: false,
         };
         let mut gateway = unpaid_order(merchant_order_id, "pending");
         assert!(should_auto_cancel_tx(&conn, &pending, &gateway, time).unwrap());
@@ -6267,16 +7847,7 @@ mod tests {
         gateway.status = "awaiting_payment".into();
         assert!(!should_auto_cancel_tx(&conn, &pending, &gateway, time).unwrap());
         gateway.status = "pending".into();
-        audit_tx(
-            &conn,
-            "system",
-            "topup_gateway_cancel_requested",
-            "topup",
-            "order-1",
-            None,
-            &now(),
-        )
-        .unwrap();
+        mark_gateway_cancel_requested_tx(&conn, "system", "order-1", &now()).unwrap();
         assert!(!should_auto_cancel_tx(&conn, &pending, &gateway, time).unwrap());
         assert!(gateway_cancel_was_requested_tx(&conn, "order-1").unwrap());
     }
@@ -6736,16 +8307,7 @@ mod tests {
             [],
         )
         .unwrap();
-        audit_tx(
-            &conn,
-            "buyer",
-            "topup_gateway_cancel_requested",
-            "topup",
-            "order-1",
-            None,
-            &now(),
-        )
-        .unwrap();
+        mark_gateway_cancel_requested_tx(&conn, "buyer", "order-1", &now()).unwrap();
         assert!(
             active_matching_topup_tx(&conn, "buyer", "channel:100")
                 .unwrap()
@@ -6890,6 +8452,7 @@ mod tests {
         let request = FinancePauseRequest {
             new_orders_paused: true,
             new_withdrawals_paused: true,
+            new_topups_paused: None,
             expected_version: 1,
         };
         set_finance_pause_tx(&conn, &request, at).unwrap();
@@ -6913,6 +8476,7 @@ mod tests {
             &FinancePauseRequest {
                 new_orders_paused: false,
                 new_withdrawals_paused: false,
+                new_topups_paused: None,
                 expected_version: 2,
             },
             at,
@@ -6920,6 +8484,43 @@ mod tests {
         .unwrap();
         require_new_wallet_orders_open_tx(&conn).unwrap();
         require_new_wallet_withdrawals_open_tx(&conn).unwrap();
+    }
+
+    #[test]
+    fn topup_pause_works_in_shadow_but_purchase_pauses_need_production() {
+        let conn = memory();
+        let at = "2026-10-16T00:00:00Z";
+        conn.execute(
+            "UPDATE market_finance_control SET mode = 'shadow' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        assert!(
+            set_finance_pause_tx(
+                &conn,
+                &FinancePauseRequest {
+                    new_orders_paused: true,
+                    new_withdrawals_paused: false,
+                    new_topups_paused: None,
+                    expected_version: 1,
+                },
+                at,
+            )
+            .is_err()
+        );
+        set_finance_pause_tx(
+            &conn,
+            &FinancePauseRequest {
+                new_orders_paused: false,
+                new_withdrawals_paused: false,
+                new_topups_paused: Some(true),
+                expected_version: 1,
+            },
+            at,
+        )
+        .unwrap();
+        assert!(finance_readiness_tx(&conn).unwrap().new_topups_paused);
+        assert!(require_new_topups_open_tx(&conn).is_err());
     }
 
     #[test]
@@ -6952,7 +8553,7 @@ mod tests {
             blocker.code == "credited_topup_missing_evidence" && blocker.count == 1
         }));
         assert!(readiness.payment_channel_blockers.iter().any(|blocker| {
-            blocker.code == "channel_no_current_live_topup" && blocker.count == 1
+            blocker.code == "channel_none_live" && blocker.count == 1
         }));
     }
 
@@ -7011,7 +8612,7 @@ mod tests {
         assert!(validate_channel_input(&input).is_err());
         input.webhook_secret = Some("0123456789abcdef".into());
         assert!(validate_webhook_mode_change("signed", "poll_only", false).is_err());
-        assert!(validate_webhook_mode_change("signed", "poll_only", true).is_ok());
+        assert!(validate_webhook_mode_change("signed", "poll_only", true).is_err());
         assert!(validate_webhook_mode_change("signed", "signed", false).is_ok());
         assert!(validate_webhook_mode_change("poll_only", "poll_only", false).is_ok());
         input.webhook_secret = None;
@@ -7037,12 +8638,29 @@ mod tests {
             verified_live_topups: 42,
             verified_live_topups_current_revision: 0,
             gateway_kind: "dujiaopay",
+            rollout_state: "live".into(),
+            promoted_at: None,
+            settings: ChannelSettingsView {
+                order_mode: "direct".into(),
+                allowed_methods: vec!["tron-usdt".into(), "unknown-token".into()],
+                min_topup_minor: Some(50),
+                max_topup_minor: Some(5_000),
+                fee_rate_bps: 150,
+                fixed_fee_minor: 10,
+                version: 3,
+            },
         };
         let value = serde_json::to_value(BuyerChannelView::from(channel)).unwrap();
         assert_eq!(
             value,
             serde_json::json!({
-                "id": "channel", "displayName": "Gateway", "gatewayKind": "dujiaopay"
+                "id": "channel", "displayName": "Gateway", "gatewayKind": "dujiaopay",
+                "orderMode": "direct",
+                "methods": [{
+                    "tokenId": "tron-usdt", "chain": "tron", "chainName": "Tron",
+                    "symbol": "USDT", "minConfirmations": 19
+                }],
+                "minTopupMinor": 100, "maxTopupMinor": 5000, "canary": false
             })
         );
     }
@@ -7312,6 +8930,7 @@ mod tests {
         assert_eq!(
             bound_webhook_order_tx(&conn, "channel", &format!("router-{}", "a".repeat(32)))
                 .unwrap()
+                .unwrap()
                 .0,
             "order-1"
         );
@@ -7445,7 +9064,7 @@ mod tests {
             readiness
                 .payment_channel_blockers
                 .iter()
-                .any(|blocker| blocker.code == "channel_no_current_live_topup")
+                .any(|blocker| blocker.code == "channel_none_live")
         );
         assert!(!readiness.can_enable);
 
@@ -7485,9 +9104,17 @@ mod tests {
     }
 
     #[test]
-    fn production_channel_reenable_requires_current_signed_live_evidence() {
+    fn production_channel_reenable_goes_through_canary_and_needs_a_signed_revision() {
         let conn = memory();
         fixture_revision(&conn, 1);
+        let rollout = |conn: &Connection| -> String {
+            conn.query_row(
+                "SELECT rollout_state FROM market_payment_channels WHERE id = 'channel'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
         conn.execute(
             "UPDATE market_payment_channels SET enabled = 0 WHERE id = 'channel'",
             [],
@@ -7499,20 +9126,19 @@ mod tests {
         )
         .unwrap();
         set_channel_enabled_tx(&conn, "channel", true, 1, "2026-10-02").unwrap();
+        assert_eq!(rollout(&conn), "canary");
         set_channel_enabled_tx(&conn, "channel", false, 2, "2026-10-03").unwrap();
+        assert_eq!(rollout(&conn), "off");
         conn.execute(
             "UPDATE market_finance_control SET mode = 'enabled' WHERE id = 1",
             [],
         )
         .unwrap();
-        assert!(set_channel_enabled_tx(&conn, "channel", true, 3, "2026-10-04").is_err());
-        conn.execute(
-            "UPDATE market_payment_channels SET webhook_verified_at = '2026-10-04',
-             webhook_verified_revision = 1 WHERE id = 'channel'",
-            [],
-        )
-        .unwrap();
-        assert!(set_channel_enabled_tx(&conn, "channel", true, 3, "2026-10-04").is_err());
+        // A signed revision without evidence re-enters through canary.
+        set_channel_enabled_tx(&conn, "channel", true, 3, "2026-10-04").unwrap();
+        assert_eq!(rollout(&conn), "canary");
+        set_channel_enabled_tx(&conn, "channel", false, 4, "2026-10-04").unwrap();
+        // With verified live evidence and a verified Webhook it is live at once.
         fixture_topup(
             &conn,
             "credited-1",
@@ -7520,9 +9146,17 @@ mod tests {
             "credited",
             1,
         );
-        set_channel_enabled_tx(&conn, "channel", true, 3, "2026-10-04").unwrap();
-        set_channel_enabled_tx(&conn, "channel", false, 4, "2026-10-05").unwrap();
+        conn.execute(
+            "UPDATE market_payment_channels SET webhook_verified_at = '2026-10-04',
+             webhook_verified_revision = 1 WHERE id = 'channel'",
+            [],
+        )
+        .unwrap();
+        set_channel_enabled_tx(&conn, "channel", true, 5, "2026-10-04").unwrap();
+        assert_eq!(rollout(&conn), "live");
+        set_channel_enabled_tx(&conn, "channel", false, 6, "2026-10-05").unwrap();
 
+        // A poll-only revision cannot accept production orders at all.
         fixture_revision(&conn, 2);
         conn.execute(
             "UPDATE market_payment_channel_revisions SET webhook_mode = 'poll_only'
@@ -7536,14 +9170,7 @@ mod tests {
             [],
         )
         .unwrap();
-        fixture_topup(
-            &conn,
-            "credited-2",
-            &format!("router-{}", "b".repeat(32)),
-            "credited",
-            2,
-        );
-        assert!(set_channel_enabled_tx(&conn, "channel", true, 5, "2026-10-06").is_err());
+        assert!(set_channel_enabled_tx(&conn, "channel", true, 7, "2026-10-06").is_err());
     }
 
     fn fixture_topup(
@@ -7617,11 +9244,14 @@ mod tests {
             token_id: Some("tron-usdt".into()),
             tx_id: Some(tx_id.into()),
             settled_amount: Some("1.00".into()),
-            confirmations: Some(1),
+            confirmations: Some(19),
             paid_at: Some("2026-10-01T00:00:00+00:00".into()),
             checkout_url: None,
             expires_at: None,
             selection_deadline: None,
+            pay_address: None,
+            payable_amount: None,
+            fx_rate: None,
         }
     }
 
@@ -7661,6 +9291,7 @@ mod tests {
             order_id: "gateway-1".into(),
             checkout_url: None,
             expires_at: None,
+            ..Default::default()
         };
         save_created_order_tx(&conn, "order-1", 1, &created, &now()).unwrap();
         let stored: (String, String) = conn
@@ -9246,6 +10877,9 @@ mod tests {
             checkout_url: None,
             expires_at: None,
             selection_deadline: None,
+            pay_address: None,
+            payable_amount: None,
+            fx_rate: None,
         };
         assert!(receipt_fingerprint("merchant", &order).is_ok());
         order.paid_source = Some("merchant_claim".into());
@@ -9271,6 +10905,7 @@ mod tests {
             order_id: gateway.order_id.clone(),
             checkout_url: Some("https://www.dujiaopay.com/checkout/ct_one".into()),
             expires_at: None,
+            ..Default::default()
         };
         save_created_order_tx(&tx, "order-1", 1, &created, &now()).unwrap();
         assert_eq!(
@@ -9441,9 +11076,13 @@ mod tests {
         fixture_topup(&tx, "order-1", merchant_order_id, "expired", 1);
         assert_eq!(
             bound_webhook_order_tx(&tx, "channel", merchant_order_id).unwrap(),
-            ("order-1".into(), 1)
+            Some(("order-1".into(), 1))
         );
-        assert!(bound_webhook_order_tx(&tx, "other", merchant_order_id).is_err());
+        assert!(
+            bound_webhook_order_tx(&tx, "other", merchant_order_id)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -10305,4 +11944,316 @@ mod tests {
             .unwrap();
         assert_eq!(audit_action, "topup_gateway_terminal_review_held");
     }
+
+    fn stored_status_and_url(conn: &Connection, id: &str) -> (String, Option<String>) {
+        conn.query_row(
+            "SELECT status, checkout_url FROM market_topup_orders WHERE id = ?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn stopping_payment_hides_but_keeps_the_checkout_and_the_order_stays_pending() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        fixture_topup(&conn, "order-1", "router-00000000000000000000000000000001", "pending", 1);
+        conn.execute(
+            "UPDATE market_topup_orders SET gateway_order_id = 'gateway-1',
+             checkout_url = 'https://www.dujiaopay.com/checkout/ct_one' WHERE id = 'order-1'",
+            [],
+        )
+        .unwrap();
+        stop_buyer_topup_tx(&conn, "order-1", "buyer").unwrap();
+        // A later authenticated pending lookup used to turn this into
+        // create_unknown, which disabled cancellation and auto-close.
+        apply_verified_unpaid_status_tx(&conn, "order-1", "pending", &now()).unwrap();
+        let (status, url) = stored_status_and_url(&conn, "order-1");
+        assert_eq!(status, "pending");
+        assert!(url.is_some());
+        assert!(read_topup(&conn, "order-1", "buyer").unwrap().checkout_url.is_none());
+    }
+
+    #[test]
+    fn cancel_request_marker_hides_checkout_without_erasing_it() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        fixture_topup(&conn, "order-1", "router-00000000000000000000000000000001", "pending", 1);
+        conn.execute(
+            "UPDATE market_topup_orders SET gateway_order_id = 'gateway-1',
+             checkout_url = 'https://www.dujiaopay.com/checkout/ct_one' WHERE id = 'order-1'",
+            [],
+        )
+        .unwrap();
+        mark_gateway_cancel_requested_tx(&conn, "system", "order-1", &now()).unwrap();
+        assert!(gateway_cancel_was_requested_tx(&conn, "order-1").unwrap());
+        assert!(read_topup(&conn, "order-1", "buyer").unwrap().checkout_url.is_none());
+        apply_verified_unpaid_status_tx(&conn, "order-1", "pending", &now()).unwrap();
+        assert_eq!(stored_status_and_url(&conn, "order-1").0, "pending");
+        // A genuinely unknown create result still reports create_unknown.
+        fixture_topup(&conn, "order-2", "router-00000000000000000000000000000002", "creating", 1);
+        apply_verified_unpaid_status_tx(&conn, "order-2", "pending", &now()).unwrap();
+        assert_eq!(stored_status_and_url(&conn, "order-2").0, "create_unknown");
+    }
+
+    #[test]
+    fn a_never_created_order_closes_only_without_gateway_identity_or_evidence() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        fixture_topup(&conn, "lost", "router-00000000000000000000000000000001", "create_unknown", 1);
+        fixture_topup(&conn, "bound", "router-00000000000000000000000000000002", "create_unknown", 1);
+        conn.execute(
+            "UPDATE market_topup_orders SET gateway_order_id = 'gateway-2' WHERE id = 'bound'",
+            [],
+        )
+        .unwrap();
+        assert!(close_never_created_tx(&conn, "lost", &now()).unwrap());
+        assert!(!close_never_created_tx(&conn, "bound", &now()).unwrap());
+        let (status, reason): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, local_close_reason FROM market_topup_orders WHERE id = 'lost'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((status.as_str(), reason.as_deref()), ("cancelled", Some("never_created")));
+        conn.execute(
+            "UPDATE market_topup_orders SET next_reconcile_at = NULL, updated_at = '2000-01-01'",
+            [],
+        )
+        .unwrap();
+        assert!(pending_topups_tx(&conn).unwrap().iter().all(|order| order.id != "lost"));
+        // A closed order no longer counts against the buyer's pending quota.
+        ensure_pending_topup_capacity_tx(&conn, "buyer").unwrap();
+    }
+
+    fn gateway_error(code: &'static str) -> AppError {
+        AppError::Coded {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code,
+            message: "test".into(),
+            details: serde_json::json!({ "gatewayCode": "test.code" }),
+        }
+    }
+
+    #[test]
+    fn create_failures_back_off_and_an_auth_failure_takes_the_channel_offline() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        fixture_topup(&conn, "order-1", "router-00000000000000000000000000000001", "creating", 1);
+        record_create_failure_tx(
+            &conn,
+            "order-1",
+            "channel",
+            &gateway_error(dujiaopay::ERR_RATE_LIMITED),
+            &now(),
+        )
+        .unwrap();
+        let (status, attempts, code, next): (String, i64, Option<String>, String) = conn
+            .query_row(
+                "SELECT status, create_attempts, create_last_error_code, next_reconcile_at
+                 FROM market_topup_orders WHERE id = 'order-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!((status.as_str(), attempts), ("create_unknown", 1));
+        assert_eq!(code.as_deref(), Some("test.code"));
+        assert!(next > now());
+        record_create_failure_tx(
+            &conn,
+            "order-1",
+            "channel",
+            &gateway_error(dujiaopay::ERR_AUTH_FAILED),
+            &now(),
+        )
+        .unwrap();
+        let (rollout, enabled): (String, i64) = conn
+            .query_row(
+                "SELECT rollout_state, enabled FROM market_payment_channels WHERE id = 'channel'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((rollout.as_str(), enabled), ("off", 0));
+        let cases: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM market_finance_reconciliation_cases
+                 WHERE code = 'payment_channel_auth_failed' AND status = 'open'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cases, 1);
+    }
+
+    #[test]
+    fn a_rotated_production_channel_reenters_through_canary_and_promotes_itself() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        conn.execute(
+            "UPDATE market_finance_control SET mode = 'enabled', cutover_approved_at = '2026-10-01'
+             WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        // A new revision: no live evidence yet, channel switched off.
+        fixture_revision(&conn, 2);
+        conn.execute(
+            "UPDATE market_payment_channels SET current_revision = 2, enabled = 0 WHERE id = 'channel'",
+            [],
+        )
+        .unwrap();
+        let version: i64 = conn
+            .query_row("SELECT version FROM market_payment_channels", [], |row| row.get(0))
+            .unwrap();
+        set_channel_enabled_tx(&conn, "channel", true, version, "2026-10-05").unwrap();
+        let rollout: String = conn
+            .query_row("SELECT rollout_state FROM market_payment_channels", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rollout, "canary");
+        assert!(topup_channel_tx(&conn, "channel", false).is_err());
+        assert_eq!(topup_channel_tx(&conn, "channel", true).unwrap().revision, 2);
+        assert!(channel_views(&conn, true).unwrap().is_empty());
+        assert_eq!(buyer_channel_views(&conn, true).unwrap().len(), 1);
+        // A credit alone is not enough in production without a verified
+        // signed Webhook for this revision.
+        fixture_topup(&conn, "credited-2", &format!("router-{}", "e".repeat(32)), "credited", 2);
+        assert!(!promote_channel_if_proven_tx(&conn, "channel", "2026-10-05").unwrap());
+        assert!(mark_channel_webhook_verified_tx(&conn, "channel", 2, "2026-10-05").unwrap());
+        let (rollout, promoted): (String, Option<String>) = conn
+            .query_row(
+                "SELECT rollout_state, promoted_at FROM market_payment_channels",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(rollout, "live");
+        assert!(promoted.is_some());
+        assert_eq!(channel_views(&conn, true).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn finance_pause_reason_names_every_paused_flow() {
+        assert_eq!(finance_pause_reason((false, false, false)), "resumed");
+        assert_eq!(finance_pause_reason((true, false, false)), "orders_paused");
+        assert_eq!(
+            finance_pause_reason((true, true, false)),
+            "orders_and_withdrawals_paused"
+        );
+        assert_eq!(
+            finance_pause_reason((false, true, true)),
+            "withdrawals_and_topups_paused"
+        );
+    }
+
+    #[test]
+    fn paid_terms_check_rail_confirmations_amount_and_source() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        let merchant_order_id = "router-00000000000000000000000000000001";
+        fixture_topup(&conn, "order-1", merchant_order_id, "pending", 1);
+        conn.execute(
+            "UPDATE market_topup_orders SET create_request_body = ?2, payable_amount = '1.0003'
+             WHERE id = ?1",
+            params![
+                "order-1",
+                r#"{"token_id":"tron-usdt","allowed_methods":[{"chain":"tron","token_id":"tron-usdt"}]}"#
+            ],
+        )
+        .unwrap();
+        let detail = |gateway: &GatewayOrder| {
+            validate_paid_terms_tx(&conn, "order-1", &loaded(), gateway)
+                .err()
+                .and_then(|error| paid_review_detail(&error))
+        };
+        let mut gateway = paid_order(merchant_order_id, "tx-1");
+        gateway.settled_amount = Some("1.0003".into());
+        assert_eq!(detail(&gateway), None);
+        gateway.settled_amount = Some("1.00".into());
+        assert_eq!(detail(&gateway), None, "a fiat-denominated settlement is accepted");
+        gateway.settled_amount = Some("0.9".into());
+        assert_eq!(detail(&gateway), Some("paid_amount_short"));
+        gateway.settled_amount = Some("1.0003".into());
+        gateway.confirmations = Some(5);
+        assert_eq!(detail(&gateway), Some("paid_confirmations_low"));
+        gateway.confirmations = Some(19);
+        gateway.token_id = Some("bsc-usdt".into());
+        gateway.chain = Some("bsc".into());
+        assert_eq!(detail(&gateway), Some("paid_method_not_allowed"));
+        gateway.token_id = Some("tron-usdt".into());
+        gateway.chain = Some("ethereum".into());
+        assert_eq!(detail(&gateway), Some("paid_method_not_allowed"));
+        gateway.chain = Some("tron".into());
+        gateway.paid_source = Some("merchant_claim".into());
+        assert_eq!(detail(&gateway), Some("paid_source_manual"));
+
+        // A token with no rail entry cannot have its chain or confirmations
+        // checked, even when the order allows any method.
+        conn.execute(
+            "UPDATE market_topup_orders SET create_request_body = '{}' WHERE id = 'order-1'",
+            [],
+        )
+        .unwrap();
+        let mut unlisted = paid_order(merchant_order_id, "tx-2");
+        unlisted.token_id = Some("tron-usdt-trc20".into());
+        unlisted.confirmations = Some(1);
+        assert_eq!(detail(&unlisted), Some("paid_method_not_allowed"));
+
+        // On a non-stablecoin rail the fiat figure is a different unit and
+        // never excuses a short payment.
+        conn.execute(
+            "UPDATE market_topup_orders SET payable_amount = '4.0' WHERE id = 'order-1'",
+            [],
+        )
+        .unwrap();
+        let mut trx = paid_order(merchant_order_id, "tx-3");
+        trx.token_id = Some("tron-trx".into());
+        trx.fiat_amount_minor = 100;
+        trx.settled_amount = Some("1.00".into());
+        assert_eq!(detail(&trx), Some("paid_amount_short"));
+        trx.settled_amount = Some("4".into());
+        assert_eq!(detail(&trx), None);
+    }
+
+    #[test]
+    fn legacy_revision_methods_still_govern_orders_without_a_frozen_body() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        let merchant_order_id = "router-00000000000000000000000000000001";
+        fixture_topup(&conn, "order-1", merchant_order_id, "pending", 1);
+        let mut revision = loaded();
+        revision.allowed_methods = vec!["tron-usdt".into()];
+        let mut gateway = paid_order(merchant_order_id, "tx-1");
+        assert!(validate_paid_terms_tx(&conn, "order-1", &revision, &gateway).is_ok());
+        gateway.token_id = Some("solana-usdc".into());
+        gateway.chain = Some("solana".into());
+        gateway.confirmations = Some(40);
+        assert!(validate_paid_terms_tx(&conn, "order-1", &revision, &gateway).is_err());
+    }
+
+    #[test]
+    fn rewrap_reseals_every_revision_with_the_newest_key() {
+        let conn = memory();
+        let old = MarketPaymentsRuntime {
+            cipher: PaymentCipher::for_test_ring(&[(1, 7)]),
+            ..MarketPaymentsRuntime::for_test()
+        };
+        seed_live_revision(&conn, &old, 1, "key", "api-secret-0000000", Some("webhook-secret-000"));
+        let ring = MarketPaymentsRuntime {
+            cipher: PaymentCipher::for_test_ring(&[(1, 7), (2, 9)]),
+            ..MarketPaymentsRuntime::for_test()
+        };
+        assert_eq!(rewrap_channel_secrets_tx(&conn, &ring).unwrap(), 1);
+        assert_eq!(rewrap_channel_secrets_tx(&conn, &ring).unwrap(), 0);
+        let only_new = MarketPaymentsRuntime {
+            cipher: PaymentCipher::for_test_ring(&[(2, 9)]),
+            ..MarketPaymentsRuntime::for_test()
+        };
+        let loaded = load_revision(&conn, &only_new, "channel", 1).unwrap();
+        assert_eq!(loaded.credentials.api_secret.as_str(), "api-secret-0000000");
+        assert!(loaded.credentials.webhook_secret.is_some());
+    }
 }
+

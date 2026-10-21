@@ -376,6 +376,274 @@ pub(crate) fn record_monthly_delivery_tx(
     )
 }
 
+/// Recompute the `disputed` projection of the given lots from their active
+/// holds. Every hold change goes through this projection.
+fn recompute_lot_holds_tx(conn: &Connection, lot_filter_sql: &str, arg: &str) -> Result<(), AppError> {
+    conn.execute(
+        &format!(
+            "UPDATE market_provider_earning_lots
+             SET disputed = CASE WHEN EXISTS (
+                     SELECT 1 FROM market_provider_earning_holds hold
+                     WHERE hold.lot_id = market_provider_earning_lots.id
+                       AND hold.released_at IS NULL) THEN 1 ELSE 0 END
+             WHERE id IN ({lot_filter_sql})"
+        ),
+        params![arg],
+    )
+    .map_err(db_error("recompute Provider earning holds"))?;
+    Ok(())
+}
+
+fn notify_providers_for_lots_tx(
+    conn: &Connection,
+    lot_filter_sql: &str,
+    arg: &str,
+    reason_kind: &str,
+    reason_ref: &str,
+    time: &str,
+) -> Result<(), AppError> {
+    let providers = {
+        let mut statement = conn
+            .prepare(&format!(
+                "SELECT provider_user_id, SUM(amount_units - reversed_units - paid_units)
+                 FROM market_provider_earning_lots WHERE id IN ({lot_filter_sql})
+                 GROUP BY provider_user_id"
+            ))
+            .map_err(db_error("prepare held earning recipients"))?;
+        statement
+            .query_map(params![arg], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(db_error("query held earning recipients"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_error("read held earning recipients"))?
+    };
+    for (provider, units) in providers {
+        crate::market_notifications::enqueue_user_notification_tx(
+            conn,
+            "provider",
+            &provider,
+            "earnings_held",
+            "earning_hold",
+            reason_ref,
+            &format!("earnings_held:{reason_kind}:{reason_ref}:{provider}"),
+            serde_json::json!({
+                "reason": reason_kind,
+                "amountMinor": units / crate::market_billing::MONEY_UNITS_PER_MINOR,
+            }),
+            time,
+        )?;
+    }
+    Ok(())
+}
+
+const CONTRACT_LOTS_SQL: &str = "SELECT lot.id FROM market_provider_earning_lots lot
+     JOIN market_delivery_slices slice ON slice.id = lot.delivery_slice_id
+     WHERE slice.contract_id = ?1";
+
+/// Hold every earning lot of a contract for a recorded cause.
+pub(crate) fn hold_contract_earnings_tx(
+    conn: &Connection,
+    contract_id: &str,
+    reason_kind: &str,
+    time: &str,
+) -> Result<(), AppError> {
+    let inserted = conn
+        .execute(
+            &format!(
+                "INSERT OR IGNORE INTO market_provider_earning_holds
+                     (id, lot_id, reason_kind, reason_ref, created_at)
+                 SELECT lower(hex(randomblob(16))), held.id, ?2, ?1, ?3
+                 FROM ({CONTRACT_LOTS_SQL}) held"
+            ),
+            params![contract_id, reason_kind, time],
+        )
+        .map_err(db_error("hold contract earnings"))?;
+    recompute_lot_holds_tx(conn, CONTRACT_LOTS_SQL, contract_id)?;
+    if inserted > 0 {
+        notify_providers_for_lots_tx(
+            conn,
+            CONTRACT_LOTS_SQL,
+            contract_id,
+            reason_kind,
+            contract_id,
+            time,
+        )?;
+    }
+    Ok(())
+}
+
+/// Hold the lots registered for a service dispute.
+pub(crate) fn hold_dispute_earnings_tx(
+    conn: &Connection,
+    dispute_id: &str,
+    time: &str,
+) -> Result<(), AppError> {
+    let lots = "SELECT earning_lot_id FROM market_service_dispute_lots WHERE dispute_id = ?1";
+    conn.execute(
+        &format!(
+            "INSERT OR IGNORE INTO market_provider_earning_holds
+                 (id, lot_id, reason_kind, reason_ref, created_at)
+             SELECT lower(hex(randomblob(16))), held.earning_lot_id, 'dispute', ?1, ?2
+             FROM ({lots}) held"
+        ),
+        params![dispute_id, time],
+    )
+    .map_err(db_error("hold disputed earnings"))?;
+    recompute_lot_holds_tx(conn, lots, dispute_id)?;
+    notify_providers_for_lots_tx(conn, lots, dispute_id, "dispute", dispute_id, time)
+}
+
+/// Release every active hold with this cause. A lot becomes withdrawable only
+/// when no other hold remains. Returns the number of released holds.
+pub(crate) fn release_earning_holds_tx(
+    conn: &Connection,
+    reason_kind: &str,
+    reason_ref: &str,
+    actor: &str,
+    release_reason: &str,
+    time: &str,
+) -> Result<usize, AppError> {
+    let lots = "SELECT lot_id FROM market_provider_earning_holds
+                WHERE reason_kind = ?1 AND reason_ref = ?2 AND released_by = ?3
+                  AND released_at = ?4";
+    let released = conn
+        .execute(
+            "UPDATE market_provider_earning_holds
+             SET released_at = ?4, released_by = ?3, release_reason = ?5
+             WHERE reason_kind = ?1 AND reason_ref = ?2 AND released_at IS NULL",
+            params![reason_kind, reason_ref, actor, time, release_reason],
+        )
+        .map_err(db_error("release Provider earning holds"))?;
+    if released == 0 {
+        return Ok(0);
+    }
+    conn.execute(
+        &format!(
+            "UPDATE market_provider_earning_lots
+             SET disputed = CASE WHEN EXISTS (
+                     SELECT 1 FROM market_provider_earning_holds hold
+                     WHERE hold.lot_id = market_provider_earning_lots.id
+                       AND hold.released_at IS NULL) THEN 1 ELSE 0 END
+             WHERE id IN ({lots})"
+        ),
+        params![reason_kind, reason_ref, actor, time],
+    )
+    .map_err(db_error("recompute released Provider earnings"))?;
+    let providers = {
+        let mut statement = conn
+            .prepare(&format!(
+                "SELECT DISTINCT provider_user_id FROM market_provider_earning_lots
+                 WHERE id IN ({lots}) AND disputed = 0"
+            ))
+            .map_err(db_error("prepare released earning recipients"))?;
+        statement
+            .query_map(params![reason_kind, reason_ref, actor, time], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(db_error("query released earning recipients"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_error("read released earning recipients"))?
+    };
+    for provider in providers {
+        crate::market_notifications::enqueue_user_notification_tx(
+            conn,
+            "provider",
+            &provider,
+            "earnings_released",
+            "earning_hold",
+            reason_ref,
+            &format!("earnings_released:{reason_kind}:{reason_ref}:{provider}:{time}"),
+            serde_json::json!({ "reason": reason_kind }),
+            time,
+        )?;
+    }
+    Ok(released)
+}
+
+/// Hold one lot whose unlock failed, open its case and alert the Owner.
+/// Resolving the case (or releasing the manual hold) returns it to maturity.
+fn hold_failed_unlock_tx(conn: &Connection, lot_id: &str, time: &str) -> Result<(), AppError> {
+    let lot = "SELECT ?1";
+    conn.execute(
+        "INSERT OR IGNORE INTO market_provider_earning_holds
+             (id, lot_id, reason_kind, reason_ref, created_at)
+         VALUES (lower(hex(randomblob(16))), ?1, 'manual', ?1, ?2)",
+        params![lot_id, time],
+    )
+    .map_err(db_error("hold failed earning unlock"))?;
+    recompute_lot_holds_tx(conn, lot, lot_id)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO market_finance_reconciliation_cases
+            (id, code, object_kind, object_id, status, created_at)
+         VALUES (?1, 'earning_unlock_failed', 'earning_lot', ?2, 'open', ?3)",
+        params![Uuid::new_v4().to_string(), lot_id, time],
+    )
+    .map_err(db_error("record failed earning unlock"))?;
+    crate::market_notifications::owner_signal_tx(
+        conn,
+        "earning_unlock_failed",
+        "earning_lot",
+        lot_id,
+        serde_json::json!({ "lotId": lot_id }),
+        time,
+        false,
+    )
+}
+
+/// The hold cause a finance case code places on contract earnings.
+pub(crate) fn hold_kind_for_case(code: &str) -> Option<&'static str> {
+    match code {
+        "wallet_cleanup_uncertain" => Some("cleanup_uncertain"),
+        "wallet_service_missing" => Some("service_missing"),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EarningHoldView {
+    pub reason_kind: String,
+    pub reason_ref: String,
+    pub provider_user_id: String,
+    pub lots: i64,
+    #[serde(serialize_with = "serialize_units")]
+    pub held_units: i64,
+    pub created_at: String,
+}
+
+/// Active holds grouped by cause, for the Owner console and the Provider.
+pub(crate) fn active_earning_holds_tx(
+    conn: &Connection,
+    provider_user_id: Option<&str>,
+) -> Result<Vec<EarningHoldView>, AppError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT hold.reason_kind, hold.reason_ref, lot.provider_user_id, COUNT(*),
+                    SUM(lot.amount_units - lot.reversed_units - lot.paid_units), MIN(hold.created_at)
+             FROM market_provider_earning_holds hold
+             JOIN market_provider_earning_lots lot ON lot.id = hold.lot_id
+             WHERE hold.released_at IS NULL AND (?1 IS NULL OR lot.provider_user_id = ?1)
+             GROUP BY hold.reason_kind, hold.reason_ref, lot.provider_user_id
+             ORDER BY MIN(hold.created_at) LIMIT 500",
+        )
+        .map_err(db_error("prepare earning holds"))?;
+    statement
+        .query_map(params![provider_user_id], |row| {
+            Ok(EarningHoldView {
+                reason_kind: row.get(0)?,
+                reason_ref: row.get(1)?,
+                provider_user_id: row.get(2)?,
+                lots: row.get(3)?,
+                held_units: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })
+        .map_err(db_error("query earning holds"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_error("read earning holds"))
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ProviderFinanceSummary {
@@ -418,6 +686,8 @@ pub(crate) fn provider_summary_tx(
 
 /// One bounded pass; running it repeatedly is harmless. The lot is locked by
 /// the caller's IMMEDIATE transaction before the journal and projection move.
+/// Production uses [`unlock_due_earnings_isolated`]; tests drive this directly.
+#[cfg(test)]
 pub(crate) fn unlock_due_earnings_tx(
     conn: &Connection,
     at: &str,
@@ -449,47 +719,124 @@ pub(crate) fn unlock_due_earnings_tx(
         if parse_utc(&maturity)? > at_utc {
             continue;
         }
-        let fingerprint = format!("{provider}:{units}:{maturity}");
-        let journal = post_journal_tx(
-            conn,
-            "earning_lot",
-            &id,
-            "unlock",
-            &fingerprint,
-            &[
-                Posting {
-                    kind: "provider_pending",
-                    subject_id: &provider,
-                    signed_units: units,
-                },
-                Posting {
-                    kind: "provider_available",
-                    subject_id: &provider,
-                    signed_units: -units,
-                },
-            ],
-            at,
-        )?;
-        if !journal.inserted {
-            return Err(AppError::Internal(
-                "earning lot unlock projection drift".into(),
-            ));
-        }
-        let changed = conn
-            .execute(
-                "UPDATE market_provider_earning_lots SET unlocked_units = unlocked_units + ?2
-             WHERE id = ?1 AND disputed = 0
-               AND amount_units - reversed_units - unlocked_units = ?2",
-                params![id, units],
-            )
-            .map_err(db_error("unlock Provider earning"))?;
-        if changed != 1 {
-            return Err(AppError::Conflict(
-                "Provider earning changed during unlock".into(),
-            ));
-        }
+        unlock_lot_tx(conn, &id, &provider, units, &maturity, at)?;
         count += 1;
     }
+    Ok(count)
+}
+
+fn unlock_lot_tx(
+    conn: &Connection,
+    id: &str,
+    provider: &str,
+    units: i64,
+    maturity: &str,
+    at: &str,
+) -> Result<(), AppError> {
+    let fingerprint = format!("{provider}:{units}:{maturity}");
+    let journal = post_journal_tx(
+        conn,
+        "earning_lot",
+        id,
+        "unlock",
+        &fingerprint,
+        &[
+            Posting {
+                kind: "provider_pending",
+                subject_id: provider,
+                signed_units: units,
+            },
+            Posting {
+                kind: "provider_available",
+                subject_id: provider,
+                signed_units: -units,
+            },
+        ],
+        at,
+    )?;
+    if !journal.inserted {
+        return Err(AppError::Internal(
+            "earning lot unlock projection drift".into(),
+        ));
+    }
+    let changed = conn
+        .execute(
+            "UPDATE market_provider_earning_lots SET unlocked_units = unlocked_units + ?2
+         WHERE id = ?1 AND disputed = 0
+           AND amount_units - reversed_units - unlocked_units = ?2",
+            params![id, units],
+        )
+        .map_err(db_error("unlock Provider earning"))?;
+    if changed != 1 {
+        return Err(AppError::Conflict(
+            "Provider earning changed during unlock".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The background variant of [`unlock_due_earnings_tx`]: one transaction,
+/// one savepoint per lot. A failing lot is rolled back and logged without
+/// blocking the other due lots in the batch.
+pub(crate) fn unlock_due_earnings_isolated(
+    conn: &Connection,
+    at: &str,
+    limit: i64,
+) -> Result<usize, AppError> {
+    let at_utc = parse_utc(at)?;
+    let tx = conn
+        .transaction_with_behavior(crate::db::TransactionBehavior::Immediate)
+        .map_err(db_error("begin earning maturity"))?;
+    let rows = {
+        let mut statement = tx
+            .prepare(
+                "SELECT id, provider_user_id, amount_units - reversed_units - unlocked_units,
+                    unlock_at FROM market_provider_earning_lots
+             WHERE disputed = 0 AND amount_units - reversed_units - unlocked_units > 0
+             ORDER BY unlock_at, id LIMIT ?1",
+            )
+            .map_err(db_error("prepare due Provider earnings"))?;
+        statement
+            .query_map(params![limit.clamp(1, 1_000)], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(db_error("query due Provider earnings"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_error("read due Provider earnings"))?
+    };
+    let mut count = 0;
+    for (id, provider, units, maturity) in rows {
+        if parse_utc(&maturity)? > at_utc {
+            continue;
+        }
+        tx.execute_batch("SAVEPOINT earning_lot_unlock")
+            .map_err(db_error("open earning unlock savepoint"))?;
+        match unlock_lot_tx(&tx, &id, &provider, units, &maturity, at) {
+            Ok(()) => {
+                tx.execute_batch("RELEASE SAVEPOINT earning_lot_unlock")
+                    .map_err(db_error("release earning unlock savepoint"))?;
+                count += 1;
+            }
+            Err(_) => {
+                tx.execute_batch(
+                    "ROLLBACK TO SAVEPOINT earning_lot_unlock;
+                     RELEASE SAVEPOINT earning_lot_unlock",
+                )
+                .map_err(db_error("roll back earning unlock savepoint"))?;
+                // A lot that cannot unlock would stay at the head of the
+                // maturity order and starve every later lot. Hold it with a
+                // visible cause for the Owner instead of retrying it forever.
+                hold_failed_unlock_tx(&tx, &id, at)?;
+                tracing::warn!(lot_id = %id, "Provider earning unlock failed; lot held for review");
+            }
+        }
+    }
+    tx.commit().map_err(db_error("commit earning maturity"))?;
     Ok(count)
 }
 

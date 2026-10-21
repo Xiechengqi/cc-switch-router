@@ -21,6 +21,10 @@ use crate::market_wallet::{
 use crate::models::AuthSession;
 
 const MIN_WITHDRAW_MINOR: i64 = 100;
+const MAX_WITHDRAW_MINOR: i64 = 500_000;
+const MAX_OPEN_WITHDRAWALS: i64 = 3;
+const ADDRESS_CODE_MINUTES: i64 = 15;
+const ADDRESS_CODE_ATTEMPTS: i64 = 5;
 const ADDRESS_COOLDOWN_HOURS: i64 = 24;
 
 fn db_error(context: &'static str) -> impl FnOnce(crate::db::Error) -> AppError {
@@ -298,6 +302,11 @@ fn create_payout_tx(
             "withdrawal amount is below minimum".into(),
         ));
     }
+    if amount_minor > MAX_WITHDRAW_MINOR {
+        return Err(AppError::BadRequest(
+            "withdrawal amount exceeds the per-request maximum".into(),
+        ));
+    }
     let amount_units = units_from_minor(amount_minor)?;
     // The request body contains an amount, not a destination version. A replay
     // must keep returning the original address snapshot even if the Provider
@@ -318,8 +327,28 @@ fn create_payout_tx(
         }
         return payout_view_tx(conn, &id, provider);
     }
+    let open: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM market_payout_requests WHERE provider_user_id = ?1
+             AND status IN ('requested', 'approved', 'transfer_in_progress',
+                            'review_required', 'transfer_failed')",
+            params![provider],
+            |row| row.get(0),
+        )
+        .map_err(db_error("count open Provider withdrawals"))?;
+    if open >= MAX_OPEN_WITHDRAWALS {
+        return Err(AppError::Conflict(
+            "too many withdrawals are still being processed".into(),
+        ));
+    }
     require_new_provider_payouts_open_tx(conn)?;
-    crate::market_reconcile::ensure_new_finance_writes_safe_tx(conn)?;
+    crate::market_reconcile::ensure_finance_scopes_safe_tx(
+        conn,
+        &[
+            crate::market_reconcile::FinanceScope::Provider(provider),
+            crate::market_reconcile::FinanceScope::Payouts,
+        ],
+    )?;
     let destination = latest_destination_tx(conn, provider)?
         .ok_or_else(|| AppError::Conflict("withdrawal destination required".into()))?;
     if chrono::DateTime::parse_from_rfc3339(&destination.usable_at)
@@ -476,7 +505,13 @@ fn transition_payout_tx(
     }
     if matches!(action, "approve" | "begin_transfer") {
         require_new_provider_payouts_open_tx(conn)?;
-        crate::market_reconcile::ensure_new_finance_writes_safe_tx(conn)?;
+        crate::market_reconcile::ensure_finance_scopes_safe_tx(
+            conn,
+            &[
+                crate::market_reconcile::FinanceScope::Provider(&provider),
+                crate::market_reconcile::FinanceScope::Payouts,
+            ],
+        )?;
         let disputed: i64 = conn
             .query_row(
                 "SELECT EXISTS(
@@ -729,7 +764,29 @@ fn create_buyer_refund_tx(
         }
         return buyer_refund_view_tx(conn, &id, user_id);
     }
-    crate::market_reconcile::ensure_new_finance_writes_safe_tx(conn)?;
+    crate::market_reconcile::ensure_finance_scopes_safe_tx(
+        conn,
+        &[
+            crate::market_reconcile::FinanceScope::User(user_id),
+            crate::market_reconcile::FinanceScope::Payouts,
+        ],
+    )?;
+    // Money already promised to running services is not refundable: a refund
+    // must not be the reason a renewal or metered budget fails.
+    let committed =
+        crate::market_platform_contracts::prior_due_funding_units_tx(conn, user_id, None, time)?;
+    let free = crate::market_wallet::wallet_snapshot_tx(conn, user_id)?.available_units - committed;
+    if free < units {
+        return Err(AppError::Coded {
+            status: axum::http::StatusCode::CONFLICT,
+            code: "MARKET_REFUND_EXCEEDS_FREE_BALANCE",
+            message: "refund exceeds the balance not committed to services".into(),
+            details: serde_json::json!({
+                "freeUnits": free.max(0).to_string(),
+                "committedUnits": committed.to_string(),
+            }),
+        });
+    }
     let id = Uuid::new_v4().to_string();
     let hold_id = reserve_wallet_tx(
         conn,
@@ -807,7 +864,13 @@ fn transition_buyer_refund_tx(
         return Err(AppError::Conflict("refund version changed".into()));
     }
     if matches!(action, "approve" | "begin_transfer") {
-        crate::market_reconcile::ensure_new_finance_writes_safe_tx(conn)?;
+        crate::market_reconcile::ensure_finance_scopes_safe_tx(
+            conn,
+            &[
+                crate::market_reconcile::FinanceScope::User(&buyer),
+                crate::market_reconcile::FinanceScope::Payouts,
+            ],
+        )?;
     }
     let target = match (status.as_str(), action) {
         ("requested", "approve") => "approved",
@@ -929,6 +992,133 @@ struct TransitionRequest {
     external_reference: Option<String>,
     reason: Option<String>,
     actual_amount_minor: Option<i64>,
+    #[serde(default)]
+    transferred_at: Option<String>,
+    #[serde(default)]
+    network_fee_minor: Option<i64>,
+    #[serde(default)]
+    variance_reason: Option<String>,
+}
+
+/// Transfer facts typed by the Owner at mark_paid. The nominal receipt keeps
+/// the requested amount; what actually arrived and the fee are recorded beside
+/// it, and a difference needs an explicit reason.
+struct TransferDetails {
+    transferred_at: String,
+    actual_amount_minor: i64,
+    network_fee_minor: Option<i64>,
+    variance_reason: Option<String>,
+}
+
+fn transfer_details(
+    request: &TransitionRequest,
+    amount_units: i64,
+    now: &str,
+) -> Result<TransferDetails, AppError> {
+    let actual = request
+        .actual_amount_minor
+        .filter(|amount| *amount >= 0)
+        .ok_or_else(|| AppError::BadRequest("the amount that actually arrived is required".into()))?;
+    let transferred_at = request
+        .transferred_at
+        .clone()
+        .ok_or_else(|| AppError::BadRequest("the transfer time is required".into()))?;
+    let at = chrono::DateTime::parse_from_rfc3339(&transferred_at)
+        .map_err(|_| AppError::BadRequest("transfer time must be RFC 3339".into()))?;
+    let now_at = chrono::DateTime::parse_from_rfc3339(now)
+        .map_err(|_| AppError::Internal("transition time invalid".into()))?;
+    if at > now_at + Duration::minutes(5) || at < now_at - Duration::days(30) {
+        return Err(AppError::BadRequest("transfer time is outside the allowed window".into()));
+    }
+    if request.network_fee_minor.is_some_and(|fee| fee < 0) {
+        return Err(AppError::BadRequest("network fee cannot be negative".into()));
+    }
+    let nominal = amount_units / crate::market_billing::MONEY_UNITS_PER_MINOR;
+    let variance_reason = request.variance_reason.clone();
+    if actual != nominal {
+        validate_reason_code(variance_reason.as_deref()).map_err(|_| {
+            AppError::BadRequest("a variance reason is required when the amounts differ".into())
+        })?;
+    }
+    Ok(TransferDetails {
+        transferred_at,
+        actual_amount_minor: actual,
+        network_fee_minor: request.network_fee_minor,
+        variance_reason,
+    })
+}
+
+fn record_transfer_details_tx(
+    conn: &Connection,
+    table: &str,
+    id: &str,
+    details: &TransferDetails,
+) -> Result<(), AppError> {
+    conn.execute(
+        &format!(
+            "UPDATE {table} SET transferred_at = ?2, actual_amount_minor = ?3,
+                 network_fee_minor = ?4, variance_reason = ?5 WHERE id = ?1"
+        ),
+        params![
+            id,
+            details.transferred_at,
+            details.actual_amount_minor,
+            details.network_fee_minor,
+            details.variance_reason
+        ],
+    )
+    .map_err(db_error("record transfer details"))?;
+    Ok(())
+}
+
+/// Record the approver, flag a self-approved transfer, and notify.
+#[allow(clippy::too_many_arguments)]
+fn after_transition_tx(
+    conn: &Connection,
+    table: &str,
+    id: &str,
+    actor: &str,
+    action: &str,
+    recipient_audience: &str,
+    recipient: &str,
+    kind: &str,
+    status: &str,
+    amount_units: i64,
+    time: &str,
+) -> Result<(), AppError> {
+    if action == "approve" {
+        conn.execute(
+            &format!("UPDATE {table} SET approved_by = ?2 WHERE id = ?1"),
+            params![id, actor],
+        )
+        .map_err(db_error("record transfer approver"))?;
+    }
+    if action == "mark_paid" {
+        let approver: Option<String> = conn
+            .query_row(
+                &format!("SELECT approved_by FROM {table} WHERE id = ?1"),
+                params![id],
+                |row| row.get(0),
+            )
+            .map_err(db_error("read transfer approver"))?;
+        if approver.as_deref() == Some(actor) {
+            audit_tx(conn, actor, "self_approved_transfer", table, id, None, time)?;
+        }
+    }
+    crate::market_notifications::enqueue_user_notification_tx(
+        conn,
+        recipient_audience,
+        recipient,
+        kind,
+        table,
+        id,
+        &format!("{kind}:{id}:{status}"),
+        serde_json::json!({
+            "status": status,
+            "amountMinor": amount_units / crate::market_billing::MONEY_UNITS_PER_MINOR,
+        }),
+        time,
+    )
 }
 
 pub fn router() -> Router<ServerState> {
@@ -938,6 +1128,22 @@ pub fn router() -> Router<ServerState> {
         .route(
             "/v1/market-provider-finance/destination",
             put(set_destination),
+        )
+        .route(
+            "/v1/market-provider-finance/destination/challenge",
+            post(request_address_challenge),
+        )
+        .route(
+            "/v1/market-provider-finance/withdrawals/:id/cancel",
+            post(cancel_withdrawal),
+        )
+        .route(
+            "/v1/market-provider-finance/holds",
+            get(list_own_earning_holds),
+        )
+        .route(
+            "/v1/market-wallet/refund-requests/:id/cancel",
+            post(cancel_buyer_refund),
         )
         .route(
             "/v1/market-provider-finance/withdrawals",
@@ -1276,7 +1482,23 @@ async fn request_buyer_refund(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin buyer wallet refund"))?;
     let time = now();
+    if !crate::market_payments::wallet_purchase_mode_tx(&tx)? {
+        return Err(AppError::ServiceUnavailable(
+            "balance refunds open with the platform wallet".into(),
+        ));
+    }
     let result = create_buyer_refund_tx(&tx, &session.user_id, &request, idem, &time)?;
+    if result.status == "requested" && result.created_at == time {
+        crate::market_notifications::owner_signal_tx(
+            &tx,
+            "refund_requested",
+            "buyer_refund",
+            &result.id,
+            serde_json::json!({ "amountMinor": request.amount_minor }),
+            &time,
+            false,
+        )?;
+    }
     tx.commit()
         .map_err(db_error("commit buyer wallet refund"))?;
     Ok((no_store(), Json(result)))
@@ -1288,30 +1510,26 @@ async fn admin_transition_buyer_refund(
     Path(id): Path<String>,
     Json(request): Json<TransitionRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let session = crate::api::require_admin_session(&state, &headers).await?;
+    let session = if request.action == "mark_paid" {
+        crate::api::require_owner_session(&state, &headers).await?
+    } else {
+        crate::api::require_admin_session(&state, &headers).await?
+    };
     let conn = state.store.conn.lock().await;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin buyer refund transition"))?;
-    if request.action == "mark_paid" {
-        let amount: i64 = tx
-            .query_row(
-                "SELECT amount_units FROM market_buyer_refund_requests WHERE id = ?1",
-                params![id],
-                |row| row.get(0),
-            )
-            .map_err(db_error("read buyer refund amount"))?;
-        if request
-            .actual_amount_minor
-            .map(units_from_minor)
-            .transpose()?
-            != Some(amount)
-        {
-            return Err(AppError::BadRequest(
-                "actual refund amount does not match request".into(),
-            ));
-        }
-    }
+    let time = now();
+    let (amount, buyer): (i64, String) = tx
+        .query_row(
+            "SELECT amount_units, user_id FROM market_buyer_refund_requests WHERE id = ?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(db_error("read buyer refund amount"))?;
+    let details = (request.action == "mark_paid")
+        .then(|| transfer_details(&request, amount, &time))
+        .transpose()?;
     let result = transition_buyer_refund_tx(
         &tx,
         &id,
@@ -1320,7 +1538,23 @@ async fn admin_transition_buyer_refund(
         request.expected_version,
         request.external_reference.as_deref(),
         request.reason.as_deref(),
-        &now(),
+        &time,
+    )?;
+    if let Some(details) = &details {
+        record_transfer_details_tx(&tx, "market_buyer_refund_requests", &id, details)?;
+    }
+    after_transition_tx(
+        &tx,
+        "market_buyer_refund_requests",
+        &id,
+        &session.user_id,
+        &request.action,
+        "buyer",
+        &buyer,
+        "refund_status",
+        &result.status,
+        amount,
+        &time,
     )?;
     tx.commit()
         .map_err(db_error("commit buyer refund transition"))?;
@@ -1358,10 +1592,20 @@ async fn get_provider_finance(
     ))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SetDestinationRequest {
+    network: String,
+    address: String,
+    confirmation: String,
+    challenge_id: String,
+    code: String,
+}
+
 async fn set_destination(
     State(state): State<ServerState>,
     headers: HeaderMap,
-    Json(request): Json<DestinationRequest>,
+    Json(request): Json<SetDestinationRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let session = require_session(&state, &headers).await?;
     let conn = state.store.conn.lock().await;
@@ -1369,7 +1613,35 @@ async fn set_destination(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin destination update"))?;
     let time = now();
-    let result = save_destination_tx(&tx, &session.user_id, &request, &time)?;
+    let changes_address = latest_destination_tx(&tx, &session.user_id)?.is_none_or(|existing| {
+        existing.network != request.network || existing.address != request.address
+    });
+    if changes_address
+        && !consume_address_challenge_tx(
+            &tx,
+            &session.user_id,
+            &request.challenge_id,
+            request.code.trim(),
+            &request.network,
+            &request.address,
+            &time,
+        )?
+    {
+        // Keep the failed attempt so the code cannot be guessed.
+        tx.commit()
+            .map_err(db_error("commit address challenge attempt"))?;
+        return Err(AppError::BadRequest("verification code is invalid".into()));
+    }
+    let result = save_destination_tx(
+        &tx,
+        &session.user_id,
+        &DestinationRequest {
+            network: request.network.clone(),
+            address: request.address.clone(),
+            confirmation: request.confirmation.clone(),
+        },
+        &time,
+    )?;
     audit_tx(
         &tx,
         &session.user_id,
@@ -1379,8 +1651,40 @@ async fn set_destination(
         None,
         &time,
     )?;
+    if changes_address {
+        crate::market_notifications::enqueue_user_notification_tx(
+            &tx,
+            "provider",
+            &session.user_id,
+            "payout_address_changed",
+            "payout_destination",
+            &result.id,
+            &format!("payout_address_changed:{}", result.id),
+            serde_json::json!({
+                "network": result.network,
+                "address": mask_address(&result.address),
+                "usableAt": result.usable_at,
+            }),
+            &time,
+        )?;
+    }
     tx.commit().map_err(db_error("commit destination update"))?;
     Ok((no_store(), Json(result)))
+}
+
+async fn list_own_earning_holds(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let session = require_session(&state, &headers).await?;
+    let conn = state.store.conn.lock().await;
+    Ok((
+        no_store(),
+        Json(crate::market_finance::active_earning_holds_tx(
+            &conn,
+            Some(&session.user_id),
+        )?),
+    ))
 }
 
 async fn request_withdrawal(
@@ -1396,6 +1700,17 @@ async fn request_withdrawal(
         .map_err(db_error("begin Provider withdrawal"))?;
     let time = now();
     let result = create_payout_tx(&tx, &session.user_id, request.amount_minor, idem, &time)?;
+    if result.status == "requested" && result.created_at == time {
+        crate::market_notifications::owner_signal_tx(
+            &tx,
+            "payout_requested",
+            "provider_withdrawal",
+            &result.id,
+            serde_json::json!({ "amountMinor": request.amount_minor }),
+            &time,
+            false,
+        )?;
+    }
     tx.commit()
         .map_err(db_error("commit Provider withdrawal"))?;
     Ok((no_store(), Json(result)))
@@ -1407,30 +1722,27 @@ async fn admin_transition_withdrawal(
     Path(id): Path<String>,
     Json(request): Json<TransitionRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let session = crate::api::require_admin_session(&state, &headers).await?;
+    let session = if request.action == "mark_paid" {
+        // Marking an external transfer paid moves Owner money.
+        crate::api::require_owner_session(&state, &headers).await?
+    } else {
+        crate::api::require_admin_session(&state, &headers).await?
+    };
     let conn = state.store.conn.lock().await;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin withdrawal transition"))?;
-    if request.action == "mark_paid" {
-        let amount: i64 = tx
-            .query_row(
-                "SELECT amount_units FROM market_payout_requests WHERE id = ?1",
-                params![id],
-                |row| row.get(0),
-            )
-            .map_err(db_error("read withdrawal amount"))?;
-        if request
-            .actual_amount_minor
-            .map(units_from_minor)
-            .transpose()?
-            != Some(amount)
-        {
-            return Err(AppError::BadRequest(
-                "actual payout amount does not match request".into(),
-            ));
-        }
-    }
+    let time = now();
+    let amount: i64 = tx
+        .query_row(
+            "SELECT amount_units FROM market_payout_requests WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .map_err(db_error("read withdrawal amount"))?;
+    let details = (request.action == "mark_paid")
+        .then(|| transfer_details(&request, amount, &time))
+        .transpose()?;
     let result = transition_payout_tx(
         &tx,
         &id,
@@ -1439,11 +1751,302 @@ async fn admin_transition_withdrawal(
         request.expected_version,
         request.external_reference.as_deref(),
         request.reason.as_deref(),
-        &now(),
+        &time,
+    )?;
+    if let Some(details) = &details {
+        record_transfer_details_tx(&tx, "market_payout_requests", &id, details)?;
+    }
+    let provider: String = tx
+        .query_row(
+            "SELECT provider_user_id FROM market_payout_requests WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .map_err(db_error("read withdrawal Provider"))?;
+    after_transition_tx(
+        &tx,
+        "market_payout_requests",
+        &id,
+        &session.user_id,
+        &request.action,
+        "provider",
+        &provider,
+        "payout_status",
+        &result.status,
+        amount,
+        &time,
     )?;
     tx.commit()
         .map_err(db_error("commit withdrawal transition"))?;
     Ok((no_store(), Json(result)))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CancelRequest {
+    expected_version: i64,
+}
+
+/// A Provider may withdraw a request the Owner has not yet approved.
+async fn cancel_withdrawal(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<CancelRequest>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let session = require_session(&state, &headers).await?;
+    let conn = state.store.conn.lock().await;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_error("begin withdrawal cancellation"))?;
+    let status: Option<String> = tx
+        .query_row(
+            "SELECT status FROM market_payout_requests WHERE id = ?1 AND provider_user_id = ?2",
+            params![id, session.user_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db_error("read own withdrawal"))?;
+    match status.as_deref() {
+        None => return Err(AppError::NotFound("withdrawal not found".into())),
+        Some("requested") => {}
+        Some(_) => {
+            return Err(AppError::Conflict(
+                "only a withdrawal awaiting approval can be cancelled".into(),
+            ));
+        }
+    }
+    let result = transition_payout_tx(
+        &tx,
+        &id,
+        &session.user_id,
+        "reject",
+        request.expected_version,
+        None,
+        Some("provider_cancelled"),
+        &now(),
+    )?;
+    tx.commit()
+        .map_err(db_error("commit withdrawal cancellation"))?;
+    Ok((no_store(), Json(result)))
+}
+
+/// A buyer may withdraw a balance refund the Owner has not yet approved.
+async fn cancel_buyer_refund(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<CancelRequest>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let session = require_session(&state, &headers).await?;
+    let conn = state.store.conn.lock().await;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_error("begin refund cancellation"))?;
+    let status: Option<String> = tx
+        .query_row(
+            "SELECT status FROM market_buyer_refund_requests WHERE id = ?1 AND user_id = ?2",
+            params![id, session.user_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db_error("read own refund"))?;
+    match status.as_deref() {
+        None => return Err(AppError::NotFound("refund not found".into())),
+        Some("requested") => {}
+        Some(_) => {
+            return Err(AppError::Conflict(
+                "only a refund awaiting approval can be cancelled".into(),
+            ));
+        }
+    }
+    let result = transition_buyer_refund_tx(
+        &tx,
+        &id,
+        &session.user_id,
+        "reject",
+        request.expected_version,
+        None,
+        Some("buyer_cancelled"),
+        &now(),
+    )?;
+    tx.commit()
+        .map_err(db_error("commit refund cancellation"))?;
+    Ok((no_store(), Json(result)))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AddressChallengeRequest {
+    network: String,
+    address: String,
+}
+
+fn code_digest(challenge_id: &str, code: &str) -> String {
+    hex::encode(Sha256::digest(
+        format!("payout-address:{challenge_id}:{code}").as_bytes(),
+    ))
+}
+
+/// Email a one-time code before a withdrawal address can change. The code is
+/// bound to the exact network and address it was requested for.
+async fn request_address_challenge(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<AddressChallengeRequest>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let session = require_session(&state, &headers).await?;
+    validate_destination(&request.network, &request.address)?;
+    let challenge_id = Uuid::new_v4().to_string();
+    let code = format!("{:06}", rand::random::<u32>() % 1_000_000);
+    {
+        let conn = state.store.conn.lock().await;
+        require_provider_tx(&conn, &session.user_id)?;
+        let recent: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM market_payout_address_challenges
+                 WHERE provider_user_id = ?1 AND created_at >= ?2",
+                params![
+                    session.user_id,
+                    (Utc::now() - Duration::hours(1)).to_rfc3339()
+                ],
+                |row| row.get(0),
+            )
+            .map_err(db_error("count address challenges"))?;
+        if recent >= 5 {
+            return Err(AppError::TooManyRequests(
+                "too many address verification codes requested".into(),
+            ));
+        }
+        conn.execute(
+            "INSERT INTO market_payout_address_challenges
+             (id, provider_user_id, network, address, code_sha256, expires_at, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                challenge_id,
+                session.user_id,
+                request.network,
+                request.address,
+                code_digest(&challenge_id, &code),
+                (Utc::now() + Duration::minutes(ADDRESS_CODE_MINUTES)).to_rfc3339(),
+                now()
+            ],
+        )
+        .map_err(db_error("create address challenge"))?;
+    }
+    let delivered = match (
+        state.config.resend_api_key.as_deref(),
+        crate::notifications::notification_sender(&state.config),
+    ) {
+        (Some(api_key), Some(from)) => {
+            let http = state.proxy_http.clone();
+            let masked = mask_address(&request.address);
+            let text = format!(
+                "提现地址变更验证码 / Withdrawal address code: {code}\n\n\
+                 地址 / Address: {masked} ({network})\n\
+                 {minutes} 分钟内有效。若非本人操作，请忽略并检查账户安全。\n\
+                 Valid for {minutes} minutes. If you did not request this, ignore it.",
+                network = request.network,
+                minutes = ADDRESS_CODE_MINUTES
+            );
+            let html = format!("<p>{}</p>", text.replace('\n', "<br>"));
+            let key = format!("payout-address-{challenge_id}");
+            crate::notifications::send_resend_frozen_email(
+                &http,
+                api_key,
+                crate::notifications::FrozenEmailEnvelope {
+                    from: &from,
+                    recipient: &session.email,
+                    subject: "提现地址验证码 / Withdrawal address code",
+                    html: &html,
+                    text: &text,
+                    reply_to: None,
+                    idempotency_key: &key,
+                },
+            )
+            .await
+            .is_ok()
+        }
+        _ => false,
+    };
+    if !delivered && !state.config.use_localhost {
+        return Err(AppError::ServiceUnavailable(
+            "verification email could not be sent".into(),
+        ));
+    }
+    if !delivered {
+        // Local development has no mail transport; the code stays in logs.
+        tracing::info!(challenge_id, code, "payout address code (localhost only)");
+    }
+    Ok((
+        no_store(),
+        Json(serde_json::json!({
+            "challengeId": challenge_id,
+            "expiresInSeconds": ADDRESS_CODE_MINUTES * 60,
+        })),
+    ))
+}
+
+fn mask_address(address: &str) -> String {
+    if address.len() <= 10 {
+        return address.to_string();
+    }
+    format!("{}…{}", &address[..6], &address[address.len() - 4..])
+}
+
+/// Consume a matching, unexpired challenge for exactly this address.
+fn consume_address_challenge_tx(
+    conn: &Connection,
+    provider: &str,
+    challenge_id: &str,
+    code: &str,
+    network: &str,
+    address: &str,
+    time: &str,
+) -> Result<bool, AppError> {
+    let row: Option<(String, String, String, i64, String, Option<String>)> = conn
+        .query_row(
+            "SELECT network, address, code_sha256, attempts, expires_at, consumed_at
+             FROM market_payout_address_challenges WHERE id = ?1 AND provider_user_id = ?2",
+            params![challenge_id, provider],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(db_error("read address challenge"))?;
+    let Some((stored_network, stored_address, digest, attempts, expires_at, consumed)) = row else {
+        return Err(AppError::BadRequest("verification code is invalid".into()));
+    };
+    if consumed.is_some()
+        || attempts >= ADDRESS_CODE_ATTEMPTS
+        || expires_at.as_str() < time
+        || stored_network != network
+        || stored_address != address
+    {
+        return Err(AppError::BadRequest("verification code is invalid or expired".into()));
+    }
+    if code_digest(challenge_id, code) != digest {
+        conn.execute(
+            "UPDATE market_payout_address_challenges SET attempts = attempts + 1 WHERE id = ?1",
+            params![challenge_id],
+        )
+        .map_err(db_error("count address challenge attempt"))?;
+        return Ok(false);
+    }
+    conn.execute(
+        "UPDATE market_payout_address_challenges SET consumed_at = ?2 WHERE id = ?1",
+        params![challenge_id, time],
+    )
+    .map_err(db_error("consume address challenge"))?;
+    Ok(true)
 }
 
 #[cfg(test)]

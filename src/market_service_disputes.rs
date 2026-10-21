@@ -187,18 +187,15 @@ fn open_dispute_tx(
         "INSERT INTO market_service_dispute_lots (dispute_id, earning_lot_id)
          SELECT ?1, lot.id FROM market_provider_earning_lots lot
          JOIN market_delivery_slices slice ON slice.id = lot.delivery_slice_id
-         WHERE slice.contract_id = ?2 AND lot.disputed = 0
+         WHERE slice.contract_id = ?2
+           AND lot.amount_units - lot.reversed_units - lot.paid_units > 0
            AND (?3 IS NULL OR slice.created_at > ?3)",
         params![id, contract_id, latest_resolution],
     )
     .map_err(db_error("record earnings frozen by service dispute"))?;
-    conn.execute(
-        "UPDATE market_provider_earning_lots SET disputed = 1
-         WHERE id IN (SELECT earning_lot_id FROM market_service_dispute_lots
-                      WHERE dispute_id = ?1) AND disputed = 0",
-        params![id],
-    )
-    .map_err(db_error("freeze disputed Provider earnings"))?;
+    // Holds stack: a lot already held for another cause is registered too,
+    // so resolving either cause alone never releases it early.
+    crate::market_finance::hold_dispute_earnings_tx(conn, &id, time)?;
     conn.execute(
         "INSERT INTO market_finance_audit_events
             (id, actor_user_id, action, object_kind, object_id, reason_code, created_at)
@@ -268,7 +265,7 @@ fn resolve_dispute_tx(
     if dispute.status != "open" || dispute.version != expected_version {
         return Err(AppError::Conflict("service dispute version changed".into()));
     }
-    crate::market_reconcile::ensure_new_finance_writes_safe_tx(conn)?;
+    crate::market_reconcile::ensure_contract_finance_safe_tx(conn, &dispute.contract_id)?;
     let lots = refundable_lots_tx(conn, dispute_id)?;
     let refundable = lots.iter().try_fold(0_i64, |sum, lot| {
         let amount = lot.amount - lot.reversed - lot.held - lot.paid;
@@ -371,25 +368,14 @@ fn resolve_dispute_tx(
     if changed != 1 {
         return Err(AppError::Conflict("service dispute version changed".into()));
     }
-    let other_holds: i64 = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM market_finance_reconciliation_cases
-              WHERE object_kind = 'platform_contract' AND object_id = ?1 AND status = 'open')",
-            params![dispute.contract_id],
-            |row| row.get(0),
-        )
-        .map_err(db_error("check other service finance holds"))?;
-    if other_holds == 0 {
-        conn.execute(
-            "UPDATE market_provider_earning_lots SET disputed = 0
-             WHERE id IN (
-               SELECT earning_lot_id FROM market_service_dispute_lots
-               WHERE dispute_id = ?1
-             ) AND disputed = 1",
-            params![dispute_id],
-        )
-        .map_err(db_error("release resolved Provider earning dispute"))?;
-    }
+    crate::market_finance::release_earning_holds_tx(
+        conn,
+        "dispute",
+        dispute_id,
+        owner,
+        resolution,
+        time,
+    )?;
     conn.execute(
         "INSERT INTO market_finance_audit_events
             (id, actor_user_id, action, object_kind, object_id, reason_code, created_at)
@@ -440,6 +426,8 @@ pub fn router() -> Router<ServerState> {
         )
 }
 
+const OWNER_DISPUTE_REFUND_MINOR: i64 = 5_000;
+
 async fn open_dispute(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -451,7 +439,17 @@ async fn open_dispute(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin service dispute"))?;
-    let result = open_dispute_tx(&tx, &id, &session.user_id, &request.reason_code, &now())?;
+    let time = now();
+    let result = open_dispute_tx(&tx, &id, &session.user_id, &request.reason_code, &time)?;
+    crate::market_notifications::owner_signal_tx(
+        &tx,
+        "dispute_opened",
+        "service_dispute",
+        &result.id,
+        serde_json::json!({ "contractId": result.contract_id, "reason": result.reason_code }),
+        &time,
+        false,
+    )?;
     tx.commit().map_err(db_error("commit service dispute"))?;
     Ok((no_store(), Json(result)))
 }
@@ -511,6 +509,14 @@ async fn resolve_dispute(
     Json(request): Json<ResolveRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let session = crate::api::require_admin_session(&state, &headers).await?;
+    // Admins handle routine disputes; larger refunds move Owner money.
+    if request.refund_amount_minor > OWNER_DISPUTE_REFUND_MINOR
+        && !crate::api::is_finance_owner(&state.config, &session.email)
+    {
+        return Err(AppError::Forbidden(
+            "refunds above $50 require the Router owner".into(),
+        ));
+    }
     let units = if request.refund_amount_minor == 0 {
         0
     } else {
@@ -527,6 +533,21 @@ async fn resolve_dispute(
         request.expected_version,
         &request.resolution_code,
         units,
+        &now(),
+    )?;
+    crate::market_notifications::enqueue_user_notification_tx(
+        &tx,
+        "buyer",
+        &result.buyer_user_id,
+        "dispute_resolved",
+        "service_dispute",
+        &result.id,
+        &format!("dispute_resolved:{}", result.id),
+        serde_json::json!({
+            "contractId": result.contract_id,
+            "status": result.resolution_code,
+            "amountMinor": request.refund_amount_minor,
+        }),
         &now(),
     )?;
     tx.commit()
@@ -849,12 +870,11 @@ mod tests {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .unwrap();
-        tx.execute(
-            "UPDATE market_provider_earning_lots SET disputed = 1
-             WHERE delivery_slice_id IN (
-                 SELECT id FROM market_delivery_slices WHERE contract_id = ?1
-             )",
-            params![contract_id],
+        crate::market_finance::hold_contract_earnings_tx(
+            &tx,
+            &contract_id,
+            "cleanup_uncertain",
+            "2026-10-02T00:00:00+00:00",
         )
         .unwrap();
         tx.execute(
@@ -873,6 +893,7 @@ mod tests {
             "2026-10-02T00:00:00+00:00",
         )
         .unwrap();
+        // The already-held lot is registered too: holds stack.
         let owned_lots: i64 = tx
             .query_row(
                 "SELECT COUNT(*) FROM market_service_dispute_lots WHERE dispute_id = ?1",
@@ -880,7 +901,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(owned_lots, 0);
+        assert_eq!(owned_lots, 1);
         resolve_dispute_tx(
             &tx,
             &dispute.id,
@@ -898,7 +919,25 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(held, 1);
+        assert_eq!(held, 1, "the cleanup hold outlives the dispute");
+        // Closing the cleanup case releases the last hold.
+        crate::market_reconcile::resolve_case_tx(
+            &tx,
+            "case",
+            "owner",
+            "cleanup_verified",
+            "2026-10-03T00:00:00+00:00",
+        )
+        .unwrap();
+        let held: i64 = tx
+            .query_row(
+                "SELECT disputed FROM market_provider_earning_lots",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(held, 0, "earnings are no longer frozen forever");
         tx.commit().unwrap();
     }
+
 }

@@ -1,8 +1,8 @@
 # Market 平台钱包与 DujiaoPay 落地实施文档
 
-> 状态：代码接线完成，待真实商户影子验收和生产切换。依据 Router `60cdcc0`、参考项目 `dujiao-next` `41b86260` 的代码审阅；若上游协议或 Router 代码变化，先更新契约测试和本文，再改资金路径。
+> 状态：代码接线完成，待真实商户影子验收和生产切换。DujiaoPay 契约依据官网 `/docs`（2026-10 提取）与参考项目 `dujiao-next` `41b86260`；若上游协议或 Router 代码变化，先更新契约测试和本文，再改资金路径。2026-10 增强（迁移 `0069`–`0074`）见 §14。
 
-当前实现进度：迁移 `0053`–`0062`，USD 整数复式账本、钱包冻结／捕获、DujiaoPay 签名回调与认证查单、充值补偿、七天收入成熟、线下提现／余额退款和 Owner 审批已接线。Share／Client 钱包合同具备试用、按秒批次、固定日历月履约、续费、暂停、确认清理后释放及服务争议退款；同一买家的到期服务优先于新单取款。旧财务写 API 在钱包模式返回 410，买家与 Provider 页面分别提供全站钱包及收入／提现入口。旧付费商品和报价保留原资金轨道，不能随模式切换自动升格；Provider 须明确重新发布。**生产支付尚未开放**：代码接线标志已打开，但必须经 Owner API 在旧义务与严重对账 case 清零、当前签名渠道完成真实入账验收后，才能写入 `cutover_approved_at` 并切换 `enabled`。验收查询只计入同时具有链上回执、已封口 journal 和对应钱包入账的 `credited` 订单；孤立的状态字段不能通过。仅手工改数据库 `mode` 不会开放新购买或普通用户充值。真实 USD 商户建单、签名回调、查单、链上回执和钱包入账尚无受控联调收据；本地 fixture 不能替代该验收。
+当前实现进度：迁移 `0053`–`0074`，USD 整数复式账本、钱包冻结／捕获、DujiaoPay 签名回调与认证查单、充值补偿、七天收入成熟、线下提现／余额退款和 Owner 审批已接线。Share／Client 钱包合同具备试用、按秒批次、固定日历月履约、续费、暂停、确认清理后释放及服务争议退款；同一买家的到期服务优先于新单取款。旧财务写 API 在钱包模式返回 410，买家与 Provider 页面分别提供全站钱包及收入／提现入口。旧付费商品和报价保留原资金轨道，不能随模式切换自动升格；Provider 须明确重新发布。**生产支付尚未开放**：代码接线标志已打开，但必须经 Owner API 在旧义务与严重对账 case 清零、当前签名渠道完成真实入账验收后，才能写入 `cutover_approved_at` 并切换 `enabled`。验收查询只计入同时具有链上回执、已封口 journal 和对应钱包入账的 `credited` 订单；孤立的状态字段不能通过。仅手工改数据库 `mode` 不会开放新购买或普通用户充值。真实 USD 商户建单、签名回调、查单、链上回执和钱包入账尚无受控联调收据；本地 fixture 不能替代该验收。
 
 > 2026-10 配置修订：迁移 `0056` 提供固定 DujiaoPay 回调 URL 和持久化查单时间表；迁移 `0057` 增加渠道版本锁、归档与密钥轮换状态；迁移 `0062` 将 Owner 的生产切换批准与模式字符串分开。DujiaoPay 官方控制台创建 Webhook 后会生成只展示一次的签名密钥；签名模式为默认，`poll_only` 是显式降级。代码集成不代表真实商户联调通过。
 
@@ -108,7 +108,7 @@ Settings 的 Marketplace 分类提供独立「充值渠道」面板及专用 Own
 
 Owner 若确需把既有签名渠道改为仅查单，须使用更换回调密钥 API 显式提交 `webhookMode: "poll_only"`；只省略 Secret 会被拒绝。恢复签名模式须提供新 Secret 和 `webhookMode: "signed"`。签名验签使用同一商户渠道的当前回调密钥，不依赖旧订单的 API revision；普通轮换可短暂接受前一个签名密钥 10 分钟，紧急轮换立即撤销。降级 `poll_only` 后，固定及旧带渠道 ID 的回调都只能唤醒认证查单。归档只停新单，不删除渠道或订单；归档也立即撤销上一回调密钥的过渡期，旧订单仍由当前签名密钥或认证查单处理。恢复后仍保持停用，并须通过 Owner 的 `verify` API 重新验证现有商户 API，或轮换为同商户的新密钥，才能再次启用。归档／恢复也清除旧回调验证状态，新的签名回调需重新证明。固定地址可接受不含订单号的商户后台测试通知，但不会将其视为支付证据或签名验证通过。
 
-影子模式允许 Owner 为验收暂时开启已验证 API 的渠道；一旦全局财务模式为 `enabled`，停用渠道重新启用还必须有当前 revision 的签名回调验证和真实核验入账。密钥轮换后若缺少这些证据，应先回到影子模式完成受控充值验收，不得绕过验收直接恢复生产接单。
+渠道启用采用试运行（canary）：启用后当前 revision 进入 `canary`，只有 Router Owner 能用它充值，普通买家看不到；当前 revision 首笔严格验真入账（生产模式下还需当前 revision 的签名回调已验证，可由商户后台的 `webhook.test` 签名事件证明）在同一事务内自动把渠道转为 `live` 并告警 Owner。轮换、整体替换、归档恢复后渠道回到 `off`，重新启用即重新试运行。此前「先回影子模式」的说法已作废：切换批准后模式不可回退，试运行就是生产中的受控验收路径。
 
 ### 5.2 充值状态机
 
@@ -243,3 +243,62 @@ Owner 收到的是 DujiaoPay 商户实际入金资产，Router 给出的却是 U
 3. 切到 `shadow`，仅由 Owner 以受控最小 USD 金额完成一次真实支付，保留脱敏订单号、官方查单状态、签名回调时间、链上回执和 journal 对账结果。另验证重复／迟到 Webhook、查单短暂失败和回跳不会重复入账。不能把 fixture、测试通知或浏览器成功页计作真实收款。
 4. 在旧路径清结并撤下所有付费旧商品和活动报价，核对旧合同、余额、hold、欠款、退款、争议、待确认充值均为零。保持 `shadow` 且 `readiness.canEnable` 为真时，Owner 才可通过 API 切到 `enabled`；不能从 `disabled` 跳过影子验收。之后 Provider 按钱包规则逐项重新发布付费 Share seat 与 Client Host。
 5. 小范围验收充值→报价→冻结→开通→履约→争议／退款、资金不足暂停、七天后提现申请→Owner 线下转账登记。每一步对比钱包、未履约、Provider 待解锁／可提现／提现中与 journal 零和。发现严重不变量或网关身份异常，使用 Owner 暂停开关立即停新钱包单与新提现，必要时关闭渠道停止新充值；继续收取并核对已发生支付的回调，已有合同照常履行。已有真实入账时只能向前修复，不能回滚旧二进制。
+
+## 14. 2026-10 钱包增强（迁移 0069–0074）
+
+本节记录在影子验收前补齐的正确性与运营能力。所有迁移只追加列、表、触发器和回填，不重建已有表；新增语义用"现有状态 + 原因列"表达。
+
+### 14.1 充值状态机（0069）
+
+- 停止付款与发起取消不再清空 `checkout_url`。站内是否展示付款入口由 `buyer_abandoned_at`、新列 `cancel_requested_at` 与未结核对单决定；"pending 且无收银台链接（或直付地址）"重新只表示建单结果不明。迁移把此前因此误写成 `create_unknown` 的已绑定订单改回 `pending`，取消和 30 分钟自动关闭对已停止订单恢复有效。
+- 首次建单请求体冻结在 `create_request_body`，重试与幂等重放逐字节相同，不受 `tunnel_domain` 变化影响；新请求附带不含邮箱的 `metadata`。
+- DujiaoPay 错误按官方 `error.code` 分类（`DUJIAOPAY_*` 码，含 `request_id`）。限流与无容量退避重试；`auth.request_unauthorized` 让渠道立即 `off`、开 case 并告警；同一冻结请求两次被校验拒绝且订单列表在建单窗口内查无此商户单号时，订单以 `cancelled` + `local_close_reason = never_created` 结案并释放待付额度；幂等冲突时按商户单号在订单列表中找回并绑定。
+- 已停止订单或已关闭渠道上的未知建单，若本次重放才首次绑定网关订单且其仍为 `pending`，立即执行一次网关取消，不留下买家从未见过的可付订单。
+- Webhook 改为验签、落库、绑定、排队后立即返回 2xx，查单由对账循环异步完成（`Notify` 唤醒）。认证查单完成后回写此前 `pending` 的事件为 `processed_by = reconcile`，不再永久阻断恢复和付款。未知订单与测试事件一律 200；DujiaoPay 回调限流放宽到每 IP 每分钟 600 次。
+- `new_topups_paused` 独立暂停新充值，影子模式也可用。
+
+### 14.2 入账二次校验与站内直付（0069、0070）
+
+- 订单保存建单、`order.method_selected` 和查单返回的 `gateway_chain/gateway_token_id/pay_address/payable_amount/fx_rate/gateway_expires_at`。
+- 入账前除既有身份与回执校验外还要求：`paid_source = chain`；`token_id` 属于该订单冻结的允许方式（直付订单为固定 token）且与链一致；确认数不低于官方各链最低确认数（`src/market_payments/chains.rs`）；`settled_amount` 不少于锁定的 `payable_amount`（仅 USDT/USDC/USDT0 等美元稳定币上，恰等于法币面额时视为网关以法币口径报告；TRX/ETH/BNB 不适用）。不在内置链表中的 `token_id` 无法校验链与确认数，一律进入 `paid_method_not_allowed` 核对。失败分别进入 `paid_method_not_allowed`、`paid_confirmations_low`、`paid_amount_short`、`paid_source_manual` 核对单。`settled_amount` 的确切口径须以真实商户 fixture 锁定。
+- 渠道 `order_mode = direct` 时买家选择 token，建单固定链与币；`GET /v1/market-wallet/topups/:id/payment-instructions` 每单每 5 秒最多一次认证查单，只在可付时返回地址与精确金额，站内展示二维码、倒计时与确认进度。
+
+### 14.3 渠道试运行、设置与主密钥（0070）
+
+- `rollout_state`（off/canary/live）见 §5.1；`enabled` 由触发器保持为兼容投影。readiness 的 `channel_no_current_live_topup` 改为 `channel_none_live`。
+- `market_payment_channel_settings` 保存托管/直付模式、允许方式、单渠道金额上下限和手续费模型；修改不产生新凭据 revision、不重新试运行。允许方式以渠道设置为唯一来源：整体替换产生的新 revision 复制当前设置，请求里的 `allowedMethods` 只在新建渠道时作为初值。手续费只用于 Owner 总览的成本估算。整体替换不再允许把签名渠道降为仅查单。
+- 主密钥支持版本环 `CC_SWITCH_ROUTER_MARKET_PAYMENT_MASTER_KEYS="2:<key>,1:<key>"`；`POST /v1/admin/market-payment-channels/rewrap` 用最新版本重新加密所有 revision。库中已有支付凭据而主密钥缺失时进程拒绝启动，不再静默生成新密钥；启动自检把无法解密的渠道置 `off` 并告警。
+- 每日（近 7 天）与每周（全量）以 `GET /v1/orders?status=paid` 扫描各商户，已付未入账的本地单立即排队查单，Router 形状却无本地单的已付订单开 `gateway_orphan_paid_order` 并告警（`market_gateway_sweeps` 可断点续扫）。若已付网关单对应的本地单已按 `never_created` 结案，扫描绑定网关单号、清除结案原因，按迟到付款正常入账，并开 `topup_never_created_contradicted` 告警。扫描在独立任务中运行，不阻塞充值对账与 Webhook 唤醒。订单列表缺少 `total` 或含无法解析的条目时，不能作为"查无此单"的证明。
+
+### 14.4 通知与告警（0071）
+
+- 买家/Provider 通知写入 `market_notification_outbox`，与资金变动同事务；投递渠道为邮件与已绑定的 Telegram（Bark 未接入，见 §14.8），同时作为站内通知列表。安全与服务状态类不可关闭，其余可按类型关闭。
+- Owner 告警复用 `operator_alert_signal_outbox`，覆盖严重对账、审计不一致、密钥无法解密、渠道认证失败、连续 5 次查单失败、待核对超 24 小时、身份冲突、孤儿已付单、外部退款、渠道转正，以及新提现/退款/争议。
+
+### 14.5 收入冻结与分域冻结（0072）
+
+- `market_provider_earning_holds` 记录每个冻结的原因（dispute、cleanup_uncertain、service_missing、manual、legacy_unknown）；`disputed` 成为"存在未释放冻结"的派生投影。冻结可叠加，只有全部原因释放后收入才可提现。清理不确定、服务缺失的 case 结案会释放其冻结；迁移把原因不明的历史冻结记为 `legacy_unknown` 并按 Provider 开 `earning_hold_legacy`，由 Owner 显式释放。
+- 严重 case 只冻结其范围：`journal_unsealed` 全局；钱包投影/入账证据冻结该用户；Provider 负债冻结该 Provider；期间未履约冻结该合同；外部付款证据冻结全部提现与退款。受冻结的合同被暂停服务而不是继续免费运行，解除后自动恢复。
+
+### 14.6 Owner 资金操作与角色（0073）
+
+- Owner 定义为 `CC_SWITCH_ROUTER_OWNER_EMAIL`（未配置时为隧道域名默认管理员）。财务模式、暂停、渠道凭据与试运行、渠道设置、主密钥重加密、手动认领入账、外部退款冲正、收入冻结的放置与释放、严重 case 结案、提现与退款的标记已付只允许 Owner；其他管理员可查看、审批、处置非严重 case 和 50 美元以内的争议退款。
+- `manual-credit`：网关报告已付但来源为商户认领/人工时，Owner 登记转账哈希后入账；回执进入同一唯一索引，journal 动作为 `credit_manual`，不计入渠道转正或切换验收证据。
+- `reverse`：商户在 DujiaoPay 登记退款后，按金额从买家可用余额冲正，不足部分记 `owner_loss`。两者都先 dry-run 预览，每单各至多一次；冲正提交必须带回预览的 `expectedShortfallMinor`，余额在预览后变化则返回 409，且只作用于未结的 `external_refund_recorded` case。
+
+### 14.7 提现、退款与合同生命周期（0074）
+
+- 标记已付必须由 Owner 手填转账时间、实际到账额与可选网络费，与申请额不一致须填差异原因；审批人与打款人相同会写入审计。单笔提现上限 5,000 美元，同时最多 3 笔未结。Provider/买家可撤回尚未审批的提现/退款。
+- 修改提现地址需邮件一次性验证码（15 分钟、5 次尝试），完成后通知；24 小时冷静期保留。
+- 余额退款只在钱包启用后开放，且不得超过"可用余额 − 已到期服务义务"。
+- 暂停合同在第 5 天提醒、默认第 7 天（`CC_SWITCH_ROUTER_MARKET_SUSPENDED_TERMINATE_DAYS`）进入清理终止；因分域冻结暂停的（`suspension_cause = finance_hold`）不计时，冻结解除后从解除时刻重新计时；迁移时已暂停的合同从迁移时刻开始计时，保证都能收到提醒。暂停中的合同可以关闭自动续费。每小时提醒 72/24 小时内余额不足的自动续费和不足一天的按秒预算。
+- 收入解锁改为单事务逐笔 savepoint，单批 200 笔。解锁失败的批次加 `manual` 冻结并开 `earning_unlock_failed` case、告警 Owner，不再停在队首阻塞其余收入；case 结案或手动释放后重新参与解锁。
+
+### 14.8 已知未实现
+
+- 争议退款超过 Provider 可退收入时的 Provider 追偿单与 `owner_loss` 垫付；目前上限仍为可退收入。
+- 冻结 `expires_at` 清理（当前没有调用方设置过期时间）。
+- 钱包通知的 Bark 投递。
+- 收入批次按自然日合并（规模触发条件：按秒合同超过约 200 个）。
+- 真实商户验收（§13）仍未进行；§13 第 3 步应同时覆盖：`webhook.test` 证明回调、canary 首单自动转正、直付二维码支付、少付/多付经商户认领后的 `manual-credit`、后台登记退款后的 `reverse`、每日扫描发现人为制造的孤儿已付单，以及 `rewrap` 后旧密钥下线。
+

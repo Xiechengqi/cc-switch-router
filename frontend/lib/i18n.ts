@@ -4,6 +4,9 @@ import {
   settingsMessagesEn,
   settingsMessagesZh,
 } from "@/lib/settings-messages";
+import { marketWalletMessagesEn, marketWalletMessagesZh } from "@/lib/market-wallet-messages";
+import { marketCheckoutMessagesEn, marketCheckoutMessagesZh } from "@/lib/market-checkout-messages";
+import { marketOwnerMessagesEn, marketOwnerMessagesZh } from "@/lib/market-owner-messages";
 
 export const LOCALE_STORAGE_KEY = "cc_switch_router_locale_v1";
 export const SUPPORTED_LOCALES = ["en", "zh-CN"] as const;
@@ -1984,6 +1987,7 @@ export const messages = {
     "marketWallet.title": "Platform wallet",
     "marketWallet.subtitle": "One balance for Share Market and Client Market.",
     "marketWallet.displayOnly": "Display estimate · actual balance {amount} USD",
+    "marketWallet.committed": "Due to running services",
     "marketWallet.notOpen": "Platform deposits are not open yet. Current rentals still use provider-specific balances and credit.",
     "marketWallet.legacyBilling": "View current Market billing",
     "marketWallet.topupUnavailable": "Top-ups are temporarily unavailable. Existing wallet funds and transactions remain visible.",
@@ -4279,6 +4283,9 @@ export const messages = {
     "providers.marketFilter.client": "Showing hosts from the selected Provider.",
     "providers.marketFilter.clear": "Clear Provider",
     ...settingsMessagesEn,
+    ...marketWalletMessagesEn,
+    ...marketCheckoutMessagesEn,
+    ...marketOwnerMessagesEn,
   },
   "zh-CN": {
     "common.language": "语言",
@@ -6195,6 +6202,7 @@ export const messages = {
     "marketWallet.title": "平台钱包",
     "marketWallet.subtitle": "Share Market 和 Client Market 共用一份余额。",
     "marketWallet.displayOnly": "仅为显示估算 · 实际余额为 {amount} 美元",
+    "marketWallet.committed": "已到期待扣（运行中服务）",
     "marketWallet.notOpen": "平台充值暂未开放。当前租用仍使用供应商预存与授信。",
     "marketWallet.legacyBilling": "查看当前市场账务",
     "marketWallet.topupUnavailable": "充值暂不可用，已有钱包余额和交易记录仍可查看。",
@@ -8425,6 +8433,9 @@ export const messages = {
     "providers.marketFilter.client": "仅显示所选 Provider 的 Host。",
     "providers.marketFilter.clear": "清除 Provider",
     ...settingsMessagesZh,
+    ...marketWalletMessagesZh,
+    ...marketCheckoutMessagesZh,
+    ...marketOwnerMessagesZh,
   },
 } as const;
 

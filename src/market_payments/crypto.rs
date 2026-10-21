@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -12,50 +13,110 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::error::AppError;
 
 const KEY_FILE: &str = "market-payment-master-key";
+const KEY_RING_ENV: &str = "CC_SWITCH_ROUTER_MARKET_PAYMENT_MASTER_KEYS";
+const SINGLE_KEY_ENV: &str = "CC_SWITCH_ROUTER_MARKET_PAYMENT_MASTER_KEY";
 const NONCE_LEN: usize = 24;
 
+/// Versioned master keys. New secrets are sealed with the highest version;
+/// each stored secret is opened with the version recorded beside it, so a
+/// key can be rotated by adding a version, re-wrapping, then retiring the old
+/// one.
 #[derive(Clone)]
 pub(super) struct PaymentCipher {
-    key: Arc<Zeroizing<[u8; 32]>>,
+    keys: Arc<BTreeMap<i64, Zeroizing<[u8; 32]>>>,
     pub(super) version: i64,
 }
 
 impl PaymentCipher {
-    pub(super) fn load(data_dir: &Path) -> Result<Self> {
-        let key =
-            if let Ok(configured) = std::env::var("CC_SWITCH_ROUTER_MARKET_PAYMENT_MASTER_KEY") {
-                parse_key(&configured).context("invalid market payment master key override")?
+    /// Load the key ring.
+    ///
+    /// * `CC_SWITCH_ROUTER_MARKET_PAYMENT_MASTER_KEYS="2:<key>,1:<key>"`
+    ///   provides explicit versions.
+    /// * Otherwise version 1 comes from `..._MASTER_KEY` or the data-dir key
+    ///   file. The file is generated only when no credentials exist yet;
+    ///   regenerating it under existing secrets would silently orphan them.
+    pub(super) fn load(data_dir: &Path, secrets_exist: bool) -> Result<Self> {
+        let mut keys = BTreeMap::new();
+        if let Ok(ring) = std::env::var(KEY_RING_ENV) {
+            for entry in ring.split(',').map(str::trim).filter(|entry| !entry.is_empty()) {
+                let (version, key) = entry
+                    .split_once(':')
+                    .context("master key ring entries must be <version>:<key>")?;
+                let version = version
+                    .trim()
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|version| *version > 0)
+                    .context("master key version must be a positive integer")?;
+                if keys.insert(version, parse_key(key)?).is_some() {
+                    bail!("duplicate market payment master key version {version}");
+                }
+            }
+        }
+        if !keys.contains_key(&1) {
+            if let Ok(configured) = std::env::var(SINGLE_KEY_ENV) {
+                keys.insert(
+                    1,
+                    parse_key(&configured).context("invalid market payment master key override")?,
+                );
             } else {
                 let path = data_dir.join(KEY_FILE);
-                if !path.exists() {
+                if path.exists() {
+                    crate::secure_file::enforce_file_mode(&path, 0o600).with_context(|| {
+                        format!("protect market payment key: {}", path.display())
+                    })?;
+                    let encoded = Zeroizing::new(
+                        fs::read_to_string(&path).context("read market payment key")?,
+                    );
+                    keys.insert(1, parse_key(&encoded).context("invalid market payment key file")?);
+                } else if keys.is_empty() {
+                    if secrets_exist {
+                        bail!(
+                            "market payment master key {} is missing but payment credentials exist; \
+                             restore the key file or set {SINGLE_KEY_ENV}",
+                            path.display()
+                        );
+                    }
                     let mut generated = Zeroizing::new([0_u8; 32]);
                     rand::rngs::OsRng.fill_bytes(generated.as_mut());
                     let encoded = Zeroizing::new(format!("{}\n", hex::encode(generated.as_ref())));
                     crate::secure_file::atomic_create_file_mode(&path, encoded.as_bytes(), 0o600)
                         .with_context(|| format!("create market payment key: {}", path.display()))?;
+                    keys.insert(1, generated);
                 }
-                crate::secure_file::enforce_file_mode(&path, 0o600)
-                    .with_context(|| format!("protect market payment key: {}", path.display()))?;
-                let encoded =
-                    Zeroizing::new(fs::read_to_string(&path).context("read market payment key")?);
-                parse_key(&encoded).context("invalid market payment key file")?
-            };
+            }
+        }
+        let version = *keys.keys().next_back().context("no market payment master key")?;
         Ok(Self {
-            key: Arc::new(key),
-            version: 1,
+            keys: Arc::new(keys),
+            version,
         })
     }
 
     #[cfg(test)]
     pub(super) fn for_test() -> Self {
+        Self::for_test_ring(&[(1, 23)])
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test_ring(entries: &[(i64, u8)]) -> Self {
+        let keys = entries
+            .iter()
+            .map(|(version, byte)| (*version, Zeroizing::new([*byte; 32])))
+            .collect::<BTreeMap<_, _>>();
+        let version = *keys.keys().next_back().unwrap();
         Self {
-            key: Arc::new(Zeroizing::new([23_u8; 32])),
-            version: 1,
+            keys: Arc::new(keys),
+            version,
         }
     }
 
     pub(super) fn seal(&self, secret: &str, aad: &str) -> Result<(String, String), AppError> {
-        let cipher = XChaCha20Poly1305::new((&**self.key).into());
+        let key = self
+            .keys
+            .get(&self.version)
+            .ok_or_else(|| AppError::Internal("market payment key unavailable".into()))?;
+        let cipher = XChaCha20Poly1305::new((&**key).into());
         let mut nonce = [0_u8; NONCE_LEN];
         rand::rngs::OsRng.fill_bytes(&mut nonce);
         let ciphertext = cipher
@@ -78,11 +139,9 @@ impl PaymentCipher {
         aad: &str,
         key_version: i64,
     ) -> Result<Zeroizing<String>, AppError> {
-        if key_version != self.version {
-            return Err(AppError::Internal(
-                "market payment key version unavailable".into(),
-            ));
-        }
+        let key = self.keys.get(&key_version).ok_or_else(|| {
+            AppError::Internal("market payment key version unavailable".into())
+        })?;
         let encoder = base64::engine::general_purpose::URL_SAFE_NO_PAD;
         let encrypted = encoder
             .decode(ciphertext)
@@ -95,7 +154,7 @@ impl PaymentCipher {
                 "invalid market payment nonce length".into(),
             ));
         }
-        let cipher = XChaCha20Poly1305::new((&**self.key).into());
+        let cipher = XChaCha20Poly1305::new((&**key).into());
         let mut plaintext = cipher
             .decrypt(
                 XNonce::from_slice(&nonce),
@@ -182,5 +241,37 @@ mod tests {
                 .is_err()
         );
         assert!(cipher.open(&ciphertext, &nonce, &context, 2).is_err());
+    }
+
+    #[test]
+    fn key_ring_opens_old_versions_and_seals_with_the_newest() {
+        let old = PaymentCipher::for_test_ring(&[(1, 7)]);
+        let ring = PaymentCipher::for_test_ring(&[(1, 7), (2, 9)]);
+        assert_eq!(ring.version, 2);
+        let context = aad("channel", 1, "merchant", "api");
+        let (ciphertext, nonce) = old.seal("secret", &context).unwrap();
+        assert_eq!(ring.open(&ciphertext, &nonce, &context, 1).unwrap().as_str(), "secret");
+        let (resealed, renonce) = ring.seal("secret", &context).unwrap();
+        assert!(old.open(&resealed, &renonce, &context, 2).is_err());
+        assert_eq!(ring.open(&resealed, &renonce, &context, 2).unwrap().as_str(), "secret");
+    }
+
+    #[test]
+    fn missing_key_file_is_never_regenerated_under_existing_secrets() {
+        let dir = std::env::temp_dir().join(format!("ccr-key-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Environment overrides would make this test non-deterministic.
+        if std::env::var(KEY_RING_ENV).is_ok() || std::env::var(SINGLE_KEY_ENV).is_ok() {
+            return;
+        }
+        assert!(PaymentCipher::load(&dir, true).is_err());
+        assert!(!dir.join(KEY_FILE).exists());
+        let created = PaymentCipher::load(&dir, false).unwrap();
+        assert_eq!(created.version, 1);
+        let reloaded = PaymentCipher::load(&dir, true).unwrap();
+        let context = aad("c", 1, "m", "api");
+        let (ciphertext, nonce) = created.seal("s", &context).unwrap();
+        assert_eq!(reloaded.open(&ciphertext, &nonce, &context, 1).unwrap().as_str(), "s");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
