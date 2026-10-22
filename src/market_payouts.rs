@@ -423,6 +423,11 @@ fn create_payout_tx(
         if remaining == 0 {
             break;
         }
+        if !crate::market_commission::lot_evidence_valid_tx(conn, &lot_id)? {
+            return Err(AppError::Conflict(
+                "service commission evidence requires Owner review before withdrawal".into(),
+            ));
+        }
         let allocated = remaining.min(available);
         let changed = conn
             .execute(
@@ -547,6 +552,20 @@ fn transition_payout_tx(
             return Err(AppError::Conflict(
                 "withdrawal contains disputed Provider earnings".into(),
             ));
+        }
+        let allocated_lots = conn
+            .prepare("SELECT earning_lot_id FROM market_payout_allocations WHERE request_id = ?1")
+            .map_err(db_error("prepare withdrawal commission recheck"))?
+            .query_map(params![request_id], |r| r.get::<_, String>(0))
+            .map_err(db_error("query withdrawal commission recheck"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_error("read withdrawal commission recheck"))?;
+        for lot in allocated_lots {
+            if !crate::market_commission::lot_evidence_valid_tx(conn, &lot)? {
+                return Err(AppError::Conflict(
+                    "service commission evidence requires Owner review before transfer".into(),
+                ));
+            }
         }
     }
     let target = match (status.as_str(), action) {
@@ -1215,6 +1234,14 @@ struct EarningView {
     #[serde(serialize_with = "serialize_units")]
     amount_units: i64,
     #[serde(serialize_with = "serialize_units")]
+    gross_units: i64,
+    #[serde(serialize_with = "serialize_units")]
+    commission_units: i64,
+    #[serde(serialize_with = "serialize_units")]
+    commission_reversed_units: i64,
+    commission_rate_bps: i64,
+    commission_policy_version: i64,
+    #[serde(serialize_with = "serialize_units")]
     reversed_units: i64,
     #[serde(serialize_with = "serialize_units")]
     unlocked_units: i64,
@@ -1247,8 +1274,13 @@ fn list_earnings_tx(
         .transpose()?;
     let mut statement = conn
         .prepare(
-            "SELECT id, amount_units, reversed_units, unlocked_units, held_units, paid_units,
-                    fulfilled_at, unlock_at, disputed, created_at
+            "SELECT id, net_amount_units, reversed_units, unlocked_units, held_units, paid_units,
+                    fulfilled_at, unlock_at, disputed, created_at, amount_units,
+                    commission_units, commission_reversed_units,
+                    COALESCE((SELECT p.rate_bps FROM market_commission_splits s
+                      JOIN market_commission_periods p ON p.id = s.period_id WHERE s.lot_id = market_provider_earning_lots.id), 0),
+                    COALESCE((SELECT p.policy_version FROM market_commission_splits s
+                      JOIN market_commission_periods p ON p.id = s.period_id WHERE s.lot_id = market_provider_earning_lots.id), 0)
              FROM market_provider_earning_lots WHERE provider_user_id = ?1
                AND (?2 IS NULL OR created_at < ?2 OR (created_at = ?2 AND id < ?3))
              ORDER BY created_at DESC, id DESC LIMIT 51",
@@ -1259,6 +1291,11 @@ fn list_earnings_tx(
             Ok(EarningView {
                 id: row.get(0)?,
                 amount_units: row.get(1)?,
+                gross_units: row.get(10)?,
+                commission_units: row.get(11)?,
+                commission_reversed_units: row.get(12)?,
+                commission_rate_bps: row.get(13)?,
+                commission_policy_version: row.get(14)?,
                 reversed_units: row.get(2)?,
                 unlocked_units: row.get(3)?,
                 held_units: row.get(4)?,
@@ -2178,6 +2215,146 @@ mod tests {
         .unwrap();
         assert!(require_payout_setup_tx(&tx, "provider", start).is_err());
         require_payout_setup_tx(&tx, "provider", "2026-09-02T00:00:00+00:00").unwrap();
+    }
+
+    #[test]
+    fn commission_is_not_charged_again_on_withdrawal_and_paid_net_is_not_clawed_back() {
+        use crate::market_platform_contracts::{BillingModel, PrepareContract};
+        let conn = Connection::open_in_memory().unwrap();
+        crate::schema::apply(&conn).unwrap();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let start = "2026-08-01T00:00:00+00:00";
+        let end = "2026-09-01T00:00:00+00:00";
+        let mature = "2026-09-09T00:00:00+00:00";
+        tx.execute("UPDATE market_finance_control SET mode = 'enabled', cutover_approved_at = ?1 WHERE id = 1", params![start]).unwrap();
+        tx.execute(
+            "INSERT INTO users (id, email_normalized, created_at, last_login_at)
+            VALUES ('provider', 'provider@example.com', ?1, ?1)",
+            params![start],
+        )
+        .unwrap();
+        tx.execute("INSERT INTO market_provider_profiles
+            (id, canonical_email, user_id, display_name, claim_state, status, created_at, updated_at)
+            VALUES ('mp_commission', 'provider@example.com', 'provider', 'Provider', 'claimed', 'active', ?1, ?1)", params![start]).unwrap();
+        credit_verified_topup_tx(&tx, "buyer", "commission-order", 10_000, "receipt", start)
+            .unwrap();
+        crate::market_commission::freeze_quote_tx(&tx, "commission-quote", "provider", start)
+            .unwrap();
+        let contract = crate::market_platform_contracts::prepare_contract_tx(
+            &tx,
+            &PrepareContract {
+                product_kind: "share",
+                product_ref: "product",
+                trial_scope_ref: "service",
+                quote_id: "commission-quote",
+                buyer_user_id: "buyer",
+                provider_user_id: "provider",
+                offer_revision: 1,
+                billing_model: BillingModel::CalendarMonth,
+                price_minor: 10_000,
+                auto_renew: false,
+                trial_seconds: 0,
+            },
+            start,
+        )
+        .unwrap();
+        crate::market_platform_contracts::activate_contract_tx(&tx, &contract, start, start)
+            .unwrap();
+        crate::market_platform_contracts::settle_monthly_segment_tx(
+            &tx, &contract, "delivery", start, end, true, end,
+        )
+        .unwrap();
+        save_destination_tx(
+            &tx,
+            "provider",
+            &DestinationRequest {
+                network: "tron".into(),
+                address: valid_address(),
+                confirmation: "CHANGE_WITHDRAWAL_ADDRESS".into(),
+            },
+            start,
+        )
+        .unwrap();
+        unlock_due_earnings_tx(&tx, mature, 20).unwrap();
+        assert_eq!(
+            provider_summary_tx(&tx, "provider")
+                .unwrap()
+                .withdrawable_units,
+            9000 * 86_400
+        );
+        assert!(create_payout_tx(&tx, "provider", 10_000, "too-much", mature).is_err());
+        let request = create_payout_tx(&tx, "provider", 9000, "net-only", mature).unwrap();
+        let dispute = crate::market_service_disputes::open_dispute_tx(
+            &tx,
+            &contract,
+            "buyer",
+            "service_quality",
+            mature,
+        )
+        .unwrap();
+        assert_eq!(dispute.refundable_units, 0);
+        assert!(
+            crate::market_service_disputes::resolve_dispute_tx(
+                &tx,
+                &dispute.id,
+                "owner",
+                1,
+                "full_refund",
+                10_000 * 86_400,
+                mature
+            )
+            .is_err()
+        );
+        crate::market_service_disputes::resolve_dispute_tx(
+            &tx,
+            &dispute.id,
+            "owner",
+            1,
+            "paid_net_reviewed",
+            0,
+            mature,
+        )
+        .unwrap();
+        let approved =
+            transition_payout_tx(&tx, &request.id, "owner", "approve", 1, None, None, mature)
+                .unwrap();
+        let sending = transition_payout_tx(
+            &tx,
+            &request.id,
+            "owner",
+            "begin_transfer",
+            approved.version,
+            None,
+            None,
+            mature,
+        )
+        .unwrap();
+        let paid = transition_payout_tx(
+            &tx,
+            &request.id,
+            "owner",
+            "mark_paid",
+            sending.version,
+            Some(TX_ID),
+            None,
+            mature,
+        )
+        .unwrap();
+        assert_eq!(paid.status, "paid");
+        let summary = provider_summary_tx(&tx, "provider").unwrap();
+        assert_eq!(summary.withdrawable_units, 0);
+        assert_eq!(summary.paid_units, 9000 * 86_400);
+        let fee: i64 = tx.query_row("SELECT -SUM(signed_units) FROM market_journal_postings WHERE account_kind = 'platform_commission_revenue'", [], |r| r.get(0)).unwrap();
+        assert_eq!(fee, 1000 * 86_400);
+        assert_eq!(
+            crate::market_wallet::wallet_snapshot_tx(&tx, "buyer")
+                .unwrap()
+                .posted_units,
+            0
+        );
+        tx.commit().unwrap();
     }
 
     #[test]

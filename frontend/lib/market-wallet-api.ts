@@ -181,6 +181,9 @@ export type MarketProviderFinance = {
   hasFinanceActivity: boolean;
   canWithdraw: boolean;
   summary: {
+    grossEarnedUnits: string;
+    commissionUnits: string;
+    netEarnedUnits: string;
     pendingUnits: string;
     availableUnits: string;
     withdrawableUnits: string;
@@ -408,6 +411,11 @@ export type MarketEarningHold = {
 export type MarketProviderEarningLot = {
   id: string;
   amountUnits: string;
+  grossUnits: string;
+  commissionUnits: string;
+  commissionReversedUnits: string;
+  commissionRateBps: number;
+  commissionPolicyVersion: number;
   reversedUnits: string;
   unlockedUnits: string;
   heldUnits: string;
@@ -763,6 +771,7 @@ export const MARKET_CRITICAL_CASE_CODES = [
   "wallet_projection_mismatch", "provider_liability_mismatch", "period_unfulfilled_mismatch",
   "journal_unsealed", "credited_topup_missing_evidence", "paid_payout_missing_evidence",
   "wallet_transfer_missing_evidence", "wallet_transfer_orphan_journal",
+  "commission_evidence_mismatch", "commission_orphan_journal",
 ] as const;
 
 export function isCriticalMarketFinanceCase(code: string) {
@@ -796,6 +805,9 @@ export type MarketFinanceOverview = {
   creditedTopupMinor: number;
   grossTopupMinor: number;
   maintenanceRevenueUnits: string;
+  commissionPendingUnits: string;
+  commissionRevenueUnits: string;
+  commissionReversedUnits: string;
   openCases: number;
   openCriticalCases: number;
   heldEarningLots: number;
@@ -904,6 +916,7 @@ export const MARKET_NOTIFICATION_KINDS = [
   "contract_terminating_soon", "contract_terminated", "refund_status", "dispute_resolved",
   "payout_status", "earnings_held", "earnings_released", "payout_address_changed",
   "wallet_transfer_sent", "wallet_transfer_received",
+  "commission_policy_changed",
 ] as const;
 
 export type MarketNotificationKind = (typeof MARKET_NOTIFICATION_KINDS)[number];

@@ -41,6 +41,7 @@ mod market_recurring;
 mod market_service_disputes;
 mod market_wallet;
 mod market_wallet_policy;
+mod market_commission;
 mod market_wallet_transfers;
 mod metrics;
 mod model_price_catalog;

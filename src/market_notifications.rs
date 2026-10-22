@@ -44,6 +44,12 @@ pub(crate) struct NotificationKind {
 
 pub(crate) const KINDS: &[NotificationKind] = &[
     NotificationKind {
+        kind: "commission_policy_changed",
+        mandatory: true,
+        subject_en: "Provider service fee updated",
+        subject_zh: "Provider 平台服务费已更新",
+    },
+    NotificationKind {
         kind: "wallet_transfer_sent",
         mandatory: true,
         subject_en: "Wallet transfer sent",
@@ -654,6 +660,28 @@ fn render(item: &Claimed, dashboard: &str) -> (String, String) {
         Some(amount) => format!("{amount}{status}"),
         None => status.trim_start_matches(" · ").to_string(),
     };
+    if item.event_kind == "commission_policy_changed" {
+        let rate = item
+            .payload
+            .get("rateBps")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let effective = item
+            .payload
+            .get("effectiveAt")
+            .and_then(Value::as_str)
+            .unwrap_or("—");
+        let subject = format!("{subject_zh} / {subject_en}");
+        let body = format!(
+            "{subject_zh}：{}.{:02}%；生效时间：{effective}。仅适用于新的计费周期，已承诺周期不变；提现不重复扣费。\n{subject_en}: {}.{:02}%. Effective: {effective}. Applies to new service periods only; committed periods stay unchanged. Withdrawals have no additional service fee.\n\n{}/account/earnings/",
+            rate / 100,
+            rate % 100,
+            rate / 100,
+            rate % 100,
+            dashboard.trim_end_matches('/')
+        );
+        return (subject, body);
+    }
     if item.event_kind == "wallet_transfer_sent" || item.event_kind == "wallet_transfer_received" {
         let counterparty = item
             .payload
@@ -1031,6 +1059,28 @@ mod tests {
         assert!(subject.contains("提现状态更新"));
         assert!(body.contains("$12.34"));
         assert!(body.ends_with("https://router.example/account/wallet/"));
+    }
+
+    #[test]
+    fn commission_notice_links_to_earnings_and_does_not_repeat_bilingual_copy() {
+        let item = Claimed {
+            id: "commission-notice".into(),
+            recipient_user_id: "provider".into(),
+            event_kind: "commission_policy_changed".into(),
+            payload: json!({"rateBps": 1025, "effectiveAt": "2026-11-01T00:00:00Z"}),
+            mandatory: true,
+            attempts: 1,
+        };
+        let (_, html, text) = render_email(&item, "https://router.example/");
+        assert_eq!(text.matches("10.25%").count(), 2);
+        assert_eq!(
+            text.matches("Withdrawals have no additional service fee.")
+                .count(),
+            1
+        );
+        assert!(text.ends_with("https://router.example/account/earnings/"));
+        assert!(html.contains("account/earnings/"));
+        assert!(!text.contains("account/wallet/"));
     }
 
     #[test]

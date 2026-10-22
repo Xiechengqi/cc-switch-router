@@ -262,6 +262,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (73, include_str!("../schema/0073_market_owner_actions.sql")),
     (74, include_str!("../schema/0074_market_payout_v2.sql")),
     (75, include_str!("../schema/0075_market_wallet_policy.sql")),
+    (
+        76,
+        include_str!("../schema/0076_market_provider_commission.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -789,7 +793,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count baseline tables");
-        assert_eq!(table_count, 205);
+        assert_eq!(table_count, 221);
         let removed_client_recovery_table_count = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -1420,6 +1424,188 @@ mod tests {
                 .unwrap()
                 .next()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn commission_upgrade_preserves_populated_ledger_lots_and_views() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 75);
+        let tables_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables_before, 212);
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        let journal = crate::market_wallet::post_journal_tx(
+            &conn,
+            "upgrade",
+            "old-delivery",
+            "earn",
+            "old-delivery",
+            &[
+                crate::market_wallet::Posting {
+                    kind: "owner_clearing",
+                    subject_id: "owner",
+                    signed_units: 86_400,
+                },
+                crate::market_wallet::Posting {
+                    kind: "provider_pending",
+                    subject_id: "provider",
+                    signed_units: -86_400,
+                },
+            ],
+            "2026-10-01T00:00:00Z",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO market_delivery_slices
+            (id, contract_kind, contract_id, source_kind, source_id, started_at, ended_at,
+             amount_units, debit_journal_id, earning_journal_id, created_at)
+            VALUES ('old-slice', 'share', 'old-contract', 'old', 'old',
+             '2026-10-01T00:00:00Z', '2026-10-01T00:00:01Z', 86400, ?1, ?1, 't')",
+            params![journal.id],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO market_provider_earning_lots
+            (id, delivery_slice_id, provider_user_id, buyer_user_id, amount_units,
+             reversed_units, unlocked_units, held_units, paid_units,
+             buyer_debited_at, fulfilled_at, unlock_at, created_at)
+            VALUES ('old-lot', 'old-slice', 'provider', 'buyer', 86400,
+                    8640, 43200, 8640, 8640, 't', 't', 't', 't');",
+        )
+        .unwrap();
+        let postings = |conn: &Connection| {
+            conn.prepare(
+                "SELECT id, journal_id, account_kind, subject_id, asset_code,
+                          signed_units, created_at FROM market_journal_postings ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, String>(6)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        };
+        let before = postings(&conn);
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        let tables_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables_after - tables_before, 9);
+        let split_lookup = conn
+            .prepare("EXPLAIN QUERY PLAN SELECT 1 FROM market_commission_splits WHERE allocation_journal_id = ?1")
+            .unwrap()
+            .query_map(params![journal.id], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(split_lookup.iter().any(|step| step.contains("idx_market_commission_splits_journal")));
+        assert_eq!(before, postings(&conn));
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM market_journal_seals
+            WHERE journal_id = ?1 AND posting_count = 2",
+                params![journal.id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        let old: (i64, i64, i64, i64, i64, i64, i64, i64) = conn.query_row(
+            "SELECT amount_units, net_amount_units, commission_units, commission_reversed_units,
+                    commission_unlocked_units, reversed_units, unlocked_units, held_units + paid_units
+             FROM market_provider_earning_lots WHERE id = 'old-lot'", [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?))).unwrap();
+        assert_eq!(old, (86_400, 86_400, 0, 0, 0, 8_640, 43_200, 17_280));
+        let views = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'view'")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for view in views {
+            conn.query_row(&format!("SELECT COUNT(*) FROM \"{view}\""), [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap_or_else(|error| panic!("upgraded view {view}: {error}"));
+        }
+        assert!(
+            conn.execute("UPDATE market_journal_postings SET signed_units = 1", [])
+                .is_err()
+        );
+        assert!(
+            conn.execute("DELETE FROM market_journal_postings", [])
+                .is_err()
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO market_journal_postings VALUES
+            ('extra', ?1, 'owner_clearing', 'owner', 'USD', 1, 't')",
+                params![journal.id]
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute(
+                "UPDATE market_provider_earning_lots SET commission_units = 1
+            WHERE id = 'old-lot'",
+                []
+            )
+            .is_err()
+        );
+        crate::market_wallet::post_journal_tx(
+            &conn,
+            "upgrade",
+            "new",
+            "commission",
+            "new",
+            &[
+                crate::market_wallet::Posting {
+                    kind: "provider_pending",
+                    subject_id: "provider",
+                    signed_units: 1,
+                },
+                crate::market_wallet::Posting {
+                    kind: "platform_commission_pending",
+                    subject_id: "new-lot",
+                    signed_units: -1,
+                },
+            ],
+            "t",
+        )
+        .unwrap();
+        let mut check = conn.prepare("PRAGMA foreign_key_check").unwrap();
+        assert!(
+            check
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA legacy_alter_table", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
         );
     }
 

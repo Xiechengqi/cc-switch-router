@@ -60,6 +60,7 @@ function lotState(lot: MarketProviderEarningLot, nowMs: number): { key: MessageK
   if (lot.disputed) return { key: "marketProviderFinance.lot.disputed", tone: "warning" };
   if (units(lot.heldUnits) > 0n) return { key: "marketProviderFinance.lot.held", tone: "warning" };
   const net = units(lot.amountUnits) - units(lot.reversedUnits);
+  if (net === 0n && units(lot.grossUnits ?? lot.amountUnits) > units(lot.reversedUnits) + units(lot.commissionReversedUnits ?? "0")) return { key: "commission.zeroNet", tone: "neutral" };
   if (net <= 0n) return { key: "marketProviderFinance.lot.reversed", tone: "neutral" };
   if (units(lot.paidUnits) >= net) return { key: "marketProviderFinance.lot.paid", tone: "success" };
   if (units(lot.unlockedUnits) > 0n || Date.parse(lot.unlockAt) <= nowMs) return { key: "marketProviderFinance.lot.available", tone: "accent" };
@@ -300,6 +301,17 @@ export function ProviderFinancePanel({ walletMode }: { walletMode: "disabled" | 
         ))}
       </div>
 
+      <details className="min-w-0 text-sm">
+        <summary className="min-h-11 cursor-pointer rounded-lg py-3 font-medium hover:text-accent focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring active:text-accent">{t("commission.earningsDetail")}</summary>
+        <dl className="grid gap-2 pb-2 tabular-nums sm:grid-cols-3">
+          {([
+            ["commission.gross", finance.summary.grossEarnedUnits],
+            ["commission.deducted", finance.summary.commissionUnits],
+            ["commission.net", finance.summary.netEarnedUnits],
+          ] as const).map(([key, value]) => <div key={key}><dt className="text-muted-foreground">{t(key)}</dt><dd className="font-medium">{formatWalletUnits(value ?? "0", "$", locale)}</dd></div>)}
+        </dl>
+        <p className="pb-3 text-muted-foreground">{t("commission.providerHelp")}</p>
+      </details>
       {holds.length ? (
         <div className="grid gap-3 rounded-xl border border-amber-300 bg-amber-50/60 p-4" role="region" aria-labelledby="provider-holds-title">
           <div className="flex flex-wrap items-center justify-between gap-2">
@@ -442,7 +454,7 @@ export function ProviderFinancePanel({ walletMode }: { walletMode: "disabled" | 
                 <tr className="border-b border-border">
                   <th scope="col" className="py-2 pr-3 font-medium">{t("marketProviderFinance.lot.fulfilled")}</th>
                   <th scope="col" className="py-2 pr-3 font-medium">{t("marketProviderFinance.lot.unlocks")}</th>
-                  <th scope="col" className="py-2 pr-3 text-right font-medium">{t("marketProviderFinance.lot.amount")}</th>
+                  <th scope="col" className="py-2 pr-3 text-right font-medium">{t("commission.net")}</th>
                   <th scope="col" className="py-2 pr-3 text-right font-medium">{t("marketProviderFinance.lot.paidOut")}</th>
                   <th scope="col" className="py-2 font-medium">{t("marketProviderFinance.lot.state")}</th>
                 </tr>
@@ -457,6 +469,12 @@ export function ProviderFinancePanel({ walletMode }: { walletMode: "disabled" | 
                       <td className="py-2 pr-3">{dateText(lot.unlockAt)}</td>
                       <td className="py-2 pr-3 text-right tabular-nums">
                         {formatWalletUnits(lot.amountUnits, "$", locale)}
+                        {lot.commissionPolicyVersion > 0 ? <details className="text-xs text-muted-foreground">
+                          <summary className="min-h-11 cursor-pointer whitespace-nowrap rounded-lg py-3 hover:text-accent focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring active:text-accent">{t("commission.breakdown")}</summary>
+                          <span className="block">{t("commission.lotGross", { amount: formatWalletUnits(lot.grossUnits, "$", locale) })}</span>
+                          <span className="block">{t("commission.previewFee", { rate: (lot.commissionRateBps / 100).toString(), fee: formatWalletUnits(lot.commissionUnits, "$", locale) })}</span>
+                          {units(lot.commissionReversedUnits) > 0n ? <span className="block">{t("commission.lotReversed", { amount: formatWalletUnits(lot.commissionReversedUnits, "$", locale) })}</span> : null}
+                        </details> : null}
                         {reversed ? <span className="block text-[0.7rem] text-muted-foreground">{t("marketProviderFinance.lot.reversedAmount", { amount: formatWalletUnits(lot.reversedUnits, "$", locale) })}</span> : null}
                       </td>
                       <td className="py-2 pr-3 text-right tabular-nums">{formatWalletUnits(lot.paidUnits, "$", locale)}</td>

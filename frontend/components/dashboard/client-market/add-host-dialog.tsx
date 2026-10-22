@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import { ProviderCommissionPreview } from "@/components/market/provider-commission-preview";
 import { Button, Modal, toast } from "@heroui/react";
 import { Check, ChevronDown, Circle, Loader2, RefreshCw, X } from "lucide-react";
 import { CopyableCodeField } from "@/components/common/copyable-code-field";
@@ -482,6 +483,7 @@ export function AddHostDialog({
                     ) : null}
                   </div>
                 )}
+                {pricing === "paid" ? <ProviderCommissionPreview price={priceUsd} /> : null}
                 <p className="text-xs text-muted-foreground">{pricing === "paid" ? t("clientMarket.offerHint") : t("clientMarket.freeDuration.hint")}</p>
                 {pricing === "paid" && paidOfferLoading ? (
                   <div role="status" className="flex items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">

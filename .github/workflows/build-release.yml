@@ -58,12 +58,12 @@ jobs:
           npm run build
           npm run test:wallet-checkout-browser
 
-      - name: Test DujiaoPay wallet and migration contracts
+      - name: Test market wallet, service commissions and migrations
+        env:
+          RUST_TEST_THREADS: 4
         run: |
-          cargo test market_payments::tests
-          cargo test schema::tests::migration_67_adds_redacted_gateway_observations_without_rewriting_orders
-          cargo test schema::tests::migration_68_adds_buyer_check_progress_without_rewriting_orders
-          cargo test schema::tests::installs_and_reopens_fresh_baseline
+          cargo test market_
+          cargo test schema::tests
 
       - name: Get version from Cargo.toml
         id: version

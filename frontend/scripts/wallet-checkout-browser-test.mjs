@@ -49,6 +49,45 @@ if (!baseUrl) {
 
 let browser;
 
+// Read computed colors only, never capture or rasterize the page. A single
+// color swatch lets Chromium normalize rgb/oklch into the same sRGB space.
+async function assertCommissionContrast(panel) {
+  const measurements = await panel.evaluate((root) => {
+    const swatch = document.createElement("canvas");
+    swatch.width = swatch.height = 1;
+    const context = swatch.getContext("2d", { willReadFrequently: true });
+    const rgba = (color) => {
+      context.clearRect(0, 0, 1, 1);
+      context.fillStyle = color;
+      context.fillRect(0, 0, 1, 1);
+      return [...context.getImageData(0, 0, 1, 1).data].map((value) => value / 255);
+    };
+    const surface = (element) => {
+      if (!element) return [1, 1, 1];
+      const color = rgba(getComputedStyle(element).backgroundColor);
+      const behind = color[3] < 1 ? surface(element.parentElement) : color;
+      return color.slice(0, 3).map((value, i) => value * color[3] + behind[i] * (1 - color[3]));
+    };
+    const luminance = (color) => color.slice(0, 3).map((value) => value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4)
+      .reduce((sum, value, i) => sum + value * [0.2126, 0.7152, 0.0722][i], 0);
+    const contrast = (a, b) => {
+      const light = [luminance(a), luminance(b)].sort((a, b) => b - a);
+      return (light[0] + 0.05) / (light[1] + 0.05);
+    };
+    const samples = [...root.querySelectorAll("h3,p,span,input,button")]
+      .filter((element) => element.getClientRects().length && !element.closest(":disabled") &&
+        (element.tagName === "INPUT" || [...element.childNodes].some((node) => node.nodeType === Node.TEXT_NODE && node.textContent.trim())))
+      .map((element) => ({ text: (element.value || element.textContent).trim().slice(0, 70),
+        minimum: 4.5, ratio: contrast(rgba(getComputedStyle(element).color), surface(element)) }));
+    const focused = root.querySelector(":focus-visible");
+    if (focused) samples.push({ text: "keyboard focus outline against its offset surface", minimum: 3,
+      ratio: contrast(rgba(getComputedStyle(focused).outlineColor), surface(focused.parentElement)) });
+    return samples;
+  });
+  assert.ok(measurements.length > 0);
+  for (const { text, ratio, minimum } of measurements) assert.ok(ratio >= minimum, `commission contrast ${ratio.toFixed(2)}: ${text}`);
+}
+
 try {
   browser = await chromium.launch({
     executablePath: process.env.CHROME_BIN || "/usr/bin/google-chrome",
@@ -389,18 +428,39 @@ try {
   await page.context().route("**/v1/market-provider-finance/me", async (route) => {
     await route.fulfill({ contentType: "application/json", body: JSON.stringify({
       isProvider: false, hasFinanceActivity: true, canWithdraw, destination: null,
-      summary: { pendingUnits: "0", availableUnits: "0", withdrawableUnits: "0", withdrawalHeldUnits: "0", paidUnits: "0" },
+      summary: { grossEarnedUnits: "864000000", commissionUnits: "86400000", netEarnedUnits: "777600000",
+        pendingUnits: "0", availableUnits: "777600000", withdrawableUnits: "777600000", withdrawalHeldUnits: "0", paidUnits: "0" },
     }) });
   });
   await page.context().route("**/v1/market-provider-finance/holds", async (route) => {
     await route.fulfill({ contentType: "application/json", body: "[]" });
   });
   await page.context().route("**/v1/market-provider-finance/earnings", async (route) => {
-    await route.fulfill({ contentType: "application/json", body: JSON.stringify({ items: [], nextCursor: null }) });
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify({ items: [{
+      id: "net-earning", amountUnits: "777600000", grossUnits: "864000000", commissionUnits: "86400000",
+      commissionReversedUnits: "0", commissionRateBps: 1000, commissionPolicyVersion: 1,
+      reversedUnits: "0", unlockedUnits: "777600000", heldUnits: "0", paidUnits: "0", disputed: false,
+      fulfilledAt: "2026-01-01T00:00:00Z", unlockAt: "2026-01-08T00:00:00Z",
+    }], nextCursor: null }) });
   });
   await page.reload();
   await page.getByRole("link", { name: "Earnings & withdrawals", exact: true }).click();
   await page.getByRole("heading", { name: "Provider earnings", exact: true }).waitFor();
+  await page.getByRole("columnheader", { name: "Net earnings", exact: true }).waitFor();
+  const earningSummary = page.getByText("Revenue & service fees", { exact: true });
+  assert.equal(await earningSummary.locator("..").getAttribute("open"), null, "detailed accounting starts collapsed");
+  await earningSummary.click();
+  const earningTotals = page.locator("dl").filter({ hasText: "Fulfilled revenue (net of refunds)" });
+  await earningTotals.getByText("$100.00", { exact: true }).waitFor();
+  await earningTotals.getByText("$10.00", { exact: true }).waitFor();
+  await earningTotals.getByText("$90.00", { exact: true }).waitFor();
+  await page.getByText("Fee breakdown", { exact: true }).click();
+  await page.getByText("Gross $100.00", { exact: true }).waitFor();
+  await page.getByText("Service fee 10% · $10.00", { exact: true }).waitFor();
+  for (const width of [320, 375, 414, 768]) {
+    await page.setViewportSize({ width, height: 900 });
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `Provider net earnings overflow at ${width}`);
+  }
   canWithdraw = false;
   await page.reload();
   await page.getByText(/Earnings history remains visible/).waitFor();
@@ -412,6 +472,9 @@ try {
     balanceRefundable: false, canEdit: true };
   let policyWrites = 0;
   let conflictPolicy = false;
+  let commissionPolicy = { version: 1, current: { policyVersion: 1, rateBps: 1000, effectiveAt: "2026-01-01T00:00:00Z" }, scheduled: null, increaseNoticeDays: 7, canEdit: true };
+  let commissionWrites = 0;
+  let conflictCommission = false;
   const categories = [{ id: "marketplace", label: "Marketplace", description: "Marketplace", fieldCount: 0 }];
   const overview = Object.fromEntries(["walletPostedUnits", "walletHeldUnits", "unfulfilledUnits", "providerPendingUnits",
     "providerAvailableUnits", "providerHeldUnits", "buyerRefundHeldUnits", "ownerLossUnits", "maintenanceRevenueUnits"].map((key) => [key, "0"]));
@@ -437,6 +500,24 @@ try {
       legacyBlockers: [], criticalCases: 0, staleTopupReviews: 0, verifiedLiveTopups: 1,
       paymentChannelBlockers: [], canEnable: false };
     else if (path === "/v1/admin/market-finance/overview") data = overview;
+    else if (path === "/v1/admin/market-finance/commission-policy") {
+      if (route.request().method() === "PUT") {
+        commissionWrites += 1;
+        const input = route.request().postDataJSON();
+        assert.deepEqual(Object.keys(input).sort(), ["expectedVersion", "rateBps"]);
+        assert.equal(input.expectedVersion, commissionPolicy.version);
+        if (conflictCommission) {
+          conflictCommission = false;
+          commissionPolicy = { ...commissionPolicy, version: commissionPolicy.version + 1 };
+          await route.fulfill({ status: 409, contentType: "application/json", body: JSON.stringify({ message: "commission policy changed" }) });
+          return;
+        }
+        assert.equal(input.rateBps, 1025);
+        commissionPolicy = { ...commissionPolicy, version: commissionPolicy.version + 1,
+          scheduled: { policyVersion: commissionPolicy.version + 1, rateBps: input.rateBps, effectiveAt: new Date(Date.now() + 7 * 86400000).toISOString() } };
+      }
+      data = commissionPolicy;
+    }
     else if (["topups", "cases"].some((kind) => path === `/v1/admin/market-finance/${kind}`)) data = { items: [], nextCursor: null };
     else if (path === "/v1/admin/market-finance/wallet-policy") {
       if (route.request().method() === "PUT") {
@@ -476,11 +557,50 @@ try {
   await page.waitForFunction(() => [...document.querySelectorAll("input")].some((input) => input.value === "7"));
   assert.equal(await feeInput.inputValue(), "7");
   assert.equal(policyWrites, 2);
+  const commissionPanel = page.locator("section").filter({ has: page.getByRole("heading", { name: "Provider service fee", exact: true }) }).last();
+  const commissionInput = commissionPanel.getByLabel("Platform service fee (%)", { exact: true });
+  for (const width of [320, 375, 414, 768]) {
+    await page.setViewportSize({ width, height: 900 });
+    await commissionPanel.scrollIntoViewIfNeeded();
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+  }
+  await assertCommissionContrast(commissionPanel);
+  await commissionInput.focus();
+  await page.keyboard.press("Tab");
+  const focus = await commissionPanel.getByRole("button", { name: "Save", exact: true }).evaluate((button) => {
+    const style = getComputedStyle(button);
+    return { visible: button.matches(":focus-visible"), width: parseFloat(style.outlineWidth), style: style.outlineStyle };
+  });
+  assert.equal(focus.visible, true);
+  assert.ok(focus.width >= 2 && focus.style !== "none", "service fee save retains a visible keyboard focus ring");
+  await assertCommissionContrast(commissionPanel);
+  await commissionInput.fill("100.01");
+  await commissionPanel.getByRole("button", { name: "Save", exact: true }).click();
+  await commissionPanel.getByRole("alert").filter({ hasText: /0–100/ }).waitFor();
+  await assertCommissionContrast(commissionPanel);
+  assert.equal(commissionWrites, 0);
+  await commissionInput.fill("10.25");
+  await commissionPanel.getByRole("button", { name: "Save", exact: true }).click();
+  await commissionPanel.getByRole("status").filter({ hasText: /Policy saved/ }).waitFor();
+  await assertCommissionContrast(commissionPanel);
+  assert.equal(commissionWrites, 1);
+  assert.equal(policyWrites, 2, "commission writes do not edit top-up policy");
+  conflictCommission = true;
+  await commissionInput.fill("12");
+  await commissionPanel.getByRole("button", { name: "Save", exact: true }).click();
+  await commissionPanel.getByRole("alert").filter({ hasText: /changed elsewhere/ }).waitFor();
+  assert.equal(await commissionInput.isDisabled(), true);
+  await commissionPanel.getByRole("button", { name: "Retry", exact: true }).click();
+  await page.waitForFunction(() => [...document.querySelectorAll("input")].some((input) => input.value === "10.25" && !input.disabled));
+  assert.equal(await commissionInput.inputValue(), "10.25");
   policy = { ...policy, canEdit: false };
+  commissionPolicy = { ...commissionPolicy, canEdit: false };
   await page.reload();
   await policyPanel.getByText("Only the Router owner can change this policy.", { exact: true }).waitFor();
   assert.equal(await feeInput.isDisabled(), true);
   assert.equal(await policyPanel.getByRole("button", { name: "Save", exact: true }).isDisabled(), true);
+  assert.equal(await commissionInput.isDisabled(), true);
+  assert.equal(await commissionPanel.getByRole("button", { name: "Save", exact: true }).isDisabled(), true);
   assert.deepEqual(pageErrors, []);
   console.log("wallet checkout: safe new tabs, fee change, recheck/stop, exact transfer, OTP retry, redirects, scoped access merge, historical Provider finance and Owner policy edits passed; four widths; no screenshots or real payments");
 } finally {

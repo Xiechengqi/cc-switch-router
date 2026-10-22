@@ -37,6 +37,12 @@ pub(super) struct FinanceOverview {
     gross_topup_minor: i64,
     #[serde(serialize_with = "serialize_units")]
     maintenance_revenue_units: i64,
+    #[serde(serialize_with = "serialize_units")]
+    commission_pending_units: i64,
+    #[serde(serialize_with = "serialize_units")]
+    commission_revenue_units: i64,
+    #[serde(serialize_with = "serialize_units")]
+    commission_reversed_units: i64,
     open_cases: i64,
     open_critical_cases: i64,
     held_earning_lots: i64,
@@ -94,6 +100,15 @@ fn overview_tx(conn: &Connection) -> Result<FinanceOverview, AppError> {
         credited_topup_minor: credited,
         gross_topup_minor: gross,
         maintenance_revenue_units: ledger("platform_fee_revenue")?,
+        commission_pending_units: ledger("platform_commission_pending")?,
+        commission_revenue_units: ledger("platform_commission_revenue")?,
+        commission_reversed_units: conn
+            .query_row(
+                "SELECT COALESCE(SUM(fee_units), 0) FROM market_commission_refunds",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(db_error("sum reversed service commission"))?,
         open_cases,
         open_critical_cases: crate::market_reconcile::critical_case_count_tx(conn)?,
         held_earning_lots: held_lots,

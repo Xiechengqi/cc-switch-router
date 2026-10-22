@@ -839,6 +839,8 @@ pub(crate) fn credit_wallet_from_liability_tx(
                 | "provider_available"
                 | "provider_held"
                 | "buyer_refund_held"
+                | "platform_commission_pending"
+                | "platform_commission_revenue"
         )
     {
         return Err(AppError::BadRequest("invalid wallet refund source".into()));

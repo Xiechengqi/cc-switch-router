@@ -6,7 +6,8 @@ import { mkdir } from "node:fs/promises";
 const baseUrl = process.env.CHECKOUT_TEST_URL || "http://127.0.0.1:3127";
 const artifacts =
   process.env.CHECKOUT_ARTIFACTS || "/tmp/client-checkout-review";
-await mkdir(artifacts, { recursive: true });
+const captureScreenshots = process.env.CHECKOUT_SCREENSHOTS === "1";
+if (captureScreenshots) await mkdir(artifacts, { recursive: true });
 (async () => {
   const browser = await chromium.launch({
     executablePath: process.env.CHROME_BIN || "/usr/bin/google-chrome",
@@ -179,7 +180,7 @@ await mkdir(artifacts, { recursive: true });
       .getByRole("heading", { name: "配置并确认" })
       .waitFor({ timeout: 60000 });
     console.log("opened", quotes);
-    await page.screenshot({ path: artifacts + "/initial.png", fullPage: true });
+    if (captureScreenshots) await page.screenshot({ path: artifacts + "/initial.png", fullPage: true });
     assert.equal(await page.locator('img[alt="Binance Pay"]').count(), 0);
     await page.getByText("剩余试用 12 小时", { exact: true }).waitFor();
     await page
@@ -187,7 +188,7 @@ await mkdir(artifacts, { recursive: true });
       .fill("test-password-123");
     for (const width of [320, 375, 414, 768]) {
       await page.setViewportSize({ width, height: 900 });
-      await page.screenshot({
+      if (captureScreenshots) await page.screenshot({
         path: `${artifacts}/checkout-${width}.png`,
         fullPage: true,
       });
@@ -360,7 +361,7 @@ await mkdir(artifacts, { recursive: true });
     console.log("English free creation and short viewport widths passed");
     assert.deepEqual(errors, []);
     console.log("free checkout passed; no browser exceptions");
-    console.log("Screenshots:", artifacts);
+    console.log(captureScreenshots ? `Screenshots: ${artifacts}` : "DOM and interaction checks only; no screenshots");
   } finally {
     await browser.close();
   }

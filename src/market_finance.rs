@@ -118,6 +118,16 @@ fn insert_slice_and_lot_tx(
     )
     .map_err(db_error("insert delivery slice"))?;
     let lot_id = Uuid::new_v4().to_string();
+    let allocation = crate::market_commission::allocate_delivery_tx(
+        conn,
+        &lot_id,
+        contract_id,
+        period_id,
+        source_kind,
+        amount_units,
+        provider,
+        now,
+    )?;
     let disputed_by_open_case: i64 = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM market_service_disputes
@@ -129,8 +139,8 @@ fn insert_slice_and_lot_tx(
     conn.execute(
         "INSERT INTO market_provider_earning_lots (
             id, delivery_slice_id, provider_user_id, buyer_user_id, amount_units,
-            buyer_debited_at, fulfilled_at, unlock_at, disputed, created_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            buyer_debited_at, fulfilled_at, unlock_at, disputed, created_at, commission_units
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             lot_id,
             id,
@@ -141,10 +151,12 @@ fn insert_slice_and_lot_tx(
             ended_at,
             unlock_at(buyer_debited_at, ended_at)?,
             disputed_by_open_case,
-            now
+            now,
+            allocation.fee_units
         ],
     )
     .map_err(db_error("insert Provider earning lot"))?;
+    crate::market_commission::finish_delivery_tx(conn, &lot_id, allocation, now)?;
     if disputed_by_open_case != 0 {
         conn.execute(
             "INSERT INTO market_service_dispute_lots (dispute_id, earning_lot_id)
@@ -420,7 +432,7 @@ fn notify_providers_for_lots_tx(
     let providers = {
         let mut statement = conn
             .prepare(&format!(
-                "SELECT provider_user_id, SUM(amount_units - reversed_units - paid_units)
+                "SELECT provider_user_id, SUM(net_amount_units - reversed_units - paid_units)
                  FROM market_provider_earning_lots WHERE id IN ({lot_filter_sql})
                  GROUP BY provider_user_id"
             ))
@@ -635,7 +647,7 @@ pub(crate) fn active_earning_holds_tx(
     let mut statement = conn
         .prepare(
             "SELECT hold.reason_kind, hold.reason_ref, lot.provider_user_id, COUNT(*),
-                    SUM(lot.amount_units - lot.reversed_units - lot.paid_units), MIN(hold.created_at)
+                    SUM(lot.net_amount_units - lot.reversed_units - lot.paid_units), MIN(hold.created_at)
              FROM market_provider_earning_holds hold
              JOIN market_provider_earning_lots lot ON lot.id = hold.lot_id
              WHERE hold.released_at IS NULL AND (?1 IS NULL OR lot.provider_user_id = ?1)
@@ -663,6 +675,12 @@ pub(crate) fn active_earning_holds_tx(
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ProviderFinanceSummary {
     #[serde(serialize_with = "serialize_units")]
+    pub gross_earned_units: i64,
+    #[serde(serialize_with = "serialize_units")]
+    pub commission_units: i64,
+    #[serde(serialize_with = "serialize_units")]
+    pub net_earned_units: i64,
+    #[serde(serialize_with = "serialize_units")]
     pub pending_units: i64,
     #[serde(serialize_with = "serialize_units")]
     pub available_units: i64,
@@ -679,15 +697,21 @@ pub(crate) fn provider_summary_tx(
     provider_user_id: &str,
 ) -> Result<ProviderFinanceSummary, AppError> {
     conn.query_row(
-        "SELECT COALESCE(SUM(amount_units - reversed_units - unlocked_units), 0),
+        "SELECT COALESCE(SUM(net_amount_units - reversed_units - unlocked_units), 0),
                 COALESCE(SUM(unlocked_units - held_units - paid_units), 0),
                 COALESCE(SUM(CASE WHEN disputed = 0
                                   THEN unlocked_units - held_units - paid_units ELSE 0 END), 0),
-                COALESCE(SUM(held_units), 0), COALESCE(SUM(paid_units), 0)
+                COALESCE(SUM(held_units), 0), COALESCE(SUM(paid_units), 0),
+                COALESCE(SUM(amount_units - reversed_units - commission_reversed_units), 0),
+                COALESCE(SUM(commission_units - commission_reversed_units), 0),
+                COALESCE(SUM(net_amount_units - reversed_units), 0)
          FROM market_provider_earning_lots WHERE provider_user_id = ?1",
         params![provider_user_id],
         |row| {
             Ok(ProviderFinanceSummary {
+                gross_earned_units: row.get(5)?,
+                commission_units: row.get(6)?,
+                net_earned_units: row.get(7)?,
                 pending_units: row.get(0)?,
                 available_units: row.get(1)?,
                 withdrawable_units: row.get(2)?,
@@ -711,9 +735,10 @@ pub(crate) fn unlock_due_earnings_tx(
     let at_utc = parse_utc(at)?;
     let mut statement = conn
         .prepare(
-            "SELECT id, provider_user_id, amount_units - reversed_units - unlocked_units,
+            "SELECT id, provider_user_id, net_amount_units - reversed_units - unlocked_units,
                 unlock_at FROM market_provider_earning_lots
-         WHERE disputed = 0 AND amount_units - reversed_units - unlocked_units > 0
+         WHERE disputed = 0 AND net_amount_units - reversed_units - unlocked_units
+             + commission_units - commission_reversed_units - commission_unlocked_units > 0
          ORDER BY unlock_at, id LIMIT ?1",
         )
         .map_err(db_error("prepare due Provider earnings"))?;
@@ -748,25 +773,52 @@ fn unlock_lot_tx(
     maturity: &str,
     at: &str,
 ) -> Result<(), AppError> {
-    let fingerprint = format!("{provider}:{units}:{maturity}");
+    if !crate::market_commission::lot_evidence_valid_tx(conn, id)? {
+        return Err(AppError::Internal(
+            "commission evidence requires Owner review".into(),
+        ));
+    }
+    let fee: i64 = conn
+        .query_row(
+            "SELECT commission_units - commission_reversed_units - commission_unlocked_units
+        FROM market_provider_earning_lots WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .map_err(db_error("read pending commission maturity"))?;
+    let fingerprint = format!("{provider}:{units}:{maturity}:commission={fee}");
+    let mut postings = Vec::new();
+    if units > 0 {
+        postings.push(Posting {
+            kind: "provider_pending",
+            subject_id: provider,
+            signed_units: units,
+        });
+        postings.push(Posting {
+            kind: "provider_available",
+            subject_id: provider,
+            signed_units: -units,
+        });
+    }
+    if fee > 0 {
+        postings.push(Posting {
+            kind: "platform_commission_pending",
+            subject_id: id,
+            signed_units: fee,
+        });
+        postings.push(Posting {
+            kind: "platform_commission_revenue",
+            subject_id: id,
+            signed_units: -fee,
+        });
+    }
     let journal = post_journal_tx(
         conn,
         "earning_lot",
         id,
         "unlock",
         &fingerprint,
-        &[
-            Posting {
-                kind: "provider_pending",
-                subject_id: provider,
-                signed_units: units,
-            },
-            Posting {
-                kind: "provider_available",
-                subject_id: provider,
-                signed_units: -units,
-            },
-        ],
+        &postings,
         at,
     )?;
     if !journal.inserted {
@@ -776,10 +828,12 @@ fn unlock_lot_tx(
     }
     let changed = conn
         .execute(
-            "UPDATE market_provider_earning_lots SET unlocked_units = unlocked_units + ?2
+            "UPDATE market_provider_earning_lots SET unlocked_units = unlocked_units + ?2,
+                commission_unlocked_units = commission_unlocked_units + ?3
          WHERE id = ?1 AND disputed = 0
-           AND amount_units - reversed_units - unlocked_units = ?2",
-            params![id, units],
+           AND net_amount_units - reversed_units - unlocked_units = ?2
+           AND commission_units - commission_reversed_units - commission_unlocked_units = ?3",
+            params![id, units, fee],
         )
         .map_err(db_error("unlock Provider earning"))?;
     if changed != 1 {
@@ -805,9 +859,10 @@ pub(crate) fn unlock_due_earnings_isolated(
     let rows = {
         let mut statement = tx
             .prepare(
-                "SELECT id, provider_user_id, amount_units - reversed_units - unlocked_units,
+                "SELECT id, provider_user_id, net_amount_units - reversed_units - unlocked_units,
                     unlock_at FROM market_provider_earning_lots
-             WHERE disputed = 0 AND amount_units - reversed_units - unlocked_units > 0
+             WHERE disputed = 0 AND net_amount_units - reversed_units - unlocked_units
+                 + commission_units - commission_reversed_units - commission_unlocked_units > 0
              ORDER BY unlock_at, id LIMIT ?1",
             )
             .map_err(db_error("prepare due Provider earnings"))?;

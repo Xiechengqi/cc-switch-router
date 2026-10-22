@@ -14,6 +14,7 @@ import { CopyableCodeField } from "@/components/common/copyable-code-field";
 import { WalletBadge } from "@/components/market/wallet-primitives";
 import { MarketFinanceOverviewSection } from "@/components/settings/market-finance-overview";
 import { WalletPolicySettings } from "@/components/settings/wallet-policy-settings";
+import { CommissionPolicySettings } from "@/components/settings/commission-policy-settings";
 import { MarketFinanceCaseDesk } from "@/components/settings/market-finance-case-desk";
 import { MarketFinanceEnableDialog } from "@/components/settings/market-finance-enable-dialog";
 import { MarketChannelSettingsDialog, channelSettingsSummary } from "@/components/settings/market-channel-settings-dialog";
@@ -263,6 +264,7 @@ export function MarketPaymentChannelsPanel() {
       <div aria-live="polite">{notice ? <Alert status="success">{notice}</Alert> : null}</div>
       <MarketFinanceOverviewSection refreshKey={refreshKey} />
       <WalletPolicySettings />
+      <CommissionPolicySettings />
 
       {readiness ? (
         <div className="grid min-w-0 gap-4 rounded-lg border border-border bg-card p-4 sm:p-5">

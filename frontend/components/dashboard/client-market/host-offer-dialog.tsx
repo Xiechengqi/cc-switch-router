@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import { ProviderCommissionPreview } from "@/components/market/provider-commission-preview";
 import { Button, Modal, toast } from "@heroui/react";
 import { Loader2, RefreshCw } from "lucide-react";
 import { SegmentedControl } from "@/components/common/segmented-control";
@@ -191,6 +192,7 @@ export function HostOfferDialog({
                 ) : null}
               </div>
             )}
+            {pricing === "paid" ? <ProviderCommissionPreview price={price} /> : null}
             {error ? <p className="text-sm text-rose-600">{error}</p> : null}
           </Modal.Body>
           <Modal.Footer>

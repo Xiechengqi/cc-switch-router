@@ -9095,6 +9095,9 @@ impl AppStore {
             service: service.clone(),
         };
         let quote_id = Uuid::new_v4().to_string();
+        if wallet_mode && offer_price_minor.is_some() {
+            crate::market_commission::freeze_quote_tx(&tx, &quote_id, &owner_user_id, &now)?;
+        }
         let snapshot_json = serde_json::to_string(&snapshot).map_err(|error| {
             AppError::Internal(format!("encode Share rent quote failed: {error}"))
         })?;

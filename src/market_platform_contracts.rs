@@ -693,6 +693,12 @@ pub(crate) fn prepare_contract_tx(
         ],
     )
     .map_err(db_error("create platform contract"))?;
+    crate::market_commission::freeze_contract_tx(conn, &id, input.quote_id, input.provider_user_id, now)?;
+    if input.billing_model == BillingModel::Metered
+        && let Some(hold) = hold_id.as_deref()
+    {
+        crate::market_commission::freeze_period_tx(conn, &id, "metered_budget", hold, true, now, now)?;
+    }
     Ok(id)
 }
 
@@ -802,6 +808,7 @@ pub(crate) fn activate_contract_tx(
             ],
         )
         .map_err(db_error("create first wallet service period"))?;
+        crate::market_commission::freeze_period_tx(conn, contract_id, "monthly_period", &period_id, true, activated_at, now)?;
         1
     } else if model == "metered" {
         0
@@ -974,6 +981,7 @@ fn start_paid_trial_tx(
             ],
         )
         .map_err(db_error("create first paid period after trial"))?;
+        crate::market_commission::freeze_period_tx(conn, contract_id, "monthly_period", &period_id, true, at, now)?;
         let changed = conn
             .execute(
                 "UPDATE market_platform_contracts
@@ -989,6 +997,7 @@ fn start_paid_trial_tx(
             ));
         }
     } else if model == "metered" {
+        crate::market_commission::freeze_period_tx(conn, contract_id, "metered_budget", &hold_id, true, at, now)?;
         let changed = conn
             .execute(
                 "UPDATE market_platform_contracts
@@ -1320,6 +1329,14 @@ fn replenish_metered_budget_tx(
     if changed != 1 {
         return Err(AppError::Conflict("metered budget changed".into()));
     }
+    // Backlogs use the earliest service actually funded by this budget, not
+    // today's policy merely because the worker was delayed.
+    let anchor: Option<String> = conn.query_row(
+        "SELECT strftime('%Y-%m-%dT%H:%M:%S+00:00', started_at, '+' || captured_seconds || ' seconds')
+         FROM market_platform_metered_observations WHERE contract_id = ?1
+           AND captured_seconds + unfunded_seconds < billable_seconds ORDER BY julianday(started_at), id LIMIT 1",
+        params![contract_id], |row| row.get(0)).optional().map_err(db_error("read budget service anchor"))?;
+    crate::market_commission::freeze_period_tx(conn, contract_id, "metered_budget", &hold_id, false, anchor.as_deref().unwrap_or(now), now)?;
     Ok(Some(hold_id))
 }
 
@@ -2234,6 +2251,7 @@ pub(crate) fn renew_monthly_contract_tx(
         ],
     )
     .map_err(db_error("create renewed monthly period"))?;
+    crate::market_commission::freeze_period_tx(conn, contract_id, "monthly_period", &next_id, false, &start.to_rfc3339(), now)?;
     conn.execute(
         "UPDATE market_platform_contracts SET current_period_sequence = ?2,
                 renewal_anchor_day = ?5, status = 'active',

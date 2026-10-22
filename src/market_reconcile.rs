@@ -21,6 +21,8 @@ const CRITICAL_CODES: &[&str] = &[
     "paid_payout_missing_evidence",
     "wallet_transfer_missing_evidence",
     "wallet_transfer_orphan_journal",
+    "commission_evidence_mismatch",
+    "commission_orphan_journal",
 ];
 
 fn case_tx(
@@ -109,13 +111,20 @@ fn scope_blocked_tx(conn: &Connection, scope: FinanceScope<'_>) -> Result<bool, 
         FinanceScope::Provider(provider) => (
             "SELECT EXISTS(SELECT 1 FROM market_finance_reconciliation_cases c
              WHERE c.status = 'open' AND c.code = 'provider_liability_mismatch'
-               AND c.object_id = ?1)",
+               AND c.object_id = ?1)
+             OR EXISTS(SELECT 1 FROM market_finance_reconciliation_cases c
+                JOIN market_provider_earning_lots l ON l.id = c.object_id
+                WHERE c.status = 'open' AND c.code = 'commission_evidence_mismatch' AND l.provider_user_id = ?1)",
             Some(provider),
         ),
         FinanceScope::Contract(contract) => (
             "SELECT EXISTS(SELECT 1 FROM market_finance_reconciliation_cases c
              WHERE c.status = 'open' AND c.code = 'period_unfulfilled_mismatch'
-               AND c.object_id IN (SELECT id FROM market_platform_periods WHERE contract_id = ?1))",
+               AND c.object_id IN (SELECT id FROM market_platform_periods WHERE contract_id = ?1))
+             OR EXISTS(SELECT 1 FROM market_finance_reconciliation_cases c
+                JOIN market_provider_earning_lots l ON l.id = c.object_id
+                JOIN market_delivery_slices d ON d.id = l.delivery_slice_id
+                WHERE c.status = 'open' AND c.code = 'commission_evidence_mismatch' AND d.contract_id = ?1)",
             Some(contract),
         ),
         FinanceScope::Payouts => (
@@ -138,7 +147,7 @@ pub(crate) fn ensure_finance_scopes_safe_tx(
     let global: bool = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM market_finance_reconciliation_cases
-             WHERE status = 'open' AND code IN ('journal_unsealed', 'wallet_transfer_orphan_journal'))",
+             WHERE status = 'open' AND code IN ('journal_unsealed', 'wallet_transfer_orphan_journal', 'commission_orphan_journal'))",
             [],
             |row| row.get(0),
         )
@@ -190,6 +199,15 @@ fn critical_case_still_failed_tx(
     object_id: &str,
 ) -> Result<bool, AppError> {
     match (code, object_kind) {
+        ("commission_evidence_mismatch", "earning_lot") => Ok(!crate::market_commission::lot_evidence_valid_tx(conn, object_id)?),
+        ("commission_orphan_journal", "journal") => conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM market_journal_transactions j
+                WHERE j.id = ?1 AND j.source_kind = 'earning_lot' AND j.action = 'commission'
+                  AND NOT EXISTS(SELECT 1 FROM market_commission_splits WHERE allocation_journal_id = j.id))
+              OR EXISTS(SELECT 1 FROM market_journal_postings p WHERE p.journal_id = ?1
+                AND p.account_kind IN ('platform_commission_pending', 'platform_commission_revenue')
+                AND NOT EXISTS(SELECT 1 FROM market_provider_earning_lots l WHERE l.id = p.subject_id))",
+            params![object_id], |r| r.get(0)).map_err(db_error("recheck orphan commission journal")),
         ("wallet_projection_mismatch", "wallet") => {
             Ok(reconcile_wallet_tx(conn, object_id).is_err())
         }
@@ -557,7 +575,57 @@ pub(crate) fn audit_finance_tx(conn: &Connection, now: &str) -> Result<usize, Ap
         opened += case_tx(conn, "credited_topup_missing_evidence", "topup", &id, now)?;
     }
 
+    let cursor: String = conn
+        .query_row(
+            "SELECT last_lot_id FROM market_commission_audit_cursor WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(db_error("read commission audit cursor"))?;
+    let mut lots = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id FROM market_provider_earning_lots WHERE id > ?1 ORDER BY id LIMIT 200",
+            )
+            .map_err(db_error("prepare commission evidence audit"))?;
+        stmt.query_map(params![cursor], |r| r.get::<_, String>(0))
+            .map_err(db_error("query commission evidence audit"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_error("read commission evidence audit"))?
+    };
+    if lots.is_empty() && !cursor.is_empty() {
+        let mut stmt = conn
+            .prepare("SELECT id FROM market_provider_earning_lots ORDER BY id LIMIT 200")
+            .map_err(db_error("restart commission audit"))?;
+        lots = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(db_error("query restarted commission audit"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_error("read restarted commission audit"))?;
+    }
+    for lot in &lots {
+        if !crate::market_commission::lot_evidence_valid_tx(conn, lot)? {
+            opened += case_tx(
+                conn,
+                "commission_evidence_mismatch",
+                "earning_lot",
+                lot,
+                now,
+            )?;
+        }
+    }
+    conn.execute(
+        "UPDATE market_commission_audit_cursor SET last_lot_id = ?1 WHERE id = 1",
+        params![lots.last().map(String::as_str).unwrap_or("")],
+    )
+    .map_err(db_error("advance commission audit cursor"))?;
     for (sql, code, kind) in [
+        ("SELECT id FROM market_journal_transactions j WHERE source_kind = 'earning_lot' AND action = 'commission'
+              AND NOT EXISTS(SELECT 1 FROM market_commission_splits s WHERE s.allocation_journal_id = j.id)
+            UNION SELECT p.journal_id FROM market_journal_postings p
+              WHERE p.account_kind IN ('platform_commission_pending', 'platform_commission_revenue')
+                AND NOT EXISTS(SELECT 1 FROM market_provider_earning_lots l WHERE l.id = p.subject_id) LIMIT 100",
+            "commission_orphan_journal", "journal"),
         ("SELECT id FROM market_wallet_transfers t WHERE NOT EXISTS
             (SELECT 1 FROM market_verified_wallet_transfer_evidence e WHERE e.id = t.id) LIMIT 100",
             "wallet_transfer_missing_evidence", "wallet_transfer"),

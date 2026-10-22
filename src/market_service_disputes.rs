@@ -48,8 +48,8 @@ fn validate_reason_code(value: &str) -> Result<(), AppError> {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct DisputeView {
-    id: String,
+pub(crate) struct DisputeView {
+    pub(crate) id: String,
     contract_id: String,
     buyer_user_id: String,
     provider_user_id: String,
@@ -59,7 +59,7 @@ struct DisputeView {
     #[serde(serialize_with = "serialize_units")]
     refunded_units: i64,
     #[serde(serialize_with = "serialize_units")]
-    refundable_units: i64,
+    pub(crate) refundable_units: i64,
     version: i64,
     created_at: String,
     resolved_at: Option<String>,
@@ -90,21 +90,16 @@ fn view_tx(conn: &Connection, id: &str) -> Result<DisputeView, AppError> {
             },
         )
         .map_err(db_error("read service dispute"))?;
-    view.refundable_units = conn
-        .query_row(
-            "SELECT COALESCE(SUM(lot.amount_units - lot.reversed_units
-                                 - lot.held_units - lot.paid_units), 0)
-             FROM market_service_dispute_lots scope
-             JOIN market_provider_earning_lots lot ON lot.id = scope.earning_lot_id
-             WHERE scope.dispute_id = ?1",
-            params![id],
-            |row| row.get(0),
-        )
-        .map_err(db_error("read service refundable balance"))?;
+    view.refundable_units = refundable_lots_tx(conn, id)?
+        .iter()
+        .try_fold(0_i64, |sum, lot| {
+            sum.checked_add(lot.refundable_gross())
+                .ok_or_else(|| AppError::Internal("service refund capacity overflow".into()))
+        })?;
     Ok(view)
 }
 
-fn open_dispute_tx(
+pub(crate) fn open_dispute_tx(
     conn: &Connection,
     contract_id: &str,
     buyer: &str,
@@ -148,21 +143,33 @@ fn open_dispute_tx(
         }
         return view_tx(conn, &id);
     }
+    let previously_resolved: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM market_service_disputes
+             WHERE contract_id = ?1 AND status = 'resolved')",
+            params![contract_id],
+            |row| row.get(0),
+        )
+        .map_err(db_error("read latest service dispute resolution"))?;
+    // A partial refund may be supplemented without inventing new delivery.
+    // A reviewed no-refund decision still requires new service evidence.
+    // Keep earlier no-refund decisions protected even after a later partial
+    // refund, which must not reopen already adjudicated older deliveries.
     let latest_resolution: Option<String> = conn
         .query_row(
             "SELECT resolved_at FROM market_service_disputes
-             WHERE contract_id = ?1 AND status = 'resolved'
-             ORDER BY resolved_at DESC, id DESC LIMIT 1",
+         WHERE contract_id = ?1 AND status = 'resolved' AND refunded_units = 0
+         ORDER BY julianday(resolved_at) DESC, id DESC LIMIT 1",
             params![contract_id],
             |row| row.get(0),
         )
         .optional()
-        .map_err(db_error("read latest service dispute resolution"))?;
+        .map_err(db_error("read protected service dispute resolution"))?;
     if let Some(resolved_at) = latest_resolution.as_deref() {
         let new_delivery: i64 = conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM market_delivery_slices
-                 WHERE contract_id = ?1 AND created_at > ?2)",
+                 WHERE contract_id = ?1 AND julianday(created_at) > julianday(?2))",
                 params![contract_id, resolved_at],
                 |row| row.get(0),
             )
@@ -171,6 +178,24 @@ fn open_dispute_tx(
             return Err(AppError::Conflict(
                 "service dispute was already reviewed; new delivery is required to reopen it"
                     .into(),
+            ));
+        }
+    }
+    if previously_resolved {
+        let outstanding: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM market_provider_earning_lots lot
+             JOIN market_delivery_slices slice ON slice.id = lot.delivery_slice_id
+             WHERE slice.contract_id = ?1
+               AND lot.amount_units > lot.reversed_units + lot.commission_reversed_units
+               AND (?2 IS NULL OR julianday(slice.created_at) > julianday(?2)))",
+                params![contract_id, latest_resolution],
+                |row| row.get(0),
+            )
+            .map_err(db_error("check remaining disputed service"))?;
+        if !outstanding {
+            return Err(AppError::Conflict(
+                "service earnings were fully refunded; new delivery is required to reopen a dispute".into(),
             ));
         }
     }
@@ -188,8 +213,8 @@ fn open_dispute_tx(
          SELECT ?1, lot.id FROM market_provider_earning_lots lot
          JOIN market_delivery_slices slice ON slice.id = lot.delivery_slice_id
          WHERE slice.contract_id = ?2
-           AND lot.amount_units - lot.reversed_units - lot.paid_units > 0
-           AND (?3 IS NULL OR slice.created_at > ?3)",
+           AND lot.amount_units - lot.reversed_units - lot.commission_reversed_units > 0
+           AND (?3 IS NULL OR julianday(slice.created_at) > julianday(?3))",
         params![id, contract_id, latest_resolution],
     )
     .map_err(db_error("record earnings frozen by service dispute"))?;
@@ -214,13 +239,50 @@ struct RefundableLot {
     unlocked: i64,
     held: i64,
     paid: i64,
+    fee: i64,
+    fee_reversed: i64,
+    fee_unlocked: i64,
+}
+
+impl RefundableLot {
+    fn net(&self) -> i64 {
+        self.amount - self.fee
+    }
+    fn refunded_gross(&self) -> i64 {
+        self.reversed + self.fee_reversed
+    }
+    fn split_refund(&self, gross: i64) -> (i64, i64) {
+        let cumulative = self.refunded_gross() + gross;
+        let total_fee = ((i128::from(cumulative) * i128::from(self.fee)
+            + i128::from(self.amount / 2))
+            / i128::from(self.amount)) as i64;
+        let fee = total_fee - self.fee_reversed;
+        (gross - fee, fee)
+    }
+    // Allocated/paid Provider net cannot be clawed back. Find the exact gross
+    // capacity at the original split (including 0/100% and tiny rounding).
+    fn refundable_gross(&self) -> i64 {
+        let capacity = self.net() - self.reversed - self.held - self.paid;
+        let mut low = 0;
+        let mut high = self.amount - self.refunded_gross();
+        while low < high {
+            let mid = low + (high - low) / 2 + (high - low) % 2;
+            if self.split_refund(mid).0 <= capacity {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        low
+    }
 }
 
 fn refundable_lots_tx(conn: &Connection, dispute_id: &str) -> Result<Vec<RefundableLot>, AppError> {
     let mut statement = conn
         .prepare(
             "SELECT lot.id, lot.amount_units, lot.reversed_units, lot.unlocked_units,
-                    lot.held_units, lot.paid_units
+                    lot.held_units, lot.paid_units, lot.commission_units,
+                    lot.commission_reversed_units, lot.commission_unlocked_units
              FROM market_service_dispute_lots scope
              JOIN market_provider_earning_lots lot ON lot.id = scope.earning_lot_id
              JOIN market_delivery_slices slice ON slice.id = lot.delivery_slice_id
@@ -237,6 +299,9 @@ fn refundable_lots_tx(conn: &Connection, dispute_id: &str) -> Result<Vec<Refunda
                 unlocked: row.get(3)?,
                 held: row.get(4)?,
                 paid: row.get(5)?,
+                fee: row.get(6)?,
+                fee_reversed: row.get(7)?,
+                fee_unlocked: row.get(8)?,
             })
         })
         .map_err(db_error("query service refund lots"))?
@@ -244,7 +309,7 @@ fn refundable_lots_tx(conn: &Connection, dispute_id: &str) -> Result<Vec<Refunda
         .map_err(db_error("read service refund lots"))
 }
 
-fn resolve_dispute_tx(
+pub(crate) fn resolve_dispute_tx(
     conn: &Connection,
     dispute_id: &str,
     owner: &str,
@@ -268,13 +333,13 @@ fn resolve_dispute_tx(
     crate::market_reconcile::ensure_contract_finance_safe_tx(conn, &dispute.contract_id)?;
     let lots = refundable_lots_tx(conn, dispute_id)?;
     let refundable = lots.iter().try_fold(0_i64, |sum, lot| {
-        let amount = lot.amount - lot.reversed - lot.held - lot.paid;
+        let amount = lot.refundable_gross();
         sum.checked_add(amount)
             .ok_or_else(|| AppError::Internal("service refundable balance overflow".into()))
     })?;
     if refund_units > refundable {
         return Err(AppError::Conflict(
-            "service refund exceeds unpaid, unallocated Provider earnings".into(),
+            "service refund requires Owner review: original Provider net is already allocated or paid; cancel the pending payout or arrange recovery first".into(),
         ));
     }
     let mut left = refund_units;
@@ -282,11 +347,20 @@ fn resolve_dispute_tx(
         if left == 0 {
             break;
         }
-        let pending = lot.amount - lot.reversed - lot.unlocked;
+        if !crate::market_commission::lot_evidence_valid_tx(conn, &lot.id)? {
+            return Err(AppError::Conflict(
+                "service commission evidence requires Owner review".into(),
+            ));
+        }
+        let taken = left.min(lot.refundable_gross());
+        let (net_taken, fee_taken) = lot.split_refund(taken);
+        let pending = lot.net() - lot.reversed - lot.unlocked;
         let available = lot.unlocked - lot.held - lot.paid;
-        let from_pending = left.min(pending);
-        let from_available = (left - from_pending).min(available);
-        let taken = from_pending + from_available;
+        let from_pending = net_taken.min(pending);
+        let from_available = (net_taken - from_pending).min(available);
+        let fee_pending = lot.fee - lot.fee_reversed - lot.fee_unlocked;
+        let fee_from_pending = fee_taken.min(fee_pending);
+        let fee_from_revenue = fee_taken - fee_from_pending;
         if taken == 0 {
             continue;
         }
@@ -326,23 +400,59 @@ fn resolve_dispute_tx(
                 ));
             }
         }
+        for (fee, kind, action) in [
+            (
+                fee_from_pending,
+                "platform_commission_pending",
+                "refund_commission_pending",
+            ),
+            (
+                fee_from_revenue,
+                "platform_commission_revenue",
+                "refund_commission_revenue",
+            ),
+        ] {
+            if fee == 0 {
+                continue;
+            }
+            let journal = credit_wallet_from_liability_tx(
+                conn,
+                &dispute.buyer_user_id,
+                fee,
+                kind,
+                &lot.id,
+                "service_dispute",
+                dispute_id,
+                &format!("{action}:{}", lot.id),
+                time,
+            )?;
+            if !journal.inserted {
+                return Err(AppError::Internal(
+                    "commission refund journal already exists".into(),
+                ));
+            }
+        }
         let changed = conn
             .execute(
                 "UPDATE market_provider_earning_lots
                  SET reversed_units = reversed_units + ?2,
-                     unlocked_units = unlocked_units - ?3
+                     unlocked_units = unlocked_units - ?3,
+                     commission_reversed_units = commission_reversed_units + ?9,
+                     commission_unlocked_units = commission_unlocked_units - ?10
                  WHERE id = ?1 AND amount_units = ?4 AND reversed_units = ?5
                    AND unlocked_units = ?6 AND held_units = ?7 AND paid_units = ?8
                    AND disputed = 1",
                 params![
                     lot.id,
-                    taken,
+                    net_taken,
                     from_available,
                     lot.amount,
                     lot.reversed,
                     lot.unlocked,
                     lot.held,
-                    lot.paid
+                    lot.paid,
+                    fee_taken,
+                    fee_from_revenue
                 ],
             )
             .map_err(db_error("reverse disputed Provider earning"))?;
@@ -351,6 +461,11 @@ fn resolve_dispute_tx(
                 "service earning changed during refund".into(),
             ));
         }
+        conn.execute(
+            "INSERT INTO market_commission_refunds VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![dispute_id, lot.id, taken, net_taken, fee_taken, time],
+        )
+        .map_err(db_error("record service refund allocation"))?;
         left -= taken;
     }
     if left != 0 {
@@ -369,12 +484,7 @@ fn resolve_dispute_tx(
         return Err(AppError::Conflict("service dispute version changed".into()));
     }
     crate::market_finance::release_earning_holds_tx(
-        conn,
-        "dispute",
-        dispute_id,
-        owner,
-        resolution,
-        time,
+        conn, "dispute", dispute_id, owner, resolution, time,
     )?;
     conn.execute(
         "INSERT INTO market_finance_audit_events
@@ -939,5 +1049,4 @@ mod tests {
         assert_eq!(held, 0, "earnings are no longer frozen forever");
         tx.commit().unwrap();
     }
-
 }

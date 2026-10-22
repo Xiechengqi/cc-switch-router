@@ -3641,6 +3641,9 @@ impl AppStore {
         .map_err(|error| AppError::Internal(format!("insert allocation quote failed: {error}")))?;
         let mut items = Vec::with_capacity(candidates.len());
         for (position, candidate) in candidates.into_iter().enumerate() {
+            if funding_rail == "platform_wallet" {
+                crate::market_commission::freeze_quote_tx(&tx, &quote_id, &candidate.provider_id, &now_rfc)?;
+            }
             let changed = tx
                 .execute(
                     "UPDATE router_ssh_hosts SET status = ?2, updated_at = ?3

@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import { ProviderCommissionPreview } from "@/components/market/provider-commission-preview";
 import { Button, Modal } from "@heroui/react";
 import {
   Clock3,
@@ -434,6 +435,7 @@ function SeatFields({
               <div className="flex h-10 items-center rounded-md border border-slate-200 bg-slate-50 px-3 text-sm font-medium">{MARKET_CURRENCY}</div>
             </div>
           </div>
+          <ProviderCommissionPreview price={draft.price} />
           <div className="grid gap-3 sm:grid-cols-2">
             <label className="grid gap-1 text-xs text-slate-500">
               {t("shareMarket.dialog.trialHours")}

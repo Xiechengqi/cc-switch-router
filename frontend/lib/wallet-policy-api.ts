@@ -1,6 +1,22 @@
 import { authFetch } from "@/lib/auth";
 import { parseJson } from "@/lib/api";
 
+export type CommissionTerms = { policyVersion: number; rateBps: number; effectiveAt: string };
+export type CommissionPolicy = { version: number; current: CommissionTerms; scheduled: CommissionTerms | null; increaseNoticeDays: number; canEdit: boolean };
+export async function getCommissionPolicy(admin = false) {
+  return validCommissionPolicy(await parseJson<CommissionPolicy>(await authFetch(admin ? "/v1/admin/market-finance/commission-policy" : "/v1/market-wallet/commission-policy", { cache: "no-store" })));
+}
+export async function saveCommissionPolicy(version: number, rateBps: number) {
+  return validCommissionPolicy(await parseJson<CommissionPolicy>(await authFetch("/v1/admin/market-finance/commission-policy", {
+    method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ expectedVersion: version, rateBps }),
+  })));
+}
+function validCommissionPolicy(value: CommissionPolicy) {
+  const valid = (terms: CommissionTerms | null | undefined) => !!terms && Number.isSafeInteger(terms.policyVersion) && terms.policyVersion > 0 && Number.isInteger(terms.rateBps) && terms.rateBps >= 0 && terms.rateBps <= 10000 && typeof terms.effectiveAt === "string" && Number.isFinite(Date.parse(terms.effectiveAt));
+  if (!value || !Number.isSafeInteger(value.version) || value.version < 1 || typeof value.canEdit !== "boolean" || value.increaseNoticeDays !== 7 || !valid(value.current) || (value.scheduled !== null && !valid(value.scheduled))) throw new Error("Service fee policy unavailable; reload to retry.");
+  return value;
+}
+
 export type WalletPolicy = {
   version: number;
   maintenanceFeeBps: number;
