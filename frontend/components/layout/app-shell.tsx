@@ -9,6 +9,8 @@ import * as React from "react";
 import { LoginDialog } from "@/components/auth/login-dialog";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
+import { NavbarWalletBalance } from "@/components/layout/navbar-wallet-balance";
+import { MarketWalletBalanceProvider } from "@/components/market/market-wallet-balance-provider";
 import { refreshAccessToken } from "@/lib/auth";
 import { DashboardDataProvider } from "@/components/dashboard/dashboard-data";
 import { AnnouncementDialog } from "@/components/announcement/announcement-dialog";
@@ -319,12 +321,12 @@ function Topbar({ active }: { active: DashboardShellActive }) {
   return (
     <>
       {/*
-        Three-column topbar: brand (logo + region title) | centered section tabs | lang + user.
+        Topbar: brand | section tabs | wallet, currency, language and user.
         Region is a chrome-less title dropdown (font-display + chevron), not a bordered Select.
       */}
       <div className="sticky top-0 z-40 bg-background/85 backdrop-blur-md">
         <header className="mx-auto w-[calc(100%-2rem)] max-w-7xl py-3.5">
-        <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 gap-y-2 lg:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)]">
+        <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 gap-y-2 xl:grid-cols-[auto_minmax(0,1fr)_auto]">
           <div className="flex min-w-0 items-center gap-2.5 justify-self-start">
             <Link href={DASHBOARD_CLIENTS_PATH} className="flex h-11 w-11 shrink-0 items-center justify-center rounded-md active:bg-slate-100" aria-label="CC-Switch Router">
               <Image src="/router-logo.svg" alt="" width={32} height={32} className="h-8 w-8 shrink-0" priority />
@@ -333,14 +335,15 @@ function Topbar({ active }: { active: DashboardShellActive }) {
           </div>
 
           {showDashboardNav ? (
-            <div className="col-span-2 row-start-2 min-w-0 max-w-full justify-self-stretch overflow-x-auto [-ms-overflow-style:none] [scrollbar-width:none] lg:col-span-1 lg:col-start-2 lg:row-start-1 lg:justify-self-center [&::-webkit-scrollbar]:hidden">
+            <div className="col-span-2 row-start-2 min-w-0 max-w-full justify-self-stretch overflow-x-auto [-ms-overflow-style:none] [scrollbar-width:none] xl:col-span-1 xl:col-start-2 xl:row-start-1 xl:justify-self-center [&::-webkit-scrollbar]:hidden">
               <DashboardNav active={active} authed={showAuthedChrome} pendingAccessRequests={pendingAccessRequests} />
             </div>
           ) : (
             <div />
           )}
 
-          <div className="col-start-2 row-start-1 flex flex-nowrap items-center justify-end gap-2 justify-self-end lg:col-start-3">
+          <div className="col-start-2 row-start-1 flex min-w-0 flex-nowrap items-center justify-end gap-0.5 justify-self-end sm:gap-2 xl:col-start-3">
+            <NavbarWalletBalance />
             <CurrencySwitcher />
             <LanguageSwitcher />
             {showAuthedChrome ? (
@@ -348,10 +351,10 @@ function Topbar({ active }: { active: DashboardShellActive }) {
                 <Dropdown.Trigger
                   aria-label={displayEmail || t("nav.userMenu")}
                   isDisabled={loading && !authed}
-                  className="inline-flex h-11 max-w-[12rem] shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md px-2.5 text-sm font-medium text-slate-500 outline-none hover:bg-slate-100 hover:text-slate-700 active:bg-slate-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+                  className="inline-flex h-11 max-w-36 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md px-2.5 text-sm font-medium text-slate-500 outline-none hover:bg-slate-100 hover:text-slate-700 active:bg-slate-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
                 >
                   <UserRound className="h-4 w-4 shrink-0 text-slate-500" />
-                  <span className="hidden min-w-0 truncate sm:inline">{displayEmail}</span>
+                  <span className="hidden min-w-0 truncate sm:inline xl:hidden 2xl:inline">{displayEmail}</span>
                 </Dropdown.Trigger>
                 <Dropdown.Popover placement="bottom right">
                   <Dropdown.Menu aria-label={t("nav.userMenu")}>
@@ -419,24 +422,26 @@ export function AppShell({
   const dashboardDataEnabled = active === "clients";
   return (
     <DashboardDataProvider enabled={dashboardDataEnabled}>
-      <a
-        href="#main-content"
-        className="sr-only fixed left-3 top-3 z-[100] rounded-md bg-white px-3 py-2 text-sm font-semibold text-foreground shadow-md ring-2 ring-primary focus:not-sr-only"
-      >
-        {t("common.skipToContent")}
-      </a>
-      <div className="flex min-h-dvh min-w-0 flex-col">
-        <Topbar active={active} />
-        <div
-          id="main-content"
-          tabIndex={-1}
-          className="flex min-w-0 flex-1 flex-col pt-4 outline-none sm:pt-5"
+      <MarketWalletBalanceProvider>
+        <a
+          href="#main-content"
+          className="sr-only fixed left-3 top-3 z-[100] rounded-md bg-white px-3 py-2 text-sm font-semibold text-foreground shadow-md ring-2 ring-primary focus:not-sr-only"
         >
-          {children}
+          {t("common.skipToContent")}
+        </a>
+        <div className="flex min-h-dvh min-w-0 flex-col">
+          <Topbar active={active} />
+          <div
+            id="main-content"
+            tabIndex={-1}
+            className="flex min-w-0 flex-1 flex-col pt-4 outline-none sm:pt-5"
+          >
+            {children}
+          </div>
         </div>
-      </div>
-      <AnnouncementDialog />
-      <Toast.Provider placement="top end" />
+        <AnnouncementDialog />
+        <Toast.Provider placement="top end" />
+      </MarketWalletBalanceProvider>
     </DashboardDataProvider>
   );
 }

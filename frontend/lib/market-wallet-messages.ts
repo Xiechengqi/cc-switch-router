@@ -2,6 +2,7 @@
 // Buyer wallet, Provider finance and wallet & trading notifications.
 
 export const marketWalletMessagesEn = {
+  "marketWallet.navBalance": "Platform balance",
   "marketWallet.copy": "Copy",
   "marketWallet.copied": "Copied",
   "marketWallet.copyAddress": "Copy address",
@@ -136,6 +137,7 @@ export const marketWalletMessagesEn = {
 } as const;
 
 export const marketWalletMessagesZh = {
+  "marketWallet.navBalance": "平台余额",
   "marketWallet.copy": "复制",
   "marketWallet.copied": "已复制",
   "marketWallet.copyAddress": "复制地址",

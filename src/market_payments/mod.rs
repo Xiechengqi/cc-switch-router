@@ -867,7 +867,7 @@ async fn get_wallet(
     headers: HeaderMap,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let session = require_session(&state, &headers).await?;
-    let (snapshot, mode, cutover_approved, has_wallet_activity) = {
+    let (snapshot, mode, cutover_approved, has_wallet_activity, earnings_conversion) = {
         let conn = state.store.conn.lock().await;
         let snapshot = wallet_snapshot_tx(&conn, &session.user_id)?;
         let (mode, cutover_approved): (String, bool) = conn
@@ -886,7 +886,15 @@ async fn get_wallet(
                 |row| row.get(0),
             )
             .map_err(db_error("read wallet activity"))?;
-        (snapshot, mode, cutover_approved, has_wallet_activity)
+        let conversion =
+            crate::market_earning_conversions::capacity_tx(&conn, &session.user_id, &now())?;
+        (
+            snapshot,
+            mode,
+            cutover_approved,
+            has_wallet_activity,
+            conversion,
+        )
     };
     let can_topup = user_topup_allowed(
         &mode,
@@ -914,6 +922,7 @@ async fn get_wallet(
             "mode": mode,
             "canTopup": can_topup,
             "hasWalletActivity": has_wallet_activity,
+            "earningsConversion": earnings_conversion,
         })),
     ))
 }

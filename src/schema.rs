@@ -266,6 +266,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         76,
         include_str!("../schema/0076_market_provider_commission.sql"),
     ),
+    (
+        77,
+        include_str!("../schema/0077_market_earning_wallet_conversion.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -793,7 +797,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count baseline tables");
-        assert_eq!(table_count, 221);
+        assert_eq!(table_count, 224);
         let removed_client_recovery_table_count = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -1340,6 +1344,90 @@ mod tests {
     }
 
     #[test]
+    fn earning_conversion_upgrade_preserves_ledger_and_only_adds_new_capabilities() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 76);
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        crate::market_wallet::credit_verified_topup_tx(
+            &conn,
+            "buyer",
+            "upgrade-credit",
+            100,
+            "receipt",
+            "2026-10-01T00:00:00Z",
+        )
+        .unwrap();
+        crate::market_finance::record_metered_delivery_tx(
+            &conn,
+            "share",
+            "old",
+            "legacy-delivery",
+            "buyer",
+            "provider",
+            "2026-10-01T00:00:00Z",
+            "2026-10-01T00:00:01Z",
+            86400,
+            "2026-10-01T00:00:01Z",
+        )
+        .unwrap();
+        let before = crate::market_wallet::wallet_snapshot_tx(&conn, "buyer").unwrap();
+        let posting_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM market_journal_postings", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",[],|r|r.get::<_,i64>(0)).unwrap(),224);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM market_journal_postings", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            posting_count
+        );
+        assert_eq!(
+            crate::market_wallet::wallet_snapshot_tx(&conn, "buyer")
+                .unwrap()
+                .posted_units,
+            before.posted_units
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT SUM(converted_units) FROM market_provider_earning_lots",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert!(
+            !crate::market_wallet_policy::policy_tx(&conn)
+                .unwrap()
+                .earnings_conversions_paused
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
+        let plan=conn.prepare("EXPLAIN QUERY PLAN SELECT * FROM market_provider_earning_lots WHERE provider_user_id=?1 AND disputed=0 ORDER BY unlock_at,id")
+            .unwrap().query_map(params!["provider"],|r|r.get::<_,String>(3)).unwrap().collect::<Result<Vec<_>,_>>().unwrap();
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("idx_market_earning_conversion_candidates"))
+        );
+        let plan=conn.prepare("EXPLAIN QUERY PLAN SELECT * FROM market_earning_conversion_allocations WHERE earning_lot_id=?1")
+            .unwrap().query_map(params!["lot"],|r|r.get::<_,String>(3)).unwrap().collect::<Result<Vec<_>,_>>().unwrap();
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("idx_market_earning_conversion_allocations_lot"))
+        );
+    }
+
+    #[test]
     fn wallet_policy_upgrade_preserves_sealed_journals_and_payment_views() {
         let conn = memory_connection();
         install_schema_through(&conn, 74);
@@ -1510,7 +1598,16 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(tables_after - tables_before, 9);
+        assert_eq!(tables_after - tables_before, 12);
+        assert_eq!(
+            conn.query_row(
+                "SELECT converted_units FROM market_provider_earning_lots WHERE id = 'old-lot'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
         let split_lookup = conn
             .prepare("EXPLAIN QUERY PLAN SELECT 1 FROM market_commission_splits WHERE allocation_journal_id = ?1")
             .unwrap()
@@ -1518,7 +1615,11 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert!(split_lookup.iter().any(|step| step.contains("idx_market_commission_splits_journal")));
+        assert!(
+            split_lookup
+                .iter()
+                .any(|step| step.contains("idx_market_commission_splits_journal"))
+        );
         assert_eq!(before, postings(&conn));
         assert_eq!(
             conn.query_row(

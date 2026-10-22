@@ -44,6 +44,7 @@ export function MarketFinanceOverviewSection({ refreshKey }: { refreshKey: numbe
     { key: "commission.pending", value: units(overview.commissionPendingUnits ?? "0") },
     { key: "commission.revenue", value: units(overview.commissionRevenueUnits ?? "0") },
     { key: "commission.reversed", value: units(overview.commissionReversedUnits ?? "0") },
+    { key: "earningConversion.overview", value: units(overview.earningConvertedUnits ?? "0") },
     { key: "settings.marketFinance.overview.gatewayCost", value: formatMinorUsd(overview.estimatedGatewayCostMinor) },
     { key: "settings.marketFinance.overview.openCases", value: overview.openCases.toLocaleString(locale) },
     { key: "settings.marketFinance.overview.criticalCases", value: overview.openCriticalCases.toLocaleString(locale), alert: overview.openCriticalCases > 0 },

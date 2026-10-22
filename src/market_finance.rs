@@ -432,7 +432,7 @@ fn notify_providers_for_lots_tx(
     let providers = {
         let mut statement = conn
             .prepare(&format!(
-                "SELECT provider_user_id, SUM(net_amount_units - reversed_units - paid_units)
+                "SELECT provider_user_id, SUM(net_amount_units - reversed_units - paid_units - converted_units)
                  FROM market_provider_earning_lots WHERE id IN ({lot_filter_sql})
                  GROUP BY provider_user_id"
             ))
@@ -647,7 +647,7 @@ pub(crate) fn active_earning_holds_tx(
     let mut statement = conn
         .prepare(
             "SELECT hold.reason_kind, hold.reason_ref, lot.provider_user_id, COUNT(*),
-                    SUM(lot.net_amount_units - lot.reversed_units - lot.paid_units), MIN(hold.created_at)
+                    SUM(lot.net_amount_units - lot.reversed_units - lot.paid_units - lot.converted_units), MIN(hold.created_at)
              FROM market_provider_earning_holds hold
              JOIN market_provider_earning_lots lot ON lot.id = hold.lot_id
              WHERE hold.released_at IS NULL AND (?1 IS NULL OR lot.provider_user_id = ?1)
@@ -675,6 +675,8 @@ pub(crate) fn active_earning_holds_tx(
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ProviderFinanceSummary {
     #[serde(serialize_with = "serialize_units")]
+    pub converted_units: i64,
+    #[serde(serialize_with = "serialize_units")]
     pub gross_earned_units: i64,
     #[serde(serialize_with = "serialize_units")]
     pub commission_units: i64,
@@ -698,17 +700,19 @@ pub(crate) fn provider_summary_tx(
 ) -> Result<ProviderFinanceSummary, AppError> {
     conn.query_row(
         "SELECT COALESCE(SUM(net_amount_units - reversed_units - unlocked_units), 0),
-                COALESCE(SUM(unlocked_units - held_units - paid_units), 0),
+                COALESCE(SUM(unlocked_units - held_units - paid_units - converted_units), 0),
                 COALESCE(SUM(CASE WHEN disputed = 0
-                                  THEN unlocked_units - held_units - paid_units ELSE 0 END), 0),
+                                  THEN unlocked_units - held_units - paid_units - converted_units ELSE 0 END), 0),
                 COALESCE(SUM(held_units), 0), COALESCE(SUM(paid_units), 0),
                 COALESCE(SUM(amount_units - reversed_units - commission_reversed_units), 0),
                 COALESCE(SUM(commission_units - commission_reversed_units), 0),
-                COALESCE(SUM(net_amount_units - reversed_units), 0)
+                COALESCE(SUM(net_amount_units - reversed_units), 0),
+                COALESCE(SUM(converted_units), 0)
          FROM market_provider_earning_lots WHERE provider_user_id = ?1",
         params![provider_user_id],
         |row| {
             Ok(ProviderFinanceSummary {
+                converted_units: row.get(8)?,
                 gross_earned_units: row.get(5)?,
                 commission_units: row.get(6)?,
                 net_earned_units: row.get(7)?,

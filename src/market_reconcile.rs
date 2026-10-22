@@ -23,6 +23,9 @@ const CRITICAL_CODES: &[&str] = &[
     "wallet_transfer_orphan_journal",
     "commission_evidence_mismatch",
     "commission_orphan_journal",
+    "earning_conversion_missing_evidence",
+    "earning_conversion_allocation_mismatch",
+    "earning_conversion_orphan_journal",
 ];
 
 fn case_tx(
@@ -85,7 +88,7 @@ pub(crate) enum FinanceScope<'a> {
     Provider(&'a str),
     /// One platform contract and its periods.
     Contract(&'a str),
-    /// External transfers: withdrawals and balance refunds.
+    /// External Provider payouts, including historical payout evidence.
     Payouts,
 }
 
@@ -105,7 +108,14 @@ fn scope_blocked_tx(conn: &Connection, scope: FinanceScope<'_>) -> Result<bool, 
                      (SELECT id FROM market_topup_orders WHERE user_id = ?1))
                  OR (c.code = 'wallet_transfer_missing_evidence' AND c.object_id IN
                      (SELECT id FROM market_wallet_transfers
-                      WHERE sender_user_id = ?1 OR recipient_user_id = ?1))))",
+                      WHERE sender_user_id = ?1 OR recipient_user_id = ?1))
+                 OR (c.code = 'earning_conversion_missing_evidence' AND c.object_id IN
+                     (SELECT v.id FROM market_earning_wallet_conversions v
+                      LEFT JOIN market_earning_conversion_allocations a ON a.conversion_id = v.id
+                      LEFT JOIN market_provider_earning_lots l ON l.id = a.earning_lot_id
+                      WHERE v.user_id = ?1 OR l.provider_user_id = ?1))
+                 OR (c.code = 'earning_conversion_allocation_mismatch' AND c.object_id IN
+                     (SELECT id FROM market_provider_earning_lots WHERE provider_user_id = ?1))))",
             Some(user),
         ),
         FinanceScope::Provider(provider) => (
@@ -114,7 +124,13 @@ fn scope_blocked_tx(conn: &Connection, scope: FinanceScope<'_>) -> Result<bool, 
                AND c.object_id = ?1)
              OR EXISTS(SELECT 1 FROM market_finance_reconciliation_cases c
                 JOIN market_provider_earning_lots l ON l.id = c.object_id
-                WHERE c.status = 'open' AND c.code = 'commission_evidence_mismatch' AND l.provider_user_id = ?1)",
+                WHERE c.status = 'open' AND c.code IN ('commission_evidence_mismatch','earning_conversion_allocation_mismatch') AND l.provider_user_id = ?1)
+             OR EXISTS (SELECT 1 FROM market_finance_reconciliation_cases c
+                WHERE c.status = 'open' AND c.code = 'earning_conversion_missing_evidence'
+                 AND c.object_id IN (SELECT v.id FROM market_earning_wallet_conversions v
+                   LEFT JOIN market_earning_conversion_allocations a ON a.conversion_id = v.id
+                   LEFT JOIN market_provider_earning_lots l ON l.id = a.earning_lot_id
+                   WHERE v.user_id = ?1 OR l.provider_user_id = ?1))",
             Some(provider),
         ),
         FinanceScope::Contract(contract) => (
@@ -124,7 +140,12 @@ fn scope_blocked_tx(conn: &Connection, scope: FinanceScope<'_>) -> Result<bool, 
              OR EXISTS(SELECT 1 FROM market_finance_reconciliation_cases c
                 JOIN market_provider_earning_lots l ON l.id = c.object_id
                 JOIN market_delivery_slices d ON d.id = l.delivery_slice_id
-                WHERE c.status = 'open' AND c.code = 'commission_evidence_mismatch' AND d.contract_id = ?1)",
+                WHERE c.status = 'open' AND c.code IN ('commission_evidence_mismatch','earning_conversion_allocation_mismatch') AND d.contract_id = ?1)
+             OR EXISTS (SELECT 1 FROM market_finance_reconciliation_cases c
+                JOIN market_earning_conversion_allocations a ON a.conversion_id = c.object_id
+                JOIN market_provider_earning_lots l ON l.id = a.earning_lot_id
+                JOIN market_delivery_slices d ON d.id = l.delivery_slice_id
+                WHERE c.status = 'open' AND c.code = 'earning_conversion_missing_evidence' AND d.contract_id = ?1)",
             Some(contract),
         ),
         FinanceScope::Payouts => (
@@ -147,7 +168,7 @@ pub(crate) fn ensure_finance_scopes_safe_tx(
     let global: bool = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM market_finance_reconciliation_cases
-             WHERE status = 'open' AND code IN ('journal_unsealed', 'wallet_transfer_orphan_journal', 'commission_orphan_journal'))",
+             WHERE status = 'open' AND code IN ('journal_unsealed', 'wallet_transfer_orphan_journal', 'commission_orphan_journal', 'earning_conversion_orphan_journal'))",
             [],
             |row| row.get(0),
         )
@@ -199,6 +220,15 @@ fn critical_case_still_failed_tx(
     object_id: &str,
 ) -> Result<bool, AppError> {
     match (code, object_kind) {
+        ("earning_conversion_allocation_mismatch", "earning_lot") =>
+            Ok(!crate::market_earning_conversions::lot_evidence_valid_tx(conn, object_id)?),
+        ("earning_conversion_missing_evidence", "earning_conversion") =>
+            conn.query_row("SELECT NOT EXISTS(SELECT 1 FROM market_verified_earning_conversion_evidence WHERE id = ?1)",
+                params![object_id], |r| r.get(0)).map_err(db_error("recheck earning conversion evidence")),
+        ("earning_conversion_orphan_journal", "journal") =>
+            conn.query_row("SELECT NOT EXISTS(SELECT 1 FROM market_earning_wallet_conversions c
+                JOIN market_verified_earning_conversion_evidence e ON e.id = c.id WHERE c.journal_id = ?1)",
+                params![object_id], |r| r.get(0)).map_err(db_error("recheck orphan earning conversion")),
         ("commission_evidence_mismatch", "earning_lot") => Ok(!crate::market_commission::lot_evidence_valid_tx(conn, object_id)?),
         ("commission_orphan_journal", "journal") => conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM market_journal_transactions j
@@ -603,11 +633,21 @@ pub(crate) fn audit_finance_tx(conn: &Connection, now: &str) -> Result<usize, Ap
             .collect::<Result<Vec<_>, _>>()
             .map_err(db_error("read restarted commission audit"))?;
     }
+    let mut conversion_evidence = crate::market_earning_conversions::EvidenceBatch::default();
     for lot in &lots {
         if !crate::market_commission::lot_evidence_valid_tx(conn, lot)? {
             opened += case_tx(
                 conn,
                 "commission_evidence_mismatch",
+                "earning_lot",
+                lot,
+                now,
+            )?;
+        }
+        if !conversion_evidence.lot_valid_tx(conn, lot)? {
+            opened += case_tx(
+                conn,
+                "earning_conversion_allocation_mismatch",
                 "earning_lot",
                 lot,
                 now,
@@ -619,7 +659,49 @@ pub(crate) fn audit_finance_tx(conn: &Connection, now: &str) -> Result<usize, Ap
         params![lots.last().map(String::as_str).unwrap_or("")],
     )
     .map_err(db_error("advance commission audit cursor"))?;
+    // A persistent cursor ensures old and high-volume conversion records are
+    // checked eventually without rescanning the whole history on every pass.
+    let cursor: String = conn
+        .query_row(
+            "SELECT earning_conversion_audit_cursor FROM market_finance_control WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(db_error("read conversion audit cursor"))?;
+    let read_batch = |after: &str| -> Result<Vec<String>, AppError> {
+        let mut stmt = conn.prepare("SELECT id FROM market_earning_wallet_conversions WHERE id > ?1 ORDER BY id LIMIT 200")
+            .map_err(db_error("prepare conversion evidence audit"))?;
+        stmt.query_map(params![after], |r| r.get(0))
+            .map_err(db_error("query conversion evidence audit"))?
+            .collect::<crate::db::Result<Vec<_>>>()
+            .map_err(db_error("read conversion evidence audit"))
+    };
+    let mut conversions = read_batch(&cursor)?;
+    if conversions.is_empty() && !cursor.is_empty() {
+        conversions = read_batch("")?;
+    }
+    for id in &conversions {
+        let valid: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM market_verified_earning_conversion_evidence WHERE id = ?1)",params![id],|r| r.get(0))
+            .map_err(db_error("verify conversion evidence"))?;
+        if !valid {
+            opened += case_tx(
+                conn,
+                "earning_conversion_missing_evidence",
+                "earning_conversion",
+                id,
+                now,
+            )?;
+        }
+    }
+    conn.execute(
+        "UPDATE market_finance_control SET earning_conversion_audit_cursor = ?1 WHERE id = 1",
+        params![conversions.last().map(String::as_str).unwrap_or("")],
+    )
+    .map_err(db_error("advance conversion audit cursor"))?;
     for (sql, code, kind) in [
+        ("SELECT id FROM market_journal_transactions j WHERE source_kind = 'earning_conversion'
+             AND NOT EXISTS(SELECT 1 FROM market_earning_wallet_conversions c WHERE c.journal_id = j.id) LIMIT 100",
+            "earning_conversion_orphan_journal", "journal"),
         ("SELECT id FROM market_journal_transactions j WHERE source_kind = 'earning_lot' AND action = 'commission'
               AND NOT EXISTS(SELECT 1 FROM market_commission_splits s WHERE s.allocation_journal_id = j.id)
             UNION SELECT p.journal_id FROM market_journal_postings p

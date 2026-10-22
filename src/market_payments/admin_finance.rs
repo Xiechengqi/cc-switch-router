@@ -43,6 +43,8 @@ pub(super) struct FinanceOverview {
     commission_revenue_units: i64,
     #[serde(serialize_with = "serialize_units")]
     commission_reversed_units: i64,
+    #[serde(serialize_with = "serialize_units")]
+    earning_converted_units: i64,
     open_cases: i64,
     open_critical_cases: i64,
     held_earning_lots: i64,
@@ -109,6 +111,14 @@ fn overview_tx(conn: &Connection) -> Result<FinanceOverview, AppError> {
                 |r| r.get(0),
             )
             .map_err(db_error("sum reversed service commission"))?,
+        // Internal liability reassignment, never a top-up or platform revenue.
+        earning_converted_units: conn
+            .query_row(
+                "SELECT COALESCE(SUM(amount_units), 0) FROM market_earning_wallet_conversions",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(db_error("sum earning conversions"))?,
         open_cases,
         open_critical_cases: crate::market_reconcile::critical_case_count_tx(conn)?,
         held_earning_lots: held_lots,

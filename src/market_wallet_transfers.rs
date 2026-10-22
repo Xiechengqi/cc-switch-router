@@ -158,6 +158,12 @@ pub(crate) fn prune_unused_tx(
 ) -> Result<(), AppError> {
     let old = (time - Duration::days(30)).to_rfc3339();
     conn.execute(
+        "DELETE FROM market_earning_conversion_quotes WHERE id IN
+         (SELECT q.id FROM market_earning_conversion_quotes q WHERE q.expires_at < ?1
+          AND NOT EXISTS(SELECT 1 FROM market_earning_wallet_conversions c WHERE c.quote_id = q.id) LIMIT 2000)",
+        params![old],
+    ).map_err(db_error("prune unused conversion quotes"))?;
+    conn.execute(
         "DELETE FROM market_wallet_transfer_attempts WHERE id IN
         (SELECT id FROM market_wallet_transfer_attempts WHERE created_at < ?1 LIMIT 2000)",
         params![(time - Duration::days(1)).to_rfc3339()],
@@ -686,6 +692,42 @@ async fn detail(
     let transfer = conn.query_row(&format!("{TRANSFER_SELECT} WHERE id = ?1 AND (sender_user_id = ?2 OR recipient_user_id = ?2)"), params![id, user.user_id], transfer_row)
         .optional().map_err(db_error("read wallet transfer"))?.ok_or_else(|| AppError::NotFound("wallet transfer not found".into()))?;
     Ok((no_store(), Json(transfer)))
+}
+
+#[cfg(test)]
+pub(crate) fn verified_transfer_for_test(
+    conn: &Connection,
+    sender: &str,
+    recipient: &str,
+    amount: i64,
+    at: &str,
+) -> Result<(), AppError> {
+    let runtime = crate::market_payments::MarketPaymentsRuntime::for_test();
+    let quote = Uuid::new_v4().to_string();
+    let challenge = Uuid::new_v4().to_string();
+    let sender_email = require_user_tx(conn, sender)?;
+    let recipient_email = require_user_tx(conn, recipient)?;
+    let expiry =
+        (chrono::DateTime::parse_from_rfc3339(at).unwrap() + Duration::minutes(10)).to_rfc3339();
+    conn.execute("INSERT INTO market_wallet_transfer_quotes (id,sender_user_id,recipient_user_id,sender_email,recipient_email,amount_units,expires_at,created_at)
+        VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",params![quote,sender,recipient,sender_email,recipient_email,amount,expiry,at]).unwrap();
+    let (version, mac) = runtime.transfer_mac(&challenge, &quote, "012345").unwrap();
+    conn.execute("INSERT INTO market_wallet_transfer_challenges (id,quote_id,code_mac,key_version,expires_at,delivered_at,created_ip,created_at)
+        VALUES (?1,?2,?3,?4,?5,?6,'127.0.0.1',?6)",params![challenge,quote,mac,version,expiry,at]).unwrap();
+    confirm_tx(
+        conn,
+        &runtime,
+        sender,
+        "converted-transfer",
+        &ConfirmRequest {
+            quote_id: quote,
+            challenge_id: challenge,
+            code: "012345".into(),
+        },
+        at,
+    )?
+    .ok_or_else(|| AppError::Internal("test transfer code rejected".into()))?;
+    Ok(())
 }
 
 #[cfg(test)]

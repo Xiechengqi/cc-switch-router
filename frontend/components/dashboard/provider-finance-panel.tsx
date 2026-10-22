@@ -34,6 +34,9 @@ import {
   type MarketProviderWithdrawal,
 } from "@/lib/market-wallet-api";
 import { formatWalletUnits, parseWithdrawalMinor } from "@/lib/market-wallet-money";
+import { useAuth } from "@/components/auth/auth-provider";
+import { EarningWalletConversion, EarningConversionHistory } from "@/components/dashboard/earning-wallet-conversion";
+import { subscribeMarketBalanceChanged } from "@/lib/earning-wallet-conversion";
 
 const UNITS_PER_MINOR = 86_400n;
 const MAX_WITHDRAWAL_MINOR = 500_000;
@@ -63,11 +66,13 @@ function lotState(lot: MarketProviderEarningLot, nowMs: number): { key: MessageK
   if (net === 0n && units(lot.grossUnits ?? lot.amountUnits) > units(lot.reversedUnits) + units(lot.commissionReversedUnits ?? "0")) return { key: "commission.zeroNet", tone: "neutral" };
   if (net <= 0n) return { key: "marketProviderFinance.lot.reversed", tone: "neutral" };
   if (units(lot.paidUnits) >= net) return { key: "marketProviderFinance.lot.paid", tone: "success" };
+  if (units(lot.paidUnits) + units(lot.convertedUnits) >= net) return { key: units(lot.paidUnits) > 0n ? "earningConversion.mixed" : "earningConversion.converted", tone: "success" };
   if (units(lot.unlockedUnits) > 0n || Date.parse(lot.unlockAt) <= nowMs) return { key: "marketProviderFinance.lot.available", tone: "accent" };
   return { key: "marketProviderFinance.lot.pending", tone: "neutral" };
 }
 
 export function ProviderFinancePanel({ walletMode }: { walletMode: "disabled" | "shadow" | "enabled" }) {
+  const { session } = useAuth();
   const { locale, t } = useLocaleText();
   const [finance, setFinance] = React.useState<MarketProviderFinance | null>(null);
   const [withdrawals, setWithdrawals] = React.useState<MarketProviderWithdrawal[]>([]);
@@ -101,6 +106,8 @@ export function ProviderFinancePanel({ walletMode }: { walletMode: "disabled" | 
     setLots(nextLots.items);
     setLotsCursor(nextLots.nextCursor);
   }, []);
+
+  React.useEffect(() => session?.user?.id ? subscribeMarketBalanceChanged(session.user.id, () => { void reload().catch((cause) => setError(errorText(cause))); }) : undefined, [session?.user?.id, reload]);
 
   React.useEffect(() => {
     let active = true;
@@ -301,6 +308,8 @@ export function ProviderFinancePanel({ walletMode }: { walletMode: "disabled" | 
         ))}
       </div>
 
+      <EarningWalletConversion capacity={finance} onConverted={reload} disabled={busy} showEmpty />
+
       <details className="min-w-0 text-sm">
         <summary className="min-h-11 cursor-pointer rounded-lg py-3 font-medium hover:text-accent focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring active:text-accent">{t("commission.earningsDetail")}</summary>
         <dl className="grid gap-2 pb-2 tabular-nums sm:grid-cols-3">
@@ -308,10 +317,12 @@ export function ProviderFinancePanel({ walletMode }: { walletMode: "disabled" | 
             ["commission.gross", finance.summary.grossEarnedUnits],
             ["commission.deducted", finance.summary.commissionUnits],
             ["commission.net", finance.summary.netEarnedUnits],
+            ["earningConversion.total", finance.summary.convertedUnits],
           ] as const).map(([key, value]) => <div key={key}><dt className="text-muted-foreground">{t(key)}</dt><dd className="font-medium">{formatWalletUnits(value ?? "0", "$", locale)}</dd></div>)}
         </dl>
         <p className="pb-3 text-muted-foreground">{t("commission.providerHelp")}</p>
       </details>
+      {units(finance.summary.convertedUnits) > 0n ? <EarningConversionHistory convertedUnits={finance.summary.convertedUnits} /> : null}
       {holds.length ? (
         <div className="grid gap-3 rounded-xl border border-amber-300 bg-amber-50/60 p-4" role="region" aria-labelledby="provider-holds-title">
           <div className="flex flex-wrap items-center justify-between gap-2">
@@ -455,7 +466,7 @@ export function ProviderFinancePanel({ walletMode }: { walletMode: "disabled" | 
                   <th scope="col" className="py-2 pr-3 font-medium">{t("marketProviderFinance.lot.fulfilled")}</th>
                   <th scope="col" className="py-2 pr-3 font-medium">{t("marketProviderFinance.lot.unlocks")}</th>
                   <th scope="col" className="py-2 pr-3 text-right font-medium">{t("commission.net")}</th>
-                  <th scope="col" className="py-2 pr-3 text-right font-medium">{t("marketProviderFinance.lot.paidOut")}</th>
+                  <th scope="col" className="py-2 pr-3 text-right font-medium">{t("earningConversion.disposed")}</th>
                   <th scope="col" className="py-2 font-medium">{t("marketProviderFinance.lot.state")}</th>
                 </tr>
               </thead>
@@ -477,7 +488,7 @@ export function ProviderFinancePanel({ walletMode }: { walletMode: "disabled" | 
                         </details> : null}
                         {reversed ? <span className="block text-[0.7rem] text-muted-foreground">{t("marketProviderFinance.lot.reversedAmount", { amount: formatWalletUnits(lot.reversedUnits, "$", locale) })}</span> : null}
                       </td>
-                      <td className="py-2 pr-3 text-right tabular-nums">{formatWalletUnits(lot.paidUnits, "$", locale)}</td>
+                      <td className="py-2 pr-3 text-right tabular-nums">{formatWalletUnits(lot.paidUnits, "$", locale)} / {formatWalletUnits(lot.convertedUnits ?? "0", "$", locale)}</td>
                       <td className="py-2"><WalletBadge tone={state.tone}>{t(state.key)}</WalletBadge></td>
                     </tr>
                   );

@@ -21,14 +21,13 @@ import { localDateTimeToIso } from "@/lib/market-explorer";
 import { CopyTextButton, TronTransactionLink } from "@/components/market/wallet-primitives";
 import { OwnerField, ownerErrorText } from "@/components/settings/market-finance-shared";
 
-type TransferKind = "withdrawals" | "refunds";
+type TransferKind = "withdrawals";
 // Admin rows may carry the recorded transfer hash once one exists.
 type Selection = { kind: TransferKind; transfer: MarketFinanceTransfer };
 
 export function MarketFinanceTransfersPanel({ financeMode, withdrawalsPaused = false }: { financeMode: "disabled" | "shadow" | "enabled"; withdrawalsPaused?: boolean }) {
   const { locale, t } = useLocaleText();
   const [withdrawals, setWithdrawals] = React.useState<MarketFinanceTransfer[]>([]);
-  const [refunds, setRefunds] = React.useState<MarketFinanceTransfer[]>([]);
   const [selection, setSelection] = React.useState<Selection | null>(null);
   const [action, setAction] = React.useState<MarketFinanceTransferAction>("approve");
   const [reference, setReference] = React.useState("");
@@ -43,20 +42,15 @@ export function MarketFinanceTransfersPanel({ financeMode, withdrawalsPaused = f
   const [notice, setNotice] = React.useState("");
 
   const reload = React.useCallback(async () => {
-    const [nextWithdrawals, nextRefunds] = await Promise.all([
-      getMarketFinanceTransfers("withdrawals"), getMarketFinanceTransfers("refunds"),
-    ]);
-    setWithdrawals(nextWithdrawals);
-    setRefunds(nextRefunds);
+    setWithdrawals(await getMarketFinanceTransfers("withdrawals"));
   }, []);
 
   React.useEffect(() => {
     let active = true;
-    Promise.all([getMarketFinanceTransfers("withdrawals"), getMarketFinanceTransfers("refunds")])
-      .then(([nextWithdrawals, nextRefunds]) => {
+    getMarketFinanceTransfers("withdrawals")
+      .then((nextWithdrawals) => {
         if (!active) return;
         setWithdrawals(nextWithdrawals);
-        setRefunds(nextRefunds);
       })
       .catch((cause) => { if (active) setError(cause instanceof Error ? cause.message : String(cause)); });
     return () => { active = false; };
@@ -129,7 +123,7 @@ export function MarketFinanceTransfersPanel({ financeMode, withdrawalsPaused = f
   };
 
   const renderList = (kind: TransferKind, items: MarketFinanceTransfer[]) => <div className="grid min-w-0 content-start gap-2">
-    <h5 className="text-sm font-semibold">{t(kind === "withdrawals" ? "settings.marketFinance.pendingWithdrawals" : "settings.marketFinance.pendingRefunds", { count: items.length })}</h5>
+    <h5 className="text-sm font-semibold">{t("settings.marketFinance.pendingWithdrawals", { count: items.length })}</h5>
     {items.length ? <ul className="grid gap-2">{items.map((item) => <li key={item.id} className="grid min-w-0 gap-2 rounded-md border border-border px-3 py-2 text-sm">
       <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
         <span className="font-semibold tabular-nums">{formatWalletUnits(item.amountUnits, "$", locale)}</span>
@@ -155,7 +149,6 @@ export function MarketFinanceTransfersPanel({ financeMode, withdrawalsPaused = f
     {notice ? <p role="status" className="text-sm text-emerald-800">{notice}</p> : null}
     <div className="grid min-w-0 gap-4">
       {renderList("withdrawals", withdrawals)}
-      {refunds.length ? renderList("refunds", refunds) : null}
     </div>
     <Button variant="ghost" size="sm" className="min-h-11 justify-self-start whitespace-nowrap" isDisabled={busy} onPress={() => void reload().catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)))}>
       {t("common.reload")}

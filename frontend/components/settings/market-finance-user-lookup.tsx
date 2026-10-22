@@ -89,6 +89,7 @@ export function MarketFinanceUserLookup() {
                   [t("marketProviderFinance.withdrawable"), result.provider.withdrawableUnits],
                   [t("marketProviderFinance.held"), result.provider.withdrawalHeldUnits],
                   [t("settings.marketFinance.lookup.providerPaid"), result.provider.paidUnits],
+                  [t("earningConversion.total"), result.provider.convertedUnits ?? "0"],
                 ] as const).map(([label, value]) => (
                   <div key={label} className="flex justify-between gap-3"><span className="text-muted-foreground">{label}</span><span className="font-medium tabular-nums">{units(value)}</span></div>
                 ))}

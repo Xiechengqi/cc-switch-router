@@ -14,12 +14,9 @@ use crate::ServerState;
 use crate::db::{Connection, OptionalExtension, TransactionBehavior, params};
 use crate::error::AppError;
 use crate::market_finance::{ProviderFinanceSummary, provider_summary_tx};
-use crate::market_wallet::{
-    Posting, credit_wallet_from_liability_tx, now, post_journal_tx, serialize_units,
-    units_from_minor,
-};
+use crate::market_wallet::{Posting, now, post_journal_tx, serialize_units, units_from_minor};
 #[cfg(test)]
-use crate::market_wallet::{capture_hold_tx, reserve_wallet_tx};
+use crate::market_wallet::{capture_hold_tx, credit_wallet_from_liability_tx, reserve_wallet_tx};
 use crate::models::AuthSession;
 
 const MIN_WITHDRAW_MINOR: i64 = 100;
@@ -129,7 +126,7 @@ fn require_provider_tx(conn: &Connection, user_id: &str) -> Result<(), AppError>
 
 // Stopping sales does not forfeit earned money. Identity conflicts and disabled
 // users remain blocked; scoped reconciliation/payout holds still apply below.
-fn can_manage_earnings_tx(conn: &Connection, user_id: &str) -> Result<bool, AppError> {
+pub(crate) fn can_manage_earnings_tx(conn: &Connection, user_id: &str) -> Result<bool, AppError> {
     conn.query_row("SELECT EXISTS(SELECT 1 FROM market_provider_profiles p JOIN users u ON u.id = p.user_id
         WHERE p.user_id = ?1 AND p.claim_state = 'claimed' AND p.status != 'identity_conflict' AND u.status = 'active')",
         params![user_id], |row| row.get(0)).map_err(db_error("read earnings capabilities"))
@@ -308,6 +305,16 @@ fn payout_view_tx(
     .map_err(db_error("read Provider withdrawal"))
 }
 
+#[cfg(test)]
+pub(crate) fn request_payout_for_test(
+    conn: &Connection,
+    provider: &str,
+    minor: i64,
+    at: &str,
+) -> Result<(), AppError> {
+    create_payout_tx(conn, provider, minor, "conversion-race", at).map(|_| ())
+}
+
 fn create_payout_tx(
     conn: &Connection,
     provider: &str,
@@ -387,10 +394,10 @@ fn create_payout_tx(
     }
     let mut statement = conn
         .prepare(
-            "SELECT id, unlocked_units - held_units - paid_units
+            "SELECT id, unlocked_units - held_units - paid_units - converted_units
          FROM market_provider_earning_lots
          WHERE provider_user_id = ?1 AND disputed = 0
-           AND unlocked_units - held_units - paid_units > 0
+           AND unlocked_units - held_units - paid_units - converted_units > 0
          ORDER BY unlock_at, id",
         )
         .map_err(db_error("prepare mature Provider lots"))?;
@@ -419,11 +426,14 @@ fn create_payout_tx(
     )
     .map_err(db_error("create Provider withdrawal"))?;
     let mut remaining = amount_units;
+    let mut evidence = crate::market_earning_conversions::EvidenceBatch::default();
     for (lot_id, available) in lots {
         if remaining == 0 {
             break;
         }
-        if !crate::market_commission::lot_evidence_valid_tx(conn, &lot_id)? {
+        if !crate::market_commission::lot_evidence_valid_tx(conn, &lot_id)?
+            || !evidence.lot_valid_tx(conn, &lot_id)?
+        {
             return Err(AppError::Conflict(
                 "service commission evidence requires Owner review before withdrawal".into(),
             ));
@@ -433,7 +443,7 @@ fn create_payout_tx(
             .execute(
                 "UPDATE market_provider_earning_lots SET held_units = held_units + ?2
              WHERE id = ?1 AND disputed = 0
-               AND unlocked_units - held_units - paid_units >= ?2",
+               AND unlocked_units - held_units - paid_units - converted_units >= ?2",
                 params![lot_id, allocated],
             )
             .map_err(db_error("reserve Provider earning lot"))?;
@@ -560,8 +570,11 @@ fn transition_payout_tx(
             .map_err(db_error("query withdrawal commission recheck"))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(db_error("read withdrawal commission recheck"))?;
+        let mut evidence = crate::market_earning_conversions::EvidenceBatch::default();
         for lot in allocated_lots {
-            if !crate::market_commission::lot_evidence_valid_tx(conn, &lot)? {
+            if !crate::market_commission::lot_evidence_valid_tx(conn, &lot)?
+                || !evidence.lot_valid_tx(conn, &lot)?
+            {
                 return Err(AppError::Conflict(
                     "service commission evidence requires Owner review before transfer".into(),
                 ));
@@ -734,6 +747,7 @@ struct BuyerRefundRequest {
     address: String,
 }
 
+#[cfg(test)]
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BuyerRefundView {
@@ -748,6 +762,7 @@ struct BuyerRefundView {
     external_reference: Option<String>,
 }
 
+#[cfg(test)]
 fn buyer_refund_view_tx(
     conn: &Connection,
     id: &str,
@@ -874,6 +889,7 @@ fn create_buyer_refund_tx(
     buyer_refund_view_tx(conn, &id, user_id)
 }
 
+#[cfg(test)]
 fn transition_buyer_refund_tx(
     conn: &Connection,
     id: &str,
@@ -1188,29 +1204,20 @@ pub fn router() -> Router<ServerState> {
             get(list_own_earning_holds),
         )
         .route(
-            "/v1/market-wallet/refund-requests/:id/cancel",
-            post(cancel_buyer_refund),
-        )
-        .route(
             "/v1/market-provider-finance/withdrawals",
             get(list_withdrawals).post(request_withdrawal),
         )
         .route(
             "/v1/market-wallet/refund-requests",
-            get(list_buyer_refunds).post(request_buyer_refund),
+            post(request_buyer_refund),
         )
         .route(
             "/v1/admin/market-finance/withdrawals",
             get(admin_list_withdrawals),
         )
-        .route("/v1/admin/market-finance/refunds", get(admin_list_refunds))
         .route(
             "/v1/admin/market-finance/withdrawals/:id/transition",
             post(admin_transition_withdrawal),
-        )
-        .route(
-            "/v1/admin/market-finance/refunds/:id/transition",
-            post(admin_transition_buyer_refund),
         )
 }
 
@@ -1230,6 +1237,8 @@ struct ListPage<T> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct EarningView {
+    #[serde(serialize_with = "serialize_units")]
+    converted_units: i64,
     id: String,
     #[serde(serialize_with = "serialize_units")]
     amount_units: i64,
@@ -1280,7 +1289,8 @@ fn list_earnings_tx(
                     COALESCE((SELECT p.rate_bps FROM market_commission_splits s
                       JOIN market_commission_periods p ON p.id = s.period_id WHERE s.lot_id = market_provider_earning_lots.id), 0),
                     COALESCE((SELECT p.policy_version FROM market_commission_splits s
-                      JOIN market_commission_periods p ON p.id = s.period_id WHERE s.lot_id = market_provider_earning_lots.id), 0)
+                      JOIN market_commission_periods p ON p.id = s.period_id WHERE s.lot_id = market_provider_earning_lots.id), 0),
+                    converted_units
              FROM market_provider_earning_lots WHERE provider_user_id = ?1
                AND (?2 IS NULL OR created_at < ?2 OR (created_at = ?2 AND id < ?3))
              ORDER BY created_at DESC, id DESC LIMIT 51",
@@ -1289,6 +1299,7 @@ fn list_earnings_tx(
     let mut items = statement
         .query_map(params![provider, cursor_at, cursor], |row| {
             Ok(EarningView {
+                converted_units: row.get(15)?,
                 id: row.get(0)?,
                 amount_units: row.get(1)?,
                 gross_units: row.get(10)?,
@@ -1405,6 +1416,7 @@ async fn list_withdrawals(
     ))
 }
 
+#[cfg(test)]
 fn list_buyer_refunds_tx(
     conn: &Connection,
     buyer: &str,
@@ -1456,23 +1468,6 @@ fn list_buyer_refunds_tx(
     })
 }
 
-async fn list_buyer_refunds(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Query(query): Query<ListQuery>,
-) -> Result<impl axum::response::IntoResponse, AppError> {
-    let session = require_session(&state, &headers).await?;
-    let conn = state.store.conn.lock().await;
-    Ok((
-        no_store(),
-        Json(list_buyer_refunds_tx(
-            &conn,
-            &session.user_id,
-            query.cursor.as_deref(),
-        )?),
-    ))
-}
-
 async fn admin_list_withdrawals(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -1506,34 +1501,6 @@ async fn admin_list_withdrawals(
     Ok((no_store(), Json(items)))
 }
 
-async fn admin_list_refunds(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-) -> Result<impl axum::response::IntoResponse, AppError> {
-    crate::api::require_admin_session(&state, &headers).await?;
-    let conn = state.store.conn.lock().await;
-    let mut statement = conn
-        .prepare(
-            "SELECT id, user_id, amount_units, status, version, created_at, network, address
-         FROM market_buyer_refund_requests WHERE status NOT IN ('paid', 'rejected')
-         ORDER BY created_at, id LIMIT 200",
-        )
-        .map_err(db_error("prepare pending refunds"))?;
-    let items = statement
-        .query_map([], |row| {
-            Ok(serde_json::json!({
-                "id": row.get::<_, String>(0)?, "userId": row.get::<_, String>(1)?,
-                "amountUnits": row.get::<_, i64>(2)?.to_string(), "status": row.get::<_, String>(3)?,
-                "version": row.get::<_, i64>(4)?, "createdAt": row.get::<_, String>(5)?,
-                "network": row.get::<_, String>(6)?, "address": row.get::<_, String>(7)?,
-            }))
-        })
-        .map_err(db_error("query pending refunds"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(db_error("read pending refunds"))?;
-    Ok((no_store(), Json(items)))
-}
-
 async fn request_buyer_refund(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -1546,62 +1513,6 @@ async fn request_buyer_refund(
         details: serde_json::json!({ "walletUrl": "/account/wallet/" }),
     })
 }
-async fn admin_transition_buyer_refund(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-    Json(request): Json<TransitionRequest>,
-) -> Result<impl axum::response::IntoResponse, AppError> {
-    let session = if request.action == "mark_paid" {
-        crate::api::require_owner_session(&state, &headers).await?
-    } else {
-        crate::api::require_admin_session(&state, &headers).await?
-    };
-    let conn = state.store.conn.lock().await;
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(db_error("begin buyer refund transition"))?;
-    let time = now();
-    let (amount, buyer): (i64, String) = tx
-        .query_row(
-            "SELECT amount_units, user_id FROM market_buyer_refund_requests WHERE id = ?1",
-            params![id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(db_error("read buyer refund amount"))?;
-    let details = (request.action == "mark_paid")
-        .then(|| transfer_details(&request, amount, &time))
-        .transpose()?;
-    let result = transition_buyer_refund_tx(
-        &tx,
-        &id,
-        &session.user_id,
-        &request.action,
-        request.expected_version,
-        request.external_reference.as_deref(),
-        request.reason.as_deref(),
-        &time,
-    )?;
-    if let Some(details) = &details {
-        record_transfer_details_tx(&tx, "market_buyer_refund_requests", &id, details)?;
-    }
-    after_transition_tx(
-        &tx,
-        "market_buyer_refund_requests",
-        &id,
-        &session.user_id,
-        &request.action,
-        "buyer",
-        &buyer,
-        "refund_status",
-        &result.status,
-        amount,
-        &time,
-    )?;
-    tx.commit()
-        .map_err(db_error("commit buyer refund transition"))?;
-    Ok((no_store(), Json(result)))
-}
 
 async fn get_provider_finance(
     State(state): State<ServerState>,
@@ -1612,6 +1523,8 @@ async fn get_provider_finance(
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
     struct View {
+        #[serde(flatten)]
+        conversion: crate::market_earning_conversions::Capacity,
         summary: ProviderFinanceSummary,
         destination: Option<DestinationView>,
         is_provider: bool,
@@ -1629,6 +1542,7 @@ async fn get_provider_finance(
     Ok((
         no_store(),
         Json(View {
+            conversion: crate::market_earning_conversions::capacity_tx(&conn, &session.user_id, &now())?,
             summary: provider_summary_tx(&conn, &session.user_id)?,
             destination: latest_destination_tx(&conn, &session.user_id)?,
             is_provider,
@@ -1877,50 +1791,6 @@ async fn cancel_withdrawal(
     )?;
     tx.commit()
         .map_err(db_error("commit withdrawal cancellation"))?;
-    Ok((no_store(), Json(result)))
-}
-
-/// A buyer may withdraw a balance refund the Owner has not yet approved.
-async fn cancel_buyer_refund(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-    Json(request): Json<CancelRequest>,
-) -> Result<impl axum::response::IntoResponse, AppError> {
-    let session = require_session(&state, &headers).await?;
-    let conn = state.store.conn.lock().await;
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(db_error("begin refund cancellation"))?;
-    let status: Option<String> = tx
-        .query_row(
-            "SELECT status FROM market_buyer_refund_requests WHERE id = ?1 AND user_id = ?2",
-            params![id, session.user_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(db_error("read own refund"))?;
-    match status.as_deref() {
-        None => return Err(AppError::NotFound("refund not found".into())),
-        Some("requested") => {}
-        Some(_) => {
-            return Err(AppError::Conflict(
-                "only a refund awaiting approval can be cancelled".into(),
-            ));
-        }
-    }
-    let result = transition_buyer_refund_tx(
-        &tx,
-        &id,
-        &session.user_id,
-        "reject",
-        request.expected_version,
-        None,
-        Some("buyer_cancelled"),
-        &now(),
-    )?;
-    tx.commit()
-        .map_err(db_error("commit refund cancellation"))?;
     Ok((no_store(), Json(result)))
 }
 

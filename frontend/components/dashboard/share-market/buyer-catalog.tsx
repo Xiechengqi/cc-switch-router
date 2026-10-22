@@ -6,6 +6,7 @@
  */
 
 import * as React from "react";
+import { EarningWalletConversion } from "@/components/dashboard/earning-wallet-conversion";
 import Link from "next/link";
 import { Button, Drawer, Modal } from "@heroui/react";
 import {
@@ -44,6 +45,7 @@ import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ApiError, quoteShareMarketSeat, rentShareMarketSeat } from "@/lib/api";
 import { DASHBOARD_ACCOUNT_WALLET_PATH } from "@/lib/dashboard-nav";
 import { formatWalletUnits, walletTopupHref } from "@/lib/market-wallet-money";
+import { notifyMarketBalanceChanged } from "@/lib/earning-wallet-conversion";
 import type { MessageKey } from "@/lib/i18n";
 import {
   marketFundingConflictFromError,
@@ -492,6 +494,7 @@ export function ShareMarketBuyerCatalog({
         rentTarget.idempotencyKey,
         rentAutoRenew,
       );
+      if (session?.user?.id) notifyMarketBalanceChanged(session.user.id);
       setRentTarget(null);
       setRentNotice("");
       setRentQuoteInvalidated(false);
@@ -1046,6 +1049,9 @@ export function ShareMarketBuyerCatalog({
                         amount: formatUsdMoney(effectiveRentFunding.requiredTopupMinor, locale),
                       })}
                     </Button>
+                  ) : null}
+                  {rentPrimaryAction === "topup" && rentWalletFunding && rentTarget ? (
+                    <EarningWalletConversion disabled={!!busySeatId} onConverted={async () => { if (!await refreshQuote()) throw new Error("quote refresh failed"); }} />
                   ) : null}
                   {rentPrimaryAction === "topup" && rentWalletFunding && rentTarget ? (
                     <Link

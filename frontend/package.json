@@ -17,7 +17,7 @@
     "test:share-market": "tsx --test components/dashboard/share-market/buyer-catalog-utils.test.ts components/dashboard/share-market/owner-workspace-utils.test.ts components/dashboard/share-market/subscription-utils.test.ts",
     "test:token-units": "tsx --test lib/token-units.test.ts",
     "test:usd-micros": "tsx --test lib/usd-micros.test.ts",
-    "test:market-wallet": "tsx --test lib/market-wallet-money.test.ts lib/market-commission.test.ts",
+    "test:market-wallet": "tsx --test lib/market-wallet-money.test.ts lib/market-commission.test.ts lib/earning-wallet-conversion.test.ts lib/market-finance-actions.test.ts",
     "test:share-settings": "tsx --test lib/share-settings.test.ts components/dashboard/share-edit/share-edit-draft.test.ts",
     "test:binance-auto-settlement": "tsx --test lib/binance-auto-settlement.test.ts",
     "test:share-model-probe": "tsx --test lib/share-model-probe.test.ts",
@@ -34,7 +34,8 @@
     "audit:share-model-health-contract": "node ../scripts/audit/audit-share-model-health-contract.mjs --check",
     "audit:model-prices": "node ../scripts/audit/audit-model-prices.mjs --check",
     "test:client-checkout-browser": "node scripts/client-checkout-browser-test.mjs",
-    "test:wallet-checkout-browser": "node scripts/wallet-checkout-browser-test.mjs"
+    "test:wallet-checkout-browser": "node scripts/wallet-checkout-browser-test.mjs",
+    "test:navbar-wallet-browser": "node scripts/navbar-wallet-browser-test.mjs"
   },
   "dependencies": {
     "@heroui/react": "^3.0.4",

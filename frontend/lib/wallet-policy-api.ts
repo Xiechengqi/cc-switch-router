@@ -22,6 +22,7 @@ export type WalletPolicy = {
   maintenanceFeeBps: number;
   transfersEnabled: boolean;
   transfersPaused: boolean;
+  earningsConversionsPaused: boolean;
   transferMaxMinor: number;
   transferDailyMaxMinor: number;
   balanceRefundable: boolean;

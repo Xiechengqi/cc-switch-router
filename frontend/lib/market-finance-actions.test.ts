@@ -11,16 +11,14 @@ test("owner transfer actions follow the audited offline settlement states", () =
   assert.deepEqual(marketFinanceActions("rejected"), []);
 });
 
-test("pausing finance stops new Provider transfers but preserves settlement and refunds", () => {
+test("pausing finance stops new Provider transfers but preserves in-flight settlement", () => {
   assert.deepEqual(marketFinanceActionsForMode("requested", "withdrawals", "disabled"), ["reject"]);
   assert.deepEqual(marketFinanceActionsForMode("approved", "withdrawals", "shadow"), ["reject"]);
   assert.deepEqual(marketFinanceActionsForMode("transfer_in_progress", "withdrawals", "disabled"), ["mark_paid", "mark_failed", "review"]);
-  assert.deepEqual(marketFinanceActionsForMode("requested", "refunds", "disabled"), ["approve", "reject"]);
   assert.deepEqual(marketFinanceActionsForMode("requested", "withdrawals", "enabled"), ["approve", "reject"]);
   assert.deepEqual(marketFinanceActionsForMode("requested", "withdrawals", "enabled", true), ["reject"]);
   assert.deepEqual(marketFinanceActionsForMode("approved", "withdrawals", "enabled", true), ["reject"]);
   assert.deepEqual(marketFinanceActionsForMode("transfer_in_progress", "withdrawals", "enabled", true), ["mark_paid", "mark_failed", "review"]);
-  assert.deepEqual(marketFinanceActionsForMode("requested", "refunds", "enabled", true), ["approve", "reject"]);
 });
 
 test("offline transfer amount must be exact cents and a safe JSON number", () => {

@@ -32,6 +32,7 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
       commitMode = "success",
       expiry = 120000,
       cancels = 0;
+    let convertible = "0", conversionPosts = 0, conversionQuote;
     const host = {
       id: "host-1",
       providerId: "provider",
@@ -77,6 +78,22 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
           isAdmin: false,
           user: { id: "buyer", email: "buyer@example.com" },
         };
+      else if (path === "/v1/market-provider-finance/me") body = {
+        convertibleUnits: convertible, canConvert: true, conversionBlockers: [],
+      };
+      else if (path === "/v1/market-provider-finance/wallet-conversion-quotes") {
+        conversionQuote = { id: "conversion-quote", amountUnits: convertible, termsVersion: 1, expiresAt: new Date(Date.now() + 300_000).toISOString() };
+        body = conversionQuote;
+      }
+      else if (path === "/v1/market-provider-finance/wallet-conversions" && req.method() === "POST") {
+        conversionPosts++;
+        assert.deepEqual(req.postDataJSON(), { quoteId: conversionQuote.id, termsVersion: 1, acknowledgeNonWithdrawable: true });
+        assert.ok(req.headers()["idempotency-key"]);
+        available = (BigInt(available) + BigInt(convertible)).toString();
+        convertible = "0"; shortfall = "0";
+        body = { id: "conversion", quoteId: conversionQuote.id, amountUnits: conversionQuote.amountUnits,
+          termsVersion: 1, journalId: "conversion-journal", createdAt: new Date().toISOString() };
+      }
       else if (path === "/v1/client-market/hosts") body = [host];
       else if (path === "/v1/client-market/my-rentals") body = [];
       else if (path === "/v1/client-market/quotes") {
@@ -267,6 +284,27 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
       .getByRole("button", { name: "充值后继续", exact: true })
       .waitFor();
     console.log("wallet conflict preserves draft and updates funding passed");
+
+    // Moving earnings within the purchase dialog refreshes the quote but never
+    // submits the Client purchase, and preserves the user's private form input.
+    available = "0"; convertible = "86400000"; shortfall = "86400000";
+    await page.goto(baseUrl + "/client-market/?focusHost=host-1");
+    await page.getByRole("heading", { name: "配置并确认" }).waitFor();
+    await page.getByLabel("Web 登录密码", { exact: true }).fill("conversion-password");
+    const commitsBeforeConversion = commits.length;
+    const quotesBeforeConversion = quotes;
+    await page.getByTestId("earning-conversion").getByRole("button", { name: "转入余额", exact: true }).click();
+    const conversionDialog = page.getByRole("dialog", { name: "收益转入平台余额", exact: true });
+    await conversionDialog.getByRole("button", { name: "核对金额", exact: true }).click();
+    assert.equal(await conversionDialog.getByRole("button", { name: "确认转入", exact: true }).isDisabled(), true);
+    await conversionDialog.getByRole("checkbox").check();
+    await conversionDialog.getByRole("button", { name: "确认转入", exact: true }).click();
+    await page.getByRole("button", { name: "确认租用并创建", exact: true }).waitFor();
+    assert.equal(conversionPosts, 1);
+    assert.equal(commits.length, commitsBeforeConversion);
+    assert.ok(quotes > quotesBeforeConversion, "conversion requires a fresh purchase quote");
+    assert.equal(await page.getByLabel("Web 登录密码", { exact: true }).inputValue(), "conversion-password");
+    console.log("earnings conversion refreshes nested checkout without purchasing or losing the private draft passed");
 
     // A lost response must replay the identical request even after quote expiry.
     trial = 43200;

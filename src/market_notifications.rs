@@ -44,6 +44,12 @@ pub(crate) struct NotificationKind {
 
 pub(crate) const KINDS: &[NotificationKind] = &[
     NotificationKind {
+        kind: "earnings_converted",
+        mandatory: true,
+        subject_en: "Earnings moved to your wallet",
+        subject_zh: "收益已转入平台余额",
+    },
+    NotificationKind {
         kind: "commission_policy_changed",
         mandatory: true,
         subject_en: "Provider service fee updated",
@@ -682,6 +688,22 @@ fn render(item: &Claimed, dashboard: &str) -> (String, String) {
         );
         return (subject, body);
     }
+    if item.event_kind == "earnings_converted" {
+        let id = item
+            .payload
+            .get("conversionId")
+            .and_then(Value::as_str)
+            .unwrap_or("—");
+        let amount = amount.as_deref().unwrap_or("—");
+        return (
+            format!("{subject_zh} / {subject_en}"),
+            format!(
+                "{subject_zh}：{amount}。可消费或转账，不可提现或转回收益。转换编号：{id}。\n\
+             {subject_en}: {amount}. Available for services or wallet transfers, not withdrawal or conversion back to earnings. Reference: {id}.\n\n{}/account/wallet/",
+                dashboard.trim_end_matches('/')
+            ),
+        );
+    }
     if item.event_kind == "wallet_transfer_sent" || item.event_kind == "wallet_transfer_received" {
         let counterparty = item
             .payload
@@ -1058,6 +1080,26 @@ mod tests {
         let (subject, body) = render(&mandatory, "https://router.example");
         assert!(subject.contains("提现状态更新"));
         assert!(body.contains("$12.34"));
+        assert!(body.ends_with("https://router.example/account/wallet/"));
+    }
+
+    #[test]
+    fn conversion_notice_names_wallet_credit_and_irreversible_terms() {
+        let item = Claimed {
+            id: "conversion-notice".into(),
+            recipient_user_id: "provider".into(),
+            event_kind: "earnings_converted".into(),
+            payload: json!({"conversionId":"conversion-1","amountUnits":"43200000"}),
+            mandatory: true,
+            attempts: 1,
+        };
+        assert!(kind("earnings_converted").unwrap().mandatory);
+        let (subject, body) = render(&item, "https://router.example/");
+        assert!(subject.contains("收益已转入平台余额"));
+        assert!(body.contains("$5.00000000"));
+        assert!(body.contains("43200000 ledger units"));
+        assert!(body.contains("conversion-1"));
+        assert!(body.contains("不可提现或转回收益"));
         assert!(body.ends_with("https://router.example/account/wallet/"));
     }
 

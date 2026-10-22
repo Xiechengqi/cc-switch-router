@@ -28,6 +28,13 @@ export type MarketWallet = {
   mode: "disabled" | "shadow" | "enabled";
   canTopup: boolean;
   hasWalletActivity: boolean;
+  earningsConversion: MarketEarningConversionCapacity;
+};
+
+export type MarketEarningConversionCapacity = {
+  convertibleUnits: string;
+  canConvert: boolean;
+  conversionBlockers: string[];
 };
 
 export type MarketWalletPage<T> = { items: T[]; nextCursor: string | null };
@@ -176,7 +183,7 @@ export type MarketWalletChannel = Pick<MarketPaymentChannel, "id" | "displayName
   canary?: boolean;
 };
 
-export type MarketProviderFinance = {
+export type MarketProviderFinance = MarketEarningConversionCapacity & {
   isProvider: boolean;
   hasFinanceActivity: boolean;
   canWithdraw: boolean;
@@ -189,6 +196,7 @@ export type MarketProviderFinance = {
     withdrawableUnits: string;
     withdrawalHeldUnits: string;
     paidUnits: string;
+    convertedUnits: string;
   };
   destination: {
     id: string;
@@ -237,17 +245,6 @@ export async function updateMarketWalletRenewal(contractId: string, autoRenew: b
     }),
   );
 }
-
-export type MarketBuyerRefund = {
-  id: string;
-  amountUnits: string;
-  status: string;
-  network: "tron";
-  address: string;
-  version: number;
-  createdAt: string;
-  externalReference: string | null;
-};
 
 export type MarketFinanceTransfer = {
   id: string;
@@ -344,9 +341,9 @@ export type MarketPaymentChannelInput = {
   expectedVersion?: number;
 };
 
-export async function getMarketWallet() {
+export async function getMarketWallet(signal?: AbortSignal) {
   return parseJson<MarketWallet>(
-    await authFetch("/v1/market-wallet", { cache: "no-store" }),
+    await authFetch("/v1/market-wallet", { cache: "no-store", signal }),
   );
 }
 
@@ -420,6 +417,7 @@ export type MarketProviderEarningLot = {
   unlockedUnits: string;
   heldUnits: string;
   paidUnits: string;
+  convertedUnits: string;
   fulfilledAt: string;
   unlockAt: string;
   disputed: boolean;
@@ -448,31 +446,14 @@ export async function requestMarketProviderWithdrawal(amountMinor: number, idemp
   );
 }
 
-export async function getMarketBuyerRefunds(cursor?: string) {
-  const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
-  return parseJson<MarketWalletPage<MarketBuyerRefund>>(
-    await authFetch(`/v1/market-wallet/refund-requests${query}`, { cache: "no-store" }),
-  );
-}
-
-export async function cancelMarketBuyerRefund(id: string, expectedVersion: number) {
-  return parseJson<MarketBuyerRefund>(
-    await authFetch(`/v1/market-wallet/refund-requests/${encodeURIComponent(id)}/cancel`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ expectedVersion }),
-    }),
-  );
-}
-
-export async function getMarketFinanceTransfers(kind: "withdrawals" | "refunds") {
+export async function getMarketFinanceTransfers(kind: "withdrawals") {
   return parseJson<MarketFinanceTransfer[]>(
     await authFetch(`/v1/admin/market-finance/${kind}`, { cache: "no-store" }),
   );
 }
 
 export async function transitionMarketFinanceTransfer(
-  kind: "withdrawals" | "refunds",
+  kind: "withdrawals",
   id: string,
   action: MarketFinanceTransferAction,
   expectedVersion: number,
@@ -488,7 +469,7 @@ export async function transitionMarketFinanceTransfer(
     varianceReason?: string;
   } = {},
 ) {
-  return parseJson<MarketProviderWithdrawal | MarketBuyerRefund>(
+  return parseJson<MarketProviderWithdrawal>(
     await authFetch(`/v1/admin/market-finance/${kind}/${encodeURIComponent(id)}/transition`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -772,6 +753,7 @@ export const MARKET_CRITICAL_CASE_CODES = [
   "journal_unsealed", "credited_topup_missing_evidence", "paid_payout_missing_evidence",
   "wallet_transfer_missing_evidence", "wallet_transfer_orphan_journal",
   "commission_evidence_mismatch", "commission_orphan_journal",
+  "earning_conversion_missing_evidence", "earning_conversion_allocation_mismatch", "earning_conversion_orphan_journal",
 ] as const;
 
 export function isCriticalMarketFinanceCase(code: string) {
@@ -808,6 +790,7 @@ export type MarketFinanceOverview = {
   commissionPendingUnits: string;
   commissionRevenueUnits: string;
   commissionReversedUnits: string;
+  earningConvertedUnits: string;
   openCases: number;
   openCriticalCases: number;
   heldEarningLots: number;
@@ -914,7 +897,7 @@ export const MARKET_NOTIFICATION_KINDS = [
   "topup_credited", "topup_closed_unpaid", "topup_review_required", "topup_reversed",
   "wallet_low_runway", "renewal_upcoming_shortfall", "contract_suspended", "contract_resumed",
   "contract_terminating_soon", "contract_terminated", "refund_status", "dispute_resolved",
-  "payout_status", "earnings_held", "earnings_released", "payout_address_changed",
+  "payout_status", "earnings_held", "earnings_released", "earnings_converted", "payout_address_changed",
   "wallet_transfer_sent", "wallet_transfer_received",
   "commission_policy_changed",
 ] as const;

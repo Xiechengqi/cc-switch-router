@@ -21,6 +21,7 @@ pub(crate) fn db_error(context: &'static str) -> impl FnOnce(crate::db::Error) -
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct WalletPolicy {
+    pub earnings_conversions_paused: bool,
     pub version: i64,
     pub maintenance_fee_bps: i64,
     pub transfers_enabled: bool,
@@ -33,8 +34,9 @@ pub(crate) struct WalletPolicy {
 pub(crate) fn policy_tx(conn: &Connection) -> Result<WalletPolicy, AppError> {
     conn.query_row(
         "SELECT version, maintenance_fee_bps, transfers_enabled, transfers_paused,
-                transfer_max_minor, transfer_daily_max_minor FROM market_wallet_policy WHERE id = 1",
+                transfer_max_minor, transfer_daily_max_minor, earnings_conversions_paused FROM market_wallet_policy WHERE id = 1",
         [], |row| Ok(WalletPolicy {
+            earnings_conversions_paused: row.get::<_, i64>(6)? != 0,
             version: row.get(0)?, maintenance_fee_bps: row.get(1)?,
             transfers_enabled: row.get::<_, i64>(2)? == 1,
             transfers_paused: row.get::<_, i64>(3)? == 1,
@@ -99,6 +101,7 @@ async fn get_admin_policy(
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SetPolicyRequest {
+    earnings_conversions_paused: bool,
     expected_version: i64,
     maintenance_fee_bps: i64,
     transfers_enabled: bool,
@@ -129,7 +132,7 @@ async fn set_policy(
         .execute(
             "UPDATE market_wallet_policy SET version = version + 1, maintenance_fee_bps = ?2,
          transfers_enabled = ?3, transfers_paused = ?4, transfer_max_minor = ?5,
-         transfer_daily_max_minor = ?6, updated_at = ?7 WHERE id = 1 AND version = ?1",
+         transfer_daily_max_minor = ?6, updated_at = ?7, earnings_conversions_paused = ?8 WHERE id = 1 AND version = ?1",
             params![
                 input.expected_version,
                 input.maintenance_fee_bps,
@@ -137,7 +140,8 @@ async fn set_policy(
                 input.transfers_paused,
                 input.transfer_max_minor,
                 input.transfer_daily_max_minor,
-                time
+                time,
+                input.earnings_conversions_paused
             ],
         )
         .map_err(db_error("update wallet policy"))?;

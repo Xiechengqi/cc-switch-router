@@ -15,12 +15,12 @@ export function marketFinanceActions(status: string): MarketFinanceTransferActio
 
 export function marketFinanceActionsForMode(
   status: string,
-  kind: "withdrawals" | "refunds",
+  kind: "withdrawals",
   financeMode: "disabled" | "shadow" | "enabled",
   withdrawalsPaused = false,
 ): MarketFinanceTransferAction[] {
   const actions = marketFinanceActions(status);
-  if (kind !== "withdrawals" || (financeMode === "enabled" && !withdrawalsPaused)) return actions;
+  if (financeMode === "enabled" && !withdrawalsPaused) return actions;
   // Pausing finance stops new Provider payouts, but the Owner must still be
   // able to reject one or record the outcome of a transfer already started.
   return actions.filter((action) => action !== "approve" && action !== "begin_transfer");

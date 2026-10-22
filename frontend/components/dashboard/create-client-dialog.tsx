@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import { EarningWalletConversion } from "@/components/dashboard/earning-wallet-conversion";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Button, Chip, Modal } from "@heroui/react";
 import { Check, Copy, Loader2, LogIn, Minus, Plus, RotateCcw, Server } from "lucide-react";
@@ -38,6 +39,7 @@ import type {
 } from "@/lib/types";
 import { formatUsdMoney } from "@/lib/market-money";
 import { walletTopupHref } from "@/lib/market-wallet-money";
+import { notifyMarketBalanceChanged } from "@/lib/earning-wallet-conversion";
 import { usePersistentState } from "@/lib/use-persistent-state";
 
 const PROVIDERS_KEY = "cc_switch_router_create_client_providers_v2";
@@ -445,26 +447,29 @@ export function CreateClientDialog({
   };
 
   const requestQuote = async () => {
-    if (loading) return;
+    if (loading) return false;
     if (!authed) {
       window.dispatchEvent(new Event("router-open-login"));
-      return;
+      return false;
     }
     if (fixedHost && !fixedHost.eligibility.allowed) {
       onOpenChange(false);
       onMarketEligibilityRequired?.(fixedHost, fixedHost.eligibility);
-      return;
+      return false;
     }
     if ((!fixedHost && (!selectedProviderIds.length || !selectedCountryCodes.length)) || capacity < quantity) {
       setError(capacity < quantity ? t("createClient.noCapacity") : t("createClient.selectionRequired"));
-      return;
+      return false;
     }
     const generation = ++quoteRequestGeneration.current;
     if (quote) preservedDrafts.current = preserveClientDrafts(quote, drafts);
     setLoading(true);
     setError("");
     try {
-      if (quote) await cancelClientMarketQuote(quote.id);
+      if (quote) {
+        setExpired(true);
+        await cancelClientMarketQuote(quote.id);
+      }
       const next = await createClientMarketQuote({
         providerIds: selectedProviderIds,
         countryCodes: selectedCountryCodes,
@@ -473,7 +478,7 @@ export function CreateClientDialog({
       });
       if (generation !== quoteRequestGeneration.current) {
         void cancelClientMarketQuote(next.id).catch(() => undefined);
-        return;
+        return false;
       }
       liveQuote.current = next;
       setExpired(false);
@@ -495,10 +500,12 @@ export function CreateClientDialog({
       preservedDrafts.current = {};
       setSubdomainChecks({});
       setPhase("quote");
+      return true;
     } catch (reason) {
       if (generation === quoteRequestGeneration.current && !routeMarketEligibilityError(reason)) {
         setError(t("clientCheckout.loadFailed"));
       }
+      return false;
     } finally {
       if (generation === quoteRequestGeneration.current) setLoading(false);
     }
@@ -603,6 +610,7 @@ export function CreateClientDialog({
         items,
         commitKeyRef.current.key,
       );
+      if (session?.user?.id) notifyMarketBalanceChanged(session.user.id);
       setSubmissionUncertain(false);
       liveQuote.current = null;
       preservedDrafts.current = {};
@@ -811,6 +819,7 @@ export function CreateClientDialog({
                 </section>)}
               </div>
             ) : null}
+            {phase === "quote" && checkout?.shortfall && !checkout.unsupported ? <EarningWalletConversion disabled={loading || submissionUncertain} onConverted={async () => { if (!await requestQuote()) throw new Error("quote refresh failed"); }} /> : null}
             {checkout?.shortfall && !checkout.unsupported ? <p className="text-xs text-muted-foreground">{t("clientCheckout.topupHint")}</p> : null}
             {error ? <p role="alert" className="text-sm text-destructive">{error}</p> : null}
           </Modal.Body>

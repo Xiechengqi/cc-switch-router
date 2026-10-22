@@ -2,7 +2,7 @@
 
 > 状态：代码接线完成，待真实商户影子验收和生产切换。DujiaoPay 契约依据官网 `/docs`（2026-10 提取）与参考项目 `dujiao-next` `41b86260`；若上游协议或 Router 代码变化，先更新契约测试和本文，再改资金路径。2026-10 增强（迁移 `0069`–`0074`）见 §14。
 
-当前实现进度：迁移 `0053`–`0075`，USD 整数复式账本、钱包冻结／捕获、DujiaoPay 签名回调与认证查单、充值补偿、七天收入成熟、Provider 线下提现和 Owner 审批已接线；普通消费余额不支持提现退款，可通过邮箱在本 Router 内转账。Share／Client 钱包合同具备试用、按秒批次、固定日历月履约、续费、暂停、确认清理后释放及服务争议退款；同一买家的到期服务优先于新单取款。旧财务写 API 在钱包模式返回 410，买家与 Provider 页面分别提供全站钱包及收入／提现入口。旧付费商品和报价保留原资金轨道，不能随模式切换自动升格；Provider 须明确重新发布。**生产支付尚未开放**：代码接线标志已打开，但必须经 Owner API 在旧义务与严重对账 case 清零、当前签名渠道完成真实入账验收后，才能写入 `cutover_approved_at` 并切换 `enabled`。验收查询只计入同时具有链上回执、已封口 journal 和对应钱包入账的 `credited` 订单；孤立的状态字段不能通过。仅手工改数据库 `mode` 不会开放新购买或普通用户充值。真实 USD 商户建单、签名回调、查单、链上回执和钱包入账尚无受控联调收据；本地 fixture 不能替代该验收。
+当前实现进度：迁移 `0053`–`0077`，USD 整数复式账本、钱包冻结／捕获、DujiaoPay 签名回调与认证查单、充值补偿、七天收入成熟、Provider 线下提现和 Owner 审批已接线；Provider 也可明确将成熟净收益 1:1 转入自己的消费余额（§17）。普通消费余额不提供现金退款，只可消费或通过邮箱在本 Router 内转账。Share／Client 钱包合同具备试用、按秒批次、固定日历月履约、续费、暂停、确认清理后释放及服务争议结算退回；同一买家的到期服务优先于新单取款。旧财务写 API 在钱包模式返回 410，买家与 Provider 页面分别提供全站钱包及收入／提现入口。旧付费商品和报价保留原资金轨道，不能随模式切换自动升格；Provider 须明确重新发布。**生产支付尚未开放**：代码接线标志已打开，但必须经 Owner API 在旧义务与严重对账 case 清零、当前签名渠道完成真实入账验收后，才能写入 `cutover_approved_at` 并切换 `enabled`。验收查询只计入同时具有链上回执、已封口 journal 和对应钱包入账的 `credited` 订单；孤立的状态字段不能通过。仅手工改数据库 `mode` 不会开放新购买或普通用户充值。真实 USD 商户建单、签名回调、查单、链上回执和钱包入账尚无受控联调收据；本地 fixture 不能替代该验收。
 
 > 2026-10 配置修订：迁移 `0056` 提供固定 DujiaoPay 回调 URL 和持久化查单时间表；迁移 `0057` 增加渠道版本锁、归档与密钥轮换状态；迁移 `0062` 将 Owner 的生产切换批准与模式字符串分开。DujiaoPay 官方控制台创建 Webhook 后会生成只展示一次的签名密钥；签名模式为默认，`poll_only` 是显式降级。代码集成不代表真实商户联调通过。
 
@@ -173,10 +173,10 @@ Owner 收到的是 DujiaoPay 商户实际入金资产，Router 给出的却是 U
 | 充值 | `GET /v1/market-wallet/channels`；`POST /v1/market-wallet/topups`；`GET /v1/market-wallet/topups/:id` | 创建使用 `Idempotency-Key`；只返回必要的安全收银台 URL 和状态。 |
 | Webhook | `POST /v1/payment-webhooks/dujiaopay`；旧 `/:channel_id` | 固定 URL 无签名渠道只唤醒查单；旧 URL 和签名渠道保持原始 body 验签，入账始终以认证查单为准。 |
 | 邮箱转账 | `/v1/market-wallet/transfer-capacity`、`/transfer-quotes`、`/transfer-quotes/:id/code`、`/transfers` | 精确邮箱、已验证用户、金额快照、邮箱 OTP、原子幂等记账。原余额退款 POST 始终返回 `410 WALLET_CASH_REFUNDS_RETIRED`。 |
-| Provider 收入 | `GET /v1/market-provider-finance/me`；`GET /v1/market-provider-finance/earnings` | 待解锁、可提现、提现中分别展示；不得混作用户钱包。 |
+| Provider 收入 | `GET /v1/market-provider-finance/me`；`GET /v1/market-provider-finance/earnings` | 待解锁、可提现、提现中与已转入分别展示；仅明确完成 §17 转入后，才增加用户钱包。 |
 | Provider 提现 | `PUT /v1/market-provider-finance/destination`；`POST /v1/market-provider-finance/withdrawals`；`GET /v1/market-provider-finance/withdrawals` | 收款资料版本化，提交幂等。 |
 | Owner 渠道 | `/v1/admin/market-payment-channels` 下创建、资料编辑、现有 API 复验、API／Webhook 密钥轮换、启停、归档／恢复接口 | Owner-only；修改使用 `expectedVersion` 乐观锁，读响应不回显 Secret；归档后旧订单仍可对账。 |
-| Owner 财务 | `/v1/admin/market-finance` 下模式、暂停、充值异常、提现、用户退款、对账 case 查询与处置接口 | `PUT /pause` 独立控制新钱包订单和新提现；所有操作有操作者、理由、版本 CAS 和审计事件。 |
+| Owner 财务 | `/v1/admin/market-finance` 下模式、暂停、充值异常、提现、服务结算调整、对账 case 查询与处置接口 | `PUT /pause` 独立控制新钱包订单和新提现；收益转入另由 `wallet-policy` 暂停；不提供余额现金退款队列。所有操作有操作者、理由、版本 CAS 和审计事件。 |
 
 用户界面只有四个购买重点：商品与周期价格、全站可用余额、需充值差额、主操作「确认租用／充值差额」。不显示 Provider UID、尾差、账单声明或多个分割区。充值结束返回原商品卡并刷新报价；未成功就保持「等待到账／人工核对」，不显示假成功。账户新增全站钱包和充值流水；Provider 收入／提现独立面板；Settings 的 Marketplace 分类增加 Owner 充值渠道与财务状态面板。原 Provider 页中预存／信用汇总与按 Provider 充值入口删除或替换，Provider 排名算法及公开质量数据不受钱包改造影响。
 
@@ -442,3 +442,78 @@ cumulative_fee = (gross * rate_bps + 5000) / 10000
 2026-10-22 本地验收：完整 Market 回归 389 项、迁移回归 46 项均通过；最后增加分账索引后，再跑服务费相关 21 项及全部 46 项迁移测试通过（各组有重叠，不合计）。前端金额／Market／Provider 回归、类型检查、三项设置／账务审计、webpack 构建及无截图浏览器交互通过。浏览器同时验证总额 100／费用 10／净额 90 的折叠明细、四种宽度、费率精度／CAS／只读、文字对比度和键盘焦点。`cargo check`、`cargo clippy --all-targets` 完成，保留仓库既有告警，新增代码行未发现 Clippy 告警。
 
 整体 review 补强了旧服务延迟补账不追收费、按秒预算按实际服务时间冻结政策、累计退款比例的独立核验、未知来源孤儿分账的冻结、对账游标轮转及 journal 唯一索引。同时修正空库安装测试的陈旧表数量基线，并验证 0075 的 212 张表升级至 0076 的 221 张表。此次没有执行远程环境变更、真实支付／转账、真实通知投递或 UI 截图；生产外部验收仍按本节清单执行。
+
+## 17. 成熟收益转入消费余额（0077）
+
+### 17.1 产品规则与资金边界
+
+Provider 仍有独立的收益应付账，不能将沉淀中的金额直接显示为可消费余额。新增一条**由本人明确选择**的去向：已完成七天沉淀、未被冻结、未分配提现的净收益，可 1:1 转入同一 `user_id` 的现有 USD 钱包。
+
+- 不自动转入，不在余额不足时自动扣收益，不自动购买或自动转给其他用户。
+- 不收转入费，不重复收充值维护费或 Provider 平台服务费；原收入的总额／服务费／净额条款不变。
+- 转入后可在 Share Market、Client Market 消费，或使用既有邮箱验证转账流程。转入不可撤回，不可再次提现，也不能转回收益。
+- 无需提现地址，不调用 DujiaoPay，不依赖某个充值渠道；但要求已验证且有效的用户、已认领且无冲突的 Provider 身份，以及已批准开放的平台钱包财务模式。停止挂售或退休的 Provider 不因此丧失自己的成熟收益。
+- 普通消费余额**不提供现金退款**。未履约或服务争议结算调整只能退回买家钱包；外部支付撤销仍须保留原始收据及冲正。它们不是用户余额兑现服务。
+
+### 17.2 账务、并发与已处置保护
+
+每次确认在一个 `IMMEDIATE` 事务中按 `unlock_at, lot_id` 顺序分配精确整数单位，写入：
+
+```text
+借：本人 provider_available
+贷：本人 wallet_available
+```
+
+同事务更新钱包投影／版本、lot 的 `converted_units`、不可变转入记录与分配、封口 journal、审计事件及强制通知 outbox。任何失败整体回滚；不产生新的平台收入或 Owner 真实入金／出款。
+
+`paid_units` 只表示 Owner 已线下实际付出；`converted_units` 只表示内部转入，不混写。可提现／可转入均减去 `converted_units`。数据库触发器禁止减少累计转入，并要求 `held_units + paid_units <= unlocked_units - converted_units`，提现与转入竞争同一余额时最多一方成功。
+
+服务争议不撤回已转入的钱包金额，不挪用其他 lot 的钱弥补。可结算退回容量排除已提现、提现冻结和已转入的净额，并沿用原服务费比例；超出容量转人工核对，本期不新增自动垫付或追偿。
+
+### 17.3 接口、预览及重试恢复
+
+| 接口 | 合同 |
+| --- | --- |
+| `POST /v1/market-provider-finance/wallet-conversion-quotes` | 只接受 `{all:true}`、整数美分 `{amountMinor:...}` 或明确选择的 `{batch:true}` 三选一；每小时每用户最多 30 次；预览有效 5 分钟，不占用资金。 |
+| `POST /v1/market-provider-finance/wallet-conversions` | 必须提交 `Idempotency-Key`、`quoteId`、`termsVersion:1` 和 `acknowledgeNonWithdrawable:true`；重新检查成熟时间、净额、冻结、对账证据与钱包上限。 |
+| `GET /v1/market-provider-finance/wallet-conversions` | 本人游标分页；可用 `quoteId` 查询丢失响应的原操作。 |
+| `GET /v1/market-provider-finance/wallet-conversions/:id` | 本人单笔详情。 |
+
+以上均要求 Session，并设置 `private, no-store`。金额以字符串整数记账单位返回。自定义至少 1 美分；“全部”保留不足一美分的每个单位，但冻结的是预览时的金额，不会把之后新增收益一起转走。最多分配 10,000 个 lot；超限时提供明确的“核对下一批”，只预览前 10,000 个 lot 的准确金额（允许不足一美分），仍需本人核对和确认。不能静默截断“全部”，也不能让大量极小收益因自定义最低一美分而永久无法转入。
+
+已成功的同键／同预览请求，在预览到期、政策暂停后仍返回原结果。相同键换请求返回冲突，同一预览换键不能重复转入。
+
+浏览器在确认 POST 前按用户保存原预览和幂等键；存储不可用则阻止提交。网络中断、网关 408／5xx 或会话失败保留原操作；刷新页面不会自动 POST，可先查询结果，再由用户明确重试同一笔。只有服务端明确业务拒绝才允许重新核对金额。成功结果须匹配原预览、金额和条款；不能因刷新余额失败就将已成功转入展示为失败。
+
+### 17.4 页面与运行开关
+
+- `/account/earnings/` 在提现资料之前提供“转入余额”，单列累计已转入与折叠分页记录；逐笔 lot 区分提现、转入及混合去向。
+- `/account/wallet/` 与市场钱包入口只将已完成转入计入可用余额，成熟收益另列入口。租用缺额时也可转入；完成后刷新报价并保留原表单，仍需本人再次确认租用。
+- 确认框以到账金额为重点，显示零手续费和不可撤回说明；同意框默认不勾选。成功后可查看余额或返回原市场。
+- 同标签和跨标签刷新使用仅含用户 ID／随机修订号的失效通知，不传播金额或凭据。历史展开时也会更新；切换用户不沿用上个用户的预览和记录。
+- Owner 的 `wallet-policy.earningsConversionsPaused` 独立暂停**新转入**，不阻断既有成功查询／幂等结果。该布尔值为完整版本化政策 PUT 的必填字段，旧前端必须刷新后再编辑。
+- Owner 平台一览单列累计内部转入，明确“非平台收入”；移除现金退款队列、公开调用函数与未使用的申请文案。旧退款 POST 保留认证后的 `410 WALLET_CASH_REFUNDS_RETIRED`，历史账务证据和核验测试不删除。
+
+新增确认控件复用现有 Router 字体、主题与间距，不改全局布局；交互按 Hallmark 组件级标准检查，八状态预览不进入生产路由。测试只用 DOM、键盘、计算样式和视口几何，不生成 UI 截图。
+
+### 17.5 升级、审计与故障处置
+
+迁移 `0077_market_earning_wallet_conversion.sql` 只增加三个表、lot 处置列、政策暂停列与审计游标，以及索引／约束／证据视图。空库共 224 张表；从 0076 的 221 张表原地升级不重写钱包余额、既有 journal 或已承诺分账。旧迁移及校验和保持不变。
+
+`market_verified_earning_conversion_evidence` 独立验证本人预览、金额／条款／期限、journal 指纹、两个准确 posting 及封口、分配总额、来源 lot 身份／成熟时间和转入序列连续性。逐 lot 累计投影还须与分配之和一致。转入／提现同一事务内复用已核验 parent 证据，避免一个跨多 lot 转入被重复全量核验。
+
+后台持久游标每批轮转核验 200 个 lot 和 200 条转入，并查找孤儿 journal：
+
+- `earning_conversion_missing_evidence`：冻结记录本人、被引用来源 lot 所有人及相关合同。
+- `earning_conversion_allocation_mismatch`：冻结对应 lot 的 Provider／用户与合同。
+- `earning_conversion_orphan_journal`：全局财务冻结。
+
+证据仍失败时不可普通结案跳过。故障先暂停收益转入，保留记录并查明原因；不删转换单、不降低 `converted_units`，不把转入当充值重记。
+
+部署前备份数据库和密钥；部署后核对迁移版本、暂停政策、个人收益／钱包总额与 Owner 资金一览。有 0077 转入后不能回滚到不识别 `converted_units` 的旧二进制，旧代码会错误地把同一笔钱再次视为可提现。应暂停新操作并向前修复。
+
+本地验收包括完整 Market 回归、空库及直接 0076→0077 升级、成熟边界／精度／0 与 100% 分成、幂等与预览失效、独立连接提现竞态、消费与真实内部转账逻辑、通知失败回滚、损坏证据隔离、201 条历史及审计游标、前端类型和契约检查、静态构建及无截图浏览器交互。真实账户操作、实际邮件投递和外部付款不属于本次本地验收，不能以 mock 声称已验证生产。
+
+2026-10-22 本地验收结果：完整 Market 回归 406 项、迁移回归 47 项通过；review 补强后重跑收益转入 20 项、提现 6 项、对账 3 项、通知 7 项均通过（各组有重叠，不相加）。前端钱包金额／恢复单测 25 项、Share 60 项、Client 19 项、Provider／导航 8 项通过；类型、设置与账务契约、来源审计、webpack 构建及钱包／Client 无截图浏览器交互通过。测试构建沿用本机 Google Fonts 的临时替身，不改字体配置，不将该产物用于发布。
+
+整体 review 修正了展开历史不刷新、HTTP 超时误清除重试凭据、已清理的过期预览无法恢复、高批次重复核验和极小收益无法减额分批等问题。浏览器覆盖未勾选同意不可提交、四种宽度／计算样式对比度／键盘焦点、提交成功但回复丢失后的查询恢复、明确分批预览及租用弹窗保留草稿且不自动下单。

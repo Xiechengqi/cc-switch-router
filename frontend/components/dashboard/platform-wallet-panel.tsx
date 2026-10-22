@@ -13,6 +13,9 @@ import { ArrowUpRight, Ban, CheckCircle2, Clock3, CreditCard, Loader2, RefreshCw
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { WalletTransferPanel } from "@/components/dashboard/wallet-transfer-panel";
+import { useAuth } from "@/components/auth/auth-provider";
+import { EarningWalletConversion } from "@/components/dashboard/earning-wallet-conversion";
+import { subscribeMarketBalanceChanged, notifyMarketBalanceChanged } from "@/lib/earning-wallet-conversion";
 import { MarketBuyerDisputesList } from "@/components/dashboard/market-buyer-disputes-list";
 import { MarketNotificationsBell } from "@/components/dashboard/market-notifications-bell";
 import { WalletBadge } from "@/components/market/wallet-primitives";
@@ -171,6 +174,7 @@ export function WalletActionButton({
 }
 
 export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWallet }) {
+  const { session } = useAuth();
   const { locale, t, displayCurrency, fxRateFresh, fxRateMicros } = useLocaleText();
   const searchParams = useSearchParams();
   const returnedTopupId = searchParams.get("topup");
@@ -209,9 +213,19 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
   const reloadVersionRef = React.useRef(0);
   const historyExpandedRef = React.useRef({ topups: false, transactions: false });
   const historiesRef = React.useRef({ topups, transactions });
+  const balanceFingerprint = `${wallet.version}:${wallet.postedUnits}:${wallet.heldUnits}:${wallet.availableUnits}`;
+  const lastBalanceFingerprintRef = React.useRef(balanceFingerprint);
   const hasUnresolvedTopups = topups.some((order) =>
     ["created", "creating", "create_unknown", "pending", "verifying", "review_required"].includes(order.status));
   const hasQueuedRecheck = topups.some((order) => order.buyerRecheckResult === "queued");
+
+  React.useEffect(() => {
+    const changed = lastBalanceFingerprintRef.current !== balanceFingerprint;
+    lastBalanceFingerprintRef.current = balanceFingerprint;
+    // Payment reconciliation may credit the wallet while this page is open.
+    // Publish only a change signal, never amounts or a second credit request.
+    if (changed && session?.user?.id) notifyMarketBalanceChanged(session.user.id);
+  }, [balanceFingerprint, session?.user?.id]);
 
   React.useEffect(() => {
     historiesRef.current = { topups, transactions };
@@ -298,6 +312,8 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
     setChannelId((current) => current || nextChannels[0]?.id || "");
     setLoaded(true);
   }, []);
+
+  React.useEffect(() => session?.user?.id ? subscribeMarketBalanceChanged(session.user.id, () => { void reload().catch(() => setError(t("earningConversion.refreshFailed"))); }) : undefined, [session?.user?.id, reload, t]);
 
   React.useEffect(() => {
     if (!hasUnresolvedTopups) return;
@@ -736,6 +752,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
           {displayCurrency === "CNY" && fxRateFresh ? <p className="mt-1 text-xs text-muted-foreground">{t("marketWallet.displayOnly", { amount: formatWalletUnits(wallet.availableUnits) })}</p> : null}
           <p className="mt-2 text-sm text-muted-foreground">{t("marketWallet.held")}: {displayCurrency === "CNY" && fxRateFresh ? formatWalletUnitsAsCny(wallet.heldUnits, fxRateMicros, locale) : formatWalletUnits(wallet.heldUnits)}</p>
           {wallet.committedUnits && wallet.committedUnits !== "0" ? <p className="mt-1 text-sm text-muted-foreground">{t("marketWallet.committed")}: {formatWalletUnits(wallet.committedUnits)}</p> : null}
+          <div className="mt-4"><EarningWalletConversion capacity={wallet.earningsConversion} onConverted={reload} disabled={!!busy} /></div>
         </div>
         {wallet.canTopup ? <form className="grid min-w-0 content-start gap-3" onSubmit={(event) => void submitTopup(event)}>
           <p className="text-sm font-semibold">{t("marketWallet.topup")}</p>
@@ -954,7 +971,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
           </ul>
         </WalletHistorySection>
       </div> : null}
-      {wallet.mode === "enabled" ? <WalletTransferPanel onTransferred={reload} walletVersion={wallet.version} /> : null}
+      {wallet.mode === "enabled" ? <WalletTransferPanel onTransferred={async () => { if (session?.user?.id) notifyMarketBalanceChanged(session.user.id); await reload(); }} walletVersion={wallet.version} /> : null}
       {wallet.hasWalletActivity ? <MarketBuyerDisputesList /> : null}
       <ConfirmAlertDialog
         open={reviewRetryConfirm}

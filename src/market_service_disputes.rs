@@ -239,6 +239,7 @@ struct RefundableLot {
     unlocked: i64,
     held: i64,
     paid: i64,
+    converted: i64,
     fee: i64,
     fee_reversed: i64,
     fee_unlocked: i64,
@@ -262,7 +263,7 @@ impl RefundableLot {
     // Allocated/paid Provider net cannot be clawed back. Find the exact gross
     // capacity at the original split (including 0/100% and tiny rounding).
     fn refundable_gross(&self) -> i64 {
-        let capacity = self.net() - self.reversed - self.held - self.paid;
+        let capacity = self.net() - self.reversed - self.held - self.paid - self.converted;
         let mut low = 0;
         let mut high = self.amount - self.refunded_gross();
         while low < high {
@@ -282,7 +283,7 @@ fn refundable_lots_tx(conn: &Connection, dispute_id: &str) -> Result<Vec<Refunda
         .prepare(
             "SELECT lot.id, lot.amount_units, lot.reversed_units, lot.unlocked_units,
                     lot.held_units, lot.paid_units, lot.commission_units,
-                    lot.commission_reversed_units, lot.commission_unlocked_units
+                    lot.commission_reversed_units, lot.commission_unlocked_units, lot.converted_units
              FROM market_service_dispute_lots scope
              JOIN market_provider_earning_lots lot ON lot.id = scope.earning_lot_id
              JOIN market_delivery_slices slice ON slice.id = lot.delivery_slice_id
@@ -299,6 +300,7 @@ fn refundable_lots_tx(conn: &Connection, dispute_id: &str) -> Result<Vec<Refunda
                 unlocked: row.get(3)?,
                 held: row.get(4)?,
                 paid: row.get(5)?,
+                converted: row.get(9)?,
                 fee: row.get(6)?,
                 fee_reversed: row.get(7)?,
                 fee_unlocked: row.get(8)?,
@@ -339,7 +341,7 @@ pub(crate) fn resolve_dispute_tx(
     })?;
     if refund_units > refundable {
         return Err(AppError::Conflict(
-            "service refund requires Owner review: original Provider net is already allocated or paid; cancel the pending payout or arrange recovery first".into(),
+            "service adjustment requires Owner review: original Provider net is allocated, paid, or converted; cancel a pending payout or arrange recovery first".into(),
         ));
     }
     let mut left = refund_units;
@@ -355,7 +357,7 @@ pub(crate) fn resolve_dispute_tx(
         let taken = left.min(lot.refundable_gross());
         let (net_taken, fee_taken) = lot.split_refund(taken);
         let pending = lot.net() - lot.reversed - lot.unlocked;
-        let available = lot.unlocked - lot.held - lot.paid;
+        let available = lot.unlocked - lot.held - lot.paid - lot.converted;
         let from_pending = net_taken.min(pending);
         let from_available = (net_taken - from_pending).min(available);
         let fee_pending = lot.fee - lot.fee_reversed - lot.fee_unlocked;
@@ -441,7 +443,7 @@ pub(crate) fn resolve_dispute_tx(
                      commission_unlocked_units = commission_unlocked_units - ?10
                  WHERE id = ?1 AND amount_units = ?4 AND reversed_units = ?5
                    AND unlocked_units = ?6 AND held_units = ?7 AND paid_units = ?8
-                   AND disputed = 1",
+                   AND disputed = 1 AND converted_units = ?11",
                 params![
                     lot.id,
                     net_taken,
@@ -452,7 +454,8 @@ pub(crate) fn resolve_dispute_tx(
                     lot.held,
                     lot.paid,
                     fee_taken,
-                    fee_from_revenue
+                    fee_from_revenue,
+                    lot.converted
                 ],
             )
             .map_err(db_error("reverse disputed Provider earning"))?;

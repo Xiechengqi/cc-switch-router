@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import { useAuth } from "@/components/auth/auth-provider";
 import Link from "next/link";
 import { Button } from "@heroui/react";
 import {
@@ -31,6 +32,7 @@ import {
 } from "@/lib/api";
 import { shareMarketHref } from "@/lib/dashboard-nav";
 import { formatUsdMoney } from "@/lib/market-money";
+import { notifyMarketBalanceChanged } from "@/lib/earning-wallet-conversion";
 import { SHARE_APP_LABELS } from "@/lib/share-app";
 import type { ShareMarketListing, ShareMarketSubscription } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -393,6 +395,7 @@ type PendingAction = {
 
 export function useShareMarketRentalActions(onChanged: () => Promise<void> | void) {
   const { locale, t } = useLocaleText();
+  const { session } = useAuth();
   const [busyId, setBusyId] = React.useState("");
   const [action, setAction] = React.useState<PendingAction | null>(null);
   const [error, setError] = React.useState("");
@@ -403,6 +406,7 @@ export function useShareMarketRentalActions(onChanged: () => Promise<void> | voi
     setError("");
     try {
       await operation();
+      if (session?.user?.id) notifyMarketBalanceChanged(session.user.id);
       setAction(null);
       await onChanged();
     } catch (reason) {
