@@ -2,6 +2,8 @@
 
 本文档描述 `cc-switch-router` 的**当前实现现状**。协议层面的接口契约见 [PROTOCOL.md](PROTOCOL.md),部署与配置见 [README.md](README.md)。
 
+> 最后核对：2026-10-22，对应提交 `a40bc94`。代码引用使用符号名而非行号，以免随代码漂移。
+
 > 本文替换了 2026-04 的同名设计提案。那份文档写于项目立项期,描述的是「建议改成…」的目标形态,且以 `cc-switch` Tauri 桌面版为客户端。实现已大幅偏离该提案,客户端也已换为 `cc-switch-server`。
 
 ---
@@ -12,8 +14,8 @@
 
 | 术语 | 含义 | 代码位置 |
 |---|---|---|
-| **Host Provider**(主机供给方) | Client Market 中出租服务器的用户 | `client_market_trade.rs:72` `provider_id` |
-| **Upstream Provider**(上游供应商) | Share 绑定的 API 后端:claude / codex / gemini / kiro / cursor | `models.rs:1989` `ShareUpstreamProvider` |
+| **Host Provider**(主机供给方) | Client Market 中出租服务器的用户 | `client_market_trade.rs` `QuoteItemView::provider_id`、`RentalView::provider_id` |
+| **Upstream Provider**(上游供应商) | Share 绑定的 API 后端。`ShareAppRuntimes` 有 claude / codex / gemini / kiro / cursor / antigravity / copilot 七个运行时槽位;Share 对外开放的 App 仍只有 claude / codex / gemini | `models.rs` `ShareUpstreamProvider`、`ShareAppRuntimes` |
 
 与 Server 侧对齐的其余词汇:
 
@@ -25,10 +27,13 @@
 | `share descriptor` | Server 同步给 Router 的 share 配置与运行时快照;一个 descriptor 可绑定 Claude/Codex/Gemini 中的 1 到 3 个 app。Router 对 Server 送来的 `ops`/`share`/edit `ack` JSON 原文验签,claim 通过原文 SHA-256 绑定 descriptor,再用严格解析后的结构校验和落库 |
 | `account` | 绑定在 Upstream Provider 上的凭据(OAuth token 或 API key),存于 Server |
 | `capacity pool` | 同一物理账号或 API key 的匿名容量标识;可跨多个独立 Share URL 复用，在凭据源变化时重派生 |
-| `统一模型入口` | 区域级 `api.<tunnel_domain>`；按用户的精确 App/模型映射选择 Share，不拥有独立容量或授权 |
+| `统一模型入口` | 区域级 `api.<tunnel_domain>`；按用户的 App/模型映射（精确模型名，或该 App 显式配置的 `*` 全量路由）选择 Share，不拥有独立容量或授权 |
 | `control_secret` | 注册时下发的对称 HMAC 密钥,用于 Router → Server 方向认证 |
 | `ingress context` | Router 注入转发请求的签名身份上下文 |
 | `pending share edit` | Router 侧排队的 share 变更,由 Server 拉取并 ack |
+| `财务模式` | Router Owner 控制的 `market_finance_control.mode`（`disabled` / `shadow` / `enabled`），决定付费商品走旧 Provider 资金轨道还是平台钱包；批准切换后单向不可回退 |
+| `平台钱包` | 每个 Router 用户一个、两个 Market 共用的 USD 余额，由 USD 整数复式 journal 记账；只存在于 Router，Server 不感知 |
+| `Router Owner` | `CC_SWITCH_ROUTER_OWNER_EMAIL`（未配置时为隧道域名默认管理员）；财务模式、支付渠道、费率与提现付款登记等资金操作只允许 Owner |
 
 ---
 
@@ -57,13 +62,13 @@ cc-switch-router 是 TokenSwitch 的**公共汇聚层**。它为 `cc-switch-serv
 
 **客户端**:`cc-switch-server` 是唯一客户端。`install-client.sh` 负责在远程主机上部署它；Router 按动态 Settings 把 `latest` 或已验证的 7 位 Commit Release 写入每次返回的脚本，脚本在安装前校验对应架构的 checksum，Commit 模式还核对 staged binary 的构建 Commit。
 
-**多区域**:仓库根部 `regions` 文件声明区域到域名的映射,当前为 `japan` / `singapore` / `hongkong` / `usa` 四个区域,经 `GET /v1/regions` 暴露(`src/api.rs:121, 2340`)。
+**多区域**:仓库根部 `regions` 文件声明区域到域名的映射,当前为 `free` / `japan` / `singapore` / `hongkong` / `usa` 五个区域,经 `GET /v1/regions` 按文件顺序暴露(`src/api.rs` 的 `REGIONS` 与 `regions()`)。
 
 ---
 
 ## 2. Client + Router 的能力边界
 
-两类内建市场共用同一套隧道、Share descriptor、准入和账户级后付费账务；它们都不依赖旧 `router_markets` 注册或 bearer session：
+两类内建市场共用同一套隧道、Share descriptor、准入和资金（由 Router Owner 的财务模式在平台钱包与旧 Provider 资金轨道之间选择，见 ⑤）；它们都不依赖旧 `router_markets` 注册或 bearer session：
 
 ### 可选的用户统一模型入口
 
@@ -76,37 +81,33 @@ Direct Share:
 
 统一模型入口:
   同一 API Key + api.region.example/v1/... + requested model
-    -> (user, app, exact model) 查映射
+    -> (user, app, requested model) 查映射：精确模型名优先，其次该 App 显式配置的 `*`
     -> 映射目标的 Share ACL/App/在线状态检查
     -> 原 Share 代理链
 ```
 
-统一入口是薄选择层，不是新的 Share、市场或计量主体。它不分配每用户子域名，不改写模型，不从用户可见 Share 中自动挑选，也不在失败时 fallback / 重试其他 Share。映射不授予访问权；Owner、有效 ShareTo grant 或 Free 权限及目标 App 可用性在每次请求时重新判定。选中后请求继续走 `proxy_handler`、IngressContext、并发和流式生命周期，因此请求日志、usage、地图归因、限额和账务都只记录在目标 Share 层。直接 Share URL 始终保留，用户没有配置映射时系统行为与此前一致。
+统一入口是薄选择层，不是新的 Share、市场或计量主体。映射键固定为 `(appType, requestedModel)`；除精确模型名外，用户可为每个 App 显式配置一条 `*` 全量路由，优先级固定为精确映射 > `*`，不支持前缀、后缀或正则匹配。它不分配每用户子域名，不改写模型，不从用户可见 Share 中自动挑选，也不在失败时 fallback / 重试其他 Share。映射不授予访问权；Owner、有效 ShareTo grant 或 Free 权限及目标 App 可用性在每次请求时重新判定。选中后请求继续走 `proxy_handler`、IngressContext、并发和流式生命周期，因此请求日志、usage、地图归因、限额和账务都只记录在目标 Share 层。直接 Share URL 始终保留，用户没有配置映射时系统行为与此前一致。
 
 控制面使用 `user_model_routing_profiles` 的 revision 做乐观并发控制，`user_model_routes` 保存区分大小写的精确键，`user_model_route_events` 按用户保留最近 100 次原子替换审计。Share 删除不级联删除 route：失效目标必须在 UI 中保持可见并在运行时 fail closed，不能静默变成未配置或换到其他 Share。
 
 ### ① Share Market —— 固定拼车位租用
 
-Share Market 内建于 Router,不注册为外部 `router_markets`。Share owner 只能从 Router 的 Share Market 页面通过「添加 Share」选择自己当前 active、尚未挂售的 Share,候选项同时展示 subdomain、owner 和已绑定应用，并创建最多 20 个拼车位。每个拼车位独立配置用户 Token/并发限制、每日价格和服务期限。
+Share Market 内建于 Router,不注册为外部 `router_markets`。Share owner 只能从 Router 的 Share Market 页面通过「添加 Share」选择自己当前 active、尚未挂售的 Share,候选项同时展示 subdomain、owner 和已绑定应用，并创建最多 20 个拼车位。每个拼车位独立配置用户 Token/并发限制、价格、试用和服务期限。新发布的付费拼车位按自然月计价（`prepaid_calendar_month`），默认 12 小时健康时长试用、试用期 Token 上限 100 万；按日计价（`legacy_metered_daily`）只为既有车位与合同保留。
 
 - Token 限额留空表示不限额，此时周期固定归一为累计且 UI 不显示周期；设置限额后才选择累计不重置、每天、自然周、每 7 天、自然月或每 30 天。Token 重置周期与服务期限相互独立。
-- 免费和付费拼车位都可设置 1–365 天固定服务期限或无固定期限。固定期限从买家确认租用成功时开始，绝对到期时间同时冻结到 Subscription 和 Server grant policy；授权延迟或账单暂停不会顺延，到期后任何状态都不得恢复服务。
-- 每日价格留空时是免费拼车位；不要求信用额度、不进入账务系统。付费固定期限到期时会立即终止账务合约，并通过现有 revoke 流程安全回收授权；回收失败时座位不会提前恢复为可租。
-- 准入按 `share/free`、`share/paid`、`client_host/free`、`client_host/paid` 四个作用域独立配置。免费默认黑名单，未知用户可先体验；付费默认白名单，需 Owner 明确允许并授予信用额度。
-- 付费拼车位先授权服务,前 12 小时不计费。体验期结束后,Router 只按实际健康服务区间累计费用,未知或不可用时间不计费。
-- 付费 Share 与 Client Host 共用按「买家 + 供应商」聚合的 USD 赊账账户。有限信用额度使用达到 80% 时向买卖双方预警,用满、任一方主动清账或最后一个服务结束时生成合并账单并暂停相关服务；无限额度只接受主动清账。美元兑人民币汇率由动态 Settings 管理并默认 `1:7`；未出账估算使用当前汇率，账单冻结出账时的汇率、人民币总额和明细，CNY 不参与记账。
-- 用户可按供应商收款资料线下付款并声明，由供应商确认；当账单冻结了 Binance UID、商家绑定了严格只读的 Binance API Key 且 Router 总开关启用时，也可创建 15 分钟 USDT 付款 intent，以四位小数唯一尾差自动识别入账。自动与人工确认共用同一原子结算核心，任一方胜出后都会阻止另一方重复入账；逾期会限制用户继续使用市场赊账。争议由 Router 管理员裁决,账单也可由管理员作废。
-- 出账时会把供应商当时的收款方式和联系方式冻结到该账单,避免后续资料修改改变未结账单的付款依据或争议证据。
-- 供应商可随时永久关闭某个买方的赊账关系；即使已有待处理账单,关闭意图也会立即锁定并终止服务,清账或作废后不会恢复,未来也禁止双方再次建立付费租约。
-- 买家点击租用先经过交易确认，确认内容固定展示 Owner、服务、在线状态、USD 日费或免费报价、独立服务期限，以及付费服务的 12 小时健康时长试用和按供应商聚合账单语义；提交继续携带 `offerRevision` 防止确认后报价被替换。
+- 免费拼车位与按日计价的付费拼车位可设置 1–365 天固定服务期限或无固定期限；按月计价的付费拼车位按自然月续期，不设固定期限。固定期限从 Server 首次应用该授权时开始：Router 在 managed grant 中下发相对期限 `durationSeconds`，Server 按自身的 `appliedAtMs` 写入绝对 `expiresAt`，Router 校验一致后冻结到 Subscription。授权下发前的等待不消耗期限，账单暂停也不会顺延，到期后任何状态都不得恢复服务。
+- 价格留空时是免费拼车位，不进入任何资金流程。付费固定期限到期时会立即终止账务合约，并通过现有 revoke 流程安全回收授权；回收失败时座位不会提前恢复为可租。
+- 准入按 `share/free`、`share/paid`、`client_host/free`、`client_host/paid` 四个作用域独立配置。免费默认黑名单，未知用户可先体验；付费默认白名单，需 Owner 明确允许（旧 Provider 资金轨道还要求同时授予信用额度）。
+- 付费拼车位先授权服务，试用期按健康服务时长消耗、不扣费；按日计价的服务在试用后只按实际健康服务区间计费，未知或不可用时间不计费。扣款、出账、付款与供应商结算规则见 ⑤。
+- 买家点击租用先经过交易确认，确认内容固定展示 Owner、服务、在线状态、USD 价格（月租或历史日费）或免费报价、服务期限与试用；平台钱包模式下同时展示全站可用余额与需充值差额，余额不足时先充值差额再重新报价，不自动下单。提交继续携带 `offerRevision` 防止确认后报价被替换。
 - 租用后,Router 才通过 pending Share edit 在 Server 上创建 `routerShareMarket` 管理的 `shareto` entitlement。普通 Share 编辑不能修改或删除仍为 active 的这类 entitlement；租约结束后的 tombstone 不再占用该邮箱，可供普通 Manual `shareto` 复用。
 - Owner 可强制回收、回收并拒绝该买家后续 Share 租用,或停止挂售。停止挂售只关闭空闲拼车位,不打断现有租约；同时递增这些车位的报价 revision 并失效未提交 quote,阻止停止前报价在恢复后被消费。
 - **恢复挂售**:停止挂售是可逆状态,始终恢复原 listing,不创建替代 listing。Owner 可勾选全部或部分未出租、未退休的 disabled 旧车位,复核并修改条款,也可在同一操作中添加新车位；进行中的租约不阻止恢复且不受影响。恢复在 Immediate 事务中完成全部校验、旧车位更新、新车位插入和 listing 激活,任一失败完整回滚。「添加 Share」只用于从未挂售或已删除旧 listing 的 Share；存在 closed listing 时直接引导「恢复挂售」。
 - 普通 Share 的 `freeAccess` 是独立的公开免费策略：默认私有，开启后任意持有效 Router 用户 API Token 的已登录用户可调用，匿名仍拒绝。它与 Share Market listing/subscription 严格互斥；候选列表排除 Free Share，业务事务和数据库 trigger 双向阻止“公开免费 + 活跃市场 entitlement”，尚未应用的“开启 Free”控制面编辑也会阻止新建或重新打开 listing。
 
-市场状态与审计由 `share_market_listings`、`share_market_seats`、`share_market_subscriptions`、`share_control_operations` 和 `share_market_events` 持久化；Seat 与 Subscription 都冻结 `service_duration_days`，Subscription 另存从租用成功时计算的绝对 `expires_at`，`activated_at` 只记录授权实际生效时间。统一准入由 `market_supplier_access_policies`、`market_counterparties`、产品规则、`market_access_requests`、私有/公共授信及事件表持久化，其中策略和规则主键均包含 `pricing_kind`。准入申请批准及管理页批量保存都使用 libSQL Immediate 事务，避免出现“已允许但未授信”或只保存部分买家的状态。统一账务由 `market_credit_accounts`、`market_service_contracts`、`market_service_intervals`、`market_accrual_entries`、`market_invoices`、`market_invoice_lines` 及付款、争议、限制、事件表持久化。币安扩展使用 `binance_payment_accounts`、`market_payment_intents`、金额预留、加密流水、外部收据和异常对账表；UID/API Key 指纹全局唯一，凭据轮换使用 revision CAS，轮询使用可过期 lease 加 revision fencing；API Secret 与原始流水分别用 XChaCha20-Poly1305 和上下文 AAD 加密，不进入公开收款方式、账单快照或聊天事件。完整运行手册见 [docs/runbook-binance-auto-settlement.md](docs/runbook-binance-auto-settlement.md)。
+市场状态与审计由 `share_market_listings`、`share_market_seats`、`share_market_subscriptions`、`share_control_operations` 和 `share_market_events` 持久化；Seat 与 Subscription 都冻结 `service_duration_days`，Subscription 另存从授权首次生效时计算的绝对 `expires_at`，`activated_at` 只记录授权实际生效时间。统一准入由 `market_supplier_access_policies`、`market_counterparties`、产品规则、`market_access_requests`、私有/公共授信及事件表持久化，其中策略和规则主键均包含 `pricing_kind`。准入申请批准及管理页批量保存都使用 libSQL Immediate 事务，避免出现“已允许但未授信”或只保存部分买家的状态。旧 Provider 资金轨道的账务由 `market_credit_accounts`、`market_service_contracts`、`market_service_intervals`、`market_accrual_entries`、`market_invoices`、`market_invoice_lines` 及付款、争议、限制、事件表持久化。币安扩展使用 `binance_payment_accounts`、`market_payment_intents`、金额预留、加密流水、外部收据和异常对账表；UID/API Key 指纹全局唯一，凭据轮换使用 revision CAS，轮询使用可过期 lease 加 revision fencing；API Secret 与原始流水分别用 XChaCha20-Poly1305 和上下文 AAD 加密，不进入公开收款方式、账单快照或聊天事件。完整运行手册见 [docs/runbook-binance-auto-settlement.md](docs/runbook-binance-auto-settlement.md)。平台钱包的数据与流程见 ⑤。
 
-账户 UI 以 `/account/market-readiness` 作为供应商运营摘要，聚合收款资料、待准入数量、账务待办与四项准入策略；实际写操作仍分别归属收款信息、市场准入和市场账务页面。账务页以待处理、应付、应收、历史和管理员争议分区，不引入独立的前端账务状态。
+账户 UI 按「安全（API Key／通知）→ 用量 → 资金 → 市场交易」组织：资金区为平台余额 `/account/wallet/` 与收入与提现 `/account/earnings/`；市场交易区为 Share 交易 `/account/share/`、Client 交易 `/account/client/` 与 Provider 设置 `/account/provider-settings/`（业务联系方式、四项准入策略与准入申请收件箱，不再配置买家授信或预存）。旧 `/account/billing/` 重定向到平台余额，`/account/payments/`、`/account/market-access/`、`/account/market-readiness/` 重定向到 Provider 设置；`disabled`／`shadow` 模式也不会恢复旧的商家直付或授信界面。
 
 Share 的 token/并发限制、请求 usage、用户 `usageRebase` 重基线、模型健康和容量池是 Share/Router 运行时能力，不等于外部 Token Market 的用户账本。普通 Share 的旧官方价格比例已退役；Share Market 报价只属于 listing/seat。Router 只保存本地 Share/seat entitlement、脱敏 observation 和服务账务；未来外部平台的下游用户、API key、token 售价、余额与 token settlement 必须留在平台自身。用户周期重基线由 Server 保存并通过 descriptor 下发，Router 不拥有编辑权。
 
@@ -116,7 +117,7 @@ Share 的 token/并发限制、请求 usage、用户 `usageRebase` 重基线、�
 
 ### ③ Client Market —— 主机供给
 
-Host Provider 贡献一台 Linux 服务器,Router 用**专用外发 Ed25519 provision key**(与入站 SSH host key 相互独立,`src/provision_ssh.rs:27`)登录,安装依赖并部署 Server,使其成为 Client + Router 容量与 Share 服务的供给节点。
+Host Provider 贡献一台 Linux 服务器,Router 用**专用外发 Ed25519 provision key**(与入站 SSH host key 相互独立,`src/provision_ssh.rs` `require_provision_ssh_keys()`)登录,安装依赖并部署 Server,使其成为 Client + Router 容量与 Share 服务的供给节点。
 
 主机状态机(`router_ssh_hosts.status`):
 
@@ -126,15 +127,20 @@ idle ──► locked ──► allocated ──► draining ──► idle
 异常态:unreachable / abnormal / disabled / reserved
 ```
 
-`reserved` 用于报价锁定期(`client_market_trade.rs:29`)。
+`reserved` 用于报价锁定期(`client_market_trade.rs` `HOST_STATUS_RESERVED`,报价 TTL 120 秒)。
 
 **任务与清理对账**(`src/client_market.rs`):
 
 | 场景 | 处理 |
 |---|---|
 | `draining` 停滞超 10 分钟 | 自动派发 cleanup job |
-| `unreachable` 超 5 分钟 | SSH 探测;确认无安装痕迹则清除 DB 记录并复位为 idle |
+| 释放后清理失败 | 按 5 分钟 → 15 分钟 → 1 小时 → 6 小时 → 24 小时退避 SSH 复查,最多 5 次;确认干净则复位为 idle,否则自动派发 cleanup job;指纹或绑定不一致只允许人工处理(`reconcile_cleanup_retry_claim`) |
+| 隔离中且无安装的 Host | 立即探测,之后按 15 分钟 / 1 小时 / 6 小时 / 24 小时重复复查(`reconcile_quarantined_host_reprobe`);两类复查都最多 4 并发 |
+| `locked` 超 25 分钟且无 job | 转为 `unreachable` |
+| `reserved` 超 10 分钟 | 复位为 `idle` |
 | 进程重启导致 job 中断 | 启动时 `reconcile_interrupted_jobs` 以最多 4 并发重跑 |
+
+Host Provider 还可对不可达 Host 执行 `POST /v1/client-market/hosts/:id/retire-unreachable`,直接删除该 Host 记录。
 
 这里的后台重试仅覆盖 Router 自身的首次开通 job 和显式 cleanup job。首次开通脚本只启动一次 Client 进程，安装的 systemd/OpenRC 服务不启用开机启动、失败重启或 respawn。开通完成后，Router 不会因 tunnel 离线而通过 provision SSH 启动或重启 `cc-switch-server`；只记录 `online`、`reconnecting`、`offline`、`disabled` 连接状态并继续心跳、告警和 UI 提示。Client 进程生命周期完全由 Client owner 管理。
 
@@ -149,6 +155,37 @@ idle ──► locked ──► allocated ──► draining ──► idle
 Market Provider 是 Share owner、Host Provider 与其资金/合同关系的稳定市场身份，不等同于 Server 的 Claude/OpenAI 等 upstream Provider type。Migration 52 以 opaque `mp_*` ID 和 alias ledger 归并两个市场；冲突身份 fail closed，不向公开 API 暴露邮箱、Router user ID 或资金。
 
 Provider Rank v1 每 15 分钟把服务质量、有效买家选择、履约和供给广度按 `45/30/15/10` 生成一个原子代次。3 个不同 Router 买家账户和 7 个观测日是正式排名门槛（账户去重不是 KYC 证明）；TTFT/TPS 仅展示，官方身份和探索插入均不改变正式分数或名次。生成失败继续读取 last-good，超过两个刷新周期标记 stale。推荐使用 `off/shadow/on` 渐进发布，默认 `shadow`。完整身份、评分、API、资金去重和发布契约见 [docs/provider-ranking.md](docs/provider-ranking.md)。
+
+### ⑤ Market 资金 —— 财务模式、平台钱包与旧 Provider 资金轨道
+
+Share Market 与 Client Market 的付费全部由 Router 承担，Server 不保存价格、余额或账单。对 Server 而言，租用、恢复和欠费暂停只是 `managedGrant` 的 `upsert` / `revoke`；Client Market 欠费时由 Router 暂停该 Client 的 tunnel。付费商品的资金轨道由财务模式决定（`src/market_payments/mod.rs` 的 `wallet_purchase_mode_tx`、`require_current_offer_rail`）：
+
+| 财务模式 | 付费商品资金轨道 | 说明 |
+|---|---|---|
+| `disabled`（新部署默认） | 旧 Provider 资金轨道（`legacy_provider`） | 平台钱包代码已接线，但不开放充值。付费拼车位仍按供应商预存与授信租用；Client Market 新付费购买界面只接受平台钱包报价，因此切换前不开放付费 Host 购买 |
+| `shadow` | 旧 Provider 资金轨道 | 仅 Router Owner 可用 canary 渠道测试充值，用于真实商户影子验收 |
+| `enabled` | 平台钱包（`platform_wallet`） | Owner 在 readiness 通过后经 API 批准切换（写入 `cutover_approved_at`），单向不可回退。旧资金写接口（`/v1/market-billing/*`、`/v1/account/payment-profile`、`/v1/account/binance-auto-settlement*`、market-access 授信与公共额度）返回 `410`（`src/api.rs` `is_retired_legacy_finance_write`）；以另一模式发布的报价必须由 Provider 重新发布 |
+
+**平台钱包**（`src/market_payments/`、`src/market_wallet*.rs`、`src/market_platform_contracts.rs`、`src/market_finance.rs`、`src/market_payouts.rs`、`src/market_commission.rs`、`src/market_earning_conversions.rs`；迁移 0053–0077）：
+
+- **账本**：USD 整数复式 journal（1 美分 = 86,400 单位）。每个 Router `user_id` 一个钱包，两个 Market 和所有 Provider 共用；余额、冻结、月租未履约款、Provider 待解锁／可提现／提现中与平台费用都能从 journal 逐笔重算。对账器发现不变量破坏时按范围冻结相关资金路径，而不是自动改账。
+- **充值**：Owner 在 Settings 配置支付渠道，首个适配器为 DujiaoPay（托管收银台或站内直付二维码；API／Webhook 密钥用独立主密钥 AEAD 加密）。渠道按 `off → canary → live` 灰度，canary 首笔严格验真入账后自动转正。用户按希望到账的 1–1,000 美元报价，另付充值维护费（默认 5%，Owner 可设 0–100%，精度 0.01 个百分点），报价 5 分钟有效。入账只认事务外的认证查单与链上回执核验（`paid_source=chain`、允许的链与币、确认数、金额不短付）；浏览器回跳和无签名通知都不算付款证明，证据不足的订单进入 Owner 核对。
+- **消费余额**：不可提现，也不能自助外部退款；可按精确邮箱免费转给本 Router 已验证的其他用户（6 位邮箱验证码，默认单笔与 UTC 自然日上限各 5,000 美元，Owner 可调整并可暂停）。
+- **购买与履约**：报价不冻结资金；提交时冻结开通所需金额，Share 授权或 Host 开通成功后才捕获当期款，失败须确认清理完成才释放。月租按半开服务区间的可用时间生成履约片段；按日计价的历史服务以约 24 小时滚动预算按健康秒数批量过账。余额不足时暂停服务，默认第 5 天提醒、第 7 天进入清理终止（`CC_SWITCH_ROUTER_MARKET_SUSPENDED_TERMINATE_DAYS`）。服务退款和争议退款都回到钱包。
+- **Provider 收入**：只由买家已扣款且已履约的服务生成。平台服务费默认为已履约总额的 10%（Owner 可设 0–100%；上调保存 7 天后生效，下调立即生效；费率按报价和计费周期冻结），免费、试用、充值与转账不产生服务费。净收益与对应服务费在 `max(buyer_debited_at, fulfilled_at) + 7 天` 后成熟。Provider 只能保存 USDT（TRON）提现地址（修改需邮箱验证码，并有 24 小时冷静期），钱包模式下发布付费商品前必须已有过了冷静期的提现地址；之后申请提现（单笔不超过 5,000 美元，最多 3 笔未结），由 Router Owner 审批、线下转账并登记链上交易；Router 不持有出款私钥，也不能自动确认链上到账。除提现外，Provider 也可由本人明确确认，把已成熟、未冻结、未分配提现的净收益 1:1 转入自己的平台钱包（迁移 0077，`/v1/market-provider-finance/wallet-conversion*`）：零手续费、不可撤回，转入后即成为不可提现的消费余额，不产生平台收入；Owner 可用 `earningsConversionsPaused` 单独暂停新转入。
+- **权限与应急**：财务模式、暂停开关、渠道凭据、手动入账／外部退款冲正、严重 case 结案与标记已付只允许 Router Owner，其他管理员只读或处理非严重事项。「暂停新钱包订单／新提现」与「暂停新充值」是独立开关，用于事故处置，不影响既有合同履行、回调与对账。
+- **页面**：平台余额 `/account/wallet/`、站内付款核对页 `/wallet-checkout/`、收入与提现 `/account/earnings/`、Provider 设置 `/account/provider-settings/`；Owner 在「设置 → 市场 → 平台钱包」管理渠道、维护费、转账限额与服务费。
+
+生产状态：代码已接线；真实 DujiaoPay 商户的影子验收与生产切换按 [docs/market-platform-wallet-implementation.md](docs/market-platform-wallet-implementation.md) §13 清单执行，已知未实现项见该文 §14.8。
+
+**旧 Provider 资金轨道**（`src/market_billing.rs`、`src/market_recurring.rs`、`src/binance_settlement/`）：财务模式切到 `enabled` 之前使用；切换后只用于清结既有义务。
+
+- 付费 Share 与 Client Host 共用按「买家 + 供应商」聚合的 USD 赊账／预存账户。有限信用额度使用达到 80% 时向买卖双方预警，用满、任一方主动清账或最后一个服务结束时生成合并账单并暂停相关服务；无限额度只接受主动清账。按日计价的服务先享受 12 小时健康时长试用，之后只按健康服务区间计费。
+- 用户可按供应商收款资料线下付款并声明，由供应商确认；当账单冻结了 Binance UID、商家绑定了严格只读的 Binance API Key 且 Router 总开关启用时，也可创建 15 分钟 USDT 付款 intent，以四位小数唯一尾差自动识别入账。自动与人工确认共用同一原子结算核心，任一方胜出后都会阻止另一方重复入账；逾期会限制用户继续使用市场赊账。争议由 Router 管理员裁决，账单也可由管理员作废。
+- 出账时冻结供应商当时的收款方式、联系方式，以及出账时的 USD/CNY 汇率和人民币金额，避免后续资料或汇率变化改写未结账单。
+- 供应商可随时永久关闭某个买方的赊账关系；即使已有待处理账单，关闭意图也会立即锁定并终止服务，清账或作废后不会恢复，未来也禁止双方再次建立付费租约。
+
+两条轨道都只以 USD 记账。人民币按 Router 每 15 分钟从 `api.exchangerate.fun` 获取并验证的 USD/CNY 汇率近似展示（`src/market_fx.rs`），`CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE` 只是首次获取成功前的回退值。
 
 ### Router 联邦 —— 横向扩展
 
@@ -172,10 +209,10 @@ Provider Rank v1 每 15 分钟把服务质量、有效买家选择、履约和�
   → axum (:80)
       ├─ <share> host → proxy_handler
       └─ api host → user_model_proxy_handler → proxy_handler
-  → subdomain_for_host()  剥离 tunnel_domain 后缀    src/proxy.rs:5746
+  → subdomain_for_host()  剥离 tunnel_domain 后缀    src/proxy.rs
   → ProxyRegistry.routes 查表
   → reqwest 请求 127.0.0.1:<临时端口>
-  → io::copy_bidirectional ↔ SSH forwarded-tcpip    src/ssh.rs:491
+  → 双向字节桥 ↔ SSH forwarded-tcpip               src/ssh/bridge.rs
   → cc-switch-server → 真·上游供应商
 ```
 
@@ -185,7 +222,7 @@ Provider Rank v1 每 15 分钟把服务质量、有效买家选择、履约和�
 routes: Arc<RwLock<HashMap<String, LogicalRoute>>>
 ```
 
-`LogicalRoute`(`src/proxy.rs:106`)用三段式管理连接世代,支撑无损切换:
+`LogicalRoute`(`src/proxy.rs`)用三段式管理连接世代,支撑无损切换:
 
 | 字段 | 作用 |
 |---|---|
@@ -193,9 +230,9 @@ routes: Arc<RwLock<HashMap<String, LogicalRoute>>>
 | `candidates: BTreeMap<u64, RouteEntry>` | 已注册但未提升的连接,按世代号排列 |
 | `draining: BTreeMap<u64, RouteEntry>` | 老连接排空中,上限 5 分钟 |
 
-路由处于 `Reconnecting` 状态时,新请求经 `watch` channel 最多阻塞等待 3 秒再返回错误(`src/proxy.rs:1136`),而非立即 502。
+路由处于 `Reconnecting` 状态时,新请求经 `watch` channel 最多阻塞等待 3 秒(`ROUTE_RECONNECT_WAIT_TIMEOUT`),每条路由最多 128 个等待者,超时返回 `503 tunnel-reconnecting`,而非立即 502。
 
-响应体经 `bytes_stream()` 流式透传,并用 RAII guard 持有并发许可与流量记录直至流关闭(`src/proxy.rs:2953-2967`)。
+响应体由独立 pump 任务经容量为 8 的 channel 流式透传,`ProxyResponseLifecycle`(`src/proxy.rs`)持有并发许可与流量记录直至流关闭;首个事件、空闲与最长生命周期超时分别为 120 / 900 / 7200 秒。SSH 侧的双向桥另有写阻塞与半关闭空闲各 300 秒超时。
 
 > **已知行为**:排空窗口内新老两条 SSH 连接可同时为同一子域名转发流量。这是优雅轮换的设计取舍。
 
@@ -211,14 +248,15 @@ routes: Arc<RwLock<HashMap<String, LogicalRoute>>>
 
 | 层 | 结构 | 存储 |
 |---|---|---|
-| 注册准入 | 全局 / 来源 / 公钥三级 TokenBucket | 内存(`registration_admission.rs:465`) |
+| 注册准入 | 全局 / 来源 / 公钥三级 TokenBucket | 内存(`registration_admission.rs` `LimiterState`) |
 | 新身份配额 | 10 分钟 / 小时 / 日 滑窗 | 业务 libSQL(重启不重置) |
 | 未绑定 Owner 水位 | 默认 50000,达到后暂停新身份准入 | 业务 libSQL |
-| 请求并发 | 6 个 `KeyedConcurrencyLimiter` | 内存(`proxy.rs:562-573`) |
-| 认证滥用 | 10 分钟 10 次失败 → 封禁 1 小时 | 内存(`abuse.rs:6-8`) |
+| 请求并发 | Share 级租约表 `ShareRequestRegistry`,加免费 Share IP 与图片任务两个 `KeyedConcurrencyLimiter` | 内存(`proxy.rs` `ProxyRegistry`) |
+| 认证滥用 | 10 分钟 10 次失败 → 封禁 1 小时 | 内存(`abuse.rs`) |
+| Share 级滥用 | 同一 Share 10 分钟 10 次违规 → 封禁 1 小时 | 业务库 `share_client_bans`(`ShareAbuseTracker`) |
 | 请求体体积 | 三档上限:普通 10 MB / 视频 32 MB / 图片 48 MB(可配置) | 内存缓冲上限(`proxy.rs` `proxy_request_body_limit()`) |
 
-请求体体积不是速率限制,而是**内存缓冲天花板**:请求体经 `axum::body::to_bytes` 一次性读入内存,峰值内存 ≈ 单档上限 × 并发请求数。三档由 `CC_SWITCH_ROUTER_PROXY_{,MEDIA_,IMAGE_}REQUEST_BODY_LIMIT_MB` 配置(MB 为单位,改后需重启)。读取发生在 `try_acquire_share_permit` 之前,因此超限请求返回 413 且不消耗 Share 并发额度。
+请求体体积不是速率限制,而是**内存缓冲天花板**:请求体经 `axum::body::to_bytes` 一次性读入内存,峰值内存 ≈ 单档上限 × 并发请求数。三档由 `CC_SWITCH_ROUTER_PROXY_{,MEDIA_,IMAGE_}REQUEST_BODY_LIMIT_MB` 配置(MB 为单位,改后需重启)。读取发生在 `try_acquire_share_permit` 之前,因此超限请求返回 413 且不消耗 Share 并发额度;读取超过 30 秒返回 408。
 
 Router 转发到 Client 时,会在签名头旁再写一个**不参与签名**的 `x-cc-switch-ingress-body-limit`(十进制字节,值 = 该请求命中的档位),Client 取 `min(本地上限, 声明值)` 作为本次 ingress 的生效上限。因此:
 
@@ -226,24 +264,24 @@ Router 转发到 Client 时,会在签名头旁再写一个**不参与签名**的
 - 两端可独立升级:旧 Client 忽略该头、沿用自身硬编码值;旧 Router 不发该头,新 Client 回退到历史默认值(普通 2 MiB / 视频 32 MiB / 图片 48 MiB)。
 - 新版 Client 的本地上限默认取 Router 允许的最大档位(64/256/256 MB),所以默认由 Router settings 决定实际天花板;卖家可在 `server.json` 的 `requestBodyLimits` 或 `CC_SWITCH_{,MEDIA_,IMAGE_}REQUEST_BODY_LIMIT_MB` 中主动收紧。
 
-并发限流键位:`share_id`、`share_id:app`、`share_id:app:email`、用户 IP(免费档)、图片任务、市场邮箱。
+Router 侧并发只按三类键限制:`share_id`(Share 并发池)、免费 Share 的真实用户 IP(默认 1)、每个 Share 的图片任务(同时最多 1 个)。按用户邮箱的并发由 Server 的 email grant 执行,Router 只识别并映射其稳定错误码。
 
 > **已知限制**:内存 TokenBucket 无持久化,进程重启即清零。业务库侧的新身份配额能兜住真正的身份创建,但尝试洪水本身在重启瞬间不受限。
 
 ### 真实客户端 IP
 
-`src/cf.rs` **不调用任何 Cloudflare API**,它只硬编码 Cloudflare 的 IPv4/IPv6 网段(`cf.rs:15-42`),用于判断 TCP peer 是否为 CF 边缘节点。
+`src/cf.rs` **不调用任何 Cloudflare API**,它只硬编码 Cloudflare 的 IPv4/IPv6 网段(`cf.rs` `CF_IPV4_CIDRS` / `CF_IPV6_CIDRS`),用于判断 TCP peer 是否为 CF 边缘节点。
 
 - peer 是 CF → 信任 `CF-Connecting-IP` / `CF-IPCountry` / `CF-ASN`
 - peer 非 CF → 回退 socket peer IP
 
-这防止伪造头绕过免费档限流(`client_meta.rs:11`、`proxy.rs:4122`)。
+这防止伪造头绕过免费档限流(`client_meta.rs` `extract_client_metadata()`、`proxy.rs` `trusted_asn_header()`)。
 
 ---
 
 ## 5. 数据层
 
-业务库与 metrics 库分离。业务 schema 由冻结 baseline 与顺序 migration 管理；当前最新版本为 52。
+业务库与 metrics 库分离。业务 schema 由冻结 baseline 与顺序 migration 管理，清单以 `src/schema.rs` 的 `MIGRATIONS` 为准（`a40bc94` 时为 0001–0077；0053 起为平台钱包相关迁移）。
 
 **数据库模式**:
 
@@ -264,9 +302,10 @@ Router 转发到 Client 时,会在签名头旁再写一个**不参与签名**的
 | 域 | 代表表 |
 |---|---|
 | 身份与隧道 | `installations`、`leases`、`tunnel_route_heads`、`shares`、`installation_client_tunnels` |
-| 计量 | `share_request_logs`、`gateway_request_observations`、`capacity_request_observations`、`llm_request_metrics`、`image_generation_*` |
+| 计量 | `share_request_logs`、`gateway_request_observations`、`capacity_request_observations`(兼容视图)、`image_generation_*`;`llm_request_metrics` 位于 metrics 库 |
 | 健康 | `share_health_checks`、`installation_health_checks`、`share_model_health_state` |
-| 统一市场账务 | `supplier_billing_profiles`、`market_credit_accounts`、`market_service_contracts`、`market_service_intervals`、`market_accrual_entries`、`market_invoices`、`market_invoice_lines`、`market_payment_*`、`market_billing_*`、`market_credit_restrictions` |
+| 平台钱包与 Provider 收入 | `market_finance_control`、`market_wallet_accounts`、`market_wallet_holds`、`market_journal_transactions`、`market_journal_postings`、`market_journal_seals`、`market_payment_channels`（含 revisions／settings）、`market_topup_*`、`market_platform_contracts`、`market_platform_periods`、`market_delivery_slices`、`market_provider_earning_lots`、`market_provider_earning_holds`、`market_payout_*`、`market_wallet_policy`、`market_wallet_transfers`、`market_earning_wallet_conversions`、`market_commission_*`、`market_service_disputes`、`market_notification_outbox`、`market_finance_reconciliation_cases`、`market_finance_audit_events` |
+| 旧 Provider 资金轨道 | `supplier_billing_profiles`、`market_credit_accounts`、`market_service_contracts`、`market_service_intervals`、`market_accrual_entries`、`market_invoices`、`market_invoice_lines`、`market_payment_declarations`、`market_payment_receipts`、`market_payment_intents`、`market_prepaid_*`、`market_funding_*`、`market_recurring_*`、`market_billing_*`、`market_credit_restrictions` |
 | 主机市场 | `router_ssh_hosts`、`client_market_subscriptions`、`account_payment_*` |
 | 联邦与市场 | `router_gateways`、`share_market_listings`、`share_market_seats`、`share_market_subscriptions`；旧 registry/live/archive 表均已由 migration 21 物理删除 |
 | 市场供应商身份与排名 | `market_provider_profiles`、`market_provider_aliases`、`market_provider_identity_events`、`market_provider_share_windows`、`market_provider_effective_selections`、`market_provider_rank_generations`、`market_provider_rank_entries` |
@@ -291,16 +330,16 @@ Router 转发到 Client 时,会在签名头旁再写一个**不参与签名**的
 
 - **单连接全局锁**:所有业务 store 方法(含只读)都要 `self.conn.lock().await`。local 模式的 WAL 不缓解进程内这把 tokio Mutex 的串行化；Turso 委派写也经过该锁。周期 replica sync 和健康快照不经过该锁。这仍是当前最确定的扩展性瓶颈。
 - **单活 Turso 写实例**:当前不支持多个 Router 同时写同一 Turso 数据库；云端不可用时写请求直接失败,没有本地补写队列。
-- **`user_api_tokens.token_plaintext`**:默认 token 以明文存储,以支持在 UI 中重复展示 API key(`store.rs:12756, 23472`)。同表已有 `token_hash`。DB 泄露即等于活跃 token 泄露。
+- **`user_api_tokens.token_plaintext`**:默认 token 以明文存储,以支持在 UI 中重复展示 API key(列定义于 `schema/0001_baseline.sql`,读写见 `store.rs` `get_default_user_api_token()` / `insert_default_user_api_token()`)。同表已有 `token_hash`。DB 泄露即等于活跃 token 泄露。
 - 健康检查类表使用 AUTOINCREMENT 追加,依赖 `cleanup_expired_data` 清理而非 schema 层 TTL。
 
 ### Client 公开聊天室与市场事件
 
-聊天室身份只使用 `installation.id`。每个已验证 Owner 的 installation 最多有一个 active 房间,该 Client 下所有 Share、Share Market 租约、Client Market 租约和统一账务事件都写入同一房间；系统不创建 Share 房间或 Share 成员期。
+聊天室身份只使用 `installation.id`。每个已验证 Owner 的 installation 最多有一个 active 房间,该 Client 下所有 Share、Share Market 租约、Client Market 租约和旧 Provider 资金轨道的账务事件都写入同一房间；系统不创建 Share 房间或 Share 成员期。
 
 业务事务先在同一 libSQL 事务内写入 `client_chat_system_outbox`,后台再物化为 `author_kind=system`、`message_kind=market_event` 的不可删除消息。`source_kind + source_event_id + installation_id` 提供幂等键；失败事件指数退避,达到上限进入 dead-letter,不会阻塞后续事件。Owner、Provider、租客和事件 actor 会自动写入 `chat_visits`,因此可在各自入口看到房间与未读数。
 
-市场系统消息公开完整交易上下文,包括双方邮箱、金额、收款资料、付款凭证、reference/note、争议或回收原因和不含凭据的原始错误。物化系统消息时,仅当同源收款图片属于 payload 中的 Owner/Provider/Supplier,才写入 `chat_public_payment_assets`；该映射随消息级联删除并阻止资料更新提前清理图片。后端禁止 API Key、OAuth/Session token、Cookie、Authorization、密码、secret、私钥、SSH/lease 凭据和带凭据 query/fragment 的 URL 进入 outbox；仅 `kind=crypto` 的 `USDT`/`USDC` 收款资产符号可使用 `token` 字段。前端渲染前再次过滤。系统消息不创建 `chat_email_events`,只有真人访客消息可触发 Owner 聊天提醒邮件。
+平台钱包的充值、扣款、余额、Provider 收入与提现不进入公开聊天室,只写入私有的 `market_notification_outbox`(站内通知、邮件与 Telegram)。市场系统消息公开完整交易上下文,包括双方邮箱、金额、收款资料、付款凭证、reference/note、争议或回收原因和不含凭据的原始错误。物化系统消息时,仅当同源收款图片属于 payload 中的 Owner/Provider/Supplier,才写入 `chat_public_payment_assets`；该映射随消息级联删除并阻止资料更新提前清理图片。后端禁止 API Key、OAuth/Session token、Cookie、Authorization、密码、secret、私钥、SSH/lease 凭据和带凭据 query/fragment 的 URL 进入 outbox；仅 `kind=crypto` 的 `USDT`/`USDC` 收款资产符号可使用 `token` 字段。前端渲染前再次过滤。系统消息不创建 `chat_email_events`,只有真人访客消息可触发 Owner 聊天提醒邮件。
 
 ---
 
@@ -324,24 +363,35 @@ Router 从不改写 Server 返回的 descriptor,只做校验;若客户端只部�
 
 | 任务 | 周期 | 职责 |
 |---|---|---|
-| `cleanup_task` | 300s | 过期数据清理 + 市场主机对账 |
-| `probe_task` | 30s | 路由健康探测 |
-| `runtime_task` | 10min | share 运行时快照刷新 |
-| `resend_usage_task` | 10min | Resend 配额轮询 |
-| `metrics_task` | — | 指标采集 |
-| `alerting_task` | 2s | Client 信号入库、静默到期、已注册 IM 渠道投递与重试 |
-| `notification_task` | 5s | 离线/恢复通知 outbox（邮件 / Telegram / Bark） |
-| `telegram bot` | 长轮询 | 用户通知 Bot 的入站半边:消费 `/start` 深链完成账号绑定 |
-| `chat_notification_task` | — | 聊天邮件投递 |
-| `client_market_trade_task` | 20s | Client Market 报价、免费期限、释放与清理状态对账 |
-| `share_market_task` | 5s | managed grant、免费期限与 Share 租约状态对账 |
-| `market_billing_task` | 5s | 健康时长计费、阈值出账、最终账单、逾期限制和控制动作重试 |
+| `cleanup` | 300s（`CC_SWITCH_ROUTER_CLEANUP_INTERVAL_SECS`） | 过期数据清理 + 市场主机对账 |
+| `database sync` | 按配置 | 仅 Turso 模式：周期拉取远端 frame |
+| `Share request watchdog` | 10s | 释放超时未结束的 Share 请求占用 |
+| `probe` | 30s | 隧道连通性探测（`/_share-router/health`） |
+| `runtime` | 5min | share 运行时快照刷新 |
+| `model health` | 30s 唤醒 | 按 UTC 半小时槽领取并执行模型健康探测 |
+| `Share listing usage rollup` | 1h | 重建 Share 挂牌用量汇总 |
 | `Market Provider rank` | 启动后立即，随后 15min | 跨 Share/Client/资金关系归并 Provider 身份，原子发布排名代次；失败保留 last-good |
-| `ip_blacklist_log_task` | 600s | 黑名单统计落日志 |
+| `Share request log recovery` | 15s | 从在线 Client 补拉缺失的 Share 请求日志 |
+| `resend usage` | 10min | Resend 配额轮询 |
+| `metrics collector` | — | 指标采集 |
+| `clock health` | — | 以多路 HTTPS `Date` 仲裁主机时钟偏差 |
+| `operator alerting` | 2s | Client 信号入库、静默到期、已注册 IM 渠道投递与重试 |
+| `client notifications` | 5s | 离线/恢复通知 outbox（邮件 / Telegram / Bark） |
+| `telegram bot` | 长轮询 | 用户通知 Bot 的入站半边:消费 `/start` 深链完成账号绑定 |
+| `chat email notifications` | — | 聊天邮件投递 |
+| `Client Market trade` | 20s | Client Market 报价、免费期限、释放与清理状态对账 |
+| `Share Market` | 5s | managed grant、免费期限与 Share 租约状态对账 |
+| `Market billing` | 5s | 旧 Provider 资金轨道：健康时长计费、阈值出账、最终账单、逾期限制和控制动作重试 |
+| `Market wallet delivery` | 5s | 平台钱包合同：试用与按秒批次、月租续期与到期、余额不足暂停／恢复／终止，并下发 Share 授权或 Client tunnel 控制 |
+| `market payments` | 30s（Webhook 可即时唤醒）；网关扫描每 10min 检查一次；审计 1h | 充值订单对账与补偿查单、Provider 收入成熟解锁、每日／每周孤儿已付单扫描、财务不变量审计 |
+| `market notifications` | 10s；提醒 1h | 钱包与 Provider 通知 outbox（邮件 / Telegram）；续费与余额不足提醒 |
+| `USD/CNY market FX` | 15min | 获取并验证 USD/CNY 展示汇率 |
+| `Binance auto-settlement` | 默认 4s 轮询 | 旧 Provider 资金轨道的币安自动到账 |
+| `ip blacklist log` | 600s | 黑名单统计落日志 |
 
-**关停**:收到 SIGTERM 后先停 HTTP 接入并排空最多 30 秒,再关 SSH listener(5 秒)。
+**关停**:收到 SIGTERM 或 Ctrl-C 后,先向全部后台任务广播停止信号,再停 HTTP 接入并排空最多 30 秒,然后关闭 SSH(最多 15 秒,其中转发任务排空 5 秒);超时的服务任务才会被 abort。随后所有后台任务共用 15 秒期限退出,只有超时者被 abort;Turso 模式最后再做一次 `sync_database()`。
 
-> **已知行为**:后台任务在关停时被 `.abort()`(`main.rs:492-500`),持有 DB 锁或处于事务中途的任务会被硬杀。
+> **已知行为**:后台任务在关停开始时就于下一个 `.await` 处停止。store 方法在业务库锁内同步执行,单次 store 调用的事务不会被切开,但跨多个步骤的工作流仍可能在步骤之间中断,依赖各自的幂等对账在重启后补齐。
 
 ---
 
@@ -396,7 +446,7 @@ Next.js 静态导出(`output: "export"`),`build.rs` 遍历 `frontend/out/` 生�
 - **模型中枢**(`/clients/?tab=mine`):作为 Clients「我的」分页内的可选能力展示区域统一入口、用户 API Key 和 revision 化模型映射；同页 Share 卡片继续显示直连 URL，并只在该上下文附加映射摘要和快捷新增入口。它不是独立一级导航，不改变首页地图或 Share 侧边栏的信息层级
 - **配置契约审计**:`cargo test admin::settings` 覆盖后端 schema、来源、关系和文件权限；`npm run audit:settings-i18n` 保证所有字段与分组都有中英文文案；`npm run audit:settings-contract` 保证 Rust schema、默认 `.env` 和前端字段 catalog 精确一致，且旧 Settings API 不会回流
 - **账户 → 通知设置**(`/account/notifications`)：邮件、Telegram、Bark 三选一，邮件始终可选；第三方渠道未绑定或 Provider 未就绪时不可选，已选渠道临时不可用时明确显示 Email 回落。Telegram 绑定按钮在 `await` 前先 `window.open("about:blank")` 保留用户手势，失败则回落为可复制深链与 `/start <token>`；页面以 3 秒间隔轮询 `GET /v1/me/notifications`，并以 `verifiedAt` 变化识别重新绑定，5 分钟后停止。Bark 表单使用密码输入接收完整 Push URL，验证成功后只显示 Server 与设备掩码，解绑与重新绑定均受后端 revision fence 保护
-- 设计 token 以 `--router-*` CSS 自定义属性承载,dark mode 经 `.dark` class 整体切换
+- 设计 token 以 `--router-*` CSS 自定义属性承载(`frontend/app/globals.css`);当前 UI 只有浅色主题,没有可切换的暗色模式
 - **Router 自己的 Web 终端**:xterm.js ↔ WebSocket ↔ `portable-pty` 起 `ssh` 子进程(非 russh client),一次性 ticket + 每用户 2 会话上限 + 空闲/硬超时。**仅 Host Provider 本人可开**,租客与 Router 管理员均不可
 - **Client 自带的 Web 终端**(另一条链路):Clients 页条目上的「终端」按钮,与「控制台」共用同一套 iframe 窗口管理器(`components/dashboard/client-console/`)。它不经过 Router 的 PTY,而是把 client web URL 加上 `?view=terminal&embed=1`(`lib/client-web-view.ts`)后在 iframe 中打开,请求经 client tunnel 转发到 Server 的 `/web-api/terminal/*`,鉴权由 Server 自身的 Web 登录态负责。`embed=1` 让 Server 前端隐藏自己的页头、状态条和「结束会话」按钮,只渲染 xterm 画布——窗口标题栏和关闭按钮由 Router 这侧提供,不重复一遍。窗口按 `clientId + kind` 去重,因此同一 client 的控制台与终端各占一个窗口
 
@@ -407,11 +457,11 @@ Next.js 静态导出(`output: "export"`),`build.rs` 遍历 `frontend/out/` 生�
 `src/admin/upgrade.rs` 实现进程自替换:
 
 1. 同目录暂存临时文件(避开跨文件系统 rename 的 EXDEV)
-2. 从 GitHub latest release 下载(180s 超时)
+2. 从 GitHub `latest` release 下载 `cc-switch-router-linux-amd64`(180s 超时,仅 amd64,不校验 checksum)
 3. `chmod +x`,以 `--help` 冒烟自检(5s)并用新二进制跑 `check-db`(30s)确认它能接受当前数据库
-4. SHA-256 比对新旧二进制
-5. 原子 `rename(2)` 交换,旧二进制留 `.bak`
+4. SHA-256 比对新旧二进制(仅提示:相同时记录告警并继续)
+5. 两次 `rename(2)` 交换:先把当前二进制改名为 `.bak`,再把临时文件改名为目标
 6. 探测服务管理器(systemd 或 nohup)
 7. `setsid -f` 派生子进程延时重启
 
-进度经 broadcast channel 以 SSE 流式推送至前端。任一步失败都在交换二进制之前 `return Err`,进程继续运行旧版本;前端只在收到 `status=success` 的 done 事件后才轮询健康并刷新页面,失败时保留日志弹窗并把最后一条 error 显示为告警。
+进度经 broadcast channel 以 SSE 流式推送至前端。第 1–4 步失败都在交换二进制之前 `return Err`,进程继续运行旧版本;交换之后若调度重启失败会返回错误但不自动回滚,需手动 `rollback_to_previous_binary()`。前端只在收到 `status=success` 的 done 事件后才轮询健康并刷新页面,失败时保留日志弹窗并把最后一条 error 显示为告警。

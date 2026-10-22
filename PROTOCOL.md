@@ -177,7 +177,7 @@ Router 不接受长效 SSH 凭据。每次建链前 Server 申请一次性 lease
 
 `ShareDescriptor` 面向全新部署时必须满足以下约束:
 
-- 当前写出版本是 **Share Contract v7**。Router 为滚动升级仍可读取 v2..v7。v5 引入本节定义的 `modelProbe` 和 Grok 媒体权限；v6 增加 scoped quota metadata；v7 在 quota 中增加独立的 `unobservedTiers`，用于展示套餐已确认但尚无真实数值观测的容量池。`unobservedTiers` 不参与调度、限流、可用性或容量评分。连接测试与半小时模型健康检查要求当前写出版本；Share Market 发布的最低版本是 `MIN_SHARE_MARKET_CONTRACT_VERSION`（v5），以便 Server/Router 滚动升级时继续接受已同步的 v5 记录。
+- 当前写出版本是 **Share Contract v7**。Router 为滚动升级仍可读取 v2..v7。v4 引入本节定义的 `modelProbe`（Router 只对 v4 及以上执行模型探针），v5 引入 Grok 媒体权限；v6 增加 scoped quota metadata；v7 在 quota 中增加独立的 `unobservedTiers`，用于展示套餐已确认但尚无真实数值观测的容量池。`unobservedTiers` 不参与调度、限流、可用性或容量评分。连接测试与半小时模型健康检查要求当前写出版本；Share Market 发布的最低版本是 `MIN_SHARE_MARKET_CONTRACT_VERSION`（v5），以便 Server/Router 滚动升级时继续接受已同步的 v5 记录。
 - quota 的 `tiers` 只承载真实上游数值；`unobservedTiers` 每项携带 `name`、`label`、`scope`、`capacityPool`、可选 `modelFamily` / `relativeWeeklyCapacity`、`source` 与 `reason`，不包含 utilization/reset。相同 `capacityPool` 或规范化 tier 身份的真实 `tiers` 项必须覆盖展示提示，不得把未观测状态渲染为 `0%`。
 - v7 quota 可选携带 `bankedReset`（仅 Codex OAuth）：`availableCount` 为已知且大于零的可用次数，`detailsAvailable` 标识到期明细是否可信，`expiresAt` 至多三个去重后的未来到期时间。该字段只供 Share 私有额度摘要显示，不属于 `tiers`，不得影响调度、限流、容量评分或公开 Share Market DTO；不得传 credit ID、workspace ID 或消费操作。Router 的 quota 解析拒绝未知字段，部署时须先升级 Router，再升级写出该字段的 Server。
 - `capacityPoolId` 是非空匿名标识。同一 Router 下复用相同物理账号或 API key 的不同 Share URL 使用同一值,用于容量与故障域去重；该值在凭据源不变期间稳定，账号绑定或 API key 改变时必须重新派生并同步。
@@ -284,6 +284,7 @@ Router **从不改写** Server 返回的 descriptor,只做校验(`store::apply_s
 | `patch.managedGrant.action` | `upsert` 授予拼车位 / `revoke` 回收 |
 | `patch.managedGrant.entitlementId` | 稳定 entitlement ID,与订阅绑定 |
 | `patch.managedGrant.policy` | 拼车位并行/Token 限制、周期及显式 `allowedApps`(upsert 必填) |
+| `patch.managedGrant.durationSeconds` | 有固定服务期限时的相对时长；Server 在应用授权时按 `appliedAtMs` 写入绝对 `expiresAt`，policy 本身不得携带 `expiresAt`；revoke 不得携带 |
 | Server 落库 `userGrants[].manager` | 固定为 `routerShareMarket` |
 
 Server 要求:
@@ -319,7 +320,7 @@ Server 要求:
 
 停止挂售是幂等且可逆的。首次停止将 `available` 车位改为 `disabled` 并递增 `offerRevision`,同时把该 listing 下所有 active rent quote 改为 `expired`；重复停止不会再次递增 revision 或重复写审计事件。恢复旧车位时再次递增 revision,因此停止前生成的 quote 即使仍在客户端内存中也不能在恢复后提交。
 
-免费和付费拼车位都可通过 `serviceDurationDays` 设置 `1..=365` 天固定服务期限；省略或传 `null` 表示无固定期限。`tokenLimit` 省略时 Router 忽略提交的 `tokenPeriod` 并归一为 `lifetime`；只有设置 Token 限额时才校验该 Server 支持的周期。报价参数在租用时冻结到 Subscription，固定期限从租用事务提交成功时计算，并以同一绝对 `expiresAt` 写入 managed grant policy，授权延迟和账单暂停均不顺延。Router 在到期前 24 小时写入一次 `service_term_expiring`，到期后终止付费合约并根据控制操作是否可能已送达选择直接释放或安全 revoke；付费尾段会精确结算到 `expiresAt`，账务与 Share worker 的先后顺序既不会漏计也不会越界计费。`grant_pending`、活跃、账单暂停、恢复中及控制失败状态均不得在到期后重新获得访问，回收失败时也不会把座位提前恢复为可租。
+免费和付费拼车位都可通过 `serviceDurationDays` 设置 `1..=365` 天固定服务期限；省略或传 `null` 表示无固定期限。`tokenLimit` 省略时 Router 忽略提交的 `tokenPeriod` 并归一为 `lifetime`；只有设置 Token 限额时才校验该 Server 支持的周期。报价参数在租用时冻结到 Subscription；固定期限从 Server 首次应用该 managed grant 时开始计算：Router 只下发相对的 `durationSeconds`，Server 以 `appliedAtMs + durationSeconds` 写入绝对 `expiresAt`，Router 在 edit-ack 中校验一致后冻结到 Subscription。授权下发前的等待不消耗期限，账单暂停不顺延。Router 在到期前 24 小时写入一次 `service_term_expiring`，到期后终止付费合约并根据控制操作是否可能已送达选择直接释放或安全 revoke；付费尾段会精确结算到 `expiresAt`，账务与 Share worker 的先后顺序既不会漏计也不会越界计费。`grant_pending`、活跃、账单暂停、恢复中及控制失败状态均不得在到期后重新获得访问，回收失败时也不会把座位提前恢复为可租。
 
 ### Client Market 钱包购买与展示契约
 
