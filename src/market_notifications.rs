@@ -44,6 +44,18 @@ pub(crate) struct NotificationKind {
 
 pub(crate) const KINDS: &[NotificationKind] = &[
     NotificationKind {
+        kind: "c2c_order_updated",
+        mandatory: true,
+        subject_en: "C2C order updated",
+        subject_zh: "C2C 余额交易状态更新",
+    },
+    NotificationKind {
+        kind: "c2c_seller_changed",
+        mandatory: true,
+        subject_en: "C2C seller settings updated",
+        subject_zh: "C2C 出售设置已更新",
+    },
+    NotificationKind {
         kind: "earnings_converted",
         mandatory: true,
         subject_en: "Earnings moved to your wallet",
@@ -236,6 +248,7 @@ fn owner_signal(kind: &str) -> OwnerSignal {
         "payout_requested" => ("info", "Provider withdrawal requested"),
         "refund_requested" => ("info", "Buyer balance refund requested"),
         "dispute_opened" => ("info", "Service dispute opened"),
+        "c2c_dispute" => ("warning", "C2C balance trade needs evidence review"),
         "earning_hold_legacy" => ("warning", "Earnings hold needs review"),
         "earning_unlock_failed" => ("warning", "Provider earning lot failed to unlock"),
         _ => ("warning", "Marketplace finance notice"),
@@ -688,6 +701,44 @@ fn render(item: &Claimed, dashboard: &str) -> (String, String) {
         );
         return (subject, body);
     }
+    if item.event_kind == "c2c_seller_changed" {
+        return (
+            format!("{subject_zh} / {subject_en}"),
+            format!(
+                "C2C 出售设置已更新，请在平台余额页核对。已有订单仍需处理；平台不能自动核实线下付款。\nC2C seller settings changed. Review your wallet; existing orders remain actionable. Offline payments are not verified by the platform.\n\n{}/account/wallet/",
+                dashboard.trim_end_matches('/')
+            ),
+        );
+    }
+    if item.event_kind == "c2c_order_updated" {
+        let id = item
+            .payload
+            .get("orderId")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let status = item
+            .payload
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let zh_status = match status {
+            "awaiting_payment" => "待付款",
+            "paid" => "买家已标记付款，待卖家核实",
+            "disputed" => "争议处理中",
+            "released" => "余额已放行",
+            "cancelled" => "已取消",
+            "expired" => "已超时",
+            _ => "设置已更新",
+        };
+        return (
+            format!("{subject_zh} / {subject_en}"),
+            format!(
+                "{subject_zh}：{zh_status}。金额：{}。平台不能自动核实线下付款，请在订单内核对；请勿向他人透露放行验证码。\n{subject_en}: {status}. Offline payment is not verified by the platform. Review the order; never share release codes.\n\n{}/account/wallet/?c2cOrder={id}",
+                amount.as_deref().unwrap_or("—"),
+                dashboard.trim_end_matches('/')
+            ),
+        );
+    }
     if item.event_kind == "earnings_converted" {
         let id = item
             .payload
@@ -1101,6 +1152,49 @@ mod tests {
         assert!(body.contains("conversion-1"));
         assert!(body.contains("不可提现或转回收益"));
         assert!(body.ends_with("https://router.example/account/wallet/"));
+    }
+
+    #[test]
+    fn c2c_notices_are_mandatory_scoped_and_never_copy_private_payment_data() {
+        let item = Claimed {
+            id: "c2c-notice".into(),
+            recipient_user_id: "seller".into(),
+            event_kind: "c2c_order_updated".into(),
+            payload: json!({
+                "orderId": "order-1", "amountUnits": "86400000", "status": "paid",
+                "contact": "PRIVATE_CONTACT", "paymentDetails": "PRIVATE_ACCOUNT",
+                "code": "SECRET_RELEASE_CODE", "note": "PRIVATE_DISPUTE_EVIDENCE",
+            }),
+            mandatory: true,
+            attempts: 1,
+        };
+        assert!(kind("c2c_order_updated").unwrap().mandatory);
+        assert!(kind("c2c_seller_changed").unwrap().mandatory);
+        let (subject, html, text) = render_email(&item, "https://router.example/");
+        assert!(subject.contains("C2C"));
+        assert!(text.contains("$10.00000000"));
+        assert!(text.contains("买家已标记付款，待卖家核实"));
+        assert!(text.contains("Offline payment is not verified by the platform"));
+        assert!(text.contains("请勿向他人透露放行验证码"));
+        assert!(text.ends_with("https://router.example/account/wallet/?c2cOrder=order-1"));
+        for private in [
+            "PRIVATE_CONTACT",
+            "PRIVATE_ACCOUNT",
+            "SECRET_RELEASE_CODE",
+            "PRIVATE_DISPUTE_EVIDENCE",
+        ] {
+            assert!(!text.contains(private));
+            assert!(!html.contains(private));
+        }
+        let seller_notice = Claimed {
+            event_kind: "c2c_seller_changed".into(),
+            payload: json!({}),
+            ..item
+        };
+        let (_, _, text) = render_email(&seller_notice, "https://router.example/");
+        assert!(text.contains("已有订单仍需处理"));
+        assert!(text.ends_with("https://router.example/account/wallet/"));
+        assert!(!text.contains("c2cOrder="));
     }
 
     #[test]

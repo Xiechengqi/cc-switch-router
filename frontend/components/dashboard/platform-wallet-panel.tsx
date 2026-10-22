@@ -15,6 +15,9 @@ import { useLocaleText } from "@/components/i18n/locale-provider";
 import { WalletTransferPanel } from "@/components/dashboard/wallet-transfer-panel";
 import { useAuth } from "@/components/auth/auth-provider";
 import { EarningWalletConversion } from "@/components/dashboard/earning-wallet-conversion";
+import { C2CBuyPanel } from "@/components/dashboard/c2c-buy-panel";
+import { C2COrdersPanel } from "@/components/dashboard/c2c-orders-panel";
+import { C2CAction } from "@/components/market/c2c-primitives";
 import { subscribeMarketBalanceChanged, notifyMarketBalanceChanged } from "@/lib/earning-wallet-conversion";
 import { MarketBuyerDisputesList } from "@/components/dashboard/market-buyer-disputes-list";
 import { MarketNotificationsBell } from "@/components/dashboard/market-notifications-bell";
@@ -178,6 +181,10 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
   const { locale, t, displayCurrency, fxRateFresh, fxRateMicros } = useLocaleText();
   const searchParams = useSearchParams();
   const returnedTopupId = searchParams.get("topup");
+  const [fundingMethod, setFundingMethod] = React.useState<"official" | "c2c">("official");
+  const [c2cOrderId, setC2COrderId] = React.useState<string | null>(searchParams.get("c2cOrder"));
+  const linkedC2COrder = searchParams.get("c2cOrder");
+  React.useEffect(() => { if (linkedC2COrder) setC2COrderId(linkedC2COrder); }, [linkedC2COrder]);
   const returnedFromCheckoutExit = searchParams.get("cancelled") === "1";
   const [returnPath, setReturnPath] = React.useState<string | null>(null);
   const [wallet, setWallet] = React.useState(initialWallet);
@@ -754,7 +761,12 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
           {wallet.committedUnits && wallet.committedUnits !== "0" ? <p className="mt-1 text-sm text-muted-foreground">{t("marketWallet.committed")}: {formatWalletUnits(wallet.committedUnits)}</p> : null}
           <div className="mt-4"><EarningWalletConversion capacity={wallet.earningsConversion} onConverted={reload} disabled={!!busy} /></div>
         </div>
-        {wallet.canTopup ? <form className="grid min-w-0 content-start gap-3" onSubmit={(event) => void submitTopup(event)}>
+        <div className="grid min-w-0 content-start gap-4">
+          <div role="group" aria-label={t("marketWallet.channel")} className="flex flex-wrap gap-2">
+            <C2CAction type="button" secondary={fundingMethod !== "official"} aria-pressed={fundingMethod === "official"} disabled={!!busy} onClick={() => setFundingMethod("official")}>{t("c2c.official")}</C2CAction>
+            <C2CAction type="button" secondary={fundingMethod !== "c2c"} aria-pressed={fundingMethod === "c2c"} disabled={!!busy} onClick={() => setFundingMethod("c2c")}>{t("c2c.buy")}</C2CAction>
+          </div>
+        {fundingMethod === "c2c" && session?.user?.id ? <C2CBuyPanel key={session.user.id} actor={session.user.id} onOrder={order => setC2COrderId(order.id)} /> : wallet.canTopup ? <form className="grid min-w-0 content-start gap-3" onSubmit={(event) => void submitTopup(event)}>
           <p className="text-sm font-semibold">{t("marketWallet.topup")}</p>
           <label className="grid min-w-0 gap-1 text-sm">
             <span className="flex flex-wrap items-center gap-2">{t("marketWallet.channel")}
@@ -846,7 +858,10 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
         </form> : <div className="grid content-start gap-3 rounded-lg bg-muted/50 p-4 text-sm text-muted-foreground">
           <p>{t(wallet.mode === "enabled" ? "marketWallet.topupUnavailable" : "marketWallet.notOpen")}</p>
         </div>}
+        </div>
       </section>
+
+      {session?.user?.id ? <C2COrdersPanel key={session.user.id} actor={session.user.id} selectedId={c2cOrderId} onSelect={setC2COrderId} /> : null}
 
       {(wallet.canTopup || wallet.hasWalletActivity) && !loaded ? <p className="text-sm text-muted-foreground">{t("common.loading")}</p> : null}
       {wallet.canTopup || wallet.hasWalletActivity ? <div className="grid min-w-0 gap-6 lg:grid-cols-2">
@@ -957,7 +972,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
               const holdOnly = delta === 0n && heldDelta !== 0n;
               return <li key={entry.id} className="flex min-w-0 items-center justify-between gap-2 rounded-md bg-muted/50 px-3 py-2 text-sm">
                 <div className="min-w-0">
-                  <p className="truncate font-medium">{t(walletEntryKey(entry.sourceKind))}</p>
+                  {entry.c2cOrderId ? <button type="button" onClick={() => setC2COrderId(entry.c2cOrderId ?? null)} className="inline-flex min-h-11 max-w-full items-center whitespace-nowrap font-medium text-primary underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring">{t("c2c.title")}</button> : <p className="truncate font-medium">{t(walletEntryKey(entry.sourceKind))}</p>}
                   {entry.counterpartyEmail ? <p className="break-all text-xs text-muted-foreground">{entry.counterpartyEmail}</p> : null}
                   <p className="text-xs text-muted-foreground">{dateText(entry.createdAt, locale)}</p>
                 </div>

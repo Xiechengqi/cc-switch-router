@@ -57,6 +57,7 @@ jobs:
           npm run audit:model-prices
           npm run build
           npm run test:wallet-checkout-browser
+          npm run test:c2c-browser
 
       - name: Test market wallet, service commissions and migrations
         env:

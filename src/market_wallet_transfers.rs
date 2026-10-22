@@ -83,6 +83,9 @@ fn capacity_tx(conn: &Connection, user: &str, time: &str) -> Result<Capacity, Ap
         params![user, day], |row| row.get(0)).map_err(db_error("sum daily wallet transfers"))?;
     let remaining = units_from_minor(policy.transfer_daily_max_minor)?
         .saturating_sub(sent)
+        .saturating_sub(crate::market_c2c::committed_transfer_units_tx(
+            conn, user, time,
+        )?)
         .max(0);
     let mode: bool = conn.query_row("SELECT mode = 'enabled' AND cutover_approved_at IS NOT NULL FROM market_finance_control WHERE id = 1", [], |row| row.get(0))
         .map_err(db_error("read transfer mode"))?;

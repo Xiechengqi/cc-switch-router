@@ -96,6 +96,12 @@ function lineAt(source, index) {
 }
 
 function allowedLegacyAssertion(relativePath, source, index, ruleName) {
+  // A C2C credit reservation has its own offline-payment window. It is not
+  // the retired per-Share/per-Client prepaid billing deadline. No other
+  // legacy billing symbols are allowed in the new module or its tests.
+  if ((relativePath === "src/market_c2c.rs" || relativePath.startsWith("src/market_c2c/")) && ruleName === "product payment deadline") {
+    return true;
+  }
   if (
     relativePath === "src/market_recurring.rs"
     && ruleName === "product prepaid period end"

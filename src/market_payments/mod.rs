@@ -946,6 +946,7 @@ struct WalletTransactionView {
     created_at: String,
     transfer_id: Option<String>,
     counterparty_email: Option<String>,
+    c2c_order_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -990,7 +991,12 @@ fn wallet_transactions_tx(
                     journal.created_at,
                     (SELECT id FROM market_wallet_transfers WHERE journal_id = journal.id),
                     (SELECT CASE WHEN sender_user_id = ?1 THEN recipient_email ELSE sender_email END
-                     FROM market_wallet_transfers WHERE journal_id = journal.id)
+                     FROM market_wallet_transfers WHERE journal_id = journal.id),
+                    CASE WHEN journal.source_kind='c2c_order' THEN
+                      (SELECT id FROM market_c2c_orders WHERE id=journal.source_id)
+                     WHEN journal.source_kind='hold' THEN
+                      (SELECT id FROM market_c2c_orders WHERE hold_id=journal.source_id)
+                     ELSE NULL END
              FROM market_journal_transactions journal
              WHERE EXISTS (SELECT 1 FROM market_journal_postings posting
                WHERE posting.journal_id = journal.id AND posting.subject_id = ?1
@@ -1011,6 +1017,7 @@ fn wallet_transactions_tx(
                 created_at: row.get(5)?,
                 transfer_id: row.get(6)?,
                 counterparty_email: row.get(7)?,
+                c2c_order_id: row.get(8)?,
             })
         })
         .map_err(db_error("query wallet transactions"))?
@@ -1020,6 +1027,15 @@ fn wallet_transactions_tx(
     items.truncate(50);
     let next_cursor = has_more.then(|| items.last().unwrap().id.clone());
     Ok(Page { items, next_cursor })
+}
+
+#[cfg(test)]
+pub(crate) fn wallet_transactions_for_test(
+    conn: &Connection,
+    user: &str,
+) -> Result<serde_json::Value, AppError> {
+    serde_json::to_value(wallet_transactions_tx(conn, user, None)?)
+        .map_err(|_| AppError::Internal("serialize test wallet history".into()))
 }
 
 async fn list_wallet_transactions(
@@ -7565,6 +7581,10 @@ pub async fn run_service(
             }
         }
     });
+    let c2c_task = tokio::spawn(crate::market_c2c::run_housekeeping(
+        state.store.clone(),
+        shutdown.clone(),
+    ));
     let wakeup = state.market_payments.reconcile_wakeup.clone();
     loop {
         let reconcile_now = tokio::select! {
@@ -7622,6 +7642,8 @@ pub async fn run_service(
     // resumed from its saved offset on the next start.
     sweep_task.abort();
     let _ = sweep_task.await;
+    c2c_task.abort();
+    let _ = c2c_task.await;
     Ok(())
 }
 

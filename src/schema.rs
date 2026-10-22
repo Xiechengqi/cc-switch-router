@@ -270,6 +270,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         77,
         include_str!("../schema/0077_market_earning_wallet_conversion.sql"),
     ),
+    (78, include_str!("../schema/0078_market_c2c.sql")),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -784,6 +785,70 @@ mod tests {
     }
 
     #[test]
+    fn migration_78_adds_c2c_without_rewriting_existing_wallet_credit() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 77);
+        let time = "2026-10-22T00:00:00Z";
+        conn.execute("INSERT INTO users(id,email_normalized,status,email_verified_at,created_at,last_login_at) VALUES('c2c-upgrade','c2c-upgrade@example.test','active',?1,?1,?1)", params![time]).unwrap();
+        crate::market_wallet::credit_verified_topup_tx(
+            &conn,
+            "c2c-upgrade",
+            "upgrade-topup",
+            1234,
+            "upgrade-receipt",
+            time,
+        )
+        .unwrap();
+        let before = crate::market_wallet::wallet_snapshot_tx(&conn, "c2c-upgrade").unwrap();
+        let journals: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM market_journal_transactions",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        let after = crate::market_wallet::wallet_snapshot_tx(&conn, "c2c-upgrade").unwrap();
+        assert_eq!(
+            (before.posted_units, before.held_units, before.version),
+            (after.posted_units, after.held_units, after.version)
+        );
+        assert_eq!(
+            journals,
+            conn.query_row(
+                "SELECT COUNT(*) FROM market_journal_transactions",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            conn.query_row("SELECT admission_minor FROM market_c2c_policy", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            10000
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM market_c2c_orders", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert!(
+            !conn
+                .query_row(
+                    "SELECT enabled FROM market_c2c_policy WHERE id=1",
+                    [],
+                    |r| r.get::<_, bool>(0)
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn installs_and_reopens_fresh_baseline() {
         let conn = memory_connection();
         apply(&conn).expect("install baseline");
@@ -797,7 +862,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count baseline tables");
-        assert_eq!(table_count, 224);
+        assert_eq!(table_count, 231);
         let removed_client_recovery_table_count = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -1378,7 +1443,7 @@ mod tests {
             .unwrap();
         apply(&conn).unwrap();
         apply(&conn).unwrap();
-        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",[],|r|r.get::<_,i64>(0)).unwrap(),224);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",[],|r|r.get::<_,i64>(0)).unwrap(),231);
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM market_journal_postings", [], |r| r
                 .get::<_, i64>(0))
@@ -1598,7 +1663,8 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(tables_after - tables_before, 12);
+        // Twelve tables from commission/conversion plus seven C2C tables.
+        assert_eq!(tables_after - tables_before, 19);
         assert_eq!(
             conn.query_row(
                 "SELECT converted_units FROM market_provider_earning_lots WHERE id = 'old-lot'",

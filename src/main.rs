@@ -27,6 +27,7 @@ mod ip_blacklist_stats;
 mod ip_iq;
 mod market_access;
 mod market_billing;
+mod market_c2c;
 mod market_commission;
 mod market_earning_conversions;
 mod market_finance;

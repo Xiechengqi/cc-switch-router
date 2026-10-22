@@ -26,9 +26,11 @@ const CRITICAL_CODES: &[&str] = &[
     "earning_conversion_missing_evidence",
     "earning_conversion_allocation_mismatch",
     "earning_conversion_orphan_journal",
+    "c2c_evidence_mismatch",
+    "c2c_orphan_journal",
 ];
 
-fn case_tx(
+pub(crate) fn case_tx(
     conn: &Connection,
     code: &str,
     object_kind: &str,
@@ -109,6 +111,8 @@ fn scope_blocked_tx(conn: &Connection, scope: FinanceScope<'_>) -> Result<bool, 
                  OR (c.code = 'wallet_transfer_missing_evidence' AND c.object_id IN
                      (SELECT id FROM market_wallet_transfers
                       WHERE sender_user_id = ?1 OR recipient_user_id = ?1))
+                 OR (c.code = 'c2c_evidence_mismatch' AND c.object_id IN
+                     (SELECT id FROM market_c2c_orders WHERE buyer_id = ?1 OR seller_id = ?1))
                  OR (c.code = 'earning_conversion_missing_evidence' AND c.object_id IN
                      (SELECT v.id FROM market_earning_wallet_conversions v
                       LEFT JOIN market_earning_conversion_allocations a ON a.conversion_id = v.id
@@ -168,7 +172,7 @@ pub(crate) fn ensure_finance_scopes_safe_tx(
     let global: bool = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM market_finance_reconciliation_cases
-             WHERE status = 'open' AND code IN ('journal_unsealed', 'wallet_transfer_orphan_journal', 'commission_orphan_journal', 'earning_conversion_orphan_journal'))",
+             WHERE status = 'open' AND code IN ('journal_unsealed', 'wallet_transfer_orphan_journal', 'commission_orphan_journal', 'earning_conversion_orphan_journal', 'c2c_orphan_journal'))",
             [],
             |row| row.get(0),
         )
@@ -220,6 +224,8 @@ fn critical_case_still_failed_tx(
     object_id: &str,
 ) -> Result<bool, AppError> {
     match (code, object_kind) {
+        ("c2c_evidence_mismatch", "c2c_order") => Ok(!crate::market_c2c::evidence_valid_tx(conn, object_id)?),
+        ("c2c_orphan_journal", "journal") => crate::market_c2c::orphan_journal_tx(conn, object_id),
         ("earning_conversion_allocation_mismatch", "earning_lot") =>
             Ok(!crate::market_earning_conversions::lot_evidence_valid_tx(conn, object_id)?),
         ("earning_conversion_missing_evidence", "earning_conversion") =>
@@ -490,7 +496,7 @@ pub(crate) fn resolve_case_tx(
 }
 
 pub(crate) fn audit_finance_tx(conn: &Connection, now: &str) -> Result<usize, AppError> {
-    let mut opened = 0;
+    let mut opened = crate::market_c2c::audit_tx_cases(conn, now)?;
     let mut journal = conn
         .prepare(
             "SELECT journal.id FROM market_journal_transactions journal

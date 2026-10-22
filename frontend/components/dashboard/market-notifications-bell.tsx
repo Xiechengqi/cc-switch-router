@@ -188,6 +188,7 @@ export function MarketNotificationsBell() {
                     {new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(item.createdAt))}
                   </p>
                   {item.eventKind === "wallet_transfer_sent" || item.eventKind === "wallet_transfer_received" ? <a href="/account/wallet/" className="mt-1 block break-all text-xs text-accent underline underline-offset-2">{String(item.payload?.[item.eventKind === "wallet_transfer_sent" ? "recipientEmail" : "senderEmail"] ?? "")}</a> : null}
+                  {item.eventKind === "c2c_order_updated" && typeof item.payload?.orderId === "string" ? <a href={`/account/wallet/?c2cOrder=${encodeURIComponent(item.payload.orderId)}`} className="mt-1 inline-flex min-h-11 items-center text-xs text-primary underline underline-offset-2">{t("c2c.detail")}</a> : null}
                   {item.eventKind === "commission_policy_changed" && typeof item.payload?.rateBps === "number" && typeof item.payload?.effectiveAt === "string" && Number.isFinite(Date.parse(item.payload.effectiveAt)) ? <p className="mt-1 text-xs leading-5 text-muted-foreground">{t("commission.scheduled", { rate: (item.payload.rateBps / 100).toString(), time: new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(item.payload.effectiveAt)) })}</p> : null}
                 </div>
                 {!item.readAt ? (

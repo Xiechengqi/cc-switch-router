@@ -116,6 +116,12 @@ try {
   // Context routes also cover the newly opened checkout tab. Page routes
   // cannot reliably intercept a popup's first navigation.
   await page.context().route("**/v1/**", async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === "/v1/market-wallet/c2c/policy") return route.fulfill({ contentType: "application/json", body: JSON.stringify({
+      policy: { version: 1, enabled: false, admissionMinor: 10000, minMinor: 100, maxMinor: 500000, paymentMinutes: 30 },
+      available: false, verified: true, termsVersion: 1, claimGraceSeconds: 120, firstPurchaseMaxMinor: 10000,
+    }) });
+    if (path === "/v1/market-wallet/c2c/orders") return route.fulfill({ contentType: "application/json", body: JSON.stringify({ items: [], next: null }) });
     await route.fulfill({ contentType: "application/json", body: "{}" });
   });
   await page.context().route("**/v1/market-wallet/topups/**", async (route) => {
@@ -640,6 +646,9 @@ try {
       legacyBlockers: [], criticalCases: 0, staleTopupReviews: 0, verifiedLiveTopups: 1,
       paymentChannelBlockers: [], canEnable: false };
     else if (path === "/v1/admin/market-finance/overview") data = overview;
+    else if (path === "/v1/admin/market-finance/c2c/policy") data = { policy: { version: 1, enabled: false,
+      admissionMinor: 10000, minMinor: 100, maxMinor: 500000, paymentMinutes: 30 }, canManage: true, emailReady: true };
+    else if (path === "/v1/admin/market-finance/c2c/orders" || path === "/v1/admin/market-finance/c2c/sellers") data = { items: [], next: null };
     else if (path === "/v1/admin/market-finance/commission-policy") {
       if (route.request().method() === "PUT") {
         commissionWrites += 1;

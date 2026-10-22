@@ -9,6 +9,7 @@ import { marketCheckoutMessagesEn, marketCheckoutMessagesZh } from "@/lib/market
 import { marketOwnerMessagesEn, marketOwnerMessagesZh } from "@/lib/market-owner-messages";
 import { walletPolicyMessagesEn, walletPolicyMessagesZh } from "@/lib/wallet-policy-messages";
 import { earningConversionMessagesEn, earningConversionMessagesZh } from "@/lib/earning-conversion-messages";
+import { marketC2CMessagesEn, marketC2CMessagesZh } from "@/lib/market-c2c-messages";
 
 export const LOCALE_STORAGE_KEY = "cc_switch_router_locale_v1";
 export const SUPPORTED_LOCALES = ["en", "zh-CN"] as const;
@@ -18,6 +19,7 @@ export type MessageKey = keyof typeof messages.en;
 
 export const messages = {
   en: {
+    ...marketC2CMessagesEn,
     ...earningConversionMessagesEn,
     "common.language": "Language",
     "common.currencySwitch": "Show prices in {currency}",
@@ -4281,6 +4283,7 @@ export const messages = {
     ...walletPolicyMessagesEn,
   },
   "zh-CN": {
+    ...marketC2CMessagesZh,
     ...earningConversionMessagesZh,
     "common.language": "语言",
     "common.currencySwitch": "以{currency}显示价格",

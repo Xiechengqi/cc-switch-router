@@ -48,6 +48,7 @@ export type MarketWalletTransaction = {
   createdAt: string;
   transferId?: string | null;
   counterpartyEmail?: string | null;
+  c2cOrderId?: string | null;
 };
 
 export type MarketTopupOrderMode = "cashier" | "direct";
