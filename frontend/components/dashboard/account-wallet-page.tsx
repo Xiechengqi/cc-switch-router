@@ -5,7 +5,6 @@ import { Button } from "@heroui/react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { PlatformWalletPanel } from "@/components/dashboard/platform-wallet-panel";
-import { ProviderFinancePanel } from "@/components/dashboard/provider-finance-panel";
 import { getMarketWallet, type MarketWallet } from "@/lib/market-wallet-api";
 
 export function AccountWalletPage() {
@@ -44,6 +43,5 @@ export function AccountWalletPage() {
   if (wallet?.actorId !== actorId) return <div className="p-6 text-sm text-muted-foreground">{t("common.loading")}</div>;
   return <React.Fragment key={actorId}>
     <PlatformWalletPanel initialWallet={wallet.value} />
-    <ProviderFinancePanel walletMode={wallet.value.mode} />
   </React.Fragment>;
 }

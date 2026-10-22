@@ -187,6 +187,7 @@ export function MarketNotificationsBell() {
                     {amount ? <span className="tabular-nums">{amount} · </span> : null}
                     {new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(item.createdAt))}
                   </p>
+                  {item.eventKind === "wallet_transfer_sent" || item.eventKind === "wallet_transfer_received" ? <a href="/account/wallet/" className="mt-1 block break-all text-xs text-accent underline underline-offset-2">{String(item.payload?.[item.eventKind === "wallet_transfer_sent" ? "recipientEmail" : "senderEmail"] ?? "")}</a> : null}
                 </div>
                 {!item.readAt ? (
                   <button

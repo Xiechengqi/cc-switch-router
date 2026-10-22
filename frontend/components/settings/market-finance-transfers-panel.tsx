@@ -153,9 +153,9 @@ export function MarketFinanceTransfersPanel({ financeMode, withdrawalsPaused = f
     </div>
     {error && !selection ? <p role="alert" className="text-sm text-destructive">{error}</p> : null}
     {notice ? <p role="status" className="text-sm text-emerald-800">{notice}</p> : null}
-    <div className="grid min-w-0 gap-4 lg:grid-cols-2">
+    <div className="grid min-w-0 gap-4">
       {renderList("withdrawals", withdrawals)}
-      {renderList("refunds", refunds)}
+      {refunds.length ? renderList("refunds", refunds) : null}
     </div>
     <Button variant="ghost" size="sm" className="min-h-11 justify-self-start whitespace-nowrap" isDisabled={busy} onPress={() => void reload().catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)))}>
       {t("common.reload")}

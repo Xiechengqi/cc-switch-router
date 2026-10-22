@@ -42,7 +42,7 @@ import { ListingPricingCard } from "@/components/dashboard/share-market/listing-
 import { drawerDialogClassName } from "@/components/dashboard/share-dashboard-utils";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ApiError, quoteShareMarketSeat, rentShareMarketSeat } from "@/lib/api";
-import { DASHBOARD_ACCOUNT_BILLING_PATH } from "@/lib/dashboard-nav";
+import { DASHBOARD_ACCOUNT_WALLET_PATH } from "@/lib/dashboard-nav";
 import { formatWalletUnits, walletTopupHref } from "@/lib/market-wallet-money";
 import type { MessageKey } from "@/lib/i18n";
 import {
@@ -676,7 +676,7 @@ export function ShareMarketBuyerCatalog({
     void chat.openClientChat(installationId);
   };
   const openRentBilling = () => {
-    window.location.href = DASHBOARD_ACCOUNT_BILLING_PATH;
+    window.location.href = DASHBOARD_ACCOUNT_WALLET_PATH;
   };
   const completeRentTopup = async () => {
     setRentDialogStep("review");

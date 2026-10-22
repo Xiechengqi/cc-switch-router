@@ -12,7 +12,7 @@ import {
 import { ProviderContactsList } from "@/components/common/provider-contacts";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ApiError, cancelMarketAccessRequest, createMarketAccessRequest } from "@/lib/api";
-import { DASHBOARD_ACCOUNT_BILLING_PATH } from "@/lib/dashboard-nav";
+import { DASHBOARD_ACCOUNT_WALLET_PATH } from "@/lib/dashboard-nav";
 import type { MessageKey } from "@/lib/i18n";
 import type {
   MarketAccessRequest,
@@ -201,7 +201,7 @@ export function MarketAccessDialog({
               </Button>
             ) : null}
             {needsBilling ? (
-              <Button variant="primary" onClick={() => { window.location.href = DASHBOARD_ACCOUNT_BILLING_PATH; }}>
+              <Button variant="primary" onClick={() => { window.location.href = DASHBOARD_ACCOUNT_WALLET_PATH; }}>
                 <CircleDollarSign className="h-4 w-4" />
                 {t("marketBilling.open")}
               </Button>

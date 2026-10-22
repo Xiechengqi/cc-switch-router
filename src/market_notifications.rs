@@ -43,22 +43,114 @@ pub(crate) struct NotificationKind {
 }
 
 pub(crate) const KINDS: &[NotificationKind] = &[
-    NotificationKind { kind: "topup_credited", mandatory: false, subject_en: "Top-up credited", subject_zh: "充值已到账" },
-    NotificationKind { kind: "topup_closed_unpaid", mandatory: false, subject_en: "Top-up closed without payment", subject_zh: "充值已关闭（未付款）" },
-    NotificationKind { kind: "topup_review_required", mandatory: false, subject_en: "Top-up needs review", subject_zh: "充值需要人工核对" },
-    NotificationKind { kind: "topup_reversed", mandatory: true, subject_en: "Top-up reversed", subject_zh: "充值已冲正" },
-    NotificationKind { kind: "wallet_low_runway", mandatory: false, subject_en: "Wallet balance is running low", subject_zh: "钱包余额即将不足" },
-    NotificationKind { kind: "renewal_upcoming_shortfall", mandatory: false, subject_en: "Upcoming renewal needs funds", subject_zh: "即将续费但余额不足" },
-    NotificationKind { kind: "contract_suspended", mandatory: true, subject_en: "Service suspended", subject_zh: "服务已暂停" },
-    NotificationKind { kind: "contract_resumed", mandatory: true, subject_en: "Service resumed", subject_zh: "服务已恢复" },
-    NotificationKind { kind: "contract_terminating_soon", mandatory: true, subject_en: "Suspended service will end soon", subject_zh: "暂停的服务即将终止" },
-    NotificationKind { kind: "contract_terminated", mandatory: true, subject_en: "Service ended", subject_zh: "服务已终止" },
-    NotificationKind { kind: "refund_status", mandatory: true, subject_en: "Balance refund updated", subject_zh: "余额退款状态更新" },
-    NotificationKind { kind: "dispute_resolved", mandatory: true, subject_en: "Service dispute resolved", subject_zh: "服务争议已处理" },
-    NotificationKind { kind: "payout_status", mandatory: true, subject_en: "Withdrawal updated", subject_zh: "提现状态更新" },
-    NotificationKind { kind: "earnings_held", mandatory: true, subject_en: "Earnings placed on hold", subject_zh: "收入已冻结" },
-    NotificationKind { kind: "earnings_released", mandatory: true, subject_en: "Earnings released", subject_zh: "收入已解冻" },
-    NotificationKind { kind: "payout_address_changed", mandatory: true, subject_en: "Withdrawal address changed", subject_zh: "提现地址已变更" },
+    NotificationKind {
+        kind: "wallet_transfer_sent",
+        mandatory: true,
+        subject_en: "Wallet transfer sent",
+        subject_zh: "余额已转出",
+    },
+    NotificationKind {
+        kind: "wallet_transfer_received",
+        mandatory: true,
+        subject_en: "Wallet transfer received",
+        subject_zh: "余额已转入",
+    },
+    NotificationKind {
+        kind: "topup_credited",
+        mandatory: false,
+        subject_en: "Top-up credited",
+        subject_zh: "充值已到账",
+    },
+    NotificationKind {
+        kind: "topup_closed_unpaid",
+        mandatory: false,
+        subject_en: "Top-up closed without payment",
+        subject_zh: "充值已关闭（未付款）",
+    },
+    NotificationKind {
+        kind: "topup_review_required",
+        mandatory: false,
+        subject_en: "Top-up needs review",
+        subject_zh: "充值需要人工核对",
+    },
+    NotificationKind {
+        kind: "topup_reversed",
+        mandatory: true,
+        subject_en: "Top-up reversed",
+        subject_zh: "充值已冲正",
+    },
+    NotificationKind {
+        kind: "wallet_low_runway",
+        mandatory: false,
+        subject_en: "Wallet balance is running low",
+        subject_zh: "钱包余额即将不足",
+    },
+    NotificationKind {
+        kind: "renewal_upcoming_shortfall",
+        mandatory: false,
+        subject_en: "Upcoming renewal needs funds",
+        subject_zh: "即将续费但余额不足",
+    },
+    NotificationKind {
+        kind: "contract_suspended",
+        mandatory: true,
+        subject_en: "Service suspended",
+        subject_zh: "服务已暂停",
+    },
+    NotificationKind {
+        kind: "contract_resumed",
+        mandatory: true,
+        subject_en: "Service resumed",
+        subject_zh: "服务已恢复",
+    },
+    NotificationKind {
+        kind: "contract_terminating_soon",
+        mandatory: true,
+        subject_en: "Suspended service will end soon",
+        subject_zh: "暂停的服务即将终止",
+    },
+    NotificationKind {
+        kind: "contract_terminated",
+        mandatory: true,
+        subject_en: "Service ended",
+        subject_zh: "服务已终止",
+    },
+    NotificationKind {
+        kind: "refund_status",
+        mandatory: true,
+        subject_en: "Balance refund updated",
+        subject_zh: "余额退款状态更新",
+    },
+    NotificationKind {
+        kind: "dispute_resolved",
+        mandatory: true,
+        subject_en: "Service dispute resolved",
+        subject_zh: "服务争议已处理",
+    },
+    NotificationKind {
+        kind: "payout_status",
+        mandatory: true,
+        subject_en: "Withdrawal updated",
+        subject_zh: "提现状态更新",
+    },
+    NotificationKind {
+        kind: "earnings_held",
+        mandatory: true,
+        subject_en: "Earnings placed on hold",
+        subject_zh: "收入已冻结",
+    },
+    NotificationKind {
+        kind: "earnings_released",
+        mandatory: true,
+        subject_en: "Earnings released",
+        subject_zh: "收入已解冻",
+    },
+    NotificationKind {
+        kind: "payout_address_changed",
+        mandatory: true,
+        subject_en: "Withdrawal address changed",
+        subject_zh: "提现地址已变更",
+    },
 ];
 
 pub(crate) fn kind(kind: &str) -> Option<&'static NotificationKind> {
@@ -85,7 +177,9 @@ pub(crate) fn enqueue_user_notification_tx(
         )));
     };
     if !matches!(audience, "buyer" | "provider") || recipient_user_id.is_empty() {
-        return Err(AppError::Internal("invalid market notification recipient".into()));
+        return Err(AppError::Internal(
+            "invalid market notification recipient".into(),
+        ));
     }
     conn.execute(
         "INSERT OR IGNORE INTO market_notification_outbox
@@ -245,7 +339,9 @@ fn feed_tx(conn: &Connection, user_id: &str, cursor: Option<&str>) -> Result<Fee
         .map_err(db_error("read notification feed"))?;
     let has_more = items.len() > 50;
     items.truncate(50);
-    let next_cursor = has_more.then(|| items.last().map(|item| item.id.clone())).flatten();
+    let next_cursor = has_more
+        .then(|| items.last().map(|item| item.id.clone()))
+        .flatten();
     let unread: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM market_notification_outbox
@@ -524,6 +620,17 @@ fn recipient_tx(conn: &Connection, item: &Claimed) -> Result<Recipient, AppError
 }
 
 fn amount_text(payload: &Value) -> Option<String> {
+    if let Some(units) = payload
+        .get("amountUnits")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<i64>().ok())
+    {
+        return Some(format!(
+            "${:.8} ({} ledger units)",
+            units as f64 / 8_640_000.0,
+            units
+        ));
+    }
     payload
         .get("amountMinor")
         .and_then(Value::as_i64)
@@ -543,15 +650,35 @@ fn render(item: &Claimed, dashboard: &str) -> (String, String) {
         .and_then(Value::as_str)
         .map(|status| format!(" · {status}"))
         .unwrap_or_default();
-    let detail = match &amount {
+    let mut detail = match &amount {
         Some(amount) => format!("{amount}{status}"),
         None => status.trim_start_matches(" · ").to_string(),
     };
+    if item.event_kind == "wallet_transfer_sent" || item.event_kind == "wallet_transfer_received" {
+        let counterparty = item
+            .payload
+            .get(if item.event_kind == "wallet_transfer_sent" {
+                "recipientEmail"
+            } else {
+                "senderEmail"
+            })
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        detail.push_str(&format!(" · {counterparty}"));
+    }
     let subject = format!("{subject_zh} / {subject_en}");
     let body = format!(
         "{subject_zh}{}\n{subject_en}{}\n\n{dashboard}/account/wallet/",
-        if detail.is_empty() { String::new() } else { format!("：{detail}") },
-        if detail.is_empty() { String::new() } else { format!(": {detail}") },
+        if detail.is_empty() {
+            String::new()
+        } else {
+            format!("：{detail}")
+        },
+        if detail.is_empty() {
+            String::new()
+        } else {
+            format!(": {detail}")
+        },
     );
     (subject, body)
 }
@@ -603,6 +730,15 @@ fn render_email(item: &Claimed, dashboard: &str) -> (String, String, String) {
         };
         rows.push((label, amount));
     }
+    if let Some(fee) = item.payload.get("feeMinor").and_then(Value::as_i64) {
+        rows.push((
+            "Maintenance fee",
+            format!("${}.{:02}", fee / 100, fee % 100),
+        ));
+    }
+    if let Some(pay) = item.payload.get("payMinor").and_then(Value::as_i64) {
+        rows.push(("Payment total", format!("${}.{:02}", pay / 100, pay % 100)));
+    }
     rows.push(("Status", status.to_string()));
     if let Some(order_id) = item.payload.get("orderId").and_then(Value::as_str) {
         rows.push(("Order", order_id.to_string()));
@@ -616,7 +752,8 @@ fn render_email(item: &Claimed, dashboard: &str) -> (String, String, String) {
         "<p style=\"margin:0 0 18px;color:#475569;font-size:15px;line-height:1.6\">{}</p>\
          <table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"margin:0 0 22px\">{rows_html}</table>\
          <a href=\"{}\" style=\"display:inline-block;padding:12px 20px;border-radius:8px;background:#2563eb;color:#ffffff;text-decoration:none;font-size:14px;font-weight:600\">Open platform wallet</a>",
-        escape_html(introduction), escape_html(&wallet_url),
+        escape_html(introduction),
+        escape_html(&wallet_url),
     );
     let html = crate::store::render_email_layout(title, introduction, &body_html);
     let details = rows
@@ -624,11 +761,17 @@ fn render_email(item: &Claimed, dashboard: &str) -> (String, String, String) {
         .map(|(label, value)| format!("{label}: {value}"))
         .collect::<Vec<_>>()
         .join("\n");
-    let text = format!("TokenSwitch\n\n{title}\n\n{introduction}\n\n{details}\n\nOpen platform wallet: {wallet_url}");
+    let text = format!(
+        "TokenSwitch\n\n{title}\n\n{introduction}\n\n{details}\n\nOpen platform wallet: {wallet_url}"
+    );
     (format!("TokenSwitch: {title}"), html, text)
 }
 
-async fn deliver(state: &ServerState, http: &reqwest::Client, item: &Claimed) -> Result<String, String> {
+async fn deliver(
+    state: &ServerState,
+    http: &reqwest::Client,
+    item: &Claimed,
+) -> Result<String, String> {
     let recipient = {
         let conn = state.store.conn.lock().await;
         recipient_tx(&conn, item).map_err(|error| error.to_string())?
@@ -636,8 +779,15 @@ async fn deliver(state: &ServerState, http: &reqwest::Client, item: &Claimed) ->
     if recipient.opted_out {
         return Ok("suppressed".into());
     }
-    let scheme = if state.config.use_localhost { "http" } else { "https" };
-    let dashboard = format!("{scheme}://{}", state.config.tunnel_domain.trim_end_matches('/'));
+    let scheme = if state.config.use_localhost {
+        "http"
+    } else {
+        "https"
+    };
+    let dashboard = format!(
+        "{scheme}://{}",
+        state.config.tunnel_domain.trim_end_matches('/')
+    );
     let (_, body) = render(item, &dashboard);
     let mut delivered = Vec::new();
     let mut failures = Vec::new();
@@ -668,7 +818,13 @@ async fn deliver(state: &ServerState, http: &reqwest::Client, item: &Claimed) ->
         }
     }
     if let Some(chat) = recipient.telegram_chat.as_deref() {
-        let token = state.dynamic.read().await.telegram_bot.token().map(str::to_string);
+        let token = state
+            .dynamic
+            .read()
+            .await
+            .telegram_bot
+            .token()
+            .map(str::to_string);
         if let Some(token) = token {
             match crate::telegram::send_message(
                 http,
@@ -729,7 +885,10 @@ fn finish_tx(
     Ok(())
 }
 
-pub async fn run_service(state: ServerState, mut shutdown: watch::Receiver<bool>) -> anyhow::Result<()> {
+pub async fn run_service(
+    state: ServerState,
+    mut shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
     let http = reqwest::Client::builder()
         .user_agent("cc-switch-router/0.1 market-notifications")
         .connect_timeout(Duration::from_secs(10))
@@ -813,14 +972,23 @@ mod tests {
             .unwrap();
         }
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM market_notification_outbox", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM market_notification_outbox",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(count, 1);
         assert!(
             enqueue_user_notification_tx(
-                &conn, "buyer", "buyer-1", "nope", "topup", "o", "k", json!({}),
+                &conn,
+                "buyer",
+                "buyer-1",
+                "nope",
+                "topup",
+                "o",
+                "k",
+                json!({}),
                 "2026-10-21T00:00:00Z"
             )
             .is_err()

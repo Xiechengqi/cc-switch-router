@@ -7,6 +7,7 @@ import {
 import { marketWalletMessagesEn, marketWalletMessagesZh } from "@/lib/market-wallet-messages";
 import { marketCheckoutMessagesEn, marketCheckoutMessagesZh } from "@/lib/market-checkout-messages";
 import { marketOwnerMessagesEn, marketOwnerMessagesZh } from "@/lib/market-owner-messages";
+import { walletPolicyMessagesEn, walletPolicyMessagesZh } from "@/lib/wallet-policy-messages";
 
 export const LOCALE_STORAGE_KEY = "cc_switch_router_locale_v1";
 export const SUPPORTED_LOCALES = ["en", "zh-CN"] as const;
@@ -949,7 +950,7 @@ export const messages = {
       "The verified USD/CNY rate is temporarily unavailable. New CNY invoices wait for a fresh quote; existing invoices keep their original amounts.",
     "account.contact.title": "Contact info",
     "account.contact.hint":
-      "Shown in the Market and on invoices so renters can reach you.",
+      "Shown in the Market so renters can reach you. Not a top-up or withdrawal account.",
     "account.contact.add": "Add",
     "account.contact.channel": "Channel",
     "account.contact.handle": "Handle / ID",
@@ -4286,6 +4287,7 @@ export const messages = {
     ...marketWalletMessagesEn,
     ...marketCheckoutMessagesEn,
     ...marketOwnerMessagesEn,
+    ...walletPolicyMessagesEn,
   },
   "zh-CN": {
     "common.language": "语言",
@@ -5202,7 +5204,7 @@ export const messages = {
     "market.currencyUnavailable":
       "可信美元兑人民币汇率暂不可用。新人民币账单等待汇率恢复；已有账单金额不变。",
     "account.contact.title": "联系信息",
-    "account.contact.hint": "会在 Market 与聚合账单中展示，方便租户联系你。",
+    "account.contact.hint": "在市场中展示，方便租户联系你；不是充值或提现账户。",
     "account.contact.add": "添加",
     "account.contact.channel": "联系渠道",
     "account.contact.handle": "用户名 / ID",
@@ -8436,6 +8438,7 @@ export const messages = {
     ...marketWalletMessagesZh,
     ...marketCheckoutMessagesZh,
     ...marketOwnerMessagesZh,
+    ...walletPolicyMessagesZh,
   },
 } as const;
 

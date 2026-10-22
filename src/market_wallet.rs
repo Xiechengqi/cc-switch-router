@@ -259,7 +259,11 @@ pub(crate) fn wallet_snapshot_tx(
     })
 }
 
-fn ensure_wallet_tx(conn: &Connection, user_id: &str, now: &str) -> Result<(), AppError> {
+pub(crate) fn ensure_wallet_tx(
+    conn: &Connection,
+    user_id: &str,
+    now: &str,
+) -> Result<(), AppError> {
     conn.execute(
         "INSERT OR IGNORE INTO market_wallet_accounts (
             user_id, asset_code, posted_units, held_units, version, created_at, updated_at
@@ -278,27 +282,44 @@ pub(crate) fn credit_verified_topup_tx(
     receipt_fingerprint: &str,
     now: &str,
 ) -> Result<JournalResult, AppError> {
-    let units = units_from_minor(amount_minor)?;
+    let (credit_minor, fee_minor) = topup_credit_terms_tx(conn, order_id, amount_minor)?;
+    let units = units_from_minor(credit_minor)?;
+    let gross_units = units_from_minor(amount_minor)?;
     ensure_wallet_tx(conn, user_id, now)?;
-    let fingerprint = format!("{user_id}:{amount_minor}:{receipt_fingerprint}");
+    let fingerprint = format!(
+        "{user_id}:{amount_minor}:{receipt_fingerprint}{}",
+        if fee_minor > 0 {
+            format!(":credit={credit_minor}:fee={fee_minor}")
+        } else {
+            String::new()
+        }
+    );
+    let mut postings = vec![
+        Posting {
+            kind: "owner_clearing",
+            subject_id: "owner",
+            signed_units: gross_units,
+        },
+        Posting {
+            kind: "wallet_available",
+            subject_id: user_id,
+            signed_units: -units,
+        },
+    ];
+    if fee_minor > 0 {
+        postings.push(Posting {
+            kind: "platform_fee_revenue",
+            subject_id: "owner",
+            signed_units: -units_from_minor(fee_minor)?,
+        });
+    }
     let result = post_journal_tx(
         conn,
         "topup",
         order_id,
         "credit",
         &fingerprint,
-        &[
-            Posting {
-                kind: "owner_clearing",
-                subject_id: "owner",
-                signed_units: units,
-            },
-            Posting {
-                kind: "wallet_available",
-                subject_id: user_id,
-                signed_units: -units,
-            },
-        ],
+        &postings,
         now,
     )?;
     if result.inserted {
@@ -329,26 +350,37 @@ pub(crate) fn credit_manual_topup_tx(
     receipt_fingerprint: &str,
     now: &str,
 ) -> Result<JournalResult, AppError> {
-    let units = units_from_minor(amount_minor)?;
+    let (credit_minor, fee_minor) = topup_credit_terms_tx(conn, order_id, amount_minor)?;
+    let units = units_from_minor(credit_minor)?;
+    let mut postings = vec![
+        Posting {
+            kind: "owner_clearing",
+            subject_id: "owner",
+            signed_units: units_from_minor(amount_minor)?,
+        },
+        Posting {
+            kind: "wallet_available",
+            subject_id: user_id,
+            signed_units: -units,
+        },
+    ];
+    if fee_minor > 0 {
+        postings.push(Posting {
+            kind: "platform_fee_revenue",
+            subject_id: "owner",
+            signed_units: -units_from_minor(fee_minor)?,
+        });
+    }
     ensure_wallet_tx(conn, user_id, now)?;
     let result = post_journal_tx(
         conn,
         "topup",
         order_id,
         "credit_manual",
-        &format!("manual:{user_id}:{amount_minor}:{receipt_fingerprint}"),
-        &[
-            Posting {
-                kind: "owner_clearing",
-                subject_id: "owner",
-                signed_units: units,
-            },
-            Posting {
-                kind: "wallet_available",
-                subject_id: user_id,
-                signed_units: -units,
-            },
-        ],
+        &format!(
+            "manual:{user_id}:{amount_minor}:{receipt_fingerprint}:credit={credit_minor}:fee={fee_minor}"
+        ),
+        &postings,
         now,
     )?;
     if result.inserted
@@ -367,6 +399,86 @@ pub(crate) fn credit_manual_topup_tx(
     Ok(result)
 }
 
+pub(crate) fn topup_credit_terms_tx(
+    conn: &Connection,
+    order_id: &str,
+    gross_minor: i64,
+) -> Result<(i64, i64), AppError> {
+    let terms = conn
+        .query_row(
+            "SELECT amount_minor, COALESCE(credit_amount_minor, amount_minor), platform_fee_minor
+         FROM market_topup_orders WHERE id = ?1",
+            params![order_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(db_error("read frozen top-up amounts"))?;
+    let Some((gross, credit, fee)) = terms else {
+        // Low-level ledger fixtures do not create gateway orders. Production
+        // must never mint a credit without its frozen financial terms.
+        #[cfg(test)]
+        return Ok((gross_minor, 0));
+        #[cfg(not(test))]
+        return Err(AppError::NotFound(
+            "top-up financial terms not found".into(),
+        ));
+    };
+    if gross != gross_minor || credit <= 0 || fee < 0 || credit.checked_add(fee) != Some(gross) {
+        return Err(AppError::Conflict(
+            "top-up financial terms do not match".into(),
+        ));
+    }
+    Ok((credit, fee))
+}
+
+/// A partial external refund reverses its proportional fee, not wallet money
+/// the buyer never received. The current fee configuration is irrelevant.
+pub(crate) fn topup_reversal_terms_tx(
+    conn: &Connection,
+    order_id: &str,
+    refund_minor: i64,
+) -> Result<(i64, i64), AppError> {
+    let terms = conn
+        .query_row(
+            "SELECT amount_minor, platform_fee_minor FROM market_topup_orders WHERE id = ?1",
+            params![order_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(db_error("read top-up reversal amounts"))?;
+    let Some((gross, fee)) = terms else {
+        #[cfg(test)]
+        return Ok((refund_minor, 0));
+        #[cfg(not(test))]
+        return Err(AppError::NotFound(
+            "top-up financial terms not found".into(),
+        ));
+    };
+    let prior: i64 = conn.query_row("SELECT COALESCE(SUM(amount_minor), 0) FROM market_topup_owner_actions WHERE order_id = ?1 AND action = 'reverse_external_refund'",
+        params![order_id], |row| row.get(0)).map_err(db_error("sum prior top-up reversals"))?;
+    let cumulative = prior
+        .checked_add(refund_minor)
+        .ok_or_else(|| AppError::BadRequest("reversal overflow".into()))?;
+    if refund_minor <= 0 || cumulative > gross {
+        return Err(AppError::BadRequest(
+            "reversal exceeds the original unreversed payment".into(),
+        ));
+    }
+    // Cumulative rounding makes a final full reversal exactly undo the fee.
+    let fee_at = |amount: i64| {
+        (i128::from(amount) * i128::from(fee) + i128::from(gross) / 2) / i128::from(gross)
+    };
+    let reversed_fee = i64::try_from(fee_at(cumulative) - fee_at(prior))
+        .map_err(|_| AppError::Internal("refund fee overflow".into()))?;
+    Ok((refund_minor - reversed_fee, reversed_fee))
+}
+
 /// Reverse part or all of a credited top-up after an external refund. The
 /// buyer's available balance covers what it can; the Owner absorbs the rest.
 /// Returns the journal and the shortfall in minor units.
@@ -378,7 +490,11 @@ pub(crate) fn reverse_topup_credit_tx(
     evidence_reference: &str,
     now: &str,
 ) -> Result<(JournalResult, i64), AppError> {
-    let total = units_from_minor(amount_minor)?;
+    let (principal_minor, reversed_fee_minor) =
+        topup_reversal_terms_tx(conn, order_id, amount_minor)?;
+    let total = principal_minor
+        .checked_mul(MONEY_UNITS_PER_MINOR)
+        .ok_or_else(|| AppError::BadRequest("reversal overflow".into()))?;
     let available = wallet_snapshot_tx(conn, user_id)?.available_units.max(0);
     // Debit whole cents only, so the shortfall stays an exact cent amount.
     let per_minor = crate::market_billing::MONEY_UNITS_PER_MINOR;
@@ -387,8 +503,15 @@ pub(crate) fn reverse_topup_credit_tx(
     let mut postings = vec![Posting {
         kind: "owner_clearing",
         subject_id: "owner",
-        signed_units: -total,
+        signed_units: -units_from_minor(amount_minor)?,
     }];
+    if reversed_fee_minor > 0 {
+        postings.push(Posting {
+            kind: "platform_fee_revenue",
+            subject_id: "owner",
+            signed_units: units_from_minor(reversed_fee_minor)?,
+        });
+    }
     if from_wallet > 0 {
         postings.push(Posting {
             kind: "wallet_available",
@@ -407,7 +530,7 @@ pub(crate) fn reverse_topup_credit_tx(
         conn,
         "topup",
         order_id,
-        "reverse",
+        &format!("reverse:{evidence_reference}"),
         &format!("reverse:{user_id}:{amount_minor}:{from_wallet}:{evidence_reference}"),
         &postings,
         now,
@@ -424,7 +547,9 @@ pub(crate) fn reverse_topup_credit_tx(
             .map_err(db_error("reverse market wallet credit"))?
             != 1
     {
-        return Err(AppError::Conflict("wallet balance changed during reversal".into()));
+        return Err(AppError::Conflict(
+            "wallet balance changed during reversal".into(),
+        ));
     }
     Ok((result, shortfall / per_minor))
 }

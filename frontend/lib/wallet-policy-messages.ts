@@ -1,0 +1,152 @@
+export const walletPolicyMessagesEn = {
+  "walletPolicy.ownerCreditSplit":
+    "Wallet credit {credit} · Maintenance fee {fee}",
+  "walletPolicy.ownerReverseSplit":
+    "Principal reversal {principal} · Fee reversal {fee}",
+  "marketNotifications.kind.wallet_transfer_sent": "Balance transferred",
+  "marketNotifications.kind.wallet_transfer_received": "Balance received",
+  "walletAccess.openHelp":
+    "Users may request this service without individual approval. Paid services still require platform balance.",
+  "walletAccess.openConfirm": "Allow unknown users unless explicitly denied.",
+  "account.nav.group.funds": "Funds",
+  "account.nav.earnings": "Earnings & withdrawals",
+  "account.nav.providerSettings": "Provider settings",
+  "walletPolicy.credit": "Balance to receive",
+  "walletPolicy.fee": "Maintenance fee ({rate}%)",
+  "walletPolicy.total": "Payment total",
+  "walletPolicy.pay": "Pay {amount}",
+  "walletPolicy.disclosure":
+    "Balance is for services or transfers to other users, not cash refunds. The maintenance fee is charged only on top-up.",
+  "walletPolicy.quoting": "Calculating payment total…",
+  "walletPolicy.quoteExpired":
+    "The price has changed or expired. Review the new total, then pay again.",
+  "walletPolicy.orderBreakdown": "Fee {fee} · Paid {total}",
+  "walletPolicy.title": "Balance & transfers",
+  "walletPolicy.help":
+    "New top-ups use this fee. Existing orders keep their original price. Channel fees below are cost estimates, not buyer fees.",
+  "walletPolicy.rate": "Top-up maintenance fee (%)",
+  "walletPolicy.singleLimit": "Transfer limit per transaction (USD)",
+  "walletPolicy.dailyLimit": "Daily transfer limit (USD, UTC)",
+  "walletPolicy.enabled": "Allow email transfers",
+  "walletPolicy.paused": "Pause new transfers",
+  "walletPolicy.invalid":
+    "Enter a fee from 0–100%, and positive transfer limits. The daily limit must cover the per-transfer limit.",
+  "walletPolicy.saved": "Saved. New orders will use this policy.",
+  "walletPolicy.changed":
+    "The policy changed elsewhere. Reload it before saving again.",
+  "walletPolicy.readOnly": "Only the Router owner can change this policy.",
+  "walletPolicy.channelRange": "The total including maintenance fee must be {min}–{max} for this channel. Adjust the balance amount.",
+  "walletTransfer.refreshFailed":
+    "Transfer completed. Reload the balance to see the latest available amount.",
+  "walletTransfer.title": "Transfer to a user",
+  "walletTransfer.help":
+    "Free, instant transfers on this Router. Verify the email carefully; completed transfers cannot be cancelled.",
+  "walletTransfer.email": "Recipient email",
+  "walletTransfer.amount": "Amount (USD)",
+  "walletTransfer.all": "Transfer all available",
+  "walletTransfer.available": "Transferable: {amount}",
+  "walletTransfer.commitment":
+    "Funds already reserved or due for services cannot be transferred. Limits may apply.",
+  "walletTransfer.preview": "Review transfer",
+  "walletTransfer.review": "Confirm recipient & amount",
+  "walletTransfer.exact": "Exact amount: {units} ledger units",
+  "walletTransfer.final":
+    "This is a balance transfer, not a cash withdrawal. Verify the recipient before sending the code.",
+  "walletTransfer.sendCode": "Email verification code",
+  "walletTransfer.code": "Verification code",
+  "walletTransfer.codeHelp": "Sent to {email}; valid for 10 minutes.",
+  "walletTransfer.confirm": "Transfer {amount}",
+  "walletTransfer.resend": "Resend code",
+  "walletTransfer.resendWait": "Resend in {seconds}s",
+  "walletTransfer.expired":
+    "This confirmation expired. Close it and review a new transfer.",
+  "walletTransfer.success": "Transferred {amount} to {email}.",
+  "walletTransfer.paused":
+    "Transfers are currently unavailable. Your existing balance is not affected.",
+  "walletTransfer.verify":
+    "Sign out and sign in with an email code before transferring.",
+  "walletTransfer.insufficient":
+    "Balance or transfer limits changed. Close this confirmation and review the amount again.",
+  "walletTransfer.badCode":
+    "Incorrect verification code. Check the email and try again (up to 5 attempts).",
+  "walletTransfer.recipientUnavailable":
+    "The recipient must first sign in to this Router with that email.",
+  "marketWallet.entry.wallet_transfer": "Balance transfer",
+  "marketFinanceOverview.maintenance": "Maintenance fees after reversals",
+  "marketFinanceOverview.gross": "Gross top-up payments",
+  "marketProviderFinance.readOnly":
+    "Earnings history remains visible. Withdrawals are unavailable until the account or Provider identity is resolved.",
+};
+export const walletPolicyMessagesZh: Record<
+  keyof typeof walletPolicyMessagesEn,
+  string
+> = {
+  "walletPolicy.ownerCreditSplit": "余额到账 {credit} · 维护费 {fee}",
+  "walletPolicy.ownerReverseSplit": "本金冲回 {principal} · 维护费冲回 {fee}",
+  "marketNotifications.kind.wallet_transfer_sent": "余额已转出",
+  "marketNotifications.kind.wallet_transfer_received": "余额已转入",
+  "walletAccess.openHelp":
+    "用户无需逐个批准即可租用；付费服务仍必须使用平台余额。",
+  "walletAccess.openConfirm": "允许未单独信任的用户，但明确拒绝的用户除外。",
+  "account.nav.group.funds": "资金",
+  "account.nav.earnings": "收入与提现",
+  "account.nav.providerSettings": "Provider 设置",
+  "walletPolicy.credit": "到账余额",
+  "walletPolicy.fee": "维护费（{rate}%）",
+  "walletPolicy.total": "实付总额",
+  "walletPolicy.pay": "支付 {amount}",
+  "walletPolicy.disclosure":
+    "余额可用于消费或转给其他用户，不支持提现退款。维护费仅在充值时收取。",
+  "walletPolicy.quoting": "正在计算实付金额…",
+  "walletPolicy.quoteExpired": "报价已过期或发生变化，请核对新金额后重新支付。",
+  "walletPolicy.orderBreakdown": "维护费 {fee} · 实付 {total}",
+  "walletPolicy.title": "余额与转账",
+  "walletPolicy.help":
+    "费率仅影响新充值单，已有订单金额不变。下方渠道费率仅用于估算成本，不是用户维护费。",
+  "walletPolicy.rate": "充值维护费（%）",
+  "walletPolicy.singleLimit": "单笔转账上限（美元）",
+  "walletPolicy.dailyLimit": "每日转账上限（美元，UTC）",
+  "walletPolicy.enabled": "允许邮箱转账",
+  "walletPolicy.paused": "暂停新转账",
+  "walletPolicy.invalid":
+    "维护费应为 0–100%，转账上限应大于零，且每日上限不低于单笔上限。",
+  "walletPolicy.saved": "已保存，新订单将使用此设置。",
+  "walletPolicy.changed": "设置已在其他页面修改，请重新加载后再保存。",
+  "walletPolicy.readOnly": "只有 Router Owner 可以修改这些设置。",
+  "walletPolicy.channelRange": "此渠道含维护费的实付金额须为 {min}–{max}，请调整到账金额。",
+  "walletTransfer.refreshFailed":
+    "转账已完成，请重新加载余额以查看最新可转金额。",
+  "walletTransfer.title": "转给用户",
+  "walletTransfer.help":
+    "同一 Router 内免费即时到账。请核对邮箱，转账完成后无法撤回。",
+  "walletTransfer.email": "收款用户邮箱",
+  "walletTransfer.amount": "金额（美元）",
+  "walletTransfer.all": "转出全部可转余额",
+  "walletTransfer.available": "当前可转：{amount}",
+  "walletTransfer.commitment":
+    "已预留或已到期应付的服务费用不可转出，并受转账限额约束。",
+  "walletTransfer.preview": "核对转账",
+  "walletTransfer.review": "确认收款人与金额",
+  "walletTransfer.exact": "精确金额：{units} 记账单位",
+  "walletTransfer.final":
+    "此操作为平台余额转账，不是提现。发送验证码前请核对收款人。",
+  "walletTransfer.sendCode": "发送邮箱验证码",
+  "walletTransfer.code": "验证码",
+  "walletTransfer.codeHelp": "已发送至 {email}，10 分钟内有效。",
+  "walletTransfer.confirm": "转出 {amount}",
+  "walletTransfer.resend": "重新发送",
+  "walletTransfer.resendWait": "{seconds} 秒后重发",
+  "walletTransfer.expired": "确认信息已过期，请关闭后重新核对转账。",
+  "walletTransfer.success": "已将 {amount} 转给 {email}。",
+  "walletTransfer.paused": "当前暂不开放转账，已有余额不受影响。",
+  "walletTransfer.verify": "请退出后通过邮箱验证码重新登录，再进行转账。",
+  "walletTransfer.insufficient":
+    "余额或转账限额已变化，请关闭确认弹窗后重新核对金额。",
+  "walletTransfer.badCode": "验证码不正确，请核对邮件后重试，最多可尝试 5 次。",
+  "walletTransfer.recipientUnavailable": "收款人需先使用该邮箱登录此 Router。",
+  "marketWallet.entry.wallet_transfer": "余额转账",
+  "marketFinanceOverview.maintenance": "维护费收入（扣除冲正）",
+  "marketFinanceOverview.gross": "充值实收总额",
+  "marketProviderFinance.readOnly":
+    "收入记录仍可查看；请解决账户或 Provider 身份问题后再提现。",
+};

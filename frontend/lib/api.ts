@@ -1310,6 +1310,12 @@ export async function getAccountPaymentProfile() {
   );
 }
 
+export async function getAccountContacts() {
+  return parseJson<{ contacts: PaymentContact[]; updatedAt: string }>(
+    await authFetch("/v1/account/provider-contacts", { cache: "no-store" }),
+  );
+}
+
 export async function updateAccountPaymentProfile(
   methods: ClientMarketPaymentMethod[],
   contacts?: PaymentContact[],
@@ -1324,8 +1330,8 @@ export async function updateAccountPaymentProfile(
 }
 
 export async function updateAccountPaymentContacts(contacts: PaymentContact[]) {
-  return parseJson<AccountPaymentProfile>(
-    await authFetch("/v1/account/payment-contacts", {
+  return parseJson<{ contacts: PaymentContact[]; updatedAt: string }>(
+    await authFetch("/v1/account/provider-contacts", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ contacts }),

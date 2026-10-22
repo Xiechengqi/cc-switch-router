@@ -252,30 +252,16 @@ const MIGRATIONS: &[(i64, &str)] = &[
         68,
         include_str!("../schema/0068_market_topup_check_progress.sql"),
     ),
-    (
-        69,
-        include_str!("../schema/0069_market_topup_state_v2.sql"),
-    ),
+    (69, include_str!("../schema/0069_market_topup_state_v2.sql")),
     (
         70,
         include_str!("../schema/0070_market_channel_rollout_settings.sql"),
     ),
-    (
-        71,
-        include_str!("../schema/0071_market_notifications.sql"),
-    ),
-    (
-        72,
-        include_str!("../schema/0072_market_earning_holds.sql"),
-    ),
-    (
-        73,
-        include_str!("../schema/0073_market_owner_actions.sql"),
-    ),
-    (
-        74,
-        include_str!("../schema/0074_market_payout_v2.sql"),
-    ),
+    (71, include_str!("../schema/0071_market_notifications.sql")),
+    (72, include_str!("../schema/0072_market_earning_holds.sql")),
+    (73, include_str!("../schema/0073_market_owner_actions.sql")),
+    (74, include_str!("../schema/0074_market_payout_v2.sql")),
+    (75, include_str!("../schema/0075_market_wallet_policy.sql")),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -1347,6 +1333,94 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("record migration {migration_version}: {error}"));
         }
+    }
+
+    #[test]
+    fn wallet_policy_upgrade_preserves_sealed_journals_and_payment_views() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 74);
+        let journal = crate::market_wallet::post_journal_tx(
+            &conn,
+            "test",
+            "old",
+            "credit",
+            "old",
+            &[
+                crate::market_wallet::Posting {
+                    kind: "owner_clearing",
+                    subject_id: "owner",
+                    signed_units: 86400,
+                },
+                crate::market_wallet::Posting {
+                    kind: "wallet_available",
+                    subject_id: "user",
+                    signed_units: -86400,
+                },
+            ],
+            "2026-10-01",
+        )
+        .unwrap();
+        conn.execute_batch("INSERT INTO market_payment_channels (id, gateway_kind, display_name, current_revision, created_at, updated_at)
+          VALUES ('upgrade-channel', 'dujiaopay', 'Upgrade', 1, 't', 't');
+          INSERT INTO market_payment_channel_revisions (channel_id, revision, merchant_id, merchant_fingerprint, api_key_id, api_secret_ciphertext, api_secret_nonce, webhook_secret_ciphertext, webhook_secret_nonce, key_version, created_at)
+          VALUES ('upgrade-channel', 1, 'm', 'm', 'k', 'c', 'n', 'c', 'n', 1, 't');
+          INSERT INTO market_topup_orders (id, user_id, channel_id, channel_revision, merchant_fingerprint, merchant_order_id, idempotency_key, request_fingerprint, amount_minor, status, created_at, updated_at)
+          VALUES ('upgrade-order', 'user', 'upgrade-channel', 1, 'm', 'upgrade-merchant', 'upgrade-idem', 'fp', 1, 'credited', 't', 't');").unwrap();
+        conn.execute("INSERT INTO market_topup_owner_actions (id, order_id, action, actor_user_id, amount_minor, evidence_reference, reason_code, journal_id, created_at)
+          VALUES ('upgrade-action', 'upgrade-order', 'credit_manual_claim', 'owner', 1, 'evidence', 'verified', ?1, 't')", params![journal.id]).unwrap();
+        apply(&conn).unwrap();
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM market_topup_owner_actions WHERE id = 'upgrade-action' AND evidence_reference = 'evidence'", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM market_journal_postings WHERE journal_id = ?1",
+                params![journal.id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM market_journal_seals WHERE journal_id = ?1",
+                params![journal.id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        for view in [
+            "market_verified_topup_evidence",
+            "market_topup_credit_journal_evidence",
+            "market_verified_wallet_transfer_evidence",
+        ] {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {view}"), [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap();
+        }
+        assert!(
+            conn.execute(
+                "UPDATE market_journal_postings SET signed_units = 1 WHERE journal_id = ?1",
+                params![journal.id]
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute(
+                "DELETE FROM market_journal_postings WHERE journal_id = ?1",
+                params![journal.id]
+            )
+            .is_err()
+        );
+        assert!(conn.execute("INSERT INTO market_journal_postings VALUES ('extra', ?1, 'owner_clearing', 'owner', 'USD', 1, 't')", params![journal.id]).is_err());
+        let mut check = conn.prepare("PRAGMA foreign_key_check").unwrap();
+        assert!(
+            check
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .next()
+                .is_none()
+        );
     }
 
     #[test]

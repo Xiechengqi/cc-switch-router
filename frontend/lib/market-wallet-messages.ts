@@ -9,7 +9,7 @@ export const marketWalletMessagesEn = {
 
   // Top-up form
   "marketWallet.customAmount": "Custom amount (USD)",
-  "marketWallet.amountRangeHelp": "Choose a preset or enter {min}–{max}. You can refund unused balance later.",
+  "marketWallet.amountRangeHelp": "Enter the balance to receive ({min}–{max}). The maintenance fee is added below.",
   "marketWallet.amountRangeError": "Enter an amount between {min} and {max}, with up to two decimals.",
   "marketWallet.paymentMethod": "Payment method",
   "marketWallet.noPaymentMethods": "This channel has no payment methods available right now.",
@@ -142,7 +142,7 @@ export const marketWalletMessagesZh = {
   "marketWallet.viewOnExplorer": "在 Tronscan 查看交易 {hash}",
 
   "marketWallet.customAmount": "自定义金额（美元）",
-  "marketWallet.amountRangeHelp": "选择预设金额或输入 {min}–{max}。未用完的余额之后可以申请退款。",
+  "marketWallet.amountRangeHelp": "输入希望到账的余额（{min}–{max}），维护费在下方另计。",
   "marketWallet.amountRangeError": "请输入 {min} 至 {max} 之间的金额，最多两位小数。",
   "marketWallet.paymentMethod": "支付方式",
   "marketWallet.noPaymentMethods": "该渠道暂时没有可用的支付方式。",

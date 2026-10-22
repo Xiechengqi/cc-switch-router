@@ -8,8 +8,8 @@ import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getAccountPaymentProfile, getMarketBillingDashboard } from "@/lib/api";
 import {
-  DASHBOARD_ACCOUNT_BILLING_PATH,
-  DASHBOARD_ACCOUNT_PAYMENTS_PATH,
+  DASHBOARD_ACCOUNT_EARNINGS_PATH,
+  DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH,
   DASHBOARD_ACCOUNT_WALLET_PATH,
 } from "@/lib/dashboard-nav";
 import { MARKET_CURRENCY } from "@/lib/market-money";
@@ -181,12 +181,12 @@ export function PaidOfferReadinessNotice({
           </div>
           <div className="flex flex-wrap gap-x-4 gap-y-1">
             {!readiness.paymentReady ? (
-              <Link className="whitespace-nowrap font-medium underline underline-offset-2" href={DASHBOARD_ACCOUNT_PAYMENTS_PATH}>
+              <Link className="whitespace-nowrap font-medium underline underline-offset-2" href={DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH}>
                 {t("shareMarket.paidReadiness.goPayments")}
               </Link>
             ) : null}
             {!readiness.settlementReady ? (
-              <Link className="whitespace-nowrap font-medium underline underline-offset-2" href={`${DASHBOARD_ACCOUNT_BILLING_PATH}?tab=receivables`}>
+              <Link className="whitespace-nowrap font-medium underline underline-offset-2" href={DASHBOARD_ACCOUNT_EARNINGS_PATH}>
                 {t("shareMarket.paidReadiness.goSettlement")}
               </Link>
             ) : null}

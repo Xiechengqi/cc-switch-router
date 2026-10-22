@@ -466,6 +466,10 @@ pub fn router() -> Router<ServerState> {
             get(get_payment_profile).put(update_payment_profile),
         )
         .route("/v1/account/payment-contacts", put(update_payment_contacts))
+        .route(
+            "/v1/account/provider-contacts",
+            get(get_provider_contacts).put(update_provider_contacts),
+        )
         .route("/v1/account/payment-assets/:id", get(get_payment_asset))
         .route("/v1/client-market/providers", get(get_provider_supply))
         .route("/v1/client-market/providers/:id", get(get_provider))
@@ -1127,6 +1131,38 @@ async fn get_payment_profile(
             .store
             .client_market_payment_profile(&session.user_id, &session.email)
             .await?,
+    ))
+}
+
+async fn get_provider_contacts(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let session = require_session(&state, &headers).await?;
+    let profile = state
+        .store
+        .client_market_payment_profile(&session.user_id, &session.email)
+        .await?;
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "private, no-store")],
+        Json(serde_json::json!({ "contacts": profile.contacts, "updatedAt": profile.updated_at })),
+    ))
+}
+
+async fn update_provider_contacts(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<UpdatePaymentContactsRequest>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let session = require_session(&state, &headers).await?;
+    let contacts = normalize_payment_contacts(input.contacts)?;
+    let profile = state
+        .store
+        .client_market_update_payment_contacts(&session, &contacts)
+        .await?;
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "private, no-store")],
+        Json(serde_json::json!({ "contacts": profile.contacts, "updatedAt": profile.updated_at })),
     ))
 }
 

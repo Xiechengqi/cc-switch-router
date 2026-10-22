@@ -35,3 +35,12 @@ test("platform balance has a permanent account destination", () => {
   assert.equal(normalizeDashboardPath("/account/wallet/"), "/account/wallet/");
   assert.equal(pathnameForDashboardShell("/account/wallet/"), "account");
 });
+
+test("funds, Provider settings and compatibility routes have distinct destinations", () => {
+  assert.equal(normalizeDashboardPath("/account/earnings/"), "/account/earnings/");
+  assert.equal(normalizeDashboardPath("/account/provider-settings/"), "/account/provider-settings/");
+  for (const old of ["payments", "market-readiness", "market-access"]) {
+    assert.equal(normalizeDashboardPath(`/account/${old}/`), "/account/provider-settings/");
+  }
+  assert.equal(normalizeDashboardPath("/account/billing/"), "/account/wallet/");
+});

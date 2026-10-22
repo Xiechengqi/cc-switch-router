@@ -7200,6 +7200,11 @@ impl AppStore {
         }
 
         let user = upsert_user_by_email(&tx, &email, now)?;
+        tx.execute(
+            "UPDATE users SET email_verified_at = COALESCE(email_verified_at, ?2) WHERE id = ?1",
+            params![user.id, now.to_rfc3339()],
+        )
+        .map_err(|e| AppError::Internal(format!("record verified email failed: {e}")))?;
         let access_token = generate_secret(48);
         let refresh_token = generate_secret(64);
         let access_expires_at = now + Duration::seconds(config.auth_session_ttl_secs);
@@ -39274,6 +39279,16 @@ mod tests {
         let code = "246810";
         {
             let mut conn = store.conn.lock().await;
+            let created = upsert_user_by_email(&conn, email, Utc::now()).unwrap();
+            assert!(
+                !conn
+                    .query_row(
+                        "SELECT email_verified_at IS NOT NULL FROM users WHERE id = ?1",
+                        params![created.id],
+                        |row| row.get::<_, bool>(0)
+                    )
+                    .unwrap()
+            );
             persist_sent_login_challenge(
                 &mut conn,
                 &config,
@@ -39303,6 +39318,14 @@ mod tests {
             .expect("verify auth device login");
         {
             let conn = store.conn.lock().await;
+            assert!(
+                conn.query_row(
+                    "SELECT email_verified_at IS NOT NULL FROM users WHERE email_normalized = ?1",
+                    params![email],
+                    |row| row.get::<_, bool>(0)
+                )
+                .unwrap()
+            );
             conn.execute(
                 "DELETE FROM auth_devices WHERE id = ?1",
                 params![registered.auth_device_id],

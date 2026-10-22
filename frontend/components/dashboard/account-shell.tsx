@@ -2,24 +2,22 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { Activity, BarChart3, Bell, ClipboardCheck, HandCoins, KeyRound, Receipt, Share2, ShieldCheck, WalletCards } from "lucide-react";
+import { Activity, BarChart3, Bell, HandCoins, KeyRound, Receipt, Share2, ShieldCheck, WalletCards } from "lucide-react";
 import * as React from "react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getMarketAccessInboxSummary } from "@/lib/api";
-import { getMarketWallet } from "@/lib/market-wallet-api";
+import { getMarketProviderFinance } from "@/lib/market-wallet-api";
 import {
   accountNavHrefFromPathname,
   DASHBOARD_ACCOUNT_API_KEYS_PATH,
   DASHBOARD_ACCOUNT_CLIENT_PATH,
-  DASHBOARD_ACCOUNT_BILLING_PATH,
+  DASHBOARD_ACCOUNT_EARNINGS_PATH,
   DASHBOARD_ACCOUNT_WALLET_PATH,
-  DASHBOARD_ACCOUNT_MARKET_ACCESS_PATH,
-  DASHBOARD_ACCOUNT_MARKET_READINESS_PATH,
+  DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH,
   DASHBOARD_ACCOUNT_CONSUMER_USAGE_PATH,
   DASHBOARD_ACCOUNT_NOTIFICATIONS_PATH,
   DASHBOARD_ACCOUNT_PATH,
-  DASHBOARD_ACCOUNT_PAYMENTS_PATH,
   DASHBOARD_ACCOUNT_PROVIDER_USAGE_PATH,
   DASHBOARD_ACCOUNT_SHARE_PATH,
   resolveAccountEntryHref,
@@ -34,17 +32,16 @@ const NAV_ITEMS: {
   groupLabelKey:
     | "account.nav.group.security"
     | "account.nav.group.usage"
-    | "account.nav.group.market";
+    | "account.nav.group.market"
+    | "account.nav.group.funds";
   labelKey:
     | "account.nav.apiKeys"
     | "account.nav.notifications"
     | "account.nav.providerUsage"
     | "account.nav.consumerUsage"
-    | "account.nav.billing"
+    | "account.nav.earnings"
+    | "account.nav.providerSettings"
     | "account.nav.wallet"
-    | "account.nav.marketReadiness"
-    | "account.nav.marketAccess"
-    | "account.nav.payments"
     | "account.nav.share"
     | "account.nav.client";
   icon: typeof KeyRound;
@@ -84,44 +81,14 @@ const NAV_ITEMS: {
     match: (pathname: string) => pathname.startsWith("/account/consumer-usage"),
   },
   {
-    id: "market-readiness",
-    href: DASHBOARD_ACCOUNT_MARKET_READINESS_PATH,
-    groupLabelKey: "account.nav.group.market",
-    labelKey: "account.nav.marketReadiness",
-    icon: ClipboardCheck,
-    match: (pathname: string) => pathname.startsWith("/account/market-readiness"),
-  },
-  {
-    id: "market-access",
-    href: DASHBOARD_ACCOUNT_MARKET_ACCESS_PATH,
-    groupLabelKey: "account.nav.group.market",
-    labelKey: "account.nav.marketAccess",
-    icon: ShieldCheck,
-    match: (pathname: string) => pathname.startsWith("/account/market-access"),
-  },
-  {
-    id: "payments",
-    href: DASHBOARD_ACCOUNT_PAYMENTS_PATH,
-    groupLabelKey: "account.nav.group.market",
-    labelKey: "account.nav.payments",
-    icon: WalletCards,
-    match: (pathname: string) => pathname.startsWith("/account/payments"),
-  },
-  {
-    id: "wallet",
-    href: DASHBOARD_ACCOUNT_WALLET_PATH,
-    groupLabelKey: "account.nav.group.market",
-    labelKey: "account.nav.wallet",
-    icon: WalletCards,
+    id: "wallet", href: DASHBOARD_ACCOUNT_WALLET_PATH,
+    groupLabelKey: "account.nav.group.funds", labelKey: "account.nav.wallet", icon: WalletCards,
     match: (pathname: string) => pathname.startsWith("/account/wallet"),
   },
   {
-    id: "billing",
-    href: DASHBOARD_ACCOUNT_BILLING_PATH,
-    groupLabelKey: "account.nav.group.market",
-    labelKey: "account.nav.billing",
-    icon: HandCoins,
-    match: (pathname: string) => pathname.startsWith("/account/billing"),
+    id: "earnings", href: DASHBOARD_ACCOUNT_EARNINGS_PATH,
+    groupLabelKey: "account.nav.group.funds", labelKey: "account.nav.earnings", icon: HandCoins,
+    match: (pathname: string) => pathname.startsWith("/account/earnings"),
   },
   {
     id: "share",
@@ -140,6 +107,11 @@ const NAV_ITEMS: {
     match: (pathname: string) =>
       pathname.startsWith("/account/client") || pathname.startsWith("/account/rentals"),
   },
+  {
+    id: "provider-settings", href: DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH,
+    groupLabelKey: "account.nav.group.market", labelKey: "account.nav.providerSettings", icon: ShieldCheck,
+    match: (pathname: string) => pathname.startsWith("/account/provider-settings"),
+  },
 ];
 
 function isAccountIndexPath(pathname: string) {
@@ -152,22 +124,22 @@ export function AccountShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname() || DASHBOARD_ACCOUNT_API_KEYS_PATH;
   const router = useRouter();
   const [pendingAccessRequests, setPendingAccessRequests] = React.useState(0);
-  const [walletMode, setWalletMode] = React.useState<string | null>(null);
+  const [hasEarnings, setHasEarnings] = React.useState(false);
   const authed = !!session?.authenticated;
   const actor = session?.user?.id || session?.user?.email || "anonymous";
   const activeItem = NAV_ITEMS.find((item) => item.match(pathname));
-  const visibleNavItems = NAV_ITEMS.filter((item) => item.id !== "billing" || walletMode === "disabled" || walletMode === "shadow");
+  const visibleNavItems = NAV_ITEMS.filter((item) => item.id !== "earnings" || hasEarnings || pathname.startsWith("/account/earnings"));
 
   React.useEffect(() => {
     if (!authed) {
-      setWalletMode(null);
+      setHasEarnings(false);
       return;
     }
     let active = true;
-    setWalletMode(null);
-    void getMarketWallet().then((wallet) => {
-      if (active) setWalletMode(wallet.mode);
-    }).catch(() => { if (active) setWalletMode(null); });
+    setHasEarnings(false);
+    void getMarketProviderFinance().then((finance) => {
+      if (active) setHasEarnings(finance.isProvider || finance.hasFinanceActivity);
+    }).catch(() => { if (active) setHasEarnings(false); });
     return () => { active = false; };
   }, [actor, authed, pathname]);
 
@@ -181,8 +153,8 @@ export function AccountShell({ children }: { children: React.ReactNode }) {
   }, [pathname, router]);
 
   React.useEffect(() => {
+    setPendingAccessRequests(0);
     if (!authed) {
-      setPendingAccessRequests(0);
       return;
     }
     let active = true;
@@ -195,7 +167,7 @@ export function AccountShell({ children }: { children: React.ReactNode }) {
       active = false;
       window.clearInterval(timer);
     };
-  }, [authed, pathname]);
+  }, [actor, authed, pathname]);
 
   return (
     <main className="mx-auto grid min-w-0 w-[calc(100%-2rem)] max-w-6xl grid-cols-[minmax(0,1fr)] gap-6 pb-12 pt-2 md:grid-cols-[13rem_minmax(0,1fr)] md:gap-8">
@@ -226,8 +198,8 @@ export function AccountShell({ children }: { children: React.ReactNode }) {
                   aria-current={active ? "page" : undefined}
                 >
                   <Icon className="h-4 w-4 shrink-0" aria-hidden />
-                  <span className="whitespace-nowrap">{item.id === "payments" && walletMode !== "disabled" && walletMode !== "shadow" ? t("account.nav.contacts") : t(item.labelKey)}</span>
-                  {(item.id === "market-readiness" || item.id === "market-access") && pendingAccessRequests > 0 ? (
+                  <span className="whitespace-nowrap">{t(item.labelKey)}</span>
+                  {item.id === "provider-settings" && pendingAccessRequests > 0 ? (
                     <span className="inline-flex min-w-5 items-center justify-center rounded-full bg-rose-100 px-1.5 text-[10px] font-semibold text-rose-700">
                       {pendingAccessRequests > 99 ? "99+" : pendingAccessRequests}
                     </span>

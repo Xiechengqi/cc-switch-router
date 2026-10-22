@@ -7,7 +7,7 @@ import {
   ReleaseRentalAction,
 } from "@/components/dashboard/client-market/release-rental-action";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { DASHBOARD_ACCOUNT_BILLING_PATH, DASHBOARD_ACCOUNT_WALLET_PATH } from "@/lib/dashboard-nav";
+import { DASHBOARD_ACCOUNT_WALLET_PATH } from "@/lib/dashboard-nav";
 import { formatUsdMoney } from "@/lib/market-money";
 import { clientMarketCleanupReasonKey, clientMarketRentalHasBanner } from "@/lib/client-market-rental-state";
 import { cleanupFailureGuidanceKey } from "@/components/dashboard/client-market/host-utils";
@@ -129,10 +129,10 @@ export function ClientMarketRentalBanner({
         <span>{lifecycle}</span>
         {showManageLink ? (
           <a
-            href={manageHref || DASHBOARD_ACCOUNT_BILLING_PATH}
+            href={manageHref || DASHBOARD_ACCOUNT_WALLET_PATH}
             className="font-medium text-accent hover:underline"
           >
-            {manageHref ? t("clientMarket.release.manageInMarket") : t("marketBilling.open")}
+            {manageHref ? t("clientMarket.release.manageInMarket") : t("account.nav.wallet")}
           </a>
         ) : null}
       </span>
@@ -174,13 +174,13 @@ export function ClientMarketRentalBanner({
   }
   return (
     <a
-      href={rental.walletContractId ? DASHBOARD_ACCOUNT_WALLET_PATH : DASHBOARD_ACCOUNT_BILLING_PATH}
+      href={DASHBOARD_ACCOUNT_WALLET_PATH}
       className={`inline-flex items-center gap-1 rounded-full border border-slate-200 bg-white font-medium text-slate-700 hover:border-slate-300 hover:bg-slate-50 ${compact ? "h-6 px-2 text-[11px]" : "h-7 px-2.5 text-xs"}`}
       data-no-row-drawer
       onClick={(event) => event.stopPropagation()}
     >
       <HandCoins className="h-3 w-3" />
-      {t(rental.walletContractId ? "account.nav.wallet" : "marketBilling.open")}
+      {t("account.nav.wallet")}
     </a>
   );
 }

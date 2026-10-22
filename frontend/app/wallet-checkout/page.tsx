@@ -314,6 +314,11 @@ function DirectCheckout({ topupId, initialOrder }: { topupId: string; initialOrd
                 <CopyTextButton value={instructions.payableAmount!} label={t("marketCheckout.copyAmount")} />
               </div>
               <p className="text-xs text-muted-foreground">{t("marketCheckout.fiatEquivalent", { amount: usdText(fiatMinor, locale) })}</p>
+              <dl className="grid grid-cols-[minmax(0,1fr)_auto] gap-x-3 gap-y-1 text-xs tabular-nums">
+                <dt className="text-muted-foreground">{t("walletPolicy.credit")}</dt><dd>{usdText(order.creditAmountMinor ?? order.amountMinor, locale)}</dd>
+                <dt className="text-muted-foreground">{t("walletPolicy.fee", { rate: (order.platformFeeRateBps ?? 0) / 100 })}</dt><dd>{usdText(order.platformFeeMinor ?? 0, locale)}</dd>
+                <dt className="font-medium">{t("walletPolicy.total")}</dt><dd>{usdText(order.amountMinor, locale)}</dd>
+              </dl>
             </div>
             <div className="grid gap-2">
               <p className="font-mono text-xs uppercase tracking-[0.15em] text-muted-foreground">{t("marketCheckout.address", { chain: chainName })}</p>

@@ -28,6 +28,44 @@ pub(super) struct PaymentCipher {
 }
 
 impl PaymentCipher {
+    pub(super) fn transfer_mac(
+        &self,
+        challenge: &str,
+        quote: &str,
+        code: &str,
+    ) -> Result<(i64, String), AppError> {
+        use hmac::{Hmac, Mac};
+        let key = self
+            .keys
+            .get(&self.version)
+            .ok_or_else(|| AppError::Internal("wallet verification key unavailable".into()))?;
+        let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(&**key)
+            .map_err(|_| AppError::Internal("wallet verification key unavailable".into()))?;
+        mac.update(format!("router:wallet-transfer:v1:{challenge}:{quote}:{code}").as_bytes());
+        Ok((self.version, hex::encode(mac.finalize().into_bytes())))
+    }
+
+    pub(super) fn verify_transfer_mac(
+        &self,
+        version: i64,
+        challenge: &str,
+        quote: &str,
+        code: &str,
+        saved: &str,
+    ) -> Result<bool, AppError> {
+        use hmac::{Hmac, Mac};
+        let key = self.keys.get(&version).ok_or_else(|| {
+            AppError::ServiceUnavailable(
+                "wallet verification key unavailable; request a new code".into(),
+            )
+        })?;
+        let bytes = hex::decode(saved)
+            .map_err(|_| AppError::Internal("invalid wallet verification evidence".into()))?;
+        let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(&**key)
+            .map_err(|_| AppError::Internal("wallet verification key unavailable".into()))?;
+        mac.update(format!("router:wallet-transfer:v1:{challenge}:{quote}:{code}").as_bytes());
+        Ok(mac.verify_slice(&bytes).is_ok())
+    }
     /// Load the key ring.
     ///
     /// * `CC_SWITCH_ROUTER_MARKET_PAYMENT_MASTER_KEYS="2:<key>,1:<key>"`
@@ -38,7 +76,11 @@ impl PaymentCipher {
     pub(super) fn load(data_dir: &Path, secrets_exist: bool) -> Result<Self> {
         let mut keys = BTreeMap::new();
         if let Ok(ring) = std::env::var(KEY_RING_ENV) {
-            for entry in ring.split(',').map(str::trim).filter(|entry| !entry.is_empty()) {
+            for entry in ring
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+            {
                 let (version, key) = entry
                     .split_once(':')
                     .context("master key ring entries must be <version>:<key>")?;
@@ -68,7 +110,10 @@ impl PaymentCipher {
                     let encoded = Zeroizing::new(
                         fs::read_to_string(&path).context("read market payment key")?,
                     );
-                    keys.insert(1, parse_key(&encoded).context("invalid market payment key file")?);
+                    keys.insert(
+                        1,
+                        parse_key(&encoded).context("invalid market payment key file")?,
+                    );
                 } else if keys.is_empty() {
                     if secrets_exist {
                         bail!(
@@ -86,7 +131,10 @@ impl PaymentCipher {
                 }
             }
         }
-        let version = *keys.keys().next_back().context("no market payment master key")?;
+        let version = *keys
+            .keys()
+            .next_back()
+            .context("no market payment master key")?;
         Ok(Self {
             keys: Arc::new(keys),
             version,
@@ -139,9 +187,10 @@ impl PaymentCipher {
         aad: &str,
         key_version: i64,
     ) -> Result<Zeroizing<String>, AppError> {
-        let key = self.keys.get(&key_version).ok_or_else(|| {
-            AppError::Internal("market payment key version unavailable".into())
-        })?;
+        let key = self
+            .keys
+            .get(&key_version)
+            .ok_or_else(|| AppError::Internal("market payment key version unavailable".into()))?;
         let encoder = base64::engine::general_purpose::URL_SAFE_NO_PAD;
         let encrypted = encoder
             .decode(ciphertext)
@@ -250,10 +299,20 @@ mod tests {
         assert_eq!(ring.version, 2);
         let context = aad("channel", 1, "merchant", "api");
         let (ciphertext, nonce) = old.seal("secret", &context).unwrap();
-        assert_eq!(ring.open(&ciphertext, &nonce, &context, 1).unwrap().as_str(), "secret");
+        assert_eq!(
+            ring.open(&ciphertext, &nonce, &context, 1)
+                .unwrap()
+                .as_str(),
+            "secret"
+        );
         let (resealed, renonce) = ring.seal("secret", &context).unwrap();
         assert!(old.open(&resealed, &renonce, &context, 2).is_err());
-        assert_eq!(ring.open(&resealed, &renonce, &context, 2).unwrap().as_str(), "secret");
+        assert_eq!(
+            ring.open(&resealed, &renonce, &context, 2)
+                .unwrap()
+                .as_str(),
+            "secret"
+        );
     }
 
     #[test]
@@ -271,7 +330,13 @@ mod tests {
         let reloaded = PaymentCipher::load(&dir, true).unwrap();
         let context = aad("c", 1, "m", "api");
         let (ciphertext, nonce) = created.seal("s", &context).unwrap();
-        assert_eq!(reloaded.open(&ciphertext, &nonce, &context, 1).unwrap().as_str(), "s");
+        assert_eq!(
+            reloaded
+                .open(&ciphertext, &nonce, &context, 1)
+                .unwrap()
+                .as_str(),
+            "s"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

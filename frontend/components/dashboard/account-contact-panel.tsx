@@ -5,40 +5,10 @@ import { Button } from "@heroui/react";
 import { Loader2, Plus, Save, Trash2 } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { getAccountPaymentProfile, updateAccountPaymentContacts } from "@/lib/api";
-import { getMarketWallet } from "@/lib/market-wallet-api";
-import { AccountPaymentsPanel } from "@/components/dashboard/account-page";
+import { getAccountContacts, updateAccountPaymentContacts } from "@/lib/api";
 import type { PaymentContact, PaymentContactChannel } from "@/lib/types";
 
 const CHANNELS: PaymentContactChannel[] = ["wechat", "telegram", "custom"];
-
-export function AccountPaymentsGate() {
-  const { t } = useLocaleText();
-  const { session, loading: authLoading } = useAuth();
-  const actor = session?.user?.id || session?.user?.email || "anonymous";
-  const [result, setResult] = React.useState<{ actor: string; mode: string } | null>(null);
-  const [error, setError] = React.useState("");
-  const [attempt, setAttempt] = React.useState(0);
-
-  React.useEffect(() => {
-    if (!session?.authenticated) return;
-    let active = true;
-    setResult(null);
-    setError("");
-    void getMarketWallet().then((wallet) => {
-      if (active) setResult({ actor, mode: wallet.mode });
-    }).catch((cause) => {
-      if (active) setError(cause instanceof Error ? cause.message : String(cause));
-    });
-    return () => { active = false; };
-  }, [actor, attempt, session?.authenticated]);
-
-  if (authLoading || (session?.authenticated && (!result || result.actor !== actor) && !error)) {
-    return <p className="flex items-center gap-2 py-6 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />{t("common.loading")}</p>;
-  }
-  if (error) return <div className="grid justify-items-start gap-3 py-6"><p role="alert" className="text-sm text-destructive">{error}</p><Button variant="outline" onPress={() => setAttempt((value) => value + 1)}>{t("common.retry")}</Button></div>;
-  return result?.mode === "enabled" ? <AccountContactPanel /> : <AccountPaymentsPanel />;
-}
 
 export function AccountContactPanel() {
   const { t } = useLocaleText();
@@ -62,7 +32,7 @@ export function AccountContactPanel() {
     setSnapshot(null);
     setLoading(true);
     setError("");
-    void getAccountPaymentProfile().then((profile) => {
+    void getAccountContacts().then((profile) => {
       if (active) setSnapshot({
         actor,
         contacts: profile.contacts || [],

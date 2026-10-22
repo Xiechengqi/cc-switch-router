@@ -34,6 +34,9 @@ pub(super) struct FinanceOverview {
     /// Fee estimate from channel settings over credited top-ups, in cents.
     estimated_gateway_cost_minor: i64,
     credited_topup_minor: i64,
+    gross_topup_minor: i64,
+    #[serde(serialize_with = "serialize_units")]
+    maintenance_revenue_units: i64,
     open_cases: i64,
     open_critical_cases: i64,
     held_earning_lots: i64,
@@ -59,16 +62,14 @@ fn overview_tx(conn: &Connection) -> Result<FinanceOverview, AppError> {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(db_error("sum wallet accounts"))?;
-    let (credited, cost): (i64, i64) = conn
+    let (credited, cost, gross): (i64, i64, i64) = conn
         .query_row(
-            "SELECT COALESCE(SUM(t.amount_minor), 0),
-                    COALESCE(SUM(t.amount_minor * COALESCE(s.fee_rate_bps, 0) / 10000
-                                 + COALESCE(s.fixed_fee_minor, 0)), 0)
+            "SELECT COALESCE(SUM(COALESCE(t.credit_amount_minor, t.amount_minor)), 0),
+                    COALESCE(SUM(t.gateway_cost_minor), 0), COALESCE(SUM(t.amount_minor), 0)
              FROM market_topup_orders t
-             LEFT JOIN market_payment_channel_settings s ON s.channel_id = t.channel_id
              WHERE t.status = 'credited'",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(db_error("sum credited top-ups"))?;
     let (open_cases, held_lots): (i64, i64) = conn
@@ -91,6 +92,8 @@ fn overview_tx(conn: &Connection) -> Result<FinanceOverview, AppError> {
         owner_loss_units: -ledger("owner_loss")?,
         estimated_gateway_cost_minor: cost,
         credited_topup_minor: credited,
+        gross_topup_minor: gross,
+        maintenance_revenue_units: ledger("platform_fee_revenue")?,
         open_cases,
         open_critical_cases: crate::market_reconcile::critical_case_count_tx(conn)?,
         held_earning_lots: held_lots,

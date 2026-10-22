@@ -107,7 +107,7 @@ export function ProviderFinancePanel({ walletMode }: { walletMode: "disabled" | 
       .then(async (nextFinance) => {
         if (!active) return;
         setFinance(nextFinance);
-        if (!nextFinance.isProvider) return;
+        if (!nextFinance.isProvider && !nextFinance.hasFinanceActivity) return;
         const [page, nextHolds, nextLots] = await Promise.all([
           getMarketProviderWithdrawals(),
           getMarketProviderHolds().catch(() => [] as MarketEarningHold[]),
@@ -135,7 +135,7 @@ export function ProviderFinancePanel({ walletMode }: { walletMode: "disabled" | 
   }, [challenge]);
 
   if (!finance) return error ? <p role="alert" className="mx-auto max-w-5xl px-4 text-sm text-destructive">{error}</p> : null;
-  if (!finance.isProvider) return null;
+  if (!finance.isProvider && !finance.hasFinanceActivity) return <p className="p-5 text-sm text-muted-foreground">{t("marketWallet.noTransactions")}</p>;
 
   const dateText = (value: string) => {
     const date = new Date(value);
@@ -158,7 +158,7 @@ export function ProviderFinancePanel({ walletMode }: { walletMode: "disabled" | 
   const sendCode = async (event?: React.FormEvent<HTMLFormElement>) => {
     event?.preventDefault();
     const target = challenge?.address ?? address.trim();
-    if (busy || !TRON_ADDRESS.test(target) || (!challenge && !confirmAddress)) return;
+    if (busy || !finance.canWithdraw || !TRON_ADDRESS.test(target) || (!challenge && !confirmAddress)) return;
     setBusy(true);
     setError("");
     setNotice("");
@@ -177,7 +177,7 @@ export function ProviderFinancePanel({ walletMode }: { walletMode: "disabled" | 
 
   const confirmCode = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (busy || !challenge || !codeValid || challengeRemaining <= 0) return;
+    if (busy || !finance.canWithdraw || !challenge || !codeValid || challengeRemaining <= 0) return;
     setBusy(true);
     setError("");
     setNotice("");
@@ -207,7 +207,7 @@ export function ProviderFinancePanel({ walletMode }: { walletMode: "disabled" | 
 
   const requestWithdrawal = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (busy || walletMode !== "enabled" || !addressReady || !amountReady || tooManyOpen || amountMinor == null) return;
+    if (busy || !finance.canWithdraw || walletMode !== "enabled" || !addressReady || !amountReady || tooManyOpen || amountMinor == null) return;
     setBusy(true);
     setError("");
     setNotice("");
@@ -283,6 +283,7 @@ export function ProviderFinancePanel({ walletMode }: { walletMode: "disabled" | 
         <h2 className="text-lg font-semibold">{t("marketProviderFinance.title")}</h2>
         <p className="text-sm text-muted-foreground">{t("marketProviderFinance.sevenDays")}</p>
         {walletMode !== "enabled" ? <p className="text-sm text-muted-foreground">{t("marketProviderFinance.notOpen")}</p> : null}
+        {!finance.canWithdraw ? <p className="text-sm text-muted-foreground">{t("marketProviderFinance.readOnly")}</p> : null}
       </div>
       {error ? <p role="alert" className="rounded-md bg-destructive/5 px-3 py-2 text-sm text-destructive">{error}</p> : null}
       {notice ? <p role="status" className="rounded-md bg-emerald-50 px-3 py-2 text-sm text-emerald-800">{notice}</p> : null}
@@ -355,7 +356,7 @@ export function ProviderFinancePanel({ walletMode }: { walletMode: "disabled" | 
                 <input type="checkbox" className="mt-0.5" checked={confirmAddress} onChange={(event) => setConfirmAddress(event.target.checked)} />
                 {t("marketProviderFinance.confirmAddress")}
               </label>
-              <Button type="submit" size="sm" className="min-h-11" isDisabled={busy || !addressValid || !confirmAddress}>
+              <Button type="submit" size="sm" className="min-h-11" isDisabled={busy || !finance.canWithdraw || !addressValid || !confirmAddress}>
                 {busy ? <Loader2 className="size-4 animate-spin motion-reduce:animate-none" aria-hidden="true" /> : <MailCheck className="size-4" aria-hidden="true" />}
                 {t("marketProviderFinance.sendCode")}
               </Button>
@@ -378,10 +379,10 @@ export function ProviderFinancePanel({ walletMode }: { walletMode: "disabled" | 
                 </span>
               </label>
               <div className="flex flex-wrap gap-2">
-                <Button type="submit" size="sm" className="min-h-11" isDisabled={busy || !codeValid || challengeRemaining <= 0}>
+                <Button type="submit" size="sm" className="min-h-11" isDisabled={busy || !finance.canWithdraw || !codeValid || challengeRemaining <= 0}>
                   {t("marketProviderFinance.confirmChange")}
                 </Button>
-                <Button type="button" size="sm" variant="outline" className="min-h-11" isDisabled={busy} onPress={() => void sendCode()}>
+                <Button type="button" size="sm" variant="outline" className="min-h-11" isDisabled={busy || !finance.canWithdraw} onPress={() => void sendCode()}>
                   {t("marketProviderFinance.resendCode")}
                 </Button>
                 <Button type="button" size="sm" variant="ghost" className="min-h-11" isDisabled={busy} onPress={resetChallenge}>
@@ -405,7 +406,7 @@ export function ProviderFinancePanel({ walletMode }: { walletMode: "disabled" | 
               </span>
             </label>
             {tooManyOpen ? <p className="text-xs text-amber-800">{t("marketProviderFinance.tooManyOpen", { count: MAX_OPEN_WITHDRAWALS })}</p> : null}
-            <Button type="submit" size="sm" className="min-h-11" isDisabled={busy || walletMode !== "enabled" || !addressReady || !amountReady || tooManyOpen}>{t("marketProviderFinance.request")}</Button>
+            <Button type="submit" size="sm" className="min-h-11" isDisabled={busy || !finance.canWithdraw || walletMode !== "enabled" || !addressReady || !amountReady || tooManyOpen}>{t("marketProviderFinance.request")}</Button>
           </form>
           <div className="grid gap-2">
             <h4 className="text-sm font-semibold">{t("marketProviderFinance.history")}</h4>

@@ -132,6 +132,7 @@ export function MarketFinanceTopupOwnerActionDialog({ action, topup, onClose, on
                       amount: formatMinorUsd(creditPreview.amountMinor),
                       token: paymentTokenLabel(creditPreview.tokenId).label,
                     })}</span>
+                    <span>{t("walletPolicy.ownerCreditSplit", { credit: formatMinorUsd(creditPreview.creditMinor), fee: formatMinorUsd(creditPreview.feeMinor) })}</span>
                     <span className="text-xs">{t("settings.marketFinance.owner.previewNote")}</span>
                   </div>
                 </Alert> : null}
@@ -142,6 +143,7 @@ export function MarketFinanceTopupOwnerActionDialog({ action, topup, onClose, on
                       fromWallet: formatMinorUsd(reversePreview.fromWalletMinor),
                       shortfall: formatMinorUsd(reversePreview.shortfallMinor),
                     })}</span>
+                    <span>{t("walletPolicy.ownerReverseSplit", { principal: formatMinorUsd(reversePreview.principalMinor), fee: formatMinorUsd(reversePreview.feeMinor) })}</span>
                     <span className="text-xs">{t("settings.marketFinance.owner.previewNote")}</span>
                   </div>
                 </Alert> : null}

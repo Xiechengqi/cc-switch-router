@@ -15,9 +15,11 @@ use crate::db::{Connection, OptionalExtension, TransactionBehavior, params};
 use crate::error::AppError;
 use crate::market_finance::{ProviderFinanceSummary, provider_summary_tx};
 use crate::market_wallet::{
-    Posting, capture_hold_tx, credit_wallet_from_liability_tx, now, post_journal_tx,
-    reserve_wallet_tx, serialize_units, units_from_minor,
+    Posting, credit_wallet_from_liability_tx, now, post_journal_tx, serialize_units,
+    units_from_minor,
 };
+#[cfg(test)]
+use crate::market_wallet::{capture_hold_tx, reserve_wallet_tx};
 use crate::models::AuthSession;
 
 const MIN_WITHDRAW_MINOR: i64 = 100;
@@ -125,6 +127,23 @@ fn require_provider_tx(conn: &Connection, user_id: &str) -> Result<(), AppError>
     Ok(())
 }
 
+// Stopping sales does not forfeit earned money. Identity conflicts and disabled
+// users remain blocked; scoped reconciliation/payout holds still apply below.
+fn can_manage_earnings_tx(conn: &Connection, user_id: &str) -> Result<bool, AppError> {
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM market_provider_profiles p JOIN users u ON u.id = p.user_id
+        WHERE p.user_id = ?1 AND p.claim_state = 'claimed' AND p.status != 'identity_conflict' AND u.status = 'active')",
+        params![user_id], |row| row.get(0)).map_err(db_error("read earnings capabilities"))
+}
+
+fn require_earnings_identity_tx(conn: &Connection, user_id: &str) -> Result<(), AppError> {
+    if !can_manage_earnings_tx(conn, user_id)? {
+        return Err(AppError::Forbidden(
+            "verified Provider earnings identity required".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DestinationView {
@@ -202,7 +221,7 @@ fn save_destination_tx(
     request: &DestinationRequest,
     time: &str,
 ) -> Result<DestinationView, AppError> {
-    require_provider_tx(conn, provider)?;
+    require_earnings_identity_tx(conn, provider)?;
     validate_destination(&request.network, &request.address)?;
     if request.confirmation != "CHANGE_WITHDRAWAL_ADDRESS" {
         return Err(AppError::BadRequest(
@@ -296,7 +315,7 @@ fn create_payout_tx(
     idem: &str,
     time: &str,
 ) -> Result<PayoutView, AppError> {
-    require_provider_tx(conn, provider)?;
+    require_earnings_identity_tx(conn, provider)?;
     if amount_minor < MIN_WITHDRAW_MINOR {
         return Err(AppError::BadRequest(
             "withdrawal amount is below minimum".into(),
@@ -687,6 +706,7 @@ fn apply_payout_allocations_tx(
     Ok(())
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct BuyerRefundRequest {
@@ -734,6 +754,7 @@ fn buyer_refund_view_tx(
     .map_err(db_error("read buyer wallet refund"))
 }
 
+#[cfg(test)]
 fn create_buyer_refund_tx(
     conn: &Connection,
     user_id: &str,
@@ -1018,7 +1039,9 @@ fn transfer_details(
     let actual = request
         .actual_amount_minor
         .filter(|amount| *amount >= 0)
-        .ok_or_else(|| AppError::BadRequest("the amount that actually arrived is required".into()))?;
+        .ok_or_else(|| {
+            AppError::BadRequest("the amount that actually arrived is required".into())
+        })?;
     let transferred_at = request
         .transferred_at
         .clone()
@@ -1028,10 +1051,14 @@ fn transfer_details(
     let now_at = chrono::DateTime::parse_from_rfc3339(now)
         .map_err(|_| AppError::Internal("transition time invalid".into()))?;
     if at > now_at + Duration::minutes(5) || at < now_at - Duration::days(30) {
-        return Err(AppError::BadRequest("transfer time is outside the allowed window".into()));
+        return Err(AppError::BadRequest(
+            "transfer time is outside the allowed window".into(),
+        ));
     }
     if request.network_fee_minor.is_some_and(|fee| fee < 0) {
-        return Err(AppError::BadRequest("network fee cannot be negative".into()));
+        return Err(AppError::BadRequest(
+            "network fee cannot be negative".into(),
+        ));
     }
     let nominal = amount_units / crate::market_billing::MONEY_UNITS_PER_MINOR;
     let variance_reason = request.variance_reason.clone();
@@ -1473,37 +1500,15 @@ async fn admin_list_refunds(
 async fn request_buyer_refund(
     State(state): State<ServerState>,
     headers: HeaderMap,
-    Json(request): Json<BuyerRefundRequest>,
-) -> Result<impl axum::response::IntoResponse, AppError> {
-    let session = require_session(&state, &headers).await?;
-    let idem = idempotency_key(&headers)?;
-    let conn = state.store.conn.lock().await;
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(db_error("begin buyer wallet refund"))?;
-    let time = now();
-    if !crate::market_payments::wallet_purchase_mode_tx(&tx)? {
-        return Err(AppError::ServiceUnavailable(
-            "balance refunds open with the platform wallet".into(),
-        ));
-    }
-    let result = create_buyer_refund_tx(&tx, &session.user_id, &request, idem, &time)?;
-    if result.status == "requested" && result.created_at == time {
-        crate::market_notifications::owner_signal_tx(
-            &tx,
-            "refund_requested",
-            "buyer_refund",
-            &result.id,
-            serde_json::json!({ "amountMinor": request.amount_minor }),
-            &time,
-            false,
-        )?;
-    }
-    tx.commit()
-        .map_err(db_error("commit buyer wallet refund"))?;
-    Ok((no_store(), Json(result)))
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_session(&state, &headers).await?;
+    Err(AppError::Coded {
+        status: axum::http::StatusCode::GONE,
+        code: "WALLET_CASH_REFUNDS_RETIRED",
+        message: "consumption balance is not cash-refundable; use it for services or transfer it to another verified user".into(),
+        details: serde_json::json!({ "walletUrl": "/account/wallet/" }),
+    })
 }
-
 async fn admin_transition_buyer_refund(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -1573,6 +1578,8 @@ async fn get_provider_finance(
         summary: ProviderFinanceSummary,
         destination: Option<DestinationView>,
         is_provider: bool,
+        has_finance_activity: bool,
+        can_withdraw: bool,
     }
     let is_provider = conn
         .query_row(
@@ -1588,6 +1595,11 @@ async fn get_provider_finance(
             summary: provider_summary_tx(&conn, &session.user_id)?,
             destination: latest_destination_tx(&conn, &session.user_id)?,
             is_provider,
+            has_finance_activity: conn.query_row("SELECT EXISTS(SELECT 1 FROM market_provider_earning_lots WHERE provider_user_id = ?1)
+                OR EXISTS(SELECT 1 FROM market_payout_requests WHERE provider_user_id = ?1)
+                OR EXISTS(SELECT 1 FROM market_payout_destinations WHERE provider_user_id = ?1)", params![session.user_id], |row| row.get(0))
+                .map_err(db_error("read historical Provider finance visibility"))?,
+            can_withdraw: can_manage_earnings_tx(&conn, &session.user_id)?,
         }),
     ))
 }
@@ -1901,7 +1913,7 @@ async fn request_address_challenge(
     let code = format!("{:06}", rand::random::<u32>() % 1_000_000);
     {
         let conn = state.store.conn.lock().await;
-        require_provider_tx(&conn, &session.user_id)?;
+        require_earnings_identity_tx(&conn, &session.user_id)?;
         let recent: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM market_payout_address_challenges
@@ -2031,7 +2043,9 @@ fn consume_address_challenge_tx(
         || stored_network != network
         || stored_address != address
     {
-        return Err(AppError::BadRequest("verification code is invalid or expired".into()));
+        return Err(AppError::BadRequest(
+            "verification code is invalid or expired".into(),
+        ));
     }
     if code_digest(challenge_id, code) != digest {
         conn.execute(
@@ -2069,6 +2083,50 @@ mod tests {
     }
 
     const TX_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn retired_provider_keeps_earnings_access_but_identity_conflict_and_blocked_user_do_not() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::schema::apply(&conn).unwrap();
+        let at = "2026-10-01T00:00:00Z";
+        conn.execute("INSERT INTO users (id, email_normalized, created_at, last_login_at) VALUES ('provider', 'provider@example.test', ?1, ?1)", params![at]).unwrap();
+        conn.execute("INSERT INTO market_provider_profiles (id, canonical_email, user_id, display_name, claim_state, status, created_at, updated_at)
+            VALUES ('profile', 'provider@example.test', 'provider', 'Provider', 'claimed', 'active', ?1, ?1)", params![at]).unwrap();
+        for status in ["active", "paused", "retired"] {
+            conn.execute(
+                "UPDATE market_provider_profiles SET status = ?1",
+                params![status],
+            )
+            .unwrap();
+            assert!(can_manage_earnings_tx(&conn, "provider").unwrap());
+            save_destination_tx(
+                &conn,
+                "provider",
+                &DestinationRequest {
+                    network: "tron".into(),
+                    address: valid_address(),
+                    confirmation: "CHANGE_WITHDRAWAL_ADDRESS".into(),
+                },
+                at,
+            )
+            .unwrap();
+            if status != "active" {
+                assert!(require_provider_tx(&conn, "provider").is_err());
+            }
+        }
+        conn.execute(
+            "UPDATE market_provider_profiles SET status = 'identity_conflict'",
+            [],
+        )
+        .unwrap();
+        assert!(!can_manage_earnings_tx(&conn, "provider").unwrap());
+        conn.execute("UPDATE market_provider_profiles SET status = 'retired'", [])
+            .unwrap();
+        conn.execute("UPDATE users SET status = 'blocked'", [])
+            .unwrap();
+        assert!(require_earnings_identity_tx(&conn, "provider").is_err());
+        assert!(!can_manage_earnings_tx(&conn, "buyer").unwrap());
+    }
 
     #[test]
     fn tron_checksum_is_required() {

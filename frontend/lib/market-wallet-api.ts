@@ -39,6 +39,8 @@ export type MarketWalletTransaction = {
   deltaUnits: string;
   heldDeltaUnits: string;
   createdAt: string;
+  transferId?: string | null;
+  counterpartyEmail?: string | null;
 };
 
 export type MarketTopupOrderMode = "cashier" | "direct";
@@ -47,6 +49,10 @@ export type MarketWalletTopup = {
   id: string;
   channelId: string;
   amountMinor: number;
+  creditAmountMinor: number;
+  platformFeeMinor: number;
+  platformFeeRateBps: number;
+  policyVersion: number;
   status: string;
   checkoutUrl: string | null;
   createdAt: string;
@@ -172,6 +178,8 @@ export type MarketWalletChannel = Pick<MarketPaymentChannel, "id" | "displayName
 
 export type MarketProviderFinance = {
   isProvider: boolean;
+  hasFinanceActivity: boolean;
+  canWithdraw: boolean;
   summary: {
     pendingUnits: string;
     availableUnits: string;
@@ -439,16 +447,6 @@ export async function getMarketBuyerRefunds(cursor?: string) {
   );
 }
 
-export async function requestMarketBuyerRefund(amountMinor: number, address: string, idempotencyKey: string) {
-  return parseJson<MarketBuyerRefund>(
-    await authFetch("/v1/market-wallet/refund-requests", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey },
-      body: JSON.stringify({ amountMinor, network: "tron", address }),
-    }),
-  );
-}
-
 export async function cancelMarketBuyerRefund(id: string, expectedVersion: number) {
   return parseJson<MarketBuyerRefund>(
     await authFetch(`/v1/market-wallet/refund-requests/${encodeURIComponent(id)}/cancel`, {
@@ -585,12 +583,12 @@ export async function getMarketWalletTopupPaymentInstructions(id: string) {
 }
 
 /** `tokenId` is required for a direct channel and must be omitted for a cashier one. */
-export async function createMarketWalletTopup(channelId: string, amountMinor: number, idempotencyKey: string, tokenId?: string) {
+export async function createMarketWalletTopup(channelId: string, amountMinor: number, idempotencyKey: string, quoteId: string, tokenId?: string) {
   return parseJson<MarketWalletTopup>(
     await authFetch("/v1/market-wallet/topups", {
       method: "POST",
       headers: { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey },
-      body: JSON.stringify(tokenId ? { channelId, amountMinor, tokenId } : { channelId, amountMinor }),
+      body: JSON.stringify({ channelId, amountMinor, quoteId, ...(tokenId ? { tokenId } : {}) }),
     }),
   );
 }
@@ -764,6 +762,7 @@ export async function rewrapMarketPaymentChannelSecrets() {
 export const MARKET_CRITICAL_CASE_CODES = [
   "wallet_projection_mismatch", "provider_liability_mismatch", "period_unfulfilled_mismatch",
   "journal_unsealed", "credited_topup_missing_evidence", "paid_payout_missing_evidence",
+  "wallet_transfer_missing_evidence", "wallet_transfer_orphan_journal",
 ] as const;
 
 export function isCriticalMarketFinanceCase(code: string) {
@@ -795,6 +794,8 @@ export type MarketFinanceOverview = {
   ownerLossUnits: string;
   estimatedGatewayCostMinor: number;
   creditedTopupMinor: number;
+  grossTopupMinor: number;
+  maintenanceRevenueUnits: string;
   openCases: number;
   openCriticalCases: number;
   heldEarningLots: number;
@@ -848,6 +849,8 @@ export type MarketTopupManualCreditResult = {
   gatewayStatus: string;
   paidSource: string | null;
   amountMinor: number;
+  creditMinor: number;
+  feeMinor: number;
   tokenId: string;
   credited: boolean;
 };
@@ -870,6 +873,8 @@ export async function manualCreditMarketFinanceTopup(id: string, input: {
 export type MarketTopupReverseResult = {
   orderId: string;
   amountMinor: number;
+  principalMinor: number;
+  feeMinor: number;
   fromWalletMinor: number;
   shortfallMinor: number;
   reversed: boolean;
@@ -898,6 +903,7 @@ export const MARKET_NOTIFICATION_KINDS = [
   "wallet_low_runway", "renewal_upcoming_shortfall", "contract_suspended", "contract_resumed",
   "contract_terminating_soon", "contract_terminated", "refund_status", "dispute_resolved",
   "payout_status", "earnings_held", "earnings_released", "payout_address_changed",
+  "wallet_transfer_sent", "wallet_transfer_received",
 ] as const;
 
 export type MarketNotificationKind = (typeof MARKET_NOTIFICATION_KINDS)[number];

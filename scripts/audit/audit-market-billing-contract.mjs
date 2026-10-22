@@ -196,6 +196,21 @@ function main() {
   const apiSource = fs.readFileSync(path.join(root, "src/api.rs"), "utf8");
   const typeSource = fs.readFileSync(path.join(root, "frontend/lib/types.ts"), "utf8");
 
+  // Retired buyer cash-out / Provider-specific payment screens are redirects,
+  // not alternate entry points into old finance APIs.
+  for (const relativePath of [
+    "frontend/components/dashboard/account-billing-page.tsx",
+    "frontend/components/dashboard/account-market-readiness-page.tsx",
+    "frontend/components/dashboard/account-page.tsx",
+    "frontend/components/dashboard/market-wallet-refund-panel.tsx",
+    "frontend/components/dashboard/account-market-access-page.tsx",
+  ]) {
+    const source = fs.readFileSync(path.join(root, relativePath), "utf8");
+    for (const retired of ["requestMarketBuyerRefund", "requestMarketPrepaidRefund", "updateAccountPaymentProfile", "MarketFundingTopupDialog", "updateMarketCounterpartyCredit", "updateMarketPublicCredit"]) {
+      if (source.includes(retired)) errors.push(`${relativePath} revives retired payment action ${retired}`);
+    }
+  }
+
   for (const [label, block] of [
     ["RouterSshHostView", extractRustBlock(clientSource, "struct RouterSshHostView")],
     ["RentalView", extractRustBlock(tradeSource, "pub struct RentalView")],
@@ -492,16 +507,13 @@ function main() {
     ],
     [
       "frontend/components/dashboard/account-billing-page.tsx",
-      ["marketBilling.tabs.todo", "marketBilling.tabs.payables", "actionSubmitLabel"],
+      ["AccountLegacyRedirect", "DASHBOARD_ACCOUNT_WALLET_PATH"],
     ],
     [
       "frontend/components/dashboard/account-market-readiness-page.tsx",
       [
-        "getAccountPaymentProfile",
-        "getMarketAccessDashboard",
-        "getMarketBillingDashboard",
-        "marketReadiness.settlement.title",
-        "?tab=receivables",
+        "AccountLegacyRedirect",
+        "DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH",
       ],
     ],
     [
@@ -529,7 +541,7 @@ function main() {
         'usePaidOfferReadiness(open && pricing === "paid")',
         'paidReadiness.status === "error"',
         "hostPaidOfferPrerequisiteError(err, t)",
-        "?tab=receivables",
+        "DASHBOARD_ACCOUNT_EARNINGS_PATH",
       ],
     ],
     [
@@ -538,7 +550,7 @@ function main() {
         'usePaidOfferReadiness(open && pricing === "paid")',
         'paidReadiness.status === "error"',
         "hostPaidOfferPrerequisiteError(reason, t)",
-        "?tab=receivables",
+        "DASHBOARD_ACCOUNT_EARNINGS_PATH",
       ],
     ],
     [

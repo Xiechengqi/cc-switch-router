@@ -19,6 +19,8 @@ const CRITICAL_CODES: &[&str] = &[
     "journal_unsealed",
     "credited_topup_missing_evidence",
     "paid_payout_missing_evidence",
+    "wallet_transfer_missing_evidence",
+    "wallet_transfer_orphan_journal",
 ];
 
 fn case_tx(
@@ -98,7 +100,10 @@ fn scope_blocked_tx(conn: &Connection, scope: FinanceScope<'_>) -> Result<bool, 
              WHERE c.status = 'open' AND (
                  (c.code = 'wallet_projection_mismatch' AND c.object_id = ?1)
                  OR (c.code = 'credited_topup_missing_evidence' AND c.object_id IN
-                     (SELECT id FROM market_topup_orders WHERE user_id = ?1))))",
+                     (SELECT id FROM market_topup_orders WHERE user_id = ?1))
+                 OR (c.code = 'wallet_transfer_missing_evidence' AND c.object_id IN
+                     (SELECT id FROM market_wallet_transfers
+                      WHERE sender_user_id = ?1 OR recipient_user_id = ?1))))",
             Some(user),
         ),
         FinanceScope::Provider(provider) => (
@@ -133,7 +138,7 @@ pub(crate) fn ensure_finance_scopes_safe_tx(
     let global: bool = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM market_finance_reconciliation_cases
-             WHERE status = 'open' AND code = 'journal_unsealed')",
+             WHERE status = 'open' AND code IN ('journal_unsealed', 'wallet_transfer_orphan_journal'))",
             [],
             |row| row.get(0),
         )
@@ -233,29 +238,19 @@ fn critical_case_still_failed_tx(
             Ok(state != Some(1))
         }
         ("credited_topup_missing_evidence", "topup") => {
-            let state = conn
-                .query_row(
-                    "SELECT topup.status, receipt.order_id IS NOT NULL,
-                            journal.source_kind = 'topup' AND journal.source_id = topup.id
-                     FROM market_topup_orders topup
-                     LEFT JOIN market_topup_receipts receipt ON receipt.order_id = topup.id
-                     LEFT JOIN market_journal_transactions journal
-                       ON journal.id = topup.credited_journal_id
-                     WHERE topup.id = ?1",
-                    params![object_id],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, bool>(1)?,
-                            row.get::<_, Option<bool>>(2)?.unwrap_or(false),
-                        ))
-                    },
-                )
-                .optional()
-                .map_err(db_error("recheck credited top-up"))?;
-            Ok(state.is_none_or(|(status, receipt, journal)| {
-                status != "credited" || !receipt || !journal
-            }))
+            conn.query_row(
+                "SELECT NOT EXISTS (SELECT 1 FROM market_completed_topup_evidence WHERE id = ?1)",
+                params![object_id], |row| row.get(0),
+            ).map_err(db_error("recheck credited top-up"))
+        }
+        ("wallet_transfer_missing_evidence", "wallet_transfer") => {
+            conn.query_row("SELECT NOT EXISTS (SELECT 1 FROM market_verified_wallet_transfer_evidence WHERE id = ?1)",
+                params![object_id], |row| row.get(0)).map_err(db_error("recheck wallet transfer"))
+        }
+        ("wallet_transfer_orphan_journal", "journal") => {
+            conn.query_row("SELECT NOT EXISTS (SELECT 1 FROM market_wallet_transfers t
+                JOIN market_verified_wallet_transfer_evidence e ON e.id = t.id WHERE t.journal_id = ?1)",
+                params![object_id], |row| row.get(0)).map_err(db_error("recheck orphan transfer journal"))
         }
         ("paid_payout_missing_evidence", "provider_withdrawal" | "buyer_refund") => {
             let (table, network_join, network_column, journal_kind, held_kind, held_subject) =
@@ -424,10 +419,14 @@ pub(crate) fn resolve_case_tx(
     if kind == "platform_contract"
         && let Some(hold_kind) = crate::market_finance::hold_kind_for_case(&code)
     {
-        crate::market_finance::release_earning_holds_tx(conn, hold_kind, &object_id, actor, reason, now)?;
+        crate::market_finance::release_earning_holds_tx(
+            conn, hold_kind, &object_id, actor, reason, now,
+        )?;
     }
     if code == "earning_unlock_failed" && kind == "earning_lot" {
-        crate::market_finance::release_earning_holds_tx(conn, "manual", &object_id, actor, reason, now)?;
+        crate::market_finance::release_earning_holds_tx(
+            conn, "manual", &object_id, actor, reason, now,
+        )?;
     }
     if code == "earning_hold_legacy" && kind == "provider" {
         crate::market_finance::release_earning_holds_tx(
@@ -544,11 +543,8 @@ pub(crate) fn audit_finance_tx(conn: &Connection, now: &str) -> Result<usize, Ap
     let mut statement = conn
         .prepare(
             "SELECT topup.id FROM market_topup_orders topup
-         LEFT JOIN market_topup_receipts receipt ON receipt.order_id = topup.id
-         LEFT JOIN market_journal_transactions journal ON journal.id = topup.credited_journal_id
          WHERE topup.status = 'credited'
-           AND (receipt.order_id IS NULL OR journal.id IS NULL
-                OR journal.source_kind != 'topup' OR journal.source_id != topup.id)
+           AND NOT EXISTS (SELECT 1 FROM market_completed_topup_evidence e WHERE e.id = topup.id)
          LIMIT 100",
         )
         .map_err(db_error("prepare credited top-up audit"))?;
@@ -559,6 +555,21 @@ pub(crate) fn audit_finance_tx(conn: &Connection, now: &str) -> Result<usize, Ap
         .map_err(db_error("read credited top-up audit"))?;
     for id in mismatched_topups {
         opened += case_tx(conn, "credited_topup_missing_evidence", "topup", &id, now)?;
+    }
+
+    for (sql, code, kind) in [
+        ("SELECT id FROM market_wallet_transfers t WHERE NOT EXISTS
+            (SELECT 1 FROM market_verified_wallet_transfer_evidence e WHERE e.id = t.id) LIMIT 100",
+            "wallet_transfer_missing_evidence", "wallet_transfer"),
+        ("SELECT id FROM market_journal_transactions j WHERE source_kind = 'wallet_transfer'
+            AND NOT EXISTS (SELECT 1 FROM market_wallet_transfers t WHERE t.journal_id = j.id) LIMIT 100",
+            "wallet_transfer_orphan_journal", "journal"),
+    ] {
+        let mut statement = conn.prepare(sql).map_err(db_error("prepare wallet transfer audit"))?;
+        let ids = statement.query_map([], |row| row.get::<_, String>(0))
+            .map_err(db_error("query wallet transfer audit"))?
+            .collect::<Result<Vec<_>, _>>().map_err(db_error("read wallet transfer audit"))?;
+        for id in ids { opened += case_tx(conn, code, kind, &id, now)?; }
     }
 
     for (table, kind, network_join, expected_network, journal_kind, held_kind, held_subject) in [
@@ -651,7 +662,9 @@ mod tests {
         assert_eq!(audit_finance_tx(&tx, at).unwrap(), 1);
         assert_eq!(critical_case_count_tx(&tx).unwrap(), 1);
         let buyer = [FinanceScope::User("buyer")];
-        assert!(is_finance_hold(&ensure_finance_scopes_safe_tx(&tx, &buyer).unwrap_err()));
+        assert!(is_finance_hold(
+            &ensure_finance_scopes_safe_tx(&tx, &buyer).unwrap_err()
+        ));
         // The hold is scoped: another buyer and an unrelated Provider proceed.
         ensure_finance_scopes_safe_tx(&tx, &[FinanceScope::User("other")]).unwrap();
         ensure_finance_scopes_safe_tx(&tx, &[FinanceScope::Provider("provider")]).unwrap();
@@ -689,7 +702,14 @@ mod tests {
         ] {
             assert!(ensure_finance_scopes_safe_tx(&conn, &[scope]).is_err());
         }
-        case_tx(&conn, "paid_payout_missing_evidence", "buyer_refund", "r1", "2026-01-01").unwrap();
+        case_tx(
+            &conn,
+            "paid_payout_missing_evidence",
+            "buyer_refund",
+            "r1",
+            "2026-01-01",
+        )
+        .unwrap();
         conn.execute(
             "UPDATE market_finance_reconciliation_cases SET status = 'resolved'
              WHERE code = 'journal_unsealed'",

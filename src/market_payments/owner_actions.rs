@@ -114,6 +114,8 @@ pub(super) struct ManualCreditView {
     gateway_status: String,
     paid_source: Option<String>,
     amount_minor: i64,
+    credit_minor: i64,
+    fee_minor: i64,
     token_id: String,
     credited: bool,
 }
@@ -132,7 +134,9 @@ fn apply_manual_credit_tx(
 ) -> Result<ManualCreditView, AppError> {
     let snapshot = snapshot_tx(conn, order_id)?;
     if snapshot.updated_at != input.expected_updated_at {
-        return Err(AppError::Conflict("top-up changed; reload before crediting".into()));
+        return Err(AppError::Conflict(
+            "top-up changed; reload before crediting".into(),
+        ));
     }
     if snapshot.status == "credited" {
         return Err(AppError::Conflict("top-up is already credited".into()));
@@ -151,7 +155,9 @@ fn apply_manual_credit_tx(
         gateway,
     )?;
     if gateway.status != "paid" {
-        return Err(AppError::Conflict("DujiaoPay does not report this order paid".into()));
+        return Err(AppError::Conflict(
+            "DujiaoPay does not report this order paid".into(),
+        ));
     }
     if !gateway
         .paid_source
@@ -167,12 +173,18 @@ fn apply_manual_credit_tx(
         .clone()
         .or_else(|| input.token_id.clone())
         .ok_or_else(|| AppError::BadRequest("payment token is required".into()))?;
-    let rail = token_rail(&token).ok_or_else(|| AppError::BadRequest("unsupported token".into()))?;
+    let rail =
+        token_rail(&token).ok_or_else(|| AppError::BadRequest("unsupported token".into()))?;
     let chain = gateway.chain.clone().unwrap_or_else(|| rail.chain.into());
     if chain != rail.chain {
-        return Err(AppError::Conflict("payment chain does not match its token".into()));
+        return Err(AppError::Conflict(
+            "payment chain does not match its token".into(),
+        ));
     }
-    let tx_hash = gateway.tx_id.clone().unwrap_or_else(|| input.tx_hash.clone());
+    let tx_hash = gateway
+        .tx_id
+        .clone()
+        .unwrap_or_else(|| input.tx_hash.clone());
     if tx_hash != input.tx_hash {
         return Err(AppError::Conflict(
             "transfer hash differs from the gateway's recorded hash".into(),
@@ -190,20 +202,30 @@ fn apply_manual_credit_tx(
         .optional()
         .map_err(db_error("check manual receipt reuse"))?;
     if reused.is_some() {
-        return Err(AppError::Conflict("this transfer was already credited".into()));
+        return Err(AppError::Conflict(
+            "this transfer was already credited".into(),
+        ));
     }
+    let (credit_minor, fee_minor) =
+        crate::market_wallet::topup_credit_terms_tx(conn, order_id, snapshot.amount_minor)?;
     let view = ManualCreditView {
         order_id: order_id.into(),
         gateway_status: gateway.status.clone(),
         paid_source: gateway.paid_source.clone(),
         amount_minor: snapshot.amount_minor,
+        credit_minor,
+        fee_minor,
         token_id: token.clone(),
         credited: !input.dry_run,
     };
     if input.dry_run {
         return Ok(view);
     }
-    let settled = format!("{}.{:02}", snapshot.amount_minor / 100, snapshot.amount_minor % 100);
+    let settled = format!(
+        "{}.{:02}",
+        snapshot.amount_minor / 100,
+        snapshot.amount_minor % 100
+    );
     conn.execute(
         "INSERT INTO market_topup_receipts
          (order_id, chain, token_id, tx_id, settled_amount, confirmations,
@@ -230,7 +252,9 @@ fn apply_manual_credit_tx(
         time,
     )?;
     if !journal.inserted {
-        return Err(AppError::Internal("manual top-up journal already exists".into()));
+        return Err(AppError::Internal(
+            "manual top-up journal already exists".into(),
+        ));
     }
     let changed = conn
         .execute(
@@ -238,11 +262,19 @@ fn apply_manual_credit_tx(
              SET status = 'credited', credited_journal_id = ?2, paid_at = ?3, updated_at = ?4,
                  next_reconcile_at = NULL, reconcile_hint_pending = 0
              WHERE id = ?1 AND updated_at = ?5 AND status != 'credited'",
-            params![order_id, journal.id, gateway.paid_at, time, snapshot.updated_at],
+            params![
+                order_id,
+                journal.id,
+                gateway.paid_at,
+                time,
+                snapshot.updated_at
+            ],
         )
         .map_err(db_error("mark manual top-up credited"))?;
     if changed != 1 {
-        return Err(AppError::Conflict("top-up changed during manual credit".into()));
+        return Err(AppError::Conflict(
+            "top-up changed during manual credit".into(),
+        ));
     }
     resolve_order_cases_tx(conn, order_id, actor, &input.reason_code, time)?;
     record_action_tx(
@@ -368,7 +400,8 @@ pub(super) async fn credit_manual_claim(
         &gateway,
         &now(),
     )?;
-    tx.commit().map_err(db_error("commit manual top-up credit"))?;
+    tx.commit()
+        .map_err(db_error("commit manual top-up credit"))?;
     Ok((no_store(), Json(view)))
 }
 
@@ -390,6 +423,8 @@ pub(super) struct ReverseRequest {
 pub(super) struct ReverseView {
     order_id: String,
     amount_minor: i64,
+    principal_minor: i64,
+    fee_minor: i64,
     from_wallet_minor: i64,
     shortfall_minor: i64,
     reversed: bool,
@@ -404,11 +439,20 @@ fn apply_reversal_tx(
 ) -> Result<ReverseView, AppError> {
     let snapshot = snapshot_tx(conn, order_id)?;
     if snapshot.status != "credited" {
-        return Err(AppError::Conflict("only a credited top-up can be reversed".into()));
+        return Err(AppError::Conflict(
+            "only a credited top-up can be reversed".into(),
+        ));
     }
     if input.amount_minor <= 0 || input.amount_minor > snapshot.amount_minor {
         return Err(AppError::BadRequest(
             "reversal must be positive and at most the credited amount".into(),
+        ));
+    }
+    let reused: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM market_topup_owner_actions WHERE order_id = ?1 AND action = 'reverse_external_refund' AND evidence_reference = ?2)",
+        params![order_id, input.evidence_reference], |row| row.get(0)).map_err(db_error("check reversal reference"))?;
+    if reused {
+        return Err(AppError::Conflict(
+            "this external refund was already reversed".into(),
         ));
     }
     let refund_recorded: bool = conn
@@ -429,12 +473,16 @@ fn apply_reversal_tx(
         .available_units
         .max(0)
         / crate::market_billing::MONEY_UNITS_PER_MINOR;
-    let from_wallet_minor = input.amount_minor.min(available_minor);
+    let (principal_minor, fee_minor) =
+        crate::market_wallet::topup_reversal_terms_tx(conn, order_id, input.amount_minor)?;
+    let from_wallet_minor = principal_minor.min(available_minor);
     let mut view = ReverseView {
         order_id: order_id.into(),
         amount_minor: input.amount_minor,
+        principal_minor,
+        fee_minor,
         from_wallet_minor,
-        shortfall_minor: input.amount_minor - from_wallet_minor,
+        shortfall_minor: principal_minor - from_wallet_minor,
         reversed: false,
     };
     if input.dry_run {
@@ -454,10 +502,12 @@ fn apply_reversal_tx(
         time,
     )?;
     if !journal.inserted {
-        return Err(AppError::Conflict("this top-up was already reversed".into()));
+        return Err(AppError::Conflict(
+            "this top-up was already reversed".into(),
+        ));
     }
     view.shortfall_minor = shortfall;
-    view.from_wallet_minor = input.amount_minor - shortfall;
+    view.from_wallet_minor = principal_minor - shortfall;
     view.reversed = true;
     record_action_tx(
         conn,
@@ -488,7 +538,7 @@ fn apply_reversal_tx(
         "topup_reversed",
         "topup",
         order_id,
-        &format!("topup_reversed:{order_id}"),
+        &format!("topup_reversed:{order_id}:{}", input.evidence_reference),
         serde_json::json!({
             "orderId": order_id,
             "amountMinor": input.amount_minor,
@@ -531,6 +581,10 @@ mod tests {
     }
 
     fn seed(conn: &Connection, status: &str) {
+        seed_terms(conn, status, 500, 0);
+    }
+
+    fn seed_terms(conn: &Connection, status: &str, credit: i64, fee: i64) {
         conn.execute(
             "INSERT INTO market_payment_channels
              (id, gateway_kind, display_name, enabled, current_revision, created_at, updated_at)
@@ -552,11 +606,11 @@ mod tests {
             "INSERT INTO market_topup_orders
              (id, user_id, channel_id, channel_revision, merchant_fingerprint,
               merchant_order_id, idempotency_key, request_fingerprint, amount_minor,
-              status, created_at, updated_at, gateway_order_id)
+              status, created_at, updated_at, gateway_order_id, credit_amount_minor, platform_fee_minor)
              VALUES ('order', 'buyer', 'channel', 1, 'merchant-fingerprint',
-                     'router-00000000000000000000000000000001', 'k', 'channel:500', 500,
-                     ?1, '2026-10-01', 'v1', 'gateway-1')",
-            params![status],
+                     'router-00000000000000000000000000000001', 'k', 'channel:500', ?2 + ?3,
+                     ?1, '2026-10-01', 'v1', 'gateway-1', ?2, ?3)",
+            params![status, credit, fee],
         )
         .unwrap();
     }
@@ -624,7 +678,9 @@ mod tests {
         .unwrap();
         assert!(!preview.credited);
         assert_eq!(
-            crate::market_wallet::wallet_snapshot_tx(&conn, "buyer").unwrap().posted_units,
+            crate::market_wallet::wallet_snapshot_tx(&conn, "buyer")
+                .unwrap()
+                .posted_units,
             0
         );
         apply_manual_credit_tx(
@@ -638,16 +694,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            crate::market_wallet::wallet_snapshot_tx(&conn, "buyer").unwrap().posted_units,
+            crate::market_wallet::wallet_snapshot_tx(&conn, "buyer")
+                .unwrap()
+                .posted_units,
             500 * crate::market_billing::MONEY_UNITS_PER_MINOR
         );
         let evidence: i64 = conn
-            .query_row("SELECT COUNT(*) FROM market_verified_topup_evidence", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM market_verified_topup_evidence",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(evidence, 0);
-        assert_eq!(crate::market_reconcile::audit_finance_tx(&conn, "2026-10-03T00:00:00Z").unwrap(), 0);
+        assert_eq!(
+            crate::market_reconcile::audit_finance_tx(&conn, "2026-10-03T00:00:00Z").unwrap(),
+            0
+        );
         // A second credit, or a chain gateway answer, is refused.
         assert!(
             apply_manual_credit_tx(
@@ -661,6 +724,82 @@ mod tests {
             )
             .is_err()
         );
+        // Manual money is valid financial evidence only while its receipt
+        // still matches the fingerprint frozen into the sealed journal.
+        conn.execute("UPDATE market_topup_receipts SET receipt_fingerprint = 'corrupt-receipt' WHERE order_id = 'order'", []).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM market_completed_topup_evidence",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert!(
+            crate::market_reconcile::audit_finance_tx(&conn, "2026-10-04T00:00:00Z").unwrap() > 0
+        );
+    }
+
+    #[test]
+    fn manual_credit_uses_frozen_principal_and_cumulative_reversals_restore_exact_fee() {
+        let conn = memory();
+        seed_terms(&conn, "review_required", 475, 25);
+        let view = apply_manual_credit_tx(
+            &conn,
+            "order",
+            "owner",
+            &credit_request(false),
+            &loaded(),
+            &claimed_gateway(),
+            "2026-10-03T00:00:00Z",
+        )
+        .unwrap();
+        assert_eq!((view.credit_minor, view.fee_minor), (475, 25));
+        // Changing the current fee has no effect on existing credit or reversal.
+        conn.execute(
+            "UPDATE market_wallet_policy SET maintenance_fee_bps = 10000",
+            [],
+        )
+        .unwrap();
+        let mut fee_total = 0;
+        for (index, amount) in [1, 99, 400].into_iter().enumerate() {
+            conn.execute("INSERT INTO market_finance_reconciliation_cases (id, code, object_kind, object_id, status, created_at)
+                VALUES (?1, 'external_refund_recorded', 'topup', 'order', 'open', 't')", params![format!("partial-case-{index}")]).unwrap();
+            let request = ReverseRequest {
+                amount_minor: amount,
+                evidence_reference: format!("partial-{index}"),
+                reason_code: "gateway_refund".into(),
+                dry_run: true,
+                expected_shortfall_minor: None,
+            };
+            let preview =
+                apply_reversal_tx(&conn, "order", "owner", &request, "2026-10-04T00:00:00Z")
+                    .unwrap();
+            let commit = ReverseRequest {
+                dry_run: false,
+                expected_shortfall_minor: Some(preview.shortfall_minor),
+                ..request
+            };
+            fee_total +=
+                apply_reversal_tx(&conn, "order", "owner", &commit, "2026-10-04T00:00:00Z")
+                    .unwrap()
+                    .fee_minor;
+            assert!(
+                apply_reversal_tx(&conn, "order", "owner", &commit, "2026-10-04T00:00:00Z")
+                    .is_err()
+            );
+        }
+        assert_eq!(fee_total, 25);
+        assert_eq!(
+            crate::market_wallet::wallet_snapshot_tx(&conn, "buyer")
+                .unwrap()
+                .posted_units,
+            0
+        );
+        assert_eq!(conn.query_row("SELECT SUM(signed_units) FROM market_journal_postings WHERE account_kind = 'platform_fee_revenue'", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        assert!(crate::market_wallet::topup_reversal_terms_tx(&conn, "order", 1).is_err());
+        crate::market_wallet::reconcile_wallet_tx(&conn, "buyer").unwrap();
     }
 
     #[test]
@@ -704,7 +843,9 @@ mod tests {
             expected_shortfall_minor: Some(300),
         };
         // No recorded gateway refund: refused.
-        assert!(apply_reversal_tx(&conn, "order", "owner", &request, "2026-10-04T00:00:00Z").is_err());
+        assert!(
+            apply_reversal_tx(&conn, "order", "owner", &request, "2026-10-04T00:00:00Z").is_err()
+        );
         conn.execute(
             "INSERT INTO market_finance_reconciliation_cases
              (id, code, object_kind, object_id, status, created_at)
@@ -733,7 +874,8 @@ mod tests {
             apply_reversal_tx(&conn, "order", "owner", &stale, "2026-10-04T00:00:00Z"),
             Err(AppError::Conflict(_))
         ));
-        let view = apply_reversal_tx(&conn, "order", "owner", &request, "2026-10-04T00:00:00Z").unwrap();
+        let view =
+            apply_reversal_tx(&conn, "order", "owner", &request, "2026-10-04T00:00:00Z").unwrap();
         assert_eq!((view.from_wallet_minor, view.shortfall_minor), (200, 300));
         let wallet = crate::market_wallet::wallet_snapshot_tx(&conn, "buyer").unwrap();
         assert_eq!(wallet.available_units, 0);
@@ -746,6 +888,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(open, 0);
-        assert!(apply_reversal_tx(&conn, "order", "owner", &request, "2026-10-04T00:00:00Z").is_err());
+        assert!(
+            apply_reversal_tx(&conn, "order", "owner", &request, "2026-10-04T00:00:00Z").is_err()
+        );
     }
 }

@@ -153,6 +153,17 @@ fn insert_slice_and_lot_tx(
             params![contract_id, lot_id],
         )
         .map_err(db_error("record earning frozen by ongoing dispute"))?;
+        // Delivery may continue while a dispute is open. New lots need the
+        // same durable hold cause as the original lots; a bare disputed flag
+        // would otherwise survive resolution with nothing to release.
+        conn.execute(
+            "INSERT OR IGNORE INTO market_provider_earning_holds
+                (id, lot_id, reason_kind, reason_ref, created_at)
+             SELECT lower(hex(randomblob(16))), ?2, 'dispute', id, ?3
+             FROM market_service_disputes WHERE contract_id = ?1 AND status = 'open'",
+            params![contract_id, lot_id, now],
+        )
+        .map_err(db_error("hold new earning for ongoing dispute"))?;
     }
     Ok(id)
 }
@@ -378,7 +389,11 @@ pub(crate) fn record_monthly_delivery_tx(
 
 /// Recompute the `disputed` projection of the given lots from their active
 /// holds. Every hold change goes through this projection.
-fn recompute_lot_holds_tx(conn: &Connection, lot_filter_sql: &str, arg: &str) -> Result<(), AppError> {
+fn recompute_lot_holds_tx(
+    conn: &Connection,
+    lot_filter_sql: &str,
+    arg: &str,
+) -> Result<(), AppError> {
     conn.execute(
         &format!(
             "UPDATE market_provider_earning_lots
