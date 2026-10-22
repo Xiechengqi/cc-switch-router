@@ -1,8 +1,5 @@
 "use client";
 
-/* Owner finance overview: inverted slate stat section with dot texture and
- * an accent glow — the console's one high-contrast moment. */
-
 import * as React from "react";
 import { WalletSectionLabel } from "@/components/market/wallet-primitives";
 import { useLocaleText } from "@/components/i18n/locale-provider";
@@ -51,25 +48,19 @@ export function MarketFinanceOverviewSection({ refreshKey }: { refreshKey: numbe
   return (
     <section
       aria-labelledby="market-finance-overview-title"
-      className="relative isolate overflow-hidden rounded-2xl bg-slate-900 p-5 text-white shadow-xl sm:p-7"
+      className="rounded-xl border border-border bg-muted/30 p-5 text-foreground sm:p-7"
     >
-      <div
-        aria-hidden="true"
-        className="pointer-events-none absolute inset-0 -z-10 opacity-[0.04]"
-        style={{ backgroundImage: "radial-gradient(circle, white 1px, transparent 1px)", backgroundSize: "32px 32px" }}
-      />
-      <div aria-hidden="true" className="pointer-events-none absolute -right-24 -top-24 -z-10 size-72 rounded-full bg-[#0052FF] opacity-25 blur-[120px]" />
       <div className="grid gap-2">
-        <WalletSectionLabel tone="inverted">{t("settings.marketFinance.overview.label")}</WalletSectionLabel>
+        <WalletSectionLabel>{t("settings.marketFinance.overview.label")}</WalletSectionLabel>
         <h4 id="market-finance-overview-title" className="font-display text-xl font-semibold tracking-tight sm:text-2xl">
           {t("settings.marketFinance.overview.title")}
         </h4>
       </div>
       <dl className="mt-5 grid grid-cols-2 gap-x-4 gap-y-5 lg:grid-cols-4">
         {stats.map((stat) => (
-          <div key={stat.key} className="min-w-0 border-l border-white/10 pl-3">
-            <dt className="text-xs text-white/60">{t(stat.key)}</dt>
-            <dd className={cn("mt-1 break-all text-lg font-semibold tabular-nums tracking-tight sm:text-xl", stat.alert && "text-amber-300")}>
+          <div key={stat.key} className="min-w-0 border-l border-border pl-3">
+            <dt className="text-xs text-muted-foreground">{t(stat.key)}</dt>
+            <dd className={cn("mt-1 break-all text-lg font-semibold tabular-nums tracking-tight sm:text-xl", stat.alert && "text-amber-700")}>
               {stat.value}
             </dd>
           </div>

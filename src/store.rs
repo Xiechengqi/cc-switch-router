@@ -26912,7 +26912,7 @@ fn render_verification_code_block(code: &str) -> String {
     )
 }
 
-fn render_email_layout(title: &str, preheader: &str, body_html: &str) -> String {
+pub(crate) fn render_email_layout(title: &str, preheader: &str, body_html: &str) -> String {
     format!(
         "<!doctype html>\
          <html lang=\"en\">\

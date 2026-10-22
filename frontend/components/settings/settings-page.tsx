@@ -29,6 +29,7 @@ import { AnnouncementPanel } from "@/components/settings/announcement-panel";
 import { MapDisplayPanel } from "@/components/settings/map-display-panel";
 import { ModelPricesPanel } from "@/components/settings/model-prices-panel";
 import { MarketPaymentChannelsPanel } from "@/components/settings/market-payment-channels-panel";
+import { usePersistentState } from "@/lib/use-persistent-state";
 import {
   settingsCategoryDescription,
   settingsCategoryLabel,
@@ -138,12 +139,32 @@ const CATEGORY_ICONS: Record<SettingsCategoryId, React.ComponentType<{ className
   marketplace: ShoppingBag,
 };
 
+type SettingsNavigation = {
+  activeSection: ActiveSection;
+  activeSubsections: Partial<Record<SettingsCategoryId, string>>;
+};
+
+function settingsNavigation(value: unknown): SettingsNavigation {
+  const saved = value && typeof value === "object" ? value as Partial<SettingsNavigation> : {};
+  const section = saved.activeSection;
+  const activeSection = typeof section === "string" && (
+    section === "overview" || section === "model_prices" || Object.hasOwn(CATEGORY_ICONS, section)
+  ) ? section as ActiveSection : "overview";
+  const activeSubsections = saved.activeSubsections && typeof saved.activeSubsections === "object"
+    ? Object.fromEntries(Object.entries(saved.activeSubsections).filter(([category, id]) =>
+      Object.hasOwn(CATEGORY_ICONS, category) && typeof id === "string"))
+    : {};
+  return { activeSection, activeSubsections };
+}
+
 export function SettingsPage() {
   const { session, loading } = useAuth();
   const { t } = useLocaleText();
   const [snapshot, setSnapshot] = React.useState<SettingsSnapshot | null>(null);
-  const [activeSection, setActiveSection] = React.useState<ActiveSection>("overview");
-  const [activeSubsections, setActiveSubsections] = React.useState<Partial<Record<SettingsCategoryId, string>>>({});
+  const [savedNavigation, setSavedNavigation, navigationReady] = usePersistentState<unknown>(
+    "cc_switch_router_settings_navigation_v1", null,
+  );
+  const { activeSection, activeSubsections } = settingsNavigation(savedNavigation);
   const [query, setQuery] = React.useState("");
   const [dirty, setDirty] = React.useState<Record<string, DirtyValue>>({});
   const [fieldErrors, setFieldErrors] = React.useState<Record<string, string[]>>({});
@@ -284,7 +305,7 @@ export function SettingsPage() {
     setPendingRevealKey("");
   }, [pendingRevealKey, activeSection, activeSubsections, snapshot]);
 
-  if (loading) {
+  if (loading || (isAdmin && !navigationReady)) {
     return <main className="mx-auto w-[calc(100%-2rem)] max-w-7xl py-12 text-muted-foreground">{t("common.loadingSession")}</main>;
   }
 
@@ -577,11 +598,21 @@ export function SettingsPage() {
     setQuery("");
   }
 
+  function setActiveSection(section: ActiveSection) {
+    setSavedNavigation((current: unknown) => ({ ...settingsNavigation(current), activeSection: section }));
+  }
+
   function selectSubsection(category: SettingsCategoryId, id: string) {
-    setActiveSubsections((current) => ({
-      ...current,
-      [category]: category === "notifications" ? normalizeNotificationSubsectionId(id) || id : id,
-    }));
+    setSavedNavigation((current: unknown) => {
+      const navigation = settingsNavigation(current);
+      return {
+        ...navigation,
+        activeSubsections: {
+          ...navigation.activeSubsections,
+          [category]: category === "notifications" ? normalizeNotificationSubsectionId(id) || id : id,
+        },
+      };
+    });
   }
 
   function revealField(field: SettingsField) {

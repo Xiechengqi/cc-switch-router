@@ -561,6 +561,71 @@ fn escape_html(value: &str) -> String {
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+/// Top-up emails use the same English document and branding as sign-in codes.
+/// Other delivery channels retain their existing bilingual messages.
+fn render_email(item: &Claimed, dashboard: &str) -> (String, String, String) {
+    let (introduction, status) = match item.event_kind.as_str() {
+        "topup_credited" => (
+            "Your top-up has been credited to your platform wallet. Your balance is ready to use.",
+            "Credited",
+        ),
+        "topup_closed_unpaid" => (
+            "This top-up was closed without a confirmed payment. No funds were added to your wallet.",
+            "Closed without payment",
+        ),
+        "topup_review_required" => (
+            "The payment for this top-up needs to be checked. Do not pay for this order again. Check your wallet for updates or contact your Router administrator.",
+            "Payment under review",
+        ),
+        "topup_reversed" => (
+            "An external refund has been recorded for this top-up. The corresponding wallet credit has been adjusted.",
+            "Credit reversed",
+        ),
+        _ => {
+            let (subject, text) = render(item, dashboard);
+            let html = format!("<p>{}</p>", escape_html(&text).replace('\n', "<br>"));
+            return (subject, html, text);
+        }
+    };
+    let title = kind(&item.event_kind)
+        .expect("known top-up notification")
+        .subject_en;
+    let mut rows = Vec::new();
+    if let Some(amount) = amount_text(&item.payload) {
+        let label = if item.event_kind == "topup_reversed" {
+            "Reversed amount"
+        } else {
+            "Top-up amount"
+        };
+        rows.push((label, amount));
+    }
+    rows.push(("Status", status.to_string()));
+    if let Some(order_id) = item.payload.get("orderId").and_then(Value::as_str) {
+        rows.push(("Order", order_id.to_string()));
+    }
+    let rows_html = rows.iter().map(|(label, value)| format!(
+        "<tr><th align=\"left\" valign=\"top\" style=\"padding:8px 16px 8px 0;color:#64748b;font-size:13px;font-weight:500\">{}</th><td style=\"padding:8px 0;color:#0f172a;font-size:14px;word-break:break-all\">{}</td></tr>",
+        escape_html(label), escape_html(value),
+    )).collect::<Vec<_>>().join("");
+    let wallet_url = format!("{}/account/wallet/", dashboard.trim_end_matches('/'));
+    let body_html = format!(
+        "<p style=\"margin:0 0 18px;color:#475569;font-size:15px;line-height:1.6\">{}</p>\
+         <table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"margin:0 0 22px\">{rows_html}</table>\
+         <a href=\"{}\" style=\"display:inline-block;padding:12px 20px;border-radius:8px;background:#2563eb;color:#ffffff;text-decoration:none;font-size:14px;font-weight:600\">Open platform wallet</a>",
+        escape_html(introduction), escape_html(&wallet_url),
+    );
+    let html = crate::store::render_email_layout(title, introduction, &body_html);
+    let details = rows
+        .iter()
+        .map(|(label, value)| format!("{label}: {value}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let text = format!("TokenSwitch\n\n{title}\n\n{introduction}\n\n{details}\n\nOpen platform wallet: {wallet_url}");
+    (format!("TokenSwitch: {title}"), html, text)
 }
 
 async fn deliver(state: &ServerState, http: &reqwest::Client, item: &Claimed) -> Result<String, String> {
@@ -573,7 +638,7 @@ async fn deliver(state: &ServerState, http: &reqwest::Client, item: &Claimed) ->
     }
     let scheme = if state.config.use_localhost { "http" } else { "https" };
     let dashboard = format!("{scheme}://{}", state.config.tunnel_domain.trim_end_matches('/'));
-    let (subject, body) = render(item, &dashboard);
+    let (_, body) = render(item, &dashboard);
     let mut delivered = Vec::new();
     let mut failures = Vec::new();
     if let (Some(email), Some(api_key), Some(from)) = (
@@ -581,10 +646,7 @@ async fn deliver(state: &ServerState, http: &reqwest::Client, item: &Claimed) ->
         state.config.resend_api_key.as_deref(),
         crate::notifications::notification_sender(&state.config),
     ) {
-        let html = format!(
-            "<p>{}</p>",
-            escape_html(&body).replace('\n', "<br>")
-        );
+        let (subject, html, text) = render_email(item, &dashboard);
         let key = format!("market-notification-{}", item.id);
         match crate::notifications::send_resend_frozen_email(
             http,
@@ -594,8 +656,8 @@ async fn deliver(state: &ServerState, http: &reqwest::Client, item: &Claimed) ->
                 recipient: email,
                 subject: &subject,
                 html: &html,
-                text: &body,
-                reply_to: None,
+                text: &text,
+                reply_to: state.config.resend_reply_to.as_deref(),
                 idempotency_key: &key,
             },
         )
@@ -801,6 +863,67 @@ mod tests {
         assert!(subject.contains("提现状态更新"));
         assert!(body.contains("$12.34"));
         assert!(body.ends_with("https://router.example/account/wallet/"));
+    }
+
+    #[test]
+    fn topup_emails_are_english_and_share_the_sign_in_layout() {
+        for (event_kind, status) in [
+            ("topup_credited", "Credited"),
+            ("topup_closed_unpaid", "Closed without payment"),
+            ("topup_review_required", "Payment under review"),
+            ("topup_reversed", "Credit reversed"),
+        ] {
+            let item = Claimed {
+                id: "notice-1".into(),
+                recipient_user_id: "buyer".into(),
+                event_kind: event_kind.into(),
+                payload: json!({
+                    "amountMinor": 1234,
+                    "orderId": "order-1",
+                    "status": "raw_internal_status",
+                    "checkoutToken": "SECRET_CHECKOUT_TOKEN",
+                }),
+                mandatory: false,
+                attempts: 1,
+            };
+            let (subject, html, text) = render_email(&item, "https://router.example/");
+            assert!(subject.starts_with("TokenSwitch: "));
+            assert!(html.contains("<html lang=\"en\">"));
+            assert!(html.contains("x-apple-disable-message-reformatting"));
+            assert!(html.matches("max-width:560px").count() >= 3);
+            assert!(html.contains("href=\"https://router.example/account/wallet/\""));
+            for content in [&subject, &html, &text] {
+                assert!(content.is_ascii(), "{event_kind} must use English");
+                assert!(!content.contains("raw_internal_status"));
+                assert!(!content.contains("SECRET_CHECKOUT_TOKEN"));
+            }
+            for content in [&html, &text] {
+                assert!(content.contains("$12.34"));
+                assert!(content.contains(status));
+                assert!(content.contains("order-1"));
+                assert!(content.contains("Open platform wallet"));
+            }
+            if event_kind == "topup_review_required" {
+                assert!(text.contains("Do not pay for this order again"));
+            }
+        }
+    }
+
+    #[test]
+    fn topup_email_escapes_values_and_link_attributes() {
+        let item = Claimed {
+            id: "notice-1".into(),
+            recipient_user_id: "buyer".into(),
+            event_kind: "topup_review_required".into(),
+            payload: json!({ "orderId": "<img src=x onerror='alert(1)'>" }),
+            mandatory: false,
+            attempts: 1,
+        };
+        let (_, html, _) = render_email(&item, "https://router.example/\" onmouseover=\"test");
+        assert!(!html.contains("<img"));
+        assert!(html.contains("&lt;img src=x onerror=&#39;alert(1)&#39;&gt;"));
+        assert!(html.contains("&quot; onmouseover=&quot;test/account/wallet/"));
+        assert!(!html.contains("\" onmouseover=\"test"));
     }
 
     #[test]

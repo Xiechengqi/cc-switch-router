@@ -36,10 +36,65 @@ import {
   type MarketWalletTopup,
   type MarketTopupGatewayStatus,
   type MarketWalletTransaction,
+  type MarketWalletPage,
 } from "@/lib/market-wallet-api";
 import { TOPUP_PRESET_MINOR, formatMinorUsd, formatTopupCountdown, formatWalletUnits, formatWalletUnitsAsCny, parseTopupMinor, parseUsdMinor, safeMarketReturnPath, shouldResetTopupIdempotency, topupAutoCheckCountdown, topupBounds, topupCancelAction, topupDisplayStatus, verifiedPayableCheckoutUrl, walletTopupCheckoutHref } from "@/lib/market-wallet-money";
 
 const CLOSED_TOPUP_STATUS = new Set(["credited", "expired", "cancelled"]);
+
+function mergeHistoryItems<T extends { id: string }>(first: T[], rest: T[]): T[] {
+  const seen = new Set(first.map((item) => item.id));
+  return [...first, ...rest.filter((item) => !seen.has(item.id))];
+}
+
+async function refreshHistoryHead<T extends { id: string }>(
+  fetchPage: (cursor?: string) => Promise<MarketWalletPage<T>>,
+  current: T[],
+): Promise<MarketWalletPage<T>> {
+  const known = new Set(current.map((item) => item.id));
+  let page = await fetchPage();
+  let items = page.items;
+  // If more than a page arrived since the last refresh, bridge the gap before
+  // joining the new head to the previously loaded history.
+  while (page.nextCursor && known.size && !page.items.some((item) => known.has(item.id))) {
+    page = await fetchPage(page.nextCursor);
+    items = mergeHistoryItems(items, page.items);
+  }
+  return { items, nextCursor: page.nextCursor };
+}
+
+function WalletHistorySection({ title, children, hasMore, loading, disabled, onLoadMore }: {
+  title: string;
+  children: React.ReactNode;
+  hasMore: boolean;
+  loading: boolean;
+  disabled: boolean;
+  onLoadMore: () => Promise<void>;
+}) {
+  const { t } = useLocaleText();
+  const titleId = React.useId();
+  return (
+    <section className="min-w-0 rounded-xl border border-border bg-card p-5">
+      <h2 id={titleId} className="text-base font-semibold">{title}</h2>
+      <div
+        role="region" aria-labelledby={titleId} tabIndex={0}
+        className="mt-3 h-96 max-h-[60dvh] overflow-y-auto overscroll-y-contain rounded-sm p-1 [scrollbar-gutter:stable] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+        onScroll={(event) => {
+          const list = event.currentTarget;
+          if (hasMore && !disabled && list.scrollHeight - list.scrollTop - list.clientHeight < 96) {
+            void onLoadMore();
+          }
+        }}
+      >
+        {children}
+        {hasMore ? <Button size="sm" variant="ghost" className="mt-2" isDisabled={disabled} onPress={() => void onLoadMore()}>
+          {loading ? <Loader2 className="size-4 animate-spin" aria-hidden="true" /> : null}
+          {t(loading ? "common.loading" : "marketWallet.more")}
+        </Button> : null}
+      </div>
+    </section>
+  );
+}
 
 function errorText(cause: unknown) {
   return cause instanceof Error ? cause.message : String(cause);
@@ -149,9 +204,15 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
   const busyRef = React.useRef(false);
   const statusRequestVersionRef = React.useRef<Record<string, number>>({});
   const reloadVersionRef = React.useRef(0);
+  const historyExpandedRef = React.useRef({ topups: false, transactions: false });
+  const historiesRef = React.useRef({ topups, transactions });
   const hasUnresolvedTopups = topups.some((order) =>
     ["created", "creating", "create_unknown", "pending", "verifying", "review_required"].includes(order.status));
   const hasQueuedRecheck = topups.some((order) => order.buyerRecheckResult === "queued");
+
+  React.useEffect(() => {
+    historiesRef.current = { topups, transactions };
+  }, [topups, transactions]);
 
   React.useEffect(() => {
     const timer = window.setInterval(() => setNowMs(Date.now()), 1_000);
@@ -219,16 +280,18 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
     const version = ++reloadVersionRef.current;
     const [nextWallet, nextChannels, nextTopups, nextTransactions] = await Promise.all([
       getMarketWallet(), getMarketWalletChannels(),
-      getMarketWalletTopups(), getMarketWalletTransactions(),
+      refreshHistoryHead(getMarketWalletTopups, historiesRef.current.topups),
+      refreshHistoryHead(getMarketWalletTransactions, historiesRef.current.transactions),
     ]);
     if (version !== reloadVersionRef.current) return;
     setWallet(nextWallet);
     setChannels(nextChannels);
     setGatewayStatuses({});
-    setTopups(nextTopups.items);
-    setTopupCursor(nextTopups.nextCursor);
-    setTransactions(nextTransactions.items);
-    setTransactionCursor(nextTransactions.nextCursor);
+    // Refresh the newest entries without discarding history already loaded by scrolling.
+    setTopups((current) => mergeHistoryItems(nextTopups.items, current));
+    setTopupCursor((current) => historyExpandedRef.current.topups ? current : nextTopups.nextCursor);
+    setTransactions((current) => mergeHistoryItems(nextTransactions.items, current));
+    setTransactionCursor((current) => historyExpandedRef.current.transactions ? current : nextTransactions.nextCursor);
     setChannelId((current) => current || nextChannels[0]?.id || "");
     setLoaded(true);
   }, []);
@@ -569,14 +632,19 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
     busyRef.current = true;
     setBusy(kind);
     setError("");
+    const version = reloadVersionRef.current;
     try {
       if (kind === "topups") {
         const page = await getMarketWalletTopups(cursor);
-        setTopups((current) => [...current, ...page.items]);
+        if (version !== reloadVersionRef.current) return;
+        historyExpandedRef.current.topups = true;
+        setTopups((current) => mergeHistoryItems(current, page.items));
         setTopupCursor(page.nextCursor);
       } else {
         const page = await getMarketWalletTransactions(cursor);
-        setTransactions((current) => [...current, ...page.items]);
+        if (version !== reloadVersionRef.current) return;
+        historyExpandedRef.current.transactions = true;
+        setTransactions((current) => mergeHistoryItems(current, page.items));
         setTransactionCursor(page.nextCursor);
       }
     } catch (cause) {
@@ -732,9 +800,9 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
 
       {(wallet.canTopup || wallet.hasWalletActivity) && !loaded ? <p className="text-sm text-muted-foreground">{t("common.loading")}</p> : null}
       {wallet.canTopup || wallet.hasWalletActivity ? <div className="grid min-w-0 gap-6 lg:grid-cols-2">
-        <section className="min-w-0 rounded-xl border border-border bg-card p-5" aria-label={t("marketWallet.topups")}>
-          <h2 className="text-base font-semibold">{t("marketWallet.topups")}</h2>
-          <ul className="mt-3 grid gap-2">
+        <WalletHistorySection title={t("marketWallet.topups")} hasMore={!!topupCursor}
+          loading={busy === "topups"} disabled={!!busy} onLoadMore={() => loadMore("topups")}>
+          <ul className="grid gap-2">
             {topups.map((order) => {
               const gateway = gatewayStatuses[order.id];
               const abandoned = !!order.buyerAbandonedAt;
@@ -826,11 +894,10 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
             })}
             {loaded && !topups.length ? <li className="text-sm text-muted-foreground">{t("marketWallet.noTopups")}</li> : null}
           </ul>
-          {topupCursor ? <Button size="sm" variant="ghost" isDisabled={!!busy} onPress={() => void loadMore("topups")}>{t("marketWallet.more")}</Button> : null}
-        </section>
-        <section className="min-w-0 rounded-xl border border-border bg-card p-5" aria-label={t("marketWallet.transactions")}>
-          <h2 className="text-base font-semibold">{t("marketWallet.transactions")}</h2>
-          <ul className="mt-3 grid gap-2">
+        </WalletHistorySection>
+        <WalletHistorySection title={t("marketWallet.transactions")} hasMore={!!transactionCursor}
+          loading={busy === "transactions"} disabled={!!busy} onLoadMore={() => loadMore("transactions")}>
+          <ul className="grid gap-2">
             {transactions.map((entry) => {
               const delta = safeBigInt(entry.deltaUnits);
               const heldDelta = safeBigInt(entry.heldDeltaUnits);
@@ -850,8 +917,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
             })}
             {loaded && !transactions.length ? <li className="text-sm text-muted-foreground">{t("marketWallet.noTransactions")}</li> : null}
           </ul>
-          {transactionCursor ? <Button size="sm" variant="ghost" isDisabled={!!busy} onPress={() => void loadMore("transactions")}>{t("marketWallet.more")}</Button> : null}
-        </section>
+        </WalletHistorySection>
       </div> : null}
       {wallet.hasWalletActivity ? <MarketWalletRefundPanel availableUnits={wallet.availableUnits} onSubmitted={reload} /> : null}
       {wallet.hasWalletActivity ? <MarketBuyerDisputesList /> : null}
