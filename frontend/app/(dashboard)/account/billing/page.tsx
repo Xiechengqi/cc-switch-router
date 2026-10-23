@@ -2,5 +2,5 @@ import { AccountLegacyRedirect } from "@/components/dashboard/account-legacy-red
 import { Suspense } from "react";
 
 export default function Page() {
-  return <Suspense fallback={null}><AccountLegacyRedirect target="/account/wallet/" billing /></Suspense>;
+  return <Suspense fallback={null}><AccountLegacyRedirect target="/account/wallet/" /></Suspense>;
 }

@@ -102,6 +102,11 @@ function allowedLegacyAssertion(relativePath, source, index, ruleName) {
   if ((relativePath === "src/market_c2c.rs" || relativePath.startsWith("src/market_c2c/")) && ruleName === "product payment deadline") {
     return true;
   }
+  if (relativePath === "src/schema.rs" && ruleName === "product payment deadline") {
+    const declaration = "fn migration_80_requires_explicit_publication_and_preserves_private_quote_evidence()";
+    const start = source.indexOf(declaration);
+    if (start >= 0 && index >= start && index < start + extractRustBlock(source, declaration).length) return true;
+  }
   if (
     relativePath === "src/market_recurring.rs"
     && ruleName === "product prepaid period end"
@@ -547,7 +552,7 @@ function main() {
         'usePaidOfferReadiness(open && pricing === "paid")',
         'paidReadiness.status === "error"',
         "hostPaidOfferPrerequisiteError(err, t)",
-        "DASHBOARD_ACCOUNT_EARNINGS_PATH",
+        "PROVIDER_INCOME_HREF",
       ],
     ],
     [
@@ -556,7 +561,7 @@ function main() {
         'usePaidOfferReadiness(open && pricing === "paid")',
         'paidReadiness.status === "error"',
         "hostPaidOfferPrerequisiteError(reason, t)",
-        "DASHBOARD_ACCOUNT_EARNINGS_PATH",
+        "PROVIDER_INCOME_HREF",
       ],
     ],
     [

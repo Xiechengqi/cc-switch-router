@@ -10,8 +10,8 @@ export const DASHBOARD_ACCOUNT_CONSUMER_USAGE_PATH = "/account/consumer-usage/";
 export const DASHBOARD_ACCOUNT_MARKET_READINESS_PATH = "/account/market-readiness/";
 export const DASHBOARD_ACCOUNT_BILLING_PATH = "/account/billing/";
 export const DASHBOARD_ACCOUNT_WALLET_PATH = "/account/wallet/";
-export const DASHBOARD_ACCOUNT_EARNINGS_PATH = "/account/earnings/";
 export const DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH = "/account/provider-settings/";
+export const PROVIDER_INCOME_HREF = `${DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH}#income`;
 export const DASHBOARD_ACCOUNT_MARKET_ACCESS_PATH = "/account/market-access/";
 export const DASHBOARD_ACCOUNT_PAYMENTS_PATH = "/account/payments/";
 export const DASHBOARD_ACCOUNT_SHARE_PATH = "/account/share/";
@@ -32,7 +32,6 @@ export type DashboardRoute =
   | typeof DASHBOARD_ACCOUNT_MARKET_READINESS_PATH
   | typeof DASHBOARD_ACCOUNT_BILLING_PATH
   | typeof DASHBOARD_ACCOUNT_WALLET_PATH
-  | typeof DASHBOARD_ACCOUNT_EARNINGS_PATH
   | typeof DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH
   | typeof DASHBOARD_ACCOUNT_MARKET_ACCESS_PATH
   | typeof DASHBOARD_ACCOUNT_PAYMENTS_PATH
@@ -48,7 +47,6 @@ export function normalizeDashboardPath(pathname: string): DashboardRoute | null 
   if (pathname.startsWith("/account/market-readiness")) return DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH;
   if (pathname.startsWith("/account/billing")) return DASHBOARD_ACCOUNT_WALLET_PATH;
   if (pathname.startsWith("/account/wallet")) return DASHBOARD_ACCOUNT_WALLET_PATH;
-  if (pathname.startsWith("/account/earnings")) return DASHBOARD_ACCOUNT_EARNINGS_PATH;
   if (pathname.startsWith("/account/provider-settings")) return DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH;
   if (pathname.startsWith("/account/market-access")) return DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH;
   if (pathname.startsWith("/account/payments")) return DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH;
@@ -56,7 +54,7 @@ export function normalizeDashboardPath(pathname: string): DashboardRoute | null 
   if (pathname.startsWith("/account/consumer-usage")) return DASHBOARD_ACCOUNT_CONSUMER_USAGE_PATH;
   if (pathname.startsWith("/account/api-keys")) return DASHBOARD_ACCOUNT_API_KEYS_PATH;
   if (pathname.startsWith("/account/notifications")) return DASHBOARD_ACCOUNT_NOTIFICATIONS_PATH;
-  if (pathname.startsWith("/account")) return DASHBOARD_ACCOUNT_PATH;
+  if (pathname === "/account" || pathname === DASHBOARD_ACCOUNT_PATH) return DASHBOARD_ACCOUNT_PATH;
   if (pathname.startsWith("/client-market")) return DASHBOARD_CLIENT_MARKET_PATH;
   if (pathname.startsWith("/providers")) return DASHBOARD_PROVIDERS_PATH;
   if (pathname.startsWith("/share-market")) return DASHBOARD_SHARE_MARKET_PATH;
@@ -125,7 +123,6 @@ const ACCOUNT_NAV_HREFS = [
   DASHBOARD_ACCOUNT_PROVIDER_USAGE_PATH,
   DASHBOARD_ACCOUNT_CONSUMER_USAGE_PATH,
   DASHBOARD_ACCOUNT_WALLET_PATH,
-  DASHBOARD_ACCOUNT_EARNINGS_PATH,
   DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH,
   DASHBOARD_ACCOUNT_SHARE_PATH,
   DASHBOARD_ACCOUNT_CLIENT_PATH,
@@ -148,7 +145,9 @@ export function readStoredAccountNavHref(): AccountNavHref | null {
   try {
     const raw = localStorage.getItem(ACCOUNT_NAV_STORAGE_KEY);
     if (raw === DASHBOARD_ACCOUNT_RENTALS_PATH) return DASHBOARD_ACCOUNT_CLIENT_PATH;
-    return raw ? accountNavHrefFromPathname(raw) : null;
+    const href = raw ? accountNavHrefFromPathname(raw) : null;
+    if (raw && !href) localStorage.removeItem(ACCOUNT_NAV_STORAGE_KEY);
+    return href;
   } catch {
     return null;
   }

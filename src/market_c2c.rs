@@ -177,9 +177,7 @@ struct Seller {
     enabled: bool,
     suspended: bool,
     display_name: String,
-    contact: String,
-    payment_method: String,
-    payment_details: String,
+    description: String,
     currency: String,
     price_bps: i64,
     min_minor: i64,
@@ -187,8 +185,8 @@ struct Seller {
     heartbeat_at: String,
 }
 fn seller_tx(conn: &Connection, id: &str) -> Result<Option<Seller>, AppError> {
-    conn.query_row("SELECT user_id,version,enabled,suspended,display_name,contact,payment_method,payment_details,currency,price_bps,min_minor,max_minor,heartbeat_at FROM market_c2c_sellers WHERE user_id=?1",params![id],|r|Ok(Seller {
-        user_id:r.get(0)?,version:r.get(1)?,enabled:r.get(2)?,suspended:r.get(3)?,display_name:r.get(4)?,contact:r.get(5)?,payment_method:r.get(6)?,payment_details:r.get(7)?,currency:r.get(8)?,price_bps:r.get(9)?,min_minor:r.get(10)?,max_minor:r.get(11)?,heartbeat_at:r.get(12)?
+    conn.query_row("SELECT user_id,version,enabled,suspended,display_name,description,currency,price_bps,min_minor,max_minor,heartbeat_at FROM market_c2c_sellers WHERE user_id=?1",params![id],|r|Ok(Seller {
+        user_id:r.get(0)?,version:r.get(1)?,enabled:r.get(2)?,suspended:r.get(3)?,display_name:r.get(4)?,description:r.get(5)?,currency:r.get(6)?,price_bps:r.get(7)?,min_minor:r.get(8)?,max_minor:r.get(9)?,heartbeat_at:r.get(10)?
     })).optional().map_err(db_error("read C2C seller"))
 }
 #[derive(Deserialize)]
@@ -196,10 +194,7 @@ fn seller_tx(conn: &Connection, id: &str) -> Result<Option<Seller>, AppError> {
 struct SellerInput {
     expected_version: i64,
     enabled: bool,
-    display_name: String,
-    contact: String,
-    payment_method: String,
-    payment_details: String,
+    description: String,
     currency: String,
     price_bps: i64,
     min_minor: i64,
@@ -226,10 +221,25 @@ fn save_seller_tx(
     {
         return Err(AppError::BadRequest("invalid C2C seller terms".into()));
     }
-    let name = text(&input.display_name, 60)?;
-    let contact = text(&input.contact, 300)?;
-    let method = text(&input.payment_method, 60)?;
-    let details = text(&input.payment_details, 1500)?;
+    if input
+        .description
+        .chars()
+        .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+    {
+        return Err(AppError::BadRequest("invalid C2C description".into()));
+    }
+    let description = text(
+        &input
+            .description
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" "),
+        300,
+    )?;
+    let name = prior
+        .as_ref()
+        .map(|s| s.display_name.clone())
+        .unwrap_or_else(|| format!("C2C-{}", &Uuid::new_v4().simple().to_string()[..12]));
     if input.enabled {
         let p = open_tx(conn)?;
         safe_tx(conn, user, user)?;
@@ -245,19 +255,19 @@ fn save_seller_tx(
             ));
         }
     }
-    conn.execute("INSERT INTO market_c2c_sellers(user_id,version,enabled,display_name,contact,payment_method,payment_details,currency,price_bps,min_minor,max_minor,heartbeat_at,created_at,updated_at)
-        VALUES(?1,1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11,?11)
-        ON CONFLICT(user_id) DO UPDATE SET version=version+1,enabled=excluded.enabled,display_name=excluded.display_name,contact=excluded.contact,
-         payment_method=excluded.payment_method,payment_details=excluded.payment_details,currency=excluded.currency,price_bps=excluded.price_bps,
+    conn.execute("INSERT INTO market_c2c_sellers(user_id,version,enabled,display_name,description,currency,price_bps,min_minor,max_minor,heartbeat_at,created_at,updated_at)
+        VALUES(?1,1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?9)
+        ON CONFLICT(user_id) DO UPDATE SET version=version+1,enabled=excluded.enabled,description=excluded.description,
+         currency=excluded.currency,price_bps=excluded.price_bps,
          min_minor=excluded.min_minor,max_minor=excluded.max_minor,heartbeat_at=excluded.heartbeat_at,updated_at=excluded.updated_at",
-        params![user,input.enabled,name,contact,method,details,input.currency,input.price_bps,input.min_minor,input.max_minor,time]).map_err(db_error("save C2C seller"))?;
+        params![user,input.enabled,name,description,input.currency,input.price_bps,input.min_minor,input.max_minor,time]).map_err(db_error("save C2C seller"))?;
     audit_tx(
         conn,
         user,
         "configure",
         "c2c_seller",
         user,
-        "seller_terms_v1",
+        "seller_description_v2",
         time,
     )?;
     crate::market_notifications::enqueue_user_notification_tx(
@@ -273,11 +283,43 @@ fn save_seller_tx(
     )?;
     seller_tx(conn, user)?.ok_or_else(|| AppError::Internal("C2C seller disappeared".into()))
 }
+// Stopping new orders must work even when admission, finance, email, identity
+// verification or publication validation would prevent starting new orders.
+fn pause_seller_tx(
+    conn: &Connection,
+    user: &str,
+    expected_version: i64,
+    time: &str,
+) -> Result<Seller, AppError> {
+    let prior =
+        seller_tx(conn, user)?.ok_or_else(|| AppError::NotFound("C2C seller not found".into()))?;
+    if prior.version != expected_version {
+        return Err(problem("C2C_STALE", "seller settings changed; reload"));
+    }
+    if prior.enabled {
+        conn.execute("UPDATE market_c2c_sellers SET enabled=0,version=version+1,updated_at=?2 WHERE user_id=?1 AND version=?3",
+            params![user,time,expected_version]).map_err(db_error("pause C2C seller"))?;
+        audit_tx(
+            conn,
+            user,
+            "pause",
+            "c2c_seller",
+            user,
+            "seller_paused",
+            time,
+        )?;
+    }
+    seller_tx(conn, user)?.ok_or_else(|| AppError::Internal("C2C seller disappeared".into()))
+}
 fn require_seller_tx(conn: &Connection, user: &str, time: &str) -> Result<Seller, AppError> {
     verified_tx(conn, user)?;
     let s = seller_tx(conn, user)?
         .ok_or_else(|| problem("C2C_SELLER_UNAVAILABLE", "seller is not available"))?;
-    if !s.enabled || s.suspended || at(&s.heartbeat_at)? + Duration::minutes(5) < at(time)? {
+    if !s.enabled
+        || s.suspended
+        || s.description.is_empty()
+        || at(&s.heartbeat_at)? + Duration::minutes(5) < at(time)?
+    {
         return Err(problem(
             "C2C_SELLER_UNAVAILABLE",
             "seller is offline or not accepting orders",
@@ -292,7 +334,7 @@ struct Offer {
     seller_id: String,
     version: i64,
     display_name: String,
-    payment_method: String,
+    description: String,
     currency: String,
     price_bps: i64,
     min_minor: i64,
@@ -353,7 +395,7 @@ fn offers_tx(
             seller_id: id,
             version: s.version,
             display_name: s.display_name,
-            payment_method: s.payment_method,
+            description: s.description,
             currency: s.currency,
             price_bps: s.price_bps,
             min_minor: min,
@@ -384,7 +426,7 @@ struct Quote {
     currency: String,
     fx_micros: i64,
     price_bps: i64,
-    payment_method: String,
+    description: String,
     expires_at: String,
 }
 #[derive(Deserialize)]
@@ -453,12 +495,12 @@ fn quote_tx(
         currency: s.currency.clone(),
         fx_micros: rate,
         price_bps: s.price_bps,
-        payment_method: s.payment_method.clone(),
+        description: s.description.clone(),
         expires_at: (at(time)? + Duration::minutes(5)).to_rfc3339(),
     };
-    conn.execute("INSERT INTO market_c2c_quotes(id,buyer_id,seller_id,seller_version,policy_version,credit_minor,pay_minor,currency,fx_micros,price_bps,seller_name,contact,payment_method,payment_details,payment_minutes,expires_at,created_at)
-        VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
-        params![q.id,buyer,q.seller_id,s.version,p.version,q.credit_minor,q.pay_minor,q.currency,rate,s.price_bps,s.display_name,s.contact,s.payment_method,s.payment_details,p.payment_minutes,q.expires_at,time]).map_err(db_error("create C2C preview"))?;
+    conn.execute("INSERT INTO market_c2c_quotes(id,buyer_id,seller_id,seller_version,policy_version,credit_minor,pay_minor,currency,fx_micros,price_bps,seller_name,description,contact,payment_method,payment_details,payment_minutes,expires_at,created_at)
+        VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'','','',?13,?14,?15)",
+        params![q.id,buyer,q.seller_id,s.version,p.version,q.credit_minor,q.pay_minor,q.currency,rate,s.price_bps,s.display_name,s.description,p.payment_minutes,q.expires_at,time]).map_err(db_error("create C2C preview"))?;
     Ok(q)
 }
 
@@ -487,16 +529,25 @@ struct Order {
     currency: String,
     fx_micros: i64,
     price_bps: i64,
-    contact: Option<String>,
+    description: Option<String>,
+    legacy_payment: Option<LegacyPayment>,
+}
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyPayment {
+    contact: String,
     payment_method: String,
-    payment_details: Option<String>,
+    payment_details: String,
 }
 fn order_tx(conn: &Connection, id: &str) -> Result<Order, AppError> {
     conn.query_row("SELECT o.id,o.quote_id,o.buyer_id,o.seller_id,o.amount_units,o.hold_id,o.status,o.version,o.payment_deadline,o.paid_at,o.released_at,o.late_payment_reported,o.late_payment_resolved,o.created_at,o.updated_at,
-       q.seller_name,q.pay_minor,q.currency,q.fx_micros,q.price_bps,q.contact,q.payment_method,q.payment_details
-       FROM market_c2c_orders o JOIN market_c2c_quotes q ON q.id=o.quote_id WHERE o.id=?1",params![id],|r|Ok(Order {
-        id:r.get(0)?,quote_id:r.get(1)?,buyer_id:r.get(2)?,seller_id:r.get(3)?,amount_units:r.get(4)?,hold_id:r.get(5)?,status:r.get(6)?,version:r.get(7)?,payment_deadline:r.get(8)?,paid_at:r.get(9)?,released_at:r.get(10)?,late_payment_reported:r.get(11)?,late_payment_resolved:r.get(12)?,created_at:r.get(13)?,updated_at:r.get(14)?,seller_name:r.get(15)?,pay_minor:r.get(16)?,currency:r.get(17)?,fx_micros:r.get(18)?,price_bps:r.get(19)?,contact:r.get(20)?,payment_method:r.get(21)?,payment_details:r.get(22)?
-    })).optional().map_err(db_error("read C2C order"))?.ok_or_else(||AppError::NotFound("C2C order not found".into()))
+       q.seller_name,q.pay_minor,q.currency,q.fx_micros,q.price_bps,q.contact,q.payment_method,q.payment_details,q.description
+       FROM market_c2c_orders o JOIN market_c2c_quotes q ON q.id=o.quote_id WHERE o.id=?1",params![id],|r| {
+        let description: String = r.get(23)?;
+        let legacy_payment = if description.is_empty() { Some(LegacyPayment { contact:r.get(20)?,payment_method:r.get(21)?,payment_details:r.get(22)? }) } else { None };
+        Ok(Order {
+        id:r.get(0)?,quote_id:r.get(1)?,buyer_id:r.get(2)?,seller_id:r.get(3)?,amount_units:r.get(4)?,hold_id:r.get(5)?,status:r.get(6)?,version:r.get(7)?,payment_deadline:r.get(8)?,paid_at:r.get(9)?,released_at:r.get(10)?,late_payment_reported:r.get(11)?,late_payment_resolved:r.get(12)?,created_at:r.get(13)?,updated_at:r.get(14)?,seller_name:r.get(15)?,pay_minor:r.get(16)?,currency:r.get(17)?,fx_micros:r.get(18)?,price_bps:r.get(19)?,description:(!description.is_empty()).then_some(description),legacy_payment
+    })}).optional().map_err(db_error("read C2C order"))?.ok_or_else(||AppError::NotFound("C2C order not found".into()))
 }
 fn owned_tx(conn: &Connection, id: &str, user: &str) -> Result<Order, AppError> {
     let o = order_tx(conn, id)?;

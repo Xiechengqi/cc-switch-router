@@ -28,10 +28,7 @@ fn terms() -> SellerInput {
     SellerInput {
         expected_version: 0,
         enabled: true,
-        display_name: "Ordinary seller".into(),
-        contact: "Contact privately".into(),
-        payment_method: "Bank transfer".into(),
-        payment_details: "Private account 123".into(),
+        description: "Bank transfer · contact seller@example.test".into(),
         currency: "USD".into(),
         price_bps: 10000,
         min_minor: 100,
@@ -41,6 +38,74 @@ fn terms() -> SellerInput {
 }
 fn offer(c: &Connection) {
     save_seller_tx(c, "seller", &terms(), AT).unwrap();
+}
+#[test]
+fn one_public_description_is_required_and_seller_identity_is_server_owned() {
+    let c = fixture();
+    let mut input = terms();
+    input.description = "  支持微信\n联系 @seller\t https://example.test  ".into();
+    let first = save_seller_tx(&c, "seller", &input, AT).unwrap();
+    assert_eq!(
+        first.description,
+        "支持微信 联系 @seller https://example.test"
+    );
+    assert!(first.display_name.starts_with("C2C-"));
+    assert!(!first.display_name.contains("seller"));
+    input.expected_version = first.version;
+    input.description = "New contact".into();
+    let second = save_seller_tx(&c, "seller", &input, AT).unwrap();
+    assert_eq!(first.display_name, second.display_name);
+    input.expected_version = second.version;
+    for value in [
+        "".to_string(),
+        " \n ".to_string(),
+        "字".repeat(301),
+        "bad\0data".to_string(),
+    ] {
+        input.description = value;
+        assert!(save_seller_tx(&c, "seller", &input, AT).is_err());
+    }
+    input.description = "字".repeat(300);
+    assert!(save_seller_tx(&c, "seller", &input, AT).is_ok());
+    let stale_shape = serde_json::json!({"expectedVersion":0,"enabled":true,"displayName":"name","contact":"private","paymentMethod":"bank","paymentDetails":"account","currency":"USD","priceBps":10000,"minMinor":100,"maxMinor":10000,"acknowledgeExternalPayment":true});
+    assert!(serde_json::from_value::<SellerInput>(stale_shape).is_err());
+}
+#[test]
+fn pausing_needs_only_ownership_and_version_and_never_changes_existing_reservations() {
+    let c = fixture();
+    offer(&c);
+    let o = order(&c, 1000);
+    let before = wallet_snapshot_tx(&c, "seller").unwrap();
+    c.execute(
+        "UPDATE market_c2c_sellers SET description='',suspended=1 WHERE user_id='seller'",
+        [],
+    )
+    .unwrap();
+    c.execute(
+        "UPDATE market_c2c_policy SET enabled=0,admission_minor=1000000",
+        [],
+    )
+    .unwrap();
+    c.execute(
+        "UPDATE users SET email_verified_at=NULL WHERE id='seller'",
+        [],
+    )
+    .unwrap();
+    assert!(pause_seller_tx(&c, "other", 1, AT).is_err());
+    assert!(pause_seller_tx(&c, "seller", 99, AT).is_err());
+    let paused = pause_seller_tx(&c, "seller", 1, AT).unwrap();
+    assert!(!paused.enabled);
+    assert_eq!(paused.version, 2);
+    assert_eq!(pause_seller_tx(&c, "seller", 2, AT).unwrap().version, 2);
+    let after = wallet_snapshot_tx(&c, "seller").unwrap();
+    assert_eq!(
+        (before.posted_units, before.held_units, before.version),
+        (after.posted_units, after.held_units, after.version)
+    );
+    assert_eq!(order_tx(&c, &o.id).unwrap().status, "awaiting_payment");
+    assert!(offers_tx(&c, "buyer", "", AT).unwrap().0.is_empty());
+    cancel_tx(&c, &o, "buyer", false, AT).unwrap();
+    crate::market_wallet::reconcile_wallet_tx(&c, "seller").unwrap();
 }
 fn preview(c: &Connection, buyer: &str, minor: i64) -> Quote {
     quote_tx(
@@ -272,7 +337,7 @@ fn immutable_quote_freezes_terms_and_stale_seller_preview_cannot_commit() {
     );
     let mut s = terms();
     s.expected_version = 1;
-    s.contact = "New contact".into();
+    s.description = "New contact".into();
     save_seller_tx(&c, "seller", &s, AT).unwrap();
     assert_eq!(
         create_tx(&c, "buyer", &input(&q), "stale-key", "127.0.0.1", AT)
@@ -281,11 +346,12 @@ fn immutable_quote_freezes_terms_and_stale_seller_preview_cannot_commit() {
         Some("C2C_STALE")
     );
     let o = order(&c, 1000);
-    assert_eq!(o.contact.as_deref(), Some("New contact"));
+    assert_eq!(o.description.as_deref(), Some("New contact"));
+    assert!(o.legacy_payment.is_none());
     s.expected_version = 2;
-    s.contact = "Newest".into();
+    s.description = "Newest".into();
     save_seller_tx(&c, "seller", &s, AT).unwrap();
-    assert_eq!(order_tx(&c, &o.id).unwrap().contact, o.contact);
+    assert_eq!(order_tx(&c, &o.id).unwrap().description, o.description);
 }
 #[test]
 fn cny_quotes_need_fresh_rate_and_integer_rounding_is_exact() {
@@ -594,24 +660,59 @@ fn seller_release_codes_are_bound_persist_failed_attempts_and_are_idempotent() {
     );
 }
 #[test]
-fn discovery_and_history_do_not_expose_contact_or_other_users_orders() {
+fn discovery_exposes_only_the_published_description_and_history_stays_owned() {
     let c = fixture();
     offer(&c);
     let public = serde_json::to_string(&offers_tx(&c, "buyer", "", AT).unwrap().0).unwrap();
-    assert!(!public.contains("Private account"));
-    assert!(!public.contains("Contact privately"));
+    assert!(public.contains(&terms().description));
+    assert!(!public.contains("paymentDetails"));
     let o = order(&c, 1000);
     assert!(owned_tx(&c, &o.id, "other").is_err());
     let list = http::test_list(&c, Some("buyer"), "", "").unwrap();
     assert_eq!(list["items"].as_array().unwrap().len(), 1);
-    assert!(list["items"][0]["contact"].is_null());
-    assert!(list["items"][0]["paymentDetails"].is_null());
+    assert_eq!(list["items"][0]["description"], terms().description);
+    assert!(list["items"][0]["legacyPayment"].is_null());
     assert!(
         http::test_list(&c, Some("other"), "", "").unwrap()["items"]
             .as_array()
             .unwrap()
             .is_empty()
     );
+}
+#[test]
+fn historical_private_quote_stays_party_only_and_can_finish_after_seller_changes() {
+    let c = fixture();
+    offer(&c);
+    let q = preview(&c, "buyer", 1000);
+    // Historical immutable quote shape: the migration leaves its private
+    // evidence intact and does not make it the seller's public description.
+    c.execute("INSERT INTO market_c2c_quotes(id,buyer_id,seller_id,seller_version,policy_version,credit_minor,pay_minor,currency,fx_micros,price_bps,seller_name,contact,payment_method,payment_details,payment_minutes,expires_at,created_at)
+        SELECT 'historical-private',buyer_id,seller_id,seller_version,policy_version,credit_minor,pay_minor,currency,fx_micros,price_bps,'Historical seller','PRIVATE CONTACT','Bank','PRIVATE ACCOUNT',payment_minutes,expires_at,created_at
+        FROM market_c2c_quotes WHERE id=?1",params![q.id]).unwrap();
+    let mut input = input(&q);
+    input.quote_id = "historical-private".into();
+    let o = create_tx(&c, "buyer", &input, "historical", "127.0.0.1", AT).unwrap();
+    pause_seller_tx(&c, "seller", 1, AT).unwrap();
+    assert!(owned_tx(&c, &o.id, "other").is_err());
+    for participant in ["buyer", "seller"] {
+        let detail = owned_tx(&c, &o.id, participant).unwrap();
+        assert!(detail.description.is_none());
+        assert_eq!(
+            detail.legacy_payment.unwrap().payment_details,
+            "PRIVATE ACCOUNT"
+        );
+    }
+    for viewer in [Some("buyer"), Some("seller"), None] {
+        let list = http::test_list(&c, viewer, "", "").unwrap();
+        assert!(list["items"][0]["description"].is_null());
+        assert!(list["items"][0]["legacyPayment"].is_null());
+        assert!(!list.to_string().contains("PRIVATE"));
+    }
+    let paid = paid(&c, &o);
+    release_tx(&c, &paid, "seller", AT).unwrap();
+    assert_eq!(order_tx(&c, &o.id).unwrap().status, "released");
+    crate::market_wallet::reconcile_wallet_tx(&c, "seller").unwrap();
+    crate::market_wallet::reconcile_wallet_tx(&c, "buyer").unwrap();
 }
 #[test]
 fn notification_write_failure_rolls_back_freeze_and_order_together() {

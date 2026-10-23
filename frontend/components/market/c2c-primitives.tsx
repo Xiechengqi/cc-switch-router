@@ -10,7 +10,7 @@ import { Check, CircleAlert, Loader2, X } from "lucide-react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import type { C2CStatus } from "@/lib/market-c2c";
 
-export const C2C_INPUT = "min-h-11 w-full min-w-0 rounded-md border border-input bg-background px-3 py-2 text-sm outline-2 outline-transparent focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-50 aria-invalid:border-destructive";
+export const C2C_INPUT = "min-h-11 w-full min-w-0 rounded-md border border-input bg-background px-3 py-2 text-sm outline-2 outline-transparent hover:bg-muted/30 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-50 aria-invalid:border-destructive";
 export function C2CAction({ phase = "default", previewState, secondary, children, className = "", ...props }: React.ButtonHTMLAttributes<HTMLButtonElement> & {
   phase?: "default" | "loading" | "error" | "success"; previewState?: "hover" | "focus" | "active"; secondary?: boolean;
 }) {

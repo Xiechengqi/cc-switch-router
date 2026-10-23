@@ -6,6 +6,7 @@
 import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { C2CAction, C2CCheck, C2CDialog, C2CError, C2C_INPUT } from "@/components/market/c2c-primitives";
+import { C2CDescription } from "@/components/market/c2c-description";
 import { formatMinorUsd } from "@/lib/market-wallet-money";
 import { notifyMarketBalanceChanged } from "@/lib/market-balance-events";
 import { C2C_PENDING_PREFIX, c2cDefinitelyRejected, c2cErrorKey, c2cNow, c2cPayLabel, createC2C, getC2COffers, getC2COrders, getC2CPolicy, matchC2CPendingOrder, parseC2CMinor, quoteC2C, readC2CPending, writeC2CPending, type C2COffer, type C2COrder, type C2CPending, type C2CPolicyView, type C2CQuote } from "@/lib/market-c2c";
@@ -62,12 +63,14 @@ export function C2CBuyPanel({ actor, onOrder }: { actor: string; onOrder: (order
         {offers.length ? <div role="group" aria-label={t("c2c.buy")} className="grid max-h-64 min-w-0 gap-2 overflow-y-auto overscroll-contain p-1">
           {offers.map(s => <button key={s.sellerId} type="button" aria-pressed={sellerId === s.sellerId} disabled={busy} onClick={() => { setSellerId(s.sellerId); setAmount(""); setQuote(null); setAck(false); }}
             className={`grid min-h-11 min-w-0 gap-1 rounded-md p-3 text-left focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring active:translate-y-px disabled:opacity-50 motion-reduce:transform-none ${sellerId === s.sellerId ? "bg-primary/10 ring-1 ring-primary" : "bg-muted/50 hover:bg-muted"}`}>
-            <span className="min-w-0 break-words font-medium">{s.displayName}</span><span className="break-words text-xs text-muted-foreground">{s.paymentMethod} · {t("c2c.rate", { rate: s.priceBps / 100, currency: s.currency })}</span>
+            <span className="flex min-w-0 flex-wrap items-center justify-between gap-2"><span className="min-w-0 break-words text-sm font-medium">{s.displayName}</span><span className="text-xs font-semibold tabular-nums">{t("c2c.rate", { rate: s.priceBps / 100, currency: s.currency })}</span></span>
+            <span className="line-clamp-2 break-words text-sm text-muted-foreground [overflow-wrap:anywhere]">{s.description}</span>
             <span className="flex min-w-0 flex-wrap justify-between gap-1 text-xs tabular-nums"><span>{t("c2c.range", { min: formatMinorUsd(s.minMinor), max: formatMinorUsd(s.maxMinor) })}</span><span>{t("c2c.completed", { count: s.completedOrders })}</span></span>
           </button>)}
         </div> : <p className="text-sm text-muted-foreground">{t("c2c.empty")}</p>}
         {next ? <C2CAction type="button" secondary disabled={busy} onClick={() => void run(() => load(next))}>{t("common.next")}</C2CAction> : null}
         {seller ? <form className="grid gap-3" onSubmit={e => { e.preventDefault(); if (!valid || !minor) return; void run(async () => { const q = await quoteC2C(seller.sellerId, minor); if (mounted.current) { setQuote(q); setNow(c2cNow()); setAck(false); } }); }}>
+          <C2CDescription value={seller.description} />
           <label className="grid min-w-0 gap-1 text-sm">{t("c2c.amount")}<input className={C2C_INPUT} inputMode="decimal" autoComplete="off" value={amount} onChange={e => setAmount(e.target.value)} placeholder={`${seller.minMinor / 100}–${seller.maxMinor / 100}`} disabled={busy} /></label>
           <C2CAction type="submit" disabled={!valid || busy} phase={busy ? "loading" : "default"}>{t("c2c.preview")}</C2CAction>
         </form> : null}
@@ -76,7 +79,8 @@ export function C2CBuyPanel({ actor, onOrder }: { actor: string; onOrder: (order
     </>}
     <C2CDialog open={!!quote && !pending} title={t("c2c.preview")} busy={busy} onClose={() => setQuote(null)}>
       {quote ? <>
-        <p className="break-words text-sm">{quote.sellerName} · {quote.paymentMethod}</p>
+        <p className="break-words text-sm">{quote.sellerName}</p>
+        <C2CDescription value={quote.description} links={false} />
         <dl className="grid grid-cols-[minmax(0,1fr)_auto] gap-3 text-sm"><dt>{t("c2c.credit")}</dt><dd className="font-semibold tabular-nums">{formatMinorUsd(quote.creditMinor)}</dd><dt>{t("c2c.pay")}</dt><dd className="font-semibold tabular-nums">{c2cPayLabel(quote.payMinor, quote.currency)}</dd></dl>
         <p className="text-xs text-muted-foreground">{t("c2c.previewExpiry", { time: new Date(quote.expiresAt).toLocaleTimeString(locale) })}</p>
         <C2CCheck checked={ack} disabled={busy} onChange={e => setAck(e.target.checked)}>{t("c2c.ack")}</C2CCheck><p className="text-xs text-muted-foreground">{t("c2c.fee")}</p>

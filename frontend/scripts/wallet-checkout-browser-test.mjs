@@ -279,7 +279,14 @@ try {
     }) });
   });
   await page.context().route("**/v1/market-provider-finance/me", async (route) => {
-    await route.fulfill({ contentType: "application/json", body: JSON.stringify({ isProvider: false }) });
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify({ isProvider: false, hasFinanceActivity: false, canPublishPaidOffers: false, automaticCredit: true,
+      summary: { grossEarnedUnits: "0", commissionUnits: "0", netEarnedUnits: "0", pendingUnits: "0", readyUnits: "0", restrictedUnits: "0", creditedUnits: "0" } }) });
+  });
+  await page.context().route("**/v1/market-provider-finance/earnings", async (route) => {
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify({ items: [], nextCursor: null }) });
+  });
+  await page.context().route("**/v1/market-provider-finance/holds", async (route) => {
+    await route.fulfill({ contentType: "application/json", body: "[]" });
   });
   await page.context().route("**/v1/market-access/dashboard", async (route) => {
     await route.fulfill({ contentType: "application/json", body: JSON.stringify({ policies: [], counterparties: [], accessRequests: [] }) });
@@ -383,7 +390,7 @@ try {
   await page.getByRole("alert").filter({ hasText: /Review the new total/ }).waitFor();
   assert.equal(topupCreates, 2);
 
-  for (const [legacy, expected] of [["payments/", "provider-settings/"], ["market-access/", "provider-settings/"], ["billing/?tab=receivables", "earnings/"]]) {
+  for (const [legacy, expected] of [["payments/", "provider-settings/"], ["market-access/", "provider-settings/"], ["billing/?tab=receivables", "wallet/"]]) {
     await page.goto(`${baseUrl}/account/${legacy}`);
     await page.waitForURL(`${baseUrl}/account/${expected}`);
   }
@@ -425,7 +432,7 @@ try {
   await accessForm.getByRole("button", { name: "Add", exact: true }).click();
   await page.waitForFunction(() => document.querySelector('input[type="email"]')?.value === "");
   assert.equal(accessUpdates, 1);
-  assert.equal(await page.locator('a[href="/account/earnings/"]').count(), 0, "ordinary buyers do not get a Provider income tab");
+  assert.equal(await page.locator('a[href="/account/earnings/"]').count(), 0, "Provider income has no standalone navigation entry");
 
   // Model the worker's authoritative credit, never a browser-created transfer.
   let matured = false;
@@ -459,12 +466,12 @@ try {
     await route.fulfill({ contentType: "application/json", body: JSON.stringify({ items: [earning()], nextCursor: null }) });
   });
   await page.reload();
-  await page.getByRole("link", { name: "Provider earnings", exact: true }).click();
+  assert.equal(await page.getByRole("link", { name: "Provider earnings", exact: true }).count(), 0);
   const earningsPanel = page.getByRole("region", { name: "Provider earnings", exact: true });
-  await earningsPanel.getByRole("columnheader", { name: "Net earnings", exact: true }).waitFor();
   const earningSummary = earningsPanel.getByText("Revenue & service fees", { exact: true });
   assert.equal(await earningSummary.locator("..").getAttribute("open"), null, "detailed accounting starts collapsed");
   await earningSummary.click();
+  await earningsPanel.getByRole("columnheader", { name: "Net earnings", exact: true }).waitFor();
   const earningTotals = earningsPanel.locator("dl").filter({ hasText: "Fulfilled revenue (net of refunds)" });
   await earningTotals.getByText("$100.00", { exact: true }).waitFor();
   await earningTotals.getByText("$10.00", { exact: true }).waitFor();
@@ -476,8 +483,7 @@ try {
   await incomeRow.getByText("Pending", { exact: true }).waitFor();
   assert.equal(await earningsPanel.getByRole("button", { name: /withdraw|move to balance/i }).count(), 0);
   await earningsPanel.getByRole("link", { name: "View balance", exact: true }).waitFor();
-  assert.equal(await earningsPanel.locator('a[href="/account/wallet/?c2cSell=1#c2c-orders"]').count(), 1);
-  assert.equal(await earningsPanel.locator('a[href="/account/wallet/#wallet-transfer"]').count(), 1);
+  assert.equal(await earningsPanel.getByRole("link").count(), 1, "wallet is the sole income shortcut");
   for (const width of [320, 375, 414, 768]) {
     await page.setViewportSize({ width, height: 900 });
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, "Provider income page overflows at " + width);
@@ -489,6 +495,7 @@ try {
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await incomeRow.getByText("Credited to balance", { exact: true }).waitFor();
   await page.reload();
+  await earningSummary.click();
   await incomeRow.getByText("Credited to balance", { exact: true }).waitFor();
   assert.equal(retiredWrites, 0, "viewing earnings never invokes retired payout or manual-credit endpoints");
 

@@ -4,5 +4,5 @@
 import { Suspense } from "react";
 import { AccountLegacyRedirect } from "@/components/dashboard/account-legacy-redirect";
 export function AccountBillingGate() {
-  return <Suspense fallback={null}><AccountLegacyRedirect target="/account/wallet/" billing /></Suspense>;
+  return <Suspense fallback={null}><AccountLegacyRedirect target="/account/wallet/" /></Suspense>;
 }

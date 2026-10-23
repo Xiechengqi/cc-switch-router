@@ -8,7 +8,7 @@ import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getAccountPaymentProfile, getMarketBillingDashboard } from "@/lib/api";
 import {
-  DASHBOARD_ACCOUNT_EARNINGS_PATH,
+  PROVIDER_INCOME_HREF,
   DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH,
 } from "@/lib/dashboard-nav";
 import { MARKET_CURRENCY } from "@/lib/market-money";
@@ -182,7 +182,7 @@ export function PaidOfferReadinessNotice({
               </Link>
             ) : null}
             {!readiness.settlementReady ? (
-              <Link className="whitespace-nowrap font-medium underline underline-offset-2" href={DASHBOARD_ACCOUNT_EARNINGS_PATH}>
+              <Link className="whitespace-nowrap font-medium underline underline-offset-2" href={PROVIDER_INCOME_HREF}>
                 {t("shareMarket.paidReadiness.goSettlement")}
               </Link>
             ) : null}

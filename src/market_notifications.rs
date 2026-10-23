@@ -679,7 +679,7 @@ fn render(item: &Claimed, dashboard: &str) -> (String, String) {
             .unwrap_or("—");
         let subject = format!("{subject_zh} / {subject_en}");
         let body = format!(
-            "{subject_zh}：{}.{:02}%；生效时间：{effective}。仅适用于新的计费周期，已承诺周期不变；收益自动到账不再扣费。\n{subject_en}: {}.{:02}%. Effective: {effective}. Applies to new service periods only; committed periods stay unchanged. Automatic income credit has no additional service fee.\n\n{}/account/earnings/",
+            "{subject_zh}：{}.{:02}%；生效时间：{effective}。仅适用于新的计费周期，已承诺周期不变；收益自动到账不再扣费。\n{subject_en}: {}.{:02}%. Effective: {effective}. Applies to new service periods only; committed periods stay unchanged. Automatic income credit has no additional service fee.\n\n{}/account/provider-settings/#income",
             rate / 100,
             rate % 100,
             rate / 100,
@@ -1202,8 +1202,8 @@ mod tests {
             1
         );
         assert!(!text.contains("Withdrawals"));
-        assert!(text.ends_with("https://router.example/account/earnings/"));
-        assert!(html.contains("account/earnings/"));
+        assert!(text.ends_with("https://router.example/account/provider-settings/#income"));
+        assert!(html.contains("account/provider-settings/#income"));
         assert!(!text.contains("account/wallet/"));
     }
 

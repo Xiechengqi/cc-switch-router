@@ -275,6 +275,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         79,
         include_str!("../schema/0079_market_automatic_earnings.sql"),
     ),
+    (
+        80,
+        include_str!("../schema/0080_market_c2c_description.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -786,6 +790,98 @@ mod tests {
 
     fn memory_connection() -> Connection {
         Connection::open_in_memory().expect("open test database")
+    }
+
+    #[test]
+    fn migration_80_requires_explicit_publication_and_preserves_private_quote_evidence() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 79);
+        let at = "2026-10-23T12:00:00Z";
+        for user in ["seller", "buyer"] {
+            conn.execute("INSERT INTO users(id,email_normalized,status,email_verified_at,created_at,last_login_at)
+                VALUES(?1,?2,'active',?3,?3,?3)",params![user,format!("{user}@example.test"),at]).unwrap();
+        }
+        crate::market_wallet::credit_verified_topup_tx(
+            &conn,
+            "seller",
+            "old-topup",
+            20000,
+            "receipt",
+            at,
+        )
+        .unwrap();
+        conn.execute("INSERT INTO market_c2c_sellers(user_id,version,enabled,display_name,contact,payment_method,payment_details,currency,price_bps,min_minor,max_minor,heartbeat_at,created_at,updated_at)
+            VALUES('seller',4,1,'Old name','PRIVATE CONTACT','Bank','PRIVATE ACCOUNT','USD',10000,100,10000,?1,?1,?1)",params![at]).unwrap();
+        conn.execute("INSERT INTO market_c2c_quotes(id,buyer_id,seller_id,seller_version,policy_version,credit_minor,pay_minor,currency,fx_micros,price_bps,seller_name,contact,payment_method,payment_details,payment_minutes,expires_at,created_at)
+            VALUES('old-quote','buyer','seller',4,1,1000,1000,'USD',1000000,10000,'Old name','PRIVATE CONTACT','Bank','PRIVATE ACCOUNT',30,?1,?1)",params![at]).unwrap();
+        let amount = crate::market_wallet::units_from_minor(1000).unwrap();
+        let hold = crate::market_wallet::reserve_wallet_tx(
+            &conn,
+            "seller",
+            "c2c_order",
+            "old-order",
+            "c2c",
+            amount,
+            None,
+            at,
+        )
+        .unwrap();
+        conn.execute("INSERT INTO market_c2c_orders(id,quote_id,buyer_id,seller_id,idempotency_key,amount_units,hold_id,status,terms_version,payment_deadline,created_ip,created_at,updated_at)
+            VALUES('old-order','old-quote','buyer','seller','old-key',?1,?2,'awaiting_payment',1,?3,'127.0.0.1',?3,?3)",params![amount,hold,at]).unwrap();
+        let before = crate::market_wallet::wallet_snapshot_tx(&conn, "seller").unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        let after = crate::market_wallet::wallet_snapshot_tx(&conn, "seller").unwrap();
+        assert_eq!(
+            (before.posted_units, before.held_units, before.version),
+            (after.posted_units, after.held_units, after.version)
+        );
+        let (enabled,version,name,description):(bool,i64,String,String)=conn.query_row("SELECT enabled,version,display_name,description FROM market_c2c_sellers WHERE user_id='seller'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        assert!(!enabled);
+        assert_eq!(version, 5);
+        assert!(name.starts_with("C2C-"));
+        assert_eq!(description, "");
+        for column in ["contact", "payment_method", "payment_details"] {
+            let present: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('market_c2c_sellers') WHERE name = ?1",
+                    params![column],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(present, 0, "retired seller field remains: {column}");
+        }
+        let frozen:(String,String,String,String,String)=conn.query_row("SELECT q.seller_name,q.contact,q.payment_details,q.description,o.status FROM market_c2c_quotes q JOIN market_c2c_orders o ON o.quote_id=q.id",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).unwrap();
+        assert_eq!(
+            frozen,
+            (
+                "Old name".into(),
+                "PRIVATE CONTACT".into(),
+                "PRIVATE ACCOUNT".into(),
+                "".into(),
+                "awaiting_payment".into()
+            )
+        );
+        assert!(
+            conn.execute(
+                "UPDATE market_c2c_quotes SET description='rewrite' WHERE id='old-quote'",
+                []
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute("DELETE FROM market_c2c_quotes WHERE id='old-quote'", [])
+                .is_err()
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
+        crate::market_wallet::reconcile_wallet_tx(&conn, "seller").unwrap();
     }
 
     #[test]

@@ -7,6 +7,7 @@ import * as React from "react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { C2CEvents } from "@/components/dashboard/c2c-orders-panel";
+import { C2CDescription } from "@/components/market/c2c-description";
 import { C2CAction, C2CCheck, C2CDialog, C2CError, C2CStatusLabel, C2C_INPUT } from "@/components/market/c2c-primitives";
 import { c2cErrorKey, c2cPayLabel, getAdminC2COrder, getAdminC2CPolicy, getAdminC2CSellers, getC2CEvents, getC2COrders, parseC2CMinor, resolveC2C, saveAdminC2CPolicy, suspendC2CSeller, type C2CAdminSeller, type C2COrder, type C2CPolicy } from "@/lib/market-c2c";
 import { formatWalletUnits } from "@/lib/market-wallet-money";
@@ -84,7 +85,8 @@ function C2CResolutionDialog({ id, actor, canManage, onClose, onResolved }: { id
     <C2CError>{error}</C2CError>
     {o ? <>
       <div className="flex flex-wrap items-center justify-between gap-2"><span className="text-xl font-semibold tabular-nums">{formatWalletUnits(o.amountUnits)}</span><C2CStatusLabel status={o.status} /></div><p className="break-all font-mono text-xs text-muted-foreground">{o.id}</p>
-      <p className="text-sm">{o.sellerName} · {c2cPayLabel(o.payMinor, o.currency)}</p><p className="whitespace-pre-wrap break-words text-sm [overflow-wrap:anywhere]">{o.contact}<br />{o.paymentDetails}</p>
+      <p className="text-sm">{o.sellerName} · {c2cPayLabel(o.payMinor, o.currency)}</p>
+      {o.description ? <C2CDescription value={o.description} links={false} /> : o.legacyPayment ? <C2CDescription value={[o.legacyPayment.paymentMethod, o.legacyPayment.contact, o.legacyPayment.paymentDetails].join("\n")} links={false} /> : null}
       {!detail?.evidenceValid ? <C2CError>{t("c2c.evidenceInvalid")}</C2CError> : null}
       <C2CEvents items={detail?.events.items ?? []} />
       {detail?.events.next ? <C2CAction type="button" secondary disabled={busy} onClick={() => {

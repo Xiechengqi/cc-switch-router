@@ -66,6 +66,7 @@ pub fn router() -> Router<ServerState> {
         .route("/v1/market-wallet/c2c/policy", get(policy))
         .route("/v1/market-wallet/c2c/seller", get(seller).put(save_seller))
         .route("/v1/market-wallet/c2c/seller/heartbeat", post(heartbeat))
+        .route("/v1/market-wallet/c2c/seller/pause", post(pause_seller))
         .route("/v1/market-wallet/c2c/sellers", get(offers))
         .route("/v1/market-wallet/c2c/quotes", post(quote))
         .route("/v1/market-wallet/c2c/orders", get(orders).post(create))
@@ -145,6 +146,29 @@ async fn heartbeat(
         Ok(())
     }).await?;
     Ok(reply(serde_json::json!({"ok":true})))
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PauseSeller {
+    expected_version: i64,
+}
+async fn pause_seller(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<PauseSeller>,
+) -> Reply<Seller> {
+    let u = session(&state, &headers).await?;
+    Ok(reply(
+        write(&state, |conn| {
+            pause_seller_tx(
+                conn,
+                &u.user_id,
+                input.expected_version,
+                &crate::market_wallet::now(),
+            )
+        })
+        .await?,
+    ))
 }
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -238,8 +262,7 @@ fn list_tx(conn: &Connection, user: Option<&str>, p: &Page) -> Result<serde_json
         .iter()
         .map(|id| {
             let mut o = order_tx(conn, id)?;
-            o.contact = None;
-            o.payment_details = None;
+            o.legacy_payment = None;
             Ok(o)
         })
         .collect::<Result<Vec<_>, AppError>>()?;

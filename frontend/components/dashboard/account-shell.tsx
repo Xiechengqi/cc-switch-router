@@ -2,17 +2,15 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { Activity, BarChart3, Bell, HandCoins, KeyRound, Receipt, Share2, ShieldCheck, WalletCards } from "lucide-react";
+import { Activity, BarChart3, Bell, KeyRound, Receipt, Share2, ShieldCheck, WalletCards } from "lucide-react";
 import * as React from "react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getMarketAccessInboxSummary } from "@/lib/api";
-import { getMarketProviderFinance } from "@/lib/market-wallet-api";
 import {
   accountNavHrefFromPathname,
   DASHBOARD_ACCOUNT_API_KEYS_PATH,
   DASHBOARD_ACCOUNT_CLIENT_PATH,
-  DASHBOARD_ACCOUNT_EARNINGS_PATH,
   DASHBOARD_ACCOUNT_WALLET_PATH,
   DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH,
   DASHBOARD_ACCOUNT_CONSUMER_USAGE_PATH,
@@ -39,7 +37,6 @@ const NAV_ITEMS: {
     | "account.nav.notifications"
     | "account.nav.providerUsage"
     | "account.nav.consumerUsage"
-    | "account.nav.earnings"
     | "account.nav.providerSettings"
     | "account.nav.wallet"
     | "account.nav.share"
@@ -86,11 +83,6 @@ const NAV_ITEMS: {
     match: (pathname: string) => pathname.startsWith("/account/wallet"),
   },
   {
-    id: "earnings", href: DASHBOARD_ACCOUNT_EARNINGS_PATH,
-    groupLabelKey: "account.nav.group.funds", labelKey: "account.nav.earnings", icon: HandCoins,
-    match: (pathname: string) => pathname.startsWith("/account/earnings"),
-  },
-  {
     id: "share",
     href: DASHBOARD_ACCOUNT_SHARE_PATH,
     groupLabelKey: "account.nav.group.market",
@@ -124,24 +116,9 @@ export function AccountShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname() || DASHBOARD_ACCOUNT_API_KEYS_PATH;
   const router = useRouter();
   const [pendingAccessRequests, setPendingAccessRequests] = React.useState(0);
-  const [hasEarnings, setHasEarnings] = React.useState(false);
   const authed = !!session?.authenticated;
   const actor = session?.user?.id || session?.user?.email || "anonymous";
   const activeItem = NAV_ITEMS.find((item) => item.match(pathname));
-  const visibleNavItems = NAV_ITEMS.filter((item) => item.id !== "earnings" || hasEarnings || pathname.startsWith("/account/earnings"));
-
-  React.useEffect(() => {
-    if (!authed) {
-      setHasEarnings(false);
-      return;
-    }
-    let active = true;
-    setHasEarnings(false);
-    void getMarketProviderFinance().then((finance) => {
-      if (active) setHasEarnings(finance.isProvider || finance.hasFinanceActivity);
-    }).catch(() => { if (active) setHasEarnings(false); });
-    return () => { active = false; };
-  }, [actor, authed, pathname]);
 
   React.useEffect(() => {
     if (isAccountIndexPath(pathname)) {
@@ -176,12 +153,12 @@ export function AccountShell({ children }: { children: React.ReactNode }) {
         className="min-w-0 md:sticky md:top-4 md:self-start"
       >
         <div className="flex gap-1 overflow-x-auto rounded-lg bg-slate-100/90 p-1 ring-1 ring-inset ring-slate-200/80 md:grid md:grid-cols-1 md:overflow-visible">
-          {visibleNavItems.map((item, index) => {
+          {NAV_ITEMS.map((item, index) => {
             const active = item.match(pathname);
             const Icon = item.icon;
             return (
               <React.Fragment key={item.id}>
-                {index === 0 || visibleNavItems[index - 1].groupLabelKey !== item.groupLabelKey ? (
+                {index === 0 || NAV_ITEMS[index - 1].groupLabelKey !== item.groupLabelKey ? (
                   <div className="hidden px-3 pb-1 pt-3 text-xs font-semibold text-slate-500 first:pt-1 md:block">
                     {t(item.groupLabelKey)}
                   </div>

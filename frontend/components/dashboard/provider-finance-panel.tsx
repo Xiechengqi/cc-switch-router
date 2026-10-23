@@ -21,8 +21,8 @@ function holdReasonKey(kind: string): MessageKey {
   return (key in messages.en ? key : "marketProviderFinance.holdReason.other") as MessageKey;
 }
 
-export function ProviderFinancePanel({ walletMode }: { walletMode: "disabled" | "shadow" | "enabled" }) {
-  const { session } = useAuth();
+export function ProviderFinancePanel() {
+  const { session, loading: authLoading } = useAuth();
   const { locale, t } = useLocaleText();
   const [finance, setFinance] = React.useState<MarketProviderFinance | null>(null);
   const [holds, setHolds] = React.useState<MarketEarningHold[]>([]);
@@ -31,9 +31,10 @@ export function ProviderFinancePanel({ walletMode }: { walletMode: "disabled" | 
   const [loadedActor, setLoadedActor] = React.useState<string>();
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
+  const [retry, setRetry] = React.useState(0);
   const generation = React.useRef(0);
   const inFlight = React.useRef(false);
-  const actor = session?.user?.id;
+  const actor = session?.authenticated ? session.user?.id : undefined;
 
   React.useEffect(() => {
     let active = true;
@@ -64,7 +65,7 @@ export function ProviderFinancePanel({ walletMode }: { walletMode: "disabled" | 
     document.addEventListener("visibilitychange", onVisible);
     onVisible();
     return () => { active = false; generation.current++; inFlight.current = false; window.clearInterval(timer); off(); window.removeEventListener("focus", onVisible); document.removeEventListener("visibilitychange", onVisible); };
-  }, [actor]);
+  }, [actor, retry]);
 
   const more = async () => {
     if (loadedActor !== actor || !history.nextCursor || busy || inFlight.current) return;
@@ -85,38 +86,28 @@ export function ProviderFinancePanel({ walletMode }: { walletMode: "disabled" | 
   };
   const linkClass = "inline-flex min-h-11 items-center whitespace-nowrap rounded-lg px-3 text-sm font-medium text-primary hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring";
 
-  return <section className="mx-auto grid max-w-5xl gap-5 px-4 pb-8 sm:px-6" aria-label={t("marketProviderFinance.title")}>
-    <header className="grid gap-2">
-      <h2 className="text-lg font-semibold">{t("marketProviderFinance.title")}</h2>
-      <p className="text-sm text-muted-foreground">{t("earningSettlement.help")}</p>
-      {walletMode !== "enabled" ? <p className="text-sm text-muted-foreground">{t("earningSettlement.notOpen")}</p> : null}
-      <div className="flex flex-wrap gap-2">
+  return <section id="income" className="grid min-w-0 scroll-mt-6 gap-4 rounded-xl border border-border bg-card p-4 sm:p-6" aria-label={t("marketProviderFinance.title")}>
+    <header className="flex min-w-0 flex-wrap items-center justify-between gap-3">
+      <div className="grid min-w-0 gap-1"><h2 className="text-lg font-semibold">{t("marketProviderFinance.title")}</h2>
+      <p className="text-sm text-muted-foreground">{t("earningSettlement.help")}</p></div>
+      <div className="flex flex-wrap gap-1">
         <Link href="/account/wallet/" className={linkClass}>{t("earningSettlement.wallet")}</Link>
-        <Link href="/account/wallet/?c2cSell=1#c2c-orders" className={linkClass}>{t("c2c.seller")}</Link>
-        <Link href="/account/wallet/#wallet-transfer" className={linkClass}>{t("walletTransfer.title")}</Link>
       </div>
     </header>
-    {error ? <p role="alert" className="text-sm text-destructive">{error}</p> : null}
-    {!finance || loadedActor !== actor ? <p role="status" className="text-sm text-muted-foreground">{t("common.loading")}</p> : <>
-      <dl className="grid gap-3 sm:grid-cols-3">
+    {error ? <div className="flex flex-wrap items-center gap-2"><p role="alert" className="text-sm text-destructive">{error}</p><Button variant="ghost" onPress={() => setRetry(value => value + 1)}>{t("common.retry")}</Button></div> : null}
+    {!authLoading && !session?.authenticated ? <p className="text-sm text-muted-foreground">{t("earningSettlement.signInRequired")}</p> : !finance || loadedActor !== actor ? !error ? <p role="status" className="text-sm text-muted-foreground">{t("common.loading")}</p> : null : !finance.hasFinanceActivity ? <p className="text-sm text-muted-foreground">{t("marketProviderFinance.noEarnings")}</p> : <>
+      <dl className="flex flex-wrap gap-x-12 gap-y-4">
         {([
           ["marketProviderFinance.pending", finance.summary.pendingUnits],
           ["earningSettlement.total", finance.summary.creditedUnits],
           ["marketProviderFinance.holdsTitle", finance.summary.restrictedUnits],
-        ] as const).map(([key, value]) => <div key={key} className="min-w-0 rounded-lg bg-muted/50 p-4">
+        ] as const).filter(([key, value]) => key !== "marketProviderFinance.holdsTitle" || earningUnits(value) > 0n).map(([key, value]) => <div key={key} className="min-w-0">
           <dt className="text-xs text-muted-foreground">{t(key)}</dt>
           <dd className="mt-1 break-all text-xl font-semibold tabular-nums">{formatWalletUnits(value, "$", locale)}</dd>
         </div>)}
       </dl>
       {earningUnits(finance.summary.readyUnits) > 0n ? <p role="status" className="text-sm text-muted-foreground">{t("earningSettlement.waiting", { amount: formatWalletUnits(finance.summary.readyUnits, "$", locale) })}</p> : null}
-      <details className="min-w-0 text-sm">
-        <summary className="min-h-11 cursor-pointer py-3 font-medium focus-visible:outline-2 focus-visible:outline-ring">{t("commission.earningsDetail")}</summary>
-        <dl className="grid gap-2 pb-3 tabular-nums sm:grid-cols-3">{([
-          ["commission.gross",finance.summary.grossEarnedUnits], ["commission.deducted",finance.summary.commissionUnits], ["commission.net",finance.summary.netEarnedUnits],
-        ] as const).map(([key,value]) => <div key={key}><dt className="text-muted-foreground">{t(key)}</dt><dd>{formatWalletUnits(value,"$",locale)}</dd></div>)}</dl>
-        <p className="text-xs text-muted-foreground">{t("commission.providerHelp")}</p>
-      </details>
-      {holds.length ? <aside className="grid gap-3 rounded-lg bg-amber-50 p-4" aria-label={t("marketProviderFinance.holdsTitle")}>
+      {holds.length ? <aside className="grid gap-3 rounded-lg bg-amber-50 p-4 text-amber-950" aria-label={t("marketProviderFinance.holdsTitle")}>
         <h3 className="flex items-center gap-2 text-sm font-semibold text-amber-950"><ShieldAlert className="size-4" aria-hidden="true" />{t("marketProviderFinance.holdsTitle")}</h3>
         <p className="text-xs text-amber-900">{t("marketProviderFinance.holdsHelp")}</p>
         <ul className="grid gap-2">{holds.map(hold => <li key={`${hold.reasonKind}:${hold.reasonRef}`} className="flex flex-wrap items-center justify-between gap-2 text-sm">
@@ -124,8 +115,12 @@ export function ProviderFinancePanel({ walletMode }: { walletMode: "disabled" | 
           <span className="tabular-nums">{formatWalletUnits(hold.heldUnits,"$",locale)}</span>
         </li>)}</ul>
       </aside> : null}
-      <section className="grid min-w-0 gap-3" aria-labelledby="provider-earnings-title">
-        <h3 id="provider-earnings-title" className="font-semibold">{t("marketProviderFinance.earningsTitle")}</h3>
+      <details className="min-w-0 text-sm">
+        <summary id="provider-earnings-title" className="min-h-11 cursor-pointer py-3 font-medium focus-visible:outline-2 focus-visible:outline-ring">{t("commission.earningsDetail")}</summary>
+        <dl className="grid gap-2 pb-3 tabular-nums sm:grid-cols-3">{([
+          ["commission.gross",finance.summary.grossEarnedUnits], ["commission.deducted",finance.summary.commissionUnits], ["commission.net",finance.summary.netEarnedUnits],
+        ] as const).map(([key,value]) => <div key={key}><dt className="text-muted-foreground">{t(key)}</dt><dd>{formatWalletUnits(value,"$",locale)}</dd></div>)}</dl>
+        <p className="pb-3 text-xs text-muted-foreground">{t("commission.providerHelp")}</p>
         {history.items.length ? <div role="region" aria-labelledby="provider-earnings-title" tabIndex={0} className="max-h-96 overflow-auto overscroll-contain rounded-sm focus-visible:outline-2 focus-visible:outline-ring">
           <table className="w-full min-w-[34rem] text-left text-xs">
             <thead className="sticky top-0 bg-background text-muted-foreground"><tr>
@@ -148,7 +143,7 @@ export function ProviderFinancePanel({ walletMode }: { walletMode: "disabled" | 
           </table>
           {history.nextCursor ? <Button size="sm" variant="ghost" isDisabled={busy} onPress={() => void more()}>{t(busy ? "common.loading" : "marketWallet.more")}</Button> : null}
         </div> : <p className="text-sm text-muted-foreground">{t("marketProviderFinance.noEarnings")}</p>}
-      </section>
+      </details>
     </>}
   </section>;
 }

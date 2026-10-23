@@ -14,7 +14,7 @@ import {
   lookupClientMarketHostIpInfo,
   testClientMarketHostSsh,
 } from "@/lib/api";
-import { DASHBOARD_ACCOUNT_EARNINGS_PATH, DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH } from "@/lib/dashboard-nav";
+import { PROVIDER_INCOME_HREF, DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH } from "@/lib/dashboard-nav";
 import { MARKET_CURRENCY } from "@/lib/market-money";
 import type { HostIpIntel, ProvisionSshKey } from "@/lib/types";
 import { usePersistentState } from "@/lib/use-persistent-state";
@@ -508,7 +508,7 @@ export function AddHostDialog({
                     </> : <>
                       <span>{t("clientMarket.offerRequiresBilling")}</span>
                       <div className="flex flex-wrap gap-3">
-                        {!paidReadiness.settlementReady ? <a href={DASHBOARD_ACCOUNT_EARNINGS_PATH} className="whitespace-nowrap font-medium text-foreground underline underline-offset-2">{t("clientMarket.goToBilling")}</a> : null}
+                        {!paidReadiness.settlementReady ? <a href={PROVIDER_INCOME_HREF} className="whitespace-nowrap font-medium text-foreground underline underline-offset-2">{t("clientMarket.goToBilling")}</a> : null}
                         {!paidReadiness.paymentReady ? <a href={DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH} className="whitespace-nowrap font-medium text-foreground underline underline-offset-2">{t("clientMarket.goToAccountPayment")}</a> : null}
                       </div>
                     </>}

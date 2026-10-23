@@ -6,21 +6,23 @@ import { parseNonNegativeUsdMinor } from "@/lib/market-wallet-money";
 export type C2CPolicy = { version: number; enabled: boolean; admissionMinor: number; minMinor: number; maxMinor: number; paymentMinutes: number };
 export type C2CPolicyView = { policy: C2CPolicy; available: boolean; verified: boolean; termsVersion: number; claimGraceSeconds: number; firstPurchaseMaxMinor: number };
 export type C2CSeller = {
-  userId: string; version: number; enabled: boolean; suspended: boolean; displayName: string; contact: string;
-  paymentMethod: string; paymentDetails: string; currency: "USD" | "CNY"; priceBps: number; minMinor: number; maxMinor: number; heartbeatAt: string;
+  userId: string; version: number; enabled: boolean; suspended: boolean; displayName: string; description: string;
+  currency: "USD" | "CNY"; priceBps: number; minMinor: number; maxMinor: number; heartbeatAt: string;
 };
-export type C2CSellerInput = Omit<C2CSeller, "userId" | "version" | "suspended" | "heartbeatAt"> & { expectedVersion: number; acknowledgeExternalPayment: boolean };
-export type C2COffer = Pick<C2CSeller, "version" | "displayName" | "paymentMethod" | "currency" | "priceBps" | "minMinor" | "maxMinor"> & {
+export type C2CSellerInput = Omit<C2CSeller, "userId" | "version" | "suspended" | "heartbeatAt" | "displayName"> & { expectedVersion: number; acknowledgeExternalPayment: boolean };
+export type C2CSellerSnapshot = { seller: C2CSeller | null; admissionBalanceUnits: string; availableUnits: string };
+export type C2COffer = Pick<C2CSeller, "version" | "displayName" | "description" | "currency" | "priceBps" | "minMinor" | "maxMinor"> & {
   sellerId: string; availableMinor: number; completedOrders: number;
 };
-export type C2CQuote = { id: string; sellerId: string; sellerName: string; sellerVersion: number; creditMinor: number; payMinor: number; currency: "USD" | "CNY"; fxMicros: number; priceBps: number; paymentMethod: string; expiresAt: string };
+export type C2CQuote = { id: string; sellerId: string; sellerName: string; sellerVersion: number; creditMinor: number; payMinor: number; currency: "USD" | "CNY"; fxMicros: number; priceBps: number; description: string; expiresAt: string };
 export const C2C_STATUSES = ["awaiting_payment", "paid", "disputed", "released", "cancelled", "expired"] as const;
 export type C2CStatus = (typeof C2C_STATUSES)[number];
 export type C2COrder = {
   id: string; quoteId: string; buyerId: string; sellerId: string; amountUnits: string; status: C2CStatus; version: number;
   paymentDeadline: string; paidAt: string | null; releasedAt: string | null; latePaymentReported: boolean; latePaymentResolved: boolean;
   createdAt: string; updatedAt: string; sellerName: string; payMinor: number; currency: "USD" | "CNY"; fxMicros: number; priceBps: number;
-  contact: string | null; paymentMethod: string; paymentDetails: string | null;
+  description: string | null;
+  legacyPayment: { contact: string; paymentMethod: string; paymentDetails: string } | null;
 };
 export type C2CEvent = { id: string; actorId: string; action: string; note: string; createdAt: string };
 export type C2CPage<T> = { items: T[]; next: string | null };
@@ -56,6 +58,25 @@ const date = (v: unknown) => typeof v === "string" && Number.isFinite(Date.parse
 const currency = (v: unknown) => v === "USD" || v === "CNY";
 const nonnegative = (v: unknown): v is number => Number.isSafeInteger(v) && Number(v) >= 0;
 const boundedText = (v: unknown, max: number, empty = false): v is string => typeof v === "string" && (empty || !!v.trim()) && [...v].length <= max;
+export const C2C_DESCRIPTION_MAX = 300;
+export function validC2CDescription(value: unknown, empty = false): value is string {
+  return boundedText(value, C2C_DESCRIPTION_MAX, empty) && !/[\u0000-\u001f\u007f-\u009f]/u.test(value);
+}
+export function c2cDescriptionParts(value: string): { text: string; href?: string }[] {
+  const parts: { text: string; href?: string }[] = [];
+  let from = 0;
+  for (const match of value.matchAll(/https?:\/\/[^\s<>]+/giu)) {
+    const text = match[0].replace(/[.,;:!?，。；：！？)\]）]+$/u, "");
+    try {
+      const url = new URL(text);
+      if (!url.hostname || url.username || url.password || !["https:", "http:"].includes(url.protocol)) continue;
+      parts.push({ text: value.slice(from, match.index) }, { text, href: url.href });
+      from = match.index + text.length;
+    } catch { /* Keep malformed URLs as inert text. */ }
+  }
+  parts.push({ text: value.slice(from) });
+  return parts;
+}
 function validUnits(v: unknown): v is string {
   return typeof v === "string" && /^(0|[1-9]\d{0,18})$/.test(v) && BigInt(v) <= 9_223_372_036_854_775_807n;
 }
@@ -73,7 +94,7 @@ export function validC2CPolicy(p: C2CPolicy): C2CPolicy {
 }
 export function validC2CQuote(q: C2CQuote): C2CQuote {
   if (!q || !id(q.id) || !id(q.sellerId) || !integer(q.sellerVersion) || !boundedText(q.sellerName, 60)
-    || !boundedText(q.paymentMethod, 60) || !date(q.expiresAt)) invalid();
+    || !validC2CDescription(q.description) || !date(q.expiresAt)) invalid();
   validTerms(q.creditMinor, q.payMinor, q.currency, q.fxMicros, q.priceBps);
   return q;
 }
@@ -81,10 +102,12 @@ export function validC2COrder(o: C2COrder): C2COrder {
   if (!o || !id(o.id) || !id(o.quoteId) || !id(o.buyerId) || !id(o.sellerId) || o.buyerId === o.sellerId || !integer(o.version)
     || !C2C_STATUSES.includes(o.status) || typeof o.amountUnits !== "string" || !/^[1-9]\d{0,18}$/.test(o.amountUnits)
     || BigInt(o.amountUnits) > 9_223_372_036_854_775_807n || BigInt(o.amountUnits) % 86_400n !== 0n
-    || !date(o.paymentDeadline) || !date(o.createdAt) || !date(o.updatedAt) || !boundedText(o.sellerName, 60) || !boundedText(o.paymentMethod, 60)
+    || !date(o.paymentDeadline) || !date(o.createdAt) || !date(o.updatedAt) || !boundedText(o.sellerName, 60)
     || typeof o.latePaymentReported !== "boolean" || typeof o.latePaymentResolved !== "boolean"
     || (o.latePaymentResolved && !o.latePaymentReported)
-    || (o.contact !== null && !boundedText(o.contact, 300)) || (o.paymentDetails !== null && !boundedText(o.paymentDetails, 1500))
+    || (o.description !== null && !validC2CDescription(o.description))
+    || (o.legacyPayment !== null && (!o.legacyPayment || o.description !== null || !boundedText(o.legacyPayment.contact, 300)
+      || !boundedText(o.legacyPayment.paymentMethod, 60) || !boundedText(o.legacyPayment.paymentDetails, 1500)))
     || (o.paidAt !== null && !date(o.paidAt)) || (o.status === "awaiting_payment" && o.paidAt !== null)
     || (["paid", "disputed", "released"].includes(o.status) && !date(o.paidAt))
     || (o.status === "released" ? !date(o.releasedAt) : o.releasedAt !== null)) invalid();
@@ -93,7 +116,7 @@ export function validC2COrder(o: C2COrder): C2COrder {
 }
 export function validC2CSeller(s: C2CSeller): C2CSeller {
   if (!s || !id(s.userId) || !integer(s.version) || typeof s.enabled !== "boolean" || typeof s.suspended !== "boolean"
-    || !boundedText(s.displayName, 60) || !boundedText(s.paymentMethod, 60) || !boundedText(s.contact, 300) || !boundedText(s.paymentDetails, 1500)
+    || !boundedText(s.displayName, 60) || !validC2CDescription(s.description, !s.enabled)
     || !currency(s.currency) || !integer(s.priceBps) || s.priceBps < 5000 || s.priceBps > 20000 || !integer(s.minMinor)
     || !integer(s.maxMinor) || s.maxMinor < s.minMinor || s.maxMinor > 10_000_000 || !date(s.heartbeatAt)) invalid();
   return s;
@@ -121,18 +144,19 @@ export async function getC2CPolicy() {
   return p;
 }
 export async function getC2CSeller() {
-  const p = await request<{ seller: C2CSeller | null; admissionBalanceUnits: string; availableUnits: string }>(`${BASE}/seller`);
+  const p = await request<C2CSellerSnapshot>(`${BASE}/seller`);
   if (!p || !validUnits(p.admissionBalanceUnits) || !validUnits(p.availableUnits)) invalid();
   if (p.seller !== null) validC2CSeller(p.seller);
   return p;
 }
 export const saveC2CSeller = async (s: C2CSellerInput) => validC2CSeller(await request<C2CSeller>(`${BASE}/seller`, s, "PUT"));
+export const pauseC2CSeller = async (s: C2CSeller) => validC2CSeller(await request<C2CSeller>(`${BASE}/seller/pause`, { expectedVersion: s.version }));
 export const heartbeatC2C = () => request(`${BASE}/seller/heartbeat`, {});
 export async function getC2COffers(before = "") {
   const p = validPage(await request<C2CPage<C2COffer>>(`${BASE}/sellers?before=${encodeURIComponent(before)}`));
   p.items.forEach(o => { if (!id(o.sellerId) || !integer(o.version) || !integer(o.availableMinor) || !integer(o.minMinor) || !integer(o.maxMinor)
     || o.maxMinor < o.minMinor || o.maxMinor > o.availableMinor || o.maxMinor > 10_000_000 || !currency(o.currency)
-    || !boundedText(o.displayName, 60) || !boundedText(o.paymentMethod, 60) || !integer(o.priceBps) || o.priceBps < 5000 || o.priceBps > 20000
+    || !boundedText(o.displayName, 60) || !validC2CDescription(o.description) || !integer(o.priceBps) || o.priceBps < 5000 || o.priceBps > 20000
     || !nonnegative(o.completedOrders)) invalid(); });
   return p;
 }
@@ -143,14 +167,16 @@ export async function createC2C(p: C2CPending) {
 export function matchC2CPendingOrder(p: C2CPending, order: C2COrder) {
   const result = validC2COrder(order);
   if (result.buyerId !== p.actor || result.quoteId !== p.quote.id || result.sellerId !== p.quote.sellerId || BigInt(result.amountUnits) !== BigInt(p.quote.creditMinor) * 86_400n
-    || result.payMinor !== p.quote.payMinor || result.currency !== p.quote.currency || result.fxMicros !== p.quote.fxMicros || result.priceBps !== p.quote.priceBps) invalid();
+    || result.payMinor !== p.quote.payMinor || result.currency !== p.quote.currency || result.fxMicros !== p.quote.fxMicros || result.priceBps !== p.quote.priceBps
+    || result.description !== p.quote.description || result.sellerName !== p.quote.sellerName) invalid();
   return result;
 }
 export function matchC2COrder(before: C2COrder, after: C2COrder): C2COrder {
   validC2COrder(after);
   if (after.id !== before.id || after.quoteId !== before.quoteId || after.buyerId !== before.buyerId || after.sellerId !== before.sellerId
     || after.amountUnits !== before.amountUnits || after.payMinor !== before.payMinor || after.currency !== before.currency
-    || after.fxMicros !== before.fxMicros || after.priceBps !== before.priceBps || after.version < before.version) invalid();
+    || after.fxMicros !== before.fxMicros || after.priceBps !== before.priceBps || after.version < before.version
+    || (before.description !== null && after.description !== before.description)) invalid();
   return after;
 }
 export async function getC2COrders(filter: { before?: string; status?: string; role?: string; quoteId?: string } = {}, admin = false) {

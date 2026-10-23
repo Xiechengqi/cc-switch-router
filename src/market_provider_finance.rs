@@ -91,7 +91,7 @@ pub(crate) fn payout_retired_error() -> AppError {
         status: StatusCode::GONE,
         code: "PROVIDER_PAYOUTS_RETIRED",
         message: "Provider earnings are automatically credited to platform balance after settlement; use C2C or wallet transfers".into(),
-        details: serde_json::json!({ "walletUrl": "/account/wallet/", "earningsUrl": "/account/earnings/" }),
+        details: serde_json::json!({ "walletUrl": "/account/wallet/", "earningsUrl": "/account/provider-settings/#income" }),
     }
 }
 async fn retired_payout(

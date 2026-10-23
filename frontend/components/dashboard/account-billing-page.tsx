@@ -7,7 +7,7 @@ import { DASHBOARD_ACCOUNT_WALLET_PATH } from "@/lib/dashboard-nav";
 export function AccountBillingPage() {
   return (
     <Suspense fallback={null}>
-      <AccountLegacyRedirect target={DASHBOARD_ACCOUNT_WALLET_PATH} billing />
+      <AccountLegacyRedirect target={DASHBOARD_ACCOUNT_WALLET_PATH} />
     </Suspense>
   );
 }

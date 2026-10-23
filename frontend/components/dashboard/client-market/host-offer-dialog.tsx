@@ -8,7 +8,7 @@ import { SegmentedControl } from "@/components/common/segmented-control";
 import { usePaidOfferReadiness } from "@/components/dashboard/share-market/paid-offer-readiness";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { updateClientMarketHostOffer } from "@/lib/api";
-import { DASHBOARD_ACCOUNT_EARNINGS_PATH, DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH } from "@/lib/dashboard-nav";
+import { PROVIDER_INCOME_HREF, DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH } from "@/lib/dashboard-nav";
 import { MARKET_CURRENCY } from "@/lib/market-money";
 import type { ClientMarketHost } from "@/lib/types";
 import {
@@ -143,7 +143,7 @@ export function HostOfferDialog({
                 </> : <>
                   <p>{t("clientMarket.offerRequiresBilling")}</p>
                   <div className="flex flex-wrap gap-3">
-                    {!paidReadiness.settlementReady ? <a href={DASHBOARD_ACCOUNT_EARNINGS_PATH} className="whitespace-nowrap font-medium text-foreground underline underline-offset-2">{t("clientMarket.goToBilling")}</a> : null}
+                    {!paidReadiness.settlementReady ? <a href={PROVIDER_INCOME_HREF} className="whitespace-nowrap font-medium text-foreground underline underline-offset-2">{t("clientMarket.goToBilling")}</a> : null}
                     {!paidReadiness.paymentReady ? <a href={DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH} className="whitespace-nowrap font-medium text-foreground underline underline-offset-2">{t("clientMarket.goToAccountPayment")}</a> : null}
                   </div>
                 </>}

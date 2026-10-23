@@ -54,6 +54,7 @@ test("current UI has no external payout or manual earning-credit actions", () =>
     assert.doesNotMatch(source(p), /EarningWalletConversion|requestMarketProviderWithdrawal|saveMarketProviderDestination|MarketFinanceTransfersPanel|canWithdraw/);
   }
   assert.equal(existsSync(new URL("../components/dashboard/earning-wallet-conversion.tsx", import.meta.url)), false);
-  assert.match(source("../components/dashboard/provider-finance-panel.tsx"), /c2cSell=1/);
+  assert.match(source("../components/dashboard/provider-finance-panel.tsx"), /href="\/account\/wallet\/"/);
+  assert.match(source("../app/(dashboard)/account/provider-settings/page.tsx"), /<ProviderFinancePanel/);
   assert.doesNotMatch(source("../components/dashboard/share-market/paid-offer-readiness.tsx"), /finance\.destination|usableAt/);
 });
