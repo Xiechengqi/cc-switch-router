@@ -179,7 +179,6 @@ export function WalletPolicySettings() {
               [
                 { key: "transfersEnabled", label: "walletPolicy.enabled" },
                 { key: "transfersPaused", label: "walletPolicy.paused" },
-                { key: "earningsConversionsPaused", label: "earningConversion.pauseSetting" },
               ] as const
             ).map((item) => (
               <label

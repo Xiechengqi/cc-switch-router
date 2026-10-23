@@ -46,7 +46,7 @@ try {
       if (p === "/v1/announcement") return json(route, { enabled: false, revision: "1", contentEn: "", contentZhCn: "" });
       if (p === "/v1/map-display") return json(route, { showFlows: true, showHeat: true, viewport: { visibleStartPx: 90 }, revision: "1" });
       if (p === "/v1/market-billing/config") return json(route, { usdCnyRateMicros: 7000000, fxRateFresh: true });
-      if (p === "/v1/market-wallet") return json(route, { assetCode: "USD", postedUnits: actor === "seller" ? "1728000000" : "0", heldUnits: "0", availableUnits: actor === "seller" ? "1728000000" : "0", version: 1, mode: "enabled", canTopup: true, hasWalletActivity: false, earningsConversion: { convertibleUnits: "0", canConvert: false, conversionBlockers: [] } });
+      if (p === "/v1/market-wallet") return json(route, { assetCode: "USD", postedUnits: actor === "seller" ? "1728000000" : "0", heldUnits: "0", availableUnits: actor === "seller" ? "1728000000" : "0", version: 1, mode: "enabled", canTopup: true, hasWalletActivity: false });
       if (p.endsWith("/channels") || p === "/v1/admin/market-payment-channels") return json(route, []);
       if (p === "/v1/market-wallet/c2c/policy") return json(route, { policy, available: policy.enabled, verified: true, termsVersion: 1, claimGraceSeconds: 120, firstPurchaseMaxMinor: 10000 });
       if (p === "/v1/market-wallet/c2c/sellers") return json(route, { items: [seller], next: null });
@@ -90,9 +90,9 @@ try {
         o.version++; o.updatedAt = new Date().toISOString(); return json(route, o);
       }
       if (p === "/v1/admin/settings") return json(route, { revision: "1", generatedAt: new Date().toISOString(), envPath: "/test/.env", schema: { categories: [{ id: "marketplace", label: "Marketplace", description: "Marketplace", fieldCount: 0 }], fields: [], groups: [] }, values: [], pendingRestartKeys: [] });
-      if (p === "/v1/admin/market-finance/readiness") return json(route, { mode: "enabled", version: 1, newOrdersPaused: false, newWithdrawalsPaused: false, newTopupsPaused: false, codeIntegrated: true, legacyBlockers: [], criticalCases: 0, staleTopupReviews: 0, verifiedLiveTopups: 1, paymentChannelBlockers: [], canEnable: false });
+      if (p === "/v1/admin/market-finance/readiness") return json(route, { mode: "enabled", version: 1, newOrdersPaused: false, newTopupsPaused: false, codeIntegrated: true, legacyBlockers: [], criticalCases: 0, staleTopupReviews: 0, verifiedLiveTopups: 1, paymentChannelBlockers: [], canEnable: false });
       if (p === "/v1/admin/market-finance/overview") return json(route, overview);
-      if (p === "/v1/admin/market-finance/wallet-policy") return json(route, { version: 1, maintenanceFeeBps: 500, transfersEnabled: true, transfersPaused: false, earningsConversionsPaused: false, transferMaxMinor: 500000, transferDailyMaxMinor: 500000, balanceRefundable: false, canEdit: true });
+      if (p === "/v1/admin/market-finance/wallet-policy") return json(route, { version: 1, maintenanceFeeBps: 500, transfersEnabled: true, transfersPaused: false, transferMaxMinor: 500000, transferDailyMaxMinor: 500000, balanceRefundable: false, canEdit: true });
       if (p === "/v1/admin/market-finance/commission-policy") return json(route, { version: 1, current: { policyVersion: 1, rateBps: 1000, effectiveAt: "2026-01-01T00:00:00Z" }, scheduled: null, increaseNoticeDays: 7, canEdit: true });
       if (p === "/v1/admin/market-finance/c2c/policy") {
         if (request.method() === "PUT") { assert.equal(body.version, policy.version); policy = { ...body, version: policy.version + 1 }; return json(route, policy); }

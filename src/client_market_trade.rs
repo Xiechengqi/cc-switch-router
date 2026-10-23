@@ -728,11 +728,7 @@ pub(crate) fn require_paid_offer_setup(
                 "wallet-funded Hosts must be priced in USD".into(),
             ));
         }
-        return crate::market_payouts::require_payout_setup_tx(
-            conn,
-            provider_id,
-            &Utc::now().to_rfc3339(),
-        );
+        return crate::market_provider_finance::require_paid_offer_setup_tx(conn, provider_id);
     }
     require_payment_profile_for_offer(conn, provider_id)?;
     crate::market_billing::require_supplier_profile_tx(conn, provider_id, currency)?;
@@ -3642,7 +3638,12 @@ impl AppStore {
         let mut items = Vec::with_capacity(candidates.len());
         for (position, candidate) in candidates.into_iter().enumerate() {
             if funding_rail == "platform_wallet" {
-                crate::market_commission::freeze_quote_tx(&tx, &quote_id, &candidate.provider_id, &now_rfc)?;
+                crate::market_commission::freeze_quote_tx(
+                    &tx,
+                    &quote_id,
+                    &candidate.provider_id,
+                    &now_rfc,
+                )?;
             }
             let changed = tx
                 .execute(

@@ -33,7 +33,7 @@
 | `pending share edit` | Router 侧排队的 share 变更,由 Server 拉取并 ack |
 | `财务模式` | Router Owner 控制的 `market_finance_control.mode`（`disabled` / `shadow` / `enabled`），决定付费商品走旧 Provider 资金轨道还是平台钱包；批准切换后单向不可回退 |
 | `平台钱包` | 每个 Router 用户一个、两个 Market 共用的 USD 余额，由 USD 整数复式 journal 记账；只存在于 Router，Server 不感知 |
-| `Router Owner` | `CC_SWITCH_ROUTER_OWNER_EMAIL`（未配置时为隧道域名默认管理员）；财务模式、支付渠道、费率与提现付款登记等资金操作只允许 Owner |
+| `Router Owner` | `CC_SWITCH_ROUTER_OWNER_EMAIL`（未配置时为隧道域名默认管理员）；财务模式、支付渠道、费率等资金操作只允许 Owner |
 
 ---
 
@@ -107,7 +107,7 @@ Share Market 内建于 Router,不注册为外部 `router_markets`。Share owner 
 
 市场状态与审计由 `share_market_listings`、`share_market_seats`、`share_market_subscriptions`、`share_control_operations` 和 `share_market_events` 持久化；Seat 与 Subscription 都冻结 `service_duration_days`，Subscription 另存从授权首次生效时计算的绝对 `expires_at`，`activated_at` 只记录授权实际生效时间。统一准入由 `market_supplier_access_policies`、`market_counterparties`、产品规则、`market_access_requests`、私有/公共授信及事件表持久化，其中策略和规则主键均包含 `pricing_kind`。准入申请批准及管理页批量保存都使用 libSQL Immediate 事务，避免出现“已允许但未授信”或只保存部分买家的状态。旧 Provider 资金轨道的账务由 `market_credit_accounts`、`market_service_contracts`、`market_service_intervals`、`market_accrual_entries`、`market_invoices`、`market_invoice_lines` 及付款、争议、限制、事件表持久化。币安扩展使用 `binance_payment_accounts`、`market_payment_intents`、金额预留、加密流水、外部收据和异常对账表；UID/API Key 指纹全局唯一，凭据轮换使用 revision CAS，轮询使用可过期 lease 加 revision fencing；API Secret 与原始流水分别用 XChaCha20-Poly1305 和上下文 AAD 加密，不进入公开收款方式、账单快照或聊天事件。完整运行手册见 [docs/runbook-binance-auto-settlement.md](docs/runbook-binance-auto-settlement.md)。平台钱包的数据与流程见 ⑤。
 
-账户 UI 按「安全（API Key／通知）→ 用量 → 资金 → 市场交易」组织：资金区为平台余额 `/account/wallet/` 与收入与提现 `/account/earnings/`；市场交易区为 Share 交易 `/account/share/`、Client 交易 `/account/client/` 与 Provider 设置 `/account/provider-settings/`（业务联系方式、四项准入策略与准入申请收件箱，不再配置买家授信或预存）。旧 `/account/billing/` 重定向到平台余额，`/account/payments/`、`/account/market-access/`、`/account/market-readiness/` 重定向到 Provider 设置；`disabled`／`shadow` 模式也不会恢复旧的商家直付或授信界面。
+账户 UI 按「安全（API Key／通知）→ 用量 → 资金 → 市场交易」组织：资金区为平台余额 `/account/wallet/` 与供应商收入 `/account/earnings/`；市场交易区为 Share 交易 `/account/share/`、Client 交易 `/account/client/` 与 Provider 设置 `/account/provider-settings/`（业务联系方式、四项准入策略与准入申请收件箱，不再配置买家授信或预存）。旧 `/account/billing/` 重定向到平台余额，`/account/payments/`、`/account/market-access/`、`/account/market-readiness/` 重定向到 Provider 设置；`disabled`／`shadow` 模式也不会恢复旧的商家直付或授信界面。
 
 Share 的 token/并发限制、请求 usage、用户 `usageRebase` 重基线、模型健康和容量池是 Share/Router 运行时能力，不等于外部 Token Market 的用户账本。普通 Share 的旧官方价格比例已退役；Share Market 报价只属于 listing/seat。Router 只保存本地 Share/seat entitlement、脱敏 observation 和服务账务；未来外部平台的下游用户、API key、token 售价、余额与 token settlement 必须留在平台自身。用户周期重基线由 Server 保存并通过 descriptor 下发，Router 不拥有编辑权。
 
@@ -144,7 +144,7 @@ Host Provider 还可对不可达 Host 执行 `POST /v1/client-market/hosts/:id/r
 
 这里的后台重试仅覆盖 Router 自身的首次开通 job 和显式 cleanup job。首次开通脚本只启动一次 Client 进程，安装的 systemd/OpenRC 服务不启用开机启动、失败重启或 respawn。开通完成后，Router 不会因 tunnel 离线而通过 provision SSH 启动或重启 `cc-switch-server`；只记录 `online`、`reconnecting`、`offline`、`disabled` 连接状态并继续心跳、告警和 UI 提示。Client 进程生命周期完全由 Client owner 管理。
 
-**准入与支付**：免费和付费 Host 分别执行 `client_host/free`、`client_host/paid` 准入。平台钱包启用后，付费租用从用户全站 USD 余额支付，Provider 的收款方式不再作为商品支付渠道或筛选项；供应商提现资料仅供发布准备与提现使用。新付费报价采用日历月租，历史按日合同按原资金路径处理。Provider 自用按免费处理。
+**准入与支付**：免费和付费 Host 分别执行 `client_host/free`、`client_host/paid` 准入。平台钱包启用后，付费租用从用户全站 USD 余额支付，Provider 的收款方式不再作为商品支付渠道或筛选项；付费发布仅需有效的供应商身份，不要求任何外部提现地址。新付费报价采用日历月租，历史按日合同按原资金路径处理。Provider 自用按免费处理。
 
 **购买确认**：指定 Host 直接获取 120 秒预留报价并进入配置确认；通用新建先选择免费资源池，最多两台。报价项返回真实剩余 `trialSecondsRemaining`，试用按健康服务时长消耗，不冻结用户资金；试用结束从平台钱包支付首期，无余额则暂停 Client tunnel。无试用时提交预留当期资金，开通成功后扣款。自动续费仅在下一期到期时扣款。报价过期保留内存草稿并要求重新确认；充值只携带 Host、子域名和续费选择，密码不持久化。新购买界面不会降级到商家直付。
 
@@ -166,15 +166,15 @@ Share Market 与 Client Market 的付费全部由 Router 承担，Server 不保�
 | `shadow` | 旧 Provider 资金轨道 | 仅 Router Owner 可用 canary 渠道测试充值，用于真实商户影子验收 |
 | `enabled` | 平台钱包（`platform_wallet`） | Owner 在 readiness 通过后经 API 批准切换（写入 `cutover_approved_at`），单向不可回退。旧资金写接口（`/v1/market-billing/*`、`/v1/account/payment-profile`、`/v1/account/binance-auto-settlement*`、market-access 授信与公共额度）返回 `410`（`src/api.rs` `is_retired_legacy_finance_write`）；以另一模式发布的报价必须由 Provider 重新发布 |
 
-**平台钱包**（`src/market_payments/`、`src/market_wallet*.rs`、`src/market_platform_contracts.rs`、`src/market_finance.rs`、`src/market_payouts.rs`、`src/market_commission.rs`、`src/market_earning_conversions.rs`；迁移 0053–0077）：
+**平台钱包**（`src/market_payments/`、`src/market_wallet*.rs`、`src/market_platform_contracts.rs`、`src/market_finance.rs`、`src/market_provider_finance.rs`、`src/market_commission.rs`、`src/market_earning_conversions.rs`；迁移 0053–0079）：
 
-- **账本**：USD 整数复式 journal（1 美分 = 86,400 单位）。每个 Router `user_id` 一个钱包，两个 Market 和所有 Provider 共用；余额、冻结、月租未履约款、Provider 待解锁／可提现／提现中与平台费用都能从 journal 逐笔重算。对账器发现不变量破坏时按范围冻结相关资金路径，而不是自动改账。
+- **账本**：USD 整数复式 journal（1 美分 = 86,400 单位）。每个 Router `user_id` 一个钱包，两个 Market 和所有 Provider 共用；余额、冻结、月租未履约款、Provider 沉淀中／待到账／冻结中的收入与平台费用都能从 journal 逐笔重算。对账器发现不变量破坏时按范围冻结相关资金路径，而不是自动改账。
 - **充值**：Owner 在 Settings 配置支付渠道，首个适配器为 DujiaoPay（托管收银台或站内直付二维码；API／Webhook 密钥用独立主密钥 AEAD 加密）。渠道按 `off → canary → live` 灰度，canary 首笔严格验真入账后自动转正。用户按希望到账的 1–1,000 美元报价，另付充值维护费（默认 5%，Owner 可设 0–100%，精度 0.01 个百分点），报价 5 分钟有效。入账只认事务外的认证查单与链上回执核验（`paid_source=chain`、允许的链与币、确认数、金额不短付）；浏览器回跳和无签名通知都不算付款证明，证据不足的订单进入 Owner 核对。
 - **消费余额**：不可提现，也不能自助外部退款；可按精确邮箱免费转给本 Router 已验证的其他用户（6 位邮箱验证码，默认单笔与 UTC 自然日上限各 5,000 美元，Owner 可调整并可暂停）。
 - **购买与履约**：报价不冻结资金；提交时冻结开通所需金额，Share 授权或 Host 开通成功后才捕获当期款，失败须确认清理完成才释放。月租按半开服务区间的可用时间生成履约片段；按日计价的历史服务以约 24 小时滚动预算按健康秒数批量过账。余额不足时暂停服务，默认第 5 天提醒、第 7 天进入清理终止（`CC_SWITCH_ROUTER_MARKET_SUSPENDED_TERMINATE_DAYS`）。服务退款和争议退款都回到钱包。
-- **Provider 收入**：只由买家已扣款且已履约的服务生成。平台服务费默认为已履约总额的 10%（Owner 可设 0–100%；上调保存 7 天后生效，下调立即生效；费率按报价和计费周期冻结），免费、试用、充值与转账不产生服务费。净收益与对应服务费在 `max(buyer_debited_at, fulfilled_at) + 7 天` 后成熟。Provider 只能保存 USDT（TRON）提现地址（修改需邮箱验证码，并有 24 小时冷静期），钱包模式下发布付费商品前必须已有过了冷静期的提现地址；之后申请提现（单笔不超过 5,000 美元，最多 3 笔未结），由 Router Owner 审批、线下转账并登记链上交易；Router 不持有出款私钥，也不能自动确认链上到账。除提现外，Provider 也可由本人明确确认，把已成熟、未冻结、未分配提现的净收益 1:1 转入自己的平台钱包（迁移 0077，`/v1/market-provider-finance/wallet-conversion*`）：零手续费、不可撤回，转入后即成为不可提现的消费余额，不产生平台收入；Owner 可用 `earningsConversionsPaused` 单独暂停新转入。
-- **权限与应急**：财务模式、暂停开关、渠道凭据、手动入账／外部退款冲正、严重 case 结案与标记已付只允许 Router Owner，其他管理员只读或处理非严重事项。「暂停新钱包订单／新提现」与「暂停新充值」是独立开关，用于事故处置，不影响既有合同履行、回调与对账。
-- **页面**：平台余额 `/account/wallet/`、站内付款核对页 `/wallet-checkout/`、收入与提现 `/account/earnings/`、Provider 设置 `/account/provider-settings/`；Owner 在「设置 → 市场 → 平台钱包」管理渠道、维护费、转账限额与服务费。
+- **Provider 收入**：只由买家已扣款且已履约的服务生成，按冻结费率扣除平台服务费。净收益在 `max(buyer_debited_at, fulfilled_at) + 7 天` 后自动 1:1 计入本人平台余额，不需要手动确认，不再扣费。冻结或异常款项保持原有隔离，解除后自动重试；余额可用于服务消费、邮箱转账或 C2C。外部提现、地址管理和手动收益转入已退役，历史账本证据只读保留。完整规则见 [收益自动到账契约](docs/market-earnings-automatic-credit.md)。
+- **权限与应急**：财务模式、暂停开关、渠道凭据、手动入账／外部退款冲正、严重 case 结案只允许 Router Owner，其他管理员只读或处理非严重事项。「暂停新钱包订单」与「暂停新充值」是独立开关，用于事故处置，不影响既有合同履行、回调与对账。
+- **页面**：平台余额 `/account/wallet/`、站内付款核对页 `/wallet-checkout/`、供应商收入 `/account/earnings/`、Provider 设置 `/account/provider-settings/`；Owner 在「设置 → 市场 → 平台钱包」管理渠道、维护费、转账限额、C2C 与服务费。
 
 生产状态：代码已接线；真实 DujiaoPay 商户的影子验收与生产切换按 [docs/market-platform-wallet-implementation.md](docs/market-platform-wallet-implementation.md) §13 清单执行，已知未实现项见该文 §14.8。
 
@@ -339,7 +339,7 @@ Router 侧并发只按三类键限制:`share_id`(Share 并发池)、免费 Share
 
 业务事务先在同一 libSQL 事务内写入 `client_chat_system_outbox`,后台再物化为 `author_kind=system`、`message_kind=market_event` 的不可删除消息。`source_kind + source_event_id + installation_id` 提供幂等键；失败事件指数退避,达到上限进入 dead-letter,不会阻塞后续事件。Owner、Provider、租客和事件 actor 会自动写入 `chat_visits`,因此可在各自入口看到房间与未读数。
 
-平台钱包的充值、扣款、余额、Provider 收入与提现不进入公开聊天室,只写入私有的 `market_notification_outbox`(站内通知、邮件与 Telegram)。市场系统消息公开完整交易上下文,包括双方邮箱、金额、收款资料、付款凭证、reference/note、争议或回收原因和不含凭据的原始错误。物化系统消息时,仅当同源收款图片属于 payload 中的 Owner/Provider/Supplier,才写入 `chat_public_payment_assets`；该映射随消息级联删除并阻止资料更新提前清理图片。后端禁止 API Key、OAuth/Session token、Cookie、Authorization、密码、secret、私钥、SSH/lease 凭据和带凭据 query/fragment 的 URL 进入 outbox；仅 `kind=crypto` 的 `USDT`/`USDC` 收款资产符号可使用 `token` 字段。前端渲染前再次过滤。系统消息不创建 `chat_email_events`,只有真人访客消息可触发 Owner 聊天提醒邮件。
+平台钱包的充值、扣款、余额、Provider 供应商收入不进入公开聊天室,只写入私有的 `market_notification_outbox`(站内通知、邮件与 Telegram)。市场系统消息公开完整交易上下文,包括双方邮箱、金额、收款资料、付款凭证、reference/note、争议或回收原因和不含凭据的原始错误。物化系统消息时,仅当同源收款图片属于 payload 中的 Owner/Provider/Supplier,才写入 `chat_public_payment_assets`；该映射随消息级联删除并阻止资料更新提前清理图片。后端禁止 API Key、OAuth/Session token、Cookie、Authorization、密码、secret、私钥、SSH/lease 凭据和带凭据 query/fragment 的 URL 进入 outbox；仅 `kind=crypto` 的 `USDT`/`USDC` 收款资产符号可使用 `token` 字段。前端渲染前再次过滤。系统消息不创建 `chat_email_events`,只有真人访客消息可触发 Owner 聊天提醒邮件。
 
 ---
 
@@ -383,7 +383,7 @@ Router 从不改写 Server 返回的 descriptor,只做校验;若客户端只部�
 | `Share Market` | 5s | managed grant、免费期限与 Share 租约状态对账 |
 | `Market billing` | 5s | 旧 Provider 资金轨道：健康时长计费、阈值出账、最终账单、逾期限制和控制动作重试 |
 | `Market wallet delivery` | 5s | 平台钱包合同：试用与按秒批次、月租续期与到期、余额不足暂停／恢复／终止，并下发 Share 授权或 Client tunnel 控制 |
-| `market payments` | 30s（Webhook 可即时唤醒）；网关扫描每 10min 检查一次；审计 1h | 充值订单对账与补偿查单、Provider 收入成熟解锁、每日／每周孤儿已付单扫描、财务不变量审计 |
+| `market payments` | 30s（Webhook 可即时唤醒）；网关扫描每 10min 检查一次；审计 1h | 充值订单对账与补偿查单、Provider 收入成熟解锁及自动计入钱包、每日／每周孤儿已付单扫描、财务不变量审计 |
 | `market notifications` | 10s；提醒 1h | 钱包与 Provider 通知 outbox（邮件 / Telegram）；续费与余额不足提醒 |
 | `USD/CNY market FX` | 15min | 获取并验证 USD/CNY 展示汇率 |
 | `Binance auto-settlement` | 默认 4s 轮询 | 旧 Provider 资金轨道的币安自动到账 |

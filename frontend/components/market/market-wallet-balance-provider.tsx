@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import { useAuth } from "@/components/auth/auth-provider";
-import { subscribeMarketBalanceChanged } from "@/lib/earning-wallet-conversion";
+import { subscribeMarketBalanceChanged } from "@/lib/market-balance-events";
 import { getMarketWallet, type MarketWallet } from "@/lib/market-wallet-api";
 
 type WalletBalanceState = {

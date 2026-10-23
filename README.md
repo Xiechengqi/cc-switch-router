@@ -80,7 +80,7 @@ API 路由按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
 |---|---:|---|---|
 | `/v1/client-market/*` | 36 | 用户 Session | `hosts`、`quotes`、`quotes/:id/commit`、`providers`、`my-rentals`、`terminal/ws` |
 | `/v1/admin/*`（不含下方财务组） | 约 44 | Session + admin 判定 | `settings`、`settings/validate`、`version`、`upgrade`、`metrics/*`、`alerting/*`、`audit`、`proxy/share-requests/force-release`、`logs/router/tail`、`share-market/control-operations/*` |
-| `/v1/admin/market-finance/*`、`/v1/admin/market-payment-channels/*` | 31 | Session；写操作多数仅 Router Owner | 财务模式与切换 `mode`/`readiness`、`pause`、充值异常与 `manual-credit`/`reverse`、对账 `cases`、收入冻结、提现与服务结算调整、`wallet-policy`、`commission-policy`；充值渠道创建/验证/轮换/启停/归档与 `rewrap`；不提供余额现金退款 |
+| `/v1/admin/market-finance/*`、`/v1/admin/market-payment-channels/*` | 31 | Session；写操作多数仅 Router Owner | 财务模式与切换 `mode`/`readiness`、`pause`、充值异常与 `manual-credit`/`reverse`、对账 `cases`、收入冻结与服务结算调整、`wallet-policy`、`commission-policy`；充值渠道创建/验证/轮换/启停/归档与 `rewrap`；不提供余额现金退款 |
 | `/v1/admin/market-billing/*` | 5 | Session + admin 判定 | 旧 Provider 资金轨道的账单争议裁决、账单作废与币安对账 case |
 | `/v1/shares/*` | 26 | Ed25519 签名 / 用户 Session | Server 侧：`claim-subdomain`、`sync`、`batch-sync`、`descriptor-batch-sync`、`pending-edits`、`edit-ack`、`edit-events`、`runtime-refresh`、`heartbeat`、`prune`；Dashboard 侧：`:share_id/settings`、`request-logs`、`model-health-calendar`、`test-connection`、`client-bans` |
 | `/v1/installations/*` | 15 | Ed25519 签名 / bearer | `register`、`heartbeat`、`audit-events/batch`、`setup-completed`、`report-status`、`client-tunnel`、`client-tunnel/claim`、`bind-owner-email`、`upgrade-task-report`、`client-subdomain-takeover` |
@@ -91,7 +91,7 @@ API 路由按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
 | `/v1/markets*`、`/v1/market/*`、`/_market/proxy/*` | 退役 | 无 | 统一返回 `410 Gone`；不会创建旧 Market session、host 或 proxy |
 | `/v1/share-market/*` | 22 | 公开 catalog / 用户 Session | `listings`、`listings/:id/reopen`、`owned-shares`、`seats/:id/quote`、`seats/:id/rent`、`subscriptions/:id/release`、`subscriptions/:id/terminate`、`force-revoke`、`price-changes/*` |
 | `/v1/market-wallet/*` | 23 | 用户 Session | 平台钱包：余额与 `transactions`、`channels`、`topup-quotes`、`topups/*`（含 `payment-instructions`、`stop`、`cancel`、`recheck`）、`transfer-quotes`/`transfers`、`contracts/:id/renewal`、`service-disputes`、`policy`、`commission-policy`；`refund-requests` 已退役，写入返回 `410` |
-| `/v1/market-provider-finance/*` | 10 | 用户 Session | Provider 收入（`me`、`earnings`、`holds`）、提现地址（`destination`，修改需邮箱验证码）与 `withdrawals`；`wallet-conversion-quotes`、`wallet-conversions` 将本人已沉淀净收益不可逆地转入消费余额 |
+| `/v1/market-provider-finance/*` | 10 | 用户 Session | Provider 收入（`me`、`earnings`、`holds`）及到账历史只读；收益沉淀后自动计入余额，原提现、地址和手动收益转入写接口返回 `410` |
 | `/v1/payment-webhooks/dujiaopay` | 2 | 网关签名或仅唤醒查单 | DujiaoPay 回调；固定 URL 与旧带渠道 ID 的 URL，入账始终以认证查单为准 |
 | `/v1/market-notifications*` | 3 | 用户 Session | 钱包与 Provider 站内通知、已读与偏好 |
 | `/v1/market-providers*` | 3 | 公开 / 用户 Session | Provider 排名与详情；`me/funding` 为买家私有资金关系 |
@@ -386,12 +386,12 @@ Share Market 与 Client Market 按产品和价格类型使用四项独立供应�
 
 付费商品的资金轨道由 Router Owner 的财务模式决定（`disabled` / `shadow` / `enabled`，新部署默认 `disabled`）。新发布的付费拼车位与付费 Host 都按自然月计价，按日计价只为既有商品和合同保留：
 
-- **平台钱包**（`enabled`）：每个 Router 用户一个全站 USD 余额，两个 Market 和所有 Provider 共用。充值经 Owner 配置的支付渠道（首个适配器为 DujiaoPay，托管收银台或站内直付二维码），用户填写希望到账的 1–1,000 美元，另付充值维护费（默认 5%，Owner 可设 0–100%）；只有认证查单与链上回执核验通过才入账，浏览器回跳不算付款证明。余额不能提现，可按邮箱免费转给本 Router 已验证的其他用户。付费拼车位默认先享受 12 小时健康时长试用（试用期 Token 上限默认 100 万），试用不扣费，之后从钱包扣当期款并可选自动续费；余额不足时暂停服务，默认第 5 天提醒、第 7 天进入清理终止。服务退款回到钱包。Provider 按已履约收入记账并扣平台服务费（默认 10%，上调 7 天后生效），净收益在 `max(买家扣款, 履约) + 7 天` 后可申请 USDT（TRON）提现，由 Owner 线下转账并登记；钱包模式下 Provider 发布付费商品前必须先配置并度过 24 小时冷静期的提现地址。切换需 Owner 完成真实商户影子验收后经 API 批准，单向不可回退；切换后旧资金写接口返回 `410`，以旧模式发布的付费商品需 Provider 重新发布。完整契约与切换清单见 [docs/market-platform-wallet-implementation.md](docs/market-platform-wallet-implementation.md)。
+- **平台钱包**（`enabled`）：每个 Router 用户一个全站 USD 余额，两个 Market 和所有 Provider 共用。充值经 Owner 配置的支付渠道（首个适配器为 DujiaoPay，托管收银台或站内直付二维码），用户填写希望到账的 1–1,000 美元，另付充值维护费（默认 5%，Owner 可设 0–100%）；只有认证查单与链上回执核验通过才入账，浏览器回跳不算付款证明。余额不能提现，可按邮箱免费转给本 Router 已验证的其他用户。付费拼车位默认先享受 12 小时健康时长试用（试用期 Token 上限默认 100 万），试用不扣费，之后从钱包扣当期款并可选自动续费；余额不足时暂停服务，默认第 5 天提醒、第 7 天进入清理终止。服务退款回到钱包。Provider 按已履约收入记账并扣平台服务费（默认 10%，上调 7 天后生效），净收益在 `max(买家扣款, 履约) + 7 天` 后自动 1:1 计入平台余额，可用于消费、C2C 出售或邮箱转账；不提供外部提现，发布商品也不要求提现地址。切换需 Owner 完成真实商户影子验收后经 API 批准，单向不可回退；切换后旧资金写接口返回 `410`，以旧模式发布的付费商品需 Provider 重新发布。完整契约与切换清单见 [docs/market-platform-wallet-implementation.md](docs/market-platform-wallet-implementation.md)。
 - **旧 Provider 资金轨道**（`disabled` / `shadow`）：平台充值不开放；付费拼车位按「买家 + 供应商」聚合的 USD 赊账/预存账户租用，Client Market 的新付费购买界面只接受平台钱包报价，因此切换前不开放付费 Host 购买。按日计价的服务先享受 12 小时健康时长试用，之后只按 Router 观测到的健康服务秒数累计；有限额度使用达到 80% 时向相关 Client 公开聊天室写入系统预警，用满后生成聚合账单并暂停相关服务。无限额度不自动出账，供应商可主动要求清账；买家也可主动清账，最后一项服务结束时剩余余额会自动出账。买家线下付款并声明，由供应商确认到账（也可启用币安自动到账）；逾期声明或争议不会自行解除市场赊账限制。账单冻结出账时的 USD/CNY 汇率和人民币金额，CNY 不形成独立账户。
 
 两条轨道都只以 USD 记账；人民币按 Router 每 15 分钟获取的 USD/CNY 汇率近似展示。
 
-Provider 已完成七天沉淀、未被冻结或分配提现的净收益，可在「账户 → 收益与提现」明确选择 1:1 转入自己的平台消费余额；两个市场余额不足时也提供该入口。转入不再收充值维护费或平台服务费，到账后可消费或通过邮箱转给本 Router 已验证用户，但不可撤回、提现或转回收益。消费余额不提供现金退款；服务异常的结算退回只回到钱包。Owner 可在钱包政策中独立暂停新转入；内部转入不是平台收入，详见实施文档 §17。
+Provider 收益完成七天沉淀后由后台自动入账，不需要手动转入，也不再收取充值维护费或平台服务费。用户在「账户 → 供应商收入」查看明细，在「平台余额」消费、邮箱转账或按 C2C 规则出售。旧外部提现和手动转入流程已退役；收入冻结、身份校验及历史账本审计继续保留。详见 [收益自动到账契约](docs/market-earnings-automatic-credit.md)。
 
 Client 公开聊天室与 `installation.id` 一一对应,只为已验证 Owner 的 Client 建立；同一 Client 下的所有 Share 共用这一房间,不存在 Share 独立聊天室。历史消息公开可读,发送真人消息必须使用 Router 登录 Session;普通用户 API Token 不能发送。匿名访客的最近聊天室和已读游标只保存在当前浏览器,登录后会一次性合并到服务端用户记录。非 Owner 真人消息在同一聊天室内从第一条消息开始使用固定 60 秒窗口聚合,窗口内每条消息都完整写入同一封 Owner 邮件;Owner 自己的消息和系统消息不会触发聊天邮件。消息与邮件事件在同一业务库事务落库,后台使用固定 Resend 幂等键、claim lease、重试和 dead-letter。Client 被清理后聊天室转为公开只读归档并保留 60 天,同一 Client 在期限内恢复时沿用原房间。
 

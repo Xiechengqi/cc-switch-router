@@ -785,6 +785,82 @@ mod tests {
     }
 
     #[test]
+    fn automatically_credited_earnings_are_transferable_with_the_same_email_code_safety() {
+        let (conn, runtime) = fixture();
+        let at = "2026-10-01T00:00:00Z";
+        let settled = "2026-10-09T00:00:00Z";
+        conn.execute("INSERT INTO market_provider_profiles(id,canonical_email,user_id,display_name,claim_state,status,created_at,updated_at)
+            VALUES('profile','recipient@example.test','recipient','Provider','claimed','active',?1,?1)",params![at]).unwrap();
+        crate::market_finance::record_metered_delivery_tx(
+            &conn,
+            "share",
+            "historical-service",
+            "earned",
+            "sender",
+            "recipient",
+            "2026-09-30T23:59:00Z",
+            at,
+            units_from_minor(700).unwrap(),
+            at,
+        )
+        .unwrap();
+        assert_eq!(
+            capacity_tx(&conn, "recipient", at)
+                .unwrap()
+                .transferable_units,
+            0
+        );
+        crate::market_finance::unlock_due_earnings_isolated(&conn, settled, 200).unwrap();
+        crate::market_earning_conversions::credit_due_earnings_isolated(&conn, settled, 200)
+            .unwrap();
+        assert_eq!(
+            capacity_tx(&conn, "recipient", settled)
+                .unwrap()
+                .transferable_units,
+            units_from_minor(700).unwrap()
+        );
+        conn.execute("INSERT INTO market_wallet_transfer_quotes(id,sender_user_id,recipient_user_id,sender_email,recipient_email,amount_units,expires_at,created_at)
+            VALUES('earned-quote','recipient','sender','recipient@example.test','sender@example.test',?1,'2026-10-09T00:15:00Z',?2)",params![units_from_minor(700).unwrap(),settled]).unwrap();
+        let (version, mac) = runtime
+            .transfer_mac("earned-code", "earned-quote", "012345")
+            .unwrap();
+        conn.execute("INSERT INTO market_wallet_transfer_challenges(id,quote_id,code_mac,key_version,expires_at,delivered_at,created_ip,created_at)
+            VALUES('earned-code','earned-quote',?1,?2,'2026-10-09T00:10:00Z',?3,'127.0.0.1',?3)",params![mac,version,settled]).unwrap();
+        let input = ConfirmRequest {
+            quote_id: "earned-quote".into(),
+            challenge_id: "earned-code".into(),
+            code: "012345".into(),
+        };
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert!(
+            confirm_tx(
+                &tx,
+                &runtime,
+                "recipient",
+                "earned-transfer",
+                &input,
+                settled
+            )
+            .unwrap()
+            .is_some()
+        );
+        tx.commit().unwrap();
+        assert_eq!(
+            wallet_snapshot_tx(&conn, "recipient")
+                .unwrap()
+                .available_units,
+            0
+        );
+        assert_eq!(
+            wallet_snapshot_tx(&conn, "sender").unwrap().available_units,
+            units_from_minor(1000).unwrap()
+        );
+        crate::market_wallet::reconcile_wallet_tx(&conn, "recipient").unwrap();
+        crate::market_wallet::reconcile_wallet_tx(&conn, "sender").unwrap();
+    }
+    #[test]
     fn racing_quotes_recheck_balance_and_daily_capacity_at_commit() {
         for daily_limit in [false, true] {
             let (conn, runtime) = fixture();

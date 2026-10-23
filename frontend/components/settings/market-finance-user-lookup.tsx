@@ -86,9 +86,7 @@ export function MarketFinanceUserLookup() {
                 {([
                   [t("marketProviderFinance.pending"), result.provider.pendingUnits],
                   [t("settings.marketFinance.lookup.providerAvailable"), result.provider.availableUnits],
-                  [t("marketProviderFinance.withdrawable"), result.provider.withdrawableUnits],
-                  [t("marketProviderFinance.held"), result.provider.withdrawalHeldUnits],
-                  [t("settings.marketFinance.lookup.providerPaid"), result.provider.paidUnits],
+                  [t("marketProviderFinance.holdsTitle"), result.provider.withdrawalHeldUnits],
                   [t("earningConversion.total"), result.provider.convertedUnits ?? "0"],
                 ] as const).map(([label, value]) => (
                   <div key={label} className="flex justify-between gap-3"><span className="text-muted-foreground">{label}</span><span className="font-medium tabular-nums">{units(value)}</span></div>

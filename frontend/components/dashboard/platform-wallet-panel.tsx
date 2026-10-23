@@ -14,11 +14,10 @@ import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { WalletTransferPanel } from "@/components/dashboard/wallet-transfer-panel";
 import { useAuth } from "@/components/auth/auth-provider";
-import { EarningWalletConversion } from "@/components/dashboard/earning-wallet-conversion";
 import { C2CBuyPanel } from "@/components/dashboard/c2c-buy-panel";
 import { C2COrdersPanel } from "@/components/dashboard/c2c-orders-panel";
 import { C2CAction } from "@/components/market/c2c-primitives";
-import { subscribeMarketBalanceChanged, notifyMarketBalanceChanged } from "@/lib/earning-wallet-conversion";
+import { subscribeMarketBalanceChanged, notifyMarketBalanceChanged } from "@/lib/market-balance-events";
 import { MarketBuyerDisputesList } from "@/components/dashboard/market-buyer-disputes-list";
 import { MarketNotificationsBell } from "@/components/dashboard/market-notifications-bell";
 import { WalletBadge } from "@/components/market/wallet-primitives";
@@ -759,7 +758,6 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
           {displayCurrency === "CNY" && fxRateFresh ? <p className="mt-1 text-xs text-muted-foreground">{t("marketWallet.displayOnly", { amount: formatWalletUnits(wallet.availableUnits) })}</p> : null}
           <p className="mt-2 text-sm text-muted-foreground">{t("marketWallet.held")}: {displayCurrency === "CNY" && fxRateFresh ? formatWalletUnitsAsCny(wallet.heldUnits, fxRateMicros, locale) : formatWalletUnits(wallet.heldUnits)}</p>
           {wallet.committedUnits && wallet.committedUnits !== "0" ? <p className="mt-1 text-sm text-muted-foreground">{t("marketWallet.committed")}: {formatWalletUnits(wallet.committedUnits)}</p> : null}
-          <div className="mt-4"><EarningWalletConversion capacity={wallet.earningsConversion} onConverted={reload} disabled={!!busy} /></div>
         </div>
         <div className="grid min-w-0 content-start gap-4">
           <div role="group" aria-label={t("marketWallet.channel")} className="flex flex-wrap gap-2">

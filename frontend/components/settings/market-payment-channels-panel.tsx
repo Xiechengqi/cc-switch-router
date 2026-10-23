@@ -22,7 +22,6 @@ import { MarketChannelSettingsDialog, channelSettingsSummary } from "@/component
 import { MarketFinanceUserLookup } from "@/components/settings/market-finance-user-lookup";
 import { MarketFinanceEarningHolds } from "@/components/settings/market-finance-earning-holds";
 import { codeLabel, ownerDateText, ownerErrorText } from "@/components/settings/market-finance-shared";
-import { MarketFinanceTransfersPanel } from "@/components/settings/market-finance-transfers-panel";
 import { MarketFinanceDisputesPanel } from "@/components/settings/market-finance-disputes-panel";
 import { MarketFinanceTopupRecoveryPanel } from "@/components/settings/market-finance-topup-recovery-panel";
 import { useLocaleText } from "@/components/i18n/locale-provider";
@@ -163,15 +162,14 @@ export function MarketPaymentChannelsPanel() {
     }
   };
 
-  const setPause = (patch: Partial<Pick<MarketFinanceReadiness, "newOrdersPaused" | "newWithdrawalsPaused" | "newTopupsPaused">>) => {
+  const setPause = (patch: Partial<Pick<MarketFinanceReadiness, "newOrdersPaused" | "newTopupsPaused">>) => {
     if (!readiness) return;
     const next = {
       newOrdersPaused: readiness.newOrdersPaused,
-      newWithdrawalsPaused: readiness.newWithdrawalsPaused,
       newTopupsPaused: readiness.newTopupsPaused ?? false,
       ...patch,
     };
-    void perform("pause", () => setMarketFinancePause(next.newOrdersPaused, next.newWithdrawalsPaused, readiness.version, next.newTopupsPaused));
+    void perform("pause", () => setMarketFinancePause(next.newOrdersPaused, readiness.version, next.newTopupsPaused));
   };
 
   const confirmRewrap = () => void perform("rewrap", async () => {
@@ -307,7 +305,6 @@ export function MarketPaymentChannelsPanel() {
               {([
                 ["newTopupsPaused", "settings.marketFinance.pause.newTopups", true],
                 ["newOrdersPaused", "settings.marketFinance.newOrders", readiness.mode === "enabled"],
-                ["newWithdrawalsPaused", "settings.marketFinance.newWithdrawals", readiness.mode === "enabled"],
               ] as const).filter(([, , shown]) => shown).map(([field, label]) => {
                 const paused = !!readiness[field];
                 return (
@@ -511,7 +508,6 @@ export function MarketPaymentChannelsPanel() {
       <MarketFinanceUserLookup />
       <MarketFinanceEarningHolds refreshKey={refreshKey} onChanged={reloadCore} />
       <MarketFinanceTopupRecoveryPanel onRecovered={reload} />
-      <MarketFinanceTransfersPanel financeMode={readiness?.mode ?? "disabled"} withdrawalsPaused={readiness?.newWithdrawalsPaused ?? false} />
       <MarketFinanceDisputesPanel />
     </section>
   );

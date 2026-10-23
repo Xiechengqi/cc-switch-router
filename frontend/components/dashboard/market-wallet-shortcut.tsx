@@ -12,7 +12,6 @@ import { useLocaleText } from "@/components/i18n/locale-provider";
 import { DASHBOARD_ACCOUNT_WALLET_PATH } from "@/lib/dashboard-nav";
 import { useMarketWalletBalance } from "@/components/market/market-wallet-balance-provider";
 import { formatWalletUnits, formatWalletUnitsAsCny } from "@/lib/market-wallet-money";
-import { EarningWalletConversion } from "@/components/dashboard/earning-wallet-conversion";
 
 export function MarketWalletShortcut() {
   const { session } = useAuth();
@@ -36,7 +35,6 @@ export function MarketWalletShortcut() {
         <strong className="min-w-0 break-all tabular-nums" aria-live="polite">{display}</strong>
       </span>
       <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-2">
-      {wallet?.earningsConversion ? <EarningWalletConversion capacity={wallet.earningsConversion} /> : null}
       <Link
         href={DASHBOARD_ACCOUNT_WALLET_PATH}
         className="inline-flex min-h-11 shrink-0 items-center whitespace-nowrap font-medium text-primary underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring active:opacity-70"

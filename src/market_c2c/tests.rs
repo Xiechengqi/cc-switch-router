@@ -88,6 +88,68 @@ fn transaction<T>(
     Ok(v)
 }
 #[test]
+fn automatically_credited_earnings_can_open_c2c_and_deliver_existing_balance() {
+    let c = fixture();
+    c.execute("INSERT INTO market_provider_profiles(id,canonical_email,user_id,display_name,claim_state,status,created_at,updated_at)
+        VALUES('profile','other@example.test','other','Provider','claimed','active',?1,?1)",params![AT]).unwrap();
+    crate::market_finance::record_metered_delivery_tx(
+        &c,
+        "share",
+        "historical-service",
+        "earned",
+        "seller",
+        "other",
+        "2026-10-22T11:59:00Z",
+        "2026-10-22T12:00:00Z",
+        units_from_minor(12000).unwrap(),
+        AT,
+    )
+    .unwrap();
+    assert!(save_seller_tx(&c, "other", &terms(), AT).is_err());
+    let settled = "2026-10-30T12:00:00Z";
+    crate::market_finance::unlock_due_earnings_isolated(&c, settled, 200).unwrap();
+    assert_eq!(
+        crate::market_earning_conversions::credit_due_earnings_isolated(&c, settled, 200).unwrap(),
+        1
+    );
+    save_seller_tx(&c, "other", &terms(), settled).unwrap();
+    let q = quote_tx(
+        &c,
+        "buyer",
+        &QuoteInput {
+            seller_id: "other".into(),
+            amount_minor: 10000,
+        },
+        settled,
+    )
+    .unwrap();
+    let o = create_tx(
+        &c,
+        "buyer",
+        &input(&q),
+        "income-c2c-order",
+        "127.0.0.1",
+        settled,
+    )
+    .unwrap();
+    let o = mark_paid_tx(&c, &o, "buyer", o.version, settled).unwrap();
+    release_tx(&c, &o, "other", settled).unwrap();
+    assert_eq!(
+        wallet_snapshot_tx(&c, "other").unwrap().available_units,
+        units_from_minor(2000).unwrap()
+    );
+    assert_eq!(
+        wallet_snapshot_tx(&c, "buyer").unwrap().available_units,
+        units_from_minor(10000).unwrap()
+    );
+    crate::market_wallet::reconcile_wallet_tx(&c, "other").unwrap();
+    crate::market_wallet::reconcile_wallet_tx(&c, "buyer").unwrap();
+    assert_eq!(
+        crate::market_reconcile::audit_finance_tx(&c, settled).unwrap(),
+        0
+    );
+}
+#[test]
 fn ordinary_users_can_sell_without_provider_identity_and_admission_is_not_a_reserve() {
     let c = fixture();
     offer(&c);

@@ -281,9 +281,6 @@ try {
   await page.context().route("**/v1/market-provider-finance/me", async (route) => {
     await route.fulfill({ contentType: "application/json", body: JSON.stringify({ isProvider: false }) });
   });
-  await page.context().route("**/v1/market-provider-finance/withdrawals", async (route) => {
-    await route.fulfill({ contentType: "application/json", body: JSON.stringify({ items: [], nextCursor: null }) });
-  });
   await page.context().route("**/v1/market-access/dashboard", async (route) => {
     await route.fulfill({ contentType: "application/json", body: JSON.stringify({ policies: [], counterparties: [], accessRequests: [] }) });
   });
@@ -430,191 +427,75 @@ try {
   assert.equal(accessUpdates, 1);
   assert.equal(await page.locator('a[href="/account/earnings/"]').count(), 0, "ordinary buyers do not get a Provider income tab");
 
-  let canWithdraw = true;
-  let convertible = "777600000";
-  let converted = "0";
-  let conversionPosts = 0;
-  let conversionQuotes = 0;
-  let loseConversionResponse = false;
-  let conversionFailure = null;
-  let batchRequired = false;
-  let lastConversionQuote;
-  const conversions = [];
-  const conversionKeys = [];
-  await page.context().route("**/v1/market-provider-finance/wallet-conversion-quotes", async (route) => {
-    conversionQuotes += 1;
-    const input = route.request().postDataJSON();
-    assert.ok(input.all === true || input.batch === true || Number.isSafeInteger(input.amountMinor));
-    if (batchRequired && !input.batch) {
-      await route.fulfill({ status: 409, contentType: "application/json", body: JSON.stringify({ code: "EARNING_CONVERSION_BATCH_LIMIT", message: "too many lots" }) });
-      return;
-    }
-    if (input.batch) batchRequired = false;
-    lastConversionQuote = { id: `earning-quote-${conversionQuotes}`, amountUnits: input.batch ? "1" : input.all ? convertible : (BigInt(input.amountMinor) * 86400n).toString(), termsVersion: 1,
-      expiresAt: new Date(Date.now() + 300000).toISOString() };
-    await route.fulfill({ contentType: "application/json", body: JSON.stringify(lastConversionQuote) });
+  // Model the worker's authoritative credit, never a browser-created transfer.
+  let matured = false;
+  let credited = "0";
+  let retiredWrites = 0;
+  const earning = () => ({
+    id: "net-earning", amountUnits: "777600000", grossUnits: "864000000", commissionUnits: "86400000",
+    commissionReversedUnits: "0", commissionRateBps: 1000, commissionPolicyVersion: 1,
+    reversedUnits: "0", unlockedUnits: matured ? "777600000" : "0", heldUnits: "0",
+    creditedUnits: credited, disputed: false,
+    fulfilledAt: "2026-01-01T00:00:00Z", unlockAt: "2026-01-08T00:00:00Z",
   });
-  await page.context().route("**/v1/market-provider-finance/wallet-conversions*", async (route) => {
-    if (route.request().method() === "GET") {
-      const quoteId = new URL(route.request().url()).searchParams.get("quoteId");
-      await route.fulfill({ contentType: "application/json", body: JSON.stringify({ items: quoteId ? conversions.filter((value) => value.quoteId === quoteId) : conversions, nextCursor: null }) });
-      return;
-    }
-    conversionPosts += 1;
-    conversionKeys.push(route.request().headers()["idempotency-key"]);
-    const input = route.request().postDataJSON();
-    assert.deepEqual(input, { quoteId: lastConversionQuote.id, termsVersion: 1, acknowledgeNonWithdrawable: true });
-    assert.ok(conversionKeys.at(-1));
-    if (conversionFailure) {
-      const code = conversionFailure;
-      conversionFailure = null;
-      await route.fulfill({ status: 409, contentType: "application/json", body: JSON.stringify({ code, message: "changed" }) });
-      return;
-    }
-    let value = conversions.find((value) => value.quoteId === input.quoteId);
-    if (!value) {
-      value = { id: `conversion-${conversionPosts}`, quoteId: input.quoteId, amountUnits: lastConversionQuote.amountUnits,
-        termsVersion: 1, journalId: `earning-journal-${conversionPosts}`, createdAt: new Date().toISOString() };
-      conversions.unshift(value);
-      converted = (BigInt(converted) + BigInt(value.amountUnits)).toString();
-      convertible = (BigInt(convertible) - BigInt(value.amountUnits)).toString();
-    }
-    if (loseConversionResponse) {
-      loseConversionResponse = false;
-      await route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ message: "lost response" }) });
-      return;
-    }
-    await route.fulfill({ contentType: "application/json", body: JSON.stringify(value) });
-  });
+  for (const suffix of ["wallet-conversion-quotes", "wallet-conversions", "withdrawals", "destination"]) {
+    await page.context().route("**/v1/market-provider-finance/" + suffix, async (route) => {
+      retiredWrites += 1;
+      await route.fulfill({ status: 410, contentType: "application/json", body: JSON.stringify({ code: "RETIRED" }) });
+    });
+  }
   await page.context().route("**/v1/market-provider-finance/me", async (route) => {
     await route.fulfill({ contentType: "application/json", body: JSON.stringify({
-      isProvider: false, hasFinanceActivity: true, canWithdraw, destination: null,
-      convertibleUnits: convertible, canConvert: true, conversionBlockers: [],
+      isProvider: false, hasFinanceActivity: true, canPublishPaidOffers: false, automaticCredit: true,
       summary: { grossEarnedUnits: "864000000", commissionUnits: "86400000", netEarnedUnits: "777600000",
-        pendingUnits: "0", availableUnits: convertible, withdrawableUnits: convertible, withdrawalHeldUnits: "0", paidUnits: "0", convertedUnits: converted },
+        pendingUnits: matured ? "0" : "777600000", readyUnits: matured && credited === "0" ? "777600000" : "0",
+        restrictedUnits: "0", creditedUnits: credited },
     }) });
   });
   await page.context().route("**/v1/market-provider-finance/holds", async (route) => {
     await route.fulfill({ contentType: "application/json", body: "[]" });
   });
   await page.context().route("**/v1/market-provider-finance/earnings", async (route) => {
-    await route.fulfill({ contentType: "application/json", body: JSON.stringify({ items: [{
-      id: "net-earning", amountUnits: "777600000", grossUnits: "864000000", commissionUnits: "86400000",
-      commissionReversedUnits: "0", commissionRateBps: 1000, commissionPolicyVersion: 1,
-      reversedUnits: "0", unlockedUnits: "777600000", heldUnits: "0", paidUnits: "0", convertedUnits: converted, disputed: false,
-      fulfilledAt: "2026-01-01T00:00:00Z", unlockAt: "2026-01-08T00:00:00Z",
-    }], nextCursor: null }) });
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify({ items: [earning()], nextCursor: null }) });
   });
   await page.reload();
-  await page.getByRole("link", { name: "Earnings & withdrawals", exact: true }).click();
-  await page.getByRole("heading", { name: "Provider earnings", exact: true }).waitFor();
-  await page.getByRole("columnheader", { name: "Net earnings", exact: true }).waitFor();
-  const earningSummary = page.getByText("Revenue & service fees", { exact: true });
+  await page.getByRole("link", { name: "Provider earnings", exact: true }).click();
+  const earningsPanel = page.getByRole("region", { name: "Provider earnings", exact: true });
+  await earningsPanel.getByRole("columnheader", { name: "Net earnings", exact: true }).waitFor();
+  const earningSummary = earningsPanel.getByText("Revenue & service fees", { exact: true });
   assert.equal(await earningSummary.locator("..").getAttribute("open"), null, "detailed accounting starts collapsed");
   await earningSummary.click();
-  const earningTotals = page.locator("dl").filter({ hasText: "Fulfilled revenue (net of refunds)" });
+  const earningTotals = earningsPanel.locator("dl").filter({ hasText: "Fulfilled revenue (net of refunds)" });
   await earningTotals.getByText("$100.00", { exact: true }).waitFor();
   await earningTotals.getByText("$10.00", { exact: true }).waitFor();
   await earningTotals.getByText("$90.00", { exact: true }).waitFor();
-  await page.getByText("Fee breakdown", { exact: true }).click();
-  await page.getByText("Gross $100.00", { exact: true }).waitFor();
-  await page.getByText("Service fee 10% · $10.00", { exact: true }).waitFor();
+  await earningsPanel.getByText("Fee breakdown", { exact: true }).click();
+  await earningsPanel.getByText("Gross $100.00", { exact: true }).waitFor();
+  await earningsPanel.getByText("Service fee 10% · $10.00", { exact: true }).waitFor();
+  const incomeRow = earningsPanel.getByRole("row").filter({ hasText: "Gross $100.00" });
+  await incomeRow.getByText("Pending", { exact: true }).waitFor();
+  assert.equal(await earningsPanel.getByRole("button", { name: /withdraw|move to balance/i }).count(), 0);
+  await earningsPanel.getByRole("link", { name: "View balance", exact: true }).waitFor();
+  assert.equal(await earningsPanel.locator('a[href="/account/wallet/?c2cSell=1#c2c-orders"]').count(), 1);
+  assert.equal(await earningsPanel.locator('a[href="/account/wallet/#wallet-transfer"]').count(), 1);
   for (const width of [320, 375, 414, 768]) {
     await page.setViewportSize({ width, height: 900 });
-    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `Provider net earnings overflow at ${width}`);
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, "Provider income page overflows at " + width);
   }
-  // No screenshot: exercise confirmation, keyboard, mobile geometry, lost
-  // responses and recovery on the real rendered conversion control.
-  const conversionControl = page.getByTestId("earning-conversion");
-  await conversionControl.getByRole("button", { name: "Move to balance", exact: true }).click();
-  let conversionDialog = page.getByRole("dialog", { name: "Move earnings to balance", exact: true });
-  await conversionDialog.getByLabel("Custom amount", { exact: true }).check();
-  await conversionDialog.getByRole("textbox", { name: "Amount (USD)", exact: true }).fill("0");
-  await page.keyboard.press("Tab");
-  await conversionDialog.getByText(/Enter at least/).waitFor();
-  assert.equal(await conversionDialog.getByRole("button", { name: "Review amount", exact: true }).isDisabled(), true);
-  await conversionDialog.getByRole("textbox", { name: "Amount (USD)", exact: true }).fill("5");
-  await conversionDialog.getByRole("button", { name: "Review amount", exact: true }).click();
-  await conversionDialog.getByText("$5.00", { exact: true }).waitFor();
-  assert.equal(await conversionDialog.getByRole("button", { name: "Confirm move", exact: true }).isDisabled(), true);
-  for (const width of [320, 375, 414, 768]) {
-    await page.setViewportSize({ width, height: 900 });
-    const geometry = await conversionDialog.evaluate((dialog) => ({ width: dialog.getBoundingClientRect().width, left: dialog.getBoundingClientRect().left,
-      scrollWidth: dialog.scrollWidth, clientWidth: dialog.clientWidth, viewport: innerWidth }));
-    assert.ok(geometry.left >= 0 && geometry.width <= geometry.viewport && geometry.scrollWidth <= geometry.clientWidth, `conversion geometry ${width}`);
-    for (const button of await conversionDialog.getByRole("button").all()) {
-      const lines = await button.evaluate((element) => getComputedStyle(element).whiteSpace);
-      assert.equal(lines, "nowrap");
-    }
-  }
-  await conversionDialog.getByRole("checkbox").check();
-  const confirmation = conversionDialog.getByRole("button", { name: "Confirm move", exact: true });
-  await confirmation.focus();
-  await page.keyboard.press("Tab");
-  await page.keyboard.press("Shift+Tab");
-  assert.ok(await confirmation.evaluate((button) => button.matches(":focus-visible") && parseFloat(getComputedStyle(button).outlineWidth) >= 2));
-  await assertCommissionContrast(conversionDialog);
-  await confirmation.click();
-  await conversionDialog.getByRole("status").filter({ hasText: "Moved $5.00" }).waitFor();
-  assert.equal(conversionPosts, 1);
-  assert.equal(await conversionDialog.getByRole("button", { name: "Confirm move", exact: true }).count(), 0);
-  await conversionDialog.getByRole("button", { name: "Close", exact: true }).click();
-  await page.getByText("Earnings moved to balance · $5.00", { exact: true }).click();
-  await page.getByTestId("earning-conversion-history").getByText("conversion-1", { exact: true }).waitFor();
-  // A committed request with a lost HTTP response must be recoverable after
-  // reload without automatically sending a second financial POST.
-  await conversionControl.getByRole("button", { name: "Move to balance", exact: true }).click();
-  conversionDialog = page.getByRole("dialog", { name: "Move earnings to balance", exact: true });
-  await conversionDialog.getByLabel("Custom amount", { exact: true }).check();
-  await conversionDialog.getByRole("textbox", { name: "Amount (USD)", exact: true }).fill("1");
-  await conversionDialog.getByRole("button", { name: "Review amount", exact: true }).click();
-  await conversionDialog.getByRole("checkbox").check();
-  loseConversionResponse = true;
-  await conversionDialog.getByRole("button", { name: "Confirm move", exact: true }).click();
-  await conversionDialog.getByRole("alert").filter({ hasText: /not yet confirmed/ }).waitFor();
-  const postsBeforeReload = conversionPosts;
+  matured = true;
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await incomeRow.getByText("Awaiting automatic credit", { exact: true }).waitFor();
+  credited = "777600000";
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await incomeRow.getByText("Credited to balance", { exact: true }).waitFor();
   await page.reload();
-  await page.getByTestId("earning-conversion").getByRole("button", { name: "Check result", exact: true }).click();
-  conversionDialog = page.getByRole("dialog", { name: "Move earnings to balance", exact: true });
-  await conversionDialog.getByRole("button", { name: "Check result", exact: true }).click();
-  await conversionDialog.getByRole("status").filter({ hasText: "Moved $1.00" }).waitFor();
-  assert.equal(conversionPosts, postsBeforeReload, "reload and lookup never repeat the conversion POST");
-  await conversionDialog.getByRole("button", { name: "Close", exact: true }).click();
-  // A stale quote is a recoverable validation error, not partial success.
-  await page.getByTestId("earning-conversion").getByRole("button", { name: "Move to balance", exact: true }).click();
-  conversionDialog = page.getByRole("dialog", { name: "Move earnings to balance", exact: true });
-  await conversionDialog.getByRole("button", { name: "Review amount", exact: true }).click();
-  await conversionDialog.getByRole("checkbox").check();
-  conversionFailure = "EARNING_CONVERSION_INSUFFICIENT";
-  await conversionDialog.getByRole("button", { name: "Confirm move", exact: true }).click();
-  await conversionDialog.getByRole("alert").filter({ hasText: /Earnings changed/ }).waitFor();
-  assert.equal(conversions.length, 2);
-  await conversionDialog.getByRole("button", { name: "Close", exact: true }).click();
-  // An explicit batch can include fractions below a cent. It has its own
-  // preview/consent, and an already-expanded history refreshes on completion.
-  const conversionHistory = page.getByTestId("earning-conversion-history");
-  if (await conversionHistory.getAttribute("open") === null) await conversionHistory.locator("summary").click();
-  batchRequired = true;
-  await page.getByTestId("earning-conversion").getByRole("button", { name: "Move to balance", exact: true }).click();
-  conversionDialog = page.getByRole("dialog", { name: "Move earnings to balance", exact: true });
-  await conversionDialog.getByRole("button", { name: "Review amount", exact: true }).click();
-  await conversionDialog.getByRole("button", { name: "Review next batch", exact: true }).click();
-  await conversionDialog.getByText("Exact amount: 1 ledger units", { exact: true }).waitFor();
-  assert.equal(await conversionDialog.getByRole("button", { name: "Confirm move", exact: true }).isDisabled(), true);
-  await conversionDialog.getByRole("checkbox").check();
-  await conversionDialog.getByRole("button", { name: "Confirm move", exact: true }).click();
-  await conversionDialog.getByRole("status").filter({ hasText: "Moved" }).waitFor();
-  await conversionDialog.getByRole("button", { name: "Close", exact: true }).click();
-  await conversionHistory.getByText(conversions[0].id, { exact: true }).waitFor();
-  assert.equal(conversions[0].amountUnits, "1");
-  canWithdraw = false;
-  await page.reload();
-  await page.getByText(/Earnings history remains visible/).waitFor();
+  await incomeRow.getByText("Credited to balance", { exact: true }).waitFor();
+  assert.equal(retiredWrites, 0, "viewing earnings never invokes retired payout or manual-credit endpoints");
 
   // Owner policy edits use integer basis points and versioned writes. A
   // conflict must reload the current policy, never silently overwrite it.
   let policy = { version: 1, maintenanceFeeBps: 500, transfersEnabled: true,
-    transfersPaused: false, earningsConversionsPaused: false, transferMaxMinor: 500_000, transferDailyMaxMinor: 500_000,
+    transfersPaused: false, transferMaxMinor: 500_000, transferDailyMaxMinor: 500_000,
     balanceRefundable: false, canEdit: true };
   let policyWrites = 0;
   let conflictPolicy = false;
@@ -642,7 +523,7 @@ try {
     if (path === "/v1/admin/settings") data = { revision: "1", generatedAt: new Date().toISOString(),
       envPath: "/test/.env", schema: { categories, fields: [], groups: [] }, values: [], pendingRestartKeys: [] };
     else if (path === "/v1/admin/market-finance/readiness") data = { mode: "enabled", version: 1,
-      newOrdersPaused: false, newWithdrawalsPaused: false, newTopupsPaused: false, codeIntegrated: true,
+      newOrdersPaused: false, newTopupsPaused: false, codeIntegrated: true,
       legacyBlockers: [], criticalCases: 0, staleTopupReviews: 0, verifiedLiveTopups: 1,
       paymentChannelBlockers: [], canEnable: false };
     else if (path === "/v1/admin/market-finance/overview") data = overview;
@@ -676,7 +557,7 @@ try {
         assert.equal(input.maintenanceFeeBps, conflictPolicy ? 600 : 525);
         assert.equal(input.canEdit, undefined);
         assert.equal(input.balanceRefundable, undefined);
-        assert.equal(input.earningsConversionsPaused, false);
+        assert.equal(input.earningsConversionsPaused, undefined);
         if (conflictPolicy) {
           conflictPolicy = false;
           policy = { ...policy, version: policy.version + 1, maintenanceFeeBps: 700 };
@@ -752,7 +633,7 @@ try {
   assert.equal(await commissionInput.isDisabled(), true);
   assert.equal(await commissionPanel.getByRole("button", { name: "Save", exact: true }).isDisabled(), true);
   assert.deepEqual(pageErrors, []);
-  console.log("wallet checkout: safe new tabs, fee change, recheck/stop, exact transfer, OTP retry, scoped access, earnings conversion, explicit subcent batch, lost-response recovery, expanded history refresh and Owner policy edits passed; four widths; no screenshots or real payments");
+  console.log("wallet checkout: safe new tabs, fee change, recheck/stop, exact transfer, OTP retry, scoped access, automatic earnings credit, retired payout/manual-credit paths and Owner policy edits passed; four widths; no screenshots or real payments");
 } finally {
   await browser?.close();
   if (server) await new Promise((resolveStop, rejectStop) => {

@@ -14,7 +14,7 @@ import {
   lookupClientMarketHostIpInfo,
   testClientMarketHostSsh,
 } from "@/lib/api";
-import { DASHBOARD_ACCOUNT_EARNINGS_PATH, DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH, DASHBOARD_ACCOUNT_WALLET_PATH } from "@/lib/dashboard-nav";
+import { DASHBOARD_ACCOUNT_EARNINGS_PATH, DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH } from "@/lib/dashboard-nav";
 import { MARKET_CURRENCY } from "@/lib/market-money";
 import type { HostIpIntel, ProvisionSshKey } from "@/lib/types";
 import { usePersistentState } from "@/lib/use-persistent-state";
@@ -503,8 +503,8 @@ export function AddHostDialog({
                 {pricing === "paid" && paidReadiness.status === "loaded" && !paidOfferReady ? (
                   <div role="alert" className="grid gap-1.5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-950">
                     {paidReadiness.rail === "wallet" ? <>
-                      <span>{t(`shareMarket.paidReadiness.wallet.${paidReadiness.walletSetup || "destination"}`)}</span>
-                      <a href={DASHBOARD_ACCOUNT_WALLET_PATH} className="whitespace-nowrap font-medium text-foreground underline underline-offset-2">{t("shareMarket.paidReadiness.goWallet")}</a>
+                      <span>{t(`shareMarket.paidReadiness.wallet.${paidReadiness.walletSetup || "provider"}`)}</span>
+                      <a href={DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH} className="whitespace-nowrap font-medium text-foreground underline underline-offset-2">{t("shareMarket.paidReadiness.goProvider")}</a>
                     </> : <>
                       <span>{t("clientMarket.offerRequiresBilling")}</span>
                       <div className="flex flex-wrap gap-3">

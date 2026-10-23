@@ -10,7 +10,6 @@ import { getAccountPaymentProfile, getMarketBillingDashboard } from "@/lib/api";
 import {
   DASHBOARD_ACCOUNT_EARNINGS_PATH,
   DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH,
-  DASHBOARD_ACCOUNT_WALLET_PATH,
 } from "@/lib/dashboard-nav";
 import { MARKET_CURRENCY } from "@/lib/market-money";
 import { getMarketProviderFinance, getMarketWallet } from "@/lib/market-wallet-api";
@@ -20,7 +19,7 @@ export type PaidOfferReadiness = {
   paymentReady: boolean;
   settlementReady: boolean;
   rail: "legacy" | "wallet" | null;
-  walletSetup: "ready" | "provider" | "destination" | "cooling" | null;
+  walletSetup: "ready" | "provider" | null;
 };
 
 const INITIAL_READINESS: PaidOfferReadiness = {
@@ -43,10 +42,7 @@ export function usePaidOfferReadiness(enabled: boolean) {
       if (wallet.mode === "enabled") {
         const finance = await getMarketProviderFinance();
         if (request !== requestRef.current) return;
-        const walletSetup = !finance.isProvider ? "provider"
-          : !finance.destination ? "destination"
-            : !Number.isFinite(Date.parse(finance.destination.usableAt))
-              || Date.parse(finance.destination.usableAt) > Date.now() ? "cooling" : "ready";
+        const walletSetup = finance.canPublishPaidOffers ? "ready" : "provider";
         setReadiness({
           status: "loaded",
           rail: "wallet",
@@ -158,10 +154,10 @@ export function PaidOfferReadinessNotice({
         <>
           <strong>{t("shareMarket.paidReadiness.title")}</strong>
           <ReadinessLine ready={false}>
-            {t(`shareMarket.paidReadiness.wallet.${readiness.walletSetup || "destination"}`)}
+            {t(`shareMarket.paidReadiness.wallet.${readiness.walletSetup || "provider"}`)}
           </ReadinessLine>
-          <Link className="whitespace-nowrap font-medium underline underline-offset-2" href={DASHBOARD_ACCOUNT_WALLET_PATH}>
-            {t("shareMarket.paidReadiness.goWallet")}
+          <Link className="whitespace-nowrap font-medium underline underline-offset-2" href={DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH}>
+            {t("shareMarket.paidReadiness.goProvider")}
           </Link>
         </>
       ) : (

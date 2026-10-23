@@ -4,7 +4,6 @@ import {
   formatWalletUnits,
   formatWalletUnitsAsCny,
   parseUsdMinor,
-  parseWithdrawalMinor,
   parseNonNegativeUsdMinor,
   payableCheckoutUrl,
   safeCheckoutUrl,
@@ -33,14 +32,6 @@ test("top-up amount accepts only exact supported cents", () => {
   assert.equal(parseUsdMinor("1000"), 100_000);
   for (const invalid of ["0.99", "1000.01", "1.001", "1e2", "-1", ".50", "01.00"]) {
     assert.equal(parseUsdMinor(invalid), null, invalid);
-  }
-});
-
-test("Provider withdrawal parses exact cents beyond the top-up per-order limit", () => {
-  assert.equal(parseWithdrawalMinor("1.00"), 100);
-  assert.equal(parseWithdrawalMinor("10000.75"), 1_000_075);
-  for (const invalid of ["0.99", "1.001", "1e5", "-1", "90071992547409.92"]) {
-    assert.equal(parseWithdrawalMinor(invalid), null, invalid);
   }
 });
 

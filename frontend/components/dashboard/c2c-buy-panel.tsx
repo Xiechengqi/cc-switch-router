@@ -7,7 +7,7 @@ import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { C2CAction, C2CCheck, C2CDialog, C2CError, C2C_INPUT } from "@/components/market/c2c-primitives";
 import { formatMinorUsd } from "@/lib/market-wallet-money";
-import { notifyMarketBalanceChanged } from "@/lib/earning-wallet-conversion";
+import { notifyMarketBalanceChanged } from "@/lib/market-balance-events";
 import { C2C_PENDING_PREFIX, c2cDefinitelyRejected, c2cErrorKey, c2cNow, c2cPayLabel, createC2C, getC2COffers, getC2COrders, getC2CPolicy, matchC2CPendingOrder, parseC2CMinor, quoteC2C, readC2CPending, writeC2CPending, type C2COffer, type C2COrder, type C2CPending, type C2CPolicyView, type C2CQuote } from "@/lib/market-c2c";
 
 export function C2CBuyPanel({ actor, onOrder }: { actor: string; onOrder: (order: C2COrder) => void }) {

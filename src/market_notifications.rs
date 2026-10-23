@@ -152,12 +152,6 @@ pub(crate) const KINDS: &[NotificationKind] = &[
         subject_zh: "服务争议已处理",
     },
     NotificationKind {
-        kind: "payout_status",
-        mandatory: true,
-        subject_en: "Withdrawal updated",
-        subject_zh: "提现状态更新",
-    },
-    NotificationKind {
         kind: "earnings_held",
         mandatory: true,
         subject_en: "Earnings placed on hold",
@@ -168,12 +162,6 @@ pub(crate) const KINDS: &[NotificationKind] = &[
         mandatory: true,
         subject_en: "Earnings released",
         subject_zh: "收入已解冻",
-    },
-    NotificationKind {
-        kind: "payout_address_changed",
-        mandatory: true,
-        subject_en: "Withdrawal address changed",
-        subject_zh: "提现地址已变更",
     },
 ];
 
@@ -245,7 +233,6 @@ fn owner_signal(kind: &str) -> OwnerSignal {
         "gateway_external_refund" => ("warning", "Merchant recorded a gateway refund"),
         "duplicate_external_reference" => ("critical", "Duplicate external transfer reference"),
         "channel_promoted_live" => ("info", "Payment channel promoted to live"),
-        "payout_requested" => ("info", "Provider withdrawal requested"),
         "refund_requested" => ("info", "Buyer balance refund requested"),
         "dispute_opened" => ("info", "Service dispute opened"),
         "c2c_dispute" => ("warning", "C2C balance trade needs evidence review"),
@@ -692,7 +679,7 @@ fn render(item: &Claimed, dashboard: &str) -> (String, String) {
             .unwrap_or("—");
         let subject = format!("{subject_zh} / {subject_en}");
         let body = format!(
-            "{subject_zh}：{}.{:02}%；生效时间：{effective}。仅适用于新的计费周期，已承诺周期不变；提现不重复扣费。\n{subject_en}: {}.{:02}%. Effective: {effective}. Applies to new service periods only; committed periods stay unchanged. Withdrawals have no additional service fee.\n\n{}/account/earnings/",
+            "{subject_zh}：{}.{:02}%；生效时间：{effective}。仅适用于新的计费周期，已承诺周期不变；收益自动到账不再扣费。\n{subject_en}: {}.{:02}%. Effective: {effective}. Applies to new service periods only; committed periods stay unchanged. Automatic income credit has no additional service fee.\n\n{}/account/earnings/",
             rate / 100,
             rate % 100,
             rate / 100,
@@ -1109,7 +1096,7 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO market_notification_preferences VALUES ('u', 'payout_status', 0, 't')",
+            "INSERT INTO market_notification_preferences VALUES ('u', 'earnings_held', 0, 't')",
             [],
         )
         .unwrap();
@@ -1123,13 +1110,13 @@ mod tests {
         };
         assert!(recipient_tx(&conn, &optional).unwrap().opted_out);
         let mandatory = Claimed {
-            event_kind: "payout_status".into(),
+            event_kind: "earnings_held".into(),
             mandatory: true,
             ..optional
         };
         assert!(!recipient_tx(&conn, &mandatory).unwrap().opted_out);
         let (subject, body) = render(&mandatory, "https://router.example");
-        assert!(subject.contains("提现状态更新"));
+        assert!(subject.contains("收入已冻结"));
         assert!(body.contains("$12.34"));
         assert!(body.ends_with("https://router.example/account/wallet/"));
     }
@@ -1210,10 +1197,11 @@ mod tests {
         let (_, html, text) = render_email(&item, "https://router.example/");
         assert_eq!(text.matches("10.25%").count(), 2);
         assert_eq!(
-            text.matches("Withdrawals have no additional service fee.")
+            text.matches("Automatic income credit has no additional service fee.")
                 .count(),
             1
         );
+        assert!(!text.contains("Withdrawals"));
         assert!(text.ends_with("https://router.example/account/earnings/"));
         assert!(html.contains("account/earnings/"));
         assert!(!text.contains("account/wallet/"));

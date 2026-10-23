@@ -5,7 +5,6 @@ export type MarketFinanceReadiness = {
   mode: "disabled" | "shadow" | "enabled";
   version: number;
   newOrdersPaused: boolean;
-  newWithdrawalsPaused: boolean;
   newTopupsPaused: boolean;
   codeIntegrated: boolean;
   legacyBlockers: { code: string; count: number }[];
@@ -28,13 +27,6 @@ export type MarketWallet = {
   mode: "disabled" | "shadow" | "enabled";
   canTopup: boolean;
   hasWalletActivity: boolean;
-  earningsConversion: MarketEarningConversionCapacity;
-};
-
-export type MarketEarningConversionCapacity = {
-  convertibleUnits: string;
-  canConvert: boolean;
-  conversionBlockers: string[];
 };
 
 export type MarketWalletPage<T> = { items: T[]; nextCursor: string | null };
@@ -184,40 +176,15 @@ export type MarketWalletChannel = Pick<MarketPaymentChannel, "id" | "displayName
   canary?: boolean;
 };
 
-export type MarketProviderFinance = MarketEarningConversionCapacity & {
+export type MarketProviderFinance = {
   isProvider: boolean;
+  canPublishPaidOffers: boolean;
   hasFinanceActivity: boolean;
-  canWithdraw: boolean;
+  automaticCredit: true;
   summary: {
-    grossEarnedUnits: string;
-    commissionUnits: string;
-    netEarnedUnits: string;
-    pendingUnits: string;
-    availableUnits: string;
-    withdrawableUnits: string;
-    withdrawalHeldUnits: string;
-    paidUnits: string;
-    convertedUnits: string;
+    grossEarnedUnits: string; commissionUnits: string; netEarnedUnits: string;
+    pendingUnits: string; readyUnits: string; restrictedUnits: string; creditedUnits: string;
   };
-  destination: {
-    id: string;
-    version: number;
-    assetCode: "USDT";
-    network: "tron";
-    address: string;
-    usableAt: string;
-  } | null;
-};
-
-export type MarketProviderWithdrawal = {
-  id: string;
-  amountUnits: string;
-  status: string;
-  network: "tron";
-  address: string;
-  version: number;
-  createdAt: string;
-  externalReference: string | null;
 };
 
 export type MarketWalletRenewal = {
@@ -246,23 +213,6 @@ export async function updateMarketWalletRenewal(contractId: string, autoRenew: b
     }),
   );
 }
-
-export type MarketFinanceTransfer = {
-  id: string;
-  userId?: string;
-  providerUserId?: string;
-  amountUnits: string;
-  status: string;
-  version: number;
-  createdAt: string;
-  network: "tron";
-  address: string;
-  destinationVersion?: number;
-  externalReference?: string | null;
-};
-
-export type MarketFinanceTransferAction =
-  "approve" | "begin_transfer" | "mark_paid" | "reject" | "mark_failed" | "review";
 
 export type MarketServiceDispute = {
   id: string;
@@ -354,47 +304,6 @@ export async function getMarketProviderFinance() {
   );
 }
 
-export async function getMarketProviderWithdrawals(cursor?: string) {
-  const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
-  return parseJson<MarketWalletPage<MarketProviderWithdrawal>>(
-    await authFetch(`/v1/market-provider-finance/withdrawals${query}`, { cache: "no-store" }),
-  );
-}
-
-/** Step 1 of an address change: emails a 6-digit code to the account. */
-export async function requestMarketProviderDestinationChallenge(address: string) {
-  return parseJson<{ challengeId: string; expiresInSeconds: number }>(
-    await authFetch("/v1/market-provider-finance/destination/challenge", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ network: "tron", address }),
-    }),
-  );
-}
-
-/** Step 2 of an address change: confirm with the emailed code. */
-export async function saveMarketProviderDestination(address: string, challengeId: string, code: string) {
-  return parseJson<NonNullable<MarketProviderFinance["destination"]>>(
-    await authFetch("/v1/market-provider-finance/destination", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        network: "tron", address, confirmation: "CHANGE_WITHDRAWAL_ADDRESS", challengeId, code,
-      }),
-    }),
-  );
-}
-
-export async function cancelMarketProviderWithdrawal(id: string, expectedVersion: number) {
-  return parseJson<MarketProviderWithdrawal>(
-    await authFetch(`/v1/market-provider-finance/withdrawals/${encodeURIComponent(id)}/cancel`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ expectedVersion }),
-    }),
-  );
-}
-
 export type MarketEarningHoldReason = "dispute" | "cleanup_uncertain" | "service_missing" | "manual" | "legacy_unknown";
 
 export type MarketEarningHold = {
@@ -417,8 +326,7 @@ export type MarketProviderEarningLot = {
   reversedUnits: string;
   unlockedUnits: string;
   heldUnits: string;
-  paidUnits: string;
-  convertedUnits: string;
+  creditedUnits: string;
   fulfilledAt: string;
   unlockAt: string;
   disputed: boolean;
@@ -434,48 +342,6 @@ export async function getMarketProviderEarnings(cursor?: string) {
   const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
   return parseJson<MarketWalletPage<MarketProviderEarningLot>>(
     await authFetch(`/v1/market-provider-finance/earnings${query}`, { cache: "no-store" }),
-  );
-}
-
-export async function requestMarketProviderWithdrawal(amountMinor: number, idempotencyKey: string) {
-  return parseJson<MarketProviderWithdrawal>(
-    await authFetch("/v1/market-provider-finance/withdrawals", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey },
-      body: JSON.stringify({ amountMinor }),
-    }),
-  );
-}
-
-export async function getMarketFinanceTransfers(kind: "withdrawals") {
-  return parseJson<MarketFinanceTransfer[]>(
-    await authFetch(`/v1/admin/market-finance/${kind}`, { cache: "no-store" }),
-  );
-}
-
-export async function transitionMarketFinanceTransfer(
-  kind: "withdrawals",
-  id: string,
-  action: MarketFinanceTransferAction,
-  expectedVersion: number,
-  options: {
-    externalReference?: string;
-    reason?: string;
-    /** mark_paid only: typed by the Owner, never prefilled. */
-    actualAmountMinor?: number;
-    /** mark_paid only: RFC 3339 timestamp of the on-chain transfer. */
-    transferredAt?: string;
-    networkFeeMinor?: number;
-    /** Required reason code when the actual amount differs from the request. */
-    varianceReason?: string;
-  } = {},
-) {
-  return parseJson<MarketProviderWithdrawal>(
-    await authFetch(`/v1/admin/market-finance/${kind}/${encodeURIComponent(id)}/transition`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action, expectedVersion, ...options }),
-    }),
   );
 }
 
@@ -655,17 +521,16 @@ export async function setMarketFinanceMode(mode: MarketFinanceReadiness["mode"],
 
 export async function setMarketFinancePause(
   newOrdersPaused: boolean,
-  newWithdrawalsPaused: boolean,
   expectedVersion: number,
   newTopupsPaused?: boolean,
 ) {
-  return parseJson<{ newOrdersPaused: boolean; newWithdrawalsPaused: boolean; newTopupsPaused?: boolean }>(
+  return parseJson<{ newOrdersPaused: boolean; newTopupsPaused?: boolean }>(
     await authFetch("/v1/admin/market-finance/pause", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(newTopupsPaused === undefined
-        ? { newOrdersPaused, newWithdrawalsPaused, expectedVersion }
-        : { newOrdersPaused, newWithdrawalsPaused, newTopupsPaused, expectedVersion }),
+        ? { newOrdersPaused, expectedVersion }
+        : { newOrdersPaused, newTopupsPaused, expectedVersion }),
     }),
   );
 }
@@ -807,7 +672,7 @@ export type MarketFinanceUserLookup = {
   userId: string;
   email: string;
   wallet: { assetCode: string; postedUnits: string; heldUnits: string; availableUnits: string; version: number };
-  provider: MarketProviderFinance["summary"];
+  provider: { pendingUnits: string; availableUnits: string; withdrawalHeldUnits: string; convertedUnits: string };
   transactions: MarketWalletTransaction[];
   topups: MarketWalletTopup[];
   earningHolds: MarketEarningHold[];
@@ -898,7 +763,7 @@ export const MARKET_NOTIFICATION_KINDS = [
   "topup_credited", "topup_closed_unpaid", "topup_review_required", "topup_reversed",
   "wallet_low_runway", "renewal_upcoming_shortfall", "contract_suspended", "contract_resumed",
   "contract_terminating_soon", "contract_terminated", "refund_status", "dispute_resolved",
-  "payout_status", "earnings_held", "earnings_released", "earnings_converted", "payout_address_changed",
+  "earnings_held", "earnings_released", "earnings_converted",
   "wallet_transfer_sent", "wallet_transfer_received",
   "commission_policy_changed",
 ] as const;

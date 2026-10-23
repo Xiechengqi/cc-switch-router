@@ -32,14 +32,6 @@ export function parseUsdMinor(raw: string): number | null {
   return minor >= 100 && minor <= 100_000 ? minor : null;
 }
 
-export function parseWithdrawalMinor(raw: string): number | null {
-  const value = raw.trim();
-  if (!/^(?:0|[1-9]\d{0,12})(?:\.\d{1,2})?$/.test(value)) return null;
-  const [dollars, fraction = ""] = value.split(".");
-  const minor = BigInt(dollars) * 100n + BigInt(fraction.padEnd(2, "0") || "0");
-  return minor >= 100n && minor <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(minor) : null;
-}
-
 export function parseNonNegativeUsdMinor(raw: string): number | null {
   const value = raw.trim();
   if (!/^(?:0|[1-9]\d{0,12})(?:\.\d{1,2})?$/.test(value)) return null;

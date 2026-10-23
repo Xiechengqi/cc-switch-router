@@ -257,22 +257,6 @@ pub(crate) fn require_new_wallet_orders_open_tx(conn: &Connection) -> Result<(),
     Ok(())
 }
 
-pub(crate) fn require_new_wallet_withdrawals_open_tx(conn: &Connection) -> Result<(), AppError> {
-    let paused: bool = conn
-        .query_row(
-            "SELECT new_withdrawals_paused FROM market_finance_control WHERE id = 1",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(db_error("read wallet withdrawal pause"))?;
-    if paused {
-        return Err(AppError::ServiceUnavailable(
-            "new Provider withdrawals are paused by the Router owner".into(),
-        ));
-    }
-    Ok(())
-}
-
 /// An offer's publication rail is immutable until the Provider explicitly
 /// edits its paid terms. A mode switch must not reinterpret an old offer.
 pub(crate) fn require_current_offer_rail(
@@ -439,7 +423,6 @@ struct FinanceReadinessView {
     mode: String,
     version: i64,
     new_orders_paused: bool,
-    new_withdrawals_paused: bool,
     new_topups_paused: bool,
     code_integrated: bool,
     legacy_blockers: Vec<ReadinessBlocker>,
@@ -466,28 +449,9 @@ fn stale_topup_review_count_tx(conn: &Connection) -> Result<i64, AppError> {
 }
 
 fn finance_readiness_tx(conn: &Connection) -> Result<FinanceReadinessView, AppError> {
-    let (mode, version, new_orders_paused, new_withdrawals_paused, new_topups_paused): (
-        String,
-        i64,
-        bool,
-        bool,
-        bool,
-    ) = conn
-        .query_row(
-            "SELECT mode, version, new_orders_paused, new_withdrawals_paused, new_topups_paused
-             FROM market_finance_control WHERE id = 1",
-            [],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            },
-        )
-        .map_err(db_error("read market finance mode"))?;
+    let (mode, version, new_orders_paused, new_topups_paused): (String, i64, bool, bool) = conn
+.query_row("SELECT mode, version, new_orders_paused, new_topups_paused FROM market_finance_control WHERE id=1", [],
+|row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).map_err(db_error("read market finance mode"))?;
     let checks: [(&'static str, &'static str); 15] = [
         (
             "legacy_share_paid_offers",
@@ -632,7 +596,6 @@ fn finance_readiness_tx(conn: &Connection) -> Result<FinanceReadinessView, AppEr
         mode,
         version,
         new_orders_paused,
-        new_withdrawals_paused,
         new_topups_paused,
         code_integrated: MARKET_WALLET_CUTOVER_IMPLEMENTED,
         legacy_blockers,
@@ -743,34 +706,30 @@ async fn set_finance_mode(
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct FinancePauseRequest {
     new_orders_paused: bool,
-    new_withdrawals_paused: bool,
     #[serde(default)]
     new_topups_paused: Option<bool>,
     expected_version: i64,
 }
 
-/// Purchase and withdrawal pauses exist only on the production wallet. The
+/// Purchase pauses exist only on the production wallet. The
 /// top-up pause also works in shadow mode, where it fences Owner test orders.
 fn set_finance_pause_tx(
     conn: &Connection,
     request: &FinancePauseRequest,
     changed_at: &str,
 ) -> Result<(), AppError> {
-    let (mode, approved, orders, withdrawals): (String, bool, bool, bool) = conn
+    let (mode, approved, orders): (String, bool, bool) = conn
         .query_row(
-            "SELECT mode, cutover_approved_at IS NOT NULL, new_orders_paused,
-                    new_withdrawals_paused
+            "SELECT mode, cutover_approved_at IS NOT NULL, new_orders_paused
              FROM market_finance_control WHERE id = 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(db_error("read finance pause"))?;
     let production = mode == "enabled" && approved;
-    if !production
-        && (request.new_orders_paused != orders || request.new_withdrawals_paused != withdrawals)
-    {
+    if !production && request.new_orders_paused != orders {
         return Err(AppError::Conflict(
-            "purchase and withdrawal pauses require an enabled wallet".into(),
+            "purchase pauses require an enabled wallet".into(),
         ));
     }
     if !production && mode != "shadow" && request.new_topups_paused.is_some() {
@@ -781,14 +740,13 @@ fn set_finance_pause_tx(
     let changed = conn
         .execute(
             "UPDATE market_finance_control
-             SET new_orders_paused = ?2, new_withdrawals_paused = ?3,
-                 new_topups_paused = COALESCE(?5, new_topups_paused),
-                 version = version + 1, updated_at = ?4
+             SET new_orders_paused = ?2,
+                 new_topups_paused = COALESCE(?4, new_topups_paused),
+                 version = version + 1, updated_at = ?3
              WHERE id = 1 AND version = ?1",
             params![
                 request.expected_version,
                 request.new_orders_paused,
-                request.new_withdrawals_paused,
                 changed_at,
                 request.new_topups_paused
             ],
@@ -803,15 +761,11 @@ fn set_finance_pause_tx(
 }
 
 /// `orders_paused`, `orders_and_topups_paused`, ... or `resumed`.
-fn finance_pause_reason((orders, withdrawals, topups): (bool, bool, bool)) -> String {
-    let paused = [
-        (orders, "orders"),
-        (withdrawals, "withdrawals"),
-        (topups, "topups"),
-    ]
-    .into_iter()
-    .filter_map(|(paused, name)| paused.then_some(name))
-    .collect::<Vec<_>>();
+fn finance_pause_reason((orders, topups): (bool, bool)) -> String {
+    let paused = [(orders, "orders"), (topups, "topups")]
+        .into_iter()
+        .filter_map(|(paused, name)| paused.then_some(name))
+        .collect::<Vec<_>>();
     if paused.is_empty() {
         "resumed".into()
     } else {
@@ -833,12 +787,12 @@ async fn set_finance_pause(
     set_finance_pause_tx(&tx, &request, &changed_at)?;
     // Describe the resulting state, not one flag of the request: the top-up
     // pause is optional in the request and may be unchanged.
-    let flags: (bool, bool, bool) = tx
+    let flags: (bool, bool) = tx
         .query_row(
-            "SELECT new_orders_paused, new_withdrawals_paused, new_topups_paused
+            "SELECT new_orders_paused, new_topups_paused
              FROM market_finance_control WHERE id = 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(db_error("read finance pause"))?;
     audit_tx(
@@ -856,7 +810,6 @@ async fn set_finance_pause(
         no_store(),
         Json(serde_json::json!({
             "newOrdersPaused": request.new_orders_paused,
-            "newWithdrawalsPaused": request.new_withdrawals_paused,
             "newTopupsPaused": request.new_topups_paused,
         })),
     ))
@@ -867,7 +820,7 @@ async fn get_wallet(
     headers: HeaderMap,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let session = require_session(&state, &headers).await?;
-    let (snapshot, mode, cutover_approved, has_wallet_activity, earnings_conversion) = {
+    let (snapshot, mode, cutover_approved, has_wallet_activity) = {
         let conn = state.store.conn.lock().await;
         let snapshot = wallet_snapshot_tx(&conn, &session.user_id)?;
         let (mode, cutover_approved): (String, bool) = conn
@@ -886,15 +839,7 @@ async fn get_wallet(
                 |row| row.get(0),
             )
             .map_err(db_error("read wallet activity"))?;
-        let conversion =
-            crate::market_earning_conversions::capacity_tx(&conn, &session.user_id, &now())?;
-        (
-            snapshot,
-            mode,
-            cutover_approved,
-            has_wallet_activity,
-            conversion,
-        )
+        (snapshot, mode, cutover_approved, has_wallet_activity)
     };
     let can_topup = user_topup_allowed(
         &mode,
@@ -922,7 +867,6 @@ async fn get_wallet(
             "mode": mode,
             "canTopup": can_topup,
             "hasWalletActivity": has_wallet_activity,
-            "earningsConversion": earnings_conversion,
         })),
     ))
 }
@@ -7585,6 +7529,24 @@ pub async fn run_service(
         state.store.clone(),
         shutdown.clone(),
     ));
+    // Income settlement must not wait behind slow or unavailable payment
+    // gateways. This task only performs bounded local ledger transactions.
+    let earnings_task = tokio::spawn({
+        let state = state.clone();
+        let mut shutdown = shutdown.clone();
+        async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => unlock_due_earnings(&state).await,
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() { break; }
+                    }
+                }
+            }
+        }
+    });
     let wakeup = state.market_payments.reconcile_wakeup.clone();
     loop {
         let reconcile_now = tokio::select! {
@@ -7636,7 +7598,6 @@ pub async fn run_service(
             }
             Err(_) => tracing::warn!("market top-up queue unavailable"),
         }
-        unlock_due_earnings(&state).await;
     }
     // A sweep page in flight finishes its own transaction; anything left is
     // resumed from its saved offset on the next start.
@@ -7644,6 +7605,8 @@ pub async fn run_service(
     let _ = sweep_task.await;
     c2c_task.abort();
     let _ = c2c_task.await;
+    earnings_task.abort();
+    let _ = earnings_task.await;
     Ok(())
 }
 
@@ -7709,6 +7672,10 @@ async fn unlock_due_earnings(state: &ServerState) {
     let result = crate::market_finance::unlock_due_earnings_isolated(&conn, &now(), 200);
     if result.is_err() {
         tracing::warn!("market earning maturity deferred");
+    }
+    if crate::market_earning_conversions::credit_due_earnings_isolated(&conn, &now(), 200).is_err()
+    {
+        tracing::warn!("market automatic earnings credit deferred");
     }
 }
 
@@ -8794,20 +8761,14 @@ mod tests {
         .unwrap();
         let request = FinancePauseRequest {
             new_orders_paused: true,
-            new_withdrawals_paused: true,
             new_topups_paused: None,
             expected_version: 1,
         };
         set_finance_pause_tx(&conn, &request, at).unwrap();
         assert!(wallet_purchase_mode_tx(&conn).unwrap());
         assert!(finance_readiness_tx(&conn).unwrap().new_orders_paused);
-        assert!(finance_readiness_tx(&conn).unwrap().new_withdrawals_paused);
         assert!(matches!(
             require_new_wallet_orders_open_tx(&conn),
-            Err(AppError::ServiceUnavailable(_))
-        ));
-        assert!(matches!(
-            require_new_wallet_withdrawals_open_tx(&conn),
             Err(AppError::ServiceUnavailable(_))
         ));
         assert!(matches!(
@@ -8818,7 +8779,6 @@ mod tests {
             &conn,
             &FinancePauseRequest {
                 new_orders_paused: false,
-                new_withdrawals_paused: false,
                 new_topups_paused: None,
                 expected_version: 2,
             },
@@ -8826,7 +8786,6 @@ mod tests {
         )
         .unwrap();
         require_new_wallet_orders_open_tx(&conn).unwrap();
-        require_new_wallet_withdrawals_open_tx(&conn).unwrap();
     }
 
     #[test]
@@ -8843,7 +8802,6 @@ mod tests {
                 &conn,
                 &FinancePauseRequest {
                     new_orders_paused: true,
-                    new_withdrawals_paused: false,
                     new_topups_paused: None,
                     expected_version: 1,
                 },
@@ -8855,7 +8813,6 @@ mod tests {
             &conn,
             &FinancePauseRequest {
                 new_orders_paused: false,
-                new_withdrawals_paused: false,
                 new_topups_paused: Some(true),
                 expected_version: 1,
             },
@@ -12551,16 +12508,13 @@ mod tests {
 
     #[test]
     fn finance_pause_reason_names_every_paused_flow() {
-        assert_eq!(finance_pause_reason((false, false, false)), "resumed");
-        assert_eq!(finance_pause_reason((true, false, false)), "orders_paused");
+        assert_eq!(finance_pause_reason((false, false)), "resumed");
+        assert_eq!(finance_pause_reason((true, false)), "orders_paused");
         assert_eq!(
-            finance_pause_reason((true, true, false)),
-            "orders_and_withdrawals_paused"
+            finance_pause_reason((true, true)),
+            "orders_and_topups_paused"
         );
-        assert_eq!(
-            finance_pause_reason((false, true, true)),
-            "withdrawals_and_topups_paused"
-        );
+        assert_eq!(finance_pause_reason((false, true)), "topups_paused");
     }
 
     #[test]

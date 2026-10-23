@@ -32,7 +32,7 @@ import {
 } from "@/lib/api";
 import { shareMarketHref } from "@/lib/dashboard-nav";
 import { formatUsdMoney } from "@/lib/market-money";
-import { notifyMarketBalanceChanged } from "@/lib/earning-wallet-conversion";
+import { notifyMarketBalanceChanged } from "@/lib/market-balance-events";
 import { SHARE_APP_LABELS } from "@/lib/share-app";
 import type { ShareMarketListing, ShareMarketSubscription } from "@/lib/types";
 import { cn } from "@/lib/utils";

@@ -1,7 +1,6 @@
 "use client";
 
 import * as React from "react";
-import { EarningWalletConversion } from "@/components/dashboard/earning-wallet-conversion";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Button, Chip, Modal } from "@heroui/react";
 import { Check, Copy, Loader2, LogIn, Minus, Plus, RotateCcw, Server } from "lucide-react";
@@ -39,7 +38,7 @@ import type {
 } from "@/lib/types";
 import { formatUsdMoney } from "@/lib/market-money";
 import { walletTopupHref } from "@/lib/market-wallet-money";
-import { notifyMarketBalanceChanged } from "@/lib/earning-wallet-conversion";
+import { notifyMarketBalanceChanged } from "@/lib/market-balance-events";
 import { usePersistentState } from "@/lib/use-persistent-state";
 
 const PROVIDERS_KEY = "cc_switch_router_create_client_providers_v2";
@@ -819,7 +818,6 @@ export function CreateClientDialog({
                 </section>)}
               </div>
             ) : null}
-            {phase === "quote" && checkout?.shortfall && !checkout.unsupported ? <EarningWalletConversion disabled={loading || submissionUncertain} onConverted={async () => { if (!await requestQuote()) throw new Error("quote refresh failed"); }} /> : null}
             {checkout?.shortfall && !checkout.unsupported ? <p className="text-xs text-muted-foreground">{t("clientCheckout.topupHint")}</p> : null}
             {error ? <p role="alert" className="text-sm text-destructive">{error}</p> : null}
           </Modal.Body>

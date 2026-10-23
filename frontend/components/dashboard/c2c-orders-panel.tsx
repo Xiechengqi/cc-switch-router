@@ -4,12 +4,13 @@
  * pre-emit critique: P5 H5 E4 S5 R5 V4
  */
 import * as React from "react";
+import { useSearchParams } from "next/navigation";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { C2CSellerPanel } from "./c2c-seller-panel";
 import { C2CAction, C2CCheck, C2CDialog, C2CError, C2CStatusLabel, C2C_INPUT } from "@/components/market/c2c-primitives";
 import { c2cErrorKey, c2cNow, c2cPayLabel, c2cPaymentWindow, getC2CPolicy, getC2COrders, getC2COrder, getC2CEvents, actC2C, sendC2CReleaseCode, releaseC2C, type C2COrder, type C2CEvent, type C2CPolicyView } from "@/lib/market-c2c";
 import { formatTopupCountdown, formatWalletUnits } from "@/lib/market-wallet-money";
-import { notifyMarketBalanceChanged } from "@/lib/earning-wallet-conversion";
+import { notifyMarketBalanceChanged } from "@/lib/market-balance-events";
 import { messages, type MessageKey } from "@/lib/i18n";
 
 export function C2CEvents({ items }: { items: C2CEvent[] }) {
@@ -21,7 +22,7 @@ export function C2CEvents({ items }: { items: C2CEvent[] }) {
 export function C2COrdersPanel({ actor, selectedId, onSelect }: { actor: string; selectedId: string | null; onSelect: (id: string | null) => void }) {
   const { t } = useLocaleText(); const [policy, setPolicy] = React.useState<C2CPolicyView | null>(null);
   const [items, setItems] = React.useState<C2COrder[]>([]); const [next, setNext] = React.useState<string | null>(null);
-  const [history, setHistory] = React.useState(false); const [selling, setSelling] = React.useState(false); const [error, setError] = React.useState(""); const [loaded, setLoaded] = React.useState(false);
+  const [history, setHistory] = React.useState(false); const [selling, setSelling] = React.useState(useSearchParams().get("c2cSell") === "1"); const [error, setError] = React.useState(""); const [loaded, setLoaded] = React.useState(false);
   const [busy, setBusy] = React.useState(false); const alive = React.useRef(true); const refreshVersion = React.useRef(0);
   React.useEffect(() => { alive.current = true; return () => { alive.current = false; refreshVersion.current++; }; }, []);
   const load = React.useCallback(async (before = "") => {
@@ -39,7 +40,7 @@ export function C2COrdersPanel({ actor, selectedId, onSelect }: { actor: string;
   }, [load, history, t]);
   React.useEffect(() => { if (selectedId) void load().catch(() => {}); }, [selectedId, load]);
   const reload = () => { setBusy(true); void load().catch(e => setError(t(c2cErrorKey(e)))).finally(() => { if (alive.current) setBusy(false); }); };
-  return <section className="grid min-w-0 gap-4 rounded-xl border border-border bg-card p-4 sm:p-6" data-c2c-orders>
+  return <section id="c2c-orders" className="grid min-w-0 gap-4 rounded-xl border border-border bg-card p-4 sm:p-6" data-c2c-orders>
     <header className="flex flex-wrap items-center justify-between gap-3"><h2 className="text-lg font-semibold">{t("c2c.title")}</h2><div className="flex flex-wrap gap-2"><C2CAction type="button" secondary aria-pressed={selling} onClick={() => setSelling(v => !v)}>{t("c2c.seller")}</C2CAction><C2CAction type="button" secondary disabled={busy} onClick={reload}>{t("common.reload")}</C2CAction></div></header>
     <C2CError>{error}</C2CError>
     {selling && policy ? <C2CSellerPanel policy={policy} onSaved={reload} /> : <>

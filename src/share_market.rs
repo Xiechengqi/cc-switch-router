@@ -6502,11 +6502,7 @@ async fn list_owned_shares(
 
 fn ensure_payment_profile_tx(tx: &Transaction<'_>, owner_user_id: &str) -> Result<(), AppError> {
     if crate::market_payments::wallet_purchase_mode_tx(tx)? {
-        return crate::market_payouts::require_payout_setup_tx(
-            tx,
-            owner_user_id,
-            &Utc::now().to_rfc3339(),
-        );
+        return crate::market_provider_finance::require_paid_offer_setup_tx(tx, owner_user_id);
     }
     let methods_json: Option<String> = tx
         .query_row(

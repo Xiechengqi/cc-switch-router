@@ -186,7 +186,7 @@ export function WalletTransferPanel({
   const wait = Math.max(0, Math.ceil((resendAt - now) / 1000));
   const enabled = capacity?.enabled && capacity.verified;
   return (
-    <section className="grid min-w-0 gap-4 rounded-xl border border-border bg-card p-5">
+    <section id="wallet-transfer" className="grid min-w-0 gap-4 rounded-xl border border-border bg-card p-5">
       <div>
         <h2 className="flex items-center gap-2 text-base font-semibold">
           <ArrowRightLeft className="size-4" aria-hidden />

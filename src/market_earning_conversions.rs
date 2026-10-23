@@ -1,5 +1,5 @@
-//! Irreversible, same-user assignment of matured net earnings to consumption
-//! credit. No gateway, external payout, new revenue, or withdrawal entitlement.
+//! Automatic, exact-unit credit of matured net earnings to the same user's
+//! wallet. Historical conversion evidence is retained, never rewritten.
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
@@ -11,17 +11,21 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+#[cfg(test)]
+use crate::market_wallet::units_from_minor;
 use crate::{
     ServerState,
     db::{Connection, OptionalExtension, TransactionBehavior, params},
     error::AppError,
-    market_wallet::{Posting, now, post_journal_tx, serialize_units, units_from_minor},
+    market_wallet::{Posting, post_journal_tx, serialize_units},
     market_wallet_policy::db_error,
 };
 
 const TERMS_VERSION: i64 = 1;
+#[cfg(test)]
 const MAX_LOTS: i64 = 10_000;
-const SELECT: &str = "SELECT id, quote_id, amount_units, terms_version, journal_id, created_at
+const SELECT: &str =
+    "SELECT id, quote_id, amount_units, terms_version, journal_id, created_at, automatic
  FROM market_earning_wallet_conversions";
 const ELIGIBLE: &str = "l.provider_user_id = ?1 AND l.disputed = 0
  AND l.unlocked_units - l.held_units - l.paid_units - l.converted_units > 0
@@ -52,11 +56,11 @@ pub fn router() -> Router<ServerState> {
     Router::new()
         .route(
             "/v1/market-provider-finance/wallet-conversion-quotes",
-            post(quote),
+            post(retired_manual_conversion),
         )
         .route(
             "/v1/market-provider-finance/wallet-conversions",
-            get(list).post(confirm),
+            get(list).post(retired_manual_conversion),
         )
         .route(
             "/v1/market-provider-finance/wallet-conversions/:id",
@@ -78,7 +82,7 @@ pub(crate) fn capacity_tx(conn: &Connection, user: &str, at: &str) -> Result<Cap
         "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1 AND status = 'active' AND email_verified_at IS NOT NULL)",
         params![user], |r| r.get(0),
     ).map_err(db_error("read conversion user"))?;
-    if !verified || !crate::market_payouts::can_manage_earnings_tx(conn, user)? {
+    if !verified || !crate::market_provider_finance::can_manage_earnings_tx(conn, user)? {
         blockers.push("identity");
     }
     let mode: bool = conn.query_row(
@@ -88,9 +92,7 @@ pub(crate) fn capacity_tx(conn: &Connection, user: &str, at: &str) -> Result<Cap
     if !mode {
         blockers.push("not_open");
     }
-    if crate::market_wallet_policy::policy_tx(conn)?.earnings_conversions_paused {
-        blockers.push("paused");
-    }
+    // The obsolete manual-conversion pause never prevents automatic credit.
     match crate::market_reconcile::ensure_finance_scopes_safe_tx(
         conn,
         &[
@@ -128,6 +130,7 @@ fn require_open_tx(conn: &Connection, user: &str, at: &str) -> Result<Capacity, 
     Ok(capacity)
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Quote {
@@ -137,6 +140,7 @@ struct Quote {
     terms_version: i64,
     expires_at: String,
 }
+#[cfg(test)]
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct QuoteRequest {
@@ -147,6 +151,7 @@ struct QuoteRequest {
     batch: bool,
 }
 
+#[cfg(test)]
 fn batch_units_tx(conn: &Connection, user: &str, at: &str, limit: i64) -> Result<i64, AppError> {
     conn.query_row(
         &format!(
@@ -160,6 +165,7 @@ fn batch_units_tx(conn: &Connection, user: &str, at: &str, limit: i64) -> Result
     )
     .map_err(db_error("sum next conversion batch"))
 }
+#[cfg(test)]
 fn create_quote_tx(
     conn: &Connection,
     user: &str,
@@ -218,6 +224,7 @@ struct Lot {
     converted_before: i64,
     contract: String,
 }
+#[cfg(test)]
 fn selected_lots_tx(
     conn: &Connection,
     user: &str,
@@ -268,6 +275,7 @@ fn selected_lots_tx(
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Conversion {
+    automatic: bool,
     id: String,
     quote_id: String,
     #[serde(serialize_with = "serialize_units")]
@@ -278,6 +286,7 @@ struct Conversion {
 }
 fn row(r: &crate::db::Row<'_>) -> crate::db::Result<Conversion> {
     Ok(Conversion {
+        automatic: r.get(6)?,
         id: r.get(0)?,
         quote_id: r.get(1)?,
         amount_units: r.get(2)?,
@@ -286,6 +295,7 @@ fn row(r: &crate::db::Row<'_>) -> crate::db::Result<Conversion> {
         created_at: r.get(5)?,
     })
 }
+#[cfg(test)]
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ConfirmRequest {
@@ -363,6 +373,7 @@ impl EvidenceBatch {
         Ok(true)
     }
 }
+#[cfg(test)]
 fn confirm_tx(
     conn: &Connection,
     user: &str,
@@ -432,8 +443,22 @@ fn confirm_tx(
             "matured earnings changed; review the amount",
         ));
     }
-    verify_balances_tx(conn, user)?;
     let lots = selected_lots_tx(conn, user, amount, at)?;
+    credit_lots_tx(conn, user, idem, &input.quote_id, amount, lots, at, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn credit_lots_tx(
+    conn: &Connection,
+    user: &str,
+    idem: &str,
+    quote_id: &str,
+    amount: i64,
+    lots: Vec<Lot>,
+    at: &str,
+    automatic: bool,
+) -> Result<Conversion, AppError> {
+    verify_balances_tx(conn, user)?;
     let mut evidence = EvidenceBatch::default();
     for lot in &lots {
         crate::market_reconcile::ensure_finance_scopes_safe_tx(
@@ -462,7 +487,7 @@ fn confirm_tx(
         "earning_conversion",
         &id,
         "convert",
-        &format!("{user}:{}:{amount}:terms={TERMS_VERSION}", input.quote_id),
+        &format!("{user}:{quote_id}:{amount}:terms={TERMS_VERSION}"),
         &[
             Posting {
                 kind: "provider_available",
@@ -478,9 +503,9 @@ fn confirm_tx(
         at,
     )?;
     conn.execute(
-        "INSERT INTO market_earning_wallet_conversions (id,user_id,quote_id,idempotency_key,amount_units,terms_version,journal_id,created_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-        params![id,user,input.quote_id,idem,amount,TERMS_VERSION,journal.id,at],
+        "INSERT INTO market_earning_wallet_conversions (id,user_id,quote_id,idempotency_key,amount_units,terms_version,journal_id,created_at,automatic)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        params![id,user,quote_id,idem,amount,TERMS_VERSION,journal.id,at,automatic],
     ).map_err(db_error("record earning conversion"))?;
     for lot in lots {
         let changed = conn.execute(
@@ -518,19 +543,23 @@ fn confirm_tx(
     }
     verify_balances_tx(conn, user)?;
     conn.execute("INSERT INTO market_finance_audit_events (id,actor_user_id,action,object_kind,object_id,reason_code,created_at)
-        VALUES (?1,?2,'convert','earning_conversion',?3,'non_withdrawable_terms_v1',?4)",
-        params![Uuid::new_v4().to_string(),user,id,at]).map_err(db_error("audit earning conversion"))?;
-    crate::market_notifications::enqueue_user_notification_tx(
-        conn,
-        "provider",
-        user,
-        "earnings_converted",
-        "earning_conversion",
-        &id,
-        &format!("earnings_converted:{id}"),
-        serde_json::json!({"conversionId":id,"amountUnits":amount.to_string(),"amountMinor":amount / crate::market_billing::MONEY_UNITS_PER_MINOR}),
-        at,
-    )?;
+        VALUES (?1,?2,'convert','earning_conversion',?3,?4,?5)",
+        params![Uuid::new_v4().to_string(),user,id,if automatic { "automatic_settlement" } else { "non_withdrawable_terms_v1" },at]).map_err(db_error("audit earning conversion"))?;
+    // Automatic micro-batches are visible in wallet history. Do not send a
+    // mandatory email per service slice every thirty seconds.
+    if !automatic {
+        crate::market_notifications::enqueue_user_notification_tx(
+            conn,
+            "provider",
+            user,
+            "earnings_converted",
+            "earning_conversion",
+            &id,
+            &format!("earnings_converted:{id}"),
+            serde_json::json!({"conversionId":id,"amountUnits":amount.to_string(),"amountMinor":amount / crate::market_billing::MONEY_UNITS_PER_MINOR}),
+            at,
+        )?;
+    }
     read_tx(conn, user, &id)
 }
 fn read_tx(conn: &Connection, user: &str, id: &str) -> Result<Conversion, AppError> {
@@ -578,43 +607,119 @@ fn page_tx(conn: &Connection, user: &str, q: &PageQuery) -> Result<Page, AppErro
     let next_cursor = more.then(|| items.last().unwrap().id.clone());
     Ok(Page { items, next_cursor })
 }
-async fn quote(
+async fn retired_manual_conversion(
     State(state): State<ServerState>,
     headers: HeaderMap,
-    Json(input): Json<QuoteRequest>,
-) -> Result<impl axum::response::IntoResponse, AppError> {
-    let user = session(&state, &headers).await?;
-    let conn = state.store.conn.lock().await;
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(db_error("begin conversion quote"))?;
-    let value = create_quote_tx(&tx, &user.user_id, &input, Utc::now())?;
-    tx.commit().map_err(db_error("commit conversion quote"))?;
-    Ok((no_store(), Json(value)))
+) -> Result<Json<serde_json::Value>, AppError> {
+    session(&state, &headers).await?;
+    Err(AppError::Coded {
+        status: StatusCode::GONE,
+        code: "MANUAL_EARNING_CONVERSIONS_RETIRED",
+        message: "matured earnings are automatically credited to platform balance; no confirmation is needed".into(),
+        details: serde_json::json!({ "walletUrl": "/account/wallet/" }),
+    })
 }
-async fn confirm(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Json(input): Json<ConfirmRequest>,
-) -> Result<impl axum::response::IntoResponse, AppError> {
-    let user = session(&state, &headers).await?;
-    let idem = headers
-        .get("Idempotency-Key")
-        .and_then(|v| v.to_str().ok())
-        .filter(|v| {
-            !v.is_empty()
-                && v.len() <= 128
-                && v.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-        })
-        .ok_or_else(|| AppError::BadRequest("valid Idempotency-Key required".into()))?;
-    let conn = state.store.conn.lock().await;
+
+/// One eligible lot, exact to the ledger unit. The old `quote` table is now
+/// just a frozen evidence envelope created and consumed in this transaction;
+/// there is no browser quote, user consent, fee, rate limit or external call.
+fn automatic_credit_lot_tx(conn: &Connection, lot_id: &str, at: &str) -> Result<i64, AppError> {
+    let lot = conn.query_row(&format!("SELECT l.provider_user_id,
+        l.unlocked_units-l.held_units-l.paid_units-l.converted_units,l.converted_units,d.contract_id
+        FROM market_provider_earning_lots l JOIN market_delivery_slices d ON d.id=l.delivery_slice_id
+        WHERE l.id=?3 AND {ELIGIBLE}"),
+        // Resolve the owner from this lot, not from caller-controlled input.
+        params![conn.query_row("SELECT provider_user_id FROM market_provider_earning_lots WHERE id=?1",params![lot_id],|r|r.get::<_,String>(0))
+            .map_err(db_error("read automatic credit owner"))?,at,lot_id],
+        |r| Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?)))
+        .optional().map_err(db_error("read automatic credit lot"))?;
+    let Some((user, amount, converted_before, contract)) = lot else {
+        return Ok(0);
+    };
+    require_open_tx(conn, &user, at)?;
+    let quote_id = Uuid::new_v4().to_string();
+    let expires = (DateTime::parse_from_rfc3339(at)
+        .map_err(|_| AppError::Internal("invalid settlement time".into()))?
+        + Duration::minutes(5))
+    .to_rfc3339();
+    conn.execute("INSERT INTO market_earning_conversion_quotes (id,user_id,amount_units,terms_version,expires_at,created_at)
+        VALUES (?1,?2,?3,1,?4,?5)",params![quote_id,user,amount,expires,at]).map_err(db_error("freeze automatic credit evidence"))?;
+    let lot = Lot {
+        id: lot_id.into(),
+        amount,
+        converted_before,
+        contract,
+    };
+    credit_lots_tx(
+        conn,
+        &user,
+        &format!("automatic:{lot_id}:{converted_before}"),
+        &quote_id,
+        amount,
+        vec![lot],
+        at,
+        true,
+    )?;
+    Ok(amount)
+}
+
+/// Persisted fair, bounded scan with one savepoint per lot. Frozen or invalid
+/// earnings never stop other users (or other contracts of the same user).
+pub(crate) fn credit_due_earnings_isolated(
+    conn: &Connection,
+    at: &str,
+    limit: i64,
+) -> Result<usize, AppError> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(db_error("begin earning conversion"))?;
-    let value = confirm_tx(&tx, &user.user_id, idem, &input, &now())?;
-    tx.commit().map_err(db_error("commit earning conversion"))?;
-    Ok((no_store(), Json(value)))
+        .map_err(db_error("begin automatic earnings credit"))?;
+    if !crate::market_payments::wallet_purchase_mode_tx(&tx)? {
+        return Ok(0);
+    }
+    let cursor: String = tx
+        .query_row(
+            "SELECT earning_settlement_cursor FROM market_finance_control WHERE id=1",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(db_error("read automatic credit cursor"))?;
+    let ids = {
+        let mut stmt=tx.prepare("SELECT l.id FROM market_provider_earning_lots l WHERE l.id>?1 AND l.disputed=0
+            AND l.unlocked_units-l.held_units-l.paid_units-l.converted_units>0 AND julianday(l.unlock_at)<=julianday(?2)
+            AND NOT EXISTS(SELECT 1 FROM market_provider_earning_holds h WHERE h.lot_id=l.id AND h.released_at IS NULL)
+            ORDER BY l.id LIMIT ?3").map_err(db_error("prepare automatic credit candidates"))?;
+        stmt.query_map(params![cursor, at, limit.clamp(1, 1000)], |r| {
+            r.get::<_, String>(0)
+        })
+        .map_err(db_error("query automatic credit candidates"))?
+        .collect::<crate::db::Result<Vec<_>>>()
+        .map_err(db_error("read automatic credit candidates"))?
+    };
+    let mut count = 0;
+    for id in &ids {
+        tx.execute_batch("SAVEPOINT automatic_earning_credit")
+            .map_err(db_error("open automatic credit savepoint"))?;
+        match automatic_credit_lot_tx(&tx, id, at) {
+            Ok(amount) => {
+                tx.execute_batch("RELEASE SAVEPOINT automatic_earning_credit")
+                    .map_err(db_error("release automatic credit savepoint"))?;
+                count += usize::from(amount > 0);
+            }
+            Err(error) => {
+                tx.execute_batch("ROLLBACK TO SAVEPOINT automatic_earning_credit; RELEASE SAVEPOINT automatic_earning_credit")
+                    .map_err(db_error("roll back automatic credit savepoint"))?;
+                tracing::warn!(lot_id=%id,code=error.code().unwrap_or("settlement_deferred"),"automatic earnings credit deferred; funds unchanged");
+            }
+        }
+    }
+    tx.execute(
+        "UPDATE market_finance_control SET earning_settlement_cursor=?1 WHERE id=1",
+        params![ids.last().map(String::as_str).unwrap_or("")],
+    )
+    .map_err(db_error("advance automatic credit cursor"))?;
+    tx.commit()
+        .map_err(db_error("commit automatic earnings credit"))?;
+    Ok(count)
 }
 async fn list(
     State(state): State<ServerState>,
@@ -642,6 +747,205 @@ mod tests {
     const START: &str = "2026-01-10T00:00:00+00:00";
     const END: &str = "2026-02-10T00:00:00+00:00";
     const AT: &str = "2026-02-18T00:00:00+00:00";
+    #[test]
+    fn automatic_credit_is_exactly_once_net_of_commission_and_requires_no_action() {
+        for product in ["share", "client_host"] {
+            let (conn, _) = fixture(1000, product);
+            assert_eq!(credit_due_earnings_isolated(&conn, AT, 200).unwrap(), 1);
+            assert_eq!(credit_due_earnings_isolated(&conn, AT, 200).unwrap(), 0);
+            let summary = crate::market_finance::provider_summary_tx(&conn, "provider").unwrap();
+            assert_eq!(summary.converted_units, units_from_minor(900).unwrap());
+            assert_eq!(summary.available_units, 0);
+            assert_eq!(
+                crate::market_wallet::wallet_snapshot_tx(&conn, "provider")
+                    .unwrap()
+                    .available_units,
+                summary.converted_units
+            );
+            assert_eq!(
+                number(
+                    &conn,
+                    "SELECT COUNT(*) FROM market_earning_wallet_conversions WHERE automatic=1"
+                ),
+                1
+            );
+            assert_eq!(
+                number(
+                    &conn,
+                    "SELECT COUNT(*) FROM market_verified_earning_conversion_evidence"
+                ),
+                1
+            );
+            assert_eq!(
+                number(&conn, "SELECT COUNT(*) FROM market_payout_requests"),
+                0
+            );
+            assert_eq!(
+                number(
+                    &conn,
+                    "SELECT COUNT(*) FROM market_notification_outbox WHERE event_kind='earnings_converted'"
+                ),
+                0
+            );
+            verify_balances_tx(&conn, "provider").unwrap();
+            assert_eq!(
+                crate::market_reconcile::audit_finance_tx(&conn, AT).unwrap(),
+                0
+            );
+        }
+    }
+    #[test]
+    fn automatic_credit_obeys_exact_maturity_identity_and_dispute_holds() {
+        let (conn, contract) = fixture(1000, "share");
+        assert_eq!(
+            credit_due_earnings_isolated(&conn, "2026-02-16T23:59:59Z", 200).unwrap(),
+            0
+        );
+        crate::market_finance::hold_contract_earnings_tx(&conn, &contract, "manual", AT).unwrap();
+        assert_eq!(credit_due_earnings_isolated(&conn, AT, 200).unwrap(), 0);
+        crate::market_finance::release_earning_holds_tx(
+            &conn,
+            "manual",
+            &contract,
+            "owner",
+            "review_complete",
+            AT,
+        )
+        .unwrap();
+        conn.execute("UPDATE users SET status='disabled' WHERE id='provider'", [])
+            .unwrap();
+        assert_eq!(credit_due_earnings_isolated(&conn, AT, 200).unwrap(), 0);
+        conn.execute("UPDATE users SET status='active' WHERE id='provider'", [])
+            .unwrap();
+        conn.execute(
+            "UPDATE market_wallet_policy SET earnings_conversions_paused=1",
+            [],
+        )
+        .unwrap();
+        // Old manual switches and purchase/top-up pauses cannot stop already
+        // earned income from settling into the wallet.
+        conn.execute("UPDATE market_finance_control SET new_orders_paused=1,new_topups_paused=1,new_withdrawals_paused=1",[]).unwrap();
+        let mut credited = 0;
+        for _ in 0..3 {
+            credited += credit_due_earnings_isolated(&conn, "2026-02-17T00:00:00Z", 200).unwrap();
+        }
+        assert_eq!(credited, 1);
+        verify_balances_tx(&conn, "provider").unwrap();
+    }
+    #[test]
+    fn automatic_credit_keeps_fractional_units_and_has_no_manual_preview_rate_limit() {
+        let (conn, _) = fixture(0, "share");
+        for i in 0..35 {
+            crate::market_finance::record_metered_delivery_tx(
+                &conn,
+                "share",
+                "legacy",
+                &format!("tiny-{i}"),
+                "buyer",
+                "provider",
+                START,
+                "2026-01-10T00:00:01Z",
+                1,
+                END,
+            )
+            .unwrap();
+        }
+        crate::market_finance::unlock_due_earnings_tx(&conn, AT, 200).unwrap();
+        assert_eq!(credit_due_earnings_isolated(&conn, AT, 200).unwrap(), 36);
+        assert_eq!(
+            crate::market_wallet::wallet_snapshot_tx(&conn, "provider")
+                .unwrap()
+                .available_units,
+            units_from_minor(1000).unwrap() + 35
+        );
+        verify_balances_tx(&conn, "provider").unwrap();
+    }
+    #[test]
+    fn automatic_credit_rollback_leaves_no_partial_evidence_or_money_and_retries() {
+        let (conn, _) = fixture(1000, "share");
+        conn.execute_batch("CREATE TRIGGER fail_auto_credit BEFORE UPDATE OF posted_units ON market_wallet_accounts WHEN NEW.user_id='provider' BEGIN SELECT RAISE(ABORT,'injected wallet failure'); END;").unwrap();
+        assert_eq!(credit_due_earnings_isolated(&conn, AT, 200).unwrap(), 0);
+        assert_eq!(
+            number(
+                &conn,
+                "SELECT COUNT(*) FROM market_earning_wallet_conversions"
+            ),
+            0
+        );
+        assert_eq!(
+            number(
+                &conn,
+                "SELECT COUNT(*) FROM market_earning_conversion_quotes"
+            ),
+            0
+        );
+        assert_eq!(
+            number(
+                &conn,
+                "SELECT COUNT(*) FROM market_journal_transactions WHERE source_kind='earning_conversion'"
+            ),
+            0
+        );
+        conn.execute_batch("DROP TRIGGER fail_auto_credit").unwrap();
+        let mut credited = 0;
+        for _ in 0..3 {
+            credited += credit_due_earnings_isolated(&conn, AT, 200).unwrap();
+        }
+        assert_eq!(credited, 1);
+        verify_balances_tx(&conn, "provider").unwrap();
+    }
+    #[test]
+    fn automatic_credit_round_robin_does_not_starve_unrelated_contracts() {
+        let (conn, contract) = fixture(0, "share");
+        crate::market_finance::record_metered_delivery_tx(
+            &conn,
+            "share",
+            "other-contract",
+            "tiny",
+            "buyer",
+            "provider",
+            START,
+            "2026-01-10T00:00:01Z",
+            1,
+            END,
+        )
+        .unwrap();
+        crate::market_finance::unlock_due_earnings_tx(&conn, AT, 200).unwrap();
+        let period: String = conn
+            .query_row(
+                "SELECT id FROM market_platform_periods WHERE contract_id=?1",
+                params![contract],
+                |r| r.get(0),
+            )
+            .unwrap();
+        crate::market_reconcile::case_tx(
+            &conn,
+            "period_unfulfilled_mismatch",
+            "period",
+            &period,
+            AT,
+        )
+        .unwrap();
+        let mut credited = 0;
+        for _ in 0..5 {
+            credited += credit_due_earnings_isolated(&conn, AT, 1).unwrap();
+        }
+        assert_eq!(credited, 1);
+        assert_eq!(
+            crate::market_wallet::wallet_snapshot_tx(&conn, "provider")
+                .unwrap()
+                .available_units,
+            1
+        );
+        assert_eq!(
+            number(
+                &conn,
+                "SELECT COUNT(*) FROM market_earning_wallet_conversions"
+            ),
+            1
+        );
+        verify_balances_tx(&conn, "provider").unwrap();
+    }
     fn fixture(rate: i64, kind: &str) -> (Connection, String) {
         fixture_on(Connection::open_in_memory().unwrap(), rate, kind)
     }
@@ -1357,33 +1661,33 @@ mod tests {
         }
     }
     #[test]
-    fn independent_connections_racing_withdrawal_and_conversion_cannot_double_spend() {
+    fn independent_connections_racing_two_disposals_cannot_double_spend() {
         let directory =
             std::env::temp_dir().join(format!("router-conversion-race-{}", Uuid::new_v4()));
         std::fs::create_dir(&directory).unwrap();
         let path = directory.join("finance.sqlite");
         let (conn, _) = fixture_on(Connection::open(&path).unwrap(), 1000, "share");
-        conn.execute("INSERT INTO market_payout_destinations (id,provider_user_id,version,asset_code,network,address,usable_at,created_at)
-            VALUES ('destination','provider',1,'USDT','tron','T111111111111111111111111111111111','2026-01-01T00:00:00+00:00',?1)",params![START]).unwrap();
-        let q = preview(&conn, Some(600));
+        let quotes = [preview(&conn, Some(600)), preview(&conn, Some(600))];
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
         let tasks = (0..2)
             .map(|i| {
                 let db = Connection::open(&path).unwrap();
                 let ready = barrier.clone();
-                let quote = q.clone();
+                let quote = quotes[i].clone();
                 std::thread::spawn(move || {
                     ready.wait();
                     let Ok(tx) = db.transaction_with_behavior(TransactionBehavior::Immediate)
                     else {
                         return false;
                     };
-                    let result = if i == 0 {
-                        confirm_tx(&tx, "provider", "racing-conversion", &input(&quote), AT)
-                            .map(|_| ())
-                    } else {
-                        crate::market_payouts::request_payout_for_test(&tx, "provider", 500, AT)
-                    };
+                    let result = confirm_tx(
+                        &tx,
+                        "provider",
+                        &format!("racing-conversion-{i}"),
+                        &input(&quote),
+                        AT,
+                    )
+                    .map(|_| ());
                     if result.is_ok() {
                         tx.commit().unwrap();
                         true

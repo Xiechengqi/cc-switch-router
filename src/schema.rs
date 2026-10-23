@@ -271,6 +271,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../schema/0077_market_earning_wallet_conversion.sql"),
     ),
     (78, include_str!("../schema/0078_market_c2c.sql")),
+    (
+        79,
+        include_str!("../schema/0079_market_automatic_earnings.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -784,6 +788,57 @@ mod tests {
         Connection::open_in_memory().expect("open test database")
     }
 
+    #[test]
+    fn migration_79_retires_external_payouts_without_rewriting_wallets_or_history() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 78);
+        let at = "2026-10-22T00:00:00Z";
+        conn.execute("INSERT INTO users(id,email_normalized,status,email_verified_at,created_at,last_login_at)
+            VALUES('user','user@example.test','active',?1,?1,?1)",params![at]).unwrap();
+        crate::market_wallet::credit_verified_topup_tx(&conn, "user", "topup", 1234, "receipt", at)
+            .unwrap();
+        conn.execute("INSERT INTO market_payout_destinations(id,provider_user_id,version,asset_code,network,address,usable_at,created_at)
+            VALUES('old-address','user',1,'USDT','tron','historical-address',?1,?1)",params![at]).unwrap();
+        let before = crate::market_wallet::wallet_snapshot_tx(&conn, "user").unwrap();
+        let journals: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM market_journal_transactions",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        let after = crate::market_wallet::wallet_snapshot_tx(&conn, "user").unwrap();
+        assert_eq!(
+            (before.posted_units, before.held_units, before.version),
+            (after.posted_units, after.held_units, after.version)
+        );
+        assert_eq!(
+            journals,
+            conn.query_row(
+                "SELECT COUNT(*) FROM market_journal_transactions",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT address FROM market_payout_destinations WHERE id='old-address'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "historical-address"
+        );
+        assert!(conn.execute("INSERT INTO market_payout_destinations(id,provider_user_id,version,asset_code,network,address,usable_at,created_at)
+            VALUES('new-address','user',2,'USDT','tron','new-address',?1,?1)",params![at]).is_err());
+        assert!(conn.execute("INSERT INTO market_payout_requests(id,provider_user_id,destination_id,idempotency_key,request_fingerprint,amount_units,status,created_at,updated_at)
+            VALUES('new-request','user','old-address','key','fingerprint',1,'requested',?1,?1)",params![at]).is_err());
+        assert!(conn.execute("INSERT INTO market_payout_address_challenges(id,provider_user_id,network,address,code_sha256,expires_at,created_at)
+            VALUES('challenge','user','tron','address','hash',?1,?1)",params![at]).is_err());
+    }
     #[test]
     fn migration_78_adds_c2c_without_rewriting_existing_wallet_credit() {
         let conn = memory_connection();
@@ -1466,9 +1521,13 @@ mod tests {
             0
         );
         assert!(
-            !crate::market_wallet_policy::policy_tx(&conn)
+            !conn
+                .query_row(
+                    "SELECT earnings_conversions_paused FROM market_wallet_policy WHERE id=1",
+                    [],
+                    |r| r.get::<_, bool>(0)
+                )
                 .unwrap()
-                .earnings_conversions_paused
         );
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r

@@ -57,8 +57,7 @@ try {
     if (path === "/v1/market-wallet") {
       walletCalls++;
       const body = { assetCode: "USD", postedUnits: "345600000", heldUnits: "129600000", availableUnits: available,
-        version: walletCalls, mode: "enabled", canTopup: false, hasWalletActivity: true,
-        earningsConversion: { convertibleUnits: "0", canConvert: false, conversionBlockers: [] } };
+        version: walletCalls, mode: "enabled", canTopup: false, hasWalletActivity: true };
       if (holdNext) {
         holdNext = false;
         await new Promise((release) => { releaseHeld = release; });

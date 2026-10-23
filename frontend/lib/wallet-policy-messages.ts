@@ -1,6 +1,6 @@
 export const walletPolicyMessagesEn = {
   "commission.title": "Provider service fee",
-  "commission.help": "Deducted from fulfilled service revenue. Buyers pay the listing price; withdrawals are not charged again.",
+  "commission.help": "Deducted from fulfilled service revenue. Buyers pay the listing price; automatic balance credit has no extra fee.",
   "commission.rate": "Platform service fee (%)",
   "commission.current": "Current rate: {rate}%",
   "commission.scheduled": "{rate}% from {time}, for new service periods.",
@@ -18,7 +18,7 @@ export const walletPolicyMessagesEn = {
   "commission.net": "Net earnings",
   "commission.zeroNet": "No net earnings",
   "commission.earningsDetail": "Revenue & service fees",
-  "commission.providerHelp": "After 7 days, net earnings may be withdrawn or moved to consumption balance. Free or trial service earns no fee. Service adjustments reverse the original net earnings and fee; moving or withdrawing earnings has no additional fee.",
+  "commission.providerHelp": "After the 7-day settlement period, net earnings are credited to platform balance automatically, with no extra fee. Use the balance for services, C2C or email transfers.",
   "commission.breakdown": "Fee breakdown",
   "commission.lotGross": "Gross {amount}",
   "commission.lotReversed": "Fee reversed {amount}",
@@ -33,7 +33,7 @@ export const walletPolicyMessagesEn = {
     "Users may request this service without individual approval. Paid services still require platform balance.",
   "walletAccess.openConfirm": "Allow unknown users unless explicitly denied.",
   "account.nav.group.funds": "Funds",
-  "account.nav.earnings": "Earnings & withdrawals",
+  "account.nav.earnings": "Provider earnings",
   "account.nav.providerSettings": "Provider settings",
   "walletPolicy.credit": "Balance to receive",
   "walletPolicy.fee": "Maintenance fee ({rate}%)",
@@ -98,15 +98,13 @@ export const walletPolicyMessagesEn = {
   "marketWallet.entry.wallet_transfer": "Balance transfer",
   "marketFinanceOverview.maintenance": "Maintenance fees after reversals",
   "marketFinanceOverview.gross": "Gross top-up payments",
-  "marketProviderFinance.readOnly":
-    "Earnings history remains visible. Withdrawals are unavailable until the account or Provider identity is resolved.",
 };
 export const walletPolicyMessagesZh: Record<
   keyof typeof walletPolicyMessagesEn,
   string
 > = {
   "commission.title": "Provider 平台服务费",
-  "commission.help": "从已履约收入中扣除。买家支付原售价，Provider 提现不再重复扣费。",
+  "commission.help": "从已履约收入中扣除，买家支付原售价，收益自动到账不再重复扣费。",
   "commission.rate": "平台服务费（%）",
   "commission.current": "当前费率：{rate}%",
   "commission.scheduled": "{time} 起，新的计费周期适用 {rate}%。",
@@ -124,7 +122,7 @@ export const walletPolicyMessagesZh: Record<
   "commission.net": "净收益",
   "commission.zeroNet": "无净收益",
   "commission.earningsDetail": "收入与服务费明细",
-  "commission.providerHelp": "净收益沉淀 7 天后可提现或转入消费余额。免费或试用服务不收服务费；服务结算退回按原记录冲回净收益与服务费，转入或提现不再重复扣费。",
+  "commission.providerHelp": "净收益完成 7 天沉淀后自动计入平台余额，不再扣费，可用于消费、C2C 或邮箱转账。",
   "commission.breakdown": "查看分账",
   "commission.lotGross": "原价 {amount}",
   "commission.lotReversed": "已冲回服务费 {amount}",
@@ -137,7 +135,7 @@ export const walletPolicyMessagesZh: Record<
     "用户无需逐个批准即可租用；付费服务仍必须使用平台余额。",
   "walletAccess.openConfirm": "允许未单独信任的用户，但明确拒绝的用户除外。",
   "account.nav.group.funds": "资金",
-  "account.nav.earnings": "收入与提现",
+  "account.nav.earnings": "供应商收入",
   "account.nav.providerSettings": "Provider 设置",
   "walletPolicy.credit": "到账余额",
   "walletPolicy.fee": "维护费（{rate}%）",
@@ -195,6 +193,4 @@ export const walletPolicyMessagesZh: Record<
   "marketWallet.entry.wallet_transfer": "余额转账",
   "marketFinanceOverview.maintenance": "维护费收入（扣除冲正）",
   "marketFinanceOverview.gross": "充值实收总额",
-  "marketProviderFinance.readOnly":
-    "收入记录仍可查看；请解决账户或 Provider 身份问题后再提现。",
 };
