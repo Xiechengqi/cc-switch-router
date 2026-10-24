@@ -103,7 +103,7 @@ function C2CBuyWorkspace({ actor, onOrder }: { actor: string; onOrder: (order: C
         <C2CDescription value={quote.description} links={false} />
         <dl className="grid grid-cols-[minmax(0,1fr)_auto] gap-3 text-sm"><dt>{t("c2c.credit")}</dt><dd className="font-semibold tabular-nums">{formatMinorUsd(quote.creditMinor)}</dd><dt>{t("c2c.pay")}</dt><dd className="font-semibold tabular-nums">{c2cPayLabel(quote.payMinor, quote.currency)}</dd></dl>
         <p className="text-xs text-muted-foreground">{t("c2c.previewExpiry", { time: new Date(quote.expiresAt).toLocaleTimeString(locale) })}</p>
-        <p role="status" className="text-sm text-muted-foreground">{t("c2c.applicationHelp", { minutes: quote.acceptanceMinutes })}</p>
+        <p role="status" className="text-sm text-muted-foreground">{t("c2c.applicationHelp", { minutes: quote.paymentMinutes! })}</p>
         <C2CCheck checked={ack} disabled={busy} onChange={e => setAck(e.target.checked)}>{t("c2c.ack")}</C2CCheck><p className="text-xs text-muted-foreground">{t("c2c.fee")}</p>
         <C2CError>{error}</C2CError>
         {now >= Date.parse(quote.expiresAt) ? <>

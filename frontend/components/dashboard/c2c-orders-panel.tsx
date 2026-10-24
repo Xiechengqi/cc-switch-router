@@ -112,7 +112,7 @@ function C2COrdersWorkspace({ actor, selectedId, onSelect }: { actor: string; se
     <header className="flex min-w-0 flex-wrap items-center justify-between gap-3">
       <h2 className="text-lg font-semibold">{t("c2c.title")}</h2>
       <C2CAction type="button" secondary disabled={!policy || !snapshot || pausing} onClick={() => { setNotice(""); setEditorKey(v => v + 1); setSelling(true); }}>
-        {t(snapshot?.seller ? "c2c.sellerSettings" : "c2c.seller")}
+        {t(snapshot?.state === "confirmation_required" ? "c2c.confirmAutoAccept" : snapshot?.seller ? "c2c.sellerSettings" : "c2c.seller")}
       </C2CAction>
     </header>
     {snapshot?.seller ? <div className="flex min-w-0 flex-wrap items-center justify-between gap-2 text-sm">
@@ -121,9 +121,10 @@ function C2COrdersWorkspace({ actor, selectedId, onSelect }: { actor: string; se
         {" · "}{t("c2c.available", { amount: formatWalletUnits(snapshot.availableUnits) })}
         {snapshot.pendingOrders ? ` · ${t("c2c.pendingCount", { count: snapshot.pendingOrders })}` : ""}
       </p>
-      <div className="flex flex-wrap gap-2">{snapshot.seller.autoPauseReason && snapshot.seller.enabled && !snapshot.seller.suspended ? <C2CAction type="button" phase={pausing ? "loading" : "default"} disabled={pausing || !snapshot.canEnable} onClick={() => void pause(true)}>{t("c2c.resumeSelling")}</C2CAction> : null}
+      <div className="flex flex-wrap gap-2">{snapshot.seller.autoPauseReason && snapshot.seller.autoAcceptTermsVersion === 3 && snapshot.seller.enabled && !snapshot.seller.suspended ? <C2CAction type="button" phase={pausing ? "loading" : "default"} disabled={pausing || !snapshot.canEnable} onClick={() => void pause(true)}>{t("c2c.resumeSelling")}</C2CAction> : null}
       {snapshot.seller.enabled ? <C2CAction type="button" secondary phase={pausing ? "loading" : "default"} disabled={pausing} onClick={() => void pause()}>{t("c2c.pauseSelling")}</C2CAction> : null}</div>
     </div> : null}
+    {snapshot?.state === "confirmation_required" ? <p role="status" className="text-sm text-muted-foreground">{t("c2c.confirmAutoAcceptHelp")}</p> : null}
     {snapshot?.seller?.autoPauseReason ? <p role="status" className="text-sm text-muted-foreground">{t(`c2c.pauseReason.${snapshot.seller.autoPauseReason}`)}</p> : null}
     <C2CError>{sellerError}</C2CError>
     {notice ? <p role="status" className="text-sm text-primary">{notice}</p> : null}
@@ -199,7 +200,7 @@ function C2COrderDialog({ actor, id, onClose, onChanged }: { actor: string; id: 
       {o.status === "awaiting_seller" && !buyer ? <div className="flex flex-wrap gap-2"><C2CAction type="button" disabled={busy || now >= Date.parse(o.acceptanceDeadline!)} phase={busy ? "loading" : "default"} onClick={() => void run(() => actC2C(o, "accept"))}>{t("c2c.acceptApplication")}</C2CAction><C2CAction type="button" secondary disabled={busy} onClick={() => void run(() => actC2C(o, "reject"))}>{t("c2c.rejectApplication")}</C2CAction></div> : null}
       {o.status === "awaiting_seller" && buyer ? <div className="grid gap-2"><C2CCheck checked={ack} disabled={busy} onChange={e => setAck(e.target.checked)}>{t("c2c.cancelAck")}</C2CCheck><C2CAction type="button" secondary disabled={busy || !ack} phase={busy ? "loading" : "default"} onClick={() => void run(() => actC2C(o, "cancel"))}>{t("c2c.withdrawApplication")}</C2CAction></div> : null}
       {buyer && o.status === "awaiting_payment" ? intent ? <div className="grid gap-2"><C2CCheck checked={ack} disabled={busy} onChange={e => setAck(e.target.checked)}>{t(intent === "paid" ? "c2c.paidAck" : "c2c.cancelAck")}</C2CCheck><div className="flex flex-wrap gap-2"><C2CAction type="button" disabled={!ack || busy || (intent === "paid" && !window.mayClaimPayment)} phase={busy ? "loading" : "default"} onClick={() => void run(() => actC2C(o, intent))}>{t(intent === "paid" ? "c2c.markPaid" : "c2c.cancel")}</C2CAction><C2CAction type="button" secondary disabled={busy} onClick={() => setIntent(null)}>{t("common.cancel")}</C2CAction></div></div> : <div className="flex flex-wrap gap-2"><C2CAction type="button" disabled={busy || !window.mayClaimPayment} onClick={() => { setIntent("paid"); setAck(false); }}>{t("c2c.markPaid")}</C2CAction><C2CAction type="button" secondary disabled={busy} onClick={() => { setIntent("cancel"); setAck(false); }}>{t("c2c.cancel")}</C2CAction></div> : null}
-      {!buyer && held && (o.flowVersion === 1 || o.acceptedAt !== null) ? <div className="grid gap-3">
+      {!buyer && held && (o.flowVersion !== 2 || o.acceptedAt !== null) ? <div className="grid gap-3">
         <C2CCheck checked={releaseAck} disabled={busy} onChange={e => setReleaseAck(e.target.checked)}>{t("c2c.releaseAck")}</C2CCheck>
         <C2CAction type="button" secondary disabled={!releaseAck || busy || (!!challenge && now < challenge.resendAt)} onClick={() => void run(async () => { const value = await sendC2CReleaseCode(o); if (alive.current) setChallenge({ id: value.id, version: o.version, resendAt: c2cNow() + value.resendAfterSeconds * 1000 }); })}>{t("c2c.sendCode")}</C2CAction>
         {challenge ? <><p role="status" className="text-xs text-muted-foreground">{t("c2c.codeSent")}</p><label className="grid gap-1 text-sm">{t("c2c.code")}<input className={C2C_INPUT} value={code} inputMode="numeric" autoComplete="one-time-code" maxLength={6} disabled={busy} onChange={e => setCode(e.target.value.replace(/\D/g, ""))} /></label><C2CAction type="button" disabled={!releaseAck || busy || code.length !== 6 || challenge.version !== o.version} phase={busy ? "loading" : "default"} onClick={() => void run(() => releaseC2C(o, challenge.id, code))}>{t("c2c.release")}</C2CAction></> : null}

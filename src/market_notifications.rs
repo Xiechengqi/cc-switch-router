@@ -690,8 +690,8 @@ fn render(item: &Claimed, dashboard: &str) -> (String, String) {
     }
     if item.event_kind == "c2c_seller_changed" {
         let change = match item.payload.get("reason").and_then(Value::as_str) {
-            Some("acceptance_upgrade") => {
-                "挂售现在持续有效，不再要求停留钱包页；收到购入申请后，请在接单期限内处理。"
+            Some("auto_accept_consent_required") => {
+                "C2C 新订单改为下单即自动接单并冻结余额。请在平台余额页明确确认新规则后继续出售；确认前不会展示挂售，已有订单仍按原规则处理。"
             }
             Some("acceptance_timeout") => {
                 "有购入申请超时未接单，已暂停接收新申请。请在平台余额页检查后手动恢复出售。"
@@ -701,10 +701,22 @@ fn render(item: &Claimed, dashboard: &str) -> (String, String) {
             }
             _ => "C2C 出售设置已更新，请在平台余额页核对。",
         };
+        let change_en = match item.payload.get("reason").and_then(Value::as_str) {
+            Some("auto_accept_consent_required") => {
+                "New orders automatically reserve your credit. Explicitly confirm the new automatic-order terms in your wallet to list again. Existing orders keep their original rules; previous pauses remain in effect."
+            }
+            Some("acceptance_timeout") => {
+                "A historical application expired without acceptance. New orders are paused; review existing orders and explicitly resume selling."
+            }
+            Some("paid_order_overdue") => {
+                "A payment-declared order has waited over 60 minutes. New orders are paused; handle the order first. Reserved credit stays protected."
+            }
+            _ => "C2C seller settings changed. Review your wallet.",
+        };
         return (
             format!("{subject_zh} / {subject_en}"),
             format!(
-                "{change} 已有订单仍需处理；平台不能自动核实线下付款。\nC2C seller settings changed. Review your wallet; existing orders remain actionable. Offline payments are not verified by the platform.\n\n{}/account/wallet/",
+                "{change} 已有订单仍需处理；平台不能自动核实线下付款。\n{change_en} Existing orders remain actionable. Offline payments are not verified by the platform.\n\n{}/account/wallet/",
                 dashboard.trim_end_matches('/')
             ),
         );
@@ -740,11 +752,35 @@ fn render(item: &Claimed, dashboard: &str) -> (String, String) {
                 "有新的购入申请。请登录平台余额页，在接单期限内接单或拒绝；超时将暂停新申请。"
             }
             ("awaiting_payment", "buyer") => {
-                "卖家已接单。请登录订单查看付款信息和剩余时间；页面显示订单已关闭时请勿付款。"
+                "订单已就绪，卖家余额已冻结。请登录订单查看付款信息和剩余时间；页面显示订单已关闭时请勿付款。"
+            }
+            ("awaiting_payment", "seller") => {
+                "有待付款订单，余额已冻结。请留意付款通知，亲自核实实际到账后再放行；不需要另行接单。"
             }
             ("paid", "seller") => "买家已标记付款。请亲自核实收款后再放行余额；平台不会自动放行。",
             ("disputed", _) => "请在订单中补充证据，等待独立处理。争议中的余额不会自动解冻。",
             _ => "请登录订单查看当前状态，以页面为准。",
+        };
+        let instruction_en = match (status, role) {
+            ("awaiting_seller", "seller") => {
+                "Review this historical application and accept or decline before its response deadline. Do not request payment before acceptance."
+            }
+            ("awaiting_seller", _) => {
+                "Do not pay yet. This historical application still requires seller acceptance."
+            }
+            ("awaiting_payment", "buyer") => {
+                "Credit is reserved. Check payment instructions and time remaining in the order; pay only during its active payment window."
+            }
+            ("awaiting_payment", "seller") => {
+                "Credit is reserved for a new order. No separate acceptance is needed. Wait for payment, then verify actual receipt before releasing credit."
+            }
+            ("paid", "seller") => {
+                "The buyer declared payment. Verify actual receipt in your payment account before releasing credit; release is never automatic."
+            }
+            ("disputed", _) => {
+                "Add evidence in the order for independent review. Reserved credit does not expire automatically."
+            }
+            _ => "Review the current order before taking action.",
         };
         let destination = if role == "handler" {
             format!("settings/?panel=market_finance&c2cOrder={id}")
@@ -754,7 +790,7 @@ fn render(item: &Claimed, dashboard: &str) -> (String, String) {
         return (
             format!("{subject_zh} / {subject_en}"),
             format!(
-                "{subject_zh}：{zh_status}。{instruction} 金额：{}。平台不能自动核实线下付款，请在订单内核对；请勿向他人透露放行验证码。\n{subject_en}: {status}. Review the current order before taking action; acceptance is required before payment. Offline payment is not verified by the platform. Never share release codes.\n\n{}/{destination}",
+                "{subject_zh}：{zh_status}。{instruction} 金额：{}。平台不能自动核实线下付款，请在订单内核对；请勿向他人透露放行验证码。\n{subject_en}: {status}. {instruction_en} Offline payment is not verified by the platform. Never share release codes.\n\n{}/{destination}",
                 amount.as_deref().unwrap_or("—"),
                 dashboard.trim_end_matches('/')
             ),
@@ -1004,6 +1040,11 @@ async fn deliver(
 
 fn c2c_notice_current_tx(conn: &Connection, item: &Claimed, time: &str) -> Result<bool, AppError> {
     if item.event_kind == "c2c_seller_changed" {
+        match item.payload.get("reason").and_then(Value::as_str) {
+            Some("acceptance_upgrade") => return Ok(false),
+            Some("auto_accept_consent_required") => return conn.query_row("SELECT EXISTS(SELECT 1 FROM market_c2c_sellers WHERE user_id=?1 AND enabled=1 AND (auto_accept_terms_version!=3 OR auto_accept_consented_at IS NULL))", params![item.recipient_user_id], |r| r.get(0)).map_err(db_error("recheck automatic C2C consent notice")),
+            _ => {}
+        }
         if let Some(reason @ ("acceptance_timeout" | "paid_order_overdue")) =
             item.payload.get("reason").and_then(Value::as_str)
         {
@@ -1133,12 +1174,12 @@ mod tests {
         let c = Connection::open_in_memory().unwrap();
         c.execute_batch("CREATE TABLE users(id TEXT,status TEXT,email_verified_at TEXT);
             CREATE TABLE market_c2c_dispute_handlers(user_id TEXT,enabled INTEGER);
-            CREATE TABLE market_c2c_sellers(user_id TEXT,enabled INTEGER,auto_pause_reason TEXT);
+            CREATE TABLE market_c2c_sellers(user_id TEXT,enabled INTEGER,auto_pause_reason TEXT,auto_accept_terms_version INTEGER,auto_accept_consented_at TEXT);
             CREATE TABLE market_c2c_orders(id TEXT,buyer_id TEXT,seller_id TEXT,status TEXT,acceptance_deadline TEXT,payment_deadline TEXT);
             INSERT INTO users VALUES('buyer','active','verified'),('seller','active','verified'),('handler','active','verified');
             INSERT INTO market_c2c_orders VALUES('order','buyer','seller','awaiting_seller','2026-10-22T12:10:00Z',NULL);
             INSERT INTO market_c2c_dispute_handlers VALUES('handler',1),('seller',1);
-            INSERT INTO market_c2c_sellers VALUES('seller',1,'acceptance_timeout');").unwrap();
+            INSERT INTO market_c2c_sellers VALUES('seller',1,'acceptance_timeout',0,NULL);").unwrap();
         let mut item = Claimed {
             id: "notice".into(),
             recipient_user_id: "seller".into(),
@@ -1185,6 +1226,12 @@ mod tests {
         c.execute("UPDATE market_c2c_sellers SET auto_pause_reason=NULL", [])
             .unwrap();
         assert!(!c2c_notice_current_tx(&c, &item, "2026-10-22T13:00:00Z").unwrap());
+        item.payload = json!({"reason":"acceptance_upgrade"});
+        assert!(!c2c_notice_current_tx(&c, &item, "2026-10-22T13:00:00Z").unwrap());
+        item.payload = json!({"reason":"auto_accept_consent_required"});
+        assert!(c2c_notice_current_tx(&c, &item, "2026-10-22T13:00:00Z").unwrap());
+        c.execute("UPDATE market_c2c_sellers SET auto_accept_terms_version=3,auto_accept_consented_at='2026-10-22T13:00:00Z'",[]).unwrap();
+        assert!(!c2c_notice_current_tx(&c, &item, "2026-10-22T13:00:00Z").unwrap());
     }
 
     #[test]
@@ -1206,6 +1253,30 @@ mod tests {
         };
         let (_, text) = render(&handler, "https://router.example");
         assert!(text.ends_with("/settings/?panel=market_finance&c2cOrder=order"));
+    }
+
+    #[test]
+    fn c2c_automatic_notices_never_require_another_seller_acceptance() {
+        let mut item = Claimed {
+            id: "notice".into(),
+            recipient_user_id: "buyer".into(),
+            event_kind: "c2c_order_updated".into(),
+            payload: json!({"orderId":"order","status":"awaiting_payment","role":"buyer"}),
+            mandatory: true,
+            attempts: 1,
+        };
+        let (_, text) = render(&item, "https://router.example");
+        assert!(text.contains("卖家余额已冻结"));
+        assert!(!text.contains("卖家已接单") && !text.contains("acceptance is required"));
+        item.payload = json!({"orderId":"order","status":"awaiting_payment","role":"seller"});
+        let (_, text) = render(&item, "https://router.example");
+        assert!(text.contains("不需要另行接单") && text.contains("核实实际到账"));
+        assert!(text.contains("No separate acceptance is needed"));
+        item.event_kind = "c2c_seller_changed".into();
+        item.payload = json!({"reason":"auto_accept_consent_required"});
+        let (_, text) = render(&item, "https://router.example");
+        assert!(text.contains("明确确认新规则") && text.contains("已有订单仍按原规则处理"));
+        assert!(text.contains("Explicitly confirm the new automatic-order terms"));
     }
 
     #[test]

@@ -106,6 +106,7 @@ function allowedLegacyAssertion(relativePath, source, index, ruleName) {
     for (const declaration of [
       "fn migration_80_requires_explicit_publication_and_preserves_private_quote_evidence()",
       "fn migration_83_preserves_active_reservations_evidence_and_running_deadlines()",
+      "fn migration_84_preserves_frozen_orders_and_requires_explicit_automatic_consent()",
     ]) {
       const start = source.indexOf(declaration);
       if (start >= 0 && index >= start && index < start + extractRustBlock(source, declaration).length) return true;
@@ -450,6 +451,20 @@ function main() {
       errors.push(`${label} must not depend on official top-up mode`);
     }
   }
+  const c2cSource = fs.readFileSync(path.join(root, "src/market_c2c.rs"), "utf8");
+  const automaticOrder = extractRustBlock(c2cSource, "fn create_tx(");
+  for (const required of ["require_seller_tx", "reserve_wallet_tx", "payment_minutes", "'awaiting_payment',3", "terms_v3_standing_auto_accept_authorization"]) {
+    if (!automaticOrder.includes(required)) errors.push(`C2C automatic creation is missing ${required}`);
+  }
+  if (/accept_tx|acceptance_minutes|accepted_at/.test(automaticOrder)) errors.push("new C2C orders must not simulate manual seller acceptance");
+  for (const declaration of ["fn require_seller_tx(", "fn resume_seller_tx("]) {
+    const block = extractRustBlock(c2cSource, declaration);
+    if (!block.includes("auto_accept_terms_version != TERMS_VERSION") || !block.includes("auto_accept_consented_at.is_none()")) {
+      errors.push(`${declaration} must require explicit automatic-order consent`);
+    }
+  }
+  const c2cPolicy = extractRustBlock(c2cSource, "pub(super) struct Policy");
+  if (c2cPolicy.includes("acceptance_minutes")) errors.push("current C2C policy must not retain a manual acceptance window");
   const publicationReadiness = fs.readFileSync(path.join(root, "frontend/components/dashboard/share-market/paid-offer-readiness.tsx"), "utf8");
   if (!publicationReadiness.includes("getMarketProviderFinance") || !publicationReadiness.includes("finance.canPublishPaidOffers")
       || /getMarketWallet|getAccountPaymentProfile|getMarketBillingDashboard/.test(publicationReadiness)) {

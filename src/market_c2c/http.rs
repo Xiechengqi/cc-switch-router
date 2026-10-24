@@ -148,6 +148,12 @@ async fn seller(State(state): State<ServerState>, headers: HeaderMap) -> Reply<s
         None => "not_selling",
         Some(s) if s.suspended => "suspended",
         Some(s) if !s.enabled => "paused",
+        Some(s)
+            if s.auto_accept_terms_version != TERMS_VERSION
+                || s.auto_accept_consented_at.is_none() =>
+        {
+            "confirmation_required"
+        }
         Some(s) if s.auto_pause_reason.is_some() => "auto_paused",
         Some(_) if !blockers.is_empty() => "unavailable",
         Some(s) if available < units_from_minor(s.min_minor.max(p.min_minor))? => {
@@ -250,7 +256,7 @@ async fn offers(
         if !opening_blockers_tx(&conn)?.is_empty() {
             Some("platform_paused")
         } else {
-            let others:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM market_c2c_sellers s JOIN users u ON u.id=s.user_id WHERE s.enabled=1 AND s.suspended=0 AND s.auto_pause_reason IS NULL AND s.user_id!=?1 AND u.status='active' AND u.email_verified_at IS NOT NULL)",params![u.user_id],|r|r.get(0)).map_err(db_error("explain public C2C availability"))?;
+            let others:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM market_c2c_sellers s JOIN users u ON u.id=s.user_id WHERE s.enabled=1 AND s.suspended=0 AND s.auto_pause_reason IS NULL AND s.auto_accept_terms_version=3 AND s.auto_accept_consented_at IS NOT NULL AND s.user_id!=?1 AND u.status='active' AND u.email_verified_at IS NOT NULL)",params![u.user_id],|r|r.get(0)).map_err(db_error("explain public C2C availability"))?;
             Some(if others {
                 "no_matching_sellers"
             } else {

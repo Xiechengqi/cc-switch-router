@@ -7,7 +7,7 @@
 import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { C2CAction, C2CCheck, C2CError, C2C_INPUT } from "@/components/market/c2c-primitives";
-import { C2C_DESCRIPTION_MAX, c2cErrorKey, c2cBlockerKey, parseC2CMinor, saveC2CSeller, validC2CDescription, type C2CPolicyView, type C2CSeller, type C2CSellerSnapshot } from "@/lib/market-c2c";
+import { C2C_DESCRIPTION_MAX, C2C_TERMS_VERSION, c2cErrorKey, c2cBlockerKey, parseC2CMinor, saveC2CSeller, validC2CDescription, type C2CPolicyView, type C2CSeller, type C2CSellerSnapshot } from "@/lib/market-c2c";
 import { formatMinorUsd, formatWalletUnits, parseNonNegativeUsdMinor } from "@/lib/market-wallet-money";
 
 // A mounted editor owns its draft. Workspace polling never replaces these
@@ -38,14 +38,15 @@ export function C2CSellerPanel({ policy, snapshot, availabilityError, onRefresh,
   const descriptionValid = validC2CDescription(description.trim());
   const termsValid = low != null && high != null && high >= low && bps != null && bps >= 5000 && bps <= 20000;
   const versionChanged = (snapshot.seller?.version ?? 0) !== (original?.version ?? 0);
-  const blocked = availabilityError ? "c2c.eligibilityFailed" : snapshot.seller?.autoPauseReason ? "c2c.error.autoPaused" : snapshot.blockers[0] ? c2cBlockerKey(snapshot.blockers[0]) : null;
+  const needsConsent = !!original && original.autoAcceptTermsVersion !== C2C_TERMS_VERSION;
+  const blocked = availabilityError ? "c2c.eligibilityFailed" : snapshot.seller?.autoPauseReason && !needsConsent ? "c2c.error.autoPaused" : snapshot.blockers[0] ? c2cBlockerKey(snapshot.blockers[0]) : null;
   const save = async () => {
     if (lock.current || versionChanged || !descriptionValid || !termsValid || !ack || blocked || low == null || high == null || bps == null) return;
     lock.current = true; setBusy(true); onBusyChange(true); setError(""); setStale(false);
     try {
       const seller = await saveC2CSeller({
         expectedVersion: original?.version ?? 0, enabled: true, description: description.trim(),
-        currency, priceBps: bps, minMinor: low, maxMinor: high, acknowledgeExternalPayment: ack,
+        currency, priceBps: bps, minMinor: low, maxMinor: high, acknowledgeExternalPayment: ack, autoAcceptTermsVersion: C2C_TERMS_VERSION,
       });
       if (alive.current) onSaved(seller);
     } catch (cause) {
@@ -109,7 +110,7 @@ export function C2CSellerPanel({ policy, snapshot, availabilityError, onRefresh,
       {stale || versionChanged ? <C2CAction type="button" secondary disabled={busy} onClick={() => void reload()}>{t("c2c.reloadSettings")}</C2CAction>
         : blocked ? <C2CAction type="button" secondary phase={busy ? "loading" : "default"} disabled={busy} onClick={() => void refreshEligibility()}>{t("c2c.refreshEligibility")}</C2CAction> : null}
       <C2CAction type="submit" aria-describedby={blocked ? fieldId + "-eligibility" : undefined} phase={busy ? "loading" : "default"} disabled={!descriptionValid || !termsValid || !ack || !!blocked || busy || stale || versionChanged}>
-        {t(original?.enabled ? "common.save" : "c2c.startSelling")}
+        {t(needsConsent && original?.enabled ? "c2c.confirmAutoAccept" : original?.enabled ? "common.save" : "c2c.startSelling")}
       </C2CAction>
     </div>
   </form>;

@@ -288,6 +288,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../schema/0082_market_topup_mode_isolation.sql"),
     ),
     (83, include_str!("../schema/0083_market_c2c_acceptance.sql")),
+    (
+        84,
+        include_str!("../schema/0084_market_c2c_auto_accept.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -799,6 +803,187 @@ mod tests {
 
     fn memory_connection() -> Connection {
         Connection::open_in_memory().expect("open test database")
+    }
+
+    #[test]
+    fn migration_84_preserves_frozen_orders_and_requires_explicit_automatic_consent() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 83);
+        let at = "2026-10-23T12:00:00Z";
+        for user in ["seller", "buyer", "paused", "suspended", "auto-paused"] {
+            conn.execute("INSERT INTO users(id,email_normalized,status,email_verified_at,created_at,last_login_at) VALUES(?1,?2,'active',?3,?3,?3)",params![user,format!("{user}@example.test"),at]).unwrap();
+        }
+        crate::market_wallet::credit_verified_topup_tx(
+            &conn,
+            "seller",
+            "migration84-funding",
+            20000,
+            "receipt",
+            at,
+        )
+        .unwrap();
+        for (user, enabled, suspended) in [
+            ("seller", true, false),
+            ("paused", false, false),
+            ("suspended", true, true),
+            ("auto-paused", true, false),
+        ] {
+            conn.execute("INSERT INTO market_c2c_sellers(user_id,version,enabled,suspended,display_name,description,currency,price_bps,min_minor,max_minor,created_at,updated_at) VALUES(?1,7,?2,?3,?1,'Contact seller','USD',10000,100,10000,?4,?4)",params![user,enabled,suspended,at]).unwrap();
+        }
+        conn.execute("UPDATE market_c2c_sellers SET auto_pause_reason='acceptance_timeout',auto_paused_at=?1,auto_pause_order_id='awaiting_seller' WHERE user_id='auto-paused'",params![at]).unwrap();
+        for (status, accepted, paid) in [
+            ("awaiting_seller", false, false),
+            ("awaiting_payment", true, false),
+            ("paid", true, true),
+            ("disputed", false, true),
+            ("cancelled", false, false),
+            ("expired", true, false),
+            ("released", true, true),
+        ] {
+            conn.execute("INSERT INTO market_c2c_quotes(id,buyer_id,seller_id,seller_version,policy_version,credit_minor,pay_minor,currency,fx_micros,price_bps,seller_name,description,contact,payment_method,payment_details,payment_minutes,expires_at,created_at,flow_version,acceptance_minutes) VALUES(?1,'buyer','seller',7,1,1000,1000,'USD',1000000,10000,'Seller','Frozen description','','','',30,'2026-10-23T12:05:00Z',?2,2,10)",params![status,at]).unwrap();
+            let amount = crate::market_wallet::units_from_minor(1000).unwrap();
+            let hold = crate::market_wallet::reserve_wallet_tx(
+                &conn,
+                "seller",
+                "c2c_order",
+                status,
+                "c2c",
+                amount,
+                None,
+                at,
+            )
+            .unwrap();
+            let deadline = accepted.then_some("2026-10-23T12:39:00Z");
+            let released_at = (status == "released").then_some("2026-10-23T12:11:00Z");
+            let release_journal = if let Some(released_at) = released_at {
+                // Seed the historical sealed delivery, not new money. Its
+                // projections and original release identity must also survive.
+                crate::market_wallet::ensure_wallet_tx(&conn, "buyer", at).unwrap();
+                let j = crate::market_wallet::post_journal_tx(
+                    &conn,
+                    "c2c_order",
+                    status,
+                    "release",
+                    &format!("seller:buyer:{amount}:{status}"),
+                    &[
+                        crate::market_wallet::Posting {
+                            kind: "wallet_held",
+                            subject_id: "seller",
+                            signed_units: amount,
+                        },
+                        crate::market_wallet::Posting {
+                            kind: "wallet_available",
+                            subject_id: "buyer",
+                            signed_units: -amount,
+                        },
+                    ],
+                    released_at,
+                )
+                .unwrap();
+                conn.execute("UPDATE market_wallet_holds SET remaining_units=0,status='captured',updated_at=?2 WHERE id=?1",params![hold,released_at]).unwrap();
+                conn.execute("UPDATE market_wallet_accounts SET posted_units=posted_units-?1,held_units=held_units-?1,version=version+1,updated_at=?2 WHERE user_id='seller'",params![amount,released_at]).unwrap();
+                conn.execute("UPDATE market_wallet_accounts SET posted_units=posted_units+?1,version=version+1,updated_at=?2 WHERE user_id='buyer'",params![amount,released_at]).unwrap();
+                Some(j.id)
+            } else {
+                None
+            };
+            conn.execute("INSERT INTO market_c2c_orders(id,quote_id,buyer_id,seller_id,idempotency_key,amount_units,hold_id,status,terms_version,payment_deadline,paid_at,late_payment_reported,acceptance_deadline,accepted_at,created_ip,created_at,updated_at,released_at,release_journal_id) VALUES(?1,?1,'buyer','seller',?1,?2,?3,?1,2,?4,?5,?6,'2026-10-23T12:10:00Z',?7,'127.0.0.1',?8,?8,?9,?10)",params![status,amount,hold,deadline,paid.then_some(if accepted {"2026-10-23T12:10:00Z"} else {at}),status=="disputed",accepted.then_some("2026-10-23T12:09:00Z"),at,released_at,release_journal]).unwrap();
+            if matches!(status, "cancelled" | "expired") {
+                crate::market_wallet::release_hold_tx(&conn, &hold, at).unwrap();
+            }
+            conn.execute("INSERT INTO market_c2c_events(id,order_id,actor_id,action,note,created_at) VALUES(?1,?1,'buyer','created','Exact original evidence',?2)",params![status,at]).unwrap();
+            conn.execute("INSERT INTO market_c2c_challenges(id,order_id,seller_id,email,binding,code_mac,key_version,attempts,delivered_at,expires_at,created_ip,created_at) VALUES(?1,?1,'seller','seller@example.test','original-binding','original-mac',1,2,?2,'2026-10-23T12:10:00Z','127.0.0.1',?2)",params![status,at]).unwrap();
+        }
+        // Snapshot every original column, including NULLs and financial
+        // projections, not just row counts. Quotes gain one new column only.
+        let mut snapshots = Vec::new();
+        for table in [
+            "market_c2c_sellers",
+            "market_c2c_quotes",
+            "market_c2c_orders",
+            "market_c2c_events",
+            "market_c2c_challenges",
+            "market_wallet_holds",
+            "market_wallet_accounts",
+            "market_journal_transactions",
+            "market_journal_postings",
+            "market_journal_seals",
+        ] {
+            let columns = conn
+                .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let sql = format!(
+                "SELECT json_array({}) FROM {table} ORDER BY 1",
+                columns.join(",")
+            );
+            let rows = conn
+                .prepare(&sql)
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            snapshots.push((sql, rows));
+        }
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        for (sql, before) in snapshots {
+            let after = conn
+                .prepare(&sql)
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(before, after, "{sql}");
+        }
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM market_c2c_sellers WHERE auto_accept_terms_version=0 AND auto_accept_consented_at IS NULL",[],|r|r.get::<_,i64>(0)).unwrap(),4);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM market_c2c_quotes WHERE flow_version=2 AND auto_accept_authorized_at IS NULL",[],|r|r.get::<_,i64>(0)).unwrap(),7);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM market_notification_outbox WHERE dedupe_key LIKE 'c2c-auto-accept-upgrade:%'",[],|r|r.get::<_,i64>(0)).unwrap(),3);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM pragma_table_info('market_c2c_policy') WHERE name='acceptance_minutes'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",[],|r|r.get::<_,i64>(0)).unwrap(),232);
+        for id in [
+            "awaiting_seller",
+            "awaiting_payment",
+            "paid",
+            "disputed",
+            "cancelled",
+            "expired",
+            "released",
+        ] {
+            assert!(
+                crate::market_c2c::evidence_valid_tx(&conn, id).unwrap(),
+                "{id}"
+            );
+        }
+        crate::market_wallet::reconcile_wallet_tx(&conn, "seller").unwrap();
+        assert!(
+            conn.execute(
+                "UPDATE market_c2c_quotes SET flow_version=3 WHERE id='awaiting_seller'",
+                []
+            )
+            .is_err()
+        );
+        assert!(conn.execute("UPDATE market_c2c_orders SET payment_deadline='2026-10-23T14:00:00Z' WHERE id='awaiting_payment'",[]).is_err());
+        assert!(
+            conn.execute(
+                "UPDATE market_c2c_sellers SET auto_accept_terms_version=3 WHERE user_id='seller'",
+                []
+            )
+            .is_err()
+        );
     }
 
     #[test]

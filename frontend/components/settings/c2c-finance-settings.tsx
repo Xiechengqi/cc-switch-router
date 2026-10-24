@@ -19,7 +19,6 @@ export function C2CFinanceSettings() {
 function C2CFinanceControl({ actor }: { actor: string }) {
   const { t } = useLocaleText(); const [policy, setPolicy] = React.useState<C2CPolicy | null>(null); const [canManage, setCanManage] = React.useState(false); const [emailReady, setEmailReady] = React.useState(true);
   const [enabled, setEnabled] = React.useState(true); const [admission, setAdmission] = React.useState("100"); const [min, setMin] = React.useState("1"); const [max, setMax] = React.useState("5000"); const [minutes, setMinutes] = React.useState("30");
-  const [acceptance, setAcceptance] = React.useState("10");
   const [handlers, setHandlers] = React.useState<C2CDisputeHandler[]>([]); const [handlerNext, setHandlerNext] = React.useState<string | null>(null); const [handlerEmail, setHandlerEmail] = React.useState("");
   const [orders, setOrders] = React.useState<C2COrder[]>([]); const [next, setNext] = React.useState<string | null>(null); const [all, setAll] = React.useState(false);
   const [sellers, setSellers] = React.useState<C2CAdminSeller[]>([]); const [sellerNext, setSellerNext] = React.useState<string | null>(null);
@@ -31,7 +30,6 @@ function C2CFinanceControl({ actor }: { actor: string }) {
   const loadPolicy = React.useCallback(async () => {
     const p = await getAdminC2CPolicy(); if (!alive.current) return;
     setPolicy(p.policy); setCanManage(p.canManage); setEmailReady(p.emailReady); setEnabled(p.policy.enabled); setAdmission(String(p.policy.admissionMinor / 100)); setMin(String(p.policy.minMinor / 100)); setMax(String(p.policy.maxMinor / 100)); setMinutes(String(p.policy.paymentMinutes));
-    setAcceptance(String(p.policy.acceptanceMinutes));
   }, []);
   const loadOrders = React.useCallback(async (before = "") => {
     const seq = ++orderRequest.current;
@@ -52,19 +50,17 @@ function C2CFinanceControl({ actor }: { actor: string }) {
   React.useEffect(() => { void run(async () => { await Promise.all([loadPolicy(), loadSellers()]); }); }, [loadPolicy, loadSellers, run]);
   React.useEffect(() => { setOrders([]); setNext(null); void loadOrders().catch(e => { if (alive.current) setError(t(c2cErrorKey(e))); }); return () => { orderRequest.current++; }; }, [loadOrders, t]);
   const low = parseC2CMinor(min); const high = parseC2CMinor(max); const threshold = parseC2CMinor(admission); const m = /^\d{1,2}$/.test(minutes) ? Number(minutes) : 0;
-  const a = /^\d{1,2}$/.test(acceptance) ? Number(acceptance) : 0;
-  const valid = low != null && high != null && high >= low && high <= 10_000_000 && threshold != null && threshold >= 100 && threshold <= 10_000_000 && m >= 5 && m <= 60 && a >= 5 && a <= 30;
+  const valid = low != null && high != null && high >= low && high <= 10_000_000 && threshold != null && threshold >= 100 && threshold <= 10_000_000 && m >= 5 && m <= 60;
   return <section className="grid min-w-0 gap-5 rounded-xl border border-border bg-card p-4 sm:p-5" data-c2c-admin>
     <header className="flex flex-wrap items-center justify-between gap-3"><h3 className="text-base font-semibold">{t("c2c.policy")}</h3><C2CAction type="button" secondary disabled={busy} onClick={() => void run(async () => { setSaved(false); await Promise.all([loadPolicy(), loadOrders(), loadSellers()]); })}>{t("common.reload")}</C2CAction></header>
     <C2CError>{error}</C2CError>
     {!emailReady ? <p className="text-sm text-muted-foreground">{t("c2c.error.email")}</p> : null}
-    {policy ? <form className="grid min-w-0 gap-3" onSubmit={e => { e.preventDefault(); if (!valid || !canManage || threshold == null || low == null || high == null) return; void run(async () => { const p = await saveAdminC2CPolicy({ ...policy, enabled, admissionMinor: threshold, minMinor: low, maxMinor: high, paymentMinutes: m, acceptanceMinutes: a }); if (alive.current) { setPolicy(p); setSaved(true); } }); }}>
+    {policy ? <form className="grid min-w-0 gap-3" onSubmit={e => { e.preventDefault(); if (!valid || !canManage || threshold == null || low == null || high == null) return; void run(async () => { const p = await saveAdminC2CPolicy({ ...policy, enabled, admissionMinor: threshold, minMinor: low, maxMinor: high, paymentMinutes: m }); if (alive.current) { setPolicy(p); setSaved(true); } }); }}>
       <p className="text-sm leading-6 text-muted-foreground">{t("c2c.policyHelp")}</p>
       <C2CCheck checked={enabled} disabled={!canManage || busy} onChange={e => { setEnabled(e.target.checked); setSaved(false); }}>{t("c2c.enabled")}</C2CCheck>
       <div className="grid min-w-0 gap-3 sm:grid-cols-2">
         <label className="grid min-w-0 gap-1 text-sm">{t("c2c.admission")}<input className={C2C_INPUT} inputMode="decimal" value={admission} disabled={!canManage || busy} onChange={e => { setAdmission(e.target.value); setSaved(false); }} /></label>
         <label className="grid min-w-0 gap-1 text-sm">{t("c2c.minutes")}<input className={C2C_INPUT} inputMode="numeric" value={minutes} disabled={!canManage || busy} onChange={e => { setMinutes(e.target.value); setSaved(false); }} /></label>
-        <label className="grid min-w-0 gap-1 text-sm">{t("c2c.acceptanceMinutes")}<input className={C2C_INPUT} inputMode="numeric" value={acceptance} disabled={!canManage || busy} onChange={e => { setAcceptance(e.target.value); setSaved(false); }} /></label>
         <label className="grid min-w-0 gap-1 text-sm">{t("c2c.min")}<input className={C2C_INPUT} inputMode="decimal" value={min} disabled={!canManage || busy} onChange={e => { setMin(e.target.value); setSaved(false); }} /></label>
         <label className="grid min-w-0 gap-1 text-sm">{t("c2c.max")}<input className={C2C_INPUT} inputMode="decimal" value={max} disabled={!canManage || busy} onChange={e => { setMax(e.target.value); setSaved(false); }} /></label>
       </div>

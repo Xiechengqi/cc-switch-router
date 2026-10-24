@@ -18,7 +18,7 @@ pub use http::router;
 mod tests;
 
 const ACTIVE: &str = "('awaiting_seller','awaiting_payment','paid','disputed')";
-const TERMS_VERSION: i64 = 2;
+const TERMS_VERSION: i64 = 3;
 
 fn problem(code: &'static str, message: &str) -> AppError {
     AppError::Coded {
@@ -65,11 +65,10 @@ pub(super) struct Policy {
     min_minor: i64,
     max_minor: i64,
     payment_minutes: i64,
-    acceptance_minutes: i64,
 }
 fn policy_tx(conn: &Connection) -> Result<Policy, AppError> {
-    conn.query_row("SELECT version,enabled,admission_minor,min_minor,max_minor,payment_minutes,acceptance_minutes FROM market_c2c_policy WHERE id=1",[],|r|Ok(Policy {
-        version:r.get(0)?,enabled:r.get(1)?,admission_minor:r.get(2)?,min_minor:r.get(3)?,max_minor:r.get(4)?,payment_minutes:r.get(5)?,acceptance_minutes:r.get(6)?
+    conn.query_row("SELECT version,enabled,admission_minor,min_minor,max_minor,payment_minutes FROM market_c2c_policy WHERE id=1",[],|r|Ok(Policy {
+        version:r.get(0)?,enabled:r.get(1)?,admission_minor:r.get(2)?,min_minor:r.get(3)?,max_minor:r.get(4)?,payment_minutes:r.get(5)?
     })).map_err(db_error("read C2C policy"))
 }
 fn open_tx(conn: &Connection) -> Result<Policy, AppError> {
@@ -152,13 +151,12 @@ fn save_policy_tx(
         || input.max_minor < input.min_minor
         || input.max_minor > 10_000_000
         || !(5..=60).contains(&input.payment_minutes)
-        || !(5..=30).contains(&input.acceptance_minutes)
     {
         return Err(AppError::BadRequest("invalid C2C policy limits".into()));
     }
     let before = policy_tx(conn)?;
-    let changed=conn.execute("UPDATE market_c2c_policy SET version=version+1,enabled=?2,admission_minor=?3,min_minor=?4,max_minor=?5,payment_minutes=?6,updated_at=?7,acceptance_minutes=?8 WHERE id=1 AND version=?1",
-        params![input.version,input.enabled,input.admission_minor,input.min_minor,input.max_minor,input.payment_minutes,time,input.acceptance_minutes]).map_err(db_error("save C2C policy"))?;
+    let changed=conn.execute("UPDATE market_c2c_policy SET version=version+1,enabled=?2,admission_minor=?3,min_minor=?4,max_minor=?5,payment_minutes=?6,updated_at=?7 WHERE id=1 AND version=?1",
+        params![input.version,input.enabled,input.admission_minor,input.min_minor,input.max_minor,input.payment_minutes,time]).map_err(db_error("save C2C policy"))?;
     if changed != 1 {
         return Err(problem("C2C_STALE", "C2C policy version changed; reload"));
     }
@@ -291,10 +289,12 @@ struct Seller {
     auto_pause_reason: Option<String>,
     auto_paused_at: Option<String>,
     auto_pause_order_id: Option<String>,
+    auto_accept_terms_version: i64,
+    auto_accept_consented_at: Option<String>,
 }
 fn seller_tx(conn: &Connection, id: &str) -> Result<Option<Seller>, AppError> {
-    conn.query_row("SELECT user_id,version,enabled,suspended,display_name,description,currency,price_bps,min_minor,max_minor,auto_pause_reason,auto_paused_at,auto_pause_order_id FROM market_c2c_sellers WHERE user_id=?1",params![id],|r|Ok(Seller {
-        user_id:r.get(0)?,version:r.get(1)?,enabled:r.get(2)?,suspended:r.get(3)?,display_name:r.get(4)?,description:r.get(5)?,currency:r.get(6)?,price_bps:r.get(7)?,min_minor:r.get(8)?,max_minor:r.get(9)?,auto_pause_reason:r.get(10)?,auto_paused_at:r.get(11)?,auto_pause_order_id:r.get(12)?
+    conn.query_row("SELECT user_id,version,enabled,suspended,display_name,description,currency,price_bps,min_minor,max_minor,auto_pause_reason,auto_paused_at,auto_pause_order_id,auto_accept_terms_version,auto_accept_consented_at FROM market_c2c_sellers WHERE user_id=?1",params![id],|r|Ok(Seller {
+        user_id:r.get(0)?,version:r.get(1)?,enabled:r.get(2)?,suspended:r.get(3)?,display_name:r.get(4)?,description:r.get(5)?,currency:r.get(6)?,price_bps:r.get(7)?,min_minor:r.get(8)?,max_minor:r.get(9)?,auto_pause_reason:r.get(10)?,auto_paused_at:r.get(11)?,auto_pause_order_id:r.get(12)?,auto_accept_terms_version:r.get(13)?,auto_accept_consented_at:r.get(14)?
     })).optional().map_err(db_error("read C2C seller"))
 }
 #[derive(Deserialize)]
@@ -308,6 +308,7 @@ struct SellerInput {
     min_minor: i64,
     max_minor: i64,
     acknowledge_external_payment: bool,
+    auto_accept_terms_version: i64,
 }
 fn save_seller_tx(
     conn: &Connection,
@@ -323,6 +324,7 @@ fn save_seller_tx(
         return Err(problem("C2C_STALE", "seller settings changed; reload"));
     }
     if !input.acknowledge_external_payment
+        || input.auto_accept_terms_version != TERMS_VERSION
         || !matches!(input.currency.as_str(), "USD" | "CNY")
         || !(5000..=20000).contains(&input.price_bps)
         || input.min_minor < 1
@@ -359,20 +361,21 @@ fn save_seller_tx(
         }
     }
     if input.enabled
-        && prior
-            .as_ref()
-            .is_some_and(|s| s.auto_pause_reason.is_some())
+        && prior.as_ref().is_some_and(|s| {
+            s.auto_pause_reason.is_some() && s.auto_accept_terms_version == TERMS_VERSION
+        })
     {
         return Err(problem(
             "C2C_AUTO_PAUSED",
             "review outstanding orders and explicitly resume selling",
         ));
     }
-    conn.execute("INSERT INTO market_c2c_sellers(user_id,version,enabled,display_name,description,currency,price_bps,min_minor,max_minor,created_at,updated_at)
-        VALUES(?1,1,?2,?3,?4,?5,?6,?7,?8,?9,?9)
+    conn.execute("INSERT INTO market_c2c_sellers(user_id,version,enabled,display_name,description,currency,price_bps,min_minor,max_minor,created_at,updated_at,auto_accept_terms_version,auto_accept_consented_at)
+        VALUES(?1,1,?2,?3,?4,?5,?6,?7,?8,?9,?9,3,?9)
         ON CONFLICT(user_id) DO UPDATE SET version=version+1,enabled=excluded.enabled,description=excluded.description,
          currency=excluded.currency,price_bps=excluded.price_bps,
-         min_minor=excluded.min_minor,max_minor=excluded.max_minor,updated_at=excluded.updated_at",
+         min_minor=excluded.min_minor,max_minor=excluded.max_minor,updated_at=excluded.updated_at,
+         auto_accept_terms_version=3,auto_accept_consented_at=COALESCE(market_c2c_sellers.auto_accept_consented_at,excluded.auto_accept_consented_at)",
         params![user,input.enabled,name,description,input.currency,input.price_bps,input.min_minor,input.max_minor,time]).map_err(db_error("save C2C seller"))?;
     audit_tx(
         conn,
@@ -380,7 +383,7 @@ fn save_seller_tx(
         "configure",
         "c2c_seller",
         user,
-        "seller_description_v2",
+        "explicit_auto_accept_terms_v3",
         time,
     )?;
     crate::market_notifications::enqueue_user_notification_tx(
@@ -432,6 +435,8 @@ fn require_seller_tx(conn: &Connection, user: &str, time: &str) -> Result<Seller
         || s.suspended
         || s.description.is_empty()
         || s.auto_pause_reason.is_some()
+        || s.auto_accept_terms_version != TERMS_VERSION
+        || s.auto_accept_consented_at.is_none()
         || overdue_paid_orders_tx(conn, user, time)?
     {
         return Err(problem(
@@ -472,7 +477,7 @@ fn offers_tx(
     } else {
         p.max_minor.min(10000)
     };
-    let mut stmt=conn.prepare("SELECT user_id FROM market_c2c_sellers WHERE enabled=1 AND suspended=0 AND auto_pause_reason IS NULL AND user_id!=?1 AND user_id>?2 ORDER BY user_id LIMIT 101").map_err(db_error("list C2C sellers"))?;
+    let mut stmt=conn.prepare("SELECT user_id FROM market_c2c_sellers WHERE enabled=1 AND suspended=0 AND auto_pause_reason IS NULL AND auto_accept_terms_version=3 AND auto_accept_consented_at IS NOT NULL AND user_id!=?1 AND user_id>?2 ORDER BY user_id LIMIT 101").map_err(db_error("list C2C sellers"))?;
     let mut ids = stmt
         .query_map(params![user, after], |r| r.get::<_, String>(0))
         .map_err(db_error("query C2C sellers"))?
@@ -540,7 +545,7 @@ struct Quote {
     description: String,
     expires_at: String,
     flow_version: i64,
-    acceptance_minutes: i64,
+    payment_minutes: i64,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -611,11 +616,11 @@ fn quote_tx(
         description: s.description.clone(),
         expires_at: (at(time)? + Duration::minutes(5)).to_rfc3339(),
         flow_version: TERMS_VERSION,
-        acceptance_minutes: p.acceptance_minutes,
+        payment_minutes: p.payment_minutes,
     };
-    conn.execute("INSERT INTO market_c2c_quotes(id,buyer_id,seller_id,seller_version,policy_version,credit_minor,pay_minor,currency,fx_micros,price_bps,seller_name,description,contact,payment_method,payment_details,payment_minutes,expires_at,created_at,flow_version,acceptance_minutes)
-        VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'','','',?13,?14,?15,2,?16)",
-        params![q.id,buyer,q.seller_id,s.version,p.version,q.credit_minor,q.pay_minor,q.currency,rate,s.price_bps,s.display_name,s.description,p.payment_minutes,q.expires_at,time,p.acceptance_minutes]).map_err(db_error("create C2C preview"))?;
+    conn.execute("INSERT INTO market_c2c_quotes(id,buyer_id,seller_id,seller_version,policy_version,credit_minor,pay_minor,currency,fx_micros,price_bps,seller_name,description,contact,payment_method,payment_details,payment_minutes,expires_at,created_at,flow_version,auto_accept_authorized_at)
+        VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'','','',?13,?14,?15,3,?16)",
+        params![q.id,buyer,q.seller_id,s.version,p.version,q.credit_minor,q.pay_minor,q.currency,rate,s.price_bps,s.display_name,s.description,p.payment_minutes,q.expires_at,time,s.auto_accept_consented_at]).map_err(db_error("create C2C preview"))?;
     Ok(q)
 }
 
@@ -737,7 +742,8 @@ fn create_tx(
     ip: &str,
     time: &str,
 ) -> Result<Order, AppError> {
-    if !matches!(input.terms_version, 1 | TERMS_VERSION) || !input.acknowledge_external_payment {
+    if !matches!(input.terms_version, 1 | 2 | TERMS_VERSION) || !input.acknowledge_external_payment
+    {
         return Err(problem("C2C_TERMS", "accept the external payment terms"));
     }
     if key.len() < 8
@@ -758,12 +764,12 @@ fn create_tx(
     if input.terms_version != TERMS_VERSION {
         return Err(problem(
             "C2C_TERMS",
-            "seller acceptance is now required; review a new quote",
+            "automatic orders require the current terms; review a new quote",
         ));
     }
     verified_tx(conn, buyer)?;
     let p = open_tx(conn)?;
-    let (seller,seller_version,policy_version,minor,minutes,expires,flow):(String,i64,i64,i64,i64,String,i64)=conn.query_row("SELECT seller_id,seller_version,policy_version,credit_minor,acceptance_minutes,expires_at,flow_version FROM market_c2c_quotes WHERE id=?1 AND buyer_id=?2",params![input.quote_id,buyer],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).optional().map_err(db_error("read own C2C preview"))?.ok_or_else(||problem("C2C_STALE","preview expired or is unavailable; review again"))?;
+    let (seller,seller_version,policy_version,minor,minutes,expires,flow):(String,i64,i64,i64,i64,String,i64)=conn.query_row("SELECT seller_id,seller_version,policy_version,credit_minor,payment_minutes,expires_at,flow_version FROM market_c2c_quotes WHERE id=?1 AND buyer_id=?2",params![input.quote_id,buyer],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).optional().map_err(db_error("read own C2C preview"))?.ok_or_else(||problem("C2C_STALE","preview expired or is unavailable; review again"))?;
     let s = require_seller_tx(conn, &seller, time)?;
     if seller == buyer
         || seller_version != s.version
@@ -828,15 +834,15 @@ fn create_tx(
         None,
         time,
     )?;
-    conn.execute("INSERT INTO market_c2c_orders(id,quote_id,buyer_id,seller_id,idempotency_key,amount_units,hold_id,status,terms_version,acceptance_deadline,created_ip,created_at,updated_at)
-        VALUES(?1,?2,?3,?4,?5,?6,?7,'awaiting_seller',2,?8,?9,?10,?10)",params![id,input.quote_id,buyer,seller,key,amount,hold,deadline,ip,time]).map_err(db_error("create C2C order"))?;
+    conn.execute("INSERT INTO market_c2c_orders(id,quote_id,buyer_id,seller_id,idempotency_key,amount_units,hold_id,status,terms_version,payment_deadline,created_ip,created_at,updated_at)
+        VALUES(?1,?2,?3,?4,?5,?6,?7,'awaiting_payment',3,?8,?9,?10,?10)",params![id,input.quote_id,buyer,seller,key,amount,hold,deadline,ip,time]).map_err(db_error("create C2C order"))?;
     let o = order_tx(conn, &id)?;
     event_tx(
         conn,
         &o,
         buyer,
         "created",
-        "terms_v2_acceptance_required",
+        "terms_v3_standing_auto_accept_authorization",
         time,
     )?;
     Ok(o)
@@ -859,6 +865,12 @@ fn accept_tx(
     if actor != o.seller_id {
         return Err(AppError::Forbidden(
             "only the seller can accept an application".into(),
+        ));
+    }
+    if o.flow_version != 2 {
+        return Err(problem(
+            "C2C_TERMS",
+            "this order does not require seller acceptance",
         ));
     }
     // A lost acceptance response may be replayed, but can never extend time.
@@ -936,6 +948,12 @@ fn resume_seller_tx(
         seller_tx(conn, actor)?.ok_or_else(|| AppError::NotFound("C2C seller not found".into()))?;
     if s.version != version || !s.enabled || s.auto_pause_reason.is_none() {
         return Err(problem("C2C_STALE", "seller changed; reload"));
+    }
+    if s.auto_accept_terms_version != TERMS_VERSION || s.auto_accept_consented_at.is_none() {
+        return Err(problem(
+            "C2C_AUTO_ACCEPT_CONSENT",
+            "confirm automatic selling terms first",
+        ));
     }
     if let Some(code) = seller_blockers_tx(conn, actor, time)?.first() {
         return Err(problem(
@@ -1309,6 +1327,7 @@ pub(crate) fn evidence_valid_tx(conn: &Connection, id: &str) -> Result<bool, App
        JOIN market_wallet_holds h ON h.id=o.hold_id AND h.user_id=o.seller_id
         AND h.source_kind='c2c_order' AND h.source_id=o.id AND h.purpose='c2c' AND h.amount_units=o.amount_units
        WHERE o.id=?1 AND o.amount_units=q.credit_minor*86400 AND o.terms_version=q.flow_version
+        AND (o.terms_version!=3 OR julianday(q.auto_accept_authorized_at) IS NOT NULL)
         AND (o.status NOT IN ('paid','disputed','released') OR o.paid_at IS NOT NULL)
         AND (o.status NOT IN ('awaiting_seller','awaiting_payment') OR o.paid_at IS NULL)
         AND EXISTS(SELECT 1 FROM market_verified_c2c_reservation_evidence r WHERE r.id=o.id) AND (
