@@ -659,9 +659,7 @@ pub fn router(state: ServerState) -> Router {
         .with_state(state)
 }
 
-/// Legacy financial obligations remain writable during disabled/shadow
-/// cleanup. Once the platform wallet is enabled, every old paid write is a
-/// deliberate 410 rather than a fallback to Provider-specific money.
+/// Official top-up mode never reopens retired Provider-specific money writes.
 fn is_retired_legacy_finance_write(method: &Method, path: &str) -> bool {
     !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
         && (path.starts_with("/v1/market-billing/")
@@ -673,43 +671,22 @@ fn is_retired_legacy_finance_write(method: &Method, path: &str) -> bool {
 }
 
 async fn retired_legacy_finance_write_middleware(
-    State(state): State<ServerState>,
+    State(_state): State<ServerState>,
     req: Request,
     next: Next,
 ) -> Response {
     let path = req.uri().path();
     let old_finance_write = is_retired_legacy_finance_write(req.method(), path);
     if old_finance_write {
-        let mode = {
-            let conn = state.store.conn.lock().await;
-            conn.query_row(
-                "SELECT mode = 'enabled' OR cutover_approved_at IS NOT NULL
-                 FROM market_finance_control WHERE id = 1",
-                [],
-                |row| row.get::<_, bool>(0),
-            )
-        };
-        match mode {
-            Ok(true) => {
-                let mut response = AppError::Gone(
-                    "legacy Provider-funded payment writes are retired; use the platform wallet"
-                        .into(),
-                )
-                .into_response();
-                response.headers_mut().insert(
-                    header::CACHE_CONTROL,
-                    HeaderValue::from_static("private, no-store"),
-                );
-                return response;
-            }
-            Err(error) => {
-                return AppError::Internal(format!(
-                    "read market finance cutover mode failed: {error}"
-                ))
-                .into_response();
-            }
-            _ => {}
-        }
+        let mut response = AppError::Gone(
+            "legacy Provider-funded payment writes are retired; use the platform wallet".into(),
+        )
+        .into_response();
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-store"),
+        );
+        return response;
     }
     next.run(req).await
 }

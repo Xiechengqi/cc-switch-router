@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration as StdDuration;
@@ -616,8 +615,10 @@ async fn require_session(
         .ok_or_else(|| AppError::Unauthorized("authenticated owner session required".into()))
 }
 
+#[cfg(test)]
 pub(crate) const PAYMENT_PROFILE_REQUIRED_FOR_OFFER: &str =
     "configure payment details on the Account page before setting a Host offer";
+#[cfg(test)]
 pub(crate) const ERROR_MARKET_PAYMENT_PROFILE_REQUIRED: &str = "MARKET_PAYMENT_PROFILE_REQUIRED";
 
 pub(crate) fn validate_offer(daily_rate_minor: Option<i64>) -> Result<Option<i64>, AppError> {
@@ -685,6 +686,7 @@ pub(crate) fn normalize_offer_currency(
     }
 }
 
+#[cfg(test)]
 fn payment_profile_has_methods(conn: &Connection, provider_id: &str) -> Result<bool, AppError> {
     let methods_json: Option<String> = conn
         .query_row(
@@ -703,6 +705,7 @@ fn payment_profile_has_methods(conn: &Connection, provider_id: &str) -> Result<b
     Ok(!methods.is_empty())
 }
 
+#[cfg(test)]
 pub(crate) fn require_payment_profile_for_offer(
     conn: &Connection,
     provider_id: &str,
@@ -722,19 +725,15 @@ pub(crate) fn require_paid_offer_setup(
     provider_id: &str,
     currency: &str,
 ) -> Result<(), AppError> {
-    if crate::market_payments::wallet_purchase_mode_tx(conn)? {
-        if currency != "USD" {
-            return Err(AppError::Conflict(
-                "wallet-funded Hosts must be priced in USD".into(),
-            ));
-        }
-        return crate::market_provider_finance::require_paid_offer_setup_tx(conn, provider_id);
+    if currency != "USD" {
+        return Err(AppError::Conflict(
+            "wallet-funded Hosts must be priced in USD".into(),
+        ));
     }
-    require_payment_profile_for_offer(conn, provider_id)?;
-    crate::market_billing::require_supplier_profile_tx(conn, provider_id, currency)?;
-    Ok(())
+    crate::market_provider_finance::require_paid_offer_setup_tx(conn, provider_id)
 }
 
+#[cfg(test)]
 fn ensure_payment_profile_can_be_cleared(
     conn: &Connection,
     supplier_user_id: &str,
@@ -2323,6 +2322,19 @@ impl AppStore {
 
     pub async fn client_market_update_payment_profile(
         &self,
+        _session: &AuthSession,
+        _methods: &[PaymentMethod],
+        _contacts: Option<&[PaymentContact]>,
+    ) -> Result<PaymentProfileView, AppError> {
+        Err(AppError::Gone(
+            "direct Provider payment methods are retired; use the platform wallet".into(),
+        ))
+    }
+
+    // Historical invoice fixtures only. No production route may create Provider payment methods.
+    #[cfg(test)]
+    pub(crate) async fn seed_legacy_payment_profile(
+        &self,
         session: &AuthSession,
         methods: &[PaymentMethod],
         contacts: Option<&[PaymentContact]>,
@@ -2333,11 +2345,6 @@ impl AppStore {
         let tx = conn.transaction().map_err(|error| {
             AppError::Internal(format!("begin payment profile update failed: {error}"))
         })?;
-        if crate::market_payments::wallet_purchase_mode_tx(&tx)? {
-            return Err(AppError::Gone(
-                "direct Provider payment methods are retired; use the platform wallet".into(),
-            ));
-        }
         let canonical_binance_uid = tx
             .query_row(
                 "SELECT binance_uid FROM binance_payment_accounts
@@ -3454,17 +3461,8 @@ impl AppStore {
                 "not enough idle free Hosts match the selected Providers and regions".into(),
             ));
         }
-        let wallet_mode = crate::market_payments::wallet_purchase_mode_tx(&tx)?;
+        // Official recharge mode never changes the rail of a new market quote.
         for candidate in &mut candidates {
-            let price_minor = candidate.cycle_price_minor.or(candidate.daily_rate_minor);
-            let pricing_kind = crate::market_access::pricing_kind_for_rate(price_minor);
-            if price_minor.is_some() && candidate.provider_id != session.user_id {
-                crate::market_payments::require_current_offer_rail(
-                    &candidate.funding_rail,
-                    wallet_mode,
-                    "Client Host",
-                )?;
-            }
             if candidate.provider_id == session.user_id {
                 candidate.daily_rate_minor = None;
                 candidate.pricing_model = crate::market_recurring::PRICING_FREE.into();
@@ -3472,15 +3470,17 @@ impl AppStore {
                 candidate.billing_interval = None;
                 candidate.currency = None;
             }
-            crate::market_access::ensure_product_access_tx(
-                &tx,
-                &candidate.provider_id,
-                &session.user_id,
-                &session.email,
-                crate::market_access::PRODUCT_CLIENT_HOST,
-                pricing_kind,
-            )?;
-            if wallet_mode && price_minor.is_some() && candidate.provider_id != session.user_id {
+            let price_minor = candidate.cycle_price_minor.or(candidate.daily_rate_minor);
+            if price_minor.is_some() {
+                crate::market_payments::require_current_offer_rail(
+                    &candidate.funding_rail,
+                    "Client Host",
+                )?;
+                if candidate.currency.as_deref() != Some("USD") {
+                    return Err(AppError::Conflict(
+                        "wallet-funded Hosts must be priced in USD".into(),
+                    ));
+                }
                 candidate.wallet_trial_seconds =
                     crate::market_platform_contracts::trial_seconds_remaining_tx(
                         &tx,
@@ -3490,18 +3490,6 @@ impl AppStore {
                         &candidate.host_id,
                         crate::market_billing::TRIAL_SECONDS,
                     )?;
-            }
-            if candidate.daily_rate_minor.is_some() && !wallet_mode {
-                crate::market_billing::ensure_credit_allowed_tx(
-                    &tx,
-                    &session.user_id,
-                    &session.email,
-                    &candidate.provider_id,
-                    crate::market_access::PRODUCT_CLIENT_HOST,
-                    candidate.currency.as_deref().ok_or_else(|| {
-                        AppError::Internal("paid quoted Host currency is missing".into())
-                    })?,
-                )?;
             } else if candidate.provider_id != session.user_id
                 && let Some(days) = candidate.free_duration_days
                 && !crate::market_billing::free_usage_available_tx(
@@ -3518,89 +3506,31 @@ impl AppStore {
                     "the free experience for this Provider has already been used".into(),
                 ));
             }
+            crate::market_access::ensure_product_access_tx(
+                &tx,
+                &candidate.provider_id,
+                &session.user_id,
+                &session.email,
+                crate::market_access::PRODUCT_CLIENT_HOST,
+                crate::market_access::pricing_kind_for_rate(price_minor),
+            )?;
         }
         let mut wallet_price_minor = 0_i64;
         let mut wallet_paid_items = false;
-        let mut funding_rates = BTreeMap::<(String, String), (String, i64)>::new();
-        let mut recurring_prices = BTreeMap::<(String, String), (String, i64)>::new();
         for candidate in &candidates {
-            if wallet_mode {
-                if let Some(price) = candidate.cycle_price_minor.or(candidate.daily_rate_minor) {
-                    wallet_paid_items = true;
-                    if candidate.currency.as_deref() != Some("USD") {
-                        return Err(AppError::Conflict(
-                            "wallet-funded Hosts must be priced in USD".into(),
-                        ));
-                    }
-                    if candidate.wallet_trial_seconds == 0 {
-                        wallet_price_minor =
-                            wallet_price_minor.checked_add(price).ok_or_else(|| {
-                                AppError::BadRequest("quoted wallet price is too large".into())
-                            })?;
-                    }
+            if let Some(price) = candidate.cycle_price_minor.or(candidate.daily_rate_minor) {
+                wallet_paid_items = true;
+                if candidate.wallet_trial_seconds == 0 {
+                    wallet_price_minor =
+                        wallet_price_minor.checked_add(price).ok_or_else(|| {
+                            AppError::BadRequest("quoted wallet price is too large".into())
+                        })?;
                 }
-                continue;
-            }
-            if let Some(daily_rate_minor) = candidate.daily_rate_minor {
-                let currency = candidate.currency.as_deref().ok_or_else(|| {
-                    AppError::Internal("paid quoted Host currency is missing".into())
-                })?;
-                let key = (candidate.provider_id.clone(), currency.to_string());
-                let (_, rate) = funding_rates
-                    .entry(key)
-                    .or_insert_with(|| (candidate.host_owner_email.clone(), 0));
-                *rate = rate.checked_add(daily_rate_minor).ok_or_else(|| {
-                    AppError::Internal("quoted Host funding rate overflowed".into())
-                })?;
-            }
-            if let Some(cycle_price_minor) = candidate.cycle_price_minor {
-                let currency = candidate.currency.as_deref().ok_or_else(|| {
-                    AppError::Internal("monthly quoted Host currency is missing".into())
-                })?;
-                let key = (candidate.provider_id.clone(), currency.to_string());
-                let (_, price) = recurring_prices
-                    .entry(key)
-                    .or_insert_with(|| (candidate.host_owner_email.clone(), 0));
-                *price = price.checked_add(cycle_price_minor).ok_or_else(|| {
-                    AppError::Internal("quoted Host monthly price overflowed".into())
-                })?;
             }
         }
-        let funding = funding_rates
-            .into_iter()
-            .map(
-                |((provider_id, currency), (provider_email, daily_rate_minor))| {
-                    crate::market_billing::market_funding_summary_tx(
-                        &tx,
-                        &session.user_id,
-                        &session.email,
-                        &provider_id,
-                        &provider_email,
-                        crate::market_access::PRODUCT_CLIENT_HOST,
-                        &currency,
-                        daily_rate_minor,
-                        &now_rfc,
-                    )
-                },
-            )
-            .collect::<Result<Vec<_>, AppError>>()?;
-        let recurring_funding = recurring_prices
-            .into_iter()
-            .map(
-                |((provider_id, currency), (provider_email, cycle_price_minor))| {
-                    crate::market_recurring::recurring_funding_summary_tx(
-                        &tx,
-                        &session.user_id,
-                        &provider_id,
-                        &provider_email,
-                        &currency,
-                        cycle_price_minor,
-                        crate::market_recurring::RENEWAL_MANUAL,
-                    )
-                },
-            )
-            .collect::<Result<Vec<_>, AppError>>()?;
-        let wallet_funding = if wallet_mode && wallet_paid_items {
+        let funding = Vec::new();
+        let recurring_funding = Vec::new();
+        let wallet_funding = if wallet_paid_items {
             Some(crate::market_wallet::wallet_quote_funding_tx(
                 &tx,
                 &session.user_id,
@@ -3611,11 +3541,7 @@ impl AppStore {
         } else {
             None
         };
-        let funding_rail = if wallet_funding.is_some() {
-            "platform_wallet"
-        } else {
-            "legacy_provider"
-        };
+        let funding_rail = "platform_wallet";
         let quote_id = Uuid::new_v4().to_string();
         let expires_at = now + Duration::seconds(QUOTE_TTL_SECS);
         let client_owner_email = normalize_email(&session.email)?;
@@ -3862,7 +3788,6 @@ impl AppStore {
                 "allocation quote expired; request a new quote".into(),
             ));
         }
-        let wallet_mode = crate::market_payments::wallet_purchase_mode_tx(&tx)?;
         if !matches!(funding_rail.as_str(), "legacy_provider" | "platform_wallet") {
             return Err(AppError::Internal(
                 "stored Client funding rail is invalid".into(),
@@ -3874,10 +3799,8 @@ impl AppStore {
             params![quote_id],
             |row| row.get(0),
         ).map_err(|error| AppError::Internal(format!("check Client quote funding rail failed: {error}")))?;
-        if paid_count > 0 && (funding_rail == "platform_wallet") != wallet_mode {
-            return Err(AppError::Gone(
-                "Client payment mode changed; request a new quote".into(),
-            ));
+        if paid_count > 0 {
+            crate::market_payments::require_current_offer_rail(&funding_rail, "Client quote")?;
         }
         ensure_creation_allowed_tx(&tx, &session.user_id, &session.email)?;
         let item_count: i64 = tx
@@ -4023,11 +3946,7 @@ impl AppStore {
                     .map_err(|error| {
                         AppError::Internal(format!("read quoted Host funding rail failed: {error}"))
                     })?;
-                crate::market_payments::require_current_offer_rail(
-                    &current_rail,
-                    wallet_mode,
-                    "Client Host",
-                )?;
+                crate::market_payments::require_current_offer_rail(&current_rail, "Client Host")?;
             }
             crate::market_access::ensure_product_access_tx(
                 &tx,
@@ -6622,7 +6541,7 @@ mod tests {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
         let supplier = session("contact-provider", "contact@example.com");
         store
-            .client_market_update_payment_profile(&supplier, &[custom_payment_method()], None)
+            .seed_legacy_payment_profile(&supplier, &[custom_payment_method()], None)
             .await
             .expect("save legacy method before cutover");
         store.conn.lock().await.execute(
@@ -6650,20 +6569,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn paid_host_requires_supplier_terms_with_stable_error_code() {
+    async fn paid_host_requires_verified_claimed_provider_not_legacy_supplier_terms() {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
         let supplier = session("supplier-with-payment", "supplier@example.com");
         store
-            .client_market_update_payment_profile(&supplier, &[custom_payment_method()], None)
+            .seed_legacy_payment_profile(&supplier, &[custom_payment_method()], None)
             .await
             .expect("configure payment profile");
         let conn = store.conn.lock().await;
-        let error = require_paid_offer_setup(&conn, &supplier.user_id, "USD")
-            .expect_err("missing supplier terms must block a paid Host offer");
-        assert_eq!(
-            error.code(),
-            Some(crate::market_billing::ERROR_MARKET_SUPPLIER_SETTLEMENT_PROFILE_REQUIRED)
+        assert!(matches!(
+            require_paid_offer_setup(&conn, &supplier.user_id, "USD"),
+            Err(AppError::Forbidden(_))
+        ));
+        crate::market_access::configure_open_test_policy(
+            &conn,
+            &supplier,
+            "USD",
+            50_000,
+            &Utc::now().to_rfc3339(),
         );
+        require_paid_offer_setup(&conn, &supplier.user_id, "USD").unwrap();
     }
 
     #[tokio::test]
@@ -6682,7 +6607,7 @@ mod tests {
             .expect("insert payment Provider user");
 
         store
-            .client_market_update_payment_profile(&supplier, &[custom_payment_method()], None)
+            .seed_legacy_payment_profile(&supplier, &[custom_payment_method()], None)
             .await
             .expect("configure payment Provider profile");
 
@@ -6735,7 +6660,7 @@ mod tests {
 
         assert!(matches!(
             store
-                .client_market_update_payment_profile(&supplier, &[custom_payment_method()], None)
+                .seed_legacy_payment_profile(&supplier, &[custom_payment_method()], None)
                 .await,
             Err(AppError::Conflict(_))
         ));
@@ -6779,7 +6704,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mixed_quote_reserves_monthly_prepaid_before_legacy_credit() {
+    async fn legacy_mixed_quote_never_creates_jobs_or_spends_prepaid_in_any_topup_mode() {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
         let supplier = session("mixed-supplier", "mixed-supplier@example.com");
         let buyer = session("mixed-buyer", "mixed-buyer@example.com");
@@ -6917,8 +6842,6 @@ mod tests {
             }
         }
 
-        // Deliberately submit the legacy item first. Monthly must still reserve
-        // the prepaid balance, leaving the flexible legacy item to use credit.
         let prepared = vec![
             (
                 "mixed-daily-item".into(),
@@ -6935,65 +6858,52 @@ mod tests {
                 false,
             ),
         ];
-        let fingerprint =
-            commit_request_fingerprint_with_renewal(&prepared).expect("fingerprint mixed quote");
-        let response = store
-            .client_market_commit_quote_with_renewal_idempotent(
-                "mixed-quote",
-                &buyer,
-                "mixed-quote-key",
-                &fingerprint,
-                &prepared,
-            )
-            .await
-            .expect("commit fundable mixed quote");
-        assert!(!response.replayed);
-
+        let fingerprint = commit_request_fingerprint_with_renewal(&prepared).unwrap();
+        for mode in ["disabled", "shadow", "enabled"] {
+            store
+                .conn
+                .lock()
+                .await
+                .execute(
+                    "UPDATE market_finance_control SET mode=?1,cutover_approved_at=NULL WHERE id=1",
+                    params![mode],
+                )
+                .unwrap();
+            assert!(matches!(
+                store
+                    .client_market_commit_quote_with_renewal_idempotent(
+                        "mixed-quote",
+                        &buyer,
+                        "mixed-quote-key",
+                        &fingerprint,
+                        &prepared
+                    )
+                    .await,
+                Err(AppError::Gone(_))
+            ));
+        }
         let conn = store.conn.lock().await;
-        let daily_job_id: String = conn
-            .query_row(
-                "SELECT id FROM provisioning_jobs WHERE subdomain = 'mixed-daily'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("read daily mixed job");
-        let monthly_job_id: String = conn
-            .query_row(
-                "SELECT id FROM provisioning_jobs WHERE subdomain = 'mixed-monthly'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("read monthly mixed job");
+        for table in [
+            "provisioning_jobs",
+            "market_funding_reservations",
+            "market_recurring_holds",
+            "market_platform_contracts",
+        ] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
         assert_eq!(
-            response.job_ids,
-            vec![daily_job_id.clone(), monthly_job_id.clone()]
-        );
-        let legacy_reservation: (i64, i64) = conn
-            .query_row(
-                "SELECT prepaid_units, credit_units FROM market_funding_reservations
-                 WHERE product_kind = 'client_host' AND product_ref = ?1",
-                params![daily_job_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+            conn.query_row(
+                "SELECT posted_balance_units FROM market_prepaid_accounts WHERE buyer_user_id=?1",
+                params![buyer.user_id],
+                |r| r.get::<_, i64>(0)
             )
-            .expect("read legacy mixed funding reservation");
-        assert_eq!(legacy_reservation.0, 0);
-        assert_eq!(
-            legacy_reservation.1,
-            1_000 * crate::market_billing::MONEY_UNITS_PER_MINOR
-        );
-        let monthly_hold: i64 = conn
-            .query_row(
-                "SELECT COALESCE(SUM(hold.amount_units), 0)
-                 FROM market_recurring_holds hold
-                 JOIN market_recurring_contracts contract ON contract.id = hold.contract_id
-                 WHERE contract.product_ref = ?1 AND hold.status = 'active'",
-                params![monthly_job_id],
-                |row| row.get(0),
-            )
-            .expect("read monthly mixed hold");
-        assert_eq!(
-            monthly_hold,
-            1_000 * crate::market_billing::MONEY_UNITS_PER_MINOR
+            .unwrap(),
+            1000 * crate::market_billing::MONEY_UNITS_PER_MINOR
         );
     }
 
@@ -7037,11 +6947,7 @@ mod tests {
             handle: "@public-provider".into(),
         }];
         store
-            .client_market_update_payment_profile(
-                &provider,
-                &[custom_payment_method()],
-                Some(&contacts),
-            )
+            .seed_legacy_payment_profile(&provider, &[custom_payment_method()], Some(&contacts))
             .await
             .expect("configure projected Provider payment profile");
 
@@ -7485,7 +7391,7 @@ mod tests {
         );
         let buyer = session("buyer-profile-guard", "buyer-profile-guard@example.com");
         store
-            .client_market_update_payment_profile(&supplier, &[custom_payment_method()], None)
+            .seed_legacy_payment_profile(&supplier, &[custom_payment_method()], None)
             .await
             .expect("configure guarded payment profile");
         let now = Utc::now();
@@ -7507,10 +7413,11 @@ mod tests {
                 params![supplier.email, now.to_rfc3339(), supplier.user_id],
             )
             .expect("insert paid Host offer");
+            conn.execute("UPDATE router_ssh_hosts SET funding_rail='legacy_provider' WHERE id='guarded-host'", []).unwrap();
         }
         assert!(matches!(
             store
-                .client_market_update_payment_profile(&supplier, &[], None)
+                .seed_legacy_payment_profile(&supplier, &[], None)
                 .await,
             Err(AppError::Conflict(_))
         ));
@@ -7551,7 +7458,7 @@ mod tests {
             .expect("activate guarded contract");
         assert!(matches!(
             store
-                .client_market_update_payment_profile(&supplier, &[], None)
+                .seed_legacy_payment_profile(&supplier, &[], None)
                 .await,
             Err(AppError::Conflict(_))
         ));
@@ -7586,7 +7493,7 @@ mod tests {
             .expect("seed guarded accrued balance");
         assert!(matches!(
             store
-                .client_market_update_payment_profile(&supplier, &[], None)
+                .seed_legacy_payment_profile(&supplier, &[], None)
                 .await,
             Err(AppError::Conflict(_))
         ));
@@ -7607,7 +7514,7 @@ mod tests {
         }
         assert!(matches!(
             store
-                .client_market_update_payment_profile(&supplier, &[], None)
+                .seed_legacy_payment_profile(&supplier, &[], None)
                 .await,
             Err(AppError::Conflict(_))
         ));
@@ -7636,11 +7543,7 @@ mod tests {
             settlement_asset: None,
         };
         store
-            .client_market_update_payment_profile(
-                &supplier,
-                std::slice::from_ref(&snapshot_method),
-                None,
-            )
+            .seed_legacy_payment_profile(&supplier, std::slice::from_ref(&snapshot_method), None)
             .await
             .expect("configure snapshotted payment asset");
         store
@@ -7706,7 +7609,7 @@ mod tests {
         replacement_method.asset_url =
             Some(format!("/v1/account/payment-assets/{replacement_asset_id}"));
         store
-            .client_market_update_payment_profile(&supplier, &[replacement_method], None)
+            .seed_legacy_payment_profile(&supplier, &[replacement_method], None)
             .await
             .expect("replace live payment profile");
         assert_eq!(

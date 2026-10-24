@@ -9,7 +9,7 @@ import { C2CAction, C2CCheck, C2CDialog, C2CError, C2C_INPUT } from "@/component
 import { C2CDescription } from "@/components/market/c2c-description";
 import { formatMinorUsd } from "@/lib/market-wallet-money";
 import { notifyMarketBalanceChanged } from "@/lib/market-balance-events";
-import { C2C_PENDING_PREFIX, c2cDefinitelyRejected, c2cErrorKey, c2cNow, c2cPayLabel, createC2C, getC2COffers, getC2COrders, getC2CPolicy, matchC2CPendingOrder, parseC2CMinor, quoteC2C, readC2CPending, writeC2CPending, type C2COffer, type C2COrder, type C2CPending, type C2CPolicyView, type C2CQuote } from "@/lib/market-c2c";
+import { C2C_PENDING_PREFIX, c2cDefinitelyRejected, c2cErrorKey, c2cBlockerKey, c2cNow, c2cPayLabel, createC2C, getC2COffers, getC2COrders, getC2CPolicy, matchC2CPendingOrder, parseC2CMinor, quoteC2C, readC2CPending, writeC2CPending, type C2COffer, type C2COrder, type C2CPending, type C2CPolicyView, type C2CQuote } from "@/lib/market-c2c";
 
 export function C2CBuyPanel({ actor, onOrder }: { actor: string; onOrder: (order: C2COrder) => void }) {
   const { t, locale } = useLocaleText();
@@ -30,6 +30,11 @@ export function C2CBuyPanel({ actor, onOrder }: { actor: string; onOrder: (order
     void load().catch(cause => { if (mounted.current) setError(t(c2cErrorKey(cause))); });
     try { const p = readC2CPending(sessionStorage, actor); setPending(p); setRecoveryBlocked(false); if (p) setError(t("c2c.uncertain")); } catch { setRecoveryBlocked(true); setError(t("c2c.storage")); }
   }, [actor, load, t]);
+  React.useEffect(() => {
+    const refresh = () => { if (document.visibilityState === "visible" && !lock.current && !quote && !pending) void load().catch(cause => { if (mounted.current) setError(t(c2cErrorKey(cause))); }); };
+    const timer = setInterval(refresh, 30_000); document.addEventListener("visibilitychange", refresh);
+    return () => { clearInterval(timer); document.removeEventListener("visibilitychange", refresh); };
+  }, [load, pending, quote, t]);
   React.useEffect(() => { if (!quote) return; const timer = setInterval(() => setNow(c2cNow()), 1000); return () => clearInterval(timer); }, [quote]);
   const run = async (fn: () => Promise<void>) => {
     if (lock.current) return; lock.current = true; setBusy(true); setError("");
@@ -58,7 +63,10 @@ export function C2CBuyPanel({ actor, onOrder }: { actor: string; onOrder: (order
       if (page.items[0]) { onOrder(page.items[0]); return; }
       sessionStorage.removeItem(C2C_PENDING_PREFIX + actor); setRecoveryBlocked(false); await load();
     })}>{t("c2c.checkExisting")}</C2CAction> : pending ? <div className="grid justify-items-start gap-2"><p className="text-sm">{t("c2c.uncertain")}</p><C2CAction type="button" phase={busy ? "loading" : "default"} onClick={() => void run(async () => { const page = await getC2COrders({ quoteId: pending.quote.id }); if (page.items[0]) done(pending, page.items[0]); else await submit(pending); })}>{t("c2c.recover")}</C2CAction></div> : <>
-      {!loaded ? error ? <C2CAction type="button" secondary disabled={busy} onClick={() => void run(() => load())}>{t("common.reload")}</C2CAction> : <p role="status" className="text-sm text-muted-foreground">{t("common.loading")}</p> : !policy?.available ? <p className="text-sm text-muted-foreground">{t("c2c.error.paused")}</p> : !policy.verified ? <p className="text-sm text-muted-foreground">{t("c2c.error.identity")}</p> : <>
+      {!loaded ? error ? <C2CAction type="button" secondary disabled={busy} onClick={() => void run(() => load())}>{t("common.reload")}</C2CAction> : <p role="status" className="text-sm text-muted-foreground">{t("common.loading")}</p> : !policy?.available ? <div className="grid justify-items-start gap-2">
+        <p role="status" className="text-sm text-muted-foreground">{t(policy?.blockers[0] ? c2cBlockerKey(policy.blockers[0]) : "c2c.error.paused")}</p>
+        <C2CAction type="button" secondary disabled={busy} onClick={() => void run(() => load())}>{t("common.reload")}</C2CAction>
+      </div> : <>
         <div className="flex flex-wrap items-center justify-between gap-2"><span className="text-sm font-semibold">{t("c2c.buy")}</span><C2CAction type="button" secondary disabled={busy} onClick={() => void run(() => load())}>{t("common.reload")}</C2CAction></div>
         {offers.length ? <div role="group" aria-label={t("c2c.buy")} className="grid max-h-64 min-w-0 gap-2 overflow-y-auto overscroll-contain p-1">
           {offers.map(s => <button key={s.sellerId} type="button" aria-pressed={sellerId === s.sellerId} disabled={busy} onClick={() => { setSellerId(s.sellerId); setAmount(""); setQuote(null); setAck(false); }}

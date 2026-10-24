@@ -8,7 +8,7 @@ import { SegmentedControl } from "@/components/common/segmented-control";
 import { usePaidOfferReadiness } from "@/components/dashboard/share-market/paid-offer-readiness";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { updateClientMarketHostOffer } from "@/lib/api";
-import { PROVIDER_INCOME_HREF, DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH } from "@/lib/dashboard-nav";
+import { DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH } from "@/lib/dashboard-nav";
 import { MARKET_CURRENCY } from "@/lib/market-money";
 import type { ClientMarketHost } from "@/lib/types";
 import {
@@ -49,8 +49,7 @@ export function HostOfferDialog({
   const paidOfferLoading = paidReadiness.status === "idle" ||
     paidReadiness.status === "loading";
   const paidOfferReady = paidReadiness.status === "loaded" &&
-    paidReadiness.paymentReady &&
-    paidReadiness.settlementReady;
+    paidReadiness.providerReady;
 
   React.useEffect(() => {
     if (!open) return;
@@ -93,7 +92,7 @@ export function HostOfferDialog({
         ? "clientMarket.offerSetupFailed"
         : paidOfferLoading
           ? "clientMarket.offerSetupChecking"
-          : "clientMarket.offerRequiresBilling"));
+          : "shareMarket.paidReadiness.wallet.provider"));
       return;
     }
     setBusy(true);
@@ -137,16 +136,8 @@ export function HostOfferDialog({
             ) : null}
             {pricing === "paid" && paidReadiness.status === "loaded" && !paidOfferReady ? (
               <div role="alert" className="grid gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-3 text-sm text-amber-950">
-                {paidReadiness.rail === "wallet" ? <>
-                  <p>{t(`shareMarket.paidReadiness.wallet.${paidReadiness.walletSetup || "provider"}`)}</p>
-                  <a href={DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH} className="whitespace-nowrap font-medium text-foreground underline underline-offset-2">{t("shareMarket.paidReadiness.goProvider")}</a>
-                </> : <>
-                  <p>{t("clientMarket.offerRequiresBilling")}</p>
-                  <div className="flex flex-wrap gap-3">
-                    {!paidReadiness.settlementReady ? <a href={PROVIDER_INCOME_HREF} className="whitespace-nowrap font-medium text-foreground underline underline-offset-2">{t("clientMarket.goToBilling")}</a> : null}
-                    {!paidReadiness.paymentReady ? <a href={DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH} className="whitespace-nowrap font-medium text-foreground underline underline-offset-2">{t("clientMarket.goToAccountPayment")}</a> : null}
-                  </div>
-                </>}
+                <p>{t("shareMarket.paidReadiness.wallet.provider")}</p>
+                <a href={DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH} className="whitespace-nowrap font-medium text-foreground underline underline-offset-2">{t("shareMarket.paidReadiness.goProvider")}</a>
               </div>
             ) : null}
             <SegmentedControl

@@ -69,7 +69,7 @@ try {
     if (path === "/v1/market-billing/config") return json(route, { usdCnyRateMicros: 7_000_000, fxRateFresh: true });
     if (path === "/v1/market-wallet/c2c/policy") return json(route, { policy: { version: 1, enabled: false,
       admissionMinor: 10000, minMinor: 100, maxMinor: 500000, paymentMinutes: 30 }, available: false,
-      verified: true, termsVersion: 1, claimGraceSeconds: 120, firstPurchaseMaxMinor: 10000 });
+      blockers: ["C2C_DISABLED"], canManagePolicy: false, verified: true, termsVersion: 1, claimGraceSeconds: 120, firstPurchaseMaxMinor: 10000 });
     if (path === "/v1/market-wallet/c2c/orders") return json(route, { items: [], next: null });
     if (path === "/v1/announcement") return json(route, { enabled: false, revision: "1", contentEn: "", contentZhCn: "" });
     if (path.endsWith("inbox-summary")) return json(route, { pendingRequests: 0 });

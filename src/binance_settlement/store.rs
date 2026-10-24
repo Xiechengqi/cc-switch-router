@@ -8541,7 +8541,7 @@ mod tests {
         let qr_url = "https://example.com/binance-qr.png";
 
         let profile = store
-            .client_market_update_payment_profile(
+            .seed_legacy_payment_profile(
                 &fixture.supplier,
                 &[PaymentMethod {
                     kind: "binance".into(),

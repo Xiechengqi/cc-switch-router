@@ -199,6 +199,7 @@ export function WalletPolicySettings() {
               </label>
             ))}
           </div>
+          <p className="text-sm text-muted-foreground sm:col-span-2">{t("walletPolicy.transferScope")}</p>
           <Button
             type="submit"
             variant="primary"

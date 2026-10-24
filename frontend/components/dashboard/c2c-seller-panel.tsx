@@ -7,13 +7,14 @@
 import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { C2CAction, C2CCheck, C2CError, C2C_INPUT } from "@/components/market/c2c-primitives";
-import { C2C_DESCRIPTION_MAX, c2cErrorKey, parseC2CMinor, saveC2CSeller, validC2CDescription, type C2CPolicyView, type C2CSeller, type C2CSellerSnapshot } from "@/lib/market-c2c";
+import { C2C_DESCRIPTION_MAX, c2cErrorKey, c2cBlockerKey, parseC2CMinor, saveC2CSeller, validC2CDescription, type C2CPolicyView, type C2CSeller, type C2CSellerSnapshot } from "@/lib/market-c2c";
 import { formatMinorUsd, formatWalletUnits, parseNonNegativeUsdMinor } from "@/lib/market-wallet-money";
 
 // A mounted editor owns its draft. Workspace polling never replaces these
 // values or advances the version the user reviewed.
-export function C2CSellerPanel({ policy, snapshot, onSaved, onBusyChange, onReload }: {
+export function C2CSellerPanel({ policy, snapshot, availabilityError, onRefresh, onSaved, onBusyChange, onReload }: {
   policy: C2CPolicyView; snapshot: C2CSellerSnapshot;
+  availabilityError: boolean; onRefresh: () => Promise<void>;
   onSaved: (seller: C2CSeller) => void; onBusyChange: (busy: boolean) => void; onReload: () => Promise<void>;
 }) {
   const { t } = useLocaleText();
@@ -36,11 +37,10 @@ export function C2CSellerPanel({ policy, snapshot, onSaved, onBusyChange, onRelo
   const low = parseC2CMinor(min); const high = parseC2CMinor(max); const bps = parseNonNegativeUsdMinor(price);
   const descriptionValid = validC2CDescription(description.trim());
   const termsValid = low != null && high != null && high >= low && bps != null && bps >= 5000 && bps <= 20000;
-  const blocked = snapshot.seller?.suspended ? "c2c.error.suspended" : !policy.verified ? "c2c.error.identity"
-    : !policy.available ? "c2c.error.paused"
-    : !original?.enabled && BigInt(snapshot.admissionBalanceUnits) < BigInt(policy.policy.admissionMinor) * 86400n ? "c2c.error.admission" : null;
+  const versionChanged = (snapshot.seller?.version ?? 0) !== (original?.version ?? 0);
+  const blocked = availabilityError ? "c2c.eligibilityFailed" : snapshot.blockers[0] ? c2cBlockerKey(snapshot.blockers[0]) : null;
   const save = async () => {
-    if (lock.current || !descriptionValid || !termsValid || !ack || blocked || low == null || high == null || bps == null) return;
+    if (lock.current || versionChanged || !descriptionValid || !termsValid || !ack || blocked || low == null || high == null || bps == null) return;
     lock.current = true; setBusy(true); onBusyChange(true); setError(""); setStale(false);
     try {
       const seller = await saveC2CSeller({
@@ -63,8 +63,16 @@ export function C2CSellerPanel({ policy, snapshot, onSaved, onBusyChange, onRelo
     catch (cause) { if (alive.current) setError(t(c2cErrorKey(cause))); }
     finally { lock.current = false; if (alive.current) { setBusy(false); onBusyChange(false); } }
   };
+  const refreshEligibility = async () => {
+    if (lock.current) return;
+    lock.current = true; setBusy(true); onBusyChange(true); setError("");
+    try { await onRefresh(); }
+    catch { if (alive.current) setError(t("c2c.eligibilityFailed")); }
+    finally { lock.current = false; if (alive.current) { setBusy(false); onBusyChange(false); } }
+  };
   return <form className="grid min-w-0 gap-4" onSubmit={event => { event.preventDefault(); setTouched(true); void save(); }} data-c2c-seller-editor>
     <p className="text-sm tabular-nums text-muted-foreground">{t("c2c.available", { amount: formatWalletUnits(snapshot.availableUnits) })}</p>
+    <p className="text-sm tabular-nums text-muted-foreground">{t("c2c.qualification", { balance: formatWalletUnits(snapshot.admissionBalanceUnits), threshold: formatMinorUsd(policy.policy.admissionMinor) })}</p>
     <div className="grid min-w-0 gap-1">
       <label htmlFor={fieldId} className="text-sm font-medium">{t("c2c.description")}</label>
       <input id={fieldId} autoFocus className={C2C_INPUT} value={description} maxLength={C2C_DESCRIPTION_MAX}
@@ -89,12 +97,17 @@ export function C2CSellerPanel({ policy, snapshot, onSaved, onBusyChange, onRelo
     </details>
     {!termsValid ? <p role="alert" className="text-sm text-destructive">{t("c2c.termsError")}</p> : null}
     <C2CCheck checked={ack} disabled={busy} onChange={event => setAck(event.target.checked)}>{t("c2c.sellerAck")}</C2CCheck>
-    {blocked ? <p role="status" className="text-sm text-muted-foreground">{t(blocked)}</p> : null}
-    {!original?.enabled ? <p className="text-xs text-muted-foreground">{t("c2c.sellerHelp", { amount: formatMinorUsd(policy.policy.admissionMinor) })}</p> : null}
+    <div id={fieldId + "-eligibility"} aria-live="polite" className="grid min-w-0 gap-2 text-sm text-muted-foreground">
+      {blocked ? <p>{t(blocked)}</p> : null}
+      {!availabilityError && snapshot.blockers.length > 1 ? <details><summary className="min-h-11 cursor-pointer rounded-md py-2 focus-visible:outline-2 focus-visible:outline-ring">{t("c2c.moreBlockers")}</summary><ul className="grid gap-2">{snapshot.blockers.slice(1).map(code => <li key={code}>{t(c2cBlockerKey(code))}</li>)}</ul></details> : null}
+      {policy.canManagePolicy && snapshot.blockers.some(code => ["C2C_DISABLED", "C2C_TRANSFERS_DISABLED", "C2C_TRANSFERS_PAUSED", "C2C_EMAIL_UNAVAILABLE"].includes(code)) ? <a href="/settings/?panel=market_finance" className="inline-flex min-h-11 items-center justify-self-start whitespace-nowrap font-medium text-primary underline underline-offset-2 focus-visible:outline-2 focus-visible:outline-ring">{t("c2c.managePolicy")}</a> : null}
+    </div>
+    {versionChanged ? <p role="status" className="text-sm text-muted-foreground">{t("c2c.error.stale")}</p> : null}
     <C2CError>{error}</C2CError>
     <div className="flex flex-wrap items-center justify-end gap-2">
-      {stale ? <C2CAction type="button" secondary disabled={busy} onClick={() => void reload()}>{t("c2c.reloadSettings")}</C2CAction> : null}
-      <C2CAction type="submit" phase={busy ? "loading" : "default"} disabled={!descriptionValid || !termsValid || !ack || !!blocked || busy || stale}>
+      {stale || versionChanged ? <C2CAction type="button" secondary disabled={busy} onClick={() => void reload()}>{t("c2c.reloadSettings")}</C2CAction>
+        : blocked ? <C2CAction type="button" secondary phase={busy ? "loading" : "default"} disabled={busy} onClick={() => void refreshEligibility()}>{t("c2c.refreshEligibility")}</C2CAction> : null}
+      <C2CAction type="submit" aria-describedby={blocked ? fieldId + "-eligibility" : undefined} phase={busy ? "loading" : "default"} disabled={!descriptionValid || !termsValid || !ack || !!blocked || busy || stale || versionChanged}>
         {t(original?.enabled ? "common.save" : "c2c.startSelling")}
       </C2CAction>
     </div>

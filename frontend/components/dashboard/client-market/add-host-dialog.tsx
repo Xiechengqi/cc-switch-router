@@ -14,7 +14,7 @@ import {
   lookupClientMarketHostIpInfo,
   testClientMarketHostSsh,
 } from "@/lib/api";
-import { PROVIDER_INCOME_HREF, DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH } from "@/lib/dashboard-nav";
+import { DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH } from "@/lib/dashboard-nav";
 import { MARKET_CURRENCY } from "@/lib/market-money";
 import type { HostIpIntel, ProvisionSshKey } from "@/lib/types";
 import { usePersistentState } from "@/lib/use-persistent-state";
@@ -66,8 +66,7 @@ export function AddHostDialog({
   const paidOfferLoading = paidReadiness.status === "idle" ||
     paidReadiness.status === "loading";
   const paidOfferReady = paidReadiness.status === "loaded" &&
-    paidReadiness.paymentReady &&
-    paidReadiness.settlementReady;
+    paidReadiness.providerReady;
 
   React.useEffect(() => {
     if (!open) return;
@@ -177,7 +176,7 @@ export function AddHostDialog({
         ? "clientMarket.offerSetupFailed"
         : paidOfferLoading
           ? "clientMarket.offerSetupChecking"
-          : "clientMarket.offerRequiresBilling"));
+          : "shareMarket.paidReadiness.wallet.provider"));
       return;
     }
     if (note.length > 500) {
@@ -502,16 +501,8 @@ export function AddHostDialog({
                 ) : null}
                 {pricing === "paid" && paidReadiness.status === "loaded" && !paidOfferReady ? (
                   <div role="alert" className="grid gap-1.5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-950">
-                    {paidReadiness.rail === "wallet" ? <>
-                      <span>{t(`shareMarket.paidReadiness.wallet.${paidReadiness.walletSetup || "provider"}`)}</span>
-                      <a href={DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH} className="whitespace-nowrap font-medium text-foreground underline underline-offset-2">{t("shareMarket.paidReadiness.goProvider")}</a>
-                    </> : <>
-                      <span>{t("clientMarket.offerRequiresBilling")}</span>
-                      <div className="flex flex-wrap gap-3">
-                        {!paidReadiness.settlementReady ? <a href={PROVIDER_INCOME_HREF} className="whitespace-nowrap font-medium text-foreground underline underline-offset-2">{t("clientMarket.goToBilling")}</a> : null}
-                        {!paidReadiness.paymentReady ? <a href={DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH} className="whitespace-nowrap font-medium text-foreground underline underline-offset-2">{t("clientMarket.goToAccountPayment")}</a> : null}
-                      </div>
-                    </>}
+                    <span>{t("shareMarket.paidReadiness.wallet.provider")}</span>
+                    <a href={DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH} className="whitespace-nowrap font-medium text-foreground underline underline-offset-2">{t("shareMarket.paidReadiness.goProvider")}</a>
                   </div>
                 ) : null}
                 <label className="grid gap-1 text-sm">

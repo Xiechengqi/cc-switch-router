@@ -1,4 +1,11 @@
 export const marketC2CMessagesEn = {
+  "c2c.error.disabled": "C2C is disabled by the Router owner. Existing orders can still be completed.",
+  "c2c.error.transfersDisabled": "Balance transfers are disabled, including C2C. Contact the administrator.",
+  "c2c.error.transfersPaused": "New balance transfers and C2C orders are paused. Existing orders remain available.",
+  "c2c.error.inactive": "This account is restricted. Contact the administrator.",
+  "c2c.qualification": "Qualifying balance {balance} · Opening threshold {threshold}",
+  "c2c.moreBlockers": "Other requirements", "c2c.managePolicy": "Open wallet settings",
+  "c2c.refreshEligibility": "Refresh eligibility", "c2c.eligibilityFailed": "Eligibility could not be refreshed. Retry before saving; your draft is kept.",
   "c2c.description": "C2C description", "c2c.descriptionExample": "Bank transfer · Telegram: @seller · https://example.com",
   "c2c.enabled": "Accept new orders",
   "c2c.descriptionHelp": "Visible to signed-in buyers. Include a contact or payment method.", "c2c.descriptionError": "Enter a single-line description of up to 300 characters.",
@@ -41,6 +48,13 @@ export const marketC2CMessagesEn = {
   "marketNotifications.kind.c2c_order_updated": "C2C order updated", "marketNotifications.kind.c2c_seller_changed": "C2C seller settings updated",
 } as const;
 export const marketC2CMessagesZh: Record<keyof typeof marketC2CMessagesEn, string> = {
+  "c2c.error.disabled": "Router 尚未开放 C2C，已有订单仍可处理。",
+  "c2c.error.transfersDisabled": "余额转移已关闭，包含 C2C。请联系管理员。",
+  "c2c.error.transfersPaused": "新的余额转移和 C2C 已暂停，已有订单仍可处理。",
+  "c2c.error.inactive": "账户受限，请联系管理员。",
+  "c2c.qualification": "可用余额 {balance} · 开启门槛 {threshold}",
+  "c2c.moreBlockers": "其他条件", "c2c.managePolicy": "前往钱包设置",
+  "c2c.refreshEligibility": "刷新资格", "c2c.eligibilityFailed": "暂时无法刷新出售资格，请重试。已填写内容会保留。",
   "c2c.description": "C2C 描述", "c2c.descriptionExample": "支持支付宝/微信，Telegram：@seller，说明：https://example.com",
   "c2c.enabled": "接受新订单",
   "c2c.descriptionHelp": "向登录买家展示，请写明联系或付款方式。", "c2c.descriptionError": "请填写不超过 300 字的单行描述。",

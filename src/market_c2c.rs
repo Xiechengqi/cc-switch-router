@@ -72,14 +72,67 @@ fn policy_tx(conn: &Connection) -> Result<Policy, AppError> {
     })).map_err(db_error("read C2C policy"))
 }
 fn open_tx(conn: &Connection) -> Result<Policy, AppError> {
-    let p = policy_tx(conn)?;
-    let mode:bool=conn.query_row("SELECT mode='enabled' AND cutover_approved_at IS NOT NULL AND new_orders_paused=0 FROM market_finance_control WHERE id=1",[],|r|r.get(0))
-        .map_err(db_error("read C2C finance mode"))?;
-    let w = crate::market_wallet_policy::policy_tx(conn)?;
-    if !p.enabled || !mode || !w.transfers_enabled || w.transfers_paused {
-        return Err(problem("C2C_PAUSED", "new C2C orders are not available"));
+    if let Some(code) = opening_blockers_tx(conn)?.first() {
+        return Err(problem(code, "new C2C orders are not available"));
     }
-    Ok(p)
+    policy_tx(conn)
+}
+/// C2C transfers existing credit: official top-ups and market purchase pauses
+/// cannot disable it. Ordinary transfers and C2C share the outflow switch.
+fn opening_blockers_tx(conn: &Connection) -> Result<Vec<&'static str>, AppError> {
+    let p = policy_tx(conn)?;
+    let w = crate::market_wallet_policy::policy_tx(conn)?;
+    let mut blockers = Vec::new();
+    if !p.enabled {
+        blockers.push("C2C_DISABLED");
+    }
+    if !w.transfers_enabled {
+        blockers.push("C2C_TRANSFERS_DISABLED");
+    }
+    if w.transfers_paused {
+        blockers.push("C2C_TRANSFERS_PAUSED");
+    }
+    Ok(blockers)
+}
+fn participation_blockers_tx(conn: &Connection, user: &str) -> Result<Vec<&'static str>, AppError> {
+    let mut blockers = opening_blockers_tx(conn)?;
+    let identity: Option<(bool, bool)> = conn
+        .query_row(
+            "SELECT status = 'active', email_verified_at IS NOT NULL FROM users WHERE id=?1",
+            params![user],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(db_error("read C2C account eligibility"))?;
+    match identity {
+        Some((false, _)) => blockers.push("C2C_ACCOUNT_INACTIVE"),
+        Some((true, false)) | None => blockers.push("C2C_IDENTITY"),
+        Some((true, true)) => {}
+    }
+    match safe_tx(conn, user, user) {
+        Ok(()) => {}
+        Err(e) if crate::market_reconcile::is_finance_hold(&e) => blockers.push("C2C_FINANCE_HOLD"),
+        Err(e) => return Err(e),
+    }
+    Ok(blockers)
+}
+fn seller_blockers_tx(
+    conn: &Connection,
+    user: &str,
+    time: &str,
+) -> Result<Vec<&'static str>, AppError> {
+    let mut blockers = participation_blockers_tx(conn, user)?;
+    let prior = seller_tx(conn, user)?;
+    if prior.as_ref().is_some_and(|s| s.suspended) {
+        blockers.push("C2C_SUSPENDED");
+    }
+    if prior.as_ref().is_none_or(|s| !s.enabled)
+        && admission_balance_tx(conn, user, time)?
+            < units_from_minor(policy_tx(conn)?.admission_minor)?
+    {
+        blockers.push("C2C_ADMISSION");
+    }
+    Ok(blockers)
 }
 fn save_policy_tx(
     conn: &Connection,
@@ -207,7 +260,9 @@ fn save_seller_tx(
     input: &SellerInput,
     time: &str,
 ) -> Result<Seller, AppError> {
-    verified_tx(conn, user)?;
+    if !input.enabled {
+        verified_tx(conn, user)?;
+    }
     let prior = seller_tx(conn, user)?;
     if prior.as_ref().map_or(0, |s| s.version) != input.expected_version {
         return Err(problem("C2C_STALE", "seller settings changed; reload"));
@@ -241,17 +296,10 @@ fn save_seller_tx(
         .map(|s| s.display_name.clone())
         .unwrap_or_else(|| format!("C2C-{}", &Uuid::new_v4().simple().to_string()[..12]));
     if input.enabled {
-        let p = open_tx(conn)?;
-        safe_tx(conn, user, user)?;
-        if prior.as_ref().is_some_and(|s| s.suspended) {
-            return Err(problem("C2C_SUSPENDED", "C2C selling is suspended"));
-        }
-        if prior.as_ref().is_none_or(|s| !s.enabled)
-            && admission_balance_tx(conn, user, time)? < units_from_minor(p.admission_minor)?
-        {
+        if let Some(code) = seller_blockers_tx(conn, user, time)?.first() {
             return Err(problem(
-                "C2C_ADMISSION",
-                "available transferable balance is below the seller admission minimum",
+                code,
+                "C2C seller eligibility requirements have not been met",
             ));
         }
     }
@@ -348,11 +396,8 @@ fn offers_tx(
     after: &str,
     time: &str,
 ) -> Result<(Vec<Offer>, Option<String>), AppError> {
-    if let Err(e) = open_tx(conn) {
-        if e.code() == Some("C2C_PAUSED") {
-            return Ok((vec![], None));
-        }
-        return Err(e);
+    if !opening_blockers_tx(conn)?.is_empty() {
+        return Ok((vec![], None));
     }
     let p = policy_tx(conn)?;
     let experienced:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM market_c2c_orders WHERE buyer_id=?1 AND status='released')",params![user],|r|r.get(0)).map_err(db_error("read C2C discovery purchase limit"))?;

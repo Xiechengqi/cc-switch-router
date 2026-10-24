@@ -3,6 +3,22 @@ import test from "node:test";
 import { ApiError } from "./api";
 import { C2C_PENDING_PREFIX, C2CClock, c2cDescriptionParts, validC2CDescription, c2cDefinitelyRejected, c2cPaymentWindow, c2cPayLabel, matchC2COrder, matchC2CPendingOrder, parseC2CMinor, readC2CPending, writeC2CPending, validC2CEvent, validC2COrder, validC2CPolicy, validC2CQuote, validC2CSeller, type C2CEvent, type C2COrder, type C2CPending, type C2CSeller } from "./market-c2c";
 import { marketC2CMessagesEn, marketC2CMessagesZh } from "./market-c2c-messages";
+import { C2C_BLOCKERS, c2cBlockerKey, validC2CCapability } from "./market-c2c";
+
+test("capabilities give distinct actionable blockers and never depend on official recharge mode", () => {
+  assert.doesNotThrow(() => validC2CCapability([], true));
+  for (const code of C2C_BLOCKERS) {
+    assert.doesNotThrow(() => validC2CCapability([code], false));
+    const key = c2cBlockerKey(code) as keyof typeof marketC2CMessagesEn;
+    assert.ok(marketC2CMessagesEn[key], code);
+    assert.ok(marketC2CMessagesZh[key], code);
+    assert.equal(c2cDefinitelyRejected(new ApiError(409, "blocked", code)), true);
+  }
+  assert.throws(() => validC2CCapability([], false));
+  assert.throws(() => validC2CCapability(["C2C_DISABLED"], true));
+  assert.throws(() => validC2CCapability(["C2C_DISABLED", "C2C_DISABLED"], false));
+  assert.throws(() => validC2CCapability(["TOPUP_SHADOW" as typeof C2C_BLOCKERS[number]], false));
+});
 const pending: C2CPending = { actor: "buyer", key: "original-key", quote: { id: "quote", sellerId: "seller", sellerName: "C2C-seller", sellerVersion: 1, creditMinor: 1000, payMinor: 1000, currency: "USD", fxMicros: 1_000_000, priceBps: 10000, description: "Bank transfer, contact @seller", expiresAt: "2026-10-22T12:05:00Z" } };
 const order: C2COrder = { id: "order", quoteId: "quote", buyerId: "buyer", sellerId: "seller", amountUnits: "86400000", status: "awaiting_payment", version: 1, paymentDeadline: "2026-10-22T12:30:00Z", paidAt: null, releasedAt: null, latePaymentReported: false, latePaymentResolved: false, createdAt: "2026-10-22T12:00:00Z", updatedAt: "2026-10-22T12:00:00Z", sellerName: "C2C-seller", payMinor: 1000, currency: "USD", fxMicros: 1_000_000, priceBps: 10000, description: pending.quote.description, legacyPayment: null };
 function storage() { const data = new Map<string, string>(); return { getItem: (key: string) => data.get(key) ?? null, setItem: (key: string, value: string) => { data.set(key, value); } }; }

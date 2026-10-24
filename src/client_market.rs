@@ -960,8 +960,7 @@ fn unavailable_paid_host_ids(conn: &Connection) -> Result<HashSet<String>, AppEr
             "SELECT id FROM router_ssh_hosts
              WHERE status = 'idle'
                AND (daily_rate_minor IS NOT NULL OR cycle_price_minor IS NOT NULL)
-               AND (funding_rail = 'platform_wallet') !=
-                   (SELECT mode = 'enabled' FROM market_finance_control WHERE id = 1)",
+               AND funding_rail != 'platform_wallet'",
         )
         .map_err(|error| {
             AppError::Internal(format!("prepare unavailable paid Hosts failed: {error}"))
@@ -6262,8 +6261,7 @@ impl AppStore {
                 "SELECT host_owner_email, country_code,
                         SUM(CASE WHEN status = 'idle'
                                   AND ((daily_rate_minor IS NULL AND cycle_price_minor IS NULL)
-                                    OR (funding_rail = 'platform_wallet') =
-                                       (SELECT mode = 'enabled' FROM market_finance_control WHERE id = 1))
+                                    OR funding_rail = 'platform_wallet')
                                  THEN 1 ELSE 0 END) AS idle_count,
                         COUNT(*) AS total_count
                  FROM router_ssh_hosts
@@ -9360,17 +9358,21 @@ mod tests {
                 [],
             )
             .unwrap();
-            assert!(unavailable_paid_host_ids(&conn).unwrap().is_empty());
-            conn.execute(
-                "UPDATE market_finance_control SET mode = 'enabled' WHERE id = 1",
-                [],
-            )
-            .unwrap();
-            assert!(
-                unavailable_paid_host_ids(&conn)
-                    .unwrap()
-                    .contains("old-paid-host")
-            );
+            // A historical paid offer remains unavailable in every recharge
+            // mode until the Provider explicitly republishes its price.
+            conn.execute("UPDATE router_ssh_hosts SET funding_rail = 'legacy_provider' WHERE id = 'old-paid-host'", []).unwrap();
+            for mode in ["disabled", "shadow", "enabled"] {
+                conn.execute(
+                    "UPDATE market_finance_control SET mode = ?1 WHERE id = 1",
+                    params![mode],
+                )
+                .unwrap();
+                assert!(
+                    unavailable_paid_host_ids(&conn)
+                        .unwrap()
+                        .contains("old-paid-host")
+                );
+            }
         }
         let supply = store.client_market_supply_summary().await.unwrap();
         assert_eq!(supply[0].idle_count, 0);
@@ -9883,7 +9885,7 @@ mod tests {
     async fn ensure_payment_profile(store: &AppStore, user_id: &str, email: &str) {
         use crate::client_market_trade::PaymentMethod;
         store
-            .client_market_update_payment_profile(
+            .seed_legacy_payment_profile(
                 &market_session(user_id, email),
                 &[PaymentMethod {
                     kind: "alipay".into(),
@@ -12305,301 +12307,148 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn paid_quote_funding_is_captured_on_activation_and_released_on_failure() {
+    async fn wallet_client_lifecycle_is_independent_of_official_topup_mode() {
         use crate::client_market_trade::CreateQuoteRequest;
 
-        let (store, _config, root) = test_store("paid-quote-funding-lifecycle");
-        let activated_host = add_provider_host(
-            &store,
-            "provider-funding",
-            "provider-funding@example.com",
-            "198.18.20.10",
-            "US",
-            Some(500),
-        )
-        .await;
-        let failed_host = add_provider_host(
-            &store,
-            "provider-funding",
-            "provider-funding@example.com",
-            "198.18.20.11",
-            "US",
-            Some(500),
-        )
-        .await;
-        let migrated_host = add_provider_host(
-            &store,
-            "provider-funding",
-            "provider-funding@example.com",
-            "198.18.20.12",
-            "US",
-            Some(500),
-        )
-        .await;
-        let expired_host = add_provider_host(
-            &store,
-            "provider-funding",
-            "provider-funding@example.com",
-            "198.18.20.13",
-            "US",
-            Some(500),
-        )
-        .await;
-        let client = market_session("client-funding", "client-funding@example.com");
-
-        let activation_quote = store
-            .client_market_create_quote(
-                &client,
-                CreateQuoteRequest {
-                    provider_ids: Vec::new(),
-                    country_codes: Vec::new(),
-                    count: 1,
-                    host_id: Some(activated_host.id.clone()),
-                },
-            )
-            .await
-            .expect("create paid activation quote");
-        let activation = store
-            .client_market_commit_quote(
-                &activation_quote.id,
-                &client,
-                &[(
-                    activation_quote.items[0].id.clone(),
-                    "funding-activated".into(),
-                    "secret".into(),
-                    activation_quote.items[0].offer_revision,
-                )],
-            )
-            .await
-            .expect("reserve paid activation funding");
-        let activation_job_id = &activation.job_ids[0];
-        {
-            let conn = store.conn.lock().await;
-            let tx = conn.transaction().expect("begin paid activation");
-            crate::client_market_trade::complete_provisioning_tx(
-                &tx,
-                activation_job_id,
-                &activated_host.id,
-                "funding-activated-installation",
-                "https://funding-activated.router.test",
-                Utc::now(),
-            )
-            .expect("activate paid Client Market subscription");
-            tx.commit().expect("commit paid activation");
-            let state: (String, i64, i64) = conn
-                .query_row(
-                    "SELECT reservation.status,
-                            (SELECT COUNT(*) FROM market_service_contracts
-                             WHERE product_kind = 'client_host' AND product_ref = ?2),
-                            (SELECT COUNT(*) FROM market_service_contracts
-                             WHERE product_kind = 'client_host'
-                               AND product_ref = 'funding-activated-installation')
-                     FROM market_funding_reservations reservation
-                     WHERE reservation.product_kind = 'client_host'
-                       AND reservation.product_ref = ?1",
-                    params![activation_job_id, activation_job_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .expect("read captured Client Market funding");
-            assert_eq!(state, ("captured".into(), 0, 1));
-        }
-
-        let migrated_client = market_session(
-            "client-funding-migrated",
-            "client-funding-migrated@example.com",
-        );
-        let migrated_quote = store
-            .client_market_create_quote(
-                &migrated_client,
-                CreateQuoteRequest {
-                    provider_ids: Vec::new(),
-                    country_codes: Vec::new(),
-                    count: 1,
-                    host_id: Some(migrated_host.id.clone()),
-                },
-            )
-            .await
-            .expect("create migrated paid activation quote");
-        let migrated = store
-            .client_market_commit_quote(
-                &migrated_quote.id,
-                &migrated_client,
-                &[(
-                    migrated_quote.items[0].id.clone(),
-                    "funding-migrated".into(),
-                    "secret".into(),
-                    migrated_quote.items[0].offer_revision,
-                )],
-            )
-            .await
-            .expect("commit migrated paid activation quote");
-        let migrated_job_id = &migrated.job_ids[0];
-        {
-            let conn = store.conn.lock().await;
-            assert_eq!(
+        for mode in ["disabled", "shadow", "enabled"] {
+            let (store, _config, root) = test_store(&format!("wallet-client-lifecycle-{mode}"));
+            let buyer = market_session("wallet-lifecycle-buyer", "buyer@example.com");
+            let now = Utc::now().to_rfc3339();
+            {
+                let conn = store.conn.lock().await;
                 conn.execute(
-                    "DELETE FROM market_funding_reservations
-                     WHERE product_kind = 'client_host' AND product_ref = ?1",
-                    params![migrated_job_id],
+                    "UPDATE market_finance_control SET mode = ?1 WHERE id = 1",
+                    params![mode],
                 )
-                .expect("remove pre-migration Client funding reservation"),
-                1
-            );
-            let tx = conn.transaction().expect("begin migrated paid activation");
-            crate::client_market_trade::complete_provisioning_tx(
-                &tx,
-                migrated_job_id,
-                &migrated_host.id,
-                "funding-migrated-installation",
-                "https://funding-migrated.router.test",
-                Utc::now(),
-            )
-            .expect("activate pre-migration paid Client Market subscription");
-            tx.commit().expect("commit migrated paid activation");
-            let state: (String, i64) = conn
-                .query_row(
-                    "SELECT reservation.status,
-                            (SELECT COUNT(*) FROM market_service_contracts
-                             WHERE product_kind = 'client_host'
-                               AND product_ref = 'funding-migrated-installation')
-                     FROM market_funding_reservations reservation
-                     WHERE reservation.product_kind = 'client_host'
-                       AND reservation.product_ref = ?1",
-                    params![migrated_job_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                .unwrap();
+                crate::market_wallet::credit_verified_topup_tx(
+                    &conn,
+                    &buyer.user_id,
+                    "lifecycle-topup",
+                    1000,
+                    "verified-receipt",
+                    &now,
                 )
-                .expect("read reconstructed Client Market funding");
-            assert_eq!(state, ("captured".into(), 1));
+                .unwrap();
+            }
+            for (index, activate) in [true, false].into_iter().enumerate() {
+                let host = add_provider_host(
+                    &store,
+                    "wallet-lifecycle-provider",
+                    "provider@example.com",
+                    &format!("198.18.20.{}", index + 10),
+                    "US",
+                    Some(500),
+                )
+                .await;
+                let quote = store
+                    .client_market_create_quote(
+                        &buyer,
+                        CreateQuoteRequest {
+                            provider_ids: Vec::new(),
+                            country_codes: Vec::new(),
+                            count: 1,
+                            host_id: Some(host.id.clone()),
+                        },
+                    )
+                    .await
+                    .expect("quote paid Host without an official recharge channel");
+                assert_eq!(quote.funding_rail, "platform_wallet", "{mode}");
+                assert_eq!(
+                    quote.items[0].trial_seconds_remaining,
+                    crate::market_billing::TRIAL_SECONDS,
+                );
+                let committed = store
+                    .client_market_commit_quote(
+                        &quote.id,
+                        &buyer,
+                        &[(
+                            quote.items[0].id.clone(),
+                            format!("wallet-lifecycle-{index}"),
+                            "secret".into(),
+                            quote.items[0].offer_revision,
+                        )],
+                    )
+                    .await
+                    .expect("commit platform-wallet quote in every official recharge mode");
+                let job_id = &committed.job_ids[0];
+                if activate {
+                    let conn = store.conn.lock().await;
+                    let tx = conn.transaction().unwrap();
+                    crate::client_market_trade::complete_provisioning_tx(
+                        &tx,
+                        job_id,
+                        &host.id,
+                        "wallet-lifecycle-installation",
+                        "https://wallet-lifecycle.router.test",
+                        Utc::now(),
+                    )
+                    .expect("activate only the quoted wallet contract");
+                    // The provisioning worker marks the validated job complete
+                    // in the same transaction as this financial binding.
+                    tx.execute("UPDATE provisioning_jobs SET status = 'succeeded', phase = 'complete' WHERE id = ?1", params![job_id]).unwrap();
+                    let state: (String, String, String) = tx
+                        .query_row(
+                            "SELECT c.status, c.service_ref, s.platform_contract_id
+                         FROM market_platform_contracts c
+                         JOIN client_market_subscriptions s ON s.platform_contract_id = c.id
+                         WHERE c.product_ref = ?1",
+                            params![job_id],
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        )
+                        .unwrap();
+                    assert_eq!(state.0, "trialing");
+                    assert_eq!(state.1, "wallet-lifecycle-installation");
+                    assert!(!state.2.is_empty());
+                    tx.commit().unwrap();
+                } else {
+                    store
+                        .client_market_finalize_create_failure(
+                            job_id,
+                            Some(&host.id),
+                            true,
+                            "installer_failed",
+                            "rollback complete",
+                        )
+                        .await
+                        .expect("clean activation failure releases its wallet obligation");
+                    let conn = store.conn.lock().await;
+                    let state: (String, String) = conn
+                        .query_row(
+                            "SELECT c.status, h.status FROM market_platform_contracts c
+                         JOIN router_ssh_hosts h ON h.id = ?2 WHERE c.product_ref = ?1",
+                            params![job_id, host.id],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .unwrap();
+                    assert_eq!(state, ("activation_failed".into(), HOST_STATUS_IDLE.into()));
+                }
+                let conn = store.conn.lock().await;
+                let legacy_count: i64 = conn
+                    .query_row(
+                        "SELECT (SELECT COUNT(*) FROM market_service_contracts)
+                          + (SELECT COUNT(*) FROM market_funding_reservations)",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    legacy_count, 0,
+                    "new orders must never create Provider credit"
+                );
+                let wallet =
+                    crate::market_wallet::wallet_snapshot_tx(&conn, &buyer.user_id).unwrap();
+                assert_eq!(
+                    wallet.available_units,
+                    1000 * 86_400,
+                    "free trials do not spend balance"
+                );
+                assert_eq!(wallet.held_units, 0);
+                crate::market_wallet::reconcile_wallet_tx(&conn, &buyer.user_id).unwrap();
+            }
+            drop(store);
+            let _ = std::fs::remove_dir_all(root);
         }
-
-        let expired_client = market_session(
-            "client-funding-expired",
-            "client-funding-expired@example.com",
-        );
-        let expired_quote = store
-            .client_market_create_quote(
-                &expired_client,
-                CreateQuoteRequest {
-                    provider_ids: Vec::new(),
-                    country_codes: Vec::new(),
-                    count: 1,
-                    host_id: Some(expired_host.id.clone()),
-                },
-            )
-            .await
-            .expect("create expiring paid activation quote");
-        let expired = store
-            .client_market_commit_quote(
-                &expired_quote.id,
-                &expired_client,
-                &[(
-                    expired_quote.items[0].id.clone(),
-                    "funding-expired".into(),
-                    "secret".into(),
-                    expired_quote.items[0].offer_revision,
-                )],
-            )
-            .await
-            .expect("commit expiring paid activation quote");
-        let expired_job_id = &expired.job_ids[0];
-        {
-            let conn = store.conn.lock().await;
-            conn.execute(
-                "UPDATE market_funding_reservations
-                 SET expires_at = ?2
-                 WHERE product_kind = 'client_host' AND product_ref = ?1",
-                params![
-                    expired_job_id,
-                    (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()
-                ],
-            )
-            .expect("expire Client funding reservation during provisioning");
-            let tx = conn.transaction().expect("begin expired paid activation");
-            crate::client_market_trade::complete_provisioning_tx(
-                &tx,
-                expired_job_id,
-                &expired_host.id,
-                "funding-expired-installation",
-                "https://funding-expired.router.test",
-                Utc::now(),
-            )
-            .expect("renew still-funded Client reservation at activation");
-            tx.commit().expect("commit renewed paid activation");
-            let state: (String, i64) = conn
-                .query_row(
-                    "SELECT reservation.status,
-                            (SELECT COUNT(*) FROM market_service_contracts
-                             WHERE product_kind = 'client_host'
-                               AND product_ref = 'funding-expired-installation')
-                     FROM market_funding_reservations reservation
-                     WHERE reservation.product_kind = 'client_host'
-                       AND reservation.product_ref = ?1",
-                    params![expired_job_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .expect("read renewed Client Market funding");
-            assert_eq!(state, ("captured".into(), 1));
-        }
-
-        let failed_client = market_session(
-            "client-funding-failure",
-            "client-funding-failure@example.com",
-        );
-        let failure_quote = store
-            .client_market_create_quote(
-                &failed_client,
-                CreateQuoteRequest {
-                    provider_ids: Vec::new(),
-                    country_codes: Vec::new(),
-                    count: 1,
-                    host_id: Some(failed_host.id.clone()),
-                },
-            )
-            .await
-            .expect("create paid failure quote");
-        let failure = store
-            .client_market_commit_quote(
-                &failure_quote.id,
-                &failed_client,
-                &[(
-                    failure_quote.items[0].id.clone(),
-                    "funding-failed".into(),
-                    "secret".into(),
-                    failure_quote.items[0].offer_revision,
-                )],
-            )
-            .await
-            .expect("reserve paid failure funding");
-        let failure_job_id = &failure.job_ids[0];
-        store
-            .client_market_finalize_create_failure(
-                failure_job_id,
-                Some(&failed_host.id),
-                true,
-                "installer_failed",
-                "rollback complete",
-            )
-            .await
-            .expect("release failed paid provisioning funding");
-        let conn = store.conn.lock().await;
-        let state: (String, i64, String) = conn
-            .query_row(
-                "SELECT reservation.status,
-                        (SELECT COUNT(*) FROM market_service_contracts
-                         WHERE product_kind = 'client_host' AND product_ref = ?2),
-                        host.status
-                 FROM market_funding_reservations reservation
-                 JOIN router_ssh_hosts host ON host.id = ?3
-                 WHERE reservation.product_kind = 'client_host'
-                   AND reservation.product_ref = ?1",
-                params![failure_job_id, failure_job_id, failed_host.id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .expect("read released Client Market funding");
-        assert_eq!(state, ("released".into(), 0, HOST_STATUS_IDLE.into()));
-        drop(conn);
-        drop(store);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -12862,6 +12711,19 @@ mod tests {
             None,
         )
         .await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE users SET email_normalized = 'provider-new@example.com' WHERE id = 'provider-stable'",
+                [],
+            ).unwrap();
+            // Seed a separately verified identity update. This test covers
+            // supply projection, not an unverified public-profile rename.
+            conn.execute(
+                "UPDATE market_provider_profiles SET canonical_email = 'provider-new@example.com' WHERE user_id = 'provider-stable'",
+                [],
+            ).unwrap();
+        }
         store
             .client_market_ensure_provider("provider-stable", "provider-new@example.com")
             .await

@@ -146,7 +146,7 @@ export function C2COrdersPanel({ actor, selectedId, onSelect }: { actor: string;
     </ul>}
     {next ? <C2CAction type="button" secondary disabled={busy} onClick={() => { setBusy(true); void load(next).catch(e => { if (alive.current) setError(t(c2cErrorKey(e))); }).finally(() => { if (alive.current) setBusy(false); }); }}>{t("common.next")}</C2CAction> : null}
     <C2CDialog open={selling && !!policy && !!snapshot} title={t(snapshot?.seller ? "c2c.sellerSettings" : "c2c.seller")} busy={editorBusy} onClose={() => setSelling(false)}>
-      {selling && policy && snapshot ? <C2CSellerPanel key={editorKey} policy={policy} snapshot={snapshot} onBusyChange={setEditorBusy} onSaved={saved}
+      {selling && policy && snapshot ? <C2CSellerPanel key={editorKey} policy={policy} snapshot={snapshot} availabilityError={!!sellerError} onRefresh={async () => { await loadSettings(); }} onBusyChange={setEditorBusy} onSaved={saved}
         onReload={async () => { if (!await loadSettings()) throw new Error("Seller settings reload superseded"); if (alive.current) { setEditorBusy(false); setEditorKey(v => v + 1); } }} /> : null}
     </C2CDialog>
     {selectedId ? <C2COrderDialog key={selectedId} actor={actor} id={selectedId} onClose={() => { onSelect(null); reload(); }} onChanged={() => { notifyMarketBalanceChanged(actor); reload(); }} /> : null}

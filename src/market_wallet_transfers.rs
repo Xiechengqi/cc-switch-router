@@ -71,6 +71,7 @@ struct Capacity {
     daily_remaining_units: i64,
     enabled: bool,
     verified: bool,
+    blockers: Vec<&'static str>,
 }
 
 fn capacity_tx(conn: &Connection, user: &str, time: &str) -> Result<Capacity, AppError> {
@@ -87,8 +88,29 @@ fn capacity_tx(conn: &Connection, user: &str, time: &str) -> Result<Capacity, Ap
             conn, user, time,
         )?)
         .max(0);
-    let mode: bool = conn.query_row("SELECT mode = 'enabled' AND cutover_approved_at IS NOT NULL FROM market_finance_control WHERE id = 1", [], |row| row.get(0))
-        .map_err(db_error("read transfer mode"))?;
+    let verified = match require_user_tx(conn, user) {
+        Ok(_) => true,
+        Err(e) if e.code() == Some("WALLET_TRANSFER_USER_UNVERIFIED") => false,
+        Err(e) => return Err(e),
+    };
+    let mut blockers = Vec::new();
+    if !policy.transfers_enabled {
+        blockers.push("disabled");
+    }
+    if policy.transfers_paused {
+        blockers.push("paused");
+    }
+    if !verified {
+        blockers.push("identity");
+    }
+    match crate::market_reconcile::ensure_finance_scopes_safe_tx(
+        conn,
+        &[crate::market_reconcile::FinanceScope::User(user)],
+    ) {
+        Ok(()) => {}
+        Err(e) if crate::market_reconcile::is_finance_hold(&e) => blockers.push("finance_hold"),
+        Err(e) => return Err(e),
+    }
     Ok(Capacity {
         transferable_units: available
             .saturating_sub(committed)
@@ -97,8 +119,9 @@ fn capacity_tx(conn: &Connection, user: &str, time: &str) -> Result<Capacity, Ap
             .min(remaining),
         committed_units: committed,
         daily_remaining_units: remaining,
-        enabled: mode && policy.transfers_enabled && !policy.transfers_paused,
-        verified: require_user_tx(conn, user).is_ok(),
+        enabled: blockers.is_empty(),
+        verified,
+        blockers,
     })
 }
 
@@ -144,12 +167,16 @@ async fn capacity(
     let user = session(&state, &headers).await?;
     let conn = state.store.conn.lock().await;
     let mut value = capacity_tx(&conn, &user.user_id, &now())?;
-    value.enabled &= state
+    let email_ready = state
         .config
         .resend_api_key
         .as_deref()
         .is_some_and(|key| !key.trim().is_empty())
         && crate::notifications::notification_sender(&state.config).is_some();
+    if !email_ready {
+        value.blockers.push("email_unavailable");
+    }
+    value.enabled = value.blockers.is_empty();
     Ok((no_store(), Json(value)))
 }
 
@@ -859,6 +886,43 @@ mod tests {
         );
         crate::market_wallet::reconcile_wallet_tx(&conn, "recipient").unwrap();
         crate::market_wallet::reconcile_wallet_tx(&conn, "sender").unwrap();
+    }
+
+    #[test]
+    fn transfers_remain_available_in_all_topup_modes_but_obey_their_own_pause() {
+        let (conn, runtime) = fixture();
+        let at = "2026-10-01T00:00:02Z";
+        for (index, mode) in ["disabled", "shadow", "enabled"].iter().enumerate() {
+            conn.execute("UPDATE market_finance_control SET mode=?1,cutover_approved_at=NULL,new_orders_paused=1,new_topups_paused=1",params![mode]).unwrap();
+            let capacity = capacity_tx(&conn, "sender", at).unwrap();
+            assert!(capacity.enabled && capacity.verified && capacity.blockers.is_empty());
+            let req = quoted_as(
+                &conn,
+                &runtime,
+                units_from_minor(100).unwrap(),
+                &format!("q-{index}"),
+                &format!("c-{index}"),
+            );
+            confirm_tx(
+                &conn,
+                &runtime,
+                "sender",
+                &format!("transfer-{index}"),
+                &req,
+                at,
+            )
+            .unwrap()
+            .unwrap();
+        }
+        conn.execute("UPDATE market_wallet_policy SET transfers_paused=1", [])
+            .unwrap();
+        assert_eq!(
+            capacity_tx(&conn, "sender", at).unwrap().blockers,
+            vec!["paused"]
+        );
+        assert!(require_transfer_tx(&conn, "sender", "recipient", 1, at).is_err());
+        crate::market_wallet::reconcile_wallet_tx(&conn, "sender").unwrap();
+        crate::market_wallet::reconcile_wallet_tx(&conn, "recipient").unwrap();
     }
     #[test]
     fn racing_quotes_recheck_balance_and_daily_capacity_at_commit() {

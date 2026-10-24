@@ -224,7 +224,9 @@ export function WalletTransferPanel({
       ) : !enabled ? (
         <p className="text-sm text-muted-foreground">
           {t(
-            !capacity.verified
+            capacity.blockers?.[0] === "email_unavailable" ? "walletTransfer.emailUnavailable"
+              : capacity.blockers?.[0] === "finance_hold" ? "walletTransfer.financeHold"
+              : !capacity.verified
               ? "walletTransfer.verify"
               : "walletTransfer.paused",
           )}

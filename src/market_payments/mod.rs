@@ -215,30 +215,6 @@ fn payment_webhook_url(domain: &str, use_localhost: bool) -> String {
     )
 }
 
-/// A raw mode edit cannot authorize wallet purchases. Existing contracts
-/// still dispatch by their own funding rail.
-pub(crate) fn wallet_purchase_mode_tx(conn: &Connection) -> Result<bool, AppError> {
-    let (enabled, approved): (bool, bool) = conn
-        .query_row(
-            "SELECT mode = 'enabled', cutover_approved_at IS NOT NULL
-             FROM market_finance_control WHERE id = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(db_error("read market finance purchase mode"))?;
-    if enabled && (!MARKET_WALLET_CUTOVER_IMPLEMENTED || !approved) {
-        return Err(AppError::ServiceUnavailable(
-            "platform wallet cutover has not been approved".into(),
-        ));
-    }
-    if approved && !enabled {
-        return Err(AppError::ServiceUnavailable(
-            "platform wallet cutover cannot return to the legacy payment rail".into(),
-        ));
-    }
-    Ok(enabled)
-}
-
 /// A pause fences only new obligations. Call this after checking for an
 /// idempotent replay, so an already committed order can finish activation.
 pub(crate) fn require_new_wallet_orders_open_tx(conn: &Connection) -> Result<(), AppError> {
@@ -257,11 +233,10 @@ pub(crate) fn require_new_wallet_orders_open_tx(conn: &Connection) -> Result<(),
     Ok(())
 }
 
-/// An offer's publication rail is immutable until the Provider explicitly
-/// edits its paid terms. A mode switch must not reinterpret an old offer.
+/// New purchases use the platform wallet, regardless of official top-up mode.
+/// Old paid terms need republication; never reinterpret an immutable quote.
 pub(crate) fn require_current_offer_rail(
     funding_rail: &str,
-    wallet_mode: bool,
     product: &str,
 ) -> Result<(), AppError> {
     if !matches!(funding_rail, "legacy_provider" | "platform_wallet") {
@@ -269,7 +244,7 @@ pub(crate) fn require_current_offer_rail(
             "stored {product} offer funding rail is invalid"
         )));
     }
-    if (funding_rail == "platform_wallet") != wallet_mode {
+    if funding_rail != "platform_wallet" {
         return Err(AppError::Gone(format!(
             "{product} offer was published under another payment mode; ask the Provider to republish it"
         )));
@@ -425,7 +400,6 @@ struct FinanceReadinessView {
     new_orders_paused: bool,
     new_topups_paused: bool,
     code_integrated: bool,
-    legacy_blockers: Vec<ReadinessBlocker>,
     critical_cases: i64,
     stale_topup_reviews: i64,
     verified_live_topups: i64,
@@ -452,94 +426,6 @@ fn finance_readiness_tx(conn: &Connection) -> Result<FinanceReadinessView, AppEr
     let (mode, version, new_orders_paused, new_topups_paused): (String, i64, bool, bool) = conn
 .query_row("SELECT mode, version, new_orders_paused, new_topups_paused FROM market_finance_control WHERE id=1", [],
 |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).map_err(db_error("read market finance mode"))?;
-    let checks: [(&'static str, &'static str); 15] = [
-        (
-            "legacy_share_paid_offers",
-            "SELECT COUNT(*) FROM share_market_seats seat
-             JOIN share_market_listings listing ON listing.id = seat.listing_id
-             WHERE listing.status = 'active' AND listing.deleted_at IS NULL
-               AND seat.status = 'available'
-               AND (seat.daily_rate_minor IS NOT NULL OR seat.cycle_price_minor IS NOT NULL)
-               AND seat.funding_rail = 'legacy_provider'",
-        ),
-        (
-            "legacy_client_paid_offers",
-            "SELECT COUNT(*) FROM router_ssh_hosts
-             WHERE status = 'idle'
-               AND (daily_rate_minor IS NOT NULL OR cycle_price_minor IS NOT NULL)
-               AND funding_rail = 'legacy_provider'",
-        ),
-        (
-            "legacy_active_share_quotes",
-            "SELECT COUNT(*) FROM share_market_rent_quotes
-             WHERE status = 'active' AND pricing_model != 'free'
-               AND CASE WHEN json_valid(snapshot_json)
-                        THEN COALESCE(json_extract(snapshot_json, '$.fundingRail'),
-                                      'legacy_provider')
-                        ELSE 'legacy_provider' END = 'legacy_provider'",
-        ),
-        (
-            "legacy_active_client_quotes",
-            "SELECT COUNT(*) FROM client_market_allocation_quotes quote
-             JOIN client_market_allocation_quote_items item ON item.quote_id = quote.id
-             WHERE quote.status = 'active'
-               AND quote.funding_rail = 'legacy_provider'
-               AND (item.daily_rate_minor IS NOT NULL OR item.cycle_price_minor IS NOT NULL)",
-        ),
-        (
-            "legacy_metered_contracts",
-            "SELECT COUNT(*) FROM market_service_contracts WHERE status != 'terminated'",
-        ),
-        (
-            "legacy_monthly_contracts",
-            "SELECT COUNT(*) FROM market_recurring_contracts WHERE status NOT IN ('ended', 'activation_failed')",
-        ),
-        (
-            "legacy_prepaid_funds",
-            "SELECT COUNT(*) FROM market_prepaid_accounts WHERE posted_balance_units > 0 OR held_balance_units > 0",
-        ),
-        (
-            "legacy_credit_debt",
-            "SELECT COUNT(*) FROM market_credit_accounts WHERE balance_units > 0",
-        ),
-        (
-            "legacy_open_invoices",
-            "SELECT COUNT(*) FROM market_invoices WHERE status NOT IN ('paid', 'void')",
-        ),
-        (
-            "legacy_refund_obligations",
-            "SELECT COUNT(*) FROM market_refund_obligations WHERE status != 'recorded'",
-        ),
-        (
-            "legacy_prepaid_refunds",
-            "SELECT COUNT(*) FROM market_prepaid_refund_requests WHERE status IN ('requested', 'approved')",
-        ),
-        (
-            "legacy_funding_intents",
-            "SELECT COUNT(*) FROM market_funding_intents WHERE status IN ('pending', 'review_required')",
-        ),
-        (
-            "legacy_billing_disputes",
-            "SELECT COUNT(*) FROM market_billing_disputes WHERE status NOT IN ('resolved', 'rejected')",
-        ),
-        (
-            "legacy_payment_cases",
-            "SELECT COUNT(*) FROM market_payment_reconciliation_cases WHERE status = 'open'",
-        ),
-        (
-            "legacy_active_reservations",
-            "SELECT COUNT(*) FROM market_funding_reservations WHERE status = 'active'",
-        ),
-    ];
-    let mut legacy_blockers = Vec::new();
-    for (code, sql) in checks {
-        let count: i64 = conn
-            .query_row(sql, [], |row| row.get(0))
-            .map_err(db_error("read legacy cutover blocker"))?;
-        if count > 0 {
-            legacy_blockers.push(ReadinessBlocker { code, count });
-        }
-    }
     let verified_live_topups: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM market_verified_topup_evidence",
@@ -575,7 +461,7 @@ fn finance_readiness_tx(conn: &Connection) -> Result<FinanceReadinessView, AppEr
         ),
         (
             "channel_none_live",
-            "SELECT CASE WHEN EXISTS (SELECT 1 FROM market_payment_channels c WHERE c.rollout_state = 'live' AND c.archived_at IS NULL AND EXISTS (SELECT 1 FROM market_verified_topup_evidence t WHERE t.channel_id = c.id AND t.channel_revision = c.current_revision)) THEN 0 ELSE 1 END",
+            "SELECT CASE WHEN EXISTS (SELECT 1 FROM market_payment_channels c WHERE c.enabled = 1 AND c.rollout_state = 'live' AND c.archived_at IS NULL AND EXISTS (SELECT 1 FROM market_verified_topup_evidence t WHERE t.channel_id = c.id AND t.channel_revision = c.current_revision)) THEN 0 ELSE 1 END",
         ),
     ];
     let mut payment_channel_blockers = Vec::new();
@@ -588,7 +474,6 @@ fn finance_readiness_tx(conn: &Connection) -> Result<FinanceReadinessView, AppEr
         }
     }
     let can_enable = MARKET_WALLET_CUTOVER_IMPLEMENTED
-        && legacy_blockers.is_empty()
         && critical_cases == 0
         && verified_live_topups > 0
         && payment_channel_blockers.is_empty();
@@ -598,7 +483,6 @@ fn finance_readiness_tx(conn: &Connection) -> Result<FinanceReadinessView, AppEr
         new_orders_paused,
         new_topups_paused,
         code_integrated: MARKET_WALLET_CUTOVER_IMPLEMENTED,
-        legacy_blockers,
         critical_cases,
         stale_topup_reviews,
         verified_live_topups,
@@ -637,24 +521,20 @@ fn set_finance_mode_tx(
     if !matches!(request.mode.as_str(), "disabled" | "shadow" | "enabled") {
         return Err(AppError::BadRequest("invalid market finance mode".into()));
     }
-    let (current_mode, was_approved): (String, bool) = conn
+    let current_mode: String = conn
         .query_row(
-            "SELECT mode, cutover_approved_at IS NOT NULL FROM market_finance_control WHERE id = 1",
+            "SELECT mode FROM market_finance_control WHERE id = 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| row.get(0),
         )
         .map_err(db_error("read market finance mode"))?;
-    if was_approved && (request.mode != "enabled" || current_mode != "enabled") {
-        return Err(AppError::Conflict(
-            "platform wallet cutover is permanent; disable payment channels to pause top-ups"
-                .into(),
-        ));
-    }
     if request.mode == "enabled" {
         let readiness = finance_readiness_tx(conn)?;
-        if !was_approved && (readiness.mode != "shadow" || !readiness.can_enable) {
+        // Every reopening checks today's channel revisions and ledger safety.
+        // A previous approval must not authorize a rotated/unverified channel.
+        if current_mode == "disabled" || !readiness.can_enable {
             return Err(AppError::Conflict(
-                "market wallet cutover gates have not passed".into(),
+                "official top-up readiness gates have not passed; test in shadow first".into(),
             ));
         }
     }
@@ -711,32 +591,12 @@ struct FinancePauseRequest {
     expected_version: i64,
 }
 
-/// Purchase pauses exist only on the production wallet. The
-/// top-up pause also works in shadow mode, where it fences Owner test orders.
+/// Purchase and official top-up pauses are independent in every top-up mode.
 fn set_finance_pause_tx(
     conn: &Connection,
     request: &FinancePauseRequest,
     changed_at: &str,
 ) -> Result<(), AppError> {
-    let (mode, approved, orders): (String, bool, bool) = conn
-        .query_row(
-            "SELECT mode, cutover_approved_at IS NOT NULL, new_orders_paused
-             FROM market_finance_control WHERE id = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .map_err(db_error("read finance pause"))?;
-    let production = mode == "enabled" && approved;
-    if !production && request.new_orders_paused != orders {
-        return Err(AppError::Conflict(
-            "purchase pauses require an enabled wallet".into(),
-        ));
-    }
-    if !production && mode != "shadow" && request.new_topups_paused.is_some() {
-        return Err(AppError::Conflict(
-            "top-up pause requires a shadow or enabled wallet".into(),
-        ));
-    }
     let changed = conn
         .execute(
             "UPDATE market_finance_control
@@ -820,15 +680,16 @@ async fn get_wallet(
     headers: HeaderMap,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let session = require_session(&state, &headers).await?;
-    let (snapshot, mode, cutover_approved, has_wallet_activity) = {
+    let owner = crate::api::is_finance_owner(&state.config, &session.email);
+    let (snapshot, mode, can_topup, has_wallet_activity) = {
         let conn = state.store.conn.lock().await;
         let snapshot = wallet_snapshot_tx(&conn, &session.user_id)?;
-        let (mode, cutover_approved): (String, bool) = conn
+        let (mode, cutover_approved, paused): (String, bool, bool) = conn
             .query_row(
-                "SELECT mode, cutover_approved_at IS NOT NULL
+                "SELECT mode, cutover_approved_at IS NOT NULL, new_topups_paused
                  FROM market_finance_control WHERE id = 1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .map_err(db_error("read wallet mode"))?;
         let has_wallet_activity: bool = conn
@@ -839,13 +700,11 @@ async fn get_wallet(
                 |row| row.get(0),
             )
             .map_err(db_error("read wallet activity"))?;
-        (snapshot, mode, cutover_approved, has_wallet_activity)
+        let can_topup = user_topup_allowed(&mode, owner, cutover_approved)
+            && !paused
+            && !buyer_channel_views(&conn, owner)?.is_empty();
+        (snapshot, mode, can_topup, has_wallet_activity)
     };
-    let can_topup = user_topup_allowed(
-        &mode,
-        crate::api::is_finance_owner(&state.config, &session.email),
-        cutover_approved,
-    );
     let committed_units = {
         let conn = state.store.conn.lock().await;
         crate::market_platform_contracts::prior_due_funding_units_tx(
@@ -4982,16 +4841,6 @@ async fn create_topup(
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(db_error("read market finance mode"))?;
-        if mode == "enabled" && (!MARKET_WALLET_CUTOVER_IMPLEMENTED || !cutover_approved) {
-            return Err(AppError::ServiceUnavailable(
-                "platform wallet cutover has not been approved".into(),
-            ));
-        }
-        if !user_topup_allowed(&mode, owner, cutover_approved) {
-            return Err(AppError::ServiceUnavailable(
-                "platform wallet top-up is not enabled".into(),
-            ));
-        }
         let prior = tx
             .query_row(
                 "SELECT id, request_fingerprint, merchant_order_id, channel_revision
@@ -5037,6 +4886,16 @@ async fn create_topup(
                     body.map(String::into_bytes),
                 )
             } else {
+                if mode == "enabled" && (!MARKET_WALLET_CUTOVER_IMPLEMENTED || !cutover_approved) {
+                    return Err(AppError::ServiceUnavailable(
+                        "platform wallet cutover has not been approved".into(),
+                    ));
+                }
+                if !user_topup_allowed(&mode, owner, cutover_approved) {
+                    return Err(AppError::ServiceUnavailable(
+                        "platform wallet top-up is not enabled".into(),
+                    ));
+                }
                 crate::market_reconcile::ensure_finance_scopes_safe_tx(
                     &tx,
                     &[crate::market_reconcile::FinanceScope::User(
@@ -8651,44 +8510,19 @@ mod tests {
     }
 
     #[test]
-    fn manually_enabled_mode_cannot_bypass_live_cutover_approval() {
-        let conn = memory();
-        assert!(!wallet_purchase_mode_tx(&conn).unwrap());
+    fn official_topup_modes_require_owner_testing_and_live_approval() {
         assert!(!user_topup_allowed("disabled", true, false));
         assert!(user_topup_allowed("shadow", true, false));
         assert!(!user_topup_allowed("shadow", false, false));
         assert!(!user_topup_allowed("enabled", false, false));
         assert!(!user_topup_allowed("enabled", true, false));
-        conn.execute(
-            "UPDATE market_finance_control SET mode = 'enabled' WHERE id = 1",
-            [],
-        )
-        .unwrap();
-        assert!(matches!(
-            wallet_purchase_mode_tx(&conn),
-            Err(AppError::ServiceUnavailable(_))
-        ));
-        conn.execute(
-            "UPDATE market_finance_control SET cutover_approved_at = '2026-10-16T00:00:00Z'
-             WHERE id = 1",
-            [],
-        )
-        .unwrap();
-        assert!(wallet_purchase_mode_tx(&conn).unwrap());
         assert!(user_topup_allowed("enabled", false, true));
     }
 
     #[test]
-    fn owner_cutover_requires_live_gates_and_never_reopens_legacy_money() {
+    fn owner_can_close_topups_but_reopening_rechecks_current_channel_readiness() {
         let conn = memory();
-        let enable = ModeRequest {
-            mode: "enabled".into(),
-            expected_version: 2,
-        };
-        assert!(matches!(
-            set_finance_mode_tx(&conn, &enable, "2026-10-16T00:00:00Z"),
-            Err(AppError::Conflict(_))
-        ));
+        let at = "2026-10-16T00:00:00Z";
         fixture_revision(&conn, 1);
         fixture_topup(
             &conn,
@@ -8697,130 +8531,96 @@ mod tests {
             "credited",
             1,
         );
+        conn.execute("UPDATE market_payment_channels SET webhook_verified_at=?1,webhook_verified_revision=1 WHERE id='channel'", params![at]).unwrap();
+        assert!(finance_readiness_tx(&conn).unwrap().can_enable);
+        assert!(
+            set_finance_mode_tx(
+                &conn,
+                &ModeRequest {
+                    mode: "enabled".into(),
+                    expected_version: 1
+                },
+                at
+            )
+            .is_err()
+        );
+        for (version, mode) in [
+            (1, "shadow"),
+            (2, "enabled"),
+            (3, "disabled"),
+            (4, "shadow"),
+            (5, "enabled"),
+            (6, "shadow"),
+        ] {
+            set_finance_mode_tx(
+                &conn,
+                &ModeRequest {
+                    mode: mode.into(),
+                    expected_version: version,
+                },
+                at,
+            )
+            .unwrap();
+        }
         conn.execute(
-            "UPDATE market_payment_channels
-             SET webhook_verified_at = '2026-10-16T00:00:00Z', webhook_verified_revision = 1
-             WHERE id = 'channel'",
+            "UPDATE market_payment_channels SET webhook_verified_revision=NULL",
             [],
         )
         .unwrap();
-        assert!(finance_readiness_tx(&conn).unwrap().can_enable);
-        assert!(set_finance_mode_tx(&conn, &enable, "2026-10-16T00:00:00Z").is_err());
-        set_finance_mode_tx(
-            &conn,
-            &ModeRequest {
-                mode: "shadow".into(),
-                expected_version: 1,
-            },
-            "2026-10-16T00:00:00Z",
-        )
-        .unwrap();
-        set_finance_mode_tx(&conn, &enable, "2026-10-16T00:00:00Z").unwrap();
-        assert!(wallet_purchase_mode_tx(&conn).unwrap());
-
-        assert!(matches!(
+        assert!(!finance_readiness_tx(&conn).unwrap().can_enable);
+        assert!(
+            set_finance_mode_tx(
+                &conn,
+                &ModeRequest {
+                    mode: "enabled".into(),
+                    expected_version: 7
+                },
+                at
+            )
+            .is_err()
+        );
+        assert!(
             set_finance_mode_tx(
                 &conn,
                 &ModeRequest {
                     mode: "disabled".into(),
-                    expected_version: 3,
+                    expected_version: 6
                 },
-                "2026-10-16T01:00:00Z",
-            ),
-            Err(AppError::Conflict(_))
-        ));
-        let approved: Option<String> = conn
-            .query_row(
-                "SELECT cutover_approved_at FROM market_finance_control WHERE id = 1",
-                [],
-                |row| row.get(0),
+                at
             )
-            .unwrap();
-        assert_eq!(approved.as_deref(), Some("2026-10-16T00:00:00Z"));
-        assert!(wallet_purchase_mode_tx(&conn).unwrap());
-        conn.execute(
-            "UPDATE market_finance_control SET mode = 'disabled' WHERE id = 1",
-            [],
-        )
-        .unwrap();
-        assert!(matches!(
-            wallet_purchase_mode_tx(&conn),
-            Err(AppError::ServiceUnavailable(_))
-        ));
-    }
-
-    #[test]
-    fn owner_can_pause_new_wallet_obligations_without_changing_the_funding_rail() {
-        let conn = memory();
-        let at = "2026-10-16T00:00:00Z";
-        conn.execute(
-            "UPDATE market_finance_control
-             SET mode = 'enabled', cutover_approved_at = ?1 WHERE id = 1",
-            params![at],
-        )
-        .unwrap();
-        let request = FinancePauseRequest {
-            new_orders_paused: true,
-            new_topups_paused: None,
-            expected_version: 1,
-        };
-        set_finance_pause_tx(&conn, &request, at).unwrap();
-        assert!(wallet_purchase_mode_tx(&conn).unwrap());
-        assert!(finance_readiness_tx(&conn).unwrap().new_orders_paused);
-        assert!(matches!(
-            require_new_wallet_orders_open_tx(&conn),
-            Err(AppError::ServiceUnavailable(_))
-        ));
-        assert!(matches!(
-            set_finance_pause_tx(&conn, &request, at),
-            Err(AppError::Conflict(_))
-        ));
-        set_finance_pause_tx(
-            &conn,
-            &FinancePauseRequest {
-                new_orders_paused: false,
-                new_topups_paused: None,
-                expected_version: 2,
-            },
-            at,
-        )
-        .unwrap();
+            .is_err()
+        );
         require_new_wallet_orders_open_tx(&conn).unwrap();
     }
 
     #[test]
-    fn topup_pause_works_in_shadow_but_purchase_pauses_need_production() {
+    fn purchase_and_topup_pauses_are_independent_in_every_topup_mode() {
         let conn = memory();
         let at = "2026-10-16T00:00:00Z";
-        conn.execute(
-            "UPDATE market_finance_control SET mode = 'shadow' WHERE id = 1",
-            [],
-        )
-        .unwrap();
-        assert!(
+        for mode in ["disabled", "shadow", "enabled"] {
+            conn.execute("UPDATE market_finance_control SET mode=?1,version=1,new_orders_paused=0,new_topups_paused=0", params![mode]).unwrap();
+            let pause = FinancePauseRequest {
+                new_orders_paused: true,
+                new_topups_paused: Some(false),
+                expected_version: 1,
+            };
+            set_finance_pause_tx(&conn, &pause, at).unwrap();
+            assert!(require_new_wallet_orders_open_tx(&conn).is_err());
+            require_new_topups_open_tx(&conn).unwrap();
+            assert!(set_finance_pause_tx(&conn, &pause, at).is_err());
             set_finance_pause_tx(
                 &conn,
                 &FinancePauseRequest {
-                    new_orders_paused: true,
-                    new_topups_paused: None,
-                    expected_version: 1,
+                    new_orders_paused: false,
+                    new_topups_paused: Some(true),
+                    expected_version: 2,
                 },
                 at,
             )
-            .is_err()
-        );
-        set_finance_pause_tx(
-            &conn,
-            &FinancePauseRequest {
-                new_orders_paused: false,
-                new_topups_paused: Some(true),
-                expected_version: 1,
-            },
-            at,
-        )
-        .unwrap();
-        assert!(finance_readiness_tx(&conn).unwrap().new_topups_paused);
-        assert!(require_new_topups_open_tx(&conn).is_err());
+            .unwrap();
+            require_new_wallet_orders_open_tx(&conn).unwrap();
+            assert!(require_new_topups_open_tx(&conn).is_err());
+        }
     }
 
     #[test]
@@ -11479,24 +11279,18 @@ mod tests {
     }
 
     #[test]
-    fn paid_legacy_supply_blocks_finance_cutover_before_a_contract_exists() {
+    fn legacy_supply_is_not_an_official_topup_readiness_gate() {
         let conn = memory();
+        let before = serde_json::to_value(finance_readiness_tx(&conn).unwrap()).unwrap();
+        conn.execute("INSERT INTO router_ssh_hosts(id,ip,port,host_owner_email,status,created_at,updated_at,daily_rate_minor,currency) VALUES('old-host','192.0.2.10',22,'provider@example.com','idle','2026-10-01','2026-10-01',100,'USD')", []).unwrap();
         conn.execute(
-            "INSERT INTO router_ssh_hosts
-             (id, ip, port, host_owner_email, status, created_at, updated_at,
-              daily_rate_minor, currency)
-             VALUES ('host-1', '192.0.2.10', 22, 'provider@example.com', 'idle',
-                     '2026-10-01', '2026-10-01', 100, 'USD')",
+            "UPDATE router_ssh_hosts SET funding_rail='legacy_provider' WHERE id='old-host'",
             [],
         )
         .unwrap();
-        let readiness = finance_readiness_tx(&conn).unwrap();
-        assert!(!readiness.can_enable);
-        assert!(
-            readiness
-                .legacy_blockers
-                .iter()
-                .any(|blocker| blocker.code == "legacy_client_paid_offers" && blocker.count == 1)
+        assert_eq!(
+            before,
+            serde_json::to_value(finance_readiness_tx(&conn).unwrap()).unwrap()
         );
     }
 
@@ -11547,6 +11341,21 @@ mod tests {
         };
         assert_eq!(
             rails(),
+            ("platform_wallet".into(), "platform_wallet".into())
+        );
+        // Simulate immutable publications made before migration 82.
+        conn.execute(
+            "UPDATE share_market_seats SET funding_rail='legacy_provider' WHERE id='seat'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE router_ssh_hosts SET funding_rail='legacy_provider' WHERE id='host'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            rails(),
             ("legacy_provider".into(), "legacy_provider".into())
         );
         conn.execute(
@@ -11578,16 +11387,6 @@ mod tests {
             rails(),
             ("legacy_provider".into(), "legacy_provider".into())
         );
-        assert_eq!(
-            finance_readiness_tx(&conn)
-                .unwrap()
-                .legacy_blockers
-                .iter()
-                .filter(|blocker| blocker.code.ends_with("paid_offers"))
-                .map(|blocker| blocker.count)
-                .sum::<i64>(),
-            2
-        );
         conn.execute(
             "UPDATE share_market_seats SET daily_rate_minor = 200, offer_revision = offer_revision + 1
              WHERE id = 'seat'",
@@ -11604,30 +11403,18 @@ mod tests {
             rails(),
             ("platform_wallet".into(), "platform_wallet".into())
         );
-        assert!(
-            !finance_readiness_tx(&conn)
-                .unwrap()
-                .legacy_blockers
-                .iter()
-                .any(|blocker| blocker.code.ends_with("paid_offers"))
-        );
     }
 
     #[test]
     fn paid_offer_cannot_cross_payment_rails_without_republication() {
         for product in ["Share", "Client Host"] {
-            assert!(require_current_offer_rail("legacy_provider", false, product).is_ok());
-            assert!(require_current_offer_rail("platform_wallet", true, product).is_ok());
+            assert!(require_current_offer_rail("platform_wallet", product).is_ok());
             assert!(matches!(
-                require_current_offer_rail("legacy_provider", true, product),
+                require_current_offer_rail("legacy_provider", product),
                 Err(AppError::Gone(_))
             ));
             assert!(matches!(
-                require_current_offer_rail("platform_wallet", false, product),
-                Err(AppError::Gone(_))
-            ));
-            assert!(matches!(
-                require_current_offer_rail("unknown", false, product),
+                require_current_offer_rail("unknown", product),
                 Err(AppError::Internal(_))
             ));
         }

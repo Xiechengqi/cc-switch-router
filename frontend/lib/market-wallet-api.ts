@@ -7,7 +7,6 @@ export type MarketFinanceReadiness = {
   newOrdersPaused: boolean;
   newTopupsPaused: boolean;
   codeIntegrated: boolean;
-  legacyBlockers: { code: string; count: number }[];
   criticalCases: number;
   staleTopupReviews: number;
   verifiedLiveTopups: number;

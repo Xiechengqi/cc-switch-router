@@ -1,4 +1,6 @@
-use std::collections::{BTreeSet, HashMap};
+#[cfg(test)]
+use std::collections::BTreeSet;
+use std::collections::HashMap;
 
 use axum::Router;
 use axum::extract::{Path, State};
@@ -12,6 +14,7 @@ use sha2::{Digest, Sha256};
 use crate::ServerState;
 use crate::db::{OptionalExtension, params};
 use crate::error::AppError;
+#[cfg(test)]
 use crate::market_billing::MarketFundingSummaryView;
 use crate::models::AuthSession;
 
@@ -172,6 +175,7 @@ struct InternalProviderView {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg(test)]
 pub struct MarketProviderRecurringFundingView {
     pub active_contract_count: i64,
     pub monthly_commitment_minor: i64,
@@ -182,6 +186,7 @@ pub struct MarketProviderRecurringFundingView {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg(test)]
 pub struct MyMarketProviderFundingView {
     pub market_provider_id: String,
     pub display_name: String,
@@ -198,6 +203,7 @@ pub struct MyMarketProviderFundingView {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg(test)]
 pub struct MyMarketProviderFundingTotalsView {
     pub currency: String,
     pub provider_count: usize,
@@ -211,13 +217,6 @@ pub struct MyMarketProviderFundingTotalsView {
     pub monthly_commitment_minor: i64,
     pub next_renewal_at: Option<String>,
     pub next_renewal_minor: i64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MyMarketProviderFundingResponse {
-    pub totals: MyMarketProviderFundingTotalsView,
-    pub providers: Vec<MyMarketProviderFundingView>,
 }
 
 pub fn router() -> Router<ServerState> {
@@ -679,6 +678,7 @@ async fn require_session(
         .ok_or_else(|| AppError::Unauthorized("authenticated user session required".into()))
 }
 
+#[cfg(test)]
 fn funding_counterparties(
     conn: &crate::db::Connection,
     session: &AuthSession,
@@ -711,42 +711,7 @@ fn funding_counterparties(
     .map_err(map_db("read buyer Market Provider funding relationships"))
 }
 
-fn recurring_funding(
-    conn: &crate::db::Connection,
-    buyer_user_id: &str,
-    supplier_user_id: &str,
-    supplier_email: &str,
-) -> Result<MarketProviderRecurringFundingView, AppError> {
-    let summary = crate::market_recurring::recurring_relationship_summary(
-        conn,
-        buyer_user_id,
-        supplier_user_id,
-    )?;
-    let topup_funding = if summary.next_funding_required_minor > 0 {
-        // This is an exact top-up demand for already-existing contracts, not a
-        // new contract quote. Manual shape intentionally asks for one missing
-        // renewal batch instead of reserving an additional future cycle.
-        Some(crate::market_recurring::recurring_funding_summary_tx(
-            conn,
-            buyer_user_id,
-            supplier_user_id,
-            supplier_email,
-            crate::market_billing::MARKET_CURRENCY,
-            summary.next_funding_required_minor,
-            crate::market_recurring::RENEWAL_MANUAL,
-        )?)
-    } else {
-        None
-    };
-    Ok(MarketProviderRecurringFundingView {
-        active_contract_count: summary.active_contract_count,
-        monthly_commitment_minor: summary.monthly_commitment_minor,
-        next_renewal_at: summary.next_renewal_at,
-        next_renewal_minor: summary.next_renewal_minor,
-        topup_funding,
-    })
-}
-
+#[cfg(test)]
 fn legacy_daily_rates(
     conn: &crate::db::Connection,
     buyer_user_id: &str,
@@ -768,6 +733,7 @@ fn legacy_daily_rates(
     .map_err(map_db("read product-specific legacy daily rates"))
 }
 
+#[cfg(test)]
 fn resolve_funding_provider_identity(
     conn: &crate::db::Connection,
     supplier_user_id: &str,
@@ -803,6 +769,7 @@ fn resolve_funding_provider_identity(
     }
 }
 
+#[cfg(test)]
 fn funding_totals(providers: &[MyMarketProviderFundingView]) -> MyMarketProviderFundingTotalsView {
     fn saturating_sum(values: impl Iterator<Item = i64>) -> i64 {
         values.fold(0i64, i64::saturating_add)
@@ -880,6 +847,7 @@ fn funding_totals(providers: &[MyMarketProviderFundingView]) -> MyMarketProvider
     }
 }
 
+#[cfg(test)]
 fn private_json<T: Serialize>(value: &T) -> Result<Response, AppError> {
     let body = serde_json::to_vec(value).map_err(|error| {
         AppError::Internal(format!("encode private Provider funding failed: {error}"))
@@ -900,104 +868,10 @@ async fn my_market_provider_funding(
     State(state): State<ServerState>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let session = require_session(&state, &headers).await?;
-    let official_email = state
-        .config
-        .official_provider_email()
-        .map(str::to_ascii_lowercase);
-    let now = Utc::now().to_rfc3339();
-    // Materialize every database-backed relationship under one guard. Network
-    // and credential availability checks happen only after the guard is gone.
-    let mut providers = {
-        let conn = state.store.conn.lock().await;
-        if crate::market_payments::wallet_purchase_mode_tx(&conn)? {
-            return Err(AppError::Gone(
-                "Provider-specific funding is retired; use the platform wallet".into(),
-            ));
-        }
-        let counterparties = funding_counterparties(&conn, &session)?;
-        let mut providers = Vec::with_capacity(counterparties.len());
-        let mut resolved_provider_ids = BTreeSet::new();
-        for (supplier_user_id, supplier_email) in counterparties {
-            let (market_provider_id, display_name) =
-                resolve_funding_provider_identity(&conn, &supplier_user_id, &supplier_email)?;
-            if !resolved_provider_ids.insert(market_provider_id.clone()) {
-                return Err(AppError::Conflict(
-                    "multiple funding identities resolve to one Market Provider".into(),
-                ));
-            }
-            let share_funding = crate::market_billing::market_funding_summary_tx(
-                &conn,
-                &session.user_id,
-                &session.email,
-                &supplier_user_id,
-                &supplier_email,
-                "share",
-                "USD",
-                0,
-                &now,
-            )?;
-            let client_funding = crate::market_billing::market_funding_summary_tx(
-                &conn,
-                &session.user_id,
-                &session.email,
-                &supplier_user_id,
-                &supplier_email,
-                "client_host",
-                "USD",
-                0,
-                &now,
-            )?;
-            let (share_legacy_daily_rate_minor, client_legacy_daily_rate_minor) =
-                legacy_daily_rates(&conn, &session.user_id, &supplier_user_id)?;
-            let recurring =
-                recurring_funding(&conn, &session.user_id, &supplier_user_id, &supplier_email)?;
-            let normalized_supplier_email = supplier_email.to_ascii_lowercase();
-            let official = official_email.as_deref() == Some(normalized_supplier_email.as_str());
-            providers.push(MyMarketProviderFundingView {
-                market_provider_id,
-                display_name: if official {
-                    "Official Provider".into()
-                } else {
-                    display_name
-                },
-                official,
-                supplier_user_id,
-                supplier_email: normalized_supplier_email,
-                currency: "USD".into(),
-                share_funding,
-                client_funding,
-                share_legacy_daily_rate_minor,
-                client_legacy_daily_rate_minor,
-                recurring,
-            });
-        }
-        providers
-    };
-    for provider in &mut providers {
-        let unavailable = state
-            .binance_settlement
-            .supplier_funding_unavailable_reason(&state.store, &provider.supplier_user_id)
-            .await?
-            .map(str::to_string);
-        provider.share_funding.topup_available = unavailable.is_none();
-        provider.share_funding.topup_unavailable_reason = unavailable.clone();
-        provider.client_funding.topup_available = unavailable.is_none();
-        provider.client_funding.topup_unavailable_reason = unavailable;
-        if let Some(topup) = &mut provider.recurring.topup_funding {
-            topup.topup_available = provider.share_funding.topup_available;
-            topup.topup_unavailable_reason =
-                provider.share_funding.topup_unavailable_reason.clone();
-        }
-    }
-    providers.sort_by(|left, right| {
-        left.display_name
-            .cmp(&right.display_name)
-            .then_with(|| left.market_provider_id.cmp(&right.market_provider_id))
-    });
-
-    let totals = funding_totals(&providers);
-    private_json(&MyMarketProviderFundingResponse { totals, providers })
+    require_session(&state, &headers).await?;
+    Err(AppError::Gone(
+        "Provider-specific funding is retired; use the platform wallet".into(),
+    ))
 }
 
 #[cfg(test)]

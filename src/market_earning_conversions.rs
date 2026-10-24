@@ -6,7 +6,9 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     routing::{get, post},
 };
-use chrono::{DateTime, Duration, Utc};
+#[cfg(test)]
+use chrono::Utc;
+use chrono::{DateTime, Duration};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -84,13 +86,6 @@ pub(crate) fn capacity_tx(conn: &Connection, user: &str, at: &str) -> Result<Cap
     ).map_err(db_error("read conversion user"))?;
     if !verified || !crate::market_provider_finance::can_manage_earnings_tx(conn, user)? {
         blockers.push("identity");
-    }
-    let mode: bool = conn.query_row(
-        "SELECT mode = 'enabled' AND cutover_approved_at IS NOT NULL FROM market_finance_control WHERE id = 1",
-        [], |r| r.get(0),
-    ).map_err(db_error("read conversion finance mode"))?;
-    if !mode {
-        blockers.push("not_open");
     }
     // The obsolete manual-conversion pause never prevents automatic credit.
     match crate::market_reconcile::ensure_finance_scopes_safe_tx(
@@ -673,9 +668,6 @@ pub(crate) fn credit_due_earnings_isolated(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin automatic earnings credit"))?;
-    if !crate::market_payments::wallet_purchase_mode_tx(&tx)? {
-        return Ok(0);
-    }
     let cursor: String = tx
         .query_row(
             "SELECT earning_settlement_cursor FROM market_finance_control WHERE id=1",
@@ -1301,6 +1293,10 @@ mod tests {
     fn identity_mode_pause_and_freeze_checks_are_independent_of_payout_address_and_gateway() {
         let (conn, contract) = fixture(1000, "share");
         assert!(capacity_tx(&conn, "provider", AT).unwrap().can_convert);
+        for mode in ["disabled", "shadow", "enabled"] {
+            conn.execute("UPDATE market_finance_control SET mode=?1,cutover_approved_at=NULL,new_orders_paused=1,new_topups_paused=1",params![mode]).unwrap();
+            assert!(capacity_tx(&conn, "provider", AT).unwrap().can_convert);
+        }
         assert_eq!(
             number(&conn, "SELECT COUNT(*) FROM market_payout_destinations"),
             0
@@ -1342,6 +1338,22 @@ mod tests {
                 .convertible_units
                 == 0
         );
+    }
+    #[test]
+    fn automatic_matured_credit_runs_in_shadow_and_disabled_without_a_gateway() {
+        for mode in ["shadow", "disabled"] {
+            let (conn, _) = fixture(1000, "share");
+            conn.execute("UPDATE market_finance_control SET mode=?1,cutover_approved_at=NULL,new_orders_paused=1,new_topups_paused=1",params![mode]).unwrap();
+            assert!(credit_due_earnings_isolated(&conn, AT, 100).unwrap() > 0);
+            assert!(
+                crate::market_wallet::wallet_snapshot_tx(&conn, "provider")
+                    .unwrap()
+                    .available_units
+                    > 0
+            );
+            assert_eq!(credit_due_earnings_isolated(&conn, AT, 100).unwrap(), 0);
+            verify_balances_tx(&conn, "provider").unwrap();
+        }
     }
     #[test]
     fn consent_ownership_expiry_and_oversized_or_ambiguous_amounts_are_rejected() {

@@ -4,13 +4,15 @@ import type { MessageKey } from "@/lib/i18n";
 import { parseNonNegativeUsdMinor } from "@/lib/market-wallet-money";
 
 export type C2CPolicy = { version: number; enabled: boolean; admissionMinor: number; minMinor: number; maxMinor: number; paymentMinutes: number };
-export type C2CPolicyView = { policy: C2CPolicy; available: boolean; verified: boolean; termsVersion: number; claimGraceSeconds: number; firstPurchaseMaxMinor: number };
+export const C2C_BLOCKERS = ["C2C_DISABLED", "C2C_TRANSFERS_DISABLED", "C2C_TRANSFERS_PAUSED", "C2C_ACCOUNT_INACTIVE", "C2C_IDENTITY", "C2C_FINANCE_HOLD", "C2C_SUSPENDED", "C2C_ADMISSION", "C2C_EMAIL_UNAVAILABLE"] as const;
+export type C2CBlocker = (typeof C2C_BLOCKERS)[number];
+export type C2CPolicyView = { policy: C2CPolicy; available: boolean; blockers: C2CBlocker[]; canManagePolicy: boolean; verified: boolean; termsVersion: number; claimGraceSeconds: number; firstPurchaseMaxMinor: number };
 export type C2CSeller = {
   userId: string; version: number; enabled: boolean; suspended: boolean; displayName: string; description: string;
   currency: "USD" | "CNY"; priceBps: number; minMinor: number; maxMinor: number; heartbeatAt: string;
 };
 export type C2CSellerInput = Omit<C2CSeller, "userId" | "version" | "suspended" | "heartbeatAt" | "displayName"> & { expectedVersion: number; acknowledgeExternalPayment: boolean };
-export type C2CSellerSnapshot = { seller: C2CSeller | null; admissionBalanceUnits: string; availableUnits: string };
+export type C2CSellerSnapshot = { seller: C2CSeller | null; admissionBalanceUnits: string; availableUnits: string; blockers: C2CBlocker[]; canEnable: boolean };
 export type C2COffer = Pick<C2CSeller, "version" | "displayName" | "description" | "currency" | "priceBps" | "minMinor" | "maxMinor"> & {
   sellerId: string; availableMinor: number; completedOrders: number;
 };
@@ -81,6 +83,10 @@ function validUnits(v: unknown): v is string {
   return typeof v === "string" && /^(0|[1-9]\d{0,18})$/.test(v) && BigInt(v) <= 9_223_372_036_854_775_807n;
 }
 function invalid(): never { throw new Error("Invalid C2C response; reload to retry"); }
+export function validC2CCapability(blockers: C2CBlocker[], available: boolean) {
+  if (!Array.isArray(blockers) || blockers.some(code => !C2C_BLOCKERS.includes(code))
+    || new Set(blockers).size !== blockers.length || typeof available !== "boolean" || available !== !blockers.length) invalid();
+}
 function validTerms(creditMinor: number, payMinor: number, code: string, fx: number, bps: number) {
   if (!integer(creditMinor) || creditMinor > 10_000_000 || !integer(payMinor) || !currency(code) || !integer(fx)
     || (code === "USD" && fx !== 1_000_000) || !integer(bps) || bps < 5000 || bps > 20000) invalid();
@@ -141,11 +147,14 @@ async function request<T>(path: string, body?: unknown, method = "POST", key?: s
 export async function getC2CPolicy() {
   const p = await request<C2CPolicyView>(`${BASE}/policy`); validC2CPolicy(p?.policy);
   if (typeof p.available !== "boolean" || typeof p.verified !== "boolean" || p.termsVersion !== 1 || p.claimGraceSeconds !== 120 || p.firstPurchaseMaxMinor !== 10000) invalid();
+  validC2CCapability(p.blockers, p.available);
+  if (typeof p.canManagePolicy !== "boolean") invalid();
   return p;
 }
 export async function getC2CSeller() {
   const p = await request<C2CSellerSnapshot>(`${BASE}/seller`);
   if (!p || !validUnits(p.admissionBalanceUnits) || !validUnits(p.availableUnits)) invalid();
+  validC2CCapability(p.blockers, p.canEnable);
   if (p.seller !== null) validC2CSeller(p.seller);
   return p;
 }
@@ -211,10 +220,19 @@ export function writeC2CPending(storage: Pick<Storage, "getItem" | "setItem">, p
   if (readC2CPending(storage, p.actor)?.key !== p.key) invalid();
 }
 export function c2cDefinitelyRejected(cause: unknown) {
-  return cause instanceof ApiError && cause.status === 409 && ["C2C_STALE", "C2C_STOCK", "C2C_PAUSED", "C2C_TERMS", "C2C_FIRST_ORDER_LIMIT", "C2C_ORDER_LIMIT", "C2C_SELLER_UNAVAILABLE", "C2C_EMAIL_UNAVAILABLE", "MARKET_FINANCE_HOLD"].includes(cause.code ?? "");
+  return cause instanceof ApiError && cause.status === 409 && [...C2C_BLOCKERS, "C2C_STALE", "C2C_STOCK", "C2C_PAUSED", "C2C_TERMS", "C2C_FIRST_ORDER_LIMIT", "C2C_ORDER_LIMIT", "C2C_SELLER_UNAVAILABLE", "MARKET_FINANCE_HOLD"].includes(cause.code ?? "");
+}
+export function c2cBlockerKey(code: C2CBlocker): MessageKey {
+  const keys: Record<C2CBlocker, MessageKey> = {
+    C2C_DISABLED: "c2c.error.disabled", C2C_TRANSFERS_DISABLED: "c2c.error.transfersDisabled", C2C_TRANSFERS_PAUSED: "c2c.error.transfersPaused",
+    C2C_ACCOUNT_INACTIVE: "c2c.error.inactive", C2C_IDENTITY: "c2c.error.identity", C2C_FINANCE_HOLD: "c2c.error.hold",
+    C2C_SUSPENDED: "c2c.error.suspended", C2C_ADMISSION: "c2c.error.admission", C2C_EMAIL_UNAVAILABLE: "c2c.error.email",
+  };
+  return keys[code];
 }
 export function c2cErrorKey(cause: unknown): MessageKey {
   const code = cause instanceof ApiError ? cause.code : null;
+  if (C2C_BLOCKERS.includes(code as C2CBlocker)) return c2cBlockerKey(code as C2CBlocker);
   if (cause instanceof ApiError && cause.status === 429) return "c2c.error.rate";
   const map: Record<string, MessageKey> = {
     C2C_STALE: "c2c.error.stale", C2C_STOCK: "c2c.error.stock", C2C_PAUSED: "c2c.error.paused", C2C_ADMISSION: "c2c.error.admission",

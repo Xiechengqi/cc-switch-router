@@ -40,6 +40,117 @@ fn offer(c: &Connection) {
     save_seller_tx(c, "seller", &terms(), AT).unwrap();
 }
 #[test]
+fn c2c_uses_shared_transfer_controls_not_official_topup_modes_or_market_pauses() {
+    let c = fixture();
+    for (index, mode) in ["disabled", "shadow", "enabled"].iter().enumerate() {
+        c.execute("UPDATE market_finance_control SET mode=?1,cutover_approved_at=NULL,new_orders_paused=1,new_topups_paused=1", params![mode]).unwrap();
+        assert!(participation_blockers_tx(&c, "seller").unwrap().is_empty());
+        let mut settings = terms();
+        settings.expected_version = index as i64;
+        save_seller_tx(&c, "seller", &settings, AT).unwrap();
+        let o = order(&c, 100);
+        c.execute("UPDATE market_wallet_policy SET transfers_paused=1", [])
+            .unwrap();
+        assert_eq!(
+            opening_blockers_tx(&c).unwrap(),
+            vec!["C2C_TRANSFERS_PAUSED"]
+        );
+        assert!(preview_result(&c).is_err());
+        let o = paid(&c, &o);
+        // Pauses fence only new obligations: an existing reservation still delivers.
+        transaction(&c, |c| release_tx(c, &o, "seller", AT)).unwrap();
+        c.execute(
+            "UPDATE market_wallet_policy SET transfers_paused=0,transfers_enabled=0",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            opening_blockers_tx(&c).unwrap(),
+            vec!["C2C_TRANSFERS_DISABLED"]
+        );
+        assert!(preview_result(&c).is_err());
+        c.execute("UPDATE market_wallet_policy SET transfers_enabled=1", [])
+            .unwrap();
+        crate::market_wallet::reconcile_wallet_tx(&c, "seller").unwrap();
+        crate::market_wallet::reconcile_wallet_tx(&c, "buyer").unwrap();
+    }
+    c.execute("UPDATE market_c2c_policy SET enabled=0", [])
+        .unwrap();
+    assert_eq!(opening_blockers_tx(&c).unwrap(), vec!["C2C_DISABLED"]);
+    assert!(offers_tx(&c, "buyer", "", AT).unwrap().0.is_empty());
+}
+
+#[test]
+fn seller_capability_and_publication_share_exact_admission_and_hold_rules() {
+    let c = fixture();
+    c.execute("UPDATE market_c2c_policy SET admission_minor=20001", [])
+        .unwrap();
+    assert_eq!(
+        seller_blockers_tx(&c, "seller", AT).unwrap(),
+        vec!["C2C_ADMISSION"]
+    );
+    assert_eq!(
+        save_seller_tx(&c, "seller", &terms(), AT)
+            .unwrap_err()
+            .code(),
+        Some("C2C_ADMISSION")
+    );
+    c.execute("UPDATE market_c2c_policy SET admission_minor=20000", [])
+        .unwrap();
+    assert!(seller_blockers_tx(&c, "seller", AT).unwrap().is_empty());
+    offer(&c); // equality qualifies; no admission reserve is created.
+    assert_eq!(wallet_snapshot_tx(&c, "seller").unwrap().held_units, 0);
+    let o = order(&c, 1000);
+    assert!(
+        seller_blockers_tx(&c, "seller", AT).unwrap().is_empty(),
+        "existing sellers can edit below admission"
+    );
+    let reserved = wallet_snapshot_tx(&c, "seller").unwrap().held_units;
+    crate::market_reconcile::case_tx(&c, "wallet_projection_mismatch", "wallet", "seller", AT)
+        .unwrap();
+    assert!(
+        seller_blockers_tx(&c, "seller", AT)
+            .unwrap()
+            .contains(&"C2C_FINANCE_HOLD")
+    );
+    let mut edit = terms();
+    edit.expected_version = 1;
+    assert_eq!(
+        save_seller_tx(&c, "seller", &edit, AT).unwrap_err().code(),
+        Some("C2C_FINANCE_HOLD")
+    );
+    assert_eq!(
+        wallet_snapshot_tx(&c, "seller").unwrap().held_units,
+        reserved
+    );
+    assert!(
+        participation_blockers_tx(&c, "buyer").unwrap().is_empty(),
+        "a seller hold does not block unrelated users"
+    );
+    c.execute(
+        "UPDATE market_c2c_sellers SET suspended=1 WHERE user_id='seller'",
+        [],
+    )
+    .unwrap();
+    assert!(
+        seller_blockers_tx(&c, "seller", AT)
+            .unwrap()
+            .contains(&"C2C_SUSPENDED")
+    );
+    c.execute("UPDATE users SET status='blocked' WHERE id='seller'", [])
+        .unwrap();
+    assert!(
+        seller_blockers_tx(&c, "seller", AT)
+            .unwrap()
+            .contains(&"C2C_ACCOUNT_INACTIVE")
+    );
+    assert_eq!(
+        save_seller_tx(&c, "seller", &edit, AT).unwrap_err().code(),
+        Some("C2C_ACCOUNT_INACTIVE")
+    );
+    assert_eq!(order_tx(&c, &o.id).unwrap().status, "awaiting_payment");
+}
+#[test]
 fn one_public_description_is_required_and_seller_identity_is_server_owned() {
     let c = fixture();
     let mut input = terms();

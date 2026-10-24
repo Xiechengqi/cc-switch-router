@@ -44,6 +44,7 @@ export type TransferCapacity = {
   dailyRemainingUnits: string;
   enabled: boolean;
   verified: boolean;
+  blockers: ("disabled" | "paused" | "identity" | "finance_hold" | "email_unavailable")[];
 };
 export type TransferQuote = {
   id: string;

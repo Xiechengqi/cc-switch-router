@@ -279,6 +279,14 @@ const MIGRATIONS: &[(i64, &str)] = &[
         80,
         include_str!("../schema/0080_market_c2c_description.sql"),
     ),
+    (
+        81,
+        include_str!("../schema/0081_email_session_verification.sql"),
+    ),
+    (
+        82,
+        include_str!("../schema/0082_market_topup_mode_isolation.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -790,6 +798,144 @@ mod tests {
 
     fn memory_connection() -> Connection {
         Connection::open_in_memory().expect("open test database")
+    }
+
+    #[test]
+    fn migration_82_isolates_new_publication_rails_without_rewriting_existing_offers() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 81);
+        conn.execute_batch("INSERT INTO share_market_listings
+            (id,share_id,installation_id,owner_user_id,owner_email,status,created_at,updated_at)
+            VALUES ('listing','share','installation','provider','provider@example.test','active','t','t');
+            INSERT INTO share_market_seats
+            (id,listing_id,position,status,token_period_json,daily_rate_minor,currency,created_at,updated_at)
+            VALUES ('old-seat','listing',1,'available','null',100,'USD','t','t');
+            INSERT INTO router_ssh_hosts
+            (id,ip,port,host_owner_email,status,created_at,updated_at,daily_rate_minor,currency)
+            VALUES ('old-host','192.0.2.10',22,'provider@example.test','idle','t','t',100,'USD');").unwrap();
+        let rail = |table: &str, id: &str| -> String {
+            conn.query_row(
+                &format!("SELECT funding_rail FROM {table} WHERE id=?1"),
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(rail("share_market_seats", "old-seat"), "legacy_provider");
+        assert_eq!(rail("router_ssh_hosts", "old-host"), "legacy_provider");
+        apply(&conn).unwrap();
+        for (i, mode) in ["disabled", "shadow", "enabled"].iter().enumerate() {
+            conn.execute(
+                "UPDATE market_finance_control SET mode=?1,cutover_approved_at=NULL WHERE id=1",
+                params![mode],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO share_market_seats
+                (id,listing_id,position,status,token_period_json,daily_rate_minor,currency,created_at,updated_at)
+                VALUES (?1,'listing',?2,'available','null',100,'USD','t','t')", params![mode, i as i64 + 2]).unwrap();
+            conn.execute(
+                "INSERT INTO router_ssh_hosts
+                (id,ip,port,host_owner_email,status,created_at,updated_at,daily_rate_minor,currency)
+                VALUES (?1,?2,22,'provider@example.test','idle','t','t',100,'USD')",
+                params![mode, format!("192.0.2.{}", i + 20)],
+            )
+            .unwrap();
+            assert_eq!(rail("share_market_seats", mode), "platform_wallet");
+            assert_eq!(rail("router_ssh_hosts", mode), "platform_wallet");
+            assert_eq!(rail("share_market_seats", "old-seat"), "legacy_provider");
+            assert_eq!(rail("router_ssh_hosts", "old-host"), "legacy_provider");
+        }
+        conn.execute_batch(
+            "UPDATE share_market_seats SET status='reserved' WHERE id='old-seat';
+            UPDATE router_ssh_hosts SET status='locked' WHERE id='old-host';",
+        )
+        .unwrap();
+        assert_eq!(rail("share_market_seats", "old-seat"), "legacy_provider");
+        assert_eq!(rail("router_ssh_hosts", "old-host"), "legacy_provider");
+        conn.execute_batch(
+            "UPDATE share_market_seats SET daily_rate_minor=100 WHERE id='old-seat';
+            UPDATE router_ssh_hosts SET daily_rate_minor=100 WHERE id='old-host';",
+        )
+        .unwrap();
+        assert_eq!(rail("share_market_seats", "old-seat"), "platform_wallet");
+        assert_eq!(rail("router_ssh_hosts", "old-host"), "platform_wallet");
+        apply(&conn).unwrap();
+    }
+
+    #[test]
+    fn migration_81_restores_only_active_users_with_valid_unrevoked_email_sessions() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 80);
+        let now = Utc::now();
+        let future = (now + chrono::Duration::days(1)).to_rfc3339();
+        let past = (now - chrono::Duration::days(1)).to_rfc3339();
+        for id in [
+            "valid",
+            "client",
+            "revoked",
+            "expired",
+            "blocked",
+            "email-only",
+            "api-only",
+            "already",
+        ] {
+            conn.execute("INSERT INTO users(id,email_normalized,status,created_at,last_login_at) VALUES(?1,?2,?3,?4,?4)",
+                params![id,format!("{id}@example.test"),if id=="blocked" {"blocked"} else {"active"},past]).unwrap();
+            if !matches!(id, "email-only" | "api-only") {
+                conn.execute("INSERT INTO user_sessions(id,user_id,auth_source_kind,auth_source_id,access_token_hash,refresh_token_hash,access_expires_at,refresh_expires_at,revoked_at,created_at,last_used_at)
+                    VALUES(?1,?1,?2,'source',?1,?1,?3,?4,?5,?3,?3)",
+                    params![id,if id=="client" {"client_installation"} else {"auth_device"},past,if id=="expired" {&past} else {&future},(id=="revoked").then_some(&past)]).unwrap();
+            }
+        }
+        conn.execute(
+            "UPDATE users SET email_verified_at='2020-01-01T00:00:00Z' WHERE id='already'",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO user_api_tokens(id,user_id,name,token_hash,token_prefix,scopes_json,created_at) VALUES('api','api-only','default','api','api','[]',?1)",params![past]).unwrap();
+        // Consumed challenges may already have been pruned. Sessions suffice.
+        apply(&conn).unwrap();
+        for id in ["valid", "client", "already"] {
+            assert!(
+                conn.query_row(
+                    "SELECT email_verified_at IS NOT NULL FROM users WHERE id=?1",
+                    params![id],
+                    |r| r.get::<_, bool>(0)
+                )
+                .unwrap()
+            );
+        }
+        for id in ["revoked", "expired", "blocked", "email-only", "api-only"] {
+            assert!(
+                !conn
+                    .query_row(
+                        "SELECT email_verified_at IS NOT NULL FROM users WHERE id=?1",
+                        params![id],
+                        |r| r.get::<_, bool>(0)
+                    )
+                    .unwrap(),
+                "{id}"
+            );
+        }
+        assert_eq!(
+            conn.query_row(
+                "SELECT email_verified_at FROM users WHERE id='already'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "2020-01-01T00:00:00Z"
+        );
+        assert!(
+            !conn
+                .query_row(
+                    "SELECT enabled FROM market_c2c_policy WHERE id=1",
+                    [],
+                    |r| r.get::<_, bool>(0)
+                )
+                .unwrap()
+        );
+        apply(&conn).unwrap();
     }
 
     #[test]

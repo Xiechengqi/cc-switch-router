@@ -6,28 +6,17 @@ import { CircleAlert, CircleCheck, Loader2, RefreshCw } from "lucide-react";
 import * as React from "react";
 
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { getAccountPaymentProfile, getMarketBillingDashboard } from "@/lib/api";
-import {
-  PROVIDER_INCOME_HREF,
-  DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH,
-} from "@/lib/dashboard-nav";
-import { MARKET_CURRENCY } from "@/lib/market-money";
-import { getMarketProviderFinance, getMarketWallet } from "@/lib/market-wallet-api";
+import { DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH } from "@/lib/dashboard-nav";
+import { getMarketProviderFinance } from "@/lib/market-wallet-api";
 
 export type PaidOfferReadiness = {
   status: "idle" | "loading" | "loaded" | "error";
-  paymentReady: boolean;
-  settlementReady: boolean;
-  rail: "legacy" | "wallet" | null;
-  walletSetup: "ready" | "provider" | null;
+  providerReady: boolean;
 };
 
 const INITIAL_READINESS: PaidOfferReadiness = {
   status: "idle",
-  paymentReady: false,
-  settlementReady: false,
-  rail: null,
-  walletSetup: null,
+  providerReady: false,
 };
 
 export function usePaidOfferReadiness(enabled: boolean) {
@@ -38,41 +27,20 @@ export function usePaidOfferReadiness(enabled: boolean) {
     const request = ++requestRef.current;
     setReadiness((current) => ({ ...current, status: "loading" }));
     try {
-      const wallet = await getMarketWallet();
-      if (wallet.mode === "enabled") {
-        const finance = await getMarketProviderFinance();
-        if (request !== requestRef.current) return;
-        const walletSetup = finance.canPublishPaidOffers ? "ready" : "provider";
-        setReadiness({
-          status: "loaded",
-          rail: "wallet",
-          walletSetup,
-          paymentReady: true,
-          settlementReady: walletSetup === "ready",
-        });
-        return;
-      }
-      const [payment, billing] = await Promise.all([
-        getAccountPaymentProfile(), getMarketBillingDashboard(),
-      ]);
+      // Paid publication uses the Provider identity, not official recharge
+      // availability or retired direct-payment/settlement profiles.
+      const finance = await getMarketProviderFinance();
+      if (typeof finance.canPublishPaidOffers !== "boolean") throw new Error("Invalid Provider readiness");
       if (request !== requestRef.current) return;
       setReadiness({
         status: "loaded",
-        paymentReady: payment.methods.length > 0,
-        settlementReady: billing.supplierProfiles.some(
-          (profile) => profile.currency === MARKET_CURRENCY,
-        ),
-        rail: "legacy",
-        walletSetup: null,
+        providerReady: finance.canPublishPaidOffers,
       });
     } catch {
       if (request !== requestRef.current) return;
       setReadiness({
         status: "error",
-        paymentReady: false,
-        settlementReady: false,
-        rail: null,
-        walletSetup: null,
+        providerReady: false,
       });
     }
   }, []);
@@ -94,20 +62,9 @@ export function usePaidOfferReadiness(enabled: boolean) {
     blocked:
       enabled &&
       (readiness.status !== "loaded" ||
-        !readiness.paymentReady ||
-        !readiness.settlementReady),
+        !readiness.providerReady),
     reload,
   };
-}
-
-function ReadinessLine({ ready, children }: { ready: boolean; children: React.ReactNode }) {
-  const Icon = ready ? CircleCheck : CircleAlert;
-  return (
-    <span className="inline-flex min-w-0 items-center gap-1.5">
-      <Icon className={ready ? "h-4 w-4 shrink-0 text-emerald-600" : "h-4 w-4 shrink-0 text-amber-700"} />
-      <span className="min-w-0">{children}</span>
-    </span>
-  );
 }
 
 export function PaidOfferReadinessNotice({
@@ -139,7 +96,7 @@ export function PaidOfferReadinessNotice({
     );
   }
 
-  const ready = readiness.paymentReady && readiness.settlementReady;
+  const ready = readiness.providerReady;
   return (
     <div role={ready ? "status" : "alert"} className={ready
       ? "flex items-center gap-2 rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2.5 text-sm text-emerald-800"
@@ -150,43 +107,13 @@ export function PaidOfferReadinessNotice({
           <CircleCheck className="h-4 w-4 shrink-0" />
           {t("shareMarket.paidReadiness.ready")}
         </>
-      ) : readiness.rail === "wallet" ? (
-        <>
-          <strong>{t("shareMarket.paidReadiness.title")}</strong>
-          <ReadinessLine ready={false}>
-            {t(`shareMarket.paidReadiness.wallet.${readiness.walletSetup || "provider"}`)}
-          </ReadinessLine>
-          <Link className="whitespace-nowrap font-medium underline underline-offset-2" href={DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH}>
-            {t("shareMarket.paidReadiness.goProvider")}
-          </Link>
-        </>
       ) : (
         <>
           <strong>{t("shareMarket.paidReadiness.title")}</strong>
-          <div className="grid gap-1.5 sm:grid-cols-2">
-            <ReadinessLine ready={readiness.paymentReady}>
-              {readiness.paymentReady
-                ? t("shareMarket.paidReadiness.paymentReady")
-                : t("shareMarket.paidReadiness.paymentMissing")}
-            </ReadinessLine>
-            <ReadinessLine ready={readiness.settlementReady}>
-              {readiness.settlementReady
-                ? t("shareMarket.paidReadiness.settlementReady")
-                : t("shareMarket.paidReadiness.settlementMissing")}
-            </ReadinessLine>
-          </div>
-          <div className="flex flex-wrap gap-x-4 gap-y-1">
-            {!readiness.paymentReady ? (
-              <Link className="whitespace-nowrap font-medium underline underline-offset-2" href={DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH}>
-                {t("shareMarket.paidReadiness.goPayments")}
-              </Link>
-            ) : null}
-            {!readiness.settlementReady ? (
-              <Link className="whitespace-nowrap font-medium underline underline-offset-2" href={PROVIDER_INCOME_HREF}>
-                {t("shareMarket.paidReadiness.goSettlement")}
-              </Link>
-            ) : null}
-          </div>
+          <span>{t("shareMarket.paidReadiness.wallet.provider")}</span>
+          <Link className="whitespace-nowrap font-medium underline underline-offset-2" href={DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH}>
+            {t("shareMarket.paidReadiness.goProvider")}
+          </Link>
         </>
       )}
     </div>

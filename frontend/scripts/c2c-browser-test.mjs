@@ -21,9 +21,13 @@ const base = `http://127.0.0.1:${server.address().port}`;
 let browser;
 try {
   browser = await chromium.launch({ executablePath: process.env.CHROME_BIN || "/usr/bin/google-chrome", headless: true, args: ["--no-sandbox"] });
-  const errors = []; const orders = []; const keys = []; let counter = 0; let quoteCounter = 0; let quoteLifetimeMs = 300000; let uncertain = false; let heartbeat = 0; let released = 0; let resolution = 0;
+  const errors = []; const orders = []; const keys = []; const loginCodeRequests = []; let counter = 0; let quoteCounter = 0; let quoteLifetimeMs = 300000; let uncertain = false; let heartbeat = 0; let released = 0; let resolution = 0;
   let policy = { version: 1, enabled: true, admissionMinor: 10000, minMinor: 100, maxMinor: 500000, paymentMinutes: 30 };
   let profile = null; let sellerUnits = "1728000000"; let available = true; let pauseCount = 0; let financeFailure = false; let sellerReadFailure = false; let heldIncome = false;
+  let topupMode = "shadow"; let publicationReady = true; let retiredSetupRequests = 0; let offerWrites = 0;
+  const publicationHost = { id: "publication-host", providerId: "seller", hostOwnerEmail: "seller@example.invalid", ip: "192.0.2.50", hostname: "Publication Host", port: 22,
+    countryCode: "JP", status: "idle", isHostOwner: true, pricingModel: "prepaid_calendar_month", cyclePriceMinor: 1000, billingInterval: "calendar_month",
+    currency: "USD", offerRevision: 1, paymentMethodKinds: [], contacts: [], eligibility: { allowed: true }, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
   const description = "Bank transfer · contact @seller · https://seller.example.invalid/pay · <b>plain text</b>";
   const seller = { sellerId: "seller", version: 1, displayName: "C2C-123456abcdef", description, currency: "USD", priceBps: 10000, minMinor: 100, maxMinor: 10000, availableMinor: 20000, completedOrders: 0 };
   const overview = Object.fromEntries(["walletPostedUnits", "walletHeldUnits", "unfulfilledUnits", "providerPendingUnits", "providerAvailableUnits", "providerHeldUnits", "buyerRefundHeldUnits", "ownerLossUnits", "maintenanceRevenueUnits"].map(k => [k, "0"]));
@@ -42,14 +46,25 @@ try {
     const json = (route, value, status = 200) => route.fulfill({ status, contentType: "application/json", headers: { "x-router-server-time": new Date().toISOString() }, body: JSON.stringify(value) });
     await context.route("**/v1/**", async route => {
       const request = route.request(); const url = new URL(request.url()); const p = url.pathname; const body = request.postData() ? request.postDataJSON() : {};
+      if (p.startsWith("/v1/auth/") && p !== "/v1/auth/session/me") loginCodeRequests.push(p);
       if (p === "/v1/auth/session/me") return json(route, { authenticated: true, isAdmin: admin, user: { id: actor, email: `${actor}@example.invalid` } });
       if (p === "/v1/regions") return json(route, []);
       if (p === "/v1/announcement") return json(route, { enabled: false, revision: "1", contentEn: "", contentZhCn: "" });
       if (p === "/v1/map-display") return json(route, { showFlows: true, showHeat: true, viewport: { visibleStartPx: 90 }, revision: "1" });
       if (p === "/v1/market-billing/config") return json(route, { usdCnyRateMicros: 7000000, fxRateFresh: true });
-      if (p === "/v1/market-wallet") return json(route, { assetCode: "USD", postedUnits: actor === "seller" ? "1728000000" : "0", heldUnits: "0", availableUnits: actor === "seller" ? "1728000000" : "0", version: 1, mode: "enabled", canTopup: true, hasWalletActivity: false });
+      if (p === "/v1/market-wallet") return json(route, { assetCode: "USD", postedUnits: actor === "seller" ? "1728000000" : "0", heldUnits: "0", availableUnits: actor === "seller" ? "1728000000" : "0", version: 1, mode: topupMode, canTopup: false, hasWalletActivity: false });
+      if (p === "/v1/market-wallet/transfer-capacity") return json(route, { transferableUnits: actor === "seller" ? sellerUnits : "0", committedUnits: "0", dailyRemainingUnits: "43200000000", enabled: true, verified: true, blockers: [] });
+      if (p === "/v1/market-wallet/commission-policy") return json(route, { version: 1, current: { policyVersion: 1, rateBps: 1000, effectiveAt: "2026-01-01T00:00:00Z" }, scheduled: null, increaseNoticeDays: 7, canEdit: false });
+      if (["/v1/account/payment-profile", "/v1/market-billing/dashboard"].includes(p)) { retiredSetupRequests++; return json(route, { message: "retired setup" }, 410); }
+      if (p === "/v1/client-market/hosts") return json(route, [publicationHost]);
+      if (p === "/v1/client-market/my-rentals") return json(route, []);
+      if (p === "/v1/client-market/hosts/publication-host/offer" && request.method() === "PATCH") {
+        assert.deepEqual(body, { cyclePriceMinor: 1000, currency: "USD" }); offerWrites++; publicationHost.offerRevision++;
+        return json(route, { ...publicationHost, hostId: publicationHost.id });
+      }
       if (p.endsWith("/channels") || p === "/v1/admin/market-payment-channels") return json(route, []);
-      if (p === "/v1/market-wallet/c2c/policy") return json(route, { policy, available: available && policy.enabled, verified: true, termsVersion: 1, claimGraceSeconds: 120, firstPurchaseMaxMinor: 10000 });
+      const blockers = [...(!policy.enabled ? ["C2C_DISABLED"] : []), ...(!available ? ["C2C_TRANSFERS_PAUSED"] : [])];
+      if (p === "/v1/market-wallet/c2c/policy") return json(route, { policy, available: !blockers.length, blockers, canManagePolicy: admin, verified: true, termsVersion: 1, claimGraceSeconds: 120, firstPurchaseMaxMinor: 10000 });
       if (p === "/v1/market-wallet/c2c/sellers") return json(route, { items: [seller], next: null });
       if (p === "/v1/market-wallet/c2c/seller/heartbeat") { heartbeat++; return json(route, { ok: true }); }
       if (p === "/v1/market-wallet/c2c/seller/pause") {
@@ -67,7 +82,8 @@ try {
           return json(route, profile);
         }
         if (sellerReadFailure) return json(route, { message: "Seller settings temporarily unavailable" }, 503);
-        return json(route, { seller: actor === "seller" ? profile : null, admissionBalanceUnits: sellerUnits, availableUnits: sellerUnits });
+        const sellerBlockers = [...blockers, ...(!profile?.enabled && BigInt(sellerUnits) < BigInt(policy.admissionMinor) * 86400n ? ["C2C_ADMISSION"] : [])];
+        return json(route, { seller: actor === "seller" ? profile : null, admissionBalanceUnits: sellerUnits, availableUnits: sellerUnits, blockers: sellerBlockers, canEnable: !sellerBlockers.length });
       }
       if (p === "/v1/market-wallet/c2c/quotes") {
         latestQuote = { id: `quote-${++quoteCounter}`, sellerId: "seller", sellerName: seller.displayName, sellerVersion: 1, creditMinor: body.amountMinor, payMinor: body.amountMinor, currency: "USD", fxMicros: 1000000, priceBps: 10000, description, expiresAt: new Date(Date.now() + quoteLifetimeMs).toISOString() };
@@ -100,7 +116,7 @@ try {
         o.version++; o.updatedAt = new Date().toISOString(); return json(route, o);
       }
       if (p === "/v1/admin/settings") return json(route, { revision: "1", generatedAt: new Date().toISOString(), envPath: "/test/.env", schema: { categories: [{ id: "marketplace", label: "Marketplace", description: "Marketplace", fieldCount: 0 }], fields: [], groups: [] }, values: [], pendingRestartKeys: [] });
-      if (p === "/v1/admin/market-finance/readiness") return json(route, { mode: "enabled", version: 1, newOrdersPaused: false, newTopupsPaused: false, codeIntegrated: true, legacyBlockers: [], criticalCases: 0, staleTopupReviews: 0, verifiedLiveTopups: 1, paymentChannelBlockers: [], canEnable: false });
+      if (p === "/v1/admin/market-finance/readiness") return json(route, { mode: "shadow", version: 1, newOrdersPaused: false, newTopupsPaused: false, codeIntegrated: true, criticalCases: 0, staleTopupReviews: 0, verifiedLiveTopups: 1, paymentChannelBlockers: [], canEnable: false });
       if (p === "/v1/admin/market-finance/overview") return json(route, overview);
       if (p === "/v1/admin/market-finance/wallet-policy") return json(route, { version: 1, maintenanceFeeBps: 500, transfersEnabled: true, transfersPaused: false, transferMaxMinor: 500000, transferDailyMaxMinor: 500000, balanceRefundable: false, canEdit: true });
       if (p === "/v1/admin/market-finance/commission-policy") return json(route, { version: 1, current: { policyVersion: 1, rateBps: 1000, effectiveAt: "2026-01-01T00:00:00Z" }, scheduled: null, increaseNoticeDays: 7, canEdit: true });
@@ -119,7 +135,7 @@ try {
       if (p.endsWith("inbox-summary")) return json(route, { pendingRequests: 0 });
       if (p === "/v1/market-provider-finance/me") {
         if (financeFailure) return json(route, { message: "Income temporarily unavailable" }, 503);
-        return json(route, { isProvider: actor === "seller", canPublishPaidOffers: actor === "seller", hasFinanceActivity: actor === "seller", automaticCredit: true,
+        return json(route, { isProvider: actor === "seller", canPublishPaidOffers: actor === "seller" && publicationReady, hasFinanceActivity: actor === "seller", automaticCredit: true,
           summary: { grossEarnedUnits: "1728000000", commissionUnits: "172800000", netEarnedUnits: "1555200000", pendingUnits: heldIncome ? "423360000" : "432000000", readyUnits: "0", restrictedUnits: heldIncome ? "8640000" : "0", creditedUnits: "1123200000" } });
       }
       if (p === "/v1/market-provider-finance/earnings") return json(route, { items: [], nextCursor: null });
@@ -190,18 +206,41 @@ try {
   await dialog.getByRole("button", { name: "I have paid", exact: true }).click(); await dialog.getByRole("checkbox").check(); await dialog.getByRole("button", { name: "I have paid", exact: true }).click();
   await dialog.getByText("Payment declared", { exact: true }).waitFor(); assert.equal(await dialog.getByRole("button", { name: "Cancel unpaid order" }).count(), 0);
   await dialog.getByRole("button", { name: "Close", exact: true }).click();
+  policy.enabled = false; sellerUnits = "0";
   const sell = await open("seller"); await sell.page.clock.install(); await sell.page.goto(`${base}/account/wallet/`); await sell.page.getByRole("button", { name: "Sell balance", exact: true }).click();
   const sellerPanel = sell.page.locator("[data-c2c-orders]");
   let editor = sell.page.getByRole("dialog", { name: "Sell balance", exact: true });
   await editor.getByLabel("C2C description", { exact: true }).fill(description);
-  assert.equal(await sellerPanel.locator("ul li").count(), 1, "order list stays mounted behind seller settings");
+  assert.equal(await sellerPanel.locator(":scope > ul > li").count(), 1, "order list stays mounted behind seller settings");
   assert.equal(await editor.locator("input:visible:not([type=checkbox])").count(), 1, "only public description is expanded by default");
   assert.equal(await editor.getByRole("button", { name: "Start selling", exact: true }).isDisabled(), true);
   await editor.getByRole("checkbox", { name: /I will verify/ }).check();
+  assert.equal(await editor.getByRole("button", { name: "Start selling", exact: true }).isDisabled(), true, "disabled C2C is explicit, not a missing email OTP");
+  await editor.getByText(/Opening threshold/).waitFor();
+  assert.equal(await editor.getByRole("link", { name: "Open wallet settings", exact: true }).count(), 0, "ordinary sellers have no owner-only shortcut");
+  const management = await open("owner", "en", true);
+  await management.page.goto(`${base}/account/wallet/?c2cSell=1`);
+  const managementLink = management.page.getByRole("dialog", { name: "Sell balance", exact: true }).getByRole("link", { name: "Open wallet settings", exact: true });
+  await managementLink.waitFor();
+  assert.equal(await managementLink.getAttribute("href"), "/settings/?panel=market_finance");
+  await managementLink.click();
+  await management.page.locator("[data-c2c-admin]").getByText("C2C settings", { exact: true }).waitFor();
+  await management.context.close();
+  sellerReadFailure = true;
+  await editor.getByRole("button", { name: "Refresh eligibility", exact: true }).click();
+  await editor.getByRole("alert").filter({ hasText: /Eligibility could not be refreshed/ }).waitFor();
+  assert.equal(await editor.getByLabel("C2C description", { exact: true }).inputValue(), description);
+  assert.equal(await editor.getByRole("checkbox", { name: /I will verify/ }).isChecked(), true);
+  sellerReadFailure = false; policy.enabled = true; sellerUnits = String(BigInt(policy.admissionMinor) * 86400n);
+  await editor.getByRole("button", { name: "Refresh eligibility", exact: true }).click();
+  await sell.page.waitForFunction(() => [...document.querySelectorAll("dialog[open] button")].some(b => b.textContent.trim() === "Start selling" && !b.disabled));
+  assert.equal(await editor.getByLabel("C2C description", { exact: true }).inputValue(), description, "eligibility refresh preserves the draft");
+  assert.equal(await editor.getByRole("checkbox", { name: /I will verify/ }).isChecked(), true);
   for (const width of [320, 375, 414, 768]) { await sell.page.setViewportSize({ width, height: 900 }); await geometry(sell.page, "dialog[open]"); }
   const firstHeartbeat = sell.page.waitForResponse(r => r.url().endsWith("/seller/heartbeat"));
   await editor.getByRole("button", { name: "Start selling", exact: true }).click(); await sellerPanel.getByText("Seller settings saved.").waitFor();
   await firstHeartbeat; assert.ok(heartbeat >= 1);
+  assert.deepEqual(loginCodeRequests, [], "a logged-in seller publishes without a second email login challenge");
   await editor.waitFor({ state: "hidden" });
   const nextHeartbeat = sell.page.waitForResponse(r => r.url().endsWith("/seller/heartbeat"));
   await sell.page.clock.fastForward(61000); await nextHeartbeat; assert.ok(heartbeat >= 2, "presence does not depend on an open editor");
@@ -211,8 +250,10 @@ try {
   const poll = sell.page.waitForResponse(r => r.url().endsWith("/c2c/seller") && r.request().method() === "GET");
   await sell.page.clock.fastForward(31000); await poll;
   assert.equal(await editor.getByLabel("C2C description", { exact: true }).inputValue(), "Unsaved local draft", "polling preserves the draft and original version");
-  await editor.getByRole("checkbox", { name: /I will verify/ }).check(); await editor.getByRole("button", { name: "Save", exact: true }).click();
-  await editor.getByRole("alert").waitFor(); sellerReadFailure = true;
+  await editor.getByRole("checkbox", { name: /I will verify/ }).check();
+  await editor.getByRole("status").filter({ hasText: /changed/ }).waitFor();
+  assert.equal(await editor.getByRole("button", { name: "Save", exact: true }).isDisabled(), true, "polling detects stale reviewed terms without overwriting the draft");
+  sellerReadFailure = true;
   await editor.getByRole("button", { name: "Reload settings", exact: true }).click();
   await editor.getByRole("alert").filter({ hasText: /could not be confirmed/ }).waitFor();
   assert.equal(await editor.getByLabel("C2C description", { exact: true }).inputValue(), "Unsaved local draft", "failed reload stays in the editor without dropping draft");
@@ -238,9 +279,16 @@ try {
   unpaid.status = "awaiting_payment"; unpaid.version++; unpaid.paymentDeadline = new Date(Date.now() - 30000).toISOString();
   await page.reload(); dialog = page.getByRole("dialog", { name: "Order details" }); await dialog.getByText(/Do not pay now/).waitFor(); assert.equal(await dialog.locator("[data-c2c-description]").count(), 0);
   unpaid.status = "disputed"; unpaid.paidAt = new Date().toISOString(); unpaid.version++;
-  const owner = await open("owner", "en", true); await owner.page.goto(`${base}/settings/`); await owner.page.getByRole("button", { name: "Marketplace", exact: true }).click();
-  await owner.page.getByRole("tab", { name: "Platform wallet", exact: true }).click();
+  const owner = await open("owner", "en", true); await owner.page.goto(`${base}/settings/?panel=market_finance`);
   const adminPanel = owner.page.locator("[data-c2c-admin]"); await adminPanel.getByText("C2C settings", { exact: true }).waitFor();
+  assert.equal(new URL(owner.page.url()).searchParams.has("panel"), false, "settings shortcut is consumed once");
+  await owner.page.getByRole("button", { name: "Overview", exact: true }).click();
+  await owner.page.waitForFunction(() => JSON.parse(localStorage.getItem("cc_switch_router_settings_navigation_v1"))?.activeSection === "overview");
+  await owner.page.reload();
+  await owner.page.getByRole("button", { name: "Overview", exact: true }).waitFor();
+  assert.equal(await adminPanel.isVisible(), false, "refresh preserves a later section choice instead of replaying the shortcut");
+  await owner.page.goto(`${base}/settings/?panel=market_finance`);
+  await adminPanel.getByText("C2C settings", { exact: true }).waitFor();
   await adminPanel.getByLabel("Opening balance threshold (USD)").fill("150"); await adminPanel.getByRole("button", { name: "Save", exact: true }).click(); assert.equal(policy.admissionMinor, 15000);
   await adminPanel.locator("summary").filter({ hasText: "C2C disputes & late payments" }).click(); await adminPanel.getByRole("button", { name: new RegExp(unpaid.id) }).click();
   const adjudication = owner.page.getByRole("dialog", { name: "Evidence-based resolution" }); await adjudication.getByLabel("Evidence-based resolution").selectOption("return_to_seller");
@@ -294,6 +342,35 @@ try {
   await zhEditor.getByText("请填写不超过 300 字的单行描述。", { exact: true }).waitFor();
   await zhSeller.page.keyboard.press("Escape"); await zhEditor.waitFor({ state: "hidden" });
   await zhSeller.context.close();
+  // Publication and transfer controls must stay available without official
+  // recharge. No legacy payment profile is consulted in any mode.
+  const editOffer = async () => {
+    await sell.page.locator('button[aria-label="Host actions"]').click();
+    await sell.page.getByRole("menuitem", { name: "Edit offer", exact: true }).click();
+    return sell.page.getByRole("dialog", { name: "Edit Host offer", exact: true });
+  };
+  const waitOfferReady = () => sell.page.waitForFunction(() => [...document.querySelectorAll('[role="dialog"] button')].some(button => button.textContent.trim() === "Save" && !button.disabled));
+  for (const mode of ["disabled", "shadow", "enabled"]) {
+    topupMode = mode;
+    await sell.page.goto(`${base}/account/wallet/`); await sell.page.locator("#wallet-transfer form").waitFor();
+    await sell.page.goto(`${base}/client-market/`);
+    const offerDialog = await editOffer(); await waitOfferReady();
+    await offerDialog.getByRole("button", { name: "Save", exact: true }).click();
+    await offerDialog.waitFor({ state: "hidden" });
+  }
+  assert.equal(offerWrites, 3);
+  publicationReady = false; topupMode = "disabled";
+  await sell.page.goto(`${base}/client-market/`);
+  let offerDialog = await editOffer();
+  await offerDialog.getByText("Claim an active Provider identity first.", { exact: true }).waitFor();
+  assert.equal(await offerDialog.getByRole("button", { name: "Save", exact: true }).isDisabled(), true);
+  assert.equal(await offerDialog.getByRole("link", { name: "Open Provider settings", exact: true }).getAttribute("href"), "/account/provider-settings/");
+  await offerDialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  publicationReady = true; financeFailure = true;
+  offerDialog = await editOffer(); await offerDialog.getByRole("alert").waitFor();
+  financeFailure = false; await offerDialog.getByRole("button", { name: "Retry", exact: true }).click(); await waitOfferReady();
+  await offerDialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  assert.equal(retiredSetupRequests, 0); topupMode = "shadow";
   // Income is embedded in Provider settings, including empty/error states.
   assert.equal((await page.request.get(`${base}/account/earnings/`)).status(), 404, "no obsolete page or redirect export");
   financeFailure = true; await sell.page.goto(`${base}/account/provider-settings/#income`);

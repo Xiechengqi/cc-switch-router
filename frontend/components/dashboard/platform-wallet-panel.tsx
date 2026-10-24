@@ -733,7 +733,6 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
       {checkoutFallbackUrl ? <p role="status" className="rounded-md bg-amber-50 px-4 py-3 text-sm text-amber-900">
         {t("marketWallet.paymentTabBlocked")} <a href={checkoutFallbackUrl} target="_blank" rel="noopener noreferrer" className="font-semibold underline underline-offset-2">{t("marketWallet.openPaymentTab")}</a>
       </p> : null}
-      {wallet.mode === "shadow" ? <p className="rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">{t("marketWallet.shadow")}</p> : null}
       {returnedTopup ? (
         <div role="status" aria-live="polite" className="flex min-w-0 flex-wrap items-center justify-between gap-3 rounded-md border border-border bg-card px-4 py-3 text-sm">
           <div className="grid gap-1">
@@ -765,6 +764,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
             <C2CAction type="button" secondary={fundingMethod !== "c2c"} aria-pressed={fundingMethod === "c2c"} disabled={!!busy} onClick={() => setFundingMethod("c2c")}>{t("c2c.buy")}</C2CAction>
           </div>
         {fundingMethod === "c2c" && session?.user?.id ? <C2CBuyPanel key={session.user.id} actor={session.user.id} onOrder={order => setC2COrderId(order.id)} /> : wallet.canTopup ? <form className="grid min-w-0 content-start gap-3" onSubmit={(event) => void submitTopup(event)}>
+          {wallet.mode === "shadow" ? <p className="text-sm text-muted-foreground">{t("marketWallet.shadow")}</p> : null}
           <p className="text-sm font-semibold">{t("marketWallet.topup")}</p>
           <label className="grid min-w-0 gap-1 text-sm">
             <span className="flex flex-wrap items-center gap-2">{t("marketWallet.channel")}
@@ -854,7 +854,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
           {matchingUnsettled ? <p className="text-xs text-amber-700">{t("marketWallet.reviewRetryNotice")}</p> : null}
           {!channels.length ? <p className="text-xs text-muted-foreground">{t("marketWallet.noChannelHelp")}</p> : null}
         </form> : <div className="grid content-start gap-3 rounded-lg bg-muted/50 p-4 text-sm text-muted-foreground">
-          <p>{t(wallet.mode === "enabled" ? "marketWallet.topupUnavailable" : "marketWallet.notOpen")}</p>
+          <p>{t(wallet.mode === "shadow" ? "marketWallet.shadow" : wallet.mode === "enabled" ? "marketWallet.topupUnavailable" : "marketWallet.notOpen")}</p>
         </div>}
         </div>
       </section>
@@ -984,7 +984,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
           </ul>
         </WalletHistorySection>
       </div> : null}
-      {wallet.mode === "enabled" ? <WalletTransferPanel onTransferred={async () => { if (session?.user?.id) notifyMarketBalanceChanged(session.user.id); await reload(); }} walletVersion={wallet.version} /> : null}
+      <WalletTransferPanel onTransferred={async () => { if (session?.user?.id) notifyMarketBalanceChanged(session.user.id); await reload(); }} walletVersion={wallet.version} />
       {wallet.hasWalletActivity ? <MarketBuyerDisputesList /> : null}
       <ConfirmAlertDialog
         open={reviewRetryConfirm}

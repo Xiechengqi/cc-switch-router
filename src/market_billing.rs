@@ -1847,43 +1847,6 @@ fn resolve_credit_grant_tx(
     Ok(grant)
 }
 
-pub(crate) fn credit_eligibility_tx(
-    tx: &Connection,
-    buyer_user_id: &str,
-    buyer_email: &str,
-    supplier_user_id: &str,
-    product_kind: &str,
-    currency: &str,
-) -> Result<crate::market_access::EffectiveCreditGrant, AppError> {
-    ensure_credit_preconditions_tx(tx, buyer_user_id, supplier_user_id, currency)?;
-    if !crate::market_access::product_access_allowed_tx(
-        tx,
-        supplier_user_id,
-        buyer_user_id,
-        buyer_email,
-        product_kind,
-        crate::market_access::PRICING_PAID,
-    )? {
-        return Err(AppError::coded_forbidden(
-            crate::market_access::ERROR_MARKET_ACCESS_REQUIRED,
-            "seller approval is required before renting this market service",
-            serde_json::json!({
-                "supplierUserId": supplier_user_id,
-                "productKind": product_kind,
-                "pricingKind": crate::market_access::PRICING_PAID,
-            }),
-        ));
-    }
-    resolve_credit_grant_tx(
-        tx,
-        buyer_user_id,
-        buyer_email,
-        supplier_user_id,
-        product_kind,
-        currency,
-    )
-}
-
 pub(crate) fn ensure_credit_allowed_tx(
     tx: &Transaction<'_>,
     buyer_user_id: &str,
@@ -10687,7 +10650,7 @@ mod tests {
 
     async fn configure_supplier(store: &AppStore, supplier: &AuthSession, credit_limit_minor: i64) {
         store
-            .client_market_update_payment_profile(
+            .seed_legacy_payment_profile(
                 supplier,
                 &[PaymentMethod {
                     kind: "custom".into(),
@@ -12517,7 +12480,8 @@ mod tests {
         ] {
             conn.execute(
                 "INSERT INTO users (id, email_normalized, status, created_at, last_login_at)
-                 VALUES (?1, ?2, 'active', ?3, ?3)",
+                 VALUES (?1, ?2, 'active', ?3, ?3)
+                 ON CONFLICT(id) DO NOTHING",
                 params![id, email, now],
             )
             .expect("insert billing chat user");
@@ -13382,7 +13346,7 @@ mod tests {
         let snapshot_updated_at = invoice.payment_profile_updated_at.clone();
 
         store
-            .client_market_update_payment_profile(
+            .seed_legacy_payment_profile(
                 &supplier,
                 &[PaymentMethod {
                     kind: "custom".into(),

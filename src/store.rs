@@ -7200,11 +7200,7 @@ impl AppStore {
         }
 
         let user = upsert_user_by_email(&tx, &email, now)?;
-        tx.execute(
-            "UPDATE users SET email_verified_at = COALESCE(email_verified_at, ?2) WHERE id = ?1",
-            params![user.id, now.to_rfc3339()],
-        )
-        .map_err(|e| AppError::Internal(format!("record verified email failed: {e}")))?;
+        record_verified_email_user(&tx, &user.id, now)?;
         let access_token = generate_secret(48);
         let refresh_token = generate_secret(64);
         let access_expires_at = now + Duration::seconds(config.auth_session_ttl_secs);
@@ -7251,9 +7247,10 @@ impl AppStore {
             .map_err(|e| AppError::Internal(format!("begin refresh session failed: {e}")))?;
         let current = get_refreshable_session_by_refresh_hash(&tx, &refresh_hash, now)?
             .ok_or_else(|| AppError::Unauthorized("refresh session not found".into()))?;
-        if current.refresh_expires_at < now {
+        if current.refresh_expires_at <= now {
             return Err(AppError::Unauthorized("refresh session expired".into()));
         }
+        record_verified_email_user(&tx, &current.user_id, now)?;
         let user = get_user_by_id(&tx, &current.user_id)?
             .ok_or_else(|| AppError::Unauthorized("user not found".into()))?;
         let access_token = generate_secret(48);
@@ -7738,17 +7735,23 @@ impl AppStore {
     ) -> Result<Option<AuthSession>, AppError> {
         let now = Utc::now();
         let conn = self.conn.lock().await;
-        let Some(session) = get_session_by_access_hash(&conn, &hash_token(access_token))? else {
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| AppError::Internal(format!("begin session resolution failed: {e}")))?;
+        let Some(session) = get_session_by_access_hash(&tx, &hash_token(access_token))? else {
             return Ok(None);
         };
-        if session.access_expires_at < now {
+        if session.access_expires_at <= now || session.refresh_expires_at <= now {
             return Ok(None);
         }
-        conn.execute(
+        record_verified_email_user(&tx, &session.user_id, now)?;
+        tx.execute(
             "UPDATE user_sessions SET last_used_at = ?2 WHERE id = ?1",
             params![session.session_id, now.to_rfc3339()],
         )
         .map_err(|e| AppError::Internal(format!("touch session failed: {e}")))?;
+        tx.commit()
+            .map_err(|e| AppError::Internal(format!("commit session resolution failed: {e}")))?;
         Ok(Some(session))
     }
 
@@ -27337,6 +27340,26 @@ fn get_user_by_id(conn: &Connection, user_id: &str) -> Result<Option<AuthUser>, 
     .map_err(|e| AppError::Internal(format!("query user by id failed: {e}")))
 }
 
+/// Call only after an email challenge or a real, unexpired login session has
+/// authenticated this user. API tokens and debug principals never call this.
+fn record_verified_email_user(
+    conn: &Connection,
+    user_id: &str,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let changed = conn
+        .execute(
+            "UPDATE users SET email_verified_at = COALESCE(email_verified_at, ?2)
+         WHERE id = ?1 AND status = 'active'",
+            params![user_id, now.to_rfc3339()],
+        )
+        .map_err(|e| AppError::Internal(format!("record verified email failed: {e}")))?;
+    if changed != 1 {
+        return Err(AppError::Unauthorized("account is not active".into()));
+    }
+    Ok(())
+}
+
 fn persist_session(conn: &Connection, session: &AuthSession) -> Result<(), AppError> {
     conn.execute(
         "INSERT INTO user_sessions (
@@ -39342,6 +39365,179 @@ mod tests {
             .await
             .expect("refresh survives device removal");
         assert_eq!(refreshed.user.email, email);
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn email_session_resolution_and_refresh_restore_verification_without_another_otp() {
+        let (store, config) = setup_store("email-session-verification-repair").await;
+        let now = Utc::now();
+        let user = {
+            let conn = store.conn.lock().await;
+            let user = upsert_user_by_email(&conn, "existing@example.test", now).unwrap();
+            persist_session(
+                &conn,
+                &AuthSession {
+                    session_id: "existing-session".into(),
+                    user_id: user.id.clone(),
+                    email: user.email.clone(),
+                    auth_source_kind: AUTH_SOURCE_AUTH_DEVICE.into(),
+                    auth_source_id: "old-browser".into(),
+                    access_token_hash: hash_token("existing-access"),
+                    refresh_token_hash: hash_token("existing-refresh"),
+                    access_expires_at: now + Duration::hours(1),
+                    refresh_expires_at: now + Duration::days(1),
+                    created_at: now - Duration::days(10),
+                    last_used_at: now,
+                },
+            )
+            .unwrap();
+            user
+        };
+        store
+            .resolve_session_by_access_token("existing-access")
+            .await
+            .unwrap()
+            .unwrap();
+        let verified_at: String = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT email_verified_at FROM users WHERE id=?1",
+                params![user.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        store
+            .resolve_session_by_access_token("existing-access")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .conn
+                .lock()
+                .await
+                .query_row(
+                    "SELECT email_verified_at FROM users WHERE id=?1",
+                    params![user.id],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            verified_at
+        );
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE users SET email_verified_at=NULL WHERE id=?1",
+                params![user.id],
+            )
+            .unwrap();
+        store
+            .refresh_session(
+                &config,
+                RefreshSessionRequest {
+                    refresh_token: "existing-refresh".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .conn
+                .lock()
+                .await
+                .query_row(
+                    "SELECT email_verified_at IS NOT NULL FROM users WHERE id=?1",
+                    params![user.id],
+                    |r| r.get::<_, bool>(0)
+                )
+                .unwrap()
+        );
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn invalid_or_restricted_sessions_cannot_restore_email_verification() {
+        let (store, config) = setup_store("email-session-verification-rejected").await;
+        let now = Utc::now();
+        for kind in ["expired", "revoked", "blocked"] {
+            let user = {
+                let conn = store.conn.lock().await;
+                let user =
+                    upsert_user_by_email(&conn, &format!("{kind}@example.test"), now).unwrap();
+                persist_session(
+                    &conn,
+                    &AuthSession {
+                        session_id: kind.into(),
+                        user_id: user.id.clone(),
+                        email: user.email.clone(),
+                        auth_source_kind: AUTH_SOURCE_AUTH_DEVICE.into(),
+                        auth_source_id: "source".into(),
+                        access_token_hash: hash_token(kind),
+                        refresh_token_hash: hash_token(&format!("refresh-{kind}")),
+                        access_expires_at: if kind == "expired" {
+                            now - Duration::seconds(1)
+                        } else {
+                            now + Duration::hours(1)
+                        },
+                        refresh_expires_at: if kind == "expired" {
+                            now - Duration::seconds(1)
+                        } else {
+                            now + Duration::days(1)
+                        },
+                        created_at: now,
+                        last_used_at: now,
+                    },
+                )
+                .unwrap();
+                if kind == "revoked" {
+                    conn.execute(
+                        "UPDATE user_sessions SET revoked_at=?1 WHERE id=?2",
+                        params![now.to_rfc3339(), kind],
+                    )
+                    .unwrap();
+                }
+                if kind == "blocked" {
+                    conn.execute(
+                        "UPDATE users SET status='blocked' WHERE id=?1",
+                        params![user.id],
+                    )
+                    .unwrap();
+                }
+                user
+            };
+            assert!(!matches!(
+                store.resolve_session_by_access_token(kind).await,
+                Ok(Some(_))
+            ));
+            assert!(
+                store
+                    .refresh_session(
+                        &config,
+                        RefreshSessionRequest {
+                            refresh_token: format!("refresh-{kind}")
+                        }
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(
+                !store
+                    .conn
+                    .lock()
+                    .await
+                    .query_row(
+                        "SELECT email_verified_at IS NOT NULL FROM users WHERE id=?1",
+                        params![user.id],
+                        |r| r.get::<_, bool>(0)
+                    )
+                    .unwrap()
+            );
+        }
         let _ = std::fs::remove_file(&config.database.path);
     }
 
@@ -52994,7 +53190,7 @@ mod tests {
         ));
 
         store
-            .client_market_update_payment_profile(&provider, &[], None)
+            .seed_legacy_payment_profile(&provider, &[], None)
             .await
             .expect("clear live profile and private assets");
         let remaining_assets: i64 = store

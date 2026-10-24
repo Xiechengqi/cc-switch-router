@@ -276,12 +276,12 @@ export function MarketPaymentChannelsPanel() {
               </span>
             </div>
             <div className="flex flex-wrap gap-2">
-              {readiness.mode === "shadow" ? (
+              {readiness.mode !== "disabled" ? (
                 <Button size="sm" variant="outline" isDisabled={!!busy} onPress={() => void perform("mode", () => setMarketFinanceMode("disabled", readiness.version))}>
                   {t("settings.marketFinance.disable")}
                 </Button>
               ) : null}
-              {readiness.mode === "disabled" ? (
+              {readiness.mode !== "shadow" ? (
                 <Button size="sm" variant="outline" isDisabled={!!busy} onPress={() => void perform("mode", () => setMarketFinanceMode("shadow", readiness.version))}>
                   {t("settings.marketFinance.shadow")}
                 </Button>
@@ -295,16 +295,14 @@ export function MarketPaymentChannelsPanel() {
           </div>
           <div className="grid gap-1 text-sm text-muted-foreground sm:grid-cols-2">
             <p>{t("settings.marketFinance.verifiedTopups", { count: readiness.verifiedLiveTopups })}</p>
-            <p>{t("settings.marketFinance.blockers", { count: readiness.legacyBlockers.length })}</p>
             <p>{t("settings.marketFinance.channelBlockers", { count: readiness.paymentChannelBlockers.length })}</p>
             <p>{t("settings.marketFinance.criticalCases", { count: readiness.criticalCases })}</p>
             {readiness.staleTopupReviews > 0 ? <p className="font-medium text-amber-800">{t("settings.marketFinance.staleTopupReviews", { count: readiness.staleTopupReviews })}</p> : null}
           </div>
-          {readiness.mode !== "disabled" ? (
-            <div className="grid gap-3 rounded-xl border border-border p-3 sm:grid-cols-2">
+            <div className="grid gap-3 sm:grid-cols-2">
               {([
                 ["newTopupsPaused", "settings.marketFinance.pause.newTopups", true],
-                ["newOrdersPaused", "settings.marketFinance.newOrders", readiness.mode === "enabled"],
+                ["newOrdersPaused", "settings.marketFinance.newOrders", true],
               ] as const).filter(([, , shown]) => shown).map(([field, label]) => {
                 const paused = !!readiness[field];
                 return (
@@ -321,9 +319,8 @@ export function MarketPaymentChannelsPanel() {
                 );
               })}
               <p className="text-xs text-muted-foreground sm:col-span-2">{t("settings.marketFinance.pause.topupNote")}</p>
-              {readiness.mode === "enabled" ? <p className="text-xs text-muted-foreground sm:col-span-2">{t("settings.marketFinance.pauseNote")}</p> : null}
+              <p className="text-xs text-muted-foreground sm:col-span-2">{t("settings.marketFinance.pauseNote")}</p>
             </div>
-          ) : null}
           {readiness.mode !== "enabled" && !readiness.canEnable ? (
             <div className="grid gap-1 text-sm text-muted-foreground">
               <p className="flex items-start gap-2">
@@ -333,16 +330,6 @@ export function MarketPaymentChannelsPanel() {
               {!readiness.codeIntegrated ? <p>{t("settings.marketFinance.codePending")}</p> : null}
               {!readiness.verifiedLiveTopups ? <p>{t("settings.marketFinance.liveTopupMissing")}</p> : null}
             </div>
-          ) : null}
-          {readiness.legacyBlockers.length ? (
-            <ul className="grid gap-1 text-xs text-muted-foreground">
-              {readiness.legacyBlockers.map((blocker) => (
-                <li key={blocker.code} className="flex justify-between gap-3">
-                  <span className="min-w-0 break-all">{blocker.code}</span>
-                  <span className="tabular-nums">{blocker.count}</span>
-                </li>
-              ))}
-            </ul>
           ) : null}
           {readiness.paymentChannelBlockers.length ? (
             <ul className="grid gap-1 text-xs text-muted-foreground">

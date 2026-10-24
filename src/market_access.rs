@@ -34,7 +34,6 @@ pub const ACCESS_REQUEST_CANCELLED: &str = "cancelled";
 pub const TARGET_SHARE_SEAT: &str = "share_seat";
 pub const TARGET_CLIENT_HOST: &str = "client_host";
 pub const ERROR_MARKET_ACCESS_REQUIRED: &str = "MARKET_ACCESS_REQUIRED";
-pub const ERROR_MARKET_CREDIT_REQUIRED: &str = "MARKET_CREDIT_REQUIRED";
 pub const ERROR_MARKET_BUYER_RESTRICTED: &str = "MARKET_BUYER_RESTRICTED";
 pub const ERROR_MARKET_SETTLEMENT_REQUIRED: &str = "MARKET_SETTLEMENT_REQUIRED";
 pub const ERROR_MARKET_CREDIT_LIMIT_REACHED: &str = "MARKET_CREDIT_LIMIT_REACHED";
@@ -503,6 +502,7 @@ fn clean_resolution_note(value: &str) -> Result<String, AppError> {
     Ok(value.to_string())
 }
 
+#[cfg(test)]
 fn validate_credit_line(
     kind: &str,
     limit_minor: Option<i64>,
@@ -1431,6 +1431,9 @@ fn approve_access_request_tx(
                 "prepaid calendar-month access approval cannot include a credit line".into(),
             ));
         }
+        return Err(AppError::Gone(
+            "Provider-scoped credit lines are retired; approve access without a credit line".into(),
+        ));
     }
     let existing = relationship_for_buyer_tx(
         tx,
@@ -1548,16 +1551,6 @@ fn approve_access_request_tx(
                 &relationship_id,
                 &currency,
                 now,
-            )?;
-        }
-        if !crate::market_payments::wallet_purchase_mode_tx(tx)? {
-            effective_credit_grant_tx(
-                tx,
-                &request.supplier_user_id,
-                &request.buyer_user_id,
-                &request.buyer_email,
-                &request.product_kind,
-                &currency,
             )?;
         }
     }
@@ -1942,17 +1935,26 @@ fn upsert_access_rule_tx(
 }
 
 fn upsert_credit_line_tx(
+    _tx: &Connection,
+    _counterparty_id: &str,
+    _input: &CreditLineInput,
+    _expected_revision: Option<i64>,
+    _now: &str,
+) -> Result<(), AppError> {
+    Err(AppError::Gone(
+        "Provider-scoped credit lines are retired; use the platform wallet".into(),
+    ))
+}
+
+// Seed immutable pre-wallet credit for historical settlement regression tests only.
+#[cfg(test)]
+fn seed_legacy_credit_line_tx(
     tx: &Connection,
     counterparty_id: &str,
     input: &CreditLineInput,
     expected_revision: Option<i64>,
     now: &str,
 ) -> Result<(), AppError> {
-    if crate::market_payments::wallet_purchase_mode_tx(tx)? {
-        return Err(AppError::Gone(
-            "Provider-scoped credit lines are retired; use the platform wallet".into(),
-        ));
-    }
     let currency = normalize_currency(&input.currency)?;
     let (kind, limit_minor) =
         validate_credit_line(&input.kind, input.limit_minor, input.risk_acknowledged)?;
@@ -2594,7 +2596,7 @@ pub(crate) fn market_eligibility_tx(
     buyer_email: &str,
     product_kind: &str,
     daily_rate_minor: Option<i64>,
-    currency: Option<&str>,
+    _currency: Option<&str>,
 ) -> Result<MarketEligibilityView, AppError> {
     let pricing_kind = pricing_kind_for_rate(daily_rate_minor);
     if !product_access_allowed_tx(
@@ -2619,47 +2621,7 @@ pub(crate) fn market_eligibility_tx(
     }
     // Wallet-funded offers use the shared buyer balance. Provider-scoped
     // settlement profiles and credit lines are not eligibility requirements.
-    if daily_rate_minor.is_none() || crate::market_payments::wallet_purchase_mode_tx(conn)? {
-        return Ok(MarketEligibilityView::allowed());
-    }
-    let currency = currency
-        .ok_or_else(|| AppError::Internal("paid market service currency is missing".into()))?;
-    match crate::market_billing::credit_eligibility_tx(
-        conn,
-        buyer_user_id,
-        buyer_email,
-        supplier_user_id,
-        product_kind,
-        currency,
-    ) {
-        Ok(_) => Ok(MarketEligibilityView::allowed()),
-        Err(error) => {
-            let status = match error.code() {
-                Some(ERROR_MARKET_ACCESS_REQUIRED) => "access_required",
-                Some(ERROR_MARKET_CREDIT_REQUIRED) => "credit_required",
-                Some(ERROR_MARKET_BUYER_RESTRICTED) => "buyer_restricted",
-                Some(ERROR_MARKET_SETTLEMENT_REQUIRED) => "settlement_required",
-                Some(ERROR_MARKET_CREDIT_LIMIT_REACHED) => "credit_limit_reached",
-                Some(ERROR_MARKET_RELATIONSHIP_CLOSED) => "relationship_closed",
-                _ => return Err(error),
-            };
-            Ok(MarketEligibilityView {
-                allowed: false,
-                status: status.into(),
-                request: if status == "access_required" {
-                    requested_access_request_tx(
-                        conn,
-                        supplier_user_id,
-                        buyer_user_id,
-                        product_kind,
-                        pricing_kind,
-                    )?
-                } else {
-                    None
-                },
-            })
-        }
-    }
+    Ok(MarketEligibilityView::allowed())
 }
 
 pub(crate) fn ensure_product_access_tx(
@@ -2927,6 +2889,21 @@ pub(crate) fn configure_open_test_policy(
     limit_minor: i64,
     now: &str,
 ) {
+    // AuthSession fixtures represent users who completed email login. Keep
+    // Provider identity explicit; no balance or payment rail is fabricated.
+    conn.execute(
+        "INSERT INTO users (id, email_normalized, status, created_at, last_login_at, email_verified_at)
+         VALUES (?1, ?2, 'active', ?3, ?3, ?3)
+         ON CONFLICT(id) DO UPDATE SET email_verified_at = COALESCE(users.email_verified_at, excluded.email_verified_at)",
+        params![supplier.user_id, supplier.email, now],
+    ).expect("seed authenticated Provider fixture");
+    crate::market_provider_identity::ensure_market_provider_identity_tx(
+        conn,
+        Some(&supplier.user_id),
+        &supplier.email,
+        now,
+    )
+    .expect("bind Provider fixture identity");
     for product_kind in [PRODUCT_SHARE, PRODUCT_CLIENT_HOST] {
         for pricing_kind in [PRICING_FREE, PRICING_PAID] {
             conn.execute(
@@ -3192,143 +3169,76 @@ mod tests {
     }
 
     #[test]
-    fn paid_approval_and_credit_are_atomic() {
-        let conn = access_request_connection();
-        insert_paid_share_target(&conn, "seat-approval");
-        let buyer = test_actor("buyer", "buyer@example.com");
-        let supplier = test_actor("supplier", "supplier@example.com");
-        let now = test_request_time();
-        let request =
-            create_access_request_tx(&conn, &buyer, &share_request_input("seat-approval"), now)
-                .expect("create approval request");
-        let before = market_eligibility_tx(
-            &conn,
-            &supplier.user_id,
-            &buyer.user_id,
-            &buyer.email,
-            PRODUCT_SHARE,
-            Some(1000),
-            Some("USD"),
-        )
-        .expect("read eligibility before approval");
-        assert_eq!(before.status, "access_required");
-        assert_eq!(before.request.expect("requested summary").id, request.id);
-
-        let stale_credit_line = ApprovalCreditLineInput {
-            currency: "USD".into(),
-            kind: CREDIT_LIMITED.into(),
-            limit_minor: Some(7_000),
-            risk_acknowledged: false,
-            expected_revision: 1,
-        };
-        {
-            let tx = conn.transaction().expect("begin stale credit approval");
+    fn paid_approval_rejects_legacy_credit_before_any_relationship_mutation() {
+        for mode in ["disabled", "shadow", "enabled"] {
+            let conn = access_request_connection();
+            conn.execute(
+                "UPDATE market_finance_control SET mode = ?1 WHERE id = 1",
+                params![mode],
+            )
+            .unwrap();
+            insert_paid_share_target(&conn, "seat-wallet-access");
+            let buyer = test_actor("buyer", "buyer@example.com");
+            let supplier = test_actor("supplier", "supplier@example.com");
+            let now = test_request_time();
+            let request = create_access_request_tx(
+                &conn,
+                &buyer,
+                &share_request_input("seat-wallet-access"),
+                now,
+            )
+            .unwrap();
+            let line = ApprovalCreditLineInput {
+                currency: "USD".into(),
+                kind: CREDIT_LIMITED.into(),
+                limit_minor: Some(7000),
+                risk_acknowledged: false,
+                expected_revision: 0,
+            };
             assert!(matches!(
                 approve_access_request_for_actor_tx(
-                    &tx,
+                    &conn,
                     &supplier,
                     &request.id,
                     request.revision,
-                    Some(&stale_credit_line),
-                    &(now + Duration::minutes(2)).to_rfc3339(),
+                    Some(&line),
+                    &now.to_rfc3339()
                 ),
-                Err(AppError::Conflict(_))
+                Err(AppError::Gone(_))
             ));
-        }
-        assert!(
-            relationship_for_buyer_tx(&conn, &supplier.user_id, &buyer.user_id, &buyer.email)
-                .expect("read relationship after stale credit rollback")
-                .is_none()
-        );
-        assert_eq!(
-            access_request_view_tx(&conn, &request.id)
-                .expect("read request after stale credit rollback")
-                .status,
-            ACCESS_REQUEST_REQUESTED
-        );
-
-        let credit_line = ApprovalCreditLineInput {
-            currency: "USD".into(),
-            kind: CREDIT_LIMITED.into(),
-            limit_minor: Some(7_000),
-            risk_acknowledged: false,
-            expected_revision: 0,
-        };
-        {
-            let tx = conn.transaction().expect("begin approval with credit");
+            assert!(
+                relationship_for_buyer_tx(&conn, &supplier.user_id, &buyer.user_id, &buyer.email)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                access_request_view_tx(&conn, &request.id).unwrap().status,
+                ACCESS_REQUEST_REQUESTED
+            );
             approve_access_request_for_actor_tx(
-                &tx,
+                &conn,
                 &supplier,
                 &request.id,
                 request.revision,
-                Some(&credit_line),
-                &(now + Duration::minutes(2)).to_rfc3339(),
+                None,
+                &now.to_rfc3339(),
             )
-            .expect("approve access request with credit");
-            tx.commit().expect("commit approval with credit");
+            .unwrap();
+            assert!(
+                market_eligibility_tx(
+                    &conn,
+                    &supplier.user_id,
+                    &buyer.user_id,
+                    &buyer.email,
+                    PRODUCT_SHARE,
+                    Some(1000),
+                    Some("USD")
+                )
+                .unwrap()
+                .allowed
+            );
         }
-        approve_access_request_for_actor_tx(
-            &conn,
-            &supplier,
-            &request.id,
-            request.revision,
-            None,
-            &(now + Duration::minutes(3)).to_rfc3339(),
-        )
-        .expect("repeat access approval idempotently");
-
-        let approved = access_request_view_tx(&conn, &request.id).expect("read approved request");
-        assert_eq!(approved.status, ACCESS_REQUEST_APPROVED);
-        assert_eq!(approved.revision, 2);
-        let relationship =
-            relationship_for_buyer_tx(&conn, &supplier.user_id, &buyer.user_id, &buyer.email)
-                .expect("read approved relationship")
-                .expect("approved relationship exists");
-        assert_eq!(relationship.2, "active");
-        let rules: Vec<(String, String, String)> = conn
-            .prepare(
-                "SELECT product_kind, pricing_kind, decision
-                 FROM market_counterparty_access_rules WHERE counterparty_id = ?1",
-            )
-            .and_then(|mut statement| {
-                statement
-                    .query_map(params![relationship.0], |row| {
-                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                    })?
-                    .collect()
-            })
-            .expect("read approved rules");
-        assert_eq!(
-            rules,
-            vec![(
-                PRODUCT_SHARE.into(),
-                PRICING_PAID.into(),
-                DECISION_ALLOW.into(),
-            )]
-        );
-        let credit: (String, Option<i64>) = conn
-            .query_row(
-                "SELECT kind, limit_minor FROM market_credit_grants WHERE counterparty_id = ?1",
-                params![relationship.0],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .expect("read approval credit grant");
-        assert_eq!(credit, (CREDIT_LIMITED.into(), Some(7_000)));
-        let after = market_eligibility_tx(
-            &conn,
-            &supplier.user_id,
-            &buyer.user_id,
-            &buyer.email,
-            PRODUCT_SHARE,
-            Some(1000),
-            Some("USD"),
-        )
-        .expect("read eligibility after approval");
-        assert_eq!(after.status, "allowed");
-        assert!(after.allowed);
-        assert!(after.request.is_none());
     }
-
     #[test]
     fn paid_approval_without_credit_creates_a_prepaid_only_relationship() {
         let conn = access_request_connection();
@@ -3466,7 +3376,7 @@ mod tests {
             params![now_text],
         )
         .expect("insert existing monthly relationship");
-        upsert_credit_line_tx(
+        seed_legacy_credit_line_tx(
             &conn,
             "monthly-existing-relationship",
             &CreditLineInput {
@@ -3542,7 +3452,7 @@ mod tests {
     }
 
     #[test]
-    fn paid_approval_accepts_unlimited_credit() {
+    fn paid_approval_rejects_unlimited_credit_without_granting_access() {
         let conn = access_request_connection();
         insert_paid_share_target(&conn, "seat-unlimited");
         let buyer = test_actor("buyer", "buyer@example.com");
@@ -3550,39 +3460,39 @@ mod tests {
         let now = test_request_time();
         let request =
             create_access_request_tx(&conn, &buyer, &share_request_input("seat-unlimited"), now)
-                .expect("create unlimited approval request");
-        let credit_line = ApprovalCreditLineInput {
+                .unwrap();
+        let line = ApprovalCreditLineInput {
             currency: "USD".into(),
             kind: CREDIT_UNLIMITED.into(),
             limit_minor: None,
             risk_acknowledged: true,
             expected_revision: 0,
         };
-        let tx = conn.transaction().expect("begin unlimited approval");
-        approve_access_request_for_actor_tx(
-            &tx,
-            &supplier,
-            &request.id,
-            request.revision,
-            Some(&credit_line),
-            &(now + Duration::minutes(1)).to_rfc3339(),
-        )
-        .expect("approve unlimited credit");
-        tx.commit().expect("commit unlimited approval");
-
-        let grant = effective_credit_grant_tx(
-            &conn,
-            &supplier.user_id,
-            &buyer.user_id,
-            &buyer.email,
-            PRODUCT_SHARE,
-            "USD",
-        )
-        .expect("resolve unlimited approval credit");
-        assert_eq!(grant.kind, CREDIT_UNLIMITED);
-        assert_eq!(grant.limit_minor, None);
+        assert!(matches!(
+            approve_access_request_for_actor_tx(
+                &conn,
+                &supplier,
+                &request.id,
+                request.revision,
+                Some(&line),
+                &now.to_rfc3339()
+            ),
+            Err(AppError::Gone(_))
+        ));
+        assert!(
+            !market_eligibility_tx(
+                &conn,
+                &supplier.user_id,
+                &buyer.user_id,
+                &buyer.email,
+                PRODUCT_SHARE,
+                Some(1000),
+                Some("USD")
+            )
+            .unwrap()
+            .allowed
+        );
     }
-
     #[test]
     fn approving_revoked_relationship_clears_old_scopes_and_credit() {
         let conn = access_request_connection();
@@ -3616,7 +3526,7 @@ mod tests {
             )
             .expect("insert stale access rule");
         }
-        upsert_credit_line_tx(
+        seed_legacy_credit_line_tx(
             &conn,
             "revoked-relationship",
             &CreditLineInput {
@@ -3653,13 +3563,7 @@ mod tests {
             &supplier,
             &request.id,
             request.revision,
-            Some(&ApprovalCreditLineInput {
-                currency: "USD".into(),
-                kind: CREDIT_LIMITED.into(),
-                limit_minor: Some(75_000),
-                risk_acknowledged: false,
-                expected_revision: 1,
-            }),
+            None,
             &(now + Duration::minutes(1)).to_rfc3339(),
         )
         .expect("approve reactivation request");
@@ -3701,7 +3605,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .expect("read reset credit grant");
-        assert_eq!(credit, (CREDIT_LIMITED.into(), Some(75_000), 3));
+        assert_eq!(credit, (CREDIT_NONE.into(), None, 2));
         let account_credit: (String, Option<i64>) = conn
             .query_row(
                 "SELECT credit_kind, credit_limit_minor FROM market_credit_accounts
@@ -3710,7 +3614,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .expect("read reset account credit");
-        assert_eq!(account_credit, (CREDIT_LIMITED.into(), Some(75_000)));
+        assert_eq!(account_credit, (CREDIT_NONE.into(), None));
     }
 
     #[test]
@@ -4019,7 +3923,7 @@ mod tests {
             &now,
         )
         .expect("create trusted buyer");
-        upsert_credit_line_tx(
+        seed_legacy_credit_line_tx(
             &conn,
             &relationship_id,
             &CreditLineInput {
@@ -4160,7 +4064,7 @@ mod tests {
             params![now],
         )
         .expect("insert existing public credit account");
-        upsert_credit_line_tx(
+        seed_legacy_credit_line_tx(
             &conn,
             "relationship",
             &CreditLineInput {

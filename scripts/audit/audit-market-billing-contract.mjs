@@ -315,15 +315,20 @@ function main() {
   }
   const approvalRequest = extractRustBlock(accessSource, "struct ApproveAccessRequest");
   if (!approvalRequest.includes("credit_line: Option<ApprovalCreditLineInput>")) {
-    errors.push("ApproveAccessRequest must support atomic paid credit approval");
+    errors.push("ApproveAccessRequest must recognize and explicitly reject retired credit payloads");
   }
   const approvalCredit = extractRustBlock(accessSource, "struct ApprovalCreditLineInput");
   if (!approvalCredit.includes("expected_revision: i64")) {
     errors.push("ApprovalCreditLineInput must require expectedRevision");
   }
   const approvalTransaction = extractRustBlock(accessSource, "fn approve_access_request_tx(");
-  if (!approvalTransaction.includes("ensure_credit_line_revision_tx")) {
-    errors.push("paid access approval must enforce credit revision before mutation");
+  const retiredApproval = approvalTransaction.indexOf("Provider-scoped credit lines are retired");
+  if (retiredApproval < 0 || retiredApproval > approvalTransaction.indexOf("relationship_for_buyer_tx")) {
+    errors.push("paid access approval must reject legacy credit before any relationship mutation");
+  }
+  const creditWrite = extractRustBlock(accessSource, "fn upsert_credit_line_tx(");
+  if (!creditWrite.includes("AppError::Gone") || creditWrite.includes("INSERT INTO")) {
+    errors.push("retired credit writes must fail closed in every official top-up mode");
   }
   const rejectionRequest = extractRustBlock(accessSource, "struct RejectAccessRequest");
   if (!rejectionRequest.includes("reason: String")) {
@@ -403,17 +408,41 @@ function main() {
     if (!source.includes(required)) errors.push(`${label} is missing ${required}`);
   }
 
-  const paidHostSetup = extractRustBlock(
-    tradeSource,
-    "pub(crate) fn require_paid_offer_setup",
-  );
-  for (const required of [
-    "require_payment_profile_for_offer",
-    "require_supplier_profile_tx",
+  for (const [label, block] of [
+    ["Client Host", extractRustBlock(tradeSource, "pub(crate) fn require_paid_offer_setup")],
+    ["Share", extractRustBlock(shareSource, "fn ensure_paid_seat_setup_tx")],
   ]) {
-    if (!paidHostSetup.includes(required)) {
-      errors.push(`Client Host paid-offer setup guard is missing ${required}`);
+    for (const required of ['currency != "USD"', "require_paid_offer_setup_tx"]) {
+      if (!block.includes(required)) errors.push(`${label} paid-offer setup guard is missing ${required}`);
     }
+    if (/require_payment_profile_for_offer|require_supplier_profile_tx/.test(block)) {
+      errors.push(`${label} paid-offer setup must not depend on retired Provider payment details`);
+    }
+  }
+  const publicationTriggers = fs.readFileSync(path.join(root, "schema/0082_market_topup_mode_isolation.sql"), "utf8");
+  if (publicationTriggers.includes("market_finance_control") || !publicationTriggers.includes("platform_wallet")) {
+    errors.push("new paid publications must use wallet credit independently of official top-up mode");
+  }
+  const paymentSource = fs.readFileSync(path.join(root, "src/market_payments/mod.rs"), "utf8");
+  for (const [label, source, declaration] of [
+    ["Share quote", shareSource, "pub async fn share_market_create_rent_quote("],
+    ["Client quote", tradeSource, "pub async fn client_market_create_quote("],
+    ["C2C opening", fs.readFileSync(path.join(root, "src/market_c2c.rs"), "utf8"), "fn opening_blockers_tx("],
+    ["offer rail", paymentSource, "pub(crate) fn require_current_offer_rail("],
+  ]) {
+    const flow = extractRustBlock(source, declaration);
+    if (/wallet_purchase_mode_tx|cutover_approved_at|market_finance_control/.test(flow)) {
+      errors.push(`${label} must not depend on official top-up mode`);
+    }
+  }
+  const publicationReadiness = fs.readFileSync(path.join(root, "frontend/components/dashboard/share-market/paid-offer-readiness.tsx"), "utf8");
+  if (!publicationReadiness.includes("getMarketProviderFinance") || !publicationReadiness.includes("finance.canPublishPaidOffers")
+      || /getMarketWallet|getAccountPaymentProfile|getMarketBillingDashboard/.test(publicationReadiness)) {
+    errors.push("paid-publication UI must use Provider identity, not recharge mode or retired payment profiles");
+  }
+  const walletPanel = fs.readFileSync(path.join(root, "frontend/components/dashboard/platform-wallet-panel.tsx"), "utf8");
+  if (walletPanel.split("\n").some(line => line.includes("<WalletTransferPanel") && line.includes("wallet.mode"))) {
+    errors.push("wallet transfer UI must not be hidden by official recharge mode");
   }
   const earlyHostSetupChecks = clientSource.match(/require_paid_offer_setup/g)?.length || 0;
   if (earlyHostSetupChecks < 3 || !tradeSource.includes("require_paid_offer_setup")) {
@@ -552,7 +581,8 @@ function main() {
         'usePaidOfferReadiness(open && pricing === "paid")',
         'paidReadiness.status === "error"',
         "hostPaidOfferPrerequisiteError(err, t)",
-        "PROVIDER_INCOME_HREF",
+        "paidReadiness.providerReady",
+        "DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH",
       ],
     ],
     [
@@ -561,7 +591,8 @@ function main() {
         'usePaidOfferReadiness(open && pricing === "paid")',
         'paidReadiness.status === "error"',
         "hostPaidOfferPrerequisiteError(reason, t)",
-        "PROVIDER_INCOME_HREF",
+        "paidReadiness.providerReady",
+        "DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH",
       ],
     ],
     [
@@ -679,17 +710,7 @@ function main() {
 
   for (const [label, source, required] of [
     [
-      "Client Host paid-offer payment prerequisite",
-      extractRustBlock(tradeSource, "pub(crate) fn require_payment_profile_for_offer"),
-      "MARKET_PAYMENT_PROFILE_REQUIRED",
-    ],
-    [
-      "Share paid-offer payment prerequisite",
-      shareSource,
-      "SHARE_MARKET_PAYMENT_PROFILE_REQUIRED",
-    ],
-    [
-      "Market supplier settlement prerequisite",
+      "Historical supplier settlement prerequisite",
       billingSource,
       "MARKET_SUPPLIER_SETTLEMENT_PROFILE_REQUIRED",
     ],

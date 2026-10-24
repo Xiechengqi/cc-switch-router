@@ -105,16 +105,31 @@ pub fn router() -> Router<ServerState> {
 async fn policy(State(state): State<ServerState>, headers: HeaderMap) -> Reply<serde_json::Value> {
     let u = session(&state, &headers).await?;
     let conn = state.store.conn.lock().await;
+    let mut blockers = participation_blockers_tx(&conn, &u.user_id)?;
+    let verified = match verified_tx(&conn, &u.user_id) {
+        Ok(_) => true,
+        Err(error) if error.code() == Some("C2C_IDENTITY") => false,
+        Err(error) => return Err(error),
+    };
+    if !email_ready(&state) {
+        blockers.push("C2C_EMAIL_UNAVAILABLE");
+    }
     Ok(reply(
-        serde_json::json!({"policy":policy_tx(&conn)?,"available":open_tx(&conn).is_ok()&&email_ready(&state),
-        "verified":verified_tx(&conn,&u.user_id).is_ok(),"termsVersion":TERMS_VERSION,"claimGraceSeconds":120,"firstPurchaseMaxMinor":10000}),
+        serde_json::json!({"policy":policy_tx(&conn)?,"available":blockers.is_empty(),"blockers":blockers,
+        "canManagePolicy":crate::api::is_finance_owner(&state.config,&u.email),
+        "verified":verified,"termsVersion":TERMS_VERSION,"claimGraceSeconds":120,"firstPurchaseMaxMinor":10000}),
     ))
 }
 async fn seller(State(state): State<ServerState>, headers: HeaderMap) -> Reply<serde_json::Value> {
     let u = session(&state, &headers).await?;
     let conn = state.store.conn.lock().await;
+    let mut blockers = seller_blockers_tx(&conn, &u.user_id, &crate::market_wallet::now())?;
+    if !email_ready(&state) {
+        blockers.push("C2C_EMAIL_UNAVAILABLE");
+    }
     Ok(reply(
         serde_json::json!({"seller":seller_tx(&conn,&u.user_id)?,
+        "blockers":blockers,"canEnable":blockers.is_empty(),
         "admissionBalanceUnits":admission_balance_tx(&conn,&u.user_id,&crate::market_wallet::now())?.to_string(),
         "availableUnits":stock_tx(&conn,&u.user_id,&crate::market_wallet::now())?.to_string()}),
     ))

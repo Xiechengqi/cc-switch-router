@@ -73,6 +73,7 @@ pub struct RecurringFundingSummaryView {
     pub topup_unavailable_reason: Option<String>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct RecurringRelationshipSummary {
     pub active_contract_count: i64,
@@ -148,6 +149,7 @@ fn map_db(context: &'static str) -> impl FnOnce(crate::db::Error) -> AppError {
     move |error| AppError::Internal(format!("{context} failed: {error}"))
 }
 
+#[cfg(test)]
 pub(crate) fn recurring_relationship_summary(
     conn: &Connection,
     buyer_user_id: &str,
@@ -2790,6 +2792,8 @@ mod tests {
         )
         .expect("summarize manual renewal");
         assert_eq!(manual.active_contract_count, 1);
+        assert_eq!(manual.monthly_commitment_minor, 1_000);
+        assert!(manual.next_renewal_at.is_some());
         assert_eq!(manual.next_renewal_minor, 1_000);
         assert_eq!(manual.next_funding_required_minor, 1_000);
 
