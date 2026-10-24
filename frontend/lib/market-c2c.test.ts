@@ -19,8 +19,8 @@ test("capabilities give distinct actionable blockers and never depend on officia
   assert.throws(() => validC2CCapability(["C2C_DISABLED", "C2C_DISABLED"], false));
   assert.throws(() => validC2CCapability(["TOPUP_SHADOW" as typeof C2C_BLOCKERS[number]], false));
 });
-const pending: C2CPending = { actor: "buyer", key: "original-key", quote: { id: "quote", sellerId: "seller", sellerName: "C2C-seller", sellerVersion: 1, creditMinor: 1000, payMinor: 1000, currency: "USD", fxMicros: 1_000_000, priceBps: 10000, description: "Bank transfer, contact @seller", expiresAt: "2026-10-22T12:05:00Z" } };
-const order: C2COrder = { id: "order", quoteId: "quote", buyerId: "buyer", sellerId: "seller", amountUnits: "86400000", status: "awaiting_payment", version: 1, paymentDeadline: "2026-10-22T12:30:00Z", paidAt: null, releasedAt: null, latePaymentReported: false, latePaymentResolved: false, createdAt: "2026-10-22T12:00:00Z", updatedAt: "2026-10-22T12:00:00Z", sellerName: "C2C-seller", payMinor: 1000, currency: "USD", fxMicros: 1_000_000, priceBps: 10000, description: pending.quote.description, legacyPayment: null };
+const pending: C2CPending = { actor: "buyer", key: "original-key", quote: { id: "quote", sellerId: "seller", sellerName: "C2C-seller", sellerVersion: 1, creditMinor: 1000, payMinor: 1000, currency: "USD", fxMicros: 1_000_000, priceBps: 10000, description: "Bank transfer, contact @seller", expiresAt: "2026-10-22T12:05:00Z", flowVersion: 2, acceptanceMinutes: 10 } };
+const order: C2COrder = { id: "order", quoteId: "quote", buyerId: "buyer", sellerId: "seller", amountUnits: "86400000", status: "awaiting_payment", version: 2, paymentDeadline: "2026-10-22T12:30:00Z", flowVersion: 2, acceptanceDeadline: "2026-10-22T12:10:00Z", acceptedAt: "2026-10-22T12:00:00Z", paidAt: null, releasedAt: null, latePaymentReported: false, latePaymentResolved: false, createdAt: "2026-10-22T12:00:00Z", updatedAt: "2026-10-22T12:00:00Z", sellerName: "C2C-seller", payMinor: 1000, currency: "USD", fxMicros: 1_000_000, priceBps: 10000, description: pending.quote.description, legacyPayment: null };
 function storage() { const data = new Map<string, string>(); return { getItem: (key: string) => data.get(key) ?? null, setItem: (key: string, value: string) => { data.set(key, value); } }; }
 test("order recovery preserves user, quote and original key across reload and expired previews", () => {
   const s = storage(); writeC2CPending(s, pending); assert.deepEqual(readC2CPending(s, "buyer"), pending); assert.equal(readC2CPending(s, "other"), null);
@@ -85,14 +85,14 @@ test("financial projections bind payable amount to currency, rate and price usin
   assert.throws(() => validC2COrder({ ...order, latePaymentResolved: true }));
 });
 test("seller, event and policy projections reject incomplete or unsafe operational data", () => {
-  const seller: C2CSeller = { userId: "seller", version: 1, enabled: true, suspended: false, displayName: "C2C-seller", description: "Contact @seller", currency: "USD", priceBps: 10000, minMinor: 1, maxMinor: 500000, heartbeatAt: order.createdAt };
+  const seller: C2CSeller = { userId: "seller", version: 1, enabled: true, suspended: false, displayName: "C2C-seller", description: "Contact @seller", currency: "USD", priceBps: 10000, minMinor: 1, maxMinor: 500000, autoPauseReason: null, autoPausedAt: null, autoPauseOrderId: null };
   assert.deepEqual(validC2CSeller(seller), seller);
-  for (const changes of [{ enabled: "false" }, { displayName: "" }, { description: null }, { description: "" }, { minMinor: 0 }, { maxMinor: 10000001 }, { heartbeatAt: "missing" }]) assert.throws(() => validC2CSeller({ ...seller, ...changes } as C2CSeller));
+  for (const changes of [{ enabled: "false" }, { displayName: "" }, { description: null }, { description: "" }, { minMinor: 0 }, { maxMinor: 10000001 }, { autoPauseReason: "missing" }]) assert.throws(() => validC2CSeller({ ...seller, ...changes } as C2CSeller));
   assert.doesNotThrow(() => validC2CSeller({ ...seller, enabled: false, description: "" }));
   const event: C2CEvent = { id: "event", actorId: "system", action: "release_reminder", note: "", createdAt: order.createdAt };
   assert.deepEqual(validC2CEvent(event), event);
   assert.throws(() => validC2CEvent({ ...event, note: null } as unknown as C2CEvent));
-  assert.throws(() => validC2CPolicy({ version: 1, enabled: false, admissionMinor: 99, minMinor: 1, maxMinor: 500000, paymentMinutes: 30 }));
+  assert.throws(() => validC2CPolicy({ version: 1, enabled: false, admissionMinor: 99, minMinor: 1, maxMinor: 500000, paymentMinutes: 30, acceptanceMinutes: 10 }));
 });
 test("every C2C UI and mandatory notification message has matching English and Chinese interpolation keys", () => {
   assert.deepEqual(Object.keys(marketC2CMessagesEn).sort(), Object.keys(marketC2CMessagesZh).sort());
@@ -112,4 +112,43 @@ test("recovery binds the public description and legacy private instructions stay
   assert.throws(() => matchC2COrder(order, { ...order, description: "Changed" }));
   assert.doesNotThrow(() => validC2COrder({ ...order, description: null, legacyPayment: { contact: "Original contact", paymentMethod: "Bank", paymentDetails: "Original account" } }));
   assert.throws(() => validC2COrder({ ...order, legacyPayment: { contact: "Contact", paymentMethod: "Bank", paymentDetails: "Account" } }));
+});
+
+test("applications have no payable window until the seller explicitly accepts", () => {
+  const application: C2COrder = { ...order, status: "awaiting_seller", version: 1, acceptedAt: null, paymentDeadline: null };
+  assert.deepEqual(validC2COrder(application), application);
+  assert.deepEqual(c2cPaymentWindow(application, Date.parse(order.createdAt)), { mayStartPayment: false, mayClaimPayment: false });
+  assert.deepEqual(matchC2COrder(application, order), order);
+  for (const changes of [{ paymentDeadline: order.paymentDeadline }, { acceptedAt: order.acceptedAt }, { acceptanceDeadline: null }, { flowVersion: 1 }, { status: "paid", paidAt: order.createdAt }]) {
+    assert.throws(() => validC2COrder({ ...application, ...changes } as C2COrder));
+  }
+  const earlyClaim = { ...application, status: "disputed" as const, paidAt: order.createdAt, latePaymentReported: true };
+  assert.deepEqual(validC2COrder(earlyClaim), earlyClaim);
+});
+
+test("accepted timestamps and flow version stay frozen across mutations", () => {
+  for (const changes of [{ acceptedAt: "2026-10-22T12:01:00Z" }, { acceptanceDeadline: "2026-10-22T12:11:00Z" }, { paymentDeadline: "2026-10-22T12:31:00Z" }]) {
+    assert.throws(() => matchC2COrder(order, { ...order, ...changes }));
+  }
+  assert.throws(() => validC2COrder({ ...order, acceptedAt: order.acceptanceDeadline }));
+  assert.throws(() => validC2COrder({ ...order, paymentDeadline: order.acceptedAt }));
+  assert.throws(() => matchC2CPendingOrder(pending, { ...order, flowVersion: 1, acceptanceDeadline: null, acceptedAt: null }));
+});
+
+test("old local submissions recover only their original version-one order", () => {
+  const s = storage(); const quote: Record<string, unknown> = { ...pending.quote };
+  delete quote.flowVersion; delete quote.acceptanceMinutes;
+  s.setItem(C2C_PENDING_PREFIX + "buyer", JSON.stringify({ ...pending, quote }));
+  const recovered = readC2CPending(s, "buyer")!;
+  assert.equal(recovered.quote.flowVersion, 1);
+  assert.deepEqual(matchC2CPendingOrder(recovered, { ...order, flowVersion: 1, acceptanceDeadline: null, acceptedAt: null }).flowVersion, 1);
+  assert.throws(() => matchC2CPendingOrder(recovered, order));
+});
+
+test("acceptance policy and quote windows fail closed on missing or out-of-range values", () => {
+  const policy = { version: 1, enabled: true, admissionMinor: 10000, minMinor: 100, maxMinor: 500000, paymentMinutes: 30, acceptanceMinutes: 10 };
+  for (const acceptanceMinutes of [undefined, 0, 4, 31, 10.5]) {
+    assert.throws(() => validC2CPolicy({ ...policy, acceptanceMinutes } as typeof policy));
+    assert.throws(() => validC2CQuote({ ...pending.quote, acceptanceMinutes } as typeof pending.quote));
+  }
 });

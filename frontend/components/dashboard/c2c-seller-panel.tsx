@@ -38,7 +38,7 @@ export function C2CSellerPanel({ policy, snapshot, availabilityError, onRefresh,
   const descriptionValid = validC2CDescription(description.trim());
   const termsValid = low != null && high != null && high >= low && bps != null && bps >= 5000 && bps <= 20000;
   const versionChanged = (snapshot.seller?.version ?? 0) !== (original?.version ?? 0);
-  const blocked = availabilityError ? "c2c.eligibilityFailed" : snapshot.blockers[0] ? c2cBlockerKey(snapshot.blockers[0]) : null;
+  const blocked = availabilityError ? "c2c.eligibilityFailed" : snapshot.seller?.autoPauseReason ? "c2c.error.autoPaused" : snapshot.blockers[0] ? c2cBlockerKey(snapshot.blockers[0]) : null;
   const save = async () => {
     if (lock.current || versionChanged || !descriptionValid || !termsValid || !ack || blocked || low == null || high == null || bps == null) return;
     lock.current = true; setBusy(true); onBusyChange(true); setError(""); setStale(false);
@@ -97,6 +97,7 @@ export function C2CSellerPanel({ policy, snapshot, availabilityError, onRefresh,
     </details>
     {!termsValid ? <p role="alert" className="text-sm text-destructive">{t("c2c.termsError")}</p> : null}
     <C2CCheck checked={ack} disabled={busy} onChange={event => setAck(event.target.checked)}>{t("c2c.sellerAck")}</C2CCheck>
+    <p className="text-xs text-muted-foreground">{t("c2c.persistentSelling")}</p>
     <div id={fieldId + "-eligibility"} aria-live="polite" className="grid min-w-0 gap-2 text-sm text-muted-foreground">
       {blocked ? <p>{t(blocked)}</p> : null}
       {!availabilityError && snapshot.blockers.length > 1 ? <details><summary className="min-h-11 cursor-pointer rounded-md py-2 focus-visible:outline-2 focus-visible:outline-ring">{t("c2c.moreBlockers")}</summary><ul className="grid gap-2">{snapshot.blockers.slice(1).map(code => <li key={code}>{t(c2cBlockerKey(code))}</li>)}</ul></details> : null}

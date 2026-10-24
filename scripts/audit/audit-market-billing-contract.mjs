@@ -103,9 +103,24 @@ function allowedLegacyAssertion(relativePath, source, index, ruleName) {
     return true;
   }
   if (relativePath === "src/schema.rs" && ruleName === "product payment deadline") {
-    const declaration = "fn migration_80_requires_explicit_publication_and_preserves_private_quote_evidence()";
-    const start = source.indexOf(declaration);
-    if (start >= 0 && index >= start && index < start + extractRustBlock(source, declaration).length) return true;
+    for (const declaration of [
+      "fn migration_80_requires_explicit_publication_and_preserves_private_quote_evidence()",
+      "fn migration_83_preserves_active_reservations_evidence_and_running_deadlines()",
+    ]) {
+      const start = source.indexOf(declaration);
+      if (start >= 0 && index >= start && index < start + extractRustBlock(source, declaration).length) return true;
+    }
+  }
+  if (relativePath === "src/market_notifications.rs" && ruleName === "product payment deadline") {
+    // C2C delivery rechecks its own live deadline before sending actionable
+    // instructions. Do not exempt unrelated notification/payment code.
+    for (const declaration of [
+      "fn c2c_notice_current_tx(",
+      "fn c2c_delivery_discards_stale_instructions_and_revoked_or_conflicting_handlers()",
+    ]) {
+      const start = source.indexOf(declaration);
+      if (start >= 0 && index >= start && index < start + extractRustBlock(source, declaration).length) return true;
+    }
   }
   if (
     relativePath === "src/market_recurring.rs"

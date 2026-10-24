@@ -689,10 +689,22 @@ fn render(item: &Claimed, dashboard: &str) -> (String, String) {
         return (subject, body);
     }
     if item.event_kind == "c2c_seller_changed" {
+        let change = match item.payload.get("reason").and_then(Value::as_str) {
+            Some("acceptance_upgrade") => {
+                "挂售现在持续有效，不再要求停留钱包页；收到购入申请后，请在接单期限内处理。"
+            }
+            Some("acceptance_timeout") => {
+                "有购入申请超时未接单，已暂停接收新申请。请在平台余额页检查后手动恢复出售。"
+            }
+            Some("paid_order_overdue") => {
+                "有已标记付款的订单超过 60 分钟未处理，已暂停新申请。已有订单的余额仍受保护，请先处理订单。"
+            }
+            _ => "C2C 出售设置已更新，请在平台余额页核对。",
+        };
         return (
             format!("{subject_zh} / {subject_en}"),
             format!(
-                "C2C 出售设置已更新，请在平台余额页核对。已有订单仍需处理；平台不能自动核实线下付款。\nC2C seller settings changed. Review your wallet; existing orders remain actionable. Offline payments are not verified by the platform.\n\n{}/account/wallet/",
+                "{change} 已有订单仍需处理；平台不能自动核实线下付款。\nC2C seller settings changed. Review your wallet; existing orders remain actionable. Offline payments are not verified by the platform.\n\n{}/account/wallet/",
                 dashboard.trim_end_matches('/')
             ),
         );
@@ -709,6 +721,7 @@ fn render(item: &Claimed, dashboard: &str) -> (String, String) {
             .and_then(Value::as_str)
             .unwrap_or("");
         let zh_status = match status {
+            "awaiting_seller" => "等待卖家接单，请勿付款",
             "awaiting_payment" => "待付款",
             "paid" => "买家已标记付款，待卖家核实",
             "disputed" => "争议处理中",
@@ -717,10 +730,31 @@ fn render(item: &Claimed, dashboard: &str) -> (String, String) {
             "expired" => "已超时",
             _ => "设置已更新",
         };
+        let role = item
+            .payload
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let instruction = match (status, role) {
+            ("awaiting_seller", "seller") => {
+                "有新的购入申请。请登录平台余额页，在接单期限内接单或拒绝；超时将暂停新申请。"
+            }
+            ("awaiting_payment", "buyer") => {
+                "卖家已接单。请登录订单查看付款信息和剩余时间；页面显示订单已关闭时请勿付款。"
+            }
+            ("paid", "seller") => "买家已标记付款。请亲自核实收款后再放行余额；平台不会自动放行。",
+            ("disputed", _) => "请在订单中补充证据，等待独立处理。争议中的余额不会自动解冻。",
+            _ => "请登录订单查看当前状态，以页面为准。",
+        };
+        let destination = if role == "handler" {
+            format!("settings/?panel=market_finance&c2cOrder={id}")
+        } else {
+            format!("account/wallet/?c2cOrder={id}")
+        };
         return (
             format!("{subject_zh} / {subject_en}"),
             format!(
-                "{subject_zh}：{zh_status}。金额：{}。平台不能自动核实线下付款，请在订单内核对；请勿向他人透露放行验证码。\n{subject_en}: {status}. Offline payment is not verified by the platform. Review the order; never share release codes.\n\n{}/account/wallet/?c2cOrder={id}",
+                "{subject_zh}：{zh_status}。{instruction} 金额：{}。平台不能自动核实线下付款，请在订单内核对；请勿向他人透露放行验证码。\n{subject_en}: {status}. Review the current order before taking action; acceptance is required before payment. Offline payment is not verified by the platform. Never share release codes.\n\n{}/{destination}",
                 amount.as_deref().unwrap_or("—"),
                 dashboard.trim_end_matches('/')
             ),
@@ -860,6 +894,34 @@ async fn deliver(
     http: &reqwest::Client,
     item: &Claimed,
 ) -> Result<String, String> {
+    if item.event_kind == "c2c_order_updated"
+        && item.payload.get("role").and_then(Value::as_str) == Some("handler")
+    {
+        let email = {
+            let conn = state.store.conn.lock().await;
+            conn.query_row(
+                "SELECT email_normalized FROM users WHERE id=?1",
+                params![item.recipient_user_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+        };
+        let dynamic = state.dynamic.read().await;
+        if email.as_ref().is_none_or(|email| !dynamic.is_admin(email)) {
+            return Ok("superseded".into());
+        }
+    }
+    // Retried outbox items must not resurrect an acceptance/payment window.
+    // The message still directs the user to the live, authenticated order.
+    if item.event_kind == "c2c_order_updated" || item.event_kind == "c2c_seller_changed" {
+        let conn = state.store.conn.lock().await;
+        if !c2c_notice_current_tx(&conn, item, &crate::market_wallet::now())
+            .map_err(|e| e.to_string())?
+        {
+            return Ok("superseded".into());
+        }
+    }
     let recipient = {
         let conn = state.store.conn.lock().await;
         recipient_tx(&conn, item).map_err(|error| error.to_string())?
@@ -938,6 +1000,28 @@ async fn deliver(
     } else {
         delivered.join(",")
     })
+}
+
+fn c2c_notice_current_tx(conn: &Connection, item: &Claimed, time: &str) -> Result<bool, AppError> {
+    if item.event_kind == "c2c_seller_changed" {
+        if let Some(reason @ ("acceptance_timeout" | "paid_order_overdue")) =
+            item.payload.get("reason").and_then(Value::as_str)
+        {
+            return conn.query_row("SELECT EXISTS(SELECT 1 FROM market_c2c_sellers WHERE user_id=?1 AND enabled=1 AND auto_pause_reason=?2)",params![item.recipient_user_id,reason],|r|r.get(0)).map_err(db_error("recheck C2C pause notice"));
+        }
+        return Ok(true);
+    }
+    let Some(id) = item.payload.get("orderId").and_then(Value::as_str) else {
+        return Ok(false);
+    };
+    let Some(status) = item.payload.get("status").and_then(Value::as_str) else {
+        return Ok(false);
+    };
+    let handler = item.payload.get("role").and_then(Value::as_str) == Some("handler");
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM market_c2c_orders WHERE id=?1 AND status=?2 AND ((?5=0 AND (buyer_id=?3 OR seller_id=?3)) OR (?5=1 AND buyer_id!=?3 AND seller_id!=?3 AND EXISTS(SELECT 1 FROM market_c2c_dispute_handlers WHERE user_id=?3 AND enabled=1)))
+        AND EXISTS(SELECT 1 FROM users u WHERE u.id=?3 AND u.status='active' AND u.email_verified_at IS NOT NULL)
+        AND (status!='awaiting_seller' OR julianday(acceptance_deadline)>julianday(?4))
+        AND (status!='awaiting_payment' OR julianday(payment_deadline)>julianday(?4)))",params![id,status,item.recipient_user_id,time,handler],|r|r.get(0)).map_err(db_error("recheck C2C actionable notice"))
 }
 
 fn finish_tx(
@@ -1040,6 +1124,88 @@ mod tests {
         let conn = Connection::open_in_memory().expect("open notification DB");
         crate::schema::apply(&conn).expect("apply schema");
         conn
+    }
+
+    #[test]
+    fn c2c_delivery_discards_stale_instructions_and_revoked_or_conflicting_handlers() {
+        // Only notification projections are needed here; wallet accounting
+        // and the real migration are covered by the C2C/schema suites.
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE users(id TEXT,status TEXT,email_verified_at TEXT);
+            CREATE TABLE market_c2c_dispute_handlers(user_id TEXT,enabled INTEGER);
+            CREATE TABLE market_c2c_sellers(user_id TEXT,enabled INTEGER,auto_pause_reason TEXT);
+            CREATE TABLE market_c2c_orders(id TEXT,buyer_id TEXT,seller_id TEXT,status TEXT,acceptance_deadline TEXT,payment_deadline TEXT);
+            INSERT INTO users VALUES('buyer','active','verified'),('seller','active','verified'),('handler','active','verified');
+            INSERT INTO market_c2c_orders VALUES('order','buyer','seller','awaiting_seller','2026-10-22T12:10:00Z',NULL);
+            INSERT INTO market_c2c_dispute_handlers VALUES('handler',1),('seller',1);
+            INSERT INTO market_c2c_sellers VALUES('seller',1,'acceptance_timeout');").unwrap();
+        let mut item = Claimed {
+            id: "notice".into(),
+            recipient_user_id: "seller".into(),
+            event_kind: "c2c_order_updated".into(),
+            payload: json!({"orderId":"order","status":"awaiting_seller","role":"seller"}),
+            mandatory: true,
+            attempts: 3,
+        };
+        assert!(c2c_notice_current_tx(&c, &item, "2026-10-22T12:09:59Z").unwrap());
+        assert!(!c2c_notice_current_tx(&c, &item, "2026-10-22T12:10:00Z").unwrap());
+        c.execute("UPDATE market_c2c_orders SET status='awaiting_payment',payment_deadline='2026-10-22T12:35:00Z'",[]).unwrap();
+        assert!(!c2c_notice_current_tx(&c, &item, "2026-10-22T12:09:59Z").unwrap());
+        item.recipient_user_id = "buyer".into();
+        item.payload = json!({"orderId":"order","status":"awaiting_payment","role":"buyer"});
+        assert!(c2c_notice_current_tx(&c, &item, "2026-10-22T12:34:59Z").unwrap());
+        assert!(!c2c_notice_current_tx(&c, &item, "2026-10-22T12:35:00Z").unwrap());
+        c.execute("UPDATE market_c2c_orders SET status='disputed'", [])
+            .unwrap();
+        item.recipient_user_id = "handler".into();
+        item.payload = json!({"orderId":"order","status":"disputed","role":"handler"});
+        assert!(c2c_notice_current_tx(&c, &item, "2026-10-22T13:00:00Z").unwrap());
+        c.execute(
+            "UPDATE market_c2c_dispute_handlers SET enabled=0 WHERE user_id='handler'",
+            [],
+        )
+        .unwrap();
+        assert!(!c2c_notice_current_tx(&c, &item, "2026-10-22T13:00:00Z").unwrap());
+        c.execute(
+            "UPDATE market_c2c_dispute_handlers SET enabled=1 WHERE user_id='handler'",
+            [],
+        )
+        .unwrap();
+        c.execute("UPDATE users SET status='blocked' WHERE id='handler'", [])
+            .unwrap();
+        assert!(!c2c_notice_current_tx(&c, &item, "2026-10-22T13:00:00Z").unwrap());
+        item.recipient_user_id = "seller".into();
+        assert!(
+            !c2c_notice_current_tx(&c, &item, "2026-10-22T13:00:00Z").unwrap(),
+            "even a granted handler cannot receive management instructions for their own order"
+        );
+        item.event_kind = "c2c_seller_changed".into();
+        item.payload = json!({"reason":"acceptance_timeout"});
+        assert!(c2c_notice_current_tx(&c, &item, "2026-10-22T13:00:00Z").unwrap());
+        c.execute("UPDATE market_c2c_sellers SET auto_pause_reason=NULL", [])
+            .unwrap();
+        assert!(!c2c_notice_current_tx(&c, &item, "2026-10-22T13:00:00Z").unwrap());
+    }
+
+    #[test]
+    fn c2c_acceptance_notices_use_role_specific_actions_without_external_payment_instructions() {
+        let item = Claimed {
+            id: "notice".into(),
+            recipient_user_id: "seller".into(),
+            event_kind: "c2c_order_updated".into(),
+            payload: json!({"orderId":"order","status":"awaiting_seller","role":"seller"}),
+            mandatory: true,
+            attempts: 1,
+        };
+        let (_, text) = render(&item, "https://router.example");
+        assert!(text.contains("接单或拒绝"));
+        assert!(text.contains("请勿付款"));
+        let handler = Claimed {
+            payload: json!({"orderId":"order","status":"disputed","role":"handler"}),
+            ..item
+        };
+        let (_, text) = render(&handler, "https://router.example");
+        assert!(text.ends_with("/settings/?panel=market_finance&c2cOrder=order"));
     }
 
     #[test]

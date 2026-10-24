@@ -3,25 +3,27 @@ import { ApiError, parseJson } from "@/lib/api";
 import type { MessageKey } from "@/lib/i18n";
 import { parseNonNegativeUsdMinor } from "@/lib/market-wallet-money";
 
-export type C2CPolicy = { version: number; enabled: boolean; admissionMinor: number; minMinor: number; maxMinor: number; paymentMinutes: number };
-export const C2C_BLOCKERS = ["C2C_DISABLED", "C2C_TRANSFERS_DISABLED", "C2C_TRANSFERS_PAUSED", "C2C_ACCOUNT_INACTIVE", "C2C_IDENTITY", "C2C_FINANCE_HOLD", "C2C_SUSPENDED", "C2C_ADMISSION", "C2C_EMAIL_UNAVAILABLE"] as const;
+export type C2CPolicy = { version: number; enabled: boolean; admissionMinor: number; minMinor: number; maxMinor: number; paymentMinutes: number; acceptanceMinutes: number };
+export const C2C_BLOCKERS = ["C2C_DISABLED", "C2C_TRANSFERS_DISABLED", "C2C_TRANSFERS_PAUSED", "C2C_ACCOUNT_INACTIVE", "C2C_IDENTITY", "C2C_FINANCE_HOLD", "C2C_SUSPENDED", "C2C_ADMISSION", "C2C_EMAIL_UNAVAILABLE", "C2C_OVERDUE_ORDERS"] as const;
 export type C2CBlocker = (typeof C2C_BLOCKERS)[number];
-export type C2CPolicyView = { policy: C2CPolicy; available: boolean; blockers: C2CBlocker[]; canManagePolicy: boolean; verified: boolean; termsVersion: number; claimGraceSeconds: number; firstPurchaseMaxMinor: number };
+export type C2CPolicyView = { policy: C2CPolicy; available: boolean; blockers: C2CBlocker[]; canManagePolicy: boolean; verified: boolean; termsVersion: number; claimGraceSeconds: number; firstPurchaseMaxMinor: number; independentDisputeHandlerAvailable: boolean };
 export type C2CSeller = {
   userId: string; version: number; enabled: boolean; suspended: boolean; displayName: string; description: string;
-  currency: "USD" | "CNY"; priceBps: number; minMinor: number; maxMinor: number; heartbeatAt: string;
+  currency: "USD" | "CNY"; priceBps: number; minMinor: number; maxMinor: number;
+  autoPauseReason: "acceptance_timeout" | "paid_order_overdue" | null; autoPausedAt: string | null; autoPauseOrderId: string | null;
 };
-export type C2CSellerInput = Omit<C2CSeller, "userId" | "version" | "suspended" | "heartbeatAt" | "displayName"> & { expectedVersion: number; acknowledgeExternalPayment: boolean };
-export type C2CSellerSnapshot = { seller: C2CSeller | null; admissionBalanceUnits: string; availableUnits: string; blockers: C2CBlocker[]; canEnable: boolean };
+export type C2CSellerInput = Omit<C2CSeller, "userId" | "version" | "suspended" | "displayName" | "autoPauseReason" | "autoPausedAt" | "autoPauseOrderId"> & { expectedVersion: number; acknowledgeExternalPayment: boolean };
+export const C2C_SELLER_STATES = ["not_selling", "selling", "paused", "auto_paused", "suspended", "insufficient_stock", "unavailable", "order_limit"] as const;
+export type C2CSellerSnapshot = { seller: C2CSeller | null; admissionBalanceUnits: string; availableUnits: string; blockers: C2CBlocker[]; canEnable: boolean; state: (typeof C2C_SELLER_STATES)[number]; pendingOrders: number };
 export type C2COffer = Pick<C2CSeller, "version" | "displayName" | "description" | "currency" | "priceBps" | "minMinor" | "maxMinor"> & {
   sellerId: string; availableMinor: number; completedOrders: number;
 };
-export type C2CQuote = { id: string; sellerId: string; sellerName: string; sellerVersion: number; creditMinor: number; payMinor: number; currency: "USD" | "CNY"; fxMicros: number; priceBps: number; description: string; expiresAt: string };
-export const C2C_STATUSES = ["awaiting_payment", "paid", "disputed", "released", "cancelled", "expired"] as const;
+export type C2CQuote = { id: string; sellerId: string; sellerName: string; sellerVersion: number; creditMinor: number; payMinor: number; currency: "USD" | "CNY"; fxMicros: number; priceBps: number; description: string; expiresAt: string; flowVersion: 1 | 2; acceptanceMinutes: number };
+export const C2C_STATUSES = ["awaiting_seller", "awaiting_payment", "paid", "disputed", "released", "cancelled", "expired"] as const;
 export type C2CStatus = (typeof C2C_STATUSES)[number];
 export type C2COrder = {
   id: string; quoteId: string; buyerId: string; sellerId: string; amountUnits: string; status: C2CStatus; version: number;
-  paymentDeadline: string; paidAt: string | null; releasedAt: string | null; latePaymentReported: boolean; latePaymentResolved: boolean;
+  paymentDeadline: string | null; flowVersion: 1 | 2; acceptanceDeadline: string | null; acceptedAt: string | null; paidAt: string | null; releasedAt: string | null; latePaymentReported: boolean; latePaymentResolved: boolean;
   createdAt: string; updatedAt: string; sellerName: string; payMinor: number; currency: "USD" | "CNY"; fxMicros: number; priceBps: number;
   description: string | null;
   legacyPayment: { contact: string; paymentMethod: string; paymentDetails: string } | null;
@@ -95,12 +97,14 @@ function validTerms(creditMinor: number, payMinor: number, code: string, fx: num
 export function validC2CPolicy(p: C2CPolicy): C2CPolicy {
   if (!p || !integer(p.version) || typeof p.enabled !== "boolean" || !integer(p.admissionMinor) || !integer(p.minMinor)
     || p.admissionMinor < 100 || p.admissionMinor > 10_000_000 || !integer(p.maxMinor) || p.maxMinor > 10_000_000
-    || p.maxMinor < p.minMinor || !integer(p.paymentMinutes) || p.paymentMinutes < 5 || p.paymentMinutes > 60) invalid();
+    || p.maxMinor < p.minMinor || !integer(p.paymentMinutes) || p.paymentMinutes < 5 || p.paymentMinutes > 60
+    || !integer(p.acceptanceMinutes) || p.acceptanceMinutes < 5 || p.acceptanceMinutes > 30) invalid();
   return p;
 }
 export function validC2CQuote(q: C2CQuote): C2CQuote {
   if (!q || !id(q.id) || !id(q.sellerId) || !integer(q.sellerVersion) || !boundedText(q.sellerName, 60)
-    || !validC2CDescription(q.description) || !date(q.expiresAt)) invalid();
+    || !validC2CDescription(q.description) || !date(q.expiresAt) || ![1, 2].includes(q.flowVersion)
+    || !integer(q.acceptanceMinutes) || q.acceptanceMinutes < 5 || q.acceptanceMinutes > 30) invalid();
   validTerms(q.creditMinor, q.payMinor, q.currency, q.fxMicros, q.priceBps);
   return q;
 }
@@ -108,13 +112,17 @@ export function validC2COrder(o: C2COrder): C2COrder {
   if (!o || !id(o.id) || !id(o.quoteId) || !id(o.buyerId) || !id(o.sellerId) || o.buyerId === o.sellerId || !integer(o.version)
     || !C2C_STATUSES.includes(o.status) || typeof o.amountUnits !== "string" || !/^[1-9]\d{0,18}$/.test(o.amountUnits)
     || BigInt(o.amountUnits) > 9_223_372_036_854_775_807n || BigInt(o.amountUnits) % 86_400n !== 0n
-    || !date(o.paymentDeadline) || !date(o.createdAt) || !date(o.updatedAt) || !boundedText(o.sellerName, 60)
+    || ![1, 2].includes(o.flowVersion) || !date(o.createdAt) || !date(o.updatedAt) || !boundedText(o.sellerName, 60)
+    || (o.flowVersion === 1 ? (!date(o.paymentDeadline) || o.acceptanceDeadline !== null || o.acceptedAt !== null || o.status === "awaiting_seller")
+      : (!date(o.acceptanceDeadline) || (o.acceptedAt === null
+        ? o.paymentDeadline !== null || !["awaiting_seller", "disputed", "released", "cancelled", "expired"].includes(o.status)
+        : !date(o.acceptedAt) || !date(o.paymentDeadline) || o.status === "awaiting_seller" || Date.parse(o.acceptedAt) >= Date.parse(o.acceptanceDeadline!) || Date.parse(o.paymentDeadline!) <= Date.parse(o.acceptedAt))))
     || typeof o.latePaymentReported !== "boolean" || typeof o.latePaymentResolved !== "boolean"
     || (o.latePaymentResolved && !o.latePaymentReported)
     || (o.description !== null && !validC2CDescription(o.description))
     || (o.legacyPayment !== null && (!o.legacyPayment || o.description !== null || !boundedText(o.legacyPayment.contact, 300)
       || !boundedText(o.legacyPayment.paymentMethod, 60) || !boundedText(o.legacyPayment.paymentDetails, 1500)))
-    || (o.paidAt !== null && !date(o.paidAt)) || (o.status === "awaiting_payment" && o.paidAt !== null)
+    || (o.paidAt !== null && !date(o.paidAt)) || (["awaiting_seller", "awaiting_payment"].includes(o.status) && o.paidAt !== null)
     || (["paid", "disputed", "released"].includes(o.status) && !date(o.paidAt))
     || (o.status === "released" ? !date(o.releasedAt) : o.releasedAt !== null)) invalid();
   validTerms(Number(BigInt(o.amountUnits) / 86_400n), o.payMinor, o.currency, o.fxMicros, o.priceBps);
@@ -124,7 +132,9 @@ export function validC2CSeller(s: C2CSeller): C2CSeller {
   if (!s || !id(s.userId) || !integer(s.version) || typeof s.enabled !== "boolean" || typeof s.suspended !== "boolean"
     || !boundedText(s.displayName, 60) || !validC2CDescription(s.description, !s.enabled)
     || !currency(s.currency) || !integer(s.priceBps) || s.priceBps < 5000 || s.priceBps > 20000 || !integer(s.minMinor)
-    || !integer(s.maxMinor) || s.maxMinor < s.minMinor || s.maxMinor > 10_000_000 || !date(s.heartbeatAt)) invalid();
+    || !integer(s.maxMinor) || s.maxMinor < s.minMinor || s.maxMinor > 10_000_000
+    || (s.autoPauseReason === null ? s.autoPausedAt !== null || s.autoPauseOrderId !== null
+      : !["acceptance_timeout", "paid_order_overdue"].includes(s.autoPauseReason) || !date(s.autoPausedAt) || !id(s.autoPauseOrderId))) invalid();
   return s;
 }
 export function validC2CEvent(e: C2CEvent): C2CEvent {
@@ -146,45 +156,49 @@ async function request<T>(path: string, body?: unknown, method = "POST", key?: s
 }
 export async function getC2CPolicy() {
   const p = await request<C2CPolicyView>(`${BASE}/policy`); validC2CPolicy(p?.policy);
-  if (typeof p.available !== "boolean" || typeof p.verified !== "boolean" || p.termsVersion !== 1 || p.claimGraceSeconds !== 120 || p.firstPurchaseMaxMinor !== 10000) invalid();
+  if (typeof p.available !== "boolean" || typeof p.verified !== "boolean" || p.termsVersion !== 2 || p.claimGraceSeconds !== 120 || p.firstPurchaseMaxMinor !== 10000 || typeof p.independentDisputeHandlerAvailable !== "boolean") invalid();
   validC2CCapability(p.blockers, p.available);
   if (typeof p.canManagePolicy !== "boolean") invalid();
   return p;
 }
 export async function getC2CSeller() {
   const p = await request<C2CSellerSnapshot>(`${BASE}/seller`);
-  if (!p || !validUnits(p.admissionBalanceUnits) || !validUnits(p.availableUnits)) invalid();
+  if (!p || !validUnits(p.admissionBalanceUnits) || !validUnits(p.availableUnits) || !C2C_SELLER_STATES.includes(p.state) || !nonnegative(p.pendingOrders)) invalid();
   validC2CCapability(p.blockers, p.canEnable);
   if (p.seller !== null) validC2CSeller(p.seller);
   return p;
 }
 export const saveC2CSeller = async (s: C2CSellerInput) => validC2CSeller(await request<C2CSeller>(`${BASE}/seller`, s, "PUT"));
 export const pauseC2CSeller = async (s: C2CSeller) => validC2CSeller(await request<C2CSeller>(`${BASE}/seller/pause`, { expectedVersion: s.version }));
-export const heartbeatC2C = () => request(`${BASE}/seller/heartbeat`, {});
+export const resumeC2CSeller = async (s: C2CSeller) => validC2CSeller(await request<C2CSeller>(`${BASE}/seller/resume`, { expectedVersion: s.version }));
 export async function getC2COffers(before = "") {
-  const p = validPage(await request<C2CPage<C2COffer>>(`${BASE}/sellers?before=${encodeURIComponent(before)}`));
+  const p = await request<C2CPage<C2COffer> & { emptyReason: "platform_paused" | "no_matching_sellers" | "no_other_sellers" | null }>(`${BASE}/sellers?before=${encodeURIComponent(before)}`);
+  validPage(p);
+  if (p.emptyReason !== null && !["platform_paused", "no_matching_sellers", "no_other_sellers"].includes(p.emptyReason)) invalid();
   p.items.forEach(o => { if (!id(o.sellerId) || !integer(o.version) || !integer(o.availableMinor) || !integer(o.minMinor) || !integer(o.maxMinor)
     || o.maxMinor < o.minMinor || o.maxMinor > o.availableMinor || o.maxMinor > 10_000_000 || !currency(o.currency)
     || !boundedText(o.displayName, 60) || !validC2CDescription(o.description) || !integer(o.priceBps) || o.priceBps < 5000 || o.priceBps > 20000
     || !nonnegative(o.completedOrders)) invalid(); });
   return p;
 }
-export const quoteC2C = async (sellerId: string, amountMinor: number) => validC2CQuote(await request<C2CQuote>(`${BASE}/quotes`, { sellerId, amountMinor }));
+export const quoteC2C = async (sellerId: string, amountMinor: number) => { const q = validC2CQuote(await request<C2CQuote>(`${BASE}/quotes`, { sellerId, amountMinor })); if (q.flowVersion !== 2 || q.sellerId !== sellerId || q.creditMinor !== amountMinor) invalid(); return q; };
 export async function createC2C(p: C2CPending) {
-  return matchC2CPendingOrder(p, await request<C2COrder>(`${BASE}/orders`, { quoteId: p.quote.id, termsVersion: 1, acknowledgeExternalPayment: true }, "POST", p.key));
+  return matchC2CPendingOrder(p, await request<C2COrder>(`${BASE}/orders`, { quoteId: p.quote.id, termsVersion: p.quote.flowVersion, acknowledgeExternalPayment: true }, "POST", p.key));
 }
 export function matchC2CPendingOrder(p: C2CPending, order: C2COrder) {
   const result = validC2COrder(order);
   if (result.buyerId !== p.actor || result.quoteId !== p.quote.id || result.sellerId !== p.quote.sellerId || BigInt(result.amountUnits) !== BigInt(p.quote.creditMinor) * 86_400n
     || result.payMinor !== p.quote.payMinor || result.currency !== p.quote.currency || result.fxMicros !== p.quote.fxMicros || result.priceBps !== p.quote.priceBps
-    || result.description !== p.quote.description || result.sellerName !== p.quote.sellerName) invalid();
+    || result.description !== p.quote.description || result.sellerName !== p.quote.sellerName || result.flowVersion !== p.quote.flowVersion) invalid();
   return result;
 }
 export function matchC2COrder(before: C2COrder, after: C2COrder): C2COrder {
   validC2COrder(after);
   if (after.id !== before.id || after.quoteId !== before.quoteId || after.buyerId !== before.buyerId || after.sellerId !== before.sellerId
     || after.amountUnits !== before.amountUnits || after.payMinor !== before.payMinor || after.currency !== before.currency
-    || after.fxMicros !== before.fxMicros || after.priceBps !== before.priceBps || after.version < before.version
+    || after.fxMicros !== before.fxMicros || after.priceBps !== before.priceBps || after.version < before.version || after.flowVersion !== before.flowVersion
+    || after.acceptanceDeadline !== before.acceptanceDeadline || (before.acceptedAt !== null && after.acceptedAt !== before.acceptedAt)
+    || (before.paymentDeadline !== null && after.paymentDeadline !== before.paymentDeadline)
     || (before.description !== null && after.description !== before.description)) invalid();
   return after;
 }
@@ -193,7 +207,7 @@ export async function getC2COrders(filter: { before?: string; status?: string; r
 }
 export const getC2COrder = async (orderId: string) => { const o = validC2COrder(await request<C2COrder>(`${BASE}/orders/${encodeURIComponent(orderId)}`)); if (o.id !== orderId) invalid(); return o; };
 export const getC2CEvents = async (orderId: string, before = "", admin = false) => validPage(await request<C2CPage<C2CEvent>>(`${admin ? ADMIN : BASE}/orders/${encodeURIComponent(orderId)}/events?before=${encodeURIComponent(before)}`), validC2CEvent);
-export const actC2C = async (o: C2COrder, action: "paid" | "cancel" | "dispute" | "late-payment" | "notes", note = "") => matchC2COrder(o, await request<C2COrder>(`${BASE}/orders/${o.id}/${action}`, { expectedVersion: o.version, note, ...(action === "cancel" ? { acknowledgeUnpaid: true } : {}) }));
+export const actC2C = async (o: C2COrder, action: "accept" | "reject" | "paid" | "cancel" | "dispute" | "late-payment" | "notes", note = "") => matchC2COrder(o, await request<C2COrder>(`${BASE}/orders/${o.id}/${action}`, { expectedVersion: o.version, note, ...(action === "cancel" ? { acknowledgeUnpaid: true } : {}) }));
 export const sendC2CReleaseCode = async (o: C2COrder) => {
   const r = await request<{ id: string; expiresAt: string; resendAfterSeconds: number }>(`${BASE}/orders/${o.id}/release-code`, { expectedVersion: o.version });
   if (!r || !id(r.id) || !date(r.expiresAt) || !integer(r.resendAfterSeconds) || r.resendAfterSeconds > 3600) invalid();
@@ -202,17 +216,24 @@ export const sendC2CReleaseCode = async (o: C2COrder) => {
 export const releaseC2C = async (o: C2COrder, challengeId: string, code: string) => matchC2COrder(o, await request<C2COrder>(`${BASE}/orders/${o.id}/release`, { expectedVersion: o.version, challengeId, code, acknowledgeReceived: true }));
 export const getAdminC2CPolicy = async () => { const p = await request<{ policy: C2CPolicy; canManage: boolean; emailReady: boolean }>(`${ADMIN}/policy`); validC2CPolicy(p?.policy); if (typeof p.canManage !== "boolean" || typeof p.emailReady !== "boolean") invalid(); return p; };
 export const saveAdminC2CPolicy = async (p: C2CPolicy) => validC2CPolicy(await request<C2CPolicy>(`${ADMIN}/policy`, p, "PUT"));
-export const getAdminC2COrder = async (orderId: string) => { const p = await request<{ order: C2COrder; events: C2CPage<C2CEvent>; evidenceValid: boolean }>(`${ADMIN}/orders/${orderId}`); validC2COrder(p?.order); validPage(p.events, validC2CEvent); if (p.order.id !== orderId || typeof p.evidenceValid !== "boolean") invalid(); return p; };
+export const getAdminC2COrder = async (orderId: string) => { const p = await request<{ order: C2COrder; events: C2CPage<C2CEvent>; evidenceValid: boolean; canResolve: boolean }>(`${ADMIN}/orders/${orderId}`); validC2COrder(p?.order); validPage(p.events, validC2CEvent); if (p.order.id !== orderId || typeof p.evidenceValid !== "boolean" || typeof p.canResolve !== "boolean") invalid(); return p; };
 export const resolveC2C = async (o: C2COrder, action: string, evidence: string) => matchC2COrder(o, await request<C2COrder>(`${ADMIN}/orders/${o.id}/resolve`, { expectedVersion: o.version, action, evidence, attestExternalEvidence: true }));
-export type C2CAdminSeller = Pick<C2CSeller, "userId" | "version" | "displayName" | "enabled" | "suspended" | "heartbeatAt">;
+export type C2CAdminSeller = Pick<C2CSeller, "userId" | "version" | "displayName" | "enabled" | "suspended" | "autoPauseReason">;
 export const getAdminC2CSellers = async (before = "") => validPage(await request<C2CPage<C2CAdminSeller>>(`${ADMIN}/sellers?before=${encodeURIComponent(before)}`), s => {
-  if (!s || !id(s.userId) || !integer(s.version) || !boundedText(s.displayName, 60) || typeof s.enabled !== "boolean" || typeof s.suspended !== "boolean" || !date(s.heartbeatAt)) invalid(); return s;
+  if (!s || !id(s.userId) || !integer(s.version) || !boundedText(s.displayName, 60) || typeof s.enabled !== "boolean" || typeof s.suspended !== "boolean" || (s.autoPauseReason !== null && !["acceptance_timeout", "paid_order_overdue"].includes(s.autoPauseReason))) invalid(); return s;
 });
 export const suspendC2CSeller = (s: C2CAdminSeller, reason: string) => request(`${ADMIN}/sellers/${s.userId}/suspension`, { expectedVersion: s.version, suspended: !s.suspended, reason });
+export type C2CDisputeHandler = { userId: string; email: string; version: number; enabled: boolean; isAdmin: boolean; updatedAt: string };
+export const getC2CDisputeHandlers = async (before = "") => validPage(await request<C2CPage<C2CDisputeHandler>>(`${ADMIN}/dispute-handlers?before=${encodeURIComponent(before)}`), h => {
+  if (!h || !id(h.userId) || !boundedText(h.email, 320) || !integer(h.version) || typeof h.enabled !== "boolean" || typeof h.isAdmin !== "boolean" || !date(h.updatedAt)) invalid(); return h;
+});
+export const saveC2CDisputeHandler = (email: string, expectedVersion: number, enabled: boolean) => request(`${ADMIN}/dispute-handlers`, { email, expectedVersion, enabled }, "PUT");
 
 export function readC2CPending(storage: Pick<Storage, "getItem">, actor: string): C2CPending | null {
   const raw = storage.getItem(C2C_PENDING_PREFIX + actor); if (!raw) return null;
   const p = JSON.parse(raw) as C2CPending;
+  // Old submissions can only recover a matching v1 order, never start v2.
+  if (p?.quote && !("flowVersion" in p.quote)) Object.assign(p.quote, { flowVersion: 1, acceptanceMinutes: 10 });
   if (!p || p.actor !== actor || !id(p.key) || p.key.length < 8) invalid(); validC2CQuote(p.quote); return p;
 }
 export function writeC2CPending(storage: Pick<Storage, "getItem" | "setItem">, p: C2CPending) {
@@ -226,7 +247,7 @@ export function c2cBlockerKey(code: C2CBlocker): MessageKey {
   const keys: Record<C2CBlocker, MessageKey> = {
     C2C_DISABLED: "c2c.error.disabled", C2C_TRANSFERS_DISABLED: "c2c.error.transfersDisabled", C2C_TRANSFERS_PAUSED: "c2c.error.transfersPaused",
     C2C_ACCOUNT_INACTIVE: "c2c.error.inactive", C2C_IDENTITY: "c2c.error.identity", C2C_FINANCE_HOLD: "c2c.error.hold",
-    C2C_SUSPENDED: "c2c.error.suspended", C2C_ADMISSION: "c2c.error.admission", C2C_EMAIL_UNAVAILABLE: "c2c.error.email",
+    C2C_SUSPENDED: "c2c.error.suspended", C2C_ADMISSION: "c2c.error.admission", C2C_EMAIL_UNAVAILABLE: "c2c.error.email", C2C_OVERDUE_ORDERS: "c2c.error.overdue",
   };
   return keys[code];
 }
@@ -235,7 +256,7 @@ export function c2cErrorKey(cause: unknown): MessageKey {
   if (C2C_BLOCKERS.includes(code as C2CBlocker)) return c2cBlockerKey(code as C2CBlocker);
   if (cause instanceof ApiError && cause.status === 429) return "c2c.error.rate";
   const map: Record<string, MessageKey> = {
-    C2C_STALE: "c2c.error.stale", C2C_STOCK: "c2c.error.stock", C2C_PAUSED: "c2c.error.paused", C2C_ADMISSION: "c2c.error.admission",
+    C2C_STALE: "c2c.error.stale", C2C_STOCK: "c2c.error.stock", C2C_PAUSED: "c2c.error.paused", C2C_AUTO_PAUSED: "c2c.error.autoPaused", C2C_TERMS: "c2c.error.stale", C2C_ADMISSION: "c2c.error.admission",
     C2C_SELLER_UNAVAILABLE: "c2c.error.offline", C2C_IDENTITY: "c2c.error.identity", C2C_SUSPENDED: "c2c.error.suspended",
     C2C_FX_UNAVAILABLE: "c2c.error.fx", C2C_PAYMENT_WINDOW: "c2c.error.window", C2C_CODE_INVALID: "c2c.error.code", C2C_EMAIL_UNAVAILABLE: "c2c.error.email",
     C2C_FIRST_ORDER_LIMIT: "c2c.error.first", C2C_ORDER_LIMIT: "c2c.error.limit", MARKET_FINANCE_HOLD: "c2c.error.hold",
@@ -243,7 +264,7 @@ export function c2cErrorKey(cause: unknown): MessageKey {
   return map[code ?? ""] ?? "c2c.error.generic";
 }
 export function c2cPaymentWindow(o: C2COrder, now = c2cNow()) {
-  const deadline = Date.parse(o.paymentDeadline);
+  const deadline = o.paymentDeadline ? Date.parse(o.paymentDeadline) : NaN;
   return { mayStartPayment: o.status === "awaiting_payment" && now < deadline, mayClaimPayment: o.status === "awaiting_payment" && now < deadline + 120_000 };
 }
 export function c2cPayLabel(minor: number, currency: string) { return `${currency === "CNY" ? "CN¥" : "US$"}${(minor / 100).toFixed(2)}`; }

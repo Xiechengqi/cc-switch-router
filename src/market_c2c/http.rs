@@ -65,13 +65,19 @@ pub fn router() -> Router<ServerState> {
     Router::new()
         .route("/v1/market-wallet/c2c/policy", get(policy))
         .route("/v1/market-wallet/c2c/seller", get(seller).put(save_seller))
-        .route("/v1/market-wallet/c2c/seller/heartbeat", post(heartbeat))
+        .route(
+            "/v1/market-wallet/c2c/seller/heartbeat",
+            post(retired_presence),
+        )
         .route("/v1/market-wallet/c2c/seller/pause", post(pause_seller))
+        .route("/v1/market-wallet/c2c/seller/resume", post(resume_seller))
         .route("/v1/market-wallet/c2c/sellers", get(offers))
         .route("/v1/market-wallet/c2c/quotes", post(quote))
         .route("/v1/market-wallet/c2c/orders", get(orders).post(create))
         .route("/v1/market-wallet/c2c/orders/:id", get(detail))
         .route("/v1/market-wallet/c2c/orders/:id/paid", post(paid))
+        .route("/v1/market-wallet/c2c/orders/:id/accept", post(accept))
+        .route("/v1/market-wallet/c2c/orders/:id/reject", post(reject))
         .route("/v1/market-wallet/c2c/orders/:id/cancel", post(cancel))
         .route("/v1/market-wallet/c2c/orders/:id/dispute", post(dispute))
         .route("/v1/market-wallet/c2c/orders/:id/late-payment", post(late))
@@ -98,12 +104,17 @@ pub fn router() -> Router<ServerState> {
         )
         .route("/v1/admin/market-finance/c2c/sellers", get(admin_sellers))
         .route(
+            "/v1/admin/market-finance/c2c/dispute-handlers",
+            get(handlers).put(save_handler),
+        )
+        .route(
             "/v1/admin/market-finance/c2c/sellers/:id/suspension",
             post(suspend),
         )
 }
 async fn policy(State(state): State<ServerState>, headers: HeaderMap) -> Reply<serde_json::Value> {
     let u = session(&state, &headers).await?;
+    let admins = state.dynamic.read().await.admin_emails.clone();
     let conn = state.store.conn.lock().await;
     let mut blockers = participation_blockers_tx(&conn, &u.user_id)?;
     let verified = match verified_tx(&conn, &u.user_id) {
@@ -117,7 +128,8 @@ async fn policy(State(state): State<ServerState>, headers: HeaderMap) -> Reply<s
     Ok(reply(
         serde_json::json!({"policy":policy_tx(&conn)?,"available":blockers.is_empty(),"blockers":blockers,
         "canManagePolicy":crate::api::is_finance_owner(&state.config,&u.email),
-        "verified":verified,"termsVersion":TERMS_VERSION,"claimGraceSeconds":120,"firstPurchaseMaxMinor":10000}),
+        "verified":verified,"termsVersion":TERMS_VERSION,"claimGraceSeconds":120,"firstPurchaseMaxMinor":10000,
+        "independentDisputeHandlerAvailable":independent_handler_tx(&conn,&admins,state.config.router_owner_email.as_deref())?}),
     ))
 }
 async fn seller(State(state): State<ServerState>, headers: HeaderMap) -> Reply<serde_json::Value> {
@@ -127,9 +139,27 @@ async fn seller(State(state): State<ServerState>, headers: HeaderMap) -> Reply<s
     if !email_ready(&state) {
         blockers.push("C2C_EMAIL_UNAVAILABLE");
     }
+    let time = crate::market_wallet::now();
+    let pending:i64=conn.query_row("SELECT COUNT(*) FROM market_c2c_orders WHERE seller_id=?1 AND status IN ('awaiting_seller','awaiting_payment','paid','disputed')",params![u.user_id],|r|r.get(0)).map_err(db_error("count C2C seller work"))?;
+    let p = policy_tx(&conn)?;
+    let own = seller_tx(&conn, &u.user_id)?;
+    let available = stock_tx(&conn, &u.user_id, &time)?;
+    let state_code = match &own {
+        None => "not_selling",
+        Some(s) if s.suspended => "suspended",
+        Some(s) if !s.enabled => "paused",
+        Some(s) if s.auto_pause_reason.is_some() => "auto_paused",
+        Some(_) if !blockers.is_empty() => "unavailable",
+        Some(s) if available < units_from_minor(s.min_minor.max(p.min_minor))? => {
+            "insufficient_stock"
+        }
+        Some(_) if pending >= 10 => "order_limit",
+        Some(_) => "selling",
+    };
     Ok(reply(
         serde_json::json!({"seller":seller_tx(&conn,&u.user_id)?,
         "blockers":blockers,"canEnable":blockers.is_empty(),
+        "state":state_code,"pendingOrders":pending,
         "admissionBalanceUnits":admission_balance_tx(&conn,&u.user_id,&crate::market_wallet::now())?.to_string(),
         "availableUnits":stock_tx(&conn,&u.user_id,&crate::market_wallet::now())?.to_string()}),
     ))
@@ -150,17 +180,8 @@ async fn save_seller(
         .await?,
     ))
 }
-async fn heartbeat(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-) -> Reply<serde_json::Value> {
-    let u = session(&state, &headers).await?;
-    write(&state,|conn| {
-        verified_tx(conn,&u.user_id)?;
-        conn.execute("UPDATE market_c2c_sellers SET heartbeat_at=?2 WHERE user_id=?1 AND enabled=1 AND suspended=0",params![u.user_id,crate::market_wallet::now()]).map_err(db_error("C2C seller heartbeat"))?;
-        Ok(())
-    }).await?;
-    Ok(reply(serde_json::json!({"ok":true})))
+async fn retired_presence() -> StatusCode {
+    StatusCode::GONE
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -177,6 +198,25 @@ async fn pause_seller(
         write(&state, |conn| {
             pause_seller_tx(
                 conn,
+                &u.user_id,
+                input.expected_version,
+                &crate::market_wallet::now(),
+            )
+        })
+        .await?,
+    ))
+}
+async fn resume_seller(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<PauseSeller>,
+) -> Reply<Seller> {
+    let u = session(&state, &headers).await?;
+    require_email(&state)?;
+    Ok(reply(
+        write(&state, |c| {
+            resume_seller_tx(
+                c,
                 &u.user_id,
                 input.expected_version,
                 &crate::market_wallet::now(),
@@ -205,7 +245,24 @@ async fn offers(
     let u = session(&state, &headers).await?;
     let conn = state.store.conn.lock().await;
     let (items, next) = offers_tx(&conn, &u.user_id, &p.before, &crate::market_wallet::now())?;
-    Ok(reply(serde_json::json!({"items":items,"next":next})))
+    // Explain only public availability/ranges, never another seller's holds.
+    let empty_reason = if items.is_empty() && next.is_none() {
+        if !opening_blockers_tx(&conn)?.is_empty() {
+            Some("platform_paused")
+        } else {
+            let others:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM market_c2c_sellers s JOIN users u ON u.id=s.user_id WHERE s.enabled=1 AND s.suspended=0 AND s.auto_pause_reason IS NULL AND s.user_id!=?1 AND u.status='active' AND u.email_verified_at IS NOT NULL)",params![u.user_id],|r|r.get(0)).map_err(db_error("explain public C2C availability"))?;
+            Some(if others {
+                "no_matching_sellers"
+            } else {
+                "no_other_sellers"
+            })
+        }
+    } else {
+        None
+    };
+    Ok(reply(
+        serde_json::json!({"items":items,"next":next,"emptyReason":empty_reason}),
+    ))
 }
 async fn quote(
     State(state): State<ServerState>,
@@ -247,6 +304,7 @@ fn list_tx(conn: &Connection, user: Option<&str>, p: &Page) -> Result<serde_json
         p.status.as_str(),
         "" | "active"
             | "exceptions"
+            | "awaiting_seller"
             | "awaiting_payment"
             | "paid"
             | "disputed"
@@ -259,7 +317,7 @@ fn list_tx(conn: &Connection, user: Option<&str>, p: &Page) -> Result<serde_json
     }
     let mut stmt=conn.prepare("SELECT o.id FROM market_c2c_orders o
        WHERE (?1 IS NULL OR ((?3='' AND (o.buyer_id=?1 OR o.seller_id=?1)) OR (?3='buyer' AND o.buyer_id=?1) OR (?3='seller' AND o.seller_id=?1)))
-        AND (?2='' OR o.status=?2 OR (?2='active' AND o.status IN ('awaiting_payment','paid','disputed')) OR (?2='exceptions' AND (o.status='disputed' OR (o.late_payment_reported=1 AND o.late_payment_resolved=0))))
+        AND (?2='' OR o.status=?2 OR (?2='active' AND o.status IN ('awaiting_seller','awaiting_payment','paid','disputed')) OR (?2='exceptions' AND (o.status='disputed' OR (o.late_payment_reported=1 AND o.late_payment_resolved=0))))
         AND (?4='' OR (o.created_at,o.id)<(SELECT created_at,id FROM market_c2c_orders WHERE id=?4))
         AND (?5='' OR o.quote_id=?5)
        ORDER BY o.created_at DESC,o.id DESC LIMIT 51").map_err(db_error("prepare C2C order history"))?;
@@ -315,6 +373,54 @@ fn current(o: &Order, input: &Action) -> Result<(), AppError> {
         return Err(problem("C2C_STALE", "order changed; reload before acting"));
     }
     Ok(())
+}
+async fn accept(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(a): Json<Action>,
+) -> Reply<Order> {
+    let u = session(&state, &headers).await?;
+    Ok(reply(
+        write(&state, |c| {
+            let o = owned_tx(c, &id, &u.user_id)?;
+            accept_tx(
+                c,
+                &o,
+                &u.user_id,
+                a.expected_version,
+                &crate::market_wallet::now(),
+            )
+        })
+        .await?,
+    ))
+}
+async fn reject(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(a): Json<Action>,
+) -> Reply<Order> {
+    let u = session(&state, &headers).await?;
+    Ok(reply(
+        write(&state, |c| {
+            let o = owned_tx(c, &id, &u.user_id)?;
+            if o.seller_id != u.user_id {
+                return Err(AppError::Forbidden(
+                    "only the seller may reject an application".into(),
+                ));
+            }
+            current(&o, &a)?;
+            if o.status != "awaiting_seller" {
+                return Err(problem(
+                    "C2C_PAYMENT_HOLD",
+                    "only an unpaid application may be rejected",
+                ));
+            }
+            cancel_tx(c, &o, &u.user_id, false, &crate::market_wallet::now())
+        })
+        .await?,
+    ))
 }
 async fn paid(
     State(state): State<ServerState>,
@@ -471,7 +577,7 @@ async fn send_code(
         .unwrap_or_else(|| peer.ip().to_string());
     let (email,o)=write(&state,|c| {
         let o=owned_tx(c,&id,&u.user_id)?;current(&o,&a)?;
-        if o.seller_id!=u.user_id || !matches!(o.status.as_str(),"paid"|"disputed") {return Err(AppError::Forbidden("only the seller may authorize release after payment was declared".into()));}
+        if o.seller_id!=u.user_id || !matches!(o.status.as_str(),"paid"|"disputed") || (o.flow_version==2 && o.accepted_at.is_none()) {return Err(AppError::Forbidden("only the seller of an accepted order may authorize release after payment was declared".into()));}
         safe_tx(c,&o.seller_id,&o.buyer_id)?;
         let email=verified_tx(c,&u.user_id)?;
         let (soon,count):(bool,i64)=c.query_row("SELECT EXISTS(SELECT 1 FROM market_c2c_challenges WHERE seller_id=?1 AND julianday(created_at)>=julianday(?3)-60.0/86400),
@@ -631,8 +737,86 @@ async fn admin_policy(
     let u = crate::api::require_admin_session(&state, &headers).await?;
     let c = state.store.conn.lock().await;
     Ok(reply(
-        serde_json::json!({"policy":policy_tx(&c)?,"canManage":crate::api::is_finance_owner(&state.config,&u.email),"emailReady":email_ready(&state)}),
+        serde_json::json!({"policy":policy_tx(&c)?,"canManage":crate::api::is_finance_owner(&state.config,&u.email),"canResolve":crate::api::is_finance_owner(&state.config,&u.email)||dispute_handler_tx(&c,&u.user_id)?,"emailReady":email_ready(&state)}),
     ))
+}
+fn independent_handler_tx(
+    c: &Connection,
+    admins: &std::collections::HashSet<String>,
+    owner: Option<&str>,
+) -> Result<bool, AppError> {
+    let mut stmt=c.prepare("SELECT u.email_normalized FROM market_c2c_dispute_handlers h JOIN users u ON u.id=h.user_id WHERE h.enabled=1 AND u.status='active' AND u.email_verified_at IS NOT NULL").map_err(db_error("prepare independent C2C handler"))?;
+    let emails = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(db_error("query independent C2C handler"))?
+        .collect::<crate::db::Result<Vec<_>>>()
+        .map_err(db_error("read independent C2C handler"))?;
+    Ok(emails
+        .iter()
+        .any(|email| admins.contains(email) && owner != Some(email.as_str())))
+}
+async fn handlers(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(p): Query<Page>,
+) -> Reply<serde_json::Value> {
+    crate::api::require_owner_session(&state, &headers).await?;
+    let admins = state.dynamic.read().await.admin_emails.clone();
+    let c = state.store.conn.lock().await;
+    let mut stmt=c.prepare("SELECT h.user_id,u.email_normalized,h.version,h.enabled,h.updated_at FROM market_c2c_dispute_handlers h JOIN users u ON u.id=h.user_id WHERE h.user_id>?1 ORDER BY h.user_id LIMIT 51").map_err(db_error("prepare C2C handlers"))?;
+    let mut items=stmt.query_map(params![p.before],|r|{let email:String=r.get(1)?;Ok(serde_json::json!({"userId":r.get::<_,String>(0)?,"email":email,"version":r.get::<_,i64>(2)?,"enabled":r.get::<_,bool>(3)?,"updatedAt":r.get::<_,String>(4)?,"isAdmin":admins.contains(&email)}))}).map_err(db_error("query C2C handlers"))?.collect::<crate::db::Result<Vec<_>>>().map_err(db_error("read C2C handlers"))?;
+    let more = items.len() > 50;
+    items.truncate(50);
+    let next = if more {
+        items.last().and_then(|v| v.get("userId")).cloned()
+    } else {
+        None
+    };
+    Ok(reply(serde_json::json!({"items":items,"next":next})))
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HandlerInput {
+    email: String,
+    expected_version: i64,
+    enabled: bool,
+}
+async fn save_handler(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<HandlerInput>,
+) -> Reply<serde_json::Value> {
+    let u = crate::api::require_owner_session(&state, &headers).await?;
+    let email = input.email.trim().to_ascii_lowercase();
+    if input.enabled
+        && (!state.dynamic.read().await.is_admin(&email)
+            || crate::api::is_finance_owner(&state.config, &email))
+    {
+        return Err(AppError::BadRequest(
+            "grant only to another existing administrator".into(),
+        ));
+    }
+    write(&state, |c| {
+        let user: String = c
+            .query_row(
+                "SELECT id FROM users WHERE email_normalized=?1",
+                params![email],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_error("find C2C dispute administrator"))?
+            .ok_or_else(|| AppError::NotFound("administrator must first sign in".into()))?;
+        set_dispute_handler_tx(
+            c,
+            &u.user_id,
+            &user,
+            input.expected_version,
+            input.enabled,
+            &crate::market_wallet::now(),
+        )
+    })
+    .await?;
+    Ok(reply(serde_json::json!({"ok":true})))
 }
 async fn save_policy(
     State(state): State<ServerState>,
@@ -664,10 +848,15 @@ async fn admin_detail(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Reply<serde_json::Value> {
-    crate::api::require_admin_session(&state, &headers).await?;
+    let u = crate::api::require_admin_session(&state, &headers).await?;
     let c = state.store.conn.lock().await;
+    let o = order_tx(&c, &id)?;
+    let can_resolve = (crate::api::is_finance_owner(&state.config, &u.email)
+        || dispute_handler_tx(&c, &u.user_id)?)
+        && u.user_id != o.buyer_id
+        && u.user_id != o.seller_id;
     Ok(reply(
-        serde_json::json!({"order":order_tx(&c,&id)?,"events":events_tx(&c,&id,"")?,"evidenceValid":evidence_valid_tx(&c,&id)?}),
+        serde_json::json!({"order":o,"events":events_tx(&c,&id,"")?,"evidenceValid":evidence_valid_tx(&c,&id)?,"canResolve":can_resolve}),
     ))
 }
 async fn admin_events(
@@ -695,9 +884,16 @@ async fn resolve(
     Path(id): Path<String>,
     Json(a): Json<Resolution>,
 ) -> Reply<Order> {
-    let u = crate::api::require_owner_session(&state, &headers).await?;
+    let u = crate::api::require_admin_session(&state, &headers).await?;
     Ok(reply(
         write(&state, |c| {
+            if !crate::api::is_finance_owner(&state.config, &u.email)
+                && !dispute_handler_tx(c, &u.user_id)?
+            {
+                return Err(AppError::Forbidden(
+                    "C2C dispute-handler authorization required".into(),
+                ));
+            }
             let o = order_tx(c, &id)?;
             resolve_tx(
                 c,
@@ -720,8 +916,8 @@ async fn admin_sellers(
 ) -> Reply<serde_json::Value> {
     crate::api::require_admin_session(&state, &headers).await?;
     let c = state.store.conn.lock().await;
-    let mut s=c.prepare("SELECT user_id,version,display_name,enabled,suspended,heartbeat_at FROM market_c2c_sellers WHERE user_id>?1 ORDER BY user_id LIMIT 51").map_err(db_error("prepare admin C2C sellers"))?;
-    let mut items=s.query_map(params![p.before],|r|Ok(serde_json::json!({"userId":r.get::<_,String>(0)?,"version":r.get::<_,i64>(1)?,"displayName":r.get::<_,String>(2)?,"enabled":r.get::<_,bool>(3)?,"suspended":r.get::<_,bool>(4)?,"heartbeatAt":r.get::<_,String>(5)?}))).map_err(db_error("query admin C2C sellers"))?.collect::<crate::db::Result<Vec<_>>>().map_err(db_error("read admin C2C sellers"))?;
+    let mut s=c.prepare("SELECT user_id,version,display_name,enabled,suspended,auto_pause_reason FROM market_c2c_sellers WHERE user_id>?1 ORDER BY user_id LIMIT 51").map_err(db_error("prepare admin C2C sellers"))?;
+    let mut items=s.query_map(params![p.before],|r|Ok(serde_json::json!({"userId":r.get::<_,String>(0)?,"version":r.get::<_,i64>(1)?,"displayName":r.get::<_,String>(2)?,"enabled":r.get::<_,bool>(3)?,"suspended":r.get::<_,bool>(4)?,"autoPauseReason":r.get::<_,Option<String>>(5)?}))).map_err(db_error("query admin C2C sellers"))?.collect::<crate::db::Result<Vec<_>>>().map_err(db_error("read admin C2C sellers"))?;
     let more = items.len() > 50;
     items.truncate(50);
     let next = if more {
@@ -747,7 +943,7 @@ async fn suspend(
     let u = crate::api::require_owner_session(&state, &headers).await?;
     write(&state,|c| {
         let reason=text(&a.reason,500)?;
-        let count=c.execute("UPDATE market_c2c_sellers SET suspended=?3,enabled=0,version=version+1,updated_at=?4 WHERE user_id=?1 AND version=?2",params![id,a.expected_version,a.suspended,crate::market_wallet::now()]).map_err(db_error("suspend C2C seller"))?;
+        let count=c.execute("UPDATE market_c2c_sellers SET suspended=?3,enabled=0,auto_pause_reason=NULL,auto_paused_at=NULL,auto_pause_order_id=NULL,version=version+1,updated_at=?4 WHERE user_id=?1 AND version=?2",params![id,a.expected_version,a.suspended,crate::market_wallet::now()]).map_err(db_error("suspend C2C seller"))?;
         if count!=1{return Err(problem("C2C_STALE","seller changed; reload"));}
         audit_tx(c,&u.user_id,if a.suspended{"suspend"}else{"unsuspend"},"c2c_seller",&id,&reason,&crate::market_wallet::now())?;
         crate::market_notifications::enqueue_user_notification_tx(c,"buyer",&id,"c2c_seller_changed","c2c_seller",&id,&format!("c2c-suspension:{id}:{}",a.expected_version+1),serde_json::json!({}),&crate::market_wallet::now())?;Ok(())

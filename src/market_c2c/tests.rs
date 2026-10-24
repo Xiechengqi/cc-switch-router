@@ -233,11 +233,15 @@ fn preview(c: &Connection, buyer: &str, minor: i64) -> Quote {
 fn input(q: &Quote) -> CreateInput {
     CreateInput {
         quote_id: q.id.clone(),
-        terms_version: 1,
+        terms_version: TERMS_VERSION,
         acknowledge_external_payment: true,
     }
 }
 fn order(c: &Connection, minor: i64) -> Order {
+    let o = application(c, minor);
+    accept_tx(c, &o, "seller", o.version, AT).unwrap()
+}
+fn application(c: &Connection, minor: i64) -> Order {
     let q = preview(c, "buyer", minor);
     create_tx(
         c,
@@ -250,7 +254,415 @@ fn order(c: &Connection, minor: i64) -> Order {
     .unwrap()
 }
 fn paid(c: &Connection, o: &Order) -> Order {
+    let accepted = if o.status == "awaiting_seller" {
+        accept_tx(c, o, "seller", o.version, AT).unwrap()
+    } else {
+        o.clone()
+    };
+    let o = &accepted;
     mark_paid_tx(c, o, "buyer", o.version, AT).unwrap()
+}
+
+#[test]
+fn application_reserves_credit_but_only_acceptance_starts_the_frozen_payment_window() {
+    let c = fixture();
+    offer(&c);
+    let q = preview(&c, "buyer", 1000);
+    assert_eq!((q.flow_version, q.acceptance_minutes), (2, 10));
+    let o = transaction(&c, |c| {
+        create_tx(c, "buyer", &input(&q), "acceptance-key", "127.0.0.1", AT)
+    })
+    .unwrap();
+    assert_eq!(o.status, "awaiting_seller");
+    assert!(o.payment_deadline.is_none() && o.accepted_at.is_none());
+    assert_eq!(
+        at(o.acceptance_deadline.as_deref().unwrap()).unwrap(),
+        at(AT).unwrap() + Duration::minutes(10)
+    );
+    assert_eq!(
+        wallet_snapshot_tx(&c, "seller").unwrap().held_units,
+        o.amount_units
+    );
+    assert!(mark_paid_tx(&c, &o, "buyer", o.version, AT).is_err());
+    assert!(accept_tx(&c, &o, "buyer", o.version, AT).is_err());
+    assert!(accept_tx(&c, &o, "seller", o.version + 1, AT).is_err());
+    c.execute(
+        "UPDATE market_c2c_policy SET payment_minutes=5,acceptance_minutes=5,version=version+1",
+        [],
+    )
+    .unwrap();
+    let accepted_at = "2026-10-22T12:09:00Z";
+    let accepted = transaction(&c, |c| accept_tx(c, &o, "seller", o.version, accepted_at)).unwrap();
+    assert_eq!(accepted.status, "awaiting_payment");
+    assert_eq!(
+        at(accepted.payment_deadline.as_deref().unwrap()).unwrap(),
+        at(accepted_at).unwrap() + Duration::minutes(30)
+    );
+    let replay = accept_tx(
+        &c,
+        &order_tx(&c, &o.id).unwrap(),
+        "seller",
+        o.version,
+        LATER,
+    )
+    .unwrap();
+    assert_eq!(
+        (replay.version, replay.payment_deadline),
+        (accepted.version, accepted.payment_deadline)
+    );
+    assert!(
+        c.execute(
+            "UPDATE market_c2c_orders SET payment_deadline='2026-10-22T14:00:00Z' WHERE id=?1",
+            params![o.id]
+        )
+        .is_err()
+    );
+    assert!(
+        c.execute(
+            "UPDATE market_c2c_orders SET acceptance_deadline='2026-10-22T14:00:00Z' WHERE id=?1",
+            params![o.id]
+        )
+        .is_err()
+    );
+    crate::market_wallet::reconcile_wallet_tx(&c, "seller").unwrap();
+}
+
+#[test]
+fn unpaid_application_withdrawal_rejection_and_acceptance_races_do_not_double_release() {
+    let c = fixture();
+    offer(&c);
+    for actor in ["buyer", "seller"] {
+        let o = application(&c, 1000);
+        let cancelled = transaction(&c, |c| cancel_tx(c, &o, actor, false, AT)).unwrap();
+        assert_eq!(cancelled.status, "cancelled");
+        assert!(transaction(&c, |c| accept_tx(c, &o, "seller", o.version, AT)).is_err());
+        let again = cancel_tx(&c, &cancelled, actor, false, AT).unwrap();
+        assert_eq!(again.version, cancelled.version);
+        assert_eq!(wallet_snapshot_tx(&c, "seller").unwrap().held_units, 0);
+        assert!(
+            seller_tx(&c, "seller")
+                .unwrap()
+                .unwrap()
+                .auto_pause_reason
+                .is_none()
+        );
+    }
+    let o = application(&c, 1000);
+    let accepted = transaction(&c, |c| accept_tx(c, &o, "seller", o.version, AT)).unwrap();
+    assert!(transaction(&c, |c| cancel_tx(c, &o, "seller", false, AT)).is_err());
+    assert_eq!(order_tx(&c, &o.id).unwrap().version, accepted.version);
+    assert_eq!(
+        wallet_snapshot_tx(&c, "seller").unwrap().held_units,
+        o.amount_units
+    );
+    crate::market_wallet::reconcile_wallet_tx(&c, "seller").unwrap();
+}
+
+#[test]
+fn acceptance_timeout_returns_credit_once_and_explicit_resume_does_not_reapply_admission() {
+    let c = fixture();
+    offer(&c);
+    let o = application(&c, 1000);
+    let deadline = o.acceptance_deadline.as_deref().unwrap();
+    assert!(accept_tx(&c, &o, "seller", o.version, deadline).is_err());
+    transaction(&c, |c| tick_tx(c, deadline)).unwrap();
+    transaction(&c, |c| tick_tx(c, LATER)).unwrap();
+    let expired = order_tx(&c, &o.id).unwrap();
+    assert_eq!(expired.status, "expired");
+    assert_eq!(wallet_snapshot_tx(&c, "seller").unwrap().held_units, 0);
+    let s = seller_tx(&c, "seller").unwrap().unwrap();
+    assert!(s.enabled);
+    assert_eq!(s.auto_pause_reason.as_deref(), Some("acceptance_timeout"));
+    assert!(offers_tx(&c, "buyer", "", LATER).unwrap().0.is_empty());
+    c.execute("UPDATE market_c2c_policy SET admission_minor=1000000", [])
+        .unwrap();
+    let s = transaction(&c, |c| resume_seller_tx(c, "seller", s.version, LATER)).unwrap();
+    assert!(s.enabled && s.auto_pause_reason.is_none());
+    assert_eq!(offers_tx(&c, "buyer", "", LATER).unwrap().0.len(), 1);
+    let events: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM market_c2c_events WHERE order_id=?1 AND action='seller_timeout'",
+            params![o.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(events, 1);
+    let s = pause_seller_tx(&c, "seller", s.version, LATER).unwrap();
+    assert!(resume_seller_tx(&c, "seller", s.version, LATER).is_err());
+    assert!(!s.enabled);
+}
+
+#[test]
+fn timeout_never_overrides_a_manual_pause_or_admin_suspension() {
+    let c = fixture();
+    offer(&c);
+    let o = application(&c, 1000);
+    let s = pause_seller_tx(&c, "seller", 1, AT).unwrap();
+    transaction(&c, |c| tick_tx(c, LATER)).unwrap();
+    let after = seller_tx(&c, "seller").unwrap().unwrap();
+    assert_eq!(after.version, s.version);
+    assert!(!after.enabled && after.auto_pause_reason.is_none());
+    assert_eq!(order_tx(&c, &o.id).unwrap().status, "expired");
+    let mut settings = terms();
+    settings.expected_version = s.version;
+    save_seller_tx(&c, "seller", &settings, LATER).unwrap();
+    let q = quote_tx(
+        &c,
+        "buyer",
+        &QuoteInput {
+            seller_id: "seller".into(),
+            amount_minor: 1000,
+        },
+        LATER,
+    )
+    .unwrap();
+    let o = create_tx(&c, "buyer", &input(&q), "suspended-key", "127.0.0.1", LATER).unwrap();
+    c.execute(
+        "UPDATE market_c2c_sellers SET suspended=1 WHERE user_id='seller'",
+        [],
+    )
+    .unwrap();
+    transaction(&c, |c| tick_tx(c, "2026-10-22T12:44:00Z")).unwrap();
+    let s = seller_tx(&c, "seller").unwrap().unwrap();
+    assert!(s.suspended && s.auto_pause_reason.is_none());
+    assert_eq!(order_tx(&c, &o.id).unwrap().status, "expired");
+}
+
+#[test]
+fn paid_nonresponse_reminders_pause_and_escalation_never_release_reserved_credit() {
+    let c = fixture();
+    offer(&c);
+    let o = paid(&c, &order(&c, 1000));
+    for (time, paused) in [
+        ("2026-10-22T12:29:59Z", false),
+        ("2026-10-22T12:30:01Z", false),
+        ("2026-10-22T13:00:01Z", true),
+        ("2026-10-23T12:00:01Z", true),
+        ("2026-10-24T12:00:01Z", true),
+    ] {
+        transaction(&c, |c| tick_tx(c, time)).unwrap();
+        assert_eq!(order_tx(&c, &o.id).unwrap().status, "paid");
+        assert_eq!(
+            wallet_snapshot_tx(&c, "seller").unwrap().held_units,
+            o.amount_units
+        );
+        assert_eq!(
+            seller_tx(&c, "seller")
+                .unwrap()
+                .unwrap()
+                .auto_pause_reason
+                .is_some(),
+            paused
+        );
+    }
+    for action in ["release_reminder", "overdue_escalated"] {
+        assert_eq!(
+            c.query_row(
+                "SELECT COUNT(*) FROM market_c2c_events WHERE order_id=?1 AND action=?2",
+                params![o.id, action],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
+    let s = seller_tx(&c, "seller").unwrap().unwrap();
+    assert_eq!(
+        resume_seller_tx(&c, "seller", s.version, "2026-10-24T12:00:01Z")
+            .unwrap_err()
+            .code(),
+        Some("C2C_OVERDUE_ORDERS")
+    );
+    let paused = pause_seller_tx(&c, "seller", s.version, "2026-10-24T12:00:01Z").unwrap();
+    let mut settings = terms();
+    settings.expected_version = paused.version;
+    assert_eq!(
+        save_seller_tx(&c, "seller", &settings, "2026-10-24T12:00:01Z")
+            .unwrap_err()
+            .code(),
+        Some("C2C_OVERDUE_ORDERS")
+    );
+    let o = transaction(&c, |c| release_tx(c, &o, "seller", "2026-10-24T12:00:01Z")).unwrap();
+    assert_eq!(o.status, "released");
+    assert!(save_seller_tx(&c, "seller", &settings, "2026-10-24T12:00:01Z").is_ok());
+    crate::market_wallet::reconcile_wallet_tx(&c, "seller").unwrap();
+    crate::market_wallet::reconcile_wallet_tx(&c, "buyer").unwrap();
+}
+
+#[test]
+fn early_external_payment_requires_independent_resolution_and_keeps_the_hold() {
+    let c = fixture();
+    offer(&c);
+    let o = application(&c, 1000);
+    let o = transaction(&c, |c| {
+        late_payment_tx(
+            c,
+            &o,
+            "buyer",
+            "Payment was sent before acceptance; reference kept by parties",
+            AT,
+        )
+    })
+    .unwrap();
+    assert_eq!(o.status, "disputed");
+    assert!(o.accepted_at.is_none() && o.payment_deadline.is_none());
+    transaction(&c, |c| tick_tx(c, "2026-10-24T12:00:00Z")).unwrap();
+    assert_eq!(
+        wallet_snapshot_tx(&c, "seller").unwrap().held_units,
+        o.amount_units
+    );
+    assert!(transaction(&c, |c| release_tx(c, &o, "seller", LATER)).is_err());
+    assert!(
+        transaction(&c, |c| resolve_tx(
+            c, &o, "buyer", o.version, "release", "Evidence", true, LATER
+        ))
+        .is_err()
+    );
+    let o = transaction(&c, |c| {
+        resolve_tx(
+            c,
+            &o,
+            "owner",
+            o.version,
+            "release",
+            "Independent confirmation from both parties",
+            true,
+            LATER,
+        )
+    })
+    .unwrap();
+    assert!(o.late_payment_resolved && o.status == "released");
+    assert_eq!(
+        wallet_snapshot_tx(&c, "buyer").unwrap().available_units,
+        o.amount_units
+    );
+    assert!(evidence_valid_tx(&c, &o.id).unwrap());
+}
+
+#[test]
+fn narrow_dispute_grants_are_versioned_revocable_and_never_allow_self_delegation() {
+    let c = fixture();
+    assert!(!dispute_handler_tx(&c, "other").unwrap());
+    assert!(set_dispute_handler_tx(&c, "owner", "owner", 0, true, AT).is_err());
+    set_dispute_handler_tx(&c, "owner", "other", 0, true, AT).unwrap();
+    assert!(dispute_handler_tx(&c, "other").unwrap());
+    assert!(set_dispute_handler_tx(&c, "owner", "other", 0, false, AT).is_err());
+    c.execute("UPDATE users SET status='blocked' WHERE id='other'", [])
+        .unwrap();
+    assert!(!dispute_handler_tx(&c, "other").unwrap());
+    set_dispute_handler_tx(&c, "owner", "other", 1, false, AT).unwrap();
+    assert!(!dispute_handler_tx(&c, "other").unwrap());
+    assert_eq!(c.query_row("SELECT COUNT(*) FROM market_finance_audit_events WHERE object_kind='c2c_dispute_handler'", [], |r|r.get::<_,i64>(0)).unwrap(), 2);
+}
+
+#[test]
+fn persistent_listings_survive_restart_and_orders_keep_their_own_deadlines() {
+    let directory = std::env::temp_dir().join(format!("router-c2c-persistence-{}", Uuid::new_v4()));
+    std::fs::create_dir(&directory).unwrap();
+    let path = directory.join("finance.sqlite");
+    let c = fixture_on(Connection::open(&path).unwrap());
+    offer(&c);
+    let o = application(&c, 1000);
+    drop(c);
+    let c = Connection::open(&path).unwrap();
+    crate::schema::apply(&c).unwrap();
+    assert_eq!(
+        order_tx(&c, &o.id).unwrap().acceptance_deadline,
+        o.acceptance_deadline
+    );
+    transaction(&c, |c| tick_tx(c, LATER)).unwrap();
+    let s = seller_tx(&c, "seller").unwrap().unwrap();
+    resume_seller_tx(&c, "seller", s.version, LATER).unwrap();
+    drop(c);
+    let c = Connection::open(&path).unwrap();
+    crate::schema::apply(&c).unwrap();
+    let distant = "2026-11-22T12:00:00Z";
+    assert_eq!(offers_tx(&c, "buyer", "", distant).unwrap().0.len(), 1);
+    assert_eq!(offers_tx(&c, "owner", "", distant).unwrap().0.len(), 1);
+    assert!(offers_tx(&c, "seller", "", distant).unwrap().0.is_empty());
+    let q = quote_tx(
+        &c,
+        "other",
+        &QuoteInput {
+            seller_id: "seller".into(),
+            amount_minor: 1000,
+        },
+        distant,
+    )
+    .unwrap();
+    let o = transaction(&c, |c| {
+        create_tx(
+            c,
+            "other",
+            &input(&q),
+            "persistent-buy-key",
+            "127.0.0.1",
+            distant,
+        )
+    })
+    .unwrap();
+    assert_eq!(o.status, "awaiting_seller");
+    drop(c);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn independent_connections_serialize_acceptance_against_application_cancellation() {
+    let directory = std::env::temp_dir().join(format!("router-c2c-accept-race-{}", Uuid::new_v4()));
+    std::fs::create_dir(&directory).unwrap();
+    let path = directory.join("finance.sqlite");
+    let c = fixture_on(Connection::open(&path).unwrap());
+    offer(&c);
+    let o = application(&c, 1000);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let tasks = (0..2)
+        .map(|i| {
+            let db = Connection::open(&path).unwrap();
+            let o = o.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let Ok(tx) = db.transaction_with_behavior(TransactionBehavior::Immediate) else {
+                    return false;
+                };
+                let result = if i == 0 {
+                    accept_tx(&tx, &o, "seller", o.version, AT)
+                } else {
+                    cancel_tx(&tx, &o, "buyer", false, AT)
+                };
+                if result.is_err() {
+                    return false;
+                }
+                tx.commit().unwrap();
+                true
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        tasks
+            .into_iter()
+            .map(|task| task.join().unwrap())
+            .filter(|ok| *ok)
+            .count(),
+        1
+    );
+    let final_order = order_tx(&c, &o.id).unwrap();
+    assert!(matches!(
+        final_order.status.as_str(),
+        "awaiting_payment" | "cancelled"
+    ));
+    assert_eq!(
+        wallet_snapshot_tx(&c, "seller").unwrap().held_units,
+        if final_order.status == "awaiting_payment" {
+            o.amount_units
+        } else {
+            0
+        }
+    );
+    assert!(evidence_valid_tx(&c, &o.id).unwrap());
+    crate::market_wallet::reconcile_wallet_tx(&c, "seller").unwrap();
+    drop(c);
+    std::fs::remove_dir_all(directory).unwrap();
 }
 fn transaction<T>(
     c: &Connection,
@@ -308,6 +720,7 @@ fn automatically_credited_earnings_can_open_c2c_and_deliver_existing_balance() {
         settled,
     )
     .unwrap();
+    let o = accept_tx(&c, &o, "other", o.version, settled).unwrap();
     let o = mark_paid_tx(&c, &o, "buyer", o.version, settled).unwrap();
     release_tx(&c, &o, "other", settled).unwrap();
     assert_eq!(
@@ -391,7 +804,7 @@ fn admission_does_not_depend_on_per_transfer_limit_and_does_not_count_held_credi
     );
 }
 #[test]
-fn admission_identity_offline_suspension_and_self_purchase_fail_closed() {
+fn admission_identity_suspension_and_self_purchase_fail_closed_without_presence_gate() {
     let c = fixture();
     assert!(save_seller_tx(&c, "buyer", &terms(), AT).is_err());
     offer(&c);
@@ -407,7 +820,7 @@ fn admission_identity_offline_suspension_and_self_purchase_fail_closed() {
         )
         .is_err()
     );
-    assert!(offers_tx(&c, "buyer", "", LATER).unwrap().0.is_empty());
+    assert_eq!(offers_tx(&c, "buyer", "", LATER).unwrap().0.len(), 1);
     c.execute(
         "UPDATE market_c2c_sellers SET suspended=1 WHERE user_id='seller'",
         [],
@@ -800,9 +1213,19 @@ fn historical_private_quote_stays_party_only_and_can_finish_after_seller_changes
     c.execute("INSERT INTO market_c2c_quotes(id,buyer_id,seller_id,seller_version,policy_version,credit_minor,pay_minor,currency,fx_micros,price_bps,seller_name,contact,payment_method,payment_details,payment_minutes,expires_at,created_at)
         SELECT 'historical-private',buyer_id,seller_id,seller_version,policy_version,credit_minor,pay_minor,currency,fx_micros,price_bps,'Historical seller','PRIVATE CONTACT','Bank','PRIVATE ACCOUNT',payment_minutes,expires_at,created_at
         FROM market_c2c_quotes WHERE id=?1",params![q.id]).unwrap();
-    let mut input = input(&q);
-    input.quote_id = "historical-private".into();
-    let o = create_tx(&c, "buyer", &input, "historical", "127.0.0.1", AT).unwrap();
+    let hold = crate::market_wallet::reserve_wallet_tx(
+        &c,
+        "seller",
+        "c2c_order",
+        "historical-order",
+        "c2c",
+        units_from_minor(1000).unwrap(),
+        None,
+        AT,
+    )
+    .unwrap();
+    c.execute("INSERT INTO market_c2c_orders(id,quote_id,buyer_id,seller_id,idempotency_key,amount_units,hold_id,status,terms_version,payment_deadline,created_ip,created_at,updated_at) VALUES('historical-order','historical-private','buyer','seller','historical',?1,?2,'awaiting_payment',1,'2026-10-22T12:30:00+00:00','127.0.0.1',?3,?3)",params![units_from_minor(1000).unwrap(),hold,AT]).unwrap();
+    let o = order_tx(&c, "historical-order").unwrap();
     pause_seller_tx(&c, "seller", 1, AT).unwrap();
     assert!(owned_tx(&c, &o.id, "other").is_err());
     for participant in ["buyer", "seller"] {
@@ -954,11 +1377,6 @@ fn history_pages_and_audit_cursor_reach_orders_beyond_the_first_two_hundred() {
     offer(&c);
     for i in 0..205 {
         let time = (at(AT).unwrap() + Duration::hours(i)).to_rfc3339();
-        c.execute(
-            "UPDATE market_c2c_sellers SET heartbeat_at=?1",
-            params![time],
-        )
-        .unwrap();
         transaction(&c, |c| {
             let q = quote_tx(
                 c,
@@ -1068,7 +1486,10 @@ fn old_and_new_policy_versions_do_not_reprice_existing_orders() {
     assert!(p.version > 1);
     assert!(create_tx(&c, "other", &input(&q), "changed-policy", "127.0.0.1", AT).is_err());
     let o = paid(&c, &o);
-    assert_eq!(o.payment_deadline, "2026-10-22T12:30:00+00:00");
+    assert_eq!(
+        o.payment_deadline.as_deref(),
+        Some("2026-10-22T12:30:00+00:00")
+    );
     let o = release_tx(&c, &o, "seller", AT).unwrap();
     assert_eq!(o.status, "released");
     assert!(evidence_valid_tx(&c, &o.id).unwrap());
@@ -1099,7 +1520,7 @@ fn evidence_history_pages_are_complete_and_cannot_cross_order_boundaries() {
     assert_eq!(first["items"].as_array().unwrap().len(), 50);
     let cursor = first["next"].as_str().unwrap();
     let last = http::test_events(&c, &o.id, cursor).unwrap();
-    assert_eq!(last["items"].as_array().unwrap().len(), 6);
+    assert_eq!(last["items"].as_array().unwrap().len(), 7);
     assert!(last["next"].is_null());
     assert!(
         http::test_events(&c, &other.id, cursor).unwrap()["items"]

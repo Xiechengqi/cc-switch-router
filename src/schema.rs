@@ -287,6 +287,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         82,
         include_str!("../schema/0082_market_topup_mode_isolation.sql"),
     ),
+    (83, include_str!("../schema/0083_market_c2c_acceptance.sql")),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -801,6 +802,100 @@ mod tests {
     }
 
     #[test]
+    fn migration_83_preserves_active_reservations_evidence_and_running_deadlines() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 82);
+        let at = "2026-10-23T12:00:00Z";
+        for user in ["seller", "buyer", "paused", "suspended"] {
+            conn.execute("INSERT INTO users(id,email_normalized,status,email_verified_at,created_at,last_login_at) VALUES(?1,?2,'active',?3,?3,?3)", params![user, format!("{user}@example.test"), at]).unwrap();
+        }
+        crate::market_wallet::credit_verified_topup_tx(
+            &conn,
+            "seller",
+            "upgrade-funding",
+            20000,
+            "receipt",
+            at,
+        )
+        .unwrap();
+        for (user, enabled, suspended) in [
+            ("seller", true, false),
+            ("paused", false, false),
+            ("suspended", true, true),
+        ] {
+            conn.execute("INSERT INTO market_c2c_sellers(user_id,version,enabled,suspended,display_name,description,currency,price_bps,min_minor,max_minor,heartbeat_at,created_at,updated_at) VALUES(?1,4,?2,?3,?1,'Contact seller','USD',10000,100,10000,?4,?4,?4)", params![user,enabled,suspended,at]).unwrap();
+        }
+        conn.execute("INSERT INTO market_c2c_quotes(id,buyer_id,seller_id,seller_version,policy_version,credit_minor,pay_minor,currency,fx_micros,price_bps,seller_name,description,contact,payment_method,payment_details,payment_minutes,expires_at,created_at) VALUES('quote83','buyer','seller',4,1,1000,1000,'USD',1000000,10000,'Seller','Contact seller','','','',30,'2026-10-23T12:05:00Z',?1)", params![at]).unwrap();
+        let amount = crate::market_wallet::units_from_minor(1000).unwrap();
+        let hold = crate::market_wallet::reserve_wallet_tx(
+            &conn,
+            "seller",
+            "c2c_order",
+            "order83",
+            "c2c",
+            amount,
+            None,
+            at,
+        )
+        .unwrap();
+        conn.execute("INSERT INTO market_c2c_orders(id,quote_id,buyer_id,seller_id,idempotency_key,amount_units,hold_id,status,terms_version,payment_deadline,created_ip,created_at,updated_at) VALUES('order83','quote83','buyer','seller','upgrade-key',?1,?2,'awaiting_payment',1,'2026-10-23T12:30:00Z','127.0.0.1',?3,?3)", params![amount, hold, at]).unwrap();
+        conn.execute("INSERT INTO market_c2c_events(id,order_id,actor_id,action,note,created_at) VALUES('event83','order83','buyer','created','Frozen evidence',?1)", params![at]).unwrap();
+        conn.execute("INSERT INTO market_c2c_challenges(id,order_id,seller_id,email,binding,code_mac,key_version,attempts,delivered_at,expires_at,created_ip,created_at) VALUES('challenge83','order83','seller','seller@example.test','frozen-binding','secret-mac',1,2,?1,'2026-10-23T12:10:00Z','127.0.0.1',?1)", params![at]).unwrap();
+        let before = crate::market_wallet::wallet_snapshot_tx(&conn, "seller").unwrap();
+        let postings: i64 = conn
+            .query_row("SELECT COUNT(*) FROM market_journal_postings", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        let after = crate::market_wallet::wallet_snapshot_tx(&conn, "seller").unwrap();
+        assert_eq!(
+            (before.posted_units, before.held_units, before.version),
+            (after.posted_units, after.held_units, after.version)
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM market_journal_postings", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            postings
+        );
+        let preserved: (i64,String,Option<String>,Option<String>) = conn.query_row("SELECT terms_version,payment_deadline,acceptance_deadline,accepted_at FROM market_c2c_orders WHERE id='order83'", [], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        assert_eq!(preserved, (1, "2026-10-23T12:30:00Z".into(), None, None));
+        assert_eq!(
+            conn.query_row(
+                "SELECT note FROM market_c2c_events WHERE id='event83'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "Frozen evidence"
+        );
+        assert_eq!(conn.query_row("SELECT binding,code_mac,attempts FROM market_c2c_challenges WHERE id='challenge83'", [], |r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?))).unwrap(), ("frozen-binding".into(),"secret-mac".into(),2));
+        for (user, expected_enabled, expected_suspended) in [
+            ("seller", true, false),
+            ("paused", false, false),
+            ("suspended", true, true),
+        ] {
+            let state:(bool,bool,i64,Option<String>) = conn.query_row("SELECT enabled,suspended,version,auto_pause_reason FROM market_c2c_sellers WHERE user_id=?1",params![user],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+            assert_eq!(state, (expected_enabled, expected_suspended, 4, None));
+        }
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM pragma_table_info('market_c2c_sellers') WHERE name='heartbeat_at'", [], |r|r.get::<_,i64>(0)).unwrap(),0);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM market_notification_outbox WHERE dedupe_key LIKE 'c2c-acceptance-upgrade:%'", [], |r|r.get::<_,i64>(0)).unwrap(),2);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
+        assert!(crate::market_c2c::evidence_valid_tx(&conn, "order83").unwrap());
+        crate::market_wallet::reconcile_wallet_tx(&conn, "seller").unwrap();
+        assert!(conn.execute("UPDATE market_c2c_orders SET payment_deadline='2026-10-23T15:00:00Z' WHERE id='order83'", []).is_err());
+    }
+
+    #[test]
     fn migration_82_isolates_new_publication_rails_without_rewriting_existing_offers() {
         let conn = memory_connection();
         install_schema_through(&conn, 81);
@@ -1159,7 +1254,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count baseline tables");
-        assert_eq!(table_count, 231);
+        assert_eq!(table_count, 232);
         let removed_client_recovery_table_count = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -1740,7 +1835,7 @@ mod tests {
             .unwrap();
         apply(&conn).unwrap();
         apply(&conn).unwrap();
-        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",[],|r|r.get::<_,i64>(0)).unwrap(),231);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",[],|r|r.get::<_,i64>(0)).unwrap(),232);
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM market_journal_postings", [], |r| r
                 .get::<_, i64>(0))
@@ -1964,8 +2059,9 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        // Twelve tables from commission/conversion plus seven C2C tables.
-        assert_eq!(tables_after - tables_before, 19);
+        // Twelve commission/conversion tables, seven C2C tables and one
+        // narrowly scoped dispute-handler authorization table.
+        assert_eq!(tables_after - tables_before, 20);
         assert_eq!(
             conn.query_row(
                 "SELECT converted_units FROM market_provider_earning_lots WHERE id = 'old-lot'",

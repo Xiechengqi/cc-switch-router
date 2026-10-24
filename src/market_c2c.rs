@@ -17,8 +17,8 @@ pub use http::router;
 #[cfg(test)]
 mod tests;
 
-const ACTIVE: &str = "('awaiting_payment','paid','disputed')";
-const TERMS_VERSION: i64 = 1;
+const ACTIVE: &str = "('awaiting_seller','awaiting_payment','paid','disputed')";
+const TERMS_VERSION: i64 = 2;
 
 fn problem(code: &'static str, message: &str) -> AppError {
     AppError::Coded {
@@ -65,10 +65,11 @@ pub(super) struct Policy {
     min_minor: i64,
     max_minor: i64,
     payment_minutes: i64,
+    acceptance_minutes: i64,
 }
 fn policy_tx(conn: &Connection) -> Result<Policy, AppError> {
-    conn.query_row("SELECT version,enabled,admission_minor,min_minor,max_minor,payment_minutes FROM market_c2c_policy WHERE id=1",[],|r|Ok(Policy {
-        version:r.get(0)?,enabled:r.get(1)?,admission_minor:r.get(2)?,min_minor:r.get(3)?,max_minor:r.get(4)?,payment_minutes:r.get(5)?
+    conn.query_row("SELECT version,enabled,admission_minor,min_minor,max_minor,payment_minutes,acceptance_minutes FROM market_c2c_policy WHERE id=1",[],|r|Ok(Policy {
+        version:r.get(0)?,enabled:r.get(1)?,admission_minor:r.get(2)?,min_minor:r.get(3)?,max_minor:r.get(4)?,payment_minutes:r.get(5)?,acceptance_minutes:r.get(6)?
     })).map_err(db_error("read C2C policy"))
 }
 fn open_tx(conn: &Connection) -> Result<Policy, AppError> {
@@ -126,6 +127,9 @@ fn seller_blockers_tx(
     if prior.as_ref().is_some_and(|s| s.suspended) {
         blockers.push("C2C_SUSPENDED");
     }
+    if overdue_paid_orders_tx(conn, user, time)? {
+        blockers.push("C2C_OVERDUE_ORDERS");
+    }
     if prior.as_ref().is_none_or(|s| !s.enabled)
         && admission_balance_tx(conn, user, time)?
             < units_from_minor(policy_tx(conn)?.admission_minor)?
@@ -133,6 +137,9 @@ fn seller_blockers_tx(
         blockers.push("C2C_ADMISSION");
     }
     Ok(blockers)
+}
+fn overdue_paid_orders_tx(conn: &Connection, user: &str, time: &str) -> Result<bool, AppError> {
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM market_c2c_orders WHERE seller_id=?1 AND status IN ('paid','disputed') AND julianday(paid_at)<=julianday(?2)-60.0/1440)", params![user,time], |r|r.get(0)).map_err(db_error("check C2C overdue orders"))
 }
 fn save_policy_tx(
     conn: &Connection,
@@ -145,12 +152,13 @@ fn save_policy_tx(
         || input.max_minor < input.min_minor
         || input.max_minor > 10_000_000
         || !(5..=60).contains(&input.payment_minutes)
+        || !(5..=30).contains(&input.acceptance_minutes)
     {
         return Err(AppError::BadRequest("invalid C2C policy limits".into()));
     }
     let before = policy_tx(conn)?;
-    let changed=conn.execute("UPDATE market_c2c_policy SET version=version+1,enabled=?2,admission_minor=?3,min_minor=?4,max_minor=?5,payment_minutes=?6,updated_at=?7 WHERE id=1 AND version=?1",
-        params![input.version,input.enabled,input.admission_minor,input.min_minor,input.max_minor,input.payment_minutes,time]).map_err(db_error("save C2C policy"))?;
+    let changed=conn.execute("UPDATE market_c2c_policy SET version=version+1,enabled=?2,admission_minor=?3,min_minor=?4,max_minor=?5,payment_minutes=?6,updated_at=?7,acceptance_minutes=?8 WHERE id=1 AND version=?1",
+        params![input.version,input.enabled,input.admission_minor,input.min_minor,input.max_minor,input.payment_minutes,time,input.acceptance_minutes]).map_err(db_error("save C2C policy"))?;
     if changed != 1 {
         return Err(problem("C2C_STALE", "C2C policy version changed; reload"));
     }
@@ -178,6 +186,51 @@ fn audit_tx(
         params![Uuid::new_v4().to_string(),actor,action,kind,id,reason,time]).map_err(db_error("audit C2C action"))?;
     Ok(())
 }
+fn dispute_handler_tx(conn: &Connection, user: &str) -> Result<bool, AppError> {
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM market_c2c_dispute_handlers h JOIN users u ON u.id=h.user_id WHERE h.user_id=?1 AND h.enabled=1 AND u.status='active' AND u.email_verified_at IS NOT NULL)",params![user],|r|r.get(0)).map_err(db_error("read C2C dispute authorization"))
+}
+fn set_dispute_handler_tx(
+    conn: &Connection,
+    actor: &str,
+    user: &str,
+    version: i64,
+    enabled: bool,
+    time: &str,
+) -> Result<(), AppError> {
+    if actor == user {
+        return Err(AppError::Forbidden(
+            "owner must delegate to an independent administrator".into(),
+        ));
+    }
+    if enabled {
+        verified_tx(conn, user)?;
+    }
+    let prior: Option<i64> = conn
+        .query_row(
+            "SELECT version FROM market_c2c_dispute_handlers WHERE user_id=?1",
+            params![user],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(db_error("read C2C dispute grant version"))?;
+    if prior.unwrap_or(0) != version {
+        return Err(problem("C2C_STALE", "dispute grant changed; reload"));
+    }
+    conn.execute("INSERT INTO market_c2c_dispute_handlers(user_id,version,enabled,granted_by,updated_at) VALUES(?1,1,?2,?3,?4) ON CONFLICT(user_id) DO UPDATE SET version=version+1,enabled=excluded.enabled,granted_by=excluded.granted_by,updated_at=excluded.updated_at",params![user,enabled,actor,time]).map_err(db_error("save C2C dispute authorization"))?;
+    audit_tx(
+        conn,
+        actor,
+        if enabled {
+            "grant_c2c_dispute"
+        } else {
+            "revoke_c2c_dispute"
+        },
+        "c2c_dispute_handler",
+        user,
+        "c2c_only_no_general_finance_authority",
+        time,
+    )
+}
 
 /// Includes unresolved C2C reservations across midnight, not just completed
 /// sales. Both ordinary transfers and C2C consume the same per-day budget.
@@ -189,7 +242,7 @@ pub(crate) fn committed_transfer_units_tx(
     let day = at(time)?.date_naive().to_string();
     conn.query_row(
         "SELECT COALESCE(SUM(amount_units),0) FROM market_c2c_orders
-        WHERE seller_id=?1 AND (status IN ('awaiting_payment','paid','disputed')
+        WHERE seller_id=?1 AND (status IN ('awaiting_seller','awaiting_payment','paid','disputed')
          OR (status='released' AND date(released_at)>=?2))",
         params![user, day],
         |r| r.get(0),
@@ -235,11 +288,13 @@ struct Seller {
     price_bps: i64,
     min_minor: i64,
     max_minor: i64,
-    heartbeat_at: String,
+    auto_pause_reason: Option<String>,
+    auto_paused_at: Option<String>,
+    auto_pause_order_id: Option<String>,
 }
 fn seller_tx(conn: &Connection, id: &str) -> Result<Option<Seller>, AppError> {
-    conn.query_row("SELECT user_id,version,enabled,suspended,display_name,description,currency,price_bps,min_minor,max_minor,heartbeat_at FROM market_c2c_sellers WHERE user_id=?1",params![id],|r|Ok(Seller {
-        user_id:r.get(0)?,version:r.get(1)?,enabled:r.get(2)?,suspended:r.get(3)?,display_name:r.get(4)?,description:r.get(5)?,currency:r.get(6)?,price_bps:r.get(7)?,min_minor:r.get(8)?,max_minor:r.get(9)?,heartbeat_at:r.get(10)?
+    conn.query_row("SELECT user_id,version,enabled,suspended,display_name,description,currency,price_bps,min_minor,max_minor,auto_pause_reason,auto_paused_at,auto_pause_order_id FROM market_c2c_sellers WHERE user_id=?1",params![id],|r|Ok(Seller {
+        user_id:r.get(0)?,version:r.get(1)?,enabled:r.get(2)?,suspended:r.get(3)?,display_name:r.get(4)?,description:r.get(5)?,currency:r.get(6)?,price_bps:r.get(7)?,min_minor:r.get(8)?,max_minor:r.get(9)?,auto_pause_reason:r.get(10)?,auto_paused_at:r.get(11)?,auto_pause_order_id:r.get(12)?
     })).optional().map_err(db_error("read C2C seller"))
 }
 #[derive(Deserialize)]
@@ -303,11 +358,21 @@ fn save_seller_tx(
             ));
         }
     }
-    conn.execute("INSERT INTO market_c2c_sellers(user_id,version,enabled,display_name,description,currency,price_bps,min_minor,max_minor,heartbeat_at,created_at,updated_at)
-        VALUES(?1,1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?9)
+    if input.enabled
+        && prior
+            .as_ref()
+            .is_some_and(|s| s.auto_pause_reason.is_some())
+    {
+        return Err(problem(
+            "C2C_AUTO_PAUSED",
+            "review outstanding orders and explicitly resume selling",
+        ));
+    }
+    conn.execute("INSERT INTO market_c2c_sellers(user_id,version,enabled,display_name,description,currency,price_bps,min_minor,max_minor,created_at,updated_at)
+        VALUES(?1,1,?2,?3,?4,?5,?6,?7,?8,?9,?9)
         ON CONFLICT(user_id) DO UPDATE SET version=version+1,enabled=excluded.enabled,description=excluded.description,
          currency=excluded.currency,price_bps=excluded.price_bps,
-         min_minor=excluded.min_minor,max_minor=excluded.max_minor,heartbeat_at=excluded.heartbeat_at,updated_at=excluded.updated_at",
+         min_minor=excluded.min_minor,max_minor=excluded.max_minor,updated_at=excluded.updated_at",
         params![user,input.enabled,name,description,input.currency,input.price_bps,input.min_minor,input.max_minor,time]).map_err(db_error("save C2C seller"))?;
     audit_tx(
         conn,
@@ -345,7 +410,7 @@ fn pause_seller_tx(
         return Err(problem("C2C_STALE", "seller settings changed; reload"));
     }
     if prior.enabled {
-        conn.execute("UPDATE market_c2c_sellers SET enabled=0,version=version+1,updated_at=?2 WHERE user_id=?1 AND version=?3",
+        conn.execute("UPDATE market_c2c_sellers SET enabled=0,auto_pause_reason=NULL,auto_paused_at=NULL,auto_pause_order_id=NULL,version=version+1,updated_at=?2 WHERE user_id=?1 AND version=?3",
             params![user,time,expected_version]).map_err(db_error("pause C2C seller"))?;
         audit_tx(
             conn,
@@ -366,11 +431,12 @@ fn require_seller_tx(conn: &Connection, user: &str, time: &str) -> Result<Seller
     if !s.enabled
         || s.suspended
         || s.description.is_empty()
-        || at(&s.heartbeat_at)? + Duration::minutes(5) < at(time)?
+        || s.auto_pause_reason.is_some()
+        || overdue_paid_orders_tx(conn, user, time)?
     {
         return Err(problem(
             "C2C_SELLER_UNAVAILABLE",
-            "seller is offline or not accepting orders",
+            "seller is not accepting orders",
         ));
     }
     safe_tx(conn, user, user)?;
@@ -406,9 +472,9 @@ fn offers_tx(
     } else {
         p.max_minor.min(10000)
     };
-    let mut stmt=conn.prepare("SELECT user_id FROM market_c2c_sellers WHERE enabled=1 AND suspended=0 AND user_id!=?1 AND user_id>?3 AND julianday(heartbeat_at)>=julianday(?2)-5.0/1440 ORDER BY user_id LIMIT 101").map_err(db_error("list C2C sellers"))?;
+    let mut stmt=conn.prepare("SELECT user_id FROM market_c2c_sellers WHERE enabled=1 AND suspended=0 AND auto_pause_reason IS NULL AND user_id!=?1 AND user_id>?2 ORDER BY user_id LIMIT 101").map_err(db_error("list C2C sellers"))?;
     let mut ids = stmt
-        .query_map(params![user, time, after], |r| r.get::<_, String>(0))
+        .query_map(params![user, after], |r| r.get::<_, String>(0))
         .map_err(db_error("query C2C sellers"))?
         .collect::<crate::db::Result<Vec<_>>>()
         .map_err(db_error("read C2C sellers"))?;
@@ -473,6 +539,8 @@ struct Quote {
     price_bps: i64,
     description: String,
     expires_at: String,
+    flow_version: i64,
+    acceptance_minutes: i64,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -542,10 +610,12 @@ fn quote_tx(
         price_bps: s.price_bps,
         description: s.description.clone(),
         expires_at: (at(time)? + Duration::minutes(5)).to_rfc3339(),
+        flow_version: TERMS_VERSION,
+        acceptance_minutes: p.acceptance_minutes,
     };
-    conn.execute("INSERT INTO market_c2c_quotes(id,buyer_id,seller_id,seller_version,policy_version,credit_minor,pay_minor,currency,fx_micros,price_bps,seller_name,description,contact,payment_method,payment_details,payment_minutes,expires_at,created_at)
-        VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'','','',?13,?14,?15)",
-        params![q.id,buyer,q.seller_id,s.version,p.version,q.credit_minor,q.pay_minor,q.currency,rate,s.price_bps,s.display_name,s.description,p.payment_minutes,q.expires_at,time]).map_err(db_error("create C2C preview"))?;
+    conn.execute("INSERT INTO market_c2c_quotes(id,buyer_id,seller_id,seller_version,policy_version,credit_minor,pay_minor,currency,fx_micros,price_bps,seller_name,description,contact,payment_method,payment_details,payment_minutes,expires_at,created_at,flow_version,acceptance_minutes)
+        VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'','','',?13,?14,?15,2,?16)",
+        params![q.id,buyer,q.seller_id,s.version,p.version,q.credit_minor,q.pay_minor,q.currency,rate,s.price_bps,s.display_name,s.description,p.payment_minutes,q.expires_at,time,p.acceptance_minutes]).map_err(db_error("create C2C preview"))?;
     Ok(q)
 }
 
@@ -562,7 +632,10 @@ struct Order {
     hold_id: String,
     status: String,
     version: i64,
-    payment_deadline: String,
+    payment_deadline: Option<String>,
+    flow_version: i64,
+    acceptance_deadline: Option<String>,
+    accepted_at: Option<String>,
     paid_at: Option<String>,
     released_at: Option<String>,
     late_payment_reported: bool,
@@ -586,12 +659,12 @@ struct LegacyPayment {
 }
 fn order_tx(conn: &Connection, id: &str) -> Result<Order, AppError> {
     conn.query_row("SELECT o.id,o.quote_id,o.buyer_id,o.seller_id,o.amount_units,o.hold_id,o.status,o.version,o.payment_deadline,o.paid_at,o.released_at,o.late_payment_reported,o.late_payment_resolved,o.created_at,o.updated_at,
-       q.seller_name,q.pay_minor,q.currency,q.fx_micros,q.price_bps,q.contact,q.payment_method,q.payment_details,q.description
+       q.seller_name,q.pay_minor,q.currency,q.fx_micros,q.price_bps,q.contact,q.payment_method,q.payment_details,q.description,o.terms_version,o.acceptance_deadline,o.accepted_at
        FROM market_c2c_orders o JOIN market_c2c_quotes q ON q.id=o.quote_id WHERE o.id=?1",params![id],|r| {
         let description: String = r.get(23)?;
         let legacy_payment = if description.is_empty() { Some(LegacyPayment { contact:r.get(20)?,payment_method:r.get(21)?,payment_details:r.get(22)? }) } else { None };
         Ok(Order {
-        id:r.get(0)?,quote_id:r.get(1)?,buyer_id:r.get(2)?,seller_id:r.get(3)?,amount_units:r.get(4)?,hold_id:r.get(5)?,status:r.get(6)?,version:r.get(7)?,payment_deadline:r.get(8)?,paid_at:r.get(9)?,released_at:r.get(10)?,late_payment_reported:r.get(11)?,late_payment_resolved:r.get(12)?,created_at:r.get(13)?,updated_at:r.get(14)?,seller_name:r.get(15)?,pay_minor:r.get(16)?,currency:r.get(17)?,fx_micros:r.get(18)?,price_bps:r.get(19)?,description:(!description.is_empty()).then_some(description),legacy_payment
+        id:r.get(0)?,quote_id:r.get(1)?,buyer_id:r.get(2)?,seller_id:r.get(3)?,amount_units:r.get(4)?,hold_id:r.get(5)?,status:r.get(6)?,version:r.get(7)?,payment_deadline:r.get(8)?,paid_at:r.get(9)?,released_at:r.get(10)?,late_payment_reported:r.get(11)?,late_payment_resolved:r.get(12)?,created_at:r.get(13)?,updated_at:r.get(14)?,seller_name:r.get(15)?,pay_minor:r.get(16)?,currency:r.get(17)?,fx_micros:r.get(18)?,price_bps:r.get(19)?,description:(!description.is_empty()).then_some(description),legacy_payment,flow_version:r.get(24)?,acceptance_deadline:r.get(25)?,accepted_at:r.get(26)?
     })}).optional().map_err(db_error("read C2C order"))?.ok_or_else(||AppError::NotFound("C2C order not found".into()))
 }
 fn owned_tx(conn: &Connection, id: &str, user: &str) -> Result<Order, AppError> {
@@ -619,9 +692,33 @@ fn event_tx(
             "c2c_order",
             &o.id,
             &format!("c2c:{}:{}:{action}:{user}", o.id, o.version),
-            serde_json::json!({"orderId":o.id,"amountUnits":o.amount_units.to_string(),"status":o.status}),
+            serde_json::json!({"orderId":o.id,"amountUnits":o.amount_units.to_string(),"status":o.status,"action":action,"role":if user==&o.seller_id {"seller"} else {"buyer"}}),
             time,
         )?;
+    }
+    if matches!(
+        action,
+        "disputed" | "late_payment_reported" | "overdue_escalated"
+    ) {
+        let mut stmt=conn.prepare("SELECT h.user_id FROM market_c2c_dispute_handlers h JOIN users u ON u.id=h.user_id WHERE h.enabled=1 AND u.status='active' AND u.email_verified_at IS NOT NULL AND h.user_id NOT IN (?1,?2)").map_err(db_error("prepare C2C handler notices"))?;
+        let users = stmt
+            .query_map(params![o.buyer_id, o.seller_id], |r| r.get::<_, String>(0))
+            .map_err(db_error("query C2C handler notices"))?
+            .collect::<crate::db::Result<Vec<_>>>()
+            .map_err(db_error("read C2C handler notices"))?;
+        for user in users {
+            crate::market_notifications::enqueue_user_notification_tx(
+                conn,
+                "buyer",
+                &user,
+                "c2c_order_updated",
+                "c2c_order",
+                &o.id,
+                &format!("c2c-handler:{}:{}:{action}:{user}", o.id, o.version),
+                serde_json::json!({"orderId":o.id,"status":o.status,"role":"handler","action":action,"amountUnits":o.amount_units.to_string()}),
+                time,
+            )?;
+        }
     }
     Ok(())
 }
@@ -640,7 +737,7 @@ fn create_tx(
     ip: &str,
     time: &str,
 ) -> Result<Order, AppError> {
-    if input.terms_version != TERMS_VERSION || !input.acknowledge_external_payment {
+    if !matches!(input.terms_version, 1 | TERMS_VERSION) || !input.acknowledge_external_payment {
         return Err(problem("C2C_TERMS", "accept the external payment terms"));
     }
     if key.len() < 8
@@ -658,13 +755,20 @@ fn create_tx(
         }
         return order_tx(conn, &id);
     }
+    if input.terms_version != TERMS_VERSION {
+        return Err(problem(
+            "C2C_TERMS",
+            "seller acceptance is now required; review a new quote",
+        ));
+    }
     verified_tx(conn, buyer)?;
     let p = open_tx(conn)?;
-    let (seller,seller_version,policy_version,minor,minutes,expires):(String,i64,i64,i64,i64,String)=conn.query_row("SELECT seller_id,seller_version,policy_version,credit_minor,payment_minutes,expires_at FROM market_c2c_quotes WHERE id=?1 AND buyer_id=?2",params![input.quote_id,buyer],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional().map_err(db_error("read own C2C preview"))?.ok_or_else(||problem("C2C_STALE","preview expired or is unavailable; review again"))?;
+    let (seller,seller_version,policy_version,minor,minutes,expires,flow):(String,i64,i64,i64,i64,String,i64)=conn.query_row("SELECT seller_id,seller_version,policy_version,credit_minor,acceptance_minutes,expires_at,flow_version FROM market_c2c_quotes WHERE id=?1 AND buyer_id=?2",params![input.quote_id,buyer],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).optional().map_err(db_error("read own C2C preview"))?.ok_or_else(||problem("C2C_STALE","preview expired or is unavailable; review again"))?;
     let s = require_seller_tx(conn, &seller, time)?;
     if seller == buyer
         || seller_version != s.version
         || policy_version != p.version
+        || flow != TERMS_VERSION
         || at(&expires)? <= at(time)?
     {
         return Err(problem(
@@ -724,10 +828,17 @@ fn create_tx(
         None,
         time,
     )?;
-    conn.execute("INSERT INTO market_c2c_orders(id,quote_id,buyer_id,seller_id,idempotency_key,amount_units,hold_id,status,terms_version,payment_deadline,created_ip,created_at,updated_at)
-        VALUES(?1,?2,?3,?4,?5,?6,?7,'awaiting_payment',1,?8,?9,?10,?10)",params![id,input.quote_id,buyer,seller,key,amount,hold,deadline,ip,time]).map_err(db_error("create C2C order"))?;
+    conn.execute("INSERT INTO market_c2c_orders(id,quote_id,buyer_id,seller_id,idempotency_key,amount_units,hold_id,status,terms_version,acceptance_deadline,created_ip,created_at,updated_at)
+        VALUES(?1,?2,?3,?4,?5,?6,?7,'awaiting_seller',2,?8,?9,?10,?10)",params![id,input.quote_id,buyer,seller,key,amount,hold,deadline,ip,time]).map_err(db_error("create C2C order"))?;
     let o = order_tx(conn, &id)?;
-    event_tx(conn, &o, buyer, "created", "terms_v1", time)?;
+    event_tx(
+        conn,
+        &o,
+        buyer,
+        "created",
+        "terms_v2_acceptance_required",
+        time,
+    )?;
     Ok(o)
 }
 
@@ -737,6 +848,127 @@ fn change_tx(conn: &Connection, o: &Order, status: &str, time: &str) -> Result<O
         return Err(problem("C2C_STALE", "order version changed; reload"));
     }
     order_tx(conn, &o.id)
+}
+fn accept_tx(
+    conn: &Connection,
+    o: &Order,
+    actor: &str,
+    version: i64,
+    time: &str,
+) -> Result<Order, AppError> {
+    if actor != o.seller_id {
+        return Err(AppError::Forbidden(
+            "only the seller can accept an application".into(),
+        ));
+    }
+    // A lost acceptance response may be replayed, but can never extend time.
+    if o.accepted_at.is_some() {
+        return Ok(o.clone());
+    }
+    if o.version != version
+        || o.status != "awaiting_seller"
+        || at(time)? >= at(o.acceptance_deadline.as_deref().unwrap_or(""))?
+    {
+        return Err(problem(
+            "C2C_STALE",
+            "application changed or acceptance deadline elapsed",
+        ));
+    }
+    verified_tx(conn, actor)?;
+    safe_tx(conn, &o.seller_id, &o.buyer_id)?;
+    if !evidence_valid_tx(conn, &o.id)? {
+        return Err(problem(
+            "MARKET_FINANCE_HOLD",
+            "C2C reservation evidence needs review",
+        ));
+    }
+    let minutes: i64 = conn
+        .query_row(
+            "SELECT payment_minutes FROM market_c2c_quotes WHERE id=?1",
+            params![o.quote_id],
+            |r| r.get(0),
+        )
+        .map_err(db_error("read frozen C2C payment window"))?;
+    let deadline = (at(time)? + Duration::minutes(minutes)).to_rfc3339();
+    let n = conn.execute("UPDATE market_c2c_orders SET status='awaiting_payment',accepted_at=?3,payment_deadline=?4,version=version+1,updated_at=?3 WHERE id=?1 AND version=?2 AND status='awaiting_seller'", params![o.id,version,time,deadline]).map_err(db_error("accept C2C application"))?;
+    if n != 1 {
+        return Err(problem("C2C_STALE", "application changed; reload"));
+    }
+    let o = order_tx(conn, &o.id)?;
+    event_tx(conn, &o, actor, "accepted", "payment_window_started", time)?;
+    Ok(o)
+}
+
+fn auto_pause_tx(conn: &Connection, o: &Order, reason: &str, time: &str) -> Result<(), AppError> {
+    // Preserve selling intent. A manual pause or admin suspension always wins.
+    let n=conn.execute("UPDATE market_c2c_sellers SET auto_pause_reason=?2,auto_paused_at=?3,auto_pause_order_id=?4,version=version+1,updated_at=?3 WHERE user_id=?1 AND enabled=1 AND suspended=0 AND auto_pause_reason IS NULL",params![o.seller_id,reason,time,o.id]).map_err(db_error("automatically pause C2C intake"))?;
+    if n == 1 {
+        audit_tx(
+            conn,
+            "system",
+            "auto_pause",
+            "c2c_seller",
+            &o.seller_id,
+            reason,
+            time,
+        )?;
+        crate::market_notifications::enqueue_user_notification_tx(
+            conn,
+            "buyer",
+            &o.seller_id,
+            "c2c_seller_changed",
+            "c2c_seller",
+            &o.seller_id,
+            &format!("c2c-pause:{}:{reason}", o.id),
+            serde_json::json!({"reason":reason,"orderId":o.id}),
+            time,
+        )?;
+    }
+    Ok(())
+}
+fn resume_seller_tx(
+    conn: &Connection,
+    actor: &str,
+    version: i64,
+    time: &str,
+) -> Result<Seller, AppError> {
+    let s =
+        seller_tx(conn, actor)?.ok_or_else(|| AppError::NotFound("C2C seller not found".into()))?;
+    if s.version != version || !s.enabled || s.auto_pause_reason.is_none() {
+        return Err(problem("C2C_STALE", "seller changed; reload"));
+    }
+    if let Some(code) = seller_blockers_tx(conn, actor, time)?.first() {
+        return Err(problem(
+            code,
+            "seller eligibility requirements have not been met",
+        ));
+    }
+    if stock_tx(conn, actor, time)? < units_from_minor(s.min_minor.max(policy_tx(conn)?.min_minor))?
+    {
+        return Err(problem("C2C_STOCK", "insufficient sellable balance"));
+    }
+    conn.execute("UPDATE market_c2c_sellers SET auto_pause_reason=NULL,auto_paused_at=NULL,auto_pause_order_id=NULL,version=version+1,updated_at=?2 WHERE user_id=?1 AND version=?3",params![actor,time,version]).map_err(db_error("resume C2C seller"))?;
+    audit_tx(
+        conn,
+        actor,
+        "resume",
+        "c2c_seller",
+        actor,
+        "explicit_resume",
+        time,
+    )?;
+    crate::market_notifications::enqueue_user_notification_tx(
+        conn,
+        "buyer",
+        actor,
+        "c2c_seller_changed",
+        "c2c_seller",
+        actor,
+        &format!("c2c-resume:{actor}:{}", version + 1),
+        serde_json::json!({}),
+        time,
+    )?;
+    seller_tx(conn, actor)?.ok_or_else(|| AppError::Internal("C2C seller disappeared".into()))
 }
 fn cancel_tx(
     conn: &Connection,
@@ -748,13 +980,26 @@ fn cancel_tx(
     if matches!(o.status.as_str(), "cancelled" | "expired") {
         return Ok(o.clone());
     }
-    if o.status != "awaiting_payment" || (!expired && actor != o.buyer_id) {
+    if !matches!(o.status.as_str(), "awaiting_seller" | "awaiting_payment")
+        || (!expired
+            && actor != o.buyer_id
+            && !(actor == o.seller_id && o.status == "awaiting_seller"))
+    {
         return Err(problem(
             "C2C_PAYMENT_HOLD",
             "a paid or disputed order cannot be cancelled without a verified resolution",
         ));
     }
-    if expired && at(time)? < at(&o.payment_deadline)? + Duration::minutes(2) {
+    let application = o.status == "awaiting_seller";
+    let deadline = if application {
+        o.acceptance_deadline.as_deref()
+    } else {
+        o.payment_deadline.as_deref()
+    };
+    if expired
+        && at(time)?
+            < at(deadline.unwrap_or(""))? + Duration::minutes(if application { 0 } else { 2 })
+    {
         return Err(problem("C2C_STALE", "payment deadline has not elapsed"));
     }
     if !evidence_valid_tx(conn, &o.id)? {
@@ -771,7 +1016,15 @@ fn cancel_tx(
         conn,
         &o,
         actor,
-        if expired { "expired" } else { "cancelled" },
+        if expired && application {
+            "seller_timeout"
+        } else if expired {
+            "expired"
+        } else if actor == o.seller_id {
+            "rejected"
+        } else {
+            "cancelled"
+        },
         "no_payment_declared",
         time,
     )?;
@@ -794,7 +1047,7 @@ fn mark_paid_tx(
     }
     if o.version != version
         || o.status != "awaiting_payment"
-        || at(time)? >= at(&o.payment_deadline)? + Duration::minutes(2)
+        || at(time)? >= at(o.payment_deadline.as_deref().unwrap_or(""))? + Duration::minutes(2)
     {
         return Err(problem(
             "C2C_PAYMENT_WINDOW",
@@ -823,6 +1076,12 @@ fn release_tx(conn: &Connection, o: &Order, actor: &str, time: &str) -> Result<O
         return Err(problem(
             "C2C_PAYMENT_HOLD",
             "payment must be declared before release",
+        ));
+    }
+    if o.flow_version == 2 && o.accepted_at.is_none() && actor == o.seller_id {
+        return Err(problem(
+            "C2C_PAYMENT_HOLD",
+            "an early payment claim requires independent adjudication",
         ));
     }
     safe_tx(conn, &o.seller_id, &o.buyer_id)?;
@@ -947,17 +1206,26 @@ fn late_payment_tx(
     note: &str,
     time: &str,
 ) -> Result<Order, AppError> {
-    if o.buyer_id != buyer || !matches!(o.status.as_str(), "cancelled" | "expired") {
+    if o.buyer_id != buyer
+        || !matches!(
+            o.status.as_str(),
+            "awaiting_seller" | "cancelled" | "expired"
+        )
+    {
         return Err(problem(
             "C2C_PAYMENT_HOLD",
-            "late payment reporting is only for closed purchases",
+            "exceptional payment reporting is only for unaccepted or closed purchases",
         ));
     }
     if o.late_payment_reported {
         return Ok(o.clone());
     }
     let note = text(note, 1500)?;
-    conn.execute("UPDATE market_c2c_orders SET late_payment_reported=1,version=version+1,updated_at=?2 WHERE id=?1",params![o.id,time]).map_err(db_error("record late C2C payment"))?;
+    if o.status == "awaiting_seller" {
+        conn.execute("UPDATE market_c2c_orders SET status='disputed',paid_at=?2,late_payment_reported=1,version=version+1,updated_at=?2 WHERE id=?1",params![o.id,time]).map_err(db_error("protect early C2C payment claim"))?;
+    } else {
+        conn.execute("UPDATE market_c2c_orders SET late_payment_reported=1,version=version+1,updated_at=?2 WHERE id=?1",params![o.id,time]).map_err(db_error("record late C2C payment"))?;
+    }
     let o = order_tx(conn, &o.id)?;
     event_tx(conn, &o, buyer, "late_payment_reported", &note, time)?;
     crate::market_notifications::owner_signal_tx(
@@ -1013,6 +1281,14 @@ fn resolve_tx(
         }
         _ => return Err(AppError::Conflict("invalid C2C resolution".into())),
     };
+    if result.late_payment_reported && !result.late_payment_resolved {
+        conn.execute(
+            "UPDATE market_c2c_orders SET late_payment_resolved=1 WHERE id=?1",
+            params![o.id],
+        )
+        .map_err(db_error("resolve C2C exceptional payment claim"))?;
+    }
+    let result = order_tx(conn, &result.id)?;
     audit_tx(conn, actor, action, "c2c_order", &o.id, &evidence, time)?;
     event_tx(conn, &result, actor, action, &evidence, time)?;
     crate::market_notifications::owner_signal_tx(
@@ -1032,11 +1308,11 @@ pub(crate) fn evidence_valid_tx(conn: &Connection, id: &str) -> Result<bool, App
        JOIN market_c2c_quotes q ON q.id=o.quote_id AND q.seller_id=o.seller_id AND q.buyer_id=o.buyer_id
        JOIN market_wallet_holds h ON h.id=o.hold_id AND h.user_id=o.seller_id
         AND h.source_kind='c2c_order' AND h.source_id=o.id AND h.purpose='c2c' AND h.amount_units=o.amount_units
-       WHERE o.id=?1 AND o.amount_units=q.credit_minor*86400 AND o.terms_version=1
+       WHERE o.id=?1 AND o.amount_units=q.credit_minor*86400 AND o.terms_version=q.flow_version
         AND (o.status NOT IN ('paid','disputed','released') OR o.paid_at IS NOT NULL)
-        AND (o.status!='awaiting_payment' OR o.paid_at IS NULL)
+        AND (o.status NOT IN ('awaiting_seller','awaiting_payment') OR o.paid_at IS NULL)
         AND EXISTS(SELECT 1 FROM market_verified_c2c_reservation_evidence r WHERE r.id=o.id) AND (
-        (o.status IN ('awaiting_payment','paid','disputed') AND h.status='active' AND h.remaining_units=o.amount_units AND o.release_journal_id IS NULL)
+        (o.status IN ('awaiting_seller','awaiting_payment','paid','disputed') AND h.status='active' AND h.remaining_units=o.amount_units AND o.release_journal_id IS NULL)
         OR (o.status IN ('cancelled','expired') AND h.status='released' AND h.remaining_units=0 AND o.release_journal_id IS NULL AND EXISTS(SELECT 1 FROM market_verified_c2c_return_evidence e WHERE e.id=o.id))
         OR (o.status='released' AND EXISTS(SELECT 1 FROM market_verified_c2c_release_evidence e WHERE e.id=o.id))))",params![id],|r|r.get(0)).map_err(db_error("verify C2C evidence"))
 }
@@ -1099,11 +1375,11 @@ pub(crate) fn audit_tx_cases(conn: &Connection, time: &str) -> Result<usize, App
 }
 pub(crate) fn tick_tx(conn: &Connection, time: &str) -> Result<(), AppError> {
     let cutoff = (at(time)? - Duration::minutes(2)).to_rfc3339();
-    let mut stmt=conn.prepare("SELECT id FROM market_c2c_orders o WHERE status='awaiting_payment' AND julianday(payment_deadline)<=julianday(?1)
+    let mut stmt=conn.prepare("SELECT id FROM market_c2c_orders o WHERE ((status='awaiting_payment' AND julianday(payment_deadline)<=julianday(?1)) OR (status='awaiting_seller' AND julianday(acceptance_deadline)<=julianday(?2)))
         AND NOT EXISTS(SELECT 1 FROM market_finance_reconciliation_cases c WHERE c.status='open' AND ((c.object_id=o.id AND c.code='c2c_evidence_mismatch') OR (c.object_id=o.seller_id AND c.code='wallet_projection_mismatch')))
-        ORDER BY payment_deadline LIMIT 100").map_err(db_error("prepare C2C expiration"))?;
+        ORDER BY COALESCE(acceptance_deadline,payment_deadline),id LIMIT 100").map_err(db_error("prepare C2C expiration"))?;
     let ids = stmt
-        .query_map(params![cutoff], |r| r.get::<_, String>(0))
+        .query_map(params![cutoff, time], |r| r.get::<_, String>(0))
         .map_err(db_error("query C2C expiration"))?
         .collect::<crate::db::Result<Vec<_>>>()
         .map_err(db_error("read C2C expiration"))?;
@@ -1127,6 +1403,9 @@ pub(crate) fn tick_tx(conn: &Connection, time: &str) -> Result<(), AppError> {
             )?;
         } else {
             cancel_tx(conn, &o, "system", true, time)?;
+            if o.status == "awaiting_seller" {
+                auto_pause_tx(conn, &o, "acceptance_timeout", time)?;
+            }
         }
     }
     let mut stmt=conn.prepare("SELECT id FROM market_c2c_orders WHERE status='paid' AND reminded_at IS NULL AND julianday(paid_at)<=julianday(?1)-30.0/1440 LIMIT 100").map_err(db_error("prepare C2C reminders"))?;
@@ -1150,6 +1429,54 @@ pub(crate) fn tick_tx(conn: &Connection, time: &str) -> Result<(), AppError> {
             params![id, time],
         )
         .map_err(db_error("record C2C reminder"))?;
+    }
+    // Real overdue transactions, not browser presence, pause new intake.
+    // Existing paid/disputed credit stays reserved until evidence is resolved.
+    let mut stmt=conn.prepare("SELECT id FROM market_c2c_orders WHERE status IN ('paid','disputed') AND seller_paused_at IS NULL AND julianday(paid_at)<=julianday(?1)-60.0/1440 ORDER BY paid_at,id LIMIT 100").map_err(db_error("prepare C2C nonresponse pause"))?;
+    let ids = stmt
+        .query_map(params![time], |r| r.get::<_, String>(0))
+        .map_err(db_error("query C2C nonresponse pause"))?
+        .collect::<crate::db::Result<Vec<_>>>()
+        .map_err(db_error("read C2C nonresponse pause"))?;
+    for id in ids {
+        let o = order_tx(conn, &id)?;
+        auto_pause_tx(conn, &o, "paid_order_overdue", time)?;
+        conn.execute(
+            "UPDATE market_c2c_orders SET seller_paused_at=?2 WHERE id=?1",
+            params![id, time],
+        )
+        .map_err(db_error("record C2C nonresponse pause"))?;
+    }
+    let mut stmt=conn.prepare("SELECT id FROM market_c2c_orders WHERE status IN ('paid','disputed') AND escalated_at IS NULL AND julianday(paid_at)<=julianday(?1)-1 ORDER BY paid_at,id LIMIT 100").map_err(db_error("prepare C2C overdue escalation"))?;
+    let ids = stmt
+        .query_map(params![time], |r| r.get::<_, String>(0))
+        .map_err(db_error("query C2C overdue escalation"))?
+        .collect::<crate::db::Result<Vec<_>>>()
+        .map_err(db_error("read C2C overdue escalation"))?;
+    for id in ids {
+        let o = order_tx(conn, &id)?;
+        crate::market_notifications::owner_signal_tx(
+            conn,
+            "c2c_dispute",
+            "c2c_order",
+            &id,
+            serde_json::json!({"orderId":id,"reason":"paid_unhandled_24h"}),
+            time,
+            false,
+        )?;
+        event_tx(
+            conn,
+            &o,
+            "system",
+            "overdue_escalated",
+            "no_automatic_adjudication",
+            time,
+        )?;
+        conn.execute(
+            "UPDATE market_c2c_orders SET escalated_at=?2 WHERE id=?1",
+            params![id, time],
+        )
+        .map_err(db_error("record C2C overdue escalation"))?;
     }
     conn.execute("DELETE FROM market_c2c_attempts WHERE id IN(SELECT id FROM market_c2c_attempts WHERE julianday(created_at)<julianday(?1)-2 LIMIT 1000)",params![time]).map_err(db_error("prune C2C rate records"))?;
     conn.execute("DELETE FROM market_c2c_challenges WHERE id IN(SELECT id FROM market_c2c_challenges WHERE julianday(expires_at)<julianday(?1)-30 AND consumed_at IS NULL LIMIT 1000)",params![time]).map_err(db_error("prune unused C2C release codes"))?;
