@@ -162,11 +162,15 @@ export const TOPUP_PRESET_MINOR = [500, 1_000, 2_000, 5_000, 10_000] as const;
 const DEFAULT_TOPUP_MIN_MINOR = 100;
 const DEFAULT_TOPUP_MAX_MINOR = 100_000;
 
-/** Effective per-channel bounds; older channel views omit them. */
-export function topupBounds(channel: { minTopupMinor?: number; maxTopupMinor?: number } | null | undefined) {
-  const min = Number.isSafeInteger(channel?.minTopupMinor) ? Math.max(1, channel!.minTopupMinor!) : DEFAULT_TOPUP_MIN_MINOR;
-  const max = Number.isSafeInteger(channel?.maxTopupMinor) ? channel!.maxTopupMinor! : DEFAULT_TOPUP_MAX_MINOR;
-  return { min, max: Math.max(min, max) };
+/** Only server-derived credit bounds are valid input bounds. Missing, empty or
+ * malformed ranges must not turn gross payment limits into a credit promise. */
+export function topupBounds(channel: { minCreditMinor?: unknown; maxCreditMinor?: unknown } | null | undefined) {
+  const min = channel?.minCreditMinor;
+  const max = channel?.maxCreditMinor;
+  if (typeof min !== "number" || typeof max !== "number"
+    || !Number.isSafeInteger(min) || !Number.isSafeInteger(max)
+    || min < DEFAULT_TOPUP_MIN_MINOR || max > DEFAULT_TOPUP_MAX_MINOR || min > max) return null;
+  return { min, max };
 }
 
 /** Parses a dollar amount (≤2 decimals) and checks it against channel bounds. */

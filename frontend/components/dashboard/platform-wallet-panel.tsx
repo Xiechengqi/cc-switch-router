@@ -43,7 +43,7 @@ import {
   type MarketWalletTransaction,
   type MarketWalletPage,
 } from "@/lib/market-wallet-api";
-import { TOPUP_PRESET_MINOR, formatMinorUsd, formatTopupCountdown, formatWalletUnits, formatWalletUnitsAsCny, parseTopupMinor, parseUsdMinor, safeMarketReturnPath, shouldResetTopupIdempotency, topupAutoCheckCountdown, topupCancelAction, topupDisplayStatus, verifiedPayableCheckoutUrl, walletTopupCheckoutHref } from "@/lib/market-wallet-money";
+import { TOPUP_PRESET_MINOR, formatMinorUsd, formatTopupCountdown, formatWalletUnits, formatWalletUnitsAsCny, parseTopupMinor, parseUsdMinor, safeMarketReturnPath, shouldResetTopupIdempotency, topupAutoCheckCountdown, topupBounds, topupCancelAction, topupDisplayStatus, verifiedPayableCheckoutUrl, walletTopupCheckoutHref } from "@/lib/market-wallet-money";
 
 const CLOSED_TOPUP_STATUS = new Set(["credited", "expired", "cancelled"]);
 
@@ -108,11 +108,6 @@ function errorText(cause: unknown) {
 function walletEntryKey(sourceKind: string): MessageKey {
   const key = `marketWallet.entry.${sourceKind}`;
   return (key in messages.en ? key : "marketWallet.entry.other") as MessageKey;
-}
-
-function detailMinor(details: Record<string, unknown> | undefined, name: string) {
-  const value = details?.[name];
-  return typeof value === "number" && Number.isSafeInteger(value) ? value : null;
 }
 
 /** Localized message for a failed top-up creation. */
@@ -217,6 +212,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
   const busyRef = React.useRef(false);
   const statusRequestVersionRef = React.useRef<Record<string, number>>({});
   const reloadVersionRef = React.useRef(0);
+  const channelReloadVersionRef = React.useRef(0);
   const historyExpandedRef = React.useRef({ topups: false, transactions: false });
   const historiesRef = React.useRef({ topups, transactions });
   const balanceFingerprint = `${wallet.version}:${wallet.postedUnits}:${wallet.heldUnits}:${wallet.availableUnits}`;
@@ -299,25 +295,46 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
     return () => { active = false; };
   }, [topups]);
 
+  const refreshChannels = React.useCallback(async () => {
+    const version = ++channelReloadVersionRef.current;
+    const nextChannels = await getMarketWalletChannels();
+    if (version !== channelReloadVersionRef.current) return;
+    setChannels(nextChannels);
+    setChannelId((current) => nextChannels.some((channel) => channel.id === current) ? current : nextChannels[0]?.id || "");
+  }, []);
+
   const reload = React.useCallback(async () => {
     const version = ++reloadVersionRef.current;
-    const [nextWallet, nextChannels, nextTopups, nextTransactions] = await Promise.all([
-      getMarketWallet(), getMarketWalletChannels(),
+    const [nextWallet, , nextTopups, nextTransactions] = await Promise.all([
+      getMarketWallet(), refreshChannels(),
       refreshHistoryHead(getMarketWalletTopups, historiesRef.current.topups),
       refreshHistoryHead(getMarketWalletTransactions, historiesRef.current.transactions),
     ]);
     if (version !== reloadVersionRef.current) return;
     setWallet(nextWallet);
-    setChannels(nextChannels);
     setGatewayStatuses({});
     // Refresh the newest entries without discarding history already loaded by scrolling.
     setTopups((current) => mergeHistoryItems(nextTopups.items, current));
     setTopupCursor((current) => historyExpandedRef.current.topups ? current : nextTopups.nextCursor);
     setTransactions((current) => mergeHistoryItems(nextTransactions.items, current));
     setTransactionCursor((current) => historyExpandedRef.current.transactions ? current : nextTransactions.nextCursor);
-    setChannelId((current) => current || nextChannels[0]?.id || "");
     setLoaded(true);
-  }, []);
+  }, [refreshChannels]);
+
+  React.useEffect(() => {
+    if (!loaded || !wallet.canTopup || fundingMethod !== "official") return;
+    // Limits can change even with no pending order. Revalidate when returning
+    // from another tab and at a bounded cadence while the form is visible.
+    const refresh = () => { if (document.visibilityState === "visible") void refreshChannels().catch(() => {}); };
+    const timer = window.setInterval(refresh, 30_000);
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", refresh);
+    };
+  }, [loaded, wallet.canTopup, fundingMethod, refreshChannels]);
 
   React.useEffect(() => session?.user?.id ? subscribeMarketBalanceChanged(session.user.id, () => { void reload().catch(() => setError(t("earningConversion.refreshFailed"))); }) : undefined, [session?.user?.id, reload, t]);
 
@@ -340,17 +357,15 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
     let active = true;
     const version = ++reloadVersionRef.current;
     Promise.all([
-      getMarketWallet(), getMarketWalletChannels(),
+      getMarketWallet(), refreshChannels(),
       getMarketWalletTopups(), getMarketWalletTransactions(),
-    ]).then(([nextWallet, nextChannels, nextTopups, nextTransactions]) => {
+    ]).then(([nextWallet, , nextTopups, nextTransactions]) => {
       if (!active || version !== reloadVersionRef.current) return;
       setWallet(nextWallet);
-      setChannels(nextChannels);
       setTopups(nextTopups.items);
       setTopupCursor(nextTopups.nextCursor);
       setTransactions(nextTransactions.items);
       setTransactionCursor(nextTransactions.nextCursor);
-      setChannelId((current) => current || nextChannels[0]?.id || "");
       setLoaded(true);
     }).catch((cause) => {
       if (!active || version !== reloadVersionRef.current) return;
@@ -358,7 +373,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
       setLoaded(true);
     });
     return () => { active = false; };
-  }, []);
+  }, [refreshChannels]);
 
   React.useEffect(() => {
     if (!returnedTopupId) return;
@@ -399,11 +414,11 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
   const selectedChannel = channels.find((channel) => channel.id === channelId) ?? null;
   const directChannel = selectedChannel?.orderMode === "direct";
   const channelMethods = React.useMemo(() => directChannel ? selectedChannel?.methods ?? [] : [], [directChannel, selectedChannel]);
-  const bounds = { min: 100, max: 100_000 };
-  const parsedAmount = parseTopupMinor(amount, bounds);
-  const amountError = amountTouched && amount && parsedAmount == null;
+  const bounds = topupBounds(selectedChannel);
+  const parsedAmount = bounds ? parseTopupMinor(amount, bounds) : null;
+  const amountError = !!bounds && amountTouched && amount && parsedAmount == null;
   const methodReady = !directChannel || channelMethods.some((method) => method.tokenId === tokenId);
-  const quoteFingerprint = `${channelId}:${parsedAmount}:${directChannel ? tokenId : ""}`;
+  const quoteFingerprint = `${channelId}:${parsedAmount}:${directChannel ? tokenId : ""}:${selectedChannel?.policyVersion}:${selectedChannel?.maintenanceFeeBps}:${selectedChannel?.channelRevision}:${selectedChannel?.channelSettingsVersion}:${bounds?.min}:${bounds?.max}`;
   const activeQuote = quote?.fingerprint === quoteFingerprint && Date.parse(quote.value.expiresAt) > nowMs ? quote.value : null;
   const quoteExpired = quote?.fingerprint === quoteFingerprint && Date.parse(quote.value.expiresAt) <= nowMs;
 
@@ -413,13 +428,32 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
     if (!wallet.canTopup || !channelId || parsedAmount == null || !methodReady) { setQuote(null); return; }
     const timer = window.setTimeout(() => {
       void quoteWalletTopup(channelId, parsedAmount, directChannel ? tokenId : undefined)
-        .then((value) => { if (active) setQuote({ fingerprint: quoteFingerprint, value }); })
-        .catch((cause) => { if (active) { setQuote(null); setQuoteError(cause instanceof ApiError && cause.code === "MARKET_TOPUP_AMOUNT_OUT_OF_RANGE"
-          ? t("walletPolicy.channelRange", { min: formatMinorUsd(detailMinor(cause.details, "minTopupMinor") ?? 100), max: formatMinorUsd(detailMinor(cause.details, "maxTopupMinor") ?? 100_000) })
-          : errorText(cause)); } });
+        .then(async (value) => {
+          if (!active) return;
+          if (value.policyVersion !== selectedChannel?.policyVersion
+            || value.feeBps !== selectedChannel.maintenanceFeeBps
+            || value.channelRevision !== selectedChannel.channelRevision
+            || value.channelSettingsVersion !== selectedChannel.channelSettingsVersion) {
+            setQuote(null);
+            setQuoteError(t("walletPolicy.quoteExpired"));
+            await refreshChannels();
+            return;
+          }
+          setQuote({ fingerprint: quoteFingerprint, value });
+        })
+        .catch((cause) => { if (active) {
+          setQuote(null);
+          const range = cause instanceof ApiError ? topupBounds(cause.details) : null;
+          setQuoteError(cause instanceof ApiError && cause.code === "MARKET_TOPUP_AMOUNT_OUT_OF_RANGE"
+            ? range ? t("marketWallet.error.amountOutOfRange", { min: formatMinorUsd(range.min), max: formatMinorUsd(range.max) }) : t("marketWallet.amountRangeUnavailable")
+            : errorText(cause));
+          if (cause instanceof ApiError && ["MARKET_TOPUP_AMOUNT_OUT_OF_RANGE", "MARKET_TOPUP_QUOTE_CHANGED"].includes(cause.code ?? "")) void refreshChannels().catch(() => {});
+        } });
     }, 450);
     return () => { active = false; window.clearTimeout(timer); };
-  }, [channelId, parsedAmount, directChannel, tokenId, methodReady, quoteFingerprint, wallet.canTopup, quoteRefresh, quoteExpired, t]);
+  // The fingerprint captures the channel's monetary configuration, without
+  // re-quoting just because polling returned an equivalent channel object.
+  }, [channelId, parsedAmount, directChannel, tokenId, methodReady, quoteFingerprint, wallet.canTopup, quoteRefresh, quoteExpired, refreshChannels, t]);
 
   React.useEffect(() => {
     // A payment method belongs to one channel; a single method is preselected,
@@ -522,15 +556,15 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
         setQuote(null);
         setQuoteRefresh((value) => value + 1);
         setError(t("walletPolicy.quoteExpired"));
+        void refreshChannels().catch(() => {});
         return;
       }
-      const rangeMin = cause instanceof ApiError ? detailMinor(cause.details, "minTopupMinor") : null;
-      const rangeMax = cause instanceof ApiError ? detailMinor(cause.details, "maxTopupMinor") : null;
+      const range = cause instanceof ApiError ? topupBounds(cause.details) : null;
       const key = topupErrorKey(cause);
       setError(cause instanceof ApiError && cause.code === "MARKET_TOPUP_AMOUNT_OUT_OF_RANGE"
-        ? t("marketWallet.error.amountOutOfRange", {
-          min: formatMinorUsd(rangeMin ?? bounds.min), max: formatMinorUsd(rangeMax ?? bounds.max),
-        })
+        ? range ? t("marketWallet.error.amountOutOfRange", {
+          min: formatMinorUsd(range.min), max: formatMinorUsd(range.max),
+        }) : t("marketWallet.amountRangeUnavailable")
         : key ? t(key) : errorText(cause));
       void reload().catch(() => {});
     } finally {
@@ -784,7 +818,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
             <legend className="mb-1">{t("marketWallet.amount")}</legend>
             <div className="grid grid-cols-3 gap-2 sm:grid-cols-5">
               {TOPUP_PRESET_MINOR.map((minor) => {
-                const allowed = minor >= bounds.min && minor <= bounds.max;
+                const allowed = !!bounds && minor >= bounds.min && minor <= bounds.max;
                 const pressed = parsedAmount === minor;
                 return <button
                   key={minor} type="button" aria-pressed={pressed}
@@ -810,12 +844,12 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
                   onBlur={() => setAmountTouched(true)}
                   aria-invalid={!!amountError} aria-describedby="wallet-amount-help"
                   className="h-11 min-w-0 rounded-md border border-input bg-background pl-7 pr-3 tabular-nums outline-2 outline-transparent focus-visible:outline-ring aria-invalid:border-destructive disabled:cursor-not-allowed disabled:opacity-50"
-                  placeholder="10.00" disabled={!wallet.canTopup || !!busy}
+                  placeholder="10.00" disabled={!bounds || !wallet.canTopup || !!busy}
                 />
               </span>
             </label>
             <span id="wallet-amount-help" className={`min-h-[1lh] text-xs ${amountError ? "text-destructive" : "text-muted-foreground"}`}>
-              {amountError
+              {!bounds ? t(selectedChannel ? "marketWallet.amountRangeUnavailable" : "marketWallet.noChannelHelp") : amountError
                 ? t("marketWallet.amountRangeError", { min: formatMinorUsd(bounds.min), max: formatMinorUsd(bounds.max) })
                 : t("marketWallet.amountRangeHelp", { min: formatMinorUsd(bounds.min), max: formatMinorUsd(bounds.max) })}
             </span>

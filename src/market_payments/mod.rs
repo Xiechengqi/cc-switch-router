@@ -6,6 +6,7 @@ mod dujiaopay;
 mod owner_actions;
 mod quotes;
 mod sweep;
+mod topup_bounds;
 
 pub(crate) use self::chains::token_rail;
 
@@ -36,6 +37,7 @@ use self::crypto::{PaymentCipher, aad};
 use self::dujiaopay::{
     Client as DujiaoPayClient, CreatedOrder, Credentials, GatewayOrder, WebhookEvent,
 };
+use self::topup_bounds::TopupAmountLimits;
 
 const MAX_TOPUP_MINOR: i64 = 100_000;
 const MIN_TOPUP_MINOR: i64 = 100;
@@ -891,12 +893,14 @@ struct BuyerChannelView {
     gateway_kind: &'static str,
     order_mode: String,
     methods: Vec<BuyerMethodView>,
-    min_topup_minor: i64,
-    max_topup_minor: i64,
+    #[serde(flatten)]
+    amount_limits: TopupAmountLimits,
+    channel_revision: i64,
+    channel_settings_version: i64,
     canary: bool,
 }
 
-/// The effective per-order bounds: the global range intersected with the
+/// The effective gross payment bounds: the global range intersected with the
 /// channel's own merchant-verified range.
 fn effective_topup_bounds(settings: &ChannelSettingsView) -> (i64, i64) {
     let min = settings
@@ -910,10 +914,13 @@ fn effective_topup_bounds(settings: &ChannelSettingsView) -> (i64, i64) {
     (min, max)
 }
 
-impl From<ChannelView> for BuyerChannelView {
-    fn from(channel: ChannelView) -> Self {
+impl BuyerChannelView {
+    fn new(
+        channel: ChannelView,
+        policy: &crate::market_wallet_policy::WalletPolicy,
+    ) -> Result<Self, AppError> {
         let (min_topup_minor, max_topup_minor) = effective_topup_bounds(&channel.settings);
-        Self {
+        Ok(Self {
             id: channel.id,
             display_name: channel.display_name,
             gateway_kind: channel.gateway_kind,
@@ -931,10 +938,16 @@ impl From<ChannelView> for BuyerChannelView {
                     min_confirmations: rail.min_confirmations,
                 })
                 .collect(),
-            min_topup_minor,
-            max_topup_minor,
+            amount_limits: TopupAmountLimits::new(
+                min_topup_minor,
+                max_topup_minor,
+                policy.maintenance_fee_bps,
+                policy.version,
+            )?,
+            channel_revision: channel.current_revision,
+            channel_settings_version: channel.settings.version,
             canary: channel.rollout_state == "canary",
-        }
+        })
     }
 }
 
@@ -1024,7 +1037,8 @@ fn buyer_channel_views(
     conn: &Connection,
     include_canary: bool,
 ) -> Result<Vec<BuyerChannelView>, AppError> {
-    Ok(channel_views(conn, false)?
+    let policy = crate::market_wallet_policy::policy_tx(conn)?;
+    channel_views(conn, false)?
         .into_iter()
         .filter(|channel| {
             channel.archived_at.is_none()
@@ -1032,8 +1046,8 @@ fn buyer_channel_views(
                 && (channel.rollout_state == "live"
                     || (include_canary && channel.rollout_state == "canary"))
         })
-        .map(BuyerChannelView::from)
-        .collect())
+        .map(|channel| BuyerChannelView::new(channel, &policy))
+        .collect()
 }
 
 async fn list_enabled_channels(
@@ -4885,17 +4899,6 @@ async fn create_topup(
                 require_new_topups_open_tx(&tx)?;
                 let channel = topup_channel_tx(&tx, &input.channel_id, owner)?;
                 quotes::validate_current_tx(&tx, &quote, &channel, &now())?;
-                if !(channel.min_topup_minor..=channel.max_topup_minor).contains(&quote.pay_minor) {
-                    return Err(AppError::Coded {
-                        status: StatusCode::BAD_REQUEST,
-                        code: "MARKET_TOPUP_AMOUNT_OUT_OF_RANGE",
-                        message: "top-up amount outside this channel's range".into(),
-                        details: serde_json::json!({
-                            "minTopupMinor": channel.min_topup_minor,
-                            "maxTopupMinor": channel.max_topup_minor,
-                        }),
-                    });
-                }
                 quotes::validate_method(&channel, input.token_id.as_deref())?;
                 ensure_pending_topup_capacity_tx(&tx, &session.user_id)?;
                 let recent: i64 = tx
@@ -7680,6 +7683,134 @@ mod tests {
     }
 
     #[test]
+    fn fee_adjusted_channel_projection_and_quotes_agree_without_creating_orders() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        conn.execute(
+            "UPDATE market_finance_control SET mode = 'shadow' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE market_payment_channels SET rollout_state = 'canary' WHERE id = 'channel'",
+            [],
+        )
+        .unwrap();
+        let at = chrono::DateTime::parse_from_rfc3339("2026-10-25T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let channels = buyer_channel_views(&conn, true).unwrap();
+        assert_eq!(channels[0].amount_limits.max_credit_minor, Some(95_238));
+        let quote = quotes::quote_tx(
+            &conn,
+            "buyer",
+            true,
+            quotes::QuoteRequest {
+                channel_id: "channel".into(),
+                amount_minor: 95_238,
+                token_id: None,
+            },
+            at,
+        )
+        .unwrap();
+        assert_eq!(
+            (quote.credit_minor, quote.fee_minor, quote.pay_minor),
+            (95_238, 4_762, 100_000)
+        );
+        for amount in [95_239, 96_000, 100_000, 99, 100_001, -1, i64::MAX] {
+            let error = quotes::quote_tx(
+                &conn,
+                "buyer",
+                true,
+                quotes::QuoteRequest {
+                    channel_id: "channel".into(),
+                    amount_minor: amount,
+                    token_id: None,
+                },
+                at,
+            )
+            .err()
+            .unwrap();
+            let AppError::Coded { code, details, .. } = error else {
+                panic!("expected coded amount error")
+            };
+            assert_eq!(code, "MARKET_TOPUP_AMOUNT_OUT_OF_RANGE");
+            assert_eq!(details["maxCreditMinor"], 95_238);
+            assert_eq!(details["maxTopupMinor"], 100_000);
+            assert_eq!(details["maintenanceFeeBps"], 500);
+        }
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM market_topup_quotes", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM market_topup_orders", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        ensure_pending_topup_capacity_tx(&conn, "buyer").unwrap();
+
+        // A policy edit immediately changes the public credit range. The old
+        // quote is still frozen but cannot create a new order at today's fee.
+        conn.execute(
+            "UPDATE market_wallet_policy SET maintenance_fee_bps = 1000, version = version + 1",
+            [],
+        )
+        .unwrap();
+        let channels = buyer_channel_views(&conn, true).unwrap();
+        assert_eq!(channels[0].amount_limits.max_credit_minor, Some(90_909));
+        assert_eq!(channels[0].amount_limits.policy_version, 2);
+        assert!(
+            quotes::validate_current_tx(
+                &conn,
+                &quote,
+                &topup_channel_tx(&conn, "channel", true).unwrap(),
+                "2026-10-25T12:01:00+00:00"
+            )
+            .is_err()
+        );
+        let old = quotes::read_quote_tx(&conn, "buyer", &quote.id).unwrap();
+        assert_eq!(
+            (old.credit_minor, old.fee_minor, old.pay_minor),
+            (95_238, 4_762, 100_000)
+        );
+
+        // Tiny but valid gross limits can have no feasible cent-valued credit.
+        conn.execute("INSERT INTO market_payment_channel_settings (channel_id, max_topup_minor, updated_at) VALUES ('channel', 100, '2026-10-25')
+            ON CONFLICT (channel_id) DO UPDATE SET max_topup_minor = 100, version = market_payment_channel_settings.version + 1", []).unwrap();
+        let channels = buyer_channel_views(&conn, true).unwrap();
+        assert_eq!(channels[0].amount_limits.min_credit_minor, None);
+        assert_eq!(channels[0].amount_limits.max_credit_minor, None);
+        let error = quotes::quote_tx(
+            &conn,
+            "buyer",
+            true,
+            quotes::QuoteRequest {
+                channel_id: "channel".into(),
+                amount_minor: 100,
+                token_id: None,
+            },
+            at,
+        )
+        .err()
+        .unwrap();
+        let AppError::Coded { details, .. } = error else {
+            panic!("expected coded empty range error")
+        };
+        assert!(details["minCreditMinor"].is_null());
+        assert!(details["maxCreditMinor"].is_null());
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM market_topup_quotes", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
     fn fee_bearing_paid_topup_credits_only_principal_and_passes_live_evidence() {
         let conn = memory();
         fixture_revision(&conn, 1);
@@ -8748,7 +8879,8 @@ mod tests {
                 version: 3,
             },
         };
-        let value = serde_json::to_value(BuyerChannelView::from(channel)).unwrap();
+        let policy = crate::market_wallet_policy::policy_tx(&memory()).unwrap();
+        let value = serde_json::to_value(BuyerChannelView::new(channel, &policy).unwrap()).unwrap();
         assert_eq!(
             value,
             serde_json::json!({
@@ -8758,7 +8890,10 @@ mod tests {
                     "tokenId": "tron-usdt", "chain": "tron", "chainName": "Tron",
                     "symbol": "USDT", "minConfirmations": 19
                 }],
-                "minTopupMinor": 100, "maxTopupMinor": 5000, "canary": false
+                "minTopupMinor": 100, "maxTopupMinor": 5000,
+                "minCreditMinor": 100, "maxCreditMinor": 4762,
+                "maintenanceFeeBps": 500, "policyVersion": 1,
+                "channelRevision": 7, "channelSettingsVersion": 3, "canary": false
             })
         );
     }

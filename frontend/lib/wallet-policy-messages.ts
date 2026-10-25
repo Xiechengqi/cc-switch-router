@@ -60,7 +60,6 @@ export const walletPolicyMessagesEn = {
   "walletPolicy.changed":
     "The policy changed elsewhere. Reload it before saving again.",
   "walletPolicy.readOnly": "Only the Router owner can change this policy.",
-  "walletPolicy.channelRange": "The total including maintenance fee must be {min}–{max} for this channel. Adjust the balance amount.",
   "walletTransfer.refreshFailed":
     "Transfer completed. Reload the balance to see the latest available amount.",
   "walletTransfer.title": "Transfer to a user",
@@ -154,7 +153,6 @@ export const walletPolicyMessagesZh: Record<
   "walletPolicy.saved": "已保存，新订单将使用此设置。",
   "walletPolicy.changed": "设置已在其他页面修改，请重新加载后再保存。",
   "walletPolicy.readOnly": "只有 Router Owner 可以修改这些设置。",
-  "walletPolicy.channelRange": "此渠道含维护费的实付金额须为 {min}–{max}，请调整到账金额。",
   "walletTransfer.refreshFailed":
     "转账已完成，请重新加载余额以查看最新可转金额。",
   "walletTransfer.title": "转给用户",

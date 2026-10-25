@@ -171,6 +171,13 @@ export type MarketWalletChannel = Pick<MarketPaymentChannel, "id" | "displayName
   methods?: MarketWalletPaymentMethod[];
   minTopupMinor?: number;
   maxTopupMinor?: number;
+  /** Authoritative wallet-credit bounds after the cent-rounded maintenance fee. */
+  minCreditMinor: number | null;
+  maxCreditMinor: number | null;
+  maintenanceFeeBps: number;
+  policyVersion: number;
+  channelRevision: number;
+  channelSettingsVersion: number;
   /** Visible only to the Owner while the channel is in canary rollout. */
   canary?: boolean;
 };

@@ -122,23 +122,14 @@ pub(super) fn quote_tx(
     )?;
     let channel = topup_channel_tx(tx, &input.channel_id, owner)?;
     validate_method(&channel, input.token_id.as_deref())?;
-    if !(MIN_TOPUP_MINOR..=MAX_TOPUP_MINOR).contains(&input.amount_minor) {
-        return Err(AppError::BadRequest(
-            "top-up credit outside supported range".into(),
-        ));
-    }
     let policy = crate::market_wallet_policy::policy_tx(tx)?;
-    let (fee, pay) =
-        crate::market_wallet_policy::topup_amounts(input.amount_minor, policy.maintenance_fee_bps)?;
-    if !(channel.min_topup_minor..=channel.max_topup_minor).contains(&pay) {
-        return Err(AppError::Coded {
-            status: StatusCode::BAD_REQUEST,
-            code: "MARKET_TOPUP_AMOUNT_OUT_OF_RANGE",
-            message: "payment total including maintenance fee is outside the channel range".into(),
-            details: serde_json::json!({ "minTopupMinor": channel.min_topup_minor,
-                "maxTopupMinor": channel.max_topup_minor, "payMinor": pay }),
-        });
-    }
+    let limits = TopupAmountLimits::new(
+        channel.min_topup_minor,
+        channel.max_topup_minor,
+        policy.maintenance_fee_bps,
+        policy.version,
+    )?;
+    let (fee, pay) = limits.validate_credit(input.amount_minor)?;
     let time = at.to_rfc3339();
     let recent: i64 = tx
         .query_row(
@@ -193,6 +184,16 @@ pub(super) fn validate_current_tx(
         || quote.channel_revision != channel.revision
         || quote.channel_settings_version != channel.settings_version
     {
+        return Err(stale_quote());
+    }
+    let limits = TopupAmountLimits::new(
+        channel.min_topup_minor,
+        channel.max_topup_minor,
+        policy.maintenance_fee_bps,
+        policy.version,
+    )?;
+    let (fee, pay) = limits.validate_credit(quote.credit_minor)?;
+    if (quote.fee_minor, quote.pay_minor) != (fee, pay) {
         return Err(stale_quote());
     }
     Ok(())

@@ -5,6 +5,8 @@ import {
   formatWalletUnitsAsCny,
   parseUsdMinor,
   parseNonNegativeUsdMinor,
+  parseTopupMinor,
+  topupBounds,
   payableCheckoutUrl,
   safeCheckoutUrl,
   safeMarketReturnPath,
@@ -33,6 +35,38 @@ test("top-up amount accepts only exact supported cents", () => {
   for (const invalid of ["0.99", "1000.01", "1.001", "1e2", "-1", ".50", "01.00"]) {
     assert.equal(parseUsdMinor(invalid), null, invalid);
   }
+});
+
+test("top-up input uses authoritative fee-adjusted credit limits, not payment limits", () => {
+  const bounds = topupBounds({ minCreditMinor: 100, maxCreditMinor: 95_238 });
+  assert.deepEqual(bounds, { min: 100, max: 95_238 });
+  assert.equal(parseTopupMinor("952.38", bounds!), 95_238);
+  assert.equal(parseTopupMinor("$1.00", bounds!), 100);
+  for (const invalid of ["952.39", "960", "1000", "0.99", "1.001", "1e2", "-1", ".50", "01.00"]) {
+    assert.equal(parseTopupMinor(invalid, bounds!), null, invalid);
+  }
+  assert.equal(parseTopupMinor("1000", topupBounds({ minCreditMinor: 100, maxCreditMinor: 100_000 })!), 100_000);
+  const raisedMinimum = topupBounds({ minCreditMinor: 952, maxCreditMinor: 4762 })!;
+  assert.equal(parseTopupMinor("9.51", raisedMinimum), null);
+  assert.equal(parseTopupMinor("9.52", raisedMinimum), 952);
+  assert.equal(parseTopupMinor("47.62", raisedMinimum), 4762);
+  assert.equal(parseTopupMinor("47.63", raisedMinimum), null);
+});
+
+test("missing, empty and malformed credit ranges fail closed", () => {
+  for (const channel of [null, undefined, {},
+    { minCreditMinor: null, maxCreditMinor: null },
+    { minCreditMinor: 100 }, { maxCreditMinor: 100_000 },
+    { minCreditMinor: "100", maxCreditMinor: 100_000 },
+    { minCreditMinor: 100, maxCreditMinor: NaN },
+    { minCreditMinor: 100, maxCreditMinor: Infinity },
+    { minCreditMinor: 100.1, maxCreditMinor: 100_000 },
+    { minCreditMinor: 99, maxCreditMinor: 100_000 },
+    { minCreditMinor: 100, maxCreditMinor: 100_001 },
+    { minCreditMinor: 200, maxCreditMinor: 100 },
+  ]) assert.equal(topupBounds(channel), null);
+  // An exactly one-cent-wide feasible interval is not an empty range.
+  assert.deepEqual(topupBounds({ minCreditMinor: 100, maxCreditMinor: 100 }), { min: 100, max: 100 });
 });
 
 test("service dispute resolution can record zero or exact cent refunds", () => {
