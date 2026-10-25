@@ -218,17 +218,17 @@ try {
     assert.equal(input.all, true);
     await route.fulfill({ contentType: "application/json", body: JSON.stringify({ id: "transfer-quote", senderEmail: "buyer@example.invalid", recipientEmail: input.recipientEmail, amountUnits: transferAmount, expiresAt: new Date(Date.now() + 900_000).toISOString() }) });
   });
-  await page.context().route("**/v1/market-wallet/transfer-quotes/*/code", async (route) => {
-    await route.fulfill({ contentType: "application/json", body: JSON.stringify({ id: "transfer-code", expiresAt: new Date(Date.now() + 600_000).toISOString(), resendAfterSeconds: 60 }) });
+  await page.context().route("**/v1/market-wallet/transfer-quotes/*/code", async () => {
+    assert.fail("retired financial OTP endpoint must not be called");
   });
   await page.context().route("**/v1/market-wallet/transfers", async (route) => {
     transferCalls += 1;
     transferKeys.push(route.request().headers()["idempotency-key"]);
     const input = route.request().postDataJSON();
     assert.equal(input.quoteId, "transfer-quote");
-    assert.equal(input.challengeId, "transfer-code");
-    if (input.code !== "123456") {
-      await route.fulfill({ status: 409, contentType: "application/json", body: JSON.stringify({ code: "WALLET_TRANSFER_CODE_INVALID", message: "invalid" }) });
+    assert.deepEqual(input, { quoteId: "transfer-quote" });
+    if (transferCalls === 1) {
+      await route.fulfill({ status: 504, contentType: "application/json", body: JSON.stringify({ message: "response uncertain" }) });
       return;
     }
     await route.fulfill({ contentType: "application/json", body: JSON.stringify({ id: "transfer-1", senderEmail: "buyer@example.invalid", recipientEmail: "recipient@example.invalid", amountUnits: transferAmount, journalId: "journal-1", createdAt: new Date().toISOString() }) });
@@ -359,7 +359,7 @@ try {
   await resumedTab.close();
 
   // No real transfer is sent. The confirmation must retain exact sub-cent
-  // units, the frozen recipient, and one idempotency key across a wrong code.
+  // units, the frozen recipient, and one idempotency key across an uncertain response, without any OTP.
   const transferPanel = page.locator("section").filter({ has: page.getByRole("heading", { name: "Transfer to a user", exact: true }) }).last();
   await transferPanel.getByLabel("Recipient email").fill("recipient@example.invalid");
   await transferPanel.getByLabel("Transfer all available").check();
@@ -371,11 +371,10 @@ try {
     await page.setViewportSize({ width, height: 900 });
     assert.ok(await transferDialog.evaluate((element) => element.scrollWidth <= element.clientWidth + 1), `transfer dialog overflow at ${width}`);
   }
-  await transferDialog.getByRole("button", { name: "Email verification code", exact: true }).click();
-  await transferDialog.locator('input[autocomplete="one-time-code"]').fill("000000");
+  assert.equal(await transferDialog.locator('input[autocomplete="one-time-code"]').count(), 0);
+  assert.equal(await transferDialog.getByRole("button", { name: /verification|code/i }).count(), 0);
   await transferDialog.getByRole("button", { name: /^Transfer \$/ }).click();
-  await transferDialog.getByRole("alert").filter({ hasText: /Incorrect verification code/ }).waitFor();
-  await transferDialog.locator('input[autocomplete="one-time-code"]').fill("123456");
+  await transferDialog.getByRole("alert").waitFor();
   await transferDialog.getByRole("button", { name: /^Transfer \$/ }).click();
   await transferPanel.getByRole("status").filter({ hasText: /Transferred/ }).waitFor();
   assert.equal(transferCalls, 2);
@@ -535,7 +534,7 @@ try {
       paymentChannelBlockers: [], canEnable: false };
     else if (path === "/v1/admin/market-finance/overview") data = overview;
     else if (path === "/v1/admin/market-finance/c2c/policy") data = { policy: { version: 1, enabled: false,
-      admissionMinor: 10000, minMinor: 100, maxMinor: 500000, paymentMinutes: 30 }, canManage: true, canResolve: true, emailReady: true };
+      admissionMinor: 10000, minMinor: 100, maxMinor: 500000, paymentMinutes: 30 }, canManage: true, canResolve: true, };
     else if (path === "/v1/admin/market-finance/c2c/orders" || path === "/v1/admin/market-finance/c2c/sellers") data = { items: [], next: null };
     else if (path === "/v1/admin/market-finance/commission-policy") {
       if (route.request().method() === "PUT") {
@@ -640,7 +639,7 @@ try {
   assert.equal(await commissionInput.isDisabled(), true);
   assert.equal(await commissionPanel.getByRole("button", { name: "Save", exact: true }).isDisabled(), true);
   assert.deepEqual(pageErrors, []);
-  console.log("wallet checkout: safe new tabs, fee change, recheck/stop, exact transfer, OTP retry, scoped access, automatic earnings credit, retired payout/manual-credit paths and Owner policy edits passed; four widths; no screenshots or real payments");
+  console.log("wallet checkout: safe new tabs, fee change, recheck/stop, exact transfer, idempotent retry without financial OTP, scoped access, automatic earnings credit, retired payout/manual-credit paths and Owner policy edits passed; four widths; no screenshots or real payments");
 } finally {
   await browser?.close();
   if (server) await new Promise((resolveStop, rejectStop) => {

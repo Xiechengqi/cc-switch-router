@@ -26920,6 +26920,20 @@ fn render_verification_code_block(code: &str) -> String {
 }
 
 pub(crate) fn render_email_layout(title: &str, preheader: &str, body_html: &str) -> String {
+    render_email_layout_with_footer(
+        title,
+        preheader,
+        body_html,
+        "TokenSwitch router notification. If this email was unexpected, no action is required.",
+    )
+}
+
+pub(crate) fn render_email_layout_with_footer(
+    title: &str,
+    preheader: &str,
+    body_html: &str,
+    footer: &str,
+) -> String {
     format!(
         "<!doctype html>\
          <html lang=\"en\">\
@@ -26939,7 +26953,7 @@ pub(crate) fn render_email_layout(title: &str, preheader: &str, body_html: &str)
                  </table>\
                  <table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"width:100%;max-width:560px;margin:0 auto 28px;background:#f8fafc;border:1px solid #e5e7eb;border-top:1px solid #eef2f7;border-radius:0 0 18px 18px;border-collapse:separate\">\
                    <tr><td style=\"padding:18px 28px;color:#64748b;font-size:12px;line-height:1.6;border-radius:0 0 18px 18px\">\
-                     <span translate=\"no\">TokenSwitch</span> router notification. If this email was unexpected, no action is required.\
+                     {footer}\
                    </td></tr>\
                  </table>\
                </td></tr>\
@@ -26948,6 +26962,11 @@ pub(crate) fn render_email_layout(title: &str, preheader: &str, body_html: &str)
          </html>",
         preheader = escape_html(preheader),
         title = escape_html(title),
+        footer = escape_html(footer).replacen(
+            "TokenSwitch",
+            "<span translate=\"no\">TokenSwitch</span>",
+            1,
+        ),
         body_html = body_html
     )
 }

@@ -292,6 +292,14 @@ const MIGRATIONS: &[(i64, &str)] = &[
         84,
         include_str!("../schema/0084_market_c2c_auto_accept.sql"),
     ),
+    (
+        85,
+        include_str!("../schema/0085_market_session_authorization.sql"),
+    ),
+    (
+        86,
+        include_str!("../schema/0086_market_notification_deliveries.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -806,6 +814,191 @@ mod tests {
     }
 
     #[test]
+    fn migration_85_preserves_historical_transfer_proof_and_retires_financial_codes() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 84);
+        let at = "2026-10-25T12:00:00Z";
+        let fp = "sender:recipient:86400:q";
+        let j = crate::market_wallet::post_journal_tx(
+            &conn,
+            "wallet_transfer",
+            "old",
+            "transfer",
+            fp,
+            &[
+                crate::market_wallet::Posting {
+                    kind: "wallet_available",
+                    subject_id: "sender",
+                    signed_units: 86400,
+                },
+                crate::market_wallet::Posting {
+                    kind: "wallet_available",
+                    subject_id: "recipient",
+                    signed_units: -86400,
+                },
+            ],
+            at,
+        )
+        .unwrap();
+        conn.execute_batch("INSERT INTO market_wallet_transfer_quotes VALUES('q','sender','recipient','s@test','r@test',86400,'2026-10-25T12:15:00Z','2026-10-25T11:59:00Z');
+            INSERT INTO market_wallet_transfer_challenges(id,quote_id,code_mac,key_version,attempts,expires_at,delivered_at,consumed_at,created_ip,created_at)
+            VALUES('c','q','historical-mac',1,1,'2026-10-25T12:10:00Z','2026-10-25T11:59:30Z','2026-10-25T12:00:00Z','test','2026-10-25T11:59:00Z');").unwrap();
+        conn.execute("INSERT INTO market_wallet_transfers VALUES('old','sender','recipient','s@test','r@test',86400,'q','c','idem',?1,?2,?3)",params![fp,j.id,at]).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM market_verified_wallet_transfer_evidence",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM market_verified_wallet_transfer_evidence WHERE id='old'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        let row:(String,String,String,i64,Option<String>)=conn.query_row("SELECT id,journal_id,challenge_id,amount_units,authorization_id FROM market_wallet_transfers",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).unwrap();
+        assert_eq!(row, ("old".into(), j.id, "c".into(), 86400, None));
+        for sql in [
+            "UPDATE market_wallet_transfer_challenges SET attempts=2",
+            "DELETE FROM market_wallet_transfer_challenges",
+            "INSERT INTO market_wallet_transfer_challenges SELECT 'new',quote_id,code_mac,key_version,attempts,expires_at,delivered_at,consumed_at,created_ip,created_at FROM market_wallet_transfer_challenges",
+        ] {
+            assert!(conn.execute(sql, []).is_err(), "{sql}");
+        }
+        let retired = conn.execute("INSERT INTO market_c2c_challenges(id,order_id,seller_id,email,binding,code_mac,key_version,created_ip,expires_at,created_at) VALUES('c','o','seller','s@test','old-binding','mac',1,'test','2026-10-25T12:10:00Z',?1)",params![at]).unwrap_err();
+        assert!(
+            retired
+                .to_string()
+                .contains("financial email codes retired")
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn migration_85_session_evidence_survives_session_lifecycle_and_rejects_invalid_times() {
+        let conn = memory_connection();
+        apply(&conn).unwrap();
+        let session = crate::market_finance_auth::test_session("sender");
+        let proof = crate::market_finance_auth::record_tx(
+            &conn,
+            &session,
+            "sender",
+            "wallet_transfer",
+            "transfer",
+            "recipient",
+            86400,
+            0,
+            "f",
+            "transfer_confirmed",
+            "2026-10-25T12:00:00Z",
+        )
+        .unwrap();
+        // Evidence is deliberately independent of auth_sessions cleanup.
+        assert_eq!(
+            conn.query_row(
+                "SELECT session_reference FROM market_financial_authorizations WHERE id=?1",
+                params![proof],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            session.session_id
+        );
+        assert!(
+            conn.execute(
+                "UPDATE market_financial_authorizations SET session_reference='another'",
+                []
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute("DELETE FROM market_financial_authorizations", [])
+                .is_err()
+        );
+        for column in [
+            "session_authenticated_at",
+            "session_access_expires_at",
+            "created_at",
+        ] {
+            let columns = [
+                "id",
+                "actor_user_id",
+                "session_reference",
+                "auth_source_kind",
+                "session_authenticated_at",
+                "session_access_expires_at",
+                "operation_kind",
+                "object_id",
+                "counterparty_user_id",
+                "amount_units",
+                "expected_version",
+                "fingerprint",
+                "acknowledgement",
+                "created_at",
+            ];
+            let projection = columns
+                .iter()
+                .map(|c| {
+                    if *c == "id" || *c == "object_id" {
+                        "'new'".to_string()
+                    } else if *c == column {
+                        "'invalid'".to_string()
+                    } else {
+                        c.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            assert!(conn.execute(&format!("INSERT INTO market_financial_authorizations SELECT {projection} FROM market_financial_authorizations"),[]).is_err(),"{column}");
+        }
+    }
+
+    #[test]
+    fn migration_86_preserves_feed_without_replaying_already_delivered_mail() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 85);
+        crate::market_notifications::enqueue_user_notification_tx(
+            &conn,
+            "buyer",
+            "buyer",
+            "topup_credited",
+            "topup",
+            "o",
+            "historical",
+            serde_json::json!({"amountMinor":100}),
+            "2026-10-25T12:00:00Z",
+        )
+        .unwrap();
+        conn.execute("UPDATE market_notification_outbox SET status='sent',delivered_channels='email',sent_at='2026-10-25T12:00:10Z'",[]).unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM market_notification_deliveries",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM market_notification_outbox WHERE status='sent' AND delivered_channels='email'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    }
+
+    #[test]
     fn migration_84_preserves_frozen_orders_and_requires_explicit_automatic_consent() {
         let conn = memory_connection();
         install_schema_through(&conn, 83);
@@ -953,7 +1146,7 @@ mod tests {
             0
         );
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM pragma_table_info('market_c2c_policy') WHERE name='acceptance_minutes'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
-        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",[],|r|r.get::<_,i64>(0)).unwrap(),232);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",[],|r|r.get::<_,i64>(0)).unwrap(),234);
         for id in [
             "awaiting_seller",
             "awaiting_payment",
@@ -1439,7 +1632,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count baseline tables");
-        assert_eq!(table_count, 232);
+        assert_eq!(table_count, 234);
         let removed_client_recovery_table_count = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -2020,7 +2213,7 @@ mod tests {
             .unwrap();
         apply(&conn).unwrap();
         apply(&conn).unwrap();
-        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",[],|r|r.get::<_,i64>(0)).unwrap(),232);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",[],|r|r.get::<_,i64>(0)).unwrap(),234);
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM market_journal_postings", [], |r| r
                 .get::<_, i64>(0))
@@ -2245,8 +2438,9 @@ mod tests {
             )
             .unwrap();
         // Twelve commission/conversion tables, seven C2C tables and one
-        // narrowly scoped dispute-handler authorization table.
-        assert_eq!(tables_after - tables_before, 20);
+        // narrowly scoped dispute-handler authorization table, plus immutable
+        // session authorizations and per-channel notification deliveries.
+        assert_eq!(tables_after - tables_before, 22);
         assert_eq!(
             conn.query_row(
                 "SELECT converted_units FROM market_provider_earning_lots WHERE id = 'old-lot'",

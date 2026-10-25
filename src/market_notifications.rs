@@ -29,6 +29,13 @@ const CLAIM_SECS: i64 = 120;
 const MAX_ATTEMPTS: i64 = 8;
 const BATCH: i64 = 25;
 
+mod delivery;
+#[cfg(test)]
+mod delivery_tests;
+mod email;
+mod policy;
+use policy::notice_current_tx;
+
 fn db_error(context: &'static str) -> impl FnOnce(crate::db::Error) -> AppError {
     move |error| AppError::Internal(format!("{context} failed: {error}"))
 }
@@ -81,7 +88,7 @@ pub(crate) const KINDS: &[NotificationKind] = &[
     },
     NotificationKind {
         kind: "topup_credited",
-        mandatory: false,
+        mandatory: true,
         subject_en: "Top-up credited",
         subject_zh: "充值已到账",
     },
@@ -93,7 +100,7 @@ pub(crate) const KINDS: &[NotificationKind] = &[
     },
     NotificationKind {
         kind: "topup_review_required",
-        mandatory: false,
+        mandatory: true,
         subject_en: "Top-up needs review",
         subject_zh: "充值需要人工核对",
     },
@@ -138,12 +145,6 @@ pub(crate) const KINDS: &[NotificationKind] = &[
         mandatory: true,
         subject_en: "Service ended",
         subject_zh: "服务已终止",
-    },
-    NotificationKind {
-        kind: "refund_status",
-        mandatory: true,
-        subject_en: "Balance refund updated",
-        subject_zh: "余额退款状态更新",
     },
     NotificationKind {
         kind: "dispute_resolved",
@@ -419,6 +420,7 @@ struct PreferenceView {
 fn preferences_tx(conn: &Connection, user_id: &str) -> Result<Vec<PreferenceView>, AppError> {
     KINDS
         .iter()
+        .filter(|entry| !matches!(entry.kind, "topup_closed_unpaid" | "earnings_converted"))
         .map(|entry| {
             let enabled = if entry.mandatory {
                 true
@@ -528,7 +530,9 @@ struct Claimed {
 }
 
 fn claim_tx(conn: &Connection, worker: &str, now: &str) -> Result<Vec<Claimed>, AppError> {
-    let expires = (Utc::now() + chrono::Duration::seconds(CLAIM_SECS)).to_rfc3339();
+    let at = DateTime::parse_from_rfc3339(now)
+        .map_err(|_| AppError::Internal("invalid notification claim time".into()))?;
+    let expires = (at + chrono::Duration::seconds(CLAIM_SECS)).to_rfc3339();
     let ids = {
         let mut statement = conn
             .prepare(
@@ -539,7 +543,7 @@ fn claim_tx(conn: &Connection, worker: &str, now: &str) -> Result<Vec<Claimed>, 
             )
             .map_err(db_error("prepare notification claim"))?;
         statement
-            .query_map(params![now, BATCH], |row| row.get::<_, String>(0))
+            .query_map(params![now, 1], |row| row.get::<_, String>(0))
             .map_err(db_error("query notification claim"))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(db_error("read notification claim"))?
@@ -561,7 +565,7 @@ fn claim_tx(conn: &Connection, worker: &str, now: &str) -> Result<Vec<Claimed>, 
         }
         let row = conn
             .query_row(
-                "SELECT recipient_user_id, event_kind, payload_json, mandatory, attempts
+                "SELECT recipient_user_id, event_kind, payload_json, mandatory, attempts, dedupe_key, created_at, object_id
                  FROM market_notification_outbox WHERE id = ?1",
                 params![id],
                 |row| {
@@ -571,15 +575,22 @@ fn claim_tx(conn: &Connection, worker: &str, now: &str) -> Result<Vec<Claimed>, 
                         row.get::<_, String>(2)?,
                         row.get::<_, i64>(3)?,
                         row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
                     ))
                 },
             )
             .map_err(db_error("read claimed notification"))?;
+        let mut payload: Value = serde_json::from_str(&row.2).unwrap_or_else(|_| json!({}));
+        payload["notificationEventKey"] = json!(row.5);
+        payload["notificationTime"] = json!(row.6);
+        payload["notificationObjectId"] = json!(row.7);
         claimed.push(Claimed {
             id,
             recipient_user_id: row.0,
             event_kind: row.1,
-            payload: serde_json::from_str(&row.2).unwrap_or_else(|_| json!({})),
+            payload,
             mandatory: row.3 == 1,
             attempts: row.4,
         });
@@ -596,7 +607,7 @@ struct Recipient {
 fn recipient_tx(conn: &Connection, item: &Claimed) -> Result<Recipient, AppError> {
     let email: Option<String> = conn
         .query_row(
-            "SELECT email_normalized FROM users WHERE id = ?1",
+            "SELECT email_normalized FROM users WHERE id = ?1 AND status='active' AND email_verified_at IS NOT NULL",
             params![item.recipient_user_id],
             |row| row.get(0),
         )
@@ -606,14 +617,15 @@ fn recipient_tx(conn: &Connection, item: &Claimed) -> Result<Recipient, AppError
     let telegram_chat: Option<String> = conn
         .query_row(
             "SELECT target FROM user_notification_channels
-             WHERE user_id = ?1 AND channel = 'telegram' AND enabled = 1 AND state = 'ready'",
+             WHERE user_id = ?1 AND channel = 'telegram' AND enabled = 1 AND state = 'ready'
+             AND EXISTS(SELECT 1 FROM users WHERE id=?1 AND status='active' AND email_verified_at IS NOT NULL)",
             params![item.recipient_user_id],
             |row| row.get(0),
         )
         .optional()
         .map_err(db_error("read notification telegram binding"))?
         .flatten();
-    let opted_out = !item.mandatory
+    let opted_out = !kind(&item.event_kind).is_some_and(|kind| kind.mandatory)
         && conn
             .query_row(
                 "SELECT enabled FROM market_notification_preferences
@@ -632,21 +644,7 @@ fn recipient_tx(conn: &Connection, item: &Claimed) -> Result<Recipient, AppError
 }
 
 fn amount_text(payload: &Value) -> Option<String> {
-    if let Some(units) = payload
-        .get("amountUnits")
-        .and_then(Value::as_str)
-        .and_then(|value| value.parse::<i64>().ok())
-    {
-        return Some(format!(
-            "${:.8} ({} ledger units)",
-            units as f64 / 8_640_000.0,
-            units
-        ));
-    }
-    payload
-        .get("amountMinor")
-        .and_then(Value::as_i64)
-        .map(|minor| format!("${}.{:02}", minor / 100, minor % 100))
+    email::amount(payload)
 }
 
 /// Short bilingual text. It names the state change and the amount; detail
@@ -790,7 +788,7 @@ fn render(item: &Claimed, dashboard: &str) -> (String, String) {
         return (
             format!("{subject_zh} / {subject_en}"),
             format!(
-                "{subject_zh}：{zh_status}。{instruction} 金额：{}。平台不能自动核实线下付款，请在订单内核对；请勿向他人透露放行验证码。\n{subject_en}: {status}. {instruction_en} Offline payment is not verified by the platform. Never share release codes.\n\n{}/{destination}",
+                "{subject_zh}：{zh_status}。{instruction} 金额：{}。平台不能自动核实线下付款，请在订单内核对。请勿分享登录凭据。\n{subject_en}: {status}. {instruction_en} Offline payment is not verified by the platform. Never share sign-in credentials.\n\n{}/{destination}",
                 amount.as_deref().unwrap_or("—"),
                 dashboard.trim_end_matches('/')
             ),
@@ -850,198 +848,17 @@ fn escape_html(value: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-/// Top-up emails use the same English document and branding as sign-in codes.
-/// Other delivery channels retain their existing bilingual messages.
 fn render_email(item: &Claimed, dashboard: &str) -> (String, String, String) {
-    let (introduction, status) = match item.event_kind.as_str() {
-        "topup_credited" => (
-            "Your top-up has been credited to your platform wallet. Your balance is ready to use.",
-            "Credited",
-        ),
-        "topup_closed_unpaid" => (
-            "This top-up was closed without a confirmed payment. No funds were added to your wallet.",
-            "Closed without payment",
-        ),
-        "topup_review_required" => (
-            "The payment for this top-up needs to be checked. Do not pay for this order again. Check your wallet for updates or contact your Router administrator.",
-            "Payment under review",
-        ),
-        "topup_reversed" => (
-            "An external refund has been recorded for this top-up. The corresponding wallet credit has been adjusted.",
-            "Credit reversed",
-        ),
-        _ => {
-            let (subject, text) = render(item, dashboard);
-            let html = format!("<p>{}</p>", escape_html(&text).replace('\n', "<br>"));
-            return (subject, html, text);
-        }
-    };
-    let title = kind(&item.event_kind)
-        .expect("known top-up notification")
-        .subject_en;
-    let mut rows = Vec::new();
-    if let Some(amount) = amount_text(&item.payload) {
-        let label = if item.event_kind == "topup_reversed" {
-            "Reversed amount"
-        } else {
-            "Top-up amount"
-        };
-        rows.push((label, amount));
-    }
-    if let Some(fee) = item.payload.get("feeMinor").and_then(Value::as_i64) {
-        rows.push((
-            "Maintenance fee",
-            format!("${}.{:02}", fee / 100, fee % 100),
-        ));
-    }
-    if let Some(pay) = item.payload.get("payMinor").and_then(Value::as_i64) {
-        rows.push(("Payment total", format!("${}.{:02}", pay / 100, pay % 100)));
-    }
-    rows.push(("Status", status.to_string()));
-    if let Some(order_id) = item.payload.get("orderId").and_then(Value::as_str) {
-        rows.push(("Order", order_id.to_string()));
-    }
-    let rows_html = rows.iter().map(|(label, value)| format!(
-        "<tr><th align=\"left\" valign=\"top\" style=\"padding:8px 16px 8px 0;color:#64748b;font-size:13px;font-weight:500\">{}</th><td style=\"padding:8px 0;color:#0f172a;font-size:14px;word-break:break-all\">{}</td></tr>",
-        escape_html(label), escape_html(value),
-    )).collect::<Vec<_>>().join("");
-    let wallet_url = format!("{}/account/wallet/", dashboard.trim_end_matches('/'));
-    let body_html = format!(
-        "<p style=\"margin:0 0 18px;color:#475569;font-size:15px;line-height:1.6\">{}</p>\
-         <table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"margin:0 0 22px\">{rows_html}</table>\
-         <a href=\"{}\" style=\"display:inline-block;padding:12px 20px;border-radius:8px;background:#2563eb;color:#ffffff;text-decoration:none;font-size:14px;font-weight:600\">Open platform wallet</a>",
-        escape_html(introduction),
-        escape_html(&wallet_url),
-    );
-    let html = crate::store::render_email_layout(title, introduction, &body_html);
-    let details = rows
-        .iter()
-        .map(|(label, value)| format!("{label}: {value}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let text = format!(
-        "TokenSwitch\n\n{title}\n\n{introduction}\n\n{details}\n\nOpen platform wallet: {wallet_url}"
-    );
-    (format!("TokenSwitch: {title}"), html, text)
-}
-
-async fn deliver(
-    state: &ServerState,
-    http: &reqwest::Client,
-    item: &Claimed,
-) -> Result<String, String> {
-    if item.event_kind == "c2c_order_updated"
-        && item.payload.get("role").and_then(Value::as_str) == Some("handler")
-    {
-        let email = {
-            let conn = state.store.conn.lock().await;
-            conn.query_row(
-                "SELECT email_normalized FROM users WHERE id=?1",
-                params![item.recipient_user_id],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|e| e.to_string())?
-        };
-        let dynamic = state.dynamic.read().await;
-        if email.as_ref().is_none_or(|email| !dynamic.is_admin(email)) {
-            return Ok("superseded".into());
-        }
-    }
-    // Retried outbox items must not resurrect an acceptance/payment window.
-    // The message still directs the user to the live, authenticated order.
-    if item.event_kind == "c2c_order_updated" || item.event_kind == "c2c_seller_changed" {
-        let conn = state.store.conn.lock().await;
-        if !c2c_notice_current_tx(&conn, item, &crate::market_wallet::now())
-            .map_err(|e| e.to_string())?
-        {
-            return Ok("superseded".into());
-        }
-    }
-    let recipient = {
-        let conn = state.store.conn.lock().await;
-        recipient_tx(&conn, item).map_err(|error| error.to_string())?
-    };
-    if recipient.opted_out {
-        return Ok("suppressed".into());
-    }
-    let scheme = if state.config.use_localhost {
-        "http"
-    } else {
-        "https"
-    };
-    let dashboard = format!(
-        "{scheme}://{}",
-        state.config.tunnel_domain.trim_end_matches('/')
-    );
-    let (_, body) = render(item, &dashboard);
-    let mut delivered = Vec::new();
-    let mut failures = Vec::new();
-    if let (Some(email), Some(api_key), Some(from)) = (
-        recipient.email.as_deref(),
-        state.config.resend_api_key.as_deref(),
-        crate::notifications::notification_sender(&state.config),
-    ) {
-        let (subject, html, text) = render_email(item, &dashboard);
-        let key = format!("market-notification-{}", item.id);
-        match crate::notifications::send_resend_frozen_email(
-            http,
-            api_key,
-            crate::notifications::FrozenEmailEnvelope {
-                from: &from,
-                recipient: email,
-                subject: &subject,
-                html: &html,
-                text: &text,
-                reply_to: state.config.resend_reply_to.as_deref(),
-                idempotency_key: &key,
-            },
-        )
-        .await
-        {
-            Ok(_) => delivered.push("email"),
-            Err(error) => failures.push(error.message),
-        }
-    }
-    if let Some(chat) = recipient.telegram_chat.as_deref() {
-        let token = state
-            .dynamic
-            .read()
-            .await
-            .telegram_bot
-            .token()
-            .map(str::to_string);
-        if let Some(token) = token {
-            match crate::telegram::send_message(
-                http,
-                &token,
-                chat,
-                None,
-                &body,
-                crate::telegram::TelegramParseMode::Plain,
-            )
-            .await
-            {
-                Ok(_) => delivered.push("telegram"),
-                Err(error) => failures.push(error.message),
-            }
-        }
-    }
-    if delivered.is_empty() && !failures.is_empty() {
-        return Err(failures.join("; "));
-    }
-    Ok(if delivered.is_empty() {
-        // No channel is configured: the in-app feed still holds the notice.
-        "feed_only".into()
-    } else {
-        delivered.join(",")
-    })
+    email::render(item, dashboard)
 }
 
 fn c2c_notice_current_tx(conn: &Connection, item: &Claimed, time: &str) -> Result<bool, AppError> {
     if item.event_kind == "c2c_seller_changed" {
         match item.payload.get("reason").and_then(Value::as_str) {
             Some("acceptance_upgrade") => return Ok(false),
+            Some(reason @ ("suspended" | "unsuspended")) => return conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM market_c2c_sellers WHERE user_id=?1 AND suspended=?2)",
+                params![item.recipient_user_id,reason=="suspended"],|r|r.get(0)).map_err(db_error("recheck C2C suspension notice")),
             Some("auto_accept_consent_required") => return conn.query_row("SELECT EXISTS(SELECT 1 FROM market_c2c_sellers WHERE user_id=?1 AND enabled=1 AND (auto_accept_terms_version!=3 OR auto_accept_consented_at IS NULL))", params![item.recipient_user_id], |r| r.get(0)).map_err(db_error("recheck automatic C2C consent notice")),
             _ => {}
         }
@@ -1068,29 +885,83 @@ fn c2c_notice_current_tx(conn: &Connection, item: &Claimed, time: &str) -> Resul
 fn finish_tx(
     conn: &Connection,
     item: &Claimed,
-    result: &Result<String, String>,
+    result: &Result<String, crate::notifications::DeliveryFailure>,
     now: &str,
 ) -> Result<(), AppError> {
     match result {
-        Ok(channels) => conn.execute(
-            "UPDATE market_notification_outbox
-             SET status = CASE WHEN ?2 = 'suppressed' THEN 'suppressed' ELSE 'sent' END,
-                 delivered_channels = ?2, sent_at = ?3, claimed_by = NULL,
-                 claim_expires_at = NULL, last_error = NULL
-             WHERE id = ?1",
-            params![item.id, channels, now],
-        ),
-        Err(error) => {
-            let delay = 60_i64 * 2_i64.pow(item.attempts.clamp(0, 10) as u32);
-            let next = (Utc::now() + chrono::Duration::seconds(delay.min(21_600))).to_rfc3339();
-            let message: String = crate::notifications::sanitize_delivery_error(error);
+        Ok(channels) => {
+            // A receipt may have succeeded before a sibling was retried and
+            // superseded. Keep that historical delivery visible in the total.
+            let mut outcomes = channels.split(',').map(str::to_string).collect::<Vec<_>>();
+            let mut statement = conn
+                .prepare(
+                    "SELECT channel,status FROM market_notification_deliveries
+                 WHERE event_id=?1 AND status IN ('sent','failed','uncertain')",
+                )
+                .map_err(db_error("prepare completed notification channels"))?;
+            let rows = statement
+                .query_map(params![item.id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(db_error("read completed notification channels"))?;
+            for row in rows {
+                let (channel, status) =
+                    row.map_err(db_error("read notification channel status"))?;
+                if !outcomes
+                    .iter()
+                    .any(|outcome| outcome.starts_with(&format!("{channel}:")))
+                {
+                    outcomes.push(format!("{channel}:{status}"));
+                }
+            }
+            let channels = outcomes.join(",");
+            let sent = channels
+                .split(',')
+                .any(|channel| channel.ends_with(":sent"));
+            let failed = channels
+                .split(',')
+                .any(|channel| channel.ends_with(":failed") || channel.ends_with(":uncertain"));
+            let status = if sent {
+                "sent"
+            } else if failed {
+                "failed"
+            } else {
+                "suppressed"
+            };
             conn.execute(
                 "UPDATE market_notification_outbox
-                 SET status = CASE WHEN attempts >= ?4 THEN 'failed' ELSE 'queued' END,
+                 SET status = ?5, delivered_channels = ?2,
+                     sent_at = CASE WHEN ?5='sent' THEN ?3 ELSE NULL END, claimed_by = NULL,
+                     claim_expires_at = NULL, last_error = NULL
+                 WHERE id = ?1 AND status='claimed' AND attempts=?4",
+                params![item.id, channels, now, item.attempts, status],
+            )
+        }
+        Err(error) => {
+            let at = DateTime::parse_from_rfc3339(now)
+                .map_err(|_| AppError::Internal("invalid notification finish time".into()))?
+                .with_timezone(&Utc);
+            let delay = 60_i64 * 2_i64.pow(item.attempts.clamp(0, 8) as u32);
+            let next = error
+                .retry_at
+                .unwrap_or(at + chrono::Duration::seconds(delay.min(21_600)))
+                .max(at + chrono::Duration::seconds(1))
+                .to_rfc3339();
+            // Channel tasks own their bounded retry counts. Do not exhaust the
+            // aggregate event while a sibling task is leased or rate-limited.
+            conn.execute(
+                "UPDATE market_notification_outbox
+                 SET status = CASE WHEN ?4=0 THEN 'failed' ELSE 'queued' END,
                      next_attempt_at = ?3, last_error = ?2, claimed_by = NULL,
                      claim_expires_at = NULL
-                 WHERE id = ?1",
-                params![item.id, message, next, MAX_ATTEMPTS],
+                 WHERE id = ?1 AND status='claimed' AND attempts=?5",
+                params![
+                    item.id,
+                    crate::notifications::sanitize_delivery_error(&error.message),
+                    next,
+                    error.retryable,
+                    item.attempts
+                ],
             )
         }
     }
@@ -1129,20 +1000,24 @@ pub async fn run_service(
                 }
             }
             _ = interval.tick() => {
-                let now = Utc::now().to_rfc3339();
-                let claimed = {
-                    let conn = state.store.conn.lock().await;
-                    claim_tx(&conn, &worker, &now)
-                };
-                let claimed = match claimed {
-                    Ok(claimed) => claimed,
-                    Err(_) => {
-                        tracing::warn!("market notification queue unavailable");
-                        continue;
-                    }
-                };
-                for item in claimed {
-                    let result = deliver(&state, &http, &item).await;
+                // Claim immediately before I/O. A batch of 25 serial deliveries
+                // used to outlive the lease of the later events in the batch.
+                for _ in 0..BATCH {
+                    if *shutdown.borrow() { break; }
+                    let now = Utc::now().to_rfc3339();
+                    let claimed = {
+                        let conn = state.store.conn.lock().await;
+                        claim_tx(&conn, &worker, &now)
+                    };
+                    let item = match claimed {
+                        Ok(mut claimed) if !claimed.is_empty() => claimed.remove(0),
+                        Ok(_) => break,
+                        Err(_) => {
+                            tracing::warn!("market notification queue unavailable");
+                            break;
+                        }
+                    };
+                    let result = delivery::deliver(&state, &http, &item).await;
                     let conn = state.store.conn.lock().await;
                     if finish_tx(&conn, &item, &result, &Utc::now().to_rfc3339()).is_err() {
                         tracing::warn!("market notification result could not be recorded");
@@ -1320,187 +1195,6 @@ mod tests {
         assert_eq!(feed.unread, 1);
         assert_eq!(feed.items[0].event_kind, "topup_credited");
         assert!(feed_tx(&conn, "buyer-2", None).unwrap().items.is_empty());
-    }
-
-    #[test]
-    fn mandatory_kinds_ignore_opt_out_and_render_amounts() {
-        let conn = memory();
-        conn.execute(
-            "INSERT INTO market_notification_preferences VALUES ('u', 'topup_credited', 0, 't')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO market_notification_preferences VALUES ('u', 'earnings_held', 0, 't')",
-            [],
-        )
-        .unwrap();
-        let optional = Claimed {
-            id: "1".into(),
-            recipient_user_id: "u".into(),
-            event_kind: "topup_credited".into(),
-            payload: json!({ "amountMinor": 1234 }),
-            mandatory: false,
-            attempts: 1,
-        };
-        assert!(recipient_tx(&conn, &optional).unwrap().opted_out);
-        let mandatory = Claimed {
-            event_kind: "earnings_held".into(),
-            mandatory: true,
-            ..optional
-        };
-        assert!(!recipient_tx(&conn, &mandatory).unwrap().opted_out);
-        let (subject, body) = render(&mandatory, "https://router.example");
-        assert!(subject.contains("收入已冻结"));
-        assert!(body.contains("$12.34"));
-        assert!(body.ends_with("https://router.example/account/wallet/"));
-    }
-
-    #[test]
-    fn conversion_notice_names_wallet_credit_and_irreversible_terms() {
-        let item = Claimed {
-            id: "conversion-notice".into(),
-            recipient_user_id: "provider".into(),
-            event_kind: "earnings_converted".into(),
-            payload: json!({"conversionId":"conversion-1","amountUnits":"43200000"}),
-            mandatory: true,
-            attempts: 1,
-        };
-        assert!(kind("earnings_converted").unwrap().mandatory);
-        let (subject, body) = render(&item, "https://router.example/");
-        assert!(subject.contains("收益已转入平台余额"));
-        assert!(body.contains("$5.00000000"));
-        assert!(body.contains("43200000 ledger units"));
-        assert!(body.contains("conversion-1"));
-        assert!(body.contains("不可提现或转回收益"));
-        assert!(body.ends_with("https://router.example/account/wallet/"));
-    }
-
-    #[test]
-    fn c2c_notices_are_mandatory_scoped_and_never_copy_private_payment_data() {
-        let item = Claimed {
-            id: "c2c-notice".into(),
-            recipient_user_id: "seller".into(),
-            event_kind: "c2c_order_updated".into(),
-            payload: json!({
-                "orderId": "order-1", "amountUnits": "86400000", "status": "paid",
-                "contact": "PRIVATE_CONTACT", "paymentDetails": "PRIVATE_ACCOUNT",
-                "code": "SECRET_RELEASE_CODE", "note": "PRIVATE_DISPUTE_EVIDENCE",
-            }),
-            mandatory: true,
-            attempts: 1,
-        };
-        assert!(kind("c2c_order_updated").unwrap().mandatory);
-        assert!(kind("c2c_seller_changed").unwrap().mandatory);
-        let (subject, html, text) = render_email(&item, "https://router.example/");
-        assert!(subject.contains("C2C"));
-        assert!(text.contains("$10.00000000"));
-        assert!(text.contains("买家已标记付款，待卖家核实"));
-        assert!(text.contains("Offline payment is not verified by the platform"));
-        assert!(text.contains("请勿向他人透露放行验证码"));
-        assert!(text.ends_with("https://router.example/account/wallet/?c2cOrder=order-1"));
-        for private in [
-            "PRIVATE_CONTACT",
-            "PRIVATE_ACCOUNT",
-            "SECRET_RELEASE_CODE",
-            "PRIVATE_DISPUTE_EVIDENCE",
-        ] {
-            assert!(!text.contains(private));
-            assert!(!html.contains(private));
-        }
-        let seller_notice = Claimed {
-            event_kind: "c2c_seller_changed".into(),
-            payload: json!({}),
-            ..item
-        };
-        let (_, _, text) = render_email(&seller_notice, "https://router.example/");
-        assert!(text.contains("已有订单仍需处理"));
-        assert!(text.ends_with("https://router.example/account/wallet/"));
-        assert!(!text.contains("c2cOrder="));
-    }
-
-    #[test]
-    fn commission_notice_links_to_earnings_and_does_not_repeat_bilingual_copy() {
-        let item = Claimed {
-            id: "commission-notice".into(),
-            recipient_user_id: "provider".into(),
-            event_kind: "commission_policy_changed".into(),
-            payload: json!({"rateBps": 1025, "effectiveAt": "2026-11-01T00:00:00Z"}),
-            mandatory: true,
-            attempts: 1,
-        };
-        let (_, html, text) = render_email(&item, "https://router.example/");
-        assert_eq!(text.matches("10.25%").count(), 2);
-        assert_eq!(
-            text.matches("Automatic income credit has no additional service fee.")
-                .count(),
-            1
-        );
-        assert!(!text.contains("Withdrawals"));
-        assert!(text.ends_with("https://router.example/account/provider-settings/#income"));
-        assert!(html.contains("account/provider-settings/#income"));
-        assert!(!text.contains("account/wallet/"));
-    }
-
-    #[test]
-    fn topup_emails_are_english_and_share_the_sign_in_layout() {
-        for (event_kind, status) in [
-            ("topup_credited", "Credited"),
-            ("topup_closed_unpaid", "Closed without payment"),
-            ("topup_review_required", "Payment under review"),
-            ("topup_reversed", "Credit reversed"),
-        ] {
-            let item = Claimed {
-                id: "notice-1".into(),
-                recipient_user_id: "buyer".into(),
-                event_kind: event_kind.into(),
-                payload: json!({
-                    "amountMinor": 1234,
-                    "orderId": "order-1",
-                    "status": "raw_internal_status",
-                    "checkoutToken": "SECRET_CHECKOUT_TOKEN",
-                }),
-                mandatory: false,
-                attempts: 1,
-            };
-            let (subject, html, text) = render_email(&item, "https://router.example/");
-            assert!(subject.starts_with("TokenSwitch: "));
-            assert!(html.contains("<html lang=\"en\">"));
-            assert!(html.contains("x-apple-disable-message-reformatting"));
-            assert!(html.matches("max-width:560px").count() >= 3);
-            assert!(html.contains("href=\"https://router.example/account/wallet/\""));
-            for content in [&subject, &html, &text] {
-                assert!(content.is_ascii(), "{event_kind} must use English");
-                assert!(!content.contains("raw_internal_status"));
-                assert!(!content.contains("SECRET_CHECKOUT_TOKEN"));
-            }
-            for content in [&html, &text] {
-                assert!(content.contains("$12.34"));
-                assert!(content.contains(status));
-                assert!(content.contains("order-1"));
-                assert!(content.contains("Open platform wallet"));
-            }
-            if event_kind == "topup_review_required" {
-                assert!(text.contains("Do not pay for this order again"));
-            }
-        }
-    }
-
-    #[test]
-    fn topup_email_escapes_values_and_link_attributes() {
-        let item = Claimed {
-            id: "notice-1".into(),
-            recipient_user_id: "buyer".into(),
-            event_kind: "topup_review_required".into(),
-            payload: json!({ "orderId": "<img src=x onerror='alert(1)'>" }),
-            mandatory: false,
-            attempts: 1,
-        };
-        let (_, html, _) = render_email(&item, "https://router.example/\" onmouseover=\"test");
-        assert!(!html.contains("<img"));
-        assert!(html.contains("&lt;img src=x onerror=&#39;alert(1)&#39;&gt;"));
-        assert!(html.contains("&quot; onmouseover=&quot;test/account/wallet/"));
-        assert!(!html.contains("\" onmouseover=\"test"));
     }
 
     #[test]

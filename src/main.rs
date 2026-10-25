@@ -31,6 +31,7 @@ mod market_c2c;
 mod market_commission;
 mod market_earning_conversions;
 mod market_finance;
+mod market_finance_auth;
 mod market_fx;
 mod market_notifications;
 mod market_payments;

@@ -28,44 +28,6 @@ pub(super) struct PaymentCipher {
 }
 
 impl PaymentCipher {
-    pub(super) fn transfer_mac(
-        &self,
-        challenge: &str,
-        quote: &str,
-        code: &str,
-    ) -> Result<(i64, String), AppError> {
-        use hmac::{Hmac, Mac};
-        let key = self
-            .keys
-            .get(&self.version)
-            .ok_or_else(|| AppError::Internal("wallet verification key unavailable".into()))?;
-        let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(&**key)
-            .map_err(|_| AppError::Internal("wallet verification key unavailable".into()))?;
-        mac.update(format!("router:wallet-transfer:v1:{challenge}:{quote}:{code}").as_bytes());
-        Ok((self.version, hex::encode(mac.finalize().into_bytes())))
-    }
-
-    pub(super) fn verify_transfer_mac(
-        &self,
-        version: i64,
-        challenge: &str,
-        quote: &str,
-        code: &str,
-        saved: &str,
-    ) -> Result<bool, AppError> {
-        use hmac::{Hmac, Mac};
-        let key = self.keys.get(&version).ok_or_else(|| {
-            AppError::ServiceUnavailable(
-                "wallet verification key unavailable; request a new code".into(),
-            )
-        })?;
-        let bytes = hex::decode(saved)
-            .map_err(|_| AppError::Internal("invalid wallet verification evidence".into()))?;
-        let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(&**key)
-            .map_err(|_| AppError::Internal("wallet verification key unavailable".into()))?;
-        mac.update(format!("router:wallet-transfer:v1:{challenge}:{quote}:{code}").as_bytes());
-        Ok(mac.verify_slice(&bytes).is_ok())
-    }
     /// Load the key ring.
     ///
     /// * `CC_SWITCH_ROUTER_MARKET_PAYMENT_MASTER_KEYS="2:<key>,1:<key>"`

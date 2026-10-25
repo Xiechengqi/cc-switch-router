@@ -104,26 +104,6 @@ impl WebhookLimiter {
 }
 
 impl MarketPaymentsRuntime {
-    pub(crate) fn transfer_mac(
-        &self,
-        challenge: &str,
-        quote: &str,
-        code: &str,
-    ) -> Result<(i64, String), AppError> {
-        self.cipher.transfer_mac(challenge, quote, code)
-    }
-
-    pub(crate) fn verify_transfer_mac(
-        &self,
-        version: i64,
-        challenge: &str,
-        quote: &str,
-        code: &str,
-        saved: &str,
-    ) -> Result<bool, AppError> {
-        self.cipher
-            .verify_transfer_mac(version, challenge, quote, code, saved)
-    }
     pub fn from_data_dir(data_dir: &std::path::Path, secrets_exist: bool) -> anyhow::Result<Self> {
         Ok(Self {
             cipher: PaymentCipher::load(data_dir, secrets_exist)?,
@@ -6926,6 +6906,23 @@ fn notify_topup_tx(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .map_err(db_error("read top-up for notification"))?;
+    let review_case: Option<String> = if kind == "topup_review_required" {
+        conn.query_row(
+            "SELECT id FROM market_finance_reconciliation_cases
+            WHERE object_kind='topup' AND object_id=?1 AND status='open'
+            ORDER BY created_at DESC,id DESC LIMIT 1",
+            params![order_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(db_error("read top-up notification episode"))?
+    } else {
+        None
+    };
+    let dedupe = review_case.as_ref().map_or_else(
+        || format!("{kind}:{order_id}"),
+        |id| format!("{kind}:{order_id}:{id}"),
+    );
     crate::market_notifications::enqueue_user_notification_tx(
         conn,
         "buyer",
@@ -6933,9 +6930,9 @@ fn notify_topup_tx(
         kind,
         "topup",
         order_id,
-        &format!("{kind}:{order_id}"),
+        &dedupe,
         serde_json::json!({ "amountMinor": amount_minor, "creditMinor": amount_minor,
-            "feeMinor": fee, "payMinor": gross, "status": status, "orderId": order_id }),
+            "feeMinor": fee, "payMinor": gross, "status": status, "orderId": order_id, "reviewCaseId":review_case }),
         time,
     )
 }

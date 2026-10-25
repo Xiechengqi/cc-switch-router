@@ -5,7 +5,7 @@ import { parseNonNegativeUsdMinor } from "@/lib/market-wallet-money";
 
 export const C2C_TERMS_VERSION = 3;
 export type C2CPolicy = { version: number; enabled: boolean; admissionMinor: number; minMinor: number; maxMinor: number; paymentMinutes: number };
-export const C2C_BLOCKERS = ["C2C_DISABLED", "C2C_TRANSFERS_DISABLED", "C2C_TRANSFERS_PAUSED", "C2C_ACCOUNT_INACTIVE", "C2C_IDENTITY", "C2C_FINANCE_HOLD", "C2C_SUSPENDED", "C2C_ADMISSION", "C2C_EMAIL_UNAVAILABLE", "C2C_OVERDUE_ORDERS"] as const;
+export const C2C_BLOCKERS = ["C2C_DISABLED", "C2C_TRANSFERS_DISABLED", "C2C_TRANSFERS_PAUSED", "C2C_ACCOUNT_INACTIVE", "C2C_IDENTITY", "C2C_FINANCE_HOLD", "C2C_SUSPENDED", "C2C_ADMISSION", "C2C_OVERDUE_ORDERS"] as const;
 export type C2CBlocker = (typeof C2C_BLOCKERS)[number];
 export type C2CPolicyView = { policy: C2CPolicy; available: boolean; blockers: C2CBlocker[]; canManagePolicy: boolean; verified: boolean; termsVersion: number; claimGraceSeconds: number; firstPurchaseMaxMinor: number; independentDisputeHandlerAvailable: boolean };
 export type C2CSeller = {
@@ -213,13 +213,8 @@ export async function getC2COrders(filter: { before?: string; status?: string; r
 export const getC2COrder = async (orderId: string) => { const o = validC2COrder(await request<C2COrder>(`${BASE}/orders/${encodeURIComponent(orderId)}`)); if (o.id !== orderId) invalid(); return o; };
 export const getC2CEvents = async (orderId: string, before = "", admin = false) => validPage(await request<C2CPage<C2CEvent>>(`${admin ? ADMIN : BASE}/orders/${encodeURIComponent(orderId)}/events?before=${encodeURIComponent(before)}`), validC2CEvent);
 export const actC2C = async (o: C2COrder, action: "accept" | "reject" | "paid" | "cancel" | "dispute" | "late-payment" | "notes", note = "") => matchC2COrder(o, await request<C2COrder>(`${BASE}/orders/${o.id}/${action}`, { expectedVersion: o.version, note, ...(action === "cancel" ? { acknowledgeUnpaid: true } : {}) }));
-export const sendC2CReleaseCode = async (o: C2COrder) => {
-  const r = await request<{ id: string; expiresAt: string; resendAfterSeconds: number }>(`${BASE}/orders/${o.id}/release-code`, { expectedVersion: o.version });
-  if (!r || !id(r.id) || !date(r.expiresAt) || !integer(r.resendAfterSeconds) || r.resendAfterSeconds > 3600) invalid();
-  return r;
-};
-export const releaseC2C = async (o: C2COrder, challengeId: string, code: string) => matchC2COrder(o, await request<C2COrder>(`${BASE}/orders/${o.id}/release`, { expectedVersion: o.version, challengeId, code, acknowledgeReceived: true }));
-export const getAdminC2CPolicy = async () => { const p = await request<{ policy: C2CPolicy; canManage: boolean; emailReady: boolean }>(`${ADMIN}/policy`); validC2CPolicy(p?.policy); if (typeof p.canManage !== "boolean" || typeof p.emailReady !== "boolean") invalid(); return p; };
+export const releaseC2C = async (o: C2COrder) => matchC2COrder(o, await request<C2COrder>(`${BASE}/orders/${o.id}/release`, { expectedVersion: o.version, acknowledgeReceived: true }));
+export const getAdminC2CPolicy = async () => { const p = await request<{ policy: C2CPolicy; canManage: boolean }>(`${ADMIN}/policy`); validC2CPolicy(p?.policy); if (typeof p.canManage !== "boolean") invalid(); return p; };
 export const saveAdminC2CPolicy = async (p: C2CPolicy) => validC2CPolicy(await request<C2CPolicy>(`${ADMIN}/policy`, p, "PUT"));
 export const getAdminC2COrder = async (orderId: string) => { const p = await request<{ order: C2COrder; events: C2CPage<C2CEvent>; evidenceValid: boolean; canResolve: boolean }>(`${ADMIN}/orders/${orderId}`); validC2COrder(p?.order); validPage(p.events, validC2CEvent); if (p.order.id !== orderId || typeof p.evidenceValid !== "boolean" || typeof p.canResolve !== "boolean") invalid(); return p; };
 export const resolveC2C = async (o: C2COrder, action: string, evidence: string) => matchC2COrder(o, await request<C2COrder>(`${ADMIN}/orders/${o.id}/resolve`, { expectedVersion: o.version, action, evidence, attestExternalEvidence: true }));
@@ -252,7 +247,7 @@ export function c2cBlockerKey(code: C2CBlocker): MessageKey {
   const keys: Record<C2CBlocker, MessageKey> = {
     C2C_DISABLED: "c2c.error.disabled", C2C_TRANSFERS_DISABLED: "c2c.error.transfersDisabled", C2C_TRANSFERS_PAUSED: "c2c.error.transfersPaused",
     C2C_ACCOUNT_INACTIVE: "c2c.error.inactive", C2C_IDENTITY: "c2c.error.identity", C2C_FINANCE_HOLD: "c2c.error.hold",
-    C2C_SUSPENDED: "c2c.error.suspended", C2C_ADMISSION: "c2c.error.admission", C2C_EMAIL_UNAVAILABLE: "c2c.error.email", C2C_OVERDUE_ORDERS: "c2c.error.overdue",
+    C2C_SUSPENDED: "c2c.error.suspended", C2C_ADMISSION: "c2c.error.admission", C2C_OVERDUE_ORDERS: "c2c.error.overdue",
   };
   return keys[code];
 }
@@ -263,7 +258,7 @@ export function c2cErrorKey(cause: unknown): MessageKey {
   const map: Record<string, MessageKey> = {
     C2C_STALE: "c2c.error.stale", C2C_STOCK: "c2c.error.stock", C2C_PAUSED: "c2c.error.paused", C2C_AUTO_PAUSED: "c2c.error.autoPaused", C2C_AUTO_ACCEPT_CONSENT: "c2c.confirmAutoAcceptHelp", C2C_TERMS: "c2c.error.stale", C2C_ADMISSION: "c2c.error.admission",
     C2C_SELLER_UNAVAILABLE: "c2c.error.offline", C2C_IDENTITY: "c2c.error.identity", C2C_SUSPENDED: "c2c.error.suspended",
-    C2C_FX_UNAVAILABLE: "c2c.error.fx", C2C_PAYMENT_WINDOW: "c2c.error.window", C2C_CODE_INVALID: "c2c.error.code", C2C_EMAIL_UNAVAILABLE: "c2c.error.email",
+    C2C_FX_UNAVAILABLE: "c2c.error.fx", C2C_PAYMENT_WINDOW: "c2c.error.window",
     C2C_FIRST_ORDER_LIMIT: "c2c.error.first", C2C_ORDER_LIMIT: "c2c.error.limit", MARKET_FINANCE_HOLD: "c2c.error.hold",
   };
   return map[code ?? ""] ?? "c2c.error.generic";

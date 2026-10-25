@@ -1494,56 +1494,52 @@ fn overlapping_previews_cannot_oversell_or_bypass_shared_daily_budget() {
     );
 }
 #[test]
-fn seller_release_codes_are_bound_persist_failed_attempts_and_are_idempotent() {
+fn session_authorized_seller_release_is_owned_acknowledged_and_idempotent() {
     let c = fixture();
     offer(&c);
     let o = paid(&c, &order(&c, 1000));
-    let runtime = crate::market_payments::MarketPaymentsRuntime::for_test();
-    let bind = http::binding_for_test(&o);
-    let (key, mac) = runtime.transfer_mac("code-id", &bind, "012345").unwrap();
-    c.execute("INSERT INTO market_c2c_challenges(id,order_id,seller_id,email,binding,code_mac,key_version,delivered_at,expires_at,created_ip,created_at) VALUES('code-id',?1,'seller','seller@example.test',?2,?3,?4,?5,'2026-10-22T12:10:00Z','127.0.0.1',?5)",params![o.id,bind,mac,key,AT]).unwrap();
+    let auth = crate::market_finance_auth::test_session("seller");
     let mut a = http::ReleaseInput {
         expected_version: o.version,
-        challenge_id: "code-id".into(),
-        code: "000000".into(),
-        acknowledge_received: true,
+        acknowledge_received: false,
     };
     assert!(
         transaction(&c, |c| http::release_authorized_tx(
-            c, &runtime, "buyer", &o.id, &a, AT
+            c, &auth, "seller", &o.id, &a, AT
         ))
         .is_err()
     );
-    for _ in 0..5 {
-        assert!(
-            transaction(&c, |c| http::release_authorized_tx(
-                c, &runtime, "seller", &o.id, &a, AT
-            ))
-            .unwrap()
-            .is_none()
-        );
-    }
-    a.code = "012345".into();
+    a.acknowledge_received = true;
     assert!(
         transaction(&c, |c| http::release_authorized_tx(
-            c, &runtime, "seller", &o.id, &a, AT
+            c,
+            &crate::market_finance_auth::test_session("buyer"),
+            "buyer",
+            &o.id,
+            &a,
+            AT
         ))
-        .unwrap()
-        .is_none()
+        .is_err()
     );
-    c.execute("UPDATE market_c2c_challenges SET attempts=0", [])
-        .unwrap();
     let completed = transaction(&c, |c| {
-        http::release_authorized_tx(c, &runtime, "seller", &o.id, &a, AT)
+        http::release_authorized_tx(c, &auth, "seller", &o.id, &a, AT)
     })
-    .unwrap()
     .unwrap();
     assert_eq!(completed.status, "released");
-    assert!(
-        http::release_authorized_tx(&c, &runtime, "seller", &o.id, &a, LATER)
+    assert_eq!(
+        http::release_authorized_tx(&c, &auth, "seller", &o.id, &a, LATER)
             .unwrap()
-            .is_some()
+            .id,
+        o.id
     );
+    assert_eq!(c.query_row("SELECT COUNT(*) FROM market_financial_authorizations WHERE operation_kind='c2c_release'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    assert_eq!(
+        c.query_row("SELECT COUNT(*) FROM market_c2c_challenges", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert!(evidence_valid_tx(&c, &o.id).unwrap());
 }
 #[test]
 fn discovery_exposes_only_the_published_description_and_history_stays_owned() {
@@ -1994,57 +1990,50 @@ fn first_purchase_and_shared_ip_active_caps_are_enforced_before_reservation() {
 }
 
 #[test]
-fn undelivered_expired_changed_identity_and_stale_version_codes_never_release() {
+fn expired_sessions_wrong_actors_and_stale_versions_never_release() {
     let c = fixture();
     offer(&c);
     let o = paid(&c, &order(&c, 1000));
-    let runtime = crate::market_payments::MarketPaymentsRuntime::for_test();
-    let bind = http::binding_for_test(&o);
-    let (key, mac) = runtime
-        .transfer_mac("delivery-code", &bind, "012345")
-        .unwrap();
-    c.execute("INSERT INTO market_c2c_challenges(id,order_id,seller_id,email,binding,code_mac,key_version,expires_at,created_ip,created_at) VALUES('delivery-code',?1,'seller','seller@example.test',?2,?3,?4,'2026-10-22T12:10:00Z','127.0.0.1',?5)",params![o.id,bind,mac,key,AT]).unwrap();
+    let mut auth = crate::market_finance_auth::test_session("seller");
     let a = http::ReleaseInput {
         expected_version: o.version,
-        challenge_id: "delivery-code".into(),
-        code: "012345".into(),
         acknowledge_received: true,
     };
+    auth.access_expires_at = chrono::DateTime::parse_from_rfc3339(AT)
+        .unwrap()
+        .with_timezone(&Utc);
     assert!(
-        http::release_authorized_tx(&c, &runtime, "seller", &o.id, &a, AT)
-            .unwrap()
-            .is_none()
+        transaction(&c, |c| http::release_authorized_tx(
+            c, &auth, "seller", &o.id, &a, AT
+        ))
+        .is_err()
     );
-    c.execute(
-        "UPDATE market_c2c_challenges SET delivered_at=?1",
-        params![AT],
+    assert!(
+        transaction(&c, |c| http::release_authorized_tx(
+            c,
+            &crate::market_finance_auth::test_session("other"),
+            "seller",
+            &o.id,
+            &a,
+            AT
+        ))
+        .is_err()
+    );
+    let auth = crate::market_finance_auth::test_session("seller");
+    dispute_tx(
+        &c,
+        &o,
+        "buyer",
+        "New evidence changes the reviewed version",
+        AT,
     )
     .unwrap();
-    assert!(
-        http::release_authorized_tx(&c, &runtime, "seller", &o.id, &a, "2026-10-22T12:10:00Z")
-            .unwrap()
-            .is_none()
-    );
-    c.execute(
-        "UPDATE users SET email_normalized='new@example.test' WHERE id='seller'",
-        [],
-    )
-    .unwrap();
-    assert!(
-        http::release_authorized_tx(&c, &runtime, "seller", &o.id, &a, AT)
-            .unwrap()
-            .is_none()
-    );
-    c.execute(
-        "UPDATE users SET email_normalized='seller@example.test' WHERE id='seller'",
-        [],
-    )
-    .unwrap();
-    dispute_tx(&c, &o, "buyer", "New evidence changes the version", AT).unwrap();
     assert_eq!(
-        http::release_authorized_tx(&c, &runtime, "seller", &o.id, &a, AT)
-            .unwrap_err()
-            .code(),
+        transaction(&c, |c| http::release_authorized_tx(
+            c, &auth, "seller", &o.id, &a, AT
+        ))
+        .unwrap_err()
+        .code(),
         Some("C2C_STALE")
     );
     assert_eq!(
@@ -2052,8 +2041,8 @@ fn undelivered_expired_changed_identity_and_stale_version_codes_never_release() 
         units_from_minor(1000).unwrap()
     );
     assert_eq!(wallet_snapshot_tx(&c, "buyer").unwrap().posted_units, 0);
+    assert!(serde_json::from_value::<http::ReleaseInput>(serde_json::json!({"expectedVersion":o.version,"acknowledgeReceived":true,"code":"123456","challengeId":"old"})).is_err());
 }
-
 #[test]
 fn wallet_history_links_reservations_returns_and_both_delivery_sides_to_the_order() {
     let c = fixture();

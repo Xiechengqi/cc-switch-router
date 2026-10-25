@@ -124,10 +124,10 @@ try {
         if (action === "events") return json(route, { items: [{ id: "event", actorId: actor, action: o.status === "awaiting_payment" ? "created" : o.status, note: "", createdAt: o.createdAt }], next: null });
         if (action === "accept") { assert.equal(actor, o.sellerId); assert.equal(o.flowVersion, 2); manualAcceptRequests++; acceptOrder(o); return json(route, o); }
         if (action === "reject") { assert.equal(actor, o.sellerId); o.status = "cancelled"; o.version++; return json(route, o); }
-        if (action === "release-code") return json(route, { id: "challenge", expiresAt: new Date(Date.now() + 600000).toISOString(), resendAfterSeconds: 60 });
+        if (action === "release-code") assert.fail("retired financial OTP endpoint must not be called");
         if (action === "release") {
           assert.equal(actor, "seller"); assert.equal(body.acknowledgeReceived, true);
-          if (body.code !== "123456") return json(route, { code: "C2C_CODE_INVALID", message: "wrong code" }, 409);
+          assert.deepEqual(body, { expectedVersion: o.version, acknowledgeReceived: true });
           o.status = "released"; o.releasedAt = new Date().toISOString(); released++;
         } else if (action === "paid") { assert.equal(actor, o.buyerId); o.status = "paid"; o.paidAt = new Date().toISOString(); }
         else if (action === "cancel") { assert.equal(body.acknowledgeUnpaid, true); o.status = "cancelled"; }
@@ -142,7 +142,7 @@ try {
       if (p === "/v1/admin/market-finance/commission-policy") return json(route, { version: 1, current: { policyVersion: 1, rateBps: 1000, effectiveAt: "2026-01-01T00:00:00Z" }, scheduled: null, increaseNoticeDays: 7, canEdit: true });
       if (p === "/v1/admin/market-finance/c2c/policy") {
         if (request.method() === "PUT") { assert.equal(body.version, policy.version); policy = { ...body, version: policy.version + 1 }; return json(route, policy); }
-        return json(route, { policy, canManage: actor === "owner", canResolve: actor === "owner" || disputeHandlers.some(h => h.enabled && h.userId === actor), emailReady: true });
+        return json(route, { policy, canManage: actor === "owner", canResolve: actor === "owner" || disputeHandlers.some(h => h.enabled && h.userId === actor), });
       }
       if (p === "/v1/admin/market-finance/c2c/dispute-handlers") {
         assert.equal(actor, "owner");
@@ -327,10 +327,11 @@ try {
   await sell.page.clock.fastForward(61000); assert.equal(heartbeat, 0, "pause needs no browser presence");
   sellerUnits = "1728000000"; available = true;
   await sell.page.goto(`${base}/account/wallet/?c2cOrder=${orders[0].id}`); const releaseDialog = sell.page.getByRole("dialog", { name: "Order details" });
-  await releaseDialog.getByRole("checkbox", { name: /I personally verified/ }).check(); await releaseDialog.getByRole("button", { name: "Send release code", exact: true }).click();
-  await releaseDialog.getByLabel("6-digit release code").fill("000000"); await releaseDialog.getByRole("button", { name: "Confirm receipt & release", exact: true }).click();
-  await releaseDialog.getByRole("alert").waitFor(); assert.equal(released, 0);
-  await releaseDialog.getByLabel("6-digit release code").fill("123456"); await releaseDialog.getByRole("button", { name: "Confirm receipt & release", exact: true }).click();
+  assert.equal(await releaseDialog.locator('input[autocomplete="one-time-code"]').count(), 0);
+  assert.equal(await releaseDialog.getByRole("button", { name: "Send release code", exact: true }).count(), 0);
+  assert.equal(await releaseDialog.getByRole("button", { name: "Confirm receipt & release", exact: true }).isDisabled(), true);
+  await releaseDialog.getByRole("checkbox", { name: /I personally verified/ }).check();
+  await releaseDialog.getByRole("button", { name: "Confirm receipt & release", exact: true }).click();
   await releaseDialog.getByText("Credit delivered", { exact: true }).first().waitFor(); assert.equal(released, 1);
   const withdrawn = makeLegacyOrder({ ...latestQuote, id: "withdraw-quote" }, "buyer"); orders.unshift(withdrawn);
   await page.goto(`${base}/account/wallet/?c2cOrder=${withdrawn.id}`); dialog = page.getByRole("dialog", { name: "Order details" });
@@ -349,7 +350,7 @@ try {
   await dialog.getByRole("button", { name: "Report payment exception", exact: true }).click(); await dialog.getByText("In dispute", { exact: true }).waitFor();
   await sell.page.goto(`${base}/account/wallet/?c2cOrder=${early.id}`);
   const exceptional = sell.page.getByRole("dialog", { name: "Order details" }); await exceptional.getByText("In dispute", { exact: true }).waitFor();
-  assert.equal(await exceptional.getByRole("button", { name: "Send release code", exact: true }).count(), 0, "never-accepted exceptional claims need independent resolution");
+  assert.equal(await exceptional.getByRole("button", { name: "Confirm receipt & release", exact: true }).count(), 0, "never-accepted exceptional claims need independent resolution");
   const legacy = makeLegacyOrder({ ...latestQuote, id: "legacy-accept-quote" }, "buyer"); orders.unshift(legacy);
   await sell.page.goto(`${base}/account/wallet/?c2cOrder=${legacy.id}`);
   const legacyDialog = sell.page.getByRole("dialog", { name: "Order details" });
@@ -509,5 +510,5 @@ try {
   await guest.page.locator("#income").getByText(/sign in/i).waitFor();
   assert.equal(guestFinanceRequests, 0, "anonymous income has a sign-in state and never fetches private finances");
   assert.deepEqual(errors, []);
-  console.log("C2C browser checks passed: automatic reservation/payment without manual acceptance, explicit seller upgrade consent preserving pauses, legacy withdrawal/rejection and early payment protection, persistent selling without heartbeat, independent dispute grants and party conflict, public descriptions, seller draft conflict, Provider income, recovery, OTP release, bilingual DOM geometry, contrast, keyboard and clock skew; no screenshots or real operations.");
+  console.log("C2C browser checks passed: automatic reservation/payment without manual acceptance, explicit seller upgrade consent preserving pauses, legacy withdrawal/rejection and early payment protection, persistent selling without heartbeat, independent dispute grants and party conflict, public descriptions, seller draft conflict, Provider income, recovery, login-authorized release without financial OTP, bilingual DOM geometry, contrast, keyboard and clock skew; no screenshots or real operations.");
 } finally { await browser?.close(); await new Promise(resolveClose => server.close(resolveClose)); }

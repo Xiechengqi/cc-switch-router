@@ -17,7 +17,7 @@ export function C2CFinanceSettings() {
   return session?.authenticated && session.user?.id ? <C2CFinanceControl key={session.user.id} actor={session.user.id} /> : null;
 }
 function C2CFinanceControl({ actor }: { actor: string }) {
-  const { t } = useLocaleText(); const [policy, setPolicy] = React.useState<C2CPolicy | null>(null); const [canManage, setCanManage] = React.useState(false); const [emailReady, setEmailReady] = React.useState(true);
+  const { t } = useLocaleText(); const [policy, setPolicy] = React.useState<C2CPolicy | null>(null); const [canManage, setCanManage] = React.useState(false);
   const [enabled, setEnabled] = React.useState(true); const [admission, setAdmission] = React.useState("100"); const [min, setMin] = React.useState("1"); const [max, setMax] = React.useState("5000"); const [minutes, setMinutes] = React.useState("30");
   const [handlers, setHandlers] = React.useState<C2CDisputeHandler[]>([]); const [handlerNext, setHandlerNext] = React.useState<string | null>(null); const [handlerEmail, setHandlerEmail] = React.useState("");
   const [orders, setOrders] = React.useState<C2COrder[]>([]); const [next, setNext] = React.useState<string | null>(null); const [all, setAll] = React.useState(false);
@@ -29,7 +29,7 @@ function C2CFinanceControl({ actor }: { actor: string }) {
   React.useEffect(() => { const id = new URLSearchParams(window.location.search).get("c2cOrder"); if (id && /^[A-Za-z0-9_-]{1,128}$/.test(id)) setSelected(id); }, []);
   const loadPolicy = React.useCallback(async () => {
     const p = await getAdminC2CPolicy(); if (!alive.current) return;
-    setPolicy(p.policy); setCanManage(p.canManage); setEmailReady(p.emailReady); setEnabled(p.policy.enabled); setAdmission(String(p.policy.admissionMinor / 100)); setMin(String(p.policy.minMinor / 100)); setMax(String(p.policy.maxMinor / 100)); setMinutes(String(p.policy.paymentMinutes));
+    setPolicy(p.policy); setCanManage(p.canManage); setEnabled(p.policy.enabled); setAdmission(String(p.policy.admissionMinor / 100)); setMin(String(p.policy.minMinor / 100)); setMax(String(p.policy.maxMinor / 100)); setMinutes(String(p.policy.paymentMinutes));
   }, []);
   const loadOrders = React.useCallback(async (before = "") => {
     const seq = ++orderRequest.current;
@@ -54,7 +54,6 @@ function C2CFinanceControl({ actor }: { actor: string }) {
   return <section className="grid min-w-0 gap-5 rounded-xl border border-border bg-card p-4 sm:p-5" data-c2c-admin>
     <header className="flex flex-wrap items-center justify-between gap-3"><h3 className="text-base font-semibold">{t("c2c.policy")}</h3><C2CAction type="button" secondary disabled={busy} onClick={() => void run(async () => { setSaved(false); await Promise.all([loadPolicy(), loadOrders(), loadSellers()]); })}>{t("common.reload")}</C2CAction></header>
     <C2CError>{error}</C2CError>
-    {!emailReady ? <p className="text-sm text-muted-foreground">{t("c2c.error.email")}</p> : null}
     {policy ? <form className="grid min-w-0 gap-3" onSubmit={e => { e.preventDefault(); if (!valid || !canManage || threshold == null || low == null || high == null) return; void run(async () => { const p = await saveAdminC2CPolicy({ ...policy, enabled, admissionMinor: threshold, minMinor: low, maxMinor: high, paymentMinutes: m }); if (alive.current) { setPolicy(p); setSaved(true); } }); }}>
       <p className="text-sm leading-6 text-muted-foreground">{t("c2c.policyHelp")}</p>
       <C2CCheck checked={enabled} disabled={!canManage || busy} onChange={e => { setEnabled(e.target.checked); setSaved(false); }}>{t("c2c.enabled")}</C2CCheck>

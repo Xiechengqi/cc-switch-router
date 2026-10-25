@@ -44,7 +44,7 @@ export type TransferCapacity = {
   dailyRemainingUnits: string;
   enabled: boolean;
   verified: boolean;
-  blockers: ("disabled" | "paused" | "identity" | "finance_hold" | "email_unavailable")[];
+  blockers: ("disabled" | "paused" | "identity" | "finance_hold")[];
 };
 export type TransferQuote = {
   id: string;
@@ -52,11 +52,6 @@ export type TransferQuote = {
   recipientEmail: string;
   amountUnits: string;
   expiresAt: string;
-};
-export type TransferChallenge = {
-  id: string;
-  expiresAt: string;
-  resendAfterSeconds: number;
 };
 export type WalletTransfer = {
   id: string;
@@ -129,18 +124,8 @@ export async function quoteWalletTransfer(
     }),
   );
 }
-export async function sendWalletTransferCode(quoteId: string) {
-  return parseJson<TransferChallenge>(
-    await authFetch(
-      `/v1/market-wallet/transfer-quotes/${encodeURIComponent(quoteId)}/code`,
-      { method: "POST" },
-    ),
-  );
-}
 export async function confirmWalletTransfer(
   quoteId: string,
-  challengeId: string,
-  code: string,
   idempotencyKey: string,
 ) {
   return parseJson<WalletTransfer>(
@@ -150,7 +135,7 @@ export async function confirmWalletTransfer(
         "Content-Type": "application/json",
         "Idempotency-Key": idempotencyKey,
       },
-      body: JSON.stringify({ quoteId, challengeId, code }),
+      body: JSON.stringify({ quoteId }),
     }),
   );
 }

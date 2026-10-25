@@ -102,7 +102,7 @@ export function C2CSellerPanel({ policy, snapshot, availabilityError, onRefresh,
     <div id={fieldId + "-eligibility"} aria-live="polite" className="grid min-w-0 gap-2 text-sm text-muted-foreground">
       {blocked ? <p>{t(blocked)}</p> : null}
       {!availabilityError && snapshot.blockers.length > 1 ? <details><summary className="min-h-11 cursor-pointer rounded-md py-2 focus-visible:outline-2 focus-visible:outline-ring">{t("c2c.moreBlockers")}</summary><ul className="grid gap-2">{snapshot.blockers.slice(1).map(code => <li key={code}>{t(c2cBlockerKey(code))}</li>)}</ul></details> : null}
-      {policy.canManagePolicy && snapshot.blockers.some(code => ["C2C_DISABLED", "C2C_TRANSFERS_DISABLED", "C2C_TRANSFERS_PAUSED", "C2C_EMAIL_UNAVAILABLE"].includes(code)) ? <a href="/settings/?panel=market_finance" className="inline-flex min-h-11 items-center justify-self-start whitespace-nowrap font-medium text-primary underline underline-offset-2 focus-visible:outline-2 focus-visible:outline-ring">{t("c2c.managePolicy")}</a> : null}
+      {policy.canManagePolicy && snapshot.blockers.some(code => ["C2C_DISABLED", "C2C_TRANSFERS_DISABLED", "C2C_TRANSFERS_PAUSED"].includes(code)) ? <a href="/settings/?panel=market_finance" className="inline-flex min-h-11 items-center justify-self-start whitespace-nowrap font-medium text-primary underline underline-offset-2 focus-visible:outline-2 focus-visible:outline-ring">{t("c2c.managePolicy")}</a> : null}
     </div>
     {versionChanged ? <p role="status" className="text-sm text-muted-foreground">{t("c2c.error.stale")}</p> : null}
     <C2CError>{error}</C2CError>

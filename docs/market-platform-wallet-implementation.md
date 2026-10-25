@@ -1,5 +1,7 @@
 # Market 平台钱包与 DujiaoPay 落地实施文档
 
+> 迁移 85、86 当前契约：资金操作二次邮箱验证码已移除，仅依赖正常登录。英文通知采用统一样式、按收件人与目的降噪、分渠道持久化重试；详见 [资金登录授权与通知契约](market-financial-session-notifications.md)。旧挑战仅保留只读审计证据，不再提供验证码功能。
+
 > 当前实现变更：外部提现、提现地址及手动「收益转入余额」章节已退役。净收益完成七天沉淀后自动计入平台余额，通过消费、邮箱转账或 C2C 流转；以 [收益自动到账契约](market-earnings-automatic-credit.md) 为准。下文相关旧设计仅保留为历史规划记录。
 
 > 迁移 81–82 当前契约：财务模式现为「官方充值模式」，仅控制网关新充值。新市场发布／报价／购买始终使用平台余额；余额转账、C2C 和成熟收益自动到账独立于充值模式。C2C 及共享转账规则仍需 Owner 显式启用。关闭或退回影子测试不恢复旧 Provider 资金写入口，重新开放充值仍须通过当期渠道和账本验收。旧条款不自动迁账；下文关于单向模式切换及旧域清空门禁的早期设计不再是当前充值开放条件。
@@ -176,7 +178,7 @@ Owner 收到的是 DujiaoPay 商户实际入金资产，Router 给出的却是 U
 | 用户钱包 | `GET /v1/market-wallet`；`GET /v1/market-wallet/transactions` | Session 归属，游标分页，私有禁缓存。 |
 | 充值 | `GET /v1/market-wallet/channels`；`POST /v1/market-wallet/topups`；`GET /v1/market-wallet/topups/:id` | 创建使用 `Idempotency-Key`；只返回必要的安全收银台 URL 和状态。 |
 | Webhook | `POST /v1/payment-webhooks/dujiaopay`；旧 `/:channel_id` | 固定 URL 无签名渠道只唤醒查单；旧 URL 和签名渠道保持原始 body 验签，入账始终以认证查单为准。 |
-| 邮箱转账 | `/v1/market-wallet/transfer-capacity`、`/transfer-quotes`、`/transfer-quotes/:id/code`、`/transfers` | 精确邮箱、已验证用户、金额快照、邮箱 OTP、原子幂等记账。原余额退款 POST 始终返回 `410 WALLET_CASH_REFUNDS_RETIRED`。 |
+| 邮箱转账 | `/v1/market-wallet/transfer-capacity`、`/transfer-quotes`、`/transfers` | 精确邮箱、正常登录、金额快照、不可变会话授权、原子幂等记账。原余额退款 POST 始终返回 `410 WALLET_CASH_REFUNDS_RETIRED`。 |
 | Provider 收入 | `GET /v1/market-provider-finance/me`；`GET /v1/market-provider-finance/earnings` | 待解锁、可提现、提现中与已转入分别展示；仅明确完成 §17 转入后，才增加用户钱包。 |
 | Provider 提现 | `PUT /v1/market-provider-finance/destination`；`POST /v1/market-provider-finance/withdrawals`；`GET /v1/market-provider-finance/withdrawals` | 收款资料版本化，提交幂等。 |
 | Owner 渠道 | `/v1/admin/market-payment-channels` 下创建、资料编辑、现有 API 复验、API／Webhook 密钥轮换、启停、归档／恢复接口 | Owner-only；修改使用 `expectedVersion` 乐观锁，读响应不回显 Secret；归档后旧订单仍可对账。 |
@@ -331,21 +333,21 @@ Owner 收到的是 DujiaoPay 商户实际入金资产，Router 给出的却是 U
 ### 15.3 邮箱转账
 
 - 仅限本 Router、有效且真实完成邮箱登录验证的用户，精确匹配规范化邮箱；不猜测相似邮箱、不代注册、不暂存未知收款人资金、不能转自己。
-- `users.email_verified_at` 只在邮箱验证码验证成功后设置；自动创建用户、既有 Session 或 API Key 不等于验证。此前登录用户需重新邮箱登录一次。
+- `users.email_verified_at` 表示正常邮箱登录已经证明归属；有效真实登录会话可按迁移 81 修复旧标记，不要求为资金操作再次登录。自动创建用户或 API Key 不能替代登录证明。
 - 默认单笔／UTC 自然日各 5,000 美元，Owner 可配置，暂停开关独立。转账不收费，不制造 Provider 收入，不绕过履约与七天沉淀。
 - 可转额 = 可用余额扣除已到期、尚未预留的服务义务，再受单笔／日上限约束。钱包 hold 已从可用额中剔除，不重复扣减，也不一次冻结所有未来续费。
 - 报价冻结收发用户 ID、双方邮箱及精确 `amount_units`，15 分钟有效。“转出全部”冻结当前所有可转单位；之后新充值不自动追加到已确认转账。
-- 显示收款邮箱与金额后，向发送人邮箱发送随机 6 位码。验证码绑定报价／收款人／金额；10 分钟有效且不超过报价期限、60 秒重发、每小时最多 10 次，5 次错误锁定。新码使旧码失效。验证码采用版本化服务端 HMAC，不记录明文日志；邮件服务不可用不降级。
+- 显示收款邮箱与金额后直接确认，无二次邮箱验证码。以正常登录会话授权，绑定原报价、收款人和精确金额。邮件服务不可用不阻止转账。
 - 每小时最多 30 次收款人报价尝试，失败查询也持久计数，按用户和来源 IP 限制，避免账户枚举。
-- 提交时在一个 IMMEDIATE 事务中复核身份、冻结范围、额度与可用额，原子写入复式 journal、双边钱包、不可变转账记录、验证码消费和两条强制通知 outbox；任一步失败全部回滚。
-- 成功重试先返回原结果，即使码已消费／过期或转账后来暂停。邮箱投递与页面刷新不参与资金事务，失败不得重复扣款。用户可在双方流水及通知查看金额和对方邮箱。
+- 提交时在一个 IMMEDIATE 事务中复核身份、冻结范围、额度与可用额，原子写入复式 journal、双边钱包、不可变转账记录、会话授权证据和两条强制通知 outbox；任一步失败全部回滚。
+- 成功重试先返回原结果，即使原报价已过期或转账后来暂停。邮箱投递与页面刷新不参与资金事务，失败不得重复扣款。用户可在双方流水及通知查看金额和对方邮箱。
 - API 只读写 Session 所属转账，不开放站外提现或 Owner 代用户无验证转账。
 
 ### 15.4 外部退款／拒付与审计
 
 “不支持余额退款”不会使已收到的外部退款／拒付事实消失。保留 Owner 先核对商户证据、dry-run 再冲正的路径。每次外部退款按原实付中本金／费用比例拆分，使用累计舍入差额，最终全额退款恰好冲回全部原费用；累计外部退款不得超过原实付，同一外部证据不得重复处理。扣除原买家尚可用的本金，不足记 Owner 损失；不能追扣已收转账的其他用户，不能改写原 journal 或生成负余额。
 
-新对账视图同时核实本金＋费用＝实付、封口 journal 的完整 posting 和 receipt。真实渠道准入检查复用正确的本金／费用口径；人工认领仍不计作链上验收。邮箱转账独立核对不可变记录、报价、已投递且消费的 challenge、双边两笔钱包 posting；证据异常冻结发送和接收用户，孤儿转账 journal 全局冻结。Owner 不能只点“结案”绕过仍然失败的不变量。
+新对账视图同时核实本金＋费用＝实付、封口 journal 的完整 posting 和 receipt。真实渠道准入检查复用正确的本金／费用口径；人工认领仍不计作链上验收。邮箱转账独立核对不可变记录、报价、新会话授权（或旧只读挑战证据）、双边两笔钱包 posting；证据异常冻结发送和接收用户，孤儿转账 journal 全局冻结。Owner 不能只点“结案”绕过仍然失败的不变量。
 
 0075 重建 posting 账户类型约束时保留历史 ID、金额和封口，并重建依赖视图与不可变触发器；升级测试必须验证旧 sealed journal、Owner 操作与外键。该结构升级不是将旧 Provider 余额迁入新钱包。
 

@@ -2391,6 +2391,61 @@ pub(crate) fn queue_funding_reminders_tx(conn: &Connection, now: DateTime<Utc>) 
     Ok(queued)
 }
 
+/// Revalidate a queued funding reminder against the current period and money.
+/// A delayed email must not ask a user who already topped up to pay again.
+pub(crate) fn funding_notice_current_tx(
+    conn: &Connection,
+    buyer: &str,
+    id: &str,
+    kind: &str,
+    expected_end: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<bool, AppError> {
+    let row = conn.query_row(
+        "SELECT c.status,c.billing_model,c.renewal_policy,c.cycle_price_minor,c.daily_rate_minor,
+            p.period_end,COALESCE(h.remaining_units,0)
+         FROM market_platform_contracts c
+         LEFT JOIN market_platform_periods p ON p.contract_id=c.id AND p.sequence=c.current_period_sequence
+         LEFT JOIN market_wallet_holds h ON h.id=c.budget_hold_id AND h.status='active'
+         WHERE c.id=?1 AND c.buyer_user_id=?2",
+        params![id,buyer], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,
+            r.get::<_,String>(2)?,r.get::<_,Option<i64>>(3)?,r.get::<_,Option<i64>>(4)?,
+            r.get::<_,Option<String>>(5)?,r.get::<_,i64>(6)?)))
+        .optional().map_err(db_error("recheck funding reminder"))?;
+    let Some((status, model, renewal, price, rate, end, budget)) = row else {
+        return Ok(false);
+    };
+    if status != "active" {
+        return Ok(false);
+    }
+    let available = crate::market_wallet::wallet_snapshot_tx(conn, buyer)?
+        .available_units
+        .max(0);
+    if kind == "wallet_low_runway" && model == "metered" {
+        let Some(rate) = rate.filter(|n| *n > 0) else {
+            return Ok(false);
+        };
+        return Ok(i128::from(budget) + i128::from(available) < i128::from(units_from_minor(rate)?));
+    }
+    if kind != "renewal_upcoming_shortfall" || model != "calendar_month" || renewal != "automatic" {
+        return Ok(false);
+    }
+    let (Some(price), Some(end)) = (price, end) else {
+        return Ok(false);
+    };
+    if expected_end != Some(end.as_str()) {
+        return Ok(false);
+    }
+    let at = parse_time(&end)?;
+    if at <= now || at > now + chrono::Duration::hours(72) {
+        return Ok(false);
+    }
+    let needed = units_from_minor(price)?
+        .checked_add(prior_due_funding_units_tx(conn, buyer, Some(id), &end)?)
+        .ok_or_else(|| AppError::Internal("funding reminder amount overflow".into()))?;
+    Ok(available < needed)
+}
+
 /// Queue a buyer notice for a contract state change. `reason` is a short
 /// machine code (for example `insufficient_funds`, `finance_hold`).
 pub(crate) fn notify_contract_tx(

@@ -53,7 +53,6 @@ export const walletPolicyMessagesEn = {
   "walletPolicy.enabled": "Allow balance transfers",
   "walletPolicy.paused": "Pause new balance transfers",
   "walletPolicy.transferScope": "Applies to email transfers and new C2C trades. Existing C2C orders can still be completed. Limits are shared.",
-  "walletTransfer.emailUnavailable": "Transfer verification email is unavailable. Retry later or contact the administrator.",
   "walletTransfer.financeHold": "Balance transfers are on a financial hold. Contact the administrator.",
   "walletPolicy.invalid":
     "Enter a fee from 0–100%, and positive transfer limits. The daily limit must cover the per-transfer limit.",
@@ -77,24 +76,17 @@ export const walletPolicyMessagesEn = {
   "walletTransfer.review": "Confirm recipient & amount",
   "walletTransfer.exact": "Exact amount: {units} ledger units",
   "walletTransfer.final":
-    "This is a balance transfer, not a cash withdrawal. Verify the recipient before sending the code.",
-  "walletTransfer.sendCode": "Email verification code",
-  "walletTransfer.code": "Verification code",
-  "walletTransfer.codeHelp": "Sent to {email}; valid for 10 minutes.",
+    "This is a balance transfer, not a cash withdrawal. Check the recipient and amount before confirming.",
   "walletTransfer.confirm": "Transfer {amount}",
-  "walletTransfer.resend": "Resend code",
-  "walletTransfer.resendWait": "Resend in {seconds}s",
   "walletTransfer.expired":
     "This confirmation expired. Close it and review a new transfer.",
   "walletTransfer.success": "Transferred {amount} to {email}.",
   "walletTransfer.paused":
     "Transfers are currently unavailable. Your existing balance is not affected.",
   "walletTransfer.verify":
-    "Sign out and sign in with an email code before transferring.",
+    "An active signed-in account with a verified email is required.",
   "walletTransfer.insufficient":
     "Balance or transfer limits changed. Close this confirmation and review the amount again.",
-  "walletTransfer.badCode":
-    "Incorrect verification code. Check the email and try again (up to 5 attempts).",
   "walletTransfer.recipientUnavailable":
     "The recipient must first sign in to this Router with that email.",
   "marketWallet.entry.wallet_transfer": "Balance transfer",
@@ -156,7 +148,6 @@ export const walletPolicyMessagesZh: Record<
   "walletPolicy.enabled": "允许余额转移",
   "walletPolicy.paused": "暂停新余额转移",
   "walletPolicy.transferScope": "同时控制邮箱转账和新 C2C 交易，两者共享限额；已有 C2C 订单仍可完成。",
-  "walletTransfer.emailUnavailable": "转账验证码暂时无法发送，请稍后重试或联系管理员。",
   "walletTransfer.financeHold": "余额转移受财务冻结限制，请联系管理员。",
   "walletPolicy.invalid":
     "维护费应为 0–100%，转账上限应大于零，且每日上限不低于单笔上限。",
@@ -179,20 +170,14 @@ export const walletPolicyMessagesZh: Record<
   "walletTransfer.review": "确认收款人与金额",
   "walletTransfer.exact": "精确金额：{units} 记账单位",
   "walletTransfer.final":
-    "此操作为平台余额转账，不是提现。发送验证码前请核对收款人。",
-  "walletTransfer.sendCode": "发送邮箱验证码",
-  "walletTransfer.code": "验证码",
-  "walletTransfer.codeHelp": "已发送至 {email}，10 分钟内有效。",
+    "此操作为平台余额转账，不是提现。确认转账前请核对收款人和金额。",
   "walletTransfer.confirm": "转出 {amount}",
-  "walletTransfer.resend": "重新发送",
-  "walletTransfer.resendWait": "{seconds} 秒后重发",
   "walletTransfer.expired": "确认信息已过期，请关闭后重新核对转账。",
   "walletTransfer.success": "已将 {amount} 转给 {email}。",
   "walletTransfer.paused": "当前暂不开放转账，已有余额不受影响。",
-  "walletTransfer.verify": "请退出后通过邮箱验证码重新登录，再进行转账。",
+  "walletTransfer.verify": "需要正常登录且邮箱已验证的有效账户。",
   "walletTransfer.insufficient":
     "余额或转账限额已变化，请关闭确认弹窗后重新核对金额。",
-  "walletTransfer.badCode": "验证码不正确，请核对邮件后重试，最多可尝试 5 次。",
   "walletTransfer.recipientUnavailable": "收款人需先使用该邮箱登录此 Router。",
   "marketWallet.entry.wallet_transfer": "余额转账",
   "marketFinanceOverview.maintenance": "维护费收入（扣除冲正）",

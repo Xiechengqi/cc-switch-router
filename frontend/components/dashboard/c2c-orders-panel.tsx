@@ -10,7 +10,7 @@ import { useLocaleText } from "@/components/i18n/locale-provider";
 import { C2CSellerPanel } from "./c2c-seller-panel";
 import { C2CDescription } from "@/components/market/c2c-description";
 import { C2CAction, C2CCheck, C2CDialog, C2CError, C2CStatusLabel, C2C_INPUT } from "@/components/market/c2c-primitives";
-import { c2cErrorKey, c2cNow, c2cPayLabel, c2cPaymentWindow, getC2CPolicy, getC2CSeller, pauseC2CSeller, resumeC2CSeller, getC2COrders, getC2COrder, getC2CEvents, actC2C, sendC2CReleaseCode, releaseC2C, type C2CSeller, type C2CSellerSnapshot, type C2COrder, type C2CEvent, type C2CPolicyView } from "@/lib/market-c2c";
+import { c2cErrorKey, c2cNow, c2cPayLabel, c2cPaymentWindow, getC2CPolicy, getC2CSeller, pauseC2CSeller, resumeC2CSeller, getC2COrders, getC2COrder, getC2CEvents, actC2C, releaseC2C, type C2CSeller, type C2CSellerSnapshot, type C2COrder, type C2CEvent, type C2CPolicyView } from "@/lib/market-c2c";
 import { formatTopupCountdown, formatWalletUnits } from "@/lib/market-wallet-money";
 import { notifyMarketBalanceChanged, subscribeMarketBalanceChanged } from "@/lib/market-balance-events";
 import { messages, type MessageKey } from "@/lib/i18n";
@@ -155,15 +155,15 @@ function C2COrdersWorkspace({ actor, selectedId, onSelect }: { actor: string; se
 function C2COrderDialog({ actor, id, onClose, onChanged }: { actor: string; id: string; onClose: () => void; onChanged: () => void }) {
   const { t, locale } = useLocaleText(); const [o, setOrder] = React.useState<C2COrder | null>(null); const [events, setEvents] = React.useState<C2CEvent[]>([]); const [next, setNext] = React.useState<string | null>(null);
   const [error, setError] = React.useState(""); const [busy, setBusy] = React.useState(false); const [intent, setIntent] = React.useState<"paid" | "cancel" | null>(null);
-  const [ack, setAck] = React.useState(false); const [note, setNote] = React.useState(""); const [releaseAck, setReleaseAck] = React.useState(false); const [code, setCode] = React.useState("");
-  const [challenge, setChallenge] = React.useState<{ id: string; version: number; resendAt: number } | null>(null); const [now, setNow] = React.useState(c2cNow);
+  const [ack, setAck] = React.useState(false); const [note, setNote] = React.useState(""); const [releaseAck, setReleaseAck] = React.useState(false);
+  const [now, setNow] = React.useState(c2cNow);
   const alive = React.useRef(true); const lock = React.useRef(false); const request = React.useRef(0); const seen = React.useRef(0); const eventsExpanded = React.useRef(false);
   React.useEffect(() => { alive.current = true; return () => { alive.current = false; request.current++; }; }, []);
   const load = React.useCallback(async () => {
     const seq = ++request.current; const [order, page] = await Promise.all([getC2COrder(id), getC2CEvents(id)]);
     if (!alive.current || seq !== request.current) return;
     if (order.buyerId !== actor && order.sellerId !== actor) throw new Error("C2C ownership changed");
-    if (seen.current && seen.current !== order.version) { setChallenge(null); setCode(""); setReleaseAck(false); notifyMarketBalanceChanged(actor); }
+    if (seen.current && seen.current !== order.version) { setReleaseAck(false); notifyMarketBalanceChanged(actor); }
     seen.current = order.version; setOrder(order); setNow(c2cNow());
     setEvents(old => eventsExpanded.current ? [...page.items, ...old.filter(e => !page.items.some(n => n.id === e.id))] : page.items);
     if (!eventsExpanded.current) setNext(page.next);
@@ -177,7 +177,7 @@ function C2COrderDialog({ actor, id, onClose, onChanged }: { actor: string; id: 
   }, [load, t]);
   const run = async (fn: () => Promise<C2COrder | void>) => {
     if (lock.current) return; lock.current = true; request.current++; setBusy(true); setError("");
-    try { const result = await fn(); if (!alive.current) return; if (result) { setOrder(result); seen.current = result.version; setIntent(null); setAck(false); setNote(""); setChallenge(null); setCode(""); setReleaseAck(false); onChanged(); } await load(); }
+    try { const result = await fn(); if (!alive.current) return; if (result) { setOrder(result); seen.current = result.version; setIntent(null); setAck(false); setNote(""); setReleaseAck(false); onChanged(); } await load(); }
     catch (e) { if (alive.current) { setError(t(c2cErrorKey(e))); void load().catch(() => {}); } }
     finally { lock.current = false; if (alive.current) setBusy(false); }
   };
@@ -202,8 +202,7 @@ function C2COrderDialog({ actor, id, onClose, onChanged }: { actor: string; id: 
       {buyer && o.status === "awaiting_payment" ? intent ? <div className="grid gap-2"><C2CCheck checked={ack} disabled={busy} onChange={e => setAck(e.target.checked)}>{t(intent === "paid" ? "c2c.paidAck" : "c2c.cancelAck")}</C2CCheck><div className="flex flex-wrap gap-2"><C2CAction type="button" disabled={!ack || busy || (intent === "paid" && !window.mayClaimPayment)} phase={busy ? "loading" : "default"} onClick={() => void run(() => actC2C(o, intent))}>{t(intent === "paid" ? "c2c.markPaid" : "c2c.cancel")}</C2CAction><C2CAction type="button" secondary disabled={busy} onClick={() => setIntent(null)}>{t("common.cancel")}</C2CAction></div></div> : <div className="flex flex-wrap gap-2"><C2CAction type="button" disabled={busy || !window.mayClaimPayment} onClick={() => { setIntent("paid"); setAck(false); }}>{t("c2c.markPaid")}</C2CAction><C2CAction type="button" secondary disabled={busy} onClick={() => { setIntent("cancel"); setAck(false); }}>{t("c2c.cancel")}</C2CAction></div> : null}
       {!buyer && held && (o.flowVersion !== 2 || o.acceptedAt !== null) ? <div className="grid gap-3">
         <C2CCheck checked={releaseAck} disabled={busy} onChange={e => setReleaseAck(e.target.checked)}>{t("c2c.releaseAck")}</C2CCheck>
-        <C2CAction type="button" secondary disabled={!releaseAck || busy || (!!challenge && now < challenge.resendAt)} onClick={() => void run(async () => { const value = await sendC2CReleaseCode(o); if (alive.current) setChallenge({ id: value.id, version: o.version, resendAt: c2cNow() + value.resendAfterSeconds * 1000 }); })}>{t("c2c.sendCode")}</C2CAction>
-        {challenge ? <><p role="status" className="text-xs text-muted-foreground">{t("c2c.codeSent")}</p><label className="grid gap-1 text-sm">{t("c2c.code")}<input className={C2C_INPUT} value={code} inputMode="numeric" autoComplete="one-time-code" maxLength={6} disabled={busy} onChange={e => setCode(e.target.value.replace(/\D/g, ""))} /></label><C2CAction type="button" disabled={!releaseAck || busy || code.length !== 6 || challenge.version !== o.version} phase={busy ? "loading" : "default"} onClick={() => void run(() => releaseC2C(o, challenge.id, code))}>{t("c2c.release")}</C2CAction></> : null}
+        <C2CAction type="button" disabled={!releaseAck || busy} phase={busy ? "loading" : "default"} onClick={() => void run(() => releaseC2C(o))}>{t("c2c.release")}</C2CAction>
       </div> : null}
       {o.status === "awaiting_seller" && buyer ? <details><summary className="min-h-11 cursor-pointer py-3 text-sm focus-visible:outline-2 focus-visible:outline-ring">{t("c2c.earlyPayment")}</summary><div className="grid gap-2"><p className="text-sm text-muted-foreground">{t("c2c.earlyPaymentHelp")}</p><label className="grid gap-1 text-sm">{t("c2c.note")}<textarea className={C2C_INPUT} rows={3} maxLength={1500} value={note} disabled={busy} onChange={e => setNote(e.target.value)} /></label><C2CAction type="button" secondary disabled={busy || !note.trim()} onClick={() => void run(() => actC2C(o, "late-payment", note))}>{t("c2c.reportEarlyPayment")}</C2CAction></div></details> : null}
       {(held || (closed && (buyer || o.latePaymentReported))) ? <div className="grid gap-2">

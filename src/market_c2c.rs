@@ -697,7 +697,7 @@ fn event_tx(
             "c2c_order",
             &o.id,
             &format!("c2c:{}:{}:{action}:{user}", o.id, o.version),
-            serde_json::json!({"orderId":o.id,"amountUnits":o.amount_units.to_string(),"status":o.status,"action":action,"role":if user==&o.seller_id {"seller"} else {"buyer"}}),
+            serde_json::json!({"orderId":o.id,"amountUnits":o.amount_units.to_string(),"payMinor":o.pay_minor,"currency":o.currency,"status":o.status,"action":action,"actorId":actor,"role":if user==&o.seller_id {"seller"} else {"buyer"}}),
             time,
         )?;
     }
@@ -720,7 +720,7 @@ fn event_tx(
                 "c2c_order",
                 &o.id,
                 &format!("c2c-handler:{}:{}:{action}:{user}", o.id, o.version),
-                serde_json::json!({"orderId":o.id,"status":o.status,"role":"handler","action":action,"amountUnits":o.amount_units.to_string()}),
+                serde_json::json!({"orderId":o.id,"status":o.status,"role":"handler","action":action,"actorId":actor,"amountUnits":o.amount_units.to_string(),"payMinor":o.pay_minor,"currency":o.currency}),
                 time,
             )?;
         }
@@ -1498,7 +1498,6 @@ pub(crate) fn tick_tx(conn: &Connection, time: &str) -> Result<(), AppError> {
         .map_err(db_error("record C2C overdue escalation"))?;
     }
     conn.execute("DELETE FROM market_c2c_attempts WHERE id IN(SELECT id FROM market_c2c_attempts WHERE julianday(created_at)<julianday(?1)-2 LIMIT 1000)",params![time]).map_err(db_error("prune C2C rate records"))?;
-    conn.execute("DELETE FROM market_c2c_challenges WHERE id IN(SELECT id FROM market_c2c_challenges WHERE julianday(expires_at)<julianday(?1)-30 AND consumed_at IS NULL LIMIT 1000)",params![time]).map_err(db_error("prune unused C2C release codes"))?;
     conn.execute("DELETE FROM market_c2c_quotes WHERE id IN(SELECT q.id FROM market_c2c_quotes q WHERE julianday(expires_at)<julianday(?1)-30 AND NOT EXISTS(SELECT 1 FROM market_c2c_orders o WHERE o.quote_id=q.id) LIMIT 1000)",params![time]).map_err(db_error("prune unused C2C quotes"))?;
     Ok(())
 }

@@ -1,5 +1,5 @@
 //! Authenticated, no-store C2C projections. Every financial mutation uses one
-//! IMMEDIATE transaction; external email delivery never holds the DB lock.
+//! IMMEDIATE transaction; email delivery never authorizes or blocks money.
 use super::*;
 use crate::{ServerState, db::TransactionBehavior};
 use axum::{
@@ -8,7 +8,6 @@ use axum::{
     http::{HeaderMap, header},
     routing::{get, post},
 };
-use rand::Rng;
 use std::net::SocketAddr;
 
 type Reply<T> = Result<([(header::HeaderName, String); 2], Json<T>), AppError>;
@@ -44,23 +43,6 @@ async fn write<T>(
     tx.commit().map_err(db_error("commit C2C write"))?;
     Ok(value)
 }
-fn email_ready(state: &ServerState) -> bool {
-    state
-        .config
-        .resend_api_key
-        .as_deref()
-        .is_some_and(|v| !v.trim().is_empty())
-        && crate::notifications::notification_sender(&state.config).is_some()
-}
-fn require_email(state: &ServerState) -> Result<(), AppError> {
-    if !email_ready(state) {
-        return Err(problem(
-            "C2C_EMAIL_UNAVAILABLE",
-            "release verification email is not configured",
-        ));
-    }
-    Ok(())
-}
 pub fn router() -> Router<ServerState> {
     Router::new()
         .route("/v1/market-wallet/c2c/policy", get(policy))
@@ -83,10 +65,6 @@ pub fn router() -> Router<ServerState> {
         .route("/v1/market-wallet/c2c/orders/:id/late-payment", post(late))
         .route("/v1/market-wallet/c2c/orders/:id/notes", post(note))
         .route("/v1/market-wallet/c2c/orders/:id/events", get(events))
-        .route(
-            "/v1/market-wallet/c2c/orders/:id/release-code",
-            post(send_code),
-        )
         .route("/v1/market-wallet/c2c/orders/:id/release", post(release))
         .route(
             "/v1/admin/market-finance/c2c/policy",
@@ -116,15 +94,12 @@ async fn policy(State(state): State<ServerState>, headers: HeaderMap) -> Reply<s
     let u = session(&state, &headers).await?;
     let admins = state.dynamic.read().await.admin_emails.clone();
     let conn = state.store.conn.lock().await;
-    let mut blockers = participation_blockers_tx(&conn, &u.user_id)?;
+    let blockers = participation_blockers_tx(&conn, &u.user_id)?;
     let verified = match verified_tx(&conn, &u.user_id) {
         Ok(_) => true,
         Err(error) if error.code() == Some("C2C_IDENTITY") => false,
         Err(error) => return Err(error),
     };
-    if !email_ready(&state) {
-        blockers.push("C2C_EMAIL_UNAVAILABLE");
-    }
     Ok(reply(
         serde_json::json!({"policy":policy_tx(&conn)?,"available":blockers.is_empty(),"blockers":blockers,
         "canManagePolicy":crate::api::is_finance_owner(&state.config,&u.email),
@@ -135,10 +110,7 @@ async fn policy(State(state): State<ServerState>, headers: HeaderMap) -> Reply<s
 async fn seller(State(state): State<ServerState>, headers: HeaderMap) -> Reply<serde_json::Value> {
     let u = session(&state, &headers).await?;
     let conn = state.store.conn.lock().await;
-    let mut blockers = seller_blockers_tx(&conn, &u.user_id, &crate::market_wallet::now())?;
-    if !email_ready(&state) {
-        blockers.push("C2C_EMAIL_UNAVAILABLE");
-    }
+    let blockers = seller_blockers_tx(&conn, &u.user_id, &crate::market_wallet::now())?;
     let time = crate::market_wallet::now();
     let pending:i64=conn.query_row("SELECT COUNT(*) FROM market_c2c_orders WHERE seller_id=?1 AND status IN ('awaiting_seller','awaiting_payment','paid','disputed')",params![u.user_id],|r|r.get(0)).map_err(db_error("count C2C seller work"))?;
     let p = policy_tx(&conn)?;
@@ -175,10 +147,7 @@ async fn save_seller(
     headers: HeaderMap,
     Json(input): Json<SellerInput>,
 ) -> Reply<Seller> {
-    let u = session(&state, &headers).await?;
-    if input.enabled {
-        require_email(&state)?;
-    }
+    let u = crate::market_finance_auth::write_session(&state, &headers).await?;
     Ok(reply(
         write(&state, |conn| {
             save_seller_tx(conn, &u.user_id, &input, &crate::market_wallet::now())
@@ -199,7 +168,7 @@ async fn pause_seller(
     headers: HeaderMap,
     Json(input): Json<PauseSeller>,
 ) -> Reply<Seller> {
-    let u = session(&state, &headers).await?;
+    let u = crate::market_finance_auth::write_session(&state, &headers).await?;
     Ok(reply(
         write(&state, |conn| {
             pause_seller_tx(
@@ -217,8 +186,7 @@ async fn resume_seller(
     headers: HeaderMap,
     Json(input): Json<PauseSeller>,
 ) -> Reply<Seller> {
-    let u = session(&state, &headers).await?;
-    require_email(&state)?;
+    let u = crate::market_finance_auth::write_session(&state, &headers).await?;
     Ok(reply(
         write(&state, |c| {
             resume_seller_tx(
@@ -275,8 +243,7 @@ async fn quote(
     headers: HeaderMap,
     Json(input): Json<QuoteInput>,
 ) -> Reply<Quote> {
-    let u = session(&state, &headers).await?;
-    require_email(&state)?;
+    let u = crate::market_finance_auth::write_session(&state, &headers).await?;
     Ok(reply(
         write(&state, |conn| {
             quote_tx(conn, &u.user_id, &input, &crate::market_wallet::now())
@@ -290,7 +257,7 @@ async fn create(
     headers: HeaderMap,
     Json(input): Json<CreateInput>,
 ) -> Reply<Order> {
-    let u = session(&state, &headers).await?;
+    let u = crate::market_finance_auth::write_session(&state, &headers).await?;
     let key = headers
         .get("Idempotency-Key")
         .and_then(|v| v.to_str().ok())
@@ -298,12 +265,20 @@ async fn create(
     let ip = crate::client_meta::extract_client_metadata(&headers, peer)
         .ip
         .unwrap_or_else(|| peer.ip().to_string());
-    // Recovery must work even after email configuration or finance was paused.
-    Ok(reply(write(&state,|conn| {
-        let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM market_c2c_orders WHERE buyer_id=?1 AND (quote_id=?2 OR idempotency_key=?3))",params![u.user_id,input.quote_id,key],|r|r.get(0)).map_err(db_error("check C2C replay"))?;
-        if !exists {require_email(&state)?;}
-        create_tx(conn,&u.user_id,&input,key,&ip,&crate::market_wallet::now())
-    }).await?))
+    // A successful replay remains available after finance was paused.
+    Ok(reply(
+        write(&state, |conn| {
+            create_tx(
+                conn,
+                &u.user_id,
+                &input,
+                key,
+                &ip,
+                &crate::market_wallet::now(),
+            )
+        })
+        .await?,
+    ))
 }
 fn list_tx(conn: &Connection, user: Option<&str>, p: &Page) -> Result<serde_json::Value, AppError> {
     if !matches!(
@@ -386,7 +361,7 @@ async fn accept(
     Path(id): Path<String>,
     Json(a): Json<Action>,
 ) -> Reply<Order> {
-    let u = session(&state, &headers).await?;
+    let u = crate::market_finance_auth::write_session(&state, &headers).await?;
     Ok(reply(
         write(&state, |c| {
             let o = owned_tx(c, &id, &u.user_id)?;
@@ -407,7 +382,7 @@ async fn reject(
     Path(id): Path<String>,
     Json(a): Json<Action>,
 ) -> Reply<Order> {
-    let u = session(&state, &headers).await?;
+    let u = crate::market_finance_auth::write_session(&state, &headers).await?;
     Ok(reply(
         write(&state, |c| {
             let o = owned_tx(c, &id, &u.user_id)?;
@@ -434,7 +409,7 @@ async fn paid(
     Path(id): Path<String>,
     Json(a): Json<Action>,
 ) -> Reply<Order> {
-    let u = session(&state, &headers).await?;
+    let u = crate::market_finance_auth::write_session(&state, &headers).await?;
     Ok(reply(
         write(&state, |c| {
             let o = owned_tx(c, &id, &u.user_id)?;
@@ -455,7 +430,7 @@ async fn cancel(
     Path(id): Path<String>,
     Json(a): Json<Action>,
 ) -> Reply<Order> {
-    let u = session(&state, &headers).await?;
+    let u = crate::market_finance_auth::write_session(&state, &headers).await?;
     Ok(reply(
         write(&state, |c| {
             let o = owned_tx(c, &id, &u.user_id)?;
@@ -478,7 +453,7 @@ async fn dispute(
     Path(id): Path<String>,
     Json(a): Json<Action>,
 ) -> Reply<Order> {
-    let u = session(&state, &headers).await?;
+    let u = crate::market_finance_auth::write_session(&state, &headers).await?;
     Ok(reply(
         write(&state, |c| {
             let o = owned_tx(c, &id, &u.user_id)?;
@@ -494,7 +469,7 @@ async fn late(
     Path(id): Path<String>,
     Json(a): Json<Action>,
 ) -> Reply<Order> {
-    let u = session(&state, &headers).await?;
+    let u = crate::market_finance_auth::write_session(&state, &headers).await?;
     Ok(reply(
         write(&state, |c| {
             let o = owned_tx(c, &id, &u.user_id)?;
@@ -510,7 +485,7 @@ async fn note(
     Path(id): Path<String>,
     Json(a): Json<Action>,
 ) -> Reply<Order> {
-    let u = session(&state, &headers).await?;
+    let u = crate::market_finance_auth::write_session(&state, &headers).await?;
     Ok(reply(write(&state,|c| {
         let o=owned_tx(c,&id,&u.user_id)?;current(&o,&a)?;
         let time=crate::market_wallet::now();
@@ -552,162 +527,71 @@ async fn events(
     owned_tx(&c, &id, &u.user_id)?;
     Ok(reply(events_tx(&c, &id, &p.before)?))
 }
-fn binding(o: &Order) -> String {
-    format!(
-        "c2c-release:{}:{}:{}:{}:{}",
-        o.id, o.seller_id, o.buyer_id, o.amount_units, o.version
-    )
-}
-#[cfg(test)]
-pub(super) fn binding_for_test(o: &Order) -> String {
-    binding(o)
-}
-async fn send_code(
-    State(state): State<ServerState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-    Json(a): Json<Action>,
-) -> Reply<serde_json::Value> {
-    let u = session(&state, &headers).await?;
-    require_email(&state)?;
-    let code = zeroize::Zeroizing::new(format!(
-        "{:06}",
-        rand::rngs::OsRng.gen_range(0..1_000_000_u32)
-    ));
-    let cid = Uuid::new_v4().to_string();
-    let time = crate::market_wallet::now();
-    let expires = (at(&time)? + Duration::minutes(10)).to_rfc3339();
-    let ip = crate::client_meta::extract_client_metadata(&headers, peer)
-        .ip
-        .unwrap_or_else(|| peer.ip().to_string());
-    let (email,o)=write(&state,|c| {
-        let o=owned_tx(c,&id,&u.user_id)?;current(&o,&a)?;
-        if o.seller_id!=u.user_id || !matches!(o.status.as_str(),"paid"|"disputed") || (o.flow_version==2 && o.accepted_at.is_none()) {return Err(AppError::Forbidden("only the seller of an accepted order may authorize release after payment was declared".into()));}
-        safe_tx(c,&o.seller_id,&o.buyer_id)?;
-        let email=verified_tx(c,&u.user_id)?;
-        let (soon,count):(bool,i64)=c.query_row("SELECT EXISTS(SELECT 1 FROM market_c2c_challenges WHERE seller_id=?1 AND julianday(created_at)>=julianday(?3)-60.0/86400),
-            (SELECT COUNT(*) FROM market_c2c_challenges WHERE (seller_id=?1 OR created_ip=?2) AND julianday(created_at)>=julianday(?3)-1.0/24)",params![u.user_id,ip,time],|r|Ok((r.get(0)?,r.get(1)?))).map_err(db_error("limit C2C release codes"))?;
-        if soon||count>=10 {return Err(AppError::TooManyRequests("wait before requesting another release code".into()));}
-        let bind=binding(&o);let (key,mac)=state.market_payments.transfer_mac(&cid,&bind,&code)?;
-        c.execute("UPDATE market_c2c_challenges SET consumed_at=?2 WHERE order_id=?1 AND consumed_at IS NULL",params![id,time]).map_err(db_error("retire C2C codes"))?;
-        c.execute("INSERT INTO market_c2c_challenges(id,order_id,seller_id,email,binding,code_mac,key_version,expires_at,created_ip,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![cid,id,u.user_id,email,bind,mac,key,expires,ip,time]).map_err(db_error("save C2C code"))?;
-        Ok((email,o))
-    }).await?;
-    let amount = format!(
-        "US${}.{:02}",
-        o.amount_units / 8_640_000,
-        (o.amount_units / 86_400) % 100
-    );
-    let text = format!(
-        "C2C 余额放行验证码：{}。订单 {}，放行金额 {amount}。请亲自核实已收到线下款项后再输入；验证码有效 10 分钟，切勿提供给买家。平台不能自动核实线下付款，放行后不可撤回。",
-        &*code, o.id
-    );
-    let html = crate::store::render_email_layout(
-        "确认 C2C 余额放行",
-        "请先核实您的收款账户，再确认放行。",
-        &format!(
-            "<p>订单 {} · 放行金额 <strong>{amount}</strong></p><p style=\"font-size:30px;font-weight:700;letter-spacing:6px\">{}</p><p>10 分钟内有效。请亲自核实已收到线下款项；不要将验证码提供给买家。放行后不可撤回。</p>",
-            o.id, &*code
-        ),
-    );
-    let from = crate::notifications::notification_sender(&state.config)
-        .ok_or_else(|| problem("C2C_EMAIL_UNAVAILABLE", "email sender is missing"))?;
-    crate::notifications::send_resend_frozen_email(
-        &state.proxy_http,
-        state.config.resend_api_key.as_deref().unwrap_or(""),
-        crate::notifications::FrozenEmailEnvelope {
-            from: &from,
-            recipient: &email,
-            subject: "确认 C2C 余额放行 · TokenSwitch",
-            html: &html,
-            text: &text,
-            reply_to: state.config.resend_reply_to.as_deref(),
-            idempotency_key: &format!("c2c-release-code:{cid}"),
-        },
-    )
-    .await
-    .map_err(|_| {
-        problem(
-            "C2C_EMAIL_UNAVAILABLE",
-            "release code was not delivered; the reservation is unchanged",
-        )
-    })?;
-    write(&state, |c| {
-        c.execute(
-            "UPDATE market_c2c_challenges SET delivered_at=?2 WHERE id=?1 AND consumed_at IS NULL",
-            params![cid, crate::market_wallet::now()],
-        )
-        .map_err(db_error("record C2C code delivery"))?;
-        Ok(())
-    })
-    .await?;
-    Ok(reply(
-        serde_json::json!({"id":cid,"expiresAt":expires,"resendAfterSeconds":60}),
-    ))
-}
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct ReleaseInput {
     pub(super) expected_version: i64,
-    pub(super) challenge_id: String,
-    pub(super) code: String,
     pub(super) acknowledge_received: bool,
 }
 pub(super) fn release_authorized_tx(
     c: &Connection,
-    runtime: &crate::market_payments::MarketPaymentsRuntime,
+    authorization: &crate::models::AuthSession,
     user: &str,
     id: &str,
     a: &ReleaseInput,
     time: &str,
-) -> Result<Option<Order>, AppError> {
+) -> Result<Order, AppError> {
     let o = owned_tx(c, id, user)?;
-    if o.seller_id != user || !a.acknowledge_received {
+    if authorization.user_id != user || o.seller_id != user || !a.acknowledge_received {
         return Err(AppError::Forbidden(
-            "only the seller who verified receipt may release".into(),
+            "only the logged-in seller who verified receipt may release".into(),
         ));
     }
+    verified_tx(c, user)?;
+    // Retry a committed release without requiring the old order version.
     if o.status == "released" {
-        return Ok(Some(o));
+        return Ok(o);
     }
     if o.version != a.expected_version {
         return Err(problem(
             "C2C_STALE",
-            "order changed; request a new release code",
+            "order changed; review it before releasing",
         ));
     }
-    let saved:Option<(String,String,i64,i64,String,bool,bool,String)>=c.query_row("SELECT binding,code_mac,key_version,attempts,expires_at,delivered_at IS NOT NULL,consumed_at IS NOT NULL,email FROM market_c2c_challenges WHERE id=?1 AND order_id=?2 AND seller_id=?3",params![a.challenge_id,id,user],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))).optional().map_err(db_error("read C2C release code"))?;
-    let Some((bind, mac, key, attempts, expires, delivered, consumed, email)) = saved else {
-        return Ok(None);
-    };
-    if consumed
-        || !delivered
-        || attempts >= 5
-        || at(&expires)? <= at(time)?
-        || bind != binding(&o)
-        || verified_tx(c, user)? != email
+    if !matches!(o.status.as_str(), "paid" | "disputed")
+        || (o.flow_version == 2 && o.accepted_at.is_none())
     {
-        return Ok(None);
+        return Err(problem(
+            "C2C_PAYMENT_HOLD",
+            "payment must be declared for an accepted order before release",
+        ));
     }
-    c.execute(
-        "UPDATE market_c2c_challenges SET attempts=attempts+1 WHERE id=?1",
-        params![a.challenge_id],
-    )
-    .map_err(db_error("count C2C code attempt"))?;
-    if a.code.len() != 6
-        || !a.code.bytes().all(|b| b.is_ascii_digit())
-        || !runtime.verify_transfer_mac(key, &a.challenge_id, &bind, &a.code, &mac)?
-    {
-        return Ok(None);
+    let fingerprint = format!(
+        "{}:{}:{}:{}",
+        o.seller_id, o.buyer_id, o.amount_units, o.quote_id
+    );
+    let proof = crate::market_finance_auth::record_tx(
+        c,
+        authorization,
+        user,
+        "c2c_release",
+        &o.id,
+        &o.buyer_id,
+        o.amount_units,
+        o.version,
+        &fingerprint,
+        "receipt_confirmed",
+        time,
+    )?;
+    let changed=c.execute("UPDATE market_c2c_orders SET release_authorization_id=?3 WHERE id=?1 AND version=?2 AND release_authorization_id IS NULL",
+        params![o.id,o.version,proof]).map_err(db_error("bind C2C session authorization"))?;
+    if changed != 1 {
+        return Err(problem(
+            "C2C_STALE",
+            "order changed; review it before releasing",
+        ));
     }
-    let result = release_tx(c, &o, user, time)?;
-    c.execute(
-        "UPDATE market_c2c_challenges SET consumed_at=?2 WHERE id=?1",
-        params![a.challenge_id, time],
-    )
-    .map_err(db_error("consume C2C code"))?;
-    Ok(Some(result))
+    release_tx(c, &o, user, time)
 }
 async fn release(
     State(state): State<ServerState>,
@@ -715,26 +599,13 @@ async fn release(
     Path(id): Path<String>,
     Json(a): Json<ReleaseInput>,
 ) -> Reply<Order> {
-    let u = session(&state, &headers).await?;
-    // Commit failed-code attempts too. Returning an error inside write would
-    // roll them back and permit unlimited brute force.
-    let result = write(&state, |c| {
-        release_authorized_tx(
-            c,
-            &state.market_payments,
-            &u.user_id,
-            &id,
-            &a,
-            &crate::market_wallet::now(),
-        )
-    })
-    .await?;
-    Ok(reply(result.ok_or_else(|| {
-        problem(
-            "C2C_CODE_INVALID",
-            "release code is invalid or expired; request a new code",
-        )
-    })?))
+    let u = crate::market_finance_auth::write_session(&state, &headers).await?;
+    Ok(reply(
+        write(&state, |c| {
+            release_authorized_tx(c, &u, &u.user_id, &id, &a, &crate::market_wallet::now())
+        })
+        .await?,
+    ))
 }
 async fn admin_policy(
     State(state): State<ServerState>,
@@ -743,7 +614,7 @@ async fn admin_policy(
     let u = crate::api::require_admin_session(&state, &headers).await?;
     let c = state.store.conn.lock().await;
     Ok(reply(
-        serde_json::json!({"policy":policy_tx(&c)?,"canManage":crate::api::is_finance_owner(&state.config,&u.email),"canResolve":crate::api::is_finance_owner(&state.config,&u.email)||dispute_handler_tx(&c,&u.user_id)?,"emailReady":email_ready(&state)}),
+        serde_json::json!({"policy":policy_tx(&c)?,"canManage":crate::api::is_finance_owner(&state.config,&u.email),"canResolve":crate::api::is_finance_owner(&state.config,&u.email)||dispute_handler_tx(&c,&u.user_id)?}),
     ))
 }
 fn independent_handler_tx(
@@ -792,7 +663,7 @@ async fn save_handler(
     headers: HeaderMap,
     Json(input): Json<HandlerInput>,
 ) -> Reply<serde_json::Value> {
-    let u = crate::api::require_owner_session(&state, &headers).await?;
+    let u = crate::market_finance_auth::write_owner_session(&state, &headers).await?;
     let email = input.email.trim().to_ascii_lowercase();
     if input.enabled
         && (!state.dynamic.read().await.is_admin(&email)
@@ -829,10 +700,7 @@ async fn save_policy(
     headers: HeaderMap,
     Json(p): Json<Policy>,
 ) -> Reply<Policy> {
-    let u = crate::api::require_owner_session(&state, &headers).await?;
-    if p.enabled {
-        require_email(&state)?;
-    }
+    let u = crate::market_finance_auth::write_owner_session(&state, &headers).await?;
     Ok(reply(
         write(&state, |c| {
             save_policy_tx(c, &u.user_id, &p, &crate::market_wallet::now())
@@ -890,7 +758,7 @@ async fn resolve(
     Path(id): Path<String>,
     Json(a): Json<Resolution>,
 ) -> Reply<Order> {
-    let u = crate::api::require_admin_session(&state, &headers).await?;
+    let u = crate::market_finance_auth::write_admin_session(&state, &headers).await?;
     Ok(reply(
         write(&state, |c| {
             if !crate::api::is_finance_owner(&state.config, &u.email)
@@ -946,13 +814,13 @@ async fn suspend(
     Path(id): Path<String>,
     Json(a): Json<Suspension>,
 ) -> Reply<serde_json::Value> {
-    let u = crate::api::require_owner_session(&state, &headers).await?;
+    let u = crate::market_finance_auth::write_owner_session(&state, &headers).await?;
     write(&state,|c| {
         let reason=text(&a.reason,500)?;
         let count=c.execute("UPDATE market_c2c_sellers SET suspended=?3,enabled=0,auto_pause_reason=NULL,auto_paused_at=NULL,auto_pause_order_id=NULL,version=version+1,updated_at=?4 WHERE user_id=?1 AND version=?2",params![id,a.expected_version,a.suspended,crate::market_wallet::now()]).map_err(db_error("suspend C2C seller"))?;
         if count!=1{return Err(problem("C2C_STALE","seller changed; reload"));}
         audit_tx(c,&u.user_id,if a.suspended{"suspend"}else{"unsuspend"},"c2c_seller",&id,&reason,&crate::market_wallet::now())?;
-        crate::market_notifications::enqueue_user_notification_tx(c,"buyer",&id,"c2c_seller_changed","c2c_seller",&id,&format!("c2c-suspension:{id}:{}",a.expected_version+1),serde_json::json!({}),&crate::market_wallet::now())?;Ok(())
+        crate::market_notifications::enqueue_user_notification_tx(c,"buyer",&id,"c2c_seller_changed","c2c_seller",&id,&format!("c2c-suspension:{id}:{}",a.expected_version+1),serde_json::json!({"reason":if a.suspended{"suspended"}else{"unsuspended"}}),&crate::market_wallet::now())?;Ok(())
     }).await?;
     Ok(reply(serde_json::json!({"ok":true})))
 }

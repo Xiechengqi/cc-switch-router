@@ -18,10 +18,8 @@ import {
   confirmWalletTransfer,
   getTransferCapacity,
   quoteWalletTransfer,
-  sendWalletTransferCode,
   type TransferCapacity,
   type TransferQuote,
-  type TransferChallenge,
 } from "@/lib/wallet-policy-api";
 
 export function WalletTransferPanel({
@@ -37,17 +35,11 @@ export function WalletTransferPanel({
   const [amount, setAmount] = React.useState("");
   const [all, setAll] = React.useState(false);
   const [quote, setQuote] = React.useState<TransferQuote | null>(null);
-  const [challenge, setChallenge] = React.useState<TransferChallenge | null>(
-    null,
-  );
-  const [code, setCode] = React.useState("");
   const [busy, setBusy] = React.useState("");
   const [error, setError] = React.useState("");
   const [success, setSuccess] = React.useState("");
   const [now, setNow] = React.useState(Date.now());
-  const [resendAt, setResendAt] = React.useState(0);
   const [reload, setReload] = React.useState(0);
-  const codeRef = React.useRef<HTMLInputElement>(null);
   const dialog = React.useRef<HTMLDialogElement>(null);
   const busyRef = React.useRef(false);
   const keyRef = React.useRef("");
@@ -69,9 +61,6 @@ export function WalletTransferPanel({
     };
   }, [walletVersion, reload]);
   React.useEffect(() => {
-    if (challenge) codeRef.current?.focus();
-  }, [challenge]);
-  React.useEffect(() => {
     if (quote && dialog.current && !dialog.current.open)
       dialog.current.showModal();
     if (!quote && dialog.current?.open) dialog.current.close();
@@ -84,9 +73,7 @@ export function WalletTransferPanel({
   const fail = (cause: unknown) => {
     const key = cause instanceof ApiError ? cause.code : null;
     setError(
-      key === "WALLET_TRANSFER_CODE_INVALID"
-        ? t("walletTransfer.badCode")
-        : key === "WALLET_TRANSFER_INSUFFICIENT"
+      key === "WALLET_TRANSFER_INSUFFICIENT"
           ? t("walletTransfer.insufficient")
           : key === "WALLET_TRANSFER_USER_UNVERIFIED"
             ? t("walletTransfer.verify")
@@ -94,8 +81,7 @@ export function WalletTransferPanel({
               ? t("walletTransfer.recipientUnavailable")
               : key === "WALLET_TRANSFER_PAUSED"
                 ? t("walletTransfer.paused")
-                : key === "WALLET_TRANSFER_QUOTE_EXPIRED" ||
-                    key === "WALLET_TRANSFER_CODE_EXPIRED"
+                : key === "WALLET_TRANSFER_QUOTE_EXPIRED"
                   ? t("walletTransfer.expired")
                   : cause instanceof Error
                     ? cause.message
@@ -119,8 +105,6 @@ export function WalletTransferPanel({
   const close = () => {
     if (!busyRef.current) {
       setQuote(null);
-      setChallenge(null);
-      setCode("");
       setError("");
     }
   };
@@ -134,30 +118,16 @@ export function WalletTransferPanel({
         all,
       );
       keyRef.current = crypto.randomUUID();
-      setChallenge(null);
-      setCode("");
       setNow(Date.now());
-      setResendAt(0);
       setQuote(value);
     });
   };
-  const send = () =>
-    void run("code", async () => {
-      if (!quote) return;
-      const value = await sendWalletTransferCode(quote.id);
-      setChallenge(value);
-      setCode("");
-      setNow(Date.now());
-      setResendAt(Date.now() + value.resendAfterSeconds * 1000);
-    });
   const confirm = (event: React.FormEvent) => {
     event.preventDefault();
     void run("confirm", async () => {
-      if (!quote || !challenge) return;
+      if (!quote) return;
       const value = await confirmWalletTransfer(
         quote.id,
-        challenge.id,
-        code.trim(),
         keyRef.current,
       );
       setSuccess(
@@ -167,8 +137,6 @@ export function WalletTransferPanel({
         }),
       );
       setQuote(null);
-      setChallenge(null);
-      setCode("");
       setAmount("");
       setAll(false);
       // Receipts and view refreshes are not allowed to repeat the money action.
@@ -182,8 +150,6 @@ export function WalletTransferPanel({
     });
   };
   const expired = !!quote && Date.parse(quote.expiresAt) <= now;
-  const codeExpired = !!challenge && Date.parse(challenge.expiresAt) <= now;
-  const wait = Math.max(0, Math.ceil((resendAt - now) / 1000));
   const enabled = capacity?.enabled && capacity.verified;
   return (
     <section id="wallet-transfer" className="grid min-w-0 gap-4 rounded-xl border border-border bg-card p-5">
@@ -224,8 +190,7 @@ export function WalletTransferPanel({
       ) : !enabled ? (
         <p className="text-sm text-muted-foreground">
           {t(
-            capacity.blockers?.[0] === "email_unavailable" ? "walletTransfer.emailUnavailable"
-              : capacity.blockers?.[0] === "finance_hold" ? "walletTransfer.financeHold"
+            capacity.blockers?.[0] === "finance_hold" ? "walletTransfer.financeHold"
               : !capacity.verified
               ? "walletTransfer.verify"
               : "walletTransfer.paused",
@@ -336,75 +301,17 @@ export function WalletTransferPanel({
                 {error}
               </p>
             ) : null}
-            {expired || codeExpired ? (
+            {expired ? (
               <p role="status" className="text-sm text-destructive">
                 {t("walletTransfer.expired")}
               </p>
             ) : null}
-            {challenge ? (
-              <form onSubmit={confirm} className="grid min-w-0 gap-3">
-                <label className="grid min-w-0 gap-1 text-sm">
-                  <span>{t("walletTransfer.code")}</span>
-                  <input
-                    ref={codeRef}
-                    autoComplete="one-time-code"
-                    inputMode="numeric"
-                    maxLength={6}
-                    pattern="[0-9]{6}"
-                    required
-                    value={code}
-                    onChange={(event) =>
-                      setCode(event.target.value.replace(/\D/g, ""))
-                    }
-                    className={WALLET_INPUT}
-                    disabled={!!busy}
-                  />
-                  <span className="break-all text-xs leading-5 text-muted-foreground">
-                    {t("walletTransfer.codeHelp", { email: quote.senderEmail })}
-                  </span>
-                </label>
-                <Button
-                  type="submit"
-                  variant="primary"
-                  className="min-h-11 whitespace-nowrap"
-                  isDisabled={
-                    !!busy || expired || codeExpired || !/^\d{6}$/.test(code)
-                  }
-                >
-                  {busy === "confirm" ? (
-                    <Loader2 className="size-4 animate-spin motion-reduce:animate-none" />
-                  ) : null}
-                  {t("walletTransfer.confirm", {
-                    amount: formatWalletUnits(quote.amountUnits),
-                  })}
-                </Button>
-                <Button
-                  variant="ghost"
-                  className="min-h-11 whitespace-nowrap"
-                  onPress={send}
-                  isDisabled={!!busy || expired || wait > 0}
-                >
-                  {t(
-                    wait
-                      ? "walletTransfer.resendWait"
-                      : "walletTransfer.resend",
-                    { seconds: wait },
-                  )}
-                </Button>
-              </form>
-            ) : (
-              <Button
-                variant="primary"
-                className="min-h-11 whitespace-nowrap"
-                onPress={send}
-                isDisabled={!!busy || expired}
-              >
-                {busy === "code" ? (
-                  <Loader2 className="size-4 animate-spin motion-reduce:animate-none" />
-                ) : null}
-                {t("walletTransfer.sendCode")}
+            <form onSubmit={confirm} className="grid min-w-0 gap-3">
+              <Button type="submit" variant="primary" className="min-h-11 whitespace-nowrap" isDisabled={!!busy || expired}>
+                {busy === "confirm" ? <Loader2 className="size-4 animate-spin motion-reduce:animate-none" aria-hidden /> : null}
+                {t("walletTransfer.confirm", { amount: formatWalletUnits(quote.amountUnits) })}
               </Button>
-            )}
+            </form>
             <Button
               variant="ghost"
               className="min-h-11 whitespace-nowrap"
