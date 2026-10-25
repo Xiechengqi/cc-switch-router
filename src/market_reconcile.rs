@@ -803,8 +803,7 @@ mod tests {
 
     #[test]
     fn internal_audit_finds_projection_drift_and_blocks_new_money() {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::schema::apply(&conn).unwrap();
+        let conn = crate::test_support::database().unwrap();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .unwrap();
@@ -847,8 +846,7 @@ mod tests {
 
     #[test]
     fn broken_journal_seal_still_freezes_every_scope() {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::schema::apply(&conn).unwrap();
+        let conn = crate::test_support::database().unwrap();
         case_tx(&conn, "journal_unsealed", "journal", "j1", "2026-01-01").unwrap();
         for scope in [
             FinanceScope::User("u"),
@@ -878,8 +876,7 @@ mod tests {
 
     #[test]
     fn payout_receipt_case_requires_matching_reference_amount_and_network() {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::schema::apply(&conn).unwrap();
+        let conn = crate::test_support::database().unwrap();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .unwrap();

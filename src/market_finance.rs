@@ -922,8 +922,7 @@ mod tests {
 
     #[test]
     fn metered_earning_unlocks_only_seven_days_after_debit_and_delivery() {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::schema::apply(&conn).unwrap();
+        let conn = crate::test_support::database().unwrap();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .unwrap();

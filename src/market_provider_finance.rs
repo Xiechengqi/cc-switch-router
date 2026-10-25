@@ -287,8 +287,7 @@ mod tests {
     use super::*;
     #[test]
     fn paid_provider_needs_identity_but_never_a_payout_address() {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::schema::apply(&conn).unwrap();
+        let conn = crate::test_support::database().unwrap();
         assert!(require_paid_offer_setup_tx(&conn, "provider").is_err());
         conn.execute("INSERT INTO users (id,email_normalized,status,email_verified_at,created_at,last_login_at)
             VALUES ('provider','provider@example.test','active','t','t','t')",[]).unwrap();
@@ -320,8 +319,7 @@ mod tests {
 
     #[test]
     fn earning_pages_are_owner_scoped_and_report_credit_without_payout_capabilities() {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::schema::apply(&conn).unwrap();
+        let conn = crate::test_support::database().unwrap();
         let at = "2026-10-01T00:00:00Z";
         for user in ["provider", "buyer", "other"] {
             conn.execute("INSERT INTO users(id,email_normalized,status,email_verified_at,created_at,last_login_at)

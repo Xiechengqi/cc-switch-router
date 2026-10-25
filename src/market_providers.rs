@@ -879,10 +879,9 @@ mod tests {
     use super::*;
 
     fn database() -> crate::db::Connection {
-        let conn = crate::db::Connection::open_in_memory().expect("open Provider test database");
+        let conn = crate::test_support::database().expect("copy Provider test database");
         conn.pragma_update(None, "foreign_keys", "ON")
             .expect("enable foreign keys");
-        crate::schema::apply(&conn).expect("install schema");
         conn
     }
 

@@ -5,6 +5,11 @@ const isDev = process.env.NODE_ENV === "development";
 const nextConfig = {
   output: "export",
   trailingSlash: true,
+  // Next 16 leaves production Turbopack disk caching off by default. The CI
+  // cache is lockfile/config-scoped; never restore an old exported application.
+  experimental: {
+    turbopackFileSystemCacheForBuild: process.env.CI === "true",
+  },
   allowedDevOrigins: ["cc"],
   images: {
     unoptimized: true,

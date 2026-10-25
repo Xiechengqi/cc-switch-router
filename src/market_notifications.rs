@@ -1162,9 +1162,7 @@ mod tests {
     use super::*;
 
     fn memory() -> Connection {
-        let conn = Connection::open_in_memory().expect("open notification DB");
-        crate::schema::apply(&conn).expect("apply schema");
-        conn
+        crate::test_support::database().expect("copy notification schema")
     }
 
     #[test]

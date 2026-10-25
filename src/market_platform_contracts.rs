@@ -3445,9 +3445,7 @@ mod tests {
     use crate::market_wallet::{credit_verified_topup_tx, reconcile_wallet_tx, wallet_snapshot_tx};
 
     fn memory() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::schema::apply(&conn).unwrap();
-        conn
+        crate::test_support::database().unwrap()
     }
 
     #[test]

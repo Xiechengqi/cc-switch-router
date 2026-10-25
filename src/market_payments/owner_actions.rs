@@ -575,9 +575,7 @@ mod tests {
     use super::*;
 
     fn memory() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::schema::apply(&conn).unwrap();
-        conn
+        crate::test_support::database().unwrap()
     }
 
     fn seed(conn: &Connection, status: &str) {

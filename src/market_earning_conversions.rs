@@ -939,7 +939,7 @@ mod tests {
         verify_balances_tx(&conn, "provider").unwrap();
     }
     fn fixture(rate: i64, kind: &str) -> (Connection, String) {
-        fixture_on(Connection::open_in_memory().unwrap(), rate, kind)
+        fixture_on(crate::test_support::database().unwrap(), rate, kind)
     }
     fn fixture_on(conn: Connection, rate: i64, kind: &str) -> (Connection, String) {
         crate::schema::apply(&conn).unwrap();
@@ -1678,7 +1678,11 @@ mod tests {
             std::env::temp_dir().join(format!("router-conversion-race-{}", Uuid::new_v4()));
         std::fs::create_dir(&directory).unwrap();
         let path = directory.join("finance.sqlite");
-        let (conn, _) = fixture_on(Connection::open(&path).unwrap(), 1000, "share");
+        let (conn, _) = fixture_on(
+            crate::test_support::database_at(&path).unwrap(),
+            1000,
+            "share",
+        );
         let quotes = [preview(&conn, Some(600)), preview(&conn, Some(600))];
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
         let tasks = (0..2)

@@ -7597,9 +7597,7 @@ mod tests {
     use crate::market_wallet::{reconcile_wallet_tx, wallet_snapshot_tx};
 
     fn memory() -> Connection {
-        let conn = Connection::open_in_memory().expect("open finance DB");
-        crate::schema::apply(&conn).expect("apply finance schema");
-        conn
+        crate::test_support::database().expect("copy finance schema")
     }
 
     #[test]

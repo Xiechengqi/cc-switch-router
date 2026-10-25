@@ -70,6 +70,8 @@ mod ssh;
 mod startup_config;
 mod store;
 mod telegram;
+#[cfg(test)]
+mod test_support;
 mod usage_account;
 mod user_notification_health;
 
@@ -1525,6 +1527,13 @@ async fn try_handle_cli() -> Result<bool> {
     };
 
     match arg.as_str() {
+        "build-info" => {
+            println!(
+                "{}",
+                serde_json::to_string(&crate::admin::version::build_info())?
+            );
+            Ok(true)
+        }
         "help" | "--help" | "-h" => {
             print_help();
             Ok(true)
@@ -1605,6 +1614,7 @@ Usage:
   cc-switch-router setup
   cc-switch-router check-config
   cc-switch-router check-db
+  cc-switch-router build-info
   cc-switch-router rotate-provision-ssh-key
   cc-switch-router help
   cc-switch-router --help

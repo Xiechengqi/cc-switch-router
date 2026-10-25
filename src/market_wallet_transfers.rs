@@ -764,8 +764,7 @@ pub(crate) fn verified_transfer_for_test(
 mod tests {
     use super::*;
     fn fixture() -> (Connection, crate::market_payments::MarketPaymentsRuntime) {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::schema::apply(&conn).unwrap();
+        let conn = crate::test_support::database().unwrap();
         conn.execute("UPDATE market_finance_control SET mode = 'enabled', cutover_approved_at = '2026-10-01T00:00:00Z' WHERE id = 1", []).unwrap();
         for (id, email) in [
             ("sender", "sender@example.test"),

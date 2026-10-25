@@ -2,155 +2,225 @@ name: Build and Release
 
 on:
   push:
-    branches:
-      - master
+    branches: [master]
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  build:
+  frontend:
     runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    concurrency:
+      group: router-frontend-${{ github.ref }}
+      cancel-in-progress: true
+    env:
+      NEXT_TELEMETRY_DISABLED: 1
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 1
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 24
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
-      - name: Validate repository provenance
+      - name: Validate repository provenance and CI contracts
         run: |
-          node scripts/audit/audit-source-provenance.mjs
+          bash scripts/ci/timed.sh 'Provenance audit' node scripts/audit/audit-source-provenance.mjs
           node scripts/audit/audit-provider-icon-provenance.mjs
-          node --test scripts/audit/source-provenance.test.mjs scripts/audit/provider-icon-provenance.test.mjs
+          node --test scripts/audit/source-provenance.test.mjs scripts/audit/provider-icon-provenance.test.mjs scripts/ci/ci.test.mjs
 
       - name: Cache Twemoji flag sources
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: frontend/.cache/flag-src
           key: twemoji-14.0.2-flag-src
 
-      - name: Build frontend assets
+      - name: Cache generated flags
+        uses: actions/cache@v5
+        with:
+          path: frontend/public/flags
+          key: flags-${{ runner.os }}-${{ hashFiles('frontend/scripts/raster-flags.mjs', 'frontend/scripts/flag-slugs.txt', 'frontend/package-lock.json') }}
+
+      - name: Cache Next.js build intermediates
+        uses: actions/cache@v5
+        with:
+          path: frontend/.next/cache
+          key: next-${{ runner.os }}-node24-${{ hashFiles('frontend/package-lock.json', 'frontend/next.config.mjs') }}-${{ github.sha }}
+          restore-keys: |
+            next-${{ runner.os }}-node24-${{ hashFiles('frontend/package-lock.json', 'frontend/next.config.mjs') }}-
+
+      - name: Install frontend dependencies
+        run: bash scripts/ci/timed.sh 'npm ci' npm --prefix frontend ci
+
+      - name: Test frontend units
         working-directory: frontend
         run: |
-          npm ci
-          npm run test:flags
+          bash ../scripts/ci/timed.sh 'Flags' npm run test:flags
           npm run test:token-units
           npm run test:usd-micros
           npm run test:market-wallet
           npm run test:share-model-probe
           npm run test:share-model-health-heatmap
+
+      - name: Audit frontend contracts
+        working-directory: frontend
+        run: |
           npm run audit:settings-i18n
           npm run audit:market-billing-contract
           npm run audit:web-token-units
           npm run audit:share-model-health-contract
           npm run audit:model-prices
-          npm run build
-          npm run test:wallet-checkout-browser
-          npm run test:c2c-browser
 
-      - name: Test market wallet, service commissions and migrations
-        env:
-          RUST_TEST_THREADS: 4
+      - name: Build frontend assets
+        working-directory: frontend
+        run: bash ../scripts/ci/timed.sh 'Next.js export' npm run build
+
+      - name: Upload frontend export for the same commit
+        uses: actions/upload-artifact@v6
+        with:
+          name: frontend-${{ github.sha }}
+          path: frontend/out/
+          include-hidden-files: true
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+      - name: Test wallet and C2C browser contracts
+        working-directory: frontend
         run: |
-          cargo test market_
-          cargo test schema::tests
+          bash ../scripts/ci/timed.sh 'Wallet checkout browser' npm run test:wallet-checkout-browser
+          bash ../scripts/ci/timed.sh 'C2C browser' npm run test:c2c-browser
+          bash ../scripts/ci/timed.sh 'Navbar wallet browser' npm run test:navbar-wallet-browser
+
+  rust-tests:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    concurrency:
+      group: router-tests-${{ github.ref }}
+      cancel-in-progress: true
+    env:
+      RUST_TEST_THREADS: 4
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust test dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: router-tests
+          cache-on-failure: false
+
+      - name: Compile test binary once
+        # build.rs watches this path even without embedded debug UI. A missing
+        # watched path makes Cargo rerun the build script on every test command.
+        run: |
+          mkdir -p frontend/out
+          bash scripts/ci/timed.sh 'Rust test compilation' cargo test --locked --no-run
+
+      - name: Test database adapter and isolated templates
+        run: |
+          bash scripts/ci/timed.sh 'Database adapter' cargo test --locked db::tests
+          bash scripts/ci/timed.sh 'Test database templates' cargo test --locked test_support::tests
+
+      - name: Test all market contracts
+        # Schema cases whose names contain market_ run in full in the next step.
+        run: bash scripts/ci/timed.sh 'Market contracts' cargo test --locked market_ -- --skip schema::tests
+
+      - name: Test real migrations without template shortcuts
+        run: bash scripts/ci/timed.sh 'Real schema migrations' cargo test --locked schema::tests
+
+  build:
+    needs: frontend
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    concurrency:
+      group: router-build-${{ github.ref }}
+      cancel-in-progress: true
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    env:
+      CC_SWITCH_ROUTER_BUILD_COMMIT: ${{ github.sha }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust release dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: router-release-x86_64-unknown-linux-gnu
+          cache-on-failure: false
+
+      - name: Download frontend export from this run and commit
+        uses: actions/download-artifact@v7
+        with:
+          name: frontend-${{ github.sha }}
+          path: frontend/out
 
       - name: Get version from Cargo.toml
         id: version
         run: |
-          VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "asset=cc-switch-router-linux-amd64" >> "$GITHUB_OUTPUT"
+          VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          test -n "$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Build release binary
-        run: |
-          cargo build --release --target x86_64-unknown-linux-gnu
+        run: bash scripts/ci/timed.sh 'Rust release compilation' cargo build --locked --release --target x86_64-unknown-linux-gnu
+
+      - name: Verify build identity and embedded frontend
+        run: bash scripts/ci/timed.sh 'Release artifact verification' node scripts/ci/verify-release.mjs target/x86_64-unknown-linux-gnu/release/cc-switch-router frontend/out "$GITHUB_SHA"
 
       - name: Prepare release assets
         run: |
           mkdir -p release-files
-          cp target/x86_64-unknown-linux-gnu/release/cc-switch-router "release-files/${{ steps.version.outputs.asset }}"
-          chmod +x "release-files/${{ steps.version.outputs.asset }}"
-          ls -lh release-files/
+          cp target/x86_64-unknown-linux-gnu/release/cc-switch-router release-files/cc-switch-router-linux-amd64
+          chmod +x release-files/cc-switch-router-linux-amd64
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: cc-switch-router-linux-amd64
-          path: release-files/*
+          path: release-files/cc-switch-router-linux-amd64
+          if-no-files-found: error
+          compression-level: 1
+          retention-days: 3
 
   release:
-    needs: build
+    needs: [frontend, rust-tests, build]
+    if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    # Never cancel a publication in the middle of moving a tag/uploading an
+    # asset. The script rejects old commits after acquiring this serial slot.
+    concurrency:
+      group: router-publish-latest
+      cancel-in-progress: false
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
+      - name: Download verified artifact from this run
+        uses: actions/download-artifact@v7
         with:
-          path: artifacts
+          name: cc-switch-router-linux-amd64
+          path: release-files
 
-      - name: Get version from Cargo.toml
-        id: version
-        run: |
-          VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-          echo "version=v${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "asset=cc-switch-router-linux-amd64" >> "$GITHUB_OUTPUT"
-          echo "Current version: v${VERSION}"
-
-      - name: Prepare release files
-        run: |
-          mkdir -p release-files
-          cp "artifacts/cc-switch-router-linux-amd64/${{ steps.version.outputs.asset }}" release-files/
-          ls -lh release-files/
-
-      - name: Delete existing latest release and tag
+      - name: Publish only the current master without deleting latest
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release delete latest --yes || true
-          git push origin :refs/tags/latest || true
-
-      - name: Create latest tag
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -f latest
-          git push -f origin latest
-
-      - name: Create or Update Latest Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: latest
-          name: "Latest Build (${{ steps.version.outputs.version }})"
-          body: |
-            ## Latest automated build
-
-            Version: ${{ steps.version.outputs.version }}
-            Commit: ${{ github.sha }}
-            Branch: ${{ github.ref_name }}
-
-            ### Assets
-
-            - Ubuntu AMD64 binary: `${{ steps.version.outputs.asset }}`
-
-            ### Quick download
-
-            ```bash
-            wget https://github.com/${{ github.repository }}/releases/download/latest/${{ steps.version.outputs.asset }} -O /usr/local/bin/cc-switch-router && chmod +x /usr/local/bin/cc-switch-router
-            ```
-          files: release-files/*
-          prerelease: false
-          draft: false
+          ROUTER_RELEASE_VERSION: ${{ needs.build.outputs.version }}
+        run: bash scripts/ci/timed.sh 'Publish latest' bash scripts/ci/publish-release.sh

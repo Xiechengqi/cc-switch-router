@@ -328,6 +328,10 @@ pub struct Connection {
     database: Arc<libsql::Database>,
     mode: ConnectionMode,
     health: Arc<DatabaseHealthTracker>,
+    // Keep disposable test files alive until every connection/statement clone
+    // has closed. This field and its cleanup never exist in production builds.
+    #[cfg(test)]
+    test_directory: Option<Arc<crate::test_support::TestDirectory>>,
 }
 
 impl fmt::Debug for Connection {
@@ -391,9 +395,20 @@ impl Connection {
             database,
             mode,
             health: Arc::new(DatabaseHealthTracker::available()),
+            #[cfg(test)]
+            test_directory: None,
         };
         connection.health.record_sync_success(frames_synced);
         Ok(connection)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_directory(
+        mut self,
+        directory: crate::test_support::TestDirectory,
+    ) -> Self {
+        self.test_directory = Some(Arc::new(directory));
+        self
     }
 
     pub fn health_handle(&self) -> DatabaseHealthHandle {
@@ -528,6 +543,8 @@ impl Connection {
             database: self.database.clone(),
             mode: self.mode,
             health: self.health.clone(),
+            #[cfg(test)]
+            test_directory: self.test_directory.clone(),
         };
         Ok(Transaction {
             inner: Some(transaction),

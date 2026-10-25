@@ -2941,9 +2941,7 @@ mod tests {
     use super::*;
 
     fn access_connection() -> Connection {
-        let conn = Connection::open_in_memory().expect("open in-memory database");
-        crate::schema::apply(&conn).expect("initialize database baseline");
-        conn
+        crate::test_support::database().expect("copy business database baseline")
     }
 
     fn access_request_connection() -> Connection {

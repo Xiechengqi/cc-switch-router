@@ -8,15 +8,27 @@ fn main() {
     println!("cargo:rerun-if-changed=.git/index");
     println!("cargo:rerun-if-changed=frontend/out");
     println!("cargo:rerun-if-changed=install-client.sh");
+    println!("cargo:rerun-if-env-changed=CC_SWITCH_ROUTER_BUILD_COMMIT");
 
-    let commit = Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
+    let commit = std::env::var("CC_SWITCH_ROUTER_BUILD_COMMIT")
         .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+        .map(|value| {
+            assert!(
+                value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "CC_SWITCH_ROUTER_BUILD_COMMIT must be a full Git commit SHA"
+            );
+            value[..7].to_ascii_lowercase()
+        })
+        .or_else(|| {
+            Command::new("git")
+                .args(["rev-parse", "--short", "HEAD"])
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
         .unwrap_or_else(|| "dev".to_string());
 
     let build_time = build_time_utc();

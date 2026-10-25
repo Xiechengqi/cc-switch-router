@@ -562,8 +562,7 @@ mod tests {
         rate: i64,
         trial_seconds: i64,
     ) -> (Connection, String) {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::schema::apply(&conn).unwrap();
+        let conn = crate::test_support::database().unwrap();
         set_policy_tx(&conn, 1, rate, "owner", "2026-01-01T00:00:00+00:00").unwrap();
         crate::market_wallet::credit_verified_topup_tx(
             &conn, "buyer", "topup", 100_000, "receipt", START,
@@ -708,8 +707,7 @@ mod tests {
     }
     #[test]
     fn increases_have_notice_cas_and_independent_topup_versions() {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::schema::apply(&conn).unwrap();
+        let conn = crate::test_support::database().unwrap();
         let before = crate::market_wallet_policy::policy_tx(&conn)
             .unwrap()
             .version;
@@ -1048,8 +1046,7 @@ mod tests {
             )
             .is_err()
         );
-        let conn = Connection::open_in_memory().unwrap();
-        crate::schema::apply(&conn).unwrap();
+        let conn = crate::test_support::database().unwrap();
         for rate in [-1, 10001, i64::MAX] {
             assert!(set_policy_tx(&conn, 1, rate, "owner", START).is_err());
         }
@@ -1348,8 +1345,7 @@ mod tests {
 
     #[test]
     fn pre_feature_months_and_delayed_renewals_are_not_backcharged() {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::schema::apply(&conn).unwrap();
+        let conn = crate::test_support::database().unwrap();
         let installed: String = conn
             .query_row(
                 "SELECT created_at FROM market_commission_policies WHERE version = 1",
@@ -1414,8 +1410,7 @@ mod tests {
 
     #[test]
     fn orphan_commission_journal_freezes_all_scopes_until_repaired() {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::schema::apply(&conn).unwrap();
+        let conn = crate::test_support::database().unwrap();
         let journal = post_journal_tx(
             &conn,
             "earning_lot",

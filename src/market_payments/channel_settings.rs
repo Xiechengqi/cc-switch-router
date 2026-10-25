@@ -171,8 +171,7 @@ mod tests {
 
     #[test]
     fn settings_edit_is_versioned_and_does_not_touch_rollout() {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::schema::apply(&conn).unwrap();
+        let conn = crate::test_support::database().unwrap();
         conn.execute(
             "INSERT INTO market_payment_channels
              (id, gateway_kind, display_name, enabled, current_revision, created_at, updated_at)

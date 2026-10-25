@@ -1968,14 +1968,13 @@ impl AppStore {
 
     #[cfg(test)]
     pub(crate) fn new_in_memory_for_tests() -> Result<Self, AppError> {
-        let conn = Connection::open_in_memory().map_err(|error| {
-            AppError::Internal(format!("open in-memory database failed: {error}"))
-        })?;
+        // Historical helper name; the disposable, independent snapshot has the
+        // same non-durable semantics without replaying every migration per test.
+        let conn = crate::test_support::database()?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(|error| {
                 AppError::Internal(format!("enable test foreign keys failed: {error}"))
             })?;
-        crate::schema::apply(&conn)?;
         let salt = Alphanumeric.sample_string(&mut rand::thread_rng(), 32);
         let database_health = conn.health_handle();
         let database_sync = conn.sync_handle();

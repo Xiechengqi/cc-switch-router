@@ -197,8 +197,7 @@ mod tests {
 
     #[test]
     fn overview_reads_liabilities_from_the_ledger() {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::schema::apply(&conn).unwrap();
+        let conn = crate::test_support::database().unwrap();
         crate::market_wallet::credit_verified_topup_tx(
             &conn,
             "buyer",

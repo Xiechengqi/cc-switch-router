@@ -137,6 +137,8 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 
 前端资源在编译期由 `build.rs` 内嵌进二进制,`cargo build --release` 前必须先执行 `(cd frontend && npm ci && npm run build)`。
 
+CI 的并行任务、缓存边界、测试数据库模板与耗时排查见 [构建性能说明](docs/ci-build-performance.md)。`cc-switch-router build-info` 可直接输出版本、提交与构建时间，不会启动服务或初始化配置文件。
+
 ### 环境变量
 
 默认配置文件路径:`$HOME/.cc-switch-router/.env`

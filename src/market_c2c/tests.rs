@@ -3,7 +3,7 @@ use crate::db::TransactionBehavior;
 const AT: &str = "2026-10-22T12:00:00+00:00";
 const LATER: &str = "2026-10-22T12:33:00+00:00";
 fn fixture() -> Connection {
-    fixture_on(Connection::open_in_memory().unwrap())
+    fixture_on(crate::test_support::database().unwrap())
 }
 fn fixture_on(c: Connection) -> Connection {
     initialize_fixture(&c);
@@ -812,7 +812,7 @@ fn persistent_listings_survive_restart_and_orders_keep_their_own_deadlines() {
     let directory = std::env::temp_dir().join(format!("router-c2c-persistence-{}", Uuid::new_v4()));
     std::fs::create_dir(&directory).unwrap();
     let path = directory.join("finance.sqlite");
-    let c = fixture_on(Connection::open(&path).unwrap());
+    let c = fixture_on(crate::test_support::database_at(&path).unwrap());
     offer(&c);
     let o = application(&c, 1000);
     drop(c);
@@ -863,7 +863,7 @@ fn independent_connections_serialize_acceptance_against_application_cancellation
     let directory = std::env::temp_dir().join(format!("router-c2c-accept-race-{}", Uuid::new_v4()));
     std::fs::create_dir(&directory).unwrap();
     let path = directory.join("finance.sqlite");
-    let c = fixture_on(Connection::open(&path).unwrap());
+    let c = fixture_on(crate::test_support::database_at(&path).unwrap());
     offer(&c);
     let o = legacy_application(&c, 1000);
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
@@ -922,7 +922,7 @@ fn automatic_last_stock_and_payment_cancellation_races_preserve_one_reservation(
         std::env::temp_dir().join(format!("router-c2c-automatic-races-{}", Uuid::new_v4()));
     std::fs::create_dir(&directory).unwrap();
     let path = directory.join("finance.sqlite");
-    let c = fixture_on(Connection::open(&path).unwrap());
+    let c = fixture_on(crate::test_support::database_at(&path).unwrap());
     offer(&c);
     crate::market_wallet_transfers::verified_transfer_for_test(
         &c,
@@ -1680,7 +1680,7 @@ fn independent_connections_cannot_double_spend_between_c2c_and_ordinary_transfer
     let directory = std::env::temp_dir().join(format!("router-c2c-race-{}", Uuid::new_v4()));
     std::fs::create_dir(&directory).unwrap();
     let path = directory.join("finance.sqlite");
-    let c = fixture_on(Connection::open(&path).unwrap());
+    let c = fixture_on(crate::test_support::database_at(&path).unwrap());
     offer(&c);
     let q = preview(&c, "buyer", 10000);
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));

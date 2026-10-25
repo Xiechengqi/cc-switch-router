@@ -1007,9 +1007,7 @@ mod tests {
     use crate::db::TransactionBehavior;
 
     fn memory() -> Connection {
-        let conn = Connection::open_in_memory().expect("open memory DB");
-        crate::schema::apply(&conn).expect("apply market schema");
-        conn
+        crate::test_support::database().expect("copy market schema")
     }
 
     #[test]

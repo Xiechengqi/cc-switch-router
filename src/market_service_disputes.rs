@@ -680,8 +680,7 @@ mod tests {
     use crate::market_wallet::{credit_verified_topup_tx, reconcile_wallet_tx, wallet_snapshot_tx};
 
     fn setup() -> (Connection, String) {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::schema::apply(&conn).unwrap();
+        let conn = crate::test_support::database().unwrap();
         let time = "2026-10-01T00:00:00+00:00";
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
