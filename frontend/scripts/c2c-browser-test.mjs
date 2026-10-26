@@ -216,7 +216,8 @@ try {
     for (const c of checks) assert.ok(c.ratio >= c.minimum, `${c.label}: contrast ${c.ratio.toFixed(2)} < ${c.minimum}`);
   };
   const buyer = await open("buyer"); const page = buyer.page;
-  await page.goto(`${base}/account/wallet/`); await page.getByRole("button", { name: "Buy from users", exact: true }).click();
+  await page.goto(`${base}/account/wallet/`); await page.getByRole("button", { name: "C2C", exact: true }).click();
+  await page.getByRole("button", { name: "Buy balance", exact: true }).click();
   await page.locator("[data-c2c-buy]").getByRole("button", { name: new RegExp(seller.displayName) }).click();
   await page.getByLabel("Wallet credit to buy (USD)").fill("10");
   for (const width of [320, 375, 414, 768]) { await page.setViewportSize({ width, height: 900 }); await geometry(page, "[data-c2c-buy]"); }
@@ -231,7 +232,8 @@ try {
   for (const width of [320, 375, 414, 768]) { await page.setViewportSize({ width, height: 900 }); await geometry(page, "dialog[open]"); }
   uncertain = true; await dialog.getByRole("button", { name: "Create order" }).click();
   await page.getByRole("button", { name: "Recover order" }).waitFor(); assert.equal(orders.length, 1); assert.equal(keys.length, 1);
-  await page.reload(); await page.getByRole("button", { name: "Buy from users", exact: true }).click(); await page.getByRole("button", { name: "Recover order" }).click();
+  await page.reload(); await page.getByRole("button", { name: "C2C", exact: true }).click();
+  await page.getByRole("button", { name: "Buy balance", exact: true }).click(); await page.getByRole("button", { name: "Recover order" }).click();
   dialog = page.getByRole("dialog", { name: "Order details" }); await dialog.getByText("Awaiting payment", { exact: true }).waitFor();
   assert.equal(await dialog.getByRole("button", { name: "I have paid", exact: true }).count(), 1);
   assert.equal(Date.parse(orders[0].paymentDeadline) - Date.parse(orders[0].createdAt), 1800000);
@@ -318,7 +320,8 @@ try {
   await sellerPanel.getByText("Accepting orders", { exact: true }).waitFor();
   assert.equal(profile.autoPauseReason, null); assert.equal(profile.enabled, true);
   await sell.page.goto(`${base}/account/provider-settings/`);
-  await page.goto(`${base}/account/wallet/`); await page.getByRole("button", { name: "Buy from users", exact: true }).click();
+  await page.goto(`${base}/account/wallet/`); await page.getByRole("button", { name: "C2C", exact: true }).click();
+  await page.getByRole("button", { name: "Buy balance", exact: true }).click();
   await page.locator("[data-c2c-buy]").getByRole("button", { name: new RegExp(seller.displayName) }).waitFor();
   assert.equal(heartbeat, 0, "seller remains listed after navigating away without any heartbeat");
   sellerUnits = "0"; available = false;
@@ -411,7 +414,8 @@ try {
   for (const o of [early, ownerTrade]) { o.status = "cancelled"; o.latePaymentResolved = true; o.version++; }
   // Corrupt local recovery data must not silently enable another order.
   await page.evaluate(() => sessionStorage.setItem("router_c2c_order_v1:buyer", "invalid-json"));
-  await page.goto(`${base}/account/wallet/`); await page.getByRole("button", { name: "Buy from users", exact: true }).click();
+  await page.goto(`${base}/account/wallet/`); await page.getByRole("button", { name: "C2C", exact: true }).click();
+  await page.getByRole("button", { name: "Buy balance", exact: true }).click();
   const buyPanel = page.locator("[data-c2c-buy]"); await buyPanel.getByRole("button", { name: "Check existing orders", exact: true }).waitFor();
   assert.equal(await buyPanel.getByRole("button", { name: new RegExp(seller.displayName) }).count(), 0);
   await buyPanel.getByRole("button", { name: "Check existing orders", exact: true }).click();
@@ -437,7 +441,7 @@ try {
     await skewDialog.getByText(/Do not pay now/).waitFor(); assert.equal(await skewDialog.locator("[data-c2c-description]").count(), 0);
     await skew.context.close();
   }
-  const zh = await open("buyer", "zh-CN"); await zh.page.goto(`${base}/account/wallet/`); await zh.page.getByRole("button", { name: "C2C 购入", exact: true }).click();
+  const zh = await open("buyer", "zh-CN"); await zh.page.goto(`${base}/account/wallet/`); await zh.page.getByRole("button", { name: "C2C", exact: true }).click(); await zh.page.getByRole("button", { name: "购入余额", exact: true }).click();
   await zh.page.locator("[data-c2c-buy]").getByRole("button", { name: new RegExp(seller.displayName) }).waitFor();
   for (const width of [320, 375, 414, 768]) { await zh.page.setViewportSize({ width, height: 900 }); await geometry(zh.page, "[data-c2c-buy]"); }
   const zhSeller = await open("seller", "zh-CN"); await zhSeller.page.goto(`${base}/account/wallet/`);

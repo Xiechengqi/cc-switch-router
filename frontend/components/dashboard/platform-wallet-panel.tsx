@@ -221,6 +221,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
     searchParams.get("c2cOrder") || searchParams.get("c2cSell") === "1" ? "c2c" : "topup",
   );
   const [c2cOrderId, setC2COrderId] = React.useState<string | null>(searchParams.get("c2cOrder"));
+  const [c2cMode, setC2CMode] = React.useState<"buy" | "sell">(searchParams.get("c2cSell") === "1" ? "sell" : "buy");
   const linkedC2COrder = searchParams.get("c2cOrder");
   React.useEffect(() => { if (linkedC2COrder) setC2COrderId(linkedC2COrder); }, [linkedC2COrder]);
   const returnedFromCheckoutExit = searchParams.get("cancelled") === "1";
@@ -869,15 +870,22 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
 
       <section className="grid min-w-0 gap-4 rounded-xl border border-border bg-card p-5 sm:p-6">
         <div role="group" aria-label={t("marketWallet.actions")} className="flex flex-wrap gap-2">
-          {(["topup", "transfer", "c2c"] as const).map((item) => (
+          {(["topup", "c2c", "transfer"] as const).map((item) => (
             <C2CAction key={item} type="button" secondary={task !== item} aria-pressed={task === item} disabled={!!busy} onClick={() => setTask(item)}>
-              {t(item === "c2c" ? "c2c.buy" : `marketWallet.action.${item}`)}
+              {t(`marketWallet.action.${item}`)}
               {item === "topup" && topupClosedReason ? <span className="ml-2 text-xs font-medium text-muted-foreground">{topupClosedReason}</span> : null}
             </C2CAction>
           ))}
         </div>
         {task === "transfer" ? <WalletTransferPanel embedded onTransferred={async () => { if (session?.user?.id) notifyMarketBalanceChanged(session.user.id); await reload(); }} walletVersion={wallet.version} /> : null}
-        {task === "c2c" && session?.user?.id ? <C2CBuyPanel key={session.user.id} actor={session.user.id} onOrder={order => setC2COrderId(order.id)} /> : null}
+        {task === "c2c" && session?.user?.id ? <div className="grid min-w-0 gap-4">
+          <div role="group" aria-label={t("c2c.mode")} className="flex flex-wrap gap-2">
+            <C2CAction type="button" secondary={c2cMode !== "buy"} aria-pressed={c2cMode === "buy"} onClick={() => setC2CMode("buy")}>{t("c2c.buy")}</C2CAction>
+            <C2CAction type="button" secondary={c2cMode !== "sell"} aria-pressed={c2cMode === "sell"} onClick={() => setC2CMode("sell")}>{t("c2c.seller")}</C2CAction>
+          </div>
+          {c2cMode === "buy" ? <C2CBuyPanel key={`${session.user.id}:buy`} actor={session.user.id} onOrder={order => { setC2CMode("buy"); setC2COrderId(order.id); }} /> : null}
+          <C2COrdersPanel key={session.user.id} actor={session.user.id} selectedId={c2cOrderId} onSelect={setC2COrderId} embedded sellOpen={c2cMode === "sell"} onSellOpenChange={open => setC2CMode(open ? "sell" : "buy")} />
+        </div> : null}
         {task === "topup" && wallet.canTopup ? <form className="grid min-w-0 content-start gap-3" onSubmit={(event) => void submitTopup(event)}>
           {wallet.mode === "shadow" ? <p className="text-sm text-muted-foreground">{t("marketWallet.shadow")}</p> : null}
           <p className="text-sm font-semibold">{t("marketWallet.topup")}</p>
@@ -978,7 +986,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
         </div> : null}
       </section>
 
-      {session?.user?.id ? <C2COrdersPanel key={session.user.id} actor={session.user.id} selectedId={c2cOrderId} onSelect={setC2COrderId} /> : null}
+
 
       {(wallet.canTopup || wallet.hasWalletActivity) && !loaded ? <p className="text-sm text-muted-foreground">{t("common.loading")}</p> : null}
       {historyError ? <p role="alert" className="rounded-md border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">{historyError}</p> : null}

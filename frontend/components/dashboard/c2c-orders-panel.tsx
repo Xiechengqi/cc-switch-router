@@ -21,10 +21,24 @@ export function C2CEvents({ items }: { items: C2CEvent[] }) {
     {items.map(e => { const key = `c2c.action.${e.action}` as MessageKey; return <li key={e.id} className="grid min-w-0 gap-1 text-xs"><span className="flex min-w-0 flex-wrap justify-between gap-2"><span>{key in messages.en ? t(key) : e.action}</span><time className="text-muted-foreground">{new Date(e.createdAt).toLocaleString(locale)}</time></span>{["note", "disputed", "late_payment_reported", "release", "return_to_seller", "record_external_resolution"].includes(e.action) && e.note ? <p className="whitespace-pre-wrap break-words text-muted-foreground [overflow-wrap:anywhere]">{e.note}</p> : null}</li>; })}
   </ul>;
 }
-export function C2COrdersPanel({ actor, selectedId, onSelect }: { actor: string; selectedId: string | null; onSelect: (id: string | null) => void }) {
-  return <C2COrdersWorkspace key={actor} actor={actor} selectedId={selectedId} onSelect={onSelect} />;
+export function C2COrdersPanel({ actor, selectedId, onSelect, embedded = false, sellOpen = false, onSellOpenChange }: {
+  actor: string;
+  selectedId: string | null;
+  onSelect: (id: string | null) => void;
+  embedded?: boolean;
+  sellOpen?: boolean;
+  onSellOpenChange?: (open: boolean) => void;
+}) {
+  return <C2COrdersWorkspace key={actor} actor={actor} selectedId={selectedId} onSelect={onSelect} embedded={embedded} sellOpen={sellOpen} onSellOpenChange={onSellOpenChange} />;
 }
-function C2COrdersWorkspace({ actor, selectedId, onSelect }: { actor: string; selectedId: string | null; onSelect: (id: string | null) => void }) {
+function C2COrdersWorkspace({ actor, selectedId, onSelect, embedded = false, sellOpen = false, onSellOpenChange }: {
+  actor: string;
+  selectedId: string | null;
+  onSelect: (id: string | null) => void;
+  embedded?: boolean;
+  sellOpen?: boolean;
+  onSellOpenChange?: (open: boolean) => void;
+}) {
   const { t } = useLocaleText();
   const [policy, setPolicy] = React.useState<C2CPolicyView | null>(null);
   const [snapshot, setSnapshot] = React.useState<C2CSellerSnapshot | null>(null);
@@ -32,7 +46,15 @@ function C2COrdersWorkspace({ actor, selectedId, onSelect }: { actor: string; se
   const [next, setNext] = React.useState<string | null>(null);
   const [history, setHistory] = React.useState(false);
   const [activeCount, setActiveCount] = React.useState(0);
-  const [selling, setSelling] = React.useState(useSearchParams().get("c2cSell") === "1");
+  const params = useSearchParams();
+  const sellOpenRef = React.useRef(sellOpen);
+  const [selling, setSelling] = React.useState(sellOpen || params.get("c2cSell") === "1");
+  const setSellOpen = (open: boolean) => { sellOpenRef.current = open; setSelling(open); onSellOpenChange?.(open); };
+  React.useEffect(() => {
+    if (sellOpen === sellOpenRef.current) return;
+    sellOpenRef.current = sellOpen;
+    setSelling(sellOpen);
+  }, [sellOpen]);
   const [editorKey, setEditorKey] = React.useState(0);
   const [editorBusy, setEditorBusy] = React.useState(false);
   const [error, setError] = React.useState("");
@@ -106,12 +128,12 @@ function C2COrdersWorkspace({ actor, selectedId, onSelect }: { actor: string; se
   const saved = (seller: C2CSeller) => {
     settingsVersion.current++;
     setSnapshot(old => old ? { ...old, seller } : old);
-    setEditorBusy(false); setSelling(false); setNotice(t("c2c.saved")); reload();
+    setEditorBusy(false); setSellOpen(false); setNotice(t("c2c.saved")); reload();
   };
-  return <section id="c2c-orders" className="grid min-w-0 gap-4 rounded-xl border border-border bg-card p-4 sm:p-6" data-c2c-orders>
-    <header className="flex min-w-0 flex-wrap items-center justify-between gap-3">
-      <h2 className="text-lg font-semibold">{t("c2c.title")}</h2>
-      <C2CAction type="button" secondary disabled={!policy || !snapshot || pausing} onClick={() => { setNotice(""); setEditorKey(v => v + 1); setSelling(true); }}>
+  return <section id="c2c-orders" className={embedded ? "grid min-w-0 gap-4" : "grid min-w-0 gap-4 rounded-xl border border-border bg-card p-4 sm:p-6"} data-c2c-orders>
+    <header className={embedded ? "flex min-w-0 justify-end" : "flex min-w-0 flex-wrap items-center justify-between gap-3"}>
+      {embedded ? null : <h2 className="text-lg font-semibold">{t("c2c.title")}</h2>}
+      <C2CAction type="button" secondary disabled={!policy || !snapshot || pausing} onClick={() => { setNotice(""); setEditorKey(v => v + 1); setSellOpen(true); }}>
         {t(snapshot?.state === "confirmation_required" ? "c2c.confirmAutoAccept" : snapshot?.seller ? "c2c.sellerSettings" : "c2c.seller")}
       </C2CAction>
     </header>
@@ -144,7 +166,7 @@ function C2COrdersWorkspace({ actor, selectedId, onSelect }: { actor: string; se
       </button></li>)}
     </ul>}
     {next ? <C2CAction type="button" secondary disabled={busy} onClick={() => { setBusy(true); void load(next).catch(e => { if (alive.current) setError(t(c2cErrorKey(e))); }).finally(() => { if (alive.current) setBusy(false); }); }}>{t("common.next")}</C2CAction> : null}
-    <C2CDialog open={selling && !!policy && !!snapshot} title={t(snapshot?.seller ? "c2c.sellerSettings" : "c2c.seller")} busy={editorBusy} onClose={() => setSelling(false)}>
+    <C2CDialog open={selling && !!policy && !!snapshot} title={t(snapshot?.seller ? "c2c.sellerSettings" : "c2c.seller")} busy={editorBusy} onClose={() => setSellOpen(false)}>
       {selling && policy && snapshot ? <C2CSellerPanel key={editorKey} policy={policy} snapshot={snapshot} availabilityError={!!sellerError} onRefresh={async () => { await loadSettings(); }} onBusyChange={setEditorBusy} onSaved={saved}
         onReload={async () => { if (!await loadSettings()) throw new Error("Seller settings reload superseded"); if (alive.current) { setEditorBusy(false); setEditorKey(v => v + 1); } }} /> : null}
     </C2CDialog>
