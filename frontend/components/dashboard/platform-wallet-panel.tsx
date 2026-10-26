@@ -92,16 +92,27 @@ function WalletHistorySection({ title, children, collapsed, hasMore, loading, di
 }) {
   const { t } = useLocaleText();
   const titleId = React.useId();
+  const listRef = React.useRef<HTMLDivElement>(null);
+  // Keep the preview height after reveal so older rows scroll inside the card.
+  const [lockedHeight, setLockedHeight] = React.useState<number | null>(null);
+  const revealEarlier = () => {
+    const height = listRef.current?.getBoundingClientRect().height;
+    if (height) setLockedHeight(Math.ceil(height));
+    onShowEarlier();
+  };
+  const locked = lockedHeight != null && !collapsed;
   return (
-    <section className="min-w-0 rounded-xl border border-border bg-card p-5">
+    <section className="min-w-0 rounded-xl border border-border bg-card p-4">
       <h2 id={titleId} className="text-base font-semibold">{title}</h2>
       <div
-        role="region" aria-labelledby={titleId} tabIndex={collapsed ? undefined : 0}
-        className={collapsed
-          ? "mt-3"
-          : "mt-3 max-h-[60dvh] overflow-y-auto overscroll-y-contain rounded-sm p-1 [scrollbar-gutter:stable] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"}
+        ref={listRef}
+        role="region" aria-labelledby={titleId} tabIndex={locked ? 0 : undefined}
+        className={locked
+          ? "mt-2 overflow-y-auto overscroll-y-contain [scrollbar-gutter:stable] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+          : "mt-2"}
+        style={locked ? { height: lockedHeight } : undefined}
         onScroll={(event) => {
-          if (collapsed) return;
+          if (!locked) return;
           const list = event.currentTarget;
           if (hasMore && !disabled && list.scrollHeight - list.scrollTop - list.clientHeight < 96) {
             void onLoadMore();
@@ -109,10 +120,10 @@ function WalletHistorySection({ title, children, collapsed, hasMore, loading, di
         }}
       >
         {children}
-        {collapsed ? <Button size="sm" variant="ghost" className="mt-2" isDisabled={disabled} onPress={onShowEarlier}>
+        {collapsed ? <Button size="sm" variant="ghost" className="mt-1" isDisabled={disabled} onPress={revealEarlier}>
           {t("marketWallet.showEarlier")}
         </Button> : null}
-        {!collapsed && hasMore ? <Button size="sm" variant="ghost" className="mt-2" isDisabled={disabled} onPress={() => void onLoadMore()}>
+        {!collapsed && hasMore ? <Button size="sm" variant="ghost" className="mt-1" isDisabled={disabled} onPress={() => void onLoadMore()}>
           {loading ? <Loader2 className="size-4 animate-spin" aria-hidden="true" /> : null}
           {t(loading ? "common.loading" : "marketWallet.more")}
         </Button> : null}
@@ -975,7 +986,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
         <WalletHistorySection title={t("marketWallet.topups")} collapsed={!historyExpanded.topups && topups.length > HISTORY_PREVIEW_LIMIT}
           hasMore={!!topupCursor} loading={busy === "topups"} disabled={!!busy}
           onShowEarlier={() => setHistoryExpanded((current) => ({ ...current, topups: true }))} onLoadMore={() => loadMore("topups")}>
-          <ul className="grid gap-2">
+          <ul>
             {(historyExpanded.topups ? topups : topups.slice(0, HISTORY_PREVIEW_LIMIT)).map((order) => {
               const gateway = gatewayStatuses[order.id];
               const abandoned = !!order.buyerAbandonedAt;
@@ -1016,28 +1027,31 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
                 : ["review_required", "payment_unavailable", "gateway_unavailable", "buyer_abandoned"].includes(shownStatus) || countdown?.phase === "soon" ? "text-amber-800"
                   : checkoutUrl || shownStatus === "pending" || shownStatus === "awaiting_payment" ? "text-primary"
                     : "text-muted-foreground";
-              return <li key={order.id} className="grid min-w-0 gap-2 rounded-md bg-muted/50 px-3 py-2 text-sm">
-                <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
-                  <p className="flex flex-wrap items-center gap-2 font-medium tabular-nums">${((order.creditAmountMinor ?? order.amountMinor) / 100).toFixed(2)}
-                    {directOrder && order.paymentTokenId ? <span className="rounded-full bg-accent/10 px-2 py-0.5 text-[0.7rem] font-medium text-accent">{paymentTokenLabel(order.paymentTokenId).label}</span> : null}
+              const showRecheck = order.status === "review_required" || countdown?.phase === "checking" || pendingVerification || (abandoned && order.status === "pending") || order.buyerRecheckResult === "retrying";
+              const showStop = canStopPayment && !(order.status === "pending" && gateway?.canCancel);
+              const showRestart = wallet.canTopup && ["expired", "cancelled"].includes(order.status);
+              return <li key={order.id} className="grid min-w-0 gap-1 border-b border-border/70 py-2 text-sm last:border-b-0">
+                <div className="flex min-w-0 items-baseline gap-2">
+                  <p className="flex min-w-0 items-center gap-2 font-medium tabular-nums">${((order.creditAmountMinor ?? order.amountMinor) / 100).toFixed(2)}
+                    {directOrder && order.paymentTokenId ? <span className="rounded-full bg-accent/10 px-1.5 py-px text-[0.7rem] font-medium text-accent">{paymentTokenLabel(order.paymentTokenId).label}</span> : null}
                   </p>
-                  <span className={`text-xs font-medium ${statusTone}`}>{neverCreated ? t("marketWallet.status.never_created") : t(`marketWallet.status.${shownStatus}` as Parameters<typeof t>[0])}</span>
+                  <span className={`min-w-0 truncate text-xs font-medium ${statusTone}`}>{neverCreated ? t("marketWallet.status.never_created") : t(`marketWallet.status.${shownStatus}` as Parameters<typeof t>[0])}</span>
+                  <span className="ml-auto shrink-0 text-xs text-muted-foreground">{dateText(order.createdAt, locale)}</span>
                 </div>
-                <p className="text-xs text-muted-foreground">{dateText(order.createdAt, locale)}</p>
-                <div className="flex flex-wrap items-center gap-2">
-                  {checkoutUrl ? <a className="inline-flex min-h-11 items-center gap-1 whitespace-nowrap text-xs font-medium text-primary underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring" href={walletTopupCheckoutHref(order.id)} target="_blank" rel="noopener noreferrer">
+                {checkoutUrl || showRecheck || showStop || order.status === "pending" || showRestart ? <div className="flex flex-wrap items-center gap-1">
+                  {checkoutUrl ? <a className="inline-flex items-center gap-1 whitespace-nowrap text-xs font-medium text-primary underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring" href={walletTopupCheckoutHref(order.id)} target="_blank" rel="noopener noreferrer">
                     {t("marketWallet.continuePay")}<ArrowUpRight className="size-3" aria-hidden="true" />
                   </a> : null}
-                  {(order.status === "review_required" || countdown?.phase === "checking" || pendingVerification || (abandoned && order.status === "pending") || order.buyerRecheckResult === "retrying") ? <Button size="sm" variant="outline" isDisabled={!!busy || statusBusyId === order.id} onPress={() => void requestRecheck(order.id)}>
+                  {showRecheck ? <Button size="sm" variant="outline" isDisabled={!!busy || statusBusyId === order.id} onPress={() => void requestRecheck(order.id)}>
                     <RefreshCw className={`size-4 ${statusBusyId === order.id ? "animate-spin" : ""}`} aria-hidden="true" />{t("marketWallet.recheck")}
                   </Button> : null}
-                  {canStopPayment && !(order.status === "pending" && gateway?.canCancel) ? <Button size="sm" variant="outline" isDisabled={!!busy || statusBusyId === order.id} onPress={() => setAbandonConfirmId(order.id)}>
+                  {showStop ? <Button size="sm" variant="outline" isDisabled={!!busy || statusBusyId === order.id} onPress={() => setAbandonConfirmId(order.id)}>
                     {t("marketWallet.abandonTopup")}
                   </Button> : null}
                   {order.status === "pending" ? <Button size="sm" variant="ghost" isIconOnly aria-label={t("marketWallet.refreshGatewayStatus")} isDisabled={statusBusyId === order.id || !!busy} onPress={() => void refreshGatewayStatus(order.id)}>
                     <RefreshCw className={`size-4 ${statusBusyId === order.id ? "animate-spin" : ""}`} aria-hidden="true" />
                   </Button> : null}
-                  {wallet.canTopup && ["expired", "cancelled"].includes(order.status) ? <Button size="sm" variant="outline" isDisabled={!!busy} onPress={() => {
+                  {showRestart ? <Button size="sm" variant="outline" isDisabled={!!busy} onPress={() => {
                     idempotencyRef.current = null;
                     setAmount(((order.creditAmountMinor ?? order.amountMinor) / 100).toFixed(2));
                     setAmountTouched(false);
@@ -1047,12 +1061,12 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
                   }}>
                     {t("marketWallet.restartTopup")}
                   </Button> : null}
-                </div>
+                </div> : null}
                 {order.buyerRecheckResult === "queued" ? <p role="status" className="text-xs font-medium text-primary">{t("marketWallet.recheckQueued")}</p>
                   : order.buyerRecheckResult === "retrying" ? <p role="status" className="text-xs text-amber-700">{t("marketWallet.recheckRetrying")}</p>
                     : order.buyerRecheckCompletedAt && order.buyerRecheckResult && recheckResultIsCurrent ? <p role="status" className="text-xs text-muted-foreground">{t(`marketWallet.recheckResult.${order.buyerRecheckResult}` as Parameters<typeof t>[0], { time: dateText(order.buyerRecheckCompletedAt, locale) })}</p> : null}
                 <details className="text-xs text-muted-foreground">
-                  <summary className="inline-flex min-h-11 cursor-pointer items-center gap-1 font-medium text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring">
+                  <summary className="inline-flex cursor-pointer items-center gap-1 py-0.5 font-medium text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring">
                     <ChevronDown className="size-3" aria-hidden="true" />{t("marketWallet.topupDetails")}
                   </summary>
                   <div className="grid gap-1 pb-2">
@@ -1086,7 +1100,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
         <WalletHistorySection title={t("marketWallet.transactions")} collapsed={!historyExpanded.transactions && transactions.length > HISTORY_PREVIEW_LIMIT}
           hasMore={!!transactionCursor} loading={busy === "transactions"} disabled={!!busy}
           onShowEarlier={() => setHistoryExpanded((current) => ({ ...current, transactions: true }))} onLoadMore={() => loadMore("transactions")}>
-          <ul className="grid gap-2">
+          <ul>
             {(historyExpanded.transactions ? transactions : transactions.slice(0, HISTORY_PREVIEW_LIMIT)).map((entry) => {
               const delta = safeBigInt(entry.deltaUnits);
               const heldDelta = safeBigInt(entry.heldDeltaUnits);
@@ -1096,12 +1110,12 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
               const entryKey = walletEntryKey(entry);
               const entryLabel = t(entryKey, entry.counterpartyEmail ? { email: entry.counterpartyEmail } : undefined);
               const amountTone = holdOnly ? "text-muted-foreground" : delta > 0n ? "text-emerald-800" : delta < 0n ? "text-foreground" : "text-muted-foreground";
-              return <li key={entry.id} className="flex min-w-0 items-center justify-between gap-2 rounded-md bg-muted/50 px-3 py-2 text-sm">
-                <div className="min-w-0">
-                  {entry.c2cOrderId ? <button type="button" onClick={() => { setTask("c2c"); setC2COrderId(entry.c2cOrderId ?? null); }} className="inline-flex min-h-11 max-w-full items-center text-left font-medium text-primary underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring">{entryLabel}</button> : <p className="truncate font-medium">{entryLabel}</p>}
-                  {entry.counterpartyEmail && !entryKey.startsWith("marketWallet.entry.transfer") ? <p className="break-all text-xs text-muted-foreground">{entry.counterpartyEmail}</p> : null}
-                  <p className="text-xs text-muted-foreground">{dateText(entry.createdAt, locale)}</p>
+              return <li key={entry.id} className="flex min-w-0 items-baseline gap-2 border-b border-border/70 py-1.5 text-sm last:border-b-0">
+                <div className="min-w-0 flex-1">
+                  {entry.c2cOrderId ? <button type="button" onClick={() => { setTask("c2c"); setC2COrderId(entry.c2cOrderId ?? null); }} className="block max-w-full truncate text-left font-medium text-primary underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring">{entryLabel}</button> : <p className="truncate font-medium">{entryLabel}</p>}
+                  {entry.counterpartyEmail && !entryKey.startsWith("marketWallet.entry.transfer") ? <p className="truncate text-xs text-muted-foreground">{entry.counterpartyEmail}</p> : null}
                 </div>
+                <span className="shrink-0 text-xs text-muted-foreground">{dateText(entry.createdAt, locale)}</span>
                 {holdOnly ? <span className="grid shrink-0 justify-items-end">
                   <span className="tabular-nums text-muted-foreground">{formatWalletUnits((heldDelta < 0n ? -heldDelta : heldDelta).toString())}</span>
                   <span className="text-[0.7rem] text-muted-foreground">{t(heldDelta > 0n ? "marketWallet.entryHeld" : "marketWallet.entryReleased")}</span>
