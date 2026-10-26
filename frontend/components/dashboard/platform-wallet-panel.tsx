@@ -800,12 +800,22 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
   const topupClosedReason = !wallet.canTopup
     ? t(wallet.mode === "shadow" ? "marketWallet.topupStatus.shadow" : wallet.mode === "enabled" ? "marketWallet.topupStatus.unavailable" : "marketWallet.topupStatus.closed")
     : null;
-  const balanceRows = [
-    ["marketWallet.available", wallet.availableUnits],
-    ["marketWallet.held", wallet.heldUnits],
-    ["marketWallet.committed", wallet.committedUnits ?? "0"],
-    ["marketWallet.posted", wallet.postedUnits],
-  ] as const;
+  const heldUnits = safeBigInt(wallet.heldUnits);
+  const owedUnits = safeBigInt(wallet.committedUnits ?? "0");
+  const transferableUnits = transferCapacity ? safeBigInt(transferCapacity.transferableUnits) : null;
+  const balanceIsClear = heldUnits === 0n && owedUnits === 0n && transferableUnits !== null
+    && transferableUnits === safeBigInt(wallet.availableUnits);
+  const balanceNote = transferCapacityUnavailable
+    ? t("marketWallet.balanceNoteUnavailable")
+    : !transferCapacity
+      ? t("common.loading")
+      : balanceIsClear
+        ? t("marketWallet.balanceClear")
+        : t("marketWallet.balanceNote", {
+            held: balanceText(wallet.heldUnits),
+            owed: balanceText(wallet.committedUnits ?? "0"),
+            transferable: balanceText(transferCapacity.transferableUnits),
+          });
 
   return (
     <main className="mx-auto grid w-full max-w-5xl min-w-0 gap-6 px-4 py-6 sm:px-6" aria-label={t("account.nav.wallet")}>
@@ -837,24 +847,13 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
         </div>
       ) : null}
 
-      <section className="min-w-0 rounded-xl border border-border bg-card p-5 sm:p-6" aria-label={t("marketWallet.balanceBreakdown")}>
-        <p className="flex items-center gap-2 text-sm text-muted-foreground"><WalletCards className="size-4" aria-hidden="true" />{t("marketWallet.available")}</p>
-        <p className="mt-2 break-all text-3xl font-semibold tabular-nums tracking-tight sm:text-4xl">{balanceText(wallet.availableUnits)}</p>
-        {displayCurrency === "CNY" && fxRateFresh ? <p className="mt-1 text-xs text-muted-foreground">{t("marketWallet.displayOnly", { amount: formatWalletUnits(wallet.availableUnits) })}</p> : null}
-        <dl className="mt-4 grid gap-2 text-sm sm:grid-cols-2">
-          {balanceRows.map(([key, units]) => (
-            <div key={key} className="flex min-w-0 items-baseline justify-between gap-3">
-              <dt className="text-muted-foreground">{t(key)}</dt>
-              <dd className="break-all text-right tabular-nums">{balanceText(units)}</dd>
-            </div>
-          ))}
-          <div className="flex min-w-0 items-baseline justify-between gap-3">
-            <dt className="text-muted-foreground">{t("marketWallet.transferable")}</dt>
-            <dd className="break-all text-right tabular-nums">
-              {transferCapacity ? balanceText(transferCapacity.transferableUnits) : t(transferCapacityUnavailable ? "marketWallet.transferableUnavailable" : "common.loading")}
-            </dd>
-          </div>
-        </dl>
+      <section className="min-w-0 rounded-xl border border-border bg-card px-5 py-4" aria-label={t("marketWallet.balanceBreakdown")}>
+        <div className="flex min-w-0 flex-wrap items-baseline justify-between gap-x-6 gap-y-1">
+          <p className="flex items-center gap-2 text-sm text-muted-foreground"><WalletCards className="size-4" aria-hidden="true" />{t("marketWallet.available")}</p>
+          <p className="break-all text-3xl font-semibold tabular-nums tracking-tight">{balanceText(wallet.availableUnits)}</p>
+        </div>
+        {displayCurrency === "CNY" && fxRateFresh ? <p className="mt-1 text-right text-xs text-muted-foreground">{t("marketWallet.displayOnly", { amount: formatWalletUnits(wallet.availableUnits) })}</p> : null}
+        <p className="mt-2 text-sm leading-6 text-muted-foreground">{balanceNote}</p>
       </section>
 
       <section className="grid min-w-0 gap-4 rounded-xl border border-border bg-card p-5 sm:p-6">
@@ -1113,7 +1112,6 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
           </ul>
         </WalletHistorySection>
       </div> : null}
-      {task !== "transfer" ? <WalletTransferPanel onTransferred={async () => { if (session?.user?.id) notifyMarketBalanceChanged(session.user.id); await reload(); }} walletVersion={wallet.version} /> : null}
       {wallet.hasWalletActivity ? <MarketBuyerDisputesList /> : null}
       <ConfirmAlertDialog
         open={reviewRetryConfirm}

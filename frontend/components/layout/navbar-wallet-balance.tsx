@@ -35,7 +35,6 @@ export function NavbarWalletBalance() {
       className="inline-flex h-11 min-w-0 max-w-24 items-center gap-1.5 whitespace-nowrap rounded-md px-1.5 text-xs font-medium text-foreground transition-colors hover:bg-secondary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring active:bg-secondary sm:max-w-52 sm:px-2 sm:text-sm"
     >
       <WalletCards className="hidden size-4 shrink-0 text-muted-foreground sm:block" aria-hidden="true" />
-      <span className="hidden text-muted-foreground 2xl:inline">{t("marketWallet.navBalance")}</span>
       <span className="min-w-0 truncate tabular-nums" aria-live="polite" aria-atomic="true">{amount}</span>
     </Link>
   );
