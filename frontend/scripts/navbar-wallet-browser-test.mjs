@@ -234,7 +234,8 @@ try {
   assert.equal(walletCalls, beforeSharedPoll + 1, "navigation reuses the shared wallet request");
   responseMode = "error";
   await changed("buyer");
-  await balance.filter({ hasText: "余额暂不可用" }).waitFor();
+  await balance.filter({ hasText: "—" }).waitFor();
+  assert.match(await balance.getAttribute("aria-label"), /余额暂不可用/);
   assert.ok(!(await balance.textContent()).includes("$9.00"), "navbar must not advertise a stale spendable balance");
   responseMode = "ready";
   await changed("buyer");
