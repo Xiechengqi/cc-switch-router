@@ -25,9 +25,11 @@ import {
 export function WalletTransferPanel({
   onTransferred,
   walletVersion,
+  embedded = false,
 }: {
   onTransferred: () => Promise<void>;
   walletVersion: number;
+  embedded?: boolean;
 }) {
   const { t } = useLocaleText();
   const [capacity, setCapacity] = React.useState<TransferCapacity | null>(null);
@@ -152,7 +154,7 @@ export function WalletTransferPanel({
   const expired = !!quote && Date.parse(quote.expiresAt) <= now;
   const enabled = capacity?.enabled && capacity.verified;
   return (
-    <section id="wallet-transfer" className="grid min-w-0 gap-4 rounded-xl border border-border bg-card p-5">
+    <section id="wallet-transfer" className={embedded ? "grid min-w-0 gap-4" : "grid min-w-0 gap-4 rounded-xl border border-border bg-card p-5"}>
       <div>
         <h2 className="flex items-center gap-2 text-base font-semibold">
           <ArrowRightLeft className="size-4" aria-hidden />

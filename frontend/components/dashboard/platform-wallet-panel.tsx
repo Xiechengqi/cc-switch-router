@@ -9,7 +9,7 @@ import * as React from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { Button } from "@heroui/react";
-import { ArrowUpRight, Ban, CheckCircle2, Clock3, CreditCard, Loader2, RefreshCw, WalletCards } from "lucide-react";
+import { ArrowUpRight, Ban, CheckCircle2, ChevronDown, Clock3, CreditCard, Loader2, RefreshCw, WalletCards } from "lucide-react";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { WalletTransferPanel } from "@/components/dashboard/wallet-transfer-panel";
@@ -19,8 +19,8 @@ import { C2COrdersPanel } from "@/components/dashboard/c2c-orders-panel";
 import { C2CAction } from "@/components/market/c2c-primitives";
 import { subscribeMarketBalanceChanged, notifyMarketBalanceChanged } from "@/lib/market-balance-events";
 import { MarketBuyerDisputesList } from "@/components/dashboard/market-buyer-disputes-list";
-import { MarketNotificationsBell } from "@/components/dashboard/market-notifications-bell";
 import { WalletBadge } from "@/components/market/wallet-primitives";
+import { getTransferCapacity, type TransferCapacity } from "@/lib/wallet-policy-api";
 import { ApiError } from "@/lib/api";
 import { messages, type MessageKey } from "@/lib/i18n";
 import { paymentTokenLabel } from "@/lib/market-payment-tokens";
@@ -46,6 +46,18 @@ import {
 import { TOPUP_PRESET_MINOR, formatMinorUsd, formatTopupCountdown, formatWalletUnits, formatWalletUnitsAsCny, parseTopupMinor, parseUsdMinor, safeMarketReturnPath, shouldResetTopupIdempotency, topupAutoCheckCountdown, topupBounds, topupCancelAction, topupDisplayStatus, verifiedPayableCheckoutUrl, walletTopupCheckoutHref } from "@/lib/market-wallet-money";
 
 const CLOSED_TOPUP_STATUS = new Set(["credited", "expired", "cancelled"]);
+const HISTORY_PREVIEW_LIMIT = 5;
+
+function moneyText(units: string, displayCurrency: string, fxRateFresh: boolean, fxRateMicros: number, locale: string) {
+  return displayCurrency === "CNY" && fxRateFresh
+    ? formatWalletUnitsAsCny(units, fxRateMicros, locale)
+    : formatWalletUnits(units);
+}
+
+function signedWalletUnits(raw: string) {
+  const text = formatWalletUnits(raw);
+  return text.startsWith("−") || text.startsWith("<") ? text : `+${text}`;
+}
 
 function mergeHistoryItems<T extends { id: string }>(first: T[], rest: T[]): T[] {
   const seen = new Set(first.map((item) => item.id));
@@ -68,12 +80,14 @@ async function refreshHistoryHead<T extends { id: string }>(
   return { items, nextCursor: page.nextCursor };
 }
 
-function WalletHistorySection({ title, children, hasMore, loading, disabled, onLoadMore }: {
+function WalletHistorySection({ title, children, collapsed, hasMore, loading, disabled, onShowEarlier, onLoadMore }: {
   title: string;
   children: React.ReactNode;
+  collapsed: boolean;
   hasMore: boolean;
   loading: boolean;
   disabled: boolean;
+  onShowEarlier: () => void;
   onLoadMore: () => Promise<void>;
 }) {
   const { t } = useLocaleText();
@@ -82,9 +96,12 @@ function WalletHistorySection({ title, children, hasMore, loading, disabled, onL
     <section className="min-w-0 rounded-xl border border-border bg-card p-5">
       <h2 id={titleId} className="text-base font-semibold">{title}</h2>
       <div
-        role="region" aria-labelledby={titleId} tabIndex={0}
-        className="mt-3 h-96 max-h-[60dvh] overflow-y-auto overscroll-y-contain rounded-sm p-1 [scrollbar-gutter:stable] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+        role="region" aria-labelledby={titleId} tabIndex={collapsed ? undefined : 0}
+        className={collapsed
+          ? "mt-3"
+          : "mt-3 max-h-[60dvh] overflow-y-auto overscroll-y-contain rounded-sm p-1 [scrollbar-gutter:stable] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"}
         onScroll={(event) => {
+          if (collapsed) return;
           const list = event.currentTarget;
           if (hasMore && !disabled && list.scrollHeight - list.scrollTop - list.clientHeight < 96) {
             void onLoadMore();
@@ -92,7 +109,10 @@ function WalletHistorySection({ title, children, hasMore, loading, disabled, onL
         }}
       >
         {children}
-        {hasMore ? <Button size="sm" variant="ghost" className="mt-2" isDisabled={disabled} onPress={() => void onLoadMore()}>
+        {collapsed ? <Button size="sm" variant="ghost" className="mt-2" isDisabled={disabled} onPress={onShowEarlier}>
+          {t("marketWallet.showEarlier")}
+        </Button> : null}
+        {!collapsed && hasMore ? <Button size="sm" variant="ghost" className="mt-2" isDisabled={disabled} onPress={() => void onLoadMore()}>
           {loading ? <Loader2 className="size-4 animate-spin" aria-hidden="true" /> : null}
           {t(loading ? "common.loading" : "marketWallet.more")}
         </Button> : null}
@@ -105,8 +125,19 @@ function errorText(cause: unknown) {
   return cause instanceof Error ? cause.message : String(cause);
 }
 
-function walletEntryKey(sourceKind: string): MessageKey {
-  const key = `marketWallet.entry.${sourceKind}`;
+function walletEntryKey(entry: MarketWalletTransaction): MessageKey {
+  if (entry.c2cOrderId) {
+    // Hold journals use action "release" for returning a reservation. That is
+    // not the C2C settlement that moves available balance to the buyer.
+    if (entry.sourceKind === "hold" || entry.action === "release_hold") return "marketWallet.entry.c2cReleaseHold";
+    if (entry.action === "release") return safeBigInt(entry.deltaUnits) > 0n ? "marketWallet.entry.c2cReleaseIn" : "marketWallet.entry.c2cReleaseOut";
+    if (entry.action.startsWith("reserve:")) return "marketWallet.entry.c2cHold";
+  }
+  if (entry.sourceKind === "wallet_transfer") {
+    return safeBigInt(entry.deltaUnits) > 0n ? "marketWallet.entry.transferIn" : "marketWallet.entry.transferOut";
+  }
+  if (entry.action.startsWith("reserve:")) return "marketWallet.entry.holdPlaced";
+  const key = `marketWallet.entry.${entry.sourceKind}`;
   return (key in messages.en ? key : "marketWallet.entry.other") as MessageKey;
 }
 
@@ -175,7 +206,9 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
   const { locale, t, displayCurrency, fxRateFresh, fxRateMicros } = useLocaleText();
   const searchParams = useSearchParams();
   const returnedTopupId = searchParams.get("topup");
-  const [fundingMethod, setFundingMethod] = React.useState<"official" | "c2c">("official");
+  const [task, setTask] = React.useState<"topup" | "transfer" | "c2c">(
+    searchParams.get("c2cOrder") || searchParams.get("c2cSell") === "1" ? "c2c" : "topup",
+  );
   const [c2cOrderId, setC2COrderId] = React.useState<string | null>(searchParams.get("c2cOrder"));
   const linkedC2COrder = searchParams.get("c2cOrder");
   React.useEffect(() => { if (linkedC2COrder) setC2COrderId(linkedC2COrder); }, [linkedC2COrder]);
@@ -194,6 +227,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
   const [transactions, setTransactions] = React.useState<MarketWalletTransaction[]>([]);
   const [topupCursor, setTopupCursor] = React.useState<string | null>(null);
   const [transactionCursor, setTransactionCursor] = React.useState<string | null>(null);
+  const [historyExpanded, setHistoryExpanded] = React.useState({ topups: false, transactions: false });
   const [returnedTopup, setReturnedTopup] = React.useState<MarketWalletTopup | null>(null);
   const [channelId, setChannelId] = React.useState("");
   const [tokenId, setTokenId] = React.useState("");
@@ -203,8 +237,11 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
   const [quoteError, setQuoteError] = React.useState("");
   const [quoteRefresh, setQuoteRefresh] = React.useState(0);
   const [busy, setBusy] = React.useState("");
-  const [error, setError] = React.useState("");
+  const [topupError, setTopupError] = React.useState("");
+  const [historyError, setHistoryError] = React.useState("");
   const [notice, setNotice] = React.useState("");
+  const [transferCapacity, setTransferCapacity] = React.useState<TransferCapacity | null>(null);
+  const [transferCapacityUnavailable, setTransferCapacityUnavailable] = React.useState(false);
   const [nowMs, setNowMs] = React.useState(() => Date.now());
   const [serverOffsetMs, setServerOffsetMs] = React.useState(0);
   const [loaded, setLoaded] = React.useState(false);
@@ -295,6 +332,16 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
     return () => { active = false; };
   }, [topups]);
 
+  const refreshTransferCapacity = React.useCallback(async () => {
+    try {
+      setTransferCapacity(await getTransferCapacity());
+      setTransferCapacityUnavailable(false);
+    } catch {
+      setTransferCapacity(null);
+      setTransferCapacityUnavailable(true);
+    }
+  }, []);
+
   const refreshChannels = React.useCallback(async () => {
     const version = ++channelReloadVersionRef.current;
     const nextChannels = await getMarketWalletChannels();
@@ -319,10 +366,11 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
     setTransactions((current) => mergeHistoryItems(nextTransactions.items, current));
     setTransactionCursor((current) => historyExpandedRef.current.transactions ? current : nextTransactions.nextCursor);
     setLoaded(true);
-  }, [refreshChannels]);
+    void refreshTransferCapacity();
+  }, [refreshChannels, refreshTransferCapacity]);
 
   React.useEffect(() => {
-    if (!loaded || !wallet.canTopup || fundingMethod !== "official") return;
+    if (!loaded || !wallet.canTopup || task !== "topup") return;
     // Limits can change even with no pending order. Revalidate when returning
     // from another tab and at a bounded cadence while the form is visible.
     const refresh = () => { if (document.visibilityState === "visible") void refreshChannels().catch(() => {}); };
@@ -334,9 +382,9 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
       window.removeEventListener("focus", refresh);
       document.removeEventListener("visibilitychange", refresh);
     };
-  }, [loaded, wallet.canTopup, fundingMethod, refreshChannels]);
+  }, [loaded, wallet.canTopup, task, refreshChannels]);
 
-  React.useEffect(() => session?.user?.id ? subscribeMarketBalanceChanged(session.user.id, () => { void reload().catch(() => setError(t("earningConversion.refreshFailed"))); }) : undefined, [session?.user?.id, reload, t]);
+  React.useEffect(() => session?.user?.id ? subscribeMarketBalanceChanged(session.user.id, () => { void reload().catch(() => setHistoryError(t("earningConversion.refreshFailed"))); }) : undefined, [session?.user?.id, reload, t]);
 
   React.useEffect(() => {
     if (!hasUnresolvedTopups) return;
@@ -367,13 +415,14 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
       setTransactions(nextTransactions.items);
       setTransactionCursor(nextTransactions.nextCursor);
       setLoaded(true);
+      void refreshTransferCapacity();
     }).catch((cause) => {
       if (!active || version !== reloadVersionRef.current) return;
-      setError(errorText(cause));
+      setHistoryError(errorText(cause));
       setLoaded(true);
     });
     return () => { active = false; };
-  }, [refreshChannels]);
+  }, [refreshChannels, refreshTransferCapacity]);
 
   React.useEffect(() => {
     if (!returnedTopupId) return;
@@ -395,12 +444,12 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
         if (credited) {
           await reload();
         }
-        setError("");
+        setHistoryError("");
         if (current.status === "review_required") retry(60_000);
         else if (!CLOSED_TOPUP_STATUS.has(current.status)) retry();
       } catch (cause) {
         if (!active) return;
-        setError(errorText(cause));
+        setHistoryError(errorText(cause));
         // A temporary API failure (including one during the balance refresh)
         // must not strand a paid order on a stale balance. A rejected order ID
         // is terminal and should not spin forever.
@@ -476,7 +525,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
     setReviewRetryConfirm(false);
     busyRef.current = true;
     setBusy("topup");
-    setError("");
+    setTopupError("");
     setNotice("");
     setCheckoutFallbackUrl(null);
     let paymentWindow: Window | null = null;
@@ -555,13 +604,13 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
         idempotencyRef.current = null;
         setQuote(null);
         setQuoteRefresh((value) => value + 1);
-        setError(t("walletPolicy.quoteExpired"));
+        setTopupError(t("walletPolicy.quoteExpired"));
         void refreshChannels().catch(() => {});
         return;
       }
       const range = cause instanceof ApiError ? topupBounds(cause.details) : null;
       const key = topupErrorKey(cause);
-      setError(cause instanceof ApiError && cause.code === "MARKET_TOPUP_AMOUNT_OUT_OF_RANGE"
+      setTopupError(cause instanceof ApiError && cause.code === "MARKET_TOPUP_AMOUNT_OUT_OF_RANGE"
         ? range ? t("marketWallet.error.amountOutOfRange", {
           min: formatMinorUsd(range.min), max: formatMinorUsd(range.max),
         }) : t("marketWallet.amountRangeUnavailable")
@@ -593,12 +642,12 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
       }
       const offset = Date.parse(status.serverNow) - Date.now();
       if (Number.isFinite(offset)) setServerOffsetMs(offset);
-      setError("");
+      setHistoryError("");
     } catch {
       if (statusRequestVersionRef.current[id] === version) {
         setGatewayStatuses((current) => ({ ...current, [id]: null }));
       }
-      setError(t("marketWallet.gatewayStatusUnavailable"));
+      setHistoryError(t("marketWallet.gatewayStatusUnavailable"));
     } finally {
       setStatusBusyId(null);
     }
@@ -633,7 +682,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
   const requestRecheck = async (id: string) => {
     if (statusBusyId || busyRef.current) return;
     setStatusBusyId(id);
-    setError("");
+    setHistoryError("");
     setNotice("");
     try {
       const result = await recheckMarketWalletTopup(id);
@@ -641,7 +690,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
       setTopups((current) => current.map((order) => order.id === id ? result.order : order));
       if (!result.queued) setNotice(t("marketWallet.recheckAlreadyQueued"));
     } catch (cause) {
-      setError(errorText(cause));
+      setHistoryError(errorText(cause));
     } finally {
       setStatusBusyId(null);
     }
@@ -653,7 +702,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
     busyRef.current = true;
     setBusy("cancelTopup");
     if (idempotencyRef.current?.orderId === id) idempotencyRef.current = null;
-    setError("");
+    setHistoryError("");
     setGatewayStatuses((current) => ({ ...current, [id]: null }));
     setCheckoutFallbackUrl(null);
     try {
@@ -663,11 +712,11 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
       try {
         await reload();
       } catch {
-        setError(t("marketWallet.cancelRefreshFailed"));
+        setHistoryError(t("marketWallet.cancelRefreshFailed"));
       }
     } catch (cause) {
       setCancelConfirmId(null);
-      setError(cause instanceof ApiError && cause.status === 409
+      setHistoryError(cause instanceof ApiError && cause.status === 409
         ? t("marketWallet.cancelChanged")
         : errorText(cause));
       await reload().catch(() => {});
@@ -683,7 +732,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
     busyRef.current = true;
     setBusy("abandonTopup");
     if (idempotencyRef.current?.orderId === id) idempotencyRef.current = null;
-    setError("");
+    setHistoryError("");
     setNotice("");
     setGatewayStatuses((current) => ({ ...current, [id]: null }));
     setCheckoutFallbackUrl(null);
@@ -695,11 +744,11 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
       try {
         await reload();
       } catch {
-        setError(t("marketWallet.abandonRefreshFailed"));
+        setHistoryError(t("marketWallet.abandonRefreshFailed"));
       }
     } catch (cause) {
       setAbandonConfirmId(null);
-      setError(cause instanceof ApiError && cause.status === 409
+      setHistoryError(cause instanceof ApiError && cause.status === 409
         ? t("marketWallet.abandonChanged") : errorText(cause));
       await reload().catch(() => {});
     } finally {
@@ -714,7 +763,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
     if (!cursor) return;
     busyRef.current = true;
     setBusy(kind);
-    setError("");
+    setHistoryError("");
     const version = reloadVersionRef.current;
     try {
       if (kind === "topups") {
@@ -731,7 +780,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
         setTransactionCursor(page.nextCursor);
       }
     } catch (cause) {
-      setError(errorText(cause));
+      setHistoryError(errorText(cause));
     } finally {
       busyRef.current = false;
       setBusy("");
@@ -747,60 +796,85 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
         ? t("marketWallet.cancelSafetyHold")
         : t("marketWallet.gatewayStatusUnavailable");
 
+  const balanceText = (units: string) => moneyText(units, displayCurrency, fxRateFresh, fxRateMicros, locale);
+  const topupClosedReason = !wallet.canTopup
+    ? t(wallet.mode === "shadow" ? "marketWallet.topupStatus.shadow" : wallet.mode === "enabled" ? "marketWallet.topupStatus.unavailable" : "marketWallet.topupStatus.closed")
+    : null;
+  const balanceRows = [
+    ["marketWallet.available", wallet.availableUnits],
+    ["marketWallet.held", wallet.heldUnits],
+    ["marketWallet.committed", wallet.committedUnits ?? "0"],
+    ["marketWallet.posted", wallet.postedUnits],
+  ] as const;
+
   return (
-    <main className="mx-auto grid w-full max-w-5xl min-w-0 gap-6 px-4 py-6 sm:px-6" aria-label={t("marketWallet.title")}>
+    <main className="mx-auto grid w-full max-w-5xl min-w-0 gap-6 px-4 py-6 sm:px-6" aria-label={t("account.nav.wallet")}>
       <header className="flex min-w-0 flex-wrap items-start justify-between gap-3">
-        <div className="min-w-0">
-          <h1 className="break-words text-2xl font-semibold tracking-tight">{t("marketWallet.title")}</h1>
-          <p className="mt-1 text-sm text-muted-foreground">{t("marketWallet.subtitle")}</p>
-        </div>
-        <div className="flex items-center gap-2">
-          <MarketNotificationsBell />
-          <Button variant="outline" size="sm" isDisabled={!!busy} onPress={() => void reload().catch((cause) => setError(errorText(cause)))}>
-            <RefreshCw className="size-4" aria-hidden="true" />{t("common.reload")}
-          </Button>
-        </div>
+        <p className="max-w-2xl text-sm leading-6 text-muted-foreground">{t("marketWallet.subtitle")}</p>
+        <Button variant="outline" size="sm" isDisabled={!!busy} onPress={() => void reload().catch((cause) => setHistoryError(errorText(cause)))}>
+          <RefreshCw className="size-4" aria-hidden="true" />{t("common.reload")}
+        </Button>
       </header>
 
-      {error ? <p role="alert" className="rounded-md border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">{error}</p> : null}
       {notice ? <p role="status" className="rounded-md bg-emerald-50 px-4 py-3 text-sm text-emerald-800">{notice}</p> : null}
       {checkoutFallbackUrl ? <p role="status" className="rounded-md bg-amber-50 px-4 py-3 text-sm text-amber-900">
         {t("marketWallet.paymentTabBlocked")} <a href={checkoutFallbackUrl} target="_blank" rel="noopener noreferrer" className="font-semibold underline underline-offset-2">{t("marketWallet.openPaymentTab")}</a>
       </p> : null}
-      {returnedTopup ? (
+      {returnedTopup || returnPath ? (
         <div role="status" aria-live="polite" className="flex min-w-0 flex-wrap items-center justify-between gap-3 rounded-md border border-border bg-card px-4 py-3 text-sm">
           <div className="grid gap-1">
-            <span className="flex items-center gap-2">
+            {returnedTopup ? <span className="flex items-center gap-2">
               {returnedTopup.status === "credited" ? <CheckCircle2 className="size-4 text-emerald-700" aria-hidden="true" /> : <Clock3 className="size-4 text-muted-foreground" aria-hidden="true" />}
               {t(`marketWallet.status.${topupDisplayStatus(returnedTopup.status, undefined, !!returnedTopup.buyerAbandonedAt)}` as Parameters<typeof t>[0])}
-            </span>
-            {returnedFromCheckoutExit && !CLOSED_TOPUP_STATUS.has(returnedTopup.status) ? <span className="text-xs text-amber-700">{t("marketWallet.checkoutExitIsNotCancellation")}</span> : null}
+            </span> : null}
+            {returnedFromCheckoutExit && returnedTopup && !CLOSED_TOPUP_STATUS.has(returnedTopup.status) ? <span className="text-xs text-amber-700">{t("marketWallet.checkoutExitIsNotCancellation")}</span> : null}
           </div>
-          {returnedTopup.status === "credited" && returnPath ? (
+          {returnPath ? (
             <Link href={returnPath} className="inline-flex min-h-11 items-center whitespace-nowrap font-medium text-primary underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring">
-              {t("marketWallet.returnToMarket")}<ArrowUpRight className="ml-1 size-4" aria-hidden="true" />
+              {t(returnedTopup?.status === "credited" ? "marketWallet.returnToMarket" : "marketWallet.returnWhilePending")}<ArrowUpRight className="ml-1 size-4" aria-hidden="true" />
             </Link>
           ) : null}
         </div>
       ) : null}
 
-      <section className="grid min-w-0 gap-5 rounded-xl border border-border bg-card p-5 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] sm:p-6">
-        <div className="min-w-0">
-          <p className="flex items-center gap-2 text-sm text-muted-foreground"><WalletCards className="size-4" aria-hidden="true" />{t("marketWallet.available")}</p>
-          <p className="mt-2 break-all text-3xl font-semibold tabular-nums tracking-tight sm:text-4xl">{displayCurrency === "CNY" && fxRateFresh ? formatWalletUnitsAsCny(wallet.availableUnits, fxRateMicros, locale) : formatWalletUnits(wallet.availableUnits)}</p>
-          {displayCurrency === "CNY" && fxRateFresh ? <p className="mt-1 text-xs text-muted-foreground">{t("marketWallet.displayOnly", { amount: formatWalletUnits(wallet.availableUnits) })}</p> : null}
-          <p className="mt-2 text-sm text-muted-foreground">{t("marketWallet.held")}: {displayCurrency === "CNY" && fxRateFresh ? formatWalletUnitsAsCny(wallet.heldUnits, fxRateMicros, locale) : formatWalletUnits(wallet.heldUnits)}</p>
-          {wallet.committedUnits && wallet.committedUnits !== "0" ? <p className="mt-1 text-sm text-muted-foreground">{t("marketWallet.committed")}: {formatWalletUnits(wallet.committedUnits)}</p> : null}
-        </div>
-        <div className="grid min-w-0 content-start gap-4">
-          <div role="group" aria-label={t("marketWallet.channel")} className="flex flex-wrap gap-2">
-            <C2CAction type="button" secondary={fundingMethod !== "official"} aria-pressed={fundingMethod === "official"} disabled={!!busy} onClick={() => setFundingMethod("official")}>{t("c2c.official")}</C2CAction>
-            <C2CAction type="button" secondary={fundingMethod !== "c2c"} aria-pressed={fundingMethod === "c2c"} disabled={!!busy} onClick={() => setFundingMethod("c2c")}>{t("c2c.buy")}</C2CAction>
+      <section className="min-w-0 rounded-xl border border-border bg-card p-5 sm:p-6" aria-label={t("marketWallet.balanceBreakdown")}>
+        <p className="flex items-center gap-2 text-sm text-muted-foreground"><WalletCards className="size-4" aria-hidden="true" />{t("marketWallet.available")}</p>
+        <p className="mt-2 break-all text-3xl font-semibold tabular-nums tracking-tight sm:text-4xl">{balanceText(wallet.availableUnits)}</p>
+        {displayCurrency === "CNY" && fxRateFresh ? <p className="mt-1 text-xs text-muted-foreground">{t("marketWallet.displayOnly", { amount: formatWalletUnits(wallet.availableUnits) })}</p> : null}
+        <dl className="mt-4 grid gap-2 text-sm sm:grid-cols-2">
+          {balanceRows.map(([key, units]) => (
+            <div key={key} className="flex min-w-0 items-baseline justify-between gap-3">
+              <dt className="text-muted-foreground">{t(key)}</dt>
+              <dd className="break-all text-right tabular-nums">{balanceText(units)}</dd>
+            </div>
+          ))}
+          <div className="flex min-w-0 items-baseline justify-between gap-3">
+            <dt className="text-muted-foreground">{t("marketWallet.transferable")}</dt>
+            <dd className="break-all text-right tabular-nums">
+              {transferCapacity ? balanceText(transferCapacity.transferableUnits) : t(transferCapacityUnavailable ? "marketWallet.transferableUnavailable" : "common.loading")}
+            </dd>
           </div>
-        {fundingMethod === "c2c" && session?.user?.id ? <C2CBuyPanel key={session.user.id} actor={session.user.id} onOrder={order => setC2COrderId(order.id)} /> : wallet.canTopup ? <form className="grid min-w-0 content-start gap-3" onSubmit={(event) => void submitTopup(event)}>
+        </dl>
+      </section>
+
+      <section className="grid min-w-0 gap-4 rounded-xl border border-border bg-card p-5 sm:p-6">
+        <div role="group" aria-label={t("marketWallet.actions")} className="flex flex-wrap gap-2">
+          {(["topup", "transfer", "c2c"] as const).map((item) => (
+            <C2CAction key={item} type="button" secondary={task !== item} aria-pressed={task === item} disabled={!!busy} onClick={() => setTask(item)}>
+              {t(item === "c2c" ? "c2c.buy" : `marketWallet.action.${item}`)}
+              {item === "topup" && topupClosedReason ? <span className="ml-2 text-xs font-medium text-muted-foreground">{topupClosedReason}</span> : null}
+            </C2CAction>
+          ))}
+        </div>
+        {task === "transfer" ? <WalletTransferPanel embedded onTransferred={async () => { if (session?.user?.id) notifyMarketBalanceChanged(session.user.id); await reload(); }} walletVersion={wallet.version} /> : null}
+        {task === "c2c" && session?.user?.id ? <C2CBuyPanel key={session.user.id} actor={session.user.id} onOrder={order => setC2COrderId(order.id)} /> : null}
+        {task === "topup" && wallet.canTopup ? <form className="grid min-w-0 content-start gap-3" onSubmit={(event) => void submitTopup(event)}>
           {wallet.mode === "shadow" ? <p className="text-sm text-muted-foreground">{t("marketWallet.shadow")}</p> : null}
           <p className="text-sm font-semibold">{t("marketWallet.topup")}</p>
-          <label className="grid min-w-0 gap-1 text-sm">
+          {channels.length === 1 && selectedChannel ? <p className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
+            {t("marketWallet.topupChannel", { channel: selectedChannel.displayName })}
+            {selectedChannel.canary ? <WalletBadge tone="warning" pulse>{t("marketWallet.canaryBadge")}</WalletBadge> : null}
+          </p> : <label className="grid min-w-0 gap-1 text-sm">
             <span className="flex flex-wrap items-center gap-2">{t("marketWallet.channel")}
               {selectedChannel?.canary ? <WalletBadge tone="warning" pulse>{t("marketWallet.canaryBadge")}</WalletBadge> : null}
             </span>
@@ -812,7 +886,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
               {!channels.length ? <option value="">{t("marketWallet.noChannel")}</option> : null}
               {channels.map((channel) => <option key={channel.id} value={channel.id}>{channel.displayName}</option>)}
             </select>
-          </label>
+          </label>}
           {selectedChannel?.canary ? <p className="text-xs text-amber-800">{t("marketWallet.canaryHelp")}</p> : null}
           <fieldset className="grid min-w-0 gap-2 text-sm" aria-describedby="wallet-amount-help">
             <legend className="mb-1">{t("marketWallet.amount")}</legend>
@@ -874,33 +948,36 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
             </div> : <p className="text-xs text-muted-foreground">{t("marketWallet.noPaymentMethods")}</p>}
             <p className="text-xs text-muted-foreground">{t("marketWallet.directMethodHelp")}</p>
           </fieldset> : null}
-          {activeQuote ? <dl aria-live="polite" className="grid grid-cols-[minmax(0,1fr)_auto] gap-x-3 gap-y-2 text-sm tabular-nums">
-            <dt className="text-muted-foreground">{t("walletPolicy.credit")}</dt><dd>{formatMinorUsd(activeQuote.creditMinor)}</dd>
-            <dt className="text-muted-foreground">{t("walletPolicy.fee", { rate: activeQuote.feeBps / 100 })}</dt><dd>{formatMinorUsd(activeQuote.feeMinor)}</dd>
-            <dt className="font-semibold">{t("walletPolicy.total")}</dt><dd className="font-semibold">{formatMinorUsd(activeQuote.payMinor)}</dd>
-          </dl> : quoteError ? <div className="grid justify-items-start gap-2"><p role="alert" className="text-sm text-destructive">{quoteError}</p><Button variant="outline" onPress={() => setQuoteRefresh((value) => value + 1)}>{t("common.retry")}</Button></div> : parsedAmount != null && methodReady ? <p role="status" className="text-xs text-muted-foreground">{t("walletPolicy.quoting")}</p> : null}
+          {parsedAmount != null && methodReady ? <dl aria-live="polite" className="grid grid-cols-[minmax(0,1fr)_auto] gap-x-3 gap-y-2 text-sm tabular-nums">
+            <dt className="text-muted-foreground">{t("walletPolicy.credit")}</dt><dd>{activeQuote ? formatMinorUsd(activeQuote.creditMinor) : t("marketWallet.quotingTotal")}</dd>
+            <dt className="text-muted-foreground">{t("walletPolicy.fee", { rate: (activeQuote?.feeBps ?? selectedChannel?.maintenanceFeeBps ?? 0) / 100 })}</dt><dd>{activeQuote ? formatMinorUsd(activeQuote.feeMinor) : t("marketWallet.quotingTotal")}</dd>
+            <dt className="font-semibold">{t("walletPolicy.total")}</dt><dd className="font-semibold">{activeQuote ? formatMinorUsd(activeQuote.payMinor) : t("marketWallet.quotingTotal")}</dd>
+          </dl> : null}
+          {quoteError ? <div className="grid justify-items-start gap-2"><p role="alert" className="text-sm text-destructive">{quoteError}</p><Button variant="outline" onPress={() => setQuoteRefresh((value) => value + 1)}>{t("common.retry")}</Button></div> : null}
           <p className="text-xs leading-5 text-muted-foreground">{t("walletPolicy.disclosure")}</p>
           <WalletActionButton
             label={busy === "topup" ? t("marketWallet.creating") : activeQuote ? t("walletPolicy.pay", { amount: formatMinorUsd(activeQuote.payMinor) }) : t("marketWallet.pay")}
-            phase={busy === "topup" ? "loading" : error ? "error" : "default"}
+            phase={busy === "topup" ? "loading" : topupError ? "error" : "default"}
             disabled={!loaded || !wallet.canTopup || !channels.length || parsedAmount == null || !methodReady || !activeQuote || !!busy}
           />
+          {topupError ? <p role="alert" className="text-sm text-destructive">{topupError}</p> : null}
           {matchingUnsettled ? <p className="text-xs text-amber-700">{t("marketWallet.reviewRetryNotice")}</p> : null}
           {!channels.length ? <p className="text-xs text-muted-foreground">{t("marketWallet.noChannelHelp")}</p> : null}
-        </form> : <div className="grid content-start gap-3 rounded-lg bg-muted/50 p-4 text-sm text-muted-foreground">
+        </form> : task === "topup" ? <div className="grid content-start gap-3 rounded-lg bg-muted/50 p-4 text-sm text-muted-foreground">
           <p>{t(wallet.mode === "shadow" ? "marketWallet.shadow" : wallet.mode === "enabled" ? "marketWallet.topupUnavailable" : "marketWallet.notOpen")}</p>
-        </div>}
-        </div>
+        </div> : null}
       </section>
 
       {session?.user?.id ? <C2COrdersPanel key={session.user.id} actor={session.user.id} selectedId={c2cOrderId} onSelect={setC2COrderId} /> : null}
 
       {(wallet.canTopup || wallet.hasWalletActivity) && !loaded ? <p className="text-sm text-muted-foreground">{t("common.loading")}</p> : null}
+      {historyError ? <p role="alert" className="rounded-md border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">{historyError}</p> : null}
       {wallet.canTopup || wallet.hasWalletActivity ? <div className="grid min-w-0 gap-6 lg:grid-cols-2">
-        <WalletHistorySection title={t("marketWallet.topups")} hasMore={!!topupCursor}
-          loading={busy === "topups"} disabled={!!busy} onLoadMore={() => loadMore("topups")}>
+        <WalletHistorySection title={t("marketWallet.topups")} collapsed={!historyExpanded.topups && topups.length > HISTORY_PREVIEW_LIMIT}
+          hasMore={!!topupCursor} loading={busy === "topups"} disabled={!!busy}
+          onShowEarlier={() => setHistoryExpanded((current) => ({ ...current, topups: true }))} onLoadMore={() => loadMore("topups")}>
           <ul className="grid gap-2">
-            {topups.map((order) => {
+            {(historyExpanded.topups ? topups : topups.slice(0, HISTORY_PREVIEW_LIMIT)).map((order) => {
               const gateway = gatewayStatuses[order.id];
               const abandoned = !!order.buyerAbandonedAt;
               const shownStatus = abandoned && order.status === "pending" && (gateway === undefined || gateway === null)
@@ -936,12 +1013,44 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
                       : order.lastGatewayStatus === "pending" ? t("marketWallet.status.gateway_pending")
                         : order.lastGatewayStatus === "awaiting_payment" ? t("marketWallet.status.awaiting_payment")
                           : t("marketWallet.status.gateway_unknown");
-              return <li key={order.id} className="flex min-w-0 flex-wrap items-center justify-between gap-2 rounded-md bg-muted/50 px-3 py-2 text-sm">
-                <div className="min-w-0">
+              const statusTone = shownStatus === "credited" ? "text-emerald-800"
+                : ["review_required", "payment_unavailable", "gateway_unavailable", "buyer_abandoned"].includes(shownStatus) || countdown?.phase === "soon" ? "text-amber-800"
+                  : checkoutUrl || shownStatus === "pending" || shownStatus === "awaiting_payment" ? "text-primary"
+                    : "text-muted-foreground";
+              return <li key={order.id} className="grid min-w-0 gap-2 rounded-md bg-muted/50 px-3 py-2 text-sm">
+                <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
                   <p className="flex flex-wrap items-center gap-2 font-medium tabular-nums">${((order.creditAmountMinor ?? order.amountMinor) / 100).toFixed(2)}
                     {directOrder && order.paymentTokenId ? <span className="rounded-full bg-accent/10 px-2 py-0.5 text-[0.7rem] font-medium text-accent">{paymentTokenLabel(order.paymentTokenId).label}</span> : null}
                   </p>
-                  <p className="text-xs text-muted-foreground">{dateText(order.createdAt, locale)}</p>
+                  <span className={`text-xs font-medium ${statusTone}`}>{neverCreated ? t("marketWallet.status.never_created") : t(`marketWallet.status.${shownStatus}` as Parameters<typeof t>[0])}</span>
+                </div>
+                <p className="text-xs text-muted-foreground">{dateText(order.createdAt, locale)}</p>
+                <div className="flex flex-wrap items-center gap-2">
+                  {checkoutUrl ? <a className="inline-flex min-h-11 items-center gap-1 whitespace-nowrap text-xs font-medium text-primary underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring" href={walletTopupCheckoutHref(order.id)} target="_blank" rel="noopener noreferrer">
+                    {t("marketWallet.continuePay")}<ArrowUpRight className="size-3" aria-hidden="true" />
+                  </a> : null}
+                  {(order.status === "review_required" || countdown?.phase === "checking" || pendingVerification || (abandoned && order.status === "pending") || order.buyerRecheckResult === "retrying") ? <Button size="sm" variant="outline" isDisabled={!!busy || statusBusyId === order.id} onPress={() => void requestRecheck(order.id)}>
+                    <RefreshCw className={`size-4 ${statusBusyId === order.id ? "animate-spin" : ""}`} aria-hidden="true" />{t("marketWallet.recheck")}
+                  </Button> : null}
+                  {canStopPayment && !(order.status === "pending" && gateway?.canCancel) ? <Button size="sm" variant="outline" isDisabled={!!busy || statusBusyId === order.id} onPress={() => setAbandonConfirmId(order.id)}>
+                    {t("marketWallet.abandonTopup")}
+                  </Button> : null}
+                  {wallet.canTopup && ["expired", "cancelled"].includes(order.status) ? <Button size="sm" variant="outline" isDisabled={!!busy} onPress={() => {
+                    idempotencyRef.current = null;
+                    setAmount(((order.creditAmountMinor ?? order.amountMinor) / 100).toFixed(2));
+                    setAmountTouched(false);
+                    setTask("topup");
+                    if (channels.some((channel) => channel.id === order.channelId)) setChannelId(order.channelId);
+                    document.getElementById("market-wallet-topup-amount")?.focus();
+                  }}>
+                    {t("marketWallet.restartTopup")}
+                  </Button> : null}
+                </div>
+                <details className="text-xs text-muted-foreground">
+                  <summary className="inline-flex min-h-11 cursor-pointer items-center gap-1 font-medium text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring">
+                    <ChevronDown className="size-3" aria-hidden="true" />{t("marketWallet.topupDetails")}
+                  </summary>
+                  <div className="grid gap-1 pb-2">
                   {order.platformFeeMinor > 0 ? <p className="text-xs text-muted-foreground">{t("walletPolicy.orderBreakdown", { fee: formatMinorUsd(order.platformFeeMinor), total: formatMinorUsd(order.amountMinor) })}</p> : null}
                   {neverCreated ? <p className="text-xs text-muted-foreground">{t("marketWallet.neverCreatedHelp")}</p> : null}
                   {order.paidAt ? <p className="text-xs text-muted-foreground">{t("marketWallet.paidAt", { time: dateText(order.paidAt, locale) })}</p> : null}
@@ -959,66 +1068,52 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
                   {order.buyerRecheckResult === "queued" ? <p role="status" className="mt-1 text-xs font-medium text-primary">{t("marketWallet.recheckQueued")}</p>
                     : order.buyerRecheckResult === "retrying" ? <p role="status" className="mt-1 text-xs text-amber-700">{t("marketWallet.recheckRetrying")}</p>
                       : order.buyerRecheckCompletedAt && order.buyerRecheckResult && recheckResultIsCurrent ? <p role="status" className="mt-1 text-xs text-muted-foreground">{t(`marketWallet.recheckResult.${order.buyerRecheckResult}` as Parameters<typeof t>[0], { time: dateText(order.buyerRecheckCompletedAt, locale) })}</p> : null}
-                  {order.lastGatewayCheckedAt ? <p className="text-xs text-muted-foreground">{t("marketWallet.lastGatewayCheck", { time: dateText(order.lastGatewayCheckedAt, locale), status: lastGatewayLabel })}</p> : null}
-                </div>
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="text-xs text-muted-foreground">{neverCreated ? t("marketWallet.status.never_created") : t(`marketWallet.status.${shownStatus}` as Parameters<typeof t>[0])}</span>
-                  {order.status === "pending" ? <Button size="sm" variant="ghost" isIconOnly aria-label={t("marketWallet.refreshGatewayStatus")} isDisabled={statusBusyId === order.id || !!busy} onPress={() => void refreshGatewayStatus(order.id)}>
-                    <RefreshCw className={`size-4 ${statusBusyId === order.id ? "animate-spin" : ""}`} aria-hidden="true" />
-                  </Button> : null}
-                  {order.status === "pending" && gateway?.canCancel ? <Button size="sm" variant="outline" isDisabled={!!busy || statusBusyId === order.id} onPress={() => void chooseCancelAction(order)}>
-                    <Ban className="size-4" aria-hidden="true" />{t("marketWallet.cancelPayment")}
-                  </Button> : null}
-                  {canStopPayment && !(order.status === "pending" && gateway?.canCancel) ? <Button size="sm" variant="outline" isDisabled={!!busy || statusBusyId === order.id} onPress={() => setAbandonConfirmId(order.id)}>
-                    {t("marketWallet.abandonTopup")}
-                  </Button> : null}
-                  {(order.status === "review_required" || countdown?.phase === "checking" || pendingVerification || (abandoned && order.status === "pending") || order.buyerRecheckResult === "retrying") ? <Button size="sm" variant="outline" isDisabled={!!busy || statusBusyId === order.id} onPress={() => void requestRecheck(order.id)}>
-                    <RefreshCw className={`size-4 ${statusBusyId === order.id ? "animate-spin" : ""}`} aria-hidden="true" />{t("marketWallet.recheck")}
-                  </Button> : null}
-                  {checkoutUrl ? <a className="inline-flex min-h-11 items-center gap-1 whitespace-nowrap text-xs font-medium text-primary underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring" href={walletTopupCheckoutHref(order.id)} target="_blank" rel="noopener noreferrer">
-                    {t("marketWallet.continuePay")}<ArrowUpRight className="size-3" aria-hidden="true" />
-                  </a> : null}
-                  {wallet.canTopup && ["expired", "cancelled"].includes(order.status) ? <Button size="sm" variant="outline" isDisabled={!!busy} onPress={() => {
-                    idempotencyRef.current = null;
-                    setAmount(((order.creditAmountMinor ?? order.amountMinor) / 100).toFixed(2));
-                    setAmountTouched(false);
-                    if (channels.some((channel) => channel.id === order.channelId)) setChannelId(order.channelId);
-                    document.getElementById("market-wallet-topup-amount")?.focus();
-                  }}>
-                    {t("marketWallet.restartTopup")}
-                  </Button> : null}
-                </div>
+                  {order.lastGatewayCheckedAt ? <p>{t("marketWallet.lastGatewayCheck", { time: dateText(order.lastGatewayCheckedAt, locale), status: lastGatewayLabel })}</p> : null}
+                  <div className="flex flex-wrap items-center gap-2 pt-1">
+                    {order.status === "pending" ? <Button size="sm" variant="ghost" isIconOnly aria-label={t("marketWallet.refreshGatewayStatus")} isDisabled={statusBusyId === order.id || !!busy} onPress={() => void refreshGatewayStatus(order.id)}>
+                      <RefreshCw className={`size-4 ${statusBusyId === order.id ? "animate-spin" : ""}`} aria-hidden="true" />
+                    </Button> : null}
+                    {order.status === "pending" && gateway?.canCancel ? <Button size="sm" variant="outline" isDisabled={!!busy || statusBusyId === order.id} onPress={() => void chooseCancelAction(order)}>
+                      <Ban className="size-4" aria-hidden="true" />{t("marketWallet.cancelPayment")}
+                    </Button> : null}
+                  </div>
+                  </div>
+                </details>
               </li>;
             })}
             {loaded && !topups.length ? <li className="text-sm text-muted-foreground">{t("marketWallet.noTopups")}</li> : null}
           </ul>
         </WalletHistorySection>
-        <WalletHistorySection title={t("marketWallet.transactions")} hasMore={!!transactionCursor}
-          loading={busy === "transactions"} disabled={!!busy} onLoadMore={() => loadMore("transactions")}>
+        <WalletHistorySection title={t("marketWallet.transactions")} collapsed={!historyExpanded.transactions && transactions.length > HISTORY_PREVIEW_LIMIT}
+          hasMore={!!transactionCursor} loading={busy === "transactions"} disabled={!!busy}
+          onShowEarlier={() => setHistoryExpanded((current) => ({ ...current, transactions: true }))} onLoadMore={() => loadMore("transactions")}>
           <ul className="grid gap-2">
-            {transactions.map((entry) => {
+            {(historyExpanded.transactions ? transactions : transactions.slice(0, HISTORY_PREVIEW_LIMIT)).map((entry) => {
               const delta = safeBigInt(entry.deltaUnits);
               const heldDelta = safeBigInt(entry.heldDeltaUnits);
               // A hold or release moves money between available and held without
               // changing the posted balance; show that movement instead of $0.00.
               const holdOnly = delta === 0n && heldDelta !== 0n;
+              const entryKey = walletEntryKey(entry);
+              const entryLabel = t(entryKey, entry.counterpartyEmail ? { email: entry.counterpartyEmail } : undefined);
+              const amountTone = holdOnly ? "text-muted-foreground" : delta > 0n ? "text-emerald-800" : delta < 0n ? "text-foreground" : "text-muted-foreground";
               return <li key={entry.id} className="flex min-w-0 items-center justify-between gap-2 rounded-md bg-muted/50 px-3 py-2 text-sm">
                 <div className="min-w-0">
-                  {entry.c2cOrderId ? <button type="button" onClick={() => setC2COrderId(entry.c2cOrderId ?? null)} className="inline-flex min-h-11 max-w-full items-center whitespace-nowrap font-medium text-primary underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring">{t("c2c.title")}</button> : <p className="truncate font-medium">{t(walletEntryKey(entry.sourceKind))}</p>}
-                  {entry.counterpartyEmail ? <p className="break-all text-xs text-muted-foreground">{entry.counterpartyEmail}</p> : null}
+                  {entry.c2cOrderId ? <button type="button" onClick={() => { setTask("c2c"); setC2COrderId(entry.c2cOrderId ?? null); }} className="inline-flex min-h-11 max-w-full items-center text-left font-medium text-primary underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring">{entryLabel}</button> : <p className="truncate font-medium">{entryLabel}</p>}
+                  {entry.counterpartyEmail && !entryKey.startsWith("marketWallet.entry.transfer") ? <p className="break-all text-xs text-muted-foreground">{entry.counterpartyEmail}</p> : null}
                   <p className="text-xs text-muted-foreground">{dateText(entry.createdAt, locale)}</p>
                 </div>
                 {holdOnly ? <span className="grid shrink-0 justify-items-end">
                   <span className="tabular-nums text-muted-foreground">{formatWalletUnits((heldDelta < 0n ? -heldDelta : heldDelta).toString())}</span>
                   <span className="text-[0.7rem] text-muted-foreground">{t(heldDelta > 0n ? "marketWallet.entryHeld" : "marketWallet.entryReleased")}</span>
-                </span> : <span className="shrink-0 tabular-nums">{formatWalletUnits(entry.deltaUnits)}</span>}
+                </span> : <span className={`shrink-0 tabular-nums ${amountTone}`}>{signedWalletUnits(entry.deltaUnits)}</span>}
               </li>;
             })}
             {loaded && !transactions.length ? <li className="text-sm text-muted-foreground">{t("marketWallet.noTransactions")}</li> : null}
           </ul>
         </WalletHistorySection>
       </div> : null}
-      <WalletTransferPanel onTransferred={async () => { if (session?.user?.id) notifyMarketBalanceChanged(session.user.id); await reload(); }} walletVersion={wallet.version} />
+      {task !== "transfer" ? <WalletTransferPanel onTransferred={async () => { if (session?.user?.id) notifyMarketBalanceChanged(session.user.id); await reload(); }} walletVersion={wallet.version} /> : null}
       {wallet.hasWalletActivity ? <MarketBuyerDisputesList /> : null}
       <ConfirmAlertDialog
         open={reviewRetryConfirm}

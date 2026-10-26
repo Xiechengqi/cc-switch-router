@@ -142,11 +142,11 @@ export function MarketNotificationsBell() {
         aria-expanded={open}
         aria-controls={panelId}
         onClick={toggle}
-        className="relative inline-flex size-11 items-center justify-center rounded-xl border border-border bg-card text-foreground transition-all duration-200 ease-out hover:-translate-y-0.5 hover:border-accent/30 hover:shadow-sm focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring active:scale-[0.98] motion-reduce:transition-none motion-reduce:hover:translate-y-0"
+        className="relative inline-flex size-11 items-center justify-center rounded-md text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring active:bg-slate-200"
       >
         <Bell className="size-4" aria-hidden="true" />
         {unread > 0 ? (
-          <span className="absolute -right-1.5 -top-1.5 inline-flex min-w-5 items-center justify-center rounded-full bg-gradient-to-r from-[#0052FF] to-[#4D7CFF] px-1.5 text-[0.68rem] font-semibold leading-5 text-white shadow-[0_4px_14px_rgba(0,82,255,0.25)]" aria-hidden="true">
+          <span className="absolute right-1 top-1 inline-flex min-w-4 items-center justify-center rounded-full bg-rose-600 px-1 text-[0.65rem] font-semibold leading-4 text-white" aria-hidden="true">
             {unread > 99 ? "99+" : unread}
           </span>
         ) : null}
