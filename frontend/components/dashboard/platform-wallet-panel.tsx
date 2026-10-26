@@ -1046,6 +1046,9 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
                     {t("marketWallet.restartTopup")}
                   </Button> : null}
                 </div>
+                {order.buyerRecheckResult === "queued" ? <p role="status" className="text-xs font-medium text-primary">{t("marketWallet.recheckQueued")}</p>
+                  : order.buyerRecheckResult === "retrying" ? <p role="status" className="text-xs text-amber-700">{t("marketWallet.recheckRetrying")}</p>
+                    : order.buyerRecheckCompletedAt && order.buyerRecheckResult && recheckResultIsCurrent ? <p role="status" className="text-xs text-muted-foreground">{t(`marketWallet.recheckResult.${order.buyerRecheckResult}` as Parameters<typeof t>[0], { time: dateText(order.buyerRecheckCompletedAt, locale) })}</p> : null}
                 <details className="text-xs text-muted-foreground">
                   <summary className="inline-flex min-h-11 cursor-pointer items-center gap-1 font-medium text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring">
                     <ChevronDown className="size-3" aria-hidden="true" />{t("marketWallet.topupDetails")}
@@ -1065,9 +1068,6 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
                   {order.status === "pending" && gateway && !gateway.canPay && !abandoned ? <p className="text-xs text-amber-700">{t(`marketWallet.payability.${gateway.payabilityReason ?? "gateway_unknown"}` as Parameters<typeof t>[0])}</p> : null}
                   {abandoned && !CLOSED_TOPUP_STATUS.has(order.status) ? <p className="text-xs text-muted-foreground">{t("marketWallet.abandonedHelp")}</p> : null}
                   {order.status === "review_required" ? <p className="mt-1 text-xs text-amber-700">{t(order.reviewReason === "terminal_payment_marker" ? "marketWallet.reviewTerminalMarker" : order.reviewReason === "paid_receipt_invalid" ? "marketWallet.reviewInvalidReceipt" : order.reviewReason === "paid_terms_review" ? "marketWallet.reviewPaidTerms" : "marketWallet.reviewHelp")}</p> : null}
-                  {order.buyerRecheckResult === "queued" ? <p role="status" className="mt-1 text-xs font-medium text-primary">{t("marketWallet.recheckQueued")}</p>
-                    : order.buyerRecheckResult === "retrying" ? <p role="status" className="mt-1 text-xs text-amber-700">{t("marketWallet.recheckRetrying")}</p>
-                      : order.buyerRecheckCompletedAt && order.buyerRecheckResult && recheckResultIsCurrent ? <p role="status" className="mt-1 text-xs text-muted-foreground">{t(`marketWallet.recheckResult.${order.buyerRecheckResult}` as Parameters<typeof t>[0], { time: dateText(order.buyerRecheckCompletedAt, locale) })}</p> : null}
                   {order.lastGatewayCheckedAt ? <p>{t("marketWallet.lastGatewayCheck", { time: dateText(order.lastGatewayCheckedAt, locale), status: lastGatewayLabel })}</p> : null}
                   <div className="flex flex-wrap items-center gap-2 pt-1">
                     {order.status === "pending" ? <Button size="sm" variant="ghost" isIconOnly aria-label={t("marketWallet.refreshGatewayStatus")} isDisabled={statusBusyId === order.id || !!busy} onPress={() => void refreshGatewayStatus(order.id)}>
