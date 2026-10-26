@@ -130,20 +130,20 @@ function C2COrdersWorkspace({ actor, selectedId, onSelect, embedded = false, sel
     setSnapshot(old => old ? { ...old, seller } : old);
     setEditorBusy(false); setSellOpen(false); setNotice(t("c2c.saved")); reload();
   };
+  const openSellerSettings = () => { setNotice(""); setEditorKey(v => v + 1); setSellOpen(true); };
+  const sellerSettingsLabel = t(snapshot?.state === "confirmation_required" ? "c2c.confirmAutoAccept" : snapshot?.seller ? "c2c.sellerSettings" : "c2c.seller");
   return <section id="c2c-orders" className={embedded ? "grid min-w-0 gap-4" : "grid min-w-0 gap-4 rounded-xl border border-border bg-card p-4 sm:p-6"} data-c2c-orders>
-    <header className={embedded ? "flex min-w-0 justify-end" : "flex min-w-0 flex-wrap items-center justify-between gap-3"}>
-      {embedded ? null : <h2 className="text-lg font-semibold">{t("c2c.title")}</h2>}
-      <C2CAction type="button" secondary disabled={!policy || !snapshot || pausing} onClick={() => { setNotice(""); setEditorKey(v => v + 1); setSellOpen(true); }}>
-        {t(snapshot?.state === "confirmation_required" ? "c2c.confirmAutoAccept" : snapshot?.seller ? "c2c.sellerSettings" : "c2c.seller")}
-      </C2CAction>
-    </header>
+    {embedded ? null : <header className="flex min-w-0 flex-wrap items-center justify-between gap-3">
+      <h2 className="text-lg font-semibold">{t("c2c.title")}</h2>
+      <C2CAction type="button" secondary disabled={!policy || !snapshot || pausing} onClick={openSellerSettings}>{sellerSettingsLabel}</C2CAction>
+    </header>}
     {snapshot?.seller ? <div className="flex min-w-0 flex-wrap items-center justify-between gap-2 text-sm">
       <p className="min-w-0 break-words text-muted-foreground">
         {t(`c2c.sellerState.${snapshot.state}`)}
         {" · "}{t("c2c.available", { amount: formatWalletUnits(snapshot.availableUnits) })}
         {snapshot.pendingOrders ? ` · ${t("c2c.pendingCount", { count: snapshot.pendingOrders })}` : ""}
       </p>
-      <div className="flex flex-wrap gap-2">{snapshot.seller.autoPauseReason && snapshot.seller.autoAcceptTermsVersion === 3 && snapshot.seller.enabled && !snapshot.seller.suspended ? <C2CAction type="button" phase={pausing ? "loading" : "default"} disabled={pausing || !snapshot.canEnable} onClick={() => void pause(true)}>{t("c2c.resumeSelling")}</C2CAction> : null}
+      <div className="flex flex-wrap gap-2">{embedded && sellerSettingsLabel !== t("c2c.seller") ? <C2CAction type="button" secondary disabled={!policy || !snapshot || pausing} onClick={openSellerSettings}>{sellerSettingsLabel}</C2CAction> : null}{snapshot.seller.autoPauseReason && snapshot.seller.autoAcceptTermsVersion === 3 && snapshot.seller.enabled && !snapshot.seller.suspended ? <C2CAction type="button" phase={pausing ? "loading" : "default"} disabled={pausing || !snapshot.canEnable} onClick={() => void pause(true)}>{t("c2c.resumeSelling")}</C2CAction> : null}
       {snapshot.seller.enabled ? <C2CAction type="button" secondary phase={pausing ? "loading" : "default"} disabled={pausing} onClick={() => void pause()}>{t("c2c.pauseSelling")}</C2CAction> : null}</div>
     </div> : null}
     {snapshot?.state === "confirmation_required" ? <p role="status" className="text-sm text-muted-foreground">{t("c2c.confirmAutoAcceptHelp")}</p> : null}

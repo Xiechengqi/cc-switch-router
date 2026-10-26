@@ -253,7 +253,7 @@ try {
   policy.enabled = false; sellerUnits = "0";
   const sell = await open("seller"); await sell.page.clock.install(); await sell.page.goto(`${base}/account/wallet/`);
   await sell.page.getByRole("button", { name: "C2C", exact: true }).click();
-  await sell.page.getByRole("button", { name: "Sell balance", exact: true }).click();
+  await sell.page.getByRole("group", { name: "C2C", exact: true }).getByRole("button", { name: "Sell balance", exact: true }).click();
   const sellerPanel = sell.page.locator("[data-c2c-orders]");
   let editor = sell.page.getByRole("dialog", { name: "Sell balance", exact: true });
   await editor.getByLabel("C2C description", { exact: true }).fill(description);
@@ -448,8 +448,8 @@ try {
   for (const width of [320, 375, 414, 768]) { await zh.page.setViewportSize({ width, height: 900 }); await geometry(zh.page, "[data-c2c-buy]"); }
   const zhSeller = await open("seller", "zh-CN"); await zhSeller.page.goto(`${base}/account/wallet/`);
   await zhSeller.page.getByRole("button", { name: "C2C", exact: true }).click();
-  await zhSeller.page.locator("[data-c2c-orders]").getByRole("button", { name: /出售设置|出售余额/ }).click();
-  const zhEditor = zhSeller.page.getByRole("dialog", { name: "出售设置", exact: true });
+  await zhSeller.page.getByRole("group", { name: "C2C", exact: true }).getByRole("button", { name: "出售余额", exact: true }).click();
+  const zhEditor = zhSeller.page.getByRole("dialog", { name: /出售设置|出售余额/ });
   await zhEditor.getByLabel("C2C 描述", { exact: true }).fill("支持支付宝和微信，Telegram：@seller，说明：https://seller.example.invalid");
   for (const expanded of [false, true]) {
     if (expanded) await zhEditor.locator("summary").click();
