@@ -3,6 +3,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { auditShareContractVersions } from "./share-contract-versions.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const errors = [];
@@ -25,8 +26,6 @@ function requireMarkers(relativePath, markers) {
 }
 
 const models = requireMarkers("src/models.rs", [
-  "MIN_SHARE_MARKET_CONTRACT_VERSION: u16 = 5",
-  "SHARE_CONTRACT_VERSION: u16 = 7",
   "pub struct ProviderModelProbe",
   "pub requested_model: String",
   "pub wire_model: String",
@@ -159,9 +158,7 @@ if (/\bAPP_PROBE\b/.test(models + store + scheduler + main)) {
   errors.push("Router Rust contract contains the retired APP_PROBE table");
 }
 
-requireMarkers("PROTOCOL.md", [
-  "Share Contract v7",
-  "MIN_SHARE_MARKET_CONTRACT_VERSION",
+const protocol = requireMarkers("PROTOCOL.md", [
   "modelProbe",
   "每个完整监测日固定 48 槽",
   "Codex → `appType=openai`",
@@ -174,6 +171,8 @@ requireMarkers("PROTOCOL.md", [
   "共享 7 分钟总预算",
   "每批最多回退一次",
 ]);
+const { errors: versionErrors, versions } = auditShareContractVersions(models, protocol);
+errors.push(...versionErrors);
 requireMarkers("frontend/package.json", [
   '"test:share-model-probe"',
   '"test:share-model-health-heatmap"',
@@ -190,4 +189,4 @@ if (errors.length) {
   process.exit(1);
 }
 
-console.log("Share model health contract audit ok: Contract v7, market floor v5, evidence v2, probe epochs, UTC slots, and heatmap aligned");
+console.log(`Share model health contract audit ok: reader v${versions.minimumVersion}..v${versions.currentVersion}, ordinary v7, market floor v${versions.marketMinimumVersion}, evidence v2, probe epochs, UTC slots, and heatmap aligned`);

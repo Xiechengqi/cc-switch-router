@@ -39,6 +39,7 @@ test("parallel CI retains every existing financial gate and separates profile ca
   assert.match(job("rust-tests"), /mkdir -p frontend\/out\s+bash [^\n]*cargo test --locked --no-run/);
   assert.match(job("build"), /shared-key: router-release-x86_64-unknown-linux-gnu/);
   assert.match(job("frontend"), /path: frontend\/\.next\/cache/);
+  assert.match(job("frontend"), /node --test [^\n]*scripts\/audit\/share-contract-versions\.test\.mjs/);
   assert.doesNotMatch(source, /path: frontend\/\.next\s*$/m);
   assert.match(job("frontend"), /name: frontend-\$\{\{ github.sha \}\}/);
   assert.match(job("build"), /name: frontend-\$\{\{ github.sha \}\}/);

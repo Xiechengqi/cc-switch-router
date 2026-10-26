@@ -177,7 +177,8 @@ Router 不接受长效 SSH 凭据。每次建链前 Server 申请一次性 lease
 
 `ShareDescriptor` 面向全新部署时必须满足以下约束:
 
-- Router当前reader支持 **Share Contract v2..v8**。Server普通未协商descriptor保持v7；账号周期v8须显式能力。v4引入本节`modelProbe`（Router仅对v4以上执行探针），v5引入Grok媒体权限，v6增加scoped quota metadata，v7增加只展示的`unobservedTiers`及Codex `bankedReset`；它们不参与调度/限流/容量评分。连接测试/模型健康检查保留v7兼容，Share Market最低版本仍v5，不因账号周期抬高。
+- Router 当前 reader 支持 **Share Contract v2..v8**。Server 普通未协商 descriptor 保持 **Share Contract v7**；账号周期 v8 须显式能力。v4 引入本节 `modelProbe`（Router 仅对 v4 以上执行探针），v5 引入 Grok 媒体权限，v6 增加 scoped quota metadata，v7 增加只展示的 `unobservedTiers` 及 Codex `bankedReset`；它们不参与调度/限流/容量评分。连接测试/模型健康检查保留 v7 兼容。
+- Share Market 最低版本仍为 v5（`MIN_SHARE_MARKET_CONTRACT_VERSION=5`），不因账号周期的协商扩展抬高。reader 上限、普通 descriptor 版本与市场最低版本是三项独立约束。
 - v8增加`tokenPeriod=accountReset`及userGrants只读`accountQuotaCycle/accountResetCapability/accountUsageBaseline`、`usageQuota.usageWatermark`。安装heartbeat响应同时返回`shareContractVersion=8,capabilities=["accountResetV1"]`；Server同时检查显式能力、Router URL/installation绑定和300秒有效期。普通v7必须省略新嵌套字段，v7携带accountReset/新字段拒绝，不能静默转换为sevenDays；市场报价不开放动态周期。
 - `accountQuotaCycle`包含`streamIncarnation/sourceRef/sourceEpoch/bucketId/cycleId/cycleSequence/cycleRevision/startsAtMs/endsAtMs/basis/observedAtMs/eventId`，UTC毫秒半开区间，end可空。缺完整历史时`usageQuota=null`而非0；Router不按本机时间外推窗口，不把本地历史加回Server权威账号quota，不用跨周期max。
 - 动态账号投影不改变管理员configRevision/静态descriptor generation/fingerprint。当前复用完整descriptor同步及ACK，Server Notify+30秒重放，**没有独立dynamic envelope或精确usageWatermark ACK**。先检查stream/source/epoch，再按cycleSequence、同cycle revision和usageWatermark合并；合法更高水位允许数值下降，旧周期/旧水位丢弃。source交接要求更新config revision；新stream完整descriptor为restore握手，允许合法静态版本从旧备份恢复，旧stream在Share级永久retire，不能随用户删除/新增复活。

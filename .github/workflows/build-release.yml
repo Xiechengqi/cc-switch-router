@@ -34,7 +34,7 @@ jobs:
         run: |
           bash scripts/ci/timed.sh 'Provenance audit' node scripts/audit/audit-source-provenance.mjs
           node scripts/audit/audit-provider-icon-provenance.mjs
-          node --test scripts/audit/source-provenance.test.mjs scripts/audit/provider-icon-provenance.test.mjs scripts/ci/ci.test.mjs
+          node --test scripts/audit/source-provenance.test.mjs scripts/audit/provider-icon-provenance.test.mjs scripts/audit/share-contract-versions.test.mjs scripts/ci/ci.test.mjs
 
       - name: Cache Twemoji flag sources
         uses: actions/cache@v5
