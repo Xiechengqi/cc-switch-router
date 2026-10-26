@@ -62,6 +62,25 @@ test("unchanged settings send no grants, runtime snapshots, or market tombstones
   assert.deepEqual(patch, {});
 });
 
+test("account quota background updates do not dirty an open draft; usage edits keep the frozen cycle", () => {
+  const cycle: NonNullable<ShareUserGrant["accountQuotaCycle"]> = { streamIncarnation: "stream", sourceRef: "opaque",
+    sourceEpoch: 1, bucketId: "weekly", cycleId: "cycle", cycleSequence: 1, cycleRevision: 1,
+    startsAtMs: 4123, basis: "publicAnnouncement", observedAtMs: 5000, eventId: "event" };
+  const accountGrant = grant("owner@example.com", { role: "owner", revision: 3,
+    policy: { tokenPeriod: "accountReset", tokenLimit: 100 }, accountQuotaCycle: cycle });
+  const original = shareView({ "owner@example.com": accountGrant });
+  const draft = buildShareEditDraft(original);
+  const refreshed = structuredClone(original);
+  refreshed.userGrants!["owner@example.com"].accountQuotaCycle = { ...cycle, cycleRevision: 2, startsAtMs: 4124 };
+  refreshed.userGrants!["owner@example.com"].usageQuota = { period: "accountReset", windowStartsAtMs: 4124,
+    effectiveTokensUsed: 50, observedTokensUsed: 50, manualOffsetTokens: 0, observedRequestsCount: 1, rebaseApplies: false, usageWatermark: 10 };
+  assert.deepEqual(buildShareEditPatch(draft, refreshed, ["claude"]), {});
+  draft.userUsageEdits = { "owner@example.com": { action: "set", targetTokens: 5, expectedGrantRevision: 3, expectedAccountCycle: cycle } };
+  const patch = buildShareEditPatch(draft, refreshed, ["claude"]);
+  assert.equal(patch.userUsageEdits?.["owner@example.com"].expectedAccountCycle?.cycleRevision, 1);
+  assert.equal(patch.expectedAccountCycle?.cycleRevision, 1);
+});
+
 test("buildShareEditPatch writes a manual shareto over a revoked market tombstone", () => {
   const share = shareView({
     "owner@example.com": grant("owner@example.com", {

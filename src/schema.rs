@@ -304,6 +304,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         87,
         include_str!("../schema/0087_market_provider_contacts.sql"),
     ),
+    (
+        88,
+        include_str!("../schema/0088_account_quota_projection.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -1193,7 +1197,7 @@ mod tests {
             0
         );
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM pragma_table_info('market_c2c_policy') WHERE name='acceptance_minutes'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
-        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",[],|r|r.get::<_,i64>(0)).unwrap(),235);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",[],|r|r.get::<_,i64>(0)).unwrap(),237);
         for id in [
             "awaiting_seller",
             "awaiting_payment",
@@ -1679,7 +1683,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count baseline tables");
-        assert_eq!(table_count, 235);
+        assert_eq!(table_count, 237);
         let removed_client_recovery_table_count = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -2260,7 +2264,7 @@ mod tests {
             .unwrap();
         apply(&conn).unwrap();
         apply(&conn).unwrap();
-        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",[],|r|r.get::<_,i64>(0)).unwrap(),235);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",[],|r|r.get::<_,i64>(0)).unwrap(),237);
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM market_journal_postings", [], |r| r
                 .get::<_, i64>(0))
@@ -2487,8 +2491,8 @@ mod tests {
         // Twelve commission/conversion tables, seven C2C tables and one
         // narrowly scoped dispute-handler authorization table, plus immutable
         // session authorizations and per-channel notification deliveries.
-        // Independent business contacts add one table.
-        assert_eq!(tables_after - tables_before, 23);
+        // Contacts add one table; exact quota attribution adds two stream tables.
+        assert_eq!(tables_after - tables_before, 25);
         assert_eq!(
             conn.query_row(
                 "SELECT converted_units FROM market_provider_earning_lots WHERE id = 'old-lot'",

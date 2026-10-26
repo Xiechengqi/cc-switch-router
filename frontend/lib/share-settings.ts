@@ -219,6 +219,10 @@ export function changedShareSettings(next: ShareSettingsPatch, baseline: ShareSe
   const activeUsageEdits = Object.fromEntries(Object.entries(usageEdits).filter(([email]) =>
     next.userGrants?.[email]?.active !== false && !!next.userGrants?.[email] && !isRouterShareMarketManagedGrant(next.userGrants[email])));
   if (Object.keys(activeUsageEdits).length) patch.userUsageEdits = activeUsageEdits;
+  if (Object.values(userGrantEdits).some((edit) => edit.policy?.tokenPeriod === "accountReset") ||
+      Object.values(activeUsageEdits).some((edit) => edit.expectedAccountCycle)) {
+    patch.expectedAccountCycle = Object.values(next.userGrants ?? {}).find((grant) => grant.active !== false && grant.policy.tokenPeriod === "accountReset")?.accountQuotaCycle;
+  }
   return patch;
 }
 

@@ -11,7 +11,7 @@ pub const MIN_SHARE_CONTRACT_VERSION: u16 = 2;
 /// v7 only add quota presentation metadata, so v5 market records remain valid
 /// during a rolling Server/Router deployment.
 pub const MIN_SHARE_MARKET_CONTRACT_VERSION: u16 = 5;
-pub const SHARE_CONTRACT_VERSION: u16 = 7;
+pub const SHARE_CONTRACT_VERSION: u16 = 8;
 
 #[derive(Debug)]
 struct ParsedRawJson<T> {
@@ -1155,6 +1155,8 @@ pub struct ShareRuntimeRefreshRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareSettingsPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_account_cycle: Option<AccountQuotaCycle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_email: Option<String>,
     #[serde(
         default,
@@ -1369,6 +1371,54 @@ pub enum ShareTokenPeriod {
     SevenDays,
     CalendarMonth,
     ThirtyDays,
+    AccountReset,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum QuotaTimeBasis {
+    UpstreamWindow,
+    DerivedFromWindow,
+    KnownNaturalBoundary,
+    PublicAnnouncement,
+    RedeemConfirmation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountQuotaCycle {
+    pub stream_incarnation: String,
+    pub source_ref: String,
+    pub source_epoch: u64,
+    pub bucket_id: String,
+    pub cycle_id: String,
+    pub cycle_sequence: u64,
+    pub cycle_revision: u64,
+    pub starts_at_ms: i64,
+    pub ends_at_ms: Option<i64>,
+    pub basis: QuotaTimeBasis,
+    pub observed_at_ms: i64,
+    pub event_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountResetCapability {
+    pub support: String,
+    pub sync_status: String,
+    pub reason: Option<String>,
+    pub minimum_contract_version: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountQuotaBaseline {
+    pub source_ref: String,
+    pub cycle_id: String,
+    pub target_tokens: u64,
+    pub usage_watermark: u64,
+    pub applied_at_ms: i64,
+    pub applied_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -1459,6 +1509,8 @@ pub struct ShareUserUsageEdit {
     pub anchor_at_ms: Option<i64>,
     #[serde(default)]
     pub source: ShareUsageRebaseSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_account_cycle: Option<AccountQuotaCycle>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -1482,6 +1534,12 @@ pub struct ShareUserQuotaView {
     pub observed_requests_count: u64,
     #[serde(default)]
     pub rebase_applies: bool,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub usage_watermark: u64,
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -1520,6 +1578,12 @@ pub struct ShareUserGrant {
     pub usage_rebase: Option<ShareUserUsageRebase>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_quota: Option<ShareUserQuotaView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_quota_cycle: Option<AccountQuotaCycle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_reset_capability: Option<AccountResetCapability>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_usage_baseline: Option<AccountQuotaBaseline>,
     #[serde(default)]
     pub created_at_ms: u128,
     #[serde(default)]
@@ -1705,6 +1769,10 @@ pub struct ShareSyncOperation {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareRequestLogEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_attribution: Option<QuotaAttribution>,
     /// Downstream clients should prefer the proxied `X-CC-Switch-Request-Id` header as
     /// the request id when present so live dashboard events and synced request logs share
     /// one identity.
@@ -1789,6 +1857,15 @@ pub struct ShareRequestLogEntry {
 
 fn default_request_kind() -> String {
     "text".to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct QuotaAttribution {
+    pub source_ref: String,
+    pub source_epoch: u64,
+    pub bucket_id: String,
+    pub started_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2184,7 +2261,9 @@ pub struct ShareUserLimitStatusRow {
     pub token_period_anchor_at_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>,
-    pub tokens_used: u64,
+    pub tokens_used: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window_starts_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3588,6 +3667,8 @@ pub struct InstallationHeartbeatRequest {
 pub struct InstallationHeartbeatResponse {
     pub ok: bool,
     pub server_time: DateTime<Utc>,
+    pub share_contract_version: u16,
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -26,6 +26,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 const APPLY_SHARE_SETTINGS_PATH: &str = "/_ctl/apply_share_settings";
 const REFRESH_SHARE_USAGE_PATH: &str = "/_ctl/refresh_share_usage";
+const PREVIEW_ACCOUNT_RESET_PATH: &str = "/_ctl/preview_account_reset";
 const VERIFY_SHARE_ACCOUNT_RECOVERY_PATH: &str = "/_ctl/verify_share_account_recovery";
 const PREPARE_CLIENT_SUBDOMAIN_ADOPTION_PATH: &str = "/_ctl/client-subdomain-adoption/prepare";
 const COMMIT_CLIENT_SUBDOMAIN_ADOPTION_PATH: &str = "/_ctl/client-subdomain-adoption/commit";
@@ -361,6 +362,18 @@ async fn post_control<T: serde::de::DeserializeOwned>(
     .await
 }
 
+pub async fn preview_account_reset(
+    backend: &str,
+    installation_id: &str,
+    control_secret: &str,
+    share_id: &str,
+    expected_config_revision: u64,
+    policies: &std::collections::BTreeMap<String, crate::models::ShareUserPolicy>,
+) -> Result<serde_json::Value, CtlError> {
+    post_control(backend, installation_id, control_secret, PREVIEW_ACCOUNT_RESET_PATH,
+        serde_json::json!({"shareId":share_id,"expectedConfigRevision":expected_config_revision,"policies":policies}).to_string()).await
+}
+
 async fn post_control_with_timeout<T: serde::de::DeserializeOwned>(
     backend: &str,
     installation_id: &str,
@@ -412,7 +425,18 @@ async fn post_control_with_timeout<T: serde::de::DeserializeOwned>(
             .map(Box::new);
         return Err(CtlError::Rejected {
             status: status.as_u16(),
-            body: body.chars().take(500).collect(),
+            body: body
+                .chars()
+                .take(
+                    if structured.as_ref().and_then(|reply| reply.code.as_deref())
+                        == Some("QUOTA_CYCLE_CONFLICT")
+                    {
+                        8192
+                    } else {
+                        500
+                    },
+                )
+                .collect(),
             message: structured.as_ref().and_then(|reply| reply.error.clone()),
             code: structured.as_ref().and_then(|reply| reply.code.clone()),
             retryable: structured.as_ref().and_then(|reply| reply.retryable),

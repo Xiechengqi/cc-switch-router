@@ -341,6 +341,13 @@ export async function getShareSettingsEdit(shareId: string, editId: string) {
   ));
 }
 
+export async function previewShareAccountReset(shareId: string, expectedConfigRevision: number,
+  policies?: Record<string, import("./types").ShareUserPolicy>): Promise<import("./types").AccountResetPreview> {
+  return parseJson<import("./types").AccountResetPreview>(await authFetch(`/v1/shares/${encodeURIComponent(shareId)}/account-reset-preview`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ expectedConfigRevision, policies }),
+  }));
+}
+
 export async function updateShareSettings(
   shareId: string,
   patch: ShareSettingsPatch,

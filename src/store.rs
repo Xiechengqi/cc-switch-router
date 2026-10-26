@@ -3581,6 +3581,8 @@ impl AppStore {
         Ok(InstallationHeartbeatResponse {
             ok: true,
             server_time: now,
+            share_contract_version: SHARE_CONTRACT_VERSION,
+            capabilities: vec!["accountResetV1".into()],
         })
     }
 
@@ -8544,7 +8546,8 @@ impl AppStore {
                         session_id, user_country, user_country_iso3, user_email, is_health_check, created_at,
                         request_kind, operation, parent_request_id, error_message, media_task_id, media_status,
                         video_duration_seconds, video_resolution, video_aspect_ratio,
-                        cache_usage_observed, usage_estimated
+                        cache_usage_observed, usage_estimated,
+                        started_at_ms, quota_source_ref, quota_source_epoch, quota_bucket_id
                  FROM share_request_logs
                  WHERE share_id = ?1
                    AND COALESCE(is_health_check, 0) = 0
@@ -9257,7 +9260,7 @@ impl AppStore {
         let mut grant_windows = Vec::with_capacity(grants.len());
         let mut unique_windows = BTreeMap::<String, UserQuotaWindow>::new();
         for grant in &grants {
-            let (start, end) = token_period_window(&grant.policy, now)?;
+            let (start, end) = grant_quota_window(grant, now)?;
             let key = quota_window_key(start, end);
             unique_windows
                 .entry(key.clone())
@@ -9286,13 +9289,17 @@ impl AppStore {
                     .and_then(|map| map.get(&email))
                     .copied()
                     .unwrap_or(0);
-                let tokens_used =
-                    effective_share_user_tokens(&grant, window_start.as_ref(), logged_tokens);
+                let account_pending = period == ShareTokenPeriod::AccountReset
+                    && (grant.account_quota_cycle.is_none() || grant.usage_quota.is_none());
+                let tokens_used = (!account_pending).then(|| {
+                    effective_share_user_tokens(&grant, window_start.as_ref(), logged_tokens)
+                });
                 let percent = grant
                     .policy
                     .token_limit
                     .filter(|limit| *limit > 0)
-                    .map(|limit| ((tokens_used as f64 / limit as f64) * 100.0).clamp(0.0, 9999.0));
+                    .zip(tokens_used)
+                    .map(|(limit, used)| ((used as f64 / limit as f64) * 100.0).clamp(0.0, 9999.0));
                 ShareUserLimitStatusRow {
                     email: grant.email,
                     role: if grant.role.eq_ignore_ascii_case("owner") {
@@ -9306,6 +9313,17 @@ impl AppStore {
                     token_period_anchor_at_ms: grant.policy.token_period_anchor_at_ms,
                     expires_at: grant.policy.expires_at,
                     tokens_used,
+                    quota_status: (period == ShareTokenPeriod::AccountReset).then(|| {
+                        if account_pending {
+                            "initializing".to_string()
+                        } else {
+                            grant
+                                .account_reset_capability
+                                .as_ref()
+                                .map(|capability| capability.sync_status.clone())
+                                .unwrap_or_else(|| "stale".into())
+                        }
+                    }),
                     window_starts_at: window_start.map(|ts| ts.to_rfc3339()),
                     percent,
                     resets_at: resets_at.map(|ts| ts.to_rfc3339()),
@@ -9620,7 +9638,7 @@ impl AppStore {
         let mut targets = Vec::with_capacity(grants.len());
         let mut windows = Vec::with_capacity(grants.len());
         for grant in &grants {
-            let (start, end) = token_period_window(&grant.policy, now)?;
+            let (start, end) = grant_quota_window(grant, now)?;
             let email = normalize_usage_email(&grant.email)
                 .unwrap_or_else(|| grant.email.trim().to_ascii_lowercase());
             targets.push(UsageBreakdownTarget {
@@ -15703,6 +15721,25 @@ fn validate_strict_share_descriptor_tx(
     let Some((current_generation, current_fingerprint)) = current else {
         return Ok(true);
     };
+    if let Some(stream) = share.user_grants.values().find_map(|grant| {
+        grant
+            .account_quota_cycle
+            .as_ref()
+            .map(|cycle| &cycle.stream_incarnation)
+    }) {
+        let active: Option<String> = conn
+            .query_row(
+                "SELECT stream_incarnation FROM share_quota_active_streams WHERE share_id=?1",
+                params![share.share_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| AppError::Internal(format!("read quota handshake failed: {error}")))?;
+        if active.is_some_and(|active| active != *stream) {
+            let mut checked = share.clone();
+            return merge_account_quota_projections(conn, &mut checked);
+        }
+    }
     if share.descriptor_generation < current_generation {
         return Err(AppError::Conflict(format!(
             "Share descriptor generation regressed from {current_generation} to {}",
@@ -16081,6 +16118,7 @@ fn upsert_share_tx(
 ) -> Result<(), AppError> {
     normalize_share_descriptor_fields(&mut share)?;
     validate_share_descriptor_bindings(&share)?;
+    let new_quota_stream = merge_account_quota_projections(conn, &mut share)?;
     let chat_share_id = share.share_id.clone();
     let next_model_probe_epoch = descriptor_model_probe_epoch_input(&share);
     let previous_event_snapshot = conn
@@ -16213,7 +16251,7 @@ fn upsert_share_tx(
             share_access_policy_version = excluded.share_access_policy_version,
             runtime_refreshed_at = shares.runtime_refreshed_at,
             updated_at = excluded.updated_at
-        WHERE excluded.descriptor_generation > shares.descriptor_generation
+        WHERE ?46 OR excluded.descriptor_generation > shares.descriptor_generation
            OR (
                 excluded.descriptor_generation = shares.descriptor_generation
                 AND excluded.descriptor_fingerprint = shares.descriptor_fingerprint
@@ -16265,10 +16303,12 @@ fn upsert_share_tx(
             i64::from(share.grok_media_policy.video_generation_enabled as u8),
             i64::from(share.free_access as u8),
             i64::from(share.contract_version),
+            new_quota_stream,
         ],
     )
     .map_err(map_share_constraint_error)?;
     if share_changed > 0 {
+        commit_account_quota_stream(conn, &share)?;
         conn.execute(
             "DELETE FROM share_bindings WHERE share_id = ?1",
             params![chat_share_id],
@@ -16852,7 +16892,236 @@ fn upsert_share_request_log_tx(
         ],
     )
     .map_err(|e| AppError::Internal(format!("upsert share request log failed: {e}")))?;
+    if changed > 0 {
+        let attribution = log.quota_attribution.as_ref();
+        if attribution
+            .is_some_and(|attribution| Some(attribution.started_at_ms) != log.started_at_ms)
+            || log.started_at_ms.is_some_and(|started| started < 0)
+        {
+            return Err(AppError::BadRequest(
+                "invalid exact quota log attribution".into(),
+            ));
+        }
+        conn.execute(
+            "UPDATE share_request_logs SET started_at_ms=?2, quota_source_ref=?3,
+            quota_source_epoch=?4, quota_bucket_id=?5 WHERE request_id=?1 AND installation_id=?6",
+            params![
+                log.request_id,
+                log.started_at_ms,
+                attribution.map(|a| &a.source_ref),
+                attribution
+                    .map(|a| i64::try_from(a.source_epoch))
+                    .transpose()
+                    .map_err(|_| AppError::BadRequest("quota epoch overflow".into()))?,
+                attribution.map(|a| &a.bucket_id),
+                installation_id
+            ],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("save exact quota log provenance failed: {error}"))
+        })?;
+    }
     Ok(changed > 0)
+}
+
+fn merge_account_quota_projections(
+    conn: &Connection,
+    share: &mut ShareDescriptor,
+) -> Result<bool, AppError> {
+    let previous: Option<(u64, String)> = conn
+        .query_row(
+            "SELECT config_revision, COALESCE(user_grants_json,'{}') FROM shares WHERE share_id=?1",
+            params![share.share_id],
+            |row| Ok((row.get::<_, i64>(0)?.max(0) as u64, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| AppError::Internal(format!("read quota projection failed: {error}")))?;
+    let (revision, grants) = previous.unwrap_or((0, "{}".into()));
+    let previous = parse_share_user_grants(Some(grants))
+        .map_err(|error| AppError::Internal(format!("read quota grants failed: {error}")))?;
+    let mut incoming_stream: Option<&str> = None;
+    for grant in share.user_grants.values() {
+        if share.contract_version < 8
+            && (grant.policy.token_period == ShareTokenPeriod::AccountReset
+                || grant.account_quota_cycle.is_some()
+                || grant.account_reset_capability.is_some()
+                || grant.account_usage_baseline.is_some())
+        {
+            return Err(AppError::BadRequest(
+                "account quota fields require Share contract v8".into(),
+            ));
+        }
+        let Some(cycle) = &grant.account_quota_cycle else {
+            if grant.policy.token_period == ShareTokenPeriod::AccountReset
+                && grant.usage_quota.is_some()
+            {
+                return Err(AppError::BadRequest(
+                    "account quota usage requires a cycle".into(),
+                ));
+            }
+            continue;
+        };
+        if cycle.stream_incarnation.is_empty()
+            || cycle.source_ref.is_empty()
+            || cycle.source_epoch == 0
+            || cycle.bucket_id.is_empty()
+            || cycle.cycle_id.is_empty()
+            || cycle.event_id.is_empty()
+            || cycle.cycle_sequence == 0
+            || cycle.cycle_revision == 0
+            || cycle.starts_at_ms < 0
+            || cycle.observed_at_ms < cycle.starts_at_ms
+            || cycle
+                .ends_at_ms
+                .is_some_and(|end| end <= cycle.starts_at_ms)
+        {
+            return Err(AppError::BadRequest("invalid account quota cycle".into()));
+        }
+        if incoming_stream.is_some_and(|stream| stream != cycle.stream_incarnation) {
+            return Err(AppError::BadRequest(
+                "a full quota snapshot must use one stream".into(),
+            ));
+        }
+        incoming_stream = Some(&cycle.stream_incarnation);
+        if grant.policy.token_period == ShareTokenPeriod::AccountReset
+            && grant.usage_quota.is_some_and(|quota| {
+                quota.period != ShareTokenPeriod::AccountReset
+                    || quota.window_starts_at_ms != Some(cycle.starts_at_ms)
+                    || quota.window_ends_at_ms != cycle.ends_at_ms
+            })
+        {
+            return Err(AppError::BadRequest(
+                "account quota usage window disagrees with cycle".into(),
+            ));
+        }
+    }
+    let mut new_stream = false;
+    if let Some(stream) = incoming_stream {
+        let retired: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM share_quota_retired_streams WHERE share_id=?1 AND stream_incarnation=?2)",
+            params![share.share_id, stream], |row| row.get(0))
+            .map_err(|error| AppError::Internal(format!("read quota stream failed: {error}")))?;
+        if retired {
+            return Err(AppError::Conflict(
+                "retired quota stream snapshot discarded".into(),
+            ));
+        }
+        let active: Option<String> = conn
+            .query_row(
+                "SELECT stream_incarnation FROM share_quota_active_streams WHERE share_id=?1",
+                params![share.share_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!("read active quota stream failed: {error}"))
+            })?;
+        new_stream = active.is_some_and(|active| active != stream);
+    }
+    for (email, next) in &mut share.user_grants {
+        let Some(prior) = previous.get(email) else {
+            continue;
+        };
+        if next.account_quota_cycle.is_none()
+            && prior.account_quota_cycle.is_some()
+            && !new_stream
+            && share.config_revision <= revision
+        {
+            next.account_quota_cycle
+                .clone_from(&prior.account_quota_cycle);
+            next.account_reset_capability
+                .clone_from(&prior.account_reset_capability);
+            next.account_usage_baseline
+                .clone_from(&prior.account_usage_baseline);
+            if next.policy.token_period == ShareTokenPeriod::AccountReset {
+                next.usage_quota = prior.usage_quota;
+            }
+        }
+        let (Some(incoming), Some(current)) =
+            (&next.account_quota_cycle, &prior.account_quota_cycle)
+        else {
+            continue;
+        };
+        let same_stream = incoming.stream_incarnation == current.stream_incarnation;
+        let same_source = incoming.source_ref == current.source_ref
+            && incoming.source_epoch == current.source_epoch
+            && incoming.bucket_id == current.bucket_id;
+        if !same_source && same_stream && share.config_revision <= revision {
+            return Err(AppError::Conflict(
+                "quota source handoff requires a newer binding revision".into(),
+            ));
+        }
+        let stale = same_stream
+            && same_source
+            && (incoming.cycle_sequence < current.cycle_sequence
+                || next
+                    .usage_quota
+                    .map(|q| q.usage_watermark)
+                    .unwrap_or(u64::MAX)
+                    < prior.usage_quota.map(|q| q.usage_watermark).unwrap_or(0)
+                || (incoming.cycle_sequence == current.cycle_sequence
+                    && incoming.cycle_revision < current.cycle_revision));
+        if same_stream
+            && same_source
+            && incoming.cycle_sequence == current.cycle_sequence
+            && incoming.cycle_id != current.cycle_id
+        {
+            return Err(AppError::Conflict("quota cycle identity conflict".into()));
+        }
+        if same_stream
+            && same_source
+            && incoming.cycle_sequence == current.cycle_sequence
+            && incoming.cycle_revision == current.cycle_revision
+            && (incoming.starts_at_ms != current.starts_at_ms
+                || incoming.ends_at_ms != current.ends_at_ms)
+        {
+            return Err(AppError::Conflict(
+                "quota boundary changed without a revision".into(),
+            ));
+        }
+        if same_stream
+            && same_source
+            && incoming.cycle_sequence > current.cycle_sequence
+            && (incoming.starts_at_ms <= current.starts_at_ms
+                || incoming.cycle_id == current.cycle_id)
+        {
+            return Err(AppError::Conflict(
+                "invalid quota cycle sequence advance".into(),
+            ));
+        }
+        if stale {
+            next.account_quota_cycle
+                .clone_from(&prior.account_quota_cycle);
+            next.account_reset_capability
+                .clone_from(&prior.account_reset_capability);
+            next.account_usage_baseline
+                .clone_from(&prior.account_usage_baseline);
+            next.usage_quota = prior.usage_quota;
+        }
+    }
+    Ok(new_stream)
+}
+
+// Publish only after the descriptor was accepted. Production callers hold a
+// SQL transaction, so a later validation/storage failure rolls this back too.
+fn commit_account_quota_stream(conn: &Connection, share: &ShareDescriptor) -> Result<(), AppError> {
+    let Some(stream) = share.user_grants.values().find_map(|grant| {
+        grant
+            .account_quota_cycle
+            .as_ref()
+            .map(|cycle| &cycle.stream_incarnation)
+    }) else {
+        return Ok(());
+    };
+    conn.execute("INSERT OR IGNORE INTO share_quota_retired_streams(share_id,stream_incarnation)
+        SELECT share_id,stream_incarnation FROM share_quota_active_streams WHERE share_id=?1 AND stream_incarnation<>?2",
+        params![share.share_id, stream]).map_err(|error| AppError::Internal(format!("retire quota stream failed: {error}")))?;
+    conn.execute(
+        "INSERT INTO share_quota_active_streams(share_id,stream_incarnation) VALUES(?1,?2)
+        ON CONFLICT(share_id) DO UPDATE SET stream_incarnation=excluded.stream_incarnation",
+        params![share.share_id, stream],
+    )
+    .map_err(|error| AppError::Internal(format!("save active quota stream failed: {error}")))?;
+    Ok(())
 }
 
 fn validate_gateway_request_observation(log: &GatewayRequestObservation) -> Result<(), AppError> {
@@ -20218,6 +20487,11 @@ fn token_period_window(
     now: DateTime<Utc>,
 ) -> Result<(Option<DateTime<Utc>>, Option<DateTime<Utc>>), AppError> {
     let result = match policy.token_period {
+        ShareTokenPeriod::AccountReset => {
+            return Err(AppError::BadRequest(
+                "accountReset requires the Server quota projection".into(),
+            ));
+        }
         ShareTokenPeriod::Lifetime => (None, None),
         ShareTokenPeriod::Day => {
             let start = now
@@ -20408,6 +20682,9 @@ mod token_period_window_tests {
         let now = Utc.with_ymd_and_hms(2026, 7, 24, 15, 30, 0).unwrap();
         let current_day_start = Utc.with_ymd_and_hms(2026, 7, 24, 0, 0, 0).unwrap();
         let mut grant = ShareUserGrant {
+            account_quota_cycle: None,
+            account_reset_capability: None,
+            account_usage_baseline: None,
             email: "user@example.com".into(),
             role: "shareto".into(),
             active: true,
@@ -20456,6 +20733,9 @@ mod token_period_window_tests {
     #[test]
     fn effective_usage_adds_new_observed_tokens_on_top_of_a_saved_baseline() {
         let mut grant = ShareUserGrant {
+            account_quota_cycle: None,
+            account_reset_capability: None,
+            account_usage_baseline: None,
             email: "user@example.com".into(),
             role: "shareto".into(),
             active: true,
@@ -20496,6 +20776,8 @@ mod token_period_window_tests {
         init_schema(&conn).unwrap();
         let log = |request_id: &str, email: &str, created_at: i64, quota_tokens: u32| {
             ShareRequestLogEntry {
+                started_at_ms: None,
+                quota_attribution: None,
                 export_sequence: 0,
                 request_id: request_id.to_string(),
                 request_kind: "text".into(),
@@ -20592,9 +20874,29 @@ struct UserQuotaWindow {
 
 fn quota_window_key(start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>) -> String {
     match (start, end) {
-        (Some(start), Some(end)) => format!("{}:{}", start.timestamp(), end.timestamp()),
-        _ => "lifetime".to_string(),
+        (Some(start), Some(end)) => {
+            format!("{}:{}", start.timestamp_millis(), end.timestamp_millis())
+        }
+        (Some(start), None) => format!("{}:open", start.timestamp_millis()),
+        (None, Some(end)) => format!("unknown:{}", end.timestamp_millis()),
+        (None, None) => "lifetime".to_string(),
     }
+}
+
+fn grant_quota_window(
+    grant: &ShareUserGrant,
+    now: DateTime<Utc>,
+) -> Result<(Option<DateTime<Utc>>, Option<DateTime<Utc>>), AppError> {
+    if grant.policy.token_period != ShareTokenPeriod::AccountReset {
+        return token_period_window(&grant.policy, now);
+    }
+    let Some(cycle) = grant.account_quota_cycle.as_ref() else {
+        return Ok((None, None));
+    };
+    Ok((
+        DateTime::from_timestamp_millis(cycle.starts_at_ms),
+        cycle.ends_at_ms.and_then(DateTime::from_timestamp_millis),
+    ))
 }
 
 fn authoritative_share_user_tokens(
@@ -20609,6 +20911,15 @@ fn effective_share_user_tokens(
     window_start: Option<&DateTime<Utc>>,
     observed_tokens: u64,
 ) -> u64 {
+    if grant.policy.token_period == ShareTokenPeriod::AccountReset {
+        // The Server exact ledger is authoritative, including downward
+        // corrections. Router's legacy second-precision history cannot add to
+        // or max against this projection.
+        return grant
+            .usage_quota
+            .map(|quota| quota.effective_tokens_used)
+            .unwrap_or(0);
+    }
     if let Some(rebase) = grant.usage_rebase.as_ref() {
         if rebase.rebase_window_matches(window_start) {
             let extra = observed_tokens.saturating_sub(rebase.observed_tokens_at_rebase);
@@ -20628,6 +20939,10 @@ fn effective_share_user_tokens(
 fn grant_usage_tokens(grant: &ShareUserGrant, window_start: Option<&DateTime<Utc>>) -> u64 {
     let expected_start_ms = window_start.map(|start| start.timestamp_millis());
     match grant.policy.token_period {
+        ShareTokenPeriod::AccountReset => grant
+            .usage_quota
+            .map(|quota| quota.effective_tokens_used)
+            .unwrap_or(0),
         ShareTokenPeriod::Lifetime => (grant.usage.lifetime.started_at_ms == 0)
             .then_some(grant.usage.lifetime.tokens_used)
             .unwrap_or(0),
@@ -21944,6 +22259,7 @@ fn normalize_share_settings_patch(
         None => None,
     };
     Ok(ShareSettingsPatch {
+        expected_account_cycle: patch.expected_account_cycle,
         owner_email: None,
         description: match patch.description {
             Some(value) => Some(normalize_share_description(value)?),
@@ -23645,7 +23961,8 @@ fn list_global_recent_share_request_logs(
                     session_id, user_country, user_country_iso3, user_email, is_health_check, created_at,
                     request_kind, operation, parent_request_id, error_message, media_task_id, media_status,
                     video_duration_seconds, video_resolution, video_aspect_ratio,
-                    cache_usage_observed, usage_estimated
+                    cache_usage_observed, usage_estimated,
+                    started_at_ms, quota_source_ref, quota_source_epoch, quota_bucket_id
              FROM share_request_logs
              WHERE COALESCE(is_health_check, 0) = 0
              ORDER BY created_at DESC, request_id DESC
@@ -23673,7 +23990,8 @@ fn list_recent_share_request_logs(
                     session_id, user_country, user_country_iso3, user_email, is_health_check, created_at,
                     request_kind, operation, parent_request_id, error_message, media_task_id, media_status,
                     video_duration_seconds, video_resolution, video_aspect_ratio,
-                    cache_usage_observed, usage_estimated
+                    cache_usage_observed, usage_estimated,
+                    started_at_ms, quota_source_ref, quota_source_epoch, quota_bucket_id
              FROM (
                  SELECT request_id, share_id, share_name, provider_id, provider_name, app_type, model,
                         request_model, request_agent, requested_model, actual_model, actual_model_source,
@@ -23685,6 +24003,7 @@ fn list_recent_share_request_logs(
                         request_kind, operation, parent_request_id, error_message, media_task_id, media_status,
                         video_duration_seconds, video_resolution, video_aspect_ratio,
                         cache_usage_observed, usage_estimated,
+                        started_at_ms, quota_source_ref, quota_source_epoch, quota_bucket_id,
                         ROW_NUMBER() OVER (
                             PARTITION BY share_id
                             ORDER BY created_at DESC, request_id DESC
@@ -23705,6 +24024,23 @@ fn list_recent_share_request_logs(
 
 fn map_share_request_log_row(row: &crate::db::Row<'_>) -> crate::db::Result<ShareRequestLogEntry> {
     Ok(ShareRequestLogEntry {
+        started_at_ms: row.get(46)?,
+        quota_attribution: match (
+            row.get::<_, Option<String>>(47)?,
+            row.get::<_, Option<i64>>(48)?,
+            row.get::<_, Option<String>>(49)?,
+            row.get::<_, Option<i64>>(46)?,
+        ) {
+            (Some(source_ref), Some(epoch), Some(bucket_id), Some(started_at_ms)) if epoch > 0 => {
+                Some(crate::models::QuotaAttribution {
+                    source_ref,
+                    source_epoch: epoch as u64,
+                    bucket_id,
+                    started_at_ms,
+                })
+            }
+            _ => None,
+        },
         export_sequence: 0,
         request_id: row.get(0)?,
         share_id: row.get(1)?,
@@ -24957,6 +25293,9 @@ fn rebind_share_user_grants_to_owner(
         normalized
             .entry(previous_owner.clone())
             .or_insert_with(|| ShareUserGrant {
+                account_quota_cycle: None,
+                account_reset_capability: None,
+                account_usage_baseline: None,
                 email: previous_owner,
                 role: "shareto".to_string(),
                 active: true,
@@ -24971,6 +25310,9 @@ fn rebind_share_user_grants_to_owner(
     normalized
         .entry(new_owner.to_string())
         .or_insert_with(|| ShareUserGrant {
+            account_quota_cycle: None,
+            account_reset_capability: None,
+            account_usage_baseline: None,
             email: new_owner.to_string(),
             role: "owner".to_string(),
             active: true,
@@ -33478,6 +33820,9 @@ mod tests {
 
     fn test_share_user_grant(email: &str, role: &str, token_limit: u64) -> ShareUserGrant {
         ShareUserGrant {
+            account_quota_cycle: None,
+            account_reset_capability: None,
+            account_usage_baseline: None,
             email: email.to_string(),
             role: role.to_string(),
             active: true,
@@ -33510,6 +33855,155 @@ mod tests {
             },
             entitlement_id: None,
         }
+    }
+
+    fn quota_test_descriptor(
+        stream: &str,
+        sequence: u64,
+        watermark: u64,
+        tokens: u64,
+    ) -> ShareDescriptor {
+        let mut share = test_share_descriptor("share-quota", "quota-sub");
+        share.contract_version = 8;
+        share.descriptor_fingerprint = "a".repeat(64);
+        let mut grant = test_share_user_grant("owner@example.com", "owner", 1_000);
+        grant.policy.token_period = ShareTokenPeriod::AccountReset;
+        grant.account_quota_cycle = Some(serde_json::from_value(serde_json::json!({
+            "streamIncarnation":stream,"sourceRef":"opaque","sourceEpoch":1,"bucketId":"weekly",
+            "cycleId":format!("cycle-{sequence}"),"cycleSequence":sequence,"cycleRevision":1,
+            "startsAtMs":sequence as i64 * 1_000 + 123,"endsAtMs":null,"basis":"publicAnnouncement",
+            "observedAtMs":10_000,"eventId":format!("event-{sequence}")
+        })).unwrap());
+        grant.usage_quota = Some(crate::models::ShareUserQuotaView {
+            period: ShareTokenPeriod::AccountReset,
+            window_starts_at_ms: Some(sequence as i64 * 1_000 + 123),
+            effective_tokens_used: tokens,
+            observed_tokens_used: tokens,
+            usage_watermark: watermark,
+            ..Default::default()
+        });
+        share.user_grants = BTreeMap::from([("owner@example.com".into(), grant)]);
+        share
+    }
+
+    #[tokio::test]
+    async fn quota_projection_orders_cycles_watermarks_and_accepts_downward_correction() {
+        let (store, _config) = setup_store("quota-projection-order").await;
+        insert_installation(&store, "inst-quota").await;
+        let conn = store.conn.lock().await;
+        upsert_share_tx(
+            &conn,
+            "inst-quota",
+            quota_test_descriptor("stream", 2, 10, 10),
+        )
+        .unwrap();
+        for mut stale in [
+            quota_test_descriptor("stream", 1, 20, 900),
+            quota_test_descriptor("stream", 3, 9, 900),
+        ] {
+            merge_account_quota_projections(&conn, &mut stale).unwrap();
+            let grant = &stale.user_grants["owner@example.com"];
+            assert_eq!(
+                grant.account_quota_cycle.as_ref().unwrap().cycle_sequence,
+                2
+            );
+            assert_eq!(grant.usage_quota.unwrap().effective_tokens_used, 10);
+        }
+        let mut corrected = quota_test_descriptor("stream", 2, 11, 3);
+        merge_account_quota_projections(&conn, &mut corrected).unwrap();
+        assert_eq!(
+            corrected.user_grants["owner@example.com"]
+                .usage_quota
+                .unwrap()
+                .effective_tokens_used,
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn quota_restore_handshake_retires_stream_for_removed_and_new_users() {
+        let (store, _config) = setup_store("quota-restore-stream").await;
+        insert_installation(&store, "inst-quota").await;
+        let conn = store.conn.lock().await;
+        let mut old = quota_test_descriptor("old", 5, 50, 900);
+        old.descriptor_generation = 8;
+        old.config_revision = 8;
+        upsert_share_tx(&conn, "inst-quota", old.clone()).unwrap();
+        let mut restored = quota_test_descriptor("restored", 2, 10, 10);
+        restored.descriptor_generation = 1;
+        restored.config_revision = 1;
+        assert!(validate_strict_share_descriptor_tx(&conn, &restored).unwrap());
+        upsert_share_tx(&conn, "inst-quota", restored).unwrap();
+        let (_, current) = list_shares(&conn)
+            .unwrap()
+            .into_iter()
+            .find(|(_, share)| share.share_id == "share-quota")
+            .unwrap();
+        assert_eq!(
+            current.user_grants["owner@example.com"]
+                .usage_quota
+                .unwrap()
+                .effective_tokens_used,
+            10
+        );
+        // A retired snapshot must not be reintroduced even if it only carries
+        // a user absent from the restored descriptor.
+        let mut grant = old.user_grants.remove("owner@example.com").unwrap();
+        grant.email = "removed@example.com".into();
+        old.user_grants.insert(grant.email.clone(), grant);
+        assert!(merge_account_quota_projections(&conn, &mut old).is_err());
+        let active: String = conn.query_row("SELECT stream_incarnation FROM share_quota_active_streams WHERE share_id='share-quota'", [], |row| row.get(0)).unwrap();
+        assert_eq!(active, "restored");
+    }
+
+    #[tokio::test]
+    async fn quota_validation_does_not_publish_a_rejected_stream() {
+        let (store, _config) = setup_store("quota-invalid-stream").await;
+        insert_installation(&store, "inst-quota").await;
+        let conn = store.conn.lock().await;
+        let mut invalid = quota_test_descriptor("invalid", 1, 1, 10);
+        invalid
+            .user_grants
+            .get_mut("owner@example.com")
+            .unwrap()
+            .account_quota_cycle
+            .as_mut()
+            .unwrap()
+            .source_epoch = 0;
+        assert!(upsert_share_tx(&conn, "inst-quota", invalid).is_err());
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM share_quota_active_streams",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        let mut legacy = quota_test_descriptor("legacy", 1, 1, 10);
+        legacy.contract_version = 7;
+        assert!(merge_account_quota_projections(&conn, &mut legacy).is_err());
+    }
+
+    #[tokio::test]
+    async fn quota_source_handoff_requires_config_revision_and_null_view_stays_pending() {
+        let (store, _config) = setup_store("quota-source-handoff").await;
+        insert_installation(&store, "inst-quota").await;
+        let conn = store.conn.lock().await;
+        upsert_share_tx(
+            &conn,
+            "inst-quota",
+            quota_test_descriptor("stream", 1, 10, 10),
+        )
+        .unwrap();
+        let mut next = quota_test_descriptor("stream", 1, 11, 0);
+        let grant = next.user_grants.get_mut("owner@example.com").unwrap();
+        grant.account_quota_cycle.as_mut().unwrap().source_ref = "new-source".into();
+        grant.usage_quota = None;
+        assert!(merge_account_quota_projections(&conn, &mut next).is_err());
+        next.config_revision += 1;
+        merge_account_quota_projections(&conn, &mut next).unwrap();
+        assert!(next.user_grants["owner@example.com"].usage_quota.is_none());
     }
 
     #[test]
@@ -33865,6 +34359,8 @@ mod tests {
         created_at: i64,
     ) -> ShareRequestLogEntry {
         ShareRequestLogEntry {
+            started_at_ms: None,
+            quota_attribution: None,
             export_sequence: 0,
             request_id: request_id.into(),
             request_kind: "text".into(),
@@ -34637,9 +35133,9 @@ mod tests {
             .expect("limit status");
         assert_eq!(status.rows.len(), 2);
         assert_eq!(status.rows[0].email, "owner@example.com");
-        assert_eq!(status.rows[0].tokens_used, 500);
+        assert_eq!(status.rows[0].tokens_used, Some(500));
         assert_eq!(status.rows[1].email, "user@example.com");
-        assert_eq!(status.rows[1].tokens_used, 70);
+        assert_eq!(status.rows[1].tokens_used, Some(70));
 
         let _ = std::fs::remove_file(&config.database.path);
     }
@@ -34692,7 +35188,7 @@ mod tests {
             .await
             .expect("limit status");
         assert_eq!(status.rows[0].email, "user@example.com");
-        assert_eq!(status.rows[0].tokens_used, 10_500);
+        assert_eq!(status.rows[0].tokens_used, Some(10_500));
 
         let _ = std::fs::remove_file(&config.database.path);
     }
@@ -34798,7 +35294,7 @@ mod tests {
             .share_user_usage_breakdown("share-bd", Some("user@example.com"))
             .await
             .expect("breakdown");
-        assert_eq!(status.rows[0].tokens_used, 57);
+        assert_eq!(status.rows[0].tokens_used, Some(57));
         assert_eq!(breakdown.rows.len(), 1);
         assert!(!breakdown.rows[0].rebase_applied);
         assert_eq!(breakdown.rows[0].observed_totals.total, 57);
@@ -34899,13 +35395,13 @@ mod tests {
             .share_user_usage_breakdown("share-rebase", Some("user@example.com"))
             .await
             .expect("breakdown");
-        assert_eq!(status.rows[0].tokens_used, 10_500);
+        assert_eq!(status.rows[0].tokens_used, Some(10_500));
         assert!(breakdown.rows[0].rebase_applied);
         assert_eq!(breakdown.rows[0].observed_totals.total, 500);
         let by_model_sum: u64 = breakdown.rows[0].by_model.iter().map(|row| row.total).sum();
         assert_eq!(by_model_sum, breakdown.rows[0].observed_totals.total);
         assert_ne!(
-            breakdown.rows[0].observed_totals.total,
+            Some(breakdown.rows[0].observed_totals.total),
             status.rows[0].tokens_used
         );
 
@@ -37854,16 +38350,19 @@ mod tests {
     }
 
     #[test]
-    fn share_contract_v7_keeps_v6_compatible_and_rejects_future_versions() {
-        let mut legacy = test_share_descriptor("share-v6", "share-v6-sub");
-        legacy.contract_version = 6;
-        normalize_share_descriptor_fields(&mut legacy).expect("v6 descriptor remains readable");
+    fn share_contract_v8_keeps_v6_v7_compatible_and_rejects_future_versions() {
+        for version in [6, 7, 8] {
+            let mut descriptor = test_share_descriptor("share-readable", "share-readable-sub");
+            descriptor.contract_version = version;
+            normalize_share_descriptor_fields(&mut descriptor)
+                .expect("v6/v7/v8 descriptors remain readable");
+        }
 
-        let mut future = test_share_descriptor("share-v8", "share-v8-sub");
+        let mut future = test_share_descriptor("share-future", "share-future-sub");
         future.contract_version = SHARE_CONTRACT_VERSION + 1;
         let error = normalize_share_descriptor_fields(&mut future)
             .expect_err("future Share contract must fail closed");
-        assert!(error.to_string().contains("expected 2..=7"));
+        assert!(error.to_string().contains("expected 2..=8"));
     }
 
     #[test]
@@ -46951,6 +47450,9 @@ mod tests {
         share.user_grants.insert(
             "router@example.com".into(),
             ShareUserGrant {
+                account_quota_cycle: None,
+                account_reset_capability: None,
+                account_usage_baseline: None,
                 email: "router@example.com".into(),
                 role: "shareto".into(),
                 active: true,
@@ -47174,6 +47676,9 @@ mod tests {
         next.user_grants.insert(
             "router@example.com".into(),
             ShareUserGrant {
+                account_quota_cycle: None,
+                account_reset_capability: None,
+                account_usage_baseline: None,
                 email: "router@example.com".into(),
                 role: "shareto".into(),
                 active: true,
@@ -48736,6 +49241,8 @@ mod tests {
                 &conn,
                 "inst-clean",
                 ShareRequestLogEntry {
+                    started_at_ms: None,
+                    quota_attribution: None,
                     export_sequence: 0,
                     request_id: "req-old-share-log".into(),
                     request_kind: "text".into(),
@@ -48923,6 +49430,8 @@ mod tests {
         insert_share(&store, "inst-logs", "share-log-1", "log-sub", "active").await;
 
         let logs = vec![ShareRequestLogEntry {
+            started_at_ms: None,
+            quota_attribution: None,
             export_sequence: 1,
             request_id: "req-1".into(),
             request_kind: "text".into(),

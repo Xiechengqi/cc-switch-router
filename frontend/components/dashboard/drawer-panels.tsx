@@ -1426,6 +1426,7 @@ export function ShareUserLimitsTable({
     sharemarket: t("dashboard.usageEmail.role.sharemarket"),
   };
   const periodLabels: Record<ShareTokenPeriod, string> = {
+    accountReset: t("dashboard.userLimit.periodAccountReset"),
     lifetime: t("dashboard.userLimit.periodLifetime"),
     day: t("dashboard.userLimit.periodDay"),
     week: t("dashboard.userLimit.periodWeek"),
@@ -1515,6 +1516,7 @@ export function ShareUserLimitsTable({
             const period = row.tokenPeriod || "lifetime";
             const limit = row.tokenLimit;
             const used = row.tokensUsed || 0;
+            const quotaPending = period === "accountReset" && row.tokensUsed == null;
             const limited = limit != null && !isUnlimited(limit);
             const pct = limited && limit > 0 ? (used / limit) * 100 : 0;
             const countdown = formatResetCountdown(row.resetsAt, nowMs);
@@ -1574,7 +1576,7 @@ export function ShareUserLimitsTable({
                 <td className="overflow-hidden px-1.5 py-2">
                   <div className="font-mono leading-4">
                     <strong>
-                      {compactTokens(used)}
+                      {quotaPending ? t("quota.awaitingObservation") : compactTokens(used)}
                       {" / "}
                       {limited ? compactTokens(limit!) : "∞"}
                     </strong>
@@ -1591,7 +1593,7 @@ export function ShareUserLimitsTable({
                       ≈ {equivalent}
                     </div>
                   ) : null}
-                  {limited ? (
+                  {limited && !quotaPending ? (
                     <UsageBar
                       used={used}
                       limit={limit!}

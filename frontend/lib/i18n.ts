@@ -602,6 +602,7 @@ export const messages = {
     "shareMarket.period.sevenDays": "Every 7 days",
     "shareMarket.period.calendarMonth": "Calendar month",
     "shareMarket.period.thirtyDays": "Every 30 days",
+    "shareMarket.period.accountReset": "Account reset cycle",
 
     "marketApproval.accessTitle": "Owner approval required",
 
@@ -3269,6 +3270,15 @@ export const messages = {
     "dashboard.userLimit.periodSevenDays": "Every 7 days",
     "dashboard.userLimit.periodMonth": "Calendar month",
     "dashboard.userLimit.periodThirtyDays": "Every 30 days",
+    "dashboard.userLimit.periodAccountReset": "Account reset cycle",
+    "dashboard.userLimit.accountReset.saveFirst": "Reload the Share before previewing its account cycle.",
+    "dashboard.userLimit.accountReset.notReady": "Account cycle is not ready.",
+    "dashboard.userLimit.accountReset.preview": "Expected usage (not a reset). Check each user, then apply again:",
+    "dashboard.userLimit.accountReset.pending": "Waiting for account cycle / verified history",
+    "dashboard.userLimit.accountReset.noEnd": "Next reset not yet confirmed",
+    "dashboard.userLimit.accountReset.observed": "Last observation",
+    "dashboard.userLimit.accountReset.exceeded": "At or over the limit",
+    "dashboard.userLimit.accountReset.caveat": "Public announcement time is not per-account execution time. External resets without evidence cannot be guaranteed detectable. Confirmed cycles are retained during temporary failures.",
     "dashboard.userLimit.anchor": "Period start (UTC)",
     "dashboard.userLimit.anchorHint":
       "Resets at fixed intervals from this UTC time. It cannot be in the future.",
@@ -4087,6 +4097,7 @@ export const messages = {
     "shareMarket.period.sevenDays": "每 7 天",
     "shareMarket.period.calendarMonth": "自然月",
     "shareMarket.period.thirtyDays": "每 30 天",
+    "shareMarket.period.accountReset": "账号重置周期",
 
     "marketApproval.accessTitle": "需要 Owner 准入",
 
@@ -6668,6 +6679,15 @@ export const messages = {
     "dashboard.userLimit.periodSevenDays": "每 7 天",
     "dashboard.userLimit.periodMonth": "自然月",
     "dashboard.userLimit.periodThirtyDays": "每 30 天",
+    "dashboard.userLimit.periodAccountReset": "账号重置周期",
+    "dashboard.userLimit.accountReset.saveFirst": "请重新加载 Share 后预览账号周期。",
+    "dashboard.userLimit.accountReset.notReady": "账号周期尚未就绪。",
+    "dashboard.userLimit.accountReset.preview": "预计用量（不会清零）；核对各用户后再次应用：",
+    "dashboard.userLimit.accountReset.pending": "等待账号周期 / 完整历史",
+    "dashboard.userLimit.accountReset.noEnd": "下次重置待确认",
+    "dashboard.userLimit.accountReset.observed": "最后观测",
+    "dashboard.userLimit.accountReset.exceeded": "达到或超过限额",
+    "dashboard.userLimit.accountReset.caveat": "公共公告时间非逐账号执行时间；缺少证据的站外重置不能保证识别。暂时失败时沿用已确认周期。",
     "dashboard.userLimit.anchor": "周期开始时间（UTC）",
     "dashboard.userLimit.anchorHint":
       "从该 UTC 时间起每隔固定天数重置，不可晚于当前时间。",

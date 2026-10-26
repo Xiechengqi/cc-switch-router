@@ -6,7 +6,7 @@ import * as React from "react";
 
 import { ShareUserLimitsTable } from "@/components/dashboard/drawer-panels";
 import type { TFn } from "@/components/dashboard/share-dashboard-utils";
-import { getShareUserLimitStatus } from "@/lib/api";
+import { getShareUserLimitStatus, previewShareAccountReset } from "@/lib/api";
 import { useShareUserUsageBreakdown } from "@/lib/use-share-user-usage-breakdown";
 import type {
   ShareTokenPeriod,
@@ -15,6 +15,7 @@ import type {
   ShareUserLimitStatusRow,
   ShareUserPolicy,
   ShareUserUsageEditMap,
+  AccountResetPreview,
 } from "@/lib/types";
 import {
   isRevokedRouterShareMarketGrant,
@@ -83,6 +84,7 @@ function makeDraft(email: string, policy: ShareUserPolicy): GrantDraft {
 
 function currentGrantTokens(grant: ShareUserGrant): number {
   if (grant.usageQuota) return grant.usageQuota.effectiveTokensUsed;
+  if (grant.policy.tokenPeriod === "accountReset") return 0; // rendered as pending below
   const usage = grant.usage as
     | {
         day?: { tokensUsed?: number };
@@ -130,7 +132,8 @@ function usageEditForGrant(
     };
   }
   return {
-    consumedTokens: tokensToMillionsInput(currentGrantTokens(grant)),
+    consumedTokens: grant.policy.tokenPeriod === "accountReset" && !grant.usageQuota
+      ? "" : tokensToMillionsInput(currentGrantTokens(grant)),
     usageAction: "unchanged",
   };
 }
@@ -163,9 +166,10 @@ function grantToLimitStatusRow(
     tokenPeriod: period,
     tokenPeriodAnchorAtMs: grant.policy.tokenPeriodAnchorAtMs,
     expiresAt: grant.policy.expiresAt,
-    tokensUsed: grantHasUsageOverride(grant, usageEdits) || !liveRow
+    tokensUsed: period === "accountReset" && !grant.usageQuota && !grantHasUsageOverride(grant, usageEdits)
+      ? null : grantHasUsageOverride(grant, usageEdits) || !liveRow
       ? displayedGrantTokens(grant, usageEdits)
-      : liveRow.tokensUsed || 0,
+      : liveRow.tokensUsed,
     windowStartsAt: livePeriodMatches ? liveRow?.windowStartsAt : undefined,
     resetsAt: livePeriodMatches ? liveRow?.resetsAt : undefined,
   };
@@ -200,6 +204,7 @@ export function ShareUserGrantsEditor({
   t,
   disabled,
   shareId,
+  configRevision,
   usageEdits = {},
   onUsageEditsChange,
   onChange,
@@ -211,11 +216,33 @@ export function ShareUserGrantsEditor({
   t: TFn;
   disabled?: boolean;
   shareId?: string;
+  configRevision?: number;
   usageEdits?: ShareUserUsageEditMap;
   onUsageEditsChange?: (value: ShareUserUsageEditMap) => void;
   onChange: (value: ShareUserGrantMap) => void;
 }) {
   const normalizedOwner = ownerEmail.trim().toLowerCase();
+  const [accountPreview, setAccountPreview] = React.useState<AccountResetPreview>();
+  const [previewIntent, setPreviewIntent] = React.useState("");
+  const [previewBusy, setPreviewBusy] = React.useState(false);
+  const [draftCycle, setDraftCycle] = React.useState<ShareUserGrant["accountQuotaCycle"]>();
+  const [batchCycle, setBatchCycle] = React.useState<ShareUserGrant["accountQuotaCycle"]>();
+  const accountCapability = accountPreview?.accountResetCapability ?? Object.values(value).find((grant) => grant.accountResetCapability)?.accountResetCapability;
+  const accountCycle = accountPreview?.accountQuotaCycle ?? Object.values(value).find((grant) => grant.accountQuotaCycle)?.accountQuotaCycle;
+  const confirmAccountPreview = async (policies: Record<string, ShareUserPolicy>, intent: string) => {
+    if (!shareId || configRevision == null) throw new Error(t("dashboard.userLimit.accountReset.saveFirst"));
+    if (previewIntent === intent && accountPreview?.accountResetCapability.syncStatus === "ready") return true;
+    setPreviewBusy(true);
+    try {
+      const preview = await previewShareAccountReset(shareId, configRevision, policies);
+      setAccountPreview(preview);
+      if (preview.accountResetCapability.syncStatus !== "ready" || preview.rows.some((row) => row.reason)) {
+        throw new Error(preview.accountResetCapability.reason || t("dashboard.userLimit.accountReset.notReady"));
+      }
+      setPreviewIntent(intent);
+      return false;
+    } finally { setPreviewBusy(false); }
+  };
   const [editingEmail, setEditingEmail] = React.useState<string | null>(null);
   const [grantDraft, setGrantDraft] = React.useState<GrantDraft | null>(null);
   const [selecting, setSelecting] = React.useState(false);
@@ -237,6 +264,7 @@ export function ShareUserGrantsEditor({
       : ["lifetime", "day", "week", "calendarMonth"],
   );
   const periods = ([
+    { key: "accountReset", label: t("dashboard.userLimit.periodAccountReset") },
     { key: "lifetime", label: t("dashboard.userLimit.periodLifetime") },
     { key: "day", label: t("dashboard.userLimit.periodDay") },
     { key: "week", label: t("dashboard.userLimit.periodWeek") },
@@ -244,7 +272,7 @@ export function ShareUserGrantsEditor({
     { key: "calendarMonth", label: t("dashboard.userLimit.periodMonth") },
     { key: "thirtyDays", label: t("dashboard.userLimit.periodThirtyDays") },
   ] satisfies Array<{ key: ShareTokenPeriod; label: string }>).filter((period) =>
-    supported.has(period.key),
+    supported.has(period.key) || (period.key === "accountReset" && Object.values(value).some((grant) => grant.policy.tokenPeriod === "accountReset")),
   );
   const periodLabel = Object.fromEntries(periods.map((period) => [period.key, period.label]));
   const shareMarketManagedEmails = routerShareMarketManagedEmails(value);
@@ -338,13 +366,17 @@ export function ShareUserGrantsEditor({
   }, [grants]);
 
   const openAdd = () => {
+    setPreviewIntent("");
+    setDraftCycle(accountCycle);
     setEditingEmail(null);
     setError("");
-    setGrantDraft(makeDraft("", defaultPolicy));
+    setGrantDraft(makeDraft("", { ...defaultPolicy, tokenPeriod: accountCapability?.syncStatus === "ready" && supported.has("accountReset") ? "accountReset" : defaultPolicy.tokenPeriod }));
   };
 
   const openEdit = (grant: ShareUserGrant) => {
     if (shareMarketManagedEmails.has(grant.email)) return;
+    setPreviewIntent("");
+    setDraftCycle(grant.accountQuotaCycle);
     setEditingEmail(grant.email);
     setError("");
     setGrantDraft({
@@ -359,20 +391,28 @@ export function ShareUserGrantsEditor({
   };
 
   const openBatchEdit = () => {
+    setPreviewIntent("");
     if (!selecting) {
       setSelecting(true);
       return;
     }
     const firstSelected = grants.find((grant) => selectedEditableEmails.has(grant.email));
     if (!firstSelected) return;
+    setBatchCycle(firstSelected.accountQuotaCycle);
     setError("");
     setBatchDraft(makeBatchDraft(firstSelected));
   };
 
   const applyGrants = (userGrants: ShareUserGrantMap) => onChange(userGrants);
 
-  const save = () => {
+  const save = async () => {
     if (!grantDraft) return;
+    if (grantDraft.tokenPeriod === "accountReset") {
+      try {
+        if (!await confirmAccountPreview({ [grantDraft.email]: { tokenPeriod: "accountReset",
+          tokenLimit: millionsInputToTokens(grantDraft.tokenLimit) ?? undefined } }, JSON.stringify(grantDraft))) return;
+      } catch (error) { setError(String(error)); return; }
+    }
     const email = grantDraft.email.trim().toLowerCase();
     const parallelLimit = grantDraft.parallelLimit.trim()
       ? Number(grantDraft.parallelLimit)
@@ -427,7 +467,7 @@ export function ShareUserGrantsEditor({
       !!grantDraft.consumedTokens.trim() &&
       (consumedTokens == null ||
         consumedTokens < 0 ||
-        consumedTokens < observedTokens);
+        (grantDraft.tokenPeriod !== "accountReset" && consumedTokens < observedTokens));
     if (usageInvalid) {
       setError(
         consumedTokens != null && consumedTokens < observedTokens
@@ -445,6 +485,10 @@ export function ShareUserGrantsEditor({
       tokenPeriodAnchorAtMs,
       expiresAt,
     });
+    if (grantDraft.tokenPeriod === "accountReset") {
+      next.accountQuotaCycle = previous?.policy.tokenPeriod === "accountReset" ? draftCycle : accountCycle;
+      next.accountResetCapability = accountCapability;
+    }
     if (grantDraft.usageAction === "set" && consumedTokens != null) {
       const previousQuota = previous?.usageQuota;
       next.usageQuota = {
@@ -483,6 +527,7 @@ export function ShareUserGrantsEditor({
           action: "set",
           targetTokens: consumedTokens,
           expectedGrantRevision: previous?.revision,
+          expectedAccountCycle: grantDraft.tokenPeriod === "accountReset" ? next.accountQuotaCycle : undefined,
           period: grantDraft.tokenPeriod,
           anchorAtMs: tokenPeriodAnchorAtMs,
           source: usageEdits[editingEmail || email]?.source ?? "manual",
@@ -491,6 +536,7 @@ export function ShareUserGrantsEditor({
         nextEdits[email] = {
           action: "clear",
           expectedGrantRevision: previous?.revision,
+          expectedAccountCycle: grantDraft.tokenPeriod === "accountReset" ? next.accountQuotaCycle : undefined,
           period: grantDraft.tokenPeriod,
           anchorAtMs: tokenPeriodAnchorAtMs,
         };
@@ -502,8 +548,19 @@ export function ShareUserGrantsEditor({
     setGrantDraft(null);
   };
 
-  const saveBatch = () => {
+  const saveBatch = async () => {
     if (!batchDraft || selectedEditableEmails.size === 0) return;
+    const previewGrants = grants.filter((grant) => selectedEditableEmails.has(grant.email));
+    if ((batchDraft.applyTokenLimit || batchDraft.applyConsumedTokens) && previewGrants.some((grant) =>
+      (batchDraft.applyTokenLimit ? batchDraft.tokenPeriod : grant.policy.tokenPeriod) === "accountReset")) {
+      try {
+        const policies = Object.fromEntries(previewGrants.filter((grant) =>
+          (batchDraft.applyTokenLimit ? batchDraft.tokenPeriod : grant.policy.tokenPeriod) === "accountReset")
+          .map((grant) => [grant.email, { ...grant.policy, tokenPeriod: "accountReset" as const,
+            tokenLimit: batchDraft.applyTokenLimit ? millionsInputToTokens(batchDraft.tokenLimit) ?? undefined : grant.policy.tokenLimit }]));
+        if (!await confirmAccountPreview(policies, JSON.stringify([batchDraft, [...selectedEditableEmails].sort()]))) return;
+      } catch (error) { setError(String(error)); return; }
+    }
     const parallelLimit = batchDraft.parallelLimit.trim()
       ? Number(batchDraft.parallelLimit)
       : undefined;
@@ -540,7 +597,7 @@ export function ShareUserGrantsEditor({
       !!batchDraft.consumedTokens.trim() &&
       (consumedTokens == null ||
         consumedTokens < 0 ||
-        consumedTokens < usageFloor);
+        (!(batchDraft.applyTokenLimit ? batchDraft.tokenPeriod === "accountReset" : selectedGrants.every((grant) => grant.policy.tokenPeriod === "accountReset")) && consumedTokens < usageFloor));
     if (
       (batchDraft.applyParallelLimit && parallelLimit != null &&
         (!Number.isInteger(parallelLimit) || parallelLimit < 1)) ||
@@ -631,16 +688,23 @@ export function ShareUserGrantsEditor({
         }
       }
     }
+    if (batchDraft.applyTokenLimit && batchDraft.tokenPeriod === "accountReset") {
+      for (const email of selectedEditableEmails) {
+        if (nextGrants[email]) nextGrants[email] = { ...nextGrants[email], accountQuotaCycle: batchCycle ?? accountCycle, accountResetCapability: accountCapability };
+      }
+    }
     applyGrants(nextGrants);
     if (onUsageEditsChange && (batchDraft.applyTokenLimit || batchDraft.applyConsumedTokens)) {
       const nextEdits: ShareUserUsageEditMap = { ...usageEdits };
       for (const grant of selectedGrants) {
         const email = grant.email.trim().toLowerCase();
+        const period = batchDraft.applyTokenLimit ? batchDraft.tokenPeriod : grant.policy.tokenPeriod;
         if (batchDraft.applyConsumedTokens && batchDraft.usageAction === "set" && consumedTokens != null) {
           nextEdits[email] = {
             action: "set",
             targetTokens: consumedTokens,
             expectedGrantRevision: grant.revision,
+            expectedAccountCycle: period === "accountReset" ? batchCycle ?? accountCycle : undefined,
             period: batchDraft.applyTokenLimit ? batchDraft.tokenPeriod : grant.policy.tokenPeriod,
             anchorAtMs: batchDraft.applyTokenLimit
               ? tokenPeriodAnchorAtMs
@@ -651,6 +715,7 @@ export function ShareUserGrantsEditor({
           nextEdits[email] = {
             action: "clear",
             expectedGrantRevision: grant.revision,
+            expectedAccountCycle: period === "accountReset" ? batchCycle ?? accountCycle : undefined,
             period: batchDraft.applyTokenLimit ? batchDraft.tokenPeriod : grant.policy.tokenPeriod,
             anchorAtMs: batchDraft.applyTokenLimit
               ? tokenPeriodAnchorAtMs
@@ -680,8 +745,19 @@ export function ShareUserGrantsEditor({
     }
   };
 
+  const previewPanel = previewIntent && accountPreview ? <div role="status" className="text-xs">
+    {t("dashboard.userLimit.accountReset.preview")}
+    {accountPreview.rows.map((row) => <div key={row.email}>{row.email}: {row.currentTokens ?? "—"} → {row.expectedTokens ?? "—"}{row.wouldExceed ? ` · ${t("dashboard.userLimit.accountReset.exceeded")}` : ""}</div>)}
+  </div> : null;
   return (
     <div className="grid gap-3">
+      <div className="text-xs text-muted-foreground" role="status">
+        {t("dashboard.userLimit.periodAccountReset")}: {accountCapability?.syncStatus ?? t("dashboard.userLimit.accountReset.pending")}{accountCapability?.reason ? ` · ${accountCapability.reason}` : ""}
+        {accountCycle ? <div>{accountCycle.bucketId} · {new Date(accountCycle.startsAtMs).toISOString()} → {accountCycle.endsAtMs ? new Date(accountCycle.endsAtMs).toISOString() : t("dashboard.userLimit.accountReset.noEnd")}
+          {" · "}{accountCycle.basis} · {t("dashboard.userLimit.accountReset.observed")} {new Date(accountCycle.observedAtMs).toISOString()}</div> : null}
+        {t("dashboard.userLimit.accountReset.caveat")}
+        {accountPreview?.ledgerHealth?.capacityWarning ? <div role="status">quota_ledger_capacity_warning ({accountPreview.ledgerHealth.revisionCount}/{accountPreview.ledgerHealth.admissionLimit})</div> : null}
+      </div>
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-1">
           <div className="mono-label text-muted-foreground">{t("dashboard.userLimit.title")}</div>
@@ -923,9 +999,10 @@ export function ShareUserGrantsEditor({
                 </div>
                 {error ? <p className="text-sm text-red-600 sm:col-span-2">{error}</p> : null}
               </Modal.Body>
+              {previewPanel}
               <Modal.Footer>
                 <Button variant="outline" onClick={() => setGrantDraft(null)}>{t("common.cancel")}</Button>
-                <Button variant="primary" onClick={save}>{t("common.apply")}</Button>
+                <Button variant="primary" isDisabled={previewBusy} onClick={() => void save()}>{t("common.apply")}</Button>
               </Modal.Footer>
             </Modal.Dialog>
           </Modal.Container>
@@ -1136,6 +1213,7 @@ export function ShareUserGrantsEditor({
               </div>
               {error ? <p className="text-sm text-red-600 sm:col-span-2">{error}</p> : null}
             </Modal.Body>
+            {previewPanel}
             <Modal.Footer>
               <Button variant="outline" onClick={() => {
                 setBatchDraft(null);
@@ -1145,11 +1223,11 @@ export function ShareUserGrantsEditor({
               </Button>
               <Button
                 variant="primary"
-                isDisabled={!!batchDraft &&
+                isDisabled={previewBusy || (!!batchDraft &&
                   !batchDraft.applyParallelLimit &&
                   !batchDraft.applyTokenLimit &&
                   !batchDraft.applyConsumedTokens &&
-                  !batchDraft.applyExpiresAt}
+                  !batchDraft.applyExpiresAt)}
                 onClick={saveBatch}
               >
                 {t("dashboard.userLimit.batchApply", { count: selectedEditableEmails.size })}

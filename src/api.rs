@@ -458,6 +458,10 @@ pub fn router(state: ServerState) -> Router {
             patch(update_share_settings),
         )
         .route(
+            "/v1/shares/:share_id/account-reset-preview",
+            post(preview_share_account_reset),
+        )
+        .route(
             "/v1/shares/:share_id/settings-edits/:edit_id",
             get(get_share_settings_edit),
         )
@@ -3561,6 +3565,36 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
+    fn quota_control_conflict_keeps_409_and_only_recoverable_fields() {
+        let error = crate::ctl_client::CtlError::Rejected {
+            status: 409,
+            body: serde_json::json!({"details":{"currentConfigRevision":12,
+                "accountQuotaCycle":null,"untrusted":"do not forward"}})
+            .to_string(),
+            message: None,
+            code: Some("QUOTA_CYCLE_CONFLICT".into()),
+            retryable: Some(true),
+            current_config_revision: Some(12),
+            current_share: None,
+        };
+        let Some(AppError::Coded {
+            status,
+            code,
+            details,
+            ..
+        }) = account_quota_control_conflict(&error)
+        else {
+            panic!("cycle conflict must stay recoverable");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(code, "QUOTA_CYCLE_CONFLICT");
+        assert_eq!(details["currentConfigRevision"], 12);
+        assert_eq!(details["previewRequired"], true);
+        assert!(details.get("untrusted").is_none());
+        assert!(account_quota_control_conflict(&crate::ctl_client::CtlError::Timeout).is_none());
+    }
+
+    #[test]
     fn share_connection_failure_parses_client_account_cooldown() {
         let body = r#"{"type":"error","error":{"type":"rate_limit_error","message":"provider provider-1 account is rate_limited (account_rate_limit): upstream rate limit is active, retry in 60s (until 2026-09-17T10:00:00Z)","code":"cc_switch_rate_limited","details":{"retryable":true}}}"#;
         let failure = parse_share_connection_failure(429, body).expect("structured failure");
@@ -4514,6 +4548,8 @@ mod tests {
 
     fn share_log(request_id: &str, created_at: i64) -> crate::models::ShareRequestLogEntry {
         crate::models::ShareRequestLogEntry {
+            started_at_ms: None,
+            quota_attribution: None,
             export_sequence: 0,
             request_id: request_id.into(),
             request_kind: "text".into(),
@@ -5209,6 +5245,92 @@ async fn get_share_settings_edit(
     ))
 }
 
+async fn preview_share_account_reset(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(share_id): Path<String>,
+    Json(input): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_share_owner(&state, &headers, &share_id).await?;
+    let revision = input
+        .get("expectedConfigRevision")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| AppError::BadRequest("expectedConfigRevision is required".into()))?;
+    let policies = input
+        .get("policies")
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()
+        .map_err(|error| AppError::BadRequest(error.to_string()))?
+        .unwrap_or_default();
+    let route = state
+        .proxy
+        .route_by_share_id(&share_id)
+        .await
+        .ok_or_else(|| {
+            AppError::ServiceUnavailable(
+                "Share client is offline; preview requires the authority".into(),
+            )
+        })?;
+    let installation_id = route
+        .installation_id()
+        .ok_or_else(|| AppError::ServiceUnavailable("Share installation unavailable".into()))?;
+    let secret = state
+        .store
+        .installation_control_secret(installation_id)
+        .await?
+        .ok_or_else(|| AppError::ServiceUnavailable("Share control is unavailable".into()))?;
+    let result = crate::ctl_client::preview_account_reset(
+        route.route_target(),
+        installation_id,
+        &secret,
+        &share_id,
+        revision,
+        &policies,
+    )
+    .await
+    .map_err(|error| {
+        if let Some(conflict) = account_quota_control_conflict(&error) {
+            return conflict;
+        }
+        match error {
+            crate::ctl_client::CtlError::Rejected { status: 404, .. } => {
+                AppError::Conflict("ACCOUNT_RESET_UNSUPPORTED: upgrade cc-switch-server".into())
+            }
+            _ => AppError::ServiceUnavailable(
+                "Account quota preview is unavailable; existing policy was not changed".into(),
+            ),
+        }
+    })?;
+    Ok(Json(result))
+}
+
+fn account_quota_control_conflict(error: &crate::ctl_client::CtlError) -> Option<AppError> {
+    let crate::ctl_client::CtlError::Rejected {
+        status: 409,
+        code,
+        body,
+        ..
+    } = error
+    else {
+        return None;
+    };
+    if code.as_deref() != Some("QUOTA_CYCLE_CONFLICT") {
+        return None;
+    }
+    let raw = serde_json::from_str::<serde_json::Value>(body).unwrap_or_default();
+    let revision = raw
+        .pointer("/details/currentConfigRevision")
+        .and_then(serde_json::Value::as_u64);
+    let cycle = raw.pointer("/details/accountQuotaCycle").and_then(|value| {
+        serde_json::from_value::<crate::models::AccountQuotaCycle>(value.clone()).ok()
+    });
+    Some(AppError::coded_conflict(
+        "QUOTA_CYCLE_CONFLICT",
+        "Share changed; reload and preview again",
+        serde_json::json!({"currentConfigRevision":revision,"accountQuotaCycle":cycle,"previewRequired":true}),
+    ))
+}
+
 async fn update_share_settings(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -5759,6 +5881,9 @@ async fn update_share_settings_with_email(
                         err.current_share(),
                     )
                     .await?;
+                if let Some(conflict) = account_quota_control_conflict(&err) {
+                    return Err(conflict);
+                }
                 return Err(AppError::UnprocessableEntity(message));
             }
         }

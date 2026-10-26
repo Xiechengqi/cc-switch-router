@@ -312,7 +312,26 @@ export type ClientSubdomainTakeoverResponse = {
 };
 
 export type ShareTokenPeriod =
-  "lifetime" | "day" | "week" | "sevenDays" | "calendarMonth" | "thirtyDays";
+  "lifetime" | "day" | "week" | "sevenDays" | "calendarMonth" | "thirtyDays" | "accountReset";
+
+export type AccountQuotaCycle = {
+  streamIncarnation: string; sourceRef: string; sourceEpoch: number; bucketId: string;
+  cycleId: string; cycleSequence: number; cycleRevision: number;
+  startsAtMs: number; endsAtMs?: number | null; observedAtMs: number; eventId: string;
+  basis: "upstreamWindow" | "derivedFromWindow" | "knownNaturalBoundary" | "publicAnnouncement" | "redeemConfirmation";
+};
+export type AccountResetCapability = {
+  support: "supported" | "conditional" | "unsupported";
+  syncStatus: "ready" | "initializing" | "stale" | "error" | "needsReconcile";
+  reason?: string | null; minimumContractVersion: number;
+};
+export type AccountResetPreview = {
+  ledgerHealth?: { revisionCount: number; capacityWarning: boolean; admissionLimit: number; retentionPolicy: string };
+  shareId: string; configRevision: number; accountQuotaCycle?: AccountQuotaCycle;
+  accountResetCapability: AccountResetCapability; complete: boolean; usageWatermark: number;
+  rows: Array<{ email: string; currentTokens?: number | null; expectedTokens?: number | null;
+    tokenLimit?: number | null; wouldExceed?: boolean | null; reason?: string | null }>;
+};
 
 export type ShareUserPolicy = {
   parallelLimit?: number;
@@ -337,6 +356,7 @@ export type ShareUserUsageRebase = {
 };
 
 export type ShareUserQuotaView = {
+  usageWatermark?: number;
   period: ShareTokenPeriod;
   anchorAtMs?: number;
   windowStartsAtMs?: number;
@@ -349,6 +369,7 @@ export type ShareUserQuotaView = {
 };
 
 export type ShareUserUsageEdit = {
+  expectedAccountCycle?: AccountQuotaCycle;
   action: "set" | "clear";
   targetTokens?: number;
   expectedGrantRevision?: number;
@@ -360,6 +381,8 @@ export type ShareUserUsageEdit = {
 export type ShareUserUsageEditMap = Record<string, ShareUserUsageEdit>;
 
 export type ShareUserGrant = {
+  accountQuotaCycle?: AccountQuotaCycle;
+  accountResetCapability?: AccountResetCapability;
   email: string;
   role: "owner" | "shareto";
   active: boolean;
@@ -465,6 +488,7 @@ export type ShareClientUnbanResponse = {
 };
 
 export type ShareSettingsPatch = {
+  expectedAccountCycle?: AccountQuotaCycle;
   ownerEmail?: string;
   description?: string | null;
   freeAccess?: boolean;
@@ -895,7 +919,8 @@ export type ShareUserLimitStatusRow = {
   tokenPeriod: ShareTokenPeriod;
   tokenPeriodAnchorAtMs?: number;
   expiresAt?: number;
-  tokensUsed: number;
+  tokensUsed: number | null;
+  quotaStatus?: string;
   percent?: number;
   windowStartsAt?: string | null;
   resetsAt?: string | null;

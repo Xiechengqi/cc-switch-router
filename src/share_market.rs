@@ -839,6 +839,11 @@ pub fn router() -> Router<ServerState> {
 }
 
 fn normalize_seat(input: SeatInput) -> Result<NormalizedSeat, AppError> {
+    if input.token_period == ShareTokenPeriod::AccountReset {
+        return Err(AppError::BadRequest(
+            "accountReset is not a frozen Share Market contract period".into(),
+        ));
+    }
     if input.parallel_limit == Some(0) || input.token_limit == Some(0) {
         return Err(AppError::BadRequest(
             "seat limits must be positive or empty for unlimited".into(),
@@ -12097,6 +12102,9 @@ fn apply_control_grant_effect(
                         .unwrap_or_default(),
                     usage_rebase,
                     usage_quota: previous.as_ref().and_then(|grant| grant.usage_quota),
+                    account_quota_cycle: None,
+                    account_reset_capability: None,
+                    account_usage_baseline: None,
                     created_at_ms: previous
                         .as_ref()
                         .map(|grant| grant.created_at_ms)
@@ -12824,6 +12832,9 @@ mod tests {
         let policy = materialize_initial_policy(&record, applied_at_ms, &stored_policy)
             .expect("materialize managed grant policy");
         let grant = ShareUserGrant {
+            account_quota_cycle: None,
+            account_reset_capability: None,
+            account_usage_baseline: None,
             email: record.renter_email.clone(),
             role: "shareto".into(),
             active: true,
@@ -12957,6 +12968,9 @@ mod tests {
         };
         let applied_at_ms = applied_at.timestamp_millis();
         let grant = ShareUserGrant {
+            account_quota_cycle: None,
+            account_reset_capability: None,
+            account_usage_baseline: None,
             email: record.renter_email.clone(),
             role: "shareto".into(),
             active: true,
@@ -19703,6 +19717,9 @@ mod tests {
                     serde_json::to_string(&BTreeMap::from([(
                         granted.email.clone(),
                         ShareUserGrant {
+                            account_quota_cycle: None,
+                            account_reset_capability: None,
+                            account_usage_baseline: None,
                             email: granted.email.clone(),
                             role: "shareto".into(),
                             active: true,
@@ -21038,6 +21055,9 @@ mod tests {
         );
 
         let direct_grant = ShareUserGrant {
+            account_quota_cycle: None,
+            account_reset_capability: None,
+            account_usage_baseline: None,
             email: renter.email.clone(),
             role: "shareto".into(),
             active: true,
