@@ -466,7 +466,9 @@ try {
   const waitOfferReady = () => sell.page.waitForFunction(() => [...document.querySelectorAll('[role="dialog"] button')].some(button => button.textContent.trim() === "Save" && !button.disabled));
   for (const mode of ["disabled", "shadow", "enabled"]) {
     topupMode = mode;
-    await sell.page.goto(`${base}/account/wallet/`); await sell.page.locator("#wallet-transfer form").waitFor();
+    await sell.page.goto(`${base}/account/wallet/`);
+    await sell.page.getByRole("button", { name: "Transfer", exact: true }).click();
+    await sell.page.locator("#wallet-transfer form").waitFor();
     await sell.page.goto(`${base}/client-market/`);
     const offerDialog = await editOffer(); await waitOfferReady();
     await offerDialog.getByRole("button", { name: "Save", exact: true }).click();

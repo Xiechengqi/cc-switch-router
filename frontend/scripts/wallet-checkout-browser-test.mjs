@@ -472,7 +472,8 @@ try {
 
   // No real transfer is sent. The confirmation must retain exact sub-cent
   // units, the frozen recipient, and one idempotency key across an uncertain response, without any OTP.
-  const transferPanel = page.locator("section").filter({ has: page.getByRole("heading", { name: "Transfer to a user", exact: true }) }).last();
+  await page.getByRole("button", { name: "Transfer", exact: true }).click();
+  const transferPanel = page.locator("#wallet-transfer");
   await transferPanel.getByLabel("Recipient email").fill("recipient@example.invalid");
   await transferPanel.getByLabel("Transfer all available").check();
   await transferPanel.getByRole("button", { name: "Review transfer" }).click();
@@ -495,6 +496,7 @@ try {
 
   // A changed policy refreshes the visible total but never silently submits
   // an order at the new price. A second user gesture is required.
+  await page.getByRole("button", { name: "Top up", exact: true }).click();
   rejectNextTopupQuote = true;
   await page.getByRole("button", { name: "Pay $1.05", exact: true }).click();
   await page.getByRole("button", { name: "Pay $1.06", exact: true }).waitFor();
