@@ -308,6 +308,7 @@ try {
   // the old pause, which still requires an explicit Resume action.
   profile = { ...profile, autoAcceptTermsVersion: 0, autoAcceptConsentedAt: null, autoPauseReason: "acceptance_timeout", autoPausedAt: new Date().toISOString(), autoPauseOrderId: orders[0].id, version: profile.version + 1 };
   sellerUnits = String(2000 * 86400); await sell.page.reload();
+  await sell.page.getByRole("button", { name: "C2C", exact: true }).click();
   await sellerPanel.getByText(/Automatic orders need confirmation/).waitFor();
   assert.equal(await sellerPanel.getByRole("button", { name: "Resume selling", exact: true }).count(), 0);
   await sellerPanel.getByRole("button", { name: "Confirm automatic orders", exact: true }).click();
@@ -327,7 +328,9 @@ try {
   await page.locator("[data-c2c-buy]").getByRole("button", { name: new RegExp(seller.displayName) }).waitFor();
   assert.equal(heartbeat, 0, "seller remains listed after navigating away without any heartbeat");
   sellerUnits = "0"; available = false;
-  await sell.page.goto(`${base}/account/wallet/`); await sellerPanel.getByRole("button", { name: "Pause", exact: true }).click();
+  await sell.page.goto(`${base}/account/wallet/`);
+  await sell.page.getByRole("button", { name: "C2C", exact: true }).click();
+  await sellerPanel.getByRole("button", { name: "Pause", exact: true }).click();
   await sellerPanel.getByText("Selling paused", { exact: true }).waitFor(); assert.equal(pauseCount, 1, "pause independent of balance, policy and editor validation");
   await sell.page.clock.fastForward(61000); assert.equal(heartbeat, 0, "pause needs no browser presence");
   sellerUnits = "1728000000"; available = true;
