@@ -1029,7 +1029,6 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
                     : "text-muted-foreground";
               const showRecheck = order.status === "review_required" || countdown?.phase === "checking" || pendingVerification || (abandoned && order.status === "pending") || order.buyerRecheckResult === "retrying";
               const showStop = canStopPayment && !(order.status === "pending" && gateway?.canCancel);
-              const showRestart = wallet.canTopup && ["expired", "cancelled"].includes(order.status);
               return <li key={order.id} className="grid min-w-0 gap-1 border-b border-border/70 py-2 text-sm last:border-b-0">
                 <div className="flex min-w-0 items-baseline gap-2">
                   <p className="flex min-w-0 items-center gap-2 font-medium tabular-nums">${((order.creditAmountMinor ?? order.amountMinor) / 100).toFixed(2)}
@@ -1038,7 +1037,7 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
                   <span className={`min-w-0 truncate text-xs font-medium ${statusTone}`}>{neverCreated ? t("marketWallet.status.never_created") : t(`marketWallet.status.${shownStatus}` as Parameters<typeof t>[0])}</span>
                   <span className="ml-auto shrink-0 text-xs text-muted-foreground">{dateText(order.createdAt, locale)}</span>
                 </div>
-                {checkoutUrl || showRecheck || showStop || order.status === "pending" || showRestart ? <div className="flex flex-wrap items-center gap-1">
+                {checkoutUrl || showRecheck || showStop || order.status === "pending" ? <div className="flex flex-wrap items-center gap-1">
                   {checkoutUrl ? <a className="inline-flex items-center gap-1 whitespace-nowrap text-xs font-medium text-primary underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring" href={walletTopupCheckoutHref(order.id)} target="_blank" rel="noopener noreferrer">
                     {t("marketWallet.continuePay")}<ArrowUpRight className="size-3" aria-hidden="true" />
                   </a> : null}
@@ -1050,16 +1049,6 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
                   </Button> : null}
                   {order.status === "pending" ? <Button size="sm" variant="ghost" isIconOnly aria-label={t("marketWallet.refreshGatewayStatus")} isDisabled={statusBusyId === order.id || !!busy} onPress={() => void refreshGatewayStatus(order.id)}>
                     <RefreshCw className={`size-4 ${statusBusyId === order.id ? "animate-spin" : ""}`} aria-hidden="true" />
-                  </Button> : null}
-                  {showRestart ? <Button size="sm" variant="outline" isDisabled={!!busy} onPress={() => {
-                    idempotencyRef.current = null;
-                    setAmount(((order.creditAmountMinor ?? order.amountMinor) / 100).toFixed(2));
-                    setAmountTouched(false);
-                    setTask("topup");
-                    if (channels.some((channel) => channel.id === order.channelId)) setChannelId(order.channelId);
-                    document.getElementById("market-wallet-topup-amount")?.focus();
-                  }}>
-                    {t("marketWallet.restartTopup")}
                   </Button> : null}
                 </div> : null}
                 {order.buyerRecheckResult === "queued" ? <p role="status" className="text-xs font-medium text-primary">{t("marketWallet.recheckQueued")}</p>
