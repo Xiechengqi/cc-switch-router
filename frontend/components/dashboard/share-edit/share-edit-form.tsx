@@ -11,7 +11,7 @@ import {
 } from "@/components/dashboard/share-dashboard-utils";
 import { resolveShareCoreApp, shareProviderSupportedApps } from "@/lib/share-app";
 import type { ShareView } from "@/lib/types";
-import { updateShareSettings } from "@/lib/api";
+import { getShareSettingsEdit, updateShareSettings } from "@/lib/api";
 import { millionsInputToTokens, tokensToMillionsInput } from "@/lib/token-units";
 import { formatDateTime } from "@/lib/utils";
 import {
@@ -43,8 +43,6 @@ function shareUserGrantsFingerprint(share: ShareView | null) {
         grant.role,
         grant.revision ?? 0,
         grant.policy,
-        grant.usageQuota ?? null,
-        grant.usageRebase ?? null,
       ]),
   );
 }
@@ -100,10 +98,20 @@ export function useShareEditForm({
   const [notice, setNotice] = React.useState("");
   const [remoteRefreshPending, setRemoteRefreshPending] = React.useState(false);
   const [blocksDirty, setBlocksDirty] = React.useState(false);
+  const [pendingEdit, setPendingEdit] = React.useState<{ id: string; shareId: string } | null>(null);
   const draftRef = React.useRef<ShareEditDraft | null>(null);
   const baseDraftRef = React.useRef<ShareEditDraft | null>(null);
   const baseShareRef = React.useRef<ShareView | null>(null);
   const blocksRef = React.useRef<ShareRequestedModelBlocksHandle | null>(null);
+  const savingRef = React.useRef(false);
+  const sessionRef = React.useRef(0);
+  React.useEffect(() => {
+    sessionRef.current += 1;
+    savingRef.current = false;
+    setBusy(false);
+    setPendingEdit(null);
+    return () => { sessionRef.current += 1; };
+  }, [share?.shareId]);
   const onBlocksStateChange = React.useCallback((state: { dirty: boolean }) => {
     setBlocksDirty(state.dirty);
   }, []);
@@ -112,10 +120,40 @@ export function useShareEditForm({
   const activeShareApps = React.useMemo(() => shareProviderSupportedApps(liveShare), [liveShare]);
   const shareApp = activeShareApps[0] ?? resolveShareCoreApp(liveShare);
   const applyDraft = React.useCallback((next: ShareEditDraft) => setDraft(next), []);
-  const locked = Boolean(liveShare?.activeEdit?.status === "pending" || liveShare?.canEditSettings === false);
+  const locked = Boolean(pendingEdit || liveShare?.activeEdit?.status === "pending" || liveShare?.canEditSettings === false);
   draftRef.current = draft;
   baseDraftRef.current = baseDraft;
   baseShareRef.current = baseShare;
+
+  React.useEffect(() => {
+    if (!pendingEdit || pendingEdit.shareId !== share?.shareId) return;
+    let disposed = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const check = async () => {
+      try {
+        const edit = await getShareSettingsEdit(pendingEdit.shareId, pendingEdit.id);
+        if (disposed) return;
+        if (edit.status === "applied") {
+          setPendingEdit(null);
+          onClose();
+          await onSaved({ appliedSynchronously: true });
+          return;
+        }
+        if (edit.status === "rejected") {
+          setPendingEdit(null);
+          setNotice("");
+          setError(edit.errorMessage || t("dashboard.operationRejected"));
+          await onSaved({ appliedSynchronously: false });
+          return;
+        }
+      } catch {
+        // A failed status read is not a failed write. Keep the draft and retry.
+      }
+      if (!disposed) timer = setTimeout(check, 2000);
+    };
+    timer = setTimeout(check, 1000);
+    return () => { disposed = true; clearTimeout(timer); };
+  }, [pendingEdit, share?.shareId, onSaved, onClose, t]);
 
   React.useEffect(() => {
     if (!share) {
@@ -141,14 +179,11 @@ export function useShareEditForm({
       setNotice("");
       return;
     }
-    const incomingApps = shareProviderSupportedApps(share);
     const currentApps = shareProviderSupportedApps(currentBaseShare);
     const sameRevision = (currentBaseShare.configRevision ?? 0) === (share.configRevision ?? 0);
-    const sameFingerprint =
-      shareEditPatchFingerprint(buildShareEditPatch(incoming, share, incomingApps)) ===
-      shareEditPatchFingerprint(
-        buildShareEditPatch(currentBaseDraft ?? incoming, currentBaseShare, currentApps),
-      );
+    const sameFingerprint = Object.keys(
+      buildShareEditPatch(incoming, currentBaseShare, currentApps),
+    ).length === 0;
     const sameGrants = shareUserGrantsFingerprint(share) === shareUserGrantsFingerprint(currentBaseShare);
     if (sameRevision && sameFingerprint && sameGrants) {
       setBaseShare(share);
@@ -244,8 +279,8 @@ export function useShareEditForm({
     parallelInvalid ||
     expiryInvalid || appApiInvalid;
 
-  const currentPatch = buildShareEditPatch(draft, liveShare, activeShareApps);
-  const basePatch = buildShareEditPatch(baseDraft, liveShare, activeShareApps);
+  const currentPatch = buildShareEditPatch(draft, baseShare || liveShare, activeShareApps);
+  const basePatch = buildShareEditPatch(baseDraft, baseShare || liveShare, activeShareApps);
   const settingsDirty = shareEditPatchFingerprint(currentPatch) !== shareEditPatchFingerprint(basePatch);
   const isDirty = settingsDirty || blocksDirty;
 
@@ -262,7 +297,9 @@ export function useShareEditForm({
   };
 
   const save = async () => {
-    if (!liveShare || busy || locked || formInvalid || !isDirty) return;
+    if (!liveShare || savingRef.current || busy || locked || formInvalid || !isDirty) return;
+    savingRef.current = true;
+    const session = sessionRef.current;
     setBusy(true);
     setError("");
     setNotice("");
@@ -274,22 +311,28 @@ export function useShareEditForm({
         const res = await updateShareSettings(
           liveShare.shareId,
           currentPatch,
-          liveShare.configRevision,
+          baseShare?.configRevision,
         );
+        if (session !== sessionRef.current) return;
         await onSaved({ appliedSynchronously: res.appliedSynchronously });
+        if (session !== sessionRef.current) return;
         if (res.appliedSynchronously) {
           onClose();
         } else {
-          setBaseDraft(draft);
-          setBaseShare(liveShare);
-          setRemoteRefreshPending(false);
+          setPendingEdit({ id: res.edit.id, shareId: liveShare.shareId });
           setNotice(t("dashboard.shareEditQueued"));
         }
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (session === sessionRef.current) {
+        setError(err instanceof Error ? err.message : String(err));
+        await onSaved({ appliedSynchronously: false }).catch(() => undefined);
+      }
     } finally {
-      setBusy(false);
+      if (session === sessionRef.current) {
+        savingRef.current = false;
+        setBusy(false);
+      }
     }
   };
 
@@ -336,7 +379,7 @@ export function ShareEditFormBody({
   form: ShareEditFormApi;
 }) {
   const { activeShareApps, draft, shareApp, liveShare, locked } = form;
-  const fieldsDisabled = locked;
+  const fieldsDisabled = locked || form.busy;
   const displayShare = liveShare || share;
 
   if (!shareApp) {

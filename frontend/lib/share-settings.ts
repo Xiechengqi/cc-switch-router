@@ -3,6 +3,7 @@ import type {
   ShareUserGrant,
   ShareUserGrantMap,
   ShareUserPolicy,
+  ShareUserUsageEditMap,
   ShareView,
 } from "@/lib/types";
 
@@ -21,6 +22,7 @@ export type ShareSettingsDraft = {
   parallelLimit: number;
   expiresAt: string;
   userGrants: ShareUserGrantMap;
+  userUsageEdits: ShareUserUsageEditMap;
 };
 
 export function isRouterShareMarketManagedGrant(
@@ -164,6 +166,7 @@ export function draftFromShare(share: ShareView): ShareSettingsDraft {
     parallelLimit: Number.isFinite(share.parallelLimit) ? share.parallelLimit : UNLIMITED_PARALLEL_LIMIT,
     expiresAt: share.expiresAt || PERMANENT_EXPIRES_AT_ISO,
     userGrants,
+    userUsageEdits: {},
   };
 }
 
@@ -171,18 +174,52 @@ export function buildShareSettingsPatch(
   draft: ShareSettingsDraft,
   share: ShareView,
 ): ShareSettingsPatch {
-  return {
-    description: draft.description.trim() || null,
-    freeAccess: draft.freeAccess,
-    tokenLimit: draft.tokenLimit,
-    parallelLimit: draft.parallelLimit,
-    expiresAt: draft.expiresAt,
+  const full = (value: ShareSettingsDraft): ShareSettingsPatch => ({
+    description: value.description.trim() || null,
+    freeAccess: value.freeAccess,
+    tokenLimit: value.tokenLimit,
+    parallelLimit: value.parallelLimit,
+    expiresAt: value.expiresAt,
     userGrants: buildOrdinaryUserGrantsPatch(
-      draft.userGrants,
+      value.userGrants,
       share.ownerEmail || "",
       defaultUserPolicy(share),
     ),
-  };
+  });
+  const baseline = full(draftFromShare(share));
+  baseline.userGrants = { ...share.userGrants, ...baseline.userGrants };
+  return changedShareSettings(full(draft), baseline, draft.userUsageEdits);
+}
+
+function policyFingerprint(policy: ShareUserPolicy) {
+  return JSON.stringify([policy.parallelLimit ?? null, policy.tokenLimit ?? null,
+    policy.tokenPeriod || "lifetime", policy.tokenPeriodAnchorAtMs ?? null, policy.expiresAt ?? null]);
+}
+
+export function changedUserGrants(next: ShareUserGrantMap, baseline: ShareUserGrantMap): NonNullable<ShareSettingsPatch["userGrantEdits"]> {
+  const edits: NonNullable<ShareSettingsPatch["userGrantEdits"]> = {};
+  for (const email of [...new Set([...Object.keys(baseline), ...Object.keys(next)])].sort()) {
+    const before = baseline[email];
+    const after = next[email];
+    if (isRouterShareMarketManagedGrant(before) || isRouterShareMarketManagedGrant(after)) continue;
+    const wasActive = !!before && before.active !== false;
+    const isActive = !!after && after.active !== false;
+    if (wasActive === isActive && (!isActive || policyFingerprint(before.policy) === policyFingerprint(after.policy))) continue;
+    edits[email] = { expectedRevision: before?.revision ?? 0, policy: isActive ? after.policy : null };
+  }
+  return edits;
+}
+
+export function changedShareSettings(next: ShareSettingsPatch, baseline: ShareSettingsPatch, usageEdits: ShareUserUsageEditMap = {}): ShareSettingsPatch {
+  const patch = Object.fromEntries(Object.entries(next).filter(([key, value]) =>
+    key !== "userGrants" && key !== "userUsageEdits" && JSON.stringify(value) !== JSON.stringify(baseline[key as keyof ShareSettingsPatch]),
+  )) as ShareSettingsPatch;
+  const userGrantEdits = changedUserGrants(next.userGrants ?? {}, baseline.userGrants ?? {});
+  if (Object.keys(userGrantEdits).length) patch.userGrantEdits = userGrantEdits;
+  const activeUsageEdits = Object.fromEntries(Object.entries(usageEdits).filter(([email]) =>
+    next.userGrants?.[email]?.active !== false && !!next.userGrants?.[email] && !isRouterShareMarketManagedGrant(next.userGrants[email])));
+  if (Object.keys(activeUsageEdits).length) patch.userUsageEdits = activeUsageEdits;
+  return patch;
 }
 
 function defaultUserPolicy(share: ShareView): ShareUserPolicy {

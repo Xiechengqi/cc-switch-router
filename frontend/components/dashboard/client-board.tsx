@@ -930,10 +930,11 @@ export function ClientBoard({
   const openConnectShare = React.useCallback((share: ShareView) => setConnectShare(share), []);
   const closeConnectDialog = React.useCallback((open: boolean) => { if (!open) setConnectShare(null); }, []);
   const handleSaved = React.useCallback(async ({ appliedSynchronously }: { appliedSynchronously: boolean }) => {
-    if (editingShare) trackOperation({ kind: "share", id: editingShare.shareId, requireHealthyRoute: true });
-    await onChanged?.();
-    if (!appliedSynchronously) toast.info(t("dashboard.shareEditQueued"));
-  }, [editingShare, onChanged, t, trackOperation]);
+    if (appliedSynchronously) toast.success(t("dashboard.operationObserved"));
+    // A settings receipt proves the save; route health is unrelated. Queued
+    // saves are shown inline in the editor, without a second toast lifecycle.
+    await Promise.resolve(onChanged?.()).catch(() => undefined);
+  }, [onChanged, t]);
   const toggleClientExpanded = React.useCallback((clientId: string) => {
     setExpandedClientIds((current) => {
       const next = new Set(current ?? (defaultExpandedClientId ? [defaultExpandedClientId] : []));

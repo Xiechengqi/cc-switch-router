@@ -47,6 +47,8 @@ struct ApplyShareSettingsReply {
     #[serde(default)]
     ok: bool,
     share: Option<ShareDescriptor>,
+    #[serde(default)]
+    settings_receipt: Option<crate::models::ShareSettingsReceipt>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -459,7 +461,7 @@ pub async fn apply_share_settings(
     control_secret: &str,
     share_id: &str,
     patch: &ShareSettingsPatch,
-) -> Result<ShareDescriptor, CtlError> {
+) -> Result<(ShareDescriptor, Option<crate::models::ShareSettingsReceipt>), CtlError> {
     let body = serde_json::to_string(&ApplyShareSettingsBody { share_id, patch })
         .map_err(|e| CtlError::Malformed(format!("serialize control body failed: {e}")))?;
     let reply: ApplyShareSettingsReply = post_control(
@@ -473,9 +475,10 @@ pub async fn apply_share_settings(
     if !reply.ok {
         return Err(CtlError::Malformed("client replied ok=false".into()));
     }
-    reply
+    let share = reply
         .share
-        .ok_or_else(|| CtlError::Malformed("client reply missing share".into()))
+        .ok_or_else(|| CtlError::Malformed("client reply missing share".into()))?;
+    Ok((share, reply.settings_receipt))
 }
 
 pub async fn refresh_share_usage(

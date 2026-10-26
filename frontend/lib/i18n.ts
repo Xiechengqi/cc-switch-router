@@ -3959,6 +3959,7 @@ export const messages = {
     "dashboard.userLimit.batchEdit": "Batch edit",
     "dashboard.userLimit.batchEditSelected": "Edit selected ({count})",
     "dashboard.userLimit.batchTitle": "Batch edit user limits",
+    "common.apply": "Apply",
     "dashboard.userLimit.batchHint":
       "{count} users selected. Checked parameters are applied to every selected user. Blank limits mean unlimited, and a blank expiration means permanent.",
     "dashboard.userLimit.batchConsumedHint":
@@ -3982,7 +3983,7 @@ export const messages = {
       "Parallel limits must be positive integers; Token limits use M with at most six decimal places; expiration must be valid.",
     "dashboard.userLimit.consumedTokens": "Consumed tokens (M, current period)",
     "dashboard.userLimit.consumedHint":
-      "Effective {effective}; saving uses this as the baseline and continues adding new requests. Observed {observed}.",
+      "Effective {effective}; observed {observed}. Unchanged unless you explicitly edit this baseline.",
     "dashboard.userLimit.newConsumedHint":
       "You can enter 0; leave blank to skip a manual baseline.",
     "dashboard.userLimit.clearRebase": "Clear baseline",
@@ -8036,6 +8037,7 @@ export const messages = {
     "dashboard.userLimit.batchEdit": "批量编辑",
     "dashboard.userLimit.batchEditSelected": "编辑已选（{count}）",
     "dashboard.userLimit.batchTitle": "批量编辑用户限制",
+    "common.apply": "应用",
     "dashboard.userLimit.batchHint":
       "已选择 {count} 个用户。勾选的参数会应用到所有已选用户；空限额表示无限，空到期时间表示永久。",
     "dashboard.userLimit.batchConsumedHint":
@@ -8058,7 +8060,7 @@ export const messages = {
       "并发限制必须是正整数；Token 限制以 M 填写且最多保留 6 位小数；到期时间必须有效。",
     "dashboard.userLimit.consumedTokens": "已消耗 Token（M，当前周期）",
     "dashboard.userLimit.consumedHint":
-      "当前有效 {effective}；保存后以该值为基线，并继续累加新请求。当前观测值 {observed}。",
+      "当前有效 {effective}；观测值 {observed}。只有主动修改此项才校准用量，普通配额修改不影响已用量。",
     "dashboard.userLimit.newConsumedHint": "可填写 0；留空表示不创建手工重基线。",
     "dashboard.userLimit.clearRebase": "清除重基线",
     "dashboard.userLimit.rebaseTarget": "基线 {value}",

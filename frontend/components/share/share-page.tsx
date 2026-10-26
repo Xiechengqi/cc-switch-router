@@ -5,7 +5,7 @@ import { Alert, Button, Checkbox, Chip, Input, TextArea } from "@heroui/react";
 import { KeyRound, Loader2, LogOut, Save } from "lucide-react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ShareUserGrantsEditor } from "@/components/dashboard/share-edit/share-user-grants-editor";
-import { getShareApiAuth, getShareContext, getSharePageShare, updateSharePageSettings, readShareApiCredentials, writeShareApiCredentials, clearShareApiCredentials, ShareApiError } from "@/lib/share-api";
+import { getShareApiAuth, getShareContext, getSharePageShare, getSharePageSettingsEdit, updateSharePageSettings, readShareApiCredentials, writeShareApiCredentials, clearShareApiCredentials, ShareApiError } from "@/lib/share-api";
 import type { ShareApiAuthResponse, ShareApiContextResponse, ShareView } from "@/lib/types";
 import {
   buildShareSettingsPatch,
@@ -132,6 +132,12 @@ function ShareSettingsForm({
 }) {
   const { t } = useLocaleText();
   const [draft, setDraft] = React.useState<ShareSettingsDraft>(() => draftFromShare(share));
+  const [baseline, setBaseline] = React.useState(share);
+  const dirtyRef = React.useRef(false);
+  const [reloadKey, setReloadKey] = React.useState(0);
+  const savingRef = React.useRef(false);
+  const refreshAfterSaveRef = React.useRef(false);
+  const [pendingEditId, setPendingEditId] = React.useState<string | null>(null);
   const [expiryPermanent, setExpiryPermanent] = React.useState(() => draft.expiresAt === PERMANENT_EXPIRES_AT_ISO || new Date(draft.expiresAt).getUTCFullYear() >= 2099);
   const [expiryLocal, setExpiryLocal] = React.useState(() => toDateTimeLocal(draft.expiresAt));
   const [tokenUnlimited, setTokenUnlimited] = React.useState(draft.tokenLimit === UNLIMITED_TOKEN_LIMIT);
@@ -144,7 +150,10 @@ function ShareSettingsForm({
   const [error, setError] = React.useState("");
 
   React.useEffect(() => {
+    if (baseline.shareId === share.shareId && !refreshAfterSaveRef.current && (dirtyRef.current || savingRef.current)) return;
+    refreshAfterSaveRef.current = false;
     const next = draftFromShare(share);
+    setBaseline(share);
     setDraft(next);
     setExpiryPermanent(next.expiresAt === PERMANENT_EXPIRES_AT_ISO || new Date(next.expiresAt).getUTCFullYear() >= 2099);
     setExpiryLocal(toDateTimeLocal(next.expiresAt));
@@ -153,10 +162,39 @@ function ShareSettingsForm({
       next.tokenLimit === UNLIMITED_TOKEN_LIMIT ? "" : tokensToMillionsInput(next.tokenLimit),
     );
     setParallelUnlimited(next.parallelLimit === UNLIMITED_PARALLEL_LIMIT);
-  }, [share]);
+  }, [share, reloadKey]);
+
+  React.useEffect(() => {
+    if (!pendingEditId) return;
+    let active = true;
+    let timer: ReturnType<typeof setTimeout>;
+    const check = async () => {
+      try {
+        const edit = await getSharePageSettingsEdit(pendingEditId);
+        if (!active) return;
+        if (edit.status !== "pending") {
+          setPendingEditId(null);
+          if (edit.status === "applied") {
+            refreshAfterSaveRef.current = true;
+            setNotice(t("dashboard.shareEditApplied"));
+          } else {
+            setNotice("");
+            setError(edit.errorMessage || t("dashboard.operationRejected"));
+          }
+          await onSaved();
+          return;
+        }
+      } catch { /* An unreadable status is not a rejected write. */ }
+      if (active) timer = setTimeout(check, 2000);
+    };
+    timer = setTimeout(check, 1000);
+    return () => { active = false; clearTimeout(timer); };
+  }, [pendingEditId, onSaved, t]);
 
   const effectiveDraft = React.useMemo<ShareSettingsDraft>(() => {
-    const expiresAt = expiryPermanent ? PERMANENT_EXPIRES_AT_ISO : fromDateTimeLocal(expiryLocal);
+    const expiresAt = expiryPermanent
+      ? (new Date(baseline.expiresAt).getUTCFullYear() >= 2099 ? baseline.expiresAt : PERMANENT_EXPIRES_AT_ISO)
+      : expiryLocal === toDateTimeLocal(baseline.expiresAt) ? baseline.expiresAt : fromDateTimeLocal(expiryLocal);
     return {
       ...draft,
       tokenLimit: tokenUnlimited
@@ -165,7 +203,10 @@ function ShareSettingsForm({
       parallelLimit: parallelUnlimited ? UNLIMITED_PARALLEL_LIMIT : draft.parallelLimit,
       expiresAt,
     };
-  }, [draft, expiryLocal, expiryPermanent, parallelUnlimited, tokenLimitInput, tokenUnlimited]);
+  }, [draft, expiryLocal, expiryPermanent, parallelUnlimited, tokenLimitInput, tokenUnlimited, baseline.expiresAt]);
+  const settingsPatch = buildShareSettingsPatch(effectiveDraft, baseline);
+  const dirty = Object.keys(settingsPatch).length > 0;
+  dirtyRef.current = dirty;
   const fieldErrors = shareSettingsFieldErrors(effectiveDraft);
   const formInvalid = shareSettingsHasFieldErrors(fieldErrors);
   const ceilingInvalid =
@@ -195,12 +236,15 @@ function ShareSettingsForm({
   };
 
   const save = async () => {
-    if (!editable || busy || formInvalid) return;
+    if (!editable || busy || savingRef.current || pendingEditId || formInvalid || !dirty || share.activeEdit?.status === "pending") return;
+    savingRef.current = true;
     setBusy(true);
     setError("");
     setNotice("");
     try {
-      const result = await updateSharePageSettings(buildShareSettingsPatch(effectiveDraft, share));
+      const result = await updateSharePageSettings(settingsPatch, baseline.configRevision);
+      if (result.appliedSynchronously) refreshAfterSaveRef.current = true;
+      else setPendingEditId(result.edit.id);
       setNotice(
         result.appliedSynchronously
           ? t("dashboard.shareEditApplied")
@@ -209,15 +253,25 @@ function ShareSettingsForm({
       await onSaved();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+      await onSaved().catch(() => undefined);
     } finally {
+      savingRef.current = false;
       setBusy(false);
     }
   };
 
   return (
-    <div className="grid gap-4">
+    <fieldset className="grid gap-4" disabled={busy || !!pendingEditId || share.activeEdit?.status === "pending"}>
       {notice ? <Alert status="success" className="!text-slate-900">{notice}</Alert> : null}
       {error ? <Alert status="danger" className="!text-slate-900">{error}</Alert> : null}
+      {dirty && baseline.configRevision !== share.configRevision ? (
+        <Alert status="warning">
+          {t("dashboard.shareEditRemoteChanged")}
+          <Button variant="ghost" onClick={() => { dirtyRef.current = false; setReloadKey((value) => value + 1); }} isDisabled={busy}>
+            {t("common.reset")}
+          </Button>
+        </Alert>
+      ) : null}
       {firstValidationMessage ? (
         <Alert status="warning" className="!text-slate-900">{firstValidationMessage}</Alert>
       ) : null}
@@ -263,6 +317,9 @@ function ShareSettingsForm({
           supportedPeriods={share.supportedUserTokenPeriods}
           t={t}
           shareId={share.shareId}
+          disabled={busy || !!pendingEditId || share.activeEdit?.status === "pending"}
+          usageEdits={draft.userUsageEdits}
+          onUsageEditsChange={(userUsageEdits) => setDraft((current) => ({ ...current, userUsageEdits }))}
           onChange={(userGrants) =>
             setDraft((current) => ({ ...current, userGrants }))
           }
@@ -346,13 +403,13 @@ function ShareSettingsForm({
 
       {editable ? (
         <div className="flex justify-end">
-          <Button variant="primary" isDisabled={busy || formInvalid} onClick={() => void save()}>
+          <Button variant="primary" isDisabled={busy || !!pendingEditId || formInvalid || !dirty || share.activeEdit?.status === "pending"} onClick={() => void save()}>
             {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
             Save settings
           </Button>
         </div>
       ) : null}
-    </div>
+    </fieldset>
   );
 }
 

@@ -171,21 +171,20 @@ function grantToLimitStatusRow(
   };
 }
 
-function makeBatchDraft(grant: ShareUserGrant, usageEdits: ShareUserUsageEditMap): BatchGrantDraft {
+function makeBatchDraft(grant: ShareUserGrant): BatchGrantDraft {
   const draft = makeDraft(grant.email, grant.policy);
-  const usage = usageEditForGrant(grant, usageEdits);
   return {
     parallelLimit: draft.parallelLimit,
     tokenLimit: draft.tokenLimit,
     tokenPeriod: draft.tokenPeriod,
     tokenPeriodAnchor: draft.tokenPeriodAnchor,
     expiresAt: draft.expiresAt,
-    consumedTokens: usage.consumedTokens,
-    usageAction: usage.usageAction === "clear" ? "clear" : "set",
-    applyParallelLimit: true,
-    applyTokenLimit: true,
-    applyConsumedTokens: true,
-    applyExpiresAt: true,
+    consumedTokens: "",
+    usageAction: "set",
+    applyParallelLimit: false,
+    applyTokenLimit: false,
+    applyConsumedTokens: false,
+    applyExpiresAt: false,
   };
 }
 
@@ -367,7 +366,7 @@ export function ShareUserGrantsEditor({
     const firstSelected = grants.find((grant) => selectedEditableEmails.has(grant.email));
     if (!firstSelected) return;
     setError("");
-    setBatchDraft(makeBatchDraft(firstSelected, usageEdits));
+    setBatchDraft(makeBatchDraft(firstSelected));
   };
 
   const applyGrants = (userGrants: ShareUserGrantMap) => onChange(userGrants);
@@ -425,6 +424,7 @@ export function ShareUserGrantsEditor({
     const observedTokens = previous && !reuseMarketTombstone ? observedGrantTokens(previous) : 0;
     const usageInvalid =
       grantDraft.usageAction === "set" &&
+      !!grantDraft.consumedTokens.trim() &&
       (consumedTokens == null ||
         consumedTokens < 0 ||
         consumedTokens < observedTokens);
@@ -487,10 +487,10 @@ export function ShareUserGrantsEditor({
           anchorAtMs: tokenPeriodAnchorAtMs,
           source: usageEdits[editingEmail || email]?.source ?? "manual",
         };
-      } else if (grantDraft.usageAction === "clear" && previous?.usageRebase) {
+      } else if (grantDraft.usageAction === "clear") {
         nextEdits[email] = {
           action: "clear",
-          expectedGrantRevision: previous.revision,
+          expectedGrantRevision: previous?.revision,
           period: grantDraft.tokenPeriod,
           anchorAtMs: tokenPeriodAnchorAtMs,
         };
@@ -537,6 +537,7 @@ export function ShareUserGrantsEditor({
     const usageInvalid =
       batchDraft.applyConsumedTokens &&
       batchDraft.usageAction === "set" &&
+      !!batchDraft.consumedTokens.trim() &&
       (consumedTokens == null ||
         consumedTokens < 0 ||
         consumedTokens < usageFloor);
@@ -646,7 +647,7 @@ export function ShareUserGrantsEditor({
               : grant.policy.tokenPeriodAnchorAtMs,
             source: usageEdits[email]?.source ?? "manual",
           };
-        } else if (batchDraft.applyConsumedTokens && batchDraft.usageAction === "clear" && grant.usageRebase) {
+        } else if (batchDraft.applyConsumedTokens && batchDraft.usageAction === "clear") {
           nextEdits[email] = {
             action: "clear",
             expectedGrantRevision: grant.revision,
@@ -655,8 +656,9 @@ export function ShareUserGrantsEditor({
               ? tokenPeriodAnchorAtMs
               : grant.policy.tokenPeriodAnchorAtMs,
           };
-        } else {
-          delete nextEdits[email];
+        } else if (batchDraft.applyTokenLimit && nextEdits[email]) {
+          // Preserve an explicit calibration already staged in this draft.
+          nextEdits[email] = { ...nextEdits[email], period: batchDraft.tokenPeriod, anchorAtMs: tokenPeriodAnchorAtMs };
         }
       }
       onUsageEditsChange(nextEdits);
@@ -923,7 +925,7 @@ export function ShareUserGrantsEditor({
               </Modal.Body>
               <Modal.Footer>
                 <Button variant="outline" onClick={() => setGrantDraft(null)}>{t("common.cancel")}</Button>
-                <Button variant="primary" onClick={save}>{t("common.save")}</Button>
+                <Button variant="primary" onClick={save}>{t("common.apply")}</Button>
               </Modal.Footer>
             </Modal.Dialog>
           </Modal.Container>

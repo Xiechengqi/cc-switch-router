@@ -71,7 +71,7 @@ export async function getSharePageShare(email?: string, token?: string) {
   );
 }
 
-export async function updateSharePageSettings(patch: ShareSettingsPatch) {
+export async function updateSharePageSettings(patch: ShareSettingsPatch, baseConfigRevision?: number) {
   const { email } = readShareApiCredentials();
   return parseShareJson<{ ok: boolean; edit: ShareEditView; appliedSynchronously: boolean }>(
     await fetch(`/share-api/share/settings${shareEmailParam(email)}`, {
@@ -80,7 +80,15 @@ export async function updateSharePageSettings(patch: ShareSettingsPatch) {
         "Content-Type": "application/json",
         ...shareAuthHeaders(),
       },
-      body: JSON.stringify({ patch }),
+      body: JSON.stringify({ patch, baseConfigRevision }),
     }),
   );
+}
+
+export async function getSharePageSettingsEdit(editId: string) {
+  const { email } = readShareApiCredentials();
+  return parseShareJson<ShareEditView>(await fetch(
+    `/share-api/share/settings-edits/${encodeURIComponent(editId)}${shareEmailParam(email)}`,
+    { headers: shareAuthHeaders(), cache: "no-store" },
+  ));
 }

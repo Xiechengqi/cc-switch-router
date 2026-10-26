@@ -6,7 +6,7 @@ import type {
   ShareUserUsageEditMap,
   ShareView,
 } from "@/lib/types";
-import { buildOrdinaryUserGrantsPatch } from "@/lib/share-settings";
+import { buildOrdinaryUserGrantsPatch, changedShareSettings } from "@/lib/share-settings";
 import { millionsInputToTokens, tokensToMillionsInput } from "@/lib/token-units";
 import {
   DEFAULT_PARALLEL_LIMIT,
@@ -105,6 +105,12 @@ export function buildShareEditDraft(share: ShareView): ShareEditDraft {
 }
 
 export function buildShareEditPatch(draft: ShareEditDraft, share: ShareView, activeShareApps: PriceApp[]): ShareSettingsPatch {
+  const baseline = fullShareEditPatch(buildShareEditDraft(share), share);
+  baseline.userGrants = { ...share.userGrants, ...baseline.userGrants };
+  return changedShareSettings(fullShareEditPatch(draft, share), baseline, draft.userUsageEdits);
+}
+
+function fullShareEditPatch(draft: ShareEditDraft, share: ShareView): ShareSettingsPatch {
   const tokenLimit = draft.tokenLimitUnlimited
     ? UNLIMITED_TOKEN_LIMIT
     : millionsInputToTokens(draft.tokenLimitInput) ?? 0;

@@ -407,6 +407,10 @@ pub fn router(state: ServerState) -> Router {
             "/share-api/share/settings",
             patch(share_api_update_settings),
         )
+        .route(
+            "/share-api/share/settings-edits/:edit_id",
+            get(share_api_get_settings_edit),
+        )
         .route("/v1/me/api-token", get(get_default_api_token))
         .route("/v1/me/api-token/reset", post(reset_default_api_token))
         .route(
@@ -460,6 +464,10 @@ pub fn router(state: ServerState) -> Router {
         .route(
             "/v1/shares/:share_id/settings",
             patch(update_share_settings),
+        )
+        .route(
+            "/v1/shares/:share_id/settings-edits/:edit_id",
+            get(get_share_settings_edit),
         )
         .route(
             "/v1/shares/:share_id/requested-model-blocks",
@@ -1943,6 +1951,34 @@ async fn share_api_share(
         )
         .await?;
     Ok(Json(ShareApiShareResponse { share, auth }))
+}
+
+async fn share_api_get_settings_edit(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<ShareApiAuthQuery>,
+    Path(edit_id): Path<String>,
+) -> Result<Json<crate::models::ShareEditView>, AppError> {
+    let route = share_route_from_headers(&state, &headers).await?;
+    let share_id = route
+        .share_id()
+        .ok_or_else(|| AppError::NotFound("share route not found".into()))?;
+    let auth = share_api_auth_response(&state, &headers, share_id, query.email.as_deref()).await?;
+    if !auth.can_manage {
+        return Err(AppError::Forbidden(
+            "only share owner can read settings edits".into(),
+        ));
+    }
+    let email = auth
+        .user
+        .ok_or_else(|| AppError::Unauthorized("api token required".into()))?
+        .email;
+    Ok(Json(
+        state
+            .store
+            .share_settings_edit_for_owner(share_id, &edit_id, &email)
+            .await?,
+    ))
 }
 
 async fn share_api_update_settings(
@@ -5232,6 +5268,20 @@ async fn batch_sync_share_descriptors(
     Ok(Json(ShareDescriptorBatchSyncResponse { ok: true, acks }))
 }
 
+async fn get_share_settings_edit(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path((share_id, edit_id)): Path<(String, String)>,
+) -> Result<Json<crate::models::ShareEditView>, AppError> {
+    let email = require_user_email(&state, &headers, "share:write").await?;
+    Ok(Json(
+        state
+            .store
+            .share_settings_edit_for_owner(&share_id, &edit_id, &email)
+            .await?,
+    ))
+}
+
 async fn update_share_settings(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -5748,12 +5798,16 @@ async fn update_share_settings_with_email(
         )
         .await
         {
-            Ok(returned_share) => {
+            Ok((returned_share, receipt)) => {
                 state
                     .store
-                    .apply_share_edit_directly(&response.edit.id, returned_share)
+                    .apply_share_edit_with_receipt(&response.edit.id, returned_share, receipt)
                     .await?;
                 response.applied_synchronously = true;
+                response.edit = state
+                    .store
+                    .share_settings_edit_for_owner(share_id, &response.edit.id, current_user_email)
+                    .await?;
                 return Ok(response);
             }
             Err(err) if err.is_transport() => {
@@ -5766,11 +5820,18 @@ async fn update_share_settings_with_email(
                 // fall through to async path
             }
             Err(err) => {
-                let message = err.to_string();
-                let _ = state
+                let message = err.client_message();
+                state
                     .store
-                    .mark_share_edit_rejected(&response.edit.id, &message)
-                    .await;
+                    .mark_share_edit_rejected_with_metadata(
+                        &response.edit.id,
+                        &message,
+                        err.error_code(),
+                        Some(err.retryable()),
+                        err.current_config_revision(),
+                        err.current_share(),
+                    )
+                    .await?;
                 return Err(AppError::UnprocessableEntity(message));
             }
         }

@@ -1189,7 +1189,87 @@ pub struct ShareSettingsPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_usage_edits: Option<BTreeMap<String, ShareUserUsageEdit>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_grant_edits: Option<BTreeMap<String, ShareUserGrantEdit>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit_context: Option<ShareSettingsEditContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed_grant: Option<ShareManagedGrantOperation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShareUserGrantEdit {
+    pub expected_revision: u64,
+    /// None revokes the ordinary grant. Runtime usage is never browser-owned.
+    #[serde(deserialize_with = "deserialize_required_nullable_policy")]
+    pub policy: Option<ShareUserPolicy>,
+}
+
+fn deserialize_required_nullable_policy<'de, D>(
+    deserializer: D,
+) -> Result<Option<ShareUserPolicy>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<ShareUserPolicy>::deserialize(deserializer)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShareSettingsEditContext {
+    pub operation_id: String,
+    pub expected_config_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShareSettingsReceipt {
+    pub operation_id: String,
+    pub patch_fingerprint: String,
+    pub config_revision: u64,
+}
+
+pub fn share_settings_fingerprint(share_id: &str, patch: &ShareSettingsPatch) -> String {
+    // Value maps are sorted in both implementations, independent of struct field order.
+    use sha2::{Digest, Sha256};
+    let mut value = serde_json::json!([share_id, patch]);
+    value.sort_all_objects();
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&value).expect("serializable settings patch"))
+    )
+}
+
+#[cfg(test)]
+mod settings_receipt_tests {
+    use super::*;
+
+    #[test]
+    fn settings_receipt_fingerprint_matches_the_cross_repository_wire_fixture() {
+        assert!(
+            serde_json::from_value::<ShareUserGrantEdit>(
+                serde_json::json!({ "expectedRevision": 1 })
+            )
+            .is_err(),
+            "omitted policy must not silently revoke a user"
+        );
+        let patch: ShareSettingsPatch = serde_json::from_value(serde_json::json!({
+            "editContext": { "operationId": "edit-1", "expectedConfigRevision": 5 },
+            "userGrantEdits": { "a@example.com": { "expectedRevision": 3,
+                "policy": { "parallelLimit": 4, "tokenPeriod": "lifetime" } } },
+            "userUsageEdits": { "a@example.com": { "action": "set", "targetTokens": 100,
+                "expectedGrantRevision": 3, "period": "lifetime", "source": "manual" } }
+        }))
+        .unwrap();
+        assert_eq!(
+            share_settings_fingerprint("share-1", &patch),
+            "60bdfea4dfca31ae4ff78c6d6e335639d896c5421403fbf7361de14a0a47b7e6"
+        );
+        assert_ne!(
+            share_settings_fingerprint("another-share", &patch),
+            share_settings_fingerprint("share-1", &patch)
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -1530,6 +1610,8 @@ pub struct SharePendingEditsResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareEditAckPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings_receipt: Option<ShareSettingsReceipt>,
     pub edit_id: String,
     pub revision: i64,
     pub status: String,

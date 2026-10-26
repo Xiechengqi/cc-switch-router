@@ -14144,10 +14144,10 @@ async fn try_apply_dispatched_edit_via_ctl(
     )
     .await
     {
-        Ok(returned_share) => {
+        Ok((returned_share, receipt)) => {
             state
                 .store
-                .apply_share_edit_directly(&edit.id, returned_share)
+                .apply_share_edit_with_receipt(&edit.id, returned_share, receipt)
                 .await?;
             Ok(true)
         }

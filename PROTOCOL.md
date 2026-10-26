@@ -273,7 +273,18 @@ Router 复用已建立的反向隧道**同步调用** Server 本地 API,避免�
 
 **降级策略**:`Unreachable` / `Timeout` 时回落到异步 pending-edit 队列 + SSE 通知路径;`Rejected` / `Malformed` 直接向 dashboard 返回硬错误。
 
-Router **从不改写** Server 返回的 descriptor,只做校验(`store::apply_share_edit_directly`);若客户端只部分应用了补丁,Router 拒绝落库而非静默持久化。
+Router **从不改写** Server 返回的 descriptor,只做校验(`store::apply_share_edit_with_receipt`);若客户端只部分应用了补丁,Router 拒绝落库而非静默持久化。
+
+普通 Share 配置保存使用同一个持久化操作身份贯穿同步 RPC 和异步队列：
+
+- 浏览器冻结编辑时的 `baseConfigRevision`；Router 将其写入 `patch.editContext.expectedConfigRevision`，并用 edit ID 设置 `operationId`。浏览器不得指定 `editContext`。
+- `userGrantEdits[email] = { expectedRevision, policy }` 只提交变化的用户；`policy: null` 撤销普通授权，不能撤销 owner 或修改 active 市场托管授权。不得与整表替换的 `userGrants` 混用。未修改用户的 revision、用量及校准记录保持不变。
+- `userUsageEdits` 仅用于显式用量校准，和普通配额编辑分离。批量参数默认不勾选，清除基线也必须显式操作。Server 在同一 quota mutation 中校验全部用户及最新用量，任一失败则整笔不落地。
+- Server 将成功操作的 `settingsReceipt = { operationId, patchFingerprint, configRevision }` 与 Share 一同持久化；同 ID、同载荷的重试只返回已有结果，不再执行。指纹为递归排序对象键后的紧凑 JSON `[shareId, patch]` 的 SHA-256 小写 hex。回执缓存最多 4096 条；缓存淘汰后，旧操作的冻结配置版本仍会阻止重放。
+- RPC 响应及 applied ACK 必须附带匹配回执，不能只凭当前动态用量判断校准是否执行。回执版本的 descriptor 必须满足补丁；若期间已出现更高版本，回执证明历史操作成功，而 descriptor 表达最新状态。晚到的已 applied 响应幂等返回，不覆盖新配置。
+- owner 可通过 `GET /v1/shares/:share_id/settings-edits/:edit_id` 查询确切任务；独立 Share 页面对应 `GET /share-api/share/settings-edits/:edit_id`。前端仅跟踪本次 edit，不用路由健康或任意 dashboard 刷新冒充成功，不重开已关闭的编辑器。
+
+部署顺序：先升级 Server，再升级 Router。旧 Server 不识别新补丁时明确失败，不降级成无版本校验的整表覆盖。已有不带 editContext 的历史队列仍按原契约处理。
 
 ### 7.1 Share Market managed grants
 
@@ -296,7 +307,7 @@ Server 要求:
 
 一个拼车位授权整个 Share,不出售单一 App。报价会冻结当时全部已启用 App 的供应商与模型条款(`service.apps[]`),租客不能再通过 `requiredApp` 收窄授权；该旧请求字段仅作为兼容输入保留并被忽略。Router-managed grant 对三个核心 App 显式下发 `allowedApps=[claude,codex,gemini]`,Server 再以目标 App 当前是否已绑定且启用作为实际可调用边界，因此 Share 后续启用的核心 App 无需重建租约即可使用。升级前的单 App 活跃 grant 通过幂等 upsert 原地扩权,不 revoke、不暂停服务或账单；迁移时已经在途的 v1 初次授权或恢复授权可完成一次旧范围确认，但不会标记为扩权完成，下一轮立即原地扩权。v2 租约不接受该兼容行为。
 
-用户“已消耗 Token / 周期起点”重基线只由 Server Provider 编辑入口提交 `userUsageEdits`；Router Share Market grant 仍只读。重基线变化会带来新的 descriptor generation，普通请求 usage 计数不会触发同步风暴。
+用户“已消耗 Token / 周期起点”重基线可由 Server Provider 或 Router owner 编辑入口显式提交 `userUsageEdits`；Router Share Market grant 仍只读。重基线变化会带来新的 descriptor generation，普通请求 usage 计数不会触发同步风暴。
 
 浏览器侧 HTTP 契约(用户 Session):
 

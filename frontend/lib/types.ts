@@ -480,6 +480,7 @@ export type ShareSettingsPatch = {
   support?: ShareSupport;
   userGrants?: ShareUserGrantMap;
   userUsageEdits?: ShareUserUsageEditMap;
+  userGrantEdits?: Record<string, { expectedRevision: number; policy: ShareUserPolicy | null }>;
   managedGrant?: {
     operationId: string;
     entitlementId: string;

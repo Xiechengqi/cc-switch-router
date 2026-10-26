@@ -158,10 +158,17 @@ test("share-page patch writes a manual shareto over a revoked market tombstone",
     { tokenPeriod: "lifetime", tokenLimit: 800 },
   );
   const patch = buildShareSettingsPatch(draft, share);
-  const restored = patch.userGrants?.["renter@example.com"];
-  assert.equal(restored?.active, true);
-  assert.equal(restored?.manager, "manual");
-  assert.equal(restored?.entitlementId, undefined);
-  assert.equal(restored?.revokedAtMs, undefined);
-  assert.equal(restored?.policy.tokenLimit, 800);
+  const restored = patch.userGrantEdits?.["renter@example.com"];
+  assert.equal(patch.userGrants, undefined);
+  assert.equal(restored?.expectedRevision, 0);
+  assert.equal(restored?.policy?.tokenLimit, 800);
+});
+
+test("independent Share page sends explicit calibration separately from policy edits", () => {
+  const share = shareView({ "a@example.com": grant("a@example.com", { revision: 2 }) });
+  const draft = draftFromShare(share);
+  draft.userUsageEdits["a@example.com"] = { action: "clear", expectedGrantRevision: 2 };
+  assert.deepEqual(buildShareSettingsPatch(draft, share), {
+    userUsageEdits: { "a@example.com": { action: "clear", expectedGrantRevision: 2 } },
+  });
 });

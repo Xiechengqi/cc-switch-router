@@ -353,6 +353,12 @@ export function recordDashboardUxEvent(event: DashboardUxEvent) {
   }).catch(() => undefined);
 }
 
+export async function getShareSettingsEdit(shareId: string, editId: string) {
+  return parseJson<ShareEditView>(await authFetch(
+    `/v1/shares/${encodeURIComponent(shareId)}/settings-edits/${encodeURIComponent(editId)}`,
+  ));
+}
+
 export async function updateShareSettings(
   shareId: string,
   patch: ShareSettingsPatch,

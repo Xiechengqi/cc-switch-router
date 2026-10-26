@@ -42,7 +42,7 @@ function shareView(userGrants: Record<string, ShareUserGrant>): ShareView {
   };
 }
 
-test("buildShareEditPatch keeps active Share Market grants and ignores tombstones", () => {
+test("unchanged settings send no grants, runtime snapshots, or market tombstones", () => {
   const share = shareView({
     "owner@example.com": grant("owner@example.com", {
       role: "owner",
@@ -59,9 +59,7 @@ test("buildShareEditPatch keeps active Share Market grants and ignores tombstone
     }),
   });
   const patch = buildShareEditPatch(buildShareEditDraft(share), share, ["claude"]);
-  assert.equal(patch.userGrants?.["active@example.com"]?.manager, "routerShareMarket");
-  assert.equal(patch.userGrants?.["active@example.com"]?.entitlementId, "entitlement-active");
-  assert.equal(patch.userGrants?.["revoked@example.com"], undefined);
+  assert.deepEqual(patch, {});
 });
 
 test("buildShareEditPatch writes a manual shareto over a revoked market tombstone", () => {
@@ -75,6 +73,7 @@ test("buildShareEditPatch writes a manual shareto over a revoked market tombston
       manager: "routerShareMarket",
       entitlementId: "entitlement-revoked",
       revokedAtMs: 1,
+      revision: 7,
     }),
   });
   const draft = buildShareEditDraft(share);
@@ -85,11 +84,36 @@ test("buildShareEditPatch writes a manual shareto over a revoked market tombston
     policy: { tokenPeriod: "lifetime", tokenLimit: 800 },
   });
   const patch = buildShareEditPatch(draft, share, ["claude"]);
-  const restored = patch.userGrants?.["renter@example.com"];
-  assert.equal(restored?.active, true);
-  assert.equal(restored?.role, "shareto");
-  assert.equal(restored?.manager, "manual");
-  assert.equal(restored?.entitlementId, undefined);
-  assert.equal(restored?.revokedAtMs, undefined);
-  assert.equal(restored?.policy.tokenLimit, 800);
+  const restored = patch.userGrantEdits?.["renter@example.com"];
+  assert.equal(patch.userGrants, undefined);
+  assert.equal(restored?.expectedRevision, 7);
+  assert.equal(restored?.policy?.tokenLimit, 800);
+});
+
+test("multi-user edits are sparse and never include observed usage", () => {
+  const share = shareView({
+    "a@example.com": grant("a@example.com", { revision: 3, policy: { tokenPeriod: "lifetime", parallelLimit: 2 } }),
+    "b@example.com": grant("b@example.com", { revision: 9, policy: { tokenPeriod: "lifetime", parallelLimit: 4 } }),
+    "c@example.com": grant("c@example.com", { revision: 1 }),
+  });
+  const draft = buildShareEditDraft(share);
+  for (const email of ["a@example.com", "b@example.com"]) {
+    draft.userGrants[email] = { ...draft.userGrants[email], policy: { tokenPeriod: "lifetime", parallelLimit: 8 } };
+  }
+  const patch = buildShareEditPatch(draft, share, ["claude"]);
+  assert.deepEqual(Object.keys(patch), ["userGrantEdits"]);
+  assert.deepEqual(Object.keys(patch.userGrantEdits!), ["a@example.com", "b@example.com"]);
+  assert.equal(patch.userGrantEdits?.["a@example.com"].expectedRevision, 3);
+  assert.equal(patch.userGrantEdits?.["b@example.com"].expectedRevision, 9);
+  assert.equal(patch.userUsageEdits, undefined);
+});
+
+test("revoking a user drops only that user's staged calibration", () => {
+  const share = shareView({ "a@example.com": grant("a@example.com", { revision: 4 }) });
+  const draft = buildShareEditDraft(share);
+  draft.userUsageEdits["a@example.com"] = { action: "set", targetTokens: 10 };
+  delete draft.userGrants["a@example.com"];
+  assert.deepEqual(buildShareEditPatch(draft, share, ["claude"]), {
+    userGrantEdits: { "a@example.com": { expectedRevision: 4, policy: null } },
+  });
 });

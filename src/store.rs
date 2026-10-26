@@ -11282,7 +11282,7 @@ impl AppStore {
         let current_app_providers = parse_app_providers(Some(app_providers_json))
             .map_err(|e| AppError::Internal(format!("parse share app providers failed: {e}")))?;
         let supported_apps = supported_apps_from_providers(&current_app_providers);
-        let patch = normalize_share_settings_patch(
+        let mut patch = normalize_share_settings_patch(
             patch,
             Some(&owner_email),
             Some(&current_bindings),
@@ -11294,7 +11294,12 @@ impl AppStore {
         ensure_free_access_market_exclusive_tx(&conn, share_id, effective_free_access)?;
         let supported_user_token_periods =
             parse_supported_user_token_periods(&supported_user_token_periods_json);
-        if patch.user_grants.as_ref().is_some_and(|grants| {
+        if patch.user_grant_edits.as_ref().is_some_and(|edits| {
+            edits
+                .values()
+                .filter_map(|edit| edit.policy.as_ref())
+                .any(|policy| !supported_user_token_periods.contains(&policy.token_period))
+        }) || patch.user_grants.as_ref().is_some_and(|grants| {
             grants
                 .values()
                 .any(|grant| !supported_user_token_periods.contains(&grant.policy.token_period))
@@ -11314,6 +11319,11 @@ impl AppStore {
         }
         let revision = next_share_edit_revision(&conn, share_id)?;
         let id = Uuid::new_v4().to_string();
+        patch.edit_context = Some(crate::models::ShareSettingsEditContext {
+            operation_id: id.clone(),
+            expected_config_revision: base_config_revision
+                .unwrap_or(current_config_revision.max(0) as u64),
+        });
         let patch_json = serde_json::to_string(&patch).map_err(|e| {
             AppError::Internal(format!("serialize share settings patch failed: {e}"))
         })?;
@@ -11350,15 +11360,20 @@ impl AppStore {
     /// pending edit requested. A report that drops a requested field (e.g. an
     /// owner transfer that forgot to demote the old owner into `shareto`) is
     /// rejected, the edit is marked `rejected`, and `shares` is left untouched.
-    pub async fn apply_share_edit_directly(
+    pub async fn apply_share_edit_with_receipt(
         &self,
         edit_id: &str,
         mut returned_share: ShareDescriptor,
+        receipt: Option<crate::models::ShareSettingsReceipt>,
     ) -> Result<(), AppError> {
         let now = Utc::now();
         let conn = self.conn.lock().await;
         let edit = get_share_edit_by_id(&conn, edit_id)?
             .ok_or_else(|| AppError::NotFound("share edit not found".into()))?;
+        if edit.status == "applied" {
+            validate_settings_receipt(&edit, receipt.as_ref())?;
+            return Ok(());
+        }
         if edit.status != "pending" {
             return Err(AppError::Conflict(format!(
                 "share edit is {} and cannot be applied",
@@ -11404,7 +11419,18 @@ impl AppStore {
             return Err(AppError::UnprocessableEntity(message));
         }
         normalize_share_descriptor_fields(&mut returned_share)?;
-        if let Err(field) = validate_returned_share_against_patch(&edit.patch, &returned_share) {
+        validate_settings_receipt(&edit, receipt.as_ref())?;
+        if let Err(field) = if let Some(receipt) = receipt.as_ref() {
+            if returned_share.config_revision < receipt.config_revision {
+                Err("configRevision")
+            } else if returned_share.config_revision == receipt.config_revision {
+                validate_returned_share_against_patch(&edit.patch, &returned_share)
+            } else {
+                Ok(())
+            }
+        } else {
+            validate_returned_share_against_patch(&edit.patch, &returned_share)
+        } {
             let message = format!("client reply did not satisfy patch field: {field}");
             reject_pending_share_edit_reply(&conn, edit_id, &now.to_rfc3339(), &message)?;
             return Err(AppError::UnprocessableEntity(message));
@@ -11474,6 +11500,31 @@ impl AppStore {
         )?;
         tx.commit().map_err(map_share_constraint_error)?;
         Ok(())
+    }
+
+    pub async fn share_settings_edit_for_owner(
+        &self,
+        share_id: &str,
+        edit_id: &str,
+        email: &str,
+    ) -> Result<ShareEditView, AppError> {
+        let conn = self.conn.lock().await;
+        let owner: Option<String> = conn
+            .query_row(
+                "SELECT owner_email FROM shares WHERE share_id = ?1",
+                params![share_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+        if owner.as_deref().map(normalize_email).transpose()? != Some(normalize_email(email)?) {
+            return Err(AppError::Forbidden(
+                "only share owner can read settings edits".into(),
+            ));
+        }
+        get_share_edit_by_id(&conn, edit_id)?
+            .filter(|edit| edit.share_id == share_id)
+            .ok_or_else(|| AppError::NotFound("share edit not found".into()))
     }
 
     pub async fn pending_share_edit_for_share(
@@ -11636,9 +11687,60 @@ impl AppStore {
             .error_message
             .as_deref()
             .map(client_chat::sanitize_system_event_text);
+        let edit = get_share_edit_by_id(&conn, &ack_edit_id)?
+            .ok_or_else(|| AppError::NotFound("share edit not found".into()))?;
+        if status == "applied" {
+            validate_settings_receipt(&edit, input.ack.settings_receipt.as_ref())?;
+        }
         let tx = conn.unchecked_transaction().map_err(|error| {
             AppError::Internal(format!("begin share edit ack transaction failed: {error}"))
         })?;
+        if status == "applied" && edit.status == "pending" && edit.patch.edit_context.is_some() {
+            if edit.installation_id != input.installation_id || edit.revision != input.ack.revision
+            {
+                return Err(AppError::Conflict(
+                    "settings receipt does not match this installation or edit revision".into(),
+                ));
+            }
+            if let Some(share) = input.ack.current_share.as_ref() {
+                let receipt = input
+                    .ack
+                    .settings_receipt
+                    .as_ref()
+                    .expect("validated settings receipt");
+                if share.share_id != edit.share_id
+                    || share.config_revision < receipt.config_revision
+                {
+                    return Err(AppError::BadRequest(
+                        "settings ACK snapshot does not match the applied edit".into(),
+                    ));
+                }
+                if share.config_revision == receipt.config_revision {
+                    validate_returned_share_against_patch(&edit.patch, share).map_err(|field| {
+                        AppError::UnprocessableEntity(format!(
+                            "settings ACK did not satisfy patch field: {field}"
+                        ))
+                    })?;
+                }
+                let owner = installation.owner_email.as_deref().ok_or_else(|| {
+                    AppError::Conflict("installation owner is not configured".into())
+                })?;
+                let mut share = share.clone();
+                validate_strict_share_descriptor_tx(&tx, &share)?;
+                ensure_share_id_writable_by_installation(
+                    &tx,
+                    &share.share_id,
+                    &edit.installation_id,
+                )?;
+                validate_share_namespace_for_installation(
+                    &tx,
+                    &edit.installation_id,
+                    &share.subdomain,
+                )?;
+                normalize_self_reported_share_owner(&mut share, &normalize_email(owner)?)?;
+                upsert_share_tx(&tx, &edit.installation_id, share)?;
+            }
+        }
         apply_revision_conflict_snapshot_tx(
             &tx,
             &ack_edit_id,
@@ -21425,7 +21527,30 @@ fn share_settings_patch_is_empty(patch: &ShareSettingsPatch) -> bool {
         && patch.support.is_none()
         && patch.user_grants.is_none()
         && patch.user_usage_edits.is_none()
+        && patch.user_grant_edits.is_none()
         && patch.managed_grant.is_none()
+}
+
+fn validate_settings_receipt(
+    edit: &ShareEditView,
+    receipt: Option<&crate::models::ShareSettingsReceipt>,
+) -> Result<(), AppError> {
+    let Some(context) = edit.patch.edit_context.as_ref() else {
+        return Ok(());
+    };
+    let valid = receipt.is_some_and(|receipt| {
+        receipt.operation_id == context.operation_id
+            && receipt.patch_fingerprint
+                == crate::models::share_settings_fingerprint(&edit.share_id, &edit.patch)
+            && receipt.config_revision > context.expected_config_revision
+    });
+    if !valid {
+        return Err(AppError::UnprocessableEntity(
+            "client reply is missing a matching durable settings receipt; update cc-switch-server"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Verifies that the descriptor the client reported back through the control
@@ -21438,6 +21563,19 @@ fn validate_returned_share_against_patch(
     patch: &ShareSettingsPatch,
     share: &ShareDescriptor,
 ) -> Result<(), &'static str> {
+    if let Some(edits) = &patch.user_grant_edits {
+        for (email, edit) in edits {
+            let returned = share.user_grants.get(email).filter(|grant| grant.active);
+            match (&edit.policy, returned) {
+                (None, None) => {}
+                (Some(policy), Some(grant))
+                    if &grant.policy == policy
+                        && grant.manager != crate::models::ShareGrantManager::RouterShareMarket
+                        && grant.revision >= edit.expected_revision => {}
+                _ => return Err("userGrantEdits"),
+            }
+        }
+    }
     if let Some(owner) = patch.owner_email.as_deref() {
         let want = normalize_email(owner).map_err(|_| "ownerEmail")?;
         let got = share
@@ -21722,6 +21860,48 @@ fn normalize_share_settings_patch(
             "managed grants can only be changed by Share Market".into(),
         ));
     }
+    if patch.edit_context.is_some() {
+        return Err(AppError::BadRequest(
+            "editContext is assigned by Router".into(),
+        ));
+    }
+    if patch.user_grants.is_some() && patch.user_grant_edits.is_some() {
+        return Err(AppError::BadRequest(
+            "cannot mix userGrants and userGrantEdits".into(),
+        ));
+    }
+    if let Some(edits) = patch.user_grant_edits.as_ref() {
+        for (email, edit) in edits {
+            if normalize_email(email)? != *email {
+                return Err(AppError::BadRequest(
+                    "userGrantEdits keys must be normalized emails".into(),
+                ));
+            }
+            let previous = existing_user_grants.and_then(|grants| grants.get(email));
+            if previous.is_some_and(|grant| {
+                grant.active && grant.manager == crate::models::ShareGrantManager::RouterShareMarket
+            }) {
+                return Err(AppError::Forbidden(
+                    "Share Market managed users are read-only".into(),
+                ));
+            }
+            if previous.map_or(0, |grant| grant.revision) != edit.expected_revision {
+                return Err(AppError::Conflict(format!(
+                    "user grant {email} changed; reload the editor"
+                )));
+            }
+            if edit.policy.is_none() && Some(email.as_str()) == owner_email {
+                return Err(AppError::BadRequest("share owner cannot be revoked".into()));
+            }
+            if let Some(policy) = &edit.policy {
+                if policy.parallel_limit == Some(0) || policy.token_limit == Some(0) {
+                    return Err(AppError::BadRequest(
+                        "user limits must be positive or unlimited".into(),
+                    ));
+                }
+            }
+        }
+    }
     if patch.owner_email.is_some() {
         return Err(AppError::Conflict(
             "share owner is managed by the installation owner".into(),
@@ -21799,6 +21979,8 @@ fn normalize_share_settings_patch(
         support,
         user_grants,
         user_usage_edits: patch.user_usage_edits,
+        user_grant_edits: patch.user_grant_edits,
+        edit_context: None,
         managed_grant: None,
     })
 }
@@ -28270,6 +28452,7 @@ mod tests {
 
         let edit_ack = ShareEditAckEnvelope {
             ack: ShareEditAckPayload {
+                settings_receipt: None,
                 edit_id: "edit-42".to_string(),
                 revision: 7,
                 status: "applied".to_string(),
@@ -50224,7 +50407,9 @@ mod tests {
     async fn share_edit_pending_state_tracks_ack() {
         let (store, config) = setup_store("share-edit-pending-state").await;
         let signing_key = insert_signed_installation(&store, "inst-1").await;
-        insert_share(&store, "inst-1", "share-edit", "edit-sub", "active").await;
+        insert_client_tunnel(&store, "inst-1", "owner@example.com", TEST_CLIENT_SUBDOMAIN).await;
+        let subdomain = test_share_host("edit-sub");
+        insert_share(&store, "inst-1", "share-edit", &subdomain, "active").await;
 
         let response = store
             .create_share_settings_edit(
@@ -50245,7 +50430,27 @@ mod tests {
                 .expect("query pending state")
         );
 
+        let mut returned = test_share_descriptor("share-edit", &subdomain);
+        returned.description = Some("pending state test".into());
+        returned.config_revision = 1;
+        returned.descriptor_generation = 1;
+        returned.descriptor_fingerprint = "a".repeat(64);
         let ack = ShareEditAckPayload {
+            settings_receipt: Some(crate::models::ShareSettingsReceipt {
+                operation_id: response.edit.id.clone(),
+                patch_fingerprint: crate::models::share_settings_fingerprint(
+                    &response.edit.share_id,
+                    &response.edit.patch,
+                ),
+                config_revision: response
+                    .edit
+                    .patch
+                    .edit_context
+                    .as_ref()
+                    .unwrap()
+                    .expected_config_revision
+                    + 1,
+            }),
             edit_id: response.edit.id.clone(),
             revision: response.edit.revision,
             status: "applied".into(),
@@ -50253,7 +50458,7 @@ mod tests {
             error_code: None,
             retryable: None,
             current_config_revision: None,
-            current_share: Some(test_share_descriptor("share-ack-snapshot", "ack-snapshot")),
+            current_share: Some(returned),
             applied_at_ms: None,
             effective_policy: None,
         };
@@ -50346,6 +50551,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn share_settings_receipts_bind_the_exact_operation_and_owner_status_lookup() {
+        let (store, config) = setup_store("share-settings-receipt").await;
+        insert_installation(&store, "inst-1").await;
+        insert_client_tunnel(&store, "inst-1", "owner@example.com", TEST_CLIENT_SUBDOMAIN).await;
+        let host = test_share_host("receipt");
+        insert_share(&store, "inst-1", "share-receipt", &host, "active").await;
+        let edit = store
+            .create_share_settings_edit(
+                "share-receipt",
+                "owner@example.com",
+                ShareSettingsPatch {
+                    description: Some(Some("changed".into())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .edit;
+        assert!(
+            store
+                .share_settings_edit_for_owner("share-receipt", &edit.id, "stranger@example.com")
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .share_settings_edit_for_owner("other-share", &edit.id, "owner@example.com")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .share_settings_edit_for_owner("share-receipt", &edit.id, "owner@example.com")
+                .await
+                .unwrap()
+                .status,
+            "pending"
+        );
+        let receipt = crate::models::ShareSettingsReceipt {
+            operation_id: edit.id.clone(),
+            patch_fingerprint: crate::models::share_settings_fingerprint(
+                &edit.share_id,
+                &edit.patch,
+            ),
+            config_revision: edit
+                .patch
+                .edit_context
+                .as_ref()
+                .unwrap()
+                .expected_config_revision
+                + 1,
+        };
+        assert!(validate_settings_receipt(&edit, None).is_err());
+        let mut wrong = receipt.clone();
+        wrong.operation_id = "different-save".into();
+        assert!(validate_settings_receipt(&edit, Some(&wrong)).is_err());
+        wrong = receipt.clone();
+        wrong.patch_fingerprint = "0".repeat(64);
+        assert!(validate_settings_receipt(&edit, Some(&wrong)).is_err());
+        let mut returned = test_share_descriptor("share-receipt", &host);
+        returned.description = Some("changed".into());
+        returned.config_revision = receipt.config_revision;
+        returned.descriptor_generation = 1;
+        returned.descriptor_fingerprint = "a".repeat(64);
+        store
+            .apply_share_edit_with_receipt(&edit.id, returned.clone(), Some(receipt.clone()))
+            .await
+            .unwrap();
+        // A late duplicate response acknowledges the same result, without
+        // upserting an old descriptor over newer state.
+        returned.description = Some("must not be written".into());
+        store
+            .apply_share_edit_with_receipt(&edit.id, returned, Some(receipt))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .share_settings_edit_for_owner("share-receipt", &edit.id, "owner@example.com")
+                .await
+                .unwrap()
+                .status,
+            "applied"
+        );
+        let description: String = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT description FROM shares WHERE share_id = 'share-receipt'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(description, "changed");
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
     async fn direct_share_edit_rejects_noncanonical_subdomain_reply() {
         let (store, config) = setup_store("share-edit-reject-subdomain-change").await;
         let installation_id = "inst-1";
@@ -50387,7 +50690,7 @@ mod tests {
         returned.descriptor_fingerprint = "a".repeat(64);
 
         let error = store
-            .apply_share_edit_directly(&edit.id, returned)
+            .apply_share_edit_with_receipt(&edit.id, returned, None)
             .await
             .expect_err("bare Share slug must be rejected");
         assert!(error.to_string().contains("immutable Share subdomain"));
@@ -50536,7 +50839,18 @@ mod tests {
         returned.descriptor_fingerprint = "a".repeat(64);
 
         store
-            .apply_share_edit_directly(&edit.id, returned)
+            .apply_share_edit_with_receipt(
+                &edit.id,
+                returned,
+                Some(crate::models::ShareSettingsReceipt {
+                    operation_id: edit.id.clone(),
+                    patch_fingerprint: crate::models::share_settings_fingerprint(
+                        &edit.share_id,
+                        &edit.patch,
+                    ),
+                    config_revision: 1,
+                }),
+            )
             .await
             .expect("canonical reply must repair legacy bare Share subdomain");
 
