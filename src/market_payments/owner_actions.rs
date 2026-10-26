@@ -472,7 +472,7 @@ fn apply_reversal_tx(
     let available_minor = crate::market_wallet::wallet_snapshot_tx(conn, &snapshot.user_id)?
         .available_units
         .max(0)
-        / crate::market_billing::MONEY_UNITS_PER_MINOR;
+        / crate::market_common::MONEY_UNITS_PER_MINOR;
     let (principal_minor, fee_minor) =
         crate::market_wallet::topup_reversal_terms_tx(conn, order_id, input.amount_minor)?;
     let from_wallet_minor = principal_minor.min(available_minor);
@@ -695,7 +695,7 @@ mod tests {
             crate::market_wallet::wallet_snapshot_tx(&conn, "buyer")
                 .unwrap()
                 .posted_units,
-            500 * crate::market_billing::MONEY_UNITS_PER_MINOR
+            500 * crate::market_common::MONEY_UNITS_PER_MINOR
         );
         let evidence: i64 = conn
             .query_row(
@@ -858,7 +858,7 @@ mod tests {
             "test",
             "spent",
             "test",
-            300 * crate::market_billing::MONEY_UNITS_PER_MINOR,
+            300 * crate::market_common::MONEY_UNITS_PER_MINOR,
             None,
             "2026-10-02T00:00:00Z",
         )

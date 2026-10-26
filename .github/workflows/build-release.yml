@@ -66,6 +66,9 @@ jobs:
           npm run test:token-units
           npm run test:usd-micros
           npm run test:market-wallet
+          npm run test:share-market
+          npm run test:client-market
+          npm run test:providers
           npm run test:share-model-probe
           npm run test:share-model-health-heatmap
 
@@ -133,8 +136,12 @@ jobs:
           bash scripts/ci/timed.sh 'Test database templates' cargo test --locked test_support::tests
 
       - name: Test all market contracts
-        # Schema cases whose names contain market_ run in full in the next step.
-        run: bash scripts/ci/timed.sh 'Market contracts' cargo test --locked market_ -- --skip schema::tests
+        # market_ does not match modules named share_market / client_market.
+        # Keep full service-control coverage, not just wallet helper tests.
+        run: |
+          bash scripts/ci/timed.sh 'Market contracts' cargo test --locked market_ -- --skip schema::tests
+          bash scripts/ci/timed.sh 'Share rental contracts' cargo test --locked share_market::tests
+          bash scripts/ci/timed.sh 'Client rental contracts' cargo test --locked client_market::tests
 
       - name: Test real migrations without template shortcuts
         run: bash scripts/ci/timed.sh 'Real schema migrations' cargo test --locked schema::tests

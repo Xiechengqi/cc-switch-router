@@ -8,12 +8,10 @@ export const DASHBOARD_ACCOUNT_NOTIFICATIONS_PATH = "/account/notifications/";
 export const DASHBOARD_ACCOUNT_PROVIDER_USAGE_PATH = "/account/provider-usage/";
 export const DASHBOARD_ACCOUNT_CONSUMER_USAGE_PATH = "/account/consumer-usage/";
 export const DASHBOARD_ACCOUNT_MARKET_READINESS_PATH = "/account/market-readiness/";
-export const DASHBOARD_ACCOUNT_BILLING_PATH = "/account/billing/";
 export const DASHBOARD_ACCOUNT_WALLET_PATH = "/account/wallet/";
 export const DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH = "/account/provider-settings/";
 export const PROVIDER_INCOME_HREF = `${DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH}#income`;
 export const DASHBOARD_ACCOUNT_MARKET_ACCESS_PATH = "/account/market-access/";
-export const DASHBOARD_ACCOUNT_PAYMENTS_PATH = "/account/payments/";
 export const DASHBOARD_ACCOUNT_SHARE_PATH = "/account/share/";
 export const DASHBOARD_ACCOUNT_CLIENT_PATH = "/account/client/";
 /** @deprecated Prefer DASHBOARD_ACCOUNT_CLIENT_PATH; kept for redirect matching. */
@@ -30,11 +28,9 @@ export type DashboardRoute =
   | typeof DASHBOARD_ACCOUNT_PROVIDER_USAGE_PATH
   | typeof DASHBOARD_ACCOUNT_CONSUMER_USAGE_PATH
   | typeof DASHBOARD_ACCOUNT_MARKET_READINESS_PATH
-  | typeof DASHBOARD_ACCOUNT_BILLING_PATH
   | typeof DASHBOARD_ACCOUNT_WALLET_PATH
   | typeof DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH
   | typeof DASHBOARD_ACCOUNT_MARKET_ACCESS_PATH
-  | typeof DASHBOARD_ACCOUNT_PAYMENTS_PATH
   | typeof DASHBOARD_ACCOUNT_SHARE_PATH
   | typeof DASHBOARD_ACCOUNT_CLIENT_PATH
   | typeof DASHBOARD_ACCOUNT_RENTALS_PATH;
@@ -45,11 +41,9 @@ export function normalizeDashboardPath(pathname: string): DashboardRoute | null 
   if (pathname.startsWith("/account/client")) return DASHBOARD_ACCOUNT_CLIENT_PATH;
   if (pathname.startsWith("/account/share")) return DASHBOARD_ACCOUNT_SHARE_PATH;
   if (pathname.startsWith("/account/market-readiness")) return DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH;
-  if (pathname.startsWith("/account/billing")) return DASHBOARD_ACCOUNT_WALLET_PATH;
   if (pathname.startsWith("/account/wallet")) return DASHBOARD_ACCOUNT_WALLET_PATH;
   if (pathname.startsWith("/account/provider-settings")) return DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH;
   if (pathname.startsWith("/account/market-access")) return DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH;
-  if (pathname.startsWith("/account/payments")) return DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH;
   if (pathname.startsWith("/account/provider-usage")) return DASHBOARD_ACCOUNT_PROVIDER_USAGE_PATH;
   if (pathname.startsWith("/account/consumer-usage")) return DASHBOARD_ACCOUNT_CONSUMER_USAGE_PATH;
   if (pathname.startsWith("/account/api-keys")) return DASHBOARD_ACCOUNT_API_KEYS_PATH;

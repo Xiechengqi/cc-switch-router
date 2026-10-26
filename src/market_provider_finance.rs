@@ -3,8 +3,8 @@
 use axum::{
     Json, Router,
     extract::{Query, State},
-    http::{HeaderMap, StatusCode, header},
-    routing::{get, post, put},
+    http::{HeaderMap, header},
+    routing::get,
 };
 use serde::{Deserialize, Serialize};
 
@@ -61,58 +61,6 @@ pub fn router() -> Router<ServerState> {
         .route("/v1/market-provider-finance/me", get(get_finance))
         .route("/v1/market-provider-finance/earnings", get(list_earnings))
         .route("/v1/market-provider-finance/holds", get(list_holds))
-        // Old tabs and clients must fail explicitly, not retain a money path.
-        .route(
-            "/v1/market-provider-finance/destination",
-            put(retired_payout),
-        )
-        .route(
-            "/v1/market-provider-finance/destination/challenge",
-            post(retired_payout),
-        )
-        .route(
-            "/v1/market-provider-finance/withdrawals",
-            get(retired_payout).post(retired_payout),
-        )
-        .route(
-            "/v1/market-provider-finance/withdrawals/:id/cancel",
-            post(retired_payout),
-        )
-        .route("/v1/admin/market-finance/withdrawals", get(retired_payout))
-        .route(
-            "/v1/admin/market-finance/withdrawals/:id/transition",
-            post(retired_payout),
-        )
-        .route("/v1/market-wallet/refund-requests", post(retired_refund))
-}
-
-pub(crate) fn payout_retired_error() -> AppError {
-    AppError::Coded {
-        status: StatusCode::GONE,
-        code: "PROVIDER_PAYOUTS_RETIRED",
-        message: "Provider earnings are automatically credited to platform balance after settlement; use C2C or wallet transfers".into(),
-        details: serde_json::json!({ "walletUrl": "/account/wallet/", "earningsUrl": "/account/provider-settings/#income" }),
-    }
-}
-async fn retired_payout(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, AppError> {
-    session(&state, &headers).await?;
-    Err(payout_retired_error())
-}
-async fn retired_refund(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, AppError> {
-    session(&state, &headers).await?;
-    Err(AppError::Coded {
-        status: StatusCode::GONE,
-        code: "WALLET_CASH_REFUNDS_RETIRED",
-        message: "platform balance is not cash-refundable; use services, C2C or wallet transfers"
-            .into(),
-        details: serde_json::json!({ "walletUrl": "/account/wallet/" }),
-    })
 }
 
 #[derive(Serialize)]
@@ -304,17 +252,6 @@ mod tests {
             .unwrap();
         assert!(require_paid_offer_setup_tx(&conn, "provider").is_err());
         assert!(can_manage_earnings_tx(&conn, "provider").unwrap());
-    }
-    #[test]
-    fn external_payout_path_is_explicitly_gone() {
-        assert!(matches!(
-            payout_retired_error(),
-            AppError::Coded {
-                status: StatusCode::GONE,
-                code: "PROVIDER_PAYOUTS_RETIRED",
-                ..
-            }
-        ));
     }
 
     #[test]

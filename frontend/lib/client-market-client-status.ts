@@ -1,3 +1,4 @@
+import { walletReleaseScheduled } from "./client-checkout";
 import type { ClientMarketRental } from "@/lib/types";
 import { clientMarketRentalNeedsFollowup } from "./client-market-rental-state";
 
@@ -45,7 +46,7 @@ export function marketClientContext(
     return { hint: null, manageAs };
   }
   if (rental.status === "billing_suspended") return { hint: "billing-suspended", manageAs };
-  if (rental.recurring?.cancelAtPeriodEnd) {
+  if (walletReleaseScheduled(rental.walletContract, rental.pricingModel)) {
     // The existing rental banner shows the actual period-end date.
     return { hint: null, manageAs };
   }

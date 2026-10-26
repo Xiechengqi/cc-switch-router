@@ -53,7 +53,7 @@ function provider(
       fulfillmentTotal: 0,
     },
     performance: { displayOnly: true },
-    paymentMethodKinds: [],
+
     exploration: false,
     joinedAt: "2026-01-01T00:00:00Z",
     ...overrides,

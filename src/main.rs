@@ -3,7 +3,6 @@ mod admin;
 mod alerting;
 mod api;
 mod bark;
-mod binance_settlement;
 mod cf;
 mod client_chat;
 mod client_logs;
@@ -26,9 +25,9 @@ mod ingress_context;
 mod ip_blacklist_stats;
 mod ip_iq;
 mod market_access;
-mod market_billing;
 mod market_c2c;
 mod market_commission;
+mod market_common;
 mod market_earning_conversions;
 mod market_finance;
 mod market_finance_auth;
@@ -41,7 +40,6 @@ mod market_provider_identity;
 mod market_provider_rank;
 mod market_providers;
 mod market_reconcile;
-mod market_recurring;
 mod market_service_disputes;
 mod market_wallet;
 mod market_wallet_policy;
@@ -246,13 +244,6 @@ async fn main() -> Result<()> {
         dynamic.clone(),
         &config,
     )?;
-    let binance_settlement = Arc::new(
-        crate::binance_settlement::BinanceSettlementRuntime::from_env(
-            &config.tunnel_domain,
-            &config.data_dir,
-        )
-        .context("configure Binance auto-settlement failed")?,
-    );
     let store = AppStore::new(&config)?;
     // A missing master key may be generated only for a database that has never
     // stored payment credentials; otherwise every stored secret would become
@@ -305,8 +296,7 @@ async fn main() -> Result<()> {
         client_subdomain_takeover_recovery_running: Arc::new(std::sync::atomic::AtomicBool::new(
             false,
         )),
-        market_billing_controls: Arc::new(Mutex::new(())),
-        binance_settlement,
+        market_wallet_controls: Arc::new(Mutex::new(())),
         market_payments,
         recent_traffic: RecentTraffic::new(),
         abuse: Arc::new(AbuseTracker::new()),
@@ -406,10 +396,8 @@ async fn main() -> Result<()> {
     let chat_notification_config = config.clone();
     let client_market_trade_state = state.clone();
     let share_market_state = state.clone();
-    let market_billing_state = state.clone();
     let market_platform_state = state.clone();
     let market_provider_rank_store = state.store.clone();
-    let binance_settlement_state = state.clone();
     let market_payments_state = state.clone();
     let market_notifications_state = state.clone();
     let market_fx_store = state.store.clone();
@@ -872,17 +860,6 @@ async fn main() -> Result<()> {
             }
             result
         });
-    let market_billing_task = spawn_background_task(
-        "Market billing",
-        background_shutdown_rx.clone(),
-        async move {
-            let result = crate::market_billing::run_service(market_billing_state).await;
-            if let Err(error) = &result {
-                tracing::error!(error = %error, "Market billing service stopped");
-            }
-            result
-        },
-    );
     let market_platform_task = spawn_background_task(
         "Market wallet delivery",
         background_shutdown_rx.clone(),
@@ -896,17 +873,6 @@ async fn main() -> Result<()> {
         background_shutdown_rx.clone(),
         async move { crate::market_fx::run_service(market_fx_store, market_fx_shutdown_rx).await },
     );
-    let binance_settlement_task = tokio::spawn(async move {
-        let result = crate::binance_settlement::run_service(
-            binance_settlement_state,
-            background_shutdown_rx,
-        )
-        .await;
-        if let Err(error) = &result {
-            tracing::error!(error = %error, "Binance auto-settlement service stopped");
-        }
-        result.context("Binance auto-settlement background service stopped")
-    });
     let market_payments_task = tokio::spawn({
         let shutdown = market_payments_shutdown_rx;
         async move { crate::market_payments::run_service(market_payments_state, shutdown).await }
@@ -992,10 +958,8 @@ async fn main() -> Result<()> {
         ("chat email notifications", chat_notification_task),
         ("Client Market trade", client_market_trade_task),
         ("Share Market", share_market_task),
-        ("Market billing", market_billing_task),
         ("Market wallet delivery", market_platform_task),
         ("USD/CNY market FX", market_fx_task),
-        ("Binance auto-settlement", binance_settlement_task),
         ("Market payments", market_payments_task),
         ("Market notifications", market_notifications_task),
     ];

@@ -22,7 +22,6 @@ hmac = "0.12"
 httpdate = "1"
 hex = "0.4"
 http = "1"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 libsql = { version = "=0.9.30", default-features = false, features = ["replication", "tls"] }
 portable-pty = "0.8"
 percent-encoding = "2"

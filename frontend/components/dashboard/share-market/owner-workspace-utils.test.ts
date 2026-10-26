@@ -1,8 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type {
-  MarketFundingSummary,
-  MarketRecurringFundingSummary,
   ShareMarketListing,
   ShareMarketOwnedShare,
   ShareMarketSeat,
@@ -12,7 +10,6 @@ import {
   activeListingSeatCount,
   canCreateOwnedShareListing,
   isCompletedSeat,
-  isPriceOnlySeatAttention,
   listingAttentionSeats,
   listingBlockedFromReopen,
   listingCanExpand,
@@ -31,19 +28,6 @@ import {
 } from "./owner-workspace-utils";
 import { shareMarketMutationError } from "./market-utils";
 import { ApiError } from "@/lib/api";
-import {
-  applyMarketFundingConflict,
-  applyRecurringFundingConflict,
-  defaultMarketFundingTopupMinor,
-  formatFundingRunway,
-  marketFundingConflictFromError,
-  marketFundingAfterRecurringHolds,
-  marketFundingDecisionState,
-  marketFundingTopupErrorKey,
-  marketFundingTopupUnavailableKey,
-  marketFundingUsesCredit,
-  recurringFundingForRenewal,
-} from "@/lib/market-funding";
 
 function seat(
   id: string,
@@ -147,17 +131,6 @@ test("completed seats are released or retired only", () => {
   assert.equal(isCompletedSeat(rentedSeat("d", "available")), false);
 });
 
-test("pending price changes without integrity failure are price-only attention", () => {
-  assert.equal(isPriceOnlySeatAttention(rentedSeat("price", "occupied", {
-    subscription: {
-      status: "active_postpaid",
-      integrityState: "compatible",
-      priceChange: { id: "pc", status: "pending" },
-    } as ShareMarketSubscription,
-  })), true);
-  assert.equal(isPriceOnlySeatAttention(rentedSeat("failed", "occupied", { subscriptionStatus: "grant_failed" })), false);
-});
-
 test("grant_failed seats need attention and stay out of history and live lists", () => {
   const failed = rentedSeat("failed", "occupied", { position: 2, subscriptionStatus: "grant_failed" });
   const idle = rentedSeat("idle", "available", { position: 1 });
@@ -182,21 +155,20 @@ test("closed listings keep remaining rentals and hide idle stopped seats", () =>
 
 test("partitions grant_failed into attention and released out of live seats", () => {
   const failed = rentedSeat("failed", "occupied", { subscriptionStatus: "grant_failed" });
-  const pendingPrice = rentedSeat("price", "occupied", {
+  const integrityViolation = rentedSeat("integrity", "occupied", {
     subscription: {
       status: "active_postpaid",
-      integrityState: "compatible",
-      priceChange: { id: "pc", status: "pending" },
+      integrityState: "violated",
     } as ShareMarketSubscription,
   });
   const idle = rentedSeat("idle", "available");
   const released = rentedSeat("done", "retired", { readOnly: true, subscriptionStatus: "released" });
-  const live = listing("alpha", "active", [failed, pendingPrice, idle, released], { shareName: "Alpha" });
+  const live = listing("alpha", "active", [failed, integrityViolation, idle, released], { shareName: "Alpha" });
   const blocked = listing("blocked", "closed", [idle], { shareName: "Blocked", canReopen: false });
   const stopped = listing("stopped", "closed", [occupiedSeat()], { shareName: "Stopped", canReopen: true });
   const partitioned = partitionOwnedListings([stopped, blocked, live]);
 
-  assert.deepEqual(partitioned.attentionSeats.map((item) => item.seat.id), ["failed", "price"]);
+  assert.deepEqual(partitioned.attentionSeats.map((item) => item.seat.id), ["failed", "integrity"]);
   assert.deepEqual(partitioned.attentionListings.map((item) => item.id), ["blocked"]);
   assert.deepEqual(partitioned.active.map((item) => item.id), ["alpha"]);
   assert.deepEqual(partitioned.closed.map((item) => item.id), ["stopped"]);
@@ -269,73 +241,6 @@ test("mixed legacy daily and monthly seats compare by monthly equivalent", () =>
   );
 });
 
-test("recurring funding recalculates the exact automatic-renewal hold", () => {
-  const funding = {
-    supplierUserId: "supplier",
-    supplierEmail: "supplier@example.com",
-    currency: "USD",
-    pricingModel: "prepaid_calendar_month",
-    billingInterval: "calendar_month",
-    cyclePriceMinor: 1_200,
-    renewalPolicy: "manual",
-    prepaidBalanceMinor: 1_500,
-    prepaidHeldMinor: 0,
-    prepaidAvailableMinor: 1_500,
-    initialHoldMinor: 1_200,
-    renewalHoldMinor: 0,
-    totalRequiredHoldMinor: 1_200,
-    requiredTopupMinor: 0,
-    topupAvailable: true,
-  } as const;
-  const automatic = recurringFundingForRenewal(funding, true);
-  assert.equal(automatic.renewalPolicy, "automatic");
-  assert.equal(automatic.renewalHoldMinor, 1_200);
-  assert.equal(automatic.totalRequiredHoldMinor, 2_400);
-  assert.equal(automatic.requiredTopupMinor, 900);
-  const manual = recurringFundingForRenewal(automatic, false);
-  assert.equal(manual.renewalPolicy, "manual");
-  assert.equal(manual.renewalHoldMinor, 0);
-  assert.equal(manual.requiredTopupMinor, 0);
-});
-
-test("calendar-month holds are applied before legacy metered funding", () => {
-  const funding = {
-    supplierUserId: "supplier",
-    supplierEmail: "supplier@example.com",
-    currency: "USD",
-    fundingMode: "prepaid_then_credit",
-    prepaidBalanceMinor: 1_500,
-    prepaidHeldMinor: 0,
-    prepaidAvailableMinor: 1_500,
-    creditKind: "limited",
-    creditLimitMinor: 500,
-    creditOutstandingMinor: 0,
-    creditReservedMinor: 0,
-    creditAvailableMinor: 500,
-    activeDailyRateMinor: 0,
-    additionalDailyRateMinor: 1_000,
-    projectedDailyRateMinor: 1_000,
-    requiredCoverageMinor: 1_000,
-    prepaidCoverageMinor: 1_000,
-    creditCoverageMinor: 0,
-    requiredTopupMinor: 0,
-    recommendedTopupMinor: 5_500,
-    recommendedCoverageDays: 7,
-    prepaidRunwaySeconds: 129_600,
-    estimatedRunwaySeconds: 172_800,
-    topupAvailable: true,
-  } satisfies MarketFundingSummary;
-  const projected = marketFundingAfterRecurringHolds(funding, 1_200);
-  assert.equal(projected.prepaidHeldMinor, 1_200);
-  assert.equal(projected.prepaidAvailableMinor, 300);
-  assert.equal(projected.prepaidCoverageMinor, 300);
-  assert.equal(projected.creditCoverageMinor, 500);
-  assert.equal(projected.requiredTopupMinor, 200);
-  assert.equal(projected.recommendedTopupMinor, 6_700);
-  assert.equal(projected.prepaidRunwaySeconds, 25_920);
-  assert.equal(projected.estimatedRunwaySeconds, 69_120);
-});
-
 test("expandable seats are live seats on active listings and remaining rentals when closed", () => {
   const failed = rentedSeat("failed", "occupied", { position: 2, subscriptionStatus: "grant_failed" });
   const idle = rentedSeat("idle", "available", { position: 1 });
@@ -373,221 +278,4 @@ test("reopen API conflicts are localized by stable error code", () => {
     ),
     "shareMarket.error.seatNotReopenable",
   );
-});
-
-test("prepaid funding races are localized by stable error code", () => {
-  const translate = (key: string) => key;
-  assert.equal(
-    shareMarketMutationError(
-      new ApiError(409, "backend English", "MARKET_PREPAID_REQUIRED"),
-      translate,
-    ),
-    "marketFunding.blocked",
-  );
-});
-
-test("prepaid funding race details update only the affected supplier", () => {
-  const conflict = marketFundingConflictFromError(new ApiError(
-    409,
-    "funding changed",
-    "MARKET_PREPAID_REQUIRED",
-    {
-      supplierUserId: "supplier-a",
-      requiredTopupMinor: 275,
-      prepaidAvailableMinor: 25,
-      creditAvailableMinor: 0,
-    },
-  ));
-  assert.deepEqual(conflict, {
-    supplierUserId: "supplier-a",
-    requiredTopupMinor: 275,
-    prepaidAvailableMinor: 25,
-    creditAvailableMinor: 0,
-  });
-
-  const funding = {
-    supplierUserId: "supplier-a",
-    supplierEmail: "supplier@example.com",
-    currency: "USD",
-    fundingMode: "prepaid",
-    prepaidBalanceMinor: 25,
-    prepaidHeldMinor: 0,
-    prepaidAvailableMinor: 10,
-    creditKind: "none",
-    creditLimitMinor: undefined,
-    creditOutstandingMinor: 0,
-    creditReservedMinor: 0,
-    creditAvailableMinor: 0,
-    activeDailyRateMinor: 0,
-    additionalDailyRateMinor: 300,
-    projectedDailyRateMinor: 300,
-    requiredCoverageMinor: 300,
-    prepaidCoverageMinor: 25,
-    creditCoverageMinor: 0,
-    requiredTopupMinor: 0,
-    recommendedTopupMinor: 2_075,
-    recommendedCoverageDays: 7,
-    prepaidRunwaySeconds: 7_200,
-    estimatedRunwaySeconds: 7_200,
-    topupAvailable: true,
-    topupUnavailableReason: undefined,
-  } satisfies MarketFundingSummary;
-  assert.deepEqual(applyMarketFundingConflict(funding, conflict!), {
-    ...funding,
-    prepaidAvailableMinor: 25,
-    creditAvailableMinor: 0,
-    requiredTopupMinor: 275,
-  });
-  assert.equal(
-    applyMarketFundingConflict(
-      { ...funding, supplierUserId: "supplier-b" },
-      conflict!,
-    ).requiredTopupMinor,
-    0,
-  );
-
-  const recurringFunding = {
-    supplierUserId: "supplier-a",
-    supplierEmail: "supplier@example.com",
-    currency: "USD",
-    pricingModel: "prepaid_calendar_month",
-    billingInterval: "calendar_month",
-    cyclePriceMinor: 300,
-    renewalPolicy: "manual",
-    prepaidBalanceMinor: 300,
-    prepaidHeldMinor: 0,
-    prepaidAvailableMinor: 300,
-    initialHoldMinor: 300,
-    renewalHoldMinor: 0,
-    totalRequiredHoldMinor: 300,
-    requiredTopupMinor: 0,
-    topupAvailable: true,
-  } satisfies MarketRecurringFundingSummary;
-  const monthlyConflict = marketFundingConflictFromError(new ApiError(
-    409,
-    "monthly funding changed",
-    "MARKET_PREPAID_REQUIRED",
-    {
-      supplierUserId: "supplier-a",
-      pricingModel: "prepaid_calendar_month",
-      requiredTopupMinor: 125,
-      prepaidAvailableMinor: 175,
-    },
-  ));
-  assert.equal(
-    applyMarketFundingConflict(funding, monthlyConflict!).requiredTopupMinor,
-    0,
-  );
-  assert.equal(
-    applyRecurringFundingConflict(recurringFunding, monthlyConflict!).requiredTopupMinor,
-    125,
-  );
-  const legacyConflict = { ...conflict!, pricingModel: "legacy_metered_daily" };
-  assert.equal(
-    applyRecurringFundingConflict(recurringFunding, legacyConflict).requiredTopupMinor,
-    0,
-  );
-  assert.equal(
-    marketFundingConflictFromError(new ApiError(
-      409,
-      "unsafe incomplete details",
-      "MARKET_PREPAID_REQUIRED",
-      { requiredTopupMinor: 100 },
-    )),
-    null,
-  );
-});
-
-test("voluntary funding defaults to the seven-day recommendation", () => {
-  const funding = {
-    supplierUserId: "supplier-a",
-    supplierEmail: "supplier@example.com",
-    currency: "USD",
-    fundingMode: "prepaid_then_credit",
-    prepaidBalanceMinor: 500,
-    prepaidHeldMinor: 0,
-    prepaidAvailableMinor: 500,
-    creditKind: "limited",
-    creditLimitMinor: 10_000,
-    creditOutstandingMinor: 1_000,
-    creditReservedMinor: 300,
-    creditAvailableMinor: 8_700,
-    activeDailyRateMinor: 100,
-    additionalDailyRateMinor: 200,
-    projectedDailyRateMinor: 300,
-    requiredCoverageMinor: 300,
-    prepaidCoverageMinor: 300,
-    creditCoverageMinor: 0,
-    requiredTopupMinor: 0,
-    recommendedTopupMinor: 1_600,
-    recommendedCoverageDays: 7,
-    prepaidRunwaySeconds: 144_000,
-    estimatedRunwaySeconds: 2_649_600,
-    topupAvailable: true,
-  } satisfies MarketFundingSummary;
-
-  assert.equal(defaultMarketFundingTopupMinor(funding), 1_600);
-  assert.equal(defaultMarketFundingTopupMinor({
-    ...funding,
-    requiredTopupMinor: 2_000,
-  }), 2_000);
-  assert.equal(defaultMarketFundingTopupMinor({
-    ...funding,
-    recommendedTopupMinor: 100_000_001,
-  }), 100_000_000);
-  assert.equal(marketFundingUsesCredit(funding), false);
-  assert.equal(marketFundingUsesCredit({ ...funding, creditCoverageMinor: 125 }), true);
-  assert.equal(marketFundingTopupUnavailableKey("region_restricted"), "marketFunding.topup.unavailable.regionRestricted");
-  assert.equal(marketFundingTopupUnavailableKey("relationship_closed"), "marketFunding.topup.unavailable.relationshipClosed");
-  assert.equal(marketFundingTopupUnavailableKey("future_reason"), "marketFunding.topup.unavailable");
-  assert.equal(
-    marketFundingTopupErrorKey(new ApiError(409, "closed", "MARKET_RELATIONSHIP_CLOSED")),
-    "marketFunding.topup.unavailable.relationshipClosed",
-  );
-  assert.match(formatFundingRunway(129_600, "en", "Unlimited"), /1\.5/);
-  assert.equal(formatFundingRunway(undefined, "en", "Unlimited"), "Unlimited");
-});
-
-test("funding decision state prioritizes blockers and material risk", () => {
-  const funding = {
-    supplierUserId: "supplier-a",
-    supplierEmail: "supplier@example.com",
-    currency: "USD",
-    fundingMode: "prepaid",
-    prepaidBalanceMinor: 700,
-    prepaidHeldMinor: 0,
-    prepaidAvailableMinor: 700,
-    creditKind: "none",
-    creditOutstandingMinor: 0,
-    creditReservedMinor: 0,
-    activeDailyRateMinor: 0,
-    additionalDailyRateMinor: 100,
-    projectedDailyRateMinor: 100,
-    requiredCoverageMinor: 100,
-    prepaidCoverageMinor: 100,
-    creditCoverageMinor: 0,
-    requiredTopupMinor: 0,
-    recommendedTopupMinor: 0,
-    recommendedCoverageDays: 7,
-    prepaidRunwaySeconds: 604_800,
-    estimatedRunwaySeconds: 604_800,
-    topupAvailable: true,
-  } satisfies MarketFundingSummary;
-
-  assert.equal(marketFundingDecisionState(funding), "ready");
-  assert.equal(marketFundingDecisionState({
-    ...funding,
-    prepaidRunwaySeconds: 86_400,
-    estimatedRunwaySeconds: 86_400,
-  }), "low_runway");
-  assert.equal(marketFundingDecisionState({
-    ...funding,
-    creditKind: "limited",
-    creditCoverageMinor: 50,
-  }), "uses_credit");
-  assert.equal(marketFundingDecisionState({
-    ...funding,
-    creditCoverageMinor: 50,
-    requiredTopupMinor: 25,
-  }), "shortfall");
 });

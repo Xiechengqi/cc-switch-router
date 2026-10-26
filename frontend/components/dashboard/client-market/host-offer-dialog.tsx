@@ -12,7 +12,6 @@ import { DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH } from "@/lib/dashboard-nav";
 import { MARKET_CURRENCY } from "@/lib/market-money";
 import type { ClientMarketHost } from "@/lib/types";
 import {
-  hostPaidOfferPrerequisiteError,
   parseFreeDurationDays,
   parseHostOffer,
 } from "@/components/dashboard/client-market/host-utils";
@@ -102,11 +101,8 @@ export function HostOfferDialog({
       toast.success(t("clientMarket.offerUpdated"));
       onSaved();
       onOpenChange(false);
-    } catch (reason) {
-      setError(
-        hostPaidOfferPrerequisiteError(reason, t) ||
-          t("clientMarket.offerUpdateFailed"),
-      );
+    } catch {
+      setError(t("clientMarket.offerUpdateFailed"));
     } finally {
       setBusy(false);
     }

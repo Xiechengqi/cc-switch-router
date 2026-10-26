@@ -20,7 +20,7 @@ export function clientMarketRentalHasBanner(rental?: ClientMarketRental | null):
   if (!rental || !rental.isClientOwner) return false;
   if (rental.status === "released") return clientMarketRentalNeedsFollowup(rental);
   if (rental.status === "releasing" || rental.status === "release_failed") return true;
-  if (rental.pricingModel === "prepaid_calendar_month" || rental.recurring) return true;
+  if (rental.pricingModel === "prepaid_calendar_month" || rental.walletContract) return true;
   if (rental.pricingModel === "free" || (rental.dailyRateMinor == null && rental.cyclePriceMinor == null)) {
     if (!rental.activatedAt) return true;
     if (rental.expiresAt) return true;

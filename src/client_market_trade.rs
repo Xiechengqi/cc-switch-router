@@ -1,24 +1,16 @@
-use std::io::Cursor;
-use std::net::{IpAddr, SocketAddr};
 use std::time::Duration as StdDuration;
 
 use crate::db::{
     Connection, OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter,
 };
-use axum::body::Body;
 use axum::extract::{Path as AxumPath, State};
-use axum::http::{HeaderMap, HeaderValue, header};
-use axum::response::Response;
+use axum::http::HeaderMap;
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use chrono::{DateTime, Duration, Utc};
-use futures_util::StreamExt;
-use image::{ImageFormat, ImageReader};
 use rand::seq::SliceRandom;
-use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use url::Url;
 use uuid::Uuid;
 
 use crate::ServerState;
@@ -29,12 +21,6 @@ use crate::store::AppStore;
 pub const HOST_STATUS_RESERVED: &str = "reserved";
 const QUOTE_TTL_SECS: i64 = 120;
 const MAX_CREATE_COUNT: usize = 2;
-const MAX_PAYMENT_METHODS: usize = 20;
-const MAX_CUSTOM_PAYMENT_CHARS: usize = 2_000;
-const MAX_QR_SOURCE_BYTES: usize = 2 * 1024 * 1024;
-const MAX_QR_PIXELS: u64 = 4_000_000;
-const MAX_QR_DIMENSION: u32 = 4_096;
-const MAX_QR_STORED_BYTES: usize = 4 * 1024 * 1024;
 const TRADE_RECONCILE_CYCLE_SECS: u64 = 20;
 pub(crate) const MAX_FREE_DURATION_DAYS: u32 = 365;
 
@@ -48,62 +34,26 @@ const MAX_PROVIDER_TERMINAL_AUTH_MINUTES: u32 = 24 * 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct PaymentContact {
+pub struct ProviderContact {
     /// `wechat` | `telegram` | `custom`
     pub channel: String,
     pub handle: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct PaymentMethod {
-    pub kind: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub account: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub qr_image_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub asset_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chain: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub address: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub instructions: Option<String>,
-    /// Public settlement asset for payment rails whose account identifier does
-    /// not itself encode an asset. Binance auto-settlement currently supports
-    /// USDT only; this value is safe to freeze into invoice snapshots.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub settlement_asset: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PaymentProfileView {
+pub struct ProviderContactsView {
     pub provider_id: String,
     pub owner_email: String,
-    pub methods: Vec<PaymentMethod>,
     #[serde(default)]
-    pub contacts: Vec<PaymentContact>,
+    pub contacts: Vec<ProviderContact>,
     pub updated_at: String,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpdatePaymentProfileRequest {
-    #[serde(default)]
-    pub methods: Vec<PaymentMethod>,
-    /// When omitted, existing contacts are preserved (backward compatible).
-    #[serde(default)]
-    pub contacts: Option<Vec<PaymentContact>>,
-}
-
-#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct UpdatePaymentContactsRequest {
-    contacts: Vec<PaymentContact>,
+struct UpdateProviderContactsRequest {
+    contacts: Vec<ProviderContact>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -139,7 +89,6 @@ pub struct ProviderSummary {
     pub min_cycle_price_minor: Option<i64>,
     pub max_cycle_price_minor: Option<i64>,
     pub successful_allocations: i64,
-    pub payment_method_kinds: Vec<String>,
     pub countries: Vec<ProviderCountrySummary>,
 }
 
@@ -306,8 +255,6 @@ pub struct AllocationQuoteView {
     pub status: String,
     pub expires_at: String,
     pub items: Vec<QuoteItemView>,
-    pub funding: Vec<crate::market_billing::MarketFundingSummaryView>,
-    pub recurring_funding: Vec<crate::market_recurring::RecurringFundingSummaryView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wallet_funding: Option<crate::market_wallet::WalletQuoteFunding>,
     pub funding_rail: String,
@@ -377,8 +324,6 @@ pub struct RentalView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub billing_interval: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub recurring: Option<crate::market_recurring::RecurringContractView>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub wallet_contract_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wallet_contract: Option<crate::market_platform_contracts::WalletLifecycleView>,
@@ -392,9 +337,8 @@ pub struct RentalView {
     pub activated_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
-    pub payment_method_kinds: Vec<String>,
     #[serde(default)]
-    pub contacts: Vec<PaymentContact>,
+    pub contacts: Vec<ProviderContact>,
     pub is_client_owner: bool,
     pub can_release: bool,
     /// The renter may end a wedged release without changing the Host disposition.
@@ -439,8 +383,8 @@ pub struct HostUsageHistoryEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub currency: Option<String>,
     pub charges_minor: i64,
-    pub unbilled_minor: i64,
-    pub invoiced_minor: i64,
+    pub refunded_minor: i64,
+    pub net_charges_minor: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -461,15 +405,9 @@ pub struct ProviderTerminalAuthorizationView {
 pub fn router() -> Router<ServerState> {
     Router::new()
         .route(
-            "/v1/account/payment-profile",
-            get(get_payment_profile).put(update_payment_profile),
-        )
-        .route("/v1/account/payment-contacts", put(update_payment_contacts))
-        .route(
             "/v1/account/provider-contacts",
             get(get_provider_contacts).put(update_provider_contacts),
         )
-        .route("/v1/account/payment-assets/:id", get(get_payment_asset))
         .route("/v1/client-market/providers", get(get_provider_supply))
         .route("/v1/client-market/providers/:id", get(get_provider))
         .route(
@@ -615,16 +553,10 @@ async fn require_session(
         .ok_or_else(|| AppError::Unauthorized("authenticated owner session required".into()))
 }
 
-#[cfg(test)]
-pub(crate) const PAYMENT_PROFILE_REQUIRED_FOR_OFFER: &str =
-    "configure payment details on the Account page before setting a Host offer";
-#[cfg(test)]
-pub(crate) const ERROR_MARKET_PAYMENT_PROFILE_REQUIRED: &str = "MARKET_PAYMENT_PROFILE_REQUIRED";
-
 pub(crate) fn validate_offer(daily_rate_minor: Option<i64>) -> Result<Option<i64>, AppError> {
     match daily_rate_minor {
         None | Some(0) => Ok(None),
-        Some(rate) if (1..=crate::market_billing::MAX_DAILY_RATE_MINOR).contains(&rate) => {
+        Some(rate) if (1..=crate::market_common::MAX_DAILY_RATE_MINOR).contains(&rate) => {
             Ok(Some(rate))
         }
         _ => Err(AppError::BadRequest(
@@ -639,7 +571,7 @@ pub(crate) fn validate_monthly_offer(
     match cycle_price_minor {
         None | Some(0) => Ok(None),
         Some(price)
-            if (1..=crate::market_billing::MAX_DAILY_RATE_MINOR).contains(&price) =>
+            if (1..=crate::market_common::MAX_DAILY_RATE_MINOR).contains(&price) =>
         {
             Ok(Some(price))
         }
@@ -680,44 +612,10 @@ pub(crate) fn normalize_offer_currency(
         .filter(|value| !value.is_empty());
     match (daily_rate_minor, normalized.as_deref()) {
         (None, _) => Ok(None),
-        (Some(_), None) => Ok(Some(crate::market_billing::MARKET_CURRENCY.into())),
-        (Some(_), Some(crate::market_billing::MARKET_CURRENCY)) => Ok(normalized),
+        (Some(_), None) => Ok(Some(crate::market_common::MARKET_CURRENCY.into())),
+        (Some(_), Some(crate::market_common::MARKET_CURRENCY)) => Ok(normalized),
         (Some(_), Some(_)) => Err(AppError::BadRequest("currency must be USD".into())),
     }
-}
-
-#[cfg(test)]
-fn payment_profile_has_methods(conn: &Connection, provider_id: &str) -> Result<bool, AppError> {
-    let methods_json: Option<String> = conn
-        .query_row(
-            "SELECT methods_json FROM account_payment_profiles WHERE user_id = ?1",
-            params![provider_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|error| {
-            AppError::Internal(format!("read payment profile for offer failed: {error}"))
-        })?;
-    let Some(methods_json) = methods_json else {
-        return Ok(false);
-    };
-    let methods: Vec<PaymentMethod> = serde_json::from_str(&methods_json).unwrap_or_default();
-    Ok(!methods.is_empty())
-}
-
-#[cfg(test)]
-pub(crate) fn require_payment_profile_for_offer(
-    conn: &Connection,
-    provider_id: &str,
-) -> Result<(), AppError> {
-    if payment_profile_has_methods(conn, provider_id)? {
-        return Ok(());
-    }
-    Err(AppError::coded_conflict(
-        ERROR_MARKET_PAYMENT_PROFILE_REQUIRED,
-        PAYMENT_PROFILE_REQUIRED_FOR_OFFER,
-        serde_json::json!({ "productKind": "client_host" }),
-    ))
 }
 
 pub(crate) fn require_paid_offer_setup(
@@ -731,63 +629,6 @@ pub(crate) fn require_paid_offer_setup(
         ));
     }
     crate::market_provider_finance::require_paid_offer_setup_tx(conn, provider_id)
-}
-
-#[cfg(test)]
-fn ensure_payment_profile_can_be_cleared(
-    conn: &Connection,
-    supplier_user_id: &str,
-) -> Result<(), AppError> {
-    let has_dependency =
-        conn.query_row(
-            "SELECT
-                EXISTS(
-                    SELECT 1 FROM router_ssh_hosts
-                    WHERE provider_id = ?1
-                      AND funding_rail = 'legacy_provider'
-                      AND (daily_rate_minor IS NOT NULL OR cycle_price_minor IS NOT NULL)
-                ) OR EXISTS(
-                    SELECT 1
-                    FROM share_market_seats seat
-                    JOIN share_market_listings listing ON listing.id = seat.listing_id
-                    WHERE listing.owner_user_id = ?1
-                      AND listing.status = 'active' AND listing.deleted_at IS NULL
-                      AND seat.funding_rail = 'legacy_provider'
-                      AND (seat.daily_rate_minor IS NOT NULL OR seat.cycle_price_minor IS NOT NULL)
-                      AND seat.retired_at IS NULL
-                      AND seat.status != 'deleted'
-                ) OR EXISTS(
-                    SELECT 1 FROM market_service_contracts
-                    WHERE supplier_user_id = ?1 AND status != 'terminated'
-                ) OR EXISTS(
-                    SELECT 1 FROM market_recurring_contracts
-                    WHERE supplier_user_id = ?1
-                      AND status NOT IN ('ended', 'activation_failed')
-                ) OR EXISTS(
-                    SELECT 1 FROM market_credit_accounts
-                    WHERE supplier_user_id = ?1 AND balance_units > 0
-                ) OR EXISTS(
-                    SELECT 1
-                    FROM market_invoices invoice
-                    JOIN market_credit_accounts account ON account.id = invoice.account_id
-                    WHERE account.supplier_user_id = ?1
-                      AND invoice.status IN ('open', 'payment_declared', 'overdue', 'disputed')
-                )",
-            params![supplier_user_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(|error| {
-            AppError::Internal(format!(
-                "check payment profile market dependencies failed: {error}"
-            ))
-        })? != 0;
-    if has_dependency {
-        return Err(AppError::Conflict(
-            "payment methods are required while paid offers, service contracts, accrued balances, or unsettled bills exist"
-                .into(),
-        ));
-    }
-    Ok(())
 }
 
 /// Reattach hosts that belong to this owner email onto the canonical provider id.
@@ -939,89 +780,7 @@ fn ensure_provider_profiles_for_orphan_hosts_tx(
     Ok(())
 }
 
-fn normalize_payment_method(mut method: PaymentMethod) -> Result<PaymentMethod, AppError> {
-    method.kind = method.kind.trim().to_ascii_lowercase();
-    method.account = clean_optional(method.account, 200)?;
-    method.qr_image_url = clean_optional(method.qr_image_url, 2_000)?;
-    method.asset_url = None;
-    method.token = clean_optional(method.token, 10)?.map(|value| value.to_ascii_uppercase());
-    method.chain = clean_optional(method.chain, 20)?.map(|value| value.to_ascii_lowercase());
-    method.address = clean_optional(method.address, 300)?;
-    method.instructions = clean_payment_instructions(method.instructions)?;
-    method.settlement_asset =
-        clean_optional(method.settlement_asset, 10)?.map(|value| value.to_ascii_uppercase());
-    match method.kind.as_str() {
-        "alipay" => {
-            if method.account.is_none() && method.qr_image_url.is_none() {
-                return Err(AppError::BadRequest(
-                    "Alipay requires a phone/account or QR image URL".into(),
-                ));
-            }
-            method.token = None;
-            method.chain = None;
-            method.address = None;
-            method.instructions = None;
-            method.settlement_asset = None;
-        }
-        "wechat" => {
-            if method.qr_image_url.is_none() {
-                return Err(AppError::BadRequest(
-                    "WeChat requires a QR image URL".into(),
-                ));
-            }
-            method.account = None;
-            method.token = None;
-            method.chain = None;
-            method.address = None;
-            method.instructions = None;
-            method.settlement_asset = None;
-        }
-        "binance" => {
-            return Err(AppError::BadRequest(
-                "Binance payment method is managed by verified API credentials".into(),
-            ));
-        }
-        "crypto" => {
-            let token = method.token.as_deref().unwrap_or_default();
-            let chain = method.chain.as_deref().unwrap_or_default();
-            if !matches!(token, "USDT" | "USDC")
-                || !matches!(chain, "bsc" | "base" | "eth" | "tron")
-                || method.address.is_none()
-            {
-                return Err(AppError::BadRequest(
-                    "crypto requires USDT or USDC, a bsc/base/eth/tron chain, and an address"
-                        .into(),
-                ));
-            }
-            validate_crypto_address(chain, method.address.as_deref().unwrap_or_default())?;
-            method.account = None;
-            method.qr_image_url = None;
-            method.instructions = None;
-            method.settlement_asset = None;
-        }
-        "custom" => {
-            if method.instructions.is_none() {
-                return Err(AppError::BadRequest(
-                    "custom payment requires instructions".into(),
-                ));
-            }
-            method.account = None;
-            method.qr_image_url = None;
-            method.token = None;
-            method.chain = None;
-            method.address = None;
-            method.settlement_asset = None;
-        }
-        _ => {
-            return Err(AppError::BadRequest(
-                "unsupported payment method kind".into(),
-            ));
-        }
-    }
-    Ok(method)
-}
-
-fn normalize_payment_contact(mut contact: PaymentContact) -> Result<PaymentContact, AppError> {
+fn normalize_provider_contact(mut contact: ProviderContact) -> Result<ProviderContact, AppError> {
     contact.channel = contact.channel.trim().to_ascii_lowercase();
     contact.handle = contact.handle.trim().to_string();
     if !matches!(contact.channel.as_str(), "wechat" | "telegram" | "custom") {
@@ -1037,9 +796,9 @@ fn normalize_payment_contact(mut contact: PaymentContact) -> Result<PaymentConta
     Ok(contact)
 }
 
-fn normalize_payment_contacts(
-    contacts: Vec<PaymentContact>,
-) -> Result<Vec<PaymentContact>, AppError> {
+fn normalize_provider_contacts(
+    contacts: Vec<ProviderContact>,
+) -> Result<Vec<ProviderContact>, AppError> {
     if contacts.len() > MAX_PAYMENT_CONTACTS {
         return Err(AppError::BadRequest(
             "at most 10 contact entries are allowed".into(),
@@ -1047,8 +806,8 @@ fn normalize_payment_contacts(
     }
     let mut output = Vec::with_capacity(contacts.len());
     for contact in contacts {
-        let contact = normalize_payment_contact(contact)?;
-        if output.iter().any(|existing: &PaymentContact| {
+        let contact = normalize_provider_contact(contact)?;
+        if output.iter().any(|existing: &ProviderContact| {
             existing.channel == contact.channel && existing.handle == contact.handle
         }) {
             return Err(AppError::BadRequest("duplicate contact entry".into()));
@@ -1058,77 +817,6 @@ fn normalize_payment_contacts(
     Ok(output)
 }
 
-fn validate_crypto_address(chain: &str, address: &str) -> Result<(), AppError> {
-    let valid = if matches!(chain, "bsc" | "base" | "eth") {
-        address.len() == 42
-            && address.starts_with("0x")
-            && address[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
-            && address[2..].bytes().any(|byte| byte != b'0')
-    } else {
-        bs58::decode(address)
-            .with_check(None)
-            .into_vec()
-            .is_ok_and(|decoded| {
-                decoded.len() == 21
-                    && decoded[0] == 0x41
-                    && decoded[1..].iter().any(|byte| *byte != 0)
-            })
-    };
-    if valid {
-        Ok(())
-    } else {
-        Err(AppError::BadRequest(format!(
-            "invalid {chain} payment address"
-        )))
-    }
-}
-
-fn clean_optional(value: Option<String>, max: usize) -> Result<Option<String>, AppError> {
-    let value = value
-        .map(|item| item.trim().to_string())
-        .filter(|item| !item.is_empty());
-    if value
-        .as_ref()
-        .is_some_and(|item| item.chars().count() > max || item.chars().any(char::is_control))
-    {
-        return Err(AppError::BadRequest(
-            "payment field is invalid or too long".into(),
-        ));
-    }
-    Ok(value)
-}
-
-fn clean_payment_instructions(value: Option<String>) -> Result<Option<String>, AppError> {
-    let value = value
-        .map(|item| item.replace("\r\n", "\n").replace('\r', "\n"))
-        .map(|item| item.trim().to_string())
-        .filter(|item| !item.is_empty());
-    if value.as_ref().is_some_and(|item| {
-        item.chars().count() > MAX_CUSTOM_PAYMENT_CHARS
-            || item
-                .chars()
-                .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\t'))
-    }) {
-        return Err(AppError::BadRequest(
-            "custom payment instructions are invalid or too long".into(),
-        ));
-    }
-    Ok(value)
-}
-
-async fn get_payment_profile(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-) -> Result<Json<PaymentProfileView>, AppError> {
-    let session = require_session(&state, &headers).await?;
-    Ok(Json(
-        state
-            .store
-            .client_market_payment_profile(&session.user_id, &session.email)
-            .await?,
-    ))
-}
-
 async fn get_provider_contacts(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -1136,7 +824,7 @@ async fn get_provider_contacts(
     let session = require_session(&state, &headers).await?;
     let profile = state
         .store
-        .client_market_payment_profile(&session.user_id, &session.email)
+        .client_market_provider_contacts(&session.user_id, &session.email)
         .await?;
     Ok((
         [(axum::http::header::CACHE_CONTROL, "private, no-store")],
@@ -1147,270 +835,18 @@ async fn get_provider_contacts(
 async fn update_provider_contacts(
     State(state): State<ServerState>,
     headers: HeaderMap,
-    Json(input): Json<UpdatePaymentContactsRequest>,
+    Json(input): Json<UpdateProviderContactsRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let session = require_session(&state, &headers).await?;
-    let contacts = normalize_payment_contacts(input.contacts)?;
+    let contacts = normalize_provider_contacts(input.contacts)?;
     let profile = state
         .store
-        .client_market_update_payment_contacts(&session, &contacts)
+        .client_market_update_provider_contacts(&session, &contacts)
         .await?;
     Ok((
         [(axum::http::header::CACHE_CONTROL, "private, no-store")],
         Json(serde_json::json!({ "contacts": profile.contacts, "updatedAt": profile.updated_at })),
     ))
-}
-
-async fn update_payment_profile(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Json(input): Json<UpdatePaymentProfileRequest>,
-) -> Result<Json<PaymentProfileView>, AppError> {
-    let session = require_session(&state, &headers).await?;
-    if input.methods.len() > MAX_PAYMENT_METHODS {
-        return Err(AppError::BadRequest(
-            "at most 20 payment methods are allowed".into(),
-        ));
-    }
-    let mut methods = Vec::with_capacity(input.methods.len());
-    let mut singleton_kinds = std::collections::HashSet::new();
-    let mut crypto_count = 0_usize;
-    for method in input.methods {
-        let mut method = normalize_payment_method(method)?;
-        if method.kind == "crypto" {
-            crypto_count += 1;
-            if crypto_count > 8 {
-                return Err(AppError::BadRequest(
-                    "at most 8 crypto payment addresses are allowed".into(),
-                ));
-            }
-        } else if !singleton_kinds.insert(method.kind.clone()) {
-            return Err(AppError::BadRequest(format!(
-                "only one {} payment method is allowed",
-                method.kind
-            )));
-        }
-        if methods.iter().any(|existing: &PaymentMethod| {
-            existing.kind == method.kind
-                && existing.token == method.token
-                && existing.chain == method.chain
-                && existing.address == method.address
-        }) {
-            return Err(AppError::BadRequest("duplicate payment method".into()));
-        }
-        if let Some(source_url) = method.qr_image_url.as_deref() {
-            let asset_id = cache_qr_asset(&state, &session.user_id, source_url).await?;
-            method.asset_url = Some(format!("/v1/account/payment-assets/{asset_id}"));
-        }
-        methods.push(method);
-    }
-    let contacts = match input.contacts {
-        Some(contacts) => Some(normalize_payment_contacts(contacts)?),
-        None => None,
-    };
-    Ok(Json(
-        state
-            .store
-            .client_market_update_payment_profile(&session, &methods, contacts.as_deref())
-            .await?,
-    ))
-}
-
-async fn update_payment_contacts(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Json(input): Json<UpdatePaymentContactsRequest>,
-) -> Result<Json<PaymentProfileView>, AppError> {
-    let session = require_session(&state, &headers).await?;
-    let contacts = normalize_payment_contacts(input.contacts)?;
-    Ok(Json(
-        state
-            .store
-            .client_market_update_payment_contacts(&session, &contacts)
-            .await?,
-    ))
-}
-
-async fn cache_qr_asset(
-    state: &ServerState,
-    user_id: &str,
-    raw_url: &str,
-) -> Result<String, AppError> {
-    let url = validate_public_https_url(raw_url).await?;
-    let host = url
-        .host_str()
-        .ok_or_else(|| AppError::BadRequest("QR image URL must have a host".into()))?;
-    let port = url.port_or_known_default().unwrap_or(443);
-    let resolved = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|_| AppError::BadRequest("QR image host could not be resolved".into()))?
-        .find(|address| is_public_ip(address.ip()))
-        .ok_or_else(|| {
-            AppError::BadRequest("QR image URL resolves to a private or reserved address".into())
-        })?;
-    let client = reqwest::Client::builder()
-        .redirect(Policy::none())
-        .no_proxy()
-        .connect_timeout(StdDuration::from_secs(8))
-        .timeout(StdDuration::from_secs(15))
-        .resolve(host, SocketAddr::new(resolved.ip(), port))
-        .build()
-        .map_err(|error| AppError::Internal(format!("build QR fetch client failed: {error}")))?;
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|_| AppError::BadRequest("QR image could not be fetched".into()))?;
-    if !response.status().is_success() {
-        return Err(AppError::BadRequest(
-            "QR image URL did not return a successful response".into(),
-        ));
-    }
-    let content_length = response.content_length().unwrap_or(0);
-    if content_length > MAX_QR_SOURCE_BYTES as u64 {
-        return Err(AppError::BadRequest(
-            "QR image exceeds the 2 MB limit".into(),
-        ));
-    }
-    let mut bytes = Vec::with_capacity((content_length as usize).min(MAX_QR_SOURCE_BYTES));
-    let mut body = response.bytes_stream();
-    while let Some(chunk) = body.next().await {
-        let chunk =
-            chunk.map_err(|_| AppError::BadRequest("QR image body could not be read".into()))?;
-        if bytes.len().saturating_add(chunk.len()) > MAX_QR_SOURCE_BYTES {
-            return Err(AppError::BadRequest(
-                "QR image exceeds the 2 MB limit".into(),
-            ));
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    let reader = ImageReader::new(Cursor::new(bytes.as_slice()))
-        .with_guessed_format()
-        .map_err(|_| AppError::BadRequest("QR image format is invalid".into()))?;
-    if !reader.format().is_some_and(is_supported_qr_format) {
-        return Err(AppError::BadRequest(
-            "QR image must be PNG, JPEG, or WebP".into(),
-        ));
-    }
-    let dimensions = reader
-        .into_dimensions()
-        .map_err(|_| AppError::BadRequest("QR image is not a supported raster image".into()))?;
-    if dimensions.0 > MAX_QR_DIMENSION
-        || dimensions.1 > MAX_QR_DIMENSION
-        || u64::from(dimensions.0) * u64::from(dimensions.1) > MAX_QR_PIXELS
-    {
-        return Err(AppError::BadRequest(
-            "QR image dimensions are too large".into(),
-        ));
-    }
-    let image = ImageReader::new(Cursor::new(bytes.as_slice()))
-        .with_guessed_format()
-        .map_err(|_| AppError::BadRequest("QR image format is invalid".into()))?
-        .decode()
-        .map_err(|_| AppError::BadRequest("QR image is not a supported raster image".into()))?;
-    let mut png = Cursor::new(Vec::new());
-    image
-        .write_to(&mut png, ImageFormat::Png)
-        .map_err(|error| AppError::Internal(format!("encode QR image failed: {error}")))?;
-    if png.get_ref().len() > MAX_QR_STORED_BYTES {
-        return Err(AppError::BadRequest(
-            "normalized QR image exceeds the 4 MB limit".into(),
-        ));
-    }
-    state
-        .store
-        .client_market_store_payment_asset(user_id, raw_url, png.get_ref())
-        .await
-}
-
-fn is_supported_qr_format(format: ImageFormat) -> bool {
-    matches!(
-        format,
-        ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::WebP
-    )
-}
-
-async fn validate_public_https_url(raw: &str) -> Result<Url, AppError> {
-    let url =
-        Url::parse(raw).map_err(|_| AppError::BadRequest("QR image URL is invalid".into()))?;
-    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
-        return Err(AppError::BadRequest(
-            "QR image URL must use HTTPS without credentials".into(),
-        ));
-    }
-    let host = url
-        .host_str()
-        .ok_or_else(|| AppError::BadRequest("QR image URL must have a host".into()))?
-        .to_string();
-    if host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") {
-        return Err(AppError::BadRequest("QR image host is not public".into()));
-    }
-    let port = url.port_or_known_default().unwrap_or(443);
-    let mut addresses = tokio::net::lookup_host((host.as_str(), port))
-        .await
-        .map_err(|_| AppError::BadRequest("QR image host could not be resolved".into()))?;
-    if !addresses.any(|address| is_public_ip(address.ip())) {
-        return Err(AppError::BadRequest(
-            "QR image URL resolves to a private or reserved address".into(),
-        ));
-    }
-    Ok(url)
-}
-
-fn is_public_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => {
-            let [first, second, third, _] = ip.octets();
-            !ip.is_private()
-                && !ip.is_loopback()
-                && !ip.is_link_local()
-                && !ip.is_broadcast()
-                && !ip.is_documentation()
-                && !ip.is_unspecified()
-                && !ip.is_multicast()
-                && first != 0
-                && !(first == 100 && (64..=127).contains(&second))
-                && !(first == 192 && second == 0 && third == 0)
-                && !(first == 192 && second == 88 && third == 99)
-                && !(first == 198 && matches!(second, 18 | 19))
-                && first < 240
-        }
-        IpAddr::V6(ip) => {
-            let first = ip.segments()[0];
-            (first & 0xe000) == 0x2000
-                && !ip.is_loopback()
-                && !ip.is_unspecified()
-                && !ip.is_multicast()
-                && !ip.is_unique_local()
-                && !ip.is_unicast_link_local()
-                && !(ip.segments()[0] == 0x2001 && ip.segments()[1] == 0x0db8)
-        }
-    }
-}
-
-async fn get_payment_asset(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    AxumPath(id): AxumPath<String>,
-) -> Result<Response, AppError> {
-    let session = crate::api::resolve_router_session(&state, &headers).await?;
-    let bytes = state
-        .store
-        .client_market_payment_asset_for_viewer(&id, session.as_ref())
-        .await?;
-    let mut response = Response::new(Body::from(bytes));
-    response
-        .headers_mut()
-        .insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("private, no-store"),
-    );
-    response.headers_mut().insert(
-        header::X_CONTENT_TYPE_OPTIONS,
-        HeaderValue::from_static("nosniff"),
-    );
-    Ok(response)
 }
 
 async fn get_provider_supply(
@@ -1500,26 +936,10 @@ async fn create_quote(
     Json(input): Json<CreateQuoteRequest>,
 ) -> Result<Json<AllocationQuoteView>, AppError> {
     let session = require_session(&state, &headers).await?;
-    let mut quote = state
+    let quote = state
         .store
         .client_market_create_quote(&session, input)
         .await?;
-    for funding in &mut quote.funding {
-        funding.topup_unavailable_reason = state
-            .binance_settlement
-            .supplier_funding_unavailable_reason(&state.store, &funding.supplier_user_id)
-            .await?
-            .map(str::to_string);
-        funding.topup_available = funding.topup_unavailable_reason.is_none();
-    }
-    for funding in &mut quote.recurring_funding {
-        funding.topup_unavailable_reason = state
-            .binance_settlement
-            .supplier_funding_unavailable_reason(&state.store, &funding.supplier_user_id)
-            .await?
-            .map(str::to_string);
-        funding.topup_available = funding.topup_unavailable_reason.is_none();
-    }
     Ok(Json(quote))
 }
 
@@ -1705,92 +1125,38 @@ async fn get_client_rental(
 }
 
 impl AppStore {
-    /// Schedule a renter-owned monthly Client for release at the paid period
-    /// boundary. Trials and renewal-recovery contracts end immediately and
-    /// return `false` so the caller can start the normal cleanup job.
-    pub async fn client_market_schedule_recurring_release(
+    pub async fn client_market_schedule_wallet_release(
         &self,
         installation_id: &str,
         session: &AuthSession,
     ) -> Result<bool, AppError> {
-        let now = Utc::now();
-        let now_text = now.to_rfc3339();
         let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|error| {
-                AppError::Internal(format!(
-                    "begin Client monthly release scheduling failed: {error}"
-                ))
-            })?;
-        let (client_user_id, pricing_model, host_id) = tx
-            .query_row(
-                "SELECT client_user_id, pricing_model, host_id
-                 FROM client_market_subscriptions WHERE installation_id = ?1",
-                params![installation_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(|error| {
-                AppError::Internal(format!("read Client rental for release failed: {error}"))
-            })?
-            .ok_or_else(|| AppError::NotFound("Client rental not found".into()))?;
-        if client_user_id != session.user_id {
+            .map_err(|e| AppError::Internal(format!("begin wallet cancellation: {e}")))?;
+        let (buyer, contract_id): (String, Option<String>) = tx.query_row(
+            "SELECT client_user_id, platform_contract_id FROM client_market_subscriptions WHERE installation_id = ?1",
+            params![installation_id], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional().map_err(|e| AppError::Internal(format!("read wallet cancellation: {e}")))?
+         .ok_or_else(|| AppError::NotFound("Client rental not found".into()))?;
+        if buyer != session.user_id {
             return Err(AppError::Forbidden(
-                "only the Client owner may release this rental".into(),
+                "Client rental belongs to another buyer".into(),
             ));
         }
-        if pricing_model != crate::market_recurring::PRICING_PREPAID_CALENDAR_MONTH {
-            return Ok(false);
-        }
-        if !crate::market_recurring::cancel_at_period_end_for_product_tx(
-            &tx,
-            "client_host",
-            installation_id,
-            &session.user_id,
-            &now_text,
-        )? {
-            return Ok(false);
-        }
-        let ended = tx
-            .query_row(
-                "SELECT status = 'ended' FROM market_recurring_contracts
-                 WHERE product_kind = 'client_host' AND product_ref = ?1
-                 ORDER BY created_at DESC LIMIT 1",
-                params![installation_id],
-                |row| row.get::<_, bool>(0),
-            )
-            .optional()
-            .map_err(|error| {
-                AppError::Internal(format!(
-                    "read scheduled Client cancellation failed: {error}"
-                ))
-            })?
-            .unwrap_or(false);
-        if !ended {
-            insert_audit_tx(
+        let scheduled = if let Some(id) = contract_id {
+            crate::market_platform_contracts::cancel_at_period_end_tx(
                 &tx,
-                Some(installation_id),
-                Some(&host_id),
-                Some(&session.user_id),
-                Some(&session.email),
-                "rental_cancelled_at_period_end",
-                serde_json::json!({ "reason": "cancel_at_period_end" }),
-                now,
-            )?;
-        }
-        tx.commit().map_err(|error| {
-            AppError::Internal(format!(
-                "commit Client monthly release scheduling failed: {error}"
-            ))
-        })?;
-        Ok(!ended)
+                &id,
+                &session.user_id,
+                &Utc::now().to_rfc3339(),
+            )?
+        } else {
+            false
+        };
+        tx.commit()
+            .map_err(|e| AppError::Internal(format!("commit wallet cancellation: {e}")))?;
+        Ok(scheduled)
     }
 
     /// Record a Client Market audit event outside of an existing transaction.
@@ -2260,354 +1626,64 @@ impl AppStore {
         Ok(user_id.to_string())
     }
 
-    pub async fn client_market_payment_profile(
+    pub async fn client_market_provider_contacts(
         &self,
         user_id: &str,
         owner_email: &str,
-    ) -> Result<PaymentProfileView, AppError> {
+    ) -> Result<ProviderContactsView, AppError> {
         let email = normalize_email(owner_email)?;
         let conn = self.conn.lock().await;
-        let row: Option<(String, String, String, String)> = conn
+        let row: Option<(String, String, String)> = conn
             .query_row(
-                "SELECT owner_email, methods_json, COALESCE(contacts_json, '[]'), updated_at
-                 FROM account_payment_profiles WHERE user_id = ?1",
+                "SELECT owner_email, contacts_json, updated_at
+                 FROM market_provider_contacts WHERE user_id = ?1",
                 params![user_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
-            .map_err(|error| AppError::Internal(format!("read payment profile failed: {error}")))?;
-        if let Some((owner_email, methods_json, contacts_json, updated_at)) = row {
-            return Ok(PaymentProfileView {
+            .map_err(|error| {
+                AppError::Internal(format!("read provider contacts failed: {error}"))
+            })?;
+        if let Some((owner_email, contacts_json, updated_at)) = row {
+            return Ok(ProviderContactsView {
                 provider_id: user_id.to_string(),
                 owner_email,
-                methods: serde_json::from_str(&methods_json).unwrap_or_default(),
                 contacts: serde_json::from_str(&contacts_json).unwrap_or_default(),
                 updated_at,
             });
         }
-        Ok(PaymentProfileView {
+        Ok(ProviderContactsView {
             provider_id: user_id.to_string(),
             owner_email: email,
-            methods: Vec::new(),
             contacts: Vec::new(),
             updated_at: Utc::now().to_rfc3339(),
         })
     }
 
-    pub async fn client_market_update_payment_contacts(
+    pub async fn client_market_update_provider_contacts(
         &self,
         session: &AuthSession,
-        contacts: &[PaymentContact],
-    ) -> Result<PaymentProfileView, AppError> {
+        contacts: &[ProviderContact],
+    ) -> Result<ProviderContactsView, AppError> {
         let email = normalize_email(&session.email)?;
         let now = Utc::now().to_rfc3339();
         let contacts_json = serde_json::to_string(contacts).map_err(|error| {
-            AppError::Internal(format!("encode payment contacts failed: {error}"))
+            AppError::Internal(format!("encode Provider contacts failed: {error}"))
         })?;
         let conn = self.conn.lock().await;
         conn.execute(
-            "INSERT INTO account_payment_profiles (user_id, owner_email, methods_json, contacts_json, updated_at)
-             VALUES (?1, ?2, '[]', ?3, ?4)
+            "INSERT INTO market_provider_contacts (user_id, owner_email, contacts_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(user_id) DO UPDATE SET
                 owner_email = excluded.owner_email,
                 contacts_json = excluded.contacts_json,
                 updated_at = excluded.updated_at",
             params![session.user_id, email, contacts_json, now],
         )
-        .map_err(|error| AppError::Internal(format!("save payment contacts failed: {error}")))?;
+        .map_err(|error| AppError::Internal(format!("save Provider contacts failed: {error}")))?;
         drop(conn);
-        self.client_market_payment_profile(&session.user_id, &session.email)
+        self.client_market_provider_contacts(&session.user_id, &session.email)
             .await
-    }
-
-    pub async fn client_market_update_payment_profile(
-        &self,
-        _session: &AuthSession,
-        _methods: &[PaymentMethod],
-        _contacts: Option<&[PaymentContact]>,
-    ) -> Result<PaymentProfileView, AppError> {
-        Err(AppError::Gone(
-            "direct Provider payment methods are retired; use the platform wallet".into(),
-        ))
-    }
-
-    // Historical invoice fixtures only. No production route may create Provider payment methods.
-    #[cfg(test)]
-    pub(crate) async fn seed_legacy_payment_profile(
-        &self,
-        session: &AuthSession,
-        methods: &[PaymentMethod],
-        contacts: Option<&[PaymentContact]>,
-    ) -> Result<PaymentProfileView, AppError> {
-        let email = normalize_email(&session.email)?;
-        let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock().await;
-        let tx = conn.transaction().map_err(|error| {
-            AppError::Internal(format!("begin payment profile update failed: {error}"))
-        })?;
-        let canonical_binance_uid = tx
-            .query_row(
-                "SELECT binance_uid FROM binance_payment_accounts
-                 WHERE supplier_user_id = ?1 AND credentials_ciphertext != ''
-                 ORDER BY updated_at DESC LIMIT 1",
-                params![session.user_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|error| {
-                AppError::Internal(format!("read API-managed Binance UID failed: {error}"))
-            })?;
-        let mut methods = methods
-            .iter()
-            .filter(|method| method.kind != "binance")
-            .cloned()
-            .collect::<Vec<_>>();
-        if canonical_binance_uid.is_some() {
-            methods.push(PaymentMethod {
-                kind: "binance".into(),
-                account: canonical_binance_uid,
-                qr_image_url: None,
-                asset_url: None,
-                token: None,
-                chain: None,
-                address: None,
-                instructions: None,
-                settlement_asset: Some("USDT".into()),
-            });
-        }
-        let methods_json = serde_json::to_string(&methods).map_err(|error| {
-            AppError::Internal(format!("encode payment methods failed: {error}"))
-        })?;
-        if methods.is_empty() {
-            ensure_payment_profile_can_be_cleared(&tx, &session.user_id)?;
-        }
-        let existing_contacts_json: String = tx
-            .query_row(
-                "SELECT COALESCE(contacts_json, '[]') FROM account_payment_profiles WHERE user_id = ?1",
-                params![session.user_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| AppError::Internal(format!("read existing contacts failed: {error}")))?
-            .unwrap_or_else(|| "[]".to_string());
-        let contacts_json = match contacts {
-            Some(contacts) => serde_json::to_string(contacts).map_err(|error| {
-                AppError::Internal(format!("encode payment contacts failed: {error}"))
-            })?,
-            None => existing_contacts_json,
-        };
-        tx.execute(
-            "INSERT INTO account_payment_profiles (user_id, owner_email, methods_json, contacts_json, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(user_id) DO UPDATE SET
-                owner_email = excluded.owner_email,
-                methods_json = excluded.methods_json,
-                contacts_json = excluded.contacts_json,
-                updated_at = excluded.updated_at",
-            params![session.user_id, email, methods_json, contacts_json, now],
-        )
-        .map_err(|error| AppError::Internal(format!("save payment profile failed: {error}")))?;
-        tx.execute(
-            "DELETE FROM account_payment_assets
-             WHERE user_id = ?1
-               AND NOT EXISTS (
-                   SELECT 1 FROM json_each(?2) method
-                   WHERE json_extract(method.value, '$.assetUrl') =
-                         '/v1/account/payment-assets/' || account_payment_assets.id
-               )
-               AND NOT EXISTS (
-                   SELECT 1
-                   FROM market_invoices invoice
-                   JOIN market_credit_accounts account ON account.id = invoice.account_id
-                   WHERE account.supplier_user_id = ?1
-                     AND EXISTS (
-                         SELECT 1 FROM json_each(invoice.payment_methods_json) method
-                         WHERE json_extract(method.value, '$.assetUrl') =
-                               '/v1/account/payment-assets/' || account_payment_assets.id
-                     )
-               )
-               AND NOT EXISTS (
-                   SELECT 1 FROM chat_public_payment_assets published
-                   WHERE published.asset_id = account_payment_assets.id
-               )",
-            params![session.user_id, methods_json],
-        )
-        .map_err(|error| {
-            AppError::Internal(format!("remove unused payment assets failed: {error}"))
-        })?;
-        tx.execute(
-            "DELETE FROM account_payment_methods WHERE profile_user_id = ?1",
-            params![session.user_id],
-        )
-        .map_err(|error| AppError::Internal(format!("replace payment methods failed: {error}")))?;
-        for (position, method) in methods.iter().enumerate() {
-            let method_json = serde_json::to_string(method).map_err(|error| {
-                AppError::Internal(format!("encode payment method failed: {error}"))
-            })?;
-            tx.execute(
-                "INSERT INTO account_payment_methods (
-                    id, profile_user_id, position, kind, method_json, enabled, created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?6)",
-                params![
-                    Uuid::new_v4().to_string(),
-                    session.user_id,
-                    position as i64,
-                    method.kind,
-                    method_json,
-                    now
-                ],
-            )
-            .map_err(|error| {
-                AppError::Internal(format!("save normalized payment method failed: {error}"))
-            })?;
-        }
-        tx.execute(
-            "INSERT INTO host_provider_profiles (provider_id, owner_email, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?3)
-             ON CONFLICT(provider_id) DO UPDATE SET owner_email = excluded.owner_email, updated_at = excluded.updated_at",
-            params![session.user_id, email, now],
-        )
-        .map_err(|error| AppError::Internal(format!("sync Provider profile failed: {error}")))?;
-        tx.execute(
-            "UPDATE router_ssh_hosts SET host_owner_email = ?2, updated_at = ?3
-             WHERE provider_id = ?1",
-            params![session.user_id, email, now],
-        )
-        .map_err(|error| AppError::Internal(format!("sync Host Provider email failed: {error}")))?;
-        tx.execute(
-            "UPDATE client_market_subscriptions SET host_owner_email = ?2, updated_at = ?3
-             WHERE provider_id = ?1 AND status != 'released'",
-            params![session.user_id, email, now],
-        )
-        .map_err(|error| {
-            AppError::Internal(format!("sync subscription Provider email failed: {error}"))
-        })?;
-        match crate::market_provider_identity::ensure_market_provider_identity_tx(
-            &tx,
-            Some(&session.user_id),
-            &email,
-            &now,
-        )? {
-            crate::market_provider_identity::MarketProviderIdentityResolution::Resolved(_) => {}
-            crate::market_provider_identity::MarketProviderIdentityResolution::Conflict(
-                conflict,
-            ) => {
-                drop(tx);
-                crate::market_provider_identity::persist_market_provider_identity_conflict(
-                    &conn, &conflict, &now,
-                )?;
-                return Err(AppError::Conflict(
-                    "the payment Provider identity conflicts with an existing Market Provider"
-                        .into(),
-                ));
-            }
-        }
-        tx.commit().map_err(|error| {
-            AppError::Internal(format!("commit payment profile update failed: {error}"))
-        })?;
-        Ok(PaymentProfileView {
-            provider_id: session.user_id.clone(),
-            owner_email: email,
-            methods,
-            contacts: serde_json::from_str(&contacts_json).unwrap_or_default(),
-            updated_at: now,
-        })
-    }
-
-    pub async fn client_market_store_payment_asset(
-        &self,
-        user_id: &str,
-        source_url: &str,
-        png: &[u8],
-    ) -> Result<String, AppError> {
-        use sha2::{Digest, Sha256};
-        let id = Uuid::new_v4().to_string();
-        let digest = format!("{:x}", Sha256::digest(png));
-        let conn = self.conn.lock().await;
-        conn.execute(
-            "INSERT INTO account_payment_assets
-                (id, user_id, source_url, media_type, content, sha256, created_at)
-             VALUES (?1, ?2, ?3, 'image/png', ?4, ?5, ?6)
-             ON CONFLICT(user_id, source_url, sha256) DO NOTHING",
-            params![
-                id,
-                user_id,
-                source_url,
-                png,
-                digest,
-                Utc::now().to_rfc3339()
-            ],
-        )
-        .map_err(|error| AppError::Internal(format!("store payment asset failed: {error}")))?;
-        conn.query_row(
-            "SELECT id FROM account_payment_assets
-             WHERE user_id = ?1 AND source_url = ?2 AND sha256 = ?3",
-            params![user_id, source_url, digest],
-            |row| row.get(0),
-        )
-        .map_err(|error| AppError::Internal(format!("read stored payment asset failed: {error}")))
-    }
-
-    pub async fn client_market_payment_asset_for_viewer(
-        &self,
-        id: &str,
-        viewer: Option<&AuthSession>,
-    ) -> Result<Vec<u8>, AppError> {
-        let conn = self.conn.lock().await;
-        let asset: Option<(String, Vec<u8>)> = conn
-            .query_row(
-                "SELECT user_id, content FROM account_payment_assets WHERE id = ?1",
-                params![id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(|error| AppError::Internal(format!("read payment asset failed: {error}")))?;
-        let (owner_user_id, content) =
-            asset.ok_or_else(|| AppError::NotFound("payment asset not found".into()))?;
-        let publicly_published = conn
-            .query_row(
-                "SELECT 1 FROM chat_public_payment_assets WHERE asset_id = ?1 LIMIT 1",
-                params![id],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(|error| {
-                AppError::Internal(format!("authorize public payment asset failed: {error}"))
-            })?
-            .is_some();
-        let invoiced_for_viewer = if let Some(viewer) = viewer {
-            conn.query_row(
-                "SELECT 1
-                     FROM market_invoices invoice
-                     JOIN market_credit_accounts account ON account.id = invoice.account_id
-                     WHERE account.supplier_user_id = ?1
-                       AND account.buyer_user_id = ?2
-                       AND EXISTS (
-                           SELECT 1 FROM json_each(invoice.payment_methods_json) method
-                           WHERE json_extract(method.value, '$.assetUrl') =
-                                 '/v1/account/payment-assets/' || ?3
-                       )
-                     LIMIT 1",
-                params![owner_user_id, viewer.user_id, id],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(|error| {
-                AppError::Internal(format!("authorize invoiced payment asset failed: {error}"))
-            })?
-            .is_some()
-        } else {
-            false
-        };
-        let allowed = publicly_published
-            || viewer.is_some_and(|viewer| owner_user_id == viewer.user_id)
-            || invoiced_for_viewer;
-        if !allowed {
-            return Err(AppError::Forbidden(
-                "not allowed to view this payment asset".into(),
-            ));
-        }
-        Ok(content)
     }
 
     pub async fn client_market_provider_supply(
@@ -2644,8 +1720,6 @@ impl AppStore {
                         (SELECT COUNT(*) FROM provisioning_jobs j
                          WHERE j.host_id IN (SELECT id FROM router_ssh_hosts WHERE provider_id = p.provider_id)
                            AND j.type = 'create' AND j.status = 'succeeded') AS successful_allocations,
-                        COALESCE((SELECT methods_json FROM account_payment_profiles payment
-                                  WHERE payment.user_id = p.provider_id), '[]'),
                         COALESCE(
                           (SELECT MAX(e.created_at) FROM client_market_audit_events e
                            WHERE e.event_type = 'host_offer_updated'
@@ -2678,8 +1752,7 @@ impl AppStore {
                     row.get::<_, Option<i64>>(14)?,
                     row.get::<_, i64>(15)?,
                     row.get::<_, String>(16)?,
-                    row.get::<_, String>(17)?,
-                    row.get::<_, Option<String>>(18)?,
+                    row.get::<_, Option<String>>(17)?,
                 ))
             })
             .map_err(|error| {
@@ -2704,20 +1777,11 @@ impl AppStore {
                 min_cycle_price_minor,
                 max_cycle_price_minor,
                 successful,
-                methods_json,
                 offer_stable_since,
                 market_provider_id,
             ) = row.map_err(|error| {
                 AppError::Internal(format!("read Provider supply failed: {error}"))
             })?;
-            let methods: Vec<PaymentMethod> =
-                serde_json::from_str(&methods_json).unwrap_or_default();
-            let mut payment_method_kinds = methods
-                .into_iter()
-                .map(|method| method.kind)
-                .collect::<Vec<_>>();
-            payment_method_kinds.sort();
-            payment_method_kinds.dedup();
             let mut country_statement = conn
                 .prepare(
                     "SELECT country_code,
@@ -2824,7 +1888,6 @@ impl AppStore {
                 min_cycle_price_minor,
                 max_cycle_price_minor,
                 successful_allocations: successful,
-                payment_method_kinds,
                 countries,
             });
         }
@@ -2990,9 +2053,9 @@ impl AppStore {
             .filter(|value| !value.is_empty())
             .map(|value| value.to_ascii_uppercase());
         let pricing_model = if daily_rate_minor.is_some() {
-            crate::market_recurring::PRICING_LEGACY_METERED_DAILY
+            crate::market_common::PRICING_LEGACY_METERED_DAILY
         } else {
-            crate::market_recurring::PRICING_FREE
+            crate::market_common::PRICING_FREE
         };
         if old_price == daily_rate_minor
             && old_pricing_model == pricing_model
@@ -3008,9 +2071,9 @@ impl AppStore {
                 host_id: host_id.to_string(),
                 daily_rate_minor,
                 pricing_model: if daily_rate_minor.is_some() {
-                    crate::market_recurring::PRICING_LEGACY_METERED_DAILY.into()
+                    crate::market_common::PRICING_LEGACY_METERED_DAILY.into()
                 } else {
-                    crate::market_recurring::PRICING_FREE.into()
+                    crate::market_common::PRICING_FREE.into()
                 },
                 cycle_price_minor: None,
                 billing_interval: None,
@@ -3025,7 +2088,7 @@ impl AppStore {
                     .into(),
             ));
         }
-        // Paid offers require both visible payment details and supplier settlement terms.
+        // Paid publication requires a verified, claimed Provider identity.
         if daily_rate_minor.is_some() {
             require_paid_offer_setup(
                 &tx,
@@ -3083,9 +2146,9 @@ impl AppStore {
             host_id: host_id.to_string(),
             daily_rate_minor,
             pricing_model: if daily_rate_minor.is_some() {
-                crate::market_recurring::PRICING_LEGACY_METERED_DAILY.into()
+                crate::market_common::PRICING_LEGACY_METERED_DAILY.into()
             } else {
-                crate::market_recurring::PRICING_FREE.into()
+                crate::market_common::PRICING_FREE.into()
             },
             cycle_price_minor: None,
             billing_interval: None,
@@ -3108,12 +2171,12 @@ impl AppStore {
         let free_duration_days =
             validate_free_duration_days(cycle_price_minor, free_duration_days)?;
         let pricing_model = if cycle_price_minor.is_some() {
-            crate::market_recurring::PRICING_PREPAID_CALENDAR_MONTH
+            crate::market_common::PRICING_PREPAID_CALENDAR_MONTH
         } else {
-            crate::market_recurring::PRICING_FREE
+            crate::market_common::PRICING_FREE
         };
         let billing_interval = cycle_price_minor
-            .map(|_| crate::market_recurring::BILLING_INTERVAL_CALENDAR_MONTH.to_string());
+            .map(|_| crate::market_common::BILLING_INTERVAL_CALENDAR_MONTH.to_string());
         let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -3425,7 +2488,7 @@ impl AppStore {
                                 .free_duration_days
                                 .filter(|_| candidate.provider_id != session.user_id)
                                 .map(|days| {
-                                    crate::market_billing::free_usage_available_tx(
+                                    crate::market_common::free_usage_available_tx(
                                         &tx,
                                         &session.user_id,
                                         &candidate.provider_id,
@@ -3465,7 +2528,7 @@ impl AppStore {
         for candidate in &mut candidates {
             if candidate.provider_id == session.user_id {
                 candidate.daily_rate_minor = None;
-                candidate.pricing_model = crate::market_recurring::PRICING_FREE.into();
+                candidate.pricing_model = crate::market_common::PRICING_FREE.into();
                 candidate.cycle_price_minor = None;
                 candidate.billing_interval = None;
                 candidate.currency = None;
@@ -3488,11 +2551,11 @@ impl AppStore {
                         &candidate.provider_id,
                         "client_host",
                         &candidate.host_id,
-                        crate::market_billing::TRIAL_SECONDS,
+                        crate::market_common::TRIAL_SECONDS,
                     )?;
             } else if candidate.provider_id != session.user_id
                 && let Some(days) = candidate.free_duration_days
-                && !crate::market_billing::free_usage_available_tx(
+                && !crate::market_common::free_usage_available_tx(
                     &tx,
                     &session.user_id,
                     &candidate.provider_id,
@@ -3528,8 +2591,6 @@ impl AppStore {
                 }
             }
         }
-        let funding = Vec::new();
-        let recurring_funding = Vec::new();
         let wallet_funding = if wallet_paid_items {
             Some(crate::market_wallet::wallet_quote_funding_tx(
                 &tx,
@@ -3650,8 +2711,6 @@ impl AppStore {
             status: "active".into(),
             expires_at: expires_at.to_rfc3339(),
             items,
-            funding,
-            recurring_funding,
             wallet_funding,
             funding_rail: funding_rail.into(),
         })
@@ -3867,38 +2926,9 @@ impl AppStore {
             ],
         )
         .map_err(|error| AppError::Internal(format!("insert Client batch failed: {error}")))?;
-        // Calendar-month products can only consume prepaid funds, while legacy
-        // metered products may fall back to an explicit supplier credit line.
-        // Reserve the less-flexible monthly funds first so request order cannot
-        // make an otherwise fundable mixed quote fail. The response is restored
-        // to request order below because callers pair job ids with passwords.
-        let mut processing_order = prepared
-            .iter()
-            .enumerate()
-            .map(|(index, (item_id, _, _, _, _))| {
-                let monthly = tx
-                    .query_row(
-                        "SELECT cycle_price_minor IS NOT NULL
-                         FROM client_market_allocation_quote_items
-                         WHERE id = ?1 AND quote_id = ?2",
-                        params![item_id, quote_id],
-                        |row| row.get::<_, bool>(0),
-                    )
-                    .optional()
-                    .map_err(|error| {
-                        AppError::Internal(format!(
-                            "read quote item billing priority failed: {error}"
-                        ))
-                    })?
-                    .ok_or_else(|| {
-                        AppError::BadRequest("quote item does not belong to this quote".into())
-                    })?;
-                Ok((index, monthly))
-            })
-            .collect::<Result<Vec<_>, AppError>>()?;
-        processing_order.sort_by_key(|(index, monthly)| (!*monthly, *index));
+        // Every item is funded by the same wallet. Preserve request order.
         let mut job_ids_by_request = vec![None; prepared.len()];
-        for (prepared_index, _) in processing_order {
+        for prepared_index in 0..prepared.len() {
             let (item_id, subdomain, _, confirmed_revision, auto_renew) = &prepared[prepared_index];
             let item = tx
                 .query_row(
@@ -3956,18 +2986,6 @@ impl AppStore {
                 crate::market_access::PRODUCT_CLIENT_HOST,
                 crate::market_access::pricing_kind_for_rate(item.6.or(item.4)),
             )?;
-            if item.4.is_some() && funding_rail != "platform_wallet" {
-                crate::market_billing::ensure_credit_allowed_tx(
-                    &tx,
-                    &session.user_id,
-                    &session.email,
-                    &item.1,
-                    crate::market_access::PRODUCT_CLIENT_HOST,
-                    item.8.as_deref().ok_or_else(|| {
-                        AppError::Internal("paid quote item currency is missing".into())
-                    })?,
-                )?;
-            }
             let changed = tx
                 .execute(
                     "UPDATE router_ssh_hosts SET status = 'locked', updated_at = ?2
@@ -4047,73 +3065,6 @@ impl AppStore {
                         trial_seconds: item.10,
                     },
                     &now.to_rfc3339(),
-                )?;
-            } else if let Some(cycle_price_minor) = item.6 {
-                let currency = item.8.as_deref().ok_or_else(|| {
-                    AppError::Internal("monthly quote item currency is missing".into())
-                })?;
-                let now_text = now.to_rfc3339();
-                let trial_allowance_seconds = crate::market_billing::trial_seconds_remaining_tx(
-                    &tx,
-                    &session.user_id,
-                    &item.1,
-                    crate::market_access::PRODUCT_CLIENT_HOST,
-                    &item.0,
-                    currency,
-                    crate::market_billing::TRIAL_SECONDS,
-                )?;
-                crate::market_recurring::prepare_contract_tx(
-                    &tx,
-                    crate::market_recurring::PrepareRecurringContractInput {
-                        product_kind: "client_host",
-                        product_ref: &job_id,
-                        activation_ref: &job_id,
-                        service_ref: &item.0,
-                        service_label: subdomain,
-                        buyer_user_id: &session.user_id,
-                        buyer_email: &session.email,
-                        supplier_user_id: &item.1,
-                        supplier_email: &item.2,
-                        currency,
-                        cycle_price_minor,
-                        offer_revision: item.9,
-                        renewal_policy: if *auto_renew {
-                            crate::market_recurring::RENEWAL_AUTOMATIC
-                        } else {
-                            crate::market_recurring::RENEWAL_MANUAL
-                        },
-                        auto_renew_max_price_minor: Some(cycle_price_minor),
-                        renewal_priority: 0,
-                        trial_allowance_seconds,
-                    },
-                    &now_text,
-                )?;
-            } else if let Some(daily_rate_minor) = item.4 {
-                let currency = item.8.as_deref().ok_or_else(|| {
-                    AppError::Internal("paid quote item currency is missing".into())
-                })?;
-                let reservation_expires_at = (now + Duration::minutes(30)).to_rfc3339();
-                let now_text = now.to_rfc3339();
-                crate::market_billing::reserve_client_market_funding_tx(
-                    &tx,
-                    &crate::market_billing::ActivateContractInput {
-                        product_kind: "client_host",
-                        product_ref: &job_id,
-                        service_ref: &item.0,
-                        service_label: subdomain,
-                        buyer_user_id: &session.user_id,
-                        buyer_email: &session.email,
-                        supplier_user_id: &item.1,
-                        supplier_email: &item.2,
-                        currency,
-                        daily_rate_minor,
-                        offer_revision: item.9,
-                        replacement_of: None,
-                        trial_allowance_seconds: crate::market_billing::TRIAL_SECONDS,
-                    },
-                    &job_id,
-                    &reservation_expires_at,
-                    &now_text,
                 )?;
             }
             tx.execute(
@@ -4412,35 +3363,21 @@ impl AppStore {
                         END,
                         s.daily_rate_minor, s.cycle_price_minor, s.pricing_model, s.currency,
                         COALESCE((
-                            SELECT SUM(accrual.amount_units)
-                            FROM market_service_contracts contract
-                            JOIN market_accrual_entries accrual
-                              ON accrual.contract_id = contract.id
-                            WHERE contract.product_kind = 'client_host'
-                              AND contract.service_ref = s.installation_id
+                            SELECT SUM(period.amount_units)
+                            FROM market_platform_periods period
+                            JOIN market_platform_contracts contract ON contract.id = period.contract_id
+                            WHERE contract.product_kind = 'client_host' AND contract.service_ref = s.installation_id
                         ), 0) + COALESCE((
-                            SELECT SUM(period.amount_minor * ?3 - period.refunded_units)
-                            FROM market_recurring_contracts contract
-                            JOIN market_recurring_periods period
-                              ON period.contract_id = contract.id
-                            WHERE contract.product_kind = 'client_host'
-                              AND contract.product_ref = s.installation_id
-                              AND period.status IN ('paid', 'partially_refunded', 'refunded')
+                            SELECT SUM(batch.amount_units)
+                            FROM market_usage_posting_batches batch
+                            JOIN market_platform_contracts contract ON contract.id = batch.contract_id
+                            WHERE contract.product_kind = 'client_host' AND contract.service_ref = s.installation_id
                         ), 0),
                         COALESCE((
-                            SELECT SUM(accrual.amount_units)
-                            FROM market_service_contracts contract
-                            JOIN market_accrual_entries accrual
-                              ON accrual.contract_id = contract.id
-                            WHERE contract.product_kind = 'client_host'
-                              AND contract.service_ref = s.installation_id
-                              AND accrual.status = 'unbilled'
-                        ), 0),
-                        COALESCE((
-                            SELECT SUM(line.amount_minor)
-                            FROM market_invoice_lines line
-                            WHERE line.product_kind = 'client_host'
-                              AND line.service_ref = s.installation_id
+                            SELECT SUM(period.refunded_units)
+                            FROM market_platform_periods period
+                            JOIN market_platform_contracts contract ON contract.id = period.contract_id
+                            WHERE contract.product_kind = 'client_host' AND contract.service_ref = s.installation_id
                         ), 0)
                  FROM client_market_subscriptions s
                  WHERE s.host_id = ?1
@@ -4453,30 +3390,22 @@ impl AppStore {
                 AppError::Internal(format!("prepare Host usage history failed: {error}"))
             })?;
         let rows = statement
-            .query_map(
-                params![
-                    host_id,
-                    HOST_USAGE_HISTORY_LIMIT,
-                    crate::market_billing::MONEY_UNITS_PER_MINOR,
-                ],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, Option<String>>(5)?,
-                        row.get::<_, Option<i64>>(6)?,
-                        row.get::<_, Option<i64>>(7)?,
-                        row.get::<_, String>(8)?,
-                        row.get::<_, Option<String>>(9)?,
-                        row.get::<_, i64>(10)?,
-                        row.get::<_, i64>(11)?,
-                        row.get::<_, i64>(12)?,
-                    ))
-                },
-            )
+            .query_map(params![host_id, HOST_USAGE_HISTORY_LIMIT,], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, i64>(11)?,
+                ))
+            })
             .map_err(|error| {
                 AppError::Internal(format!("query Host usage history failed: {error}"))
             })?
@@ -4499,8 +3428,7 @@ impl AppStore {
                     pricing_model,
                     currency,
                     charge_units,
-                    unbilled_units,
-                    invoiced_minor,
+                    refunded_units,
                 )| HostUsageHistoryEntry {
                     installation_id,
                     client_owner_email,
@@ -4514,9 +3442,11 @@ impl AppStore {
                     cycle_price_minor,
                     pricing_model,
                     currency,
-                    charges_minor: crate::market_billing::ceil_minor_units(charge_units),
-                    unbilled_minor: crate::market_billing::ceil_minor_units(unbilled_units),
-                    invoiced_minor,
+                    charges_minor: crate::market_common::ceil_minor_units(charge_units),
+                    refunded_minor: crate::market_common::floor_minor_units(refunded_units),
+                    net_charges_minor: crate::market_common::ceil_minor_units(
+                        charge_units.saturating_sub(refunded_units),
+                    ),
                 },
             )
             .collect())
@@ -5105,7 +4035,6 @@ struct RentalRow {
     offer_revision: i64,
     activated_at: Option<String>,
     expires_at: Option<String>,
-    methods_json: String,
     contacts_json: String,
     active_cleanup_job_id: Option<String>,
     latest_cleanup_failure_code: Option<String>,
@@ -5129,9 +4058,7 @@ fn load_rental_views(
                 s.client_user_id, s.client_owner_email, s.status, s.daily_rate_minor,
                 s.currency, s.free_duration_days, s.offer_revision,
                 s.activated_at, s.expires_at,
-                COALESCE((SELECT methods_json FROM account_payment_profiles p
-                          WHERE p.user_id = s.provider_id), '[]'),
-                COALESCE((SELECT contacts_json FROM account_payment_profiles p
+                COALESCE((SELECT contacts_json FROM market_provider_contacts p
                           WHERE p.user_id = s.provider_id), '[]'),
                 (SELECT j.id FROM provisioning_jobs j
                  WHERE j.installation_id = s.installation_id
@@ -5196,22 +4123,21 @@ fn load_rental_views(
             offer_revision: row.get(10)?,
             activated_at: row.get(11)?,
             expires_at: row.get(12)?,
-            methods_json: row.get(13)?,
-            contacts_json: row.get(14)?,
-            active_cleanup_job_id: row.get(15)?,
-            provider_terminal_expires_at: row.get(16)?,
-            provider_terminal_revoked_at: row.get(17)?,
-            updated_at: row.get(18)?,
-            pricing_model: row.get(19)?,
-            cycle_price_minor: row.get(20)?,
-            billing_interval: row.get(21)?,
-            latest_cleanup_failure_code: row.get(22)?,
-            next_cleanup_probe_at: row.get(23)?,
-            cleanup_probe_attempts: row.get(24)?,
-            bound_host_status: row.get(25)?,
-            wallet_contract_id: row.get(26)?,
-            wallet_lifecycle_id: row.get(28)?,
-            open_wallet_dispute: row.get::<_, i64>(27)? != 0,
+            contacts_json: row.get(13)?,
+            active_cleanup_job_id: row.get(14)?,
+            provider_terminal_expires_at: row.get(15)?,
+            provider_terminal_revoked_at: row.get(16)?,
+            updated_at: row.get(17)?,
+            pricing_model: row.get(18)?,
+            cycle_price_minor: row.get(19)?,
+            billing_interval: row.get(20)?,
+            latest_cleanup_failure_code: row.get(21)?,
+            next_cleanup_probe_at: row.get(22)?,
+            cleanup_probe_attempts: row.get(23)?,
+            bound_host_status: row.get(24)?,
+            wallet_contract_id: row.get(25)?,
+            wallet_lifecycle_id: row.get(27)?,
+            open_wallet_dispute: row.get::<_, i64>(26)? != 0,
         })
     };
     let rows = if let Some(installation_id) = installation_id {
@@ -5233,30 +4159,12 @@ fn load_rental_views(
         if !client_role && !provider_role {
             continue;
         }
-        let methods: Vec<PaymentMethod> =
-            serde_json::from_str(&row.methods_json).unwrap_or_default();
-        let mut kinds = methods
-            .iter()
-            .map(|method| method.kind.clone())
-            .collect::<Vec<_>>();
-        kinds.sort();
-        kinds.dedup();
         let provider_terminal_access_active = row.provider_terminal_revoked_at.is_none()
             && row
                 .provider_terminal_expires_at
                 .as_deref()
                 .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
                 .is_some_and(|expires_at| expires_at > Utc::now());
-        let recurring =
-            if row.pricing_model == crate::market_recurring::PRICING_PREPAID_CALENDAR_MONTH {
-                crate::market_recurring::contract_view_for_product_tx(
-                    conn,
-                    "client_host",
-                    &row.installation_id,
-                )?
-            } else {
-                None
-            };
         let host_cleanup_pending = row
             .bound_host_status
             .as_deref()
@@ -5287,7 +4195,6 @@ fn load_rental_views(
             pricing_model: row.pricing_model,
             cycle_price_minor: row.cycle_price_minor,
             billing_interval: row.billing_interval,
-            recurring,
             wallet_contract: if client_role {
                 row.wallet_lifecycle_id
                     .as_deref()
@@ -5310,7 +4217,6 @@ fn load_rental_views(
             offer_revision: row.offer_revision,
             activated_at: row.activated_at,
             expires_at: row.expires_at,
-            payment_method_kinds: kinds,
             contacts: serde_json::from_str(&row.contacts_json).unwrap_or_default(),
             is_client_owner: client_role,
             can_release: (client_role || provider_role)
@@ -5519,6 +4425,22 @@ fn enqueue_client_market_chat_event_tx(
     else {
         return Ok(());
     };
+    let contacts_json: Option<String> = tx
+        .query_row(
+            "SELECT contacts_json FROM market_provider_contacts WHERE user_id = ?1",
+            params![provider_user_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "read Client Market support contacts failed: {error}"
+            ))
+        })?;
+    let contacts: Vec<ProviderContact> = contacts_json
+        .as_deref()
+        .and_then(|value| serde_json::from_str(value).ok())
+        .unwrap_or_default();
     let summary = format!("{client_label}: {}", event_type.replace('_', " "));
     let mut payload = serde_json::json!({
         "summary": summary,
@@ -5539,6 +4461,7 @@ fn enqueue_client_market_chat_event_tx(
         "billingInterval": billing_interval,
         "currency": currency,
         "offerRevision": offer_revision,
+        "contacts": contacts,
         "actorUserId": actor_user_id,
         "actorEmail": actor_email,
     });
@@ -5559,37 +4482,6 @@ fn enqueue_client_market_chat_event_tx(
         if let Some(value) = detail.get(field) {
             output.insert(field.into(), value.clone());
         }
-    }
-    if let Some((methods_json, contacts_json)) = tx
-        .query_row(
-            "SELECT methods_json, COALESCE(contacts_json, '[]')
-             FROM account_payment_profiles WHERE user_id = ?1",
-            params![provider_user_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional()
-        .map_err(|error| {
-            AppError::Internal(format!(
-                "read Client Market chat payment profile failed: {error}"
-            ))
-        })?
-    {
-        output.insert(
-            "paymentMethods".into(),
-            serde_json::from_str(&methods_json).map_err(|error| {
-                AppError::Internal(format!(
-                    "parse Client Market chat payment methods failed: {error}"
-                ))
-            })?,
-        );
-        output.insert(
-            "paymentContacts".into(),
-            serde_json::from_str(&contacts_json).map_err(|error| {
-                AppError::Internal(format!(
-                    "parse Client Market chat payment contacts failed: {error}"
-                ))
-            })?,
-        );
     }
     let mut followers = vec![client_user_id, provider_user_id];
     if let Some(actor_user_id) = actor_user_id {
@@ -5828,7 +4720,7 @@ pub(crate) fn complete_provisioning_tx(
     ) = if provider_id == client_user_id {
         (
             None,
-            crate::market_recurring::PRICING_FREE.to_string(),
+            crate::market_common::PRICING_FREE.to_string(),
             None,
             None,
             None,
@@ -5847,6 +4739,9 @@ pub(crate) fn complete_provisioning_tx(
     let wallet_contract_id =
         crate::market_platform_contracts::contract_for_product_tx(tx, "client_host", job_id)?;
     let is_paid = cycle_price_minor.or(daily_rate_minor).is_some();
+    if is_paid {
+        crate::market_payments::require_current_offer_rail(&funding_rail, "Client Host")?;
+    }
     if (funding_rail == "platform_wallet" && is_paid) != wallet_contract_id.is_some()
         || (funding_rail != "platform_wallet" && wallet_contract_id.is_some())
     {
@@ -5860,7 +4755,7 @@ pub(crate) fn complete_provisioning_tx(
                 let days = u32::try_from(days).map_err(|_| {
                     AppError::Internal("free Client Host duration is invalid".into())
                 })?;
-                let seconds = crate::market_billing::claim_free_usage_tx(
+                let seconds = crate::market_common::claim_free_usage_tx(
                     tx,
                     &client_user_id,
                     &provider_id,
@@ -5892,9 +4787,9 @@ pub(crate) fn complete_provisioning_tx(
              client_user_id, client_owner_email, status, daily_rate_minor,
              currency, free_duration_days, offer_revision, activated_at, expires_at,
              created_at, updated_at, free_usage_seconds, pricing_model,
-             cycle_price_minor, billing_interval, recurring_contract_id)
+             cycle_price_minor, billing_interval)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                 ?12, ?12, ?14, ?15, ?16, ?17, NULL)",
+                 ?12, ?12, ?14, ?15, ?16, ?17)",
         params![
             installation_id,
             host_id,
@@ -5919,7 +4814,6 @@ pub(crate) fn complete_provisioning_tx(
         AppError::Internal(format!("create Client Market subscription failed: {error}"))
     })?;
     persist_subscription_client_subdomain_tx(tx, installation_id)?;
-    let label = client_label_tx(tx, installation_id)?;
     if funding_rail == "platform_wallet"
         && let Some(_price_minor) = cycle_price_minor.or(daily_rate_minor)
     {
@@ -5954,127 +4848,6 @@ pub(crate) fn complete_provisioning_tx(
         .map_err(|error| {
             AppError::Internal(format!("link Client wallet contract failed: {error}"))
         })?;
-    } else if let Some(cycle_price_minor) = cycle_price_minor {
-        if pricing_model != crate::market_recurring::PRICING_PREPAID_CALENDAR_MONTH
-            || billing_interval.as_deref()
-                != Some(crate::market_recurring::BILLING_INTERVAL_CALENDAR_MONTH)
-        {
-            return Err(AppError::Internal(
-                "monthly Client Host quote has inconsistent billing terms".into(),
-            ));
-        }
-        let contract_id = crate::market_recurring::activate_contract_tx(
-            tx,
-            "client_host",
-            job_id,
-            installation_id,
-            installation_id,
-            &label,
-            now,
-            &now.to_rfc3339(),
-        )?
-        .ok_or_else(|| {
-            AppError::Conflict(
-                "the Client Market monthly funding reservation expired before provisioning completed"
-                    .into(),
-            )
-        })?;
-        tx.execute(
-            "UPDATE client_market_subscriptions
-             SET recurring_contract_id = ?2 WHERE installation_id = ?1",
-            params![installation_id, contract_id],
-        )
-        .map_err(|error| {
-            AppError::Internal(format!("link Client recurring contract failed: {error}"))
-        })?;
-        let _ = cycle_price_minor;
-    } else if let Some(daily_rate_minor) = daily_rate_minor {
-        let currency = currency
-            .as_deref()
-            .ok_or_else(|| AppError::Internal("paid Client Host currency is missing".into()))?;
-        let now_text = now.to_rfc3339();
-        let mut funding_captured = crate::market_billing::finish_market_funding_reservation_tx(
-            tx,
-            "client_host",
-            job_id,
-            true,
-            "service_activated",
-            &now_text,
-        )?;
-        if !funding_captured {
-            let reservation_status = tx
-                .query_row(
-                    "SELECT status FROM market_funding_reservations
-                     WHERE product_kind = 'client_host' AND product_ref = ?1",
-                    params![job_id],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()
-                .map_err(|error| {
-                    AppError::Internal(format!(
-                        "read completed Client funding reservation failed: {error}"
-                    ))
-                })?;
-            if reservation_status
-                .as_deref()
-                .is_none_or(|status| matches!(status, "released" | "expired"))
-            {
-                crate::market_billing::reserve_client_market_funding_tx(
-                    tx,
-                    &crate::market_billing::ActivateContractInput {
-                        product_kind: "client_host",
-                        product_ref: job_id,
-                        service_ref: installation_id,
-                        service_label: &label,
-                        buyer_user_id: &client_user_id,
-                        buyer_email: &client_email,
-                        supplier_user_id: &provider_id,
-                        supplier_email: &host_email,
-                        currency,
-                        daily_rate_minor,
-                        offer_revision: revision,
-                        replacement_of: None,
-                        trial_allowance_seconds: crate::market_billing::TRIAL_SECONDS,
-                    },
-                    job_id,
-                    &(now + Duration::minutes(1)).to_rfc3339(),
-                    &now_text,
-                )?;
-                funding_captured = crate::market_billing::finish_market_funding_reservation_tx(
-                    tx,
-                    "client_host",
-                    job_id,
-                    true,
-                    "service_activated",
-                    &now_text,
-                )?;
-            }
-        }
-        if !funding_captured {
-            return Err(AppError::Conflict(
-                "the Client Market funding reservation expired before provisioning completed"
-                    .into(),
-            ));
-        }
-        crate::market_billing::activate_contract_tx(
-            tx,
-            crate::market_billing::ActivateContractInput {
-                product_kind: "client_host",
-                product_ref: installation_id,
-                service_ref: installation_id,
-                service_label: &label,
-                buyer_user_id: &client_user_id,
-                buyer_email: &client_email,
-                supplier_user_id: &provider_id,
-                supplier_email: &host_email,
-                currency,
-                daily_rate_minor,
-                offer_revision: revision,
-                replacement_of: None,
-                trial_allowance_seconds: crate::market_billing::TRIAL_SECONDS,
-            },
-            &now.to_rfc3339(),
-        )?;
     }
     insert_audit_tx(
         tx,
@@ -6095,7 +4868,7 @@ pub(crate) fn complete_provisioning_tx(
             "offerRevision": revision,
             "activatedAt": now.to_rfc3339(),
             "expiresAt": expires_at.map(|value| value.to_rfc3339()),
-            "trialHours": crate::market_billing::TRIAL_SECONDS / 3_600,
+            "trialHours": crate::market_common::TRIAL_SECONDS / 3_600,
         }),
         now,
     )?;
@@ -6119,13 +4892,12 @@ pub(crate) fn cleanup_started_tx(
         String,
         Option<i64>,
         Option<String>,
-        String,
         Option<i64>,
     )> = tx
         .query_row(
             "SELECT s.provider_id, s.client_user_id, s.client_owner_email,
                     COALESCE(p.owner_email, s.host_owner_email), s.daily_rate_minor,
-                    s.expires_at, s.pricing_model, s.cycle_price_minor
+                    s.expires_at, s.cycle_price_minor
              FROM client_market_subscriptions s
              LEFT JOIN host_provider_profiles p ON p.provider_id = s.provider_id
              WHERE s.installation_id = ?1",
@@ -6139,7 +4911,6 @@ pub(crate) fn cleanup_started_tx(
                     row.get(4)?,
                     row.get(5)?,
                     row.get(6)?,
-                    row.get(7)?,
                 ))
             },
         )
@@ -6154,7 +4925,6 @@ pub(crate) fn cleanup_started_tx(
         provider_email,
         daily_rate_minor,
         expires_at,
-        pricing_model,
         cycle_price_minor,
     )) = subscription
     {
@@ -6176,32 +4946,6 @@ pub(crate) fn cleanup_started_tx(
                 &now.to_rfc3339(),
             )?;
         }
-        if pricing_model == crate::market_recurring::PRICING_PREPAID_CALENDAR_MONTH
-            && actor_user_id == Some(provider_id.as_str())
-        {
-            crate::market_recurring::supplier_terminate_and_refund_tx(
-                tx,
-                "client_host",
-                installation_id,
-                reason,
-                &now.to_rfc3339(),
-            )?;
-        } else {
-            crate::market_recurring::terminate_contract_tx(
-                tx,
-                "client_host",
-                installation_id,
-                reason,
-                &now.to_rfc3339(),
-            )?;
-        }
-        crate::market_billing::terminate_contract_tx(
-            tx,
-            "client_host",
-            installation_id,
-            reason,
-            &now.to_rfc3339(),
-        )?;
         tx.execute(
             "UPDATE client_market_subscriptions
              SET status = ?2, updated_at = ?3 WHERE installation_id = ?1 AND status != 'released'",
@@ -6388,7 +5132,6 @@ async fn run_trade_reconcile_worker(state: ServerState) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     use super::*;
 
@@ -6406,20 +5149,6 @@ mod tests {
             refresh_expires_at: now + Duration::days(30),
             created_at: now,
             last_used_at: now,
-        }
-    }
-
-    fn custom_payment_method() -> PaymentMethod {
-        PaymentMethod {
-            kind: "custom".into(),
-            account: None,
-            qr_image_url: None,
-            asset_url: None,
-            token: None,
-            chain: None,
-            address: None,
-            instructions: Some("Wire transfer details".into()),
-            settlement_asset: None,
         }
     }
 
@@ -6461,7 +5190,6 @@ mod tests {
             min_cycle_price_minor: None,
             max_cycle_price_minor: None,
             successful_allocations: 0,
-            payment_method_kinds: Vec::new(),
             countries: Vec::new(),
         }
     }
@@ -6528,54 +5256,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn paid_host_requires_payment_profile_with_stable_error_code() {
-        let store = AppStore::new_in_memory_for_tests().expect("test store");
-        let conn = store.conn.lock().await;
-        let error = require_payment_profile_for_offer(&conn, "missing-provider")
-            .expect_err("missing payment profile must block a paid Host offer");
-        assert_eq!(error.code(), Some(ERROR_MARKET_PAYMENT_PROFILE_REQUIRED));
-    }
-
-    #[tokio::test]
-    async fn wallet_contacts_can_change_without_rewriting_legacy_payment_methods() {
-        let store = AppStore::new_in_memory_for_tests().expect("test store");
+    async fn wallet_contacts_are_independent_of_payment_and_finance_mode() {
+        let store = AppStore::new_in_memory_for_tests().unwrap();
         let supplier = session("contact-provider", "contact@example.com");
-        store
-            .seed_legacy_payment_profile(&supplier, &[custom_payment_method()], None)
-            .await
-            .expect("save legacy method before cutover");
-        store.conn.lock().await.execute(
-            "UPDATE market_finance_control SET mode = 'enabled', cutover_approved_at = '2026-10-16T00:00:00Z' WHERE id = 1",
-            [],
-        ).unwrap();
-        let updated = store
-            .client_market_update_payment_contacts(
+        {
+            let conn = store.conn.lock().await;
+            crate::market_access::configure_open_test_policy(
+                &conn,
                 &supplier,
-                &[PaymentContact {
-                    channel: "telegram".into(),
-                    handle: "@contact".into(),
-                }],
-            )
-            .await
-            .expect("update contacts on wallet rail");
-        assert_eq!(updated.methods, vec![custom_payment_method()]);
-        assert_eq!(updated.contacts[0].handle, "@contact");
-        assert!(matches!(
+                "USD",
+                0,
+                &Utc::now().to_rfc3339(),
+            );
+        }
+        for mode in ["disabled", "shadow", "enabled"] {
             store
-                .client_market_update_payment_profile(&supplier, &[], None)
-                .await,
-            Err(AppError::Gone(_))
-        ));
+                .conn
+                .lock()
+                .await
+                .execute(
+                    "UPDATE market_finance_control SET mode = ?1 WHERE id = 1",
+                    params![mode],
+                )
+                .unwrap();
+            let updated = store
+                .client_market_update_provider_contacts(
+                    &supplier,
+                    &[ProviderContact {
+                        channel: "telegram".into(),
+                        handle: format!("@{mode}"),
+                    }],
+                )
+                .await
+                .unwrap();
+            assert_eq!(updated.contacts[0].handle, format!("@{mode}"));
+            assert!(
+                serde_json::to_value(updated)
+                    .unwrap()
+                    .get("methods")
+                    .is_none()
+            );
+        }
     }
 
     #[tokio::test]
     async fn paid_host_requires_verified_claimed_provider_not_legacy_supplier_terms() {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
         let supplier = session("supplier-with-payment", "supplier@example.com");
-        store
-            .seed_legacy_payment_profile(&supplier, &[custom_payment_method()], None)
-            .await
-            .expect("configure payment profile");
+
         let conn = store.conn.lock().await;
         assert!(matches!(
             require_paid_offer_setup(&conn, &supplier.user_id, "USD"),
@@ -6589,322 +5317,6 @@ mod tests {
             &Utc::now().to_rfc3339(),
         );
         require_paid_offer_setup(&conn, &supplier.user_id, "USD").unwrap();
-    }
-
-    #[tokio::test]
-    async fn client_market_update_payment_profile_binds_market_provider_immediately() {
-        let store = AppStore::new_in_memory_for_tests().expect("test store");
-        let supplier = session("payment-identity", "payment-identity@example.com");
-        store
-            .conn
-            .lock()
-            .await
-            .execute(
-                "INSERT INTO users (id, email_normalized, status, created_at, last_login_at)
-                 VALUES (?1, ?2, 'active', 'now', 'now')",
-                params![supplier.user_id, supplier.email],
-            )
-            .expect("insert payment Provider user");
-
-        store
-            .seed_legacy_payment_profile(&supplier, &[custom_payment_method()], None)
-            .await
-            .expect("configure payment Provider profile");
-
-        let conn = store.conn.lock().await;
-        let (host_market_provider_id, profile_user_id): (Option<String>, Option<String>) = conn
-            .query_row(
-                "SELECT host.market_provider_id, profile.user_id
-                 FROM host_provider_profiles host
-                 LEFT JOIN market_provider_profiles profile
-                   ON profile.id = host.market_provider_id
-                 WHERE host.provider_id = ?1",
-                params![supplier.user_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .expect("read immediate Market Provider binding");
-        assert!(host_market_provider_id.is_some());
-        assert_eq!(profile_user_id.as_deref(), Some(supplier.user_id.as_str()));
-    }
-
-    #[tokio::test]
-    async fn client_market_update_payment_profile_rolls_back_on_identity_conflict() {
-        let store = AppStore::new_in_memory_for_tests().expect("test store");
-        let supplier = session("conflicted-payment", "conflicted-payment@example.com");
-        {
-            let conn = store.conn.lock().await;
-            conn.execute_batch(
-                "INSERT INTO users (id, email_normalized, status, created_at, last_login_at)
-                 VALUES ('conflicted-payment', 'conflicted-payment@example.com',
-                         'active', 'now', 'now');
-                 INSERT INTO market_provider_profiles (
-                    id, user_id, canonical_email, display_name, claim_state,
-                    status, created_at, updated_at, claimed_at
-                 ) VALUES (
-                    'mp_conflicted_user', 'conflicted-payment', 'former@example.com',
-                    'Former identity', 'claimed', 'active', 'now', 'now', 'now'
-                 ), (
-                    'mp_conflicted_email', NULL, 'conflicted-payment@example.com',
-                    'Email identity', 'unclaimed', 'active', 'now', 'now', NULL
-                 );
-                 INSERT INTO market_provider_aliases (
-                    market_provider_id, alias_kind, alias_value, created_at
-                 ) VALUES (
-                    'mp_conflicted_user', 'user_id', 'conflicted-payment', 'now'
-                 ), (
-                    'mp_conflicted_email', 'email', 'conflicted-payment@example.com', 'now'
-                 );",
-            )
-            .expect("seed conflicting Market Provider identities");
-        }
-
-        assert!(matches!(
-            store
-                .seed_legacy_payment_profile(&supplier, &[custom_payment_method()], None)
-                .await,
-            Err(AppError::Conflict(_))
-        ));
-
-        let conn = store.conn.lock().await;
-        let payment_profiles: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM account_payment_profiles WHERE user_id = ?1",
-                params![supplier.user_id],
-                |row| row.get(0),
-            )
-            .expect("count rolled-back payment profiles");
-        let host_profiles: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM host_provider_profiles WHERE provider_id = ?1",
-                params![supplier.user_id],
-                |row| row.get(0),
-            )
-            .expect("count rolled-back Host Provider profiles");
-        let fenced_profiles: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM market_provider_profiles
-                 WHERE id IN ('mp_conflicted_user', 'mp_conflicted_email')
-                   AND status = 'identity_conflict'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("count durably fenced Market Provider identities");
-        let conflict_events: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM market_provider_identity_events
-                 WHERE event_kind = 'identity_conflict'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("count durable Market Provider conflict events");
-        assert_eq!(payment_profiles, 0);
-        assert_eq!(host_profiles, 0);
-        assert_eq!(fenced_profiles, 2);
-        assert_eq!(conflict_events, 2);
-    }
-
-    #[tokio::test]
-    async fn legacy_mixed_quote_never_creates_jobs_or_spends_prepaid_in_any_topup_mode() {
-        let store = AppStore::new_in_memory_for_tests().expect("test store");
-        let supplier = session("mixed-supplier", "mixed-supplier@example.com");
-        let buyer = session("mixed-buyer", "mixed-buyer@example.com");
-        let now = Utc::now();
-        let now_text = now.to_rfc3339();
-        store
-            .market_billing_update_supplier_profile(
-                &supplier,
-                crate::market_billing::MARKET_CURRENCY,
-                24,
-            )
-            .await
-            .expect("configure mixed-quote supplier settlement terms");
-        {
-            let conn = store.conn.lock().await;
-            crate::market_access::configure_open_test_policy(
-                &conn,
-                &supplier,
-                crate::market_billing::MARKET_CURRENCY,
-                1_000,
-                &now_text,
-            );
-            let account_id = crate::market_billing::ensure_market_prepaid_account_tx(
-                &conn,
-                &buyer.user_id,
-                &buyer.email,
-                &supplier.user_id,
-                &supplier.email,
-                crate::market_billing::MARKET_CURRENCY,
-                &now_text,
-            )
-            .expect("create mixed-quote prepaid account");
-            conn.execute(
-                "UPDATE market_prepaid_accounts
-                 SET posted_balance_units = ?2, updated_at = ?3 WHERE id = ?1",
-                params![
-                    account_id,
-                    1_000 * crate::market_billing::MONEY_UNITS_PER_MINOR,
-                    now_text
-                ],
-            )
-            .expect("fund mixed-quote prepaid account");
-            for (host_id, ip, pricing_model, daily_rate, cycle_price, interval) in [
-                (
-                    "mixed-daily-host",
-                    "203.0.113.41",
-                    crate::market_recurring::PRICING_LEGACY_METERED_DAILY,
-                    Some(1_000_i64),
-                    None,
-                    None,
-                ),
-                (
-                    "mixed-monthly-host",
-                    "203.0.113.42",
-                    crate::market_recurring::PRICING_PREPAID_CALENDAR_MONTH,
-                    None,
-                    Some(1_000_i64),
-                    Some(crate::market_recurring::BILLING_INTERVAL_CALENDAR_MONTH),
-                ),
-            ] {
-                conn.execute(
-                    "INSERT INTO router_ssh_hosts (
-                        id, ip, port, host_owner_email, status, created_at, updated_at,
-                        provider_id, daily_rate_minor, pricing_model, cycle_price_minor,
-                        billing_interval, currency, offer_revision
-                     ) VALUES (?1, ?2, 22, ?3, 'reserved', ?4, ?4, ?5, ?6, ?7, ?8,
-                               ?9, 'USD', 1)",
-                    params![
-                        host_id,
-                        ip,
-                        supplier.email,
-                        now_text,
-                        supplier.user_id,
-                        daily_rate,
-                        pricing_model,
-                        cycle_price,
-                        interval,
-                    ],
-                )
-                .expect("insert mixed-quote Host");
-            }
-            conn.execute(
-                "INSERT INTO client_market_allocation_quotes (
-                    id, client_user_id, client_owner_email, status, expires_at,
-                    created_at, updated_at
-                 ) VALUES ('mixed-quote', ?1, ?2, 'active', ?3, ?4, ?4)",
-                params![
-                    buyer.user_id,
-                    buyer.email,
-                    (now + Duration::minutes(2)).to_rfc3339(),
-                    now_text,
-                ],
-            )
-            .expect("insert mixed allocation quote");
-            for (item_id, position, host_id, pricing_model, daily_rate, cycle_price, interval) in [
-                (
-                    "mixed-daily-item",
-                    0_i64,
-                    "mixed-daily-host",
-                    crate::market_recurring::PRICING_LEGACY_METERED_DAILY,
-                    Some(1_000_i64),
-                    None,
-                    None,
-                ),
-                (
-                    "mixed-monthly-item",
-                    1_i64,
-                    "mixed-monthly-host",
-                    crate::market_recurring::PRICING_PREPAID_CALENDAR_MONTH,
-                    None,
-                    Some(1_000_i64),
-                    Some(crate::market_recurring::BILLING_INTERVAL_CALENDAR_MONTH),
-                ),
-            ] {
-                conn.execute(
-                    "INSERT INTO client_market_allocation_quote_items (
-                        id, quote_id, position, host_id, provider_id, host_owner_email,
-                        daily_rate_minor, pricing_model, cycle_price_minor,
-                        billing_interval, currency, offer_revision
-                     ) VALUES (?1, 'mixed-quote', ?2, ?3, ?4, ?5, ?6, ?7, ?8,
-                               ?9, 'USD', 1)",
-                    params![
-                        item_id,
-                        position,
-                        host_id,
-                        supplier.user_id,
-                        supplier.email,
-                        daily_rate,
-                        pricing_model,
-                        cycle_price,
-                        interval,
-                    ],
-                )
-                .expect("insert mixed allocation quote item");
-            }
-        }
-
-        let prepared = vec![
-            (
-                "mixed-daily-item".into(),
-                "mixed-daily".into(),
-                "daily-password".into(),
-                1,
-                false,
-            ),
-            (
-                "mixed-monthly-item".into(),
-                "mixed-monthly".into(),
-                "monthly-password".into(),
-                1,
-                false,
-            ),
-        ];
-        let fingerprint = commit_request_fingerprint_with_renewal(&prepared).unwrap();
-        for mode in ["disabled", "shadow", "enabled"] {
-            store
-                .conn
-                .lock()
-                .await
-                .execute(
-                    "UPDATE market_finance_control SET mode=?1,cutover_approved_at=NULL WHERE id=1",
-                    params![mode],
-                )
-                .unwrap();
-            assert!(matches!(
-                store
-                    .client_market_commit_quote_with_renewal_idempotent(
-                        "mixed-quote",
-                        &buyer,
-                        "mixed-quote-key",
-                        &fingerprint,
-                        &prepared
-                    )
-                    .await,
-                Err(AppError::Gone(_))
-            ));
-        }
-        let conn = store.conn.lock().await;
-        for table in [
-            "provisioning_jobs",
-            "market_funding_reservations",
-            "market_recurring_holds",
-            "market_platform_contracts",
-        ] {
-            assert_eq!(
-                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
-                    .get::<_, i64>(0))
-                    .unwrap(),
-                0
-            );
-        }
-        assert_eq!(
-            conn.query_row(
-                "SELECT posted_balance_units FROM market_prepaid_accounts WHERE buyer_user_id=?1",
-                params![buyer.user_id],
-                |r| r.get::<_, i64>(0)
-            )
-            .unwrap(),
-            1000 * crate::market_billing::MONEY_UNITS_PER_MINOR
-        );
     }
 
     #[tokio::test]
@@ -6942,14 +5354,24 @@ mod tests {
     async fn client_market_audit_producer_enqueues_only_the_public_market_projection() {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
         let provider = session("provider-chat-projection", "provider-chat@example.com");
-        let contacts = [PaymentContact {
+        {
+            let conn = store.conn.lock().await;
+            crate::market_access::configure_open_test_policy(
+                &conn,
+                &provider,
+                "USD",
+                0,
+                &Utc::now().to_rfc3339(),
+            );
+        }
+        let contacts = [ProviderContact {
             channel: "telegram".into(),
             handle: "@public-provider".into(),
         }];
         store
-            .seed_legacy_payment_profile(&provider, &[custom_payment_method()], Some(&contacts))
+            .client_market_update_provider_contacts(&provider, &contacts)
             .await
-            .expect("configure projected Provider payment profile");
+            .expect("configure projected Provider support contacts");
 
         let now = Utc::now();
         let now_text = now.to_rfc3339();
@@ -7005,7 +5427,7 @@ mod tests {
         assert_eq!(payload["dailyRateMinor"], 125);
         assert_eq!(payload["offerRevision"], 7);
         assert_eq!(payload["failureCode"], "cleanup_timeout");
-        assert_eq!(payload["paymentMethodKinds"], serde_json::json!(["custom"]));
+        assert!(payload.get("paymentMethods").is_none());
         assert_eq!(payload["contacts"], serde_json::to_value(contacts).unwrap());
         for private_field in [
             "clientUserId",
@@ -7211,37 +5633,6 @@ mod tests {
     }
 
     #[test]
-    fn payment_asset_network_policy_rejects_reserved_addresses() {
-        assert!(is_public_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
-        assert!(is_public_ip(IpAddr::V6(
-            "2606:4700:4700::1111".parse::<Ipv6Addr>().unwrap()
-        )));
-
-        for address in [
-            "0.0.0.1",
-            "10.0.0.1",
-            "100.64.0.1",
-            "127.0.0.1",
-            "169.254.1.1",
-            "192.0.0.1",
-            "192.0.2.1",
-            "198.18.0.1",
-            "224.0.0.1",
-            "240.0.0.1",
-            "::1",
-            "fc00::1",
-            "fe80::1",
-            "2001:db8::1",
-            "ff02::1",
-        ] {
-            assert!(
-                !is_public_ip(address.parse().unwrap()),
-                "reserved address was accepted: {address}"
-            );
-        }
-    }
-
-    #[test]
     fn paid_host_offer_defaults_to_usd_and_rejects_other_currencies() {
         assert_eq!(
             normalize_offer_currency(Some(500), None).expect("default paid Host currency"),
@@ -7253,378 +5644,5 @@ mod tests {
             Some("USD".into())
         );
         assert!(normalize_offer_currency(Some(500), Some("CNY".into())).is_err());
-    }
-
-    #[test]
-    fn wallet_paid_offers_do_not_require_legacy_provider_payment_methods() {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::schema::apply(&conn).unwrap();
-        conn.execute(
-            "INSERT INTO router_ssh_hosts
-             (id, ip, port, host_owner_email, provider_id, status,
-              daily_rate_minor, currency, funding_rail, created_at, updated_at)
-             VALUES ('wallet-host', '192.0.2.10', 22, 'provider@example.com',
-                     'provider', 'idle', 100, 'USD', 'platform_wallet',
-                     '2026-10-01', '2026-10-01')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "UPDATE router_ssh_hosts SET funding_rail = 'platform_wallet'
-             WHERE id = 'wallet-host'",
-            [],
-        )
-        .unwrap();
-        assert!(ensure_payment_profile_can_be_cleared(&conn, "provider").is_ok());
-        conn.execute(
-            "UPDATE router_ssh_hosts SET funding_rail = 'legacy_provider'
-             WHERE id = 'wallet-host'",
-            [],
-        )
-        .unwrap();
-        assert!(ensure_payment_profile_can_be_cleared(&conn, "provider").is_err());
-    }
-
-    #[test]
-    fn payment_assets_accept_only_planned_raster_formats() {
-        assert!(is_supported_qr_format(ImageFormat::Png));
-        assert!(is_supported_qr_format(ImageFormat::Jpeg));
-        assert!(is_supported_qr_format(ImageFormat::WebP));
-        assert!(!is_supported_qr_format(ImageFormat::Gif));
-    }
-
-    #[test]
-    fn crypto_payment_addresses_are_chain_specific() {
-        assert!(
-            validate_crypto_address("bsc", "0x1111111111111111111111111111111111111111").is_ok()
-        );
-        assert!(
-            validate_crypto_address("eth", "1111111111111111111111111111111111111111").is_err()
-        );
-        assert!(validate_crypto_address("base", "0x1234").is_err());
-        assert!(
-            validate_crypto_address("bsc", "0x0000000000000000000000000000000000000000").is_err()
-        );
-
-        assert!(validate_crypto_address("tron", "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj").is_ok());
-        let bad_checksum = "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdk";
-        assert!(validate_crypto_address("tron", bad_checksum).is_err());
-        assert!(validate_crypto_address("tron", &format!("T{}", "0".repeat(33))).is_err());
-    }
-
-    #[test]
-    fn custom_payment_instructions_preserve_safe_multiline_text() {
-        let method = normalize_payment_method(PaymentMethod {
-            kind: "custom".into(),
-            account: None,
-            qr_image_url: None,
-            asset_url: None,
-            token: None,
-            chain: None,
-            address: None,
-            instructions: Some(" Bank transfer\r\nReference: client\tID ".into()),
-            settlement_asset: None,
-        })
-        .expect("normalize multiline custom payment instructions");
-        assert_eq!(
-            method.instructions.as_deref(),
-            Some("Bank transfer\nReference: client\tID")
-        );
-        assert!(
-            normalize_payment_method(PaymentMethod {
-                kind: "custom".into(),
-                account: None,
-                qr_image_url: None,
-                asset_url: None,
-                token: None,
-                chain: None,
-                address: None,
-                instructions: Some("unsafe\0text".into()),
-                settlement_asset: None,
-            })
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn public_payment_profile_rejects_browser_supplied_binance_methods() {
-        for method in [
-            PaymentMethod {
-                kind: " Binance ".into(),
-                account: Some("123456789".into()),
-                qr_image_url: None,
-                asset_url: None,
-                token: None,
-                chain: None,
-                address: None,
-                instructions: None,
-                settlement_asset: Some("USDT".into()),
-            },
-            PaymentMethod {
-                kind: "binance".into(),
-                account: None,
-                qr_image_url: Some("https://example.com/binance-qr.png".into()),
-                asset_url: None,
-                token: None,
-                chain: None,
-                address: None,
-                instructions: None,
-                settlement_asset: None,
-            },
-        ] {
-            let error = normalize_payment_method(method)
-                .expect_err("Binance methods must only come from verified API credentials");
-            assert!(matches!(
-                error,
-                AppError::BadRequest(message)
-                    if message == "Binance payment method is managed by verified API credentials"
-            ));
-        }
-    }
-
-    #[tokio::test]
-    async fn payment_methods_cannot_be_cleared_with_market_dependencies() {
-        let store = AppStore::new_in_memory_for_tests().expect("test store");
-        let supplier = session(
-            "supplier-profile-guard",
-            "supplier-profile-guard@example.com",
-        );
-        let buyer = session("buyer-profile-guard", "buyer-profile-guard@example.com");
-        store
-            .seed_legacy_payment_profile(&supplier, &[custom_payment_method()], None)
-            .await
-            .expect("configure guarded payment profile");
-        let now = Utc::now();
-        {
-            let conn = store.conn.lock().await;
-            crate::market_access::configure_open_test_policy(
-                &conn,
-                &supplier,
-                "USD",
-                50_000,
-                &now.to_rfc3339(),
-            );
-            conn.execute(
-                "INSERT INTO router_ssh_hosts (
-                    id, ip, port, host_owner_email, status, created_at, updated_at,
-                    provider_id, daily_rate_minor, currency, offer_revision
-                 ) VALUES ('guarded-host', '203.0.113.10', 22, ?1, 'idle', ?2, ?2,
-                           ?3, 500, 'USD', 1)",
-                params![supplier.email, now.to_rfc3339(), supplier.user_id],
-            )
-            .expect("insert paid Host offer");
-            conn.execute("UPDATE router_ssh_hosts SET funding_rail='legacy_provider' WHERE id='guarded-host'", []).unwrap();
-        }
-        assert!(matches!(
-            store
-                .seed_legacy_payment_profile(&supplier, &[], None)
-                .await,
-            Err(AppError::Conflict(_))
-        ));
-        store
-            .conn
-            .lock()
-            .await
-            .execute(
-                "UPDATE router_ssh_hosts SET daily_rate_minor = NULL, currency = NULL
-                 WHERE id = 'guarded-host'",
-                [],
-            )
-            .expect("withdraw paid Host offer");
-        store
-            .market_billing_update_supplier_profile(&supplier, "USD", 24)
-            .await
-            .expect("configure supplier credit profile");
-        store
-            .market_billing_activate_contract(
-                crate::market_billing::ActivateContractInput {
-                    product_kind: "client_host",
-                    product_ref: "guarded-client",
-                    service_ref: "guarded-client",
-                    service_label: "Guarded Client",
-                    buyer_user_id: &buyer.user_id,
-                    buyer_email: &buyer.email,
-                    supplier_user_id: &supplier.user_id,
-                    supplier_email: &supplier.email,
-                    currency: "USD",
-                    daily_rate_minor: 500,
-                    offer_revision: 1,
-                    replacement_of: None,
-                    trial_allowance_seconds: crate::market_billing::TRIAL_SECONDS,
-                },
-                now,
-            )
-            .await
-            .expect("activate guarded contract");
-        assert!(matches!(
-            store
-                .seed_legacy_payment_profile(&supplier, &[], None)
-                .await,
-            Err(AppError::Conflict(_))
-        ));
-        store
-            .market_billing_terminate_contract(
-                "client_host",
-                "guarded-client",
-                "test_cleanup",
-                now + Duration::seconds(1),
-            )
-            .await
-            .expect("terminate guarded contract");
-        let account_id: String = store
-            .conn
-            .lock()
-            .await
-            .query_row(
-                "SELECT id FROM market_credit_accounts
-                 WHERE buyer_user_id = ?1 AND supplier_user_id = ?2",
-                params![buyer.user_id, supplier.user_id],
-                |row| row.get(0),
-            )
-            .expect("read guarded credit account");
-        store
-            .conn
-            .lock()
-            .await
-            .execute(
-                "UPDATE market_credit_accounts SET balance_units = 86400 WHERE id = ?1",
-                params![account_id],
-            )
-            .expect("seed guarded accrued balance");
-        assert!(matches!(
-            store
-                .seed_legacy_payment_profile(&supplier, &[], None)
-                .await,
-            Err(AppError::Conflict(_))
-        ));
-        {
-            let conn = store.conn.lock().await;
-            let timestamp = (now + Duration::seconds(2)).to_rfc3339();
-            conn.execute(
-                "INSERT INTO market_invoices (
-                    id, account_id, sequence, amount_minor, amount_cny_minor,
-                    usd_cny_rate_micros, amount_units, currency,
-                    payment_methods_json, payment_contacts_json, payment_profile_updated_at,
-                    status, due_at, deadline_at, opened_at
-                 ) VALUES ('guarded-invoice', ?1, 1, 500, 3500, 7000000, 500000, 'USD',
-                           '[]', '[]', ?2, 'open', ?2, ?2, ?2)",
-                params![account_id, timestamp],
-            )
-            .expect("insert unsettled guarded invoice");
-        }
-        assert!(matches!(
-            store
-                .seed_legacy_payment_profile(&supplier, &[], None)
-                .await,
-            Err(AppError::Conflict(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn invoice_snapshots_retain_and_authorize_their_payment_assets() {
-        let store = AppStore::new_in_memory_for_tests().expect("test store");
-        let supplier = session("supplier-asset-snapshot", "supplier@example.com");
-        let buyer = session("buyer-asset-snapshot", "buyer@example.com");
-        let now = Utc::now().to_rfc3339();
-        let source_url = "https://example.com/qr.png";
-        let snapshot_asset_id = store
-            .client_market_store_payment_asset(&supplier.user_id, source_url, &[1, 2, 3])
-            .await
-            .expect("store snapshotted payment asset");
-        let snapshot_method = PaymentMethod {
-            kind: "custom".into(),
-            account: None,
-            qr_image_url: None,
-            asset_url: Some(format!("/v1/account/payment-assets/{snapshot_asset_id}")),
-            token: None,
-            chain: None,
-            address: None,
-            instructions: Some("Snapshot instructions".into()),
-            settlement_asset: None,
-        };
-        store
-            .seed_legacy_payment_profile(&supplier, std::slice::from_ref(&snapshot_method), None)
-            .await
-            .expect("configure snapshotted payment asset");
-        store
-            .market_billing_update_supplier_profile(&supplier, "USD", 24)
-            .await
-            .expect("configure snapshot supplier credit profile");
-        {
-            let conn = store.conn.lock().await;
-            crate::market_access::configure_open_test_policy(&conn, &supplier, "USD", 50_000, &now);
-        }
-        store
-            .market_billing_activate_contract(
-                crate::market_billing::ActivateContractInput {
-                    product_kind: "client_host",
-                    product_ref: "asset-snapshot-client",
-                    service_ref: "asset-snapshot-client",
-                    service_label: "Asset Snapshot Client",
-                    buyer_user_id: &buyer.user_id,
-                    buyer_email: &buyer.email,
-                    supplier_user_id: &supplier.user_id,
-                    supplier_email: &supplier.email,
-                    currency: "USD",
-                    daily_rate_minor: 500,
-                    offer_revision: 1,
-                    replacement_of: None,
-                    trial_allowance_seconds: crate::market_billing::TRIAL_SECONDS,
-                },
-                Utc::now(),
-            )
-            .await
-            .expect("activate snapshot billing contract");
-        let snapshot_json =
-            serde_json::to_string(&[snapshot_method]).expect("encode snapshotted payment method");
-        {
-            let conn = store.conn.lock().await;
-            let account_id: String = conn
-                .query_row(
-                    "SELECT id FROM market_credit_accounts
-                     WHERE buyer_user_id = ?1 AND supplier_user_id = ?2",
-                    params![buyer.user_id, supplier.user_id],
-                    |row| row.get(0),
-                )
-                .expect("read snapshot credit account");
-            conn.execute(
-                "INSERT INTO market_invoices (
-                    id, account_id, sequence, amount_minor, amount_cny_minor,
-                    usd_cny_rate_micros, amount_units, currency,
-                    payment_methods_json, payment_contacts_json, payment_profile_updated_at,
-                    status, due_at, deadline_at, opened_at
-                 ) VALUES ('asset-snapshot-invoice', ?1, 1, 500, 3500, 7000000, 500000, 'USD',
-                           ?2, '[]', ?3, 'open', ?3, ?3, ?3)",
-                params![account_id, snapshot_json, now],
-            )
-            .expect("insert payment asset invoice snapshot");
-        }
-
-        let replacement_asset_id = store
-            .client_market_store_payment_asset(&supplier.user_id, source_url, &[4, 5, 6])
-            .await
-            .expect("store replacement payment asset");
-        assert_ne!(snapshot_asset_id, replacement_asset_id);
-        let mut replacement_method = custom_payment_method();
-        replacement_method.asset_url =
-            Some(format!("/v1/account/payment-assets/{replacement_asset_id}"));
-        store
-            .seed_legacy_payment_profile(&supplier, &[replacement_method], None)
-            .await
-            .expect("replace live payment profile");
-        assert_eq!(
-            store
-                .client_market_payment_asset_for_viewer(&snapshot_asset_id, Some(&buyer))
-                .await
-                .expect("invoice buyer reads snapshotted payment asset"),
-            vec![1, 2, 3]
-        );
-        assert_eq!(
-            store
-                .client_market_payment_asset_for_viewer(&replacement_asset_id, Some(&supplier))
-                .await
-                .expect("supplier reads replacement payment asset"),
-            vec![4, 5, 6]
-        );
     }
 }

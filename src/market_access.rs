@@ -24,9 +24,6 @@ pub const MODE_BLACKLIST: &str = "blacklist";
 pub const DECISION_INHERIT: &str = "inherit";
 pub const DECISION_ALLOW: &str = "allow";
 pub const DECISION_DENY: &str = "deny";
-pub const CREDIT_NONE: &str = "none";
-pub const CREDIT_LIMITED: &str = "limited";
-pub const CREDIT_UNLIMITED: &str = "unlimited";
 pub const ACCESS_REQUEST_REQUESTED: &str = "requested";
 pub const ACCESS_REQUEST_APPROVED: &str = "approved";
 pub const ACCESS_REQUEST_REJECTED: &str = "rejected";
@@ -34,27 +31,13 @@ pub const ACCESS_REQUEST_CANCELLED: &str = "cancelled";
 pub const TARGET_SHARE_SEAT: &str = "share_seat";
 pub const TARGET_CLIENT_HOST: &str = "client_host";
 pub const ERROR_MARKET_ACCESS_REQUIRED: &str = "MARKET_ACCESS_REQUIRED";
-pub const ERROR_MARKET_BUYER_RESTRICTED: &str = "MARKET_BUYER_RESTRICTED";
-pub const ERROR_MARKET_SETTLEMENT_REQUIRED: &str = "MARKET_SETTLEMENT_REQUIRED";
-pub const ERROR_MARKET_CREDIT_LIMIT_REACHED: &str = "MARKET_CREDIT_LIMIT_REACHED";
-pub const ERROR_MARKET_RELATIONSHIP_CLOSED: &str = "MARKET_RELATIONSHIP_CLOSED";
-pub const ERROR_MARKET_PREPAID_REQUIRED: &str = "MARKET_PREPAID_REQUIRED";
 
-const MAX_CREDIT_LIMIT_MINOR: i64 = 100_000_000;
 const ACCESS_REQUEST_REAPPLY_COOLDOWN_HOURS: i64 = 24;
 
 #[derive(Debug, Clone)]
 pub struct MarketAccessActor {
     pub user_id: String,
     pub email: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct EffectiveCreditGrant {
-    pub kind: String,
-    pub limit_minor: Option<i64>,
-    pub source: String,
-    pub revision: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -79,26 +62,6 @@ pub struct CounterpartyAccessRuleView {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CreditLineView {
-    pub currency: String,
-    pub kind: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub limit_minor: Option<i64>,
-    pub revision: i64,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CounterpartyExposureView {
-    pub currency: String,
-    pub balance_minor: i64,
-    pub status: String,
-    pub active_service_count: i64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct CounterpartyView {
     pub id: String,
     pub buyer_email: String,
@@ -107,8 +70,6 @@ pub struct CounterpartyView {
     pub status: String,
     pub revision: i64,
     pub access_rules: Vec<CounterpartyAccessRuleView>,
-    pub credit_lines: Vec<CreditLineView>,
-    pub exposures: Vec<CounterpartyExposureView>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -186,22 +147,10 @@ impl MarketEligibilityView {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PublicCreditLineView {
-    pub currency: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub limit_minor: Option<i64>,
-    pub enabled: bool,
-    pub revision: i64,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct MarketAccessDashboardView {
     pub policies: Vec<AccessPolicyView>,
     pub counterparties: Vec<CounterpartyView>,
     pub access_requests: Vec<AccessRequestView>,
-    pub public_credit_lines: Vec<PublicCreditLineView>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -226,20 +175,6 @@ struct ResolveAccessRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ApproveAccessRequest {
-    expected_revision: i64,
-    #[serde(default)]
-    credit_line: Option<ApprovalCreditLineInput>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ApprovalCreditLineInput {
-    currency: String,
-    kind: String,
-    #[serde(default)]
-    limit_minor: Option<i64>,
-    #[serde(default)]
-    risk_acknowledged: bool,
     expected_revision: i64,
 }
 
@@ -267,25 +202,12 @@ pub struct AccessRuleInput {
     pub decision: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CreditLineInput {
-    pub currency: String,
-    pub kind: String,
-    #[serde(default)]
-    pub limit_minor: Option<i64>,
-    #[serde(default)]
-    pub risk_acknowledged: bool,
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct UpsertCounterpartyRequest {
     email: String,
     #[serde(default)]
     access_rules: Vec<AccessRuleInput>,
-    #[serde(default)]
-    credit_lines: Vec<CreditLineInput>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -300,29 +222,6 @@ struct UpdateCounterpartyRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct UpdateCreditLineRequest {
-    kind: String,
-    #[serde(default)]
-    limit_minor: Option<i64>,
-    #[serde(default)]
-    risk_acknowledged: bool,
-    expected_revision: i64,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct BatchCreditLineUpdate {
-    currency: String,
-    kind: String,
-    #[serde(default)]
-    limit_minor: Option<i64>,
-    #[serde(default)]
-    risk_acknowledged: bool,
-    expected_revision: i64,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct BatchCounterpartyUpdate {
     id: String,
     expected_revision: i64,
@@ -330,25 +229,12 @@ struct BatchCounterpartyUpdate {
     access_rules: Vec<AccessRuleInput>,
     #[serde(default)]
     status: Option<String>,
-    #[serde(default)]
-    credit_lines: Vec<BatchCreditLineUpdate>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct BatchCounterpartyUpdateRequest {
     updates: Vec<BatchCounterpartyUpdate>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct UpdatePublicCreditLineRequest {
-    enabled: bool,
-    #[serde(default)]
-    limit_minor: Option<i64>,
-    #[serde(default)]
-    risk_acknowledged: bool,
-    expected_revision: i64,
 }
 
 pub fn router() -> Router<ServerState> {
@@ -370,14 +256,6 @@ pub fn router() -> Router<ServerState> {
         .route(
             "/v1/market-access/counterparties/:id",
             put(update_counterparty),
-        )
-        .route(
-            "/v1/market-access/counterparties/:id/credit-lines/:currency",
-            put(update_credit_line),
-        )
-        .route(
-            "/v1/market-access/public-credit-lines/:currency",
-            put(update_public_credit_line),
         )
         .route("/v1/market-access/requests", post(create_access_request))
         .route(
@@ -468,15 +346,6 @@ fn normalize_decision(value: &str) -> Result<String, AppError> {
     }
 }
 
-pub(crate) fn normalize_currency(value: &str) -> Result<String, AppError> {
-    let currency = value.trim().to_ascii_uppercase();
-    if currency == crate::market_billing::MARKET_CURRENCY {
-        Ok(currency)
-    } else {
-        Err(AppError::BadRequest("currency must be USD".into()))
-    }
-}
-
 fn normalize_email(value: &str) -> Result<String, AppError> {
     let email = value.trim().to_ascii_lowercase();
     if !crate::notifications::is_basic_email(&email) {
@@ -500,62 +369,6 @@ fn clean_resolution_note(value: &str) -> Result<String, AppError> {
         ));
     }
     Ok(value.to_string())
-}
-
-#[cfg(test)]
-fn validate_credit_line(
-    kind: &str,
-    limit_minor: Option<i64>,
-    risk_acknowledged: bool,
-) -> Result<(String, Option<i64>), AppError> {
-    let kind = kind.trim().to_ascii_lowercase();
-    match kind.as_str() {
-        CREDIT_NONE => Ok((kind, None)),
-        CREDIT_LIMITED => {
-            let limit = limit_minor
-                .ok_or_else(|| AppError::BadRequest("limited credit requires limitMinor".into()))?;
-            if !(1..=MAX_CREDIT_LIMIT_MINOR).contains(&limit) {
-                return Err(AppError::BadRequest(format!(
-                    "limitMinor must be between 1 and {MAX_CREDIT_LIMIT_MINOR}"
-                )));
-            }
-            Ok((kind, Some(limit)))
-        }
-        CREDIT_UNLIMITED => {
-            if !risk_acknowledged {
-                return Err(AppError::BadRequest(
-                    "unlimited credit requires riskAcknowledged=true".into(),
-                ));
-            }
-            Ok((kind, None))
-        }
-        _ => Err(AppError::BadRequest(
-            "credit kind must be none, limited, or unlimited".into(),
-        )),
-    }
-}
-
-fn validate_public_credit_line(
-    enabled: bool,
-    limit_minor: Option<i64>,
-    risk_acknowledged: bool,
-) -> Result<Option<i64>, AppError> {
-    if !enabled {
-        return Ok(None);
-    }
-    if !risk_acknowledged {
-        return Err(AppError::BadRequest(
-            "public credit requires riskAcknowledged=true".into(),
-        ));
-    }
-    let limit = limit_minor
-        .ok_or_else(|| AppError::BadRequest("enabled public credit requires limitMinor".into()))?;
-    if !(1..=MAX_CREDIT_LIMIT_MINOR).contains(&limit) {
-        return Err(AppError::BadRequest(format!(
-            "limitMinor must be between 1 and {MAX_CREDIT_LIMIT_MINOR}"
-        )));
-    }
-    Ok(Some(limit))
 }
 
 async fn require_actor(
@@ -701,8 +514,7 @@ fn counterparty_view_tx(conn: &Connection, id: &str) -> Result<CounterpartyView,
                     status: row.get(3)?,
                     revision: row.get(4)?,
                     access_rules: Vec::new(),
-                    credit_lines: Vec::new(),
-                    exposures: Vec::new(),
+
                     created_at: row.get(5)?,
                     updated_at: row.get(6)?,
                 })
@@ -728,58 +540,6 @@ fn counterparty_view_tx(conn: &Connection, id: &str) -> Result<CounterpartyView,
                 .collect::<Result<Vec<_>, _>>()
         })
         .map_err(map_db("read counterparty access rules"))?;
-    view.credit_lines = conn
-        .prepare(
-            "SELECT currency, kind, limit_minor, revision, updated_at
-             FROM market_credit_grants
-             WHERE counterparty_id = ?1 AND currency = 'USD'
-             ORDER BY currency",
-        )
-        .and_then(|mut statement| {
-            statement
-                .query_map(params![id], |row| {
-                    Ok(CreditLineView {
-                        currency: row.get(0)?,
-                        kind: row.get(1)?,
-                        limit_minor: row.get(2)?,
-                        revision: row.get(3)?,
-                        updated_at: row.get(4)?,
-                    })
-                })?
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .map_err(map_db("read counterparty credit lines"))?;
-    if let Some(buyer_user_id) = view.buyer_user_id.as_deref() {
-        view.exposures = conn
-            .prepare(
-                "SELECT account.currency,
-                        (account.balance_units + 86399) / 86400,
-                        account.status,
-                        (SELECT COUNT(*) FROM market_service_contracts contract
-                         WHERE contract.account_id = account.id
-                           AND contract.status IN (
-                               'pending_activation', 'trial', 'active', 'billing_suspended'
-                           ))
-                 FROM market_credit_accounts account
-                 JOIN market_counterparties counterparty ON counterparty.supplier_user_id = account.supplier_user_id
-                 WHERE counterparty.id = ?1 AND account.buyer_user_id = ?2
-                   AND account.currency = 'USD'
-                 ORDER BY account.currency",
-            )
-            .and_then(|mut statement| {
-                statement
-                    .query_map(params![id, buyer_user_id], |row| {
-                        Ok(CounterpartyExposureView {
-                            currency: row.get(0)?,
-                            balance_minor: row.get(1)?,
-                            status: row.get(2)?,
-                            active_service_count: row.get(3)?,
-                        })
-                    })?
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .map_err(map_db("read counterparty exposure"))?;
-    }
     Ok(view)
 }
 
@@ -926,8 +686,7 @@ impl AppStore {
                             status: row.get(3)?,
                             revision: row.get(4)?,
                             access_rules: Vec::new(),
-                            credit_lines: Vec::new(),
-                            exposures: Vec::new(),
+
                             created_at: row.get(5)?,
                             updated_at: row.get(6)?,
                         })
@@ -964,85 +723,8 @@ impl AppStore {
                 map.entry(id).or_default().push(rule);
                 map
             });
-        let mut credit_lines = conn
-            .prepare(
-                "SELECT grant.counterparty_id, grant.currency, grant.kind,
-                        grant.limit_minor, grant.revision, grant.updated_at
-                 FROM market_credit_grants grant
-                 JOIN market_counterparties counterparty ON counterparty.id = grant.counterparty_id
-                 WHERE counterparty.supplier_user_id = ?1 AND grant.currency = 'USD'
-                 ORDER BY grant.counterparty_id, grant.currency",
-            )
-            .and_then(|mut statement| {
-                statement
-                    .query_map(params![actor.user_id], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            CreditLineView {
-                                currency: row.get(1)?,
-                                kind: row.get(2)?,
-                                limit_minor: row.get(3)?,
-                                revision: row.get(4)?,
-                                updated_at: row.get(5)?,
-                            },
-                        ))
-                    })?
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .map_err(map_db("list market counterparty credit lines"))?
-            .into_iter()
-            .fold(HashMap::<String, Vec<_>>::new(), |mut map, (id, line)| {
-                map.entry(id).or_default().push(line);
-                map
-            });
-        let mut exposures = conn
-            .prepare(
-                "SELECT counterparty.id, account.currency,
-                        (account.balance_units + 86399) / 86400,
-                        account.status, COUNT(contract.id)
-                 FROM market_counterparties counterparty
-                 JOIN market_credit_accounts account
-                   ON account.supplier_user_id = counterparty.supplier_user_id
-                  AND account.buyer_user_id = counterparty.buyer_user_id
-                 LEFT JOIN market_service_contracts contract
-                   ON contract.account_id = account.id
-                  AND contract.status IN (
-                      'pending_activation', 'trial', 'active', 'billing_suspended'
-                  )
-                 WHERE counterparty.supplier_user_id = ?1
-                   AND counterparty.buyer_user_id IS NOT NULL
-                   AND account.currency = 'USD'
-                 GROUP BY counterparty.id, account.id
-                 ORDER BY counterparty.id, account.currency",
-            )
-            .and_then(|mut statement| {
-                statement
-                    .query_map(params![actor.user_id], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            CounterpartyExposureView {
-                                currency: row.get(1)?,
-                                balance_minor: row.get(2)?,
-                                status: row.get(3)?,
-                                active_service_count: row.get(4)?,
-                            },
-                        ))
-                    })?
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .map_err(map_db("list market counterparty exposures"))?
-            .into_iter()
-            .fold(
-                HashMap::<String, Vec<_>>::new(),
-                |mut map, (id, exposure)| {
-                    map.entry(id).or_default().push(exposure);
-                    map
-                },
-            );
         for counterparty in &mut counterparties {
             counterparty.access_rules = access_rules.remove(&counterparty.id).unwrap_or_default();
-            counterparty.credit_lines = credit_lines.remove(&counterparty.id).unwrap_or_default();
-            counterparty.exposures = exposures.remove(&counterparty.id).unwrap_or_default();
         }
 
         let access_requests = conn
@@ -1087,47 +769,10 @@ impl AppStore {
                     .collect::<Result<Vec<_>, _>>()
             })
             .map_err(map_db("list market access requests"))?;
-        let mut public_credit_lines = conn
-            .prepare(
-                "SELECT currency, enabled, limit_minor, revision, updated_at
-                 FROM market_public_credit_policies
-                 WHERE supplier_user_id = ?1 AND currency = 'USD'
-                 ORDER BY currency",
-            )
-            .and_then(|mut statement| {
-                statement
-                    .query_map(params![actor.user_id], |row| {
-                        Ok(PublicCreditLineView {
-                            currency: row.get(0)?,
-                            enabled: row.get::<_, i64>(1)? != 0,
-                            limit_minor: row.get(2)?,
-                            revision: row.get(3)?,
-                            updated_at: row.get(4)?,
-                        })
-                    })?
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .map_err(map_db("list public credit policies"))?;
-        for currency in [crate::market_billing::MARKET_CURRENCY] {
-            if !public_credit_lines
-                .iter()
-                .any(|line| line.currency == currency)
-            {
-                public_credit_lines.push(PublicCreditLineView {
-                    currency: currency.into(),
-                    enabled: false,
-                    limit_minor: None,
-                    revision: 0,
-                    updated_at: String::new(),
-                });
-            }
-        }
-        public_credit_lines.sort_by(|left, right| left.currency.cmp(&right.currency));
         Ok(MarketAccessDashboardView {
             policies,
             counterparties,
             access_requests,
-            public_credit_lines,
         })
     }
 }
@@ -1417,24 +1062,8 @@ fn approve_access_request_tx(
     tx: &Connection,
     actor: &MarketAccessActor,
     request: &AccessRequestView,
-    credit_line: Option<&ApprovalCreditLineInput>,
     now: &str,
 ) -> Result<String, AppError> {
-    if credit_line.is_some() {
-        if request.pricing_kind == PRICING_FREE {
-            return Err(AppError::BadRequest(
-                "free market access approval cannot include a credit line".into(),
-            ));
-        }
-        if request.pricing_model == crate::market_recurring::PRICING_PREPAID_CALENDAR_MONTH {
-            return Err(AppError::BadRequest(
-                "prepaid calendar-month access approval cannot include a credit line".into(),
-            ));
-        }
-        return Err(AppError::Gone(
-            "Provider-scoped credit lines are retired; approve access without a credit line".into(),
-        ));
-    }
     let existing = relationship_for_buyer_tx(
         tx,
         &request.supplier_user_id,
@@ -1445,14 +1074,6 @@ fn approve_access_request_tx(
         .as_ref()
         .map(|relationship| relationship.0.clone())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
-    if let Some(credit_line) = credit_line {
-        ensure_credit_line_revision_tx(
-            tx,
-            &relationship_id,
-            &credit_line.currency,
-            credit_line.expected_revision,
-        )?;
-    }
     if let Some((_, bound_user_id, status)) = existing {
         if bound_user_id.is_some_and(|bound| bound != request.buyer_user_id) {
             return Err(AppError::Conflict(
@@ -1465,19 +1086,6 @@ fn approve_access_request_tx(
                 params![relationship_id],
             )
             .map_err(map_db("clear revoked market access rules"))?;
-            tx.execute(
-                "UPDATE market_credit_grants
-                 SET kind = 'none', limit_minor = NULL, revision = revision + 1, updated_at = ?2
-                 WHERE counterparty_id = ?1",
-                params![relationship_id, now],
-            )
-            .map_err(map_db("clear revoked market credit grants"))?;
-            revoke_counterparty_credit_accounts_tx(
-                tx,
-                &request.supplier_user_id,
-                &relationship_id,
-                now,
-            )?;
         }
         tx.execute(
             "UPDATE market_counterparties
@@ -1520,40 +1128,6 @@ fn approve_access_request_tx(
         },
         now,
     )?;
-    if request.pricing_kind == PRICING_PAID {
-        let currency = normalize_currency(
-            request
-                .currency
-                .as_deref()
-                .unwrap_or(crate::market_billing::MARKET_CURRENCY),
-        )?;
-        if let Some(credit_line) = credit_line {
-            if normalize_currency(&credit_line.currency)? != currency {
-                return Err(AppError::BadRequest(
-                    "approval credit currency must match the requested market service".into(),
-                ));
-            }
-            upsert_credit_line_tx(
-                tx,
-                &relationship_id,
-                &CreditLineInput {
-                    currency: credit_line.currency.clone(),
-                    kind: credit_line.kind.clone(),
-                    limit_minor: credit_line.limit_minor,
-                    risk_acknowledged: credit_line.risk_acknowledged,
-                },
-                None,
-                now,
-            )?;
-            apply_counterparty_credit_line_to_accounts_tx(
-                tx,
-                &request.supplier_user_id,
-                &relationship_id,
-                &currency,
-                now,
-            )?;
-        }
-    }
     record_event_tx(
         tx,
         &actor.user_id,
@@ -1565,7 +1139,6 @@ fn approve_access_request_tx(
             "buyerEmail": request.buyer_email,
             "productKind": request.product_kind,
             "pricingKind": request.pricing_kind,
-            "creditGranted": credit_line.is_some(),
         }),
         now,
     )?;
@@ -1577,7 +1150,6 @@ fn approve_access_request_for_actor_tx(
     actor: &MarketAccessActor,
     id: &str,
     expected_revision: i64,
-    credit_line: Option<&ApprovalCreditLineInput>,
     now: &str,
 ) -> Result<(), AppError> {
     let request = access_request_view_tx(tx, id)?;
@@ -1600,7 +1172,7 @@ fn approve_access_request_for_actor_tx(
             "market access request revision changed; reload before approving".into(),
         ));
     }
-    approve_access_request_tx(tx, actor, &request, credit_line, now)?;
+    approve_access_request_tx(tx, actor, &request, now)?;
     let changed = tx
         .execute(
             "UPDATE market_access_requests
@@ -1631,20 +1203,9 @@ async fn approve_access_request(
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin market access approval"))?;
-        approve_access_request_for_actor_tx(
-            &tx,
-            &actor,
-            &id,
-            input.expected_revision,
-            input.credit_line.as_ref(),
-            &now,
-        )?;
+        approve_access_request_for_actor_tx(&tx, &actor, &id, input.expected_revision, &now)?;
         tx.commit()
             .map_err(map_db("commit market access approval"))?;
-    }
-    if input.credit_line.is_some() {
-        let actions = state.store.market_billing_reconcile(Utc::now()).await?;
-        crate::market_billing::dispatch_actions(&state, actions).await;
     }
     Ok(Json(state.store.market_access_dashboard(&actor).await?))
 }
@@ -1934,132 +1495,6 @@ fn upsert_access_rule_tx(
     Ok(())
 }
 
-fn upsert_credit_line_tx(
-    _tx: &Connection,
-    _counterparty_id: &str,
-    _input: &CreditLineInput,
-    _expected_revision: Option<i64>,
-    _now: &str,
-) -> Result<(), AppError> {
-    Err(AppError::Gone(
-        "Provider-scoped credit lines are retired; use the platform wallet".into(),
-    ))
-}
-
-// Seed immutable pre-wallet credit for historical settlement regression tests only.
-#[cfg(test)]
-fn seed_legacy_credit_line_tx(
-    tx: &Connection,
-    counterparty_id: &str,
-    input: &CreditLineInput,
-    expected_revision: Option<i64>,
-    now: &str,
-) -> Result<(), AppError> {
-    let currency = normalize_currency(&input.currency)?;
-    let (kind, limit_minor) =
-        validate_credit_line(&input.kind, input.limit_minor, input.risk_acknowledged)?;
-    if let Some(expected_revision) = expected_revision {
-        ensure_credit_line_revision_tx(tx, counterparty_id, &currency, expected_revision)?;
-    }
-    tx.execute(
-        "INSERT INTO market_credit_grants (
-            counterparty_id, currency, kind, limit_minor, revision, created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, 1, ?5, ?5)
-         ON CONFLICT(counterparty_id, currency) DO UPDATE SET
-            kind = excluded.kind, limit_minor = excluded.limit_minor,
-            revision = market_credit_grants.revision + 1,
-            updated_at = excluded.updated_at",
-        params![counterparty_id, currency, kind, limit_minor, now],
-    )
-    .map_err(map_db("upsert counterparty credit line"))?;
-    Ok(())
-}
-
-fn ensure_credit_line_revision_tx(
-    tx: &Connection,
-    counterparty_id: &str,
-    currency: &str,
-    expected_revision: i64,
-) -> Result<(), AppError> {
-    let currency = normalize_currency(currency)?;
-    let current_revision = tx
-        .query_row(
-            "SELECT revision FROM market_credit_grants
-             WHERE counterparty_id = ?1 AND currency = ?2",
-            params![counterparty_id, currency],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()
-        .map_err(map_db("read credit grant revision"))?
-        .unwrap_or(0);
-    if expected_revision != current_revision {
-        return Err(AppError::Conflict(
-            "credit line revision changed; reload before saving".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn apply_counterparty_credit_line_to_accounts_tx(
-    tx: &Connection,
-    supplier_user_id: &str,
-    counterparty_id: &str,
-    currency: &str,
-    now: &str,
-) -> Result<(String, Option<i64>, i64), AppError> {
-    let currency = normalize_currency(currency)?;
-    let grant = tx
-        .query_row(
-            "SELECT kind, limit_minor, revision FROM market_credit_grants
-             WHERE counterparty_id = ?1 AND currency = ?2",
-            params![counterparty_id, currency],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .map_err(map_db("read updated credit grant"))?;
-    tx.execute(
-        "UPDATE market_credit_accounts
-         SET credit_kind = ?3, credit_limit_minor = ?4,
-             credit_source = 'counterparty', credit_revision = ?5, updated_at = ?6
-         WHERE supplier_user_id = ?1 AND currency = ?2
-           AND (buyer_user_id = (SELECT buyer_user_id FROM market_counterparties WHERE id = ?7)
-                OR buyer_email = (SELECT buyer_email FROM market_counterparties WHERE id = ?7))",
-        params![
-            supplier_user_id,
-            currency,
-            grant.0,
-            grant.1,
-            grant.2,
-            now,
-            counterparty_id,
-        ],
-    )
-    .map_err(map_db("apply credit grant to active accounts"))?;
-    Ok(grant)
-}
-
-fn revoke_counterparty_credit_accounts_tx(
-    tx: &Connection,
-    supplier_user_id: &str,
-    counterparty_id: &str,
-    now: &str,
-) -> Result<usize, AppError> {
-    tx.execute(
-        "UPDATE market_credit_accounts
-         SET credit_kind = 'none', credit_limit_minor = NULL,
-             credit_source = 'counterparty',
-             credit_revision = credit_revision + 1, updated_at = ?2
-         WHERE supplier_user_id = ?1
-           AND (buyer_user_id = (
-                    SELECT buyer_user_id FROM market_counterparties WHERE id = ?3
-                )
-                OR buyer_email = (
-                    SELECT buyer_email FROM market_counterparties WHERE id = ?3
-                ))",
-        params![supplier_user_id, now, counterparty_id],
-    )
-    .map_err(map_db("revoke counterparty credit accounts"))
-}
-
 async fn upsert_counterparty(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -2072,7 +1507,6 @@ async fn upsert_counterparty(
             "cannot add your own account as a market counterparty".into(),
         ));
     }
-    let credit_lines_changed = !input.credit_lines.is_empty();
     let id = {
         let now = Utc::now().to_rfc3339();
         let conn = state.store.conn.lock().await;
@@ -2127,16 +1561,6 @@ async fn upsert_counterparty(
                 )?;
             }
         }
-        for line in &input.credit_lines {
-            upsert_credit_line_tx(&tx, &id, line, None, &now)?;
-            apply_counterparty_credit_line_to_accounts_tx(
-                &tx,
-                &actor.user_id,
-                &id,
-                &line.currency,
-                &now,
-            )?;
-        }
         record_event_tx(
             &tx,
             &actor.user_id,
@@ -2149,10 +1573,6 @@ async fn upsert_counterparty(
         tx.commit().map_err(map_db("commit counterparty upsert"))?;
         id
     };
-    if credit_lines_changed {
-        let actions = state.store.market_billing_reconcile(Utc::now()).await?;
-        crate::market_billing::dispatch_actions(&state, actions).await;
-    }
     let conn = state.store.conn.lock().await;
     Ok(Json(counterparty_view_tx(&conn, &id)?))
 }
@@ -2164,9 +1584,8 @@ fn update_counterparty_tx(
     expected_revision: i64,
     requested_status: Option<&str>,
     access_rules: &[AccessRuleInput],
-    credit_lines: &[BatchCreditLineUpdate],
     now: &str,
-) -> Result<bool, AppError> {
+) -> Result<(), AppError> {
     let current: (String, i64, String, Option<String>, String) = tx
         .query_row(
             "SELECT supplier_user_id, revision, status, buyer_user_id, buyer_email
@@ -2213,7 +1632,6 @@ fn update_counterparty_tx(
         )
         .map_err(map_db("update market counterparty"))?;
     }
-    let credit_revoked = status == "revoked";
     for rule in access_rules {
         upsert_access_rule_tx(tx, id, rule, now)?;
         if status == "active" && rule.decision.trim().eq_ignore_ascii_case(DECISION_ALLOW) {
@@ -2231,19 +1649,6 @@ fn update_counterparty_tx(
             )?;
         }
     }
-    for line in credit_lines {
-        let input = CreditLineInput {
-            currency: line.currency.clone(),
-            kind: line.kind.clone(),
-            limit_minor: line.limit_minor,
-            risk_acknowledged: line.risk_acknowledged,
-        };
-        upsert_credit_line_tx(tx, id, &input, Some(line.expected_revision), now)?;
-        apply_counterparty_credit_line_to_accounts_tx(tx, &actor.user_id, id, &line.currency, now)?;
-    }
-    if credit_revoked {
-        revoke_counterparty_credit_accounts_tx(tx, &actor.user_id, id, now)?;
-    }
     record_event_tx(
         tx,
         &actor.user_id,
@@ -2253,11 +1658,10 @@ fn update_counterparty_tx(
         serde_json::json!({
             "status": status,
             "accessRules": access_rules,
-            "creditCurrencies": credit_lines.iter().map(|line| &line.currency).collect::<Vec<_>>(),
         }),
         now,
     )?;
-    Ok(credit_revoked || !credit_lines.is_empty())
+    Ok(())
 }
 
 async fn update_counterparty(
@@ -2267,29 +1671,23 @@ async fn update_counterparty(
     Json(input): Json<UpdateCounterpartyRequest>,
 ) -> Result<Json<CounterpartyView>, AppError> {
     let actor = require_actor(&state, &headers, "market:access:write").await?;
-    let needs_reconcile = {
+    {
         let now = Utc::now().to_rfc3339();
         let conn = state.store.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin counterparty update"))?;
-        let needs_reconcile = update_counterparty_tx(
+        update_counterparty_tx(
             &tx,
             &actor,
             &id,
             input.expected_revision,
             input.status.as_deref(),
             &input.access_rules,
-            &[],
             &now,
         )?;
         tx.commit().map_err(map_db("commit counterparty update"))?;
-        needs_reconcile
     };
-    if needs_reconcile {
-        let actions = state.store.market_billing_reconcile(Utc::now()).await?;
-        crate::market_billing::dispatch_actions(&state, actions).await;
-    }
     let conn = state.store.conn.lock().await;
     Ok(Json(counterparty_view_tx(&conn, &id)?))
 }
@@ -2315,202 +1713,26 @@ async fn update_counterparties_batch(
             "updates cannot contain duplicate counterparties".into(),
         ));
     }
-    let needs_reconcile = {
+    {
         let now = Utc::now().to_rfc3339();
         let conn = state.store.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin counterparty batch update"))?;
-        let mut needs_reconcile = false;
         for update in &input.updates {
-            needs_reconcile |= update_counterparty_tx(
+            update_counterparty_tx(
                 &tx,
                 &actor,
                 &update.id,
                 update.expected_revision,
                 update.status.as_deref(),
                 &update.access_rules,
-                &update.credit_lines,
                 &now,
             )?;
         }
         tx.commit()
             .map_err(map_db("commit counterparty batch update"))?;
-        needs_reconcile
     };
-    if needs_reconcile {
-        let actions = state.store.market_billing_reconcile(Utc::now()).await?;
-        crate::market_billing::dispatch_actions(&state, actions).await;
-    }
-    Ok(Json(state.store.market_access_dashboard(&actor).await?))
-}
-
-async fn update_credit_line(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Path((id, currency)): Path<(String, String)>,
-    Json(input): Json<UpdateCreditLineRequest>,
-) -> Result<Json<CounterpartyView>, AppError> {
-    let actor = require_actor(&state, &headers, "market:access:write").await?;
-    let currency = normalize_currency(&currency)?;
-    {
-        let now = Utc::now().to_rfc3339();
-        let conn = state.store.conn.lock().await;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(map_db("begin credit line update"))?;
-        let supplier_user_id = tx
-            .query_row(
-                "SELECT supplier_user_id FROM market_counterparties WHERE id = ?1",
-                params![id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(map_db("read credit line counterparty"))?
-            .ok_or_else(|| AppError::NotFound("market counterparty not found".into()))?;
-        if supplier_user_id != actor.user_id {
-            return Err(AppError::Forbidden(
-                "market counterparty belongs to another supplier".into(),
-            ));
-        }
-        upsert_credit_line_tx(
-            &tx,
-            &id,
-            &CreditLineInput {
-                currency: currency.clone(),
-                kind: input.kind,
-                limit_minor: input.limit_minor,
-                risk_acknowledged: input.risk_acknowledged,
-            },
-            Some(input.expected_revision),
-            &now,
-        )?;
-        let grant = apply_counterparty_credit_line_to_accounts_tx(
-            &tx,
-            &actor.user_id,
-            &id,
-            &currency,
-            &now,
-        )?;
-        record_event_tx(
-            &tx,
-            &actor.user_id,
-            Some(&id),
-            &actor.user_id,
-            "credit_line_updated",
-            serde_json::json!({
-                "currency": currency,
-                "kind": grant.0,
-                "limitMinor": grant.1,
-                "revision": grant.2,
-            }),
-            &now,
-        )?;
-        tx.commit().map_err(map_db("commit credit line update"))?;
-    }
-    let actions = state.store.market_billing_reconcile(Utc::now()).await?;
-    crate::market_billing::dispatch_actions(&state, actions).await;
-    let conn = state.store.conn.lock().await;
-    Ok(Json(counterparty_view_tx(&conn, &id)?))
-}
-
-async fn update_public_credit_line(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Path(currency): Path<String>,
-    Json(input): Json<UpdatePublicCreditLineRequest>,
-) -> Result<Json<MarketAccessDashboardView>, AppError> {
-    let actor = require_actor(&state, &headers, "market:access:write").await?;
-    let currency = normalize_currency(&currency)?;
-    let limit_minor =
-        validate_public_credit_line(input.enabled, input.limit_minor, input.risk_acknowledged)?;
-    {
-        let now = Utc::now().to_rfc3339();
-        let conn = state.store.conn.lock().await;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(map_db("begin public credit update"))?;
-        let current = tx
-            .query_row(
-                "SELECT revision, enabled FROM market_public_credit_policies
-             WHERE supplier_user_id = ?1 AND currency = ?2",
-                params![actor.user_id, currency],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? != 0)),
-            )
-            .optional()
-            .map_err(map_db("read public credit revision"))?
-            .unwrap_or((0, false));
-        if input.expected_revision != current.0 {
-            return Err(AppError::Conflict(
-                "public credit revision changed; reload before saving".into(),
-            ));
-        }
-        if input.enabled && !current.1 {
-            return Err(AppError::BadRequest(
-                "public paid credit is retired; allow prepaid access or grant credit to a specific buyer"
-                    .into(),
-            ));
-        }
-        tx.execute(
-            "INSERT INTO market_public_credit_policies (
-            supplier_user_id, supplier_email, currency, enabled, limit_minor,
-            revision, risk_acknowledged_at, created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?7)
-         ON CONFLICT(supplier_user_id, currency) DO UPDATE SET
-            supplier_email = excluded.supplier_email,
-            enabled = excluded.enabled, limit_minor = excluded.limit_minor,
-            revision = market_public_credit_policies.revision + 1,
-            risk_acknowledged_at = excluded.risk_acknowledged_at,
-            updated_at = excluded.updated_at",
-            params![
-                actor.user_id,
-                actor.email,
-                currency,
-                i64::from(input.enabled),
-                limit_minor,
-                if input.enabled {
-                    Some(now.as_str())
-                } else {
-                    None
-                },
-                now,
-            ],
-        )
-        .map_err(map_db("upsert public credit policy"))?;
-        tx.execute(
-            "UPDATE market_credit_accounts
-         SET credit_kind = CASE WHEN ?3 = 1 THEN 'limited' ELSE 'none' END,
-             credit_limit_minor = ?4, credit_source = 'public',
-             credit_revision = (SELECT revision FROM market_public_credit_policies
-                                WHERE supplier_user_id = ?1 AND currency = ?2),
-             updated_at = ?5
-         WHERE supplier_user_id = ?1 AND currency = ?2 AND credit_source = 'public'",
-            params![
-                actor.user_id,
-                currency,
-                i64::from(input.enabled),
-                limit_minor,
-                now,
-            ],
-        )
-        .map_err(map_db("apply public credit policy to active accounts"))?;
-        record_event_tx(
-            &tx,
-            &actor.user_id,
-            None,
-            &actor.user_id,
-            "public_credit_updated",
-            serde_json::json!({
-                "currency": currency,
-                "enabled": input.enabled,
-                "limitMinor": limit_minor,
-            }),
-            &now,
-        )?;
-        tx.commit().map_err(map_db("commit public credit update"))?;
-    }
-    let actions = state.store.market_billing_reconcile(Utc::now()).await?;
-    crate::market_billing::dispatch_actions(&state, actions).await;
     Ok(Json(state.store.market_access_dashboard(&actor).await?))
 }
 
@@ -2782,111 +2004,12 @@ pub(crate) fn set_product_access_decision_tx(
     Ok(relationship_id)
 }
 
-pub(crate) fn effective_credit_grant_tx(
-    conn: &Connection,
-    supplier_user_id: &str,
-    buyer_user_id: &str,
-    buyer_email: &str,
-    product_kind: &str,
-    currency: &str,
-) -> Result<EffectiveCreditGrant, AppError> {
-    let product_kind = normalize_product_kind(product_kind)?;
-    let currency = normalize_currency(currency)?;
-    let buyer_email = normalize_email(buyer_email)?;
-    let mode = access_mode_tx(conn, supplier_user_id, &product_kind, PRICING_PAID)?;
-    if let Some((relationship_id, _, status)) =
-        relationship_for_buyer_tx(conn, supplier_user_id, buyer_user_id, &buyer_email)?
-    {
-        if status != "active" {
-            return Err(AppError::Forbidden(
-                "seller revoked this market relationship".into(),
-            ));
-        }
-        if let Some((kind, limit_minor, revision)) = conn
-            .query_row(
-                "SELECT kind, limit_minor, revision FROM market_credit_grants
-                 WHERE counterparty_id = ?1 AND currency = ?2",
-                params![relationship_id, currency],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<i64>>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(map_db("read counterparty credit grant"))?
-        {
-            return Ok(EffectiveCreditGrant {
-                kind,
-                limit_minor,
-                source: "counterparty".into(),
-                revision,
-            });
-        }
-    }
-    // Public credit is a legacy compatibility rail only.  Existing accounts
-    // retain their snapshotted grant, but a default-open paid market no longer
-    // grants debt capacity to a previously unknown buyer.
-    if let Some((kind, limit_minor, revision)) = conn
-        .query_row(
-            "SELECT credit_kind, credit_limit_minor, credit_revision
-             FROM market_credit_accounts
-             WHERE buyer_user_id = ?1 AND supplier_user_id = ?2 AND currency = ?3
-               AND credit_source = 'public' AND credit_kind != 'none'",
-            params![buyer_user_id, supplier_user_id, currency],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<i64>>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(map_db("read legacy public credit account"))?
-    {
-        return Ok(EffectiveCreditGrant {
-            kind,
-            limit_minor,
-            source: "public".into(),
-            revision,
-        });
-    }
-    if mode == MODE_BLACKLIST
-        && let Some((limit_minor, revision)) = conn
-            .query_row(
-                "SELECT limit_minor, revision FROM market_public_credit_policies
-                 WHERE supplier_user_id = ?1 AND currency = ?2 AND enabled = 1
-                   AND legacy_only = 0",
-                params![supplier_user_id, currency],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-            )
-            .optional()
-            .map_err(map_db("read public credit policy"))?
-    {
-        return Ok(EffectiveCreditGrant {
-            kind: CREDIT_LIMITED.into(),
-            limit_minor: Some(limit_minor),
-            source: "public".into(),
-            revision,
-        });
-    }
-    Ok(EffectiveCreditGrant {
-        kind: CREDIT_NONE.into(),
-        limit_minor: None,
-        source: "counterparty".into(),
-        revision: 0,
-    })
-}
-
 #[cfg(test)]
 pub(crate) fn configure_open_test_policy(
     conn: &Connection,
     supplier: &AuthSession,
-    currency: &str,
-    limit_minor: i64,
+    _currency: &str,
+    _limit_minor: i64,
     now: &str,
 ) {
     // AuthSession fixtures represent users who completed email login. Keep
@@ -2924,16 +2047,6 @@ pub(crate) fn configure_open_test_policy(
             .expect("configure open test access policy");
         }
     }
-    conn.execute(
-        "INSERT INTO market_public_credit_policies (
-            supplier_user_id, supplier_email, currency, enabled, limit_minor,
-            revision, risk_acknowledged_at, created_at, updated_at, legacy_only
-         ) VALUES (?1, ?2, ?3, 1, ?4, 1, ?5, ?5, ?5, 0)
-         ON CONFLICT(supplier_user_id, currency) DO UPDATE SET
-            enabled = 1, limit_minor = excluded.limit_minor, legacy_only = 0",
-        params![supplier.user_id, supplier.email, currency, limit_minor, now],
-    )
-    .expect("configure public test credit");
 }
 
 #[cfg(test)]
@@ -2990,40 +2103,6 @@ mod tests {
             params![seat_id, listing_id, now],
         )
         .expect("insert access request seat");
-    }
-
-    fn insert_monthly_share_target(conn: &Connection, seat_id: &str) {
-        let listing_id = format!("listing-{seat_id}");
-        let share_id = format!("share-{seat_id}");
-        let now = test_request_time().to_rfc3339();
-        conn.execute(
-            "INSERT OR IGNORE INTO supplier_billing_profiles (
-                supplier_user_id, supplier_email, currency, settlement_grace_hours,
-                revision, created_at, updated_at
-             ) VALUES ('supplier', 'supplier@example.com', 'USD', 24, 1, ?1, ?1)",
-            params![now],
-        )
-        .expect("insert monthly supplier billing profile");
-        conn.execute(
-            "INSERT INTO share_market_listings (
-                id, share_id, installation_id, owner_user_id, owner_email,
-                status, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, 'supplier', 'supplier@example.com',
-                       'active', ?4, ?4)",
-            params![listing_id, share_id, format!("installation-{seat_id}"), now],
-        )
-        .expect("insert monthly access request listing");
-        conn.execute(
-            "INSERT INTO share_market_seats (
-                id, listing_id, position, status, token_period_json,
-                daily_rate_minor, pricing_model, cycle_price_minor, billing_interval,
-                currency, offer_revision, created_at, updated_at
-             ) VALUES (?1, ?2, 1, 'available', 'null', NULL,
-                       'prepaid_calendar_month', 1000, 'calendar_month',
-                       'USD', 1, ?3, ?3)",
-            params![seat_id, listing_id, now],
-        )
-        .expect("insert monthly access request seat");
     }
 
     fn share_request_input(seat_id: &str) -> CreateAccessRequest {
@@ -3104,7 +2183,6 @@ mod tests {
                 &other,
                 &request.id,
                 request.revision,
-                None,
                 &now.to_rfc3339(),
             ),
             Err(AppError::Forbidden(_))
@@ -3126,7 +2204,6 @@ mod tests {
                 &supplier,
                 &request.id,
                 0,
-                None,
                 &now.to_rfc3339(),
             ),
             Err(AppError::Conflict(_))
@@ -3167,130 +2244,6 @@ mod tests {
     }
 
     #[test]
-    fn paid_approval_rejects_legacy_credit_before_any_relationship_mutation() {
-        for mode in ["disabled", "shadow", "enabled"] {
-            let conn = access_request_connection();
-            conn.execute(
-                "UPDATE market_finance_control SET mode = ?1 WHERE id = 1",
-                params![mode],
-            )
-            .unwrap();
-            insert_paid_share_target(&conn, "seat-wallet-access");
-            let buyer = test_actor("buyer", "buyer@example.com");
-            let supplier = test_actor("supplier", "supplier@example.com");
-            let now = test_request_time();
-            let request = create_access_request_tx(
-                &conn,
-                &buyer,
-                &share_request_input("seat-wallet-access"),
-                now,
-            )
-            .unwrap();
-            let line = ApprovalCreditLineInput {
-                currency: "USD".into(),
-                kind: CREDIT_LIMITED.into(),
-                limit_minor: Some(7000),
-                risk_acknowledged: false,
-                expected_revision: 0,
-            };
-            assert!(matches!(
-                approve_access_request_for_actor_tx(
-                    &conn,
-                    &supplier,
-                    &request.id,
-                    request.revision,
-                    Some(&line),
-                    &now.to_rfc3339()
-                ),
-                Err(AppError::Gone(_))
-            ));
-            assert!(
-                relationship_for_buyer_tx(&conn, &supplier.user_id, &buyer.user_id, &buyer.email)
-                    .unwrap()
-                    .is_none()
-            );
-            assert_eq!(
-                access_request_view_tx(&conn, &request.id).unwrap().status,
-                ACCESS_REQUEST_REQUESTED
-            );
-            approve_access_request_for_actor_tx(
-                &conn,
-                &supplier,
-                &request.id,
-                request.revision,
-                None,
-                &now.to_rfc3339(),
-            )
-            .unwrap();
-            assert!(
-                market_eligibility_tx(
-                    &conn,
-                    &supplier.user_id,
-                    &buyer.user_id,
-                    &buyer.email,
-                    PRODUCT_SHARE,
-                    Some(1000),
-                    Some("USD")
-                )
-                .unwrap()
-                .allowed
-            );
-        }
-    }
-    #[test]
-    fn paid_approval_without_credit_creates_a_prepaid_only_relationship() {
-        let conn = access_request_connection();
-        insert_paid_share_target(&conn, "seat-prepaid-only");
-        let buyer = test_actor("buyer", "buyer@example.com");
-        let supplier = test_actor("supplier", "supplier@example.com");
-        let now = test_request_time();
-        let request = create_access_request_tx(
-            &conn,
-            &buyer,
-            &share_request_input("seat-prepaid-only"),
-            now,
-        )
-        .expect("create prepaid-only approval request");
-
-        let tx = conn.transaction().expect("begin prepaid-only approval");
-        approve_access_request_for_actor_tx(
-            &tx,
-            &supplier,
-            &request.id,
-            request.revision,
-            None,
-            &(now + Duration::minutes(1)).to_rfc3339(),
-        )
-        .expect("approve paid access without credit");
-        tx.commit().expect("commit prepaid-only approval");
-
-        let grant = effective_credit_grant_tx(
-            &conn,
-            &supplier.user_id,
-            &buyer.user_id,
-            &buyer.email,
-            PRODUCT_SHARE,
-            "USD",
-        )
-        .expect("resolve prepaid-only funding");
-        assert_eq!(grant.kind, CREDIT_NONE);
-        assert_eq!(grant.limit_minor, None);
-        assert_eq!(grant.source, "counterparty");
-        let eligibility = market_eligibility_tx(
-            &conn,
-            &supplier.user_id,
-            &buyer.user_id,
-            &buyer.email,
-            PRODUCT_SHARE,
-            Some(1_000),
-            Some("USD"),
-        )
-        .expect("read prepaid-only eligibility");
-        assert!(eligibility.allowed);
-        assert_eq!(eligibility.status, "allowed");
-    }
-
-    #[test]
     fn wallet_paid_access_needs_product_permission_but_not_legacy_credit_or_settlement() {
         let conn = access_request_connection();
         insert_paid_share_target(&conn, "seat-wallet-access");
@@ -3326,7 +2279,6 @@ mod tests {
             &supplier,
             &request.id,
             request.revision,
-            None,
             &now.to_rfc3339(),
         )
         .unwrap();
@@ -3342,277 +2294,6 @@ mod tests {
         .unwrap();
         assert!(after.allowed);
         assert_eq!(after.status, "allowed");
-        let credit = upsert_credit_line_tx(
-            &conn,
-            &request.id,
-            &CreditLineInput {
-                currency: "USD".into(),
-                kind: CREDIT_LIMITED.into(),
-                limit_minor: Some(1_000),
-                risk_acknowledged: false,
-            },
-            None,
-            &now.to_rfc3339(),
-        );
-        assert!(matches!(credit, Err(AppError::Gone(_))));
-    }
-
-    #[test]
-    fn monthly_approval_rejects_injected_credit_without_side_effects() {
-        let conn = access_request_connection();
-        insert_monthly_share_target(&conn, "seat-monthly-credit-injection");
-        let buyer = test_actor("buyer", "buyer@example.com");
-        let supplier = test_actor("supplier", "supplier@example.com");
-        let now = test_request_time();
-        let now_text = now.to_rfc3339();
-        conn.execute(
-            "INSERT INTO market_counterparties (
-                id, supplier_user_id, supplier_email, buyer_user_id, buyer_email,
-                status, revision, created_at, updated_at
-             ) VALUES ('monthly-existing-relationship', 'supplier', 'supplier@example.com',
-                       'buyer', 'buyer@example.com', 'active', 1, ?1, ?1)",
-            params![now_text],
-        )
-        .expect("insert existing monthly relationship");
-        seed_legacy_credit_line_tx(
-            &conn,
-            "monthly-existing-relationship",
-            &CreditLineInput {
-                currency: "USD".into(),
-                kind: CREDIT_LIMITED.into(),
-                limit_minor: Some(5_000),
-                risk_acknowledged: false,
-            },
-            Some(0),
-            &now_text,
-        )
-        .expect("insert existing credit line");
-        let request = create_access_request_tx(
-            &conn,
-            &buyer,
-            &share_request_input("seat-monthly-credit-injection"),
-            now,
-        )
-        .expect("create monthly access request");
-        assert_eq!(
-            request.pricing_model,
-            crate::market_recurring::PRICING_PREPAID_CALENDAR_MONTH
-        );
-
-        let error = approve_access_request_for_actor_tx(
-            &conn,
-            &supplier,
-            &request.id,
-            request.revision,
-            Some(&ApprovalCreditLineInput {
-                currency: "USD".into(),
-                kind: CREDIT_LIMITED.into(),
-                limit_minor: Some(9_000),
-                risk_acknowledged: false,
-                expected_revision: 1,
-            }),
-            &(now + Duration::minutes(1)).to_rfc3339(),
-        )
-        .expect_err("monthly approval must reject an injected credit line");
-        assert!(matches!(error, AppError::BadRequest(_)));
-
-        let relationship: (String, i64) = conn
-            .query_row(
-                "SELECT status, revision FROM market_counterparties
-                 WHERE id = 'monthly-existing-relationship'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .expect("read unchanged monthly relationship");
-        assert_eq!(relationship, ("active".into(), 1));
-        let credit: (String, Option<i64>, i64) = conn
-            .query_row(
-                "SELECT kind, limit_minor, revision FROM market_credit_grants
-                 WHERE counterparty_id = 'monthly-existing-relationship' AND currency = 'USD'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .expect("read unchanged monthly credit line");
-        assert_eq!(credit, (CREDIT_LIMITED.into(), Some(5_000), 1));
-        let rule_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM market_counterparty_access_rules
-                 WHERE counterparty_id = 'monthly-existing-relationship'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("count monthly access rules");
-        assert_eq!(rule_count, 0);
-        let unchanged_request =
-            access_request_view_tx(&conn, &request.id).expect("read unchanged monthly request");
-        assert_eq!(unchanged_request.status, ACCESS_REQUEST_REQUESTED);
-        assert_eq!(unchanged_request.revision, request.revision);
-    }
-
-    #[test]
-    fn paid_approval_rejects_unlimited_credit_without_granting_access() {
-        let conn = access_request_connection();
-        insert_paid_share_target(&conn, "seat-unlimited");
-        let buyer = test_actor("buyer", "buyer@example.com");
-        let supplier = test_actor("supplier", "supplier@example.com");
-        let now = test_request_time();
-        let request =
-            create_access_request_tx(&conn, &buyer, &share_request_input("seat-unlimited"), now)
-                .unwrap();
-        let line = ApprovalCreditLineInput {
-            currency: "USD".into(),
-            kind: CREDIT_UNLIMITED.into(),
-            limit_minor: None,
-            risk_acknowledged: true,
-            expected_revision: 0,
-        };
-        assert!(matches!(
-            approve_access_request_for_actor_tx(
-                &conn,
-                &supplier,
-                &request.id,
-                request.revision,
-                Some(&line),
-                &now.to_rfc3339()
-            ),
-            Err(AppError::Gone(_))
-        ));
-        assert!(
-            !market_eligibility_tx(
-                &conn,
-                &supplier.user_id,
-                &buyer.user_id,
-                &buyer.email,
-                PRODUCT_SHARE,
-                Some(1000),
-                Some("USD")
-            )
-            .unwrap()
-            .allowed
-        );
-    }
-    #[test]
-    fn approving_revoked_relationship_clears_old_scopes_and_credit() {
-        let conn = access_request_connection();
-        insert_paid_share_target(&conn, "seat-reactivation");
-        let buyer = test_actor("buyer", "buyer@example.com");
-        let supplier = test_actor("supplier", "supplier@example.com");
-        let now = test_request_time();
-        let now_text = now.to_rfc3339();
-        conn.execute(
-            "INSERT INTO market_counterparties (
-                id, supplier_user_id, supplier_email, buyer_user_id, buyer_email,
-                status, revision, created_at, updated_at, revoked_at
-             ) VALUES ('revoked-relationship', 'supplier', 'supplier@example.com',
-                       'buyer', 'buyer@example.com', 'revoked', 4, ?1, ?1, ?1)",
-            params![now_text],
-        )
-        .expect("insert revoked relationship");
-        for (product_kind, pricing_kind) in [
-            (PRODUCT_SHARE, PRICING_FREE),
-            (PRODUCT_CLIENT_HOST, PRICING_PAID),
-        ] {
-            upsert_access_rule_tx(
-                &conn,
-                "revoked-relationship",
-                &AccessRuleInput {
-                    product_kind: product_kind.into(),
-                    pricing_kind: pricing_kind.into(),
-                    decision: DECISION_ALLOW.into(),
-                },
-                &now_text,
-            )
-            .expect("insert stale access rule");
-        }
-        seed_legacy_credit_line_tx(
-            &conn,
-            "revoked-relationship",
-            &CreditLineInput {
-                currency: "USD".into(),
-                kind: CREDIT_LIMITED.into(),
-                limit_minor: Some(50_000),
-                risk_acknowledged: false,
-            },
-            Some(0),
-            &now_text,
-        )
-        .expect("insert stale credit grant");
-        conn.execute(
-            "INSERT INTO market_credit_accounts (
-                id, buyer_user_id, buyer_email, supplier_user_id, supplier_email,
-                currency, status, balance_units, credit_kind, credit_limit_minor,
-                credit_source, credit_revision, version, created_at, updated_at
-             ) VALUES ('stale-account', 'buyer', 'buyer@example.com', 'supplier',
-                       'supplier@example.com', 'USD', 'active', 0, 'limited', 50000,
-                       'counterparty', 1, 1, ?1, ?1)",
-            params![now_text],
-        )
-        .expect("insert stale credit account");
-
-        let request = create_access_request_tx(
-            &conn,
-            &buyer,
-            &share_request_input("seat-reactivation"),
-            now,
-        )
-        .expect("create reactivation request");
-        approve_access_request_for_actor_tx(
-            &conn,
-            &supplier,
-            &request.id,
-            request.revision,
-            None,
-            &(now + Duration::minutes(1)).to_rfc3339(),
-        )
-        .expect("approve reactivation request");
-
-        let relationship: (String, i64, Option<String>) = conn
-            .query_row(
-                "SELECT status, revision, revoked_at FROM market_counterparties
-                 WHERE id = 'revoked-relationship'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .expect("read reactivated relationship");
-        assert_eq!(relationship, ("active".into(), 5, None));
-        let rules: Vec<(String, String, String)> = conn
-            .prepare(
-                "SELECT product_kind, pricing_kind, decision
-                 FROM market_counterparty_access_rules
-                 WHERE counterparty_id = 'revoked-relationship'",
-            )
-            .and_then(|mut statement| {
-                statement
-                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-                    .collect()
-            })
-            .expect("read reset access rules");
-        assert_eq!(
-            rules,
-            vec![(
-                PRODUCT_SHARE.into(),
-                PRICING_PAID.into(),
-                DECISION_ALLOW.into(),
-            )]
-        );
-        let credit: (String, Option<i64>, i64) = conn
-            .query_row(
-                "SELECT kind, limit_minor, revision FROM market_credit_grants
-                 WHERE counterparty_id = 'revoked-relationship' AND currency = 'USD'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .expect("read reset credit grant");
-        assert_eq!(credit, (CREDIT_NONE.into(), None, 2));
-        let account_credit: (String, Option<i64>) = conn
-            .query_row(
-                "SELECT credit_kind, credit_limit_minor FROM market_credit_accounts
-                 WHERE id = 'stale-account'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .expect("read reset account credit");
-        assert_eq!(account_credit, (CREDIT_NONE.into(), None));
     }
 
     #[test]
@@ -3649,7 +2330,6 @@ mod tests {
                 1,
                 None,
                 std::slice::from_ref(&rule),
-                &[],
                 &now,
             )
             .expect("apply first batch update");
@@ -3661,7 +2341,6 @@ mod tests {
                     0,
                     None,
                     std::slice::from_ref(&rule),
-                    &[],
                     &now,
                 ),
                 Err(AppError::Conflict(_))
@@ -3830,28 +2509,8 @@ mod tests {
         assert_eq!(default_access_mode(PRICING_FREE), MODE_BLACKLIST);
         assert_eq!(default_access_mode(PRICING_PAID), MODE_WHITELIST);
         assert!(validate_policy_transition(MODE_WHITELIST, MODE_BLACKLIST, false).is_err());
-        validate_policy_transition(MODE_WHITELIST, MODE_BLACKLIST, true)
-            .expect("acknowledge blacklist transition");
-        validate_policy_transition(MODE_BLACKLIST, MODE_BLACKLIST, false)
-            .expect("implicit free blacklist needs no acknowledgement");
-        assert!(validate_public_credit_line(true, Some(10_000), false).is_err());
-        assert!(validate_public_credit_line(true, None, true).is_err());
-        assert_eq!(
-            validate_public_credit_line(true, Some(10_000), true)
-                .expect("acknowledge finite public credit"),
-            Some(10_000)
-        );
-        assert_eq!(
-            validate_public_credit_line(false, Some(10_000), false)
-                .expect("disabled public credit ignores stale input"),
-            None
-        );
-    }
-
-    #[test]
-    fn market_credit_accepts_only_usd() {
-        assert_eq!(normalize_currency(" usd ").expect("normalize USD"), "USD");
-        assert!(normalize_currency("CNY").is_err());
+        validate_policy_transition(MODE_WHITELIST, MODE_BLACKLIST, true).unwrap();
+        validate_policy_transition(MODE_BLACKLIST, MODE_BLACKLIST, false).unwrap();
     }
 
     #[test]
@@ -3905,201 +2564,6 @@ mod tests {
     }
 
     #[test]
-    fn explicit_credit_is_resolved_and_new_public_credit_is_ignored() {
-        let conn = access_connection();
-        let now = Utc::now().to_rfc3339();
-        let relationship_id = set_product_access_decision_tx(
-            &conn,
-            "supplier",
-            "supplier@example.com",
-            "buyer",
-            "buyer@example.com",
-            PRODUCT_CLIENT_HOST,
-            PRICING_PAID,
-            DECISION_ALLOW,
-            "supplier",
-            &now,
-        )
-        .expect("create trusted buyer");
-        seed_legacy_credit_line_tx(
-            &conn,
-            &relationship_id,
-            &CreditLineInput {
-                currency: "USD".into(),
-                kind: CREDIT_LIMITED.into(),
-                limit_minor: Some(25_000),
-                risk_acknowledged: false,
-            },
-            Some(0),
-            &now,
-        )
-        .expect("grant limited credit");
-        let grant = effective_credit_grant_tx(
-            &conn,
-            "supplier",
-            "buyer",
-            "buyer@example.com",
-            PRODUCT_CLIENT_HOST,
-            "USD",
-        )
-        .expect("resolve limited credit");
-        assert_eq!(grant.kind, CREDIT_LIMITED);
-        assert_eq!(grant.limit_minor, Some(25_000));
-        assert_eq!(grant.source, "counterparty");
-        assert!(validate_credit_line(CREDIT_UNLIMITED, None, false).is_err());
-        assert_eq!(
-            validate_credit_line(CREDIT_UNLIMITED, Some(99), true)
-                .expect("acknowledge unlimited private credit"),
-            (CREDIT_UNLIMITED.into(), None)
-        );
-
-        conn.execute(
-            "INSERT INTO market_supplier_access_policies (
-                supplier_user_id, supplier_email, product_kind, pricing_kind, mode, revision,
-                risk_acknowledged_at, created_at, updated_at
-             ) VALUES ('public-supplier', 'public@example.com', 'share', 'paid', 'blacklist',
-                       1, ?1, ?1, ?1)",
-            params![now],
-        )
-        .expect("enable acknowledged blacklist policy");
-        conn.execute(
-            "INSERT INTO market_public_credit_policies (
-                supplier_user_id, supplier_email, currency, enabled, limit_minor,
-                revision, risk_acknowledged_at, created_at, updated_at
-             ) VALUES ('public-supplier', 'public@example.com', 'USD', 1, 5000,
-                       1, ?1, ?1, ?1)",
-            params![now],
-        )
-        .expect("configure finite public credit");
-        let public_grant = effective_credit_grant_tx(
-            &conn,
-            "public-supplier",
-            "unknown-buyer",
-            "unknown@example.com",
-            PRODUCT_SHARE,
-            "USD",
-        )
-        .expect("resolve unknown buyer funding");
-        assert_eq!(public_grant.kind, CREDIT_NONE);
-        assert_eq!(public_grant.limit_minor, None);
-        assert_eq!(public_grant.source, "counterparty");
-    }
-
-    #[test]
-    fn revoking_counterparty_credit_only_updates_matching_accounts() {
-        let conn = access_connection();
-        let now = Utc::now().to_rfc3339();
-        conn.execute(
-            "INSERT INTO market_counterparties (
-                id, supplier_user_id, supplier_email, buyer_user_id, buyer_email,
-                status, revision, created_at, updated_at
-             ) VALUES ('relationship', 'supplier', 'supplier@example.com', 'buyer',
-                       'buyer@example.com', 'revoked', 2, ?1, ?1)",
-            params![now],
-        )
-        .expect("insert revoked counterparty");
-        for (id, buyer_user_id, buyer_email) in [
-            ("matching", "buyer", "buyer@example.com"),
-            ("other", "other-buyer", "other@example.com"),
-        ] {
-            conn.execute(
-                "INSERT INTO market_credit_accounts (
-                    id, buyer_user_id, buyer_email, supplier_user_id, supplier_email,
-                    currency, status, balance_units, credit_kind, credit_limit_minor,
-                    credit_source, credit_revision, version, created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, 'supplier', 'supplier@example.com', 'USD',
-                           'active', 0, 'limited', 10000, 'counterparty', 4, 1, ?4, ?4)",
-                params![id, buyer_user_id, buyer_email, now],
-            )
-            .expect("insert credit account");
-        }
-
-        assert_eq!(
-            revoke_counterparty_credit_accounts_tx(&conn, "supplier", "relationship", &now)
-                .expect("revoke matching credit"),
-            1
-        );
-        let matching: (String, Option<i64>, i64) = conn
-            .query_row(
-                "SELECT credit_kind, credit_limit_minor, credit_revision
-                 FROM market_credit_accounts WHERE id = 'matching'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .expect("read revoked account");
-        assert_eq!(matching, (CREDIT_NONE.into(), None, 5));
-        let other: String = conn
-            .query_row(
-                "SELECT credit_kind FROM market_credit_accounts WHERE id = 'other'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("read unrelated account");
-        assert_eq!(other, CREDIT_LIMITED);
-    }
-
-    #[test]
-    fn applying_private_credit_refreshes_an_existing_public_account() {
-        let conn = access_connection();
-        let now = Utc::now().to_rfc3339();
-        conn.execute(
-            "INSERT INTO market_counterparties (
-                id, supplier_user_id, supplier_email, buyer_user_id, buyer_email,
-                status, revision, created_at, updated_at
-             ) VALUES ('relationship', 'supplier', 'supplier@example.com', 'buyer',
-                       'buyer@example.com', 'active', 1, ?1, ?1)",
-            params![now],
-        )
-        .expect("insert active counterparty");
-        conn.execute(
-            "INSERT INTO market_credit_accounts (
-                id, buyer_user_id, buyer_email, supplier_user_id, supplier_email,
-                currency, status, balance_units, credit_kind, credit_limit_minor,
-                credit_source, credit_revision, version, created_at, updated_at
-             ) VALUES ('account', 'buyer', 'buyer@example.com', 'supplier',
-                       'supplier@example.com', 'USD', 'active', 0, 'limited', 5000,
-                       'public', 3, 1, ?1, ?1)",
-            params![now],
-        )
-        .expect("insert existing public credit account");
-        seed_legacy_credit_line_tx(
-            &conn,
-            "relationship",
-            &CreditLineInput {
-                currency: "USD".into(),
-                kind: CREDIT_UNLIMITED.into(),
-                limit_minor: None,
-                risk_acknowledged: true,
-            },
-            Some(0),
-            &now,
-        )
-        .expect("grant private unlimited credit");
-
-        let grant = apply_counterparty_credit_line_to_accounts_tx(
-            &conn,
-            "supplier",
-            "relationship",
-            "USD",
-            &now,
-        )
-        .expect("apply private credit to existing account");
-        assert_eq!(grant, (CREDIT_UNLIMITED.into(), None, 1));
-        let account: (String, Option<i64>, String, i64) = conn
-            .query_row(
-                "SELECT credit_kind, credit_limit_minor, credit_source, credit_revision
-                 FROM market_credit_accounts WHERE id = 'account'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .expect("read refreshed credit account");
-        assert_eq!(
-            account,
-            (CREDIT_UNLIMITED.into(), None, "counterparty".into(), 1)
-        );
-    }
-
-    #[test]
     fn update_requests_require_expected_revision() {
         assert!(
             serde_json::from_value::<UpdatePolicyRequest>(serde_json::json!({
@@ -4110,18 +2574,6 @@ mod tests {
         assert!(
             serde_json::from_value::<UpdateCounterpartyRequest>(serde_json::json!({
                 "accessRules": []
-            }))
-            .is_err()
-        );
-        assert!(
-            serde_json::from_value::<UpdateCreditLineRequest>(serde_json::json!({
-                "kind": "none"
-            }))
-            .is_err()
-        );
-        assert!(
-            serde_json::from_value::<UpdatePublicCreditLineRequest>(serde_json::json!({
-                "enabled": false
             }))
             .is_err()
         );

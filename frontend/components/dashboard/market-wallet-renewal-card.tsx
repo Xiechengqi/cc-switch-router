@@ -62,13 +62,14 @@ export function MarketWalletRenewalCard({
   if (!contract && !error) return <span className="inline-flex items-center gap-2 text-xs text-muted-foreground"><Loader2 className="h-3.5 w-3.5 animate-spin" />{t("common.loading")}</span>;
   if (!contract) return <div className="flex flex-wrap items-center gap-2 text-xs text-destructive"><span role="alert">{error}</span><Button size="sm" variant="ghost" onPress={() => setAttempt((value) => value + 1)}><RefreshCw className="h-3.5 w-3.5" />{t("common.retry")}</Button></div>;
 
-  const canChange = contract.status === "trialing" || contract.status === "active";
+  const canChange = contract.status === "trialing" || contract.status === "active"
+    || (contract.status === "suspended" && contract.renewalPolicy === "automatic");
   const nextDate = contract.periodEnd && Number.isFinite(Date.parse(contract.periodEnd))
     ? new Intl.DateTimeFormat(locale, { dateStyle: "medium" }).format(new Date(contract.periodEnd))
     : null;
   return <div className={`flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2 rounded-md border border-border bg-card ${compact ? "px-2 py-1.5 text-xs" : "px-3 py-2 text-sm"}`} data-no-card-open>
     <span className="inline-flex items-center gap-1.5"><CalendarClock className="h-4 w-4 text-muted-foreground" />
-      <strong>{formatUsdMoney(contract.cyclePriceMinor, locale)} / {t("marketBilling.month")}</strong>
+      <strong>{formatUsdMoney(contract.cyclePriceMinor, locale)} / {t("market.month")}</strong>
     </span>
     <span className="text-muted-foreground">{t(walletLifecycleKey(contract), { hours: trialHours(contract.trialSecondsRemaining, locale), date: nextDate || "—" })}</span>
     <span className="text-muted-foreground">{contract.renewalPolicy === "automatic"

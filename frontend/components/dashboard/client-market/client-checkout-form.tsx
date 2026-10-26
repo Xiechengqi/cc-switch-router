@@ -214,7 +214,7 @@ export function ClientCheckoutForm({
         <p role="alert" className="text-sm text-destructive">
           {t("clientCheckout.unsupported")}
         </p>
-      ) : quote.walletFunding ? (
+      ) : state.paid && quote.walletFunding ? (
         <div className="grid gap-2 border-t border-border pt-4 text-sm">
           <div className="flex items-baseline justify-between gap-3">
             <span className="text-muted-foreground">

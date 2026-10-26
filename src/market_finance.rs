@@ -2,9 +2,7 @@
 
 use crate::db::{Connection, OptionalExtension, params};
 use crate::error::AppError;
-use crate::market_wallet::{
-    Posting, capture_hold_tx, debit_available_tx, post_journal_tx, serialize_units,
-};
+use crate::market_wallet::{Posting, capture_hold_tx, post_journal_tx, serialize_units};
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use uuid::Uuid;
@@ -180,7 +178,8 @@ fn insert_slice_and_lot_tx(
     Ok(id)
 }
 
-/// Use only for persisted, billable metered service intervals. The debit and
+#[cfg(test)]
+/// Fixture helper for historical direct-debit evidence. The debit and
 /// earning lot share one journal, so there is no Provider credit without cash.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_metered_delivery_tx(
@@ -206,7 +205,7 @@ pub(crate) fn record_metered_delivery_tx(
     )? {
         return Ok(id);
     }
-    let journal = debit_available_tx(
+    let journal = crate::market_wallet::debit_available_tx(
         conn,
         buyer,
         amount_units,
@@ -456,7 +455,7 @@ fn notify_providers_for_lots_tx(
             &format!("earnings_held:{reason_kind}:{reason_ref}:{provider}"),
             serde_json::json!({
                 "reason": reason_kind,
-                "amountMinor": units / crate::market_billing::MONEY_UNITS_PER_MINOR,
+                "amountMinor": units / crate::market_common::MONEY_UNITS_PER_MINOR,
             }),
             time,
         )?;

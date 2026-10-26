@@ -39,14 +39,14 @@ test("grant polling stays on until pending grants finish", () => {
   ]), true);
 });
 
-test("attention covers failures, integrity, and pending price changes", () => {
+test("attention covers failures and integrity", () => {
   assert.equal(needsRentalAttention(subscription("a", "grant_failed")), true);
   assert.equal(needsRentalAttention(subscription("b", "billing_suspended")), true);
   assert.equal(needsRentalAttention(subscription("c", "revoke_failed")), true);
   assert.equal(needsRentalAttention(subscription("d", "billing_control_failed")), true);
   assert.equal(needsRentalAttention(subscription("e", "active_free", { integrityState: "violated" })), true);
   assert.equal(needsRentalAttention(subscription("f", "active_postpaid", {
-    priceChange: { id: "pc", status: "pending" } as ShareMarketSubscription["priceChange"],
+    integrityState: "violated",
   })), true);
   assert.equal(needsRentalAttention(subscription("g", "grant_pending")), false);
   assert.equal(needsRentalAttention(subscription("h", "active_free")), false);
@@ -55,8 +55,8 @@ test("attention covers failures, integrity, and pending price changes", () => {
 
 test("partitions grant_failed into attention and released into history", () => {
   const failed = subscription("failed", "grant_failed");
-  const pendingPrice = subscription("price", "active_postpaid", {
-    priceChange: { id: "pc", status: "pending" } as ShareMarketSubscription["priceChange"],
+  const integrityViolation = subscription("integrity", "active_postpaid", {
+    integrityState: "violated",
   });
   const healthy = subscription("live", "active_free");
   const granting = subscription("granting", "grant_pending");
@@ -66,10 +66,10 @@ test("partitions grant_failed into attention and released into history", () => {
     healthy,
     failed,
     granting,
-    pendingPrice,
+    integrityViolation,
   ]);
 
-  assert.deepEqual(partitioned.attention.map((item) => item.id), ["failed", "price"]);
+  assert.deepEqual(partitioned.attention.map((item) => item.id), ["failed", "integrity"]);
   assert.deepEqual(partitioned.active.map((item) => item.id), ["granting", "live"]);
   assert.deepEqual(partitioned.history.map((item) => item.id), ["done"]);
 });

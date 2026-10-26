@@ -101,15 +101,6 @@ export function needsOwnedSeatAttention(
   return !!seat.subscription && needsRentalAttention(seat.subscription);
 }
 
-export function isPriceOnlySeatAttention(
-  seat: Pick<ShareMarketSeat, "subscription">,
-) {
-  const subscription = seat.subscription;
-  if (!subscription || subscription.priceChange?.status !== "pending") return false;
-  if (subscription.integrityState != null && subscription.integrityState !== "compatible") return false;
-  return !needsRentalAttention({ ...subscription, priceChange: undefined });
-}
-
 function bySeatPosition<T extends Pick<ShareMarketSeat, "position">>(left: T, right: T) {
   return left.position - right.position;
 }

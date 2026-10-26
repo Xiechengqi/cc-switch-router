@@ -143,7 +143,7 @@ export function CatalogSeatPreview({
         )}
       </span>
       <strong className="shrink-0 tabular-nums text-slate-800">
-        {formatSeatPrice(seat, locale, t("shareMarket.free"), t("marketBilling.day"))}
+        {formatSeatPrice(seat, locale, t("shareMarket.free"), t("market.day"))}
       </strong>
       {showRent ? (
         <button
@@ -288,7 +288,7 @@ export function MarketShareCard({
   });
   const subdomain = listing.subdomain?.trim() || listing.shareName;
   const interactive = !!onOpen;
-  const price = listingPriceSummary(listing, locale, t("shareMarket.free"), t("marketBilling.day"));
+  const price = listingPriceSummary(listing, locale, t("shareMarket.free"), t("market.day"));
   const priceLabel = price.isFrom
     ? t("shareMarket.catalog.fromPrice", { price: price.price })
     : price.price;

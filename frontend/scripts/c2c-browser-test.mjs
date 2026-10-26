@@ -27,7 +27,7 @@ try {
   let topupMode = "shadow"; let publicationReady = true; let retiredSetupRequests = 0; let offerWrites = 0;
   const publicationHost = { id: "publication-host", providerId: "seller", hostOwnerEmail: "seller@example.invalid", ip: "192.0.2.50", hostname: "Publication Host", port: 22,
     countryCode: "JP", status: "idle", isHostOwner: true, pricingModel: "prepaid_calendar_month", cyclePriceMinor: 1000, billingInterval: "calendar_month",
-    currency: "USD", offerRevision: 1, paymentMethodKinds: [], contacts: [], eligibility: { allowed: true }, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+    currency: "USD", offerRevision: 1, contacts: [], eligibility: { allowed: true }, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
   const description = "Bank transfer · contact @seller · https://seller.example.invalid/pay · <b>plain text</b>";
   const seller = { sellerId: "seller", version: 1, displayName: "C2C-123456abcdef", description, currency: "USD", priceBps: 10000, minMinor: 100, maxMinor: 10000, availableMinor: 20000, completedOrders: 0 };
   const overview = Object.fromEntries(["walletPostedUnits", "walletHeldUnits", "unfulfilledUnits", "providerPendingUnits", "providerAvailableUnits", "providerHeldUnits", "buyerRefundHeldUnits", "ownerLossUnits", "maintenanceRevenueUnits"].map(k => [k, "0"]));
@@ -57,7 +57,7 @@ try {
       if (p === "/v1/regions") return json(route, []);
       if (p === "/v1/announcement") return json(route, { enabled: false, revision: "1", contentEn: "", contentZhCn: "" });
       if (p === "/v1/map-display") return json(route, { showFlows: true, showHeat: true, viewport: { visibleStartPx: 90 }, revision: "1" });
-      if (p === "/v1/market-billing/config") return json(route, { usdCnyRateMicros: 7000000, fxRateFresh: true });
+      if (p === "/v1/market/config") return json(route, { usdCnyRateMicros: 7000000, fxRateFresh: true });
       if (p === "/v1/market-wallet") return json(route, { assetCode: "USD", postedUnits: actor === "seller" ? "1728000000" : "0", heldUnits: "0", availableUnits: actor === "seller" ? "1728000000" : "0", version: 1, mode: topupMode, canTopup: false, hasWalletActivity: false });
       if (p === "/v1/market-wallet/transfer-capacity") return json(route, { transferableUnits: actor === "seller" ? sellerUnits : "0", committedUnits: "0", dailyRemainingUnits: "43200000000", enabled: true, verified: true, blockers: [] });
       if (p === "/v1/market-wallet/commission-policy") return json(route, { version: 1, current: { policyVersion: 1, rateBps: 1000, effectiveAt: "2026-01-01T00:00:00Z" }, scheduled: null, increaseNoticeDays: 7, canEdit: false });

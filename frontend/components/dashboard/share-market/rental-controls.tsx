@@ -1,15 +1,11 @@
 "use client";
+import { walletLifecycleKey, walletReleaseScheduled, trialHours } from "@/lib/client-checkout";
 
 import * as React from "react";
 import { useAuth } from "@/components/auth/auth-provider";
 import Link from "next/link";
 import { Button } from "@heroui/react";
-import {
-  Check,
-  Loader2,
-  RotateCcw,
-  X,
-} from "lucide-react";
+import { Loader2, RotateCcw } from "lucide-react";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import {
@@ -25,11 +21,7 @@ import {
 import { MarketPagination } from "@/components/dashboard/share-market/market-pagination";
 import { MarketShareIdentity } from "@/components/dashboard/share-market/market-share-identity";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import {
-  acceptShareMarketPriceChange,
-  rejectShareMarketPriceChange,
-  releaseShareMarketSubscription,
-} from "@/lib/api";
+import { releaseShareMarketSubscription } from "@/lib/api";
 import { shareMarketHref } from "@/lib/dashboard-nav";
 import { formatUsdMoney } from "@/lib/market-money";
 import { notifyMarketBalanceChanged } from "@/lib/market-balance-events";
@@ -38,14 +30,13 @@ import type { ShareMarketListing, ShareMarketSubscription } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import {
   isCoreShareApp,
-  refundStatusKey,
   shareMarketMutationError,
   subscriptionStatusKey,
 } from "@/components/dashboard/share-market/market-utils";
 
 type Translate = ReturnType<typeof useLocaleText>["t"];
 
-function formatUtcDateTime(value: string | undefined, locale: string) {
+function formatUtcDateTime(value: string | null | undefined, locale: string) {
   if (!value) return "-";
   const timestamp = Date.parse(value);
   if (!Number.isFinite(timestamp)) return value;
@@ -67,7 +58,7 @@ export function rentalPrice(subscription: ShareMarketSubscription, locale: strin
     subscription.pricingModel === "prepaid_calendar_month"
     && subscription.cyclePriceMinor != null
   ) {
-    return `${formatUsdMoney(subscription.cyclePriceMinor, locale)} / ${t("marketBilling.month")}`;
+    return `${formatUsdMoney(subscription.cyclePriceMinor, locale)} / ${t("market.month")}`;
   }
   if (
     subscription.pricingModel === "free"
@@ -75,7 +66,7 @@ export function rentalPrice(subscription: ShareMarketSubscription, locale: strin
   ) {
     return t("shareMarket.free");
   }
-  return `${formatUsdMoney(subscription.dailyRateMinor, locale)} / ${t("marketBilling.day")}`;
+  return `${formatUsdMoney(subscription.dailyRateMinor, locale)} / ${t("market.day")}`;
 }
 
 /** The term frozen into the rental at rent time, independent of what the listing says today. */
@@ -109,19 +100,10 @@ export function RentalTermLine({
     return () => window.clearInterval(timer);
   }, []);
 
-  const recurring = subscription.pricingModel === "prepaid_calendar_month"
-    ? subscription.recurring
-    : undefined;
+  const contract = subscription.walletContract;
   const progress = rentalTermProgress(subscription, nowMs);
-  const recurringTime = (value?: string) => formatUtcDateTime(value, locale);
-  const remaining = recurring
-    ? recurring.cancelAtPeriodEnd
-      ? t("marketRecurring.compact.cancelAt", { time: recurringTime(recurring.currentPeriodEnd) })
-      : recurring.status === "recovery"
-        ? t("marketRecurring.compact.recoveryBy", { time: recurringTime(recurring.recoveryDeadline) })
-        : recurring.status === "trial"
-          ? t("marketRecurring.compact.trialUntil", { time: recurringTime(recurring.trialEndsAt) })
-          : t("marketRecurring.compact.renewsAt", { time: recurringTime(recurring.currentPeriodEnd) })
+  const remaining = contract
+    ? t(walletLifecycleKey(contract), { date: formatUtcDateTime(contract.periodEnd, locale), hours: trialHours(contract.trialSecondsRemaining, locale) })
     : progress.pending
       ? t("account.share.activationPending")
       : progress.expired
@@ -131,8 +113,8 @@ export function RentalTermLine({
           : progress.hours != null
             ? t("shareMarket.serviceDuration.remainingHours", { count: progress.hours })
             : t("shareMarket.serviceDuration.permanent");
-  const urgent = recurring
-    ? recurring.status === "recovery" || recurring.cancelAtPeriodEnd
+  const urgent = contract
+    ? ["suspended", "ending", "review_required"].includes(contract.status)
     : progress.expired || progress.hours != null || (progress.days ?? 99) <= 2;
 
   return (
@@ -146,12 +128,7 @@ export function RentalTermLine({
 
 function historyNote(subscription: ShareMarketSubscription, locale: string, t: Translate) {
   const parts: string[] = [];
-  if (subscription.terminationAdjustment) {
-    parts.push(t("shareMarket.refund.summary", {
-      amount: formatUsdMoney(subscription.terminationAdjustment.amountMinor, locale),
-      status: t(refundStatusKey(subscription.terminationAdjustment.status)),
-    }));
-  }
+
   if (subscription.releaseReason) {
     parts.push(t("shareMarket.subscription.statusDetail", { reason: subscription.releaseReason }));
   }
@@ -173,32 +150,19 @@ export function RentalActions({
   t,
   busy,
   onRelease,
-  onAcceptPrice,
-  onRejectPrice,
+
 }: {
   subscription: ShareMarketSubscription;
   t: Translate;
   busy?: boolean;
   onRelease?: () => void;
-  onAcceptPrice?: () => void;
-  onRejectPrice?: () => void;
+
 }) {
-  const pendingPrice = subscription.priceChange?.status === "pending";
+
   return (
     <div className="flex shrink-0 flex-wrap items-center justify-end gap-1">
-      {pendingPrice && onAcceptPrice ? (
-        <Button size="sm" variant="primary" className="h-7 min-w-0 px-2 text-xs" isDisabled={busy} onClick={onAcceptPrice}>
-          <Check className="h-3.5 w-3.5" />
-          {t("shareMarket.priceChange.accept")}
-        </Button>
-      ) : null}
-      {pendingPrice && onRejectPrice ? (
-        <Button size="sm" variant="outline" className="h-7 min-w-0 px-2 text-xs" isDisabled={busy} onClick={onRejectPrice}>
-          <X className="h-3.5 w-3.5" />
-          {t("shareMarket.priceChange.reject")}
-        </Button>
-      ) : null}
-      {subscription.canRelease && !subscription.recurring?.cancelAtPeriodEnd && onRelease ? (
+
+      {subscription.canRelease && !walletReleaseScheduled(subscription.walletContract, subscription.pricingModel) && onRelease ? (
         <Button size="sm" variant="outline" className="h-7 min-w-0 px-2 text-xs" isDisabled={busy} onClick={onRelease}>
           {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RotateCcw className="h-3.5 w-3.5" />}
           {t("shareMarket.release")}
@@ -418,43 +382,19 @@ export function useShareMarketRentalActions(onChanged: () => Promise<void> | voi
 
   const rowActions = (subscription: ShareMarketSubscription) => ({
     onRelease: subscription.canRelease
-      && !subscription.recurring?.cancelAtPeriodEnd
+      && !walletReleaseScheduled(subscription.walletContract, subscription.pricingModel)
       ? () => setAction({
         subscriptionId: subscription.id,
-        title: subscription.recurring
-          ? t(subscription.recurring.status === "active"
-              ? "shareMarket.confirm.releaseMonthlyTitle"
-              : "shareMarket.confirm.releaseImmediateTitle")
-          : t("shareMarket.confirm.releaseTitle"),
-        description: subscription.recurring
-          ? subscription.recurring.status === "active"
-            ? t("shareMarket.confirm.releaseMonthlyDescription", {
-                share: subscription.shareName,
-                time: formatUtcDateTime(subscription.recurring.currentPeriodEnd, locale),
-              })
-            : t("shareMarket.confirm.releaseImmediateDescription", {
-                share: subscription.shareName,
-              })
+        title: t(subscription.walletContract?.status === "active" && subscription.pricingModel === "prepaid_calendar_month"
+          ? "shareMarket.confirm.releaseMonthlyTitle" : "shareMarket.confirm.releaseTitle"),
+        description: subscription.walletContract?.status === "active" && subscription.pricingModel === "prepaid_calendar_month"
+          ? t("shareMarket.confirm.releaseMonthlyDescription", { share: subscription.shareName, time: formatUtcDateTime(subscription.walletContract.periodEnd, locale) })
           : t("shareMarket.confirm.releaseDescription", { share: subscription.shareName }),
         label: t("shareMarket.release"),
         run: () => releaseShareMarketSubscription(subscription.id),
       })
       : undefined,
-    onAcceptPrice: subscription.priceChange
-      ? () => setAction({
-        subscriptionId: subscription.id,
-        title: t("shareMarket.priceChange.acceptTitle"),
-        description: t("shareMarket.priceChange.acceptDescription", {
-          previous: formatUsdMoney(subscription.priceChange!.previousDailyRateMinor, locale),
-          proposed: formatUsdMoney(subscription.priceChange!.proposedDailyRateMinor, locale),
-        }),
-        label: t("shareMarket.priceChange.accept"),
-        run: () => acceptShareMarketPriceChange(subscription.priceChange!.id),
-      })
-      : undefined,
-    onRejectPrice: subscription.priceChange
-      ? () => void run(subscription.id, () => rejectShareMarketPriceChange(subscription.priceChange!.id))
-      : undefined,
+
   });
 
   const dialog = (

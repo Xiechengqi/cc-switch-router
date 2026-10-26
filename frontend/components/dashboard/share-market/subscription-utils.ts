@@ -32,11 +32,10 @@ export function subscriptionsNeedGrantPolling(subscriptions: Array<Pick<ShareMar
 
 export function needsRentalAttention(subscription: Pick<
   ShareMarketSubscription,
-  "status" | "integrityState" | "priceChange"
+  "status" | "integrityState"
 >) {
   return ATTENTION_STATUSES.has(subscription.status)
-    || (subscription.integrityState != null && subscription.integrityState !== "compatible")
-    || subscription.priceChange?.status === "pending";
+    || (subscription.integrityState != null && subscription.integrityState !== "compatible");
 }
 
 function anomalyRank(status: string) {

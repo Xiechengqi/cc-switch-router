@@ -892,9 +892,7 @@ struct RouterSshHostView {
     free_duration_days: Option<u32>,
     offer_revision: i64,
     #[serde(default)]
-    payment_method_kinds: Vec<String>,
-    #[serde(default)]
-    contacts: Vec<crate::client_market_trade::PaymentContact>,
+    contacts: Vec<crate::client_market_trade::ProviderContact>,
     #[serde(default)]
     seller_approval_required: bool,
     eligibility: crate::market_access::MarketEligibilityView,
@@ -1163,7 +1161,6 @@ async fn list_hosts(
                 }),
                 free_duration_days: host.free_duration_days,
                 offer_revision: host.offer_revision,
-                payment_method_kinds: host.payment_method_kinds,
                 contacts: host.contacts,
                 seller_approval_required,
                 eligibility,
@@ -1286,11 +1283,11 @@ fn normalize_host_transfer_pricing(
         ));
     }
     let expected_pricing_model = if cycle_price_minor.is_some() {
-        crate::market_recurring::PRICING_PREPAID_CALENDAR_MONTH
+        crate::market_common::PRICING_PREPAID_CALENDAR_MONTH
     } else if daily_rate_minor.is_some() {
-        crate::market_recurring::PRICING_LEGACY_METERED_DAILY
+        crate::market_common::PRICING_LEGACY_METERED_DAILY
     } else {
-        crate::market_recurring::PRICING_FREE
+        crate::market_common::PRICING_FREE
     };
     if entry
         .pricing_model
@@ -1302,7 +1299,7 @@ fn normalize_host_transfer_pricing(
         ));
     }
     let expected_billing_interval = cycle_price_minor
-        .map(|_| crate::market_recurring::BILLING_INTERVAL_CALENDAR_MONTH.to_string());
+        .map(|_| crate::market_common::BILLING_INTERVAL_CALENDAR_MONTH.to_string());
     if entry.billing_interval.is_some()
         && entry.billing_interval.as_ref() != expected_billing_interval.as_ref()
     {
@@ -1583,11 +1580,11 @@ async fn create_host(
             None,
             cycle_price_minor,
             if cycle_price_minor.is_some() {
-                crate::market_recurring::PRICING_PREPAID_CALENDAR_MONTH
+                crate::market_common::PRICING_PREPAID_CALENDAR_MONTH
             } else {
-                crate::market_recurring::PRICING_FREE
+                crate::market_common::PRICING_FREE
             },
-            cycle_price_minor.map(|_| crate::market_recurring::BILLING_INTERVAL_CALENDAR_MONTH),
+            cycle_price_minor.map(|_| crate::market_common::BILLING_INTERVAL_CALENDAR_MONTH),
             currency.as_deref(),
             free_duration_days,
         )
@@ -2162,7 +2159,7 @@ async fn release_client(
     let session = require_session(&state, &headers).await?;
     if state
         .store
-        .client_market_schedule_recurring_release(&installation_id, &session)
+        .client_market_schedule_wallet_release(&installation_id, &session)
         .await?
     {
         return Ok(Json(CreateClientResponse {
@@ -5680,7 +5677,6 @@ fn host_to_view(host: RouterSshHostRecord, reveal: bool) -> RouterSshHostView {
         currency: host.currency,
         free_duration_days: host.free_duration_days,
         offer_revision: host.offer_revision,
-        payment_method_kinds: host.payment_method_kinds,
         contacts: host.contacts,
         seller_approval_required: false,
         eligibility: crate::market_access::MarketEligibilityView::allowed(),
@@ -5747,8 +5743,7 @@ pub struct RouterSshHostRecord {
     pub currency: Option<String>,
     pub free_duration_days: Option<u32>,
     pub offer_revision: i64,
-    pub payment_method_kinds: Vec<String>,
-    pub contacts: Vec<crate::client_market_trade::PaymentContact>,
+    pub contacts: Vec<crate::client_market_trade::ProviderContact>,
     pub country_code: Option<String>,
     pub hostname: Option<String>,
     pub ssh_host_key_fingerprint: Option<String>,
@@ -6211,9 +6206,7 @@ impl AppStore {
                     h.ip_intel_json, t.subdomain,
                     COALESCE(NULLIF(TRIM(t.owner_email), ''), NULLIF(TRIM(i.owner_email), '')),
                     s.client_user_id, h.provider_id, h.daily_rate_minor, h.offer_revision,
-                    COALESCE((SELECT methods_json FROM account_payment_profiles p
-                              WHERE p.user_id = h.provider_id), '[]'),
-                    COALESCE((SELECT contacts_json FROM account_payment_profiles p
+                    COALESCE((SELECT contacts_json FROM market_provider_contacts p
                               WHERE p.user_id = h.provider_id), '[]'),
                     NULLIF(TRIM(h.currency), ''), h.free_duration_days,
                     t.enabled, ns.last_heartbeat_at, h.pricing_model,
@@ -6356,9 +6349,9 @@ impl AppStore {
             daily_rate_minor,
             None,
             if daily_rate_minor.is_some() {
-                crate::market_recurring::PRICING_LEGACY_METERED_DAILY
+                crate::market_common::PRICING_LEGACY_METERED_DAILY
             } else {
-                crate::market_recurring::PRICING_FREE
+                crate::market_common::PRICING_FREE
             },
             None,
             currency,
@@ -6396,16 +6389,15 @@ impl AppStore {
             ));
         }
         let expected_pricing_model = if cycle_price_minor.is_some() {
-            crate::market_recurring::PRICING_PREPAID_CALENDAR_MONTH
+            crate::market_common::PRICING_PREPAID_CALENDAR_MONTH
         } else if daily_rate_minor.is_some() {
-            crate::market_recurring::PRICING_LEGACY_METERED_DAILY
+            crate::market_common::PRICING_LEGACY_METERED_DAILY
         } else {
-            crate::market_recurring::PRICING_FREE
+            crate::market_common::PRICING_FREE
         };
         if pricing_model != expected_pricing_model
             || (cycle_price_minor.is_some()
-                && billing_interval
-                    != Some(crate::market_recurring::BILLING_INTERVAL_CALENDAR_MONTH))
+                && billing_interval != Some(crate::market_common::BILLING_INTERVAL_CALENDAR_MONTH))
             || (cycle_price_minor.is_none() && billing_interval.is_some())
         {
             return Err(AppError::BadRequest(
@@ -6630,13 +6622,6 @@ impl AppStore {
 
         let now = Utc::now();
         let now_text = now.to_rfc3339();
-        crate::market_billing::terminate_contract_tx(
-            &tx,
-            "client_host",
-            &installation_id,
-            "unreachable_host_retired",
-            &now_text,
-        )?;
         let subscription_changed = tx
             .execute(
                 "UPDATE client_market_subscriptions
@@ -7290,21 +7275,6 @@ impl AppStore {
             params![job_id],
         )
         .map_err(|e| AppError::Internal(format!("release failed job reservation failed: {e}")))?;
-        crate::market_billing::finish_market_funding_reservation_tx(
-            &tx,
-            "client_host",
-            job_id,
-            false,
-            "provisioning_failed",
-            &now,
-        )?;
-        crate::market_recurring::fail_activation_tx(
-            &tx,
-            "client_host",
-            job_id,
-            "provisioning_failed",
-            &now,
-        )?;
         if let Some(contract_id) =
             crate::market_platform_contracts::contract_for_product_tx(&tx, "client_host", job_id)?
         {
@@ -7499,9 +7469,7 @@ impl AppStore {
                         h.ip_intel_json, t.subdomain,
                         COALESCE(NULLIF(TRIM(t.owner_email), ''), NULLIF(TRIM(i.owner_email), '')),
                         s.client_user_id, h.provider_id, h.daily_rate_minor, h.offer_revision,
-                        COALESCE((SELECT methods_json FROM account_payment_profiles p
-                                  WHERE p.user_id = h.provider_id), '[]'),
-                        COALESCE((SELECT contacts_json FROM account_payment_profiles p
+                        COALESCE((SELECT contacts_json FROM market_provider_contacts p
                                   WHERE p.user_id = h.provider_id), '[]'),
                         NULLIF(TRIM(h.currency), ''), h.free_duration_days,
                         t.enabled, ns.last_heartbeat_at, h.pricing_model,
@@ -8453,21 +8421,6 @@ impl AppStore {
             params![job_id],
         )
         .map_err(|e| AppError::Internal(format!("release failed reservation failed: {e}")))?;
-        crate::market_billing::finish_market_funding_reservation_tx(
-            &tx,
-            "client_host",
-            job_id,
-            false,
-            failure_code,
-            &now,
-        )?;
-        crate::market_recurring::fail_activation_tx(
-            &tx,
-            "client_host",
-            job_id,
-            failure_code,
-            &now,
-        )?;
         if let Some(contract_id) =
             crate::market_platform_contracts::contract_for_product_tx(&tx, "client_host", job_id)?
         {
@@ -9190,9 +9143,7 @@ fn get_router_ssh_host(
                 h.ip_intel_json, t.subdomain,
                 COALESCE(NULLIF(TRIM(t.owner_email), ''), NULLIF(TRIM(i.owner_email), '')),
                 s.client_user_id, h.provider_id, h.daily_rate_minor, h.offer_revision,
-                COALESCE((SELECT methods_json FROM account_payment_profiles p
-                          WHERE p.user_id = h.provider_id), '[]'),
-                COALESCE((SELECT contacts_json FROM account_payment_profiles p
+                COALESCE((SELECT contacts_json FROM market_provider_contacts p
                           WHERE p.user_id = h.provider_id), '[]'),
                 NULLIF(TRIM(h.currency), ''), h.free_duration_days,
                 t.enabled, ns.last_heartbeat_at, h.pricing_model,
@@ -9230,22 +9181,12 @@ fn get_provisioning_job(
 }
 
 fn map_router_ssh_host_row(row: &crate::db::Row<'_>) -> crate::db::Result<RouterSshHostRecord> {
-    let methods_json: String = row.get(21)?;
-    let contacts_json: String = row.get(22)?;
-    let currency: Option<String> = row.get(23)?;
+    let contacts_json: String = row.get(21)?;
+    let currency: Option<String> = row.get(22)?;
     let free_duration_days = row
-        .get::<_, Option<i64>>(24)?
+        .get::<_, Option<i64>>(23)?
         .and_then(|value| u32::try_from(value).ok());
-    let payment_methods =
-        serde_json::from_str::<Vec<crate::client_market_trade::PaymentMethod>>(&methods_json)
-            .unwrap_or_default();
-    let mut payment_method_kinds = payment_methods
-        .iter()
-        .map(|method| method.kind.clone())
-        .collect::<Vec<_>>();
-    payment_method_kinds.sort();
-    payment_method_kinds.dedup();
-    let contacts: Vec<crate::client_market_trade::PaymentContact> =
+    let contacts: Vec<crate::client_market_trade::ProviderContact> =
         serde_json::from_str(&contacts_json).unwrap_or_default();
     Ok(RouterSshHostRecord {
         id: row.get(0)?,
@@ -9266,16 +9207,15 @@ fn map_router_ssh_host_row(row: &crate::db::Row<'_>) -> crate::db::Result<Router
         client_subdomain: row.get(15)?,
         client_owner_email: row.get(16)?,
         client_owner_user_id: row.get(17)?,
-        client_tunnel_enabled: row.get::<_, Option<i64>>(25)?.map(|value| value != 0),
-        client_last_heartbeat_at: row.get(26)?,
-        pricing_model: row.get(27)?,
-        cycle_price_minor: row.get(28)?,
-        billing_interval: row.get(29)?,
+        client_tunnel_enabled: row.get::<_, Option<i64>>(24)?.map(|value| value != 0),
+        client_last_heartbeat_at: row.get(25)?,
+        pricing_model: row.get(26)?,
+        cycle_price_minor: row.get(27)?,
+        billing_interval: row.get(28)?,
         provider_id: row.get(18)?,
-        market_provider_id: row.get(30)?,
+        market_provider_id: row.get(29)?,
         daily_rate_minor: row.get(19)?,
         offer_revision: row.get(20)?,
-        payment_method_kinds,
         contacts,
         currency,
         free_duration_days,
@@ -9433,7 +9373,7 @@ mod tests {
             auth_source_hourly_limit: 15,
             ip_blacklist: String::new(),
             free_share_ip_parallel_limit: 1,
-            market_usd_cny_rate_micros: crate::market_billing::DEFAULT_USD_CNY_RATE_MICROS,
+            market_usd_cny_rate_micros: crate::market_common::DEFAULT_USD_CNY_RATE_MICROS,
             market_provider_recommendation_mode:
                 crate::config::MarketProviderRecommendationMode::Shadow,
             ip_intel_endpoints: Vec::new(),
@@ -9882,28 +9822,6 @@ mod tests {
             .expect("insert host")
     }
 
-    async fn ensure_payment_profile(store: &AppStore, user_id: &str, email: &str) {
-        use crate::client_market_trade::PaymentMethod;
-        store
-            .seed_legacy_payment_profile(
-                &market_session(user_id, email),
-                &[PaymentMethod {
-                    kind: "alipay".into(),
-                    account: Some("13800000000".into()),
-                    qr_image_url: None,
-                    asset_url: None,
-                    token: None,
-                    chain: None,
-                    address: None,
-                    instructions: None,
-                    settlement_asset: None,
-                }],
-                None,
-            )
-            .await
-            .expect("configure test payment profile");
-    }
-
     fn market_session(user_id: &str, email: &str) -> crate::models::AuthSession {
         let now = Utc::now();
         crate::models::AuthSession {
@@ -9945,13 +9863,6 @@ mod tests {
         {
             let conn = store.conn.lock().await;
             crate::market_access::configure_open_test_policy(&conn, &session, "USD", 50_000, &now);
-        }
-        if daily_rate_minor.is_some() {
-            ensure_payment_profile(store, provider_id, email).await;
-            store
-                .market_billing_update_supplier_profile(&session, "USD", 24)
-                .await
-                .expect("configure test USD payment grace");
         }
         store
             .client_market_insert_host_for_provider(
@@ -10242,7 +10153,7 @@ mod tests {
                 note: Some("first".into()),
                 daily_rate_minor: None,
                 cycle_price_minor: None,
-                pricing_model: Some(crate::market_recurring::PRICING_FREE.into()),
+                pricing_model: Some(crate::market_common::PRICING_FREE.into()),
                 billing_interval: None,
                 currency: None,
                 free_duration_days: Some(1),
@@ -10255,7 +10166,7 @@ mod tests {
                 note: Some("second".into()),
                 daily_rate_minor: Some(500),
                 cycle_price_minor: None,
-                pricing_model: Some(crate::market_recurring::PRICING_LEGACY_METERED_DAILY.into()),
+                pricing_model: Some(crate::market_common::PRICING_LEGACY_METERED_DAILY.into()),
                 billing_interval: None,
                 currency: Some("USD".into()),
                 free_duration_days: None,
@@ -10392,7 +10303,7 @@ mod tests {
             NormalizedHostTransferPricing {
                 daily_rate_minor: Some(500),
                 cycle_price_minor: None,
-                pricing_model: crate::market_recurring::PRICING_LEGACY_METERED_DAILY.into(),
+                pricing_model: crate::market_common::PRICING_LEGACY_METERED_DAILY.into(),
                 billing_interval: None,
                 currency: Some("USD".into()),
                 free_duration_days: None,
@@ -10408,9 +10319,9 @@ mod tests {
                 note: Some("monthly".into()),
                 daily_rate_minor: None,
                 cycle_price_minor: Some(3_000),
-                pricing_model: Some(crate::market_recurring::PRICING_PREPAID_CALENDAR_MONTH.into()),
+                pricing_model: Some(crate::market_common::PRICING_PREPAID_CALENDAR_MONTH.into()),
                 billing_interval: Some(
-                    crate::market_recurring::BILLING_INTERVAL_CALENDAR_MONTH.into(),
+                    crate::market_common::BILLING_INTERVAL_CALENDAR_MONTH.into(),
                 ),
                 currency: Some("USD".into()),
                 free_duration_days: None,
@@ -10428,9 +10339,9 @@ mod tests {
             NormalizedHostTransferPricing {
                 daily_rate_minor: None,
                 cycle_price_minor: Some(3_000),
-                pricing_model: crate::market_recurring::PRICING_PREPAID_CALENDAR_MONTH.into(),
+                pricing_model: crate::market_common::PRICING_PREPAID_CALENDAR_MONTH.into(),
                 billing_interval: Some(
-                    crate::market_recurring::BILLING_INTERVAL_CALENDAR_MONTH.into(),
+                    crate::market_common::BILLING_INTERVAL_CALENDAR_MONTH.into(),
                 ),
                 currency: Some("USD".into()),
                 free_duration_days: None,
@@ -10438,11 +10349,11 @@ mod tests {
         );
 
         let mut wrong_model = decoded.hosts[0].clone();
-        wrong_model.pricing_model = Some(crate::market_recurring::PRICING_FREE.into());
+        wrong_model.pricing_model = Some(crate::market_common::PRICING_FREE.into());
         assert!(normalize_host_transfer_pricing(&wrong_model).is_err());
         let mut wrong_interval = legacy.hosts[0].clone();
         wrong_interval.billing_interval =
-            Some(crate::market_recurring::BILLING_INTERVAL_CALENDAR_MONTH.into());
+            Some(crate::market_common::BILLING_INTERVAL_CALENDAR_MONTH.into());
         assert!(normalize_host_transfer_pricing(&wrong_interval).is_err());
     }
 
@@ -11306,6 +11217,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn host_usage_history_counts_wallet_debits_and_returns_without_double_counting_fulfillment()
+     {
+        use crate::market_platform_contracts::{self as contracts, BillingModel, PrepareContract};
+        let store = AppStore::new_in_memory_for_tests().unwrap();
+        let host = add_provider_host(
+            &store,
+            "history-provider",
+            "history-provider@example.com",
+            "198.18.8.1",
+            "US",
+            Some(100),
+        )
+        .await;
+        let start = "2026-10-01T00:00:00Z";
+        let minute = "2026-10-01T00:01:00Z";
+        let day = "2026-10-02T00:00:00Z";
+        {
+            let conn = store.conn.lock().await;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            crate::market_wallet::credit_verified_topup_tx(
+                &tx,
+                "history-buyer",
+                "history-topup",
+                10000,
+                "history-receipt",
+                start,
+            )
+            .unwrap();
+            for (installation, model, price, status) in [
+                (
+                    "history-monthly",
+                    BillingModel::CalendarMonth,
+                    3100,
+                    "released",
+                ),
+                ("history-metered", BillingModel::Metered, 1440, "active"),
+            ] {
+                tx.execute("INSERT INTO client_market_subscriptions
+                    (installation_id,host_id,provider_id,host_owner_email,client_user_id,client_owner_email,
+                     status,offer_revision,created_at,updated_at)
+                    VALUES(?1,?2,'history-provider','history-provider@example.com','history-buyer','history-buyer@example.com',?3,1,?4,?4)",
+                    params![installation,host.id,status,start]).unwrap();
+                let input = PrepareContract {
+                    product_kind: "client_host",
+                    product_ref: installation,
+                    trial_scope_ref: &host.id,
+                    quote_id: installation,
+                    buyer_user_id: "history-buyer",
+                    provider_user_id: "history-provider",
+                    offer_revision: 1,
+                    billing_model: model,
+                    price_minor: price,
+                    auto_renew: false,
+                    trial_seconds: 0,
+                };
+                let id = contracts::prepare_contract_tx(&tx, &input, start).unwrap();
+                contracts::bind_client_installation_tx(
+                    &tx,
+                    &id,
+                    installation,
+                    installation,
+                    "history-buyer",
+                    "history-provider",
+                    start,
+                )
+                .unwrap();
+                contracts::activate_contract_tx(&tx, &id, start, start).unwrap();
+                match model {
+                    BillingModel::CalendarMonth => {
+                        contracts::settle_monthly_segment_tx(
+                            &tx,
+                            &id,
+                            "history-service-day",
+                            start,
+                            day,
+                            true,
+                            day,
+                        )
+                        .unwrap();
+                        for _ in 0..2 {
+                            assert!(
+                                contracts::terminate_after_cleanup_tx(&tx, &id, true, day)
+                                    .unwrap()
+                                    .finalized
+                            );
+                        }
+                    }
+                    BillingModel::Metered => {
+                        contracts::observe_metered_interval_tx(
+                            &tx,
+                            &id,
+                            "client_host_health",
+                            "history-minute",
+                            start,
+                            minute,
+                            minute,
+                        )
+                        .unwrap();
+                        contracts::settle_metered_batch_tx(&tx, &id, minute).unwrap();
+                        contracts::settle_metered_batch_tx(&tx, &id, minute).unwrap();
+                    }
+                }
+            }
+            crate::market_wallet::reconcile_wallet_tx(&tx, "history-buyer").unwrap();
+            tx.commit().unwrap();
+        }
+        let history = store
+            .client_market_host_usage_history(&host.id)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 2);
+        let monthly = history
+            .iter()
+            .find(|row| row.installation_id == "history-monthly")
+            .unwrap();
+        assert_eq!(
+            (
+                monthly.charges_minor,
+                monthly.refunded_minor,
+                monthly.net_charges_minor
+            ),
+            (3100, 3000, 100)
+        );
+        let metered = history
+            .iter()
+            .find(|row| row.installation_id == "history-metered")
+            .unwrap();
+        assert_eq!(
+            (
+                metered.charges_minor,
+                metered.refunded_minor,
+                metered.net_charges_minor
+            ),
+            (1, 0, 1)
+        );
+    }
+
+    #[tokio::test]
     async fn host_usage_history_returns_recent_released_and_active_rentals() {
         let (store, _config, root) = test_store("host-usage-history");
         let host = add_provider_host(
@@ -11529,13 +11580,12 @@ mod tests {
             port: 2222,
             host_owner_email: "host@example.com".into(),
             daily_rate_minor: Some(500),
-            pricing_model: crate::market_recurring::PRICING_LEGACY_METERED_DAILY.into(),
+            pricing_model: crate::market_common::PRICING_LEGACY_METERED_DAILY.into(),
             cycle_price_minor: None,
             billing_interval: None,
             currency: Some("USD".into()),
             free_duration_days: None,
             offer_revision: 1,
-            payment_method_kinds: vec!["alipay".into()],
             contacts: vec![],
             country_code: Some("US".into()),
             hostname: Some("host.example".into()),
@@ -11707,11 +11757,7 @@ mod tests {
             .expect("create two-Host quote");
         assert_eq!(quote.items.len(), 2);
         let provider = market_session("provider-1", "provider@example.com");
-        ensure_payment_profile(&store, "provider-1", "provider@example.com").await;
-        store
-            .market_billing_update_supplier_profile(&provider, "USD", 24)
-            .await
-            .expect("configure Provider payment grace");
+
         assert!(matches!(
             store
                 .client_market_update_host_offer(
@@ -11933,7 +11979,7 @@ mod tests {
         assert_eq!(quote.funding_rail, "platform_wallet");
         assert_eq!(
             quote.items[0].trial_seconds_remaining,
-            crate::market_billing::TRIAL_SECONDS
+            crate::market_common::TRIAL_SECONDS
         );
         let funding = quote.wallet_funding.as_ref().unwrap();
         assert_eq!(funding.required_units, 0);
@@ -11942,7 +11988,7 @@ mod tests {
         let json = serde_json::to_value(&quote).unwrap();
         assert_eq!(
             json["items"][0]["trialSecondsRemaining"],
-            crate::market_billing::TRIAL_SECONDS
+            crate::market_common::TRIAL_SECONDS
         );
         assert_eq!(json["walletFunding"]["requiredUnits"], "0");
         store
@@ -12011,7 +12057,7 @@ mod tests {
         assert_eq!(lifecycle.status, "trialing");
         assert_eq!(
             lifecycle.trial_seconds_remaining,
-            crate::market_billing::TRIAL_SECONDS
+            crate::market_common::TRIAL_SECONDS
         );
         assert!(
             !lifecycle.id.is_empty(),
@@ -12356,7 +12402,7 @@ mod tests {
                 assert_eq!(quote.funding_rail, "platform_wallet", "{mode}");
                 assert_eq!(
                     quote.items[0].trial_seconds_remaining,
-                    crate::market_billing::TRIAL_SECONDS,
+                    crate::market_common::TRIAL_SECONDS,
                 );
                 let committed = store
                     .client_market_commit_quote(
@@ -12616,16 +12662,6 @@ mod tests {
         )
         .await;
         let provider = market_session("provider-normalize", "provider-normalize@example.com");
-        ensure_payment_profile(
-            &store,
-            "provider-normalize",
-            "provider-normalize@example.com",
-        )
-        .await;
-        store
-            .market_billing_update_supplier_profile(&provider, "USD", 24)
-            .await
-            .expect("configure normalized Provider billing profile");
         {
             let conn = store.conn.lock().await;
             conn.execute(
@@ -12651,7 +12687,7 @@ mod tests {
         assert_eq!(updated.daily_rate_minor, Some(500));
         assert_eq!(
             updated.pricing_model,
-            crate::market_recurring::PRICING_LEGACY_METERED_DAILY
+            crate::market_common::PRICING_LEGACY_METERED_DAILY
         );
         assert!(updated.cycle_price_minor.is_none());
         assert!(updated.billing_interval.is_none());
@@ -12681,7 +12717,7 @@ mod tests {
         assert_eq!(
             stored,
             (
-                crate::market_recurring::PRICING_LEGACY_METERED_DAILY.into(),
+                crate::market_common::PRICING_LEGACY_METERED_DAILY.into(),
                 None,
                 None,
             )

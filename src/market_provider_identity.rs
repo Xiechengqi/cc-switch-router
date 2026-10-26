@@ -806,14 +806,6 @@ pub(crate) fn reconcile_conn(conn: &Connection, now: DateTime<Utc>) -> Result<us
                            WHERE lower(trim(listing.owner_email)) = u.email_normalized)
                 OR EXISTS (SELECT 1 FROM market_counterparties counterparty
                            WHERE counterparty.supplier_user_id = u.id)
-                OR EXISTS (SELECT 1 FROM market_credit_accounts credit
-                           WHERE credit.supplier_user_id = u.id)
-                OR EXISTS (SELECT 1 FROM market_prepaid_accounts prepaid
-                           WHERE prepaid.supplier_user_id = u.id)
-                OR EXISTS (SELECT 1 FROM market_service_contracts contract
-                           WHERE contract.supplier_user_id = u.id)
-                OR EXISTS (SELECT 1 FROM market_recurring_contracts recurring
-                           WHERE recurring.supplier_user_id = u.id)
              ORDER BY u.created_at, u.id",
         )
         .and_then(|mut statement| {
@@ -832,14 +824,6 @@ pub(crate) fn reconcile_conn(conn: &Connection, now: DateTime<Utc>) -> Result<us
                 SELECT lower(trim(owner_email)) AS email FROM share_market_listings
                 UNION
                 SELECT lower(trim(supplier_email)) AS email FROM market_counterparties
-                UNION
-                SELECT lower(trim(supplier_email)) AS email FROM market_credit_accounts
-                UNION
-                SELECT lower(trim(supplier_email)) AS email FROM market_prepaid_accounts
-                UNION
-                SELECT lower(trim(supplier_email)) AS email FROM market_service_contracts
-                UNION
-                SELECT lower(trim(supplier_email)) AS email FROM market_recurring_contracts
              ) WHERE email != '' ORDER BY email",
         )
         .and_then(|mut statement| {
@@ -1324,7 +1308,7 @@ mod tests {
     }
 
     #[test]
-    fn reconciliation_keeps_contract_and_funding_only_suppliers() {
+    fn reconciliation_ignores_retired_contract_and_funding_only_suppliers() {
         let conn = database();
         conn.execute_batch(
             "INSERT INTO users (id, email_normalized, status, created_at, last_login_at)
@@ -1368,7 +1352,10 @@ mod tests {
                     .collect::<Result<Vec<_>, _>>()
             })
             .expect("read non-supply Provider identities");
-        assert_eq!(before.len(), 2);
+        assert!(
+            before.is_empty(),
+            "retired financial records are not current Provider supply"
+        );
         assert!(before.iter().all(|(_, id)| id.starts_with(PROFILE_PREFIX)));
 
         reconcile_conn(&conn, Utc::now()).expect("repeat non-supply reconciliation");

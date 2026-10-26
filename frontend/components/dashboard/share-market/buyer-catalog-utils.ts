@@ -1,5 +1,4 @@
 import type {
-  MarketFundingSummary,
   ShareMarketListing,
   ShareMarketProviderFamily,
   ShareMarketSeat,
@@ -17,61 +16,14 @@ import {
 
 type SelectableSeat = Pick<ShareMarketSeat, "id" | "status" | "readOnly">;
 
-export type RentConfirmPrimaryAction =
-  | "confirm"
-  | "topup"
-  | "refresh"
-  | "retry"
-  | "contact"
-  | "billing"
-  | "close";
-
 export function catalogNeedsRuntimeSync(
   listings: Array<Pick<ShareMarketListing, "serviceBlockReason">>,
 ) {
   return listings.some((listing) => listing.serviceBlockReason === "runtime_stale");
 }
 
-type RentConfirmFunding = Pick<
-  MarketFundingSummary,
-  "requiredTopupMinor" | "topupAvailable" | "topupUnavailableReason"
->;
-
-export function rentConfirmPrimaryAction(
-  quoteRequiresRefresh: boolean,
-  funding?: RentConfirmFunding,
-): RentConfirmPrimaryAction {
-  if (quoteRequiresRefresh) return "refresh";
-  if (!funding || funding.requiredTopupMinor <= 0) return "confirm";
-  if (funding.topupAvailable) return "topup";
-  switch (funding.topupUnavailableReason) {
-    case "temporarily_unavailable":
-      return "retry";
-    case "settlement_required":
-    case "relationship_closed":
-      return "billing";
-    case "router_disabled":
-    case "router_shadow":
-    case "region_restricted":
-    case "credential_storage_unavailable":
-      return "close";
-    case "supplier_unavailable":
-    default:
-      return "contact";
-  }
-}
-
 export function showRentQuoteCountdown(quoteRequiresRefresh: boolean, remainingSeconds: number) {
   return quoteRequiresRefresh || remainingSeconds <= 30;
-}
-
-export function canOptionallyTopupRent(
-  quoteRequiresRefresh: boolean,
-  funding?: RentConfirmFunding,
-) {
-  return !quoteRequiresRefresh
-    && !!funding?.topupAvailable
-    && funding.requiredTopupMinor <= 0;
 }
 
 function isIdle(seat: SelectableSeat) {

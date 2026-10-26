@@ -58,7 +58,6 @@ function sameHost(left: ClientMarketHost, right: ClientMarketHost): boolean {
   for (const key of HOST_SCALAR_KEYS) {
     if (left[key] !== right[key]) return false;
   }
-  if (!sameStringList(left.paymentMethodKinds, right.paymentMethodKinds)) return false;
   if (JSON.stringify(left.contacts ?? []) !== JSON.stringify(right.contacts ?? [])) return false;
   if (JSON.stringify(left.eligibility) !== JSON.stringify(right.eligibility)) return false;
   if (JSON.stringify(left.clientConnection ?? null) !== JSON.stringify(right.clientConnection ?? null)) return false;
@@ -109,7 +108,6 @@ function sameRental(left: ClientMarketRental, right: ClientMarketRental): boolea
   for (const key of RENTAL_SCALAR_KEYS) {
     if (left[key] !== right[key]) return false;
   }
-  if (!sameStringList(left.paymentMethodKinds, right.paymentMethodKinds)) return false;
   if (JSON.stringify(left.contacts ?? []) !== JSON.stringify(right.contacts ?? [])) return false;
   return true;
 }

@@ -3,7 +3,6 @@
 import * as React from "react";
 import { Button, Modal } from "@heroui/react";
 import {
-  CircleDollarSign,
   Mail,
   MessagesSquare,
   Send,
@@ -12,22 +11,17 @@ import {
 import { ProviderContactsList } from "@/components/common/provider-contacts";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ApiError, cancelMarketAccessRequest, createMarketAccessRequest } from "@/lib/api";
-import { DASHBOARD_ACCOUNT_WALLET_PATH } from "@/lib/dashboard-nav";
 import type { MessageKey } from "@/lib/i18n";
 import type {
   MarketAccessRequest,
   MarketEligibility,
   MarketEligibilityStatus,
-  PaymentContact,
+  ProviderContact,
 } from "@/lib/types";
 
 const MARKET_ERROR_STATUS: Record<string, MarketEligibilityStatus> = {
   MARKET_ACCESS_REQUIRED: "access_required",
-  MARKET_CREDIT_REQUIRED: "credit_required",
-  MARKET_BUYER_RESTRICTED: "buyer_restricted",
-  MARKET_SETTLEMENT_REQUIRED: "settlement_required",
-  MARKET_CREDIT_LIMIT_REACHED: "credit_limit_reached",
-  MARKET_RELATIONSHIP_CLOSED: "relationship_closed",
+
 };
 
 export function marketEligibilityFromError(reason: unknown): MarketEligibility | null {
@@ -40,20 +34,13 @@ function descriptionKey(status: MarketEligibilityStatus, share: boolean): Messag
   if (status === "access_required") {
     return share ? "marketApproval.shareDescription" : "marketApproval.clientHostDescription";
   }
-  if (status === "credit_required") return "marketApproval.creditDescription";
-  if (status === "buyer_restricted") return "marketApproval.restrictedDescription";
-  if (status === "settlement_required") return "marketApproval.settlementDescription";
-  if (status === "credit_limit_reached") return "marketApproval.limitDescription";
-  if (status === "relationship_closed") return "marketApproval.closedDescription";
+
   return "marketApproval.unavailableDescription";
 }
 
 function titleKey(status: MarketEligibilityStatus): MessageKey {
   if (status === "access_required") return "marketApproval.accessTitle";
-  if (status === "credit_required") return "marketApproval.creditTitle";
-  if (["buyer_restricted", "settlement_required", "credit_limit_reached"].includes(status)) {
-    return "marketApproval.billingTitle";
-  }
+
   return "marketApproval.unavailableTitle";
 }
 
@@ -75,7 +62,7 @@ export function MarketAccessDialog({
   product: "share" | "clientHost";
   ownerEmail: string;
   buyerEmail: string;
-  contacts?: PaymentContact[] | null;
+  contacts?: ProviderContact[] | null;
   targetKind: "share_seat" | "client_host";
   targetId: string;
   currency?: string;
@@ -137,13 +124,8 @@ export function MarketAccessDialog({
     }
   };
 
-  const needsBilling = [
-    "buyer_restricted",
-    "settlement_required",
-    "credit_limit_reached",
-  ].includes(eligibility.status);
   const canApply = eligibility.status === "access_required";
-  const canContact = canApply || eligibility.status === "credit_required";
+  const canContact = canApply;
 
   return (
     <Modal.Backdrop isOpen={open} onOpenChange={onOpenChange}>
@@ -198,12 +180,6 @@ export function MarketAccessDialog({
             {canApply && request ? (
               <Button variant="outline" isDisabled={busy} onClick={() => void cancelRequest()}>
                 {t("marketApproval.cancelRequest")}
-              </Button>
-            ) : null}
-            {needsBilling ? (
-              <Button variant="primary" onClick={() => { window.location.href = DASHBOARD_ACCOUNT_WALLET_PATH; }}>
-                <CircleDollarSign className="h-4 w-4" />
-                {t("marketBilling.open")}
               </Button>
             ) : null}
             {canApply && !request ? (

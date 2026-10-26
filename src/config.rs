@@ -1069,8 +1069,8 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1),
             market_usd_cny_rate_micros: env_var("CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE")
-                .and_then(|value| crate::market_billing::parse_usd_cny_rate_micros(&value).ok())
-                .unwrap_or(crate::market_billing::DEFAULT_USD_CNY_RATE_MICROS),
+                .and_then(|value| crate::market_common::parse_usd_cny_rate_micros(&value).ok())
+                .unwrap_or(crate::market_common::DEFAULT_USD_CNY_RATE_MICROS),
             market_provider_recommendation_mode: MarketProviderRecommendationMode::parse(
                 env_var("CC_SWITCH_ROUTER_MARKET_PROVIDER_RECOMMENDATION_MODE")
                     .as_deref()
@@ -1527,8 +1527,6 @@ CC_SWITCH_ROUTER_FREE_SHARE_IP_PARALLEL_LIMIT=1
 # Existing CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE values are used only as an
 # emergency display fallback; new installations use the verified FX feed.
 CC_SWITCH_ROUTER_MARKET_PROVIDER_RECOMMENDATION_MODE=shadow
-CC_SWITCH_ROUTER_BINANCE_AUTO_SETTLEMENT_MODE=disabled
-CC_SWITCH_ROUTER_BINANCE_SOCKS_PROXY_URL=
 CC_SWITCH_ROUTER_IP_INTEL_ENDPOINTS=http://3.0.3.0,http://3.0.2.1,http://3.0.2.9
 CC_SWITCH_ROUTER_VERIFICATION_SERVICE_BASE_URL=https://tokenswitch.org
 CC_SWITCH_ROUTER_VERIFICATION_SERVICE_API_KEY=
@@ -1863,7 +1861,7 @@ mod tests {
             auth_source_hourly_limit: 5,
             ip_blacklist: String::new(),
             free_share_ip_parallel_limit: 1,
-            market_usd_cny_rate_micros: crate::market_billing::DEFAULT_USD_CNY_RATE_MICROS,
+            market_usd_cny_rate_micros: crate::market_common::DEFAULT_USD_CNY_RATE_MICROS,
             market_provider_recommendation_mode: MarketProviderRecommendationMode::Shadow,
             ip_intel_endpoints: Vec::new(),
             verification_service_base_url: "https://example.com".into(),

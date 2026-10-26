@@ -263,21 +263,9 @@ function HostRowImpl({
     if (entry.dailyRateMinor == null && entry.cyclePriceMinor == null) {
       return locale.startsWith("zh") ? "免费" : "Free";
     }
-    const total = formatUsdMoney(entry.chargesMinor, locale);
-    const parts = [total];
-    if (entry.invoicedMinor > 0) {
-      parts.push(
-        t("clientMarket.usageHistory.invoiced", {
-          amount: formatUsdMoney(entry.invoicedMinor, locale),
-        }),
-      );
-    }
-    if (entry.unbilledMinor > 0) {
-      parts.push(
-        t("clientMarket.usageHistory.unbilled", {
-          amount: formatUsdMoney(entry.unbilledMinor, locale),
-        }),
-      );
+    const parts = [formatUsdMoney(entry.netChargesMinor, locale)];
+    if (entry.refundedMinor > 0) {
+      parts.push(t("clientMarket.usageHistory.returned", { amount: formatUsdMoney(entry.refundedMinor, locale) }));
     }
     return parts.join(" · ");
   };

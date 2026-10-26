@@ -61,9 +61,7 @@ pub struct ServerState {
     /// Ensures Client subdomain takeover reconciliation has only one active worker.
     pub client_subdomain_takeover_recovery_running: Arc<std::sync::atomic::AtomicBool>,
     /// Serializes external billing suspend/resume/terminate effects across API and worker tasks.
-    pub market_billing_controls: Arc<Mutex<()>>,
-    /// Private credential vault, Binance API adapter, and global settlement kill switch.
-    pub binance_settlement: Arc<crate::binance_settlement::BinanceSettlementRuntime>,
+    pub market_wallet_controls: Arc<Mutex<()>>,
     /// Independent encrypted DujiaoPay credentials and signed API client.
     pub market_payments: Arc<crate::market_payments::MarketPaymentsRuntime>,
     /// In-memory rolling tracker of proxy traffic by user origin. Drives the dashboard

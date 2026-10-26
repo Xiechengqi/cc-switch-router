@@ -2479,24 +2479,6 @@ fn materialize_client_system_event_tx(
     .map_err(|error| {
         AppError::Internal(format!("materialize client chat event failed: {error}"))
     })?;
-    let stored_message_id = conn
-        .query_row(
-            "SELECT id FROM chat_messages WHERE source_event_id = ?1",
-            params![message_source_id],
-            |row| row.get::<_, String>(0),
-        )
-        .map_err(|error| {
-            AppError::Internal(format!(
-                "read materialized client chat event failed: {error}"
-            ))
-        })?;
-    publish_system_event_payment_assets_tx(
-        conn,
-        &room_id,
-        &stored_message_id,
-        &payload,
-        &created_at,
-    )?;
     conn.execute(
         "UPDATE chat_rooms
          SET last_message_at = CASE
@@ -2516,85 +2498,6 @@ fn materialize_client_system_event_tx(
     )
     .map_err(|error| AppError::Internal(format!("complete client chat outbox failed: {error}")))?;
     Ok(())
-}
-
-fn publish_system_event_payment_assets_tx(
-    conn: &Connection,
-    room_id: &str,
-    message_id: &str,
-    payload: &serde_json::Value,
-    created_at: &str,
-) -> Result<(), AppError> {
-    let allowed_owners = ["ownerUserId", "providerUserId", "supplierUserId"]
-        .iter()
-        .filter_map(|field| payload.get(*field).and_then(serde_json::Value::as_str))
-        .filter(|value| !value.trim().is_empty())
-        .collect::<HashSet<_>>();
-    if allowed_owners.is_empty() {
-        return Ok(());
-    }
-    let mut asset_ids = HashSet::new();
-    collect_system_event_payment_asset_ids(payload, &mut asset_ids);
-    for asset_id in asset_ids {
-        let asset_owner = conn
-            .query_row(
-                "SELECT user_id FROM account_payment_assets WHERE id = ?1",
-                params![asset_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|error| {
-                AppError::Internal(format!("read system event payment asset failed: {error}"))
-            })?;
-        if !asset_owner
-            .as_deref()
-            .is_some_and(|owner| allowed_owners.contains(owner))
-        {
-            continue;
-        }
-        conn.execute(
-            "INSERT OR IGNORE INTO chat_public_payment_assets (
-                asset_id, message_id, room_id, created_at
-             ) VALUES (?1, ?2, ?3, ?4)",
-            params![asset_id, message_id, room_id, created_at],
-        )
-        .map_err(|error| {
-            AppError::Internal(format!(
-                "publish system event payment asset failed: {error}"
-            ))
-        })?;
-    }
-    Ok(())
-}
-
-fn collect_system_event_payment_asset_ids<'a>(
-    value: &'a serde_json::Value,
-    output: &mut HashSet<&'a str>,
-) {
-    match value {
-        serde_json::Value::Object(object) => {
-            for value in object.values() {
-                collect_system_event_payment_asset_ids(value, output);
-            }
-        }
-        serde_json::Value::Array(values) => {
-            for value in values {
-                collect_system_event_payment_asset_ids(value, output);
-            }
-        }
-        serde_json::Value::String(value) => {
-            if let Some(asset_id) = value.strip_prefix("/v1/account/payment-assets/")
-                && !asset_id.is_empty()
-                && asset_id.len() <= 128
-                && asset_id
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-            {
-                output.insert(asset_id);
-            }
-        }
-        _ => {}
-    }
 }
 
 fn room_id_installation(conn: &Connection, room_id: &str) -> Result<String, AppError> {

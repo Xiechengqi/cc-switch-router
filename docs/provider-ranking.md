@@ -87,17 +87,14 @@ Share 页的价格、空闲量和在线率等显式排序始终使用原语义�
 
 | 方法 | 路径 | 可见性 | 缓存 |
 |---|---|---|---|
-| `GET` | `/v1/market-providers` | 公开排名、组件分、供给摘要、支付方式种类 | `public, max-age=60, stale-while-revalidate=300` + strong ETag |
+| `GET` | `/v1/market-providers` | 公开排名、组件分、供给摘要 | `public, max-age=60, stale-while-revalidate=300` + strong ETag |
 | `GET` | `/v1/market-providers/:id` | 公开 Provider 详情及 Share/Client 供给 | 同上 |
-| `GET` | `/v1/market-providers/me/funding` | 当前登录买家的供应商资金关系 | `private, no-store`，无 ETag |
 
-公开响应不得包含 canonical email、Router user ID、supplier user ID、预付余额、信用或合同金额。公开 display name 若为空或含邮箱会退回稳定匿名名；Provider 详情中的 Share 名称也由 listing ID 派生为匿名标签，避免历史 `share_name` 实际保存 owner email 时旁路泄漏。私有 funding 响应可以包含当前买家关系所需的 supplier identity，并严格按 Session buyer 过滤。
+公开响应不得包含 canonical email、Router user ID、supplier user ID、预付余额、信用或合同金额。公开 display name 若为空或含邮箱会退回稳定匿名名；Provider 详情中的 Share 名称也由 listing ID 派生为匿名标签，避免历史 `share_name` 实际保存 owner email 时旁路泄漏。不再提供 Provider 分户资金响应。
 
-## 资金汇总
+## 钱包与排名分离
 
-预付与信用账户按「买家 + 供应商」共享，Share/Client 两个 funding projection 中的余额和信用只汇总一次。funding projection 的 active rate 本身是跨产品共享口径，因此 Provider 页面另按合同 `product_kind` 计算 Share/Client legacy daily run rate，避免把同一总额重复相加；calendar-month commitment 按合同相加。最近续费金额只合计最早同一续费时间的合同。无限信用显示为 Provider 数量，不伪装成金额。
-
-Provider 页面仅在用户已登录后请求私有资金端点。即使 Provider 当前没有公开供给，只要与当前买家存在预付、信用或合同关系，仍会出现在旧资金清理区。Provider 级 Binance 充值只在旧财务模式 `disabled`／`shadow` 中可见；平台钱包 `enabled` 后，页面只显示全站钱包入口，不再向买家展示按 Provider 的预存／授信数据或旧充值操作。旧财务清理区仍按 Share/Client 即时覆盖需求与最早一批尚未备资的 calendar-month 续费选择更高的需求；已被 hold 覆盖的自动续费不会再次建议充值。旧资金和债务须在启用钱包前清结，不能自动转换为新钱包余额。
+所有 Provider 共用用户的同一平台余额。排名页只展示可靠性、选择与供给，不查询 Provider 专属余额、授信或收款方式。余额位于导航栏及账户平台余额，供应商收入位于 Provider 设置。只有旧资金记录而没有当前供给或身份的账户，不会因此重新成为当前供应商。
 
 ## 前端导航
 

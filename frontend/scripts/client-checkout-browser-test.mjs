@@ -46,7 +46,6 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
       cyclePriceMinor: 1000,
       currency: "USD",
       offerRevision: 1,
-      paymentMethodKinds: ["binance"],
       contacts: [],
       eligibility: { allowed: true },
       createdAt: new Date().toISOString(),

@@ -29,7 +29,6 @@ import {
   authorizedKeysInstallCommand,
   formatHostIpIntelSecondary,
   formatHostIpLocation,
-  hostPaidOfferPrerequisiteError,
   parseFreeDurationDays,
   parseHostOffer,
 } from "@/components/dashboard/client-market/host-utils";
@@ -255,7 +254,7 @@ export function AddHostDialog({
       onAdded();
     } catch (err) {
       const raw = err instanceof Error ? err.message : String(err);
-      const message = hostPaidOfferPrerequisiteError(err, t) || mapHostError(raw);
+      const message = mapHostError(raw);
       setError(message);
       setStepStatus(markStepFailed);
     } finally {

@@ -74,15 +74,7 @@ import type {
   ProvisioningJob,
   CreateClientMarketClientResponse,
   ClientTunnelSubdomainAvailability,
-  AccountPaymentProfile,
-  BinanceAutoSettlementStatus,
-  DiscoverBinanceAccountResponse,
-  BinanceReceiptHistoryResponse,
-  BinancePaymentIntent,
-  BinanceFundingIntent,
-  BinanceSettlementAdmin,
-  ClientMarketPaymentMethod,
-  PaymentContact,
+  ProviderContact,
   ClientMarketProviderSupply,
   MarketProviderList,
   MarketProviderDetail,
@@ -101,14 +93,6 @@ import type {
   ShareMarketReopenListingInput,
   ShareMarketReopenListingResponse,
   ShareMarketRentQuote,
-  ShareMarketTerminationQuote,
-  ShareMarketTerminationAdjustment,
-  ShareMarketRefundObligation,
-  AdminMarketBillingDispute,
-  MarketBillingDashboard,
-  MarketBillingConfig,
-  MarketBillingInvoiceHistory,
-  MarketRecurringContract,
   MarketAccessDashboard,
   MarketAccessInboxSummary,
   MarketAccessRequest,
@@ -116,7 +100,6 @@ import type {
   MarketAccessDecision,
   MarketAccessPricingKind,
   MarketAccessProductKind,
-  MarketCreditKind,
   ClientSubdomainTakeoverRequest,
   ClientSubdomainTakeoverResponse,
   ClientLogsResponse,
@@ -127,7 +110,6 @@ import type {
   ShareRecentErrorsResponse,
   ShareControlDeadLetterPage,
 } from "@/lib/types";
-
 
 export class ApiError extends Error {
   readonly status: number;
@@ -1310,396 +1292,18 @@ export async function finalizeClientMarketFailedRental(installationId: string) {
   );
 }
 
-export async function getAccountPaymentProfile() {
-  return parseJson<AccountPaymentProfile>(
-    await authFetch("/v1/account/payment-profile", { cache: "no-store" }),
-  );
-}
-
 export async function getAccountContacts() {
-  return parseJson<{ contacts: PaymentContact[]; updatedAt: string }>(
+  return parseJson<{ contacts: ProviderContact[]; updatedAt: string }>(
     await authFetch("/v1/account/provider-contacts", { cache: "no-store" }),
   );
 }
 
-export async function updateAccountPaymentProfile(
-  methods: ClientMarketPaymentMethod[],
-  contacts?: PaymentContact[],
-) {
-  return parseJson<AccountPaymentProfile>(
-    await authFetch("/v1/account/payment-profile", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ methods, contacts }),
-    }),
-  );
-}
-
-export async function updateAccountPaymentContacts(contacts: PaymentContact[]) {
-  return parseJson<{ contacts: PaymentContact[]; updatedAt: string }>(
+export async function updateAccountProviderContacts(contacts: ProviderContact[]) {
+  return parseJson<{ contacts: ProviderContact[]; updatedAt: string }>(
     await authFetch("/v1/account/provider-contacts", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ contacts }),
-    }),
-  );
-}
-
-export async function getBinanceAutoSettlementStatus() {
-  return parseJson<BinanceAutoSettlementStatus>(
-    await authFetch("/v1/account/binance-auto-settlement", { cache: "no-store" }),
-  );
-}
-
-export async function getBinanceReceiptHistory(cursor?: string, signal?: AbortSignal) {
-  const query = new URLSearchParams({ limit: "20" });
-  if (cursor) query.set("cursor", cursor);
-  return parseJson<BinanceReceiptHistoryResponse>(
-    await authFetch(`/v1/account/binance-auto-settlement/receipts?${query}`, {
-      cache: "no-store",
-      signal,
-    }),
-  );
-}
-
-export async function discoverBinanceAutoSettlement(body: {
-  apiKey: string;
-  apiSecret: string;
-}) {
-  return parseJson<DiscoverBinanceAccountResponse>(
-    await authFetch("/v1/account/binance-auto-settlement/discover", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    }),
-  );
-}
-
-export async function confirmBinanceAutoSettlement(confirmationToken: string) {
-  return parseJson<BinanceAutoSettlementStatus>(
-    await authFetch("/v1/account/binance-auto-settlement", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ confirmationToken }),
-    }),
-  );
-}
-
-export async function verifyBinanceAutoSettlement() {
-  return parseJson<BinanceAutoSettlementStatus>(
-    await authFetch("/v1/account/binance-auto-settlement/verify", { method: "POST" }),
-  );
-}
-
-export async function enableBinanceAutoSettlement() {
-  return parseJson<BinanceAutoSettlementStatus>(
-    await authFetch("/v1/account/binance-auto-settlement/enable", { method: "POST" }),
-  );
-}
-
-export async function disableBinanceAutoSettlement() {
-  return parseJson<BinanceAutoSettlementStatus>(
-    await authFetch("/v1/account/binance-auto-settlement/disable", { method: "POST" }),
-  );
-}
-
-export async function deleteBinanceAutoSettlement() {
-  return parseJson<BinanceAutoSettlementStatus>(
-    await authFetch("/v1/account/binance-auto-settlement", { method: "DELETE" }),
-  );
-}
-
-export async function createBinancePaymentIntent(invoiceId: string) {
-  return parseJson<BinancePaymentIntent>(
-    await authFetch(`/v1/market-billing/invoices/${encodeURIComponent(invoiceId)}/binance-intent`, {
-      method: "POST",
-    }),
-  );
-}
-
-export async function getBinancePaymentIntent(invoiceId: string, signal?: AbortSignal) {
-  return parseJson<BinancePaymentIntent | null>(
-    await authFetch(`/v1/market-billing/invoices/${encodeURIComponent(invoiceId)}/binance-intent`, {
-      cache: "no-store",
-      signal,
-    }),
-  );
-}
-
-export async function refreshBinancePaymentIntent(invoiceId: string) {
-  return parseJson<BinancePaymentIntent>(
-    await authFetch(
-      `/v1/market-billing/invoices/${encodeURIComponent(invoiceId)}/binance-intent/refresh`,
-      { method: "POST" },
-    ),
-  );
-}
-
-export async function cancelBinancePaymentIntent(invoiceId: string) {
-  return parseJson<BinancePaymentIntent>(
-    await authFetch(`/v1/market-billing/invoices/${encodeURIComponent(invoiceId)}/binance-intent`, {
-      method: "DELETE",
-    }),
-  );
-}
-
-export async function createBinanceFundingIntent(body: {
-  supplierUserId: string;
-  amountMinor: number;
-  idempotencyKey: string;
-}) {
-  return parseJson<BinanceFundingIntent>(
-    await authFetch("/v1/market-billing/funding-intents", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    }),
-  );
-}
-
-export async function getBinanceFundingIntent(intentId: string, signal?: AbortSignal) {
-  return parseJson<BinanceFundingIntent>(
-    await authFetch(`/v1/market-billing/funding-intents/${encodeURIComponent(intentId)}`, {
-      cache: "no-store",
-      signal,
-    }),
-  );
-}
-
-export async function refreshBinanceFundingIntent(intentId: string) {
-  return parseJson<BinanceFundingIntent>(
-    await authFetch(
-      `/v1/market-billing/funding-intents/${encodeURIComponent(intentId)}/refresh`,
-      { method: "POST" },
-    ),
-  );
-}
-
-export async function cancelBinanceFundingIntent(intentId: string) {
-  return parseJson<BinanceFundingIntent>(
-    await authFetch(`/v1/market-billing/funding-intents/${encodeURIComponent(intentId)}`, {
-      method: "DELETE",
-    }),
-  );
-}
-
-export async function getAdminBinanceReconciliation(signal?: AbortSignal) {
-  return parseJson<BinanceSettlementAdmin>(
-    await authFetch("/v1/admin/market-billing/binance-reconciliation", {
-      cache: "no-store",
-      signal,
-    }),
-  );
-}
-
-export async function resolveAdminBinanceReconciliation(
-  caseId: string,
-  body: { resolution: "settle" | "ignore"; invoiceId?: string; note?: string },
-) {
-  return parseJson<{ ok: true }>(
-    await authFetch(
-      `/v1/admin/market-billing/binance-reconciliation/${encodeURIComponent(caseId)}/resolve`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      },
-    ),
-  );
-}
-
-export async function getMarketBillingDashboard(signal?: AbortSignal) {
-  return parseJson<MarketBillingDashboard>(
-    await authFetch("/v1/market-billing/dashboard", { cache: "no-store", signal }),
-  );
-}
-
-export async function getMarketBillingConfig(signal?: AbortSignal) {
-  return parseJson<MarketBillingConfig>(
-    await authFetch("/v1/market-billing/config", { cache: "no-store", signal }),
-  );
-}
-
-export async function updateMarketBillingSupplierProfile(
-  currency: "USD",
-  settlementGraceHours: number,
-) {
-  return parseJson<MarketBillingDashboard>(
-    await authFetch(`/v1/market-billing/supplier-profiles/${currency}`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ settlementGraceHours }),
-    }),
-  );
-}
-
-export async function settleMarketBillingAccount(accountId: string) {
-  return parseJson<MarketBillingDashboard>(
-    await authFetch(`/v1/market-billing/accounts/${encodeURIComponent(accountId)}/settle`, {
-      method: "POST",
-    }),
-  );
-}
-
-export async function requestMarketBillingSettlement(accountId: string) {
-  return parseJson<{ ok: true }>(
-    await authFetch(`/v1/market-billing/accounts/${encodeURIComponent(accountId)}/request-settlement`, {
-      method: "POST",
-    }),
-  );
-}
-
-export async function closeMarketBillingAccount(accountId: string) {
-  return parseJson<MarketBillingDashboard>(
-    await authFetch(`/v1/market-billing/accounts/${encodeURIComponent(accountId)}/close`, {
-      method: "POST",
-    }),
-  );
-}
-
-export async function getMarketBillingInvoiceHistory(
-  accountId: string,
-  beforeSequence?: number,
-) {
-  const query = new URLSearchParams({ limit: "20" });
-  if (beforeSequence != null) query.set("beforeSequence", String(beforeSequence));
-  return parseJson<MarketBillingInvoiceHistory>(
-    await authFetch(
-      `/v1/market-billing/accounts/${encodeURIComponent(accountId)}/invoices?${query.toString()}`,
-      { cache: "no-store" },
-    ),
-  );
-}
-
-export async function requestMarketPrepaidRefund(
-  accountId: string,
-  amountMinor: number,
-  reason?: string,
-) {
-  return parseJson<MarketBillingDashboard>(
-    await authFetch(`/v1/market-billing/prepaid-accounts/${encodeURIComponent(accountId)}/refunds`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ amountMinor, reason }),
-    }),
-  );
-}
-
-export async function resolveMarketPrepaidRefund(
-  refundId: string,
-  resolution: "approve" | "reject",
-  note?: string,
-) {
-  return parseJson<MarketBillingDashboard>(
-    await authFetch(
-      `/v1/market-billing/prepaid-refunds/${encodeURIComponent(refundId)}/${resolution}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ note }),
-      },
-    ),
-  );
-}
-
-export async function recordMarketPrepaidRefund(refundId: string, externalReference: string) {
-  return parseJson<MarketBillingDashboard>(
-    await authFetch(`/v1/market-billing/prepaid-refunds/${encodeURIComponent(refundId)}/record`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ externalReference }),
-    }),
-  );
-}
-
-export async function declareMarketBillingPayment(
-  invoiceId: string,
-  body: {
-    paymentMethodKind?: string;
-    paymentReference?: string;
-    note?: string;
-    evidenceUrl?: string;
-  },
-) {
-  return parseJson<MarketBillingDashboard>(
-    await authFetch(`/v1/market-billing/invoices/${encodeURIComponent(invoiceId)}/declare-payment`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    }),
-  );
-}
-
-export async function confirmMarketBillingPayment(invoiceId: string) {
-  return parseJson<MarketBillingDashboard>(
-    await authFetch(`/v1/market-billing/invoices/${encodeURIComponent(invoiceId)}/confirm`, {
-      method: "POST",
-    }),
-  );
-}
-
-export async function rejectMarketBillingPayment(invoiceId: string, reason: string) {
-  return parseJson<MarketBillingDashboard>(
-    await authFetch(`/v1/market-billing/invoices/${encodeURIComponent(invoiceId)}/reject`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ reason }),
-    }),
-  );
-}
-
-export async function disputeMarketBillingInvoice(invoiceId: string, reason: string) {
-  return parseJson<MarketBillingDashboard>(
-    await authFetch(`/v1/market-billing/invoices/${encodeURIComponent(invoiceId)}/disputes`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ reason }),
-    }),
-  );
-}
-
-export async function recordMarketRefundObligation(
-  obligationId: string,
-  externalReference: string,
-) {
-  return parseJson<ShareMarketRefundObligation>(
-    await authFetch(
-      `/v1/market-billing/refund-obligations/${encodeURIComponent(obligationId)}/record`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ externalReference }),
-      },
-    ),
-  );
-}
-
-export async function getAdminMarketBillingDisputes(signal?: AbortSignal) {
-  return parseJson<AdminMarketBillingDispute[]>(
-    await authFetch("/v1/admin/market-billing/disputes", { cache: "no-store", signal }),
-  );
-}
-
-export async function resolveAdminMarketBillingDispute(
-  disputeId: string,
-  resolution: "uphold" | "void",
-  note?: string,
-) {
-  return parseJson<{ ok: true }>(
-    await authFetch(`/v1/admin/market-billing/disputes/${encodeURIComponent(disputeId)}/resolve`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ resolution, note }),
-    }),
-  );
-}
-
-export async function voidAdminMarketBillingInvoice(invoiceId: string, reason: string) {
-  return parseJson<{ ok: true }>(
-    await authFetch(`/v1/admin/market-billing/invoices/${encodeURIComponent(invoiceId)}/void`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ reason }),
     }),
   );
 }
@@ -1737,12 +1341,7 @@ export async function upsertMarketCounterparty(body: {
     pricingKind: MarketAccessPricingKind;
     decision: MarketAccessDecision;
   }>;
-  creditLines?: Array<{
-    currency: "USD";
-    kind: MarketCreditKind;
-    limitMinor?: number;
-    riskAcknowledged?: boolean;
-  }>;
+
 }) {
   return parseJson<MarketCounterparty>(
     await authFetch("/v1/market-access/counterparties", {
@@ -1774,25 +1373,6 @@ export async function updateMarketCounterparty(
   );
 }
 
-export async function updateMarketCounterpartyCredit(
-  id: string,
-  currency: "USD",
-  body: {
-    kind: MarketCreditKind;
-    limitMinor?: number;
-    riskAcknowledged?: boolean;
-    expectedRevision: number;
-  },
-) {
-  return parseJson<unknown>(
-    await authFetch(`/v1/market-access/counterparties/${encodeURIComponent(id)}/credit-lines/${currency}`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    }),
-  );
-}
-
 export async function updateMarketCounterpartiesBatch(body: {
   updates: Array<{
     id: string;
@@ -1803,30 +1383,11 @@ export async function updateMarketCounterpartiesBatch(body: {
       decision: MarketAccessDecision;
     }>;
     status?: "active" | "revoked";
-    creditLines: Array<{
-      currency: "USD";
-      kind: MarketCreditKind;
-      limitMinor?: number;
-      riskAcknowledged?: boolean;
-      expectedRevision: number;
-    }>;
+
   }>;
 }) {
   return parseJson<MarketAccessDashboard>(
     await authFetch("/v1/market-access/counterparties/batch", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    }),
-  );
-}
-
-export async function updateMarketPublicCredit(
-  currency: "USD",
-  body: { enabled: boolean; limitMinor?: number; riskAcknowledged?: boolean; expectedRevision: number },
-) {
-  return parseJson<MarketAccessDashboard>(
-    await authFetch(`/v1/market-access/public-credit-lines/${currency}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -1851,13 +1412,7 @@ export async function approveMarketAccessRequest(
   id: string,
   body: {
     expectedRevision: number;
-    creditLine?: {
-      currency: "USD";
-      kind: MarketCreditKind;
-      limitMinor?: number;
-      riskAcknowledged?: boolean;
-      expectedRevision: number;
-    };
+
   },
 ) {
   return parseJson<MarketAccessDashboard>(
@@ -2191,51 +1746,6 @@ export async function rentShareMarketSeat(
   );
 }
 
-export async function updateMarketRecurringRenewal(
-  contractId: string,
-  body: {
-    renewalPolicy: "manual" | "automatic";
-    autoRenewMaxPriceMinor?: number;
-    renewalPriority?: number;
-  },
-) {
-  return parseJson<MarketRecurringContract>(
-    await authFetch(
-      `/v1/market-billing/recurring-contracts/${encodeURIComponent(contractId)}/renewal`,
-      {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      },
-    ),
-  );
-}
-
-export async function reserveNextMarketRecurringPeriod(contractId: string) {
-  return parseJson<MarketRecurringContract>(
-    await authFetch(
-      `/v1/market-billing/recurring-contracts/${encodeURIComponent(contractId)}/reserve-next`,
-      { method: "POST" },
-    ),
-  );
-}
-
-export async function cancelMarketRecurringContract(
-  contractId: string,
-  mode: "period_end" | "immediate" = "period_end",
-) {
-  return parseJson<MarketRecurringContract>(
-    await authFetch(
-      `/v1/market-billing/recurring-contracts/${encodeURIComponent(contractId)}/cancel`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode }),
-      },
-    ),
-  );
-}
-
 export async function releaseShareMarketSubscription(subscriptionId: string) {
   return parseJson<{ ok: true }>(
     await authFetch(`/v1/share-market/subscriptions/${encodeURIComponent(subscriptionId)}/release`, {
@@ -2281,77 +1791,4 @@ export async function requeueShareControlDeadLetter(operationId: string) {
       method: "POST",
     }),
   );
-}
-
-export async function quoteShareMarketSubscriptionTermination(
-  subscriptionId: string,
-  signal?: AbortSignal,
-) {
-  return parseJson<ShareMarketTerminationQuote>(
-    await authFetch(
-      `/v1/share-market/subscriptions/${encodeURIComponent(subscriptionId)}/termination-quote`,
-      { method: "POST", signal },
-    ),
-  );
-}
-
-export async function terminateShareMarketSubscription(
-  subscriptionId: string,
-  quoteId: string,
-  idempotencyKey: string,
-  denyFutureAccess: boolean,
-) {
-  return parseJson<{
-    ok: true;
-    subscriptionId: string;
-    replayed: boolean;
-    adjustment: ShareMarketTerminationAdjustment;
-  }>(
-    await authFetch(`/v1/share-market/subscriptions/${encodeURIComponent(subscriptionId)}/terminate`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ quoteId, idempotencyKey, denyFutureAccess }),
-    }),
-  );
-}
-
-export async function proposeShareMarketPriceChange(
-  subscriptionId: string,
-  dailyRateMinor: number,
-  offerRevision: number,
-) {
-  return parseJson<{ ok: true; proposalId: string }>(
-    await authFetch(
-      `/v1/share-market/subscriptions/${encodeURIComponent(subscriptionId)}/price-changes`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ dailyRateMinor, offerRevision }),
-      },
-    ),
-  );
-}
-
-async function resolveShareMarketPriceChange(
-  proposalId: string,
-  action: "accept" | "reject" | "cancel",
-) {
-  return parseJson<{ ok: true }>(
-    await authFetch(
-      `/v1/share-market/price-changes/${encodeURIComponent(proposalId)}/${action}`,
-      { method: "POST" },
-    ),
-  );
-}
-
-export function acceptShareMarketPriceChange(proposalId: string) {
-  return resolveShareMarketPriceChange(proposalId, "accept");
-}
-
-export function rejectShareMarketPriceChange(proposalId: string) {
-  return resolveShareMarketPriceChange(proposalId, "reject");
-}
-
-export function cancelShareMarketPriceChange(proposalId: string) {
-  return resolveShareMarketPriceChange(proposalId, "cancel");
 }

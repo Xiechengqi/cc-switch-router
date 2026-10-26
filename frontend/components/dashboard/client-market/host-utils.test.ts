@@ -30,7 +30,7 @@ function provider(providerId: string, freeIdle: number): ClientMarketProvider {
     externalClientsOver30Days: 0,
     anomalousHostRate: 0,
     successfulAllocations: 0,
-    paymentMethodKinds: [],
+
     countries: [],
   };
 }

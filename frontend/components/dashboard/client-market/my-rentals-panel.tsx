@@ -1,4 +1,5 @@
 "use client";
+import { walletReleaseScheduled } from "@/lib/client-checkout";
 
 import * as React from "react";
 import { Button, Chip, toast } from "@heroui/react";
@@ -7,7 +8,7 @@ import { useClientChat } from "@/components/chat/client-chat";
 import { CompactSelect } from "@/components/common/compact-select";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { ClientMarketRentalBanner } from "@/components/dashboard/client-market-rental-banner";
-import { MarketRecurringContractCard } from "@/components/dashboard/market-recurring-contract-card";
+
 import { MarketWalletRenewalCard } from "@/components/dashboard/market-wallet-renewal-card";
 import { MarketServiceDisputeControl } from "@/components/dashboard/market-service-dispute-control";
 import { CountryFlag } from "@/components/common/country-flag";
@@ -243,7 +244,7 @@ export function MyRentalsPanel({
               </span>
               {/* Keep mounted through `releasing` so the same instance can finish polling
                   (and reattach after refresh). Retries for release_failed live in the banner. */}
-              {rental.status !== "release_failed" && !rental.recurring?.cancelAtPeriodEnd ? (
+              {rental.status !== "release_failed" && !walletReleaseScheduled(rental.walletContract, rental.pricingModel) ? (
                 <ReleaseRentalAction rental={rental} onChanged={onChanged} />
               ) : null}
             </div>
@@ -256,12 +257,7 @@ export function MyRentalsPanel({
             {(rental.walletContract?.id || rental.walletContractId) && rental.cyclePriceMinor != null ? (
               <MarketWalletRenewalCard contractId={(rental.walletContract?.id || rental.walletContractId)!} refreshKey={JSON.stringify([rental.walletContract?.status, rental.walletContract?.renewalPolicy, rental.walletContract?.periodEnd, rental.walletContract?.trialSecondsRemaining])} onChanged={onChanged} />
             ) : null}
-            {rental.recurring ? (
-              <MarketRecurringContractCard
-                contract={rental.recurring}
-                onChanged={onChanged}
-              />
-            ) : null}
+
             {host?.clientConnection?.state === "offline" ? (
               <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">
                 <p>{t("clientMarket.connection.manualAction")}</p>

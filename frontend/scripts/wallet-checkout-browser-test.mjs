@@ -518,7 +518,11 @@ try {
   await page.getByRole("alert").filter({ hasText: /Review the new total/ }).waitFor();
   assert.equal(topupCreates, 2);
 
-  for (const [legacy, expected] of [["payments/", "provider-settings/"], ["market-access/", "provider-settings/"], ["billing/?tab=receivables", "wallet/"]]) {
+  for (const retired of ["payments", "billing"]) {
+    const response = await fetch(baseUrl + "/account/" + retired + "/");
+    assert.equal(response.status, 404, "retired " + retired + " page must not return");
+  }
+  for (const [legacy, expected] of [["market-access/", "provider-settings/"]]) {
     await page.goto(`${baseUrl}/account/${legacy}`);
     await page.waitForURL(`${baseUrl}/account/${expected}`);
   }

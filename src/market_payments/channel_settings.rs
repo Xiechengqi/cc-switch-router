@@ -3,9 +3,9 @@
 //! Owner reporting. Editing them never creates a credential revision, so a
 //! live channel stays live. Each order freezes the values it was created with.
 
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
-use axum::Json;
 use serde::Deserialize;
 
 use super::{
@@ -58,7 +58,8 @@ pub(super) fn validate_settings(input: &ChannelSettingsRequest) -> Result<Vec<St
     {
         return invalid("minimum top-up exceeds the maximum");
     }
-    if !(0..=10_000).contains(&input.fee_rate_bps) || !(0..=1_000_000).contains(&input.fixed_fee_minor)
+    if !(0..=10_000).contains(&input.fee_rate_bps)
+        || !(0..=1_000_000).contains(&input.fixed_fee_minor)
     {
         return invalid("fee settings are out of range");
     }
@@ -193,6 +194,9 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert_eq!((mode.as_str(), version, rollout.as_str()), ("direct", 2, "live"));
+        assert_eq!(
+            (mode.as_str(), version, rollout.as_str()),
+            ("direct", 2, "live")
+        );
     }
 }

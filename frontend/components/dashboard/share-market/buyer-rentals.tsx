@@ -1,18 +1,17 @@
 "use client";
+import { walletLifecycleKey, walletReleaseScheduled, trialHours } from "@/lib/client-checkout";
 
 import * as React from "react";
 import Link from "next/link";
 import { Button, Chip } from "@heroui/react";
 import {
   ArrowUpRight,
-  Check,
   ExternalLink,
   Loader2,
   RotateCcw,
-  X,
 } from "lucide-react";
 import { subdomainTunnelUrl } from "@/components/dashboard/share-dashboard-utils";
-import { MarketRecurringContractCard } from "@/components/dashboard/market-recurring-contract-card";
+
 import { MarketWalletRenewalCard } from "@/components/dashboard/market-wallet-renewal-card";
 import { MarketServiceDisputeControl } from "@/components/dashboard/market-service-dispute-control";
 import { filterMarketListings } from "@/components/dashboard/share-market/buyer-catalog-utils";
@@ -33,10 +32,7 @@ import {
   useShareMarketRentalActions,
 } from "@/components/dashboard/share-market/rental-controls";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import {
-  shareMarketHref,
-} from "@/lib/dashboard-nav";
-import { formatUsdMoney } from "@/lib/market-money";
+import { shareMarketHref } from "@/lib/dashboard-nav";
 import type { ShareMarketListing, ShareMarketProviderFamily, ShareMarketSubscription } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import {
@@ -44,7 +40,6 @@ import {
   grantFailureMessageKey,
   integrityReasonText,
   integrityStatusKey,
-  refundStatusKey,
   subscriptionStatusKey,
 } from "@/components/dashboard/share-market/market-utils";
 import {
@@ -71,7 +66,7 @@ function isAnomalous(status: string) {
   ].includes(status);
 }
 
-function formatDate(value: string | undefined, locale: string) {
+function formatDate(value: string | null | undefined, locale: string) {
   if (!value) return "-";
   const timestamp = Date.parse(value);
   return Number.isFinite(timestamp)
@@ -87,25 +82,10 @@ function rentalQuota(subscription: ShareMarketSubscription, locale: string, t: T
 }
 
 function rentalServiceTiming(subscription: ShareMarketSubscription, locale: string, t: Translate) {
-  if (subscription.pricingModel === "prepaid_calendar_month" && subscription.recurring) {
-    const recurring = subscription.recurring;
-    if (recurring.cancelAtPeriodEnd) {
-      return t("marketRecurring.compact.cancelAt", {
-        time: formatDate(recurring.currentPeriodEnd, locale),
-      });
-    }
-    if (recurring.status === "recovery") {
-      return t("marketRecurring.compact.recoveryBy", {
-        time: formatDate(recurring.recoveryDeadline, locale),
-      });
-    }
-    if (recurring.status === "trial") {
-      return t("marketRecurring.compact.trialUntil", {
-        time: formatDate(recurring.trialEndsAt, locale),
-      });
-    }
-    return t("marketRecurring.compact.renewsAt", {
-      time: formatDate(recurring.currentPeriodEnd, locale),
+  if (subscription.walletContract) {
+    return t(walletLifecycleKey(subscription.walletContract), {
+      date: formatDate(subscription.walletContract.periodEnd, locale),
+      hours: trialHours(subscription.walletContract.trialSecondsRemaining, locale),
     });
   }
   if (!subscription.serviceStartedAt) return t("account.share.activationPending");
@@ -129,8 +109,7 @@ function StatusDetails({
     || !!subscription.releaseReason
     || !!subscription.failureCode
     || subscription.grantAttempts != null
-    || subscription.integrityState !== "compatible"
-    || !!subscription.terminationAdjustment;
+    || subscription.integrityState !== "compatible";
   if (!hasStatusDetail) return null;
   return (
     <div className="grid gap-0.5 border-l-2 border-rose-400 bg-rose-50 px-3 py-2 text-xs leading-5 text-rose-900">
@@ -139,41 +118,7 @@ function StatusDetails({
       {subscription.grantAttempts != null ? <p>{t("shareMarket.authorizationFailure.attempts", { count: subscription.grantAttempts })}</p> : null}
       {subscription.releaseReason ? <p className="break-words text-rose-800/80">{t(grantFailed ? "shareMarket.authorizationFailure.reason" : "shareMarket.subscription.statusDetail", { reason: subscription.releaseReason })}</p> : null}
       {subscription.integrityState !== "compatible" ? <p>{t(integrityStatusKey(subscription.integrityState))}{subscription.integrityReason ? ` · ${integrityReasonText(subscription.integrityReason, t)}` : ""}</p> : null}
-      {subscription.terminationAdjustment ? <p>{t("shareMarket.refund.summary", { amount: formatUsdMoney(subscription.terminationAdjustment.amountMinor, locale), status: t(refundStatusKey(subscription.terminationAdjustment.status)) })}</p> : null}
-    </div>
-  );
-}
 
-function PriceChangeDetails({
-  subscription,
-  locale,
-  t,
-  busy,
-  onAcceptPrice,
-  onRejectPrice,
-}: {
-  subscription: ShareMarketSubscription;
-  locale: string;
-  t: Translate;
-  busy?: boolean;
-  onAcceptPrice?: () => void;
-  onRejectPrice?: () => void;
-}) {
-  const priceChange = subscription.priceChange;
-  if (!priceChange) return null;
-  return (
-    <div className="grid gap-2 border-l-2 border-amber-400 bg-amber-50 px-3 py-2 text-sm text-amber-950">
-      <strong>{t(`shareMarket.priceChange.status.${priceChange.status}`)}</strong>
-      <span>{t("shareMarket.priceChange.summary", {
-        previous: formatUsdMoney(priceChange.previousDailyRateMinor, locale),
-        proposed: formatUsdMoney(priceChange.proposedDailyRateMinor, locale),
-      })}</span>
-      {priceChange.status === "pending" && (onAcceptPrice || onRejectPrice) ? (
-        <div className="flex flex-wrap gap-2">
-          {onAcceptPrice ? <Button size="sm" variant="primary" isDisabled={busy} onClick={onAcceptPrice}><Check className="h-4 w-4" />{t("shareMarket.priceChange.accept")}</Button> : null}
-          {onRejectPrice ? <Button size="sm" variant="outline" isDisabled={busy} onClick={onRejectPrice}><X className="h-4 w-4" />{t("shareMarket.priceChange.reject")}</Button> : null}
-        </div>
-      ) : null}
     </div>
   );
 }
@@ -183,15 +128,13 @@ export function ShareMarketSubscriptionCard({
   perspective = "user",
   busy,
   onRelease,
-  onAcceptPrice,
-  onRejectPrice,
+
 }: {
   subscription: ShareMarketSubscription;
   perspective?: "user" | "provider";
   busy: boolean;
   onRelease?: () => void;
-  onAcceptPrice?: () => void;
-  onRejectPrice?: () => void;
+
 }) {
   const { locale, t } = useLocaleText();
   const anomalous = isAnomalous(subscription.status) || subscription.integrityState !== "compatible";
@@ -248,14 +191,6 @@ export function ShareMarketSubscriptionCard({
 
       <StatusDetails subscription={subscription} locale={locale} t={t} />
       {perspective === "user" ? <MarketServiceDisputeControl contractId={subscription.walletContractId} initiallyOpen={subscription.openWalletDispute} /> : null}
-      <PriceChangeDetails
-        subscription={subscription}
-        locale={locale}
-        t={t}
-        busy={busy}
-        onAcceptPrice={perspective === "user" ? onAcceptPrice : undefined}
-        onRejectPrice={perspective === "user" ? onRejectPrice : undefined}
-      />
 
       <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border/70 pt-3">
         <p className="text-xs text-muted-foreground">
@@ -267,7 +202,7 @@ export function ShareMarketSubscriptionCard({
               {t("account.share.openShare")}<ExternalLink className="h-3.5 w-3.5" />
             </a>
           ) : null}
-          {perspective === "user" && subscription.canRelease && !subscription.recurring?.cancelAtPeriodEnd && onRelease ? (
+          {perspective === "user" && subscription.canRelease && !walletReleaseScheduled(subscription.walletContract, subscription.pricingModel) && onRelease ? (
             <Button size="sm" variant="outline" isDisabled={busy} onClick={onRelease}><RotateCcw className="h-4 w-4" />{t("shareMarket.release")}</Button>
           ) : null}
           {manageHref ? (
@@ -390,46 +325,30 @@ export function ShareMarketBuyerRentals({
                     showHint={false}
                   />
                   <RentalTermLine subscription={subscription} className="px-1.5 pt-1" />
-                  {subscription.recurring ? (
+
+                  {subscription.walletContract?.id && subscription.cyclePriceMinor != null ? (
                     <div className="mt-2" data-no-card-open>
-                      <MarketRecurringContractCard
-                        contract={subscription.recurring}
-                        onChanged={onChanged}
-                        compact
-                      />
-                    </div>
-                  ) : null}
-                  {subscription.walletContractId && subscription.cyclePriceMinor != null ? (
-                    <div className="mt-2" data-no-card-open>
-                      <MarketWalletRenewalCard contractId={subscription.walletContractId} compact onChanged={onChanged} />
+                      <MarketWalletRenewalCard contractId={subscription.walletContract!.id} refreshKey={subscription.updatedAt} compact onChanged={onChanged} />
                     </div>
                   ) : null}
                   <div data-no-card-open>
-                    <RentalActions subscription={subscription} t={t} busy={rentals.busyId === subscription.id} onRelease={actions.onRelease} onAcceptPrice={actions.onAcceptPrice} onRejectPrice={actions.onRejectPrice} />
+                    <RentalActions subscription={subscription} t={t} busy={rentals.busyId === subscription.id} onRelease={actions.onRelease}   />
                   </div>
                 </div>
               ) : (
                 <div className="grid content-start gap-1.5 border-t border-slate-100 pt-1.5">
                   <RentalTermLine subscription={subscription} className="px-1.5" />
-                  {subscription.recurring ? (
+
+                  {subscription.walletContract?.id && subscription.cyclePriceMinor != null ? (
                     <div className="mt-2" data-no-card-open>
-                      <MarketRecurringContractCard
-                        contract={subscription.recurring}
-                        onChanged={onChanged}
-                        compact
-                      />
-                    </div>
-                  ) : null}
-                  {subscription.walletContractId && subscription.cyclePriceMinor != null ? (
-                    <div className="mt-2" data-no-card-open>
-                      <MarketWalletRenewalCard contractId={subscription.walletContractId} compact onChanged={onChanged} />
+                      <MarketWalletRenewalCard contractId={subscription.walletContract!.id} refreshKey={subscription.updatedAt} compact onChanged={onChanged} />
                     </div>
                   ) : null}
                   <p className="min-w-0 truncate px-1.5 text-[10px] leading-4 text-slate-500">
                     {rentalQuota(subscription, locale, t)}
                   </p>
                   <div data-no-card-open>
-                    <RentalActions subscription={subscription} t={t} busy={rentals.busyId === subscription.id} onRelease={actions.onRelease} onAcceptPrice={actions.onAcceptPrice} onRejectPrice={actions.onRejectPrice} />
+                    <RentalActions subscription={subscription} t={t} busy={rentals.busyId === subscription.id} onRelease={actions.onRelease}   />
                   </div>
                 </div>
               );

@@ -140,7 +140,7 @@ function synthesizeRentalFromHost(
     currency: host.currency,
     freeDurationDays: host.freeDurationDays,
     offerRevision: host.offerRevision ?? 0,
-    paymentMethodKinds: host.paymentMethodKinds || [],
+
     isClientOwner,
     canRelease: !!host.installationId,
     canFinalizeRelease: false,
@@ -232,8 +232,8 @@ function MonitorCard({
           {freeTiming ? <dd className="text-xs text-muted-foreground">{freeTiming}</dd> : null}
         </div>
         <div className="grid gap-0.5">
-          <dt className="text-xs text-muted-foreground">{t(rental?.walletContractId ? "account.nav.wallet" : "account.nav.billing")}</dt>
-          <dd className="font-medium">{status === "released" ? t("account.client.billing.ended") : isFreeOffer(pricingModel, dailyRateMinor, cyclePriceMinor) ? t("shareMarket.free") : t("marketBilling.status.active")}</dd>
+          <dt className="text-xs text-muted-foreground">{t("account.client.status")}</dt>
+          <dd className="font-medium">{status === "released" ? t("account.client.status.ended") : isFreeOffer(pricingModel, dailyRateMinor, cyclePriceMinor) ? t("shareMarket.free") : t("clientCheckout.lifecycle.active")}</dd>
           {rental?.hostCleanupPending ? <dd className="text-xs text-amber-800">{t("clientMarket.release.hostPending")}</dd> : null}
         </div>
         <div className="grid gap-0.5 sm:col-span-2">

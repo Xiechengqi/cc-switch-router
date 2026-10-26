@@ -7965,10 +7965,7 @@ mod tests {
             client_subdomain_takeover_recovery_running: Arc::new(
                 std::sync::atomic::AtomicBool::new(false),
             ),
-            market_billing_controls: Arc::new(Mutex::new(())),
-            binance_settlement: Arc::new(
-                crate::binance_settlement::BinanceSettlementRuntime::disabled_for_tests(),
-            ),
+            market_wallet_controls: Arc::new(Mutex::new(())),
             market_payments: Arc::new(crate::market_payments::MarketPaymentsRuntime::for_test()),
             recent_traffic: RecentTraffic::new(),
             abuse: Arc::new(crate::abuse::AbuseTracker::new()),
@@ -8044,7 +8041,7 @@ mod tests {
             auth_source_hourly_limit: 15,
             ip_blacklist: String::new(),
             free_share_ip_parallel_limit: 1,
-            market_usd_cny_rate_micros: crate::market_billing::DEFAULT_USD_CNY_RATE_MICROS,
+            market_usd_cny_rate_micros: crate::market_common::DEFAULT_USD_CNY_RATE_MICROS,
             market_provider_recommendation_mode:
                 crate::config::MarketProviderRecommendationMode::Shadow,
             ip_intel_endpoints: Vec::new(),

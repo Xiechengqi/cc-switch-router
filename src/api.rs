@@ -254,17 +254,9 @@ struct ForceReleaseShareRequestsResponse {
 
 pub fn router(state: ServerState) -> Router {
     let middleware_state = state.clone();
-    let legacy_finance_routes = Router::new()
-        .merge(crate::market_access::router())
-        .merge(crate::market_billing::router())
-        .merge(crate::market_recurring::router())
-        .merge(crate::binance_settlement::router())
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            retired_legacy_finance_write_middleware,
-        ));
     let public_api = Router::new()
         .route("/v1/healthz", get(health))
+        .merge(crate::market_fx::router())
         .route("/v1/public/map-points", get(public_map_points))
         .route("/v1/public/network-stats", get(public_network_stats))
         .route("/v1/public/usage/global", get(public_usage_global))
@@ -293,7 +285,7 @@ pub fn router(state: ServerState) -> Router {
         .merge(crate::client_market_trade::router())
         .merge(crate::client_market_terminal::router())
         .merge(crate::share_market::router())
-        .merge(legacy_finance_routes)
+        .merge(crate::market_access::router())
         .merge(crate::market_payments::router())
         .merge(crate::market_notifications::router())
         .merge(crate::market_provider_finance::router())
@@ -665,38 +657,6 @@ pub fn router(state: ServerState) -> Router {
             ip_blacklist_middleware,
         ))
         .with_state(state)
-}
-
-/// Official top-up mode never reopens retired Provider-specific money writes.
-fn is_retired_legacy_finance_write(method: &Method, path: &str) -> bool {
-    !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
-        && (path.starts_with("/v1/market-billing/")
-            || path.starts_with("/v1/account/binance-auto-settlement")
-            || path == "/v1/account/payment-profile"
-            || (path.starts_with("/v1/market-access/")
-                && (path.contains("/credit-lines")
-                    || path.starts_with("/v1/market-access/public-credit-lines/"))))
-}
-
-async fn retired_legacy_finance_write_middleware(
-    State(_state): State<ServerState>,
-    req: Request,
-    next: Next,
-) -> Response {
-    let path = req.uri().path();
-    let old_finance_write = is_retired_legacy_finance_write(req.method(), path);
-    if old_finance_write {
-        let mut response = AppError::Gone(
-            "legacy Provider-funded payment writes are retired; use the platform wallet".into(),
-        )
-        .into_response();
-        response.headers_mut().insert(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("private, no-store"),
-        );
-        return response;
-    }
-    next.run(req).await
 }
 
 async fn ip_blacklist_middleware(
@@ -3941,39 +3901,6 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         server.abort();
-    }
-
-    #[test]
-    fn wallet_cutover_retires_only_old_finance_writes() {
-        for path in [
-            "/v1/market-billing/funding-intents",
-            "/v1/market-billing/recurring-contracts/contract/reserve-next",
-            "/v1/account/binance-auto-settlement/enable",
-            "/v1/account/payment-profile",
-            "/v1/market-access/counterparties/party/credit-lines/USD",
-            "/v1/market-access/public-credit-lines/USD",
-        ] {
-            assert!(
-                is_retired_legacy_finance_write(&Method::POST, path),
-                "{path}"
-            );
-        }
-        assert!(!is_retired_legacy_finance_write(
-            &Method::GET,
-            "/v1/market-billing/dashboard"
-        ));
-        assert!(!is_retired_legacy_finance_write(
-            &Method::POST,
-            "/v1/market-access/requests"
-        ));
-        assert!(!is_retired_legacy_finance_write(
-            &Method::POST,
-            "/v1/market-wallet/topups"
-        ));
-        assert!(!is_retired_legacy_finance_write(
-            &Method::PUT,
-            "/v1/account/payment-contacts"
-        ));
     }
 
     #[tokio::test]

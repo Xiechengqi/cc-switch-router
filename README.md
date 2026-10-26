@@ -81,26 +81,25 @@ API 路由按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
 | `/v1/client-market/*` | 36 | 用户 Session | `hosts`、`quotes`、`quotes/:id/commit`、`providers`、`my-rentals`、`terminal/ws` |
 | `/v1/admin/*`（不含下方财务组） | 约 44 | Session + admin 判定 | `settings`、`settings/validate`、`version`、`upgrade`、`metrics/*`、`alerting/*`、`audit`、`proxy/share-requests/force-release`、`logs/router/tail`、`share-market/control-operations/*` |
 | `/v1/admin/market-finance/*`、`/v1/admin/market-payment-channels/*` | 31 | Session；写操作多数仅 Router Owner | 财务模式与切换 `mode`/`readiness`、`pause`、充值异常与 `manual-credit`/`reverse`、对账 `cases`、收入冻结与服务结算调整、`wallet-policy`、`commission-policy`；充值渠道创建/验证/轮换/启停/归档与 `rewrap`；不提供余额现金退款 |
-| `/v1/admin/market-billing/*` | 5 | Session + admin 判定 | 旧 Provider 资金轨道的账单争议裁决、账单作废与币安对账 case |
 | `/v1/shares/*` | 26 | Ed25519 签名 / 用户 Session | Server 侧：`claim-subdomain`、`sync`、`batch-sync`、`descriptor-batch-sync`、`pending-edits`、`edit-ack`、`edit-events`、`runtime-refresh`、`heartbeat`、`prune`；Dashboard 侧：`:share_id/settings`、`request-logs`、`model-health-calendar`、`test-connection`、`client-bans` |
 | `/v1/installations/*` | 15 | Ed25519 签名 / bearer | `register`、`heartbeat`、`audit-events/batch`、`setup-completed`、`report-status`、`client-tunnel`、`client-tunnel/claim`、`bind-owner-email`、`upgrade-task-report`、`client-subdomain-takeover` |
 | `/v1/server-logs/*` | 4 | 公开读 / 用户 Session / Router owner | `meta`、`events`、`export`、`clients/:installation_id/live-tail`；匿名只读最近 5 分钟公开投影，用户读取自有 Client，Router owner 读取全部 Client 并可按需拉取在线诊断 |
 | `/v1/clients/:installation_id/logs` | 1 | 公开读 / 已验证 Client owner | 从在线 Client 拉取脱敏进程日志；Client owner 最多 100 行，匿名、非 owner 用户和非 owner 管理员最多 10 行 |
 | `/v1/clients/:installation_id/online-calendar` | 1 | 公开读 | 仅返回 Clients 列表中已激活 Client 的按日在线率，匿名可查看 |
 | `/v1/chat/*` | 9 | 公开读 / Session 写 | `clients/:installation_id/room`、`rooms/:room_id/messages`、`rooms/:room_id/stream`；不存在 Share 独立房间 |
-| `/v1/markets*`、`/v1/market/*`、`/_market/proxy/*` | 退役 | 无 | 统一返回 `410 Gone`；不会创建旧 Market session、host 或 proxy |
-| `/v1/share-market/*` | 22 | 公开 catalog / 用户 Session | `listings`、`listings/:id/reopen`、`owned-shares`、`seats/:id/quote`、`seats/:id/rent`、`subscriptions/:id/release`、`subscriptions/:id/terminate`、`force-revoke`、`price-changes/*` |
-| `/v1/market-wallet/*` | 23 | 用户 Session | 平台钱包：余额与 `transactions`、`channels`、`topup-quotes`、`topups/*`（含 `payment-instructions`、`stop`、`cancel`、`recheck`）、`transfer-quotes`/`transfers`、`contracts/:id/renewal`、`service-disputes`、`policy`、`commission-policy`；`refund-requests` 已退役，写入返回 `410` |
-| `/v1/market-provider-finance/*` | 10 | 用户 Session | Provider 收入（`me`、`earnings`、`holds`）及到账历史只读；收益沉淀后自动计入余额，原提现、地址和手动收益转入写接口返回 `410` |
+| `/v1/markets*`、`/v1/market/*`（不含 config）、`/_market/proxy/*` | 退役 | 无 | 统一返回 `410 Gone`；不会创建旧 Market session、host 或 proxy |
+| /v1/share-market/* | 17 | 公开 catalog / Session | 挂牌、钱包报价与租用、释放与回收；合同价格冻结 |
+| /v1/market/config | 1 | 公开 | 展示汇率、来源与新鲜度，不依赖支付配置 |
+| `/v1/market-wallet/*` | 23 | 用户 Session | 平台钱包：余额与 `transactions`、`channels`、`topup-quotes`、`topups/*`（含 `payment-instructions`、`stop`、`cancel`、`recheck`）、`transfer-quotes`/`transfers`、`contracts/:id/renewal`、`service-disputes`、`policy`、`commission-policy`；不提供现金退款接口 |
+| `/v1/market-provider-finance/*` | 10 | 用户 Session | Provider 收入（`me`、`earnings`、`holds`）及到账历史只读；收益沉淀后自动计入余额，不再提供提现、地址或手动收益转入接口 |
 | `/v1/payment-webhooks/dujiaopay` | 2 | 网关签名或仅唤醒查单 | DujiaoPay 回调；固定 URL 与旧带渠道 ID 的 URL，入账始终以认证查单为准 |
 | `/v1/market-notifications*` | 3 | 用户 Session | 钱包与 Provider 站内通知、已读与偏好 |
-| `/v1/market-providers*` | 3 | 公开 / 用户 Session | Provider 排名与详情；`me/funding` 为买家私有资金关系 |
-| `/v1/market-access/*` | 12 | 用户 Session / scoped API Token | `dashboard`、`inbox-summary`、`policies`、`counterparties/batch`、准入申请批准/拒绝/取消；买家授信与公共额度只属于旧 Provider 资金轨道，平台钱包启用后返回 `410` |
-| `/v1/market-billing/*` | 25 | 公开 `config` / 用户 Session | 旧 Provider 资金轨道：赊账/预存账户、聚合账单、付款声明/确认/拒绝与争议、`invoices/:id/binance-intent`、月租合同；平台钱包启用后写接口返回 `410` |
+| /v1/market-providers* | 2 | 公开 | Provider 排名与详情，不查询分户资金 |
+| /v1/market-access/* | 10 | Session / scoped API Token | 准入策略、买家规则、申请及原子批量保存；不处理授信 |
 | `/v1/gateway/*`、`/v1/gateways/*` | 5 | Ed25519 签名(`x-cc-gateway-*`) | `register`、`shares`、`shares/headroom`、`shares/feedback`、`request-logs/batch`；签名绑定原始 body，owner email、Free 与 ShareTo 均不授权，新 grant contract 前普通 Share 整体 fail-closed |
 | `/v1/auth/*` | 6 | 公开 / Session | `devices/register`、`email/request-code`、`email/verify-code`、`session/refresh`、`session/me`、`session/logout` |
 | `/v1/tunnels/*` | 4 | Ed25519 签名 | `lease`、`lease/renew`、`activate`、`state` |
-| `/v1/account/*` | 10 | Session | `provider-contacts`、`payment-contacts`、`payment-assets/:id`；`payment-profile` 与 `binance-auto-settlement/*` 只服务旧 Provider 资金轨道，平台钱包启用后写入返回 `410` |
+| /v1/account/provider-contacts | 1 | Session | GET/PUT 业务联系方式，不含收款方式或凭据 |
 | `/v1/public/*` | 5 | 公开 | `map-points`、`network-stats`、`usage/global`、`embed/global.svg`、`embed/usage/:user_id` |
 | `/share-api/*` | 4 | 子域名上下文,Session 可选 | `context`、`share`、`auth/me`、`share/settings` |
 | `/v1/dashboard/*`、`/v1/me/*` | 16 | Session | `dashboard`、`presence`、`ux-events`、`me/api-token`、`me/model-routing`、`me/shares`、`me/usage-card`、`me/usage/consumer`、`me/usage/provider`、`me/notifications`、`me/notifications/telegram/bind-link`、`me/notifications/bark` |
@@ -108,7 +107,7 @@ API 路由按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
 
 ## 管理设置与运维
 
-管理员页面按职责拆分为两个入口：`/settings/` 只管理配置，`/operations/` 承载版本与服务控制、Router 日志、通知投递历史和管理员审计。Settings 的受管环境变量分为 General & Display、Connectivity、Data & Lifecycle、Identity & Security、Notifications、Observability、Marketplace 七个配置域；Binance settlement 位于 Marketplace，地图和公告留在 General & Display，通知渠道验证分别留在 Notifications 的邮件、Telegram、Bark tab。
+管理员页面按职责拆分为两个入口：`/settings/` 只管理配置，`/operations/` 承载版本与服务控制、Router 日志、通知投递历史和管理员审计。Settings 的受管环境变量分为 General & Display、Connectivity、Data & Lifecycle、Identity & Security、Notifications、Observability、Marketplace 七个配置域；平台钱包与 DujiaoPay 位于 Marketplace，地图和公告留在 General & Display，通知渠道验证分别留在 Notifications 的邮件、Telegram、Bark tab。
 
 Settings 使用 revision 化的三段式 API：`GET /v1/admin/settings` 返回 schema、持久化值、运行时有效值和 revision；`POST /v1/admin/settings/validate` 在不写盘的情况下校验整组修改；`PATCH /v1/admin/settings` 要求相同的 `expectedRevision` 后才原子替换 `.env`。并发修改返回 `SETTINGS_REVISION_CONFLICT`，前端会加载最新版本并保留待复核草稿。地图与公告也有各自的 revision，避免多个管理员互相覆盖。
 
@@ -270,13 +269,6 @@ CI 的并行任务、缓存边界、测试数据库模板与耗时排查见 [构
 | `CC_SWITCH_ROUTER_MARKET_PAYMENT_MASTER_KEYS` | 空 | 平台钱包支付渠道凭据的版本化主密钥环，格式 `2:<key>,1:<key>`；新密钥用最高版本加密，轮换后由 Owner 调用 `POST /v1/admin/market-payment-channels/rewrap` 重新加密。修改后需重启 |
 | `CC_SWITCH_ROUTER_MARKET_PAYMENT_MASTER_KEY` | 自动托管 | 未配置密钥环时作为版本 1 主密钥；两者都未配置时，仅在库中还没有支付凭据时于数据目录生成 `market-payment-master-key`。已有支付凭据而主密钥缺失时 Router 拒绝启动，不会静默生成新密钥 |
 | `CC_SWITCH_ROUTER_MARKET_SUSPENDED_TERMINATE_DAYS` | `7` | 平台钱包合同因余额不足暂停后进入清理终止的天数（1–90）；第 5 天（或终止前一天，取较早者）提醒买家。因财务冻结暂停的合同不计时 |
-| `CC_SWITCH_ROUTER_BINANCE_AUTO_SETTLEMENT_MODE` | `disabled` | 仅服务旧 Provider 资金轨道。币安自动到账总开关：`disabled`、`shadow` 或 `enabled`；修改后需重启。`disabled` 还会持久化把全部绑定降为账户级 shadow，`shadow` 读取和匹配但不改账，并强制该阶段的新绑定保持账户级 shadow；切到 `enabled` 后仍需各 Provider 使用已保存凭据明确确认启用 |
-| `CC_SWITCH_ROUTER_BINANCE_SOCKS_PROXY_URL` | 空 | 仅供 Binance 地区检测、凭据验证与 Pay 流水轮询使用的 `socks5h://` 代理；支持 URL 内认证，DNS 由代理解析，修改后需重启 |
-| `CC_SWITCH_ROUTER_BINANCE_MASTER_KEY` | 自动托管 | 高级部署覆盖项。默认在 Router 数据目录自动生成权限为 `0600` 的 `binance-master-key`，无需在 Settings 配置；变更密钥后已有商家必须重新绑定 |
-| `CC_SWITCH_ROUTER_BINANCE_MASTER_KEY_VERSION` | `1` | 隐藏的高级部署覆盖项；普通部署保持默认值 |
-| `CC_SWITCH_ROUTER_BINANCE_API_BASE` | `https://api.binance.com` | 隐藏的测试/高级部署覆盖项；普通部署固定使用 Binance 官方 API |
-| `CC_SWITCH_ROUTER_BINANCE_PAYMENT_HOME_REGION` | Router tunnel domain（为空时 `local`） | 隐藏的多 Region 部署覆盖项；普通部署自动使用稳定的 Router tunnel domain |
-| `CC_SWITCH_ROUTER_BINANCE_POLL_INTERVAL_SECS` | `4` | 隐藏的高级部署覆盖项；普通部署使用安全默认值 |
 | `CC_SWITCH_ROUTER_IP_INTEL_ENDPOINTS` | 内置三个 `http://` 源站 | Client Market 主机 IP 情报服务,逗号分隔的 base URL,按顺序尝试。**每台登记主机的 IP 都会发送到这些端点**,应由 Router 运维方自建或交给可信任全量主机清单的一方。缺少 scheme 时按 `https://` 处理;仍使用 `http://` 时启动会打印告警。结果缓存 6 小时 |
 
 ### 统一入口 DNS 与 TLS
@@ -384,20 +376,17 @@ Router 还会并发读取三路 HTTPS `Date` 响应,以两路仲裁和 RTT 中�
 
 告警投递、状态查询和测试 API 均以通用渠道 ID 工作，事故与 outbox 模型不依赖具体供应商；当前已注册 Telegram（Bot `sendMessage`）和 Bark（`/push`）适配器。Settings 页面可独立测试已注册渠道并显示最近真实投递/测试状态；Metrics 页面可确认、定时静默、恢复事故通知和重试失败投递。未来新增渠道只需增加配置、适配器和渠道注册，不需要重写事故状态机、投递存储或管理 API。
 
-Share Market 与 Client Market 按产品和价格类型使用四项独立供应商准入策略：免费商品默认黑名单模式（默认开放），付费商品默认白名单模式（仅可信买家）。供应商可预先按买家邮箱建立信任，也可处理买家从具体商品发起的准入申请。平台钱包启用后，付费租用只需通过准入，不再要求供应商授信；买家 USD 信用额度与有限公共额度只属于旧 Provider 资金轨道（该轨道下批准付费申请须原子授予额度，切换付费作用域到黑名单须显式确认风险，公共额度不能设为无限）。
+Share Market 与 Client Market 按产品和价格类型执行四项独立准入策略。准入只决定能否购买，不再配置授信、公共额度或每个 Provider 的预存。
 
-付费商品的资金轨道由 Router Owner 的财务模式决定（`disabled` / `shadow` / `enabled`，新部署默认 `disabled`）。新发布的付费拼车位与付费 Host 都按自然月计价，按日计价只为既有商品和合同保留：
+所有付费租用只使用平台钱包。官方充值 disabled / shadow / enabled 模式只控制新的网关充值，不影响已有余额消费、转账与按独立规则启用的 C2C。Owner 配置 DujiaoPay 渠道；用户填写希望到账的 1–1,000 美元，另付动态维护费，只有认证查单及回执核验通过才入账。
 
-- **平台钱包**（`enabled`）：每个 Router 用户一个全站 USD 余额，两个 Market 和所有 Provider 共用。充值经 Owner 配置的支付渠道（首个适配器为 DujiaoPay，托管收银台或站内直付二维码），用户填写希望到账的 1–1,000 美元，另付充值维护费（默认 5%，Owner 可设 0–100%）；只有认证查单与链上回执核验通过才入账，浏览器回跳不算付款证明。余额不能提现，可按邮箱免费转给本 Router 已验证的其他用户。付费拼车位默认先享受 12 小时健康时长试用（试用期 Token 上限默认 100 万），试用不扣费，之后从钱包扣当期款并可选自动续费；余额不足时暂停服务，默认第 5 天提醒、第 7 天进入清理终止。服务退款回到钱包。Provider 按已履约收入记账并扣平台服务费（默认 10%，上调 7 天后生效），净收益在 `max(买家扣款, 履约) + 7 天` 后自动 1:1 计入平台余额，可用于消费、C2C 出售或邮箱转账；不提供外部提现，发布商品也不要求提现地址。切换需 Owner 完成真实商户影子验收后经 API 批准，单向不可回退；切换后旧资金写接口返回 `410`，以旧模式发布的付费商品需 Provider 重新发布。完整契约与切换清单见 [docs/market-platform-wallet-implementation.md](docs/market-platform-wallet-implementation.md)。
-- **旧 Provider 资金轨道**（`disabled` / `shadow`）：平台充值不开放；付费拼车位按「买家 + 供应商」聚合的 USD 赊账/预存账户租用，Client Market 的新付费购买界面只接受平台钱包报价，因此切换前不开放付费 Host 购买。按日计价的服务先享受 12 小时健康时长试用，之后只按 Router 观测到的健康服务秒数累计；有限额度使用达到 80% 时向相关 Client 公开聊天室写入系统预警，用满后生成聚合账单并暂停相关服务。无限额度不自动出账，供应商可主动要求清账；买家也可主动清账，最后一项服务结束时剩余余额会自动出账。买家线下付款并声明，由供应商确认到账（也可启用币安自动到账）；逾期声明或争议不会自行解除市场赊账限制。账单冻结出账时的 USD/CNY 汇率和人民币金额，CNY 不形成独立账户。
+提交购买时冻结余额，服务确认开通后才扣款。授权或 Host 清理不确定时保留冻结，确认清理后幂等释放。取消已付款月租只关闭续费，服务保留到期；试用、按秒及暂停服务可立即发起清理。未履约款只回到平台余额，不提供现金退款或提现。
 
-两条轨道都只以 USD 记账；人民币按 Router 每 15 分钟获取的 USD/CNY 汇率近似展示。
-
-Provider 收益完成七天沉淀后由后台自动入账，不需要手动转入，也不再收取充值维护费或平台服务费。用户在「账户 → 供应商收入」查看明细，在「平台余额」消费、邮箱转账或按 C2C 规则出售。旧外部提现和手动转入流程已退役；收入冻结、身份校验及历史账本审计继续保留。详见 [收益自动到账契约](docs/market-earnings-automatic-credit.md)。
+Provider 净收益沉淀七天后自动计入同一余额，可消费、转账或 C2C 出售；明细位于「账户 → 市场交易 → Provider 设置 → 供应商收入」。旧商家直付运行代码和界面已删除，历史资金不自动转换或删除。完整边界见 [市场支付清理契约](docs/market-wallet-retirement.md)。
 
 Client 公开聊天室与 `installation.id` 一一对应,只为已验证 Owner 的 Client 建立；同一 Client 下的所有 Share 共用这一房间,不存在 Share 独立聊天室。历史消息公开可读,发送真人消息必须使用 Router 登录 Session;普通用户 API Token 不能发送。匿名访客的最近聊天室和已读游标只保存在当前浏览器,登录后会一次性合并到服务端用户记录。非 Owner 真人消息在同一聊天室内从第一条消息开始使用固定 60 秒窗口聚合,窗口内每条消息都完整写入同一封 Owner 邮件;Owner 自己的消息和系统消息不会触发聊天邮件。消息与邮件事件在同一业务库事务落库,后台使用固定 Resend 幂等键、claim lease、重试和 dead-letter。Client 被清理后聊天室转为公开只读归档并保留 60 天,同一 Client 在期限内恢复时沿用原房间。
 
-Share Market、Client Market 与统一账务的关键事件通过持久化 outbox 写入对应 Client 公开聊天室。租用双方的完整邮箱、账单金额、收款方式与联系方式、付款 reference/note、凭证 URL、争议或回收原因以及安全的原始错误均公开展示；系统消息引用的同源收款图片随消息公开并在消息保留期内防止清理,未发布图片仍需 Owner 或账单买方身份。API Key、OAuth/Session token、Cookie、Authorization、密码、secret、私钥和 SSH/lease 凭据禁止进入 Market 源事件和聊天室 payload；后端在持久化前拒绝敏感字段与 query/fragment/userinfo 带凭据的 URL,并替换外部错误或备注中的凭据片段,前端渲染时再执行一次同类过滤。`PaymentMethod.token` 只允许表达 `USDT`/`USDC` 资产符号。验证码、安全通知、Client 注册/离线生命周期邮件和真人聊天提醒邮件仍保留,Market/Billing 业务事件本身不再发送交易邮件。
+Share Market 与 Client Market 的租用生命周期事件通过持久化 outbox 进入 Client 公开聊天室。业务联系方式可以展示，不再发布收款方式、收款图片或付款声明；私有钱包余额、充值回执和账务凭据不进入公共聊天室。密钥、Session、Cookie、密码及 SSH 凭据在持久化前过滤，前端再次防护。资金邮件由独立英文通知链路投递，与公开聊天室分离。
 
 旧留言板、`/v1/board/*` API 及其 Telegram 推送配置已彻底移除；Client 公开聊天室是唯一的站内讨论渠道。
 

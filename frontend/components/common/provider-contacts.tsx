@@ -1,13 +1,12 @@
 "use client";
 
 import * as React from "react";
-import { Button, Chip, Modal, Tooltip } from "@heroui/react";
-import { ContactRound, WalletCards } from "lucide-react";
-import { AuthenticatedImage } from "@/components/common/authenticated-image";
-import { PaymentMethodIcons } from "@/components/common/payment-method-icons";
+import { Button, Modal, Tooltip } from "@heroui/react";
+import { ContactRound } from "lucide-react";
+
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import type { MessageKey } from "@/lib/i18n";
-import type { ClientMarketPaymentMethod, PaymentContact } from "@/lib/types";
+import type { ProviderContact } from "@/lib/types";
 
 export function contactChannelLabelKey(channel: string): MessageKey {
   switch (channel) {
@@ -22,8 +21,8 @@ export function contactChannelLabelKey(channel: string): MessageKey {
   }
 }
 
-/** Read-only list used inside payment dialogs. */
-export function ProviderContactsList({ contacts }: { contacts?: PaymentContact[] | null }) {
+/** Public business contacts used in market access and contact dialogs. */
+export function ProviderContactsList({ contacts }: { contacts?: ProviderContact[] | null }) {
   const { t } = useLocaleText();
   const items = (contacts || []).filter((contact) => contact.handle?.trim());
   if (!items.length) return null;
@@ -45,89 +44,12 @@ export function ProviderContactsList({ contacts }: { contacts?: PaymentContact[]
   );
 }
 
-function paymentMethodLabel(method: ClientMarketPaymentMethod, t: ReturnType<typeof useLocaleText>["t"]) {
-  switch (method.kind) {
-    case "alipay":
-      return t("billing.payment.alipay");
-    case "wechat":
-      return t("billing.payment.wechat");
-    case "binance":
-      return t("billing.payment.binance");
-    case "crypto":
-      return t("billing.payment.crypto");
-    case "custom":
-      return t("billing.payment.custom");
-    default:
-      return method.kind;
-  }
-}
-
-export function ProviderPaymentMethodsList({
-  paymentMethods,
-}: {
-  paymentMethods?: ClientMarketPaymentMethod[] | null;
-}) {
-  const { t } = useLocaleText();
-  const methods = (paymentMethods || []).filter((method) => method.kind?.trim());
-  if (!methods.length) return null;
-
-  return (
-    <div className="grid min-w-0 gap-2 rounded-md border border-border bg-slate-50 p-3">
-      <div className="flex min-w-0 items-center gap-2">
-        <WalletCards className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
-        <strong className="text-sm">{t("marketBilling.providerPaymentDetails")}</strong>
-      </div>
-      <div className="grid min-w-0 gap-3">
-        {methods.map((method, index) => {
-          const label = paymentMethodLabel(method, t);
-          return (
-            <section
-              key={`${method.kind}:${method.account || method.address || index}`}
-              className="grid min-w-0 gap-2 border-b border-slate-200 pb-3 last:border-0 last:pb-0"
-            >
-              <div className="flex min-w-0 flex-wrap items-center gap-2">
-                <PaymentMethodIcons kinds={[method.kind]} />
-                <strong className="text-sm">{label}</strong>
-                {method.token ? <Chip size="sm" variant="soft">{method.token}</Chip> : null}
-                {method.chain ? <Chip size="sm" variant="soft">{method.chain.toUpperCase()}</Chip> : null}
-              </div>
-              {method.account ? (
-                <div className="min-w-0 break-words text-sm">
-                  <span className="text-muted-foreground">{t("billing.account")}: </span>
-                  <span className="font-medium text-foreground">{method.account}</span>
-                </div>
-              ) : null}
-              {method.address ? (
-                <code className="break-all rounded-md bg-white px-3 py-2 text-xs text-foreground">
-                  {method.address}
-                </code>
-              ) : null}
-              {method.instructions ? (
-                <p className="whitespace-pre-wrap break-words text-sm leading-6 text-slate-700">
-                  {method.instructions}
-                </p>
-              ) : null}
-              {method.assetUrl ? (
-                <AuthenticatedImage
-                  src={method.assetUrl}
-                  alt={t("billing.qrAlt", { method: label })}
-                  className="h-40 w-40 rounded-md border bg-white object-contain p-1"
-                />
-              ) : null}
-            </section>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
 /** Market contact glyph: opens the Provider's public contact channels. */
 export function ProviderContactButton({
   contacts,
   className,
 }: {
-  contacts?: PaymentContact[] | null;
+  contacts?: ProviderContact[] | null;
   className?: string;
 }) {
   const { t } = useLocaleText();

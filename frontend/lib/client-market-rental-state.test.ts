@@ -13,7 +13,7 @@ const ended: ClientMarketRental = {
   status: "released",
   pricingModel: "free",
   offerRevision: 1,
-  paymentMethodKinds: [],
+
   isClientOwner: true,
   canRelease: false,
   canFinalizeRelease: false,
@@ -37,7 +37,6 @@ test("quarantined Host reason stays a safe, compact category", () => {
   assert.equal(clientMarketCleanupReasonKey("cleanup_fingerprint_mismatch"), "clientMarket.release.reason.safety");
   assert.equal(clientMarketCleanupReasonKey("cleanup_purge_failed"), "clientMarket.release.reason.purge");
 });
-
 
 test("ended rentals with unsettled wallet funds remain visible after Host cleanup", () => {
   const rental = { ...ended, hostCleanupPending: false, walletContract: { status: "review_required", trialSecondsRemaining: 0, renewalPolicy: "manual" } };

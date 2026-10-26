@@ -5,6 +5,7 @@ import {
   preserveClientDrafts,
   trialHours,
   walletLifecycleKey,
+  walletReleaseScheduled,
 } from "./client-checkout";
 import type { ClientMarketAllocationQuote } from "./types";
 
@@ -13,8 +14,7 @@ const quote: ClientMarketAllocationQuote = {
   status: "active",
   expiresAt: "2030-01-01T00:00:00Z",
   fundingRail: "platform_wallet",
-  funding: [],
-  recurringFunding: [],
+
   items: [
     {
       id: "item",
@@ -50,7 +50,7 @@ test("trial uses actual remaining allowance, while exhausted trials require wall
     walletFunding: {
       ...quote.walletFunding!,
       requiredUnits: "86400000",
-      shortfallUnits: "1",
+      shortfallUnits: "86400000",
     },
   };
   assert.deepEqual(clientCheckoutState(exhausted), {
@@ -106,6 +106,19 @@ test("requote preserves entries by Host, never moves a password to a different H
   const preserved = preserveClientDrafts(quote, { item: draft });
   assert.deepEqual(preserved.host, draft);
   assert.equal(preserved["different-host"], undefined);
+});
+
+test("malformed Client funding cannot throw or enable checkout", () => {
+  for (const value of ["-1", "NaN", "1.2", "9223372036854775808"]) {
+    const result = clientCheckoutState({ ...quote, walletFunding: { ...quote.walletFunding!, committedUnits: value } });
+    assert.equal(result.unsupported, true);
+    assert.equal(result.shortfall, false);
+  }
+  const contract = { status: "active", renewalPolicy: "manual", trialSecondsRemaining: 0 };
+  assert.equal(walletReleaseScheduled(contract, "prepaid_calendar_month"), true);
+  assert.equal(walletReleaseScheduled({ ...contract, status: "trialing" }, "prepaid_calendar_month"), false);
+  assert.equal(walletReleaseScheduled({ ...contract, status: "suspended" }, "prepaid_calendar_month"), false);
+  assert.equal(walletReleaseScheduled(contract, "legacy_metered_daily"), false);
 });
 
 test("wallet lifecycle distinguishes trial, renewal, expiry and uncertain cleanup", () => {

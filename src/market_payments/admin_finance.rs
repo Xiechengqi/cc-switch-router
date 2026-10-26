@@ -210,7 +210,7 @@ mod tests {
         let overview = overview_tx(&conn).unwrap();
         assert_eq!(
             overview.wallet_posted_units,
-            250 * crate::market_billing::MONEY_UNITS_PER_MINOR
+            250 * crate::market_common::MONEY_UNITS_PER_MINOR
         );
         assert_eq!(overview.owner_loss_units, 0);
         assert_eq!(overview.open_critical_cases, 0);

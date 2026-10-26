@@ -2129,8 +2129,8 @@ export type ClientMarketHost = {
   currency?: "USD";
   freeDurationDays?: number;
   offerRevision: number;
-  paymentMethodKinds: string[];
-  contacts?: PaymentContact[];
+
+  contacts?: ProviderContact[];
   sellerApprovalRequired?: boolean;
   eligibility: MarketEligibility;
   countryCode?: string;
@@ -2206,470 +2206,11 @@ export type CreateClientMarketClientResponse = {
   cancellationScheduled: boolean;
 };
 
-export type ClientMarketPaymentMethod = {
-  kind: "alipay" | "wechat" | "binance" | "crypto" | "custom" | string;
-  account?: string;
-  qrImageUrl?: string;
-  assetUrl?: string;
-  token?: "USDT" | "USDC" | string;
-  chain?: "bsc" | "base" | "eth" | "tron" | string;
-  address?: string;
-  instructions?: string;
-  settlementAsset?: "USDT" | string;
-};
+export type ProviderContactChannel = "wechat" | "telegram" | "custom";
 
-export type PaymentContactChannel = "wechat" | "telegram" | "custom";
-
-export type PaymentContact = {
-  channel: PaymentContactChannel | string;
+export type ProviderContact = {
+  channel: ProviderContactChannel | string;
   handle: string;
-};
-
-export type AccountPaymentProfile = {
-  providerId: string;
-  ownerEmail: string;
-  methods: ClientMarketPaymentMethod[];
-  contacts?: PaymentContact[];
-  updatedAt: string;
-};
-
-export type BinanceAutoSettlementAccount = {
-  binanceUid: string;
-  maskedApiKey: string;
-  status: "verified" | "degraded" | "disabled" | string;
-  automationMode: "enabled" | "shadow" | string;
-  paymentHomeRegion: string;
-  permissionsVerifiedAt?: string;
-  uidConfirmed: boolean;
-  uidConfirmationSource?: "receiver_history" | "payer_history" | "payment_observation" | string;
-  lastPollSuccessAt?: string;
-  lastPollErrorCode?: string;
-  consecutiveFailures: number;
-  credentialRevision: number;
-  createdAt: string;
-  updatedAt: string;
-};
-
-export type DiscoveredBinanceAccount = {
-  binanceUid: string;
-  maskedApiKey: string;
-  readingEnabled: boolean;
-  dangerousPermissionsDisabled: boolean;
-  uidConfirmationSource?: "receiver_history" | "payer_history" | string;
-  evidenceCount: number;
-  detectedAt: string;
-  previousBinanceUid?: string;
-};
-
-export type DiscoverBinanceAccountResponse = {
-  account: DiscoveredBinanceAccount;
-  confirmationToken: string;
-  expiresAt: string;
-};
-
-export type BinanceAutoSettlementStatus = {
-  globalMode: "disabled" | "shadow" | "enabled" | string;
-  credentialStorageConfigured: boolean;
-  paymentHomeRegion: string;
-  serviceAvailability:
-    | "unchecked"
-    | "available"
-    | "region_restricted"
-    | "temporarily_unavailable"
-    | string;
-  serviceAvailabilityCheckedAt?: string;
-  serviceAvailabilityErrorCode?: string;
-  account?: BinanceAutoSettlementAccount;
-};
-
-export type BinanceReceiptMarketLine = {
-  productKind: string;
-  serviceLabel: string;
-  serviceStartedAt: string;
-  serviceEndedAt: string;
-  amountUsdMinor: number;
-  amountCnyMinor: number;
-};
-
-type BinanceReceiptHistoryCommon = {
-  receiptId: string;
-  transactionId: string;
-  orderId?: string;
-  transactionAt: string;
-  confirmedAt: string;
-  source: "binance_auto" | "admin_reconciliation" | string;
-  matchedBy: string;
-  asset: string;
-  expectedAmount: string;
-  actualAmount: string;
-};
-
-export type BinanceReceiptHistoryEntry = BinanceReceiptHistoryCommon & (
-  | {
-      kind: "invoice_payment";
-      paymentIntentId: string;
-      invoice: {
-        id: string;
-        sequence: number;
-        status: string;
-        paidAt?: string;
-        buyerEmail: string;
-        amountUsdMinor: number;
-        amountCnyMinor: number;
-        lines: BinanceReceiptMarketLine[];
-      };
-    }
-  | {
-      kind: "prepaid_topup";
-      fundingIntentId: string;
-      topup: {
-        prepaidAccountId: string;
-        buyerEmail: string;
-        status: string;
-        creditedAt: string;
-        currency: "USD";
-        creditedAmountMinor: number;
-      };
-    }
-);
-
-export type BinanceReceiptHistoryResponse = {
-  items: BinanceReceiptHistoryEntry[];
-  nextCursor?: string;
-};
-
-export type BinancePaymentIntent = {
-  id: string;
-  invoiceId: string;
-  status: "pending" | "paid" | "expired" | "cancelled" | "review_required" | string;
-  asset: "USDT" | string;
-  baseAmount: string;
-  payAmount: string;
-  receiverUid: string;
-  noteCode: string;
-  expiresAt: string;
-  createdAt: string;
-  paidAt?: string;
-  cancellationReason?: string;
-  accountStatus: string;
-  lastCheckedAt?: string;
-};
-
-export type BinanceFundingIntent = {
-  id: string;
-  prepaidAccountId: string;
-  supplierUserId: string;
-  status: "pending" | "credited" | "expired" | "cancelled" | "review_required" | string;
-  asset: "USDT" | string;
-  baseAmount: string;
-  payAmount: string;
-  receiverUid: string;
-  noteCode: string;
-  expiresAt: string;
-  createdAt: string;
-  creditedAt?: string;
-  creditedMinor?: number;
-  cancellationReason?: string;
-  accountStatus: string;
-  lastCheckedAt?: string;
-};
-
-export type BinanceReconciliationCase = {
-  id: string;
-  invoiceId?: string;
-  paymentIntentId?: string;
-  fundingIntentId?: string;
-  prepaidAccountId?: string;
-  paymentAccountId: string;
-  transactionId: string;
-  orderId?: string;
-  counterpartyReference?: string;
-  payerBinanceIdReference?: string;
-  caseKind: string;
-  status: string;
-  detail: Record<string, unknown>;
-  supplierUserId: string;
-  binanceUid: string;
-  transactionTime: string;
-  asset: string;
-  amount: string;
-  invoiceStatus?: string;
-  createdAt: string;
-  resolvedAt?: string;
-};
-
-export type BinanceDegradedAccount = {
-  paymentAccountId: string;
-  supplierUserId: string;
-  binanceUid: string;
-  paymentHomeRegion: string;
-  automationMode: string;
-  lastPollSuccessAt?: string;
-  lastPollErrorCode?: string;
-  consecutiveFailures: number;
-  degradedSince?: string;
-  nextPollAt?: string;
-  leaseUntil?: string;
-  pollScanCursorAt?: string;
-  pollScanTargetAt?: string;
-  updatedAt: string;
-};
-
-export type BinanceSettlementAdmin = {
-  cases: BinanceReconciliationCase[];
-  /** Optional while an older Router API is still serving during a rolling upgrade. */
-  degradedAccounts?: BinanceDegradedAccount[];
-  openCaseCount: number;
-  pendingIntentCount: number;
-  degradedAccountCount: number;
-  oldestOpenCaseAt?: string;
-};
-
-export type MarketBillingSupplierProfile = {
-  currency: "USD";
-  settlementGraceHours: number;
-  revision: number;
-  updatedAt: string;
-};
-
-export type MarketBillingService = {
-  id: string;
-  productKind: "share" | "client_host" | string;
-  productRef: string;
-  serviceRef: string;
-  serviceLabel: string;
-  status: string;
-  healthState: string;
-  dailyRateMinor: number;
-  offerRevision: number;
-  trialSecondsRemaining: number;
-  activatedAt: string;
-  suspendedAt?: string;
-  terminatedAt?: string;
-};
-
-export type MarketBillingInvoiceLine = {
-  id: string;
-  contractId: string;
-  productKind: string;
-  productRef: string;
-  serviceRef: string;
-  serviceLabel: string;
-  dailyRateMinor: number;
-  billableSeconds: number;
-  amountMinor: number;
-  amountUsdMinor: number;
-  amountCnyMinor: number;
-  serviceStartedAt: string;
-  serviceEndedAt: string;
-  evidence: Record<string, unknown>;
-};
-
-export type MarketBillingPaymentDeclaration = {
-  id: string;
-  status: string;
-  paymentMethodKind?: string;
-  paymentReference?: string;
-  note?: string;
-  evidenceUrl?: string;
-  declaredAt: string;
-  rejectedAt?: string;
-  rejectionReason?: string;
-};
-
-export type MarketBillingDispute = {
-  id: string;
-  reason: string;
-  status: string;
-  resolution?: string;
-  createdAt: string;
-  respondBy?: string;
-  escalatedAt?: string;
-  autoResolveAt?: string;
-  resolvedAt?: string;
-};
-
-export type MarketBillingCreditNote = {
-  id: string;
-  kind: "service_credit" | "external_refund" | string;
-  amountMinor: number;
-  amountUsdMinor: number;
-  amountCnyMinor: number;
-  currency: "USD";
-  reason: string;
-  externalReference?: string;
-  status: string;
-  createdByEmail: string;
-  createdAt: string;
-};
-
-export type MarketBillingInvoice = {
-  id: string;
-  sequence: number;
-  status: string;
-  amountMinor: number;
-  amountUsdMinor: number;
-  amountCnyMinor: number;
-  usdCnyRateMicros: number;
-  currency: "USD";
-  dueAt: string;
-  deadlineAt: string;
-  openedAt: string;
-  declaredAt?: string;
-  paidAt?: string;
-  paymentMethods: ClientMarketPaymentMethod[];
-  contacts: PaymentContact[];
-  paymentProfileUpdatedAt: string;
-  lines: MarketBillingInvoiceLine[];
-  declaration?: MarketBillingPaymentDeclaration;
-  dispute?: MarketBillingDispute;
-  creditNotes: MarketBillingCreditNote[];
-  externalPaymentReceipt?: {
-    kind: "binance" | string;
-    source: string;
-    matchedBy: string;
-    asset: string;
-    expectedAmount: string;
-    actualAmount: string;
-    confirmedAt: string;
-  };
-};
-
-export type MarketBillingInvoiceHistory = {
-  invoices: MarketBillingInvoice[];
-  nextBeforeSequence?: number | null;
-};
-
-export type MarketCreditAccount = {
-  id: string;
-  buyerUserId: string;
-  buyerEmail: string;
-  supplierUserId: string;
-  supplierEmail: string;
-  currency: "USD";
-  status: string;
-  balanceMinor: number;
-  prepaidAccountId?: string;
-  prepaidBalanceMinor: number;
-  prepaidHeldMinor: number;
-  prepaidAvailableMinor: number;
-  creditKind: "none" | "limited" | "unlimited" | string;
-  creditLimitMinor?: number;
-  utilizationBps?: number;
-  dailyRateMinor: number;
-  prepaidRunwaySeconds?: number;
-  estimatedRunwaySeconds?: number;
-  fundingRunwayAlertLevel: "none" | "warning" | "critical" | string;
-  estimatedSettlementAt?: string;
-  isBuyer: boolean;
-  isSupplier: boolean;
-  canSettle: boolean;
-  canClose: boolean;
-  closeRequested: boolean;
-  services: MarketBillingService[];
-  openInvoice?: MarketBillingInvoice;
-  createdAt: string;
-  updatedAt: string;
-};
-
-export type MarketPrepaidLedgerEntry = {
-  id: string;
-  entryKind: string;
-  direction: "credit" | "debit" | string;
-  amountMinor: number;
-  balanceAfterMinor: number;
-  sourceKind: string;
-  sourceId: string;
-  detail: Record<string, unknown>;
-  createdAt: string;
-};
-
-export type MarketPrepaidRefundRequest = {
-  id: string;
-  prepaidAccountId: string;
-  buyerUserId: string;
-  supplierUserId: string;
-  amountMinor: number;
-  currency: "USD";
-  status: string;
-  reason?: string;
-  resolutionNote?: string;
-  externalReference?: string;
-  requestedAt: string;
-  resolvedAt?: string;
-  recordedAt?: string;
-  canReview: boolean;
-  canRecord: boolean;
-};
-
-export type MarketPrepaidAccount = {
-  id: string;
-  buyerUserId: string;
-  buyerEmail: string;
-  supplierUserId: string;
-  supplierEmail: string;
-  currency: "USD";
-  status: string;
-  balanceMinor: number;
-  heldMinor: number;
-  availableMinor: number;
-  isBuyer: boolean;
-  isSupplier: boolean;
-  topupAvailable: boolean;
-  topupUnavailableReason?: string;
-  ledger: MarketPrepaidLedgerEntry[];
-  refundRequests: MarketPrepaidRefundRequest[];
-  createdAt: string;
-  updatedAt: string;
-};
-
-export type MarketFundingSummary = {
-  supplierUserId: string;
-  supplierEmail: string;
-  currency: "USD";
-  fundingMode: "prepaid" | "prepaid_then_credit" | string;
-  prepaidAccountId?: string;
-  prepaidBalanceMinor: number;
-  prepaidHeldMinor: number;
-  prepaidAvailableMinor: number;
-  creditKind: MarketCreditKind;
-  creditLimitMinor?: number;
-  creditOutstandingMinor: number;
-  creditReservedMinor: number;
-  creditAvailableMinor?: number;
-  activeDailyRateMinor: number;
-  additionalDailyRateMinor: number;
-  projectedDailyRateMinor: number;
-  requiredCoverageMinor: number;
-  prepaidCoverageMinor: number;
-  creditCoverageMinor: number;
-  requiredTopupMinor: number;
-  recommendedTopupMinor: number;
-  recommendedCoverageDays: number;
-  prepaidRunwaySeconds?: number;
-  estimatedRunwaySeconds?: number;
-  topupAvailable: boolean;
-  topupUnavailableReason?: string;
-};
-
-export type MarketRecurringFundingSummary = {
-  supplierUserId: string;
-  supplierEmail: string;
-  currency: "USD";
-  pricingModel: "prepaid_calendar_month" | string;
-  billingInterval: "calendar_month" | string;
-  cyclePriceMinor: number;
-  renewalPolicy: "manual" | "automatic" | string;
-  prepaidAccountId?: string;
-  prepaidBalanceMinor: number;
-  prepaidHeldMinor: number;
-  prepaidAvailableMinor: number;
-  initialHoldMinor: number;
-  renewalHoldMinor: number;
-  totalRequiredHoldMinor: number;
-  requiredTopupMinor: number;
-  topupAvailable: boolean;
-  topupUnavailableReason?: string;
 };
 
 export type MarketWalletQuoteFunding = {
@@ -2681,81 +2222,15 @@ export type MarketWalletQuoteFunding = {
   shortfallUnits: string;
 };
 
-export type MarketRecurringContract = {
-  id: string;
-  productKind: "share" | "client_host" | string;
-  productRef: string;
-  pricingModel: "prepaid_calendar_month" | string;
-  billingInterval: "calendar_month" | string;
-  cyclePriceMinor: number;
-  currency: "USD" | string;
-  supplierUserId: string;
-  supplierEmail: string;
-  status: "pending_activation" | "trial" | "active" | "recovery" | "ended" | "activation_failed" | string;
-  renewalPolicy: "manual" | "automatic" | string;
-  renewalStatus: "initial_funded" | "funded" | "funding_required" | "cancel_at_period_end" | "ended" | string;
-  autoRenewMaxPriceMinor?: number;
-  renewalPriority: number;
-  currentPeriodStart?: string;
-  currentPeriodEnd?: string;
-  nextRenewalAt?: string;
-  nextPeriodHeldMinor: number;
-  cancelAtPeriodEnd: boolean;
-  recoveryDeadline?: string;
-  trialEndsAt?: string;
-};
-
-export type MarketCreditRestriction = {
-  id: string;
-  invoiceId: string;
-  reason: string;
-  createdAt: string;
-};
-
-export type MarketBillingDashboard = {
-  accounts: MarketCreditAccount[];
-  prepaidAccounts: MarketPrepaidAccount[];
-  supplierProfiles: MarketBillingSupplierProfile[];
-  restrictions: MarketCreditRestriction[];
-  refundObligations: ShareMarketRefundObligation[];
-  trialHours: number;
-  usdCnyRateMicros: number;
-};
-
-export type MarketBillingConfig = {
-  currency: "USD";
-  usdCnyRateMicros: number;
-  fxRateSource: "api.exchangerate.fun" | "stale_cache" | "legacy_fallback";
-  fxRateSourceTimestamp: number | null;
-  fxRateFetchedAt: number | null;
-  fxRateFresh: boolean;
-  binanceAutoSettlementEnabled: boolean;
-  binanceServiceAvailability?: string;
-};
-
-export type AdminMarketBillingDispute = {
-  dispute: MarketBillingDispute;
-  accountId: string;
-  buyerEmail: string;
-  supplierEmail: string;
-  invoice: MarketBillingInvoice;
-};
-
 export type MarketAccessProductKind = "share" | "client_host";
 export type MarketAccessPricingKind = "free" | "paid";
 export type MarketAccessMode = "whitelist" | "blacklist";
 export type MarketAccessDecision = "inherit" | "allow" | "deny";
-export type MarketCreditKind = "none" | "limited" | "unlimited";
 
 export type MarketEligibilityStatus =
   | "allowed"
   | "login_required"
   | "access_required"
-  | "credit_required"
-  | "buyer_restricted"
-  | "settlement_required"
-  | "credit_limit_reached"
-  | "relationship_closed"
   | string;
 
 export type MarketAccessRequestSummary = {
@@ -2786,21 +2261,6 @@ export type MarketCounterpartyAccessRule = {
   decision: MarketAccessDecision;
 };
 
-export type MarketCreditLine = {
-  currency: "USD";
-  kind: MarketCreditKind;
-  limitMinor?: number;
-  revision: number;
-  updatedAt: string;
-};
-
-export type MarketCounterpartyExposure = {
-  currency: "USD";
-  balanceMinor: number;
-  status: string;
-  activeServiceCount: number;
-};
-
 export type MarketCounterparty = {
   id: string;
   buyerEmail: string;
@@ -2808,8 +2268,7 @@ export type MarketCounterparty = {
   status: "active" | "revoked" | string;
   revision: number;
   accessRules: MarketCounterpartyAccessRule[];
-  creditLines: MarketCreditLine[];
-  exposures: MarketCounterpartyExposure[];
+
   createdAt: string;
   updatedAt: string;
 };
@@ -2839,19 +2298,11 @@ export type MarketAccessRequest = {
   resolutionNote?: string;
 };
 
-export type MarketPublicCreditLine = {
-  currency: "USD";
-  limitMinor?: number;
-  enabled: boolean;
-  revision: number;
-  updatedAt: string;
-};
-
 export type MarketAccessDashboard = {
   policies: MarketAccessPolicy[];
   counterparties: MarketCounterparty[];
   accessRequests: MarketAccessRequest[];
-  publicCreditLines: MarketPublicCreditLine[];
+
 };
 
 export type MarketAccessInboxSummary = {
@@ -2896,7 +2347,7 @@ export type ClientMarketProvider = {
   minCyclePriceMinor?: number;
   maxCyclePriceMinor?: number;
   successfulAllocations: number;
-  paymentMethodKinds: string[];
+
   countries: ClientMarketProviderCountry[];
 };
 
@@ -2961,7 +2412,7 @@ export type MarketProvider = {
     averageTps?: number;
     displayOnly: boolean;
   };
-  paymentMethodKinds: string[];
+
   exploration: boolean;
   joinedAt: string;
 };
@@ -3009,8 +2460,7 @@ export type ClientMarketAllocationQuote = {
   status: string;
   expiresAt: string;
   items: ClientMarketQuoteItem[];
-  funding: MarketFundingSummary[];
-  recurringFunding: MarketRecurringFundingSummary[];
+
   walletFunding?: MarketWalletQuoteFunding;
   fundingRail?: "legacy_provider" | "platform_wallet";
 };
@@ -3054,7 +2504,7 @@ export type ClientMarketRental = {
   pricingModel: MarketPricingModel;
   cyclePriceMinor?: number;
   billingInterval?: MarketBillingInterval;
-  recurring?: MarketRecurringContract;
+
   walletContractId?: string;
   walletContract?: WalletLifecycle;
   openWalletDispute?: boolean;
@@ -3063,8 +2513,8 @@ export type ClientMarketRental = {
   offerRevision: number;
   activatedAt?: string;
   expiresAt?: string;
-  paymentMethodKinds: string[];
-  contacts?: PaymentContact[];
+
+  contacts?: ProviderContact[];
   isClientOwner: boolean;
   canRelease: boolean;
   canFinalizeRelease: boolean;
@@ -3093,8 +2543,8 @@ export type ClientMarketHostUsageHistoryEntry = {
   pricingModel: MarketPricingModel;
   currency?: string;
   chargesMinor: number;
-  unbilledMinor: number;
-  invoicedMinor: number;
+  refundedMinor: number;
+  netChargesMinor: number;
 };
 
 export type ClientMarketHostTransferDocument = {
@@ -3174,7 +2624,7 @@ export type ShareMarketSubscription = {
   integrityState: "compatible" | "violated" | "remediating" | "terminated" | string;
   integrityReason?: string;
   integrityViolatedAt?: string;
-  terminationAdjustment?: ShareMarketTerminationAdjustmentSummary;
+
   seatPosition: number;
   parallelLimit?: number;
   tokenLimit?: number;
@@ -3183,8 +2633,9 @@ export type ShareMarketSubscription = {
   pricingModel: MarketPricingModel;
   cyclePriceMinor?: number;
   billingInterval?: MarketBillingInterval;
-  recurring?: MarketRecurringContract;
+
   walletContractId?: string;
+  walletContract?: WalletLifecycle;
   openWalletDispute?: boolean;
   currency?: "USD";
   serviceDurationDays?: number;
@@ -3194,90 +2645,18 @@ export type ShareMarketSubscription = {
   activatedAt?: string;
   serviceStartedAt?: string;
   expiresAt?: string;
-  paymentMethodKinds: string[];
-  contacts?: PaymentContact[];
+
+  contacts?: ProviderContact[];
   canRelease: boolean;
   canForceRevoke: boolean;
   canRetryGrant: boolean;
-  canProposePriceChange: boolean;
-  priceChange?: ShareMarketPriceChange;
+
   releaseReason?: string;
   failureCode?: string;
   grantAttempts?: number;
   releasedAt?: string;
   createdAt: string;
   updatedAt: string;
-};
-
-export type ShareMarketTerminationCalculation = {
-  contractId: string;
-  accountId: string;
-  productKind: string;
-  productRef: string;
-  currency: "USD" | string;
-  serviceStartedAt: string;
-  serviceEndsAt: string;
-  evaluatedAt: string;
-  elapsedBps: number;
-  refundBps: number;
-  refundableBaseUnits: number;
-  amountUnits: number;
-  amountMinor: number;
-};
-
-export type ShareMarketRefundObligation = {
-  id: string;
-  adjustmentId: string;
-  invoiceId: string;
-  amountMinor: number;
-  currency: "USD" | string;
-  status: string;
-  dueAt: string;
-  externalReference?: string;
-  recordedAt?: string;
-  canRecord: boolean;
-};
-
-export type ShareMarketTerminationAdjustmentSummary = {
-  id: string;
-  status: "applied" | "refund_due" | "settled" | string;
-  currency: "USD" | string;
-  elapsedBps: number;
-  refundBps: number;
-  amountMinor: number;
-  prepaidCreditMinor: number;
-  unbilledCreditMinor: number;
-  invoiceCreditMinor: number;
-  externalRefundMinor: number;
-  refundObligationStatus?: "pending" | "recorded" | string;
-};
-
-export type ShareMarketTerminationQuote = {
-  id: string;
-  subscriptionId: string;
-  status: "active" | "consumed" | "expired";
-  expiresAt: string;
-  calculation: ShareMarketTerminationCalculation;
-};
-
-export type ShareMarketTerminationAdjustment = ShareMarketTerminationAdjustmentSummary & {
-  calculation: ShareMarketTerminationCalculation;
-  obligations: ShareMarketRefundObligation[];
-};
-
-export type ShareMarketPriceChange = {
-  id: string;
-  previousDailyRateMinor: number;
-  proposedDailyRateMinor: number;
-  currency: "USD";
-  baseOfferRevision: number;
-  status: "pending" | "accepted";
-  canAccept: boolean;
-  canReject: boolean;
-  canCancel: boolean;
-  createdAt: string;
-  updatedAt: string;
-  respondedAt?: string;
 };
 
 export type ShareMarketSeat = ShareMarketSeatInput & {
@@ -3400,8 +2779,8 @@ export type ShareMarketListing = {
   canReopen: boolean;
   reopenBlockedReason?: string;
   reopenableSeatCount: number;
-  contacts?: PaymentContact[];
-  paymentMethodKinds: string[];
+  contacts?: ProviderContact[];
+
   performance: ShareMarketPerformance;
   reliability: ShareMarketReliability;
   tokenLimit?: number;
@@ -3442,8 +2821,7 @@ export type ShareMarketRentQuote = {
   status: "active" | "consumed" | "expired";
   expiresAt: string;
   trialSecondsRemaining: number;
-  funding?: MarketFundingSummary;
-  recurringFunding?: MarketRecurringFundingSummary;
+
   walletFunding?: MarketWalletQuoteFunding;
   offer: {
     seatId: string;

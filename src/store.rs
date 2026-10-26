@@ -1986,7 +1986,7 @@ impl AppStore {
             ip_hash_salt: Arc::new(salt),
             geo_lookup_base_url: Arc::new("https://ip.im".to_string()),
             market_fx_rate: Arc::new(StdRwLock::new(crate::market_fx::MarketFxSnapshot {
-                rate_micros: crate::market_billing::DEFAULT_USD_CNY_RATE_MICROS,
+                rate_micros: crate::market_common::DEFAULT_USD_CNY_RATE_MICROS,
                 source_timestamp: Some(Utc::now().timestamp()),
                 fetched_at: Some(Utc::now().timestamp()),
             })),
@@ -2202,10 +2202,6 @@ impl AppStore {
             .ok_or_else(|| AppError::NotFound("model price was not found".into()))
     }
 
-    pub(crate) fn market_usd_cny_rate_micros(&self) -> i64 {
-        self.market_fx_snapshot().rate_micros
-    }
-
     pub(crate) fn market_fx_snapshot(&self) -> crate::market_fx::MarketFxSnapshot {
         match self.market_fx_rate.read() {
             Ok(guard) => *guard,
@@ -2245,19 +2241,6 @@ impl AppStore {
             }
         }
         Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_market_usd_cny_rate_micros(&self, rate_micros: i64) {
-        let snapshot = crate::market_fx::MarketFxSnapshot {
-            rate_micros,
-            source_timestamp: Some(Utc::now().timestamp()),
-            fetched_at: Some(Utc::now().timestamp()),
-        };
-        match self.market_fx_rate.write() {
-            Ok(mut guard) => *guard = snapshot,
-            Err(poisoned) => *poisoned.into_inner() = snapshot,
-        }
     }
 
     pub fn sync_database(&self) -> Result<DatabaseHealthSnapshot, AppError> {
@@ -29213,7 +29196,7 @@ mod tests {
             auth_source_hourly_limit: 15,
             ip_blacklist: String::new(),
             free_share_ip_parallel_limit: 1,
-            market_usd_cny_rate_micros: crate::market_billing::DEFAULT_USD_CNY_RATE_MICROS,
+            market_usd_cny_rate_micros: crate::market_common::DEFAULT_USD_CNY_RATE_MICROS,
             market_provider_recommendation_mode:
                 crate::config::MarketProviderRecommendationMode::Shadow,
             ip_intel_endpoints: Vec::new(),
@@ -53447,95 +53430,6 @@ mod tests {
         assert_eq!(source_count, 1);
         assert_eq!(payload_version, 2);
         drop(conn);
-        let _ = std::fs::remove_file(config.database.path);
-    }
-
-    #[tokio::test]
-    async fn market_chat_does_not_publish_private_payment_asset() {
-        let (store, config) = setup_store("client-chat-private-payment-asset").await;
-        let installation_id = "share-chat-installation-public-payment-asset";
-        insert_installation(&store, installation_id).await;
-        ensure_test_chat_room(&store, installation_id).await;
-        let provider = chat_test_session("public-asset-provider", "provider@example.com");
-        insert_chat_user(&store, &provider.user_id, &provider.email).await;
-        let asset_id = store
-            .client_market_store_payment_asset(
-                &provider.user_id,
-                "https://payment.example.com/public.png",
-                &[1, 2, 3, 4],
-            )
-            .await
-            .expect("store public payment asset");
-        let unpublished_asset_id = store
-            .client_market_store_payment_asset(
-                &provider.user_id,
-                "https://payment.example.com/private.png",
-                &[5, 6, 7, 8],
-            )
-            .await
-            .expect("store unpublished payment asset");
-        {
-            let conn = store.conn.lock().await;
-            client_chat::enqueue_client_system_event_tx(
-                &conn,
-                installation_id,
-                "market_billing",
-                "public-payment-asset-event",
-                "payment_due",
-                serde_json::json!({
-                    "summary": "Payment due",
-                    "marketKind": "billing",
-                    "billingEventType": "payment_due",
-                    "installationId": installation_id,
-                    "supplierUserId": provider.user_id.clone(),
-                    "paymentMethods": [{
-                        "kind": "crypto",
-                        "token": "USDT",
-                        "chain": "tron",
-                        "address": "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj",
-                        "assetUrl": format!("/v1/account/payment-assets/{asset_id}"),
-                    }],
-                }),
-                &[provider.user_id.clone()],
-                &Utc::now().to_rfc3339(),
-            )
-            .expect("enqueue public payment asset event");
-        }
-        assert_eq!(
-            store
-                .process_client_chat_system_outbox(100)
-                .await
-                .expect("materialize public payment asset event"),
-            1
-        );
-        assert!(matches!(
-            store
-                .client_market_payment_asset_for_viewer(&asset_id, None)
-                .await,
-            Err(AppError::Forbidden(_))
-        ));
-        assert!(matches!(
-            store
-                .client_market_payment_asset_for_viewer(&unpublished_asset_id, None)
-                .await,
-            Err(AppError::Forbidden(_))
-        ));
-
-        store
-            .seed_legacy_payment_profile(&provider, &[], None)
-            .await
-            .expect("clear live profile and private assets");
-        let remaining_assets: i64 = store
-            .conn
-            .lock()
-            .await
-            .query_row(
-                "SELECT COUNT(*) FROM account_payment_assets WHERE id IN (?1, ?2)",
-                params![asset_id, unpublished_asset_id],
-                |row| row.get(0),
-            )
-            .expect("check private payment asset cleanup");
-        assert_eq!(remaining_assets, 0);
         let _ = std::fs::remove_file(config.database.path);
     }
 

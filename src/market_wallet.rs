@@ -4,7 +4,7 @@
 
 use crate::db::{Connection, OptionalExtension, params};
 use crate::error::AppError;
-use crate::market_billing::MONEY_UNITS_PER_MINOR;
+use crate::market_common::MONEY_UNITS_PER_MINOR;
 use chrono::Utc;
 use serde::{Serialize, Serializer};
 use uuid::Uuid;
@@ -226,7 +226,9 @@ pub(crate) fn wallet_quote_funding_tx(
         held_units: snapshot.held_units,
         committed_units,
         required_units,
-        shortfall_units: total_required.saturating_sub(snapshot.available_units),
+        shortfall_units: total_required
+            .saturating_sub(snapshot.available_units)
+            .max(0),
     })
 }
 
@@ -497,7 +499,7 @@ pub(crate) fn reverse_topup_credit_tx(
         .ok_or_else(|| AppError::BadRequest("reversal overflow".into()))?;
     let available = wallet_snapshot_tx(conn, user_id)?.available_units.max(0);
     // Debit whole cents only, so the shortfall stays an exact cent amount.
-    let per_minor = crate::market_billing::MONEY_UNITS_PER_MINOR;
+    let per_minor = crate::market_common::MONEY_UNITS_PER_MINOR;
     let from_wallet = total.min(available / per_minor * per_minor);
     let shortfall = total - from_wallet;
     let mut postings = vec![Posting {
@@ -1018,6 +1020,25 @@ mod tests {
         for invalid in ["-1", "+1", "1.001", "1.2.3", "1e2", "", ".5"] {
             assert!(parse_usd_minor(invalid).is_err(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn wallet_quote_shortfall_is_zero_for_exact_or_excess_balance() {
+        let conn = memory();
+        let time = now();
+        credit_verified_topup_tx(&conn, "buyer", "quote-funds", 200, "quote-receipt", &time)
+            .unwrap();
+        for (price, expected) in [(0, 0), (100, 0), (200, 0), (201, MONEY_UNITS_PER_MINOR)] {
+            let funding = wallet_quote_funding_tx(&conn, "buyer", price, 0, &time).unwrap();
+            assert_eq!(funding.shortfall_units, expected);
+        }
+        assert_eq!(
+            wallet_quote_funding_tx(&conn, "buyer", 1000, 1, &time)
+                .unwrap()
+                .shortfall_units,
+            0
+        );
+        reconcile_wallet_tx(&conn, "buyer").unwrap();
     }
 
     #[test]

@@ -5,10 +5,10 @@ import { Button } from "@heroui/react";
 import { Loader2, Plus, Save, Trash2 } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { getAccountContacts, updateAccountPaymentContacts } from "@/lib/api";
-import type { PaymentContact, PaymentContactChannel } from "@/lib/types";
+import { getAccountContacts, updateAccountProviderContacts } from "@/lib/api";
+import type { ProviderContact, ProviderContactChannel } from "@/lib/types";
 
-const CHANNELS: PaymentContactChannel[] = ["wechat", "telegram", "custom"];
+const CHANNELS: ProviderContactChannel[] = ["wechat", "telegram", "custom"];
 
 export function AccountContactPanel() {
   const { t } = useLocaleText();
@@ -18,7 +18,7 @@ export function AccountContactPanel() {
     : "anonymous";
   const [snapshot, setSnapshot] = React.useState<{
     actor: string;
-    contacts: PaymentContact[];
+    contacts: ProviderContact[];
     saved: string;
   } | null>(null);
   const [loading, setLoading] = React.useState(false);
@@ -50,14 +50,14 @@ export function AccountContactPanel() {
 
   const contacts = snapshot.contacts;
   const saved = snapshot.saved;
-  const update = (next: PaymentContact[]) => setSnapshot((current) => current?.actor === actor
+  const update = (next: ProviderContact[]) => setSnapshot((current) => current?.actor === actor
     ? { ...current, contacts: next } : current);
   const save = async () => {
     if (!snapshot || snapshot.actor !== actor || saving) return;
     setSaving(true);
     setError("");
     try {
-      const profile = await updateAccountPaymentContacts(contacts);
+      const profile = await updateAccountProviderContacts(contacts);
       setSnapshot({ actor, contacts: profile.contacts || [], saved: JSON.stringify(profile.contacts || []) });
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -80,7 +80,7 @@ export function AccountContactPanel() {
     {contacts.map((contact, index) => <div key={index} className="grid gap-2 sm:grid-cols-[10rem_minmax(0,1fr)_2.75rem] sm:items-end">
       <label className="grid gap-1 text-sm">
         <span>{t("account.contact.channel")}</span>
-        <select className="h-11 rounded-md border border-border bg-background px-3" value={contact.channel} onChange={(event) => update(contacts.map((item, i) => i === index ? { ...item, channel: event.target.value as PaymentContactChannel } : item))}>
+        <select className="h-11 rounded-md border border-border bg-background px-3" value={contact.channel} onChange={(event) => update(contacts.map((item, i) => i === index ? { ...item, channel: event.target.value as ProviderContactChannel } : item))}>
           {CHANNELS.map((channel) => <option key={channel} value={channel}>{t(`account.contact.channel.${channel}`)}</option>)}
         </select>
       </label>

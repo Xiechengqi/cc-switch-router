@@ -41,10 +41,11 @@ test("platform balance has a permanent account destination", () => {
 test("funds, Provider settings and compatibility routes have distinct destinations", () => {
   assert.equal(normalizeDashboardPath("/account/earnings/"), null);
   assert.equal(normalizeDashboardPath("/account/provider-settings/"), "/account/provider-settings/");
-  for (const old of ["payments", "market-readiness", "market-access"]) {
+  for (const old of ["market-readiness", "market-access"]) {
     assert.equal(normalizeDashboardPath(`/account/${old}/`), "/account/provider-settings/");
   }
-  assert.equal(normalizeDashboardPath("/account/billing/"), "/account/wallet/");
+  assert.equal(normalizeDashboardPath("/account/billing/"), null);
+  assert.equal(normalizeDashboardPath("/account/payments/"), null);
 });
 test("Provider income has no retired route or navigation compatibility shim", () => {
   assert.equal(PROVIDER_INCOME_HREF, "/account/provider-settings/#income");

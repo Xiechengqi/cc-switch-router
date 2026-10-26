@@ -7884,7 +7884,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             wallet_snapshot_tx(&conn, "buyer").unwrap().posted_units,
-            100_000 * crate::market_billing::MONEY_UNITS_PER_MINOR
+            100_000 * crate::market_common::MONEY_UNITS_PER_MINOR
         );
         assert_eq!(
             conn.query_row(
@@ -7895,7 +7895,7 @@ mod tests {
             .unwrap(),
             1
         );
-        assert_eq!(conn.query_row("SELECT -SUM(signed_units) FROM market_journal_postings WHERE account_kind = 'platform_fee_revenue'", [], |r| r.get::<_, i64>(0)).unwrap(), 5_000 * crate::market_billing::MONEY_UNITS_PER_MINOR);
+        assert_eq!(conn.query_row("SELECT -SUM(signed_units) FROM market_journal_postings WHERE account_kind = 'platform_fee_revenue'", [], |r| r.get::<_, i64>(0)).unwrap(), 5_000 * crate::market_common::MONEY_UNITS_PER_MINOR);
         assert_eq!(
             crate::market_reconcile::audit_finance_tx(&conn, "2026-10-22T12:00:00Z").unwrap(),
             0
@@ -7912,7 +7912,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             wallet_snapshot_tx(&conn, "buyer").unwrap().posted_units,
-            100_000 * crate::market_billing::MONEY_UNITS_PER_MINOR
+            100_000 * crate::market_common::MONEY_UNITS_PER_MINOR
         );
         assert!(
             conn.execute(

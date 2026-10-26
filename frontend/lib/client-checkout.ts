@@ -1,5 +1,6 @@
 import type { ClientMarketAllocationQuote, WalletLifecycle } from "./types";
 import type { MessageKey } from "./i18n";
+import { validWalletQuoteFunding } from "./market-wallet-quote";
 
 export type ClientDraft = {
   subdomain: string;
@@ -20,7 +21,7 @@ export function clientCheckoutState(quote: ClientMarketAllocationQuote) {
   const unsupported =
     paid.length > 0 &&
     (quote.fundingRail !== "platform_wallet" ||
-      !quote.walletFunding ||
+      !validWalletQuoteFunding(quote.walletFunding) ||
       paid.some(
         (item) =>
           !Number.isFinite(item.trialSecondsRemaining) ||
@@ -31,8 +32,8 @@ export function clientCheckoutState(quote: ClientMarketAllocationQuote) {
     unsupported,
     trial:
       paid.length > 0 && paid.every((item) => item.trialSecondsRemaining > 0),
-    shortfall: quote.walletFunding
-      ? BigInt(quote.walletFunding.shortfallUnits) > 0n
+    shortfall: validWalletQuoteFunding(quote.walletFunding)
+      ? BigInt(quote.walletFunding!.shortfallUnits) > 0n
       : false,
   };
 }
@@ -80,4 +81,9 @@ export function trialHours(seconds: number, locale: string) {
   return (Math.ceil(Math.max(0, seconds) / 36) / 100).toLocaleString(locale, {
     maximumFractionDigits: 2,
   });
+}
+
+/** Disabling renewal keeps an already-paid monthly service until its period end. */
+export function walletReleaseScheduled(contract: WalletLifecycle | undefined, pricingModel: string) {
+  return pricingModel === "prepaid_calendar_month" && contract?.status === "active" && contract.renewalPolicy === "manual";
 }

@@ -59,9 +59,7 @@ export function shareMarketMutationError(reason: unknown, t: MarketTranslate) {
   }
 
   const coded: Partial<Record<string, MessageKey>> = {
-    SHARE_MARKET_PAYMENT_PROFILE_REQUIRED: "shareMarket.error.paymentRequired",
-    MARKET_SUPPLIER_SETTLEMENT_PROFILE_REQUIRED: "shareMarket.error.settlementRequired",
-    MARKET_PREPAID_REQUIRED: "marketFunding.blocked",
+
     DATABASE_UNAVAILABLE: "shareMarket.error.temporarilyUnavailable",
     share_market_client_upgrade_required: "shareMarket.error.clientUpgradeRequired",
     share_market_share_tokens_exhausted: "shareMarket.error.shareTokensExhausted",
@@ -75,8 +73,6 @@ export function shareMarketMutationError(reason: unknown, t: MarketTranslate) {
     share_market_service_term_unfulfillable: "shareMarket.error.termUnfulfillable",
     share_market_seat_capacity_invalid: "shareMarket.error.parallelExceedsShare",
     share_market_contract_settings_protected: "shareMarket.error.settingsProtected",
-    share_market_fixed_term_required: "shareMarket.error.fixedTermRequired",
-    share_market_termination_quote_required: "shareMarket.error.terminationQuoteRequired",
     share_market_reopen_required: "shareMarket.error.reopenRequired",
     share_market_other_active_listing: "shareMarket.error.otherActiveListing",
     share_market_listing_not_closed: "shareMarket.error.listingNotClosed",
@@ -88,8 +84,7 @@ export function shareMarketMutationError(reason: unknown, t: MarketTranslate) {
 
   const message = reason.message.toLowerCase();
   const known: Array<[string, MessageKey]> = [
-    ["configure account payment details", "shareMarket.error.paymentRequired"],
-    ["configure usd settlement terms", "shareMarket.error.settlementRequired"],
+
     ["share must be active", "shareMarket.error.shareInactive"],
     ["disable public free access", "shareMarket.error.publicAccessEnabled"],
     ["pending public free access edit", "shareMarket.error.pendingShareEdit"],
@@ -357,8 +352,7 @@ export function subscriptionStatusKey(status: string): MessageKey | null {
   const keys: Record<string, MessageKey> = {
     grant_pending: "shareMarket.subscription.grantPending",
     active_free: "shareMarket.subscription.activeFree",
-    active_postpaid: "shareMarket.subscription.activePostpaid",
-    active_prepaid: "shareMarket.subscription.activePrepaid",
+    active_postpaid: "shareMarket.subscription.activePaid",
     billing_suspend_pending: "shareMarket.subscription.billingSuspendPending",
     billing_suspended: "shareMarket.subscription.billingSuspended",
     billing_resume_pending: "shareMarket.subscription.billingResumePending",
@@ -409,15 +403,6 @@ export function integrityReasonText(reason: string | undefined, t: MarketTransla
     .filter(Boolean)
     .map((item) => t(keys[item] || "shareMarket.integrity.reason.unknown"));
   return [...new Set(messages)].join(" · ");
-}
-
-export function refundStatusKey(status: string): MessageKey {
-  const keys: Record<string, MessageKey> = {
-    applied: "shareMarket.refund.status.applied",
-    refund_due: "shareMarket.refund.status.refund_due",
-    settled: "shareMarket.refund.status.settled",
-  };
-  return keys[status] || "shareMarket.refund.status.refund_due";
 }
 
 export function grantFailureMessageKey(code?: string): MessageKey {

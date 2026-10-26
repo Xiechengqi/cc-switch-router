@@ -3,7 +3,6 @@ import test from "node:test";
 import {
   catalogNeedsRuntimeSync,
   catalogSeatPreview,
-  canOptionallyTopupRent,
   filterMarketListings,
   filterMergedCatalogListings,
   initialCatalogSeat,
@@ -19,12 +18,10 @@ import {
   pageForShareId,
   paginateListings,
   preserveCatalogSeat,
-  rentConfirmPrimaryAction,
   rentedShareIdsFromSubscriptions,
   showRentQuoteCountdown,
   sortCatalogListings,
-  sortMergedCatalogListings,
-} from "./buyer-catalog-utils";
+  sortMergedCatalogListings} from "./buyer-catalog-utils";
 import {
   integrityReasonText,
   marketProviderStatusView,
@@ -32,7 +29,7 @@ import {
   subscriptionStatusKey,
 } from "./market-utils";
 import { mergeShareMarketSubscriptionPage } from "./subscription-utils";
-import { recurringFundingForRenewal } from "@/lib/market-funding";
+
 import type {
   ShareMarketAppCapability,
   ShareMarketListing,
@@ -44,65 +41,6 @@ const seat = (id: string, status = "available", readOnly = false) => ({ id, stat
 test("multiple idle seats require an explicit selection", () => {
   assert.equal(initialCatalogSeat([seat("a"), seat("b")]), undefined);
   assert.equal(initialCatalogSeat([seat("a")])?.id, "a");
-});
-
-test("rent confirmation prioritizes quote freshness, then funding", () => {
-  const ready = { requiredTopupMinor: 0, topupAvailable: true };
-  const payable = { requiredTopupMinor: 125, topupAvailable: true };
-
-  assert.equal(rentConfirmPrimaryAction(false, undefined), "confirm");
-  assert.equal(rentConfirmPrimaryAction(false, ready), "confirm");
-  assert.equal(rentConfirmPrimaryAction(false, payable), "topup");
-  assert.equal(rentConfirmPrimaryAction(true, payable), "refresh");
-  assert.equal(canOptionallyTopupRent(false, ready), true);
-  assert.equal(canOptionallyTopupRent(false, payable), false);
-  assert.equal(canOptionallyTopupRent(true, ready), false);
-});
-
-test("rent confirmation always offers a useful action when top-up is unavailable", () => {
-  const actionFor = (topupUnavailableReason?: string) => rentConfirmPrimaryAction(false, {
-    requiredTopupMinor: 125,
-    topupAvailable: false,
-    topupUnavailableReason,
-  });
-
-  assert.equal(actionFor("temporarily_unavailable"), "retry");
-  assert.equal(actionFor("settlement_required"), "billing");
-  assert.equal(actionFor("relationship_closed"), "billing");
-  assert.equal(actionFor("router_disabled"), "close");
-  assert.equal(actionFor("router_shadow"), "close");
-  assert.equal(actionFor("region_restricted"), "close");
-  assert.equal(actionFor("credential_storage_unavailable"), "close");
-  assert.equal(actionFor("supplier_unavailable"), "contact");
-  assert.equal(actionFor("future_reason"), "contact");
-  assert.equal(actionFor(), "contact");
-});
-
-test("auto-renew immediately changes the rental shortfall and primary action", () => {
-  const funding = {
-    supplierUserId: "supplier",
-    supplierEmail: "supplier@example.com",
-    currency: "USD" as const,
-    pricingModel: "prepaid_calendar_month",
-    billingInterval: "calendar_month",
-    cyclePriceMinor: 1_000,
-    renewalPolicy: "manual",
-    prepaidBalanceMinor: 1_500,
-    prepaidHeldMinor: 0,
-    prepaidAvailableMinor: 1_500,
-    initialHoldMinor: 1_000,
-    renewalHoldMinor: 0,
-    totalRequiredHoldMinor: 1_000,
-    requiredTopupMinor: 0,
-    topupAvailable: true,
-  };
-
-  const manual = recurringFundingForRenewal(funding, false);
-  const automatic = recurringFundingForRenewal(funding, true);
-  assert.equal(manual.requiredTopupMinor, 0);
-  assert.equal(rentConfirmPrimaryAction(false, manual), "confirm");
-  assert.equal(automatic.requiredTopupMinor, 500);
-  assert.equal(rentConfirmPrimaryAction(false, automatic), "topup");
 });
 
 test("catalog runtime sync polling only activates for stale runtime evidence", () => {
@@ -118,11 +56,15 @@ test("rent quote countdown stays quiet until action is useful", () => {
   assert.equal(showRentQuoteCountdown(true, 90), true);
 });
 
-test("prepaid monthly subscriptions have a visible status label", () => {
+test("retired prepaid subscription states do not revive an old status label", () => {
   assert.equal(
     subscriptionStatusKey("active_prepaid"),
-    "shareMarket.subscription.activePrepaid",
+    null,
   );
+});
+
+test("current paid wallet access does not claim to be postpaid", () => {
+  assert.equal(subscriptionStatusKey("active_postpaid"), "shareMarket.subscription.activePaid");
 });
 
 test("a selected seat is preserved by id without falling back", () => {
@@ -484,7 +426,7 @@ const listing = (
   canDelete: false,
   canReopen: false,
   reopenableSeatCount: 0,
-  paymentMethodKinds: [],
+
   performance: extra.performance || {
     recentRequestCount: 0,
     ttftSampleCount: 0,
@@ -522,11 +464,10 @@ const rental = (
   seatPosition: extra.seatPosition || 1,
   tokenPeriod: extra.tokenPeriod || "lifetime",
   offerRevision: extra.offerRevision || 1,
-  paymentMethodKinds: extra.paymentMethodKinds || [],
+
   canRelease: extra.canRelease ?? true,
   canForceRevoke: false,
   canRetryGrant: false,
-  canProposePriceChange: false,
   createdAt: extra.createdAt || extra.updatedAt || "2026-01-01T00:00:00Z",
   updatedAt: extra.updatedAt || "2026-01-01T00:00:00Z",
   ...extra,

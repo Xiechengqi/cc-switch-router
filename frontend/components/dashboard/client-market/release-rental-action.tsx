@@ -16,6 +16,7 @@ import {
   cleanupPhaseLabelKey,
 } from "@/components/dashboard/client-market/host-utils";
 import type { ClientMarketRental, ProvisioningJob } from "@/lib/types";
+import { walletReleaseScheduled } from "@/lib/client-checkout";
 
 const POLL_INTERVAL_MS = 1200;
 const POLL_MAX_ATTEMPTS = 180;
@@ -258,18 +259,18 @@ export function ReleaseRentalAction({
     job?.status === "failed" ? "failed" : job?.status === "succeeded" ? "success" : "running";
   const settled = job?.status === "failed" || job?.status === "succeeded";
   const recurring = rental.pricingModel === "prepaid_calendar_month"
-    ? rental.recurring
+    ? rental.walletContract
     : undefined;
   const schedulesAtPeriodEnd = recurring?.status === "active";
-  const periodEnd = recurring?.currentPeriodEnd
+  const periodEnd = recurring?.periodEnd && Number.isFinite(Date.parse(recurring.periodEnd))
     ? new Intl.DateTimeFormat(locale, {
         dateStyle: "medium",
         timeStyle: "short",
-      }).format(new Date(recurring.currentPeriodEnd))
+      }).format(new Date(recurring.periodEnd))
     : "—";
   const showReleaseButton = rental.canRelease
     && rental.status !== "releasing"
-    && recurring?.cancelAtPeriodEnd !== true;
+    && !walletReleaseScheduled(rental.walletContract, rental.pricingModel);
 
   return (
     <>

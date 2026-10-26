@@ -80,7 +80,7 @@ impl SettingsCategory {
             }
             Self::Observability => "Metrics, clock health, and Server audit-log collection.",
             Self::Marketplace => {
-                "Share and Client Market policy, billing, Binance settlement, and host intelligence."
+                "Share and Client Market policy, wallet payments, and host intelligence."
             }
         }
     }
@@ -1391,31 +1391,6 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         placeholder: None,
         dynamic_group: Some(DynamicGroup::MarketProviderRecommendation),
     },
-    // ── Binance settlement ──
-    SettingsField {
-        key: "CC_SWITCH_ROUTER_BINANCE_AUTO_SETTLEMENT_MODE",
-        label: "Binance auto-settlement mode",
-        group: "Binance settlement",
-        field_type: FieldType::Select,
-        required: false,
-        restart_required: true,
-        default: Some("disabled"),
-        description: "Choose disabled, observation-only shadow, or globally enabled automatic settlement. After restart, each shadow Provider account must explicitly enable settlement with its saved credentials. Router manages credential encryption and safe connection defaults automatically.",
-        placeholder: None,
-        dynamic_group: None,
-    },
-    SettingsField {
-        key: "CC_SWITCH_ROUTER_BINANCE_SOCKS_PROXY_URL",
-        label: "Binance SOCKS5 proxy",
-        group: "Binance settlement",
-        field_type: FieldType::Secret,
-        required: false,
-        restart_required: true,
-        default: None,
-        description: "Optional proxy used only for Binance checks and Pay polling. Use socks5h:// so DNS also goes through the proxy.",
-        placeholder: Some("socks5h://127.0.0.1:1080"),
-        dynamic_group: None,
-    },
     // ── External verification ──
     SettingsField {
         key: "CC_SWITCH_ROUTER_VERIFICATION_SERVICE_BASE_URL",
@@ -2024,9 +1999,6 @@ fn field_to_view(field: &SettingsField) -> SettingsFieldView {
         dependencies: dependencies_for_field(field.key),
         options: match field.key {
             "CC_SWITCH_ROUTER_DB_MODE" => vec!["local".into(), "turso".into()],
-            "CC_SWITCH_ROUTER_BINANCE_AUTO_SETTLEMENT_MODE" => {
-                vec!["disabled".into(), "shadow".into(), "enabled".into()]
-            }
             "CC_SWITCH_ROUTER_MARKET_PROVIDER_RECOMMENDATION_MODE" => {
                 vec!["off".into(), "shadow".into(), "on".into()]
             }
@@ -2062,9 +2034,7 @@ fn category_for_group(group: &str) -> SettingsCategory {
         | "Bark alerts"
         | "Bark channel" => SettingsCategory::Notifications,
         "Metrics" | "Clock health" | "Server logs" => SettingsCategory::Observability,
-        "Free share" | "Market billing" | "Binance settlement" | "Client Market" => {
-            SettingsCategory::Marketplace
-        }
+        "Free share" | "Market billing" | "Client Market" => SettingsCategory::Marketplace,
         _ => SettingsCategory::GeneralDisplay,
     }
 }
@@ -2083,8 +2053,6 @@ fn risk_for_field(field: &SettingsField) -> RiskLevel {
         | "CC_SWITCH_ROUTER_PROVISION_SSH_PUBLIC_KEY_PATH"
         | "CC_SWITCH_ROUTER_ADMIN_EMAILS"
         | "CC_SWITCH_ROUTER_IP_BLACKLIST"
-        | "CC_SWITCH_ROUTER_BINANCE_AUTO_SETTLEMENT_MODE"
-        | "CC_SWITCH_ROUTER_BINANCE_SOCKS_PROXY_URL"
         | "CC_SWITCH_ROUTER_BARK_SERVER_URL"
         | "CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY"
         | "CC_SWITCH_ROUTER_BARK_CREDENTIAL_KEY_VERSION" => RiskLevel::Critical,
@@ -3093,11 +3061,6 @@ fn normalize_value(field: &SettingsField, raw: &str) -> Result<Option<String>, A
                     field.key
                 ))),
             },
-            "CC_SWITCH_ROUTER_BINANCE_AUTO_SETTLEMENT_MODE" => {
-                crate::binance_settlement::GlobalMode::parse(trimmed)
-                    .map(|mode| Some(mode.as_str().to_string()))
-                    .map_err(|error| AppError::BadRequest(error.to_string()))
-            }
             "CC_SWITCH_ROUTER_MARKET_PROVIDER_RECOMMENDATION_MODE" => {
                 crate::config::MarketProviderRecommendationMode::parse(trimmed)
                     .map(|mode| Some(mode.as_str().to_string()))
@@ -3270,11 +3233,6 @@ fn normalize_value(field: &SettingsField, raw: &str) -> Result<Option<String>, A
         }
         FieldType::Secret if field.key == "CC_SWITCH_ROUTER_ALERT_BARK_DEVICE_KEY" => {
             crate::bark::validate_device_key(trimmed)
-                .map_err(|error| AppError::BadRequest(format!("{}: {error}", field.key)))?;
-            Ok(Some(trimmed.to_string()))
-        }
-        FieldType::Secret if field.key == "CC_SWITCH_ROUTER_BINANCE_SOCKS_PROXY_URL" => {
-            crate::binance_settlement::validate_binance_socks_proxy_url(trimmed)
                 .map_err(|error| AppError::BadRequest(format!("{}: {error}", field.key)))?;
             Ok(Some(trimmed.to_string()))
         }
@@ -4467,36 +4425,6 @@ mod tests {
     }
 
     #[test]
-    fn binance_settings_expose_mode_and_dedicated_socks_proxy() {
-        let mode = field_by_key("CC_SWITCH_ROUTER_BINANCE_AUTO_SETTLEMENT_MODE").unwrap();
-        assert_eq!(
-            normalize_value(mode, " ShAdOw ").unwrap(),
-            Some("shadow".into())
-        );
-        assert!(normalize_value(mode, "live").is_err());
-        let proxy = field_by_key("CC_SWITCH_ROUTER_BINANCE_SOCKS_PROXY_URL").unwrap();
-        assert_eq!(
-            normalize_value(proxy, " socks5h://proxy.example:1080 ").unwrap(),
-            Some("socks5h://proxy.example:1080".into())
-        );
-        assert!(normalize_value(proxy, "socks5://proxy.example:1080").is_err());
-        assert!(normalize_value(proxy, "http://proxy.example:1080").is_err());
-        assert!(normalize_value(proxy, "socks5h://proxy.example").is_err());
-        for hidden in [
-            "CC_SWITCH_ROUTER_BINANCE_MASTER_KEY",
-            "CC_SWITCH_ROUTER_BINANCE_MASTER_KEY_VERSION",
-            "CC_SWITCH_ROUTER_BINANCE_API_BASE",
-            "CC_SWITCH_ROUTER_BINANCE_PAYMENT_HOME_REGION",
-            "CC_SWITCH_ROUTER_BINANCE_POLL_INTERVAL_SECS",
-        ] {
-            assert!(
-                field_by_key(hidden).is_none(),
-                "{hidden} must stay advanced-only"
-            );
-        }
-    }
-
-    #[test]
     fn client_server_release_is_dynamic_and_strictly_canonicalized() {
         let field = field_by_key("CC_SWITCH_ROUTER_CLIENT_SERVER_RELEASE").unwrap();
         assert_eq!(
@@ -5441,8 +5369,8 @@ mod tests {
     #[test]
     fn settings_contract_exposes_all_fields_in_seven_domains() {
         let schema = schema_response();
-        assert_eq!(SETTINGS_FIELDS.len(), 131);
-        assert_eq!(schema.fields.len(), 131);
+        assert_eq!(SETTINGS_FIELDS.len(), 129);
+        assert_eq!(schema.fields.len(), 129);
         assert_eq!(schema.categories.len(), 7);
         assert!(
             SETTINGS_FIELDS
@@ -5456,7 +5384,7 @@ mod tests {
                 .iter()
                 .map(|category| category.field_count)
                 .sum::<usize>(),
-            131
+            SETTINGS_FIELDS.len()
         );
         assert!(schema.fields.iter().all(|field| !field.group.is_empty()));
         let webhook = schema
@@ -5486,29 +5414,6 @@ mod tests {
             .expect("clock sources field");
         assert_eq!(clock_sources.constraints.min_items, Some(3));
         assert_eq!(clock_sources.constraints.max_items, Some(5));
-        let binance_mode = schema
-            .fields
-            .iter()
-            .find(|field| field.key == "CC_SWITCH_ROUTER_BINANCE_AUTO_SETTLEMENT_MODE")
-            .expect("Binance mode field");
-        assert_eq!(binance_mode.category, SettingsCategory::Marketplace);
-        assert_eq!(binance_mode.options, ["disabled", "shadow", "enabled"]);
-        assert!(matches!(binance_mode.risk, RiskLevel::Critical));
-        assert_eq!(
-            schema
-                .fields
-                .iter()
-                .filter(|field| field.group == "Binance settlement")
-                .count(),
-            2
-        );
-        let binance_proxy = schema
-            .fields
-            .iter()
-            .find(|field| field.key == "CC_SWITCH_ROUTER_BINANCE_SOCKS_PROXY_URL")
-            .expect("Binance proxy field");
-        assert!(matches!(binance_proxy.risk, RiskLevel::Critical));
-        assert!(binance_proxy.restart_required);
         for key in [
             "CC_SWITCH_ROUTER_BARK_SERVER_URL",
             "CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY",
@@ -5877,7 +5782,7 @@ mod tests {
             auth_source_hourly_limit: 10,
             ip_blacklist: String::new(),
             free_share_ip_parallel_limit: 1,
-            market_usd_cny_rate_micros: crate::market_billing::DEFAULT_USD_CNY_RATE_MICROS,
+            market_usd_cny_rate_micros: crate::market_common::DEFAULT_USD_CNY_RATE_MICROS,
             market_provider_recommendation_mode:
                 crate::config::MarketProviderRecommendationMode::Shadow,
             ip_intel_endpoints: Vec::new(),

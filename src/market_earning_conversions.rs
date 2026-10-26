@@ -4,7 +4,7 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
-    routing::{get, post},
+    routing::get,
 };
 #[cfg(test)]
 use chrono::Utc;
@@ -56,14 +56,7 @@ async fn session(
 }
 pub fn router() -> Router<ServerState> {
     Router::new()
-        .route(
-            "/v1/market-provider-finance/wallet-conversion-quotes",
-            post(retired_manual_conversion),
-        )
-        .route(
-            "/v1/market-provider-finance/wallet-conversions",
-            get(list).post(retired_manual_conversion),
-        )
+        .route("/v1/market-provider-finance/wallet-conversions", get(list))
         .route(
             "/v1/market-provider-finance/wallet-conversions/:id",
             get(detail),
@@ -551,7 +544,7 @@ fn credit_lots_tx(
             "earning_conversion",
             &id,
             &format!("earnings_converted:{id}"),
-            serde_json::json!({"conversionId":id,"amountUnits":amount.to_string(),"amountMinor":amount / crate::market_billing::MONEY_UNITS_PER_MINOR}),
+            serde_json::json!({"conversionId":id,"amountUnits":amount.to_string(),"amountMinor":amount / crate::market_common::MONEY_UNITS_PER_MINOR}),
             at,
         )?;
     }
@@ -601,18 +594,6 @@ fn page_tx(conn: &Connection, user: &str, q: &PageQuery) -> Result<Page, AppErro
     items.truncate(50);
     let next_cursor = more.then(|| items.last().unwrap().id.clone());
     Ok(Page { items, next_cursor })
-}
-async fn retired_manual_conversion(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, AppError> {
-    session(&state, &headers).await?;
-    Err(AppError::Coded {
-        status: StatusCode::GONE,
-        code: "MANUAL_EARNING_CONVERSIONS_RETIRED",
-        message: "matured earnings are automatically credited to platform balance; no confirmation is needed".into(),
-        details: serde_json::json!({ "walletUrl": "/account/wallet/" }),
-    })
 }
 
 /// One eligible lot, exact to the ledger unit. The old `quote` table is now

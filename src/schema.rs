@@ -300,6 +300,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         86,
         include_str!("../schema/0086_market_notification_deliveries.sql"),
     ),
+    (
+        87,
+        include_str!("../schema/0087_market_provider_contacts.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -999,6 +1003,49 @@ mod tests {
     }
 
     #[test]
+    fn migration_87_separates_provider_contacts_without_copying_payment_methods_or_money() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 86);
+        let at = "2026-10-26T00:00:00Z";
+        conn.execute("INSERT INTO users(id,email_normalized,status,created_at,last_login_at) VALUES('provider','provider@example.test','active',?1,?1)", params![at]).unwrap();
+        let contacts = r#"[{"channel":"telegram","handle":"@support"}]"#;
+        conn.execute(r#"INSERT INTO account_payment_profiles(user_id,owner_email,methods_json,contacts_json,updated_at) VALUES('provider','provider@example.test','[{"kind":"binance"}]',?1,?2)"#,params![contacts,at]).unwrap();
+        conn.execute("INSERT INTO account_payment_profiles(user_id,owner_email,contacts_json,updated_at) VALUES('orphan','orphan@example.test','[]',?1)",params![at]).unwrap();
+        crate::market_wallet::credit_verified_topup_tx(
+            &conn,
+            "provider",
+            "contact-migration",
+            123,
+            "receipt",
+            at,
+        )
+        .unwrap();
+        let before = crate::market_wallet::wallet_snapshot_tx(&conn, "provider").unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        let saved: String = conn
+            .query_row(
+                "SELECT contacts_json FROM market_provider_contacts WHERE user_id = 'provider'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(saved, contacts);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM market_provider_contacts", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            1
+        );
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM pragma_table_info('market_provider_contacts') WHERE name = 'methods_json'", [], |row|row.get::<_,i64>(0)).unwrap(), 0);
+        let after = crate::market_wallet::wallet_snapshot_tx(&conn, "provider").unwrap();
+        assert_eq!(after.posted_units, before.posted_units);
+        assert_eq!(after.held_units, before.held_units);
+        crate::market_wallet::reconcile_wallet_tx(&conn, "provider").unwrap();
+    }
+
+    #[test]
     fn migration_84_preserves_frozen_orders_and_requires_explicit_automatic_consent() {
         let conn = memory_connection();
         install_schema_through(&conn, 83);
@@ -1146,7 +1193,7 @@ mod tests {
             0
         );
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM pragma_table_info('market_c2c_policy') WHERE name='acceptance_minutes'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
-        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",[],|r|r.get::<_,i64>(0)).unwrap(),234);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",[],|r|r.get::<_,i64>(0)).unwrap(),235);
         for id in [
             "awaiting_seller",
             "awaiting_payment",
@@ -1632,7 +1679,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count baseline tables");
-        assert_eq!(table_count, 234);
+        assert_eq!(table_count, 235);
         let removed_client_recovery_table_count = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -2213,7 +2260,7 @@ mod tests {
             .unwrap();
         apply(&conn).unwrap();
         apply(&conn).unwrap();
-        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",[],|r|r.get::<_,i64>(0)).unwrap(),234);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",[],|r|r.get::<_,i64>(0)).unwrap(),235);
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM market_journal_postings", [], |r| r
                 .get::<_, i64>(0))
@@ -2440,7 +2487,8 @@ mod tests {
         // Twelve commission/conversion tables, seven C2C tables and one
         // narrowly scoped dispute-handler authorization table, plus immutable
         // session authorizations and per-channel notification deliveries.
-        assert_eq!(tables_after - tables_before, 22);
+        // Independent business contacts add one table.
+        assert_eq!(tables_after - tables_before, 23);
         assert_eq!(
             conn.query_row(
                 "SELECT converted_units FROM market_provider_earning_lots WHERE id = 'old-lot'",

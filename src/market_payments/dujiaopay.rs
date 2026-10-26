@@ -245,7 +245,8 @@ pub(super) fn create_order_body(input: &CreateOrderInput<'_>) -> Result<Vec<u8>,
     if let Some(metadata) = &input.metadata {
         data["metadata"] = metadata.clone();
     }
-    serde_json::to_vec(&data).map_err(|_| AppError::Internal("encode DujiaoPay order failed".into()))
+    serde_json::to_vec(&data)
+        .map_err(|_| AppError::Internal("encode DujiaoPay order failed".into()))
 }
 
 /// The chain of a configured method. Known tokens use the documented rail
@@ -413,7 +414,8 @@ impl Client {
         if bytes.is_empty() && empty_cancel_response {
             return Ok(Value::Null);
         }
-        serde_json::from_slice::<Value>(&bytes).map_err(|_| unavailable("DujiaoPay response invalid"))
+        serde_json::from_slice::<Value>(&bytes)
+            .map_err(|_| unavailable("DujiaoPay response invalid"))
     }
 
     pub async fn whoami(&self, credentials: &Credentials) -> Result<String, AppError> {
@@ -543,7 +545,14 @@ impl Client {
             .collect::<Vec<_>>()
             .join("&");
         let value = self
-            .request(credentials, Method::GET, "/v1/orders", &raw_query, None, None)
+            .request(
+                credentials,
+                Method::GET,
+                "/v1/orders",
+                &raw_query,
+                None,
+                None,
+            )
             .await?;
         let source = payload(&value);
         let entries = source
@@ -553,7 +562,8 @@ impl Client {
         let orders: Vec<ListedOrder> = entries
             .iter()
             .filter_map(|order| {
-                let order_id = optional_string(order, "order_id").filter(|id| valid_order_id(id))?;
+                let order_id =
+                    optional_string(order, "order_id").filter(|id| valid_order_id(id))?;
                 Some(ListedOrder {
                     order_id,
                     merchant_order_id: optional_string(order, "merchant_order_id"),
@@ -1402,10 +1412,22 @@ mod tests {
         };
         let cases = [
             (401, "auth.request_unauthorized", GatewayErrorKind::Auth),
-            (429, "billing.api_rate_limited", GatewayErrorKind::RateLimited),
+            (
+                429,
+                "billing.api_rate_limited",
+                GatewayErrorKind::RateLimited,
+            ),
             (422, "order.no_capacity", GatewayErrorKind::Capacity),
-            (422, "order.idempotency_conflict", GatewayErrorKind::Idempotency),
-            (409, "order.merchant_order_id_conflict", GatewayErrorKind::Idempotency),
+            (
+                422,
+                "order.idempotency_conflict",
+                GatewayErrorKind::Idempotency,
+            ),
+            (
+                409,
+                "order.merchant_order_id_conflict",
+                GatewayErrorKind::Idempotency,
+            ),
             (404, "order.not_found", GatewayErrorKind::NotFound),
             (409, "order.not_cancelable", GatewayErrorKind::Conflict),
             (400, "request.invalid_argument", GatewayErrorKind::Rejected),
@@ -1539,7 +1561,10 @@ mod tests {
         assert_eq!(page.returned, 3);
         assert!(!page.complete());
         assert!(page.is_last(3));
-        assert_eq!(page.orders[0].merchant_order_id.as_deref(), Some("router-x"));
+        assert_eq!(
+            page.orders[0].merchant_order_id.as_deref(),
+            Some("router-x")
+        );
         assert!(page.orders[1].merchant_order_id.is_none());
         server.abort();
     }
@@ -1580,4 +1605,3 @@ mod tests {
         assert!(unsafe_terms.payable_amount.is_none());
     }
 }
-

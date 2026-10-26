@@ -153,7 +153,7 @@ Gateway proxy 的当前签名只绑定 Gateway ID、固定 action、原始 body 
 /_market/proxy/*
 ```
 
-它们只在 frozen baseline、migration 19/21、显式 `410` 和负向退休测试中出现；migration 21 完成后不存在可查询的旧 archive。Share Market、Client Market、`/v1/market-access/*` 与 `/v1/market-billing/*` 是 Router 内建能力，名称中的 market 不表示旧 Token Market。
+它们只在 frozen baseline、migration 19/21、显式 `410` 和负向退休测试中出现；migration 21 完成后不存在可查询的旧 archive。Share Market、Client Market、`/v1/market-access/*` 与 `/v1/market-wallet/*` 是 Router 内建能力，名称中的 market 不表示旧 Token Market。
 
 ---
 
@@ -313,7 +313,7 @@ Server 要求:
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
-| `GET` | `/v1/share-market/listings` | 公开 catalog(含统一准入与授信计算后的 `canRent`) |
+| `GET` | `/v1/share-market/listings` | 公开 catalog(含商品准入与可用性计算后的 `canRent`) |
 | `POST` | `/v1/share-market/listings` | 添加 Share 挂牌(1–20 座位) |
 | `DELETE` | `/v1/share-market/listings/:id` | 停止挂售；空闲车位报价 revision 递增，未提交 quote 立即失效 |
 | `POST` | `/v1/share-market/listings/:id/reopen` | 原子恢复原 listing，可修改并重新发布旧车位，同时添加新车位 |
@@ -341,54 +341,24 @@ Server 要求:
 - `GET/PUT /v1/market-wallet/contracts/:id/renewal` 为买家专属月租管理接口，读取包含剩余试用；更新携带 `expectedPolicy` 防止覆盖其他会话的修改。
 - 商品页不展示 Provider 收款方式；平台充值渠道只在钱包充值流程出现。充值返回时重新报价，不自动购买；密码不得通过 URL 或持久化草稿传递。
 
-### 7.2 Share / Client Market 统一准入与历史授信
+### 7.2 Share / Client Market 统一准入
 
-平台钱包启用后，下述授信、公共额度及供应商结算规则仅用于旧资金路径；新的付费租用仍执行供应商准入，但不要求供应商授信。
-
-Share 与 Client Host 的新租用都执行供应商准入，但策略按「产品 + 价格类型」拆成四个独立作用域：`share/free`、`share/paid`、`client_host/free`、`client_host/paid`。免费作用域隐式默认 `blacklist`，便于未知用户先体验；付费作用域隐式默认 `whitelist`，必须先建立信任和授信。供应商可按规范化邮箱添加买家，买家尚未注册时可预授权；首次租用时 Router 按已验证邮箱绑定 `buyer_user_id`。每个关系可对四个作用域分别设置 `inherit`、`allow` 或 `deny`。
-
-- 白名单模式下，只有有效关系且对应作用域明确 `allow` 的买家可新租；黑名单模式下，除对应作用域明确 `deny` 外均可新租。免费或付费、Share 或 Host 的规则互不隐式继承。
-- 付费租用还要求同一买家和供应商存在 USD `limited` 或 `unlimited` 私有授信。有限额度是账户自动出账边界；无限额度不自动出账,由任一方发起清账。
-- 只有从白名单实际切换到黑名单时必须提交风险确认；重复保存黑名单不重复要求确认。供应商可另行开启有限公共额度供付费黑名单作用域中的未知买家使用，但公共额度不能设为无限。
-- `GET /v1/share-market/listings` 的座位与 `GET /v1/client-market/hosts` 的 Host 都返回 `sellerApprovalRequired`。该字段只面向已登录的非 Owner,表示当前供应商准入不允许该买家；前端据此保留「租用」/「新建」入口并引导联系 Owner,不得把服务端英文拒绝消息直接展示为红色错误。Share 引导到对应 Client 聊天室；Client Host 展示 Owner 邮箱及其公开联系方式。
-- 模式切换和产品规则更新只影响新租用。撤销整个买家关系会把该买家的账户信用设为 `none` 并终止现有付费服务；以后确认历史账单也不会恢复这些服务。现有免费服务不因单独修改策略而中断,Owner 可另行强制回收。
-- 所有更新操作使用 revision 做乐观并发控制；下列 `PUT` 请求必须提交当前资源的 `expectedRevision`，新资源提交 `0`。浏览器可用用户 Session；外部系统可用用户 API Token,读取和写入分别要求 `market:access:read`、`market:access:write` scope。
-- 白名单买家可从具体 Share seat 或 Client Host 发起「申请准入」。同一买家、供应商、产品和价格作用域只保留一个待处理申请；拒绝后 24 小时内不能重复申请。申请记录目标名称、当时的日费和币种供供应商判断，供应商的「市场准备」与「市场准入」入口显示待处理数量；最终租用仍校验商品当前 `offerRevision`。
-- 免费申请批准只允许对应免费作用域。付费申请必须在同一 libSQL Immediate 事务中同时允许对应付费作用域并授予有效 USD 有限或无限额度；任一步失败时关系、规则、额度和申请状态全部回滚。供应商拒绝必须提交原因，买家可用申请 revision 取消仍在等待的申请。
+准入按 share/free、share/paid、client_host/free、client_host/paid 隔离。免费默认 blacklist，付费默认 whitelist；关系支持邮箱预授权，首次使用绑定已验证用户。每个作用域可设置 inherit / allow / deny。准入不创建信用或债务，余额是否足够由钱包报价与提交事务判断。
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
-| `GET` | `/v1/market-access/dashboard` | 读取产品模式、可信买家、授信与当前风险敞口 |
-| `GET` | `/v1/market-access/inbox-summary` | 读取供应商待处理准入申请数量，用于导航角标 |
-| `PUT` | `/v1/market-access/policies/:product_kind/:pricing_kind` | 独立切换四个作用域的白名单或黑名单模式 |
-| `POST` | `/v1/market-access/counterparties` | 按邮箱创建或重新启用可信买家关系 |
-| `PUT` | `/v1/market-access/counterparties/batch` | 原子保存多个买家关系、四作用域规则和 USD 授信 |
-| `PUT` | `/v1/market-access/counterparties/:id` | 更新产品规则或撤销关系 |
-| `PUT` | `/v1/market-access/counterparties/:id/credit-lines/:currency` | 更新买家 USD 私有信用额度 |
-| `PUT` | `/v1/market-access/public-credit-lines/:currency` | 更新黑名单模式的有限公共额度 |
-| `POST` | `/v1/market-access/requests` | 买家按 `targetKind + targetId` 申请对应供应商作用域 |
-| `POST` | `/v1/market-access/requests/:id/approve` | 供应商批准；付费申请可原子携带信用额度 |
-| `POST` | `/v1/market-access/requests/:id/reject` | 供应商填写原因并拒绝申请 |
-| `POST` | `/v1/market-access/requests/:id/cancel` | 买家取消自己的待处理申请 |
+| GET | /v1/market-access/dashboard | 策略、关系与规则 |
+| GET | /v1/market-access/inbox-summary | 待处理申请数量 |
+| PUT | /v1/market-access/policies/:product_kind/:pricing_kind | 更新准入模式 |
+| POST | /v1/market-access/counterparties | 添加邮箱关系 |
+| PUT | /v1/market-access/counterparties/batch | 原子更新多名买家及其规则 |
+| PUT | /v1/market-access/counterparties/:id | 更新关系或撤销 |
+| POST | /v1/market-access/requests | 创建准入申请 |
+| POST | /v1/market-access/requests/:id/approve | 批准商品准入 |
+| POST | /v1/market-access/requests/:id/reject | 拒绝申请并记录原因 |
+| POST | /v1/market-access/requests/:id/cancel | 买家取消申请 |
 
-写入请求使用 camelCase JSON，未知字段会被拒绝：
-
-| 路径 | 关键请求字段 |
-|---|---|
-| `PUT /policies/:product_kind/:pricing_kind` | `mode`、从白名单切换到黑名单时的 `riskAcknowledged: true`、`expectedRevision` |
-| `POST /counterparties` | `email`、`accessRules[] { productKind, pricingKind, decision }`，可选初始 `creditLines[] { currency, kind, limitMinor?, riskAcknowledged? }` |
-| `PUT /counterparties/batch` | `updates[] { id, expectedRevision, status?, accessRules[], creditLines[] }`；每条 `creditLines[]` 还携带自己的 `expectedRevision` |
-| `PUT /counterparties/:id` | 本次变更的 `accessRules[] { productKind, pricingKind, decision }`、可选 `status`、`expectedRevision` |
-| `PUT /counterparties/:id/credit-lines/:currency` | `kind`(`none` / `limited` / `unlimited`)、有限额度的 `limitMinor`、无限额度的 `riskAcknowledged: true`、`expectedRevision` |
-| `PUT /public-credit-lines/:currency` | `enabled`、启用时的有限 `limitMinor` 与 `riskAcknowledged: true`、`expectedRevision` |
-| `POST /requests` | `targetKind`(`share_seat` / `client_host`)、`targetId` |
-| `POST /requests/:id/approve` | `expectedRevision`；付费申请在新增或修改授信时携带 `creditLine { currency: "USD", kind, limitMinor?, riskAcknowledged?, expectedRevision }`，沿用既有有效授信时可省略，免费申请不得携带 |
-| `POST /requests/:id/reject` | `expectedRevision`、必填 `reason` |
-| `POST /requests/:id/cancel` | `expectedRevision` |
-
-`limitMinor` 使用 USD 最小单位（美分）且范围为 `1..=100000000`；路径币种仅接受 `USD`。私有无限额度和任何公共额度都必须显式确认风险，公共额度始终只能是有限额度。
-
-Client Host 继续使用独立的免费期限契约：Host 创建、编辑与导入接口接受 `freeDurationDays=1..365` 或 `null`（永久），付费 Host 拒绝该字段。Allocation Quote 冻结期限和 `offerRevision`；倒计时从 Client provisioning 成功、订阅写入 `activatedAt` 时开始。到期前 24 小时只产生一次临期事件，到期后 Router 以 `free_period_expired` 调用现有安全 cleanup。清理失败时租约保持 `release_failed` 且 Host 继续隔离，不会错误回到 `idle`。
+写入要求 expectedRevision，批量冲突整体回滚。审批不接受旧 creditLine 参数。Session 与 scoped API Token 继续按 read/write 隔离。GET/PUT /v1/account/provider-contacts 只管理业务联系方式，不含收款账户、二维码或密钥。
 
 ### 7.2.1 Market Provider identity 与排名 API
 
@@ -398,49 +368,32 @@ Client Host 继续使用独立的免费期限契约：Host 创建、编辑与导
 |---|---|---|
 | `GET` | `/v1/market-providers` | 公开当前 last-good generation 和 Provider 排名列表；strong ETag，允许 public cache |
 | `GET` | `/v1/market-providers/:id` | 公开 Provider 详情、Share listing 与 Client Host 国家供给 |
-| `GET` | `/v1/market-providers/me/funding` | 必须有 Router 用户 Session；只返回当前买家的 Provider 资金关系，`private, no-store` |
 
 v1 权重固定为服务质量 45%、有效选择 30%、履约 15%、供给广度 10%；正式名次要求至少 3 个不同 Router 买家账户和 7 个观测日。免费选择权重为付费选择的 0.25；pending Share grant、自租和一天内释放不算有效选择，`grant_failed` 进入履约失败分母。自租按用户 ID 和双方 canonical email 双重排除；Share 历史质量、选择、履约和性能按显式的 listing Provider 半开时间窗归属，关闭、重开或换主不会移动旧证据；当前供给只统计与公开 catalog 一致的 active Share/可见 seat。这里的账户去重不是 KYC 或完整反女巫证明。TTFT/TPS 明确为 display-only。官方身份没有 score boost，探索展示不改写 `rankPosition`。
 
 一个 generation 只有在完整 entries 与 `published` 状态同事务提交后才可见。`building` 或 `failed` generation 不得替换 last-good；超过 30 分钟只标记 `stale`，不能用不完整新数据覆盖。没有任何已发布代次时端点返回 503。推荐模式由 `CC_SWITCH_ROUTER_MARKET_PROVIDER_RECOMMENDATION_MODE=off|shadow|on` 控制，默认 `shadow`；Share/Client 响应携带 `recommendationMode`，只有 `on` 改变推荐顺序，显式价格/空闲/在线率排序不受影响。
 
-私有资金汇总按「买家 + Market Provider」去重共享的预付余额和信用；Share/Client daily rate 分别相加，calendar-month contract 按合同汇总。无限信用返回 Provider 数，不转换为虚构金额。完整算法和运维边界见 [docs/provider-ranking.md](docs/provider-ranking.md)。
+所有供应商共用一份平台余额，不提供分户资金汇总。完整算法和运维边界见 [docs/provider-ranking.md](docs/provider-ranking.md)。
 
-### 7.3 Share / Client Market 历史后付费
+### 7.3 平台钱包与商品生命周期
 
-本节描述旧资金路径。新的平台钱包租用遵循上文钱包购买契约，不使用商家直付与付款声明。
+Share 与 Client Host 付费报价冻结商品条款及资金需求。提交只接受当前钱包报价，余额竞争或报价过期要求刷新，不回退到商家直付。报价不冻结资金；提交在 Immediate 事务内创建唯一合同并冻结开通款。远端服务确认后才扣款，不确定失败保留 hold，清理确认后幂等结算与释放。
 
-付费 Share 与 Client Host 不再按单个商品预付或续费。Router 按「买家 + 供应商」维护唯一 USD 赊账账户；每个服务独立享受 12 小时健康时长试用,之后按固定 USD 每日价格和实际健康秒数累计。有限额度使用达到 80% 时向买卖双方各发送一次预警,用满后自动生成聚合账单。买家主动清账、供应商要求清账、供应商永久关闭赊账账户或最后一个服务结束时也会生成聚合账单。
+月租取消仅关闭续费并保留当期服务，试用、按秒和暂停服务走立即清理。续费通过 GET/PUT /v1/market-wallet/contracts/:id/renewal 管理，校验 buyer 与 expectedPolicy。试用 Share 也返回买家私有 walletContract，公开投影清除钱包合同与争议信息。改价只影响新报价，不改写既有合同。
 
-USD 是唯一报价、授信、记账和结算币种。账单总额与每条账单明细同时返回 `amountUsdMinor` 和 `amountCnyMinor`，其中 `amountMinor` 继续作为 USD 兼容字段。Router 每 15 分钟从 `https://api.exchangerate.fun/latest` 获取并验证 USD/CNY，持久化最近可信汇率；`CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE` 只作为首次获取失败时的历史展示回退，不能再通过 Settings 热更新。可信汇率超过 48 小时未更新时，暂缓新人民币账单开具，恢复后补开；未出账估算只在可信汇率新鲜时提供人民币显示。账单通过 `usdCnyRateMicros`（百万分之一精度）冻结出账汇率及人民币金额，后续汇率变更不影响历史账单。人民币金额四舍五入到分且仅用于展示。`/v1/market-billing/supplier-profiles/:currency` 的路径参数只接受 `USD`。
+Host 历史从月租扣款与按秒 posting batch 计算 chargesMinor、refundedMinor 与 netChargesMinor，履约分账不重复计入消费。未履约款只回平台余额，不提供现金退款。Provider 成熟收益自动入余额，无提现或手动转入 API。
 
-| 方法 | 路径 | 用途 |
-|---|---|---|
-| `GET` | `/v1/market-billing/config` | 当前 USD 记账币种及美元兑人民币展示汇率 |
-| `GET` | `/v1/market-billing/dashboard` | 买方应付、供应商应收、当前账单与赊账限制 |
-| `PUT` | `/v1/market-billing/supplier-profiles/:currency` | 设置账单付款宽限时间 |
-| `POST` | `/v1/market-billing/accounts/:id/settle` | 买方主动生成当前聚合账单 |
-| `POST` | `/v1/market-billing/accounts/:id/request-settlement` | 供应商要求买家结清当前余额,包括无限额度账户 |
-| `POST` | `/v1/market-billing/accounts/:id/close` | 供应商永久终止关系；无账单时生成最终账单，已有账单时锁定关闭意图 |
-| `GET` | `/v1/market-billing/accounts/:id/invoices` | 按 sequence 游标分页读取已结账单 |
-| `POST` | `/v1/market-billing/invoices/:id/declare-payment` | 买方提交链下付款声明 |
-| `POST` | `/v1/market-billing/invoices/:id/confirm` | 供应商核验并确认到账 |
-| `POST` | `/v1/market-billing/invoices/:id/reject` | 供应商拒绝付款声明 |
-| `POST` | `/v1/market-billing/invoices/:id/disputes` | 买方发起一次账单争议 |
-| `GET`/`POST` | `/v1/admin/market-billing/disputes…` | 管理员查看并裁决争议 |
-| `POST` | `/v1/admin/market-billing/invoices/:id/void` | 管理员强制作废账单 |
+GET /v1/market/config 返回 currency、usdCnyRateMicros、fxRateSource、fxRateSourceTimestamp、fxRateFetchedAt 和 fxRateFresh，设置 no-store。汇率每 15 分钟更新，记账始终为 USD。
 
-每张账单在生成时冻结供应商当时的收款方式、联系方式和资料更新时间；后续修改供应商收款资料不会改写历史或未结账单。付款声明和发起争议都不代表债务已解除。账单到达截止时间后,即使处于 `payment_declared` 或 `disputed` 状态也会保留全局市场赊账限制；只有供应商确认到账或管理员作废账单才解除该账单对应的限制。服务暂停期间不计费。
-
-供应商可在账户已有待付、待确认、逾期或争议账单时继续执行永久关闭。关闭意图一经锁定即终止全部关联服务；后续确认到账或管理员作废账单只结清债务,不会恢复服务,双方也不能再次建立付费租约。
+旧商家支付模块、路由、环境变量和页面已经删除。历史数据库记录仅保留审计证据，不自动迁为钱包资金。详见 [清理契约](docs/market-wallet-retirement.md)。
 
 ### 7.4 Market 系统事件与 Client 公开聊天室
 
 Share Market、Client Market 和统一账务不创建商品级聊天室。Router 只按 `installation.id` 建立唯一 Client 公开房间；Share Market 表格和 Client Market Provider/租客入口均解析到对应 `GET /v1/chat/clients/:installation_id/room`。同一 Client 的多个 Share 必须返回同一个 room ID。
 
-关键业务事件与原业务写入处于同一 libSQL 事务,先进入 `client_chat_system_outbox`,再由后台幂等物化为系统消息。Share 服务启停、到期、供应商变更、离线/恢复；挂牌、拼车位、租用、授权、回收；Client 开通、清理开始/成功/失败、强制释放；额度预警、出账、付款声明/确认/拒绝、逾期、争议和裁决均属于该事件流。系统消息自动关注 Owner、Provider、租客和 actor,产生未读,但不触发真人聊天提醒邮件。
+关键业务事件与原业务写入处于同一 libSQL 事务,先进入 `client_chat_system_outbox`,再由后台幂等物化为系统消息。Share 服务启停、到期、供应商变更、离线/恢复；挂牌、拼车位、租用、授权、回收；Client 开通、清理开始/成功/失败、强制释放均属于该事件流；资金和私有争议信息使用独立通知，不进入公共聊天室。系统消息自动关注 Owner、Provider、租客和 actor,产生未读,但不触发真人聊天提醒邮件。
 
-事件 payload 是公开数据。Router 原样公开完整邮箱、账单金额、收款方式/联系方式、付款 reference/note、凭证 URL、争议/回收原因和安全的原始错误。系统消息中由 Owner/Provider/Supplier 发布的 `/v1/account/payment-assets/:id` 收款图片也允许匿名读取；未被系统消息引用的资产继续要求 Owner 或对应账单买方 Session。以下内容是唯一保密例外,不得出现在 DB、API、日志或 UI：API Key、OAuth/Session token、Cookie、Authorization、密码、secret、私钥以及 SSH/lease 凭据。`PaymentMethod.token` 仅在 `kind=crypto` 且值为 `USDT`/`USDC` 时作为公开资产符号放行,其他 `token` 字段均按凭据拒绝。后端入 outbox 前拒绝敏感字段和带凭据 query/userinfo/fragment 的 URL,错误文本命中凭据片段时整体替换为固定占位；Web UI 还会独立执行字段、文本和 URL 二次过滤。
+事件 payload 采用公开字段白名单：商品、供应商公开邮箱、业务联系方式与脱敏服务状态。不发布买家身份、钱包余额、付款 reference、凭证、私有争议或原始诊断。商家支付方式及收款图片资产 API 已移除。历史消息保留审计记录，读取时继续执行公开投影及凭据过滤。API Key、OAuth/Session token、Cookie、Authorization、密码、secret、私钥和 SSH/lease 凭据不得进入事件 DB、API、日志或 UI。后端入 outbox 前拒绝敏感字段和带凭据 query/userinfo/fragment 的 URL，错误文本命中凭据片段时整体替换为固定占位；Web UI 继续独立执行字段、文本和 URL 二次过滤。
 
 ### 7.5 Client 自升级状态与 rollout circuit
 

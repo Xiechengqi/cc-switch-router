@@ -1,7 +1,3 @@
-#[cfg(test)]
-use std::collections::BTreeSet;
-use std::collections::HashMap;
-
 use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -14,9 +10,6 @@ use sha2::{Digest, Sha256};
 use crate::ServerState;
 use crate::db::{OptionalExtension, params};
 use crate::error::AppError;
-#[cfg(test)]
-use crate::market_billing::MarketFundingSummaryView;
-use crate::models::AuthSession;
 
 const PUBLIC_CACHE_CONTROL: &str = "public, max-age=60, stale-while-revalidate=300";
 const GENERATION_STALE_AFTER_SECS: i64 =
@@ -100,7 +93,6 @@ pub struct MarketProviderView {
     pub inventory: MarketProviderInventoryView,
     pub quality: MarketProviderQualityView,
     pub performance: MarketProviderPerformanceView,
-    pub payment_method_kinds: Vec<String>,
     pub exploration: bool,
     pub joined_at: String,
 }
@@ -173,59 +165,9 @@ struct InternalProviderView {
     public: MarketProviderView,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-#[cfg(test)]
-pub struct MarketProviderRecurringFundingView {
-    pub active_contract_count: i64,
-    pub monthly_commitment_minor: i64,
-    pub next_renewal_at: Option<String>,
-    pub next_renewal_minor: i64,
-    pub topup_funding: Option<crate::market_recurring::RecurringFundingSummaryView>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-#[cfg(test)]
-pub struct MyMarketProviderFundingView {
-    pub market_provider_id: String,
-    pub display_name: String,
-    pub official: bool,
-    pub supplier_user_id: String,
-    pub supplier_email: String,
-    pub currency: String,
-    pub share_funding: MarketFundingSummaryView,
-    pub client_funding: MarketFundingSummaryView,
-    pub share_legacy_daily_rate_minor: i64,
-    pub client_legacy_daily_rate_minor: i64,
-    pub recurring: MarketProviderRecurringFundingView,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-#[cfg(test)]
-pub struct MyMarketProviderFundingTotalsView {
-    pub currency: String,
-    pub provider_count: usize,
-    pub prepaid_balance_minor: i64,
-    pub prepaid_held_minor: i64,
-    pub prepaid_available_minor: i64,
-    pub credit_outstanding_minor: i64,
-    pub finite_credit_available_minor: i64,
-    pub unlimited_credit_provider_count: usize,
-    pub legacy_daily_rate_minor: i64,
-    pub monthly_commitment_minor: i64,
-    pub next_renewal_at: Option<String>,
-    pub next_renewal_minor: i64,
-}
-
 pub fn router() -> Router<ServerState> {
     Router::new()
         .route("/v1/market-providers", get(list_market_providers))
-        .route(
-            "/v1/market-providers/me/funding",
-            get(my_market_provider_funding),
-        )
         .route("/v1/market-providers/:id", get(get_market_provider))
 }
 
@@ -279,42 +221,6 @@ fn latest_generation_view(
     })
 }
 
-fn payment_method_kinds_by_user(
-    conn: &crate::db::Connection,
-    generation_id: &str,
-) -> Result<HashMap<String, Vec<String>>, AppError> {
-    let rows = conn
-        .prepare(
-            "SELECT payment.user_id, payment.methods_json
-             FROM account_payment_profiles payment
-             JOIN market_provider_profiles profile ON profile.user_id = payment.user_id
-             JOIN market_provider_rank_entries entry
-               ON entry.market_provider_id = profile.id
-              AND entry.generation_id = ?1",
-        )
-        .and_then(|mut statement| {
-            statement
-                .query_map(params![generation_id], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .map_err(map_db("read Market Provider payment kinds"))?;
-    Ok(rows
-        .into_iter()
-        .map(|(user_id, methods_json)| {
-            let mut kinds = serde_json::from_str::<Vec<serde_json::Value>>(&methods_json)
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|method| method.get("kind")?.as_str().map(str::to_string))
-                .collect::<Vec<_>>();
-            kinds.sort();
-            kinds.dedup();
-            (user_id, kinds)
-        })
-        .collect())
-}
-
 fn public_provider_display_name(profile_id: &str, stored: &str) -> String {
     let stored = stored.trim();
     if !stored.is_empty() && stored.len() <= 80 && !stored.contains('@') {
@@ -333,7 +239,6 @@ fn internal_provider_views(
     official_email: Option<&str>,
 ) -> Result<Vec<InternalProviderView>, AppError> {
     let official_email = official_email.map(|value| value.trim().to_ascii_lowercase());
-    let payment_kinds = payment_method_kinds_by_user(conn, generation_id)?;
     let rows = conn
         .prepare(
             "SELECT profile.id, profile.user_id, profile.canonical_email,
@@ -430,12 +335,6 @@ fn internal_provider_views(
                     average_tps: row.16,
                     display_only: true,
                 },
-                payment_method_kinds: row
-                    .1
-                    .as_ref()
-                    .and_then(|user_id| payment_kinds.get(user_id))
-                    .cloned()
-                    .unwrap_or_default(),
                 exploration: false,
                 joined_at: row.5,
             },
@@ -669,211 +568,6 @@ async fn get_market_provider(
     public_json(&headers, &detail)
 }
 
-async fn require_session(
-    state: &ServerState,
-    headers: &HeaderMap,
-) -> Result<AuthSession, AppError> {
-    crate::api::resolve_router_session(state, headers)
-        .await?
-        .ok_or_else(|| AppError::Unauthorized("authenticated user session required".into()))
-}
-
-#[cfg(test)]
-fn funding_counterparties(
-    conn: &crate::db::Connection,
-    session: &AuthSession,
-) -> Result<Vec<(String, String)>, AppError> {
-    conn.prepare(
-        "SELECT supplier_user_id, MAX(supplier_email) FROM (
-            SELECT supplier_user_id, supplier_email FROM market_counterparties
-             WHERE buyer_user_id = ?1 OR (buyer_user_id IS NULL AND lower(buyer_email) = lower(?2))
-            UNION ALL
-            SELECT supplier_user_id, supplier_email FROM market_credit_accounts
-             WHERE buyer_user_id = ?1
-            UNION ALL
-            SELECT supplier_user_id, supplier_email FROM market_prepaid_accounts
-             WHERE buyer_user_id = ?1
-            UNION ALL
-            SELECT supplier_user_id, supplier_email FROM market_service_contracts
-             WHERE buyer_user_id = ?1
-            UNION ALL
-            SELECT supplier_user_id, supplier_email FROM market_recurring_contracts
-             WHERE buyer_user_id = ?1
-         ) GROUP BY supplier_user_id ORDER BY lower(MAX(supplier_email)), supplier_user_id",
-    )
-    .and_then(|mut statement| {
-        statement
-            .query_map(params![session.user_id, session.email], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()
-    })
-    .map_err(map_db("read buyer Market Provider funding relationships"))
-}
-
-#[cfg(test)]
-fn legacy_daily_rates(
-    conn: &crate::db::Connection,
-    buyer_user_id: &str,
-    supplier_user_id: &str,
-) -> Result<(i64, i64), AppError> {
-    conn.query_row(
-        "SELECT
-            COALESCE(SUM(CASE WHEN product_kind = 'share' THEN daily_rate_minor ELSE 0 END), 0),
-            COALESCE(SUM(CASE WHEN product_kind = 'client_host' THEN daily_rate_minor ELSE 0 END), 0)
-         FROM market_service_contracts
-         WHERE buyer_user_id = ?1 AND supplier_user_id = ?2 AND currency = 'USD'
-           AND (
-               status IN ('trial', 'active')
-               OR (status = 'billing_suspended' AND desired_control_state != 'terminated')
-           )",
-        params![buyer_user_id, supplier_user_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )
-    .map_err(map_db("read product-specific legacy daily rates"))
-}
-
-#[cfg(test)]
-fn resolve_funding_provider_identity(
-    conn: &crate::db::Connection,
-    supplier_user_id: &str,
-    supplier_email: &str,
-) -> Result<(String, String), AppError> {
-    let normalized_email = supplier_email.trim().to_ascii_lowercase();
-    let identities = conn
-        .prepare(
-            "SELECT DISTINCT profile.id, profile.display_name
-             FROM market_provider_aliases alias
-             JOIN market_provider_profiles profile ON profile.id = alias.market_provider_id
-             WHERE profile.status != 'identity_conflict'
-               AND ((alias.alias_kind = 'user_id' AND alias.alias_value = ?1)
-                    OR (alias.alias_kind = 'email' AND alias.alias_value = ?2))
-             ORDER BY profile.id",
-        )
-        .and_then(|mut statement| {
-            statement
-                .query_map(params![supplier_user_id, normalized_email], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .map_err(map_db("resolve funding Market Provider identity"))?;
-    match identities.as_slice() {
-        [identity] => Ok(identity.clone()),
-        [] => Err(AppError::ServiceUnavailable(
-            "Market Provider identity is not ready".into(),
-        )),
-        _ => Err(AppError::Conflict(
-            "Market Provider identity is ambiguous".into(),
-        )),
-    }
-}
-
-#[cfg(test)]
-fn funding_totals(providers: &[MyMarketProviderFundingView]) -> MyMarketProviderFundingTotalsView {
-    fn saturating_sum(values: impl Iterator<Item = i64>) -> i64 {
-        values.fold(0i64, i64::saturating_add)
-    }
-
-    let next_renewal_at = providers
-        .iter()
-        .filter_map(|provider| provider.recurring.next_renewal_at.clone())
-        .min();
-    let mut counted_unlimited = BTreeSet::new();
-    MyMarketProviderFundingTotalsView {
-        currency: "USD".into(),
-        provider_count: providers.len(),
-        // Share and Client use one supplier-scoped prepaid/credit account. Read
-        // the shared values once rather than adding the two product views.
-        prepaid_balance_minor: saturating_sum(
-            providers
-                .iter()
-                .map(|provider| provider.share_funding.prepaid_balance_minor),
-        ),
-        prepaid_held_minor: saturating_sum(
-            providers
-                .iter()
-                .map(|provider| provider.share_funding.prepaid_held_minor),
-        ),
-        prepaid_available_minor: saturating_sum(
-            providers
-                .iter()
-                .map(|provider| provider.share_funding.prepaid_available_minor),
-        ),
-        credit_outstanding_minor: saturating_sum(
-            providers
-                .iter()
-                .map(|provider| provider.share_funding.credit_outstanding_minor),
-        ),
-        finite_credit_available_minor: saturating_sum(providers.iter().map(|provider| {
-            provider
-                .share_funding
-                .credit_available_minor
-                .unwrap_or_default()
-                .max(
-                    provider
-                        .client_funding
-                        .credit_available_minor
-                        .unwrap_or_default(),
-                )
-        })),
-        unlimited_credit_provider_count: providers
-            .iter()
-            .filter(|provider| {
-                let unlimited = provider.share_funding.credit_kind == "unlimited"
-                    || provider.client_funding.credit_kind == "unlimited";
-                unlimited && counted_unlimited.insert(provider.market_provider_id.clone())
-            })
-            .count(),
-        // Legacy daily contracts remain product-specific, so both markets are
-        // intentionally included in the run-rate total.
-        legacy_daily_rate_minor: saturating_sum(providers.iter().map(|provider| {
-            provider
-                .share_legacy_daily_rate_minor
-                .saturating_add(provider.client_legacy_daily_rate_minor)
-        })),
-        monthly_commitment_minor: saturating_sum(
-            providers
-                .iter()
-                .map(|provider| provider.recurring.monthly_commitment_minor),
-        ),
-        next_renewal_minor: saturating_sum(
-            providers
-                .iter()
-                .filter(|provider| provider.recurring.next_renewal_at == next_renewal_at)
-                .map(|provider| provider.recurring.next_renewal_minor),
-        ),
-        next_renewal_at,
-    }
-}
-
-#[cfg(test)]
-fn private_json<T: Serialize>(value: &T) -> Result<Response, AppError> {
-    let body = serde_json::to_vec(value).map_err(|error| {
-        AppError::Internal(format!("encode private Provider funding failed: {error}"))
-    })?;
-    let mut response = Response::new(axum::body::Body::from(body));
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("private, no-store"),
-    );
-    Ok(response)
-}
-
-async fn my_market_provider_funding(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-) -> Result<Response, AppError> {
-    require_session(&state, &headers).await?;
-    Err(AppError::Gone(
-        "Provider-specific funding is retired; use the platform wallet".into(),
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -883,106 +577,6 @@ mod tests {
         conn.pragma_update(None, "foreign_keys", "ON")
             .expect("enable foreign keys");
         conn
-    }
-
-    fn session(user_id: &str, email: &str) -> AuthSession {
-        let now = Utc::now();
-        AuthSession {
-            session_id: format!("session-{user_id}"),
-            user_id: user_id.into(),
-            email: email.into(),
-            auth_source_kind: "auth_device".into(),
-            auth_source_id: format!("browser-{user_id}"),
-            access_token_hash: "access".into(),
-            refresh_token_hash: "refresh".into(),
-            access_expires_at: now + Duration::hours(1),
-            refresh_expires_at: now + Duration::days(30),
-            created_at: now,
-            last_used_at: now,
-        }
-    }
-
-    fn funding_summary(
-        supplier_user_id: &str,
-        prepaid_balance_minor: i64,
-        prepaid_held_minor: i64,
-        credit_kind: &str,
-        credit_available_minor: Option<i64>,
-        credit_outstanding_minor: i64,
-        active_daily_rate_minor: i64,
-    ) -> MarketFundingSummaryView {
-        MarketFundingSummaryView {
-            supplier_user_id: supplier_user_id.into(),
-            supplier_email: format!("{supplier_user_id}@example.com"),
-            currency: "USD".into(),
-            funding_mode: "prepaid".into(),
-            prepaid_account_id: Some(format!("prepaid-{supplier_user_id}")),
-            prepaid_balance_minor,
-            prepaid_held_minor,
-            prepaid_available_minor: prepaid_balance_minor - prepaid_held_minor,
-            credit_kind: credit_kind.into(),
-            credit_limit_minor: credit_available_minor,
-            credit_outstanding_minor,
-            credit_reserved_minor: 0,
-            credit_available_minor,
-            active_daily_rate_minor,
-            additional_daily_rate_minor: 0,
-            projected_daily_rate_minor: active_daily_rate_minor,
-            required_coverage_minor: 0,
-            prepaid_coverage_minor: 0,
-            credit_coverage_minor: 0,
-            required_topup_minor: 0,
-            recommended_topup_minor: 0,
-            recommended_coverage_days: 30,
-            prepaid_runway_seconds: None,
-            estimated_runway_seconds: None,
-            topup_available: true,
-            topup_unavailable_reason: None,
-        }
-    }
-
-    fn funded_provider(
-        id: &str,
-        prepaid_balance_minor: i64,
-        credit_kind: &str,
-        next_renewal_at: &str,
-        next_renewal_minor: i64,
-    ) -> MyMarketProviderFundingView {
-        MyMarketProviderFundingView {
-            market_provider_id: id.into(),
-            display_name: id.into(),
-            official: false,
-            supplier_user_id: format!("supplier-{id}"),
-            supplier_email: format!("{id}@example.com"),
-            currency: "USD".into(),
-            share_funding: funding_summary(
-                &format!("supplier-{id}"),
-                prepaid_balance_minor,
-                100,
-                credit_kind,
-                (credit_kind == "limited").then_some(300),
-                50,
-                10,
-            ),
-            client_funding: funding_summary(
-                &format!("supplier-{id}"),
-                prepaid_balance_minor,
-                100,
-                credit_kind,
-                (credit_kind == "limited").then_some(300),
-                50,
-                999,
-            ),
-            share_legacy_daily_rate_minor: 10,
-            client_legacy_daily_rate_minor: 20,
-            recurring: MarketProviderRecurringFundingView {
-                active_contract_count: 1,
-                monthly_commitment_minor: next_renewal_minor,
-                next_renewal_at: Some(next_renewal_at.into()),
-                next_renewal_minor,
-                topup_funding: None,
-            },
-        }
     }
 
     fn provider(id: &str, rank_state: &str) -> InternalProviderView {
@@ -1026,7 +620,6 @@ mod tests {
                     average_tps: None,
                     display_only: true,
                 },
-                payment_method_kinds: vec![],
                 exploration: false,
                 joined_at: "now".into(),
             },
@@ -1100,101 +693,6 @@ mod tests {
                     provider.public.rank_state == "collecting"
                         && provider.public.rank_position.is_none()
                 })
-        );
-    }
-
-    #[test]
-    fn funding_identity_resolver_uses_user_alias_then_email_fallback_and_fails_closed() {
-        let conn = database();
-        conn.execute_batch(
-            "INSERT INTO market_provider_profiles (
-                id, canonical_email, display_name, claim_state, status, created_at, updated_at
-             ) VALUES
-                ('mp_primary', 'primary@example.com', 'Primary', 'unclaimed', 'active', 'now', 'now'),
-                ('mp_other', 'other@example.com', 'Other', 'unclaimed', 'active', 'now', 'now');
-             INSERT INTO market_provider_aliases
-                (market_provider_id, alias_kind, alias_value, created_at)
-             VALUES
-                ('mp_primary', 'user_id', 'supplier-user', 'now'),
-                ('mp_primary', 'email', 'primary@example.com', 'now'),
-                ('mp_other', 'email', 'other@example.com', 'now');",
-        )
-        .expect("seed Provider aliases");
-
-        assert_eq!(
-            resolve_funding_provider_identity(&conn, "supplier-user", "unknown@example.com")
-                .expect("resolve user alias")
-                .0,
-            "mp_primary"
-        );
-        assert_eq!(
-            resolve_funding_provider_identity(&conn, "unknown-user", "PRIMARY@example.com")
-                .expect("resolve email fallback")
-                .0,
-            "mp_primary"
-        );
-        assert!(matches!(
-            resolve_funding_provider_identity(&conn, "missing", "missing@example.com"),
-            Err(AppError::ServiceUnavailable(_))
-        ));
-        assert!(matches!(
-            resolve_funding_provider_identity(&conn, "supplier-user", "other@example.com"),
-            Err(AppError::Conflict(_))
-        ));
-    }
-
-    #[test]
-    fn funding_counterparties_are_restricted_to_the_current_buyer() {
-        let conn = database();
-        conn.execute_batch(
-            "INSERT INTO market_counterparties (
-                id, supplier_user_id, supplier_email, buyer_user_id,
-                buyer_email, status, revision, created_at, updated_at
-             ) VALUES
-                ('mine', 'supplier-mine', 'mine@example.com', 'buyer-a',
-                 'buyer-a@example.com', 'active', 1, 'now', 'now'),
-                ('theirs', 'supplier-theirs', 'theirs@example.com', 'buyer-b',
-                 'buyer-b@example.com', 'active', 1, 'now', 'now');",
-        )
-        .expect("seed buyer-scoped counterparties");
-
-        let rows = funding_counterparties(&conn, &session("buyer-a", "buyer-a@example.com"))
-            .expect("read buyer funding counterparties");
-        assert_eq!(
-            rows,
-            vec![("supplier-mine".into(), "mine@example.com".into())]
-        );
-    }
-
-    #[test]
-    fn legacy_daily_rates_keep_share_and_client_products_separate() {
-        let conn = database();
-        conn.execute_batch(
-            "INSERT INTO market_service_contracts (
-                id, account_id, product_kind, product_ref, service_ref, service_label,
-                buyer_user_id, buyer_email, supplier_user_id, supplier_email, currency,
-                daily_rate_minor, offer_revision, status, trial_seconds_remaining,
-                health_state, desired_control_state, applied_control_state,
-                last_evaluated_at, activated_at, created_at, updated_at
-             ) VALUES
-                ('share-rate', 'account', 'share', 'share-rate', 'share-service', 'Share',
-                 'buyer', 'buyer@example.com', 'supplier', 'supplier@example.com', 'USD',
-                 100, 1, 'active', 0, 'healthy', 'active', 'active',
-                 'now', 'now', 'now', 'now'),
-                ('client-rate', 'account', 'client_host', 'client-rate', 'client-service', 'Client',
-                 'buyer', 'buyer@example.com', 'supplier', 'supplier@example.com', 'USD',
-                 200, 1, 'billing_suspended', 0, 'healthy', 'active', 'active',
-                 'now', 'now', 'now', 'now'),
-                ('terminated-rate', 'account', 'share', 'terminated-rate', 'terminated-service', 'Old',
-                 'buyer', 'buyer@example.com', 'supplier', 'supplier@example.com', 'USD',
-                 400, 1, 'billing_suspended', 0, 'healthy', 'terminated', 'terminated',
-                 'now', 'now', 'now', 'now');",
-        )
-        .expect("seed product-specific legacy rates");
-
-        assert_eq!(
-            legacy_daily_rates(&conn, "buyer", "supplier").expect("read legacy rates"),
-            (100, 200)
         );
     }
 
@@ -1316,35 +814,6 @@ mod tests {
     }
 
     #[test]
-    fn funding_totals_count_shared_money_once_and_product_rates_twice() {
-        let providers = vec![
-            funded_provider("mp_limited", 1_000, "limited", "2026-10-01T00:00:00Z", 100),
-            funded_provider(
-                "mp_unlimited",
-                2_000,
-                "unlimited",
-                "2026-10-01T00:00:00Z",
-                200,
-            ),
-        ];
-        let totals = funding_totals(&providers);
-        assert_eq!(totals.provider_count, 2);
-        assert_eq!(totals.prepaid_balance_minor, 3_000);
-        assert_eq!(totals.prepaid_held_minor, 200);
-        assert_eq!(totals.prepaid_available_minor, 2_800);
-        assert_eq!(totals.credit_outstanding_minor, 100);
-        assert_eq!(totals.finite_credit_available_minor, 300);
-        assert_eq!(totals.unlimited_credit_provider_count, 1);
-        assert_eq!(totals.legacy_daily_rate_minor, 60);
-        assert_eq!(totals.monthly_commitment_minor, 300);
-        assert_eq!(
-            totals.next_renewal_at.as_deref(),
-            Some("2026-10-01T00:00:00Z")
-        );
-        assert_eq!(totals.next_renewal_minor, 300);
-    }
-
-    #[test]
     fn public_responses_are_cacheable_and_private_funding_is_not() {
         let initial = public_json(&HeaderMap::new(), &serde_json::json!({ "id": "mp_public" }))
             .expect("build public response");
@@ -1398,14 +867,5 @@ mod tests {
                 .status(),
             StatusCode::NOT_MODIFIED
         );
-
-        let private =
-            private_json(&serde_json::json!({ "balance": 100 })).expect("build private response");
-        assert_eq!(private.status(), StatusCode::OK);
-        assert_eq!(
-            private.headers().get(header::CACHE_CONTROL).unwrap(),
-            "private, no-store"
-        );
-        assert!(private.headers().get(header::ETAG).is_none());
     }
 }

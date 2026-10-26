@@ -50,7 +50,7 @@ export function LocaleProvider({ children }: { children: React.ReactNode }) {
     let active = true;
     const loadRate = async () => {
       try {
-        const response = await fetch("/v1/market-billing/config", { cache: "no-store" });
+        const response = await fetch("/v1/market/config", { cache: "no-store" });
         if (!response.ok) throw new Error("market FX rate unavailable");
         const config = await response.json() as { usdCnyRateMicros?: number; fxRateFresh?: boolean };
         if (!active) return;

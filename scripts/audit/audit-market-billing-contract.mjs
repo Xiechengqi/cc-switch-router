@@ -124,12 +124,6 @@ function allowedLegacyAssertion(relativePath, source, index, ruleName) {
     }
   }
   if (
-    relativePath === "src/market_recurring.rs"
-    && ruleName === "product prepaid period end"
-  ) {
-    return true;
-  }
-  if (
     relativePath === "src/client_market.rs"
     && [
       "Client rental period field",
@@ -201,606 +195,69 @@ function assertProductDtoIsRedacted(errors, label, block) {
 function main() {
   const files = [...new Set(sourceRoots.flatMap(walk).concat(documentFiles))].sort();
   const errors = [];
-
   for (const relativePath of files) {
     const source = fs.readFileSync(path.join(root, relativePath), "utf8");
     for (const [ruleName, expression] of legacyRules) {
       expression.lastIndex = 0;
       for (const match of source.matchAll(expression)) {
         if (allowedLegacyAssertion(relativePath, source, match.index, ruleName)) continue;
-        errors.push(`${relativePath}:${lineNumber(source, match.index)} contains ${ruleName}: ${match[0]}`);
+        errors.push(relativePath + ":" + lineNumber(source, match.index) + " contains " + ruleName);
       }
     }
   }
-
-  const clientSource = fs.readFileSync(path.join(root, "src/client_market.rs"), "utf8");
-  const tradeSource = fs.readFileSync(path.join(root, "src/client_market_trade.rs"), "utf8");
-  const shareSource = fs.readFileSync(path.join(root, "src/share_market.rs"), "utf8");
-  const accessSource = fs.readFileSync(path.join(root, "src/market_access.rs"), "utf8");
-  const billingSource = fs.readFileSync(path.join(root, "src/market_billing.rs"), "utf8");
-  const recurringSource = fs.readFileSync(path.join(root, "src/market_recurring.rs"), "utf8");
-  const chatSource = fs.readFileSync(path.join(root, "src/store/client_chat.rs"), "utf8");
-  const apiSource = fs.readFileSync(path.join(root, "src/api.rs"), "utf8");
-  const typeSource = fs.readFileSync(path.join(root, "frontend/lib/types.ts"), "utf8");
-
-  // Retired buyer cash-out / Provider-specific payment screens are redirects,
-  // not alternate entry points into old finance APIs.
-  for (const relativePath of [
+  const read = relativePath => fs.readFileSync(path.join(root, relativePath), "utf8");
+  for (const retired of [
+    "src/binance_settlement/mod.rs", "src/market_billing.rs", "src/market_recurring.rs",
+    "frontend/lib/market-funding.ts", "frontend/lib/binance-auto-settlement.ts",
+    "frontend/components/dashboard/market-funding-topup-dialog.tsx",
+    "frontend/components/dashboard/market-recurring-contract-card.tsx",
     "frontend/components/dashboard/account-billing-page.tsx",
-    "frontend/components/dashboard/account-market-readiness-page.tsx",
-    "frontend/components/dashboard/account-page.tsx",
     "frontend/components/dashboard/market-wallet-refund-panel.tsx",
-    "frontend/components/dashboard/account-market-access-page.tsx",
+    "frontend/components/dashboard/binance-api-key-guide-dialog.tsx",
+    "frontend/components/dashboard/binance-receipt-history-dialog.tsx",
+    "frontend/components/common/payment-method-icons.tsx",
+    "frontend/app/(dashboard)/account/billing/page.tsx",
+    "frontend/app/(dashboard)/account/payments/page.tsx",
   ]) {
-    const source = fs.readFileSync(path.join(root, relativePath), "utf8");
-    for (const retired of ["requestMarketBuyerRefund", "requestMarketPrepaidRefund", "updateAccountPaymentProfile", "MarketFundingTopupDialog", "updateMarketCounterpartyCredit", "updateMarketPublicCredit"]) {
-      if (source.includes(retired)) errors.push(`${relativePath} revives retired payment action ${retired}`);
-    }
+    if (fs.existsSync(path.join(root, retired))) errors.push("retired payment implementation returned: " + retired);
   }
-
+  const main = read("src/main.rs"), api = read("frontend/lib/api.ts"), types = read("frontend/lib/types.ts");
+  const settings = read("src/admin/settings.rs"), access = read("src/market_access.rs");
+  const trade = read("src/client_market_trade.rs"), share = read("src/share_market.rs");
+  for (const [label, source, forbidden] of [
+    ["runtime", main, /binance_settlement|mod market_billing|mod market_recurring|run_market_billing_worker/],
+    ["Settings", settings, /CC_SWITCH_ROUTER_BINANCE|Binance settlement/],
+    ["frontend API", api, /\/v1\/(?:admin\/)?market-billing|\/v1\/account\/(?:payment-profile|payment-assets|binance-auto-settlement)|credit-lines|price-changes|termination-quotes/],
+    ["frontend DTO", types, /\b(?:MarketFundingSummary|MarketRecurringContract|MarketCreditLine|BinanceFundingIntent|ClientMarketPaymentMethod)\b/],
+    ["frontend messages", read("frontend/lib/i18n.ts"), /"(?:account\.binanceAuto\.|marketReadiness\.|marketFunding\.|marketRecurring\.|createClient\.quoteTerms\.postpaid|clientMarket\.offerRequires(?:Payment|Settlement)|shareMarket\.(?:catalog\.postpaidHint|subscription\.activePostpaid))/],
+    ["Host offer prerequisites", read("frontend/components/dashboard/client-market/host-utils.ts"), /MARKET_(?:PAYMENT|SUPPLIER_SETTLEMENT)_PROFILE_REQUIRED|isPaymentProfileRequiredError|hostPaidOfferPrerequisiteError/],
+    ["contact runtime", trade.split("#[cfg(test)]")[0], /account_payment_profiles|market_payment_assets/],
+    ["access runtime", access.split("#[cfg(test)]")[0], /market_credit_accounts|market_credit_grants|market_prepaid_accounts/],
+  ]) if (forbidden.test(source)) errors.push(label + " revives retired finance");
   for (const [label, block] of [
-    ["RouterSshHostView", extractRustBlock(clientSource, "struct RouterSshHostView")],
-    ["RentalView", extractRustBlock(tradeSource, "pub struct RentalView")],
-    ["Share ListingView", extractRustBlock(shareSource, "pub struct ListingView")],
-    ["Share ShareMarketAppCapability", extractRustBlock(shareSource, "pub struct ShareMarketAppCapability")],
-    ["Share SeatView", extractRustBlock(shareSource, "pub struct SeatView")],
-    ["Share SubscriptionView", extractRustBlock(shareSource, "pub struct SubscriptionView")],
-    ["CreditAccountView", extractRustBlock(billingSource, "pub struct CreditAccountView")],
-    ["RecurringContractView", extractRustBlock(recurringSource, "pub struct RecurringContractView")],
-    ["ClientMarketHost", extractTypeBlock(typeSource, "ClientMarketHost")],
-    ["ClientMarketRental", extractTypeBlock(typeSource, "ClientMarketRental")],
-    ["ShareMarketListing", extractTypeBlock(typeSource, "ShareMarketListing")],
-    ["ShareMarketAppCapability", extractTypeBlock(typeSource, "ShareMarketAppCapability")],
-    ["ShareMarketSubscription", extractTypeBlock(typeSource, "ShareMarketSubscription")],
-    ["MarketCreditAccount", extractTypeBlock(typeSource, "MarketCreditAccount")],
-    ["MarketRecurringContract", extractTypeBlock(typeSource, "MarketRecurringContract")],
-  ]) {
-    assertProductDtoIsRedacted(errors, label, block);
-  }
-
-  for (const [label, block, required] of [
-    [
-      "Share ShareMarketAppCapability",
-      extractRustBlock(shareSource, "pub struct ShareMarketAppCapability"),
-      ["health_state", "account_hint", "quota"],
-    ],
-    [
-      "ShareMarketAppCapability",
-      extractTypeBlock(typeSource, "ShareMarketAppCapability"),
-      ["healthState", "accountHint", "quota"],
-    ],
-  ]) {
-    for (const field of required) {
-      if (!block.includes(field)) errors.push(`${label} is missing ${field}`);
-    }
-  }
-
-  const invoiceType = extractTypeBlock(typeSource, "MarketBillingInvoice");
-  for (const required of [
-    "amountUsdMinor",
-    "amountCnyMinor",
-    "usdCnyRateMicros",
-    "paymentMethods",
-    "paymentProfileUpdatedAt",
-    "lines",
-  ]) {
-    if (!invoiceType.includes(required)) errors.push(`MarketBillingInvoice is missing ${required}`);
-  }
-  const invoiceLineType = extractTypeBlock(typeSource, "MarketBillingInvoiceLine");
-  for (const required of ["amountUsdMinor", "amountCnyMinor"]) {
-    if (!invoiceLineType.includes(required)) {
-      errors.push(`MarketBillingInvoiceLine is missing ${required}`);
-    }
-  }
-
-  for (const required of [
-    "MARKET_CURRENCY",
-    "DEFAULT_USD_CNY_RATE_MICROS",
-    "usd_cny_rate_micros",
-    "amount_usd_minor",
-    "amount_cny_minor",
-  ]) {
-    if (!billingSource.includes(required)) errors.push(`market billing is missing ${required}`);
-  }
-
-  for (const [label, block] of [
-    ["RouterSshHostView", extractRustBlock(clientSource, "struct RouterSshHostView")],
-    ["Share SeatView", extractRustBlock(shareSource, "pub struct SeatView")],
-    ["ClientMarketHost", extractTypeBlock(typeSource, "ClientMarketHost")],
-    ["ShareMarketSeat", extractTypeBlock(typeSource, "ShareMarketSeat")],
-  ]) {
-    if (!block.includes("seller_approval_required") && !block.includes("sellerApprovalRequired")) {
-      errors.push(`${label} is missing sellerApprovalRequired`);
-    }
-  }
-
-  for (const requestType of [
-    "UpdatePolicyRequest",
-    "UpdateCounterpartyRequest",
-    "UpdateCreditLineRequest",
-    "UpdatePublicCreditLineRequest",
-    "ApproveAccessRequest",
-    "RejectAccessRequest",
-    "ResolveAccessRequest",
-    "BatchCounterpartyUpdate",
-  ]) {
-    const block = extractRustBlock(accessSource, `struct ${requestType}`);
-    if (!block.includes("expected_revision: i64")) {
-      errors.push(`${requestType} must require expectedRevision`);
-    }
-  }
-  const approvalRequest = extractRustBlock(accessSource, "struct ApproveAccessRequest");
-  if (!approvalRequest.includes("credit_line: Option<ApprovalCreditLineInput>")) {
-    errors.push("ApproveAccessRequest must recognize and explicitly reject retired credit payloads");
-  }
-  const approvalCredit = extractRustBlock(accessSource, "struct ApprovalCreditLineInput");
-  if (!approvalCredit.includes("expected_revision: i64")) {
-    errors.push("ApprovalCreditLineInput must require expectedRevision");
-  }
-  const approvalTransaction = extractRustBlock(accessSource, "fn approve_access_request_tx(");
-  const retiredApproval = approvalTransaction.indexOf("Provider-scoped credit lines are retired");
-  if (retiredApproval < 0 || retiredApproval > approvalTransaction.indexOf("relationship_for_buyer_tx")) {
-    errors.push("paid access approval must reject legacy credit before any relationship mutation");
-  }
-  const creditWrite = extractRustBlock(accessSource, "fn upsert_credit_line_tx(");
-  if (!creditWrite.includes("AppError::Gone") || creditWrite.includes("INSERT INTO")) {
-    errors.push("retired credit writes must fail closed in every official top-up mode");
-  }
-  const rejectionRequest = extractRustBlock(accessSource, "struct RejectAccessRequest");
-  if (!rejectionRequest.includes("reason: String")) {
-    errors.push("RejectAccessRequest must require a supplier reason");
-  }
-  for (const [label, declaration] of [
-    ["market access approval", "async fn approve_access_request("],
-    ["market counterparty batch update", "async fn update_counterparties_batch("],
-  ]) {
-    const block = extractRustBlock(accessSource, declaration);
-    if (!block.includes("TransactionBehavior::Immediate") || !block.includes("tx.commit()")) {
-      errors.push(`${label} must use one committed SQLite Immediate transaction`);
-    }
-  }
-
-  for (const requiredRoute of [
-    "/v1/client-market/my-rentals",
-    "/v1/client-market/clients/:installation_id/rental",
-    "/v1/share-market/listings",
-    "/v1/share-market/me/listings",
-    "/v1/share-market/me/subscriptions",
-    "/v1/market-access/dashboard",
-    "/v1/market-access/inbox-summary",
-    "/v1/market-access/policies/:product_kind/:pricing_kind",
-    "/v1/market-access/counterparties",
-    "/v1/market-access/counterparties/batch",
-    "/v1/market-access/counterparties/:id",
-    "/v1/market-access/counterparties/:id/credit-lines/:currency",
-    "/v1/market-access/public-credit-lines/:currency",
-    "/v1/market-access/requests",
-    "/v1/market-access/requests/:id/approve",
-    "/v1/market-access/requests/:id/reject",
-    "/v1/market-access/requests/:id/cancel",
-    "/v1/market-billing/dashboard",
-    "/v1/market-billing/config",
-    "/v1/market-billing/accounts/:account_id/request-settlement",
-    "/v1/market-billing/recurring-contracts/:id/renewal",
-    "/v1/market-billing/recurring-contracts/:id/reserve-next",
-    "/v1/market-billing/recurring-contracts/:id/cancel",
-  ]) {
-    if (!files.some((relativePath) => {
-      if (!relativePath.startsWith("src/")) return false;
-      return fs.readFileSync(path.join(root, relativePath), "utf8").includes(requiredRoute);
-    })) {
-      errors.push(`required route is missing: ${requiredRoute}`);
-    }
-  }
-
-  for (const required of [
-    "/v1/chat/clients/:installation_id/room",
-    "client_chat_system_outbox",
-    "enqueue_client_system_event_tx",
-    "'system', 'market_event'",
-    "sanitize_system_event_payload",
-  ]) {
-    const source = required.startsWith("/v1/chat/") ? apiSource : chatSource;
-    if (!source.includes(required)) {
-      errors.push(`Client public chat contract is missing ${required}`);
-    }
-  }
-  if (!chatSource.includes("parsed.fragment()")) {
-    errors.push("Client chat credential URL guard must inspect fragment parameters");
-  }
-  const chatRendererSource = fs.readFileSync(
-    path.join(root, "frontend/components/chat/chat-system-event.ts"),
-    "utf8",
-  );
-  if (!chatRendererSource.includes("url.hash.slice(1)")) {
-    errors.push("Client chat UI credential URL guard must inspect fragment parameters");
-  }
-
+    ["Client rental", extractRustBlock(trade, "pub struct RentalView")],
+    ["Share subscription", extractRustBlock(share, "pub struct SubscriptionView")],
+    ["Share listing", extractRustBlock(share, "pub struct ListingView")],
+    ["Client rental DTO", extractTypeBlock(types, "ClientMarketRental")],
+    ["Share subscription DTO", extractTypeBlock(types, "ShareMarketSubscription")],
+  ]) assertProductDtoIsRedacted(errors, label, block);
   for (const [label, source, required] of [
-    ["Share Market chat integration", shareSource, "enqueue_client_system_event_tx"],
-    ["Client Market chat integration", tradeSource, "enqueue_client_system_event_tx"],
-    ["Market Billing chat integration", billingSource, "enqueue_client_system_event_tx"],
-  ]) {
-    if (!source.includes(required)) errors.push(`${label} is missing ${required}`);
-  }
-
-  for (const [label, block] of [
-    ["Client Host", extractRustBlock(tradeSource, "pub(crate) fn require_paid_offer_setup")],
-    ["Share", extractRustBlock(shareSource, "fn ensure_paid_seat_setup_tx")],
-  ]) {
-    for (const required of ['currency != "USD"', "require_paid_offer_setup_tx"]) {
-      if (!block.includes(required)) errors.push(`${label} paid-offer setup guard is missing ${required}`);
-    }
-    if (/require_payment_profile_for_offer|require_supplier_profile_tx/.test(block)) {
-      errors.push(`${label} paid-offer setup must not depend on retired Provider payment details`);
-    }
-  }
-  const publicationTriggers = fs.readFileSync(path.join(root, "schema/0082_market_topup_mode_isolation.sql"), "utf8");
-  if (publicationTriggers.includes("market_finance_control") || !publicationTriggers.includes("platform_wallet")) {
-    errors.push("new paid publications must use wallet credit independently of official top-up mode");
-  }
-  const paymentSource = fs.readFileSync(path.join(root, "src/market_payments/mod.rs"), "utf8");
-  for (const [label, source, declaration] of [
-    ["Share quote", shareSource, "pub async fn share_market_create_rent_quote("],
-    ["Client quote", tradeSource, "pub async fn client_market_create_quote("],
-    ["C2C opening", fs.readFileSync(path.join(root, "src/market_c2c.rs"), "utf8"), "fn opening_blockers_tx("],
-    ["offer rail", paymentSource, "pub(crate) fn require_current_offer_rail("],
-  ]) {
-    const flow = extractRustBlock(source, declaration);
-    if (/wallet_purchase_mode_tx|cutover_approved_at|market_finance_control/.test(flow)) {
-      errors.push(`${label} must not depend on official top-up mode`);
-    }
-  }
-  const c2cSource = fs.readFileSync(path.join(root, "src/market_c2c.rs"), "utf8");
-  const automaticOrder = extractRustBlock(c2cSource, "fn create_tx(");
-  for (const required of ["require_seller_tx", "reserve_wallet_tx", "payment_minutes", "'awaiting_payment',3", "terms_v3_standing_auto_accept_authorization"]) {
-    if (!automaticOrder.includes(required)) errors.push(`C2C automatic creation is missing ${required}`);
-  }
-  if (/accept_tx|acceptance_minutes|accepted_at/.test(automaticOrder)) errors.push("new C2C orders must not simulate manual seller acceptance");
-  for (const declaration of ["fn require_seller_tx(", "fn resume_seller_tx("]) {
-    const block = extractRustBlock(c2cSource, declaration);
-    if (!block.includes("auto_accept_terms_version != TERMS_VERSION") || !block.includes("auto_accept_consented_at.is_none()")) {
-      errors.push(`${declaration} must require explicit automatic-order consent`);
-    }
-  }
-  const c2cPolicy = extractRustBlock(c2cSource, "pub(super) struct Policy");
-  if (c2cPolicy.includes("acceptance_minutes")) errors.push("current C2C policy must not retain a manual acceptance window");
-  const publicationReadiness = fs.readFileSync(path.join(root, "frontend/components/dashboard/share-market/paid-offer-readiness.tsx"), "utf8");
-  if (!publicationReadiness.includes("getMarketProviderFinance") || !publicationReadiness.includes("finance.canPublishPaidOffers")
-      || /getMarketWallet|getAccountPaymentProfile|getMarketBillingDashboard/.test(publicationReadiness)) {
-    errors.push("paid-publication UI must use Provider identity, not recharge mode or retired payment profiles");
-  }
-  const walletPanel = fs.readFileSync(path.join(root, "frontend/components/dashboard/platform-wallet-panel.tsx"), "utf8");
-  if (walletPanel.split("\n").some(line => line.includes("<WalletTransferPanel") && line.includes("wallet.mode"))) {
-    errors.push("wallet transfer UI must not be hidden by official recharge mode");
-  }
-  const earlyHostSetupChecks = clientSource.match(/require_paid_offer_setup/g)?.length || 0;
-  if (earlyHostSetupChecks < 3 || !tradeSource.includes("require_paid_offer_setup")) {
-    errors.push(
-      "Client Host create, import, insert, and edit paths must share the paid-offer setup guard",
-    );
-  }
-  for (const [label, block] of [
-    ["Client Host create", extractRustBlock(clientSource, "async fn create_host")],
-    ["Client Host import", extractRustBlock(clientSource, "async fn import_one_host")],
-  ]) {
-    const guardIndex = block.indexOf("require_paid_offer_setup");
-    const sshIndex = block.indexOf("ssh_verify_host");
-    if (guardIndex < 0 || sshIndex < 0 || guardIndex > sshIndex) {
-      errors.push(`${label} must validate paid-offer setup before SSH verification`);
-    }
-  }
-  for (const [label, block] of [
-    ["Share Market source event", extractRustBlock(shareSource, "fn event_tx")],
-    ["Client Market source event", extractRustBlock(tradeSource, "fn insert_audit_tx")],
-    ["Market Billing source event", extractRustBlock(billingSource, "fn record_event_tx")],
-  ]) {
-    if (!block.includes("sanitize_system_event_payload")) {
-      errors.push(`${label} must sanitize details before source-event persistence`);
-    }
-  }
-  if (!chatSource.includes('normalized == "token" && allows_payment_asset_token')) {
-    errors.push("Client chat token exception must be restricted to crypto payment assets");
-  }
-
-  const paymentAssetReader = extractRustBlock(
-    tradeSource,
-    "pub async fn client_market_payment_asset_for_viewer",
-  );
-  for (const required of [
-    "market_invoices",
-    "market_credit_accounts",
-    "chat_public_payment_assets",
-  ]) {
-    if (!paymentAssetReader.includes(required)) {
-      errors.push(`payment asset authorization is missing ${required}`);
-    }
-  }
-  for (const forbidden of [
-    "router_ssh_hosts",
-    "client_market_subscriptions",
-    "share_market_",
-    "market_service_contracts",
-  ]) {
-    if (paymentAssetReader.includes(forbidden)) {
-      errors.push(`payment asset authorization must not depend on ${forbidden}`);
-    }
-  }
-
-  for (const relativePath of walk("frontend/components")) {
-    const source = fs.readFileSync(path.join(root, relativePath), "utf8");
-    if (!source.includes("ProviderPaymentMethodsList")) continue;
-    if (![
-      "frontend/components/common/provider-contacts.tsx",
-      "frontend/components/dashboard/account-billing-page.tsx",
-    ].includes(relativePath)) {
-      errors.push(`${relativePath} renders full payment methods outside Account Billing`);
-    }
-  }
-
-  for (const [relativePath, requiredMarkers] of [
-    [
-      "frontend/components/dashboard/share-market/buyer-catalog.tsx",
-      [
-        "quoteShareMarketSeat(item.seat.id)",
-        "setRentTarget({ ...item, quote, idempotencyKey:",
-        "crypto.randomUUID()",
-        "rentTarget.idempotencyKey,\n        rentAutoRenew,",
-        "rentTarget.quote.offer.parallelLimit",
-        "rentTarget.quote.offer.serviceDurationDays",
-        "rentTarget.quote.trialSecondsRemaining",
-        "shareMarket.rentConfirm.remainingTrial",
-        "shareMarket.rentConfirm.serviceFixed",
-        "shareMarket.rentConfirm.quoteExpiry",
-        "shareMarket.rentConfirm.requote",
-        "rentTarget.quote.offer.service.apps.map",
-        "shareMarket.catalog.enabledApps",
-        "rentTarget.quote.offer.service.shareParallelLimit",
-        "rentTarget.quote.offer.service.shareTokensUsed",
-      ],
-    ],
-    [
-      "frontend/components/dashboard/market-funding-topup-dialog.tsx",
-      [
-        "ConfirmAlertDialog",
-        "setRefreshConfirmOpen(true)",
-        'description={t("marketBilling.binance.refreshConfirm")}',
-        "onConfirm={() => void refreshIntent()}",
-        "setCancelConfirmOpen(true)",
-        'description={t("marketBilling.binance.cancelConfirm")}',
-        "onConfirm={() => void cancelIntent()}",
-      ],
-    ],
-    [
-      "frontend/components/dashboard/create-client-dialog.tsx",
-      ["ClientCheckoutForm", "clientCheckoutState", "offerRevision: item.offerRevision"],
-    ],
-    [
-      "frontend/components/dashboard/account-billing-page.tsx",
-      ["AccountLegacyRedirect", "DASHBOARD_ACCOUNT_WALLET_PATH"],
-    ],
-    [
-      "frontend/components/dashboard/account-market-readiness-page.tsx",
-      [
-        "AccountLegacyRedirect",
-        "DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH",
-      ],
-    ],
-    [
-      "frontend/components/dashboard/share-market/owner-workspace.tsx",
-      [
-        "usePaidOfferReadiness(open && hasPaidSeat)",
-        "PaidOfferReadinessNotice",
-        "setSeatDialog({ listing, template: seat })",
-        "template={seatDialog?.template}",
-        "shareMarketMutationError(reason, t)",
-        "shareMarket.tokensMillions",
-      ],
-    ],
-    [
-      "frontend/components/dashboard/client-market/host-utils.ts",
-      [
-        "MARKET_PAYMENT_PROFILE_REQUIRED",
-        "MARKET_SUPPLIER_SETTLEMENT_PROFILE_REQUIRED",
-        "clientMarket.offerRequiresSettlement",
-      ],
-    ],
-    [
-      "frontend/components/dashboard/client-market/add-host-dialog.tsx",
-      [
-        'usePaidOfferReadiness(open && pricing === "paid")',
-        'paidReadiness.status === "error"',
-        "hostPaidOfferPrerequisiteError(err, t)",
-        "paidReadiness.providerReady",
-        "DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH",
-      ],
-    ],
-    [
-      "frontend/components/dashboard/client-market/host-offer-dialog.tsx",
-      [
-        'usePaidOfferReadiness(open && pricing === "paid")',
-        'paidReadiness.status === "error"',
-        "hostPaidOfferPrerequisiteError(reason, t)",
-        "paidReadiness.providerReady",
-        "DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH",
-      ],
-    ],
-    [
-      "frontend/components/dashboard/share-market/paid-offer-readiness.tsx",
-      [
-        "request !== requestRef.current",
-        'readiness.status !== "loaded"',
-        "shareMarket.paidReadiness.failed",
-        "requestRef.current += 1",
-      ],
-    ],
-    [
-      "frontend/lib/api.ts",
-      [
-        "/v1/market-access/counterparties/batch",
-        "/v1/market-access/inbox-summary",
-        "/v1/share-market/seats/${encodeURIComponent(seatId)}/quote",
-        "export async function quoteShareMarketSeat(seatId: string)",
-        "body: JSON.stringify({ quoteId, idempotencyKey, autoRenew })",
-      ],
-    ],
-  ]) {
-    const source = fs.readFileSync(path.join(root, relativePath), "utf8");
-    for (const marker of requiredMarkers) {
-      if (!source.includes(marker)) errors.push(`${relativePath} is missing ${marker}`);
-    }
-  }
-
-  const buyerCatalogSource = fs.readFileSync(
-    path.join(root, "frontend/components/dashboard/share-market/buyer-catalog.tsx"),
-    "utf8",
-  );
-  const rentConfirmDialogStart = buyerCatalogSource.indexOf(
-    '<Modal.Backdrop isOpen={!!rentTarget}',
-  );
-  const rentConfirmDialogEnd = buyerCatalogSource.indexOf(
-    "<MarketAccessDialog",
-    rentConfirmDialogStart,
-  );
-  if (rentConfirmDialogStart < 0 || rentConfirmDialogEnd <= rentConfirmDialogStart) {
-    errors.push("Share rental confirmation dialog source boundary is missing");
-  } else {
-    const rentConfirmDialog = buyerCatalogSource.slice(
-      rentConfirmDialogStart,
-      rentConfirmDialogEnd,
-    );
-    const dividerClass = rentConfirmDialog.match(
-      /\b(?:border-[xytrbl](?:-\d+)?|divide-[xy])\b/,
-    );
-    if (dividerClass) {
-      errors.push(
-        `Share rental confirmation dialog must stay free of directional divider classes: ${dividerClass[0]}`,
-      );
-    }
-  }
-
-  const fundingTopupSource = fs.readFileSync(
-    path.join(root, "frontend/components/dashboard/market-funding-topup-dialog.tsx"),
-    "utf8",
-  );
-  const fundingTopupFlowStart = fundingTopupSource.indexOf(
-    "export function MarketFundingTopupFlow(",
-  );
-  const fundingTopupFlowEnd = fundingTopupSource.indexOf(
-    "export function MarketFundingTopupDialog(",
-    fundingTopupFlowStart,
-  );
-  if (fundingTopupFlowStart < 0 || fundingTopupFlowEnd <= fundingTopupFlowStart) {
-    errors.push("MarketFundingTopupFlow source boundary is missing");
-  } else {
-    const fundingTopupFlow = fundingTopupSource.slice(
-      fundingTopupFlowStart,
-      fundingTopupFlowEnd,
-    );
-    if (fundingTopupFlow.includes("window.confirm(")) {
-      errors.push("MarketFundingTopupFlow confirmations must use the application confirmation dialog");
-    }
-    const dividerClass = fundingTopupFlow.match(
-      /\b(?:border-[xytrbl](?:-\d+)?|divide-[xy])\b/,
-    );
-    if (dividerClass) {
-      errors.push(
-        `MarketFundingTopupFlow must stay free of directional divider classes: ${dividerClass[0]}`,
-      );
-    }
-  }
-
-  for (const relativePath of [
-    "frontend/components/dashboard/share-market/buyer-catalog.tsx",
-    "frontend/lib/api.ts",
-    "frontend/lib/types.ts",
-  ]) {
-    const source = fs.readFileSync(path.join(root, relativePath), "utf8");
-    if (source.includes("requiredApp")) {
-      errors.push(`${relativePath} must not expose the retired single-App rental selector`);
-    }
-  }
-
-  for (const required of [
-    "share_market_create_rent_quote",
-    "share_market_commit_rent_quote",
-    "trial_seconds_remaining_tx",
-    "request_fingerprint",
-    "consume_share_rent_quote_tx",
-    "MARKET_ALLOWED_APPS",
-    "RentAppServiceSnapshot",
-    "contract_apps_json",
-    "service_snapshot_json",
-    "TransactionBehavior::Immediate",
-  ]) {
-    if (!shareSource.includes(required)) {
-      errors.push(`Share rent quote backend contract is missing ${required}`);
-    }
-  }
-
-  for (const [label, source, required] of [
-    [
-      "Historical supplier settlement prerequisite",
-      billingSource,
-      "MARKET_SUPPLIER_SETTLEMENT_PROFILE_REQUIRED",
-    ],
-  ]) {
-    if (!source.includes(required) || !source.includes("AppError::coded_conflict")) {
-      errors.push(`${label} must return coded conflict ${required}`);
-    }
-  }
-
-  const rentQuoteType = extractTypeBlock(typeSource, "ShareMarketRentQuote");
-  for (const required of [
-    "trialSecondsRemaining",
-    "expiresAt",
-    "offer",
-    "service",
-  ]) {
-    if (!rentQuoteType.includes(required)) {
-      errors.push(`ShareMarketRentQuote is missing ${required}`);
-    }
-  }
-  const recurringContractType = extractTypeBlock(typeSource, "MarketRecurringContract");
-  for (const required of [
-    "pricingModel",
-    "billingInterval",
-    "cyclePriceMinor",
-    "renewalPolicy",
-    "renewalStatus",
-    "currentPeriodEnd",
-    "nextPeriodHeldMinor",
-    "cancelAtPeriodEnd",
-  ]) {
-    if (!recurringContractType.includes(required)) {
-      errors.push(`MarketRecurringContract is missing ${required}`);
-    }
-  }
-  const rentServiceType = extractTypeBlock(typeSource, "ShareMarketRentService");
-  for (const required of [
-    "supportedApps",
-    "apps",
-    "shareParallelLimit",
-    "shareTokenLimit",
-    "shareTokensUsed",
-  ]) {
-    if (!rentServiceType.includes(required)) {
-      errors.push(`ShareMarketRentService is missing ${required}`);
-    }
-  }
-  const rentAppServiceType = extractTypeBlock(typeSource, "ShareMarketRentAppService");
-  for (const required of ["app", "providerFamily", "providerType", "modelMode", "models"]) {
-    if (!rentAppServiceType.includes(required)) {
-      errors.push(`ShareMarketRentAppService is missing ${required}`);
-    }
-  }
-
+    ["Client checkout", read("frontend/lib/client-checkout.ts"), ["walletFunding", "fundingRail", "platform_wallet"]],
+    ["Share checkout", read("frontend/lib/share-checkout.ts"), ["walletFunding", "unsupported", "MARKET_WALLET_REQUIRED"]],
+    ["wallet lifecycle", read("src/market_platform_contracts.rs"), ["cancel_at_period_end_tx", "terminate_after_cleanup_inner_tx", "fail_activation_tx"]],
+    ["independent FX", read("src/market_fx.rs"), ["/v1/market/config", "fxRateFresh", "no-store"]],
+    ["contact separation", trade, ["FROM market_provider_contacts", "INSERT INTO market_provider_contacts"]],
+    ["Client charge history", extractRustBlock(trade, "pub async fn client_market_host_usage_history"), ["market_platform_periods", "market_usage_posting_batches", "refunded_units"]],
+    ["trial renewal UI", read("frontend/components/dashboard/share-market/buyer-rentals.tsx"), ["subscription.walletContract?.id", "MarketWalletRenewalCard"]],
+  ]) for (const item of required) if (!source.includes(item)) errors.push(label + " is missing " + item);
+  const redaction = extractRustBlock(share, "fn redact_public_subscription");
+  for (const field of ["wallet_contract = None", "wallet_contract_id = None", "open_wallet_dispute = false"])
+    if (!redaction.includes(field)) errors.push("public Share projection exposes wallet detail: " + field);
   if (errors.length) {
-    console.error(`market billing contract audit failed:\n${errors.map((error) => `- ${error}`).join("\n")}`);
+    console.error("market wallet contract audit failed:\n" + errors.map(error => "- " + error).join("\n"));
     process.exit(1);
   }
-
-  console.log(`market billing contract audit ok: ${files.length} source/document files checked`);
+  console.log("market wallet contract audit ok: " + files.length + " source/document files checked");
 }
 
 main();

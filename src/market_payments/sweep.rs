@@ -451,8 +451,7 @@ mod tests {
         );
         // Another shop's order in the same merchant project is not ours.
         assert_eq!(
-            handle_paid_order_tx(&conn, &target(), &listed("do_x", Some("shop-42")), time)
-                .unwrap(),
+            handle_paid_order_tx(&conn, &target(), &listed("do_x", Some("shop-42")), time).unwrap(),
             (false, false)
         );
         let cases: i64 = conn
@@ -479,6 +478,10 @@ mod tests {
         )
         .unwrap();
         assert!(due_sweep_tx(&conn, &target(), "daily").unwrap().is_none());
-        assert!(due_sweep_tx(&conn, &target(), "weekly_full").unwrap().is_some());
+        assert!(
+            due_sweep_tx(&conn, &target(), "weekly_full")
+                .unwrap()
+                .is_some()
+        );
     }
 }

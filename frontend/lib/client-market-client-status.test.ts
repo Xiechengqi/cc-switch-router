@@ -18,7 +18,7 @@ function rental(overrides: Partial<ClientMarketRental> = {}): ClientMarketRental
     status: "active",
     pricingModel: "free",
     offerRevision: 1,
-    paymentMethodKinds: [],
+
     isClientOwner: true,
     canRelease: true,
     canFinalizeRelease: false,
@@ -62,7 +62,7 @@ test("provider management does not impersonate the Client owner", () => {
 test("scheduled, releasing, failed, and ended rentals do not promise a manual release", () => {
   const scheduled = rental({
     pricingModel: "prepaid_calendar_month",
-    recurring: { cancelAtPeriodEnd: true } as ClientMarketRental["recurring"],
+    walletContract: { status: "active", trialSecondsRemaining: 0, renewalPolicy: "manual", periodEnd: "2030-01-01T00:00:00Z" },
   });
   assert.equal(marketClientContext("router_market", scheduled, true, longAgo, now)?.hint, null);
   assert.equal(marketClientContext("router_market", rental({ status: "releasing" }), true, longAgo, now)?.hint, null);

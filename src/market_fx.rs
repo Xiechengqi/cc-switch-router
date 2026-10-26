@@ -9,6 +9,28 @@ use crate::db::{Connection, OptionalExtension};
 use crate::error::AppError;
 use crate::store::AppStore;
 
+pub(crate) fn router() -> axum::Router<crate::ServerState> {
+    axum::Router::new().route("/v1/market/config", axum::routing::get(get_config))
+}
+
+async fn get_config(
+    axum::extract::State(state): axum::extract::State<crate::ServerState>,
+) -> impl axum::response::IntoResponse {
+    let fx = state.store.market_fx_snapshot();
+    let fresh = fx.is_fresh_at(Utc::now().timestamp());
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        axum::Json(serde_json::json!({
+            "currency": crate::market_common::MARKET_CURRENCY,
+            "usdCnyRateMicros": fx.rate_micros,
+            "fxRateSource": if fresh { "api.exchangerate.fun" } else if fx.source_timestamp.is_some() { "stale_cache" } else { "fallback" },
+            "fxRateSourceTimestamp": fx.source_timestamp,
+            "fxRateFetchedAt": fx.fetched_at,
+            "fxRateFresh": fresh,
+        })),
+    )
+}
+
 pub(crate) const SOURCE_URL: &str = "https://api.exchangerate.fun/latest";
 const POLL_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const MAX_BODY_BYTES: usize = 64 * 1024;

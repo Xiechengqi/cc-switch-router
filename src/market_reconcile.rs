@@ -86,11 +86,12 @@ pub(crate) fn case_is_critical_tx(conn: &Connection, case_id: &str) -> Result<bo
 pub(crate) enum FinanceScope<'a> {
     /// A buyer wallet (top-ups, holds, debits, refunds).
     User(&'a str),
-    /// A Provider's earnings and withdrawals.
+    /// A Provider's earnings and historical payout evidence.
     Provider(&'a str),
     /// One platform contract and its periods.
     Contract(&'a str),
     /// External Provider payouts, including historical payout evidence.
+    #[cfg(test)]
     Payouts,
 }
 
@@ -152,6 +153,7 @@ fn scope_blocked_tx(conn: &Connection, scope: FinanceScope<'_>) -> Result<bool, 
                 WHERE c.status = 'open' AND c.code = 'earning_conversion_missing_evidence' AND d.contract_id = ?1)",
             Some(contract),
         ),
+        #[cfg(test)]
         FinanceScope::Payouts => (
             "SELECT EXISTS(SELECT 1 FROM market_finance_reconciliation_cases c
              WHERE c.status = 'open' AND c.code = 'paid_payout_missing_evidence'
@@ -357,7 +359,7 @@ fn critical_case_still_failed_tx(
                     &sql,
                     params![
                         object_id,
-                        crate::market_billing::MONEY_UNITS_PER_MINOR,
+                        crate::market_common::MONEY_UNITS_PER_MINOR,
                         object_kind
                     ],
                     |row| {
@@ -780,7 +782,7 @@ pub(crate) fn audit_finance_tx(conn: &Connection, now: &str) -> Result<usize, Ap
             .map_err(db_error("prepare paid transfer audit"))?;
         let mismatched = statement
             .query_map(
-                params![kind, crate::market_billing::MONEY_UNITS_PER_MINOR],
+                params![kind, crate::market_common::MONEY_UNITS_PER_MINOR],
                 |row| row.get::<_, String>(0),
             )
             .map_err(db_error("query paid transfer audit"))?

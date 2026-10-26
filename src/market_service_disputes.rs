@@ -322,7 +322,7 @@ pub(crate) fn resolve_dispute_tx(
 ) -> Result<DisputeView, AppError> {
     validate_reason_code(resolution)?;
     if refund_units < 0
-        || (refund_units > 0 && refund_units % crate::market_billing::MONEY_UNITS_PER_MINOR != 0)
+        || (refund_units > 0 && refund_units % crate::market_common::MONEY_UNITS_PER_MINOR != 0)
     {
         return Err(AppError::BadRequest(
             "service refund must use exact USD cents".into(),

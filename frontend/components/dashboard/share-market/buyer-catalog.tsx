@@ -28,7 +28,6 @@ import {
   marketEligibilityFromError,
 } from "@/components/common/seller-approval-dialog";
 import { ShareProviderStatusPanel } from "@/components/dashboard/share-provider-status-panel";
-import { MarketFundingTopupFlow } from "@/components/dashboard/market-funding-topup-dialog";
 import {
   CatalogSeatPreviewList,
   MARKET_SHARE_CARD_GRID_CLASS,
@@ -42,15 +41,10 @@ import { ListingPricingCard } from "@/components/dashboard/share-market/listing-
 import { drawerDialogClassName } from "@/components/dashboard/share-dashboard-utils";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ApiError, quoteShareMarketSeat, rentShareMarketSeat } from "@/lib/api";
-import { DASHBOARD_ACCOUNT_WALLET_PATH } from "@/lib/dashboard-nav";
 import { formatWalletUnits, walletTopupHref } from "@/lib/market-wallet-money";
 import { notifyMarketBalanceChanged } from "@/lib/market-balance-events";
 import type { MessageKey } from "@/lib/i18n";
-import {
-  marketFundingConflictFromError,
-  marketFundingTopupUnavailableKey,
-  recurringFundingForRenewal,
-} from "@/lib/market-funding";
+import { shareCheckoutState, isWalletQuoteConflict } from "@/lib/share-checkout";
 import { SHARE_APP_LABELS } from "@/lib/share-app";
 import type {
   MarketEligibility,
@@ -84,13 +78,11 @@ import {
   pageForShareId,
   paginateListings,
   preserveCatalogSeat,
-  rentConfirmPrimaryAction,
   rentedShareIdsFromSubscriptions,
   showRentQuoteCountdown,
   sortCatalogListings,
   type MarketCatalogSort,
 } from "@/components/dashboard/share-market/buyer-catalog-utils";
-import { formatUsdMoney } from "@/lib/market-money";
 import { MarketListingFilters } from "@/components/dashboard/share-market/market-listing-filters";
 import { MarketPagination } from "@/components/dashboard/share-market/market-pagination";
 import {
@@ -133,11 +125,6 @@ const RENT_BLOCK_REASON_KEYS: Record<string, MessageKey> = {
   seat_unavailable: "shareMarket.blockReason.seat_unavailable",
   approval_required: "shareMarket.blockReason.approval_required",
   access_required: "shareMarket.blockReason.access_required",
-  credit_required: "shareMarket.blockReason.credit_required",
-  buyer_restricted: "shareMarket.blockReason.buyer_restricted",
-  settlement_required: "shareMarket.blockReason.settlement_required",
-  credit_limit_reached: "shareMarket.blockReason.credit_limit_reached",
-  relationship_closed: "shareMarket.blockReason.relationship_closed",
   unavailable: "shareMarket.blockReason.unavailable",
 };
 
@@ -215,8 +202,7 @@ function ListingCard({
                 t={t}
                 busy={busy}
                 onRelease={actions?.onRelease}
-                onAcceptPrice={actions?.onAcceptPrice}
-                onRejectPrice={actions?.onRejectPrice}
+
               />
             </div>
           ) : null}
@@ -262,7 +248,7 @@ function SeatChoice({ seat, selected, onSelect }: { seat: ShareMarketSeat; selec
           {!seat.isFree && seat.trialHours != null ? ` · ${t("shareMarket.dialog.trialHours")} ${seat.trialHours}` : ""}
         </span>
       </span>
-      <strong className="shrink-0 text-sm tabular-nums">{formatSeatPrice(seat, locale, t("shareMarket.free"), t("marketBilling.day"))}</strong>
+      <strong className="shrink-0 text-sm tabular-nums">{formatSeatPrice(seat, locale, t("shareMarket.free"), t("market.day"))}</strong>
     </button>
   );
 }
@@ -323,8 +309,6 @@ export function ShareMarketBuyerCatalog({
   const [selected, setSelected] = React.useState<SelectedListing | null>(null);
   const [rentTarget, setRentTarget] = React.useState<RentTarget | null>(null);
   const [rentAutoRenew, setRentAutoRenew] = React.useState(false);
-  const [rentDialogStep, setRentDialogStep] = React.useState<"review" | "topup">("review");
-  const [rentTopupDismissBlocked, setRentTopupDismissBlocked] = React.useState(false);
   const [accessTarget, setAccessTarget] = React.useState<(SeatCard & { eligibility: MarketEligibility }) | null>(null);
   const [busySeatId, setBusySeatId] = React.useState("");
   const [error, setError] = React.useState("");
@@ -442,7 +426,7 @@ export function ShareMarketBuyerCatalog({
       const quote = await quoteShareMarketSeat(item.seat.id);
       setRentQuoteInvalidated(false);
       setRentAutoRenew(false);
-      setRentDialogStep("review");
+
       setRentTarget({ ...item, quote, idempotencyKey: `share-rent:${quote.id}:${crypto.randomUUID()}` });
     } catch (reason) {
       const eligibility = marketEligibilityFromError(reason);
@@ -478,7 +462,7 @@ export function ShareMarketBuyerCatalog({
   };
 
   const confirmRent = async () => {
-    if (!rentTarget || busySeatId) return;
+    if (!rentTarget || busySeatId || shareCheckoutState(rentTarget.quote).unsupported) return;
     if (rentQuoteInvalidated || Date.parse(rentTarget.quote.expiresAt) <= Date.now()) {
       await refreshQuote();
       return;
@@ -504,7 +488,7 @@ export function ShareMarketBuyerCatalog({
         setRentQuoteInvalidated(true);
         setError(t("shareMarket.rentConfirm.expired"));
       } else {
-        const fundingConflict = marketFundingConflictFromError(reason);
+        const fundingConflict = isWalletQuoteConflict(reason);
         if (fundingConflict) {
           setRentQuoteInvalidated(true);
           try {
@@ -538,19 +522,11 @@ export function ShareMarketBuyerCatalog({
     : 0;
   const quoteExpired = !!rentTarget && quoteRemainingSeconds <= 0;
   const quoteRequiresRefresh = quoteExpired || rentQuoteInvalidated;
-  const rentFunding = rentTarget?.quote.funding;
-  const rentWalletFunding = rentTarget?.quote.walletFunding;
-  const rentWalletShortfall = rentWalletFunding ? BigInt(rentWalletFunding.shortfallUnits) > 0n : false;
-  const rentRecurringFunding = React.useMemo(
-    () => rentTarget?.quote.recurringFunding
-      ? recurringFundingForRenewal(rentTarget.quote.recurringFunding, rentAutoRenew)
-      : undefined,
-    [rentAutoRenew, rentTarget?.quote.recurringFunding],
-  );
-  const effectiveRentFunding = rentWalletFunding ? undefined : (rentRecurringFunding ?? rentFunding);
-  const rentPrimaryAction = rentWalletFunding
-    ? quoteRequiresRefresh ? "refresh" : rentWalletShortfall ? "topup" : "confirm"
-    : rentConfirmPrimaryAction(quoteRequiresRefresh, effectiveRentFunding);
+  const rentCheckout = shareCheckoutState(rentTarget?.quote);
+  const rentWalletFunding = rentCheckout.paid && !rentCheckout.unsupported ? rentTarget?.quote.walletFunding : undefined;
+  const rentWalletShortfall = rentCheckout.shortfall;
+  const rentPrimaryAction: "refresh" | "topup" | "confirm" = quoteRequiresRefresh || rentCheckout.unsupported
+    ? "refresh" : rentWalletShortfall ? "topup" : "confirm";
   const showQuoteCountdown = showRentQuoteCountdown(quoteRequiresRefresh, quoteRemainingSeconds);
   const rentQuoteStatusDetails = !rentTarget
     ? ""
@@ -573,7 +549,7 @@ export function ShareMarketBuyerCatalog({
       },
       locale,
       t("shareMarket.free"),
-      t("marketBilling.day"),
+      t("market.day"),
     )
     : "";
   const rentTrialTokens = rentOffer?.trialTokenLimit != null && rentOffer.trialTokenLimit > 0
@@ -647,45 +623,14 @@ export function ShareMarketBuyerCatalog({
             : "",
         })
         : t("shareMarket.rentConfirm.noTrial");
-  const rentRequiredNowMinor = !effectiveRentFunding
-    ? 0
-    : "totalRequiredHoldMinor" in effectiveRentFunding
-      ? effectiveRentFunding.totalRequiredHoldMinor
-      : effectiveRentFunding.requiredCoverageMinor;
-  const rentFundingBlocked = effectiveRentFunding
-    && effectiveRentFunding.requiredTopupMinor > 0
-    && !effectiveRentFunding.topupAvailable
-    ? t(marketFundingTopupUnavailableKey(effectiveRentFunding.topupUnavailableReason))
-    : "";
-  const rentFundingUsesCredit = !rentRecurringFunding
-    && !!rentFunding
-    && rentFunding.creditCoverageMinor > 0;
-  const rentAutoRenewHoldMinor = rentTarget?.quote.recurringFunding?.cyclePriceMinor ?? 0;
   const closeRentDialog = () => {
-    if (busySeatId || rentTopupDismissBlocked) return;
+    if (busySeatId) return;
     setRentTarget(null);
     setRentAutoRenew(false);
-    setRentDialogStep("review");
-    setRentTopupDismissBlocked(false);
+
     setRentNotice("");
     setRentQuoteInvalidated(false);
     setError("");
-  };
-  const contactRentSeller = () => {
-    if (!rentTarget) return;
-    const installationId = rentTarget.listing.installationId;
-    closeRentDialog();
-    void chat.openClientChat(installationId);
-  };
-  const openRentBilling = () => {
-    window.location.href = DASHBOARD_ACCOUNT_WALLET_PATH;
-  };
-  const completeRentTopup = async () => {
-    setRentDialogStep("review");
-    const refreshed = await refreshQuote();
-    setRentNotice(t(refreshed
-      ? "shareMarket.rentConfirm.topupCredited"
-      : "marketFunding.topup.quoteRefreshFallback"));
   };
 
   const displayError = error || rentals.error;
@@ -820,7 +765,7 @@ export function ShareMarketBuyerCatalog({
             {selected ? (
               <div className="absolute inset-x-0 bottom-0 flex items-center justify-between gap-3 border-t border-slate-200 bg-white px-5 py-4">
                 <div className="min-w-0">
-                  <strong className="block truncate text-sm">{selected.seat ? `${t("shareMarket.catalog.seatPosition", { position: selected.seat.position })} · ${formatSeatPrice(selected.seat, locale, t("shareMarket.free"), t("marketBilling.day"))}` : t("shareMarket.catalog.selectSeatFirst")}</strong>
+                  <strong className="block truncate text-sm">{selected.seat ? `${t("shareMarket.catalog.seatPosition", { position: selected.seat.position })} · ${formatSeatPrice(selected.seat, locale, t("shareMarket.free"), t("market.day"))}` : t("shareMarket.catalog.selectSeatFirst")}</strong>
                   <span className="text-xs text-slate-500">{selected.seat?.rentBlockReason ? t(rentBlockReasonKey(selected.seat.rentBlockReason)) : t("shareMarket.catalog.frozenTermsHint")}</span>
                 </div>
                 <Button
@@ -840,18 +785,7 @@ export function ShareMarketBuyerCatalog({
       <Modal.Backdrop isOpen={!!rentTarget} onOpenChange={(open) => !open && closeRentDialog()}>
         <Modal.Container placement="center">
           <Modal.Dialog className="light max-h-[calc(100dvh-1rem)] w-[min(500px,calc(100vw-1rem))] max-w-none overflow-hidden !bg-white !text-slate-900">
-            {rentDialogStep === "topup" && effectiveRentFunding ? (
-              <MarketFundingTopupFlow
-                active={!!rentTarget}
-                funding={effectiveRentFunding}
-                variant="checkout"
-                onDismissBlockedChange={setRentTopupDismissBlocked}
-                onBack={() => setRentDialogStep("review")}
-                onClose={closeRentDialog}
-                onCredited={() => completeRentTopup()}
-              />
-            ) : (
-              <>
+            <>
                 <Modal.Header>
                   {rentTarget ? (
                     <div className="flex min-w-0 flex-1 items-start justify-between gap-3 pr-8">
@@ -899,45 +833,7 @@ export function ShareMarketBuyerCatalog({
                         <p className="truncate text-xs text-slate-500" title={rentTermsSummary}>{rentTermsSummary}</p>
                       </section>
 
-                      {effectiveRentFunding ? (
-                        <section className="grid gap-3 rounded-lg bg-slate-50 px-3 py-3" aria-live="polite">
-                          <div className="flex items-center justify-between gap-3">
-                            <h3 className="text-sm font-semibold text-slate-900">{t("shareMarket.rentConfirm.fundingLabel")}</h3>
-                            <span className={cn(
-                              "text-xs font-medium",
-                              effectiveRentFunding.requiredTopupMinor > 0
-                                ? "text-rose-700"
-                                : rentFundingUsesCredit
-                                  ? "text-amber-700"
-                                  : "text-emerald-700",
-                            )}>
-                              {effectiveRentFunding.requiredTopupMinor > 0
-                                ? t("shareMarket.rentConfirm.fundingTopup", { amount: formatUsdMoney(effectiveRentFunding.requiredTopupMinor, locale) })
-                                : rentFundingUsesCredit
-                                  ? t("shareMarket.rentConfirm.fundingCredit", { amount: formatUsdMoney(rentFunding?.creditCoverageMinor ?? 0, locale) })
-                                  : t("shareMarket.rentConfirm.fundingReadyShort")}
-                            </span>
-                          </div>
-                          <dl className="grid grid-cols-3 gap-3 text-sm">
-                            <div className="min-w-0">
-                              <dt className="text-[11px] leading-4 text-slate-500">{t("marketFunding.prepaidAvailable")}</dt>
-                              <dd className="mt-1 truncate font-semibold tabular-nums">{formatUsdMoney(effectiveRentFunding.prepaidAvailableMinor, locale)}</dd>
-                            </div>
-                            <div className="min-w-0">
-                              <dt className="text-[11px] leading-4 text-slate-500">{t("marketFunding.topup.requiredNow")}</dt>
-                              <dd className="mt-1 truncate font-semibold tabular-nums">{formatUsdMoney(rentRequiredNowMinor, locale)}</dd>
-                            </div>
-                            <div className="min-w-0">
-                              <dt className="text-[11px] leading-4 text-slate-500">{t("marketFunding.shortfall")}</dt>
-                              <dd className={cn(
-                                "mt-1 truncate font-semibold tabular-nums",
-                                effectiveRentFunding.requiredTopupMinor > 0 ? "text-rose-700" : "text-emerald-700",
-                              )}>{formatUsdMoney(effectiveRentFunding.requiredTopupMinor, locale)}</dd>
-                            </div>
-                          </dl>
-                        </section>
-                      ) : null}
-
+                      {rentCheckout.unsupported ? <p role="alert" className="rounded-md bg-rose-50 p-3 text-sm text-rose-800">{t("clientCheckout.unsupported")}</p> : null}
                       {rentWalletFunding ? (
                         <section className="grid gap-2 rounded-lg bg-muted/50 px-3 py-3 text-sm" aria-live="polite">
                           <h3 className="font-semibold">{t("marketWallet.title")}</h3>
@@ -961,7 +857,7 @@ export function ShareMarketBuyerCatalog({
                         </section>
                       ) : null}
 
-                      {rentRecurringFunding || (rentWalletFunding && rentOffer?.pricingModel === "prepaid_calendar_month") ? (
+                      {rentWalletFunding && rentOffer?.pricingModel === "prepaid_calendar_month" ? (
                         <label className={cn(
                           "flex min-h-11 items-center justify-between gap-3 rounded-lg bg-slate-50 px-3 py-3 text-sm",
                           busySeatId || quoteRequiresRefresh
@@ -969,10 +865,8 @@ export function ShareMarketBuyerCatalog({
                             : "cursor-pointer",
                         )}>
                           <span className="min-w-0">
-                            <strong className="block text-slate-900">{t("marketRecurring.autoRenew")}</strong>
-                            <span className="block truncate text-xs text-slate-500">{rentWalletFunding
-                              ? t("marketWallet.autoRenewAtDue")
-                              : t("shareMarket.rentConfirm.autoRenewHold", { amount: formatUsdMoney(rentAutoRenewHoldMinor, locale) })}</span>
+                            <strong className="block text-slate-900">{t("marketWallet.autoRenew")}</strong>
+                            <span className="block truncate text-xs text-slate-500">{t("marketWallet.autoRenewAtDue")}</span>
                           </span>
                           <span className="relative shrink-0">
                             <input
@@ -988,7 +882,7 @@ export function ShareMarketBuyerCatalog({
                       ) : null}
 
                       {rentNotice ? <p role="status" className="rounded-md bg-amber-50 px-3 py-2 text-sm leading-5 text-amber-900">{rentNotice}</p> : null}
-                      {rentFundingBlocked ? <p role="alert" className="rounded-md bg-rose-50 px-3 py-2 text-sm leading-5 text-rose-800">{rentFundingBlocked}</p> : null}
+
                       {error ? <p role="alert" className="rounded-md bg-rose-50 px-3 py-2 text-sm leading-5 text-rose-800">{error}</p> : null}
 
                       <details className="group rounded-lg bg-slate-50 px-3">
@@ -1003,7 +897,7 @@ export function ShareMarketBuyerCatalog({
                           <section className="grid gap-2">
                             <h3 className="text-sm font-semibold text-slate-900">{t("shareMarket.rentConfirm.billingDetails")}</h3>
                             <div className="grid gap-2 text-xs leading-5 text-slate-600">
-                              <p>{rentWalletFunding ? t("marketWallet.serviceBilling") : rentBillingDetails}</p>
+                              <p>{t("marketWallet.serviceBilling")}</p>
                               <p>{rentServiceDetails}</p>
                             </div>
                           </section>
@@ -1035,20 +929,14 @@ export function ShareMarketBuyerCatalog({
                   ) : null}
                 </Modal.Body>
                 <Modal.Footer className="flex-wrap justify-between">
-                  {rentPrimaryAction !== "close" ? <Button className="min-h-11 whitespace-nowrap" variant="ghost" isDisabled={!!busySeatId} onClick={closeRentDialog}>{t("common.cancel")}</Button> : <span />}
-                  {rentPrimaryAction === "refresh" || rentPrimaryAction === "retry" ? (
+                  {<Button className="min-h-11 whitespace-nowrap" variant="ghost" isDisabled={!!busySeatId} onClick={closeRentDialog}>{t("common.cancel")}</Button>}
+                  {rentPrimaryAction === "refresh" ? (
                     <Button className="min-h-11 whitespace-nowrap" variant="primary" isDisabled={!!busySeatId} onClick={() => void refreshQuote()}>
                       {busySeatId ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
-                      {t(rentPrimaryAction === "retry" ? "shareMarket.rentConfirm.retry" : "shareMarket.rentConfirm.requote")}
+                      {t("shareMarket.rentConfirm.requote")}
                     </Button>
                   ) : null}
-                  {rentPrimaryAction === "topup" && effectiveRentFunding ? (
-                    <Button className="min-h-11 whitespace-nowrap" variant="primary" isDisabled={!!busySeatId} onClick={() => setRentDialogStep("topup")}>
-                      {t("shareMarket.rentConfirm.topupAmount", {
-                        amount: formatUsdMoney(effectiveRentFunding.requiredTopupMinor, locale),
-                      })}
-                    </Button>
-                  ) : null}
+
                   {rentPrimaryAction === "topup" && rentWalletFunding && rentTarget ? (
                     <Link
                       href={walletTopupHref(rentWalletFunding.shortfallUnits, `/share-market/?focus=${encodeURIComponent(rentTarget.quote.offer.shareId)}`)}
@@ -1061,32 +949,16 @@ export function ShareMarketBuyerCatalog({
                     </Link>
                   ) : null}
                   {rentPrimaryAction === "confirm" ? (
-                    <Button className="min-h-11 whitespace-nowrap" variant="primary" isDisabled={!!busySeatId} onClick={() => void confirmRent()}>
+                    <Button className="min-h-11 whitespace-nowrap" variant="primary" isDisabled={!!busySeatId || rentCheckout.unsupported} onClick={() => void confirmRent()}>
                       {busySeatId ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShoppingCart className="h-4 w-4" />}
                       {rentIsFree
                         ? t("shareMarket.rentConfirm.confirmFree")
                         : t("shareMarket.rentConfirm.confirm")}
                     </Button>
                   ) : null}
-                  {rentPrimaryAction === "contact" ? (
-                    <Button className="min-h-11 whitespace-nowrap" variant="primary" isDisabled={!!busySeatId} onClick={contactRentSeller}>
-                      <MessageCircle className="h-4 w-4" />
-                      {t("shareMarket.rentConfirm.contactSeller")}
-                    </Button>
-                  ) : null}
-                  {rentPrimaryAction === "billing" ? (
-                    <Button className="min-h-11 whitespace-nowrap" variant="primary" isDisabled={!!busySeatId} onClick={openRentBilling}>
-                      {t("shareMarket.rentConfirm.openBilling")}
-                    </Button>
-                  ) : null}
-                  {rentPrimaryAction === "close" ? (
-                    <Button className="min-h-11 whitespace-nowrap" variant="primary" isDisabled={!!busySeatId} onClick={closeRentDialog}>
-                      {t("shareMarket.rentConfirm.returnToMarket")}
-                    </Button>
-                  ) : null}
+
                 </Modal.Footer>
               </>
-            )}
           </Modal.Dialog>
         </Modal.Container>
       </Modal.Backdrop>
