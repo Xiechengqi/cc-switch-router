@@ -20,9 +20,7 @@ import {
   RefreshCw,
   Search,
 } from "lucide-react";
-import { useAuth } from "@/components/auth/auth-provider";
 import { SegmentedControl } from "@/components/common/segmented-control";
-import { MarketWalletShortcut } from "@/components/dashboard/market-wallet-shortcut";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   getMarketProvider,
@@ -477,11 +475,9 @@ function RankingMethodDrawer({
 
 export function ProvidersPage() {
   const { locale, t } = useLocaleText();
-  const { session } = useAuth();
   const pathname = usePathname();
   const router = useRouter();
   const searchParams = useSearchParams();
-  const authed = !!session?.authenticated;
   const providerId = searchParams.get("provider") || "";
 
   const [providerList, setProviderList] = React.useState<MarketProviderList | null>(null);
@@ -608,8 +604,6 @@ export function ProvidersPage() {
           </Button>
         </div>
       </header>
-
-      {authed ? <MarketWalletShortcut /> : null}
 
       {providerList?.generation.stale ? (
         <div className="flex min-w-0 items-start gap-2 rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-900" role="status">

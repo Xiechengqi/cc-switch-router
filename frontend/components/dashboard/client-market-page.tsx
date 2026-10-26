@@ -10,7 +10,6 @@ import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { SegmentedControl } from "@/components/common/segmented-control";
 import { MarketAccessDialog } from "@/components/common/seller-approval-dialog";
 import { CreateClientDialog } from "@/components/dashboard/create-client-dialog";
-import { MarketWalletShortcut } from "@/components/dashboard/market-wallet-shortcut";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   deleteClientMarketHost,
@@ -504,7 +503,6 @@ export function ClientMarketPage() {
   return (
     <main className="mx-auto grid min-w-0 w-[calc(100%-2rem)] max-w-7xl grid-cols-[minmax(0,1fr)] gap-5 pb-10">
       <h1 className="sr-only">{t("clientMarket.title")}</h1>
-      {authed ? <MarketWalletShortcut /> : null}
       {marketProviderId ? (
         <div className="flex min-h-11 min-w-0 flex-wrap items-center justify-between gap-2 rounded-lg bg-slate-100 px-3 py-2 text-sm">
           <span className="min-w-0 text-slate-700">{t("providers.marketFilter.client")}</span>

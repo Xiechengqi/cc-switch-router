@@ -6,7 +6,6 @@ import { Loader2, RefreshCw } from "lucide-react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useAuth } from "@/components/auth/auth-provider";
 import { SegmentedControl } from "@/components/common/segmented-control";
-import { MarketWalletShortcut } from "@/components/dashboard/market-wallet-shortcut";
 import { ShareMarketBuyerCatalog } from "@/components/dashboard/share-market/buyer-catalog";
 import { catalogNeedsRuntimeSync } from "@/components/dashboard/share-market/buyer-catalog-utils";
 import { shareMarketMutationError } from "@/components/dashboard/share-market/market-utils";
@@ -313,7 +312,6 @@ export function ShareMarketWorkspace() {
   return (
     <main className="mx-auto grid w-full max-w-7xl gap-5 px-1 pb-10">
       <h1 className="sr-only">{t("shareMarket.title")}</h1>
-      {authed ? <MarketWalletShortcut /> : null}
       <div className="flex min-w-0 flex-wrap items-center justify-between gap-3 border-b border-slate-200 pb-3">
         {authed ? (
           <SegmentedControl
