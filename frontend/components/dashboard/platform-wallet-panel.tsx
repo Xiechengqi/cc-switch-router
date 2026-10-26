@@ -1035,6 +1035,9 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
                   {canStopPayment && !(order.status === "pending" && gateway?.canCancel) ? <Button size="sm" variant="outline" isDisabled={!!busy || statusBusyId === order.id} onPress={() => setAbandonConfirmId(order.id)}>
                     {t("marketWallet.abandonTopup")}
                   </Button> : null}
+                  {order.status === "pending" ? <Button size="sm" variant="ghost" isIconOnly aria-label={t("marketWallet.refreshGatewayStatus")} isDisabled={statusBusyId === order.id || !!busy} onPress={() => void refreshGatewayStatus(order.id)}>
+                    <RefreshCw className={`size-4 ${statusBusyId === order.id ? "animate-spin" : ""}`} aria-hidden="true" />
+                  </Button> : null}
                   {wallet.canTopup && ["expired", "cancelled"].includes(order.status) ? <Button size="sm" variant="outline" isDisabled={!!busy} onPress={() => {
                     idempotencyRef.current = null;
                     setAmount(((order.creditAmountMinor ?? order.amountMinor) / 100).toFixed(2));
@@ -1070,9 +1073,6 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
                   {order.status === "review_required" ? <p className="mt-1 text-xs text-amber-700">{t(order.reviewReason === "terminal_payment_marker" ? "marketWallet.reviewTerminalMarker" : order.reviewReason === "paid_receipt_invalid" ? "marketWallet.reviewInvalidReceipt" : order.reviewReason === "paid_terms_review" ? "marketWallet.reviewPaidTerms" : "marketWallet.reviewHelp")}</p> : null}
                   {order.lastGatewayCheckedAt ? <p>{t("marketWallet.lastGatewayCheck", { time: dateText(order.lastGatewayCheckedAt, locale), status: lastGatewayLabel })}</p> : null}
                   <div className="flex flex-wrap items-center gap-2 pt-1">
-                    {order.status === "pending" ? <Button size="sm" variant="ghost" isIconOnly aria-label={t("marketWallet.refreshGatewayStatus")} isDisabled={statusBusyId === order.id || !!busy} onPress={() => void refreshGatewayStatus(order.id)}>
-                      <RefreshCw className={`size-4 ${statusBusyId === order.id ? "animate-spin" : ""}`} aria-hidden="true" />
-                    </Button> : null}
                     {order.status === "pending" && gateway?.canCancel ? <Button size="sm" variant="outline" isDisabled={!!busy || statusBusyId === order.id} onPress={() => void chooseCancelAction(order)}>
                       <Ban className="size-4" aria-hidden="true" />{t("marketWallet.cancelPayment")}
                     </Button> : null}
