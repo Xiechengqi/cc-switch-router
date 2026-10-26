@@ -900,8 +900,8 @@ struct BuyerChannelView {
     canary: bool,
 }
 
-/// The effective gross payment bounds: the global range intersected with the
-/// channel's own merchant-verified range.
+/// Wallet-credit bounds: the global principal range intersected with the
+/// Owner-configured channel range. Maintenance fees are added separately.
 fn effective_topup_bounds(settings: &ChannelSettingsView) -> (i64, i64) {
     let min = settings
         .min_topup_minor
@@ -7683,7 +7683,7 @@ mod tests {
     }
 
     #[test]
-    fn fee_adjusted_channel_projection_and_quotes_agree_without_creating_orders() {
+    fn principal_channel_limits_survive_fee_changes_without_creating_orders() {
         let conn = memory();
         fixture_revision(&conn, 1);
         conn.execute(
@@ -7700,14 +7700,15 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         let channels = buyer_channel_views(&conn, true).unwrap();
-        assert_eq!(channels[0].amount_limits.max_credit_minor, Some(95_238));
+        assert_eq!(channels[0].amount_limits.min_credit_minor, Some(100));
+        assert_eq!(channels[0].amount_limits.max_credit_minor, Some(100_000));
         let quote = quotes::quote_tx(
             &conn,
             "buyer",
             true,
             quotes::QuoteRequest {
                 channel_id: "channel".into(),
-                amount_minor: 95_238,
+                amount_minor: 100_000,
                 token_id: None,
             },
             at,
@@ -7715,9 +7716,25 @@ mod tests {
         .unwrap();
         assert_eq!(
             (quote.credit_minor, quote.fee_minor, quote.pay_minor),
-            (95_238, 4_762, 100_000)
+            (100_000, 5_000, 105_000)
         );
-        for amount in [95_239, 96_000, 100_000, 99, 100_001, -1, i64::MAX] {
+        for amount in [100, 95_239, 96_000] {
+            let valid = quotes::quote_tx(
+                &conn,
+                "buyer",
+                true,
+                quotes::QuoteRequest {
+                    channel_id: "channel".into(),
+                    amount_minor: amount,
+                    token_id: None,
+                },
+                at,
+            )
+            .unwrap();
+            assert_eq!(valid.credit_minor, amount);
+            assert_eq!(valid.pay_minor, amount + valid.fee_minor);
+        }
+        for amount in [99, 100_001, -1, i64::MAX] {
             let error = quotes::quote_tx(
                 &conn,
                 "buyer",
@@ -7735,7 +7752,7 @@ mod tests {
                 panic!("expected coded amount error")
             };
             assert_eq!(code, "MARKET_TOPUP_AMOUNT_OUT_OF_RANGE");
-            assert_eq!(details["maxCreditMinor"], 95_238);
+            assert_eq!(details["maxCreditMinor"], 100_000);
             assert_eq!(details["maxTopupMinor"], 100_000);
             assert_eq!(details["maintenanceFeeBps"], 500);
         }
@@ -7743,7 +7760,7 @@ mod tests {
             conn.query_row("SELECT COUNT(*) FROM market_topup_quotes", [], |r| r
                 .get::<_, i64>(0))
                 .unwrap(),
-            1
+            4
         );
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM market_topup_orders", [], |r| r
@@ -7753,15 +7770,16 @@ mod tests {
         );
         ensure_pending_topup_capacity_tx(&conn, "buyer").unwrap();
 
-        // A policy edit immediately changes the public credit range. The old
-        // quote is still frozen but cannot create a new order at today's fee.
+        // A dynamic policy edit changes the fee, never the principal range.
+        // Old quotes stay frozen but cannot create new orders at today's fee.
         conn.execute(
-            "UPDATE market_wallet_policy SET maintenance_fee_bps = 1000, version = version + 1",
+            "UPDATE market_wallet_policy SET maintenance_fee_bps = 725, version = version + 1",
             [],
         )
         .unwrap();
         let channels = buyer_channel_views(&conn, true).unwrap();
-        assert_eq!(channels[0].amount_limits.max_credit_minor, Some(90_909));
+        assert_eq!(channels[0].amount_limits.max_credit_minor, Some(100_000));
+        assert_eq!(channels[0].amount_limits.maintenance_fee_bps, 725);
         assert_eq!(channels[0].amount_limits.policy_version, 2);
         assert!(
             quotes::validate_current_tx(
@@ -7775,16 +7793,37 @@ mod tests {
         let old = quotes::read_quote_tx(&conn, "buyer", &quote.id).unwrap();
         assert_eq!(
             (old.credit_minor, old.fee_minor, old.pay_minor),
-            (95_238, 4_762, 100_000)
+            (100_000, 5_000, 105_000)
+        );
+        let current = quotes::quote_tx(
+            &conn,
+            "buyer",
+            true,
+            quotes::QuoteRequest {
+                channel_id: "channel".into(),
+                amount_minor: 100_000,
+                token_id: None,
+            },
+            at,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                current.credit_minor,
+                current.fee_bps,
+                current.fee_minor,
+                current.pay_minor
+            ),
+            (100_000, 725, 7_250, 107_250)
         );
 
-        // Tiny but valid gross limits can have no feasible cent-valued credit.
+        // Even an exact $1 principal range remains payable with a nonzero fee.
         conn.execute("INSERT INTO market_payment_channel_settings (channel_id, max_topup_minor, updated_at) VALUES ('channel', 100, '2026-10-25')
             ON CONFLICT (channel_id) DO UPDATE SET max_topup_minor = 100, version = market_payment_channel_settings.version + 1", []).unwrap();
         let channels = buyer_channel_views(&conn, true).unwrap();
-        assert_eq!(channels[0].amount_limits.min_credit_minor, None);
-        assert_eq!(channels[0].amount_limits.max_credit_minor, None);
-        let error = quotes::quote_tx(
+        assert_eq!(channels[0].amount_limits.min_credit_minor, Some(100));
+        assert_eq!(channels[0].amount_limits.max_credit_minor, Some(100));
+        let minimum = quotes::quote_tx(
             &conn,
             "buyer",
             true,
@@ -7795,34 +7834,44 @@ mod tests {
             },
             at,
         )
-        .err()
         .unwrap();
-        let AppError::Coded { details, .. } = error else {
-            panic!("expected coded empty range error")
-        };
-        assert!(details["minCreditMinor"].is_null());
-        assert!(details["maxCreditMinor"].is_null());
+        assert_eq!(
+            (minimum.credit_minor, minimum.fee_minor, minimum.pay_minor),
+            (100, 7, 107)
+        );
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM market_topup_quotes", [], |r| r
                 .get::<_, i64>(0))
                 .unwrap(),
-            1
+            6
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM market_topup_orders", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
         );
     }
 
     #[test]
-    fn fee_bearing_paid_topup_credits_only_principal_and_passes_live_evidence() {
+    fn maximum_fee_bearing_paid_topup_credits_only_frozen_principal_and_passes_live_evidence() {
         let conn = memory();
         fixture_revision(&conn, 1);
         conn.execute("INSERT INTO market_topup_orders (id, user_id, channel_id, channel_revision, merchant_fingerprint,
           merchant_order_id, idempotency_key, request_fingerprint, amount_minor, credit_amount_minor,
           platform_fee_minor, platform_fee_rate_bps, status, created_at, updated_at)
           VALUES ('fee-order', 'buyer', 'channel', 1, 'merchant-fingerprint',
-          'router-00000000000000000000000000000001', 'fee-idem', 'fee-fp', 1050, 1000, 50, 500,
+          'router-00000000000000000000000000000001', 'fee-idem', 'fee-fp', 105000, 100000, 5000, 500,
           'pending', '2026-10-01', '2026-10-01')", []).unwrap();
+        // The Owner may change today's rate before this frozen order is paid.
+        conn.execute(
+            "UPDATE market_wallet_policy SET maintenance_fee_bps = 725, version = version + 1",
+            [],
+        )
+        .unwrap();
         let mut gateway = paid_order("router-00000000000000000000000000000001", "fee-tx");
-        gateway.fiat_amount_minor = 1050;
-        gateway.settled_amount = Some("10.50".into());
+        gateway.fiat_amount_minor = 105000;
+        gateway.settled_amount = Some("1050.00".into());
         apply_paid_order_tx(
             &conn,
             "fee-order",
@@ -7835,7 +7884,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             wallet_snapshot_tx(&conn, "buyer").unwrap().posted_units,
-            1000 * crate::market_billing::MONEY_UNITS_PER_MINOR
+            100_000 * crate::market_billing::MONEY_UNITS_PER_MINOR
         );
         assert_eq!(
             conn.query_row(
@@ -7846,7 +7895,7 @@ mod tests {
             .unwrap(),
             1
         );
-        assert_eq!(conn.query_row("SELECT -SUM(signed_units) FROM market_journal_postings WHERE account_kind = 'platform_fee_revenue'", [], |r| r.get::<_, i64>(0)).unwrap(), 50 * crate::market_billing::MONEY_UNITS_PER_MINOR);
+        assert_eq!(conn.query_row("SELECT -SUM(signed_units) FROM market_journal_postings WHERE account_kind = 'platform_fee_revenue'", [], |r| r.get::<_, i64>(0)).unwrap(), 5_000 * crate::market_billing::MONEY_UNITS_PER_MINOR);
         assert_eq!(
             crate::market_reconcile::audit_finance_tx(&conn, "2026-10-22T12:00:00Z").unwrap(),
             0
@@ -7863,7 +7912,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             wallet_snapshot_tx(&conn, "buyer").unwrap().posted_units,
-            1000 * crate::market_billing::MONEY_UNITS_PER_MINOR
+            100_000 * crate::market_billing::MONEY_UNITS_PER_MINOR
         );
         assert!(
             conn.execute(
@@ -8891,7 +8940,7 @@ mod tests {
                     "symbol": "USDT", "minConfirmations": 19
                 }],
                 "minTopupMinor": 100, "maxTopupMinor": 5000,
-                "minCreditMinor": 100, "maxCreditMinor": 4762,
+                "minCreditMinor": 100, "maxCreditMinor": 5000,
                 "maintenanceFeeBps": 500, "policyVersion": 1,
                 "channelRevision": 7, "channelSettingsVersion": 3, "canary": false
             })

@@ -33,8 +33,8 @@ export const marketWalletMessagesEn = {
 
   // Top-up form
   "marketWallet.customAmount": "Custom amount (USD)",
-  "marketWallet.amountRangeHelp": "Enter the balance to receive ({min}–{max}). The maintenance fee is added below.",
-  "marketWallet.amountRangeError": "Enter an amount between {min} and {max}, with up to two decimals.",
+  "marketWallet.amountRangeHelp": "Enter the balance to receive ({min}–{max}). The maintenance fee is added separately and does not count toward this limit.",
+  "marketWallet.amountRangeError": "Enter a balance credit between {min} and {max}, with up to two decimals. The maintenance fee is additional.",
   "marketWallet.amountRangeUnavailable": "This channel has no available top-up range. Choose another channel or refresh to retry.",
   "marketWallet.paymentMethod": "Payment method",
   "marketWallet.noPaymentMethods": "This channel has no payment methods available right now.",
@@ -160,8 +160,8 @@ export const marketWalletMessagesZh = {
   "marketWallet.viewOnExplorer": "在 Tronscan 查看交易 {hash}",
 
   "marketWallet.customAmount": "自定义金额（美元）",
-  "marketWallet.amountRangeHelp": "输入希望到账的余额（{min}–{max}），维护费在下方另计。",
-  "marketWallet.amountRangeError": "请输入 {min} 至 {max} 之间的金额，最多两位小数。",
+  "marketWallet.amountRangeHelp": "输入实际到账余额（{min}–{max}），维护费另加，不计入此限额。",
+  "marketWallet.amountRangeError": "请输入 {min} 至 {max} 之间的到账余额，最多两位小数，维护费另计。",
   "marketWallet.amountRangeUnavailable": "该渠道暂无可充值金额，请选择其他渠道或刷新重试。",
   "marketWallet.paymentMethod": "支付方式",
   "marketWallet.noPaymentMethods": "该渠道暂时没有可用的支付方式。",

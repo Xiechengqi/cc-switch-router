@@ -162,8 +162,8 @@ export const TOPUP_PRESET_MINOR = [500, 1_000, 2_000, 5_000, 10_000] as const;
 const DEFAULT_TOPUP_MIN_MINOR = 100;
 const DEFAULT_TOPUP_MAX_MINOR = 100_000;
 
-/** Only server-derived credit bounds are valid input bounds. Missing, empty or
- * malformed ranges must not turn gross payment limits into a credit promise. */
+/** Only server-provided principal bounds are valid input bounds. Maintenance
+ * fees are additional; missing, empty or malformed ranges fail closed. */
 export function topupBounds(channel: { minCreditMinor?: unknown; maxCreditMinor?: unknown } | null | undefined) {
   const min = channel?.minCreditMinor;
   const max = channel?.maxCreditMinor;

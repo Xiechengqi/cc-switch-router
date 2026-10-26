@@ -37,20 +37,27 @@ test("top-up amount accepts only exact supported cents", () => {
   }
 });
 
-test("top-up input uses authoritative fee-adjusted credit limits, not payment limits", () => {
-  const bounds = topupBounds({ minCreditMinor: 100, maxCreditMinor: 95_238 });
-  assert.deepEqual(bounds, { min: 100, max: 95_238 });
+test("top-up input accepts the full principal range independently of the current fee", () => {
+  const bounds = topupBounds({ minCreditMinor: 100, maxCreditMinor: 100_000 });
+  assert.deepEqual(bounds, { min: 100, max: 100_000 });
   assert.equal(parseTopupMinor("952.38", bounds!), 95_238);
+  assert.equal(parseTopupMinor("952.39", bounds!), 95_239);
+  assert.equal(parseTopupMinor("960", bounds!), 96_000);
+  assert.equal(parseTopupMinor("1000", bounds!), 100_000);
   assert.equal(parseTopupMinor("$1.00", bounds!), 100);
-  for (const invalid of ["952.39", "960", "1000", "0.99", "1.001", "1e2", "-1", ".50", "01.00"]) {
+  for (const invalid of ["1000.01", "0.99", "1.001", "1e2", "-1", ".50", "01.00"]) {
     assert.equal(parseTopupMinor(invalid, bounds!), null, invalid);
   }
-  assert.equal(parseTopupMinor("1000", topupBounds({ minCreditMinor: 100, maxCreditMinor: 100_000 })!), 100_000);
-  const raisedMinimum = topupBounds({ minCreditMinor: 952, maxCreditMinor: 4762 })!;
-  assert.equal(parseTopupMinor("9.51", raisedMinimum), null);
-  assert.equal(parseTopupMinor("9.52", raisedMinimum), 952);
-  assert.equal(parseTopupMinor("47.62", raisedMinimum), 4762);
-  assert.equal(parseTopupMinor("47.63", raisedMinimum), null);
+  for (const maintenanceFeeBps of [0, 500, 725, 1000, 10_000]) {
+    const channel = { minCreditMinor: 100, maxCreditMinor: 100_000, maintenanceFeeBps };
+    assert.deepEqual(topupBounds(channel), bounds);
+    assert.equal(parseTopupMinor("1000", topupBounds(channel)!), 100_000);
+  }
+  const customRange = topupBounds({ minCreditMinor: 1000, maxCreditMinor: 5000 })!;
+  assert.equal(parseTopupMinor("9.99", customRange), null);
+  assert.equal(parseTopupMinor("10", customRange), 1000);
+  assert.equal(parseTopupMinor("50", customRange), 5000);
+  assert.equal(parseTopupMinor("50.01", customRange), null);
 });
 
 test("missing, empty and malformed credit ranges fail closed", () => {

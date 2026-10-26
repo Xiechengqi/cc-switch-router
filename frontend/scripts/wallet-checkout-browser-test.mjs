@@ -208,18 +208,17 @@ try {
   let rejectNextTopupQuote = false;
   let feeBps = 500;
   let policyVersion = 1;
+  let channelSettingsVersion = 1;
+  let primaryMaxCreditMinor = 100_000;
   let delayedQuote = null;
   const quoteRequests = [];
   const channelLimits = (id, displayName, minTopupMinor, maxTopupMinor) => {
-    let minCreditMinor = null, maxCreditMinor = null;
-    // Exhaustive cent-valued oracle, independent of the server's binary search.
-    for (let credit = 100; credit <= 100_000; credit += 1) {
-      const pay = credit + Math.floor((credit * feeBps + 5000) / 10000);
-      if (pay >= minTopupMinor && pay <= maxTopupMinor) { minCreditMinor ??= credit; maxCreditMinor = credit; }
-    }
+    const lower = Math.max(100, minTopupMinor), upper = Math.min(100_000, maxTopupMinor);
+    const minCreditMinor = lower <= upper ? lower : null;
+    const maxCreditMinor = lower <= upper ? upper : null;
     return { id, displayName, gatewayKind: "dujiaopay", orderMode: "cashier", methods: [],
       minTopupMinor, maxTopupMinor, minCreditMinor, maxCreditMinor,
-      maintenanceFeeBps: feeBps, policyVersion, channelRevision: 1, channelSettingsVersion: 1 };
+      maintenanceFeeBps: feeBps, policyVersion, channelRevision: 1, channelSettingsVersion };
   };
   const transferKeys = [];
   let transferAmount = "8640001";
@@ -251,9 +250,9 @@ try {
   await page.context().route("**/v1/market-wallet/topup-quotes", async (route) => {
     const { channelId, amountMinor } = route.request().postDataJSON();
     quoteRequests.push({ channelId, amountMinor });
-    const channel = channelId === "channel-2" ? channelLimits(channelId, "Bounded channel", 1000, 5000) : channelLimits(channelId, "DujiaoPay", 100, 100_000);
+    const channel = channelId === "channel-2" ? channelLimits(channelId, "Bounded channel", 1000, 5000) : channelLimits(channelId, "DujiaoPay", 100, primaryMaxCreditMinor);
     const feeMinor = Math.floor((amountMinor * feeBps + 5000) / 10000);
-    const response = { id: `quote-${amountMinor}`, creditMinor: amountMinor, feeBps, feeMinor, payMinor: amountMinor + feeMinor, policyVersion, channelRevision: 1, channelSettingsVersion: 1, expiresAt: new Date(Date.now() + 300_000).toISOString() };
+    const response = { id: `quote-${amountMinor}`, creditMinor: amountMinor, feeBps, feeMinor, payMinor: amountMinor + feeMinor, policyVersion, channelRevision: 1, channelSettingsVersion, expiresAt: new Date(Date.now() + 300_000).toISOString() };
     if (delayedQuote) {
       const pending = delayedQuote;
       delayedQuote = null;
@@ -279,9 +278,9 @@ try {
   });
   await page.context().route("**/v1/market-wallet/channels", async (route) => {
     await route.fulfill({ contentType: "application/json", body: JSON.stringify([
-      channelLimits("channel-1", "DujiaoPay", 100, 100_000),
+      channelLimits("channel-1", "DujiaoPay", 100, primaryMaxCreditMinor),
       channelLimits("channel-2", "Bounded channel", 1000, 5000),
-      channelLimits("channel-3", "Unavailable channel", 100, 100),
+      channelLimits("channel-3", "Unavailable channel", 200, 100),
     ]) });
   });
   await page.context().route("**/v1/market-wallet/topups", async (route) => {
@@ -351,36 +350,43 @@ try {
   assert.equal(stopCalls, 1);
   assert.equal(topup.status, "review_required");
 
-  // The displayed range describes wallet credit, not the gross payment cap.
+  // The full $1–$1,000 principal range excludes the additional maintenance fee.
   // Invalid inputs never request a quote or consume pending-order capacity.
   const amountInput = page.locator("#market-wallet-topup-amount");
   const amountHelp = page.locator("#wallet-amount-help");
   const channelSelect = page.locator("select").filter({ has: page.locator('option[value="channel-1"]') });
-  await amountHelp.filter({ hasText: "$1.00–$952.38" }).waitFor();
+  await amountHelp.filter({ hasText: "$1.00–$1,000.00" }).waitFor();
   const requestsBeforeInvalid = quoteRequests.length;
-  for (const invalid of ["960", "952.39"]) {
+  for (const invalid of ["0.99", "1000.01"]) {
     await amountInput.fill(invalid);
     await amountInput.blur();
-    await amountHelp.filter({ hasText: /\$952\.38/ }).waitFor();
+    await amountHelp.filter({ hasText: /\$1,000\.00/ }).waitFor();
     assert.equal(await amountInput.getAttribute("aria-invalid"), "true");
     assert.equal(await page.getByRole("button", { name: "Continue to payment", exact: true }).isDisabled(), true);
     await page.waitForTimeout(600);
   }
   assert.equal(quoteRequests.length, requestsBeforeInvalid);
   assert.equal(topupCreates, 0);
-  await amountInput.fill("952.38");
-  await page.getByRole("button", { name: "Pay $1,000.00", exact: true }).waitFor();
+  await amountInput.fill("960");
+  await page.getByRole("button", { name: "Pay $1,008.00", exact: true }).waitFor();
+  assert.equal(quoteRequests.at(-1).amountMinor, 96_000);
+  await amountInput.fill("1000");
+  await page.getByRole("button", { name: "Pay $1,050.00", exact: true }).waitFor();
+  assert.equal(quoteRequests.at(-1).amountMinor, 100_000);
 
   await channelSelect.selectOption("channel-2");
-  await amountHelp.filter({ hasText: /\$9\.52.*\$47\.62/ }).waitFor();
-  assert.equal(await amountInput.inputValue(), "952.38", "switching never silently clamps the requested credit");
+  await amountHelp.filter({ hasText: /\$10\.00.*\$50\.00/ }).waitFor();
+  assert.equal(await amountInput.inputValue(), "1000", "switching never silently clamps the requested credit");
   assert.equal(await page.getByRole("button", { name: "$5", exact: true }).isDisabled(), true);
-  assert.equal(await page.getByRole("button", { name: "$50", exact: true }).isDisabled(), true);
+  assert.equal(await page.getByRole("button", { name: "$50", exact: true }).isDisabled(), false);
+  assert.equal(await page.getByRole("button", { name: "$100", exact: true }).isDisabled(), true);
   assert.equal(await page.getByRole("button", { name: "$10", exact: true }).isDisabled(), false);
-  await amountInput.fill("9.51");
+  await amountInput.fill("9.99");
   assert.equal(await amountInput.getAttribute("aria-invalid"), "true");
-  await amountInput.fill("9.52");
-  await page.getByRole("button", { name: "Pay $10.00", exact: true }).waitFor();
+  await amountInput.fill("10");
+  await page.getByRole("button", { name: "Pay $10.50", exact: true }).waitFor();
+  await amountInput.fill("50");
+  await page.getByRole("button", { name: "Pay $52.50", exact: true }).waitFor();
   await channelSelect.selectOption("channel-3");
   await amountHelp.filter({ hasText: /no available top-up range/ }).waitFor();
   assert.equal(await amountInput.isDisabled(), true);
@@ -398,39 +404,48 @@ try {
   await page.getByRole("button", { name: "Pay $10.50", exact: true }).waitFor();
   releaseOldQuote();
   await page.waitForTimeout(100);
-  assert.match(await amountHelp.textContent(), /\$9\.52.*\$47\.62/);
+  assert.match(await amountHelp.textContent(), /\$10\.00.*\$50\.00/);
   assert.equal(await page.getByRole("button", { name: "Pay $10.50", exact: true }).isDisabled(), false);
 
   // A fee update invalidates the old quote as soon as current channel data
   // arrives, even if no new payment is being created. Input remains untouched.
   await channelSelect.selectOption("channel-1");
-  await amountInput.fill("952.38");
-  await page.getByRole("button", { name: "Pay $1,000.00", exact: true }).waitFor();
-  feeBps = 1000; policyVersion += 1;
+  await amountInput.fill("1000");
+  await page.getByRole("button", { name: "Pay $1,050.00", exact: true }).waitFor();
+  feeBps = 725; policyVersion += 1;
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
-  await amountHelp.filter({ hasText: /\$909\.09/ }).waitFor();
-  assert.equal(await amountInput.inputValue(), "952.38");
-  assert.equal(await amountInput.getAttribute("aria-invalid"), "true");
-  assert.equal(await page.getByRole("button", { name: "Continue to payment", exact: true }).isDisabled(), true);
+  await page.getByRole("button", { name: "Pay $1,072.50", exact: true }).waitFor();
+  assert.equal(await amountInput.inputValue(), "1000");
+  assert.equal(await amountInput.getAttribute("aria-invalid"), "false");
+  assert.match(await amountHelp.textContent(), /\$1\.00.*\$1,000\.00/);
+  for (const [rate, total] of [[0, "$1,000.00"], [10_000, "$2,000.00"]]) {
+    feeBps = rate; policyVersion += 1;
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    await page.getByRole("button", { name: `Pay ${total}`, exact: true }).waitFor();
+    assert.equal(await amountInput.inputValue(), "1000");
+    assert.equal(await amountInput.getAttribute("aria-invalid"), "false");
+    assert.match(await amountHelp.textContent(), /\$1\.00.*\$1,000\.00/);
+  }
+  assert.equal(topupCreates, 0, "fee refresh never submits an order automatically");
 
   // If a quote sees a newer policy before channel polling does, refresh its
   // limits and request a matching quote before enabling payment.
   feeBps = 500; policyVersion += 1;
   await amountInput.fill("10");
   await page.getByRole("button", { name: "Pay $10.50", exact: true }).waitFor();
-  await amountHelp.filter({ hasText: /\$952\.38/ }).waitFor();
+  await amountHelp.filter({ hasText: /\$1,000\.00/ }).waitFor();
 
-  // A range error carries credit limits too; it refreshes the form instead
-  // of leaving a generic payment-total error with stale $1–$1,000 help.
-  feeBps = 2500; policyVersion += 1;
+  // Only an explicit channel principal-limit change narrows the input range.
+  // An error refreshes that range without clamping the entered principal.
+  primaryMaxCreditMinor = 80_000; channelSettingsVersion += 1;
   await amountInput.fill("850");
   await amountHelp.filter({ hasText: /\$800\.00/ }).waitFor();
   assert.equal(await amountInput.inputValue(), "850");
   assert.equal(await amountInput.getAttribute("aria-invalid"), "true");
   assert.equal(topupCreates, 0);
-  feeBps = 500; policyVersion += 1;
+  primaryMaxCreditMinor = 100_000; channelSettingsVersion += 1;
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
-  await amountHelp.filter({ hasText: /\$952\.38/ }).waitFor();
+  await amountHelp.filter({ hasText: /\$1,000\.00/ }).waitFor();
 
   // A committed order with no payable capability stays visible in the new
   // tab. The wallet must not pretend it is ready to choose a payment method.
@@ -753,7 +768,7 @@ try {
   assert.equal(await commissionInput.isDisabled(), true);
   assert.equal(await commissionPanel.getByRole("button", { name: "Save", exact: true }).isDisabled(), true);
   assert.deepEqual(pageErrors, []);
-  console.log("wallet checkout: fee-adjusted credit limits, exact boundary cents, unavailable channels, stale-quote races, live fee refresh, safe new tabs, recheck/stop, exact transfer, idempotent retry without financial OTP, scoped access, automatic earnings credit, retired payout/manual-credit paths and Owner policy edits passed; four widths; no screenshots or real payments");
+  console.log("wallet checkout: fee-independent principal limits, exact boundary cents, dynamic 0%/5%/7.25%/100% fees, unavailable channels, stale-quote races, live fee refresh, safe new tabs, recheck/stop, exact transfer, idempotent retry without financial OTP, scoped access, automatic earnings credit, retired payout/manual-credit paths and Owner policy edits passed; four widths; no screenshots or real payments");
 } finally {
   await browser?.close();
   if (server) await new Promise((resolveStop, rejectStop) => {

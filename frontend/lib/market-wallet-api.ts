@@ -171,7 +171,7 @@ export type MarketWalletChannel = Pick<MarketPaymentChannel, "id" | "displayName
   methods?: MarketWalletPaymentMethod[];
   minTopupMinor?: number;
   maxTopupMinor?: number;
-  /** Authoritative wallet-credit bounds after the cent-rounded maintenance fee. */
+  /** Authoritative wallet-credit bounds, excluding the additional maintenance fee. */
   minCreditMinor: number | null;
   maxCreditMinor: number | null;
   maintenanceFeeBps: number;
