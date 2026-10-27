@@ -902,6 +902,19 @@ async fn main() -> Result<()> {
         let shutdown = market_payments_shutdown_rx;
         async move { crate::market_payments::run_service(market_payments_state, shutdown).await }
     });
+    let market_notification_tracking_state = market_notifications_state.clone();
+    let market_notification_tracking_shutdown = background_shutdown_rx.clone();
+    let market_notification_tracking_task = spawn_background_task(
+        "Market notification tracking",
+        background_shutdown_rx.clone(),
+        async move {
+            crate::market_notifications::run_tracking_service(
+                market_notification_tracking_state,
+                market_notification_tracking_shutdown,
+            )
+            .await
+        },
+    );
     let market_notifications_task = tokio::spawn({
         let shutdown = market_notifications_shutdown_rx;
         async move {
@@ -988,6 +1001,10 @@ async fn main() -> Result<()> {
         ("USD/CNY market FX", market_fx_task),
         ("Market payments", market_payments_task),
         ("Market notifications", market_notifications_task),
+        (
+            "Market notification tracking",
+            market_notification_tracking_task,
+        ),
     ];
     #[cfg(unix)]
     background_tasks.push(("local user administration", user_admin_task));

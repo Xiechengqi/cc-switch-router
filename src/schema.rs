@@ -313,6 +313,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../schema/0089_market_suspension_notifications.sql"),
     ),
     (90, include_str!("../schema/0090_user_passwords.sql")),
+    (
+        91,
+        include_str!("../schema/0091_market_notification_safety.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -822,8 +826,9 @@ fn migration_checksum(sql: &str) -> String {
 mod tests {
     use super::*;
 
-    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 241;
+    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 244;
 
+    mod notification_safety;
     mod suspension;
 
     fn memory_connection() -> Connection {

@@ -1101,6 +1101,78 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
     },
     // ── Client lifecycle notifications ──
     SettingsField {
+        key: "CC_SWITCH_ROUTER_RESEND_WEBHOOK_SECRET",
+        label: "Resend delivery webhook secret",
+        group: "Email (Resend)",
+        field_type: FieldType::Secret,
+        required: false,
+        restart_required: true,
+        default: None,
+        description: "Optional Resend signing secret for /v1/webhooks/resend. Delivery tracking only; never authorizes a resend.",
+        placeholder: Some("whsec_…"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_SERVICE_NOTICE_COOLDOWN_SECS",
+        label: "Service pause cooldown (seconds)",
+        group: "Email (Resend)",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("1800"),
+        description: "Minimum interval between pause reminders for the same service. Noisy updates become one status digest.",
+        placeholder: Some("1800"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_SERVICE_NOTICE_PAUSE_DAILY_LIMIT",
+        label: "Pause reminders per service per day",
+        group: "Email (Resend)",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("3"),
+        description: "Rolling 24-hour pause reminder cap per user, service and channel. Zero disables pause reminders, not receipts.",
+        placeholder: Some("3"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_SERVICE_NOTICE_USER_HOURLY_LIMIT",
+        label: "Service reminders per user per hour",
+        group: "Email (Resend)",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("10"),
+        description: "Rolling hourly service-notice budget per user and channel. Financial receipts and login are excluded.",
+        placeholder: Some("10"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_SERVICE_NOTICE_EMAIL_DAILY_LIMIT",
+        label: "Platform service-email budget per day",
+        group: "Email (Resend)",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("50"),
+        description: "Rolling daily platform-wide marketplace service-email circuit breaker. Leave provider quota for login and financial receipts. Zero pauses service email only.",
+        placeholder: Some("50"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_SERVICE_NOTICE_MAX_AGE_SECS",
+        label: "Service reminder freshness (seconds)",
+        group: "Email (Resend)",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("3600"),
+        description: "Do not submit service reminders older than this limit. Already accepted mail cannot be recalled.",
+        placeholder: Some("3600"),
+        dynamic_group: None,
+    },
+    SettingsField {
         key: "CC_SWITCH_ROUTER_CLIENT_EMAIL_NOTIFICATIONS_ENABLED",
         label: "Client email notifications",
         group: "Client notifications",
@@ -2135,6 +2207,11 @@ fn constraints_for_field(key: &str) -> FieldConstraints {
         "CC_SWITCH_ROUTER_REGISTRATION_UNOWNED_INSTALLATION_WATERMARK" => {
             Some((1_000.0, 1_000_000.0))
         }
+        "CC_SWITCH_ROUTER_SERVICE_NOTICE_COOLDOWN_SECS"
+        | "CC_SWITCH_ROUTER_SERVICE_NOTICE_MAX_AGE_SECS" => Some((60.0, 86400.0)),
+        "CC_SWITCH_ROUTER_SERVICE_NOTICE_PAUSE_DAILY_LIMIT" => Some((0.0, 100.0)),
+        "CC_SWITCH_ROUTER_SERVICE_NOTICE_USER_HOURLY_LIMIT" => Some((0.0, 1000.0)),
+        "CC_SWITCH_ROUTER_SERVICE_NOTICE_EMAIL_DAILY_LIMIT" => Some((0.0, 100000.0)),
         "CC_SWITCH_ROUTER_CLIENT_OFFLINE_ALERT_SECS" => Some((180.0, 86_400.0)),
         "CC_SWITCH_ROUTER_CLIENT_RECOVERY_STABLE_SECS" => Some((30.0, 3_600.0)),
         "CC_SWITCH_ROUTER_CLIENT_ALERT_COOLDOWN_SECS" => Some((60.0, 604_800.0)),
@@ -3212,6 +3289,19 @@ fn normalize_value(field: &SettingsField, raw: &str) -> Result<Option<String>, A
             crate::client_server_release::normalize_client_server_release(trimmed)
                 .map(Some)
                 .map_err(AppError::BadRequest)
+        }
+        FieldType::Secret if field.key == "CC_SWITCH_ROUTER_RESEND_WEBHOOK_SECRET" => {
+            use base64::Engine;
+            let valid = trimmed
+                .strip_prefix("whsec_")
+                .and_then(|key| base64::engine::general_purpose::STANDARD.decode(key).ok())
+                .is_some_and(|key| (16..=128).contains(&key.len()));
+            if !valid {
+                return Err(AppError::BadRequest(
+                    "Resend webhook secret must be a valid whsec_ signing secret".into(),
+                ));
+            }
+            Ok(Some(trimmed.to_string()))
         }
         FieldType::Secret if field.key == "CC_SWITCH_ROUTER_RESEND_API_KEY" => {
             if !trimmed.starts_with("re_") {
@@ -4339,6 +4429,32 @@ fn parse_bool_truthy(v: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn service_notice_settings_have_bounded_budgets_and_a_valid_optional_signing_secret() {
+        use base64::Engine;
+        let secret = super::field_by_key("CC_SWITCH_ROUTER_RESEND_WEBHOOK_SECRET").unwrap();
+        assert!(super::normalize_value(secret, "not-a-signing-secret").is_err());
+        let valid = format!(
+            "whsec_{}",
+            base64::engine::general_purpose::STANDARD.encode([7u8; 32])
+        );
+        assert_eq!(super::normalize_value(secret, &valid).unwrap(), Some(valid));
+        assert!(super::normalize_value(secret, "").unwrap().is_none());
+        for key in [
+            "CC_SWITCH_ROUTER_SERVICE_NOTICE_PAUSE_DAILY_LIMIT",
+            "CC_SWITCH_ROUTER_SERVICE_NOTICE_USER_HOURLY_LIMIT",
+            "CC_SWITCH_ROUTER_SERVICE_NOTICE_EMAIL_DAILY_LIMIT",
+        ] {
+            let field = super::field_by_key(key).unwrap();
+            assert!(field.restart_required);
+            assert!(super::normalize_value(field, "0").is_ok());
+            assert!(super::normalize_value(field, "-1").is_err());
+            assert!(super::normalize_value(field, "100001").is_err());
+        }
+        let age = super::field_by_key("CC_SWITCH_ROUTER_SERVICE_NOTICE_MAX_AGE_SECS").unwrap();
+        assert!(super::normalize_value(age, "59").is_err());
+        assert!(super::normalize_value(age, "3600").is_ok());
+    }
     use super::*;
 
     #[test]
@@ -5369,8 +5485,8 @@ mod tests {
     #[test]
     fn settings_contract_exposes_all_fields_in_seven_domains() {
         let schema = schema_response();
-        assert_eq!(SETTINGS_FIELDS.len(), 129);
-        assert_eq!(schema.fields.len(), 129);
+        assert_eq!(SETTINGS_FIELDS.len(), 135);
+        assert_eq!(schema.fields.len(), 135);
         assert_eq!(schema.categories.len(), 7);
         assert!(
             SETTINGS_FIELDS
@@ -5769,6 +5885,8 @@ mod tests {
             resend_from: None,
             resend_from_name: None,
             resend_reply_to: None,
+            resend_webhook_secret: None,
+            service_notice_limits: crate::config::ServiceNoticeLimits::default(),
             client_notifications: crate::config::ClientNotificationSettings::default(),
             telegram_bot: crate::config::TelegramBotSettings::default(),
             bark: crate::config::BarkSettings::default(),

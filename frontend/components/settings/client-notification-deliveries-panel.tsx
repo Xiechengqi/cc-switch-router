@@ -4,6 +4,7 @@ import { Alert, Button, Card, Chip, Input } from "@heroui/react";
 import { Loader2, RefreshCw, RotateCcw } from "lucide-react";
 import * as React from "react";
 import { CompactSelect } from "@/components/common/compact-select";
+import { MarketNotificationDiagnosticsPanel } from "@/components/settings/market-notification-diagnostics-panel";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getAlertingOverview, getClientChatDeliveries, getClientNotificationDeliveries, requeueClientChatDelivery } from "@/lib/api";
 import type { MessageKey } from "@/lib/i18n";
@@ -86,6 +87,7 @@ export function ClientNotificationDeliveriesPanel() {
 
   return (
     <div className="grid gap-6">
+    <MarketNotificationDiagnosticsPanel />
     <Card className="rounded-lg">
       <Card.Header className="flex-row items-start justify-between gap-4 space-y-0">
         <div>

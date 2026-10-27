@@ -229,6 +229,12 @@ CI 的并行任务、缓存边界、测试数据库模板与耗时排查见 [构
 | `CC_SWITCH_ROUTER_RESEND_FROM` | 空 | 邮件发件人,可填裸邮箱或 `TokenSwitch <noreply@example.com>`;裸邮箱会自动显示为 `TokenSwitch <邮箱>` |
 | `CC_SWITCH_ROUTER_RESEND_FROM_NAME` | `TokenSwitch` | `CC_SWITCH_ROUTER_RESEND_FROM` 为裸邮箱时使用的发件人显示名 |
 | `CC_SWITCH_ROUTER_RESEND_REPLY_TO` | 空 | 验证码、Client 生命周期与聊天室邮件的 Reply-To |
+| `CC_SWITCH_ROUTER_RESEND_WEBHOOK_SECRET` | 空 | Resend 为 `/v1/webhooks/resend` 生成的签名密钥，只追踪最终投递，不重发已接收邮件 |
+| `CC_SWITCH_ROUTER_SERVICE_NOTICE_COOLDOWN_SECS` | `1800` | 同一市场服务的暂停提醒冷却时间，频繁变化合并摘要 |
+| `CC_SWITCH_ROUTER_SERVICE_NOTICE_PAUSE_DAILY_LIMIT` | `3` | 每用户、服务及渠道滚动 24 小时暂停提醒上限 |
+| `CC_SWITCH_ROUTER_SERVICE_NOTICE_USER_HOURLY_LIMIT` | `10` | 每用户、渠道跨服务提醒的滚动小时上限 |
+| `CC_SWITCH_ROUTER_SERVICE_NOTICE_EMAIL_DAILY_LIMIT` | `50` | 市场服务邮件滚动每日总预算，0 仅关闭服务邮件，不影响资金回执和登录 |
+| `CC_SWITCH_ROUTER_SERVICE_NOTICE_MAX_AGE_SECS` | `3600` | 不再向网关提交过期服务提醒；已被接受的邮件无法撤回 |
 | `CC_SWITCH_ROUTER_CLIENT_EMAIL_NOTIFICATIONS_ENABLED` | `true` | Client 注册/离线邮件总开关;通知仅发送至对应 Client 当前已验证的 Owner 邮箱 |
 | `CC_SWITCH_ROUTER_CLIENT_OFFLINE_ALERT_SECS` | `180` | 连续缺少可信签名心跳多久后确认离线;安全下限为 180 秒 |
 | `CC_SWITCH_ROUTER_CLIENT_RECOVERY_STABLE_SECS` | `120` | 离线 Client 心跳持续稳定多久后才结束原离线 episode；不会启动或重启进程 |

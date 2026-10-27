@@ -38,6 +38,8 @@
     "test:wallet-checkout-browser": "node scripts/wallet-checkout-browser-test.mjs",
     "test:navbar-wallet-browser": "node scripts/navbar-wallet-browser-test.mjs",
     "test:auth-password": "tsx --test lib/password-auth.test.ts lib/password-auth-transport.test.ts",
+    "test:market-notifications": "tsx --test lib/market-notification-diagnostics.test.ts",
+    "test:market-notifications-browser": "node scripts/market-notification-browser-test.mjs",
     "test:auth-password-browser": "node scripts/auth-password-browser-test.mjs"
   },
   "dependencies": {

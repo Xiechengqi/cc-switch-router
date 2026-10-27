@@ -44,6 +44,7 @@ pub(super) fn purpose(item: &Claimed) -> Option<&'static str> {
         "earnings_held" => Some("provider_hold"),
         "earnings_released" => Some("provider_hold_released"),
         "contract_suspended" => Some("service_paused"),
+        "service_status_summary" => Some("service_status_summary"),
         "contract_terminating_soon" => Some("service_ending_warning"),
         "contract_terminated" => Some("service_ended"),
         "dispute_resolved" => Some("service_dispute_decision"),
@@ -133,6 +134,7 @@ pub(super) enum Prepared {
 
 /// Persist before the provider request. A changed template/config can never
 /// mutate the body under an already-used provider idempotency key.
+#[cfg(test)]
 pub(super) fn prepare_tx(
     conn: &Connection,
     item: &Claimed,
@@ -142,15 +144,39 @@ pub(super) fn prepare_tx(
     ready: bool,
     time: &str,
 ) -> Result<Prepared, AppError> {
+    prepare_with_limits_tx(
+        conn,
+        item,
+        channel,
+        purpose,
+        envelope,
+        ready,
+        time,
+        &crate::config::ServiceNoticeLimits::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prepare_with_limits_tx(
+    conn: &Connection,
+    item: &Claimed,
+    channel: &str,
+    purpose: &str,
+    envelope: Value,
+    ready: bool,
+    time: &str,
+    limits: &crate::config::ServiceNoticeLimits,
+) -> Result<Prepared, AppError> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin channel notification claim"))?;
-    let prepared = prepare_in_tx(&tx, item, channel, purpose, envelope, ready, time)?;
+    let prepared = prepare_in_tx(&tx, item, channel, purpose, envelope, ready, time, limits)?;
     tx.commit()
         .map_err(db_error("commit channel notification claim"))?;
     Ok(prepared)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_in_tx(
     conn: &Connection,
     item: &Claimed,
@@ -159,6 +185,7 @@ fn prepare_in_tx(
     envelope: Value,
     ready: bool,
     time: &str,
+    limits: &crate::config::ServiceNoticeLimits,
 ) -> Result<Prepared, AppError> {
     let semantic = semantic_key(item, purpose);
     let id = Uuid::new_v4().to_string();
@@ -211,6 +238,20 @@ fn prepare_in_tx(
         // Configuring mail later does not flood users with historical receipts.
         conn.execute("UPDATE market_notification_deliveries SET status='blocked_config',last_error='notification channel is not configured' WHERE id=?1",params![id]).map_err(db_error("record disabled notification channel"))?;
         return Ok(Prepared::Done("blocked_config".into()));
+    }
+    if let Some(reason) = super::safety::reason_tx(conn, item, &id, channel, purpose, limits, time)?
+    {
+        let status = super::safety::suppress_tx(
+            conn,
+            item,
+            &id,
+            purpose,
+            first.as_deref(),
+            reason,
+            limits,
+            time,
+        )?;
+        return Ok(Prepared::Done(status));
     }
     if first.is_none() {
         conn.execute("UPDATE market_notification_deliveries SET envelope_json=?2,status='queued' WHERE id=?1 AND first_attempt_at IS NULL",params![id,envelope.to_string()]).map_err(db_error("freeze notification envelope"))?;
@@ -271,8 +312,16 @@ pub(super) fn finish_attempt_tx(
             )
         }
     };
-    conn.execute("UPDATE market_notification_deliveries SET status=?3,provider_message_id=?4,last_error=?5,next_attempt_at=?6,sent_at=CASE WHEN ?3='sent' THEN ?7 ELSE sent_at END,claim_token=NULL,claim_expires_at=NULL
-        WHERE id=?1 AND claim_token=?2 AND status='claimed'",params![a.id,a.token,status,provider,error,next,time]).map(|n|n==1).map_err(db_error("finish channel notification"))
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_error("begin channel result"))?;
+    let changed=tx.execute("UPDATE market_notification_deliveries SET status=?3,provider_message_id=?4,last_error=?5,next_attempt_at=?6,sent_at=CASE WHEN ?3='sent' THEN ?7 ELSE sent_at END,claim_token=NULL,claim_expires_at=NULL
+        WHERE id=?1 AND claim_token=?2 AND status='claimed'",params![a.id,a.token,status,provider,error,next,time]).map_err(db_error("finish channel notification"))?;
+    if changed == 1 && status == "sent" {
+        super::tracking::accepted_tx(&tx, &a.id, time)?;
+    }
+    tx.commit().map_err(db_error("commit channel result"))?;
+    Ok(changed == 1)
 }
 
 fn merge_retry(current: &mut Option<DeliveryFailure>, next: DeliveryFailure) {
@@ -319,6 +368,20 @@ pub(super) async fn deliver(
             mandatory: item.mandatory,
             attempts: item.attempts,
         };
+        if purpose == "service_status_summary" {
+            let (total, paused, active) = super::safety::digest_counts_tx(&conn, item)
+                .map_err(|e| failure(&e.to_string(), true, None))?;
+            if total == 0 {
+                return Ok("superseded".into());
+            }
+            content.payload["relatedCount"] = json!(total);
+            content.payload["pausedCount"] = json!(paused);
+            content.payload["activeCount"] = json!(active);
+            content.payload["statusAsOf"] = json!(time);
+        } else if super::safety::is_service(purpose) {
+            super::email::enrich_service_tx(&conn, &mut content)
+                .map_err(|e| failure(&e.to_string(), true, None))?;
+        }
         if matches!(purpose, "funding_summary" | "service_recovery_summary") {
             let count =
                 super::policy::related_count_tx(&conn, item, purpose, &crate::market_wallet::now())
@@ -392,15 +455,28 @@ pub(super) async fn deliver(
     for (channel, envelope, ready, credential) in channels {
         let prepared = {
             let conn = state.store.conn.lock().await;
-            prepare_tx(
-                &conn,
-                item,
-                channel,
-                purpose,
-                envelope,
-                ready,
-                &crate::market_wallet::now(),
-            )
+            let time = crate::market_wallet::now();
+            // Recheck each channel immediately before claiming: Telegram/config
+            // lookups and a sibling network attempt may have outlived the state.
+            match super::notice_current_tx(&conn, item, &time) {
+                Err(e) => Err(e),
+                Ok(false) => super::policy::suppress_obsolete_deliveries_tx(&conn, item, &time)
+                    .map(|lease| {
+                        lease
+                            .map(Prepared::Deferred)
+                            .unwrap_or_else(|| Prepared::Done("superseded".into()))
+                    }),
+                Ok(true) => prepare_with_limits_tx(
+                    &conn,
+                    item,
+                    channel,
+                    purpose,
+                    envelope,
+                    ready,
+                    &time,
+                    &state.config.service_notice_limits,
+                ),
+            }
         };
         let prepared = match prepared {
             Ok(v) => v,

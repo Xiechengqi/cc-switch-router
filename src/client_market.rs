@@ -9360,6 +9360,8 @@ mod tests {
             resend_from: None,
             resend_from_name: None,
             resend_reply_to: None,
+            resend_webhook_secret: None,
+            service_notice_limits: crate::config::ServiceNoticeLimits::default(),
             client_notifications: ClientNotificationSettings::default(),
             telegram_bot: crate::config::TelegramBotSettings::default(),
             bark: crate::config::BarkSettings::default(),

@@ -28,12 +28,22 @@ use crate::error::AppError;
 const CLAIM_SECS: i64 = 120;
 const MAX_ATTEMPTS: i64 = 8;
 const BATCH: i64 = 25;
+pub(crate) const RESEND_WEBHOOK_PATH: &str = "/v1/webhooks/resend";
+
+pub(crate) fn allow_resend_webhook_ip(ip: std::net::IpAddr) -> bool {
+    tracking::allow_webhook_ip(ip)
+}
 
 mod delivery;
 #[cfg(test)]
 mod delivery_tests;
+mod diagnostics;
 mod email;
 mod policy;
+mod safety;
+#[cfg(test)]
+mod safety_tests;
+mod tracking;
 use policy::notice_current_tx;
 
 fn db_error(context: &'static str) -> impl FnOnce(crate::db::Error) -> AppError {
@@ -127,6 +137,12 @@ pub(crate) const KINDS: &[NotificationKind] = &[
         mandatory: true,
         subject_en: "Service suspended",
         subject_zh: "服务已暂停",
+    },
+    NotificationKind {
+        kind: "service_status_summary",
+        mandatory: true,
+        subject_en: "Service status summary",
+        subject_zh: "服务状态汇总",
     },
     NotificationKind {
         kind: "contract_resumed",
@@ -239,6 +255,7 @@ fn owner_signal(kind: &str) -> OwnerSignal {
         "c2c_dispute" => ("warning", "C2C balance trade needs evidence review"),
         "earning_hold_legacy" => ("warning", "Earnings hold needs review"),
         "earning_unlock_failed" => ("warning", "Provider earning lot failed to unlock"),
+        "service_notice_circuit" => ("warning", "Service notification safety policy activated"),
         _ => ("warning", "Marketplace finance notice"),
     };
     OwnerSignal { severity, title }
@@ -512,6 +529,8 @@ fn no_store() -> [(axum::http::header::HeaderName, &'static str); 1] {
 
 pub fn router() -> Router<ServerState> {
     Router::new()
+        .merge(tracking::router())
+        .merge(diagnostics::router())
         .route("/v1/market-notifications", get(list_feed))
         .route("/v1/market-notifications/:id/read", post(mark_read))
         .route(
@@ -539,7 +558,10 @@ fn claim_tx(conn: &Connection, worker: &str, now: &str) -> Result<Vec<Claimed>, 
                 "SELECT id FROM market_notification_outbox
                  WHERE (status = 'queued' AND next_attempt_at <= ?1)
                     OR (status = 'claimed' AND claim_expires_at <= ?1)
-                 ORDER BY next_attempt_at, id LIMIT ?2",
+                 ORDER BY CASE WHEN event_kind IN ('contract_suspended','contract_resumed',
+                    'contract_terminating_soon','contract_terminated','wallet_low_runway',
+                    'renewal_upcoming_shortfall','service_status_summary') THEN 1 ELSE 0 END,
+                    next_attempt_at, id LIMIT ?2",
             )
             .map_err(db_error("prepare notification claim"))?;
         statement
@@ -983,8 +1005,20 @@ pub async fn run_service(
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut reminders = tokio::time::interval(Duration::from_secs(3_600));
     reminders.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut digests = tokio::time::interval(Duration::from_secs(60));
+    digests.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
+            _ = digests.tick() => {
+                let conn = state.store.conn.lock().await;
+                let result = conn.transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(db_error("begin service digest queue"))
+                    .and_then(|tx| {
+                        safety::queue_digests_tx(&tx, &Utc::now().to_rfc3339(), &state.config.service_notice_limits)?;
+                        tx.commit().map_err(db_error("commit service digests"))
+                    });
+                if result.is_err() { tracing::warn!("service digest queue deferred"); }
+            }
             _ = reminders.tick() => {
                 let conn = state.store.conn.lock().await;
                 let result = conn
@@ -1030,6 +1064,13 @@ pub async fn run_service(
         }
     }
     Ok(())
+}
+
+pub async fn run_tracking_service(
+    state: ServerState,
+    shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    tracking::run_service(state, shutdown).await
 }
 
 #[cfg(test)]

@@ -3,8 +3,45 @@
 //! Hallmark · component: financial receipt · genre: modern-minimal
 //! theme: existing sign-in branding · hierarchy: outcome / amount / facts / link
 //! pre-emit critique: P5 H5 E4 S5 R5 V4
+use super::{AppError, Connection, OptionalExtension, db_error, params};
 use super::{Claimed, escape_html};
+use chrono::{DateTime, Utc};
 use serde_json::Value;
+use serde_json::json;
+
+pub(super) fn enrich_service_tx(conn: &Connection, item: &mut Claimed) -> Result<(), AppError> {
+    let Some(id) = item.payload.get("contractId").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let row: Option<(String,String,Option<String>)>=conn.query_row(
+        "SELECT c.product_kind,COALESCE(c.service_ref,c.product_ref),COALESCE(s.share_name,j.subdomain)
+         FROM market_platform_contracts c
+         LEFT JOIN share_market_subscriptions rental ON c.product_kind='share' AND rental.id=c.product_ref
+         LEFT JOIN shares s ON s.share_id=rental.share_id
+         LEFT JOIN provisioning_jobs j ON c.product_kind='client_host' AND j.id=c.product_ref
+         WHERE c.id=?1 AND c.buyer_user_id=?2",params![id,item.recipient_user_id],
+        |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(db_error("describe service notification"))?;
+    if let Some((kind, reference, name)) = row {
+        let name = name
+            .filter(|s| s.is_ascii() && !s.chars().any(char::is_control) && !s.trim().is_empty());
+        item.payload["serviceName"] = json!(name.unwrap_or_else(|| {
+            format!(
+                "{} {}",
+                if kind == "share" {
+                    "Share"
+                } else {
+                    "Client hosting"
+                },
+                reference
+                    .chars()
+                    .filter(|c| c.is_ascii() && !c.is_control())
+                    .take(100)
+                    .collect::<String>()
+            )
+        }));
+    }
+    Ok(())
+}
 
 fn field<'a>(payload: &'a Value, key: &str) -> Option<&'a str> {
     payload.get(key).and_then(Value::as_str).filter(|s| {
@@ -198,6 +235,10 @@ pub(super) fn render(item: &Claimed, dashboard: &str) -> (String, String, String
             "Service paused",
             "A service was paused. Review the current status and funding requirements in your account.",
         ),
+        "service_status_summary" => (
+            "Service status summary",
+            "Several service updates were combined to avoid repeated emails. The snapshot below is not a new charge. Sign in for the current status.",
+        ),
         "contract_resumed" => (
             "Service resumed",
             "Your service is active again. Review your account for the latest service status.",
@@ -225,6 +266,43 @@ pub(super) fn render(item: &Claimed, dashboard: &str) -> (String, String, String
         ),
     };
     let mut rows: Vec<(&str, String)> = Vec::new();
+    if let Some(name) = field(p, "serviceName") {
+        rows.push(("Service name", name.chars().take(160).collect()));
+    }
+    if item.event_kind == "contract_suspended" {
+        let reason = match field(p, "reason") {
+            Some("insufficient_funds") => "Insufficient available wallet balance",
+            Some("finance_hold") => "Service is on hold for financial review",
+            _ => "Service is paused; check your account for details",
+        };
+        rows.push(("Reason", reason.into()));
+    }
+    for (key, label) in [
+        ("suspensionStartedAt", "Pause started"),
+        ("statusAsOf", "Status as of"),
+    ] {
+        if let Some(at) = field(p, key).and_then(|s| DateTime::parse_from_rfc3339(s).ok()) {
+            rows.push((
+                label,
+                at.with_timezone(&Utc)
+                    .format("%Y-%m-%d %H:%M:%S UTC")
+                    .to_string(),
+            ));
+        }
+    }
+    if item.event_kind == "service_status_summary" {
+        for (key, label) in [
+            ("pausedCount", "Paused services"),
+            ("activeCount", "Active services"),
+        ] {
+            if let Some(n) = p.get(key).and_then(Value::as_i64) {
+                rows.push((label, n.to_string()));
+            }
+        }
+    }
+    if super::safety::is_service(super::delivery::purpose(item).unwrap_or("")) {
+        rows.push(("Notification reference", item.id.clone()));
+    }
     if let Some(n) = p.get("feeMinor").and_then(Value::as_i64) {
         rows.push(("Maintenance fee", minor(n, "USD")));
     }
@@ -299,7 +377,11 @@ pub(super) fn render(item: &Claimed, dashboard: &str) -> (String, String, String
     if let Some(time) = field(p, "notificationTime") {
         if let Ok(at) = chrono::DateTime::parse_from_rfc3339(time) {
             rows.push((
-                "Recorded",
+                if super::safety::is_service(super::delivery::purpose(item).unwrap_or("")) {
+                    "Event occurred"
+                } else {
+                    "Recorded"
+                },
                 at.with_timezone(&chrono::Utc)
                     .format("%Y-%m-%d %H:%M:%S UTC")
                     .to_string(),

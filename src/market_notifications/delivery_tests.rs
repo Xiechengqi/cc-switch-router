@@ -583,6 +583,7 @@ fn pause_delivery_identity_is_stable_and_reuses_the_historical_provider_key() {
     first.event_kind = "contract_suspended".into();
     first.payload = json!({
         "contractId":"service", "suspensionStartedAt":AT,
+        "notificationTime":AT,
         "notificationEventKey":format!("contract_suspended:service:{AT}")
     });
     let mut legacy = task(&conn);
@@ -640,15 +641,22 @@ fn obsolete_channel_cleanup_preserves_sent_receipts_and_live_or_uncertain_attemp
     for (purpose, finish) in [
         ("sent", true),
         ("queued", false),
+        ("unattempted", false),
         ("live", false),
         ("expired", false),
     ] {
+        if purpose == "unattempted" {
+            assert!(
+                matches!(prepare_tx(&conn,&notice,"email",purpose,envelope(),false,AT).unwrap(),Prepared::Done(s) if s=="blocked_config")
+            );
+            continue;
+        }
         let a =
             sending(prepare_tx(&conn, &notice, "email", purpose, envelope(), true, AT).unwrap());
         if finish {
             finish_attempt_tx(&conn, &a, &Ok("known-receipt".into()), AT).unwrap();
         } else if purpose == "queued" {
-            finish_attempt_tx(&conn, &a, &Err(failure("HTTP 429", true, None)), AT).unwrap();
+            finish_attempt_tx(&conn, &a, &Err(failure("response lost", true, None)), AT).unwrap();
         } else if purpose == "expired" {
             conn.execute(
                 "UPDATE market_notification_deliveries SET claim_expires_at=?2 WHERE id=?1",
@@ -670,7 +678,8 @@ fn obsolete_channel_cleanup_preserves_sent_receipts_and_live_or_uncertain_attemp
     );
     for (purpose, expected) in [
         ("sent", "sent"),
-        ("queued", "suppressed"),
+        ("queued", "uncertain"),
+        ("unattempted", "suppressed"),
         ("live", "claimed"),
         ("expired", "uncertain"),
     ] {

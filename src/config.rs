@@ -751,6 +751,48 @@ impl Default for ClientNotificationSettings {
     }
 }
 
+/// Independent service-notice budgets. Financial receipts and authentication
+/// never consume these slots. Zero disables external service notices only.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceNoticeLimits {
+    pub pause_cooldown_secs: i64,
+    pub pause_daily_limit: i64,
+    pub user_hourly_limit: i64,
+    pub email_daily_limit: i64,
+    pub max_age_secs: i64,
+}
+impl Default for ServiceNoticeLimits {
+    fn default() -> Self {
+        Self {
+            pause_cooldown_secs: 1800,
+            pause_daily_limit: 3,
+            user_hourly_limit: 10,
+            email_daily_limit: 50,
+            max_age_secs: 3600,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ResendWebhookSecret(zeroize::Zeroizing<String>);
+impl From<String> for ResendWebhookSecret {
+    fn from(value: String) -> Self {
+        Self(zeroize::Zeroizing::new(value))
+    }
+}
+impl std::ops::Deref for ResendWebhookSecret {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.0.as_str()
+    }
+}
+impl std::fmt::Debug for ResendWebhookSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub api_addr: SocketAddr,
@@ -778,6 +820,8 @@ pub struct Config {
     pub resend_from: Option<String>,
     pub resend_from_name: Option<String>,
     pub resend_reply_to: Option<String>,
+    pub resend_webhook_secret: Option<ResendWebhookSecret>,
+    pub service_notice_limits: ServiceNoticeLimits,
     pub client_notifications: ClientNotificationSettings,
     pub telegram_bot: TelegramBotSettings,
     pub bark: BarkSettings,
@@ -983,6 +1027,20 @@ impl Config {
                 .or_else(|| crate::startup_config::default_resend_from(&tunnel_domain)),
             resend_from_name: env_var("CC_SWITCH_ROUTER_RESEND_FROM_NAME"),
             resend_reply_to: env_var("CC_SWITCH_ROUTER_RESEND_REPLY_TO"),
+            resend_webhook_secret: env_var("CC_SWITCH_ROUTER_RESEND_WEBHOOK_SECRET")
+                .map(ResendWebhookSecret::from),
+            service_notice_limits: ServiceNoticeLimits {
+                pause_cooldown_secs: env_i64("CC_SWITCH_ROUTER_SERVICE_NOTICE_COOLDOWN_SECS", 1800)
+                    .clamp(60, 86400),
+                pause_daily_limit: env_i64("CC_SWITCH_ROUTER_SERVICE_NOTICE_PAUSE_DAILY_LIMIT", 3)
+                    .clamp(0, 100),
+                user_hourly_limit: env_i64("CC_SWITCH_ROUTER_SERVICE_NOTICE_USER_HOURLY_LIMIT", 10)
+                    .clamp(0, 1000),
+                email_daily_limit: env_i64("CC_SWITCH_ROUTER_SERVICE_NOTICE_EMAIL_DAILY_LIMIT", 50)
+                    .clamp(0, 100000),
+                max_age_secs: env_i64("CC_SWITCH_ROUTER_SERVICE_NOTICE_MAX_AGE_SECS", 3600)
+                    .clamp(60, 86400),
+            },
             client_notifications: ClientNotificationSettings {
                 enabled: env_bool("CC_SWITCH_ROUTER_CLIENT_EMAIL_NOTIFICATIONS_ENABLED", true),
                 offline_alert_secs: env_i64("CC_SWITCH_ROUTER_CLIENT_OFFLINE_ALERT_SECS", 180),
@@ -1535,6 +1593,13 @@ CC_SWITCH_ROUTER_RESEND_API_KEY=
 CC_SWITCH_ROUTER_RESEND_FROM=
 CC_SWITCH_ROUTER_RESEND_FROM_NAME=
 CC_SWITCH_ROUTER_RESEND_REPLY_TO=
+CC_SWITCH_ROUTER_RESEND_WEBHOOK_SECRET=
+# Marketplace service notices only; financial receipts/login are excluded.
+CC_SWITCH_ROUTER_SERVICE_NOTICE_COOLDOWN_SECS=1800
+CC_SWITCH_ROUTER_SERVICE_NOTICE_PAUSE_DAILY_LIMIT=3
+CC_SWITCH_ROUTER_SERVICE_NOTICE_USER_HOURLY_LIMIT=10
+CC_SWITCH_ROUTER_SERVICE_NOTICE_EMAIL_DAILY_LIMIT=50
+CC_SWITCH_ROUTER_SERVICE_NOTICE_MAX_AGE_SECS=3600
 # Client lifecycle email notifications default to enabled and go to each currently verified owner.
 CC_SWITCH_ROUTER_CLIENT_EMAIL_NOTIFICATIONS_ENABLED=true
 CC_SWITCH_ROUTER_CLIENT_OFFLINE_ALERT_SECS=180
@@ -1820,6 +1885,12 @@ fn existing_env_path() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resend_webhook_secret_debug_is_redacted() {
+        let secret = super::ResendWebhookSecret::from("whsec_PRIVATE_SIGNING_SECRET".to_string());
+        assert_eq!(&*secret, "whsec_PRIVATE_SIGNING_SECRET");
+        assert_eq!(format!("{secret:?}"), "[REDACTED]");
+    }
     use super::*;
 
     #[test]
@@ -1848,6 +1919,8 @@ mod tests {
             resend_from: None,
             resend_from_name: None,
             resend_reply_to: None,
+            resend_webhook_secret: None,
+            service_notice_limits: ServiceNoticeLimits::default(),
             client_notifications: ClientNotificationSettings::default(),
             telegram_bot: TelegramBotSettings::default(),
             bark: BarkSettings::default(),

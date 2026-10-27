@@ -9,6 +9,10 @@ pub(super) fn notice_current_tx(
 ) -> Result<bool, AppError> {
     let field = |key: &str| item.payload.get(key).and_then(Value::as_str);
     match item.event_kind.as_str() {
+        "service_status_summary" => conn.query_row("SELECT EXISTS(SELECT 1 FROM market_notification_service_digests
+            WHERE user_id=?1 AND queued_version=?2)",
+            params![item.recipient_user_id,item.payload.get("digestVersion").and_then(Value::as_i64)],|r|r.get(0))
+            .map_err(db_error("recheck service status digest")),
         "c2c_order_updated" | "c2c_seller_changed" => super::c2c_notice_current_tx(conn,item,time),
         "topup_credited" => conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM market_topup_orders t JOIN market_completed_topup_evidence e ON e.id=t.id WHERE t.id=?1 AND t.user_id=?2 AND t.status='credited')",
@@ -39,7 +43,8 @@ pub(super) fn notice_current_tx(
 
 /// Do not leave queued channel tasks behind when the business instruction has
 /// become obsolete. An in-flight sender still owns its live lease; an expired
-/// attempt with unknown acceptance must not be relabelled as never sent.
+/// attempt with unknown acceptance must not be relabelled as never sent. A
+/// queued retry can also be uncertain after losing the provider response.
 pub(super) fn suppress_obsolete_deliveries_tx(
     conn: &Connection,
     item: &Claimed,
@@ -47,7 +52,7 @@ pub(super) fn suppress_obsolete_deliveries_tx(
 ) -> Result<Option<DateTime<Utc>>, AppError> {
     conn.execute(
         "UPDATE market_notification_deliveries
-         SET status = CASE WHEN status='claimed' AND first_attempt_at IS NOT NULL
+         SET status = CASE WHEN first_attempt_at IS NOT NULL
                            THEN 'uncertain' ELSE 'suppressed' END,
              claim_token=NULL, claim_expires_at=NULL, last_error='superseded_business_state'
          WHERE event_id=?1 AND (status IN ('queued','blocked_config')

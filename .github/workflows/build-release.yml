@@ -67,6 +67,7 @@ jobs:
           npm run test:usd-micros
           npm run test:auth-password
           npm run test:market-wallet
+          npm run test:market-notifications
           npm run test:share-market
           npm run test:client-market
           npm run test:providers
@@ -103,6 +104,7 @@ jobs:
           bash ../scripts/ci/timed.sh 'C2C browser' npm run test:c2c-browser
           bash ../scripts/ci/timed.sh 'Navbar wallet browser' npm run test:navbar-wallet-browser
           bash ../scripts/ci/timed.sh 'Password authentication browser' npm run test:auth-password-browser
+          bash ../scripts/ci/timed.sh 'Marketplace email diagnostics browser' npm run test:market-notifications-browser
 
   rust-tests:
     runs-on: ubuntu-22.04

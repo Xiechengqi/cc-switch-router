@@ -693,6 +693,21 @@ async fn ip_blacklist_middleware(
     if !is_user_model_api && req.uri().path() == crate::telegram::service::WEBHOOK_PATH {
         return next.run(req).await;
     }
+    // Resend delivery callbacks authenticate their raw body with Svix. Do not
+    // let an unrelated user-IP ban silently break final delivery tracking.
+    if !is_user_model_api && req.uri().path() == crate::market_notifications::RESEND_WEBHOOK_PATH {
+        if !source_ip_from_request(&req)
+            .is_some_and(crate::market_notifications::allow_resend_webhook_ip)
+        {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::RETRY_AFTER, "60")],
+                "delivery webhook rate limited",
+            )
+                .into_response();
+        }
+        return next.run(req).await;
+    }
     let payment_webhook_path = req.uri().path() == "/v1/payment-webhooks/dujiaopay"
         || req
             .uri()
