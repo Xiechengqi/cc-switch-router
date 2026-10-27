@@ -24,10 +24,10 @@ try {
   const errors = []; const orders = []; const keys = []; const loginCodeRequests = []; let counter = 0; let quoteCounter = 0; let quoteLifetimeMs = 300000; let uncertain = false; let heartbeat = 0; let released = 0; let resolution = 0; let manualAcceptRequests = 0;
   let policy = { version: 1, enabled: true, admissionMinor: 10000, minMinor: 100, maxMinor: 500000, paymentMinutes: 30 };
   let profile = null; let sellerUnits = "1728000000"; let available = true; let pauseCount = 0; let financeFailure = false; let sellerReadFailure = false; let heldIncome = false;
-  let topupMode = "shadow"; let publicationReady = true; let retiredSetupRequests = 0; let offerWrites = 0;
+  let topupMode = "shadow"; let publicationReady = true; let retiredSetupRequests = 0; let offerWrites = 0; let expectedTrialHours = null;
   const publicationHost = { id: "publication-host", providerId: "seller", hostOwnerEmail: "seller@example.invalid", ip: "192.0.2.50", hostname: "Publication Host", port: 22,
     countryCode: "JP", status: "idle", isHostOwner: true, pricingModel: "prepaid_calendar_month", cyclePriceMinor: 1000, billingInterval: "calendar_month",
-    currency: "USD", offerRevision: 1, contacts: [], eligibility: { allowed: true }, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+    currency: "USD", trialHours: null, defaultTrialHours: 12, offerRevision: 1, contacts: [], eligibility: { allowed: true }, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
   const description = "Bank transfer · contact @seller · https://seller.example.invalid/pay · <b>plain text</b>";
   const seller = { sellerId: "seller", version: 1, displayName: "C2C-123456abcdef", description, currency: "USD", priceBps: 10000, minMinor: 100, maxMinor: 10000, availableMinor: 20000, completedOrders: 0 };
   const overview = Object.fromEntries(["walletPostedUnits", "walletHeldUnits", "unfulfilledUnits", "providerPendingUnits", "providerAvailableUnits", "providerHeldUnits", "buyerRefundHeldUnits", "ownerLossUnits", "maintenanceRevenueUnits"].map(k => [k, "0"]));
@@ -61,11 +61,13 @@ try {
       if (p === "/v1/market-wallet") return json(route, { assetCode: "USD", postedUnits: actor === "seller" ? "1728000000" : "0", heldUnits: "0", availableUnits: actor === "seller" ? "1728000000" : "0", version: 1, mode: topupMode, canTopup: false, hasWalletActivity: false });
       if (p === "/v1/market-wallet/transfer-capacity") return json(route, { transferableUnits: actor === "seller" ? sellerUnits : "0", committedUnits: "0", dailyRemainingUnits: "43200000000", enabled: true, verified: true, blockers: [] });
       if (p === "/v1/market-wallet/commission-policy") return json(route, { version: 1, current: { policyVersion: 1, rateBps: 1000, effectiveAt: "2026-01-01T00:00:00Z" }, scheduled: null, increaseNoticeDays: 7, canEdit: false });
+      if (p === "/v1/market-wallet/policy") return json(route, { version: 1, maintenanceFeeBps: 500, transfersEnabled: true, transfersPaused: false, transferMaxMinor: 500000, transferDailyMaxMinor: 500000, balanceRefundable: false });
+      if (p === "/v1/market-trials/policy") return json(route, { version: 1, clientHours: 12, shareHours: 12, shareTokens: 1_000_000 });
       if (["/v1/account/payment-profile", "/v1/market-billing/dashboard"].includes(p)) { retiredSetupRequests++; return json(route, { message: "retired setup" }, 410); }
       if (p === "/v1/client-market/hosts") return json(route, [publicationHost]);
       if (p === "/v1/client-market/my-rentals") return json(route, []);
       if (p === "/v1/client-market/hosts/publication-host/offer" && request.method() === "PATCH") {
-        assert.deepEqual(body, { cyclePriceMinor: 1000, currency: "USD" }); offerWrites++; publicationHost.offerRevision++;
+        assert.deepEqual(body, { cyclePriceMinor: 1000, currency: "USD", trialHours: expectedTrialHours }); offerWrites++; publicationHost.offerRevision++; publicationHost.trialHours = body.trialHours;
         return json(route, { ...publicationHost, hostId: publicationHost.id });
       }
       if (p.endsWith("/channels") || p === "/v1/admin/market-payment-channels") return json(route, []);
@@ -139,6 +141,7 @@ try {
       if (p === "/v1/admin/market-finance/readiness") return json(route, { mode: "shadow", version: 1, newOrdersPaused: false, newTopupsPaused: false, codeIntegrated: true, criticalCases: 0, staleTopupReviews: 0, verifiedLiveTopups: 1, paymentChannelBlockers: [], canEnable: false });
       if (p === "/v1/admin/market-finance/overview") return json(route, overview);
       if (p === "/v1/admin/market-finance/wallet-policy") return json(route, { version: 1, maintenanceFeeBps: 500, transfersEnabled: true, transfersPaused: false, transferMaxMinor: 500000, transferDailyMaxMinor: 500000, balanceRefundable: false, canEdit: true });
+      if (p === "/v1/admin/market/trial-policy") return json(route, { version: 1, clientHours: 12, shareHours: 12, shareTokens: 1_000_000, canEdit: true });
       if (p === "/v1/admin/market-finance/commission-policy") return json(route, { version: 1, current: { policyVersion: 1, rateBps: 1000, effectiveAt: "2026-01-01T00:00:00Z" }, scheduled: null, increaseNoticeDays: 7, canEdit: true });
       if (p === "/v1/admin/market-finance/c2c/policy") {
         if (request.method() === "PUT") { assert.equal(body.version, policy.version); policy = { ...body, version: policy.version + 1 }; return json(route, policy); }
@@ -474,13 +477,18 @@ try {
     return sell.page.getByRole("dialog", { name: "Edit Host offer", exact: true });
   };
   const waitOfferReady = () => sell.page.waitForFunction(() => [...document.querySelectorAll('[role="dialog"] button')].some(button => button.textContent.trim() === "Save" && !button.disabled));
-  for (const mode of ["disabled", "shadow", "enabled"]) {
+  for (const [mode, trialHours] of [["disabled", null], ["shadow", 0], ["enabled", 6]]) {
     topupMode = mode;
+    expectedTrialHours = trialHours;
     await sell.page.goto(`${base}/account/wallet/`);
     await sell.page.getByRole("button", { name: "Transfer", exact: true }).click();
     await sell.page.locator("#wallet-transfer form").waitFor();
     await sell.page.goto(`${base}/client-market/`);
     const offerDialog = await editOffer(); await waitOfferReady();
+    const trialInput = offerDialog.getByLabel("Trial hours (optional)", { exact: true });
+    assert.equal(await trialInput.inputValue(), publicationHost.trialHours == null ? "" : String(publicationHost.trialHours));
+    assert.equal(await trialInput.getAttribute("placeholder"), "Router default: 12 hours");
+    await trialInput.fill(trialHours == null ? "" : String(trialHours));
     await offerDialog.getByRole("button", { name: "Save", exact: true }).click();
     await offerDialog.waitFor({ state: "hidden" });
   }

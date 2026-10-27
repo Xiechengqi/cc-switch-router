@@ -33,15 +33,22 @@ pub(crate) struct WalletPolicy {
 pub(crate) fn policy_tx(conn: &Connection) -> Result<WalletPolicy, AppError> {
     conn.query_row(
         "SELECT version, maintenance_fee_bps, transfers_enabled, transfers_paused,
-                transfer_max_minor, transfer_daily_max_minor FROM market_wallet_policy WHERE id = 1",
-        [], |row| Ok(WalletPolicy {
-            version: row.get(0)?, maintenance_fee_bps: row.get(1)?,
-            transfers_enabled: row.get::<_, i64>(2)? == 1,
-            transfers_paused: row.get::<_, i64>(3)? == 1,
-            transfer_max_minor: row.get(4)?, transfer_daily_max_minor: row.get(5)?,
-            balance_refundable: false,
-        }),
-    ).map_err(db_error("read wallet policy"))
+                transfer_max_minor, transfer_daily_max_minor
+         FROM market_wallet_policy WHERE id = 1",
+        [],
+        |row| {
+            Ok(WalletPolicy {
+                version: row.get(0)?,
+                maintenance_fee_bps: row.get(1)?,
+                transfers_enabled: row.get::<_, i64>(2)? == 1,
+                transfers_paused: row.get::<_, i64>(3)? == 1,
+                transfer_max_minor: row.get(4)?,
+                transfer_daily_max_minor: row.get(5)?,
+                balance_refundable: false,
+            })
+        },
+    )
+    .map_err(db_error("read wallet policy"))
 }
 
 /// Nonnegative, round-half-up to a cent, using a wide intermediate.
@@ -129,7 +136,8 @@ async fn set_policy(
         .execute(
             "UPDATE market_wallet_policy SET version = version + 1, maintenance_fee_bps = ?2,
          transfers_enabled = ?3, transfers_paused = ?4, transfer_max_minor = ?5,
-         transfer_daily_max_minor = ?6, updated_at = ?7 WHERE id = 1 AND version = ?1",
+         transfer_daily_max_minor = ?6, updated_at = ?7
+         WHERE id = 1 AND version = ?1",
             params![
                 input.expected_version,
                 input.maintenance_fee_bps,

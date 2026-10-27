@@ -11,7 +11,8 @@ pub const MIN_SHARE_CONTRACT_VERSION: u16 = 2;
 /// v7 only add quota presentation metadata, so v5 market records remain valid
 /// during a rolling Server/Router deployment.
 pub const MIN_SHARE_MARKET_CONTRACT_VERSION: u16 = 5;
-pub const SHARE_CONTRACT_VERSION: u16 = 8;
+pub const SHARE_CONTRACT_VERSION: u16 = 9;
+pub const SHARE_TRIAL_CONTRACT_VERSION: u16 = 9;
 
 #[derive(Debug)]
 struct ParsedRawJson<T> {
@@ -1309,6 +1310,43 @@ pub struct ShareManagedGrantOperation {
     pub policy: Option<ShareUserPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_phase: Option<ShareMarketPhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_scope_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_token_allowance: Option<u64>,
+    /// A one-time trial cap, independent of the ordinary periodic quota.
+    /// None means time-only; zero is never a valid cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_token_limit: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ShareMarketPhase {
+    Trial,
+    Paid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShareMarketEntitlement {
+    pub trial_scope_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_token_allowance: Option<u64>,
+    pub email: String,
+    pub phase: ShareMarketPhase,
+    pub active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_token_limit: Option<u64>,
+    pub trial_tokens_used: u64,
+    pub usage_revision: u64,
+    #[serde(default)]
+    pub usage_uncertain: bool,
+    pub applied_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paid_started_at_ms: Option<i64>,
 }
 
 #[cfg(test)]
@@ -3259,6 +3297,8 @@ pub struct ShareDescriptor {
     pub descriptor_fingerprint: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub user_grants: BTreeMap<String, ShareUserGrant>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub market_entitlements: BTreeMap<String, ShareMarketEntitlement>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supported_user_token_periods: Vec<ShareTokenPeriod>,
 }

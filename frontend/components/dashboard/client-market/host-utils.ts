@@ -19,6 +19,13 @@ import { formatMarketPrice as formatUsdMoney, MARKET_CURRENCY } from "@/lib/mark
 
 export const CLIENT_MARKET_POLL_MS = 20_000;
 
+export function parseClientTrialHours(value: string): number | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (!/^\d+$/.test(trimmed) || Number(trimmed) > 720) throw new Error("invalid_client_trial_hours");
+  return Number(trimmed);
+}
+
 export const ROUTER_OPEN_LOGIN_EVENT = "router-open-login";
 export const ADD_HOST_SSH_KEY_OPEN_KEY = "cc-switch.client-market.add-host.ssh-key-open";
 export const ADD_HOST_MODE_KEY = "cc-switch.client-market.add-host.mode";
@@ -213,7 +220,7 @@ export function hostExportKey(host: { ip?: string | null; port?: number | null }
 
 /**
  * Transfer line format:
- * ip:port|note|priceMinor|USD|freeDurationDays|fingerprint|pricingModel
+ * ip:port|note|priceMinor|USD|freeDurationDays|fingerprint|pricingModel|trialHours
  *
  * The seventh field was added for calendar-month offers.  A missing field is
  * intentionally interpreted as `legacy_metered_daily`, so every transfer file
@@ -261,7 +268,8 @@ export function encodeHostTransferLine(entry: HostTransferLineEntry): string {
       : "legacy_metered_daily"
     : "";
   const status = entry.informationalStatus?.trim();
-  const line = `${endpoint}|${note}|${price}|${currency}|${freeDurationDays}|${fingerprint}|${pricingModel}`;
+  const trial = entry.trialHours == null ? "" : `|${entry.trialHours}`;
+  const line = `${endpoint}|${note}|${price}|${currency}|${freeDurationDays}|${fingerprint}|${pricingModel}${trial}`;
   return status ? `${line} # ${status}` : line;
 }
 
@@ -285,6 +293,7 @@ export function parseHostTransferLines(text: string): { document?: ClientMarketH
       freeDurationRaw = "",
       fingerprint = "",
       pricingModelRaw = "",
+      trialHoursRaw = "",
     ] = line
       .split("|")
       .map((part) => part.trim());
@@ -320,6 +329,8 @@ export function parseHostTransferLines(text: string): { document?: ClientMarketH
       }
     }
     if (priceMinor && freeDurationDays != null) return { errorLine: trimmed };
+    let trialHours: number | null;
+    try { trialHours = parseClientTrialHours(trialHoursRaw); } catch { return { errorLine: trimmed }; }
     hosts.push({
       ip: endpoint.ip,
       port: endpoint.port,
@@ -330,6 +341,7 @@ export function parseHostTransferLines(text: string): { document?: ClientMarketH
       billingInterval: pricingModel === "prepaid_calendar_month" ? "calendar_month" : undefined,
       currency: currency ? MARKET_CURRENCY : undefined,
       freeDurationDays,
+      ...(trialHours == null ? {} : { trialHours }),
       expectedFingerprint: fingerprint || undefined,
     });
   }

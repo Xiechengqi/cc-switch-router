@@ -700,6 +700,7 @@ mod tests {
                 price_minor: 500,
                 auto_renew: false,
                 trial_seconds: 0,
+                trial_allowance_seconds: 0,
             },
             time,
         )

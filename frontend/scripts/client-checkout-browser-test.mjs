@@ -26,7 +26,7 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
     });
     let trial = 43200,
       available = "0",
-      shortfall = "0",
+      shortfall = "86400000",
       quotes = 0,
       commits = [],
       commitMode = "success",
@@ -108,7 +108,7 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
                   availableUnits: available,
                   heldUnits: "0",
                   committedUnits: "0",
-                  requiredUnits: trial ? "0" : "86400000",
+                  requiredUnits: "86400000",
                   shortfallUnits: shortfall,
                 },
         };
@@ -187,6 +187,13 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
     if (captureScreenshots) await page.screenshot({ path: artifacts + "/initial.png", fullPage: true });
     assert.equal(await page.locator('img[alt="Binance Pay"]').count(), 0);
     await page.getByText("剩余试用 12 小时", { exact: true }).waitFor();
+    await page.getByRole("button", { name: "充值后继续", exact: true }).waitFor();
+    assert.equal(await page.getByRole("button", { name: "开始试用并创建", exact: true }).count(), 0);
+    assert.equal(commits.length, 0, "an unfunded trial cannot submit a rental");
+    available = "86400000";
+    shortfall = "0";
+    await page.goto(baseUrl + "/client-market/?focusHost=host-1");
+    await page.getByRole("heading", { name: "配置并确认" }).waitFor();
     await page
       .getByLabel("Web 登录密码", { exact: true })
       .fill("test-password-123");
@@ -220,6 +227,7 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
       .last()
       .click();
     trial = 0;
+    available = "0";
     shortfall = "86400000";
     await page.goto(baseUrl + "/client-market/?focusHost=host-1");
     await page.getByRole("heading", { name: "配置并确认" }).waitFor();

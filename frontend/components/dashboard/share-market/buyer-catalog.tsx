@@ -552,9 +552,10 @@ export function ShareMarketBuyerCatalog({
       t("market.day"),
     )
     : "";
-  const rentTrialTokens = rentOffer?.trialTokenLimit != null && rentOffer.trialTokenLimit > 0
+  const rentTrialBudget = rentOffer?.trial?.tokenBudget ?? rentOffer?.trialTokenLimit ?? 0;
+  const rentTrialTokens = rentTrialBudget > 0
     ? t("shareMarket.rentConfirm.trialTokenCompact", {
-      tokens: formatTokenMillions(rentOffer.trialTokenLimit, locale),
+      tokens: formatTokenMillions(rentTrialBudget, locale),
     })
     : "";
   const rentTrialSummary = !rentOffer || rentIsFree || rentTarget.quote.trialSecondsRemaining <= 0
@@ -833,6 +834,7 @@ export function ShareMarketBuyerCatalog({
                         <p className="truncate text-xs text-slate-500" title={rentTermsSummary}>{rentTermsSummary}</p>
                       </section>
 
+                      {rentTarget.quote.trialSecondsRemaining > 0 ? <p className="rounded-lg bg-emerald-50 px-3 py-3 text-xs leading-6 text-emerald-900">{t("marketTrial.checkout", { hours: (rentTarget.quote.trialSecondsRemaining / 3600).toFixed(1), tokens: rentTrialBudget > 0 ? formatTokenMillions(rentTrialBudget, locale) : t("marketTrial.timeOnly") })}</p> : null}
                       {rentCheckout.unsupported ? <p role="alert" className="rounded-md bg-rose-50 p-3 text-sm text-rose-800">{t("clientCheckout.unsupported")}</p> : null}
                       {rentWalletFunding ? (
                         <section className="grid gap-2 rounded-lg bg-muted/50 px-3 py-3 text-sm" aria-live="polite">

@@ -8,8 +8,8 @@ import type { ShareMarketRentQuote } from "./types";
 const quote = {
   offer: { dailyRateMinor: 100, currency: "USD" },
   walletFunding: {
-    assetCode: "USD", availableUnits: "200", heldUnits: "10",
-    committedUnits: "100", requiredUnits: "100", shortfallUnits: "0",
+    assetCode: "USD", availableUnits: "8640100", heldUnits: "10",
+    committedUnits: "100", requiredUnits: "8640000", shortfallUnits: "0",
   },
 } as ShareMarketRentQuote;
 
@@ -18,7 +18,13 @@ test("paid Share uses platform balance, accounting for existing commitments", ()
   const funding = { ...quote.walletFunding!, committedUnits: "101", shortfallUnits: "1" };
   assert.deepEqual(shareCheckoutState({ ...quote, walletFunding: funding }),
     { paid: true, shortfall: true, unsupported: false });
-  assert.equal(validWalletQuoteFunding({ ...funding, availableUnits: "999", shortfallUnits: "0" }), true);
+  assert.equal(validWalletQuoteFunding({ ...funding, availableUnits: "9999999", shortfallUnits: "0" }), true);
+});
+
+test("Share trials cannot bypass the first-period balance requirement", () => {
+  const trial = { ...quote, trialSecondsRemaining: 43200 };
+  assert.deepEqual(shareCheckoutState({ ...trial, walletFunding: { ...quote.walletFunding!, availableUnits: "0", committedUnits: "0", shortfallUnits: "8640000" } }), { paid: true, shortfall: true, unsupported: false });
+  assert.equal(shareCheckoutState({ ...trial, walletFunding: { ...quote.walletFunding!, committedUnits: "0", requiredUnits: "0" } }).unsupported, true);
 });
 
 test("invalid paid funding fails closed, never enables a Provider payment fallback", () => {

@@ -207,7 +207,8 @@ pub(crate) fn wallet_quote_funding_tx(
         return Err(AppError::BadRequest("invalid wallet quote amount".into()));
     }
     let snapshot = wallet_snapshot_tx(conn, user_id)?;
-    let required_units = if trial_seconds_remaining > 0 || price_minor == 0 {
+    // A trial defers the debit, not the first-period affordability requirement.
+    let required_units = if price_minor == 0 {
         0
     } else {
         units_from_minor(price_minor)?
@@ -230,6 +231,23 @@ pub(crate) fn wallet_quote_funding_tx(
             .saturating_sub(snapshot.available_units)
             .max(0),
     })
+}
+
+pub(crate) fn require_order_funding_tx(
+    conn: &Connection,
+    user_id: &str,
+    price_minor: i64,
+    now: &str,
+) -> Result<(), AppError> {
+    let funding = wallet_quote_funding_tx(conn, user_id, price_minor, 0, now)?;
+    if funding.shortfall_units > 0 {
+        return Err(AppError::coded_conflict(
+            "MARKET_WALLET_REQUIRED",
+            "insufficient platform balance for the first billing period; top up before renting",
+            serde_json::to_value(funding).map_err(|error| AppError::Internal(error.to_string()))?,
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn wallet_snapshot_tx(
@@ -1036,7 +1054,7 @@ mod tests {
             wallet_quote_funding_tx(&conn, "buyer", 1000, 1, &time)
                 .unwrap()
                 .shortfall_units,
-            0
+            units_from_minor(800).unwrap()
         );
         reconcile_wallet_tx(&conn, "buyer").unwrap();
     }

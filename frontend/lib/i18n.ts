@@ -342,8 +342,8 @@ export const messages = {
     "shareMarket.rentConfirm.fundingChanged":
       "Funding changed. This is the latest quote; review it before confirming again.",
 
-    "shareMarket.rentConfirm.postpaid": "Free healthy-service time: {hours} hours{tokens}. After the trial, healthy-service usage is deducted from your platform balance at the daily rate; insufficient balance pauses service.",
-    "shareMarket.rentConfirm.prepaidMonthly": "Free healthy-service time: {hours} hours{tokens}. After the trial, each calendar month is paid from your platform balance. Without a remaining trial, the first month is reserved before activation. Automatic renewal charges at the next boundary; stopping it keeps access until the paid month ends.",
+    "shareMarket.rentConfirm.postpaid": "Free healthy-service time: {hours} hours{tokens}. Renting requires enough balance for the first billing period. After the trial, healthy-service usage is deducted at the daily rate. If trial-to-paid payment fails, the seat is immediately released after access is revoked.",
+    "shareMarket.rentConfirm.prepaidMonthly": "Free healthy-service time: {hours} hours{tokens}. Renting requires the first month's balance, but the trial is not charged. If payment fails at trial end, the seat is immediately released after access is revoked. Without a remaining trial, the first month is reserved before activation. Automatic renewal charges at the next boundary; stopping it keeps access until the paid month ends.",
     "shareMarket.rentConfirm.trialTokens":
       ", with a free trial token quota of {tokens}",
     "shareMarket.rentConfirm.freeBilling":
@@ -1361,13 +1361,13 @@ export const messages = {
     "clientMarket.exportedHosts": "Exported {count} Hosts",
     "clientMarket.importSizeLimit": "Host import text must not exceed 1 MB.",
     "clientMarket.importVersionRequired":
-      "Each line must be ip:port with optional |note|priceMinor|currency|freeDurationDays|fingerprint|pricingModel.",
+      "Each line must be ip:port with optional |note|priceMinor|currency|freeDurationDays|fingerprint|pricingModel|trialHours.",
     "clientMarket.importMyHosts": "Import my Hosts",
     "clientMarket.exportMyHosts": "Export my Hosts",
     "clientMarket.importDialogTitle": "Import Hosts",
     "clientMarket.exportDialogTitle": "Export Hosts",
     "clientMarket.transferFormatHint":
-      "One host per line: ip:port|note|priceMinor|currency|freeDurationDays|fingerprint|pricingModel. New paid rows use prepaid_calendar_month; files without pricingModel retain legacy daily semantics. Free duration is 1-365 days or blank for permanent access.",
+      "One host per line: ip:port|note|priceMinor|currency|freeDurationDays|fingerprint|pricingModel|trialHours. New paid rows use prepaid_calendar_month; files without pricingModel retain legacy daily semantics. Free duration is 1-365 days or blank for permanent access. Trial hours: blank inherits the Router default; 0 disables the trial (0–720).",
     "clientMarket.importPlaceholder":
       "203.0.113.9:22\n203.0.113.10:22|trial host|||7",
     "clientMarket.importSubmit": "Import",
@@ -1501,8 +1501,8 @@ export const messages = {
     "clientCheckout.reservedNow": "Reserve now",
     "clientCheckout.captureHint": "Reserved on confirmation; charged after successful activation.",
     "clientCheckout.trial": "{hours} hours of trial remaining",
-    "clientCheckout.trialHint": "Only available service time counts. No payment is required now.",
-    "clientCheckout.trialCharge": "After the trial, {price} is paid from your platform balance.",
+    "clientCheckout.trialHint": "Only available service time counts. Enough balance for the first billing period is required; no payment is taken during the trial.",
+    "clientCheckout.trialCharge": "After the trial, {price} is paid from your platform balance. If payment fails, the Client and its data are permanently removed and the Host is returned to the market after cleanup.",
     "clientCheckout.trialAction": "Start trial and create",
     "clientCheckout.paidAction": "Rent and create",
     "clientCheckout.autoRenew": "Renew subsequent months from platform balance",
@@ -1666,7 +1666,7 @@ export const messages = {
     "marketWallet.shortcutUnavailable": "Balance unavailable",
     "marketWallet.viewWallet": "View wallet",
     "marketWallet.returnToMarket": "Return to Market",
-    "marketWallet.requiredNow": "Due now",
+    "marketWallet.requiredNow": "First-period balance required",
     "marketWallet.existingCommitments": "Existing service due",
     "marketWallet.shortfall": "Add {amount} to continue",
     "marketWallet.autoRenewAtDue": "The next month is charged only when due.",
@@ -3841,8 +3841,8 @@ export const messages = {
     "shareMarket.rentConfirm.fundingChanged":
       "资金状态已变化，以下是最新报价，请重新核对后确认。",
 
-    "shareMarket.rentConfirm.postpaid": "健康服务免费试用 {hours} 小时{tokens}；试用结束后按日费从平台余额扣除健康服务用量，余额不足时暂停服务。",
-    "shareMarket.rentConfirm.prepaidMonthly": "健康服务免费试用 {hours} 小时{tokens}；试用结束后从平台余额支付日历月费用，无剩余试用时会在开通前冻结首期费用。自动续费在到期时扣款；停止续费后仍可使用至已付周期结束。",
+    "shareMarket.rentConfirm.postpaid": "健康服务免费试用 {hours} 小时{tokens}；租用前须具备首期所需余额。试用结束后按日费扣除健康服务用量；试用转付费失败时立即撤销授权，确认撤销后释放拼车位。",
+    "shareMarket.rentConfirm.prepaidMonthly": "健康服务免费试用 {hours} 小时{tokens}；租用前须具备首月所需余额，试用期间不扣款。试用结束支付失败时立即撤销授权，确认撤销后释放拼车位。无剩余试用时会在开通前冻结首期费用；自动续费在到期时扣款，停止续费后可使用至已付周期结束。",
     "shareMarket.rentConfirm.trialTokens":
       "，试用 Token 额度为 {tokens}",
     "shareMarket.rentConfirm.freeBilling": "该拼车位免费，不会产生费用。",
@@ -4837,13 +4837,13 @@ export const messages = {
     "clientMarket.exportedHosts": "已导出 {count} 台 Host",
     "clientMarket.importSizeLimit": "Host 导入文本不能超过 1 MB。",
     "clientMarket.importVersionRequired":
-      "每行格式为 ip:port，可选 |备注|价格（最小货币单位）|币种|免费期限天数|指纹|计价模式。",
+      "每行格式为 ip:port，可选 |备注|价格（最小货币单位）|币种|免费期限天数|指纹|计价模式|试用小时数。",
     "clientMarket.importMyHosts": "导入我的 Host",
     "clientMarket.exportMyHosts": "导出我的 Host",
     "clientMarket.importDialogTitle": "导入 Host",
     "clientMarket.exportDialogTitle": "导出 Host",
     "clientMarket.transferFormatHint":
-      "每行一台：ip:port|备注|价格（最小货币单位）|币种|免费期限天数|指纹|计价模式。新付费行使用 prepaid_calendar_month；没有计价模式的旧文件继续按日计费。免费期限为 1-365 天，留空表示永久。",
+      "每行一台：ip:port|备注|价格（最小货币单位）|币种|免费期限天数|指纹|计价模式|试用小时数。新付费行使用 prepaid_calendar_month；没有计价模式的旧文件继续按日计费。免费期限为 1-365 天，留空表示永久。试用小时数留空继承 Router 默认值，0 表示不试用（0–720）。",
     "clientMarket.importPlaceholder":
       "203.0.113.9:22\n203.0.113.10:22|体验主机|||7",
     "clientMarket.importSubmit": "导入",
@@ -4969,8 +4969,8 @@ export const messages = {
     "clientCheckout.reservedNow": "本次预留",
     "clientCheckout.captureHint": "确认后预留，开通成功后扣款。",
     "clientCheckout.trial": "剩余试用 {hours} 小时",
-    "clientCheckout.trialHint": "按实际可用服务时长计算，本次无需付款。",
-    "clientCheckout.trialCharge": "试用结束后，从平台余额支付 {price}。",
+    "clientCheckout.trialHint": "按实际可用服务时长计算；租用前须具备首期所需余额，试用期间不扣款。",
+    "clientCheckout.trialCharge": "试用结束后，从平台余额支付 {price}；支付失败将立即回收 Client 并永久清理其数据，清理成功后 Host 重新上架。",
     "clientCheckout.trialAction": "开始试用并创建",
     "clientCheckout.paidAction": "确认租用并创建",
     "clientCheckout.autoRenew": "后续按月从平台余额自动续费",
@@ -5128,7 +5128,7 @@ export const messages = {
     "marketWallet.shortcutUnavailable": "余额暂不可用",
     "marketWallet.viewWallet": "查看钱包",
     "marketWallet.returnToMarket": "返回市场",
-    "marketWallet.requiredNow": "本次需付",
+    "marketWallet.requiredNow": "首期所需余额",
     "marketWallet.existingCommitments": "已有服务待付",
     "marketWallet.shortfall": "还需充值 {amount}",
     "marketWallet.autoRenewAtDue": "下期到期时才扣款。",

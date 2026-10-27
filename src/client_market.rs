@@ -890,6 +890,8 @@ struct RouterSshHostView {
     currency: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     free_duration_days: Option<u32>,
+    trial_hours: Option<i64>,
+    default_trial_hours: i64,
     offer_revision: i64,
     #[serde(default)]
     contacts: Vec<crate::client_market_trade::ProviderContact>,
@@ -1160,6 +1162,8 @@ async fn list_hosts(
                         .map(|_| "USD".into())
                 }),
                 free_duration_days: host.free_duration_days,
+                trial_hours: host.trial_hours,
+                default_trial_hours: host.default_trial_hours,
                 offer_revision: host.offer_revision,
                 contacts: host.contacts,
                 seller_approval_required,
@@ -1225,6 +1229,8 @@ struct CreateHostRequest {
     currency: Option<String>,
     #[serde(default)]
     free_duration_days: Option<u32>,
+    #[serde(default)]
+    trial_hours: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1246,6 +1252,8 @@ struct HostTransferEntry {
     currency: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     free_duration_days: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trial_hours: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expected_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1269,6 +1277,7 @@ struct NormalizedHostTransferPricing {
     billing_interval: Option<String>,
     currency: Option<String>,
     free_duration_days: Option<u32>,
+    trial_hours: Option<i64>,
 }
 
 fn normalize_host_transfer_pricing(
@@ -1321,6 +1330,7 @@ fn normalize_host_transfer_pricing(
         billing_interval: expected_billing_interval,
         currency,
         free_duration_days,
+        trial_hours: crate::market_common::validate_client_trial_hours(entry.trial_hours)?,
     })
 }
 
@@ -1522,6 +1532,7 @@ async fn create_host(
         cycle_price_minor,
         input.free_duration_days,
     )?;
+    let trial_hours = crate::market_common::validate_client_trial_hours(input.trial_hours)?;
     if cycle_price_minor.is_some() {
         let conn = state.store.conn.lock().await;
         crate::client_market_trade::require_paid_offer_setup(
@@ -1587,6 +1598,7 @@ async fn create_host(
             cycle_price_minor.map(|_| crate::market_common::BILLING_INTERVAL_CALENDAR_MONTH),
             currency.as_deref(),
             free_duration_days,
+            trial_hours,
         )
         .await?;
     Ok(Json(host_to_view(host, true)))
@@ -1614,6 +1626,7 @@ async fn export_hosts(
             billing_interval: host.billing_interval,
             currency: host.currency,
             free_duration_days: host.free_duration_days,
+            trial_hours: host.trial_hours,
             expected_fingerprint: host.ssh_host_key_fingerprint,
             informational_status: Some(host.status),
         })
@@ -1840,6 +1853,7 @@ async fn import_one_host(
                 pricing.billing_interval.as_deref(),
                 pricing.currency.as_deref(),
                 pricing.free_duration_days,
+                pricing.trial_hours,
             )
             .await?;
         Ok(Some(host.id))
@@ -5676,6 +5690,8 @@ fn host_to_view(host: RouterSshHostRecord, reveal: bool) -> RouterSshHostView {
         billing_interval: host.billing_interval,
         currency: host.currency,
         free_duration_days: host.free_duration_days,
+        trial_hours: host.trial_hours,
+        default_trial_hours: host.default_trial_hours,
         offer_revision: host.offer_revision,
         contacts: host.contacts,
         seller_approval_required: false,
@@ -5742,6 +5758,8 @@ pub struct RouterSshHostRecord {
     pub billing_interval: Option<String>,
     pub currency: Option<String>,
     pub free_duration_days: Option<u32>,
+    pub trial_hours: Option<i64>,
+    pub default_trial_hours: i64,
     pub offer_revision: i64,
     pub contacts: Vec<crate::client_market_trade::ProviderContact>,
     pub country_code: Option<String>,
@@ -6211,7 +6229,8 @@ impl AppStore {
                     NULLIF(TRIM(h.currency), ''), h.free_duration_days,
                     t.enabled, ns.last_heartbeat_at, h.pricing_model,
                     h.cycle_price_minor, h.billing_interval,
-                    provider.market_provider_id
+                    provider.market_provider_id, h.trial_hours,
+                    (SELECT client_hours FROM market_trial_policy WHERE id = 1)
              FROM router_ssh_hosts h
              LEFT JOIN installation_client_tunnels t ON t.installation_id = h.installation_id
              LEFT JOIN installations i ON i.id = h.installation_id
@@ -6356,6 +6375,7 @@ impl AppStore {
             None,
             currency,
             free_duration_days,
+            None,
         )
         .await
     }
@@ -6378,7 +6398,9 @@ impl AppStore {
         billing_interval: Option<&str>,
         currency: Option<&str>,
         free_duration_days: Option<u32>,
+        trial_hours: Option<i64>,
     ) -> Result<RouterSshHostRecord, AppError> {
+        let trial_hours = crate::market_common::validate_client_trial_hours(trial_hours)?;
         let owner = normalize_market_email(owner_email)?;
         let daily_rate_minor = crate::client_market_trade::validate_offer(daily_rate_minor)?;
         let cycle_price_minor =
@@ -6432,9 +6454,9 @@ impl AppStore {
                 id, provider_id, ip, port, host_owner_email, country_code, hostname, ssh_host_key_fingerprint,
                 status, installation_id, last_verified_at, last_error, note, ip_intel_json,
                 daily_rate_minor, currency, free_duration_days, offer_revision, created_at, updated_at,
-                pricing_model, cycle_price_minor, billing_interval
+                pricing_model, cycle_price_minor, billing_interval, trial_hours
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, NULL, ?11, ?12,
-                       ?13, ?14, ?15, 1, ?10, ?10, ?16, ?17, ?18)",
+                       ?13, ?14, ?15, 1, ?10, ?10, ?16, ?17, ?18, ?19)",
             params![
                 id,
                 provider_id,
@@ -6454,6 +6476,7 @@ impl AppStore {
                 pricing_model,
                 cycle_price_minor,
                 billing_interval,
+                trial_hours,
             ],
         )
         .map_err(|e| {
@@ -7474,7 +7497,8 @@ impl AppStore {
                         NULLIF(TRIM(h.currency), ''), h.free_duration_days,
                         t.enabled, ns.last_heartbeat_at, h.pricing_model,
                         h.cycle_price_minor, h.billing_interval,
-                        provider.market_provider_id
+                        provider.market_provider_id, h.trial_hours,
+                        (SELECT client_hours FROM market_trial_policy WHERE id = 1)
                  FROM router_ssh_hosts h
                  LEFT JOIN installation_client_tunnels t ON t.installation_id = h.installation_id
                  LEFT JOIN installations i ON i.id = h.installation_id
@@ -9148,7 +9172,8 @@ fn get_router_ssh_host(
                 NULLIF(TRIM(h.currency), ''), h.free_duration_days,
                 t.enabled, ns.last_heartbeat_at, h.pricing_model,
                 h.cycle_price_minor, h.billing_interval,
-                provider.market_provider_id
+                provider.market_provider_id, h.trial_hours,
+                (SELECT client_hours FROM market_trial_policy WHERE id = 1)
          FROM router_ssh_hosts h
          LEFT JOIN installation_client_tunnels t ON t.installation_id = h.installation_id
          LEFT JOIN installations i ON i.id = h.installation_id
@@ -9219,6 +9244,8 @@ fn map_router_ssh_host_row(row: &crate::db::Row<'_>) -> crate::db::Result<Router
         contacts,
         currency,
         free_duration_days,
+        trial_hours: row.get(30)?,
+        default_trial_hours: row.get(31)?,
     })
 }
 
@@ -10159,6 +10186,7 @@ mod tests {
                 billing_interval: None,
                 currency: None,
                 free_duration_days: Some(1),
+                trial_hours: None,
                 expected_fingerprint: Some("SHA256:first".into()),
                 informational_status: Some("idle".into()),
             },
@@ -10172,6 +10200,7 @@ mod tests {
                 billing_interval: None,
                 currency: Some("USD".into()),
                 free_duration_days: None,
+                trial_hours: Some(6),
                 expected_fingerprint: Some("SHA256:second".into()),
                 informational_status: Some("allocated".into()),
             },
@@ -10309,6 +10338,7 @@ mod tests {
                 billing_interval: None,
                 currency: Some("USD".into()),
                 free_duration_days: None,
+                trial_hours: None,
             }
         );
 
@@ -10327,6 +10357,7 @@ mod tests {
                 ),
                 currency: Some("USD".into()),
                 free_duration_days: None,
+                trial_hours: Some(0),
                 expected_fingerprint: Some("SHA256:monthly".into()),
                 informational_status: Some("idle".into()),
             }],
@@ -10347,6 +10378,7 @@ mod tests {
                 ),
                 currency: Some("USD".into()),
                 free_duration_days: None,
+                trial_hours: Some(0),
             }
         );
 
@@ -11275,6 +11307,7 @@ mod tests {
                     price_minor: price,
                     auto_renew: false,
                     trial_seconds: 0,
+                    trial_allowance_seconds: 0,
                 };
                 let id = contracts::prepare_contract_tx(&tx, &input, start).unwrap();
                 contracts::bind_client_installation_tx(
@@ -11587,6 +11620,8 @@ mod tests {
             billing_interval: None,
             currency: Some("USD".into()),
             free_duration_days: None,
+            trial_hours: None,
+            default_trial_hours: 12,
             offer_revision: 1,
             contacts: vec![],
             country_code: Some("US".into()),
@@ -11892,6 +11927,18 @@ mod tests {
             )
             .await
             .expect("create fixed Host quote");
+        {
+            let conn = store.conn.lock().await;
+            crate::market_wallet::credit_verified_topup_tx(
+                &conn,
+                &client.user_id,
+                "quoted-host-funding",
+                900,
+                "quoted-host-receipt",
+                &Utc::now().to_rfc3339(),
+            )
+            .unwrap();
+        }
         let prepared = vec![(
             fixed.items[0].id.clone(),
             "quoted-client".into(),
@@ -11948,6 +11995,195 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn host_trial_overrides_are_owned_versioned_and_zero_disables_the_trial() {
+        use crate::client_market_trade::CreateQuoteRequest;
+        let (store, _config, root) = test_store("client-trial-overrides");
+        let host = add_provider_host(
+            &store,
+            "provider-trial",
+            "provider-trial@example.com",
+            "198.18.21.19",
+            "US",
+            None,
+        )
+        .await;
+        let provider = market_session("provider-trial", "provider-trial@example.com");
+        let buyer = market_session("buyer-trial", "buyer-trial@example.com");
+        assert!(matches!(
+            store
+                .client_market_update_host_monthly_offer(
+                    &host.id,
+                    &buyer,
+                    Some(1000),
+                    Some("USD".into()),
+                    None,
+                    Some(0)
+                )
+                .await,
+            Err(AppError::Forbidden(_))
+        ));
+        for invalid in [-1, 721] {
+            assert!(matches!(
+                store
+                    .client_market_update_host_monthly_offer(
+                        &host.id,
+                        &provider,
+                        Some(1000),
+                        Some("USD".into()),
+                        None,
+                        Some(invalid)
+                    )
+                    .await,
+                Err(AppError::BadRequest(_))
+            ));
+        }
+        let mut revision = 1;
+        for (override_hours, expected_hours) in [(None, 12), (Some(6), 6), (None, 12), (Some(0), 0)]
+        {
+            let offer = store
+                .client_market_update_host_monthly_offer(
+                    &host.id,
+                    &provider,
+                    Some(1000),
+                    Some("USD".into()),
+                    None,
+                    override_hours,
+                )
+                .await
+                .unwrap();
+            assert_eq!(offer.trial_hours, override_hours);
+            assert!(offer.offer_revision > revision);
+            revision = offer.offer_revision;
+            let unchanged = store
+                .client_market_update_host_monthly_offer(
+                    &host.id,
+                    &provider,
+                    Some(1000),
+                    Some("USD".into()),
+                    None,
+                    override_hours,
+                )
+                .await
+                .unwrap();
+            assert_eq!(unchanged.offer_revision, revision);
+            let current = store
+                .client_market_get_host(&host.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(current.trial_hours, override_hours);
+            assert_eq!(current.default_trial_hours, 12);
+            let quote = store
+                .client_market_create_quote(
+                    &buyer,
+                    CreateQuoteRequest {
+                        provider_ids: vec![],
+                        country_codes: vec![],
+                        count: 1,
+                        host_id: Some(host.id.clone()),
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                quote.items[0].trial_seconds_remaining,
+                expected_hours * 3600
+            );
+            assert!(matches!(
+                store
+                    .client_market_update_host_monthly_offer(
+                        &host.id,
+                        &provider,
+                        Some(1000),
+                        Some("USD".into()),
+                        None,
+                        Some(1)
+                    )
+                    .await,
+                Err(AppError::Conflict(_))
+            ));
+            store
+                .client_market_cancel_quote(&quote.id, &buyer)
+                .await
+                .unwrap();
+        }
+        let quote = store
+            .client_market_create_quote(
+                &buyer,
+                CreateQuoteRequest {
+                    provider_ids: vec![],
+                    country_codes: vec![],
+                    count: 1,
+                    host_id: Some(host.id.clone()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(quote.items[0].trial_seconds_remaining, 0);
+        {
+            let conn = store.conn.lock().await;
+            crate::market_wallet::credit_verified_topup_tx(
+                &conn,
+                &buyer.user_id,
+                "initial",
+                1000,
+                "receipt",
+                &Utc::now().to_rfc3339(),
+            )
+            .unwrap();
+        }
+        let committed = store
+            .client_market_commit_quote(
+                &quote.id,
+                &buyer,
+                &[(
+                    quote.items[0].id.clone(),
+                    "zero-trial-client".into(),
+                    "password".into(),
+                    revision,
+                )],
+            )
+            .await
+            .unwrap();
+        {
+            let conn = store.conn.lock().await;
+            assert_eq!(
+                crate::market_wallet::wallet_snapshot_tx(&conn, &buyer.user_id)
+                    .unwrap()
+                    .held_units,
+                1000 * 86_400
+            );
+            let tx = conn.transaction().unwrap();
+            crate::client_market_trade::complete_provisioning_tx(
+                &tx,
+                &committed.job_ids[0],
+                &host.id,
+                "zero-trial-installation",
+                "https://zero-trial-client.router.test",
+                Utc::now(),
+            )
+            .unwrap();
+            assert_eq!(
+                tx.query_row(
+                    "SELECT status FROM market_platform_contracts WHERE product_ref=?1",
+                    params![committed.job_ids[0]],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+                "active"
+            );
+            let payload: String = tx.query_row("SELECT detail_json FROM client_market_audit_events WHERE installation_id='zero-trial-installation' AND event_type='client_provisioned'", [], |r|r.get(0)).unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(payload["trialSeconds"], 0);
+            assert_eq!(payload["trialHours"], 0.0);
+            crate::market_wallet::reconcile_wallet_tx(&tx, &buyer.user_id).unwrap();
+            tx.commit().unwrap();
+        }
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn wallet_client_quote_exposes_trial_without_holding_buyer_funds() {
         use crate::client_market_trade::CreateQuoteRequest;
         let (store, _config, root) = test_store("wallet-client-quote-trial");
@@ -11984,15 +12220,15 @@ mod tests {
             crate::market_common::TRIAL_SECONDS
         );
         let funding = quote.wallet_funding.as_ref().unwrap();
-        assert_eq!(funding.required_units, 0);
+        assert_eq!(funding.required_units, 1000 * 86_400);
         assert_eq!(funding.held_units, 0);
-        assert_eq!(funding.shortfall_units, 0);
+        assert_eq!(funding.shortfall_units, 1000 * 86_400);
         let json = serde_json::to_value(&quote).unwrap();
         assert_eq!(
             json["items"][0]["trialSecondsRemaining"],
             crate::market_common::TRIAL_SECONDS
         );
-        assert_eq!(json["walletFunding"]["requiredUnits"], "0");
+        assert_eq!(json["walletFunding"]["requiredUnits"], "86400000");
         store
             .client_market_cancel_quote(&quote.id, &buyer)
             .await
@@ -12018,21 +12254,90 @@ mod tests {
             )
             .await
             .unwrap();
-        let committed = store
-            .client_market_commit_quote(
-                &quote.id,
-                &buyer,
-                &[(
-                    quote.items[0].id.clone(),
-                    "trial-wallet-client".into(),
-                    "trial-password".into(),
-                    quote.items[0].offer_revision,
-                )],
+        let prepared = vec![(
+            quote.items[0].id.clone(),
+            "trial-wallet-client".into(),
+            "trial-password".into(),
+            quote.items[0].offer_revision,
+        )];
+        // A default change after quoting cannot rewrite this accepted trial.
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE market_trial_policy SET client_hours=0 WHERE id=1",
+                [],
             )
+            .unwrap();
+        let error = store
+            .client_market_commit_quote(&quote.id, &buyer, &prepared)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Some("MARKET_WALLET_REQUIRED"));
+        {
+            let conn = store.conn.lock().await;
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM provisioning_jobs", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM market_platform_contracts", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap(),
+                0
+            );
+            crate::market_wallet::credit_verified_topup_tx(
+                &conn,
+                &buyer.user_id,
+                "initial",
+                1000,
+                "initial-receipt",
+                &Utc::now().to_rfc3339(),
+            )
+            .unwrap();
+        }
+        let hold = {
+            let conn = store.conn.lock().await;
+            crate::market_wallet::reserve_wallet_tx(
+                &conn,
+                &buyer.user_id,
+                "test",
+                "another-order",
+                "budget",
+                86_400,
+                None,
+                &Utc::now().to_rfc3339(),
+            )
+            .unwrap()
+        };
+        let changed_balance = store
+            .client_market_commit_quote(&quote.id, &buyer, &prepared)
+            .await
+            .unwrap_err();
+        assert_eq!(changed_balance.code(), Some("MARKET_WALLET_REQUIRED"));
+        {
+            let conn = store.conn.lock().await;
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM provisioning_jobs", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            crate::market_wallet::release_hold_tx(&conn, &hold, &Utc::now().to_rfc3339()).unwrap();
+        }
+        let committed = store
+            .client_market_commit_quote(&quote.id, &buyer, &prepared)
             .await
             .unwrap();
         {
             let conn = store.conn.lock().await;
+            let wallet = crate::market_wallet::wallet_snapshot_tx(&conn, &buyer.user_id).unwrap();
+            assert_eq!(wallet.available_units, 1000 * 86_400);
+            assert_eq!(wallet.held_units, 0);
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .unwrap();
@@ -12072,6 +12377,130 @@ mod tests {
             .await
             .unwrap();
         assert!(provider_view.wallet_contract.is_none());
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_client_batch_requires_the_combined_first_period_balance_atomically() {
+        use crate::client_market_trade::CreateQuoteRequest;
+        let (store, _config, root) = test_store("client-trial-batch-funding");
+        for ip in ["198.18.21.31", "198.18.21.32"] {
+            add_provider_host(
+                &store,
+                "provider-batch",
+                "provider-batch@example.com",
+                ip,
+                "US",
+                None,
+            )
+            .await;
+        }
+        let buyer = market_session("buyer-batch", "buyer-batch@example.com");
+        let quote = store
+            .client_market_create_quote(
+                &buyer,
+                CreateQuoteRequest {
+                    provider_ids: vec!["provider-batch".into()],
+                    country_codes: vec!["US".into()],
+                    count: 2,
+                    host_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        // Exercise the internal multi-paid-item commit even though today's
+        // random buyer catalog only selects free Hosts.
+        {
+            let conn = store.conn.lock().await;
+            conn.execute("UPDATE client_market_allocation_quote_items SET pricing_model='prepaid_calendar_month', cycle_price_minor=1000, billing_interval='calendar_month', currency='USD', wallet_trial_seconds=43200 WHERE quote_id=?1", params![quote.id]).unwrap();
+            conn.execute("UPDATE router_ssh_hosts SET pricing_model='prepaid_calendar_month', cycle_price_minor=1000, billing_interval='calendar_month', currency='USD', funding_rail='platform_wallet'", []).unwrap();
+            crate::market_wallet::credit_verified_topup_tx(
+                &conn,
+                &buyer.user_id,
+                "partial",
+                1000,
+                "partial-receipt",
+                &Utc::now().to_rfc3339(),
+            )
+            .unwrap();
+        }
+        let prepared = quote
+            .items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                (
+                    item.id.clone(),
+                    format!("batch-trial-{index}"),
+                    "password".into(),
+                    item.offer_revision,
+                )
+            })
+            .collect::<Vec<_>>();
+        let error = store
+            .client_market_commit_quote(&quote.id, &buyer, &prepared)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Some("MARKET_WALLET_REQUIRED"));
+        {
+            let conn = store.conn.lock().await;
+            for table in [
+                "provisioning_jobs",
+                "client_market_batches",
+                "market_platform_contracts",
+            ] {
+                assert_eq!(
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                );
+            }
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM router_ssh_hosts WHERE status='reserved'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                2
+            );
+            crate::market_wallet::credit_verified_topup_tx(
+                &conn,
+                &buyer.user_id,
+                "rest",
+                1000,
+                "rest-receipt",
+                &Utc::now().to_rfc3339(),
+            )
+            .unwrap();
+        }
+        let committed = store
+            .client_market_commit_quote(&quote.id, &buyer, &prepared)
+            .await
+            .unwrap();
+        assert_eq!(committed.job_ids.len(), 2);
+        assert_eq!(
+            store
+                .conn
+                .lock()
+                .await
+                .query_row("SELECT COUNT(*) FROM market_platform_contracts", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap(),
+            2
+        );
+        {
+            let conn = store.conn.lock().await;
+            assert_eq!(
+                crate::market_wallet::wallet_snapshot_tx(&conn, &buyer.user_id)
+                    .unwrap()
+                    .held_units,
+                0
+            );
+        }
         drop(store);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -12163,6 +12592,7 @@ mod tests {
                     price_minor: 500,
                     auto_renew: false,
                     trial_seconds: 0,
+                    trial_allowance_seconds: 0,
                 },
                 &now,
             )
@@ -12317,6 +12747,7 @@ mod tests {
                     price_minor: 500,
                     auto_renew: false,
                     trial_seconds: 0,
+                    trial_allowance_seconds: 0,
                 },
                 &now,
             )
@@ -12528,6 +12959,15 @@ mod tests {
             .expect("create quote before Provider access changes");
         {
             let conn = store.conn.lock().await;
+            crate::market_wallet::credit_verified_topup_tx(
+                &conn,
+                &client.user_id,
+                "access-test-funding",
+                500,
+                "access-test-receipt",
+                &Utc::now().to_rfc3339(),
+            )
+            .unwrap();
             crate::market_access::set_product_access_decision_tx(
                 &conn,
                 "provider-blocked-quote",

@@ -317,6 +317,11 @@ const MIGRATIONS: &[(i64, &str)] = &[
         91,
         include_str!("../schema/0091_market_notification_safety.sql"),
     ),
+    (
+        92,
+        include_str!("../schema/0092_market_client_trial_policy.sql"),
+    ),
+    (93, include_str!("../schema/0093_market_share_trials.sql")),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -826,13 +831,186 @@ fn migration_checksum(sql: &str) -> String {
 mod tests {
     use super::*;
 
-    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 244;
+    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 248;
 
     mod notification_safety;
     mod suspension;
 
     fn memory_connection() -> Connection {
         Connection::open_in_memory().expect("open test database")
+    }
+
+    #[test]
+    fn migration_93_separates_trial_defaults_from_fees_without_rewriting_explicit_seat_terms() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 92);
+        conn.execute("UPDATE market_wallet_policy SET default_client_trial_hours=24,maintenance_fee_bps=725 WHERE id=1",[]).unwrap();
+        let wallet_version: i64 = conn
+            .query_row(
+                "SELECT version FROM market_wallet_policy WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        apply(&conn).unwrap();
+        let defaults = crate::market_trial_policy::policy_tx(&conn).unwrap();
+        assert_eq!(
+            (
+                defaults.version,
+                defaults.client_hours,
+                defaults.share_hours,
+                defaults.share_tokens
+            ),
+            (1, 24, 12, 1_000_000)
+        );
+        let fees = crate::market_wallet_policy::policy_tx(&conn).unwrap();
+        assert_eq!(
+            (fees.version, fees.maintenance_fee_bps),
+            (wallet_version, 725)
+        );
+        assert!(
+            conn.query_row(
+                "SELECT default_client_trial_hours FROM market_wallet_policy",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .is_err()
+        );
+        for (hours, tokens) in [(0, 0), (720, crate::market_trial_policy::MAX_TOKENS)] {
+            conn.execute(
+                "UPDATE market_trial_policy SET share_hours=?1,share_tokens=?2 WHERE id=1",
+                params![hours, tokens],
+            )
+            .unwrap();
+        }
+        for (hours, tokens) in [
+            (-1, 0),
+            (721, 0),
+            (12, crate::market_trial_policy::MAX_TOKENS + 1),
+        ] {
+            assert!(
+                conn.execute(
+                    "UPDATE market_trial_policy SET share_hours=?1,share_tokens=?2 WHERE id=1",
+                    params![hours, tokens]
+                )
+                .is_err()
+            );
+        }
+        apply(&conn).unwrap();
+        assert_eq!(
+            crate::market_trial_policy::policy_tx(&conn)
+                .unwrap()
+                .share_hours,
+            720
+        );
+    }
+
+    #[test]
+    fn migration_92_adds_inherited_client_trials_and_preserves_frozen_quotes_and_money() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 91);
+        let at = "2026-10-27T00:00:00Z";
+        conn.execute(
+            "INSERT INTO router_ssh_hosts(id,ip,port,host_owner_email,status,created_at,updated_at)
+            VALUES('trial-host','192.0.2.1',22,'provider@example.test','idle',?1,?1)",
+            params![at],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO client_market_allocation_quote_items(id,quote_id,position,host_id,provider_id,host_owner_email,offer_revision,wallet_trial_seconds)
+            VALUES('trial-item','trial-quote',0,'trial-host','provider','provider@example.test',1,1234)", []).unwrap();
+        crate::market_wallet::credit_verified_topup_tx(
+            &conn,
+            "trial-buyer",
+            "topup",
+            1000,
+            "receipt",
+            at,
+        )
+        .unwrap();
+        let before = crate::market_wallet::wallet_snapshot_tx(&conn, "trial-buyer").unwrap();
+        let journals: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM market_journal_transactions",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        apply(&conn).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT client_hours FROM market_trial_policy WHERE id=1",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            12
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT trial_hours FROM router_ssh_hosts WHERE id='trial-host'",
+                [],
+                |r| r.get::<_, Option<i64>>(0)
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(conn.query_row("SELECT wallet_trial_seconds,wallet_trial_allowance_seconds FROM client_market_allocation_quote_items WHERE id='trial-item'", [], |r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?))).unwrap(), (1234,43200));
+        conn.execute(
+            "UPDATE router_ssh_hosts SET trial_hours=0 WHERE id='trial-host'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE market_trial_policy SET client_hours=0 WHERE id=1",
+            [],
+        )
+        .unwrap();
+        apply(&conn).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT trial_hours FROM router_ssh_hosts WHERE id='trial-host'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            crate::market_trial_policy::policy_tx(&conn)
+                .unwrap()
+                .client_hours,
+            0
+        );
+        for invalid in [-1, 721] {
+            assert!(
+                conn.execute(
+                    "UPDATE market_trial_policy SET client_hours=?1 WHERE id=1",
+                    params![invalid]
+                )
+                .is_err()
+            );
+            assert!(
+                conn.execute(
+                    "UPDATE router_ssh_hosts SET trial_hours=?1 WHERE id='trial-host'",
+                    params![invalid]
+                )
+                .is_err()
+            );
+        }
+        let after = crate::market_wallet::wallet_snapshot_tx(&conn, "trial-buyer").unwrap();
+        assert_eq!(
+            (before.posted_units, before.held_units, before.version),
+            (after.posted_units, after.held_units, after.version)
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM market_journal_transactions",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            journals
+        );
     }
 
     #[test]

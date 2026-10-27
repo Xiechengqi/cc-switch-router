@@ -12,3 +12,9 @@ export function validWalletQuoteFunding(funding?: MarketWalletQuoteFunding): boo
   const due = required + committed;
   return shortfall === (due > available ? due - available : 0n);
 }
+
+/** A trial does not waive first-period affordability. Reject old zero-price projections. */
+export function validPaidWalletQuoteFunding(funding: MarketWalletQuoteFunding | undefined, priceMinor: number): boolean {
+  return Number.isSafeInteger(priceMinor) && priceMinor > 0 && validWalletQuoteFunding(funding)
+    && BigInt(funding!.requiredUnits) === BigInt(priceMinor) * 86_400n;
+}

@@ -18,6 +18,7 @@ import { DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH } from "@/lib/dashboard-nav";
 import { MARKET_CURRENCY } from "@/lib/market-money";
 import type { HostIpIntel, ProvisionSshKey } from "@/lib/types";
 import { usePersistentState } from "@/lib/use-persistent-state";
+import { ClientTrialInput } from "./client-trial-input";
 import {
   ADD_HOST_MODE_KEY,
   ADD_HOST_SSH_KEY_OPEN_KEY,
@@ -30,6 +31,7 @@ import {
   formatHostIpIntelSecondary,
   formatHostIpLocation,
   parseFreeDurationDays,
+  parseClientTrialHours,
   parseHostOffer,
 } from "@/components/dashboard/client-market/host-utils";
 
@@ -53,6 +55,7 @@ export function AddHostDialog({
   const [note, setNote] = React.useState("");
   const [pricing, setPricing] = React.useState<"free" | "paid">("free");
   const [priceUsd, setPriceUsd] = React.useState("");
+  const [trialHours, setTrialHours] = React.useState("");
   const [freeDurationMode, setFreeDurationMode] = React.useState<"fixed" | "permanent">("fixed");
   const [freeDurationDays, setFreeDurationDays] = React.useState("1");
   const [busy, setBusy] = React.useState(false);
@@ -152,10 +155,11 @@ export function AddHostDialog({
       cyclePriceMinor?: number;
       currency?: string;
       freeDurationDays?: number;
+      trialHours?: number | null;
     };
     try {
       offer = pricing === "paid"
-        ? parseHostOffer(priceUsd, t)
+        ? { ...parseHostOffer(priceUsd, t), trialHours: parseClientTrialHours(trialHours) }
         : {
             freeDurationDays:
               freeDurationMode === "fixed"
@@ -163,7 +167,8 @@ export function AddHostDialog({
                 : undefined,
           };
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(reason instanceof Error && reason.message === "invalid_client_trial_hours"
+        ? t("clientMarket.trialInvalid") : reason instanceof Error ? reason.message : String(reason));
       return;
     }
     if (pricing === "paid" && (!offer.cyclePriceMinor || !paidOfferReady)) {
@@ -482,6 +487,7 @@ export function AddHostDialog({
                   </div>
                 )}
                 {pricing === "paid" ? <ProviderCommissionPreview price={priceUsd} /> : null}
+                {pricing === "paid" ? <ClientTrialInput value={trialHours} onChange={setTrialHours} disabled={busy || testing} /> : null}
                 <p className="text-xs text-muted-foreground">{pricing === "paid" ? t("clientMarket.offerHint") : t("clientMarket.freeDuration.hint")}</p>
                 {pricing === "paid" && paidOfferLoading ? (
                   <div role="status" className="flex items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">

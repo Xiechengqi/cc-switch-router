@@ -4,10 +4,22 @@ import {
   encodeHostTransferDocument,
   hostMatchesMarketProvider,
   parseHostTransferLines,
+  parseClientTrialHours,
   persistedClientMarketProviderSelection,
   recommendedClientMarketProviderId,
 } from "./host-utils";
 import type { ClientMarketProvider } from "@/lib/types";
+
+test("Client trial overrides preserve explicit zero and distinguish inherited defaults", () => {
+  for (const input of ["", "  "]) assert.equal(parseClientTrialHours(input), null);
+  for (const value of [0, 1, 12, 720]) assert.equal(parseClientTrialHours(String(value)), value);
+  for (const input of ["-1", "721", "1.5", "1e2", "Infinity", "NaN"]) assert.throws(() => parseClientTrialHours(input));
+  for (const trialHours of [undefined, 0, 6, 720]) {
+    const text = encodeHostTransferDocument({ version: 2, hosts: [{ ip: "203.0.113.10", port: 22, cyclePriceMinor: 1000, trialHours }] });
+    assert.equal(parseHostTransferLines(text).document?.hosts[0].trialHours, trialHours);
+  }
+  assert.ok(parseHostTransferLines("203.0.113.10:22||1000||||prepaid_calendar_month|721").errorLine);
+});
 
 function provider(providerId: string, freeIdle: number): ClientMarketProvider {
   return {

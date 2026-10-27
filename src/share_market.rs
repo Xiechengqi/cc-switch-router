@@ -28,7 +28,7 @@ use crate::store::{AppStore, ShareRouteTarget, fetch_share_runtime_snapshot_from
 
 const DEFAULT_TRIAL_HOURS: i64 = crate::market_common::DEFAULT_TRIAL_HOURS;
 const DEFAULT_TRIAL_TOKEN_LIMIT: u64 = 1_000_000;
-const MAX_TRIAL_HOURS: i64 = 100_000;
+const MAX_TRIAL_HOURS: i64 = crate::market_trial_policy::MAX_HOURS;
 const SERVICE_CYCLE_SECS: u64 = 5;
 const MAX_SEATS_PER_LISTING: usize = 20;
 const MAX_SERVICE_DURATION_DAYS: u32 = 365;
@@ -338,6 +338,8 @@ pub struct SeatView {
     pub trial_hours: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trial_token_limit: Option<u64>,
+    pub trial_hours_override: Option<i64>,
+    pub trial_token_limit_override: Option<u64>,
     pub offer_revision: i64,
     pub is_free: bool,
     pub can_rent: bool,
@@ -400,6 +402,8 @@ pub struct SubscriptionView {
     pub trial_hours: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trial_token_limit: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trial: Option<crate::market_share_trials::TrialView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activated_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -678,6 +682,8 @@ pub struct RentQuoteSnapshot {
     pub trial_hours: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trial_token_limit: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial: Option<crate::market_share_trials::TrialQuote>,
     pub offer_revision: i64,
     #[serde(default = "default_legacy_funding_rail")]
     pub funding_rail: String,
@@ -918,14 +924,14 @@ fn normalize_seat(input: SeatInput) -> Result<NormalizedSeat, AppError> {
     if currency != crate::market_common::MARKET_CURRENCY {
         return Err(AppError::BadRequest("currency must be USD".into()));
     }
-    let trial_hours = input.trial_hours.unwrap_or(DEFAULT_TRIAL_HOURS);
-    if !(0..=MAX_TRIAL_HOURS).contains(&trial_hours) {
+    let trial_hours = input.trial_hours;
+    if trial_hours.is_some_and(|hours| !(0..=MAX_TRIAL_HOURS).contains(&hours)) {
         return Err(AppError::BadRequest(format!(
             "trialHours must be an integer between 0 and {MAX_TRIAL_HOURS}"
         )));
     }
-    let trial_token_limit = input.trial_token_limit.unwrap_or(DEFAULT_TRIAL_TOKEN_LIMIT);
-    if trial_token_limit > i64::MAX as u64 {
+    let trial_token_limit = input.trial_token_limit;
+    if trial_token_limit.is_some_and(|tokens| tokens > crate::market_trial_policy::MAX_TOKENS) {
         return Err(AppError::BadRequest(
             "trial token limit is too large".into(),
         ));
@@ -949,8 +955,8 @@ fn normalize_seat(input: SeatInput) -> Result<NormalizedSeat, AppError> {
         } else {
             input.service_duration_days
         },
-        trial_hours: Some(trial_hours),
-        trial_token_limit: Some(trial_token_limit),
+        trial_hours,
+        trial_token_limit,
     })
 }
 
@@ -1790,8 +1796,9 @@ fn contract_policy(record: &SubscriptionRecord) -> Result<ShareUserPolicy, AppEr
     let token_period: ShareTokenPeriod = serde_json::from_str(&record.token_period_json)
         .map_err(|_| AppError::Internal("stored seat token period is invalid".into()))?;
     let service_started_at = record
-        .service_started_at
+        .paid_quota_started_at
         .as_deref()
+        .or(record.service_started_at.as_deref())
         .or(record.activated_at.as_deref())
         .map(parse_time)
         .transpose()?;
@@ -1817,6 +1824,7 @@ fn grant_token_limit(record: &SubscriptionRecord) -> Option<u64> {
     if should_apply_trial_tokens(record) {
         return record
             .trial_token_limit
+            .filter(|value| *value > 0)
             .and_then(|value| u64::try_from(value).ok())
             .or_else(|| {
                 record
@@ -1829,8 +1837,53 @@ fn grant_token_limit(record: &SubscriptionRecord) -> Option<u64> {
         .and_then(|value| u64::try_from(value).ok())
 }
 
+pub(crate) fn enqueue_trial_paid_activation_tx(
+    conn: &Connection,
+    subscription: &str,
+    now: &str,
+) -> Result<(), AppError> {
+    let record = subscription_record(conn, subscription)?
+        .ok_or_else(|| AppError::NotFound("Share trial subscription missing".into()))?;
+    let mut policy = contract_policy(&record)?;
+    // The Server materializes the formal quota anchor when it applies this
+    // phase, not when the trial originally started or the operation was queued.
+    policy.token_period_anchor_at_ms = None;
+    enqueue_control_operation_tx(
+        conn,
+        &record.share_id,
+        &record.id,
+        &record.entitlement_id,
+        "upsert",
+        &record.renter_email,
+        Some(&policy),
+        now,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn validate_trial_paid_activation_tx(
+    conn: &Connection,
+    contract: &str,
+    at: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let (subscription, json): (String, String) = conn.query_row("SELECT c.product_ref,s.user_grants_json FROM market_platform_contracts c JOIN share_market_subscriptions sub ON sub.id=c.product_ref JOIN shares s ON s.share_id=sub.share_id WHERE c.id=?1 AND c.product_kind='share'",params![contract],|r|Ok((r.get(0)?,r.get(1)?))).map_err(map_db("read paid phase grant"))?;
+    let mut record = subscription_record(conn, &subscription)?
+        .ok_or_else(|| AppError::NotFound("Share subscription missing".into()))?;
+    record.paid_quota_started_at = Some(at.to_rfc3339());
+    let grant = active_entitlement_grant(Some(&json), &record.entitlement_id)
+        .ok_or_else(|| AppError::Conflict("paid phase grant not yet observed".into()))?;
+    let expected = contract_policy(&record)?;
+    if grant.policy != expected {
+        return Err(AppError::Conflict(
+            "paid phase grant differs from frozen terms".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn should_apply_trial_tokens(record: &SubscriptionRecord) -> bool {
-    if (record.daily_rate_minor.is_none() && record.cycle_price_minor.is_none())
+    if record.one_time_trial
+        || (record.daily_rate_minor.is_none() && record.cycle_price_minor.is_none())
         || record.trial_hours.unwrap_or(0) <= 0
     {
         return false;
@@ -3585,6 +3638,8 @@ struct SubscriptionRecord {
     trial_hours: Option<i64>,
     trial_token_limit: Option<i64>,
     contract_trial_seconds_remaining: Option<i64>,
+    one_time_trial: bool,
+    paid_quota_started_at: Option<String>,
     offer_revision: i64,
     release_reason: Option<String>,
     failure_code: Option<String>,
@@ -3720,7 +3775,9 @@ fn subscription_record(
                      WHERE contract.product_kind = 'share' AND contract.product_ref = sub.id
                        AND contract.status NOT IN ('ended', 'activation_failed')
                      LIMIT 1),
-                sub.pricing_model, sub.cycle_price_minor, sub.billing_interval
+                sub.pricing_model, sub.cycle_price_minor, sub.billing_interval,
+                EXISTS(SELECT 1 FROM market_share_trial_contracts t JOIN market_platform_contracts c ON c.id=t.contract_id WHERE c.product_ref=sub.id AND c.product_kind='share'),
+                (SELECT t.paid_applied_at FROM market_share_trial_contracts t JOIN market_platform_contracts c ON c.id=t.contract_id WHERE c.product_ref=sub.id AND c.product_kind='share')
          FROM share_market_subscriptions sub
          LEFT JOIN shares s ON s.share_id = sub.share_id
          WHERE sub.id = ?1",
@@ -3775,6 +3832,8 @@ fn subscription_record(
                 pricing_model: row.get(42)?,
                 cycle_price_minor: row.get(43)?,
                 billing_interval: row.get(44)?,
+                one_time_trial: row.get(45)?,
+                paid_quota_started_at: row.get(46)?,
             })
         },
     )
@@ -3920,7 +3979,9 @@ fn catalog_subscription_records(
                      WHERE contract.product_kind = 'share' AND contract.product_ref = sub.id
                        AND contract.status NOT IN ('ended', 'activation_failed')
                      LIMIT 1),
-                sub.pricing_model, sub.cycle_price_minor, sub.billing_interval
+                sub.pricing_model, sub.cycle_price_minor, sub.billing_interval,
+                EXISTS(SELECT 1 FROM market_share_trial_contracts t JOIN market_platform_contracts c ON c.id=t.contract_id WHERE c.product_ref=sub.id AND c.product_kind='share'),
+                (SELECT t.paid_applied_at FROM market_share_trial_contracts t JOIN market_platform_contracts c ON c.id=t.contract_id WHERE c.product_ref=sub.id AND c.product_kind='share')
          FROM share_market_subscriptions sub
          LEFT JOIN shares share ON share.share_id = sub.share_id
          WHERE {filter}"
@@ -3981,6 +4042,8 @@ fn catalog_subscription_records(
                         pricing_model: row.get(42)?,
                         cycle_price_minor: row.get(43)?,
                         billing_interval: row.get(44)?,
+                        one_time_trial: row.get(45)?,
+                        paid_quota_started_at: row.get(46)?,
                     };
                     Ok((record.id.clone(), record))
                 })?
@@ -4723,7 +4786,7 @@ fn subscription_view(
         false
     };
     Ok(SubscriptionView {
-        id: record.id,
+        id: record.id.clone(),
         seat_id: record.seat_id,
         listing_id: record.listing_id,
         share_id: record.share_id,
@@ -4761,6 +4824,7 @@ fn subscription_view(
         trial_token_limit: record
             .trial_token_limit
             .and_then(|value| u64::try_from(value).ok()),
+        trial: crate::market_share_trials::view_tx(conn, &record.id)?,
         activated_at: record.activated_at,
         service_started_at: record.service_started_at,
         expires_at: record.expires_at,
@@ -5372,7 +5436,11 @@ impl AppStore {
                         .service_duration_days
                         .and_then(|value| u32::try_from(value).ok()),
                     trial_hours: if offer_price_minor.is_some() {
-                        Some(seat.trial_hours.unwrap_or(DEFAULT_TRIAL_HOURS))
+                        Some(
+                            seat.trial_hours.unwrap_or(
+                                crate::market_trial_policy::policy_tx(&conn)?.share_hours,
+                            ),
+                        )
                     } else {
                         None
                     },
@@ -5380,12 +5448,18 @@ impl AppStore {
                         Some(
                             seat.trial_token_limit
                                 .and_then(|value| u64::try_from(value).ok())
-                                .unwrap_or(DEFAULT_TRIAL_TOKEN_LIMIT),
+                                .unwrap_or(
+                                    crate::market_trial_policy::policy_tx(&conn)?.share_tokens,
+                                ),
                         )
                     } else {
                         None
                     },
                     offer_revision: seat.offer_revision,
+                    trial_hours_override: seat.trial_hours,
+                    trial_token_limit_override: seat
+                        .trial_token_limit
+                        .and_then(|value| u64::try_from(value).ok()),
                     is_free: offer_price_minor.is_none(),
                     can_rent,
                     rent_prerequisites_met: base_rent_prerequisites,
@@ -5499,7 +5573,7 @@ impl AppStore {
         Ok(ShareMarketCatalog {
             listings,
             my_subscriptions,
-            trial_hours: DEFAULT_TRIAL_HOURS,
+            trial_hours: crate::market_trial_policy::policy_tx(&conn)?.share_hours,
             recommendation_mode: "off".into(),
         })
     }
@@ -7834,8 +7908,9 @@ impl AppStore {
             crate::market_access::PRODUCT_SHARE,
             crate::market_access::pricing_kind_for_rate(offer_price_minor),
         )?;
+        let trial_policy = crate::market_trial_policy::policy_tx(&tx)?;
         let quoted_trial_hours = if offer_price_minor.is_some() {
-            Some(trial_hours.unwrap_or(DEFAULT_TRIAL_HOURS))
+            Some(trial_hours.unwrap_or(trial_policy.share_hours))
         } else {
             None
         };
@@ -7843,7 +7918,7 @@ impl AppStore {
             Some(
                 trial_token_limit
                     .and_then(|value| u64::try_from(value).ok())
-                    .unwrap_or(DEFAULT_TRIAL_TOKEN_LIMIT),
+                    .unwrap_or(trial_policy.share_tokens),
             )
         } else {
             None
@@ -7858,6 +7933,7 @@ impl AppStore {
                 .map_err(map_db("read Share offer funding rail"))?;
             crate::market_payments::require_current_offer_rail(&current_rail, "Share")?;
         }
+        let mut trial_quote = None;
         let (trial_seconds_remaining, wallet_funding) = if let Some(price_minor) = offer_price_minor
         {
             if currency.as_deref() != Some("USD") {
@@ -7865,14 +7941,25 @@ impl AppStore {
                     "wallet-funded Share seats must be priced in USD".into(),
                 ));
             }
-            let trial = crate::market_platform_contracts::trial_seconds_remaining_tx(
+            let (trial, token_budget) = crate::market_share_trials::remaining_tx(
                 &tx,
                 &session.user_id,
                 &owner_user_id,
-                "share",
                 &share_id,
                 trial_seconds_from_hours(quoted_trial_hours.unwrap_or(0))?,
+                quoted_trial_token_limit.unwrap_or(0),
             )?;
+            if trial > 0 {
+                crate::market_share_trials::require_capability_tx(&tx, &share_id)?;
+            }
+            trial_quote = Some(crate::market_share_trials::TrialQuote {
+                version: 1,
+                policy_version: trial_policy.version,
+                hours_inherited: trial_hours.is_none(),
+                tokens_inherited: trial_token_limit.is_none(),
+                token_allowance: quoted_trial_token_limit.unwrap_or(0),
+                token_budget,
+            });
             let funding = crate::market_wallet::wallet_quote_funding_tx(
                 &tx,
                 &session.user_id,
@@ -7954,6 +8041,7 @@ impl AppStore {
                 .and_then(|value| u32::try_from(value).ok()),
             trial_hours: quoted_trial_hours,
             trial_token_limit: quoted_trial_token_limit,
+            trial: trial_quote,
             offer_revision,
             funding_rail: "platform_wallet".into(),
             service: service.clone(),
@@ -8832,8 +8920,13 @@ impl AppStore {
         };
         let token_period: ShareTokenPeriod = serde_json::from_str(&token_period_json)
             .map_err(|_| AppError::Internal("stored seat token period is invalid".into()))?;
+        let trial_policy = crate::market_trial_policy::policy_tx(tx)?;
         let rented_trial_hours = if offer_price_minor.is_some() {
-            Some(trial_hours.unwrap_or(DEFAULT_TRIAL_HOURS))
+            Some(
+                trial_hours
+                    .or_else(|| quote_snapshot.and_then(|s| s.trial_hours))
+                    .unwrap_or(trial_policy.share_hours),
+            )
         } else {
             None
         };
@@ -8841,7 +8934,8 @@ impl AppStore {
             Some(
                 trial_token_limit
                     .and_then(|value| u64::try_from(value).ok())
-                    .unwrap_or(DEFAULT_TRIAL_TOKEN_LIMIT),
+                    .or_else(|| quote_snapshot.and_then(|s| s.trial_token_limit))
+                    .unwrap_or(trial_policy.share_tokens),
             )
         } else {
             None
@@ -8931,10 +9025,12 @@ impl AppStore {
                 AppError::Internal(format!("encode Share contract Apps failed: {error}"))
             })?;
         let grant_token_limit = if offer_price_minor.is_some()
+            && quote_snapshot.is_none_or(|snapshot| snapshot.trial.is_none())
             && rented_trial_hours.unwrap_or(0) > 0
             && quoted_trial_seconds.unwrap_or(i64::MAX) > 0
         {
             rented_trial_token_limit
+                .filter(|tokens| *tokens > 0)
                 .or_else(|| token_limit.and_then(|value| u64::try_from(value).ok()))
         } else {
             token_limit.and_then(|value| u64::try_from(value).ok())
@@ -9010,7 +9106,7 @@ impl AppStore {
             let quote_id = metadata
                 .map(|value| value.quote_id.as_str())
                 .ok_or_else(|| AppError::Gone("wallet quote is missing".into()))?;
-            crate::market_platform_contracts::prepare_contract_tx(
+            let contract_id = crate::market_platform_contracts::prepare_contract_tx(
                 tx,
                 &crate::market_platform_contracts::PrepareContract {
                     product_kind: "share",
@@ -9028,9 +9124,25 @@ impl AppStore {
                     price_minor,
                     auto_renew: cycle_price_minor.is_some() && auto_renew,
                     trial_seconds: quoted_trial_seconds.unwrap_or(0),
+                    trial_allowance_seconds: trial_seconds_from_hours(
+                        rented_trial_hours.unwrap_or(0),
+                    )?,
                 },
                 now,
             )?;
+            if let Some(terms) = quote_snapshot.and_then(|s| s.trial.as_ref()) {
+                crate::market_share_trials::prepare_tx(
+                    tx,
+                    &contract_id,
+                    &entitlement_id,
+                    terms,
+                    now,
+                )?;
+            } else if quoted_trial_seconds.unwrap_or(0) > 0 {
+                return Err(AppError::Gone(
+                    "request a fresh one-time Share trial quote".into(),
+                ));
+            }
         }
         let changed = tx
             .execute(
@@ -9630,9 +9742,13 @@ fn validate_effective_resume_policy(
 ) -> Result<(), AppError> {
     let token_period: ShareTokenPeriod = serde_json::from_str(&record.token_period_json)
         .map_err(|_| AppError::Internal("stored seat token period is invalid".into()))?;
-    let service_started_at = record.service_started_at.as_deref().ok_or_else(|| {
-        AppError::Internal("billing-suspended Share service start is missing".into())
-    })?;
+    let service_started_at = record
+        .paid_quota_started_at
+        .as_deref()
+        .or(record.service_started_at.as_deref())
+        .ok_or_else(|| {
+            AppError::Internal("billing-suspended Share service start is missing".into())
+        })?;
     let expected_anchor = token_period_anchor_at_ms(token_period, parse_time(service_started_at)?);
     let expected_expiry = record
         .expires_at
@@ -11398,6 +11514,30 @@ impl AppStore {
             else {
                 continue;
             };
+            if action == "upsert" {
+                let revoking: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM market_share_trial_contracts trial
+                     JOIN market_platform_contracts contract ON contract.id=trial.contract_id
+                     WHERE contract.product_kind='share' AND contract.product_ref=?1
+                       AND trial.phase='revoking')",
+                        params![subscription_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(map_db("check isolated Share trial before dispatch"))?;
+                if revoking {
+                    // Reconciliation and control dispatch run independently.
+                    // Never turn a stale queued trial upsert into paid access
+                    // while confirmed cleanup is waiting for its worker pass.
+                    retire_unconfirmed_grant_tx(
+                        &tx,
+                        &subscription_id,
+                        "market_trial_revoking",
+                        &now,
+                    )?;
+                    continue;
+                }
+            }
             if !dispatched_shares.insert(share_id.clone()) {
                 continue;
             }
@@ -11505,6 +11645,26 @@ impl AppStore {
                     email,
                     policy,
                     duration_seconds,
+                    market_phase: if action == "upsert" {
+                        crate::market_share_trials::control_terms_tx(&tx, &subscription_id)?.0
+                    } else {
+                        None
+                    },
+                    trial_token_limit: if action == "upsert" {
+                        crate::market_share_trials::control_terms_tx(&tx, &subscription_id)?.1
+                    } else {
+                        None
+                    },
+                    trial_scope_id: if action == "upsert" {
+                        crate::market_share_trials::control_scope_tx(&tx, &subscription_id)?.0
+                    } else {
+                        None
+                    },
+                    trial_token_allowance: if action == "upsert" {
+                        crate::market_share_trials::control_scope_tx(&tx, &subscription_id)?.1
+                    } else {
+                        None
+                    },
                 }),
                 ..ShareSettingsPatch::default()
             };
@@ -11887,6 +12047,19 @@ pub(crate) fn handle_control_edit_ack_with_effect(
     )
     .map_err(map_db("reject Share control operation"))?;
     if action == "upsert" {
+        if let Some(contract) = crate::market_platform_contracts::contract_for_product_tx(
+            conn,
+            "share",
+            &subscription_id,
+        )? {
+            conn.execute("UPDATE market_share_trial_contracts SET phase='revoking',updated_at=?2 WHERE contract_id=?1 AND phase='activating'",params![contract,now]).map_err(map_db("isolate rejected paid phase"))?;
+            let rejected_conversion:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM market_share_trial_contracts WHERE contract_id=?1 AND phase='revoking')",params![contract],|r|r.get(0)).map_err(map_db("read rejected paid phase"))?;
+            if rejected_conversion {
+                crate::market_platform_contracts::mark_for_confirmed_cleanup_tx(
+                    conn, &contract, now,
+                )?;
+            }
+        }
         if let Some(record) = subscription_record(conn, &subscription_id)?
             && record.status == SUB_GRANT_PENDING
             && let Some(contract_id) = crate::market_platform_contracts::contract_for_product_tx(
@@ -12707,7 +12880,7 @@ mod tests {
                     format!("{share_id}-route"),
                     now,
                     periods,
-                    i64::from(MIN_SHARE_MARKET_CONTRACT_VERSION),
+                    i64::from(crate::models::SHARE_TRIAL_CONTRACT_VERSION),
                 ],
             )
             .expect("insert Share");
@@ -14096,6 +14269,15 @@ mod tests {
         {
             let conn = store.conn.lock().await;
             let tx = conn.transaction().unwrap();
+            crate::market_wallet::credit_verified_topup_tx(
+                &tx,
+                &renter.user_id,
+                "trial-history-topup",
+                1200,
+                "trial-history-receipt",
+                &start.to_rfc3339(),
+            )
+            .unwrap();
             let contract = crate::market_platform_contracts::prepare_contract_tx(
                 &tx,
                 &crate::market_platform_contracts::PrepareContract {
@@ -14110,6 +14292,7 @@ mod tests {
                     price_minor: 1200,
                     auto_renew: false,
                     trial_seconds: crate::market_common::TRIAL_SECONDS,
+                    trial_allowance_seconds: crate::market_common::TRIAL_SECONDS,
                 },
                 &start.to_rfc3339(),
             )
@@ -14696,6 +14879,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_paid_share_trial_requires_first_period_balance_before_creating_any_grant() {
+        let store = AppStore::new_in_memory_for_tests().unwrap();
+        let owner = session("share-funded-owner", "share-funded-owner@example.com");
+        let renter = session("share-funded-buyer", "share-funded-buyer@example.com");
+        insert_share(
+            &store,
+            "share-funded-trial",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let (_, seat) = create_listing(&store, &owner, "share-funded-trial", monthly_seat()).await;
+        let quote = store
+            .share_market_create_rent_quote(&renter, &seat, Some("codex"))
+            .await
+            .unwrap();
+        assert!(quote.trial_seconds_remaining > 0);
+        assert_eq!(
+            quote.wallet_funding.as_ref().unwrap().required_units,
+            1200 * 86_400
+        );
+        for amount in [0, 1199] {
+            if amount > 0 {
+                let conn = store.conn.lock().await;
+                crate::market_wallet::credit_verified_topup_tx(
+                    &conn,
+                    &renter.user_id,
+                    "partial",
+                    amount,
+                    "partial-receipt",
+                    &Utc::now().to_rfc3339(),
+                )
+                .unwrap();
+            }
+            let error = store
+                .share_market_commit_rent_quote(&renter, &seat, &quote.id, "funded-trial")
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), Some("MARKET_WALLET_REQUIRED"));
+            let conn = store.conn.lock().await;
+            for table in [
+                "share_market_subscriptions",
+                "market_platform_contracts",
+                "share_control_operations",
+            ] {
+                assert_eq!(
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                );
+            }
+            assert_eq!(
+                conn.query_row(
+                    "SELECT status FROM share_market_seats WHERE id=?1",
+                    params![seat],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+                SEAT_AVAILABLE
+            );
+        }
+        {
+            let conn = store.conn.lock().await;
+            crate::market_wallet::credit_verified_topup_tx(
+                &conn,
+                &renter.user_id,
+                "rest",
+                1,
+                "rest-receipt",
+                &Utc::now().to_rfc3339(),
+            )
+            .unwrap();
+        }
+        store
+            .share_market_commit_rent_quote(&renter, &seat, &quote.id, "funded-trial")
+            .await
+            .unwrap();
+        let conn = store.conn.lock().await;
+        let wallet = crate::market_wallet::wallet_snapshot_tx(&conn, &renter.user_id).unwrap();
+        assert_eq!(wallet.available_units, 1200 * 86_400);
+        assert_eq!(wallet.held_units, 0);
+        crate::market_wallet::reconcile_wallet_tx(&conn, &renter.user_id).unwrap();
+    }
+
+    #[tokio::test]
     async fn wallet_share_monthly_grant_captures_only_after_control_confirmation_in_every_topup_mode()
      {
         for mode in ["disabled", "shadow", "enabled"] {
@@ -15209,6 +15478,7 @@ mod tests {
             service_duration_days: Some(30),
             trial_hours: Some(12),
             trial_token_limit: Some(1_000_000),
+            trial: None,
             offer_revision: 7,
             funding_rail: default_legacy_funding_rail(),
             service: RentServiceSnapshot {
@@ -15802,10 +16072,10 @@ mod tests {
     }
 
     #[test]
-    fn paid_seat_defaults_trial_hours_and_tokens_and_rejects_free_trial_fields() {
+    fn paid_seat_inherits_trial_defaults_and_rejects_free_trial_fields() {
         let paid = normalize_seat(paid_seat()).expect("paid seat");
-        assert_eq!(paid.trial_hours, Some(DEFAULT_TRIAL_HOURS));
-        assert_eq!(paid.trial_token_limit, Some(DEFAULT_TRIAL_TOKEN_LIMIT));
+        assert_eq!(paid.trial_hours, None);
+        assert_eq!(paid.trial_token_limit, None);
 
         let mut zero = paid_seat();
         zero.trial_hours = Some(0);
@@ -15813,10 +16083,722 @@ mod tests {
         let zero = normalize_seat(zero).expect("zero trial is allowed");
         assert_eq!(zero.trial_hours, Some(0));
         assert_eq!(zero.trial_token_limit, Some(0));
+        let mut limit = paid_seat();
+        limit.trial_hours = Some(720);
+        assert!(normalize_seat(limit.clone()).is_ok());
+        limit.trial_hours = Some(721);
+        assert!(normalize_seat(limit).is_err());
 
         let mut free = free_seat();
         free.trial_hours = Some(12);
         assert!(normalize_seat(free).is_err());
+    }
+
+    async fn one_time_trial_fixture() -> (
+        AppStore,
+        AuthSession,
+        AuthSession,
+        String,
+        crate::models::ShareMarketEntitlement,
+    ) {
+        let store = AppStore::new_in_memory_for_tests().unwrap();
+        let owner = session("trial-provider", "trial-provider@example.com");
+        let buyer = session("trial-buyer", "trial-buyer@example.com");
+        insert_share(
+            &store,
+            "trial-share",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let (_, seat) = create_listing(&store, &owner, "trial-share", monthly_seat()).await;
+        let subscription = store
+            .rent_fixture_share(&buyer, &seat, RentSeatRequest { offer_revision: 1 })
+            .await
+            .unwrap();
+        activate_subscription(&store, &subscription, Utc::now()).await;
+        let state=store.conn.lock().await.query_row("SELECT t.scope_id,t.token_allowance,t.token_budget FROM market_share_trial_contracts t JOIN market_platform_contracts c ON c.id=t.contract_id WHERE c.product_ref=?1",params![subscription],|r|Ok(crate::models::ShareMarketEntitlement {
+            trial_scope_id:r.get(0)?,trial_token_allowance:Some(r.get(1)?),email:buyer.email.clone(),phase:crate::models::ShareMarketPhase::Trial,active:true,trial_token_limit:Some(r.get(2)?),trial_tokens_used:0,usage_revision:0,usage_uncertain:false,applied_at_ms:Utc::now().timestamp_millis(),paid_started_at_ms:None
+        })).unwrap();
+        (store, owner, buyer, subscription, state)
+    }
+
+    #[tokio::test]
+    async fn one_time_trial_token_conversion_reserves_then_charges_only_confirmed_paid_phase_once()
+    {
+        let (store, _, buyer, subscription, mut state) = one_time_trial_fixture().await;
+        let now = Utc::now();
+        let conn = store.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let record = subscription_record(&tx, &subscription).unwrap().unwrap();
+        let contract: String = tx
+            .query_row(
+                "SELECT id FROM market_platform_contracts WHERE product_ref=?1",
+                params![subscription],
+                |r| r.get(0),
+            )
+            .unwrap();
+        state.trial_tokens_used = 300;
+        state.usage_revision = 1;
+        let states = BTreeMap::from([(record.entitlement_id.clone(), state.clone())]);
+        tx.execute(
+            "UPDATE shares SET market_entitlements_json=?1 WHERE share_id='trial-share'",
+            params![serde_json::to_string(&states).unwrap()],
+        )
+        .unwrap();
+        assert!(
+            crate::market_share_trials::reconcile_tx(&tx, &contract, &now.to_rfc3339()).unwrap()
+        );
+        let wallet = crate::market_wallet::wallet_snapshot_tx(&tx, &buyer.user_id).unwrap();
+        assert!(wallet.held_units > 0);
+        assert_eq!(
+            tx.query_row(
+                "SELECT COUNT(*) FROM market_platform_periods WHERE contract_id=?1",
+                params![contract],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0,
+            "a queued paid grant must not debit the wallet"
+        );
+        assert_eq!(
+            crate::market_platform_contracts::prior_due_funding_units_tx(
+                &tx,
+                &buyer.user_id,
+                None,
+                &now.to_rfc3339()
+            )
+            .unwrap(),
+            0,
+            "the conversion hold is not a second due obligation"
+        );
+        // Time exhaustion racing the Token trigger must reuse the same operation and hold.
+        crate::market_platform_contracts::start_paid_trial_tx(
+            &tx,
+            &contract,
+            &now.to_rfc3339(),
+            &now.to_rfc3339(),
+        )
+        .unwrap();
+        assert_eq!(tx.query_row("SELECT COUNT(*) FROM share_control_operations WHERE subscription_id=?1 AND status='pending' AND action='upsert'",params![subscription],|r|r.get::<_,i64>(0)).unwrap(),1);
+        // The Server may apply within the same millisecond. Its receipt must
+        // not be rejected against Router's higher-precision request timestamp.
+        let at = DateTime::from_timestamp_millis(now.timestamp_millis()).unwrap();
+        let record = subscription_record(&tx, &subscription).unwrap().unwrap();
+        let policy = contract_policy(&record).unwrap();
+        assert_eq!(
+            policy.token_limit,
+            Some(10_000),
+            "trial cap does not replace the ordinary periodic policy"
+        );
+        apply_control_grant_effect(
+            &tx,
+            &record.share_id,
+            "upsert",
+            &record.renter_email,
+            &record.entitlement_id,
+            Some(&policy),
+            Some(at.timestamp_millis()),
+            &at.to_rfc3339(),
+        )
+        .unwrap();
+        state.phase = crate::models::ShareMarketPhase::Paid;
+        state.paid_started_at_ms = Some(at.timestamp_millis());
+        state.applied_at_ms = at.timestamp_millis();
+        tx.execute(
+            "UPDATE shares SET market_entitlements_json=?1 WHERE share_id='trial-share'",
+            params![
+                serde_json::to_string(&BTreeMap::from([(record.entitlement_id, state)])).unwrap()
+            ],
+        )
+        .unwrap();
+        let after = at + Duration::seconds(1);
+        assert!(
+            crate::market_share_trials::reconcile_tx(&tx, &contract, &after.to_rfc3339()).unwrap()
+        );
+        assert!(
+            !crate::market_share_trials::reconcile_tx(&tx, &contract, &after.to_rfc3339()).unwrap()
+        );
+        assert_eq!(
+            tx.query_row(
+                "SELECT COUNT(*) FROM market_platform_periods WHERE contract_id=?1",
+                params![contract],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        let paid: String = tx
+            .query_row(
+                "SELECT paid_started_at FROM market_platform_contracts WHERE id=?1",
+                params![contract],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            parse_time(&paid).unwrap().timestamp_millis(),
+            at.timestamp_millis()
+        );
+        crate::market_wallet::reconcile_wallet_tx(&tx, &buyer.user_id).unwrap();
+        assert_eq!(
+            crate::market_share_trials::remaining_tx(
+                &tx,
+                &buyer.user_id,
+                "trial-provider",
+                "trial-share",
+                720 * 3600,
+                9_000_000
+            )
+            .unwrap(),
+            (0, 0),
+            "a larger future default cannot revive an ended scope"
+        );
+        tx.commit().unwrap();
+    }
+
+    #[tokio::test]
+    async fn one_time_trial_insufficient_funds_reclaims_without_a_paid_period_or_late_revival() {
+        let (store, _, buyer, subscription, mut state) = one_time_trial_fixture().await;
+        let now = Utc::now().to_rfc3339();
+        let conn = store.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let record = subscription_record(&tx, &subscription).unwrap().unwrap();
+        let contract: String = tx
+            .query_row(
+                "SELECT id FROM market_platform_contracts WHERE product_ref=?1",
+                params![subscription],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let available = crate::market_wallet::wallet_snapshot_tx(&tx, &buyer.user_id)
+            .unwrap()
+            .available_units;
+        crate::market_wallet::reserve_wallet_tx(
+            &tx,
+            &buyer.user_id,
+            "other_service",
+            "other",
+            "test",
+            available,
+            None,
+            &now,
+        )
+        .unwrap();
+        state.trial_tokens_used = 250;
+        state.usage_revision = 1;
+        tx.execute(
+            "UPDATE shares SET market_entitlements_json=?1 WHERE share_id='trial-share'",
+            params![
+                serde_json::to_string(&BTreeMap::from([(record.entitlement_id, state)])).unwrap()
+            ],
+        )
+        .unwrap();
+        crate::market_share_trials::reconcile_tx(&tx, &contract, &now).unwrap();
+        assert_eq!(
+            tx.query_row(
+                "SELECT status FROM market_platform_contracts WHERE id=?1",
+                params![contract],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "ending"
+        );
+        crate::market_wallet::credit_verified_topup_tx(
+            &tx,
+            &buyer.user_id,
+            "late",
+            1200,
+            "late-receipt",
+            &now,
+        )
+        .unwrap();
+        assert_eq!(
+            tx.query_row(
+                "SELECT status FROM market_platform_contracts WHERE id=?1",
+                params![contract],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "ending"
+        );
+        assert_eq!(
+            tx.query_row(
+                "SELECT COUNT(*) FROM market_platform_periods WHERE contract_id=?1",
+                params![contract],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            tx.query_row(
+                "SELECT status FROM share_market_seats WHERE id=?1",
+                params![record.seat_id],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            SEAT_OCCUPIED,
+            "cleanup is not yet confirmed, so the seat must not be reused"
+        );
+        tx.commit().unwrap();
+    }
+
+    #[tokio::test]
+    async fn one_time_trial_defaults_are_inherited_but_frozen_quotes_survive_policy_changes() {
+        let store = AppStore::new_in_memory_for_tests().unwrap();
+        let owner = session("defaults-owner", "defaults-owner@example.com");
+        let buyer = session("defaults-buyer", "defaults-buyer@example.com");
+        insert_share(
+            &store,
+            "defaults-share",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let (_, seat) = create_listing(&store, &owner, "defaults-share", paid_seat()).await;
+        let quote = store
+            .share_market_create_rent_quote(&buyer, &seat, None)
+            .await
+            .unwrap();
+        assert_eq!(quote.offer.trial_hours, Some(12));
+        assert_eq!(quote.offer.trial_token_limit, Some(1_000_000));
+        assert!(quote.offer.trial.as_ref().unwrap().hours_inherited);
+        {
+            let conn = store.conn.lock().await;
+            conn.execute("UPDATE market_trial_policy SET version=version+1,share_hours=2,share_tokens=0 WHERE id=1",[]).unwrap();
+            crate::market_wallet::credit_verified_topup_tx(
+                &conn,
+                &buyer.user_id,
+                "default-funding",
+                1200,
+                "default-receipt",
+                &Utc::now().to_rfc3339(),
+            )
+            .unwrap();
+        }
+        let result = store
+            .share_market_commit_rent_quote(&buyer, &seat, &quote.id, "frozen-defaults")
+            .await
+            .unwrap();
+        let conn = store.conn.lock().await;
+        let frozen: (i64, i64) = conn
+            .query_row(
+                "SELECT trial_hours,trial_token_limit FROM share_market_subscriptions WHERE id=?1",
+                params![result.subscription_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(frozen, (12, 1_000_000));
+        assert_eq!(
+            crate::market_wallet_policy::policy_tx(&conn)
+                .unwrap()
+                .version,
+            1,
+            "trial edits do not change maintenance-fee quote versions"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_time_trial_unknown_activation_reclaims_but_retains_money_until_cleanup() {
+        let (store, _, buyer, subscription, _) = one_time_trial_fixture().await;
+        let now = Utc::now();
+        let conn = store.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let record = subscription_record(&tx, &subscription).unwrap().unwrap();
+        let contract: String = tx
+            .query_row(
+                "SELECT id FROM market_platform_contracts WHERE product_ref=?1",
+                params![subscription],
+                |r| r.get(0),
+            )
+            .unwrap();
+        tx.execute(
+            "UPDATE market_platform_contracts SET trial_seconds_remaining=0 WHERE id=?1",
+            params![contract],
+        )
+        .unwrap();
+        assert!(
+            crate::market_share_trials::reconcile_tx(&tx, &contract, &now.to_rfc3339()).unwrap()
+        );
+        let held = crate::market_wallet::wallet_snapshot_tx(&tx, &buyer.user_id)
+            .unwrap()
+            .held_units;
+        assert!(held > 0);
+        assert!(
+            crate::market_share_trials::reconcile_tx(
+                &tx,
+                &contract,
+                &(now + Duration::seconds(301)).to_rfc3339()
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            tx.query_row(
+                "SELECT status FROM market_platform_contracts WHERE id=?1",
+                params![contract],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "ending"
+        );
+        assert_eq!(
+            crate::market_wallet::wallet_snapshot_tx(&tx, &buyer.user_id)
+                .unwrap()
+                .held_units,
+            held,
+            "an unknown ACK never releases the reservation"
+        );
+        assert_eq!(
+            tx.query_row(
+                "SELECT COUNT(*) FROM market_platform_periods WHERE contract_id=?1",
+                params![contract],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        finish_release_tx(
+            &tx,
+            &subscription,
+            &record.seat_id,
+            &record.listing_id,
+            "confirmed_revoke",
+            &(now + Duration::seconds(302)).to_rfc3339(),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::market_wallet::wallet_snapshot_tx(&tx, &buyer.user_id)
+                .unwrap()
+                .held_units,
+            0
+        );
+        crate::market_wallet::reconcile_wallet_tx(&tx, &buyer.user_id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn one_time_trial_isolated_activation_cannot_dispatch_a_stale_paid_upsert() {
+        let (store, _, buyer, subscription, _) = one_time_trial_fixture().await;
+        let now = Utc::now();
+        let held;
+        {
+            let conn = store.conn.lock().await;
+            let contract: String = conn
+                .query_row(
+                    "SELECT id FROM market_platform_contracts WHERE product_ref=?1",
+                    params![subscription],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "UPDATE market_platform_contracts SET trial_seconds_remaining=0 WHERE id=?1",
+                params![contract],
+            )
+            .unwrap();
+            crate::market_share_trials::reconcile_tx(&conn, &contract, &now.to_rfc3339()).unwrap();
+            held = crate::market_wallet::wallet_snapshot_tx(&conn, &buyer.user_id)
+                .unwrap()
+                .held_units;
+            crate::market_share_trials::reconcile_tx(
+                &conn,
+                &contract,
+                &(now + Duration::seconds(301)).to_rfc3339(),
+            )
+            .unwrap();
+        }
+        store
+            .share_market_reconcile_and_dispatch(now + Duration::seconds(302))
+            .await
+            .unwrap();
+        let conn = store.conn.lock().await;
+        let pending: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM share_control_operations WHERE subscription_id=?1
+             AND action='upsert' AND status IN ('pending','dispatched')",
+                params![subscription],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            pending, 0,
+            "cleanup cannot reactivate the isolated entitlement"
+        );
+        assert_eq!(
+            crate::market_wallet::wallet_snapshot_tx(&conn, &buyer.user_id)
+                .unwrap()
+                .held_units,
+            held
+        );
+    }
+
+    #[tokio::test]
+    async fn one_time_trial_uncertain_usage_reclaims_without_a_charge() {
+        let (store, _, buyer, subscription, mut state) = one_time_trial_fixture().await;
+        let conn = store.conn.lock().await;
+        let record = subscription_record(&conn, &subscription).unwrap().unwrap();
+        let contract: String = conn
+            .query_row(
+                "SELECT id FROM market_platform_contracts WHERE product_ref=?1",
+                params![subscription],
+                |r| r.get(0),
+            )
+            .unwrap();
+        state.usage_uncertain = true;
+        crate::market_share_trials::observe_share_tx(
+            &conn,
+            &record.share_id,
+            &BTreeMap::from([(record.entitlement_id, state)]),
+            &Utc::now().to_rfc3339(),
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT status FROM market_platform_contracts WHERE id=?1",
+                params![contract],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "ending"
+        );
+        assert_eq!(
+            crate::market_share_trials::remaining_tx(
+                &conn,
+                &buyer.user_id,
+                "trial-provider",
+                "trial-share",
+                43200,
+                1_000_000
+            )
+            .unwrap(),
+            (0, 0)
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM market_platform_periods WHERE contract_id=?1",
+                params![contract],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn one_time_trial_late_uncertainty_reclaims_the_replacement_scope_too() {
+        let (store, _, _, subscription, mut state) = one_time_trial_fixture().await;
+        let conn = store.conn.lock().await;
+        let record = subscription_record(&conn, &subscription).unwrap().unwrap();
+        let original: String = conn
+            .query_row(
+                "SELECT id FROM market_platform_contracts WHERE product_ref=?1",
+                params![subscription],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE market_platform_contracts SET status='ended',ended_at=?2 WHERE id=?1",
+            params![original, now],
+        )
+        .unwrap();
+        // Minimal successor contract: this test exercises the financial scope
+        // fence, independently of the seat provisioning/dispatch fixtures.
+        conn.execute(
+            "INSERT INTO market_platform_contracts
+            (id,product_kind,product_ref,trial_scope_ref,quote_id,request_fingerprint,
+             buyer_user_id,provider_user_id,offer_revision,billing_model,cycle_price_minor,
+             renewal_policy,status,trial_seconds_remaining,activated_at,created_at,updated_at)
+            SELECT 'successor','share','successor-subscription',trial_scope_ref,'successor-quote',
+             request_fingerprint,buyer_user_id,provider_user_id,offer_revision,billing_model,
+             cycle_price_minor,renewal_policy,'trialing',1,?2,?2,?2
+            FROM market_platform_contracts WHERE id=?1",
+            params![original, now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO market_share_trial_contracts
+            (contract_id,scope_id,entitlement_id,token_allowance,token_budget,created_at,updated_at)
+            SELECT 'successor',scope_id,'successor-entitlement',token_allowance,token_budget,?2,?2
+            FROM market_share_trial_contracts WHERE contract_id=?1",
+            params![original, now],
+        )
+        .unwrap();
+        state.active = false;
+        state.usage_uncertain = true;
+        crate::market_share_trials::observe_share_tx(
+            &conn,
+            &record.share_id,
+            &BTreeMap::from([(record.entitlement_id, state)]),
+            &now,
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT status FROM market_platform_contracts WHERE id='successor'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "ending"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT phase FROM market_share_trial_contracts WHERE contract_id='successor'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "revoking"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT status FROM market_platform_contracts WHERE id=?1",
+                params![original],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "ended"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_time_trial_invalid_formal_policy_is_reclaimed_without_capturing_the_hold() {
+        let (store, _, buyer, subscription, mut state) = one_time_trial_fixture().await;
+        let now = Utc::now();
+        let conn = store.conn.lock().await;
+        let record = subscription_record(&conn, &subscription).unwrap().unwrap();
+        let contract: String = conn
+            .query_row(
+                "SELECT id FROM market_platform_contracts WHERE product_ref=?1",
+                params![subscription],
+                |r| r.get(0),
+            )
+            .unwrap();
+        crate::market_share_trials::request_conversion_tx(
+            &conn,
+            &contract,
+            "time",
+            &now.to_rfc3339(),
+        )
+        .unwrap();
+        let at = now + Duration::seconds(1);
+        let mut policy = contract_policy(&record).unwrap();
+        policy.token_limit = Some(1);
+        apply_control_grant_effect(
+            &conn,
+            &record.share_id,
+            "upsert",
+            &record.renter_email,
+            &record.entitlement_id,
+            Some(&policy),
+            Some(at.timestamp_millis()),
+            &at.to_rfc3339(),
+        )
+        .unwrap();
+        state.phase = crate::models::ShareMarketPhase::Paid;
+        state.paid_started_at_ms = Some(at.timestamp_millis());
+        state.applied_at_ms = at.timestamp_millis();
+        conn.execute(
+            "UPDATE shares SET market_entitlements_json=?1 WHERE share_id=?2",
+            params![
+                serde_json::to_string(&BTreeMap::from([(record.entitlement_id, state)])).unwrap(),
+                record.share_id
+            ],
+        )
+        .unwrap();
+        assert!(
+            crate::market_share_trials::reconcile_tx(
+                &conn,
+                &contract,
+                &(at + Duration::seconds(1)).to_rfc3339()
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT status FROM market_platform_contracts WHERE id=?1",
+                params![contract],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "ending"
+        );
+        assert!(
+            crate::market_wallet::wallet_snapshot_tx(&conn, &buyer.user_id)
+                .unwrap()
+                .held_units
+                > 0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM market_platform_periods WHERE contract_id=?1",
+                params![contract],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn one_time_trial_requires_v9_but_disabled_and_free_offers_do_not() {
+        let store = AppStore::new_in_memory_for_tests().unwrap();
+        let owner = session("version-owner", "version-owner@example.com");
+        let buyer = session("version-buyer", "version-buyer@example.com");
+        insert_share(
+            &store,
+            "version-share",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let mut offer = paid_seat();
+        offer.trial_hours = Some(12);
+        offer.trial_token_limit = Some(0);
+        let (_, seat) = create_listing(&store, &owner, "version-share", offer).await;
+        let quote = store
+            .share_market_create_rent_quote(&buyer, &seat, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            quote.offer.trial.as_ref().unwrap().token_budget,
+            0,
+            "0 Tokens is a time-only trial"
+        );
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE shares SET share_access_policy_version=8 WHERE share_id='version-share'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            store
+                .share_market_create_rent_quote(&buyer, &seat, None)
+                .await
+                .is_err()
+        );
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE share_market_seats SET trial_hours=0 WHERE id=?1",
+                params![seat],
+            )
+            .unwrap();
+        let quote = store
+            .share_market_create_rent_quote(&buyer, &seat, None)
+            .await
+            .unwrap();
+        assert_eq!(quote.trial_seconds_remaining, 0);
     }
 
     #[tokio::test]

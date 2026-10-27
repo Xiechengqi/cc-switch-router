@@ -316,6 +316,8 @@ pub(crate) struct PrepareContract<'a> {
     pub auto_renew: bool,
     /// Healthy free-service seconds. A trial does not reserve buyer money.
     pub trial_seconds: i64,
+    /// Full offered allowance frozen in the quote, before prior usage.
+    pub trial_allowance_seconds: i64,
 }
 
 #[derive(Debug)]
@@ -394,6 +396,12 @@ fn due_funding_claims_tx(
         let trial_conversion = paid_started.is_none()
             && trial_remaining == 0
             && matches!(status.as_str(), "trialing" | "suspended");
+        if trial_conversion {
+            let reserved:bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM market_share_trial_contracts t JOIN market_wallet_holds h ON h.id=t.conversion_hold_id WHERE t.contract_id=?1 AND h.status='active')",params![id],|r|r.get(0)).map_err(db_error("read reserved Share conversion obligation"))?;
+            if reserved {
+                continue;
+            }
+        }
         let monthly_due = period_end
             .as_deref()
             .map(parse_time)
@@ -577,6 +585,7 @@ pub(crate) fn prepare_contract_tx(
         || input.offer_revision <= 0
         || input.price_minor <= 0
         || !(0..=30 * 86_400).contains(&input.trial_seconds)
+        || !(input.trial_seconds..=30 * 86_400).contains(&input.trial_allowance_seconds)
         || (input.billing_model == BillingModel::Metered && input.auto_renew)
     {
         return Err(AppError::BadRequest("invalid platform contract".into()));
@@ -584,7 +593,7 @@ pub(crate) fn prepare_contract_tx(
     parse_time(now)?;
     let amount_units = units_from_minor(input.price_minor)?;
     let fingerprint = format!(
-        "{}:{}:{}:{}:{}:{}:{}:{}:{}:trial:{}",
+        "{}:{}:{}:{}:{}:{}:{}:{}:{}:trial:{}:allowance:{}",
         input.product_kind,
         input.product_ref,
         input.trial_scope_ref,
@@ -595,6 +604,7 @@ pub(crate) fn prepare_contract_tx(
         input.billing_model.as_str(),
         input.price_minor,
         input.trial_seconds,
+        input.trial_allowance_seconds,
     ) + if input.auto_renew { ":auto" } else { ":manual" };
     let existing = conn
         .query_row(
@@ -628,7 +638,7 @@ pub(crate) fn prepare_contract_tx(
             input.provider_user_id,
             input.product_kind,
             input.trial_scope_ref,
-            input.trial_seconds,
+            input.trial_allowance_seconds,
         )?
     {
         return Err(AppError::Conflict(
@@ -659,28 +669,12 @@ pub(crate) fn prepare_contract_tx(
         }
     }
     let id = Uuid::new_v4().to_string();
-    if input.trial_seconds == 0 {
-        let prior = prior_due_funding_units_tx(conn, input.buyer_user_id, None, now)?;
-        let needed = prior
-            .checked_add(amount_units)
-            .ok_or_else(|| AppError::Internal("wallet funding commitments overflow".into()))?;
-        if crate::market_wallet::wallet_snapshot_tx(conn, input.buyer_user_id)?.available_units
-            < needed
-        {
-            return Err(AppError::coded_conflict(
-                "MARKET_WALLET_REQUIRED",
-                "wallet balance changed; refresh the quote",
-                serde_json::to_value(crate::market_wallet::wallet_quote_funding_tx(
-                    conn,
-                    input.buyer_user_id,
-                    input.price_minor,
-                    0,
-                    now,
-                )?)
-                .map_err(|error| AppError::Internal(error.to_string()))?,
-            ));
-        }
-    }
+    crate::market_wallet::require_order_funding_tx(
+        conn,
+        input.buyer_user_id,
+        input.price_minor,
+        now,
+    )?;
     let hold_id = if input.trial_seconds == 0 {
         Some(reserve_wallet_tx(
             conn,
@@ -958,7 +952,7 @@ pub(crate) struct TrialAdvanceResult {
     pub replayed: bool,
 }
 
-fn start_paid_trial_tx(
+pub(crate) fn start_paid_trial_tx(
     conn: &Connection,
     contract_id: &str,
     at: &str,
@@ -998,12 +992,22 @@ fn start_paid_trial_tx(
         ));
     }
     crate::market_reconcile::ensure_contract_finance_safe_tx(conn, contract_id)?;
+    let confirmed_hold = crate::market_share_trials::confirmed_hold_tx(conn, contract_id)?;
+    if crate::market_share_trials::is_managed_tx(conn, contract_id)? && confirmed_hold.is_none() {
+        crate::market_share_trials::request_conversion_tx(conn, contract_id, "time", now)?;
+        return Ok(false);
+    }
     let units = units_from_minor(price)?;
-    let prior = prior_due_funding_units_tx(conn, &buyer, Some(contract_id), now)?;
-    if crate::market_wallet::wallet_snapshot_tx(conn, &buyer)?.available_units
-        < prior
-            .checked_add(units)
-            .ok_or_else(|| AppError::Internal("wallet funding commitments overflow".into()))?
+    let prior = if confirmed_hold.is_none() {
+        prior_due_funding_units_tx(conn, &buyer, Some(contract_id), now)?
+    } else {
+        0
+    };
+    if confirmed_hold.is_none()
+        && crate::market_wallet::wallet_snapshot_tx(conn, &buyer)?.available_units
+            < prior
+                .checked_add(units)
+                .ok_or_else(|| AppError::Internal("wallet funding commitments overflow".into()))?
     {
         if conn
             .execute(
@@ -1024,16 +1028,20 @@ fn start_paid_trial_tx(
         }
         return Ok(false);
     }
-    let hold_id = reserve_wallet_tx(
-        conn,
-        &buyer,
-        "platform_contract",
-        contract_id,
-        "activation",
-        units,
-        None,
-        now,
-    )?;
+    let hold_id = if let Some(hold) = confirmed_hold {
+        hold
+    } else {
+        reserve_wallet_tx(
+            conn,
+            &buyer,
+            "platform_contract",
+            contract_id,
+            "activation",
+            units,
+            None,
+            now,
+        )?
+    };
     if model == "calendar_month" {
         let start = parse_time(at)?;
         let end = crate::market_common::next_calendar_month_at(start, start.day())?;
@@ -2727,10 +2735,9 @@ fn resume_suspended_contract_inner_tx(
         return Ok(false);
     }
     if paid_started.is_none() && trial_remaining == 0 {
-        // Retry funding without leaving the suspension. Flipping to trialing
-        // first would reset suspended_at and create a fresh pause every 5s.
-        // The successful conversion alone advances the service/health cursor.
-        return start_paid_trial_tx(conn, contract_id, now, now);
+        // A failed trial conversion relinquishes the resource. A late top-up
+        // must not race teardown and revive the previous tenant's service.
+        return Ok(false);
     }
     if model == "calendar_month" {
         return renew_monthly_contract_tx(conn, contract_id, now);
@@ -2866,7 +2873,8 @@ fn suspension_terminate_days() -> i64 {
         .unwrap_or(7)
 }
 
-/// End a service the buyer has left unfunded for too long, after a warning.
+/// Reclaim failed trial conversions immediately. Paid services keep their
+/// configured suspension window and receive a warning before expiry.
 /// A suspension caused by a finance hold is the Router's problem, not the
 /// buyer's, and never times out. Returns whether the contract was marked for
 /// cleanup.
@@ -2875,20 +2883,28 @@ fn enforce_suspension_timeout_tx(
     contract_id: &str,
     now: DateTime<Utc>,
 ) -> Result<bool, AppError> {
-    let (suspended_at, cause, buyer): (Option<String>, Option<String>, String) = conn
+    let (suspended_at, cause, buyer, paid_started, trial_remaining): (
+        Option<String>, Option<String>, String, Option<String>, i64,
+    ) = conn
         .query_row(
-            "SELECT suspended_at, suspension_cause, buyer_user_id
+            "SELECT suspended_at, suspension_cause, buyer_user_id, paid_started_at, trial_seconds_remaining
              FROM market_platform_contracts WHERE id = ?1",
             params![contract_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .map_err(db_error("read contract suspension"))?;
-    let Some(suspended_at) = suspended_at else {
-        return Ok(false);
-    };
     if crate::market_reconcile::ensure_contract_finance_safe_tx(conn, contract_id).is_err() {
         return Ok(false);
     }
+    // An exhausted, never-paid trial has no resource-retention entitlement.
+    // Use the existing confirmed cleanup rail; never publish an unclean Host.
+    if paid_started.is_none() && trial_remaining == 0 {
+        mark_for_confirmed_cleanup_tx(conn, contract_id, &now.to_rfc3339())?;
+        return Ok(true);
+    }
+    let Some(suspended_at) = suspended_at else {
+        return Ok(false);
+    };
     if cause.as_deref() == Some("finance_hold") {
         // The hold has cleared but the service is still suspended, so it now
         // waits on funding. The buyer's window starts only from this moment.
@@ -2927,7 +2943,7 @@ fn enforce_suspension_timeout_tx(
     Ok(false)
 }
 
-fn mark_for_confirmed_cleanup_tx(
+pub(crate) fn mark_for_confirmed_cleanup_tx(
     conn: &Connection,
     contract_id: &str,
     now: &str,
@@ -3387,17 +3403,21 @@ fn reconcile_platform_contracts_tx(
                 .map_err(db_error("record missing wallet service"))?;
                 return Ok(None);
             }
-            if status == "suspended" && enforce_suspension_timeout_tx(conn, &id, now)? {
-                // Marked for cleanup; the next pass dispatches termination.
-                conn.execute(
-                    "UPDATE market_platform_contracts SET updated_at = ?2 WHERE id = ?1",
-                    params![id, now_text],
-                )
-                .map_err(db_error("rotate expired suspension"))?;
-                return Ok(None);
-            }
             let expiry = service_expiry_tx(conn, &kind, &product_ref, &service_ref)?;
-            if matches!(status.as_str(), "trialing" | "active") {
+            let trial_transition_pending = kind == "share"
+                && matches!(status.as_str(), "trialing" | "active")
+                && crate::market_share_trials::reconcile_tx(conn, &id, &now_text)?;
+            let still_trialing: bool = conn
+                .query_row(
+                    "SELECT status = ?2 FROM market_platform_contracts WHERE id = ?1",
+                    params![id, status],
+                    |r| r.get(0),
+                )
+                .map_err(db_error("read post-trial service state"))?;
+            if matches!(status.as_str(), "trialing" | "active")
+                && !trial_transition_pending
+                && still_trialing
+            {
                 reconcile_service_interval_tx(
                     conn,
                     &id,
@@ -3412,14 +3432,19 @@ fn reconcile_platform_contracts_tx(
                     expiry,
                 )?;
             }
-            let (current_status, current_cursor, sequence): (String, Option<String>, i64) = conn
-                .query_row(
+            let (mut current_status, current_cursor, sequence): (String, Option<String>, i64) =
+                conn.query_row(
                     "SELECT status, last_evaluated_at, current_period_sequence
              FROM market_platform_contracts WHERE id = ?1",
                     params![id],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .map_err(db_error("read reconciled wallet service state"))?;
+            // Run after interval settlement too, so trial conversion failure
+            // dispatches teardown in this very pass rather than pausing for days.
+            if current_status == "suspended" && enforce_suspension_timeout_tx(conn, &id, now)? {
+                current_status = "ending".into();
+            }
             if matches!(current_status.as_str(), "active" | "trialing" | "suspended")
                 && expiry.is_some_and(|expires| {
                     expires <= now
@@ -3826,6 +3851,7 @@ mod tests {
             price_minor: 100,
             auto_renew: false,
             trial_seconds: 0,
+            trial_allowance_seconds: 0,
         };
         let error = prepare_contract_tx(&conn, &order, time).unwrap_err();
         assert_eq!(error.code(), Some("MARKET_WALLET_REQUIRED"));
@@ -3861,6 +3887,7 @@ mod tests {
             price_minor: 1_000,
             auto_renew,
             trial_seconds: 0,
+            trial_allowance_seconds: crate::market_common::TRIAL_SECONDS,
         }
     }
 
@@ -3951,6 +3978,7 @@ mod tests {
             price_minor: 1_000,
             auto_renew: true,
             trial_seconds,
+            trial_allowance_seconds: trial_seconds,
         };
         let id = prepare_contract_tx(conn, &input, start).unwrap();
         bind_client_installation_tx(
@@ -3986,8 +4014,7 @@ mod tests {
         id
     }
 
-    #[test]
-    fn active_free_share_trial_can_observe_health_and_convert_once() {
+    fn share_trial_fixture() -> (Connection, String, DateTime<Utc>) {
         let conn = memory();
         let start = "2026-01-01T00:00:00+00:00";
         let end = parse_time(start).unwrap() + chrono::Duration::seconds(5);
@@ -4035,6 +4062,7 @@ mod tests {
                 price_minor: 100,
                 auto_renew: false,
                 trial_seconds: 5,
+                trial_allowance_seconds: 5,
             },
             start,
         )
@@ -4047,6 +4075,91 @@ mod tests {
             params![end.timestamp()],
         )
         .unwrap();
+        (conn, contract_id, end)
+    }
+
+    #[test]
+    fn failed_share_trial_conversion_dispatches_revoke_without_releasing_a_dirty_seat() {
+        let (conn, id, end) = share_trial_fixture();
+        reserve_wallet_tx(
+            &conn,
+            "buyer",
+            "test",
+            "other",
+            "budget",
+            units_from_minor(100).unwrap(),
+            None,
+            &end.to_rfc3339(),
+        )
+        .unwrap();
+        let actions = reconcile_platform_contracts_tx(&conn, end).unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].product_kind, "share");
+        assert_eq!(actions[0].product_ref, "subscription-1");
+        assert_eq!(actions[0].kind, PlatformControlKind::Terminate);
+        assert_eq!(
+            conn.query_row(
+                "SELECT status FROM market_platform_contracts WHERE id=?1",
+                params![id],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "ending"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT status FROM share_market_seats WHERE id='seat-1'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "occupied"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM market_platform_periods", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        reconcile_wallet_tx(&conn, "buyer").unwrap();
+    }
+
+    #[test]
+    fn historical_suspended_trials_are_reclaimed_without_a_new_retention_window() {
+        let (conn, id, end) = share_trial_fixture();
+        reserve_wallet_tx(
+            &conn,
+            "buyer",
+            "test",
+            "other",
+            "budget",
+            units_from_minor(100).unwrap(),
+            None,
+            &end.to_rfc3339(),
+        )
+        .unwrap();
+        let start = "2026-01-01T00:00:00+00:00";
+        advance_trial_interval_tx(
+            &conn,
+            &id,
+            "share_control",
+            "legacy",
+            start,
+            &end.to_rfc3339(),
+            true,
+            &end.to_rfc3339(),
+        )
+        .unwrap();
+        conn.execute("UPDATE share_market_subscriptions SET status='billing_suspended' WHERE id='subscription-1'", []).unwrap();
+        let actions =
+            reconcile_platform_contracts_tx(&conn, end + chrono::Duration::hours(1)).unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, PlatformControlKind::Terminate);
+    }
+
+    #[test]
+    fn active_free_share_trial_can_observe_health_and_convert_once() {
+        let (conn, contract_id, end) = share_trial_fixture();
         reconcile_platform_contracts_tx(&conn, end).unwrap();
         assert_eq!(
             conn.query_row(
@@ -4215,6 +4328,7 @@ mod tests {
                 price_minor: 100_000,
                 auto_renew: false,
                 trial_seconds: 0,
+                trial_allowance_seconds: 0,
             },
             start,
         )
@@ -4405,6 +4519,7 @@ mod tests {
         let start = "2026-01-01T00:00:00+00:00";
         let end = parse_time(start).unwrap() + chrono::Duration::seconds(5);
         let valid_id = client_monthly_fixture(&conn, start, 0);
+        credit_verified_topup_tx(&conn, "buyer", "extra", 100, "extra-receipt", start).unwrap();
         let invalid_id = prepare_contract_tx(
             &conn,
             &PrepareContract {
@@ -4419,6 +4534,7 @@ mod tests {
                 price_minor: 100,
                 auto_renew: false,
                 trial_seconds: 5,
+                trial_allowance_seconds: 5,
             },
             start,
         )
@@ -4616,6 +4732,7 @@ mod tests {
             price_minor: 100,
             auto_renew: false,
             trial_seconds: 0,
+            trial_allowance_seconds: 0,
         };
         let second = PrepareContract {
             product_ref: "job-2",
@@ -4635,7 +4752,119 @@ mod tests {
     }
 
     #[test]
-    fn trial_does_not_hold_money_and_suspends_if_conversion_is_unfunded() {
+    fn every_paid_product_requires_the_first_period_balance_even_with_a_trial() {
+        for kind in ["client_host", "share"] {
+            for model in [BillingModel::CalendarMonth, BillingModel::Metered] {
+                for trial in [0, 3600] {
+                    let conn = memory();
+                    let at = "2026-01-01T00:00:00+00:00";
+                    let input = PrepareContract {
+                        product_kind: kind,
+                        billing_model: model,
+                        price_minor: 100,
+                        trial_seconds: trial,
+                        trial_allowance_seconds: trial,
+                        ..monthly("funding-quote", false)
+                    };
+                    for credit in [0, 99] {
+                        if credit > 0 {
+                            credit_verified_topup_tx(
+                                &conn,
+                                "buyer",
+                                "partial",
+                                credit,
+                                "partial-receipt",
+                                at,
+                            )
+                            .unwrap();
+                        }
+                        let error = prepare_contract_tx(&conn, &input, at).unwrap_err();
+                        assert_eq!(error.code(), Some("MARKET_WALLET_REQUIRED"));
+                        assert_eq!(
+                            conn.query_row(
+                                "SELECT COUNT(*) FROM market_platform_contracts",
+                                [],
+                                |r| r.get::<_, i64>(0)
+                            )
+                            .unwrap(),
+                            0
+                        );
+                        assert_eq!(wallet_snapshot_tx(&conn, "buyer").unwrap().held_units, 0);
+                    }
+                    credit_verified_topup_tx(&conn, "buyer", "rest", 1, "rest-receipt", at)
+                        .unwrap();
+                    let id = prepare_contract_tx(&conn, &input, at).unwrap();
+                    let snapshot = wallet_snapshot_tx(&conn, "buyer").unwrap();
+                    assert_eq!(snapshot.posted_units, units_from_minor(100).unwrap());
+                    assert_eq!(
+                        snapshot.held_units,
+                        if trial == 0 {
+                            units_from_minor(100).unwrap()
+                        } else {
+                            0
+                        }
+                    );
+                    assert_eq!(prepare_contract_tx(&conn, &input, at).unwrap(), id);
+                    reconcile_wallet_tx(&conn, "buyer").unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn remaining_trial_uses_frozen_total_allowance_without_double_subtraction() {
+        let conn = memory();
+        let start = "2026-01-01T00:00:00+00:00";
+        let end = "2026-01-01T00:00:04+00:00";
+        credit_verified_topup_tx(&conn, "buyer", "initial", 1000, "receipt", start).unwrap();
+        let input = PrepareContract {
+            trial_seconds: 10,
+            trial_allowance_seconds: 10,
+            ..monthly("first", false)
+        };
+        let id = prepare_contract_tx(&conn, &input, start).unwrap();
+        activate_contract_tx(&conn, &id, start, start).unwrap();
+        advance_trial_interval_tx(&conn, &id, "share_control", "part", start, end, true, end)
+            .unwrap();
+        assert!(
+            terminate_after_cleanup_tx(&conn, &id, true, end)
+                .unwrap()
+                .finalized
+        );
+        assert_eq!(
+            trial_seconds_remaining_tx(&conn, "buyer", "provider", "share", "share-1", 10).unwrap(),
+            6
+        );
+        let second = PrepareContract {
+            product_ref: "subscription-2",
+            quote_id: "second",
+            trial_seconds: 7,
+            ..input
+        };
+        assert!(matches!(
+            prepare_contract_tx(&conn, &second, end),
+            Err(AppError::Conflict(_))
+        ));
+        let second = PrepareContract {
+            trial_seconds: 6,
+            ..second
+        };
+        let next = prepare_contract_tx(&conn, &second, end).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT trial_seconds_remaining FROM market_platform_contracts WHERE id=?1",
+                params![next],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            6
+        );
+        assert_eq!(wallet_snapshot_tx(&conn, "buyer").unwrap().held_units, 0);
+        reconcile_wallet_tx(&conn, "buyer").unwrap();
+    }
+
+    #[test]
+    fn trial_requires_balance_without_holding_it_and_detects_unfunded_conversion() {
         let conn = memory();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -4645,9 +4874,21 @@ mod tests {
         let end = "2026-01-01T00:00:15+00:00";
         let mut input = monthly("trial-quote", false);
         input.trial_seconds = 10;
+        credit_verified_topup_tx(&tx, "buyer", "initial", 1000, "initial-receipt", start).unwrap();
         let id = prepare_contract_tx(&tx, &input, start).unwrap();
         assert_eq!(wallet_snapshot_tx(&tx, "buyer").unwrap().held_units, 0);
         activate_contract_tx(&tx, &id, start, start).unwrap();
+        reserve_wallet_tx(
+            &tx,
+            "buyer",
+            "test",
+            "other-service",
+            "budget",
+            units_from_minor(1000).unwrap(),
+            None,
+            start,
+        )
+        .unwrap();
         let outage = advance_trial_interval_tx(
             &tx,
             &id,
@@ -4675,7 +4916,7 @@ mod tests {
             provider_summary_tx(&tx, "provider").unwrap().pending_units,
             0
         );
-        assert_eq!(wallet_snapshot_tx(&tx, "buyer").unwrap().posted_units, 0);
+        assert_eq!(wallet_snapshot_tx(&tx, "buyer").unwrap().available_units, 0);
         let status: String = tx
             .query_row(
                 "SELECT status FROM market_platform_contracts WHERE id = ?1",
@@ -4731,7 +4972,7 @@ mod tests {
     }
 
     #[test]
-    fn suspended_trial_resumes_only_when_funded_without_charging_the_gap_or_replaying() {
+    fn failed_trial_conversion_never_revives_after_a_late_topup() {
         for model in [BillingModel::CalendarMonth, BillingModel::Metered] {
             let conn = memory();
             let tx = conn
@@ -4743,11 +4984,25 @@ mod tests {
             let input = PrepareContract {
                 billing_model: model,
                 trial_seconds: 5,
+                trial_allowance_seconds: 5,
                 price_minor: 100,
                 ..monthly("funded-trial", false)
             };
+            credit_verified_topup_tx(&tx, "buyer", "initial", 100, "initial-receipt", start)
+                .unwrap();
             let id = prepare_contract_tx(&tx, &input, start).unwrap();
             activate_contract_tx(&tx, &id, start, start).unwrap();
+            reserve_wallet_tx(
+                &tx,
+                "buyer",
+                "test",
+                "other",
+                "budget",
+                units_from_minor(100).unwrap(),
+                None,
+                start,
+            )
+            .unwrap();
             assert!(
                 advance_trial_interval_tx(
                     &tx,
@@ -4764,56 +5019,41 @@ mod tests {
             );
             credit_verified_topup_tx(&tx, "buyer", "partial", 50, "partial-receipt", end).unwrap();
             assert!(!resume_suspended_contract_tx(&tx, &id, "2026-01-01T00:30:00+00:00").unwrap());
-            assert_eq!(wallet_snapshot_tx(&tx, "buyer").unwrap().held_units, 0);
+            assert_eq!(
+                wallet_snapshot_tx(&tx, "buyer").unwrap().held_units,
+                units_from_minor(100).unwrap()
+            );
             credit_verified_topup_tx(&tx, "buyer", "rest", 50, "rest-receipt", funded_at).unwrap();
-            assert!(resume_suspended_contract_tx(&tx, &id, funded_at).unwrap());
             assert!(!resume_suspended_contract_tx(&tx, &id, funded_at).unwrap());
-            let state: (String, String, String, String, Option<String>) = tx
+            assert!(
+                enforce_suspension_timeout_tx(&tx, &id, parse_time(funded_at).unwrap()).unwrap()
+            );
+            assert!(!resume_suspended_contract_tx(&tx, &id, funded_at).unwrap());
+            let state: (String, Option<String>, i64) = tx
                 .query_row(
-                    "SELECT status,paid_started_at,last_evaluated_at,health_fence_at,suspended_at
+                    "SELECT status,paid_started_at,trial_seconds_remaining
                  FROM market_platform_contracts WHERE id=?1",
                     params![id],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .unwrap();
-            assert_eq!(
-                state,
-                (
-                    "active".into(),
-                    funded_at.into(),
-                    funded_at.into(),
-                    funded_at.into(),
-                    None
-                )
-            );
+            assert_eq!(state, ("ending".into(), None, 0));
             assert_eq!(tx.query_row("SELECT COUNT(*) FROM market_notification_outbox WHERE object_id=?1 AND event_kind='contract_suspended'",params![id],|r|r.get::<_,i64>(0)).unwrap(),1);
-            assert_eq!(tx.query_row("SELECT COUNT(*) FROM market_notification_outbox WHERE object_id=?1 AND event_kind='contract_resumed'",params![id],|r|r.get::<_,i64>(0)).unwrap(),1);
-            if matches!(model, BillingModel::CalendarMonth) {
-                assert_eq!(
-                    tx.query_row(
-                        "SELECT period_start FROM market_platform_periods WHERE contract_id=?1",
-                        params![id],
-                        |r| r.get::<_, String>(0)
-                    )
-                    .unwrap(),
-                    funded_at
-                );
-                assert_eq!(wallet_snapshot_tx(&tx, "buyer").unwrap().posted_units, 0);
-            } else {
-                assert_eq!(
-                    wallet_snapshot_tx(&tx, "buyer").unwrap().held_units,
-                    units_from_minor(100).unwrap()
-                );
-                assert_eq!(
-                    tx.query_row(
-                        "SELECT budget_sequence FROM market_platform_contracts WHERE id=?1",
-                        params![id],
-                        |r| r.get::<_, i64>(0)
-                    )
-                    .unwrap(),
-                    1
-                );
-            }
+            assert_eq!(tx.query_row("SELECT COUNT(*) FROM market_notification_outbox WHERE object_id=?1 AND event_kind='contract_resumed'",params![id],|r|r.get::<_,i64>(0)).unwrap(),0);
+            assert_eq!(
+                tx.query_row(
+                    "SELECT COUNT(*) FROM market_platform_periods WHERE contract_id=?1",
+                    params![id],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+            assert!(
+                terminate_after_cleanup_tx(&tx, &id, true, funded_at)
+                    .unwrap()
+                    .finalized
+            );
             assert_eq!(
                 provider_summary_tx(&tx, "provider").unwrap().pending_units,
                 0
@@ -4876,7 +5116,7 @@ mod tests {
     }
 
     #[test]
-    fn client_trial_worker_preserves_pause_and_reaches_warning_and_termination() {
+    fn client_trial_worker_dispatches_immediate_cleanup_in_the_conversion_pass() {
         let conn = memory();
         let start = "2026-01-01T00:00:00+00:00";
         let end = parse_time(start).unwrap() + chrono::Duration::seconds(5);
@@ -4897,8 +5137,23 @@ mod tests {
         conn.execute("INSERT INTO installation_health_checks(installation_id,checked_at,is_healthy,status,reason) VALUES('installation-1',?1,1,'healthy','route_healthy')",params![end.timestamp()]).unwrap();
         let actions = reconcile_platform_contracts_tx(&conn, end).unwrap();
         assert_eq!(actions.len(), 1);
-        assert_eq!(actions[0].kind, PlatformControlKind::Suspend);
-        conn.execute("UPDATE client_market_subscriptions SET status='billing_suspended' WHERE installation_id='installation-1'",[]).unwrap();
+        assert_eq!(actions[0].kind, PlatformControlKind::Terminate);
+        assert_eq!(actions[0].service_ref, "installation-1");
+        assert_eq!(
+            conn.query_row(
+                "SELECT status FROM market_platform_contracts WHERE id=?1",
+                params![id],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "ending"
+        );
+        // Dispatch may be retried until cleanup has actually started. Never
+        // advertise the subscription as released before confirmed cleanup.
+        let repeated = reconcile_platform_contracts_tx(&conn, end).unwrap();
+        assert_eq!(repeated.len(), 1);
+        assert_eq!(repeated[0].kind, PlatformControlKind::Terminate);
+        conn.execute("UPDATE client_market_subscriptions SET status='releasing' WHERE installation_id='installation-1'",[]).unwrap();
         for tick in 1..=120 {
             assert!(
                 reconcile_platform_contracts_tx(&conn, end + chrono::Duration::seconds(tick * 5))
@@ -4906,38 +5161,24 @@ mod tests {
                     .is_empty()
             );
         }
-        let suspended: String = conn
+        let suspended: Option<String> = conn
             .query_row(
                 "SELECT suspended_at FROM market_platform_contracts WHERE id=?1",
                 params![id],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(parse_time(&suspended).unwrap(), end);
-        assert_eq!(conn.query_row("SELECT COUNT(*) FROM market_notification_outbox WHERE object_id=?1 AND event_kind='contract_suspended'",params![id],|r|r.get::<_,i64>(0)).unwrap(),1);
-        for offset in [0, 5] {
-            assert!(
-                reconcile_platform_contracts_tx(
-                    &conn,
-                    end + chrono::Duration::days(5) + chrono::Duration::seconds(offset)
-                )
-                .unwrap()
-                .is_empty()
-            );
-        }
-        assert_eq!(conn.query_row("SELECT COUNT(*) FROM market_notification_outbox WHERE object_id=?1 AND event_kind='contract_terminating_soon'",params![id],|r|r.get::<_,i64>(0)).unwrap(),1);
         assert!(
-            reconcile_platform_contracts_tx(&conn, end + chrono::Duration::days(7))
-                .unwrap()
-                .is_empty()
+            suspended.is_none(),
+            "ending contracts no longer carry a suspension clock"
         );
-        let actions = reconcile_platform_contracts_tx(
-            &conn,
-            end + chrono::Duration::days(7) + chrono::Duration::seconds(5),
-        )
-        .unwrap();
-        assert_eq!(actions.len(), 1);
-        assert_eq!(actions[0].kind, PlatformControlKind::Terminate);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM market_notification_outbox WHERE object_id=?1 AND event_kind='contract_suspended'",params![id],|r|r.get::<_,i64>(0)).unwrap(),1);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM market_notification_outbox WHERE object_id=?1 AND event_kind='contract_terminating_soon'",params![id],|r|r.get::<_,i64>(0)).unwrap(),0);
+        assert!(
+            terminate_after_cleanup_tx(&conn, &id, true, &end.to_rfc3339())
+                .unwrap()
+                .finalized
+        );
         reconcile_wallet_tx(&conn, "buyer").unwrap();
     }
 
@@ -5256,6 +5497,7 @@ mod tests {
                 price_minor: 100,
                 auto_renew: false,
                 trial_seconds: 0,
+                trial_allowance_seconds: 0,
             },
             start,
         )
@@ -5391,6 +5633,7 @@ mod tests {
                 price_minor: 100,
                 auto_renew: false,
                 trial_seconds: 0,
+                trial_allowance_seconds: 0,
             },
             start,
         )
@@ -5459,6 +5702,7 @@ mod tests {
                 price_minor: 100,
                 auto_renew: false,
                 trial_seconds: 0,
+                trial_allowance_seconds: 0,
             },
             start,
         )

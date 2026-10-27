@@ -62,6 +62,7 @@ export function shareMarketMutationError(reason: unknown, t: MarketTranslate) {
 
     DATABASE_UNAVAILABLE: "shareMarket.error.temporarilyUnavailable",
     share_market_client_upgrade_required: "shareMarket.error.clientUpgradeRequired",
+    share_market_trial_upgrade_required: "marketTrial.upgradeRequired",
     share_market_share_tokens_exhausted: "shareMarket.error.shareTokensExhausted",
     share_market_share_offline: "shareMarket.error.shareOffline",
     share_market_share_expired: "shareMarket.error.shareExpired",

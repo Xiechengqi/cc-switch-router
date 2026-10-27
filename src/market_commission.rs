@@ -583,6 +583,7 @@ mod tests {
                 price_minor: 1000,
                 auto_renew: model == BillingModel::CalendarMonth,
                 trial_seconds,
+                trial_allowance_seconds: trial_seconds,
             },
             START,
         )
@@ -1380,6 +1381,7 @@ mod tests {
                 price_minor: 1000,
                 auto_renew: true,
                 trial_seconds: 0,
+                trial_allowance_seconds: 0,
             },
             &start,
         )

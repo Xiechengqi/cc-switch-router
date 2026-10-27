@@ -5,6 +5,16 @@ use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Utc};
 
 pub const DEFAULT_TRIAL_HOURS: i64 = 12;
 pub const TRIAL_SECONDS: i64 = DEFAULT_TRIAL_HOURS * 3_600;
+pub(crate) const MAX_CLIENT_TRIAL_HOURS: i64 = 720;
+
+pub(crate) fn validate_client_trial_hours(hours: Option<i64>) -> Result<Option<i64>, AppError> {
+    if hours.is_some_and(|hours| !(0..=MAX_CLIENT_TRIAL_HOURS).contains(&hours)) {
+        return Err(AppError::BadRequest(
+            "Client trial hours must be between 0 and 720".into(),
+        ));
+    }
+    Ok(hours)
+}
 pub(crate) const MARKET_CURRENCY: &str = "USD";
 pub(crate) const MONEY_UNITS_PER_MINOR: i64 = 86_400;
 pub(crate) const MAX_DAILY_RATE_MINOR: i64 = 100_000_000;

@@ -636,6 +636,9 @@ try {
   let policy = { version: 1, maintenanceFeeBps: 500, transfersEnabled: true,
     transfersPaused: false, transferMaxMinor: 500_000, transferDailyMaxMinor: 500_000,
     balanceRefundable: false, canEdit: true };
+  let trialPolicy = { version: 1, clientHours: 12, shareHours: 12, shareTokens: 1_000_000, canEdit: true };
+  let trialWrites = 0;
+  let conflictTrial = false;
   let policyWrites = 0;
   let conflictPolicy = false;
   let commissionPolicy = { version: 1, current: { policyVersion: 1, rateBps: 1000, effectiveAt: "2026-01-01T00:00:00Z" }, scheduled: null, increaseNoticeDays: 7, canEdit: true };
@@ -669,6 +672,21 @@ try {
     else if (path === "/v1/admin/market-finance/c2c/policy") data = { policy: { version: 1, enabled: false,
       admissionMinor: 10000, minMinor: 100, maxMinor: 500000, paymentMinutes: 30 }, canManage: true, canResolve: true, };
     else if (path === "/v1/admin/market-finance/c2c/orders" || path === "/v1/admin/market-finance/c2c/sellers") data = { items: [], next: null };
+    else if (path === "/v1/admin/market/trial-policy") {
+      if (route.request().method() === "PUT") {
+        trialWrites += 1;
+        const input = route.request().postDataJSON();
+        assert.deepEqual(Object.keys(input).sort(), ["clientHours", "expectedVersion", "shareHours", "shareTokens"]);
+        assert.equal(input.expectedVersion, trialPolicy.version);
+        if (conflictTrial) {
+          conflictTrial = false;
+          trialPolicy = { ...trialPolicy, version: trialPolicy.version + 1, shareHours: 6 };
+          return route.fulfill({ status: 409, contentType: "application/json", body: JSON.stringify({ message: "trial policy changed" }) });
+        }
+        trialPolicy = { ...trialPolicy, ...input, version: trialPolicy.version + 1 };
+      }
+      data = trialPolicy;
+    }
     else if (path === "/v1/admin/market-finance/commission-policy") {
       if (route.request().method() === "PUT") {
         commissionWrites += 1;
@@ -694,6 +712,7 @@ try {
         const input = route.request().postDataJSON();
         assert.equal(input.expectedVersion, policy.version);
         assert.equal(input.maintenanceFeeBps, conflictPolicy ? 600 : 525);
+        assert.equal(input.defaultClientTrialHours, undefined, "trial policy is independent from wallet fees");
         assert.equal(input.canEdit, undefined);
         assert.equal(input.balanceRefundable, undefined);
         assert.equal(input.earningsConversionsPaused, undefined);
@@ -714,10 +733,30 @@ try {
   await page.getByRole("tab", { name: "Platform wallet", exact: true }).click();
   const policyPanel = page.locator("section").filter({ has: page.getByRole("heading", { name: "Balance & transfers", exact: true }) }).last();
   const feeInput = policyPanel.getByLabel("Top-up maintenance fee (%)", { exact: true });
+  const trialPanel = page.locator("section").filter({ has: page.getByRole("heading", { name: "Market trial rules", exact: true }) }).last();
+  const trialInput = trialPanel.getByLabel("Default Client trial (hours)", { exact: true });
+  assert.equal(await trialInput.inputValue(), "12");
+  await trialInput.fill("0");
+  await trialPanel.getByLabel("Default Share trial Tokens (M)", { exact: true }).fill("0");
+  await trialPanel.getByRole("button", { name: "Save", exact: true }).click();
+  await trialPanel.getByRole("status").filter({ hasText: /Saved/ }).waitFor();
+  assert.equal(trialWrites, 1);
+  assert.equal(trialPolicy.clientHours, 0);
+  assert.equal(trialPolicy.shareTokens, 0);
+  assert.equal(policyWrites, 0, "trial edits must not change the wallet fee version");
+  conflictTrial = true;
+  await trialPanel.getByLabel("Default Share trial (hours)", { exact: true }).fill("24");
+  await trialPanel.getByRole("button", { name: "Save", exact: true }).click();
+  await trialPanel.getByRole("alert").filter({ hasText: /changed elsewhere/ }).waitFor();
+  assert.equal(await trialPanel.getByRole("button", { name: "Save", exact: true }).isEnabled(), false);
+  await trialPanel.getByRole("button", { name: "Refresh", exact: true }).click();
+  await page.waitForFunction(() => document.querySelector('input[aria-label="Default Share trial (hours)"]')?.value === "6");
   await feeInput.fill("5.25");
   await policyPanel.getByRole("button", { name: "Save", exact: true }).click();
   await policyPanel.getByRole("status").filter({ hasText: /Saved/ }).waitFor();
   assert.equal(policyWrites, 1);
+  assert.equal(trialPolicy.clientHours, 0);
+  assert.equal(await trialInput.inputValue(), "0");
   conflictPolicy = true;
   await feeInput.fill("6");
   assert.equal(await policyPanel.getByRole("status").count(), 0, "editing clears stale saved feedback");

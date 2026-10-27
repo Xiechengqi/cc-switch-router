@@ -11,8 +11,10 @@ import { updateClientMarketHostOffer } from "@/lib/api";
 import { DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH } from "@/lib/dashboard-nav";
 import { MARKET_CURRENCY } from "@/lib/market-money";
 import type { ClientMarketHost } from "@/lib/types";
+import { ClientTrialInput } from "./client-trial-input";
 import {
   parseFreeDurationDays,
+  parseClientTrialHours,
   parseHostOffer,
 } from "@/components/dashboard/client-market/host-utils";
 
@@ -43,6 +45,7 @@ export function HostOfferDialog({
     String(host.freeDurationDays ?? 1),
   );
   const [busy, setBusy] = React.useState(false);
+  const [trialHours, setTrialHours] = React.useState(String(host.trialHours ?? ""));
   const [error, setError] = React.useState("");
   const paidReadiness = usePaidOfferReadiness(open && pricing === "paid");
   const paidOfferLoading = paidReadiness.status === "idle" ||
@@ -60,18 +63,20 @@ export function HostOfferDialog({
     );
     setFreeDurationMode(host.freeDurationDays == null ? "permanent" : "fixed");
     setFreeDurationDays(String(host.freeDurationDays ?? 1));
+    setTrialHours(String(host.trialHours ?? ""));
     setError("");
-  }, [host.cyclePriceMinor, host.dailyRateMinor, host.freeDurationDays, open]);
+  }, [host.cyclePriceMinor, host.dailyRateMinor, host.freeDurationDays, host.trialHours, open]);
 
   const save = async () => {
     let offer: {
       cyclePriceMinor?: number;
       currency?: string;
       freeDurationDays?: number;
+      trialHours?: number | null;
     };
     try {
       offer = pricing === "paid"
-        ? parseHostOffer(price, t)
+        ? { ...parseHostOffer(price, t), trialHours: parseClientTrialHours(trialHours) }
         : {
             freeDurationDays:
               freeDurationMode === "fixed"
@@ -79,7 +84,8 @@ export function HostOfferDialog({
                 : undefined,
           };
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(reason instanceof Error && reason.message === "invalid_client_trial_hours"
+        ? t("clientMarket.trialInvalid") : reason instanceof Error ? reason.message : String(reason));
       return;
     }
     if (pricing === "paid" && (!offer.cyclePriceMinor || !paidOfferReady)) {
@@ -180,6 +186,7 @@ export function HostOfferDialog({
               </div>
             )}
             {pricing === "paid" ? <ProviderCommissionPreview price={price} /> : null}
+            {pricing === "paid" ? <ClientTrialInput value={trialHours} onChange={setTrialHours} disabled={busy} defaultHours={host.defaultTrialHours} /> : null}
             {error ? <p className="text-sm text-rose-600">{error}</p> : null}
           </Modal.Body>
           <Modal.Footer>

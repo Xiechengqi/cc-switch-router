@@ -41,6 +41,8 @@ mod market_provider_rank;
 mod market_providers;
 mod market_reconcile;
 mod market_service_disputes;
+mod market_share_trials;
+mod market_trial_policy;
 mod market_wallet;
 mod market_wallet_policy;
 mod market_wallet_transfers;

@@ -2169,6 +2169,8 @@ export type ClientMarketHost = {
   billingInterval?: MarketBillingInterval;
   currency?: "USD";
   freeDurationDays?: number;
+  trialHours?: number | null;
+  defaultTrialHours?: number;
   offerRevision: number;
 
   contacts?: ProviderContact[];
@@ -2601,6 +2603,7 @@ export type ClientMarketHostTransferDocument = {
     billingInterval?: MarketBillingInterval;
     currency?: "USD";
     freeDurationDays?: number;
+    trialHours?: number;
     expectedFingerprint?: string;
     informationalStatus?: string;
   }>;
@@ -2649,6 +2652,7 @@ export type ShareMarketSeatInput = {
 };
 
 export type ShareMarketSubscription = {
+  trial?: { phase: "trial" | "activating" | "paid" | "revoking"; tokenAllowance: number; tokensUsed: number; tokensRemaining: number | null; endReason?: string };
   id: string;
   seatId: string;
   listingId: string;
@@ -2701,6 +2705,8 @@ export type ShareMarketSubscription = {
 };
 
 export type ShareMarketSeat = ShareMarketSeatInput & {
+  trialHoursOverride?: number | null;
+  trialTokenLimitOverride?: number | null;
   id: string;
   position: number;
   status: string;
@@ -2882,6 +2888,7 @@ export type ShareMarketRentQuote = {
     serviceDurationDays?: number;
     trialHours?: number;
     trialTokenLimit?: number;
+    trial?: { version: number; policyVersion: number; hoursInherited: boolean; tokensInherited: boolean; tokenAllowance: number; tokenBudget: number };
     offerRevision: number;
     service: ShareMarketRentService;
   };

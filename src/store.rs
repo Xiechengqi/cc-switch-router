@@ -3583,7 +3583,7 @@ impl AppStore {
             ok: true,
             server_time: now,
             share_contract_version: SHARE_CONTRACT_VERSION,
-            capabilities: vec!["accountResetV1".into()],
+            capabilities: vec!["accountResetV1".into(), "marketTrialV1".into()],
         })
     }
 
@@ -15790,6 +15790,52 @@ fn validate_strict_share_descriptor_tx(
 }
 
 fn validate_share_descriptor_bindings(share: &ShareDescriptor) -> Result<(), AppError> {
+    if !share.market_entitlements.is_empty()
+        && share.contract_version < crate::models::SHARE_TRIAL_CONTRACT_VERSION
+    {
+        return Err(AppError::BadRequest(
+            "market trial states require Share contract v9".into(),
+        ));
+    }
+    for (id, state) in &share.market_entitlements {
+        if id.is_empty()
+            || id.len() > 128
+            || state.trial_scope_id.is_empty()
+            || state.trial_scope_id.len() > 128
+            || state.email.trim() != state.email
+            || state.email != state.email.to_ascii_lowercase()
+            || !state.email.contains('@')
+            || state.trial_tokens_used > crate::market_trial_policy::MAX_TOKENS
+            || state.usage_revision > i64::MAX as u64
+            || state.applied_at_ms <= 0
+            || state.trial_token_limit.is_some() != state.trial_token_allowance.is_some()
+            || state
+                .trial_token_limit
+                .zip(state.trial_token_allowance)
+                .is_some_and(|(budget, total)| {
+                    budget == 0 || budget > total || total > crate::market_trial_policy::MAX_TOKENS
+                })
+            || (state.phase == crate::models::ShareMarketPhase::Paid
+                && state.paid_started_at_ms.is_none_or(|at| at <= 0))
+            || (state.phase == crate::models::ShareMarketPhase::Trial
+                && state.paid_started_at_ms.is_some())
+        {
+            return Err(AppError::BadRequest(
+                "invalid market trial identity, budget or phase receipt".into(),
+            ));
+        }
+        if state.active
+            && !share.user_grants.get(&state.email).is_some_and(|grant| {
+                grant.active
+                    && grant.manager == crate::models::ShareGrantManager::RouterShareMarket
+                    && grant.entitlement_id.as_deref() == Some(id.as_str())
+            })
+        {
+            return Err(AppError::BadRequest(
+                "active market trial has no matching managed grant".into(),
+            ));
+        }
+    }
     if share.capacity_pool_id.trim().is_empty() || share.capacity_pool_id.len() > 128 {
         return Err(AppError::BadRequest(
             "share capacityPoolId must be a non-empty identifier of at most 128 bytes".into(),
@@ -16340,6 +16386,21 @@ fn upsert_share_tx(
     )
     .map_err(map_share_constraint_error)?;
     if share_changed > 0 {
+        conn.execute(
+            "UPDATE shares SET market_entitlements_json = ?2 WHERE share_id = ?1",
+            params![
+                chat_share_id,
+                serde_json::to_string(&share.market_entitlements)
+                    .map_err(|e| AppError::Internal(e.to_string()))?
+            ],
+        )
+        .map_err(|e| AppError::Internal(format!("save market trial evidence: {e}")))?;
+        crate::market_share_trials::observe_share_tx(
+            conn,
+            &chat_share_id,
+            &share.market_entitlements,
+            &Utc::now().to_rfc3339(),
+        )?;
         commit_account_quota_stream(conn, &share)?;
         conn.execute(
             "DELETE FROM share_bindings WHERE share_id = ?1",
@@ -21609,7 +21670,7 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppE
                     COALESCE(s.previous_response_cache_enabled, 0), COALESCE(s.free_access, 0),
                     COALESCE(s.grok_image_generation_enabled, 0),
                     COALESCE(s.grok_image_edit_enabled, 0),
-                    COALESCE(s.grok_video_generation_enabled, 0)
+                    COALESCE(s.grok_video_generation_enabled, 0), s.market_entitlements_json
              FROM shares s
              INNER JOIN installations i ON i.id = s.installation_id
              WHERE i.lifecycle = 'active'
@@ -21664,6 +21725,8 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppE
                     descriptor_generation: row.get::<_, i64>(26)?.max(0) as u64,
                     descriptor_fingerprint: row.get(27)?,
                     user_grants: parse_share_user_grants(row.get(23)?)?,
+                    market_entitlements: serde_json::from_str(&row.get::<_, String>(37)?)
+                        .unwrap_or_default(),
                     supported_user_token_periods: parse_supported_user_token_periods(
                         &row.get::<_, String>(24)?,
                     ),
@@ -33804,6 +33867,7 @@ pub(crate) mod tests {
             descriptor_generation: 0,
             descriptor_fingerprint: String::new(),
             user_grants: BTreeMap::new(),
+            market_entitlements: BTreeMap::new(),
             supported_user_token_periods: legacy_supported_user_token_periods(),
         }
     }
@@ -38384,19 +38448,19 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn share_contract_v8_keeps_v6_v7_compatible_and_rejects_future_versions() {
-        for version in [6, 7, 8] {
+    fn share_contract_v9_keeps_v6_v7_v8_compatible_and_rejects_future_versions() {
+        for version in [6, 7, 8, 9] {
             let mut descriptor = test_share_descriptor("share-readable", "share-readable-sub");
             descriptor.contract_version = version;
             normalize_share_descriptor_fields(&mut descriptor)
-                .expect("v6/v7/v8 descriptors remain readable");
+                .expect("v6/v7/v8/v9 descriptors remain readable");
         }
 
         let mut future = test_share_descriptor("share-future", "share-future-sub");
         future.contract_version = SHARE_CONTRACT_VERSION + 1;
         let error = normalize_share_descriptor_fields(&mut future)
             .expect_err("future Share contract must fail closed");
-        assert!(error.to_string().contains("expected 2..=8"));
+        assert!(error.to_string().contains("expected 2..=9"));
     }
 
     #[test]
@@ -45640,6 +45704,7 @@ pub(crate) mod tests {
             descriptor_generation: 0,
             descriptor_fingerprint: String::new(),
             user_grants: BTreeMap::new(),
+            market_entitlements: BTreeMap::new(),
             supported_user_token_periods: legacy_supported_user_token_periods(),
         };
 
@@ -46512,6 +46577,7 @@ pub(crate) mod tests {
             descriptor_generation: 0,
             descriptor_fingerprint: String::new(),
             user_grants: BTreeMap::new(),
+            market_entitlements: BTreeMap::new(),
             supported_user_token_periods: legacy_supported_user_token_periods(),
         };
         let claim = share_claim_payload(&share);
@@ -46611,6 +46677,7 @@ pub(crate) mod tests {
             descriptor_generation: 0,
             descriptor_fingerprint: String::new(),
             user_grants: BTreeMap::new(),
+            market_entitlements: BTreeMap::new(),
             supported_user_token_periods: legacy_supported_user_token_periods(),
         };
         let claim = ShareClaimPayload {
@@ -46706,6 +46773,7 @@ pub(crate) mod tests {
             descriptor_generation: 0,
             descriptor_fingerprint: String::new(),
             user_grants: BTreeMap::new(),
+            market_entitlements: BTreeMap::new(),
             supported_user_token_periods: legacy_supported_user_token_periods(),
         };
 
@@ -46838,6 +46906,7 @@ pub(crate) mod tests {
             descriptor_generation: 0,
             descriptor_fingerprint: String::new(),
             user_grants: BTreeMap::new(),
+            market_entitlements: BTreeMap::new(),
             supported_user_token_periods: legacy_supported_user_token_periods(),
         };
 
@@ -47113,6 +47182,7 @@ pub(crate) mod tests {
             descriptor_generation: 0,
             descriptor_fingerprint: String::new(),
             user_grants: BTreeMap::new(),
+            market_entitlements: BTreeMap::new(),
             supported_user_token_periods: legacy_supported_user_token_periods(),
         };
 
@@ -47230,6 +47300,7 @@ pub(crate) mod tests {
             descriptor_generation: 0,
             descriptor_fingerprint: String::new(),
             user_grants: BTreeMap::new(),
+            market_entitlements: BTreeMap::new(),
             supported_user_token_periods: legacy_supported_user_token_periods(),
         };
         let ops = vec![ShareSyncOperation {

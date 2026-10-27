@@ -228,7 +228,12 @@ export function ClientCheckoutForm({
               )}
             </strong>
           </div>
-          {!state.trial ? (
+          {state.trial ? (
+            <div className="flex items-baseline justify-between gap-3">
+              <span>{t("clientCheckout.requiredBalance")}</span>
+              <strong className="break-all text-right tabular-nums">{formatWalletUnits(quote.walletFunding.requiredUnits, "$", locale)}</strong>
+            </div>
+          ) : (
             <>
               <div className="flex items-baseline justify-between gap-3">
                 <span>{t("clientCheckout.reservedNow")}</span>
@@ -244,7 +249,7 @@ export function ClientCheckoutForm({
                 {t("clientCheckout.captureHint")}
               </p>
             </>
-          ) : null}
+          )}
           {BigInt(quote.walletFunding.committedUnits || "0") > 0n ? (
             <details className="text-xs text-muted-foreground">
               <summary className="cursor-pointer">

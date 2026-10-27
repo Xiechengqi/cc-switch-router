@@ -966,6 +966,7 @@ mod tests {
                 price_minor: 1000,
                 auto_renew: false,
                 trial_seconds: 0,
+                trial_allowance_seconds: 0,
             },
             START,
         )
@@ -1606,6 +1607,7 @@ mod tests {
                     price_minor: 100,
                     auto_renew: false,
                     trial_seconds: 0,
+                    trial_allowance_seconds: 0,
                 },
                 AT,
             )

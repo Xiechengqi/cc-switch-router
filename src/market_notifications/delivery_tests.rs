@@ -740,6 +740,7 @@ fn grouped_funding_reminders_recheck_current_wallet_and_current_contracts() {
                 price_minor: 1000,
                 auto_renew: true,
                 trial_seconds: 0,
+                trial_allowance_seconds: 0,
             },
             start,
         )

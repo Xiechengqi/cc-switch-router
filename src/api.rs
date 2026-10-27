@@ -298,6 +298,7 @@ pub fn router(state: ServerState) -> Router {
         .merge(crate::market_notifications::router())
         .merge(crate::market_provider_finance::router())
         .merge(crate::market_wallet_policy::router())
+        .merge(crate::market_trial_policy::router())
         .merge(crate::market_commission::router())
         .merge(crate::market_wallet_transfers::router())
         .merge(crate::market_earning_conversions::router())

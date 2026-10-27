@@ -187,9 +187,11 @@ Router 不接受长效 SSH 凭据。每次建链前 Server 申请一次性 lease
 
 `ShareDescriptor` 面向全新部署时必须满足以下约束:
 
-- Router 当前 reader 支持 **Share Contract v2..v8**。Server 普通未协商 descriptor 保持 **Share Contract v7**；账号周期 v8 须显式能力。v4 引入本节 `modelProbe`（Router 仅对 v4 以上执行探针），v5 引入 Grok 媒体权限，v6 增加 scoped quota metadata，v7 增加只展示的 `unobservedTiers` 及 Codex `bankedReset`；它们不参与调度/限流/容量评分。连接测试/模型健康检查保留 v7 兼容。
+- Router 当前 reader 支持 **Share Contract v2..v9**。Server 普通未协商 descriptor 保持 **Share Contract v7**；账号周期 v8、一次性市场试用 v9 须显式能力。v4 引入本节 `modelProbe`（Router 仅对 v4 以上执行探针），v5 引入 Grok 媒体权限，v6 增加 scoped quota metadata，v7 增加只展示的 `unobservedTiers` 及 Codex `bankedReset`；它们不参与调度/限流/容量评分。连接测试/模型健康检查保留 v7 兼容。
 - Share Market 最低版本仍为 v5（`MIN_SHARE_MARKET_CONTRACT_VERSION=5`），不因账号周期的协商扩展抬高。reader 上限、普通 descriptor 版本与市场最低版本是三项独立约束。
-- v8增加`tokenPeriod=accountReset`及userGrants只读`accountQuotaCycle/accountResetCapability/accountUsageBaseline`、`usageQuota.usageWatermark`。安装heartbeat响应同时返回`shareContractVersion=8,capabilities=["accountResetV1"]`；Server同时检查显式能力、Router URL/installation绑定和300秒有效期。普通v7必须省略新嵌套字段，v7携带accountReset/新字段拒绝，不能静默转换为sevenDays；市场报价不开放动态周期。
+- v8增加`tokenPeriod=accountReset`及userGrants只读`accountQuotaCycle/accountResetCapability/accountUsageBaseline`、`usageQuota.usageWatermark`。安装heartbeat响应同时返回`shareContractVersion=9,capabilities=["accountResetV1","marketTrialV1"]`；Server同时检查显式能力、Router URL/installation绑定和300秒有效期。普通v7必须省略新嵌套字段，v7携带accountReset/新字段拒绝，不能静默转换为sevenDays；市场报价不开放动态周期。
+- v9 的 `marketEntitlements` 按 entitlement ID 返回 `trialScopeId/email/phase/active/trialTokenAllowance/trialTokenLimit/trialTokensUsed/usageRevision/usageUncertain/appliedAtMs/paidStartedAtMs`。`phase=trial|paid`，Token cap 缺省表示仅时长试用，不能写普通 `tokenLimit:0`。试用累计数和修订只增不减，与普通日／周／月 quota 分开；使用量变化不提升静态 descriptor generation。完整 descriptor 的 Notify＋周期重放持续携带动态试用水位。v9 以下不得携带非空试用状态。
+- managed upsert 可附 `marketPhase/trialScopeId/trialTokenAllowance/trialTokenLimit`；revoke 不附这些字段。相同 entitlement 不得改变 scope、重新赋予试用或增加原始预算。Server 在转发前持久化请求所属 entitlement 和 phase，迟到试用用量不能计入正式额度。正式授权回执确认后 Router 才从预留款捕获首期费用；失败或未知回执先撤权，确认清理后才释放预留。`usageUncertain` 表示崩溃等情况下消费不能证明完整，须安全回收，不能当作零用量续试。
 - `accountQuotaCycle`包含`streamIncarnation/sourceRef/sourceEpoch/bucketId/cycleId/cycleSequence/cycleRevision/startsAtMs/endsAtMs/basis/observedAtMs/eventId`，UTC毫秒半开区间，end可空。缺完整历史时`usageQuota=null`而非0；Router不按本机时间外推窗口，不把本地历史加回Server权威账号quota，不用跨周期max。
 - 动态账号投影不改变管理员configRevision/静态descriptor generation/fingerprint。当前复用完整descriptor同步及ACK，Server Notify+30秒重放，**没有独立dynamic envelope或精确usageWatermark ACK**。先检查stream/source/epoch，再按cycleSequence、同cycle revision和usageWatermark合并；合法更高水位允许数值下降，旧周期/旧水位丢弃。source交接要求更新config revision；新stream完整descriptor为restore握手，允许合法静态版本从旧备份恢复，旧stream在Share级永久retire，不能随用户删除/新增复活。
 - `schema/0088_account_quota_projection.sql`追加nullable历史`started_at_ms/quota_source_ref/quota_source_epoch/quota_bucket_id`和active/retired stream表。旧created_at秒级日志保持unknown provenance，不乘1000伪造精确。请求日志wire新增可选`startedAtMs/quotaAttribution`；账号用量仍以Server投影为权威。
@@ -352,7 +354,7 @@ Server 要求:
 ### Client Market 钱包购买与展示契约
 
 - `POST /v1/client-market/quotes` 的每项返回 `trialSecondsRemaining`（实际剩余健康服务秒数）；`walletFunding` 的金额字段使用整数单位字符串，`fundingRail=platform_wallet` 才可进入新的付费购买界面。免费报价可无钱包字段。报价只预留资源，不冻结用户资金。
-- `POST /v1/client-market/quotes/:id/commit` 保留报价修订校验与幂等键；试用不预留资金，非试用在提交事务中预留当期金额。资金竞争返回 `409 / MARKET_WALLET_REQUIRED` 及资金摘要，调用方保留草稿、重新报价并由用户确认。网络错误或结果未知时重试同一请求及幂等键，不能换单重建。
+- `POST /v1/client-market/quotes/:id/commit` 保留报价修订校验与幂等键；所有付费订单（含试用）须有完整首期可用余额，试用不预留资金，非试用在提交事务中预留当期金额。资金竞争返回 `409 / MARKET_WALLET_REQUIRED` 及资金摘要，调用方保留草稿、重新报价并由用户确认。网络错误或结果未知时重试同一请求及幂等键，不能换单重建。
 - Client 租约读取接口向租客返回可选 `walletContract`：`id`、`status`、`trialSecondsRemaining`、`renewalPolicy`、`periodEnd`；不向 Host Provider 暴露买家私有合同投影。试用没有确定的墙钟结束时间。独立的 `walletContractId` 仍仅用于已开始付费的争议入口，不用于判断试用合同是否存在。
 - `GET/PUT /v1/market-wallet/contracts/:id/renewal` 为买家专属月租管理接口，读取包含剩余试用；更新携带 `expectedPolicy` 防止覆盖其他会话的修改。
 - 商品页不展示 Provider 收款方式；平台充值渠道只在钱包充值流程出现。充值返回时重新报价，不自动购买；密码不得通过 URL 或持久化草稿传递。

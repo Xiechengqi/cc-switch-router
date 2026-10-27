@@ -29,15 +29,15 @@ const quote: ClientMarketAllocationQuote = {
   ],
   walletFunding: {
     assetCode: "USD",
-    availableUnits: "0",
+    availableUnits: "86400000",
     heldUnits: "0",
     committedUnits: "0",
-    requiredUnits: "0",
+    requiredUnits: "86400000",
     shortfallUnits: "0",
   },
 };
 
-test("trial uses actual remaining allowance, while exhausted trials require wallet funds", () => {
+test("trial defers payment but still requires the first-period balance", () => {
   assert.deepEqual(clientCheckoutState(quote), {
     paid: true,
     trial: true,
@@ -49,6 +49,7 @@ test("trial uses actual remaining allowance, while exhausted trials require wall
     items: quote.items.map((item) => ({ ...item, trialSecondsRemaining: 0 })),
     walletFunding: {
       ...quote.walletFunding!,
+      availableUnits: "0",
       requiredUnits: "86400000",
       shortfallUnits: "86400000",
     },
@@ -60,6 +61,8 @@ test("trial uses actual remaining allowance, while exhausted trials require wall
     shortfall: true,
   });
   assert.equal(trialHours(1, "en"), "0.01");
+  assert.equal(clientCheckoutState({ ...quote, walletFunding: { ...quote.walletFunding!, availableUnits: "0", shortfallUnits: "86400000" } }).shortfall, true);
+  assert.equal(clientCheckoutState({ ...quote, walletFunding: { ...quote.walletFunding!, requiredUnits: "0" } }).unsupported, true);
 });
 
 test("missing wallet or trial contract cannot fall back to provider payment", () => {

@@ -1,5 +1,6 @@
 "use client";
 import { walletLifecycleKey, walletReleaseScheduled, trialHours } from "@/lib/client-checkout";
+import { shareTrialSummary } from "@/lib/share-trial";
 
 import * as React from "react";
 import Link from "next/link";
@@ -83,10 +84,10 @@ function rentalQuota(subscription: ShareMarketSubscription, locale: string, t: T
 
 function rentalServiceTiming(subscription: ShareMarketSubscription, locale: string, t: Translate) {
   if (subscription.walletContract) {
-    return t(walletLifecycleKey(subscription.walletContract), {
+    return [t(walletLifecycleKey(subscription.walletContract), {
       date: formatDate(subscription.walletContract.periodEnd, locale),
       hours: trialHours(subscription.walletContract.trialSecondsRemaining, locale),
-    });
+    }), shareTrialSummary(subscription, locale, t)].filter(Boolean).join(" · ");
   }
   if (!subscription.serviceStartedAt) return t("account.share.activationPending");
   return subscription.expiresAt

@@ -33,6 +33,7 @@ import {
   listingCardId,
 } from "@/components/dashboard/share-market/market-share-card";
 import { useLocaleText } from "@/components/i18n/locale-provider";
+import { getMarketTrialPolicy, type MarketTrialPolicy } from "@/lib/market-trial-policy";
 import {
   addShareMarketSeat,
   closeShareMarketListing,
@@ -88,10 +89,6 @@ import {
 } from "@/components/dashboard/share-market/owner-workspace-utils";
 
 type TFn = ReturnType<typeof useLocaleText>["t"];
-const DEFAULT_TRIAL_HOURS = 12;
-const DEFAULT_TRIAL_TOKEN_MILLIONS = "1";
-const TRIAL_HOURS_STORAGE_KEY = "cc_switch_share_market_trial_hours_v1";
-const TRIAL_TOKEN_MILLIONS_STORAGE_KEY = "cc_switch_share_market_trial_token_millions_v1";
 
 type SeatDraft = {
   parallelLimit: string;
@@ -138,51 +135,15 @@ class SeatDraftError extends Error {
   }
 }
 
-function readStoredString(key: string, fallback: string) {
-  if (typeof window === "undefined") return fallback;
-  try {
-    const stored = window.localStorage.getItem(key);
-    if (stored == null) return fallback;
-    const parsed = JSON.parse(stored);
-    return typeof parsed === "string" && parsed.trim() ? parsed : fallback;
-  } catch {
-    return fallback;
-  }
-}
-
-function writeStoredString(key: string, value: string) {
-  if (typeof window === "undefined") return;
-  try {
-    window.localStorage.setItem(key, JSON.stringify(value));
-  } catch {
-    // Storage can be unavailable in private browsing or locked-down contexts.
-  }
-}
-
-function storedTrialDefaults() {
-  return {
-    hours: readStoredString(TRIAL_HOURS_STORAGE_KEY, String(DEFAULT_TRIAL_HOURS)),
-    tokens: readStoredString(TRIAL_TOKEN_MILLIONS_STORAGE_KEY, DEFAULT_TRIAL_TOKEN_MILLIONS),
-  };
-}
-
-function rememberPaidTrial(value: { trialHours: string; trialTokenLimit: string }) {
-  writeStoredString(TRIAL_HOURS_STORAGE_KEY, value.trialHours);
-  writeStoredString(TRIAL_TOKEN_MILLIONS_STORAGE_KEY, value.trialTokenLimit);
-}
-
 function emptySeat(periods: ShareTokenPeriod[] = TOKEN_PERIODS): SeatDraft {
-  const trial = storedTrialDefaults();
-  const trialHours = trial.hours;
-  const trialTokenLimit = trial.tokens;
   return {
     parallelLimit: "",
     tokenLimit: "",
     tokenPeriod: periods.includes("lifetime") ? "lifetime" : periods[0] || "lifetime",
     paid: false,
     price: "",
-    trialHours,
-    trialTokenLimit,
+    trialHours: "",
+    trialTokenLimit: "",
     serviceDurationMode: "fixed",
     serviceDurationDays: "1",
     serviceDurationTouched: false,
@@ -190,7 +151,8 @@ function emptySeat(periods: ShareTokenPeriod[] = TOKEN_PERIODS): SeatDraft {
 }
 
 function seatDraft(seat: ShareMarketSeat): SeatDraft {
-  const trial = storedTrialDefaults();
+  const hours = seat.trialHoursOverride === undefined ? seat.trialHours : seat.trialHoursOverride;
+  const tokens = seat.trialTokenLimitOverride === undefined ? seat.trialTokenLimit : seat.trialTokenLimitOverride;
   return {
     parallelLimit: seat.parallelLimit == null ? "" : String(seat.parallelLimit),
     tokenLimit: seat.tokenLimit == null ? "" : tokensToMillionsInput(seat.tokenLimit),
@@ -199,12 +161,8 @@ function seatDraft(seat: ShareMarketSeat): SeatDraft {
     price: seat.cyclePriceMinor != null
       ? (seat.cyclePriceMinor / 100).toFixed(2)
       : "",
-    trialHours: !seat.isFree
-      ? String(seat.trialHours ?? DEFAULT_TRIAL_HOURS)
-      : trial.hours,
-    trialTokenLimit: !seat.isFree
-      ? tokensToMillionsInput(seat.trialTokenLimit ?? 1_000_000)
-      : trial.tokens,
+    trialHours: hours == null ? "" : String(hours),
+    trialTokenLimit: tokens == null ? "" : tokensToMillionsInput(tokens),
     serviceDurationMode: !seat.isFree || seat.serviceDurationDays == null ? "permanent" : "fixed",
     serviceDurationDays: String(seat.serviceDurationDays ?? 1),
     serviceDurationTouched: true,
@@ -277,15 +235,18 @@ function normalizedSeat(draft: SeatDraft, t: TFn): ShareMarketSeatInput {
   if (cyclePriceMinor > MAX_PRICE_MINOR) {
     throw new SeatDraftError("price", t("shareMarket.error.priceRange"));
   }
-  const trialHours = Number(draft.trialHours);
-  if (!Number.isSafeInteger(trialHours) || trialHours < 0) {
+  const trialHours = draft.trialHours.trim() === "" ? undefined : Number(draft.trialHours);
+  if (trialHours != null && (!/^\d+$/.test(draft.trialHours) || !Number.isSafeInteger(trialHours) || trialHours < 0 || trialHours > 720)) {
     throw new SeatDraftError("trialHours", t("shareMarket.error.nonNegativeInteger", { field: t("shareMarket.dialog.trialHours") }));
   }
-  if (!validTokenMillionsInput(draft.trialTokenLimit, { allowZero: true })) {
+  if (trialHours === 0) {
+    return { ...base, serviceDurationDays: undefined, cyclePriceMinor, currency: MARKET_CURRENCY, trialHours, trialTokenLimit: undefined };
+  }
+  if (draft.trialTokenLimit.trim() !== "" && !validTokenMillionsInput(draft.trialTokenLimit, { allowZero: true })) {
     throw new SeatDraftError("trialTokenLimit", t("shareMarket.error.nonNegativeMillions", { field: t("shareMarket.dialog.trialTokenLimit") }));
   }
-  const trialTokenLimit = millionsInputToTokens(draft.trialTokenLimit);
-  if (trialTokenLimit == null) {
+  const trialTokenLimit = draft.trialTokenLimit.trim() === "" ? undefined : millionsInputToTokens(draft.trialTokenLimit);
+  if (trialTokenLimit === null) {
     throw new SeatDraftError("trialTokenLimit", t("shareMarket.error.nonNegativeMillions", { field: t("shareMarket.dialog.trialTokenLimit") }));
   }
   return { ...base, serviceDurationDays: undefined, cyclePriceMinor, currency: MARKET_CURRENCY, trialHours, trialTokenLimit };
@@ -333,16 +294,17 @@ function SeatFields({
   disabled = false,
   validation = { message: "" },
   onChange,
-  onPaidTrialChange,
 }: {
   draft: SeatDraft;
   supportedPeriods?: ShareTokenPeriod[];
   disabled?: boolean;
   validation?: SeatDraftValidation;
   onChange: (draft: SeatDraft) => void;
-  onPaidTrialChange?: (value: { trialHours: string; trialTokenLimit: string }) => void;
 }) {
-  const { t } = useLocaleText();
+  const { locale, t } = useLocaleText();
+  const [trialPolicy, setTrialPolicy] = React.useState<MarketTrialPolicy | null>(null);
+  const [trialError, setTrialError] = React.useState("");
+  React.useEffect(() => { let active = true; getMarketTrialPolicy().then((p) => { if (active) setTrialPolicy(p); }).catch((e) => { if (active) setTrialError(e instanceof Error ? e.message : String(e)); }); return () => { active = false; }; }, []);
   const errorId = React.useId();
   const periods = supportedPeriods?.length ? supportedPeriods : TOKEN_PERIODS;
   const patch = (value: Partial<SeatDraft>) => onChange({ ...draft, ...value });
@@ -431,6 +393,8 @@ function SeatFields({
               {t("shareMarket.dialog.trialHours")}
               <input
                 className={fieldClass(invalid("trialHours"))}
+                placeholder={t("clientMarket.trialInherit")}
+                type="number" min={0} max={720} step={1}
                 inputMode="numeric"
                 disabled={disabled}
                 aria-invalid={invalid("trialHours")}
@@ -439,7 +403,6 @@ function SeatFields({
                 onChange={(event) => {
                   const trialHours = event.target.value;
                   patch({ trialHours });
-                  onPaidTrialChange?.({ trialHours, trialTokenLimit: draft.trialTokenLimit });
                 }}
               />
             </label>
@@ -447,19 +410,22 @@ function SeatFields({
               {t("shareMarket.dialog.trialTokenLimit")}
               <input
                 className={fieldClass(invalid("trialTokenLimit"))}
+                placeholder={t("clientMarket.trialInherit")}
                 inputMode="decimal"
-                disabled={disabled}
+                disabled={disabled || draft.trialHours === "0"}
                 aria-invalid={invalid("trialTokenLimit")}
                 aria-describedby={describedBy("trialTokenLimit")}
                 value={draft.trialTokenLimit}
                 onChange={(event) => {
                   const trialTokenLimit = event.target.value;
                   patch({ trialTokenLimit });
-                  onPaidTrialChange?.({ trialHours: draft.trialHours, trialTokenLimit });
                 }}
               />
             </label>
           </div>
+          <p className="text-xs leading-6 text-muted-foreground">{t("marketTrial.overrideHelp")}</p>
+          {trialPolicy ? <p className="text-xs text-muted-foreground">{t("marketTrial.defaults", { hours: trialPolicy.shareHours, tokens: trialPolicy.shareTokens > 0 ? formatTokenMillions(trialPolicy.shareTokens, locale) : t("marketTrial.timeOnly") })}</p> : null}
+          {trialError ? <p role="alert" className="text-xs text-danger">{trialError}</p> : null}
         </>
       ) : null}
       {!draft.paid ? <div className="grid gap-2">
@@ -642,7 +608,7 @@ export function ShareMarketAddListingDialog({
                           {seats.length > 1 ? <Button isIconOnly size="sm" variant="ghost" aria-label={t("common.delete")} isDisabled={busy} onClick={() => setSeats((items) => items.filter((_, itemIndex) => itemIndex !== index))}><X className="h-4 w-4" /></Button> : null}
                         </div>
                       </div>
-                      <SeatFields draft={seat} supportedPeriods={selected?.supportedUserTokenPeriods} disabled={busy} validation={seatErrors[index]} onChange={(next) => setSeats((items) => items.map((item, itemIndex) => itemIndex === index ? next : item))} onPaidTrialChange={rememberPaidTrial} />
+                      <SeatFields draft={seat} supportedPeriods={selected?.supportedUserTokenPeriods} disabled={busy} validation={seatErrors[index]} onChange={(next) => setSeats((items) => items.map((item, itemIndex) => itemIndex === index ? next : item))} />
                     </section>
                   ))}
                   {seats.length < 20 ? <Button variant="outline" isDisabled={busy} onClick={() => setSeats((items) => [...items, emptySeat(selected?.supportedUserTokenPeriods)])}><Plus className="h-4 w-4" />{t("shareMarket.dialog.addSeat")}</Button> : null}
@@ -829,7 +795,6 @@ function ReopenListingDialog({
                           onChange={(next) => setExisting((items) => items.map((current, itemIndex) =>
                             itemIndex === index ? { ...current, draft: next } : current
                           ))}
-                          onPaidTrialChange={rememberPaidTrial}
                         />
                       </section>
                     ))}
@@ -850,7 +815,7 @@ function ReopenListingDialog({
                             <Button isIconOnly size="sm" variant="ghost" aria-label={t("common.delete")} isDisabled={busy} onClick={() => setNewSeats((items) => items.filter((_, itemIndex) => itemIndex !== index))}><X className="h-4 w-4" /></Button>
                           </div>
                         </div>
-                        <SeatFields draft={seat} supportedPeriods={listing.supportedUserTokenPeriods} disabled={busy} validation={newSeatErrors[index]} onChange={(next) => setNewSeats((items) => items.map((current, itemIndex) => itemIndex === index ? next : current))} onPaidTrialChange={rememberPaidTrial} />
+                        <SeatFields draft={seat} supportedPeriods={listing.supportedUserTokenPeriods} disabled={busy} validation={newSeatErrors[index]} onChange={(next) => setNewSeats((items) => items.map((current, itemIndex) => itemIndex === index ? next : current))} />
                       </section>
                     ))}
                   </section>
@@ -936,7 +901,7 @@ function SeatDialog({
           <Modal.Header><Modal.Heading>{seat ? t("shareMarket.manage") : template ? t("shareMarket.createFromSeat") : t("shareMarket.addSeat")}</Modal.Heading></Modal.Header>
           <Modal.Body className="grid max-h-[75vh] gap-4 overflow-y-auto">
             {listing ? <ShareCapacitySummary parallelLimit={listing.parallelLimit} tokenLimit={listing.tokenLimit} /> : null}
-            <SeatFields draft={draft} supportedPeriods={listing?.supportedUserTokenPeriods} disabled={busy} validation={validation} onChange={setDraft} onPaidTrialChange={rememberPaidTrial} />
+            <SeatFields draft={draft} supportedPeriods={listing?.supportedUserTokenPeriods} disabled={busy} validation={validation} onChange={setDraft} />
             {draft.paid ? <PaidOfferReadinessNotice readiness={paidReadiness} /> : null}
             {error ? <p className="text-sm text-rose-700">{error}</p> : null}
           </Modal.Body>

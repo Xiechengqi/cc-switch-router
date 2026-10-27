@@ -693,6 +693,8 @@ mod tests {
             billing_interval: None,
             currency: Some("USD".into()),
             free_duration_days: None,
+            trial_hours: None,
+            default_trial_hours: 12,
             offer_revision: 1,
             contacts: vec![],
             country_code: Some("US".into()),

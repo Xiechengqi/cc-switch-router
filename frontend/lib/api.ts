@@ -1153,6 +1153,7 @@ export async function createClientMarketHost(body: {
   cyclePriceMinor?: number;
   currency?: string;
   freeDurationDays?: number;
+  trialHours?: number | null;
 }) {
   return parseJson<ClientMarketHost>(
     await authFetch("/v1/client-market/hosts", {
@@ -1478,7 +1479,7 @@ export async function getMarketProvider(id: string, signal?: AbortSignal) {
 
 export async function updateClientMarketHostOffer(
   hostId: string,
-  body: { cyclePriceMinor?: number; currency?: string; freeDurationDays?: number },
+  body: { cyclePriceMinor?: number; currency?: string; freeDurationDays?: number; trialHours?: number | null },
 ) {
   return parseJson<{
     hostId: string;

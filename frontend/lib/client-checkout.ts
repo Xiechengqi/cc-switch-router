@@ -1,6 +1,6 @@
 import type { ClientMarketAllocationQuote, WalletLifecycle } from "./types";
 import type { MessageKey } from "./i18n";
-import { validWalletQuoteFunding } from "./market-wallet-quote";
+import { validPaidWalletQuoteFunding, validWalletQuoteFunding } from "./market-wallet-quote";
 
 export type ClientDraft = {
   subdomain: string;
@@ -21,7 +21,7 @@ export function clientCheckoutState(quote: ClientMarketAllocationQuote) {
   const unsupported =
     paid.length > 0 &&
     (quote.fundingRail !== "platform_wallet" ||
-      !validWalletQuoteFunding(quote.walletFunding) ||
+      !validPaidWalletQuoteFunding(quote.walletFunding, paid.reduce((sum, item) => sum + (item.cyclePriceMinor ?? item.dailyRateMinor ?? 0), 0)) ||
       paid.some(
         (item) =>
           !Number.isFinite(item.trialSecondsRemaining) ||

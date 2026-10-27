@@ -1,5 +1,6 @@
 "use client";
 import { walletLifecycleKey, walletReleaseScheduled, trialHours } from "@/lib/client-checkout";
+import { shareTrialSummary } from "@/lib/share-trial";
 
 import * as React from "react";
 import { useAuth } from "@/components/auth/auth-provider";
@@ -122,6 +123,7 @@ export function RentalTermLine({
       <strong className="font-semibold tabular-nums text-slate-700">{rentalPrice(subscription, locale, t)}</strong>
       <span>{rentalServiceTerm(subscription, t)}</span>
       <span className={cn("tabular-nums", urgent ? "font-medium text-amber-700" : null)}>{remaining}</span>
+      {shareTrialSummary(subscription, locale, t) ? <span>{shareTrialSummary(subscription, locale, t)}</span> : null}
     </p>
   );
 }

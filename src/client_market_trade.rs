@@ -194,6 +194,8 @@ pub struct UpdateHostOfferRequest {
     pub currency: Option<String>,
     #[serde(default)]
     pub free_duration_days: Option<u32>,
+    #[serde(default)]
+    pub trial_hours: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -210,6 +212,7 @@ pub struct HostOfferView {
     pub currency: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub free_duration_days: Option<u32>,
+    pub trial_hours: Option<i64>,
     pub offer_revision: i64,
 }
 
@@ -925,6 +928,7 @@ async fn update_host_offer(
                 cycle_price_minor,
                 currency,
                 free_duration_days,
+                input.trial_hours,
             )
             .await?,
     ))
@@ -2079,6 +2083,7 @@ impl AppStore {
                 billing_interval: None,
                 currency,
                 free_duration_days,
+                trial_hours: None,
                 offer_revision: old_revision,
             });
         }
@@ -2154,6 +2159,7 @@ impl AppStore {
             billing_interval: None,
             currency,
             free_duration_days,
+            trial_hours: None,
             offer_revision: revision,
         })
     }
@@ -2165,7 +2171,9 @@ impl AppStore {
         cycle_price_minor: Option<i64>,
         currency: Option<String>,
         free_duration_days: Option<u32>,
+        trial_hours: Option<i64>,
     ) -> Result<HostOfferView, AppError> {
+        let trial_hours = crate::market_common::validate_client_trial_hours(trial_hours)?;
         let cycle_price_minor = validate_monthly_offer(cycle_price_minor)?;
         let currency = normalize_offer_currency(cycle_price_minor, currency)?;
         let free_duration_days =
@@ -2187,7 +2195,7 @@ impl AppStore {
             .query_row(
                 "SELECT provider_id, daily_rate_minor, pricing_model, cycle_price_minor,
                         billing_interval, currency, free_duration_days,
-                        offer_revision, status
+                        offer_revision, status, trial_hours
                  FROM router_ssh_hosts WHERE id = ?1",
                 params![host_id],
                 |row| {
@@ -2201,6 +2209,7 @@ impl AppStore {
                         row.get::<_, Option<i64>>(6)?,
                         row.get::<_, i64>(7)?,
                         row.get::<_, String>(8)?,
+                        row.get::<_, Option<i64>>(9)?,
                     ))
                 },
             )
@@ -2249,6 +2258,7 @@ impl AppStore {
             && host.4 == billing_interval
             && normalized_old_currency == currency
             && host.6 == free_duration_days.map(i64::from)
+            && host.9 == trial_hours
         {
             tx.commit().map_err(|error| {
                 AppError::Internal(format!(
@@ -2263,6 +2273,7 @@ impl AppStore {
                 billing_interval,
                 currency,
                 free_duration_days,
+                trial_hours,
                 offer_revision: host.7,
             });
         }
@@ -2288,7 +2299,7 @@ impl AppStore {
              SET daily_rate_minor = NULL, pricing_model = ?2,
                  cycle_price_minor = ?3, billing_interval = ?4,
                  currency = ?5, free_duration_days = ?6,
-                 offer_revision = ?7, updated_at = ?8
+                 offer_revision = ?7, updated_at = ?8, trial_hours = ?9
              WHERE id = ?1",
             params![
                 host_id,
@@ -2299,6 +2310,7 @@ impl AppStore {
                 free_duration_days.map(i64::from),
                 revision,
                 now.to_rfc3339(),
+                trial_hours,
             ],
         )
         .map_err(|error| {
@@ -2318,12 +2330,14 @@ impl AppStore {
                 "oldBillingInterval": host.4,
                 "oldCurrency": host.5,
                 "oldFreeDurationDays": host.6,
+                "oldTrialHours": host.9,
                 "dailyRateMinor": null,
                 "pricingModel": pricing_model,
                 "cyclePriceMinor": cycle_price_minor,
                 "billingInterval": billing_interval,
                 "currency": currency,
                 "freeDurationDays": free_duration_days,
+                "trialHours": trial_hours,
                 "offerRevision": revision,
             }),
             now,
@@ -2339,6 +2353,7 @@ impl AppStore {
             billing_interval,
             currency,
             free_duration_days,
+            trial_hours,
             offer_revision: revision,
         })
     }
@@ -2424,7 +2439,8 @@ impl AppStore {
                             h.cycle_price_minor, h.billing_interval,
                             CASE WHEN h.daily_rate_minor IS NULL AND h.cycle_price_minor IS NULL THEN NULL
                                  ELSE COALESCE(NULLIF(TRIM(h.currency), ''), 'USD') END,
-                            h.free_duration_days, h.offer_revision, h.funding_rail
+                            h.free_duration_days, h.offer_revision, h.funding_rail,
+                            COALESCE(h.trial_hours, (SELECT client_hours FROM market_trial_policy WHERE id = 1))
                      FROM router_ssh_hosts h
                      WHERE h.id = ?1 AND h.status = 'idle' AND h.provider_id IS NOT NULL",
                     params![host_id],
@@ -2450,7 +2466,8 @@ impl AppStore {
                         h.cycle_price_minor, h.billing_interval,
                         CASE WHEN h.daily_rate_minor IS NULL AND h.cycle_price_minor IS NULL THEN NULL
                              ELSE COALESCE(NULLIF(TRIM(h.currency), ''), 'USD') END,
-                        h.free_duration_days, h.offer_revision, h.funding_rail
+                        h.free_duration_days, h.offer_revision, h.funding_rail,
+                        COALESCE(h.trial_hours, (SELECT client_hours FROM market_trial_policy WHERE id = 1))
                  FROM router_ssh_hosts h
                  WHERE h.status = 'idle'
                    AND h.daily_rate_minor IS NULL AND h.cycle_price_minor IS NULL
@@ -2551,7 +2568,7 @@ impl AppStore {
                         &candidate.provider_id,
                         "client_host",
                         &candidate.host_id,
-                        crate::market_common::TRIAL_SECONDS,
+                        candidate.trial_hours * 3_600,
                     )?;
             } else if candidate.provider_id != session.user_id
                 && let Some(days) = candidate.free_duration_days
@@ -2583,12 +2600,9 @@ impl AppStore {
         for candidate in &candidates {
             if let Some(price) = candidate.cycle_price_minor.or(candidate.daily_rate_minor) {
                 wallet_paid_items = true;
-                if candidate.wallet_trial_seconds == 0 {
-                    wallet_price_minor =
-                        wallet_price_minor.checked_add(price).ok_or_else(|| {
-                            AppError::BadRequest("quoted wallet price is too large".into())
-                        })?;
-                }
+                wallet_price_minor = wallet_price_minor.checked_add(price).ok_or_else(|| {
+                    AppError::BadRequest("quoted wallet price is too large".into())
+                })?;
             }
         }
         let wallet_funding = if wallet_paid_items {
@@ -2652,9 +2666,10 @@ impl AppStore {
                     (id, quote_id, position, host_id, provider_id, host_owner_email,
                      country_code, hostname, daily_rate_minor, currency,
                      free_duration_days, offer_revision, pricing_model,
-                     cycle_price_minor, billing_interval, wallet_trial_seconds)
+                     cycle_price_minor, billing_interval, wallet_trial_seconds,
+                     wallet_trial_allowance_seconds)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                         ?13, ?14, ?15, ?16)",
+                         ?13, ?14, ?15, ?16, ?17)",
                 params![
                     item_id,
                     quote_id,
@@ -2672,6 +2687,7 @@ impl AppStore {
                     candidate.cycle_price_minor,
                     candidate.billing_interval,
                     candidate.wallet_trial_seconds,
+                    candidate.trial_hours * 3_600,
                 ],
             )
             .map_err(|error| AppError::Internal(format!("insert quote item failed: {error}")))?;
@@ -2774,7 +2790,7 @@ impl AppStore {
         let now = Utc::now();
         let conn = self.conn.lock().await;
         let tx = conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| AppError::Internal(format!("begin quote commit failed: {error}")))?;
         expire_quotes_tx(&tx, now)?;
         let quote: Option<(String, String, String, String)> = tx
@@ -2860,6 +2876,22 @@ impl AppStore {
         ).map_err(|error| AppError::Internal(format!("check Client quote funding rail failed: {error}")))?;
         if paid_count > 0 {
             crate::market_payments::require_current_offer_rail(&funding_rail, "Client quote")?;
+            let price: i64 = tx
+                .query_row(
+                    "SELECT COALESCE(SUM(COALESCE(cycle_price_minor, daily_rate_minor, 0)), 0)
+                 FROM client_market_allocation_quote_items WHERE quote_id = ?1",
+                    params![quote_id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| {
+                    AppError::Internal(format!("read Client batch funding failed: {error}"))
+                })?;
+            crate::market_wallet::require_order_funding_tx(
+                &tx,
+                &session.user_id,
+                price,
+                &now.to_rfc3339(),
+            )?;
         }
         ensure_creation_allowed_tx(&tx, &session.user_id, &session.email)?;
         let item_count: i64 = tx
@@ -2935,7 +2967,7 @@ impl AppStore {
                     "SELECT host_id, provider_id, host_owner_email, country_code,
                             daily_rate_minor, pricing_model, cycle_price_minor,
                             billing_interval, currency, offer_revision,
-                            wallet_trial_seconds
+                            wallet_trial_seconds, wallet_trial_allowance_seconds
                      FROM client_market_allocation_quote_items
                      WHERE id = ?1 AND quote_id = ?2",
                     params![item_id, quote_id],
@@ -2952,6 +2984,7 @@ impl AppStore {
                             row.get::<_, Option<String>>(8)?,
                             row.get::<_, i64>(9)?,
                             row.get::<_, i64>(10)?,
+                            row.get::<_, i64>(11)?,
                         ))
                     },
                 )
@@ -3063,6 +3096,7 @@ impl AppStore {
                         price_minor,
                         auto_renew: item.6.is_some() && *auto_renew,
                         trial_seconds: item.10,
+                        trial_allowance_seconds: item.11,
                     },
                     &now.to_rfc3339(),
                 )?;
@@ -3855,6 +3889,7 @@ struct QuoteCandidate {
     offer_revision: i64,
     funding_rail: String,
     wallet_trial_seconds: i64,
+    trial_hours: i64,
 }
 
 fn map_quote_candidate(row: &crate::db::Row<'_>) -> crate::db::Result<QuoteCandidate> {
@@ -3876,6 +3911,7 @@ fn map_quote_candidate(row: &crate::db::Row<'_>) -> crate::db::Result<QuoteCandi
         offer_revision: row.get(12)?,
         funding_rail: row.get(13)?,
         wallet_trial_seconds: 0,
+        trial_hours: row.get(14)?,
     })
 }
 
@@ -4814,6 +4850,7 @@ pub(crate) fn complete_provisioning_tx(
         AppError::Internal(format!("create Client Market subscription failed: {error}"))
     })?;
     persist_subscription_client_subdomain_tx(tx, installation_id)?;
+    let mut activated_trial_seconds = 0_i64;
     if funding_rail == "platform_wallet"
         && let Some(_price_minor) = cycle_price_minor.or(daily_rate_minor)
     {
@@ -4840,6 +4877,15 @@ pub(crate) fn complete_provisioning_tx(
             &now.to_rfc3339(),
             &now.to_rfc3339(),
         )?;
+        activated_trial_seconds = tx
+            .query_row(
+                "SELECT trial_seconds_remaining FROM market_platform_contracts WHERE id = ?1",
+                params![contract_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("read activated Client trial failed: {error}"))
+            })?;
         tx.execute(
             "UPDATE client_market_subscriptions
              SET platform_contract_id = ?2 WHERE installation_id = ?1",
@@ -4868,7 +4914,8 @@ pub(crate) fn complete_provisioning_tx(
             "offerRevision": revision,
             "activatedAt": now.to_rfc3339(),
             "expiresAt": expires_at.map(|value| value.to_rfc3339()),
-            "trialHours": crate::market_common::TRIAL_SECONDS / 3_600,
+            "trialHours": activated_trial_seconds as f64 / 3_600.0,
+            "trialSeconds": activated_trial_seconds,
         }),
         now,
     )?;
