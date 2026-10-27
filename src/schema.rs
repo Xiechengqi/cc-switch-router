@@ -308,6 +308,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         88,
         include_str!("../schema/0088_account_quota_projection.sql"),
     ),
+    (
+        89,
+        include_str!("../schema/0089_market_suspension_notifications.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -816,6 +820,8 @@ fn migration_checksum(sql: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod suspension;
 
     fn memory_connection() -> Connection {
         Connection::open_in_memory().expect("open test database")

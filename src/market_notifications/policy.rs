@@ -29,11 +29,49 @@ pub(super) fn notice_current_tx(
         "contract_suspended" | "contract_resumed" | "contract_terminating_soon" | "contract_terminated" => {
             let expected=match item.event_kind.as_str() {"contract_resumed"=>"active","contract_terminated"=>"ended",_=>"suspended"};
             conn.query_row("SELECT EXISTS(SELECT 1 FROM market_platform_contracts WHERE id=?1 AND buyer_user_id=?2 AND status=?3
-                AND (?4!='contract_terminating_soon' OR ?5='contract_terminating_soon:'||id||':'||suspended_at))",
-                params![field("contractId"),item.recipient_user_id,expected,item.event_kind,field("notificationEventKey")],|r|r.get(0)).map_err(db_error("recheck service notice"))
+                AND (?4 NOT IN ('contract_suspended','contract_terminating_soon') OR ?5=?4||':'||id||':'||suspended_at)
+                AND (?4!='contract_suspended' OR ?6 IS NULL OR ?6=suspended_at))",
+                params![field("contractId"),item.recipient_user_id,expected,item.event_kind,field("notificationEventKey"),field("suspensionStartedAt")],|r|r.get(0)).map_err(db_error("recheck service notice"))
         }
         _ => Ok(true),
     }
+}
+
+/// Do not leave queued channel tasks behind when the business instruction has
+/// become obsolete. An in-flight sender still owns its live lease; an expired
+/// attempt with unknown acceptance must not be relabelled as never sent.
+pub(super) fn suppress_obsolete_deliveries_tx(
+    conn: &Connection,
+    item: &Claimed,
+    time: &str,
+) -> Result<Option<DateTime<Utc>>, AppError> {
+    conn.execute(
+        "UPDATE market_notification_deliveries
+         SET status = CASE WHEN status='claimed' AND first_attempt_at IS NOT NULL
+                           THEN 'uncertain' ELSE 'suppressed' END,
+             claim_token=NULL, claim_expires_at=NULL, last_error='superseded_business_state'
+         WHERE event_id=?1 AND (status IN ('queued','blocked_config')
+               OR (status='claimed' AND claim_expires_at<=?2))",
+        params![item.id, time],
+    )
+    .map_err(db_error("suppress obsolete notification channels"))?;
+    let lease: Option<String> = conn
+        .query_row(
+            "SELECT MIN(claim_expires_at) FROM market_notification_deliveries
+             WHERE event_id=?1 AND status='claimed' AND claim_expires_at>?2",
+            params![item.id, time],
+            |r| r.get(0),
+        )
+        .map_err(db_error("read obsolete notification's live lease"))?;
+    // Wait for a live sender's receipt before finalizing the aggregate event.
+    // Otherwise a late successful send could be hidden under 'suppressed'.
+    lease
+        .map(|at| {
+            DateTime::parse_from_rfc3339(&at)
+                .map(|at| at.with_timezone(&Utc))
+                .map_err(|_| AppError::Internal("invalid notification lease time".into()))
+        })
+        .transpose()
 }
 
 pub(super) fn related_count_tx(

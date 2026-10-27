@@ -964,10 +964,17 @@ fn start_paid_trial_tx(
     at: &str,
     now: &str,
 ) -> Result<bool, AppError> {
-    let (buyer, model, price, status, remaining): (String, String, i64, String, i64) = conn
+    let (buyer, model, price, status, remaining, paid_started): (
+        String,
+        String,
+        i64,
+        String,
+        i64,
+        Option<String>,
+    ) = conn
         .query_row(
             "SELECT buyer_user_id, billing_model, COALESCE(cycle_price_minor, daily_rate_minor),
-                    status, trial_seconds_remaining
+                    status, trial_seconds_remaining, paid_started_at
              FROM market_platform_contracts WHERE id = ?1",
             params![contract_id],
             |row| {
@@ -977,11 +984,15 @@ fn start_paid_trial_tx(
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
                 ))
             },
         )
         .map_err(db_error("read trial conversion contract"))?;
-    if status != "trialing" || remaining != 0 {
+    if !matches!(status.as_str(), "trialing" | "suspended")
+        || remaining != 0
+        || paid_started.is_some()
+    {
         return Err(AppError::Conflict(
             "wallet trial is not ready to convert".into(),
         ));
@@ -1072,9 +1083,13 @@ fn start_paid_trial_tx(
             .execute(
                 "UPDATE market_platform_contracts
              SET status = 'active', activation_hold_id = ?2, paid_started_at = ?3,
-                 current_period_sequence = 1, renewal_anchor_day = ?5, updated_at = ?4
-             WHERE id = ?1 AND status = 'trialing' AND trial_seconds_remaining = 0",
-                params![contract_id, hold_id, at, now, start.day()],
+                 current_period_sequence = 1, renewal_anchor_day = ?5,
+                 last_evaluated_at = CASE WHEN ?6 = 'suspended' THEN ?3 ELSE last_evaluated_at END,
+                 health_fence_at = CASE WHEN ?6 = 'suspended' THEN ?3 ELSE health_fence_at END,
+                 updated_at = ?4
+             WHERE id = ?1 AND status = ?6 AND trial_seconds_remaining = 0
+               AND paid_started_at IS NULL",
+                params![contract_id, hold_id, at, now, start.day(), status],
             )
             .map_err(db_error("activate paid monthly service after trial"))?;
         if changed != 1 {
@@ -1096,9 +1111,13 @@ fn start_paid_trial_tx(
             .execute(
                 "UPDATE market_platform_contracts
              SET status = 'active', activation_hold_id = ?2, budget_hold_id = ?2,
-                 budget_sequence = 1, paid_started_at = ?3, updated_at = ?4
-             WHERE id = ?1 AND status = 'trialing' AND trial_seconds_remaining = 0",
-                params![contract_id, hold_id, at, now],
+                 budget_sequence = 1, paid_started_at = ?3,
+                 last_evaluated_at = CASE WHEN ?5 = 'suspended' THEN ?3 ELSE last_evaluated_at END,
+                 health_fence_at = CASE WHEN ?5 = 'suspended' THEN ?3 ELSE health_fence_at END,
+                 updated_at = ?4
+             WHERE id = ?1 AND status = ?5 AND trial_seconds_remaining = 0
+               AND paid_started_at IS NULL",
+                params![contract_id, hold_id, at, now, status],
             )
             .map_err(db_error("activate paid metered service after trial"))?;
         if changed != 1 {
@@ -2599,14 +2618,42 @@ pub(crate) fn notify_contract_tx(
     reason: &str,
     now: &str,
 ) -> Result<(), AppError> {
-    let (buyer, product_kind, status, updated_at): (String, String, String, String) = conn
+    let (buyer, product_kind, status, updated_at, suspended_at): (
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+    ) = conn
         .query_row(
-            "SELECT buyer_user_id, product_kind, status, updated_at
+            "SELECT buyer_user_id, product_kind, status, updated_at, suspended_at
              FROM market_platform_contracts WHERE id = ?1",
             params![contract_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .map_err(db_error("read contract for notification"))?;
+    // updated_at is also a reconciliation cursor, not a state-change ID.
+    // A continuous suspension must retain one notice even across worker retries.
+    let event_at = if kind == "contract_suspended" {
+        if status != "suspended" {
+            return Err(AppError::Conflict(
+                "wallet contract is not suspended".into(),
+            ));
+        }
+        suspended_at
+            .as_deref()
+            .ok_or_else(|| AppError::Internal("wallet suspension has no start time".into()))?
+    } else {
+        &updated_at
+    };
     crate::market_notifications::enqueue_user_notification_tx(
         conn,
         "buyer",
@@ -2614,12 +2661,13 @@ pub(crate) fn notify_contract_tx(
         kind,
         "platform_contract",
         contract_id,
-        &format!("{kind}:{contract_id}:{updated_at}"),
+        &format!("{kind}:{contract_id}:{event_at}"),
         serde_json::json!({
             "contractId": contract_id,
             "productKind": product_kind,
             "status": status,
             "reason": reason,
+            "suspensionStartedAt": suspended_at,
         }),
         now,
     )
@@ -2679,13 +2727,9 @@ fn resume_suspended_contract_inner_tx(
         return Ok(false);
     }
     if paid_started.is_none() && trial_remaining == 0 {
-        conn.execute(
-            "UPDATE market_platform_contracts SET status = 'trialing',
-                    last_evaluated_at = ?2, health_fence_at = ?2, updated_at = ?2
-             WHERE id = ?1 AND status = 'suspended'",
-            params![contract_id, now],
-        )
-        .map_err(db_error("retry wallet trial conversion"))?;
+        // Retry funding without leaving the suspension. Flipping to trialing
+        // first would reset suspended_at and create a fresh pause every 5s.
+        // The successful conversion alone advances the service/health cursor.
         return start_paid_trial_tx(conn, contract_id, now, now);
     }
     if model == "calendar_month" {
@@ -4640,6 +4684,43 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "suspended");
+        let paused_state: (String, String, String) = tx
+            .query_row(
+                "SELECT suspended_at,last_evaluated_at,health_fence_at
+             FROM market_platform_contracts WHERE id=?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        for tick in 1..=120 {
+            let retry =
+                (parse_time(end).unwrap() + chrono::Duration::seconds(tick * 5)).to_rfc3339();
+            assert!(!resume_suspended_contract_tx(&tx, &id, &retry).unwrap());
+            assert_eq!(
+                tx.query_row(
+                    "SELECT suspended_at,last_evaluated_at,health_fence_at
+                 FROM market_platform_contracts WHERE id=?1",
+                    params![id],
+                    |r| Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?
+                    )),
+                )
+                .unwrap(),
+                paused_state
+            );
+        }
+        assert_eq!(
+            tx.query_row(
+                "SELECT COUNT(*) FROM market_notification_outbox
+             WHERE object_id=?1 AND event_kind='contract_suspended'",
+                params![id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
         assert!(
             terminate_after_cleanup_tx(&tx, &id, true, end)
                 .unwrap()
@@ -4647,6 +4728,217 @@ mod tests {
         );
         reconcile_wallet_tx(&tx, "buyer").unwrap();
         tx.commit().unwrap();
+    }
+
+    #[test]
+    fn suspended_trial_resumes_only_when_funded_without_charging_the_gap_or_replaying() {
+        for model in [BillingModel::CalendarMonth, BillingModel::Metered] {
+            let conn = memory();
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let start = "2026-01-01T00:00:00+00:00";
+            let end = "2026-01-01T00:00:05+00:00";
+            let funded_at = "2026-01-01T01:00:00+00:00";
+            let input = PrepareContract {
+                billing_model: model,
+                trial_seconds: 5,
+                price_minor: 100,
+                ..monthly("funded-trial", false)
+            };
+            let id = prepare_contract_tx(&tx, &input, start).unwrap();
+            activate_contract_tx(&tx, &id, start, start).unwrap();
+            assert!(
+                advance_trial_interval_tx(
+                    &tx,
+                    &id,
+                    "share_control",
+                    "trial",
+                    start,
+                    end,
+                    true,
+                    end
+                )
+                .unwrap()
+                .needs_pause
+            );
+            credit_verified_topup_tx(&tx, "buyer", "partial", 50, "partial-receipt", end).unwrap();
+            assert!(!resume_suspended_contract_tx(&tx, &id, "2026-01-01T00:30:00+00:00").unwrap());
+            assert_eq!(wallet_snapshot_tx(&tx, "buyer").unwrap().held_units, 0);
+            credit_verified_topup_tx(&tx, "buyer", "rest", 50, "rest-receipt", funded_at).unwrap();
+            assert!(resume_suspended_contract_tx(&tx, &id, funded_at).unwrap());
+            assert!(!resume_suspended_contract_tx(&tx, &id, funded_at).unwrap());
+            let state: (String, String, String, String, Option<String>) = tx
+                .query_row(
+                    "SELECT status,paid_started_at,last_evaluated_at,health_fence_at,suspended_at
+                 FROM market_platform_contracts WHERE id=?1",
+                    params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                state,
+                (
+                    "active".into(),
+                    funded_at.into(),
+                    funded_at.into(),
+                    funded_at.into(),
+                    None
+                )
+            );
+            assert_eq!(tx.query_row("SELECT COUNT(*) FROM market_notification_outbox WHERE object_id=?1 AND event_kind='contract_suspended'",params![id],|r|r.get::<_,i64>(0)).unwrap(),1);
+            assert_eq!(tx.query_row("SELECT COUNT(*) FROM market_notification_outbox WHERE object_id=?1 AND event_kind='contract_resumed'",params![id],|r|r.get::<_,i64>(0)).unwrap(),1);
+            if matches!(model, BillingModel::CalendarMonth) {
+                assert_eq!(
+                    tx.query_row(
+                        "SELECT period_start FROM market_platform_periods WHERE contract_id=?1",
+                        params![id],
+                        |r| r.get::<_, String>(0)
+                    )
+                    .unwrap(),
+                    funded_at
+                );
+                assert_eq!(wallet_snapshot_tx(&tx, "buyer").unwrap().posted_units, 0);
+            } else {
+                assert_eq!(
+                    wallet_snapshot_tx(&tx, "buyer").unwrap().held_units,
+                    units_from_minor(100).unwrap()
+                );
+                assert_eq!(
+                    tx.query_row(
+                        "SELECT budget_sequence FROM market_platform_contracts WHERE id=?1",
+                        params![id],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                    1
+                );
+            }
+            assert_eq!(
+                provider_summary_tx(&tx, "provider").unwrap().pending_units,
+                0
+            );
+            reconcile_wallet_tx(&tx, "buyer").unwrap();
+            tx.commit().unwrap();
+        }
+    }
+
+    #[test]
+    fn pause_notice_is_once_per_suspension_not_per_reconciliation_cursor() {
+        let conn = memory();
+        let start = "2026-01-01T00:00:00+00:00";
+        let first = "2026-01-01T00:00:05+00:00";
+        let second = "2026-01-01T00:00:15+00:00";
+        let id = client_monthly_fixture(&conn, start, 0);
+        for (status, at) in [
+            ("suspended", first),
+            ("active", "2026-01-01T00:00:10+00:00"),
+            ("suspended", second),
+        ] {
+            conn.execute(
+                "UPDATE market_platform_contracts SET status=?2,updated_at=?3 WHERE id=?1",
+                params![id, status, at],
+            )
+            .unwrap();
+            if status == "suspended" {
+                for tick in 0..=3 {
+                    let time =
+                        (parse_time(at).unwrap() + chrono::Duration::seconds(tick)).to_rfc3339();
+                    conn.execute(
+                        "UPDATE market_platform_contracts SET updated_at=?2 WHERE id=?1",
+                        params![id, time],
+                    )
+                    .unwrap();
+                    notify_contract_tx(
+                        &conn,
+                        &id,
+                        "contract_suspended",
+                        "insufficient_funds",
+                        &time,
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        let mut statement=conn.prepare("SELECT dedupe_key FROM market_notification_outbox WHERE object_id=?1 AND event_kind='contract_suspended' ORDER BY created_at").unwrap();
+        let keys = statement
+            .query_map(params![id], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            keys,
+            vec![
+                format!("contract_suspended:{id}:{first}"),
+                format!("contract_suspended:{id}:{second}")
+            ]
+        );
+    }
+
+    #[test]
+    fn client_trial_worker_preserves_pause_and_reaches_warning_and_termination() {
+        let conn = memory();
+        let start = "2026-01-01T00:00:00+00:00";
+        let end = parse_time(start).unwrap() + chrono::Duration::seconds(5);
+        let id = client_monthly_fixture(&conn, start, 5);
+        // Another commitment leaves this trial unfunded; no manual wallet
+        // edits may break the journal/hold invariants in the regression.
+        reserve_wallet_tx(
+            &conn,
+            "buyer",
+            "test",
+            "other-commitment",
+            "budget",
+            units_from_minor(1000).unwrap(),
+            None,
+            start,
+        )
+        .unwrap();
+        conn.execute("INSERT INTO installation_health_checks(installation_id,checked_at,is_healthy,status,reason) VALUES('installation-1',?1,1,'healthy','route_healthy')",params![end.timestamp()]).unwrap();
+        let actions = reconcile_platform_contracts_tx(&conn, end).unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, PlatformControlKind::Suspend);
+        conn.execute("UPDATE client_market_subscriptions SET status='billing_suspended' WHERE installation_id='installation-1'",[]).unwrap();
+        for tick in 1..=120 {
+            assert!(
+                reconcile_platform_contracts_tx(&conn, end + chrono::Duration::seconds(tick * 5))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let suspended: String = conn
+            .query_row(
+                "SELECT suspended_at FROM market_platform_contracts WHERE id=?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(parse_time(&suspended).unwrap(), end);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM market_notification_outbox WHERE object_id=?1 AND event_kind='contract_suspended'",params![id],|r|r.get::<_,i64>(0)).unwrap(),1);
+        for offset in [0, 5] {
+            assert!(
+                reconcile_platform_contracts_tx(
+                    &conn,
+                    end + chrono::Duration::days(5) + chrono::Duration::seconds(offset)
+                )
+                .unwrap()
+                .is_empty()
+            );
+        }
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM market_notification_outbox WHERE object_id=?1 AND event_kind='contract_terminating_soon'",params![id],|r|r.get::<_,i64>(0)).unwrap(),1);
+        assert!(
+            reconcile_platform_contracts_tx(&conn, end + chrono::Duration::days(7))
+                .unwrap()
+                .is_empty()
+        );
+        let actions = reconcile_platform_contracts_tx(
+            &conn,
+            end + chrono::Duration::days(7) + chrono::Duration::seconds(5),
+        )
+        .unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, PlatformControlKind::Terminate);
+        reconcile_wallet_tx(&conn, "buyer").unwrap();
     }
 
     #[test]

@@ -544,7 +544,16 @@ fn resolved_payment_cases_and_changed_service_states_do_not_send_stale_instructi
     i.recipient_user_id = "another-user".into();
     assert!(!notice_current_tx(&conn, &i, AT).unwrap());
     i = item("contract_suspended", json!({"contractId":"service"}));
+    i.payload["notificationEventKey"] = json!("contract_suspended:service:2026-10-24T00:00:00Z");
     assert!(notice_current_tx(&conn, &i, AT).unwrap());
+    // Still suspended is not enough: this notice must belong to the current
+    // uninterrupted suspension, not an old episode or a retry timestamp.
+    i.payload["notificationEventKey"] = json!("contract_suspended:service:2026-10-24T00:00:05Z");
+    assert!(!notice_current_tx(&conn, &i, AT).unwrap());
+    i.payload["notificationEventKey"] = json!("contract_suspended:service:2026-10-24T00:00:00Z");
+    i.payload["suspensionStartedAt"] = json!("2026-10-23T00:00:00Z");
+    assert!(!notice_current_tx(&conn, &i, AT).unwrap());
+    i.payload["suspensionStartedAt"] = Value::Null;
     i.event_kind = "contract_terminating_soon".into();
     i.payload["notificationEventKey"] =
         json!("contract_terminating_soon:service:2026-10-24T00:00:00Z");
@@ -565,6 +574,135 @@ fn resolved_payment_cases_and_changed_service_states_do_not_send_stale_instructi
     assert!(!notice_current_tx(&conn, &i, AT).unwrap());
     i.event_kind = "contract_terminated".into();
     assert!(notice_current_tx(&conn, &i, AT).unwrap());
+}
+
+#[test]
+fn pause_delivery_identity_is_stable_and_reuses_the_historical_provider_key() {
+    let conn = db();
+    let mut first = task(&conn);
+    first.event_kind = "contract_suspended".into();
+    first.payload = json!({
+        "contractId":"service", "suspensionStartedAt":AT,
+        "notificationEventKey":format!("contract_suspended:service:{AT}")
+    });
+    let mut legacy = task(&conn);
+    legacy.event_kind = first.event_kind.clone();
+    legacy.payload = first.payload.clone();
+    legacy
+        .payload
+        .as_object_mut()
+        .unwrap()
+        .remove("suspensionStartedAt");
+    assert_eq!(
+        semantic_key(&first, "service_paused"),
+        semantic_key(&legacy, "service_paused")
+    );
+    let a = sending(
+        prepare_tx(
+            &conn,
+            &legacy,
+            "email",
+            "service_paused",
+            envelope(),
+            true,
+            AT,
+        )
+        .unwrap(),
+    );
+    finish_attempt_tx(&conn, &a, &Ok("pause-receipt".into()), AT).unwrap();
+    first.payload["notificationTime"] = json!("2026-10-25T12:05:00+00:00");
+    first.payload["notificationEventKey"] = json!("changed-by-a-retry");
+    assert!(matches!(
+        prepare_tx(&conn, &first, "email", "service_paused", envelope(), true, AT).unwrap(),
+        Prepared::Done(status) if status == "sent"
+    ));
+    assert_eq!(
+        conn.query_row(
+            "SELECT idempotency_key FROM market_notification_deliveries",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        a.key
+    );
+    first.payload["suspensionStartedAt"] = json!("2026-10-26T12:00:00+00:00");
+    assert_ne!(
+        semantic_key(&first, "service_paused"),
+        semantic_key(&legacy, "service_paused")
+    );
+}
+
+#[test]
+fn obsolete_channel_cleanup_preserves_sent_receipts_and_live_or_uncertain_attempts() {
+    let conn = db();
+    let notice = task(&conn);
+    let mut live = None;
+    for (purpose, finish) in [
+        ("sent", true),
+        ("queued", false),
+        ("live", false),
+        ("expired", false),
+    ] {
+        let a =
+            sending(prepare_tx(&conn, &notice, "email", purpose, envelope(), true, AT).unwrap());
+        if finish {
+            finish_attempt_tx(&conn, &a, &Ok("known-receipt".into()), AT).unwrap();
+        } else if purpose == "queued" {
+            finish_attempt_tx(&conn, &a, &Err(failure("HTTP 429", true, None)), AT).unwrap();
+        } else if purpose == "expired" {
+            conn.execute(
+                "UPDATE market_notification_deliveries SET claim_expires_at=?2 WHERE id=?1",
+                params![a.id, AT],
+            )
+            .unwrap();
+        } else if purpose == "live" {
+            live = Some(a);
+        }
+    }
+    assert_eq!(
+        policy::suppress_obsolete_deliveries_tx(&conn, &notice, AT).unwrap(),
+        Some(
+            DateTime::parse_from_rfc3339(AT)
+                .unwrap()
+                .with_timezone(&Utc)
+                + chrono::Duration::seconds(CLAIM_SECS)
+        ),
+    );
+    for (purpose, expected) in [
+        ("sent", "sent"),
+        ("queued", "suppressed"),
+        ("live", "claimed"),
+        ("expired", "uncertain"),
+    ] {
+        assert_eq!(
+            conn.query_row(
+                "SELECT status FROM market_notification_deliveries WHERE purpose=?1",
+                params![purpose],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            expected
+        );
+    }
+    finish_attempt_tx(&conn, &live.unwrap(), &Ok("late-receipt".into()), AT).unwrap();
+    assert!(
+        policy::suppress_obsolete_deliveries_tx(&conn, &notice, AT)
+            .unwrap()
+            .is_none()
+    );
+    conn.execute(
+        "UPDATE market_notification_outbox SET status='claimed',attempts=1",
+        [],
+    )
+    .unwrap();
+    finish_tx(&conn, &notice, &Ok("superseded".into()), AT).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT status FROM market_notification_outbox", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .unwrap(),
+        "sent"
+    );
 }
 
 #[test]

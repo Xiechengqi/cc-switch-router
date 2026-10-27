@@ -53,6 +53,15 @@ pub(super) fn purpose(item: &Claimed) -> Option<&'static str> {
 
 pub(super) fn semantic_key(item: &Claimed, purpose: &str) -> String {
     let created = text_field(item, "notificationTime");
+    if purpose == "service_paused" {
+        let contract = text_field(item, "contractId");
+        let started = text_field(item, "suspensionStartedAt");
+        if !contract.is_empty() && !started.is_empty() {
+            // Keep the historical key shape so an attempted legacy envelope
+            // keeps its original provider idempotency key after an upgrade.
+            return format!("service_paused:contract_suspended:{contract}:{started}");
+        }
+    }
     if purpose == "funding_summary" {
         return format!("funding:{}", created.get(..10).unwrap_or(&item.id));
     }
@@ -285,9 +294,19 @@ pub(super) async fn deliver(
     };
     let (recipient, content) = {
         let conn = state.store.conn.lock().await;
-        if !super::notice_current_tx(&conn, item, &crate::market_wallet::now())
+        let time = crate::market_wallet::now();
+        if !super::notice_current_tx(&conn, item, &time)
             .map_err(|e| failure(&e.to_string(), true, None))?
         {
+            if let Some(lease) = super::policy::suppress_obsolete_deliveries_tx(&conn, item, &time)
+                .map_err(|e| failure(&e.to_string(), true, None))?
+            {
+                return Err(failure(
+                    "obsolete notification awaits an in-flight delivery result",
+                    true,
+                    Some(lease),
+                ));
+            }
             return Ok("superseded".into());
         }
         let recipient =
