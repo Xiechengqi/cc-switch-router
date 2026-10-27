@@ -312,6 +312,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         89,
         include_str!("../schema/0089_market_suspension_notifications.sql"),
     ),
+    (90, include_str!("../schema/0090_user_passwords.sql")),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -821,10 +822,90 @@ fn migration_checksum(sql: &str) -> String {
 mod tests {
     use super::*;
 
+    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 241;
+
     mod suspension;
 
     fn memory_connection() -> Connection {
         Connection::open_in_memory().expect("open test database")
+    }
+
+    #[test]
+    fn migration_90_adds_optional_passwords_without_rewriting_sessions_tokens_or_money() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 89);
+        let at = "2026-10-27T00:00:00Z";
+        conn.execute("INSERT INTO users(id,email_normalized,status,email_verified_at,created_at,last_login_at)
+            VALUES('password-upgrade','upgrade@example.test','active',?1,?1,?1)", params![at]).unwrap();
+        conn.execute("INSERT INTO user_sessions(id,user_id,auth_source_kind,auth_source_id,access_token_hash,refresh_token_hash,access_expires_at,refresh_expires_at,created_at,last_used_at)
+            VALUES('old-session','password-upgrade','auth_device','browser','old-access','old-refresh','2099-01-01T00:00:00Z','2099-02-01T00:00:00Z',?1,?1)", params![at]).unwrap();
+        conn.execute("INSERT INTO user_api_tokens(id,user_id,name,token_hash,token_prefix,scopes_json,created_at)
+            VALUES('old-api-token','password-upgrade','default','api-hash','api-prefix','[]',?1)", params![at]).unwrap();
+        crate::market_wallet::credit_verified_topup_tx(
+            &conn,
+            "password-upgrade",
+            "upgrade-topup",
+            1234,
+            "receipt",
+            at,
+        )
+        .unwrap();
+        let before = crate::market_wallet::wallet_snapshot_tx(&conn, "password-upgrade").unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT auth_version FROM users WHERE id='password-upgrade'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        let session: (String, String, i64, String, Option<String>, Option<String>, Option<String>) = conn.query_row(
+            "SELECT access_token_hash,refresh_token_hash,auth_version,auth_method,email_authenticated_at,login_event_id,revoked_at FROM user_sessions WHERE id='old-session'", [],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).unwrap();
+        assert_eq!(
+            session,
+            (
+                "old-access".into(),
+                "old-refresh".into(),
+                0,
+                "legacy".into(),
+                None,
+                None,
+                None
+            )
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT token_hash FROM user_api_tokens WHERE id='old-api-token'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "api-hash"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM user_password_credentials", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+        let after = crate::market_wallet::wallet_snapshot_tx(&conn, "password-upgrade").unwrap();
+        assert_eq!(
+            (before.posted_units, before.held_units, before.version),
+            (after.posted_units, after.held_units, after.version)
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -1203,7 +1284,7 @@ mod tests {
             0
         );
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM pragma_table_info('market_c2c_policy') WHERE name='acceptance_minutes'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
-        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",[],|r|r.get::<_,i64>(0)).unwrap(),237);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",[],|r|r.get::<_,i64>(0)).unwrap(),CURRENT_SCHEMA_TABLE_COUNT);
         for id in [
             "awaiting_seller",
             "awaiting_payment",
@@ -1689,7 +1770,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count baseline tables");
-        assert_eq!(table_count, 237);
+        assert_eq!(table_count, CURRENT_SCHEMA_TABLE_COUNT);
         let removed_client_recovery_table_count = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -2270,7 +2351,7 @@ mod tests {
             .unwrap();
         apply(&conn).unwrap();
         apply(&conn).unwrap();
-        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",[],|r|r.get::<_,i64>(0)).unwrap(),237);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",[],|r|r.get::<_,i64>(0)).unwrap(),CURRENT_SCHEMA_TABLE_COUNT);
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM market_journal_postings", [], |r| r
                 .get::<_, i64>(0))
@@ -2498,7 +2579,11 @@ mod tests {
         // narrowly scoped dispute-handler authorization table, plus immutable
         // session authorizations and per-channel notification deliveries.
         // Contacts add one table; exact quota attribution adds two stream tables.
-        assert_eq!(tables_after - tables_before, 25);
+        // Optional passwords add credentials, attempts, audit and notification tables.
+        assert_eq!(
+            tables_after - tables_before,
+            CURRENT_SCHEMA_TABLE_COUNT - 212
+        );
         assert_eq!(
             conn.query_row(
                 "SELECT converted_units FROM market_provider_earning_lots WHERE id = 'old-lot'",

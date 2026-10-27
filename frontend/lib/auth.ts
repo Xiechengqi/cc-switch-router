@@ -1,6 +1,7 @@
 "use client";
 
-import type { SessionStatus } from "@/lib/types";
+import type { AuthResult, SessionStatus } from "@/lib/types";
+import { sameLoginContext } from "@/lib/password-auth";
 
 const AUTH_KEY = "cc_switch_router_auth_v2";
 const PROTOCOL_EPOCH = "namespace-flat-1";
@@ -17,6 +18,7 @@ export type AuthState = {
   publicKey?: string | null;
   privateKey?: string | null;
   email?: string | null;
+  loginEpoch?: string | null;
   accessToken?: string | null;
   refreshToken?: string | null;
   expiresAt?: string | null;
@@ -54,13 +56,14 @@ export function mergeAuthState(patch: AuthState) {
   return next;
 }
 
-export function clearSessionTokens() {
+export function clearSessionTokens({ preserveLoginEpoch = false }: { preserveLoginEpoch?: boolean } = {}) {
   const state = readAuthState();
   mergeAuthState({
     authDeviceId: state.authDeviceId || null,
     publicKey: state.publicKey || null,
     privateKey: state.privateKey || null,
-    email: null,
+    email: preserveLoginEpoch ? state.email : null,
+    loginEpoch: preserveLoginEpoch ? state.loginEpoch : null,
     accessToken: null,
     refreshToken: null,
     expiresAt: null,
@@ -308,7 +311,10 @@ async function handleUnauthorizedRefresh(state: AuthState, crossTabLockHeld: boo
   if (!crossTabLockHeld) await waitForFallbackRefreshRecheck();
   const changedResult = changedSessionResult(state);
   if (changedResult !== null) return changedResult;
-  clearSessionTokens();
+  // Server-side expiry/revocation is not an explicit logout intent. Keep the
+  // context marker so an in-flight successful password change can accept its
+  // replacement tokens; the server still validates every credential version.
+  clearSessionTokens({ preserveLoginEpoch: true });
   return false;
 }
 
@@ -390,23 +396,34 @@ function requestWithAccessToken(input: RequestInfo | URL, init: RequestInit, acc
   return fetch(input, { ...init, headers });
 }
 
-export async function authFetch(input: RequestInfo | URL, init: RequestInit = {}) {
+function checkLoginContext(expected: AuthState | undefined, current = readAuthState()) {
+  if (expected && !sameLoginContext(expected, current)) {
+    throw new AuthError("Your sign-in session changed. Sign in again.", "password_session_changed");
+  }
+}
+
+export async function authFetch(input: RequestInfo | URL, init: RequestInit = {}, expectedContext?: AuthState) {
   let state = readAuthState();
+  checkLoginContext(expectedContext, state);
   if (accessTokenExpiresSoon(state)) {
     await refreshAccessToken();
     state = readAuthState();
+    checkLoginContext(expectedContext, state);
   }
 
   const attemptedAccessToken = bearerTokenForRequest(state);
   const response = await requestWithAccessToken(input, init, attemptedAccessToken);
   if (response.status !== 401) return response;
 
+  checkLoginContext(expectedContext);
   let currentAccessToken = bearerTokenForRequest(readAuthState());
   if (currentAccessToken && currentAccessToken !== attemptedAccessToken) {
     return requestWithAccessToken(input, init, currentAccessToken);
   }
 
-  if (await refreshAccessToken()) {
+  const refreshed = await refreshAccessToken();
+  checkLoginContext(expectedContext);
+  if (refreshed) {
     currentAccessToken = bearerTokenForRequest(readAuthState());
     if (currentAccessToken) return requestWithAccessToken(input, init, currentAccessToken);
   }
@@ -464,7 +481,8 @@ export async function requestEmailCode(email: string) {
   }
 }
 
-export async function verifyEmailCode(email: string, code: string, identity: AuthDeviceIdentity) {
+export async function verifyEmailCode(email: string, code: string, identity: AuthDeviceIdentity): Promise<AuthResult> {
+  const started = readAuthState();
   const response = await fetch("/v1/auth/email/verify-code", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -472,15 +490,58 @@ export async function verifyEmailCode(email: string, code: string, identity: Aut
   });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data?.message || `verify failed (${response.status})`);
+  return acceptAuthResult(data, identity, started);
+}
+
+export class AuthError extends Error {
+  constructor(message: string, public readonly code?: string) { super(message); }
+}
+
+function acceptAuthResult(data: AuthResult, identity: AuthDeviceIdentity | undefined, started: AuthState) {
+  checkLoginContext(started);
   mergeAuthState({
-    authDeviceId: identity.authDeviceId,
-    publicKey: identity.publicKey,
-    privateKey: identity.privateKey,
-    email: data.user?.email || email,
-    accessToken: data.accessToken,
-    refreshToken: data.refreshToken,
-    expiresAt: data.expiresAt,
-    refreshExpiresAt: data.refreshExpiresAt,
+    ...(identity || {}), email: data.user.email,
+    loginEpoch: crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`,
+    accessToken: data.accessToken, refreshToken: data.refreshToken,
+    expiresAt: data.expiresAt, refreshExpiresAt: data.refreshExpiresAt,
   });
   return data;
+}
+
+async function loginWithPasswordIdentity(email: string, password: string, identity: AuthDeviceIdentity, started: AuthState): Promise<AuthResult> {
+  checkLoginContext(started);
+  const signed = await signAuthPayloadWithIdentity(identity, "auth_password_login", { email, password });
+  checkLoginContext(started);
+  const response = await fetch("/v1/auth/password/login", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password, ...signed }),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new AuthError(data.message || "Password login failed", data.code || (response.status === 429 ? "password_rate_limited" : undefined));
+  return acceptAuthResult(data, identity, started);
+}
+
+export async function loginWithPassword(email: string, password: string): Promise<AuthResult> {
+  const started = readAuthState();
+  let identity = await ensureAuthDeviceIdentity();
+  try {
+    return await loginWithPasswordIdentity(email, password, identity, started);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!(error instanceof AuthError) || error.code || !shouldResetAuthDeviceIdentity(message)) throw error;
+    checkLoginContext(started);
+    identity = await replaceAuthDeviceIdentity(identity.authDeviceId);
+    return loginWithPasswordIdentity(email, password, identity, started);
+  }
+}
+
+export async function updateLoginPassword(newPassword: string, expectedVersion: number, currentPassword?: string): Promise<AuthResult> {
+  const started = readAuthState();
+  const response = await authFetch("/v1/auth/password", {
+    method: "PUT", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ newPassword, currentPassword, expectedVersion }),
+  }, started);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new AuthError(data.message || "Password update failed", data.code || (response.status === 429 ? "password_rate_limited" : undefined));
+  return acceptAuthResult(data, undefined, started);
 }

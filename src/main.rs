@@ -72,6 +72,7 @@ mod telegram;
 #[cfg(test)]
 mod test_support;
 mod usage_account;
+mod user_cli;
 mod user_notification_health;
 
 use std::collections::HashSet;
@@ -413,6 +414,30 @@ async fn main() -> Result<()> {
     info!("ssh listener bound on {}", config.ssh_addr);
 
     let (background_shutdown_tx, background_shutdown_rx) = watch::channel(false);
+
+    let password_notice_store = state.store.clone();
+    let password_notice_config = config.clone();
+    let password_notice_task = spawn_background_task(
+        "password security notifications",
+        background_shutdown_rx.clone(),
+        async move {
+            crate::store::password_auth::deliver_notices(
+                password_notice_store,
+                password_notice_config,
+            )
+            .await
+        },
+    );
+    #[cfg(unix)]
+    let user_admin_task = {
+        let listener = user_cli::bind(&config)?;
+        let store = state.store.clone();
+        spawn_background_task(
+            "local user administration",
+            background_shutdown_rx.clone(),
+            async move { user_cli::serve(listener, store).await },
+        )
+    };
 
     let ip_blacklist_log_task = spawn_background_task(
         "IP blacklist logger",
@@ -940,6 +965,7 @@ async fn main() -> Result<()> {
     };
 
     let mut background_tasks = vec![
+        ("password security notifications", password_notice_task),
         ("cleanup", cleanup_task),
         ("Share request watchdog", share_request_watchdog_task),
         ("IP blacklist logger", ip_blacklist_log_task),
@@ -963,6 +989,8 @@ async fn main() -> Result<()> {
         ("Market payments", market_payments_task),
         ("Market notifications", market_notifications_task),
     ];
+    #[cfg(unix)]
+    background_tasks.push(("local user administration", user_admin_task));
     if let Some(task) = database_sync_task {
         background_tasks.push(("database sync", task));
     }
@@ -1492,6 +1520,10 @@ async fn try_handle_cli() -> Result<bool> {
     };
 
     match arg.as_str() {
+        "user" => {
+            user_cli::run(args.collect()).await?;
+            Ok(true)
+        }
         "build-info" => {
             println!(
                 "{}",
@@ -1581,6 +1613,10 @@ Usage:
   cc-switch-router check-db
   cc-switch-router build-info
   cc-switch-router rotate-provision-ssh-key
+  cc-switch-router user password status --email EMAIL [--env-file PATH] [--offline]
+  cc-switch-router user password set --email EMAIL [--env-file PATH] [--offline]
+  cc-switch-router user password set --email EMAIL --password-stdin --yes
+  cc-switch-router user password result --operation-id UUID [--env-file PATH] [--offline]
   cc-switch-router help
   cc-switch-router --help
   cc-switch-router -h

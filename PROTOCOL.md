@@ -101,6 +101,16 @@ Dashboard 浏览器通过 `POST /v1/auth/devices/register` 建立 `kind=browser`
 
 Client Web 邮箱登录使用 `/v1/client-web/auth/email/request-code` 和 `/v1/client-web/auth/email/verify-code`,由 Server 使用自己的 installation 私钥签名,因此 challenge 来源是 `client_installation`。Session 创建后只由 access/refresh token 标识；refresh 请求只提交 `refreshToken`,不会把 Session 生命周期绑到来源记录是否仍存在。
 
+### 3.2 Router 可选密码登录
+
+`POST /v1/auth/password/login` 接收 `email`、`password`、`authDeviceId`、`timestampMs`、`nonce`、`signature`，按 action `auth_password_login` 签名。payload 为规范化小写邮箱和原样密码的紧凑 JSON，字段顺序固定为 `{"email":"...","password":"..."}`。密码不能 trim。此 nonce 使用独立 action 持久化；签名时钟窗口沿用通用请求契约。请求体最大 4096 字节。
+
+成功返回与验证码验证相同的用户和 Session token 字段（不创建／返回 API Token），并增加 `password: { hasPassword, version, canResetWithoutPassword, loginEventId }`。`session/me`、验证码验证和 refresh 也返回当前用户自己的该状态。未知用户和未设密码返回相同的 `401 password_unavailable`；已设密码但密码错误、账号禁用或邮箱未验证返回 `401 password_invalid`。
+
+`PUT /v1/auth/password` 接收 `newPassword`、可选 `currentPassword` 和 `expectedVersion`。只接受当前有效 Session 显式 Bearer，校验浏览器 Origin，不允许 Cookie／API Token／开发模式替代。最近真实邮箱验证在 10 分钟内时无需旧密码，否则必须提供旧密码；首次设置必须有最近邮箱证明。旧密码错误和证明不足分别为 `403 password_current_invalid`／`403 password_email_required`，不当作全局 Session 401。并发凭据变更为 `409 password_changed`。尝试过量为 `429`，计算繁忙为 `503 password_busy`。
+
+凭据更新原子提升用户 `auth_version` 并撤销全部旧 Session；网页更新返回替换 Session。CLI 更新不返回用户 Session。refresh 继承原认证方式、邮箱验证时间和 login event，不延长邮箱证明，也不能通过 rotation grace 恢复改密前的会话。历史 Session 的认证方式为 `legacy`，邮箱证明为空。CLI、限流与运维见 [密码登录文档](docs/password-authentication.md)。
+
 ### 2.3 Gateway（中性容量接入身份）
 
 Gateway 不是 Client，也不是旧 Token Market 注册。它是一个外部容量消费者在**单个 Router**上的 Ed25519 公钥身份。当前注册接口仍是公开的基础注册；`ownerEmail` 是调用方自报、未验证的本地审计元数据，不参与 Share 可见性、proxy、headroom、feedback 或 observation 授权，也不会创建下游用户、API key、余额或 token 账本：

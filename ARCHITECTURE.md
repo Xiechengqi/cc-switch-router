@@ -237,6 +237,14 @@ routes: Arc<RwLock<HashMap<String, LogicalRoute>>>
 
 ## 4. 认证与准入
 
+### 用户登录与密码救援
+
+Router 默认邮箱验证码登录，可选密码登录。`store::password_auth` 使用 Argon2id（64 MiB / t=3 / p=1），限制两个并发计算任务，并在计算前持久化邮箱、来源、设备与全局尝试预算。网页改密和本机 CLI 共用 credential version-CAS 事务，同时写 hash、撤销全部旧 Session（含 refresh 宽限）、审计与邮件 outbox；不改变 API Token、角色或资金。
+
+`user_sessions` 保存真实认证方式、原始邮箱验证时间和登录事件 ID。刷新仅继承这些事实，不续期最近 10 分钟的邮箱证明。旧 Session 不追认新证明。Session 解析和 refresh 使用权威数据库写事务检查 `auth_version`，包括 Turso 委派到主库的事务读取。
+
+`user_cli` 通过受限本机 Unix socket 在线管理任意已有用户；只有 root／服务 UID 可用。显式离线模式复用进程锁和项目数据库层，不运行迁移、不建用户、不自动回退写库。安全通知为英文带样式邮件，冻结内容和幂等键，限次退避重试，发送失败不回滚改密。详见 [密码登录与本机管理](docs/password-authentication.md)。
+
 ### SSH 面
 
 见 [PROTOCOL.md](PROTOCOL.md) 第 5 节。要点:仅一次性密码认证、用户名必须为 UUID、无 shell / exec / sftp、只放行 `tcpip_forward`。
@@ -309,7 +317,7 @@ Router 侧并发只按三类键限制:`share_id`(Share 并发池)、免费 Share
 | 通知 | `installation_notification_state`、`client_notification_events`、`client_notification_runtime`、`notification_deliveries`、`notification_delivery_items`、`notification_delivery_attempts`、`user_notification_channels`、`telegram_bot_runtime`、`telegram_bind_tokens`、`telegram_inbound_updates`、`telegram_poll_cursors`、`bark_binding_attempts`、`bark_provider_runtime` |
 | 运维告警信号 | `operator_alert_signal_outbox` |
 | 聊天 | `chat_rooms`、`chat_messages`、`chat_visits`、`share_presence_state`、`client_chat_system_outbox`、`chat_public_payment_assets`、`chat_rate_limit`、`chat_email_events`、`chat_email_deliveries`、`chat_email_delivery_items` |
-| 认证 | `users`（含用量卡片公开开关）、`user_sessions`、`user_api_tokens`、`email_login_challenges` |
+| 认证 | `users`（含用量卡片公开开关与 auth version）、`user_sessions`、`user_api_tokens`、`email_login_challenges`、`user_password_credentials`、`auth_password_attempts`、`auth_password_events`、`auth_password_notifications` |
 | 用户模型路由 | `user_model_routing_profiles`、`user_model_routes`、`user_model_route_events` |
 
 ### 账户用量（Provider / Consumer）

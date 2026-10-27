@@ -3,7 +3,24 @@ export type AuthUser = {
   email: string;
 };
 
+export type PasswordState = {
+  hasPassword: boolean;
+  version: number;
+  canResetWithoutPassword: boolean;
+  loginEventId?: string | null;
+};
+
+export type AuthResult = {
+  user: AuthUser;
+  accessToken: string;
+  refreshToken: string;
+  expiresAt: string;
+  refreshExpiresAt: string;
+  password?: PasswordState;
+};
+
 export type SessionStatus = {
+  password?: PasswordState;
   authenticated: boolean;
   user?: AuthUser;
   expiresAt?: string;

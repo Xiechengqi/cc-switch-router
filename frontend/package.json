@@ -36,7 +36,9 @@
     "audit:model-prices": "node ../scripts/audit/audit-model-prices.mjs --check",
     "test:client-checkout-browser": "node scripts/client-checkout-browser-test.mjs",
     "test:wallet-checkout-browser": "node scripts/wallet-checkout-browser-test.mjs",
-    "test:navbar-wallet-browser": "node scripts/navbar-wallet-browser-test.mjs"
+    "test:navbar-wallet-browser": "node scripts/navbar-wallet-browser-test.mjs",
+    "test:auth-password": "tsx --test lib/password-auth.test.ts lib/password-auth-transport.test.ts",
+    "test:auth-password-browser": "node scripts/auth-password-browser-test.mjs"
   },
   "dependencies": {
     "@heroui/react": "^3.0.4",

@@ -256,10 +256,11 @@ function DashboardNav({
 }
 
 function Topbar({ active }: { active: DashboardShellActive }) {
-  const { session, loading, logout } = useAuth();
+  const { session, loading, logout, openPasswordSettings, passwordSettingsOpen } = useAuth();
   const { t } = useLocaleText();
   const router = useRouter();
   const [loginOpen, setLoginOpen] = React.useState(false);
+  const [loginResetPassword, setLoginResetPassword] = React.useState(false);
   const [clientRedirect, setClientRedirect] = React.useState<string | null>(null);
   const [pendingAccessRequests, setPendingAccessRequests] = React.useState(0);
   const redirectStartedRef = React.useRef(false);
@@ -304,20 +305,23 @@ function Topbar({ active }: { active: DashboardShellActive }) {
   // 由 Topbar 统一接住打开 LoginDialog。和 router-auth-changed 同模式（见
   // AuthProvider）。
   React.useEffect(() => {
-    const handler = () => setLoginOpen(true);
+    const handler = (event: Event) => {
+      setLoginResetPassword(!!(event as CustomEvent<{ resetPassword?: boolean }>).detail?.resetPassword);
+      setLoginOpen(true);
+    };
     window.addEventListener("router-open-login", handler);
     return () => window.removeEventListener("router-open-login", handler);
   }, []);
 
   React.useEffect(() => {
-    if (!clientRedirect || loading || !authed || redirectStartedRef.current) return;
+    if (!clientRedirect || loading || !authed || loginOpen || passwordSettingsOpen || redirectStartedRef.current) return;
     redirectStartedRef.current = true;
     refreshAccessToken()
       .catch(() => false)
       .finally(() => {
         window.location.replace(clientRedirect);
       });
-  }, [authed, clientRedirect, loading]);
+  }, [authed, clientRedirect, loading, loginOpen, passwordSettingsOpen]);
 
   return (
     <>
@@ -369,6 +373,10 @@ function Topbar({ active }: { active: DashboardShellActive }) {
                       <KeyRound className="h-4 w-4" />
                       API Token
                     </Dropdown.Item>
+                    {session?.password ? <Dropdown.Item id="login-password" onAction={openPasswordSettings}>
+                      <KeyRound className="h-4 w-4" />
+                      {t(session.password.hasPassword ? "auth.password.changeTitle" : "auth.password.setTitle")}
+                    </Dropdown.Item> : null}
                     {session?.isAdmin ? (
                       <>
                         <Dropdown.Item id="operations" onAction={() => window.open("/operations/", "_blank", "noopener,noreferrer")}>
@@ -397,7 +405,7 @@ function Topbar({ active }: { active: DashboardShellActive }) {
                 variant="ghost"
                 size="sm"
                 className="h-11 shrink-0 px-2.5 text-sm font-medium text-slate-500 hover:text-slate-700 active:bg-slate-100"
-                onClick={() => setLoginOpen(true)}
+                onClick={() => { setLoginResetPassword(false); setLoginOpen(true); }}
                 isDisabled={loading}
               >
                 {t("nav.login")}
@@ -408,7 +416,7 @@ function Topbar({ active }: { active: DashboardShellActive }) {
         </header>
       </div>
 
-      <LoginDialog open={loginOpen} onOpenChange={setLoginOpen} />
+      <LoginDialog open={loginOpen} onOpenChange={setLoginOpen} resetPassword={loginResetPassword} />
     </>
   );
 }

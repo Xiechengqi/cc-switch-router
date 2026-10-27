@@ -65,6 +65,7 @@ jobs:
           bash ../scripts/ci/timed.sh 'Flags' npm run test:flags
           npm run test:token-units
           npm run test:usd-micros
+          npm run test:auth-password
           npm run test:market-wallet
           npm run test:share-market
           npm run test:client-market
@@ -101,6 +102,7 @@ jobs:
           bash ../scripts/ci/timed.sh 'Wallet checkout browser' npm run test:wallet-checkout-browser
           bash ../scripts/ci/timed.sh 'C2C browser' npm run test:c2c-browser
           bash ../scripts/ci/timed.sh 'Navbar wallet browser' npm run test:navbar-wallet-browser
+          bash ../scripts/ci/timed.sh 'Password authentication browser' npm run test:auth-password-browser
 
   rust-tests:
     runs-on: ubuntu-22.04
@@ -142,6 +144,14 @@ jobs:
           bash scripts/ci/timed.sh 'Market contracts' cargo test --locked market_ -- --skip schema::tests
           bash scripts/ci/timed.sh 'Share rental contracts' cargo test --locked share_market::tests
           bash scripts/ci/timed.sh 'Client rental contracts' cargo test --locked client_market::tests
+
+      - name: Test password authentication and administrator CLI
+        run: |
+          bash scripts/ci/timed.sh 'Password credentials' cargo test --locked password_auth::tests
+          bash scripts/ci/timed.sh 'Password HTTP boundaries' cargo test --locked password_ -- --skip password_auth::tests
+          bash scripts/ci/timed.sh 'User administrator CLI' cargo test --locked user_cli::tests
+          bash scripts/ci/timed.sh 'Session authentication' cargo test --locked session_
+          bash scripts/ci/timed.sh 'Email authentication' cargo test --locked auth_code_verification_
 
       - name: Test real migrations without template shortcuts
         run: bash scripts/ci/timed.sh 'Real schema migrations' cargo test --locked schema::tests

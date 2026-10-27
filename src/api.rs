@@ -130,6 +130,7 @@ const SHARE_EDIT_WAKE_RETRY_ATTEMPTS: usize = 3;
 const DASHBOARD_REQUEST_TICKER_LIMIT: usize = 100;
 const ROUTER_ACCESS_COOKIE: &str = "cc_switch_router_access";
 const INSTALLATION_CONTROL_BODY_LIMIT_BYTES: usize = 16 * 1024;
+const PASSWORD_BODY_LIMIT_BYTES: usize = 4096;
 const INSTALLATION_UPGRADE_TASK_PAYLOAD_BUDGET_BYTES: usize = 512 * 1024;
 const INSTALLATION_UPGRADE_TASK_BODY_LIMIT_BYTES: usize =
     INSTALLATION_UPGRADE_TASK_PAYLOAD_BUDGET_BYTES + 32 * 1024;
@@ -141,6 +142,13 @@ where
     S: Clone + Send + Sync + 'static,
 {
     route.layer(DefaultBodyLimit::max(INSTALLATION_CONTROL_BODY_LIMIT_BYTES))
+}
+
+fn password_body_limited<S>(route: MethodRouter<S>) -> MethodRouter<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    route.layer(DefaultBodyLimit::max(PASSWORD_BODY_LIMIT_BYTES))
 }
 
 fn installation_upgrade_task_body_limited<S>(route: MethodRouter<S>) -> MethodRouter<S>
@@ -381,6 +389,14 @@ pub fn router(state: ServerState) -> Router {
         )
         .route("/v1/auth/email/request-code", post(request_email_code))
         .route("/v1/auth/email/verify-code", post(verify_email_code))
+        .route(
+            "/v1/auth/password/login",
+            password_body_limited(post(password_login)),
+        )
+        .route(
+            "/v1/auth/password",
+            password_body_limited(put(update_password)),
+        )
         .route(
             "/v1/client-web/auth/email/request-code",
             post(request_client_web_email_code),
@@ -3250,6 +3266,56 @@ async fn verify_email_code(
     Ok(with_session_cookie(&state, Json(response)))
 }
 
+async fn password_login(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(input): Json<crate::store::password_auth::PasswordLoginRequest>,
+) -> Result<Response, AppError> {
+    let scheme = if state.config.use_localhost {
+        "http"
+    } else {
+        "https"
+    };
+    crate::market_finance_auth::check_browser_origin(
+        &headers,
+        &format!(
+            "{scheme}://{}",
+            state.config.tunnel_domain.trim_end_matches('/')
+        ),
+    )?;
+    let response = state
+        .store
+        .password_login(
+            &state.config,
+            input,
+            extract_client_metadata(&headers, addr),
+        )
+        .await?;
+    Ok(with_session_cookie(&state, Json(response)))
+}
+
+async fn update_password(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(input): Json<crate::store::password_auth::PasswordUpdateRequest>,
+) -> Result<Response, AppError> {
+    // Explicit bearer + exact trusted origin. Never use the cookie/dev/API-key fallback.
+    let session = crate::market_finance_auth::write_session(&state, &headers).await?;
+    let metadata = extract_client_metadata(&headers, addr);
+    let response = state
+        .store
+        .update_password(
+            &state.config,
+            &session,
+            input,
+            metadata.ip.as_deref().unwrap_or("unknown"),
+        )
+        .await?;
+    Ok(with_session_cookie(&state, Json(response)))
+}
+
 async fn verify_client_web_email_code(
     State(state): State<ServerState>,
     Json(input): Json<ClientWebVerifyEmailCodeRequest>,
@@ -3897,6 +3963,40 @@ mod tests {
         server.abort();
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn password_body_limits_reject_before_credential_handlers() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/v1/auth/password/login",
+                password_body_limited(post(counted_json_handler)),
+            )
+            .route(
+                "/v1/auth/password",
+                password_body_limited(put(counted_json_handler)),
+            )
+            .with_state(calls.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        for (method, path) in [
+            (reqwest::Method::POST, "/v1/auth/password/login"),
+            (reqwest::Method::PUT, "/v1/auth/password"),
+        ] {
+            let response = reqwest::Client::new()
+                .request(method, format!("http://{address}{path}"))
+                .json(&serde_json::json!({"password":"x".repeat(PASSWORD_BODY_LIMIT_BYTES)}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        }
+        server.abort();
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
@@ -6420,6 +6520,7 @@ fn dev_auth_session() -> AuthSession {
 fn dev_session_status() -> SessionStatusResponse {
     let session = dev_auth_session();
     SessionStatusResponse {
+        password: None,
         authenticated: true,
         user: Some(crate::models::AuthUser {
             id: session.user_id,

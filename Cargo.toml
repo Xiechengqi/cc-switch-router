@@ -6,6 +6,7 @@ build = "build.rs"
 
 [dependencies]
 anyhow = "1"
+argon2 = { version = "0.5", features = ["zeroize"] }
 async-stream = "0.3"
 async-trait = "0.1"
 axum = { version = "0.7", features = ["json", "ws"] }
@@ -23,6 +24,7 @@ httpdate = "1"
 hex = "0.4"
 http = "1"
 libsql = { version = "=0.9.30", default-features = false, features = ["replication", "tls"] }
+libc = "0.2"
 portable-pty = "0.8"
 percent-encoding = "2"
 rand = "0.8"
@@ -43,5 +45,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
-zeroize = { version = "1", features = ["derive"] }
+zeroize = { version = "1", features = ["derive", "serde"] }
 rpassword = "7"

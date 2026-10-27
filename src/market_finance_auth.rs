@@ -33,6 +33,14 @@ pub(crate) fn check_write_origin(
             "a Router login session bearer is required".into(),
         ));
     }
+    check_browser_origin(headers, trusted_origin)
+}
+
+/// Reject browser cross-origin writes. Non-browser signed clients may omit Origin.
+pub(crate) fn check_browser_origin(
+    headers: &HeaderMap,
+    trusted_origin: &str,
+) -> Result<(), AppError> {
     if headers
         .get("sec-fetch-site")
         .is_some_and(|v| v == "cross-site")
@@ -168,6 +176,18 @@ pub(crate) fn test_session(user: &str) -> AuthSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn password_login_origin_check_does_not_require_a_session_but_rejects_foreign_browsers() {
+        let mut headers = HeaderMap::new();
+        assert!(check_browser_origin(&headers, "https://router.test").is_ok());
+        headers.insert(header::ORIGIN, "https://router.test".parse().unwrap());
+        assert!(check_browser_origin(&headers, "https://router.test").is_ok());
+        headers.insert(header::ORIGIN, "https://share.router.test".parse().unwrap());
+        assert!(check_browser_origin(&headers, "https://router.test").is_err());
+        headers.remove(header::ORIGIN);
+        headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
+        assert!(check_browser_origin(&headers, "https://router.test").is_err());
+    }
     #[test]
     fn financial_writes_require_an_explicit_session_and_exact_trusted_origin() {
         let mut h = HeaderMap::new();

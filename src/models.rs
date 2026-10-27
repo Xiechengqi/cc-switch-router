@@ -320,6 +320,8 @@ pub struct ClientWebVerifyEmailCodeRequest {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VerifyEmailCodeResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<crate::store::password_auth::PasswordState>,
     pub user: AuthUser,
     pub access_token: String,
     pub refresh_token: String,
@@ -504,6 +506,8 @@ pub struct RefreshSessionRequest {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionStatusResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<crate::store::password_auth::PasswordState>,
     pub authenticated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<AuthUser>,

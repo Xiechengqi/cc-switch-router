@@ -109,6 +109,7 @@ use crate::registration_admission::{
 };
 
 pub(crate) mod client_chat;
+pub(crate) mod password_auth;
 
 const SHARE_REQUEST_LOG_RECOVERY_LIMIT: usize = 10;
 pub const IMAGE_GENERATION_REQUEST_LOG_RETAIN_PER_SHARE: usize = 10;
@@ -7006,7 +7007,14 @@ impl AppStore {
                 nonce,
                 signature,
             )?;
-            consume_auth_source_nonce(&conn, source_kind, source_id, nonce, request_at)?;
+            consume_auth_source_nonce(
+                &conn,
+                source_kind,
+                source_id,
+                "auth_request_code",
+                nonce,
+                request_at,
+            )?;
             enforce_auth_send_limits(
                 &conn,
                 config,
@@ -7203,11 +7211,14 @@ impl AppStore {
             last_used_at: now,
         };
         persist_session(&tx, &session)?;
+        password_auth::record_email_login(&tx, &session.session_id, now)?;
+        let password = Some(password_auth::session_state(&tx, &session.session_id, now)?);
         let (api_token, api_token_status) = ensure_default_user_api_token(&tx, &user.id, now)?;
         tx.commit()
             .map_err(|e| AppError::Internal(format!("commit email verification failed: {e}")))?;
 
         Ok(VerifyEmailCodeResponse {
+            password,
             user,
             access_token,
             refresh_token,
@@ -7227,7 +7238,7 @@ impl AppStore {
         let refresh_hash = hash_token(input.refresh_token.trim());
         let conn = self.conn.lock().await;
         let tx = conn
-            .unchecked_transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| AppError::Internal(format!("begin refresh session failed: {e}")))?;
         let current = get_refreshable_session_by_refresh_hash(&tx, &refresh_hash, now)?
             .ok_or_else(|| AppError::Unauthorized("refresh session not found".into()))?;
@@ -7276,10 +7287,17 @@ impl AppStore {
             last_used_at: now,
         };
         persist_session(&tx, &replacement)?;
+        password_auth::inherit_login(&tx, &current.session_id, &replacement.session_id)?;
+        let password = Some(password_auth::session_state(
+            &tx,
+            &replacement.session_id,
+            now,
+        )?);
         tx.commit()
             .map_err(|e| AppError::Internal(format!("commit refresh session failed: {e}")))?;
 
         Ok(VerifyEmailCodeResponse {
+            password,
             user,
             access_token,
             refresh_token,
@@ -7297,6 +7315,7 @@ impl AppStore {
     ) -> Result<SessionStatusResponse, AppError> {
         let Some(access_token) = access_token.map(str::trim).filter(|v| !v.is_empty()) else {
             return Ok(SessionStatusResponse {
+                password: None,
                 authenticated: false,
                 user: None,
                 expires_at: None,
@@ -7308,7 +7327,28 @@ impl AppStore {
             .resolve_session_by_access_token(access_token)
             .await?
             .ok_or_else(|| AppError::Unauthorized("session not found".into()))?;
+        let password = {
+            let conn = self.conn.lock().await;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|e| {
+                    AppError::Internal(format!("begin password session status failed: {e}"))
+                })?;
+            get_session_by_access_hash(&tx, &session.access_token_hash)?
+                .filter(|s| s.access_expires_at > Utc::now())
+                .ok_or_else(|| AppError::Unauthorized("session not found".into()))?;
+            let password = Some(password_auth::session_state(
+                &tx,
+                &session.session_id,
+                Utc::now(),
+            )?);
+            tx.commit().map_err(|e| {
+                AppError::Internal(format!("commit password session status failed: {e}"))
+            })?;
+            password
+        };
         Ok(SessionStatusResponse {
+            password,
             authenticated: true,
             user: Some(AuthUser {
                 id: session.user_id,
@@ -7720,7 +7760,7 @@ impl AppStore {
         let now = Utc::now();
         let conn = self.conn.lock().await;
         let tx = conn
-            .unchecked_transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| AppError::Internal(format!("begin session resolution failed: {e}")))?;
         let Some(session) = get_session_by_access_hash(&tx, &hash_token(access_token))? else {
             return Ok(None);
@@ -27518,6 +27558,7 @@ fn consume_auth_source_nonce(
     conn: &Connection,
     source_kind: &str,
     source_id: &str,
+    action: &str,
     nonce: &str,
     now: DateTime<Utc>,
 ) -> Result<(), AppError> {
@@ -27525,8 +27566,8 @@ fn consume_auth_source_nonce(
         AUTH_SOURCE_AUTH_DEVICE => {
             conn.execute(
                 "INSERT INTO auth_device_nonces (auth_device_id, action, nonce, created_at)
-                 VALUES (?1, 'auth_request_code', ?2, ?3)",
-                params![source_id, nonce, now.to_rfc3339()],
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![source_id, action, nonce, now.to_rfc3339()],
             )
             .map_err(|error| {
                 let text = error.to_string();
@@ -27547,13 +27588,9 @@ fn consume_auth_source_nonce(
             })?;
             Ok(())
         }
-        AUTH_SOURCE_CLIENT_INSTALLATION => consume_authenticated_installation_nonce(
-            conn,
-            source_id,
-            "auth_request_code",
-            nonce,
-            now,
-        ),
+        AUTH_SOURCE_CLIENT_INSTALLATION => {
+            consume_authenticated_installation_nonce(conn, source_id, action, nonce, now)
+        }
         _ => Err(AppError::BadRequest(
             "unsupported authentication source".into(),
         )),
@@ -27889,8 +27926,9 @@ fn persist_session(conn: &Connection, session: &AuthSession) -> Result<(), AppEr
     conn.execute(
         "INSERT INTO user_sessions (
             id, user_id, auth_source_kind, auth_source_id, access_token_hash, refresh_token_hash,
-            access_expires_at, refresh_expires_at, revoked_at, created_at, last_used_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10)",
+            access_expires_at, refresh_expires_at, revoked_at, created_at, last_used_at, auth_version
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10,
+            (SELECT auth_version FROM users WHERE id = ?2))",
         params![
             session.session_id,
             session.user_id,
@@ -27934,7 +27972,8 @@ fn get_session_by_access_hash(
                 s.access_expires_at, s.refresh_expires_at, s.created_at, s.last_used_at, u.email_normalized
          FROM user_sessions s
          INNER JOIN users u ON u.id = s.user_id
-         WHERE s.access_token_hash = ?1 AND s.revoked_at IS NULL",
+         WHERE s.access_token_hash = ?1 AND s.revoked_at IS NULL
+           AND s.auth_version = u.auth_version AND u.status = 'active'",
         params![access_hash],
         map_auth_session_row,
     )
@@ -27956,6 +27995,7 @@ fn get_refreshable_session_by_refresh_hash(
          FROM user_sessions s
          INNER JOIN users u ON u.id = s.user_id
          WHERE s.refresh_token_hash = ?1
+           AND s.auth_version = u.auth_version AND u.status = 'active'
            AND (s.revoked_at IS NULL OR s.rotated_at >= ?2)",
         params![refresh_hash, rotation_cutoff],
         map_auth_session_row,
@@ -28653,7 +28693,7 @@ fn gateway_share_label(share_id: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::Config;
     use crate::models::{
@@ -29489,7 +29529,7 @@ mod tests {
         );
     }
 
-    fn test_config(name: &str) -> Config {
+    pub(crate) fn test_config(name: &str) -> Config {
         let db_path =
             std::env::temp_dir().join(format!("cc-switch-router-{name}-{}.db", Uuid::new_v4()));
         let data_dir = db_path

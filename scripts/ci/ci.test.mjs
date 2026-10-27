@@ -43,7 +43,7 @@ test("parallel CI retains every existing financial gate and separates profile ca
   assert.doesNotMatch(source, /path: frontend\/\.next\s*$/m);
   assert.match(job("frontend"), /name: frontend-\$\{\{ github.sha \}\}/);
   assert.match(job("build"), /name: frontend-\$\{\{ github.sha \}\}/);
-  for (const command of ["test:flags", "test:token-units", "test:usd-micros", "test:market-wallet", "test:share-model-probe", "test:share-model-health-heatmap", "audit:settings-i18n", "audit:market-billing-contract", "audit:web-token-units", "audit:share-model-health-contract", "audit:model-prices", "test:wallet-checkout-browser", "test:c2c-browser", "test:navbar-wallet-browser"]) {
+  for (const command of ["test:flags", "test:token-units", "test:usd-micros", "test:market-wallet", "test:share-model-probe", "test:share-model-health-heatmap", "audit:settings-i18n", "audit:market-billing-contract", "audit:web-token-units", "audit:share-model-health-contract", "audit:model-prices", "test:wallet-checkout-browser", "test:c2c-browser", "test:navbar-wallet-browser", "test:auth-password", "test:auth-password-browser"]) {
     assert.ok(job("frontend").includes(`npm run ${command}`), `lost frontend gate: ${command}`);
   }
   assert.match(job("rust-tests"), /cargo test --locked market_ -- --skip schema::tests/);
@@ -55,6 +55,9 @@ test("parallel CI retains every existing financial gate and separates profile ca
   assert.match(job("rust-tests"), /cargo test --locked schema::tests/);
   assert.match(job("rust-tests"), /cargo test --locked test_support::tests/);
   assert.match(job("rust-tests"), /cargo test --locked db::tests/);
+  for (const suite of ["password_auth::tests", "password_", "user_cli::tests", "session_", "auth_code_verification_"]) {
+    assert.ok(job("rust-tests").includes(`cargo test --locked ${suite}`), `lost authentication gate: ${suite}`);
+  }
   assert.match(job("build"), /verify-release\.mjs/);
   assert.doesNotMatch(source, /git push|release delete|continue-on-error/);
 });

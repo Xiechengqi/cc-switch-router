@@ -97,7 +97,7 @@ API 路由按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
 | /v1/market-providers* | 2 | 公开 | Provider 排名与详情，不查询分户资金 |
 | /v1/market-access/* | 10 | Session / scoped API Token | 准入策略、买家规则、申请及原子批量保存；不处理授信 |
 | `/v1/gateway/*`、`/v1/gateways/*` | 5 | Ed25519 签名(`x-cc-gateway-*`) | `register`、`shares`、`shares/headroom`、`shares/feedback`、`request-logs/batch`；签名绑定原始 body，owner email、Free 与 ShareTo 均不授权，新 grant contract 前普通 Share 整体 fail-closed |
-| `/v1/auth/*` | 6 | 公开 / Session | `devices/register`、`email/request-code`、`email/verify-code`、`session/refresh`、`session/me`、`session/logout` |
+| `/v1/auth/*` | 8 | 公开 / Session | `devices/register`、`email/request-code`、`email/verify-code`、`password/login`、`password`、`session/refresh`、`session/me`、`session/logout` |
 | `/v1/tunnels/*` | 4 | Ed25519 签名 | `lease`、`lease/renew`、`activate`、`state` |
 | /v1/account/provider-contacts | 1 | Session | GET/PUT 业务联系方式，不含收款方式或凭据 |
 | `/v1/public/*` | 5 | 公开 | `map-points`、`network-stats`、`usage/global`、`embed/global.svg`、`embed/usage/:user_id` |
@@ -430,12 +430,22 @@ dashboard 当前行为:
 - 页脚 `PAGE ONLINE` 右侧在 free plan 且 Resend 返回 `x-resend-daily-quota` 时,会显示 `RESEND USAGE xx%`
 - Resend 用量由服务端每 10 分钟主动请求一次并缓存;若响应头不存在,则页脚只显示 `PAGE ONLINE`
 
-邮件登录相关端点:
+用户登录相关端点:
 
 - `POST /v1/auth/email/request-code` 请求邮件验证码
 - `POST /v1/auth/email/verify-code` 校验验证码并签发 access / refresh token
+- `POST /v1/auth/password/login` 已设置密码的用户用密码登录
+- `PUT /v1/auth/password` 当前 Session 设置／修改密码，其他旧 Session 立即失效
 - `POST /v1/auth/session/refresh` 刷新会话
 - `GET /v1/auth/session/me` 查询当前浏览器登录态
+
+默认仍为验证码登录。未设置密码的用户每次真实完成验证码登录后会出现一次可关闭的设置弹窗，右上角用户菜单也可设置／修改密码。忘记密码时使用验证码登录再重置。部署管理员可以在本机为任意已有用户设置密码：
+
+```bash
+cc-switch-router user password set --email user@example.com --env-file /path/to/router.env
+```
+
+默认通过受限 Unix socket 在线操作；停服救援需显式加 `--offline` 并取得进程锁。密码不接受明文命令行参数，不依赖发信服务。规则、权限、标准输入和超时恢复见 [密码登录与 CLI 管理](docs/password-authentication.md)。
 
 `GET /v1/public/map-points` 返回公开地图所需的点位数据,其中 `clients` 是按国家质心聚合后的地图点数组,每个点包含 `count`;`clientCount` 是符合条件的真实活跃 client 总数,两者可能不相等。
 

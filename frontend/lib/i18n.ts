@@ -10,6 +10,7 @@ import { marketOwnerMessagesEn, marketOwnerMessagesZh } from "@/lib/market-owner
 import { walletPolicyMessagesEn, walletPolicyMessagesZh } from "@/lib/wallet-policy-messages";
 import { earningConversionMessagesEn, earningConversionMessagesZh } from "@/lib/earning-conversion-messages";
 import { marketC2CMessagesEn, marketC2CMessagesZh } from "@/lib/market-c2c-messages";
+import { passwordMessagesEn, passwordMessagesZh } from "@/lib/password-messages";
 
 export const LOCALE_STORAGE_KEY = "cc_switch_router_locale_v1";
 export const SUPPORTED_LOCALES = ["en", "zh-CN"] as const;
@@ -19,6 +20,7 @@ export type MessageKey = keyof typeof messages.en;
 
 export const messages = {
   en: {
+    ...passwordMessagesEn,
     "marketAccess.decision.inherit": "Use default",
     "marketAccess.decision.allow": "Allow",
     "marketAccess.decision.deny": "Deny",
@@ -1819,7 +1821,7 @@ export const messages = {
     "createClient.noCapacity": "No idle host matches the current selection.",
     "createClient.subdomainTaken": "Subdomain is not available",
     "createClient.close": "Close",
-    "auth.title": "Share Email Login",
+    "auth.title": "Sign in",
     "auth.email": "Email",
     "auth.code": "Code",
     "auth.sendCode": "Send Code",
@@ -3523,6 +3525,7 @@ export const messages = {
     ...walletPolicyMessagesEn,
   },
   "zh-CN": {
+    ...passwordMessagesZh,
     "marketAccess.decision.inherit": "使用默认策略",
     "marketAccess.decision.allow": "允许",
     "marketAccess.decision.deny": "拒绝",
@@ -5279,7 +5282,7 @@ export const messages = {
     "createClient.noCapacity": "当前选择没有匹配的空闲主机。",
     "createClient.subdomainTaken": "子域名不可用",
     "createClient.close": "关闭",
-    "auth.title": "邮箱登录",
+    "auth.title": "登录",
     "auth.email": "邮箱",
     "auth.code": "验证码",
     "auth.sendCode": "发送验证码",
