@@ -64,6 +64,8 @@ Clients 页的每个 client 条目提供「控制台」和「终端」两个入�
 
 Client Web tunnel:静态资源和明确列出的登录/OAuth 回调公开;其余 `/web-api/*` 默认要求 owner/admin 身份,Router 鉴权后向 client 注入可信身份头。`/api/*`、`/v1/*`、`/_ctl/*` 和 `/_share-router/*` 不通过 client web tunnel 暴露。流式管理接口必须使用 `Authorization` header,不接受 query-string token。
 
+Client Market 新付费租用按日历月从平台余额预付。供应商月租收益以付费周期起点为锚点，每小时依据已持久化的健康/访问控制记录批量结算；健康观测仍保持短周期，故障或缺失证据的时段不计入供应商收益，对应服务费用退回平台余额。到期或回收时结清不足一小时的已观测尾段，收益仍须经过 7 天沉淀期才自动转入余额。试用期间不扣租金、不冻结租金，也不产生供应商收益，但创建租用时必须具备首期所需余额；试用按已核实的健康服务时间消耗，结束后自动尝试扣除首个月租，扣款失败则立即进入回收流程。
+
 ## 用户统一模型入口
 
 每个区域额外提供一个可选的共享入口 `https://api.<TUNNEL_DOMAIN>`。用户在 Clients 页「我的」分页的「模型中枢」中维护精确的 `(App, 请求模型) → Share` 映射，同一把 Router API Key 可据此调用多个当前有权限的 Share。App 固定为 Claude、Codex、Gemini；模型名区分大小写且不会被 Router 改写。

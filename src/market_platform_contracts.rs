@@ -1737,6 +1737,10 @@ pub(crate) fn terminate_after_cleanup_tx(
     cleanup_confirmed: bool,
     now: &str,
 ) -> Result<ContractTermination, AppError> {
+    // Hourly posting must not discard already-observed service in the final
+    // partial hour. On uncertain cleanup these new lots are held below along
+    // with earlier income; no unobserved cleanup time becomes Provider income.
+    settle_client_monthly_evidence_tx(conn, contract_id, true, now)?;
     let was_ended: bool = conn
         .query_row(
             "SELECT status = 'ended' FROM market_platform_contracts WHERE id = ?1",
@@ -2103,7 +2107,12 @@ pub(crate) fn settle_monthly_segment_tx(
             },
         )
         .map_err(db_error("read open wallet service period"))?;
-    if !matches!(status.as_str(), "active" | "ending") {
+    // A Client's persisted pre-pause/pre-cleanup evidence may still have an
+    // unposted partial hour. Financial scope checks below continue to apply.
+    if !matches!(status.as_str(), "active" | "ending")
+        && !(product_kind == "client_host"
+            && matches!(status.as_str(), "suspended" | "review_required"))
+    {
         return Err(AppError::Conflict("monthly contract is not serving".into()));
     }
     let replay = conn
@@ -2262,6 +2271,138 @@ pub(crate) fn settle_monthly_segment_tx(
         amount_units: amount,
         replayed: false,
     })
+}
+
+/// Client monthly earnings advance in hours anchored to the paid period, not
+/// in five-second worker ticks. Keep collecting short health observations so
+/// outages, stale health and control fences within an hour remain unbillable.
+/// Reuse the period's financial cursor for durable, exactly-once posting; no
+/// in-memory accumulator or second source of money is needed across restarts.
+fn settle_client_monthly_evidence_tx(
+    conn: &Connection,
+    contract_id: &str,
+    flush_partial: bool,
+    now: &str,
+) -> Result<(), AppError> {
+    let period = conn
+        .query_row(
+            "SELECT period.period_start, period.period_end, period.settled_through_at,
+                    contract.last_evaluated_at
+             FROM market_platform_contracts contract
+             JOIN market_platform_periods period ON period.contract_id = contract.id
+              AND period.sequence = contract.current_period_sequence
+             WHERE contract.id = ?1 AND contract.product_kind = 'client_host'
+               AND contract.billing_model = 'calendar_month'
+               AND contract.status IN ('active', 'ending', 'suspended', 'review_required')
+               AND period.status = 'open'",
+            params![contract_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(db_error("read hourly Client settlement cursors"))?;
+    let Some((start, end, settled, observed)) = period else {
+        return Ok(());
+    };
+    let first = parse_time(&start)?;
+    let last = parse_time(&end)?;
+    let mut cursor = parse_time(&settled)?;
+    let observed_end = parse_time(&observed)?.min(parse_time(now)?).min(last);
+    let ready_end = if flush_partial || observed_end == last {
+        observed_end
+    } else {
+        first + chrono::Duration::hours((observed_end - first).num_seconds() / 3_600)
+    };
+    while cursor < ready_end {
+        let next_hour = first + chrono::Duration::hours((cursor - first).num_seconds() / 3_600 + 1);
+        let through = next_hour.min(ready_end);
+        let start_text = cursor.to_rfc3339();
+        let end_text = through.to_rfc3339();
+        // Evidence timestamps are normalized by record_service_evidence_tx.
+        // Include the preceding observation in case it crosses this hour's
+        // boundary, without scanning every earlier observation in the month.
+        let mut statement = conn
+            .prepare(
+                "SELECT started_at, ended_at, service_available
+                 FROM market_platform_service_evidence
+                 WHERE contract_id = ?1 AND source_kind = 'client_host_health'
+                   AND started_at >= COALESCE(
+                       (SELECT MAX(started_at) FROM market_platform_service_evidence
+                        WHERE contract_id = ?1 AND started_at <= ?2), ?2)
+                   AND started_at < ?3
+                 ORDER BY started_at",
+            )
+            .map_err(db_error("prepare hourly Client service evidence"))?;
+        let observations = statement
+            .query_map(params![contract_id, start_text, end_text], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            })
+            .map_err(db_error("query hourly Client service evidence"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_error("read hourly Client service evidence"))?;
+        let mut segments: Vec<(DateTime<Utc>, DateTime<Utc>, bool)> = Vec::new();
+        let mut append = |start, end, available| {
+            if let Some(previous) = segments.last_mut()
+                && previous.1 == start
+                && previous.2 == available
+            {
+                previous.1 = end;
+            } else {
+                segments.push((start, end, available));
+            }
+        };
+        let mut observed_cursor = cursor;
+        for (start, end, available) in observations {
+            let start = parse_time(&start)?.max(cursor);
+            let end = parse_time(&end)?.min(through);
+            if end <= cursor {
+                continue;
+            }
+            if start < observed_cursor || start >= end {
+                return Err(AppError::Conflict(
+                    "hourly Client service evidence overlaps or is invalid".into(),
+                ));
+            }
+            if start > observed_cursor {
+                append(observed_cursor, start, false);
+            }
+            append(start, end, available);
+            observed_cursor = end;
+        }
+        if observed_cursor < through {
+            append(observed_cursor, through, false);
+        }
+        // Merge only adjacent observations with the same availability. A
+        // healthy hour normally creates one income lot; mixed hours retain
+        // their exact outage boundaries and cumulative monetary rounding.
+        for (start, end, available) in segments {
+            settle_monthly_segment_tx(
+                conn,
+                contract_id,
+                &format!(
+                    "client-hourly:{}:{}",
+                    start.timestamp_millis(),
+                    end.timestamp_millis()
+                ),
+                &start.to_rfc3339(),
+                &end.to_rfc3339(),
+                available,
+                now,
+            )?;
+        }
+        cursor = through;
+    }
+    Ok(())
 }
 
 /// Do not reserve the next month in advance. Only a closed, already-ended
@@ -3086,6 +3227,11 @@ fn reconcile_service_interval_tx(
     if end <= cursor {
         return Ok(());
     }
+    if billing_model == "calendar_month" && status == "active" && product_kind == "client_host" {
+        // Batching income must not delay the existing fail-closed response to
+        // a finance hold until the next hourly posting boundary.
+        crate::market_reconcile::ensure_contract_finance_safe_tx(conn, contract_id)?;
+    }
     if billing_model == "metered" && status == "active" {
         // Settle any older persisted seconds first. A new observation must not
         // be created against a budget that has already run out; otherwise the
@@ -3290,15 +3436,17 @@ fn reconcile_service_interval_tx(
         // budget even if the latest health check has since failed.
         settle_metered_batch_tx(conn, contract_id, &now.to_rfc3339())?;
     } else {
-        settle_monthly_segment_tx(
-            conn,
-            contract_id,
-            &source_id,
-            &cursor.to_rfc3339(),
-            &split_end.to_rfc3339(),
-            available,
-            &now.to_rfc3339(),
-        )?;
+        if product_kind == "share" {
+            settle_monthly_segment_tx(
+                conn,
+                contract_id,
+                &source_id,
+                &cursor.to_rfc3339(),
+                &split_end.to_rfc3339(),
+                available,
+                &now.to_rfc3339(),
+            )?;
+        }
         let changed = conn
             .execute(
                 "UPDATE market_platform_contracts
@@ -3314,6 +3462,14 @@ fn reconcile_service_interval_tx(
             .map_err(db_error("advance wallet monthly observation cursor"))?;
         if changed != 1 {
             return Err(AppError::Conflict("wallet monthly cursor changed".into()));
+        }
+        if product_kind == "client_host" {
+            settle_client_monthly_evidence_tx(
+                conn,
+                contract_id,
+                expiry.is_some_and(|expires| split_end >= expires),
+                &now.to_rfc3339(),
+            )?;
         }
     }
     Ok(())
@@ -4184,7 +4340,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_uses_persisted_client_health_and_replays_without_double_earning() {
+    fn runtime_posts_client_monthly_income_hourly_without_double_earning() {
         let conn = memory();
         let start = "2026-01-01T00:00:00+00:00";
         let end = parse_time(start).unwrap() + chrono::Duration::seconds(5);
@@ -4208,7 +4364,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(earned > 0);
+        assert_eq!(earned, 0);
         assert_eq!(
             conn.query_row(
                 "SELECT COUNT(*) FROM market_platform_service_evidence WHERE contract_id = ?1",
@@ -4229,6 +4385,435 @@ mod tests {
             earned
         );
         reconcile_wallet_tx(&conn, "buyer").unwrap();
+        let start_at = parse_time(start).unwrap();
+        // Health and access are still checked every five seconds. A healthy
+        // hour should create one earning lot, not 720 small financial posts.
+        for tick in 2..=720 {
+            let at = start_at + chrono::Duration::seconds(tick * 5);
+            conn.execute(
+                "INSERT INTO installation_health_checks
+                    (installation_id, checked_at, is_healthy, status, reason)
+                 VALUES ('installation-1', ?1, 1, 'healthy', 'route_healthy')",
+                params![at.timestamp()],
+            )
+            .unwrap();
+            assert!(
+                reconcile_platform_contracts_tx(&conn, at)
+                    .unwrap()
+                    .is_empty()
+            );
+            if tick == 719 {
+                assert_eq!(
+                    provider_summary_tx(&conn, "provider")
+                        .unwrap()
+                        .gross_earned_units,
+                    0
+                );
+            }
+        }
+        let hour = start_at + chrono::Duration::hours(1);
+        let expected = units_from_minor(1_000).unwrap() / (31 * 24);
+        assert_eq!(
+            provider_summary_tx(&conn, "provider")
+                .unwrap()
+                .gross_earned_units,
+            expected
+        );
+        let (lots, maturity): (i64, String) = conn
+            .query_row(
+                "SELECT COUNT(*), MIN(unlock_at) FROM market_provider_earning_lots",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(lots, 1);
+        assert_eq!(
+            parse_time(&maturity).unwrap(),
+            hour + chrono::Duration::days(7)
+        );
+        // Replay and a new observation inside the next hour cannot repost the
+        // first hour or advance earnings prematurely.
+        for at in [hour, hour + chrono::Duration::seconds(5)] {
+            reconcile_platform_contracts_tx(&conn, at).unwrap();
+            assert_eq!(
+                provider_summary_tx(&conn, "provider")
+                    .unwrap()
+                    .gross_earned_units,
+                expected
+            );
+        }
+        reconcile_wallet_tx(&conn, "buyer").unwrap();
+    }
+
+    fn observe_client_fixture(conn: &Connection, at: DateTime<Utc>, healthy: bool) {
+        conn.execute(
+            "INSERT INTO installation_health_checks
+                (installation_id, checked_at, is_healthy, status, reason)
+             VALUES ('installation-1', ?1, ?2, ?3, 'test_observation')",
+            params![
+                at.timestamp(),
+                healthy,
+                if healthy { "healthy" } else { "unhealthy" }
+            ],
+        )
+        .unwrap();
+        reconcile_platform_contracts_tx(conn, at).unwrap();
+    }
+
+    #[test]
+    fn hourly_client_income_preserves_outages_and_never_backfills_worker_gaps() {
+        let conn = memory();
+        let start = "2026-01-01T00:17:00.125+00:00";
+        let first = parse_time(start).unwrap();
+        let id = client_monthly_fixture(&conn, start, 0);
+        // A subsecond activation fence requires the first health sample to be
+        // in a strictly later second, as it is here.
+        for (seconds, healthy) in [(5, true), (10, false), (15, true)] {
+            observe_client_fixture(&conn, first + chrono::Duration::seconds(seconds), healthy);
+        }
+        assert_eq!(
+            provider_summary_tx(&conn, "provider")
+                .unwrap()
+                .gross_earned_units,
+            0
+        );
+        let hour = first + chrono::Duration::hours(1);
+        // A fresh health sample after a worker gap cannot certify that gap.
+        observe_client_fixture(&conn, hour, true);
+        let (earned, refunded, cursor): (i64, i64, String) = conn
+            .query_row(
+                "SELECT fulfilled_units, refunded_units, settled_through_at
+                 FROM market_platform_periods WHERE contract_id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let allocated = |seconds: i64| units_from_minor(1_000).unwrap() * seconds / (31 * 86_400);
+        assert_eq!(earned, allocated(5) + allocated(15) - allocated(10));
+        assert_eq!(earned + refunded, allocated(3_600));
+        assert_eq!(parse_time(&cursor).unwrap(), hour);
+        assert_eq!(
+            provider_summary_tx(&conn, "provider")
+                .unwrap()
+                .gross_earned_units,
+            earned
+        );
+        assert_eq!(
+            wallet_snapshot_tx(&conn, "buyer").unwrap().posted_units,
+            refunded
+        );
+        reconcile_wallet_tx(&conn, "buyer").unwrap();
+    }
+
+    #[test]
+    fn hourly_client_settlement_reuses_durable_evidence_and_rejects_overlap() {
+        for overlap in [false, true] {
+            let conn = memory();
+            let start = "2026-01-01T00:00:00+00:00";
+            let first = parse_time(start).unwrap();
+            let id = client_monthly_fixture(&conn, start, 0);
+            for (from, to) in [(0, 10), (if overlap { 5 } else { 15 }, 20)] {
+                record_service_evidence_tx(
+                    &conn,
+                    &id,
+                    "client_host_health",
+                    first + chrono::Duration::seconds(from),
+                    first + chrono::Duration::seconds(to),
+                    "healthy",
+                    true,
+                    "service_healthy",
+                    start,
+                )
+                .unwrap();
+            }
+            let hour = (first + chrono::Duration::hours(1)).to_rfc3339();
+            conn.execute(
+                "UPDATE market_platform_contracts SET last_evaluated_at = ?2 WHERE id = ?1",
+                params![id, hour],
+            )
+            .unwrap();
+            // There is no in-memory aggregation state: a restarted worker can
+            // settle these rows, treating missing evidence as unavailable.
+            let result = settle_client_monthly_evidence_tx(&conn, &id, false, &hour);
+            if overlap {
+                assert!(matches!(result, Err(AppError::Conflict(_))));
+                assert_eq!(
+                    provider_summary_tx(&conn, "provider")
+                        .unwrap()
+                        .gross_earned_units,
+                    0
+                );
+            } else {
+                result.unwrap();
+                let earned = provider_summary_tx(&conn, "provider")
+                    .unwrap()
+                    .gross_earned_units;
+                assert!(earned > 0);
+                settle_client_monthly_evidence_tx(&conn, &id, false, &hour).unwrap();
+                assert_eq!(
+                    provider_summary_tx(&conn, "provider")
+                        .unwrap()
+                        .gross_earned_units,
+                    earned
+                );
+            }
+            reconcile_wallet_tx(&conn, "buyer").unwrap();
+        }
+    }
+
+    #[test]
+    fn hourly_client_finance_hold_does_not_wait_for_the_posting_boundary() {
+        let conn = memory();
+        let start = "2026-01-01T00:00:00+00:00";
+        let first = parse_time(start).unwrap();
+        let id = client_monthly_fixture(&conn, start, 0);
+        conn.execute(
+            "INSERT INTO market_finance_reconciliation_cases
+                (id, code, object_kind, object_id, status, created_at)
+             SELECT 'test-hold', 'period_unfulfilled_mismatch', 'period', id, 'open', ?2
+             FROM market_platform_periods WHERE contract_id = ?1",
+            params![id, start],
+        )
+        .unwrap();
+        observe_client_fixture(&conn, first + chrono::Duration::seconds(5), true);
+        let state: (String, String) = conn
+            .query_row(
+                "SELECT status, suspension_cause FROM market_platform_contracts WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("suspended".into(), "finance_hold".into()));
+        assert_eq!(
+            provider_summary_tx(&conn, "provider")
+                .unwrap()
+                .gross_earned_units,
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM market_platform_service_evidence WHERE contract_id = ?1",
+                params![id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        reconcile_wallet_tx(&conn, "buyer").unwrap();
+    }
+
+    #[test]
+    fn client_cleanup_flushes_only_observed_partial_hour_and_holds_uncertain_income() {
+        let conn = memory();
+        let start = "2026-01-01T00:00:00+00:00";
+        let first = parse_time(start).unwrap();
+        let id = client_monthly_fixture(&conn, start, 0);
+        observe_client_fixture(&conn, first + chrono::Duration::seconds(5), true);
+        observe_client_fixture(&conn, first + chrono::Duration::seconds(10), true);
+        let cleanup_at = (first + chrono::Duration::seconds(50)).to_rfc3339();
+        assert!(
+            !terminate_after_cleanup_tx(&conn, &id, false, &cleanup_at)
+                .unwrap()
+                .finalized
+        );
+        let earned = units_from_minor(1_000).unwrap() * 10 / (31 * 86_400);
+        let (gross, disputed, lots): (i64, i64, i64) = conn.query_row(
+            "SELECT SUM(amount_units), MIN(disputed), COUNT(*) FROM market_provider_earning_lots",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!((gross, disputed, lots), (earned, 1, 1));
+        assert!(
+            terminate_after_cleanup_tx(&conn, &id, true, &cleanup_at)
+                .unwrap()
+                .finalized
+        );
+        assert!(
+            terminate_after_cleanup_tx(&conn, &id, true, &cleanup_at)
+                .unwrap()
+                .finalized
+        );
+        assert_eq!(
+            provider_summary_tx(&conn, "provider")
+                .unwrap()
+                .gross_earned_units,
+            earned
+        );
+        assert_eq!(
+            wallet_snapshot_tx(&conn, "buyer").unwrap().posted_units,
+            units_from_minor(1_000).unwrap() - earned
+        );
+        reconcile_wallet_tx(&conn, "buyer").unwrap();
+    }
+
+    #[test]
+    fn client_expiry_flushes_partial_hour_before_dispatching_cleanup() {
+        let conn = memory();
+        let start = "2026-01-01T00:00:00+00:00";
+        let first = parse_time(start).unwrap();
+        let id = client_monthly_fixture(&conn, start, 0);
+        let expiry = first + chrono::Duration::seconds(12);
+        conn.execute(
+            "UPDATE client_market_subscriptions SET expires_at = ?1 WHERE installation_id = 'installation-1'",
+            params![expiry.to_rfc3339()],
+        ).unwrap();
+        observe_client_fixture(&conn, first + chrono::Duration::seconds(5), true);
+        observe_client_fixture(&conn, first + chrono::Duration::seconds(10), true);
+        let actions =
+            reconcile_platform_contracts_tx(&conn, first + chrono::Duration::seconds(15)).unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, PlatformControlKind::Terminate);
+        let earned = units_from_minor(1_000).unwrap() * 12 / (31 * 86_400);
+        assert_eq!(
+            provider_summary_tx(&conn, "provider")
+                .unwrap()
+                .gross_earned_units,
+            earned
+        );
+        let cursor: String = conn
+            .query_row(
+                "SELECT settled_through_at FROM market_platform_periods WHERE contract_id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(parse_time(&cursor).unwrap(), expiry);
+        reconcile_wallet_tx(&conn, "buyer").unwrap();
+    }
+
+    #[test]
+    fn hourly_client_settlement_closes_the_month_before_renewal() {
+        let conn = memory();
+        let start = "2026-01-01T00:00:00+00:00";
+        let id = client_monthly_fixture(&conn, start, 0);
+        let boundary = parse_time("2026-02-01T00:00:00+00:00").unwrap();
+        let tail = (boundary - chrono::Duration::seconds(5)).to_rfc3339();
+        settle_monthly_segment_tx(
+            &conn,
+            &id,
+            "prior-unavailable-month",
+            start,
+            &tail,
+            false,
+            &tail,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE market_platform_contracts SET last_evaluated_at = ?2 WHERE id = ?1",
+            params![id, tail],
+        )
+        .unwrap();
+        credit_verified_topup_tx(
+            &conn,
+            "buyer",
+            "renewal-topup",
+            1_000,
+            "renewal-receipt",
+            &tail,
+        )
+        .unwrap();
+        observe_client_fixture(&conn, boundary, true);
+        let periods: (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END)
+             FROM market_platform_periods WHERE contract_id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(periods, (2, 1));
+        assert!(
+            provider_summary_tx(&conn, "provider")
+                .unwrap()
+                .gross_earned_units
+                > 0
+        );
+        assert_eq!(
+            wallet_renewal_view_tx(&conn, &id, "buyer")
+                .unwrap()
+                .period_end
+                .as_deref(),
+            Some("2026-03-01T00:00:00+00:00")
+        );
+        reconcile_wallet_tx(&conn, "buyer").unwrap();
+    }
+
+    #[test]
+    fn client_trial_has_no_rent_debit_hold_or_earnings_until_paid_conversion() {
+        for convert in [false, true] {
+            let conn = memory();
+            let start = "2026-01-01T00:00:00+00:00";
+            let first = parse_time(start).unwrap();
+            let id = client_monthly_fixture(&conn, start, 20);
+            let original = units_from_minor(1_000).unwrap();
+            for (seconds, healthy) in [(5, false), (10, true), (15, true), (20, true)] {
+                observe_client_fixture(&conn, first + chrono::Duration::seconds(seconds), healthy);
+                let balance = wallet_snapshot_tx(&conn, "buyer").unwrap();
+                assert_eq!(
+                    (
+                        balance.posted_units,
+                        balance.available_units,
+                        balance.held_units
+                    ),
+                    (original, original, 0)
+                );
+                assert_eq!(
+                    provider_summary_tx(&conn, "provider")
+                        .unwrap()
+                        .gross_earned_units,
+                    0
+                );
+            }
+            let view = wallet_lifecycle_view_tx(&conn, &id, "buyer")
+                .unwrap()
+                .unwrap();
+            assert_eq!(view.status, "trialing");
+            assert_eq!(view.trial_seconds_remaining, 5);
+            let finish = first + chrono::Duration::seconds(25);
+            if convert {
+                observe_client_fixture(&conn, finish, true);
+                let balance = wallet_snapshot_tx(&conn, "buyer").unwrap();
+                assert_eq!((balance.posted_units, balance.held_units), (0, 0));
+                assert_eq!(
+                    wallet_lifecycle_view_tx(&conn, &id, "buyer")
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    "active"
+                );
+                let paid_start: String = conn
+                    .query_row(
+                        "SELECT paid_started_at FROM market_platform_contracts WHERE id = ?1",
+                        params![id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(parse_time(&paid_start).unwrap(), finish);
+            } else {
+                assert!(
+                    terminate_after_cleanup_tx(&conn, &id, true, &finish.to_rfc3339())
+                        .unwrap()
+                        .finalized
+                );
+                assert_eq!(
+                    wallet_snapshot_tx(&conn, "buyer").unwrap().posted_units,
+                    original
+                );
+                assert_eq!(
+                    conn.query_row("SELECT COUNT(*) FROM market_platform_periods", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                    0
+                );
+            }
+            assert_eq!(
+                provider_summary_tx(&conn, "provider")
+                    .unwrap()
+                    .gross_earned_units,
+                0
+            );
+            reconcile_wallet_tx(&conn, "buyer").unwrap();
+        }
     }
 
     #[test]
@@ -4245,6 +4830,15 @@ mod tests {
         )
         .unwrap();
         reconcile_platform_contracts_tx(&conn, start_at + chrono::Duration::seconds(10)).unwrap();
+        // Flush a partial hour as cleanup would, to inspect the exact health
+        // fence accounting separately from the hourly cadence test above.
+        settle_client_monthly_evidence_tx(
+            &conn,
+            &id,
+            true,
+            &(start_at + chrono::Duration::seconds(10)).to_rfc3339(),
+        )
+        .unwrap();
         let earned_before: i64 = conn
             .query_row(
                 "SELECT COALESCE(SUM(amount_units), 0) FROM market_provider_earning_lots",
@@ -4262,6 +4856,13 @@ mod tests {
         )
         .unwrap();
         reconcile_platform_contracts_tx(&conn, start_at + chrono::Duration::seconds(15)).unwrap();
+        settle_client_monthly_evidence_tx(
+            &conn,
+            &id,
+            true,
+            &(start_at + chrono::Duration::seconds(15)).to_rfc3339(),
+        )
+        .unwrap();
         assert_eq!(
             conn.query_row(
                 "SELECT COALESCE(SUM(amount_units), 0) FROM market_provider_earning_lots",
@@ -4289,6 +4890,13 @@ mod tests {
         )
         .unwrap();
         reconcile_platform_contracts_tx(&conn, start_at + chrono::Duration::seconds(20)).unwrap();
+        settle_client_monthly_evidence_tx(
+            &conn,
+            &id,
+            true,
+            &(start_at + chrono::Duration::seconds(20)).to_rfc3339(),
+        )
+        .unwrap();
         assert!(
             conn.query_row(
                 "SELECT COALESCE(SUM(amount_units), 0) FROM market_provider_earning_lots",
@@ -4427,6 +5035,7 @@ mod tests {
         let end = parse_time(start).unwrap() + chrono::Duration::seconds(5);
         let id = client_monthly_fixture(&conn, start, 0);
         reconcile_platform_contracts_tx(&conn, end).unwrap();
+        settle_client_monthly_evidence_tx(&conn, &id, true, &end.to_rfc3339()).unwrap();
         let (refunded, fulfilled): (i64, i64) = conn
             .query_row(
                 "SELECT refunded_units, fulfilled_units FROM market_platform_periods
@@ -4469,6 +5078,7 @@ mod tests {
         )
         .unwrap();
         reconcile_platform_contracts_tx(&conn, end).unwrap();
+        settle_client_monthly_evidence_tx(&conn, &id, true, &end.to_rfc3339()).unwrap();
         let (refunded, fulfilled): (i64, i64) = conn
             .query_row(
                 "SELECT refunded_units, fulfilled_units FROM market_platform_periods
@@ -4501,6 +5111,7 @@ mod tests {
         )
         .unwrap();
         reconcile_platform_contracts_tx(&conn, end).unwrap();
+        settle_client_monthly_evidence_tx(&conn, &id, true, &end.to_rfc3339()).unwrap();
         let (refunded, fulfilled): (i64, i64) = conn
             .query_row(
                 "SELECT refunded_units, fulfilled_units FROM market_platform_periods
@@ -4554,6 +5165,7 @@ mod tests {
         )
         .unwrap();
         reconcile_platform_contracts_tx(&conn, end).unwrap();
+        settle_client_monthly_evidence_tx(&conn, &valid_id, true, &end.to_rfc3339()).unwrap();
         assert!(
             conn.query_row(
                 "SELECT fulfilled_units FROM market_platform_periods WHERE contract_id = ?1",
