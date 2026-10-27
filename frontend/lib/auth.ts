@@ -535,11 +535,11 @@ export async function loginWithPassword(email: string, password: string): Promis
   }
 }
 
-export async function updateLoginPassword(newPassword: string, expectedVersion: number, currentPassword?: string): Promise<AuthResult> {
+export async function updateLoginPassword(newPassword: string, expectedVersion: number): Promise<AuthResult> {
   const started = readAuthState();
   const response = await authFetch("/v1/auth/password", {
     method: "PUT", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ newPassword, currentPassword, expectedVersion }),
+    body: JSON.stringify({ newPassword, expectedVersion }),
   }, started);
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new AuthError(data.message || "Password update failed", data.code || (response.status === 429 ? "password_rate_limited" : undefined));

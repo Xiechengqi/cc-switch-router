@@ -432,10 +432,11 @@ async fn main() -> Result<()> {
     let user_admin_task = {
         let listener = user_cli::bind(&config)?;
         let store = state.store.clone();
+        let admin_config = config.clone();
         spawn_background_task(
             "local user administration",
             background_shutdown_rx.clone(),
-            async move { user_cli::serve(listener, store).await },
+            async move { user_cli::serve(listener, store, admin_config).await },
         )
     };
 

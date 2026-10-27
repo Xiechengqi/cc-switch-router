@@ -13,3 +13,6 @@
 /frontend/public/flags/**/*.png
 /frontend/public/flags/.build.json
 /frontend/tsconfig.tsbuildinfo
+# Local key for short-lived password confirmation emails.
+password-notice-key
+.password-notice-key.*.tmp

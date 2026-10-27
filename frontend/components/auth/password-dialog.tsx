@@ -19,35 +19,21 @@ export function PasswordDialog({
   const { t } = useLocaleText();
   const [password, setPassword] = React.useState("");
   const [confirm, setConfirm] = React.useState("");
-  const [current, setCurrent] = React.useState("");
   const [error, setError] = React.useState("");
   const [busy, setBusy] = React.useState(false);
   const [saved, setSaved] = React.useState(false);
-  const [forceEmail, setForceEmail] = React.useState(false);
   const submitting = React.useRef(false);
   const target = React.useRef({ open, userId: session?.user?.id });
   target.current = { open, userId: session?.user?.id };
   const state = session?.password;
-  const needsEmail =
-    forceEmail ||
-    (!!state && !state.hasPassword && !state.canResetWithoutPassword);
-  const needsCurrent = !!state?.hasPassword && !state.canResetWithoutPassword;
   React.useEffect(() => {
     setPassword("");
     setConfirm("");
-    setCurrent("");
     setError("");
     setSaved(false);
-    setForceEmail(false);
   }, [open, session?.user?.id]);
-  const reauthenticate = () => {
-    onOpenChange(false);
-    window.dispatchEvent(
-      new CustomEvent("router-open-login", { detail: { resetPassword: true } }),
-    );
-  };
   async function save() {
-    if (submitting.current || !state || needsEmail) return;
+    if (submitting.current || !state) return;
     if (!validLoginPassword(password)) {
       setError(t("auth.password.policy"));
       return;
@@ -63,15 +49,10 @@ export function PasswordDialog({
     const stillCurrent = () =>
       target.current.open && target.current.userId === userId;
     try {
-      await updateLoginPassword(
-        password,
-        state.version,
-        needsCurrent ? current : undefined,
-      );
+      await updateLoginPassword(password, state.version);
       if (!stillCurrent()) return;
       setPassword("");
       setConfirm("");
-      setCurrent("");
       setSaved(true);
       await refresh();
     } catch (err) {
@@ -82,14 +63,6 @@ export function PasswordDialog({
       setError(key ? t(key) : err instanceof Error ? err.message : String(err));
       if (err instanceof AuthError && err.code === "password_changed")
         void refresh();
-      if (
-        err instanceof AuthError &&
-        ["password_email_required", "password_session_changed"].includes(
-          err.code || "",
-        )
-      )
-        setForceEmail(true);
-      setCurrent("");
     } finally {
       submitting.current = false;
       setBusy(false);
@@ -141,49 +114,25 @@ export function PasswordDialog({
                         : "auth.password.setupHint",
                     )}
                   </p>
-                  {needsEmail ? (
-                    <p className="text-sm text-slate-600">
-                      {t("auth.password.emailRequired")}
-                    </p>
-                  ) : (
-                    <>
-                      {needsCurrent ? (
-                        <PasswordField
-                          label={t("auth.password.current")}
-                          value={current}
-                          onChange={setCurrent}
-                          autoComplete="current-password"
-                          autoFocus
-                          disabled={busy}
-                        />
-                      ) : null}
-                      <PasswordField
-                        label={t("auth.password.new")}
-                        value={password}
-                        onChange={setPassword}
-                        autoFocus={!needsCurrent}
-                        disabled={busy}
-                      />
-                      <PasswordField
-                        label={t("auth.password.confirm")}
-                        value={confirm}
-                        onChange={setConfirm}
-                        disabled={busy}
-                      />
-                      <p className="text-xs text-slate-500">
-                        {t("auth.password.policy")}
-                      </p>
-                      {needsCurrent ? (
-                        <button
-                          type="button"
-                          className="justify-self-start text-sm text-accent hover:underline"
-                          onClick={reauthenticate}
-                        >
-                          {t("auth.password.forgot")}
-                        </button>
-                      ) : null}
-                    </>
-                  )}
+                  <p className="text-sm text-slate-500">
+                    {t("auth.password.emailNotice")}
+                  </p>
+                  <PasswordField
+                    label={t("auth.password.new")}
+                    value={password}
+                    onChange={setPassword}
+                    autoFocus
+                    disabled={busy}
+                  />
+                  <PasswordField
+                    label={t("auth.password.confirm")}
+                    value={confirm}
+                    onChange={setConfirm}
+                    disabled={busy}
+                  />
+                  <p className="text-xs text-slate-500">
+                    {t("auth.password.policy")}
+                  </p>
                 </>
               )}
               {error ? (
@@ -208,30 +157,14 @@ export function PasswordDialog({
                 )}
               </Button>
               {!saved ? (
-                needsEmail ? (
-                  <Button
-                    type="button"
-                    variant="primary"
-                    onClick={reauthenticate}
-                  >
-                    {t("auth.password.useEmail")}
-                  </Button>
-                ) : (
-                  <Button
-                    type="submit"
-                    variant="primary"
-                    isDisabled={
-                      busy ||
-                      !state ||
-                      !password ||
-                      !confirm ||
-                      (needsCurrent && !current)
-                    }
-                  >
-                    {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-                    {t("auth.password.save")}
-                  </Button>
-                )
+                <Button
+                  type="submit"
+                  variant="primary"
+                  isDisabled={busy || !state || !password || !confirm}
+                >
+                  {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                  {t("auth.password.save")}
+                </Button>
               ) : null}
             </Modal.Footer>
           </Form>

@@ -31,7 +31,7 @@ export function shouldPromptForPassword(
 export function validLoginPassword(password: string) {
   const length = Array.from(password).length;
   return (
-    length >= 12 &&
+    length >= 6 &&
     length <= 128 &&
     !/[\p{Cc}]/u.test(password) &&
     password.trim().length > 0
@@ -41,8 +41,6 @@ export function validLoginPassword(password: string) {
 export const passwordErrorKeys = {
   password_unavailable: "auth.password.unavailable",
   password_invalid: "auth.password.invalid",
-  password_current_invalid: "auth.password.currentInvalid",
-  password_email_required: "auth.password.emailRequired",
   password_changed: "auth.password.changedElsewhere",
   password_policy: "auth.password.policy",
   password_busy: "auth.password.busy",

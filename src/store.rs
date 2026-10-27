@@ -7212,7 +7212,7 @@ impl AppStore {
         };
         persist_session(&tx, &session)?;
         password_auth::record_email_login(&tx, &session.session_id, now)?;
-        let password = Some(password_auth::session_state(&tx, &session.session_id, now)?);
+        let password = Some(password_auth::session_state(&tx, &session.session_id)?);
         let (api_token, api_token_status) = ensure_default_user_api_token(&tx, &user.id, now)?;
         tx.commit()
             .map_err(|e| AppError::Internal(format!("commit email verification failed: {e}")))?;
@@ -7288,11 +7288,7 @@ impl AppStore {
         };
         persist_session(&tx, &replacement)?;
         password_auth::inherit_login(&tx, &current.session_id, &replacement.session_id)?;
-        let password = Some(password_auth::session_state(
-            &tx,
-            &replacement.session_id,
-            now,
-        )?);
+        let password = Some(password_auth::session_state(&tx, &replacement.session_id)?);
         tx.commit()
             .map_err(|e| AppError::Internal(format!("commit refresh session failed: {e}")))?;
 
@@ -7337,11 +7333,7 @@ impl AppStore {
             get_session_by_access_hash(&tx, &session.access_token_hash)?
                 .filter(|s| s.access_expires_at > Utc::now())
                 .ok_or_else(|| AppError::Unauthorized("session not found".into()))?;
-            let password = Some(password_auth::session_state(
-                &tx,
-                &session.session_id,
-                Utc::now(),
-            )?);
+            let password = Some(password_auth::session_state(&tx, &session.session_id)?);
             tx.commit().map_err(|e| {
                 AppError::Internal(format!("commit password session status failed: {e}"))
             })?;

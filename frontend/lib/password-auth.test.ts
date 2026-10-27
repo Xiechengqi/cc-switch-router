@@ -51,7 +51,6 @@ test("only accounts without a password or an explicit reset intent need the OTP 
   const password = {
     hasPassword: false,
     version: 0,
-    canResetWithoutPassword: true,
     loginEventId: "real-email-login",
   };
   assert.equal(shouldPromptForPassword({ password }), true);
@@ -68,21 +67,32 @@ test("only accounts without a password or an explicit reset intent need the OTP 
   );
 });
 
-test("password policy preserves spaces and Unicode without arbitrary composition rules", () => {
+test("password policy accepts 6–128 Unicode characters without arbitrary composition rules", () => {
   for (const value of [
+    "123456",
+    "1234567",
+    "12345678",
+    "  ab  ",
     "  long password  ",
     "correct horse battery staple",
-    "密".repeat(12),
+    "密".repeat(6),
+    "🔑".repeat(6),
+    "a".repeat(128),
     "🔑".repeat(128),
   ]) {
     assert.equal(validLoginPassword(value), true);
   }
   for (const value of [
+    "",
     "short",
-    " ".repeat(12),
+    "🔑".repeat(5),
+    " ".repeat(6),
+    "\u2003".repeat(6),
     "invalid\nlong password",
     "invalid\u007flong password",
+    "abc\0def",
     "a".repeat(129),
+    "🔑".repeat(129),
   ]) {
     assert.equal(validLoginPassword(value), false);
   }
@@ -97,6 +107,8 @@ test("password copy and structured errors have complete English and Chinese reso
     passwordMessagesZh["auth.password.unavailable"],
     "当前用户不能使用密码登录，请使用验证码登录后，再设置登录密码。",
   );
+  assert.match(passwordMessagesEn["auth.password.policy"], /6–128/);
+  assert.match(passwordMessagesZh["auth.password.policy"], /6–128/);
   for (const [key, english] of Object.entries(passwordMessagesEn)) {
     assert.ok(english.trim());
     assert.ok(
@@ -104,8 +116,8 @@ test("password copy and structured errors have complete English and Chinese reso
     );
   }
   assert.equal(
-    passwordErrorKey("password_current_invalid"),
-    "auth.password.currentInvalid",
+    passwordErrorKey("password_session_changed"),
+    "auth.password.sessionChanged",
   );
   for (const unknown of [undefined, "OTHER", "__proto__", "constructor"])
     assert.equal(passwordErrorKey(unknown), undefined);

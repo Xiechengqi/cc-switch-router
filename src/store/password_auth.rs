@@ -1,5 +1,5 @@
 //! Optional Router passwords. All credential mutations share one versioned
-//! transaction; neither API keys nor a refreshed session prove recent email auth.
+//! transaction. Password changes require a real login session, not API keys.
 use super::*;
 use argon2::{
     Argon2, Params as ArgonParams, PasswordHash, PasswordHasher, PasswordVerifier,
@@ -11,7 +11,10 @@ use std::sync::OnceLock;
 use tokio::sync::Semaphore;
 use zeroize::Zeroizing;
 
-pub(crate) const RECENT_EMAIL_SECS: i64 = 600;
+mod notice_crypto;
+use notice_crypto::{NoticeCipher, SEALED_PREFIX};
+
+pub(crate) const PASSWORD_POLICY_HINT: &str = "Use 6–128 characters without control characters.";
 const MAX_PASSWORD_BYTES: usize = 512;
 #[cfg(test)]
 pub(crate) static HASH_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -21,7 +24,6 @@ pub(crate) static HASH_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::c
 pub struct PasswordState {
     pub has_password: bool,
     pub version: i64,
-    pub can_reset_without_password: bool,
     pub login_event_id: Option<String>,
 }
 
@@ -41,7 +43,6 @@ pub(crate) struct PasswordLoginRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PasswordUpdateRequest {
     pub new_password: Zeroizing<String>,
-    pub current_password: Option<Zeroizing<String>>,
     pub expected_version: i64,
 }
 
@@ -76,7 +77,7 @@ fn invalid_password() -> AppError {
 
 pub(crate) fn validate_password(password: &str) -> Result<(), AppError> {
     let chars = password.chars().count();
-    if !(12..=128).contains(&chars)
+    if !(6..=128).contains(&chars)
         || password.len() > MAX_PASSWORD_BYTES
         || password.chars().any(char::is_control)
         || password.trim().is_empty()
@@ -84,7 +85,7 @@ pub(crate) fn validate_password(password: &str) -> Result<(), AppError> {
         return Err(coded(
             StatusCode::UNPROCESSABLE_ENTITY,
             "password_policy",
-            "Use 12–128 characters without control characters.",
+            PASSWORD_POLICY_HINT,
         ));
     }
     Ok(())
@@ -186,25 +187,18 @@ pub(crate) fn inherit_login(conn: &Connection, from: &str, to: &str) -> Result<(
     Ok(())
 }
 
-pub(crate) fn session_state(
-    conn: &Connection,
-    id: &str,
-    now: DateTime<Utc>,
-) -> Result<PasswordState, AppError> {
-    let (has, at, event, version): (bool, Option<String>, Option<String>, i64) = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM user_password_credentials p WHERE p.user_id=s.user_id),
-            s.email_authenticated_at,s.login_event_id,s.auth_version FROM user_sessions s WHERE s.id=?1",
-        params![id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))
+pub(crate) fn session_state(conn: &Connection, id: &str) -> Result<PasswordState, AppError> {
+    let (has, event, version): (bool, Option<String>, i64) = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM user_password_credentials p WHERE p.user_id=s.user_id),
+            s.login_event_id,s.auth_version FROM user_sessions s WHERE s.id=?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
         .map_err(|e| AppError::Internal(format!("read password session state failed: {e}")))?;
-    let recent = at
-        .and_then(|v| DateTime::parse_from_rfc3339(&v).ok())
-        .is_some_and(|at| {
-            at <= now && now.signed_duration_since(at).num_seconds() <= RECENT_EMAIL_SECS
-        });
     Ok(PasswordState {
         has_password: has,
         version,
-        can_reset_without_password: recent,
         login_event_id: event,
     })
 }
@@ -343,6 +337,14 @@ pub(crate) fn replace_tx(
     )
     .map_err(|e| AppError::Internal(format!("record password event failed: {e}")))?;
     conn.execute(
+        "UPDATE auth_password_notifications SET status='failed',envelope_json=NULL,
+            last_error='superseded by a newer password'
+         WHERE status IN ('pending','sending') AND event_id IN
+            (SELECT id FROM auth_password_events WHERE user_id=?1 AND auth_version<?2)",
+        params![user.user_id, expected + 1],
+    )
+    .map_err(|e| AppError::Internal(format!("supersede old password notices failed: {e}")))?;
+    conn.execute(
         "INSERT INTO auth_password_notifications(event_id,next_attempt_at) VALUES(?1,?2)",
         params![event, now.to_rfc3339()],
     )
@@ -377,7 +379,7 @@ fn issue_session(
         params![session.session_id,now.to_rfc3339(),Uuid::new_v4().to_string()])
         .map_err(|e| AppError::Internal(format!("record password authentication failed: {e}")))?;
     let response = VerifyEmailCodeResponse {
-        password: Some(session_state(conn, &session.session_id, now)?),
+        password: Some(session_state(conn, &session.session_id)?),
         user,
         access_token,
         refresh_token,
@@ -501,14 +503,13 @@ impl AppStore {
     ) -> Result<VerifyEmailCodeResponse, AppError> {
         let new_password = input.new_password;
         validate_password(&new_password)?;
-        let old = input.current_password;
-        let (recent, hash) = {
+        {
             let conn = self.conn.lock().await;
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|e| AppError::Internal(format!("begin password proof failed: {e}")))?;
             let current = get_session_by_access_hash(&tx, &session.access_token_hash)?
-                .filter(|s| s.access_expires_at > Utc::now())
+                .filter(|s| s.access_expires_at > Utc::now() && s.refresh_expires_at > Utc::now())
                 .ok_or_else(|| AppError::Unauthorized("login required".into()))?;
             let user = status(&tx, &current.email)?;
             if user.version != input.expected_version {
@@ -518,59 +519,26 @@ impl AppStore {
                     "Password changed elsewhere. Reload and retry.",
                 ));
             }
-            let recent =
-                session_state(&tx, &current.session_id, Utc::now())?.can_reset_without_password;
-            let hash = tx
-                .query_row(
-                    "SELECT password_hash FROM user_password_credentials WHERE user_id=?1",
-                    params![current.user_id],
-                    |r| r.get::<_, String>(0),
-                )
-                .optional()
-                .map_err(|e| AppError::Internal(format!("read current password failed: {e}")))?;
-            if !recent {
-                if hash.is_none() || old.is_none() {
-                    return Err(coded(
-                        StatusCode::FORBIDDEN,
-                        "password_email_required",
-                        "Sign in again with an email code before setting or resetting a password.",
-                    ));
-                }
-                reserve_attempt(
-                    &tx,
-                    &session.email,
-                    source_ip,
-                    &session.auth_source_id,
-                    Utc::now(),
-                )?;
-            }
+            reserve_attempt(
+                &tx,
+                &current.email,
+                source_ip,
+                &current.auth_source_id,
+                Utc::now(),
+            )?;
             tx.commit()
                 .map_err(|e| AppError::Internal(format!("commit password proof failed: {e}")))?;
-            (recent, hash)
-        };
-        if !recent && !check_password(old.unwrap_or_default(), hash).await? {
-            return Err(coded(
-                StatusCode::FORBIDDEN,
-                "password_current_invalid",
-                "Current password is incorrect.",
-            ));
         }
-        let hash = hash_password(new_password).await?;
+        let hash = hash_password(new_password.clone()).await?;
         let now = Utc::now();
         let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| AppError::Internal(format!("begin password update failed: {e}")))?;
         let current = get_session_by_access_hash(&tx, &session.access_token_hash)?
-            .filter(|s| s.access_expires_at > now)
+            .filter(|s| s.access_expires_at > now && s.refresh_expires_at > now)
             .ok_or_else(|| AppError::Unauthorized("login required".into()))?;
-        if recent && !session_state(&tx, &current.session_id, now)?.can_reset_without_password {
-            return Err(coded(
-                StatusCode::FORBIDDEN,
-                "password_email_required",
-                "Recent email verification expired. Sign in again with an email code.",
-            ));
-        }
+        let event = Uuid::new_v4().to_string();
         replace_tx(
             &tx,
             &current.email,
@@ -578,9 +546,10 @@ impl AppStore {
             input.expected_version,
             "web",
             &current.session_id,
-            &Uuid::new_v4().to_string(),
+            &event,
             now,
         )?;
+        queue_password_notice_tx(&tx, &config.data_dir, &current.email, &event, &new_password)?;
         let (replacement, mut response) = issue_session(
             &tx,
             config,
@@ -591,27 +560,118 @@ impl AppStore {
             &current.auth_source_id,
             now,
         )?;
-        // Retain the device/source and original proof, not a new email timestamp.
+        // A password change is not a new email verification.
         tx.execute(
             "UPDATE user_sessions SET auth_source_kind=?2 WHERE id=?1",
             params![replacement.session_id, current.auth_source_kind],
         )
         .map_err(|e| AppError::Internal(format!("retain password session source failed: {e}")))?;
         inherit_login(&tx, &current.session_id, &replacement.session_id)?;
-        response.password = Some(session_state(&tx, &replacement.session_id, now)?);
+        response.password = Some(session_state(&tx, &replacement.session_id)?);
         tx.commit()
             .map_err(|e| AppError::Internal(format!("commit password update failed: {e}")))?;
         Ok(response)
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 struct NoticeEnvelope {
     from: String,
     recipient: String,
     html: String,
     text: String,
     reply_to: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum StoredNotice {
+    Password { password: Zeroizing<String> },
+    Envelope { envelope: NoticeEnvelope },
+}
+
+fn notice_cipher(conn: &Connection, data_dir: &std::path::Path) -> anyhow::Result<NoticeCipher> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM auth_password_notifications
+         WHERE status IN ('pending','sending') AND envelope_json LIKE ?1)",
+        params![format!("{SEALED_PREFIX}%")],
+        |r| r.get(0),
+    )?;
+    NoticeCipher::load(data_dir, !exists)
+}
+
+/// Called in the same transaction as credential replacement, including by CLI.
+/// Mail can be configured later; only its short-lived encrypted seed is queued.
+pub(crate) fn queue_password_notice_tx(
+    conn: &Connection,
+    data_dir: &std::path::Path,
+    email: &str,
+    event: &str,
+    password: &str,
+) -> Result<(), AppError> {
+    let queued = (|| -> anyhow::Result<()> {
+        let cipher = notice_cipher(conn, data_dir)?;
+        let seed = Zeroizing::new(serde_json::to_string(&StoredNotice::Password {
+            password: Zeroizing::new(password.into()),
+        })?);
+        let sealed = cipher.seal(&seed, event, email)?;
+        anyhow::ensure!(conn.execute(
+            "UPDATE auth_password_notifications SET envelope_json=?2 WHERE event_id=?1 AND status='pending'",
+            params![event, sealed],
+        )? == 1, "password notice was not queued");
+        Ok(())
+    })();
+    queued.map_err(|_| AppError::Internal("could not securely queue password email".into()))
+}
+
+fn render_notice(
+    sender: &str,
+    email: &str,
+    at: &str,
+    source: &str,
+    password: Option<&str>,
+    template: &NotificationTemplateContext,
+) -> NoticeEnvelope {
+    let password_text = Zeroizing::new(password.map(|value| format!(
+        "\nNew password: {value}\nKeep this email private. Save your password in a password manager, then delete this email.\n"
+    )).unwrap_or_default());
+    let password_html = Zeroizing::new(password.map(|value| format!(
+        "<p>New password:</p><pre style=\"white-space:pre-wrap;overflow-wrap:anywhere;padding:16px;background:#f1f5f9;border-radius:8px;\">{}</pre><p>Keep this email private. Save your password in a password manager, then delete this email.</p>",
+        escape_html(value)
+    )).unwrap_or_default());
+    NoticeEnvelope {
+        from: sender.into(),
+        recipient: email.into(),
+        html: render_email_layout(
+            "Login password changed",
+            "Your account security settings changed.",
+            &format!(
+                "<p>Your TokenSwitch login password was changed.</p>{}<p>Recorded: {}</p><p>Source: {}</p><p>All previous login sessions were revoked.</p><p>If this was not you, sign in with an email code and reset your password, or contact the Router operator.</p><p><a href=\"{}\">Open TokenSwitch</a></p>",
+                &*password_html,
+                escape_html(at),
+                escape_html(source),
+                escape_html(&template.dashboard_url)
+            ),
+        ),
+        text: format!(
+            "Your TokenSwitch login password was changed.\n{}Recorded: {at}\nSource: {source}\nAll previous login sessions were revoked.\nIf this was not you, sign in with an email code and reset your password, or contact the Router operator.\n{}",
+            &*password_text, template.dashboard_url
+        ),
+        reply_to: template.reply_to.clone(),
+    }
+}
+
+/// Run even without email credentials so disabled mail cannot retain passwords forever.
+fn expire_notices(conn: &Connection, now: DateTime<Utc>) -> anyhow::Result<()> {
+    conn.execute(
+        "UPDATE auth_password_notifications SET status='failed',envelope_json=NULL,
+            last_error='delivery window exhausted'
+         WHERE status IN ('pending','sending') AND
+            (event_id IN (SELECT id FROM auth_password_events WHERE created_at<?1)
+             OR (attempts>=6 AND next_attempt_at<=?2))",
+        params![(now - Duration::hours(12)).to_rfc3339(), now.to_rfc3339()],
+    )?;
+    Ok(())
 }
 
 /// Frozen envelopes and stable provider idempotency keys prevent retries from
@@ -623,6 +683,13 @@ pub(crate) async fn deliver_notices(store: AppStore, config: Config) -> anyhow::
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
     loop {
         interval.tick().await;
+        {
+            let conn = store.conn.lock().await;
+            if expire_notices(&conn, Utc::now()).is_err() {
+                tracing::warn!("password notice cleanup deferred; will retry");
+                continue;
+            }
+        }
         let Some(key) = config.resend_api_key.as_deref().filter(|v| !v.is_empty()) else {
             continue;
         };
@@ -631,7 +698,7 @@ pub(crate) async fn deliver_notices(store: AppStore, config: Config) -> anyhow::
             continue;
         };
         // A transient database/transport error must not kill this background worker.
-        if deliver_one_notice(&store, &http, key, sender, &template)
+        if deliver_one_notice(&store, &http, key, sender, &template, &config.data_dir)
             .await
             .is_err()
         {
@@ -650,6 +717,7 @@ fn claim_notice(
     conn: &Connection,
     sender: &str,
     template: &NotificationTemplateContext,
+    data_dir: &std::path::Path,
     now: DateTime<Utc>,
 ) -> anyhow::Result<Option<ClaimedNotice>> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -677,43 +745,46 @@ fn claim_notice(
             .ok()
             .map(|at| now.signed_duration_since(at));
         if attempts >= 6 || age.is_none_or(|age| age > Duration::hours(12)) {
-            tx.execute("UPDATE auth_password_notifications SET status='failed',last_error='delivery window exhausted' WHERE event_id=?1",params![id])?;
+            tx.execute("UPDATE auth_password_notifications SET status='failed',envelope_json=NULL,last_error='delivery window exhausted' WHERE event_id=?1",params![id])?;
             tx.commit()?;
             return Ok(None);
         }
-        let envelope = if let Some(frozen) = frozen {
-            frozen
-        } else {
-            let text = format!(
-                "Your TokenSwitch login password was changed.\nRecorded: {at}\nSource: {source}\nAll previous login sessions were revoked.\nIf this was not you, sign in with an email code and reset your password, or contact the Router operator.\n{}",
-                template.dashboard_url
-            );
-            let html = render_email_layout(
-                "Login password changed",
-                "Your account security settings changed.",
-                &format!(
-                    "<p>Your TokenSwitch login password was changed.</p><p>Recorded: {}</p><p>Source: {}</p><p>All previous login sessions were revoked.</p><p>If this was not you, sign in with an email code and reset your password, or contact the Router operator.</p><p><a href=\"{}\">Open TokenSwitch</a></p>",
-                    escape_html(&at),
-                    escape_html(&source),
-                    escape_html(&template.dashboard_url)
-                ),
-            );
-            serde_json::to_string(&NoticeEnvelope {
-                from: sender.into(),
-                recipient: email,
-                html,
-                text,
-                reply_to: template.reply_to.clone(),
-            })?
-        };
-        // A corrupt frozen envelope must not block the rest of the queue.
-        let parsed: NoticeEnvelope = match serde_json::from_str(&envelope) {
+        let cipher = notice_cipher(&tx, data_dir)?;
+        let parsed = (|| -> anyhow::Result<NoticeEnvelope> {
+            let Some(frozen) = frozen.as_deref() else {
+                return Ok(render_notice(sender, &email, &at, &source, None, template));
+            };
+            if !frozen.starts_with(SEALED_PREFIX) {
+                // Existing generic notifications never contained a password.
+                return Ok(serde_json::from_str(frozen)?);
+            }
+            let plaintext = cipher.open(frozen, &id, &email)?;
+            match serde_json::from_str::<StoredNotice>(&plaintext)? {
+                StoredNotice::Envelope { envelope } => Ok(envelope),
+                StoredNotice::Password { password } => Ok(render_notice(
+                    sender,
+                    &email,
+                    &at,
+                    &source,
+                    Some(&password),
+                    template,
+                )),
+            }
+        })();
+        // Never copy invalid payloads or transport diagnostics into last_error.
+        let parsed = match parsed {
             Ok(value) => value,
             Err(_) => {
-                tx.execute("UPDATE auth_password_notifications SET status='failed',last_error='invalid frozen notice' WHERE event_id=?1", params![id])?;
+                tx.execute("UPDATE auth_password_notifications SET status='failed',envelope_json=NULL,last_error='invalid frozen notice' WHERE event_id=?1", params![id])?;
                 tx.commit()?;
                 return Ok(None);
             }
+        };
+        let stored = StoredNotice::Envelope { envelope: parsed };
+        let serialized = Zeroizing::new(serde_json::to_string(&stored)?);
+        let envelope = cipher.seal(&serialized, &id, &email)?;
+        let StoredNotice::Envelope { envelope: parsed } = stored else {
+            unreachable!("serialized notice envelope")
         };
         tx.execute("UPDATE auth_password_notifications SET status='sending',attempts=attempts+1,next_attempt_at=?2,envelope_json=?3 WHERE event_id=?1",
                     params![id,(now+Duration::minutes(2)).to_rfc3339(),envelope])?;
@@ -735,10 +806,11 @@ async fn deliver_one_notice(
     key: &str,
     sender: &str,
     template: &NotificationTemplateContext,
+    data_dir: &std::path::Path,
 ) -> anyhow::Result<()> {
     let notice = {
         let conn = store.conn.lock().await;
-        claim_notice(&conn, sender, template, Utc::now())?
+        claim_notice(&conn, sender, template, data_dir, Utc::now())?
     };
     let Some(notice) = notice else {
         return Ok(());
@@ -787,8 +859,12 @@ fn finish_notice(
         ),
     };
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let updated = tx.execute("UPDATE auth_password_notifications SET status=?2,next_attempt_at=?3,last_error=?4 WHERE event_id=?1 AND status='sending' AND attempts=?5",
-            params![notice.id,status,next.to_rfc3339(),error,notice.attempt])?;
+    let updated = tx.execute(
+        "UPDATE auth_password_notifications SET status=?2,next_attempt_at=?3,last_error=?4,
+        envelope_json=CASE WHEN ?2 IN ('sent','failed') THEN NULL ELSE envelope_json END
+        WHERE event_id=?1 AND status='sending' AND attempts=?5",
+        params![notice.id, status, next.to_rfc3339(), error, notice.attempt],
+    )?;
     if updated == 1 && status == "sent" {
         tx.execute("INSERT OR IGNORE INTO email_send_logs(id,email_type,to_email,provider_message_id,status,created_at)
                 VALUES(?1,'password_changed',?2,?3,'sent',?4)", params![format!("password-{}",notice.id),notice.envelope.recipient,message_id,now.to_rfc3339()])?;

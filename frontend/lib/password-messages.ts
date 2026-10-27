@@ -13,7 +13,8 @@ export const passwordMessagesEn = {
     "Use a password to sign in without waiting for email. Email code login remains available.",
   "auth.password.changeHint":
     "Your other login sessions will be signed out. API Tokens and rented services are unchanged.",
-  "auth.password.current": "Current password",
+  "auth.password.emailNotice":
+    "A confirmation email will include your new password. Keep your mailbox secure and do not forward the email.",
   "auth.password.new": "New password",
   "auth.password.confirm": "Confirm new password",
   "auth.password.later": "Not now",
@@ -23,13 +24,10 @@ export const passwordMessagesEn = {
     "You can now sign in with your email and password.",
   "auth.password.mismatch": "Passwords do not match.",
   "auth.password.policy":
-    "Use 12–128 characters without control characters. Spaces and passphrases are welcome.",
+    "Use 6–128 characters without control characters. Spaces and passphrases are welcome.",
   "auth.password.unavailable":
     "This account cannot use password login. Sign in with an email code, then set a login password.",
   "auth.password.invalid": "Email or password is incorrect.",
-  "auth.password.currentInvalid": "Current password is incorrect.",
-  "auth.password.emailRequired":
-    "Sign in again with an email code before setting or resetting a password.",
   "auth.password.changedElsewhere":
     "Password changed elsewhere. Reload your session and retry.",
   "auth.password.busy":
@@ -57,7 +55,8 @@ export const passwordMessagesZh: Record<
   "auth.password.setupHint": "设置后可用密码快捷登录，仍可使用邮箱验证码登录。",
   "auth.password.changeHint":
     "其他登录会话将退出，API Token 和已租服务不受影响。",
-  "auth.password.current": "当前密码",
+  "auth.password.emailNotice":
+    "确认邮件将包含新密码明文，请保护邮箱安全，不要转发此邮件。",
   "auth.password.new": "新密码",
   "auth.password.confirm": "确认新密码",
   "auth.password.later": "稍后设置",
@@ -66,13 +65,10 @@ export const passwordMessagesZh: Record<
   "auth.password.savedHint": "现在可以使用邮箱和密码登录。",
   "auth.password.mismatch": "两次输入的密码不一致。",
   "auth.password.policy":
-    "使用 12–128 个字符，不含控制字符；支持空格、长口令及密码管理器。",
+    "使用 6–128 个字符，不含控制字符；支持空格、长口令及密码管理器。",
   "auth.password.unavailable":
     "当前用户不能使用密码登录，请使用验证码登录后，再设置登录密码。",
   "auth.password.invalid": "邮箱或密码不正确。",
-  "auth.password.currentInvalid": "当前密码不正确。",
-  "auth.password.emailRequired":
-    "请先重新使用邮箱验证码登录，再设置或重置密码。",
   "auth.password.changedElsewhere":
     "密码已在其他位置修改，请刷新登录状态后重试。",
   "auth.password.busy": "密码验证繁忙，请稍后重试。",

@@ -109,7 +109,7 @@ pub(crate) fn bind(config: &Config) -> Result<AdminListener> {
 }
 
 #[cfg(unix)]
-pub(crate) async fn serve(listener: AdminListener, store: AppStore) -> Result<()> {
+pub(crate) async fn serve(listener: AdminListener, store: AppStore, config: Config) -> Result<()> {
     let mut jobs = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
@@ -118,6 +118,7 @@ pub(crate) async fn serve(listener: AdminListener, store: AppStore) -> Result<()
                 let peer=stream.peer_cred()?;
                 if !matches!(peer.uid(),v if v==0 || v==uid()) || jobs.len()>=8 { continue; }
                 let store=store.clone();
+                let config=config.clone();
                 jobs.spawn(async move {
                     let _=tokio::time::timeout(std::time::Duration::from_secs(15),async {
                         let mut stream=stream;
@@ -126,7 +127,7 @@ pub(crate) async fn serve(listener: AdminListener, store: AppStore) -> Result<()
                         anyhow::ensure!(bytes.len()<=MAX_FRAME as usize,"admin request too large");
                         let request:Request=serde_json::from_slice(&bytes)?;
                         let actor=format!("uid:{}",peer.uid());
-                        let result=handle(&store,request,&actor).await;
+                        let result=handle(&store,&config,request,&actor).await;
                         let reply=match result {Ok(v)=>v,Err(e)=>Reply {status:None,operation_id:None,error:Some(e.to_string())}};
                         stream.write_all(&serde_json::to_vec(&reply)?).await?;
                         stream.shutdown().await?;
@@ -139,7 +140,7 @@ pub(crate) async fn serve(listener: AdminListener, store: AppStore) -> Result<()
     }
 }
 
-async fn handle(store: &AppStore, request: Request, actor: &str) -> Result<Reply> {
+async fn handle(store: &AppStore, config: &Config, request: Request, actor: &str) -> Result<Reply> {
     match request {
         Request::Status { email } => {
             let conn = store.conn.lock().await;
@@ -188,7 +189,7 @@ async fn handle(store: &AppStore, request: Request, actor: &str) -> Result<Reply
                 }
                 tx.commit()?;
             }
-            let hash = password_auth::hash_password(password).await?;
+            let hash = password_auth::hash_password(password.clone()).await?;
             let conn = store.conn.lock().await;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             if let Some(user) = operation_result(&tx, &operation_id, actor)? {
@@ -212,6 +213,13 @@ async fn handle(store: &AppStore, request: Request, actor: &str) -> Result<Reply
                 actor,
                 &operation_id,
                 Utc::now(),
+            )?;
+            password_auth::queue_password_notice_tx(
+                &tx,
+                &config.data_dir,
+                &user.email,
+                &operation_id,
+                &password,
             )?;
             tx.commit()?;
             Ok(Reply {
@@ -348,6 +356,7 @@ fn read_password(stdin: bool) -> Result<Zeroizing<String>> {
         io::stdin().is_terminal(),
         "use --password-stdin --yes for noninteractive input"
     );
+    eprintln!("{}", password_auth::PASSWORD_POLICY_HINT);
     let password = Zeroizing::new(rpassword::prompt_password("New password: ")?);
     let confirm = Zeroizing::new(rpassword::prompt_password("Confirm new password: ")?);
     anyhow::ensure!(*password == *confirm, "passwords do not match");
@@ -526,7 +535,7 @@ pub(crate) async fn run(args: Vec<String>) -> Result<()> {
                     expected_version,
                     operation_id,
                 } => {
-                    let hash = password_auth::hash_password(password).await?;
+                    let hash = password_auth::hash_password(password.clone()).await?;
                     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                     let status = password_auth::replace_tx(
                         &tx,
@@ -537,6 +546,13 @@ pub(crate) async fn run(args: Vec<String>) -> Result<()> {
                         &actor,
                         &operation_id,
                         Utc::now(),
+                    )?;
+                    password_auth::queue_password_notice_tx(
+                        &tx,
+                        &config.data_dir,
+                        &status.email,
+                        &operation_id,
+                        &password,
                     )?;
                     tx.commit()?;
                     Ok(Reply {
@@ -577,7 +593,7 @@ pub(crate) async fn run(args: Vec<String>) -> Result<()> {
         return Ok(());
     }
     eprintln!(
-        "User: {}\nAccount: {}\nExisting password: {}\nAll previous login sessions will be revoked.",
+        "User: {}\nAccount: {}\nExisting password: {}\nAll previous login sessions will be revoked.\nA confirmation email will include the new password. Keep the mailbox secure.",
         status.email, status.status, status.has_password
     );
     if !options.yes {
@@ -719,7 +735,11 @@ mod tests {
                 & 0o777,
             0o600
         );
-        let service = tokio::spawn(serve(listener, fixture.store.clone()));
+        let service = tokio::spawn(serve(
+            listener,
+            fixture.store.clone(),
+            fixture.config.clone(),
+        ));
         let status = call_online(
             &fixture.config,
             Request::Status {
@@ -734,7 +754,7 @@ mod tests {
         let operation_id = Uuid::new_v4().to_string();
         let set_request = || Request::Set {
             email: "cli@example.test".into(),
-            password: Zeroizing::new("a secure CLI password".into()),
+            password: Zeroizing::new("cli123".into()),
             expected_version: 0,
             operation_id: operation_id.clone(),
         };
@@ -758,6 +778,15 @@ mod tests {
         assert_eq!(recovered.status.unwrap().version, 1);
         {
             let conn = fixture.store.conn.lock().await;
+            let sealed: String = conn
+                .query_row(
+                    "SELECT envelope_json FROM auth_password_notifications",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(sealed.starts_with("password-notice:v1:"));
+            assert!(!sealed.contains("cli123"));
             assert_eq!(
                 conn.query_row("SELECT COUNT(*) FROM auth_password_events", [], |r| r
                     .get::<_, i64>(0))

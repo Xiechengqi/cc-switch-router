@@ -148,3 +148,22 @@ test("password update can retry normal token rotation within the same login", as
     assert.equal(readAuthState().email, initial.email);
   });
 });
+
+test("password updates send only two-field form data and its version, never an old password", async () => {
+  await withAuthEnvironment(async () => {
+    globalThis.fetch = async (_url, options) => {
+      assert.deepEqual(JSON.parse(String(options?.body)), {
+        newPassword: "valid6",
+        expectedVersion: 3,
+      });
+      return Response.json({
+        user: { id: "original-user", email: initial.email },
+        accessToken: "replacement-access",
+        refreshToken: "replacement-refresh",
+        expiresAt: "2099-01-01T00:00:00Z",
+        refreshExpiresAt: "2099-02-01T00:00:00Z",
+      });
+    };
+    await updateLoginPassword("valid6", 3);
+  });
+});

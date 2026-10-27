@@ -2,7 +2,8 @@ use super::*;
 use ed25519_dalek::{Signer, SigningKey};
 
 fn fixture() -> (AppStore, Config, SigningKey) {
-    let config = crate::store::tests::test_config("password-auth");
+    let mut config = crate::store::tests::test_config("password-auth");
+    config.data_dir = config.database.path.with_extension("data");
     crate::test_support::database_at(&config.database.path).unwrap();
     let store = AppStore::new(&config).unwrap();
     let key = SigningKey::generate(&mut rand::rngs::OsRng);
@@ -59,21 +60,36 @@ fn metadata() -> ClientMetadata {
 }
 
 #[test]
-fn password_policy_preserves_spaces_and_accepts_passphrases() {
+fn password_policy_accepts_six_to_128_unicode_characters_without_composition_rules() {
     for password in [
+        "123456",
+        "1234567",
+        "12345678",
+        "  ab  ",
         "  long password  ",
         "correct horse battery staple",
-        "密".repeat(12).as_str(),
+        &"密".repeat(6),
+        &"🔑".repeat(6),
+        &"x".repeat(128),
+        &"🔑".repeat(128),
     ] {
         assert!(validate_password(password).is_ok());
     }
     for password in [
+        "",
         "short",
-        "            ",
+        &"🔑".repeat(5),
+        "      ",
+        &"\u{2003}".repeat(6),
         "invalid\nlong password",
+        "invalid\u{007f}long password",
+        "abc\0def",
         &"x".repeat(129),
+        &"🔑".repeat(129),
     ] {
-        assert!(validate_password(password).is_err());
+        let error = validate_password(password).unwrap_err();
+        assert_eq!(error.code(), Some("password_policy"));
+        assert!(error.to_string().contains("6–128"));
     }
 }
 
@@ -82,13 +98,38 @@ async fn setup_login_change_cli_reset_and_refresh_revocation() {
     let _hash = HASH_TEST_LOCK.lock().await;
     let (store, config, key) = fixture();
     let original = seed(&store, &key).await;
+    let error = store
+        .update_password(
+            &config,
+            &original,
+            PasswordUpdateRequest {
+                new_password: Zeroizing::new("short".into()),
+                expected_version: 0,
+            },
+            "192.0.2.1",
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Some("password_policy"));
+    assert!(
+        store
+            .resolve_session_by_access_token("email-access")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    {
+        let conn = store.conn.lock().await;
+        let password = status(&conn, &original.email).unwrap();
+        assert!(!password.has_password);
+        assert_eq!(password.version, 0);
+    }
     let setup = store
         .update_password(
             &config,
             &original,
             PasswordUpdateRequest {
-                new_password: Zeroizing::new("first secure password".into()),
-                current_password: None,
+                new_password: Zeroizing::new("first6".into()),
                 expected_version: 0,
             },
             "192.0.2.1",
@@ -118,18 +159,12 @@ async fn setup_login_change_cli_reset_and_refresh_revocation() {
     let password_login = store
         .password_login(
             &config,
-            request(&key, "buyer@example.test", "first secure password"),
+            request(&key, "buyer@example.test", "first6"),
             metadata(),
         )
         .await
         .unwrap();
-    assert!(
-        !password_login
-            .password
-            .as_ref()
-            .unwrap()
-            .can_reset_without_password
-    );
+    assert_eq!(password_login.password.as_ref().unwrap().version, 1);
     let session = store
         .resolve_session_by_access_token(&password_login.access_token)
         .await
@@ -140,22 +175,20 @@ async fn setup_login_change_cli_reset_and_refresh_revocation() {
             &config,
             &session,
             PasswordUpdateRequest {
-                new_password: Zeroizing::new("next secure password".into()),
-                current_password: Some(Zeroizing::new("incorrect password".into())),
-                expected_version: 1,
+                new_password: Zeroizing::new("next06".into()),
+                expected_version: 0,
             },
             "192.0.2.1",
         )
         .await
         .unwrap_err();
-    assert_eq!(error.code(), Some("password_current_invalid"));
+    assert_eq!(error.code(), Some("password_changed"));
     let changed = store
         .update_password(
             &config,
             &session,
             PasswordUpdateRequest {
-                new_password: Zeroizing::new("next secure password".into()),
-                current_password: Some(Zeroizing::new("first secure password".into())),
+                new_password: Zeroizing::new("next06".into()),
                 expected_version: 1,
             },
             "192.0.2.1",
@@ -236,6 +269,7 @@ async fn setup_login_change_cli_reset_and_refresh_revocation() {
 
 #[tokio::test]
 async fn refresh_preserves_real_email_proof_and_does_not_renew_it() {
+    let _hash = HASH_TEST_LOCK.lock().await;
     let (store, config, key) = fixture();
     let session = seed(&store, &key).await;
     let event = {
@@ -246,7 +280,7 @@ async fn refresh_preserves_real_email_proof_and_does_not_renew_it() {
             params![old, session.session_id],
         )
         .unwrap();
-        session_state(&conn, &session.session_id, Utc::now())
+        session_state(&conn, &session.session_id)
             .unwrap()
             .login_event_id
     };
@@ -261,26 +295,35 @@ async fn refresh_preserves_real_email_proof_and_does_not_renew_it() {
         .unwrap();
     let state = refreshed.password.unwrap();
     assert_eq!(state.login_event_id, event);
-    assert!(!state.can_reset_without_password);
+    {
+        let conn = store.conn.lock().await;
+        let proof: String = conn
+            .query_row(
+                "SELECT email_authenticated_at FROM user_sessions WHERE access_token_hash=?1",
+                params![hash_token(&refreshed.access_token)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(DateTime::parse_from_rfc3339(&proof).unwrap() < Utc::now() - Duration::minutes(10));
+    }
     let session = store
         .resolve_session_by_access_token(&refreshed.access_token)
         .await
         .unwrap()
         .unwrap();
-    let error = store
+    let changed = store
         .update_password(
             &config,
             &session,
             PasswordUpdateRequest {
                 new_password: Zeroizing::new("long enough password".into()),
-                current_password: None,
                 expected_version: 0,
             },
             "192.0.2.1",
         )
         .await
-        .unwrap_err();
-    assert_eq!(error.code(), Some("password_email_required"));
+        .unwrap();
+    assert_eq!(changed.password.unwrap().version, 1);
 }
 
 #[tokio::test]
@@ -478,25 +521,20 @@ async fn passwords_never_verify_or_enable_an_account_and_reject_wrong_passwords(
         .await
         .unwrap();
     assert_eq!(result.user.id, session.user_id);
-    assert!(!result.password.unwrap().can_reset_without_password);
+    assert!(result.password.unwrap().has_password);
 }
 
 #[tokio::test]
-async fn legacy_or_future_sessions_are_not_recent_email_proof_and_versions_are_authoritative() {
+async fn legacy_session_versions_are_authoritative() {
     let (store, config, key) = fixture();
     let session = seed(&store, &key).await;
-    for proof in [None, Some((Utc::now() + Duration::minutes(1)).to_rfc3339())] {
+    {
         let conn = store.conn.lock().await;
         conn.execute(
-            "UPDATE user_sessions SET auth_method='legacy',email_authenticated_at=?1 WHERE id=?2",
-            params![proof, session.session_id],
+            "UPDATE user_sessions SET auth_method='legacy',email_authenticated_at=NULL WHERE id=?1",
+            params![session.session_id],
         )
         .unwrap();
-        assert!(
-            !session_state(&conn, &session.session_id, Utc::now())
-                .unwrap()
-                .can_reset_without_password
-        );
     }
     {
         let conn = store.conn.lock().await;
@@ -607,11 +645,35 @@ async fn security_notices_are_frozen_leased_bounded_english_and_logged_once() {
         now,
     )
     .unwrap();
+    let password = "  <new-password> & \"secret\"  ";
+    queue_password_notice_tx(
+        &tx,
+        &config.data_dir,
+        &session.email,
+        "notice-one",
+        password,
+    )
+    .unwrap();
+    let sealed: String = tx
+        .query_row(
+            "SELECT envelope_json FROM auth_password_notifications WHERE event_id='notice-one'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(sealed.starts_with(SEALED_PREFIX));
+    assert!(!sealed.contains(password));
     tx.commit().unwrap();
     let template = NotificationTemplateContext::from_config(&config);
-    let first = claim_notice(&conn, "sender@example.test", &template, now)
-        .unwrap()
-        .unwrap();
+    let first = claim_notice(
+        &conn,
+        "sender@example.test",
+        &template,
+        &config.data_dir,
+        now,
+    )
+    .unwrap()
+    .unwrap();
     assert!(
         first
             .envelope
@@ -620,6 +682,15 @@ async fn security_notices_are_frozen_leased_bounded_english_and_logged_once() {
     );
     assert!(first.envelope.html.contains("<html"));
     assert!(
+        first
+            .envelope
+            .text
+            .contains(&format!("New password: {password}\n"))
+    );
+    assert!(first.envelope.html.contains("&lt;new-password&gt;"));
+    assert!(!first.envelope.html.contains("<new-password>"));
+    assert!(first.envelope.html.contains("Keep this email private"));
+    assert!(
         !first
             .envelope
             .html
@@ -627,14 +698,21 @@ async fn security_notices_are_frozen_leased_bounded_english_and_logged_once() {
             .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
     );
     assert!(
-        claim_notice(&conn, "sender@example.test", &template, now)
-            .unwrap()
-            .is_none()
+        claim_notice(
+            &conn,
+            "sender@example.test",
+            &template,
+            &config.data_dir,
+            now
+        )
+        .unwrap()
+        .is_none()
     );
     let second = claim_notice(
         &conn,
         "changed@example.test",
         &template,
+        &config.data_dir,
         now + Duration::minutes(3),
     )
     .unwrap()
@@ -676,6 +754,7 @@ async fn security_notices_are_frozen_leased_bounded_english_and_logged_once() {
             &conn,
             "changed@example.test",
             &template,
+            &config.data_dir,
             now + Duration::minutes(4)
         )
         .unwrap()
@@ -685,6 +764,7 @@ async fn security_notices_are_frozen_leased_bounded_english_and_logged_once() {
         &conn,
         "changed@example.test",
         &template,
+        &config.data_dir,
         now + Duration::hours(2),
     )
     .unwrap()
@@ -712,6 +792,16 @@ async fn security_notices_are_frozen_leased_bounded_english_and_logged_once() {
         .unwrap(),
         1
     );
+    assert!(
+        conn.query_row(
+            "SELECT envelope_json FROM auth_password_notifications WHERE event_id='notice-one'",
+            [],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .unwrap()
+        .is_none(),
+        "successful delivery clears its secret payload"
+    );
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .unwrap();
@@ -728,9 +818,15 @@ async fn security_notices_are_frozen_leased_bounded_english_and_logged_once() {
     .unwrap();
     tx.commit().unwrap();
     assert!(
-        claim_notice(&conn, "changed@example.test", &template, now)
-            .unwrap()
-            .is_none()
+        claim_notice(
+            &conn,
+            "changed@example.test",
+            &template,
+            &config.data_dir,
+            now
+        )
+        .unwrap()
+        .is_none()
     );
     assert_eq!(
         conn.query_row(
@@ -740,6 +836,291 @@ async fn security_notices_are_frozen_leased_bounded_english_and_logged_once() {
         )
         .unwrap(),
         "failed"
+    );
+}
+
+#[test]
+fn password_notice_cipher_binds_event_and_recipient_and_reloads_the_same_key() {
+    let (_store, config, _) = fixture();
+    let cipher = NoticeCipher::load(&config.data_dir, true).unwrap();
+    let sealed = cipher
+        .seal("password with spaces ", "event", "a@example.test")
+        .unwrap();
+    let reloaded = NoticeCipher::load(&config.data_dir, false).unwrap();
+    assert_eq!(
+        reloaded
+            .open(&sealed, "event", "a@example.test")
+            .unwrap()
+            .as_str(),
+        "password with spaces "
+    );
+    assert!(
+        reloaded
+            .open(&sealed, "other-event", "a@example.test")
+            .is_err()
+    );
+    assert!(reloaded.open(&sealed, "event", "b@example.test").is_err());
+    assert!(
+        reloaded
+            .open("password-notice:v1:bad:bad", "event", "a@example.test")
+            .is_err()
+    );
+    assert_ne!(
+        sealed,
+        cipher
+            .seal("password with spaces ", "event", "a@example.test")
+            .unwrap()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(config.data_dir.join("password-notice-key"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+}
+
+#[tokio::test]
+async fn password_notice_secrets_are_cleared_on_supersession_permanent_failure_and_expiry() {
+    let (store, config, key) = fixture();
+    let session = seed(&store, &key).await;
+    let conn = store.conn.lock().await;
+    let now = Utc::now();
+    let template = NotificationTemplateContext::from_config(&config);
+    for (version, event, at) in [
+        (0, "first", now),
+        (1, "second", now),
+        (2, "expired", now - Duration::hours(13)),
+    ] {
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        replace_tx(
+            &tx,
+            &session.email,
+            "hash",
+            version,
+            "web",
+            "session",
+            event,
+            at,
+        )
+        .unwrap();
+        queue_password_notice_tx(&tx, &config.data_dir, &session.email, event, "secret<&>")
+            .unwrap();
+        tx.commit().unwrap();
+        if event == "second" {
+            let old: (String, Option<String>) = conn.query_row(
+                "SELECT status,envelope_json FROM auth_password_notifications WHERE event_id='first'", [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            ).unwrap();
+            assert_eq!(old, ("failed".into(), None));
+            let notice = claim_notice(
+                &conn,
+                "sender@example.test",
+                &template,
+                &config.data_dir,
+                now,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(notice.id, "second");
+            finish_notice(
+                &conn,
+                &notice,
+                Err(crate::notifications::DeliveryFailure {
+                    retryable: false,
+                    retry_at: None,
+                    message: "provider echoed secret<&>".into(),
+                    failure_code: None,
+                    failure_hint: None,
+                    failure_details: None,
+                }),
+                now,
+            )
+            .unwrap();
+            let failure: (Option<String>, String) = conn.query_row(
+                "SELECT envelope_json,last_error FROM auth_password_notifications WHERE event_id='second'", [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            ).unwrap();
+            assert!(failure.0.is_none());
+            assert!(!failure.1.contains("secret"));
+        }
+    }
+    // This cleanup does not require any mail provider configuration.
+    expire_notices(&conn, now).unwrap();
+    assert_eq!(conn.query_row(
+        "SELECT COUNT(*) FROM auth_password_notifications WHERE status='failed' AND envelope_json IS NULL", [], |r| r.get::<_, i64>(0),
+    ).unwrap(), 3);
+}
+
+#[tokio::test]
+async fn encrypted_password_notices_never_regenerate_a_missing_key_or_retain_corrupt_payloads() {
+    let (store, config, key) = fixture();
+    let session = seed(&store, &key).await;
+    let conn = store.conn.lock().await;
+    let now = Utc::now();
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    replace_tx(
+        &tx,
+        &session.email,
+        "hash",
+        0,
+        "web",
+        "session",
+        "bound-notice",
+        now,
+    )
+    .unwrap();
+    queue_password_notice_tx(
+        &tx,
+        &config.data_dir,
+        &session.email,
+        "bound-notice",
+        "secret6",
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    let template = NotificationTemplateContext::from_config(&config);
+    let key_path = config.data_dir.join("password-notice-key");
+    let backup_path = config.data_dir.join("saved-notice-key");
+    std::fs::rename(&key_path, &backup_path).unwrap();
+    assert!(
+        claim_notice(
+            &conn,
+            "sender@example.test",
+            &template,
+            &config.data_dir,
+            now
+        )
+        .is_err()
+    );
+    assert!(
+        !key_path.exists(),
+        "existing ciphertext must never acquire a newly generated key"
+    );
+    std::fs::rename(&backup_path, &key_path).unwrap();
+    conn.execute(
+        "UPDATE auth_password_notifications SET envelope_json=envelope_json || '!'",
+        [],
+    )
+    .unwrap();
+    assert!(
+        claim_notice(
+            &conn,
+            "sender@example.test",
+            &template,
+            &config.data_dir,
+            now
+        )
+        .unwrap()
+        .is_none()
+    );
+    let failed: (String, Option<String>, String) = conn
+        .query_row(
+            "SELECT status,envelope_json,last_error FROM auth_password_notifications",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        failed,
+        ("failed".into(), None, "invalid frozen notice".into())
+    );
+}
+
+#[tokio::test]
+async fn password_change_rejects_missing_or_expired_sessions_and_rolls_back_if_mail_cannot_be_secured()
+ {
+    let _hash = HASH_TEST_LOCK.lock().await;
+    let (store, config, key) = fixture();
+    let mut session = seed(&store, &key).await;
+    let actual_hash = session.access_token_hash.clone();
+    session.access_token_hash = "not-a-real-session".into();
+    let input = || PasswordUpdateRequest {
+        new_password: Zeroizing::new("valid6".into()),
+        expected_version: 0,
+    };
+    assert!(
+        store
+            .update_password(&config, &session, input(), "192.0.2.1")
+            .await
+            .is_err()
+    );
+    session.access_token_hash = actual_hash;
+    {
+        let conn = store.conn.lock().await;
+        conn.execute(
+            "UPDATE user_sessions SET refresh_expires_at=?1 WHERE id=?2",
+            params![
+                (Utc::now() - Duration::seconds(1)).to_rfc3339(),
+                session.session_id
+            ],
+        )
+        .unwrap();
+    }
+    assert!(
+        store
+            .update_password(&config, &session, input(), "192.0.2.1")
+            .await
+            .is_err()
+    );
+    {
+        let conn = store.conn.lock().await;
+        conn.execute(
+            "UPDATE user_sessions SET refresh_expires_at=?1 WHERE id=?2",
+            params![
+                (Utc::now() + Duration::days(1)).to_rfc3339(),
+                session.session_id
+            ],
+        )
+        .unwrap();
+    }
+    // An unsafe key target must fail the whole change, not leave an unmailed password.
+    std::fs::create_dir(config.data_dir.join("password-notice-key")).unwrap();
+    let error = store
+        .update_password(&config, &session, input(), "192.0.2.1")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("securely queue"));
+    let conn = store.conn.lock().await;
+    assert_eq!(status(&conn, &session.email).unwrap().version, 0);
+    assert!(!status(&conn, &session.email).unwrap().has_password);
+    assert!(
+        get_session_by_access_hash(&conn, &session.access_token_hash)
+            .unwrap()
+            .is_some()
+    );
+    for table in ["auth_password_events", "auth_password_notifications"] {
+        assert_eq!(
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+}
+
+#[test]
+fn password_update_contract_has_no_current_password_or_email_proof() {
+    assert!(
+        serde_json::from_value::<PasswordUpdateRequest>(serde_json::json!({
+            "newPassword":"valid6", "expectedVersion":0,
+        }))
+        .is_ok()
+    );
+    assert!(
+        serde_json::from_value::<PasswordUpdateRequest>(serde_json::json!({
+            "newPassword":"valid6", "expectedVersion":0, "currentPassword":"old password",
+        }))
+        .is_err()
     );
 }
 

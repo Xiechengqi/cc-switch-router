@@ -80,7 +80,6 @@ try {
   let state = {
     hasPassword: false,
     version: 0,
-    canResetWithoutPassword: false,
     loginEventId: null,
   };
   let credential = null;
@@ -89,7 +88,7 @@ try {
   let codeRequests = 0;
   let passwordRequests = 0;
   let updates = 0;
-  let expireNextProof = false;
+  let busyNextSave = false;
   let rotateNextSave = true;
   let loseNextDevice = false;
   let holdNextPasswordLogin = false;
@@ -150,7 +149,6 @@ try {
       actor = user;
       state = {
         ...state,
-        canResetWithoutPassword: true,
         loginEventId: `email-${++otpEvents}`,
       };
       return json(route, result());
@@ -188,7 +186,6 @@ try {
       actor = user;
       state = {
         ...state,
-        canResetWithoutPassword: false,
         loginEventId: `password-${passwordRequests}`,
       };
       const response = result();
@@ -205,12 +202,11 @@ try {
       const body = route.request().postDataJSON();
       assert.match(route.request().headers().authorization, /^Bearer access-/);
       assert.equal(body.expectedVersion, state.version);
-      if (expireNextProof) {
-        expireNextProof = false;
-        return json(route, { code: "password_email_required" }, 403);
+      assert.deepEqual(Object.keys(body).sort(), ["expectedVersion", "newPassword"]);
+      if (busyNextSave) {
+        busyNextSave = false;
+        return json(route, { code: "password_busy" }, 503);
       }
-      if (!state.canResetWithoutPassword && body.currentPassword !== credential)
-        return json(route, { code: "password_current_invalid" }, 403);
       if (rotateNextSave) {
         rotateNextSave = false;
         await page.evaluate(() => {
@@ -343,7 +339,17 @@ try {
   await dialog().getByRole("button", { name: "Not now", exact: true }).click();
   await dialog().waitFor({ state: "hidden" });
   await changeMenu("Set login password");
-  await setNew("first secure password");
+  assert.equal(
+    await dialog().getByLabel("Current password", { exact: true }).count(),
+    0,
+  );
+  await setNew("short");
+  await dialog()
+    .getByRole("alert")
+    .filter({ hasText: "Use 6–128 characters" })
+    .waitFor();
+  assert.equal(updates, 0, "a five-character password never reaches the API");
+  await setNew("first6");
   await page
     .getByRole("heading", { name: "Password saved", exact: true })
     .waitFor();
@@ -376,20 +382,11 @@ try {
   await dialog().waitFor({ state: "hidden" });
   assert.equal(codeRequests, 2, "password login never sends an OTP email");
   await changeMenu("Change login password");
+  assert.equal(await dialog().getByLabel("Current password", { exact: true }).count(), 0);
   await dialog()
-    .getByLabel("Current password", { exact: true })
-    .fill("wrong old password");
-  await setNew("second secure password");
-  await dialog()
-    .getByRole("alert")
-    .filter({ hasText: "Current password is incorrect" })
+    .getByText("A confirmation email will include your new password.", { exact: false })
     .waitFor();
-  await dialog()
-    .getByLabel("Current password", { exact: true })
-    .fill(credential);
-  await dialog()
-    .getByRole("button", { name: "Save password", exact: true })
-    .click();
+  await setNew("next06");
   await page
     .getByRole("heading", { name: "Password saved", exact: true })
     .waitFor();
@@ -399,10 +396,12 @@ try {
     .click();
   await dialog().waitFor({ state: "hidden" });
   console.log(
-    "PASS signed password login, harmless token rotation, stale-device recovery, old-password change and non-logout proof errors",
+    "PASS signed password login, token rotation, stale-device recovery and two-field password change without old password or OTP",
   );
 
-  await changeMenu("Change login password");
+  await changeMenu("Logout");
+  await page.getByRole("button", { name: "Login", exact: true }).click();
+  await dialog().getByRole("button", { name: "Password", exact: true }).click();
   await dialog()
     .getByRole("button", { name: "Forgot password?", exact: true })
     .click();
@@ -414,17 +413,11 @@ try {
     await dialog().getByLabel("Current password", { exact: true }).count(),
     0,
   );
-  expireNextProof = true;
+  busyNextSave = true;
   await setNew("third secure password");
   await dialog()
-    .getByRole("button", { name: "Use an email code", exact: true })
-    .waitFor();
-  await dialog()
-    .getByRole("button", { name: "Use an email code", exact: true })
-    .click();
-  await verifyOtp();
-  await page
-    .getByRole("heading", { name: "Change login password", exact: true })
+    .getByRole("alert")
+    .filter({ hasText: "Password authentication is busy" })
     .waitFor();
   await setNew("third secure password");
   await page
@@ -437,11 +430,11 @@ try {
   await dialog().waitFor({ state: "hidden" });
   assert.equal(
     updates,
-    5,
-    "each save emits one mutation, including failed proof checks",
+    4,
+    "each save emits one mutation, including a failed busy check",
   );
   console.log(
-    "PASS OTP password reset and expired-proof recovery without old-password or financial OTP",
+    "PASS forgotten-password email recovery and retryable change errors without adding a second verification step",
   );
 
   // An old in-flight session read must not restore a previous account.
@@ -554,10 +547,12 @@ try {
     box && box.width <= 375 && box.x >= 0,
     "mobile password dialog fits the viewport",
   );
-  assert.equal(
-    await dialog().getByLabel("当前密码", { exact: true }).getAttribute("type"),
-    "password",
-  );
+  assert.equal(await dialog().getByLabel("当前密码", { exact: true }).count(), 0);
+  assert.equal(await dialog().locator('input[type="password"]').count(), 2);
+  await dialog().getByText("使用 6–128 个字符", { exact: false }).waitFor();
+  await dialog()
+    .getByText("确认邮件将包含新密码明文", { exact: false })
+    .waitFor();
   await dialog().getByRole("button", { name: "取消", exact: true }).click();
   await dialog().waitFor({ state: "hidden" });
   assert.deepEqual(errors, []);

@@ -6,7 +6,6 @@ export type AuthUser = {
 export type PasswordState = {
   hasPassword: boolean;
   version: number;
-  canResetWithoutPassword: boolean;
   loginEventId?: string | null;
 };
 
