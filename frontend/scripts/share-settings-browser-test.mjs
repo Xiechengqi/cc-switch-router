@@ -94,6 +94,7 @@ try {
         ? { message: "share changed; reload the editor" }
         : { ok: true, appliedSynchronously: mode !== "queued", edit: { id: "edit-1", status: mode === "queued" ? "pending" : "applied" } } });
     }
+    if (request.url().includes("/v1/auth/home")) return route.fulfill({ json: { hasActivity: true, entry: null, source: null } });
     if (request.url().includes("/settings-edits/")) return route.fulfill({ json: { id: "edit-1", status, errorMessage: "revision conflict" } });
     if (request.url().endsWith("/requested-model-blocks")) return route.fulfill({ json: { shareId: "share-1", revision: 1, blockedModelsByApp: {} } });
     return route.fulfill({ json: { rows: [], usdCnyRateMicros: 7000000, fxRateFresh: true } });

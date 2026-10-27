@@ -7351,6 +7351,42 @@ impl AppStore {
         })
     }
 
+    pub async fn home_entry_status(
+        &self,
+        user_id: &str,
+        email: &str,
+    ) -> Result<crate::models::HomeEntryStatus, AppError> {
+        let user_id = user_id.to_string();
+        let email = normalize_email(email)?;
+        let conn = self.conn.lock().await;
+        home_entry_status_tx(&conn, &user_id, &email)
+    }
+
+    pub async fn set_home_entry(
+        &self,
+        user_id: &str,
+        email: &str,
+        entry: crate::models::HomeEntry,
+        source: crate::models::HomeEntrySource,
+    ) -> Result<crate::models::HomeEntryStatus, AppError> {
+        validate_home_entry_choice(entry, source)?;
+        let user_id = user_id.to_string();
+        let email = normalize_email(email)?;
+        let conn = self.conn.lock().await;
+        let changed = conn
+            .execute(
+                "UPDATE users
+                 SET home_entry = ?2, home_entry_source = ?3
+                 WHERE id = ?1",
+                params![user_id, entry.as_str(), source.as_str()],
+            )
+            .map_err(|error| AppError::Internal(format!("save home entry failed: {error}")))?;
+        if changed != 1 {
+            return Err(AppError::Unauthorized("session not found".into()));
+        }
+        home_entry_status_tx(&conn, &user_id, &email)
+    }
+
     pub async fn revoke_session_by_access_token(&self, access_token: &str) -> Result<(), AppError> {
         let access_token = access_token.trim();
         if access_token.is_empty() {
@@ -27351,6 +27387,108 @@ fn log_email_verification_rejection(reason: EmailVerificationRejectionReason) {
         reason = reason.as_str(),
         "email verification challenge rejected"
     );
+}
+
+pub(crate) fn validate_home_entry_choice(
+    entry: crate::models::HomeEntry,
+    source: crate::models::HomeEntrySource,
+) -> Result<(), AppError> {
+    use crate::models::{HomeEntry, HomeEntrySource};
+    let allowed = match source {
+        // Clients is a valid saved home. Skip is only the start page's
+        // no-choice path, so it cannot point anywhere else.
+        HomeEntrySource::Choice => true,
+        HomeEntrySource::Skip => entry == HomeEntry::Clients,
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(AppError::BadRequest("invalid home entry".into()))
+    }
+}
+
+fn home_entry_value(value: Option<String>) -> Result<Option<crate::models::HomeEntry>, AppError> {
+    use crate::models::HomeEntry;
+    match value.as_deref() {
+        None => Ok(None),
+        Some("clients") => Ok(Some(HomeEntry::Clients)),
+        Some("client-market") => Ok(Some(HomeEntry::ClientMarket)),
+        Some("share-market") => Ok(Some(HomeEntry::ShareMarket)),
+        Some("wallet") => Ok(Some(HomeEntry::Wallet)),
+        Some("providers") => Ok(Some(HomeEntry::Providers)),
+        Some(_) => Err(AppError::Internal("stored home entry is invalid".into())),
+    }
+}
+
+fn home_entry_source_value(
+    value: Option<String>,
+) -> Result<Option<crate::models::HomeEntrySource>, AppError> {
+    use crate::models::HomeEntrySource;
+    match value.as_deref() {
+        None => Ok(None),
+        Some("choice") => Ok(Some(HomeEntrySource::Choice)),
+        Some("skip") => Ok(Some(HomeEntrySource::Skip)),
+        Some(_) => Err(AppError::Internal(
+            "stored home entry source is invalid".into(),
+        )),
+    }
+}
+
+pub(crate) fn home_entry_status_tx(
+    conn: &Connection,
+    user_id: &str,
+    email: &str,
+) -> Result<crate::models::HomeEntryStatus, AppError> {
+    let row = conn
+        .query_row(
+            "SELECT home_entry, home_entry_source FROM users WHERE id = ?1",
+            params![user_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| AppError::Internal(format!("read home entry failed: {error}")))?
+        .ok_or_else(|| AppError::Unauthorized("session not found".into()))?;
+    Ok(crate::models::HomeEntryStatus {
+        has_activity: user_has_activity(conn, user_id, email)?,
+        entry: home_entry_value(row.0)?,
+        source: home_entry_source_value(row.1)?,
+    })
+}
+
+fn user_has_activity(conn: &Connection, user_id: &str, email: &str) -> Result<bool, AppError> {
+    let exists = conn
+        .query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM market_journal_postings
+                WHERE subject_id = ?1
+                  AND account_kind IN ('wallet_available', 'wallet_held')
+            ) OR EXISTS (
+                SELECT 1 FROM market_topup_orders WHERE user_id = ?1
+            ) OR EXISTS (
+                SELECT 1 FROM market_platform_contracts
+                WHERE buyer_user_id = ?1 OR provider_user_id = ?1
+            ) OR EXISTS (
+                SELECT 1 FROM market_c2c_orders
+                WHERE buyer_id = ?1 OR seller_id = ?1
+            ) OR EXISTS (
+                SELECT 1 FROM market_c2c_sellers WHERE user_id = ?1
+            ) OR EXISTS (
+                SELECT 1 FROM market_provider_profiles WHERE user_id = ?1
+            ) OR EXISTS (
+                SELECT 1 FROM installations WHERE owner_email = ?2 COLLATE NOCASE
+            ) OR EXISTS (
+                SELECT 1 FROM shares WHERE owner_email = ?2 COLLATE NOCASE
+            )",
+            params![user_id, email],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| AppError::Internal(format!("read home activity failed: {error}")))?;
+    Ok(exists)
 }
 
 fn normalize_email(value: &str) -> Result<String, AppError> {

@@ -51,6 +51,7 @@ try {
   const json = (route, body, status = 200) => route.fulfill({ status, contentType: "application/json", body: JSON.stringify(body) });
   await page.route("**/v1/**", async (route) => {
     const path = new URL(route.request().url()).pathname;
+    if (path === "/v1/auth/home") return json(route, { hasActivity: true, entry: null, source: null });
     if (path === "/v1/auth/session/me") return json(route, actor
       ? { authenticated: true, isAdmin: false, user: { id: actor, email: `${actor}@example.invalid` } }
       : { authenticated: false, isAdmin: false });

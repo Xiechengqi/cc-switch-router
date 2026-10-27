@@ -322,6 +322,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../schema/0092_market_client_trial_policy.sql"),
     ),
     (93, include_str!("../schema/0093_market_share_trials.sql")),
+    (94, include_str!("../schema/0094_user_home_entry.sql")),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -1937,6 +1938,135 @@ mod tests {
                 )
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn migration_94_stores_home_entry_without_marking_existing_users_seen() {
+        use crate::models::{HomeEntry, HomeEntrySource};
+        use crate::store::{home_entry_status_tx, validate_home_entry_choice};
+
+        let conn = memory_connection();
+        install_schema_through(&conn, 93);
+        conn.execute(
+            "INSERT INTO users (id, email_normalized, created_at, last_login_at)
+             VALUES ('empty-user', 'empty@example.com', 'now', 'now')",
+            [],
+        )
+        .expect("seed user before home columns exist");
+        apply(&conn).expect("apply home entry migration");
+
+        let fresh = home_entry_status_tx(&conn, "empty-user", "empty@example.com")
+            .expect("read fresh home entry");
+        assert!(!fresh.has_activity);
+        assert_eq!(fresh.entry, None);
+        assert_eq!(fresh.source, None);
+
+        validate_home_entry_choice(HomeEntry::Clients, HomeEntrySource::Choice)
+            .expect("the account page can save Clients");
+        validate_home_entry_choice(HomeEntry::Wallet, HomeEntrySource::Skip)
+            .expect_err("skip can only select clients");
+        validate_home_entry_choice(HomeEntry::ClientMarket, HomeEntrySource::Choice)
+            .expect("market choice is valid");
+        validate_home_entry_choice(HomeEntry::Clients, HomeEntrySource::Skip)
+            .expect("skip is valid");
+
+        conn.execute(
+            "UPDATE users SET home_entry = 'client-market', home_entry_source = 'choice'
+             WHERE id = 'empty-user'",
+            [],
+        )
+        .expect("save home entry");
+        let saved = home_entry_status_tx(&conn, "empty-user", "Empty@Example.com")
+            .expect("read saved home entry");
+        assert_eq!(saved.entry, Some(HomeEntry::ClientMarket));
+        assert_eq!(saved.source, Some(HomeEntrySource::Choice));
+        assert!(
+            conn.execute(
+                "UPDATE users SET home_entry = 'clients', home_entry_source = 'choice' WHERE id = 'empty-user'",
+                [],
+            )
+            .is_ok(),
+            "existing-table migration cannot add the cross-column rule"
+        );
+        assert!(
+            conn.execute(
+                "UPDATE users SET home_entry = 'elsewhere' WHERE id = 'empty-user'",
+                [],
+            )
+            .is_err()
+        );
+
+        let at = "2026-10-27T00:00:00Z";
+        // Wallet postings and top-up orders share the sealed journal and payment
+        // channel constraints. Provider identity, C2C seller state, an owned
+        // client, and an owned share each exercise one independent activity source.
+        let cases = [
+            (
+                "provider-user",
+                "provider@example.com",
+                format!(
+                    "INSERT INTO market_provider_profiles
+                        (id, user_id, canonical_email, display_name, claim_state, created_at, updated_at)
+                     VALUES ('provider-home', 'provider-user', 'provider@example.com', 'Provider', 'claimed', '{at}', '{at}');"
+                ),
+            ),
+            (
+                "buyer-user",
+                "buyer@example.com",
+                format!(
+                    "INSERT INTO users (id, email_normalized, created_at, last_login_at)
+                     VALUES ('contract-provider', 'contract-provider@example.com', '{at}', '{at}');
+                     INSERT INTO market_platform_contracts
+                        (id, product_kind, product_ref, trial_scope_ref, quote_id, request_fingerprint,
+                         buyer_user_id, provider_user_id, offer_revision, billing_model, cycle_price_minor,
+                         renewal_policy, status, created_at, updated_at)
+                     VALUES ('contract-home', 'share', 'share-contract', 'scope-home', 'quote-home', 'request-home',
+                         'buyer-user', 'contract-provider', 1, 'calendar_month', 100, 'manual', 'ended', '{at}', '{at}');"
+                ),
+            ),
+            (
+                "seller-user",
+                "seller@example.com",
+                format!(
+                    "INSERT INTO market_c2c_sellers
+                        (user_id, version, enabled, display_name, currency, price_bps, min_minor, max_minor, created_at, updated_at)
+                     VALUES ('seller-user', 1, 0, 'Seller', 'USD', 10000, 100, 1000, '{at}', '{at}');"
+                ),
+            ),
+            (
+                "client-user",
+                "client@example.com",
+                "INSERT INTO installations (id, public_key, platform, app_version, owner_email, created_at, last_seen_at, control_secret_b64)
+                 VALUES ('installation-home', 'key', 'linux', '1', 'client@example.com', 'now', 'now', 'secret');"
+                    .to_string(),
+            ),
+            (
+                "share-user",
+                "share@example.com",
+                "INSERT INTO shares
+                    (share_id, capacity_pool_id, installation_id, share_name, owner_email, app_type,
+                     token_limit, tokens_used, requests_count, share_status, created_at, expires_at, updated_at)
+                 VALUES ('share-home', 'pool-home', 'installation-home', 'Share', 'share@example.com', 'claude',
+                     1, 0, 0, 'active', 'now', 'now', 'now');"
+                    .to_string(),
+            ),
+        ];
+        for (user_id, email, sql) in cases {
+            conn.execute(
+                "INSERT INTO users (id, email_normalized, created_at, last_login_at) VALUES (?1, ?2, 'now', 'now')",
+                params![user_id, email],
+            )
+            .unwrap_or_else(|error| panic!("seed {user_id}: {error}"));
+            conn.execute_batch(&sql)
+                .unwrap_or_else(|error| panic!("seed activity for {user_id}: {error}"));
+            let status = home_entry_status_tx(&conn, user_id, email)
+                .unwrap_or_else(|error| panic!("read activity for {user_id}: {error}"));
+            assert!(status.has_activity, "{user_id} should count as active");
+            assert!(status.entry.is_none());
+        }
+        let untouched = home_entry_status_tx(&conn, "empty-user", "empty@example.com")
+            .expect("reread empty user");
+        assert!(!untouched.has_activity);
     }
 
     #[test]

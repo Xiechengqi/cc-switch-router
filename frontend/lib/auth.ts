@@ -1,5 +1,6 @@
 "use client";
 
+import { parseHomeEntryStatus, type HomeEntry, type HomeEntrySource, type HomeEntryStatus } from "@/lib/home-entry";
 import type { AuthResult, SessionStatus } from "@/lib/types";
 import { sameLoginContext } from "@/lib/password-auth";
 
@@ -434,6 +435,26 @@ export async function authFetch(input: RequestInfo | URL, init: RequestInit = {}
     return requestWithAccessToken(input, init, currentAccessToken);
   }
   return requestWithAccessToken(input, init, null);
+}
+
+export async function homeEntryStatus(): Promise<HomeEntryStatus> {
+  const response = await authFetch("/v1/auth/home");
+  const body = await response.json().catch(() => null);
+  const parsed = parseHomeEntryStatus(body);
+  if (!response.ok || !parsed) throw new Error("home entry unavailable");
+  return parsed;
+}
+
+export async function saveHomeEntry(entry: HomeEntry, source: HomeEntrySource) {
+  const response = await authFetch("/v1/auth/home", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ entry, source }),
+  });
+  const body = await response.json().catch(() => null);
+  const parsed = parseHomeEntryStatus(body);
+  if (!response.ok || !parsed) throw new Error("home entry unavailable");
+  return parsed;
 }
 
 export async function sessionStatus(): Promise<SessionStatus> {

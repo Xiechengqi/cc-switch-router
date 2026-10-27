@@ -116,6 +116,9 @@ try {
   // Context routes also cover the newly opened checkout tab. Page routes
   // cannot reliably intercept a popup's first navigation.
   await page.context().route("**/v1/**", async (route) => {
+    if (new URL(route.request().url()).pathname === "/v1/auth/home") {
+      return route.fulfill({ contentType: "application/json", body: JSON.stringify({ hasActivity: true, entry: null, source: null }) });
+    }
     const path = new URL(route.request().url()).pathname;
     if (path === "/v1/market-wallet/c2c/policy") return route.fulfill({ contentType: "application/json", body: JSON.stringify({
       policy: { version: 1, enabled: false, admissionMinor: 10000, minMinor: 100, maxMinor: 500000, paymentMinutes: 30 },

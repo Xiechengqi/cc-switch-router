@@ -4,6 +4,7 @@ export const DASHBOARD_CLIENT_MARKET_PATH = "/client-market/";
 export const DASHBOARD_PROVIDERS_PATH = "/providers/";
 export const DASHBOARD_ACCOUNT_PATH = "/account/";
 export const DASHBOARD_ACCOUNT_API_KEYS_PATH = "/account/api-keys/";
+export const DASHBOARD_ACCOUNT_HOME_PATH = "/account/home/";
 export const DASHBOARD_ACCOUNT_NOTIFICATIONS_PATH = "/account/notifications/";
 export const DASHBOARD_ACCOUNT_PROVIDER_USAGE_PATH = "/account/provider-usage/";
 export const DASHBOARD_ACCOUNT_CONSUMER_USAGE_PATH = "/account/consumer-usage/";
@@ -24,6 +25,7 @@ export type DashboardRoute =
   | typeof DASHBOARD_PROVIDERS_PATH
   | typeof DASHBOARD_ACCOUNT_PATH
   | typeof DASHBOARD_ACCOUNT_API_KEYS_PATH
+  | typeof DASHBOARD_ACCOUNT_HOME_PATH
   | typeof DASHBOARD_ACCOUNT_NOTIFICATIONS_PATH
   | typeof DASHBOARD_ACCOUNT_PROVIDER_USAGE_PATH
   | typeof DASHBOARD_ACCOUNT_CONSUMER_USAGE_PATH
@@ -47,6 +49,7 @@ export function normalizeDashboardPath(pathname: string): DashboardRoute | null 
   if (pathname.startsWith("/account/provider-usage")) return DASHBOARD_ACCOUNT_PROVIDER_USAGE_PATH;
   if (pathname.startsWith("/account/consumer-usage")) return DASHBOARD_ACCOUNT_CONSUMER_USAGE_PATH;
   if (pathname.startsWith("/account/api-keys")) return DASHBOARD_ACCOUNT_API_KEYS_PATH;
+  if (pathname.startsWith("/account/home")) return DASHBOARD_ACCOUNT_HOME_PATH;
   if (pathname.startsWith("/account/notifications")) return DASHBOARD_ACCOUNT_NOTIFICATIONS_PATH;
   if (pathname === "/account" || pathname === DASHBOARD_ACCOUNT_PATH) return DASHBOARD_ACCOUNT_PATH;
   if (pathname.startsWith("/client-market")) return DASHBOARD_CLIENT_MARKET_PATH;
@@ -68,8 +71,10 @@ export function dashboardRouteForFocus(kind: "request" | "client" | "share" | "c
 }
 
 export function defaultDashboardRouteFromSearch(search: string): DashboardRoute {
-  const drawerKind = new URLSearchParams(search).get("drawerKind");
-  if (drawerKind === "market") return DASHBOARD_SHARE_MARKET_PATH;
+  const params = new URLSearchParams(search);
+  if (params.get("drawerKind") === "market") return DASHBOARD_SHARE_MARKET_PATH;
+  if (params.has("topup") || params.has("amount") || params.has("returnTo")) return DASHBOARD_ACCOUNT_WALLET_PATH;
+  if (params.has("c2cOrder") || params.get("c2cSell") === "1") return DASHBOARD_ACCOUNT_WALLET_PATH;
   return DASHBOARD_CLIENTS_PATH;
 }
 
@@ -113,6 +118,7 @@ export const ACCOUNT_NAV_STORAGE_KEY = "cc_switch_router_account_nav_v1";
 
 const ACCOUNT_NAV_HREFS = [
   DASHBOARD_ACCOUNT_API_KEYS_PATH,
+  DASHBOARD_ACCOUNT_HOME_PATH,
   DASHBOARD_ACCOUNT_NOTIFICATIONS_PATH,
   DASHBOARD_ACCOUNT_PROVIDER_USAGE_PATH,
   DASHBOARD_ACCOUNT_CONSUMER_USAGE_PATH,

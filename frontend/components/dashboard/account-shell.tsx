@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { Activity, BarChart3, Bell, KeyRound, Receipt, Share2, ShieldCheck, WalletCards } from "lucide-react";
+import { Activity, BarChart3, Bell, House, KeyRound, Receipt, Share2, ShieldCheck, WalletCards } from "lucide-react";
 import * as React from "react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
@@ -10,6 +10,7 @@ import { getMarketAccessInboxSummary } from "@/lib/api";
 import {
   accountNavHrefFromPathname,
   DASHBOARD_ACCOUNT_API_KEYS_PATH,
+  DASHBOARD_ACCOUNT_HOME_PATH,
   DASHBOARD_ACCOUNT_CLIENT_PATH,
   DASHBOARD_ACCOUNT_WALLET_PATH,
   DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH,
@@ -34,6 +35,7 @@ const NAV_ITEMS: {
     | "account.nav.group.funds";
   labelKey:
     | "account.nav.apiKeys"
+    | "start.home.title"
     | "account.nav.notifications"
     | "account.nav.providerUsage"
     | "account.nav.consumerUsage"
@@ -52,6 +54,14 @@ const NAV_ITEMS: {
     icon: KeyRound,
     match: (pathname: string) =>
       pathname.startsWith("/account/api-keys") || pathname === "/account" || pathname === "/account/",
+  },
+  {
+    id: "home",
+    href: DASHBOARD_ACCOUNT_HOME_PATH,
+    groupLabelKey: "account.nav.group.security",
+    labelKey: "start.home.title",
+    icon: House,
+    match: (pathname: string) => pathname.startsWith("/account/home"),
   },
   {
     id: "notifications",

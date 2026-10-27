@@ -31,6 +31,9 @@ export function RootPage() {
   React.useEffect(() => {
     if (mode !== "dashboard") return;
     const search = window.location.search;
+    // A bare home stays here. The start gate sends it to the saved entry, or
+    // to Clients when that lookup fails. A task query leaves for its page.
+    if (!search || new URLSearchParams(search).toString().length === 0) return;
     router.replace(buildDashboardHref(defaultDashboardRouteFromSearch(search), search));
   }, [mode, router]);
 

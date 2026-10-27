@@ -53,6 +53,7 @@ try {
     await context.route("**/v1/**", async route => {
       const request = route.request(); const url = new URL(request.url()); const p = url.pathname; const body = request.postData() ? request.postDataJSON() : {};
       if (p.startsWith("/v1/auth/") && p !== "/v1/auth/session/me") loginCodeRequests.push(p);
+      if (p === "/v1/auth/home") return json(route, { hasActivity: true, entry: null, source: null });
       if (p === "/v1/auth/session/me") return json(route, { authenticated: true, isAdmin: admin, user: { id: actor, email: `${actor}@example.invalid` } });
       if (p === "/v1/regions") return json(route, []);
       if (p === "/v1/announcement") return json(route, { enabled: false, revision: "1", contentEn: "", contentZhCn: "" });

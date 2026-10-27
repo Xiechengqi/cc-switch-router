@@ -333,7 +333,7 @@ function Topbar({ active }: { active: DashboardShellActive }) {
         <header className="mx-auto w-[calc(100%-2rem)] max-w-7xl py-3.5">
         <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 gap-y-2 xl:grid-cols-[auto_minmax(0,1fr)_auto]">
           <div className="flex min-w-0 items-center gap-2.5 justify-self-start">
-            <Link href={DASHBOARD_CLIENTS_PATH} className="flex h-11 w-11 shrink-0 items-center justify-center rounded-md active:bg-slate-100" aria-label="CC-Switch Router">
+            <Link href="/" className="flex h-11 w-11 shrink-0 items-center justify-center rounded-md active:bg-slate-100" aria-label="CC-Switch Router">
               <Image src="/router-logo.svg" alt="" width={32} height={32} className="h-8 w-8 shrink-0" priority />
             </Link>
             <RouterSwitcher />

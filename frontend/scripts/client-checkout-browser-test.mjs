@@ -71,7 +71,8 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
       const req = route.request(),
         path = new URL(req.url()).pathname;
       let body = {};
-      if (path === "/v1/auth/session/me")
+      if (path === "/v1/auth/home") body = { hasActivity: true, entry: null, source: null };
+      else if (path === "/v1/auth/session/me")
         body = {
           authenticated: true,
           isAdmin: false,

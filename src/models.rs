@@ -173,6 +173,59 @@ pub struct AuthUser {
     pub email: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HomeEntry {
+    Clients,
+    ClientMarket,
+    ShareMarket,
+    Wallet,
+    Providers,
+}
+
+impl HomeEntry {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Clients => "clients",
+            Self::ClientMarket => "client-market",
+            Self::ShareMarket => "share-market",
+            Self::Wallet => "wallet",
+            Self::Providers => "providers",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HomeEntrySource {
+    Choice,
+    Skip,
+}
+
+impl HomeEntrySource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Choice => "choice",
+            Self::Skip => "skip",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HomeEntryStatus {
+    pub has_activity: bool,
+    pub entry: Option<HomeEntry>,
+    pub source: Option<HomeEntrySource>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PutHomeEntryRequest {
+    pub entry: HomeEntry,
+    pub source: HomeEntrySource,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TunnelLease {

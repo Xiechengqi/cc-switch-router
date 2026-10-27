@@ -112,6 +112,7 @@ try {
   });
   await page.route("**/v1/**", async (route) => {
     const path = new URL(route.request().url()).pathname;
+    if (path === "/v1/auth/home") return json(route, { hasActivity: true, entry: null, source: null });
     if (path === "/v1/auth/session/me") {
       const response = actor
         ? {

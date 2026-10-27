@@ -1239,6 +1239,12 @@ export function ClientBoard({
           <EmptyBlock>
             <div className="grid justify-items-center gap-2">
               <span>{sortedClients.length ? t("dashboard.noFilterResults") : t("dashboard.noClients")}</span>
+              {sortedClients.length ? null : (
+                <span className="flex flex-wrap justify-center gap-x-3 gap-y-1">
+                  <a href="/client-market/" className="text-xs font-medium text-primary hover:underline">{t("dashboard.emptyClients.rent")}</a>
+                  <a href="/account/wallet/" className="text-xs font-medium text-primary hover:underline">{t("dashboard.emptyClients.balance")}</a>
+                </span>
+              )}
               {sortedClients.length ? <button type="button" className="text-xs font-medium text-primary hover:underline" onClick={() => { setQuery(""); selectClientListTab("all"); clearRegionFilters(); setIssuesOnly(false); }}>{t("dashboard.clearFilters")}</button> : null}
             </div>
           </EmptyBlock>

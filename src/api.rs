@@ -409,6 +409,7 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/auth/session/refresh", post(refresh_session))
         .route("/v1/auth/session/logout", post(logout_session))
         .route("/v1/auth/session/me", get(session_me))
+        .route("/v1/auth/home", get(get_home_entry).put(put_home_entry))
         .route("/share-api/context", get(share_api_context))
         .route("/share-api/share", get(share_api_share))
         .route("/share-api/auth/me", get(share_api_auth_me))
@@ -3371,6 +3372,42 @@ async fn logout_session(
     Ok(with_clear_session_cookie(
         &state,
         Json(serde_json::json!({ "ok": true })),
+    ))
+}
+
+async fn require_session_user(
+    state: &ServerState,
+    headers: &HeaderMap,
+) -> Result<AuthSession, AppError> {
+    resolve_router_session(state, headers)
+        .await?
+        .ok_or_else(|| AppError::Unauthorized("authenticated owner session required".into()))
+}
+
+async fn get_home_entry(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<crate::models::HomeEntryStatus>, AppError> {
+    let session = require_session_user(&state, &headers).await?;
+    Ok(Json(
+        state
+            .store
+            .home_entry_status(&session.user_id, &session.email)
+            .await?,
+    ))
+}
+
+async fn put_home_entry(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<crate::models::PutHomeEntryRequest>,
+) -> Result<Json<crate::models::HomeEntryStatus>, AppError> {
+    let session = require_session_user(&state, &headers).await?;
+    Ok(Json(
+        state
+            .store
+            .set_home_entry(&session.user_id, &session.email, input.entry, input.source)
+            .await?,
     ))
 }
 

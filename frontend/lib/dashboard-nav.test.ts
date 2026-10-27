@@ -33,6 +33,13 @@ test("Provider Rank is a first-class dashboard destination", () => {
   assert.equal(pathnameForDashboardShell("/providers/?provider=mp_public"), "providers");
 });
 
+test("home entry settings stay inside the account section", () => {
+  assert.equal(normalizeDashboardPath("/account/home/"), "/account/home/");
+  assert.equal(pathnameForDashboardShell("/account/home/"), "account");
+  assert.equal(accountNavHrefFromPathname("/account/home/"), "/account/home/");
+  assert.equal(isAccountNavHref("/account/home/"), true);
+});
+
 test("platform balance has a permanent account destination", () => {
   assert.equal(normalizeDashboardPath("/account/wallet/"), "/account/wallet/");
   assert.equal(pathnameForDashboardShell("/account/wallet/"), "account");
