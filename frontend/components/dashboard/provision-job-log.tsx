@@ -321,9 +321,11 @@ function ProvisionLogLine({ line }: { line: string }) {
 export function ProvisionJobLog({
   log,
   phase,
+  intent = "install",
 }: {
   log: string;
   phase: "running" | "failed" | "success";
+  intent?: "install" | "release";
 }) {
   const { t } = useLocaleText();
   const viewportRef = React.useRef<HTMLDivElement | null>(null);
@@ -346,7 +348,7 @@ export function ProvisionJobLog({
           {phase === "running" ? (
             <span className="inline-flex items-center gap-1.5 rounded-full border border-sky-200 bg-sky-50 px-2 py-0.5 font-medium text-sky-800">
               <Loader2 className="h-3 w-3 animate-spin" />
-              {t("createClient.provisioning")}
+              {t(intent === "release" ? "createClient.releasing" : "createClient.provisioning")}
             </span>
           ) : null}
           {hasInstaller ? (
@@ -370,7 +372,7 @@ export function ProvisionJobLog({
               )}
             </div>
           ) : (
-            <p className="text-slate-400">{t("createClient.logWaiting")}</p>
+            <p className="text-slate-400">{t(intent === "release" ? "createClient.releaseLogWaiting" : "createClient.logWaiting")}</p>
           )}
         </div>
       </div>

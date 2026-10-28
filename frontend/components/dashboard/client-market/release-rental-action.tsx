@@ -359,7 +359,7 @@ export function ReleaseRentalAction({
                 {!settled ? <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" /> : null}
               </div>
 
-              <ProvisionJobLog log={job?.log || ""} phase={jobPhase} />
+              <ProvisionJobLog log={job?.log || ""} phase={jobPhase} intent="release" />
 
               {job?.status === "failed" ? (
                 <p className="text-xs leading-5 text-rose-700">

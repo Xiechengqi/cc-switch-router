@@ -785,6 +785,7 @@ function HostRowImpl({
                         phase={
                           cleanupTone === "failed" ? "failed" : cleanupTone === "success" ? "success" : "running"
                         }
+                        intent="release"
                       />
                       {cleanupJob?.status === "failed" ? (
                         <p className="text-sm text-rose-600">
