@@ -113,7 +113,7 @@ export function ClientTerminationsPanel({ role }: { role: Role }) {
   const current = actor && page?.actor === actor && page.role === role ? page : null;
   if (!actor) return null;
   return <section className="grid min-w-0 gap-3 rounded-xl border border-border bg-card p-4" aria-label={t("clientTermination.title")}>
-    <header className="flex flex-wrap items-center justify-between gap-2"><h3 className="font-semibold">{t("clientTermination.title")}</h3><Button size="sm" variant="ghost" onPress={() => void load()}>{t("common.reload")}</Button></header>
+    <header className="flex flex-wrap items-center justify-between gap-2"><h3 className="font-semibold">{t("clientTermination.title")}</h3><Button size="sm" variant="ghost" className="min-h-11" onPress={() => void load()}>{t("common.reload")}</Button></header>
     <p className="text-xs leading-5 text-muted-foreground">{t("clientTermination.help")}</p>
     {error && !selected ? <p role="alert" className="text-sm text-danger">{error}</p> : null}
     {current?.items.length ? <div className="grid max-h-96 gap-3 overflow-y-auto overscroll-contain" role="region" aria-label={t("clientTermination.title")} tabIndex={0}>
@@ -137,12 +137,12 @@ export function ClientTerminationsPanel({ role }: { role: Role }) {
         </div> : item.resolution ? <p>{t(`clientTermination.${item.resolution}`)}</p> : null}
         {item.disputeUsed && item.chatAvailable ? <div className="grid gap-1"><p className="text-muted-foreground">{t("clientTermination.chatHelp")}</p><a href={`/clients/?chat=${encodeURIComponent(item.installationId)}`} target="_blank" rel="noopener noreferrer" className="justify-self-start underline">{t("clientTermination.chat")}</a></div> : null}
         <div className="flex flex-wrap gap-2">
-          {(role === "buyer" ? terminationCanDispute(item) : terminationCanDecide(item)) ? <Button size="sm" variant="ghost" onPress={() => open(item, role === "buyer" ? "dispute" : "decision")}>{t(role === "buyer" ? "clientTermination.dispute" : role === "provider" ? "clientTermination.waive" : "clientTermination.resolve")}</Button> : null}
-          {role === "buyer" && terminationCanWithdraw(item) ? <Button size="sm" variant="ghost" onPress={() => open(item, "withdraw")}>{t("clientTermination.withdraw")}</Button> : null}
-          {role === "provider" && terminationCanRespond(item) ? <Button size="sm" variant="ghost" onPress={() => open(item, "respond")}>{t("clientTermination.respond")}</Button> : null}
+          {(role === "buyer" ? terminationCanDispute(item) : terminationCanDecide(item)) ? <Button size="sm" variant="ghost" className="min-h-11" onPress={() => open(item, role === "buyer" ? "dispute" : "decision")}>{t(role === "buyer" ? "clientTermination.dispute" : role === "provider" ? "clientTermination.waive" : "clientTermination.resolve")}</Button> : null}
+          {role === "buyer" && terminationCanWithdraw(item) ? <Button size="sm" variant="ghost" className="min-h-11" onPress={() => open(item, "withdraw")}>{t("clientTermination.withdraw")}</Button> : null}
+          {role === "provider" && terminationCanRespond(item) ? <Button size="sm" variant="ghost" className="min-h-11" onPress={() => open(item, "respond")}>{t("clientTermination.respond")}</Button> : null}
         </div>
       </article>)}
-      {current.nextCursor ? <Button variant="ghost" size="sm" isDisabled={busy} onPress={() => void more()}>{t("marketWallet.more")}</Button> : null}
+      {current.nextCursor ? <Button variant="ghost" size="sm" className="min-h-11" isDisabled={busy} onPress={() => void more()}>{t("marketWallet.more")}</Button> : null}
     </div> : <p className="text-xs text-muted-foreground">{t(current ? "clientTermination.empty" : "common.loading")}</p>}
     <Modal.Backdrop isOpen={!!selected} onOpenChange={next => { if (!next && !busy) {setSelected(null); setError("");} }}>
       <Modal.Container><Modal.Dialog className="light w-[min(560px,calc(100vw-2rem))] !bg-white !text-slate-900">
@@ -156,7 +156,7 @@ export function ClientTerminationsPanel({ role }: { role: Role }) {
           {action !== "withdraw" ? <label className="grid gap-1 text-sm">{t(action === "dispute" ? "clientTermination.claim" : "clientTermination.note")}<textarea className={WALLET_INPUT} value={note} maxLength={2000} onChange={e => setNote(e.target.value)} /></label> : null}
           {action !== "withdraw" && !terminationExplanationValid(note) ? <p role="alert" className="text-xs text-danger">{t("clientTermination.explanationTooLong")}</p> : null}
           {selected?.chatAvailable && action !== "withdraw" ? <div className="grid gap-1 text-xs leading-5"><p>{t("clientTermination.chatHelp")}</p><a href={`/clients/?chat=${encodeURIComponent(selected.installationId)}`} target="_blank" rel="noopener noreferrer" className="underline">{t("clientTermination.chat")}</a></div> : null}
-          {error ? <div className="grid gap-2"><p role="alert" className="text-sm text-danger">{error}</p><Button size="sm" variant="ghost" isDisabled={busy} onPress={() => void reloadSelected()}>{t("common.reload")}</Button></div> : null}
+          {error ? <div className="grid gap-2"><p role="alert" className="text-sm text-danger">{error}</p><Button size="sm" variant="ghost" className="min-h-11" isDisabled={busy} onPress={() => void reloadSelected()}>{t("common.reload")}</Button></div> : null}
         </Modal.Body>
         <Modal.Footer><Button variant="ghost" isDisabled={busy} onPress={() => { setSelected(null); setError(""); }}>{t("common.cancel")}</Button><Button variant="primary" isDisabled={busy || !actionAllowed || (action !== "withdraw" && !terminationExplanationValid(note, action !== "dispute"))} onPress={() => void submit()}>{t(busy ? "common.loading" : action === "withdraw" ? "clientTermination.withdraw" : "common.save")}</Button></Modal.Footer>
       </Modal.Dialog></Modal.Container>

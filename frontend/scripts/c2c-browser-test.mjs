@@ -21,9 +21,9 @@ const base = `http://127.0.0.1:${server.address().port}`;
 let browser;
 try {
   browser = await chromium.launch({ executablePath: process.env.CHROME_BIN || "/usr/bin/google-chrome", headless: true, args: ["--no-sandbox"] });
-  const errors = []; const orders = []; const keys = []; const loginCodeRequests = []; let counter = 0; let quoteCounter = 0; let quoteLifetimeMs = 300000; let uncertain = false; let heartbeat = 0; let released = 0; let resolution = 0; let manualAcceptRequests = 0;
+  const errors = []; const orders = []; const keys = []; const loginCodeRequests = []; const terminationReads = []; let counter = 0; let quoteCounter = 0; let quoteLifetimeMs = 300000; let uncertain = false; let heartbeat = 0; let released = 0; let resolution = 0; let manualAcceptRequests = 0;
   let policy = { version: 1, enabled: true, admissionMinor: 10000, minMinor: 100, maxMinor: 500000, paymentMinutes: 30 };
-  let profile = null; let sellerUnits = "1728000000"; let available = true; let pauseCount = 0; let financeFailure = false; let sellerReadFailure = false; let heldIncome = false;
+  let profile = null; let sellerUnits = "1728000000"; let available = true; let pauseCount = 0; let financeFailure = false; let terminationFailure = false; let sellerReadFailure = false; let heldIncome = false;
   let topupMode = "shadow"; let publicationReady = true; let retiredSetupRequests = 0; let offerWrites = 0; let expectedTrialHours = null;
   const publicationHost = { id: "publication-host", providerId: "seller", hostOwnerEmail: "seller@example.invalid", ip: "192.0.2.50", hostname: "Publication Host", port: 22,
     countryCode: "JP", status: "idle", isHostOwner: true, pricingModel: "prepaid_calendar_month", cyclePriceMinor: 1000, billingInterval: "calendar_month",
@@ -67,6 +67,13 @@ try {
       if (["/v1/account/payment-profile", "/v1/market-billing/dashboard"].includes(p)) { retiredSetupRequests++; return json(route, { message: "retired setup" }, 410); }
       if (p === "/v1/client-market/hosts") return json(route, [publicationHost]);
       if (p === "/v1/client-market/my-rentals") return json(route, []);
+      if (p === "/v1/client-market/terminations" || p === "/v1/admin/market/client-terminations") {
+        assert.equal(request.method(), "GET");
+        assert.equal(url.searchParams.get("openOnly"), p.startsWith("/v1/admin/") ? "true" : "false");
+        terminationReads.push({ actor, role: p.startsWith("/v1/admin/") ? "owner" : url.searchParams.get("provider") === "true" ? "provider" : "buyer" });
+        if (terminationFailure) return json(route, { message: "Termination history temporarily unavailable" }, 503);
+        return json(route, { items: [], nextCursor: null });
+      }
       if (p === "/v1/client-market/hosts/publication-host/offer" && request.method() === "PATCH") {
         assert.deepEqual(body, { cyclePriceMinor: 1000, currency: "USD", trialHours: expectedTrialHours }); offerWrites++; publicationHost.offerRevision++; publicationHost.trialHours = body.trialHours;
         return json(route, { ...publicationHost, hostId: publicationHost.id });
@@ -143,6 +150,7 @@ try {
       if (p === "/v1/admin/market-finance/overview") return json(route, overview);
       if (p === "/v1/admin/market-finance/wallet-policy") return json(route, { version: 1, maintenanceFeeBps: 500, transfersEnabled: true, transfersPaused: false, transferMaxMinor: 500000, transferDailyMaxMinor: 500000, balanceRefundable: false, canEdit: true });
       if (p === "/v1/admin/market/trial-policy") return json(route, { version: 1, clientHours: 12, shareHours: 12, shareTokens: 1_000_000, canEdit: true });
+      if (p === "/v1/admin/market/client-termination-policy") return json(route, { version: 1, rateBps: 1000, canEdit: actor === "owner" });
       if (p === "/v1/admin/market-finance/commission-policy") return json(route, { version: 1, current: { policyVersion: 1, rateBps: 1000, effectiveAt: "2026-01-01T00:00:00Z" }, scheduled: null, increaseNoticeDays: 7, canEdit: true });
       if (p === "/v1/admin/market-finance/c2c/policy") {
         if (request.method() === "PUT") { assert.equal(body.version, policy.version); policy = { ...body, version: policy.version + 1 }; return json(route, policy); }
@@ -219,8 +227,12 @@ try {
     assert.ok(checks.length > 0);
     for (const c of checks) assert.ok(c.ratio >= c.minimum, `${c.label}: contrast ${c.ratio.toFixed(2)} < ${c.minimum}`);
   };
+  const terminationPanel = page => page.getByRole("region", { name: "Client rental terminations", exact: true });
   const buyer = await open("buyer"); const page = buyer.page;
-  await page.goto(`${base}/account/wallet/`); await page.getByRole("button", { name: "C2C", exact: true }).click();
+  await page.goto(`${base}/account/wallet/`);
+  await terminationPanel(page).getByText("No Client termination records.", { exact: true }).waitFor();
+  assert.equal(await terminationPanel(page).getByRole("alert").count(), 0);
+  await page.getByRole("button", { name: "C2C", exact: true }).click();
   await page.getByRole("button", { name: "Buy balance", exact: true }).click();
   await page.locator("[data-c2c-buy]").getByRole("button", { name: new RegExp(seller.displayName) }).click();
   await page.getByLabel("Wallet credit to buy (USD)").fill("10");
@@ -382,6 +394,7 @@ try {
   await page.reload(); dialog = page.getByRole("dialog", { name: "Order details" }); await dialog.getByText(/Do not pay now/).waitFor(); assert.equal(await dialog.locator("[data-c2c-description]").count(), 0);
   unpaid.status = "disputed"; unpaid.paidAt = new Date().toISOString(); unpaid.version++;
   const owner = await open("owner", "en", true); await owner.page.goto(`${base}/settings/?panel=market_finance`);
+  await terminationPanel(owner.page).getByText("No Client termination records.", { exact: true }).waitFor();
   const adminPanel = owner.page.locator("[data-c2c-admin]"); await adminPanel.getByText("C2C settings", { exact: true }).waitFor();
   assert.equal(new URL(owner.page.url()).searchParams.has("panel"), false, "settings shortcut is consumed once");
   await owner.page.getByRole("button", { name: "Overview", exact: true }).click();
@@ -508,10 +521,23 @@ try {
   assert.equal(retiredSetupRequests, 0); topupMode = "shadow";
   // Income is embedded in Provider settings, including empty/error states.
   assert.equal((await page.request.get(`${base}/account/earnings/`)).status(), 404, "no obsolete page or redirect export");
-  financeFailure = true; await sell.page.goto(`${base}/account/provider-settings/#income`);
-  const income = sell.page.locator("#income"); await income.getByRole("alert").waitFor();
+  // Income and termination history load independently. Two real failures
+  // must stay distinguishable, and retrying one must not hide the other.
+  financeFailure = true; terminationFailure = true;
+  await sell.page.goto(`${base}/account/provider-settings/#income`);
+  const income = sell.page.locator("#income");
+  const incomeError = income.getByRole("alert").filter({ hasText: "Income temporarily unavailable" });
+  const terminationHistory = terminationPanel(sell.page);
+  const terminationError = terminationHistory.getByRole("alert").filter({ hasText: "Termination history temporarily unavailable" });
+  await incomeError.waitFor(); await terminationError.waitFor();
+  assert.equal(await income.getByRole("alert").count(), 2);
   financeFailure = false; await income.getByRole("button", { name: "Retry", exact: true }).click();
   await income.getByText("$130.00", { exact: true }).waitFor();
+  await incomeError.waitFor({ state: "hidden" });
+  assert.equal(await terminationError.isVisible(), true, "income retry leaves termination errors visible");
+  terminationFailure = false; await terminationHistory.getByRole("button", { name: "Reload", exact: true }).click();
+  await terminationHistory.getByText("No Client termination records.", { exact: true }).waitFor();
+  assert.equal(await income.getByRole("alert").count(), 0, "both successful reads clear their own errors");
   assert.equal(await sell.page.locator('nav a[href*="earnings"]').count(), 0);
   assert.equal(await income.getByRole("button", { name: /withdraw|convert|transfer/i }).count(), 0);
   assert.equal(await income.locator("details[open]").count(), 0, "earnings details folded initially");
@@ -530,6 +556,10 @@ try {
   await guest.page.goto(`${base}/account/provider-settings/`);
   await guest.page.locator("#income").getByText(/sign in/i).waitFor();
   assert.equal(guestFinanceRequests, 0, "anonymous income has a sign-in state and never fetches private finances");
+  assert.equal(terminationReads.some(read => read.actor === "guest"), false, "anonymous viewers never fetch private termination history");
+  for (const [actor, role] of [["buyer", "buyer"], ["seller", "provider"], ["owner", "owner"]]) {
+    assert.ok(terminationReads.some(read => read.actor === actor && read.role === role), `${role} termination history uses its scoped API`);
+  }
   assert.deepEqual(errors, []);
-  console.log("C2C browser checks passed: automatic reservation/payment without manual acceptance, explicit seller upgrade consent preserving pauses, legacy withdrawal/rejection and early payment protection, persistent selling without heartbeat, independent dispute grants and party conflict, public descriptions, seller draft conflict, Provider income, recovery, login-authorized release without financial OTP, bilingual DOM geometry, contrast, keyboard and clock skew; no screenshots or real operations.");
+  console.log("C2C browser checks passed: automatic reservation/payment without manual acceptance, explicit seller upgrade consent preserving pauses, legacy withdrawal/rejection and early payment protection, persistent selling without heartbeat, independent dispute grants and party conflict, public descriptions, seller draft conflict, Provider income and scoped termination history with independent failure recovery, login-authorized release without financial OTP, bilingual DOM geometry, contrast, keyboard and clock skew; no screenshots or real operations.");
 } finally { await browser?.close(); await new Promise(resolveClose => server.close(resolveClose)); }

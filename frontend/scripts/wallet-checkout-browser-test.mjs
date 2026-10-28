@@ -125,6 +125,7 @@ try {
       available: false, blockers: ["C2C_DISABLED"], canManagePolicy: false, verified: true, termsVersion: 3, independentDisputeHandlerAvailable: false, claimGraceSeconds: 120, firstPurchaseMaxMinor: 10000,
     }) });
     if (path === "/v1/market-wallet/c2c/orders") return route.fulfill({ contentType: "application/json", body: JSON.stringify({ items: [], next: null }) });
+    if (path === "/v1/client-market/terminations") return route.fulfill({ contentType: "application/json", body: JSON.stringify({ items: [], nextCursor: null }) });
     await route.fulfill({ contentType: "application/json", body: "{}" });
   });
   await page.context().route("**/v1/market-wallet/topups/**", async (route) => {
@@ -338,6 +339,7 @@ try {
     await route.fulfill({ contentType: "application/json", body: JSON.stringify(topup) });
   });
   await page.goto(`${baseUrl}/account/wallet/`);
+  await page.getByRole("region", { name: "Client rental terminations", exact: true }).getByText("No Client termination records.", { exact: true }).waitFor();
   await page.getByRole("button", { name: "Check payment" }).waitFor();
   for (const width of [320, 375, 414, 768]) {
     await page.setViewportSize({ width, height: 900 });
@@ -603,6 +605,8 @@ try {
   await page.reload();
   assert.equal(await page.getByRole("link", { name: "Provider earnings", exact: true }).count(), 0);
   const earningsPanel = page.getByRole("region", { name: "Provider earnings", exact: true });
+  await earningsPanel.getByRole("region", { name: "Client rental terminations", exact: true }).getByText("No Client termination records.", { exact: true }).waitFor();
+  assert.equal(await earningsPanel.getByRole("alert").count(), 0);
   const earningSummary = earningsPanel.getByText("Revenue & service fees", { exact: true });
   assert.equal(await earningSummary.locator("..").getAttribute("open"), null, "detailed accounting starts collapsed");
   await earningSummary.click();
@@ -675,6 +679,8 @@ try {
     else if (path === "/v1/admin/market-finance/c2c/policy") data = { policy: { version: 1, enabled: false,
       admissionMinor: 10000, minMinor: 100, maxMinor: 500000, paymentMinutes: 30 }, canManage: true, canResolve: true, };
     else if (path === "/v1/admin/market-finance/c2c/orders" || path === "/v1/admin/market-finance/c2c/sellers") data = { items: [], next: null };
+    else if (path === "/v1/admin/market/client-termination-policy") data = { version: 1, rateBps: 1000, canEdit: true };
+    else if (path === "/v1/admin/market/client-terminations") data = { items: [], nextCursor: null };
     else if (path === "/v1/admin/market/trial-policy") {
       if (route.request().method() === "PUT") {
         trialWrites += 1;
@@ -734,6 +740,7 @@ try {
   await page.goto(`${baseUrl}/settings/`);
   await page.getByRole("button", { name: "Marketplace", exact: true }).click();
   await page.getByRole("tab", { name: "Platform wallet", exact: true }).click();
+  await page.getByRole("region", { name: "Client rental terminations", exact: true }).getByText("No Client termination records.", { exact: true }).waitFor();
   const policyPanel = page.locator("section").filter({ has: page.getByRole("heading", { name: "Balance & transfers", exact: true }) }).last();
   const feeInput = policyPanel.getByLabel("Top-up maintenance fee (%)", { exact: true });
   const trialPanel = page.locator("section").filter({ has: page.getByRole("heading", { name: "Market trial rules", exact: true }) }).last();
