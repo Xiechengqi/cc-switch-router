@@ -135,7 +135,7 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
                   availableUnits: available,
                   heldUnits: "0",
                   committedUnits: "0",
-                  requiredUnits: "86400000",
+                  requiredUnits: (BigInt(host.cyclePriceMinor) * 86_400n).toString(),
                   shortfallUnits: shortfall,
                 },
         };
@@ -213,9 +213,24 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
     console.log("opened", quotes);
     if (captureScreenshots) await page.screenshot({ path: artifacts + "/initial.png", fullPage: true });
     assert.equal(await page.locator('img[alt="Binance Pay"]').count(), 0);
-    await page.locator("[data-client-trial]").getByText("本次可试用", { exact: true }).waitFor();
-    assert.equal(await page.locator("[data-client-trial] dd").nth(2).textContent(), "12小时");
-    await page.getByText(/正式租金扣款成功后，恢复下一次租用/).waitFor();
+    const trialSummary = page.locator("[data-client-trial]");
+    const trialRules = trialSummary.locator("details");
+    await trialSummary.getByText("免费试用", { exact: true }).waitFor();
+    assert.equal(await trialSummary.locator(":scope > dl dd").textContent(), "12小时");
+    await trialSummary.getByText(/试用免费，结束后从平台余额支付 .*10\.00/).waitFor();
+    await trialSummary.getByText("须备足首期余额；扣款失败即回收 Client 并永久清理数据。", { exact: true }).waitFor();
+    const sharedTrialRule = trialRules.getByText(/同账号在此 Host 共用一份试用额度/);
+    assert.equal(await trialRules.getAttribute("open"), null);
+    assert.equal(await sharedTrialRule.isVisible(), false, "detailed rules are collapsed by default");
+    const expandTrialRules = trialRules.locator("summary");
+    await expandTrialRules.focus();
+    await page.keyboard.press("Enter");
+    await sharedTrialRule.waitFor();
+    assert.equal(await trialRules.locator("dd").first().textContent(), "12小时");
+    assert.equal(await trialRules.locator("dd").last().textContent(), "0秒");
+    await trialRules.getByText("仅计算实际可用的服务时长。", { exact: true }).waitFor();
+    await page.keyboard.press("Enter");
+    await sharedTrialRule.waitFor({ state: "hidden" });
     await page.getByRole("button", { name: "充值后继续", exact: true }).waitFor();
     assert.equal(await page.getByRole("button", { name: "开始试用并创建", exact: true }).count(), 0);
     assert.equal(commits.length, 0, "an unfunded trial cannot submit a rental");
@@ -258,12 +273,26 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
     trial = 4500;
     await page.goto(baseUrl + "/client-market/?focusHost=host-1");
     await page.getByRole("heading", { name: "配置并确认" }).waitFor();
-    assert.equal(await page.locator("[data-client-trial] dd").nth(1).textContent(), "10小时 45分钟");
-    assert.equal(await page.locator("[data-client-trial] dd").nth(2).textContent(), "1小时 15分钟");
+    assert.equal(await trialRules.locator("dd").last().textContent(), "10小时 45分钟");
+    assert.equal(await trialSummary.locator(":scope > dl dd").textContent(), "1小时 15分钟");
+    assert.equal(await trialRules.getAttribute("open"), null);
+    // The reported example must show the actual remaining time and quoted price,
+    // rather than repeating the full allowance and the already-used time.
+    trialAllowance = 3600;
+    trial = 498;
+    host.cyclePriceMinor = 5;
+    await page.goto(baseUrl + "/client-market/?focusHost=host-1");
+    await page.getByRole("heading", { name: "配置并确认" }).waitFor();
+    assert.equal(await trialSummary.locator(":scope > dl dd").textContent(), "8分钟 18秒");
+    assert.equal(await trialRules.locator("dd").last().textContent(), "51分钟 42秒");
+    await trialSummary.getByText(/试用免费，结束后从平台余额支付 .*0\.05/).waitFor();
+    if (captureScreenshots) await page.screenshot({ path: artifacts + "/concise-trial.png", fullPage: true });
+    trialAllowance = 43200;
+    host.cyclePriceMinor = 1000;
     trial = 1;
     await page.goto(baseUrl + "/client-market/?focusHost=host-1");
     await page.getByRole("heading", { name: "配置并确认" }).waitFor();
-    assert.equal(await page.locator("[data-client-trial] dd").nth(2).textContent(), "1秒");
+    assert.equal(await trialSummary.locator(":scope > dl dd").textContent(), "1秒");
     trial = 0;
     available = "0";
     shortfall = "86400000";
@@ -272,7 +301,9 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
     await page
       .getByRole("button", { name: "充值后继续", exact: true })
       .waitFor();
-    await page.locator("[data-client-trial]").getByText(/本轮试用额度已用尽.*直接支付首期租金/).waitFor();
+    await trialSummary.getByText(/试用额度已用尽，开通后支付 .*10\.00/).waitFor();
+    assert.equal(await trialSummary.locator(":scope > dl").count(), 0, "an exhausted trial does not show a redundant zero timer");
+    assert.equal(await trialRules.getAttribute("open"), null);
     await page.getByLabel("访问子域名", { exact: true }).fill("saved-domain");
     await page.getByLabel("后续按月从平台余额自动续费").check();
     await page.getByRole("button", { name: "充值后继续", exact: true }).click();
@@ -389,10 +420,23 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
     trial = 0;
     await page.goto(baseUrl + "/client-market/?focusHost=host-1");
     await page.getByRole("heading", { name: "配置并确认" }).waitFor();
-    await page.locator("[data-client-trial]").getByText("此 Host 不提供免费试用。", { exact: true }).waitFor();
-    assert.equal(await page.locator("[data-client-trial] dd").nth(2).textContent(), "0秒");
-    assert.equal(await page.locator("[data-client-trial]").getByText(/本轮试用额度已用尽/).count(), 0);
-    console.log("shared trial accounting copy, partial/one-second/exhausted/disabled allowances passed");
+    await trialSummary.getByText(/无免费试用，开通后支付 .*10\.00/).waitFor();
+    assert.equal(await trialSummary.locator("dl, details").count(), 0, "a Host without a trial has no trial metrics or rules");
+    assert.equal(await trialSummary.getByText(/试用额度已用尽/).count(), 0);
+    trialAllowance = 43200;
+    trial = 4500;
+    await page.goto(baseUrl + "/client-market/?focusHost=host-1&testLocale=en");
+    await page.getByRole("heading", { name: "Configure and confirm" }).waitFor();
+    await trialSummary.getByText("Free trial", { exact: true }).waitFor();
+    assert.equal(await trialSummary.locator(":scope > dl dd").textContent(), "1 hr 15 min");
+    await trialSummary.getByText(/Free during the trial, then .*10\.00/).waitFor();
+    await trialSummary.getByText(/Enough balance for the first period is required.*permanently deletes Client data/).waitFor();
+    assert.equal(await trialRules.getAttribute("open"), null);
+    for (const width of [320, 375, 414, 768]) {
+      await page.setViewportSize({ width, height: 640 });
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth), false, `English trial overflow at ${width}`);
+    }
+    console.log("concise bilingual trial summary, keyboard-accessible collapsed rules, dynamic prices and full/partial/one-second/exhausted/disabled allowances passed");
 
     // Free checkout has no wallet or renewal controls, including English rendering.
     host.cyclePriceMinor = undefined;
@@ -409,6 +453,7 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
       await page.getByRole("button", { name: "创建", exact: true }).count(),
       1,
     );
+    assert.equal(await trialSummary.count(), 0, "free offers do not display paid trial terms");
     await page.goto(baseUrl + "/client-market/?focusHost=host-1&testLocale=en");
     await page
       .getByRole("heading", { name: "Configure and confirm" })

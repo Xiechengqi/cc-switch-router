@@ -180,21 +180,38 @@ export function ClientCheckoutForm({
             </div>
             {(item.cyclePriceMinor != null || item.dailyRateMinor != null) && !state.unsupported ? (
               <div className="grid gap-2 rounded-lg bg-muted p-3 text-sm" data-client-trial>
-                <dl className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
-                  {([
-                    ["clientTrial.allowance", item.trialAllowanceSeconds],
-                    ["clientTrial.consumed", item.trialSecondsConsumed],
-                    ["clientTrial.remaining", item.trialSecondsRemaining],
-                  ] as const).map(([key, value]) => <React.Fragment key={key}>
-                    <dt className="text-muted-foreground">{t(key)}</dt>
-                    <dd className="text-right font-medium tabular-nums">{trialDuration(value, locale)}</dd>
-                  </React.Fragment>)}
-                </dl>
-                <p className="text-xs leading-5">{item.trialAllowanceSeconds === 0
-                  ? t("clientTrial.disabled") : item.trialSecondsRemaining > 0
-                    ? t("clientCheckout.trialHint") : t("clientTrial.exhausted", { price })}</p>
-                {item.trialSecondsRemaining > 0 ? <p className="text-xs leading-5 text-muted-foreground">{t("clientCheckout.trialCharge", { price })}</p> : null}
-                <p className="text-xs leading-5 text-muted-foreground">{t("clientTrial.rules")}</p>
+                {item.trialSecondsRemaining > 0 ? (
+                  <>
+                    <dl className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+                      <dt className="text-muted-foreground">{t("clientTrial.remaining")}</dt>
+                      <dd className="font-semibold tabular-nums">{trialDuration(item.trialSecondsRemaining, locale)}</dd>
+                    </dl>
+                    <p className="text-xs leading-5">{t("clientCheckout.trialCharge", { price })}</p>
+                    <p className="text-xs leading-5 text-muted-foreground">{t("clientCheckout.trialHint")}</p>
+                  </>
+                ) : (
+                  <p className="text-xs leading-5">{t(item.trialAllowanceSeconds === 0 ? "clientTrial.disabled" : "clientTrial.exhausted", { price })}</p>
+                )}
+                {item.trialAllowanceSeconds > 0 ? (
+                  <details className="text-xs text-muted-foreground">
+                    <summary className="cursor-pointer rounded focus-visible:outline-2 focus-visible:outline-ring">
+                      {t("clientTrial.details")}
+                    </summary>
+                    <div className="mt-2 grid gap-2 leading-5">
+                      <dl className="grid grid-cols-2 gap-x-4 gap-y-1">
+                        {([
+                          ["clientTrial.allowance", item.trialAllowanceSeconds],
+                          ["clientTrial.consumed", item.trialSecondsConsumed],
+                        ] as const).map(([key, value]) => <React.Fragment key={key}>
+                          <dt>{t(key)}</dt>
+                          <dd className="text-right tabular-nums">{trialDuration(value, locale)}</dd>
+                        </React.Fragment>)}
+                      </dl>
+                      <p>{t("clientTrial.serviceTime")}</p>
+                      <p>{t("clientTrial.rules")}</p>
+                    </div>
+                  </details>
+                ) : null}
               </div>
             ) : null}
             {item.pricingModel === "prepaid_calendar_month" &&
