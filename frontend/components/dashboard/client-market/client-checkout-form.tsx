@@ -45,6 +45,7 @@ export function ClientCheckoutForm({
           ? t("clientCheckout.reserved", { seconds })
           : t("clientCheckout.expired")}
       </p>
+      {state.paid && quote.terminationPolicy ? <p className="rounded-lg bg-muted p-3 text-xs leading-5 text-muted-foreground">{t("clientTermination.purchaseTerms", { rate: String(quote.terminationPolicy.rateBps / 100) })}</p> : null}
       {quote.items.map((item, index) => {
         const draft = drafts[item.id] || {
           subdomain: "",

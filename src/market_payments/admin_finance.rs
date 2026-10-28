@@ -83,7 +83,7 @@ fn overview_tx(conn: &Connection) -> Result<FinanceOverview, AppError> {
     let (open_cases, held_lots): (i64, i64) = conn
         .query_row(
             "SELECT (SELECT COUNT(*) FROM market_finance_reconciliation_cases WHERE status = 'open'),
-                    (SELECT COUNT(*) FROM market_provider_earning_lots WHERE disputed = 1)",
+                    (SELECT COUNT(*) FROM market_provider_income_view WHERE disputed = 1)",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -114,7 +114,8 @@ fn overview_tx(conn: &Connection) -> Result<FinanceOverview, AppError> {
         // Internal liability reassignment, never a top-up or platform revenue.
         earning_converted_units: conn
             .query_row(
-                "SELECT COALESCE(SUM(amount_units), 0) FROM market_earning_wallet_conversions",
+                "SELECT (SELECT COALESCE(SUM(amount_units), 0) FROM market_earning_wallet_conversions)
+                    + (SELECT COALESCE(SUM(credited_units), 0) FROM client_termination_compensations)",
                 [],
                 |r| r.get(0),
             )

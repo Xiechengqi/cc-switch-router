@@ -323,6 +323,7 @@ export type MarketEarningHold = {
 
 export type MarketProviderEarningLot = {
   id: string;
+  incomeKind?: "service" | "client_termination";
   amountUnits: string;
   grossUnits: string;
   commissionUnits: string;
@@ -772,6 +773,8 @@ export const MARKET_NOTIFICATION_KINDS = [
   "earnings_held", "earnings_released", "earnings_converted",
   "wallet_transfer_sent", "wallet_transfer_received",
   "commission_policy_changed",
+  "client_termination_settled",
+  "client_termination_claim",
 ] as const;
 
 export type MarketNotificationKind = (typeof MARKET_NOTIFICATION_KINDS)[number];

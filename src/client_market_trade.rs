@@ -261,6 +261,7 @@ pub struct AllocationQuoteView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wallet_funding: Option<crate::market_wallet::WalletQuoteFunding>,
     pub funding_rail: String,
+    pub termination_policy: Option<crate::client_market_termination::Policy>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -388,6 +389,10 @@ pub struct HostUsageHistoryEntry {
     pub charges_minor: i64,
     pub refunded_minor: i64,
     pub net_charges_minor: i64,
+    #[serde(serialize_with = "crate::market_wallet::serialize_units")]
+    pub service_units: i64,
+    #[serde(serialize_with = "crate::market_wallet::serialize_units")]
+    pub compensation_units: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1129,40 +1134,6 @@ async fn get_client_rental(
 }
 
 impl AppStore {
-    pub async fn client_market_schedule_wallet_release(
-        &self,
-        installation_id: &str,
-        session: &AuthSession,
-    ) -> Result<bool, AppError> {
-        let conn = self.conn.lock().await;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| AppError::Internal(format!("begin wallet cancellation: {e}")))?;
-        let (buyer, contract_id): (String, Option<String>) = tx.query_row(
-            "SELECT client_user_id, platform_contract_id FROM client_market_subscriptions WHERE installation_id = ?1",
-            params![installation_id], |r| Ok((r.get(0)?, r.get(1)?)),
-        ).optional().map_err(|e| AppError::Internal(format!("read wallet cancellation: {e}")))?
-         .ok_or_else(|| AppError::NotFound("Client rental not found".into()))?;
-        if buyer != session.user_id {
-            return Err(AppError::Forbidden(
-                "Client rental belongs to another buyer".into(),
-            ));
-        }
-        let scheduled = if let Some(id) = contract_id {
-            crate::market_platform_contracts::cancel_at_period_end_tx(
-                &tx,
-                &id,
-                &session.user_id,
-                &Utc::now().to_rfc3339(),
-            )?
-        } else {
-            false
-        };
-        tx.commit()
-            .map_err(|e| AppError::Internal(format!("commit wallet cancellation: {e}")))?;
-        Ok(scheduled)
-    }
-
     /// Record a Client Market audit event outside of an existing transaction.
     /// Used by surfaces that are not themselves transactional — notably the web
     /// terminal, whose root sessions previously left no durable trace at all.
@@ -2636,6 +2607,12 @@ impl AppStore {
             ],
         )
         .map_err(|error| AppError::Internal(format!("insert allocation quote failed: {error}")))?;
+        let termination_policy = if funding_rail == "platform_wallet" {
+            crate::client_market_termination::freeze_quote_tx(&tx, &quote_id)?;
+            Some(crate::client_market_termination::policy_tx(&tx)?)
+        } else {
+            None
+        };
         let mut items = Vec::with_capacity(candidates.len());
         for (position, candidate) in candidates.into_iter().enumerate() {
             if funding_rail == "platform_wallet" {
@@ -2729,6 +2706,7 @@ impl AppStore {
             items,
             wallet_funding,
             funding_rail: funding_rail.into(),
+            termination_policy,
         })
     }
 
@@ -3412,7 +3390,12 @@ impl AppStore {
                             FROM market_platform_periods period
                             JOIN market_platform_contracts contract ON contract.id = period.contract_id
                             WHERE contract.product_kind = 'client_host' AND contract.service_ref = s.installation_id
-                        ), 0)
+                        ), 0),
+                        COALESCE((SELECT SUM(d.amount_units) FROM market_delivery_slices d
+                            JOIN market_platform_contracts c ON c.id=d.contract_id
+                            WHERE c.product_kind='client_host' AND c.service_ref=s.installation_id),0),
+                        COALESCE((SELECT SUM(c.amount_units-c.reversed_units) FROM client_termination_compensations c
+                            JOIN client_market_terminations t ON t.id=c.id WHERE t.installation_id=s.installation_id),0)
                  FROM client_market_subscriptions s
                  WHERE s.host_id = ?1
                  ORDER BY datetime(COALESCE(s.activated_at, s.created_at)) DESC,
@@ -3438,6 +3421,8 @@ impl AppStore {
                     row.get::<_, Option<String>>(9)?,
                     row.get::<_, i64>(10)?,
                     row.get::<_, i64>(11)?,
+                    row.get::<_, i64>(12)?,
+                    row.get::<_, i64>(13)?,
                 ))
             })
             .map_err(|error| {
@@ -3463,7 +3448,11 @@ impl AppStore {
                     currency,
                     charge_units,
                     refunded_units,
+                    service_units,
+                    compensation_units,
                 )| HostUsageHistoryEntry {
+                    service_units,
+                    compensation_units,
                     installation_id,
                     client_owner_email,
                     client_subdomain: client_subdomain
@@ -4985,11 +4974,13 @@ pub(crate) fn cleanup_started_tx(
             .map_err(|error| {
                 AppError::Internal(format!("read Client wallet contract failed: {error}"))
             })?;
-        if let Some(contract_id) = wallet_contract_id {
-            crate::market_platform_contracts::terminate_after_cleanup_tx(
+        if wallet_contract_id.is_some() {
+            crate::client_market_termination::accept_tx(
                 tx,
-                &contract_id,
-                false,
+                installation_id,
+                actor_user_id,
+                reason,
+                None,
                 &now.to_rfc3339(),
             )?;
         }
@@ -5059,6 +5050,12 @@ pub(crate) fn cleanup_finished_tx(
     host_id: &str,
     now: DateTime<Utc>,
 ) -> Result<(), AppError> {
+    crate::client_market_termination::record_cleanup_confirmed_tx(
+        tx,
+        installation_id,
+        host_id,
+        &now.to_rfc3339(),
+    )?;
     tx.execute(
         "UPDATE client_market_subscriptions
          SET status = ?2, released_at = COALESCE(released_at, ?3), updated_at = ?3
@@ -5086,6 +5083,7 @@ pub(crate) fn cleanup_failed_tx(
     failure_code: &str,
     now: DateTime<Utc>,
 ) -> Result<(), AppError> {
+    crate::client_market_termination::cleanup_failed_tx(tx, installation_id, &now.to_rfc3339())?;
     // Billing and the Client tunnel were already stopped when cleanup began.
     // A remote, network, or safety failure cannot keep the renter locked to an
     // ended contract. The Host remains bound and quarantined until verified clean.

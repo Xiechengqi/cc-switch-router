@@ -56,6 +56,62 @@ fn sending(value: Prepared) -> Attempt {
 }
 
 #[test]
+fn client_termination_receipts_have_a_delivery_purpose_exact_amounts_and_role_specific_links() {
+    for role in ["buyer", "provider"] {
+        let i = item(
+            "client_termination_settled",
+            json!({
+                "role":role,"amountUnits":"43200","walletReturnUnits":"388800",
+                "compensationUnits":"43200","clientReference":"sample-client",
+                "claim":"PRIVATE_CLAIM","note":"PRIVATE_NOTE",
+            }),
+        );
+        assert_eq!(purpose(&i), Some("client_termination_receipt"));
+        let (subject, html, text) = render_email(&i, "https://router.example");
+        assert!(subject.is_ascii() && html.is_ascii() && text.is_ascii());
+        assert!(text.contains("Total Provider compensation: USD 0.005"));
+        assert!(text.contains("Total wallet return: USD 0.045"));
+        assert!(text.contains("sample-client"));
+        assert!(!html.contains("PRIVATE_CLAIM") && !text.contains("PRIVATE_NOTE"));
+        assert!(html.contains(if role == "provider" {
+            "/account/provider-settings/#income"
+        } else {
+            "/account/wallet/"
+        }));
+        let key = semantic_key(&i, "client_termination_receipt");
+        let mut retry = i;
+        retry.attempts += 1;
+        assert_eq!(key, semantic_key(&retry, "client_termination_receipt"));
+    }
+}
+
+#[test]
+fn client_termination_claim_notices_are_actionable_private_and_have_a_delivery_purpose() {
+    for role in ["buyer", "provider"] {
+        let i = item(
+            "client_termination_claim",
+            json!({"role":role,"action":"opened",
+            "responseDeadline":"2026-10-28T12:00:00Z","clientReference":"test-client",
+            "claim":"PRIVATE_CLAIM","note":"PRIVATE_NOTE"}),
+        );
+        assert_eq!(purpose(&i), Some("client_termination_claim"));
+        let (subject, html, text) = render_email(&i, "https://router.example");
+        assert!(subject.is_ascii() && html.is_ascii() && text.is_ascii());
+        assert!(text.contains("72 hours") && text.contains("2026-10-28T12:00:00Z"));
+        assert!(!html.contains("PRIVATE_CLAIM") && !text.contains("PRIVATE_NOTE"));
+        assert!(html.contains(if role == "provider" {
+            "/account/provider-settings/#income"
+        } else {
+            "/account/wallet/"
+        }));
+        let mut response = i;
+        response.payload["action"] = json!("responded");
+        let (_, _, text) = render_email(&response, "https://router.example");
+        assert!(text.contains("Owner decision"));
+    }
+}
+
+#[test]
 fn every_financial_email_is_english_and_uses_the_shared_layout() {
     for kind in KINDS {
         let item = item(

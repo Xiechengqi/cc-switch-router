@@ -15,6 +15,7 @@ import { WalletBadge } from "@/components/market/wallet-primitives";
 import { MarketFinanceOverviewSection } from "@/components/settings/market-finance-overview";
 import { WalletPolicySettings } from "@/components/settings/wallet-policy-settings";
 import { MarketTrialSettings } from "@/components/settings/market-trial-settings";
+import { ClientTerminationSettings } from "@/components/settings/client-termination-settings";
 import { CommissionPolicySettings } from "@/components/settings/commission-policy-settings";
 import { C2CFinanceSettings } from "@/components/settings/c2c-finance-settings";
 import { MarketFinanceCaseDesk } from "@/components/settings/market-finance-case-desk";
@@ -265,6 +266,7 @@ export function MarketPaymentChannelsPanel() {
       <MarketFinanceOverviewSection refreshKey={refreshKey} />
       <WalletPolicySettings />
       <MarketTrialSettings />
+      <ClientTerminationSettings />
       <CommissionPolicySettings />
       <C2CFinanceSettings />
 

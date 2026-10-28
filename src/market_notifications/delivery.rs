@@ -47,6 +47,8 @@ pub(super) fn purpose(item: &Claimed) -> Option<&'static str> {
         "service_status_summary" => Some("service_status_summary"),
         "contract_terminating_soon" => Some("service_ending_warning"),
         "contract_terminated" => Some("service_ended"),
+        "client_termination_settled" => Some("client_termination_receipt"),
+        "client_termination_claim" => Some("client_termination_claim"),
         "dispute_resolved" => Some("service_dispute_decision"),
         _ => None,
     }

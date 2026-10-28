@@ -16,7 +16,11 @@ import {
   cleanupPhaseLabelKey,
 } from "@/components/dashboard/client-market/host-utils";
 import type { ClientMarketRental, ProvisioningJob } from "@/lib/types";
-import { walletReleaseScheduled } from "@/lib/client-checkout";
+import { getClientTermination, previewClientTermination, terminationExplanationValid, type ClientTermination, type ClientTerminationPreview, type ClientTerminationRequest } from "@/lib/client-termination";
+import { formatWalletUnits } from "@/lib/market-wallet-money";
+import { notifyMarketBalanceChanged } from "@/lib/market-balance-events";
+import { useAuth } from "@/components/auth/auth-provider";
+import { WALLET_INPUT } from "@/components/market/wallet-primitives";
 
 const POLL_INTERVAL_MS = 1200;
 const POLL_MAX_ATTEMPTS = 180;
@@ -95,19 +99,39 @@ export function ReleaseRentalAction({
   className?: string;
 }) {
   const { locale, t } = useLocaleText();
+  const { session } = useAuth();
+  const actor = session?.user?.id || session?.user?.email;
   const [confirmOpen, setConfirmOpen] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   const [job, setJob] = React.useState<ProvisioningJob | null>(null);
   const [progressOpen, setProgressOpen] = React.useState(false);
+  const [preview, setPreview] = React.useState<ClientTerminationPreview | null>(null);
+  const [termination, setTermination] = React.useState<ClientTermination | null>(null);
+  const [previewError, setPreviewError] = React.useState("");
+  const [previewAttempt, setPreviewAttempt] = React.useState(0);
+  const [reason, setReason] = React.useState<ClientTerminationRequest["reason"]>("voluntary");
+  const [claim, setClaim] = React.useState("");
   const cancelledRef = React.useRef(false);
   const trackingJobIdRef = React.useRef<string | null>(null);
 
-  React.useEffect(
-    () => () => {
-      cancelledRef.current = true;
-    },
-    [],
-  );
+  const refreshSettlement = React.useCallback(async () => {
+    const result = await getClientTermination(rental.installationId);
+    if (!cancelledRef.current) setTermination(result);
+    if (actor) notifyMarketBalanceChanged(actor);
+  }, [actor, rental.installationId]);
+  React.useEffect(() => {
+    if (!confirmOpen) return;
+    let active = true;
+    setPreview(null); setPreviewError("");
+    previewClientTermination(rental.installationId).then(value => { if (active) setPreview(value); })
+      .catch(error => { if (active) setPreviewError(error instanceof Error ? error.message : String(error)); });
+    return () => { active = false; };
+  }, [confirmOpen, rental.installationId, previewAttempt]);
+
+  React.useEffect(() => {
+    cancelledRef.current = false;
+    return () => { cancelledRef.current = true; };
+  }, []);
 
   const pollJob = React.useCallback(
     async (jobId: string) => {
@@ -124,6 +148,7 @@ export function ReleaseRentalAction({
         if (cancelledRef.current || trackingJobIdRef.current !== jobId) return;
         setJob(latest);
         if (latest.status === "succeeded") {
+          await refreshSettlement();
           try {
             sessionStorage.removeItem(resumeStorageKey(rental.installationId));
           } catch {
@@ -147,7 +172,7 @@ export function ReleaseRentalAction({
       toast.danger(t("clientMarket.cleanupTimedOut"));
       await onChanged();
     },
-    [rental.installationId, onChanged, t],
+    [rental.installationId, onChanged, refreshSettlement, t],
   );
 
   const attachToJob = React.useCallback(
@@ -161,6 +186,7 @@ export function ReleaseRentalAction({
           if (cancelledRef.current || trackingJobIdRef.current !== jobId) return;
           setJob(latest);
           if (latest.status === "succeeded") {
+            await refreshSettlement();
             try {
               sessionStorage.removeItem(resumeStorageKey(rental.installationId));
             } catch {
@@ -188,7 +214,7 @@ export function ReleaseRentalAction({
         if (trackingJobIdRef.current === jobId) setBusy(false);
       }
     },
-    [rental.installationId, onChanged, pollJob, t],
+    [rental.installationId, onChanged, pollJob, refreshSettlement, t],
   );
 
   // Reattach after refresh: the rental record is authoritative; sessionStorage
@@ -216,24 +242,12 @@ export function ReleaseRentalAction({
   ]);
 
   const release = React.useCallback(async () => {
+    if (!preview) return;
     setBusy(true);
     try {
-      const response = await releaseClientMarketRental(rental.installationId);
-      if (response.cancellationScheduled) {
-        trackingJobIdRef.current = null;
-        try {
-          sessionStorage.removeItem(resumeStorageKey(rental.installationId));
-        } catch {
-          /* ignore quota / private mode */
-        }
-        setConfirmOpen(false);
-        setProgressOpen(false);
-        toast.success(t("clientMarket.release.scheduled"));
-        await onChanged();
-        return;
-      }
+      const response = await releaseClientMarketRental(rental.installationId, { previewId: preview.previewId, reason, claim: reason === "voluntary" ? "" : claim });
       const jobId = response.jobId;
-      if (!jobId) throw new Error(t("clientMarket.release.missingJob"));
+      if (!jobId) { await refreshSettlement(); setConfirmOpen(false); setProgressOpen(true); await onChanged(); return; }
       try {
         sessionStorage.setItem(resumeStorageKey(rental.installationId), jobId);
       } catch {
@@ -247,30 +261,19 @@ export function ReleaseRentalAction({
       await onChanged();
       await pollJob(jobId);
     } catch (reason) {
-      setConfirmOpen(false);
       toast.danger(reason instanceof Error ? reason.message : String(reason));
+      setPreviewAttempt(n => n + 1);
       await onChanged();
     } finally {
       setBusy(false);
     }
-  }, [rental.installationId, onChanged, pollJob, t]);
+  }, [rental.installationId, onChanged, pollJob, preview, reason, claim, refreshSettlement]);
 
   const jobPhase: "running" | "failed" | "success" =
     job?.status === "failed" ? "failed" : job?.status === "succeeded" ? "success" : "running";
-  const settled = job?.status === "failed" || job?.status === "succeeded";
-  const recurring = rental.pricingModel === "prepaid_calendar_month"
-    ? rental.walletContract
-    : undefined;
-  const schedulesAtPeriodEnd = recurring?.status === "active";
-  const periodEnd = recurring?.periodEnd && Number.isFinite(Date.parse(recurring.periodEnd))
-    ? new Intl.DateTimeFormat(locale, {
-        dateStyle: "medium",
-        timeStyle: "short",
-      }).format(new Date(recurring.periodEnd))
-    : "—";
+  const settled = job?.status === "failed" || job?.status === "succeeded" || !!termination?.cleanupConfirmedAt;
   const showReleaseButton = rental.canRelease
-    && rental.status !== "releasing"
-    && !walletReleaseScheduled(rental.walletContract, rental.pricingModel);
+    && rental.status !== "releasing";
 
   return (
     <>
@@ -282,32 +285,40 @@ export function ReleaseRentalAction({
           isDisabled={busy}
           onClick={() => setConfirmOpen(true)}
         >
-          {label ?? t("clientMarket.release.action")}
+          {label ?? t("clientTermination.immediate")}
         </Button>
       ) : null}
 
       <ConfirmAlertDialog
         open={confirmOpen}
-        title={recurring
-          ? t(schedulesAtPeriodEnd
-              ? "clientMarket.release.scheduleTitle"
-              : "clientMarket.release.immediateMonthlyTitle")
-          : t("clientMarket.release.confirmTitle")}
-        description={recurring
-          ? schedulesAtPeriodEnd
-            ? t("clientMarket.release.scheduleDescription", { time: periodEnd })
-            : t("clientMarket.release.immediateMonthlyDescription")
-          : t("clientMarket.release.confirmDescription")}
-        confirmLabel={t(schedulesAtPeriodEnd
-          ? "clientMarket.release.scheduleAction"
-          : "clientMarket.release.action")}
+        title={t("clientTermination.confirmTitle")}
+        description={t("clientTermination.confirmHelp")}
+        confirmLabel={t("clientTermination.immediate")}
         cancelLabel={t("common.cancel")}
         busy={busy}
-        tone={schedulesAtPeriodEnd ? "warning" : "danger"}
+        confirmDisabled={!preview || (reason !== "voluntary" && !terminationExplanationValid(claim))}
+        tone="danger"
         extra={
-          <p className="rounded-md border border-sky-200 bg-sky-50 px-3 py-2 text-xs leading-5 text-sky-900">
-            {t("chat.marketPublicNotice")}
-          </p>
+          <div className="grid max-h-[55vh] gap-3 overflow-y-auto">
+            <p className="rounded-md bg-amber-50 p-3 text-xs leading-5 text-amber-950">{t("clientTermination.dataWarning")}</p>
+            {previewError ? <p role="alert" className="text-danger">{previewError}</p> : null}
+            {!preview ? <Button variant="ghost" onPress={() => setPreviewAttempt(n => n + 1)}>{t(previewError ? "common.retry" : "common.loading")}</Button> : <>
+              <dl className="grid grid-cols-2 gap-x-4 gap-y-2 rounded-lg bg-slate-50 p-3 text-xs tabular-nums">
+                {([
+                  ["clientTermination.period", preview.periodAmountUnits],
+                  ["clientTermination.remaining", preview.remainingUnits],
+                  [reason === "voluntary" ? "clientTermination.compensation" : "clientTermination.held", preview.compensationUnits],
+                  ["clientTermination.return", preview.returnUnits],
+                ] as const).map(([key, amount]) => <React.Fragment key={key}><dt>{t(key)}</dt><dd className="text-right font-medium">{formatWalletUnits(amount, "$", locale)}</dd></React.Fragment>)}
+              </dl>
+              <p className="text-xs text-muted-foreground">{preview.policyVersion === 0 ? t("clientTermination.noRetroactive") : t("clientTermination.purchaseTerms", { rate: String(preview.rateBps / 100) })}</p>
+              <label className="grid gap-1 text-sm">{t("clientTermination.reason")}<select className={WALLET_INPUT} value={reason} onChange={e => setReason(e.target.value as ClientTerminationRequest["reason"])}>
+                <option value="voluntary">{t("clientTermination.voluntary")}</option><option value="provider_issue">{t("clientTermination.providerIssue")}</option><option value="platform_issue">{t("clientTermination.platformIssue")}</option>
+              </select></label>
+              {reason !== "voluntary" ? <><label className="grid gap-1 text-xs">{t("clientTermination.claim")}<textarea className={WALLET_INPUT} value={claim} maxLength={2000} onChange={e => setClaim(e.target.value)} /></label>{!terminationExplanationValid(claim) ? <p role="alert" className="text-xs text-danger">{t("clientTermination.explanationTooLong")}</p> : null}<p className="text-xs text-muted-foreground">{t("clientTermination.claimHelp")}</p><p className="text-xs text-muted-foreground">{t("clientTermination.chatHelp")}</p><a href={`/clients/?chat=${encodeURIComponent(rental.installationId)}`} target="_blank" rel="noopener noreferrer" className="text-xs underline">{t("clientTermination.chat")}</a></> : null}
+              <p className="text-xs text-muted-foreground">{t("clientTermination.expires")} <button type="button" className="underline" onClick={() => setPreviewAttempt(n => n + 1)}>{t("common.reload")}</button></p>
+            </>}
+          </div>
         }
         onConfirm={() => void release()}
         onOpenChange={(next) => !busy && setConfirmOpen(next)}
@@ -356,6 +367,9 @@ export function ReleaseRentalAction({
               {job?.status === "succeeded" ? (
                 <p className="text-xs leading-5 text-emerald-700">{t("clientMarket.release.succeeded")}</p>
               ) : null}
+              {termination ? <div className="grid gap-1 text-xs"><p>{t(`clientTermination.${termination.status}`)}</p><p>{t("clientTermination.return")}: {formatWalletUnits(termination.returnedUnits, "$", locale)}</p><p>{t("clientTermination.compensation")}: {formatWalletUnits(termination.compensationUnits, "$", locale)}</p><p>{t("clientTermination.held")}: {formatWalletUnits(termination.heldUnits, "$", locale)}</p></div> : null}
+              {(reason !== "voluntary" || termination?.disputeUsed) ? <div className="grid gap-2 rounded-lg bg-amber-50 p-3 text-xs leading-5"><p>{t("clientTermination.claimHelp")}</p><p>{t("clientTermination.chatHelp")}</p><a href={`/clients/?chat=${encodeURIComponent(rental.installationId)}`} target="_blank" rel="noopener noreferrer" className="underline">{t("clientTermination.chat")}</a></div> : null}
+              <a href="/account/wallet/" className="text-xs underline">{t("clientTermination.history")}</a>
             </Modal.Body>
             <Modal.Footer>
               <Button variant="ghost" isDisabled={!settled} onClick={() => setProgressOpen(false)}>

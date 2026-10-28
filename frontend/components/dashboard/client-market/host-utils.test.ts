@@ -3,12 +3,22 @@ import test from "node:test";
 import {
   encodeHostTransferDocument,
   hostMatchesMarketProvider,
+  hostCanClientRelease,
   parseHostTransferLines,
   parseClientTrialHours,
   persistedClientMarketProviderSelection,
   recommendedClientMarketProviderId,
 } from "./host-utils";
-import type { ClientMarketProvider } from "@/lib/types";
+import type { ClientMarketHost, ClientMarketProvider } from "@/lib/types";
+
+test("stopping Client renewal does not hide immediate termination", () => {
+  const host = { isClientOwner: true, installationId: "rental", status: "allocated" } as ClientMarketHost;
+  const rental = { isClientOwner: true, canRelease: true, status: "active", recurring: { cancelAtPeriodEnd: true } };
+  assert.equal(hostCanClientRelease(host, rental), true);
+  assert.equal(hostCanClientRelease(host, { ...rental, status: "releasing" }), false);
+  assert.equal(hostCanClientRelease(host, { ...rental, canRelease: false }), false);
+  assert.equal(hostCanClientRelease({ ...host, isClientOwner: false }, rental), false);
+});
 
 test("Client trial overrides preserve explicit zero and distinguish inherited defaults", () => {
   for (const input of ["", "  "]) assert.equal(parseClientTrialHours(input), null);

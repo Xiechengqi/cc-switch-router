@@ -1277,10 +1277,12 @@ export async function cleanupClientMarketProviderRental(
   );
 }
 
-export async function releaseClientMarketRental(installationId: string) {
+export async function releaseClientMarketRental(installationId: string, termination: import("@/lib/client-termination").ClientTerminationRequest) {
   return parseJson<CreateClientMarketClientResponse>(
     await authFetch(`/v1/client-market/clients/${encodeURIComponent(installationId)}/release`, {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(termination),
     }),
   );
 }

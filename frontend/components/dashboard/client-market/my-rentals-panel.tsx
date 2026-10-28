@@ -1,5 +1,4 @@
 "use client";
-import { walletReleaseScheduled } from "@/lib/client-checkout";
 
 import * as React from "react";
 import { Button, Chip, toast } from "@heroui/react";
@@ -244,7 +243,7 @@ export function MyRentalsPanel({
               </span>
               {/* Keep mounted through `releasing` so the same instance can finish polling
                   (and reattach after refresh). Retries for release_failed live in the banner. */}
-              {rental.status !== "release_failed" && !walletReleaseScheduled(rental.walletContract, rental.pricingModel) ? (
+              {rental.status !== "release_failed" ? (
                 <ReleaseRentalAction rental={rental} onChanged={onChanged} />
               ) : null}
             </div>

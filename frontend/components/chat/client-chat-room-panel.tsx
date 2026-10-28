@@ -508,7 +508,7 @@ export function ClientChatRoomPanel({
       </ScrollShadow>
       <div className="shrink-0 border-t border-slate-200 bg-slate-50/70 px-3 py-2">
         {error ? <p className="mb-1.5 break-words text-xs text-red-600">{error}</p> : null}
-        {room.status === "archived" || room.readOnly ? (
+        {(room.status === "archived" && !room.canPost) || (room.readOnly && session?.authenticated) ? (
           <p className="py-1.5 text-center text-xs text-slate-500">{t("chat.archivedReadOnly")}</p>
         ) : !session?.authenticated ? (
           <div className="grid gap-1.5">
@@ -519,6 +519,7 @@ export function ClientChatRoomPanel({
           </div>
         ) : (
           <div className="grid gap-1.5">
+            {room.status === "archived" ? <p className="text-xs leading-5 text-slate-500">{t("clientTermination.chatHelp")}</p> : null}
             <TextArea
               ref={textareaRef as React.Ref<HTMLTextAreaElement>}
               value={body}

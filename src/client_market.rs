@@ -2169,17 +2169,21 @@ async fn release_client(
     State(state): State<ServerState>,
     headers: HeaderMap,
     AxumPath(installation_id): AxumPath<String>,
+    input: Option<Json<crate::client_market_termination::TerminationRequest>>,
 ) -> Result<Json<CreateClientResponse>, AppError> {
     let session = require_session(&state, &headers).await?;
-    if state
-        .store
-        .client_market_schedule_wallet_release(&installation_id, &session)
-        .await?
     {
-        return Ok(Json(CreateClientResponse {
-            job_id: None,
-            cancellation_scheduled: true,
-        }));
+        let conn = state.store.conn.lock().await;
+        if let Some(job) = crate::client_market_termination::replay_job_tx(
+            &conn,
+            &installation_id,
+            &session.user_id,
+        )? {
+            return Ok(Json(CreateClientResponse {
+                job_id: job,
+                cancellation_scheduled: false,
+            }));
+        }
     }
     start_client_cleanup(
         state,
@@ -2188,6 +2192,7 @@ async fn release_client(
         "client_release",
         false,
         "client",
+        input.map(|Json(value)| value),
     )
     .await
 }
@@ -2215,6 +2220,7 @@ async fn provider_cleanup_client(
         reason,
         input.deny_client_access.unwrap_or(false),
         "provider",
+        None,
     )
     .await
 }
@@ -2226,6 +2232,7 @@ async fn start_client_cleanup(
     reason: &str,
     deny_client_access: bool,
     required_role: &str,
+    termination: Option<crate::client_market_termination::TerminationRequest>,
 ) -> Result<Json<CreateClientResponse>, AppError> {
     let session = require_session(&state, &headers).await?;
     let viewer = session.email.clone();
@@ -2238,7 +2245,7 @@ async fn start_client_cleanup(
         let _action_guard = state.client_market_actions.lock(&installation_id).await;
         state
             .store
-            .client_market_begin_cleanup_job_with_context(
+            .client_market_begin_confirmed_cleanup_job(
                 &installation_id,
                 Some(&session.user_id),
                 &viewer,
@@ -2246,6 +2253,7 @@ async fn start_client_cleanup(
                 Some(required_role),
                 reason,
                 Some(deny_client_access),
+                termination.as_ref(),
             )
             .await?
     };
@@ -8631,11 +8639,37 @@ impl AppStore {
         reason: &str,
         deny_client_access: Option<bool>,
     ) -> Result<String, AppError> {
+        self.client_market_begin_confirmed_cleanup_job(
+            installation_id,
+            actor_user_id,
+            viewer_email,
+            is_admin,
+            required_role,
+            reason,
+            deny_client_access,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn client_market_begin_confirmed_cleanup_job(
+        &self,
+        installation_id: &str,
+        actor_user_id: Option<&str>,
+        viewer_email: &str,
+        is_admin: bool,
+        required_role: Option<&str>,
+        reason: &str,
+        deny_client_access: Option<bool>,
+        termination: Option<&crate::client_market_termination::TerminationRequest>,
+    ) -> Result<String, AppError> {
         let viewer = normalize_market_email(viewer_email)?;
         let conn = self.conn.lock().await;
-        let tx = conn.transaction().map_err(|e| {
-            AppError::Internal(format!("begin cleanup job transaction failed: {e}"))
-        })?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| {
+                AppError::Internal(format!("begin cleanup job transaction failed: {e}"))
+            })?;
         let provision_source: Option<String> = tx
             .query_row(
                 "SELECT provision_source FROM installations WHERE id = ?1",
@@ -8794,6 +8828,14 @@ impl AppStore {
             }
         }
         let job_id = Uuid::new_v4().to_string();
+        crate::client_market_termination::accept_tx(
+            &tx,
+            installation_id,
+            actor_user_id,
+            reason,
+            termination,
+            &now,
+        )?;
         let client_owner_email = subscription_owner
             .as_ref()
             .map(|owner| owner.1.as_str())
@@ -8826,6 +8868,9 @@ impl AppStore {
             ],
         )
         .map_err(|e| AppError::Internal(format!("insert cleanup job failed: {e}")))?;
+        tx.execute("UPDATE client_market_terminations SET cleanup_job_id=?2,status='cleanup_pending',updated_at=?3
+            WHERE installation_id=?1 AND cleanup_confirmed_at IS NULL",params![installation_id,job_id,now])
+            .map_err(|e|AppError::Internal(format!("bind termination cleanup job failed: {e}")))?;
         let changed = tx
             .execute(
                 "UPDATE router_ssh_hosts
@@ -12669,7 +12714,8 @@ mod tests {
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .unwrap();
-            assert_eq!(isolated, ("review_required".into(), 1));
+            // Ordinary asynchronous cleanup is not a manual finance dispute.
+            assert_eq!(isolated, ("ending".into(), 0));
             assert_eq!(
                 crate::market_wallet::wallet_snapshot_tx(&tx, &buyer.user_id)
                     .unwrap()

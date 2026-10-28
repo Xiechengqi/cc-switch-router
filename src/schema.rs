@@ -323,6 +323,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
     ),
     (93, include_str!("../schema/0093_market_share_trials.sql")),
     (94, include_str!("../schema/0094_user_home_entry.sql")),
+    (
+        95,
+        include_str!("../schema/0095_client_market_termination.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -832,10 +836,71 @@ fn migration_checksum(sql: &str) -> String {
 mod tests {
     use super::*;
 
-    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 248;
+    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 257;
 
     mod notification_safety;
     mod suspension;
+
+    #[test]
+    fn migration_95_freezes_new_client_terms_without_repricing_existing_periods() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 94);
+        let at = "2026-10-01T00:00:00+00:00";
+        crate::market_wallet::credit_verified_topup_tx(
+            &conn,
+            "buyer",
+            "existing-topup",
+            1000,
+            "receipt",
+            at,
+        )
+        .unwrap();
+        let debit = crate::market_wallet::debit_available_tx(
+            &conn,
+            "buyer",
+            86400000,
+            "unfulfilled",
+            "period",
+            "platform_period",
+            "period",
+            "debit",
+            at,
+        )
+        .unwrap();
+        conn.execute("INSERT INTO market_platform_contracts (id,product_kind,product_ref,trial_scope_ref,quote_id,
+            request_fingerprint,buyer_user_id,provider_user_id,offer_revision,billing_model,cycle_price_minor,
+            renewal_policy,status,created_at,updated_at,current_period_sequence)
+            VALUES ('contract','client_host','job','host','quote','request','buyer','provider',1,'calendar_month',1000,'automatic','active',?1,?1,1)",params![at]).unwrap();
+        conn.execute("INSERT INTO market_platform_periods (id,contract_id,sequence,period_start,period_end,settled_through_at,
+            amount_units,debit_journal_id,debited_at,status,created_at,updated_at)
+            VALUES ('period','contract',1,?1,'2026-11-01T00:00:00+00:00',?1,86400000,?2,?1,'open',?1,?1)",params![at,debit.id]).unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM client_termination_period_terms",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT rate_bps FROM client_termination_policies WHERE version=1",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1000
+        );
+        assert_eq!(conn.query_row("SELECT amount_units,fulfilled_units,refunded_units,termination_compensation_units FROM market_platform_periods WHERE id='period'",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,i64>(3)?))).unwrap(),(86400000,0,0,0));
+        crate::market_wallet::reconcile_wallet_tx(&conn, "buyer").unwrap();
+        assert!(
+            conn.execute("UPDATE client_termination_policies SET rate_bps=0", [])
+                .is_err()
+        );
+    }
 
     fn memory_connection() -> Connection {
         Connection::open_in_memory().expect("open test database")

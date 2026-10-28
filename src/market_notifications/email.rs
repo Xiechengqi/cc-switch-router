@@ -92,7 +92,10 @@ fn destination(item: &Claimed, dashboard: &str) -> Option<String> {
     let provider = matches!(
         item.event_kind.as_str(),
         "earnings_converted" | "earnings_held" | "earnings_released" | "commission_policy_changed"
-    );
+    ) || (matches!(
+        item.event_kind.as_str(),
+        "client_termination_settled" | "client_termination_claim"
+    ) && field(&item.payload, "role") == Some("provider"));
     let handler = field(&item.payload, "role") == Some("handler");
     url.set_path(if provider {
         "/account/provider-settings/"
@@ -123,6 +126,24 @@ pub(super) fn render(item: &Claimed, dashboard: &str) -> (String, String, String
     let role = field(p, "role").unwrap_or("");
     let action = field(p, "action").unwrap_or("");
     let (title, intro) = match item.event_kind.as_str() {
+        "client_termination_claim" => (
+            "Client termination compensation claim",
+            if action == "responded" {
+                "The Provider has formally responded. Any remaining contested compensation stays held for an Owner decision, unless the buyer voluntarily ends the claim. Chat messages alone do not decide the financial outcome."
+            } else if role == "provider" {
+                "The buyer has requested a compensation waiver. Respond by reducing or waiving compensation, or formally request an Owner decision before the response deadline. If you do not respond within 72 hours, the remaining compensation is automatically waived. Open the Client chat from the termination record to discuss the issue."
+            } else {
+                "Your compensation claim is open. Only the contested compensation is held; other unused rent returns after verified cleanup. If the Provider does not formally respond within 72 hours, the remaining compensation is waived. You may discuss the issue in the Client chat or voluntarily end your claim in your wallet."
+            },
+        ),
+        "client_termination_settled" => (
+            "Client rental termination settlement",
+            if role == "provider" {
+                "The Client rental has ended. Any termination compensation is separate from service income, carries no service commission and moves to your wallet automatically after its seven-day settlement window. Disputed amounts remain held for review."
+            } else {
+                "The Client rental has ended. The amount shown is the total unused rent returned as platform credit for this termination, not a new top-up or an external cash refund. Review the settlement in your wallet."
+            },
+        ),
         "topup_credited" => (
             "Top-up credited",
             "Your top-up has been credited to your platform wallet and is ready to use.",
@@ -388,6 +409,27 @@ pub(super) fn render(item: &Claimed, dashboard: &str) -> (String, String, String
             ));
         }
     }
+    if matches!(
+        item.event_kind.as_str(),
+        "client_termination_settled" | "client_termination_claim"
+    ) {
+        if let Some(reference) = field(p, "clientReference") {
+            rows.push(("Client", reference.into()));
+        }
+        if let Some(deadline) = field(p, "responseDeadline") {
+            rows.push(("Provider response deadline (72 hours)", deadline.into()));
+        }
+        for (key, label) in [
+            ("walletReturnUnits", "Total wallet return"),
+            ("compensationUnits", "Total Provider compensation"),
+        ] {
+            if let Some(raw) = field(p, key)
+                && let Some(value) = amount(&json!({"amountUnits":raw}))
+            {
+                rows.push((label, value));
+            }
+        }
+    }
     let amount = amount(p);
     let amount_html=amount.as_ref().map(|n|format!("<p style=\"margin:0 0 24px;font-size:32px;line-height:1.2;font-weight:700;font-variant-numeric:tabular-nums;color:#0f172a;overflow-wrap:anywhere\">{}</p>",escape_html(n))).unwrap_or_default();
     let facts=rows.iter().map(|(k,v)|format!("<tr><th align=\"left\" valign=\"top\" style=\"padding:8px 16px 8px 0;color:#475569;font-size:13px;font-weight:400\">{}</th><td align=\"right\" style=\"padding:8px 0;color:#0f172a;font-size:14px;word-break:break-all\">{}</td></tr>",escape_html(k),escape_html(v))).collect::<String>();
@@ -398,6 +440,10 @@ pub(super) fn render(item: &Claimed, dashboard: &str) -> (String, String, String
         "View top-up"
     } else if item.event_kind.starts_with("earnings_")
         || item.event_kind == "commission_policy_changed"
+        || matches!(
+            item.event_kind.as_str(),
+            "client_termination_settled" | "client_termination_claim"
+        ) && role == "provider"
     {
         "View provider income"
     } else {

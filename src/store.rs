@@ -54289,6 +54289,128 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn client_termination_chat_keeps_only_parties_posting_after_cleanup_and_stays_retained_until_resolved()
+     {
+        let (store, config) = setup_store("client-termination-chat").await;
+        let installation = "terminated-chat-client";
+        insert_installation(&store, installation).await;
+        for (user, email) in [
+            ("claim-buyer", "buyer@example.com"),
+            ("claim-provider", "provider@example.com"),
+            ("outsider", "outsider@example.com"),
+        ] {
+            insert_chat_user(&store, user, email).await;
+        }
+        let room = ensure_test_chat_room(&store, installation).await;
+        let now = Utc::now();
+        {
+            let conn = store.conn.lock().await;
+            conn.execute("INSERT INTO client_market_terminations(id,installation_id,host_id,buyer_user_id,provider_user_id,
+                policy_version,rate_bps,period_amount_units,remaining_units,compensation_cap_units,reason,responsibility,status,
+                cutoff_at,dispute_opened_at,dispute_used,updated_at) VALUES ('claim',?1,'host','claim-buyer','claim-provider',1,1000,100,100,10,
+                'provider_issue','undetermined','disputed',?2,?2,1,?2)",params![installation,now.to_rfc3339()]).unwrap();
+            client_chat::ensure_termination_chat_tx(&conn, installation, &now.to_rfc3339())
+                .unwrap();
+            client_chat::archive_room_for_installation_tx(
+                &conn,
+                installation,
+                now - Duration::days(61),
+            )
+            .unwrap();
+            conn.execute(
+                "DELETE FROM installations WHERE id=?1",
+                params![installation],
+            )
+            .unwrap();
+            assert_eq!(
+                client_chat::cleanup_expired_rooms_tx(&conn, now).unwrap(),
+                0
+            );
+        }
+        for (user, email) in [
+            ("claim-buyer", "buyer@example.com"),
+            ("claim-provider", "provider@example.com"),
+        ] {
+            let view = store
+                .get_client_chat_room_by_installation(installation, Some(user))
+                .await
+                .unwrap();
+            assert_eq!(view.status, "archived");
+            assert!(view.can_post && !view.read_only);
+            store
+                .create_client_chat_message(
+                    &room,
+                    &chat_test_session(user, email),
+                    "Discussing the service issue".into(),
+                    Uuid::new_v4().to_string(),
+                )
+                .await
+                .unwrap();
+        }
+        for viewer in [None, Some("outsider")] {
+            let view = store
+                .get_client_chat_room_by_installation(installation, viewer)
+                .await
+                .unwrap();
+            assert!(view.read_only && !view.can_post);
+        }
+        assert!(
+            store
+                .create_client_chat_message(
+                    &room,
+                    &chat_test_session("outsider", "outsider@example.com"),
+                    "Not a party".into(),
+                    Uuid::new_v4().to_string()
+                )
+                .await
+                .is_err()
+        );
+        {
+            let conn = store.conn.lock().await;
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM chat_email_events", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM installations WHERE id=?1",
+                    params![installation],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+            conn.execute("UPDATE client_market_terminations SET responsibility='buyer',status='completed' WHERE id='claim'",[]).unwrap();
+        }
+        let view = store
+            .get_client_chat_room_by_installation(installation, Some("claim-buyer"))
+            .await
+            .unwrap();
+        assert!(!view.can_post && view.read_only);
+        assert!(
+            store
+                .create_client_chat_message(
+                    &room,
+                    &chat_test_session("claim-buyer", "buyer@example.com"),
+                    "Already closed".into(),
+                    Uuid::new_v4().to_string()
+                )
+                .await
+                .is_err()
+        );
+        {
+            let conn = store.conn.lock().await;
+            assert_eq!(
+                client_chat::cleanup_expired_rooms_tx(&conn, now).unwrap(),
+                1
+            );
+        }
+        let _ = std::fs::remove_file(config.database.path);
+    }
+
+    #[tokio::test]
     async fn client_system_event_materializes_into_archived_room_after_purge() {
         let (store, config) = setup_store("client-chat-archived-system-event").await;
         let installation_id = "client-chat-archived-installation";

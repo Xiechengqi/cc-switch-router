@@ -9,6 +9,7 @@ mod client_logs;
 mod client_market;
 mod client_market_coordination;
 mod client_market_terminal;
+mod client_market_termination;
 mod client_market_trade;
 mod client_meta;
 mod client_server_release;

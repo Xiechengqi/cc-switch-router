@@ -21,6 +21,7 @@ export function ConfirmAlertDialog({
   confirmLabel,
   cancelLabel,
   busy = false,
+  confirmDisabled = false,
   tone = "primary",
   extra,
   onConfirm,
@@ -32,6 +33,7 @@ export function ConfirmAlertDialog({
   confirmLabel: React.ReactNode;
   cancelLabel: React.ReactNode;
   busy?: boolean;
+  confirmDisabled?: boolean;
   tone?: ConfirmTone;
   /** Optional controls under the description (e.g. block checkbox). */
   extra?: React.ReactNode;
@@ -71,7 +73,7 @@ export function ConfirmAlertDialog({
               <Button
                 variant={confirmVariant}
                 className={confirmClassName}
-                isDisabled={busy}
+                isDisabled={busy || confirmDisabled}
                 onClick={onConfirm}
               >
                 {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}

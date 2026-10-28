@@ -7528,6 +7528,12 @@ async fn run_finance_audit(state: &ServerState) {
 /// lot cannot hold back the rest of the batch.
 async fn unlock_due_earnings(state: &ServerState) {
     let conn = state.store.conn.lock().await;
+    if crate::client_market_termination::expire_disputes_isolated(&conn, &now(), 200).is_err() {
+        tracing::warn!("Client compensation timeout waiver deferred");
+    }
+    if crate::client_market_termination::recover_cleanup_isolated(&conn, &now()).is_err() {
+        tracing::warn!("Client cleanup financial recovery deferred");
+    }
     let result = crate::market_finance::unlock_due_earnings_isolated(&conn, &now(), 200);
     if result.is_err() {
         tracing::warn!("market earning maturity deferred");
@@ -7535,6 +7541,9 @@ async fn unlock_due_earnings(state: &ServerState) {
     if crate::market_earning_conversions::credit_due_earnings_isolated(&conn, &now(), 200).is_err()
     {
         tracing::warn!("market automatic earnings credit deferred");
+    }
+    if crate::client_market_termination::credit_due_isolated(&conn, &now(), 200).is_err() {
+        tracing::warn!("Client compensation credit deferred");
     }
 }
 

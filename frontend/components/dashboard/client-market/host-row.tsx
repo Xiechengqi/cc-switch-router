@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import { formatWalletUnits } from "@/lib/market-wallet-money";
 import { createPortal } from "react-dom";
 import { Button, Checkbox, Chip, Dropdown, Modal, toast } from "@heroui/react";
 import { ChevronDown, Fingerprint, Loader2, MessageCircle, MoreHorizontal, Pencil, Plus, RefreshCw, ServerOff, Trash2 } from "lucide-react";
@@ -264,6 +265,8 @@ function HostRowImpl({
       return locale.startsWith("zh") ? "免费" : "Free";
     }
     const parts = [formatUsdMoney(entry.netChargesMinor, locale)];
+    if (entry.serviceUnits && BigInt(entry.serviceUnits) > 0n) parts.push(`${t("clientTermination.serviceIncome")}: ${formatWalletUnits(entry.serviceUnits, "$", locale)}`);
+    if (entry.compensationUnits && BigInt(entry.compensationUnits) > 0n) parts.push(`${t("clientTermination.compensation")}: ${formatWalletUnits(entry.compensationUnits, "$", locale)}`);
     if (entry.refundedMinor > 0) {
       parts.push(t("clientMarket.usageHistory.returned", { amount: formatUsdMoney(entry.refundedMinor, locale) }));
     }

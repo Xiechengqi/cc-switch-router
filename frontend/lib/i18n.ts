@@ -11,6 +11,7 @@ import { walletPolicyMessagesEn, walletPolicyMessagesZh } from "@/lib/wallet-pol
 import { earningConversionMessagesEn, earningConversionMessagesZh } from "@/lib/earning-conversion-messages";
 import { marketC2CMessagesEn, marketC2CMessagesZh } from "@/lib/market-c2c-messages";
 import { passwordMessagesEn, passwordMessagesZh } from "@/lib/password-messages";
+import { clientTerminationMessagesEn, clientTerminationMessagesZh } from "@/lib/client-termination-messages";
 
 export const LOCALE_STORAGE_KEY = "cc_switch_router_locale_v1";
 export const SUPPORTED_LOCALES = ["en", "zh-CN"] as const;
@@ -20,6 +21,7 @@ export type MessageKey = keyof typeof messages.en;
 
 export const messages = {
   en: {
+    ...clientTerminationMessagesEn,
     ...passwordMessagesEn,
     "marketAccess.decision.inherit": "Use default",
     "marketAccess.decision.allow": "Allow",
@@ -3541,6 +3543,7 @@ export const messages = {
     ...walletPolicyMessagesEn,
   },
   "zh-CN": {
+    ...clientTerminationMessagesZh,
     ...passwordMessagesZh,
     "marketAccess.decision.inherit": "使用默认策略",
     "marketAccess.decision.allow": "允许",

@@ -1,4 +1,5 @@
 "use client";
+import { ClientTerminationsPanel } from "@/components/market/client-terminations-panel";
 
 import * as React from "react";
 import Link from "next/link";
@@ -127,7 +128,7 @@ export function ProviderFinancePanel() {
               {(["marketProviderFinance.lot.fulfilled","marketProviderFinance.lot.unlocks","commission.net","earningSettlement.credited","marketProviderFinance.lot.state"] as const).map(key => <th key={key} scope="col" className="py-3 pr-3 font-medium">{t(key)}</th>)}
             </tr></thead>
             <tbody>{history.items.map(lot => { const state = earningLotState(lot); return <tr key={lot.id}>
-              <td className="py-3 pr-3">{dateText(lot.fulfilledAt)}</td><td className="py-3 pr-3">{dateText(lot.unlockAt)}</td>
+              <td className="py-3 pr-3">{dateText(lot.fulfilledAt)}<span className="mt-1 block text-muted-foreground">{t(lot.incomeKind === "client_termination" ? "clientTermination.compensationIncome" : "clientTermination.serviceIncome")}</span></td><td className="py-3 pr-3">{dateText(lot.unlockAt)}</td>
               <td className="py-3 pr-3 tabular-nums">
                 {formatWalletUnits((earningUnits(lot.amountUnits)-earningUnits(lot.reversedUnits)).toString(),"$",locale)}
                 {lot.commissionPolicyVersion > 0 ? <details className="text-muted-foreground">
@@ -145,5 +146,6 @@ export function ProviderFinancePanel() {
         </div> : <p className="text-sm text-muted-foreground">{t("marketProviderFinance.noEarnings")}</p>}
       </details>
     </>}
+    <ClientTerminationsPanel role="provider" />
   </section>;
 }

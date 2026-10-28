@@ -697,7 +697,7 @@ pub(crate) fn provider_summary_tx(
     conn: &Connection,
     provider_user_id: &str,
 ) -> Result<ProviderFinanceSummary, AppError> {
-    conn.query_row(
+    let mut summary = conn.query_row(
         "SELECT COALESCE(SUM(net_amount_units - reversed_units - unlocked_units), 0),
                 COALESCE(SUM(unlocked_units - held_units - paid_units - converted_units), 0),
                 COALESCE(SUM(CASE WHEN disputed = 0
@@ -723,7 +723,21 @@ pub(crate) fn provider_summary_tx(
             })
         },
     )
-    .map_err(db_error("read Provider finance summary"))
+    .map_err(db_error("read Provider finance summary"))?;
+    let (gross, pending, credited): (i64, i64, i64) = conn
+        .query_row(
+            "SELECT COALESCE(SUM(amount_units-reversed_units),0),
+        COALESCE(SUM(amount_units-reversed_units-credited_units),0),COALESCE(SUM(credited_units),0)
+        FROM client_termination_compensations WHERE provider_user_id=?1",
+            params![provider_user_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .map_err(db_error("read Client compensation summary"))?;
+    summary.gross_earned_units += gross;
+    summary.net_earned_units += gross;
+    summary.pending_units += pending;
+    summary.converted_units += credited;
+    Ok(summary)
 }
 
 /// One bounded pass; running it repeatedly is harmless. The lot is locked by

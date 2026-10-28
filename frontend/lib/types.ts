@@ -2506,6 +2506,7 @@ export type ClientMarketAllocationQuote = {
 
   walletFunding?: MarketWalletQuoteFunding;
   fundingRail?: "legacy_provider" | "platform_wallet";
+  terminationPolicy?: { version: number; rateBps: number } | null;
 };
 
 export type ClientMarketCommitQuoteResponse = {
@@ -2588,6 +2589,8 @@ export type ClientMarketHostUsageHistoryEntry = {
   chargesMinor: number;
   refundedMinor: number;
   netChargesMinor: number;
+  serviceUnits?: string;
+  compensationUnits?: string;
 };
 
 export type ClientMarketHostTransferDocument = {

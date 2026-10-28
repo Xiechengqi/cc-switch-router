@@ -743,6 +743,7 @@ pub(crate) fn prepare_contract_tx(
         input.provider_user_id,
         now,
     )?;
+    crate::client_market_termination::freeze_contract_tx(conn, &id, input.quote_id)?;
     if input.billing_model == BillingModel::Metered
         && let Some(hold) = hold_id.as_deref()
     {
@@ -865,6 +866,13 @@ pub(crate) fn activate_contract_tx(
             ],
         )
         .map_err(db_error("create first wallet service period"))?;
+        crate::client_market_termination::freeze_period_tx(
+            conn,
+            contract_id,
+            &period_id,
+            true,
+            activated_at,
+        )?;
         crate::market_commission::freeze_period_tx(
             conn,
             contract_id,
@@ -1078,6 +1086,13 @@ pub(crate) fn start_paid_trial_tx(
             ],
         )
         .map_err(db_error("create first paid period after trial"))?;
+        crate::client_market_termination::freeze_period_tx(
+            conn,
+            contract_id,
+            &period_id,
+            true,
+            at,
+        )?;
         crate::market_commission::freeze_period_tx(
             conn,
             contract_id,
@@ -1737,6 +1752,12 @@ pub(crate) fn terminate_after_cleanup_tx(
     cleanup_confirmed: bool,
     now: &str,
 ) -> Result<ContractTermination, AppError> {
+    if cleanup_confirmed
+        && let Some(result) =
+            crate::client_market_termination::finalize_recorded_month_tx(conn, contract_id, now)?
+    {
+        return Ok(result);
+    }
     // Hourly posting must not discard already-observed service in the final
     // partial hour. On uncertain cleanup these new lots are held below along
     // with earlier income; no unobserved cleanup time becomes Provider income.
@@ -1751,7 +1772,14 @@ pub(crate) fn terminate_after_cleanup_tx(
         .map_err(db_error("read contract before termination"))?
         .unwrap_or(true);
     let result = terminate_after_cleanup_inner_tx(conn, contract_id, cleanup_confirmed, now)?;
-    if result.finalized && !was_ended {
+    let client_notice: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM client_market_terminations WHERE contract_id=?1)",
+            params![contract_id],
+            |r| r.get(0),
+        )
+        .map_err(db_error("check Client termination settlement notice"))?;
+    if result.finalized && !was_ended && !client_notice {
         notify_contract_tx(conn, contract_id, "contract_terminated", "ended", now)?;
     }
     Ok(result)
@@ -2278,7 +2306,7 @@ pub(crate) fn settle_monthly_segment_tx(
 /// outages, stale health and control fences within an hour remain unbillable.
 /// Reuse the period's financial cursor for durable, exactly-once posting; no
 /// in-memory accumulator or second source of money is needed across restarts.
-fn settle_client_monthly_evidence_tx(
+pub(crate) fn settle_client_monthly_evidence_tx(
     conn: &Connection,
     contract_id: &str,
     flush_partial: bool,
@@ -2552,6 +2580,13 @@ pub(crate) fn renew_monthly_contract_tx(
         ],
     )
     .map_err(db_error("create renewed monthly period"))?;
+    crate::client_market_termination::freeze_period_tx(
+        conn,
+        contract_id,
+        &next_id,
+        false,
+        &start.to_rfc3339(),
+    )?;
     crate::market_commission::freeze_period_tx(
         conn,
         contract_id,
@@ -3186,6 +3221,37 @@ fn health_observed_after_control_fence_tx(
     let fence = parse_time(&fence)?;
     let earliest = fence.timestamp() + i64::from(fence.timestamp_subsec_nanos() > 0);
     Ok(checked_at.is_some_and(|checked_at| checked_at >= earliest))
+}
+
+/// Settle observed Client service through the accepted cutoff, including its
+/// partial hour. Cancelling a trial never starts a new paid period.
+pub(crate) fn settle_client_termination_tail_tx(
+    conn: &Connection,
+    id: &str,
+    at: &str,
+) -> Result<(), AppError> {
+    let row = conn.query_row("SELECT product_ref,service_ref,billing_model,status,last_evaluated_at,trial_seconds_remaining
+        FROM market_platform_contracts WHERE id=?1 AND product_kind='client_host'",params![id],|r|Ok((
+            r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,i64>(5)?)))
+        .optional().map_err(db_error("read Client termination service tail"))?;
+    if let Some((product, Some(service), model, status, Some(cursor), remaining)) = row {
+        if status == "active" {
+            reconcile_service_interval_tx(
+                conn,
+                id,
+                "client_host",
+                &product,
+                &service,
+                &model,
+                &status,
+                &cursor,
+                remaining,
+                parse_time(at)?,
+                None,
+            )?;
+        }
+    }
+    settle_client_monthly_evidence_tx(conn, id, true, at)
 }
 
 fn reconcile_service_interval_tx(

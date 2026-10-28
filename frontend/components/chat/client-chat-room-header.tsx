@@ -54,7 +54,7 @@ export function ClientChatRoomHeader({
             {room.clientLabel}
           </h2>
           <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-slate-500">
-            {room.status === "archived" ? (
+            {room.status === "archived" && !room.canPost ? (
               <span className="inline-flex items-center gap-1 text-amber-700">
                 <Lock className="h-3 w-3" />
                 {t("chat.archived")}
@@ -62,7 +62,7 @@ export function ClientChatRoomHeader({
             ) : (
               <span className="inline-flex items-center gap-1">
                 <Globe2 className="h-3 w-3" />
-                {t("chat.public")}
+                {t(room.status === "archived" ? "clientTermination.chatContinuation" : "chat.public")}
               </span>
             )}
             {ownerEmail ? (

@@ -28,6 +28,8 @@ const CRITICAL_CODES: &[&str] = &[
     "earning_conversion_orphan_journal",
     "c2c_evidence_mismatch",
     "c2c_orphan_journal",
+    "client_termination_evidence_mismatch",
+    "client_termination_orphan_journal",
 ];
 
 pub(crate) fn case_tx(
@@ -102,6 +104,29 @@ pub(crate) fn is_finance_hold(error: &AppError) -> bool {
 }
 
 fn scope_blocked_tx(conn: &Connection, scope: FinanceScope<'_>) -> Result<bool, AppError> {
+    let (predicate, id) = match scope {
+        // An award can already have reached the Provider's ordinary wallet.
+        // Protect both parties' wallet paths, not just earnings operations.
+        FinanceScope::User(id) => ("(t.buyer_user_id=?1 OR t.provider_user_id=?1)", id),
+        FinanceScope::Provider(id) => ("t.provider_user_id=?1", id),
+        FinanceScope::Contract(id) => ("t.contract_id=?1", id),
+        #[cfg(test)]
+        FinanceScope::Payouts => ("0", ""),
+    };
+    let broken_termination: bool = conn
+        .query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM market_finance_reconciliation_cases c
+        JOIN client_market_terminations t ON t.id=c.object_id WHERE c.status='open'
+        AND c.code='client_termination_evidence_mismatch' AND {predicate} AND ?1 IS NOT NULL)"
+            ),
+            params![id],
+            |r| r.get(0),
+        )
+        .map_err(db_error("check Client termination finance scope"))?;
+    if broken_termination {
+        return Ok(true);
+    }
     let (sql, subject): (&str, Option<&str>) = match scope {
         FinanceScope::User(user) => (
             "SELECT EXISTS(SELECT 1 FROM market_finance_reconciliation_cases c
@@ -174,7 +199,7 @@ pub(crate) fn ensure_finance_scopes_safe_tx(
     let global: bool = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM market_finance_reconciliation_cases
-             WHERE status = 'open' AND code IN ('journal_unsealed', 'wallet_transfer_orphan_journal', 'commission_orphan_journal', 'earning_conversion_orphan_journal', 'c2c_orphan_journal'))",
+             WHERE status = 'open' AND code IN ('journal_unsealed', 'wallet_transfer_orphan_journal', 'commission_orphan_journal', 'earning_conversion_orphan_journal', 'c2c_orphan_journal','client_termination_orphan_journal'))",
             [],
             |row| row.get(0),
         )
@@ -226,6 +251,11 @@ fn critical_case_still_failed_tx(
     object_id: &str,
 ) -> Result<bool, AppError> {
     match (code, object_kind) {
+        ("client_termination_evidence_mismatch","client_termination") => Ok(!crate::client_market_termination::evidence_valid_tx(conn,object_id)?),
+        ("client_termination_orphan_journal","journal") => conn.query_row("SELECT EXISTS(SELECT 1 FROM market_journal_transactions j
+            WHERE j.id=?1 AND j.source_kind IN ('client_termination','client_compensation')
+            AND NOT EXISTS(SELECT 1 FROM client_termination_events e WHERE e.journal_id=j.id))",params![object_id],|r|r.get(0))
+            .map_err(db_error("recheck Client termination orphan journal")),
         ("c2c_evidence_mismatch", "c2c_order") => Ok(!crate::market_c2c::evidence_valid_tx(conn, object_id)?),
         ("c2c_orphan_journal", "journal") => crate::market_c2c::orphan_journal_tx(conn, object_id),
         ("earning_conversion_allocation_mismatch", "earning_lot") =>
@@ -270,7 +300,7 @@ fn critical_case_still_failed_tx(
         ("period_unfulfilled_mismatch", "period") => {
             let projection = conn
                 .query_row(
-                    "SELECT period.amount_units - period.fulfilled_units - period.refunded_units,
+                    "SELECT period.amount_units - period.fulfilled_units - period.refunded_units - period.termination_compensation_units,
                         COALESCE((SELECT SUM(signed_units) FROM market_journal_postings
                                   WHERE account_kind = 'unfulfilled' AND subject_id = period.id), 0)
                      FROM market_platform_periods period WHERE period.id = ?1",
@@ -499,6 +529,48 @@ pub(crate) fn resolve_case_tx(
 
 pub(crate) fn audit_finance_tx(conn: &Connection, now: &str) -> Result<usize, AppError> {
     let mut opened = crate::market_c2c::audit_tx_cases(conn, now)?;
+    let termination_ids = {
+        let mut s = conn
+            .prepare("SELECT id FROM client_market_terminations")
+            .map_err(db_error("prepare Client termination audit"))?;
+        s.query_map([], |r| r.get::<_, String>(0))
+            .map_err(db_error("query Client termination audit"))?
+            .collect::<crate::db::Result<Vec<_>>>()
+            .map_err(db_error("read Client termination audit"))?
+    };
+    for id in termination_ids {
+        if !crate::client_market_termination::evidence_valid_tx(conn, &id)? {
+            opened += case_tx(
+                conn,
+                "client_termination_evidence_mismatch",
+                "client_termination",
+                &id,
+                now,
+            )?;
+        }
+    }
+    let orphan_ids = {
+        let mut s = conn
+            .prepare(
+                "SELECT id FROM market_journal_transactions j
+        WHERE source_kind IN ('client_termination','client_compensation') AND NOT EXISTS
+          (SELECT 1 FROM client_termination_events e WHERE e.journal_id=j.id) LIMIT 100",
+            )
+            .map_err(db_error("prepare Client termination journal audit"))?;
+        s.query_map([], |r| r.get::<_, String>(0))
+            .map_err(db_error("query Client termination journal audit"))?
+            .collect::<crate::db::Result<Vec<_>>>()
+            .map_err(db_error("read Client termination journal audit"))?
+    };
+    for id in orphan_ids {
+        opened += case_tx(
+            conn,
+            "client_termination_orphan_journal",
+            "journal",
+            &id,
+            now,
+        )?;
+    }
     let mut journal = conn
         .prepare(
             "SELECT journal.id FROM market_journal_transactions journal
@@ -537,6 +609,7 @@ pub(crate) fn audit_finance_tx(conn: &Connection, now: &str) -> Result<usize, Ap
     let mut statement = conn
         .prepare(
             "SELECT provider_user_id FROM market_provider_earning_lots
+         UNION SELECT provider_user_id FROM client_termination_compensations
          UNION SELECT subject_id FROM market_journal_postings
            WHERE account_kind IN ('provider_pending', 'provider_available', 'provider_held')",
         )
@@ -583,7 +656,7 @@ pub(crate) fn audit_finance_tx(conn: &Connection, now: &str) -> Result<usize, Ap
            ON posting.account_kind = 'unfulfilled' AND posting.subject_id = period.id
          GROUP BY period.id
          HAVING COALESCE(SUM(posting.signed_units), 0)
-             != -(period.amount_units - period.fulfilled_units - period.refunded_units)
+             != -(period.amount_units - period.fulfilled_units - period.refunded_units - period.termination_compensation_units)
          LIMIT 100",
         )
         .map_err(db_error("prepare unfulfilled audit"))?;

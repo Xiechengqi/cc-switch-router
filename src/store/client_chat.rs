@@ -34,6 +34,62 @@ enum ChatDeliveryOutcome<'a> {
 const SHARE_OFFLINE_CONFIRM_SECS: i64 = 180;
 const SHARE_RECOVERY_CONFIRM_SECS: i64 = 120;
 
+/// Preserve the original Client discussion without reactivating a cleaned
+/// installation. Claims and financial notes must never be copied into this
+/// public chat history. Only the two financial parties can post after archive.
+pub(crate) fn ensure_termination_chat_tx(
+    conn: &Connection,
+    installation: &str,
+    at: &str,
+) -> Result<(), AppError> {
+    let now = DateTime::parse_from_rfc3339(at)
+        .map_err(|_| AppError::Internal("invalid termination chat time".into()))?
+        .with_timezone(&Utc);
+    let (buyer, provider, email, label): (String,String,String,String) = conn.query_row(
+        "SELECT t.buyer_user_id,t.provider_user_id,u.email_normalized,
+            COALESCE(NULLIF(s.client_subdomain,''),t.installation_id)
+         FROM client_market_terminations t JOIN users u ON u.id=t.buyer_user_id
+         LEFT JOIN client_market_subscriptions s ON s.installation_id=t.installation_id WHERE t.installation_id=?1",
+        params![installation], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))
+        .map_err(|e| AppError::Internal(format!("read termination chat parties failed: {e}")))?;
+    let existing: Option<String> = conn.query_row("SELECT id FROM chat_rooms WHERE installation_id=?1 ORDER BY owner_generation DESC LIMIT 1",
+        params![installation], |r| r.get(0)).optional().map_err(|e| AppError::Internal(format!("read termination chat failed: {e}")))?;
+    let room = if let Some(room) = existing {
+        room
+    } else {
+        let live: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM installations WHERE id=?1 AND lifecycle='active'
+            AND client_activated_at IS NOT NULL AND owner_verified_at IS NOT NULL AND lower(trim(owner_email))=?2)",
+            params![installation,email], |r| r.get(0)).map_err(|e| AppError::Internal(format!("read termination chat lifecycle failed: {e}")))?;
+        if live {
+            ensure_room_for_verified_owner_tx(conn, installation, &email, now)?
+        } else {
+            let id = Uuid::new_v4().to_string();
+            conn.execute("INSERT INTO chat_rooms(id,installation_id,client_label_snapshot,owner_user_id_snapshot,
+                owner_email_snapshot,owner_generation,status,created_at,updated_at,archived_at,delete_after)
+                VALUES (?1,?2,?3,?4,?5,1,'archived',?6,?6,?6,?7)",
+                params![id,installation,label,buyer,email,at,(now+Duration::seconds(CHAT_ARCHIVE_RETENTION_SECS)).to_rfc3339()])
+                .map_err(|e| AppError::Internal(format!("preserve termination chat failed: {e}")))?;
+            id
+        }
+    };
+    for user in [buyer, provider] {
+        upsert_visit_tx(conn, &user, &room, None, now)?;
+    }
+    Ok(())
+}
+
+fn termination_chat_participant_tx(
+    conn: &Connection,
+    installation: &str,
+    user: &str,
+) -> Result<bool, AppError> {
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM client_market_terminations WHERE installation_id=?1
+        AND responsibility='undetermined' AND dispute_used=1 AND (buyer_user_id=?2 OR provider_user_id=?2)
+        AND (compensation_cap_units>0 OR compensation_units>0 OR held_units>0))",
+        params![installation,user], |r| r.get(0))
+        .map_err(|e| AppError::Internal(format!("check termination chat participant failed: {e}")))
+}
+
 pub(super) fn ensure_room_for_verified_owner_tx(
     conn: &Connection,
     installation_id: &str,
@@ -854,7 +910,10 @@ pub(super) fn cleanup_expired_rooms_tx(
     let deleted = conn
         .execute(
             "DELETE FROM chat_rooms
-         WHERE status = 'archived' AND delete_after IS NOT NULL AND delete_after <= ?1",
+         WHERE status = 'archived' AND delete_after IS NOT NULL AND delete_after <= ?1
+           AND NOT EXISTS(SELECT 1 FROM client_market_terminations t WHERE t.installation_id=chat_rooms.installation_id
+               AND t.responsibility='undetermined' AND t.dispute_used=1
+               AND (t.compensation_cap_units>0 OR t.compensation_units>0 OR t.held_units>0))",
             params![now.to_rfc3339()],
         )
         .map_err(|error| {
@@ -1252,10 +1311,10 @@ impl AppStore {
         let room = tx
             .query_row(
                 "SELECT r.installation_id, r.owner_email_snapshot, r.owner_generation,
-                        lower(trim(i.owner_email)), i.owner_verified_at
+                        lower(trim(i.owner_email)), i.owner_verified_at,r.status,i.lifecycle
                  FROM chat_rooms r
                  LEFT JOIN installations i ON i.id = r.installation_id
-                 WHERE r.id = ?1 AND r.status = 'active' AND i.lifecycle = 'active'",
+                 WHERE r.id = ?1",
                 params![room_id],
                 |row| {
                     Ok((
@@ -1264,22 +1323,43 @@ impl AppStore {
                         row.get::<_, i64>(2)?,
                         row.get::<_, Option<String>>(3)?,
                         row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
                     ))
                 },
             )
             .optional()
             .map_err(|error| AppError::Internal(format!("read active chat room failed: {error}")))?
             .ok_or_else(|| AppError::Conflict("chat room is archived or unavailable".into()))?;
-        let (installation_id, owner_snapshot, owner_generation, owner_email, owner_verified_at) =
-            room;
-        let owner_email = owner_email
-            .filter(|_| owner_verified_at.is_some())
-            .ok_or_else(|| AppError::Conflict("client owner is not verified".into()))?;
-        if !owner_snapshot.eq_ignore_ascii_case(&owner_email) {
-            return Err(AppError::Conflict(
-                "client owner changed; retry the message".into(),
-            ));
-        }
+        let (
+            installation_id,
+            owner_snapshot,
+            owner_generation,
+            owner_email,
+            owner_verified_at,
+            room_status,
+            lifecycle,
+        ) = room;
+        let archived_claim = room_status == "archived"
+            && termination_chat_participant_tx(&tx, &installation_id, &session.user_id)?;
+        let owner_email = if archived_claim {
+            owner_snapshot.clone()
+        } else {
+            if room_status != "active" || lifecycle.as_deref() != Some("active") {
+                return Err(AppError::Conflict(
+                    "chat room is archived or unavailable".into(),
+                ));
+            }
+            let owner = owner_email
+                .filter(|_| owner_verified_at.is_some())
+                .ok_or_else(|| AppError::Conflict("client owner is not verified".into()))?;
+            if !owner_snapshot.eq_ignore_ascii_case(&owner) {
+                return Err(AppError::Conflict(
+                    "client owner changed; retry the message".into(),
+                ));
+            }
+            owner
+        };
 
         consume_chat_rate_limit_tx(
             &tx,
@@ -1332,7 +1412,7 @@ impl AppStore {
             AppError::Internal(format!("update chat room activity failed: {error}"))
         })?;
 
-        if !author_email.eq_ignore_ascii_case(&owner_email) {
+        if !archived_claim && !author_email.eq_ignore_ascii_case(&owner_email) {
             insert_chat_email_event_tx(
                 &tx,
                 &message_id,
@@ -2616,7 +2696,13 @@ fn load_room_by_id(
     else {
         return Ok(None);
     };
-    let can_post = status == "active" && viewer_user_id.is_some();
+    let can_post = if let Some(user) = viewer_user_id {
+        status == "active"
+            || (status == "archived"
+                && termination_chat_participant_tx(conn, &installation_id, user)?)
+    } else {
+        false
+    };
     let latest_seq = latest_visible_seq(conn, &id)?;
     let last_message = latest_visible_message_preview(conn, &id)?;
     let unread_count = if let Some(user_id) = viewer_user_id {

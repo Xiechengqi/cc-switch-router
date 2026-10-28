@@ -61,6 +61,18 @@ pub(crate) struct NotificationKind {
 
 pub(crate) const KINDS: &[NotificationKind] = &[
     NotificationKind {
+        kind: "client_termination_claim",
+        mandatory: true,
+        subject_en: "Client termination compensation claim",
+        subject_zh: "Client 退租补偿申诉",
+    },
+    NotificationKind {
+        kind: "client_termination_settled",
+        mandatory: true,
+        subject_en: "Client rental termination settlement",
+        subject_zh: "Client 退租结算",
+    },
+    NotificationKind {
         kind: "c2c_order_updated",
         mandatory: true,
         subject_en: "C2C order updated",
@@ -253,6 +265,17 @@ fn owner_signal(kind: &str) -> OwnerSignal {
         "refund_requested" => ("info", "Buyer balance refund requested"),
         "dispute_opened" => ("info", "Service dispute opened"),
         "c2c_dispute" => ("warning", "C2C balance trade needs evidence review"),
+        "client_compensation_dispute" => {
+            ("warning", "Client termination compensation needs review")
+        }
+        "client_compensation_dispute_overdue" => (
+            "warning",
+            "Client termination compensation decision is overdue",
+        ),
+        "client_cleanup_finalization_failed" => (
+            "warning",
+            "Client is clean but financial finalization needs review",
+        ),
         "earning_hold_legacy" => ("warning", "Earnings hold needs review"),
         "earning_unlock_failed" => ("warning", "Provider earning lot failed to unlock"),
         "service_notice_circuit" => ("warning", "Service notification safety policy activated"),

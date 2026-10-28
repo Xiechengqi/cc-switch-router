@@ -26,7 +26,7 @@
     "test:model-price-effectivity": "tsx --test lib/model-price-effectivity.test.ts",
     "test:share-model-health-heatmap": "tsx --test components/dashboard/share-model-health-heatmap.test.ts components/dashboard/client-online-heatmap.test.ts",
     "test:client-upgrade-state": "tsx --test components/dashboard/client-upgrade-state.test.ts",
-    "test:client-market": "tsx --test components/dashboard/client-market/host-utils.test.ts components/dashboard/client-market-client-context.test.tsx lib/client-market-rental-state.test.ts lib/client-market-client-status.test.ts lib/client-checkout.test.ts",
+    "test:client-market": "tsx --test components/dashboard/client-market/host-utils.test.ts components/dashboard/client-market-client-context.test.tsx lib/client-market-rental-state.test.ts lib/client-market-client-status.test.ts lib/client-checkout.test.ts lib/client-termination.test.ts",
     "test:providers": "tsx --test components/dashboard/providers-page-utils.test.ts lib/dashboard-nav.test.ts lib/home-entry.test.ts",
     "audit:settings-i18n": "node ../scripts/audit/audit-settings-i18n.mjs --check",
     "audit:settings-contract": "node ../scripts/audit/audit-settings-contract.mjs --check",

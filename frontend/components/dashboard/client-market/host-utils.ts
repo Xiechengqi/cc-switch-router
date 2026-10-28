@@ -172,7 +172,6 @@ export function hostCanClientRelease(
   if (!rental) return true;
   if (rental.isClientOwner === false) return false;
   if (rental.status === "released" || rental.status === "releasing") return false;
-  if (rental.recurring?.cancelAtPeriodEnd) return false;
   return rental.canRelease !== false;
 }
 

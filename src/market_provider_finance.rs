@@ -92,12 +92,12 @@ async fn get_finance(
     let (restricted,pending): (i64,i64) = conn.query_row("SELECT COALESCE(SUM(CASE WHEN disputed != 0
         THEN net_amount_units - reversed_units - paid_units - converted_units ELSE held_units END),0),
         COALESCE(SUM(CASE WHEN disputed = 0 THEN net_amount_units - reversed_units - unlocked_units ELSE 0 END),0)
-        FROM market_provider_earning_lots WHERE provider_user_id = ?1", params![user.user_id], |r| Ok((r.get(0)?,r.get(1)?)))
+        FROM market_provider_income_view WHERE provider_user_id = ?1", params![user.user_id], |r| Ok((r.get(0)?,r.get(1)?)))
         .map_err(db_error("read pending and restricted earnings"))?;
     let is_provider = can_manage_earnings_tx(&conn, &user.user_id)?;
     let has_finance_activity: bool = conn
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM market_provider_earning_lots WHERE provider_user_id = ?1)",
+            "SELECT EXISTS(SELECT 1 FROM market_provider_income_view WHERE provider_user_id = ?1)",
             params![user.user_id],
             |r| r.get(0),
         )
@@ -137,6 +137,7 @@ struct Page<T> {
 #[serde(rename_all = "camelCase")]
 struct Earning {
     id: String,
+    income_kind: String,
     #[serde(serialize_with = "serialize_units")]
     amount_units: i64,
     #[serde(serialize_with = "serialize_units")]
@@ -164,20 +165,20 @@ fn earnings_tx(
     user: &str,
     cursor: Option<&str>,
 ) -> Result<Page<Earning>, AppError> {
-    let cursor_at = cursor.map(|id| conn.query_row("SELECT created_at FROM market_provider_earning_lots WHERE id = ?1 AND provider_user_id = ?2",
+    let cursor_at = cursor.map(|id| conn.query_row("SELECT created_at FROM market_provider_income_view WHERE id = ?1 AND provider_user_id = ?2",
         params![id,user], |r| r.get::<_,String>(0)).optional().map_err(db_error("read earnings cursor"))?
         .ok_or_else(|| AppError::BadRequest("invalid earnings cursor".into()))).transpose()?;
     let mut stmt = conn.prepare("SELECT l.id,l.net_amount_units,l.amount_units,l.commission_units,l.commission_reversed_units,
-        COALESCE(p.rate_bps,0),COALESCE(p.policy_version,0),l.reversed_units,l.unlocked_units,l.held_units,l.converted_units,
-        l.fulfilled_at,l.unlock_at,l.disputed
-        FROM market_provider_earning_lots l LEFT JOIN market_commission_splits s ON s.lot_id = l.id
-        LEFT JOIN market_commission_periods p ON p.id = s.period_id
+        l.commission_rate_bps,l.commission_policy_version,l.reversed_units,l.unlocked_units,l.held_units,l.converted_units,
+        l.fulfilled_at,l.unlock_at,l.disputed,l.income_kind
+        FROM market_provider_income_view l
         WHERE l.provider_user_id = ?1 AND (?2 IS NULL OR l.created_at < ?2 OR (l.created_at = ?2 AND l.id < ?3))
         ORDER BY l.created_at DESC,l.id DESC LIMIT 51").map_err(db_error("prepare earnings"))?;
     let mut items = stmt
         .query_map(params![user, cursor_at, cursor], |r| {
             Ok(Earning {
                 id: r.get(0)?,
+                income_kind: r.get(14)?,
                 amount_units: r.get(1)?,
                 gross_units: r.get(2)?,
                 commission_units: r.get(3)?,
