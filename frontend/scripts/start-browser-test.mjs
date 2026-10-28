@@ -11,13 +11,10 @@ async function openPage(locale) {
   page.on("pageerror", (error) => { throw error; });
   await page.addInitScript((selected) => {
     localStorage.setItem("cc_switch_router_locale_v1", selected);
-    localStorage.setItem("cc_switch_router_auth_v2", JSON.stringify({
-      authDeviceId: "start-test", publicKey: "test", privateKey: "test",
-      accessToken: "start-test", expiresAt: "2099-01-01T00:00:00Z",
-    }));
   }, locale);
   let home = { hasActivity: false, entry: null, source: null };
   let failHome = false;
+  let signedIn = true;
   const json = (route, body, status = 200) => route.fulfill({ status, contentType: "application/json", body: JSON.stringify(body) });
   await page.route(/\/(?:v1|share-api)\//, async (route) => {
     const url = new URL(route.request().url());
@@ -34,7 +31,9 @@ async function openPage(locale) {
       if (failHome) return json(route, { message: "unavailable" }, 503);
       return json(route, home);
     }
-    if (path === "/v1/auth/session/me") return json(route, { authenticated: true, isAdmin: false, user: { id: "empty", email: "empty@example.invalid" } });
+    if (path === "/v1/auth/session/me") return json(route, signedIn
+      ? { authenticated: true, isAdmin: false, user: { id: "empty", email: "empty@example.invalid" } }
+      : { authenticated: false, isAdmin: false });
     if (path === "/v1/regions") return json(route, []);
     if (path === "/v1/announcement") return json(route, { enabled: false, revision: "1", contentEn: "", contentZhCn: "" });
     if (path.endsWith("inbox-summary")) return json(route, { pendingRequests: 0 });
@@ -58,13 +57,37 @@ async function openPage(locale) {
     return json(route, {});
   });
   await page.route("**/share-api/**", (route) => json(route, { message: "not a share" }, 404));
-  return { page, puts, setHome: (value) => { home = value; }, setFail: (value) => { failHome = value; } };
+  const signIn = async () => {
+    signedIn = true;
+    await page.evaluate(() => {
+      localStorage.setItem("cc_switch_router_auth_v2", JSON.stringify({
+        authDeviceId: "start-test", publicKey: "test", privateKey: "test",
+        accessToken: "start-test", expiresAt: "2099-01-01T00:00:00Z",
+      }));
+      window.dispatchEvent(new Event("router-auth-changed"));
+    });
+  };
+  return {
+    page, puts, signIn,
+    setSignedIn: (value) => { signedIn = value; },
+    setHome: (value) => { home = value; },
+    setFail: (value) => { failHome = value; },
+  };
 }
 
 try {
   const zh = await openPage("zh-CN");
+  zh.setSignedIn(false);
   await zh.page.goto(`${baseUrl}/`);
+  await zh.page.waitForURL(/\/clients\/$/);
+  await zh.page.getByRole("heading", { name: "客户端", level: 1 }).waitFor();
+  assert.equal(await zh.page.getByRole("dialog").count(), 0);
+  await zh.signIn();
   await zh.page.getByRole("heading", { name: "先做哪一件？" }).waitFor();
+  await zh.page.evaluate(() => localStorage.setItem("cc_switch_router_auth_v2", JSON.stringify({
+    authDeviceId: "start-test", publicKey: "test", privateKey: "test",
+    accessToken: "start-test", expiresAt: "2099-01-01T00:00:00Z",
+  })));
   assert.equal(await zh.page.getByRole("navigation", { name: "控制台分区" }).count(), 0);
   const recommended = zh.page.getByRole("button", { name: /租一个客户端/ });
   const other = zh.page.getByRole("button", { name: "买一段共享额度" });
