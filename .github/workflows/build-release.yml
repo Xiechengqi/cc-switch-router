@@ -101,6 +101,8 @@ jobs:
         working-directory: frontend
         run: |
           bash ../scripts/ci/timed.sh 'Client checkout browser' npm run test:client-checkout-browser
+          bash ../scripts/ci/timed.sh 'Client termination browser' npm run test:client-termination-browser
+          bash ../scripts/ci/timed.sh 'Client rental audit browser' npm run test:client-rental-audit-browser
           bash ../scripts/ci/timed.sh 'Wallet checkout browser' npm run test:wallet-checkout-browser
           bash ../scripts/ci/timed.sh 'C2C browser' npm run test:c2c-browser
           bash ../scripts/ci/timed.sh 'Navbar wallet browser' npm run test:navbar-wallet-browser

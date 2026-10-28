@@ -24,6 +24,7 @@ export type SessionStatus = {
   user?: AuthUser;
   expiresAt?: string;
   isAdmin: boolean;
+  canAuditClientMarket?: boolean;
 };
 
 export type MapViewportSettings = {

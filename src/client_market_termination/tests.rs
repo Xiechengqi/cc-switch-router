@@ -1,11 +1,11 @@
 use super::*;
 use crate::market_platform_contracts::{self as contracts, BillingModel, PrepareContract};
 use crate::market_wallet::{units_from_minor, wallet_snapshot_tx};
-const START: &str = "2026-01-01T00:00:00+00:00";
-const INSTALL: &str = "client-installation";
-const HOST: &str = "client-host";
+pub(super) const START: &str = "2026-01-01T00:00:00+00:00";
+pub(super) const INSTALL: &str = "client-installation";
+pub(super) const HOST: &str = "client-host";
 
-fn fixture(price: i64, terms: bool, trial: i64) -> (Connection, String) {
+pub(super) fn fixture(price: i64, terms: bool, trial: i64) -> (Connection, String) {
     fixture_with_rate(price, terms, trial, 1000)
 }
 fn fixture_with_rate(price: i64, terms: bool, trial: i64, rate: i64) -> (Connection, String) {
@@ -66,7 +66,7 @@ fn fixture_with_rate(price: i64, terms: bool, trial: i64, rate: i64) -> (Connect
     contracts::activate_contract_tx(&conn, &id, START, START).unwrap();
     (conn, id)
 }
-fn deliver(conn: &Connection, id: &str, percent: i64) -> String {
+pub(super) fn deliver(conn: &Connection, id: &str, percent: i64) -> String {
     let end: String = conn
         .query_row(
             "SELECT period_end FROM market_platform_periods WHERE contract_id=?1",
@@ -97,7 +97,7 @@ fn deliver(conn: &Connection, id: &str, percent: i64) -> String {
     .unwrap();
     through
 }
-fn accept(conn: &Connection, at: &str, reason: &str) -> Termination {
+pub(super) fn accept(conn: &Connection, at: &str, reason: &str) -> Termination {
     let p = preview_tx(conn, INSTALL, "buyer", at).unwrap();
     accept_tx(
         conn,

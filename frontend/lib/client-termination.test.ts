@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseTerminationRate, parseTerminationAward, terminationCanDispute, terminationCanDecide, terminationCanWithdraw, terminationCanRespond, terminationTimeoutDue, terminationRemainingCompensation, terminationExplanationValid, type ClientTermination } from "./client-termination";
+import { parseTerminationRate, parseTerminationAward, terminationCanDispute, terminationCanDecide, terminationCanWithdraw, terminationCanRespond, terminationTimeoutDue, terminationRemainingCompensation, terminationExplanationValid, terminationActionAllowed, terminationServerNow, clientTerminationHref, parseClientTerminationDetail, parseClientTerminationWorkspace, parseClientTerminationWorkPage, type ClientTermination, type ClientTerminationDetail } from "./client-termination";
 import { clientTerminationMessagesEn, clientTerminationMessagesZh } from "./client-termination-messages";
 const at = Date.parse("2026-10-01T00:00:00Z");
 function settlement(patch: Partial<ClientTermination> = {}): ClientTermination {
@@ -71,4 +71,41 @@ test("withdrawal confirmation uses the actual remaining compensation including p
   assert.equal(terminationRemainingCompensation(settlement({ cleanupConfirmedAt: null, compensationUnits: "0", heldUnits: "0", compensationCapUnits: "999" })), "999");
   assert.equal(terminationCanWithdraw(settlement({ responsibility: "undetermined", disputeUsed: true, status: "finance_pending" }), at), false);
   assert.equal(terminationCanRespond(settlement({ responsibility: "undetermined", disputeUsed: true, status: "finance_pending", compensationUnits: "0", heldUnits: "0" }), at), true);
+});
+
+test("workbench actions require both the server capability and an unexpired state", () => {
+  const detail: ClientTerminationDetail = { ...settlement({ responsibility: "undetermined", status: "disputed", disputeUsed: true,
+    disputeOpenedAt: "2026-10-01T00:00:00Z", disputeDeadlineAt: "2026-10-04T00:00:00Z" }),
+    permissions: { buyer: false, provider: true, owner: false, dispute: false, withdraw: false, waive: true, respond: true, resolve: false, retryCleanup: false },
+    attention: "provider_response", actionRequired: true, serverNow: "2026-10-01T00:00:00Z", events: [], eventsNextCursor: null };
+  assert.equal(terminationActionAllowed(detail, "provider", "respond", at), true);
+  assert.equal(terminationActionAllowed(detail, "owner", "decision", at), false);
+  assert.equal(terminationActionAllowed(detail, "buyer", "decision", at), false);
+  assert.equal(terminationActionAllowed(detail, "provider", "respond", at + 72 * 3600000), false);
+  assert.equal(terminationActionAllowed({ ...detail, permissions: { ...detail.permissions, respond: false } }, "provider", "respond", at), false);
+  assert.equal(terminationActionAllowed({ ...detail, permissions: { ...detail.permissions, provider: false } }, "provider", "respond", at), false);
+  assert.equal(terminationServerNow(detail, 100, 1100), at + 1000);
+  assert.equal(terminationServerNow(detail, 100, -100), at);
+  assert.equal(clientTerminationHref("old/id?x=1"), "/client-market/?terminationId=old%2Fid%3Fx%3D1");
+});
+
+test("workbench projections reject malformed money, dates, capabilities and pagination before rendering", () => {
+  const detail: ClientTerminationDetail = { ...settlement(),
+    permissions: { buyer: false, provider: true, owner: false, dispute: false, withdraw: false, waive: true, respond: false, resolve: false, retryCleanup: false },
+    attention: "completed", actionRequired: false, serverNow: "2026-10-01T00:00:00Z", events: [], eventsNextCursor: null };
+  assert.equal(parseClientTerminationDetail(detail, detail.id), detail);
+  for (const patch of [
+    { returnedUnits: "NaN" }, { heldUnits: "-1" }, { compensationUnits: "1e5" }, { creditedUnits: "9223372036854775808" },
+    { cleanupConfirmedAt: "invalid" }, { serverNow: "invalid" }, { permissions: { ...detail.permissions, waive: "yes" } },
+    { version: 1.5 }, { events: [{ id: "event", action: "owner_decision", actorRole: "owner", note: null, awardUnits: "bad", createdAt: detail.serverNow }] },
+    { eventsNextCursor: {} }, { id: "another-case" },
+  ]) assert.throws(() => parseClientTerminationDetail({ ...detail, ...patch }, detail.id), /Invalid termination detail/);
+  const workspace = { hosts: [{ hostId: "host", terminationId: detail.id, attention: detail.attention, actionRequiredCount: 0, responseDeadlineAt: null }], actionRequiredCount: 0, canAdjudicate: false, serverNow: detail.serverNow };
+  assert.equal(parseClientTerminationWorkspace(workspace), workspace);
+  assert.throws(() => parseClientTerminationWorkspace({ ...workspace, hosts: [{ ...workspace.hosts[0], responseDeadlineAt: "bad" }] }), /Invalid termination workspace/);
+  assert.throws(() => parseClientTerminationWorkspace({ ...workspace, actionRequiredCount: -1 }), /Invalid termination workspace/);
+  const page = { items: [detail], nextCursor: null, serverNow: detail.serverNow };
+  assert.equal(parseClientTerminationWorkPage(page), page);
+  assert.throws(() => parseClientTerminationWorkPage({ ...page, items: [{ ...detail, heldUnits: "bad" }] }), /Invalid termination records/);
+  assert.throws(() => parseClientTerminationWorkPage({ ...page, nextCursor: "" }), /Invalid termination records/);
 });

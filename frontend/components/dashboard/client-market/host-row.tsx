@@ -54,6 +54,7 @@ import {
   statusLabelKey,
 } from "@/components/dashboard/client-market/host-utils";
 import { formatUsdMoney } from "@/lib/market-money";
+import type { ClientTerminationHostSummary } from "@/lib/client-termination";
 
 function HostRowImpl({
   host,
@@ -66,6 +67,8 @@ function HostRowImpl({
   onChanged,
   onCreate,
   onUiBusyChange,
+  terminationSummary,
+  onTerminationOpen,
 }: {
   host: ClientMarketHost;
   rental?: ClientMarketRental | null;
@@ -79,6 +82,8 @@ function HostRowImpl({
   onChanged: () => void;
   onCreate: (host: ClientMarketHost) => void;
   onUiBusyChange?: (hostId: string, busy: boolean) => void;
+  terminationSummary?: ClientTerminationHostSummary;
+  onTerminationOpen?: (id: string) => void;
 }) {
   const { locale, t } = useLocaleText();
   const { session } = useAuth();
@@ -499,6 +504,14 @@ function HostRowImpl({
         </td>
         <td className="whitespace-nowrap px-2 py-2 align-middle" onClick={(event) => event.stopPropagation()}>
           <div className="flex items-center justify-end gap-1">
+            {terminationSummary && onTerminationOpen ? <div className="grid justify-items-end gap-0.5"><Button size="sm" variant={terminationSummary.actionRequiredCount ? "outline" : "ghost"}
+              className="min-h-8 shrink-0 whitespace-nowrap px-2 text-xs"
+              aria-label={t(terminationSummary.actionRequiredCount ? "clientTermination.rowTasks" : "clientTermination.rowHistory", { count: terminationSummary.actionRequiredCount })}
+              onPress={() => onTerminationOpen(terminationSummary.terminationId)}>
+              {terminationSummary.actionRequiredCount ? `${t(`clientTermination.attention.${terminationSummary.attention}`)} · ${terminationSummary.actionRequiredCount}` : t("clientTermination.rowHistory")}
+            </Button>{terminationSummary.responseDeadlineAt && ["provider_response", "waiting_provider"].includes(terminationSummary.attention) ? <time dateTime={terminationSummary.responseDeadlineAt} className="text-[10px] text-muted-foreground" title={t("clientTermination.responseDeadline")}>
+              {t("clientTermination.respondBy", { time: new Intl.DateTimeFormat(locale, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(terminationSummary.responseDeadlineAt)) })}
+            </time> : null}</div> : null}
             <Button
               variant="ghost"
               size="sm"

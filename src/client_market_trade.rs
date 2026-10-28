@@ -3072,6 +3072,7 @@ impl AppStore {
             .map_err(|error| {
                 AppError::Internal(format!("insert quoted provisioning job failed: {error}"))
             })?;
+            crate::client_market_audit::capture_job_identity_tx(&tx, &job_id)?;
             if funding_rail == "platform_wallet"
                 && let Some(price_minor) = item.6.or(item.4)
             {
@@ -4867,6 +4868,7 @@ pub(crate) fn complete_provisioning_tx(
         AppError::Internal(format!("create Client Market subscription failed: {error}"))
     })?;
     persist_subscription_client_subdomain_tx(tx, installation_id)?;
+    crate::client_market_audit::bind_installation_tx(tx, job_id, installation_id)?;
     let mut activated_trial_seconds = 0_i64;
     if funding_rail == "platform_wallet"
         && let Some(_price_minor) = cycle_price_minor.or(daily_rate_minor)

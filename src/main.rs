@@ -7,6 +7,7 @@ mod cf;
 mod client_chat;
 mod client_logs;
 mod client_market;
+mod client_market_audit;
 mod client_market_coordination;
 mod client_market_terminal;
 mod client_market_termination;

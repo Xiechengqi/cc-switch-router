@@ -11,6 +11,16 @@
 
 各处 Client 退租入口共用同一预览与确认组件。钱包页面可查看结算、计费截止时间、清理状态、补偿金额及异议进度。Provider 在原有 Provider 设置的收入区域查看收益和退租记录，不新增独立侧边栏项目。
 
+### Client Market 行内处理工作台
+
+- 原 Host 对应行的操作区显示待答复、待裁决、清理失败等入口、待办数量及答复截止时间；没有待办时保留退租详情入口。不把退租处理混入当前租户的控制菜单。
+- Provider 直接在共享弹窗中全部／部分减免或正式答复；Router 财务 Owner 在需要裁决时通过同一弹窗处理。兼有多种身份时可切换处理身份。普通管理员没有财务裁决权限。
+- 弹窗按不可变的 `terminationId` 加载原租户、原 Provider、资金状态和分页处理历史。Host 再次出租、转给另一 Provider、下架或删除，不会改写旧退租身份，也不授权新租户／新 Provider 查看旧争议。
+- 页面顶部“退租待办”独立分页，不受公开 Host 列表、筛选和分页影响，已删除 Host 的待处理事项仍可找到。普通无争议退租自动清理、结算，不新增 Provider 确认或 Owner 审批步骤。
+- 钱包、Provider 设置、财务设置共用同一详情／处理弹窗。站内通知和新增退租邮件中的链接直接定位 `/client-market/?terminationId=...`；新增普通退租及待裁决提醒仅使用去重站内通知，不额外增加邮件。
+- 提交后保留弹窗并刷新权威状态；编辑期间不自动刷新覆盖输入，版本冲突须重新核对，不能重复提交旧裁决。加载更多的处理历史和待办不会被轮询重置为第一页。
+- 清理重试仅适用于仍绑定原 installation、Host 和 Provider 的失败租用；不能因处理旧争议而清理当前新租户。财务异常只能进入账务核对，不能以责任裁决代替修复，也不能在清理确认前提前返还余额。
+
 ## 金额规则
 
 `P` 是当前完整付费日历月实际租金，不含充值维护费。`R` 是截至确认退租时，扣除已交付服务和此前已退回金额后的剩余租金。`r` 是本周期冻结的补偿比例。
@@ -111,6 +121,9 @@ SSH 在事务提交后执行。重复请求沿用原记录、截止时间和任�
 - `POST /v1/client-market/clients/:installation/release`（携带 previewId、reason、claim）
 - `GET /v1/client-market/clients/:installation/termination`
 - `GET /v1/client-market/terminations?provider=false|true&cursor=...`
+- `GET /v1/client-market/termination-workspace`（当前身份可见的 Host 摘要、待办总数和服务端时间）
+- `GET /v1/client-market/termination-workspace/records?hostId=...&pendingOnly=true&cursor=...`（Provider／Owner 独立工作队列，每页 50 条）
+- `GET /v1/client-market/terminations/:id?eventCursor=...`（原买家／原 Provider／财务 Owner 的详情、操作能力与分页时间线）
 - `POST /v1/client-market/terminations/:id/dispute`
 - `POST /v1/client-market/terminations/:id/waive`
 - `POST /v1/client-market/terminations/:id/respond`（Provider 正式答复，expectedVersion、note）
@@ -123,6 +136,8 @@ SSH 在事务提交后执行。重复请求沿用原记录、截止时间和任�
 ## 运维与验证
 
 数据库使用新增 migration 95，不修改已发布 migration。启动时先备份数据库，按正常升级流程自动建表。上线后检查 Owner 的默认补偿比例，并在新报价中确认条款展示。
+
+行内工作台使用新增 migration 98，仅增加 Host 历史和 Provider 待办查询索引；不改写既有退租、清理凭证或金融记录，不新增资金状态机。
 
 清理失败：按原 Host 清理/重验证流程处理，不直接把 Host 标成空闲。清理已完成但资金待处理：检查 Client 退租记录和财务核对事项，修复具体证据异常，再由后台重试收尾，不重复发起新退租。需要裁定的剩余争议只能由 Owner 处理，不能借用一般服务争议接口结算补偿；Provider 减免、用户结束追讨和无人答复的超时减免均走专门的退租账务路径。
 

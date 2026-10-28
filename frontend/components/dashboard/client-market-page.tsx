@@ -28,7 +28,11 @@ import { preferredScrollBehavior } from "@/lib/utils";
 import { useBatchOperations } from "@/components/dashboard/client-market/use-batch-operations";
 import { AddHostDialog } from "@/components/dashboard/client-market/add-host-dialog";
 import { HostRow } from "@/components/dashboard/client-market/host-row";
+import { ClientRentalAuditPanel } from "@/components/dashboard/client-market/rental-audit-panel";
 import { HostSortHeader } from "@/components/dashboard/client-market/host-sort-header";
+import { ClientTerminationDialog } from "@/components/market/client-termination-dialog";
+import { ClientTerminationWorkList } from "@/components/market/client-termination-work-list";
+import { useClientTerminationWorkspace } from "@/components/market/use-client-termination-workspace";
 import {
   BatchProgressItem,
   CLEARED_HOST_SORT,
@@ -79,6 +83,10 @@ export function ClientMarketPage() {
   const authed = !!session?.authenticated;
   const viewerUserId = session?.user?.id;
   const viewerEmail = session?.user?.email;
+  const terminationWork = useClientTerminationWorkspace(authed ? viewerUserId : undefined);
+  const [terminationId, setTerminationId] = React.useState<string | null>(null);
+  const [terminationQueueOpen, setTerminationQueueOpen] = React.useState(false);
+  const terminationLinkApplied = React.useRef<string | null>(null);
   const marketProviderId = searchParams.get("provider") || undefined;
   const returnedHostId = searchParams.get("focusHost") || undefined;
 
@@ -185,6 +193,28 @@ export function ClientMarketPage() {
   );
 
   const silentRefresh = React.useCallback(() => load({ silent: true }), [load]);
+  const onTerminationChanged = React.useCallback(() => {
+    void silentRefresh(); void terminationWork.refresh(true);
+  }, [silentRefresh, terminationWork.refresh]);
+  const terminationByHost = React.useMemo(() => new Map(terminationWork.workspace?.hosts.map(item => [item.hostId, item]) || []), [terminationWork.workspace]);
+  React.useEffect(() => {
+    setTerminationId(null); setTerminationQueueOpen(false); terminationLinkApplied.current = null;
+  }, [viewerUserId]);
+  const linkedTermination = searchParams.get("terminationId");
+  React.useEffect(() => {
+    if (!linkedTermination) { terminationLinkApplied.current = null; return; }
+    if (!authed || !linkedTermination || terminationLinkApplied.current === linkedTermination) return;
+    terminationLinkApplied.current = linkedTermination; setTerminationId(linkedTermination);
+  }, [authed, viewerUserId, linkedTermination]);
+  const closeTermination = React.useCallback(() => {
+    setTerminationId(null);
+    if (linkedTermination) {
+      const params = new URLSearchParams(searchParams.toString()); params.delete("terminationId");
+      // Removing a dialog-only query is a shallow URL update, not a route
+      // navigation (which can refetch/remount a statically exported page).
+      window.history.replaceState(null, "", `${pathname}${params.size ? `?${params}` : ""}${window.location.hash}`);
+    }
+  }, [linkedTermination, pathname, searchParams]);
 
   React.useEffect(() => {
     void load();
@@ -335,6 +365,7 @@ export function ClientMarketPage() {
     exportOpen ||
     !!fixedHost ||
     !!accessDialog ||
+    !!terminationId ||
     rowUiBusyCount > 0;
 
   React.useEffect(() => {
@@ -503,6 +534,18 @@ export function ClientMarketPage() {
   return (
     <main className="mx-auto grid min-w-0 w-[calc(100%-2rem)] max-w-7xl grid-cols-[minmax(0,1fr)] gap-5 pb-10">
       <h1 className="sr-only">{t("clientMarket.title")}</h1>
+      {authed ? <div className="grid min-w-0 gap-3 rounded-lg border border-border bg-card p-3">
+        <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
+          <Button size="sm" variant={terminationWork.workspace?.actionRequiredCount ? "outline" : "ghost"}
+            className="min-h-11 whitespace-nowrap" aria-expanded={terminationQueueOpen}
+            onPress={() => { setTerminationQueueOpen(open => !open); void terminationWork.refresh(true); }}>
+            {terminationWork.workspace ? t("clientTermination.queueButton", { count: terminationWork.workspace.actionRequiredCount }) : t("clientTermination.queue")}
+          </Button>
+          {terminationWork.error ? <div className="flex min-w-0 flex-wrap items-center gap-2"><p role="alert" className="text-xs text-danger">{t("clientTermination.workspaceUnavailable")}</p><Button size="sm" variant="ghost" onPress={() => void terminationWork.refresh(true)}>{t("common.reload")}</Button></div> : null}
+        </div>
+        {terminationQueueOpen ? <ClientTerminationWorkList pendingOnly revision={terminationWork.revision} onOpen={setTerminationId} /> : null}
+      </div> : null}
+      <ClientTerminationDialog terminationId={terminationId} onClose={closeTermination} onChanged={onTerminationChanged} />
       {marketProviderId ? (
         <div className="flex min-h-11 min-w-0 flex-wrap items-center justify-between gap-2 rounded-lg bg-slate-100 px-3 py-2 text-sm">
           <span className="min-w-0 text-slate-700">{t("providers.marketFilter.client")}</span>
@@ -829,6 +872,8 @@ export function ClientMarketPage() {
                   <HostRow
                     key={host.id}
                     host={host}
+                    terminationSummary={terminationByHost.get(host.id)}
+                    onTerminationOpen={setTerminationId}
                     rental={
                       host.installationId
                         ? rentalByInstallation.get(host.installationId) ?? null
@@ -909,6 +954,7 @@ export function ClientMarketPage() {
         </div>
       )}
 
+      <ClientRentalAuditPanel onTerminationOpen={setTerminationId} revision={terminationWork.revision} />
       <AddHostDialog open={addOpen} onOpenChange={setAddOpen} onAdded={() => void silentRefresh()} />
       <CreateClientDialog
         open={!!fixedHost}

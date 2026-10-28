@@ -112,6 +112,25 @@ fn client_termination_claim_notices_are_actionable_private_and_have_a_delivery_p
 }
 
 #[test]
+fn client_termination_emails_link_to_the_exact_case_without_private_text_or_untrusted_urls() {
+    for role in ["buyer", "provider", "handler"] {
+        for kind in ["client_termination_claim", "client_termination_settled"] {
+            let i = item(
+                kind,
+                json!({"role":role,"terminationId":"old/id?other=case#fragment",
+                "claim":"PRIVATE_CLAIM","note":"PRIVATE_NOTE","url":"https://untrusted.example/"}),
+            );
+            let (_, html, text) =
+                render_email(&i, "https://router.example/settings/?stale=1#income");
+            let link = "https://router.example/client-market/?terminationId=old%2Fid%3Fother%3Dcase%23fragment";
+            assert!(html.contains(link) && text.contains(link));
+            assert!(!html.contains("PRIVATE_CLAIM") && !text.contains("PRIVATE_NOTE"));
+            assert!(!html.contains("untrusted.example") && !text.contains("stale=1"));
+        }
+    }
+}
+
+#[test]
 fn every_financial_email_is_english_and_uses_the_shared_layout() {
     for kind in KINDS {
         let item = item(

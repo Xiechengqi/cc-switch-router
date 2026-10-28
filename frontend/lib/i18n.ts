@@ -14,6 +14,7 @@ import { passwordMessagesEn, passwordMessagesZh } from "@/lib/password-messages"
 import { clientTerminationMessagesEn, clientTerminationMessagesZh } from "@/lib/client-termination-messages";
 import { clientTrialMessagesEn, clientTrialMessagesZh } from "@/lib/client-trial-messages";
 import { notificationCenterMessagesEn, notificationCenterMessagesZh } from "@/lib/notification-center-messages";
+import { rentalAuditMessagesEn, rentalAuditMessagesZh } from "@/lib/client-rental-audit-messages";
 
 export const LOCALE_STORAGE_KEY = "cc_switch_router_locale_v1";
 export const SUPPORTED_LOCALES = ["en", "zh-CN"] as const;
@@ -23,6 +24,7 @@ export type MessageKey = keyof typeof messages.en;
 
 export const messages = {
   en: {
+    ...rentalAuditMessagesEn,
     ...notificationCenterMessagesEn,
     ...clientTrialMessagesEn,
     ...clientTerminationMessagesEn,
@@ -3549,6 +3551,7 @@ export const messages = {
     ...walletPolicyMessagesEn,
   },
   "zh-CN": {
+    ...rentalAuditMessagesZh,
     ...notificationCenterMessagesZh,
     ...clientTrialMessagesZh,
     ...clientTerminationMessagesZh,

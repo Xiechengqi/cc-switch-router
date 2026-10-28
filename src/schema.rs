@@ -332,6 +332,14 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../schema/0096_client_market_trial_resets.sql"),
     ),
     (97, include_str!("../schema/0097_notification_center.sql")),
+    (
+        98,
+        include_str!("../schema/0098_client_termination_workbench.sql"),
+    ),
+    (
+        99,
+        include_str!("../schema/0099_client_market_rental_audit.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -841,7 +849,78 @@ fn migration_checksum(sql: &str) -> String {
 mod tests {
     use super::*;
 
-    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 261;
+    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 262;
+
+    #[test]
+    fn migration_99_preserves_rental_history_without_inventing_old_host_metadata() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 98);
+        conn.execute("INSERT INTO router_ssh_hosts (id,ip,port,host_owner_email,status,created_at,updated_at)
+            VALUES ('host','192.0.2.99',22,'current@example.test','idle','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",[]).unwrap();
+        conn.execute("INSERT INTO client_market_subscriptions
+            (installation_id,host_id,provider_id,host_owner_email,client_user_id,client_owner_email,status,offer_revision,created_at,updated_at,client_subdomain)
+            VALUES ('old-client','host','provider','synced@example.test','buyer','buyer@example.test','released',1,'2026-01-01T00:00:00Z','2026-01-02T00:00:00Z','old-name')",[]).unwrap();
+        conn.execute("INSERT INTO client_market_subscription_events (id,installation_id,event_type,detail_json,created_at)
+            VALUES ('activation','old-client','client_provisioned','{\"providerId\":\"provider\",\"hostOwnerEmail\":\"original@example.test\"}','2026-01-01T00:00:00Z')",[]).unwrap();
+        for (job, installation, status) in [
+            ("original", Some("old-client"), "succeeded"),
+            ("retry", Some("old-client"), "failed"),
+            ("never-delivered", None, "failed"),
+        ] {
+            conn.execute("INSERT INTO provisioning_jobs (id,type,host_id,client_owner_email,installation_id,status,created_at,updated_at)
+                VALUES (?1,'create','host','buyer@example.test',?2,?3,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",params![job,installation,status]).unwrap();
+        }
+        let journals: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM market_journal_transactions",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM client_market_rental_identities",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(conn.query_row("SELECT provider_email,host_ip,client_subdomain FROM client_market_rental_identities WHERE installation_id='old-client'",[],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?))).unwrap(),("original@example.test".into(),None,"old-name".into()));
+        conn.execute("DELETE FROM router_ssh_hosts WHERE id='host'", [])
+            .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM client_market_rental_identities",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            journals,
+            conn.query_row(
+                "SELECT COUNT(*) FROM market_journal_transactions",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn migration_98_adds_client_workbench_indexes_without_new_financial_tables() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 97);
+        let tables: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND (name LIKE 'market_%' OR name LIKE 'client_termination%')", [], |r| r.get(0)).unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN ('idx_client_termination_host_history','idx_client_termination_provider_work')", [], |r| r.get::<_,i64>(0)).unwrap(), 2);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND (name LIKE 'market_%' OR name LIKE 'client_termination%')", [], |r| r.get::<_,i64>(0)).unwrap(), tables);
+    }
 
     #[test]
     fn migration_97_adds_notification_center_without_rewriting_market_events_or_read_state() {

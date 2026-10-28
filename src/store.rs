@@ -7324,6 +7324,7 @@ impl AppStore {
                 user: None,
                 expires_at: None,
                 is_admin: false,
+                can_audit_client_market: false,
             });
         };
 
@@ -7356,6 +7357,7 @@ impl AppStore {
             }),
             expires_at: Some(session.access_expires_at),
             is_admin: false,
+            can_audit_client_market: false,
         })
     }
 

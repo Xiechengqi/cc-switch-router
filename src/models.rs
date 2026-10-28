@@ -569,6 +569,9 @@ pub struct SessionStatusResponse {
     pub expires_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub is_admin: bool,
+    /// Server-owned capability; a general administrator is not a finance owner.
+    #[serde(default)]
+    pub can_audit_client_market: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

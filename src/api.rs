@@ -291,6 +291,7 @@ pub fn router(state: ServerState) -> Router {
         .merge(public_api)
         .merge(crate::client_market::router())
         .merge(crate::client_market_trade::router())
+        .merge(crate::client_market_audit::router())
         .merge(crate::client_market_terminal::router())
         .merge(crate::share_market::router())
         .merge(crate::market_access::router())
@@ -3424,6 +3425,7 @@ async fn session_me(
     let mut response = state.store.session_status(session_token.as_deref()).await?;
     if let Some(user) = response.user.as_ref() {
         response.is_admin = state.dynamic.read().await.is_admin(&user.email);
+        response.can_audit_client_market = is_finance_owner(&state.config, &user.email);
     }
     Ok(Json(response))
 }
@@ -6583,6 +6585,7 @@ fn dev_session_status() -> SessionStatusResponse {
         }),
         expires_at: Some(session.access_expires_at),
         is_admin: true,
+        can_audit_client_market: true,
     }
 }
 

@@ -22,6 +22,7 @@ use crate::{
 
 #[cfg(test)]
 mod tests;
+mod workbench;
 
 fn time(at: &str) -> Result<DateTime<Utc>, AppError> {
     DateTime::parse_from_rfc3339(at)
@@ -373,6 +374,9 @@ pub(crate) fn accept_tx(
             at,
             false,
         )?;
+    } else if voluntary {
+        // Immediate in-app awareness, without a second email for the same exit.
+        workbench::notify_started_tx(conn, &by_id_tx(conn, &id)?, at)?;
     }
     Ok(())
 }
@@ -1217,6 +1221,7 @@ fn apply_decision_tx(
     }
     if still_disputed && t.provider_responded_at.is_none() {
         notify_claim_tx(conn, &result, "responded", at)?;
+        workbench::notify_owner_ready_tx(conn, &result, at)?;
     }
     Ok(result)
 }
@@ -1275,6 +1280,7 @@ fn respond_tx(
     )?;
     let result = by_id_tx(conn, id)?;
     notify_claim_tx(conn, &result, "responded", at)?;
+    workbench::notify_owner_ready_tx(conn, &result, at)?;
     Ok(result)
 }
 fn withdraw_tx(
@@ -1402,6 +1408,15 @@ pub fn router() -> Router<ServerState> {
         )
         .route("/v1/client-market/clients/:id/termination", get(detail))
         .route("/v1/client-market/terminations", get(list))
+        .route("/v1/client-market/terminations/:id", get(workbench::detail))
+        .route(
+            "/v1/client-market/termination-workspace",
+            get(workbench::summary),
+        )
+        .route(
+            "/v1/client-market/termination-workspace/records",
+            get(workbench::records),
+        )
         .route("/v1/client-market/terminations/:id/waive", post(waive))
         .route("/v1/client-market/terminations/:id/dispute", post(dispute))
         .route("/v1/client-market/terminations/:id/respond", post(respond))

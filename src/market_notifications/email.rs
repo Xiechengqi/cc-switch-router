@@ -89,6 +89,13 @@ fn destination(item: &Claimed, dashboard: &str) -> Option<String> {
     }
     url.set_query(None);
     url.set_fragment(None);
+    if item.event_kind.starts_with("client_termination_")
+        && let Some(id) = field(&item.payload, "terminationId")
+    {
+        url.set_path("/client-market/");
+        url.query_pairs_mut().append_pair("terminationId", id);
+        return Some(url.to_string());
+    }
     let provider = matches!(
         item.event_kind.as_str(),
         "earnings_converted" | "earnings_held" | "earnings_released" | "commission_policy_changed"
@@ -133,7 +140,7 @@ pub(super) fn render(item: &Claimed, dashboard: &str) -> (String, String, String
             } else if role == "provider" {
                 "The buyer has requested a compensation waiver. Respond by reducing or waiving compensation, or formally request an Owner decision before the response deadline. If you do not respond within 72 hours, the remaining compensation is automatically waived. Open the Client chat from the termination record to discuss the issue."
             } else {
-                "Your compensation claim is open. Only the contested compensation is held; other unused rent returns after verified cleanup. If the Provider does not formally respond within 72 hours, the remaining compensation is waived. You may discuss the issue in the Client chat or voluntarily end your claim in your wallet."
+                "Your compensation claim is open. Only the contested compensation is held; other unused rent returns after verified cleanup. If the Provider does not formally respond within 72 hours, the remaining compensation is waived. You may discuss the issue in the Client chat or voluntarily end your claim from the termination record."
             },
         ),
         "client_termination_settled" => (
@@ -141,7 +148,7 @@ pub(super) fn render(item: &Claimed, dashboard: &str) -> (String, String, String
             if role == "provider" {
                 "The Client rental has ended. Any termination compensation is separate from service income, carries no service commission and moves to your wallet automatically after its seven-day settlement window. Disputed amounts remain held for review."
             } else {
-                "The Client rental has ended. The amount shown is the total unused rent returned as platform credit for this termination, not a new top-up or an external cash refund. Review the settlement in your wallet."
+                "The Client rental has ended. The amount shown is the total unused rent returned as platform credit for this termination, not a new top-up or an external cash refund. Open the termination record to review the settlement."
             },
         ),
         "topup_credited" => (
@@ -434,7 +441,9 @@ pub(super) fn render(item: &Claimed, dashboard: &str) -> (String, String, String
     let amount_html=amount.as_ref().map(|n|format!("<p style=\"margin:0 0 24px;font-size:32px;line-height:1.2;font-weight:700;font-variant-numeric:tabular-nums;color:#0f172a;overflow-wrap:anywhere\">{}</p>",escape_html(n))).unwrap_or_default();
     let facts=rows.iter().map(|(k,v)|format!("<tr><th align=\"left\" valign=\"top\" style=\"padding:8px 16px 8px 0;color:#475569;font-size:13px;font-weight:400\">{}</th><td align=\"right\" style=\"padding:8px 0;color:#0f172a;font-size:14px;word-break:break-all\">{}</td></tr>",escape_html(k),escape_html(v))).collect::<String>();
     let url = destination(item, dashboard);
-    let cta = if item.event_kind.starts_with("c2c_order") {
+    let cta = if item.event_kind.starts_with("client_termination_") {
+        "View termination"
+    } else if item.event_kind.starts_with("c2c_order") {
         "View order"
     } else if item.event_kind.starts_with("topup_") {
         "View top-up"
