@@ -33,6 +33,7 @@ export function NotificationsBell() {
   const [panelOffset, setPanelOffset] = React.useState(0);
   const rootRef = React.useRef<HTMLDivElement>(null);
   const triggerRef = React.useRef<HTMLButtonElement>(null);
+  const listRef = React.useRef<HTMLUListElement>(null);
   const versionRef = React.useRef(0);
   const busyRef = React.useRef(false);
   const loadingRef = React.useRef(false);
@@ -71,7 +72,7 @@ export function NotificationsBell() {
     if (!open) return;
     const placePanel = () => {
       const right = rootRef.current?.getBoundingClientRect().right ?? window.innerWidth;
-      const width = Math.min(384, window.innerWidth - 32);
+      const width = Math.min(320, window.innerWidth - 32);
       setPanelOffset(Math.max(0, width + 16 - right));
     };
     placePanel();
@@ -146,6 +147,17 @@ export function NotificationsBell() {
     }
   };
 
+  React.useEffect(() => {
+    const list = listRef.current;
+    if (!open || !cursor || !list) return;
+    const onScroll = () => {
+      if (list.scrollTop + list.clientHeight < list.scrollHeight - 96) return;
+      void loadMore();
+    };
+    list.addEventListener("scroll", onScroll, { passive: true });
+    return () => list.removeEventListener("scroll", onScroll);
+  }, [cursor, loadMore, open]);
+
   const label = unread > 0 ? t("notificationCenter.bellUnread", { count: unread }) : t("notificationCenter.bell");
 
   return (
@@ -156,9 +168,9 @@ export function NotificationsBell() {
         {unread > 0 ? <span className="absolute right-1 top-1 inline-flex min-w-4 items-center justify-center rounded-full bg-rose-600 px-1 text-[0.65rem] font-semibold leading-4 text-white" aria-hidden="true">{unread > 99 ? "99+" : unread}</span> : null}
       </button>
       <div id={panelId} role="region" aria-label={t("notificationCenter.title")} hidden={!open} style={{ right: -panelOffset }}
-        className="absolute right-0 top-full z-40 mt-2 w-[min(24rem,calc(100vw-2rem))] overflow-hidden rounded-2xl border border-border bg-card shadow-[0_20px_25px_rgba(0,0,0,0.1)] animate-fade-in-up">
-        <div className="flex items-center justify-between gap-2 border-b border-border px-4 py-3">
-          <h2 className="text-sm font-semibold">{t("notificationCenter.title")}</h2>
+        className="absolute right-0 top-full z-40 mt-2 w-[min(20rem,calc(100vw-2rem))] overflow-hidden rounded-xl border border-border bg-card shadow-[0_16px_24px_rgba(0,0,0,0.1)] animate-fade-in-up">
+        <div className="flex items-center gap-1 border-b border-border px-3 py-1.5">
+          <h2 className="min-w-0 flex-1 truncate text-sm font-semibold">{t("notificationCenter.title")}</h2>
           <button type="button" disabled={loading || !!busyId} onClick={() => void load()} aria-label={t("common.reload")} title={t("common.reload")}
             className="ml-auto inline-flex size-11 shrink-0 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring disabled:opacity-40">
             <RefreshCw className="size-3.5" aria-hidden="true" />
@@ -171,7 +183,7 @@ export function NotificationsBell() {
         </div>
         <p className="sr-only" aria-live="polite">{loading ? t("common.loading") : ""}</p>
         {error ? <p role="alert" className="px-4 py-2 text-xs text-destructive">{t("notificationCenter.unavailable")}</p> : null}
-        <ul className="max-h-[60vh] divide-y divide-border overflow-y-auto overscroll-contain">
+        <ul ref={listRef} className="max-h-[min(24rem,calc(100vh-8rem))] divide-y divide-border overflow-y-auto overscroll-contain">
           {items.map((item) => {
             const amount = payloadAmount(item.payload);
             return <li key={item.id} className={cn("flex items-start gap-3 px-4 py-3 text-sm", !item.readAt && "bg-accent/[0.03]")}>
@@ -191,7 +203,7 @@ export function NotificationsBell() {
                 {item.eventKind === "wallet_transfer_sent" || item.eventKind === "wallet_transfer_received" ? <p className="mt-1 break-all text-xs text-muted-foreground">{String(item.payload[item.eventKind === "wallet_transfer_sent" ? "recipientEmail" : "senderEmail"] ?? "")}</p> : null}
                 {item.eventKind === "commission_policy_changed" && typeof item.payload.rateBps === "number" && typeof item.payload.effectiveAt === "string" && Number.isFinite(Date.parse(item.payload.effectiveAt)) ? <p className="mt-1 text-xs leading-5 text-muted-foreground">{t("commission.scheduled", { rate: (item.payload.rateBps / 100).toString(), time: new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(item.payload.effectiveAt)) })}</p> : null}
                 {item.category !== "system" || session?.isAdmin ? (
-                  <a href={notificationHref(item)} className="mt-1 inline-flex min-h-11 items-center text-xs text-primary underline underline-offset-2">{t("notificationCenter.view")}</a>
+                  <a href={notificationHref(item)} className="mt-1 inline-flex min-h-8 items-center text-xs text-primary underline underline-offset-2">{t("notificationCenter.view")}</a>
                 ) : null}
               </div>
               {!item.readAt ? <button type="button" aria-label={t("marketNotifications.markRead")} title={t("marketNotifications.markRead")} disabled={!!busyId} onClick={() => void markRead(item.id)}
@@ -201,10 +213,8 @@ export function NotificationsBell() {
             </li>;
           })}
           {!loading && !items.length ? <li className="px-4 py-6 text-center text-sm text-muted-foreground">{t("marketNotifications.empty")}</li> : null}
+          {cursor && loading ? <li className="flex min-h-8 items-center justify-center" aria-hidden="true"><Loader2 className="size-3.5 animate-spin motion-reduce:animate-none text-muted-foreground" /></li> : null}
         </ul>
-        {cursor ? <div className="border-t border-border px-4 py-2">
-          <button type="button" disabled={loading || !!busyId} onClick={() => void loadMore()} className="inline-flex min-h-11 w-full items-center justify-center rounded-lg text-xs font-medium text-accent hover:bg-accent/5 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:opacity-50">{t("marketWallet.more")}</button>
-        </div> : null}
       </div>
     </div>
   );

@@ -189,7 +189,8 @@ try {
       return rect.left >= 15 && rect.right <= innerWidth - 15;
     });
   }
-  await center.getByRole("button", { name: "Load more", exact: true }).click();
+  const list = center.locator("ul");
+  await list.evaluate((node) => { node.scrollTop = node.scrollHeight; node.dispatchEvent(new Event("scroll")); });
   await center.getByText("older-client", { exact: true }).waitFor();
   assert.ok(feedRequests.includes("?cursor=older-page"));
   const oldCount = await center.locator("li").count();
