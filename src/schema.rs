@@ -2422,16 +2422,29 @@ mod tests {
             )
             .expect("count retired schema objects");
         assert_eq!(legacy_objects, 0);
-        let job_indexes = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master
-                 WHERE type = 'index' AND tbl_name = 'provisioning_jobs'
-                   AND name NOT LIKE 'sqlite_%'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .expect("count rebuilt job indexes");
-        assert_eq!(job_indexes, 5);
+        // apply() upgrades through the latest migration. Later migrations may
+        // add indexes, so verify the indexes rebuilt by migration 13 directly
+        // rather than fixing the final table's total index count forever.
+        for index in [
+            "idx_provisioning_jobs_client",
+            "idx_provisioning_jobs_host",
+            "idx_provisioning_jobs_active_host",
+            "idx_provisioning_jobs_batch_status",
+            "idx_provisioning_jobs_running_lease",
+        ] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                     WHERE type = 'index' AND tbl_name = 'provisioning_jobs' AND name = ?1)",
+                    params![index],
+                    |row| row.get(0),
+                )
+                .expect("inspect rebuilt job index");
+            assert!(
+                exists,
+                "migration 13 index {index} is missing after upgrade"
+            );
+        }
         let error = conn
             .execute(
                 "INSERT INTO provisioning_jobs
