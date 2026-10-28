@@ -4,6 +4,7 @@ import {
   clientCheckoutState,
   preserveClientDrafts,
   trialHours,
+  trialDuration,
   walletLifecycleKey,
   walletReleaseScheduled,
 } from "./client-checkout";
@@ -25,6 +26,8 @@ const quote: ClientMarketAllocationQuote = {
       cyclePriceMinor: 1000,
       offerRevision: 2,
       trialSecondsRemaining: 43200,
+      trialAllowanceSeconds: 43200,
+      trialSecondsConsumed: 0,
     },
   ],
   walletFunding: {
@@ -46,7 +49,7 @@ test("trial defers payment but still requires the first-period balance", () => {
   });
   const exhausted = {
     ...quote,
-    items: quote.items.map((item) => ({ ...item, trialSecondsRemaining: 0 })),
+    items: quote.items.map((item) => ({ ...item, trialSecondsRemaining: 0, trialSecondsConsumed: 43200 })),
     walletFunding: {
       ...quote.walletFunding!,
       availableUnits: "0",
@@ -61,6 +64,10 @@ test("trial defers payment but still requires the first-period balance", () => {
     shortfall: true,
   });
   assert.equal(trialHours(1, "en"), "0.01");
+  assert.equal(trialDuration(1, "en"), "1 sec");
+  assert.equal(trialDuration(0, "zh-CN"), "0秒");
+  assert.equal(trialDuration(3661, "zh-CN"), "1小时 1分钟 1秒");
+  assert.equal(trialDuration(-1, "en"), "—");
   assert.equal(clientCheckoutState({ ...quote, walletFunding: { ...quote.walletFunding!, availableUnits: "0", shortfallUnits: "86400000" } }).shortfall, true);
   assert.equal(clientCheckoutState({ ...quote, walletFunding: { ...quote.walletFunding!, requiredUnits: "0" } }).unsupported, true);
 });
@@ -109,6 +116,22 @@ test("requote preserves entries by Host, never moves a password to a different H
   const preserved = preserveClientDrafts(quote, { item: draft });
   assert.deepEqual(preserved.host, draft);
   assert.equal(preserved["different-host"], undefined);
+});
+
+test("trial scope accounting fails closed rather than promising an unknown free window", () => {
+  for (const patch of [
+    { trialAllowanceSeconds: undefined }, { trialSecondsConsumed: undefined },
+    { trialAllowanceSeconds: -1 }, { trialAllowanceSeconds: 2592001 },
+    { trialSecondsConsumed: -1 }, { trialSecondsRemaining: 0 },
+    { trialSecondsRemaining: 0.5 }, { trialAllowanceSeconds: Infinity },
+  ]) {
+    const item = { ...quote.items[0], ...patch } as typeof quote.items[number];
+    assert.equal(clientCheckoutState({ ...quote, items: [item] }).unsupported, true);
+  }
+  for (const consumed of [0, 1, 7200]) {
+    const item = { ...quote.items[0], trialAllowanceSeconds: 0, trialSecondsConsumed: consumed, trialSecondsRemaining: 0 };
+    assert.equal(clientCheckoutState({ ...quote, items: [item] }).unsupported, false);
+  }
 });
 
 test("malformed Client funding cannot throw or enable checkout", () => {

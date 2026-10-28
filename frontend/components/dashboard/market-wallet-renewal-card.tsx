@@ -1,6 +1,7 @@
 "use client";
 
 import { walletLifecycleKey, trialHours } from "@/lib/client-checkout";
+import { ClientNextTrialNotice } from "@/components/dashboard/client-market/client-next-trial-notice";
 import * as React from "react";
 import Link from "next/link";
 import { Button } from "@heroui/react";
@@ -79,6 +80,7 @@ export function MarketWalletRenewalCard({
       {t(contract.renewalPolicy === "automatic" ? "marketWallet.renewal.stop" : "marketWallet.renewal.start")}
     </Button> : null}
     <Link className="font-medium text-primary hover:underline" href={DASHBOARD_ACCOUNT_WALLET_PATH}>{t("marketWallet.renewal.wallet")}</Link>
+    {!compact ? <ClientNextTrialNotice trial={contract.nextRentalTrial} className="basis-full" /> : null}
     {error ? <span role="alert" className="basis-full text-xs text-destructive">{error}</span> : null}
   </div>;
 }

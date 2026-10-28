@@ -24,8 +24,10 @@ export function clientCheckoutState(quote: ClientMarketAllocationQuote) {
       !validPaidWalletQuoteFunding(quote.walletFunding, paid.reduce((sum, item) => sum + (item.cyclePriceMinor ?? item.dailyRateMinor ?? 0), 0)) ||
       paid.some(
         (item) =>
-          !Number.isFinite(item.trialSecondsRemaining) ||
-          item.trialSecondsRemaining < 0,
+          ![item.trialSecondsRemaining, item.trialAllowanceSeconds, item.trialSecondsConsumed]
+            .every((seconds) => Number.isSafeInteger(seconds) && seconds >= 0) ||
+          item.trialAllowanceSeconds > 30 * 86400 ||
+          item.trialSecondsRemaining !== Math.max(0, item.trialAllowanceSeconds - item.trialSecondsConsumed),
       ));
   return {
     paid: paid.length > 0,
@@ -81,6 +83,20 @@ export function trialHours(seconds: number, locale: string) {
   return (Math.ceil(Math.max(0, seconds) / 36) / 100).toLocaleString(locale, {
     maximumFractionDigits: 2,
   });
+}
+
+/** Exact whole-second display; a positive allowance never rounds to zero. */
+export function trialDuration(seconds: number, locale: string) {
+  if (!Number.isSafeInteger(seconds) || seconds < 0) return "—";
+  const parts: string[] = [];
+  for (const [unit, size] of [["hour", 3600], ["minute", 60], ["second", 1]] as const) {
+    const value = Math.floor(seconds / size);
+    seconds %= size;
+    if (value || (unit === "second" && !parts.length)) {
+      parts.push(new Intl.NumberFormat(locale, { style: "unit", unit, unitDisplay: "short" }).format(value));
+    }
+  }
+  return parts.join(" ");
 }
 
 /** Disabling renewal keeps an already-paid monthly service until its period end. */

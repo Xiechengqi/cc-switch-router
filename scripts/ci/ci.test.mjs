@@ -47,6 +47,7 @@ test("parallel CI retains every existing financial gate and separates profile ca
     assert.ok(job("frontend").includes(`npm run ${command}`), `lost frontend gate: ${command}`);
   }
   assert.match(job("rust-tests"), /cargo test --locked market_ -- --skip schema::tests/);
+  assert.ok(job("frontend").includes("npm run test:client-checkout-browser"), "lost Client trial checkout browser gate");
   assert.match(job("rust-tests"), /cargo test --locked share_market::tests/);
   assert.match(job("rust-tests"), /cargo test --locked client_market::tests/);
   assert.match(job("rust-tests"), /cargo test --locked client_termination_chat_/);

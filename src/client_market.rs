@@ -12040,6 +12040,152 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_trial_reset_invalidates_an_old_quote_without_partial_commit() {
+        use crate::client_market_trade::CreateQuoteRequest;
+        use crate::market_platform_contracts::{self as contracts, BillingModel, PrepareContract};
+        let (store, _config, root) = test_store("trial-reset-stale-quote");
+        let host = add_provider_host(
+            &store,
+            "trial-provider",
+            "trial-provider@example.com",
+            "198.18.21.20",
+            "US",
+            None,
+        )
+        .await;
+        let buyer = market_session("trial-buyer", "trial-buyer@example.com");
+        let now = Utc::now().to_rfc3339();
+        let contract = {
+            let conn = store.conn.lock().await;
+            conn.execute("UPDATE market_finance_control SET mode='enabled',cutover_approved_at=?1 WHERE id=1", params![now]).unwrap();
+            conn.execute("UPDATE router_ssh_hosts SET funding_rail='platform_wallet',pricing_model='prepaid_calendar_month',cycle_price_minor=1000,billing_interval='calendar_month',currency='USD' WHERE id=?1", params![host.id]).unwrap();
+            crate::market_wallet::credit_verified_topup_tx(
+                &conn,
+                &buyer.user_id,
+                "initial",
+                2000,
+                "receipt",
+                &now,
+            )
+            .unwrap();
+            contracts::prepare_contract_tx(
+                &conn,
+                &PrepareContract {
+                    product_kind: "client_host",
+                    product_ref: "previous-job",
+                    trial_scope_ref: &host.id,
+                    quote_id: "previous-quote",
+                    buyer_user_id: &buyer.user_id,
+                    provider_user_id: "trial-provider",
+                    offer_revision: 1,
+                    billing_model: BillingModel::CalendarMonth,
+                    price_minor: 1000,
+                    auto_renew: false,
+                    trial_seconds: 0,
+                    trial_allowance_seconds: 12 * 3600,
+                },
+                &now,
+            )
+            .unwrap()
+        };
+        let request = || CreateQuoteRequest {
+            provider_ids: vec![],
+            country_codes: vec![],
+            count: 1,
+            host_id: Some(host.id.clone()),
+        };
+        let quote = store
+            .client_market_create_quote(&buyer, request())
+            .await
+            .unwrap();
+        // An in-flight real rent debit completes after the quote was issued.
+        {
+            let conn = store.conn.lock().await;
+            let tx = conn.transaction().unwrap();
+            contracts::activate_contract_tx(&tx, &contract, &now, &now).unwrap();
+            tx.commit().unwrap();
+        }
+        let error = store
+            .client_market_commit_quote(
+                &quote.id,
+                &buyer,
+                &[(
+                    quote.items[0].id.clone(),
+                    "stale-trial-client".into(),
+                    "password".into(),
+                    quote.items[0].offer_revision,
+                )],
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AppError::Conflict(ref message) if message.contains("trial allowance changed"))
+        );
+        {
+            let conn = store.conn.lock().await;
+            for table in [
+                "provisioning_jobs",
+                "client_market_batches",
+                "subdomain_reservations",
+            ] {
+                assert_eq!(
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    0,
+                    "{table}"
+                );
+            }
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM market_platform_contracts", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap(),
+                1
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT status FROM client_market_allocation_quotes WHERE id=?1",
+                    params![quote.id],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+                "active"
+            );
+            let wallet = crate::market_wallet::wallet_snapshot_tx(&conn, &buyer.user_id).unwrap();
+            assert_eq!(
+                (wallet.available_units, wallet.held_units),
+                (1000 * 86400, 0)
+            );
+            crate::market_wallet::reconcile_wallet_tx(&conn, &buyer.user_id).unwrap();
+        }
+        store
+            .client_market_cancel_quote(&quote.id, &buyer)
+            .await
+            .unwrap();
+        let current = store
+            .client_market_create_quote(&buyer, request())
+            .await
+            .unwrap();
+        assert_eq!(current.items[0].trial_allowance_seconds, 12 * 3600);
+        assert_eq!(current.items[0].trial_seconds_consumed, 0);
+        assert_eq!(current.items[0].trial_seconds_remaining, 12 * 3600);
+        let conn = store.conn.lock().await;
+        assert_eq!(
+            conn.query_row(
+                "SELECT wallet_trial_epoch FROM client_market_allocation_quote_items WHERE id=?1",
+                params![current.items[0].id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        drop(conn);
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn host_trial_overrides_are_owned_versioned_and_zero_disables_the_trial() {
         use crate::client_market_trade::CreateQuoteRequest;
         let (store, _config, root) = test_store("client-trial-overrides");

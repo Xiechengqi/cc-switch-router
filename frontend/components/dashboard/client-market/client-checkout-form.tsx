@@ -9,7 +9,7 @@ import { formatHostOffer } from "./host-utils";
 import { formatWalletUnits } from "@/lib/market-wallet-money";
 import {
   clientCheckoutState,
-  trialHours,
+  trialDuration,
   type ClientDraft,
   type ClientSubdomainCheck,
 } from "@/lib/client-checkout";
@@ -178,19 +178,23 @@ export function ClientCheckoutForm({
                 {t("createClient.passwordHint")}
               </span>
             </div>
-            {item.trialSecondsRemaining > 0 && !state.unsupported ? (
-              <div className="grid gap-1 text-sm">
-                <strong>
-                  {t("clientCheckout.trial", {
-                    hours: trialHours(item.trialSecondsRemaining, locale),
-                  })}
-                </strong>
-                <p className="text-xs text-muted-foreground">
-                  {t("clientCheckout.trialHint")}
-                </p>
-                <p className="text-xs text-muted-foreground">
-                  {t("clientCheckout.trialCharge", { price })}
-                </p>
+            {(item.cyclePriceMinor != null || item.dailyRateMinor != null) && !state.unsupported ? (
+              <div className="grid gap-2 rounded-lg bg-muted p-3 text-sm" data-client-trial>
+                <dl className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
+                  {([
+                    ["clientTrial.allowance", item.trialAllowanceSeconds],
+                    ["clientTrial.consumed", item.trialSecondsConsumed],
+                    ["clientTrial.remaining", item.trialSecondsRemaining],
+                  ] as const).map(([key, value]) => <React.Fragment key={key}>
+                    <dt className="text-muted-foreground">{t(key)}</dt>
+                    <dd className="text-right font-medium tabular-nums">{trialDuration(value, locale)}</dd>
+                  </React.Fragment>)}
+                </dl>
+                <p className="text-xs leading-5">{item.trialAllowanceSeconds === 0
+                  ? t("clientTrial.disabled") : item.trialSecondsRemaining > 0
+                    ? t("clientCheckout.trialHint") : t("clientTrial.exhausted", { price })}</p>
+                {item.trialSecondsRemaining > 0 ? <p className="text-xs leading-5 text-muted-foreground">{t("clientCheckout.trialCharge", { price })}</p> : null}
+                <p className="text-xs leading-5 text-muted-foreground">{t("clientTrial.rules")}</p>
               </div>
             ) : null}
             {item.pricingModel === "prepaid_calendar_month" &&

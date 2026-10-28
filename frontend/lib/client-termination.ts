@@ -2,7 +2,7 @@ import { authFetch } from "@/lib/auth";
 import { parseJson } from "@/lib/api";
 
 export type ClientTerminationPolicy = { version: number; rateBps: number; canEdit?: boolean };
-export type ClientTerminationPreview = { previewId: string; expiresAt: string; policyVersion: number; rateBps: number; periodAmountUnits: string; remainingUnits: string; compensationUnits: string; returnUnits: string };
+export type ClientTerminationPreview = { previewId: string; expiresAt: string; policyVersion: number; rateBps: number; periodAmountUnits: string; remainingUnits: string; compensationUnits: string; returnUnits: string; nextRentalTrial?: import("./types").ClientTrialState; trialSecondsRemaining?: number | null };
 export type ClientTerminationRequest = { previewId: string; reason: "voluntary" | "provider_issue" | "platform_issue"; claim: string };
 export type ClientTerminationResolution = "provider_waiver" | "owner_decision" | "buyer_withdrawal" | "timeout_waiver";
 export type ClientTermination = {

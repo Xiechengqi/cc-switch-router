@@ -126,6 +126,71 @@ fn assert_clean(conn: &Connection, at: &str) {
     );
 }
 
+fn assert_trial_restored_once(conn: &Connection) {
+    let trial =
+        crate::market_client_trials::state_tx(conn, "buyer", "provider", HOST, 43200).unwrap();
+    assert_eq!(
+        (trial.epoch, trial.consumed_seconds, trial.remaining_seconds),
+        (1, 0, 43200)
+    );
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM client_market_trial_resets", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn paid_trial_restoration_survives_full_wallet_return_and_zero_or_partial_compensation() {
+    for rate in [0, 725, 1000] {
+        for reason in ["voluntary", "provider_issue", "platform_issue"] {
+            let (conn, id) = fixture_with_rate(5, true, 0, rate);
+            assert_trial_restored_once(&conn);
+            let preview = preview_tx(&conn, INSTALL, "buyer", START).unwrap();
+            assert!(preview.next_rental_trial.is_some());
+            assert_eq!(preview.trial_seconds_remaining, Some(0));
+            let t = accept(&conn, START, reason);
+            cleanup_failed_tx(&conn, INSTALL, START).unwrap();
+            assert_trial_restored_once(&conn);
+            cleanup_confirmed_tx(&conn, INSTALL, HOST, START).unwrap();
+            if reason != "voluntary" && rate > 0 {
+                let t = by_id_tx(&conn, &t.id).unwrap();
+                decide_tx(
+                    &conn,
+                    &t.id,
+                    "provider",
+                    false,
+                    &Decision {
+                        expected_version: t.version,
+                        award_units: "0".into(),
+                        responsibility: "provider".into(),
+                        note: "Provider waives all compensation".into(),
+                    },
+                    START,
+                )
+                .unwrap();
+            }
+            cleanup_confirmed_tx(&conn, INSTALL, HOST, START).unwrap();
+            assert_trial_restored_once(&conn);
+            if reason != "voluntary" || rate == 0 {
+                assert_eq!(
+                    wallet_snapshot_tx(&conn, "buyer").unwrap().available_units,
+                    units_from_minor(5).unwrap()
+                );
+            }
+            assert_eq!(
+                contracts::wallet_lifecycle_view_tx(&conn, &id, "buyer")
+                    .unwrap()
+                    .unwrap()
+                    .trial_seconds_remaining,
+                0
+            );
+            assert_clean(&conn, START);
+        }
+    }
+}
+
 #[test]
 fn precise_compensation_is_capped_and_never_rounded_to_cents() {
     let p = units_from_minor(10000).unwrap();
@@ -208,6 +273,16 @@ fn no_compensation_issue_does_not_create_a_financial_claim_or_owner_task() {
         assert_eq!(t.responsibility, "none");
         assert!(!t.dispute_used && t.dispute_deadline_at.is_none());
         assert_eq!(t.status, "completed");
+        if trial > 0 {
+            assert_eq!(
+                crate::market_client_trials::state_tx(&conn, "buyer", "provider", HOST, 43200)
+                    .unwrap()
+                    .epoch,
+                0
+            );
+        } else {
+            assert_trial_restored_once(&conn);
+        }
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM market_notification_outbox WHERE event_kind='client_termination_claim'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
         assert_clean(&conn, START);
     }
@@ -235,6 +310,7 @@ fn unanswered_claims_waive_exact_remaining_compensation_at_72_hours_once() {
         assert_eq!(result.compensation_units + result.held_units, 0);
         assert_eq!(result.resolution.as_deref(), Some("timeout_waiver"));
         assert_eq!(result.responsibility, "none");
+        assert_trial_restored_once(&conn);
         assert_eq!(expire_disputes_isolated(&conn, &deadline, 50).unwrap(), 0);
         assert_eq!(
             conn.query_row(
@@ -401,6 +477,7 @@ fn formal_provider_response_or_partial_waiver_stops_timeout_but_never_awards_dis
             .is_err()
         );
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM market_notification_outbox WHERE event_kind='client_termination_claim'",[],|r|r.get::<_,i64>(0)).unwrap(),4);
+        assert_trial_restored_once(&conn);
         assert_clean(&conn, &later);
     }
 }
@@ -574,6 +651,7 @@ fn buyer_ending_claim_is_final_preserves_returns_and_awards_only_remaining_compe
         assert_eq!(t.returned_units, units_from_minor(7000).unwrap());
         assert_eq!(t.compensation_units, units_from_minor(1000).unwrap());
         assert_eq!(t.held_units, 0);
+        assert_trial_restored_once(&conn);
         assert!(
             withdraw_tx(
                 &conn,
@@ -797,6 +875,7 @@ fn claims_hold_only_compensation_and_owner_decision_starts_a_new_seven_day_windo
     let t = decide_tx(&conn, &t.id, "owner", true, &d, &decision_at).unwrap();
     assert_eq!(t.returned_units, units_from_minor(7500).unwrap());
     assert_eq!(t.held_units, 0);
+    assert_trial_restored_once(&conn);
     assert_eq!(
         time(t.unlock_at.as_deref().unwrap()).unwrap(),
         time(&decision_at).unwrap() + Duration::days(7)
@@ -1099,6 +1178,7 @@ fn waived_award_reverses_only_the_compensation_and_never_resets_service_maturity
     .unwrap();
     assert_eq!(t.compensation_units, units_from_minor(500).unwrap());
     assert_eq!(t.returned_units, units_from_minor(7500).unwrap());
+    assert_trial_restored_once(&conn);
     assert_eq!(
         service_unlock,
         conn.query_row(

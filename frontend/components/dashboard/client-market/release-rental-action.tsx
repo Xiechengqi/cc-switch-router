@@ -312,6 +312,8 @@ export function ReleaseRentalAction({
                 ] as const).map(([key, amount]) => <React.Fragment key={key}><dt>{t(key)}</dt><dd className="text-right font-medium">{formatWalletUnits(amount, "$", locale)}</dd></React.Fragment>)}
               </dl>
               <p className="text-xs text-muted-foreground">{preview.policyVersion === 0 ? t("clientTermination.noRetroactive") : t("clientTermination.purchaseTerms", { rate: String(preview.rateBps / 100) })}</p>
+              {preview.nextRentalTrial ? <p className="text-xs leading-5 text-muted-foreground">{t("clientTrial.releasePaid")}</p>
+                : preview.trialSecondsRemaining != null ? <p className="text-xs leading-5 text-muted-foreground">{t("clientTrial.releaseUnpaid")}</p> : null}
               <label className="grid gap-1 text-sm">{t("clientTermination.reason")}<select className={WALLET_INPUT} value={reason} onChange={e => setReason(e.target.value as ClientTerminationRequest["reason"])}>
                 <option value="voluntary">{t("clientTermination.voluntary")}</option><option value="provider_issue">{t("clientTermination.providerIssue")}</option><option value="platform_issue">{t("clientTermination.platformIssue")}</option>
               </select></label>

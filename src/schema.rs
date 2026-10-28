@@ -327,6 +327,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         95,
         include_str!("../schema/0095_client_market_termination.sql"),
     ),
+    (
+        96,
+        include_str!("../schema/0096_client_market_trial_resets.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -836,8 +840,9 @@ fn migration_checksum(sql: &str) -> String {
 mod tests {
     use super::*;
 
-    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 257;
+    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 259;
 
+    mod client_trials;
     mod notification_safety;
     mod suspension;
 

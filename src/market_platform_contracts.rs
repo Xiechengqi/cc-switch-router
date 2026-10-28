@@ -41,6 +41,8 @@ struct WalletRenewalView {
     status: String,
     period_end: Option<String>,
     trial_seconds_remaining: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_rental_trial: Option<crate::market_client_trials::TrialState>,
 }
 
 /// Buyer-only lifecycle projection shared by rental details and wallet controls.
@@ -52,6 +54,8 @@ pub struct WalletLifecycleView {
     pub trial_seconds_remaining: i64,
     pub renewal_policy: String,
     pub period_end: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_rental_trial: Option<crate::market_client_trials::TrialState>,
 }
 
 pub(crate) fn wallet_lifecycle_view_tx(
@@ -59,24 +63,30 @@ pub(crate) fn wallet_lifecycle_view_tx(
     id: &str,
     buyer: &str,
 ) -> Result<Option<WalletLifecycleView>, AppError> {
-    conn.query_row(
-        "SELECT status, trial_seconds_remaining, renewal_policy,
+    let mut view = conn
+        .query_row(
+            "SELECT status, trial_seconds_remaining, renewal_policy,
                 (SELECT period_end FROM market_platform_periods
                  WHERE contract_id = contract.id AND sequence = contract.current_period_sequence)
          FROM market_platform_contracts contract WHERE id = ?1 AND buyer_user_id = ?2",
-        params![id, buyer],
-        |row| {
-            Ok(WalletLifecycleView {
-                id: id.to_string(),
-                status: row.get(0)?,
-                trial_seconds_remaining: row.get(1)?,
-                renewal_policy: row.get(2)?,
-                period_end: row.get(3)?,
-            })
-        },
-    )
-    .optional()
-    .map_err(db_error("read wallet service lifecycle"))
+            params![id, buyer],
+            |row| {
+                Ok(WalletLifecycleView {
+                    id: id.to_string(),
+                    status: row.get(0)?,
+                    trial_seconds_remaining: row.get(1)?,
+                    renewal_policy: row.get(2)?,
+                    period_end: row.get(3)?,
+                    next_rental_trial: None,
+                })
+            },
+        )
+        .optional()
+        .map_err(db_error("read wallet service lifecycle"))?;
+    if let Some(view) = view.as_mut() {
+        view.next_rental_trial = crate::market_client_trials::for_contract_tx(conn, id)?;
+    }
+    Ok(view)
 }
 
 #[derive(Deserialize)]
@@ -91,30 +101,34 @@ fn wallet_renewal_view_tx(
     contract_id: &str,
     buyer: &str,
 ) -> Result<WalletRenewalView, AppError> {
-    conn.query_row(
-        "SELECT id, product_kind, billing_model, cycle_price_minor, renewal_policy, status,
+    let mut view = conn
+        .query_row(
+            "SELECT id, product_kind, billing_model, cycle_price_minor, renewal_policy, status,
                 (SELECT period_end FROM market_platform_periods
                  WHERE contract_id = contract.id AND sequence = contract.current_period_sequence),
                 trial_seconds_remaining
          FROM market_platform_contracts contract WHERE id = ?1 AND buyer_user_id = ?2
            AND billing_model = 'calendar_month'",
-        params![contract_id, buyer],
-        |row| {
-            Ok(WalletRenewalView {
-                id: row.get(0)?,
-                product_kind: row.get(1)?,
-                billing_model: row.get(2)?,
-                cycle_price_minor: row.get(3)?,
-                renewal_policy: row.get(4)?,
-                status: row.get(5)?,
-                period_end: row.get(6)?,
-                trial_seconds_remaining: row.get(7)?,
-            })
-        },
-    )
-    .optional()
-    .map_err(db_error("read wallet renewal policy"))?
-    .ok_or_else(|| AppError::NotFound("monthly wallet contract not found".into()))
+            params![contract_id, buyer],
+            |row| {
+                Ok(WalletRenewalView {
+                    id: row.get(0)?,
+                    product_kind: row.get(1)?,
+                    billing_model: row.get(2)?,
+                    cycle_price_minor: row.get(3)?,
+                    renewal_policy: row.get(4)?,
+                    status: row.get(5)?,
+                    period_end: row.get(6)?,
+                    trial_seconds_remaining: row.get(7)?,
+                    next_rental_trial: None,
+                })
+            },
+        )
+        .optional()
+        .map_err(db_error("read wallet renewal policy"))?
+        .ok_or_else(|| AppError::NotFound("monthly wallet contract not found".into()))?;
+    view.next_rental_trial = crate::market_client_trials::for_contract_tx(conn, contract_id)?;
+    Ok(view)
 }
 
 fn set_wallet_renewal_tx(
@@ -549,6 +563,16 @@ pub(crate) fn trial_seconds_remaining_tx(
     if offered_seconds == 0 {
         return Ok(0);
     }
+    if product_kind == "client_host" {
+        return Ok(crate::market_client_trials::state_tx(
+            conn,
+            buyer_user_id,
+            provider_user_id,
+            trial_scope_ref,
+            offered_seconds,
+        )?
+        .remaining_seconds);
+    }
     let consumed: i64 = conn
         .query_row(
             "SELECT COALESCE(SUM(segment.consumed_seconds), 0)
@@ -623,6 +647,16 @@ pub(crate) fn prepare_contract_tx(
         }
         return Ok(id);
     }
+    let client_trial_epoch = if input.product_kind == "client_host" {
+        crate::market_client_trials::epoch_tx(
+            conn,
+            input.buyer_user_id,
+            input.provider_user_id,
+            input.trial_scope_ref,
+        )?
+    } else {
+        0
+    };
     crate::market_payments::require_new_wallet_orders_open_tx(conn)?;
     crate::market_reconcile::ensure_finance_scopes_safe_tx(
         conn,
@@ -699,9 +733,9 @@ pub(crate) fn prepare_contract_tx(
             buyer_user_id, provider_user_id, offer_revision, billing_model,
             daily_rate_minor, cycle_price_minor, renewal_policy, status,
             activation_hold_id, budget_hold_id, budget_sequence,
-            trial_seconds_remaining, created_at, updated_at
+            trial_seconds_remaining, client_trial_epoch, created_at, updated_at
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                   'pending_activation', ?14, ?15, ?16, ?17, ?18, ?18)",
+                   'pending_activation', ?14, ?15, ?16, ?17, ?18, ?19, ?19)",
         params![
             id,
             input.product_kind,
@@ -732,6 +766,7 @@ pub(crate) fn prepare_contract_tx(
                 0
             },
             input.trial_seconds,
+            client_trial_epoch,
             now,
         ],
     )
@@ -866,6 +901,7 @@ pub(crate) fn activate_contract_tx(
             ],
         )
         .map_err(db_error("create first wallet service period"))?;
+        crate::market_client_trials::paid_month_tx(conn, contract_id, &period_id, now)?;
         crate::client_market_termination::freeze_period_tx(
             conn,
             contract_id,
@@ -1086,6 +1122,7 @@ pub(crate) fn start_paid_trial_tx(
             ],
         )
         .map_err(db_error("create first paid period after trial"))?;
+        crate::market_client_trials::paid_month_tx(conn, contract_id, &period_id, now)?;
         crate::client_market_termination::freeze_period_tx(
             conn,
             contract_id,
@@ -1691,6 +1728,9 @@ pub(crate) fn settle_metered_batch_tx(
         ],
     )
     .map_err(db_error("record wallet usage batch"))?;
+    if kind == "client_host" {
+        crate::market_client_trials::paid_metered_tx(conn, contract_id, &batch_id, now)?;
+    }
     for (observation_id, first_second, seconds) in items {
         conn.execute(
             "INSERT INTO market_platform_usage_batch_items (
@@ -2580,6 +2620,7 @@ pub(crate) fn renew_monthly_contract_tx(
         ],
     )
     .map_err(db_error("create renewed monthly period"))?;
+    crate::market_client_trials::paid_month_tx(conn, contract_id, &next_id, now)?;
     crate::client_market_termination::freeze_period_tx(
         conn,
         contract_id,

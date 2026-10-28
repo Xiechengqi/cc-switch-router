@@ -202,6 +202,7 @@ export type MarketWalletRenewal = {
   status: string;
   periodEnd: string | null;
   trialSecondsRemaining: number;
+  nextRentalTrial?: import("./types").ClientTrialState;
 };
 
 export async function getMarketWalletRenewal(contractId: string) {

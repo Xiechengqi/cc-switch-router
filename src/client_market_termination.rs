@@ -158,6 +158,9 @@ struct Preview {
     compensation_units: i64,
     #[serde(serialize_with = "serialize_units")]
     return_units: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_rental_trial: Option<crate::market_client_trials::TrialState>,
+    trial_seconds_remaining: Option<i64>,
 }
 fn preview_tx(
     conn: &Connection,
@@ -203,6 +206,24 @@ fn preview_tx(
         remaining_units: b.remaining,
         compensation_units: cap,
         return_units: b.remaining - cap,
+        next_rental_trial: b
+            .contract
+            .as_deref()
+            .map(|id| crate::market_client_trials::for_contract_tx(conn, id))
+            .transpose()?
+            .flatten(),
+        trial_seconds_remaining: b
+            .contract
+            .as_deref()
+            .map(|id| {
+                conn.query_row(
+                    "SELECT trial_seconds_remaining FROM market_platform_contracts WHERE id=?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+            })
+            .transpose()
+            .map_err(db_error("read termination trial remainder"))?,
     })
 }
 

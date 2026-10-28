@@ -249,6 +249,8 @@ pub struct QuoteItemView {
     pub free_duration_days: Option<u32>,
     pub offer_revision: i64,
     pub trial_seconds_remaining: i64,
+    pub trial_allowance_seconds: i64,
+    pub trial_seconds_consumed: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -943,13 +945,16 @@ async fn create_quote(
     State(state): State<ServerState>,
     headers: HeaderMap,
     Json(input): Json<CreateQuoteRequest>,
-) -> Result<Json<AllocationQuoteView>, AppError> {
+) -> Result<impl axum::response::IntoResponse, AppError> {
     let session = require_session(&state, &headers).await?;
     let quote = state
         .store
         .client_market_create_quote(&session, input)
         .await?;
-    Ok(Json(quote))
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "private, no-store")],
+        Json(quote),
+    ))
 }
 
 async fn commit_quote(
@@ -1097,13 +1102,16 @@ fn validate_client_password(password: &str) -> Result<(), AppError> {
 async fn list_my_rentals(
     State(state): State<ServerState>,
     headers: HeaderMap,
-) -> Result<Json<Vec<RentalView>>, AppError> {
+) -> Result<impl axum::response::IntoResponse, AppError> {
     let session = require_session(&state, &headers).await?;
-    Ok(Json(
-        state
-            .store
-            .client_market_list_rentals_for_viewer(&session)
-            .await?,
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "private, no-store")],
+        Json(
+            state
+                .store
+                .client_market_list_rentals_for_viewer(&session)
+                .await?,
+        ),
     ))
 }
 
@@ -1123,13 +1131,16 @@ async fn get_client_rental(
     State(state): State<ServerState>,
     headers: HeaderMap,
     AxumPath(installation_id): AxumPath<String>,
-) -> Result<Json<RentalView>, AppError> {
+) -> Result<impl axum::response::IntoResponse, AppError> {
     let session = require_session(&state, &headers).await?;
-    Ok(Json(
-        state
-            .store
-            .client_market_rental_for_viewer(&installation_id, &session)
-            .await?,
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "private, no-store")],
+        Json(
+            state
+                .store
+                .client_market_rental_for_viewer(&installation_id, &session)
+                .await?,
+        ),
     ))
 }
 
@@ -2532,15 +2543,16 @@ impl AppStore {
                         "wallet-funded Hosts must be priced in USD".into(),
                     ));
                 }
-                candidate.wallet_trial_seconds =
-                    crate::market_platform_contracts::trial_seconds_remaining_tx(
-                        &tx,
-                        &session.user_id,
-                        &candidate.provider_id,
-                        "client_host",
-                        &candidate.host_id,
-                        candidate.trial_hours * 3_600,
-                    )?;
+                let trial = crate::market_client_trials::state_tx(
+                    &tx,
+                    &session.user_id,
+                    &candidate.provider_id,
+                    &candidate.host_id,
+                    candidate.trial_hours * 3_600,
+                )?;
+                candidate.wallet_trial_seconds = trial.remaining_seconds;
+                candidate.wallet_trial_consumed_seconds = trial.consumed_seconds;
+                candidate.wallet_trial_epoch = trial.epoch;
             } else if candidate.provider_id != session.user_id
                 && let Some(days) = candidate.free_duration_days
                 && !crate::market_common::free_usage_available_tx(
@@ -2644,9 +2656,9 @@ impl AppStore {
                      country_code, hostname, daily_rate_minor, currency,
                      free_duration_days, offer_revision, pricing_model,
                      cycle_price_minor, billing_interval, wallet_trial_seconds,
-                     wallet_trial_allowance_seconds)
+                     wallet_trial_allowance_seconds, wallet_trial_epoch, wallet_trial_consumed_seconds)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                         ?13, ?14, ?15, ?16, ?17)",
+                         ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
                 params![
                     item_id,
                     quote_id,
@@ -2665,6 +2677,8 @@ impl AppStore {
                     candidate.billing_interval,
                     candidate.wallet_trial_seconds,
                     candidate.trial_hours * 3_600,
+                    candidate.wallet_trial_epoch,
+                    candidate.wallet_trial_consumed_seconds,
                 ],
             )
             .map_err(|error| AppError::Internal(format!("insert quote item failed: {error}")))?;
@@ -2684,6 +2698,8 @@ impl AppStore {
                 free_duration_days: candidate.free_duration_days,
                 offer_revision: candidate.offer_revision,
                 trial_seconds_remaining: candidate.wallet_trial_seconds,
+                trial_allowance_seconds: candidate.trial_hours * 3_600,
+                trial_seconds_consumed: candidate.wallet_trial_consumed_seconds,
             });
         }
         insert_audit_tx(
@@ -2945,7 +2961,7 @@ impl AppStore {
                     "SELECT host_id, provider_id, host_owner_email, country_code,
                             daily_rate_minor, pricing_model, cycle_price_minor,
                             billing_interval, currency, offer_revision,
-                            wallet_trial_seconds, wallet_trial_allowance_seconds
+                            wallet_trial_seconds, wallet_trial_allowance_seconds, wallet_trial_epoch
                      FROM client_market_allocation_quote_items
                      WHERE id = ?1 AND quote_id = ?2",
                     params![item_id, quote_id],
@@ -2963,6 +2979,7 @@ impl AppStore {
                             row.get::<_, i64>(9)?,
                             row.get::<_, i64>(10)?,
                             row.get::<_, i64>(11)?,
+                            row.get::<_, i64>(12)?,
                         ))
                     },
                 )
@@ -2978,6 +2995,13 @@ impl AppStore {
                 ));
             }
             if item.6.or(item.4).is_some() {
+                crate::market_client_trials::validate_quote_epoch_tx(
+                    &tx,
+                    &session.user_id,
+                    &item.1,
+                    &item.0,
+                    item.12,
+                )?;
                 let current_rail: String = tx
                     .query_row(
                         "SELECT funding_rail FROM router_ssh_hosts WHERE id = ?1",
@@ -3878,6 +3902,8 @@ struct QuoteCandidate {
     offer_revision: i64,
     funding_rail: String,
     wallet_trial_seconds: i64,
+    wallet_trial_consumed_seconds: i64,
+    wallet_trial_epoch: i64,
     trial_hours: i64,
 }
 
@@ -3900,6 +3926,8 @@ fn map_quote_candidate(row: &crate::db::Row<'_>) -> crate::db::Result<QuoteCandi
         offer_revision: row.get(12)?,
         funding_rail: row.get(13)?,
         wallet_trial_seconds: 0,
+        wallet_trial_consumed_seconds: 0,
+        wallet_trial_epoch: 0,
         trial_hours: row.get(14)?,
     })
 }

@@ -11,6 +11,7 @@ import { DASHBOARD_ACCOUNT_WALLET_PATH } from "@/lib/dashboard-nav";
 import { clientMarketCleanupReasonKey, clientMarketRentalHasBanner } from "@/lib/client-market-rental-state";
 import { cleanupFailureGuidanceKey } from "@/components/dashboard/client-market/host-utils";
 import type { ClientMarketRental } from "@/lib/types";
+import { ClientNextTrialNotice } from "@/components/dashboard/client-market/client-next-trial-notice";
 
 /** Rental and wallet lifecycle are separate from Client connection health. */
 export function ClientMarketRentalBanner({
@@ -92,6 +93,7 @@ export function ClientMarketRentalBanner({
     return <span className={`inline-flex min-w-0 flex-wrap items-center gap-1.5 text-muted-foreground ${compact ? "text-[11px]" : "text-xs"}`}>
       <CalendarClock className="h-3 w-3 shrink-0" />
       <span>{t(walletLifecycleKey(contract), { hours: trialHours(contract.trialSecondsRemaining, locale), date })}</span>
+      {!compact && showSchedule ? <ClientNextTrialNotice trial={contract.nextRentalTrial} className="basis-full" /> : null}
       {showManageLink ? <a href={manageHref || DASHBOARD_ACCOUNT_WALLET_PATH} className="font-medium text-primary hover:underline">{t(manageHref ? "clientMarket.release.manageInMarket" : "account.nav.wallet")}</a> : null}
     </span>;
   }

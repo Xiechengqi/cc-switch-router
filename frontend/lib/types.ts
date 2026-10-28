@@ -2496,6 +2496,8 @@ export type ClientMarketQuoteItem = {
   freeDurationDays?: number;
   offerRevision: number;
   trialSecondsRemaining: number;
+  trialAllowanceSeconds: number;
+  trialSecondsConsumed: number;
 };
 
 export type ClientMarketAllocationQuote = {
@@ -2523,12 +2525,21 @@ export type ClientMarketBatch = {
   jobs: ProvisioningJob[];
 };
 
+export type ClientTrialState = {
+  epoch: number;
+  allowanceSeconds: number;
+  consumedSeconds: number;
+  remainingSeconds: number;
+  lastResetAt: string | null;
+};
+
 export type WalletLifecycle = {
   id?: string;
   status: string;
   trialSecondsRemaining: number;
   renewalPolicy: string;
   periodEnd?: string | null;
+  nextRentalTrial?: ClientTrialState;
 };
 
 export type ClientMarketRental = {

@@ -1,9 +1,29 @@
 import { chromium } from "playwright";
 import assert from "node:assert/strict";
-import { mkdir } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import { extname, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 
-// Start the frontend first. All business APIs are mocked; no SSH or payments occur.
-const baseUrl = process.env.CHECKOUT_TEST_URL || "http://127.0.0.1:3127";
+// Serve the production export by default. All business APIs are mocked; no
+// SSH or payments occur. An explicit URL can still target a development server.
+let baseUrl = process.env.CHECKOUT_TEST_URL;
+let server;
+if (!baseUrl) {
+  const output = resolve(fileURLToPath(new URL("../out/", import.meta.url)));
+  server = createServer(async (req, res) => {
+    try {
+      const pathname = decodeURIComponent(new URL(req.url, "http://localhost").pathname);
+      const path = resolve(output, `.${pathname.endsWith("/") ? `${pathname}index.html` : pathname}`);
+      if (!path.startsWith(output + sep)) return res.writeHead(403).end();
+      const body = await readFile(path);
+      res.writeHead(200, { "Content-Type": ({ ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".txt": "text/plain", ".svg": "image/svg+xml", ".woff2": "font/woff2" })[extname(path)] || "application/octet-stream", "Cache-Control": "no-store" });
+      res.end(body);
+    } catch { res.writeHead(404).end(); }
+  });
+  await new Promise((ready, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", ready); });
+  baseUrl = `http://127.0.0.1:${server.address().port}`;
+}
 const artifacts =
   process.env.CHECKOUT_ARTIFACTS || "/tmp/client-checkout-review";
 const captureScreenshots = process.env.CHECKOUT_SCREENSHOTS === "1";
@@ -25,6 +45,7 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
       if (message.type() === "error" && !message.text().startsWith("Failed to load resource:")) errors.push(message.text());
     });
     let trial = 43200,
+      trialAllowance = 43200,
       available = "0",
       shortfall = "86400000",
       quotes = 0,
@@ -99,6 +120,8 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
               id: "item-" + quotes,
               hostId: host.id,
               trialSecondsRemaining: trial,
+              trialAllowanceSeconds: trialAllowance,
+              trialSecondsConsumed: Math.max(0, trialAllowance - trial),
             },
           ],
           walletFunding:
@@ -187,7 +210,9 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
     console.log("opened", quotes);
     if (captureScreenshots) await page.screenshot({ path: artifacts + "/initial.png", fullPage: true });
     assert.equal(await page.locator('img[alt="Binance Pay"]').count(), 0);
-    await page.getByText("剩余试用 12 小时", { exact: true }).waitFor();
+    await page.locator("[data-client-trial]").getByText("本次可试用", { exact: true }).waitFor();
+    assert.equal(await page.locator("[data-client-trial] dd").nth(2).textContent(), "12小时");
+    await page.getByText(/正式租金扣款成功后，恢复下一次租用/).waitFor();
     await page.getByRole("button", { name: "充值后继续", exact: true }).waitFor();
     assert.equal(await page.getByRole("button", { name: "开始试用并创建", exact: true }).count(), 0);
     assert.equal(commits.length, 0, "an unfunded trial cannot submit a rental");
@@ -227,6 +252,15 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
       .getByRole("button", { name: "关闭", exact: true })
       .last()
       .click();
+    trial = 4500;
+    await page.goto(baseUrl + "/client-market/?focusHost=host-1");
+    await page.getByRole("heading", { name: "配置并确认" }).waitFor();
+    assert.equal(await page.locator("[data-client-trial] dd").nth(1).textContent(), "10小时 45分钟");
+    assert.equal(await page.locator("[data-client-trial] dd").nth(2).textContent(), "1小时 15分钟");
+    trial = 1;
+    await page.goto(baseUrl + "/client-market/?focusHost=host-1");
+    await page.getByRole("heading", { name: "配置并确认" }).waitFor();
+    assert.equal(await page.locator("[data-client-trial] dd").nth(2).textContent(), "1秒");
     trial = 0;
     available = "0";
     shortfall = "86400000";
@@ -235,6 +269,7 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
     await page
       .getByRole("button", { name: "充值后继续", exact: true })
       .waitFor();
+    await page.locator("[data-client-trial]").getByText(/本轮试用额度已用尽.*直接支付首期租金/).waitFor();
     await page.getByLabel("访问子域名", { exact: true }).fill("saved-domain");
     await page.getByLabel("后续按月从平台余额自动续费").check();
     await page.getByRole("button", { name: "充值后继续", exact: true }).click();
@@ -347,6 +382,15 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
     );
     console.log("expiry retains draft and requires explicit requote passed");
 
+    trialAllowance = 0;
+    trial = 0;
+    await page.goto(baseUrl + "/client-market/?focusHost=host-1");
+    await page.getByRole("heading", { name: "配置并确认" }).waitFor();
+    await page.locator("[data-client-trial]").getByText("此 Host 不提供免费试用。", { exact: true }).waitFor();
+    assert.equal(await page.locator("[data-client-trial] dd").nth(2).textContent(), "0秒");
+    assert.equal(await page.locator("[data-client-trial]").getByText(/本轮试用额度已用尽/).count(), 0);
+    console.log("shared trial accounting copy, partial/one-second/exhausted/disabled allowances passed");
+
     // Free checkout has no wallet or renewal controls, including English rendering.
     host.cyclePriceMinor = undefined;
     host.pricingModel = "free";
@@ -393,6 +437,7 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
     console.log(captureScreenshots ? `Screenshots: ${artifacts}` : "DOM and interaction checks only; no screenshots");
   } finally {
     await browser.close();
+    if (server) await new Promise((done) => server.close(done));
   }
 })().catch((e) => {
   console.error(e);

@@ -40,6 +40,7 @@ export function MarketTrialSettings() {
       <label className="grid gap-1 text-sm">{t("marketTrial.shareHours")}<input aria-label={t("marketTrial.shareHours")} className={WALLET_INPUT} type="number" min={0} max={720} step={1} required value={share} onChange={(e) => { setShare(e.target.value); setSaved(false); }} disabled={disabled} /></label>
       <label className="grid gap-1 text-sm">{t("marketTrial.shareTokens")}<input aria-label={t("marketTrial.shareTokens")} className={WALLET_INPUT} inputMode="decimal" required value={tokens} onChange={(e) => { setTokens(e.target.value); setSaved(false); }} disabled={disabled || share === "0"} /></label>
       <p className="text-xs leading-6 text-muted-foreground sm:col-span-3">{t("marketTrial.rules")}</p>
+      <p className="text-xs leading-6 text-muted-foreground sm:col-span-3">{t("clientTrial.settings")}</p>
       <Button type="submit" variant="primary" isDisabled={disabled || stale}>{busy ? t("common.loading") : t("common.save")}</Button>
     </form>
   </section>;
