@@ -13,6 +13,7 @@ import { marketC2CMessagesEn, marketC2CMessagesZh } from "@/lib/market-c2c-messa
 import { passwordMessagesEn, passwordMessagesZh } from "@/lib/password-messages";
 import { clientTerminationMessagesEn, clientTerminationMessagesZh } from "@/lib/client-termination-messages";
 import { clientTrialMessagesEn, clientTrialMessagesZh } from "@/lib/client-trial-messages";
+import { notificationCenterMessagesEn, notificationCenterMessagesZh } from "@/lib/notification-center-messages";
 
 export const LOCALE_STORAGE_KEY = "cc_switch_router_locale_v1";
 export const SUPPORTED_LOCALES = ["en", "zh-CN"] as const;
@@ -22,6 +23,7 @@ export type MessageKey = keyof typeof messages.en;
 
 export const messages = {
   en: {
+    ...notificationCenterMessagesEn,
     ...clientTrialMessagesEn,
     ...clientTerminationMessagesEn,
     ...passwordMessagesEn,
@@ -1348,8 +1350,8 @@ export const messages = {
     "clientMarket.usageHistory.charges": "Charges",
     "clientMarket.usageHistory.returned": "Returned to wallet {amount}",
     "clientMarket.usageHistory.ongoing": "Ongoing",
-    "clientMarket.usageHistory.expand": "Show recent Client usage",
-    "clientMarket.usageHistory.collapse": "Hide recent Client usage",
+    "clientMarket.usageHistory.expand": "Show rental details and usage history",
+    "clientMarket.usageHistory.collapse": "Hide rental details and usage history",
     "clientMarket.sortBy": "Sort by {column}",
     "clientMarket.sortAsc": "Sorted ascending",
     "clientMarket.sortDesc": "Sorted descending",
@@ -3545,6 +3547,7 @@ export const messages = {
     ...walletPolicyMessagesEn,
   },
   "zh-CN": {
+    ...notificationCenterMessagesZh,
     ...clientTrialMessagesZh,
     ...clientTerminationMessagesZh,
     ...passwordMessagesZh,
@@ -4842,8 +4845,8 @@ export const messages = {
     "clientMarket.usageHistory.charges": "费用",
     "clientMarket.usageHistory.returned": "已退回余额 {amount}",
     "clientMarket.usageHistory.ongoing": "进行中",
-    "clientMarket.usageHistory.expand": "展开最近 Client 使用",
-    "clientMarket.usageHistory.collapse": "收起最近 Client 使用",
+    "clientMarket.usageHistory.expand": "展开租用详情与使用历史",
+    "clientMarket.usageHistory.collapse": "收起租用详情与使用历史",
     "clientMarket.sortBy": "按{column}排序",
     "clientMarket.sortAsc": "升序",
     "clientMarket.sortDesc": "降序",

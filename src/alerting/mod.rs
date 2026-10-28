@@ -351,6 +351,15 @@ impl AlertingService {
             }
         }
 
+        // Independent of outbound channel availability and delivery retries.
+        // Persist first, acknowledge second so a crash can only repeat a safe,
+        // idempotent export rather than lose a notification.
+        if let Err(error) = self.mirror_in_app_events(app_store, now).await {
+            // Inbox failures must not prevent an existing outbound alert.
+            // Unacknowledged events remain retryable on the next cycle.
+            warn!(error = %error, "in-app alert export deferred");
+        }
+
         for _ in 0..MAX_DELIVERIES_PER_CYCLE {
             let Some(delivery) = self
                 .store
@@ -418,6 +427,17 @@ impl AlertingService {
                 .await?;
         }
         Ok(())
+    }
+
+    async fn mirror_in_app_events(&self, app_store: &AppStore, now: i64) -> Result<(), AppError> {
+        let events = self.store.pending_in_app_events().await?;
+        if events.is_empty() {
+            return Ok(());
+        }
+        crate::user_notifications::store_owner_alerts(app_store, &events).await?;
+        self.store
+            .complete_in_app_events(events.into_iter().map(|event| event.id).collect(), now)
+            .await
     }
 }
 

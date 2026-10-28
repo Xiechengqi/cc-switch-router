@@ -331,6 +331,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         96,
         include_str!("../schema/0096_client_market_trial_resets.sql"),
     ),
+    (97, include_str!("../schema/0097_notification_center.sql")),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -840,7 +841,45 @@ fn migration_checksum(sql: &str) -> String {
 mod tests {
     use super::*;
 
-    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 259;
+    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 261;
+
+    #[test]
+    fn migration_97_adds_notification_center_without_rewriting_market_events_or_read_state() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 96);
+        conn.execute(
+            "INSERT INTO market_notification_outbox
+            (id, audience, recipient_user_id, event_kind, object_kind, object_id, dedupe_key,
+             status, next_attempt_at, read_at, created_at)
+            VALUES ('existing', 'buyer', 'buyer', 'topup_credited', 'topup', 'order', 'once',
+             'sent', '2026-10-28T00:00:00Z', '2026-10-28T00:01:00Z', '2026-10-28T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        let row: (String, String, String) = conn.query_row(
+            "SELECT status, read_at, dedupe_key FROM market_notification_outbox WHERE id = 'existing'",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        assert_eq!(
+            row,
+            ("sent".into(), "2026-10-28T00:01:00Z".into(), "once".into())
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM user_notification_events", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM user_notification_reads", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
 
     mod client_trials;
     mod notification_safety;

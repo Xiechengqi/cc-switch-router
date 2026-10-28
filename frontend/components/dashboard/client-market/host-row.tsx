@@ -93,6 +93,7 @@ function HostRowImpl({
   const [offerOpen, setOfferOpen] = React.useState(false);
   const [hostKeyOpen, setHostKeyOpen] = React.useState(false);
   const [historyOpen, setHistoryOpen] = React.useState(false);
+  const historyId = React.useId();
   const [historyLoading, setHistoryLoading] = React.useState(false);
   const [historyError, setHistoryError] = React.useState("");
   const [history, setHistory] = React.useState<ClientMarketHostUsageHistoryEntry[] | null>(null);
@@ -322,7 +323,7 @@ function HostRowImpl({
   const chatUnread = host.installationId
     ? unreadByInstallation.get(host.installationId) || 0
     : 0;
-  /** Notes only — rental lifecycle lives under the offer cell to avoid interstitial table rows. */
+  /** Notes stay outside the expandable current-rental and history details. */
   const showSubrow = !!noteText;
   const ipIntelSubtitle = secondaryIntelParts.length ? secondaryIntelParts.join(" · ") : "";
   const statusGuidanceKey = hostStatusGuidanceKey(host.status, host.lastError);
@@ -421,6 +422,8 @@ function HostRowImpl({
                   onChanged={onChanged}
                   compact
                   resumeRelease
+                  summaryOnly
+                  showManageLink={false}
                 />
               </div>
             ) : null}
@@ -496,12 +499,21 @@ function HostRowImpl({
         </td>
         <td className="whitespace-nowrap px-2 py-2 align-middle" onClick={(event) => event.stopPropagation()}>
           <div className="flex items-center justify-end gap-1">
-            <ChevronDown
-              className={`h-4 w-4 shrink-0 text-muted-foreground transition-transform ${
-                historyOpen ? "rotate-180" : ""
-              }`}
-              aria-hidden
-            />
+            <Button
+              variant="ghost"
+              size="sm"
+              isIconOnly
+              className="h-8 w-8 min-w-8 shrink-0"
+              aria-label={t(historyOpen ? "clientMarket.usageHistory.collapse" : "clientMarket.usageHistory.expand")}
+              aria-expanded={historyOpen}
+              aria-controls={historyId}
+              onClick={() => setHistoryOpen((open) => !open)}
+            >
+              <ChevronDown
+                className={`h-4 w-4 shrink-0 text-muted-foreground transition-transform ${historyOpen ? "rotate-180" : ""}`}
+                aria-hidden="true"
+              />
+            </Button>
             {host.installationId ? (
               <span className="relative inline-flex" title={t("clientMarket.openGroupChat")}>
                 <Button
@@ -618,9 +630,15 @@ function HostRowImpl({
         </td>
       </tr>
       {historyOpen ? (
-        <tr className="border-b border-border/60 bg-muted/15">
+        <tr id={historyId} className="border-b border-border/60 bg-muted/15">
           <td colSpan={colSpan} className="px-3 py-2.5 align-top">
             <div className="grid gap-2">
+              {showRenterRental && rental ? (
+                <section aria-label={t("clientMarket.currentRental.title")} className="grid gap-1.5 border-b border-border/60 pb-3 mb-1">
+                  <h3 className="text-xs font-medium text-foreground">{t("clientMarket.currentRental.title")}</h3>
+                  <ClientMarketRentalBanner rental={rental} onChanged={onChanged} readOnly showManageLink={false} />
+                </section>
+              ) : null}
               <div className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
                 {t("clientMarket.usageHistory.title")}
               </div>

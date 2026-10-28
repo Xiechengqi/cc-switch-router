@@ -85,6 +85,18 @@ pub struct AlertTransition {
     pub occurred_at: i64,
 }
 
+/// Minimal, secret-free projection for the Owner's in-app notification center.
+#[derive(Debug, Clone)]
+pub struct InAppAlertEvent {
+    pub id: String,
+    pub incident_id: String,
+    pub transition: String,
+    pub severity: String,
+    pub title: String,
+    pub occurred_at: i64,
+    pub related_user_event_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AlertDelivery {

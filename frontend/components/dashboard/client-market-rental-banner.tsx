@@ -1,7 +1,7 @@
 "use client";
 
 import { trialHours, walletLifecycleKey } from "@/lib/client-checkout";
-import { CalendarClock, Clock3, HandCoins, Loader2 } from "lucide-react";
+import { Clock3, HandCoins, Loader2 } from "lucide-react";
 import {
   FinalizeFailedRentalAction,
   ReleaseRentalAction,
@@ -11,7 +11,7 @@ import { DASHBOARD_ACCOUNT_WALLET_PATH } from "@/lib/dashboard-nav";
 import { clientMarketCleanupReasonKey, clientMarketRentalHasBanner } from "@/lib/client-market-rental-state";
 import { cleanupFailureGuidanceKey } from "@/components/dashboard/client-market/host-utils";
 import type { ClientMarketRental } from "@/lib/types";
-import { ClientNextTrialNotice } from "@/components/dashboard/client-market/client-next-trial-notice";
+import { ClientRentalSchedule } from "@/components/dashboard/client-market/client-rental-schedule";
 
 /** Rental and wallet lifecycle are separate from Client connection health. */
 export function ClientMarketRentalBanner({
@@ -23,6 +23,7 @@ export function ClientMarketRentalBanner({
   manageHref,
   showManageLink = true,
   showSchedule = true,
+  summaryOnly = false,
 }: {
   rental?: ClientMarketRental;
   onChanged: () => Promise<void> | void;
@@ -33,6 +34,8 @@ export function ClientMarketRentalBanner({
   showManageLink?: boolean;
   /** Free-duration schedule is verbose; list rows hide it and surface it in the client drawer instead. */
   showSchedule?: boolean;
+  /** Dense status cells keep trial/exception states, not normal dates or links. */
+  summaryOnly?: boolean;
 }) {
   const { locale, t } = useLocaleText();
   if (!clientMarketRentalHasBanner(rental)) return null;
@@ -87,19 +90,12 @@ export function ClientMarketRentalBanner({
   }
 
   if (rental.walletContract) {
-    const contract = rental.walletContract;
-    const date = contract.periodEnd && Number.isFinite(Date.parse(contract.periodEnd))
-      ? new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(contract.periodEnd)) : "—";
-    return <span className={`inline-flex min-w-0 flex-wrap items-center gap-1.5 text-muted-foreground ${compact ? "text-[11px]" : "text-xs"}`}>
-      <CalendarClock className="h-3 w-3 shrink-0" />
-      <span>{t(walletLifecycleKey(contract), { hours: trialHours(contract.trialSecondsRemaining, locale), date })}</span>
-      {!compact && showSchedule ? <ClientNextTrialNotice trial={contract.nextRentalTrial} className="basis-full" /> : null}
-      {showManageLink ? <a href={manageHref || DASHBOARD_ACCOUNT_WALLET_PATH} className="font-medium text-primary hover:underline">{t(manageHref ? "clientMarket.release.manageInMarket" : "account.nav.wallet")}</a> : null}
-    </span>;
+    return <ClientRentalSchedule contract={rental.walletContract} compact={compact} summaryOnly={summaryOnly}
+      showSchedule={showSchedule} showManageLink={showManageLink} manageHref={manageHref} />;
   }
 
   if (rental.pricingModel === "free" || (rental.dailyRateMinor == null && rental.cyclePriceMinor == null)) {
-    if (!showSchedule) return null;
+    if (summaryOnly || !showSchedule) return null;
     const activated = rental.activatedAt
       ? new Date(rental.activatedAt).toLocaleString(locale)
       : null;
@@ -131,6 +127,7 @@ export function ClientMarketRentalBanner({
       </span>
     );
   }
+  if (summaryOnly || !showManageLink) return null;
   return (
     <a
       href={DASHBOARD_ACCOUNT_WALLET_PATH}

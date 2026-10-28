@@ -3705,6 +3705,14 @@ impl AppStore {
         })?;
         client_chat::ensure_room_for_verified_owner_tx(&tx, &installation.id, &owner_email, now)?;
 
+        crate::user_notifications::client_event_tx(
+            &tx,
+            &installation.id,
+            "client_registered",
+            0,
+            now,
+        )?;
+
         let snapshot = serde_json::json!({
             "installationId": installation.id,
             "platform": installation.platform,
@@ -19605,6 +19613,19 @@ fn enqueue_client_presence_operator_signal_tx(
     last_heartbeat_at: Option<&str>,
     occurred_at: DateTime<Utc>,
 ) -> Result<(), AppError> {
+    crate::user_notifications::client_event_tx(
+        conn,
+        installation_id,
+        if reason == "installation_removed" {
+            "client_removed"
+        } else if transition == "firing" {
+            "client_offline"
+        } else {
+            "client_recovered"
+        },
+        episode,
+        occurred_at,
+    )?;
     let state = if transition == "firing" {
         "offline"
     } else {

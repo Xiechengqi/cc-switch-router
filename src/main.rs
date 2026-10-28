@@ -78,6 +78,7 @@ mod test_support;
 mod usage_account;
 mod user_cli;
 mod user_notification_health;
+mod user_notifications;
 
 use std::collections::HashSet;
 use std::env;

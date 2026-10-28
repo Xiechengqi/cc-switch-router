@@ -9,7 +9,7 @@ import * as React from "react";
 import { LoginDialog } from "@/components/auth/login-dialog";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { MarketNotificationsBell } from "@/components/dashboard/market-notifications-bell";
+import { NotificationsBell } from "@/components/dashboard/notifications-bell";
 import { NavbarWalletBalance } from "@/components/layout/navbar-wallet-balance";
 import { MarketWalletBalanceProvider } from "@/components/market/market-wallet-balance-provider";
 import { refreshAccessToken } from "@/lib/auth";
@@ -348,7 +348,7 @@ function Topbar({ active }: { active: DashboardShellActive }) {
           )}
 
           <div className="col-start-2 row-start-1 flex min-w-0 flex-nowrap items-center justify-end gap-0.5 justify-self-end sm:gap-2 xl:col-start-3">
-            {showAuthedChrome ? <MarketNotificationsBell /> : null}
+            {authed ? <NotificationsBell key={session?.user?.id || displayEmail} /> : null}
             <NavbarWalletBalance />
             <CurrencySwitcher />
             <LanguageSwitcher />

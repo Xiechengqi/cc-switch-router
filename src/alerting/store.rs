@@ -138,6 +138,64 @@ impl AlertStore {
             .map_err(|error| AppError::Internal(format!("alert init task failed: {error}")))?
     }
 
+    /// Export committed incident transitions, not per-channel deliveries or
+    /// reminders. A failed main-database write leaves the batch retryable.
+    pub async fn pending_in_app_events(
+        &self,
+    ) -> Result<Vec<super::models::InAppAlertEvent>, AppError> {
+        let store = self.clone();
+        spawn_blocking(move || {
+            let conn = store.open()?;
+            let mut statement = conn.prepare(
+                "SELECT t.id, t.incident_id, t.transition, t.severity, i.title, t.occurred_at,
+                    CASE
+                        WHEN t.source_event_id LIKE 'client_presence:offline:%'
+                            THEN 'client:client_offline:' || SUBSTR(t.source_event_id, LENGTH('client_presence:offline:') + 1)
+                        WHEN t.source_event_id LIKE 'client_presence:recovered:%'
+                            THEN 'client:client_recovered:' || SUBSTR(t.source_event_id, LENGTH('client_presence:recovered:') + 1)
+                        WHEN t.source_event_id LIKE 'client_presence:removed:%'
+                            THEN 'client:client_removed:' || SUBSTR(t.source_event_id, LENGTH('client_presence:removed:') + 1)
+                    END
+                 FROM alert_transitions t INNER JOIN alert_incidents i ON i.id = t.incident_id
+                 WHERE t.in_app_synced_at IS NULL AND t.transition IN ('firing', 'escalated', 'resolved')
+                 ORDER BY t.occurred_at, t.id LIMIT 100"
+            ).map_err(|error| AppError::Internal(format!("prepare in-app alerts failed: {error}")))?;
+            statement.query_map([], |row| Ok(super::models::InAppAlertEvent {
+                id: row.get(0)?, incident_id: row.get(1)?, transition: row.get(2)?,
+                severity: row.get(3)?, title: row.get(4)?, occurred_at: row.get(5)?, related_user_event_id: row.get(6)?,
+            })).map_err(|error| AppError::Internal(format!("query in-app alerts failed: {error}")))?
+                .collect::<Result<Vec<_>, _>>().map_err(|error| AppError::Internal(format!("read in-app alerts failed: {error}")))
+        }).await.map_err(|error| AppError::Internal(format!("in-app alerts task failed: {error}")))?
+    }
+
+    pub async fn complete_in_app_events(&self, ids: Vec<String>, now: i64) -> Result<(), AppError> {
+        let store = self.clone();
+        spawn_blocking(move || {
+            let mut conn = store.open()?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|error| {
+                    AppError::Internal(format!("begin in-app alert export failed: {error}"))
+                })?;
+            for id in ids {
+                tx.execute(
+                    "UPDATE alert_transitions SET in_app_synced_at = ?2 WHERE id = ?1",
+                    params![id, now],
+                )
+                .map_err(|error| {
+                    AppError::Internal(format!("complete in-app alert failed: {error}"))
+                })?;
+            }
+            tx.commit().map_err(|error| {
+                AppError::Internal(format!("commit in-app alert export failed: {error}"))
+            })
+        })
+        .await
+        .map_err(|error| {
+            AppError::Internal(format!("complete in-app alerts task failed: {error}"))
+        })?
+    }
+
     pub async fn reconcile_conditions(
         &self,
         scope: String,
@@ -1231,6 +1289,7 @@ fn init_alert_db(conn: &Connection) -> Result<(), AppError> {
     )
     .map_err(|error| AppError::Internal(format!("init alert database failed: {error}")))?;
     for (table, column, definition) in [
+        ("alert_transitions", "in_app_synced_at", "INTEGER"),
         ("alert_delivery_attempts", "failure_code", "TEXT"),
         ("alert_delivery_attempts", "failure_hint", "TEXT"),
         ("alert_delivery_attempts", "failure_details_json", "TEXT"),
@@ -1240,6 +1299,12 @@ fn init_alert_db(conn: &Connection) -> Result<(), AppError> {
     ] {
         ensure_alert_column(conn, table, column, definition)?;
     }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_alert_transitions_in_app
+        ON alert_transitions(occurred_at, id) WHERE in_app_synced_at IS NULL
+        AND transition IN ('firing', 'escalated', 'resolved');",
+    )
+    .map_err(|error| AppError::Internal(format!("index in-app alerts failed: {error}")))?;
     Ok(())
 }
 
@@ -2049,6 +2114,115 @@ mod tests {
             message: "FD usage is elevated".into(),
             details: serde_json::json!({ "percent": 75 }),
         }
+    }
+
+    #[tokio::test]
+    async fn notification_center_exports_incident_transitions_without_channel_duplicates_or_reminders()
+     {
+        let store = test_store("in-app-events");
+        let policy = AlertDeliveryPolicy {
+            enabled: false,
+            dashboard_url: "https://router.test".into(),
+            channels: vec![],
+        };
+        let signal = |id: &str, transition: &str, time| OperatorAlertSignal {
+            source_event_id: id.into(),
+            fingerprint: "client_offline:client:client-one".into(),
+            transition: transition.into(),
+            kind: "client_offline".into(),
+            entity_kind: "client".into(),
+            entity_id: Some("client-one".into()),
+            severity: "critical".into(),
+            title: "Client offline".into(),
+            message: "Message not exported".into(),
+            details: serde_json::json!({"secret": "never-export"}),
+            occurred_at: time,
+            attempts: 0,
+        };
+        store
+            .ingest_signal(
+                signal("client_presence:offline:client-one:7", "firing", 100),
+                policy.clone(),
+            )
+            .await
+            .unwrap();
+        store
+            .ingest_signal(
+                signal("client_presence:offline:client-one:7", "firing", 100),
+                policy.clone(),
+            )
+            .await
+            .unwrap();
+        let pending = store.pending_in_app_events().await.unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "export works even with outbound channels disabled"
+        );
+        assert_eq!(pending[0].transition, "firing");
+        assert_eq!(
+            pending[0].related_user_event_id.as_deref(),
+            Some("client:client_offline:client-one:7")
+        );
+        assert_eq!(
+            store.pending_in_app_events().await.unwrap()[0].id,
+            pending[0].id,
+            "failed/unacknowledged export remains retryable"
+        );
+        store
+            .complete_in_app_events(pending.iter().map(|e| e.id.clone()).collect(), 101)
+            .await
+            .unwrap();
+        assert!(store.pending_in_app_events().await.unwrap().is_empty());
+        store
+            .ingest_signal(signal("second", "firing", 110), policy.clone())
+            .await
+            .unwrap();
+        assert!(
+            store.pending_in_app_events().await.unwrap().is_empty(),
+            "unchanged repeated signal is not another inbox event"
+        );
+        store
+            .ingest_signal(
+                signal("client_presence:recovered:client-one:7", "resolved", 120),
+                policy.clone(),
+            )
+            .await
+            .unwrap();
+        let resolved = store.pending_in_app_events().await.unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].transition, "resolved");
+        assert_eq!(
+            resolved[0].related_user_event_id.as_deref(),
+            Some("client:client_recovered:client-one:7")
+        );
+        store
+            .complete_in_app_events(resolved.into_iter().map(|event| event.id).collect(), 121)
+            .await
+            .unwrap();
+        store
+            .ingest_signal(
+                signal("client_presence:offline:client-one:8", "firing", 130),
+                policy.clone(),
+            )
+            .await
+            .unwrap();
+        store
+            .ingest_signal(
+                signal("client_presence:removed:client-one:8", "resolved", 140),
+                policy,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .pending_in_app_events()
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| event.related_user_event_id.as_deref()
+                    == Some("client:client_removed:client-one:8"))
+        );
     }
 
     #[tokio::test]

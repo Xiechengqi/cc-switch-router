@@ -780,37 +780,11 @@ export const MARKET_NOTIFICATION_KINDS = [
 
 export type MarketNotificationKind = (typeof MARKET_NOTIFICATION_KINDS)[number];
 
-export type MarketNotification = {
-  id: string;
-  audience: "buyer" | "provider" | string;
-  eventKind: MarketNotificationKind | string;
-  objectKind: string;
-  objectId: string;
-  payload: Record<string, unknown>;
-  mandatory: boolean;
-  readAt: string | null;
-  createdAt: string;
-};
-
 export type MarketNotificationPreference = {
   eventKind: MarketNotificationKind | string;
   mandatory: boolean;
   enabled: boolean;
 };
-
-export async function getMarketNotifications(cursor?: string) {
-  const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
-  return parseJson<MarketWalletPage<MarketNotification> & { unread: number }>(
-    await authFetch(`/v1/market-notifications${query}`, { cache: "no-store" }),
-  );
-}
-
-/** Pass "all" to mark every notification read. */
-export async function markMarketNotificationRead(id: string | "all") {
-  return parseJson<{ ok: boolean }>(
-    await authFetch(`/v1/market-notifications/${encodeURIComponent(id)}/read`, { method: "POST" }),
-  );
-}
 
 export async function getMarketNotificationPreferences() {
   return parseJson<MarketNotificationPreference[]>(

@@ -54,6 +54,7 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
       expiry = 120000,
       cancels = 0;
     let retiredMoneyRequests = 0;
+    let rentals = [];
     const host = {
       id: "host-1",
       providerId: "provider",
@@ -104,7 +105,9 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
         return route.fulfill({ status: 410, contentType: "application/json", body: JSON.stringify({ code: "RETIRED" }) });
       }
       else if (path === "/v1/client-market/hosts") body = [host];
-      else if (path === "/v1/client-market/my-rentals") body = [];
+      else if (path === "/v1/client-market/my-rentals") body = rentals;
+      else if (path.endsWith("/usage-history")) body = [];
+      else if (path === "/v1/notifications") body = { items: [], nextCursor: null, unread: 0, readThrough: null };
       else if (path === "/v1/client-market/quotes") {
         quotes++;
         body = {
@@ -432,6 +435,59 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
       .getByRole("link", { name: "Open Client", exact: true })
       .waitFor();
     console.log("English free creation and short viewport widths passed");
+
+    Object.assign(host, { status: "allocated", installationId: "client-one", isClientOwner: true,
+      clientSubdomain: "rental-client", pricingModel: "prepaid_calendar_month", cyclePriceMinor: 5,
+      clientConnection: { state: "online", since: "2026-10-28T00:00:00Z", lastHeartbeatAt: "2026-10-28T00:00:00Z" } });
+    rentals = [{ installationId: "client-one", hostId: host.id, providerId: host.providerId,
+      hostOwnerEmail: host.hostOwnerEmail, clientOwnerEmail: "buyer@example.com", status: "active",
+      pricingModel: "prepaid_calendar_month", cyclePriceMinor: 5, offerRevision: 1, isClientOwner: true,
+      canRelease: true, canFinalizeRelease: false, hostCleanupPending: false, providerTerminalAccessActive: false,
+      canManageProviderTerminal: false, updatedAt: "2026-10-28T00:00:00Z", walletContract: {
+        id: "wallet-contract", status: "active", trialSecondsRemaining: 0, renewalPolicy: "manual",
+        periodEnd: "2026-11-28T06:02:00Z", nextRentalTrial: { epoch: 1, allowanceSeconds: 43200,
+          consumedSeconds: 0, remainingSeconds: 43200, lastResetAt: "2026-10-28T00:00:00Z" },
+      } }];
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto(baseUrl + "/client-market/?tab=mine&testLocale=en");
+    const rentalRow = page.locator("#client-market-host-client-one");
+    await rentalRow.waitFor();
+    const statusCell = rentalRow.locator("td").first();
+    assert.doesNotMatch(await statusCell.textContent(), /Ends on|Renews on|Platform wallet/);
+    await statusCell.getByText("Client online", { exact: true }).waitFor();
+    const expandRental = rentalRow.getByRole("button", { name: "Show rental details and usage history", exact: true });
+    await expandRental.focus();
+    await page.keyboard.press("Enter");
+    const rentalDetails = page.getByRole("region", { name: "Current rental", exact: true });
+    // A named section is an accessible region when it has an aria-label.
+    await rentalDetails.getByText(/^Ends on /).waitFor();
+    await rentalDetails.locator("[data-next-rental-trial]").waitFor();
+    assert.equal(await rentalDetails.getByRole("link", { name: "Platform wallet", exact: true }).count(), 0);
+    const collapseRental = rentalRow.getByRole("button", { name: "Hide rental details and usage history", exact: true });
+    assert.equal(await collapseRental.getAttribute("aria-expanded"), "true");
+    assert.equal(await page.locator(`[id="${await collapseRental.getAttribute("aria-controls")}"]`).count(), 1);
+    await collapseRental.click();
+    await rentalDetails.waitFor({ state: "hidden" });
+    for (const [status, renewal, hint] of [
+      ["active", "automatic", /^Renews on /],
+      ["trialing", "automatic", /Trial/],
+      ["suspended", "automatic", /Paused/],
+    ]) {
+      rentals[0].walletContract.status = status;
+      rentals[0].walletContract.renewalPolicy = renewal;
+      rentals[0].walletContract.trialSecondsRemaining = status === "trialing" ? 3600 : 0;
+      await page.reload();
+      await rentalRow.waitFor();
+      if (status === "active") assert.doesNotMatch(await statusCell.textContent(), /Renews on/);
+      else await statusCell.getByText(hint).waitFor();
+      await rentalRow.click();
+      await rentalDetails.getByText(hint).waitFor();
+    }
+    rentals[0].status = "release_failed";
+    rentals[0].cleanupFailureKind = "cleanup_ssh_unreachable";
+    await page.reload();
+    await rentalRow.getByText(/SSH|Host|unreachable|offline/).first().waitFor();
+    console.log("Client rows keep status/health and exception actions visible; expiry, renewal and restored trials live in expandable details");
     assert.deepEqual(errors, []);
     console.log("free checkout passed; no browser exceptions");
     console.log(captureScreenshots ? `Screenshots: ${artifacts}` : "DOM and interaction checks only; no screenshots");

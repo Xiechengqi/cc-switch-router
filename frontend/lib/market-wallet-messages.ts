@@ -98,9 +98,6 @@ export const marketWalletMessagesEn = {
   "marketProviderFinance.lot.reversed": "Returned to buyer balance",
 
   // Wallet & trading notifications
-  "marketNotifications.title": "Wallet & trading",
-  "marketNotifications.bell": "Wallet notifications",
-  "marketNotifications.bellUnread": "Wallet notifications, {count} unread",
   "marketNotifications.unread": "unread",
   "marketNotifications.markRead": "Mark as read",
   "marketNotifications.markAllRead": "Mark all read",
@@ -222,9 +219,6 @@ export const marketWalletMessagesZh = {
   "marketProviderFinance.lot.held": "冻结中",
   "marketProviderFinance.lot.reversed": "已结算退回",
 
-  "marketNotifications.title": "钱包与交易",
-  "marketNotifications.bell": "钱包通知",
-  "marketNotifications.bellUnread": "钱包通知，{count} 条未读",
   "marketNotifications.unread": "未读",
   "marketNotifications.markRead": "标为已读",
   "marketNotifications.markAllRead": "全部已读",

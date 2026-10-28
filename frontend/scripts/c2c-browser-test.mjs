@@ -185,7 +185,7 @@ try {
       if (p === "/v1/market-provider-finance/holds") return json(route, heldIncome && actor === "seller" ? [{ reasonKind: "dispute", reasonRef: "contract", providerUserId: actor, lots: 1, heldUnits: "8640000", createdAt: new Date().toISOString() }] : []);
       if (p === "/v1/market-access/dashboard") return json(route, { policies: [], counterparties: [], accessRequests: [] });
       if (p.endsWith("/rooms")) return json(route, { rooms: [], totalUnread: 0 });
-      if (p.includes("market-notifications")) return json(route, { items: [], nextCursor: null, unread: 0 });
+      if (p === "/v1/notifications" || p.includes("market-notifications")) return json(route, { items: [], nextCursor: null, unread: 0, readThrough: null });
       if (["topups", "transactions", "cases"].some(s => p.endsWith(`/${s}`))) return json(route, { items: [], nextCursor: null });
       if (p.startsWith("/v1/admin/")) return json(route, []);
       return json(route, {});

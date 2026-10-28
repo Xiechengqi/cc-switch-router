@@ -140,6 +140,11 @@ jobs:
           bash scripts/ci/timed.sh 'Database adapter' cargo test --locked db::tests
           bash scripts/ci/timed.sh 'Test database templates' cargo test --locked test_support::tests
 
+      - name: Test notification center and incident export
+        run: |
+          bash scripts/ci/timed.sh 'Notification center' cargo test --locked user_notifications::tests
+          bash scripts/ci/timed.sh 'Incident export' cargo test --locked alerting::store::tests
+
       - name: Test all market contracts
         # market_ does not match modules named share_market / client_market.
         # Keep full service-control coverage, not just wallet helper tests.

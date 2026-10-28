@@ -93,6 +93,9 @@ export function MetricsPage() {
   const { session, loading, refresh: refreshAuth } = useAuth();
   const { locale, t } = useLocaleText();
   const [activeTab, setActiveTab] = React.useState<MetricsTab>("overview");
+  React.useEffect(() => {
+    if (new URLSearchParams(window.location.search).get("tab") === "alerts") setActiveTab("alerts");
+  }, []);
   const [range, setRange] = React.useState("1h");
   const [autoRefresh, setAutoRefresh] = React.useState(true);
   const [snapshot, setSnapshot] = React.useState<MetricsSnapshot | null>(null);
