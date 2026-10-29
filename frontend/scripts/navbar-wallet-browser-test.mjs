@@ -32,7 +32,10 @@ try {
   browser = await chromium.launch({ executablePath: process.env.CHROME_BIN || "/usr/bin/google-chrome", headless: true, args: ["--no-sandbox"] });
   const page = await browser.newPage();
   const errors = [];
-  page.on("pageerror", (error) => errors.push(error.message));
+  page.on("pageerror", (error) => {
+    errors.push(error.message);
+    console.error("Navbar wallet browser exception:", error.message);
+  });
   await page.clock.install();
   await page.addInitScript(() => {
     localStorage.setItem("cc_switch_router_locale_v1", "en");
@@ -66,6 +69,11 @@ try {
       if (responseMode === "error") return json(route, { message: "offline" }, 503);
       return json(route, responseMode === "malformed" ? { availableUnits: "not-money" } : body);
     }
+    if (path === "/v1/market-wallet/transfer-capacity") return json(route, {
+      transferableUnits: (BigInt(available) < 43_200_000_000n ? BigInt(available) : 43_200_000_000n).toString(),
+      committedUnits: "0", dailyRemainingUnits: "43200000000", enabled: true, verified: true, blockers: [],
+    });
+    if (path === "/v1/market-wallet/service-disputes") return json(route, []);
     if (path === "/v1/regions") return json(route, [{ name: "Long Router region name", url: baseUrl }]);
     if (path === "/v1/market/config") return json(route, { usdCnyRateMicros: 7_000_000, fxRateFresh: true });
     if (path === "/v1/market-wallet/c2c/policy") return json(route, { policy: { version: 1, enabled: false,
@@ -249,7 +257,9 @@ try {
   for (const name of ["充值", "C2C", "转出"]) await quick.getByRole("tab", { name, exact: true }).waitFor();
   await quick.getByRole("link", { name: "查看完整余额与流水" }).click();
   await page.waitForURL(`${baseUrl}/account/wallet/`);
+  await page.locator("#wallet-actions").waitFor();
   await expectAmount("$9.00");
+  assert.deepEqual(errors, [], "opening the full wallet must not cause a render exception");
   // On the balance page it focuses the page's own actions rather than stacking a second form.
   await balance.click();
   await page.waitForFunction(() => document.activeElement?.id === "wallet-actions");

@@ -46,6 +46,25 @@ export type TransferCapacity = {
   verified: boolean;
   blockers: ("disabled" | "paused" | "identity" | "finance_hold")[];
 };
+
+/** Validate before amounts or capabilities reach the wallet's render state. */
+export function parseTransferCapacity(value: unknown): TransferCapacity {
+  const unavailable = () => new Error("Wallet transfer capacity unavailable; reload to retry.");
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw unavailable();
+  const { transferableUnits, committedUnits, dailyRemainingUnits, enabled, verified, blockers } = value as Record<string, unknown>;
+  const validUnits = (units: unknown): units is string =>
+    typeof units === "string" && /^(?:0|[1-9]\d{0,18})$/.test(units)
+    && BigInt(units) <= 9_223_372_036_854_775_807n;
+  const validBlocker = (blocker: unknown): blocker is TransferCapacity["blockers"][number] =>
+    blocker === "disabled" || blocker === "paused" || blocker === "identity" || blocker === "finance_hold";
+  if (!validUnits(transferableUnits) || !validUnits(committedUnits) || !validUnits(dailyRemainingUnits)
+    || typeof enabled !== "boolean" || typeof verified !== "boolean"
+    || !Array.isArray(blockers) || !blockers.every(validBlocker)
+    || enabled !== (blockers.length === 0) || verified !== !blockers.includes("identity")
+    || BigInt(transferableUnits) > BigInt(dailyRemainingUnits)) throw unavailable();
+  return { transferableUnits, committedUnits, dailyRemainingUnits, enabled, verified, blockers };
+}
+
 export type TransferQuote = {
   id: string;
   senderEmail: string;
@@ -105,11 +124,11 @@ export async function quoteWalletTopup(
   );
 }
 export async function getTransferCapacity() {
-  return parseJson<TransferCapacity>(
+  return parseTransferCapacity(await parseJson<unknown>(
     await authFetch("/v1/market-wallet/transfer-capacity", {
       cache: "no-store",
     }),
-  );
+  ));
 }
 export async function quoteWalletTransfer(
   recipientEmail: string,

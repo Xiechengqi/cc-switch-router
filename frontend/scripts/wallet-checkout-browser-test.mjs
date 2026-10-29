@@ -228,7 +228,7 @@ try {
   const transferKeys = [];
   let transferAmount = "8640001";
   await page.context().route("**/v1/market-wallet/transfer-capacity", async (route) => {
-    await route.fulfill({ contentType: "application/json", body: JSON.stringify({ transferableUnits: transferAmount, committedUnits: "0", dailyRemainingUnits: "86400000", enabled: true, verified: true }) });
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify({ transferableUnits: transferAmount, committedUnits: "0", dailyRemainingUnits: "86400000", enabled: true, verified: true, blockers: [] }) });
   });
   await page.context().route("**/v1/market-wallet/transfer-quotes", async (route) => {
     const input = route.request().postDataJSON();
