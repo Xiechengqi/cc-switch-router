@@ -3570,10 +3570,10 @@ async fn root_handler(
             && matches!(*req.method(), Method::GET | Method::HEAD)
             && is_router_share_ui_path(req.uri().path())
         {
-            if let Some(response) = ui_response_for_request_path(req.uri().path()) {
+            if let Some(response) = ui_response_for_request_path(req.uri().path(), req.headers()) {
                 return response;
             }
-            if let Some(response) = ui_response("index.html") {
+            if let Some(response) = ui_response("index.html", req.headers()) {
                 return response;
             }
         }
@@ -3581,7 +3581,7 @@ async fn root_handler(
     }
 
     if matches!(*req.method(), Method::GET | Method::HEAD) {
-        if let Some(response) = ui_response("index.html") {
+        if let Some(response) = ui_response("index.html", req.headers()) {
             return response;
         }
         return (
@@ -3602,17 +3602,17 @@ async fn ui_or_proxy_handler(
         if matches!(*req.method(), Method::GET | Method::HEAD)
             && is_router_share_ui_path(req.uri().path())
         {
-            if let Some(response) = ui_response_for_request_path(req.uri().path()) {
+            if let Some(response) = ui_response_for_request_path(req.uri().path(), req.headers()) {
                 return response;
             }
-            if let Some(response) = ui_response("index.html") {
+            if let Some(response) = ui_response("index.html", req.headers()) {
                 return response;
             }
         }
         return proxy_handler(State(state), ConnectInfo(peer), req).await;
     }
     if matches!(*req.method(), Method::GET | Method::HEAD) {
-        if let Some(response) = ui_response_for_request_path(req.uri().path()) {
+        if let Some(response) = ui_response_for_request_path(req.uri().path(), req.headers()) {
             return response;
         }
     }
@@ -3645,7 +3645,7 @@ async fn should_proxy_host(state: &ServerState, host: String) -> bool {
         .is_some()
 }
 
-fn ui_response_for_request_path(path: &str) -> Option<Response> {
+fn ui_response_for_request_path(path: &str, request_headers: &HeaderMap) -> Option<Response> {
     let trimmed = path.trim_start_matches('/');
     let candidates = [
         trimmed.to_string(),
@@ -3656,28 +3656,125 @@ fn ui_response_for_request_path(path: &str) -> Option<Response> {
         if candidate.is_empty() {
             continue;
         }
-        if let Some(response) = ui_response(&candidate) {
+        if let Some(response) = ui_response(&candidate, request_headers) {
             return Some(response);
         }
     }
     None
 }
 
-fn ui_response(path: &str) -> Option<Response> {
-    let asset = ui_assets::ui_asset(path)?;
-    let cache_control = if asset.immutable {
+/// Only content-hashed `_next/static/` files may be cached without asking.
+/// HTML and the static-export RSC payloads (`*.txt`) name the build they
+/// belong to; a stale copy makes the Next router abandon client navigation
+/// for a full page load, so browsers and the CDN must revalidate them.
+fn ui_cache_control(asset: &ui_assets::UiAsset) -> &'static str {
+    if asset.immutable {
         "public, max-age=31536000, immutable"
-    } else if asset.content_type.starts_with("text/html") {
+    } else if asset.content_type.starts_with("text/html")
+        || asset.content_type.starts_with("text/plain")
+    {
         "no-cache"
     } else {
-        "public, max-age=2592000"
+        "public, max-age=86400"
+    }
+}
+
+fn accepts_gzip(request_headers: &HeaderMap) -> bool {
+    request_headers
+        .get_all(header::ACCEPT_ENCODING)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|coding| {
+            let mut parts = coding.split(';');
+            let name = parts.next().unwrap_or_default().trim();
+            let refused = parts.any(|param| {
+                param
+                    .trim()
+                    .strip_prefix("q=")
+                    .and_then(|q| q.trim().parse::<f32>().ok())
+                    .is_some_and(|q| q <= 0.0)
+            });
+            !refused && (name.eq_ignore_ascii_case("gzip") || name == "*")
+        })
+}
+
+fn etag_matches(request_headers: &HeaderMap, etag: &str) -> bool {
+    let opaque = etag.trim_matches('"');
+    request_headers
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(|candidate| candidate.trim().trim_start_matches("W/").trim_matches('"'))
+        .any(|candidate| {
+            candidate == "*"
+                || candidate == opaque
+                || candidate.strip_suffix("-gzip") == Some(opaque)
+        })
+}
+
+/// Browsers that loaded the UI before RSC payloads became `no-cache` hold
+/// them for up to 30 days under URLs that do not change per build (the
+/// `_rsc` value only hashes router headers). Each stale hit turns a soft
+/// navigation into a full page load. One `Clear-Site-Data: "cache"` per
+/// browser evicts them; cookies and storage are untouched. The marker cookie
+/// is `Secure`, so it is stored exactly where browsers honour the header
+/// (HTTPS and localhost); over plain HTTP the header is ignored and resent.
+/// Bump the epoch only for another forced eviction.
+const UI_CACHE_EPOCH_COOKIE: &str = "ccr_ui_cache_epoch";
+const UI_CACHE_EPOCH: &str = "1";
+
+fn ui_cache_epoch_current(request_headers: &HeaderMap) -> bool {
+    request_headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|cookie| cookie.split(';'))
+        .filter_map(|part| part.trim().split_once('='))
+        .any(|(name, value)| name == UI_CACHE_EPOCH_COOKIE && value.trim() == UI_CACHE_EPOCH)
+}
+
+fn ui_response(path: &str, request_headers: &HeaderMap) -> Option<Response> {
+    let asset = ui_assets::ui_asset(path)?;
+    let gzip = asset.gzip.filter(|_| accepts_gzip(request_headers));
+    let etag = if gzip.is_some() {
+        format!("\"{}-gzip\"", asset.etag.trim_matches('"'))
+    } else {
+        asset.etag.to_string()
     };
-    Response::builder()
-        .header(header::CONTENT_TYPE, asset.content_type)
-        .header(header::CACHE_CONTROL, cache_control)
-        .header("X-UI-Asset", asset.path)
-        .body(Body::from(asset.bytes))
-        .ok()
+    let mut builder = Response::builder()
+        .header(header::CACHE_CONTROL, ui_cache_control(&asset))
+        .header(header::ETAG, &etag)
+        .header("X-UI-Asset", asset.path);
+    if asset.gzip.is_some() {
+        builder = builder.header(header::VARY, "Accept-Encoding");
+    }
+    if etag_matches(request_headers, asset.etag) {
+        return builder
+            .status(StatusCode::NOT_MODIFIED)
+            .body(Body::empty())
+            .ok();
+    }
+    builder = builder.header(header::CONTENT_TYPE, asset.content_type);
+    if asset.content_type.starts_with("text/html") && !ui_cache_epoch_current(request_headers) {
+        builder = builder
+            .header("Clear-Site-Data", "\"cache\"")
+            .header(
+                header::SET_COOKIE,
+                format!(
+                    "{UI_CACHE_EPOCH_COOKIE}={UI_CACHE_EPOCH}; Path=/; Max-Age=31536000; SameSite=Lax; HttpOnly; Secure"
+                ),
+            );
+    }
+    let body = match gzip {
+        Some(bytes) => {
+            builder = builder.header(header::CONTENT_ENCODING, "gzip");
+            bytes
+        }
+        None => asset.bytes,
+    };
+    builder.body(Body::from(body)).ok()
 }
 
 #[cfg(test)]
@@ -3715,6 +3812,80 @@ mod tests {
         assert_eq!(details["previewRequired"], true);
         assert!(details.get("untrusted").is_none());
         assert!(account_quota_control_conflict(&crate::ctl_client::CtlError::Timeout).is_none());
+    }
+
+    fn ui_test_asset(path: &'static str, content_type: &'static str) -> ui_assets::UiAsset {
+        ui_assets::UiAsset {
+            path,
+            bytes: b"",
+            gzip: None,
+            etag: "\"abc123\"",
+            content_type,
+            immutable: path.starts_with("_next/static/"),
+        }
+    }
+
+    #[test]
+    fn ui_cache_control_revalidates_build_specific_documents() {
+        let rsc = ui_test_asset("clients/index.txt", "text/plain; charset=utf-8");
+        let html = ui_test_asset("clients/index.html", "text/html; charset=utf-8");
+        let chunk = ui_test_asset("_next/static/chunks/a.js", "application/javascript");
+        let icon = ui_test_asset("router-logo.svg", "image/svg+xml; charset=utf-8");
+        assert_eq!(ui_cache_control(&rsc), "no-cache");
+        assert_eq!(ui_cache_control(&html), "no-cache");
+        assert_eq!(
+            ui_cache_control(&chunk),
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(ui_cache_control(&icon), "public, max-age=86400");
+    }
+
+    #[test]
+    fn ui_etag_matching_accepts_lists_weak_and_encoded_variants() {
+        let headers = |value: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::IF_NONE_MATCH, HeaderValue::from_static(value));
+            headers
+        };
+        assert!(etag_matches(&headers("\"abc123\""), "\"abc123\""));
+        assert!(etag_matches(&headers("W/\"abc123\""), "\"abc123\""));
+        assert!(etag_matches(
+            &headers("\"zzz\", \"abc123-gzip\""),
+            "\"abc123\""
+        ));
+        assert!(etag_matches(&headers("*"), "\"abc123\""));
+        assert!(!etag_matches(&headers("\"abc124\""), "\"abc123\""));
+        assert!(!etag_matches(&HeaderMap::new(), "\"abc123\""));
+    }
+
+    #[test]
+    fn ui_cache_epoch_cookie_is_read_among_other_cookies() {
+        let headers = |value: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::COOKIE, HeaderValue::from_static(value));
+            headers
+        };
+        assert!(ui_cache_epoch_current(&headers(
+            "a=1; ccr_ui_cache_epoch=1; b=2"
+        )));
+        assert!(!ui_cache_epoch_current(&headers("ccr_ui_cache_epoch=0")));
+        assert!(!ui_cache_epoch_current(&headers("xccr_ui_cache_epoch=1")));
+        assert!(!ui_cache_epoch_current(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn ui_gzip_negotiation_honours_refusals() {
+        let headers = |value: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::ACCEPT_ENCODING, HeaderValue::from_static(value));
+            headers
+        };
+        assert!(accepts_gzip(&headers("gzip, deflate, br")));
+        assert!(accepts_gzip(&headers("br;q=1.0, GZIP;q=0.5")));
+        assert!(accepts_gzip(&headers("*")));
+        assert!(!accepts_gzip(&headers("gzip;q=0, br")));
+        assert!(!accepts_gzip(&headers("br")));
+        assert!(!accepts_gzip(&HeaderMap::new()));
     }
 
     #[test]

@@ -47,3 +47,7 @@ url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 zeroize = { version = "1", features = ["derive", "serde"] }
 rpassword = "7"
+
+[build-dependencies]
+flate2 = "1"
+sha2 = "0.10"

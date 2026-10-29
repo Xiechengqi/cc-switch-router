@@ -1,7 +1,12 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use flate2::Compression;
+use flate2::write::GzEncoder;
+use sha2::{Digest, Sha256};
 
 fn main() {
     println!("cargo:rerun-if-changed=.git/HEAD");
@@ -71,11 +76,17 @@ fn generate_ui_assets() {
     }
     files.sort_by(|a, b| a.0.cmp(&b.0));
 
+    let gzip_dir = Path::new(&out_dir).join("ui_gzip");
+    fs::create_dir_all(&gzip_dir).expect("create gzip asset dir");
+    let mut gzip_files = std::collections::HashSet::new();
+
     let mut body = String::new();
     body.push_str(
         "pub struct UiAsset {\n\
          \tpub path: &'static str,\n\
          \tpub bytes: &'static [u8],\n\
+         \tpub gzip: Option<&'static [u8]>,\n\
+         \tpub etag: &'static str,\n\
          \tpub content_type: &'static str,\n\
          \tpub immutable: bool,\n\
          }\n\n\
@@ -85,16 +96,95 @@ fn generate_ui_assets() {
     for (rel, abs) in files {
         let content_type = content_type_for(&rel);
         let immutable = rel.starts_with("_next/static/");
+        let bytes = fs::read(&abs).expect("read frontend asset");
+        let digest = asset_digest(&bytes);
+        let etag = format!("\"{digest}\"");
+        let gzip = gzip_asset(&gzip_dir, &digest, content_type, &bytes, &mut gzip_files)
+            .map(|path| format!("Some(include_bytes!({:?}))", path.display().to_string()))
+            .unwrap_or_else(|| "None".to_string());
         body.push_str(&format!(
-            "\t\t{rel:?} => Some(UiAsset {{ path: {rel:?}, bytes: include_bytes!({abs:?}), content_type: {content_type:?}, immutable: {immutable} }}),\n",
+            "\t\t{rel:?} => Some(UiAsset {{ path: {rel:?}, bytes: include_bytes!({abs:?}), gzip: {gzip}, etag: {etag:?}, content_type: {content_type:?}, immutable: {immutable} }}),\n",
             rel = rel,
             abs = abs.display().to_string(),
+            gzip = gzip,
+            etag = etag,
             content_type = content_type,
             immutable = immutable,
         ));
     }
     body.push_str("\t\t_ => None,\n\t}\n}\n");
     fs::write(dest, body).expect("write generated ui asset table");
+    prune_gzip_dir(&gzip_dir, &gzip_files);
+}
+
+/// Content hash used as the strong validator for conditional revalidation
+/// (HTML and RSC payloads are `no-cache`, so every deploy is picked up while
+/// unchanged files cost a 304) and as the name of the cached gzip file.
+fn asset_digest(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest[..12]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Precompress text assets once so serving them costs no CPU. Results are
+/// content-addressed, so a rerun of this script (any git index change) only
+/// compresses files that changed. Small files and files that barely shrink
+/// are served as-is; a `.skip` marker remembers that verdict.
+fn gzip_asset(
+    gzip_dir: &Path,
+    digest: &str,
+    content_type: &str,
+    bytes: &[u8],
+    used: &mut std::collections::HashSet<String>,
+) -> Option<PathBuf> {
+    let compressible = content_type.starts_with("text/")
+        || content_type.starts_with("application/javascript")
+        || content_type.starts_with("application/json")
+        || content_type.starts_with("image/svg+xml");
+    if !compressible || bytes.len() < 1024 {
+        return None;
+    }
+    let path = gzip_dir.join(format!("{digest}.gz"));
+    let skip = gzip_dir.join(format!("{digest}.skip"));
+    if path.exists() {
+        used.insert(format!("{digest}.gz"));
+        return Some(path);
+    }
+    if skip.exists() {
+        used.insert(format!("{digest}.skip"));
+        return None;
+    }
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::new(9));
+    encoder.write_all(bytes).expect("gzip frontend asset");
+    let compressed = encoder.finish().expect("finish gzip frontend asset");
+    if compressed.len() * 10 > bytes.len() * 9 {
+        fs::write(&skip, b"").expect("write gzip skip marker");
+        used.insert(format!("{digest}.skip"));
+        return None;
+    }
+    fs::write(&path, compressed).expect("write gzip frontend asset");
+    used.insert(format!("{digest}.gz"));
+    Some(path)
+}
+
+fn prune_gzip_dir(gzip_dir: &Path, used: &std::collections::HashSet<String>) {
+    let Ok(entries) = fs::read_dir(gzip_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if used.contains(&name) {
+            continue;
+        }
+        let path = entry.path();
+        let _ = if path.is_dir() {
+            fs::remove_dir_all(path)
+        } else {
+            fs::remove_file(path)
+        };
+    }
 }
 
 fn collect_files(root: &Path, dir: &Path, files: &mut Vec<(String, PathBuf)>) {
