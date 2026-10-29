@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { readFile, mkdir } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { extname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
@@ -58,9 +58,10 @@ try {
           && (!url.searchParams.get("buyerEmail") || r.buyerEmail === url.searchParams.get("buyerEmail"))
           && (!url.searchParams.get("status") || r.status === url.searchParams.get("status"))
           && (!url.searchParams.get("attention") || r.attention === url.searchParams.get("attention")));
-        const start = url.searchParams.get("cursor") ? filtered.findIndex(r => r.id === url.searchParams.get("cursor")) + 1 : 0;
-        const items = filtered.slice(start, start + 50);
-        return json(route, { items, nextCursor: filtered.length > start + 50 ? items.at(-1).id : null, total: filtered.length, serverNow: at });
+        const totalPages = Math.max(1, Math.ceil(filtered.length / 5));
+        const page = Math.min(Number(url.searchParams.get("page") || 1), totalPages);
+        const items = filtered.slice((page - 1) * 5, page * 5);
+        return json(route, { items, page, pageSize: 5, totalPages, total: filtered.length, serverNow: at });
       }
       const record = records.find(r => r.id === decodeURIComponent(path.split("/").at(-1)));
       if (!record) return json(route, {}, 404);
@@ -82,44 +83,49 @@ try {
   });
   const panel = () => page.getByTestId("client-rental-audit");
   const rows = () => panel().getByTestId("rental-audit-row");
-  const detail = () => panel().getByTestId("rental-audit-detail");
+  const detail = () => page.getByTestId("rental-audit-detail");
+  const detailDialog = () => page.getByRole("dialog", { name: "Rental audit details", exact: true });
   const toggle = () => rows().first().getByRole("button");
   const goto = locale => page.goto(`${base}/client-market/?testLocale=${locale || "en"}`);
   const switchActor = async next => { actor = next; await page.evaluate(() => window.dispatchEvent(new Event("router-auth-changed"))); };
-  if (process.env.AUDIT_SCREENSHOTS === "1") await mkdir("/tmp/client-rental-audit-review", { recursive: true });
-  await goto(); await panel().getByText("53 matching records · page 1", { exact: true }).waitFor();
-  assert.equal(await rows().count(), 50);
-  assert.equal(await detail().count(), 0, "all rental details start collapsed");
-  assert.equal(requests.filter(r => r.path !== "/v1/admin/client-market/rental-audit").length, 0, "collapsed rows must not fetch private detail individually");
+  await goto(); await panel().getByText("53 matching records · page 1 / 11", { exact: true }).waitFor();
+  assert.equal(await rows().count(), 5);
+  assert.equal(await detail().count(), 0, "rental details are loaded only on demand");
+  assert.equal(requests.filter(r => r.path !== "/v1/admin/client-market/rental-audit").length, 0, "summary rows must not fetch private detail individually");
   assert.equal(await panel().getByRole("button", { name: "View termination", exact: true }).count(), 0);
   assert.equal(await panel().getByLabel("Provider email", { exact: true }).isVisible(), false);
   await panel().getByRole("button", { name: "Next", exact: true }).click();
-  await panel().getByText("53 matching records · page 2", { exact: true }).waitFor(); assert.equal(await rows().count(), 3);
-  await panel().getByRole("button", { name: "Previous", exact: true }).click(); await panel().getByText("53 matching records · page 1", { exact: true }).waitFor();
-  const selectFilter = async (label, option) => {
-    await panel().getByRole("button", { name: new RegExp(label) }).click();
+  await panel().getByText("53 matching records · page 2 / 11", { exact: true }).waitFor(); assert.equal(await rows().count(), 5);
+  await panel().getByLabel("Go to page", { exact: true }).fill("11");
+  await panel().getByRole("button", { name: "Go", exact: true }).click();
+  await panel().getByText("53 matching records · page 11 / 11", { exact: true }).waitFor(); assert.equal(await rows().count(), 3);
+  await panel().getByLabel("Go to page", { exact: true }).fill("1");
+  await panel().getByLabel("Go to page", { exact: true }).press("Enter");
+  await panel().getByText("53 matching records · page 1 / 11", { exact: true }).waitFor();
+  const selectFilter = async (label, option, within = panel()) => {
+    await within.getByRole("button", { name: new RegExp(label) }).click();
     await page.getByRole("option", { name: option, exact: true }).click();
   };
   await selectFilter("Rental status", "Paid service");
-  assert.equal(await rows().count(), 50, "selecting a draft filter must not submit the form");
+  assert.equal(await rows().count(), 5, "selecting a draft filter must not submit the form");
   await panel().getByRole("button", { name: "Search", exact: true }).click();
   await panel().getByText("No matching rental records.", { exact: true }).waitFor();
   assert.equal(new URLSearchParams(requests.at(-1).query).get("status"), "paid");
   await selectFilter("Rental status", "All");
   await panel().getByRole("button", { name: "Search", exact: true }).click();
-  await panel().getByText("53 matching records · page 1", { exact: true }).waitFor();
+  await panel().getByText("53 matching records · page 1 / 11", { exact: true }).waitFor();
   assert.equal(new URLSearchParams(requests.at(-1).query).has("status"), false, "All restores the empty filter value");
   await panel().getByRole("button", { name: "More filters", exact: true }).click();
-  await selectFilter("Follow-up", "Cleanup failed");
-  await panel().getByLabel("Renter email", { exact: true }).fill("nobody@example.test"); await panel().getByRole("button", { name: "Search", exact: true }).click();
+  const filterDialog = page.getByRole("dialog", { name: "More filters", exact: true });
+  await selectFilter("Follow-up", "Cleanup failed", filterDialog);
+  await filterDialog.getByLabel("Renter email", { exact: true }).fill("nobody@example.test"); await filterDialog.getByRole("button", { name: "Search", exact: true }).click();
   await panel().getByText("No matching rental records.", { exact: true }).waitFor();
   assert.equal(new URLSearchParams(requests.at(-1).query).get("attention"), "cleanup_failed");
-  await panel().getByRole("button", { name: "Reset", exact: true }).click(); await panel().getByText("53 matching records · page 1", { exact: true }).waitFor();
-  assert.equal(await panel().getByRole("button", { name: /Follow-up/ }).innerText(), "All");
+  await panel().getByRole("button", { name: "Reset", exact: true }).click(); await panel().getByText("53 matching records · page 1 / 11", { exact: true }).waitFor();
   await rows().first().getByText("historical-client-1", { exact: true }).click();
   await detail().getByText("Identity captured at order creation", { exact: false }).waitFor();
-  assert.equal(await toggle().getAttribute("aria-expanded"), "true");
-  assert.equal(await page.getByRole("dialog").count(), 0, "rental details expand inline, without a modal");
+  assert.equal(await toggle().getAttribute("aria-haspopup"), "dialog");
+  assert.equal(await detailDialog().count(), 1, "details use a dialog without growing the five-row list");
   await detail().getByText("$0.05 / month", { exact: true }).waitFor();
   await detail().getByText("Manual / ends at period expiry", { exact: true }).waitFor();
   assert.ok(await detail().getByText("$0.005", { exact: true }).count() > 0);
@@ -132,18 +138,21 @@ try {
   await detail().getByRole("button", { name: "View termination", exact: true }).click();
   const termination = page.getByRole("dialog", { name: "Client termination", exact: true });
   await termination.getByRole("alert").waitFor(); await termination.getByRole("button", { name: "Close", exact: true }).click();
-  assert.equal(await detail().count(), 1, "opening a termination keeps the audit row expanded");
-  await toggle().focus(); await page.keyboard.press("Enter"); await detail().waitFor({ state: "hidden" });
-  await page.keyboard.press("Space"); await detail().getByText("$0.05 / month", { exact: true }).waitFor();
+  assert.equal(await detail().count(), 1, "closing termination returns to the audit details");
+  await page.keyboard.press("Escape"); await detail().waitFor({ state: "hidden" });
+  await toggle().focus(); await page.keyboard.press("Enter"); await detail().getByText("$0.05 / month", { exact: true }).waitFor();
+  await page.keyboard.press("Escape"); await detail().waitFor({ state: "hidden" });
+  await toggle().focus(); await page.keyboard.press("Space"); await detail().getByText("$0.05 / month", { exact: true }).waitFor();
+  await page.keyboard.press("Escape"); await detail().waitFor({ state: "hidden" });
   await rows().nth(1).getByRole("button").click();
   await detail().getByText("job:order-2", { exact: true }).waitFor();
-  assert.equal(await detail().count(), 1, "only the selected rental is expanded");
-  assert.equal(await toggle().getAttribute("aria-expanded"), "false");
+  assert.equal(await detail().count(), 1, "only the selected rental has a detail dialog");
+  await page.keyboard.press("Escape"); await detail().waitFor({ state: "hidden" });
   await panel().getByRole("button", { name: "Next", exact: true }).click();
-  await panel().getByText("53 matching records · page 2", { exact: true }).waitFor();
-  assert.equal(await detail().count(), 0, "pagination collapses the previous detail");
+  await panel().getByText("53 matching records · page 2 / 11", { exact: true }).waitFor();
+  assert.equal(await detail().count(), 0, "pagination never restores a previous detail");
   await panel().getByRole("button", { name: "Previous", exact: true }).click();
-  await panel().getByText("53 matching records · page 1", { exact: true }).waitFor();
+  await panel().getByText("53 matching records · page 1 / 11", { exact: true }).waitFor();
 
   auditFailure = true; await panel().getByRole("button", { name: "Refresh audit", exact: true }).click();
   await panel().getByRole("alert").waitFor(); assert.equal(await page.getByRole("button", { name: "Add host", exact: true }).count(), 1);
@@ -153,7 +162,7 @@ try {
   auditForbidden = true; await panel().getByRole("button", { name: "Refresh audit", exact: true }).click();
   await panel().getByRole("alert").waitFor(); assert.equal(await rows().count(), 0, "revoked access must clear previously visible audit records");
   auditForbidden = false; await panel().getByRole("button", { name: "Refresh audit", exact: true }).click();
-  await panel().getByText("53 matching records · page 1", { exact: true }).waitFor();
+  await panel().getByText("53 matching records · page 1 / 11", { exact: true }).waitFor();
 
   holdDetail = true; await toggle().click(); await detail().waitFor();
   await assert.doesNotReject(async () => {
@@ -166,25 +175,23 @@ try {
   await switchActor("admin"); await page.getByRole("button", { name: "Add host", exact: true }).waitFor();
   assert.equal(await panel().count(), 0);
   await switchActor(""); await goto(); assert.equal(await panel().count(), 0);
-  await switchActor("owner"); await panel().getByText("53 matching records · page 1", { exact: true }).waitFor();
+  await switchActor("owner"); await panel().getByText("53 matching records · page 1 / 11", { exact: true }).waitFor();
   assert.equal(requests.filter(r => r.actor !== "owner").length, 0, "non-owners must not issue audit reads");
   assert.equal(await page.evaluate(() => Object.values(localStorage).some(v => v.includes("original-buyer@example.test") || v.includes("original-provider@example.test"))), false);
   for (const locale of ["en", "zh-CN"]) for (const width of [320, 375, 414, 640, 768, 1366]) {
     await page.setViewportSize({ width, height: 1000 }); await goto(locale);
     await rows().first().waitFor();
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), `page overflow at ${locale}/${width}`);
-    if (process.env.AUDIT_SCREENSHOTS === "1" && (width === 375 || width === 1366)) await page.screenshot({ path: `/tmp/client-rental-audit-review/${locale}-${width}-table.png`, animations: "disabled", fullPage: true });
-    const before = await rows().first().locator("td").first().boundingBox();
+    const before = await panel().boundingBox();
     await toggle().focus(); await page.keyboard.press("Enter");
     await detail().getByText("original-provider@example.test", { exact: true }).waitFor();
-    const box = await detail().boundingBox(); assert.ok(box.x >= 0 && box.x + box.width <= width + 1, `inline detail overflows at ${locale}/${width}`);
-    const after = await rows().first().locator("td").first().boundingBox();
-    assert.ok(Math.abs(before.width - after.width) < 1, `expanding must not squeeze the Client column at ${locale}/${width}: ${before.width} -> ${after.width}`);
-    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), `expanded page overflow at ${locale}/${width}`);
-    if (process.env.AUDIT_SCREENSHOTS === "1" && (width === 375 || width === 1366)) await page.screenshot({ path: `/tmp/client-rental-audit-review/${locale}-${width}.png`, animations: "disabled" });
-    await toggle().focus(); await page.keyboard.press("Enter"); await detail().waitFor({ state: "hidden" });
+    const box = await detail().boundingBox(); assert.ok(box.x >= 0 && box.x + box.width <= width + 1, `detail dialog overflows at ${locale}/${width}`);
+    const after = await panel().boundingBox();
+    assert.equal(before.height, after.height, `details must not grow the fixed audit card at ${locale}/${width}`);
+    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), `detail page overflow at ${locale}/${width}`);
+    await page.keyboard.press("Escape"); await detail().waitFor({ state: "hidden" });
   }
   assert.equal(writes.length, 0, `audit must remain read-only: ${writes.join(",")}`);
   assert.deepEqual(errors, []);
-  console.log("Client rental audit: compact summary rows, collapsed filters and lazy inline details, click/keyboard expansion, stable columns across all responsive breakpoints, Owner-only capability, 53-row pagination, exact sub-cent money, paged periods/events, termination entry, isolated failures, revoked-access clearing, account-change cancellation, no private browser storage or writes; EN/ZH at six widths passed");
+  console.log("Client rental audit: fixed-height five-row list, filter and lazy detail dialogs, click/keyboard access, Owner-only capability, numbered pages and direct jumps, exact sub-cent money, independent paged periods/events, termination entry, isolated failures, revoked-access clearing, account-change cancellation, no screenshots, private browser storage or writes; EN/ZH at six widths passed");
 } finally { releaseDetail?.(); await page?.close(); await browser?.close(); await new Promise(resolve => server.close(resolve)); }

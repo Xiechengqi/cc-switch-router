@@ -4,6 +4,8 @@ import {
   DASHBOARD_CLIENTS_PATH,
   DASHBOARD_PROVIDERS_PATH,
   DASHBOARD_SHARE_MARKET_PATH,
+  buildDashboardHref,
+  defaultDashboardRouteFromSearch,
 } from "@/lib/dashboard-nav";
 
 export const HOME_ENTRIES = ["clients", "client-market", "share-market", "wallet", "providers"] as const;
@@ -41,6 +43,40 @@ export function isGatedHomePath(pathname: string) {
 export function isHomeTaskAddress(pathname: string, search: string) {
   if (!isGatedHomePath(pathname)) return true;
   return new URLSearchParams(search).toString().length > 0;
+}
+
+export type HomeGateDecision = {
+  screen: "content" | "loading" | "start";
+  redirect: string | null;
+  needsHome: boolean;
+};
+
+/** Keep navigation and rendering on the same decision. In particular, both
+ * /clients and /clients/ are explicit destinations, never saved-entry redirects.
+ * The first-use guide is unchanged; only the bare root applies a saved entry. */
+export function resolveHomeGate({ pathname, search, authed, loading, home }: {
+  pathname: string;
+  search: string | null;
+  authed: boolean;
+  loading: boolean;
+  home: HomeEntryStatus | "failed" | null;
+}): HomeGateDecision {
+  const path = pathname.replace(/\/+$/, "") || "/";
+  const content: HomeGateDecision = { screen: "content", redirect: null, needsHome: false };
+  if (!isGatedHomePath(path)) return content;
+  if (search === null) return { ...content, screen: "loading" };
+  if (isHomeTaskAddress(path, search)) {
+    return { ...content, redirect: path === "/" ? buildDashboardHref(defaultDashboardRouteFromSearch(search), search) : null };
+  }
+  if (loading) return { ...content, screen: "loading" };
+  if (!authed) return path === "/" ? { ...content, screen: "loading", redirect: DASHBOARD_CLIENTS_PATH } : content;
+  if (home === null) return { screen: "loading", redirect: null, needsHome: true };
+  if (home !== "failed" && !home.hasActivity && home.entry === null) return { screen: "start", redirect: null, needsHome: true };
+  return {
+    screen: path === "/" ? "loading" : "content",
+    redirect: path === "/" ? home !== "failed" && home.entry ? pathForHomeEntry(home.entry) : DASHBOARD_CLIENTS_PATH : null,
+    needsHome: true,
+  };
 }
 
 export function parseHomeEntryStatus(value: unknown): HomeEntryStatus | null {

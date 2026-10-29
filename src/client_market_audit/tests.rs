@@ -91,18 +91,25 @@ fn audit_pages_all_history_with_stable_ties_and_no_resource_dependency() {
         rental(&conn, n, "released");
     }
     conn.execute("DELETE FROM router_ssh_hosts", []).unwrap();
-    let mut cursor = None;
     let mut all = std::collections::HashSet::new();
-    loop {
+    for number in 1..=25 {
         let page = list_tx(
             &conn,
             &AuditQuery {
-                cursor,
+                page: Some(number),
                 ..Default::default()
             },
         )
         .unwrap();
         assert_eq!(page["total"], 125);
+        assert_eq!(page["page"], number);
+        assert_eq!(page["pageSize"], 5);
+        assert_eq!(page["totalPages"], 25);
+        assert_eq!(page["items"].as_array().unwrap().len(), 5);
+        assert_eq!(
+            page["items"][0]["id"],
+            format!("job:job-{:04}", 124 - (number - 1) * 5)
+        );
         for item in page["items"].as_array().unwrap() {
             assert!(all.insert(item["id"].as_str().unwrap().to_string()));
             assert_eq!(item["hostPresent"], false);
@@ -119,22 +126,107 @@ fn audit_pages_all_history_with_stable_ties_and_no_resource_dependency() {
                 )
             );
         }
-        cursor = page["nextCursor"].as_str().map(str::to_string);
-        if cursor.is_none() {
-            break;
-        }
     }
     assert_eq!(all.len(), 125);
     assert!(
         list_tx(
             &conn,
             &AuditQuery {
-                cursor: Some("missing".into()),
+                page: Some(0),
                 ..Default::default()
             }
         )
         .is_err()
     );
+}
+
+#[test]
+fn audit_numbered_pages_jump_directly_and_normalize_empty_partial_and_shrunk_results() {
+    let conn = crate::test_support::database().unwrap();
+    let empty = list_tx(
+        &conn,
+        &AuditQuery {
+            page: Some(u32::MAX),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(empty["items"], json!([]));
+    assert_eq!(empty["page"], 1);
+    assert_eq!(empty["totalPages"], 1);
+    assert_eq!(empty["total"], 0);
+    for n in 0..23 {
+        rental(&conn, n, if n == 0 { "opening" } else { "released" });
+    }
+    // Neither a cursor nor a visit to an earlier page is required.
+    for (number, first, len) in [(3, 12, 5), (5, 2, 3), (u32::MAX, 2, 3), (1, 22, 5)] {
+        let page = list_tx(
+            &conn,
+            &AuditQuery {
+                page: Some(number),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(page["total"], 23);
+        assert_eq!(page["totalPages"], 5);
+        assert_eq!(page["page"], number.min(5));
+        assert_eq!(page["items"].as_array().unwrap().len(), len);
+        assert_eq!(page["items"][0]["id"], format!("job:job-{first:04}"));
+    }
+    let shrunk = list_tx(
+        &conn,
+        &AuditQuery {
+            page: Some(5),
+            status: Some("opening".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(shrunk["page"], 1);
+    assert_eq!(shrunk["totalPages"], 1);
+    assert_eq!(shrunk["total"], 1);
+    assert_eq!(shrunk["items"][0]["id"], "job:job-0000");
+    for page in [
+        json!(-1),
+        json!(1.5),
+        json!(4294967296_u64),
+        json!("1; DROP TABLE users"),
+    ] {
+        assert!(serde_json::from_value::<AuditQuery>(json!({ "page": page })).is_err());
+    }
+    assert!(serde_json::from_value::<AuditQuery>(json!({ "cursor": "retired" })).is_err());
+}
+
+#[test]
+fn audit_page_query_rejects_malformed_http_values() {
+    for (suffix, expected) in [
+        ("", None),
+        ("?page=1", Some(1)),
+        ("?page=4294967295", Some(u32::MAX)),
+    ] {
+        let uri = format!("/v1/admin/client-market/rental-audit{suffix}")
+            .parse()
+            .unwrap();
+        let Query(query) = Query::<AuditQuery>::try_from_uri(&uri).unwrap();
+        assert_eq!(query.page, expected);
+    }
+    for query in [
+        "page=",
+        "page=-1",
+        "page=1.5",
+        "page=1e1",
+        "page=4294967296",
+        "page=NaN",
+        "page=1%3BDROP",
+        "page=1&page=2",
+        "cursor=retired",
+    ] {
+        let uri = format!("/v1/admin/client-market/rental-audit?{query}")
+            .parse()
+            .unwrap();
+        assert!(Query::<AuditQuery>::try_from_uri(&uri).is_err(), "{query}");
+    }
 }
 
 #[test]
@@ -600,7 +692,7 @@ fn audit_lifecycle_uses_indexed_job_lookups_before_page_scoped_money() {
     let mut statement = conn
         .prepare(&format!(
             "EXPLAIN QUERY PLAN {FACTS}SELECT {COLUMNS} FROM records
-         WHERE attention!='none' ORDER BY created_at DESC,id DESC LIMIT 51"
+         WHERE attention!='none' ORDER BY created_at DESC,id DESC LIMIT 5 OFFSET 10"
         ))
         .unwrap();
     let plan = statement
@@ -611,7 +703,7 @@ fn audit_lifecycle_uses_indexed_job_lookups_before_page_scoped_money() {
         .join("\n");
     assert!(plan.contains("idx_client_rental_audit_jobs"), "{plan}");
     assert!(!plan.contains("SCAN cleanup"), "{plan}");
-    // Amount sources must only be accessed by attach_money, after LIMIT 51.
+    // Amount sources must only be accessed by attach_money, after LIMIT 5.
     for source in [
         "market_delivery_slices",
         "market_platform_periods",

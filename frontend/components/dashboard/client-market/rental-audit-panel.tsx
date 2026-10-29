@@ -1,33 +1,26 @@
 "use client";
 
 import * as React from "react";
-import { Button } from "@heroui/react";
-import { ChevronDown, ChevronLeft, ChevronRight, Loader2, RefreshCw, Search } from "lucide-react";
+import { Button, Modal } from "@heroui/react";
+import { ChevronLeft, ChevronRight, Loader2, RefreshCw, RotateCcw, Search, SlidersHorizontal } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { CompactSelect } from "@/components/common/compact-select";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ApiError } from "@/lib/api";
-import { AUDIT_ATTENTION, AUDIT_MONEY_FIELDS, AUDIT_STATUSES, auditFiltersFromDates, getRentalAudit, getRentalAuditDetail, type AuditDetail, type AuditFilters, type AuditPage, type AuditRecord } from "@/lib/client-rental-audit";
+import { AUDIT_ATTENTION, AUDIT_MONEY_FIELDS, AUDIT_STATUSES, auditFiltersFromDates, getRentalAudit, getRentalAuditDetail, parseAuditPageNumber, type AuditDetail, type AuditFilters, type AuditPage, type AuditRecord } from "@/lib/client-rental-audit";
 import { formatWalletUnits } from "@/lib/market-wallet-money";
 import { rentalAuditMessagesEn } from "@/lib/client-rental-audit-messages";
 import type { MessageKey } from "@/lib/i18n";
 
-const FIELD = "h-9 w-full min-w-0 rounded-lg border border-border bg-white px-2 text-sm text-foreground outline-none focus-visible:ring-2 focus-visible:ring-accent";
+/* Hallmark · component: rental audit · genre: modern-minimal · theme: existing Router system
+ * states: default · hover · focus · active · disabled · loading · error · success
+ * pre-emit critique: P5 H4 E4 S5 R5 V4 · no new theme or decorative motion
+ */
+const FIELD = "h-11 w-full min-w-0 rounded-lg border border-border bg-card px-2 text-sm text-foreground outline-none hover:bg-muted/30 focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-50";
+const ACTION = "h-11 min-w-11 shrink-0 whitespace-nowrap px-2 text-xs";
 const INITIAL = { search: "", buyerEmail: "", providerEmail: "", status: "", attention: "", startDate: "", endDate: "" };
 function Field({ label, children, as: Tag = "label" }: { label: string; children: React.ReactNode; as?: "label" | "div" }) {
   return <Tag className="grid min-w-0 gap-1 text-xs text-muted-foreground"><span>{label}</span>{children}</Tag>;
-}
-
-function useAuditColumnCount() {
-  const [count, setCount] = React.useState(6);
-  React.useEffect(() => {
-    const breakpoints = [640, 768, 1024].map(width => window.matchMedia(`(min-width: ${width}px)`));
-    const update = () => setCount(3 + breakpoints.filter(query => query.matches).length);
-    update();
-    for (const query of breakpoints) query.addEventListener("change", update);
-    return () => { for (const query of breakpoints) query.removeEventListener("change", update); };
-  }, []);
-  return count;
 }
 
 /** Separate from public Host filtering/polling. Unmount on capability/account
@@ -42,124 +35,161 @@ function AuditWorkspace({ onTerminationOpen, revision }: { onTerminationOpen: (i
   const { t } = useLocaleText();
   const [draft, setDraft] = React.useState(INITIAL);
   const [filters, setFilters] = React.useState<AuditFilters>({});
-  const [cursors, setCursors] = React.useState<(string | undefined)[]>([undefined]);
+  const [requestedPage, setRequestedPage] = React.useState(1);
   const [refresh, setRefresh] = React.useState(0);
-  const [loaded, setLoaded] = React.useState<{ scope: string; page: AuditPage } | null>(null);
-  const [loading, setLoading] = React.useState(true);
-  const [error, setError] = React.useState<"error" | "invalidDates" | null>(null);
-  const [selected, setSelected] = React.useState<string | null>(null);
+  const [read, setRead] = React.useState<{ scope: string; page: AuditPage | null; state: "loading" | "ready" | "error" } | null>(null);
+  const [selected, setSelected] = React.useState<{ scope: string; id: string } | null>(null);
   const [filtersOpen, setFiltersOpen] = React.useState(false);
-  const filterId = React.useId();
-  // A colspan that includes display:none columns creates phantom table tracks
-  // on small screens and squeezes the visible Client column when expanded.
-  const columnCount = useAuditColumnCount();
-  const cursor = cursors[cursors.length - 1];
-  const scope = JSON.stringify([filters, cursor]);
-  const page = loaded?.scope === scope ? loaded.page : null;
-  React.useEffect(() => { setSelected(null); }, [scope]);
+  const [invalidDates, setInvalidDates] = React.useState(false);
+  const [jump, setJump] = React.useState("1");
+  const [invalidPage, setInvalidPage] = React.useState(false);
+  const request = React.useRef<AbortController | null>(null);
+  const formId = React.useId();
+  const jumpErrorId = React.useId();
+  const scope = JSON.stringify([filters, requestedPage, refresh]);
+  const current = read?.scope === scope ? read : null;
+  const page = current?.page ?? null;
+  const loading = !current || current.state === "loading";
+  const error = current?.state === "error";
+  const selection = selected?.scope === scope ? selected : null;
+  const denyAccess = React.useCallback(() => {
+    request.current?.abort();
+    setRead({ scope, page: null, state: "error" });
+    setSelected(null); setFiltersOpen(false);
+  }, [scope]);
   React.useEffect(() => {
     const controller = new AbortController();
-    setLoading(true); setError(null);
-    void getRentalAudit(filters, cursor, controller.signal).then(value => {
-      if (!controller.signal.aborted) setLoaded({ scope, page: value });
+    request.current = controller;
+    setRead({ scope, page: null, state: "loading" });
+    void getRentalAudit(filters, requestedPage, controller.signal).then(value => {
+      // Use the server's authoritative page after shrinking results. Keeping
+      // the request key avoids a redundant second fetch just to clamp state.
+      if (!controller.signal.aborted) setRead({ scope, page: value, state: "ready" });
     }).catch(error => {
       if (controller.signal.aborted) return;
-      if (error instanceof ApiError && (error.status === 401 || error.status === 403)) { setLoaded(null); setSelected(null); }
-      setError("error");
-    })
-      .finally(() => { if (!controller.signal.aborted) setLoading(false); });
+      if (error instanceof ApiError && (error.status === 401 || error.status === 403)) { setSelected(null); setFiltersOpen(false); }
+      setRead({ scope, page: null, state: "error" });
+    });
     return () => controller.abort();
-  }, [filters, cursor, refresh, revision, scope]);
+  }, [filters, requestedPage, refresh, revision, scope]);
+  // Clear, rather than merely hide, the previous page's selection: returning
+  // to that page must never reopen a stale detail dialog.
+  React.useEffect(() => { setSelected(null); }, [scope]);
+  React.useEffect(() => { setJump(String(page?.page ?? requestedPage)); setInvalidPage(false); }, [page?.page, requestedPage, scope]);
   const apply = (event: React.FormEvent) => {
     event.preventDefault();
-    try { setFilters(auditFiltersFromDates(draft)); setCursors([undefined]); setRefresh(n => n + 1); }
-    catch { setError("invalidDates"); }
+    try {
+      setFilters(auditFiltersFromDates(draft)); setRequestedPage(1); setRefresh(n => n + 1);
+      setInvalidDates(false); setFiltersOpen(false);
+    } catch { setInvalidDates(true); }
   };
-  return <section aria-labelledby="client-rental-audit-title" className="grid min-w-0 gap-3 rounded-xl border border-border bg-card p-3 sm:p-4" data-testid="client-rental-audit">
-    <div className="flex flex-wrap items-center justify-between gap-2">
+  const reset = () => { setDraft(INITIAL); setFilters({}); setRequestedPage(1); setRefresh(n => n + 1); setInvalidDates(false); setFiltersOpen(false); };
+  const jumpToPage = (event: React.FormEvent) => {
+    event.preventDefault();
+    if (loading || !page?.total) return;
+    const number = parseAuditPageNumber(jump, page.totalPages);
+    setInvalidPage(number === null);
+    if (number !== null) { setJump(String(number)); setRequestedPage(number); }
+  };
+  const resetDisabled = !Object.values(draft).some(Boolean) && !Object.values(filters).some(Boolean);
+  return <section aria-labelledby="client-rental-audit-title" className="grid h-[44rem] min-w-0 grid-rows-[2.75rem_8.5rem_1.25rem_19.75rem_minmax(0,1fr)] gap-3 rounded-xl border border-border bg-card p-3 sm:h-[37rem] sm:grid-rows-[2.75rem_4rem_1.25rem_19.75rem_minmax(0,1fr)] sm:p-4" data-testid="client-rental-audit">
+    <div className="flex min-w-0 items-center justify-between gap-2">
       <div><h2 id="client-rental-audit-title" className="text-base font-semibold">{t("rentalAudit.title")}</h2><p className="text-xs text-muted-foreground">{t("rentalAudit.ownerOnly")}</p></div>
-      <Button size="sm" variant="outline" isDisabled={loading} onClick={() => setRefresh(n => n + 1)}><RefreshCw className="h-3.5 w-3.5" />{t("rentalAudit.refresh")}</Button>
+      <Button size="sm" variant="outline" className={ACTION} aria-label={t("rentalAudit.refresh")} isDisabled={loading} onPress={() => { setRequestedPage(1); setRefresh(n => n + 1); }}><RefreshCw aria-hidden className="h-3.5 w-3.5" /><span className="hidden sm:inline">{t("rentalAudit.refresh")}</span></Button>
     </div>
-    <form onSubmit={apply} className="grid gap-3">
-      <div className="flex flex-wrap items-end gap-2">
-        <div className="min-w-0 flex-[1_1_16rem]"><Field label={t("rentalAudit.search")}><input className={FIELD} maxLength={254} value={draft.search} placeholder={t("rentalAudit.searchHint")} onChange={e => setDraft(v => ({ ...v, search: e.target.value }))} /></Field></div>
-        <div className="min-w-0 flex-[1_1_10rem] sm:max-w-48"><Field as="div" label={t("rentalAudit.status")}><CompactSelect ariaLabel={t("rentalAudit.status")} className="w-full" value={draft.status} onChange={status => setDraft(v => ({ ...v, status }))}
-          options={[{ value: "", label: t("rentalAudit.all") }, ...AUDIT_STATUSES.map(value => ({ value, label: t(`rentalAudit.status.${value}`) }))]} /></Field></div>
-        <Button size="sm" variant="primary" type="submit"><Search className="h-3.5 w-3.5" />{t("rentalAudit.apply")}</Button>
-        <Button size="sm" variant="ghost" type="button" aria-expanded={filtersOpen} aria-controls={filterId} onPress={() => setFiltersOpen(open => !open)}>{t("rentalAudit.filters")}<ChevronDown aria-hidden className={`h-3.5 w-3.5 ${filtersOpen ? "rotate-180" : ""}`} /></Button>
-        {Object.values(draft).some(Boolean) || Object.keys(filters).length ? <Button size="sm" variant="ghost" type="button" onClick={() => { setDraft(INITIAL); setFilters({}); setCursors([undefined]); setRefresh(n => n + 1); }}>{t("common.reset")}</Button> : null}
-      </div>
-      <div id={filterId} hidden={!filtersOpen}>
-        <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-          <Field label={t("rentalAudit.buyer")}><input className={FIELD} maxLength={254} value={draft.buyerEmail} onChange={e => setDraft(v => ({ ...v, buyerEmail: e.target.value }))} /></Field>
-          <Field label={t("rentalAudit.provider")}><input className={FIELD} maxLength={254} value={draft.providerEmail} onChange={e => setDraft(v => ({ ...v, providerEmail: e.target.value }))} /></Field>
-          <Field as="div" label={t("rentalAudit.attention")}><CompactSelect ariaLabel={t("rentalAudit.attention")} className="w-full" value={draft.attention} onChange={attention => setDraft(v => ({ ...v, attention }))}
-            options={[{ value: "", label: t("rentalAudit.all") }, { value: "any", label: t("rentalAudit.anyAttention") }, ...AUDIT_ATTENTION.map(value => ({ value, label: t(`rentalAudit.attention.${value}`) }))]} /></Field>
-          <Field label={t("rentalAudit.from")}><input type="date" className={FIELD} value={draft.startDate} onChange={e => setDraft(v => ({ ...v, startDate: e.target.value }))} /></Field>
-          <Field label={t("rentalAudit.until")}><input type="date" className={FIELD} value={draft.endDate} onChange={e => setDraft(v => ({ ...v, endDate: e.target.value }))} /></Field>
-        </div>
+    <form onSubmit={apply} className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-end gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,0.65fr)_auto]">
+      <div className="col-span-2 min-w-0 sm:col-span-1"><Field label={t("rentalAudit.search")}><input className={FIELD} maxLength={254} value={draft.search} placeholder={t("rentalAudit.searchHint")} onChange={e => setDraft(v => ({ ...v, search: e.target.value }))} /></Field></div>
+      <Field as="div" label={t("rentalAudit.status")}><CompactSelect ariaLabel={t("rentalAudit.status")} className="w-full" triggerClassName="h-11" value={draft.status} onChange={status => setDraft(v => ({ ...v, status }))}
+        options={[{ value: "", label: t("rentalAudit.all") }, ...AUDIT_STATUSES.map(value => ({ value, label: t(`rentalAudit.status.${value}`) }))]} /></Field>
+      <div className="flex gap-1">
+        <Button size="sm" variant="primary" className={ACTION} type="submit" aria-label={t("rentalAudit.apply")}><Search aria-hidden className="h-3.5 w-3.5" /><span className="hidden md:inline">{t("rentalAudit.apply")}</span></Button>
+        <Button size="sm" variant="outline" className={ACTION} type="button" aria-haspopup="dialog" aria-label={t("rentalAudit.filters")} onPress={() => setFiltersOpen(true)}><SlidersHorizontal aria-hidden className="h-3.5 w-3.5" /><span className="hidden md:inline">{t("rentalAudit.filters")}</span></Button>
+        <Button size="sm" variant="ghost" className={ACTION} type="button" aria-label={t("common.reset")} isDisabled={resetDisabled} onPress={reset}><RotateCcw aria-hidden className="h-3.5 w-3.5" /><span className="hidden lg:inline">{t("common.reset")}</span></Button>
       </div>
     </form>
-    {error ? <p role="alert" className="text-sm text-destructive">{t(`rentalAudit.${error}`)}</p> : null}
-    {loading ? <p role="status" className="flex items-center gap-2 text-xs text-muted-foreground"><Loader2 className="h-3.5 w-3.5 animate-spin" />{t("rentalAudit.loading")}</p> : null}
-    {page ? <>
-      <div className="max-h-[32rem] min-w-0 overflow-auto rounded-lg border border-border" tabIndex={0} role="region" aria-label={t("rentalAudit.title")}>
+    <div className="min-w-0 text-xs text-destructive">{invalidPage ? <p id={jumpErrorId} role="alert" className="truncate" title={t("rentalAudit.invalidPage", { pages: page?.totalPages ?? 1 })}>{t("rentalAudit.invalidPage", { pages: page?.totalPages ?? 1 })}</p> : invalidDates && !filtersOpen ? <p role="alert">{t("rentalAudit.invalidDates")}</p> : null}</div>
+    <div className="min-w-0 rounded-lg border border-border" role="region" aria-label={t("rentalAudit.title")} aria-busy={loading} data-testid="rental-audit-list">
+      {loading ? <p role="status" className="flex h-full items-center justify-center gap-2 text-sm text-muted-foreground"><Loader2 aria-hidden className="h-4 w-4 animate-spin motion-reduce:animate-none" />{t("rentalAudit.loading")}</p>
+        : error ? <div role="alert" className="grid h-full content-center justify-items-center gap-3 px-4 text-center text-sm"><p className="max-w-md text-destructive">{t("rentalAudit.error")}</p><Button variant="outline" onPress={() => setRefresh(n => n + 1)}>{t("common.retry")}</Button></div>
+        : !page?.items.length ? <p className="grid h-full place-items-center p-4 text-sm text-muted-foreground">{t("rentalAudit.empty")}</p> :
         <table className="w-full table-fixed text-left text-xs">
-          <thead className="sticky top-0 z-10 bg-muted"><tr>
-            <th scope="col" className="px-2 py-2 font-medium sm:px-3">Client</th>
-            <th scope="col" className="hidden px-3 py-2 font-medium md:table-cell">{t("rentalAudit.buyer")}</th>
-            <th scope="col" className="w-24 px-2 py-2 font-medium sm:w-36 sm:px-3">{t("rentalAudit.status")}</th>
-            <th scope="col" className="hidden w-28 px-3 py-2 text-right font-medium sm:table-cell">{t("rentalAudit.chargedShort")}</th>
-            <th scope="col" className="hidden w-44 px-3 py-2 font-medium lg:table-cell">{t("rentalAudit.orderedShort")}</th>
-            <th scope="col" className="w-10"><span className="sr-only">{t("rentalAudit.details")}</span></th>
+          <thead className="bg-muted"><tr className="h-8">
+            <th scope="col" className="px-2 font-medium sm:px-3">Client</th>
+            <th scope="col" className="hidden px-3 font-medium md:table-cell">{t("rentalAudit.buyer")}</th>
+            <th scope="col" className="w-24 px-2 font-medium sm:w-36 sm:px-3">{t("rentalAudit.status")}</th>
+            <th scope="col" className="hidden w-24 px-2 text-right font-medium sm:table-cell">{t("rentalAudit.chargedShort")}</th>
+            <th scope="col" className="hidden w-40 px-3 font-medium lg:table-cell">{t("rentalAudit.orderedShort")}</th>
+            <th scope="col" className="w-11"><span className="sr-only">{t("rentalAudit.details")}</span></th>
           </tr></thead>
-          <tbody>{page.items.map(record => <AuditRow key={record.id} record={record} expanded={selected === record.id}
-            onToggle={() => setSelected(current => current === record.id ? null : record.id)}
-            onTerminationOpen={onTerminationOpen} columnCount={columnCount} revision={`${refresh}:${revision}`} />)}</tbody>
-        </table>
-        {!page.items.length ? <p className="p-5 text-sm text-muted-foreground">{t("rentalAudit.empty")}</p> : null}
+          <tbody>{page.items.map(record => <AuditRow key={record.id} record={record} onOpen={() => setSelected({ scope, id: record.id })} />)}</tbody>
+        </table>}
+    </div>
+    <nav className="grid min-w-0 content-start grid-cols-2 gap-1 text-xs text-muted-foreground" aria-label={t("rentalAudit.pagination")}>
+      <p className="col-span-2 truncate tabular-nums" aria-live="polite">{page ? t("rentalAudit.count", { count: page.total, page: page.page, pages: page.totalPages }) : "—"}</p>
+      <div className="col-span-2 flex justify-between gap-1 sm:col-span-1 sm:justify-start">
+        <Button size="sm" variant="outline" className={ACTION} isDisabled={loading || !page || page.page === 1} onPress={() => { if (page) setRequestedPage(page.page - 1); }}><ChevronLeft aria-hidden className="h-3.5 w-3.5" />{t("common.previous")}</Button>
+        <Button size="sm" variant="outline" className={ACTION} isDisabled={loading || !page || page.page >= page.totalPages} onPress={() => { if (page) setRequestedPage(page.page + 1); }}>{t("common.next")}<ChevronRight aria-hidden className="h-3.5 w-3.5" /></Button>
       </div>
-      <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground"><p>{t("rentalAudit.count", { count: page.total, page: cursors.length })}</p><div className="flex gap-1">
-        <Button size="sm" variant="outline" isDisabled={loading || cursors.length === 1} onClick={() => setCursors(v => v.slice(0, -1))}><ChevronLeft className="h-3.5 w-3.5" />{t("common.previous")}</Button>
-        <Button size="sm" variant="outline" isDisabled={loading || !page.nextCursor} onClick={() => { if (page.nextCursor) setCursors(v => [...v, page.nextCursor!]); }}>{t("common.next")}<ChevronRight className="h-3.5 w-3.5" /></Button>
-      </div></div>
-    </> : null}
+      <form className="col-span-2 flex min-w-0 items-center justify-between gap-2 sm:col-span-1 sm:justify-end" onSubmit={jumpToPage}>
+        <label htmlFor={`${formId}-page`} className="whitespace-nowrap">{t("rentalAudit.pageNumber")}</label>
+        <input id={`${formId}-page`} className={`${FIELD} max-w-20 tabular-nums ${invalidPage ? "border-destructive" : ""}`} inputMode="numeric" maxLength={10} value={jump} disabled={loading || !page?.total} aria-invalid={invalidPage} aria-describedby={invalidPage ? jumpErrorId : undefined} onChange={event => { setJump(event.target.value); setInvalidPage(false); }} />
+        <Button size="sm" variant="outline" className={ACTION} type="submit" isDisabled={loading || !page?.total}>{t("rentalAudit.jump")}</Button>
+      </form>
+    </nav>
+    {filtersOpen ? <AuditDialog title={t("rentalAudit.filters")} onClose={() => setFiltersOpen(false)} footer={<><Button variant="ghost" isDisabled={resetDisabled} onPress={reset}>{t("common.reset")}</Button><Button variant="primary" type="submit" form={formId}>{t("rentalAudit.apply")}</Button></>}>
+      <form id={formId} onSubmit={apply} className="grid min-w-0 gap-3 sm:grid-cols-2">
+        <Field label={t("rentalAudit.buyer")}><input className={FIELD} maxLength={254} value={draft.buyerEmail} onChange={e => setDraft(v => ({ ...v, buyerEmail: e.target.value }))} /></Field>
+        <Field label={t("rentalAudit.provider")}><input className={FIELD} maxLength={254} value={draft.providerEmail} onChange={e => setDraft(v => ({ ...v, providerEmail: e.target.value }))} /></Field>
+        <Field as="div" label={t("rentalAudit.attention")}><CompactSelect ariaLabel={t("rentalAudit.attention")} className="w-full" triggerClassName="h-11" value={draft.attention} onChange={attention => setDraft(v => ({ ...v, attention }))}
+          options={[{ value: "", label: t("rentalAudit.all") }, { value: "any", label: t("rentalAudit.anyAttention") }, ...AUDIT_ATTENTION.map(value => ({ value, label: t(`rentalAudit.attention.${value}`) }))]} /></Field>
+        <Field label={t("rentalAudit.from")}><input type="date" className={FIELD} value={draft.startDate} onChange={e => setDraft(v => ({ ...v, startDate: e.target.value }))} /></Field>
+        <Field label={t("rentalAudit.until")}><input type="date" className={FIELD} value={draft.endDate} onChange={e => setDraft(v => ({ ...v, endDate: e.target.value }))} /></Field>
+        {invalidDates ? <p role="alert" className="text-sm text-destructive sm:col-span-2">{t("rentalAudit.invalidDates")}</p> : null}
+      </form>
+    </AuditDialog> : null}
+    {selection ? <AuditDialog title={t("rentalAudit.details")} onClose={() => setSelected(null)}><RentalDetail key={selection.id} id={selection.id} revision={`${refresh}:${revision}`} onTerminationOpen={onTerminationOpen} onForbidden={denyAccess} /></AuditDialog> : null}
   </section>;
 }
 
-function AuditRow({ record, expanded, onToggle, onTerminationOpen, columnCount, revision }: {
-  record: AuditRecord; expanded: boolean; onToggle: () => void; onTerminationOpen: (id: string) => void; columnCount: number; revision: string;
-}) {
-  const { locale, t } = useLocaleText();
-  const detailId = React.useId();
-  const client = record.clientSubdomain || record.installationId || record.jobId || record.id;
-  const buyer = record.buyerEmail || t("rentalAudit.notRecorded");
-  return <>
-    <tr data-testid="rental-audit-row" className={`cursor-pointer border-t border-border align-middle hover:bg-muted/50 ${expanded ? "bg-muted/50" : ""}`}
-      onClick={event => {
-        if ((event.target as HTMLElement).closest("button, a") || window.getSelection()?.toString()) return;
-        onToggle();
-      }}>
-      <td className="px-2 py-3 sm:px-3"><p className="break-all font-medium">{client}</p><p className="mt-1 break-all text-muted-foreground md:hidden">{buyer}</p></td>
-      <td className="hidden break-all px-3 py-3 md:table-cell">{buyer}</td>
-      <td className="px-2 py-3 sm:px-3"><p>{t(`rentalAudit.status.${record.status}`)}</p>{record.attention !== "none" ? <p className="mt-1 text-amber-700">{t(`rentalAudit.attention.${record.attention}`)}</p> : null}</td>
-      <td className="hidden break-all px-3 py-3 text-right tabular-nums sm:table-cell">{record.money ? formatWalletUnits(record.money.chargedUnits, "$", locale) : <span title={t("rentalAudit.moneyUnavailable")}>—</span>}</td>
-      <td className="hidden px-3 py-3 text-muted-foreground lg:table-cell"><time dateTime={record.createdAt}>{new Intl.DateTimeFormat(locale, { dateStyle: "short", timeStyle: "short" }).format(new Date(record.createdAt))}</time></td>
-      <td className="px-1 py-2"><Button size="sm" variant="ghost" isIconOnly aria-label={t(expanded ? "rentalAudit.collapse" : "rentalAudit.expand", { client })}
-        aria-expanded={expanded} aria-controls={detailId} onPress={onToggle}>
-        <ChevronDown aria-hidden className={`h-4 w-4 ${expanded ? "rotate-180" : ""}`} />
-      </Button></td>
-    </tr>
-    {expanded ? <tr><td colSpan={columnCount} className="border-t border-border bg-muted/20 p-3 sm:p-4"><RentalDetail id={record.id} regionId={detailId} revision={revision} onTerminationOpen={onTerminationOpen} /></td></tr> : null}
-  </>;
+function AuditDialog({ title, onClose, children, footer }: { title: string; onClose: () => void; children: React.ReactNode; footer?: React.ReactNode }) {
+  const { t } = useLocaleText();
+  return <Modal.Backdrop isOpen onOpenChange={open => { if (!open) onClose(); }}>
+    <Modal.Container placement="center"><Modal.Dialog className="light w-[min(52rem,calc(100%-2rem))] max-w-none bg-card text-foreground">
+      <Modal.CloseTrigger />
+      <Modal.Header><Modal.Heading>{title}</Modal.Heading></Modal.Header>
+      <Modal.Body className="grid min-w-0 max-h-[65dvh] gap-4 overflow-y-auto overscroll-contain">{children}</Modal.Body>
+      <Modal.Footer className="flex-wrap">{footer}<Button variant="outline" className="whitespace-nowrap" onPress={onClose}>{t("common.close")}</Button></Modal.Footer>
+    </Modal.Dialog></Modal.Container>
+  </Modal.Backdrop>;
 }
 
-function RentalDetail({ id, regionId, revision, onTerminationOpen }: { id: string; regionId: string; revision: string; onTerminationOpen: (id: string) => void }) {
+function AuditRow({ record, onOpen }: { record: AuditRecord; onOpen: () => void }) {
+  const { locale, t } = useLocaleText();
+  const client = record.clientSubdomain || record.installationId || record.jobId || record.id;
+  const buyer = record.buyerEmail || t("rentalAudit.notRecorded");
+  return <tr data-testid="rental-audit-row" className="h-14 cursor-pointer border-t border-border align-middle hover:bg-muted/50 focus-within:bg-muted/50"
+      onClick={event => {
+        if ((event.target as HTMLElement).closest("button, a") || window.getSelection()?.toString()) return;
+        onOpen();
+      }}>
+      <td className="px-2 sm:px-3"><p className="truncate font-medium" title={client}>{client}</p><p className="mt-1 truncate text-muted-foreground md:hidden" title={buyer}>{buyer}</p></td>
+      <td className="hidden px-3 md:table-cell"><p className="truncate" title={buyer}>{buyer}</p></td>
+      <td className="px-2 sm:px-3"><p className="truncate" title={t(`rentalAudit.status.${record.status}`)}>{t(`rentalAudit.status.${record.status}`)}</p>{record.attention !== "none" ? <p className="mt-1 truncate font-medium text-foreground" title={t(`rentalAudit.attention.${record.attention}`)}>{t(`rentalAudit.attention.${record.attention}`)}</p> : null}</td>
+      <td className="hidden px-2 text-right tabular-nums sm:table-cell"><p className="truncate">{record.money ? formatWalletUnits(record.money.chargedUnits, "$", locale) : <span title={t("rentalAudit.moneyUnavailable")}>—</span>}</p></td>
+      <td className="hidden px-3 text-muted-foreground lg:table-cell"><time className="block truncate" dateTime={record.createdAt}>{new Intl.DateTimeFormat(locale, { dateStyle: "short", timeStyle: "short" }).format(new Date(record.createdAt))}</time></td>
+      <td><Button size="sm" variant="ghost" className="h-11 w-11" isIconOnly aria-label={t("rentalAudit.open", { client })} aria-haspopup="dialog" onPress={onOpen}>
+        <ChevronRight aria-hidden className="h-4 w-4" />
+      </Button></td>
+    </tr>;
+}
+
+function RentalDetail({ id, revision, onTerminationOpen, onForbidden }: { id: string; revision: string; onTerminationOpen: (id: string) => void; onForbidden: () => void }) {
   const { locale, t } = useLocaleText();
   const [detail, setDetail] = React.useState<AuditDetail | null>(null);
   const [busy, setBusy] = React.useState(true);
   const [error, setError] = React.useState(false);
   const request = React.useRef<AbortController | null>(null);
+  const forbidden = React.useRef(onForbidden); forbidden.current = onForbidden;
   const latest = React.useRef(detail); latest.current = detail;
   const load = React.useCallback(async (kind: "initial" | "periods" | "events" = "initial") => {
     request.current?.abort(); const controller = new AbortController(); request.current = controller;
@@ -175,7 +205,7 @@ function RentalDetail({ id, regionId, revision, onTerminationOpen }: { id: strin
       });
     } catch (error) {
       if (!controller.signal.aborted) {
-        if (error instanceof ApiError && (error.status === 401 || error.status === 403)) setDetail(null);
+        if (error instanceof ApiError && (error.status === 401 || error.status === 403)) { setDetail(null); forbidden.current(); }
         setError(true);
       }
     }
@@ -200,7 +230,7 @@ function RentalDetail({ id, regionId, revision, onTerminationOpen }: { id: strin
     [t("rentalAudit.price"), price], [t("rentalAudit.renewal"), renewal],
     [t("rentalAudit.trial"), record.trialSecondsRemaining === null ? "—" : `${detail?.trialConsumedSeconds ?? 0} / ${record.trialSecondsRemaining}`],
   ] : [];
-  return <section id={regionId} aria-label={t("rentalAudit.details")} className="grid min-w-0 gap-4" data-testid="rental-audit-detail">
+  return <section aria-label={t("rentalAudit.details")} className="grid min-w-0 gap-4" data-testid="rental-audit-detail">
       {busy ? <p role="status" className="text-xs text-muted-foreground">{t("rentalAudit.loading")}</p> : null}
       {error ? <div role="alert" className="text-sm text-destructive">{t("rentalAudit.error")} <Button size="sm" variant="ghost" onClick={() => void load()}>{t("common.retry")}</Button></div> : null}
       {record && detail ? <>

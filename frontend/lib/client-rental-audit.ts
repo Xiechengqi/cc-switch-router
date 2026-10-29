@@ -22,7 +22,9 @@ export type AuditFilters = {
   search?: string; buyerEmail?: string; providerEmail?: string; status?: string;
   attention?: string; from?: string; until?: string;
 };
-export type AuditPage = { items: AuditRecord[]; nextCursor: string | null; total: number; serverNow: string };
+export const AUDIT_LIST_PAGE_SIZE = 5;
+const MAX_PAGE = 4_294_967_295;
+export type AuditPage = { items: AuditRecord[]; total: number; page: number; pageSize: typeof AUDIT_LIST_PAGE_SIZE; totalPages: number; serverNow: string };
 export type AuditPeriod = {
   id: string; sequence: number; startedAt: string; endedAt: string; debitedAt: string;
   amountUnits: string; serviceUnits: string; returnedUnits: string; compensationUnits: string;
@@ -53,10 +55,20 @@ function validRecord(v: unknown): v is AuditRecord {
     && (v.money === null || object(v.money) && AUDIT_MONEY_FIELDS.every(k => units((v.money as Record<string, unknown>)[k])));
 }
 export function parseAuditPage(v: unknown): AuditPage {
-  if (!object(v) || !Array.isArray(v.items) || v.items.length > 50 || !v.items.every(validRecord)
-    || new Set(v.items.map(i => i.id)).size !== v.items.length || !nullableText(v.nextCursor) || !integer(v.total) || !time(v.serverNow)
-    || v.nextCursor !== null && v.nextCursor !== v.items.at(-1)?.id) throw new Error("Invalid rental audit page");
+  if (!object(v) || !Array.isArray(v.items) || v.items.length > AUDIT_LIST_PAGE_SIZE || !v.items.every(validRecord)
+    || new Set(v.items.map(i => i.id)).size !== v.items.length || !integer(v.total) || !time(v.serverNow)
+    || v.pageSize !== AUDIT_LIST_PAGE_SIZE || !integer(v.page) || v.page < 1 || v.page > MAX_PAGE
+    || !integer(v.totalPages) || v.totalPages !== Math.max(1, Math.ceil(v.total / AUDIT_LIST_PAGE_SIZE)) || v.page > v.totalPages
+    || v.items.length !== Math.min(AUDIT_LIST_PAGE_SIZE, v.total - (v.page - 1) * AUDIT_LIST_PAGE_SIZE)) throw new Error("Invalid rental audit page");
   return v as AuditPage;
+}
+
+/** Explicit submission only; never coerce decimals, exponents or unsafe pages. */
+export function parseAuditPageNumber(value: string, totalPages: number): number | null {
+  const trimmed = value.trim();
+  if (!/^[1-9]\d{0,9}$/.test(trimmed) || !integer(totalPages) || totalPages < 1) return null;
+  const page = Number(trimmed);
+  return page <= Math.min(totalPages, MAX_PAGE) ? page : null;
 }
 export function parseAuditDetail(v: unknown, id: string): AuditDetail {
   if (!object(v) || !validRecord(v.record) || v.record.id !== id || !Array.isArray(v.periods) || v.periods.length > 50
@@ -85,10 +97,11 @@ export function auditFiltersFromDates(value: AuditFilters & { startDate?: string
   return { ...rest, from, until };
 }
 const ROOT = "/v1/admin/client-market/rental-audit";
-export async function getRentalAudit(filters: AuditFilters, cursor?: string, signal?: AbortSignal) {
+export async function getRentalAudit(filters: AuditFilters, page = 1, signal?: AbortSignal) {
+  if (!Number.isInteger(page) || page < 1 || page > MAX_PAGE) throw new Error("Invalid rental audit page number");
   const query = new URLSearchParams();
   for (const [key, value] of Object.entries(filters)) if (value?.trim()) query.set(key, value.trim());
-  if (cursor) query.set("cursor", cursor);
+  query.set("page", String(page));
   return parseAuditPage(await parseJson<unknown>(await authFetch(`${ROOT}?${query}`, { cache: "no-store", signal })));
 }
 export async function getRentalAuditDetail(id: string, options: { periodCursor?: number; eventCursor?: string } = {}, signal?: AbortSignal) {

@@ -85,12 +85,12 @@ fn periods_tx(
         "compensationUnits":r.get::<_,i64>(7)?.to_string(),"journalId":r.get::<_,String>(8)?,"debitedAt":r.get::<_,String>(9)?,
         "status":r.get::<_,String>(10)?,"terminationRateBps":r.get::<_,Option<i64>>(11)?,"commissionRateBps":r.get::<_,Option<i64>>(12)?
     }))).map_err(db_error("query audited periods"))?.collect::<crate::db::Result<Vec<_>>>().map_err(db_error("read audited periods"))?;
-    let next = if rows.len() > PAGE_SIZE {
-        rows[PAGE_SIZE - 1]["sequence"].as_i64()
+    let next = if rows.len() > DETAIL_PAGE_SIZE {
+        rows[DETAIL_PAGE_SIZE - 1]["sequence"].as_i64()
     } else {
         None
     };
-    rows.truncate(PAGE_SIZE);
+    rows.truncate(DETAIL_PAGE_SIZE);
     Ok((rows, next))
 }
 
@@ -146,12 +146,12 @@ fn events_tx(
         "id":r.get::<_,String>(0)?,"action":safe_action(&r.get::<_,String>(1)?),"actorEmail":r.get::<_,Option<String>>(2)?,
         "createdAt":r.get::<_,String>(3)?,"note":r.get::<_,Option<String>>(4)?.map(|s|s.chars().take(2000).collect::<String>())
     }))).map_err(db_error("query audited events"))?.collect::<crate::db::Result<Vec<_>>>().map_err(db_error("read audited events"))?;
-    let next = if rows.len() > PAGE_SIZE {
-        rows[PAGE_SIZE - 1]["id"].clone()
+    let next = if rows.len() > DETAIL_PAGE_SIZE {
+        rows[DETAIL_PAGE_SIZE - 1]["id"].clone()
     } else {
         Value::Null
     };
-    rows.truncate(PAGE_SIZE);
+    rows.truncate(DETAIL_PAGE_SIZE);
     Ok((rows, next))
 }
 

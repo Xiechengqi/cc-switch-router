@@ -17,7 +17,8 @@ mod detail;
 #[cfg(test)]
 mod tests;
 
-const PAGE_SIZE: usize = 50;
+const LIST_PAGE_SIZE: i64 = 5;
+const DETAIL_PAGE_SIZE: usize = 50;
 fn db_error(context: &'static str) -> impl FnOnce(crate::db::Error) -> AppError {
     move |error| AppError::Internal(format!("{context} failed: {error}"))
 }
@@ -97,7 +98,7 @@ struct AuditQuery {
     attention: Option<String>,
     from: Option<String>,
     until: Option<String>,
-    cursor: Option<String>,
+    page: Option<u32>,
 }
 
 async fn list(
@@ -296,7 +297,11 @@ fn record_row(r: &crate::db::Row<'_>) -> crate::db::Result<Value> {
 }
 
 fn list_tx(conn: &Connection, q: &AuditQuery) -> Result<Value, AppError> {
-    let (mut predicate, mut args) = filters(q)?;
+    let requested_page = q.page.unwrap_or(1);
+    if requested_page == 0 {
+        return Err(AppError::BadRequest("invalid rental audit page".into()));
+    }
+    let (predicate, mut args) = filters(q)?;
     let total: i64 = conn
         .query_row(
             &format!("{FACTS}SELECT COUNT(*) FROM records WHERE {predicate}"),
@@ -304,42 +309,27 @@ fn list_tx(conn: &Connection, q: &AuditQuery) -> Result<Value, AppError> {
             |r| r.get(0),
         )
         .map_err(db_error("count rental audit records"))?;
-    if let Some(cursor) = q.cursor.as_deref() {
-        if cursor.len() > 200 {
-            return Err(AppError::BadRequest("invalid rental audit cursor".into()));
-        }
-        let at: String = conn
-            .query_row(
-                "SELECT created_at FROM client_market_rental_identities WHERE id=?1",
-                params![cursor],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(db_error("read rental audit cursor"))?
-            .ok_or_else(|| AppError::BadRequest("invalid rental audit cursor".into()))?;
-        args.push(SqlValue::Text(at));
-        let time_arg = args.len();
-        args.push(SqlValue::Text(cursor.into()));
-        let id_arg = args.len();
-        predicate.push_str(&format!(
-            " AND (created_at<?{time_arg} OR (created_at=?{time_arg} AND id<?{id_arg}))"
-        ));
-    }
-    let mut statement=conn.prepare(&format!("{FACTS}SELECT {COLUMNS} FROM records WHERE {predicate} ORDER BY created_at DESC,id DESC LIMIT 51"))
+    // Count and records share the caller's read transaction. A filter or live
+    // lifecycle change may remove the requested page; return the last valid
+    // page instead of an empty, stranded page. Empty results use page 1 of 1.
+    let total_pages = (total / LIST_PAGE_SIZE + i64::from(total % LIST_PAGE_SIZE != 0)).max(1);
+    let page = i64::from(requested_page).min(total_pages);
+    args.push(SqlValue::Integer(LIST_PAGE_SIZE));
+    let limit_arg = args.len();
+    args.push(SqlValue::Integer((page - 1) * LIST_PAGE_SIZE));
+    let offset_arg = args.len();
+    let mut statement=conn.prepare(&format!("{FACTS}SELECT {COLUMNS} FROM records WHERE {predicate} ORDER BY created_at DESC,id DESC LIMIT ?{limit_arg} OFFSET ?{offset_arg}"))
         .map_err(db_error("prepare rental audit records"))?;
     let mut items = statement
         .query_map(args, record_row)
         .map_err(db_error("query rental audit records"))?
         .collect::<crate::db::Result<Vec<_>>>()
         .map_err(db_error("read rental audit records"))?;
-    let next = if items.len() > PAGE_SIZE {
-        items[PAGE_SIZE - 1]["id"].clone()
-    } else {
-        Value::Null
-    };
-    items.truncate(PAGE_SIZE);
     attach_money(conn, &mut items)?;
-    Ok(json!({"items":items,"nextCursor":next,"total":total,"serverNow":Utc::now().to_rfc3339()}))
+    Ok(
+        json!({"items":items,"total":total,"page":page,"pageSize":LIST_PAGE_SIZE,
+        "totalPages":total_pages,"serverNow":Utc::now().to_rfc3339()}),
+    )
 }
 
 const MONEY_FIELDS: [&str; 9] = [
