@@ -281,7 +281,7 @@ try {
       .click();
   };
 
-  await page.goto(`${base}/account/api-keys/`);
+  await page.goto(`${base}/account/security/`);
   await page.getByRole("button", { name: "Login", exact: true }).click();
   assert.equal(
     await dialog()

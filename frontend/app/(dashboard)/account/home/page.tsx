@@ -1,7 +1,5 @@
-"use client";
-
-import { AccountHomePage } from "@/components/dashboard/account-home-page";
+import { AccountLegacyRedirect } from "@/components/dashboard/account-legacy-redirect";
 
 export default function Page() {
-  return <AccountHomePage />;
+  return <AccountLegacyRedirect />;
 }

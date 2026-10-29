@@ -1,22 +1,10 @@
 "use client";
 
 import * as React from "react";
-import { BarChart3, ChevronDown, ChevronRight, Loader2 } from "lucide-react";
-import { useAuth } from "@/components/auth/auth-provider";
+import { ChevronDown, ChevronRight } from "lucide-react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import {
-  UsageModelTable,
-  UsagePeriodChips,
-  UsageTokenMixBar,
-  UsageTotalsStrip,
-} from "@/components/dashboard/account-usage-shared";
-import { getMyUsageProvider } from "@/lib/api";
-import type {
-  AccountUsagePeriod,
-  ProviderInstallationUsage,
-  ProviderShareUsage,
-  ProviderUsageResponse,
-} from "@/lib/types";
+import { UsageModelTable } from "@/components/dashboard/account-usage-shared";
+import type { ProviderInstallationUsage, ProviderShareUsage } from "@/lib/types";
 import { compactTokens } from "@/lib/utils";
 
 function ShareBlock({ share }: { share: ProviderShareUsage }) {
@@ -32,7 +20,8 @@ function ShareBlock({ share }: { share: ProviderShareUsage }) {
     <div className="rounded-lg border border-border bg-background">
       <button
         type="button"
-        className="flex w-full items-center gap-2 px-3 py-2.5 text-left"
+        aria-expanded={open}
+        className="flex min-h-11 w-full items-center gap-2 px-3 py-2.5 text-left"
         onClick={() => setOpen((value) => !value)}
       >
         {open ? (
@@ -105,6 +94,7 @@ function InstallationBlock({ installation }: { installation: ProviderInstallatio
     <section className="grid gap-2 rounded-xl border border-border bg-card p-3 sm:p-4">
       <button
         type="button"
+        aria-expanded={open}
         className="flex w-full items-center gap-3 text-left"
         onClick={() => setOpen((value) => !value)}
       >
@@ -139,98 +129,23 @@ function InstallationBlock({ installation }: { installation: ProviderInstallatio
   );
 }
 
-export function AccountProviderUsagePanel() {
+/** Provider usage by Client installation, then by Share, busiest first. */
+export function ProviderUsageInstallations({ installations }: { installations: ProviderInstallationUsage[] }) {
   const { t } = useLocaleText();
-  const { session, loading: authLoading } = useAuth();
-  const authed = !!session?.authenticated;
-
-  const [period, setPeriod] = React.useState<AccountUsagePeriod>("7d");
-  const [usage, setUsage] = React.useState<ProviderUsageResponse | null>(null);
-  const [loading, setLoading] = React.useState(false);
-  const [error, setError] = React.useState("");
-
-  React.useEffect(() => {
-    if (!authed) return;
-    let cancelled = false;
-    setLoading(true);
-    setError("");
-    getMyUsageProvider(period)
-      .then((data) => {
-        if (!cancelled) setUsage(data);
-      })
-      .catch((err) => {
-        if (!cancelled) {
-          setUsage(null);
-          setError(err instanceof Error ? err.message : String(err));
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [authed, period]);
-
-  if (authLoading) {
-    return (
-      <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
-        <Loader2 className="h-4 w-4 animate-spin" />
-        {t("account.loading")}
-      </div>
-    );
-  }
-
-  if (!authed) {
-    return <p className="py-6 text-sm text-muted-foreground">{t("account.usage.signInRequired")}</p>;
-  }
-
   return (
-    <div className="grid min-w-0 gap-6">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <h2 className="flex items-center gap-2 text-base font-semibold text-foreground">
-            <BarChart3 className="h-4 w-4 text-muted-foreground" aria-hidden />
-            {t("account.providerUsage.title")}
-          </h2>
-          <p className="mt-0.5 text-sm text-muted-foreground">{t("account.providerUsage.hint")}</p>
+    <section className="grid gap-2">
+      <h3 className="text-sm font-semibold text-foreground">{t("account.providerUsage.installations")}</h3>
+      {installations.length ? (
+        <div className="grid gap-3">
+          {installations.map((installation) => (
+            <InstallationBlock key={installation.installationId} installation={installation} />
+          ))}
         </div>
-        <UsagePeriodChips period={period} onChange={setPeriod} t={t} />
-      </div>
-
-      {error ? (
-        <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div>
-      ) : null}
-
-      {loading && !usage ? (
-        <div className="flex items-center gap-2 py-4 text-sm text-muted-foreground">
-          <Loader2 className="h-4 w-4 animate-spin" />
-          {t("account.usage.loading")}
-        </div>
-      ) : null}
-
-      {usage ? (
-        <>
-          <UsageTotalsStrip totals={usage} t={t} />
-          <UsageTokenMixBar totals={usage} t={t} />
-          <div>
-            <h3 className="mb-2 text-sm font-semibold text-foreground">
-              {t("account.providerUsage.installations")}
-            </h3>
-            {usage.installations.length ? (
-              <div className="grid gap-3">
-                {usage.installations.map((installation) => (
-                  <InstallationBlock key={installation.installationId} installation={installation} />
-                ))}
-              </div>
-            ) : (
-              <p className="rounded-lg border border-dashed border-border px-3 py-6 text-center text-sm text-muted-foreground">
-                {t("account.providerUsage.noInstallations")}
-              </p>
-            )}
-          </div>
-        </>
-      ) : null}
-    </div>
+      ) : (
+        <p className="rounded-lg border border-dashed border-border px-3 py-6 text-center text-sm text-muted-foreground">
+          {t("account.providerUsage.noInstallations")}
+        </p>
+      )}
+    </section>
   );
 }

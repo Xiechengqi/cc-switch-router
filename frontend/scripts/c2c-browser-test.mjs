@@ -585,14 +585,16 @@ try {
   }
   heldIncome = false;
   // Client history has its own error and retry, scoped to the selected role.
-  await sell.page.goto(`${base}/account/client/?tab=provider`);
+  await sell.page.goto(`${base}/account/provider-settings/?tab=listings&market=client`);
   const terminationError = sell.page.getByRole("alert").filter({ hasText: "Termination settlements could not be loaded" });
   await terminationError.waitFor();
   terminationFailure = false;
   await terminationError.getByRole("button", { name: "Retry", exact: true }).click();
   await terminationError.waitFor({ state: "hidden" });
+  // The retired per-market address lands on My rentals, narrowed to Client Market.
   await page.goto(`${base}/account/client/`);
-  await page.getByRole("tab", { name: "User", exact: true }).waitFor();
+  await page.waitForURL(`${base}/account/rentals/?market=client`);
+  await page.getByRole("tab", { name: "Client Market", exact: true, selected: true }).waitFor();
   await page.goto(`${base}/account/provider-settings/?tab=income`); await page.locator("#income").getByText("No earnings yet.", { exact: true }).waitFor();
   assert.equal(await page.locator("#income dl").count(), 0, "empty income does not show a wall of zeros");
   const guest = await open("guest");

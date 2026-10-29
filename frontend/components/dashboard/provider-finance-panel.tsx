@@ -5,6 +5,7 @@ import Link from "next/link";
 import { Button } from "@heroui/react";
 import { ShieldAlert } from "lucide-react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
+import { AccountSectionError } from "@/components/dashboard/account-section";
 import { WalletBadge } from "@/components/market/wallet-primitives";
 import { messages, type MessageKey } from "@/lib/i18n";
 import {
@@ -88,13 +89,13 @@ export function ProviderFinancePanel() {
 
   return <section id="income" className="grid min-w-0 scroll-mt-6 gap-4 rounded-xl border border-border bg-card p-4 sm:p-6" aria-label={t("marketProviderFinance.title")}>
     <header className="flex min-w-0 flex-wrap items-center justify-between gap-3">
-      <div className="grid min-w-0 gap-1"><h2 className="text-lg font-semibold">{t("marketProviderFinance.title")}</h2>
+      <div className="grid min-w-0 gap-1"><h3 className="text-base font-semibold">{t("marketProviderFinance.title")}</h3>
       <p className="text-sm text-muted-foreground">{t("earningSettlement.help")}</p></div>
       <div className="flex flex-wrap gap-1">
         <Link href="/account/wallet/" className={linkClass}>{t("earningSettlement.wallet")}</Link>
       </div>
     </header>
-    {error ? <div className="flex flex-wrap items-center gap-2"><p role="alert" className="text-sm text-destructive">{error}</p><Button variant="ghost" onPress={() => setRetry(value => value + 1)}>{t("common.retry")}</Button></div> : null}
+    {error ? <AccountSectionError message={error} onRetry={() => setRetry(value => value + 1)} /> : null}
     {!authLoading && !session?.authenticated ? <p className="text-sm text-muted-foreground">{t("earningSettlement.signInRequired")}</p> : !finance || loadedActor !== actor ? !error ? <p role="status" className="text-sm text-muted-foreground">{t("common.loading")}</p> : null : !finance.hasFinanceActivity ? <p className="text-sm text-muted-foreground">{t("marketProviderFinance.noEarnings")}</p> : <>
       <dl className="flex flex-wrap gap-x-12 gap-y-4">
         {([

@@ -9,6 +9,7 @@ import Link from "next/link";
 import { Button } from "@heroui/react";
 import { ArrowUpRight, ExternalLink } from "lucide-react";
 import { ExpandableRecordTable, RecordDetailList, type RecordTableColumn } from "@/components/common/expandable-record-table";
+import { AccountSectionError } from "@/components/dashboard/account-section";
 import { MarketServiceDisputeControl } from "@/components/dashboard/market-service-dispute-control";
 import { MarketWalletRenewalCard } from "@/components/dashboard/market-wallet-renewal-card";
 import { MarketPagination } from "@/components/dashboard/share-market/market-pagination";
@@ -286,12 +287,12 @@ export function AccountShareRentals({
 
   return (
     <div className="grid min-w-0 gap-5">
-      {rentals.error ? <p className="border-l-2 border-rose-400 bg-rose-50 px-3 py-2 text-sm text-rose-700">{rentals.error}</p> : null}
+      {rentals.error ? <AccountSectionError message={rentals.error} /> : null}
       {!historyOnly ? <section className="grid min-w-0 gap-2" aria-labelledby="account-share-rentals-current">
-        <h3 id="account-share-rentals-current" className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+        <h4 id="account-share-rentals-current" className="text-xs font-semibold uppercase tracking-wide text-slate-500">
           {t("account.share.active")}
           {current.length ? <span className="ml-1.5 tabular-nums text-slate-400">{current.length}</span> : null}
-        </h3>
+        </h4>
         <ExpandableRecordTable
           rows={current}
           rowKey={(subscription) => subscription.id}
@@ -313,7 +314,7 @@ export function AccountShareRentals({
         />
       </section> : null}
       <section className="grid min-w-0 gap-2" aria-labelledby="account-share-rentals-history">
-        <h3 id="account-share-rentals-history" className="text-sm font-semibold text-muted-foreground">{t("account.share.history")} · {historyCount}</h3>
+        <h4 id="account-share-rentals-history" className="text-sm font-semibold text-muted-foreground">{t("account.share.history")} · {historyCount}</h4>
         <ExpandableRecordTable rows={pagedHistory?.items ?? history} rowKey={(item) => item.id} rowLabel={(item) => item.shareName}
           columns={columns.filter((column) => column.id !== "open")}
           ariaLabel={t("account.share.history")} focusKey={focusId}

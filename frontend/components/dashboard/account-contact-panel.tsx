@@ -5,6 +5,7 @@ import { Button } from "@heroui/react";
 import { Loader2, Plus, Save, Trash2 } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { CompactSelect } from "@/components/common/compact-select";
+import { AccountInlineLoading, AccountSectionError } from "@/components/dashboard/account-section";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getAccountContacts, updateAccountProviderContacts } from "@/lib/api";
 import type { ProviderContact, ProviderContactChannel } from "@/lib/types";
@@ -45,9 +46,9 @@ export function AccountContactPanel() {
     return () => { active = false; };
   }, [actor, attempt, session?.authenticated]);
 
-  if (authLoading || loading || (session?.authenticated && (!snapshot || snapshot.actor !== actor) && !error)) return <p className="flex items-center gap-2 py-6 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />{t("common.loading")}</p>;
-  if (!session?.authenticated) return <p className="py-6 text-sm text-muted-foreground">{t("account.signInRequired")}</p>;
-  if (!snapshot || snapshot.actor !== actor) return <div className="grid justify-items-start gap-3 py-6"><p role="alert" className="text-sm text-destructive">{error || t("common.loading")}</p><Button variant="outline" onPress={() => setAttempt((value) => value + 1)}>{t("common.retry")}</Button></div>;
+  if (authLoading || loading || (session?.authenticated && (!snapshot || snapshot.actor !== actor) && !error)) return <AccountInlineLoading />;
+  if (!session?.authenticated) return null;
+  if (!snapshot || snapshot.actor !== actor) return <AccountSectionError message={error || t("common.loading")} onRetry={() => setAttempt((value) => value + 1)} />;
 
   const contacts = snapshot.contacts;
   const saved = snapshot.saved;
@@ -70,14 +71,14 @@ export function AccountContactPanel() {
   return <section className="grid gap-5 rounded-xl border border-border bg-card p-5">
     <div className="flex flex-wrap items-start justify-between gap-3">
       <div>
-        <h2 className="text-base font-semibold">{t("account.contact.title")}</h2>
+        <h3 className="text-base font-semibold">{t("account.contact.title")}</h3>
         <p className="mt-1 text-sm text-muted-foreground">{t("account.contact.hint")}</p>
       </div>
       <Button variant="primary" isDisabled={saving || JSON.stringify(contacts) === saved} onPress={() => void save()}>
         {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}{t("common.save")}
       </Button>
     </div>
-    {error ? <p role="alert" className="text-sm text-destructive">{error}</p> : null}
+    {error ? <AccountSectionError message={error} /> : null}
     {contacts.map((contact, index) => <div key={index} className="grid gap-2 sm:grid-cols-[10rem_minmax(0,1fr)_2.75rem] sm:items-end">
       <div className="grid gap-1 text-sm">
         <span>{t("account.contact.channel")}</span>

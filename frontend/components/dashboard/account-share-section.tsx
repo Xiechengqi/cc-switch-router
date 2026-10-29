@@ -2,15 +2,9 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { useSearchParams } from "next/navigation";
-import { Button } from "@heroui/react";
-import {
-  ArrowUpRight,
-  Loader2,
-  RefreshCw,
-} from "lucide-react";
+import { ArrowUpRight } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
-import { SegmentedControl } from "@/components/common/segmented-control";
+import { AccountInlineLoading, AccountSectionError } from "@/components/dashboard/account-section";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import { CLIENT_MARKET_POLL_MS } from "@/components/dashboard/client-market/host-utils";
 import { AccountShareRentals, rentalTermText } from "@/components/dashboard/account-share-rentals";
@@ -25,7 +19,6 @@ import { rememberView, useRememberedView } from "@/lib/cached-resource";
 import { shareMarketHref } from "@/lib/dashboard-nav";
 import { SHARE_APP_LABELS } from "@/lib/share-app";
 import type { ShareMarketListing, ShareMarketSubscription } from "@/lib/types";
-import { replaceCurrentSearch } from "@/lib/url-search";
 import { cn } from "@/lib/utils";
 import {
   formatSeatPrice,
@@ -41,7 +34,7 @@ import {
   partitionOwnedListings,
 } from "@/components/dashboard/share-market/owner-workspace-utils";
 
-type ShareMonitorTab = "user" | "provider";
+export type AccountMarketRole = "user" | "provider";
 
 function ListingApps({ listing }: { listing: ShareMarketListing }) {
   const apps = listing.supportedApps.filter(isCoreShareApp);
@@ -174,7 +167,7 @@ function AccountShareListings({ listings, focusId }: { listings: ShareMarketList
       rows={listings}
       rowKey={(listing) => listing.id}
       rowLabel={(listing) => listing.shareName}
-      ariaLabel={t("account.share.tab.provider")}
+      ariaLabel={t("account.listings.shareSection")}
       columns={columns}
       rowTone={(listing) => listingAttentionSeats(listing).length ? "attention" : undefined}
       focusKey={focusId}
@@ -190,19 +183,21 @@ type AccountShareView = {
   ownedListings: ShareMarketListing[];
 };
 
-const accountShareViewKey = (actorKey: string) => `account-share:${actorKey}`;
+const accountShareViewKey = (role: AccountMarketRole, actorKey: string) => `account-share:${role}:${actorKey}`;
 
-export function AccountSharePage() {
+/**
+ * Share Market seats of this account: what it rents (`user`) or what it lists
+ * (`provider`). Each role loads only its own list, so one endpoint failing
+ * never hides the other, and remembers it for an instant return.
+ */
+export function AccountShareSection({ role, focusId }: { role: AccountMarketRole; focusId?: string | null }) {
   const { t } = useLocaleText();
   const { session } = useAuth();
-  const searchParams = useSearchParams();
   const authed = !!session?.authenticated;
   const actorKey = authed
     ? session?.user?.id || session?.user?.email?.toLowerCase() || "authenticated"
     : "anonymous";
-  const tab: ShareMonitorTab = searchParams.get("tab") === "provider" ? "provider" : "user";
-  const focusId = searchParams.get("focus");
-  const { remembered, takeSeed } = useRememberedView<AccountShareView>(authed ? accountShareViewKey(actorKey) : null);
+  const { remembered, takeSeed } = useRememberedView<AccountShareView>(authed ? accountShareViewKey(role, actorKey) : null);
   const [subscriptions, setSubscriptions] = React.useState<ShareMarketSubscription[]>(remembered?.subscriptions ?? []);
   const [subscriptionCursor, setSubscriptionCursor] = React.useState<string | null>(remembered?.subscriptionCursor ?? null);
   const [subscriptionHistoryTotal, setSubscriptionHistoryTotal] = React.useState(remembered?.subscriptionHistoryTotal ?? 0);
@@ -220,7 +215,6 @@ export function AccountSharePage() {
   const expandedSubscriptionHistoryRef = React.useRef(false);
   const subscriptionHistoryGenerationRef = React.useRef(0);
 
-  const setTab = (next: ShareMonitorTab) => replaceCurrentSearch((params) => params.set("tab", next));
   const load = React.useCallback(async ({
     silent = false,
     skipIfBusy = false,
@@ -244,24 +238,26 @@ export function AccountSharePage() {
     if (!skipIfBusy) setError("");
     try {
       const [nextSubscriptions, nextListings] = await Promise.all([
-        getShareMarketSubscriptions(controller.signal),
-        getShareMarketOwnedListings(controller.signal),
+        role === "user" ? getShareMarketSubscriptions(controller.signal) : null,
+        role === "provider" ? getShareMarketOwnedListings(controller.signal) : null,
       ]);
       if (controller.signal.aborted || actorKeyRef.current !== requestedActorKey) return;
-      setSubscriptions((current) => silent
-        ? mergeShareMarketSubscriptionPage(current, nextSubscriptions.subscriptions, false)
-        : nextSubscriptions.subscriptions);
-      setSubscriptionHistoryTotal(nextSubscriptions.historyTotal ?? 0);
-      if (!silent || !expandedSubscriptionHistoryRef.current) {
-        if (!silent) expandedSubscriptionHistoryRef.current = false;
-        setSubscriptionCursor(nextSubscriptions.nextCursor || null);
+      if (nextSubscriptions) {
+        setSubscriptions((current) => silent
+          ? mergeShareMarketSubscriptionPage(current, nextSubscriptions.subscriptions, false)
+          : nextSubscriptions.subscriptions);
+        setSubscriptionHistoryTotal(nextSubscriptions.historyTotal ?? 0);
+        if (!silent || !expandedSubscriptionHistoryRef.current) {
+          if (!silent) expandedSubscriptionHistoryRef.current = false;
+          setSubscriptionCursor(nextSubscriptions.nextCursor || null);
+        }
       }
-      setOwnedListings(nextListings.listings);
-      rememberView<AccountShareView>(accountShareViewKey(requestedActorKey), {
-        subscriptions: nextSubscriptions.subscriptions,
-        subscriptionCursor: nextSubscriptions.nextCursor || null,
-        subscriptionHistoryTotal: nextSubscriptions.historyTotal ?? 0,
-        ownedListings: nextListings.listings,
+      if (nextListings) setOwnedListings(nextListings.listings);
+      rememberView<AccountShareView>(accountShareViewKey(role, requestedActorKey), {
+        subscriptions: nextSubscriptions?.subscriptions ?? [],
+        subscriptionCursor: nextSubscriptions?.nextCursor || null,
+        subscriptionHistoryTotal: nextSubscriptions?.historyTotal ?? 0,
+        ownedListings: nextListings?.listings ?? [],
       });
       setLoadedActorKey(requestedActorKey);
       setFailedActorKey(null);
@@ -278,7 +274,7 @@ export function AccountSharePage() {
         setLoading(false);
       }
     }
-  }, [actorKey, authed, t]);
+  }, [actorKey, authed, role, t]);
   const loadMoreSubscriptions = React.useCallback(async () => {
     if (!subscriptionCursor || loadingMoreSubscriptions) return;
     const requestedActorKey = actorKey;
@@ -336,12 +332,12 @@ export function AccountSharePage() {
   const focusCursors = React.useRef(new Set<string>());
   React.useEffect(() => { focusCursors.current.clear(); }, [actorKey, focusId]);
   React.useEffect(() => {
-    if (tab !== "user" || !focusId || loading || loadingMoreSubscriptions || !subscriptionCursor
+    if (role !== "user" || !focusId || loading || loadingMoreSubscriptions || !subscriptionCursor
       || loadedActorKey !== actorKey || subscriptions.some((item) => item.id === focusId)
       || focusCursors.current.has(subscriptionCursor)) return;
     focusCursors.current.add(subscriptionCursor);
     void loadMoreSubscriptions();
-  }, [actorKey, focusId, tab, loading, loadedActorKey, subscriptions, subscriptionCursor, loadingMoreSubscriptions, loadMoreSubscriptions]);
+  }, [actorKey, focusId, role, loading, loadedActorKey, subscriptions, subscriptionCursor, loadingMoreSubscriptions, loadMoreSubscriptions]);
 
   const { attentionListings, active, closed } = React.useMemo(
     () => partitionOwnedListings(ownedListings),
@@ -349,25 +345,13 @@ export function AccountSharePage() {
   );
   const providerListings = [...attentionListings, ...active, ...closed];
 
-  if (!authed) return <p className="py-6 text-sm text-muted-foreground">{t("shareMarket.loginRequired")}</p>;
-  if (loading || (loadedActorKey !== actorKey && failedActorKey !== actorKey)) return <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />{t("common.loading")}</div>;
-  if (loadedActorKey !== actorKey) {
-    return (
-      <div role="alert" className="flex flex-wrap items-center gap-3 border-l-2 border-rose-400 bg-rose-50 px-3 py-3 text-sm text-rose-700">
-        <span className="min-w-0 flex-1 break-words">{error}</span>
-        <Button size="sm" variant="outline" onClick={() => void load()}>
-          <RefreshCw className="h-4 w-4" />
-          {t("common.retry")}
-        </Button>
-      </div>
-    );
-  }
+  if (!authed) return null;
+  if (loading || (loadedActorKey !== actorKey && failedActorKey !== actorKey)) return <AccountInlineLoading />;
+  if (loadedActorKey !== actorKey) return <AccountSectionError message={error} onRetry={() => void load()} />;
   return (
     <div className="grid min-w-0 gap-4">
-      <div><h2 className="text-base font-semibold text-foreground">{t("account.nav.share")}</h2><p className="mt-0.5 text-sm text-muted-foreground">{t("account.shareHint")}</p></div>
-      <SegmentedControl value={tab} onChange={setTab} ariaLabel={t("account.nav.share")} size="md" className="w-full max-w-sm" fullWidth items={[{ id: "user", label: t("account.share.tab.user") }, { id: "provider", label: t("account.share.tab.provider") }]} />
-      {error ? <p className="border-l-2 border-rose-400 bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p> : null}
-      {tab === "user" ? (
+      {error ? <AccountSectionError message={error} /> : null}
+      {role === "user" ? (
         <AccountShareRentals
           key={`user:${actorKey}`}
           subscriptions={subscriptions}

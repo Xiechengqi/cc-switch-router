@@ -8,6 +8,7 @@ import * as React from "react";
 import { Button } from "@heroui/react";
 import { Loader2, RefreshCw } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
+import { AccountInlineLoading, AccountSectionError } from "@/components/dashboard/account-section";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { CompactSelect } from "@/components/common/compact-select";
@@ -152,18 +153,13 @@ function AccountMarketAccessEditor({ onPendingChange }: { onPendingChange?: (cou
       }),
     );
   };
-  if (!session?.authenticated)
-    return (
-      <p className="text-sm text-muted-foreground">
-        {t("account.signInRequired")}
-      </p>
-    );
+  if (!session?.authenticated) return null;
   return (
     <section className="grid min-w-0 gap-7">
       <div className="flex items-center justify-between gap-3">
-        <h2 className="text-lg font-semibold">
-          {t("marketAccess.walletTitle")}
-        </h2>
+        <h3 className="text-base font-semibold">
+          {t("providerCenter.tab.access")}
+        </h3>
         <Button
           variant="ghost"
           isIconOnly
@@ -174,15 +170,9 @@ function AccountMarketAccessEditor({ onPendingChange }: { onPendingChange?: (cou
           <RefreshCw className="size-4" />
         </Button>
       </div>
-      {error ? (
-        <p role="alert" className="text-sm text-destructive">
-          {error}
-        </p>
-      ) : null}
+      {error ? <AccountSectionError message={error} onRetry={data ? undefined : () => void run(async () => {})} /> : null}
       {!data ? (
-        <p role="status" className="text-sm text-muted-foreground">
-          {t("common.loading")}
-        </p>
+        error ? null : <AccountInlineLoading />
       ) : (
         <>
           {/* Pending requests are the only items waiting on the Provider: list them first. */}

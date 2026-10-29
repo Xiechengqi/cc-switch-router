@@ -16,6 +16,7 @@ import { clientTrialMessagesEn, clientTrialMessagesZh } from "@/lib/client-trial
 import { notificationCenterMessagesEn, notificationCenterMessagesZh } from "@/lib/notification-center-messages";
 import { rentalAuditMessagesEn, rentalAuditMessagesZh } from "@/lib/client-rental-audit-messages";
 import { accountMarketMessagesEn, accountMarketMessagesZh } from "@/lib/account-market-messages";
+import { accountSectionMessagesEn, accountSectionMessagesZh } from "@/lib/account-section-messages";
 
 export const LOCALE_STORAGE_KEY = "cc_switch_router_locale_v1";
 export const SUPPORTED_LOCALES = ["en", "zh-CN"] as const;
@@ -109,7 +110,6 @@ export const messages = {
     "start.skip": "Skip for now",
     "start.error": "That choice could not be saved. Try again.",
     "start.home.title": "Home entry",
-    "start.home.lead": "Opening the product home uses this page. It does not change the five section tabs.",
     "start.home.clients": "Clients",
     "start.home.save": "Save home entry",
     "start.home.saved": "Saved.",
@@ -653,33 +653,11 @@ export const messages = {
       "Your access request has been submitted. The owner can approve it in Market access.",
     "marketApproval.cancelRequest": "Cancel request",
     "marketApproval.clientHostEmailSubject": "Client Host allowlist request",
-    "account.title": "Account",
-    "account.pageHint":
-      "Manage payment details for Hosts you provide, and Clients you rent from the market.",
     "account.loading": "Loading account settings...",
-    "account.signInRequired":
-      "Sign in to configure Host Provider payment details.",
     "account.nav.sections": "Account sections",
-    "account.nav.group.security": "Access & security",
-    "account.nav.group.usage": "Usage",
-    "account.nav.group.market": "Marketplace",
-    "account.nav.apiKeys": "API keys",
     "account.nav.notifications": "Notifications",
-    "account.nav.providerUsage": "Provider usage",
-    "account.nav.consumerUsage": "Consumer usage",
-    "account.nav.marketReadiness": "Market readiness",
 
     "account.nav.wallet": "Platform balance",
-    "account.nav.marketAccess": "Market access",
-    "account.nav.payments": "Payment details",
-    "account.nav.contacts": "Contact details",
-    "account.nav.share": "Share Market",
-    "account.nav.shareHint":
-      "Read-only monitor for Share Market rentals (separate from top-nav Share Market)",
-    "account.nav.client": "Client Market",
-    "account.nav.clientHint":
-      "Read-only monitor for Market rentals (separate from top-nav Clients)",
-    "account.nav.rentals": "Client rentals",
     "account.usage.period.24h": "24h",
     "account.usage.period.7d": "7d",
     "account.usage.period.30d": "30d",
@@ -695,20 +673,12 @@ export const messages = {
     "account.usage.model": "Model",
     "account.usage.empty": "No usage in this period.",
     "account.usage.loading": "Loading usage…",
-    "account.usage.signInRequired": "Sign in to view your usage.",
-    "account.providerUsage.title": "Provider usage",
-    "account.providerUsage.hint":
-      "Token usage across Clients and Shares you own.",
     "account.providerUsage.installations": "Installations",
     "account.providerUsage.shares": "Shares",
     "account.providerUsage.caller": "Caller",
     "account.providerUsage.noInstallations":
       "No provider usage in this period.",
-    "account.consumerUsage.title": "Consumer usage",
-    "account.consumerUsage.hint":
-      "Token usage from your API token and account email.",
     "account.consumerUsage.trend": "Daily trend",
-    "account.consumerUsage.card": "Usage card",
     "account.consumerUsage.cardHint":
       "The card uses your account email. Turning off public stats makes its public URL private.",
     "account.consumerUsage.cardIdentity": "Card identity",
@@ -739,7 +709,7 @@ export const messages = {
     "account.consumerUsage.format.full": "Full",
     "account.notifications.title": "Notification settings",
     "account.notifications.hint":
-      "Where this account receives Client alerts, such as a Client going offline.",
+      "How this account is told about wallet and trading events, rentals and Client status.",
     "account.notifications.channelTitle": "Delivery channel",
     "account.notifications.channelHint":
       "Alerts are delivered on exactly one channel. Registration messages always stay on email because they carry the Client web password hint.",
@@ -834,17 +804,9 @@ export const messages = {
     "account.apiKeys.resetConfirmAction": "Reset token",
     "account.apiKeys.exampleTitle": "Share API example",
     "account.apiKeys.exampleHint":
-      "Replace <share-subdomain> with your Share subdomain. Reveal the token above to fill it into the sample, or copy with the real token when available.",
-    "account.apiKeys.signInRequired": "Sign in to manage your API token.",
-    "account.clientHint": "Manage Client rentals as a renter or Host Provider. Paid rentals use the platform balance.",
-    "account.client.status": "Status",
-    "account.shareHint": "Manage Share Market seats as a user or Provider. Paid rentals use the platform balance.",
-    "account.client.tab.user": "User",
-    "account.client.tab.provider": "Provider",
-    "account.client.userEmpty": "No rentals as a Client user right now.",
+      "Replace <share-subdomain> with your Share subdomain and <model> with a model it serves. Reveal the token above to fill it into the sample, or copy with the real token when available.",
+    "account.client.userEmpty": "You are not renting any Client right now.",
     "account.client.providerEmpty": "No rentals on your Hosts right now.",
-    "account.client.provider": "Provider: {owner}",
-    "account.client.renter": "Renter: {email}",
     "account.client.offer": "Offer",
     "account.client.noRenter": "No renter yet",
     "account.client.updated": "Last updated",
@@ -859,8 +821,6 @@ export const messages = {
     "account.client.status.ended": "Ended",
     "account.client.status.idle": "Idle",
     "account.client.status.unknown": "Unknown",
-    "account.share.tab.user": "User",
-    "account.share.tab.provider": "Provider",
     "account.share.userEmpty": "No Share seats rented right now.",
     "account.share.providerEmpty":
       "No Share listings or rentals as a provider right now.",
@@ -893,7 +853,6 @@ export const messages = {
     "account.share.closedListingHint":
       "Listing is closed. Active rentals continue until returned or reclaimed.",
     "account.share.status.unknown": "Unknown",
-    "account.rentalsHint": "Monitor or release Clients rented from Host Providers. Payments use your platform balance.",
 
     "account.contact.title": "Contact info",
     "account.contact.hint":
@@ -1420,7 +1379,6 @@ export const messages = {
     "clientMarket.rentals.empty": "You are not renting any hosts right now.",
     "clientMarket.rentals.provider": "Provider: {owner}",
     "clientMarket.rentals.count": "{count} active rentals",
-    "clientMarket.rentals.loginRequired": "Sign in to see the hosts you rent.",
     "clientMarket.tabMyHosts": "My hosts",
     "clientMarket.tabMyRentals": "Client rentals",
     "clientMarket.batchConfirmCleanupTitle": "Cleanup selected clients?",
@@ -1641,7 +1599,6 @@ export const messages = {
     "billing.account": "Account",
     "billing.qrAlt": "{method} payment QR code",
 
-    "marketAccess.walletTitle": "Market access",
     "marketAccess.policyTitle": "Default access policy",
     "marketAccess.product.share": "Share Market",
     "marketAccess.product.clientHost": "Client Host Market",
@@ -3551,6 +3508,7 @@ export const messages = {
     ...marketOwnerMessagesEn,
     ...walletPolicyMessagesEn,
     ...accountMarketMessagesEn,
+    ...accountSectionMessagesEn,
   },
   "zh-CN": {
     ...rentalAuditMessagesZh,
@@ -3635,7 +3593,6 @@ export const messages = {
     "start.skip": "先跳过",
     "start.error": "这次选择没有保存，请再试一次。",
     "start.home.title": "更改首页入口",
-    "start.home.lead": "打开产品首页时进入这一页。五个主标签保持不变。",
     "start.home.clients": "客户端",
     "start.home.save": "保存首页入口",
     "start.home.saved": "已保存。",
@@ -4171,32 +4128,11 @@ export const messages = {
       "准入申请已提交，Owner 可在“市场准入”中处理。",
     "marketApproval.cancelRequest": "取消申请",
     "marketApproval.clientHostEmailSubject": "申请加入 Client Host 白名单",
-    "account.title": "账户",
-    "account.pageHint":
-      "管理你作为供给方的收款信息，以及作为租用方的 Client 租约。",
     "account.loading": "正在加载账户设置...",
-    "account.signInRequired": "登录后可配置 Host Provider 收款信息。",
     "account.nav.sections": "账户分区",
-    "account.nav.group.security": "访问与安全",
-    "account.nav.group.usage": "用量",
-    "account.nav.group.market": "市场交易",
-    "account.nav.apiKeys": "API 密钥",
     "account.nav.notifications": "通知设置",
-    "account.nav.providerUsage": "我提供的",
-    "account.nav.consumerUsage": "我使用的",
-    "account.nav.marketReadiness": "市场准备",
 
     "account.nav.wallet": "平台余额",
-    "account.nav.marketAccess": "市场准入",
-    "account.nav.payments": "收款信息",
-    "account.nav.contacts": "联系方式",
-    "account.nav.share": "Share 市场",
-    "account.nav.shareHint":
-      "Share Market 租用只读监控（与顶栏 Share Market 操作页不同）",
-    "account.nav.client": "Client 市场",
-    "account.nav.clientHint":
-      "Market 租用只读监控（与顶栏 Clients 安装管理不同）",
-    "account.nav.rentals": "Client 租用",
     "account.usage.period.24h": "24 小时",
     "account.usage.period.7d": "7 天",
     "account.usage.period.30d": "30 天",
@@ -4212,19 +4148,11 @@ export const messages = {
     "account.usage.model": "模型",
     "account.usage.empty": "该周期暂无用量。",
     "account.usage.loading": "正在加载用量…",
-    "account.usage.signInRequired": "登录后可查看用量。",
-    "account.providerUsage.title": "我提供的用量",
-    "account.providerUsage.hint":
-      "你拥有的 Client / Share 被消耗的 Token 汇总。",
     "account.providerUsage.installations": "安装实例",
-    "account.providerUsage.shares": "Shares",
+    "account.providerUsage.shares": "Share 数",
     "account.providerUsage.caller": "调用方",
     "account.providerUsage.noInstallations": "该周期暂无供给侧用量。",
-    "account.consumerUsage.title": "我使用的用量",
-    "account.consumerUsage.hint":
-      "你的 API Token 与账号邮箱发起的 Token 消耗。",
     "account.consumerUsage.trend": "每日趋势",
-    "account.consumerUsage.card": "用量卡片",
     "account.consumerUsage.cardHint":
       "卡片直接显示当前账号邮箱；关闭公开统计后，公开链接将停止展示用量。",
     "account.consumerUsage.cardIdentity": "卡片身份",
@@ -4253,7 +4181,7 @@ export const messages = {
     "account.consumerUsage.format.compact": "紧凑",
     "account.consumerUsage.format.full": "完整",
     "account.notifications.title": "通知设置",
-    "account.notifications.hint": "本账号接收 Client 告警（例如 Client 离线）的方式。",
+    "account.notifications.hint": "本账号接收钱包与交易、租用服务、Client 状态等通知的方式。",
     "account.notifications.channelTitle": "投递渠道",
     "account.notifications.channelHint":
       "告警只会投递到一个渠道。注册消息始终走邮件，因为其中包含 Client Web 密码提示。",
@@ -4347,17 +4275,9 @@ export const messages = {
     "account.apiKeys.resetConfirmAction": "确认重置",
     "account.apiKeys.exampleTitle": "Share API 调用示例",
     "account.apiKeys.exampleHint":
-      "把 <share-subdomain> 换成你的 Share 子域名。上方点开眼睛可把 token 填进示例；复制时会优先使用真实 token。",
-    "account.apiKeys.signInRequired": "登录后可管理你的 API Token。",
-    "account.clientHint": "以租户或 Host 供给方视角管理 Client 租用；付费租用统一使用平台余额。",
-    "account.client.status": "状态",
-    "account.shareHint": "以用户或供应商视角管理 Share Market 拼车位；付费租用统一使用平台余额。",
-    "account.client.tab.user": "用户",
-    "account.client.tab.provider": "供应商",
-    "account.client.userEmpty": "你当前没有作为租户的租用。",
-    "account.client.providerEmpty": "你的 Host 上当前没有租用关系。",
-    "account.client.provider": "供给方：{owner}",
-    "account.client.renter": "租户：{email}",
+      "把 <share-subdomain> 换成你的 Share 子域名，<model> 换成它提供的模型。上方点开眼睛可把 token 填进示例；复制时会优先使用真实 token。",
+    "account.client.userEmpty": "你当前没有租用 Client。",
+    "account.client.providerEmpty": "你的 Host 当前没有出租。",
     "account.client.offer": "报价",
     "account.client.noRenter": "暂无租户",
     "account.client.updated": "最近更新",
@@ -4372,8 +4292,6 @@ export const messages = {
     "account.client.status.ended": "已结束",
     "account.client.status.idle": "空闲",
     "account.client.status.unknown": "未知",
-    "account.share.tab.user": "用户",
-    "account.share.tab.provider": "供应商",
     "account.share.userEmpty": "你当前没有租用的 Share 拼车位。",
     "account.share.providerEmpty": "你当前没有挂售的 Share，也没有租客租约。",
     "account.share.provider": "车主：{owner}",
@@ -4405,7 +4323,6 @@ export const messages = {
     "account.share.closedListingHint":
       "已停止挂售。进行中的租约可继续，直至归还或回收。",
     "account.share.status.unknown": "未知",
-    "account.rentalsHint": "监控或释放从 Host 供给方租用的 Client；付费统一使用平台余额。",
 
     "account.contact.title": "联系信息",
     "account.contact.hint": "在市场中展示，方便租户联系你；不是充值或提现账户。",
@@ -4918,7 +4835,6 @@ export const messages = {
     "clientMarket.rentals.empty": "你当前没有租用中的主机。",
     "clientMarket.rentals.provider": "供给方:{owner}",
     "clientMarket.rentals.count": "{count} 个租用中",
-    "clientMarket.rentals.loginRequired": "登录后查看你租用的主机。",
     "clientMarket.tabMyHosts": "我的主机",
     "clientMarket.tabMyRentals": "Client 租用",
     "clientMarket.batchConfirmCleanupTitle": "批量清理选中的 Client？",
@@ -5126,7 +5042,6 @@ export const messages = {
     "billing.account": "账号",
     "billing.qrAlt": "{method}收款二维码",
 
-    "marketAccess.walletTitle": "市场准入",
     "marketAccess.policyTitle": "默认准入策略",
     "marketAccess.product.share": "Share 市场",
     "marketAccess.product.clientHost": "Client Host 市场",
@@ -6981,6 +6896,7 @@ export const messages = {
     ...marketOwnerMessagesZh,
     ...walletPolicyMessagesZh,
     ...accountMarketMessagesZh,
+    ...accountSectionMessagesZh,
   },
 } as const;
 

@@ -1,45 +1,47 @@
 "use client";
 
 import * as React from "react";
-import { Button } from "@heroui/react";
 import { useAuth } from "@/components/auth/auth-provider";
-import { useLocaleText } from "@/components/i18n/locale-provider";
+import { PageSkeleton } from "@/components/common/page-skeleton";
+import { AccountSectionError } from "@/components/dashboard/account-section";
 import { PlatformWalletPanel } from "@/components/dashboard/platform-wallet-panel";
+import { rememberedView } from "@/lib/cached-resource";
 import { getMarketWallet, type MarketWallet } from "@/lib/market-wallet-api";
 
-export function AccountWalletPage() {
-  const { t } = useLocaleText();
-  const { session, loading } = useAuth();
-  const [wallet, setWallet] = React.useState<{ actorId: string; value: MarketWallet } | null>(null);
-  const [error, setError] = React.useState<{ actorId: string; message: string } | null>(null);
-  const actorId = session?.user?.id || session?.user?.email || "authenticated";
+const walletViewKey = (actorId: string) => `wallet:${actorId}`;
 
-  const reload = React.useCallback(async () => {
-    setError(null);
-    try {
-      setWallet({ actorId, value: await getMarketWallet() });
-    } catch (cause) {
-      setError({ actorId, message: cause instanceof Error ? cause.message : String(cause) });
-    }
-  }, [actorId]);
+export function AccountWalletPage() {
+  const { session } = useAuth();
+  const actorId = session?.user?.id || session?.user?.email || "authenticated";
+  return <WalletLoader key={actorId} actorId={actorId} />;
+}
+
+/**
+ * The panel reloads balance and history as soon as it mounts and remembers
+ * the latest balance. So a return visit paints that balance at once with no
+ * extra request; only the first visit fetches the balance here before the
+ * panel can start.
+ */
+function WalletLoader({ actorId }: { actorId: string }) {
+  const viewKey = walletViewKey(actorId);
+  const [wallet, setWallet] = React.useState<MarketWallet | undefined>(() => rememberedView<MarketWallet>(viewKey));
+  const [error, setError] = React.useState("");
+  const [attempt, setAttempt] = React.useState(0);
+  const needsFetch = wallet === undefined;
 
   React.useEffect(() => {
-    if (!session?.authenticated) return;
+    if (!needsFetch) return;
     let active = true;
+    setError("");
     getMarketWallet().then((view) => {
-      if (active) { setWallet({ actorId, value: view }); setError(null); }
+      if (active) setWallet(view);
     }).catch((cause) => {
-      if (active) setError({ actorId, message: cause instanceof Error ? cause.message : String(cause) });
+      if (active) setError(cause instanceof Error ? cause.message : String(cause));
     });
     return () => { active = false; };
-  }, [actorId, session?.authenticated]);
+  }, [attempt, needsFetch]);
 
-  if (loading || !session?.authenticated) {
-    return <div className="p-6 text-sm text-muted-foreground">{t("common.loadingSession")}</div>;
-  }
-  if (error?.actorId === actorId) {
-    return <div className="grid gap-3 p-6"><p role="alert" className="text-sm text-destructive">{error.message}</p><Button variant="outline" onPress={() => void reload()}>{t("common.retry")}</Button></div>;
-  }
-  if (wallet?.actorId !== actorId) return <div className="p-6 text-sm text-muted-foreground">{t("common.loading")}</div>;
-  return <PlatformWalletPanel key={actorId} initialWallet={wallet.value} />;
+  if (wallet) return <PlatformWalletPanel initialWallet={wallet} rememberKey={viewKey} />;
+  if (error) return <AccountSectionError message={error} onRetry={() => setAttempt((value) => value + 1)} />;
+  return <PageSkeleton inset />;
 }

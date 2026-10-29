@@ -11,6 +11,7 @@ import { useSearchParams } from "next/navigation";
 import { Button } from "@heroui/react";
 import { ArrowUpRight, Ban, CheckCircle2, ChevronDown, Clock3, Loader2, RefreshCw, WalletCards } from "lucide-react";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
+import { AccountSectionHeader } from "@/components/dashboard/account-section";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { WalletTransferPanel } from "@/components/dashboard/wallet-transfer-panel";
 import { useAuth } from "@/components/auth/auth-provider";
@@ -22,6 +23,7 @@ import { MarketBuyerDisputesList } from "@/components/dashboard/market-buyer-dis
 import { WalletTopupForm } from "@/components/market/wallet-topup-form";
 import { getTransferCapacity, type TransferCapacity } from "@/lib/wallet-policy-api";
 import { ApiError } from "@/lib/api";
+import { rememberView } from "@/lib/cached-resource";
 import { WALLET_ACTIONS_ID } from "@/lib/dashboard-nav";
 import { messages, type MessageKey } from "@/lib/i18n";
 import { paymentTokenLabel } from "@/lib/market-payment-tokens";
@@ -174,7 +176,8 @@ function dateText(value: string, locale: string) {
     : new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(date);
 }
 
-export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWallet }) {
+/** `rememberKey` keeps the latest balance for the next visit to paint at once. */
+export function PlatformWalletPanel({ initialWallet, rememberKey }: { initialWallet: MarketWallet; rememberKey?: string }) {
   const { session } = useAuth();
   const { locale, t, displayCurrency, fxRateFresh, fxRateMicros } = useLocaleText();
   const searchParams = useSearchParams();
@@ -235,6 +238,10 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
   React.useEffect(() => {
     historiesRef.current = { topups, transactions };
   }, [topups, transactions]);
+
+  React.useEffect(() => {
+    if (rememberKey) rememberView(rememberKey, wallet);
+  }, [rememberKey, wallet]);
 
   React.useEffect(() => {
     const timer = window.setInterval(() => setNowMs(Date.now()), 1_000);
@@ -588,13 +595,17 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
           });
 
   return (
-    <main className="mx-auto grid w-full max-w-5xl min-w-0 gap-6 px-4 py-6 sm:px-6" aria-label={t("account.nav.wallet")}>
-      <header className="flex min-w-0 flex-wrap items-start justify-between gap-3">
-        <p className="max-w-2xl text-sm leading-6 text-muted-foreground">{t("marketWallet.subtitle")}</p>
-        <Button variant="outline" size="sm" isDisabled={anyBusy} onPress={() => void reload().catch((cause) => setHistoryError(errorText(cause)))}>
-          <RefreshCw className="size-4" aria-hidden="true" />{t("common.reload")}
-        </Button>
-      </header>
+    <div className="grid w-full min-w-0 gap-6">
+      <AccountSectionHeader
+        icon={WalletCards}
+        title={t("account.nav.wallet")}
+        hint={t("marketWallet.subtitle")}
+        actions={(
+          <Button variant="outline" size="sm" isDisabled={anyBusy} onPress={() => void reload().catch((cause) => setHistoryError(errorText(cause)))}>
+            <RefreshCw className="size-4" aria-hidden="true" />{t("common.reload")}
+          </Button>
+        )}
+      />
 
       {notice ? <p role="status" className="rounded-md bg-emerald-50 px-4 py-3 text-sm text-emerald-800">{notice}</p> : null}
       {returnedTopup || returnPath ? (
@@ -838,6 +849,6 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
         }}
         onOpenChange={(open) => { if (!open) setCancelUnavailableId(null); }}
       />
-    </main>
+    </div>
   );
 }

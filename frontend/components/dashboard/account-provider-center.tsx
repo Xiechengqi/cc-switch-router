@@ -2,19 +2,24 @@
 
 /* Hallmark · component: Provider center · genre: modern-minimal · theme: existing Router system
  * states: default · focus · selected · badge · signed-out
- * Three independent jobs — income, buyer access, contact — as tabs instead of
- * one long scroll. The tab lives in the URL so links can open the right one.
+ * Everything a Provider runs — what is rented out, its income, buyer access,
+ * contact — as tabs instead of one long scroll. The tab lives in the URL so
+ * links can open the right one; without one the page opens at once on what
+ * is rented out, which every Provider has, instead of waiting to learn
+ * whether there is income yet.
  */
 
 import * as React from "react";
 import { useSearchParams } from "next/navigation";
+import { Store } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { SegmentedControl } from "@/components/common/segmented-control";
 import { AccountContactPanel } from "@/components/dashboard/account-contact-panel";
 import { AccountMarketAccessPage } from "@/components/dashboard/account-market-access-page";
+import { AccountMarketRecords } from "@/components/dashboard/account-market-records";
+import { AccountSectionHeader } from "@/components/dashboard/account-section";
 import { ProviderFinancePanel } from "@/components/dashboard/provider-finance-panel";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { getMarketProviderFinance } from "@/lib/market-wallet-api";
 import { PROVIDER_CENTER_TABS, providerCenterTab, type ProviderCenterTab } from "@/lib/dashboard-nav";
 import { replaceCurrentSearch } from "@/lib/url-search";
 import { useMarketAccessInboxSummary } from "@/lib/use-market-access-inbox-summary";
@@ -30,11 +35,7 @@ function ProviderCenterWorkspace({ actor }: { actor?: string }) {
   const searchParams = useSearchParams();
   const [hash, setHash] = React.useState("");
   const { pendingRequests, setPendingRequests } = useMarketAccessInboxSummary(actor);
-  const [hasIncome, setHasIncome] = React.useState<boolean | null>(null);
-  const [defaultError, setDefaultError] = React.useState(false);
-  const requestedTab = searchParams.get("tab");
-  const explicitTab = PROVIDER_CENTER_TABS.includes(requestedTab as ProviderCenterTab) || hash === "#income";
-  const tab = providerCenterTab(requestedTab, hash, hasIncome === true);
+  const tab = providerCenterTab(searchParams.get("tab"), hash);
 
   React.useEffect(() => {
     const read = () => setHash(window.location.hash);
@@ -43,41 +44,36 @@ function ProviderCenterWorkspace({ actor }: { actor?: string }) {
     return () => window.removeEventListener("hashchange", read);
   }, []);
 
-  React.useEffect(() => {
-    if (!actor) return;
-    let active = true;
-    void getMarketProviderFinance().then((finance) => {
-      if (active) setHasIncome(finance.hasFinanceActivity);
-    }).catch(() => { if (active) { setHasIncome(false); setDefaultError(true); } });
-    return () => { active = false; };
-  }, [actor]);
-
   const setTab = (next: ProviderCenterTab) => {
     setHash("");
-    replaceCurrentSearch((params) => params.set("tab", next), { dropHash: true });
+    replaceCurrentSearch((params) => {
+      params.set("tab", next);
+      // Market filter and focus belong to the listings tab.
+      if (next !== "listings") {
+        params.delete("market");
+        params.delete("focus");
+      }
+    }, { dropHash: true });
   };
 
   const labels: Record<ProviderCenterTab, string> = {
+    listings: t("providerCenter.tab.listings"),
     income: t("providerCenter.tab.income"),
     access: t("providerCenter.tab.access"),
     contact: t("providerCenter.tab.contact"),
   };
 
-  if (!actor) return <p className="text-sm text-muted-foreground">{t("account.signInRequired")}</p>;
-  if (hasIncome === null && !explicitTab) return <p role="status" className="text-sm text-muted-foreground">{t("common.loading")}</p>;
+  if (!actor) return null;
 
   return (
     <div className="grid min-w-0 gap-4">
-      <div>
-        <h2 className="text-base font-semibold text-foreground">{t("account.nav.providerSettings")}</h2>
-        <p className="mt-0.5 text-sm text-muted-foreground">{t("providerCenter.hint")}</p>
-      </div>
+      <AccountSectionHeader icon={Store} title={t("account.nav.providerSettings")} hint={t("providerCenter.hint")} />
       <SegmentedControl
         value={tab}
         onChange={setTab}
         ariaLabel={t("providerCenter.sections")}
         size="md"
-        className="w-full max-w-md"
+        className="w-full max-w-xl"
         fullWidth
         items={PROVIDER_CENTER_TABS.map((id) => ({
           id,
@@ -97,8 +93,12 @@ function ProviderCenterWorkspace({ actor }: { actor?: string }) {
         }))}
       />
       <div role="tabpanel" aria-label={labels[tab]} className="min-w-0">
-        {defaultError ? <p role="status" className="mb-3 text-sm text-muted-foreground">{t("providerCenter.defaultUnavailable")}</p> : null}
-        {tab === "income" ? <ProviderFinancePanel /> : tab === "access" ? <AccountMarketAccessPage onPendingChange={setPendingRequests} /> : <AccountContactPanel />}
+        {tab === "listings" ? (
+          <div className="grid min-w-0 gap-4">
+            <p className="text-sm text-muted-foreground">{t("account.listings.hint")}</p>
+            <AccountMarketRecords role="provider" />
+          </div>
+        ) : tab === "income" ? <ProviderFinancePanel /> : tab === "access" ? <AccountMarketAccessPage onPendingChange={setPendingRequests} /> : <AccountContactPanel />}
       </div>
     </div>
   );

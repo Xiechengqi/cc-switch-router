@@ -2,13 +2,13 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { useSearchParams } from "next/navigation";
-import { ArrowUpRight, Loader2 } from "lucide-react";
+import { ArrowUpRight } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { CountryFlag } from "@/components/common/country-flag";
 import { ExpandableRecordTable, RecordDetailList, type RecordTableColumn } from "@/components/common/expandable-record-table";
-import { SegmentedControl } from "@/components/common/segmented-control";
 import { formatShortDate } from "@/components/dashboard/account-share-rentals";
+import { AccountInlineLoading, AccountSectionError } from "@/components/dashboard/account-section";
+import type { AccountMarketRole } from "@/components/dashboard/account-share-section";
 import { CLIENT_MARKET_POLL_MS } from "@/components/dashboard/client-market/host-utils";
 import { MarketServiceDisputeControl } from "@/components/dashboard/market-service-dispute-control";
 import { MarketWalletRenewalCard } from "@/components/dashboard/market-wallet-renewal-card";
@@ -26,13 +26,12 @@ import { clientMarketMineHref, DASHBOARD_ACCOUNT_WALLET_PATH } from "@/lib/dashb
 import type { MessageKey } from "@/lib/i18n";
 import { formatUsdMoney } from "@/lib/market-money";
 import { formatWalletUnits } from "@/lib/market-wallet-money";
-import { replaceCurrentSearch } from "@/lib/url-search";
 import { compareAccountRecords } from "@/lib/account-market-records";
 import { terminationCanRespond } from "@/lib/client-termination";
 import type { ClientMarketHost, ClientMarketRental } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
-type ClientMonitorTab = "user" | "provider";
+type ClientMonitorTab = AccountMarketRole;
 
 type AccountClientView = {
   hosts: ClientMarketHost[];
@@ -368,7 +367,7 @@ function MonitorTable({
       rows={entries}
       rowKey={(entry) => entry.key}
       rowLabel={(entry) => entryFacts(entry).title}
-      ariaLabel={t(perspective === "user" ? "account.client.tab.user" : "account.client.tab.provider")}
+      ariaLabel={t(perspective === "user" ? "account.rentals.clientSection" : "account.listings.clientSection")}
       columns={columns}
       rowTone={(entry) => {
         const status = entryFacts(entry).status;
@@ -393,25 +392,21 @@ function MonitorTable({
 }
 
 /**
- * Account → Client Market: read-only Provider / User monitor.
- * Includes free Hosts (rental + host fallback). Actions stay on Client Market.
+ * Client Market leases of this account: what it rents (`user`) or the Hosts it
+ * rents out (`provider`), including idle free Hosts. Renewal, disputes and
+ * terminations are handled in place; the rest stays on Client Market.
  */
-export function AccountClientPage() {
+export function AccountClientSection({ role, focusKey }: { role: ClientMonitorTab; focusKey?: string | null }) {
   const { session } = useAuth();
   const actor = session?.authenticated ? session.user?.id || session.user?.email : undefined;
-  return <AccountClientWorkspace key={actor || "anonymous"} />;
+  return <AccountClientWorkspace key={actor || "anonymous"} tab={role} focusKey={focusKey ?? null} />;
 }
 
-function AccountClientWorkspace() {
+function AccountClientWorkspace({ tab, focusKey }: { tab: ClientMonitorTab; focusKey: string | null }) {
   const { t } = useLocaleText();
   const { session } = useAuth();
-  const searchParams = useSearchParams();
   const authed = !!session?.authenticated;
   const viewerUserId = session?.user?.id;
-
-  const tabParam = searchParams.get("tab");
-  const tab: ClientMonitorTab = tabParam === "provider" ? "provider" : "user";
-  const focusKey = searchParams.get("focus");
   const terminations = useAccountClientTerminations(authed ? viewerUserId : undefined, tab === "user" ? "buyer" : "provider", focusKey);
   const [selection, setSelection] = React.useState<{ id: string; role: "buyer" | "provider"; action?: ClientTerminationAction } | null>(null);
   const openTermination = (item: ClientTermination, action?: ClientTerminationAction) => setSelection({ id: item.id, role: tab === "user" ? "buyer" : "provider", action });
@@ -440,14 +435,6 @@ function AccountClientWorkspace() {
   const [loadedOk, setLoadedOk] = React.useState(remembered !== undefined);
   const [error, setError] = React.useState("");
   const refreshAbortRef = React.useRef<AbortController | null>(null);
-
-  const setTab = React.useCallback(
-    (next: ClientMonitorTab) => {
-      setSelection(null);
-      replaceCurrentSearch((params) => params.set("tab", next));
-    },
-    [],
-  );
 
   const load = React.useCallback(async (options?: { silent?: boolean; reportErrors?: boolean }) => {
     const silent = options?.silent === true;
@@ -596,66 +583,22 @@ function AccountClientWorkspace() {
     return entries;
   }, [allRentals, hosts, hostsById, hostsByInstallation, viewerUserId]);
 
-  if (!authed) {
-    return <p className="py-6 text-sm text-muted-foreground">{t("clientMarket.rentals.loginRequired")}</p>;
-  }
-
-  if (loading) {
-    return (
-      <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
-        <Loader2 className="h-4 w-4 animate-spin" />…
-      </div>
-    );
-  }
-
-  if (error) {
-    return <p className="py-6 text-sm text-rose-600">{error}</p>;
-  }
+  if (!authed) return null;
+  if (loading) return <AccountInlineLoading />;
+  if (error && !loadedOk) return <AccountSectionError message={error} onRetry={() => void load()} />;
 
   return (
     <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-4">
-      <div>
-        <h2 className="text-base font-semibold text-foreground">{t("account.nav.client")}</h2>
-        <p className="mt-0.5 text-sm text-muted-foreground">{t("account.clientHint")}</p>
-      </div>
-
-      <SegmentedControl
-        value={tab}
-        onChange={setTab}
-        ariaLabel={t("account.nav.client")}
-        size="md"
-        className="w-full max-w-sm"
-        fullWidth
-        items={[
-          { id: "user", label: t("account.client.tab.user") },
-          { id: "provider", label: t("account.client.tab.provider") },
-        ]}
+      {error ? <AccountSectionError message={error} onRetry={() => void load()} /> : null}
+      <MonitorTable
+        entries={attachTerminations(tab === "user" ? userEntries : providerEntries)}
+        perspective={tab}
+        emptyKey={tab === "user" ? "account.client.userEmpty" : "account.client.providerEmpty"}
+        focusKey={focusKey}
+        onChanged={() => load({ silent: true })}
+        onTerminationOpen={openTermination}
       />
-
-      {tab === "user" ? (
-        <>
-          <MonitorTable
-            entries={attachTerminations(userEntries)}
-            perspective="user"
-            emptyKey="account.client.userEmpty"
-            focusKey={focusKey}
-            onChanged={() => load({ silent: true })}
-            onTerminationOpen={openTermination}
-          />
-        </>
-      ) : (
-        <>
-          <MonitorTable
-            entries={attachTerminations(providerEntries)}
-            perspective="provider"
-            emptyKey="account.client.providerEmpty"
-            focusKey={focusKey}
-            onChanged={() => load({ silent: true })}
-            onTerminationOpen={openTermination}
-          />
-        </>
-      )}
-      {terminations.error ? <div role="alert" className="flex flex-wrap items-center gap-2 text-sm text-destructive">{t("account.market.terminationsUnavailable")}<Button variant="ghost" onPress={() => void terminations.reload()}>{t("common.retry")}</Button></div> : null}
+      {terminations.error ? <AccountSectionError message={t("account.market.terminationsUnavailable")} onRetry={() => void terminations.reload()} /> : null}
       {terminations.nextCursor ? <Button variant="ghost" className="min-h-11 justify-self-start" isDisabled={terminations.loading} onPress={() => void terminations.more()}>{t("account.market.earlierTerminations")}</Button> : null}
       <ClientTerminationDialog terminationId={selection?.id || null} initialRole={selection?.role} initialAction={selection?.action}
         onClose={() => setSelection(null)} onChanged={() => { void terminations.reload(); void load({ silent: true }); }} />

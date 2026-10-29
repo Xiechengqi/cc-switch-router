@@ -771,6 +771,8 @@ export type ProviderUsageResponse = UsageTokenTotals & {
   bucketGranularity?: "hour" | "day" | string;
   days: number;
   installations: ProviderInstallationUsage[];
+  /** Absent from routers older than the provider trend. */
+  daily?: UsageDailyBucket[];
 };
 
 export type UsageCardSettingsResponse = {

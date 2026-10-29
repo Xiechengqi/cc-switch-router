@@ -575,7 +575,7 @@ try {
     accessData.counterparties[0].revision += 1;
     await route.fulfill({ contentType: "application/json", body: "{}" });
   });
-  await page.goto(`${baseUrl}/account/provider-settings/`);
+  await page.goto(`${baseUrl}/account/provider-settings/?tab=access`);
   const accessForm = page.locator("form").filter({ has: page.getByRole("heading", { name: "Add a trusted buyer", exact: true }) });
   await accessForm.getByLabel("Buyer email", { exact: true }).fill("trusted@example.invalid");
   await accessForm.getByLabel("Client Host Market · Paid", { exact: true }).check();

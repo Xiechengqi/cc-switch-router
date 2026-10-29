@@ -26,7 +26,7 @@ test("termination actions are scoped to Client records, never wallet or income",
   for (const path of ["components/dashboard/platform-wallet-panel.tsx", "components/dashboard/provider-finance-panel.tsx"]) {
     assert.doesNotMatch(source(path), /ClientTerminationsPanel|ClientTerminationRecord|ClientTerminationDialog/);
   }
-  const client = source("components/dashboard/account-client-page.tsx");
+  const client = source("components/dashboard/account-client-section.tsx");
   assert.match(client, /<ClientTerminationRecord\b/);
   assert.equal(client.match(/<ClientTerminationDialog\b/g)?.length, 1, "refreshes update rows without remounting an open dialog");
   assert.match(client, /key=\{actor \|\| "anonymous"\}/);
@@ -41,7 +41,7 @@ test("record details mount lazily and use stable identity across refreshes", () 
   assert.match(table, /aria-expanded=\{open\}/);
   assert.match(table, /rootRef\.current\?\.querySelector/);
   assert.match(source("components/dashboard/account-share-rentals.tsx"), /renderDetail=\{\(subscription\) =>/);
-  assert.match(source("components/dashboard/account-client-page.tsx"), /renderDetail=\{\(entry\) =>/);
+  assert.match(source("components/dashboard/account-client-section.tsx"), /renderDetail=\{\(entry\) =>/);
 });
 
 test("navbar actions are lazy and refocus the existing wallet instead of duplicating it", () => {
@@ -58,6 +58,12 @@ test("navbar actions are lazy and refocus the existing wallet instead of duplica
   assert.match(c2c, /inline=\{inlineConfirmation\}/);
   assert.match(c2c, /previewForm\.current\?\.querySelector<HTMLButtonElement>/);
   assert.match(c2c, /<C2CError>\{!quote \|\| pending \? error : ""\}<\/C2CError>/, "confirmation errors appear once, inside the active confirmation");
+});
+
+test("account section labels have both languages", async () => {
+  const { accountSectionMessagesEn, accountSectionMessagesZh } = await import("./account-section-messages");
+  assert.deepEqual(Object.keys(accountSectionMessagesZh).sort(), Object.keys(accountSectionMessagesEn).sort());
+  for (const value of [...Object.values(accountSectionMessagesEn), ...Object.values(accountSectionMessagesZh)]) assert.ok(value.trim());
 });
 
 test("account labels have both languages and balance sending does not rename external payment", () => {

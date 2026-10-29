@@ -1,5 +1,5 @@
-import { AccountApiKeysPanel } from "@/components/dashboard/account-api-keys-panel";
+import { AccountLegacyRedirect } from "@/components/dashboard/account-legacy-redirect";
 
 export default function Page() {
-  return <AccountApiKeysPanel />;
+  return <AccountLegacyRedirect />;
 }

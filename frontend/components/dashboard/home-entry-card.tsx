@@ -1,88 +1,97 @@
 "use client";
 
-import { Alert, Button } from "@heroui/react";
-import { Loader2 } from "lucide-react";
+import { Button } from "@heroui/react";
+import { House, Loader2, Monitor, Network, Share2, Trophy, WalletCards } from "lucide-react";
 import * as React from "react";
 import { useAuth } from "@/components/auth/auth-provider";
+import { ChoiceCard } from "@/components/common/choice-card";
+import { AccountInlineLoading, AccountSectionError } from "@/components/dashboard/account-section";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { homeEntryStatus, saveHomeEntry } from "@/lib/auth";
+import { useCachedResource } from "@/lib/cached-resource";
+import { HOME_ENTRY_SECTION_ID } from "@/lib/dashboard-nav";
 import { HOME_ENTRIES, rememberHomeEntryStatus, type HomeEntry } from "@/lib/home-entry";
 
-const LABELS: Record<HomeEntry, "start.home.clients" | "nav.clientMarketTab" | "nav.shareMarketTab" | "account.nav.wallet" | "nav.providersTab"> = {
-  clients: "start.home.clients",
-  "client-market": "nav.clientMarketTab",
-  "share-market": "nav.shareMarketTab",
-  wallet: "account.nav.wallet",
-  providers: "nav.providersTab",
+const OPTIONS: Record<HomeEntry, {
+  icon: typeof House;
+  labelKey: "start.home.clients" | "nav.clientMarketTab" | "nav.shareMarketTab" | "account.nav.wallet" | "nav.providersTab";
+}> = {
+  clients: { icon: Monitor, labelKey: "start.home.clients" },
+  "client-market": { icon: Network, labelKey: "nav.clientMarketTab" },
+  "share-market": { icon: Share2, labelKey: "nav.shareMarketTab" },
+  wallet: { icon: WalletCards, labelKey: "account.nav.wallet" },
+  providers: { icon: Trophy, labelKey: "nav.providersTab" },
 };
 
-export function AccountHomePage() {
+/** Which page the product home opens for this account. */
+export function HomeEntryCard() {
   const { t } = useLocaleText();
-  const { session, loading } = useAuth();
-  const [selected, setSelected] = React.useState<HomeEntry>("clients");
-  const [ready, setReady] = React.useState(false);
+  const { session } = useAuth();
+  const actor = session?.user?.id || "";
+  const status = useCachedResource(actor ? `home-entry:${actor}` : null, homeEntryStatus);
+  const [choice, setChoice] = React.useState<HomeEntry | null>(null);
   const [saving, setSaving] = React.useState(false);
   const [saved, setSaved] = React.useState(false);
-  const [error, setError] = React.useState(false);
+  const [saveError, setSaveError] = React.useState(false);
+  const current = status.data?.entry ?? null;
+  const selected = choice ?? current ?? "clients";
 
   React.useEffect(() => {
-    if (loading || !session?.authenticated) return;
-    let active = true;
-    homeEntryStatus()
-      .then((status) => {
-        rememberHomeEntryStatus(session?.user?.id || "", status);
-        if (active && status.entry) setSelected(status.entry);
-      })
-      .catch(() => { if (active) setError(true); })
-      .finally(() => { if (active) setReady(true); });
-    return () => { active = false; };
-  }, [loading, session?.authenticated, session?.user?.id]);
+    if (actor && status.data) rememberHomeEntryStatus(actor, status.data);
+  }, [actor, status.data]);
 
   const save = () => {
     setSaving(true);
     setSaved(false);
-    setError(false);
+    setSaveError(false);
     void saveHomeEntry(selected, "choice")
-      .then((status) => {
-        rememberHomeEntryStatus(session?.user?.id || "", status);
+      .then((next) => {
+        rememberHomeEntryStatus(actor, next);
+        status.mutate(() => next);
+        setChoice(null);
         setSaved(true);
       })
-      .catch(() => setError(true))
+      .catch(() => setSaveError(true))
       .finally(() => setSaving(false));
   };
 
   return (
-    <section className="grid max-w-xl gap-4">
-      <h1 className="text-lg font-semibold">{t("start.home.title")}</h1>
-      <p className="text-sm text-muted-foreground">{t("start.home.lead")}</p>
-      {!ready ? (
-        <div className="flex items-center gap-2 text-sm text-muted-foreground" role="status">
-          <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
-          {t("common.loading")}
-        </div>
+    <section id={HOME_ENTRY_SECTION_ID} aria-labelledby="home-entry-title" className="grid min-w-0 scroll-mt-20 gap-4 rounded-xl border border-border bg-card p-4 sm:p-5">
+      <div>
+        <h3 id="home-entry-title" className="flex items-center gap-2 text-sm font-semibold text-foreground">
+          <House className="h-4 w-4 text-muted-foreground" aria-hidden />
+          {t("start.home.title")}
+        </h3>
+        <p className="mt-0.5 text-sm text-muted-foreground">{t("account.security.homeHint")}</p>
+      </div>
+      {status.data === undefined ? (
+        status.error ? <AccountSectionError message={t("start.error")} onRetry={() => void status.refresh()} /> : <AccountInlineLoading />
       ) : (
-        <fieldset className="grid gap-2">
-          <legend className="sr-only">{t("start.home.title")}</legend>
-          {HOME_ENTRIES.map((entry) => (
-            <label key={entry} className="flex items-center gap-2 text-sm">
-              <input
-                type="radio"
+        <>
+          <div role="radiogroup" aria-labelledby="home-entry-title" className="grid gap-2 sm:grid-cols-2">
+            {HOME_ENTRIES.map((entry) => (
+              <ChoiceCard
+                key={entry}
                 name="home-entry"
                 value={entry}
                 checked={selected === entry}
-                onChange={() => { setSelected(entry); setSaved(false); }}
+                onChange={(value) => { setChoice(value as HomeEntry); setSaved(false); }}
+                icon={OPTIONS[entry].icon}
+                title={t(OPTIONS[entry].labelKey)}
+                selectedLabel={t("common.selected")}
               />
-              {t(LABELS[entry])}
-            </label>
-          ))}
-        </fieldset>
+            ))}
+          </div>
+          {saveError ? <AccountSectionError message={t("start.error")} /> : null}
+          <div className="flex flex-wrap items-center gap-3">
+            <Button isDisabled={saving || selected === current} onPress={save}>
+              {saving ? <Loader2 className="h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden /> : null}
+              {t("start.home.save")}
+            </Button>
+            {saved ? <p className="text-sm text-muted-foreground" role="status">{t("start.home.saved")}</p> : null}
+          </div>
+        </>
       )}
-      {error ? <Alert status="danger">{t("start.error")}</Alert> : null}
-      {saved ? <p className="text-sm text-muted-foreground" role="status">{t("start.home.saved")}</p> : null}
-      <Button className="w-fit" isDisabled={!ready || saving} onPress={save}>
-        {saving ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : null}
-        {t("start.home.save")}
-      </Button>
     </section>
   );
 }

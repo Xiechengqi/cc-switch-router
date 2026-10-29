@@ -1,9 +1,11 @@
 "use client";
 
 import * as React from "react";
-import { Bell, Check, CheckCheck, Loader2, RefreshCw } from "lucide-react";
+import Link from "next/link";
+import { Bell, Check, CheckCheck, Loader2, RefreshCw, Settings2 } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
+import { DASHBOARD_ACCOUNT_NOTIFICATIONS_PATH } from "@/lib/dashboard-nav";
 import { getNotifications, markNotificationRead, notificationKindKey, notificationHref,
   type UserNotification } from "@/lib/user-notifications";
 import { formatMinorUsd, formatWalletUnits } from "@/lib/market-wallet-money";
@@ -215,6 +217,13 @@ export function NotificationsBell() {
           {!loading && !items.length ? <li className="px-4 py-6 text-center text-sm text-muted-foreground">{t("marketNotifications.empty")}</li> : null}
           {cursor && loading ? <li className="flex min-h-8 items-center justify-center" aria-hidden="true"><Loader2 className="size-3.5 animate-spin motion-reduce:animate-none text-muted-foreground" /></li> : null}
         </ul>
+        <div className="border-t border-border px-3 py-1">
+          <Link href={DASHBOARD_ACCOUNT_NOTIFICATIONS_PATH} onClick={() => { openRef.current = false; setOpen(false); }}
+            className="inline-flex min-h-11 items-center gap-1.5 rounded-lg px-1 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring">
+            <Settings2 className="size-3.5" aria-hidden="true" />
+            {t("account.nav.notifications")}
+          </Link>
+        </div>
       </div>
     </div>
   );

@@ -1,5 +1,5 @@
-import { AccountProviderUsagePanel } from "@/components/dashboard/account-provider-usage-panel";
+import { AccountLegacyRedirect } from "@/components/dashboard/account-legacy-redirect";
 
 export default function Page() {
-  return <AccountProviderUsagePanel />;
+  return <AccountLegacyRedirect />;
 }

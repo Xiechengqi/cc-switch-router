@@ -16,7 +16,7 @@ import { refreshAccessToken } from "@/lib/auth";
 import { DashboardDataProvider } from "@/components/dashboard/dashboard-data";
 import { AnnouncementDialog } from "@/components/announcement/announcement-dialog";
 import {
-  DASHBOARD_ACCOUNT_API_KEYS_PATH,
+  DASHBOARD_ACCOUNT_SECURITY_PATH,
   DASHBOARD_ACCOUNT_PATH,
   DASHBOARD_CLIENTS_PATH,
   DASHBOARD_SHARE_MARKET_PATH,
@@ -355,9 +355,9 @@ function Topbar({ active }: { active: DashboardShellActive }) {
                         {displayEmail}
                       </Dropdown.Item>
                     </Dropdown.Section>
-                    <Dropdown.Item id="api-token" onAction={() => router.push(DASHBOARD_ACCOUNT_API_KEYS_PATH)}>
+                    <Dropdown.Item id="api-token" onAction={() => router.push(DASHBOARD_ACCOUNT_SECURITY_PATH)}>
                       <KeyRound className="h-4 w-4" />
-                      API Token
+                      {t("account.apiKeys.title")}
                     </Dropdown.Item>
                     {session?.password ? <Dropdown.Item id="login-password" onAction={openPasswordSettings}>
                       <KeyRound className="h-4 w-4" />

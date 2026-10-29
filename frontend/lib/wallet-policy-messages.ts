@@ -54,7 +54,6 @@ export const walletPolicyMessagesEn = {
   "walletAccess.openHelp":
     "Users may request this service without individual approval. Paid services still require platform balance.",
   "walletAccess.openConfirm": "Allow unknown users unless explicitly denied.",
-  "account.nav.group.funds": "Funds",
   "account.nav.providerSettings": "Provider center",
   "walletPolicy.credit": "Balance to receive",
   "walletPolicy.fee": "Maintenance fee ({rate}%)",
@@ -171,7 +170,6 @@ export const walletPolicyMessagesZh: Record<
   "walletAccess.openHelp":
     "用户无需逐个批准即可租用；付费服务仍必须使用平台余额。",
   "walletAccess.openConfirm": "允许未单独信任的用户，但明确拒绝的用户除外。",
-  "account.nav.group.funds": "资金",
   "account.nav.providerSettings": "供应商中心",
   "walletPolicy.credit": "到账余额",
   "walletPolicy.fee": "维护费（{rate}%）",

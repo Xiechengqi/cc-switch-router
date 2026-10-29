@@ -107,7 +107,7 @@ try {
     return release;
   };
 
-  await page.goto(`${baseUrl}/account/api-keys/`);
+  await page.goto(`${baseUrl}/account/security/`);
   await page.getByRole("button", { name: "Login", exact: true }).waitFor();
   assert.equal(await balance.count(), 0);
   assert.equal(walletCalls, 0);

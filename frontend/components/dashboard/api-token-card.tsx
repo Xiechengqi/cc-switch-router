@@ -5,6 +5,7 @@ import { Button } from "@heroui/react";
 import { Copy, Eye, EyeOff, KeyRound, Loader2, RotateCcw } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
+import { AccountSectionError } from "@/components/dashboard/account-section";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getUserApiToken, resetUserApiToken } from "@/lib/api";
 import type { UserApiTokenStatus } from "@/lib/types";
@@ -19,13 +20,14 @@ function buildShareCurlExample(host: string, apiToken: string) {
     `  -H 'Authorization: ${bearer}' \\`,
     `  -H 'Accept: text/event-stream' \\`,
     `  -H 'Content-Type: application/json' \\`,
-    `  -d '{"model":"claude-opus-4-7","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"who are you"}]}'`,
+    `  -d '{"model":"<model>","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"who are you"}]}'`,
   ].join("\n");
 }
 
-export function AccountApiKeysPanel() {
+/** The account API token: reveal, copy and reset, with a ready-to-edit Share call. */
+export function ApiTokenCard() {
   const { locale, t } = useLocaleText();
-  const { session, loading: authLoading } = useAuth();
+  const { session } = useAuth();
   const authed = !!session?.authenticated;
 
   const [token, setToken] = React.useState<UserApiTokenStatus | null>(null);
@@ -33,6 +35,8 @@ export function AccountApiKeysPanel() {
   const [showToken, setShowToken] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
+  // Retry re-reads the token only when reading it failed, never after a failed reset.
+  const [loadFailed, setLoadFailed] = React.useState(false);
   const [copiedToken, setCopiedToken] = React.useState(false);
   const [copiedCurl, setCopiedCurl] = React.useState(false);
   const [host, setHost] = React.useState("router.example.com");
@@ -55,6 +59,7 @@ export function AccountApiKeysPanel() {
   const load = React.useCallback(async () => {
     setBusy(true);
     setError("");
+    setLoadFailed(false);
     try {
       const response = await getUserApiToken();
       setToken(response.token);
@@ -62,6 +67,7 @@ export function AccountApiKeysPanel() {
       setShowToken(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+      setLoadFailed(true);
     } finally {
       setBusy(false);
     }
@@ -81,6 +87,7 @@ export function AccountApiKeysPanel() {
   const reset = async () => {
     setBusy(true);
     setError("");
+    setLoadFailed(false);
     setCopiedToken(false);
     try {
       const response = await resetUserApiToken();
@@ -109,34 +116,19 @@ export function AccountApiKeysPanel() {
     window.setTimeout(() => setCopiedCurl(false), 1500);
   };
 
-  if (authLoading) {
-    return (
-      <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
-        <Loader2 className="h-4 w-4 animate-spin" />
-        {t("account.loading")}
-      </div>
-    );
-  }
-
-  if (!authed) {
-    return <p className="py-6 text-sm text-muted-foreground">{t("account.apiKeys.signInRequired")}</p>;
-  }
-
   return (
-    <div className="grid min-w-0 gap-6">
+    <section aria-labelledby="api-token-title" className="grid min-w-0 gap-4 rounded-xl border border-border bg-card p-4 sm:p-5">
       <div>
-        <h2 className="flex items-center gap-2 text-base font-semibold text-foreground">
+        <h3 id="api-token-title" className="flex items-center gap-2 text-sm font-semibold text-foreground">
           <KeyRound className="h-4 w-4 text-muted-foreground" aria-hidden />
           {t("account.apiKeys.title")}
-        </h2>
+        </h3>
         <p className="mt-0.5 text-sm text-muted-foreground">{t("account.apiKeys.hint")}</p>
       </div>
 
-      {error ? (
-        <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700" role="alert">{error}</div>
-      ) : null}
+      {error ? <AccountSectionError message={error} onRetry={loadFailed ? () => void load() : undefined} /> : null}
 
-      <section className="grid gap-3 rounded-xl border border-border bg-card p-4 sm:p-5">
+      <div className="grid gap-3">
         <div className="grid gap-2 text-sm">
           <div className="flex justify-between gap-3">
             <span className="text-muted-foreground">{t("account.apiKeys.created")}</span>
@@ -174,11 +166,11 @@ export function AccountApiKeysPanel() {
             {t("account.apiKeys.reset")}
           </Button>
         </div>
-      </section>
+      </div>
 
-      <section className="grid gap-3">
+      <div className="grid gap-3 border-t border-border pt-4">
         <div>
-          <h3 className="text-sm font-semibold text-foreground">{t("account.apiKeys.exampleTitle")}</h3>
+          <h4 className="text-sm font-semibold text-foreground">{t("account.apiKeys.exampleTitle")}</h4>
           <p className="mt-0.5 text-sm text-muted-foreground">{t("account.apiKeys.exampleHint")}</p>
         </div>
         <div className="relative rounded-xl border border-border bg-muted/30 p-4">
@@ -195,7 +187,7 @@ export function AccountApiKeysPanel() {
             {curlExample}
           </pre>
         </div>
-      </section>
+      </div>
 
       <ConfirmAlertDialog
         open={resetConfirmOpen}
@@ -208,6 +200,6 @@ export function AccountApiKeysPanel() {
         onConfirm={() => void reset()}
         onOpenChange={(next) => !busy && setResetConfirmOpen(next)}
       />
-    </div>
+    </section>
   );
 }

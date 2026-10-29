@@ -2,9 +2,13 @@
 
 import * as React from "react";
 import { Button, Input } from "@heroui/react";
-import { AlertTriangle, Bell, Check, ExternalLink, Loader2, Mail, RefreshCw, Send, Smartphone, Unlink } from "lucide-react";
+import { useSearchParams } from "next/navigation";
+import { AlertTriangle, Bell, ExternalLink, Loader2, Mail, RefreshCw, Send, Smartphone, Unlink } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
+import { ChoiceCard } from "@/components/common/choice-card";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
+import { SegmentedControl } from "@/components/common/segmented-control";
+import { AccountInlineLoading, AccountSectionError, AccountSectionHeader } from "@/components/dashboard/account-section";
 import { MarketNotificationPreferences } from "@/components/dashboard/market-notification-preferences";
 import { CompactSelect } from "@/components/common/compact-select";
 import { useLocaleText } from "@/components/i18n/locale-provider";
@@ -18,7 +22,9 @@ import {
   unbindMyBark,
   updateMyNotificationSettings,
 } from "@/lib/api";
+import { NOTIFICATION_SETTINGS_TABS, notificationSettingsTab, type NotificationSettingsTab } from "@/lib/dashboard-nav";
 import type { NotificationChannelSettings, NotificationSettings, TelegramBindLink, UserNotificationHistoryItem } from "@/lib/types";
+import { replaceCurrentSearch } from "@/lib/url-search";
 import { cn, formatDateTime } from "@/lib/utils";
 
 /** How long to keep watching for the `/start` handshake after opening the tab. */
@@ -61,10 +67,18 @@ const CHANNEL_OPTIONS: ChannelOption[] = [
   },
 ];
 
+/**
+ * Notification settings in three tabs: where alerts go (and the bindings each
+ * destination needs), which kinds are sent, and what was delivered. The tab
+ * lives in `?tab=`; the history loads only when opened.
+ */
 export function AccountNotificationsPanel() {
   const { locale, t } = useLocaleText();
-  const { session, loading: authLoading } = useAuth();
+  const { session } = useAuth();
   const authed = !!session?.authenticated;
+  const searchParams = useSearchParams();
+  const tab = notificationSettingsTab(searchParams.get("tab"));
+  const setTab = (next: NotificationSettingsTab) => replaceCurrentSearch((params) => params.set("tab", next));
 
   const [settings, setSettings] = React.useState<NotificationSettings | null>(null);
   const [bindLink, setBindLink] = React.useState<TelegramBindLink | null>(null);
@@ -249,27 +263,7 @@ export function AccountNotificationsPanel() {
     }
   };
 
-  if (authLoading) {
-    return (
-      <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
-        <Loader2 className="h-4 w-4 animate-spin" />
-        {t("account.loading")}
-      </div>
-    );
-  }
-
-  if (!authed) {
-    return <p className="py-6 text-sm text-muted-foreground">{t("account.apiKeys.signInRequired")}</p>;
-  }
-
-  if (loading && !settings) {
-    return (
-      <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
-        <Loader2 className="h-4 w-4 animate-spin" />
-        {t("account.loading")}
-      </div>
-    );
-  }
+  if (!authed) return null;
 
   const telegram = channelSettings(settings, "telegram");
   const bark = channelSettings(settings, "bark");
@@ -310,20 +304,22 @@ export function AccountNotificationsPanel() {
 
   return (
     <div className="grid min-w-0 gap-6">
-      <div>
-        <h2 className="flex items-center gap-2 text-base font-semibold text-foreground">
-          <Bell className="h-4 w-4 text-muted-foreground" aria-hidden />
-          {t("account.notifications.title")}
-        </h2>
-        <p className="mt-0.5 text-sm text-muted-foreground">{t("account.notifications.hint")}</p>
-      </div>
+      <AccountSectionHeader icon={Bell} title={t("account.notifications.title")} hint={t("account.notifications.hint")} />
+      <SegmentedControl
+        value={tab}
+        onChange={setTab}
+        ariaLabel={t("account.notifications.sections")}
+        size="md"
+        className="w-full max-w-md"
+        fullWidth
+        items={NOTIFICATION_SETTINGS_TABS.map((id) => ({ id, label: t(`account.notifications.tab.${id}`) }))}
+      />
 
-      {error ? (
-        <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700" role="alert">
-          {error}
-        </div>
-      ) : null}
+      {tab === "channels" && error ? <AccountSectionError message={error} onRetry={settings ? undefined : () => void load()} /> : null}
 
+      {tab === "channels" && loading && !settings ? <AccountInlineLoading /> : null}
+
+      {tab === "channels" && settings ? <>
       <section className="grid gap-3">
         <div>
           <h3 className="text-sm font-semibold text-foreground">{t("account.notifications.channelTitle")}</h3>
@@ -358,59 +354,29 @@ export function AccountNotificationsPanel() {
             // change, and disabling the focused radio mid-request would drop
             // keyboard focus out of the group.
             const disabled = !usable && !selected;
+            const needsBinding = !usable && channel?.state !== "ready";
             return (
-              <label
+              <ChoiceCard
                 key={option.value}
-                className={cn(
-                  "group relative flex min-h-16 cursor-pointer items-center gap-3 rounded-xl border px-3 py-3 transition-all duration-200 sm:px-4",
-                  selected
-                    ? "border-accent bg-accent/5 shadow-[0_4px_14px_rgba(0,82,255,0.15)]"
-                    : "border-border bg-card hover:border-accent/30 hover:shadow-md",
-                  disabled && !selected && "cursor-not-allowed opacity-60 hover:border-border hover:shadow-none",
-                  "focus-within:ring-2 focus-within:ring-accent focus-within:ring-offset-2",
-                )}
-              >
-                <input
-                  type="radio"
-                  name="notification-delivery-channel"
-                  className="sr-only"
-                  value={option.value}
-                  checked={selected}
-                  disabled={disabled}
-                  onChange={() => void selectChannel(option.value)}
-                />
-                <span
-                  className={cn(
-                    "flex h-9 w-9 shrink-0 items-center justify-center rounded-lg transition-all duration-200",
-                    selected
-                      ? "bg-gradient-to-br from-accent to-[rgb(var(--router-accent-secondary))] text-white"
-                      : "bg-muted text-muted-foreground",
-                  )}
-                  aria-hidden
-                >
-                  <Icon className="h-4 w-4" />
-                </span>
-                <div className="min-w-0 flex-1">
-                  <div className="text-sm font-medium text-foreground">{t(option.labelKey)}</div>
-                  <div className="text-xs leading-relaxed text-muted-foreground">
-                    {reason && !selected ? reason : t(option.hintKey)}
-                  </div>
-                </div>
-                {selected ? (
-                  <span className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-accent px-2.5 py-1 text-xs font-medium text-white">
-                    <Check className="h-3 w-3" aria-hidden />
-                    {t("account.notifications.channel.selected")}
-                  </span>
-                ) : (
-                  <span
-                    className={cn(
-                      "h-4 w-4 shrink-0 rounded-full border-2 transition-colors duration-200",
-                      disabled ? "border-border" : "border-muted-foreground/40 group-hover:border-accent",
-                    )}
-                    aria-hidden
-                  />
-                )}
-              </label>
+                name="notification-delivery-channel"
+                value={option.value}
+                checked={selected}
+                disabled={disabled}
+                onChange={(value) => void selectChannel(value)}
+                icon={option.icon}
+                title={t(option.labelKey)}
+                selectedLabel={t("account.notifications.channel.selected")}
+                description={reason && !selected ? (
+                  <>
+                    {reason}
+                    {needsBinding ? (
+                      <a href={`#notify-${option.value}`} className="ml-1 font-medium text-accent underline-offset-2 hover:underline">
+                        {t("account.notifications.goBind")}
+                      </a>
+                    ) : null}
+                  </>
+                ) : t(option.hintKey)}
+              />
             );
           })}
         </div>
@@ -426,7 +392,7 @@ export function AccountNotificationsPanel() {
         </p>
       </section>
 
-      <section className="grid gap-3 rounded-xl border border-border bg-card p-4 sm:p-5">
+      <section id="notify-telegram" className="grid scroll-mt-20 gap-3 rounded-xl border border-border bg-card p-4 sm:p-5">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0">
             <h3 className="flex items-center gap-2 text-sm font-semibold text-foreground">
@@ -553,7 +519,7 @@ export function AccountNotificationsPanel() {
         ) : null}
       </section>
 
-      <section className="grid gap-3 rounded-xl border border-border bg-card p-4 sm:p-5">
+      <section id="notify-bark" className="grid scroll-mt-20 gap-3 rounded-xl border border-border bg-card p-4 sm:p-5">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0">
             <h3 className="flex items-center gap-2 text-sm font-semibold text-foreground">
@@ -665,9 +631,11 @@ export function AccountNotificationsPanel() {
         ) : null}
       </section>
 
-      <MarketNotificationPreferences />
+      </> : null}
 
-      <AccountNotificationHistory accountKey={session?.user?.email || ""} />
+      {tab === "types" ? <MarketNotificationPreferences /> : null}
+
+      {tab === "history" ? <AccountNotificationHistory accountKey={session?.user?.email || ""} /> : null}
 
       <ConfirmAlertDialog
         open={unbindOpen}
@@ -737,7 +705,7 @@ function AccountNotificationHistory({ accountKey }: { accountKey: string }) {
   }, [accountKey, channel, status]);
 
   return (
-    <section className="grid gap-3 border-t pt-6">
+    <section className="grid gap-3">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h3 className="text-sm font-semibold text-foreground">{t("account.notifications.historyTitle")}</h3>
@@ -761,7 +729,7 @@ function AccountNotificationHistory({ accountKey }: { accountKey: string }) {
           { value: "suppressed", label: t("account.notifications.historySuppressed") },
         ]} />
       </div>
-      {error ? <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div> : null}
+      {error ? <AccountSectionError message={error} onRetry={() => void load(false)} /> : null}
       <div className="divide-y rounded-md border">
         {items.map((item) => (
           <details key={item.id} className="group px-3 py-3">

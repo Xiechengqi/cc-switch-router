@@ -24,13 +24,14 @@ export function UsagePeriodChips({
   t: Translate;
 }) {
   return (
-    <div className="flex flex-wrap items-center gap-1">
+    <div role="group" aria-label={t("account.usage.periodLabel")} className="flex flex-wrap items-center gap-1">
       {USAGE_PERIODS.map((item) => (
         <button
           key={item}
           type="button"
+          aria-pressed={period === item}
           className={cn(
-            "rounded-md border px-2.5 py-1 text-xs transition-colors",
+            "min-h-11 rounded-md border px-3 py-1 text-xs transition-colors",
             period === item
               ? "border-foreground/25 bg-background font-semibold text-foreground"
               : "border-transparent text-muted-foreground hover:border-border hover:bg-muted/40",

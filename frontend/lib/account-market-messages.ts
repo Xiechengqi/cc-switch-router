@@ -47,12 +47,10 @@ export const accountMarketMessagesEn = {
   "account.market.earlierTerminations": "Earlier termination records",
 
   "providerCenter.sections": "Provider center sections",
-  "providerCenter.hint": "Your income as a Provider, who may rent from you, and how buyers can reach you.",
   "providerCenter.tab.income": "Income",
   "providerCenter.tab.access": "Buyer access",
   "providerCenter.tab.contact": "Contact",
   "providerCenter.pendingRequests": "{count} pending",
-  "providerCenter.defaultUnavailable": "Income could not be checked. Buyer access is shown by default; you can still select Income.",
 
   "settings.marketPaymentChannels.methodActive":
     "{method} already has an active channel ({channel}). Disable it before enabling another one.",
@@ -108,12 +106,10 @@ export const accountMarketMessagesZh: Record<keyof typeof accountMarketMessagesE
   "account.market.earlierTerminations": "更早的退租记录",
 
   "providerCenter.sections": "供应商中心分区",
-  "providerCenter.hint": "管理你作为供应商的收入、买家准入和联系信息。",
   "providerCenter.tab.income": "收入",
   "providerCenter.tab.access": "买家准入",
   "providerCenter.tab.contact": "联系信息",
   "providerCenter.pendingRequests": "{count} 待处理",
-  "providerCenter.defaultUnavailable": "暂时无法核对收入，已默认显示买家准入；你仍可切换到收入页。",
 
   "settings.marketPaymentChannels.methodActive":
     "{method}已有启用中的渠道（{channel}），请先停用它再启用其他渠道。",
