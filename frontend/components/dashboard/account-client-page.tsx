@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useSearchParams } from "next/navigation";
 import { ArrowUpRight, Loader2 } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { CountryFlag } from "@/components/common/country-flag";
@@ -20,17 +20,24 @@ import { Button } from "@heroui/react";
 import type { ClientTermination, ClientTerminationAction } from "@/lib/client-termination";
 import { trialHours, walletLifecycleKey } from "@/lib/client-checkout";
 import { getClientMarketHosts, getMyClientMarketRentals } from "@/lib/api";
+import { rememberView, useRememberedView } from "@/lib/cached-resource";
 import { mergeHosts, mergeRentalMap } from "@/lib/client-market-refresh";
-import { clientMarketMineHref, DASHBOARD_ACCOUNT_CLIENT_PATH, DASHBOARD_ACCOUNT_WALLET_PATH } from "@/lib/dashboard-nav";
+import { clientMarketMineHref, DASHBOARD_ACCOUNT_WALLET_PATH } from "@/lib/dashboard-nav";
 import type { MessageKey } from "@/lib/i18n";
 import { formatUsdMoney } from "@/lib/market-money";
 import { formatWalletUnits } from "@/lib/market-wallet-money";
+import { replaceCurrentSearch } from "@/lib/url-search";
 import { compareAccountRecords } from "@/lib/account-market-records";
 import { terminationCanRespond } from "@/lib/client-termination";
 import type { ClientMarketHost, ClientMarketRental } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 type ClientMonitorTab = "user" | "provider";
+
+type AccountClientView = {
+  hosts: ClientMarketHost[];
+  rentals: Map<string, ClientMarketRental>;
+};
 
 type MonitorEntry = {
   key: string;
@@ -398,7 +405,6 @@ export function AccountClientPage() {
 function AccountClientWorkspace() {
   const { t } = useLocaleText();
   const { session } = useAuth();
-  const router = useRouter();
   const searchParams = useSearchParams();
   const authed = !!session?.authenticated;
   const viewerUserId = session?.user?.id;
@@ -424,34 +430,34 @@ function AccountClientWorkspace() {
       });
   };
 
-  const [hosts, setHosts] = React.useState<ClientMarketHost[]>([]);
+  const viewKey = authed && viewerUserId ? `account-client:${viewerUserId}` : null;
+  const { remembered, takeSeed } = useRememberedView<AccountClientView>(viewKey);
+  const [hosts, setHosts] = React.useState<ClientMarketHost[]>(remembered?.hosts ?? []);
   const [rentalByInstallation, setRentalByInstallation] = React.useState<
     Map<string, ClientMarketRental>
-  >(new Map());
-  const [loading, setLoading] = React.useState(true);
+  >(() => remembered?.rentals ?? new Map());
+  const [loading, setLoading] = React.useState(!remembered);
+  const [loadedOk, setLoadedOk] = React.useState(remembered !== undefined);
   const [error, setError] = React.useState("");
   const refreshAbortRef = React.useRef<AbortController | null>(null);
 
   const setTab = React.useCallback(
     (next: ClientMonitorTab) => {
       setSelection(null);
-      const params = new URLSearchParams(searchParams.toString());
-      params.set("tab", next);
-      router.replace(`${DASHBOARD_ACCOUNT_CLIENT_PATH}?${params.toString()}`, { scroll: false });
+      replaceCurrentSearch((params) => params.set("tab", next));
     },
-    [router, searchParams],
+    [],
   );
 
-  const load = React.useCallback(async (options?: { silent?: boolean }) => {
+  const load = React.useCallback(async (options?: { silent?: boolean; reportErrors?: boolean }) => {
     const silent = options?.silent === true;
+    const reportErrors = !silent || options?.reportErrors === true;
     if (silent && refreshAbortRef.current) return;
     if (!silent) refreshAbortRef.current?.abort();
     const controller = new AbortController();
     refreshAbortRef.current = controller;
-    if (!silent) {
-      setLoading(true);
-      setError("");
-    }
+    if (!silent) setLoading(true);
+    if (reportErrors) setError("");
     try {
       const [nextHosts, rentals] = await Promise.all([
         getClientMarketHosts(undefined, controller.signal),
@@ -460,9 +466,10 @@ function AccountClientWorkspace() {
       if (controller.signal.aborted) return;
       setHosts((prev) => mergeHosts(prev, nextHosts));
       setRentalByInstallation((prev) => mergeRentalMap(prev, rentals));
+      setLoadedOk(true);
     } catch (err) {
       if (controller.signal.aborted) return;
-      if (!silent) setError(err instanceof Error ? err.message : String(err));
+      if (reportErrors) setError(err instanceof Error ? err.message : String(err));
     } finally {
       if (refreshAbortRef.current === controller) refreshAbortRef.current = null;
       if (!silent) setLoading(false);
@@ -474,9 +481,15 @@ function AccountClientWorkspace() {
       setLoading(false);
       return;
     }
-    void load();
+    // A remembered view is already on screen; refresh it without a spinner
+    // but still say so when the refresh fails.
+    void load(takeSeed() ? { silent: true, reportErrors: true } : undefined);
     return () => refreshAbortRef.current?.abort();
-  }, [authed, load]);
+  }, [authed, load, takeSeed]);
+
+  React.useEffect(() => {
+    if (loadedOk) rememberView<AccountClientView>(viewKey, { hosts, rentals: rentalByInstallation });
+  }, [hosts, loadedOk, rentalByInstallation, viewKey]);
 
   React.useEffect(() => {
     if (!authed) return;

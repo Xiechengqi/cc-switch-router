@@ -15,13 +15,17 @@ import {
 } from "@/components/dashboard/web-terminal";
 
 export function DashboardLayout({ children }: { children: React.ReactNode }) {
-  const { data, error, loading, refreshing } = useDashboardData();
+  const { data, stale, error, loading, refreshing } = useDashboardData();
   const { t } = useLocaleText();
+  // Focus and verification decide that a target is gone when it is missing
+  // from the snapshot, so they wait for a re-read rather than trust one kept
+  // from an earlier visit.
+  const verifiedData = stale ? null : data;
 
   return (
-    <DashboardFocusProvider data={data}>
+    <DashboardFocusProvider data={verifiedData}>
       <DashboardViewStateProvider>
-        <OperationVerificationProvider data={data}>
+        <OperationVerificationProvider data={verifiedData}>
           <ClientConsoleManagerProvider>
             <WebTerminalManagerProvider>
               <ClientChatProvider>

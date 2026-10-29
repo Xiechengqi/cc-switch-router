@@ -79,6 +79,26 @@ export function resolveHomeGate({ pathname, search, authed, loading, home }: {
   };
 }
 
+/** A status that can never show the first-use guide again. */
+export function isSettledHomeEntryStatus(status: HomeEntryStatus) {
+  return status.hasActivity || status.entry !== null;
+}
+
+const settledHomeEntryByActor = new Map<string, HomeEntryStatus>();
+
+/** Settled statuses survive soft navigations so returning to Clients never
+ * blanks the dashboard shell while the same answer is fetched again. A
+ * first-use status is not kept: it is read again on every gated visit. */
+export function settledHomeEntryStatus(actor: string) {
+  return actor ? settledHomeEntryByActor.get(actor) ?? null : null;
+}
+
+export function rememberHomeEntryStatus(actor: string, status: HomeEntryStatus) {
+  if (!actor) return;
+  if (isSettledHomeEntryStatus(status)) settledHomeEntryByActor.set(actor, status);
+  else settledHomeEntryByActor.delete(actor);
+}
+
 export function parseHomeEntryStatus(value: unknown): HomeEntryStatus | null {
   if (!value || typeof value !== "object") return null;
   const record = value as Record<string, unknown>;

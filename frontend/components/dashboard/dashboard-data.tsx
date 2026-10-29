@@ -7,6 +7,9 @@ import type { DashboardResponse } from "@/lib/types";
 
 type DashboardDataValue = {
   data: DashboardResponse | null;
+  /** `data` is the snapshot kept from an earlier visit and has not been
+   * re-read since polling resumed. Fine to show; not proof of existence. */
+  stale: boolean;
   error: string;
   loading: boolean;
   refreshing: boolean;
@@ -28,10 +31,12 @@ export function DashboardDataProvider({ enabled, children }: { enabled: boolean;
   const [error, setError] = React.useState("");
   const [loading, setLoading] = React.useState(enabled);
   const [refreshing, setRefreshing] = React.useState(false);
+  const [stale, setStale] = React.useState(false);
   const [clock, setClock] = React.useState(() => Date.now());
   const requestSeq = React.useRef(0);
   const inFlightRef = React.useRef<DashboardRefreshFlight | null>(null);
   const dataRef = React.useRef<DashboardResponse | null>(null);
+  const dataContextRef = React.useRef("");
   const { loading: authLoading, session } = useAuth();
   const refreshContextKey = `${session?.authenticated ? "authenticated" : "anonymous"}:${session?.user?.email?.trim().toLowerCase() || "-"}`;
 
@@ -56,6 +61,7 @@ export function DashboardDataProvider({ enabled, children }: { enabled: boolean;
         if (seq !== requestSeq.current) return;
         dataRef.current = next;
         setData(next);
+        setStale(false);
         setError("");
         setClock(Date.now());
       } catch (err) {
@@ -80,11 +86,17 @@ export function DashboardDataProvider({ enabled, children }: { enabled: boolean;
     requestSeq.current += 1;
     inFlightRef.current?.controller.abort();
     inFlightRef.current = null;
-    dataRef.current = null;
-    setData(null);
+    // Leaving Clients only pauses polling. Coming back shows the last snapshot
+    // at once and refreshes it; a different account never sees it.
+    if (dataContextRef.current !== refreshContextKey) {
+      dataContextRef.current = refreshContextKey;
+      dataRef.current = null;
+      setData(null);
+    }
+    setStale(dataRef.current != null);
     setError("");
     setRefreshing(false);
-    setLoading(enabled && !authLoading);
+    setLoading(enabled && !authLoading && dataRef.current == null);
     setClock(Date.now());
     if (!enabled || authLoading) return;
     void refresh();
@@ -105,8 +117,8 @@ export function DashboardDataProvider({ enabled, children }: { enabled: boolean;
   const generatedAt = data ? Date.parse(data.generatedAt) : 0;
   const fresh = Boolean(data && !error && Number.isFinite(generatedAt) && clock - generatedAt < 20_000);
   const value = React.useMemo(
-    () => ({ data, error, loading, refreshing, fresh, refresh }),
-    [data, error, fresh, loading, refresh, refreshing],
+    () => ({ data, stale, error, loading, refreshing, fresh, refresh }),
+    [data, error, fresh, loading, refresh, refreshing, stale],
   );
   return <DashboardDataContext.Provider value={value}>{children}</DashboardDataContext.Provider>;
 }

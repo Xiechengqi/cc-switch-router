@@ -6,7 +6,6 @@ import { Activity, BarChart3, Bell, House, KeyRound, Receipt, Share2, ShieldChec
 import * as React from "react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { getMarketAccessInboxSummary } from "@/lib/api";
 import {
   accountNavHrefFromPathname,
   DASHBOARD_ACCOUNT_API_KEYS_PATH,
@@ -23,6 +22,7 @@ import {
   writeStoredAccountNavHref,
   type AccountNavHref,
 } from "@/lib/dashboard-nav";
+import { useMarketAccessInboxSummary } from "@/lib/use-market-access-inbox-summary";
 import { cn } from "@/lib/utils";
 
 const NAV_ITEMS: {
@@ -125,9 +125,10 @@ export function AccountShell({ children }: { children: React.ReactNode }) {
   const { session } = useAuth();
   const pathname = usePathname() || DASHBOARD_ACCOUNT_API_KEYS_PATH;
   const router = useRouter();
-  const [pendingAccessRequests, setPendingAccessRequests] = React.useState(0);
   const authed = !!session?.authenticated;
-  const actor = session?.user?.id || session?.user?.email || "anonymous";
+  const { pendingRequests: pendingAccessRequests, refresh: refreshPendingAccessRequests } = useMarketAccessInboxSummary(
+    authed ? session?.user?.id || session?.user?.email : null,
+  );
   const activeItem = NAV_ITEMS.find((item) => item.match(pathname));
 
   React.useEffect(() => {
@@ -139,22 +140,10 @@ export function AccountShell({ children }: { children: React.ReactNode }) {
     if (href) writeStoredAccountNavHref(href);
   }, [pathname, router]);
 
+  // Each account section re-reads the badge; the request is shared.
   React.useEffect(() => {
-    setPendingAccessRequests(0);
-    if (!authed) {
-      return;
-    }
-    let active = true;
-    const loadPending = () => void getMarketAccessInboxSummary()
-      .then((summary) => { if (active) setPendingAccessRequests(summary.pendingRequests); })
-      .catch(() => undefined);
-    loadPending();
-    const timer = window.setInterval(loadPending, 30_000);
-    return () => {
-      active = false;
-      window.clearInterval(timer);
-    };
-  }, [actor, authed, pathname]);
+    void refreshPendingAccessRequests();
+  }, [pathname, refreshPendingAccessRequests]);
 
   return (
     <main className="mx-auto grid min-w-0 w-[calc(100%-2rem)] max-w-6xl grid-cols-[minmax(0,1fr)] gap-6 pb-12 pt-2 md:grid-cols-[13rem_minmax(0,1fr)] md:gap-8">

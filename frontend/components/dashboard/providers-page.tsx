@@ -7,7 +7,7 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { useSearchParams } from "next/navigation";
 import { Button, Drawer } from "@heroui/react";
 import {
   AlertTriangle,
@@ -26,12 +26,14 @@ import {
   getMarketProvider,
   getMarketProviders,
 } from "@/lib/api";
+import { rememberedView, rememberView } from "@/lib/cached-resource";
 import { clientMarketHref, shareMarketHref } from "@/lib/dashboard-nav";
 import type {
   MarketProvider,
   MarketProviderDetail,
   MarketProviderList,
 } from "@/lib/types";
+import { replaceCurrentSearch } from "@/lib/url-search";
 import {
   actorBoundValue,
   filterMarketProviders,
@@ -473,14 +475,18 @@ function RankingMethodDrawer({
   );
 }
 
+const PROVIDER_LIST_VIEW_KEY = "market-providers";
+
 export function ProvidersPage() {
   const { locale, t } = useLocaleText();
-  const pathname = usePathname();
-  const router = useRouter();
   const searchParams = useSearchParams();
   const providerId = searchParams.get("provider") || "";
 
-  const [providerList, setProviderList] = React.useState<MarketProviderList | null>(null);
+  // The public ranking needs no account scope; a remembered list renders at
+  // once while it is re-read.
+  const [providerList, setProviderList] = React.useState<MarketProviderList | null>(
+    () => rememberedView<MarketProviderList>(PROVIDER_LIST_VIEW_KEY) ?? null,
+  );
   const [providerLoading, setProviderLoading] = React.useState(true);
   const [providerError, setProviderError] = React.useState("");
   const [detailSnapshot, setDetailSnapshot] = React.useState<{
@@ -508,7 +514,10 @@ export function ProvidersPage() {
     setProviderError("");
     try {
       const next = await getMarketProviders(controller.signal);
-      if (!controller.signal.aborted) setProviderList(next);
+      if (!controller.signal.aborted) {
+        setProviderList(next);
+        rememberView(PROVIDER_LIST_VIEW_KEY, next);
+      }
     } catch (reason) {
       if (!controller.signal.aborted) {
         setProviderError(reason instanceof Error ? reason.message : String(reason));
@@ -558,12 +567,11 @@ export function ProvidersPage() {
   }, [providerId]);
 
   const updateProviderQuery = React.useCallback((nextProviderId?: string) => {
-    const params = new URLSearchParams(searchParams.toString());
-    if (nextProviderId) params.set("provider", nextProviderId);
-    else params.delete("provider");
-    const search = params.toString();
-    router.replace(`${pathname}${search ? `?${search}` : ""}`, { scroll: false });
-  }, [pathname, router, searchParams]);
+    replaceCurrentSearch((params) => {
+      if (nextProviderId) params.set("provider", nextProviderId);
+      else params.delete("provider");
+    });
+  }, []);
 
   const visibleProviders = React.useMemo(
     () => filterMarketProviders(providerList?.providers ?? [], {

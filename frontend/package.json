@@ -27,7 +27,7 @@
     "test:share-model-health-heatmap": "tsx --test components/dashboard/share-model-health-heatmap.test.ts components/dashboard/client-online-heatmap.test.ts",
     "test:client-upgrade-state": "tsx --test components/dashboard/client-upgrade-state.test.ts",
     "test:client-market": "tsx --test components/dashboard/client-market/host-utils.test.ts components/dashboard/client-market/client-next-trial-notice.test.tsx components/dashboard/client-market/client-rental-schedule.test.tsx components/dashboard/client-market-client-context.test.tsx lib/client-market-rental-state.test.ts lib/client-market-client-status.test.ts lib/client-market-refresh.test.ts lib/client-checkout.test.ts lib/client-termination.test.ts lib/client-rental-audit.test.ts",
-    "test:providers": "tsx --test components/dashboard/providers-page-utils.test.ts lib/dashboard-nav.test.ts lib/home-entry.test.ts lib/account-market-records.test.ts lib/account-market-contract.test.ts",
+    "test:providers": "tsx --test components/dashboard/providers-page-utils.test.ts lib/dashboard-nav.test.ts lib/home-entry.test.ts lib/url-search.test.ts lib/account-market-records.test.ts lib/account-market-contract.test.ts",
     "audit:settings-i18n": "node ../scripts/audit/audit-settings-i18n.mjs --check",
     "audit:settings-contract": "node ../scripts/audit/audit-settings-contract.mjs --check",
     "audit:market-billing-contract": "node ../scripts/audit/audit-market-billing-contract.mjs --check",
@@ -53,9 +53,9 @@
     "clsx": "latest",
     "dompurify": "^3.2.6",
     "lucide-react": "latest",
-    "next": "latest",
-    "react": "latest",
-    "react-dom": "latest",
+    "next": "16.2.6",
+    "react": "19.2.6",
+    "react-dom": "19.2.6",
     "tailwind-merge": "^3.3.1"
   },
   "devDependencies": {

@@ -7,16 +7,17 @@
  */
 
 import * as React from "react";
-import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { useSearchParams } from "next/navigation";
 import { useAuth } from "@/components/auth/auth-provider";
 import { SegmentedControl } from "@/components/common/segmented-control";
 import { AccountContactPanel } from "@/components/dashboard/account-contact-panel";
 import { AccountMarketAccessPage } from "@/components/dashboard/account-market-access-page";
 import { ProviderFinancePanel } from "@/components/dashboard/provider-finance-panel";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { getMarketAccessInboxSummary } from "@/lib/api";
 import { getMarketProviderFinance } from "@/lib/market-wallet-api";
 import { PROVIDER_CENTER_TABS, providerCenterTab, type ProviderCenterTab } from "@/lib/dashboard-nav";
+import { replaceCurrentSearch } from "@/lib/url-search";
+import { useMarketAccessInboxSummary } from "@/lib/use-market-access-inbox-summary";
 
 export function AccountProviderCenter() {
   const { session } = useAuth();
@@ -26,11 +27,9 @@ export function AccountProviderCenter() {
 
 function ProviderCenterWorkspace({ actor }: { actor?: string }) {
   const { t } = useLocaleText();
-  const router = useRouter();
-  const pathname = usePathname();
   const searchParams = useSearchParams();
   const [hash, setHash] = React.useState("");
-  const [pendingRequests, setPendingRequests] = React.useState(0);
+  const { pendingRequests, setPendingRequests } = useMarketAccessInboxSummary(actor);
   const [hasIncome, setHasIncome] = React.useState<boolean | null>(null);
   const [defaultError, setDefaultError] = React.useState(false);
   const requestedTab = searchParams.get("tab");
@@ -53,23 +52,9 @@ function ProviderCenterWorkspace({ actor }: { actor?: string }) {
     return () => { active = false; };
   }, [actor]);
 
-  React.useEffect(() => {
-    setPendingRequests(0);
-    if (!actor) return;
-    let active = true;
-    const load = () => void getMarketAccessInboxSummary()
-      .then((summary) => { if (active) setPendingRequests(summary.pendingRequests); })
-      .catch(() => undefined);
-    load();
-    const timer = window.setInterval(load, 30_000);
-    return () => { active = false; window.clearInterval(timer); };
-  }, [actor, tab]);
-
   const setTab = (next: ProviderCenterTab) => {
-    const params = new URLSearchParams(searchParams.toString());
-    params.set("tab", next);
     setHash("");
-    router.replace(`${pathname}?${params.toString()}`, { scroll: false });
+    replaceCurrentSearch((params) => params.set("tab", next), { dropHash: true });
   };
 
   const labels: Record<ProviderCenterTab, string> = {

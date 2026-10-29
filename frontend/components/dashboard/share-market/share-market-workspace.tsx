@@ -3,7 +3,7 @@
 import * as React from "react";
 import { Button } from "@heroui/react";
 import { Loader2, RefreshCw } from "lucide-react";
-import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { useSearchParams } from "next/navigation";
 import { useAuth } from "@/components/auth/auth-provider";
 import { SegmentedControl } from "@/components/common/segmented-control";
 import { ShareMarketBuyerCatalog } from "@/components/dashboard/share-market/buyer-catalog";
@@ -19,11 +19,13 @@ import {
   getShareMarketRentedListings,
   getShareMarketSubscriptions,
 } from "@/lib/api";
+import { rememberView, useRememberedView } from "@/lib/cached-resource";
 import type {
   ShareMarketCatalog,
   ShareMarketListing,
   ShareMarketSubscription,
 } from "@/lib/types";
+import { replaceCurrentSearch } from "@/lib/url-search";
 
 type Workspace = "catalog" | "selling";
 type LoadScope = Workspace | "all";
@@ -57,29 +59,40 @@ function consumeRentalsQuery() {
   window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
 }
 
+type ShareMarketView = {
+  catalog: ShareMarketCatalog;
+  ownedListings: ShareMarketListing[];
+  rentedListings: ShareMarketListing[];
+  ownedShareCount: number;
+  subscriptions: ShareMarketSubscription[];
+  subscriptionCursor: string | null;
+  subscriptionHistoryTotal: number;
+};
+
+const shareMarketViewKey = (actorKey: string) => `share-market:${actorKey}`;
+
 export function ShareMarketWorkspace() {
   const { t } = useLocaleText();
   const { session, loading: authLoading } = useAuth();
   const searchParams = useSearchParams();
-  const pathname = usePathname();
-  const router = useRouter();
   const authed = !!session?.authenticated;
   const actorKey = authed
     ? session?.user?.id || session?.user?.email?.toLowerCase() || "authenticated"
     : "anonymous";
-  const [catalog, setCatalog] = React.useState<ShareMarketCatalog | null>(null);
-  const [ownedListings, setOwnedListings] = React.useState<ShareMarketListing[]>([]);
-  const [rentedListings, setRentedListings] = React.useState<ShareMarketListing[]>([]);
-  const [ownedShareCount, setOwnedShareCount] = React.useState<number | null>(null);
-  const [subscriptions, setSubscriptions] = React.useState<ShareMarketSubscription[]>([]);
-  const [subscriptionCursor, setSubscriptionCursor] = React.useState<string | null>(null);
-  const [subscriptionHistoryTotal, setSubscriptionHistoryTotal] = React.useState(0);
+  const { remembered, takeSeed } = useRememberedView<ShareMarketView>(authLoading ? null : shareMarketViewKey(actorKey));
+  const [catalog, setCatalog] = React.useState<ShareMarketCatalog | null>(remembered?.catalog ?? null);
+  const [ownedListings, setOwnedListings] = React.useState<ShareMarketListing[]>(remembered?.ownedListings ?? []);
+  const [rentedListings, setRentedListings] = React.useState<ShareMarketListing[]>(remembered?.rentedListings ?? []);
+  const [ownedShareCount, setOwnedShareCount] = React.useState<number | null>(remembered?.ownedShareCount ?? null);
+  const [subscriptions, setSubscriptions] = React.useState<ShareMarketSubscription[]>(remembered?.subscriptions ?? []);
+  const [subscriptionCursor, setSubscriptionCursor] = React.useState<string | null>(remembered?.subscriptionCursor ?? null);
+  const [subscriptionHistoryTotal, setSubscriptionHistoryTotal] = React.useState(remembered?.subscriptionHistoryTotal ?? 0);
   const [loadingMoreSubscriptions, setLoadingMoreSubscriptions] = React.useState(false);
   const [pausePolling, setPausePolling] = React.useState(false);
   const [workspace, setWorkspaceState] = React.useState<Workspace>(() =>
     workspaceFromQuery(searchParams.get("view") || searchParams.get("tab")),
   );
-  const [loading, setLoading] = React.useState(true);
+  const [loading, setLoading] = React.useState(!remembered);
   const [error, setError] = React.useState("");
   const [loadedActorKey, setLoadedActorKey] = React.useState(actorKey);
   const requestRef = React.useRef<AbortController | null>(null);
@@ -93,11 +106,8 @@ export function ShareMarketWorkspace() {
   const initialMine = mineFromQuery(searchParams.get("view") || searchParams.get("tab"));
 
   const clearMarketProvider = React.useCallback(() => {
-    const params = new URLSearchParams(searchParams.toString());
-    params.delete("provider");
-    const query = params.toString();
-    router.replace(`${pathname}${query ? `?${query}` : ""}`, { scroll: false });
-  }, [pathname, router, searchParams]);
+    replaceCurrentSearch((params) => params.delete("provider"));
+  }, []);
 
   React.useEffect(() => {
     consumeRentalsQuery();
@@ -147,6 +157,15 @@ export function ShareMarketWorkspace() {
         setSubscriptions([]);
         setSubscriptionCursor(null);
         setSubscriptionHistoryTotal(0);
+        rememberView<ShareMarketView>(shareMarketViewKey(requestedActorKey), {
+          catalog: nextCatalog,
+          ownedListings: [],
+          rentedListings: [],
+          ownedShareCount: 0,
+          subscriptions: [],
+          subscriptionCursor: null,
+          subscriptionHistoryTotal: 0,
+        });
         setLoadedActorKey(actorKey);
         return;
       }
@@ -165,6 +184,15 @@ export function ShareMarketWorkspace() {
         setRentedListings(nextRented.listings);
         setOwnedShareCount(nextShares.length);
         applySubscriptionPage(nextSubscriptions);
+        rememberView<ShareMarketView>(shareMarketViewKey(requestedActorKey), {
+          catalog: nextCatalog,
+          ownedListings: nextOwned.listings,
+          rentedListings: nextRented.listings,
+          ownedShareCount: nextShares.length,
+          subscriptions: nextSubscriptions.subscriptions,
+          subscriptionCursor: nextSubscriptions.nextCursor || null,
+          subscriptionHistoryTotal: nextSubscriptions.historyTotal ?? 0,
+        });
         setLoadedActorKey(actorKey);
       } else if (scope === "catalog") {
         const [nextCatalog, nextRented, nextShares, nextSubscriptions] = await Promise.all([
@@ -244,12 +272,13 @@ export function ShareMarketWorkspace() {
         return "catalog";
       });
     }
-    void load({ scope: "all" });
+    // A remembered view is already on screen; refresh it without a spinner.
+    void load({ scope: "all", silent: takeSeed() });
     return () => {
       requestRef.current?.abort();
       loadMoreRequestRef.current?.abort();
     };
-  }, [actorKey, authed, authLoading, load]);
+  }, [actorKey, authed, authLoading, load, takeSeed]);
 
   const grantPolling = subscriptionsNeedGrantPolling(subscriptions);
   const runtimeSyncPolling = workspace === "catalog"

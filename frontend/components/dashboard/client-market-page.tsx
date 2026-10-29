@@ -3,7 +3,7 @@
 import * as React from "react";
 import { Button, Checkbox, Chip, Modal, toast, Tooltip } from "@heroui/react";
 import { CheckSquare, ChevronLeft, ChevronRight, Download, Loader2, Plus, RefreshCw, Trash2, Upload } from "lucide-react";
-import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { useSearchParams } from "next/navigation";
 import { useAuth } from "@/components/auth/auth-provider";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
@@ -21,10 +21,12 @@ import {
   importMyClientMarketHosts,
   reverifyClientMarketHost,
 } from "@/lib/api";
+import { rememberView, useRememberedView } from "@/lib/cached-resource";
 import { mergeHosts } from "@/lib/client-market-refresh";
 import type { ClientMarketHost, ClientMarketHostImportResponse, ClientMarketRental, MarketEligibility } from "@/lib/types";
 import { usePersistentState } from "@/lib/use-persistent-state";
 import { preferredScrollBehavior } from "@/lib/utils";
+import { replaceCurrentSearch } from "@/lib/url-search";
 import { useBatchOperations } from "@/components/dashboard/client-market/use-batch-operations";
 import { AddHostDialog } from "@/components/dashboard/client-market/add-host-dialog";
 import { HostRow } from "@/components/dashboard/client-market/host-row";
@@ -73,11 +75,14 @@ import {
   statusGroupLabelKey,
 } from "@/components/dashboard/client-market/host-utils";
 
+type ClientMarketView = {
+  hosts: ClientMarketHost[];
+  rentals: ClientMarketRental[];
+};
+
 export function ClientMarketPage() {
   const { locale, t } = useLocaleText();
   const { session } = useAuth();
-  const pathname = usePathname();
-  const router = useRouter();
   const searchParams = useSearchParams();
   const authed = !!session?.authenticated;
   const viewerUserId = session?.user?.id;
@@ -88,9 +93,15 @@ export function ClientMarketPage() {
   const marketProviderId = searchParams.get("provider") || undefined;
   const returnedHostId = searchParams.get("focusHost") || undefined;
 
-  const [hosts, setHosts] = React.useState<ClientMarketHost[]>([]);
-  const [rentals, setRentals] = React.useState<ClientMarketRental[]>([]);
-  const [loading, setLoading] = React.useState(true);
+  const viewKey = `client-market:${authed ? viewerUserId || "authenticated" : "anonymous"}`;
+  const { remembered, takeSeed } = useRememberedView<ClientMarketView>(viewKey);
+  const viewKeyRef = React.useRef(viewKey);
+  viewKeyRef.current = viewKey;
+  const [hosts, setHosts] = React.useState<ClientMarketHost[]>(remembered?.hosts ?? []);
+  const [rentals, setRentals] = React.useState<ClientMarketRental[]>(remembered?.rentals ?? []);
+  const [loading, setLoading] = React.useState(!remembered);
+  // The view key whose data the state holds; only that key may remember it.
+  const [loadedKey, setLoadedKey] = React.useState<string | null>(remembered ? viewKey : null);
   const [addOpen, setAddOpen] = React.useState(false);
   const [pendingAddAfterLogin, setPendingAddAfterLogin] = React.useState(false);
   const [ownerFiltersRaw, setOwnerFiltersRaw] = usePersistentState<string[]>(OWNER_FILTER_KEY, []);
@@ -150,17 +161,17 @@ export function ClientMarketPage() {
   }, [authed]);
 
   const load = React.useCallback(
-    async (options?: { silent?: boolean }) => {
+    async (options?: { silent?: boolean; reportErrors?: boolean }) => {
       const silent = options?.silent === true;
+      const reportErrors = !silent || options?.reportErrors === true;
+      const requestedKey = viewKeyRef.current;
       // Silent polls never interrupt each other or a visible load.
       if (silent && refreshAbortRef.current) return;
       if (!silent) refreshAbortRef.current?.abort();
       const controller = new AbortController();
       refreshAbortRef.current = controller;
-      if (!silent) {
-        setLoading(true);
-        setError("");
-      }
+      if (!silent) setLoading(true);
+      if (reportErrors) setError("");
       try {
         const nextHosts = await getClientMarketHosts(undefined, controller.signal);
         if (controller.signal.aborted) return;
@@ -168,7 +179,9 @@ export function ClientMarketPage() {
         if (authed) {
           try {
             const nextRentals = await getMyClientMarketRentals(controller.signal);
-            if (!controller.signal.aborted) setRentals(nextRentals);
+            if (controller.signal.aborted) return;
+            setRentals(nextRentals);
+            setLoadedKey(requestedKey);
           } catch {
             if (!controller.signal.aborted && !silent) {
               /* hosts still usable; renter actions degrade until next poll */
@@ -176,10 +189,11 @@ export function ClientMarketPage() {
           }
         } else {
           setRentals([]);
+          setLoadedKey(requestedKey);
         }
       } catch (err) {
         if (controller.signal.aborted) return;
-        if (!silent) {
+        if (reportErrors) {
           setError(err instanceof Error ? err.message : String(err));
         }
       } finally {
@@ -206,20 +220,21 @@ export function ClientMarketPage() {
   }, [authed, viewerUserId, linkedTermination]);
   const closeTermination = React.useCallback(() => {
     setTerminationId(null);
-    if (linkedTermination) {
-      const params = new URLSearchParams(searchParams.toString()); params.delete("terminationId");
-      // Removing a dialog-only query is a shallow URL update, not a route
-      // navigation (which can refetch/remount a statically exported page).
-      window.history.replaceState(null, "", `${pathname}${params.size ? `?${params}` : ""}${window.location.hash}`);
-    }
-  }, [linkedTermination, pathname, searchParams]);
+    if (linkedTermination) replaceCurrentSearch((params) => params.delete("terminationId"));
+  }, [linkedTermination]);
 
   React.useEffect(() => {
-    void load();
+    // A remembered view is already on screen; refresh it without a spinner
+    // but still say so when the refresh fails.
+    void load(takeSeed() ? { silent: true, reportErrors: true } : undefined);
     return () => {
       refreshAbortRef.current?.abort();
     };
-  }, [load, viewerUserId]);
+  }, [load, takeSeed, viewerUserId]);
+
+  React.useEffect(() => {
+    if (loadedKey === viewKey) rememberView<ClientMarketView>(viewKey, { hosts, rentals });
+  }, [hosts, loadedKey, rentals, viewKey]);
 
   React.useEffect(() => {
     if (!importResult || importResult.status === "completed") return;
@@ -279,11 +294,8 @@ export function ClientMarketPage() {
   }, [hosts, marketProviderId, ownerFilters, regionFilters]);
 
   const clearMarketProvider = React.useCallback(() => {
-    const params = new URLSearchParams(searchParams.toString());
-    params.delete("provider");
-    const query = params.toString();
-    router.replace(`${pathname}${query ? `?${query}` : ""}`, { scroll: false });
-  }, [pathname, router, searchParams]);
+    replaceCurrentSearch((params) => params.delete("provider"));
+  }, []);
 
   const handleListTabChange = React.useCallback((next: HostListTab) => {
     if (marketProviderId) {

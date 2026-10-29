@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useSearchParams } from "next/navigation";
 import { Button } from "@heroui/react";
 import {
   ArrowUpRight,
@@ -21,12 +21,11 @@ import {
   getShareMarketOwnedListings,
   getShareMarketSubscriptions,
 } from "@/lib/api";
-import {
-  DASHBOARD_ACCOUNT_SHARE_PATH,
-  shareMarketHref,
-} from "@/lib/dashboard-nav";
+import { rememberView, useRememberedView } from "@/lib/cached-resource";
+import { shareMarketHref } from "@/lib/dashboard-nav";
 import { SHARE_APP_LABELS } from "@/lib/share-app";
 import type { ShareMarketListing, ShareMarketSubscription } from "@/lib/types";
+import { replaceCurrentSearch } from "@/lib/url-search";
 import { cn } from "@/lib/utils";
 import {
   formatSeatPrice,
@@ -184,10 +183,18 @@ function AccountShareListings({ listings, focusId }: { listings: ShareMarketList
   );
 }
 
+type AccountShareView = {
+  subscriptions: ShareMarketSubscription[];
+  subscriptionCursor: string | null;
+  subscriptionHistoryTotal: number;
+  ownedListings: ShareMarketListing[];
+};
+
+const accountShareViewKey = (actorKey: string) => `account-share:${actorKey}`;
+
 export function AccountSharePage() {
   const { t } = useLocaleText();
   const { session } = useAuth();
-  const router = useRouter();
   const searchParams = useSearchParams();
   const authed = !!session?.authenticated;
   const actorKey = authed
@@ -195,12 +202,13 @@ export function AccountSharePage() {
     : "anonymous";
   const tab: ShareMonitorTab = searchParams.get("tab") === "provider" ? "provider" : "user";
   const focusId = searchParams.get("focus");
-  const [subscriptions, setSubscriptions] = React.useState<ShareMarketSubscription[]>([]);
-  const [subscriptionCursor, setSubscriptionCursor] = React.useState<string | null>(null);
-  const [subscriptionHistoryTotal, setSubscriptionHistoryTotal] = React.useState(0);
+  const { remembered, takeSeed } = useRememberedView<AccountShareView>(authed ? accountShareViewKey(actorKey) : null);
+  const [subscriptions, setSubscriptions] = React.useState<ShareMarketSubscription[]>(remembered?.subscriptions ?? []);
+  const [subscriptionCursor, setSubscriptionCursor] = React.useState<string | null>(remembered?.subscriptionCursor ?? null);
+  const [subscriptionHistoryTotal, setSubscriptionHistoryTotal] = React.useState(remembered?.subscriptionHistoryTotal ?? 0);
   const [loadingMoreSubscriptions, setLoadingMoreSubscriptions] = React.useState(false);
-  const [ownedListings, setOwnedListings] = React.useState<ShareMarketListing[]>([]);
-  const [loading, setLoading] = React.useState(true);
+  const [ownedListings, setOwnedListings] = React.useState<ShareMarketListing[]>(remembered?.ownedListings ?? []);
+  const [loading, setLoading] = React.useState(!remembered);
   const [error, setError] = React.useState("");
   const [failedActorKey, setFailedActorKey] = React.useState<string | null>(null);
   const [pausePolling, setPausePolling] = React.useState(false);
@@ -212,11 +220,7 @@ export function AccountSharePage() {
   const expandedSubscriptionHistoryRef = React.useRef(false);
   const subscriptionHistoryGenerationRef = React.useRef(0);
 
-  const setTab = (next: ShareMonitorTab) => {
-    const params = new URLSearchParams(searchParams.toString());
-    params.set("tab", next);
-    router.replace(`${DASHBOARD_ACCOUNT_SHARE_PATH}?${params.toString()}`, { scroll: false });
-  };
+  const setTab = (next: ShareMonitorTab) => replaceCurrentSearch((params) => params.set("tab", next));
   const load = React.useCallback(async ({
     silent = false,
     skipIfBusy = false,
@@ -253,6 +257,12 @@ export function AccountSharePage() {
         setSubscriptionCursor(nextSubscriptions.nextCursor || null);
       }
       setOwnedListings(nextListings.listings);
+      rememberView<AccountShareView>(accountShareViewKey(requestedActorKey), {
+        subscriptions: nextSubscriptions.subscriptions,
+        subscriptionCursor: nextSubscriptions.nextCursor || null,
+        subscriptionHistoryTotal: nextSubscriptions.historyTotal ?? 0,
+        ownedListings: nextListings.listings,
+      });
       setLoadedActorKey(requestedActorKey);
       setFailedActorKey(null);
     } catch (reason) {
@@ -305,13 +315,14 @@ export function AccountSharePage() {
     loadMoreAbortRef.current = null;
     setLoadingMoreSubscriptions(false);
     expandedSubscriptionHistoryRef.current = false;
-    if (authed) void load();
+    // A remembered view is already on screen; refresh it without a spinner.
+    if (authed) void load({ silent: takeSeed() });
     else setLoading(false);
     return () => {
       abortRef.current?.abort();
       loadMoreAbortRef.current?.abort();
     };
-  }, [actorKey, authed, load]);
+  }, [actorKey, authed, load, takeSeed]);
   React.useEffect(() => {
     if (!authed || pausePolling) return;
     const timer = window.setInterval(

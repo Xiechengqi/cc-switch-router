@@ -8,7 +8,7 @@ import * as React from "react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { saveHomeEntry } from "@/lib/auth";
-import { pathForHomeEntry, type HomeEntry } from "@/lib/home-entry";
+import { pathForHomeEntry, rememberHomeEntryStatus, type HomeEntry, type HomeEntryStatus } from "@/lib/home-entry";
 
 const CHOICES: { entry: Exclude<HomeEntry, "clients">; titleKey: "start.rentClient" | "start.buyShare" | "start.addBalance" | "start.sell"; subtitleKey: "nav.clientMarketTab" | "nav.shareMarketTab" | "account.nav.wallet" | "nav.providersTab" }[] = [
   { entry: "client-market", titleKey: "start.rentClient", subtitleKey: "nav.clientMarketTab" },
@@ -17,9 +17,9 @@ const CHOICES: { entry: Exclude<HomeEntry, "clients">; titleKey: "start.rentClie
   { entry: "providers", titleKey: "start.sell", subtitleKey: "nav.providersTab" },
 ];
 
-export function StartPage() {
+export function StartPage({ onSaved }: { onSaved?: (status: HomeEntryStatus) => void }) {
   const { t } = useLocaleText();
-  const { logout } = useAuth();
+  const { session, logout } = useAuth();
   const router = useRouter();
   const [pending, setPending] = React.useState<HomeEntry | "skip" | null>(null);
   const [error, setError] = React.useState(false);
@@ -31,7 +31,13 @@ export function StartPage() {
     setPending(source === "skip" ? "skip" : entry);
     setError(false);
     void saveHomeEntry(entry, source)
-      .then(() => router.replace(pathForHomeEntry(entry)))
+      .then((status) => {
+        rememberHomeEntryStatus(session?.user?.id || "", status);
+        // The gate leaves this page itself, even when the chosen entry is
+        // the address already open and the navigation changes nothing.
+        onSaved?.(status);
+        router.replace(pathForHomeEntry(entry));
+      })
       .catch(() => {
         setPending(null);
         setError(true);

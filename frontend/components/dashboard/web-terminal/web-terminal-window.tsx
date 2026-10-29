@@ -1,10 +1,11 @@
 "use client";
 
+import dynamic from "next/dynamic";
 import { usePathname } from "next/navigation";
+import { Loader2 } from "lucide-react";
 import * as React from "react";
 import { useClientConsole } from "@/components/dashboard/client-console/client-console-manager";
 import { ClientConsoleTrafficLights } from "@/components/dashboard/client-console/client-console-traffic-lights";
-import { WebTerminalSession } from "@/components/dashboard/web-terminal/web-terminal-session";
 import {
   CONSOLE_DOCK_HEIGHT,
   CONSOLE_DOCK_RESERVED_HEIGHT,
@@ -15,6 +16,20 @@ import {
 } from "@/components/dashboard/web-terminal/web-terminal-manager";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { DASHBOARD_CLIENT_MARKET_PATH } from "@/lib/dashboard-nav";
+
+// xterm is the largest single dependency; load it when a terminal opens, not
+// with every dashboard page.
+const WebTerminalSession = dynamic(
+  () => import("@/components/dashboard/web-terminal/web-terminal-session").then((module) => module.WebTerminalSession),
+  {
+    ssr: false,
+    loading: () => (
+      <div className="flex h-full items-center justify-center text-slate-400" role="status">
+        <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+      </div>
+    ),
+  },
+);
 
 const MIN_WIDTH = 420;
 const MIN_HEIGHT = 280;

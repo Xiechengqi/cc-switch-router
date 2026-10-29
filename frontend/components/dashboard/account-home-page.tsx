@@ -6,7 +6,7 @@ import * as React from "react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { homeEntryStatus, saveHomeEntry } from "@/lib/auth";
-import { HOME_ENTRIES, type HomeEntry } from "@/lib/home-entry";
+import { HOME_ENTRIES, rememberHomeEntryStatus, type HomeEntry } from "@/lib/home-entry";
 
 const LABELS: Record<HomeEntry, "start.home.clients" | "nav.clientMarketTab" | "nav.shareMarketTab" | "account.nav.wallet" | "nav.providersTab"> = {
   clients: "start.home.clients",
@@ -29,18 +29,24 @@ export function AccountHomePage() {
     if (loading || !session?.authenticated) return;
     let active = true;
     homeEntryStatus()
-      .then((status) => { if (active && status.entry) setSelected(status.entry); })
+      .then((status) => {
+        rememberHomeEntryStatus(session?.user?.id || "", status);
+        if (active && status.entry) setSelected(status.entry);
+      })
       .catch(() => { if (active) setError(true); })
       .finally(() => { if (active) setReady(true); });
     return () => { active = false; };
-  }, [loading, session?.authenticated]);
+  }, [loading, session?.authenticated, session?.user?.id]);
 
   const save = () => {
     setSaving(true);
     setSaved(false);
     setError(false);
     void saveHomeEntry(selected, "choice")
-      .then(() => setSaved(true))
+      .then((status) => {
+        rememberHomeEntryStatus(session?.user?.id || "", status);
+        setSaved(true);
+      })
       .catch(() => setError(true))
       .finally(() => setSaving(false));
   };

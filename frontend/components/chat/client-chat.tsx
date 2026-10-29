@@ -379,11 +379,12 @@ function ClientChatDock({
   onRemoveRecent: (room: ClientChatRoom) => void;
 }) {
   const { t } = useLocaleText();
-  const { data } = useDashboardData();
+  const { data, stale } = useDashboardData();
   const dockBottom = useChatDockBottom();
   const panelRef = React.useRef<HTMLDivElement | null>(null);
   const previousFocusRef = React.useRef<HTMLElement | null>(null);
-  const selectedClient = selectedRoom
+  // A snapshot kept from an earlier Clients visit would show frozen status.
+  const selectedClient = selectedRoom && !stale
     ? findDashboardClient(data?.clients, selectedRoom.installationId)
     : undefined;
 

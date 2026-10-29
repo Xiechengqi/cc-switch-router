@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { defaultDashboardRouteFromSearch } from "./dashboard-nav";
-import { HOME_ENTRIES, isGatedHomePath, isHomeTaskAddress, parseHomeEntryStatus, pathForHomeEntry, resolveHomeGate } from "./home-entry";
+import { HOME_ENTRIES, isGatedHomePath, isHomeTaskAddress, isSettledHomeEntryStatus, parseHomeEntryStatus, pathForHomeEntry, rememberHomeEntryStatus, resolveHomeGate, settledHomeEntryStatus } from "./home-entry";
 
 test("only the bare home and clients addresses can show the start page", () => {
   assert.equal(isGatedHomePath("/"), true);
@@ -63,4 +63,22 @@ test("first-use guidance, loading and task deep links retain their independent b
   assert.equal(resolveHomeGate({ ...base, search: "?topup=1" }).redirect, "/account/wallet/?topup=1");
   assert.equal(resolveHomeGate({ ...base, search: "?drawerKind=market" }).redirect, "/share-market/?drawerKind=market");
   assert.deepEqual(resolveHomeGate({ ...base, pathname: "/clients/", search: "?focusId=one" }), { screen: "content", redirect: null, needsHome: false });
+});
+
+test("only settled home statuses are remembered across navigations", () => {
+  const firstUse = { hasActivity: false, entry: null, source: null } as const;
+  const chosen = { hasActivity: false, entry: "wallet", source: "choice" } as const;
+  const active = { hasActivity: true, entry: null, source: null } as const;
+  assert.equal(isSettledHomeEntryStatus(firstUse), false);
+  assert.equal(isSettledHomeEntryStatus(chosen), true);
+  assert.equal(isSettledHomeEntryStatus(active), true);
+
+  rememberHomeEntryStatus("user-a", firstUse);
+  assert.equal(settledHomeEntryStatus("user-a"), null);
+  rememberHomeEntryStatus("user-a", chosen);
+  assert.deepEqual(settledHomeEntryStatus("user-a"), chosen);
+  assert.equal(settledHomeEntryStatus("user-b"), null);
+  assert.equal(settledHomeEntryStatus(""), null);
+  rememberHomeEntryStatus("", active);
+  assert.equal(settledHomeEntryStatus(""), null);
 });

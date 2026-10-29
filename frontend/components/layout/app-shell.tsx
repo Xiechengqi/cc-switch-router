@@ -24,7 +24,7 @@ import {
   DASHBOARD_PROVIDERS_PATH,
   type DashboardShellActive,
 } from "@/lib/dashboard-nav";
-import { getMarketAccessInboxSummary } from "@/lib/api";
+import { useMarketAccessInboxSummary } from "@/lib/use-market-access-inbox-summary";
 import { cn } from "@/lib/utils";
 
 type RegionOption = {
@@ -262,7 +262,6 @@ function Topbar({ active }: { active: DashboardShellActive }) {
   const [loginOpen, setLoginOpen] = React.useState(false);
   const [loginResetPassword, setLoginResetPassword] = React.useState(false);
   const [clientRedirect, setClientRedirect] = React.useState<string | null>(null);
-  const [pendingAccessRequests, setPendingAccessRequests] = React.useState(0);
   const redirectStartedRef = React.useRef(false);
   const lastAuthedEmailRef = React.useRef<string | null>(null);
   if (session?.authenticated && session.user?.email) {
@@ -275,22 +274,9 @@ function Topbar({ active }: { active: DashboardShellActive }) {
   const displayEmail = session?.user?.email || lastAuthedEmailRef.current || "";
   const showDashboardNav = active === "clients" || active === "share-market" || active === "client-market" || active === "providers" || active === "account";
 
-  React.useEffect(() => {
-    if (!authed || active === "account") {
-      setPendingAccessRequests(0);
-      return;
-    }
-    let activeRequest = true;
-    const loadPending = () => void getMarketAccessInboxSummary()
-      .then((summary) => { if (activeRequest) setPendingAccessRequests(summary.pendingRequests); })
-      .catch(() => undefined);
-    loadPending();
-    const timer = window.setInterval(loadPending, 30_000);
-    return () => {
-      activeRequest = false;
-      window.clearInterval(timer);
-    };
-  }, [active, authed]);
+  const inbox = useMarketAccessInboxSummary(authed ? session?.user?.id || session?.user?.email : null);
+  // The account sidebar shows the same count next to Provider settings.
+  const pendingAccessRequests = active === "account" ? 0 : inbox.pendingRequests;
 
   React.useEffect(() => {
     setClientRedirect(sameRouterDomainClientRedirect(new URLSearchParams(window.location.search).get("clientRedirect")));
