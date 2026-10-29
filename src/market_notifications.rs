@@ -99,13 +99,13 @@ pub(crate) const KINDS: &[NotificationKind] = &[
     NotificationKind {
         kind: "wallet_transfer_sent",
         mandatory: true,
-        subject_en: "Wallet transfer sent",
+        subject_en: "Balance sent",
         subject_zh: "余额已转出",
     },
     NotificationKind {
         kind: "wallet_transfer_received",
         mandatory: true,
-        subject_en: "Wallet transfer received",
+        subject_en: "Balance received",
         subject_zh: "余额已转入",
     },
     NotificationKind {
@@ -722,7 +722,7 @@ fn render(item: &Claimed, dashboard: &str) -> (String, String) {
             .unwrap_or("—");
         let subject = format!("{subject_zh} / {subject_en}");
         let body = format!(
-            "{subject_zh}：{}.{:02}%；生效时间：{effective}。仅适用于新的计费周期，已承诺周期不变；收益自动到账不再扣费。\n{subject_en}: {}.{:02}%. Effective: {effective}. Applies to new service periods only; committed periods stay unchanged. Automatic income credit has no additional service fee.\n\n{}/account/provider-settings/#income",
+            "{subject_zh}：{}.{:02}%；生效时间：{effective}。仅适用于新的计费周期，已承诺周期不变；收益自动到账不再扣费。\n{subject_en}: {}.{:02}%. Effective: {effective}. Applies to new service periods only; committed periods stay unchanged. Automatic income credit has no additional service fee.\n\n{}/account/provider-settings/?tab=income",
             rate / 100,
             rate % 100,
             rate / 100,
@@ -849,8 +849,8 @@ fn render(item: &Claimed, dashboard: &str) -> (String, String) {
         return (
             format!("{subject_zh} / {subject_en}"),
             format!(
-                "{subject_zh}：{amount}。可消费或转账，不可提现或转回收益。转换编号：{id}。\n\
-             {subject_en}: {amount}. Available for services or wallet transfers, not withdrawal or conversion back to earnings. Reference: {id}.\n\n{}/account/wallet/",
+                "{subject_zh}：{amount}。可消费或转出，不可提现或转回收益。转换编号：{id}。\n\
+             {subject_en}: {amount}. Available for services or sending to other users, not withdrawal or conversion back to earnings. Reference: {id}.\n\n{}/account/wallet/",
                 dashboard.trim_end_matches('/')
             ),
         );

@@ -15,6 +15,7 @@ import { clientTerminationMessagesEn, clientTerminationMessagesZh } from "@/lib/
 import { clientTrialMessagesEn, clientTrialMessagesZh } from "@/lib/client-trial-messages";
 import { notificationCenterMessagesEn, notificationCenterMessagesZh } from "@/lib/notification-center-messages";
 import { rentalAuditMessagesEn, rentalAuditMessagesZh } from "@/lib/client-rental-audit-messages";
+import { accountMarketMessagesEn, accountMarketMessagesZh } from "@/lib/account-market-messages";
 
 export const LOCALE_STORAGE_KEY = "cc_switch_router_locale_v1";
 export const SUPPORTED_LOCALES = ["en", "zh-CN"] as const;
@@ -609,7 +610,7 @@ export const messages = {
     "shareMarket.paidReadiness.ready": "Paid-offer setup is ready.",
     "shareMarket.paidReadiness.title": "Complete paid-offer setup",
     "shareMarket.paidReadiness.wallet.provider": "Claim an active Provider identity first.",
-    "shareMarket.paidReadiness.goProvider": "Open Provider settings",
+    "shareMarket.paidReadiness.goProvider": "Open Provider center",
     "shareMarket.serviceDuration.label": "Service term",
     "shareMarket.serviceDuration.fixed": "Fixed term",
     "shareMarket.serviceDuration.permanent": "No fixed end date",
@@ -974,7 +975,7 @@ export const messages = {
     "settings.provisionSshKeyDesc":
       "Public material for the dedicated outbound SSH key. Add the authorized_keys line to root on each Host before registration.",
     "settings.marketFinance.title": "Platform wallet",
-    "settings.marketFinance.description": "Test official top-ups in shadow mode before opening them to users. Existing balance spending, transfers, C2C and earnings are independent.",
+    "settings.marketFinance.description": "Test official top-ups in shadow mode before opening them to users. Existing balance spending, sending, C2C and earnings are independent.",
     "settings.marketFinance.refresh": "Refresh",
     "settings.marketFinance.mode": "Official top-up mode",
     "settings.marketFinance.mode.disabled": "Disabled",
@@ -988,7 +989,7 @@ export const messages = {
     "settings.marketFinance.resume": "Resume",
     "settings.marketFinance.statusPaused": "Paused",
     "settings.marketFinance.statusOpen": "Open",
-    "settings.marketFinance.pauseNote": "Market purchase pauses do not pause transfers or C2C. Existing contracts, orders, callbacks and reconciliation continue.",
+    "settings.marketFinance.pauseNote": "Market purchase pauses do not pause sending balance or C2C. Existing contracts, orders, callbacks and reconciliation continue.",
     "settings.marketFinance.verifiedTopups": "Verified credits: {count}",
     "settings.marketFinance.channelBlockers": "Channel readiness blockers: {count}",
     "settings.marketFinance.criticalCases": "Open critical finance cases: {count}",
@@ -1685,7 +1686,7 @@ export const messages = {
     "marketWallet.subtitle": "One balance for Share Market and Client Market.",
     "marketWallet.displayOnly": "Display estimate · actual balance {amount} USD",
     "marketWallet.committed": "Due to running services",
-    "marketWallet.notOpen": "Official top-ups are closed. Existing balance spending, transfers and C2C are unaffected.",
+    "marketWallet.notOpen": "Official top-ups are closed. Existing balance spending, sending and C2C are unaffected.",
 
     "marketWallet.topupUnavailable": "Top-ups are temporarily unavailable. Existing wallet funds and transactions remain visible.",
     "marketWallet.available": "Available balance",
@@ -1740,7 +1741,7 @@ export const messages = {
     "marketWallet.reviewPossiblePayment": "Payment evidence or a receipt exception needs checking. Do not pay this order again or assume it is closed.",
     "marketWallet.reviewTerminalMarker": "The gateway order ended, but a payment field needs checking. Do not pay this order again.",
     "marketWallet.reviewInvalidReceipt": "The gateway reports payment, but the receipt did not pass verification. Do not transfer again; this needs a payment review.",
-    "marketWallet.shadow": "Official top-ups are owner-test only. Existing balance spending, transfers and C2C are unaffected.",
+    "marketWallet.shadow": "Official top-ups are owner-test only. Existing balance spending, sending and C2C are unaffected.",
     "marketWallet.topups": "Deposits",
     "marketWallet.transactions": "Wallet activity",
     "marketWallet.noTopups": "No deposits yet.",
@@ -1792,7 +1793,7 @@ export const messages = {
     "marketWallet.status.pending": "Awaiting payment",
     "marketWallet.status.awaiting_payment": "Choose payment method",
     "marketWallet.status.buyer_abandoned": "Abandoned · gateway pending",
-    "marketWallet.status.gateway_pending": "Awaiting transfer",
+    "marketWallet.status.gateway_pending": "Awaiting payment",
     "marketWallet.status.gateway_confirming": "Confirming on-chain",
     "marketWallet.status.gateway_paid": "Paid · syncing wallet",
     "marketWallet.status.gateway_canceled": "Canceled · syncing",
@@ -1813,7 +1814,7 @@ export const messages = {
     "marketWallet.entry.metered_batch": "Usage",
     "marketWallet.entry.monthly_segment": "Service credit adjustment",
     "marketWallet.entry.platform_termination": "Unused service credit",
-    "marketWallet.entry.buyer_refund": "Historical balance payout",
+    "marketWallet.entry.buyer_refund": "Historical external refund",
     "marketWallet.entry.hold": "Reservation released",
     "marketWallet.entry.other": "Wallet adjustment",
     "marketWallet.reportServiceIssue": "Report a service issue",
@@ -3549,6 +3550,7 @@ export const messages = {
     ...marketCheckoutMessagesEn,
     ...marketOwnerMessagesEn,
     ...walletPolicyMessagesEn,
+    ...accountMarketMessagesEn,
   },
   "zh-CN": {
     ...rentalAuditMessagesZh,
@@ -4127,7 +4129,7 @@ export const messages = {
     "shareMarket.paidReadiness.ready": "付费挂售配置已就绪。",
     "shareMarket.paidReadiness.title": "请完成付费挂售配置",
     "shareMarket.paidReadiness.wallet.provider": "请先认领有效的供应商身份。",
-    "shareMarket.paidReadiness.goProvider": "前往 Provider 设置",
+    "shareMarket.paidReadiness.goProvider": "前往供应商中心",
     "shareMarket.serviceDuration.label": "服务期限",
     "shareMarket.serviceDuration.fixed": "固定期限",
     "shareMarket.serviceDuration.permanent": "无固定期限",
@@ -4484,7 +4486,7 @@ export const messages = {
     "settings.provisionSshKeyDesc":
       "专用出站 SSH 密钥的公开信息。登记 Host 前，将 authorized_keys 行添加到该 Host 的 root 账户。",
     "settings.marketFinance.title": "平台钱包",
-    "settings.marketFinance.description": "先在影子模式验证官方充值，再向用户开放；已有余额消费、转账、C2C 和收益入账独立运行。",
+    "settings.marketFinance.description": "先在影子模式验证官方充值，再向用户开放；已有余额消费、转出、C2C 和收益入账独立运行。",
     "settings.marketFinance.refresh": "刷新",
     "settings.marketFinance.mode": "官方充值模式",
     "settings.marketFinance.mode.disabled": "已关闭",
@@ -4498,7 +4500,7 @@ export const messages = {
     "settings.marketFinance.resume": "恢复",
     "settings.marketFinance.statusPaused": "已暂停",
     "settings.marketFinance.statusOpen": "开放中",
-    "settings.marketFinance.pauseNote": "暂停市场新租用不影响转账和 C2C；已有合同、订单、支付回调和对账照常进行。",
+    "settings.marketFinance.pauseNote": "暂停市场新租用不影响余额转出和 C2C；已有合同、订单、支付回调和对账照常进行。",
     "settings.marketFinance.verifiedTopups": "已核验入账：{count}",
     "settings.marketFinance.channelBlockers": "渠道验收阻塞：{count}",
     "settings.marketFinance.criticalCases": "未处理的严重财务对账异常：{count}",
@@ -5169,7 +5171,7 @@ export const messages = {
     "marketWallet.subtitle": "Share Market 和 Client Market 共用一份余额。",
     "marketWallet.displayOnly": "仅为显示估算 · 实际余额为 {amount} 美元",
     "marketWallet.committed": "已到期待扣（运行中服务）",
-    "marketWallet.notOpen": "官方充值暂未开放，不影响已有余额消费、转账和 C2C。",
+    "marketWallet.notOpen": "官方充值暂未开放，不影响已有余额消费、转出和 C2C。",
 
     "marketWallet.topupUnavailable": "充值暂不可用，已有钱包余额和交易记录仍可查看。",
     "marketWallet.available": "可用余额",
@@ -5224,7 +5226,7 @@ export const messages = {
     "marketWallet.reviewPossiblePayment": "付款线索或回执异常需要核对；请勿为此订单重复付款，核实前不能视为已关闭。",
     "marketWallet.reviewTerminalMarker": "网关订单已结束，但有付款字段待核对。请勿再支付此订单。",
     "marketWallet.reviewInvalidReceipt": "网关报告已付款，但回执未通过核验。请勿重复转账，等待付款核对。",
-    "marketWallet.shadow": "官方充值仅供 Owner 测试，不影响已有余额消费、转账和 C2C。",
+    "marketWallet.shadow": "官方充值仅供 Owner 测试，不影响已有余额消费、转出和 C2C。",
     "marketWallet.topups": "充值记录",
     "marketWallet.transactions": "钱包流水",
     "marketWallet.noTopups": "暂无充值记录。",
@@ -5276,7 +5278,7 @@ export const messages = {
     "marketWallet.status.pending": "等待付款",
     "marketWallet.status.awaiting_payment": "待选支付方式",
     "marketWallet.status.buyer_abandoned": "已放弃 · 待网关终结",
-    "marketWallet.status.gateway_pending": "等待转账",
+    "marketWallet.status.gateway_pending": "等待付款",
     "marketWallet.status.gateway_confirming": "链上确认中",
     "marketWallet.status.gateway_paid": "已付款 · 钱包同步中",
     "marketWallet.status.gateway_canceled": "网关已取消 · 同步中",
@@ -5297,7 +5299,7 @@ export const messages = {
     "marketWallet.entry.metered_batch": "用量扣费",
     "marketWallet.entry.monthly_segment": "服务结算退回",
     "marketWallet.entry.platform_termination": "未履约余额退回",
-    "marketWallet.entry.buyer_refund": "历史余额外部转出",
+    "marketWallet.entry.buyer_refund": "历史外部退款",
     "marketWallet.entry.hold": "解除预留",
     "marketWallet.entry.other": "钱包调整",
     "marketWallet.reportServiceIssue": "反馈服务问题",
@@ -6978,6 +6980,7 @@ export const messages = {
     ...marketCheckoutMessagesZh,
     ...marketOwnerMessagesZh,
     ...walletPolicyMessagesZh,
+    ...accountMarketMessagesZh,
   },
 } as const;
 

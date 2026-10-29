@@ -248,7 +248,7 @@ function main() {
     ["independent FX", read("src/market_fx.rs"), ["/v1/market/config", "fxRateFresh", "no-store"]],
     ["contact separation", trade, ["FROM market_provider_contacts", "INSERT INTO market_provider_contacts"]],
     ["Client charge history", extractRustBlock(trade, "pub async fn client_market_host_usage_history"), ["market_platform_periods", "market_usage_posting_batches", "refunded_units"]],
-    ["trial renewal UI", read("frontend/components/dashboard/share-market/buyer-rentals.tsx"), ["subscription.walletContract?.id", "MarketWalletRenewalCard"]],
+    ["trial renewal UI", read("frontend/components/dashboard/account-share-rentals.tsx"), ["subscription.walletContract?.id", "MarketWalletRenewalCard"]],
   ]) for (const item of required) if (!source.includes(item)) errors.push(label + " is missing " + item);
   const redaction = extractRustBlock(share, "fn redact_public_subscription");
   for (const field of ["wallet_contract = None", "wallet_contract_id = None", "open_wallet_dispute = false"])

@@ -234,8 +234,7 @@ try {
   const terminationPanel = page => page.getByRole("region", { name: "Client rental terminations", exact: true });
   const buyer = await open("buyer"); const page = buyer.page;
   await page.goto(`${base}/account/wallet/`);
-  await terminationPanel(page).getByText("No Client termination records.", { exact: true }).waitFor();
-  assert.equal(await terminationPanel(page).getByRole("alert").count(), 0);
+  assert.equal(await terminationPanel(page).count(), 0, "balance no longer mounts rental history");
   await page.getByRole("button", { name: "C2C", exact: true }).click();
   await page.getByRole("button", { name: "Buy balance", exact: true }).click();
   await page.locator("[data-c2c-buy]").getByRole("button", { name: new RegExp(seller.displayName) }).click();
@@ -538,7 +537,7 @@ try {
     topupMode = mode;
     expectedTrialHours = trialHours;
     await sell.page.goto(`${base}/account/wallet/`);
-    await sell.page.getByRole("button", { name: "Transfer", exact: true }).click();
+    await sell.page.getByRole("button", { name: "Send", exact: true }).click();
     await sell.page.locator("#wallet-transfer form").waitFor();
     await sell.page.goto(`${base}/client-market/`);
     const offerDialog = await editOffer(); await waitOfferReady();
@@ -555,32 +554,27 @@ try {
   let offerDialog = await editOffer();
   await offerDialog.getByText("Claim an active Provider identity first.", { exact: true }).waitFor();
   assert.equal(await offerDialog.getByRole("button", { name: "Save", exact: true }).isDisabled(), true);
-  assert.equal(await offerDialog.getByRole("link", { name: "Open Provider settings", exact: true }).getAttribute("href"), "/account/provider-settings/");
+  assert.equal(await offerDialog.getByRole("link", { name: "Open Provider center", exact: true }).getAttribute("href"), "/account/provider-settings/");
   await offerDialog.getByRole("button", { name: "Cancel", exact: true }).click();
   publicationReady = true; financeFailure = true;
   offerDialog = await editOffer(); await offerDialog.getByRole("alert").waitFor();
   financeFailure = false; await offerDialog.getByRole("button", { name: "Retry", exact: true }).click(); await waitOfferReady();
   await offerDialog.getByRole("button", { name: "Cancel", exact: true }).click();
   assert.equal(retiredSetupRequests, 0); topupMode = "shadow";
-  // Income is embedded in Provider settings, including empty/error states.
+  // Income is a Provider center tab, with rental settlements in Client records.
   assert.equal((await page.request.get(`${base}/account/earnings/`)).status(), 404, "no obsolete page or redirect export");
-  // Income and termination history load independently. Two real failures
-  // must stay distinguishable, and retrying one must not hide the other.
+  // Income errors stay inside Income; termination reads never run here.
   financeFailure = true; terminationFailure = true;
   await sell.page.goto(`${base}/account/provider-settings/#income`);
   const income = sell.page.locator("#income");
   const incomeError = income.getByRole("alert").filter({ hasText: "Income temporarily unavailable" });
-  const terminationHistory = terminationPanel(sell.page);
-  const terminationError = terminationHistory.getByRole("alert").filter({ hasText: "Termination history temporarily unavailable" });
-  await incomeError.waitFor(); await terminationError.waitFor();
-  assert.equal(await income.getByRole("alert").count(), 2);
+  await incomeError.waitFor();
+  assert.equal(await income.getByRole("alert").count(), 1);
+  assert.equal(await terminationPanel(sell.page).count(), 0);
   financeFailure = false; await income.getByRole("button", { name: "Retry", exact: true }).click();
   await income.getByText("$130.00", { exact: true }).waitFor();
   await incomeError.waitFor({ state: "hidden" });
-  assert.equal(await terminationError.isVisible(), true, "income retry leaves termination errors visible");
-  terminationFailure = false; await terminationHistory.getByRole("button", { name: "Reload", exact: true }).click();
-  await terminationHistory.getByText("No Client termination records.", { exact: true }).waitFor();
-  assert.equal(await income.getByRole("alert").count(), 0, "both successful reads clear their own errors");
+  assert.equal(await income.getByRole("alert").count(), 0);
   assert.equal(await sell.page.locator('nav a[href*="earnings"]').count(), 0);
   assert.equal(await income.getByRole("button", { name: /withdraw|convert|transfer/i }).count(), 0);
   assert.equal(await income.locator("details[open]").count(), 0, "earnings details folded initially");
@@ -590,14 +584,24 @@ try {
     for (const width of [320, 375, 414, 768]) { await sell.page.setViewportSize({ width, height: 900 }); await geometry(sell.page, "#income"); }
   }
   heldIncome = false;
-  await page.goto(`${base}/account/provider-settings/`); await page.locator("#income").getByText("No earnings yet.", { exact: true }).waitFor();
+  // Client history has its own error and retry, scoped to the selected role.
+  await sell.page.goto(`${base}/account/client/?tab=provider`);
+  const terminationError = sell.page.getByRole("alert").filter({ hasText: "Termination settlements could not be loaded" });
+  await terminationError.waitFor();
+  terminationFailure = false;
+  await terminationError.getByRole("button", { name: "Retry", exact: true }).click();
+  await terminationError.waitFor({ state: "hidden" });
+  await page.goto(`${base}/account/client/`);
+  await page.getByRole("tab", { name: "User", exact: true }).waitFor();
+  await page.goto(`${base}/account/provider-settings/?tab=income`); await page.locator("#income").getByText("No earnings yet.", { exact: true }).waitFor();
   assert.equal(await page.locator("#income dl").count(), 0, "empty income does not show a wall of zeros");
   const guest = await open("guest");
   await guest.context.route("**/v1/auth/session/me", route => route.fulfill({ contentType: "application/json", body: JSON.stringify({ authenticated: false, isAdmin: false, user: null }) }));
   let guestFinanceRequests = 0;
   await guest.context.route("**/v1/market-provider-finance/**", route => { guestFinanceRequests++; return route.fulfill({ status: 401, contentType: "application/json", body: "{}" }); });
   await guest.page.goto(`${base}/account/provider-settings/`);
-  await guest.page.locator("#income").getByText(/sign in/i).waitFor();
+  await guest.page.getByText(/sign in/i).last().waitFor();
+  assert.equal(await guest.page.locator("#income").count(), 0);
   assert.equal(guestFinanceRequests, 0, "anonymous income has a sign-in state and never fetches private finances");
   assert.equal(terminationReads.some(read => read.actor === "guest"), false, "anonymous viewers never fetch private termination history");
   for (const [actor, role] of [["buyer", "buyer"], ["seller", "provider"], ["owner", "owner"]]) {

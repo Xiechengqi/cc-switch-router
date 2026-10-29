@@ -1,5 +1,4 @@
 "use client";
-import { ClientTerminationsPanel } from "@/components/market/client-terminations-panel";
 
 import * as React from "react";
 import Link from "next/link";
@@ -146,6 +145,5 @@ export function ProviderFinancePanel() {
         </div> : <p className="text-sm text-muted-foreground">{t("marketProviderFinance.noEarnings")}</p>}
       </details>
     </>}
-    <ClientTerminationsPanel role="provider" />
   </section>;
 }

@@ -13,12 +13,12 @@ import { useAuth } from "@/components/auth/auth-provider";
 import { SegmentedControl } from "@/components/common/segmented-control";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import { CLIENT_MARKET_POLL_MS } from "@/components/dashboard/client-market/host-utils";
-import { ShareMarketBuyerRentals } from "@/components/dashboard/share-market/buyer-rentals";
+import { AccountShareRentals, rentalTermText } from "@/components/dashboard/account-share-rentals";
+import { ExpandableRecordTable, RecordDetailList, type RecordTableColumn } from "@/components/common/expandable-record-table";
 import { mergeShareMarketSubscriptionPage } from "@/components/dashboard/share-market/subscription-utils";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   getShareMarketOwnedListings,
-  getShareMarketRentedListings,
   getShareMarketSubscriptions,
 } from "@/lib/api";
 import {
@@ -29,13 +29,15 @@ import { SHARE_APP_LABELS } from "@/lib/share-app";
 import type { ShareMarketListing, ShareMarketSubscription } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import {
+  formatSeatPrice,
   isCoreShareApp,
   listingIdleCount,
   shareMarketMutationError,
+  subscriptionStatusKey,
 } from "@/components/dashboard/share-market/market-utils";
+import { isHistorySubscription } from "@/components/dashboard/share-market/subscription-utils";
 import {
   listingAttentionSeats,
-  listingClosedRentalSeats,
   listingLiveSeats,
   partitionOwnedListings,
 } from "@/components/dashboard/share-market/owner-workspace-utils";
@@ -52,41 +54,133 @@ function ListingApps({ listing }: { listing: ShareMarketListing }) {
   );
 }
 
-function AccountListingRow({ listing }: { listing: ShareMarketListing }) {
-  const { t } = useLocaleText();
-  const closed = listing.status === "closed";
-  const liveSeats = listingLiveSeats(listing);
-  const idle = listingIdleCount({ seats: liveSeats });
-  const remaining = listingClosedRentalSeats(listing).length;
-  const attention = listingAttentionSeats(listing).length;
-  const statusLabel = closed
-    ? t("shareMarket.closed")
-    : t("shareMarket.catalog.occupancy", { idle, total: liveSeats.length });
+function seatsByPosition(listing: ShareMarketListing) {
+  return [...listing.seats].filter((seat) => !seat.retiredAt).sort((left, right) => left.position - right.position);
+}
+
+function rentedSeatCount(listing: ShareMarketListing) {
+  return listing.seats.filter((seat) => seat.subscription && !isHistorySubscription(seat.subscription.status)).length;
+}
+
+function ListingSeatsDetail({ listing }: { listing: ShareMarketListing }) {
+  const { locale, t } = useLocaleText();
+  const seats = seatsByPosition(listing);
   return (
-    <article className="flex min-w-0 flex-col gap-2 px-3 py-2.5 sm:flex-row sm:items-center sm:justify-between">
-      <div className="min-w-0">
-        <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5">
-          <ListingApps listing={listing} />
-          <strong className="min-w-0 truncate text-sm text-slate-900">{listing.shareName}</strong>
-          <span className={cn("shrink-0 text-[11px] font-medium", listing.shareOnline ? "text-emerald-700" : "text-rose-700")}>
-            {listing.shareOnline ? t("shareMarket.online") : t("shareMarket.offline")}
-          </span>
-          <span className="min-w-0 truncate text-[11px] text-slate-500">{statusLabel}</span>
+    <div className="grid min-w-0 gap-3">
+      <RecordDetailList items={[
+        { label: t("account.market.col.seats"), value: `${listingIdleCount({ seats: listingLiveSeats(listing) })} / ${listingLiveSeats(listing).length}` },
+        { label: t("account.market.col.rented"), value: rentedSeatCount(listing) },
+      ]} />
+      {seats.length ? (
+        <div className="min-w-0 overflow-hidden rounded-md border border-border/70 bg-background">
+          <table className="w-full table-fixed text-left text-xs" aria-label={`${listing.shareName} · ${t("account.market.col.seat")}`}>
+            <thead className="bg-muted/50 text-muted-foreground">
+              <tr>
+                <th scope="col" className="w-14 px-3 py-1.5 font-medium">{t("account.market.col.seat")}</th>
+                <th scope="col" className="px-3 py-1.5 font-medium">{t("account.market.col.renter")}</th>
+                <th scope="col" className="hidden w-28 px-3 py-1.5 font-medium sm:table-cell">{t("account.market.col.price")}</th>
+                <th scope="col" className="w-28 px-3 py-1.5 font-medium">{t("account.market.col.status")}</th>
+                <th scope="col" className="hidden w-44 px-3 py-1.5 font-medium md:table-cell">{t("account.market.col.term")}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {seats.map((seat) => {
+                const subscription = seat.subscription && !isHistorySubscription(seat.subscription.status) ? seat.subscription : undefined;
+                const statusKey = subscription ? subscriptionStatusKey(subscription.status) : null;
+                return (
+                  <tr key={seat.id} className="border-t border-border/60">
+                    <td className="px-3 py-1.5 tabular-nums text-muted-foreground">#{seat.position}</td>
+                    <td className="min-w-0 break-all px-3 py-1.5">
+                      {subscription?.renterEmail || <span className="text-muted-foreground">{t("account.market.vacant")}</span>}
+                      <span className="mt-1 block text-muted-foreground sm:hidden">{formatSeatPrice(seat, locale, t("shareMarket.free"), t("market.day"), t("market.month"))}</span>
+                      {subscription ? <span className="mt-1 block text-muted-foreground md:hidden">{rentalTermText(subscription, locale, t)}</span> : null}
+                    </td>
+                    <td className="hidden truncate px-3 py-1.5 tabular-nums sm:table-cell">{formatSeatPrice(seat, locale, t("shareMarket.free"), t("market.day"), t("market.month"))}</td>
+                    <td className="truncate px-3 py-1.5">{subscription ? (statusKey ? t(statusKey) : subscription.status) : seat.status === "available" ? t("account.market.vacant") : seat.status}</td>
+                    <td className="hidden truncate px-3 py-1.5 text-muted-foreground md:table-cell">{subscription ? rentalTermText(subscription, locale, t) : "—"}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
         </div>
-        <p className="mt-1 flex min-w-0 flex-wrap gap-x-2 gap-y-0.5 text-xs text-slate-500">
-          {attention ? <span className="font-medium text-rose-700">{t("account.share.seatsAttention")} · {attention}</span> : null}
-          {closed && remaining ? <span>{t("shareMarket.listings.activeRentals", { count: remaining })}</span> : null}
-          {listing.subdomain ? <span className="min-w-0 truncate font-mono text-[11px] text-slate-400">{listing.subdomain}</span> : null}
-        </p>
+      ) : <p className="text-sm text-muted-foreground">{t("account.market.detail.seatsEmpty")}</p>}
+      <div className="flex flex-wrap items-center justify-end gap-2">
+        {listing.subdomain ? <span className="mr-auto min-w-0 truncate font-mono text-[11px] text-muted-foreground">{listing.subdomain}</span> : null}
+        <Link
+          href={shareMarketHref({ workspace: "selling", shareId: listing.shareId })}
+          className="inline-flex h-9 items-center gap-1.5 whitespace-nowrap rounded-md border border-border bg-background px-3 text-sm font-medium hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+        >
+          {t("account.share.manageInMarket")}<ArrowUpRight className="h-3.5 w-3.5" aria-hidden />
+        </Link>
       </div>
-      <Link
-        href={shareMarketHref({ workspace: "selling", shareId: listing.shareId })}
-        className="inline-flex h-7 shrink-0 items-center gap-1 rounded-md px-2 text-xs font-medium text-slate-700 hover:bg-slate-100 hover:text-slate-900"
-      >
-        {t("account.share.manageInMarket")}
-        <ArrowUpRight className="h-3.5 w-3.5" />
-      </Link>
-    </article>
+    </div>
+  );
+}
+
+function AccountShareListings({ listings, focusId }: { listings: ShareMarketListing[]; focusId?: string | null }) {
+  const { t } = useLocaleText();
+  const columns: RecordTableColumn<ShareMarketListing>[] = [
+    {
+      id: "share",
+      header: t("account.market.col.share"),
+      cell: (listing) => (
+        <span className="flex min-w-0 items-center gap-2">
+          <ListingApps listing={listing} />
+          <span className="min-w-0 truncate font-medium">{listing.shareName}</span>
+          <span role="img" aria-label={listing.shareOnline ? t("shareMarket.online") : t("shareMarket.offline")}
+            title={listing.shareOnline ? t("shareMarket.online") : t("shareMarket.offline")}
+            className={cn("inline-block size-2 shrink-0 rounded-full", listing.shareOnline ? "bg-emerald-500" : "bg-rose-400")} />
+        </span>
+      ),
+    },
+    {
+      id: "status",
+      header: t("account.market.col.status"),
+      className: "w-24 sm:w-28",
+      cell: (listing) => {
+        const attention = listingAttentionSeats(listing).length;
+        return (
+          <div className="grid min-w-0 gap-0.5">
+            <span className="truncate">{listing.status === "closed" ? t("shareMarket.closed") : t("account.market.listed")}</span>
+            {attention ? <span className="truncate text-xs font-medium text-amber-700">{t("account.market.attention", { count: attention })}</span> : null}
+          </div>
+        );
+      },
+    },
+    {
+      id: "seats",
+      header: t("account.market.col.seats"),
+      minWidth: "sm",
+      className: "w-28",
+      cell: (listing) => {
+        const live = listingLiveSeats(listing);
+        return <span className="tabular-nums">{listingIdleCount({ seats: live })} / {live.length}</span>;
+      },
+    },
+    {
+      id: "rented",
+      header: t("account.market.col.rented"),
+      minWidth: "md",
+      className: "w-20",
+      cell: (listing) => <span className="tabular-nums">{rentedSeatCount(listing)}</span>,
+    },
+    {
+      id: "manage", header: <span className="sr-only">{t("account.market.col.actions")}</span>, minWidth: "sm", className: "w-12",
+      cell: (listing) => <Link href={shareMarketHref({ workspace: "selling", shareId: listing.shareId })} aria-label={`${t("account.share.manageInMarket")} · ${listing.shareName}`} className="inline-flex size-11 items-center justify-center rounded-md hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring"><ArrowUpRight className="size-4" aria-hidden /></Link>,
+    },
+  ];
+  return (
+    <ExpandableRecordTable
+      rows={listings}
+      rowKey={(listing) => listing.id}
+      rowLabel={(listing) => listing.shareName}
+      ariaLabel={t("account.share.tab.provider")}
+      columns={columns}
+      rowTone={(listing) => listingAttentionSeats(listing).length ? "attention" : undefined}
+      focusKey={focusId}
+      renderDetail={(listing) => <ListingSeatsDetail listing={listing} />}
+    />
   );
 }
 
@@ -100,12 +194,12 @@ export function AccountSharePage() {
     ? session?.user?.id || session?.user?.email?.toLowerCase() || "authenticated"
     : "anonymous";
   const tab: ShareMonitorTab = searchParams.get("tab") === "provider" ? "provider" : "user";
+  const focusId = searchParams.get("focus");
   const [subscriptions, setSubscriptions] = React.useState<ShareMarketSubscription[]>([]);
   const [subscriptionCursor, setSubscriptionCursor] = React.useState<string | null>(null);
   const [subscriptionHistoryTotal, setSubscriptionHistoryTotal] = React.useState(0);
   const [loadingMoreSubscriptions, setLoadingMoreSubscriptions] = React.useState(false);
   const [ownedListings, setOwnedListings] = React.useState<ShareMarketListing[]>([]);
-  const [rentedListings, setRentedListings] = React.useState<ShareMarketListing[]>([]);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState("");
   const [failedActorKey, setFailedActorKey] = React.useState<string | null>(null);
@@ -145,10 +239,9 @@ export function AccountSharePage() {
     }
     if (!skipIfBusy) setError("");
     try {
-      const [nextSubscriptions, nextListings, nextRented] = await Promise.all([
+      const [nextSubscriptions, nextListings] = await Promise.all([
         getShareMarketSubscriptions(controller.signal),
         getShareMarketOwnedListings(controller.signal),
-        getShareMarketRentedListings(controller.signal),
       ]);
       if (controller.signal.aborted || actorKeyRef.current !== requestedActorKey) return;
       setSubscriptions((current) => silent
@@ -160,7 +253,6 @@ export function AccountSharePage() {
         setSubscriptionCursor(nextSubscriptions.nextCursor || null);
       }
       setOwnedListings(nextListings.listings);
-      setRentedListings(nextRented.listings);
       setLoadedActorKey(requestedActorKey);
       setFailedActorKey(null);
     } catch (reason) {
@@ -229,6 +321,17 @@ export function AccountSharePage() {
     return () => window.clearInterval(timer);
   }, [authed, load, pausePolling]);
 
+  // Follow a rental link even when it points beyond the first history page.
+  const focusCursors = React.useRef(new Set<string>());
+  React.useEffect(() => { focusCursors.current.clear(); }, [actorKey, focusId]);
+  React.useEffect(() => {
+    if (tab !== "user" || !focusId || loading || loadingMoreSubscriptions || !subscriptionCursor
+      || loadedActorKey !== actorKey || subscriptions.some((item) => item.id === focusId)
+      || focusCursors.current.has(subscriptionCursor)) return;
+    focusCursors.current.add(subscriptionCursor);
+    void loadMoreSubscriptions();
+  }, [actorKey, focusId, tab, loading, loadedActorKey, subscriptions, subscriptionCursor, loadingMoreSubscriptions, loadMoreSubscriptions]);
+
   const { attentionListings, active, closed } = React.useMemo(
     () => partitionOwnedListings(ownedListings),
     [ownedListings],
@@ -254,11 +357,10 @@ export function AccountSharePage() {
       <SegmentedControl value={tab} onChange={setTab} ariaLabel={t("account.nav.share")} size="md" className="w-full max-w-sm" fullWidth items={[{ id: "user", label: t("account.share.tab.user") }, { id: "provider", label: t("account.share.tab.provider") }]} />
       {error ? <p className="border-l-2 border-rose-400 bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p> : null}
       {tab === "user" ? (
-        <ShareMarketBuyerRentals
+        <AccountShareRentals
           key={`user:${actorKey}`}
           subscriptions={subscriptions}
-          listings={rentedListings}
-          loading={false}
+          focusId={focusId}
           onChanged={() => load({ silent: true })}
           onInteractionChange={setPausePolling}
           nextCursor={subscriptionCursor}
@@ -267,11 +369,7 @@ export function AccountSharePage() {
           onLoadMore={loadMoreSubscriptions}
         />
       ) : providerListings.length ? (
-        <div className="divide-y divide-slate-100 rounded-md border border-slate-200 bg-white">
-          {providerListings.map((listing) => (
-            <AccountListingRow key={`${actorKey}:${listing.id}`} listing={listing} />
-          ))}
-        </div>
+        <AccountShareListings key={`provider:${actorKey}`} listings={providerListings} focusId={focusId} />
       ) : <div className="grid justify-items-center gap-2 rounded-md border border-dashed border-border px-4 py-12 text-center text-sm text-muted-foreground"><span>{t("account.share.providerEmpty")}</span><Link href={shareMarketHref({ workspace: "selling" })} className="inline-flex items-center gap-1 font-medium text-accent hover:underline">{t("account.share.openMarket")}<ArrowUpRight className="h-3.5 w-3.5" /></Link></div>}
     </div>
   );

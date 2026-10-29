@@ -167,6 +167,8 @@ export type MarketWalletPaymentMethod = {
 };
 
 export type MarketWalletChannel = Pick<MarketPaymentChannel, "id" | "displayName" | "gatewayKind"> & {
+  /** Buyer-facing category supplied by Router; never infer it from a merchant name. */
+  methodCategory: "crypto";
   orderMode?: MarketTopupOrderMode;
   methods?: MarketWalletPaymentMethod[];
   minTopupMinor?: number;

@@ -36,13 +36,13 @@ const SCOPES = (["share", "client_host"] as const).flatMap((productKind) =>
   })),
 );
 
-export function AccountMarketAccessPage() {
+export function AccountMarketAccessPage({ onPendingChange }: { onPendingChange?: (count: number) => void }) {
   const { session } = useAuth();
   const actor = session?.user?.id || session?.user?.email || "anonymous";
-  return <AccountMarketAccessEditor key={actor} />;
+  return <AccountMarketAccessEditor key={actor} onPendingChange={onPendingChange} />;
 }
 
-function AccountMarketAccessEditor() {
+function AccountMarketAccessEditor({ onPendingChange }: { onPendingChange?: (count: number) => void }) {
   const { session } = useAuth();
   const { t } = useLocaleText();
   const [data, setData] = React.useState<MarketAccessDashboard | null>(null);
@@ -63,6 +63,9 @@ function AccountMarketAccessEditor() {
   const [ack, setAck] = React.useState(false);
   const [revoke, setRevoke] = React.useState<MarketCounterparty | null>(null);
   const actor = session?.user?.id || session?.user?.email;
+  React.useEffect(() => {
+    if (data) onPendingChange?.(data.accessRequests.filter((item) => item.status === "requested").length);
+  }, [data, onPendingChange]);
   React.useEffect(() => {
     let active = true;
     setData(null);
@@ -182,6 +185,59 @@ function AccountMarketAccessEditor() {
         </p>
       ) : (
         <>
+          {/* Pending requests are the only items waiting on the Provider: list them first. */}
+          {data.accessRequests.some((item) => item.status === "requested") ? (
+            <div className="grid min-w-0 gap-3">
+              <h3 className="text-sm font-semibold">
+                {t("marketAccess.requestCount", {
+                  count: data.accessRequests.filter(
+                    (item) => item.status === "requested",
+                  ).length,
+                })}
+              </h3>
+              {data.accessRequests
+                .filter((item) => item.status === "requested")
+                .map((item) => (
+                  <div
+                    key={item.id}
+                    className="flex min-w-0 flex-wrap items-center justify-between gap-3 rounded-md bg-muted/50 p-3"
+                  >
+                    <div className="min-w-0">
+                      <p className="break-all text-sm font-medium">
+                        {item.buyerEmail}
+                      </p>
+                      <p className="text-xs text-muted-foreground">
+                        {label(item)} · {item.targetLabel}
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <Button
+                        variant="outline"
+                        className="min-h-11 whitespace-nowrap"
+                        isDisabled={busy}
+                        onPress={() => {
+                          setReason("");
+                          setRequest({ item, action: "approve" });
+                        }}
+                      >
+                        {t("marketAccess.approve")}
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        className="min-h-11 whitespace-nowrap"
+                        isDisabled={busy}
+                        onPress={() => {
+                          setReason("");
+                          setRequest({ item, action: "reject" });
+                        }}
+                      >
+                        {t("marketAccess.reject")}
+                      </Button>
+                    </div>
+                  </div>
+                ))}
+            </div>
+          ) : null}
           <div className="grid gap-3">
             <h3 className="text-sm font-semibold">
               {t("marketAccess.policyTitle")}
@@ -288,56 +344,6 @@ function AccountMarketAccessEditor() {
               {t("common.add")}
             </Button>
           </form>
-          <div className="grid min-w-0 gap-3">
-            <h3 className="text-sm font-semibold">
-              {t("marketAccess.requestCount", {
-                count: data.accessRequests.filter(
-                  (item) => item.status === "requested",
-                ).length,
-              })}
-            </h3>
-            {data.accessRequests
-              .filter((item) => item.status === "requested")
-              .map((item) => (
-                <div
-                  key={item.id}
-                  className="flex min-w-0 flex-wrap items-center justify-between gap-3 rounded-md bg-muted/50 p-3"
-                >
-                  <div className="min-w-0">
-                    <p className="break-all text-sm font-medium">
-                      {item.buyerEmail}
-                    </p>
-                    <p className="text-xs text-muted-foreground">
-                      {label(item)} · {item.targetLabel}
-                    </p>
-                  </div>
-                  <div className="flex flex-wrap gap-2">
-                    <Button
-                      variant="outline"
-                      className="min-h-11 whitespace-nowrap"
-                      isDisabled={busy}
-                      onPress={() => {
-                        setReason("");
-                        setRequest({ item, action: "approve" });
-                      }}
-                    >
-                      {t("marketAccess.approve")}
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      className="min-h-11 whitespace-nowrap"
-                      isDisabled={busy}
-                      onPress={() => {
-                        setReason("");
-                        setRequest({ item, action: "reject" });
-                      }}
-                    >
-                      {t("marketAccess.reject")}
-                    </Button>
-                  </div>
-                </div>
-              ))}
-          </div>
           <div className="grid min-w-0 gap-3">
             <h3 className="text-sm font-semibold">
               {t("marketAccess.buyersTitle")}

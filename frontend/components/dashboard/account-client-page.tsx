@@ -3,19 +3,32 @@
 import * as React from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { Chip } from "@heroui/react";
 import { ArrowUpRight, Loader2 } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { CountryFlag } from "@/components/common/country-flag";
+import { ExpandableRecordTable, RecordDetailList, type RecordTableColumn } from "@/components/common/expandable-record-table";
 import { SegmentedControl } from "@/components/common/segmented-control";
+import { formatShortDate } from "@/components/dashboard/account-share-rentals";
 import { CLIENT_MARKET_POLL_MS } from "@/components/dashboard/client-market/host-utils";
+import { MarketServiceDisputeControl } from "@/components/dashboard/market-service-dispute-control";
+import { MarketWalletRenewalCard } from "@/components/dashboard/market-wallet-renewal-card";
 import { useLocaleText } from "@/components/i18n/locale-provider";
+import { ClientTerminationRecord } from "@/components/market/client-terminations-panel";
+import { ClientTerminationDialog } from "@/components/market/client-termination-dialog";
+import { useAccountClientTerminations } from "./use-account-client-terminations";
+import { Button } from "@heroui/react";
+import type { ClientTermination, ClientTerminationAction } from "@/lib/client-termination";
+import { trialHours, walletLifecycleKey } from "@/lib/client-checkout";
 import { getClientMarketHosts, getMyClientMarketRentals } from "@/lib/api";
 import { mergeHosts, mergeRentalMap } from "@/lib/client-market-refresh";
 import { clientMarketMineHref, DASHBOARD_ACCOUNT_CLIENT_PATH, DASHBOARD_ACCOUNT_WALLET_PATH } from "@/lib/dashboard-nav";
 import type { MessageKey } from "@/lib/i18n";
 import { formatUsdMoney } from "@/lib/market-money";
+import { formatWalletUnits } from "@/lib/market-wallet-money";
+import { compareAccountRecords } from "@/lib/account-market-records";
+import { terminationCanRespond } from "@/lib/client-termination";
 import type { ClientMarketHost, ClientMarketRental } from "@/lib/types";
+import { cn } from "@/lib/utils";
 
 type ClientMonitorTab = "user" | "provider";
 
@@ -23,9 +36,8 @@ type MonitorEntry = {
   key: string;
   rental?: ClientMarketRental;
   host?: ClientMarketHost;
+  termination?: ClientTermination;
 };
-
-const RECENT_RELEASED_MS = 30 * 24 * 60 * 60 * 1000;
 
 function isFreeOffer(
   pricingModel: string | undefined,
@@ -112,14 +124,6 @@ function isAnomalous(status: string) {
   return status === "billing_suspended" || status === "release_failed" || status === "releasing";
 }
 
-function isRecentReleased(rental: ClientMarketRental, now = Date.now()) {
-  if (rental.status !== "released") return false;
-  if (rental.hostCleanupPending) return true;
-  const updated = Date.parse(rental.updatedAt);
-  if (!Number.isFinite(updated)) return true;
-  return now - updated <= RECENT_RELEASED_MS;
-}
-
 /** Host-only / rental-missing rows during provisioning reconciliation. */
 function synthesizeRentalFromHost(
   host: ClientMarketHost,
@@ -151,141 +155,233 @@ function synthesizeRentalFromHost(
   };
 }
 
-function entryRank(status: string) {
-  if (status === "release_failed") return 0;
-  if (status === "billing_suspended") return 1;
-  if (status === "releasing") return 2;
-  if (status === "active") return 3;
-  if (status === "idle") return 4;
-  return 5;
-}
+const LINK_CLASS = "inline-flex h-9 items-center gap-1.5 whitespace-nowrap rounded-lg border border-border bg-background px-3 text-sm font-medium text-foreground transition-colors hover:border-accent/30 hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring";
 
-function MonitorCard({
-  entry,
-  perspective,
-}: {
-  entry: MonitorEntry;
-  perspective: ClientMonitorTab;
-}) {
-  const { locale, t } = useLocaleText();
+/** Everything both tables and the details derive from one monitor entry. */
+function entryFacts(entry: MonitorEntry) {
   const rental = entry.rental;
   const host = entry.host;
-  const status = rental?.status || host?.status || "unknown";
+  const termination = entry.termination;
+  const status = rental?.status || (termination ? "released" : host?.status) || "unknown";
   const dailyRateMinor = rental?.dailyRateMinor ?? host?.dailyRateMinor;
   const cyclePriceMinor = rental?.cyclePriceMinor ?? host?.cyclePriceMinor;
   const pricingModel = rental?.pricingModel ?? host?.pricingModel;
-  const freeDurationDays = rental?.freeDurationDays ?? host?.freeDurationDays;
-  const currency = rental?.currency || host?.currency || "USD";
-  const subdomain = host?.clientSubdomain;
   const title =
-    subdomain ||
+    termination?.clientSubdomain ||
+    host?.clientSubdomain ||
     host?.hostname ||
     host?.ip ||
     (rental?.installationId.startsWith("host:")
       ? rental.installationId.slice(5, 17)
       : rental?.installationId.slice(0, 12)) ||
     host?.id.slice(0, 12) ||
+    termination?.installationId.slice(0, 12) ||
     "—";
-  const anomalous = isAnomalous(status) || rental?.hostCleanupPending === true;
-  const providerEmail = rental?.hostOwnerEmail || host?.hostOwnerEmail || "—";
-  const renterEmail = rental?.clientOwnerEmail || host?.clientOwnerEmail || "";
-  const marketHref = host?.installationId
-    ? clientMarketMineHref(host.installationId)
-    : rental && !rental.installationId.startsWith("host:")
-      ? clientMarketMineHref(rental.installationId)
+  const installationId = rental?.installationId || termination?.installationId || host?.installationId;
+  const marketHref = installationId && !installationId.startsWith("host:")
+      ? clientMarketMineHref(installationId)
       : clientMarketMineHref();
-  const updatedAt = rental?.updatedAt || host?.updatedAt || host?.createdAt;
+  return {
+    rental,
+    host,
+    status,
+    title,
+    dailyRateMinor,
+    cyclePriceMinor,
+    pricingModel,
+    free: termination && !rental && !host ? BigInt(termination.periodAmountUnits) === 0n : isFreeOffer(pricingModel, dailyRateMinor, cyclePriceMinor),
+    freeDurationDays: rental?.freeDurationDays ?? host?.freeDurationDays,
+    currency: rental?.currency || host?.currency || "USD",
+    anomalous: isAnomalous(status) || rental?.hostCleanupPending === true,
+    providerEmail: rental?.hostOwnerEmail || termination?.providerEmail || host?.hostOwnerEmail || "",
+    renterEmail: rental?.clientOwnerEmail || termination?.buyerEmail || host?.clientOwnerEmail || "",
+    marketHref,
+    updatedAt: rental?.updatedAt || termination?.updatedAt || host?.updatedAt || host?.createdAt,
+  };
+}
+
+function entryPrice(entry: MonitorEntry, locale: string) {
+  if (entry.termination && !entry.rental && !entry.host) return formatWalletUnits(entry.termination.periodAmountUnits, "$", locale);
+  const facts = entryFacts(entry);
+  return offerLabel(facts.dailyRateMinor, facts.cyclePriceMinor, facts.pricingModel, facts.freeDurationDays, locale);
+}
+
+function clientTermText(entry: MonitorEntry, locale: string, t: ReturnType<typeof useLocaleText>["t"]) {
+  const facts = entryFacts(entry);
+  const rental = facts.rental;
+  if (!rental || facts.status === "released") return "—";
+  if (rental.walletContract) {
+    return t(walletLifecycleKey(rental.walletContract), {
+      date: formatShortDate(rental.walletContract.periodEnd, locale),
+      hours: trialHours(rental.walletContract.trialSecondsRemaining, locale),
+    });
+  }
+  if (!facts.free) return "—";
+  if (!rental.activatedAt) {
+    return rental.status === "idle" ? "—" : t("clientMarket.freeDuration.pendingActivation");
+  }
+  return rental.expiresAt
+    ? t("clientCheckout.lifecycle.expires", { date: formatShortDate(rental.expiresAt, locale) })
+    : t("clientMarket.freeDuration.permanent");
+}
+
+function EntryDetail({ entry, perspective, onChanged, onTerminationOpen }: {
+  entry: MonitorEntry;
+  perspective: ClientMonitorTab;
+  onChanged: () => Promise<void> | void;
+  onTerminationOpen: (item: ClientTermination, action?: ClientTerminationAction) => void;
+}) {
+  const { locale, t } = useLocaleText();
+  const facts = entryFacts(entry);
+  const rental = facts.rental;
   const freeTiming = freePeriodTiming(rental, locale, t);
-
+  const contractId = rental?.walletContract?.id || rental?.walletContractId;
   return (
-    <section
-      className={`grid gap-3 rounded-xl border bg-card p-4 shadow-sm sm:p-5 ${
-        anomalous ? "border-rose-200/80 ring-1 ring-rose-100" : "border-border"
-      }`}
-    >
-      <div className="flex min-w-0 flex-wrap items-center gap-2">
-        {host?.countryCode ? (
-          <CountryFlag code={host.countryCode} />
-        ) : null}
-        <strong className="truncate text-sm">{title}</strong>
-        <Chip size="sm" variant={anomalous ? "primary" : "tertiary"}>
-          {t(statusLabelKey(status))}
-        </Chip>
-        {host?.status && host.status !== status ? (
-          <Chip size="sm" variant="tertiary">
-            {host.status}
-          </Chip>
-        ) : null}
-        <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
-          {perspective === "user"
-            ? t("account.client.provider", { owner: providerEmail })
-            : renterEmail
-              ? t("account.client.renter", { email: renterEmail })
-              : t("account.client.noRenter")}
-        </span>
+    <div className="grid min-w-0 gap-3">
+      <RecordDetailList items={[
+        { label: t("account.client.offer"), value: entryPrice(entry, locale) },
+        { label: t("account.market.col.status"), value: t(statusLabelKey(facts.status)) },
+        ...(freeTiming ? [{ label: t("account.market.detail.service"), value: freeTiming }] : []),
+        ...(facts.host?.status && facts.host.status !== facts.status
+          ? [{ label: t("account.market.detail.hostStatus"), value: facts.host.status }] : []),
+        perspective === "user"
+          ? { label: t("account.market.col.provider"), value: <span className="break-all">{facts.providerEmail || "—"}</span> }
+          : { label: t("account.market.col.renter"), value: <span className="break-all">{facts.renterEmail || t("account.client.noRenter")}</span> },
+        { label: t("account.client.updated"), value: formatDate(facts.updatedAt, locale) },
+        { label: t("account.market.col.term"), value: clientTermText(entry, locale, t) },
+      ]} />
+      {rental?.hostCleanupPending ? <p className="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-900">{t("clientMarket.release.hostPending")}</p> : null}
+      {perspective === "user" && facts.status !== "released" && contractId && rental?.cyclePriceMinor != null ? (
+        <MarketWalletRenewalCard
+          contractId={contractId}
+          refreshKey={JSON.stringify([rental.walletContract?.status, rental.walletContract?.renewalPolicy, rental.walletContract?.periodEnd, rental.walletContract?.trialSecondsRemaining])}
+          compact
+          onChanged={onChanged}
+        />
+      ) : null}
+      {perspective === "user" && rental?.walletContractId && (facts.status !== "released" || rental.openWalletDispute) ? (
+        <MarketServiceDisputeControl contractId={rental.walletContractId} initiallyOpen={rental.openWalletDispute} onChanged={onChanged} />
+      ) : null}
+      {entry.termination ? <section className="grid min-w-0 gap-3 border-t border-border pt-3" aria-label={t("clientTermination.title")}>
+        <h4 className="text-sm font-semibold">{t("clientTermination.title")}</h4>
+        <ClientTerminationRecord item={entry.termination} role={perspective === "user" ? "buyer" : "provider"} onOpen={onTerminationOpen} />
+      </section> : null}
+      <div className="flex flex-wrap items-center justify-end gap-2">
+        {perspective === "user" && !facts.free ? <Link href={DASHBOARD_ACCOUNT_WALLET_PATH} className={LINK_CLASS}>{t("account.nav.wallet")}<ArrowUpRight className="h-3.5 w-3.5" aria-hidden /></Link> : null}
+        <Link href={facts.marketHref} className={LINK_CLASS}>{t("account.client.manageInMarket")}<ArrowUpRight className="h-3.5 w-3.5" aria-hidden /></Link>
       </div>
-
-      <dl className="grid gap-2 text-sm sm:grid-cols-2">
-        <div className="grid gap-0.5">
-          <dt className="text-xs text-muted-foreground">{t("account.client.offer")}</dt>
-          <dd className="font-medium">{offerLabel(dailyRateMinor, cyclePriceMinor, pricingModel, freeDurationDays, locale, currency)}</dd>
-          {freeTiming ? <dd className="text-xs text-muted-foreground">{freeTiming}</dd> : null}
-        </div>
-        <div className="grid gap-0.5">
-          <dt className="text-xs text-muted-foreground">{t("account.client.status")}</dt>
-          <dd className="font-medium">{status === "released" ? t("account.client.status.ended") : isFreeOffer(pricingModel, dailyRateMinor, cyclePriceMinor) ? t("shareMarket.free") : t("clientCheckout.lifecycle.active")}</dd>
-          {rental?.hostCleanupPending ? <dd className="text-xs text-amber-800">{t("clientMarket.release.hostPending")}</dd> : null}
-        </div>
-        <div className="grid gap-0.5 sm:col-span-2">
-          <dt className="text-xs text-muted-foreground">{t("account.client.updated")}</dt>
-          <dd className="text-muted-foreground">
-            {formatDate(updatedAt, locale)}
-          </dd>
-        </div>
-      </dl>
-
-      <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border/70 pt-3">
-        <p className="text-xs text-muted-foreground">{t("account.client.readOnlyHint")}</p>
-        <div className="flex flex-wrap gap-2">
-          {!isFreeOffer(pricingModel, dailyRateMinor, cyclePriceMinor) ? <Link href={DASHBOARD_ACCOUNT_WALLET_PATH} className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-border bg-background px-3 text-sm font-medium text-foreground transition-colors hover:border-accent/30 hover:bg-muted">{t("account.nav.wallet")}<ArrowUpRight className="h-3.5 w-3.5" aria-hidden /></Link> : null}
-          <Link href={marketHref} className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-border bg-background px-3 text-sm font-medium text-foreground transition-colors hover:border-accent/30 hover:bg-muted">{t("account.client.manageInMarket")}<ArrowUpRight className="h-3.5 w-3.5" aria-hidden /></Link>
-        </div>
-      </div>
-    </section>
+    </div>
   );
 }
 
-function MonitorList({
+function MonitorTable({
   entries,
   perspective,
   emptyKey,
+  focusKey,
+  onChanged,
+  onTerminationOpen,
 }: {
   entries: MonitorEntry[];
   perspective: ClientMonitorTab;
   emptyKey: "account.client.userEmpty" | "account.client.providerEmpty";
+  focusKey?: string | null;
+  onChanged: () => Promise<void> | void;
+  onTerminationOpen: (item: ClientTermination, action?: ClientTerminationAction) => void;
 }) {
-  const { t } = useLocaleText();
-  if (!entries.length) {
-    return (
-      <div className="grid justify-items-center gap-2 rounded-xl border border-dashed border-border bg-card/40 px-4 py-12 text-center text-sm text-muted-foreground">
-        <span>{t(emptyKey)}</span>
-        <Link
-          href={clientMarketMineHref()}
-          className="inline-flex items-center gap-1 text-sm font-medium text-accent hover:underline"
-        >
-          {t("account.client.openMarket")}
-          <ArrowUpRight className="h-3.5 w-3.5" aria-hidden />
-        </Link>
-      </div>
-    );
-  }
-
+  const { locale, t } = useLocaleText();
+  const counterparty = (entry: MonitorEntry) => {
+    const facts = entryFacts(entry);
+    return perspective === "user" ? facts.providerEmail || "—" : facts.renterEmail || t("account.market.notRented");
+  };
+  const columns: RecordTableColumn<MonitorEntry>[] = [
+    {
+      id: "client",
+      header: t(perspective === "user" ? "account.market.col.client" : "account.market.col.host"),
+      cell: (entry) => {
+        const facts = entryFacts(entry);
+        return (
+          <div className="grid min-w-0 gap-0.5">
+            <span className="flex min-w-0 items-center gap-2">
+              {facts.host?.countryCode ? <CountryFlag code={facts.host.countryCode} /> : null}
+              <span className="min-w-0 truncate font-medium">{facts.title}</span>
+            </span>
+            <span className="truncate text-xs text-muted-foreground md:hidden">{counterparty(entry)}</span>
+          </div>
+        );
+      },
+    },
+    {
+      id: "counterparty",
+      header: t(perspective === "user" ? "account.market.col.provider" : "account.market.col.renter"),
+      minWidth: "md",
+      cell: (entry) => <span className="block truncate text-muted-foreground" title={counterparty(entry)}>{counterparty(entry)}</span>,
+    },
+    {
+      id: "status",
+      header: t("account.market.col.status"),
+      className: "w-16 sm:w-32",
+      cell: (entry) => {
+        const facts = entryFacts(entry);
+        return (
+          <span className={cn("block truncate", facts.anomalous ? "font-medium text-amber-700" : null)}>
+            {t(facts.status === "released" ? "account.client.status.ended" : statusLabelKey(facts.status))}
+          </span>
+        );
+      },
+    },
+    {
+      id: "price",
+      header: t("account.market.col.price"),
+      className: "w-20 sm:w-32",
+      cell: (entry) => {
+        return <span className="block truncate tabular-nums">{entryPrice(entry, locale)}</span>;
+      },
+    },
+    perspective === "user"
+      ? {
+        id: "term",
+        header: t("account.market.col.term"),
+        minWidth: "lg",
+        className: "w-48",
+        cell: (entry) => <span className="block truncate text-muted-foreground">{clientTermText(entry, locale, t)}</span>,
+      }
+      : {
+        id: "updated",
+        header: t("account.market.col.updated"),
+        minWidth: "lg",
+        className: "w-44",
+        cell: (entry) => <span className="block truncate text-muted-foreground">{formatDate(entryFacts(entry).updatedAt, locale)}</span>,
+      },
+    { id: "manage", header: <span className="sr-only">{t("account.market.col.actions")}</span>, minWidth: "sm", className: "w-12",
+      cell: (entry) => <Link href={entryFacts(entry).marketHref} aria-label={`${t("account.client.manageInMarket")} · ${entryFacts(entry).title}`} className="inline-flex size-11 items-center justify-center rounded-md hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring"><ArrowUpRight className="size-4" aria-hidden /></Link> },
+  ];
   return (
-    <div className="grid gap-3">
-      {entries.map((entry) => (
-        <MonitorCard key={`${perspective}:${entry.key}`} entry={entry} perspective={perspective} />
-      ))}
-    </div>
+    <ExpandableRecordTable
+      rows={entries}
+      rowKey={(entry) => entry.key}
+      rowLabel={(entry) => entryFacts(entry).title}
+      ariaLabel={t(perspective === "user" ? "account.client.tab.user" : "account.client.tab.provider")}
+      columns={columns}
+      rowTone={(entry) => {
+        const status = entryFacts(entry).status;
+        return status === "release_failed" ? "danger" : entryFacts(entry).anomalous ? "attention" : undefined;
+      }}
+      focusKey={focusKey}
+      renderDetail={(entry) => <EntryDetail entry={entry} perspective={perspective} onChanged={onChanged} onTerminationOpen={onTerminationOpen} />}
+      empty={(
+        <div className="grid justify-items-center gap-2 rounded-xl border border-dashed border-border bg-card/40 px-4 py-12 text-center text-sm text-muted-foreground">
+          <span>{t(emptyKey)}</span>
+          <Link
+            href={clientMarketMineHref()}
+            className="inline-flex items-center gap-1 text-sm font-medium text-accent hover:underline"
+          >
+            {t("account.client.openMarket")}
+            <ArrowUpRight className="h-3.5 w-3.5" aria-hidden />
+          </Link>
+        </div>
+      )}
+    />
   );
 }
 
@@ -294,6 +390,12 @@ function MonitorList({
  * Includes free Hosts (rental + host fallback). Actions stay on Client Market.
  */
 export function AccountClientPage() {
+  const { session } = useAuth();
+  const actor = session?.authenticated ? session.user?.id || session.user?.email : undefined;
+  return <AccountClientWorkspace key={actor || "anonymous"} />;
+}
+
+function AccountClientWorkspace() {
   const { t } = useLocaleText();
   const { session } = useAuth();
   const router = useRouter();
@@ -303,6 +405,24 @@ export function AccountClientPage() {
 
   const tabParam = searchParams.get("tab");
   const tab: ClientMonitorTab = tabParam === "provider" ? "provider" : "user";
+  const focusKey = searchParams.get("focus");
+  const terminations = useAccountClientTerminations(authed ? viewerUserId : undefined, tab === "user" ? "buyer" : "provider", focusKey);
+  const [selection, setSelection] = React.useState<{ id: string; role: "buyer" | "provider"; action?: ClientTerminationAction } | null>(null);
+  const openTermination = (item: ClientTermination, action?: ClientTerminationAction) => setSelection({ id: item.id, role: tab === "user" ? "buyer" : "provider", action });
+  const attachTerminations = (entries: MonitorEntry[]) => {
+    const byInstallation = new Map(terminations.items.map(item => [item.installationId, item]));
+    const seen = new Set(entries.map(entry => entry.key));
+    return [...entries.map(entry => ({ ...entry, termination: byInstallation.get(entry.key) })),
+      ...terminations.items.filter(item => !seen.has(item.installationId)).map(item => ({ key: item.installationId, termination: item }))]
+      .sort((a, b) => {
+        const order = (entry: MonitorEntry) => {
+          const facts = entryFacts(entry);
+          return { id: entry.key, attention: facts.anomalous || !!entry.termination && (entry.termination.status === "cleanup_failed" || terminationCanRespond(entry.termination)),
+            ended: facts.status === "released", expiresAt: entry.rental?.walletContract?.periodEnd || entry.rental?.expiresAt, updatedAt: facts.updatedAt };
+        };
+        return compareAccountRecords(order(a), order(b));
+      });
+  };
 
   const [hosts, setHosts] = React.useState<ClientMarketHost[]>([]);
   const [rentalByInstallation, setRentalByInstallation] = React.useState<
@@ -314,6 +434,7 @@ export function AccountClientPage() {
 
   const setTab = React.useCallback(
     (next: ClientMonitorTab) => {
+      setSelection(null);
       const params = new URLSearchParams(searchParams.toString());
       params.set("tab", next);
       router.replace(`${DASHBOARD_ACCOUNT_CLIENT_PATH}?${params.toString()}`, { scroll: false });
@@ -354,6 +475,7 @@ export function AccountClientPage() {
       return;
     }
     void load();
+    return () => refreshAbortRef.current?.abort();
   }, [authed, load]);
 
   React.useEffect(() => {
@@ -387,7 +509,6 @@ export function AccountClientPage() {
 
     for (const rental of allRentals) {
       if (!rental.isClientOwner) continue;
-      if (rental.status === "released" && !isRecentReleased(rental)) continue;
       seen.add(rental.installationId);
       entries.push({
         key: rental.installationId,
@@ -408,13 +529,7 @@ export function AccountClientPage() {
       });
     }
 
-    return entries.sort((left, right) => {
-      const leftStatus = left.rental?.status || left.host?.status || "";
-      const rightStatus = right.rental?.status || right.host?.status || "";
-      return (
-        entryRank(leftStatus) - entryRank(rightStatus) || left.key.localeCompare(right.key)
-      );
-    });
+    return entries;
   }, [allRentals, hosts, hostsByInstallation]);
 
   const providerEntries = React.useMemo(() => {
@@ -423,12 +538,13 @@ export function AccountClientPage() {
     const seenHosts = new Set<string>();
 
     for (const rental of allRentals) {
-      const host =
-        hostsByInstallation.get(rental.installationId) || hostsById.get(rental.hostId);
+      const providerHost = hostsById.get(rental.hostId);
+      // A re-rented Host must not give an ended lease the new tenant's identity.
+      const host = hostsByInstallation.get(rental.installationId)
+        || (rental.status !== "released" && !providerHost?.installationId ? providerHost : undefined);
       const isProvider =
-        (!!viewerUserId && rental.providerId === viewerUserId) || host?.isHostOwner === true;
+        (!!viewerUserId && rental.providerId === viewerUserId) || providerHost?.isHostOwner === true;
       if (!isProvider) continue;
-      if (rental.status === "released" && !isRecentReleased(rental)) continue;
       seenInstallations.add(rental.installationId);
       if (host) seenHosts.add(host.id);
       entries.push({ key: rental.installationId, rental, host });
@@ -464,17 +580,7 @@ export function AccountClientPage() {
       }
     }
 
-    return entries.sort((left, right) => {
-      const leftStatus = left.rental?.status || left.host?.status || "";
-      const rightStatus = right.rental?.status || right.host?.status || "";
-      const leftRenter = left.rental?.clientOwnerEmail || left.host?.clientOwnerEmail || "";
-      const rightRenter = right.rental?.clientOwnerEmail || right.host?.clientOwnerEmail || "";
-      return (
-        entryRank(leftStatus) - entryRank(rightStatus) ||
-        leftRenter.localeCompare(rightRenter) ||
-        left.key.localeCompare(right.key)
-      );
-    });
+    return entries;
   }, [allRentals, hosts, hostsById, hostsByInstallation, viewerUserId]);
 
   if (!authed) {
@@ -514,18 +620,32 @@ export function AccountClientPage() {
       />
 
       {tab === "user" ? (
-        <MonitorList
-          entries={userEntries}
-          perspective="user"
-          emptyKey="account.client.userEmpty"
-        />
+        <>
+          <MonitorTable
+            entries={attachTerminations(userEntries)}
+            perspective="user"
+            emptyKey="account.client.userEmpty"
+            focusKey={focusKey}
+            onChanged={() => load({ silent: true })}
+            onTerminationOpen={openTermination}
+          />
+        </>
       ) : (
-        <MonitorList
-          entries={providerEntries}
-          perspective="provider"
-          emptyKey="account.client.providerEmpty"
-        />
+        <>
+          <MonitorTable
+            entries={attachTerminations(providerEntries)}
+            perspective="provider"
+            emptyKey="account.client.providerEmpty"
+            focusKey={focusKey}
+            onChanged={() => load({ silent: true })}
+            onTerminationOpen={openTermination}
+          />
+        </>
       )}
+      {terminations.error ? <div role="alert" className="flex flex-wrap items-center gap-2 text-sm text-destructive">{t("account.market.terminationsUnavailable")}<Button variant="ghost" onPress={() => void terminations.reload()}>{t("common.retry")}</Button></div> : null}
+      {terminations.nextCursor ? <Button variant="ghost" className="min-h-11 justify-self-start" isDisabled={terminations.loading} onPress={() => void terminations.more()}>{t("account.market.earlierTerminations")}</Button> : null}
+      <ClientTerminationDialog terminationId={selection?.id || null} initialRole={selection?.role} initialAction={selection?.action}
+        onClose={() => setSelection(null)} onChanged={() => { void terminations.reload(); void load({ silent: true }); }} />
     </div>
   );
 }

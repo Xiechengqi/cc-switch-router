@@ -81,7 +81,24 @@ export function ClientTerminationsPanel({ role }: { role: Role }) {
     <p className="text-xs leading-5 text-muted-foreground">{t("clientTermination.help")}</p>
     {error && !selected ? <p role="alert" className="text-sm text-danger">{error}</p> : null}
     {current?.items.length ? <div className="grid max-h-96 gap-3 overflow-y-auto overscroll-contain" role="region" aria-label={t("clientTermination.title")} tabIndex={0}>
-      {current.items.map(item => <article key={item.id} className="grid gap-2 rounded-lg border border-border p-3 text-xs">
+      {current.items.map(item => <ClientTerminationRecord key={item.id} item={item} role={role} onOpen={open} />)}
+      {current.nextCursor ? <Button variant="ghost" size="sm" className="min-h-11" isDisabled={busy} onPress={() => void more()}>{t("marketWallet.more")}</Button> : null}
+    </div> : <p className="text-xs text-muted-foreground">{t(current ? "clientTermination.empty" : "common.loading")}</p>}
+    <ClientTerminationDialog terminationId={selected?.id || null} initialRole={role} initialAction={action}
+      onClose={() => setSelected(null)} onChanged={() => void load(true)} />
+  </section>;
+}
+
+/** The same settlement facts/actions in an expanded account rental, without a
+ * second page-level inbox or one network request per collapsed rental. */
+export function ClientTerminationRecord({ item, role, onOpen }: {
+  item: ClientTermination;
+  role: Role;
+  onOpen: (item: ClientTermination, action?: ClientTerminationAction) => void;
+}) {
+  const { locale, t } = useLocaleText();
+  const open = onOpen;
+  return <article key={item.id} className="grid min-w-0 gap-2 text-sm">
         <div className="flex flex-wrap justify-between gap-2"><span className="font-mono">{item.clientSubdomain || item.installationId}</span><span>{t(`clientTermination.${item.status}`)}</span></div>
         <p className="break-all text-muted-foreground">{role !== "buyer" ? item.buyerEmail : item.providerEmail}</p>
         <p className="text-muted-foreground">{t("clientTermination.cutoff")}: {new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(item.cutoffAt))}</p>
@@ -106,10 +123,5 @@ export function ClientTerminationsPanel({ role }: { role: Role }) {
           {role === "buyer" && terminationCanWithdraw(item) ? <Button size="sm" variant="ghost" className="min-h-11" onPress={() => open(item, "withdraw")}>{t("clientTermination.withdraw")}</Button> : null}
           {role === "provider" && terminationCanRespond(item) ? <Button size="sm" variant="ghost" className="min-h-11" onPress={() => open(item, "respond")}>{t("clientTermination.respond")}</Button> : null}
         </div>
-      </article>)}
-      {current.nextCursor ? <Button variant="ghost" size="sm" className="min-h-11" isDisabled={busy} onPress={() => void more()}>{t("marketWallet.more")}</Button> : null}
-    </div> : <p className="text-xs text-muted-foreground">{t(current ? "clientTermination.empty" : "common.loading")}</p>}
-    <ClientTerminationDialog terminationId={selected?.id || null} initialRole={role} initialAction={action}
-      onClose={() => setSelected(null)} onChanged={() => void load(true)} />
-  </section>;
+      </article>;
 }

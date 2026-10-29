@@ -111,7 +111,7 @@ try {
   (await heldResponse())();
   await expectAmount("$25.00");
   assert.equal(walletCalls, 1);
-  assert.equal(await balance.getAttribute("href"), "/account/wallet/");
+  assert.equal(await balance.getAttribute("aria-haspopup"), "dialog");
   console.log("PASS anonymous privacy, loading state, and available (not posted) balance");
 
   available = "181440000";
@@ -241,11 +241,21 @@ try {
   responseMode = "ready";
   await changed("buyer");
   await expectAmount("$9.00");
+  // The navbar balance opens quick actions in place instead of navigating away.
   await balance.click();
+  const quick = page.getByRole("dialog", { name: "平台余额" });
+  await quick.waitFor();
+  await quick.getByText("$9.00").waitFor();
+  for (const name of ["充值", "C2C", "转出"]) await quick.getByRole("tab", { name, exact: true }).waitFor();
+  await quick.getByRole("link", { name: "查看完整余额与流水" }).click();
   await page.waitForURL(`${baseUrl}/account/wallet/`);
   await expectAmount("$9.00");
+  // On the balance page it focuses the page's own actions rather than stacking a second form.
+  await balance.click();
+  await page.waitForFunction(() => document.activeElement?.id === "wallet-actions");
+  assert.equal(await page.getByRole("dialog").count(), 0);
   assert.deepEqual(errors, []);
-  console.log("PASS shared shortcut request, wallet navigation, retained balance across routes, and no browser exceptions");
+  console.log("PASS shared shortcut request, quick balance dialog, wallet navigation, retained balance across routes, and no browser exceptions");
 } finally {
   await browser?.close();
   if (server) await new Promise((closed) => server.close(closed));

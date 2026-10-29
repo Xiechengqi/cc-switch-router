@@ -214,13 +214,14 @@ try {
   let policyVersion = 1;
   let channelSettingsVersion = 1;
   let primaryMaxCreditMinor = 100_000;
+  let activeChannel = "channel-1";
   let delayedQuote = null;
   const quoteRequests = [];
   const channelLimits = (id, displayName, minTopupMinor, maxTopupMinor) => {
     const lower = Math.max(100, minTopupMinor), upper = Math.min(100_000, maxTopupMinor);
     const minCreditMinor = lower <= upper ? lower : null;
     const maxCreditMinor = lower <= upper ? upper : null;
-    return { id, displayName, gatewayKind: "dujiaopay", orderMode: "cashier", methods: [],
+    return { id, displayName, gatewayKind: "dujiaopay", methodCategory: "crypto", orderMode: "cashier", methods: [],
       minTopupMinor, maxTopupMinor, minCreditMinor, maxCreditMinor,
       maintenanceFeeBps: feeBps, policyVersion, channelRevision: 1, channelSettingsVersion };
   };
@@ -282,9 +283,11 @@ try {
   });
   await page.context().route("**/v1/market-wallet/channels", async (route) => {
     await route.fulfill({ contentType: "application/json", body: JSON.stringify([
-      channelLimits("channel-1", "DujiaoPay", 100, primaryMaxCreditMinor),
-      channelLimits("channel-2", "Bounded channel", 1000, 5000),
-      channelLimits("channel-3", "Unavailable channel", 200, 100),
+      activeChannel === "channel-2" ? channelLimits(activeChannel, "Bounded channel", 1000, 5000)
+        : activeChannel === "channel-3" ? channelLimits(activeChannel, "Unavailable channel", 200, 100)
+          : channelLimits(activeChannel, "DujiaoPay", 100, primaryMaxCreditMinor),
+      channelLimits("legacy-duplicate", "Hidden merchant name", 100, 1000),
+      { ...channelLimits("unknown-category", "Unsupported method", 100, 1000), methodCategory: "unknown" },
     ]) });
   });
   await page.context().route("**/v1/market-wallet/topups", async (route) => {
@@ -339,7 +342,7 @@ try {
     await route.fulfill({ contentType: "application/json", body: JSON.stringify(topup) });
   });
   await page.goto(`${baseUrl}/account/wallet/`);
-  await page.getByRole("region", { name: "Client rental terminations", exact: true }).getByText("No Client termination records.", { exact: true }).waitFor();
+  assert.equal(await page.getByRole("region", { name: "Client rental terminations", exact: true }).count(), 0, "termination actions belong to Client rentals, not balance history");
   await page.getByRole("button", { name: "Check payment" }).waitFor();
   for (const width of [320, 375, 414, 768]) {
     await page.setViewportSize({ width, height: 900 });
@@ -358,10 +361,17 @@ try {
   // The full $1–$1,000 principal range excludes the additional maintenance fee.
   // Invalid inputs never request a quote or consume pending-order capacity.
   const amountInput = page.locator("#market-wallet-topup-amount");
-  const amountHelp = page.locator("#wallet-amount-help");
+  const amountHelp = page.locator("#market-wallet-topup-amount-help");
+  // Buyers choose a method, not a merchant. Simulate an Owner changing which
+  // merchant is active, then revalidate the form without losing its draft.
   const selectChannel = async name => {
-    await page.getByRole("button", { name: /Payment channel/ }).click();
-    await page.getByRole("option", { name, exact: true }).click();
+    activeChannel = { DujiaoPay: "channel-1", "Bounded channel": "channel-2", "Unavailable channel": "channel-3" }[name];
+    assert.ok(activeChannel);
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    await page.waitForFunction(id => document.querySelector("form[data-topup-channel]")?.dataset.topupChannel === id, activeChannel);
+    await page.getByRole("button", { name: /Top-up method/ }).click();
+    assert.equal(await page.getByRole("option").count(), 1, "duplicate or unknown categories never become buyer choices");
+    await page.getByRole("option", { name: "Cryptocurrency", exact: true }).click();
   };
   await amountHelp.filter({ hasText: "$1.00–$1,000.00" }).waitFor();
   const requestsBeforeInvalid = quoteRequests.length;
@@ -495,11 +505,11 @@ try {
 
   // No real transfer is sent. The confirmation must retain exact sub-cent
   // units, the frozen recipient, and one idempotency key across an uncertain response, without any OTP.
-  await page.getByRole("button", { name: "Transfer", exact: true }).click();
+  await page.getByRole("button", { name: "Send", exact: true }).click();
   const transferPanel = page.locator("#wallet-transfer");
   await transferPanel.getByLabel("Recipient email").fill("recipient@example.invalid");
-  await transferPanel.getByLabel("Transfer all available").check();
-  await transferPanel.getByRole("button", { name: "Review transfer" }).click();
+  await transferPanel.getByLabel("Send all available").check();
+  await transferPanel.getByRole("button", { name: "Review send" }).click();
   const transferDialog = page.getByRole("dialog", { name: "Confirm recipient & amount" });
   await transferDialog.getByText("recipient@example.invalid", { exact: true }).waitFor();
   await transferDialog.getByText("Exact amount: 8640001 ledger units", { exact: true }).waitFor();
@@ -509,10 +519,10 @@ try {
   }
   assert.equal(await transferDialog.locator('input[autocomplete="one-time-code"]').count(), 0);
   assert.equal(await transferDialog.getByRole("button", { name: /verification|code/i }).count(), 0);
-  await transferDialog.getByRole("button", { name: /^Transfer \$/ }).click();
+  await transferDialog.getByRole("button", { name: /^Send \$/ }).click();
   await transferDialog.getByRole("alert").waitFor();
-  await transferDialog.getByRole("button", { name: /^Transfer \$/ }).click();
-  await transferPanel.getByRole("status").filter({ hasText: /Transferred/ }).waitFor();
+  await transferDialog.getByRole("button", { name: /^Send \$/ }).click();
+  await transferPanel.getByRole("status").filter({ hasText: /Sent/ }).waitFor();
   assert.equal(transferCalls, 2);
   assert.ok(transferKeys[0]);
   assert.equal(transferKeys[0], transferKeys[1]);
@@ -532,7 +542,7 @@ try {
   }
   for (const [legacy, expected] of [["market-access/", "provider-settings/"]]) {
     await page.goto(`${baseUrl}/account/${legacy}`);
-    await page.waitForURL(`${baseUrl}/account/${expected}`);
+    await page.waitForURL(`${baseUrl}/account/${expected}?tab=access`);
   }
 
   // Updating one permission through the new Provider settings must preserve
@@ -608,7 +618,7 @@ try {
   await page.reload();
   assert.equal(await page.getByRole("link", { name: "Provider earnings", exact: true }).count(), 0);
   const earningsPanel = page.getByRole("region", { name: "Provider earnings", exact: true });
-  await earningsPanel.getByRole("region", { name: "Client rental terminations", exact: true }).getByText("No Client termination records.", { exact: true }).waitFor();
+  assert.equal(await earningsPanel.getByRole("region", { name: "Client rental terminations", exact: true }).count(), 0, "income is separate from rental actions");
   assert.equal(await earningsPanel.getByRole("alert").count(), 0);
   const earningSummary = earningsPanel.getByText("Revenue & service fees", { exact: true });
   assert.equal(await earningSummary.locator("..").getAttribute("open"), null, "detailed accounting starts collapsed");
@@ -744,7 +754,7 @@ try {
   await page.getByRole("button", { name: "Marketplace", exact: true }).click();
   await page.getByRole("tab", { name: "Platform wallet", exact: true }).click();
   await page.getByRole("region", { name: "Client rental terminations", exact: true }).getByText("No Client termination records.", { exact: true }).waitFor();
-  const policyPanel = page.locator("section").filter({ has: page.getByRole("heading", { name: "Balance & transfers", exact: true }) }).last();
+  const policyPanel = page.locator("section").filter({ has: page.getByRole("heading", { name: "Balance & sending", exact: true }) }).last();
   const feeInput = policyPanel.getByLabel("Top-up maintenance fee (%)", { exact: true });
   const trialPanel = page.locator("section").filter({ has: page.getByRole("heading", { name: "Market trial rules", exact: true }) }).last();
   const trialInput = trialPanel.getByLabel("Default Client trial (hours)", { exact: true });

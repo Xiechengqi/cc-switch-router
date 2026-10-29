@@ -96,13 +96,32 @@ fn destination(item: &Claimed, dashboard: &str) -> Option<String> {
         url.query_pairs_mut().append_pair("terminationId", id);
         return Some(url.to_string());
     }
+    // Very old notifications may lack a case ID. The records now live with
+    // Client rentals, not on the wallet or Provider income tab.
+    if item.event_kind.starts_with("client_termination_") {
+        let role = field(&item.payload, "role");
+        if role == Some("handler") {
+            url.set_path("/client-market/");
+        } else {
+            url.set_path("/account/client/");
+            url.query_pairs_mut().append_pair(
+                "tab",
+                if role == Some("provider") {
+                    "provider"
+                } else {
+                    "user"
+                },
+            );
+            if let Some(id) = field(&item.payload, "installationId") {
+                url.query_pairs_mut().append_pair("focus", id);
+            }
+        }
+        return Some(url.to_string());
+    }
     let provider = matches!(
         item.event_kind.as_str(),
         "earnings_converted" | "earnings_held" | "earnings_released" | "commission_policy_changed"
-    ) || (matches!(
-        item.event_kind.as_str(),
-        "client_termination_settled" | "client_termination_claim"
-    ) && field(&item.payload, "role") == Some("provider"));
+    );
     let handler = field(&item.payload, "role") == Some("handler");
     url.set_path(if provider {
         "/account/provider-settings/"
@@ -112,7 +131,7 @@ fn destination(item: &Claimed, dashboard: &str) -> Option<String> {
         "/account/wallet/"
     });
     if provider {
-        url.set_fragment(Some("income"));
+        url.query_pairs_mut().append_pair("tab", "income");
     }
     if handler {
         url.query_pairs_mut().append_pair("panel", "market_finance");

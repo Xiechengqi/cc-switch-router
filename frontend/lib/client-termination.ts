@@ -107,14 +107,14 @@ export const getClientTerminationPolicy = (admin = false) => request<ClientTermi
 export const saveClientTerminationPolicy = (policy: ClientTerminationPolicy, rateBps: number) => request<ClientTerminationPolicy>("/v1/admin/market/client-termination-policy", "PUT", { expectedVersion: policy.version, rateBps });
 export const previewClientTermination = (installationId: string) => request<ClientTerminationPreview>(`/v1/client-market/clients/${encodeURIComponent(installationId)}/termination-preview`, "POST");
 export const getClientTermination = (installationId: string) => request<ClientTermination | null>(`/v1/client-market/clients/${encodeURIComponent(installationId)}/termination`);
-export const getClientTerminations = (role: "buyer" | "provider" | "owner", cursor?: string) => request<ClientTerminationPage>(`${role === "owner" ? "/v1/admin/market/client-terminations" : "/v1/client-market/terminations"}?provider=${role === "provider"}&openOnly=${role === "owner"}&${cursor ? `cursor=${encodeURIComponent(cursor)}` : ""}`);
+export const getClientTerminations = (role: "buyer" | "provider" | "owner", cursor?: string, signal?: AbortSignal) => request<ClientTerminationPage>(`${role === "owner" ? "/v1/admin/market/client-terminations" : "/v1/client-market/terminations"}?provider=${role === "provider"}&openOnly=${role === "owner"}&${cursor ? `cursor=${encodeURIComponent(cursor)}` : ""}`, "GET", undefined, signal);
 export const decideClientTermination = (termination: ClientTermination, owner: boolean, awardUnits: string, responsibility: string, note: string) => request<ClientTermination>(`${owner ? "/v1/admin/market/client-terminations" : "/v1/client-market/terminations"}/${encodeURIComponent(termination.id)}/${owner ? "resolve" : "waive"}`, "POST", { expectedVersion: termination.version, awardUnits, responsibility, note });
 export const disputeClientTermination = (termination: ClientTermination, claim: string) => request<ClientTermination>(`/v1/client-market/terminations/${encodeURIComponent(termination.id)}/dispute`, "POST", { expectedVersion: termination.version, claim });
 export const respondClientTermination = (termination: ClientTermination, note: string) => request<ClientTermination>(`/v1/client-market/terminations/${encodeURIComponent(termination.id)}/respond`, "POST", { expectedVersion: termination.version, note });
 export const withdrawClientTerminationClaim = (termination: ClientTermination) => request<ClientTermination>(`/v1/client-market/terminations/${encodeURIComponent(termination.id)}/withdraw`, "POST", { expectedVersion: termination.version });
 
-async function request<T>(path: string, method = "GET", body?: unknown) {
-  return parseJson<T>(await authFetch(path, { method, cache: "no-store", ...(body === undefined ? {} : { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }) }));
+async function request<T>(path: string, method = "GET", body?: unknown, signal?: AbortSignal) {
+  return parseJson<T>(await authFetch(path, { method, cache: "no-store", signal, ...(body === undefined ? {} : { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }) }));
 }
 
 export function parseTerminationRate(raw: string): number | null {

@@ -10,8 +10,20 @@ export const DASHBOARD_ACCOUNT_PROVIDER_USAGE_PATH = "/account/provider-usage/";
 export const DASHBOARD_ACCOUNT_CONSUMER_USAGE_PATH = "/account/consumer-usage/";
 export const DASHBOARD_ACCOUNT_MARKET_READINESS_PATH = "/account/market-readiness/";
 export const DASHBOARD_ACCOUNT_WALLET_PATH = "/account/wallet/";
+/** The balance page section the navbar balance focuses when that page is open. */
+export const WALLET_ACTIONS_ID = "wallet-actions";
 export const DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH = "/account/provider-settings/";
-export const PROVIDER_INCOME_HREF = `${DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH}#income`;
+export const PROVIDER_INCOME_HREF = `${DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH}?tab=income`;
+export const PROVIDER_ACCESS_HREF = `${DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH}?tab=access`;
+export const PROVIDER_CENTER_TABS = ["income", "access", "contact"] as const;
+export type ProviderCenterTab = (typeof PROVIDER_CENTER_TABS)[number];
+
+/** The Provider center tab from `?tab=`, accepting the older `#income` anchor. */
+export function providerCenterTab(tab: string | null | undefined, hash = "", hasIncome = false): ProviderCenterTab {
+  if (PROVIDER_CENTER_TABS.includes(tab as ProviderCenterTab)) return tab as ProviderCenterTab;
+  const anchor = hash.replace(/^#/, "");
+  return PROVIDER_CENTER_TABS.includes(anchor as ProviderCenterTab) ? anchor as ProviderCenterTab : hasIncome ? "income" : "access";
+}
 export const DASHBOARD_ACCOUNT_MARKET_ACCESS_PATH = "/account/market-access/";
 export const DASHBOARD_ACCOUNT_SHARE_PATH = "/account/share/";
 export const DASHBOARD_ACCOUNT_CLIENT_PATH = "/account/client/";

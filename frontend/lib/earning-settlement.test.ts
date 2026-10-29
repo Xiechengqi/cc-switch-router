@@ -55,6 +55,7 @@ test("current UI has no external payout or manual earning-credit actions", () =>
   }
   assert.equal(existsSync(new URL("../components/dashboard/earning-wallet-conversion.tsx", import.meta.url)), false);
   assert.match(source("../components/dashboard/provider-finance-panel.tsx"), /href="\/account\/wallet\/"/);
-  assert.match(source("../app/(dashboard)/account/provider-settings/page.tsx"), /<ProviderFinancePanel/);
+  assert.match(source("../app/(dashboard)/account/provider-settings/page.tsx"), /<AccountProviderCenter/);
+  assert.match(source("../components/dashboard/account-provider-center.tsx"), /tab === "income" \? <ProviderFinancePanel/);
   assert.doesNotMatch(source("../components/dashboard/share-market/paid-offer-readiness.tsx"), /finance\.destination|usableAt/);
 });

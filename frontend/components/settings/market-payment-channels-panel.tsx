@@ -138,6 +138,12 @@ export function MarketPaymentChannelsPanel() {
         setError(t("settings.marketFinance.versionChanged"));
       } else if (cause instanceof ApiError && cause.status === 409 && cause.message.includes("has not passed verification")) {
         setError(t("settings.marketFinance.channelNeedsVerification"));
+      } else if (cause instanceof ApiError && cause.code === "MARKET_PAYMENT_METHOD_CHANNEL_ACTIVE") {
+        const method = cause.details?.method;
+        setError(t("settings.marketPaymentChannels.methodActive", {
+          method: method === "crypto" ? t("marketWallet.topupMethod.crypto") : String(method ?? ""),
+          channel: String(cause.details?.displayName ?? cause.details?.channelId ?? ""),
+        }));
       } else {
         setError(ownerErrorText(t, cause));
       }
@@ -362,6 +368,7 @@ export function MarketPaymentChannelsPanel() {
           </div>
         </div>
         <p className="text-xs text-muted-foreground">{t("settings.marketFinance.channel.canaryNote")}</p>
+        <p className="text-xs text-muted-foreground">{t("settings.marketPaymentChannels.singleMethod")}</p>
         {readiness?.webhookUrl ? (
           <div className="grid gap-1">
             <CopyableCodeField

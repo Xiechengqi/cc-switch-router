@@ -891,6 +891,8 @@ struct BuyerChannelView {
     id: String,
     display_name: String,
     gateway_kind: &'static str,
+    /// Product-facing payment method, independent of the merchant adapter.
+    method_category: &'static str,
     order_mode: String,
     methods: Vec<BuyerMethodView>,
     #[serde(flatten)]
@@ -924,6 +926,7 @@ impl BuyerChannelView {
             id: channel.id,
             display_name: channel.display_name,
             gateway_kind: channel.gateway_kind,
+            method_category: topup_method_for_gateway(channel.gateway_kind),
             order_mode: channel.settings.order_mode.clone(),
             methods: channel
                 .settings
@@ -1886,6 +1889,9 @@ fn set_channel_enabled_tx(
     time: &str,
 ) -> Result<(), AppError> {
     editable_revision_tx(conn, id, expected_version)?;
+    if enabled {
+        require_single_active_method_tx(conn, id)?;
+    }
     let changed = conn
         .execute(
             "UPDATE market_payment_channels
@@ -1915,6 +1921,53 @@ fn set_channel_enabled_tx(
         ));
     }
     Ok(())
+}
+
+/// The buyer-facing top-up method a gateway kind is offered as.
+fn topup_method_for_gateway(gateway_kind: &str) -> &str {
+    match gateway_kind {
+        "dujiaopay" => "crypto",
+        other => other,
+    }
+}
+
+/// Buyers pick a top-up method, not a merchant account: at most one channel
+/// per method may take orders. DujiaoPay is currently the only supported adapter.
+/// Disable the active one before switching; live/canary transitions and edits
+/// to already active channels do not strand historical orders.
+fn require_single_active_method_tx(conn: &Connection, id: &str) -> Result<(), AppError> {
+    let active = conn
+        .query_row(
+            "SELECT other.id, other.display_name, other.gateway_kind
+             FROM market_payment_channels this
+             JOIN market_payment_channels other
+               ON other.gateway_kind = this.gateway_kind AND other.id != this.id
+             WHERE this.id = ?1 AND (this.rollout_state = 'off' OR this.archived_at IS NOT NULL)
+               AND other.rollout_state != 'off' AND other.archived_at IS NULL
+             ORDER BY other.sort_order, other.id LIMIT 1",
+            params![id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(db_error("check active top-up method channel"))?;
+    match active {
+        Some((channel_id, display_name, gateway_kind)) => Err(AppError::coded_conflict(
+            "MARKET_PAYMENT_METHOD_CHANNEL_ACTIVE",
+            "this top-up method already has an active channel; disable it first",
+            serde_json::json!({
+                "method": topup_method_for_gateway(&gateway_kind),
+                "channelId": channel_id,
+                "displayName": display_name,
+            }),
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Promote a canary revision after its first strictly verified credit.
@@ -8942,7 +8995,7 @@ mod tests {
         assert_eq!(
             value,
             serde_json::json!({
-                "id": "channel", "displayName": "Gateway", "gatewayKind": "dujiaopay",
+                "id": "channel", "displayName": "Gateway", "gatewayKind": "dujiaopay", "methodCategory": "crypto",
                 "orderMode": "direct",
                 "methods": [{
                     "tokenId": "tron-usdt", "chain": "tron", "chainName": "Tron",
@@ -9462,6 +9515,77 @@ mod tests {
         )
         .unwrap();
         assert!(set_channel_enabled_tx(&conn, "channel", true, 7, "2026-10-06").is_err());
+    }
+
+    #[test]
+    fn a_top_up_method_takes_orders_through_one_channel_at_a_time() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        conn.execute(
+            "INSERT INTO market_payment_channels
+             (id, gateway_kind, display_name, enabled, current_revision, created_at, updated_at)
+             VALUES ('second', 'dujiaopay', 'Second', 0, 0, '2026-10-01', '2026-10-01')",
+            [],
+        )
+        .unwrap();
+        let version = |conn: &Connection, id: &str| -> i64 {
+            conn.query_row(
+                "SELECT version FROM market_payment_channels WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        let error = set_channel_enabled_tx(
+            &conn,
+            "second",
+            true,
+            version(&conn, "second"),
+            "2026-10-02",
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), Some("MARKET_PAYMENT_METHOD_CHANNEL_ACTIVE"));
+        // Direct and legacy writes cannot bypass the API check.
+        assert!(
+            conn.execute(
+                "UPDATE market_payment_channels SET enabled = 1 WHERE id = 'second'",
+                []
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute(
+                "UPDATE market_payment_channels SET rollout_state = 'canary' WHERE id = 'second'",
+                []
+            )
+            .is_err()
+        );
+
+        // Disabling the active channel frees the method for another one.
+        set_channel_enabled_tx(
+            &conn,
+            "channel",
+            false,
+            version(&conn, "channel"),
+            "2026-10-03",
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE market_payment_channels SET enabled = 1 WHERE id = 'second'",
+            [],
+        )
+        .unwrap();
+        let state: String = conn
+            .query_row(
+                "SELECT rollout_state FROM market_payment_channels WHERE id = 'second'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "live");
+        // Re-enabling the channel that is already active is not blocked by itself.
+        assert!(require_single_active_method_tx(&conn, "second").is_ok());
     }
 
     fn fixture_topup(

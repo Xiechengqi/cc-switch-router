@@ -15,56 +15,66 @@ import type { ClientMarketHost, ClientMarketRental } from "@/lib/types";
  * table will silently render stale values.
  */
 
-/** Scalar fields of `ClientMarketHost`; payment collections and `ipIntel` are
- *  compared separately because they are not primitives. */
-const HOST_SCALAR_KEYS = [
-  "id",
-  "providerId",
-  "ip",
-  "port",
-  "hostOwnerEmail",
-  "dailyRateMinor",
-  "currency",
-  "freeDurationDays",
-  "offerRevision",
-  "countryCode",
-  "hostname",
-  "sshHostKeyFingerprint",
-  "status",
-  "clientSubdomain",
-  "clientOwnerEmail",
-  "installationId",
-  "sellerApprovalRequired",
-  "canWebTerminal",
-  "isHostOwner",
-  "isClientOwner",
-  "canRetireUnreachable",
-  "lastVerifiedAt",
-  "lastError",
-  "note",
-  "createdAt",
-  "updatedAt",
-] as const satisfies readonly (keyof ClientMarketHost)[];
-
-function sameStringList(left?: readonly string[], right?: readonly string[]): boolean {
-  if (left === right) return true;
-  if (!left || !right) return !left && !right;
-  if (left.length !== right.length) return false;
-  return left.every((value, index) => value === right[index]);
+/** Requiring every key here makes a newly added API field a typecheck failure
+ *  until its comparison strategy is chosen, including optional fields. */
+function recordComparator<T extends object>(fields: Record<keyof T, "scalar" | "nested" | "list">) {
+  const keys = Object.keys(fields) as (keyof T)[];
+  const scalarKeys = keys.filter(key => fields[key] === "scalar");
+  const nestedKeys = keys.filter(key => fields[key] !== "scalar");
+  return (left: T, right: T): boolean => {
+    if (left === right) return true;
+    for (const key of scalarKeys) {
+      if (left[key] !== right[key]) return false;
+    }
+    // Only serialize nested values after all cheap scalar checks pass. Missing
+    // contacts still mean an empty list; missing nullable objects mean null.
+    for (const key of nestedKeys) {
+      if (left[key] === right[key]) continue;
+      const fallback = fields[key] === "list" ? [] : null;
+      if (JSON.stringify(left[key] ?? fallback) !== JSON.stringify(right[key] ?? fallback)) return false;
+    }
+    return true;
+  };
 }
 
-function sameHost(left: ClientMarketHost, right: ClientMarketHost): boolean {
-  if (left === right) return true;
-  for (const key of HOST_SCALAR_KEYS) {
-    if (left[key] !== right[key]) return false;
-  }
-  if (JSON.stringify(left.contacts ?? []) !== JSON.stringify(right.contacts ?? [])) return false;
-  if (JSON.stringify(left.eligibility) !== JSON.stringify(right.eligibility)) return false;
-  if (JSON.stringify(left.clientConnection ?? null) !== JSON.stringify(right.clientConnection ?? null)) return false;
-  // ipIntel is a nested object refreshed rarely; only pay for it once the cheap
-  // scalar pass has found no difference.
-  return JSON.stringify(left.ipIntel ?? null) === JSON.stringify(right.ipIntel ?? null);
-}
+const sameHost = recordComparator<ClientMarketHost>({
+  id: "scalar",
+  providerId: "scalar",
+  marketProviderId: "scalar",
+  ip: "scalar",
+  port: "scalar",
+  hostOwnerEmail: "scalar",
+  dailyRateMinor: "scalar",
+  pricingModel: "scalar",
+  cyclePriceMinor: "scalar",
+  billingInterval: "scalar",
+  currency: "scalar",
+  freeDurationDays: "scalar",
+  trialHours: "scalar",
+  defaultTrialHours: "scalar",
+  offerRevision: "scalar",
+  contacts: "list",
+  sellerApprovalRequired: "scalar",
+  eligibility: "nested",
+  countryCode: "scalar",
+  hostname: "scalar",
+  sshHostKeyFingerprint: "scalar",
+  status: "scalar",
+  clientSubdomain: "scalar",
+  clientOwnerEmail: "scalar",
+  installationId: "scalar",
+  canWebTerminal: "scalar",
+  isHostOwner: "scalar",
+  isClientOwner: "scalar",
+  canRetireUnreachable: "scalar",
+  clientConnection: "nested",
+  lastVerifiedAt: "scalar",
+  lastError: "scalar",
+  note: "scalar",
+  ipIntel: "nested",
+  createdAt: "scalar",
+  updatedAt: "scalar",
+});
 
 export function mergeHosts(prev: ClientMarketHost[], next: ClientMarketHost[]): ClientMarketHost[] {
   if (prev.length !== next.length) return next;
@@ -82,35 +92,39 @@ export function mergeHosts(prev: ClientMarketHost[], next: ClientMarketHost[]): 
   return changed ? merged : prev;
 }
 
-const RENTAL_SCALAR_KEYS = [
-  "installationId",
-  "hostId",
-  "providerId",
-  "hostOwnerEmail",
-  "clientOwnerEmail",
-  "status",
-  "dailyRateMinor",
-  "currency",
-  "offerRevision",
-  "isClientOwner",
-  "canRelease",
-  "canFinalizeRelease",
-  "hostCleanupPending",
-  "cleanupFailureKind",
-  "nextCleanupProbeAt",
-  "cleanupProbeAttempts",
-  "activeCleanupJobId",
-  "updatedAt",
-] as const satisfies readonly (keyof ClientMarketRental)[];
-
-function sameRental(left: ClientMarketRental, right: ClientMarketRental): boolean {
-  if (left === right) return true;
-  for (const key of RENTAL_SCALAR_KEYS) {
-    if (left[key] !== right[key]) return false;
-  }
-  if (JSON.stringify(left.contacts ?? []) !== JSON.stringify(right.contacts ?? [])) return false;
-  return true;
-}
+const sameRental = recordComparator<ClientMarketRental>({
+  installationId: "scalar",
+  hostId: "scalar",
+  providerId: "scalar",
+  hostOwnerEmail: "scalar",
+  clientOwnerEmail: "scalar",
+  status: "scalar",
+  dailyRateMinor: "scalar",
+  pricingModel: "scalar",
+  cyclePriceMinor: "scalar",
+  billingInterval: "scalar",
+  walletContractId: "scalar",
+  walletContract: "nested",
+  openWalletDispute: "scalar",
+  currency: "scalar",
+  freeDurationDays: "scalar",
+  offerRevision: "scalar",
+  activatedAt: "scalar",
+  expiresAt: "scalar",
+  contacts: "list",
+  isClientOwner: "scalar",
+  canRelease: "scalar",
+  canFinalizeRelease: "scalar",
+  hostCleanupPending: "scalar",
+  cleanupFailureKind: "scalar",
+  nextCleanupProbeAt: "scalar",
+  cleanupProbeAttempts: "scalar",
+  activeCleanupJobId: "scalar",
+  providerTerminalAuthorizedUntil: "scalar",
+  providerTerminalAccessActive: "scalar",
+  canManageProviderTerminal: "scalar",
+  updatedAt: "scalar",
+});
 
 export function mergeRentalMap(
   prev: Map<string, ClientMarketRental>,

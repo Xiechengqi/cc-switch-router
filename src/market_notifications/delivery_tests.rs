@@ -74,9 +74,9 @@ fn client_termination_receipts_have_a_delivery_purpose_exact_amounts_and_role_sp
         assert!(text.contains("sample-client"));
         assert!(!html.contains("PRIVATE_CLAIM") && !text.contains("PRIVATE_NOTE"));
         assert!(html.contains(if role == "provider" {
-            "/account/provider-settings/#income"
+            "/account/client/?tab=provider"
         } else {
-            "/account/wallet/"
+            "/account/client/?tab=user"
         }));
         let key = semantic_key(&i, "client_termination_receipt");
         let mut retry = i;
@@ -100,9 +100,9 @@ fn client_termination_claim_notices_are_actionable_private_and_have_a_delivery_p
         assert!(text.contains("72 hours") && text.contains("2026-10-28T12:00:00Z"));
         assert!(!html.contains("PRIVATE_CLAIM") && !text.contains("PRIVATE_NOTE"));
         assert!(html.contains(if role == "provider" {
-            "/account/provider-settings/#income"
+            "/account/client/?tab=provider"
         } else {
-            "/account/wallet/"
+            "/account/client/?tab=user"
         }));
         let mut response = i;
         response.payload["action"] = json!("responded");
@@ -566,7 +566,7 @@ fn provider_fee_receipt_has_one_rate_and_no_duplicate_language_or_code_instructi
     );
     let (_, html, text) = render_email(&i, "https://router.example");
     assert_eq!(text.matches("10.25%").count(), 1);
-    assert!(html.contains("/account/provider-settings/#income"));
+    assert!(html.contains("/account/provider-settings/?tab=income"));
     assert!(text.contains("2026-11-01 00:00:00 UTC"));
     assert!(!text.contains("account/wallet"));
     assert_eq!(

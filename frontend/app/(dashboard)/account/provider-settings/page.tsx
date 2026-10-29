@@ -1,12 +1,10 @@
-import { AccountContactPanel } from "@/components/dashboard/account-contact-panel";
-import { AccountMarketAccessPage } from "@/components/dashboard/account-market-access-page";
-import { ProviderFinancePanel } from "@/components/dashboard/provider-finance-panel";
+import { Suspense } from "react";
+import { AccountProviderCenter } from "@/components/dashboard/account-provider-center";
+
 export default function Page() {
   return (
-    <div className="grid min-w-0 gap-6">
-      <ProviderFinancePanel />
-      <AccountContactPanel />
-      <AccountMarketAccessPage />
-    </div>
+    <Suspense fallback={null}>
+      <AccountProviderCenter />
+    </Suspense>
   );
 }

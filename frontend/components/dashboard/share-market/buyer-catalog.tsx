@@ -88,9 +88,9 @@ import { MarketPagination } from "@/components/dashboard/share-market/market-pag
 import {
   RentalActions,
   RentalTermLine,
-  ShareMarketRentalHistory,
   useShareMarketRentalActions,
 } from "@/components/dashboard/share-market/rental-controls";
+import { AccountShareRentals } from "@/components/dashboard/account-share-rentals";
 import { needsRentalAttention, partitionShareMarketSubscriptions } from "@/components/dashboard/share-market/subscription-utils";
 
 type SeatCard = { listing: ShareMarketListing; seat: ShareMarketSeat };
@@ -700,9 +700,11 @@ export function ShareMarketBuyerCatalog({
       ) : null}
       <MarketPagination page={paged.page} pageCount={paged.pageCount} onPageChange={setPage} />
       {authed ? (
-        <ShareMarketRentalHistory
+        <AccountShareRentals
+          historyOnly
+          historyPageSize={5}
           subscriptions={history}
-          listings={mergedListings}
+          onChanged={onChanged}
           nextCursor={nextCursor}
           historyTotal={historyTotal}
           loadingMore={loadingMore}

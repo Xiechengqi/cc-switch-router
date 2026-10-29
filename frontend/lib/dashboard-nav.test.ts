@@ -6,7 +6,7 @@ import {
   normalizeDashboardPath,
   pathnameForDashboardShell,
   shareMarketHref,
-  accountNavHrefFromPathname, isAccountNavHref, PROVIDER_INCOME_HREF,
+  accountNavHrefFromPathname, isAccountNavHref, PROVIDER_ACCESS_HREF, PROVIDER_INCOME_HREF, providerCenterTab,
 } from "./dashboard-nav";
 
 test("Market Provider deep links use opaque query values without losing other scope", () => {
@@ -55,10 +55,21 @@ test("funds, Provider settings and compatibility routes have distinct destinatio
   assert.equal(normalizeDashboardPath("/account/payments/"), null);
 });
 test("Provider income has no retired route or navigation compatibility shim", () => {
-  assert.equal(PROVIDER_INCOME_HREF, "/account/provider-settings/#income");
+  assert.equal(PROVIDER_INCOME_HREF, "/account/provider-settings/?tab=income");
   assert.equal(isAccountNavHref("/account/earnings/"), false);
   assert.equal(accountNavHrefFromPathname("/account/earnings/"), null);
   assert.equal(existsSync(new URL("../app/(dashboard)/account/earnings/page.tsx", import.meta.url)), false);
   assert.equal(existsSync(new URL("../components/dashboard/account-earnings-page.tsx", import.meta.url)), false);
   assert.doesNotMatch(readFileSync(new URL("../components/dashboard/account-shell.tsx", import.meta.url), "utf8"), /getMarketProviderFinance|account\.nav\.earnings|hasEarnings/);
+});
+
+test("Provider center tabs come from the query and still honor the old income anchor", () => {
+  assert.equal(PROVIDER_ACCESS_HREF, "/account/provider-settings/?tab=access");
+  assert.equal(providerCenterTab("access"), "access");
+  assert.equal(providerCenterTab("contact", "#income"), "contact");
+  assert.equal(providerCenterTab(null, "#income"), "income");
+  assert.equal(providerCenterTab("unknown", ""), "access");
+  assert.equal(providerCenterTab(null), "access");
+  assert.equal(providerCenterTab(null, "", true), "income");
+  assert.equal(providerCenterTab("access", "", true), "access");
 });

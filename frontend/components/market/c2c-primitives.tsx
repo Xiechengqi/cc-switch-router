@@ -2,7 +2,7 @@
 /* Hallmark · component: C2C controls · genre: modern-minimal · theme: existing Router tokens
  * audience: wallet holders · use: explicit credit exchange · tone: concise, factual
  * states: default · hover · focus · active · disabled · loading · error · success
- * contrast: pass (40–41, scoped DOM checks) · mobile: pass (320/375/414/768, no screenshots)
+ * contrast: inherited Router tokens · responsive code reviewed; no visual verification in this revision
  * pre-emit critique: P5 H5 E4 S5 R5 V4 · component-scope: no macrostructure
  */
 import * as React from "react";
@@ -27,8 +27,16 @@ export function C2CStatusLabel({ status }: { status: C2CStatus }) {
   const { t } = useLocaleText();
   return <span className={`inline-flex w-fit max-w-full rounded-md px-2 py-1 text-xs font-medium ${status === "disputed" ? "bg-destructive/5 text-foreground" : status === "released" ? "bg-primary/10 text-primary" : "bg-muted text-foreground"}`}>{t(`c2c.status.${status}`)}</span>;
 }
-export function C2CDialog({ open, title, busy = false, onClose, children }: { open: boolean; title: string; busy?: boolean; onClose: () => void; children: React.ReactNode }) {
+export function C2CDialog({ open, title, busy = false, inline = false, onClose, children }: { open: boolean; title: string; busy?: boolean; inline?: boolean; onClose: () => void; children: React.ReactNode }) {
   const { t } = useLocaleText(); const dialog = React.useRef<HTMLDialogElement>(null); const heading = React.useId();
+  const inlineRegion = React.useRef<HTMLElement>(null);
+  React.useEffect(() => {
+    if (!inline || !open) return;
+    const previous = document.activeElement as HTMLElement | null;
+    inlineRegion.current?.focus({ preventScroll: true });
+    inlineRegion.current?.scrollIntoView({ block: "nearest" });
+    return () => { if (previous?.isConnected) previous.focus({ preventScroll: true }); };
+  }, [inline, open]);
   const backdropPointerDown = React.useRef(false);
   const outsideDialog = (event: React.MouseEvent<HTMLDialogElement>) => {
     const bounds = event.currentTarget.getBoundingClientRect();
@@ -38,7 +46,12 @@ export function C2CDialog({ open, title, busy = false, onClose, children }: { op
     const d = dialog.current; if (!d) return;
     if (open && !d.open) d.showModal(); else if (!open && d.open) d.close();
     return () => { if (d.open) d.close(); };
-  }, [open]);
+  }, [inline, open]);
+  const content = <div className="grid min-w-0 gap-4 p-4 sm:p-6">
+    <header className="flex min-w-0 items-start justify-between gap-2"><h2 id={heading} className="min-w-0 break-words text-lg font-semibold tracking-tight">{title}</h2><C2CAction type="button" secondary aria-label={t("common.close")} disabled={busy} onClick={onClose}><X className="size-4" aria-hidden="true" /></C2CAction></header>
+    {children}
+  </div>;
+  if (inline) return open ? <section ref={inlineRegion} role="region" tabIndex={-1} aria-labelledby={heading} className="min-w-0 border-t border-border outline-none focus-visible:outline-2 focus-visible:outline-ring">{content}</section> : null;
   return <dialog ref={dialog} aria-labelledby={heading} tabIndex={-1}
     onPointerDownCapture={e => { backdropPointerDown.current = e.target === e.currentTarget && outsideDialog(e); }}
     onPointerCancel={() => { backdropPointerDown.current = false; }}
@@ -60,9 +73,6 @@ export function C2CDialog({ open, title, busy = false, onClose, children }: { op
       if (backdrop && e.target === e.currentTarget && outsideDialog(e) && !busy) onClose();
     }}
     className="m-auto max-h-[90dvh] w-[calc(100%-2rem)] max-w-lg overflow-y-auto overscroll-contain rounded-xl bg-card p-0 text-foreground shadow-lg backdrop:bg-foreground/30">
-    <div className="grid min-w-0 gap-4 p-4 sm:p-6">
-      <header className="flex min-w-0 items-start justify-between gap-2"><h2 id={heading} className="min-w-0 break-words text-lg font-semibold tracking-tight">{title}</h2><C2CAction type="button" secondary aria-label={t("common.close")} disabled={busy} onClick={onClose}><X className="size-4" aria-hidden="true" /></C2CAction></header>
-      {children}
-    </div>
+    {content}
   </dialog>;
 }

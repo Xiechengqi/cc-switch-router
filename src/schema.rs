@@ -340,6 +340,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         99,
         include_str!("../schema/0099_client_market_rental_audit.sql"),
     ),
+    (
+        100,
+        include_str!("../schema/0100_market_payment_single_active_method.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -850,6 +854,96 @@ mod tests {
     use super::*;
 
     const CURRENT_SCHEMA_TABLE_COUNT: i64 = 262;
+
+    #[test]
+    fn migration_100_bounds_new_channel_activation_without_rewriting_live_orders() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 99);
+        // Historical duplicate active merchants remain valid during upgrade.
+        for id in ["first", "legacy"] {
+            conn.execute(
+                "INSERT INTO market_payment_channels
+                (id,gateway_kind,display_name,enabled,created_at,updated_at)
+                VALUES (?1,'dujiaopay',?1,1,'now','now')",
+                params![id],
+            )
+            .unwrap();
+        }
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM market_payment_channels WHERE rollout_state='live'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
+        // Edits and canary promotion on an existing activation remain possible.
+        conn.execute("UPDATE market_payment_channels SET display_name='Edited',rollout_state='canary' WHERE id='first'", []).unwrap();
+        conn.execute(
+            "UPDATE market_payment_channels SET rollout_state='live' WHERE id='first'",
+            [],
+        )
+        .unwrap();
+        for (enabled, rollout) in [(1, "off"), (0, "canary"), (1, "live")] {
+            assert!(
+                conn.execute(
+                    "INSERT INTO market_payment_channels
+                (id,gateway_kind,display_name,enabled,rollout_state,created_at,updated_at)
+                VALUES ('new','dujiaopay','New',?1,?2,'now','now')",
+                    params![enabled, rollout]
+                )
+                .is_err()
+            );
+        }
+        conn.execute(
+            "INSERT INTO market_payment_channels
+            (id,gateway_kind,display_name,enabled,rollout_state,archived_at,created_at,updated_at)
+            VALUES ('archived','dujiaopay','Archived',1,'live','now','now','now')",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "UPDATE market_payment_channels SET archived_at=NULL WHERE id='archived'",
+                []
+            )
+            .is_err()
+        );
+        conn.execute(
+            "UPDATE market_payment_channels SET enabled=0 WHERE id='first'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "UPDATE market_payment_channels SET enabled=1 WHERE id='first'",
+                []
+            )
+            .is_err()
+        );
+        conn.execute(
+            "UPDATE market_payment_channels SET enabled=0 WHERE id='legacy'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE market_payment_channels SET rollout_state='canary' WHERE id='first'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM market_journal_transactions",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
 
     #[test]
     fn migration_99_preserves_rental_history_without_inventing_old_host_metadata() {

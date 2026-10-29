@@ -11,10 +11,11 @@ import { formatMinorUsd } from "@/lib/market-wallet-money";
 import { notifyMarketBalanceChanged } from "@/lib/market-balance-events";
 import { C2C_PENDING_PREFIX, c2cDefinitelyRejected, c2cErrorKey, c2cBlockerKey, c2cNow, c2cPayLabel, createC2C, getC2COffers, getC2COrders, getC2CPolicy, matchC2CPendingOrder, parseC2CMinor, quoteC2C, readC2CPending, writeC2CPending, type C2COffer, type C2COrder, type C2CPending, type C2CPolicyView, type C2CQuote } from "@/lib/market-c2c";
 
-export function C2CBuyPanel({ actor, onOrder }: { actor: string; onOrder: (order: C2COrder) => void }) {
-  return <C2CBuyWorkspace key={actor} actor={actor} onOrder={onOrder} />;
+type C2CBuyProps = { actor: string; onOrder: (order: C2COrder) => void; onBusyChange?: (busy: boolean) => void; inlineConfirmation?: boolean };
+export function C2CBuyPanel({ actor, onOrder, onBusyChange, inlineConfirmation }: C2CBuyProps) {
+  return <C2CBuyWorkspace key={actor} actor={actor} onOrder={onOrder} onBusyChange={onBusyChange} inlineConfirmation={inlineConfirmation} />;
 }
-function C2CBuyWorkspace({ actor, onOrder }: { actor: string; onOrder: (order: C2COrder) => void }) {
+function C2CBuyWorkspace({ actor, onOrder, onBusyChange, inlineConfirmation = false }: C2CBuyProps) {
   const { t, locale } = useLocaleText();
   const [policy, setPolicy] = React.useState<C2CPolicyView | null>(null); const [offers, setOffers] = React.useState<C2COffer[]>([]);
   const [next, setNext] = React.useState<string | null>(null); const [sellerId, setSellerId] = React.useState(""); const [amount, setAmount] = React.useState("");
@@ -24,8 +25,22 @@ function C2CBuyWorkspace({ actor, onOrder }: { actor: string; onOrder: (order: C
   const [ack, setAck] = React.useState(false); const [busy, setBusy] = React.useState(false); const [error, setError] = React.useState("");
   const [loaded, setLoaded] = React.useState(false); const [now, setNow] = React.useState(c2cNow); const mounted = React.useRef(true); const lock = React.useRef(false);
   const sequence = React.useRef(0); const identity = React.useRef(actor); identity.current = actor;
+  const previewForm = React.useRef<HTMLFormElement>(null);
+  const inlineWasOpen = React.useRef(false);
   const seller = offers.find(s => s.sellerId === sellerId); const minor = parseC2CMinor(amount);
   const valid = !!seller && minor != null && minor >= seller.minMinor && minor <= seller.maxMinor;
+  React.useEffect(() => {
+    onBusyChange?.(busy || (!!quote && !pending));
+    return () => onBusyChange?.(false);
+  }, [busy, quote, pending, onBusyChange]);
+  React.useEffect(() => {
+    if (!inlineConfirmation) return;
+    if (quote && !pending) inlineWasOpen.current = true;
+    else if (!quote && !pending && !busy && inlineWasOpen.current) {
+      inlineWasOpen.current = false;
+      previewForm.current?.querySelector<HTMLButtonElement>('button[type="submit"]')?.focus({ preventScroll: true });
+    }
+  }, [busy, inlineConfirmation, pending, quote]);
   React.useEffect(() => { mounted.current = true; return () => { mounted.current = false; sequence.current++; }; }, [actor]);
   const load = React.useCallback(async (before = "") => {
     const seq = ++sequence.current;
@@ -66,7 +81,7 @@ function C2CBuyWorkspace({ actor, onOrder }: { actor: string; onOrder: (order: C
   };
   return <div className="grid min-w-0 gap-3" data-c2c-buy>
     <p className="text-sm text-muted-foreground">{t("c2c.intro")}</p>
-    <C2CError>{error}</C2CError>
+    <C2CError>{!quote || pending ? error : ""}</C2CError>
     {recoveryBlocked ? <C2CAction type="button" phase={busy ? "loading" : "default"} onClick={() => void run(async () => {
       const page = await getC2COrders({ role: "buyer", status: "active" });
       if (!mounted.current) return;
@@ -74,6 +89,7 @@ function C2CBuyWorkspace({ actor, onOrder }: { actor: string; onOrder: (order: C
       if (page.items[0]) { onOrder(page.items[0]); return; }
       sessionStorage.removeItem(C2C_PENDING_PREFIX + actor); setRecoveryBlocked(false); await load();
     })}>{t("c2c.checkExisting")}</C2CAction> : pending ? <div className="grid justify-items-start gap-2"><p className="text-sm">{t("c2c.uncertain")}</p><C2CAction type="button" phase={busy ? "loading" : "default"} onClick={() => void run(async () => { const page = await getC2COrders({ quoteId: pending.quote.id }); if (page.items[0]) done(pending, page.items[0]); else await submit(pending); })}>{t("c2c.recover")}</C2CAction></div> : <>
+      <div hidden={inlineConfirmation && !!quote} className={inlineConfirmation && !!quote ? "hidden" : "grid min-w-0 gap-3"}>
       {!loaded ? error ? <C2CAction type="button" secondary disabled={busy} onClick={() => void run(() => load())}>{t("common.reload")}</C2CAction> : <p role="status" className="text-sm text-muted-foreground">{t("common.loading")}</p> : !policy?.available ? <div className="grid justify-items-start gap-2">
         <p role="status" className="text-sm text-muted-foreground">{t(policy?.blockers[0] ? c2cBlockerKey(policy.blockers[0]) : "c2c.error.paused")}</p>
         <C2CAction type="button" secondary disabled={busy} onClick={() => void run(() => load())}>{t("common.reload")}</C2CAction>
@@ -88,7 +104,7 @@ function C2CBuyWorkspace({ actor, onOrder }: { actor: string; onOrder: (order: C
           </button>)}
         </div> : <p role="status" className="text-sm text-muted-foreground">{t(emptyReason ? `c2c.empty.${emptyReason}` : "c2c.empty")}</p>}
         {next ? <C2CAction type="button" secondary disabled={busy} onClick={() => void run(() => load(next))}>{t("common.next")}</C2CAction> : null}
-        {seller ? <form className="grid gap-3" onSubmit={e => { e.preventDefault(); if (!valid || !minor) return; void run(async () => { const q = await quoteC2C(seller.sellerId, minor); if (mounted.current) { setQuote(q); setNow(c2cNow()); setAck(false); } }); }}>
+        {seller ? <form ref={previewForm} className="grid gap-3" onSubmit={e => { e.preventDefault(); if (!valid || !minor) return; void run(async () => { const q = await quoteC2C(seller.sellerId, minor); if (mounted.current) { setQuote(q); setNow(c2cNow()); setAck(false); } }); }}>
           <C2CDescription value={seller.description} />
           <label className="grid min-w-0 gap-1 text-sm">{t("c2c.amount")}<input className={C2C_INPUT} inputMode="decimal" autoComplete="off" value={amount} onChange={e => setAmount(e.target.value)} placeholder={`${seller.minMinor / 100}–${seller.maxMinor / 100}`} disabled={busy} /></label>
           <C2CAction type="submit" disabled={!valid || busy} phase={busy ? "loading" : "default"}>{t("c2c.preview")}</C2CAction>
@@ -96,8 +112,9 @@ function C2CBuyWorkspace({ actor, onOrder }: { actor: string; onOrder: (order: C
         <p className="text-xs leading-5 text-muted-foreground">{t("c2c.statsHint")} {t("c2c.fee")}</p>
         {!policy.independentDisputeHandlerAvailable ? <details className="text-xs text-muted-foreground"><summary className="min-h-11 cursor-pointer py-3 focus-visible:outline-2 focus-visible:outline-ring">{t("c2c.reviewLimit")}</summary><p>{t("c2c.reviewLimitHelp")}</p></details> : null}
       </>}
+      </div>
     </>}
-    <C2CDialog open={!!quote && !pending} title={t("c2c.preview")} busy={busy} onClose={() => setQuote(null)}>
+    <C2CDialog open={!!quote && !pending} inline={inlineConfirmation} title={t("c2c.preview")} busy={busy} onClose={() => setQuote(null)}>
       {quote ? <>
         <p className="break-words text-sm">{quote.sellerName}</p>
         <C2CDescription value={quote.description} links={false} />

@@ -26,10 +26,14 @@ export function WalletTransferPanel({
   onTransferred,
   walletVersion,
   embedded = false,
+  onBusyChange,
+  inlineConfirmation = false,
 }: {
   onTransferred: () => Promise<void>;
   walletVersion: number;
   embedded?: boolean;
+  onBusyChange?: (busy: boolean) => void;
+  inlineConfirmation?: boolean;
 }) {
   const { t } = useLocaleText();
   const [capacity, setCapacity] = React.useState<TransferCapacity | null>(null);
@@ -43,10 +47,17 @@ export function WalletTransferPanel({
   const [now, setNow] = React.useState(Date.now());
   const [reload, setReload] = React.useState(0);
   const dialog = React.useRef<HTMLDialogElement>(null);
+  const inlineRegion = React.useRef<HTMLElement>(null);
+  const reviewForm = React.useRef<HTMLFormElement>(null);
+  const inlineWasOpen = React.useRef(false);
   const busyRef = React.useRef(false);
   const keyRef = React.useRef("");
   const amountMinor = parseNonNegativeUsdMinor(amount);
   const available = capacity?.transferableUnits ?? "0";
+  React.useEffect(() => {
+    onBusyChange?.(!!busy || !!quote);
+    return () => onBusyChange?.(false);
+  }, [busy, quote, onBusyChange]);
 
   React.useEffect(() => {
     let active = true;
@@ -63,10 +74,21 @@ export function WalletTransferPanel({
     };
   }, [walletVersion, reload]);
   React.useEffect(() => {
+    if (inlineConfirmation) {
+      if (quote && !inlineWasOpen.current) {
+        inlineWasOpen.current = true;
+        inlineRegion.current?.focus({ preventScroll: true });
+        inlineRegion.current?.scrollIntoView({ block: "nearest" });
+      } else if (!quote && !busy && inlineWasOpen.current) {
+        inlineWasOpen.current = false;
+        reviewForm.current?.querySelector<HTMLButtonElement>('button[type="submit"]')?.focus({ preventScroll: true });
+      }
+      return;
+    }
     if (quote && dialog.current && !dialog.current.open)
       dialog.current.showModal();
     if (!quote && dialog.current?.open) dialog.current.close();
-  }, [quote]);
+  }, [busy, inlineConfirmation, quote]);
   React.useEffect(() => {
     if (!quote) return;
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
@@ -153,6 +175,36 @@ export function WalletTransferPanel({
   };
   const expired = !!quote && Date.parse(quote.expiresAt) <= now;
   const enabled = capacity?.enabled && capacity.verified;
+  const confirmationContent = quote ? (
+    <div className="grid min-w-0 gap-5">
+      <h3 id="wallet-transfer-title" className="text-lg font-semibold">
+        {t("walletTransfer.review")}
+      </h3>
+      <div className="grid gap-2">
+        <p className="break-all text-base font-medium">{quote.recipientEmail}</p>
+        <p className="break-all text-3xl font-semibold tabular-nums">
+          {formatWalletUnits(quote.amountUnits)}
+        </p>
+        {BigInt(quote.amountUnits) % 86_400n !== 0n ? (
+          <p className="break-all text-xs text-muted-foreground">
+            {t("walletTransfer.exact", { units: quote.amountUnits })}
+          </p>
+        ) : null}
+        <p className="text-xs leading-5 text-muted-foreground">{t("walletTransfer.final")}</p>
+      </div>
+      {error ? <p role="alert" className="break-words text-sm text-destructive">{error}</p> : null}
+      {expired ? <p role="status" className="text-sm text-destructive">{t("walletTransfer.expired")}</p> : null}
+      <form onSubmit={confirm} className="grid min-w-0 gap-3">
+        <Button type="submit" variant="primary" className="min-h-11 whitespace-nowrap" isDisabled={!!busy || expired}>
+          {busy === "confirm" ? <Loader2 className="size-4 animate-spin motion-reduce:animate-none" aria-hidden /> : null}
+          {t("walletTransfer.confirm", { amount: formatWalletUnits(quote.amountUnits) })}
+        </Button>
+      </form>
+      <Button variant="ghost" className="min-h-11 whitespace-nowrap" isDisabled={!!busy} onPress={close}>
+        {t("common.close")}
+      </Button>
+    </div>
+  ) : null;
   return (
     <section id="wallet-transfer" className={embedded ? "grid min-w-0 gap-4" : "grid min-w-0 gap-4 rounded-xl border border-border bg-card p-5"}>
       <div>
@@ -199,7 +251,7 @@ export function WalletTransferPanel({
           )}
         </p>
       ) : (
-        <form onSubmit={review} className="grid min-w-0 gap-4 sm:grid-cols-2">
+        <form ref={reviewForm} onSubmit={review} hidden={inlineConfirmation && !!quote} className={inlineConfirmation && !!quote ? "hidden" : "grid min-w-0 gap-4 sm:grid-cols-2"}>
           <label className="grid min-w-0 gap-1 text-sm">
             <span>{t("walletTransfer.email")}</span>
             <input
@@ -265,7 +317,7 @@ export function WalletTransferPanel({
           </Button>
         </form>
       )}
-      <dialog
+      {inlineConfirmation ? (quote ? <section ref={inlineRegion} tabIndex={-1} aria-labelledby="wallet-transfer-title" className="grid min-w-0 gap-4 border-t border-border pt-4 outline-none focus-visible:outline-2 focus-visible:outline-ring">{confirmationContent}</section> : null) : <dialog
         ref={dialog}
         onCancel={(event) => {
           event.preventDefault();
@@ -277,54 +329,8 @@ export function WalletTransferPanel({
         className="fixed inset-0 m-auto h-fit max-h-[85dvh] w-[calc(100%-2rem)] max-w-md overflow-y-auto rounded-xl bg-card p-6 text-card-foreground shadow-lg backdrop:bg-foreground/30"
         aria-labelledby="wallet-transfer-title"
       >
-        {quote ? (
-          <div className="grid min-w-0 gap-5">
-            <h3 id="wallet-transfer-title" className="text-lg font-semibold">
-              {t("walletTransfer.review")}
-            </h3>
-            <div className="grid gap-2">
-              <p className="break-all text-base font-medium">
-                {quote.recipientEmail}
-              </p>
-              <p className="break-all text-3xl font-semibold tabular-nums">
-                {formatWalletUnits(quote.amountUnits)}
-              </p>
-              {BigInt(quote.amountUnits) % 86_400n !== 0n ? (
-                <p className="break-all text-xs text-muted-foreground">
-                  {t("walletTransfer.exact", { units: quote.amountUnits })}
-                </p>
-              ) : null}
-              <p className="text-xs leading-5 text-muted-foreground">
-                {t("walletTransfer.final")}
-              </p>
-            </div>
-            {error ? (
-              <p role="alert" className="break-words text-sm text-destructive">
-                {error}
-              </p>
-            ) : null}
-            {expired ? (
-              <p role="status" className="text-sm text-destructive">
-                {t("walletTransfer.expired")}
-              </p>
-            ) : null}
-            <form onSubmit={confirm} className="grid min-w-0 gap-3">
-              <Button type="submit" variant="primary" className="min-h-11 whitespace-nowrap" isDisabled={!!busy || expired}>
-                {busy === "confirm" ? <Loader2 className="size-4 animate-spin motion-reduce:animate-none" aria-hidden /> : null}
-                {t("walletTransfer.confirm", { amount: formatWalletUnits(quote.amountUnits) })}
-              </Button>
-            </form>
-            <Button
-              variant="ghost"
-              className="min-h-11 whitespace-nowrap"
-              isDisabled={!!busy}
-              onPress={close}
-            >
-              {t("common.close")}
-            </Button>
-          </div>
-        ) : null}
-      </dialog>
+        {confirmationContent}
+      </dialog>}
     </section>
   );
 }
