@@ -67,6 +67,9 @@ try {
       if (["/v1/account/payment-profile", "/v1/market-billing/dashboard"].includes(p)) { retiredSetupRequests++; return json(route, { message: "retired setup" }, 410); }
       if (p === "/v1/client-market/hosts") return json(route, [publicationHost]);
       if (p === "/v1/client-market/my-rentals") return json(route, []);
+      // The Provider center opens on what is rented out, Share listings included.
+      if (p === "/v1/share-market/me/listings") return json(route, { listings: [] });
+      if (p === "/v1/share-market/me/subscriptions") return json(route, { subscriptions: [], nextCursor: null, historyTotal: 0 });
       if (p === "/v1/client-market/terminations" || p === "/v1/admin/market/client-terminations") {
         assert.equal(request.method(), "GET");
         assert.equal(url.searchParams.get("openOnly"), p.startsWith("/v1/admin/") ? "true" : "false");

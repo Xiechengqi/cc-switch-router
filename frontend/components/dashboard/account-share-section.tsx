@@ -242,22 +242,25 @@ export function AccountShareSection({ role, focusId }: { role: AccountMarketRole
         role === "provider" ? getShareMarketOwnedListings(controller.signal) : null,
       ]);
       if (controller.signal.aborted || actorKeyRef.current !== requestedActorKey) return;
+      // A partial response must not take the section down with it.
+      const subscriptionPage = nextSubscriptions?.subscriptions ?? [];
+      const listings = nextListings?.listings ?? [];
       if (nextSubscriptions) {
         setSubscriptions((current) => silent
-          ? mergeShareMarketSubscriptionPage(current, nextSubscriptions.subscriptions, false)
-          : nextSubscriptions.subscriptions);
+          ? mergeShareMarketSubscriptionPage(current, subscriptionPage, false)
+          : subscriptionPage);
         setSubscriptionHistoryTotal(nextSubscriptions.historyTotal ?? 0);
         if (!silent || !expandedSubscriptionHistoryRef.current) {
           if (!silent) expandedSubscriptionHistoryRef.current = false;
           setSubscriptionCursor(nextSubscriptions.nextCursor || null);
         }
       }
-      if (nextListings) setOwnedListings(nextListings.listings);
+      if (nextListings) setOwnedListings(listings);
       rememberView<AccountShareView>(accountShareViewKey(role, requestedActorKey), {
-        subscriptions: nextSubscriptions?.subscriptions ?? [],
+        subscriptions: subscriptionPage,
         subscriptionCursor: nextSubscriptions?.nextCursor || null,
         subscriptionHistoryTotal: nextSubscriptions?.historyTotal ?? 0,
-        ownedListings: nextListings?.listings ?? [],
+        ownedListings: listings,
       });
       setLoadedActorKey(requestedActorKey);
       setFailedActorKey(null);
@@ -290,7 +293,7 @@ export function AccountShareSection({ role, focusId }: { role: AccountMarketRole
         || actorKeyRef.current !== requestedActorKey
         || subscriptionHistoryGenerationRef.current !== requestedGeneration) return;
       expandedSubscriptionHistoryRef.current = true;
-      setSubscriptions((current) => mergeShareMarketSubscriptionPage(current, page.subscriptions, true));
+      setSubscriptions((current) => mergeShareMarketSubscriptionPage(current, page.subscriptions ?? [], true));
       setSubscriptionCursor(page.nextCursor || null);
       setSubscriptionHistoryTotal(page.historyTotal ?? 0);
     } catch (reason) {
