@@ -6,6 +6,7 @@
 import * as React from "react";
 import { Alert, Button, Modal } from "@heroui/react";
 import { Loader2 } from "lucide-react";
+import { CompactSelect } from "@/components/common/compact-select";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   MARKET_PAYMENT_TOKEN_IDS,
@@ -15,7 +16,6 @@ import {
 } from "@/lib/market-wallet-api";
 import { formatMinorUsd, parseNonNegativeUsdMinor } from "@/lib/market-wallet-money";
 import { paymentTokenLabel } from "@/lib/market-payment-tokens";
-import { WALLET_INPUT } from "@/components/market/wallet-primitives";
 import { OWNER_DIALOG_CLASS, OwnerField, ownerErrorText } from "@/components/settings/market-finance-shared";
 
 function minorToInput(minor: number | null | undefined) {
@@ -110,13 +110,11 @@ export function MarketChannelSettingsDialog({ channel, onClose, onSaved }: {
           <form onSubmit={(event) => void submit(event)}>
             <Modal.Body className="grid max-h-[65vh] gap-4 overflow-y-auto text-sm">
               {channel ? <p className="font-medium">{channel.displayName}</p> : null}
-              <label className="grid gap-1">
+              <div className="grid gap-1">
                 <span className="font-medium">{t("settings.marketFinance.channel.orderMode")}</span>
-                <select autoFocus value={orderMode} onChange={(event) => setOrderMode(event.target.value as MarketTopupOrderMode)} className={WALLET_INPUT}>
-                  <option value="cashier">{t("settings.marketFinance.channel.orderMode.cashier")}</option>
-                  <option value="direct">{t("settings.marketFinance.channel.orderMode.direct")}</option>
-                </select>
-              </label>
+                <CompactSelect autoFocus ariaLabel={t("settings.marketFinance.channel.orderMode")} className="w-full" triggerClassName="h-11" value={orderMode} onChange={value => setOrderMode(value as MarketTopupOrderMode)}
+                  options={[{ value: "cashier", label: t("settings.marketFinance.channel.orderMode.cashier") }, { value: "direct", label: t("settings.marketFinance.channel.orderMode.direct") }]} />
+              </div>
               <fieldset className="grid gap-2" aria-describedby={methodsInvalid ? "channel-methods-error" : undefined}>
                 <legend className="mb-1 font-medium">{t("settings.marketFinance.channel.methods")}</legend>
                 <div className="grid grid-cols-1 gap-1 sm:grid-cols-2">

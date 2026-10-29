@@ -19,6 +19,7 @@ export function CompactSelect({
   onChange,
   ariaLabel,
   disabled = false,
+  autoFocus = false,
   className,
   triggerClassName,
 }: {
@@ -27,22 +28,32 @@ export function CompactSelect({
   onChange: (value: string) => void;
   ariaLabel: string;
   disabled?: boolean;
+  autoFocus?: boolean;
   className?: string;
   triggerClassName?: string;
 }) {
+  const trigger = React.useRef<HTMLButtonElement>(null);
+  const [portalContainer, setPortalContainer] = React.useState<HTMLDialogElement>();
+  React.useEffect(() => {
+    // Native modal dialogs make body portals inert. Keep their dropdowns in
+    // the same top layer so options remain visible, focusable and clickable.
+    setPortalContainer(trigger.current?.closest("dialog") ?? undefined);
+  }, []);
   const selected = options.find((option) => option.value === value) || options[0];
   return (
     <Select
       selectedKey={value === "" ? EMPTY_KEY : value}
       isDisabled={disabled}
       aria-label={ariaLabel}
-      className={className}
+      className={cn("min-w-0", className)}
       onSelectionChange={(key: React.Key | null) => {
         const next = String(key || "");
         if (next) onChange(next === EMPTY_KEY ? "" : next);
       }}
     >
       <Select.Trigger
+        ref={trigger}
+        autoFocus={autoFocus}
         className={cn(
           "min-h-9 gap-3 rounded-lg border bg-white px-3 text-xs shadow-sm",
           selected?.content ? undefined : selected?.description && "py-2",
@@ -65,7 +76,10 @@ export function CompactSelect({
         </Select.Value>
         <Select.Indicator className="ml-1 shrink-0 text-muted-foreground" />
       </Select.Trigger>
-      <Select.Popover className="min-w-[var(--trigger-width)] bg-white text-foreground">
+      <Select.Popover
+        UNSTABLE_portalContainer={portalContainer}
+        className="light min-w-[var(--trigger-width)] max-w-[calc(100vw-2rem)] bg-white text-foreground"
+      >
         <ListBox aria-label={ariaLabel}>
           {options.map((option) => (
             <ListBox.Item

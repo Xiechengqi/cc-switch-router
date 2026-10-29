@@ -5,6 +5,7 @@
  * pre-emit critique: P5 H5 E4 S5 R5 V4 · component-scope: no macrostructure
  */
 import * as React from "react";
+import { CompactSelect } from "@/components/common/compact-select";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { C2CAction, C2CCheck, C2CError, C2C_INPUT } from "@/components/market/c2c-primitives";
 import { C2C_DESCRIPTION_MAX, C2C_TERMS_VERSION, c2cErrorKey, c2cBlockerKey, parseC2CMinor, saveC2CSeller, validC2CDescription, type C2CPolicyView, type C2CSeller, type C2CSellerSnapshot } from "@/lib/market-c2c";
@@ -89,7 +90,8 @@ export function C2CSellerPanel({ policy, snapshot, availabilityError, onRefresh,
         <span className="mt-1 block text-xs text-muted-foreground">{t("c2c.rate", { rate: bps != null ? bps / 100 : "—", currency })} · {t("c2c.range", { min: low != null ? formatMinorUsd(low) : "—", max: high != null ? formatMinorUsd(high) : "—" })}</span>
       </summary>
       <div className="grid min-w-0 gap-3 pt-3 sm:grid-cols-2">
-        <label className="grid min-w-0 gap-1 text-sm">{t("c2c.currency")}<select className={C2C_INPUT} value={currency} disabled={busy} onChange={event => setCurrency(event.target.value as "USD" | "CNY")}><option value="USD">USD</option><option value="CNY">CNY</option></select></label>
+        <div className="grid min-w-0 gap-1 text-sm"><span>{t("c2c.currency")}</span><CompactSelect ariaLabel={t("c2c.currency")} className="w-full" triggerClassName="h-11" value={currency} disabled={busy} onChange={value => setCurrency(value as "USD" | "CNY")}
+          options={[{ value: "USD", label: "USD" }, { value: "CNY", label: "CNY" }]} /></div>
         <label className="grid min-w-0 gap-1 text-sm">{t("c2c.price")}<input className={C2C_INPUT} inputMode="decimal" value={price} disabled={busy} onChange={event => setPrice(event.target.value)} required /></label>
         <label className="grid min-w-0 gap-1 text-sm">{t("c2c.min")}<input className={C2C_INPUT} inputMode="decimal" value={min} disabled={busy} onChange={event => setMin(event.target.value)} required /></label>
         <label className="grid min-w-0 gap-1 text-sm">{t("c2c.max")}<input className={C2C_INPUT} inputMode="decimal" value={max} disabled={busy} onChange={event => setMax(event.target.value)} required /></label>

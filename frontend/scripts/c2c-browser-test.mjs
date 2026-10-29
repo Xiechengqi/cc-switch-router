@@ -198,9 +198,13 @@ try {
       if (document.documentElement.scrollWidth > innerWidth + 1) issues.push("page horizontal overflow");
       for (const el of [root, ...root.querySelectorAll("button,input,select,textarea,p,dt,dd,h2,h3")]) {
         if (!el.getClientRects().length) continue;
+        // React Aria keeps clipped autofill controls and screen-reader-only
+        // dismiss buttons. Visible triggers and options still get every check.
+        if (el.closest('[data-testid="hidden-select-container"][aria-hidden="true"]')) continue;
+        if (el.matches('button[tabindex="-1"]') && getComputedStyle(el.parentElement).clipPath === "inset(50%)") continue;
         const r = el.getBoundingClientRect();
         if (r.left < -1 || r.right > innerWidth + 1) issues.push(`${el.tagName}: ${(el.textContent || "").slice(0, 50)} overflow`);
-        if (["BUTTON", "INPUT", "SELECT"].includes(el.tagName) && !["checkbox", "radio"].includes(el.type) && r.height < 43.9) issues.push(`short target ${el.tagName}`);
+        if (["BUTTON", "INPUT", "SELECT"].includes(el.tagName) && !["checkbox", "radio"].includes(el.type) && r.height < 43.9) issues.push(`short target ${el.tagName} ${el.className}: ${r.height}px`);
         // Seller selectors contain multiple distinct rows; action labels
         // themselves must remain single-line at every breakpoint.
         if (el.matches("button[data-state]") && getComputedStyle(el).whiteSpace !== "nowrap") issues.push("action label can wrap");
@@ -219,7 +223,7 @@ try {
       const bg = el => { if (!el) return [1, 1, 1]; const c = rgb(getComputedStyle(el).backgroundColor); const behind = c[3] < 1 ? bg(el.parentElement) : c; return c.slice(0, 3).map((v, i) => v * c[3] + behind[i] * (1 - c[3])); };
       const lum = c => c.slice(0, 3).map(v => v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4).reduce((s, v, i) => s + v * [0.2126, 0.7152, 0.0722][i], 0);
       const ratio = (a, b) => { const l = [lum(a), lum(b)].sort((a, b) => b - a); return (l[0] + 0.05) / (l[1] + 0.05); };
-      const checks = [...root.querySelectorAll("h2,h3,p,span,button,input,textarea,select,dt,dd")].filter(el => el.getClientRects().length && !el.closest(":disabled") && (["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName) || [...el.childNodes].some(n => n.nodeType === Node.TEXT_NODE && n.textContent.trim()))).map(el => ({ label: (el.value || el.textContent).slice(0, 65), ratio: ratio(rgb(getComputedStyle(el).color), bg(el)), minimum: 4.5 }));
+      const checks = [...root.querySelectorAll("h2,h3,p,span,button,input,textarea,select,dt,dd")].filter(el => el.getClientRects().length && !el.closest(":disabled") && !el.closest('[data-testid="hidden-select-container"][aria-hidden="true"]') && (["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName) || [...el.childNodes].some(n => n.nodeType === Node.TEXT_NODE && n.textContent.trim()))).map(el => ({ label: (el.value || el.textContent).slice(0, 65), ratio: ratio(rgb(getComputedStyle(el).color), bg(el)), minimum: 4.5 }));
       const focused = root.querySelector(":focus-visible");
       if (focused) checks.push({ label: "keyboard focus outline", ratio: ratio(rgb(getComputedStyle(focused).outlineColor), bg(focused.parentElement)), minimum: 3 });
       return checks;
@@ -406,8 +410,17 @@ try {
   await adminPanel.getByText("C2C settings", { exact: true }).waitFor();
   await adminPanel.getByLabel("Opening balance threshold (USD)").fill("150"); await adminPanel.getByRole("button", { name: "Save", exact: true }).click(); assert.equal(policy.admissionMinor, 15000);
   await adminPanel.locator("summary").filter({ hasText: "C2C disputes & late payments" }).click(); await adminPanel.getByRole("button", { name: new RegExp(unpaid.id) }).click();
-  const adjudication = owner.page.getByRole("dialog", { name: "Evidence-based resolution" }); await adjudication.getByLabel("Evidence-based resolution").selectOption("return_to_seller");
+  const adjudication = owner.page.getByRole("dialog", { name: "Evidence-based resolution" });
+  await adjudication.getByRole("button", { name: /Evidence-based resolution/ }).click();
+  await adjudication.getByRole("option", { name: "Return reservation to seller", exact: true }).click();
   await adjudication.getByLabel("Explanation / evidence reference").fill("Both parties confirm no payment. External reference recorded."); await adjudication.getByRole("checkbox").check();
+  await adjudication.getByRole("button", { name: /Evidence-based resolution/ }).click();
+  await adjudication.getByRole("option", { name: "—", exact: true }).click();
+  assert.equal(await adjudication.getByRole("checkbox").isChecked(), false, "clearing a decision also clears its confirmation");
+  assert.equal(await adjudication.getByRole("button", { name: "Save", exact: true }).isDisabled(), true);
+  await adjudication.getByRole("button", { name: /Evidence-based resolution/ }).click();
+  await adjudication.getByRole("option", { name: "Return reservation to seller", exact: true }).click();
+  await adjudication.getByRole("checkbox").check();
   for (const width of [320, 375, 414, 768]) { await owner.page.setViewportSize({ width, height: 900 }); await geometry(owner.page, "dialog[open]"); }
   await adjudication.getByRole("button", { name: "Save", exact: true }).click(); await adjudication.getByText("Cancelled", { exact: true }).waitFor(); assert.equal(resolution, 1);
   await adjudication.getByRole("button", { name: "Close", exact: true }).click();
@@ -419,18 +432,18 @@ try {
   const handler = await open("handler", "en", true); await handler.page.goto(`${base}/settings/?panel=market_finance&c2cOrder=${early.id}`);
   let handlerDialog = handler.page.getByRole("dialog", { name: "Evidence-based resolution" });
   await handlerDialog.getByText("In dispute", { exact: true }).waitFor();
-  assert.equal(await handlerDialog.getByLabel("Evidence-based resolution").isDisabled(), false);
+  assert.equal(await handlerDialog.getByRole("button", { name: /Evidence-based resolution/ }).isDisabled(), false);
   assert.equal(await handler.page.locator("[data-c2c-admin]").getByLabel("Opening balance threshold (USD)").isDisabled(), true);
   await handlerSection.getByRole("button", { name: "Revoke", exact: true }).click();
   await handlerSection.getByText(/Revoked/).waitFor(); await handler.page.reload();
   handlerDialog = handler.page.getByRole("dialog", { name: "Evidence-based resolution" });
   await handlerDialog.getByText(/Only the Owner/).waitFor();
-  assert.equal(await handlerDialog.getByLabel("Evidence-based resolution").isDisabled(), true); await handler.context.close();
+  assert.equal(await handlerDialog.getByRole("button", { name: /Evidence-based resolution/ }).isDisabled(), true); await handler.context.close();
   const ownerTrade = { ...makeOrder({ ...latestQuote, id: "owner-trade" }, "buyer"), sellerId: "owner", status: "disputed", paidAt: new Date().toISOString(), latePaymentReported: true };
   orders.unshift(ownerTrade); await owner.page.goto(`${base}/settings/?panel=market_finance&c2cOrder=${ownerTrade.id}`);
   const ownerConflict = owner.page.getByRole("dialog", { name: "Evidence-based resolution" });
   await ownerConflict.getByText("You are a party to this order and cannot adjudicate it.", { exact: true }).waitFor();
-  assert.equal(await ownerConflict.getByLabel("Evidence-based resolution").isDisabled(), true);
+  assert.equal(await ownerConflict.getByRole("button", { name: /Evidence-based resolution/ }).isDisabled(), true);
   // Independent resolutions finish these mock exceptional trades before
   // exercising the separate empty-order storage recovery scenario below.
   for (const o of [early, ownerTrade]) { o.status = "cancelled"; o.latePaymentResolved = true; o.version++; }
@@ -478,10 +491,40 @@ try {
       for (const width of [320, 375, 414, 768]) { await zhSeller.page.setViewportSize({ width, height: 900 }); await geometry(zhSeller.page, "dialog[open]"); }
     }
   }
-  await zhEditor.getByLabel("C2C 描述", { exact: true }).fill(""); await zhEditor.getByRole("combobox").focus();
+  // The shared Select must stay in the native dialog's top layer. Exercise
+  // real visible options, keyboard selection, dismissal and focus return.
+  const currencySelect = zhEditor.getByRole("button", { name: /收款币种/ });
+  for (const width of [320, 375, 414, 768]) {
+    await zhSeller.page.setViewportSize({ width, height: 900 });
+    await currencySelect.click();
+    const list = zhEditor.getByRole("listbox");
+    await list.waitFor();
+    const box = await list.boundingBox();
+    assert.ok(box.x >= 0 && box.x + box.width <= width + 1, `currency dropdown overflow at ${width}`);
+    await zhEditor.getByRole("option", { name: "CNY", exact: true }).click();
+    await list.waitFor({ state: "detached" });
+    assert.equal(await currencySelect.innerText(), "CNY");
+    await currencySelect.click();
+    await list.waitFor();
+    await zhSeller.page.keyboard.press("Escape");
+    await list.waitFor({ state: "detached" });
+    assert.equal(await zhEditor.isVisible(), true, "Escape closes only the dropdown");
+    assert.equal(await currencySelect.evaluate(el => el === document.activeElement), true);
+    await currencySelect.press("ArrowDown");
+    await list.waitFor();
+    await zhSeller.page.keyboard.press("Home");
+    await zhSeller.page.keyboard.press("Enter");
+    await list.waitFor({ state: "detached" });
+    assert.equal(await currencySelect.innerText(), "USD");
+  }
+  await zhEditor.getByLabel("C2C 描述", { exact: true }).fill(""); await zhEditor.getByRole("button", { name: /收款币种/ }).focus();
   assert.equal(await zhEditor.getByLabel("C2C 描述", { exact: true }).getAttribute("aria-invalid"), "true");
   await zhEditor.getByText("请填写不超过 300 字的单行描述。", { exact: true }).waitFor();
   await zhSeller.page.keyboard.press("Escape"); await zhEditor.waitFor({ state: "hidden" });
+  await zhSeller.page.getByRole("group", { name: "C2C", exact: true }).getByRole("button", { name: "出售余额", exact: true }).click();
+  await zhEditor.waitFor();
+  await zhSeller.page.mouse.click(1, 1);
+  await zhEditor.waitFor({ state: "hidden" });
   await zhSeller.context.close();
   // Publication and transfer controls must stay available without official
   // recharge. No legacy payment profile is consulted in any mode.

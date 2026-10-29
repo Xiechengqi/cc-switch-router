@@ -10,6 +10,7 @@ import { Loader2, RefreshCw } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
+import { CompactSelect } from "@/components/common/compact-select";
 import { WALLET_INPUT } from "@/components/market/wallet-primitives";
 import {
   approveMarketAccessRequest,
@@ -187,27 +188,21 @@ function AccountMarketAccessEditor() {
             </h3>
             <div className="grid gap-3 sm:grid-cols-2">
               {data.policies.map((policy) => (
-                <label key={key(policy)} className="grid min-w-0 gap-1 text-sm">
+                <div key={key(policy)} className="grid min-w-0 gap-1 text-sm">
                   <span>{label(policy)}</span>
-                  <select
-                    className={WALLET_INPUT}
+                  <CompactSelect
+                    ariaLabel={label(policy)} className="w-full" triggerClassName="h-11"
                     value={policy.mode}
                     disabled={busy}
-                    onChange={(event) =>
+                    onChange={(value) =>
                       savePolicy(
                         policy,
-                        event.target.value as "whitelist" | "blacklist",
+                        value as "whitelist" | "blacklist",
                       )
                     }
-                  >
-                    <option value="whitelist">
-                      {t("marketAccess.mode.whitelist")}
-                    </option>
-                    <option value="blacklist">
-                      {t("marketAccess.mode.blacklist")}
-                    </option>
-                  </select>
-                </label>
+                    options={[{ value: "whitelist", label: t("marketAccess.mode.whitelist") }, { value: "blacklist", label: t("marketAccess.mode.blacklist") }]}
+                  />
+                </div>
               ))}
             </div>
           </div>
@@ -395,36 +390,29 @@ function AccountMarketAccessEditor() {
                   </div>
                   <div className="grid min-w-0 gap-3 sm:grid-cols-2">
                     {SCOPES.map((scope) => (
-                      <label
+                      <div
                         key={key(scope)}
                         className="grid min-w-0 gap-1 text-xs"
                       >
                         <span>{label(scope)}</span>
-                        <select
-                          className={WALLET_INPUT}
+                        <CompactSelect
+                          ariaLabel={label(scope)} className="w-full" triggerClassName="h-11"
                           value={
                             buyer.accessRules.find(
                               (item) => key(item) === key(scope),
                             )?.decision || "inherit"
                           }
                           disabled={busy || buyer.status === "revoked"}
-                          onChange={(event) =>
+                          onChange={(value) =>
                             saveRule(
                               buyer,
                               scope,
-                              event.target.value as MarketAccessDecision,
+                              value as MarketAccessDecision,
                             )
                           }
-                        >
-                          {(["inherit", "allow", "deny"] as const).map(
-                            (decision) => (
-                              <option value={decision} key={decision}>
-                                {t(`marketAccess.decision.${decision}`)}
-                              </option>
-                            ),
-                          )}
-                        </select>
-                      </label>
+                          options={(["inherit", "allow", "deny"] as const).map(value => ({ value, label: t(`marketAccess.decision.${value}`) }))}
+                        />
+                      </div>
                     ))}
                   </div>
                 </div>

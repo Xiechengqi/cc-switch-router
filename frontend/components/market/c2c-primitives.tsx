@@ -29,22 +29,36 @@ export function C2CStatusLabel({ status }: { status: C2CStatus }) {
 }
 export function C2CDialog({ open, title, busy = false, onClose, children }: { open: boolean; title: string; busy?: boolean; onClose: () => void; children: React.ReactNode }) {
   const { t } = useLocaleText(); const dialog = React.useRef<HTMLDialogElement>(null); const heading = React.useId();
+  const backdropPointerDown = React.useRef(false);
+  const outsideDialog = (event: React.MouseEvent<HTMLDialogElement>) => {
+    const bounds = event.currentTarget.getBoundingClientRect();
+    return event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom;
+  };
   React.useEffect(() => {
     const d = dialog.current; if (!d) return;
     if (open && !d.open) d.showModal(); else if (!open && d.open) d.close();
     return () => { if (d.open) d.close(); };
   }, [open]);
   return <dialog ref={dialog} aria-labelledby={heading} tabIndex={-1}
+    onPointerDownCapture={e => { backdropPointerDown.current = e.target === e.currentTarget && outsideDialog(e); }}
+    onPointerCancel={() => { backdropPointerDown.current = false; }}
     onKeyDown={e => {
-      if (e.key !== "Tab") return;
+      if (e.key !== "Tab" || e.defaultPrevented) return;
       const d = e.currentTarget;
-      const targets = [...d.querySelectorAll<HTMLElement>('a[href],button,input,select,textarea,[tabindex]')].filter(el => el.tabIndex >= 0 && !el.matches(":disabled") && el.getClientRects().length > 0);
+      const targets = [...d.querySelectorAll<HTMLElement>('a[href],button,input,select,textarea,[tabindex]')].filter(el => el.tabIndex >= 0 && !el.matches(":disabled") && !el.closest("[inert]") && el.getClientRects().length > 0);
       const first = targets[0]; const last = targets[targets.length - 1];
       if (!first) { e.preventDefault(); d.focus(); }
       else if (e.shiftKey && (document.activeElement === first || document.activeElement === d)) { e.preventDefault(); last.focus(); }
       else if (!e.shiftKey && (document.activeElement === last || document.activeElement === d)) { e.preventDefault(); first.focus(); }
     }}
-    onCancel={e => { e.preventDefault(); if (!busy) onClose(); }} onClick={e => { if (e.target === e.currentTarget && !busy) onClose(); }}
+    onCancel={e => { e.preventDefault(); if (!busy) onClose(); }} onClick={e => {
+      // A Select opens on pointerdown and makes its siblings inert. The browser
+      // may then retarget pointerup/click to this dialog; that is not a backdrop
+      // click. Dismiss only a gesture that started and ended on the backdrop.
+      const backdrop = backdropPointerDown.current;
+      backdropPointerDown.current = false;
+      if (backdrop && e.target === e.currentTarget && outsideDialog(e) && !busy) onClose();
+    }}
     className="m-auto max-h-[90dvh] w-[calc(100%-2rem)] max-w-lg overflow-y-auto overscroll-contain rounded-xl bg-card p-0 text-foreground shadow-lg backdrop:bg-foreground/30">
     <div className="grid min-w-0 gap-4 p-4 sm:p-6">
       <header className="flex min-w-0 items-start justify-between gap-2"><h2 id={heading} className="min-w-0 break-words text-lg font-semibold tracking-tight">{title}</h2><C2CAction type="button" secondary aria-label={t("common.close")} disabled={busy} onClick={onClose}><X className="size-4" aria-hidden="true" /></C2CAction></header>

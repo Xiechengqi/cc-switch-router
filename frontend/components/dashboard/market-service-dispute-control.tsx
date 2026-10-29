@@ -7,6 +7,7 @@
 
 import * as React from "react";
 import { Button } from "@heroui/react";
+import { CompactSelect } from "@/components/common/compact-select";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { openMarketServiceDispute } from "@/lib/market-wallet-api";
 
@@ -49,13 +50,11 @@ export function MarketServiceDisputeControl({ contractId, initiallyOpen, onChang
     </summary>
     <form className="grid max-w-sm gap-2 pb-2" onSubmit={(event) => void submit(event)}>
       <p className="text-muted-foreground">{t("marketWallet.disputeHelp")}</p>
-      <label className="grid gap-1">
+      <div className="grid gap-1">
         <span>{t("marketWallet.disputeReason")}</span>
-        <select value={reason} onChange={(event) => setReason(event.target.value as (typeof REASONS)[number])}
-          className="h-11 min-w-0 rounded-md border border-input bg-background px-3 focus-visible:outline-2 focus-visible:outline-ring">
-          {REASONS.map((item) => <option key={item} value={item}>{t(`marketWallet.disputeReason.${item}`)}</option>)}
-        </select>
-      </label>
+        <CompactSelect ariaLabel={t("marketWallet.disputeReason")} className="w-full" triggerClassName="h-11" value={reason} onChange={value => setReason(value as (typeof REASONS)[number])}
+          options={REASONS.map(value => ({ value, label: t(`marketWallet.disputeReason.${value}`) }))} />
+      </div>
       {error ? <p role="alert" className="text-destructive">{error}</p> : null}
       <Button type="submit" size="sm" variant="outline" isDisabled={busy} className="min-h-11 justify-self-start whitespace-nowrap">
         {busy ? t("common.loading") : t("marketWallet.submitDispute")}

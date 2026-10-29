@@ -3,6 +3,7 @@
 import * as React from "react";
 import { Button, Modal } from "@heroui/react";
 import { useAuth } from "@/components/auth/auth-provider";
+import { CompactSelect } from "@/components/common/compact-select";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ProvisionJobLog } from "@/components/dashboard/provision-job-log";
 import { cleanupClientMarketProviderRental, getClientMarketJob } from "@/lib/api";
@@ -215,9 +216,8 @@ function TerminationDialogContent({ actor, id, initialRole, initialAction, onClo
           <p className="text-xs">{t("clientTermination.reason")}: {t(current.reason === "provider_issue" ? "clientTermination.providerIssue" : current.reason === "platform_issue" ? "clientTermination.platformIssue" : current.reason === "voluntary" ? "clientTermination.voluntary" : "clientTermination.systemExit")}</p>
           {current.claim ? <p className="whitespace-pre-wrap break-words rounded-lg bg-muted p-3 text-sm">{current.claim}</p> : null}
           {current.disputeDeadlineAt && current.responsibility === "undetermined" && !current.providerRespondedAt ? <p className="text-xs">{t("clientTermination.responseDeadline")}: {date(current.disputeDeadlineAt)}</p> : null}
-          {(["buyer", "provider", "owner"] as const).filter(value => current.permissions[value]).length > 1 ? <label className="grid gap-1 text-xs">{t("clientTermination.actingAs")}<select aria-label={t("clientTermination.actingAs")} className={WALLET_INPUT} value={role} disabled={busy || !!action} onChange={e => setRole(e.target.value as ClientTerminationRole)}>
-            {(["buyer", "provider", "owner"] as const).filter(value => current.permissions[value]).map(value => <option key={value} value={value}>{t(`clientTermination.role.${value}`)}</option>)}
-          </select></label> : null}
+          {(["buyer", "provider", "owner"] as const).filter(value => current.permissions[value]).length > 1 ? <div className="grid gap-1 text-xs"><span>{t("clientTermination.actingAs")}</span><CompactSelect ariaLabel={t("clientTermination.actingAs")} className="w-full" triggerClassName="h-11" value={role} disabled={busy || !!action} onChange={value => setRole(value as ClientTerminationRole)}
+            options={(["buyer", "provider", "owner"] as const).filter(value => current.permissions[value]).map(value => ({ value, label: t(`clientTermination.role.${value}`) }))} /></div> : null}
           {!action ? <div className="flex flex-wrap gap-2">{([
             ["decision", role === "owner" ? "clientTermination.resolve" : "clientTermination.waive"],
             ["respond", "clientTermination.respond"], ["dispute", "clientTermination.dispute"], ["withdraw", "clientTermination.withdraw"],
@@ -227,9 +227,11 @@ function TerminationDialogContent({ actor, id, initialRole, initialAction, onClo
           {action ? <section className="grid gap-3 rounded-lg border border-border p-3" aria-label={t("clientTermination.handle")}>
             {action === "withdraw" ? <p className="text-sm leading-6">{t("clientTermination.withdrawHelp", { amount: money(cap) })}</p>
               : action === "decision" ? <>
-                <label className="grid gap-1 text-sm">{t("clientTermination.award")}<select aria-label={t("clientTermination.award")} className={WALLET_INPUT} disabled={busy} value={awardChoice} onChange={e => setAwardChoice(e.target.value)}><option value="zero">{t("clientTermination.waiveAll")}</option>{role === "owner" ? <option value="full">{t("clientTermination.fullAward")}</option> : null}<option value="custom">{t("clientTermination.customAward")}</option></select></label>
+                <div className="grid gap-1 text-sm"><span>{t("clientTermination.award")}</span><CompactSelect ariaLabel={t("clientTermination.award")} className="w-full" triggerClassName="h-11" disabled={busy} value={awardChoice} onChange={setAwardChoice}
+                  options={[{ value: "zero", label: t("clientTermination.waiveAll") }, ...(role === "owner" ? [{ value: "full", label: t("clientTermination.fullAward") }] : []), { value: "custom", label: t("clientTermination.customAward") }]} /></div>
                 {awardChoice === "custom" ? <label className="grid gap-1 text-sm">{t("clientTermination.customAward")}<input aria-label={t("clientTermination.customAward")} className={WALLET_INPUT} disabled={busy} inputMode="decimal" value={customAward} onChange={e => setCustomAward(e.target.value)} /></label> : null}
-                {role === "owner" && awardChoice === "zero" ? <label className="grid gap-1 text-sm">{t("clientTermination.responsibility")}<select aria-label={t("clientTermination.responsibility")} className={WALLET_INPUT} disabled={busy} value={responsibility} onChange={e => setResponsibility(e.target.value)}><option value="provider">{t("clientTermination.provider")}</option><option value="platform">{t("clientTermination.platform")}</option><option value="none">{t("clientTermination.none")}</option></select></label> : null}
+                {role === "owner" && awardChoice === "zero" ? <div className="grid gap-1 text-sm"><span>{t("clientTermination.responsibility")}</span><CompactSelect ariaLabel={t("clientTermination.responsibility")} className="w-full" triggerClassName="h-11" disabled={busy} value={responsibility} onChange={setResponsibility}
+                  options={[{ value: "provider", label: t("clientTermination.provider") }, { value: "platform", label: t("clientTermination.platform") }, { value: "none", label: t("clientTermination.none") }]} /></div> : null}
                 {validAward ? <p className="text-xs leading-5" data-testid="termination-award-preview">{t("clientTermination.awardPreview", { returned: money((BigInt(cap)-BigInt(units!)).toString()), award: money(units!) })}</p> : <p role="alert" className="text-xs text-danger">{t("clientTermination.invalidAward")}</p>}
               </> : <p className="text-xs leading-5">{t(action === "respond" ? "clientTermination.responseHelp" : "clientTermination.claimHelp")}</p>}
             {action !== "withdraw" ? <label className="grid gap-1 text-sm">{t(action === "dispute" ? "clientTermination.claim" : "clientTermination.note")}<textarea aria-label={t(action === "dispute" ? "clientTermination.claim" : "clientTermination.note")} className={WALLET_INPUT} value={note} disabled={busy} maxLength={2000} onChange={e => setNote(e.target.value)} /></label> : null}

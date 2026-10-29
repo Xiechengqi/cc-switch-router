@@ -276,14 +276,10 @@ struct HostSummary {
     response_deadline_at: Option<String>,
 }
 fn priority(p: &Projection) -> u8 {
-    match (p.action_required, p.attention) {
-        (true, "provider_response") => 0,
-        (true, "finance_review") => 1,
-        (true, "owner_decision") => 2,
-        (true, _) => 3,
-        (false, "waiting_provider" | "waiting_owner" | "timeout_pending") => 4,
-        (false, "completed") => 6,
-        _ => 5,
+    match p.attention {
+        "provider_response" => 0,
+        "owner_decision" => 1,
+        _ => 2,
     }
 }
 fn summary_tx(
@@ -300,17 +296,9 @@ fn summary_tx(
     } else {
         "?2=0 AND t.provider_user_id=?1"
     };
-    let latest_scope = if owner {
-        "?2=1"
-    } else {
-        "latest.provider_user_id=?1"
-    };
     let mut statement = conn
         .prepare(&format!(
-            "{FACTS} WHERE {scope}
-        AND (t.status!='completed' OR t.id=(SELECT latest.id FROM client_market_terminations latest
-            WHERE latest.host_id=t.host_id AND {latest_scope}
-            ORDER BY latest.cutoff_at DESC,latest.id DESC LIMIT 1))
+            "{FACTS} WHERE {scope} AND t.status!='completed'
         ORDER BY t.cutoff_at DESC,t.id DESC"
         ))
         .map_err(db_error("prepare Client termination summary"))?;
@@ -322,7 +310,18 @@ fn summary_tx(
     for f in facts {
         let f = f.map_err(db_error("read Client termination summary"))?;
         let p = project(&f, user, owner, at)?;
-        count += usize::from(p.action_required);
+        // Market rows expose only actions this viewer can handle here. History
+        // remains available through records/deep links; finance holds use the
+        // finance workbench and must not hide another case awaiting adjudication.
+        if !p.action_required
+            || !matches!(
+                p.attention,
+                "provider_response" | "owner_decision" | "cleanup_failed"
+            )
+        {
+            continue;
+        }
+        count += 1;
         let rank = priority(&p);
         let entry = hosts.entry(f.host.clone()).or_insert_with(|| {
             (
@@ -336,7 +335,7 @@ fn summary_tx(
                 rank,
             )
         });
-        entry.0.action_required_count += usize::from(p.action_required);
+        entry.0.action_required_count += 1;
         if rank < entry.1 || (rank == 0 && p.response_deadline_at < entry.0.response_deadline_at) {
             entry.0.termination_id = f.id;
             entry.0.attention = p.attention;

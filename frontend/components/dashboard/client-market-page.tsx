@@ -31,7 +31,6 @@ import { HostRow } from "@/components/dashboard/client-market/host-row";
 import { ClientRentalAuditPanel } from "@/components/dashboard/client-market/rental-audit-panel";
 import { HostSortHeader } from "@/components/dashboard/client-market/host-sort-header";
 import { ClientTerminationDialog } from "@/components/market/client-termination-dialog";
-import { ClientTerminationWorkList } from "@/components/market/client-termination-work-list";
 import { useClientTerminationWorkspace } from "@/components/market/use-client-termination-workspace";
 import {
   BatchProgressItem,
@@ -85,7 +84,6 @@ export function ClientMarketPage() {
   const viewerEmail = session?.user?.email;
   const terminationWork = useClientTerminationWorkspace(authed ? viewerUserId : undefined);
   const [terminationId, setTerminationId] = React.useState<string | null>(null);
-  const [terminationQueueOpen, setTerminationQueueOpen] = React.useState(false);
   const terminationLinkApplied = React.useRef<string | null>(null);
   const marketProviderId = searchParams.get("provider") || undefined;
   const returnedHostId = searchParams.get("focusHost") || undefined;
@@ -198,7 +196,7 @@ export function ClientMarketPage() {
   }, [silentRefresh, terminationWork.refresh]);
   const terminationByHost = React.useMemo(() => new Map(terminationWork.workspace?.hosts.map(item => [item.hostId, item]) || []), [terminationWork.workspace]);
   React.useEffect(() => {
-    setTerminationId(null); setTerminationQueueOpen(false); terminationLinkApplied.current = null;
+    setTerminationId(null); terminationLinkApplied.current = null;
   }, [viewerUserId]);
   const linkedTermination = searchParams.get("terminationId");
   React.useEffect(() => {
@@ -534,17 +532,7 @@ export function ClientMarketPage() {
   return (
     <main className="mx-auto grid min-w-0 w-[calc(100%-2rem)] max-w-7xl grid-cols-[minmax(0,1fr)] gap-5 pb-10">
       <h1 className="sr-only">{t("clientMarket.title")}</h1>
-      {authed ? <div className="grid min-w-0 gap-3 rounded-lg border border-border bg-card p-3">
-        <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
-          <Button size="sm" variant={terminationWork.workspace?.actionRequiredCount ? "outline" : "ghost"}
-            className="min-h-11 whitespace-nowrap" aria-expanded={terminationQueueOpen}
-            onPress={() => { setTerminationQueueOpen(open => !open); void terminationWork.refresh(true); }}>
-            {terminationWork.workspace ? t("clientTermination.queueButton", { count: terminationWork.workspace.actionRequiredCount }) : t("clientTermination.queue")}
-          </Button>
-          {terminationWork.error ? <div className="flex min-w-0 flex-wrap items-center gap-2"><p role="alert" className="text-xs text-danger">{t("clientTermination.workspaceUnavailable")}</p><Button size="sm" variant="ghost" onPress={() => void terminationWork.refresh(true)}>{t("common.reload")}</Button></div> : null}
-        </div>
-        {terminationQueueOpen ? <ClientTerminationWorkList pendingOnly revision={terminationWork.revision} onOpen={setTerminationId} /> : null}
-      </div> : null}
+      {authed && terminationWork.error ? <div className="flex min-w-0 flex-wrap items-center gap-2"><p role="alert" className="text-xs text-danger">{t("clientTermination.workspaceUnavailable")}</p><Button size="sm" variant="ghost" onPress={() => void terminationWork.refresh(true)}>{t("common.reload")}</Button></div> : null}
       <ClientTerminationDialog terminationId={terminationId} onClose={closeTermination} onChanged={onTerminationChanged} />
       {marketProviderId ? (
         <div className="flex min-h-11 min-w-0 flex-wrap items-center justify-between gap-2 rounded-lg bg-slate-100 px-3 py-2 text-sm">

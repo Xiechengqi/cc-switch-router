@@ -13,10 +13,10 @@
 
 ### Client Market 行内处理工作台
 
-- 原 Host 对应行的操作区显示待答复、待裁决、清理失败等入口、待办数量及答复截止时间；没有待办时保留退租详情入口。不把退租处理混入当前租户的控制菜单。
+- 只有当前登录者需要处理时，原 Host 对应行才显示红色入口：Provider 待答复或需要重试清理时显示“退租处理”，正式答复后需 Owner 裁定时向 Router owner 显示“退租裁决”。多笔待办附带数量，待答复时显示截止时间；已完成、自动处理中、等待对方或等待超时自动减免时不显示入口。不把退租处理混入当前租户的控制菜单。
 - Provider 直接在共享弹窗中全部／部分减免或正式答复；Router 财务 Owner 在需要裁决时通过同一弹窗处理。兼有多种身份时可切换处理身份。普通管理员没有财务裁决权限。
 - 弹窗按不可变的 `terminationId` 加载原租户、原 Provider、资金状态和分页处理历史。Host 再次出租、转给另一 Provider、下架或删除，不会改写旧退租身份，也不授权新租户／新 Provider 查看旧争议。
-- 页面顶部“退租待办”独立分页，不受公开 Host 列表、筛选和分页影响，已删除 Host 的待处理事项仍可找到。普通无争议退租自动清理、结算，不新增 Provider 确认或 Owner 审批步骤。
+- 页面顶部不再展示独立的“退租待办”区域。历史和已删除 Host 的事项仍可经通知深链、Provider 设置／财务设置中的退租记录以及 Owner 的租用审计详情进入。普通无争议退租自动清理、结算，不新增 Provider 确认或 Owner 审批步骤。
 - 钱包、Provider 设置、财务设置共用同一详情／处理弹窗。站内通知和新增退租邮件中的链接直接定位 `/client-market/?terminationId=...`；新增普通退租及待裁决提醒仅使用去重站内通知，不额外增加邮件。
 - 提交后保留弹窗并刷新权威状态；编辑期间不自动刷新覆盖输入，版本冲突须重新核对，不能重复提交旧裁决。加载更多的处理历史和待办不会被轮询重置为第一页。
 - 清理重试仅适用于仍绑定原 installation、Host 和 Provider 的失败租用；不能因处理旧争议而清理当前新租户。财务异常只能进入账务核对，不能以责任裁决代替修复，也不能在清理确认前提前返还余额。
@@ -121,7 +121,7 @@ SSH 在事务提交后执行。重复请求沿用原记录、截止时间和任�
 - `POST /v1/client-market/clients/:installation/release`（携带 previewId、reason、claim）
 - `GET /v1/client-market/clients/:installation/termination`
 - `GET /v1/client-market/terminations?provider=false|true&cursor=...`
-- `GET /v1/client-market/termination-workspace`（当前身份可见的 Host 摘要、待办总数和服务端时间）
+- `GET /v1/client-market/termination-workspace`（仅当前身份可在市场行内处理的 Host 待办摘要、总数和服务端时间；财务核对事项保留在完整记录与财务设置中）
 - `GET /v1/client-market/termination-workspace/records?hostId=...&pendingOnly=true&cursor=...`（Provider／Owner 独立工作队列，每页 50 条）
 - `GET /v1/client-market/terminations/:id?eventCursor=...`（原买家／原 Provider／财务 Owner 的详情、操作能力与分页时间线）
 - `POST /v1/client-market/terminations/:id/dispute`

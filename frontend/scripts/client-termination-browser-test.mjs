@@ -136,18 +136,30 @@ try {
   });
   const dialog = () => page.getByRole("dialog", { name: "Client termination", exact: true });
   const loaded = modal => modal.getByTestId("termination-original-client").filter({ hasText: "original-client" }).waitFor();
-  const open = async () => { await page.getByRole("button", { name: "Handle termination · 1", exact: true }).click(); await loaded(dialog()); };
+  const rowAction = () => page.getByRole("button", { name: actor === "owner" ? "Decide termination" : "Handle termination", exact: true });
+  const open = async () => { await rowAction().click(); await loaded(dialog()); };
   const close = async () => { await dialog().getByRole("button", { name: "Close", exact: true }).click(); await dialog().waitFor({ state: "hidden" }); };
   const goto = () => page.goto(`${base}/client-market/`);
   const switchActor = async next => { actor = next; await page.evaluate(() => window.dispatchEvent(new Event("router-auth-changed"))); };
   if (process.env.TERMINATION_SCREENSHOTS === "1") await mkdir("/tmp/client-termination-review", { recursive: true });
 
-  await goto(); await open();
+  await goto(); await rowAction().waitFor();
+  assert.equal(await page.getByRole("button", { name: /Termination tasks/ }).count(), 0);
+  assert.equal(await page.getByRole("button", { name: "View termination", exact: true }).count(), 0);
+  const rgb = await rowAction().evaluate(button => {
+    const canvas = document.createElement("canvas"), context = canvas.getContext("2d");
+    context.fillStyle = getComputedStyle(button).backgroundColor;
+    context.fillRect(0, 0, 1, 1);
+    return [...context.getImageData(0, 0, 1, 1).data];
+  });
+  assert.ok(rgb[0] > rgb[1] && rgb[0] > rgb[2] && rgb[3] > 0, `row action must be red: ${rgb}`);
+  await open();
   assert.equal(await dialog().getByText("new-tenant@example.test", { exact: true }).count(), 0);
   assert.equal(await dialog().getByRole("button", { name: "Decide responsibility", exact: true }).count(), 0);
   await dialog().getByRole("button", { name: "Reduce / waive compensation", exact: true }).click();
-  await dialog().getByLabel("Provider award", { exact: true }).selectOption("custom");
-  await dialog().getByLabel("Custom amount (USD)", { exact: true }).fill("0.0025");
+  await dialog().getByRole("button", { name: /Provider award/ }).click();
+  await page.getByRole("option", { name: "Custom amount (USD)", exact: true }).click();
+  await dialog().getByRole("textbox", { name: "Custom amount (USD)", exact: true }).fill("0.0025");
   await dialog().getByLabel("Decision explanation (required)", { exact: true }).fill("Partial waiver; please decide the rest.");
   assert.match(await dialog().getByTestId("termination-award-preview").innerText(), /0\.0025/);
   await dialog().getByRole("button", { name: "Save", exact: true }).click();
@@ -164,13 +176,20 @@ try {
   await dialog().getByText("Termination settlement updated.", { exact: true }).waitFor();
   assert.ok(writes.at(-1).path.startsWith("/v1/admin/"));
   await close();
+  await rowAction().waitFor({ state: "hidden" });
 
-  // Deleted Host: independent queue and deep links still reach the original case.
+  // Only a Provider request creates an Owner row action. A financial hold is
+  // handled in finance tools, not presented as a premature adjudication task.
+  for (const patch of [{}, { status: "finance_pending" }]) {
+    record = initial(patch); await goto(); await page.waitForLoadState("networkidle");
+    assert.equal(await rowAction().count(), 0);
+    assert.equal(await page.getByRole("button", { name: "View termination", exact: true }).count(), 0);
+  }
+
+  // Deleted Host: notifications/history deep links still reach the original case.
   record = initial({ providerRespondedAt: iso() }); hostPresent = false;
   await goto();
-  await page.getByRole("button", { name: "Termination tasks · 1", exact: true }).click();
-  await page.getByRole("region", { name: "Terminations needing attention", exact: true }).getByRole("button").filter({ hasText: "original-client" }).click();
-  await loaded(dialog()); await close();
+  assert.equal(await page.getByRole("button", { name: /Termination tasks/ }).count(), 0);
   await page.goto(`${base}/client-market/?terminationId=old-termination`);
   await loaded(dialog()); await close();
   await page.waitForURL(url => !url.searchParams.has("terminationId"));
@@ -186,6 +205,7 @@ try {
   await dialog().getByRole("button", { name: "Save", exact: true }).click();
   await dialog().getByText("Termination settlement updated.", { exact: true }).waitFor();
   assert.ok(writes.at(-1).path.endsWith("/respond")); await close();
+  await rowAction().waitFor({ state: "hidden" });
   record = initial(); conflict = true; await goto(); await open();
   await dialog().getByRole("button", { name: "Reduce / waive compensation", exact: true }).click();
   await dialog().getByLabel("Decision explanation (required)", { exact: true }).fill("Waive all disputed compensation.");
@@ -193,7 +213,8 @@ try {
   await dialog().getByRole("alert").filter({ hasText: "termination changed" }).waitFor();
   assert.equal(await dialog().getByRole("button", { name: "Save", exact: true }).isDisabled(), true); await close();
   record = initial({ disputeDeadlineAt: new Date(Date.now() - 1000).toISOString() }); await goto();
-  await page.getByRole("button", { name: "View termination", exact: true }).click();
+  await page.waitForLoadState("networkidle"); assert.equal(await rowAction().count(), 0);
+  await page.goto(`${base}/client-market/?terminationId=old-termination`);
   await dialog().getByText("Response deadline passed · automatic waiver pending", { exact: true }).waitFor();
   assert.equal(await dialog().getByRole("button", { name: "Disagree / request Owner decision", exact: true }).count(), 0); await close();
   record = initial({ status: "finance_pending" }); await goto(); await open();
@@ -207,7 +228,8 @@ try {
   assert.equal(writes.filter(write => write.path.endsWith("/provider-cleanup")).length, 1); await close();
 
   dualRole = true; record = initial({ buyerUserId: "provider" }); await goto(); await open();
-  await dialog().getByLabel("Acting as", { exact: true }).selectOption("buyer");
+  await dialog().getByRole("button", { name: /Acting as/ }).click();
+  await page.getByRole("option", { name: "Original renter", exact: true }).click();
   await dialog().getByRole("button", { name: "End compensation claim", exact: true }).waitFor();
   assert.equal(await dialog().getByRole("button", { name: "Disagree / request Owner decision", exact: true }).count(), 0);
   dualRole = false; await close();
@@ -236,12 +258,16 @@ try {
 
   // Ordinary trial exits are informational, never a new manual approval step.
   record = initial({ status: "completed", reason: "voluntary", responsibility: "none", disputeUsed: false, compensationCapUnits: "0", heldUnits: "0" });
-  await goto(); await page.getByRole("button", { name: "View termination", exact: true }).click();
+  await goto(); await page.waitForLoadState("networkidle");
+  assert.equal(await rowAction().count(), 0);
+  assert.equal(await page.getByRole("button", { name: "View termination", exact: true }).count(), 0);
+  await page.goto(`${base}/client-market/?terminationId=old-termination`); await loaded(dialog());
   assert.equal(await dialog().getByRole("button", { name: "Reduce / waive compensation", exact: true }).count(), 0); await close();
   workspaceFailure = true; await goto();
   await page.getByRole("alert").filter({ hasText: "Termination tasks could not be loaded" }).waitFor();
   workspaceFailure = false; await page.getByRole("button", { name: "Reload", exact: true }).click();
-  await page.getByRole("button", { name: "View termination", exact: true }).waitFor();
+  await page.getByRole("alert").filter({ hasText: "Termination tasks could not be loaded" }).waitFor({ state: "hidden" });
+  assert.equal(await rowAction().count(), 0);
 
   // Localised dialog geometry, keyboard dismissal, no horizontal page overflow.
   record = initial();
@@ -263,16 +289,19 @@ try {
 
   // A late private read must not re-open a case after account replacement.
   record = initial(); actor = "provider"; await page.goto(`${base}/client-market/?testLocale=en`);
-  holdDetail = true; await page.getByRole("button", { name: "Handle termination · 1", exact: true }).click();
+  holdDetail = true; await rowAction().click();
   await page.waitForFunction(() => !!document.querySelector('[role="dialog"]'));
   await switchActor("stranger");
-  await page.getByRole("button", { name: "Termination tasks · 0", exact: true }).waitFor();
+  await dialog().waitFor({ state: "hidden" });
   assert.equal(typeof releaseDetail, "function"); releaseDetail();
   await page.getByRole("dialog").waitFor({ state: "hidden" });
   assert.equal(await page.getByText("Original rental claim, not the new tenant's issue.", { exact: true }).count(), 0);
+  assert.equal(await page.getByRole("button", { name: /Handle termination|Decide termination|View termination/ }).count(), 0);
+  actor = "buyer"; await goto(); await page.waitForLoadState("networkidle");
+  assert.equal(await page.getByRole("button", { name: /Handle termination|Decide termination|View termination/ }).count(), 0);
   actor = null; await goto(); assert.equal(anonymousPrivateReads, 0);
   assert.deepEqual(errors, []);
-  console.log("Client termination browser: Provider waiver/reply, non-admin finance Owner adjudication, deleted-Host queue and repeat deep links, explicit conflict review, stable edited versions across history paging, deadlines, finance holds, original-installation cleanup with transient recovery, dual roles, trial-only history, account-switch race, keyboard and four widths in both locales passed; no real operations.");
+  console.log("Client termination browser: action-only red row buttons, no top queue or history buttons, Provider waiver/reply, Owner entry only after escalation, deleted-Host deep links, conflict review, stable edited versions, deadlines, finance holds, cleanup retry, dual roles, trial history, account-switch race, keyboard and four widths in both locales passed; no real operations.");
 } catch (cause) {
   console.error("Termination browser failure:", (await page?.getByRole("dialog").allTextContents())?.map(text => text.slice(0, 1800)), { writes: writes.slice(-3), reads: reads.slice(-5) });
   if (page && process.env.TERMINATION_SCREENSHOTS === "1") await page.screenshot({ path: "/tmp/client-termination-review/failure.png" });

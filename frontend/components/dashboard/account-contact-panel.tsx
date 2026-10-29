@@ -4,6 +4,7 @@ import * as React from "react";
 import { Button } from "@heroui/react";
 import { Loader2, Plus, Save, Trash2 } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
+import { CompactSelect } from "@/components/common/compact-select";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getAccountContacts, updateAccountProviderContacts } from "@/lib/api";
 import type { ProviderContact, ProviderContactChannel } from "@/lib/types";
@@ -78,12 +79,11 @@ export function AccountContactPanel() {
     </div>
     {error ? <p role="alert" className="text-sm text-destructive">{error}</p> : null}
     {contacts.map((contact, index) => <div key={index} className="grid gap-2 sm:grid-cols-[10rem_minmax(0,1fr)_2.75rem] sm:items-end">
-      <label className="grid gap-1 text-sm">
+      <div className="grid gap-1 text-sm">
         <span>{t("account.contact.channel")}</span>
-        <select className="h-11 rounded-md border border-border bg-background px-3" value={contact.channel} onChange={(event) => update(contacts.map((item, i) => i === index ? { ...item, channel: event.target.value as ProviderContactChannel } : item))}>
-          {CHANNELS.map((channel) => <option key={channel} value={channel}>{t(`account.contact.channel.${channel}`)}</option>)}
-        </select>
-      </label>
+        <CompactSelect ariaLabel={t("account.contact.channel")} className="w-full" triggerClassName="h-11" value={contact.channel} onChange={value => update(contacts.map((item, i) => i === index ? { ...item, channel: value as ProviderContactChannel } : item))}
+          options={CHANNELS.map(value => ({ value, label: t(`account.contact.channel.${value}`) }))} />
+      </div>
       <label className="grid gap-1 text-sm">
         <span>{t("account.contact.handle")}</span>
         <input className="h-11 min-w-0 rounded-md border border-border bg-background px-3" value={contact.handle} placeholder={t("account.contact.handlePlaceholder")} onChange={(event) => update(contacts.map((item, i) => i === index ? { ...item, handle: event.target.value } : item))} />

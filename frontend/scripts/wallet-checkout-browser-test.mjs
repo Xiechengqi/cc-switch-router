@@ -359,7 +359,10 @@ try {
   // Invalid inputs never request a quote or consume pending-order capacity.
   const amountInput = page.locator("#market-wallet-topup-amount");
   const amountHelp = page.locator("#wallet-amount-help");
-  const channelSelect = page.locator("select").filter({ has: page.locator('option[value="channel-1"]') });
+  const selectChannel = async name => {
+    await page.getByRole("button", { name: /Payment channel/ }).click();
+    await page.getByRole("option", { name, exact: true }).click();
+  };
   await amountHelp.filter({ hasText: "$1.00–$1,000.00" }).waitFor();
   const requestsBeforeInvalid = quoteRequests.length;
   for (const invalid of ["0.99", "1000.01"]) {
@@ -379,7 +382,7 @@ try {
   await page.getByRole("button", { name: "Pay $1,050.00", exact: true }).waitFor();
   assert.equal(quoteRequests.at(-1).amountMinor, 100_000);
 
-  await channelSelect.selectOption("channel-2");
+  await selectChannel("Bounded channel");
   await amountHelp.filter({ hasText: /\$10\.00.*\$50\.00/ }).waitFor();
   assert.equal(await amountInput.inputValue(), "1000", "switching never silently clamps the requested credit");
   assert.equal(await page.getByRole("button", { name: "$5", exact: true }).isDisabled(), true);
@@ -392,20 +395,20 @@ try {
   await page.getByRole("button", { name: "Pay $10.50", exact: true }).waitFor();
   await amountInput.fill("50");
   await page.getByRole("button", { name: "Pay $52.50", exact: true }).waitFor();
-  await channelSelect.selectOption("channel-3");
+  await selectChannel("Unavailable channel");
   await amountHelp.filter({ hasText: /no available top-up range/ }).waitFor();
   assert.equal(await amountInput.isDisabled(), true);
   assert.equal(await page.getByRole("button", { name: "Continue to payment", exact: true }).isDisabled(), true);
 
   // An old, delayed quote must not win after switching channels.
-  await channelSelect.selectOption("channel-1");
+  await selectChannel("DujiaoPay");
   let releaseOldQuote;
   const oldQuoteStarted = new Promise((started) => {
     delayedQuote = { started, wait: new Promise((release) => { releaseOldQuote = release; }) };
   });
   await amountInput.fill("10");
   await oldQuoteStarted;
-  await channelSelect.selectOption("channel-2");
+  await selectChannel("Bounded channel");
   await page.getByRole("button", { name: "Pay $10.50", exact: true }).waitFor();
   releaseOldQuote();
   await page.waitForTimeout(100);
@@ -414,7 +417,7 @@ try {
 
   // A fee update invalidates the old quote as soon as current channel data
   // arrives, even if no new payment is being created. Input remains untouched.
-  await channelSelect.selectOption("channel-1");
+  await selectChannel("DujiaoPay");
   await amountInput.fill("1000");
   await page.getByRole("button", { name: "Pay $1,050.00", exact: true }).waitFor();
   feeBps = 725; policyVersion += 1;

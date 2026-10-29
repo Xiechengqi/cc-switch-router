@@ -114,6 +114,81 @@ fn stub(conn: &Connection, id: &str, host: &str, provider: &str, at: &str, respo
 }
 
 #[test]
+fn market_row_actions_follow_the_responsible_actor_and_hide_history() {
+    let (conn, _) = fixture(1000, true, 3600);
+    stub(&conn, "claim", HOST, "provider", START, false);
+    let summary = |user, owner, at| summary_tx(&conn, user, owner, at).unwrap();
+    assert_eq!(summary("provider", false, START)["actionRequiredCount"], 1);
+    assert_eq!(summary("owner", true, START)["hosts"], json!([]));
+    assert_eq!(summary("buyer", false, START)["hosts"], json!([]));
+
+    let deadline = (time(START).unwrap() + Duration::days(3)).to_rfc3339();
+    assert_eq!(summary("provider", false, &deadline)["hosts"], json!([]));
+
+    conn.execute(
+        "UPDATE client_market_terminations SET provider_responded_at=?1 WHERE id='claim'",
+        params![START],
+    )
+    .unwrap();
+    assert_eq!(summary("provider", false, START)["hosts"], json!([]));
+    assert_eq!(
+        summary("owner", true, START)["hosts"][0]["attention"],
+        "owner_decision"
+    );
+
+    conn.execute(
+        "UPDATE client_market_terminations SET status='completed',responsibility='none',compensation_cap_units=0 WHERE id='claim'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(summary("provider", false, START)["hosts"], json!([]));
+    assert_eq!(summary("owner", true, START)["hosts"], json!([]));
+    // Closing the row task must not remove the original record or its access.
+    let history = records_tx(&conn, "provider", false, &RecordsQuery::default(), START).unwrap();
+    assert_eq!(history["items"][0]["id"], "claim");
+}
+
+#[test]
+fn finance_holds_and_automatic_cleanup_do_not_mask_row_adjudication() {
+    let (conn, _) = fixture(1000, true, 3600);
+    stub(&conn, "decision", HOST, "provider", START, true);
+    stub(&conn, "finance", HOST, "provider", START, true);
+    conn.execute(
+        "UPDATE client_market_terminations SET status='finance_pending' WHERE id='finance'",
+        [],
+    )
+    .unwrap();
+    stub(&conn, "automatic", "another-host", "provider", START, false);
+    conn.execute(
+        "UPDATE client_market_terminations SET responsibility='buyer' WHERE id='automatic'",
+        [],
+    )
+    .unwrap();
+    let summary = summary_tx(&conn, "owner", true, START).unwrap();
+    assert_eq!(summary["actionRequiredCount"], 1);
+    assert_eq!(summary["hosts"].as_array().unwrap().len(), 1);
+    assert_eq!(summary["hosts"][0]["terminationId"], "decision");
+    assert_eq!(summary["hosts"][0]["attention"], "owner_decision");
+    assert_eq!(
+        summary_tx(&conn, "provider", false, START).unwrap()["hosts"],
+        json!([])
+    );
+    // Finance follow-up remains available through the full work records.
+    let records = records_tx(
+        &conn,
+        "owner",
+        true,
+        &RecordsQuery {
+            pending_only: true,
+            ..Default::default()
+        },
+        START,
+    )
+    .unwrap();
+    assert_eq!(records["items"].as_array().unwrap().len(), 2);
+}
+
+#[test]
 fn workbench_survives_host_reuse_deletion_and_does_not_give_a_new_provider_old_claims() {
     let (conn, contract) = fixture(1000, true, 0);
     let at = deliver(&conn, &contract, 10);

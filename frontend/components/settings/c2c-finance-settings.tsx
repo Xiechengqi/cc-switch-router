@@ -4,6 +4,7 @@
  * pre-emit critique: P5 H4 E4 S5 R5 V4
  */
 import * as React from "react";
+import { CompactSelect } from "@/components/common/compact-select";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { C2CEvents } from "@/components/dashboard/c2c-orders-panel";
@@ -109,7 +110,8 @@ function C2CResolutionDialog({ id, actor, onClose, onResolved }: { id: string; a
         }).catch(e => { if (alive.current) setError(t(c2cErrorKey(e))); }).finally(() => { lock.current = false; if (alive.current) setBusy(false); });
       }}>{t("common.next")}</C2CAction> : null}
       {mayResolve ? <>
-        <select aria-label={t("c2c.resolution")} className={C2C_INPUT} value={action} disabled={!canManage || conflict || busy || !detail?.evidenceValid} onChange={e => { setAction(e.target.value); setAck(false); }}><option value="">—</option>{o.status === "disputed" ? <><option value="release">{t("c2c.resolveRelease")}</option><option value="return_to_seller">{t("c2c.resolveReturn")}</option></> : <option value="record_external_resolution">{t("c2c.resolveExternal")}</option>}</select>
+        <CompactSelect ariaLabel={t("c2c.resolution")} className="w-full" triggerClassName="h-11" value={action} disabled={!canManage || conflict || busy || !detail?.evidenceValid} onChange={value => { setAction(value); setAck(false); }}
+          options={[{ value: "", label: "—" }, ...(o.status === "disputed" ? [{ value: "release", label: t("c2c.resolveRelease") }, { value: "return_to_seller", label: t("c2c.resolveReturn") }] : [{ value: "record_external_resolution", label: t("c2c.resolveExternal") }])]} />
         <label className="grid gap-1 text-sm">{t("c2c.note")}<textarea className={C2C_INPUT} rows={4} value={evidence} maxLength={1500} disabled={!canManage || conflict || busy} onChange={e => setEvidence(e.target.value)} /></label>
         <C2CCheck checked={ack} disabled={!canManage || conflict || busy} onChange={e => setAck(e.target.checked)}>{t("c2c.resolveAck")}</C2CCheck>
         <C2CAction type="button" disabled={!canManage || conflict || busy || !ack || !action || !evidence.trim() || !detail?.evidenceValid} phase={busy ? "loading" : "default"} onClick={() => {

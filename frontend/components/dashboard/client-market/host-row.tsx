@@ -504,12 +504,11 @@ function HostRowImpl({
         </td>
         <td className="whitespace-nowrap px-2 py-2 align-middle" onClick={(event) => event.stopPropagation()}>
           <div className="flex items-center justify-end gap-1">
-            {terminationSummary && onTerminationOpen ? <div className="grid justify-items-end gap-0.5"><Button size="sm" variant={terminationSummary.actionRequiredCount ? "outline" : "ghost"}
+            {terminationSummary && terminationSummary.actionRequiredCount > 0 && ["provider_response", "owner_decision", "cleanup_failed"].includes(terminationSummary.attention) && onTerminationOpen ? <div className="grid justify-items-end gap-0.5"><Button size="sm" variant="danger"
               className="min-h-8 shrink-0 whitespace-nowrap px-2 text-xs"
-              aria-label={t(terminationSummary.actionRequiredCount ? "clientTermination.rowTasks" : "clientTermination.rowHistory", { count: terminationSummary.actionRequiredCount })}
               onPress={() => onTerminationOpen(terminationSummary.terminationId)}>
-              {terminationSummary.actionRequiredCount ? `${t(`clientTermination.attention.${terminationSummary.attention}`)} · ${terminationSummary.actionRequiredCount}` : t("clientTermination.rowHistory")}
-            </Button>{terminationSummary.responseDeadlineAt && ["provider_response", "waiting_provider"].includes(terminationSummary.attention) ? <time dateTime={terminationSummary.responseDeadlineAt} className="text-[10px] text-muted-foreground" title={t("clientTermination.responseDeadline")}>
+              {t(terminationSummary.attention === "owner_decision" ? "clientTermination.rowAdjudicate" : "clientTermination.rowHandle")}{terminationSummary.actionRequiredCount > 1 ? ` · ${terminationSummary.actionRequiredCount}` : ""}
+            </Button>{terminationSummary.responseDeadlineAt && terminationSummary.attention === "provider_response" ? <time dateTime={terminationSummary.responseDeadlineAt} className="text-[10px] text-muted-foreground" title={t("clientTermination.responseDeadline")}>
               {t("clientTermination.respondBy", { time: new Intl.DateTimeFormat(locale, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(terminationSummary.responseDeadlineAt)) })}
             </time> : null}</div> : null}
             <Button

@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import { CompactSelect } from "@/components/common/compact-select";
 import { Button, Chip, Modal, toast } from "@heroui/react";
 import { Loader2, Unlink } from "lucide-react";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
@@ -314,9 +315,8 @@ export function ReleaseRentalAction({
               <p className="text-xs text-muted-foreground">{preview.policyVersion === 0 ? t("clientTermination.noRetroactive") : t("clientTermination.purchaseTerms", { rate: String(preview.rateBps / 100) })}</p>
               {preview.nextRentalTrial ? <p className="text-xs leading-5 text-muted-foreground">{t("clientTrial.releasePaid")}</p>
                 : preview.trialSecondsRemaining != null ? <p className="text-xs leading-5 text-muted-foreground">{t("clientTrial.releaseUnpaid")}</p> : null}
-              <label className="grid gap-1 text-sm">{t("clientTermination.reason")}<select className={WALLET_INPUT} value={reason} onChange={e => setReason(e.target.value as ClientTerminationRequest["reason"])}>
-                <option value="voluntary">{t("clientTermination.voluntary")}</option><option value="provider_issue">{t("clientTermination.providerIssue")}</option><option value="platform_issue">{t("clientTermination.platformIssue")}</option>
-              </select></label>
+              <div className="grid gap-1 text-sm"><span>{t("clientTermination.reason")}</span><CompactSelect ariaLabel={t("clientTermination.reason")} className="w-full" triggerClassName="h-11" value={reason} onChange={value => setReason(value as ClientTerminationRequest["reason"])}
+                options={[{ value: "voluntary", label: t("clientTermination.voluntary") }, { value: "provider_issue", label: t("clientTermination.providerIssue") }, { value: "platform_issue", label: t("clientTermination.platformIssue") }]} /></div>
               {reason !== "voluntary" ? <><label className="grid gap-1 text-xs">{t("clientTermination.claim")}<textarea className={WALLET_INPUT} value={claim} maxLength={2000} onChange={e => setClaim(e.target.value)} /></label>{!terminationExplanationValid(claim) ? <p role="alert" className="text-xs text-danger">{t("clientTermination.explanationTooLong")}</p> : null}<p className="text-xs text-muted-foreground">{t("clientTermination.claimHelp")}</p><p className="text-xs text-muted-foreground">{t("clientTermination.chatHelp")}</p><a href={`/clients/?chat=${encodeURIComponent(rental.installationId)}`} target="_blank" rel="noopener noreferrer" className="text-xs underline">{t("clientTermination.chat")}</a></> : null}
               <p className="text-xs text-muted-foreground">{t("clientTermination.expires")} <button type="button" className="underline" onClick={() => setPreviewAttempt(n => n + 1)}>{t("common.reload")}</button></p>
             </>}

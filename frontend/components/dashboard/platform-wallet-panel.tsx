@@ -11,6 +11,7 @@ import { useSearchParams } from "next/navigation";
 import { Button } from "@heroui/react";
 import { ArrowUpRight, Ban, CheckCircle2, ChevronDown, Clock3, CreditCard, Loader2, RefreshCw, WalletCards } from "lucide-react";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
+import { CompactSelect } from "@/components/common/compact-select";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { WalletTransferPanel } from "@/components/dashboard/wallet-transfer-panel";
 import { useAuth } from "@/components/auth/auth-provider";
@@ -892,19 +893,17 @@ export function PlatformWalletPanel({ initialWallet }: { initialWallet: MarketWa
           {channels.length === 1 && selectedChannel ? <p className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
             {t("marketWallet.topupChannel", { channel: selectedChannel.displayName })}
             {selectedChannel.canary ? <WalletBadge tone="warning" pulse>{t("marketWallet.canaryBadge")}</WalletBadge> : null}
-          </p> : <label className="grid min-w-0 gap-1 text-sm">
+          </p> : <div className="grid min-w-0 gap-1 text-sm">
             <span className="flex flex-wrap items-center gap-2">{t("marketWallet.channel")}
               {selectedChannel?.canary ? <WalletBadge tone="warning" pulse>{t("marketWallet.canaryBadge")}</WalletBadge> : null}
             </span>
-            <select
-              className="h-11 min-w-0 rounded-md border border-input bg-background px-3 outline-2 outline-transparent focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-50"
-              value={channelId} onChange={(event) => { setChannelId(event.target.value); idempotencyRef.current = null; }}
+            <CompactSelect
+              ariaLabel={t("marketWallet.channel")} className="w-full" triggerClassName="h-11"
+              value={channelId} onChange={(value) => { setChannelId(value); idempotencyRef.current = null; }}
               disabled={!wallet.canTopup || !channels.length || !!busy}
-            >
-              {!channels.length ? <option value="">{t("marketWallet.noChannel")}</option> : null}
-              {channels.map((channel) => <option key={channel.id} value={channel.id}>{channel.displayName}</option>)}
-            </select>
-          </label>}
+              options={channels.length ? channels.map((channel) => ({ value: channel.id, label: channel.displayName })) : [{ value: "", label: t("marketWallet.noChannel") }]}
+            />
+          </div>}
           {selectedChannel?.canary ? <p className="text-xs text-amber-800">{t("marketWallet.canaryHelp")}</p> : null}
           <fieldset className="grid min-w-0 gap-2 text-sm" aria-describedby="wallet-amount-help">
             <legend className="mb-1">{t("marketWallet.amount")}</legend>

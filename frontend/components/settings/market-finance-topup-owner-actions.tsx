@@ -6,6 +6,7 @@
 import * as React from "react";
 import { Alert, Button, Modal } from "@heroui/react";
 import { Loader2 } from "lucide-react";
+import { CompactSelect } from "@/components/common/compact-select";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   MARKET_PAYMENT_TOKEN_IDS,
@@ -18,7 +19,6 @@ import {
 } from "@/lib/market-wallet-api";
 import { formatMinorUsd, parseNonNegativeUsdMinor } from "@/lib/market-wallet-money";
 import { paymentTokenLabel } from "@/lib/market-payment-tokens";
-import { WALLET_INPUT } from "@/components/market/wallet-primitives";
 import { OWNER_DIALOG_CLASS, OwnerField, ownerErrorText } from "@/components/settings/market-finance-shared";
 
 export type TopupOwnerAction = "credit" | "reverse";
@@ -111,13 +111,11 @@ export function MarketFinanceTopupOwnerActionDialog({ action, topup, onClose, on
               <p className="text-xs text-muted-foreground">{t(action === "reverse" ? "settings.marketFinance.topupRecovery.reverseNote" : "settings.marketFinance.topupRecovery.manualCreditNote")}</p>
               {action === "credit" ? <>
                 <OwnerField autoFocus label={t("settings.marketFinance.topupRecovery.txHash")} value={txHash} onChange={(event) => setTxHash(event.target.value)} invalid={!!txHash && !txValid} maxLength={128} inputClassName="font-mono text-xs" />
-                <label className="grid gap-1">
+                <div className="grid gap-1">
                   <span className="font-medium">{t("settings.marketFinance.topupRecovery.tokenId")}</span>
-                  <select value={tokenId} onChange={(event) => setTokenId(event.target.value)} className={WALLET_INPUT}>
-                    <option value="">{t("settings.marketFinance.topupRecovery.tokenAuto")}</option>
-                    {MARKET_PAYMENT_TOKEN_IDS.map((id) => <option key={id} value={id}>{paymentTokenLabel(id).label}</option>)}
-                  </select>
-                </label>
+                  <CompactSelect ariaLabel={t("settings.marketFinance.topupRecovery.tokenId")} className="w-full" triggerClassName="h-11" value={tokenId} onChange={setTokenId}
+                    options={[{ value: "", label: t("settings.marketFinance.topupRecovery.tokenAuto") }, ...MARKET_PAYMENT_TOKEN_IDS.map(value => ({ value, label: paymentTokenLabel(value).label }))]} />
+                </div>
               </> : (
                 <OwnerField autoFocus label={t("settings.marketFinance.topupRecovery.reverseAmount")} inputMode="decimal" value={amount} onChange={(event) => setAmount(event.target.value)} invalid={!!amount && !amountValid} />
               )}

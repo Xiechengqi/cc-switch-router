@@ -10,6 +10,7 @@ import * as React from "react";
 import { AlertTriangle, CheckCircle2, KeyRound, Loader2, Plus, RefreshCw, SlidersHorizontal } from "lucide-react";
 import { Alert, Button, Modal } from "@heroui/react";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
+import { CompactSelect } from "@/components/common/compact-select";
 import { CopyableCodeField } from "@/components/common/copyable-code-field";
 import { WalletBadge } from "@/components/market/wallet-primitives";
 import { MarketFinanceOverviewSection } from "@/components/settings/market-finance-overview";
@@ -449,12 +450,10 @@ export function MarketPaymentChannelsPanel() {
                   <Field label={t("settings.marketFinance.apiSecret")} value={form.apiSecret} onChange={(value) => setForm((current) => ({ ...current, apiSecret: value }))} type="password" minLength={16} maxLength={4096} required />
                 </> : null}
                 {dialog?.kind === "create" || dialog?.kind === "webhook" ? <>
-                  <label className="grid gap-1 text-sm font-medium"><span>{t("settings.marketFinance.webhookMode")}</span>
-                    <select className="h-11 rounded-md border border-input bg-background px-3 text-sm focus-visible:outline-2 focus-visible:outline-ring" value={form.webhookMode} onChange={(event) => setForm((current) => ({ ...current, webhookMode: event.target.value as FormState["webhookMode"], webhookSecret: "" }))}>
-                      <option value="signed">{t("settings.marketFinance.webhookMode.signed")}</option>
-                      <option value="poll_only">{t("settings.marketFinance.webhookMode.poll_only")}</option>
-                    </select>
-                  </label>
+                  <div className="grid gap-1 text-sm font-medium"><span>{t("settings.marketFinance.webhookMode")}</span>
+                    <CompactSelect ariaLabel={t("settings.marketFinance.webhookMode")} className="w-full" triggerClassName="h-11" value={form.webhookMode} onChange={value => setForm((current) => ({ ...current, webhookMode: value as FormState["webhookMode"], webhookSecret: "" }))}
+                      options={[{ value: "signed", label: t("settings.marketFinance.webhookMode.signed") }, { value: "poll_only", label: t("settings.marketFinance.webhookMode.poll_only") }]} />
+                  </div>
                   {form.webhookMode === "signed" ? <Field label={t("settings.marketFinance.webhookSecret")} value={form.webhookSecret} onChange={(value) => setForm((current) => ({ ...current, webhookSecret: value }))} type="password" minLength={16} maxLength={4096} required /> : null}
                   <p className="text-xs text-muted-foreground">{t(form.webhookMode === "signed" ? "settings.marketFinance.signedNote" : "settings.marketFinance.pollOnlyNote")}</p>
                   {dialog.kind === "webhook" && dialog.channel?.webhookMode === "signed" && form.webhookMode === "signed" ? <label className="flex items-start gap-2 text-xs"><input type="checkbox" checked={form.emergencyRevokePrevious} onChange={(event) => setForm((current) => ({ ...current, emergencyRevokePrevious: event.target.checked }))} />{t("settings.marketFinance.emergencyRevoke")}</label> : null}
