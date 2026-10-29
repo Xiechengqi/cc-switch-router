@@ -615,7 +615,8 @@ try {
   await page.context().route("**/v1/market-provider-finance/earnings", async (route) => {
     await route.fulfill({ contentType: "application/json", body: JSON.stringify({ items: [earning()], nextCursor: null }) });
   });
-  await page.reload();
+  // The Provider center opens on Rented out; income is its own tab.
+  await page.goto(`${baseUrl}/account/provider-settings/?tab=income`);
   assert.equal(await page.getByRole("link", { name: "Provider earnings", exact: true }).count(), 0);
   const earningsPanel = page.getByRole("region", { name: "Provider earnings", exact: true });
   assert.equal(await earningsPanel.getByRole("region", { name: "Client rental terminations", exact: true }).count(), 0, "income is separate from rental actions");
