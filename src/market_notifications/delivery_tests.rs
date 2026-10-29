@@ -74,9 +74,9 @@ fn client_termination_receipts_have_a_delivery_purpose_exact_amounts_and_role_sp
         assert!(text.contains("sample-client"));
         assert!(!html.contains("PRIVATE_CLAIM") && !text.contains("PRIVATE_NOTE"));
         assert!(html.contains(if role == "provider" {
-            "/account/client/?tab=provider"
+            "/account/provider-settings/?tab=listings&amp;market=client"
         } else {
-            "/account/client/?tab=user"
+            "/account/rentals/?market=client"
         }));
         let key = semantic_key(&i, "client_termination_receipt");
         let mut retry = i;
@@ -100,9 +100,9 @@ fn client_termination_claim_notices_are_actionable_private_and_have_a_delivery_p
         assert!(text.contains("72 hours") && text.contains("2026-10-28T12:00:00Z"));
         assert!(!html.contains("PRIVATE_CLAIM") && !text.contains("PRIVATE_NOTE"));
         assert!(html.contains(if role == "provider" {
-            "/account/client/?tab=provider"
+            "/account/provider-settings/?tab=listings&amp;market=client"
         } else {
-            "/account/client/?tab=user"
+            "/account/rentals/?market=client"
         }));
         let mut response = i;
         response.payload["action"] = json!("responded");

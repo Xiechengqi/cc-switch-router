@@ -411,6 +411,104 @@ fn build_account_usage(
     }
 }
 
+/// SQL for the bucket a row falls in: observations store RFC 3339 text,
+/// Share logs store Unix seconds.
+fn usage_bucket_exprs(window: &AccountUsagePeriodWindow) -> (&'static str, &'static str) {
+    if window.bucket_granularity == "hour" {
+        (
+            "strftime('%Y-%m-%dT%H:00:00Z', ml.created_at)",
+            "strftime('%Y-%m-%dT%H:00:00Z', sl.created_at, 'unixepoch')",
+        )
+    } else {
+        ("date(ml.created_at)", "date(sl.created_at, 'unixepoch')")
+    }
+}
+
+/// Provider usage per bucket of the period: the same rows as the provider
+/// breakdown (observations, plus Share logs without one), summed per bucket
+/// only, so the trend never multiplies the breakdown's row count.
+fn query_provider_daily(
+    conn: &Connection,
+    email: &str,
+    window: &AccountUsagePeriodWindow,
+) -> Result<BTreeMap<String, TokenAgg>, AppError> {
+    let (observation_bucket, share_bucket) = usage_bucket_exprs(window);
+    let observation_input = observation_input_tokens_expr("ml");
+    let observation_total = observation_total_tokens_expr("ml");
+    let observation_sql = format!(
+        "SELECT {observation_bucket} AS usage_bucket,
+                COALESCE(SUM(CASE WHEN ({observation_total}) > 0 OR sl.request_id IS NULL THEN {observation_input} ELSE COALESCE(sl.input_tokens, 0) END), 0),
+                COALESCE(SUM(CASE WHEN ({observation_total}) > 0 OR sl.request_id IS NULL THEN COALESCE(ml.output_tokens, 0) ELSE COALESCE(sl.output_tokens, 0) END), 0),
+                COALESCE(SUM(CASE WHEN ({observation_total}) > 0 OR sl.request_id IS NULL THEN COALESCE(ml.cache_read_tokens, 0) ELSE COALESCE(sl.cache_read_tokens, 0) END), 0),
+                COALESCE(SUM(CASE WHEN ({observation_total}) > 0 OR sl.request_id IS NULL THEN COALESCE(ml.cache_creation_tokens, 0) ELSE COALESCE(sl.cache_creation_tokens, 0) END), 0)
+         FROM capacity_request_observations ml
+         INNER JOIN shares s
+           ON s.share_id = ml.share_id
+          AND lower(trim(s.owner_email)) = lower(trim(?1))
+         LEFT JOIN share_request_logs sl
+           ON sl.request_id = ml.request_id
+          AND sl.share_id = ml.share_id
+          AND sl.is_health_check = 0
+         WHERE ml.created_at >= ?2
+         GROUP BY usage_bucket"
+    );
+    let share_sql = format!(
+        "SELECT {share_bucket} AS usage_bucket,
+                COALESCE(SUM(sl.input_tokens), 0),
+                COALESCE(SUM(sl.output_tokens), 0),
+                COALESCE(SUM(sl.cache_read_tokens), 0),
+                COALESCE(SUM(sl.cache_creation_tokens), 0)
+         FROM share_request_logs sl
+         INNER JOIN shares s
+           ON s.share_id = sl.share_id
+          AND lower(trim(s.owner_email)) = lower(trim(?1))
+         WHERE sl.created_at >= ?2
+           AND sl.is_health_check = 0
+           AND NOT EXISTS (
+                SELECT 1
+                FROM capacity_request_observations ml
+                WHERE ml.request_id = sl.request_id
+                  AND COALESCE(ml.share_id, '') = sl.share_id
+           )
+         GROUP BY usage_bucket"
+    );
+    let map_row = |row: &crate::db::Row<'_>| -> Result<_, crate::db::Error> {
+        Ok((
+            row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+            row.get::<_, i64>(1)?.max(0) as u64,
+            row.get::<_, i64>(2)?.max(0) as u64,
+            row.get::<_, i64>(3)?.max(0) as u64,
+            row.get::<_, i64>(4)?.max(0) as u64,
+        ))
+    };
+    let mut daily = BTreeMap::<String, TokenAgg>::new();
+    let observation_rows = conn
+        .prepare(&observation_sql)
+        .and_then(|mut stmt| {
+            stmt.query_map(params![email, window.start_at.to_rfc3339()], map_row)?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|e| {
+            AppError::Internal(format!("query provider daily observations failed: {e}"))
+        })?;
+    let share_rows = conn
+        .prepare(&share_sql)
+        .and_then(|mut stmt| {
+            stmt.query_map(params![email, window.start_at.timestamp()], map_row)?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|e| AppError::Internal(format!("query provider daily share logs failed: {e}")))?;
+    for (bucket, input, output, cache_read, cache_creation) in
+        observation_rows.into_iter().chain(share_rows)
+    {
+        daily
+            .entry(bucket)
+            .or_default()
+            .add(input, output, cache_read, cache_creation);
+    }
+    Ok(daily)
+}
+
 fn query_consumer_events(
     conn: &Connection,
     email: Option<&str>,
@@ -418,16 +516,7 @@ fn query_consumer_events(
 ) -> Result<Vec<UsageEvent>, AppError> {
     let start_ts = window.start_at.timestamp();
     let start_rfc3339 = window.start_at.to_rfc3339();
-    let observation_bucket_expr = if window.bucket_granularity == "hour" {
-        "strftime('%Y-%m-%dT%H:00:00Z', ml.created_at)"
-    } else {
-        "date(ml.created_at)"
-    };
-    let share_bucket_expr = if window.bucket_granularity == "hour" {
-        "strftime('%Y-%m-%dT%H:00:00Z', sl.created_at, 'unixepoch')"
-    } else {
-        "date(sl.created_at, 'unixepoch')"
-    };
+    let (observation_bucket_expr, share_bucket_expr) = usage_bucket_exprs(window);
     let observation_input = observation_input_tokens_expr("ml");
     let observation_total = observation_total_tokens_expr("ml");
     let observation_model = observation_model_expr("ml");
@@ -837,6 +926,8 @@ impl AppStore {
             }
         }
 
+        let daily = query_provider_daily(&conn, &email, &window)?;
+
         let mut totals = TokenAgg::default();
         for (
             installation_id,
@@ -961,6 +1052,7 @@ impl AppStore {
             cache_creation_tokens: totals.cache_creation,
             total_tokens: totals.total(),
             installations: installation_rows,
+            daily: finish_daily(&window.bucket_keys, daily),
         })
     }
 

@@ -2245,6 +2245,9 @@ pub struct ProviderUsageResponse {
     pub cache_creation_tokens: u64,
     pub total_tokens: u64,
     pub installations: Vec<ProviderInstallationUsage>,
+    /// Totals per bucket of the period, like the consumer view's trend.
+    #[serde(default)]
+    pub daily: Vec<UsageDailyBucket>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -97,24 +97,25 @@ fn destination(item: &Claimed, dashboard: &str) -> Option<String> {
         return Some(url.to_string());
     }
     // Very old notifications may lack a case ID. The records now live with
-    // Client rentals, not on the wallet or Provider income tab.
+    // the account's Client rentals (or, for Providers, what they rent out),
+    // not on the wallet or Provider income tab.
     if item.event_kind.starts_with("client_termination_") {
         let role = field(&item.payload, "role");
         if role == Some("handler") {
             url.set_path("/client-market/");
+        } else if role == Some("provider") {
+            url.set_path("/account/provider-settings/");
+            url.query_pairs_mut()
+                .append_pair("tab", "listings")
+                .append_pair("market", "client");
         } else {
-            url.set_path("/account/client/");
-            url.query_pairs_mut().append_pair(
-                "tab",
-                if role == Some("provider") {
-                    "provider"
-                } else {
-                    "user"
-                },
-            );
-            if let Some(id) = field(&item.payload, "installationId") {
-                url.query_pairs_mut().append_pair("focus", id);
-            }
+            url.set_path("/account/rentals/");
+            url.query_pairs_mut().append_pair("market", "client");
+        }
+        if role != Some("handler")
+            && let Some(id) = field(&item.payload, "installationId")
+        {
+            url.query_pairs_mut().append_pair("focus", id);
         }
         return Some(url.to_string());
     }
