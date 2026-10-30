@@ -12,7 +12,7 @@ use crate::models::ProviderModelProbe;
 use crate::proxy::ProxyRegistry;
 use crate::store::{
     AppStore, ShareModelHealthSlotResult, ShareModelProbeEpochInput, ShareRouteTarget,
-    model_probe_actual_model,
+    automatic_share_probe, model_probe_actual_model,
 };
 
 const SLOT_SECONDS: i64 = 30 * 60;
@@ -1062,49 +1062,13 @@ fn selected_epoch_input(
 }
 
 fn select_app(target: &ShareRouteTarget) -> Option<SelectedApp> {
-    if target.support.codex {
-        if let Some(probe) = target
-            .app_runtimes
-            .codex
-            .as_ref()
-            .and_then(|runtime| runtime.model_probe.clone())
-        {
-            return Some(SelectedApp {
-                app_type: "codex",
-                api_type: "openai",
-                probe: Some(probe),
-            });
-        }
-    }
-    if target.support.claude {
-        if let Some(probe) = target
-            .app_runtimes
-            .claude
-            .as_ref()
-            .and_then(|runtime| runtime.model_probe.clone())
-        {
-            return Some(SelectedApp {
-                app_type: "claude",
-                api_type: "anthropic",
-                probe: Some(probe),
-            });
-        }
-    }
-    if target.support.gemini {
-        if let Some(probe) = target
-            .app_runtimes
-            .gemini
-            .as_ref()
-            .and_then(|runtime| runtime.model_probe.clone())
-        {
-            return Some(SelectedApp {
-                app_type: "gemini",
-                api_type: "gemini",
-                probe: Some(probe),
-            });
-        }
-    }
-    None
+    let (app_type, api_type, _, probe) =
+        automatic_share_probe(&target.support, &target.app_runtimes, &target.bindings)?;
+    Some(SelectedApp {
+        app_type,
+        api_type,
+        probe: Some(probe.clone()),
+    })
 }
 
 fn floor_slot(timestamp: i64) -> i64 {
@@ -1299,6 +1263,37 @@ mod tests {
 
         target.app_runtimes.gemini.as_mut().unwrap().model_probe = None;
         assert!(select_app(&target).is_none());
+    }
+
+    #[test]
+    fn automatic_selection_requires_a_binding_and_never_uses_health_as_fallback() {
+        let mut target = target(ShareSupport {
+            claude: true,
+            codex: true,
+            gemini: true,
+        });
+        target.app_runtimes.codex.as_mut().unwrap().model_probe = Some(test_probe("openai"));
+        target.app_runtimes.claude.as_mut().unwrap().model_probe = Some(test_probe("anthropic"));
+        target.app_runtimes.codex.as_mut().unwrap().available = Some(false);
+        assert_eq!(select_app(&target).unwrap().app_type, "codex");
+        target.bindings.remove("codex");
+        assert_eq!(select_app(&target).unwrap().app_type, "claude");
+        target
+            .bindings
+            .insert("codex".into(), "provider-codex".into());
+        target
+            .app_runtimes
+            .codex
+            .as_mut()
+            .unwrap()
+            .model_probe
+            .as_mut()
+            .unwrap()
+            .health_fingerprint
+            .clear();
+        assert_eq!(select_app(&target).unwrap().app_type, "claude");
+        target.app_runtimes.codex.as_mut().unwrap().model_probe = Some(test_probe("gemini"));
+        assert_eq!(select_app(&target).unwrap().app_type, "claude");
     }
 
     #[test]

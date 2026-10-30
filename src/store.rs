@@ -16012,36 +16012,9 @@ fn descriptor_model_probe_epoch_input(
     if share.share_status != "active" || share.contract_version < 4 {
         return None;
     }
-    let (app_type, api_type, runtime, probe) = [
-        (
-            "codex",
-            "openai",
-            share.support.codex,
-            share.app_runtimes.codex.as_ref(),
-        ),
-        (
-            "claude",
-            "anthropic",
-            share.support.claude,
-            share.app_runtimes.claude.as_ref(),
-        ),
-        (
-            "gemini",
-            "gemini",
-            share.support.gemini,
-            share.app_runtimes.gemini.as_ref(),
-        ),
-    ]
-    .into_iter()
-    .find_map(|(app_type, api_type, enabled, runtime)| {
-        let runtime = enabled.then_some(runtime).flatten()?;
-        let probe = runtime.model_probe.as_ref()?;
-        Some((app_type, api_type, runtime, probe))
-    })?;
+    let (app_type, api_type, runtime, probe) =
+        automatic_share_probe(&share.support, &share.app_runtimes, &share.bindings)?;
     let provider_id = share.bindings.get(app_type)?.trim();
-    if provider_id.is_empty() || probe.health_fingerprint.is_empty() {
-        return None;
-    }
     let policy_mode = runtime.model_policy.as_ref().map(|policy| match policy {
         crate::models::ShareProviderModelPolicy::Passthrough => "passthrough".to_string(),
         crate::models::ShareProviderModelPolicy::Single { .. } => "single".to_string(),
@@ -16056,6 +16029,42 @@ fn descriptor_model_probe_epoch_input(
         wire_model: model_probe_actual_model(runtime, probe),
         policy_mode,
         health_fingerprint: probe.health_fingerprint.clone(),
+    })
+}
+
+/// Fixed automatic monitoring order, also used by the Server. A previous
+/// success/failure is never an eligibility criterion and never triggers fallback.
+pub(crate) fn automatic_share_probe<'a>(
+    support: &ShareSupport,
+    runtimes: &'a ShareAppRuntimes,
+    bindings: &BTreeMap<String, String>,
+) -> Option<(
+    &'static str,
+    &'static str,
+    &'a ShareUpstreamProvider,
+    &'a crate::models::ProviderModelProbe,
+)> {
+    [
+        ("codex", "openai", support.codex, runtimes.codex.as_ref()),
+        (
+            "claude",
+            "anthropic",
+            support.claude,
+            runtimes.claude.as_ref(),
+        ),
+        ("gemini", "gemini", support.gemini, runtimes.gemini.as_ref()),
+    ]
+    .into_iter()
+    .find_map(|(app_type, api_type, enabled, runtime)| {
+        let runtime = enabled.then_some(runtime).flatten()?;
+        let probe = runtime.model_probe.as_ref()?;
+        if bindings.get(app_type).is_none_or(|id| id.trim().is_empty())
+            || probe.api_type != api_type
+            || probe.health_fingerprint.is_empty()
+        {
+            return None;
+        }
+        Some((app_type, api_type, runtime, probe))
     })
 }
 

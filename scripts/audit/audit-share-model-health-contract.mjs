@@ -102,11 +102,15 @@ requireMarkers("schema/0028_share_model_health_evidence.sql", [
   "idx_share_model_health_slots_observation",
 ]);
 
-const codexPriority = scheduler.indexOf("if target.support.codex");
-const claudePriority = scheduler.indexOf("if target.support.claude");
-const geminiPriority = scheduler.indexOf("if target.support.gemini");
+const selection = store.slice(store.indexOf("pub(crate) fn automatic_share_probe"), store.indexOf("pub(crate) fn model_probe_actual_model"));
+const codexPriority = selection.indexOf('"codex"');
+const claudePriority = selection.indexOf('"claude"');
+const geminiPriority = selection.indexOf('"gemini"');
 if (!(codexPriority >= 0 && codexPriority < claudePriority && claudePriority < geminiPriority)) {
-  errors.push("src/share_model_health.rs must select Codex/OpenAI before Claude/Anthropic before Gemini");
+  errors.push("automatic_share_probe must select Codex/OpenAI before Claude/Anthropic before Gemini");
+}
+if (!/automatic_share_probe\(\s*&target\.support/.test(scheduler) || !/automatic_share_probe\(\s*&share\.support/.test(store)) {
+  errors.push("Router scheduler and descriptor epochs must use the same automatic probe selector");
 }
 
 const connection = [
