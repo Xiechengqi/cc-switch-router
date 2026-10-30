@@ -9,15 +9,18 @@ import * as React from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { Button } from "@heroui/react";
-import { ArrowUpRight, Ban, CheckCircle2, ChevronDown, Clock3, Loader2, RefreshCw, WalletCards } from "lucide-react";
+import { ArrowRight, ArrowUpRight, Ban, CheckCircle2, ChevronDown, Clock3, Loader2, RefreshCw, WalletCards } from "lucide-react";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
+import { InfoHint } from "@/components/common/info-hint";
+import { SegmentedControl } from "@/components/common/segmented-control";
+import { UnderlineTabs } from "@/components/common/underline-tabs";
 import { AccountSectionHeader } from "@/components/dashboard/account-section";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { WalletTransferPanel } from "@/components/dashboard/wallet-transfer-panel";
 import { useAuth } from "@/components/auth/auth-provider";
 import { C2CBuyPanel } from "@/components/dashboard/c2c-buy-panel";
-import { C2COrdersPanel } from "@/components/dashboard/c2c-orders-panel";
-import { C2CAction } from "@/components/market/c2c-primitives";
+import { C2COrdersPanel, type C2CView } from "@/components/dashboard/c2c-orders-panel";
+import { getC2COrders } from "@/lib/market-c2c";
 import { subscribeMarketBalanceChanged, notifyMarketBalanceChanged } from "@/lib/market-balance-events";
 import { MarketBuyerDisputesList } from "@/components/dashboard/market-buyer-disputes-list";
 import { WalletTopupForm } from "@/components/market/wallet-topup-form";
@@ -55,8 +58,17 @@ function isWalletTask(value: string | null): value is WalletTask {
   return WALLET_TASKS.includes(value as WalletTask);
 }
 
+const C2C_VIEWS = ["buy", "sell", "orders"] as const;
+
+function initialC2CView(searchParams: { get(name: string): string | null }): C2CView {
+  if (searchParams.get("c2cOrder")) return "orders";
+  if (searchParams.get("c2cSell") === "1") return "sell";
+  const requested = searchParams.get("c2c");
+  return C2C_VIEWS.includes(requested as C2CView) ? requested as C2CView : "buy";
+}
+
 function initialWalletTask(searchParams: { get(name: string): string | null }): WalletTask {
-  if (searchParams.get("c2cOrder") || searchParams.get("c2cSell") === "1") return "c2c";
+  if (searchParams.get("c2cOrder") || searchParams.get("c2cSell") === "1" || C2C_VIEWS.includes(searchParams.get("c2c") as C2CView)) return "c2c";
   const requested = searchParams.get("task");
   return isWalletTask(requested) ? requested : "topup";
 }
@@ -184,9 +196,12 @@ export function PlatformWalletPanel({ initialWallet, rememberKey }: { initialWal
   const returnedTopupId = searchParams.get("topup");
   const [task, setTask] = React.useState<WalletTask>(() => initialWalletTask(searchParams));
   const [c2cOrderId, setC2COrderId] = React.useState<string | null>(searchParams.get("c2cOrder"));
-  const [c2cMode, setC2CMode] = React.useState<"buy" | "sell">(searchParams.get("c2cSell") === "1" ? "sell" : "buy");
+  const [c2cView, setC2CView] = React.useState<C2CView>(() => initialC2CView(searchParams));
+  const [c2cActive, setC2CActive] = React.useState(0);
+  // The page header's reload also refreshes the C2C panels.
+  const [c2cReload, setC2CReload] = React.useState(0);
   const linkedC2COrder = searchParams.get("c2cOrder");
-  React.useEffect(() => { if (linkedC2COrder) { setTask("c2c"); setC2COrderId(linkedC2COrder); } }, [linkedC2COrder]);
+  React.useEffect(() => { if (linkedC2COrder) { setTask("c2c"); setC2CView("orders"); setC2COrderId(linkedC2COrder); } }, [linkedC2COrder]);
   const linkedTask = searchParams.get("task");
   React.useEffect(() => { if (isWalletTask(linkedTask)) setTask(linkedTask); }, [linkedTask]);
   const returnedFromCheckoutExit = searchParams.get("cancelled") === "1";
@@ -303,6 +318,17 @@ export function PlatformWalletPanel({ initialWallet, rememberKey }: { initialWal
       setTransferCapacityUnavailable(true);
     }
   }, []);
+
+  const actorId = session?.user?.id;
+  // Active C2C orders badge the task switch before the C2C panel is opened.
+  const refreshC2CActive = React.useCallback(() => {
+    if (!actorId) return;
+    getC2COrders({ status: "active" }).then((page) => setC2CActive(page.items.length)).catch(() => {});
+  }, [actorId]);
+  // An open C2C task reports its own count; fetching here too would race it.
+  const taskRef = React.useRef(task);
+  taskRef.current = task;
+  React.useEffect(() => { if (taskRef.current !== "c2c") refreshC2CActive(); }, [refreshC2CActive]);
 
   const reload = React.useCallback(async () => {
     const version = ++reloadVersionRef.current;
@@ -582,17 +608,6 @@ export function PlatformWalletPanel({ initialWallet, rememberKey }: { initialWal
   const transferableUnits = transferCapacity ? safeBigInt(transferCapacity.transferableUnits) : null;
   const balanceIsClear = heldUnits === 0n && owedUnits === 0n && transferableUnits !== null
     && transferableUnits === safeBigInt(wallet.availableUnits);
-  const balanceNote = transferCapacityUnavailable
-    ? t("marketWallet.balanceNoteUnavailable")
-    : !transferCapacity
-      ? t("common.loading")
-      : balanceIsClear
-        ? t("marketWallet.balanceClear")
-        : t("marketWallet.balanceNote", {
-            held: balanceText(wallet.heldUnits),
-            owed: balanceText(wallet.committedUnits ?? "0"),
-            transferable: balanceText(transferCapacity.transferableUnits),
-          });
 
   return (
     <div className="grid w-full min-w-0 gap-6">
@@ -601,7 +616,11 @@ export function PlatformWalletPanel({ initialWallet, rememberKey }: { initialWal
         title={t("account.nav.wallet")}
         hint={t("marketWallet.subtitle")}
         actions={(
-          <Button variant="outline" size="sm" isDisabled={anyBusy} onPress={() => void reload().catch((cause) => setHistoryError(errorText(cause)))}>
+          <Button variant="outline" size="sm" isDisabled={anyBusy} onPress={() => {
+            void reload().catch((cause) => setHistoryError(errorText(cause)));
+            setC2CReload((value) => value + 1);
+            if (task !== "c2c") refreshC2CActive();
+          }}>
             <RefreshCw className="size-4" aria-hidden="true" />{t("common.reload")}
           </Button>
         )}
@@ -625,45 +644,81 @@ export function PlatformWalletPanel({ initialWallet, rememberKey }: { initialWal
         </div>
       ) : null}
 
-      <section className="min-w-0 rounded-xl border border-border bg-card px-5 py-4" aria-label={t("marketWallet.balanceBreakdown")}>
-        <div className="flex min-w-0 flex-wrap items-baseline justify-between gap-x-6 gap-y-1">
-          <p className="flex items-center gap-2 text-sm text-muted-foreground"><WalletCards className="size-4" aria-hidden="true" />{t("marketWallet.available")}</p>
-          <p className="break-all text-3xl font-semibold tabular-nums tracking-tight">{balanceText(wallet.availableUnits)}</p>
-        </div>
-        {displayCurrency === "CNY" && fxRateFresh ? <p className="mt-1 text-right text-xs text-muted-foreground">{t("marketWallet.displayOnly", { amount: formatWalletUnits(wallet.availableUnits) })}</p> : null}
-        <p className="mt-2 text-sm leading-6 text-muted-foreground">{balanceNote}</p>
+      <section className="min-w-0 rounded-xl border border-border bg-card p-5 sm:p-6" aria-label={t("marketWallet.balanceBreakdown")}>
+        <p className="flex items-center gap-2 text-sm text-muted-foreground">
+          <WalletCards className="size-4" aria-hidden="true" />{t("marketWallet.available")}
+          {displayCurrency === "CNY" && fxRateFresh ? <InfoHint>{t("marketWallet.displayOnly", { amount: formatWalletUnits(wallet.availableUnits) })}</InfoHint> : null}
+        </p>
+        <p className="mt-1 break-all text-3xl font-semibold tabular-nums tracking-tight sm:text-4xl">{balanceText(wallet.availableUnits)}</p>
+        {balanceIsClear ? <p className="mt-3 flex items-center gap-1.5 text-xs text-emerald-800"><CheckCircle2 className="size-3.5" aria-hidden="true" />{t("marketWallet.balanceClear")}</p>
+          : <dl className="mt-4 grid gap-2 border-t border-border pt-3 sm:grid-cols-3 sm:gap-0 sm:divide-x sm:divide-border">
+            {([
+              ["held", balanceText(wallet.heldUnits)],
+              ["owed", balanceText(wallet.committedUnits ?? "0")],
+              ["transferable", transferCapacity ? balanceText(transferCapacity.transferableUnits) : transferCapacityUnavailable ? "—" : "…"],
+            ] as const).map(([key, value], index) => <div key={key} className={`flex min-w-0 items-center justify-between gap-3 sm:block ${index ? "sm:pl-4" : "sm:pr-4"}`}>
+              <dt className="flex items-center gap-1 text-xs text-slate-600">{t(`marketWallet.stat.${key}`)}<InfoHint>{t(`marketWallet.stat.${key}Help`)}</InfoHint></dt>
+              <dd className="break-all text-sm font-semibold tabular-nums sm:mt-0.5">{value}</dd>
+            </div>)}
+          </dl>}
+        {transferCapacityUnavailable ? <p className="mt-2 text-xs text-muted-foreground">{t("marketWallet.balanceNoteUnavailable")}</p> : null}
       </section>
 
-      <section id={WALLET_ACTIONS_ID} tabIndex={-1} aria-label={t("marketWallet.actions")} className="grid min-w-0 scroll-mt-20 gap-4 rounded-xl border border-border bg-card p-5 outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring sm:p-6">
-        <div role="group" aria-label={t("marketWallet.actions")} className="flex flex-wrap gap-2">
-          {WALLET_TASKS.map((item) => (
-            <C2CAction key={item} type="button" secondary={task !== item} aria-pressed={task === item} disabled={anyBusy} onClick={() => setTask(item)}>
+      <section id={WALLET_ACTIONS_ID} tabIndex={-1} aria-label={t("marketWallet.actions")} className="grid min-w-0 scroll-mt-20 gap-5 rounded-xl border border-border bg-card p-4 outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring sm:p-6">
+        <SegmentedControl
+          value={task}
+          onChange={setTask}
+          ariaLabel={t("marketWallet.actions")}
+          size="lg"
+          fullWidth
+          disabled={anyBusy}
+          items={WALLET_TASKS.map((item) => ({
+            id: item,
+            ariaLabel: t(`marketWallet.action.${item}`),
+            title: item === "c2c" && c2cActive ? t("c2c.activeTitle", { count: c2cActive }) : item === "topup" && topupClosedReason ? topupClosedReason : undefined,
+            label: <>
               {t(`marketWallet.action.${item}`)}
-              {item === "topup" && topupClosedReason ? <span className="ml-2 text-xs font-medium text-muted-foreground">{topupClosedReason}</span> : null}
-            </C2CAction>
-          ))}
+              {item === "c2c" && c2cActive ? <span aria-hidden="true" className="rounded-full bg-accent px-1.5 text-[11px] font-semibold leading-5 tabular-nums text-white">{c2cActive}</span> : null}
+              {item === "topup" && topupClosedReason ? <span aria-hidden="true" className="size-1.5 rounded-full bg-amber-500" /> : null}
+            </>,
+          }))}
+        />
+        <div role="tabpanel" aria-label={t(`marketWallet.action.${task}`)} className="min-w-0">
+          {task === "transfer" ? <WalletTransferPanel embedded onBusyChange={handleFormBusy} onTransferred={async () => { if (actorId) notifyMarketBalanceChanged(actorId); await reload(); }} walletVersion={wallet.version} /> : null}
+          {task === "c2c" && actorId ? <div className="grid min-w-0 gap-4">
+            <UnderlineTabs
+              value={c2cView}
+              onChange={setC2CView}
+              ariaLabel={t("c2c.mode")}
+              disabled={anyBusy}
+              items={C2C_VIEWS.map((view) => ({
+                id: view,
+                ariaLabel: t(`c2c.tab.${view}`),
+                title: view === "orders" && c2cActive ? t("c2c.activeTitle", { count: c2cActive }) : undefined,
+                label: <>{t(`c2c.tab.${view}`)}{view === "orders" && c2cActive ? <span aria-hidden="true" className="rounded-full bg-accent/10 px-1.5 text-xs font-semibold tabular-nums text-accent">{c2cActive}</span> : null}</>,
+              }))}
+            />
+            {c2cView === "buy" && c2cActive ? <button type="button" disabled={anyBusy} onClick={() => setC2CView("orders")}
+              className="group flex min-h-11 min-w-0 items-center justify-between gap-3 rounded-xl border border-accent/20 bg-accent/5 px-4 py-2 text-left text-sm text-accent transition-colors duration-200 hover:border-accent/40 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:opacity-50">
+              <span className="flex min-w-0 items-center gap-2"><span aria-hidden="true" className="size-2 shrink-0 rounded-full bg-accent pulse-dot" />{t("c2c.activeBanner", { count: c2cActive })}</span>
+              <span className="inline-flex shrink-0 items-center gap-1 font-medium">{t("c2c.viewOrders")}<ArrowRight className="size-4 transition-transform duration-200 group-hover:translate-x-0.5 motion-reduce:transition-none" aria-hidden="true" /></span>
+            </button> : null}
+            {c2cView === "buy" ? <C2CBuyPanel key={`${actorId}:buy`} actor={actorId} reloadSignal={c2cReload} onBusyChange={handleFormBusy} onOrder={order => { setC2CView("orders"); setC2COrderId(order.id); }} /> : null}
+            <C2COrdersPanel key={actorId} actor={actorId} selectedId={c2cOrderId} onSelect={setC2COrderId} view={c2cView} reloadSignal={c2cReload} onActiveCountChange={setC2CActive} />
+          </div> : null}
+          <div hidden={task !== "topup"}><WalletTopupForm
+            wallet={wallet}
+            topups={topups}
+            ready={historyReady}
+            active={task === "topup"}
+            returnPath={returnPath}
+            suggestedAmount={suggestedAmount}
+            externalBusy={!!busy}
+            onBusyChange={handleFormBusy}
+            onOrderCreated={handleOrderCreated}
+            onReload={reload}
+          /></div>
         </div>
-        {task === "transfer" ? <WalletTransferPanel embedded onBusyChange={handleFormBusy} onTransferred={async () => { if (session?.user?.id) notifyMarketBalanceChanged(session.user.id); await reload(); }} walletVersion={wallet.version} /> : null}
-        {task === "c2c" && session?.user?.id ? <div className="grid min-w-0 gap-4">
-          <div role="group" aria-label={t("c2c.mode")} className="flex flex-wrap gap-2">
-            <C2CAction type="button" secondary={c2cMode !== "buy"} aria-pressed={c2cMode === "buy"} disabled={anyBusy} onClick={() => setC2CMode("buy")}>{t("c2c.buy")}</C2CAction>
-            <C2CAction type="button" secondary={c2cMode !== "sell"} aria-pressed={c2cMode === "sell"} disabled={anyBusy} onClick={() => setC2CMode("sell")}>{t("c2c.seller")}</C2CAction>
-          </div>
-          {c2cMode === "buy" ? <C2CBuyPanel key={`${session.user.id}:buy`} actor={session.user.id} onBusyChange={handleFormBusy} onOrder={order => { setC2CMode("buy"); setC2COrderId(order.id); }} /> : null}
-          <C2COrdersPanel key={session.user.id} actor={session.user.id} selectedId={c2cOrderId} onSelect={setC2COrderId} embedded sellOpen={c2cMode === "sell"} onSellOpenChange={open => setC2CMode(open ? "sell" : "buy")} />
-        </div> : null}
-        <div hidden={task !== "topup"}><WalletTopupForm
-          wallet={wallet}
-          topups={topups}
-          ready={historyReady}
-          active={task === "topup"}
-          returnPath={returnPath}
-          suggestedAmount={suggestedAmount}
-          externalBusy={!!busy}
-          onBusyChange={handleFormBusy}
-          onOrderCreated={handleOrderCreated}
-          onReload={reload}
-        /></div>
       </section>
 
       {(wallet.canTopup || wallet.hasWalletActivity) && !loaded ? <p className="text-sm text-muted-foreground">{t("common.loading")}</p> : null}
@@ -788,7 +843,7 @@ export function PlatformWalletPanel({ initialWallet, rememberKey }: { initialWal
               const counterparty = entry.counterpartyEmail && !entryKey.startsWith("marketWallet.entry.transfer") ? entry.counterpartyEmail : null;
               const holdNote = holdOnly ? t(heldDelta > 0n ? "marketWallet.entryHeld" : "marketWallet.entryReleased") : null;
               const entryMain = <>
-                {entry.c2cOrderId ? <button type="button" onClick={() => { setTask("c2c"); setC2COrderId(entry.c2cOrderId ?? null); }} className="min-w-0 truncate text-left font-medium text-primary underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring">{entryLabel}</button> : <span className="min-w-0 truncate font-medium">{entryLabel}</span>}
+                {entry.c2cOrderId ? <button type="button" onClick={() => { setTask("c2c"); setC2CView("orders"); setC2COrderId(entry.c2cOrderId ?? null); }} className="min-w-0 truncate text-left font-medium text-primary underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring">{entryLabel}</button> : <span className="min-w-0 truncate font-medium">{entryLabel}</span>}
                 <span className="ml-auto shrink-0 text-xs text-muted-foreground">{dateText(entry.createdAt, locale)}</span>
                 {holdOnly ? <span className="shrink-0 tabular-nums text-muted-foreground">{formatWalletUnits((heldDelta < 0n ? -heldDelta : heldDelta).toString())}</span>
                   : <span className={`shrink-0 tabular-nums ${amountTone}`}>{signedWalletUnits(entry.deltaUnits)}</span>}

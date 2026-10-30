@@ -7,6 +7,7 @@
 import * as React from "react";
 import { Button } from "@heroui/react";
 import { ArrowRightLeft, Loader2 } from "lucide-react";
+import { InfoHint } from "@/components/common/info-hint";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ApiError } from "@/lib/api";
 import {
@@ -53,6 +54,7 @@ export function WalletTransferPanel({
   const busyRef = React.useRef(false);
   const keyRef = React.useRef("");
   const amountMinor = parseNonNegativeUsdMinor(amount);
+  const amountId = React.useId();
   const available = capacity?.transferableUnits ?? "0";
   React.useEffect(() => {
     onBusyChange?.(!!busy || !!quote);
@@ -190,7 +192,7 @@ export function WalletTransferPanel({
             {t("walletTransfer.exact", { units: quote.amountUnits })}
           </p>
         ) : null}
-        <p className="text-xs leading-5 text-muted-foreground">{t("walletTransfer.final")}</p>
+        <p className="flex items-center gap-1 text-xs leading-5 text-muted-foreground">{t("walletTransfer.finalShort")}<InfoHint>{t("walletTransfer.final")}</InfoHint></p>
       </div>
       {error ? <p role="alert" className="break-words text-sm text-destructive">{error}</p> : null}
       {expired ? <p role="status" className="text-sm text-destructive">{t("walletTransfer.expired")}</p> : null}
@@ -207,15 +209,22 @@ export function WalletTransferPanel({
   ) : null;
   return (
     <section id="wallet-transfer" className={embedded ? "grid min-w-0 gap-4" : "grid min-w-0 gap-4 rounded-xl border border-border bg-card p-5"}>
-      <div>
-        <h2 className="flex items-center gap-2 text-base font-semibold">
-          <ArrowRightLeft className="size-4" aria-hidden />
-          {t("walletTransfer.title")}
-        </h2>
-        <p className="mt-1 text-sm leading-6 text-muted-foreground">
-          {t("walletTransfer.help")}
+      {embedded ? (
+        <p className="flex items-center gap-1 text-xs text-muted-foreground">
+          {t("walletTransfer.helpShort")}
+          <InfoHint>{t("walletTransfer.help")}</InfoHint>
         </p>
-      </div>
+      ) : (
+        <div>
+          <h2 className="flex items-center gap-2 text-base font-semibold">
+            <ArrowRightLeft className="size-4" aria-hidden />
+            {t("walletTransfer.title")}
+          </h2>
+          <p className="mt-1 text-sm leading-6 text-muted-foreground">
+            {t("walletTransfer.help")}
+          </p>
+        </div>
+      )}
       {!quote && error ? (
         <p role="alert" className="break-words text-sm text-destructive">
           {error}
@@ -265,44 +274,43 @@ export function WalletTransferPanel({
               disabled={!!busy}
             />
           </label>
-          <label className="grid min-w-0 gap-1 text-sm">
-            <span>{t("walletTransfer.amount")}</span>
-            <input
-              inputMode="decimal"
-              autoComplete="off"
-              className={WALLET_INPUT}
-              value={
-                all ? formatWalletUnits(available).replace(/^\$/, "") : amount
-              }
-              onChange={(event) => setAmount(event.target.value)}
-              disabled={!!busy || all}
-              required={!all}
-            />
-          </label>
-          <div className="grid gap-1 sm:col-span-2">
-            <label className="flex min-h-11 items-center gap-2 text-sm">
+          <div className="grid min-w-0 gap-1 text-sm">
+            <span className="flex min-w-0 flex-wrap items-center justify-between gap-x-2">
+              <label htmlFor={amountId}>{t("walletTransfer.amount")}</label>
+              <span className="flex items-center gap-1 text-xs tabular-nums text-muted-foreground">
+                {t("walletTransfer.availableShort", { amount: formatWalletUnits(available) })}
+                <InfoHint>{t("walletTransfer.commitment")}</InfoHint>
+              </span>
+            </span>
+            <span className="relative grid min-w-0">
               <input
-                type="checkbox"
-                checked={all}
-                onChange={(event) => setAll(event.target.checked)}
-                disabled={!!busy}
-                className="size-4 accent-primary"
+                id={amountId}
+                inputMode="decimal"
+                autoComplete="off"
+                className={`${WALLET_INPUT} w-full pr-20 tabular-nums`}
+                value={
+                  all ? formatWalletUnits(available).replace(/^\$/, "") : amount
+                }
+                onChange={(event) => setAmount(event.target.value)}
+                disabled={!!busy || all}
+                required={!all}
               />
-              {t("walletTransfer.all")}
-            </label>
-            <p className="text-sm tabular-nums">
-              {t("walletTransfer.available", {
-                amount: formatWalletUnits(available),
-              })}
-            </p>
-            <p className="text-xs leading-5 text-muted-foreground">
-              {t("walletTransfer.commitment")}
-            </p>
+              <button
+                type="button"
+                aria-pressed={all}
+                aria-label={t("walletTransfer.all")}
+                onClick={() => setAll((value) => !value)}
+                disabled={!!busy}
+                className={`absolute inset-y-0 right-0 inline-flex min-h-11 items-center rounded-r-lg px-3 text-xs font-semibold transition-colors duration-200 focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-50 ${all ? "bg-accent text-white" : "text-accent hover:bg-accent/5"}`}
+              >
+                {t("walletTransfer.allShort")}
+              </button>
+            </span>
           </div>
           <Button
             type="submit"
             variant="primary"
-            className="min-h-11 justify-self-start whitespace-nowrap"
+            className="min-h-11 justify-self-start whitespace-nowrap sm:col-span-2"
             isDisabled={
               !!busy ||
               !recipient.trim() ||

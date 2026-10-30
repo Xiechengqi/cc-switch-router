@@ -89,7 +89,6 @@ export const walletPolicyMessagesEn = {
   "walletTransfer.email": "Recipient email",
   "walletTransfer.amount": "Amount (USD)",
   "walletTransfer.all": "Send all available",
-  "walletTransfer.available": "Available to send: {amount}",
   "walletTransfer.commitment":
     "Funds already reserved or due for services cannot be sent. Limits may apply.",
   "walletTransfer.preview": "Review send",
@@ -203,7 +202,6 @@ export const walletPolicyMessagesZh: Record<
   "walletTransfer.email": "收款用户邮箱",
   "walletTransfer.amount": "金额（美元）",
   "walletTransfer.all": "转出全部可转出余额",
-  "walletTransfer.available": "当前可转出：{amount}",
   "walletTransfer.commitment":
     "已预留或已到期应付的服务费用不可转出，并受转出限额约束。",
   "walletTransfer.preview": "核对转出",

@@ -4,7 +4,6 @@
 export const marketWalletMessagesEn = {
   "marketWallet.navBalance": "Platform balance",
   "marketWallet.balanceBreakdown": "Balance breakdown",
-  "marketWallet.balanceNote": "{held} is set aside · {owed} is due for running services · {transferable} can be sent",
   "marketWallet.balanceClear": "Nothing is set aside or due. All of this can be sent.",
   "marketWallet.balanceNoteUnavailable": "Set-aside and sendable amounts are unavailable right now.",
   "marketWallet.actions": "Balance actions",
@@ -34,7 +33,7 @@ export const marketWalletMessagesEn = {
 
   // Top-up form
   "marketWallet.customAmount": "Custom amount (USD)",
-  "marketWallet.amountRangeHelp": "Enter the balance to receive ({min}–{max}). The maintenance fee is added separately and does not count toward this limit.",
+  "marketWallet.amountRangeHelp": "Balance to receive: {min}–{max}",
   "marketWallet.amountRangeError": "Enter a balance credit between {min} and {max}, with up to two decimals. The maintenance fee is additional.",
   "marketWallet.amountRangeUnavailable": "This channel has no available top-up range. Choose another channel or refresh to retry.",
   "marketWallet.paymentMethod": "Payment method",
@@ -131,7 +130,6 @@ export const marketWalletMessagesEn = {
 export const marketWalletMessagesZh = {
   "marketWallet.navBalance": "平台余额",
   "marketWallet.balanceBreakdown": "余额构成",
-  "marketWallet.balanceNote": "暂扣 {held} · 运行中服务待扣 {owed} · 可转出 {transferable}",
   "marketWallet.balanceClear": "没有暂扣或待扣，全部可以转出。",
   "marketWallet.balanceNoteUnavailable": "暂扣和可转出金额暂时无法读取。",
   "marketWallet.actions": "余额操作",
@@ -160,7 +158,7 @@ export const marketWalletMessagesZh = {
   "marketWallet.viewOnExplorer": "在 Tronscan 查看交易 {hash}",
 
   "marketWallet.customAmount": "自定义金额（美元）",
-  "marketWallet.amountRangeHelp": "输入实际到账余额（{min}–{max}），维护费另加，不计入此限额。",
+  "marketWallet.amountRangeHelp": "到账范围 {min}–{max}",
   "marketWallet.amountRangeError": "请输入 {min} 至 {max} 之间的到账余额，最多两位小数，维护费另计。",
   "marketWallet.amountRangeUnavailable": "该渠道暂无可充值金额，请选择其他渠道或刷新重试。",
   "marketWallet.paymentMethod": "支付方式",

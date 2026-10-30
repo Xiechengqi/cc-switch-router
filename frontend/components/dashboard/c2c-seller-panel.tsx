@@ -6,6 +6,7 @@
  */
 import * as React from "react";
 import { CompactSelect } from "@/components/common/compact-select";
+import { InfoHint } from "@/components/common/info-hint";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { C2CAction, C2CCheck, C2CError, C2C_INPUT } from "@/components/market/c2c-primitives";
 import { C2C_DESCRIPTION_MAX, C2C_TERMS_VERSION, c2cErrorKey, c2cBlockerKey, parseC2CMinor, saveC2CSeller, validC2CDescription, type C2CPolicyView, type C2CSeller, type C2CSellerSnapshot } from "@/lib/market-c2c";
@@ -73,34 +74,34 @@ export function C2CSellerPanel({ policy, snapshot, availabilityError, onRefresh,
     finally { lock.current = false; if (alive.current) { setBusy(false); onBusyChange(false); } }
   };
   return <form className="grid min-w-0 gap-4" onSubmit={event => { event.preventDefault(); setTouched(true); void save(); }} data-c2c-seller-editor>
-    <p className="text-sm tabular-nums text-muted-foreground">{t("c2c.available", { amount: formatWalletUnits(snapshot.availableUnits) })}</p>
-    <p className="text-sm tabular-nums text-muted-foreground">{t("c2c.qualification", { balance: formatWalletUnits(snapshot.admissionBalanceUnits), threshold: formatMinorUsd(policy.policy.admissionMinor) })}</p>
+    <p className="flex flex-wrap gap-x-3 gap-y-1 rounded-xl bg-muted/60 px-3 py-2 text-xs tabular-nums text-slate-700">
+      <span>{t("c2c.available", { amount: formatWalletUnits(snapshot.availableUnits) })}</span>
+      <span>{t("c2c.qualification", { balance: formatWalletUnits(snapshot.admissionBalanceUnits), threshold: formatMinorUsd(policy.policy.admissionMinor) })}</span>
+    </p>
     <div className="grid min-w-0 gap-1">
-      <label htmlFor={fieldId} className="text-sm font-medium">{t("c2c.description")}</label>
+      <span className="flex items-center gap-1"><label htmlFor={fieldId} className="text-sm font-medium">{t("c2c.description")}</label><InfoHint>{t("c2c.descriptionHelp")}</InfoHint></span>
       <input id={fieldId} autoFocus className={C2C_INPUT} value={description} maxLength={C2C_DESCRIPTION_MAX}
         placeholder={t("c2c.descriptionExample")} required disabled={busy} aria-invalid={touched && !descriptionValid}
         aria-describedby={fieldId + "-help"} onBlur={() => setTouched(true)} onChange={event => setDescription(event.target.value)} />
       <p id={fieldId + "-help"} className={`min-h-[1lh] text-xs ${touched && !descriptionValid ? "text-destructive" : "text-muted-foreground"}`}>
-        {t(touched && !descriptionValid ? "c2c.descriptionError" : "c2c.descriptionHelp")}
+        {t(touched && !descriptionValid ? "c2c.descriptionError" : "c2c.descriptionHelpShort")}
       </p>
     </div>
     <details className="min-w-0">
-      <summary className="min-h-11 cursor-pointer rounded-md py-2 text-sm focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring">
+      <summary className="min-h-11 cursor-pointer rounded-xl border border-border px-3 py-2 text-sm transition-colors hover:border-accent/30 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring">
         <span className="font-medium">{t("c2c.tradeSettings")}</span>
         <span className="mt-1 block text-xs text-muted-foreground">{t("c2c.rate", { rate: bps != null ? bps / 100 : "—", currency })} · {t("c2c.range", { min: low != null ? formatMinorUsd(low) : "—", max: high != null ? formatMinorUsd(high) : "—" })}</span>
       </summary>
       <div className="grid min-w-0 gap-3 pt-3 sm:grid-cols-2">
-        <div className="grid min-w-0 gap-1 text-sm"><span>{t("c2c.currency")}</span><CompactSelect ariaLabel={t("c2c.currency")} className="w-full" triggerClassName="h-11" value={currency} disabled={busy} onChange={value => setCurrency(value as "USD" | "CNY")}
+        <div className="grid min-w-0 gap-1 text-sm"><span className="flex items-center gap-1">{t("c2c.currency")}<InfoHint>{t("c2c.currencyHelp")}</InfoHint></span><CompactSelect ariaLabel={t("c2c.currency")} className="w-full" triggerClassName="h-11" value={currency} disabled={busy} onChange={value => setCurrency(value as "USD" | "CNY")}
           options={[{ value: "USD", label: "USD" }, { value: "CNY", label: "CNY" }]} /></div>
         <label className="grid min-w-0 gap-1 text-sm">{t("c2c.price")}<input className={C2C_INPUT} inputMode="decimal" value={price} disabled={busy} onChange={event => setPrice(event.target.value)} required /></label>
         <label className="grid min-w-0 gap-1 text-sm">{t("c2c.min")}<input className={C2C_INPUT} inputMode="decimal" value={min} disabled={busy} onChange={event => setMin(event.target.value)} required /></label>
         <label className="grid min-w-0 gap-1 text-sm">{t("c2c.max")}<input className={C2C_INPUT} inputMode="decimal" value={max} disabled={busy} onChange={event => setMax(event.target.value)} required /></label>
       </div>
-      <p className="mt-2 text-xs text-muted-foreground">{t("c2c.currencyHelp")}</p>
     </details>
     {!termsValid ? <p role="alert" className="text-sm text-destructive">{t("c2c.termsError")}</p> : null}
-    <C2CCheck checked={ack} disabled={busy} onChange={event => setAck(event.target.checked)}>{t("c2c.sellerAck")}</C2CCheck>
-    <p className="text-xs text-muted-foreground">{t("c2c.persistentSelling")}</p>
+    <C2CCheck checked={ack} disabled={busy} onChange={event => setAck(event.target.checked)} hint={<><span className="block">{t("c2c.sellerAck")}</span><span className="mt-1.5 block">{t("c2c.persistentSelling")}</span></>}>{t("c2c.sellerAckShort")}</C2CCheck>
     <div id={fieldId + "-eligibility"} aria-live="polite" className="grid min-w-0 gap-2 text-sm text-muted-foreground">
       {blocked ? <p>{t(blocked)}</p> : null}
       {!availabilityError && snapshot.blockers.length > 1 ? <details><summary className="min-h-11 cursor-pointer rounded-md py-2 focus-visible:outline-2 focus-visible:outline-ring">{t("c2c.moreBlockers")}</summary><ul className="grid gap-2">{snapshot.blockers.slice(1).map(code => <li key={code}>{t(c2cBlockerKey(code))}</li>)}</ul></details> : null}

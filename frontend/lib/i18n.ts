@@ -17,6 +17,7 @@ import { notificationCenterMessagesEn, notificationCenterMessagesZh } from "@/li
 import { rentalAuditMessagesEn, rentalAuditMessagesZh } from "@/lib/client-rental-audit-messages";
 import { accountMarketMessagesEn, accountMarketMessagesZh } from "@/lib/account-market-messages";
 import { accountSectionMessagesEn, accountSectionMessagesZh } from "@/lib/account-section-messages";
+import { walletActionsMessagesEn, walletActionsMessagesZh } from "@/lib/wallet-actions-messages";
 
 export const LOCALE_STORAGE_KEY = "cc_switch_router_locale_v1";
 export const SUPPORTED_LOCALES = ["en", "zh-CN"] as const;
@@ -1657,7 +1658,6 @@ export const messages = {
     "marketWallet.serviceBilling": "Only verified service time is charged; unused monthly service is returned to your wallet.",
     "marketWallet.topupShortfall": "Add funds",
     "marketWallet.held": "Reserved",
-    "marketWallet.topup": "Add funds",
     "marketWallet.channel": "Payment channel",
     "marketWallet.noChannel": "No channel available",
     "marketWallet.noChannelHelp": "The Router owner has not enabled a payment channel.",
@@ -3509,6 +3509,7 @@ export const messages = {
     ...walletPolicyMessagesEn,
     ...accountMarketMessagesEn,
     ...accountSectionMessagesEn,
+    ...walletActionsMessagesEn,
   },
   "zh-CN": {
     ...rentalAuditMessagesZh,
@@ -5100,7 +5101,6 @@ export const messages = {
     "marketWallet.serviceBilling": "仅计费已核实的服务时间；月租未履约部分退回钱包。",
     "marketWallet.topupShortfall": "充值余额",
     "marketWallet.held": "已预留",
-    "marketWallet.topup": "充值",
     "marketWallet.channel": "支付渠道",
     "marketWallet.noChannel": "暂无可用渠道",
     "marketWallet.noChannelHelp": "Router 管理员尚未启用支付渠道。",
@@ -6897,6 +6897,7 @@ export const messages = {
     ...walletPolicyMessagesZh,
     ...accountMarketMessagesZh,
     ...accountSectionMessagesZh,
+    ...walletActionsMessagesZh,
   },
 } as const;
 

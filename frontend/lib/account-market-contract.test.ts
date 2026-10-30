@@ -73,3 +73,19 @@ test("account labels have both languages and balance sending does not rename ext
   assert.equal(walletPolicyMessagesZh["walletTransfer.confirm"], "转出 {amount}");
   assert.match(source("lib/i18n.ts"), /"marketWallet\.reviewInvalidReceipt": "网关报告已付款，但回执未通过核验。请勿重复转账/);
 });
+
+test("wallet action copy has both languages", async () => {
+  const { walletActionsMessagesEn, walletActionsMessagesZh } = await import("./wallet-actions-messages");
+  assert.deepEqual(Object.keys(walletActionsMessagesZh).sort(), Object.keys(walletActionsMessagesEn).sort());
+  for (const value of [...Object.values(walletActionsMessagesEn), ...Object.values(walletActionsMessagesZh)]) assert.ok(value.trim());
+});
+
+test("short consent labels keep the full terms one tap away", () => {
+  assert.match(source("components/dashboard/c2c-buy-panel.tsx"), /hint=\{t\("c2c\.ack"\)\}>\{t\("c2c\.ackShort"\)\}/);
+  const orders = source("components/dashboard/c2c-orders-panel.tsx");
+  assert.match(orders, /hint=\{t\("c2c\.releaseAck"\)\}>\{t\("c2c\.releaseAckShort"\)\}/);
+  assert.match(orders, /hint=\{intent === "paid" \? t\("c2c\.paidAck"\)/);
+  assert.match(source("components/dashboard/c2c-seller-panel.tsx"), /\{t\("c2c\.sellerAck"\)\}[\s\S]*\{t\("c2c\.sellerAckShort"\)\}/);
+  // Hints render in the top layer so a modal <dialog> cannot hide them.
+  assert.match(source("components/common/info-hint.tsx"), /setAttribute\("popover", "manual"\)/);
+});

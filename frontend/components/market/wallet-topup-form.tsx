@@ -11,6 +11,7 @@ import { Button } from "@heroui/react";
 import { CheckCircle2, CreditCard, Loader2 } from "lucide-react";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { CompactSelect } from "@/components/common/compact-select";
+import { InfoHint } from "@/components/common/info-hint";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { WalletBadge } from "@/components/market/wallet-primitives";
 import { ApiError } from "@/lib/api";
@@ -392,10 +393,9 @@ export function WalletTopupForm({
   return (
     <form className="grid min-w-0 content-start gap-3" data-topup-channel={channelId} onSubmit={submitTopup}>
       {wallet.mode === "shadow" ? <p className="text-sm text-muted-foreground">{t("marketWallet.shadow")}</p> : null}
-      <p className="text-sm font-semibold">{t("marketWallet.topup")}</p>
       <div className="grid min-w-0 gap-1 text-sm">
         <span className="flex flex-wrap items-center gap-2">{t("marketWallet.topupMethod")}
-          {selectedChannel?.canary ? <WalletBadge tone="warning" pulse>{t("marketWallet.canaryBadge")}</WalletBadge> : null}
+          {selectedChannel?.canary ? <><WalletBadge tone="warning" pulse>{t("marketWallet.canaryBadge")}</WalletBadge><InfoHint>{t("marketWallet.canaryHelp")}</InfoHint></> : null}
         </span>
         <CompactSelect
           ariaLabel={t("marketWallet.topupMethod")} className="w-full" triggerClassName="h-11"
@@ -406,7 +406,6 @@ export function WalletTopupForm({
             : [{ value: "", label: t("marketWallet.noTopupMethod") }]}
         />
       </div>
-      {selectedChannel?.canary ? <p className="text-xs text-amber-800">{t("marketWallet.canaryHelp")}</p> : null}
       <fieldset className="grid min-w-0 gap-2 text-sm" aria-describedby={amountHelpId}>
         <legend className="mb-1">{t("marketWallet.amount")}</legend>
         <div className="grid grid-cols-3 gap-2 sm:grid-cols-5">
@@ -441,14 +440,17 @@ export function WalletTopupForm({
             />
           </span>
         </label>
-        <span id={amountHelpId} className={`min-h-[1lh] text-xs ${amountError ? "text-destructive" : "text-muted-foreground"}`}>
-          {!bounds ? t(selectedChannel ? "marketWallet.amountRangeUnavailable" : "marketWallet.noChannelHelp") : amountError
-            ? t("marketWallet.amountRangeError", { min: formatMinorUsd(bounds.min), max: formatMinorUsd(bounds.max) })
-            : t("marketWallet.amountRangeHelp", { min: formatMinorUsd(bounds.min), max: formatMinorUsd(bounds.max) })}
+        <span className="flex min-h-[1lh] items-start gap-1">
+          <span id={amountHelpId} className={`text-xs ${amountError ? "text-destructive" : "text-muted-foreground"}`}>
+            {!bounds ? t(selectedChannel ? "marketWallet.amountRangeUnavailable" : "marketWallet.noChannelHelp") : amountError
+              ? t("marketWallet.amountRangeError", { min: formatMinorUsd(bounds.min), max: formatMinorUsd(bounds.max) })
+              : t("marketWallet.amountRangeHelp", { min: formatMinorUsd(bounds.min), max: formatMinorUsd(bounds.max) })}
+          </span>
+          {bounds && !amountError ? <InfoHint>{t("marketWallet.amountRangeDetail")}</InfoHint> : null}
         </span>
       </fieldset>
       {directChannel ? <fieldset className="grid min-w-0 gap-2 text-sm">
-        <legend className="mb-1">{t("marketWallet.paymentMethod")}</legend>
+        <legend className="mb-1 flex items-center gap-1">{t("marketWallet.paymentMethod")}<InfoHint>{t("marketWallet.directMethodHelp")}</InfoHint></legend>
         {channelMethods.length ? <div role="radiogroup" aria-label={t("marketWallet.paymentMethod")} className="grid gap-2 sm:grid-cols-2">
           {channelMethods.map((method) => (
             <label key={method.tokenId} className="flex min-h-11 cursor-pointer items-center gap-3 rounded-md border border-border bg-background px-3 py-2 hover:bg-muted has-[:checked]:border-primary has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-2 has-[:focus-visible]:outline-ring has-[:disabled]:cursor-not-allowed has-[:disabled]:opacity-50">
@@ -465,15 +467,14 @@ export function WalletTopupForm({
             </label>
           ))}
         </div> : <p className="text-xs text-muted-foreground">{t("marketWallet.noPaymentMethods")}</p>}
-        <p className="text-xs text-muted-foreground">{t("marketWallet.directMethodHelp")}</p>
       </fieldset> : null}
-      {parsedAmount != null && methodReady ? <dl aria-live="polite" className="grid grid-cols-[minmax(0,1fr)_auto] gap-x-3 gap-y-2 text-sm tabular-nums">
-        <dt className="text-muted-foreground">{t("walletPolicy.credit")}</dt><dd>{activeQuote ? formatMinorUsd(activeQuote.creditMinor) : t("marketWallet.quotingTotal")}</dd>
-        <dt className="text-muted-foreground">{t("walletPolicy.fee", { rate: (activeQuote?.feeBps ?? selectedChannel?.maintenanceFeeBps ?? 0) / 100 })}</dt><dd>{activeQuote ? formatMinorUsd(activeQuote.feeMinor) : t("marketWallet.quotingTotal")}</dd>
-        <dt className="font-semibold">{t("walletPolicy.total")}</dt><dd className="font-semibold">{activeQuote ? formatMinorUsd(activeQuote.payMinor) : t("marketWallet.quotingTotal")}</dd>
+      {parsedAmount != null && methodReady ? <dl aria-live="polite" className="grid grid-cols-[minmax(0,1fr)_auto] gap-x-3 gap-y-1.5 rounded-xl bg-muted/60 p-4 text-sm tabular-nums">
+        <dt className="text-slate-600">{t("walletPolicy.credit")}</dt><dd className="text-right">{activeQuote ? formatMinorUsd(activeQuote.creditMinor) : t("marketWallet.quotingTotal")}</dd>
+        <dt className="text-slate-600">{t("walletPolicy.fee", { rate: (activeQuote?.feeBps ?? selectedChannel?.maintenanceFeeBps ?? 0) / 100 })}</dt><dd className="text-right">{activeQuote ? formatMinorUsd(activeQuote.feeMinor) : t("marketWallet.quotingTotal")}</dd>
+        <dt className="mt-1.5 border-t border-border pt-2 font-semibold">{t("walletPolicy.total")}</dt><dd className="mt-1.5 border-t border-border pt-2 text-right text-lg font-semibold">{activeQuote ? formatMinorUsd(activeQuote.payMinor) : t("marketWallet.quotingTotal")}</dd>
       </dl> : null}
       {quoteError ? <div className="grid justify-items-start gap-2"><p role="alert" className="text-sm text-destructive">{quoteError}</p><Button variant="outline" onPress={() => setQuoteRefresh((value) => value + 1)}>{t("common.retry")}</Button></div> : null}
-      <p className="text-xs leading-5 text-muted-foreground">{t("walletPolicy.disclosure")}</p>
+      <p className="flex items-center gap-1 text-xs text-muted-foreground">{t("walletPolicy.disclosureShort")}<InfoHint>{t("walletPolicy.disclosure")}</InfoHint></p>
       <WalletActionButton
         label={busy ? t("marketWallet.creating") : activeQuote ? t("walletPolicy.pay", { amount: formatMinorUsd(activeQuote.payMinor) }) : t("marketWallet.pay")}
         phase={busy ? "loading" : topupError ? "error" : "default"}

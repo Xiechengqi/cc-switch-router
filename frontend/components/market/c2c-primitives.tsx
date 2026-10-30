@@ -7,6 +7,7 @@
  */
 import * as React from "react";
 import { Check, CircleAlert, Loader2, X } from "lucide-react";
+import { InfoHint } from "@/components/common/info-hint";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import type { C2CStatus } from "@/lib/market-c2c";
 
@@ -20,12 +21,23 @@ export function C2CAction({ phase = "default", previewState, secondary, children
   </button>;
 }
 export function C2CError({ children }: { children?: React.ReactNode }) { return children ? <p role="alert" className="flex min-w-0 items-start gap-2 rounded-md bg-destructive/5 p-3 text-sm text-foreground"><CircleAlert className="mt-0.5 size-4 shrink-0 text-destructive" aria-hidden="true" /><span className="min-w-0 break-words">{children}</span></p> : null; }
-export function C2CCheck({ children, ...props }: React.InputHTMLAttributes<HTMLInputElement>) {
-  return <label className="flex min-h-11 cursor-pointer items-start gap-3 py-2 text-sm leading-6"><input {...props} type="checkbox" className="mt-1 size-4 shrink-0 accent-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:cursor-not-allowed" /><span className="min-w-0 break-words">{children}</span></label>;
+/** A consent checkbox. Keep its label to one line; `hint` holds the full terms. */
+export function C2CCheck({ children, hint, ...props }: React.InputHTMLAttributes<HTMLInputElement> & { hint?: React.ReactNode }) {
+  const box = <label className="flex min-h-11 min-w-0 cursor-pointer items-start gap-3 py-2 text-sm leading-6"><input {...props} type="checkbox" className="mt-1 size-4 shrink-0 accent-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:cursor-not-allowed" /><span className="min-w-0 break-words">{children}</span></label>;
+  return hint ? <div className="flex min-w-0 items-start gap-1">{box}<InfoHint className="mt-3.5">{hint}</InfoHint></div> : box;
 }
+const C2C_STATUS_TONE: Record<C2CStatus, string> = {
+  awaiting_seller: "bg-amber-50 text-amber-900",
+  awaiting_payment: "bg-amber-50 text-amber-900",
+  paid: "bg-accent/10 text-accent",
+  disputed: "bg-red-50 text-red-800",
+  released: "bg-emerald-50 text-emerald-800",
+  cancelled: "bg-muted text-slate-700",
+  expired: "bg-muted text-slate-700",
+};
 export function C2CStatusLabel({ status }: { status: C2CStatus }) {
   const { t } = useLocaleText();
-  return <span className={`inline-flex w-fit max-w-full rounded-md px-2 py-1 text-xs font-medium ${status === "disputed" ? "bg-destructive/5 text-foreground" : status === "released" ? "bg-primary/10 text-primary" : "bg-muted text-foreground"}`}>{t(`c2c.status.${status}`)}</span>;
+  return <span className={`inline-flex w-fit max-w-full items-center whitespace-nowrap rounded-full px-2.5 py-1 text-xs font-medium ${C2C_STATUS_TONE[status]}`}>{t(`c2c.status.${status}`)}</span>;
 }
 export function C2CDialog({ open, title, busy = false, inline = false, onClose, children }: { open: boolean; title: string; busy?: boolean; inline?: boolean; onClose: () => void; children: React.ReactNode }) {
   const { t } = useLocaleText(); const dialog = React.useRef<HTMLDialogElement>(null); const heading = React.useId();
