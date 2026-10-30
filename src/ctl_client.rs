@@ -373,6 +373,29 @@ pub async fn preview_account_reset(
     post_control(backend, installation_id, control_secret, PREVIEW_ACCOUNT_RESET_PATH,
         serde_json::json!({"shareId":share_id,"expectedConfigRevision":expected_config_revision,"policies":policies}).to_string()).await
 }
+pub async fn preview_value_quota(
+    backend: &str,
+    installation_id: &str,
+    control_secret: &str,
+    share_id: &str,
+    expected_config_revision: u64,
+    policies: &std::collections::BTreeMap<String, crate::models::ShareUserPolicy>,
+) -> Result<serde_json::Value, CtlError> {
+    post_control(backend,installation_id,control_secret,"/_ctl/preview_value_quota",
+        serde_json::json!({"shareId":share_id,"expectedConfigRevision":expected_config_revision,"policies":policies}).to_string()).await
+}
+pub async fn edit_value_usage(
+    backend: &str,
+    installation_id: &str,
+    control_secret: &str,
+    share_id: &str,
+    expected_config_revision: u64,
+    actor: &str,
+    edits: &std::collections::BTreeMap<String, crate::share_value_pricing::ValueUsageEdit>,
+) -> Result<serde_json::Value, CtlError> {
+    post_control(backend,installation_id,control_secret,"/_ctl/edit_value_usage",
+        serde_json::json!({"shareId":share_id,"expectedConfigRevision":expected_config_revision,"actor":actor,"edits":edits}).to_string()).await
+}
 
 async fn post_control_with_timeout<T: serde::de::DeserializeOwned>(
     backend: &str,

@@ -147,6 +147,7 @@ export function draftFromShare(share: ShareView): ShareSettingsDraft {
       ...grant,
       email,
       role: email === ownerEmail ? "owner" : "shareto",
+      policy: grant.pendingValueQuota?.policy ?? grant.policy,
     };
   }
   const defaultPolicy = defaultUserPolicy(share);
@@ -193,6 +194,7 @@ export function buildShareSettingsPatch(
 
 function policyFingerprint(policy: ShareUserPolicy) {
   return JSON.stringify([policy.parallelLimit ?? null, policy.tokenLimit ?? null,
+    policy.valueQuota?.limitUsdMicros ?? null, policy.valueQuota?.tariffPolicyId ?? null,
     policy.tokenPeriod || "lifetime", policy.tokenPeriodAnchorAtMs ?? null, policy.expiresAt ?? null]);
 }
 

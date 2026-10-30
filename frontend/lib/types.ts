@@ -353,6 +353,7 @@ export type AccountResetPreview = {
 export type ShareUserPolicy = {
   parallelLimit?: number;
   tokenLimit?: number;
+  valueQuota?: { limitUsdMicros: string; tariffPolicyId: "api-equivalent-v1" };
   tokenPeriod: ShareTokenPeriod;
   tokenPeriodAnchorAtMs?: number;
   expiresAt?: number;
@@ -398,6 +399,8 @@ export type ShareUserUsageEdit = {
 export type ShareUserUsageEditMap = Record<string, ShareUserUsageEdit>;
 
 export type ShareUserGrant = {
+  valueMetering?: { quotaPolicyEpoch: string; valueMeteredFromMs: number; effectiveFromMs: number; pricingRevision: string };
+  pendingValueQuota?: { policy: ShareUserPolicy; effectiveFromMs: number; retainAccess: boolean };
   accountQuotaCycle?: AccountQuotaCycle;
   accountResetCapability?: AccountResetCapability;
   email: string;

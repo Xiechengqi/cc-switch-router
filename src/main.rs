@@ -70,6 +70,8 @@ mod server_logs;
 mod server_state;
 mod share_market;
 mod share_model_health;
+mod share_value_pricing;
+mod share_value_quotas;
 mod ssh;
 mod startup_config;
 mod store;

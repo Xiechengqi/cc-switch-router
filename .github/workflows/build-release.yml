@@ -73,6 +73,8 @@ jobs:
           npm run test:providers
           npm run test:share-model-probe
           npm run test:share-model-health-heatmap
+          npm run test:share-settings
+          npm run test:share-value-quota
 
       - name: Audit frontend contracts
         working-directory: frontend
@@ -166,6 +168,12 @@ jobs:
 
       - name: Test real migrations without template shortcuts
         run: bash scripts/ci/timed.sh 'Real schema migrations' cargo test --locked schema::tests
+
+      - name: Test Share value quota contracts
+        run: |
+          bash scripts/ci/timed.sh 'Share value pricing and signed projections' cargo test --locked share_value
+          bash scripts/ci/timed.sh 'Share reader compatibility' cargo test --locked share_contract_reader
+          bash scripts/ci/timed.sh 'Share authorization contracts' cargo test --locked share_user
 
   build:
     needs: frontend

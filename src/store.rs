@@ -110,6 +110,7 @@ use crate::registration_admission::{
 
 pub(crate) mod client_chat;
 pub(crate) mod password_auth;
+pub(crate) mod share_value_quotas;
 
 const SHARE_REQUEST_LOG_RECOVERY_LIMIT: usize = 10;
 pub const IMAGE_GENERATION_REQUEST_LOG_RETAIN_PER_SHARE: usize = 10;
@@ -3583,7 +3584,12 @@ impl AppStore {
             ok: true,
             server_time: now,
             share_contract_version: SHARE_CONTRACT_VERSION,
-            capabilities: vec!["accountResetV1".into(), "marketTrialV1".into()],
+            capabilities: vec![
+                "accountResetV1".into(),
+                "marketTrialV1".into(),
+                "usdEquivalentQuotaV1".into(),
+                "cacheCreationTtlV1".into(),
+            ],
         })
     }
 
@@ -8625,7 +8631,7 @@ impl AppStore {
                         request_kind, operation, parent_request_id, error_message, media_task_id, media_status,
                         video_duration_seconds, video_resolution, video_aspect_ratio,
                         cache_usage_observed, usage_estimated,
-                        started_at_ms, quota_source_ref, quota_source_epoch, quota_bucket_id
+                        started_at_ms, quota_source_ref, quota_source_epoch, quota_bucket_id, cache_creation_5m_tokens, cache_creation_1h_tokens
                  FROM share_request_logs
                  WHERE share_id = ?1
                    AND COALESCE(is_health_check, 0) = 0
@@ -9488,8 +9494,8 @@ impl AppStore {
                 ),
                 " LEFT JOIN thresholds th ON th.model_key = e.model_key".to_string(),
                 "CASE WHEN th.threshold IS NULL THEN 'base'
-                      WHEN th.inclusive = 1 AND e.input_tokens >= th.threshold THEN 'long'
-                      WHEN th.inclusive = 0 AND e.input_tokens >  th.threshold THEN 'long'
+                      WHEN th.inclusive = 1 AND (e.input_tokens + e.cache_read_tokens + e.cache_write_tokens) >= th.threshold THEN 'long'
+                      WHEN th.inclusive = 0 AND (e.input_tokens + e.cache_read_tokens + e.cache_write_tokens) >  th.threshold THEN 'long'
                       ELSE 'base' END"
                     .to_string(),
             )
@@ -15412,6 +15418,41 @@ fn normalize_share_descriptor_fields(share: &mut ShareDescriptor) -> Result<(), 
         )));
     }
     share.token_limit = normalize_share_limit_value(share.token_limit);
+    for grant in share.user_grants.values() {
+        validate_share_user_policy(&grant.policy, Utc::now().timestamp_millis())?;
+        if let Some(pending) = &grant.pending_value_quota {
+            validate_share_user_policy(&pending.policy, Utc::now().timestamp_millis())?;
+            if pending.policy.value_quota.is_none()
+                || grant
+                    .value_metering
+                    .as_ref()
+                    .is_none_or(|binding| pending.effective_from_ms < binding.value_metered_from_ms)
+            {
+                return Err(AppError::BadRequest("invalid scheduled value quota".into()));
+            }
+        }
+        if share.contract_version < 10
+            && (grant.policy.value_quota.is_some()
+                || grant.value_metering.is_some()
+                || grant.pending_value_quota.is_some())
+        {
+            return Err(AppError::BadRequest(
+                "USD-equivalent quota fields require Share contract v10".into(),
+            ));
+        }
+        if grant.manager == crate::models::ShareGrantManager::RouterShareMarket
+            && (grant.policy.value_quota.is_some() || grant.pending_value_quota.is_some())
+        {
+            return Err(AppError::BadRequest(
+                "Share Market managed terms cannot use USD-equivalent quotas".into(),
+            ));
+        }
+        if grant.policy.value_quota.is_some() && grant.value_metering.is_none() {
+            return Err(AppError::BadRequest(
+                "USD-equivalent quota requires Server metering evidence".into(),
+            ));
+        }
+    }
     share.parallel_limit = normalize_share_limit_value(share.parallel_limit);
     validate_share_model_probes(share)?;
     if share.expires_at == LEGACY_PERMANENT_SHARE_EXPIRES_AT {
@@ -16242,6 +16283,19 @@ fn upsert_share_tx(
 ) -> Result<(), AppError> {
     normalize_share_descriptor_fields(&mut share)?;
     validate_share_descriptor_bindings(&share)?;
+    for binding in share
+        .user_grants
+        .values()
+        .filter_map(|g| g.value_metering.as_ref())
+    {
+        let acknowledged:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM share_value_pricing_acks WHERE installation_id=?1 AND revision=?2)",
+            params![installation_id,binding.pricing_revision],|r|r.get(0)).map_err(|e|AppError::Internal(e.to_string()))?;
+        if !acknowledged {
+            return Err(AppError::Conflict(
+                "USD-equivalent tariff is not acknowledged by this installation".into(),
+            ));
+        }
+    }
     let new_quota_stream = merge_account_quota_projections(conn, &mut share)?;
     let chat_share_id = share.share_id.clone();
     let next_model_probe_epoch = descriptor_model_probe_epoch_input(&share);
@@ -16919,6 +16973,15 @@ fn upsert_share_request_log_tx(
     installation_id: &str,
     log: ShareRequestLogEntry,
 ) -> Result<bool, AppError> {
+    match (log.cache_creation_5m_tokens, log.cache_creation_1h_tokens) {
+        (None, None) => {}
+        (Some(five), Some(hour)) if five.checked_add(hour) == Some(log.cache_creation_tokens) => {}
+        _ => {
+            return Err(AppError::BadRequest(
+                "invalid cache creation TTL breakdown".into(),
+            ));
+        }
+    }
     let changed = conn.execute(
         "INSERT INTO share_request_logs (
             request_id, installation_id, share_id, share_name, provider_id, provider_name,
@@ -17032,6 +17095,17 @@ fn upsert_share_request_log_tx(
     )
     .map_err(|e| AppError::Internal(format!("upsert share request log failed: {e}")))?;
     if changed > 0 {
+        conn.execute(
+            "UPDATE share_request_logs SET cache_creation_5m_tokens=?2,cache_creation_1h_tokens=?3
+            WHERE request_id=?1 AND installation_id=?4",
+            params![
+                log.request_id,
+                log.cache_creation_5m_tokens.map(i64::from),
+                log.cache_creation_1h_tokens.map(i64::from),
+                installation_id
+            ],
+        )
+        .map_err(|e| AppError::Internal(format!("save cache TTL breakdown: {e}")))?;
         let attribution = log.quota_attribution.as_ref();
         if attribution
             .is_some_and(|attribution| Some(attribution.started_at_ms) != log.started_at_ms)
@@ -17080,6 +17154,27 @@ fn merge_account_quota_projections(
         .map_err(|error| AppError::Internal(format!("read quota grants failed: {error}")))?;
     let mut incoming_stream: Option<&str> = None;
     for grant in share.user_grants.values() {
+        if let Some(binding) = &grant.value_metering {
+            if binding.quota_policy_epoch.is_empty()
+                || binding.quota_policy_epoch.len() > 128
+                || binding.value_metered_from_ms < 0
+                || binding.effective_from_ms < binding.value_metered_from_ms
+            {
+                return Err(AppError::BadRequest(
+                    "invalid value metering binding".into(),
+                ));
+            }
+            if let Some(previous) = previous
+                .get(&grant.email)
+                .and_then(|g| g.value_metering.as_ref())
+            {
+                if previous.value_metered_from_ms != binding.value_metered_from_ms {
+                    return Err(AppError::Conflict(
+                        "value metering origin is immutable".into(),
+                    ));
+                }
+            }
+        }
         if share.contract_version < 8
             && (grant.policy.token_period == ShareTokenPeriod::AccountReset
                 || grant.account_quota_cycle.is_some()
@@ -20722,6 +20817,16 @@ fn token_period_window(
 }
 
 fn validate_share_user_policy(policy: &ShareUserPolicy, now_ms: i64) -> Result<(), AppError> {
+    if let Some(quota) = &policy.value_quota {
+        if policy.token_limit.is_some() {
+            return Err(AppError::BadRequest(
+                "tokenLimit and valueQuota are mutually exclusive".into(),
+            ));
+        }
+        quota
+            .limit_picos()
+            .map_err(|e| AppError::BadRequest(e.to_string()))?;
+    }
     let anchored = matches!(
         policy.token_period,
         ShareTokenPeriod::SevenDays | ShareTokenPeriod::ThirtyDays
@@ -20962,6 +21067,8 @@ mod token_period_window_tests {
                 output_tokens: 100,
                 cache_read_tokens: 50,
                 cache_creation_tokens: 25,
+                cache_creation_5m_tokens: None,
+                cache_creation_1h_tokens: None,
                 cache_usage_observed: true,
                 usage_estimated: false,
                 quota_tokens: Some(quota_tokens),
@@ -21388,7 +21495,12 @@ fn price_share_email_usage(
             continue;
         };
         let tier = ServiceTier::parse(&tier_raw).unwrap_or(ServiceTier::Standard);
-        let context = if price.is_long_context(split.input) {
+        let context = if price.is_long_context(
+            split
+                .input
+                .saturating_add(split.cache_read)
+                .saturating_add(split.cache_write),
+        ) {
             ContextTier::Long
         } else {
             ContextTier::Base
@@ -21545,8 +21657,8 @@ fn query_share_user_model_usage(
             ),
             " LEFT JOIN thresholds th ON th.model_key = e.model_key".to_string(),
             "CASE WHEN th.threshold IS NULL THEN 0
-                  WHEN th.inclusive = 1 AND e.input_tokens >= th.threshold THEN 1
-                  WHEN th.inclusive = 0 AND e.input_tokens >  th.threshold THEN 1
+                  WHEN th.inclusive = 1 AND (e.input_tokens + e.cache_read_tokens + e.cache_write_tokens) >= th.threshold THEN 1
+                  WHEN th.inclusive = 0 AND (e.input_tokens + e.cache_read_tokens + e.cache_write_tokens) >  th.threshold THEN 1
                   ELSE 0 END"
                 .to_string(),
         )
@@ -22021,7 +22133,12 @@ fn validate_returned_share_against_patch(
             match (&edit.policy, returned) {
                 (None, None) => {}
                 (Some(policy), Some(grant))
-                    if &grant.policy == policy
+                    if grant
+                        .pending_value_quota
+                        .as_ref()
+                        .map(|pending| &pending.policy)
+                        .unwrap_or(&grant.policy)
+                        == policy
                         && grant.manager != crate::models::ShareGrantManager::RouterShareMarket
                         && grant.revision >= edit.expected_revision => {}
                 _ => return Err("userGrantEdits"),
@@ -22129,7 +22246,12 @@ fn validate_returned_share_against_patch(
             };
             if returned.email != expected.email
                 || returned.role != expected.role
-                || returned.policy != expected.policy
+                || returned
+                    .pending_value_quota
+                    .as_ref()
+                    .map(|pending| &pending.policy)
+                    .unwrap_or(&returned.policy)
+                    != &expected.policy
             {
                 return Err("userGrants");
             }
@@ -22249,6 +22371,14 @@ fn normalize_share_user_grants_preserving(
             .and_then(|map| map.get(&email))
             .map(|prev| prev.usage.clone())
             .unwrap_or_default();
+        // Monetary bindings and schedules are Server-owned, not browser edits.
+        grant.value_metering = existing
+            .and_then(|map| map.get(&email))
+            .and_then(|g| g.value_metering.clone());
+        grant.pending_value_quota = existing
+            .and_then(|map| map.get(&email))
+            .and_then(|g| g.pending_value_quota.clone())
+            .filter(|pending| pending.policy == grant.policy);
         // Usage snapshots and manual rebases are Server-owned.  Preserve the
         // current rebase for an existing grant and never accept a client value
         // as a new baseline through the Router patch path.
@@ -24116,7 +24246,7 @@ fn list_global_recent_share_request_logs(
                     request_kind, operation, parent_request_id, error_message, media_task_id, media_status,
                     video_duration_seconds, video_resolution, video_aspect_ratio,
                     cache_usage_observed, usage_estimated,
-                    started_at_ms, quota_source_ref, quota_source_epoch, quota_bucket_id
+                    started_at_ms, quota_source_ref, quota_source_epoch, quota_bucket_id, cache_creation_5m_tokens, cache_creation_1h_tokens
              FROM share_request_logs
              WHERE COALESCE(is_health_check, 0) = 0
              ORDER BY created_at DESC, request_id DESC
@@ -24145,7 +24275,7 @@ fn list_recent_share_request_logs(
                     request_kind, operation, parent_request_id, error_message, media_task_id, media_status,
                     video_duration_seconds, video_resolution, video_aspect_ratio,
                     cache_usage_observed, usage_estimated,
-                    started_at_ms, quota_source_ref, quota_source_epoch, quota_bucket_id
+                    started_at_ms, quota_source_ref, quota_source_epoch, quota_bucket_id, cache_creation_5m_tokens, cache_creation_1h_tokens
              FROM (
                  SELECT request_id, share_id, share_name, provider_id, provider_name, app_type, model,
                         request_model, request_agent, requested_model, actual_model, actual_model_source,
@@ -24157,7 +24287,7 @@ fn list_recent_share_request_logs(
                         request_kind, operation, parent_request_id, error_message, media_task_id, media_status,
                         video_duration_seconds, video_resolution, video_aspect_ratio,
                         cache_usage_observed, usage_estimated,
-                        started_at_ms, quota_source_ref, quota_source_epoch, quota_bucket_id,
+                        started_at_ms, quota_source_ref, quota_source_epoch, quota_bucket_id, cache_creation_5m_tokens, cache_creation_1h_tokens,
                         ROW_NUMBER() OVER (
                             PARTITION BY share_id
                             ORDER BY created_at DESC, request_id DESC
@@ -24245,6 +24375,8 @@ fn map_share_request_log_row(row: &crate::db::Row<'_>) -> crate::db::Result<Shar
         video_resolution: row.get(42)?,
         video_aspect_ratio: row.get(43)?,
         cache_usage_observed: row.get::<_, i64>(44)? != 0,
+        cache_creation_5m_tokens: row.get::<_, Option<i64>>(50)?.map(|v| v as u32),
+        cache_creation_1h_tokens: row.get::<_, Option<i64>>(51)?.map(|v| v as u32),
         usage_estimated: row.get::<_, i64>(45)? != 0,
     })
 }
@@ -24415,6 +24547,8 @@ struct RecentShareLogFingerprint {
     output_tokens: u32,
     cache_read_tokens: u32,
     cache_creation_tokens: u32,
+    cache_creation_5m_tokens: Option<u32>,
+    cache_creation_1h_tokens: Option<u32>,
     cache_usage_observed: bool,
     usage_estimated: bool,
     is_streaming: bool,
@@ -24441,6 +24575,8 @@ fn deduplicate_recent_share_request_logs(
             output_tokens: log.output_tokens,
             cache_read_tokens: log.cache_read_tokens,
             cache_creation_tokens: log.cache_creation_tokens,
+            cache_creation_5m_tokens: log.cache_creation_5m_tokens,
+            cache_creation_1h_tokens: log.cache_creation_1h_tokens,
             cache_usage_observed: log.cache_usage_observed,
             usage_estimated: log.usage_estimated,
             is_streaming: log.is_streaming,
@@ -34079,6 +34215,8 @@ pub(crate) mod tests {
 
     fn test_share_user_grant(email: &str, role: &str, token_limit: u64) -> ShareUserGrant {
         ShareUserGrant {
+            value_metering: None,
+            pending_value_quota: None,
             account_quota_cycle: None,
             account_reset_capability: None,
             account_usage_baseline: None,
@@ -34086,6 +34224,7 @@ pub(crate) mod tests {
             role: role.to_string(),
             active: true,
             policy: crate::models::ShareUserPolicy {
+                value_quota: None,
                 parallel_limit: Some(2),
                 token_limit: Some(token_limit),
                 token_period: crate::models::ShareTokenPeriod::Day,
@@ -34114,6 +34253,68 @@ pub(crate) mod tests {
             },
             entitlement_id: None,
         }
+    }
+
+    #[test]
+    fn share_value_v10_schedules_are_acknowledged_without_faking_immediate_activation() {
+        use crate::share_value_pricing::{TARIFF_POLICY, ValueMeteringBinding, ValueQuota};
+        let mut descriptor = test_share_descriptor("value-share", "value-sub");
+        let email = "user@example.com";
+        let old = test_share_user_grant(email, "shareto", 100);
+        let mut requested = old.clone();
+        requested.policy.token_limit = None;
+        requested.policy.value_quota = Some(ValueQuota {
+            limit_usd_micros: "1000000".into(),
+            tariff_policy_id: TARIFF_POLICY.into(),
+        });
+        let patch = ShareSettingsPatch {
+            user_grants: Some(BTreeMap::from([(email.into(), requested.clone())])),
+            ..Default::default()
+        };
+        let mut saved = old.clone();
+        saved.value_metering = Some(ValueMeteringBinding {
+            quota_policy_epoch: "epoch".into(),
+            value_metered_from_ms: 1,
+            effective_from_ms: 2,
+            pricing_revision: "revision".into(),
+        });
+        saved.pending_value_quota = Some(crate::models::PendingValueQuota {
+            policy: requested.policy.clone(),
+            effective_from_ms: 2,
+            retain_access: true,
+        });
+        descriptor.user_grants = BTreeMap::from([(email.into(), saved)]);
+        descriptor.contract_version = 10;
+        normalize_share_descriptor_fields(&mut descriptor).unwrap();
+        validate_returned_share_against_patch(&patch, &descriptor).unwrap();
+        // Cancelling a pending switch must remove the pending policy, not
+        // merely report that the old policy is still being enforced.
+        let cancel = ShareSettingsPatch {
+            user_grants: Some(BTreeMap::from([(email.into(), old)])),
+            ..Default::default()
+        };
+        assert_eq!(
+            validate_returned_share_against_patch(&cancel, &descriptor),
+            Err("userGrants")
+        );
+        for version in [7, 8, 9] {
+            let mut legacy = descriptor.clone();
+            legacy.contract_version = version;
+            assert!(normalize_share_descriptor_fields(&mut legacy).is_err());
+        }
+        let mut market = descriptor.clone();
+        market.user_grants.get_mut(email).unwrap().manager =
+            crate::models::ShareGrantManager::RouterShareMarket;
+        assert!(normalize_share_descriptor_fields(&mut market).is_err());
+        let mut mixed = requested.policy.clone();
+        mixed.token_limit = Some(1);
+        assert!(validate_share_user_policy(&mixed, Utc::now().timestamp_millis()).is_err());
+        descriptor
+            .user_grants
+            .get_mut(email)
+            .unwrap()
+            .pending_value_quota = None;
+        assert!(validate_returned_share_against_patch(&patch, &descriptor).is_err());
     }
 
     fn quota_test_descriptor(
@@ -34652,6 +34853,8 @@ pub(crate) mod tests {
             output_tokens: 2,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            cache_creation_5m_tokens: None,
+            cache_creation_1h_tokens: None,
             cache_usage_observed: true,
             usage_estimated: false,
             quota_tokens: None,
@@ -34717,6 +34920,37 @@ pub(crate) mod tests {
         assert_eq!(
             stored[0].effective_service_tier.as_deref(),
             Some("priority")
+        );
+    }
+
+    #[test]
+    fn share_value_cache_ttl_round_trips_without_fabricating_legacy_splits() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let mut log = test_share_request_log_entry("ttl", "share-1", Utc::now().timestamp());
+        log.cache_creation_tokens = 12;
+        upsert_share_request_log_tx(&conn, "installation", log.clone()).unwrap();
+        let legacy = list_global_recent_share_request_logs(&conn, 10).unwrap();
+        assert_eq!(legacy[0].cache_creation_5m_tokens, None);
+        assert_eq!(legacy[0].cache_creation_1h_tokens, None);
+        let mut updated = log.clone();
+        updated.usage_revision = 1;
+        updated.cache_creation_5m_tokens = Some(5);
+        updated.cache_creation_1h_tokens = Some(7);
+        upsert_share_request_log_tx(&conn, "installation", updated.clone()).unwrap();
+        assert!(!upsert_share_request_log_tx(&conn, "installation", log).unwrap());
+        let read = list_global_recent_share_request_logs(&conn, 10).unwrap();
+        assert_eq!(read[0].cache_creation_tokens, 12);
+        assert_eq!(read[0].cache_creation_5m_tokens, Some(5));
+        assert_eq!(read[0].cache_creation_1h_tokens, Some(7));
+        updated.usage_revision = 2;
+        updated.cache_creation_1h_tokens = None;
+        assert!(upsert_share_request_log_tx(&conn, "installation", updated.clone()).is_err());
+        updated.cache_creation_1h_tokens = Some(8);
+        assert!(upsert_share_request_log_tx(&conn, "installation", updated).is_err());
+        assert_eq!(
+            list_global_recent_share_request_logs(&conn, 10).unwrap()[0].usage_revision,
+            1
         );
     }
 
@@ -36570,6 +36804,301 @@ pub(crate) mod tests {
         )
         .expect("insert signed installation");
         signing_key
+    }
+
+    #[tokio::test]
+    async fn share_value_signed_sync_binds_installation_nonce_tariff_epoch_and_revision() {
+        use crate::share_value_pricing::{
+            PricingSnapshot, TARIFF_POLICY, ValueMeteringBinding, ValueQuota, ValueQuotaStatus,
+        };
+        use crate::store::share_value_quotas::{PublishPricing, SignedValueRequest};
+        use serde_json::json;
+        let (store, _config) = setup_store("share-value-signed").await;
+        let key = insert_signed_installation(&store, "value-install").await;
+        let other_key = insert_signed_installation(&store, "other-install").await;
+        insert_share(
+            &store,
+            "value-install",
+            "value-share",
+            "value-sub",
+            "active",
+        )
+        .await;
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/share-value-pricing-v1.json"
+        ))
+        .unwrap();
+        let snapshot: PricingSnapshot =
+            serde_json::from_value(fixture["snapshot"].clone()).unwrap();
+        let revision = snapshot.revision().unwrap();
+        let settings = store
+            .publish_value_pricing(
+                PublishPricing {
+                    expected_version: 0,
+                    effective_from_ms: Utc::now().timestamp_millis() + 60000,
+                    snapshot: snapshot.clone(),
+                },
+                "owner@example.com",
+            )
+            .await
+            .unwrap();
+        assert_eq!(settings.revision.as_deref(), Some(revision.as_str()));
+        assert!(
+            store
+                .publish_value_pricing(
+                    PublishPricing {
+                        expected_version: 0,
+                        effective_from_ms: Utc::now().timestamp_millis() + 60000,
+                        snapshot
+                    },
+                    "owner@example.com"
+                )
+                .await
+                .is_err()
+        );
+        let mut grant = test_share_user_grant("user@example.com", "shareto", 100);
+        grant.policy.token_limit = None;
+        grant.policy.token_period = ShareTokenPeriod::Lifetime;
+        grant.policy.value_quota = Some(ValueQuota {
+            limit_usd_micros: "1000000".into(),
+            tariff_policy_id: TARIFF_POLICY.into(),
+        });
+        grant.value_metering = Some(ValueMeteringBinding {
+            quota_policy_epoch: "epoch".into(),
+            value_metered_from_ms: 0,
+            effective_from_ms: 0,
+            pricing_revision: revision.clone(),
+        });
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET user_grants_json=?2 WHERE share_id=?1",
+                params![
+                    "value-share",
+                    serde_json::to_string(&BTreeMap::from([(grant.email.clone(), grant.clone())]))
+                        .unwrap()
+                ],
+            )
+            .unwrap();
+        }
+        let request = |installation: &str,
+                       signer: &SigningKey,
+                       action: &str,
+                       payload: serde_json::Value,
+                       nonce: &str| {
+            let timestamp_ms = Utc::now().timestamp_millis();
+            let nonce = format!("value-{nonce}");
+            SignedValueRequest {
+                protocol_epoch: PROTOCOL_EPOCH.into(),
+                installation_id: installation.into(),
+                timestamp_ms,
+                signature: sign_test_payload(
+                    signer,
+                    installation,
+                    action,
+                    &payload,
+                    timestamp_ms,
+                    &nonce,
+                ),
+                nonce,
+                payload,
+            }
+        };
+        let fetch = store
+            .signed_value_operation(
+                "share_value_pricing_fetch",
+                request(
+                    "value-install",
+                    &key,
+                    "share_value_pricing_fetch",
+                    json!({}),
+                    "fetch",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fetch["installationId"], "value-install");
+        assert_eq!(fetch["revision"], revision);
+        assert!(
+            store
+                .signed_value_operation(
+                    "share_value_pricing_fetch",
+                    request(
+                        "value-install",
+                        &key,
+                        "share_value_pricing_fetch",
+                        json!({}),
+                        "fetch"
+                    )
+                )
+                .await
+                .is_err()
+        );
+        let mut status = ValueQuotaStatus {
+            email: grant.email.clone(),
+            policy_epoch: "epoch".into(),
+            window_id: "Lifetime:0:0".into(),
+            window_starts_at_ms: 0,
+            resets_at_ms: None,
+            metered_from_ms: 0,
+            active_pricing_revision: revision.clone(),
+            usage_pricing_revisions_digest: "digest".into(),
+            usage_watermark: 2,
+            limit_usd_micros: Some("1000000".into()),
+            used_picos: "100".into(),
+            observed_picos: "100".into(),
+            manual_offset_picos: "0".into(),
+            pending_risk_picos: "0".into(),
+            metering_status: "observed".into(),
+            synced_at_ms: Utc::now().timestamp_millis(),
+        };
+        let report = |status: &ValueQuotaStatus| json!({"shareId":"value-share","status":status});
+        assert!(
+            store
+                .signed_value_operation(
+                    "share_value_quota_watermark",
+                    request(
+                        "value-install",
+                        &key,
+                        "share_value_quota_watermark",
+                        report(&status),
+                        "before-ack"
+                    )
+                )
+                .await
+                .is_err()
+        );
+        store
+            .signed_value_operation(
+                "share_value_pricing_ack",
+                request(
+                    "value-install",
+                    &key,
+                    "share_value_pricing_ack",
+                    json!({"revision":revision,"storageSchema":3}),
+                    "ack",
+                ),
+            )
+            .await
+            .unwrap();
+        let accepted = store
+            .signed_value_operation(
+                "share_value_quota_watermark",
+                request(
+                    "value-install",
+                    &key,
+                    "share_value_quota_watermark",
+                    report(&status),
+                    "initial",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted["usageWatermark"], 2);
+        status.observed_picos = "90".into();
+        status.used_picos = "90".into();
+        assert!(
+            store
+                .signed_value_operation(
+                    "share_value_quota_watermark",
+                    request(
+                        "value-install",
+                        &key,
+                        "share_value_quota_watermark",
+                        report(&status),
+                        "same-revision-conflict"
+                    )
+                )
+                .await
+                .is_err()
+        );
+        status.usage_watermark = 3;
+        store
+            .signed_value_operation(
+                "share_value_quota_watermark",
+                request(
+                    "value-install",
+                    &key,
+                    "share_value_quota_watermark",
+                    report(&status),
+                    "lower-usage",
+                ),
+            )
+            .await
+            .unwrap();
+        status.usage_watermark = 1;
+        status.observed_picos = "999".into();
+        status.used_picos = "999".into();
+        let older = store
+            .signed_value_operation(
+                "share_value_quota_watermark",
+                request(
+                    "value-install",
+                    &key,
+                    "share_value_quota_watermark",
+                    report(&status),
+                    "older",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(older["usageWatermark"], 3);
+        assert!(
+            store
+                .signed_value_operation(
+                    "share_value_quota_watermark",
+                    request(
+                        "other-install",
+                        &other_key,
+                        "share_value_quota_watermark",
+                        report(&status),
+                        "other-installation"
+                    )
+                )
+                .await
+                .is_err()
+        );
+        status.policy_epoch = "old-epoch".into();
+        assert!(
+            store
+                .signed_value_operation(
+                    "share_value_quota_watermark",
+                    request(
+                        "value-install",
+                        &key,
+                        "share_value_quota_watermark",
+                        report(&status),
+                        "wrong-epoch"
+                    )
+                )
+                .await
+                .is_err()
+        );
+        let own = store
+            .share_value_quota_status("value-share", Some(&grant.email))
+            .await
+            .unwrap();
+        assert_eq!(own.len(), 1);
+        assert_eq!(own[0].used_picos, "90");
+        assert!(
+            store
+                .share_value_quota_status("value-share", Some("other@example.com"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        {
+            let conn = store.conn.lock().await;
+            conn.execute("DELETE FROM share_request_logs", []).unwrap();
+        }
+        assert_eq!(
+            store
+                .share_value_quota_status("value-share", Some(&grant.email))
+                .await
+                .unwrap()[0]
+                .used_picos,
+            "90"
+        );
     }
 
     async fn insert_setup_client_tunnel(store: &AppStore, installation_id: &str, subdomain: &str) {
@@ -38609,19 +39138,21 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn share_contract_v9_keeps_v6_v7_v8_compatible_and_rejects_future_versions() {
-        for version in [6, 7, 8, 9] {
+    fn share_contract_reader_keeps_previous_versions_compatible_and_rejects_future_versions() {
+        for version in 6..=SHARE_CONTRACT_VERSION {
             let mut descriptor = test_share_descriptor("share-readable", "share-readable-sub");
             descriptor.contract_version = version;
             normalize_share_descriptor_fields(&mut descriptor)
-                .expect("v6/v7/v8/v9 descriptors remain readable");
+                .expect("supported ordinary Share descriptors remain readable");
         }
 
         let mut future = test_share_descriptor("share-future", "share-future-sub");
         future.contract_version = SHARE_CONTRACT_VERSION + 1;
         let error = normalize_share_descriptor_fields(&mut future)
             .expect_err("future Share contract must fail closed");
-        assert!(error.to_string().contains("expected 2..=9"));
+        assert!(error.to_string().contains(&format!(
+            "expected {MIN_SHARE_CONTRACT_VERSION}..={SHARE_CONTRACT_VERSION}"
+        )));
     }
 
     #[test]
@@ -49541,6 +50072,8 @@ pub(crate) mod tests {
                     output_tokens: 2,
                     cache_read_tokens: 0,
                     cache_creation_tokens: 0,
+                    cache_creation_5m_tokens: None,
+                    cache_creation_1h_tokens: None,
                     cache_usage_observed: true,
                     usage_estimated: false,
                     quota_tokens: None,
@@ -49730,6 +50263,8 @@ pub(crate) mod tests {
             output_tokens: 20,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            cache_creation_5m_tokens: None,
+            cache_creation_1h_tokens: None,
             cache_usage_observed: true,
             usage_estimated: false,
             quota_tokens: Some(30),

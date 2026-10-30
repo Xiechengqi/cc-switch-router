@@ -18,6 +18,7 @@ import { rentalAuditMessagesEn, rentalAuditMessagesZh } from "@/lib/client-renta
 import { accountMarketMessagesEn, accountMarketMessagesZh } from "@/lib/account-market-messages";
 import { accountSectionMessagesEn, accountSectionMessagesZh } from "@/lib/account-section-messages";
 import { walletActionsMessagesEn, walletActionsMessagesZh } from "@/lib/wallet-actions-messages";
+import { valueQuotaMessagesEn, valueQuotaMessagesZh } from "@/lib/share-value-quota-messages";
 
 export const LOCALE_STORAGE_KEY = "cc_switch_router_locale_v1";
 export const SUPPORTED_LOCALES = ["en", "zh-CN"] as const;
@@ -3510,6 +3511,7 @@ export const messages = {
     ...accountMarketMessagesEn,
     ...accountSectionMessagesEn,
     ...walletActionsMessagesEn,
+    ...valueQuotaMessagesEn,
   },
   "zh-CN": {
     ...rentalAuditMessagesZh,
@@ -6898,6 +6900,7 @@ export const messages = {
     ...accountMarketMessagesZh,
     ...accountSectionMessagesZh,
     ...walletActionsMessagesZh,
+    ...valueQuotaMessagesZh,
   },
 } as const;
 

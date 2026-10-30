@@ -4,6 +4,7 @@ import { ChevronDown, ChevronRight, Eye, Link2, Maximize2, Pencil } from "lucide
 import { Button, Card, Chip, Input, Modal, ProgressBar, Tabs } from "@heroui/react";
 import * as React from "react";
 import { useAuth } from "@/components/auth/auth-provider";
+import { useShareValueQuota } from "@/lib/use-share-value-quota";
 import { ShareProviderStatusPanel } from "@/components/dashboard/share-provider-status-panel";
 import {
   ShareProviderLogo,
@@ -45,6 +46,7 @@ import {
   formatRelativeTime,
 } from "@/lib/utils";
 import { formatTokenMillions, formatTokenMillionsFixed } from "@/lib/token-units";
+import { microsToUsdInput, formatQuotaPicos, compatibleValueStatus, valueStatusTextKey, valueQuotaAvailability, type ValueQuotaStatus } from "@/lib/share-value-quota";
 import { isPermanentUserPolicyExpiry } from "@/lib/share-settings";
 import {
   formatUsdMicros,
@@ -813,6 +815,8 @@ export function ShareEmailUsagePanel({
   const [error, setError] = React.useState("");
   const showUsage = mode === "table" || mode === "trend";
   const showLimits = mode === "limits";
+  const {session}=useAuth();
+  const privateValueStatuses=useShareValueQuota(share.shareId,!!share.canManage || !!session?.isAdmin,showLimits);
   const limitGrants = React.useMemo(
     () => activeUserLimitGrants(share),
     [share],
@@ -951,6 +955,7 @@ export function ShareEmailUsagePanel({
         <ShareUserLimitsTable
           rows={limitRows || undefined}
           grants={limitGrants}
+          valueQuotaStatuses={privateValueStatuses}
           t={t}
           breakdown={breakdown}
           breakdownRevision={breakdownRevision}
@@ -1389,9 +1394,11 @@ export function ShareUserLimitsTable({
   breakdownLoaded,
   onExpand,
   onPriceSaved,
+  valueQuotaStatuses,
 }: {
   rows?: ShareUserLimitStatusRow[];
   grants?: ShareUserGrant[];
+  valueQuotaStatuses?: ValueQuotaStatus[];
   t: TFn;
   leading?: {
     header: React.ReactNode;
@@ -1521,6 +1528,9 @@ export function ShareUserLimitsTable({
             const pct = limited && limit > 0 ? (used / limit) * 100 : 0;
             const countdown = formatResetCountdown(row.resetsAt, nowMs);
             const grant = grantByEmail.get(row.email.trim().toLowerCase());
+            const valueQuota = (grant?.pendingValueQuota?.policy ?? grant?.policy)?.valueQuota;
+            const valueStatus = compatibleValueStatus(valueQuotaStatuses, grant);
+            const valueAvailable = grant?.pendingValueQuota ? undefined : valueQuotaAvailability(valueStatus?.usedPicos, valueQuota?.limitUsdMicros);
             const roleTag = userLimitRoleTag(row, grant);
             const emailKey = row.email.trim().toLowerCase();
             const isExpanded = expanded.has(emailKey);
@@ -1576,16 +1586,21 @@ export function ShareUserLimitsTable({
                 <td className="overflow-hidden px-1.5 py-2">
                   <div className="font-mono leading-4">
                     <strong>
-                      {quotaPending ? t("quota.awaitingObservation") : compactTokens(used)}
+                      {valueQuota ? formatQuotaPicos(valueStatus?.usedPicos) : quotaPending ? t("quota.awaitingObservation") : compactTokens(used)}
                       {" / "}
-                      {limited ? compactTokens(limit!) : "∞"}
+                      {valueQuota ? `US$${microsToUsdInput(valueQuota.limitUsdMicros)}` : limited ? compactTokens(limit!) : "∞"}
                     </strong>
                     <span className="text-muted-foreground">
                       {" · "}
-                      {periodLabels[period] || period}
+                      {periodLabels[grant?.pendingValueQuota?.policy.tokenPeriod ?? period] || period}
                     </span>
                   </div>
-                  {equivalent ? (
+                  {valueQuota ? <div className="mt-0.5 text-[10px] text-muted-foreground">
+                    {t(grant?.pendingValueQuota ? "dashboard.userLimit.value.state.scheduled" : valueStatusTextKey(valueStatus, nowMs))}
+                    {grant?.pendingValueQuota ? ` · ${new Date(grant.pendingValueQuota.effectiveFromMs).toLocaleString()}` : null}
+                  </div> : null}
+                  {valueAvailable ? <div className="mt-0.5 text-[10px] text-muted-foreground">{t("dashboard.userLimit.value.remaining")}: {formatQuotaPicos(valueAvailable.remainingPicos)}</div> : null}
+                  {equivalent && !valueQuota ? (
                     <div
                       className="mt-0.5 font-mono text-[10px] leading-4 text-muted-foreground"
                       title={t("dashboard.userLimit.equivalent.hint")}
@@ -1593,7 +1608,7 @@ export function ShareUserLimitsTable({
                       ≈ {equivalent}
                     </div>
                   ) : null}
-                  {limited && !quotaPending ? (
+                  {limited && !quotaPending && !valueQuota ? (
                     <UsageBar
                       used={used}
                       limit={limit!}
@@ -1601,11 +1616,11 @@ export function ShareUserLimitsTable({
                       className="w-full"
                     />
                   ) : null}
-                  {pct >= 100 ? (
+                  {valueAvailable?.exhausted || (!valueQuota && pct >= 100) ? (
                     <div className="mt-0.5 text-[10px] text-danger">
                       {t("dashboard.userLimit.atLimit")}
                     </div>
-                  ) : pct >= 80 ? (
+                  ) : valueAvailable?.nearLimit || (!valueQuota && pct >= 80) ? (
                     <div className="mt-0.5 text-[10px] text-warning">
                       {t("dashboard.userLimit.nearLimit")}
                     </div>

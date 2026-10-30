@@ -9,7 +9,9 @@
 //! Boundaries this module deliberately does not cross (§2):
 //!   * R1 — amounts produced here are display-only and must never reach
 //!     `market_accrual_entries` / `market_invoices` / any billing snapshot.
-//!   * R3 — the Server never computes cost or USD; this lives on the Router.
+//!   * Reference prices live on Router. Share v10 may separately execute
+//!     pure USD-equivalent quotas on Server using an acknowledged frozen
+//!     tariff; those counters never represent wallet money or Provider bills.
 //!
 //! Split off from transport and storage in the same spirit as
 //! `proxy/TokenHub/backend/internal/metering/pricing.go`.

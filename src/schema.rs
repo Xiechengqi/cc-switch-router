@@ -344,6 +344,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         100,
         include_str!("../schema/0100_market_payment_single_active_method.sql"),
     ),
+    (101, include_str!("../schema/0101_share_value_quotas.sql")),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -853,7 +854,51 @@ fn migration_checksum(sql: &str) -> String {
 mod tests {
     use super::*;
 
-    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 262;
+    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 266;
+
+    #[test]
+    fn migration_101_adds_private_value_quotas_without_repricing_wallets_or_inventing_cache_ttl() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 100);
+        conn.execute("INSERT INTO share_request_logs(request_id,installation_id,share_id,share_name,provider_id,provider_name,
+            app_type,model,request_model,status_code,latency_ms,input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,is_streaming,created_at)
+            VALUES('old-value-log','install','share','Share','provider','Provider','claude','model','model',200,1,100,10,20,30,0,1)",[]).unwrap();
+        let before: i64 = conn
+            .query_row(
+                "SELECT version FROM market_wallet_policy WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT version FROM market_wallet_policy WHERE id=1",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            before
+        );
+        assert_eq!(conn.query_row("SELECT input_tokens,cache_creation_tokens,cache_creation_5m_tokens,cache_creation_1h_tokens FROM share_request_logs WHERE request_id='old-value-log'",[],
+            |r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,Option<i64>>(2)?,r.get::<_,Option<i64>>(3)?))).unwrap(),(100,30,None,None));
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM share_value_quota_projections",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM share_value_pricing_config", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
 
     #[test]
     fn migration_100_bounds_new_channel_activation_without_rewriting_live_orders() {

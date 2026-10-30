@@ -187,10 +187,12 @@ Router 不接受长效 SSH 凭据。每次建链前 Server 申请一次性 lease
 
 `ShareDescriptor` 面向全新部署时必须满足以下约束:
 
-- Router 当前 reader 支持 **Share Contract v2..v9**。Server 普通未协商 descriptor 保持 **Share Contract v7**；账号周期 v8、一次性市场试用 v9 须显式能力。v4 引入本节 `modelProbe`（Router 仅对 v4 以上执行探针），v5 引入 Grok 媒体权限，v6 增加 scoped quota metadata，v7 增加只展示的 `unobservedTiers` 及 Codex `bankedReset`；它们不参与调度/限流/容量评分。连接测试/模型健康检查保留 v7 兼容。
+- Router 当前 reader 支持 **Share Contract v2..v10**。Server 普通未协商 descriptor 保持 **Share Contract v7**；账号周期 v8、一次性市场试用 v9、美元等值配额 v10 须显式能力。v4 引入本节 `modelProbe`（Router 仅对 v4 以上执行探针），v5 引入 Grok 媒体权限，v6 增加 scoped quota metadata，v7 增加只展示的 `unobservedTiers` 及 Codex `bankedReset`；它们不参与调度/限流/容量评分。连接测试/模型健康检查保留 v7 兼容。
 - Share Market 最低版本仍为 v5（`MIN_SHARE_MARKET_CONTRACT_VERSION=5`），不因账号周期的协商扩展抬高。reader 上限、普通 descriptor 版本与市场最低版本是三项独立约束。
-- v8增加`tokenPeriod=accountReset`及userGrants只读`accountQuotaCycle/accountResetCapability/accountUsageBaseline`、`usageQuota.usageWatermark`。安装heartbeat响应同时返回`shareContractVersion=9,capabilities=["accountResetV1","marketTrialV1"]`；Server同时检查显式能力、Router URL/installation绑定和300秒有效期。普通v7必须省略新嵌套字段，v7携带accountReset/新字段拒绝，不能静默转换为sevenDays；市场报价不开放动态周期。
+- v8增加`tokenPeriod=accountReset`及userGrants只读`accountQuotaCycle/accountResetCapability/accountUsageBaseline`、`usageQuota.usageWatermark`。安装heartbeat响应同时返回`shareContractVersion=10,capabilities=["accountResetV1","marketTrialV1","usdEquivalentQuotaV1","cacheCreationTtlV1"]`；Server同时检查显式能力、Router URL/installation绑定和300秒有效期。普通v7必须省略新嵌套字段，v7携带accountReset/新字段拒绝，不能静默转换为sevenDays；市场报价不开放动态周期。
 - v9 的 `marketEntitlements` 按 entitlement ID 返回 `trialScopeId/email/phase/active/trialTokenAllowance/trialTokenLimit/trialTokensUsed/usageRevision/usageUncertain/appliedAtMs/paidStartedAtMs`。`phase=trial|paid`，Token cap 缺省表示仅时长试用，不能写普通 `tokenLimit:0`。试用累计数和修订只增不减，与普通日／周／月 quota 分开；使用量变化不提升静态 descriptor generation。完整 descriptor 的 Notify＋周期重放持续携带动态试用水位。v9 以下不得携带非空试用状态。
+- v10 的普通用户 `policy.valueQuota={limitUsdMicros:"10000000",tariffPolicyId:"api-equivalent-v1"}` 与 `tokenLimit` 互斥，共用原 `tokenPeriod` 和 anchor。它是模型 API 标价等值使用限额，不是钱包余额或 Provider 账单。缺省仍为不限额；零额度非法。grant 可带 Server-owned `valueMetering={quotaPolicyEpoch,valueMeteredFromMs,effectiveFromMs,pricingRevision}` 和 `pendingValueQuota={policy,effectiveFromMs,retainAccess}`。切换到未完整覆盖的自然窗口时保留原 policy，到边界后持久化启用；新授权等待期间不提供无限制访问。首次累计模式从确认的计量起点开始，之后删加授权、改策略、切换单位均不能重设该起点或清空同窗口消费。v7–v9 不接受这些字段；活跃市场托管授权不允许金额模式。
+- `cacheCreationTtlV1` 是独立的请求日志能力，不能从 reader v10 或 `usdEquivalentQuotaV1` 推断。协商后可同时附 `cacheCreation5mTokens`、`cacheCreation1hTokens`，两者非负且和等于原 `cacheCreationTokens`；两者必须同时缺省或同时出现。历史合并值保持 unknown TTL，不能虚构拆分；原四桶 Token 总数不变。
 - managed upsert 可附 `marketPhase/trialScopeId/trialTokenAllowance/trialTokenLimit`；revoke 不附这些字段。相同 entitlement 不得改变 scope、重新赋予试用或增加原始预算。Server 在转发前持久化请求所属 entitlement 和 phase，迟到试用用量不能计入正式额度。正式授权回执确认后 Router 才从预留款捕获首期费用；失败或未知回执先撤权，确认清理后才释放预留。`usageUncertain` 表示崩溃等情况下消费不能证明完整，须安全回收，不能当作零用量续试。
 - `accountQuotaCycle`包含`streamIncarnation/sourceRef/sourceEpoch/bucketId/cycleId/cycleSequence/cycleRevision/startsAtMs/endsAtMs/basis/observedAtMs/eventId`，UTC毫秒半开区间，end可空。缺完整历史时`usageQuota=null`而非0；Router不按本机时间外推窗口，不把本地历史加回Server权威账号quota，不用跨周期max。
 - 动态账号投影不改变管理员configRevision/静态descriptor generation/fingerprint。当前复用完整descriptor同步及ACK，Server Notify+30秒重放，**没有独立dynamic envelope或精确usageWatermark ACK**。先检查stream/source/epoch，再按cycleSequence、同cycle revision和usageWatermark合并；合法更高水位允许数值下降，旧周期/旧水位丢弃。source交接要求更新config revision；新stream完整descriptor为restore握手，允许合法静态版本从旧备份恢复，旧stream在Share级永久retire，不能随用户删除/新增复活。
@@ -694,3 +696,53 @@ Share 直连隧道另有独立白名单:`/v1`、`/v1/`、`/v1beta/`、`/gemini/v
 - `POST /v1/shares/edit-ack` 对 `{"ack":<请求体 ack 原文>}` 验签，包含 `ack.currentShare` 时不得重序列化 descriptor
 - 上述 Share sync/claim/edit-ack 控制请求为兼容旧 Server 可省略 `protocolEpoch`；一旦出现就必须是当前 epoch 的非空字符串，`null` 与错误 epoch 都拒绝
 - Share descriptor、其嵌套权威对象和 batch operation 都拒绝未知字段；契约扩展必须提升 `contractVersion` 并先部署 Router。Server 的 `shareSha256` 请求必须同样遵循 Router-first 发布顺序
+
+## 13. Share v10 美元等值额度
+
+此功能与钱包、充值、市场租金完全独立。完整实现规格和真实灰度门槛见 [实施计划](docs/share-user-value-quota-implementation-plan.md)。当前只声明本地／夹具验证；真实转发面保持 `live_pending`。
+
+### 13.1 不可变执行价目
+
+`GET/POST /v1/admin/share-value-pricing` 仅 Router Owner 可用。发布体为 `{expectedVersion,effectiveFromMs,snapshot}`，配置 CAS 冲突为 409。快照 schema v1 使用 `currency=USD`、`tariffPolicyId=api-equivalent-v1`、准确 `models` 和显式 `exactAliases`；模型包含 `contextInputBasis=rawInput|freshInput`、长上下文阈值及比较方向、每个声明服务层级的 base/long 费率矩阵。费率是整数微美元／百万 Token 的十进制字符串；`null` 为不可用，不是零价。模型和别名唯一；最多 10,000 模型、40,000 别名、4 MiB。修订为规范字段顺序及排序 map 序列化的 SHA-256；测试向量见 `tests/fixtures/share-value-pricing-v1.json`。
+
+Server 使用通用 installation Ed25519 envelope（`protocolEpoch/installationId/timestampMs/nonce/signature`，同 §3 签名串）调用：
+
+| 路径 | action | 签名 payload |
+| --- | --- | --- |
+| `POST /v1/shares/value-pricing/fetch` | `share_value_pricing_fetch` | `{}` |
+| `POST /v1/shares/value-pricing/ack` | `share_value_pricing_ack` | `{revision,storageSchema:3}` |
+| `POST /v1/shares/:share_id/value-quota-watermarks` | `share_value_quota_watermark` | `{shareId,status}` |
+
+fetch 返回 null 或 `{installationId,revision,effectiveFromMs,snapshot}`。Server 校验绑定、大小及散列，在生效时间到达后安装到 committed SQLite；收到匹配的 ACK 回执才激活本地修订。无快照时不开启美元模式。断连时继续使用最后确认的本地快照，不能接受无法核验的新修订。调价只作用于新准入请求；历史使用量保留冻结修订和费率。
+
+### 13.2 精度、准入和动态水位
+
+额度 `limitUsdMicros` 必须大于零且最多 `1000000000000000`。累计量使用整数 picos 字符串，`1 USD=10^12 picos`；每分类贡献直接为 `tokens × rateMicrosPer1m`，不先截断成美分。cache write 只有合并量时使用已证明的两档最高价并标记 `conservative`；没有可信上界则不可用。
+
+Server 在真正发上游前以 IMMEDIATE SQLite 事务校验并写入风险占用。`spent + pendingRisk >= limit` 拒绝新请求，已准入请求自然结束，可超过额度，是请求级软上限而非绝对硬上限。当前未使用可信输出 ceiling，单次请求预占全部剩余容量；最大并发还受原并发限制与金额模式上限 4 共同约束。
+
+首期仅允许三组实际运行时：`claude.anthropic_api_key` + `http.anthropic_messages`、`codex.openai_api_key` + `http.openai_responses`、`gemini.google_api_key` + `http.gemini_native`，对应 Messages、Responses、Chat Completions、Gemini 的单 attempt 文本请求。保存预览和发送前均核对实际 profile／driver，而非只信任兼容 ProviderType；同类型的 Web Session、Coding Plan、其他自定义 profile，以及媒体、内置付费工具、OAuth／估算和未知 retry 均不能绕过美元计量。客户端自定义 function tool 的文本可计量，但 Server 不执行工具；旧 Token 模式保持不变。
+
+`status` 包含 `email/policyEpoch/windowId/windowStartsAtMs/resetsAtMs/meteredFromMs/activePricingRevision/usagePricingRevisionsDigest/usageWatermark/limitUsdMicros/observedPicos/manualOffsetPicos/usedPicos/pendingRiskPicos/meteringStatus/syncedAtMs`。窗口跨策略 epoch 聚合，不按 epoch 归零。`meteringStatus=observed|conservative|pending|unavailable|scheduled`。动态水位不更改静态配置、generation 或 fingerprint。Router 校验当前 installation/grant/epoch/窗口和价目 ACK，旧水位幂等返回较高已确认水位；相同水位不能改变金额，更高合法修订允许金额下降。Server 如收到超出本地真实水位的 ACK，冻结该 scope 并要求恢复核对。
+
+失败、499、504 和取消仍计已观测使用量；流式未确认结束、缺量、模型不符等不能释放风险为免费。错误分别为 `value_quota_exhausted`（429）、`price_unavailable`、`quota_unavailable`（503）；控制面版本冲突使用 `quota_revision_conflict`（409）。都不等同钱包不足。
+
+原生 Gemini 的执行模型取自真实 URL，而非客户端 JSON `model`。上游响应模型证据与用量原子落盘；流式分片中的矛盾模型不能被后续正常帧抹去。响应模型与执行模型不同，仅冻结快照明确声明的 exact alias 可证明同一身份，不使用同族／日期后缀猜测。异常响应保留风险并暂停该窗口的新美元请求，不能先释放风险、再异步补记异常。
+
+Gemini 的金额模式仅覆盖 `generateContent`／`streamGenerateContent`；辅助 `countTokens`、embedding、batch 等未覆盖动作在金额预占和发网前返回 `quota_unavailable`，不改变旧 Token 模式的可用动作。
+
+### 13.3 私有读取与校准
+
+以下浏览器接口都要求登录并返回 `Cache-Control: private, no-store`：
+
+| 接口 | 访问范围 |
+| --- | --- |
+| `GET /v1/shares/:share_id/value-quota-status` | Share Owner / Router Owner，当前授权用户投影 |
+| `GET /v1/me/share-value-quotas?shareId=…` | 仅当前用户自己的投影 |
+| `POST /v1/shares/:share_id/value-quota-preview` | Share Owner / Router Owner；`expectedConfigRevision` + `policies`，经 `/_ctl/preview_value_quota` 只读取得权威预览 |
+| `POST /v1/shares/:share_id/value-usage-edits` | Share Owner / Router Owner；`expectedConfigRevision` + `edits`，经 `/_ctl/edit_value_usage` 执行独立金额校准 |
+| `GET /v1/admin/share-value-pricing/health` | Router Owner；启用／待生效／shadow／延迟及价目 ACK 数，无用户邮箱 |
+
+金额校准为独立 `set|clear`，携带 grant revision、windowId、observed watermark、operationId 和审计原因；set 不得低于真实观测，clear 仅清人工偏移。批量全成或全败。旧 Token `usageRebase/userUsageEdits` 不承载金额；活跃市场 managed grant 仍只读。原公开用量 API 不附加私人金额策略；客户端切账号清理响应，超过 90 秒标注同步延迟，缺状态不显示伪造的零。
+
+Server 金额检查点和幂等身份不依赖 Router 30 天请求日志。托管恢复在覆盖数据库前写独立 restore fence；旧窗口证据不全则拒绝金额模式，不能删安全标记或通过切换单位重置真实用量。新旧二进制降级前必须撤销／切换并确认所有金额策略与在途数据；不允许旧版本忽略字段变成不限额。

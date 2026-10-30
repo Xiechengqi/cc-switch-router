@@ -1,8 +1,8 @@
 # 设计：Share 授权用户的按模型用量与官方价格等价
 
-> 状态：**阶段一已落地**（schema 0039、派生价目、owner/公开 API、owner 展开表、公开价目卡、审计脚本）。阶段二（Settings 价目管理）与阶段三（按等价美元卡配额）未实施。§11 已知精度缺口仍然有效。
-> 范围：仅 Router（`cc-switch-router`）。**不改动 Share Contract，不需要 Server 配合，不需要 v7。**
-> 最后更新：2026-09-10。
+> 状态：**阶段一已落地**（schema 0039、派生价目、owner/公开 API、owner 展开表、公开价目卡、审计脚本）；本文保留原只读展示设计。阶段三已进入独立双仓实现和本地验证，真实验收仍为 `live_pending`，以 [Share 用户双口径用量限额实施计划](share-user-value-quota-implementation-plan.md) 的状态为准。执行价目独立于本文读时参考价，不将 §11 展示精度当执行精度。
+> 范围：本文原稿只设计 Router 侧只读展示；原稿中“不需要 Server 配合／下一版 v7”的限制和版本判断**不适用于阶段三**。阶段三以现行协议和上述新计划为准。
+> 原稿：2026-09-10；状态校正：2026-10-29。
 >
 > 相关文档：[ARCHITECTURE.md](../ARCHITECTURE.md) §5 数据层 / §9 前端、[PROTOCOL.md](../PROTOCOL.md) §8 探针。
 
@@ -104,6 +104,8 @@ migration 21 将 `capacity_request_observations` 重建为对 `gateway_request_o
 该字段已退役，Server 侧 `domain/sharing/retired_fields.rs` 对 camelCase 与 snake_case **双向 fail-closed**。本设计的所有新标识符必须与之无关，且**不得进入 Share descriptor**。
 
 ### R3 — Server 不参与定价
+
+> 历史阶段一边界。阶段三明确允许 Server 对 Router 已确认的冻结费率做纯 USD 等值配额换算；仍不计算应付 Provider 账单、不操作钱包、不从第三方取价。以下原稿不作为 v10 实现约束。
 
 Server README 明确：「**只统计 Token / 状态 / 延迟，不计算成本或 USD 金额**」。价目表与计算**全部留在 Router 本地**。Share Contract 保持 v6 不变。
 
@@ -1125,6 +1127,8 @@ shareMarket.pricing.*    title / perMillion / input / output / cacheRead / cache
 > 产品决策的直接成本，不是范围蔓延。
 
 ### 13.1 阶段三的架构障碍（现在不解，但别堵死）
+
+> 历史决策背景。当前选择 Router 发布不可变执行快照、Server 本地计量和准入，并通过独立鉴权接口同步水位；不是将整份目录塞进每个 descriptor。现行实现与限制见新实施计划和 PROTOCOL §13，以下保留原分析。
 
 限额**执行**在 Server 侧，价目表与计算**全部**在 Router 侧（R3）。要按等价美元卡额，
 Server 必须知道美元——而它按定义算不出来。三条出路：

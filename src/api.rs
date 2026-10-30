@@ -265,6 +265,7 @@ pub fn router(state: ServerState) -> Router {
     let public_api = Router::new()
         .route("/v1/healthz", get(health))
         .merge(crate::market_fx::router())
+        .merge(crate::share_value_quotas::router())
         .route("/v1/public/map-points", get(public_map_points))
         .route("/v1/public/network-stats", get(public_network_stats))
         .route("/v1/public/usage/global", get(public_usage_global))
@@ -4910,6 +4911,8 @@ mod tests {
             output_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            cache_creation_5m_tokens: None,
+            cache_creation_1h_tokens: None,
             cache_usage_observed: true,
             usage_estimated: false,
             quota_tokens: None,

@@ -11,7 +11,7 @@ pub const MIN_SHARE_CONTRACT_VERSION: u16 = 2;
 /// v7 only add quota presentation metadata, so v5 market records remain valid
 /// during a rolling Server/Router deployment.
 pub const MIN_SHARE_MARKET_CONTRACT_VERSION: u16 = 5;
-pub const SHARE_CONTRACT_VERSION: u16 = 9;
+pub const SHARE_CONTRACT_VERSION: u16 = 10;
 pub const SHARE_TRIAL_CONTRACT_VERSION: u16 = 9;
 
 #[derive(Debug)]
@@ -1526,6 +1526,8 @@ pub struct ShareUserPolicy {
     pub parallel_limit: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_limit: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_quota: Option<crate::share_value_pricing::ValueQuota>,
     #[serde(default)]
     pub token_period: ShareTokenPeriod,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1670,6 +1672,10 @@ pub struct ShareUserGrant {
     pub active: bool,
     #[serde(default)]
     pub policy: ShareUserPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_metering: Option<crate::share_value_pricing::ValueMeteringBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_value_quota: Option<PendingValueQuota>,
     #[serde(default)]
     pub usage: ShareUserUsage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1694,6 +1700,16 @@ pub struct ShareUserGrant {
     pub manager: ShareGrantManager,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entitlement_id: Option<String>,
+}
+
+/// Server-owned scheduled change. `policy` above remains the enforced policy
+/// until this change is durably activated; scheduling never grants free access.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PendingValueQuota {
+    pub policy: ShareUserPolicy,
+    pub effective_from_ms: i64,
+    pub retain_access: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -1920,6 +1936,10 @@ pub struct ShareRequestLogEntry {
     pub output_tokens: u32,
     pub cache_read_tokens: u32,
     pub cache_creation_tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_5m_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_1h_tokens: Option<u32>,
     /// True when the upstream reported cache-token fields. A false value means the
     /// numeric cache fields are compatibility placeholders, not observed zeroes.
     #[serde(default = "default_true")]

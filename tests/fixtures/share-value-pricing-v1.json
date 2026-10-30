@@ -1,0 +1,145 @@
+{
+  "schemaVersion": 1,
+  "description": "Repository-owned protocol golden vectors; API-equivalent quota, never wallet money.",
+  "snapshot": {
+    "schemaVersion": 1,
+    "tariffPolicyId": "api-equivalent-v1",
+    "currency": "USD",
+    "models": {
+      "free-text": {
+        "contextInputBasis": "freshInput",
+        "longContextThreshold": null,
+        "longContextInclusive": false,
+        "rates": {
+          "standard/base": {
+            "input": "0",
+            "output": "0",
+            "cacheRead": "0",
+            "cacheWrite5m": null,
+            "cacheWrite1h": null,
+            "cacheWritePolicy": "unavailable"
+          }
+        }
+      },
+      "text-model": {
+        "contextInputBasis": "rawInput",
+        "longContextThreshold": 200000,
+        "longContextInclusive": false,
+        "rates": {
+          "standard/base": {
+            "input": "3000000",
+            "output": "15000000",
+            "cacheRead": "300000",
+            "cacheWrite5m": "3750000",
+            "cacheWrite1h": "6000000",
+            "cacheWritePolicy": "both"
+          },
+          "standard/long": {
+            "input": "6000000",
+            "output": "30000000",
+            "cacheRead": "600000",
+            "cacheWrite5m": "7500000",
+            "cacheWrite1h": "12000000",
+            "cacheWritePolicy": "both"
+          }
+        }
+      }
+    },
+    "exactAliases": {
+      "text-alias": "text-model"
+    }
+  },
+  "revision": "sha256:0dad34706589cfc2116ee78580de6cc264868c2745e3aec8c24145a2f8a2099e",
+  "vectors": [
+    {
+      "name": "fresh-plus-output",
+      "model": "text-model",
+      "tier": "standard",
+      "tokens": {
+        "freshInput": 1000,
+        "output": 1000,
+        "cacheRead": 0,
+        "cacheWrite5m": 0,
+        "cacheWrite1h": 0,
+        "cacheWriteUnknown": 0
+      },
+      "picos": "18000000000",
+      "conservative": false
+    },
+    {
+      "name": "raw-cache-context-crosses-threshold",
+      "model": "text-alias",
+      "tier": "standard",
+      "tokens": {
+        "freshInput": 1,
+        "output": 0,
+        "cacheRead": 300000,
+        "cacheWrite5m": 0,
+        "cacheWrite1h": 0,
+        "cacheWriteUnknown": 0
+      },
+      "picos": "180006000000",
+      "conservative": false
+    },
+    {
+      "name": "unknown-ttl-upper-bound",
+      "model": "text-model",
+      "tier": "standard",
+      "tokens": {
+        "freshInput": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite5m": 0,
+        "cacheWrite1h": 0,
+        "cacheWriteUnknown": 10
+      },
+      "picos": "60000000",
+      "conservative": true
+    },
+    {
+      "name": "exact-ttl-split",
+      "model": "text-model",
+      "tier": "standard",
+      "tokens": {
+        "freshInput": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite5m": 10,
+        "cacheWrite1h": 10,
+        "cacheWriteUnknown": 0
+      },
+      "picos": "97500000",
+      "conservative": false
+    },
+    {
+      "name": "one-token-fraction-preserved",
+      "model": "text-model",
+      "tier": "standard",
+      "tokens": {
+        "freshInput": 1,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite5m": 0,
+        "cacheWrite1h": 0,
+        "cacheWriteUnknown": 0
+      },
+      "picos": "3000000",
+      "conservative": false
+    },
+    {
+      "name": "explicit-zero-is-free",
+      "model": "free-text",
+      "tier": "standard",
+      "tokens": {
+        "freshInput": 10,
+        "output": 10,
+        "cacheRead": 0,
+        "cacheWrite5m": 0,
+        "cacheWrite1h": 0,
+        "cacheWriteUnknown": 0
+      },
+      "picos": "0",
+      "conservative": false
+    }
+  ]
+}

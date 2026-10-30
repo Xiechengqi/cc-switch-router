@@ -1807,6 +1807,7 @@ fn contract_policy(record: &SubscriptionRecord) -> Result<ShareUserPolicy, AppEr
             .parallel_limit
             .and_then(|value| u32::try_from(value).ok()),
         token_limit: grant_token_limit(record),
+        value_quota: None,
         token_period,
         token_period_anchor_at_ms: service_started_at
             .and_then(|started_at| token_period_anchor_at_ms(token_period, started_at)),
@@ -9038,6 +9039,7 @@ impl AppStore {
         let policy = ShareUserPolicy {
             parallel_limit: parallel_limit.and_then(|value| u32::try_from(value).ok()),
             token_limit: grant_token_limit,
+            value_quota: None,
             token_period,
             token_period_anchor_at_ms: None,
             expires_at: None,
@@ -12269,6 +12271,8 @@ fn apply_control_grant_effect(
                     role: "shareto".to_string(),
                     active: true,
                     policy,
+                    value_metering: None,
+                    pending_value_quota: None,
                     usage: previous
                         .as_ref()
                         .map(|grant| grant.usage.clone())
@@ -13005,6 +13009,8 @@ mod tests {
         let policy = materialize_initial_policy(&record, applied_at_ms, &stored_policy)
             .expect("materialize managed grant policy");
         let grant = ShareUserGrant {
+            value_metering: None,
+            pending_value_quota: None,
             account_quota_cycle: None,
             account_reset_capability: None,
             account_usage_baseline: None,
@@ -20699,6 +20705,8 @@ mod tests {
                     serde_json::to_string(&BTreeMap::from([(
                         granted.email.clone(),
                         ShareUserGrant {
+                            value_metering: None,
+                            pending_value_quota: None,
                             account_quota_cycle: None,
                             account_reset_capability: None,
                             account_usage_baseline: None,
