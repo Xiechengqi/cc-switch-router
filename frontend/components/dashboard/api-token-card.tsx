@@ -117,7 +117,7 @@ export function ApiTokenCard() {
   };
 
   return (
-    <section aria-labelledby="api-token-title" className="grid min-w-0 gap-4 rounded-xl border border-border bg-card p-4 sm:p-5">
+    <section aria-labelledby="api-token-title" className="grid min-w-0 grid-cols-1 gap-4 overflow-hidden rounded-xl border border-border bg-card p-4 sm:p-5 [&>*]:min-w-0">
       <div>
         <h3 id="api-token-title" className="flex items-center gap-2 text-sm font-semibold text-foreground">
           <KeyRound className="h-4 w-4 text-muted-foreground" aria-hidden />
@@ -129,18 +129,18 @@ export function ApiTokenCard() {
       {error ? <AccountSectionError message={error} onRetry={loadFailed ? () => void load() : undefined} /> : null}
 
       <div className="grid gap-3">
-        <div className="grid gap-2 text-sm">
-          <div className="flex justify-between gap-3">
-            <span className="text-muted-foreground">{t("account.apiKeys.created")}</span>
-            <span className="tabular-nums">{token?.createdAt ? formatDateTime(token.createdAt, locale) : "-"}</span>
+        <div className="grid min-w-0 gap-2 text-sm">
+          <div className="flex min-w-0 justify-between gap-3">
+            <span className="shrink-0 text-muted-foreground">{t("account.apiKeys.created")}</span>
+            <span className="min-w-0 text-right tabular-nums">{token?.createdAt ? formatDateTime(token.createdAt, locale) : "-"}</span>
           </div>
-          <div className="flex justify-between gap-3">
-            <span className="text-muted-foreground">{t("account.apiKeys.lastUsed")}</span>
-            <span className="tabular-nums">{token?.lastUsedAt ? formatDateTime(token.lastUsedAt, locale) : "-"}</span>
+          <div className="flex min-w-0 justify-between gap-3">
+            <span className="shrink-0 text-muted-foreground">{t("account.apiKeys.lastUsed")}</span>
+            <span className="min-w-0 text-right tabular-nums">{token?.lastUsedAt ? formatDateTime(token.lastUsedAt, locale) : "-"}</span>
           </div>
         </div>
 
-        <div className="flex items-start gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2">
+        <div className="flex min-w-0 items-start gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2">
           <div className="min-w-0 flex-1 break-all font-mono text-xs text-foreground">
             {busy && !token ? t("account.loading") : showToken && rawToken ? rawToken : maskedToken}
           </div>
@@ -173,7 +173,7 @@ export function ApiTokenCard() {
           <h4 className="text-sm font-semibold text-foreground">{t("account.apiKeys.exampleTitle")}</h4>
           <p className="mt-0.5 text-sm text-muted-foreground">{t("account.apiKeys.exampleHint")}</p>
         </div>
-        <div className="relative rounded-xl border border-border bg-muted/30 p-4">
+        <div className="relative min-w-0 overflow-hidden rounded-xl border border-border bg-muted/30 p-4">
           <Button
             variant="ghost"
             size="sm"

@@ -22,7 +22,7 @@ export function AccountSecurityPage() {
   }, []);
 
   return (
-    <div className="grid min-w-0 gap-6">
+    <div className="grid min-w-0 grid-cols-1 gap-6 [&>*]:min-w-0">
       <AccountSectionHeader icon={ShieldCheck} title={t("account.nav.security")} hint={t("account.security.hint")} />
       <ApiTokenCard />
       {password ? (

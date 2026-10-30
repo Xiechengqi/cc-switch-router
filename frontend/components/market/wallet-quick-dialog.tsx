@@ -102,7 +102,7 @@ export function WalletQuickDialog({ open, onOpenChange }: { open: boolean; onOpe
     <Modal.Backdrop isOpen={open} onOpenChange={(next) => { if (next || !busy) onOpenChange(next); }}>
       <Modal.Container placement="center" className="p-0 sm:p-4">
         <Modal.Dialog className="light flex h-dvh w-full max-w-none flex-col overflow-hidden rounded-none bg-card text-card-foreground sm:h-auto sm:max-h-[calc(100dvh-2rem)] sm:max-w-[34rem] sm:rounded-xl">
-          <Modal.CloseTrigger isDisabled={busy} />
+          <Modal.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" isDisabled={busy} />
           <Modal.Header>
             <Modal.Heading className="flex items-center gap-2">
               <WalletCards className="size-4 text-muted-foreground" aria-hidden />

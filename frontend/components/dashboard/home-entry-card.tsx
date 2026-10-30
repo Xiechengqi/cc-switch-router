@@ -56,7 +56,7 @@ export function HomeEntryCard() {
   };
 
   return (
-    <section id={HOME_ENTRY_SECTION_ID} aria-labelledby="home-entry-title" className="grid min-w-0 scroll-mt-20 gap-4 rounded-xl border border-border bg-card p-4 sm:p-5">
+    <section id={HOME_ENTRY_SECTION_ID} aria-labelledby="home-entry-title" className="grid min-w-0 grid-cols-1 scroll-mt-20 gap-4 overflow-hidden rounded-xl border border-border bg-card p-4 sm:p-5 [&>*]:min-w-0">
       <div>
         <h3 id="home-entry-title" className="flex items-center gap-2 text-sm font-semibold text-foreground">
           <House className="h-4 w-4 text-muted-foreground" aria-hidden />
