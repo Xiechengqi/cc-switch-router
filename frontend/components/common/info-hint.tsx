@@ -31,6 +31,9 @@ export function InfoHint({ label, children, className }: {
   const [open, setOpen] = React.useState(false);
   const [position, setPosition] = React.useState<{ top: number; left: number } | null>(null);
   const pinned = React.useRef(false);
+  // Only a pinned bubble takes pointer events; a hover or focus preview must
+  // never cover the control underneath it.
+  const [pinnedOpen, setPinnedOpen] = React.useState(false);
   const pressInside = React.useRef(false);
   const timer = React.useRef<number | undefined>(undefined);
 
@@ -41,6 +44,7 @@ export function InfoHint({ label, children, className }: {
   const close = React.useCallback(() => {
     window.clearTimeout(timer.current);
     pinned.current = false;
+    setPinnedOpen(false);
     setOpen(false);
   }, []);
 
@@ -109,7 +113,15 @@ export function InfoHint({ label, children, className }: {
         className="-m-2.5 inline-flex size-11 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors duration-200 hover:text-accent focus-visible:outline-2 focus-visible:outline-offset-[-8px] focus-visible:outline-ring data-[open]:text-accent"
         onPointerEnter={(event) => { if (event.pointerType === "mouse") schedule(true, 120); }}
         onPointerLeave={leave}
-        onFocus={() => { window.clearTimeout(timer.current); setOpen(true); }}
+        onFocus={(event) => {
+          // Keyboard focus only: a dialog that focuses its first control on
+          // open must not cover its own actions with a bubble.
+          let keyboard = false;
+          try { keyboard = event.currentTarget.matches(":focus-visible"); } catch { /* Older engines skip it. */ }
+          if (!keyboard) return;
+          window.clearTimeout(timer.current);
+          setOpen(true);
+        }}
         onBlur={() => {
           if (pressInside.current) { pressInside.current = false; return; }
           close();
@@ -117,7 +129,7 @@ export function InfoHint({ label, children, className }: {
         onClick={() => {
           window.clearTimeout(timer.current);
           if (open && pinned.current) close();
-          else { pinned.current = true; setOpen(true); }
+          else { pinned.current = true; setPinnedOpen(true); setOpen(true); }
         }}
         onKeyDown={(event) => {
           // Keep Esc from also dismissing an enclosing dialog.
@@ -141,6 +153,7 @@ export function InfoHint({ label, children, className }: {
         className={cn(
           "fixed z-[1000] m-0 block w-max max-w-[min(20rem,calc(100vw-1rem))] overflow-visible rounded-xl border border-border bg-card p-3 text-left text-xs font-normal leading-5 text-foreground shadow-lg",
           !open && "hidden",
+          !pinnedOpen && "pointer-events-none",
         )}
       >
         {children}
