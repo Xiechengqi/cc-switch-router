@@ -226,6 +226,22 @@ fn current_projection(
     Ok(())
 }
 impl AppStore {
+    /// Latest publication is reported separately from the Server's active tariff.
+    /// A future publication must not invalidate an already acknowledged active one.
+    pub(crate) async fn value_pricing_readiness(
+        &self,
+        installation: &str,
+    ) -> Result<serde_json::Value, AppError> {
+        let conn = self.conn.lock().await;
+        let settings = read_settings(&conn)?;
+        let acknowledged_at: Option<i64> = conn.query_row(
+            "SELECT acknowledged_at_ms FROM share_value_pricing_acks WHERE installation_id=?1 AND revision=?2",
+            params![installation, settings.revision], |row| row.get(0),
+        ).optional().map_err(db_error)?;
+        Ok(serde_json::json!({"publishedRevision":settings.revision,
+            "effectiveFromMs":settings.effective_from_ms,"acknowledgedAtMs":acknowledged_at,
+            "version":settings.version}))
+    }
     pub(crate) async fn value_quota_health(&self) -> Result<serde_json::Value, AppError> {
         let conn = self.conn.lock().await;
         let mut shares = conn
@@ -285,7 +301,8 @@ impl AppStore {
             )
             .map_err(db_error)?;
         Ok(
-            serde_json::json!({"activeUsdGrants":enabled,"scheduledGrants":scheduled,"shadowGrants":shadow,"staleGrants":stale,"acknowledgedInstallations":acknowledgements}),
+            serde_json::json!({"activeUsdGrants":enabled,"scheduledGrants":scheduled,"shadowGrants":shadow,"staleGrants":stale,"acknowledgedInstallations":acknowledgements,
+                "publishedRevision":settings.revision,"effectiveFromMs":settings.effective_from_ms}),
         )
     }
     pub(crate) async fn value_pricing_settings(&self) -> Result<PricingSettings, AppError> {

@@ -1,6 +1,6 @@
 # Share 用户双口径用量限额：完整落地实施计划
 
-> 状态：**双仓本地实现、定向验证与整体 review 完成，`local_verified / live_pending`；未部署**。规格制定于 2026-10-29，实施核对：2026-10-30。第 1–10 节保留设计目标与验收要求，第 11 节记录实际落点、选择和验证边界；不能把本地实现视为真实流量验收通过。
+> 状态：**双仓本地实现，`local_verified / live_pending`；未部署**。规格制定于 2026-10-29，初次实施核对：2026-10-30。第 1–10 节保留设计目标与验收要求，第 11 节记录初次实施，第 12 节记录 2026-10-31 的能力诊断与自定义文本补强；不能把本地实现视为真实流量验收通过。
 >
 > 范围：普通 Share 授权用户可选择按 Token 数量或按模型 API 标价折算的 USD 等值限制使用。Share Market 已发布车位和活跃合同的计费条款、平台钱包、Provider 收益均不在本次改造范围内。
 >
@@ -301,3 +301,46 @@ Router 的 schema 使用**新递增迁移**追加价格快照元数据、金额�
 全量 review 中发现并修正了 Gemini native passthrough 模型识别、旧 body 映射误标真实 URL 模型、上游模型证据与用量分事务产生的短暂放行窗口、空用量帧清除 WebSocket fallback 证据，以及 Gemini 辅助动作误占额度。兼容性版号复测和金额专项已加入 Router CI 的既有编译复用 job，不增加第二次全量编译。已有旧编译 dead-code warning 与 Web 大 chunk 提示不是新增失败，也未通过屏蔽 warning 来绕过检查。
 
 仍须由部署后的灰度独立完成第 9.2 节要求：每个准备开放的 Provider/App 转发面 **7 个自然日、至少 100 条真实完成文本请求**，逐窗口／请求／价目对账。OAuth、媒体、内置付费工具、未知用量和多 attempt 不在本期安全开放范围；不能因 UI 可选择美元额度而擅自开启。离线手工替换权威数据库不在托管恢复 fence 保证范围，禁止在线手工替库。当前仅在本地完成实现与回归时，应标记 `local_verified / live_pending`，不能标记生产 `live_verified`。
+
+## 12. 就绪诊断与自定义文本支持（2026-10-31）
+
+### 12.1 生产问题和修复边界
+
+sgptokenswitch 的只读排查确认三个独立阻塞：Server marker 是 `shadow_verified` 而非 `committed`；Router 尚无执行快照／发布配置／ACK；现有 Share 使用自定义 HTTP profile，被初版原生 API-key 白名单排除。Router v10 本身已支持，提示中的 v10 指协议版本，不是软件版本。只改提示或解除下拉框禁用不能解决问题。
+
+执行时不自动迁移远程权威存储，不自动发布模型估值，不篡改 marker，不改钱包、市场钱款或旧 Token 用量。`qiniu/conatus-free` 等未覆盖模型必须由 Owner 核定估值；名称含 free 不是零价证据。
+
+### 12.2 实际交付
+
+- Server 返回协议、SQLite authority、存储健康、激活价目和每个绑定的实际 profile／driver 检查。能力失败仍返回所有原因，不因查询用户 ledger 提前变成笼统 500；版本冲突仍保留 409。
+- 普通自定义文本仅开放协议表列出的四种组合；预览、保存、shadow、真实发送共用白名单。OAuth、Web Session、Coding Plan、跨协议组合、媒体、内置付费工具、多 attempt 和未知用量继续 fail closed。
+- Router 加入本 installation 的最新发布／ACK 元数据，不让其他 Server 的 ACK 冒充本机就绪；待发布的新版本不否定旧有效价目。
+- 两端配额编辑分别维护基础能力和显式用户策略预览，支持重新检查及可见页面周期刷新；取消旧请求／忽略旧账号与 Share 响应，后台查询不冲掉二次确认。离线、超时、旧 Server、控制授权、响应异常和版本冲突可区分。
+- Router 添加／编辑／批量弹窗使用自身 light surface，关闭按钮采用现有深色文字、浅底、hover／focus 样式，不依赖父弹窗的 portal 继承。
+- 执行价目增加按准确模型、tier/context 行编辑的美元／百万 Token 表单，精确换算整数微美元，显式区分空与零，保留高级 JSON／exact aliases。同名参考价只填入 standard/base 输入输出草稿，不推断缓存或长上下文。审核勾选及发布确认后才写入；CAS 冲突保留草稿，重载须确认丢弃。
+
+### 12.3 受控上线操作
+
+1. 先部署支持诊断的 Router，再部署 Server。检查实际服务的可执行文件、配置目录和运行用户，不能只看 PATH 中 CLI。
+2. 安排 Server 维护窗口，停止该配置目录的所有写进程，按官方迁移指南备份整个配置目录、数据库 WAL／SHM 和密钥；备份含凭据，应仅管理员可读。
+3. 用同一运行用户、环境密钥和配置目录执行 `cc-switch-server --config-dir <目录> config migrate-server-store` 只读预检。Provider S1→S2 前提未满足时，先按官方流程处理，不强行改 marker。
+4. 预检通过后显式执行同命令加 `--apply`；官方状态机推进到 `committed`，保留迁移备份。重新启动，确认 Provider／Share／授权／Token 用量及服务健康正常。详细权威说明见 Server `docs/guide/data-migration.md`；不提供直接编辑 marker 的快捷方式。
+5. Owner 在设置 → 模型价格 → 执行额度价目，为实际执行模型和响应模型明确核价／别名，核对缓存、tier、上下文矩阵后发布。缺价模型不得擅自填零或套用近似模型价。
+6. 等待生效时间、Server 拉取／安装／ACK／激活，在对应 Share 弹窗重新检查。须看到全部基础检查通过；再对目标用户预览，核对计量起点／排期后保存。已有有效快照可继续执行，不等待未来修订。
+7. 小范围核对流式与非流式、缓存、真实模型、额度拒绝、两端水位及日志；按第 9.2 节独立完成真实灰度。异常时保留在途和账证，不通过清表、改价格历史或切单位恢复额度。
+
+本次仅实施本地代码及回归，不执行远程迁移、停服、发布价目或部署；生产启用仍须逐项完成上述门槛。没有截图或 UI 自动化验证。
+
+### 12.4 本轮验证与整体 review
+
+以下仅记录 2026-10-31 本轮实际执行结果，不复用第 11 节的历史全量结果：
+
+- Router：`cargo check --locked`、金额额度专项 12 项、Share 用户授权相关 9 项通过；既有 dead-code warning 未屏蔽。
+- Server：`cargo clippy --locked --all-targets -- -D warnings` 通过；`value_quota_` 定向回归 18 项通过、1 项既有容量测试默认 ignored。本轮没有重新执行容量压测或两仓全部 Rust 测试。
+- 本地 HTTP 上游夹具扩展为 8 个原生／自定义入口组合 × 流式／非流式 × 正常／异常响应模型，共 32 组。验证发网前持久准入、精确 `$0.018` 结算、超限拒绝、缺价不发网，以及异常响应模型保留风险；没有外部 Provider 或真实凭据。
+- Router 额度／价目纯测试 11 项、Share settings 13 项；Server Web 额度／批量策略／传输／i18n 纯测试 34 项通过。两端类型检查通过。Router 使用 `npm run build -- --webpack` 的生产构建通过；默认 Turbopack 构建曾因 Google Fonts 网络连接失败，不记为通过。Server Vite 生产构建通过，生成的 `web-dist` 已更新，既有大 chunk 提示仍存在。
+- 两仓格式、空白检查，以及 Router 设置／i18n／模型价格、Server Provider 覆盖／UI 矩阵／文档索引／SQLite 权威边界／产品边界／Web 边界／i18n literals／运行时契约／构建体积审计通过。
+
+整体 review 发现并修复：自定义 HTTP profile 的上游响应模型证据此前未进入同一持久计量路径，可能让不符模型的完整用量被错误结算。现在证据采集覆盖这些 profile，保留 sticky conflict，准入仍独立核验实际 profile／driver，异常模型夹具已覆盖。另复核并补强账号／Share／revision 变化后的异步隔离、预览取消与响应校验、参考价仅作草稿、非法表单输入保留及 portal 关闭按钮对比。
+
+UI 沿用现有样式系统，只做组件级状态和可读性修正；按用户要求没有截图、浏览器或 UI 自动化，不能据静态检查宣称视觉验收完成。Review 后未发现已知阻塞性代码问题；生产真实灰度仍为 `live_pending`，本轮不提交、不推送。

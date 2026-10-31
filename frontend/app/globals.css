@@ -795,6 +795,21 @@ a {
   box-shadow: none !important;
 }
 
+/* Quota dialogs are portalled outside the parent light surface. */
+.share-edit-surface .share-quota-close {
+  color: rgb(var(--router-foreground)) !important;
+  background: rgb(var(--router-muted)) !important;
+  opacity: 1;
+}
+.share-edit-surface .share-quota-close:hover,
+.share-edit-surface .share-quota-close:active {
+  background: rgb(var(--router-border)) !important;
+}
+.share-edit-surface .share-quota-close:focus-visible {
+  outline: 2px solid rgb(var(--router-accent));
+  outline-offset: 2px;
+}
+
 .mono-label {
   font-family: var(--font-jetbrains), "JetBrains Mono", monospace;
   font-size: 0.72rem;

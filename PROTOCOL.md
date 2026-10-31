@@ -721,7 +721,16 @@ fetch 返回 null 或 `{installationId,revision,effectiveFromMs,snapshot}`。Ser
 
 Server 在真正发上游前以 IMMEDIATE SQLite 事务校验并写入风险占用。`spent + pendingRisk >= limit` 拒绝新请求，已准入请求自然结束，可超过额度，是请求级软上限而非绝对硬上限。当前未使用可信输出 ceiling，单次请求预占全部剩余容量；最大并发还受原并发限制与金额模式上限 4 共同约束。
 
-首期仅允许三组实际运行时：`claude.anthropic_api_key` + `http.anthropic_messages`、`codex.openai_api_key` + `http.openai_responses`、`gemini.google_api_key` + `http.gemini_native`，对应 Messages、Responses、Chat Completions、Gemini 的单 attempt 文本请求。保存预览和发送前均核对实际 profile／driver，而非只信任兼容 ProviderType；同类型的 Web Session、Coding Plan、其他自定义 profile，以及媒体、内置付费工具、OAuth／估算和未知 retry 均不能绕过美元计量。客户端自定义 function tool 的文本可计量，但 Server 不执行工具；旧 Token 模式保持不变。
+仅允许以下实际 profile／driver 组合的单 attempt 文本请求；预览、保存、shadow 与发送前共用同一能力函数：
+
+| Profile | Driver |
+| --- | --- |
+| `claude.anthropic_api_key`、`claude.custom_http` | `http.anthropic_messages` |
+| `codex.openai_api_key`、`codex.custom_http` | `http.openai_responses` |
+| `codex.custom_http` | `http.openai_chat` |
+| `gemini.google_api_key`、`gemini.custom_http` | `http.gemini_native` |
+
+不只信任兼容 ProviderType。自定义 profile 的其他协议组合、Web Session、Coding Plan、媒体、内置付费工具、OAuth／估算和未知 retry 仍不能绕过美元计量。客户端自定义 function tool 文本可计量，但 Server 不执行工具；旧 Token 模式保持不变。新增组合仅完成本地夹具验证，不宣称生产流量验收。
 
 `status` 包含 `email/policyEpoch/windowId/windowStartsAtMs/resetsAtMs/meteredFromMs/activePricingRevision/usagePricingRevisionsDigest/usageWatermark/limitUsdMicros/observedPicos/manualOffsetPicos/usedPicos/pendingRiskPicos/meteringStatus/syncedAtMs`。窗口跨策略 epoch 聚合，不按 epoch 归零。`meteringStatus=observed|conservative|pending|unavailable|scheduled`。动态水位不更改静态配置、generation 或 fingerprint。Router 校验当前 installation/grant/epoch/窗口和价目 ACK，旧水位幂等返回较高已确认水位；相同水位不能改变金额，更高合法修订允许金额下降。Server 如收到超出本地真实水位的 ACK，冻结该 scope 并要求恢复核对。
 
@@ -742,6 +751,10 @@ Gemini 的金额模式仅覆盖 `generateContent`／`streamGenerateContent`；�
 | `POST /v1/shares/:share_id/value-quota-preview` | Share Owner / Router Owner；`expectedConfigRevision` + `policies`，经 `/_ctl/preview_value_quota` 只读取得权威预览 |
 | `POST /v1/shares/:share_id/value-usage-edits` | Share Owner / Router Owner；`expectedConfigRevision` + `edits`，经 `/_ctl/edit_value_usage` 执行独立金额校准 |
 | `GET /v1/admin/share-value-pricing/health` | Router Owner；启用／待生效／shadow／延迟及价目 ACK 数，无用户邮箱 |
+
+预览增量字段：`capabilityReady` 表示基础设施能力，`ready` 同时要求所提交用户策略的历史覆盖可用；不能用单个用户的历史缺口禁用整个 Share 的单位选择。`checks[]` 逐项包含 `{code,ready}`：`router_protocol`、`sqlite_authority`（附 `state=committed|prepared|shadow_verified|unavailable`）、`metering_storage`、`acknowledged_tariff`、每个绑定各一项 `text_surface`（附 `app/profileId/driverId`）。Router 另加 `tariff_published` 及本 installation 的 `pricing={publishedRevision,effectiveFromMs,acknowledgedAtMs,version}`。该最新发布信息与 `activePricingRevision` 分开：新价待生效或待确认不作废旧的有效快照。能力不满足时返回全部检查和空 `rows`，不查询用户窗口；revision 冲突仍为 409。旧 Server 缺检查字段时 UI 保持关闭并提示升级。
+
+控制连接失败统一保留安全 `quota_unavailable`，`details.readinessCode` 区分 `quota_server_offline|quota_server_timeout|quota_server_upgrade_required|quota_control_unauthorized|quota_server_invalid_response|quota_unavailable`，不转发上游正文、凭据或网络细节。预览响应须匹配请求的配置版本。配置、账号或 Share 变化后取消／忽略旧检查；后台检查不覆盖显式策略预览。
 
 金额校准为独立 `set|clear`，携带 grant revision、windowId、observed watermark、operationId 和审计原因；set 不得低于真实观测，clear 仅清人工偏移。批量全成或全败。旧 Token `usageRebase/userUsageEdits` 不承载金额；活跃市场 managed grant 仍只读。原公开用量 API 不附加私人金额策略；客户端切账号清理响应，超过 90 秒标注同步延迟，缺状态不显示伪造的零。
 

@@ -37,3 +37,34 @@ export function newExecutionPriceModel() {
   return {contextInputBasis: "rawInput", longContextThreshold: null, longContextInclusive: false,
     rates: {"standard/base": {input: null, output: null, cacheRead: null, cacheWrite5m: null, cacheWrite1h: null, cacheWritePolicy: "unavailable"}}};
 }
+
+export type ExecutionRate = {input:string|null;output:string|null;cacheRead:string|null;cacheWrite5m:string|null;cacheWrite1h:string|null;
+  cacheWritePolicy:"unavailable"|"fiveMinutesOnly"|"oneHourOnly"|"both"};
+export type ExecutionModel = {contextInputBasis:"rawInput"|"freshInput";longContextThreshold:number|null;
+  longContextInclusive:boolean;rates:Record<string,ExecutionRate>};
+export type ExecutionDraft = {schemaVersion:1;tariffPolicyId:"api-equivalent-v1";currency:"USD";
+  models:Record<string,ExecutionModel>;exactAliases:Record<string,string>};
+/** Form rates are USD / million. Wire rates are integer micro-USD / million. */
+export function executionRateMicros(input:string):string|undefined {
+  if(!/^(0|[1-9]\d{0,12})(?:\.\d{1,6})?$/.test(input))return undefined;
+  const [whole,part=""]=input.split(".");
+  const micros=BigInt(whole)*1_000_000n+BigInt(part.padEnd(6,"0"));
+  return micros<=9_223_372_036_854_775_807n?String(micros):undefined;
+}
+export function executionRateInput(micros:string|null):string {
+  if(micros==null || !/^(0|[1-9]\d*)$/.test(micros))return "";
+  const n=BigInt(micros),part=String(n%1_000_000n).padStart(6,"0").replace(/0+$/,"");
+  return String(n/1_000_000n)+(part?"."+part:"");
+}
+export function executionCachePolicy(rate:ExecutionRate):ExecutionRate["cacheWritePolicy"] {
+  return rate.cacheWrite5m!=null ? (rate.cacheWrite1h!=null?"both":"fiveMinutesOnly") : rate.cacheWrite1h!=null?"oneHourOnly":"unavailable";
+}
+/** Flattened reference prices cannot prove cache TTL, long context or tier support. */
+export function executionReferenceDraft(rates:{input:number;output:number}):ExecutionModel {
+  const model=newExecutionPriceModel() as ExecutionModel;
+  for(const field of ["input","output"] as const) {
+    if(!Number.isSafeInteger(rates[field]) || rates[field]<0)throw new Error("Invalid reference rate");
+    model.rates["standard/base"][field]=String(rates[field]);
+  }
+  return model;
+}

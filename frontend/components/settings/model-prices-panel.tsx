@@ -137,7 +137,7 @@ export function ModelPricesPanel() {
 
   return (
     <section className="grid gap-5">
-      <ShareValuePricingPanel />
+      <ShareValuePricingPanel referenceModels={data?.models}/>
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div><h2 className="font-display text-2xl">{t("settings.modelPrices.title")}</h2><p className="mt-1 text-sm text-muted-foreground">{t("settings.modelPrices.description")}</p></div>
         <div className="flex gap-2"><Button variant="outline" onClick={() => { const model = { modelKey: "", displayName: "", priced: false, discoveredFrom: [] } satisfies AdminModelPriceListItem; openEditor(model); }}><Plus className="h-4 w-4" />{t("settings.modelPrices.add")}</Button><Button variant="outline" onClick={() => void load()} isDisabled={loading || busy}>{loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}{t("common.reload")}</Button></div>

@@ -57,9 +57,21 @@ fn control_error(error: crate::ctl_client::CtlError) -> AppError {
             };
         }
     }
+    let code = match &error {
+        crate::ctl_client::CtlError::Unreachable(_) => "quota_server_offline",
+        crate::ctl_client::CtlError::Timeout => "quota_server_timeout",
+        crate::ctl_client::CtlError::Rejected {
+            status: 404 | 405, ..
+        } => "quota_server_upgrade_required",
+        crate::ctl_client::CtlError::Rejected {
+            status: 401 | 403, ..
+        } => "quota_control_unauthorized",
+        crate::ctl_client::CtlError::Malformed(_) => "quota_server_invalid_response",
+        _ => "quota_unavailable",
+    };
     AppError::Coded {status:axum::http::StatusCode::SERVICE_UNAVAILABLE,code:"quota_unavailable",
         message:"USD-equivalent metering is unavailable; check Server storage, coverage and acknowledged tariff readiness".into(),
-        details:serde_json::json!({})}
+        details:serde_json::json!({"readinessCode":code})}
 }
 async fn health(
     State(state): State<ServerState>,
@@ -103,11 +115,7 @@ async fn preview(
         .proxy
         .route_by_share_id(&share_id)
         .await
-        .ok_or_else(|| {
-            AppError::ServiceUnavailable(
-                "Share client is offline; preview requires the authority".into(),
-            )
-        })?;
+        .ok_or_else(|| control_error(crate::ctl_client::CtlError::Unreachable(String::new())))?;
     let installation = route
         .installation_id()
         .ok_or_else(|| AppError::ServiceUnavailable("Share installation unavailable".into()))?;
@@ -116,7 +124,7 @@ async fn preview(
         .installation_control_secret(installation)
         .await?
         .ok_or_else(|| AppError::ServiceUnavailable("Share control unavailable".into()))?;
-    let response = crate::ctl_client::preview_value_quota(
+    let mut response = crate::ctl_client::preview_value_quota(
         route.route_target(),
         installation,
         &secret,
@@ -126,7 +134,42 @@ async fn preview(
     )
     .await
     .map_err(control_error)?;
+    if !response.is_object()
+        || response
+            .get("ready")
+            .and_then(serde_json::Value::as_bool)
+            .is_none()
+        || response
+            .get("configRevision")
+            .and_then(serde_json::Value::as_u64)
+            != Some(revision)
+        || !response
+            .get("rows")
+            .is_some_and(serde_json::Value::is_array)
+    {
+        return Err(control_error(crate::ctl_client::CtlError::Malformed(
+            String::new(),
+        )));
+    }
+    let pricing = state.store.value_pricing_readiness(installation).await?;
+    let published = response_pricing_published(&pricing);
+    response["pricing"] = pricing;
+    if let Some(checks) = response
+        .get_mut("checks")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        checks.push(serde_json::json!({"code":"tariff_published","ready":published}));
+    }
+    if !published {
+        response["ready"] = false.into();
+        response["capabilityReady"] = false.into();
+    }
     Ok((private(), Json(response)))
+}
+fn response_pricing_published(pricing: &serde_json::Value) -> bool {
+    pricing["publishedRevision"]
+        .as_str()
+        .is_some_and(|r| !r.is_empty())
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -323,6 +366,29 @@ mod tests {
         );
         let unavailable = control_error(crate::ctl_client::CtlError::Timeout);
         assert_eq!(unavailable.code(), Some("quota_unavailable"));
+        if let AppError::Coded { details, .. } = unavailable {
+            assert_eq!(details["readinessCode"], "quota_server_timeout");
+        } else {
+            panic!("expected structured error");
+        }
+        let old_server = control_error(crate::ctl_client::CtlError::Rejected {
+            status: 404,
+            body: "private upstream data".into(),
+            message: None,
+            code: None,
+            retryable: None,
+            current_config_revision: None,
+            current_share: None,
+        });
+        if let AppError::Coded {
+            details, message, ..
+        } = old_server
+        {
+            assert_eq!(details["readinessCode"], "quota_server_upgrade_required");
+            assert!(!message.contains("private upstream data"));
+        } else {
+            panic!("expected structured error");
+        }
         let conflict = control_error(crate::ctl_client::CtlError::Rejected {
             status: 409,
             body: "private upstream data".into(),

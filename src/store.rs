@@ -36823,6 +36823,13 @@ pub(crate) mod tests {
         use crate::store::share_value_quotas::{PublishPricing, SignedValueRequest};
         use serde_json::json;
         let (store, _config) = setup_store("share-value-signed").await;
+        assert!(
+            store
+                .value_pricing_readiness("value-install")
+                .await
+                .unwrap()["publishedRevision"]
+                .is_null()
+        );
         let key = insert_signed_installation(&store, "value-install").await;
         let other_key = insert_signed_installation(&store, "other-install").await;
         insert_share(
@@ -36852,6 +36859,12 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(settings.revision.as_deref(), Some(revision.as_str()));
+        let readiness = store
+            .value_pricing_readiness("value-install")
+            .await
+            .unwrap();
+        assert_eq!(readiness["publishedRevision"], revision);
+        assert!(readiness["acknowledgedAtMs"].is_null());
         assert!(
             store
                 .publish_value_pricing(
@@ -36990,6 +37003,21 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
+        assert!(
+            store
+                .value_pricing_readiness("value-install")
+                .await
+                .unwrap()["acknowledgedAtMs"]
+                .as_i64()
+                .is_some()
+        );
+        assert!(
+            store
+                .value_pricing_readiness("other-install")
+                .await
+                .unwrap()["acknowledgedAtMs"]
+                .is_null()
+        );
         let accepted = store
             .signed_value_operation(
                 "share_value_quota_watermark",

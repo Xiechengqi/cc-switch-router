@@ -3,10 +3,48 @@ import test from "node:test";
 import {
   usdLimitToMicros, microsToUsdInput, usdUsageToPicos, formatQuotaPicos,
   mergeValueStatuses, compatibleValueStatus, valueStatusTextKey, valueQuotaAvailability, type ValueQuotaStatus,
+  valueCapabilityReady,valueReadinessError,type ValueQuotaPreview,
+  previewValueQuota,
 } from "./share-value-quota";
 import { applyShareUserPolicyBatch } from "../components/dashboard/share-edit/share-user-policy-batch";
 import { buildShareSettingsPatch, draftFromShare } from "./share-settings";
 import type { ShareUserGrant, ShareView } from "./types";
+
+test("readiness transport carries cancellation and rejects malformed or stale authoritative previews",async()=>{
+  const original=globalThis.fetch;const controller=new AbortController();
+  let body:unknown={ready:false,capabilityReady:false,checks:[],configRevision:7,rows:[]};
+  try {
+    globalThis.fetch=async (url,init)=>{
+      assert.equal(url,"/v1/shares/share%2Ftest/value-quota-preview");
+      assert.equal(init?.signal,controller.signal);
+      assert.equal(init?.cache,"no-store");
+      assert.deepEqual(JSON.parse(String(init?.body)),{expectedConfigRevision:7,policies:{}});
+      return Response.json(body);
+    };
+    assert.equal((await previewValueQuota("share/test",7,{},controller.signal)).ready,false);
+    for(const invalid of [null,{},[],{ready:true,configRevision:6,rows:[]},{ready:true,configRevision:7,rows:[],checks:[null]}]) {
+      body=invalid;
+      await assert.rejects(previewValueQuota("share/test",7,{},controller.signal),error=>valueReadinessError(error)==="invalidResponse");
+    }
+  }finally{globalThis.fetch=original;}
+});
+
+test("capability readiness requires every independent authoritative check, not policy history or a generic ready flag",()=>{
+  const checks=["router_protocol","sqlite_authority","metering_storage","acknowledged_tariff","text_surface"].map(code=>({code,ready:true}));
+  const preview:ValueQuotaPreview={ready:false,capabilityReady:true,checks,configRevision:1,rows:[]};
+  assert.equal(valueCapabilityReady(preview),true,"incomplete user coverage is distinct from infrastructure capability");
+  assert.equal(valueCapabilityReady({...preview,ready:true,checks:undefined}),false);
+  for(const check of checks) {
+    assert.equal(valueCapabilityReady({...preview,checks:checks.filter(c=>c.code!==check.code)}),false,check.code);
+    assert.equal(valueCapabilityReady({...preview,checks:checks.map(c=>c===check?{...c,ready:false}:c)}),false,check.code);
+  }
+  assert.equal(valueCapabilityReady({...preview,checks:[...checks,{code:"text_surface",ready:false}]}),false,"all bindings must be verified");
+  assert.equal(valueCapabilityReady({...preview,checks:[...checks,{code:"tariff_published",ready:false}]}),false);
+  assert.equal(valueReadinessError({status:409}),"conflict");
+  assert.equal(valueReadinessError({code:"quota_unavailable",details:{readinessCode:"quota_server_offline"}}),"offline");
+  assert.equal(valueReadinessError({details:{readinessCode:"quota_server_upgrade_required"}}),"upgrade");
+  assert.equal(valueReadinessError(new Error("sensitive upstream body")),"failed");
+});
 
 test("USD quota decimals are exact, bounded and independent of wallet currency", () => {
   assert.equal(usdLimitToMicros("0.000001"), "1");

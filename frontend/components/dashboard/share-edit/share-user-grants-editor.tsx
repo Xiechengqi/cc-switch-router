@@ -8,6 +8,8 @@ import { ShareUserLimitsTable } from "@/components/dashboard/drawer-panels";
 import type { TFn } from "@/components/dashboard/share-dashboard-utils";
 import { getShareUserLimitStatus, previewShareAccountReset } from "@/lib/api";
 import { useShareUserUsageBreakdown } from "@/lib/use-share-user-usage-breakdown";
+import { useValueQuotaReadiness } from "@/lib/use-value-quota-readiness";
+import { ValueQuotaReadiness } from "./value-quota-readiness";
 import type {
   ShareTokenPeriod,
   ShareUserGrant,
@@ -230,30 +232,38 @@ export function ShareUserGrantsEditor({
   const normalizedOwner = ownerEmail.trim().toLowerCase();
   const [accountPreview, setAccountPreview] = React.useState<AccountResetPreview>();
   const [valuePreview, setValuePreview] = React.useState<ValueQuotaPreview>();
-  const [valueCapabilityReady, setValueCapabilityReady] = React.useState(false);
+  const readiness = useValueQuotaReadiness(shareId, configRevision);
+  const valueCapabilityReady = readiness.ready;
+  const valueScope = React.useRef(readiness.key);
+  valueScope.current = readiness.key;
+  const confirmedValueScope = React.useRef("");
+  const valuePreviewRequest = React.useRef<AbortController | null>(null);
   const [valuePreviewIntent, setValuePreviewIntent] = React.useState("");
   const valueStatuses = useShareValueQuota(shareId,true);
   const setValueStatuses = (items:ValueQuotaStatus[])=>window.dispatchEvent(new CustomEvent("share-value-quota-updated",{detail:{shareId,items}}));
   React.useEffect(() => {
-    setValuePreview(undefined); setValuePreviewIntent(""); setValueCapabilityReady(false);
-    if (!shareId || configRevision == null) return;
-    let active = true;
-    void previewValueQuota(shareId, configRevision).then((r) => {
-      if (active) { setValuePreview(r); setValueCapabilityReady(r.ready); }
-    }).catch(() => {});
-    return () => { active = false; };
-  }, [shareId, configRevision]);
+    setValuePreview(undefined); setValuePreviewIntent(""); setPreviewBusy(false); confirmedValueScope.current = "";
+    return () => { valuePreviewRequest.current?.abort(); };
+  }, [readiness.key]);
   const confirmValuePreview = async (policies: Record<string, ShareUserPolicy>, intent: string) => {
     if (!shareId || configRevision == null) throw new Error(t("dashboard.userLimit.value.notReady"));
-    if (valuePreviewIntent === intent && valuePreview?.ready) return true;
+    if (valuePreviewIntent === intent && valuePreview?.ready && confirmedValueScope.current === readiness.key) return true;
+    const requestedScope = readiness.key;
+    valuePreviewRequest.current?.abort();
+    const controller = new AbortController(); valuePreviewRequest.current = controller;
     setPreviewBusy(true);
     try {
-      const preview = await previewValueQuota(shareId, configRevision, policies);
+      const preview = await previewValueQuota(shareId, configRevision, policies, controller.signal);
+      if (controller.signal.aborted || requestedScope !== valueScope.current) return false;
       setValuePreview(preview);
-      if (!preview.ready) throw new Error(preview.reason || t("dashboard.userLimit.value.notReady"));
+      if (!preview.ready) throw new Error(preview.capabilityReady === false ? t("dashboard.userLimit.value.notReady") : preview.reason || t("dashboard.userLimit.value.notReady"));
+      confirmedValueScope.current = requestedScope;
       setValuePreviewIntent(intent);
       return false;
-    } finally { setPreviewBusy(false); }
+    } catch (cause) {
+      if (controller.signal.aborted || requestedScope !== valueScope.current) return false;
+      throw cause;
+    } finally { if (requestedScope === valueScope.current) setPreviewBusy(false); }
   };
   const [previewIntent, setPreviewIntent] = React.useState("");
   const [previewBusy, setPreviewBusy] = React.useState(false);
@@ -963,8 +973,8 @@ export function ShareUserGrantsEditor({
         className="z-[70]"
       >
           <Modal.Container placement="center" className="z-[70]">
-            <Modal.Dialog className="light w-[min(620px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
-              <Modal.CloseTrigger />
+            <Modal.Dialog className="share-edit-surface light w-[min(620px,calc(100vw-2rem))] max-w-none bg-background text-foreground">
+              <Modal.CloseTrigger className="share-quota-close" />
               <Modal.Header>
                 <Modal.Heading>{editingEmail ? t("dashboard.userLimit.edit") : t("dashboard.userLimit.add")}</Modal.Heading>
               </Modal.Header>
@@ -981,9 +991,9 @@ export function ShareUserGrantsEditor({
                   <span className="mono-label text-muted-foreground">{t("dashboard.userLimit.value.unit")}</span>
                   <Select aria-label={t("dashboard.userLimit.value.unit")} selectedKey={grantDraft?.quotaUnit || "tokens"} onSelectionChange={(key) => grantDraft && setGrantDraft({ ...grantDraft, quotaUnit: key === "usdEquivalent" ? "usdEquivalent" : "tokens", tokenLimit: "", usageAction: "unchanged", consumedTokens: "" })}>
                     <Select.Trigger><Select.Value>{t(grantDraft?.quotaUnit === "usdEquivalent" ? "dashboard.userLimit.value.usd" : "dashboard.userLimit.value.tokens")}</Select.Value><Select.Indicator /></Select.Trigger>
-                    <Select.Popover><ListBox><ListBox.Item id="tokens" textValue={t("dashboard.userLimit.value.tokens")}>{t("dashboard.userLimit.value.tokens")}</ListBox.Item><ListBox.Item id="usdEquivalent" isDisabled={!valueCapabilityReady && grantDraft?.quotaUnit !== "usdEquivalent"} textValue={t("dashboard.userLimit.value.usd")}>{t("dashboard.userLimit.value.usd")}</ListBox.Item></ListBox></Select.Popover>
+                    <Select.Popover className="share-edit-popover light z-[80]"><ListBox><ListBox.Item id="tokens" textValue={t("dashboard.userLimit.value.tokens")}>{t("dashboard.userLimit.value.tokens")}</ListBox.Item><ListBox.Item id="usdEquivalent" isDisabled={!valueCapabilityReady && grantDraft?.quotaUnit !== "usdEquivalent"} textValue={t("dashboard.userLimit.value.usd")}>{t("dashboard.userLimit.value.usd")}</ListBox.Item></ListBox></Select.Popover>
                   </Select>
-                  {!valueCapabilityReady ? <p className="text-xs text-muted-foreground">{t("dashboard.userLimit.value.notReady")}</p> : null}
+                  <ValueQuotaReadiness state={readiness} t={t}/>
                   <span className="mono-label text-muted-foreground">{t(grantDraft?.quotaUnit === "usdEquivalent" ? "dashboard.userLimit.value.limit" : "dashboard.field.tokenLimit")}</span>
                   <Input type="text" inputMode="decimal" placeholder={t("common.unlimited")} value={grantDraft?.tokenLimit || ""} onChange={(event) => grantDraft && setGrantDraft({ ...grantDraft, tokenLimit: event.target.value })} />
                   {grantDraft?.quotaUnit === "usdEquivalent" ? <div className="text-xs text-muted-foreground"><p>{t("dashboard.userLimit.value.hint")}</p><p>{t("dashboard.userLimit.value.start")}</p>{valuePreview?.rows.map((row) => <p key={row.email}>{row.email}: {new Date(row.effectiveFromMs).toLocaleString()} · {formatQuotaPicos(row.usedPicos ?? undefined)}</p>)}</div> : null}
@@ -1086,8 +1096,8 @@ export function ShareUserGrantsEditor({
         className="z-[70]"
       >
         <Modal.Container placement="center" className="z-[70]">
-          <Modal.Dialog className="light w-[min(620px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
-            <Modal.CloseTrigger />
+          <Modal.Dialog className="share-edit-surface light w-[min(620px,calc(100vw-2rem))] max-w-none bg-background text-foreground">
+            <Modal.CloseTrigger className="share-quota-close" />
             <Modal.Header>
               <Modal.Heading>{t("dashboard.userLimit.batchTitle")}</Modal.Heading>
             </Modal.Header>
@@ -1143,8 +1153,9 @@ export function ShareUserGrantsEditor({
                 </Checkbox>
                 <Select aria-label={t("dashboard.userLimit.value.unit")} isDisabled={!batchDraft?.applyTokenLimit} selectedKey={batchDraft?.quotaUnit || "tokens"} onSelectionChange={(key) => batchDraft && setBatchDraft({ ...batchDraft, quotaUnit: key === "usdEquivalent" ? "usdEquivalent" : "tokens", tokenLimit: "", applyConsumedTokens: false })}>
                   <Select.Trigger><Select.Value>{t(batchDraft?.quotaUnit === "usdEquivalent" ? "dashboard.userLimit.value.usd" : "dashboard.userLimit.value.tokens")}</Select.Value><Select.Indicator /></Select.Trigger>
-                  <Select.Popover><ListBox><ListBox.Item id="tokens" textValue={t("dashboard.userLimit.value.tokens")}>{t("dashboard.userLimit.value.tokens")}</ListBox.Item><ListBox.Item id="usdEquivalent" isDisabled={!valueCapabilityReady && batchDraft?.quotaUnit !== "usdEquivalent"} textValue={t("dashboard.userLimit.value.usd")}>{t("dashboard.userLimit.value.usd")}</ListBox.Item></ListBox></Select.Popover>
+                  <Select.Popover className="share-edit-popover light z-[80]"><ListBox><ListBox.Item id="tokens" textValue={t("dashboard.userLimit.value.tokens")}>{t("dashboard.userLimit.value.tokens")}</ListBox.Item><ListBox.Item id="usdEquivalent" isDisabled={!valueCapabilityReady && batchDraft?.quotaUnit !== "usdEquivalent"} textValue={t("dashboard.userLimit.value.usd")}>{t("dashboard.userLimit.value.usd")}</ListBox.Item></ListBox></Select.Popover>
                 </Select>
+                {batchDraft?.applyTokenLimit ? <ValueQuotaReadiness state={readiness} t={t}/> : null}
                 {batchDraft?.applyTokenLimit && batchDraft.quotaUnit === "usdEquivalent" ? <p className="text-xs text-muted-foreground">{t("dashboard.userLimit.value.hint")} {t("dashboard.userLimit.value.start")}</p> : null}
                 <Input
                   type="text"
