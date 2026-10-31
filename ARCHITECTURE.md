@@ -40,7 +40,7 @@
 
 ## 1. 系统定位
 
-Share v10 为普通授权增加 Token／USD 等值二选一配额。`share_value_pricing` 负责严格快照与定点算法，`store/share_value_quotas` 保存不可变价目、installation ACK 和私有动态投影；Server 是准入、在途风险、历史用量和校准的权威。该子系统不读取支付渠道，也不写 `market_*` 资金表。默认无执行快照，须 Owner 明确发布并经 Server ACK；旧 v7／Token 行为和活跃市场车位合同保持。具体协议、恢复与 `live_pending` 验收边界见 [PROTOCOL §13](PROTOCOL.md#13-share-v10-美元等值额度)。
+Share v10 为普通授权增加 Token／USD 等值二选一配额。`share_value_pricing` 负责严格快照与定点算法，`store/share_value_quotas` 保存不可变价目、installation ACK 和私有动态投影（每个 Share 用户仅保留当前窗口一行，删除 Share／清理 installation 时一并删除投影与 ACK）；Server 是准入、在途风险、历史用量和校准的权威。该子系统不读取支付渠道，也不写 `market_*` 资金表。默认无执行快照，须 Owner 明确发布并经 Server ACK；旧 v7／Token 行为和活跃市场车位合同保持。具体协议、恢复与 `live_pending` 验收边界见 [PROTOCOL §13](PROTOCOL.md#13-share-v10-美元等值额度)。
 
 cc-switch-router 是 TokenSwitch 的**公共汇聚层**。它为 `cc-switch-server` 实例提供公网可达性，并在 Client + Router 边界内承载 Router 自有的 Share Market、Client Market 与中性的 Gateway 容量适配。旧独立 Token Market 不再是 Router 的运行时角色。
 

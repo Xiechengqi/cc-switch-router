@@ -946,6 +946,8 @@ export type ShareUserLimitStatusRow = {
   percent?: number;
   windowStartsAt?: string | null;
   resetsAt?: string | null;
+  /** UI only: the enforced Token limit is not known yet (a USD policy is scheduled, no live row). */
+  limitUnknown?: boolean;
 };
 
 export type ShareUserLimitStatusResponse = {

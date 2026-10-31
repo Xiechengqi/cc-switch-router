@@ -192,10 +192,33 @@ export function buildShareSettingsPatch(
   return changedShareSettings(full(draft), baseline, draft.userUsageEdits);
 }
 
-function policyFingerprint(policy: ShareUserPolicy) {
+/** Every policy field the Server enforces, USD quota included. */
+export function sharePolicyFingerprint(policy: ShareUserPolicy) {
   return JSON.stringify([policy.parallelLimit ?? null, policy.tokenLimit ?? null,
     policy.valueQuota?.limitUsdMicros ?? null, policy.valueQuota?.tariffPolicyId ?? null,
     policy.tokenPeriod || "lifetime", policy.tokenPeriodAnchorAtMs ?? null, policy.expiresAt ?? null]);
+}
+
+/**
+ * The policy plus its scheduled USD policy: dropping a schedule (see
+ * `stageUserPolicy`) is an edit even when the policy itself is unchanged.
+ */
+function grantPolicyFingerprint(grant: ShareUserGrant) {
+  return JSON.stringify([sharePolicyFingerprint(grant.policy),
+    grant.pendingValueQuota?.policy ? sharePolicyFingerprint(grant.pendingValueQuota.policy) : null]);
+}
+
+/**
+ * Stage an edited policy on a grant that may carry a scheduled USD policy.
+ * Re-applying exactly the scheduled policy keeps the schedule and leaves
+ * `current` in force. Any other policy replaces the schedule — Server
+ * recomputes one on save if it is still needed — while the metering binding
+ * stays, so usage is never reset.
+ */
+export function stageUserPolicy(grant: ShareUserGrant, policy: ShareUserPolicy, current: ShareUserPolicy = grant.policy): ShareUserGrant {
+  const pending = grant.pendingValueQuota;
+  if (pending?.policy && sharePolicyFingerprint(pending.policy) === sharePolicyFingerprint(policy)) return { ...grant, policy: current };
+  return { ...grant, policy, pendingValueQuota: undefined };
 }
 
 export function changedUserGrants(next: ShareUserGrantMap, baseline: ShareUserGrantMap): NonNullable<ShareSettingsPatch["userGrantEdits"]> {
@@ -206,7 +229,7 @@ export function changedUserGrants(next: ShareUserGrantMap, baseline: ShareUserGr
     if (isRouterShareMarketManagedGrant(before) || isRouterShareMarketManagedGrant(after)) continue;
     const wasActive = !!before && before.active !== false;
     const isActive = !!after && after.active !== false;
-    if (wasActive === isActive && (!isActive || policyFingerprint(before.policy) === policyFingerprint(after.policy))) continue;
+    if (wasActive === isActive && (!isActive || grantPolicyFingerprint(before) === grantPolicyFingerprint(after))) continue;
     edits[email] = { expectedRevision: before?.revision ?? 0, policy: isActive ? after.policy : null };
   }
   return edits;

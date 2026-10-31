@@ -15453,6 +15453,14 @@ fn normalize_share_descriptor_fields(share: &mut ShareDescriptor) -> Result<(), 
             ));
         }
     }
+    // Only grants that enforce or schedule a USD policy carry a metering
+    // binding. Older Servers also bound Token grants (shadow metering); those
+    // bindings are not authoritative and must not gate descriptor sync.
+    for grant in share.user_grants.values_mut() {
+        if grant.policy.value_quota.is_none() && grant.pending_value_quota.is_none() {
+            grant.value_metering = None;
+        }
+    }
     share.parallel_limit = normalize_share_limit_value(share.parallel_limit);
     validate_share_model_probes(share)?;
     if share.expires_at == LEGACY_PERMANENT_SHARE_EXPIRES_AT {
@@ -16285,6 +16293,44 @@ fn sync_share_model_probe_epoch_tx(
     })
 }
 
+/// Every tariff revision bound by a USD-enforcing or USD-scheduled grant must
+/// have been acknowledged by this installation. Bindings of other grants were
+/// already dropped by `normalize_share_descriptor_fields`.
+fn ensure_value_pricing_acknowledged(
+    conn: &Connection,
+    installation_id: &str,
+    share: &ShareDescriptor,
+) -> Result<(), AppError> {
+    let revisions = share
+        .user_grants
+        .values()
+        .filter(|g| g.policy.value_quota.is_some() || g.pending_value_quota.is_some())
+        .filter_map(|g| g.value_metering.as_ref())
+        .map(|binding| binding.pricing_revision.as_str())
+        .collect::<BTreeSet<_>>();
+    let missing = revisions
+        .into_iter()
+        .map(|revision| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM share_value_pricing_acks WHERE installation_id=?1 AND revision=?2)",
+                params![installation_id, revision],
+                |r| r.get::<_, bool>(0),
+            )
+            .map(|acknowledged| (!acknowledged).then(|| revision.to_string()))
+            .map_err(|e| AppError::Internal(format!("read value pricing ACK failed: {e}")))
+        })
+        .filter_map(Result::transpose)
+        .collect::<Result<Vec<_>, _>>()?;
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(AppError::coded_conflict(
+        "value_pricing_ack_missing",
+        "USD-equivalent tariff is not acknowledged by this installation; acknowledge it and retry",
+        serde_json::json!({"revisions": missing}),
+    ))
+}
+
 fn upsert_share_tx(
     conn: &Connection,
     installation_id: &str,
@@ -16292,19 +16338,7 @@ fn upsert_share_tx(
 ) -> Result<(), AppError> {
     normalize_share_descriptor_fields(&mut share)?;
     validate_share_descriptor_bindings(&share)?;
-    for binding in share
-        .user_grants
-        .values()
-        .filter_map(|g| g.value_metering.as_ref())
-    {
-        let acknowledged:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM share_value_pricing_acks WHERE installation_id=?1 AND revision=?2)",
-            params![installation_id,binding.pricing_revision],|r|r.get(0)).map_err(|e|AppError::Internal(e.to_string()))?;
-        if !acknowledged {
-            return Err(AppError::Conflict(
-                "USD-equivalent tariff is not acknowledged by this installation".into(),
-            ));
-        }
-    }
+    ensure_value_pricing_acknowledged(conn, installation_id, &share)?;
     let new_quota_stream = merge_account_quota_projections(conn, &mut share)?;
     let chat_share_id = share.share_id.clone();
     let next_model_probe_epoch = descriptor_model_probe_epoch_input(&share);
@@ -16769,6 +16803,11 @@ fn delete_share_auxiliary_rows_tx(conn: &Connection, share_id: &str) -> Result<(
         params![share_id],
     )
     .map_err(|e| AppError::Internal(format!("delete gateway share runtime states failed: {e}")))?;
+    conn.execute(
+        "DELETE FROM share_value_quota_projections WHERE share_id = ?1",
+        params![share_id],
+    )
+    .map_err(|e| AppError::Internal(format!("delete share value quota projections failed: {e}")))?;
     Ok(())
 }
 
@@ -16842,6 +16881,25 @@ pub(crate) fn purge_installation_data_tx(
         params![installation_id],
     )
     .map_err(|e| AppError::Internal(format!("delete installation client tunnel failed: {e}")))?;
+    // Both tables reference installations(id) without ON DELETE.
+    conn.execute(
+        "DELETE FROM share_value_quota_projections WHERE installation_id = ?1",
+        params![installation_id],
+    )
+    .map_err(|e| {
+        AppError::Internal(format!(
+            "delete installation value quota projections failed: {e}"
+        ))
+    })?;
+    conn.execute(
+        "DELETE FROM share_value_pricing_acks WHERE installation_id = ?1",
+        params![installation_id],
+    )
+    .map_err(|e| {
+        AppError::Internal(format!(
+            "delete installation value pricing ACKs failed: {e}"
+        ))
+    })?;
     conn.execute(
         "DELETE FROM installations WHERE id = ?1",
         params![installation_id],
@@ -16967,6 +17025,10 @@ pub(crate) fn retire_share_tx(
             "gateway_share_runtime_states",
             "gateway share runtime state",
         ),
+        (
+            "share_value_quota_projections",
+            "share value quota projections",
+        ),
     ] {
         conn.execute(
             &format!("DELETE FROM {table} WHERE share_id = ?1"),
@@ -16982,15 +17044,28 @@ fn upsert_share_request_log_tx(
     installation_id: &str,
     log: ShareRequestLogEntry,
 ) -> Result<bool, AppError> {
-    match (log.cache_creation_5m_tokens, log.cache_creation_1h_tokens) {
-        (None, None) => {}
-        (Some(five), Some(hour)) if five.checked_add(hour) == Some(log.cache_creation_tokens) => {}
-        _ => {
-            return Err(AppError::BadRequest(
-                "invalid cache creation TTL breakdown".into(),
-            ));
-        }
-    }
+    let (cache_creation_5m_tokens, cache_creation_1h_tokens) =
+        match (log.cache_creation_5m_tokens, log.cache_creation_1h_tokens) {
+            (None, None) => (None, None),
+            (Some(five), Some(hour))
+                if five.checked_add(hour) == Some(log.cache_creation_tokens) =>
+            {
+                (Some(five), Some(hour))
+            }
+            // An inconsistent split only loses TTL evidence (priced as unknown
+            // TTL); it must not reject the rest of the log batch.
+            (five, hour) => {
+                tracing::warn!(
+                    request_id = %log.request_id,
+                    installation_id,
+                    cache_creation_tokens = log.cache_creation_tokens,
+                    cache_creation_5m_tokens = ?five,
+                    cache_creation_1h_tokens = ?hour,
+                    "dropping inconsistent cache creation TTL breakdown"
+                );
+                (None, None)
+            }
+        };
     let changed = conn.execute(
         "INSERT INTO share_request_logs (
             request_id, installation_id, share_id, share_name, provider_id, provider_name,
@@ -17002,8 +17077,9 @@ fn upsert_share_request_log_tx(
             cache_usage_observed, usage_estimated,
             is_streaming, session_id, user_country, user_country_iso3, user_email, is_health_check, created_at,
             request_kind, operation, parent_request_id, error_message, media_task_id, media_status,
-            video_duration_seconds, video_resolution, video_aspect_ratio
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46, ?47)
+            video_duration_seconds, video_resolution, video_aspect_ratio,
+            cache_creation_5m_tokens, cache_creation_1h_tokens
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49)
         ON CONFLICT(request_id) DO UPDATE SET
             installation_id = excluded.installation_id,
             share_id = excluded.share_id,
@@ -17051,6 +17127,8 @@ fn upsert_share_request_log_tx(
             , video_duration_seconds = COALESCE(excluded.video_duration_seconds, share_request_logs.video_duration_seconds)
             , video_resolution = COALESCE(excluded.video_resolution, share_request_logs.video_resolution)
             , video_aspect_ratio = COALESCE(excluded.video_aspect_ratio, share_request_logs.video_aspect_ratio)
+            , cache_creation_5m_tokens = excluded.cache_creation_5m_tokens
+            , cache_creation_1h_tokens = excluded.cache_creation_1h_tokens
         WHERE excluded.usage_revision >= share_request_logs.usage_revision",
         params![
             log.request_id,
@@ -17100,21 +17178,12 @@ fn upsert_share_request_log_tx(
             log.video_duration_seconds.map(i64::from),
             log.video_resolution,
             log.video_aspect_ratio,
+            cache_creation_5m_tokens.map(i64::from),
+            cache_creation_1h_tokens.map(i64::from),
         ],
     )
     .map_err(|e| AppError::Internal(format!("upsert share request log failed: {e}")))?;
     if changed > 0 {
-        conn.execute(
-            "UPDATE share_request_logs SET cache_creation_5m_tokens=?2,cache_creation_1h_tokens=?3
-            WHERE request_id=?1 AND installation_id=?4",
-            params![
-                log.request_id,
-                log.cache_creation_5m_tokens.map(i64::from),
-                log.cache_creation_1h_tokens.map(i64::from),
-                installation_id
-            ],
-        )
-        .map_err(|e| AppError::Internal(format!("save cache TTL breakdown: {e}")))?;
         let attribution = log.quota_attribution.as_ref();
         if attribution
             .is_some_and(|attribution| Some(attribution.started_at_ms) != log.started_at_ms)
@@ -17173,8 +17242,11 @@ fn merge_account_quota_projections(
                     "invalid value metering binding".into(),
                 ));
             }
+            // Only a binding that was enforcing/scheduling USD fixes the
+            // origin; legacy Token shadow bindings never did.
             if let Some(previous) = previous
                 .get(&grant.email)
+                .filter(|g| g.policy.value_quota.is_some() || g.pending_value_quota.is_some())
                 .and_then(|g| g.value_metering.as_ref())
             {
                 if previous.value_metered_from_ms != binding.value_metered_from_ms {
@@ -34952,15 +35024,22 @@ pub(crate) mod tests {
         assert_eq!(read[0].cache_creation_tokens, 12);
         assert_eq!(read[0].cache_creation_5m_tokens, Some(5));
         assert_eq!(read[0].cache_creation_1h_tokens, Some(7));
+        // Inconsistent splits are dropped (TTL unknown) instead of rejecting the log.
         updated.usage_revision = 2;
         updated.cache_creation_1h_tokens = None;
-        assert!(upsert_share_request_log_tx(&conn, "installation", updated.clone()).is_err());
+        assert!(upsert_share_request_log_tx(&conn, "installation", updated.clone()).unwrap());
+        let read = list_global_recent_share_request_logs(&conn, 10).unwrap();
+        assert_eq!(read[0].usage_revision, 2);
+        assert_eq!(read[0].cache_creation_tokens, 12);
+        assert_eq!(read[0].cache_creation_5m_tokens, None);
+        assert_eq!(read[0].cache_creation_1h_tokens, None);
+        updated.usage_revision = 3;
         updated.cache_creation_1h_tokens = Some(8);
-        assert!(upsert_share_request_log_tx(&conn, "installation", updated).is_err());
-        assert_eq!(
-            list_global_recent_share_request_logs(&conn, 10).unwrap()[0].usage_revision,
-            1
-        );
+        assert!(upsert_share_request_log_tx(&conn, "installation", updated).unwrap());
+        let read = list_global_recent_share_request_logs(&conn, 10).unwrap();
+        assert_eq!(read[0].usage_revision, 3);
+        assert_eq!(read[0].cache_creation_5m_tokens, None);
+        assert_eq!(read[0].cache_creation_1h_tokens, None);
     }
 
     #[tokio::test]
@@ -36851,7 +36930,7 @@ pub(crate) mod tests {
             .publish_value_pricing(
                 PublishPricing {
                     expected_version: 0,
-                    effective_from_ms: Utc::now().timestamp_millis() + 60000,
+                    effective_from_ms: Some(Utc::now().timestamp_millis() + 60000),
                     snapshot: snapshot.clone(),
                 },
                 "owner@example.com",
@@ -36870,7 +36949,7 @@ pub(crate) mod tests {
                 .publish_value_pricing(
                     PublishPricing {
                         expected_version: 0,
-                        effective_from_ms: Utc::now().timestamp_millis() + 60000,
+                        effective_from_ms: Some(Utc::now().timestamp_millis() + 60000),
                         snapshot
                     },
                     "owner@example.com"
@@ -37011,6 +37090,88 @@ pub(crate) mod tests {
                 .as_i64()
                 .is_some()
         );
+        // A repeated ACK is idempotent and keeps the original acknowledgement time.
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE share_value_pricing_acks SET acknowledged_at_ms=7 WHERE installation_id='value-install'",
+                [],
+            )
+            .unwrap();
+        }
+        store
+            .signed_value_operation(
+                "share_value_pricing_ack",
+                request(
+                    "value-install",
+                    &key,
+                    "share_value_pricing_ack",
+                    json!({"revision":revision,"storageSchema":3}),
+                    "ack-again",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .value_pricing_readiness("value-install")
+                .await
+                .unwrap()["acknowledgedAtMs"],
+            7
+        );
+        let unchanged = store
+            .signed_value_operation(
+                "share_value_pricing_fetch",
+                request(
+                    "value-install",
+                    &key,
+                    "share_value_pricing_fetch",
+                    json!({"knownRevision":revision}),
+                    "fetch-known",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unchanged, json!({"unchanged":true,"revision":revision}));
+        let changed = store
+            .signed_value_operation(
+                "share_value_pricing_fetch",
+                request(
+                    "value-install",
+                    &key,
+                    "share_value_pricing_fetch",
+                    json!({"knownRevision":"sha256:older"}),
+                    "fetch-older",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(changed["revision"], revision);
+        assert!(changed["snapshot"].is_object());
+        assert!(
+            store
+                .signed_value_operation(
+                    "share_value_pricing_fetch",
+                    request(
+                        "value-install",
+                        &key,
+                        "share_value_pricing_fetch",
+                        json!({"knownRevision":revision,"extra":true}),
+                        "fetch-unknown-key",
+                    ),
+                )
+                .await
+                .is_err()
+        );
+        // Rows of earlier windows are pruned once the current window is stored.
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO share_value_quota_projections VALUES('value-install','value-share',?1,'epoch','Day:0:86400000',1,'{}',0)",
+                params![grant.email],
+            )
+            .unwrap();
+        }
         assert!(
             store
                 .value_pricing_readiness("other-install")
@@ -37032,6 +37193,17 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(accepted["usageWatermark"], 2);
+        {
+            let conn = store.conn.lock().await;
+            let windows: Vec<String> = conn
+                .prepare("SELECT window_id FROM share_value_quota_projections WHERE share_id='value-share'")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(windows, vec!["Lifetime:0:0".to_string()]);
+        }
         status.observed_picos = "90".into();
         status.used_picos = "90".into();
         assert!(
@@ -37116,7 +37288,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(own.len(), 1);
-        assert_eq!(own[0].used_picos, "90");
+        assert_eq!(own[0].projected().unwrap().used_picos, "90");
         assert!(
             store
                 .share_value_quota_status("value-share", Some("other@example.com"))
@@ -37133,9 +37305,388 @@ pub(crate) mod tests {
                 .share_value_quota_status("value-share", Some(&grant.email))
                 .await
                 .unwrap()[0]
+                .projected()
+                .unwrap()
                 .used_picos,
             "90"
         );
+    }
+
+    #[tokio::test]
+    async fn share_value_fetch_with_known_revision_but_no_ack_returns_full_manifest() {
+        use crate::store::share_value_quotas::{PublishPricing, SignedValueRequest};
+        use serde_json::json;
+        let (store, _config) = setup_store("share-value-fetch-reack").await;
+        let key = insert_signed_installation(&store, "reack-install").await;
+        let other_key = insert_signed_installation(&store, "reack-other").await;
+        let snapshot = share_value_test_snapshot();
+        let revision = snapshot.revision().unwrap();
+        store
+            .publish_value_pricing(
+                PublishPricing {
+                    expected_version: 0,
+                    effective_from_ms: None,
+                    snapshot,
+                },
+                "owner@example.com",
+            )
+            .await
+            .unwrap();
+        let signed = |installation: &str,
+                      signer: &SigningKey,
+                      action: &str,
+                      payload: serde_json::Value,
+                      nonce: &str| {
+            let timestamp_ms = Utc::now().timestamp_millis();
+            let nonce = format!("reack-{nonce}");
+            SignedValueRequest {
+                protocol_epoch: PROTOCOL_EPOCH.into(),
+                installation_id: installation.into(),
+                timestamp_ms,
+                signature: sign_test_payload(
+                    signer,
+                    installation,
+                    action,
+                    &payload,
+                    timestamp_ms,
+                    &nonce,
+                ),
+                nonce,
+                payload,
+            }
+        };
+        let fetch_known = |installation: &'static str, signer: &SigningKey, nonce: &str| {
+            signed(
+                installation,
+                signer,
+                "share_value_pricing_fetch",
+                json!({"knownRevision":revision}),
+                nonce,
+            )
+        };
+        // The Server already knows the revision but this installation never ACKed it.
+        let manifest = store
+            .signed_value_operation(
+                "share_value_pricing_fetch",
+                fetch_known("reack-install", &key, "before-ack"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(manifest["installationId"], "reack-install");
+        assert_eq!(manifest["revision"], revision);
+        assert!(manifest["snapshot"].is_object());
+        assert!(manifest.get("unchanged").is_none());
+        store
+            .signed_value_operation(
+                "share_value_pricing_ack",
+                signed(
+                    "reack-install",
+                    &key,
+                    "share_value_pricing_ack",
+                    json!({"revision":revision,"storageSchema":3}),
+                    "ack",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .signed_value_operation(
+                    "share_value_pricing_fetch",
+                    fetch_known("reack-install", &key, "after-ack"),
+                )
+                .await
+                .unwrap(),
+            json!({"unchanged":true,"revision":revision})
+        );
+        // The published revision is global; ACKs are per installation.
+        let other = store
+            .signed_value_operation(
+                "share_value_pricing_fetch",
+                fetch_known("reack-other", &other_key, "other"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(other["installationId"], "reack-other");
+        assert!(other["snapshot"].is_object());
+    }
+
+    #[tokio::test]
+    async fn share_value_status_lists_scheduled_usd_policy_before_first_watermark() {
+        use crate::share_value_pricing::{TARIFF_POLICY, ValueMeteringBinding, ValueQuota};
+        let (store, _config) = setup_store("share-value-scheduled-row").await;
+        insert_share(
+            &store,
+            "sched-install",
+            "sched-share",
+            "sched-sub",
+            "active",
+        )
+        .await;
+        let mut scheduled = test_share_user_grant("user@example.com", "shareto", 100);
+        scheduled.policy.token_period = ShareTokenPeriod::Day;
+        let mut pending_policy = scheduled.policy.clone();
+        pending_policy.token_limit = None;
+        pending_policy.token_period = ShareTokenPeriod::Week;
+        pending_policy.value_quota = Some(ValueQuota {
+            limit_usd_micros: "5000000".into(),
+            tariff_policy_id: TARIFF_POLICY.into(),
+        });
+        scheduled.value_metering = Some(ValueMeteringBinding {
+            quota_policy_epoch: "epoch".into(),
+            value_metered_from_ms: 0,
+            effective_from_ms: 0,
+            pricing_revision: "revision".into(),
+        });
+        scheduled.pending_value_quota = Some(crate::models::PendingValueQuota {
+            policy: pending_policy,
+            effective_from_ms: 1_900_000_000_000,
+            retain_access: true,
+        });
+        let plain = test_share_user_grant("tokens@example.com", "shareto", 100);
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET user_grants_json=?2 WHERE share_id=?1",
+                params![
+                    "sched-share",
+                    serde_json::to_string(&BTreeMap::from([
+                        (scheduled.email.clone(), scheduled.clone()),
+                        (plain.email.clone(), plain.clone()),
+                    ]))
+                    .unwrap()
+                ],
+            )
+            .unwrap();
+        }
+        let own = store
+            .share_value_quota_status("sched-share", Some("user@example.com"))
+            .await
+            .unwrap();
+        assert_eq!(own.len(), 1);
+        assert!(own[0].projected().is_none());
+        let row = serde_json::to_value(&own[0]).unwrap();
+        assert_eq!(row["email"], "user@example.com");
+        assert_eq!(row["meteringStatus"], "scheduled");
+        assert_eq!(
+            row["tokenPeriod"],
+            serde_json::to_value(ShareTokenPeriod::Day).unwrap()
+        );
+        assert_eq!(row["pendingLimitUsdMicros"], "5000000");
+        assert_eq!(
+            row["pendingTokenPeriod"],
+            serde_json::to_value(ShareTokenPeriod::Week).unwrap()
+        );
+        assert_eq!(row["pendingEffectiveFromMs"], 1_900_000_000_000_i64);
+        for usage in ["usedPicos", "observedPicos", "limitUsdMicros", "syncedAtMs"] {
+            assert!(row.get(usage).is_none(), "{usage} must not be fabricated");
+        }
+        // Owner view: the same row; Token-only grants stay absent.
+        let all = store
+            .share_value_quota_status("sched-share", None)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].email(), "user@example.com");
+        assert!(
+            store
+                .share_value_quota_status("sched-share", Some("tokens@example.com"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // Inactive grants never surface.
+        scheduled.active = false;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET user_grants_json=?2 WHERE share_id=?1",
+                params![
+                    "sched-share",
+                    serde_json::to_string(&BTreeMap::from([(scheduled.email.clone(), scheduled)]))
+                        .unwrap()
+                ],
+            )
+            .unwrap();
+        }
+        assert!(
+            store
+                .share_value_quota_status("sched-share", None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    fn share_value_test_snapshot() -> crate::share_value_pricing::PricingSnapshot {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/share-value-pricing-v1.json"
+        ))
+        .unwrap();
+        serde_json::from_value(fixture["snapshot"].clone()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn share_value_signed_fixture_verifies_end_to_end_from_canonical_bytes() {
+        use crate::store::share_value_quotas::SignedValueRequest;
+        let (store, _config) = setup_store("share-value-signed-fixture").await;
+        let key = insert_signed_installation(&store, "inst-fixture").await;
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/share-value-signed-payload-v1.json"
+        ))
+        .unwrap();
+        let action = fixture["action"].as_str().unwrap();
+        let canonical = fixture["canonical"].as_str().unwrap();
+        let body = |signed_json: &str, nonce: &str| {
+            let timestamp_ms = Utc::now().timestamp_millis();
+            let mut body = serde_json::json!({
+                "protocolEpoch": PROTOCOL_EPOCH,
+                "installationId": "inst-fixture",
+                "timestampMs": timestamp_ms,
+                "nonce": nonce,
+                "signature": sign_test_payload_json(
+                    &key,
+                    "inst-fixture",
+                    action,
+                    signed_json,
+                    timestamp_ms,
+                    nonce,
+                ),
+            });
+            for (field, value) in fixture["payload"].as_object().unwrap() {
+                body[field] = value.clone();
+            }
+            // Wire field order and whitespace are irrelevant to verification.
+            serde_json::from_str::<SignedValueRequest>(
+                &serde_json::to_string_pretty(&body).unwrap(),
+            )
+            .unwrap()
+        };
+        // The signature passes; the request then fails only on Share state.
+        let error = store
+            .signed_value_operation(action, body(canonical, "fixture-canonical"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppError::Conflict(_)), "{error:?}");
+        // Signing any non-canonical rendering of the same payload is rejected.
+        let pretty = serde_json::to_string_pretty(&fixture["payload"]).unwrap();
+        let error = store
+            .signed_value_operation(action, body(&pretty, "fixture-pretty"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, AppError::Unauthorized(message) if message == "signature verification failed"),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn share_value_rows_do_not_block_installation_or_share_purge() {
+        use crate::store::share_value_quotas::PublishPricing;
+        let (store, _config) = setup_store("share-value-purge").await;
+        insert_signed_installation(&store, "value-purge").await;
+        insert_share(&store, "value-purge", "purge-share", "purge-sub", "active").await;
+        insert_share(&store, "value-purge", "other-share", "other-sub", "active").await;
+        let revision = store
+            .publish_value_pricing(
+                PublishPricing {
+                    expected_version: 0,
+                    effective_from_ms: None,
+                    snapshot: share_value_test_snapshot(),
+                },
+                "owner@example.com",
+            )
+            .await
+            .unwrap()
+            .revision
+            .unwrap();
+        let conn = store.conn.lock().await;
+        conn.execute(
+            "INSERT INTO share_value_pricing_acks VALUES('value-purge',?1,1)",
+            params![revision],
+        )
+        .unwrap();
+        for share in ["purge-share", "other-share"] {
+            conn.execute(
+                "INSERT INTO share_value_quota_projections VALUES('value-purge',?1,'user@example.com','epoch','Lifetime:0:0',1,'{}',1)",
+                params![share],
+            )
+            .unwrap();
+        }
+        let count = |table: &str| -> i64 {
+            conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        delete_share_auxiliary_rows_tx(&conn, "purge-share").unwrap();
+        assert_eq!(count("share_value_quota_projections"), 1);
+        let tx = conn.unchecked_transaction().unwrap();
+        purge_installation_data_tx(&tx, "value-purge").unwrap();
+        tx.commit().unwrap();
+        assert_eq!(count("share_value_quota_projections"), 0);
+        assert_eq!(count("share_value_pricing_acks"), 0);
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM installations WHERE id='value-purge'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn share_value_ack_gate_applies_only_to_usd_grants_and_is_coded() {
+        use crate::share_value_pricing::{TARIFF_POLICY, ValueMeteringBinding, ValueQuota};
+        let (store, _config) = setup_store("share-value-ack-gate").await;
+        insert_installation(&store, "inst-value").await;
+        let conn = store.conn.lock().await;
+        let binding = |revision: &str| ValueMeteringBinding {
+            quota_policy_epoch: "epoch".into(),
+            value_metered_from_ms: 0,
+            effective_from_ms: 0,
+            pricing_revision: revision.into(),
+        };
+        let mut share = test_share_descriptor("value-gate", "value-gate-sub");
+        share.contract_version = 10;
+        // Legacy shadow binding on a Token grant: never gates the sync and is dropped.
+        let mut token = test_share_user_grant("token@example.com", "shareto", 100);
+        token.value_metering = Some(binding("sha256:never-acked"));
+        share.user_grants = BTreeMap::from([(token.email.clone(), token)]);
+        upsert_share_tx(&conn, "inst-value", share.clone()).unwrap();
+        let (_, stored) = list_shares(&conn)
+            .unwrap()
+            .into_iter()
+            .find(|(_, s)| s.share_id == "value-gate")
+            .unwrap();
+        assert!(
+            stored.user_grants["token@example.com"]
+                .value_metering
+                .is_none()
+        );
+
+        let mut usd = test_share_user_grant("usd@example.com", "shareto", 100);
+        usd.policy.token_limit = None;
+        usd.policy.token_period = ShareTokenPeriod::Lifetime;
+        usd.policy.value_quota = Some(ValueQuota {
+            limit_usd_micros: "1000000".into(),
+            tariff_policy_id: TARIFF_POLICY.into(),
+        });
+        usd.value_metering = Some(binding("sha256:unacked"));
+        let mut second = usd.clone();
+        second.email = "usd2@example.com".into();
+        share.user_grants.insert(usd.email.clone(), usd);
+        share.user_grants.insert(second.email.clone(), second);
+        share.config_revision += 1;
+        share.descriptor_generation += 1;
+        let error = upsert_share_tx(&conn, "inst-value", share).unwrap_err();
+        assert_eq!(error.code(), Some("value_pricing_ack_missing"));
+        if let AppError::Coded { details, .. } = error {
+            // Each distinct revision is reported (and looked up) once.
+            assert_eq!(details["revisions"], serde_json::json!(["sha256:unacked"]));
+        } else {
+            panic!("expected coded conflict");
+        }
     }
 
     async fn insert_setup_client_tunnel(store: &AppStore, installation_id: &str, subdomain: &str) {

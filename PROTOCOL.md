@@ -191,7 +191,7 @@ Router 不接受长效 SSH 凭据。每次建链前 Server 申请一次性 lease
 - Share Market 最低版本仍为 v5（`MIN_SHARE_MARKET_CONTRACT_VERSION=5`），不因账号周期的协商扩展抬高。reader 上限、普通 descriptor 版本与市场最低版本是三项独立约束。
 - v8增加`tokenPeriod=accountReset`及userGrants只读`accountQuotaCycle/accountResetCapability/accountUsageBaseline`、`usageQuota.usageWatermark`。安装heartbeat响应同时返回`shareContractVersion=10,capabilities=["accountResetV1","marketTrialV1","usdEquivalentQuotaV1","cacheCreationTtlV1"]`；Server同时检查显式能力、Router URL/installation绑定和300秒有效期。普通v7必须省略新嵌套字段，v7携带accountReset/新字段拒绝，不能静默转换为sevenDays；市场报价不开放动态周期。
 - v9 的 `marketEntitlements` 按 entitlement ID 返回 `trialScopeId/email/phase/active/trialTokenAllowance/trialTokenLimit/trialTokensUsed/usageRevision/usageUncertain/appliedAtMs/paidStartedAtMs`。`phase=trial|paid`，Token cap 缺省表示仅时长试用，不能写普通 `tokenLimit:0`。试用累计数和修订只增不减，与普通日／周／月 quota 分开；使用量变化不提升静态 descriptor generation。完整 descriptor 的 Notify＋周期重放持续携带动态试用水位。v9 以下不得携带非空试用状态。
-- v10 的普通用户 `policy.valueQuota={limitUsdMicros:"10000000",tariffPolicyId:"api-equivalent-v1"}` 与 `tokenLimit` 互斥，共用原 `tokenPeriod` 和 anchor。它是模型 API 标价等值使用限额，不是钱包余额或 Provider 账单。缺省仍为不限额；零额度非法。grant 可带 Server-owned `valueMetering={quotaPolicyEpoch,valueMeteredFromMs,effectiveFromMs,pricingRevision}` 和 `pendingValueQuota={policy,effectiveFromMs,retainAccess}`。切换到未完整覆盖的自然窗口时保留原 policy，到边界后持久化启用；新授权等待期间不提供无限制访问。首次累计模式从确认的计量起点开始，之后删加授权、改策略、切换单位均不能重设该起点或清空同窗口消费。v7–v9 不接受这些字段；活跃市场托管授权不允许金额模式。
+- v10 的普通用户 `policy.valueQuota={limitUsdMicros:"10000000",tariffPolicyId:"api-equivalent-v1"}` 与 `tokenLimit` 互斥，共用原 `tokenPeriod` 和 anchor。它是模型 API 标价等值使用限额，不是钱包余额或 Provider 账单。缺省仍为不限额；零额度非法。grant 可带 Server-owned `valueMetering={quotaPolicyEpoch,valueMeteredFromMs,effectiveFromMs,pricingRevision}` 和 `pendingValueQuota={policy,effectiveFromMs,retainAccess}`；`valueMetering` 只出现在金额模式或已排期金额策略的授权上，Token 授权不带（见 §13.2）。切换到未完整覆盖的自然窗口时保留原 policy，到边界后持久化启用；新授权等待期间不提供无限制访问。首次累计模式从确认的计量起点开始，之后删加授权、改策略、切换单位均不能重设该起点或清空同窗口消费。v7–v9 不接受这些字段；活跃市场托管授权不允许金额模式。
 - `cacheCreationTtlV1` 是独立的请求日志能力，不能从 reader v10 或 `usdEquivalentQuotaV1` 推断。协商后可同时附 `cacheCreation5mTokens`、`cacheCreation1hTokens`，两者非负且和等于原 `cacheCreationTokens`；两者必须同时缺省或同时出现。历史合并值保持 unknown TTL，不能虚构拆分；原四桶 Token 总数不变。
 - managed upsert 可附 `marketPhase/trialScopeId/trialTokenAllowance/trialTokenLimit`；revoke 不附这些字段。相同 entitlement 不得改变 scope、重新赋予试用或增加原始预算。Server 在转发前持久化请求所属 entitlement 和 phase，迟到试用用量不能计入正式额度。正式授权回执确认后 Router 才从预留款捕获首期费用；失败或未知回执先撤权，确认清理后才释放预留。`usageUncertain` 表示崩溃等情况下消费不能证明完整，须安全回收，不能当作零用量续试。
 - `accountQuotaCycle`包含`streamIncarnation/sourceRef/sourceEpoch/bucketId/cycleId/cycleSequence/cycleRevision/startsAtMs/endsAtMs/basis/observedAtMs/eventId`，UTC毫秒半开区间，end可空。缺完整历史时`usageQuota=null`而非0；Router不按本机时间外推窗口，不把本地历史加回Server权威账号quota，不用跨周期max。
@@ -703,25 +703,35 @@ Share 直连隧道另有独立白名单:`/v1`、`/v1/`、`/v1beta/`、`/gemini/v
 
 ### 13.1 不可变执行价目
 
-`GET/POST /v1/admin/share-value-pricing` 仅 Router Owner 可用。发布体为 `{expectedVersion,effectiveFromMs,snapshot}`，配置 CAS 冲突为 409。快照 schema v1 使用 `currency=USD`、`tariffPolicyId=api-equivalent-v1`、准确 `models` 和显式 `exactAliases`；模型包含 `contextInputBasis=rawInput|freshInput`、长上下文阈值及比较方向、每个声明服务层级的 base/long 费率矩阵。费率是整数微美元／百万 Token 的十进制字符串；`null` 为不可用，不是零价。模型和别名唯一；最多 10,000 模型、40,000 别名、4 MiB。修订为规范字段顺序及排序 map 序列化的 SHA-256；测试向量见 `tests/fixtures/share-value-pricing-v1.json`。
+`GET/POST /v1/admin/share-value-pricing` 仅 Router Owner 可用。发布体为 `{expectedVersion,effectiveFromMs?,snapshot}`，配置 CAS 冲突为 409。`effectiveFromMs` 可省略；缺省或早于 Router 当前时间 +60 秒时被钳制为 now+60s（不再因浏览器时钟偏差拒绝），晚于一年仍为 400。同一内容修订的首次生效时间不可变。仅发布接口接受最大 4 MiB+64 KiB 请求体；本节其他接口（签名 fetch／ack／watermark、预览、校准）上限 256 KiB。快照 schema v1 使用 `currency=USD`、`tariffPolicyId=api-equivalent-v1`、准确 `models` 和显式 `exactAliases`；模型包含 `contextInputBasis=rawInput|freshInput`、长上下文阈值及比较方向、每个声明服务层级的 base/long 费率矩阵。费率是整数微美元／百万 Token 的十进制字符串；`null` 为不可用，不是零价。模型和别名唯一；最多 10,000 模型、40,000 别名、4 MiB。修订为规范字段顺序及排序 map 序列化的 SHA-256；测试向量见 `tests/fixtures/share-value-pricing-v1.json`。
 
 Server 使用通用 installation Ed25519 envelope（`protocolEpoch/installationId/timestampMs/nonce/signature`，同 §3 签名串）调用：
 
 | 路径 | action | 签名 payload |
 | --- | --- | --- |
-| `POST /v1/shares/value-pricing/fetch` | `share_value_pricing_fetch` | `{}` |
+| `POST /v1/shares/value-pricing/fetch` | `share_value_pricing_fetch` | `{}` 或 `{knownRevision}` |
 | `POST /v1/shares/value-pricing/ack` | `share_value_pricing_ack` | `{revision,storageSchema:3}` |
 | `POST /v1/shares/:share_id/value-quota-watermarks` | `share_value_quota_watermark` | `{shareId,status}` |
 
-fetch 返回 null 或 `{installationId,revision,effectiveFromMs,snapshot}`。Server 校验绑定、大小及散列，在生效时间到达后安装到 committed SQLite；收到匹配的 ACK 回执才激活本地修订。无快照时不开启美元模式。断连时继续使用最后确认的本地快照，不能接受无法核验的新修订。调价只作用于新准入请求；历史使用量保留冻结修订和费率。
+**签名 payload 规范化**：上述三个 action 的 payload 是请求体中除 envelope 五个字段外的全部字段，签名串中的 `<payload_json>` 必须是其**规范 JSON**：所有层级对象的键按 UTF-8 字节序排序、无任何空白、数字与字符串按 serde_json 默认格式输出。Router 将收到的 payload 解析为 JSON 值后重新序列化验签（Router 的 serde_json 未开启 `preserve_order`，输出即为排序形式），因此请求体线上的键顺序和空白无关，但 Server 必须对规范形式签名。双仓共用夹具 `tests/fixtures/share-value-signed-payload-v1.json`（`canonical` 字段）。Router 先在不持有写锁的情况下读取 installation 公钥并完成时间戳、Ed25519 验签与 payload 校验，再在 IMMEDIATE 事务中复核公钥、消费 nonce 并执行；nonce 防重放语义不变，验签或校验失败不消耗 nonce。
+
+fetch payload 只允许 `{}` 或 `{"knownRevision":"<rev>"}`，其他键 400。Router 的发布修订是全局唯一的（不按 installation 区分），ACK 按 `(installation, revision)` 记录。`knownRevision` 等于当前发布修订**且**本 installation 已有该修订的 ACK 行时，只返回 `{"unchanged":true,"revision":"<rev>"}`，不构造、不序列化快照；本 installation 没有 ACK 行时返回完整清单（与无 `knownRevision` 时相同），以便 Server 重新安装并重新 ACK。旧 Router 对 `knownRevision` 返回 400 时，Server 回退为 `{}` 重新 fetch。ACK 幂等：同一 `(installation, revision)` 重复 ACK 返回成功，但保留首次 `acknowledgedAtMs`。
+
+fetch 返回 null 或 `{installationId,revision,effectiveFromMs,snapshot}`。Server 校验绑定、大小及散列后立即安装到 committed SQLite 并 ACK，即使 `effectiveFromMs` 在未来；未来生效的价目由 Server 在 `effectiveFrom` 到达时激活，此前继续使用已激活的旧修订。无快照时不开启美元模式。断连时继续使用最后确认的本地快照，不能接受无法核验的新修订。调价只作用于新准入请求；历史使用量保留冻结修订和费率。
 
 ### 13.2 精度、准入和动态水位
 
 额度 `limitUsdMicros` 必须大于零且最多 `1000000000000000`。累计量使用整数 picos 字符串，`1 USD=10^12 picos`；每分类贡献直接为 `tokens × rateMicrosPer1m`，不先截断成美分。cache write 只有合并量时使用已证明的两档最高价并标记 `conservative`；没有可信上界则不可用。
 
-Server 在真正发上游前以 IMMEDIATE SQLite 事务校验并写入风险占用。`spent + pendingRisk >= limit` 拒绝新请求，已准入请求自然结束，可超过额度，是请求级软上限而非绝对硬上限。当前未使用可信输出 ceiling，单次请求预占全部剩余容量；最大并发还受原并发限制与金额模式上限 4 共同约束。
+Server 在真正发上游前以 IMMEDIATE SQLite 事务校验并写入风险占用。`spent + pendingRisk >= limit` 拒绝新请求，已准入请求自然结束，可超过额度，是请求级软上限而非绝对硬上限。每个请求的风险预占有界（不再预占全部剩余额度）；同一用户的金额模式并发为 `min(parallelLimit, 4)`（未设并发即 4），超出时返回 `value_quota_busy`。
 
-仅允许以下实际 profile／driver 组合的单 attempt 文本请求；预览、保存、shadow 与发送前共用同一能力函数：
+**不再有 shadow 计量**：Token 模式授权不再获得 `valueMetering` 绑定，Server 也不为其记录金额。只有 `policy.valueQuota` 生效或携带 `pendingValueQuota` 的授权才有绑定；Router 在 descriptor 同步时丢弃其他授权上残留的旧绑定，且只对这些授权检查价目 ACK。缺少 ACK 时整份 descriptor 返回 409 `value_pricing_ack_missing`，`details.revisions` 列出（去重后）未 ACK 的修订；Server 对这些修订重新 ACK 后自动重试一次同步。作为兜底，Router 在 fetch 的 `knownRevision` 匹配但本 installation 无 ACK 行时返回完整清单（见 §13.1），使 Server 重新安装并 ACK。计量起点只在同为金额模式（启用或排期）的前后绑定之间不可变。
+
+**启用规则**：自然周期（day/week/sevenDays/calendarMonth/thirtyDays）从下一个窗口开始执行，除非该用户当前窗口已经是金额计量，或该用户在当前窗口内尚无任何已记录请求（全新用户）——此时 Server 立即启用，`meteredFrom` 为当前窗口起点；`lifetime` 与 `accountReset` 立即开始，`meteredFrom=now`。
+
+**按结果结算**：未发出上游请求，或上游错误且无 usage → $0；流式中断 → 已观测部分 usage 加按已流出文本估算的输出，标记 `conservative`；结果未知 → `max(已观测, 预占)`，标记 `conservative`。超时未结算的 pending 记录由 Server 的清扫任务按上述规则收敛，不会永久占用风险。
+
+仅允许以下实际 profile／driver 组合的单 attempt 文本请求；预览、保存与发送前共用同一能力函数：
 
 | Profile | Driver |
 | --- | --- |
@@ -732,9 +742,18 @@ Server 在真正发上游前以 IMMEDIATE SQLite 事务校验并写入风险占�
 
 不只信任兼容 ProviderType。自定义 profile 的其他协议组合、Web Session、Coding Plan、媒体、内置付费工具、OAuth／估算和未知 retry 仍不能绕过美元计量。客户端自定义 function tool 文本可计量，但 Server 不执行工具；旧 Token 模式保持不变。新增组合仅完成本地夹具验证，不宣称生产流量验收。
 
-`status` 包含 `email/policyEpoch/windowId/windowStartsAtMs/resetsAtMs/meteredFromMs/activePricingRevision/usagePricingRevisionsDigest/usageWatermark/limitUsdMicros/observedPicos/manualOffsetPicos/usedPicos/pendingRiskPicos/meteringStatus/syncedAtMs`。窗口跨策略 epoch 聚合，不按 epoch 归零。`meteringStatus=observed|conservative|pending|unavailable|scheduled`。动态水位不更改静态配置、generation 或 fingerprint。Router 校验当前 installation/grant/epoch/窗口和价目 ACK，旧水位幂等返回较高已确认水位；相同水位不能改变金额，更高合法修订允许金额下降。Server 如收到超出本地真实水位的 ACK，冻结该 scope 并要求恢复核对。
+`status` 包含 `email/policyEpoch/windowId/windowStartsAtMs/resetsAtMs/meteredFromMs/activePricingRevision/usagePricingRevisionsDigest/usageWatermark/limitUsdMicros/observedPicos/manualOffsetPicos/usedPicos/pendingRiskPicos/meteringStatus/syncedAtMs`。窗口跨策略 epoch 聚合，不按 epoch 归零。`meteringStatus=observed|conservative|pending|blocked|scheduled`；`unavailable` 仅表示该行不可读。`scheduled` 仅在当前策略不是金额模式、且有待生效金额策略时出现（此时 `limitUsdMicros=null`）；金额策略正在执行时 Server 报告真实当前状态，即使另有待生效的新金额策略。待生效字段（`pending*`）始终由 Router 从已存 descriptor 补充，不在水位 payload 中。Router 对未知取值不拒绝水位，而是按 `unavailable` 存储并记 warn。Router 对每个 `(Share, 用户)` 只保留当前窗口一行：新窗口行写入后删除旧窗口及其他 installation 遗留行；状态接口只读取当前窗口。删除 Share 或清理 installation 时同时删除其投影与 ACK。Server 水位保活间隔 45 秒（心跳 60±6 秒）；Router 健康接口将 180 秒未确认的当前窗口投影计为 `staleGrants`。动态水位不更改静态配置、generation 或 fingerprint。Router 校验当前 installation/grant/epoch/窗口和价目 ACK，旧水位幂等返回较高已确认水位；相同水位不能改变金额，更高合法修订允许金额下降。Server 如收到超出本地真实水位的 ACK，冻结该 scope 并要求恢复核对。
 
-失败、499、504 和取消仍计已观测使用量；流式未确认结束、缺量、模型不符等不能释放风险为免费。错误分别为 `value_quota_exhausted`（429）、`price_unavailable`、`quota_unavailable`（503）；控制面版本冲突使用 `quota_revision_conflict`（409）。都不等同钱包不足。
+失败、499、504 和取消仍计已观测使用量；流式未确认结束、缺量、模型不符等不能释放风险为免费。Server 代理错误码：
+
+| code | HTTP | 含义 |
+| --- | --- | --- |
+| `value_quota_exhausted` | 403 | 已用 + 在途风险达到额度；带 `resetsAt`（lifetime 无） |
+| `value_quota_busy` | 429 | 金额模式并发已满，带 `Retry-After` |
+| `price_unavailable` | 503 | 当前执行模型／档位无有效价目 |
+| `quota_unavailable` | 503 | 存储、覆盖、ACK 或计量能力不可用 |
+
+控制面版本冲突使用 `quota_revision_conflict`（409）。都不等同钱包不足。
 
 原生 Gemini 的执行模型取自真实 URL，而非客户端 JSON `model`。上游响应模型证据与用量原子落盘；流式分片中的矛盾模型不能被后续正常帧抹去。响应模型与执行模型不同，仅冻结快照明确声明的 exact alias 可证明同一身份，不使用同族／日期后缀猜测。异常响应保留风险并暂停该窗口的新美元请求，不能先释放风险、再异步补记异常。
 
@@ -747,15 +766,17 @@ Gemini 的金额模式仅覆盖 `generateContent`／`streamGenerateContent`；�
 | 接口 | 访问范围 |
 | --- | --- |
 | `GET /v1/shares/:share_id/value-quota-status` | Share Owner / Router Owner，当前授权用户投影 |
-| `GET /v1/me/share-value-quotas?shareId=…` | 仅当前用户自己的投影 |
+| `GET /v1/me/share-value-quotas?shareId=…` | 仅当前用户自己的投影；每行自包含 |
 | `POST /v1/shares/:share_id/value-quota-preview` | Share Owner / Router Owner；`expectedConfigRevision` + `policies`，经 `/_ctl/preview_value_quota` 只读取得权威预览 |
 | `POST /v1/shares/:share_id/value-usage-edits` | Share Owner / Router Owner；`expectedConfigRevision` + `edits`，经 `/_ctl/edit_value_usage` 执行独立金额校准 |
-| `GET /v1/admin/share-value-pricing/health` | Router Owner；启用／待生效／shadow／延迟及价目 ACK 数，无用户邮箱 |
+| `GET /v1/admin/share-value-pricing/health` | Router Owner；启用／待生效／遗留绑定（`shadowGrants`，仅统计尚未被新 descriptor 覆盖的旧 shadow 绑定）／延迟及价目 ACK 数，无用户邮箱 |
+
+成功与错误响应（含 401/403/404 与提取器拒绝）一律带 `Cache-Control: private, no-store`。两个状态接口的 `items[]` 在 `status` 字段之外附加 `tokenPeriod`、`pendingLimitUsdMicros`、`pendingTokenPeriod`、`pendingEffectiveFromMs`（无排期时为 null），因此前端无需授权对象即可展示 `limitUsdMicros/usedPicos/pendingRiskPicos/windowStartsAtMs/resetsAtMs/meteredFromMs/meteringStatus/syncedAtMs` 与排期。当前策略非金额模式、只有待生效金额策略且尚无当前窗口投影的有效授权，返回仅由已存 descriptor 构造的最小行 `{email,meteringStatus:"scheduled",tokenPeriod,pendingLimitUsdMicros,pendingTokenPeriod,pendingEffectiveFromMs}`；用量、窗口、`limitUsdMicros` 与 `syncedAtMs` 字段缺省，绝不伪造 $0 用量。
 
 预览增量字段：`capabilityReady` 表示基础设施能力，`ready` 同时要求所提交用户策略的历史覆盖可用；不能用单个用户的历史缺口禁用整个 Share 的单位选择。`checks[]` 逐项包含 `{code,ready}`：`router_protocol`、`sqlite_authority`（附 `state=committed|prepared|shadow_verified|unavailable`）、`metering_storage`、`acknowledged_tariff`、每个绑定各一项 `text_surface`（附 `app/profileId/driverId`）。Router 另加 `tariff_published` 及本 installation 的 `pricing={publishedRevision,effectiveFromMs,acknowledgedAtMs,version}`。该最新发布信息与 `activePricingRevision` 分开：新价待生效或待确认不作废旧的有效快照。能力不满足时返回全部检查和空 `rows`，不查询用户窗口；revision 冲突仍为 409。旧 Server 缺检查字段时 UI 保持关闭并提示升级。
 
-控制连接失败统一保留安全 `quota_unavailable`，`details.readinessCode` 区分 `quota_server_offline|quota_server_timeout|quota_server_upgrade_required|quota_control_unauthorized|quota_server_invalid_response|quota_unavailable`，不转发上游正文、凭据或网络细节。预览响应须匹配请求的配置版本。配置、账号或 Share 变化后取消／忽略旧检查；后台检查不覆盖显式策略预览。
+控制连接失败与 Server 5xx 统一为安全 `quota_unavailable`（503）；预览与金额校准对 Share 离线／无 installation 绑定一致返回 `readinessCode=quota_server_offline`，缺少控制凭据或 Server 401/403 为 `quota_control_unauthorized`。`details.readinessCode` 区分 `quota_server_offline|quota_server_timeout|quota_server_upgrade_required|quota_control_unauthorized|quota_server_invalid_response|price_unavailable|quota_unavailable`。Server 的 4xx 客户端错误原状态透传，`code` 取白名单 `invalid_policy|quota_target_invalid|quota_revision_conflict|value_quota_not_active|value_quota_busy|quota_target_not_found`（未知码按状态回落：404→`quota_target_not_found`，409→`quota_revision_conflict`，429→`value_quota_busy`，其他→`invalid_policy`），`details.reasonCode` 取 Server 的 `details.reasonCode`（仅小写 token），缺省时无码 400 为 `invalid_policy`、其他为该 `code`；`quota_revision_conflict` 另带 `previewRequired:true`。带 JSON 错误体的 404（未知 Share／用户）透传为 404；空体的路由级 404/405 才视为旧 Server（`quota_server_upgrade_required`）。错误消息由 Router 生成，不转发上游正文、凭据或网络细节。预览响应须匹配请求的配置版本。配置、账号或 Share 变化后取消／忽略旧检查；后台检查不覆盖显式策略预览。
 
-金额校准为独立 `set|clear`，携带 grant revision、windowId、observed watermark、operationId 和审计原因；set 不得低于真实观测，clear 仅清人工偏移。批量全成或全败。旧 Token `usageRebase/userUsageEdits` 不承载金额；活跃市场 managed grant 仍只读。原公开用量 API 不附加私人金额策略；客户端切账号清理响应，超过 90 秒标注同步延迟，缺状态不显示伪造的零。
+金额校准为独立 `set|clear`，携带 grant revision、windowId、observed watermark、operationId 和审计原因；set 不得低于真实观测，clear 仅清人工偏移。批量全成或全败。金额校准永不返回 500：前置条件失败为 400/409（`quota_target_invalid`、`quota_revision_conflict`、`value_quota_not_active`），未知 Share／用户为 404，存储不可用为 503；成功响应 `items[]` 中不可读的行带 `error:{code}`，Router 原样转发。`set` 同时是对账（reconcile）操作：Server 先收敛已超过请求最大超时加余量（与 sweeper 同一阈值）仍未结算的 attempt（较新的在途 attempt 保持预占）、重建检查点，并清除该 scope 的阻断／restore fence；`expectedWatermark` 不再要求精确等于当前水位，幂等只依赖 `operationId`，且 `target >= 当前已观测`。旧 Token `usageRebase/userUsageEdits` 不承载金额；活跃市场 managed grant 仍只读。原公开用量 API 不附加私人金额策略；客户端切账号清理响应，超过 180 秒标注同步延迟，缺状态不显示伪造的零。
 
 Server 金额检查点和幂等身份不依赖 Router 30 天请求日志。托管恢复在覆盖数据库前写独立 restore fence；旧窗口证据不全则拒绝金额模式，不能删安全标记或通过切换单位重置真实用量。新旧二进制降级前必须撤销／切换并确认所有金额策略与在途数据；不允许旧版本忽略字段变成不限额。

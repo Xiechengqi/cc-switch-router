@@ -1,18 +1,40 @@
 import type {
   ShareTokenPeriod,
+  ShareUserGrant,
   ShareUserGrantMap,
+  ShareUserPolicy,
 } from "@/lib/types";
+import { stageUserPolicy } from "@/lib/share-settings";
 
 export type ShareUserPolicyBatchPatch = {
   parallelLimit?: { value?: number };
   tokenLimit?: {
     value?: number;
-    valueQuota?: import("@/lib/types").ShareUserPolicy["valueQuota"];
+    valueQuota?: ShareUserPolicy["valueQuota"];
     period: ShareTokenPeriod;
     periodAnchorAtMs?: number;
   };
   expiresAt?: { value?: number };
 };
+
+/** The policy a batch patch asks for, built on the grant's scheduled policy when it has one. */
+export function patchedUserPolicy(grant: ShareUserGrant, patch: ShareUserPolicyBatchPatch): ShareUserPolicy {
+  const policy = { ...(grant.pendingValueQuota?.policy ?? grant.policy) };
+  if (patch.parallelLimit) {
+    policy.parallelLimit = patch.parallelLimit.value;
+  }
+  if (patch.tokenLimit) {
+    policy.tokenLimit = patch.tokenLimit.value;
+    if (patch.tokenLimit.valueQuota) policy.valueQuota = patch.tokenLimit.valueQuota;
+    else delete policy.valueQuota;
+    policy.tokenPeriod = patch.tokenLimit.period;
+    policy.tokenPeriodAnchorAtMs = patch.tokenLimit.periodAnchorAtMs;
+  }
+  if (patch.expiresAt) {
+    policy.expiresAt = patch.expiresAt.value;
+  }
+  return policy;
+}
 
 export function applyShareUserPolicyBatch(
   value: ShareUserGrantMap,
@@ -27,22 +49,7 @@ export function applyShareUserPolicyBatch(
   for (const [key, grant] of Object.entries(value)) {
     const email = grant.email.trim().toLowerCase();
     if (!normalizedEmails.has(email)) continue;
-
-    const policy = { ...(grant.pendingValueQuota?.policy ?? grant.policy) };
-    if (patch.parallelLimit) {
-      policy.parallelLimit = patch.parallelLimit.value;
-    }
-    if (patch.tokenLimit) {
-      policy.tokenLimit = patch.tokenLimit.value;
-      if (patch.tokenLimit.valueQuota) policy.valueQuota = patch.tokenLimit.valueQuota;
-      else delete policy.valueQuota;
-      policy.tokenPeriod = patch.tokenLimit.period;
-      policy.tokenPeriodAnchorAtMs = patch.tokenLimit.periodAnchorAtMs;
-    }
-    if (patch.expiresAt) {
-      policy.expiresAt = patch.expiresAt.value;
-    }
-    updated[key] = { ...grant, policy };
+    updated[key] = stageUserPolicy(grant, patchedUserPolicy(grant, patch));
   }
 
   return updated;

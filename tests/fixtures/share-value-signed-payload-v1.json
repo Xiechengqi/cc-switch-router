@@ -1,0 +1,26 @@
+{
+  "description": "Signed Router control payloads for USD-equivalent quota endpoints are serialized canonically: every object's keys sorted by byte order, no insignificant whitespace, serde_json number/string formatting. The Server signs exactly `canonical`; the Router re-serializes the received payload and must reproduce it byte for byte.",
+  "action": "share_value_quota_watermark",
+  "payload": {
+    "shareId": "share_fixture",
+    "status": {
+      "email": "user@example.com",
+      "policyEpoch": "epoch_01",
+      "windowId": "day:2026-10-30",
+      "windowStartsAtMs": 1793318400000,
+      "resetsAtMs": 1793404800000,
+      "meteredFromMs": 1793318400000,
+      "activePricingRevision": "rev_abc",
+      "usagePricingRevisionsDigest": "digest_def",
+      "usageWatermark": 42,
+      "limitUsdMicros": "10000000",
+      "usedPicos": "18000000000",
+      "observedPicos": "18000000000",
+      "manualOffsetPicos": "0",
+      "pendingRiskPicos": "0",
+      "meteringStatus": "observed",
+      "syncedAtMs": 1793360000000
+    }
+  },
+  "canonical": "{\"shareId\":\"share_fixture\",\"status\":{\"activePricingRevision\":\"rev_abc\",\"email\":\"user@example.com\",\"limitUsdMicros\":\"10000000\",\"manualOffsetPicos\":\"0\",\"meteredFromMs\":1793318400000,\"meteringStatus\":\"observed\",\"observedPicos\":\"18000000000\",\"pendingRiskPicos\":\"0\",\"policyEpoch\":\"epoch_01\",\"resetsAtMs\":1793404800000,\"syncedAtMs\":1793360000000,\"usagePricingRevisionsDigest\":\"digest_def\",\"usageWatermark\":42,\"usedPicos\":\"18000000000\",\"windowId\":\"day:2026-10-30\",\"windowStartsAtMs\":1793318400000}}"
+}

@@ -137,12 +137,12 @@ export function ModelPricesPanel() {
 
   return (
     <section className="grid gap-5">
-      <ShareValuePricingPanel referenceModels={data?.models}/>
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div><h2 className="font-display text-2xl">{t("settings.modelPrices.title")}</h2><p className="mt-1 text-sm text-muted-foreground">{t("settings.modelPrices.description")}</p></div>
         <div className="flex gap-2"><Button variant="outline" onClick={() => { const model = { modelKey: "", displayName: "", priced: false, discoveredFrom: [] } satisfies AdminModelPriceListItem; openEditor(model); }}><Plus className="h-4 w-4" />{t("settings.modelPrices.add")}</Button><Button variant="outline" onClick={() => void load()} isDisabled={loading || busy}>{loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}{t("common.reload")}</Button></div>
       </div>
       {error ? <Alert status="danger">{error}</Alert> : null}
+      <ShareValuePricingPanel referenceModels={data?.models}/>
       <div className="grid grid-cols-2 overflow-hidden rounded-md border bg-background sm:grid-cols-4">
         {([["total", data?.total], ["priced", data?.priced], ["unpriced", data?.unpriced], ["overrides", data?.adminOverrides]] as const).map(([key, value]) => <div key={key} className="border-r p-4 last:border-r-0"><div className="text-2xl font-semibold tabular-nums">{value ?? "—"}</div><div className="text-xs text-muted-foreground">{t(`settings.modelPrices.stat.${key}`)}</div></div>)}
       </div>

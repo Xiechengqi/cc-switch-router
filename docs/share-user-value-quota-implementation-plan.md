@@ -98,7 +98,7 @@ Router 与 Server 应共享一份版本化的计量规范及测试向量，Serve
 
 ### 4.2 软上限和并发暴露
 
-额度在“新请求准入”时检查，已经放行的流式请求自然结束。`spent >= limit` 一定拒绝；可确定的本次输入最低等值金额已经超过剩余额度时也拒绝。在途记录另有**风险预占**，不是真实扣额：有可由上游请求参数实际强制执行的输出上界时按输入及输出的保守估计预占，最多预占当前剩余额度；没有可信上界时预占全部剩余额度，待请求结算后释放，从而防止更多不确定请求同时进入。中途用量修订要将已确认消耗与剩余风险分开更新，不能双计或提前释放；同一窗口跨 `policyEpoch` 的旧在途请求仍占用当前准入风险。`spent + pendingRisk >= limit` 时暂停新请求准入。金额模式的有效单用户并发数取现有 `parallelLimit` 与 **4** 的较小值；原来不限并发的用户在金额模式下最多同时执行 4 个请求，界面明确展示此规则。该上限不改 Token 模式，且不能推出“最终金额永不超限”：单个已准入请求仍可超额；若以后要求绝对硬上限，另做可证明最大输出成本的严格预占与能力限制。额度错误文案不能归咎于钱包余额，也不能无依据承诺“只会小幅超额”。
+额度在“新请求准入”时检查，已经放行的流式请求自然结束。`spent >= limit` 一定拒绝；可确定的本次输入最低等值金额已经超过剩余额度时也拒绝。在途记录另有**风险预占**，不是真实扣额：有可由上游请求参数实际强制执行的输出上界时按输入及输出的保守估计预占，最多预占当前剩余额度；没有可信上界时预占全部剩余额度，待请求结算后释放，从而防止更多不确定请求同时进入（**第二轮修订**：已改为每请求有界预占，配合 `min(parallelLimit,4)` 并发上限与按结果结算，见 §11.4）。中途用量修订要将已确认消耗与剩余风险分开更新，不能双计或提前释放；同一窗口跨 `policyEpoch` 的旧在途请求仍占用当前准入风险。`spent + pendingRisk >= limit` 时暂停新请求准入。金额模式的有效单用户并发数取现有 `parallelLimit` 与 **4** 的较小值；原来不限并发的用户在金额模式下最多同时执行 4 个请求，界面明确展示此规则。该上限不改 Token 模式，且不能推出“最终金额永不超限”：单个已准入请求仍可超额；若以后要求绝对硬上限，另做可证明最大输出成本的严格预占与能力限制。额度错误文案不能归咎于钱包余额，也不能无依据承诺“只会小幅超额”。
 
 ### 4.3 周期与归属
 
@@ -106,11 +106,11 @@ Router 与 Server 应共享一份版本化的计量规范及测试向量，Serve
 - `accountReset` 只在已有 Router/Server 能力、有效 `AccountQuotaCycle` 与可证明完整历史下允许金额模式。不同 Provider source/epoch/bucket 不得混合，未知新周期不是“已用 $0”。
 - 请求开始时持久化 `windowId`，迟到修订仍归原窗口；不能按完成时间把旧消费挪到新周期。策略变化时在途请求按开始时冻结的策略版本和价目版本结算。
 - 本功能启用前若没有该用户完整窗口的金额计量证据，当前窗口不可伪装为“从零开始的完整周期”。自然周期默认从**下一个完整窗口**生效；累计和没有可预测边界的账号周期仅在首次引入金额计量时显式确认 `meteredFrom`，界面写明“自此时间起计量”。此后切换模式、改额度或推进 `policyEpoch` 均不得重设该起点；真正要调整历史已用额度，只能走独立审计操作。已在途旧请求没有可验证价目与用量时，不得在当前窗口启用金额模式。
-- 双口径计数在具备完整价格证据后均持续维护：Server 从 shadow 阶段起也为 Token 模式请求记录独立金额计量，但不据此拦截 Token 模式；缺价/缺用量在金额窗口覆盖上留下明确缺口。价目快照与计量能力不能只为当前金额用户下发。窗口消耗按 `(Share, 用户, 真实周期窗口, 最早有效 meteredFrom)` 从带时间戳的原始计量记录聚合，`policyEpoch` 只绑定策略和同步版本，**不能**作为让已用金额归零的新分桶。切回金额模式要复用同一窗口内先前金额消耗及在途风险；切换单位本身不能创造新的免费窗口。修改周期或 anchor 必须从原始记录重算新窗口、预览覆盖率并留下显式审计，证据不全则推迟生效；补录、清除或增加已用额度是单独有权限、预览和审计的操作。
+- （**第二轮修订**：shadow 计量已取消，Token 授权不再有 `valueMetering` 绑定、也不记录金额；自然周期从下一窗口启用，除非当前窗口已是金额计量；lifetime／accountReset 立即启用且 `meteredFrom=now`。本条以下关于 shadow 的描述仅为历史设计，见 §11.4。）双口径计数在具备完整价格证据后均持续维护：Server 从 shadow 阶段起也为 Token 模式请求记录独立金额计量，但不据此拦截 Token 模式；缺价/缺用量在金额窗口覆盖上留下明确缺口。价目快照与计量能力不能只为当前金额用户下发。窗口消耗按 `(Share, 用户, 真实周期窗口, 最早有效 meteredFrom)` 从带时间戳的原始计量记录聚合，`policyEpoch` 只绑定策略和同步版本，**不能**作为让已用金额归零的新分桶。切回金额模式要复用同一窗口内先前金额消耗及在途风险；切换单位本身不能创造新的免费窗口。修改周期或 anchor 必须从原始记录重算新窗口、预览覆盖率并留下显式审计，证据不全则推迟生效；补录、清除或增加已用额度是单独有权限、预览和审计的操作。
 
 ### 4.4 手工校准
 
-现有 `userUsageEdits` / `usageRebase` 仍只处理 Token。金额模式新增独立 `valueUsageEdit`，支持以现有窗口为准的 `set` / `clear`，必须携带 expected grant revision、windowId、服务器已观测水位和幂等 operationId。低于已证明真实消耗的 target 拒绝；明确删除人工偏移与删除已观测用量是两回事。Server 在同一 quota mutation 中验证批量编辑，任何一项失败都不得部分落地。
+现有 `userUsageEdits` / `usageRebase` 仍只处理 Token。金额模式新增独立 `valueUsageEdit`，支持以现有窗口为准的 `set` / `clear`，必须携带 expected grant revision、windowId、服务器已观测水位和幂等 operationId。（第二轮修订：`set` 兼作对账，水位不再要求精确匹配，只依赖 operationId 幂等与 `target >= 已观测`，见 §11.4。）低于已证明真实消耗的 target 拒绝；明确删除人工偏移与删除已观测用量是两回事。Server 在同一 quota mutation 中验证批量编辑，任何一项失败都不得部分落地。
 
 普通 owner 不能用 `valueUsageEdit` 修改活跃 `routerShareMarket` grant，Router owner 的管理员能力也不得绕过 Server 的历史证据校验。金额基线与 Token 基线互不转换、互不覆盖。
 
@@ -156,7 +156,7 @@ Router 生成规范排序、独立 schema 版本、签名/哈希的不可变费�
 
 在 Server 已有的 `src/repository/server_sqlite` 中以新递增 schema 迁移增加独立金额账本、窗口检查点、在途风险和价目快照表；仅在该安装的 SQLite authority 已 `committed` 且事务、备份/恢复验证通过后，允许金额模式生效。仍处于 SQLite shadow 的安装继续原 Token 模式，不能把金额热路径写入会整体重写的旧 usage 文件，也不能把 picoUSD 塞进现有 `quota_usage_entries.tokens`。所有读改写通过 `ServerStateInner` 域方法封装，遵守现有锁顺序；金额准入检查、风险预占、开始事件必须在同一数据库事务中提交后才能向上游发请求。最少保存 `(installationId, shareId, requestId, attemptId, revision)`、规范化用户、策略世代、请求开始周期、价目修订、模型和档位、分类 token、金额 picos、计量状态及最小审计时间。沿用现有 quota ledger 的 request scope、revision、watermark 思路，但金额账本独立索引、独立完整性检查。
 
-每个活跃金额窗口有可校验的累计检查点和修订水位；Token 模式 shadow 计量也保留覆盖证据，供将来切换口径使用。报表请求明细被清理、Share 脱线、Server 重启或 Router 重启，不得让额度归零。迟到修订需要在尚可修订的窗口里替换旧值；窗口关闭后的证明仍可用于对账但不能重开过期授权。窗口关闭且全部请求已确认终态后，才可压缩到不可归零的累计检查点，并保留足够的去重墓碑供迟到重放识别。`lifetime` 等长期不关闭的窗口也需要可证明的压缩：终态记录可转为保留完整不可变 scope、最高修订、既记金额、模型/档位和冻结价目引用的最小行，并维护核验过的累计检查点；这种最小行仍须足以处理合法迟到修订，不能简单删除。仍 pending 的请求绝不压缩；压缩之后收到无法归属/验真的迟到修订时隔离该窗口并告警，不能猜一个差额入账。为高使用量窗口提供容量测试、索引/归档预算和告警，而不是沿用现有 Token ledger 的固定百万修订上限；若无法证明精确状态，相关金额准入 fail closed，不能通过裁剪/静默删除解决。
+每个活跃金额窗口有可校验的累计检查点和修订水位；Token 模式 shadow 计量也保留覆盖证据，供将来切换口径使用（第二轮修订已取消 shadow 计量，见 §11.4）。报表请求明细被清理、Share 脱线、Server 重启或 Router 重启，不得让额度归零。迟到修订需要在尚可修订的窗口里替换旧值；窗口关闭后的证明仍可用于对账但不能重开过期授权。窗口关闭且全部请求已确认终态后，才可压缩到不可归零的累计检查点，并保留足够的去重墓碑供迟到重放识别。`lifetime` 等长期不关闭的窗口也需要可证明的压缩：终态记录可转为保留完整不可变 scope、最高修订、既记金额、模型/档位和冻结价目引用的最小行，并维护核验过的累计检查点；这种最小行仍须足以处理合法迟到修订，不能简单删除。仍 pending 的请求绝不压缩；压缩之后收到无法归属/验真的迟到修订时隔离该窗口并告警，不能猜一个差额入账。为高使用量窗口提供容量测试、索引/归档预算和告警，而不是沿用现有 Token ledger 的固定百万修订上限；若无法证明精确状态，相关金额准入 fail closed，不能通过裁剪/静默删除解决。
 
 手工金额基线记录为单独审计事件，有 actor、理由、before/after、observed watermark、窗口和操作身份。它不是 `share_request_logs` 中的一条伪请求。
 
@@ -256,7 +256,7 @@ Router 的 schema 使用**新递增迁移**追加价格快照元数据、金额�
 | --- | --- |
 | WP0／WP1 | 两仓各自实现纯定点计价模块及同一份黄金向量；完整模型／tier／context 矩阵、raw/fresh 阈值、独立 5m/1h TTL；更新协议与架构文档。 |
 | WP2 | Share reader v10，未协商普通 descriptor 仍为 v7、市场最低 v5 不变；Router 迁移 101；Server SQLite schema v3 独立金额 ledger，不改钱包和旧 Token 账证。 |
-| WP3 | 在 generic 原生文本真实模型／tier 确定后、首次向上游发请求前做持久准入；IMMEDIATE 事务、全部剩余额度风险预占、最高修订幂等、流式风险保留和迟到修订。仅开放下述三组实际 profile／driver，其他转发面明确拒绝金额模式，不暗中免费放行。 |
+| WP3 | 在 generic 原生文本真实模型／tier 确定后、首次向上游发请求前做持久准入；IMMEDIATE 事务、全部剩余额度风险预占（第二轮改为有界预占，见 §11.4）、最高修订幂等、流式风险保留和迟到修订。仅开放下述三组实际 profile／driver，其他转发面明确拒绝金额模式，不暗中免费放行。 |
 | WP4 | Router 与独立 Server Web 的单项／批量单位编辑、权威预览后再次保存确认、私人用量状态、剩余额度和耗尽提示；金额校准独立审计；Router Owner 配置执行价目与逐模型／档位覆盖检查。 |
 | WP5 | 市场托管授权保持原条款；Router 私人投影与健康概览、Server ledger／gap／容量诊断、按原因拒绝指标；不逐请求发送邮件。真实 Provider/App 计量覆盖率仍待灰度采集。 |
 
@@ -268,12 +268,12 @@ Router 的 schema 使用**新递增迁移**追加价格快照元数据、金额�
 
 第 5.3 节原拟 GET snapshot 接口实际选用 installation Ed25519 签名 **POST** `/v1/shares/value-pricing/fetch` 和 `/v1/shares/value-pricing/ack`，以复用现行 action／时间戳／nonce／installation 绑定。动态水位保持 POST `/v1/shares/:share_id/value-quota-watermarks`。私人状态、预览与校准路径详见 [PROTOCOL.md §13](../PROTOCOL.md)。缓存 TTL 日志通过独立 `cacheCreationTtlV1` 协商，不能从 USD capability 推断。
 
-首次完整自然窗口不足时，Server 持久保存 `pendingValueQuota`，旧 policy 继续执行；新增授权在等待期间不开放。已有完整 shadow 证据才可立即生效。lifetime 首次从确认的计量起点开始；存在旧未覆盖在途请求则拒绝立即启用。删除再添加授权复用最早持久 coverage，切换模式／改额度／换 epoch 都不能清零。切换周期须核验新真实窗口，不能复用旧窗口零值。
+首次完整自然窗口不足时，Server 持久保存 `pendingValueQuota`，旧 policy 继续执行；新增授权在等待期间不开放。已有完整 shadow 证据才可立即生效（第二轮修订：shadow 已取消，改为“当前窗口已是金额计量才立即生效”，见 §11.4）。lifetime 首次从确认的计量起点开始；存在旧未覆盖在途请求则拒绝立即启用。删除再添加授权复用最早持久 coverage，切换模式／改额度／换 epoch 都不能清零。切换周期须核验新真实窗口，不能复用旧窗口零值。
 
 ### 11.2 整体 review 补强
 
 - 预览与保存使用相同 coverage 判定；预览不写 coverage、不生成 epoch。排期回执按 Server 返回的 pending policy 核对，不能误报保存失败或伪装立即生效。
-- 单个 USD／shadow 状态异常与普通 Token 用户隔离；金额结算异常通过 savepoint 回滚金额变更、保留旧风险，真实 Usage／Token 证据与 USD-only 数据库故障标记一并持久化，再写独立外部故障标记。
+- 单个 USD 状态异常（原含 shadow，第二轮已取消）与普通 Token 用户隔离；金额结算异常通过 savepoint 回滚金额变更、保留旧风险，真实 Usage／Token 证据与 USD-only 数据库故障标记一并持久化，再写独立外部故障标记。
 - 价目失效、未覆盖文本面、媒体、内置付费工具、多 attempt／retry 均 fail closed。旧 Router 无法接收活跃美元策略时仅隔离受影响 Share；已撤销授权可以同步撤销投影，历史本地策略和金额证据仍保留。
 - 保存预览及转发早期都核对真实 profile／driver，防止兼容 ProviderType 将 Web Session／Coding Plan 导向特殊 forwarder 后绕过计量；免费 Share 的个人授权撤销后不继续强加旧金额策略，私有 Share 则在发送前再次拒绝撤销竞态。
 - 原生 Gemini 从真实请求 URL 取得执行模型，不向 JSON 人为注入 `model`、也不信任冲突的 body 字段。原生 API 的响应模型证据与用量在同一事务进入账本；流式证据跨分片累计，冲突保持到终态。仅接受执行模型本身或冻结快照中明确声明的 exact alias，不凭同族名称或日期后缀猜测价格；证据不符保留在途风险并阻止后续美元请求。
@@ -302,6 +302,45 @@ Router 的 schema 使用**新递增迁移**追加价格快照元数据、金额�
 
 仍须由部署后的灰度独立完成第 9.2 节要求：每个准备开放的 Provider/App 转发面 **7 个自然日、至少 100 条真实完成文本请求**，逐窗口／请求／价目对账。OAuth、媒体、内置付费工具、未知用量和多 attempt 不在本期安全开放范围；不能因 UI 可选择美元额度而擅自开启。离线手工替换权威数据库不在托管恢复 fence 保证范围，禁止在线手工替库。当前仅在本地完成实现与回归时，应标记 `local_verified / live_pending`，不能标记生产 `live_verified`。
 
+### 11.4 第二轮 review 修订（2026-10-31）
+
+第二轮 review 在两仓发现若干会在生产中造成故障或误导的问题。本节记录问题与修订；上文 §4.2、§4.3、§6.1、§11.1、§11.2、§12.2 中被推翻的表述已加简短注记，未整体改写历史。
+
+**Router 发现的问题**
+
+- P0 外键：`share_value_pricing_acks`、`share_value_quota_projections` 引用 `installations(id)` 且无 `ON DELETE`，`purge_installation_data_tx` 未删除它们；任何 installation 一旦 ACK，保留期清理和客户端市场清理都会因外键失败。删除 Share 也遗留投影。
+- P1 descriptor 同步：任一授权（包括 Token 授权的 shadow 绑定）引用未 ACK 修订就拒绝整份 descriptor，且错误不可区分，并对每个授权重复查询。
+- P1 投影无限增长：每个 `(Share, 用户, 窗口)` 永久一行，状态与健康接口在全局锁下解析全部历史行，且逐授权查询。
+- P1 日志批次：单条日志 5m/1h 缓存 TTL 拆分不一致即让整批日志 400。
+- P1 签名控制面：fetch／ack／watermark 先拿全局 DB 锁并开 IMMEDIATE 事务后才验签；4 MiB 请求体上限覆盖了所有路由。
+- P2：发布 `effectiveFromMs` 依赖浏览器时钟（Date.now()+60s）而被 Router 拒绝；窗口 ID 依赖 Rust `Debug` 输出；私有接口的错误响应缺 `Cache-Control`；校准对离线 Share 与预览返回不同错误；被授权人视图缺排期信息；若干重复校验、未用函数与重复序列化。
+
+**Router 修订（本仓）**
+
+- 清理 installation 时删除其 ACK 与投影；`delete_share_auxiliary_rows_tx` 与删除 Share 一并删除投影。无需重建表的迁移。
+- descriptor 规范化时丢弃“既无生效金额策略也无排期”授权上的 `valueMetering`；只对金额授权按去重修订检查 ACK，缺失返回 409 `value_pricing_ack_missing`（`details.revisions`），Server 对其重新 ACK 后自动重试一次；兜底：fetch 的 `knownRevision` 与当前发布修订相同但本 installation 无 ACK 行时，Router 返回完整清单而非 `unchanged`，使 Server 重新安装并 ACK。计量起点不可变只在前后均为金额绑定时校验。
+- watermark 写入当前窗口后删除该 `(Share, 用户)` 的旧窗口及其他 installation 遗留行（`current_projection` 本就拒绝非当前窗口，无读取方需要旧窗口）；状态接口只读取当前窗口行，健康检查改为一次查询。
+- TTL 拆分不一致时丢弃该条日志的拆分（两列均为 NULL，即 TTL 未知、按保守价计）并记 warn，其余日志正常入库；TTL 两列并入主 upsert，不再单独 UPDATE。
+- 签名接口先做时间戳检查、短锁读取公钥、无锁 Ed25519 验签与 payload 校验，再在 IMMEDIATE 事务中复核公钥、消费 nonce 并执行；完整价目清单在释放锁后解码与序列化。只有发布接口保留 4 MiB+64 KiB 上限，其余为 256 KiB。
+- 签名 payload 采用规范 JSON（键按字节序、无空白），新增双仓共享夹具 `tests/fixtures/share-value-signed-payload-v1.json` 的反序列化与端到端验签测试。fetch 支持 `knownRevision`，相同且本 installation 已 ACK 时只回 `{unchanged:true,revision}`，否则返回完整清单；未知键 400。Router 的发布修订是全局的（不按 installation 区分），ACK 按 installation 记录；旧 Router 对 `knownRevision` 返回 400 时 Server 回退为 `{}`。重复 ACK 不覆盖首次时间。
+- `effectiveFromMs` 可省略，早于 now+60s 时钳制而不拒绝；窗口 ID 改为显式映射，字符串与旧值完全相同并有测试固定。
+- 私有接口所有响应（含错误）经中间件统一加 `private, no-store`；预览与校准共用 owner／Router owner 鉴权和控制目标解析，离线一致返回 `quota_unavailable` + `readinessCode=quota_server_offline`。
+- 状态行附带 `tokenPeriod`、`pendingLimitUsdMicros`、`pendingTokenPeriod`、`pendingEffectiveFromMs`，被授权人无需授权对象即可展示；匿名接口未扩充。当前策略非金额、只有待生效金额策略且尚无当前投影的有效授权，返回由已存 descriptor 构造的最小行（`meteringStatus:"scheduled"`，无用量／窗口／同步时间字段，不伪造 $0），Owner 状态接口同样适用。
+- `meteringStatus` 接受 `observed|conservative|pending|blocked|unavailable|scheduled`，未知值按 `unavailable` 存储并告警，不拒绝水位。`scheduled` 仅表示当前策略不是金额模式且有待生效金额策略；金额策略执行中时 Server 报告真实状态，待生效字段由 Router 从 descriptor 补充。
+- 投影新鲜度阈值 `PROJECTION_FRESH_MS` 为 180 秒（Server 水位保活 45 秒、心跳 60±6 秒），超时计入健康接口 `staleGrants`。
+- 预览／校准控制错误：Server 4xx 原状态透传白名单 `code`（`invalid_policy|quota_target_invalid|quota_revision_conflict|value_quota_not_active|value_quota_busy|quota_target_not_found`）及 `details.reasonCode`（Server 未给时无码 400 为 `invalid_policy`）；带 JSON 错误体的 404 为未知 Share／用户，只有空体路由 404/405 才判为 `quota_server_upgrade_required`；5xx 仍为 `quota_unavailable`（`price_unavailable` 保留为 `readinessCode`）。校准成功响应中行级 `error:{code}` 原样转发。
+- 清理：删除 watermark 中与 `current_projection` 重复的校验、未使用的 `is_metered_text_payload`／`usd_to_micros`；价目快照只序列化一次；就绪、健康和 `knownRevision` 判断只读元数据，不再解析和散列 4 MiB 快照（因此没有另加按版本缓存）。
+
+**Server 修订（cc-switch-server，并行完成，此处只记契约）**
+
+- 签名 payload 按规范 JSON 生成；fetch 携带 `knownRevision`，处理 `unchanged`，旧 Router 返回 400 时回退为 `{}`；收到 `value_pricing_ack_missing` 后对 `details.revisions` 重新 ACK 并重试一次。未来生效的价目收到即安装并 ACK，到 `effectiveFrom` 时由 Server 激活。水位保活 45 秒，心跳 60±6 秒。
+- 取消 shadow 计量：Token 授权不再有 `valueMetering`。启用规则：自然周期从下一窗口开始，除非当前窗口已是金额计量，或该用户在当前窗口内无任何已记录请求（全新用户，立即启用并从窗口起点计量）；lifetime／accountReset 立即开始，`meteredFrom=now`。`scheduled` 仅在当前策略非金额且有待生效金额策略时上报。
+- 每用户金额并发 `min(parallelLimit,4)`，单请求有界预占（不再预占全部剩余额度），超出返回 429 `value_quota_busy` + `Retry-After`；额度耗尽为 403 `value_quota_exhausted` 并带 `resetsAt`；`price_unavailable`／`quota_unavailable` 为 503。
+- 按结果结算：未发出或上游错误且无 usage 为 $0；流式中断按部分 usage 加已流出文本估算输出，标记 conservative；结果未知取 `max(已观测, 预占)`，标记 conservative；另有超时 pending 清扫任务。计量状态为 `observed|conservative|pending|blocked`。
+- `valueUsageEdit set` 兼作对账：收敛已超过请求最大超时加余量（与 sweeper 同一阈值）的卡住 attempt，较新的在途 attempt 保持预占不动、重建检查点、清除该 scope 的阻断／restore fence；不再要求 `expectedWatermark` 精确匹配，只依赖 `operationId` 幂等及 `target >= 已观测`。校准永不返回 500：前置条件失败为 400/409（`quota_target_invalid`／`quota_revision_conflict`／`value_quota_not_active`），未知 Share／用户 404，存储不可用 503；不可读的结果行带 `error:{code}`。
+
+**验证边界**：按环境约束，本轮 Router 只执行 `cargo check --all-targets` 与格式化；新增／修改的测试已编写但未运行，需由用户流水线执行。前端由另一会话负责，不在本节 Router 修订范围内。
+
 ## 12. 就绪诊断与自定义文本支持（2026-10-31）
 
 ### 12.1 生产问题和修复边界
@@ -313,7 +352,7 @@ sgptokenswitch 的只读排查确认三个独立阻塞：Server marker 是 `shad
 ### 12.2 实际交付
 
 - Server 返回协议、SQLite authority、存储健康、激活价目和每个绑定的实际 profile／driver 检查。能力失败仍返回所有原因，不因查询用户 ledger 提前变成笼统 500；版本冲突仍保留 409。
-- 普通自定义文本仅开放协议表列出的四种组合；预览、保存、shadow、真实发送共用白名单。OAuth、Web Session、Coding Plan、跨协议组合、媒体、内置付费工具、多 attempt 和未知用量继续 fail closed。
+- 普通自定义文本仅开放协议表列出的四种组合；预览、保存、真实发送共用白名单（原 shadow 路径已于第二轮取消）。OAuth、Web Session、Coding Plan、跨协议组合、媒体、内置付费工具、多 attempt 和未知用量继续 fail closed。
 - Router 加入本 installation 的最新发布／ACK 元数据，不让其他 Server 的 ACK 冒充本机就绪；待发布的新版本不否定旧有效价目。
 - 两端配额编辑分别维护基础能力和显式用户策略预览，支持重新检查及可见页面周期刷新；取消旧请求／忽略旧账号与 Share 响应，后台查询不冲掉二次确认。离线、超时、旧 Server、控制授权、响应异常和版本冲突可区分。
 - Router 添加／编辑／批量弹窗使用自身 light surface，关闭按钮采用现有深色文字、浅底、hover／focus 样式，不依赖父弹窗的 portal 继承。

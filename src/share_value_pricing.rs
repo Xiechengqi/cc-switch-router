@@ -29,75 +29,6 @@ pub enum ValueUsageEditAction {
     Clear,
 }
 
-/// Excludes separately billed resources; tool-call text itself is token usage.
-/// Deliberately conservative: unrecognized typed content is not made free.
-pub fn is_metered_text_payload(bytes: &[u8]) -> bool {
-    fn text(value: &serde_json::Value) -> bool {
-        match value {
-            serde_json::Value::Object(map) => {
-                if map.keys().any(|key| {
-                    matches!(
-                        key.as_str(),
-                        "inlineData"
-                            | "inline_data"
-                            | "fileData"
-                            | "file_data"
-                            | "image_url"
-                            | "input_audio"
-                            | "audio"
-                            | "video"
-                            | "image"
-                            | "audioConfig"
-                            | "speechConfig"
-                            | "groundingConfig"
-                            | "cachedContent"
-                            | "googleSearch"
-                            | "google_search"
-                            | "googleSearchRetrieval"
-                            | "google_search_retrieval"
-                            | "codeExecution"
-                            | "code_execution"
-                            | "urlContext"
-                            | "url_context"
-                            | "computer_use"
-                    )
-                }) {
-                    return false;
-                }
-                if let Some(kind) = map.get("type").and_then(serde_json::Value::as_str) {
-                    if !matches!(
-                        kind,
-                        "text"
-                            | "input_text"
-                            | "output_text"
-                            | "message"
-                            | "function"
-                            | "function_call"
-                            | "function_call_output"
-                            | "tool_use"
-                            | "tool_result"
-                    ) {
-                        return false;
-                    }
-                }
-                if map
-                    .get("responseModalities")
-                    .and_then(serde_json::Value::as_array)
-                    .is_some_and(|m| m.iter().any(|v| v.as_str() != Some("TEXT")))
-                {
-                    return false;
-                }
-                map.iter().all(|(key, value)| {
-                    matches!(key.as_str(), "parameters" | "input_schema" | "schema") || text(value)
-                })
-            }
-            serde_json::Value::Array(items) => items.iter().all(text),
-            _ => true,
-        }
-    }
-    serde_json::from_slice::<serde_json::Value>(bytes)
-        .is_ok_and(|body| body.is_object() && text(&body))
-}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ValueMeteringBinding {
@@ -169,31 +100,6 @@ pub fn unsigned_decimal(raw: &str) -> Result<i128, ValueError> {
         return Err(ValueError::InvalidDecimal);
     }
     raw.parse().map_err(|_| ValueError::OutOfRange)
-}
-
-/// USD user input to exact micro-USD. The wire itself uses integer strings.
-pub fn usd_to_micros(raw: &str) -> Result<String, ValueError> {
-    let (whole, fraction) = raw.split_once('.').unwrap_or((raw, ""));
-    if whole.is_empty()
-        || (raw.contains('.') && fraction.is_empty())
-        || fraction.len() > 6
-        || !whole.bytes().all(|b| b.is_ascii_digit())
-        || !fraction.bytes().all(|b| b.is_ascii_digit())
-    {
-        return Err(ValueError::InvalidDecimal);
-    }
-    let whole: i128 = whole.parse().map_err(|_| ValueError::OutOfRange)?;
-    let fraction: i128 = format!("{fraction:0<6}")
-        .parse()
-        .map_err(|_| ValueError::InvalidDecimal)?;
-    let micros = whole
-        .checked_mul(1_000_000)
-        .and_then(|v| v.checked_add(fraction))
-        .ok_or(ValueError::Overflow)?;
-    if micros == 0 || micros > MAX_LIMIT_MICROS {
-        return Err(ValueError::OutOfRange);
-    }
-    Ok(micros.to_string())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -446,7 +352,7 @@ fn valid_model_key(key: &str) -> bool {
     !key.is_empty() && key.len() <= 250 && key.trim() == key && !key.chars().any(char::is_control)
 }
 impl PricingSnapshot {
-    pub fn validate(&self) -> Result<(), ValueError> {
+    fn validate_fields(&self) -> Result<(), ValueError> {
         if self.schema_version != 1
             || self.tariff_policy_id != TARIFF_POLICY
             || self.currency != "USD"
@@ -470,19 +376,23 @@ impl PricingSnapshot {
                 return Err(ValueError::InvalidSnapshot);
             }
         }
-        if serde_json::to_vec(self)
-            .map_err(|_| ValueError::InvalidSnapshot)?
-            .len()
-            > MAX_SNAPSHOT_BYTES
-        {
-            return Err(ValueError::InvalidSnapshot);
-        }
         Ok(())
     }
+    /// Validates once and returns the canonical serialization whose SHA-256 is
+    /// the revision. Callers that also persist the JSON reuse these bytes.
+    pub fn canonical_json(&self) -> Result<String, ValueError> {
+        self.validate_fields()?;
+        let json = serde_json::to_string(self).map_err(|_| ValueError::InvalidSnapshot)?;
+        if json.len() > MAX_SNAPSHOT_BYTES {
+            return Err(ValueError::InvalidSnapshot);
+        }
+        Ok(json)
+    }
+    pub fn revision_of_canonical_json(json: &str) -> String {
+        format!("sha256:{:x}", Sha256::digest(json.as_bytes()))
+    }
     pub fn revision(&self) -> Result<String, ValueError> {
-        self.validate()?;
-        let bytes = serde_json::to_vec(self).map_err(|_| ValueError::InvalidSnapshot)?;
-        Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+        Ok(Self::revision_of_canonical_json(&self.canonical_json()?))
     }
     pub fn model(&self, effective_model: &str) -> Result<&ExecutionModelPrice, ValueError> {
         let key = self
@@ -564,19 +474,6 @@ mod tests {
                 .price("priority", &ValueTokens::default())
                 .is_err()
         );
-    }
-    #[test]
-    fn only_text_and_client_function_tools_are_metered_not_media_or_paid_builtin_tools() {
-        assert!(is_metered_text_payload(br#"{"messages":[{"role":"user","content":"hello"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{"image":{"type":"string"}}}}}]}"#));
-        for request in [
-            br#"{"tools":[{"googleSearch":{}}]}"#.as_slice(),
-            br#"{"tools":[{"type":"web_search"}]}"#,
-            br#"{"messages":[{"content":[{"type":"image_url","image_url":"url"}]}]}"#,
-            br#"{"generationConfig":{"responseModalities":["IMAGE"]}}"#,
-            br#"{"cachedContent":"unverified-context"}"#,
-        ] {
-            assert!(!is_metered_text_payload(request));
-        }
     }
     fn rates() -> ExecutionRates {
         ExecutionRates {
@@ -663,10 +560,6 @@ mod tests {
         for raw in ["", "-1", "+1", "01", "1.0", " 1", "1e6"] {
             assert!(unsigned_decimal(raw).is_err());
         }
-        for raw in ["0", "1.", ".1", "1e2", "-1", "1.0000001", " 1"] {
-            assert!(usd_to_micros(raw).is_err());
-        }
-        assert_eq!(usd_to_micros("10.000001").unwrap(), "10000001");
         assert_eq!(
             ValueQuota {
                 limit_usd_micros: "10000000".into(),
