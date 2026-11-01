@@ -306,6 +306,96 @@ impl PricingCatalog {
     }
 }
 
+impl PricingCatalog {
+    /// The USD-equivalent quota tariff is this catalog, frozen at `at_unix`:
+    /// what a Share user sees as a cost is what the Server deducts. Every
+    /// tier and context row is materialized through the same fallback chain
+    /// the display uses ([`crate::model_pricing::resolve_rates`]), cache
+    /// writes without a 1h price are charged at the 5m rate like the display,
+    /// and the long-context verdict counts all input including cache.
+    pub fn execution_snapshot(
+        &self,
+        at_unix: i64,
+    ) -> Result<crate::share_value_pricing::PricingSnapshot, crate::share_value_pricing::ValueError>
+    {
+        use crate::share_value_pricing::{
+            CacheWritePolicy, ContextInputBasis, ExecutionModelPrice, ExecutionRates,
+            PricingSnapshot, TARIFF_POLICY,
+        };
+        let rate = |value: MicrosPer1M| Some(value.max(0).to_string());
+        let mut models = BTreeMap::new();
+        for (key, price) in self.effective_models(at_unix) {
+            let contexts: &[ContextTier] = if price.long_context_threshold.is_some() {
+                &[ContextTier::Base, ContextTier::Long]
+            } else {
+                &[ContextTier::Base]
+            };
+            let mut rates = BTreeMap::new();
+            for tier in ServiceTier::ALL {
+                for &context in contexts {
+                    let Some((set, _)) = crate::model_pricing::resolve_rates(price, tier, context)
+                    else {
+                        continue;
+                    };
+                    let write_5m = rate(set.cache_write_5m_micros_per_1m);
+                    rates.insert(
+                        format!("{}/{}", tier.as_str(), context.as_str()),
+                        ExecutionRates {
+                            input: rate(set.input_micros_per_1m),
+                            output: rate(set.output_micros_per_1m),
+                            cache_read: rate(set.cache_read_micros_per_1m),
+                            cache_write1h: set
+                                .cache_write_1h_micros_per_1m
+                                .map_or_else(|| write_5m.clone(), rate),
+                            cache_write5m: write_5m,
+                            cache_write_policy: CacheWritePolicy::Both,
+                        },
+                    );
+                }
+            }
+            let complete = ServiceTier::ALL.iter().all(|tier| {
+                contexts.iter().all(|context| {
+                    rates.contains_key(&format!("{}/{}", tier.as_str(), context.as_str()))
+                })
+            });
+            // A model without a standard base row cannot be priced at all.
+            if !complete {
+                continue;
+            }
+            let model = ExecutionModelPrice {
+                context_input_basis: ContextInputBasis::RawInput,
+                long_context_threshold: price.long_context_threshold,
+                long_context_inclusive: price.long_context_inclusive,
+                rates,
+            };
+            // One malformed catalog row must not take every other model's
+            // USD quota down with it.
+            if !crate::share_value_pricing::valid_model_key(key) || model.validate().is_err() {
+                tracing::warn!(model = %key, "model price cannot be used for USD quotas; skipped");
+                continue;
+            }
+            models.insert(key.to_string(), model);
+        }
+        let exact_aliases = self
+            .exact_aliases
+            .iter()
+            .filter(|(alias, key)| {
+                models.contains_key(*key)
+                    && !models.contains_key(*alias)
+                    && crate::share_value_pricing::valid_model_key(alias)
+            })
+            .map(|(alias, key)| (alias.clone(), key.clone()))
+            .collect();
+        Ok(PricingSnapshot {
+            schema_version: 1,
+            tariff_policy_id: TARIFF_POLICY.into(),
+            currency: "USD".into(),
+            models,
+            exact_aliases,
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Load
 // ---------------------------------------------------------------------------
@@ -1049,7 +1139,7 @@ fn compute_revision(
 /// unwrapped identities. Every candidate is a whole-string identity, never a
 /// family prefix, so `claude-sonnet-4-5-thinking` can land on
 /// `claude-sonnet-4-5` while `gpt-5-mini` cannot land on `gpt-5`.
-fn identity_candidates(model_text: &str) -> Vec<String> {
+pub(crate) fn identity_candidates(model_text: &str) -> Vec<String> {
     let mut ordered = Vec::new();
     let mut seen = HashSet::new();
     let mut queue = VecDeque::new();
@@ -1379,6 +1469,124 @@ mod tests {
         )
         .expect("price");
         assert_eq!(priced.total_micros, 3_000_000);
+    }
+
+    #[test]
+    fn execution_snapshot_is_the_displayed_price() {
+        use crate::share_value_pricing::{MAX_SNAPSHOT_BYTES, PICOS_PER_MICRO, ValueTokens};
+        let conn = fixture_conn();
+        let at = 1_757_462_400;
+        let catalog = load(&conn, at).expect("load");
+        let snapshot = catalog.execution_snapshot(at).expect("derive");
+        let json = snapshot.canonical_json().expect("valid tariff");
+        assert!(json.len() < MAX_SNAPSHOT_BYTES / 2, "{} bytes", json.len());
+        assert_eq!(snapshot.models.len(), catalog.effective_models(at).len());
+        // Deterministic: the same catalog always publishes the same revision.
+        assert_eq!(
+            snapshot.revision().unwrap(),
+            catalog.execution_snapshot(at).unwrap().revision().unwrap()
+        );
+
+        let key = "claude-3-7-sonnet-20250219";
+        let display = catalog.price_at(key, at).expect("display price");
+        let execution = snapshot.model(key).expect("execution price");
+        let split = TokenSplit {
+            input: 120_000,
+            output: 30_000,
+            cache_read: 50_000,
+            cache_write: 10_000,
+        };
+        for tier in ServiceTier::ALL {
+            let shown = price_usage(
+                display,
+                tier,
+                &split,
+                split.input + split.cache_read + split.cache_write,
+            )
+            .expect("display prices every tier through its fallback chain");
+            let charged = execution
+                .price(
+                    tier.as_str(),
+                    &ValueTokens {
+                        fresh_input: split.input,
+                        output: split.output,
+                        cache_read: split.cache_read,
+                        cache_write5m: split.cache_write,
+                        ..ValueTokens::default()
+                    },
+                )
+                .expect("execution prices every tier");
+            // Display truncates each line to whole micros; execution keeps picos.
+            let charged_micros = charged.usage_picos / PICOS_PER_MICRO;
+            assert!(
+                (charged_micros - shown.total_micros).abs() <= 4,
+                "{tier:?}: charged {charged_micros} vs shown {}",
+                shown.total_micros
+            );
+        }
+    }
+
+    #[test]
+    fn admin_priced_models_join_the_execution_snapshot() {
+        let conn = fixture_conn();
+        load(&conn, 1_757_462_400).expect("initial load");
+        conn.execute(
+            "INSERT INTO model_price_catalog (
+                 price_key, effective_from, display_name, source, updated_at
+             ) VALUES ('house-model', 100, 'House Model', 'admin', 100)",
+            params![],
+        )
+        .expect("insert admin header");
+        conn.execute(
+            "INSERT INTO model_price_rates (
+                 price_key, effective_from, service_tier, context_tier,
+                 input_micros_per_1m, output_micros_per_1m,
+                 cache_read_micros_per_1m, cache_write_5m_micros_per_1m
+             ) VALUES ('house-model', 100, 'standard', 'base', 1000000, 2000000, 100000, 1250000)",
+            params![],
+        )
+        .expect("insert admin rate");
+        let catalog = load(&conn, 1_757_462_500).expect("reload");
+        let snapshot = catalog.execution_snapshot(1_757_462_500).expect("derive");
+        let model = snapshot
+            .model("House-Model")
+            .expect("admin price is executable");
+        // Priority and flex fall back to standard, as the display does.
+        for key in ["standard/base", "priority/base", "flex/base"] {
+            let rates = &model.rates[key];
+            assert_eq!(rates.input.as_deref(), Some("1000000"));
+            // No 1h price: every cache write costs the 5m rate, as displayed.
+            assert_eq!(rates.cache_write1h.as_deref(), Some("1250000"));
+        }
+        assert!(snapshot.model("unpriced-model").is_err());
+    }
+
+    #[test]
+    fn execution_lookup_unwraps_wire_names_like_the_display() {
+        let conn = fixture_conn();
+        let at = 1_757_462_400;
+        let catalog = load(&conn, at).expect("load");
+        let snapshot = catalog.execution_snapshot(at).expect("derive");
+        for observed in [
+            "claude-3-7-sonnet-20250219",
+            "  Claude-3-7-Sonnet-20250219 ",
+            "anthropic.claude-3-7-sonnet-20250219-v1:0",
+            "claude-3-7-sonnet-20250219-thinking",
+            "publishers/anthropic/models/claude-3-7-sonnet-20250219",
+            "gpt-5-unknown-variant",
+            "totally-made-up-model",
+        ] {
+            let shown = catalog.lookup(observed, at).map(|(key, _)| key.to_string());
+            let charged = snapshot.model(observed).ok().map(|price| {
+                snapshot
+                    .models
+                    .iter()
+                    .find(|(_, candidate)| std::ptr::eq(*candidate, price))
+                    .map(|(key, _)| key.clone())
+                    .unwrap()
+            });
+            assert_eq!(charged, shown, "{observed}");
+        }
     }
 
     #[test]

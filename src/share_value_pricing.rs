@@ -348,7 +348,7 @@ pub struct PricingSnapshot {
     #[serde(deserialize_with = "unique_map")]
     pub exact_aliases: BTreeMap<String, String>,
 }
-fn valid_model_key(key: &str) -> bool {
+pub(crate) fn valid_model_key(key: &str) -> bool {
     !key.is_empty() && key.len() <= 250 && key.trim() == key && !key.chars().any(char::is_control)
 }
 impl PricingSnapshot {
@@ -394,13 +394,24 @@ impl PricingSnapshot {
     pub fn revision(&self) -> Result<String, ValueError> {
         Ok(Self::revision_of_canonical_json(&self.canonical_json()?))
     }
+    /// Resolves the wire model exactly as the price display does: the name
+    /// as sent, then with provider qualifiers and runtime suffixes peeled
+    /// (`anthropic.`, `publishers/…/models/`, `-thinking`, `[1m]`, `-v1:0`,
+    /// date stamps), each candidate matched as an exact alias or model key.
     pub fn model(&self, effective_model: &str) -> Result<&ExecutionModelPrice, ValueError> {
-        let key = self
-            .exact_aliases
-            .get(effective_model)
-            .map(String::as_str)
-            .unwrap_or(effective_model);
-        self.models.get(key).ok_or(ValueError::PriceUnavailable)
+        std::iter::once(effective_model.to_string())
+            .chain(crate::model_price_catalog::identity_candidates(
+                effective_model,
+            ))
+            .find_map(|candidate| {
+                let key = self
+                    .exact_aliases
+                    .get(&candidate)
+                    .map(String::as_str)
+                    .unwrap_or(&candidate);
+                self.models.get(key)
+            })
+            .ok_or(ValueError::PriceUnavailable)
     }
 }
 
@@ -436,6 +447,52 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn model_identity_matches_shared_vectors() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/share-value-model-identity-v1.json"
+        ))
+        .unwrap();
+        let rates = ExecutionRates {
+            input: Some("1".into()),
+            output: Some("1".into()),
+            cache_read: None,
+            cache_write5m: None,
+            cache_write1h: None,
+            cache_write_policy: CacheWritePolicy::Unavailable,
+        };
+        let model = ExecutionModelPrice {
+            context_input_basis: ContextInputBasis::RawInput,
+            long_context_threshold: None,
+            long_context_inclusive: false,
+            rates: [("standard/base".to_string(), rates)].into_iter().collect(),
+        };
+        let snapshot = PricingSnapshot {
+            schema_version: 1,
+            tariff_policy_id: TARIFF_POLICY.into(),
+            currency: "USD".into(),
+            models: fixture["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|key| (key.as_str().unwrap().to_string(), model.clone()))
+                .collect(),
+            exact_aliases: serde_json::from_value(fixture["exactAliases"].clone()).unwrap(),
+        };
+        for case in fixture["cases"].as_array().unwrap() {
+            let observed = case["model"].as_str().unwrap();
+            let resolved = snapshot.model(observed).ok().map(|price| {
+                snapshot
+                    .models
+                    .iter()
+                    .find(|(_, candidate)| std::ptr::eq(*candidate, price))
+                    .map(|(key, _)| key.as_str())
+                    .unwrap()
+            });
+            assert_eq!(resolved, case["expected"].as_str(), "{observed:?}");
+        }
+    }
+
     #[test]
     fn protocol_golden_vectors_freeze_snapshot_hash_aliases_and_exact_amounts() {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(

@@ -1,0 +1,78 @@
+{
+  "description": "Wire model text -> execution tariff key. Router and Server resolve exactly as the Router price display does.",
+  "models": [
+    "claude-sonnet-4-5",
+    "claude-sonnet-4-5-20250929",
+    "claude-sonnet-4-8",
+    "gpt-5",
+    "gpt-5-mini",
+    "o3",
+    "conatus-free",
+    "kimi-k2.5"
+  ],
+  "exactAliases": {
+    "claude-4-sonnet-alias": "claude-sonnet-4-5"
+  },
+  "cases": [
+    {
+      "model": "claude-sonnet-4-5-20250929",
+      "expected": "claude-sonnet-4-5-20250929"
+    },
+    {
+      "model": "  Claude-Sonnet-4-5-20250514 ",
+      "expected": "claude-sonnet-4-5"
+    },
+    {
+      "model": "anthropic.claude-sonnet-4-5-20250929-v1:0",
+      "expected": "claude-sonnet-4-5-20250929"
+    },
+    {
+      "model": "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+      "expected": "claude-sonnet-4-5-20250929"
+    },
+    {
+      "model": "publishers/anthropic/models/claude-sonnet-4-5",
+      "expected": "claude-sonnet-4-5"
+    },
+    {
+      "model": "claude-sonnet-4-5-thinking",
+      "expected": "claude-sonnet-4-5"
+    },
+    {
+      "model": "claude-sonnet-4-5[1m]",
+      "expected": "claude-sonnet-4-5"
+    },
+    {
+      "model": "claude-sonnet-4.8",
+      "expected": "claude-sonnet-4-8"
+    },
+    {
+      "model": "qiniu/conatus-free",
+      "expected": "conatus-free"
+    },
+    {
+      "model": "moonshotai/kimi-k2.5",
+      "expected": "kimi-k2.5"
+    },
+    {
+      "model": "azure.o3",
+      "expected": "o3"
+    },
+    {
+      "model": "gpt-5-mini",
+      "expected": "gpt-5-mini"
+    },
+    {
+      "model": "claude-4-sonnet-alias",
+      "expected": "claude-sonnet-4-5"
+    },
+    {
+      "model": "gpt-5-unknown-variant",
+      "expected": null
+    },
+    {
+      "model": "",
+      "expected": null
+    }
+  ]
+}

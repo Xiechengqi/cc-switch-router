@@ -701,9 +701,11 @@ Share 直连隧道另有独立白名单:`/v1`、`/v1/`、`/v1beta/`、`/gemini/v
 
 此功能与钱包、充值、市场租金完全独立。完整实现规格和真实灰度门槛见 [实施计划](docs/share-user-value-quota-implementation-plan.md)。当前只声明本地／夹具验证；真实转发面保持 `live_pending`。
 
-### 13.1 不可变执行价目
+### 13.1 不可变执行价目（由模型价格自动派生）
 
-`GET/POST /v1/admin/share-value-pricing` 仅 Router Owner 可用。发布体为 `{expectedVersion,effectiveFromMs?,snapshot}`，配置 CAS 冲突为 409。`effectiveFromMs` 可省略；缺省或早于 Router 当前时间 +60 秒时被钳制为 now+60s（不再因浏览器时钟偏差拒绝），晚于一年仍为 400。同一内容修订的首次生效时间不可变。仅发布接口接受最大 4 MiB+64 KiB 请求体；本节其他接口（签名 fetch／ack／watermark、预览、校准）上限 256 KiB。快照 schema v1 使用 `currency=USD`、`tariffPolicyId=api-equivalent-v1`、准确 `models` 和显式 `exactAliases`；模型包含 `contextInputBasis=rawInput|freshInput`、长上下文阈值及比较方向、每个声明服务层级的 base/long 费率矩阵。费率是整数微美元／百万 Token 的十进制字符串；`null` 为不可用，不是零价。模型和别名唯一；最多 10,000 模型、40,000 别名、4 MiB。修订为规范字段顺序及排序 map 序列化的 SHA-256；测试向量见 `tests/fixtures/share-value-pricing-v1.json`。
+执行价目没有单独的编辑或发布接口：它就是「设置 → 模型价格」页的价目（LiteLLM 派生行 + 管理员在该表为未定价模型或覆盖填写的价格），在某一时刻冻结成快照。Router 在启动及每次价格变更（`reload_pricing_catalog`）后派生快照；内容修订变化时写入并发布——首个价目立即生效，替换已有价目时生效时间为 now+60s，便于已连接的 Server 先安装和 ACK。同一内容修订的首次生效时间不可变。派生规则与价格显示一致：每个模型按显示所用回退链（同 tier 的 base → standard 同上下文 → standard/base）物化全部 `standard|priority|flex` × `base`（及有阈值时的 `long`）行；`contextInputBasis=rawInput`（与显示一样计入缓存输入判定长上下文）；缺 1h 缓存写价时 1h 与 5m 同价、`cacheWritePolicy=both`；单个非法模型行跳过并记日志，不影响其他模型。被替换超过 30 天的修订其 `payload_json` 压缩为 `{}`，行保留以满足 ACK 和 Share 绑定引用。
+
+快照 schema v1 使用 `currency=USD`、`tariffPolicyId=api-equivalent-v1`、准确 `models` 和显式 `exactAliases`。费率是整数微美元／百万 Token 的十进制字符串；`null` 为不可用，不是零价。模型和别名唯一；最多 10,000 模型、40,000 别名、4 MiB（当前完整 LiteLLM 目录约 1.9 MiB）。修订为规范字段顺序及排序 map 序列化的 SHA-256；测试向量见 `tests/fixtures/share-value-pricing-v1.json`。模型解析与显示相同：先原样，再按显示的身份剥离（`anthropic.` 等厂商前缀、`publishers/…/models/` 路径、`-thinking`／`-latest`／`[1m]`／Bedrock `-v1:0`、日期戳、`claude-sonnet-4.8` 写法）逐个候选匹配精确别名或模型键。未定价模型不可被美元额度用户调用，需在模型价格表定价。本节接口请求体上限 256 KiB；价目只在 fetch 响应中由 Router 下发。
 
 Server 使用通用 installation Ed25519 envelope（`protocolEpoch/installationId/timestampMs/nonce/signature`，同 §3 签名串）调用：
 

@@ -2145,6 +2145,11 @@ impl AppStore {
             Ok(mut guard) => *guard = Arc::clone(&catalog),
             Err(poisoned) => *poisoned.into_inner() = Arc::clone(&catalog),
         }
+        // A price edit is also a USD quota tariff edit; failing to republish
+        // keeps the previous tariff and is retried on the next start or edit.
+        if let Err(error) = self.sync_value_tariff_from_catalog().await {
+            tracing::warn!(%error, "USD quota tariff was not republished after a price change");
+        }
         Ok(catalog)
     }
 
@@ -37578,6 +37583,70 @@ pub(crate) mod tests {
             matches!(&error, AppError::Unauthorized(message) if message == "signature verification failed"),
             "{error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn value_tariff_follows_model_prices() {
+        let (store, _config) = setup_store("share-value-tariff-sync").await;
+        let started = Utc::now().timestamp_millis();
+        let first = store
+            .sync_value_tariff_from_catalog()
+            .await
+            .unwrap()
+            .expect("the first catalog publishes a tariff");
+        let meta = |store: &AppStore| {
+            let store = store.clone();
+            async move {
+                let conn = store.conn.lock().await;
+                let meta = super::share_value_quotas::tests_settings_meta(&conn);
+                meta
+            }
+        };
+        let (version, revision, effective_from) = meta(&store).await;
+        assert_eq!((version, revision.as_deref()), (1, Some(first.as_str())));
+        // Nothing was live before, so nothing has to wait for Servers.
+        assert!(effective_from.unwrap() <= Utc::now().timestamp_millis());
+        assert_eq!(store.sync_value_tariff_from_catalog().await.unwrap(), None);
+
+        // An old, superseded payload is compacted; its row stays for ACKs.
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO share_value_pricing_snapshots VALUES('sha256:old','{\"x\":1}',1,'owner',1)",
+                [],
+            )
+            .unwrap();
+        }
+        // A price edit is a tariff edit, applied after Servers had a minute to install it.
+        store
+            .upsert_admin_model_price(crate::model_price_catalog::AdminModelPriceInput {
+                price_key: "house-model".into(),
+                display_name: "House Model".into(),
+                input: 1_000_000,
+                output: 2_000_000,
+                cache_read: 100_000,
+                cache_write_5m: 1_250_000,
+                cache_write_1h: None,
+                expected_effective_from: None,
+                expect_unpriced: true,
+            })
+            .await
+            .unwrap();
+        let (version, revision, effective_from) = meta(&store).await;
+        assert_eq!(version, 2);
+        assert_ne!(revision.as_deref(), Some(first.as_str()));
+        assert!(effective_from.unwrap() >= started + 60_000);
+        let conn = store.conn.lock().await;
+        let payload = |revision: &str| -> String {
+            conn.query_row(
+                "SELECT payload_json FROM share_value_pricing_snapshots WHERE revision=?1",
+                params![revision],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(payload("sha256:old"), "{}");
+        assert!(payload(revision.as_deref().unwrap()).contains("house-model"));
     }
 
     #[tokio::test]

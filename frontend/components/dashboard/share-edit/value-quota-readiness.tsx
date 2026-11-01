@@ -1,14 +1,10 @@
 // Hallmark · pre-emit critique: P4 H4 E4 S5 R5 V4 · component-scope, existing Router tokens.
 "use client";
-import { ExternalLink } from "lucide-react";
 import type { TFn } from "@/components/dashboard/share-dashboard-utils";
-import { useAuth } from "@/components/auth/auth-provider";
 import { InfoHint } from "@/components/common/info-hint";
 import { knownReadinessCode, valueReadinessItems, valueReadinessSummary, type ValueReadinessCheck } from "@/lib/share-value-quota";
 import type { useValueQuotaReadiness } from "@/lib/use-value-quota-readiness";
 
-/** Where the Router admin reviews and publishes the execution tariff. */
-export const VALUE_TARIFF_SETTINGS_HREF = "/settings/?panel=model_prices";
 const LINK = "rounded px-1 py-0.5 font-medium text-primary underline-offset-2 transition-colors hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-primary";
 
 const shortPhrase = (code: string, t: TFn) => {
@@ -29,14 +25,11 @@ const actionSentence = (check: ValueReadinessCheck, t: TFn) => {
 export function ValueQuotaReadiness({state, t, id}: {state:ReturnType<typeof useValueQuotaReadiness>;t:TFn;
   /** Lets the disabled `$` option point at this line. */
   id?: string}) {
-  const {session} = useAuth();
   if (!state.unavailable) return null;
   const checks = state.preview?.checks;
   const items = valueReadinessItems(checks);
   const {root, more} = valueReadinessSummary(checks);
   const reason = state.error ? t(`dashboard.userLimit.value.readiness.short.${state.error}`) : root ? shortPhrase(root.code, t) : undefined;
-  // Reading and publishing the tariff need the Router owner, not any admin.
-  const canPublish = session?.canAuditClientMarket === true && !state.error && items.some(item => !item.waitingOn && item.check.code === "tariff_published");
   const pricing = state.preview?.pricing;
   return <div className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-muted-foreground" role="status" aria-busy={state.loading}>
     <span id={id} className="inline-flex min-w-0 items-center gap-1.5">
@@ -68,15 +61,6 @@ export function ValueQuotaReadiness({state, t, id}: {state:ReturnType<typeof use
           ? <span>{t(`dashboard.userLimit.value.readiness.${pricing.acknowledgedAtMs == null ? "pendingAck" : "pendingEffective"}`)}</span> : null}
       </span>
     </InfoHint>
-    {canPublish ? <>
-      <span aria-hidden="true">·</span>
-      {/* A new tab keeps the unsaved Share draft in this dialog. */}
-      <a href={VALUE_TARIFF_SETTINGS_HREF} target="_blank" rel="noopener noreferrer" className={`inline-flex items-center gap-1 ${LINK}`}>
-        {t("dashboard.userLimit.value.readiness.publishTariff")}
-        <ExternalLink aria-hidden="true" className="h-3 w-3" />
-        <span className="sr-only">({t("dashboard.clientFrame.openNewTab")})</span>
-      </a>
-    </> : null}
     <span aria-hidden="true">·</span>
     <button type="button" className={`${LINK} disabled:opacity-50`} disabled={state.loading} onClick={state.retry}>
       {t("dashboard.userLimit.value.readiness.retry")}

@@ -273,6 +273,9 @@ async fn main() -> Result<()> {
         )
         .context("configure platform wallet payments failed")?,
     );
+    if let Err(error) = store.sync_value_tariff_from_catalog().await {
+        tracing::warn!(%error, "USD quota tariff could not be derived from model prices at startup");
+    }
     if let Err(error) = market_fx::refresh_on_startup(&store).await {
         tracing::warn!(error = %error, "initial USD/CNY rate refresh failed; using verified cache if fresh");
     }

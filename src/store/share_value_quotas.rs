@@ -17,10 +17,13 @@ const METERING_STATUSES: &[&str] = &[
     // fields always come from the stored descriptor, not the watermark.
     "scheduled",
 ];
-/// A published tariff never activates sooner than this after publication, so a
-/// browser clock or network delay cannot make a publish request fail.
+/// A replacement tariff activates this long after publication, so connected
+/// Servers can install and acknowledge it before it applies.
 const PUBLISH_MIN_LEAD_MS: i64 = 60_000;
+#[cfg(test)]
 const PUBLISH_MAX_LEAD_MS: i64 = 366 * 86_400_000;
+/// Superseded tariff payloads are kept this long for inspection, then compacted.
+const TARIFF_PAYLOAD_RETENTION_MS: i64 = 30 * 86_400_000;
 /// Server watermark keepalive is 45 s with 60±6 s heartbeats; 180 s tolerates
 /// a couple of missed beats before a projection counts as stale.
 const PROJECTION_FRESH_MS: i64 = 180_000;
@@ -49,6 +52,7 @@ pub(crate) struct PricingSettings {
     pub effective_from_ms: Option<i64>,
     pub snapshot: Option<PricingSnapshot>,
 }
+#[cfg(test)]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PublishPricing {
@@ -167,6 +171,12 @@ fn read_settings_meta(conn: &Connection) -> Result<SettingsMeta, AppError> {
             effective_from_ms: Some(at),
         },
     })
+}
+/// `(version, revision, effective_from_ms)` of the current tariff, for tests.
+#[cfg(test)]
+pub(crate) fn tests_settings_meta(conn: &Connection) -> (i64, Option<String>, Option<i64>) {
+    let meta = read_settings_meta(conn).unwrap();
+    (meta.version, meta.revision, meta.effective_from_ms)
 }
 type RawSettings = Option<(i64, String, i64, String)>;
 fn read_settings_raw(conn: &Connection) -> Result<RawSettings, AppError> {
@@ -490,13 +500,73 @@ impl AppStore {
                 "publishedRevision":settings.revision,"effectiveFromMs":settings.effective_from_ms}),
         )
     }
-    pub(crate) async fn value_pricing_settings(&self) -> Result<PricingSettings, AppError> {
-        let raw = {
-            let conn = self.conn.lock().await;
-            read_settings_raw(&conn)?
-        };
-        decode_settings(raw)
+    /// The USD-equivalent tariff follows the model price catalog: whenever the
+    /// catalog's frozen form changes it is published here, effective from the
+    /// next minute while an earlier tariff is live so Servers can install it
+    /// first. Superseded payloads older than 30 days are compacted to `{}`;
+    /// their rows stay because ACKs and Share bindings reference them.
+    pub(crate) async fn sync_value_tariff_from_catalog(&self) -> Result<Option<String>, AppError> {
+        let catalog = self.pricing_catalog();
+        if catalog.is_empty() {
+            return Ok(None);
+        }
+        let derived_from = catalog.revision().to_string();
+        let now = Utc::now();
+        let at_unix = now.timestamp();
+        // Deriving and hashing a few MiB is CPU work; keep it off the runtime.
+        let (json, revision) = tokio::task::spawn_blocking(move || {
+            let json = catalog
+                .execution_snapshot(at_unix)
+                .and_then(|snapshot| snapshot.canonical_json())
+                .map_err(|e| AppError::Internal(format!("derive USD quota tariff failed: {e}")))?;
+            let revision = PricingSnapshot::revision_of_canonical_json(&json);
+            Ok::<_, AppError>((json, revision))
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("derive USD quota tariff failed: {e}")))??;
+        let now_ms = now.timestamp_millis();
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        // A concurrent price edit swapped the catalog meanwhile; its own sync
+        // publishes the newer prices, and this older derivation must not win.
+        if self.pricing_catalog().revision() != derived_from {
+            return Ok(None);
+        }
+        let current = read_settings_meta(&tx)?;
+        let changed = current.revision.as_deref() != Some(revision.as_str());
+        if changed {
+            let effective_from_ms = if current.revision.is_some() {
+                now_ms + PUBLISH_MIN_LEAD_MS
+            } else {
+                now_ms
+            };
+            // A content revision is immutable, including its initial activation time.
+            tx.execute(
+                "INSERT OR IGNORE INTO share_value_pricing_snapshots VALUES(?1,?2,?3,'model-prices',?4)",
+                params![revision, json, effective_from_ms, now_ms],
+            )
+            .map_err(db_error)?;
+            tx.execute("INSERT INTO share_value_pricing_config VALUES(1,?1,?2)
+                ON CONFLICT(singleton) DO UPDATE SET revision=excluded.revision,version=excluded.version",
+                params![revision,current.version.checked_add(1).ok_or_else(|| db_error("configuration version overflow"))?]).map_err(db_error)?;
+        }
+        tx.execute(
+            "UPDATE share_value_pricing_snapshots SET payload_json='{}'
+             WHERE revision<>?1 AND created_at_ms<?2 AND payload_json<>'{}'",
+            params![revision, now_ms - TARIFF_PAYLOAD_RETENTION_MS],
+        )
+        .map_err(db_error)?;
+        tx.commit().map_err(db_error)?;
+        if changed {
+            tracing::info!(%revision, "published the USD quota tariff derived from model prices");
+        }
+        Ok(changed.then_some(revision))
     }
+    /// Test fixture for arbitrary snapshots; production tariffs come only from
+    /// [`Self::sync_value_tariff_from_catalog`].
+    #[cfg(test)]
     pub(crate) async fn publish_value_pricing(
         &self,
         input: PublishPricing,

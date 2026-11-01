@@ -1,9 +1,5 @@
 //! Private Share value-quota control plane. Never mounted on public usage APIs.
-use crate::{
-    ServerState,
-    error::AppError,
-    store::share_value_quotas::{PublishPricing, SignedValueRequest},
-};
+use crate::{ServerState, error::AppError, store::share_value_quotas::SignedValueRequest};
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Path, Query, State},
@@ -15,15 +11,10 @@ use axum::{
 use serde::Deserialize;
 
 /// Signed Server control payloads (fetch/ack/watermark) and browser control
-/// bodies are small; only the Owner tariff publication carries a snapshot.
+/// bodies are small; tariffs only travel Router → Server, in fetch responses.
 const CONTROL_BODY_LIMIT: usize = 256 * 1024;
 
 pub fn router() -> Router<ServerState> {
-    let publication = Router::new()
-        .route("/v1/admin/share-value-pricing", get(settings).post(publish))
-        .layer(DefaultBodyLimit::max(
-            crate::share_value_pricing::MAX_SNAPSHOT_BYTES + 65536,
-        ));
     Router::new()
         .route("/v1/admin/share-value-pricing/health", get(health))
         .route("/v1/shares/value-pricing/fetch", post(fetch))
@@ -37,7 +28,6 @@ pub fn router() -> Router<ServerState> {
         .route("/v1/shares/:share_id/value-quota-preview", post(preview))
         .route("/v1/shares/:share_id/value-usage-edits", post(edit_usage))
         .layer(DefaultBodyLimit::max(CONTROL_BODY_LIMIT))
-        .merge(publication)
         // Every response here, including errors and extractor rejections, is private.
         .layer(middleware::map_response(no_store))
 }
@@ -317,26 +307,6 @@ async fn edit_usage(
     .map_err(control_error)?;
     // Per-row failures arrive as `items[].error: {code}` and are forwarded as-is.
     Ok(Json(result))
-}
-async fn settings(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-) -> Result<Json<crate::store::share_value_quotas::PricingSettings>, AppError> {
-    crate::api::require_owner_session(&state, &headers).await?;
-    Ok(Json(state.store.value_pricing_settings().await?))
-}
-async fn publish(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Json(input): Json<PublishPricing>,
-) -> Result<Json<crate::store::share_value_quotas::PricingSettings>, AppError> {
-    let session = crate::api::require_owner_session(&state, &headers).await?;
-    Ok(Json(
-        state
-            .store
-            .publish_value_pricing(input, &session.email)
-            .await?,
-    ))
 }
 async fn fetch(
     State(state): State<ServerState>,

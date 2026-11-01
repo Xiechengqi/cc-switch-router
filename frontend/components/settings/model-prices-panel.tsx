@@ -4,7 +4,7 @@ import { History, Loader2, Pencil, Plus, RefreshCw, RotateCcw, Search } from "lu
 import { Alert, Button, Card, Chip, Input, Modal } from "@heroui/react";
 import * as React from "react";
 import { CompactSelect } from "@/components/common/compact-select";
-import { ShareValuePricingPanel } from "./share-value-pricing-panel";
+import { ValueTariffStatus } from "./value-tariff-status";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { formatModelPriceEffectiveFrom, formatModelPriceHistoryRange, isRetroactiveModelPrice } from "@/lib/model-price-effectivity";
 import {
@@ -142,7 +142,7 @@ export function ModelPricesPanel() {
         <div className="flex gap-2"><Button variant="outline" onClick={() => { const model = { modelKey: "", displayName: "", priced: false, discoveredFrom: [] } satisfies AdminModelPriceListItem; openEditor(model); }}><Plus className="h-4 w-4" />{t("settings.modelPrices.add")}</Button><Button variant="outline" onClick={() => void load()} isDisabled={loading || busy}>{loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}{t("common.reload")}</Button></div>
       </div>
       {error ? <Alert status="danger">{error}</Alert> : null}
-      <ShareValuePricingPanel referenceModels={data?.models}/>
+      <ValueTariffStatus unpriced={data?.unpriced} onShowUnpriced={() => setFilter("unpriced")} />
       <div className="grid grid-cols-2 overflow-hidden rounded-md border bg-background sm:grid-cols-4">
         {([["total", data?.total], ["priced", data?.priced], ["unpriced", data?.unpriced], ["overrides", data?.adminOverrides]] as const).map(([key, value]) => <div key={key} className="border-r p-4 last:border-r-0"><div className="text-2xl font-semibold tabular-nums">{value ?? "—"}</div><div className="text-xs text-muted-foreground">{t(`settings.modelPrices.stat.${key}`)}</div></div>)}
       </div>
