@@ -29,7 +29,7 @@ const frontendOccurrences = [...frontendBlock[1].matchAll(/"(CC_SWITCH_ROUTER_[A
 const frontendKeys = [...new Set(frontendOccurrences)].sort();
 
 const errors = [];
-if (schemaKeys.length !== 135) errors.push(`expected 135 Settings fields, found ${schemaKeys.length}`);
+if (schemaKeys.length !== 133) errors.push(`expected 133 Settings fields, found ${schemaKeys.length}`);
 for (const [label, occurrences, unique] of [
   ["Settings schema", schemaKeyOccurrences, schemaKeys],
   ["default env", defaultEnvOccurrences, defaultEnvKeys],
@@ -43,20 +43,59 @@ for (const [label, keys] of [["default env", defaultEnvKeys], ["frontend catalog
 }
 
 for (const category of [
-  "GeneralDisplay",
-  "Connectivity",
-  "DataLifecycle",
-  "IdentitySecurity",
-  "Notifications",
-  "Observability",
+  "SiteAccess",
+  "AccountsSecurity",
   "Marketplace",
+  "Notifications",
+  "Monitoring",
+  "DataRetention",
+  "Connectivity",
+  "Deployment",
 ]) {
   if (!settingsSource.includes(`Self::${category}`)) errors.push(`missing Settings category ${category}`);
+}
+
+// The leftover-key cleanup offers every Router-prefixed env-file entry that
+// is neither a Settings field nor in UNLISTED_ENV_KEYS. A key read anywhere
+// else must be registered, or cleanup could delete a live setting.
+const unlistedBlock = settingsSource.match(/pub const UNLISTED_ENV_KEYS: &\[&str\] = &\[([\s\S]*?)\n\];/);
+if (!unlistedBlock) throw new Error("UNLISTED_ENV_KEYS block not found");
+const unlistedKeys = new Set([...unlistedBlock[1].matchAll(/"(CC_SWITCH_ROUTER_[A-Z0-9_]+)"/g)].map((match) => match[1]));
+// Retired keys the code mentions only to prove they stay ignored, and
+// test-only scratch keys. Both are fine to clean up.
+const ignoredKeys = new Set([
+  "CC_SWITCH_ROUTER_CLIENT_ALERT_EMAILS",
+  "CC_SWITCH_ROUTER_CLIENT_OFFLINE_NOTIFY_OWNER",
+  "CC_SWITCH_ROUTER_MANAGED_ENV_CLEAR_TEST",
+  "CC_SWITCH_ROUTER_MANAGED_ENV_PRECEDENCE_TEST",
+  "CC_SWITCH_ROUTER_TEST_BOOL_GARBAGE",
+  "CC_SWITCH_ROUTER_RETIRED_GATEWAY_SECRET",
+  "CC_SWITCH_ROUTER_UX_TELEMETRY_ENABLED",
+  "CC_SWITCH_ROUTER_NOT_IN_FILE",
+]);
+function rustFiles(directory) {
+  return fs.readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const full = path.join(directory, entry.name);
+    if (entry.isDirectory()) return rustFiles(full);
+    return entry.name.endsWith(".rs") ? [full] : [];
+  });
+}
+const schemaKeySet = new Set(schemaKeys);
+for (const file of rustFiles(path.join(root, "src"))) {
+  const source = fs.readFileSync(file, "utf8");
+  for (const [, key] of source.matchAll(/"(CC_SWITCH_ROUTER_[A-Z0-9_]*[A-Z0-9])"/g)) {
+    if (schemaKeySet.has(key) || unlistedKeys.has(key) || ignoredKeys.has(key)) continue;
+    errors.push(`${path.relative(root, file)} reads ${key}, which is neither a Settings field nor in UNLISTED_ENV_KEYS`);
+  }
+}
+for (const key of unlistedKeys) {
+  if (schemaKeySet.has(key)) errors.push(`UNLISTED_ENV_KEYS repeats Settings field ${key}`);
 }
 
 for (const route of [
   '"/v1/admin/settings"',
   '"/v1/admin/settings/validate"',
+  '"/v1/admin/settings/unrecognized-keys/remove"',
   '"/v1/admin/client-server-release/validate"',
 ]) {
   if (!apiSource.includes(route)) errors.push(`missing Settings API route ${route}`);

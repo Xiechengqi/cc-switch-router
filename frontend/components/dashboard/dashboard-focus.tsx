@@ -3,7 +3,6 @@
 import * as React from "react";
 import { usePathname, useRouter } from "next/navigation";
 import type { DashboardResponse } from "@/lib/types";
-import { recordDashboardUxEvent } from "@/lib/api";
 import {
   buildDashboardHref,
   dashboardRouteForDrawer,
@@ -149,18 +148,12 @@ export function DashboardFocusProvider({ data, children }: { data: DashboardResp
     (next: DashboardFocusTarget) => {
       setTarget(next);
       navigateForFocus(next);
-      void recordDashboardUxEvent({
-        eventType: next.kind === "request" && next.source === "activity" ? "map_request_selected" : "dashboard_focus_set",
-        source: next.source,
-        targetType: next.kind,
-      });
     },
     [navigateForFocus],
   );
   const clearFocus = React.useCallback(() => {
     setTarget(null);
     navigateForFocus(null);
-    void recordDashboardUxEvent({ eventType: "dashboard_focus_clear" });
   }, [navigateForFocus]);
   const openDrawer = React.useCallback(
     (kind: "client" | "share", id: string) => {

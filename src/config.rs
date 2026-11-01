@@ -848,8 +848,6 @@ pub struct Config {
     /// from the broader administrator set.
     pub router_owner_email: Option<String>,
     pub admin_emails: HashSet<String>,
-    pub ux_telemetry_enabled: bool,
-    pub ux_telemetry_retention_days: u32,
     pub footer_telegram_url: String,
     pub metrics: MetricsConfig,
     pub clock_health: ClockHealthConfig,
@@ -1145,10 +1143,6 @@ impl Config {
             verification_service_api_key: env_var("CC_SWITCH_ROUTER_VERIFICATION_SERVICE_API_KEY"),
             router_owner_email,
             admin_emails,
-            ux_telemetry_enabled: env_bool("CC_SWITCH_ROUTER_UX_TELEMETRY_ENABLED", false),
-            ux_telemetry_retention_days: env_var("CC_SWITCH_ROUTER_UX_TELEMETRY_RETENTION_DAYS")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(7),
             footer_telegram_url: env::var("CC_SWITCH_ROUTER_FOOTER_TELEGRAM_URL")
                 .ok()
                 .map(|value| value.trim().to_string())
@@ -1617,8 +1611,6 @@ CC_SWITCH_ROUTER_CLIENT_ALERT_REGISTRATION_GLOBAL_HOURLY_LIMIT=10
 # router@<tunnel_domain-host> is always treated as admin. Use this variable
 # to add additional admin emails (comma-separated, case-insensitive).
 CC_SWITCH_ROUTER_ADMIN_EMAILS=
-CC_SWITCH_ROUTER_UX_TELEMETRY_ENABLED=false
-CC_SWITCH_ROUTER_UX_TELEMETRY_RETENTION_DAYS=7
 CC_SWITCH_ROUTER_FOOTER_TELEGRAM_URL=https://t.me/tokenswitchorg
 CC_SWITCH_ROUTER_METRICS_ENABLED=true
 CC_SWITCH_ROUTER_METRICS_DB_PATH={}
@@ -1941,8 +1933,6 @@ mod tests {
             verification_service_api_key: None,
             router_owner_email: None,
             admin_emails: HashSet::new(),
-            ux_telemetry_enabled: false,
-            ux_telemetry_retention_days: 7,
             footer_telegram_url: DEFAULT_FOOTER_TELEGRAM_URL.to_string(),
             metrics: MetricsConfig {
                 enabled: true,

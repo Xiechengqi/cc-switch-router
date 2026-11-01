@@ -317,24 +317,6 @@ export async function updateAnnouncement(update: AnnouncementSettingsUpdate) {
   );
 }
 
-export type DashboardUxEvent = {
-  eventType: string;
-  source?: string;
-  targetType?: "request" | "client" | "share" | "country";
-  stepCount?: number;
-  elapsedMs?: number;
-  keyboard?: boolean;
-};
-
-export function recordDashboardUxEvent(event: DashboardUxEvent) {
-  return fetch("/v1/dashboard/ux-events", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(event),
-    keepalive: true,
-  }).catch(() => undefined);
-}
-
 export async function getShareSettingsEdit(shareId: string, editId: string) {
   return parseJson<ShareEditView>(await authFetch(
     `/v1/shares/${encodeURIComponent(shareId)}/settings-edits/${encodeURIComponent(editId)}`,
@@ -681,6 +663,17 @@ export async function saveSettings(
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ expectedRevision, updates }),
+    }),
+  );
+}
+
+/** Deletes leftover env-file entries; the Router refuses any key still read. */
+export async function removeUnrecognizedSettingsKeys(expectedRevision: string, keys: string[]) {
+  return parseJson<{ removedKeys: string[]; revision: string }>(
+    await authFetch("/v1/admin/settings/unrecognized-keys/remove", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expectedRevision, keys }),
     }),
   );
 }

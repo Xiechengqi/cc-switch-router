@@ -9455,8 +9455,6 @@ mod tests {
             verification_service_api_key: None,
             router_owner_email: None,
             admin_emails: HashSet::new(),
-            ux_telemetry_enabled: false,
-            ux_telemetry_retention_days: 7,
             footer_telegram_url: crate::config::DEFAULT_FOOTER_TELEGRAM_URL.to_string(),
             metrics: MetricsConfig {
                 enabled: false,

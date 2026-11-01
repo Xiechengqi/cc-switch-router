@@ -2851,28 +2851,6 @@ pub struct DashboardPresenceResponse {
     pub telegram_url: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DashboardUxEventRequest {
-    pub event_type: String,
-    #[serde(default)]
-    pub source: Option<String>,
-    #[serde(default)]
-    pub target_type: Option<String>,
-    #[serde(default)]
-    pub step_count: Option<u16>,
-    #[serde(default)]
-    pub elapsed_ms: Option<u64>,
-    #[serde(default)]
-    pub keyboard: bool,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DashboardUxEventResponse {
-    pub accepted: bool,
-}
-
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResendUsageResponse {

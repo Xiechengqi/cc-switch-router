@@ -13,20 +13,14 @@ import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { CompactSelect } from "@/components/common/compact-select";
 import { CopyableCodeField } from "@/components/common/copyable-code-field";
 import { WalletBadge } from "@/components/market/wallet-primitives";
-import { MarketFinanceOverviewSection } from "@/components/settings/market-finance-overview";
 import { WalletPolicySettings } from "@/components/settings/wallet-policy-settings";
 import { MarketTrialSettings } from "@/components/settings/market-trial-settings";
 import { ClientTerminationSettings } from "@/components/settings/client-termination-settings";
 import { CommissionPolicySettings } from "@/components/settings/commission-policy-settings";
 import { C2CFinanceSettings } from "@/components/settings/c2c-finance-settings";
-import { MarketFinanceCaseDesk } from "@/components/settings/market-finance-case-desk";
 import { MarketFinanceEnableDialog } from "@/components/settings/market-finance-enable-dialog";
 import { MarketChannelSettingsDialog, channelSettingsSummary } from "@/components/settings/market-channel-settings-dialog";
-import { MarketFinanceUserLookup } from "@/components/settings/market-finance-user-lookup";
-import { MarketFinanceEarningHolds } from "@/components/settings/market-finance-earning-holds";
 import { codeLabel, ownerDateText, ownerErrorText } from "@/components/settings/market-finance-shared";
-import { MarketFinanceDisputesPanel } from "@/components/settings/market-finance-disputes-panel";
-import { MarketFinanceTopupRecoveryPanel } from "@/components/settings/market-finance-topup-recovery-panel";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ApiError } from "@/lib/api";
 import {
@@ -76,7 +70,6 @@ export function MarketPaymentChannelsPanel() {
   const { locale, t } = useLocaleText();
   const [readiness, setReadiness] = React.useState<MarketFinanceReadiness | null>(null);
   const [channels, setChannels] = React.useState<MarketPaymentChannel[]>([]);
-  const [refreshKey, setRefreshKey] = React.useState(0);
   const [enableOpen, setEnableOpen] = React.useState(false);
   const [enableError, setEnableError] = React.useState("");
   const [settingsChannel, setSettingsChannel] = React.useState<MarketPaymentChannel | null>(null);
@@ -92,8 +85,8 @@ export function MarketPaymentChannelsPanel() {
   const [loaded, setLoaded] = React.useState(false);
   const busyRef = React.useRef(false);
 
-  // Readiness and channels drive this panel; the overview, case desk and
-  // holds reload themselves whenever `refreshKey` changes.
+  // Readiness and channels drive this panel. Balances and case handling
+  // live in Operations → Finance (`MarketFinanceDesk`).
   const reloadCore = React.useCallback(async () => {
     const version = ++loadVersion.current;
     const [nextReadiness, nextChannels] = await Promise.all([
@@ -105,11 +98,6 @@ export function MarketPaymentChannelsPanel() {
     setChannels(nextChannels);
     setLoaded(true);
   }, []);
-
-  const reload = React.useCallback(async () => {
-    setRefreshKey((value) => value + 1);
-    await reloadCore();
-  }, [reloadCore]);
 
   React.useEffect(() => {
     let active = true;
@@ -129,10 +117,10 @@ export function MarketPaymentChannelsPanel() {
     setNotice("");
     try {
       await action();
-      await reload();
+      await reloadCore();
     } catch (cause) {
       if (cause instanceof ApiError && cause.status === 409 && cause.message.includes("version changed")) {
-        await reload().catch(() => {});
+        await reloadCore().catch(() => {});
         setDialog(null);
         setForm(EMPTY_FORM);
         setError(t("settings.marketFinance.versionChanged"));
@@ -161,7 +149,7 @@ export function MarketPaymentChannelsPanel() {
     try {
       await setMarketFinanceMode("enabled", readiness.version);
       setEnableOpen(false);
-      await reload().catch(() => {});
+      await reloadCore().catch(() => {});
     } catch (cause) {
       setEnableError(ownerErrorText(t, cause));
       await reloadCore().catch(() => {});
@@ -261,7 +249,7 @@ export function MarketPaymentChannelsPanel() {
           size="sm"
           aria-label={t("settings.marketFinance.refresh")}
           isDisabled={!!busy}
-          onPress={() => void perform("refresh", reload)}
+          onPress={() => void perform("refresh", reloadCore)}
         >
           <RefreshCw className="size-4" /> {t("settings.marketFinance.refresh")}
         </Button>
@@ -270,7 +258,6 @@ export function MarketPaymentChannelsPanel() {
       {!loaded ? <p className="flex items-center gap-2 text-sm text-muted-foreground"><Loader2 className="size-4 animate-spin" />{t("common.loading")}</p> : null}
       {error && !dialog && !settingsChannel ? <Alert status="danger" role="alert">{error}</Alert> : null}
       <div aria-live="polite">{notice ? <Alert status="success">{notice}</Alert> : null}</div>
-      <MarketFinanceOverviewSection refreshKey={refreshKey} />
       <WalletPolicySettings />
       <MarketTrialSettings />
       <ClientTerminationSettings />
@@ -501,11 +488,6 @@ export function MarketPaymentChannelsPanel() {
         onClose={() => setEnableOpen(false)}
       /> : null}
 
-      <MarketFinanceCaseDesk refreshKey={refreshKey} onChanged={reloadCore} />
-      <MarketFinanceUserLookup />
-      <MarketFinanceEarningHolds refreshKey={refreshKey} onChanged={reloadCore} />
-      <MarketFinanceTopupRecoveryPanel onRecovered={reload} />
-      <MarketFinanceDisputesPanel />
     </section>
   );
 }

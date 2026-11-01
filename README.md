@@ -104,16 +104,16 @@ API 路由按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
 | /v1/account/provider-contacts | 1 | Session | GET/PUT 业务联系方式，不含收款方式或凭据 |
 | `/v1/public/*` | 5 | 公开 | `map-points`、`network-stats`、`usage/global`、`embed/global.svg`、`embed/usage/:user_id` |
 | `/share-api/*` | 4 | 子域名上下文,Session 可选 | `context`、`share`、`auth/me`、`share/settings` |
-| `/v1/dashboard/*`、`/v1/me/*` | 16 | Session | `dashboard`、`presence`、`ux-events`、`me/api-token`、`me/model-routing`、`me/shares`、`me/usage-card`、`me/usage/consumer`、`me/usage/provider`、`me/notifications`、`me/notifications/telegram/bind-link`、`me/notifications/bark` |
+| `/v1/dashboard/*`、`/v1/me/*` | 15 | Session | `dashboard`、`presence`、`me/api-token`、`me/model-routing`、`me/shares`、`me/usage-card`、`me/usage/consumer`、`me/usage/provider`、`me/notifications`、`me/notifications/telegram/bind-link`、`me/notifications/bark` |
 | 其余单例 | 约 16 | 混合 | `healthz`、`regions`、`announcement`、`map-display`、`client-tunnel/subdomain-availability`、`integrations/telegram/webhook`、`_gateway/proxy/*`、`*path`(前端与反代 catch-all) |
 
 ## 管理设置与运维
 
-管理员页面按职责拆分为两个入口：`/settings/` 只管理配置，`/operations/` 承载版本与服务控制、Router 日志、通知投递历史和管理员审计。Settings 的受管环境变量分为 General & Display、Connectivity、Data & Lifecycle、Identity & Security、Notifications、Observability、Marketplace 七个配置域；平台钱包与 DujiaoPay 位于 Marketplace，地图和公告留在 General & Display，通知渠道验证分别留在 Notifications 的邮件、Telegram、Bark tab。
+管理员页面按职责拆分为两个入口：`/settings/` 只管理配置，`/operations/` 承载版本与服务控制、财务处理（余额、案件、收益冻结、充值补单、争议）、Router 日志、通知投递历史和管理员审计。Settings 按管理任务分为八个分类：站点与访问、账号与安全、市场与计费、通知、运行与监控、数据与保留、连接与性能、部署信息；每个分类下的标签页（section）、所含字段分组和非 `.env` 面板（地图、公告、模型价格、钱包与支付、渠道状态等）都由后端 `SETTINGS_SECTIONS` 定义。字段分为四层：常用（直接显示）、高级（折叠）、部署（只读，API 拒绝修改，须改 `.env` 后重启）和托管（Router 自行维护，不显示）。概览会列出 `.env` 中已无任何代码读取的 `CC_SWITCH_ROUTER_*` 遗留项，可经确认后移除。
 
-Settings 使用 revision 化的三段式 API：`GET /v1/admin/settings` 返回 schema、持久化值、运行时有效值和 revision；`POST /v1/admin/settings/validate` 在不写盘的情况下校验整组修改；`PATCH /v1/admin/settings` 要求相同的 `expectedRevision` 后才原子替换 `.env`。并发修改返回 `SETTINGS_REVISION_CONFLICT`，前端会加载最新版本并保留待复核草稿。地图与公告也有各自的 revision，避免多个管理员互相覆盖。
+Settings 使用 revision 化的三段式 API：`GET /v1/admin/settings` 返回 schema、持久化值、运行时有效值和 revision；`POST /v1/admin/settings/validate` 在不写盘的情况下校验整组修改；`PATCH /v1/admin/settings` 要求相同的 `expectedRevision` 后才原子替换 `.env`；`POST /v1/admin/settings/unrecognized-keys/remove` 以同一 revision 删除遗留项，并拒绝任何仍被读取的键。并发修改返回 `SETTINGS_REVISION_CONFLICT`，前端会加载最新版本并保留待复核草稿。地图与公告也有各自的 revision，避免多个管理员互相覆盖。
 
-Settings 管理的 `.env` 是 Router 配置的唯一权威来源，启动时会覆盖进程中预先存在的同名变量，全部字段均可通过 Web 修改。热更新字段的运行值直接读取当前 `DynamicSettings`；绕过 API 手工修改 `.env` 时，页面会保留实际内存值并标记等待重启，不会把文件值误报为已生效。Secret 只返回是否已配置，API 从不返回明文；清除 Secret 必须使用显式操作。`.env` 与备份写入采用 `0600` 权限、临时文件 fsync 和同目录原子 rename，需要重启的字段保存后会持续显示 pending restart，直到新进程读取该值。
+Settings 管理的 `.env` 是 Router 配置的唯一权威来源，启动时会覆盖进程中预先存在的同名变量；除部署层（监听地址与文件路径）外的字段均可通过 Web 修改。热更新字段的运行值直接读取当前 `DynamicSettings`；绕过 API 手工修改 `.env` 时，页面会保留实际内存值并标记等待重启，不会把文件值误报为已生效。Secret 只返回是否已配置，API 从不返回明文；清除 Secret 必须使用显式操作。`.env` 与备份写入采用 `0600` 权限、临时文件 fsync 和同目录原子 rename，需要重启的字段保存后会持续显示 pending restart，直到新进程读取该值。
 
 配置契约由 Rust 单元测试和前端审计共同保护。修改 Settings 字段时需运行：
 

@@ -46,12 +46,11 @@ use crate::models::{
     ClientWebRequestEmailCodeRequest, ClientWebVerifyEmailCodeRequest, CountryBoard,
     CountryClientBoard, CountryMapPoint, CountryShareBoard, DashboardClientTunnelView,
     DashboardClientView, DashboardMap, DashboardMapPoint, DashboardPresenceRequest,
-    DashboardResponse, DashboardStats, DashboardTickerShare, DashboardUxEventRequest,
-    GatewayRegistryRecord, GatewayRequestObservation, GatewayRequestObservationBatch,
-    GatewayShareAppView, GatewayShareView, GetInstallationOwnerEmailQuery,
-    GetInstallationOwnerEmailResponse, HealthCheckEntry, HealthTimelineBucket,
-    ImageGenerationRequestLogEntry, Installation, InstallationHeartbeatRequest,
-    InstallationHeartbeatResponse, InstallationSetupCompletedPayload,
+    DashboardResponse, DashboardStats, DashboardTickerShare, GatewayRegistryRecord,
+    GatewayRequestObservation, GatewayRequestObservationBatch, GatewayShareAppView,
+    GatewayShareView, GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse,
+    HealthCheckEntry, HealthTimelineBucket, ImageGenerationRequestLogEntry, Installation,
+    InstallationHeartbeatRequest, InstallationHeartbeatResponse, InstallationSetupCompletedPayload,
     InstallationSetupCompletedRequest, InstallationSetupCompletedResponse,
     InstallationSetupCompletedStatus, InstallationUpgradeTaskReportPayload,
     InstallationUpgradeTaskReportRequest, InstallationUpgradeTaskReportResponse,
@@ -6870,72 +6869,6 @@ impl AppStore {
             )
             .map_err(|e| AppError::Internal(format!("count dashboard presence failed: {e}")))?;
         Ok(count as usize)
-    }
-
-    pub async fn record_dashboard_ux_event(
-        &self,
-        input: DashboardUxEventRequest,
-        retention_days: u32,
-    ) -> Result<(), AppError> {
-        const ALLOWED_EVENTS: &[&str] = &[
-            "dashboard_focus_set",
-            "dashboard_focus_clear",
-            "map_request_selected",
-            "client_located_from_map",
-            "share_located_from_request",
-            "market_located_from_share",
-            "drawer_opened",
-            "filter_applied",
-            "operation_submitted",
-            "operation_verified",
-        ];
-        let event_type = input.event_type.trim();
-        if !ALLOWED_EVENTS.contains(&event_type) {
-            return Err(AppError::BadRequest(
-                "unsupported dashboard UX event".into(),
-            ));
-        }
-        let source = input.source.as_deref().map(str::trim).filter(|value| {
-            matches!(
-                *value,
-                "map" | "client-board" | "market-table" | "drawer" | "activity"
-            )
-        });
-        let target_type = input
-            .target_type
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| matches!(*value, "request" | "client" | "share" | "market"));
-        let now = Utc::now();
-        let cutoff = now - Duration::days(i64::from(retention_days.clamp(1, 90)));
-        let conn = self.conn.lock().await;
-        conn.execute(
-            "INSERT INTO dashboard_ux_events (
-                id, event_type, source, target_type, step_count, elapsed_ms, keyboard, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                Uuid::new_v4().to_string(),
-                event_type,
-                source,
-                target_type,
-                input.step_count.map(|value| i64::from(value.min(100))),
-                input
-                    .elapsed_ms
-                    .map(|value| value.min(60 * 60 * 1000) as i64),
-                i64::from(input.keyboard),
-                now.to_rfc3339(),
-            ],
-        )
-        .map_err(|e| AppError::Internal(format!("record dashboard UX event failed: {e}")))?;
-        conn.execute(
-            "DELETE FROM dashboard_ux_events
-             WHERE created_at < ?1 OR id IN (
-               SELECT id FROM dashboard_ux_events ORDER BY created_at DESC LIMIT -1 OFFSET 10000
-             )",
-            params![cutoff.to_rfc3339()],
-        )
-        .map_err(|e| AppError::Internal(format!("prune dashboard UX events failed: {e}")))?;
-        Ok(())
     }
 
     pub async fn count_sent_emails_last_24h(&self) -> Result<usize, AppError> {
@@ -30026,8 +29959,6 @@ pub(crate) mod tests {
             verification_service_api_key: None,
             router_owner_email: None,
             admin_emails: HashSet::new(),
-            ux_telemetry_enabled: false,
-            ux_telemetry_retention_days: 7,
             footer_telegram_url: crate::config::DEFAULT_FOOTER_TELEGRAM_URL.to_string(),
             metrics: crate::config::MetricsConfig {
                 enabled: true,
@@ -51629,45 +51560,6 @@ pub(crate) mod tests {
                 .map(|reason| reason.code.as_str()),
             Some("route_offline")
         );
-
-        let _ = std::fs::remove_file(&config.database.path);
-    }
-
-    #[tokio::test]
-    async fn local_ux_telemetry_records_only_minimized_fields() {
-        let (store, config) = setup_store("dashboard-ux-telemetry").await;
-        store
-            .record_dashboard_ux_event(
-                DashboardUxEventRequest {
-                    event_type: "dashboard_focus_set".into(),
-                    source: Some("map".into()),
-                    target_type: Some("client".into()),
-                    step_count: Some(1),
-                    elapsed_ms: Some(25),
-                    keyboard: false,
-                },
-                7,
-            )
-            .await
-            .expect("record UX event");
-        let conn = store.conn.lock().await;
-        let row: (String, Option<String>, Option<String>, i64) = conn
-            .query_row(
-                "SELECT event_type, source, target_type, keyboard FROM dashboard_ux_events",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .expect("UX event row");
-        assert_eq!(
-            row,
-            (
-                "dashboard_focus_set".into(),
-                Some("map".into()),
-                Some("client".into()),
-                0
-            )
-        );
-        drop(conn);
 
         let _ = std::fs::remove_file(&config.database.path);
     }

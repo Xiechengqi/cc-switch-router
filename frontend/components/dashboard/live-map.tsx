@@ -3,7 +3,6 @@
 import * as React from "react";
 import { ChevronUp } from "lucide-react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { recordDashboardUxEvent } from "@/lib/api";
 import { useDashboardFocus } from "@/components/dashboard/dashboard-focus";
 import { useDashboardViewState } from "@/components/dashboard/dashboard-view-state";
 import { MapCountryTooltip } from "@/components/dashboard/map-country-tooltip";
@@ -590,7 +589,6 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
       const region = regionCodeFromMapCountry(country);
       if (!region) return;
       setRegionFilters([region]);
-      void recordDashboardUxEvent({ eventType: "filter_applied", source: "map", targetType: "client" });
     },
     [setRegionFilters],
   );

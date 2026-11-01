@@ -2,24 +2,28 @@
 
 import {
   AlertTriangle,
-  BadgeDollarSign,
+  Bell,
   CheckCircle2,
+  ChevronRight,
   CircleGauge,
   Database,
   Eye,
+  Globe,
+  HardDrive,
   KeyRound,
   Loader2,
   RefreshCw,
   RotateCcw,
   Save,
   Search,
-  Settings2,
   ShoppingBag,
+  Trash2,
   Wifi,
 } from "lucide-react";
 import { Alert, Button, Chip, Input, Switch, TextArea } from "@heroui/react";
 import * as React from "react";
 import { useAuth } from "@/components/auth/auth-provider";
+import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { CopyableCodeField } from "@/components/common/copyable-code-field";
 import { CompactSelect } from "@/components/common/compact-select";
 import { useLocaleText } from "@/components/i18n/locale-provider";
@@ -37,6 +41,7 @@ import {
   settingsFieldLabel,
   settingsFieldPlaceholder,
   settingsGroupLabel,
+  settingsSectionLabel,
   settingsValueSource,
 } from "@/lib/settings-i18n";
 import {
@@ -44,6 +49,7 @@ import {
   getMapDisplay,
   getProvisionSshKey,
   getSettings,
+  removeUnrecognizedSettingsKeys,
   saveSettings,
   updateMapDisplay,
   validateClientServerRelease,
@@ -60,25 +66,17 @@ import type {
   ClientServerReleaseValidation,
   ProvisionSshKey,
   SettingValueEntry,
-  SettingsCategory,
   SettingsCategoryId,
   SettingsField,
+  SettingsPanelId,
+  SettingsSection,
   SettingsSnapshot,
 } from "@/lib/types";
 
 type DirtyValue = string | boolean | null;
-type ActiveSection = "overview" | "model_prices" | SettingsCategoryId;
+type ActiveCategory = "overview" | SettingsCategoryId;
 type Banner = { kind: "default" | "success" | "destructive" | "warning"; text: string };
-type SettingsPanel = "map" | "announcement" | "channel_health" | "provision_key" | "market_finance";
-type SettingsSubsection = {
-  id: string;
-  label: string;
-  groups?: string[];
-  panel?: SettingsPanel;
-  channel?: "email" | "telegram" | "bark";
-  fieldCount?: number;
-  dirtyCount: number;
-};
+type Translate = ReturnType<typeof useLocaleText>["t"];
 
 type ClientServerReleaseCheck = {
   release: string;
@@ -94,67 +92,42 @@ type ClientServerReleaseCheck = {
   result?: ClientServerReleaseValidation;
 };
 
-const ROUTER_MANAGED_BARK_FIELDS = new Set([
-  "CC_SWITCH_ROUTER_BARK_CREDENTIAL_MASTER_KEY",
-  "CC_SWITCH_ROUTER_BARK_CREDENTIAL_KEY_VERSION",
-  "CC_SWITCH_ROUTER_BARK_RECIPIENT_HOURLY_LIMIT",
-  "CC_SWITCH_ROUTER_BARK_GLOBAL_HOURLY_LIMIT",
-]);
-
 const CLIENT_SERVER_RELEASE_KEY = "CC_SWITCH_ROUTER_CLIENT_SERVER_RELEASE";
-
-const PANEL_SUBSECTION_IDS: Record<SettingsPanel, string> = {
-  map: "panel:map",
-  announcement: "panel:announcement",
-  channel_health: "panel:channel_health",
-  provision_key: "panel:provision_key",
-  market_finance: "panel:market_finance",
-};
-
-const NOTIFICATION_SUBSECTION_IDS = {
-  system: "notifications:system",
-  business: "notifications:business",
-  email: "notifications:email",
-  telegram: "notifications:telegram",
-  bark: "notifications:bark",
-} as const;
-
-const LEGACY_NOTIFICATION_CHANNELS_SUBSECTION = "notifications:channels";
-
-const NOTIFICATION_SUBSECTION_GROUPS = {
-  system: ["Alerting"],
-  business: ["Client notifications"],
-  email: ["Email (Resend)"],
-  telegram: ["Telegram bot", "Telegram alerts"],
-  bark: ["Bark alerts", "Bark channel"],
-} as const;
+// Wallet links from the Share market and C2C seller pages land on this tab.
+const LEGACY_PANEL_SECTIONS: Record<string, string> = { market_finance: "wallet_payments" };
+const MAP_SECTION = "map";
 
 const CATEGORY_ICONS: Record<SettingsCategoryId, React.ComponentType<{ className?: string }>> = {
-  general_display: Settings2,
-  connectivity: Wifi,
-  data_lifecycle: Database,
-  identity_security: KeyRound,
-  notifications: CheckCircle2,
-  observability: CircleGauge,
+  site_access: Globe,
+  accounts_security: KeyRound,
   marketplace: ShoppingBag,
+  notifications: Bell,
+  monitoring: CircleGauge,
+  data_retention: Database,
+  connectivity: Wifi,
+  deployment: HardDrive,
 };
 
 type SettingsNavigation = {
-  activeSection: ActiveSection;
-  activeSubsections: Partial<Record<SettingsCategoryId, string>>;
+  activeCategory: ActiveCategory;
+  activeSections: Partial<Record<SettingsCategoryId, string>>;
 };
 
 function settingsNavigation(value: unknown): SettingsNavigation {
   const saved = value && typeof value === "object" ? value as Partial<SettingsNavigation> : {};
-  const section = saved.activeSection;
-  const activeSection = typeof section === "string" && (
-    section === "overview" || section === "model_prices" || Object.hasOwn(CATEGORY_ICONS, section)
-  ) ? section as ActiveSection : "overview";
-  const activeSubsections = saved.activeSubsections && typeof saved.activeSubsections === "object"
-    ? Object.fromEntries(Object.entries(saved.activeSubsections).filter(([category, id]) =>
-      Object.hasOwn(CATEGORY_ICONS, category) && typeof id === "string"))
+  const category = saved.activeCategory;
+  const activeCategory = typeof category === "string" && (category === "overview" || Object.hasOwn(CATEGORY_ICONS, category))
+    ? category as ActiveCategory
+    : "overview";
+  const activeSections = saved.activeSections && typeof saved.activeSections === "object"
+    ? Object.fromEntries(Object.entries(saved.activeSections).filter(([key, id]) =>
+      Object.hasOwn(CATEGORY_ICONS, key) && typeof id === "string"))
     : {};
-  return { activeSection, activeSubsections };
+  return { activeCategory, activeSections };
+}
+
+function isVisible(field: SettingsField) {
+  return field.tier !== "managed";
 }
 
 export function SettingsPage() {
@@ -162,27 +135,12 @@ export function SettingsPage() {
   const { t } = useLocaleText();
   const [snapshot, setSnapshot] = React.useState<SettingsSnapshot | null>(null);
   const [savedNavigation, setSavedNavigation, navigationReady] = usePersistentState<unknown>(
-    "cc_switch_router_settings_navigation_v1", null,
+    "cc_switch_router_settings_navigation_v2", null,
   );
-  const { activeSection, activeSubsections } = settingsNavigation(savedNavigation);
-  // An explicit wallet-settings link takes precedence over the cached group,
-  // once per navigation. Subsequent tab choices remain user-owned.
+  const { activeCategory, activeSections } = settingsNavigation(savedNavigation);
+  // A deep link (`?section=` or the older `?panel=`) wins over the remembered
+  // tab once, after the schema is known; later choices stay user-owned.
   const deepLinkApplied = React.useRef(false);
-  React.useEffect(() => {
-    if (!navigationReady || deepLinkApplied.current) return;
-    deepLinkApplied.current = true;
-    const url = new URL(window.location.href);
-    if (url.searchParams.get("panel") === "market_finance") {
-      setSavedNavigation((current: unknown) => {
-        const navigation = settingsNavigation(current);
-        return { ...navigation, activeSection: "marketplace", activeSubsections: { ...navigation.activeSubsections, marketplace: PANEL_SUBSECTION_IDS.market_finance } };
-      });
-      // Consume the shortcut so a later refresh restores the user's newest
-      // section choice instead of applying the old shortcut a second time.
-      url.searchParams.delete("panel");
-      window.history.replaceState(window.history.state, "", url.pathname + url.search + url.hash);
-    }
-  }, [navigationReady, setSavedNavigation]);
   const [query, setQuery] = React.useState("");
   const [dirty, setDirty] = React.useState<Record<string, DirtyValue>>({});
   const [fieldErrors, setFieldErrors] = React.useState<Record<string, string[]>>({});
@@ -196,11 +154,15 @@ export function SettingsPage() {
   const [provisionError, setProvisionError] = React.useState("");
   const [settingsRevision, setSettingsRevision] = React.useState(0);
   const [pendingRevealKey, setPendingRevealKey] = React.useState("");
+  const [expandedGroups, setExpandedGroups] = React.useState<Set<string>>(() => new Set());
+  // Panels mount on first visit and stay mounted while their category is open,
+  // so unsaved panel drafts survive tab switches without loading every panel.
+  const [visitedSections, setVisitedSections] = React.useState<Set<string>>(() => new Set());
   const [clientServerReleaseCheck, setClientServerReleaseCheck] = React.useState<ClientServerReleaseCheck>({
     release: "",
     phase: "idle",
   });
-  const subsectionPanelId = React.useId().replaceAll(":", "");
+  const sectionPanelId = React.useId().replaceAll(":", "");
 
   const isAdmin = !!session?.isAdmin;
   const mapDirty = !sameMapDisplaySettings(mapDraft, mapSaved);
@@ -275,6 +237,27 @@ export function SettingsPage() {
   }, [isAdmin, loadMap, loadProvisionKey, loadSettings]);
 
   React.useEffect(() => {
+    if (!navigationReady || !snapshot || deepLinkApplied.current) return;
+    deepLinkApplied.current = true;
+    const url = new URL(window.location.href);
+    const panel = url.searchParams.get("panel");
+    const requested = url.searchParams.get("section") || (panel ? LEGACY_PANEL_SECTIONS[panel] : null);
+    const target = snapshot.schema.sections.find((section) => section.id === requested);
+    if (!target) return;
+    setSavedNavigation((current: unknown) => {
+      const navigation = settingsNavigation(current);
+      return {
+        activeCategory: target.category,
+        activeSections: { ...navigation.activeSections, [target.category]: target.id },
+      };
+    });
+    // Consume the shortcut so a refresh restores the newest choice instead.
+    url.searchParams.delete("panel");
+    url.searchParams.delete("section");
+    window.history.replaceState(window.history.state, "", url.pathname + url.search + url.hash);
+  }, [navigationReady, setSavedNavigation, snapshot]);
+
+  React.useEffect(() => {
     if (!isAdmin || !clientServerReleaseField) {
       setClientServerReleaseCheck({ release: "", phase: "idle" });
       return;
@@ -321,7 +304,20 @@ export function SettingsPage() {
     if (!node) return;
     node.scrollIntoView({ block: "center", behavior: "smooth" });
     setPendingRevealKey("");
-  }, [pendingRevealKey, activeSection, activeSubsections, snapshot]);
+  }, [pendingRevealKey, activeCategory, activeSections, snapshot, expandedGroups]);
+
+  const schema = snapshot?.schema;
+  const categorySections = activeCategory === "overview"
+    ? []
+    : (schema?.sections || []).filter((section) => section.category === activeCategory);
+  const activeSection = categorySections.find((section) => section.id === activeSections[activeCategory as SettingsCategoryId])
+    || categorySections[0];
+  const activeSectionId = activeSection?.id;
+
+  React.useEffect(() => {
+    if (!activeSectionId) return;
+    setVisitedSections((current) => current.has(activeSectionId) ? current : new Set(current).add(activeSectionId));
+  }, [activeSectionId]);
 
   if (loading || (isAdmin && !navigationReady)) {
     return <main className="mx-auto w-[calc(100%-2rem)] max-w-7xl py-12 text-muted-foreground">{t("common.loadingSession")}</main>;
@@ -336,27 +332,11 @@ export function SettingsPage() {
     );
   }
 
-  const schema = snapshot?.schema;
-  const settingsFields = (schema?.fields || []).filter((field) => !ROUTER_MANAGED_BARK_FIELDS.has(field.key));
+  const visibleSchemaFields = (schema?.fields || []).filter(isVisible);
   const normalizedQuery = query.trim().toLocaleLowerCase();
-  const activeCategory = activeSection === "overview" || activeSection === "model_prices"
-    ? undefined
-    : activeSection;
-  const categoryFields = settingsFields.filter((field) => field.category === activeCategory);
-  const subsections = activeCategory
-    ? buildSettingsSubsections(activeCategory, categoryFields, values, dirty, mapDirty, t)
-    : [];
-  const requestedSubsection = activeCategory
-    ? (activeCategory === "notifications"
-      ? normalizeNotificationSubsectionId(activeSubsections[activeCategory])
-      : activeSubsections[activeCategory])
-    : undefined;
-  const activeSubsection = subsections.find((item) => item.id === requestedSubsection) || subsections[0];
-  const activeSubsectionIndex = Math.max(0, subsections.findIndex((item) => item.id === activeSubsection?.id));
-  const matchingFields = settingsFields.filter((field) => {
-    if (!normalizedQuery) {
-      return !!activeSubsection?.groups?.includes(field.group) && field.category === activeCategory;
-    }
+  const searching = !!normalizedQuery;
+  const matchingFields = visibleSchemaFields.filter((field) => {
+    if (!searching) return !!activeSection?.groups.includes(field.group);
     return [
       field.key,
       settingsFieldLabel(t, field),
@@ -364,11 +344,13 @@ export function SettingsPage() {
       settingsGroupLabel(t, field.group),
     ].some((value) => value.toLocaleLowerCase().includes(normalizedQuery));
   });
-  const visibleFields = matchingFields.filter((field) => dependenciesSatisfied(field, schema?.fields || [], values, dirty));
-  const groupedFields = groupFields(visibleFields, activeSubsection?.groups);
-  const keepGeneralPanelsMounted = activeSection === "general_display";
-  const keepProvisionKeyMounted = activeSection === "marketplace";
-  const keepChannelHealthMounted = activeSection === "notifications";
+  const shownFields = matchingFields.filter((field) => dependenciesSatisfied(field, schema?.fields || [], values, dirty));
+  const groupedFields = groupFields(shownFields, searching ? undefined : activeSection?.groups);
+  const category = schema?.categories.find((item) => item.id === activeCategory);
+  const panelsToMount = categorySections.flatMap((section) =>
+    visitedSections.has(section.id) || section.id === activeSectionId
+      ? section.panels.map((panel) => ({ section, panel }))
+      : []);
 
   return (
     <main className="settings-surface mx-auto grid w-[calc(100%-2rem)] max-w-7xl gap-5 pb-10 text-foreground">
@@ -377,22 +359,10 @@ export function SettingsPage() {
           <h1 className="font-display text-3xl">{t("settings.title")}</h1>
           <p className="mt-2 max-w-3xl text-sm text-muted-foreground">{t("settings.workspaceDescription")}</p>
         </div>
-        <div className={`flex flex-wrap justify-end gap-2 ${activeSection === "model_prices" ? "hidden" : ""}`}>
-          <Button variant="outline" onClick={resetDraft} isDisabled={!!busy || dirtyCount === 0}>
-            <RotateCcw className="h-4 w-4" />
-            {t("common.reset")}
-          </Button>
+        <div className="flex flex-wrap justify-end gap-2">
           <Button variant="outline" onClick={() => reloadAll()} isDisabled={!!busy}>
             {busy === "load" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
             {t("common.reload")}
-          </Button>
-          <Button
-            variant="primary"
-            onClick={() => void submit()}
-            isDisabled={!!busy || dirtyCount === 0 || !snapshot || !clientServerReleaseReady}
-          >
-            {busy === "save" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
-            {dirtyCount ? t("common.saveWithCount", { count: dirtyCount }) : t("common.save")}
           </Button>
         </div>
       </header>
@@ -402,7 +372,7 @@ export function SettingsPage() {
         <Alert status="warning" className="!text-slate-900">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <span>{t("settings.pendingRestart", { count: snapshot.pendingRestartKeys.length })}</span>
-            {activeSection !== "overview" || normalizedQuery ? (
+            {activeCategory !== "overview" || searching ? (
               <Button size="sm" variant="ghost" onClick={() => selectCategory("overview")}>
                 {t("settings.pendingRestartOpenOverview")}
               </Button>
@@ -415,36 +385,30 @@ export function SettingsPage() {
         <aside className="h-fit rounded-md bg-muted/35 p-2 lg:sticky lg:top-4">
           <nav aria-label={t("settings.categoriesAria")} className="grid gap-1">
             <SettingsNavButton
-              active={activeSection === "overview" && !normalizedQuery}
+              active={activeCategory === "overview" && !searching}
               label={t("settings.overview")}
               count={dirtyCount || undefined}
               icon={Eye}
               onClick={() => selectCategory("overview")}
             />
-            {(schema?.categories || []).map((category) => (
+            {(schema?.categories || []).map((item) => (
               <SettingsNavButton
-                key={category.id}
-                active={activeSection === category.id && !normalizedQuery}
-                label={settingsCategoryLabel(t, category)}
+                key={item.id}
+                active={activeCategory === item.id && !searching}
+                label={settingsCategoryLabel(t, item)}
                 count={(
-                  categoryDirtyCount(category.id, settingsFields, dirty)
-                  + (category.id === "general_display" && mapDirty ? 1 : 0)
+                  categoryDirtyCount(item.id, visibleSchemaFields, dirty)
+                  + (mapDirty && schema?.sections.some((section) => section.category === item.id && section.id === MAP_SECTION) ? 1 : 0)
                 ) || undefined}
-                icon={CATEGORY_ICONS[category.id]}
-                onClick={() => selectCategory(category.id)}
+                icon={CATEGORY_ICONS[item.id]}
+                onClick={() => selectCategory(item.id)}
               />
             ))}
-            <SettingsNavButton
-              active={activeSection === "model_prices"}
-              label={t("settings.modelPrices.nav")}
-              icon={BadgeDollarSign}
-              onClick={() => { setActiveSection("model_prices"); setQuery(""); }}
-            />
           </nav>
         </aside>
 
         <div className="min-w-0">
-          <div className={`relative mb-5 ${activeSection === "model_prices" ? "hidden" : ""}`}>
+          <div className="relative mb-5">
             <Search className="pointer-events-none absolute left-3 top-1/2 z-10 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
             <Input
               aria-label={t("settings.search")}
@@ -455,144 +419,163 @@ export function SettingsPage() {
             />
           </div>
 
-          {activeSection === "model_prices" ? (
-            <ModelPricesPanel />
-          ) : !snapshot && busy === "load" ? (
+          {!snapshot && busy === "load" ? (
             <div className="flex min-h-64 items-center justify-center gap-2 text-sm text-muted-foreground">
               <Loader2 className="h-4 w-4 animate-spin" />
               {t("settings.loading")}
             </div>
-          ) : activeSection === "overview" && !normalizedQuery ? (
+          ) : activeCategory === "overview" && !searching ? (
             <SettingsOverview
               snapshot={snapshot}
               dirtyCount={dirtyCount}
               onSelect={selectCategory}
               onRevealField={revealField}
+              onRemoveUnrecognized={removeUnrecognized}
+              removing={busy === "remove"}
             />
           ) : (
             <div className="grid gap-8">
               <div>
                 <h2 className="font-display text-2xl">
-                  {normalizedQuery
-                    ? t("settings.searchResults")
-                    : settingsCategoryLabel(t, schema?.categories.find((item) => item.id === activeSection))}
+                  {searching ? t("settings.searchResults") : settingsCategoryLabel(t, category)}
                 </h2>
                 <p className="mt-2 text-sm text-muted-foreground">
-                  {normalizedQuery
-                    ? t("settings.searchResultCount", { count: visibleFields.length })
-                    : settingsCategoryDescription(t, schema?.categories.find((item) => item.id === activeSection))}
+                  {searching
+                    ? t("settings.searchResultCount", { count: shownFields.length })
+                    : settingsCategoryDescription(t, category)}
                 </p>
               </div>
 
-              {!normalizedQuery && activeCategory && subsections.length ? (
+              {!searching && activeCategory === "deployment" && snapshot ? (
+                <Alert status="default">{t("settings.deployment.notice", { path: snapshot.envPath })}</Alert>
+              ) : null}
+
+              {!searching && categorySections.length > 1 ? (
                 <SettingsSubnav
-                  items={subsections}
-                  value={activeSubsection?.id || ""}
-                  panelId={subsectionPanelId}
-                  onChange={(id) => selectSubsection(activeCategory, id)}
+                  sections={categorySections}
+                  value={activeSectionId || ""}
+                  panelId={sectionPanelId}
+                  fields={visibleSchemaFields}
+                  values={values}
+                  dirty={dirty}
+                  mapDirty={mapDirty}
+                  onChange={(id) => selectSection(activeCategory as SettingsCategoryId, id)}
                 />
               ) : null}
 
               <div
-                id={!normalizedQuery && activeCategory ? subsectionPanelId : undefined}
-                role={!normalizedQuery && activeCategory ? "tabpanel" : undefined}
-                aria-labelledby={!normalizedQuery && activeCategory ? `${subsectionPanelId}-tab-${activeSubsectionIndex}` : undefined}
+                id={!searching ? sectionPanelId : undefined}
+                role={!searching && categorySections.length > 1 ? "tabpanel" : undefined}
+                aria-labelledby={!searching && categorySections.length > 1
+                  ? `${sectionPanelId}-tab-${Math.max(0, categorySections.findIndex((section) => section.id === activeSectionId))}`
+                  : undefined}
                 className="grid gap-8"
               >
                 {groupedFields.map(([group, fields]) => (
-                  <section key={group} className="grid gap-4">
-                    <div className="flex flex-wrap items-center justify-between gap-2 px-1">
-                      <h3 className="text-lg font-semibold">{settingsGroupLabel(t, group)}</h3>
-                      <span className="text-xs tabular-nums text-muted-foreground">{t("settings.fieldCount", { count: fields.length })}</span>
-                    </div>
-                    <div className="grid gap-1 rounded-md bg-muted/30 p-1">
-                      {fields.map((field) => (
-                        <SettingsFieldRow
-                          key={field.key}
-                          field={field}
-                          entry={values[field.key]}
-                          value={dirtyValue(field, values[field.key], dirty)}
-                          dirty={Object.prototype.hasOwnProperty.call(dirty, field.key)}
-                          errors={fieldErrors[field.key] || []}
-                          clientServerReleaseCheck={field.key === CLIENT_SERVER_RELEASE_KEY
-                            ? clientServerReleaseCheck
-                            : undefined}
-                          t={t}
-                          onChange={(value) => updateDirty(field, value)}
-                        />
-                      ))}
-                    </div>
-                  </section>
+                  <SettingsGroup
+                    key={group}
+                    group={group}
+                    fields={fields}
+                    flatten={searching}
+                    expanded={expandedGroups.has(group)}
+                    onToggle={() => toggleGroup(group)}
+                    renderField={(field) => (
+                      <SettingsFieldRow
+                        key={field.key}
+                        field={field}
+                        entry={values[field.key]}
+                        value={dirtyValue(field, values[field.key], dirty)}
+                        dirty={Object.prototype.hasOwnProperty.call(dirty, field.key)}
+                        errors={fieldErrors[field.key] || []}
+                        clientServerReleaseCheck={field.key === CLIENT_SERVER_RELEASE_KEY
+                          ? clientServerReleaseCheck
+                          : undefined}
+                        t={t}
+                        onChange={(value) => updateDirty(field, value)}
+                      />
+                    )}
+                    dirty={dirty}
+                    fieldErrors={fieldErrors}
+                  />
                 ))}
 
-                {!visibleFields.length && normalizedQuery ? (
+                {!shownFields.length && searching ? (
                   <div className="rounded-md bg-muted/30 py-14 text-center text-sm text-muted-foreground">{t("settings.noSearchResults")}</div>
                 ) : null}
 
-                {keepGeneralPanelsMounted ? (
-                  <div hidden={!!normalizedQuery || activeSubsection?.panel !== "map"}>
-                    <MapDisplayPanel
-                      canEdit
-                      value={mapDraft}
-                      onChange={setMapDraft}
-                      dirty={mapDirty}
-                      loading={mapLoading}
-                    />
-                    {mapError ? <Alert status="danger">{mapError}</Alert> : null}
+                {panelsToMount.map(({ section, panel }) => (
+                  <div key={`${section.id}:${panel}`} hidden={searching || section.id !== activeSectionId}>
+                    {renderPanel(panel)}
                   </div>
-                ) : null}
-
-                {keepGeneralPanelsMounted ? (
-                  <div hidden={!!normalizedQuery || activeSubsection?.panel !== "announcement"}>
-                    <AnnouncementPanel />
-                  </div>
-                ) : null}
-
-                {keepProvisionKeyMounted ? (
-                  <div hidden={!!normalizedQuery || activeSubsection?.panel !== "provision_key"}>
-                    <ProvisionKeyPanel value={provisionSshKey} error={provisionError} />
-                  </div>
-                ) : null}
-
-                {keepProvisionKeyMounted ? (
-                  <div hidden={!!normalizedQuery || activeSubsection?.panel !== "market_finance"}>
-                    <MarketPaymentChannelsPanel />
-                  </div>
-                ) : null}
-
-                {keepChannelHealthMounted ? (
-                  <>
-                    <div hidden={!!normalizedQuery || activeSubsection?.channel !== "email"}>
-                      <EmailChannelPanel
-                        refreshToken={settingsRevision}
-                        apiKeyConfigured={!!values.CC_SWITCH_ROUTER_RESEND_API_KEY?.hasValue}
-                        fromConfigured={
-                          !!(values.CC_SWITCH_ROUTER_RESEND_FROM?.hasValue
-                            || values.CC_SWITCH_ROUTER_RESEND_FROM?.effectiveHasValue)
-                        }
-                        pendingRestart={
-                          !!values.CC_SWITCH_ROUTER_RESEND_API_KEY?.pendingRestart
-                          || !!values.CC_SWITCH_ROUTER_RESEND_FROM?.pendingRestart
-                          || !!values.CC_SWITCH_ROUTER_RESEND_FROM_NAME?.pendingRestart
-                          || !!values.CC_SWITCH_ROUTER_RESEND_REPLY_TO?.pendingRestart
-                        }
-                      />
-                    </div>
-                    <div hidden={!!normalizedQuery || activeSubsection?.channel !== "telegram"}>
-                      <AlertChannelsPanel channel="telegram" refreshToken={settingsRevision} />
-                    </div>
-                    <div hidden={!!normalizedQuery || activeSubsection?.channel !== "bark"}>
-                      <AlertChannelsPanel channel="bark" refreshToken={settingsRevision} />
-                    </div>
-                  </>
-                ) : null}
+                ))}
               </div>
             </div>
           )}
         </div>
       </section>
+
+      {dirtyCount ? (
+        <div className="sticky bottom-4 z-20 flex flex-wrap items-center justify-between gap-3 rounded-md border bg-background/95 px-4 py-3 shadow-lg backdrop-blur">
+          <span className="text-sm font-medium text-amber-700">{t("settings.unsavedChanges", { count: dirtyCount })}</span>
+          <div className="flex flex-wrap gap-2">
+            <Button variant="outline" onClick={resetDraft} isDisabled={!!busy}>
+              <RotateCcw className="h-4 w-4" />
+              {t("common.reset")}
+            </Button>
+            <Button
+              variant="primary"
+              onClick={() => void submit()}
+              isDisabled={!!busy || !snapshot || !clientServerReleaseReady}
+            >
+              {busy === "save" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+              {t("common.saveWithCount", { count: dirtyCount })}
+            </Button>
+          </div>
+        </div>
+      ) : null}
     </main>
   );
+
+  function renderPanel(panel: SettingsPanelId) {
+    switch (panel) {
+      case "map_display":
+        return (
+          <>
+            <MapDisplayPanel canEdit value={mapDraft} onChange={setMapDraft} dirty={mapDirty} loading={mapLoading} />
+            {mapError ? <Alert status="danger">{mapError}</Alert> : null}
+          </>
+        );
+      case "announcement":
+        return <InstantPanel><AnnouncementPanel /></InstantPanel>;
+      case "provision_key":
+        return <ProvisionKeyPanel value={provisionSshKey} error={provisionError} />;
+      case "model_prices":
+        return <InstantPanel><ModelPricesPanel /></InstantPanel>;
+      case "market_finance":
+        return <InstantPanel><MarketPaymentChannelsPanel /></InstantPanel>;
+      case "email_health":
+        return (
+          <EmailChannelPanel
+            refreshToken={settingsRevision}
+            apiKeyConfigured={!!values.CC_SWITCH_ROUTER_RESEND_API_KEY?.hasValue}
+            fromConfigured={
+              !!(values.CC_SWITCH_ROUTER_RESEND_FROM?.hasValue
+                || values.CC_SWITCH_ROUTER_RESEND_FROM?.effectiveHasValue)
+            }
+            pendingRestart={
+              !!values.CC_SWITCH_ROUTER_RESEND_API_KEY?.pendingRestart
+              || !!values.CC_SWITCH_ROUTER_RESEND_FROM?.pendingRestart
+              || !!values.CC_SWITCH_ROUTER_RESEND_FROM_NAME?.pendingRestart
+              || !!values.CC_SWITCH_ROUTER_RESEND_REPLY_TO?.pendingRestart
+            }
+          />
+        );
+      case "telegram_health":
+        return <AlertChannelsPanel channel="telegram" refreshToken={settingsRevision} />;
+      case "bark_health":
+        return <AlertChannelsPanel channel="bark" refreshToken={settingsRevision} />;
+    }
+  }
 
   function updateDirty(field: SettingsField, value: DirtyValue) {
     setFieldErrors((current) => {
@@ -611,31 +594,32 @@ export function SettingsPage() {
     });
   }
 
-  function selectCategory(category: ActiveSection) {
-    setActiveSection(category);
+  function toggleGroup(group: string) {
+    setExpandedGroups((current) => {
+      const next = new Set(current);
+      if (!next.delete(group)) next.add(group);
+      return next;
+    });
+  }
+
+  function selectCategory(next: ActiveCategory) {
+    setSavedNavigation((current: unknown) => ({ ...settingsNavigation(current), activeCategory: next }));
     setQuery("");
   }
 
-  function setActiveSection(section: ActiveSection) {
-    setSavedNavigation((current: unknown) => ({ ...settingsNavigation(current), activeSection: section }));
-  }
-
-  function selectSubsection(category: SettingsCategoryId, id: string) {
+  function selectSection(categoryId: SettingsCategoryId, id: string) {
     setSavedNavigation((current: unknown) => {
       const navigation = settingsNavigation(current);
       return {
-        ...navigation,
-        activeSubsections: {
-          ...navigation.activeSubsections,
-          [category]: category === "notifications" ? normalizeNotificationSubsectionId(id) || id : id,
-        },
+        activeCategory: categoryId,
+        activeSections: { ...navigation.activeSections, [categoryId]: id },
       };
     });
   }
 
   function revealField(field: SettingsField) {
-    setActiveSection(field.category);
-    selectSubsection(field.category, subsectionIdForField(field));
+    selectSection(field.category, field.section);
+    if (field.tier === "advanced") setExpandedGroups((current) => new Set(current).add(field.group));
     setQuery("");
     setPendingRevealKey(field.key);
   }
@@ -657,6 +641,33 @@ export function SettingsPage() {
     void loadSettings();
     void loadMap();
     void loadProvisionKey();
+  }
+
+  async function removeUnrecognized(keys: string[]) {
+    if (!snapshot) return;
+    setBusy("remove");
+    setBanner(null);
+    // Refresh the snapshot without discarding field edits still in the draft.
+    const refresh = async () => {
+      const latest = await getSettings();
+      setSnapshot(latest);
+      setDirty((current) => reconcileDirty(latest, current));
+      setSettingsRevision((revision) => revision + 1);
+    };
+    try {
+      const result = await removeUnrecognizedSettingsKeys(snapshot.revision, keys);
+      await refresh().catch(() => undefined);
+      setBanner({ kind: "success", text: t("settings.unrecognized.removed", { count: result.removedKeys.length }) });
+    } catch (cause) {
+      if (cause instanceof ApiError && cause.code === "SETTINGS_REVISION_CONFLICT") {
+        await refresh().catch(() => undefined);
+        setBanner({ kind: "warning", text: t("settings.revisionConflict") });
+      } else {
+        setBanner({ kind: "destructive", text: errorMessage(cause) });
+      }
+    } finally {
+      setBusy("");
+    }
   }
 
   async function submit() {
@@ -734,8 +745,8 @@ export function SettingsPage() {
           setMapSaved(latest);
           setMapDraft(rebaseMapDisplaySettings(latest, mapSaved, mapDraft));
           setMapError("");
-          setActiveSection("general_display");
-          selectSubsection("general_display", PANEL_SUBSECTION_IDS.map);
+          const mapSection = snapshot.schema.sections.find((section) => section.id === MAP_SECTION);
+          if (mapSection) selectSection(mapSection.category, mapSection.id);
           setQuery("");
           setBanner({
             kind: "warning",
@@ -776,20 +787,102 @@ export function SettingsPage() {
   }
 }
 
+/** Marks a panel that saves through its own controls, not the save bar. */
+function InstantPanel({ children }: { children: React.ReactNode }) {
+  const { t } = useLocaleText();
+  return (
+    <div className="grid gap-4">
+      <p className="text-xs text-muted-foreground">{t("settings.instantPanel")}</p>
+      {children}
+    </div>
+  );
+}
+
+function SettingsGroup({
+  group,
+  fields,
+  flatten,
+  expanded,
+  onToggle,
+  renderField,
+  dirty,
+  fieldErrors,
+}: {
+  group: string;
+  fields: SettingsField[];
+  /** Search results list every match; the advanced fold only organizes browsing. */
+  flatten: boolean;
+  expanded: boolean;
+  onToggle: () => void;
+  renderField: (field: SettingsField) => React.ReactNode;
+  dirty: Record<string, DirtyValue>;
+  fieldErrors: Record<string, string[]>;
+}) {
+  const { t } = useLocaleText();
+  const advancedId = React.useId();
+  const primary = flatten ? fields : fields.filter((field) => field.tier !== "advanced");
+  const advanced = flatten ? [] : fields.filter((field) => field.tier === "advanced");
+  const advancedDirty = advanced.filter((field) => Object.prototype.hasOwnProperty.call(dirty, field.key)).length;
+  // A changed or failing field is never hidden behind the fold.
+  const open = expanded || advanced.some((field) => fieldErrors[field.key]?.length) || advancedDirty > 0;
+  return (
+    <section className="grid gap-4">
+      <div className="flex flex-wrap items-center justify-between gap-2 px-1">
+        <h3 className="text-lg font-semibold">{settingsGroupLabel(t, group)}</h3>
+        <span className="text-xs tabular-nums text-muted-foreground">{t("settings.fieldCount", { count: fields.length })}</span>
+      </div>
+      <div className="grid gap-1 rounded-md bg-muted/30 p-1">
+        {primary.map(renderField)}
+        {advanced.length ? (
+          <>
+            <button
+              type="button"
+              aria-expanded={open}
+              aria-controls={advancedId}
+              onClick={onToggle}
+              className="flex min-h-11 w-full flex-wrap items-center gap-x-3 gap-y-1 rounded-sm px-4 py-2 text-left text-sm transition-colors hover:bg-background/75"
+            >
+              <ChevronRight className={`h-4 w-4 shrink-0 text-muted-foreground transition-transform ${open ? "rotate-90" : ""}`} />
+              <span className="font-medium">{t("settings.tier.advanced", { count: advanced.length })}</span>
+              {advancedDirty ? <span className="text-xs font-medium text-amber-700">{t("settings.changedFieldCount", { count: advancedDirty })}</span> : null}
+              <span className="text-xs text-muted-foreground">{t("settings.tier.advancedHint")}</span>
+            </button>
+            <div id={advancedId} hidden={!open} className="grid gap-1">
+              {advanced.map(renderField)}
+            </div>
+          </>
+        ) : null}
+      </div>
+    </section>
+  );
+}
+
 function SettingsOverview({
   snapshot,
   dirtyCount,
   onSelect,
   onRevealField,
+  onRemoveUnrecognized,
+  removing,
 }: {
   snapshot: SettingsSnapshot | null;
   dirtyCount: number;
   onSelect: (category: SettingsCategoryId) => void;
   onRevealField: (field: SettingsField) => void;
+  onRemoveUnrecognized: (keys: string[]) => Promise<void>;
+  removing: boolean;
 }) {
   const { t } = useLocaleText();
+  const [confirmOpen, setConfirmOpen] = React.useState(false);
   if (!snapshot) return null;
   const valuesByKey = Object.fromEntries(snapshot.values.map((entry) => [entry.key, entry]));
+  const visibleFields = snapshot.schema.fields.filter(isVisible);
+  // The admin UI writes every key to the env file, so "saved" says little;
+  // what an operator wants to know is how much differs from the defaults.
+  const customized = visibleFields.filter((field) => {
+    const value = valuesByKey[field.key]?.value?.trim();
+    return !!value && value !== (field.default ?? "");
+  }).length;
   const pendingItems = snapshot.pendingRestartKeys.flatMap((key) => {
     const field = snapshot.schema.fields.find((candidate) => candidate.key === key);
     if (!field) return [];
@@ -801,17 +894,48 @@ function SettingsOverview({
     if (group) return group;
     return settingsFieldLabel(t, left.field).localeCompare(settingsFieldLabel(t, right.field), undefined, { sensitivity: "base" });
   });
+  const unrecognized = snapshot.unrecognizedKeys;
   return (
     <div className="grid gap-7">
-      <section className="grid rounded-md bg-muted/35 sm:grid-cols-2">
-        <OverviewStat
-          label={t("settings.configuredFields")}
-          value={snapshot.schema.fields.filter((field) => !ROUTER_MANAGED_BARK_FIELDS.has(field.key)).length}
-        />
+      <section className="grid rounded-md bg-muted/35 sm:grid-cols-3">
+        <OverviewStat label={t("settings.configuredFields")} value={visibleFields.length} />
+        <OverviewStat label={t("settings.customizedFields")} value={customized} />
         <OverviewStat label={t("settings.pendingRestartLabel")} value={snapshot.pendingRestartKeys.length} tone={snapshot.pendingRestartKeys.length ? "warning" : "default"} />
       </section>
 
       {dirtyCount ? <Alert status="warning">{t("settings.unsavedChanges", { count: dirtyCount })}</Alert> : null}
+
+      {unrecognized.length ? (
+        <section className="grid gap-3 rounded-md border border-amber-300/60 bg-amber-50/60 p-4">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div className="min-w-0 flex-1 basis-80">
+              <h2 className="flex items-center gap-2 font-semibold">
+                <AlertTriangle className="h-4 w-4 text-amber-700" />
+                {t("settings.unrecognized.title")}
+              </h2>
+              <p className="mt-1 text-sm text-muted-foreground">{t("settings.unrecognized.description", { path: snapshot.envPath })}</p>
+            </div>
+            <Button size="sm" variant="outline" className="min-h-11 sm:min-h-9" isDisabled={removing} onClick={() => setConfirmOpen(true)}>
+              {removing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+              {t("settings.unrecognized.remove", { count: unrecognized.length })}
+            </Button>
+          </div>
+          <ul className="flex flex-wrap gap-1.5">
+            {unrecognized.map((key) => <li key={key}><code className="break-all rounded-sm bg-background px-1.5 py-0.5 text-xs">{key}</code></li>)}
+          </ul>
+          <ConfirmAlertDialog
+            open={confirmOpen}
+            tone="danger"
+            title={t("settings.unrecognized.confirmTitle")}
+            description={t("settings.unrecognized.confirmBody", { keys: unrecognized.join(", ") })}
+            confirmLabel={t("settings.unrecognized.remove", { count: unrecognized.length })}
+            cancelLabel={t("common.cancel")}
+            busy={removing}
+            onConfirm={() => void onRemoveUnrecognized(unrecognized).finally(() => setConfirmOpen(false))}
+            onOpenChange={(open) => { if (!removing) setConfirmOpen(open); }}
+          />
+        </section>
+      ) : null}
 
       {pendingItems.length ? (
         <section>
@@ -855,6 +979,7 @@ function SettingsOverview({
         <div className="mt-4 grid gap-1 rounded-md bg-muted/30 p-1">
           {snapshot.schema.categories.map((category) => {
             const Icon = CATEGORY_ICONS[category.id];
+            const sections = snapshot.schema.sections.filter((section) => section.category === category.id);
             return (
               <button
                 key={category.id}
@@ -866,6 +991,11 @@ function SettingsOverview({
                 <span className="min-w-0">
                   <span className="block font-medium">{settingsCategoryLabel(t, category)}</span>
                   <span className="mt-1 block text-sm text-muted-foreground">{settingsCategoryDescription(t, category)}</span>
+                  {sections.length > 1 ? (
+                    <span className="mt-1.5 block text-xs text-muted-foreground">
+                      {sections.map((section) => settingsSectionLabel(t, section)).join(" · ")}
+                    </span>
+                  ) : null}
                 </span>
                 <span className="text-xs tabular-nums text-muted-foreground">{t("settings.fieldCount", { count: category.fieldCount })}</span>
               </button>
@@ -882,10 +1012,7 @@ function SettingsOverview({
   );
 }
 
-function formatOverviewSettingValue(
-  value: string | null | undefined,
-  t: ReturnType<typeof useLocaleText>["t"],
-) {
+function formatOverviewSettingValue(value: string | null | undefined, t: Translate) {
   const trimmed = value?.trim();
   return trimmed ? trimmed : t("common.unset");
 }
@@ -916,6 +1043,7 @@ function SettingsNavButton({
     <button
       type="button"
       onClick={onClick}
+      aria-current={active ? "page" : undefined}
       className={`flex min-h-10 w-full items-center gap-2 rounded-sm px-2.5 text-left text-sm transition-colors ${active ? "bg-background font-medium text-foreground" : "text-muted-foreground hover:bg-background/70 hover:text-foreground"}`}
     >
       <Icon className="h-4 w-4 shrink-0" />
@@ -926,26 +1054,34 @@ function SettingsNavButton({
 }
 
 function SettingsSubnav({
-  items,
+  sections,
   value,
   panelId,
+  fields,
+  values,
+  dirty,
+  mapDirty,
   onChange,
 }: {
-  items: SettingsSubsection[];
+  sections: SettingsSection[];
   value: string;
   panelId: string;
+  fields: SettingsField[];
+  values: Record<string, SettingValueEntry>;
+  dirty: Record<string, DirtyValue>;
+  mapDirty: boolean;
   onChange: (id: string) => void;
 }) {
   const { t } = useLocaleText();
   const listRef = React.useRef<HTMLDivElement>(null);
-  const selectedIndex = Math.max(0, items.findIndex((item) => item.id === value));
+  const selectedIndex = Math.max(0, sections.findIndex((section) => section.id === value));
 
   const selectAt = (index: number) => {
-    const item = items[index];
-    if (!item) return;
-    onChange(item.id);
+    const section = sections[index];
+    if (!section) return;
+    onChange(section.id);
     listRef.current
-      ?.querySelector<HTMLButtonElement>(`[data-settings-subsection-index="${index}"]`)
+      ?.querySelector<HTMLButtonElement>(`[data-settings-section-index="${index}"]`)
       ?.focus();
   };
 
@@ -960,44 +1096,45 @@ function SettingsSubnav({
         onKeyDown={(event) => {
           if (event.key === "ArrowRight") {
             event.preventDefault();
-            selectAt((selectedIndex + 1) % items.length);
+            selectAt((selectedIndex + 1) % sections.length);
           } else if (event.key === "ArrowLeft") {
             event.preventDefault();
-            selectAt((selectedIndex - 1 + items.length) % items.length);
+            selectAt((selectedIndex - 1 + sections.length) % sections.length);
           } else if (event.key === "Home") {
             event.preventDefault();
             selectAt(0);
           } else if (event.key === "End") {
             event.preventDefault();
-            selectAt(items.length - 1);
+            selectAt(sections.length - 1);
           }
         }}
       >
-        {items.map((item, index) => {
-          const selected = item.id === value;
-          const fieldCountLabel = item.fieldCount == null
-            ? ""
-            : t("settings.fieldCount", { count: item.fieldCount });
-          const dirtyCountLabel = item.dirtyCount
-            ? t("settings.changedFieldCount", { count: item.dirtyCount })
-            : "";
+        {sections.map((section, index) => {
+          const selected = section.id === value;
+          const sectionFields = fields.filter((field) => section.groups.includes(field.group));
+          const fieldCount = sectionFields.filter((field) => dependenciesSatisfied(field, fields, values, dirty)).length;
+          const dirtyCount = sectionFields.filter((field) => Object.prototype.hasOwnProperty.call(dirty, field.key)).length
+            + (section.id === MAP_SECTION && mapDirty ? 1 : 0);
+          const fieldCountLabel = section.groups.length ? t("settings.fieldCount", { count: fieldCount }) : "";
+          const dirtyCountLabel = dirtyCount ? t("settings.changedFieldCount", { count: dirtyCount }) : "";
+          const label = settingsSectionLabel(t, section);
           return (
             <button
-              key={item.id}
+              key={section.id}
               type="button"
               role="tab"
               id={`${panelId}-tab-${index}`}
-              data-settings-subsection-index={index}
+              data-settings-section-index={index}
               aria-controls={panelId}
               aria-selected={selected}
-              aria-label={[item.label, fieldCountLabel, dirtyCountLabel].filter(Boolean).join(", ")}
+              aria-label={[label, fieldCountLabel, dirtyCountLabel].filter(Boolean).join(", ")}
               tabIndex={selected ? 0 : -1}
-              onClick={() => onChange(item.id)}
+              onClick={() => onChange(section.id)}
               className={`relative grid min-h-[58px] min-w-[9rem] content-center rounded-sm px-3 py-2 text-left transition-colors after:absolute after:inset-x-3 after:bottom-0 after:h-0.5 after:rounded-full after:transition-colors ${selected
                 ? "bg-background text-foreground after:bg-primary"
                 : "text-muted-foreground after:bg-transparent hover:bg-background/60 hover:text-foreground"}`}
             >
-              <span className="whitespace-nowrap text-sm font-medium">{item.label}</span>
+              <span className="whitespace-nowrap text-sm font-medium">{label}</span>
               {fieldCountLabel || dirtyCountLabel ? (
                 <span className="mt-1 flex items-center gap-2 whitespace-nowrap text-[11px] tabular-nums">
                   {fieldCountLabel ? <span>{fieldCountLabel}</span> : null}
@@ -1028,10 +1165,11 @@ function SettingsFieldRow({
   dirty: boolean;
   errors: string[];
   clientServerReleaseCheck?: ClientServerReleaseCheck;
-  t: ReturnType<typeof useLocaleText>["t"];
+  t: Translate;
   onChange: (value: DirtyValue) => void;
 }) {
   const inputValue = String(value ?? "");
+  const readOnly = field.tier === "bootstrap";
   const rowState = errors.length
     ? "bg-danger/5 hover:bg-danger/10"
     : dirty
@@ -1043,10 +1181,11 @@ function SettingsFieldRow({
     <div id={`settings-field-${field.key}`} className={`grid gap-4 rounded-sm px-4 py-5 transition-colors md:grid-cols-[minmax(230px,0.9fr)_minmax(0,1.1fr)] ${rowState}`}>
       <div className="min-w-0">
         <div className="flex flex-wrap items-center gap-2">
-          <label className="font-medium" htmlFor={field.key}>{settingsFieldLabel(t, field)}</label>
-          {field.required ? <Chip size="sm" variant="soft">{t("common.required")}</Chip> : null}
-          {field.restartRequired ? <Chip color="warning" size="sm" variant="soft">{t("common.restartRequired")}</Chip> : null}
-          {field.risk === "critical" ? <Chip color="danger" size="sm" variant="soft">{t("settings.highRisk")}</Chip> : null}
+          <label className="font-medium" htmlFor={readOnly ? undefined : field.key}>{settingsFieldLabel(t, field)}</label>
+          {readOnly ? <Chip size="sm" variant="soft">{t("settings.tier.readOnly")}</Chip> : null}
+          {field.required && !readOnly ? <Chip size="sm" variant="soft">{t("common.required")}</Chip> : null}
+          {field.restartRequired && !readOnly ? <Chip color="warning" size="sm" variant="soft">{t("common.restartRequired")}</Chip> : null}
+          {field.risk === "critical" && !readOnly ? <Chip color="danger" size="sm" variant="soft">{t("settings.highRisk")}</Chip> : null}
           {dirty ? <Chip color="accent" size="sm" variant="soft">{t("common.changed")}</Chip> : null}
         </div>
         <p className="mt-2 text-sm leading-6 text-muted-foreground">{settingsFieldDescription(t, field)}</p>
@@ -1066,7 +1205,11 @@ function SettingsFieldRow({
       </div>
 
       <div className="grid content-start gap-2">
-        {field.fieldType === "bool" ? (
+        {readOnly ? (
+          <code className="min-h-10 break-all rounded-sm border bg-background/60 px-3 py-2.5 text-sm">
+            {entry?.effectiveValue || entry?.value || field.default || t("common.unset")}
+          </code>
+        ) : field.fieldType === "bool" ? (
           <Switch
             aria-label={settingsFieldLabel(t, field)}
             isSelected={Boolean(value)}
@@ -1113,7 +1256,7 @@ function SettingsFieldRow({
           />
         )}
 
-        {field.unit ? <span className="text-right text-xs text-muted-foreground">{field.unit}</span> : null}
+        {field.unit && !readOnly ? <span className="text-right text-xs text-muted-foreground">{field.unit}</span> : null}
         {clientServerReleaseCheck && clientServerReleaseCheck.phase !== "idle" ? (
           <ClientServerReleaseFeedback check={clientServerReleaseCheck} />
         ) : null}
@@ -1198,154 +1341,6 @@ function groupFields(fields: SettingsField[], preferredOrder?: readonly string[]
   return entries.sort(([left], [right]) => (
     (order.get(left) ?? Number.MAX_SAFE_INTEGER) - (order.get(right) ?? Number.MAX_SAFE_INTEGER)
   ));
-}
-
-function groupSubsectionId(group: string) {
-  return `group:${group}`;
-}
-
-function buildSettingsSubsections(
-  category: SettingsCategoryId,
-  fields: SettingsField[],
-  values: Record<string, SettingValueEntry>,
-  dirty: Record<string, DirtyValue>,
-  mapDirty: boolean,
-  t: ReturnType<typeof useLocaleText>["t"],
-) {
-  if (category === "notifications") {
-    return buildNotificationSubsections(fields, values, dirty, t);
-  }
-
-  const items: SettingsSubsection[] = groupFields(fields).map(([group, groupItems]) => ({
-    id: groupSubsectionId(group),
-    label: settingsGroupLabel(t, group),
-    groups: [group],
-    fieldCount: groupItems.filter((field) => dependenciesSatisfied(field, fields, values, dirty)).length,
-    dirtyCount: groupItems.filter((field) => Object.prototype.hasOwnProperty.call(dirty, field.key)).length,
-  }));
-
-  if (category === "general_display") {
-    items.push(
-      {
-        id: PANEL_SUBSECTION_IDS.map,
-        label: t("settings.map"),
-        panel: "map",
-        dirtyCount: mapDirty ? 1 : 0,
-      },
-      {
-        id: PANEL_SUBSECTION_IDS.announcement,
-        label: t("settings.announcement"),
-        panel: "announcement",
-        dirtyCount: 0,
-      },
-    );
-  } else if (category === "marketplace") {
-    items.push(
-      {
-        id: PANEL_SUBSECTION_IDS.provision_key,
-        label: t("settings.provisionSshKeyTitle"),
-        panel: "provision_key",
-        dirtyCount: 0,
-      },
-      {
-        id: PANEL_SUBSECTION_IDS.market_finance,
-        label: t("settings.marketFinance.title"),
-        panel: "market_finance",
-        dirtyCount: 0,
-      },
-    );
-  }
-
-  return items;
-}
-
-function buildNotificationSubsections(
-  fields: SettingsField[],
-  values: Record<string, SettingValueEntry>,
-  dirty: Record<string, DirtyValue>,
-  t: ReturnType<typeof useLocaleText>["t"],
-) {
-  const knownGroups = new Set<string>(Object.values(NOTIFICATION_SUBSECTION_GROUPS).flat());
-  const subsection = (
-    id: string,
-    label: string,
-    groups: readonly string[],
-    panel?: SettingsPanel,
-    channel?: SettingsSubsection["channel"],
-  ): SettingsSubsection => {
-    const subsectionFields = fields.filter((field) => groups.includes(field.group));
-    return {
-      id,
-      label,
-      groups: [...groups],
-      panel,
-      channel,
-      fieldCount: subsectionFields.filter((field) => dependenciesSatisfied(field, fields, values, dirty)).length,
-      dirtyCount: subsectionFields.filter((field) => Object.prototype.hasOwnProperty.call(dirty, field.key)).length,
-    };
-  };
-
-  const items = [
-    subsection(
-      NOTIFICATION_SUBSECTION_IDS.system,
-      t("settings.notifications.system"),
-      NOTIFICATION_SUBSECTION_GROUPS.system,
-    ),
-    subsection(
-      NOTIFICATION_SUBSECTION_IDS.business,
-      t("settings.notifications.business"),
-      NOTIFICATION_SUBSECTION_GROUPS.business,
-    ),
-    subsection(
-      NOTIFICATION_SUBSECTION_IDS.email,
-      t("settings.notifications.email"),
-      NOTIFICATION_SUBSECTION_GROUPS.email,
-      "channel_health",
-      "email",
-    ),
-    subsection(
-      NOTIFICATION_SUBSECTION_IDS.telegram,
-      t("settings.notifications.telegram"),
-      NOTIFICATION_SUBSECTION_GROUPS.telegram,
-      "channel_health",
-      "telegram",
-    ),
-    subsection(
-      NOTIFICATION_SUBSECTION_IDS.bark,
-      t("settings.notifications.bark"),
-      NOTIFICATION_SUBSECTION_GROUPS.bark,
-      "channel_health",
-      "bark",
-    ),
-  ];
-
-  const unclassified = fields.filter((field) => !knownGroups.has(field.group));
-  items.push(...groupFields(unclassified).map(([group, groupItems]) => ({
-    id: groupSubsectionId(group),
-    label: settingsGroupLabel(t, group),
-    groups: [group],
-    fieldCount: groupItems.filter((field) => dependenciesSatisfied(field, fields, values, dirty)).length,
-    dirtyCount: groupItems.filter((field) => Object.prototype.hasOwnProperty.call(dirty, field.key)).length,
-  })));
-
-  return items;
-}
-
-function subsectionIdForField(field: SettingsField) {
-  if (field.category !== "notifications") return groupSubsectionId(field.group);
-  for (const [subsection, groups] of Object.entries(NOTIFICATION_SUBSECTION_GROUPS)) {
-    if ((groups as readonly string[]).includes(field.group)) {
-      return NOTIFICATION_SUBSECTION_IDS[subsection as keyof typeof NOTIFICATION_SUBSECTION_IDS];
-    }
-  }
-  return groupSubsectionId(field.group);
-}
-
-function normalizeNotificationSubsectionId(id: string | undefined) {
-  if (id === LEGACY_NOTIFICATION_CHANNELS_SUBSECTION) {
-    return NOTIFICATION_SUBSECTION_IDS.email;
-  }
-  return id;
 }
 
 function categoryDirtyCount(category: SettingsCategoryId, fields: SettingsField[], dirty: Record<string, DirtyValue>) {

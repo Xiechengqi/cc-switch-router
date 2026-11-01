@@ -5,7 +5,6 @@ import * as React from "react";
 import { shareOperationalSummary } from "@/components/dashboard/operational-status";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import type { DashboardResponse, OperationalState } from "@/lib/types";
-import { recordDashboardUxEvent } from "@/lib/api";
 
 type VerificationTarget = {
   kind: "share";
@@ -30,7 +29,6 @@ export function OperationVerificationProvider({ data, children }: { data: Dashbo
   const trackOperation = React.useCallback((target: Omit<VerificationTarget, "submittedAt">) => {
     setPending((current) => [...current.filter((item) => item.kind !== target.kind || item.id !== target.id), { ...target, submittedAt: Date.now(), baselineSnapshot: data?.generatedAt }]);
     toast.info(t("dashboard.operationSubmitted"));
-    void recordDashboardUxEvent({ eventType: "operation_submitted", targetType: target.kind });
   }, [data?.generatedAt, t]);
 
   React.useEffect(() => {
@@ -66,7 +64,6 @@ export function OperationVerificationProvider({ data, children }: { data: Dashbo
           continue;
         }
         toast.success(t(item.requireHealthyRoute ? "dashboard.operationRouteVerified" : "dashboard.operationObserved"));
-        void recordDashboardUxEvent({ eventType: "operation_verified", targetType: item.kind, elapsedMs: now - item.submittedAt });
         continue;
       }
       remaining.push(item);

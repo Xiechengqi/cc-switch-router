@@ -1331,13 +1331,35 @@ export type HealthTimelineBucket = {
 };
 
 export type SettingsCategoryId =
-  | "general_display"
-  | "connectivity"
-  | "data_lifecycle"
-  | "identity_security"
+  | "site_access"
+  | "accounts_security"
+  | "marketplace"
   | "notifications"
-  | "observability"
-  | "marketplace";
+  | "monitoring"
+  | "data_retention"
+  | "connectivity"
+  | "deployment";
+
+/** essential: shown; advanced: collapsed; bootstrap: read-only; managed: hidden. */
+export type SettingsTier = "essential" | "advanced" | "bootstrap" | "managed";
+
+export type SettingsPanelId =
+  | "map_display"
+  | "announcement"
+  | "provision_key"
+  | "model_prices"
+  | "market_finance"
+  | "email_health"
+  | "telegram_health"
+  | "bark_health";
+
+export type SettingsSection = {
+  id: string;
+  category: SettingsCategoryId;
+  label: string;
+  groups: string[];
+  panels: SettingsPanelId[];
+};
 
 export type SettingsCategory = {
   id: SettingsCategoryId;
@@ -1351,6 +1373,8 @@ export type SettingsField = {
   label: string;
   group: string;
   category: SettingsCategoryId;
+  section: string;
+  tier: SettingsTier;
   fieldType:
     | "text"
     | "select"
@@ -1386,6 +1410,7 @@ export type SettingsSchema = {
   fields: SettingsField[];
   groups: string[];
   categories: SettingsCategory[];
+  sections: SettingsSection[];
 };
 
 export type SettingValueEntry = {
@@ -1407,6 +1432,8 @@ export type SettingsSnapshot = {
   schema: SettingsSchema;
   values: SettingValueEntry[];
   pendingRestartKeys: string[];
+  /** Router env-file entries nothing reads any more. */
+  unrecognizedKeys: string[];
 };
 
 export type SettingsValidationResponse = {

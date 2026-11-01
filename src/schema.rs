@@ -345,6 +345,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../schema/0100_market_payment_single_active_method.sql"),
     ),
     (101, include_str!("../schema/0101_share_value_quotas.sql")),
+    (
+        102,
+        include_str!("../schema/0102_retire_dashboard_ux_telemetry.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {

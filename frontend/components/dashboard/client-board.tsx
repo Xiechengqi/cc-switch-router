@@ -42,7 +42,7 @@ import {
 import type { ClientMarketRental, DashboardClient, ShareView } from "@/lib/types";
 import { formatDateTime, formatRelativeTime, preferredScrollBehavior } from "@/lib/utils";
 import { usePersistentState } from "@/lib/use-persistent-state";
-import { getMyClientMarketRentals, recordDashboardUxEvent } from "@/lib/api";
+import { getMyClientMarketRentals } from "@/lib/api";
 import { CompactSelect } from "@/components/common/compact-select";
 import { clientWebTerminalUrl } from "@/lib/client-web-view";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
@@ -908,13 +908,11 @@ export function ClientBoard({
   const openClient = React.useCallback((client: DashboardClient) => {
     setSelectedClientId(client.installation.id);
     focus.openDrawer("client", client.installation.id);
-    void recordDashboardUxEvent({ eventType: "drawer_opened", source: "client-board", targetType: "client" });
   }, [focus]);
   const closeClientDrawer = React.useCallback((open: boolean) => { if (!open) { setSelectedClientId(""); focus.closeDrawer(); } }, [focus]);
   const openShare = React.useCallback((share: ShareView) => {
     setSelectedShareId(share.shareId);
     focus.openDrawer("share", share.shareId);
-    void recordDashboardUxEvent({ eventType: "drawer_opened", source: "client-board", targetType: "share" });
   }, [focus]);
   const closeShareDrawer = React.useCallback((open: boolean) => {
     if (open) return;
@@ -1144,10 +1142,7 @@ export function ClientBoard({
                     {t("dashboard.region")}
                     <CompactRegionMultiSelect
                       values={regionFilters}
-                      onChange={(value) => {
-                        setRegionFilters(value);
-                        void recordDashboardUxEvent({ eventType: "filter_applied", source: "client-board", targetType: "client" });
-                      }}
+                      onChange={setRegionFilters}
                       options={regions.map((region) => ({ value: region, label: region }))}
                       allLabel={t("dashboard.allRegions")}
                       moreLabel={(count) => t("dashboard.regionsMore", { count })}
@@ -1160,10 +1155,7 @@ export function ClientBoard({
                     {t("dashboard.filterGeneral")}
                     <CompactSelect
                       value={sortOrder === "registered" ? "running" : sortOrder}
-                      onChange={(value) => {
-                        setSortOrder(value);
-                        void recordDashboardUxEvent({ eventType: "filter_applied", source: "client-board", targetType: "client" });
-                      }}
+                      onChange={setSortOrder}
                       options={[
                         { value: "issues", label: t("dashboard.sortIssues") },
                         { value: "name", label: t("dashboard.sortName") },
@@ -1180,10 +1172,7 @@ export function ClientBoard({
                     <button
                       type="button"
                       className="justify-self-start text-xs font-medium text-primary hover:underline"
-                      onClick={() => {
-                        clearRegionFilters();
-                        void recordDashboardUxEvent({ eventType: "filter_applied", source: "client-board", targetType: "client" });
-                      }}
+                      onClick={() => clearRegionFilters()}
                     >
                       {t("dashboard.clearFilters")}
                     </button>

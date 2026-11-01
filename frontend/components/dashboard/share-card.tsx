@@ -44,7 +44,6 @@ import {
   shareEnabledApps,
   SHARE_APP_LABELS,
 } from "@/lib/share-app";
-import { recordDashboardUxEvent } from "@/lib/api";
 import { shareEditPendingLabel } from "@/components/dashboard/share-edit/share-edit-section";
 import { SubdomainCopyButton } from "@/components/dashboard/subdomain-copy-button";
 import { ShareProviderStatusPanel } from "@/components/dashboard/share-provider-status-panel";
@@ -250,12 +249,6 @@ export const ShareCard = React.memo(function ShareCard({
       block: "nearest",
       inline: "center",
     });
-    if (focus.target?.kind === "request")
-      void recordDashboardUxEvent({
-        eventType: "share_located_from_request",
-        source: "activity",
-        targetType: "share",
-      });
   }, [focus.target?.source, focused]);
 
   return (

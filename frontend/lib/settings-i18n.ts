@@ -1,7 +1,6 @@
 import type { MessageKey } from "@/lib/i18n";
 import { SETTINGS_GROUP_SLUG, settingsMessagesEn } from "@/lib/settings-messages";
-import type { SettingsField } from "@/lib/types";
-import type { SettingsCategory } from "@/lib/types";
+import type { SettingsCategory, SettingsField, SettingsSection } from "@/lib/types";
 
 type TranslateFn = (key: MessageKey, values?: Record<string, string | number>) => string;
 
@@ -17,13 +16,14 @@ export function settingsGroupLabel(t: TranslateFn, group: string) {
 }
 
 const CATEGORY_SLUG: Record<string, string> = {
-  general_display: "generalDisplay",
-  connectivity: "connectivity",
-  data_lifecycle: "dataLifecycle",
-  identity_security: "identitySecurity",
-  notifications: "notifications",
-  observability: "observability",
+  site_access: "siteAccess",
+  accounts_security: "accountsSecurity",
   marketplace: "marketplace",
+  notifications: "notifications",
+  monitoring: "monitoring",
+  data_retention: "dataRetention",
+  connectivity: "connectivity",
+  deployment: "deployment",
 };
 
 export function settingsCategoryLabel(t: TranslateFn, category?: SettingsCategory) {
@@ -36,6 +36,10 @@ export function settingsCategoryDescription(t: TranslateFn, category?: SettingsC
   if (!category) return "";
   const slug = CATEGORY_SLUG[category.id];
   return translateSettings(t, `settings.category.${slug}.description` as MessageKey, category.description);
+}
+
+export function settingsSectionLabel(t: TranslateFn, section: SettingsSection) {
+  return translateSettings(t, `settings.section.${section.id}` as MessageKey, section.label);
 }
 
 export function settingsFieldLabel(t: TranslateFn, field: SettingsField) {

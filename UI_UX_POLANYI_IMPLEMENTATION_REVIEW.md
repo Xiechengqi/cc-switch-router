@@ -59,6 +59,8 @@
 
 ### 本地隐私观测
 
+> 2026-11 更新：该能力已移除（迁移 0102 删除 `dashboard_ux_events`，相关设置与接口一并下线），因为采集的数据从未被任何功能或报表读取。以下为当时的实现记录。
+
 - 新增本地 `dashboard_ux_events` 表和写入接口。
 - 默认关闭：`CC_SWITCH_ROUTER_UX_TELEMETRY_ENABLED=false`。
 - 可配置保留天数，范围被限制在安全区间。

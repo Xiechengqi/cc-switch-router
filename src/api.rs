@@ -26,10 +26,11 @@ use crate::abuse::ShareClientUnbanResponse;
 use crate::admin::{
     restart::{RestartStrategy, schedule_restart},
     settings::{
-        ApplyOutcome, SettingsSnapshotResponse, SettingsUpdateRequest, SettingsUpdateResponse,
-        SettingsValidationResponse, apply_updates_to_dynamic, read_env_file, settings_revision,
-        snapshot_response, validate_and_diff_with_runtime, validation_response_with_runtime,
-        write_env_file_atomic,
+        ApplyOutcome, SettingsKeyRemovalRequest, SettingsKeyRemovalResponse,
+        SettingsSnapshotResponse, SettingsUpdateRequest, SettingsUpdateResponse,
+        SettingsValidationResponse, apply_updates_to_dynamic, read_env_file,
+        remove_unrecognized_env_keys, settings_revision, snapshot_response,
+        validate_and_diff_with_runtime, validation_response_with_runtime, write_env_file_atomic,
     },
     upgrade::{UpgradeLogEntry, UpgradeStatus},
     version::{
@@ -51,14 +52,13 @@ use crate::models::{
     ClientOnlineCalendarResponse, ClientTunnelClaimRequest, ClientTunnelQuery,
     ClientTunnelResponse, ClientTunnelUpdateRequest, ClientWebRequestEmailCodeRequest,
     ClientWebVerifyEmailCodeRequest, DashboardPresenceRequest, DashboardPresenceResponse,
-    DashboardResponse, DashboardTickerShare, DashboardUxEventRequest, DashboardUxEventResponse,
-    GatewayRegistryRecord, GatewayRequestObservationBatch, GatewayShareView,
-    GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse, HealthResponse,
-    ImageGenerationRequestLogEntry, InstallationHeartbeatRequest, InstallationHeartbeatResponse,
-    InstallationSetupCompletedRequest, InstallationSetupCompletedResponse,
-    InstallationUpgradeTaskReportPayload, InstallationUpgradeTaskReportRequest,
-    InstallationUpgradeTaskReportResponse, IssueLeaseRequest, IssueLeaseResponse,
-    MapDisplaySettings, MapDisplaySettingsUpdate, NotificationSettingsResponse,
+    DashboardResponse, DashboardTickerShare, GatewayRegistryRecord, GatewayRequestObservationBatch,
+    GatewayShareView, GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse,
+    HealthResponse, ImageGenerationRequestLogEntry, InstallationHeartbeatRequest,
+    InstallationHeartbeatResponse, InstallationSetupCompletedRequest,
+    InstallationSetupCompletedResponse, InstallationUpgradeTaskReportPayload,
+    InstallationUpgradeTaskReportRequest, InstallationUpgradeTaskReportResponse, IssueLeaseRequest,
+    IssueLeaseResponse, MapDisplaySettings, MapDisplaySettingsUpdate, NotificationSettingsResponse,
     PostClientChatMessageRequest, ProviderUsageResponse, PublicMapPointsResponse,
     PublicNetworkStatsResponse, RefreshSessionRequest, RegisterAuthDeviceRequest,
     RegisterAuthDeviceResponse, RegisterGatewayRequest, RegisterGatewayResponse,
@@ -327,7 +327,6 @@ pub fn router(state: ServerState) -> Router {
             post(batch_sync_gateway_request_logs),
         )
         .route("/v1/dashboard/presence", post(dashboard_presence))
-        .route("/v1/dashboard/ux-events", post(dashboard_ux_event))
         .route(
             "/v1/installations/register",
             installation_control_body_limited(post(register_installation)),
@@ -598,6 +597,10 @@ pub fn router(state: ServerState) -> Router {
             get(admin_settings_get).patch(admin_settings_apply),
         )
         .route("/v1/admin/settings/validate", post(admin_settings_validate))
+        .route(
+            "/v1/admin/settings/unrecognized-keys/remove",
+            post(admin_settings_remove_unrecognized),
+        )
         .route(
             "/v1/admin/client-server-release/validate",
             post(admin_client_server_release_validate),
@@ -3225,20 +3228,6 @@ async fn dashboard_presence(
         email_sent_24h,
         telegram_url,
     }))
-}
-
-async fn dashboard_ux_event(
-    State(state): State<ServerState>,
-    Json(input): Json<DashboardUxEventRequest>,
-) -> Result<Json<DashboardUxEventResponse>, AppError> {
-    if !state.config.ux_telemetry_enabled {
-        return Ok(Json(DashboardUxEventResponse { accepted: false }));
-    }
-    state
-        .store
-        .record_dashboard_ux_event(input, state.config.ux_telemetry_retention_days)
-        .await?;
-    Ok(Json(DashboardUxEventResponse { accepted: true }))
 }
 
 async fn request_email_code(
@@ -7375,6 +7364,41 @@ async fn admin_settings_apply(
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect(),
         ),
+    }))
+}
+
+/// Removes env-file entries nothing reads any more (for example the settings
+/// of a retired integration, which may still hold a secret). Live keys are
+/// refused even if a stale page asks for them.
+async fn admin_settings_remove_unrecognized(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(input): Json<SettingsKeyRemovalRequest>,
+) -> Result<Json<SettingsKeyRemovalResponse>, AppError> {
+    let session = require_admin_session(&state, &headers).await?;
+    // Same lock as `admin_settings_apply`, so the two writers never interleave.
+    let dynamic_guard = state.dynamic.write().await;
+    let existing = read_env_file(&state.env_path)?;
+    ensure_settings_revision(&existing, &input.expected_revision)?;
+    let next = remove_unrecognized_env_keys(&existing, &input.keys)?;
+    write_env_file_atomic(&state.env_path, &next)?;
+    drop(dynamic_guard);
+
+    let metadata = extract_client_metadata(&headers, addr);
+    let payload = serde_json::json!({ "removedKeys": input.keys });
+    let _ = state
+        .store
+        .record_admin_audit(
+            Some(&session.email),
+            "settings.remove_unrecognized",
+            Some(&payload),
+            metadata.ip.as_deref(),
+        )
+        .await;
+    Ok(Json(SettingsKeyRemovalResponse {
+        removed_keys: input.keys,
+        revision: settings_revision(&next.into_iter().collect()),
     }))
 }
 

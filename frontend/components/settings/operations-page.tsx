@@ -1,18 +1,20 @@
 "use client";
 
-import { BellRing, FileClock, ScrollText, ServerCog } from "lucide-react";
+import { BellRing, FileClock, Landmark, ScrollText, ServerCog } from "lucide-react";
 import * as React from "react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { AdminAuditPanel } from "@/components/settings/admin-audit-panel";
 import { ClientNotificationDeliveriesPanel } from "@/components/settings/client-notification-deliveries-panel";
 import { LogsPanel } from "@/components/settings/logs-panel";
+import { MarketFinanceDesk } from "@/components/settings/market-finance-desk";
 import { VersionPanel } from "@/components/settings/version-panel";
 
-type OperationsSection = "service" | "logs" | "deliveries" | "audit";
+type OperationsSection = "service" | "finance" | "logs" | "deliveries" | "audit";
 
 const ITEMS = [
   { id: "service" as const, icon: ServerCog, label: "operations.service" as const },
+  { id: "finance" as const, icon: Landmark, label: "operations.finance" as const },
   { id: "logs" as const, icon: ScrollText, label: "operations.logs" as const },
   { id: "deliveries" as const, icon: BellRing, label: "operations.deliveries" as const },
   { id: "audit" as const, icon: FileClock, label: "operations.audit" as const },
@@ -67,6 +69,7 @@ export function OperationsPage() {
         </aside>
         <div className="min-w-0">
           {active === "service" ? <VersionPanel isAdmin /> : null}
+          {active === "finance" ? <MarketFinanceDesk /> : null}
           {active === "logs" ? <LogsPanel /> : null}
           {active === "deliveries" ? <ClientNotificationDeliveriesPanel /> : null}
           {active === "audit" ? <AdminAuditPanel /> : null}
