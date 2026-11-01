@@ -729,20 +729,9 @@ export function ProvidersPage() {
 
   return (
     <main className="mx-auto grid w-[calc(100%-2rem)] min-w-0 max-w-7xl gap-8 pb-12">
-      <header className="relative grid min-w-0 gap-4 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
-        <div className="min-w-0">
-          <span className="inline-flex items-center gap-2 rounded-full border border-primary/30 bg-primary/5 px-3 py-1">
-            <span className="h-1.5 w-1.5 rounded-full bg-primary motion-safe:animate-pulse" aria-hidden="true" />
-            <span className="font-mono text-[11px] uppercase tracking-[0.15em] text-primary">{t("providers.eyebrow")}</span>
-          </span>
-          <h1 className="mt-3 min-w-0 text-2xl font-bold tracking-tight text-foreground [overflow-wrap:anywhere]">
-            {t("providers.title")}
-          </h1>
-          <p className="mt-1 max-w-3xl text-sm leading-6 text-muted-foreground">
-            {t("providers.subtitle")}
-          </p>
-        </div>
-        <div className="flex min-w-0 flex-wrap items-center gap-2 sm:justify-end">
+      <header className="flex min-w-0 justify-end">
+        <h1 className="sr-only">{t("providers.title")}</h1>
+        <div className="flex min-w-0 flex-wrap items-center justify-end gap-2">
           <Button
             variant="ghost"
             size="sm"
@@ -782,14 +771,10 @@ export function ProvidersPage() {
       ) : null}
 
       {noneRanked && generation ? (
-        <section className="relative grid min-w-0 gap-1 overflow-hidden rounded-xl bg-foreground px-5 py-5 text-background">
-          <span
-            className="pointer-events-none absolute inset-0 opacity-[0.04] [background-image:radial-gradient(circle,white_1px,transparent_1px)] [background-size:24px_24px]"
-            aria-hidden="true"
-          />
-          <span className="pointer-events-none absolute -right-16 -top-16 h-48 w-48 rounded-full bg-accent/30 blur-3xl" aria-hidden="true" />
+        <section className="relative grid min-w-0 gap-1 overflow-hidden rounded-xl border border-primary/20 bg-primary/5 px-5 py-5 text-foreground">
+          <span className="pointer-events-none absolute -right-16 -top-16 h-48 w-48 rounded-full bg-accent/10 blur-3xl" aria-hidden="true" />
           <h2 className="relative text-base font-semibold">{t("providers.noRanked.title")}</h2>
-          <p className="relative max-w-3xl text-sm leading-6 text-white/75">
+          <p className="relative max-w-3xl text-sm leading-6 text-muted-foreground">
             {t("providers.noRanked.body", {
               buyers: generation.minimumIndependentBuyers,
               days: generation.minimumObservationDays,

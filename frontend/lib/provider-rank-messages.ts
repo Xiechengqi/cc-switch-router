@@ -1,8 +1,6 @@
 /** The public Provider ranking and a Provider's own standing. */
 export const providerRankMessagesEn = {
   "providers.title": "Providers",
-  "providers.eyebrow": "Provider ranking",
-  "providers.subtitle": "Compare Providers on observed reliability, then open what they have available now.",
   "providers.rankingTitle": "Ranking",
   "providers.search.label": "Search",
   "providers.search.placeholder": "Provider name",
@@ -115,8 +113,6 @@ export const providerRankMessagesEn = {
 
 export const providerRankMessagesZh: Record<keyof typeof providerRankMessagesEn, string> = {
   "providers.title": "供应商",
-  "providers.eyebrow": "供应商排名",
-  "providers.subtitle": "按实测可靠性比较供应商，再直接查看其当前可用的供给。",
   "providers.rankingTitle": "排名",
   "providers.search.label": "搜索",
   "providers.search.placeholder": "供应商名称",
