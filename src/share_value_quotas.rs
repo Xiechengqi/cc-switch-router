@@ -264,12 +264,26 @@ async fn preview(
         .and_then(serde_json::Value::as_array_mut)
     {
         checks.push(serde_json::json!({"code":"tariff_published","ready":published}));
+        if !published {
+            mark_blocked_by_tariff(checks);
+        }
     }
     if !published {
         response["ready"] = false.into();
         response["capabilityReady"] = false.into();
     }
     Ok(Json(response))
+}
+/// An unacknowledged tariff is a consequence of an unpublished one; point the
+/// failed check at its root unless the Server already named a blocker.
+fn mark_blocked_by_tariff(checks: &mut [serde_json::Value]) {
+    for check in checks.iter_mut().filter(|c| {
+        c["code"] == "acknowledged_tariff"
+            && c["ready"] != true
+            && c.get("blockedBy").is_none_or(serde_json::Value::is_null)
+    }) {
+        check["blockedBy"] = "tariff_published".into();
+    }
 }
 fn response_pricing_published(pricing: &serde_json::Value) -> bool {
     pricing["publishedRevision"]
@@ -461,6 +475,24 @@ mod tests {
         });
         assert_eq!(conflict.code(), Some("quota_revision_conflict"));
         assert!(!conflict.to_string().contains("private"));
+    }
+
+    #[test]
+    fn unpublished_tariff_blocks_failed_acknowledgement_only() {
+        let mut checks = vec![
+            serde_json::json!({"code":"acknowledged_tariff","ready":false}),
+            serde_json::json!({"code":"acknowledged_tariff","ready":false,"blockedBy":"sqlite_authority"}),
+            serde_json::json!({"code":"acknowledged_tariff","ready":true}),
+            serde_json::json!({"code":"sqlite_authority","ready":false}),
+            serde_json::json!({"code":"tariff_published","ready":false}),
+        ];
+        mark_blocked_by_tariff(&mut checks);
+        assert_eq!(checks[0]["blockedBy"], "tariff_published");
+        // A Server-named blocker wins; ready and unrelated checks stay untouched.
+        assert_eq!(checks[1]["blockedBy"], "sqlite_authority");
+        assert!(checks[2].get("blockedBy").is_none());
+        assert!(checks[3].get("blockedBy").is_none());
+        assert!(checks[4].get("blockedBy").is_none());
     }
 
     fn rejected(status: u16, body: serde_json::Value) -> crate::ctl_client::CtlError {

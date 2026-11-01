@@ -7,7 +7,9 @@ import {
   previewValueQuota, parseUsdLimit, formatUsdLimit, valuePreviewRowOutcome, valuePreviewNeedsAcknowledgement,
   valuePreviewBlocker, valueQuotaErrorMessage, valueQuotaView, normalizeValueStatuses, ValueQuotaClientError,
   splitValueStatusRows, upsertValueStatuses, valueStatusReason, formatQuotaTime, VALUE_STATUS_STALE_MS,
+  valueReadinessItems, valueReadinessRoots, valueReadinessSummary, type ValueReadinessCheck,
 } from "./share-value-quota";
+import { valueQuotaMessagesEn, valueQuotaMessagesZh } from "./share-value-quota-messages";
 import { applyShareUserPolicyBatch } from "../components/dashboard/share-edit/share-user-policy-batch";
 import { buildShareSettingsPatch, draftFromShare, stageUserPolicy } from "./share-settings";
 import type { ShareUserGrant, ShareView } from "./types";
@@ -46,6 +48,62 @@ test("capability readiness requires every independent authoritative check, not p
   assert.equal(valueReadinessError({code:"quota_unavailable",details:{readinessCode:"quota_server_offline"}}),"offline");
   assert.equal(valueReadinessError({details:{readinessCode:"quota_server_upgrade_required"}}),"upgrade");
   assert.equal(valueReadinessError(new Error("sensitive upstream body")),"failed");
+});
+
+test("readiness roots skip consequences and follow the fix-first order",()=>{
+  // The production shape: storage not committed, tariff never published.
+  const production:ValueReadinessCheck[]=[
+    {code:"router_protocol",ready:true},{code:"sqlite_authority",ready:false,state:"shadow_verified"},
+    {code:"metering_storage",ready:true},{code:"acknowledged_tariff",ready:false,blockedBy:"sqlite_authority"},
+    {code:"text_surface",ready:true,app:"claude"},{code:"tariff_published",ready:false},
+  ];
+  assert.deepEqual(valueReadinessRoots(production).map(c=>c.code),["sqlite_authority","tariff_published"]);
+  assert.deepEqual(valueReadinessItems(production).map(i=>[i.check.code,i.waitingOn]),
+    [["sqlite_authority",undefined],["tariff_published",undefined],["acknowledged_tariff","sqlite_authority"]]);
+  assert.deepEqual(valueReadinessSummary(production),{root:production[1],more:1});
+  // Priority, not arrival order; unknown codes go last in the order sent.
+  const shuffled:ValueReadinessCheck[]=["zeta","text_surface","acknowledged_tariff","tariff_published","alpha","metering_storage",
+    "sqlite_authority","router_protocol"].map(code=>({code,ready:false}));
+  assert.deepEqual(valueReadinessRoots(shuffled).map(c=>c.code),["router_protocol","sqlite_authority","metering_storage",
+    "tariff_published","acknowledged_tariff","text_surface","zeta","alpha"]);
+  assert.equal(valueReadinessSummary(shuffled).more,7);
+});
+
+test("a blocker that passed or is missing leaves its check a root; chains resolve to the end",()=>{
+  const passed:ValueReadinessCheck[]=[{code:"sqlite_authority",ready:true},{code:"acknowledged_tariff",ready:false,blockedBy:"sqlite_authority"}];
+  assert.deepEqual(valueReadinessRoots(passed).map(c=>c.code),["acknowledged_tariff"]);
+  assert.deepEqual(valueReadinessRoots([{code:"acknowledged_tariff",ready:false,blockedBy:"router_protocol"}]).map(c=>c.code),
+    ["acknowledged_tariff"],"an unreported blocker is not a failed check");
+  assert.deepEqual(valueReadinessRoots([{code:"acknowledged_tariff",ready:false,blockedBy:"acknowledged_tariff"}]).map(c=>c.code),
+    ["acknowledged_tariff"],"a self-reference is still a root");
+  const chain:ValueReadinessCheck[]=[{code:"acknowledged_tariff",ready:false,blockedBy:"tariff_published"},
+    {code:"tariff_published",ready:false,blockedBy:"router_protocol"},{code:"router_protocol",ready:false}];
+  assert.deepEqual(valueReadinessItems(chain).map(i=>[i.check.code,i.waitingOn]),
+    [["router_protocol",undefined],["tariff_published","router_protocol"],["acknowledged_tariff","router_protocol"]]);
+  const cycle:ValueReadinessCheck[]=[{code:"x",ready:false,blockedBy:"y"},{code:"y",ready:false,blockedBy:"x"}];
+  assert.deepEqual(valueReadinessRoots(cycle).map(c=>c.code),["x","y"],"a cycle never hides every failure");
+  assert.deepEqual(valueReadinessRoots(undefined),[]);
+  assert.deepEqual(valueReadinessSummary([{code:"router_protocol",ready:true}]),{root:undefined,more:0});
+});
+
+test("the +N count is per kind of root, not per binding",()=>{
+  const bindings:ValueReadinessCheck[]=[1,2,3].map(n=>({code:"text_surface",ready:false,app:"codex",profileId:`p${n}`}));
+  assert.equal(valueReadinessRoots(bindings).length,3);
+  assert.deepEqual(valueReadinessSummary(bindings),{root:bindings[0],more:0});
+  assert.equal(valueReadinessSummary([...bindings,{code:"tariff_published",ready:false}]).root?.code,"tariff_published");
+  assert.equal(valueReadinessSummary([...bindings,{code:"tariff_published",ready:false}]).more,1);
+});
+
+test("readiness copy exists for every check and request failure in both locales",()=>{
+  const en:Record<string,string>=valueQuotaMessagesEn, zh:Record<string,string>=valueQuotaMessagesZh;
+  for(const code of ["router_protocol","sqlite_authority","metering_storage","tariff_published","acknowledged_tariff","text_surface","unknown",
+    "failed","offline","timeout","upgrade","controlAuth","invalidResponse","conflict"]) {
+    assert.ok(en[`dashboard.userLimit.value.readiness.short.${code}`],code);
+    assert.ok(zh[`dashboard.userLimit.value.readiness.short.${code}`],code);
+  }
+  assert.equal(zh["dashboard.userLimit.value.readiness.short.sqlite_authority"],"Server 需完成存储迁移");
+  assert.match(en["dashboard.userLimit.value.readiness.sqlite_authority"],/Settings → General → Data storage → “Migrate and restart”/);
+  assert.equal("dashboard.userLimit.value.unavailable" in en,false,"retired in favour of the root-cause line");
 });
 
 test("USD quota decimals are exact, bounded and independent of wallet currency", () => {

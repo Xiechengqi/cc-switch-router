@@ -185,7 +185,54 @@ export function renderValueQuotaMessage(message: ValueQuotaMessage, t: ValueQuot
   return "raw" in message ? message.raw : t(message.key, message.values);
 }
 
-export type ValueReadinessCheck = {code: string; ready: boolean; state?: string; app?: string; profileId?: string | null; driverId?: string | null};
+export type ValueReadinessCheck = {code: string; ready: boolean; state?: string; app?: string; profileId?: string | null; driverId?: string | null;
+  /** The `code` of another check this one only waits on, e.g. an unacknowledged tariff waiting on an unpublished one. */
+  blockedBy?: string | null};
+/** Most fundamental first: what an operator should fix before anything else. */
+export const VALUE_READINESS_ORDER = ["router_protocol", "sqlite_authority", "metering_storage", "tariff_published",
+  "acknowledged_tariff", "text_surface"] as const;
+export type ValueReadinessCode = typeof VALUE_READINESS_ORDER[number];
+export function knownReadinessCode(code: unknown): ValueReadinessCode | undefined {
+  return VALUE_READINESS_ORDER.find(known => known === code);
+}
+/** A failed check, and the failed root it ultimately waits on when it is only a consequence. */
+export type ValueReadinessItem = {check: ValueReadinessCheck; waitingOn?: string};
+const readinessRank = (code: string) => {
+  const index = VALUE_READINESS_ORDER.indexOf(code as ValueReadinessCode);
+  return index < 0 ? VALUE_READINESS_ORDER.length : index;
+};
+/**
+ * Every failed check, roots first, each group in priority order (unknown codes
+ * last, otherwise as sent). A check is a root unless its `blockedBy` names
+ * another failed check; a consequence points at the root at the end of that
+ * chain. A blocker cycle has no root to point at, so its checks count as roots.
+ */
+export function valueReadinessItems(checks: readonly ValueReadinessCheck[] | null | undefined): ValueReadinessItem[] {
+  const failed = (checks ?? []).filter(check => check.ready !== true);
+  const failedCodes = new Set(failed.map(check => check.code));
+  const blocker = new Map(failed.map(check => [check.code, check.blockedBy ?? undefined]));
+  const items = failed.map((check, index) => {
+    let at = check.code, next = check.blockedBy ?? undefined;
+    const seen = new Set([at]);
+    while (next && next !== at && failedCodes.has(next) && !seen.has(next)) { seen.add(next); at = next; next = blocker.get(at); }
+    const cycle = !!next && next !== at && failedCodes.has(next);
+    return {item: cycle || at === check.code ? {check} : {check, waitingOn: at}, index};
+  });
+  return items.sort((a, b) => Number(!!a.item.waitingOn) - Number(!!b.item.waitingOn)
+    || readinessRank(a.item.check.code) - readinessRank(b.item.check.code) || a.index - b.index).map(({item}) => item);
+}
+/** Failed checks that are causes rather than consequences, most fundamental first. */
+export function valueReadinessRoots(checks: readonly ValueReadinessCheck[] | null | undefined): ValueReadinessCheck[] {
+  return valueReadinessItems(checks).filter(item => !item.waitingOn).map(item => item.check);
+}
+/**
+ * The one-line summary: the first root, and how many other kinds of root
+ * remain (several unverified bindings are one kind of problem, not several).
+ */
+export function valueReadinessSummary(checks: readonly ValueReadinessCheck[] | null | undefined): {root?: ValueReadinessCheck; more: number} {
+  const roots = valueReadinessRoots(checks);
+  return {root: roots[0], more: Math.max(0, new Set(roots.map(check => check.code)).size - 1)};
+}
 export function valueCapabilityReady(preview: ValueQuotaPreview | undefined) {
   return preview?.capabilityReady === true && Array.isArray(preview.checks)
     && ["router_protocol", "sqlite_authority", "metering_storage", "acknowledged_tariff", "text_surface"]

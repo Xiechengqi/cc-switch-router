@@ -1,6 +1,6 @@
 "use client";
 import * as React from "react";
-import { Button, Checkbox, Input, Modal } from "@heroui/react";
+import { Alert, Button, Checkbox, Input, Modal } from "@heroui/react";
 import { Trash2 } from "lucide-react";
 import { CompactSelect } from "@/components/common/compact-select";
 import { InfoHint } from "@/components/common/info-hint";
@@ -66,6 +66,8 @@ export function ShareValuePricingPanel({referenceModels=[]}:{referenceModels?:Ad
   const [saved,setSaved]=React.useState(false);
   const [visitedModels,setVisitedModels]=React.useState<Set<string>>(new Set());
   const [confirmation,setConfirmation]=React.useState<Confirmation|null>(null);
+  const [open,setOpen]=React.useState(false);
+  const modelInputId=React.useId();
   const coverage=React.useMemo(()=>{try{return inspectExecutionPricing(JSON.parse(draft));}catch{return [];}},[draft]);
   const parsed=React.useMemo(()=>{try{const value=JSON.parse(draft);return value?.models && typeof value.models==="object" && !Array.isArray(value.models)?value as ExecutionDraft:undefined;}catch{return undefined;}},[draft]);
   const replaceDraft=(value:string)=>{setDraft(value);setReviewed(false);setSaved(false);setInvalidFields(new Set());setVisitedModels(new Set());setEpoch(n=>n+1);};
@@ -96,6 +98,8 @@ export function ShareValuePricingPanel({referenceModels=[]}:{referenceModels?:Ad
     void authFetch("/v1/admin/share-value-pricing",{signal:controller.signal}).then(parseJson<Settings>).then((data)=>{
       if(controller.signal.aborted)return;
       setSettings(data);
+      // Nothing published means USD quotas are off everywhere: lead with the editor.
+      if(!data.revision)setOpen(true);
       const text=data.snapshot?JSON.stringify(data.snapshot,null,2):emptySnapshot();
       setDraft(text);setLoadedDraft(text);
     }).catch((cause)=>{if(!controller.signal.aborted)setError(errorText(cause));});
@@ -135,14 +139,25 @@ export function ShareValuePricingPanel({referenceModels=[]}:{referenceModels?:Ad
     }catch(cause){setError(errorText(cause));}finally{setBusy(false);}
   };
   const listedModels=confirmation?.kind==="publish"?confirmation.models:[];
-  return <details className="rounded-lg border bg-background p-4">
+  const startDraft=()=>{setOpen(true);window.requestAnimationFrame(()=>document.getElementById(modelInputId)?.focus());};
+  return <>{settings && !settings.revision ? <Alert status="warning" className="!text-slate-900">
+    <Alert.Indicator/>
+    <Alert.Content className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+      <span className="grid min-w-0 flex-1 basis-72 gap-0.5">
+        <Alert.Title>{t("dashboard.userLimit.value.unpublishedNotice.title")}</Alert.Title>
+        <Alert.Description>{t("dashboard.userLimit.value.unpublishedNotice.body")}</Alert.Description>
+      </span>
+      <Button size="sm" variant="primary" className="min-h-11 sm:min-h-9" onClick={startDraft}>{t("dashboard.userLimit.value.unpublishedNotice.action")}</Button>
+    </Alert.Content>
+  </Alert> : null}
+  <details className="rounded-lg border bg-background p-4" open={open} onToggle={event=>setOpen(event.currentTarget.open)}>
     <summary className="cursor-pointer font-medium">{t("dashboard.userLimit.value.pricing")}</summary>
     <p className="my-3 text-sm text-muted-foreground">{t("dashboard.userLimit.value.pricingHint")}</p>
     {health ? <div className="my-3 flex flex-wrap gap-x-5 gap-y-2 text-xs">{(["activeUsdGrants","scheduledGrants","staleGrants","acknowledgedInstallations"] as const).map(key=><span key={key}>{t(`dashboard.userLimit.value.health.${key}`)}: <strong>{health[key]}</strong></span>)}</div>:null}
     <div className="my-3 flex flex-wrap items-center gap-3"><span role="status" className="text-sm">{t(`dashboard.userLimit.value.pricingState.${publicationState}`)}</span>
       <Button size="sm" variant="secondary" isDisabled={refreshing||busy} onClick={()=>void reload()}>{t("common.reload")}</Button></div>
     {settings ? <fieldset className="min-w-0 border-0 p-0" disabled={busy||refreshing}><p className="break-all font-mono text-xs">{settings.revision || "—"} · v{settings.version}{settings.effectiveFromMs?` · ${new Date(settings.effectiveFromMs).toLocaleString()}`:null}</p>
-    <div className="mt-3 flex flex-wrap gap-2"><Input className="min-w-0 flex-1" aria-label={t("dashboard.userLimit.value.modelId")} placeholder={t("dashboard.userLimit.value.modelId")} value={model}
+    <div className="mt-3 flex flex-wrap gap-2"><Input id={modelInputId} className="min-w-0 flex-1" aria-label={t("dashboard.userLimit.value.modelId")} placeholder={t("dashboard.userLimit.value.modelId")} value={model}
         aria-invalid={modelError?true:undefined} aria-describedby={modelError?"execution-model-error":undefined}
         onChange={event=>setModel(event.target.value)} onKeyDown={event=>{if(event.key==="Enter"){event.preventDefault();addModel();}}}/>
       <Button variant="secondary" isDisabled={busy || invalidFields.size>0 || !modelKey || !!modelError} onClick={()=>addModel()}>{t("dashboard.userLimit.value.addModel")}</Button>
@@ -233,5 +248,5 @@ export function ShareValuePricingPanel({referenceModels=[]}:{referenceModels?:Ad
         </Modal.Footer>
       </Modal.Dialog></Modal.Container>
     </Modal.Backdrop>
-  </details>;
+  </details></>;
 }

@@ -165,17 +165,20 @@ export function SettingsPage() {
     "cc_switch_router_settings_navigation_v1", null,
   );
   const { activeSection, activeSubsections } = settingsNavigation(savedNavigation);
-  // An explicit wallet-settings link takes precedence over the cached group,
+  // An explicit wallet-settings or model-prices link takes precedence over the cached group,
   // once per navigation. Subsequent tab choices remain user-owned.
   const deepLinkApplied = React.useRef(false);
   React.useEffect(() => {
     if (!navigationReady || deepLinkApplied.current) return;
     deepLinkApplied.current = true;
     const url = new URL(window.location.href);
-    if (url.searchParams.get("panel") === "market_finance") {
+    const panel = url.searchParams.get("panel");
+    if (panel === "market_finance" || panel === "model_prices") {
       setSavedNavigation((current: unknown) => {
         const navigation = settingsNavigation(current);
-        return { ...navigation, activeSection: "marketplace", activeSubsections: { ...navigation.activeSubsections, marketplace: PANEL_SUBSECTION_IDS.market_finance } };
+        return panel === "model_prices"
+          ? { ...navigation, activeSection: "model_prices" }
+          : { ...navigation, activeSection: "marketplace", activeSubsections: { ...navigation.activeSubsections, marketplace: PANEL_SUBSECTION_IDS.market_finance } };
       });
       // Consume the shortcut so a later refresh restores the user's newest
       // section choice instead of applying the old shortcut a second time.
