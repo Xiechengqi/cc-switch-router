@@ -858,7 +858,34 @@ fn migration_checksum(sql: &str) -> String {
 mod tests {
     use super::*;
 
-    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 266;
+    // Migration 0102 dropped the write-only `dashboard_ux_events` table.
+    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 265;
+
+    #[test]
+    fn migration_102_drops_only_the_dashboard_ux_table() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 101);
+        let tables = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let before = tables(&conn);
+        apply(&conn).unwrap();
+        assert_eq!(tables(&conn), before - 1);
+        assert_eq!(tables(&conn), CURRENT_SCHEMA_TABLE_COUNT);
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('dashboard_ux_events', 'idx_dashboard_ux_events_created')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
 
     #[test]
     fn migration_101_adds_private_value_quotas_without_repricing_wallets_or_inventing_cache_ttl() {

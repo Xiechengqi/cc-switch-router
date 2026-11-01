@@ -148,7 +148,7 @@ try {
         else if (action === "late-payment") { assert.ok(body.note); o.latePaymentReported = true; if (o.status === "awaiting_seller") { o.status = "disputed"; o.paidAt = new Date().toISOString(); } }
         o.version++; o.updatedAt = new Date().toISOString(); return json(route, o);
       }
-      if (p === "/v1/admin/settings") return json(route, { revision: "1", generatedAt: new Date().toISOString(), envPath: "/test/.env", schema: { categories: [{ id: "marketplace", label: "Marketplace", description: "Marketplace", fieldCount: 0 }], fields: [], groups: [] }, values: [], pendingRestartKeys: [] });
+      if (p === "/v1/admin/settings") return json(route, { revision: "1", generatedAt: new Date().toISOString(), envPath: "/test/.env", schema: { categories: [{ id: "marketplace", label: "Market & Billing", description: "Market & Billing", fieldCount: 0 }], sections: [{ id: "share_market", category: "marketplace", label: "Share Market", groups: [], panels: [] }, { id: "wallet_payments", category: "marketplace", label: "Wallet & payments", groups: [], panels: ["market_finance"] }], fields: [], groups: [] }, values: [], pendingRestartKeys: [], unrecognizedKeys: [] });
       if (p === "/v1/admin/market-finance/readiness") return json(route, { mode: "shadow", version: 1, newOrdersPaused: false, newTopupsPaused: false, codeIntegrated: true, criticalCases: 0, staleTopupReviews: 0, verifiedLiveTopups: 1, paymentChannelBlockers: [], canEnable: false });
       if (p === "/v1/admin/market-finance/overview") return json(route, overview);
       if (p === "/v1/admin/market-finance/wallet-policy") return json(route, { version: 1, maintenanceFeeBps: 500, transfersEnabled: true, transfersPaused: false, transferMaxMinor: 500000, transferDailyMaxMinor: 500000, balanceRefundable: false, canEdit: true });
@@ -292,7 +292,7 @@ try {
   await management.page.goto(`${base}/account/wallet/?c2cSell=1`);
   const managementLink = management.page.getByRole("dialog", { name: "Sell balance", exact: true }).getByRole("link", { name: "Open wallet settings", exact: true });
   await managementLink.waitFor();
-  assert.equal(await managementLink.getAttribute("href"), "/settings/?panel=market_finance");
+  assert.equal(await managementLink.getAttribute("href"), "/settings/?section=wallet_payments");
   await managementLink.click();
   await management.page.locator("[data-c2c-admin]").getByText("C2C settings", { exact: true }).waitFor();
   await management.context.close();
@@ -406,7 +406,7 @@ try {
   const adminPanel = owner.page.locator("[data-c2c-admin]"); await adminPanel.getByText("C2C settings", { exact: true }).waitFor();
   assert.equal(new URL(owner.page.url()).searchParams.has("panel"), false, "settings shortcut is consumed once");
   await owner.page.getByRole("button", { name: "Overview", exact: true }).click();
-  await owner.page.waitForFunction(() => JSON.parse(localStorage.getItem("cc_switch_router_settings_navigation_v1"))?.activeSection === "overview");
+  await owner.page.waitForFunction(() => JSON.parse(localStorage.getItem("cc_switch_router_settings_navigation_v2"))?.activeCategory === "overview");
   await owner.page.reload();
   await owner.page.getByRole("button", { name: "Overview", exact: true }).waitFor();
   assert.equal(await adminPanel.isVisible(), false, "refresh preserves a later section choice instead of replaying the shortcut");

@@ -665,7 +665,8 @@ try {
   let commissionPolicy = { version: 1, current: { policyVersion: 1, rateBps: 1000, effectiveAt: "2026-01-01T00:00:00Z" }, scheduled: null, increaseNoticeDays: 7, canEdit: true };
   let commissionWrites = 0;
   let conflictCommission = false;
-  const categories = [{ id: "marketplace", label: "Marketplace", description: "Marketplace", fieldCount: 0 }];
+  const categories = [{ id: "marketplace", label: "Market & Billing", description: "Market & Billing", fieldCount: 0 }];
+  const sections = [{ id: "share_market", category: "marketplace", label: "Share Market", groups: [], panels: [] }, { id: "wallet_payments", category: "marketplace", label: "Wallet & payments", groups: [], panels: ["market_finance"] }];
   const overview = Object.fromEntries(["walletPostedUnits", "walletHeldUnits", "unfulfilledUnits", "providerPendingUnits",
     "providerAvailableUnits", "providerHeldUnits", "buyerRefundHeldUnits", "ownerLossUnits", "maintenanceRevenueUnits"].map((key) => [key, "0"]));
   Object.assign(overview, { estimatedGatewayCostMinor: 0, creditedTopupMinor: 0, grossTopupMinor: 0,
@@ -684,7 +685,7 @@ try {
     const path = new URL(route.request().url()).pathname;
     let data = [];
     if (path === "/v1/admin/settings") data = { revision: "1", generatedAt: new Date().toISOString(),
-      envPath: "/test/.env", schema: { categories, fields: [], groups: [] }, values: [], pendingRestartKeys: [] };
+      envPath: "/test/.env", schema: { categories, sections, fields: [], groups: [] }, values: [], pendingRestartKeys: [], unrecognizedKeys: [] };
     else if (path === "/v1/admin/market-finance/readiness") data = { mode: "enabled", version: 1,
       newOrdersPaused: false, newTopupsPaused: false, codeIntegrated: true,
       criticalCases: 0, staleTopupReviews: 0, verifiedLiveTopups: 1,
@@ -752,8 +753,8 @@ try {
     await route.fulfill({ contentType: "application/json", body: JSON.stringify(data) });
   });
   await page.goto(`${baseUrl}/settings/`);
-  await page.getByRole("button", { name: "Marketplace", exact: true }).click();
-  await page.getByRole("tab", { name: "Platform wallet", exact: true }).click();
+  await page.getByRole("button", { name: "Market & Billing", exact: true }).click();
+  await page.getByRole("tab", { name: /^Wallet & payments/ }).click();
   await page.getByRole("region", { name: "Client rental terminations", exact: true }).getByText("No Client termination records.", { exact: true }).waitFor();
   const policyPanel = page.locator("section").filter({ has: page.getByRole("heading", { name: "Balance & sending", exact: true }) }).last();
   const feeInput = policyPanel.getByLabel("Top-up maintenance fee (%)", { exact: true });
