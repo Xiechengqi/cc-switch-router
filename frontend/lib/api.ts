@@ -78,6 +78,7 @@ import type {
   ClientMarketProviderSupply,
   MarketProviderList,
   MarketProviderDetail,
+  MyMarketProvider,
   ClientMarketAllocationQuote,
   ClientMarketCommitQuoteResponse,
   ClientMarketBatch,
@@ -1468,6 +1469,23 @@ export async function getMarketProvider(id: string, signal?: AbortSignal) {
     await fetch(`/v1/market-providers/${encodeURIComponent(id)}`, {
       cache: "no-cache",
       signal,
+    }),
+  );
+}
+
+export async function getMyMarketProvider(signal?: AbortSignal) {
+  return parseJson<MyMarketProvider>(
+    await authFetch("/v1/account/market-provider", { cache: "no-store", signal }),
+  );
+}
+
+/** An empty name restores the generated default. */
+export async function updateMyMarketProviderDisplayName(displayName: string) {
+  return parseJson<MyMarketProvider>(
+    await authFetch("/v1/account/market-provider/display-name", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ displayName }),
     }),
   );
 }

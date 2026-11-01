@@ -1,7 +1,7 @@
 "use client";
 
 import { Button } from "@heroui/react";
-import { House, Loader2, Monitor, Network, Share2, Trophy, WalletCards } from "lucide-react";
+import { House, Loader2, Monitor, Network, Share2, Store, WalletCards } from "lucide-react";
 import * as React from "react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { ChoiceCard } from "@/components/common/choice-card";
@@ -14,13 +14,13 @@ import { HOME_ENTRIES, rememberHomeEntryStatus, type HomeEntry } from "@/lib/hom
 
 const OPTIONS: Record<HomeEntry, {
   icon: typeof House;
-  labelKey: "start.home.clients" | "nav.clientMarketTab" | "nav.shareMarketTab" | "account.nav.wallet" | "nav.providersTab";
+  labelKey: "start.home.clients" | "nav.clientMarketTab" | "nav.shareMarketTab" | "account.nav.wallet" | "account.nav.providerSettings";
 }> = {
   clients: { icon: Monitor, labelKey: "start.home.clients" },
   "client-market": { icon: Network, labelKey: "nav.clientMarketTab" },
   "share-market": { icon: Share2, labelKey: "nav.shareMarketTab" },
   wallet: { icon: WalletCards, labelKey: "account.nav.wallet" },
-  providers: { icon: Trophy, labelKey: "nav.providersTab" },
+  providers: { icon: Store, labelKey: "account.nav.providerSettings" },
 };
 
 /** Which page the product home opens for this account. */

@@ -82,7 +82,7 @@ type ClientMarketView = {
 
 export function ClientMarketPage() {
   const { locale, t } = useLocaleText();
-  const { session } = useAuth();
+  const { session, loading: authLoading } = useAuth();
   const searchParams = useSearchParams();
   const authed = !!session?.authenticated;
   const viewerUserId = session?.user?.id;
@@ -460,6 +460,17 @@ export function ClientMarketPage() {
     }
     setAddOpen(true);
   };
+
+  // `?addHost=1` (the Provider center's "Rent out a Host") opens the dialog
+  // once; the flag leaves the address so a reload does not reopen it.
+  const addHostRequested = searchParams.get("addHost") === "1";
+  React.useEffect(() => {
+    if (!addHostRequested || authLoading) return;
+    replaceCurrentSearch((params) => params.delete("addHost"));
+    openAddHost();
+    // openAddHost reads the current sign-in state; run once per request.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [addHostRequested, authLoading]);
 
   const openExportDialog = async (selectedOnly: boolean) => {
     setTransferBusy(true);

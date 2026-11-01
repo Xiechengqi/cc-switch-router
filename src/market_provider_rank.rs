@@ -8,14 +8,37 @@ use crate::db::{Connection, Transaction, TransactionBehavior, params};
 use crate::error::AppError;
 use crate::store::AppStore;
 
-pub(crate) const ALGORITHM_VERSION: &str = "provider-rank-v1";
+/// v2 bounds every signal to a recent window: a 400-day probe history and
+/// an all-time fulfillment ledger let old failures (and old successes)
+/// outweigh what a buyer would meet today.
+pub(crate) const ALGORITHM_VERSION: &str = "provider-rank-v2";
 pub(crate) const REFRESH_INTERVAL_SECS: u64 = 15 * 60;
-const SELECTION_WINDOW_DAYS: i64 = 90;
-const SHARE_QUALITY_WINDOW_DAYS: i64 = 400;
-const GENERATION_RETENTION_DAYS: i64 = 30;
+pub(crate) const SELECTION_WINDOW_DAYS: i64 = 90;
+pub(crate) const SHARE_QUALITY_WINDOW_DAYS: i64 = 90;
+pub(crate) const HOST_QUALITY_WINDOW_DAYS: i64 = 30;
+pub(crate) const FULFILLMENT_WINDOW_DAYS: i64 = 90;
+pub(crate) const PERFORMANCE_WINDOW_DAYS: i64 = 30;
+pub(crate) const GENERATION_RETENTION_DAYS: i64 = 30;
 const PERFORMANCE_MIN_GENERATION_MS: i64 = 100;
-const MIN_INDEPENDENT_BUYERS: i64 = 3;
-const MIN_OBSERVATION_DAYS: i64 = 7;
+pub(crate) const MIN_INDEPENDENT_BUYERS: i64 = 3;
+pub(crate) const MIN_OBSERVATION_DAYS: i64 = 7;
+
+/// Score weights in percent. The public method view publishes these exact
+/// values, so the explanation cannot drift from the arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RankWeights {
+    pub service_quality: u8,
+    pub effective_choice: u8,
+    pub fulfillment: u8,
+    pub supply_breadth: u8,
+}
+
+pub(crate) const RANK_WEIGHTS: RankWeights = RankWeights {
+    service_quality: 45,
+    effective_choice: 30,
+    fulfillment: 15,
+    supply_breadth: 10,
+};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RankProjection {
@@ -78,10 +101,11 @@ impl RankSignals {
     }
 
     pub(crate) fn score(self) -> f64 {
-        (0.45 * self.service_quality
-            + 0.30 * self.effective_choice
-            + 0.15 * self.fulfillment
-            + 0.10 * self.supply_breadth)
+        let weight = |percent: u8| f64::from(percent) / 100.0;
+        (weight(RANK_WEIGHTS.service_quality) * self.service_quality
+            + weight(RANK_WEIGHTS.effective_choice) * self.effective_choice
+            + weight(RANK_WEIGHTS.fulfillment) * self.fulfillment
+            + weight(RANK_WEIGHTS.supply_breadth) * self.supply_breadth)
             .clamp(0.0, 1.0)
     }
 }
@@ -116,6 +140,7 @@ struct ProviderMetrics {
     idle_host_total: i64,
     country_count: i64,
     app_count: i64,
+    performance_samples: i64,
 }
 
 fn map_db(context: &'static str) -> impl FnOnce(crate::db::Error) -> AppError {
@@ -405,8 +430,11 @@ fn candidate_tx(
     now: DateTime<Utc>,
 ) -> Result<Candidate, AppError> {
     let probe_cutoff = (now - Duration::days(SHARE_QUALITY_WINDOW_DAYS)).timestamp();
-    let host_cutoff = (now - Duration::days(30)).format("%Y-%m-%d").to_string();
-    let request_cutoff = (now - Duration::days(30)).timestamp();
+    let host_cutoff = (now - Duration::days(HOST_QUALITY_WINDOW_DAYS))
+        .format("%Y-%m-%d")
+        .to_string();
+    let request_cutoff = (now - Duration::days(PERFORMANCE_WINDOW_DAYS)).timestamp();
+    let fulfillment_cutoff = (now - Duration::days(FULFILLMENT_WINDOW_DAYS)).to_rfc3339();
     let (probe_success, probe_total): (i64, i64) = tx
         .query_row(
             "SELECT COALESCE(SUM(CASE WHEN observation.outcome = 'success' THEN 1 ELSE 0 END), 0),
@@ -503,8 +531,10 @@ fn candidate_tx(
                        profile.canonical_email
                )
                AND (subscription.activated_at IS NOT NULL
-                    OR subscription.status = 'grant_failed')",
-            params![profile_id],
+                    OR subscription.status = 'grant_failed')
+               AND julianday(COALESCE(subscription.activated_at, subscription.created_at))
+                   >= julianday(?2)",
+            params![profile_id, fulfillment_cutoff],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(map_db("read Market Provider Share fulfillment"))?;
@@ -526,8 +556,9 @@ fn candidate_tx(
                        lower(trim(COALESCE(NULLIF(job.host_owner_email, ''),
                                            host.host_owner_email)))
                )
-               AND job.type = 'create' AND job.status IN ('succeeded', 'failed')",
-            params![profile_id],
+               AND job.type = 'create' AND job.status IN ('succeeded', 'failed')
+               AND julianday(job.created_at) >= julianday(?2)",
+            params![profile_id, fulfillment_cutoff],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(map_db("read Market Provider Client fulfillment"))?;
@@ -595,7 +626,7 @@ fn candidate_tx(
             |row| row.get(0),
         )
         .map_err(map_db("read Market Provider app breadth"))?;
-    let (ttft_ms, tps) = tx
+    let (ttft_ms, tps, performance_samples) = tx
         .query_row(
             "SELECT AVG(CASE WHEN log.is_streaming != 0
                                   AND lower(COALESCE(log.stream_status, '')) = 'completed'
@@ -610,7 +641,12 @@ fn candidate_tx(
                                   AND log.latency_ms - log.first_token_ms
                                       >= MAX(?3, (log.latency_ms + 99) / 100)
                              THEN (log.output_tokens * 1000.0)
-                                  / (log.latency_ms - log.first_token_ms) END)
+                                  / (log.latency_ms - log.first_token_ms) END),
+                    COUNT(CASE WHEN log.is_streaming != 0
+                                    AND lower(COALESCE(log.stream_status, '')) = 'completed'
+                                    AND log.first_token_ms > 0
+                                    AND log.latency_ms > log.first_token_ms
+                               THEN 1 END)
              FROM share_request_logs log
              WHERE log.created_at >= ?2
                AND log.status_code BETWEEN 200 AND 299 AND log.is_health_check = 0
@@ -625,7 +661,13 @@ fn candidate_tx(
                           OR log.created_at < unixepoch(window.ends_at))
                )",
             params![profile_id, request_cutoff, PERFORMANCE_MIN_GENERATION_MS],
-            |row| Ok((row.get::<_, Option<f64>>(0)?, row.get::<_, Option<f64>>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, Option<f64>>(0)?,
+                    row.get::<_, Option<f64>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
         )
         .map_err(map_db("read display-only Market Provider performance"))?;
 
@@ -660,6 +702,7 @@ fn candidate_tx(
         idle_host_total: idle_hosts,
         country_count: countries,
         app_count,
+        performance_samples,
     })
     .map_err(|error| {
         AppError::Internal(format!("encode Market Provider metrics failed: {error}"))
@@ -1113,7 +1156,54 @@ mod tests {
     }
 
     #[test]
-    fn weights_match_provider_rank_v1_contract() {
+    fn fulfillment_only_counts_the_recent_window() {
+        let conn = database();
+        insert_profile(&conn, "mp_window", None);
+        conn.execute(
+            "UPDATE market_provider_profiles
+             SET canonical_email = 'owner@example.com' WHERE id = 'mp_window'",
+            [],
+        )
+        .expect("align windowed Share owner identity");
+        let now = Utc::now();
+        let recent = (now - Duration::hours(2)).to_rfc3339();
+        let expired = (now - Duration::days(FULFILLMENT_WINDOW_DAYS + 30)).to_rfc3339();
+        insert_share_subscription(
+            &conn,
+            "mp_window",
+            "recent",
+            "active",
+            "recent-buyer",
+            Some(&recent),
+            Some(100),
+        );
+        insert_share_subscription(
+            &conn,
+            "mp_window",
+            "expired",
+            "active",
+            "expired-buyer",
+            Some(&expired),
+            Some(100),
+        );
+        let tx = conn.transaction().expect("start windowed transaction");
+        let candidate = candidate_tx(&tx, "mp_window", now).expect("calculate windowed rank");
+        let metrics: serde_json::Value =
+            serde_json::from_str(&candidate.metrics_json).expect("decode windowed metrics");
+        assert_eq!(metrics["fulfillmentSuccesses"], 1);
+        assert_eq!(metrics["fulfillmentTotal"], 1);
+        drop(tx);
+    }
+
+    #[test]
+    fn weights_match_the_published_contract() {
+        assert_eq!(
+            u32::from(RANK_WEIGHTS.service_quality)
+                + u32::from(RANK_WEIGHTS.effective_choice)
+                + u32::from(RANK_WEIGHTS.fulfillment)
+                + u32::from(RANK_WEIGHTS.supply_breadth),
+            100
+        );
         let quality = RankSignals {
             service_quality: 1.0,
             effective_choice: 0.0,

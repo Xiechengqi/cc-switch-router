@@ -20,6 +20,7 @@
   --color-muted-foreground: rgb(var(--router-muted-foreground));
   --color-accent: rgb(var(--router-accent));
   --color-accent-foreground: rgb(var(--router-accent-foreground));
+  --color-accent-secondary: rgb(var(--router-accent-secondary));
   --color-destructive: rgb(var(--router-destructive));
   --color-destructive-foreground: rgb(var(--router-destructive-foreground));
   --color-border: rgb(var(--router-border));

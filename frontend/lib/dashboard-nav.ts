@@ -227,6 +227,18 @@ export function clientMarketMineHref(installationId?: string) {
   return buildDashboardHref(DASHBOARD_CLIENT_MARKET_PATH, params);
 }
 
+/** Client Market with the add-Host dialog open, after sign-in when needed. */
+export function clientMarketAddHostHref() {
+  return buildDashboardHref(DASHBOARD_CLIENT_MARKET_PATH, new URLSearchParams({ addHost: "1" }));
+}
+
+/** The public ranking with one Provider's detail open. */
+export function providerRankingHref(providerId?: string) {
+  return providerId
+    ? buildDashboardHref(DASHBOARD_PROVIDERS_PATH, new URLSearchParams({ provider: providerId }))
+    : DASHBOARD_PROVIDERS_PATH;
+}
+
 /** Deep-link into Client Market, optionally filtering to one public Market Provider. */
 export function clientMarketHref(options?: { providerId?: string }) {
   const params = new URLSearchParams();

@@ -1,12 +1,17 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { ApiError } from "@/lib/api";
 import type { MarketProvider } from "@/lib/types";
 import {
   actorBoundValue,
   basisPointsScore,
   filterMarketProviders,
   formatBasisPointScore,
+  hasAvailableSupply,
   isFormallyRanked,
+  providerLoadError,
+  providerMarketFilter,
+  rankProgress,
 } from "./providers-page-utils";
 
 test("private snapshots are hidden synchronously when the authenticated actor changes", () => {
@@ -120,4 +125,53 @@ test("formal rank presentation fails closed when rank fields disagree", () => {
     rankPosition: 1,
     scoreBps: 10_001,
   })), false);
+});
+
+test("available-only follows the selected market and search matches the shown name", () => {
+  const base = provider("base").inventory;
+  const fullShareIdleHost = provider("Official Provider", {
+    official: true,
+    inventory: { ...base, activeShareCount: 1, hasShareMarket: true, hostTotal: 1, idleHostTotal: 1, hasClientMarket: true },
+  });
+  const openShare = provider("Open Share", {
+    inventory: { ...base, activeShareCount: 1, availableShareSeats: 2, hasShareMarket: true },
+  });
+  assert.equal(hasAvailableSupply(fullShareIdleHost, "share"), false);
+  assert.equal(hasAvailableSupply(fullShareIdleHost, "client"), true);
+  assert.equal(hasAvailableSupply(fullShareIdleHost), true);
+  const providers = [fullShareIdleHost, openShare];
+  assert.deepEqual(
+    filterMarketProviders(providers, { market: "share", availableOnly: true }).map((item) => item.id),
+    ["Open Share"],
+  );
+  assert.deepEqual(
+    filterMarketProviders(providers, {
+      query: "官方",
+      nameOf: (item) => (item.official ? "官方供应商" : item.displayName),
+    }).map((item) => item.id),
+    ["Official Provider"],
+  );
+});
+
+test("the market filter from the address falls back to every market", () => {
+  assert.equal(providerMarketFilter("share"), "share");
+  assert.equal(providerMarketFilter("client"), "client");
+  assert.equal(providerMarketFilter("hosts"), "all");
+  assert.equal(providerMarketFilter(null), "all");
+});
+
+test("rank progress reports each threshold separately", () => {
+  const progress = rankProgress(
+    provider("collecting", { independentBuyerCount: 1, observationDays: 27 }),
+    { minimumIndependentBuyers: 3, minimumObservationDays: 7 },
+  );
+  assert.deepEqual(progress.buyers, { count: 1, min: 3, met: false });
+  assert.deepEqual(progress.days, { count: 27, min: 7, met: true });
+});
+
+test("coded Router errors map to page states", () => {
+  assert.equal(providerLoadError(new ApiError(503, "x", "provider_rank_not_ready")), "notReady");
+  assert.equal(providerLoadError(new ApiError(404, "x", "provider_not_found")), "notFound");
+  assert.equal(providerLoadError(new ApiError(500, "x")), "generic");
+  assert.equal(providerLoadError(new Error("offline")), "generic");
 });

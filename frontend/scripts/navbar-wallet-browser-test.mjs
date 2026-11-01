@@ -232,7 +232,7 @@ try {
   available = "86400000";
   await page.evaluate(() => window.dispatchEvent(new Event("router-auth-changed")));
   await expectAmount("$10.00");
-  await page.getByRole("navigation", { name: "控制台分区" }).getByRole("link", { name: "服务商", exact: true }).click();
+  await page.getByRole("navigation", { name: "控制台分区" }).getByRole("link", { name: "供应商", exact: true }).click();
   await page.waitForURL(`${baseUrl}/providers/`);
   await expectAmount("$10.00");
   assert.equal(await page.getByRole("complementary", { name: "平台钱包", exact: true }).count(), 0);

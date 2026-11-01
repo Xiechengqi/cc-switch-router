@@ -19,6 +19,7 @@ import { AccountMarketAccessPage } from "@/components/dashboard/account-market-a
 import { AccountMarketRecords } from "@/components/dashboard/account-market-records";
 import { AccountSectionHeader } from "@/components/dashboard/account-section";
 import { ProviderFinancePanel } from "@/components/dashboard/provider-finance-panel";
+import { ProviderStandingCard } from "@/components/dashboard/provider-standing-card";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { PROVIDER_CENTER_TABS, providerCenterTab, type ProviderCenterTab } from "@/lib/dashboard-nav";
 import { replaceCurrentSearch } from "@/lib/url-search";
@@ -68,6 +69,7 @@ function ProviderCenterWorkspace({ actor }: { actor?: string }) {
   return (
     <div className="grid min-w-0 gap-4">
       <AccountSectionHeader icon={Store} title={t("account.nav.providerSettings")} hint={t("providerCenter.hint")} />
+      <ProviderStandingCard />
       <SegmentedControl
         value={tab}
         onChange={setTab}

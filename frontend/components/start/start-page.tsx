@@ -10,11 +10,11 @@ import { useLocaleText } from "@/components/i18n/locale-provider";
 import { saveHomeEntry } from "@/lib/auth";
 import { pathForHomeEntry, rememberHomeEntryStatus, type HomeEntry, type HomeEntryStatus } from "@/lib/home-entry";
 
-const CHOICES: { entry: Exclude<HomeEntry, "clients">; titleKey: "start.rentClient" | "start.buyShare" | "start.addBalance" | "start.sell"; subtitleKey: "nav.clientMarketTab" | "nav.shareMarketTab" | "account.nav.wallet" | "nav.providersTab" }[] = [
+const CHOICES: { entry: Exclude<HomeEntry, "clients">; titleKey: "start.rentClient" | "start.buyShare" | "start.addBalance" | "start.sell"; subtitleKey: "nav.clientMarketTab" | "nav.shareMarketTab" | "account.nav.wallet" | "account.nav.providerSettings" }[] = [
   { entry: "client-market", titleKey: "start.rentClient", subtitleKey: "nav.clientMarketTab" },
   { entry: "share-market", titleKey: "start.buyShare", subtitleKey: "nav.shareMarketTab" },
   { entry: "wallet", titleKey: "start.addBalance", subtitleKey: "account.nav.wallet" },
-  { entry: "providers", titleKey: "start.sell", subtitleKey: "nav.providersTab" },
+  { entry: "providers", titleKey: "start.sell", subtitleKey: "account.nav.providerSettings" },
 ];
 
 export function StartPage({ onSaved }: { onSaved?: (status: HomeEntryStatus) => void }) {

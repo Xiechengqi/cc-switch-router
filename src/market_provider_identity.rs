@@ -84,7 +84,7 @@ fn new_profile_id() -> String {
     format!("{PROFILE_PREFIX}{}", Uuid::new_v4().simple())
 }
 
-fn default_display_name(profile_id: &str) -> String {
+pub(crate) fn default_display_name(profile_id: &str) -> String {
     let suffix = profile_id
         .strip_prefix(PROFILE_PREFIX)
         .unwrap_or(profile_id)

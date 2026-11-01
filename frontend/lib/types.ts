@@ -2449,6 +2449,15 @@ export type MarketProviderRankGeneration = {
   };
   minimumIndependentBuyers: number;
   minimumObservationDays: number;
+  /** Older Routers omit the windows; the method view then leaves them out. */
+  windows?: {
+    shareQualityDays: number;
+    hostQualityDays: number;
+    effectiveChoiceDays: number;
+    fulfillmentDays: number;
+    performanceDays: number;
+  };
+  refreshIntervalSecs?: number;
 };
 
 export type MarketProvider = {
@@ -2458,6 +2467,8 @@ export type MarketProvider = {
   status: string;
   rankState: "ranked" | "collecting" | string;
   rankPosition?: number;
+  /** Places gained (positive) or lost since a day earlier. */
+  rankChange?: number;
   scoreBps?: number;
   components: {
     serviceQualityBps: number;
@@ -2488,6 +2499,7 @@ export type MarketProvider = {
   performance: {
     averageTtftMs?: number;
     averageTps?: number;
+    sampleCount?: number;
     displayOnly: boolean;
   };
 
@@ -2503,6 +2515,7 @@ export type MarketProviderList = {
 export type MarketProviderDetail = MarketProvider & {
   shareSupply: Array<{
     listingId: string;
+    shareId?: string;
     shareName: string;
     apps: string[];
     availableSeats: number;
@@ -2513,6 +2526,20 @@ export type MarketProviderDetail = MarketProvider & {
     idleHosts: number;
     totalHosts: number;
   }>;
+};
+
+export type MyMarketProvider = {
+  profile: {
+    id: string;
+    displayName: string;
+    defaultDisplayName: string;
+    status: string;
+    official: boolean;
+  } | null;
+  standing: MarketProvider | null;
+  generation: MarketProviderRankGeneration | null;
+  displayNameMinChars: number;
+  displayNameMaxChars: number;
 };
 
 export type ClientMarketQuoteItem = {

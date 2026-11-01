@@ -1,4 +1,4 @@
-# Provider Rank v1
+# Provider Rank v2
 
 Provider Rank 是 Router 内建 Share Market 与 Client Market 的供应商发现层。它把同一供应商跨两个市场的供给、履约和资金关系归到一个稳定身份，并用可审计的观测信号生成排名。它不改变商品准入、授权、计费或结算规则。
 
@@ -30,11 +30,11 @@ score = 45% service quality
       + 10% supply breadth
 ```
 
-只有同时达到 **3 个独立买家**和 **7 个观测日**的 Provider 才进入 `ranked`；其余 Provider 保持 `collecting`，仍在列表中展示。
+只有同时达到 **3 个独立买家**和 **7 个观测日**的 Provider 才进入 `ranked`；其余 Provider 保持 `collecting`，仍在列表中展示，并公开各自距离两个门槛的进度。权重、门槛与各信号的时间窗都定义在 `src/market_provider_rank.rs` 的常量中，公开 generation 视图直接引用这些常量（`weights`、`minimumIndependentBuyers`、`minimumObservationDays`、`windows`、`refreshIntervalSecs`），说明文字因此不会与计算漂移。
 
 ### Service quality（45%）
 
-- Share 使用最近最多 400 天的 canonical model-probe observation；legacy/unobserved 证据不进入成功样本。探测、请求性能、有效选择和履约都按事件发生时所在的显式 listing Provider 时间窗归属；关闭期间不计，重开或换主也不会把旧证据移动给当前 Provider。
+- Share 使用最近 90 天的 canonical model-probe observation（v1 为 400 天，过长的历史会稀释近期故障）；legacy/unobserved 证据不进入成功样本。探测、请求性能、有效选择和履约都按事件发生时所在的显式 listing Provider 时间窗归属；关闭期间不计，重开或换主也不会把旧证据移动给当前 Provider。
 - observation 必须通过 `share_model_health_slots.observation_id` 实际投影到对应 Share，才可沿该 Share 的 listing 时间窗归属；同一 observation 只计一次，不因同一 Share 的历史 listing 或同 installation 的其他 Share/listing 重复、串号或放大样本。
 - Client 使用最近 30 天的 Host online/observed samples。
 - 两类信号同时存在时按 70% Share、30% Client 混合；单边存在时使用该单边。
@@ -46,20 +46,21 @@ score = 45% service quality
 - 付费选择权重为 1.00；免费选择权重为 0.25。
 - 同一买家跨 Share 与 Client 选择同一 Provider 只保留一个买家，并取较高权重。
 - 未激活、一天内释放和 Provider 自租不计入选择；自租按事件所属时间窗的 Provider user ID 与 canonical email fail closed。交易行上的 owner 字段会在合法换主流程中更新，因此不能作为历史归属真相。
-- “独立买家”在 v1 中表示不同的 Router `user_id`，不是 KYC 身份或完整的反女巫证明。
+- “独立买家”当前表示不同的 Router `user_id`，不是 KYC 身份或完整的反女巫证明。
 
 ### Fulfillment（15%）
 
 - Share 的已激活 subscription 算成功，`grant_failed` 算失败；仍在 pending 的授权不进入分母。
 - Client 的 create provisioning job 仅以 `succeeded` / `failed` 进入分母。
 - 两个市场的 Provider 自租/自建都不进入履约分子或分母，避免供应商用自测请求堆高样本。
-- v1 使用全部已保存的履约历史；quality 和 choice 使用上述时间窗口。这是有意的保守口径，后续如改为滚动窗口必须提升 algorithm version。
+- v2 只计最近 90 天的履约：Share 按激活时间（失败按创建时间），Client 按 job 创建时间。v1 使用全部历史，旧失败永远不会衰减。
+- Client 履约按 job 发生时记录的 Host owner 归属，Host 转让后历史履约仍属于原 Provider；这与 choice 按 Host Provider alias 归属不同，是有意的历史口径。
 
 ### Supply breadth（10%）
 
 已启用 App 数、国家数以及可用 Share seat/空闲 Host 数形成饱和分数。Share 供给必须同时满足 listing 有效、底层 Share active 且 owner 一致、至少存在一个未退休可见 seat；只有实际 enabled 的 App binding 计数。Client 已 disabled 的 Host 不再属于公开供给。以上边界与两个 Market 的可选库存一致。供给广度不能代替质量和履约。
 
-TTFT 与 TPS 来自最近 30 天成功、非健康检查且完整结束的流式 Share 请求；TPS 还要求 observed usage 和可信的生成时长，terminal flush 不进入吞吐样本。同一请求只计一次，不因 listing 历史重复加权。两项指标仅作展示，`displayOnly=true`，不参与分数、资格或排序。
+TTFT 与 TPS 来自最近 30 天成功、非健康检查且完整结束的流式 Share 请求；TPS 还要求 observed usage 和可信的生成时长，terminal flush 不进入吞吐样本。同一请求只计一次，不因 listing 历史重复加权。两项指标仅作展示，`displayOnly=true`，不参与分数、资格或排序；`sampleCount` 公开参与 TTFT 的流式响应数。
 
 ## 代次、发布与陈旧语义
 
@@ -68,7 +69,7 @@ TTFT 与 TPS 来自最近 30 天成功、非健康检查且完整结束的流式
 1. 后台任务启动后立即 reconciliation 并生成首个代次，之后每 15 分钟刷新。
 2. 一个 `IMMEDIATE` 事务内先按真实时间值校验 Share 时间窗可解析、结束不早于开始、窗口无重叠且当前生命周期一致，再写完 `building` generation、所有 entries，最后原子切换为 `published`；开窗和关窗写路径也拒绝时钟回拨产生的反向边界，账本漂移会 fail closed。
 3. 生成失败只写脱敏的 `failed` 诊断；`building`、`failed` 和部分数据永远不会替换最新 `published` 代次。
-4. 没有已发布代次时公开 API 返回 503；已发布代次超过 30 分钟时继续返回 last-good，并标记 `generation.stale=true`。
+4. 没有已发布代次时公开 API 返回 503（`code=provider_rank_not_ready`，页面显示“首次排名生成中”）；已发布代次超过 30 分钟时继续返回 last-good，并标记 `generation.stale=true`。
 5. 只为当前仍有活跃 Share listing 或 Client Host 的身份生成公开排名；纯资金/历史合同身份只出现在相应买家的私有资金区。成功发布时清理 30 天前的旧代次，entries 由外键级联删除，当前代次始终保留。
 
 排名生成不再阻塞 Router 监听器启动。大库启动时，Provider 页面可能短暂处于“排名尚未准备好”，但其他 Router 能力保持可用。
@@ -88,9 +89,15 @@ Share 页的价格、空闲量和在线率等显式排序始终使用原语义�
 | 方法 | 路径 | 可见性 | 缓存 |
 |---|---|---|---|
 | `GET` | `/v1/market-providers` | 公开排名、组件分、供给摘要 | `public, max-age=60, stale-while-revalidate=300` + strong ETag |
-| `GET` | `/v1/market-providers/:id` | 公开 Provider 详情及 Share/Client 供给 | 同上 |
+| `GET` | `/v1/market-providers/:id` | 公开 Provider 详情及 Share/Client 实时供给 | 同上 |
+| `GET` | `/v1/account/market-provider` | 当前用户的已认领 Provider 资料、最新排名条目与门槛 | `private, no-store` |
+| `PUT` | `/v1/account/market-provider/display-name` | 修改公开名称；空字符串恢复默认名 | `private, no-store` |
 
-公开响应不得包含 canonical email、Router user ID、supplier user ID、预付余额、信用或合同金额。公开 display name 若为空或含邮箱会退回稳定匿名名；Provider 详情中的 Share 名称也由 listing ID 派生为匿名标签，避免历史 `share_name` 实际保存 owner email 时旁路泄漏。不再提供 Provider 分户资金响应。
+公开响应不得包含 canonical email、Router user ID、supplier user ID、预付余额、信用或合同金额。公开 display name 若为空或含邮箱会退回稳定匿名名（与身份创建时的默认名同一规则）。Provider 详情中的 Share 名称与 Share Market 卡片一致，使用 subdomain；没有 subdomain 时由 listing ID 派生匿名标签。`share_name` 本身是自由文本、常保存 owner email，因此从不公开。
+
+列表按“代次 ID + 官方邮箱 + Provider 资料数量与最后更新时间”缓存在进程内，匿名流量不再每次重读全部 entries；改名或暂停会更新资料时间并立即失效。详情的库存数字用实时 Share/Client 供给覆盖代次快照，避免抽屉标题与下方列表矛盾。`rankChange` 为相对约 24 小时前已发布代次的名次变化，任一侧未正式排名时省略。
+
+公开名称规则：2–32 个字符，折叠空白，不能含邮箱、链接、控制字符，不能含 “official / 官方”，不能冒用系统生成的 `Provider XXXXXX` 格式（自己的默认名除外），不区分大小写全局唯一；每次修改写入 `market_provider_identity_events`（`display_name_changed`）。官方运营方在公开列表中始终显示为本地化的“官方供应商”。
 
 ## 钱包与排名分离
 
@@ -98,11 +105,11 @@ Share 页的价格、空闲量和在线率等显式排序始终使用原语义�
 
 ## 前端导航
 
-`/providers/` 与 Client、Share Market、Client Market、账户同级。公开详情 Drawer 使用 `/providers/?provider=<opaque-id>`；跳转市场时分别使用 `/share-market/?provider=<opaque-id>` 和 `/client-market/?provider=<opaque-id>`。目标市场只匹配服务端返回的 `marketProviderId`，未绑定旧记录不会被猜测归入筛选结果。
+`/providers/`（中文导航“供应商”）与 Client、Share Market、Client Market、账户同级；`?market=share|client` 与 `?available=1` 记录筛选，搜索词不写入地址。首次引导中的“发布并出售”进入供应商中心，而不是排名页；供应商中心顶部展示“我的排名”与公开名称，未成为供应商时提供出租 Share 与出租主机（`/client-market/?addHost=1`）两个入口。暂停接单的 Provider 保留名次但排在列表末尾，也不占用探索位。公开详情 Drawer 使用 `/providers/?provider=<opaque-id>`；跳转市场时分别使用 `/share-market/?provider=<opaque-id>` 和 `/client-market/?provider=<opaque-id>`。目标市场只匹配服务端返回的 `marketProviderId`，未绑定旧记录不会被猜测归入筛选结果。
 
 ## 当前扩展限制
 
 - 业务库仍由单个 `Arc<Mutex<Connection>>` 串行访问；排名刷新会在事务期间占用连接。首轮已移出同步启动路径，但大规模市场仍应监控刷新耗时。
-- v1 candidate 计算按 Provider 聚合多个历史表。若 Provider 数和观测历史继续增长，应先引入物化日汇总，再提高刷新频率；不能通过减少证据校验换取速度。
+- candidate 计算按 Provider 聚合多个历史表。若 Provider 数和观测历史继续增长，应先引入物化日汇总，再提高刷新频率；不能通过减少证据校验换取速度。
 - 推荐开关是 Router 级动态设置，不是每用户实验。修改为用户级实验前必须定义稳定分桶与可审计 exposure。
-- v1 只能排除直接自租，不能证明多个 Router 账户背后一定是不同自然人。若排名开始影响更高价值的流量或结算，应在提升算法版本前引入付款、设备或风控侧的抗女巫证据，不能把 `user_id` 数量当作已验证身份数。
+- 当前算法只能排除直接自租，不能证明多个 Router 账户背后一定是不同自然人。若排名开始影响更高价值的流量或结算，应在提升算法版本前引入付款、设备或风控侧的抗女巫证据，不能把 `user_id` 数量当作已验证身份数。

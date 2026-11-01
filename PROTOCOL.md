@@ -387,7 +387,9 @@ Server 要求:
 | 方法 | 路径 | 契约 |
 |---|---|---|
 | `GET` | `/v1/market-providers` | 公开当前 last-good generation 和 Provider 排名列表；strong ETag，允许 public cache |
-| `GET` | `/v1/market-providers/:id` | 公开 Provider 详情、Share listing 与 Client Host 国家供给 |
+| `GET` | `/v1/market-providers/:id` | 公开 Provider 详情、Share listing 与 Client Host 国家实时供给 |
+| `GET` | `/v1/account/market-provider` | 登录用户自己的 Provider 资料、当前排名条目与门槛 |
+| `PUT` | `/v1/account/market-provider/display-name` | 修改公开名称（`{displayName}`，空字符串恢复默认） |
 
 v1 权重固定为服务质量 45%、有效选择 30%、履约 15%、供给广度 10%；正式名次要求至少 3 个不同 Router 买家账户和 7 个观测日。免费选择权重为付费选择的 0.25；pending Share grant、自租和一天内释放不算有效选择，`grant_failed` 进入履约失败分母。自租按用户 ID 和双方 canonical email 双重排除；Share 历史质量、选择、履约和性能按显式的 listing Provider 半开时间窗归属，关闭、重开或换主不会移动旧证据；当前供给只统计与公开 catalog 一致的 active Share/可见 seat。这里的账户去重不是 KYC 或完整反女巫证明。TTFT/TPS 明确为 display-only。官方身份没有 score boost，探索展示不改写 `rankPosition`。
 

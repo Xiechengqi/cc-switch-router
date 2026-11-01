@@ -102,6 +102,7 @@ API 路由按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
 | `/v1/auth/*` | 8 | 公开 / Session | `devices/register`、`email/request-code`、`email/verify-code`、`password/login`、`password`、`session/refresh`、`session/me`、`session/logout` |
 | `/v1/tunnels/*` | 4 | Ed25519 签名 | `lease`、`lease/renew`、`activate`、`state` |
 | /v1/account/provider-contacts | 1 | Session | GET/PUT 业务联系方式，不含收款方式或凭据 |
+| /v1/account/market-provider* | 2 | Session | 自己的 Provider 排名条目与门槛（GET），修改公开名称（PUT `display-name`） |
 | `/v1/public/*` | 5 | 公开 | `map-points`、`network-stats`、`usage/global`、`embed/global.svg`、`embed/usage/:user_id` |
 | `/share-api/*` | 4 | 子域名上下文,Session 可选 | `context`、`share`、`auth/me`、`share/settings` |
 | `/v1/dashboard/*`、`/v1/me/*` | 15 | Session | `dashboard`、`presence`、`me/api-token`、`me/model-routing`、`me/shares`、`me/usage-card`、`me/usage/consumer`、`me/usage/provider`、`me/notifications`、`me/notifications/telegram/bind-link`、`me/notifications/bark` |

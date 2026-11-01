@@ -1,8 +1,8 @@
 import {
+  DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH,
   DASHBOARD_ACCOUNT_WALLET_PATH,
   DASHBOARD_CLIENT_MARKET_PATH,
   DASHBOARD_CLIENTS_PATH,
-  DASHBOARD_PROVIDERS_PATH,
   DASHBOARD_SHARE_MARKET_PATH,
   buildDashboardHref,
   defaultDashboardRouteFromSearch,
@@ -23,7 +23,9 @@ const ENTRY_PATHS: Record<HomeEntry, string> = {
   "client-market": DASHBOARD_CLIENT_MARKET_PATH,
   "share-market": DASHBOARD_SHARE_MARKET_PATH,
   wallet: DASHBOARD_ACCOUNT_WALLET_PATH,
-  providers: DASHBOARD_PROVIDERS_PATH,
+  // "Sell" lands where selling starts and is managed; the public ranking is
+  // a buyer's comparison page with nothing to publish.
+  providers: DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH,
 };
 
 export function isHomeEntry(value: unknown): value is HomeEntry {

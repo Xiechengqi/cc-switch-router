@@ -21,6 +21,7 @@ test("only the bare home and clients addresses can show the start page", () => {
 
 test("a saved entry maps to its page and rejects an unknown response", () => {
   assert.equal(pathForHomeEntry("wallet"), "/account/wallet/");
+  assert.equal(pathForHomeEntry("providers"), "/account/provider-settings/");
   assert.deepEqual(parseHomeEntryStatus({ hasActivity: false, entry: "providers", source: "choice" }), {
     hasActivity: false,
     entry: "providers",
