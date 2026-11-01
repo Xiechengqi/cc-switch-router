@@ -6,7 +6,7 @@ import {
   valueCapabilityReady,valueReadinessError,type ValueQuotaPreview,
   previewValueQuota, parseUsdLimit, formatUsdLimit, valuePreviewRowOutcome, valuePreviewNeedsAcknowledgement,
   valuePreviewBlocker, valueQuotaErrorMessage, valueQuotaView, normalizeValueStatuses, ValueQuotaClientError,
-  splitValueStatusRows, upsertValueStatuses, valueStatusReason, formatQuotaTime,
+  splitValueStatusRows, upsertValueStatuses, valueStatusReason, formatQuotaTime, VALUE_STATUS_STALE_MS,
 } from "./share-value-quota";
 import { applyShareUserPolicyBatch } from "../components/dashboard/share-edit/share-user-policy-batch";
 import { buildShareSettingsPatch, draftFromShare, stageUserPolicy } from "./share-settings";
@@ -122,7 +122,8 @@ test("a higher authoritative revision may lower usage; stale windows and waterma
   assert.equal(mergeValueStatuses([status], [{...status, windowId: "older", windowStartsAtMs: 0}])[0], status);
   assert.equal(mergeValueStatuses([status], [{...status, usageWatermark: 3, usedPicos: "90"}])[0].usedPicos, "90");
   assert.equal(mergeValueStatuses([status], [{...status, windowId: "next", windowStartsAtMs: 2, usageWatermark: 0}])[0].windowId, "next");
-  assert.equal(valueStatusTextKey(status, 100_000), "dashboard.userLimit.value.stale");
+  assert.equal(valueStatusTextKey(status, status.syncedAtMs + VALUE_STATUS_STALE_MS), "dashboard.userLimit.value.state.observed");
+  assert.equal(valueStatusTextKey(status, status.syncedAtMs + VALUE_STATUS_STALE_MS + 1), "dashboard.userLimit.value.stale");
   assert.equal(valueStatusTextKey(undefined), "dashboard.userLimit.value.unsynced");
 });
 const money = {limitUsdMicros: "1000000", tariffPolicyId: "api-equivalent-v1" as const};
