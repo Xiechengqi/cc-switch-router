@@ -2745,6 +2745,12 @@ export type ShareTerminationBlockedReason =
   | "paid_period_rolling_over";
 
 export type ShareMarketSubscription = {
+  controlProgress?: {
+    stage: "awaiting_revocation" | "awaiting_final_usage" | "awaiting_settlement" | "retry_scheduled" | "manual_intervention";
+    attempts: number;
+    nextAttemptAt?: string;
+    errorCode?: string;
+  };
   canTerminateImmediately?: boolean;
   terminationBlockedReason?: ShareTerminationBlockedReason;
   terminationId?: string;

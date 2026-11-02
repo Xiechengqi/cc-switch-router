@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import { ShareControlProgressDetails } from "./control-progress-details";
 import { ShareTerminationRowAction } from "@/components/market/share-termination-dialog";
 import { ProviderCommissionPreview } from "@/components/market/provider-commission-preview";
 import { Button, Modal } from "@heroui/react";
@@ -1193,6 +1194,7 @@ const renderSeatStatusDetails = (seat: ShareMarketSeat, tone: "rose" | "amber" |
     const grantContractViolation = subscription?.failureCode === "share_market_grant_contract_violation";
     const hasStatusDetail = !!subscription && (
       grantFailed
+      || !!subscription.controlProgress
       || !!subscription.releaseReason
       || !!subscription.failureCode
       || subscription.grantAttempts != null
@@ -1210,8 +1212,9 @@ const renderSeatStatusDetails = (seat: ShareMarketSeat, tone: "rose" | "amber" |
             : "text-slate-600",
       )}>
         {grantFailed || grantContractViolation ? <p className="font-medium">{t(grantFailureMessageKey(subscription.failureCode))}</p> : null}
+        <ShareControlProgressDetails progress={subscription.controlProgress} />
         {subscription.failureCode ? <p className="break-all font-mono text-[10px] opacity-70">{t("shareMarket.authorizationFailure.code", { code: subscription.failureCode })}</p> : null}
-        {subscription.grantAttempts != null ? <p>{t("shareMarket.authorizationFailure.attempts", { count: subscription.grantAttempts })}</p> : null}
+        {!subscription.controlProgress && subscription.grantAttempts != null ? <p>{t("shareMarket.authorizationFailure.attempts", { count: subscription.grantAttempts })}</p> : null}
         {subscription.releaseReason ? <p className="break-words opacity-80">{t(grantFailed ? "shareMarket.authorizationFailure.reason" : "shareMarket.subscription.statusDetail", { reason: subscription.releaseReason })}</p> : null}
         {subscription.integrityState !== "compatible" ? <p>{t(integrityStatusKey(subscription.integrityState))}{subscription.integrityReason ? ` · ${integrityReasonText(subscription.integrityReason, t)}` : ""}</p> : null}
 

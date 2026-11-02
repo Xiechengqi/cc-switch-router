@@ -155,7 +155,7 @@ jobs:
         # market_ includes share_market_termination and its exact arithmetic.
         run: |
           bash scripts/ci/timed.sh 'Market contracts' cargo test --locked market_ -- --skip schema::tests
-          bash scripts/ci/timed.sh 'Share rental contracts' cargo test --locked share_market::tests
+          bash scripts/ci/timed.sh 'Share rental contracts' cargo test --locked share_market::
           bash scripts/ci/timed.sh 'Client rental contracts' cargo test --locked client_market::tests
           bash scripts/ci/timed.sh 'Termination chat contracts' cargo test --locked client_termination_chat_
 

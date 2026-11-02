@@ -11475,7 +11475,10 @@ impl AppStore {
         }
         normalize_share_descriptor_fields(&mut returned_share)?;
         validate_settings_receipt(&edit, receipt.as_ref())?;
-        if let Err(field) = if let Some(receipt) = receipt.as_ref() {
+        if let Err(field) = if let Some(receipt) = receipt
+            .as_ref()
+            .filter(|_| edit.patch.edit_context.is_some())
+        {
             if returned_share.config_revision < receipt.config_revision {
                 Err("configRevision")
             } else if returned_share.config_revision == receipt.config_revision {
@@ -11744,6 +11747,57 @@ impl AppStore {
             .map(client_chat::sanitize_system_event_text);
         let edit = get_share_edit_by_id(&conn, &ack_edit_id)?
             .ok_or_else(|| AppError::NotFound("share edit not found".into()))?;
+        // Managed ACKs carry the original execution time/policy, not the time
+        // Router received a delayed or replayed acknowledgement. An actual
+        // matching descriptor is a compatible alternative to explicit fields.
+        let managed_effect = if status == "applied"
+            && edit.patch.managed_grant.as_ref().is_some_and(|operation| {
+                operation.action == crate::models::ShareManagedGrantAction::Upsert
+            }) {
+            let effect = input
+                .ack
+                .applied_at_ms
+                .zip(input.ack.effective_policy.clone())
+                .or_else(|| {
+                    let operation = edit.patch.managed_grant.as_ref()?;
+                    let share = input.ack.current_share.as_ref()?;
+                    if share.share_id != edit.share_id {
+                        return None;
+                    }
+                    let grant = share
+                        .user_grants
+                        .get(&operation.email.trim().to_ascii_lowercase())?;
+                    crate::share_market::control_policy::managed_grant_matches(operation, grant)
+                        .then(|| {
+                            i64::try_from(grant.updated_at_ms)
+                                .ok()
+                                .map(|at| (at, grant.policy.clone()))
+                        })
+                        .flatten()
+                });
+            if effect.is_none() && edit.status == "pending" {
+                return Err(AppError::UnprocessableEntity("managed grant ACK requires its execution time and effective policy or a matching applied descriptor".into()));
+            }
+            effect
+        } else {
+            None
+        };
+        if status == "applied"
+            && edit.status == "pending"
+            && let Some(operation) = edit.patch.managed_grant.as_ref()
+            && operation.action == crate::models::ShareManagedGrantAction::Upsert
+            && input.ack.current_share.as_ref().is_some_and(|share| {
+                share.share_id == edit.share_id
+                    && share.user_grants.values().any(|grant| {
+                        grant.entitlement_id.as_deref() == Some(operation.entitlement_id.as_str())
+                            && grant.pending_value_quota.is_some()
+                    })
+            })
+        {
+            return Err(AppError::Conflict(
+                "managed grant policy is scheduled, not yet applied".into(),
+            ));
+        }
         if status == "applied" {
             validate_settings_receipt(&edit, input.ack.settings_receipt.as_ref())?;
         }
@@ -11906,8 +11960,14 @@ impl AppStore {
             ack_error.as_deref(),
             input.ack.error_code.as_deref(),
             input.ack.retryable,
-            input.ack.applied_at_ms,
-            input.ack.effective_policy.as_ref(),
+            managed_effect
+                .as_ref()
+                .map(|(at, _)| *at)
+                .or(input.ack.applied_at_ms),
+            managed_effect
+                .as_ref()
+                .map(|(_, policy)| policy)
+                .or(input.ack.effective_policy.as_ref()),
             &now,
         )?;
         tx.commit().map_err(|error| {
@@ -15762,14 +15822,19 @@ fn reject_pending_share_edit_reply(
     now: &str,
     message: &str,
 ) -> Result<(), AppError> {
-    conn.execute(
+    let tx = conn.unchecked_transaction().map_err(|error| {
+        AppError::Internal(format!("begin invalid Share reply cleanup: {error}"))
+    })?;
+    tx.execute(
         "UPDATE share_edit_requests
          SET status = 'rejected', updated_at = ?2, error_message = ?3
          WHERE id = ?1 AND status = 'pending'",
         params![edit_id, now, message],
     )
     .map_err(|error| AppError::Internal(format!("reject share edit failed: {error}")))?;
-    Ok(())
+    crate::share_market::reject_invalid_reply_tx(&tx, edit_id, message, now)?;
+    tx.commit()
+        .map_err(|error| AppError::Internal(format!("commit invalid Share reply cleanup: {error}")))
 }
 
 fn apply_revision_conflict_snapshot_tx(
@@ -16613,6 +16678,13 @@ fn upsert_share_tx(
             &chat_share_id,
             slot_start,
             next_model_probe_epoch.as_ref(),
+        )?;
+        crate::share_market::wake_recovered_revocations_tx(
+            conn,
+            installation_id,
+            &chat_share_id,
+            share.config_revision,
+            Utc::now(),
         )?;
     }
     if let Some((
@@ -22403,23 +22475,8 @@ fn validate_returned_share_against_patch(
                 }) else {
                     return Err("managedGrant");
                 };
-                let policy_matches = operation.policy.as_ref().is_some_and(|expected| {
-                    if operation.duration_seconds.is_none() {
-                        expected == &returned.policy
-                    } else {
-                        expected.parallel_limit == returned.policy.parallel_limit
-                            && expected.token_limit == returned.policy.token_limit
-                            && expected.token_period == returned.policy.token_period
-                            && returned.policy.expires_at.is_some()
-                            && returned.policy.token_period_anchor_at_ms.is_some()
-                                == matches!(
-                                    expected.token_period,
-                                    crate::models::ShareTokenPeriod::SevenDays
-                                        | crate::models::ShareTokenPeriod::ThirtyDays
-                                )
-                    }
-                });
-                if !policy_matches {
+                if !crate::share_market::control_policy::managed_grant_matches(operation, returned)
+                {
                     return Err("managedGrant");
                 }
             }
@@ -29181,6 +29238,7 @@ fn gateway_share_label(share_id: &str) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    mod share_market_control;
     include!("store/share_value_quotas/signed_delivery_tests.rs");
     include!("store/share_value_quotas/metering_scope_tests.rs");
     use crate::config::Config;

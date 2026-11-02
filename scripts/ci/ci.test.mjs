@@ -50,7 +50,7 @@ test("parallel CI retains every existing financial gate and separates profile ca
   assert.ok(job("frontend").includes("npm run test:client-checkout-browser"), "lost Client trial checkout browser gate");
   assert.ok(job("frontend").includes("npm run test:client-termination-browser"), "lost Client termination workbench browser gate");
   assert.ok(job("frontend").includes("npm run test:client-rental-audit-browser"), "lost Owner Client rental audit browser gate");
-  assert.match(job("rust-tests"), /cargo test --locked share_market::tests/);
+  assert.match(job("rust-tests"), /cargo test --locked share_market::(?:\s|$)/m);
   assert.match(job("rust-tests"), /cargo test --locked client_market::tests/);
   assert.match(job("rust-tests"), /cargo test --locked client_termination_chat_/);
   assert.match(job("rust-tests"), /cargo test --locked user_notifications::tests/);

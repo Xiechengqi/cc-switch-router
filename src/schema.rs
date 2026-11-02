@@ -369,6 +369,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         107,
         include_str!("../schema/0107_share_market_termination.sql"),
     ),
+    (
+        108,
+        include_str!("../schema/0108_share_control_recovery.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -1463,6 +1467,7 @@ mod tests {
     }
 
     mod client_trials;
+    mod control_recovery;
     mod notification_safety;
     mod suspension;
 

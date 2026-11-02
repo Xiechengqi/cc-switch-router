@@ -27,6 +27,11 @@ use crate::models::{
 use crate::share_value_pricing::ValueQuota;
 use crate::store::{AppStore, ShareRouteTarget, fetch_share_runtime_snapshot_from_route};
 
+pub(crate) mod control_policy;
+mod control_recovery;
+pub(crate) use control_recovery::reject_invalid_reply_tx;
+pub(crate) use control_recovery::wake_recovered_revocations_tx;
+
 const DEFAULT_TRIAL_HOURS: i64 = crate::market_common::DEFAULT_TRIAL_HOURS;
 const DEFAULT_TRIAL_TOKEN_LIMIT: u64 = 1_000_000;
 const MAX_TRIAL_HOURS: i64 = crate::market_trial_policy::MAX_HOURS;
@@ -370,6 +375,8 @@ pub struct SeatView {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubscriptionView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control_progress: Option<control_recovery::ControlProgress>,
     pub can_terminate_immediately: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub termination_blocked_reason:
@@ -4902,6 +4909,7 @@ fn public_catalog_seat_visible(seat: &SeatView) -> bool {
 }
 
 fn redact_public_subscription(subscription: &mut SubscriptionView) {
+    subscription.control_progress = None;
     subscription.contacts.clear();
     subscription.wallet_contract = None;
     subscription.wallet_contract_id = None;
@@ -5007,6 +5015,11 @@ fn subscription_view(
 ) -> Result<SubscriptionView, AppError> {
     let is_renter = viewer.is_some_and(|session| session.user_id == record.renter_user_id);
     let is_owner = viewer.is_some_and(|session| session.user_id == record.owner_user_id);
+    let control_progress = if is_owner || is_renter {
+        control_recovery::progress_tx(conn, &record)?
+    } else {
+        None
+    };
     let contacts = if is_renter || is_owner {
         provider_contact
             .map(|(contacts, _)| contacts.clone())
@@ -5095,6 +5108,7 @@ fn subscription_view(
         (false, None)
     };
     Ok(SubscriptionView {
+        control_progress,
         can_terminate_immediately,
         termination_blocked_reason,
         termination_id: if is_renter || is_owner {
@@ -10161,24 +10175,18 @@ fn materialize_initial_policy(
     applied_at_ms: i64,
     policy: &ShareUserPolicy,
 ) -> Result<ShareUserPolicy, AppError> {
-    let applied_at = DateTime::<Utc>::from_timestamp_millis(applied_at_ms).ok_or_else(|| {
-        AppError::BadRequest("managed grant appliedAtMs is outside the supported range".into())
-    })?;
     let token_period: ShareTokenPeriod = serde_json::from_str(&record.token_period_json)
         .map_err(|_| AppError::Internal("stored seat token period is invalid".into()))?;
-    let expires_at = record
+    let duration_seconds = record
         .service_duration_days
-        .map(|days| {
-            i64::from(days)
-                .checked_mul(86_400_000)
-                .and_then(|duration| applied_at_ms.checked_add(duration))
-                .ok_or_else(|| AppError::Internal("Share service expiry overflowed".into()))
-        })
-        .transpose()?;
-    let mut materialized = policy.clone();
-    materialized.token_period_anchor_at_ms = token_period_anchor_at_ms(token_period, applied_at);
-    materialized.expires_at = expires_at;
-    Ok(materialized)
+        .map(|days| u64::from(days) * 86_400);
+    let initial = ShareUserPolicy {
+        token_period,
+        token_period_anchor_at_ms: None,
+        expires_at: None,
+        ..policy.clone()
+    };
+    control_policy::materialize_policy(&initial, duration_seconds, applied_at_ms)
 }
 
 fn persist_effective_control_policy(
@@ -10219,21 +10227,7 @@ fn validate_effective_initial_policy(
 ) -> Result<(), AppError> {
     let token_period: ShareTokenPeriod = serde_json::from_str(&record.token_period_json)
         .map_err(|_| AppError::Internal("stored seat token period is invalid".into()))?;
-    let expected_anchor = token_period_anchor_at_ms(
-        token_period,
-        DateTime::<Utc>::from_timestamp_millis(applied_at_ms).ok_or_else(|| {
-            AppError::BadRequest("managed grant appliedAtMs is outside the supported range".into())
-        })?,
-    );
-    let expected_expiry = record
-        .service_duration_days
-        .map(|days| {
-            i64::from(days)
-                .checked_mul(86_400_000)
-                .and_then(|duration| applied_at_ms.checked_add(duration))
-                .ok_or_else(|| AppError::Internal("Share service expiry overflowed".into()))
-        })
-        .transpose()?;
+    let expected = materialize_initial_policy(record, applied_at_ms, &contract_policy(record)?)?;
     let expected_parallel = record
         .parallel_limit
         .and_then(|value| u32::try_from(value).ok());
@@ -10242,8 +10236,8 @@ fn validate_effective_initial_policy(
         || effective_policy.token_limit != expected_tokens
         || effective_policy.value_quota != expected_value_quota
         || effective_policy.token_period != token_period
-        || effective_policy.token_period_anchor_at_ms != expected_anchor
-        || effective_policy.expires_at != expected_expiry
+        || effective_policy.token_period_anchor_at_ms != expected.token_period_anchor_at_ms
+        || effective_policy.expires_at != expected.expires_at
         || !effective_policy_has_contract_app_scope(record, effective_policy)
     {
         return Err(AppError::Conflict(
@@ -11746,7 +11740,10 @@ impl AppStore {
             }
 
             if record.status == SUB_BILLING_RESUME_PENDING {
-                if let Some(grant) = entitlement_grant.as_ref() {
+                if let Some(grant) = entitlement_grant
+                    .as_ref()
+                    .filter(|grant| grant.pending_value_quota.is_none())
+                {
                     let applied_at_ms = match i64::try_from(grant.updated_at_ms) {
                         Ok(value) => value,
                         Err(_) => {
@@ -11817,7 +11814,10 @@ impl AppStore {
             }
 
             if record.status == SUB_GRANT_PENDING {
-                if let Some(grant) = entitlement_grant.as_ref() {
+                if let Some(grant) = entitlement_grant
+                    .as_ref()
+                    .filter(|grant| grant.pending_value_quota.is_none())
+                {
                     let applied_at_ms = match i64::try_from(grant.updated_at_ms) {
                         Ok(value) => value,
                         Err(_) => {
@@ -12219,6 +12219,20 @@ impl AppStore {
                 }),
                 ..ShareSettingsPatch::default()
             };
+            let patch = match control_recovery::retry_patch_tx(&tx, &operation_id, &patch)? {
+                control_recovery::RetryPatch::Fresh => patch,
+                control_recovery::RetryPatch::Replay(saved) => saved,
+                control_recovery::RetryPatch::MissingEvidence => {
+                    control_recovery::block_unreplayable_tx(
+                        &tx,
+                        &operation_id,
+                        &subscription_id,
+                        &action,
+                        &now,
+                    )?;
+                    continue;
+                }
+            };
             let patch_json = serde_json::to_string(&patch).map_err(|error| {
                 AppError::Internal(format!("encode Share control patch failed: {error}"))
             })?;
@@ -12254,9 +12268,11 @@ impl AppStore {
             tx.execute(
                 "UPDATE share_control_operations
                  SET status = 'dispatched', edit_id = ?2, attempts = attempts + 1,
-                     next_attempt_at = NULL, last_error = NULL, updated_at = ?3
+                     last_attempt_edit_id = ?2, last_attempt_config_revision = ?4,
+                     next_attempt_at = NULL, last_error = NULL, last_error_code = NULL, updated_at = ?3
                  WHERE id = ?1 AND status = 'pending'",
-                params![operation_id, edit_id, now],
+                params![operation_id, edit_id, now,
+                    patch.managed_grant.as_ref().expect("managed control patch").expected_config_revision],
             )
             .map_err(map_db("mark Share control dispatched"))?;
             events.push(ShareEditAvailableEvent {
@@ -12456,7 +12472,7 @@ pub(crate) fn handle_control_edit_ack_with_effect(
         let resume_record = upsert_record
             .as_ref()
             .filter(|record| record.status == SUB_BILLING_RESUME_PENDING);
-        if let Some(record) = pending_record.or(resume_record)
+        if let Some(record) = upsert_record.as_ref()
             && let Err(error) =
                 validate_managed_grant_applied_at(&record.created_at, applied_at_ms, now)
         {
@@ -12484,6 +12500,32 @@ pub(crate) fn handle_control_edit_ack_with_effect(
         let policy = effective_policy
             .or(materialized_policy.as_ref())
             .or(stored_policy.as_ref());
+        if let Some(record) = upsert_record.as_ref()
+            && let Some(policy) = policy
+        {
+            let patch_json: String = conn
+                .query_row(
+                    "SELECT patch_json FROM share_edit_requests WHERE id = ?1",
+                    params![edit_id],
+                    |row| row.get(0),
+                )
+                .map_err(map_db("read acknowledged Share policy terms"))?;
+            let patch: ShareSettingsPatch = serde_json::from_str(&patch_json)
+                .map_err(|_| AppError::Internal("acknowledged Share patch is invalid".into()))?;
+            if !patch.managed_grant.as_ref().is_some_and(|operation| {
+                control_policy::effective_policy_matches(operation, applied_at_ms, policy)
+            }) {
+                quarantine_invalid_effective_grant_tx(
+                    conn,
+                    record,
+                    &operation_id,
+                    Some(edit_id),
+                    "client applied a managed grant policy that differs from the dispatched terms",
+                    now,
+                )?;
+                return Ok(());
+            }
+        }
         if let Some(record) = pending_record {
             let validation = policy.map_or_else(
                 || {
@@ -12566,6 +12608,12 @@ pub(crate) fn handle_control_edit_ack_with_effect(
     let explicitly_nonretryable = retryable == Some(false);
     let should_retry = retry_requested && attempts < MAX_CONTROL_ATTEMPTS;
     let revision_conflict = error_code == Some(SHARE_REVISION_CONFLICT_CODE);
+    conn.execute(
+        "UPDATE share_control_operations SET last_error_code = ?2
+         WHERE id = ?1 AND status = 'dispatched'",
+        params![operation_id, error_code],
+    )
+    .map_err(map_db("persist Share control failure context"))?;
     let sanitized_error = error_message.map(crate::store::client_chat::sanitize_system_event_text);
     let error_message = sanitized_error.as_deref();
     if should_retry {
@@ -12827,7 +12875,13 @@ fn apply_control_grant_effect(
                     role: "shareto".to_string(),
                     active: true,
                     policy,
-                    value_metering: None,
+                    value_metering: previous
+                        .as_ref()
+                        .filter(|grant| {
+                            grant.manager == ShareGrantManager::RouterShareMarket
+                                && grant.entitlement_id.as_deref() == Some(entitlement_id)
+                        })
+                        .and_then(|grant| grant.value_metering.clone()),
                     pending_value_quota: None,
                     usage: previous
                         .as_ref()
@@ -13278,6 +13332,7 @@ pub async fn run_service(state: ServerState) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod control_recovery_tests;
 
     #[test]
     fn banked_reset_is_accepted_in_share_contract_but_not_public_market_quota() {
