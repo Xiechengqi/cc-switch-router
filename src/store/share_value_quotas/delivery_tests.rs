@@ -143,8 +143,8 @@ fn publication_retry_covers_failed_edits_missing_targets_and_scheduled_catalog_g
         "an effective generation not yet derived is not published"
     );
     conn.execute(
-        "UPDATE share_value_pricing_publication SET updated_at_ms=101_000",
-        [],
+        "UPDATE share_value_pricing_publication SET updated_at_ms=?1",
+        params![101_000],
     )
     .unwrap();
     assert!(!needs_retry(&conn, "catalog", 101).unwrap());
