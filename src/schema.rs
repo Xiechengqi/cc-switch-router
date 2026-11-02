@@ -349,6 +349,14 @@ const MIGRATIONS: &[(i64, &str)] = &[
         102,
         include_str!("../schema/0102_retire_dashboard_ux_telemetry.sql"),
     ),
+    (
+        103,
+        include_str!("../schema/0103_share_market_value_quota.sql"),
+    ),
+    (
+        104,
+        include_str!("../schema/0104_share_market_value_trials.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -860,6 +868,131 @@ mod tests {
 
     // Migration 0102 dropped the write-only `dashboard_ux_events` table.
     const CURRENT_SCHEMA_TABLE_COUNT: i64 = 265;
+
+    #[test]
+    fn migration_103_keeps_token_seats_and_frozen_rentals_without_inventing_value_usage() {
+        let conn = memory_connection();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        install_schema_through(&conn, 102);
+        conn.execute("INSERT INTO share_market_seats(id,listing_id,position,status,token_limit,token_period_json,offer_revision,trial_token_limit,created_at,updated_at)
+            VALUES('seat','listing',1,'occupied',1234,'\"day\"',7,500,'before','before')", []).unwrap();
+        conn.execute("INSERT INTO share_market_subscriptions(id,seat_id,listing_id,share_id,installation_id,entitlement_id,owner_user_id,owner_email,renter_user_id,renter_email,status,token_limit,token_period_json,offer_revision,created_at,updated_at)
+            VALUES('sub','seat','listing','share','install','entitlement','provider','provider@example.test','buyer','buyer@example.test','active',1234,'\"day\"',7,'before','before')", []).unwrap();
+        let wallet_version: i64 = conn
+            .query_row(
+                "SELECT version FROM market_wallet_policy WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        assert_eq!(conn.query_row("SELECT token_limit,trial_token_limit,offer_revision,value_limit_usd_micros,updated_at FROM share_market_seats WHERE id='seat'", [],
+            |r| Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,String>(4)?))).unwrap(), (1234,500,7,None,"before".into()));
+        assert_eq!(conn.query_row("SELECT token_limit,offer_revision,value_limit_usd_micros,value_pricing_revision,updated_at FROM share_market_subscriptions WHERE id='sub'", [],
+            |r| Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,String>(4)?))).unwrap(), (1234,7,None,None,"before".into()));
+        assert_eq!(
+            conn.query_row(
+                "SELECT version FROM market_wallet_policy WHERE id=1",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            wallet_version
+        );
+        assert!(
+            conn.execute(
+                "UPDATE share_market_seats SET value_limit_usd_micros='100' WHERE id='seat'",
+                []
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute(
+                "UPDATE share_market_subscriptions SET value_limit_usd_micros='100' WHERE id='sub'",
+                []
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn migration_104_preserves_token_trials_and_installs_bounded_optional_usd_budgets() {
+        let conn = memory_connection();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        install_schema_through(&conn, 103);
+        conn.execute("INSERT INTO market_share_trial_scopes(id,buyer_user_id,provider_user_id,share_id) VALUES('started','buyer','provider','share'),('unused','other','provider','share')", []).unwrap();
+        conn.execute("INSERT INTO market_share_trial_contracts(contract_id,scope_id,entitlement_id,token_allowance,token_budget,tokens_used,usage_revision,created_at,updated_at)
+            VALUES('old','started','entitlement',1000,900,100,4,'before','before')", []).unwrap();
+        let version: i64 = conn
+            .query_row(
+                "SELECT version FROM market_trial_policy WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT unit FROM market_share_trial_scopes WHERE id='started'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "tokens"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT unit FROM market_share_trial_scopes WHERE id='unused'",
+                [],
+                |r| r.get::<_, Option<String>>(0)
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(conn.query_row("SELECT token_allowance,token_budget,tokens_used,usage_revision,value_allowance_usd_micros,value_budget_usd_micros,value_used_picos FROM market_share_trial_contracts WHERE contract_id='old'", [],
+            |r| Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,i64>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,String>(6)?))).unwrap(), (1000,900,100,4,None,None,"0".into()));
+        assert_eq!(
+            conn.query_row(
+                "SELECT version,share_value_usd_micros FROM market_trial_policy WHERE id=1",
+                [],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            )
+            .unwrap(),
+            (version, "1000000".into())
+        );
+        for invalid in ["", "01", "-1", "1e6", "1000000000000001"] {
+            assert!(
+                conn.execute(
+                    "UPDATE market_trial_policy SET share_value_usd_micros=?1 WHERE id=1",
+                    params![invalid]
+                )
+                .is_err(),
+                "{invalid}"
+            );
+        }
+        for valid in ["0", "1", "1000000000000000"] {
+            conn.execute(
+                "UPDATE market_trial_policy SET share_value_usd_micros=?1 WHERE id=1",
+                params![valid],
+            )
+            .unwrap();
+        }
+        // Frozen USD amounts must be paired, exclusive of Token amounts,
+        // canonical and no larger than the offered allowance.
+        assert!(conn.execute("UPDATE market_share_trial_contracts SET value_allowance_usd_micros='100',value_budget_usd_micros='100' WHERE contract_id='old'", []).is_err());
+        conn.execute("UPDATE market_share_trial_contracts SET token_allowance=0,token_budget=0 WHERE contract_id='old'", []).unwrap();
+        assert!(conn.execute("UPDATE market_share_trial_contracts SET value_allowance_usd_micros='100' WHERE contract_id='old'", []).is_err());
+        assert!(conn.execute("UPDATE market_share_trial_contracts SET value_budget_usd_micros='100' WHERE contract_id='old'", []).is_err());
+        for (allowance, budget) in [("100", "101"), ("100", "01"), ("1000000000000001", "100")] {
+            assert!(conn.execute("UPDATE market_share_trial_contracts SET value_allowance_usd_micros=?1,value_budget_usd_micros=?2 WHERE contract_id='old'", params![allowance,budget]).is_err());
+        }
+        for (allowance, budget) in [("0", "0"), ("100", "0"), ("100", "100")] {
+            conn.execute("UPDATE market_share_trial_contracts SET value_allowance_usd_micros=?1,value_budget_usd_micros=?2 WHERE contract_id='old'", params![allowance,budget]).unwrap();
+        }
+        assert!(conn.execute("UPDATE market_share_trial_contracts SET value_used_picos='170141183460469231731687303715884105728' WHERE contract_id='old'", []).is_err());
+    }
 
     #[test]
     fn migration_102_drops_only_the_dashboard_ux_table() {

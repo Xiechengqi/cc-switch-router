@@ -11,6 +11,7 @@ import {
   type ShareProviderStatusPanelView,
 } from "@/components/dashboard/share-provider-status-panel";
 import { SHARE_APP_LABELS } from "@/lib/share-app";
+import { formatUsdLimit, USD_LIMIT_MAX_MICROS } from "@/lib/share-value-quota";
 import type {
   ShareMarketAppCapability,
   ShareMarketListing,
@@ -79,6 +80,7 @@ export function shareMarketMutationError(reason: unknown, t: MarketTranslate) {
     share_market_listing_not_closed: "shareMarket.error.listingNotClosed",
     share_market_seat_not_reopenable: "shareMarket.error.seatNotReopenable",
     share_market_offer_changed: "shareMarket.error.offerChanged",
+    share_market_value_quota_unavailable: "shareMarket.error.valueQuotaUnavailable",
   };
   const codeKey = reason.code ? coded[reason.code] : undefined;
   if (codeKey) return t(codeKey);
@@ -147,6 +149,82 @@ export function listingLowestDailyRate(listing: {
   return Math.min(...seats.map(seatComparableMonthlyMinor));
 }
 
+/** Quota windows in 30 days as a fraction; cumulative quotas never repeat. */
+const WINDOWS_PER_30_DAYS: Partial<Record<ShareTokenPeriod, readonly [bigint, bigint]>> = {
+  day: [30n, 1n],
+  week: [30n, 7n],
+  sevenDays: [30n, 7n],
+  calendarMonth: [1n, 1n],
+  thirtyDays: [1n, 1n],
+};
+
+export type SeatValueDiscount = {
+  /** Rent as a share of the full-use API list-price value, in basis points. */
+  ratioBps: number;
+  /** API list-price value of using the whole quota for 30 days, in micros. */
+  monthlyValueMicros: string;
+  monthlyPriceMinor: number;
+};
+
+/**
+ * Nominal discount of a paid USD-equivalent seat: 30 days of rent against
+ * 30 days of fully used quota at API list prices. A seat without a USD
+ * quota, a free seat or a cumulative quota has none. Exact BigInt maths.
+ */
+export function seatValueDiscount(
+  seat: Pick<ShareMarketSeat, "isFree" | "valueQuota" | "tokenPeriod" | "dailyRateMinor" | "cyclePriceMinor">,
+): SeatValueDiscount | null {
+  const windows = WINDOWS_PER_30_DAYS[seat.tokenPeriod];
+  const limit = seat.valueQuota?.limitUsdMicros;
+  const monthlyPriceMinor = seatComparableMonthlyMinor(seat);
+  if (seat.isFree || !windows || !limit || !/^[1-9]\d{0,15}$/.test(limit)
+    || BigInt(limit) > USD_LIMIT_MAX_MICROS || !Number.isSafeInteger(monthlyPriceMinor) || monthlyPriceMinor <= 0) return null;
+  const [count, days] = windows;
+  const valueMicros = BigInt(limit) * count;
+  // price micros / (value micros / days) = price * 10_000 * days / valueMicros
+  const rounded = (BigInt(monthlyPriceMinor) * 10_000n * days * 10_000n + valueMicros / 2n) / valueMicros;
+  // Never turn a positive rent into "100% off" through basis-point rounding.
+  const ratioBps = rounded < 1n ? 1n : rounded;
+  if (ratioBps > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+  return {
+    ratioBps: Number(ratioBps),
+    monthlyValueMicros: (valueMicros / days).toString(),
+    monthlyPriceMinor,
+  };
+}
+
+/**
+ * Chinese buyers read discounts as 折 (6.67% → 0.7 折), others as percent off.
+ * The off-percentage rounds down so a discount is never overstated. Null
+ * when the rent is not below the API list-price value.
+ */
+export function formatSeatValueDiscount(discount: SeatValueDiscount, locale: string) {
+  if (!Number.isSafeInteger(discount.ratioBps) || discount.ratioBps <= 0 || discount.ratioBps >= 10_000) return null;
+  if (locale.startsWith("zh")) {
+    const zhe = discount.ratioBps / 1_000;
+    const digits = zhe >= 1 ? 1 : 2;
+    const value = Math.max(Math.ceil(zhe * 10 ** digits) / 10 ** digits, 10 ** -digits);
+    return `${new Intl.NumberFormat(locale, { maximumFractionDigits: digits }).format(value)} 折`;
+  }
+  return `${Math.floor((10_000 - discount.ratioBps) / 100)}% off`;
+}
+
+/** Rent as a percentage of full-use API value, e.g. `6.7%` or `120%`. */
+export function formatSeatValueRatio(discount: SeatValueDiscount, locale: string) {
+  return `${new Intl.NumberFormat(locale, { maximumFractionDigits: discount.ratioBps < 1_000 ? 2 : 1 }).format(discount.ratioBps / 100)}%`;
+}
+
+/** Best (lowest) nominal ratio among a listing's rentable USD seats. */
+export function listingBestValueRatio(listing: {
+  seats: Array<Pick<ShareMarketSeat, "status" | "readOnly" | "isFree" | "valueQuota" | "tokenPeriod" | "dailyRateMinor" | "cyclePriceMinor">>;
+}) {
+  const idle = listing.seats.filter(isSeatIdle);
+  const ratios = (idle.length ? idle : listing.seats)
+    .map((seat) => seatValueDiscount(seat)?.ratioBps)
+    .filter((ratio): ratio is number => ratio != null);
+  return ratios.length ? Math.min(...ratios) : Number.POSITIVE_INFINITY;
+}
+
 /** Comparable monthly key for mixed legacy-daily and calendar-month catalog rows. */
 export function seatComparableMonthlyMinor(
   seat: Pick<ShareMarketSeat, "isFree" | "dailyRateMinor" | "cyclePriceMinor">,
@@ -208,12 +286,20 @@ export function formatSeatPrice(
     : `${formatUsdMoney(seat.dailyRateMinor, locale)} / ${dayLabel}`;
 }
 
-export function formatTokenLimit(
-  seat: Pick<ShareMarketSeat, "tokenLimit" | "tokenPeriod">,
+/**
+ * A seat's usage limit in its own unit: Tokens, or a USD-equivalent amount
+ * that `valueLabel` marks as API value so it never reads as a price.
+ */
+export function formatSeatQuota(
+  seat: Pick<ShareMarketSeat, "tokenLimit" | "tokenPeriod" | "valueQuota">,
   locale: string,
   unlimitedLabel: string,
   periodLabel: (period: ShareTokenPeriod) => string,
+  valueLabel: (amount: string) => string,
 ) {
+  if (seat.valueQuota) {
+    return `${valueLabel(formatUsdLimit(seat.valueQuota.limitUsdMicros))} · ${periodLabel(seat.tokenPeriod)}`;
+  }
   if (seat.tokenLimit == null) return unlimitedLabel;
   return `${formatTokenMillions(seat.tokenLimit, locale)} · ${periodLabel(seat.tokenPeriod)}`;
 }

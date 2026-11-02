@@ -8,13 +8,16 @@ import { SubdomainCopyButton } from "@/components/dashboard/subdomain-copy-butto
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import type { ShareMarketListing, ShareMarketSeat } from "@/lib/types";
 import { formatTokenMillions } from "@/lib/token-units";
+import { formatUsdLimit } from "@/lib/share-value-quota";
 import { cn } from "@/lib/utils";
 import {
   formatSeatPrice,
+  formatSeatValueDiscount,
   isSeatIdle,
   listingIdleCount,
   listingPriceSummary,
   marketProviderStatusView,
+  seatValueDiscount,
 } from "@/components/dashboard/share-market/market-utils";
 import { marketShareCardSeatPreview } from "@/components/dashboard/share-market/buyer-catalog-utils";
 
@@ -83,20 +86,25 @@ export function MarketShareCardMetric({
 }
 
 function compactSeatTerms(
-  seat: Pick<ShareMarketSeat, "parallelLimit" | "tokenLimit" | "tokenPeriod" | "isFree" | "trialHours">,
+  seat: Pick<ShareMarketSeat, "parallelLimit" | "tokenLimit" | "valueQuota" | "tokenPeriod" | "isFree" | "trialHours">,
   locale: string,
   unlimited: string,
   periodLabel: string,
   trialLabel?: string,
+  valueLabel: (amount: string) => string = (amount) => amount,
+  discountLabel?: string | null,
 ) {
   const parallel = seat.parallelLimit == null ? "P∞" : `P${seat.parallelLimit}`;
-  const tokens = seat.tokenLimit == null
-    ? unlimited
-    : `${formatTokenMillions(seat.tokenLimit, locale)}/${periodLabel}`;
+  const tokens = seat.valueQuota
+    ? `${valueLabel(formatUsdLimit(seat.valueQuota.limitUsdMicros))}/${periodLabel}`
+    : seat.tokenLimit == null
+      ? unlimited
+      : `${formatTokenMillions(seat.tokenLimit, locale)}/${periodLabel}`;
   const trial = !seat.isFree && seat.trialHours != null && trialLabel
     ? ` · ${trialLabel}`
     : "";
-  return `${parallel} · ${tokens}${trial}`;
+  const discount = discountLabel ? ` · ${discountLabel}` : "";
+  return `${parallel} · ${tokens}${discount}${trial}`;
 }
 
 export function CatalogSeatPreview({
@@ -116,6 +124,7 @@ export function CatalogSeatPreview({
 }) {
   const { locale, t } = useLocaleText();
   const idle = isSeatIdle(seat);
+  const discount = seatValueDiscount(seat);
   const showRent = idle && !!onRent && !mine && seat.canRent !== false;
   const className = cn(
     "grid min-w-0 items-center gap-2 rounded px-1.5 py-1 text-left text-[11px]",
@@ -140,6 +149,8 @@ export function CatalogSeatPreview({
           t("common.unlimited"),
           t(`shareMarket.period.${seat.tokenPeriod}`),
           seat.trialHours != null ? `${seat.trialHours}h` : undefined,
+          (amount) => t("shareMarket.quota.usdAmount", { amount }),
+          discount ? formatSeatValueDiscount(discount, locale) : null,
         )}
       </span>
       <strong className="shrink-0 tabular-nums text-slate-800">

@@ -27,6 +27,10 @@ pub fn router() -> Router<ServerState> {
         .route("/v1/me/share-value-quotas", get(mine))
         .route("/v1/shares/:share_id/value-quota-preview", post(preview))
         .route("/v1/shares/:share_id/value-usage-edits", post(edit_usage))
+        .route(
+            "/v1/shares/:share_id/market-value-quota-readiness",
+            get(market_readiness),
+        )
         .layer(DefaultBodyLimit::max(CONTROL_BODY_LIMIT))
         // Every response here, including errors and extractor rejections, is private.
         .layer(middleware::map_response(no_store))
@@ -264,6 +268,120 @@ async fn preview(
     }
     Ok(Json(response))
 }
+/// Readiness check a Server adds once it can enforce a USD-equivalent quota on
+/// a Router-managed market grant. Older Servers omit it.
+pub(crate) const MARKET_SEAT_QUOTA_CHECK: &str = "market_seat_quota";
+/// Readiness check a Server adds once it enforces a one-time USD trial budget
+/// (`trialValueLimitUsdMicros`) on a managed market grant. Older Servers omit it.
+pub(crate) const MARKET_TRIAL_VALUE_CHECK: &str = "market_trial_value";
+/// Reason reported when the seat would offer a USD trial budget but the
+/// Server predates `market_trial_value`.
+pub(crate) const SERVER_TRIAL_UPGRADE_REQUIRED: &str = "server_trial_upgrade_required";
+fn market_value_unavailable(reason: String) -> AppError {
+    AppError::coded_conflict(
+        "share_market_value_quota_unavailable",
+        "this Share cannot sell a USD-equivalent quota right now",
+        serde_json::json!({ "reason": reason }),
+    )
+}
+fn check_ready(checks: &[serde_json::Value], code: &str) -> bool {
+    checks
+        .iter()
+        .any(|check| check["code"] == code && check["ready"] == true)
+}
+/// A seat may sell a USD-equivalent quota only while its Share's Server can
+/// enforce one: the owner's USD capability (storage, tariff, text surfaces)
+/// must be ready and the Server must run managed USD grants. Checked when a
+/// USD seat is published, edited, reopened or quoted; the Server rejects the
+/// grant itself if readiness is lost before the rental applies. A seat that
+/// offers a budgeted USD trial (`value_trial`) also needs a Server that
+/// enforces the USD trial budget; there is no silent time-only fallback.
+pub(crate) async fn ensure_market_value_quota_ready(
+    state: &ServerState,
+    share_id: &str,
+    value_trial: bool,
+) -> Result<(), AppError> {
+    let checks = market_value_quota_checks(state, share_id).await?;
+    if value_trial && !check_ready(&checks, MARKET_TRIAL_VALUE_CHECK) {
+        return Err(market_value_unavailable(
+            SERVER_TRIAL_UPGRADE_REQUIRED.into(),
+        ));
+    }
+    Ok(())
+}
+/// The base USD seat gate; returns the Server's readiness checks on success.
+async fn market_value_quota_checks(
+    state: &ServerState,
+    share_id: &str,
+) -> Result<Vec<serde_json::Value>, AppError> {
+    let unavailable = market_value_unavailable;
+    let target = control_target(state, share_id)
+        .await
+        .map_err(|_| unavailable("quota_server_offline".into()))?;
+    let revision = state.store.share_config_revision(share_id).await?;
+    let response = crate::ctl_client::preview_value_quota(
+        &target.backend,
+        &target.installation,
+        &target.secret,
+        share_id,
+        revision,
+        &std::collections::BTreeMap::new(),
+    )
+    .await
+    .map_err(|error| match control_error(error) {
+        AppError::Coded { code, details, .. } => unavailable(
+            details["readinessCode"]
+                .as_str()
+                .unwrap_or(code)
+                .to_string(),
+        ),
+        _ => unavailable("quota_unavailable".into()),
+    })?;
+    let checks = response["checks"].as_array().cloned().unwrap_or_default();
+    if !check_ready(&checks, MARKET_SEAT_QUOTA_CHECK) {
+        return Err(unavailable("server_upgrade_required".into()));
+    }
+    if response["capabilityReady"] != true {
+        let failed = checks
+            .iter()
+            .find(|check| check["ready"] != true)
+            .and_then(|check| check["code"].as_str())
+            .unwrap_or("quota_unavailable");
+        return Err(unavailable(failed.to_string()));
+    }
+    let pricing = state
+        .store
+        .value_pricing_readiness(&target.installation)
+        .await?;
+    if !response_pricing_published(&pricing) {
+        return Err(unavailable("tariff_published".into()));
+    }
+    Ok(checks)
+}
+/// Whether the seat editor may offer a USD-equivalent quota for this Share;
+/// the same gate publish, edit, reopen and quote apply. `valueTrialReady`
+/// tells whether a USD seat may also offer a budgeted USD trial.
+async fn market_readiness(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(share_id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_share_manager(&state, &headers, &share_id).await?;
+    Ok(Json(
+        match market_value_quota_checks(&state, &share_id).await {
+            Ok(checks) => serde_json::json!({
+                "ready": true,
+                "valueTrialReady": check_ready(&checks, MARKET_TRIAL_VALUE_CHECK),
+            }),
+            Err(AppError::Coded {
+                code: "share_market_value_quota_unavailable",
+                details,
+                ..
+            }) => serde_json::json!({ "ready": false, "reason": details["reason"] }),
+            Err(error) => return Err(error),
+        },
+    ))
+}
 /// An unacknowledged tariff is a consequence of an unpublished one; point the
 /// failed check at its root unless the Server already named a blocker.
 fn mark_blocked_by_tariff(checks: &mut [serde_json::Value]) {
@@ -445,6 +563,28 @@ mod tests {
         });
         assert_eq!(conflict.code(), Some("quota_revision_conflict"));
         assert!(!conflict.to_string().contains("private"));
+    }
+
+    #[test]
+    fn usd_trial_capability_is_a_distinct_ready_check() {
+        let old_server = vec![
+            serde_json::json!({"code": MARKET_SEAT_QUOTA_CHECK, "ready": true}),
+            serde_json::json!({"code": "sqlite_authority", "ready": true}),
+        ];
+        assert!(check_ready(&old_server, MARKET_SEAT_QUOTA_CHECK));
+        assert!(!check_ready(&old_server, MARKET_TRIAL_VALUE_CHECK));
+        let mut current = old_server.clone();
+        current.push(serde_json::json!({"code": MARKET_TRIAL_VALUE_CHECK, "ready": true}));
+        assert!(check_ready(&current, MARKET_TRIAL_VALUE_CHECK));
+        let not_ready = vec![serde_json::json!({"code": MARKET_TRIAL_VALUE_CHECK, "ready": false})];
+        assert!(!check_ready(&not_ready, MARKET_TRIAL_VALUE_CHECK));
+        let error = market_value_unavailable(SERVER_TRIAL_UPGRADE_REQUIRED.into());
+        assert_eq!(error.code(), Some("share_market_value_quota_unavailable"));
+        if let AppError::Coded { details, .. } = error {
+            assert_eq!(details["reason"], "server_trial_upgrade_required");
+        } else {
+            panic!("expected structured error");
+        }
     }
 
     #[test]

@@ -17,7 +17,7 @@ export type UsdAmountParse = { ok: true; micros: string } | { ok: false; error: 
  * ` 10`, `.5`, `05` and `10.`, but never a sign, an exponent, misgrouped
  * thousands separators or more than six decimals. BigInt only.
  */
-export function parseUsdLimit(input: string): UsdAmountParse {
+export function parseUsdLimit(input: string, { allowZero = false }: { allowZero?: boolean } = {}): UsdAmountParse {
   let text = input.trim();
   if (!text) return { ok: false, error: "empty" };
   const symbol = /^(?:US\$|\$)\s*/i.exec(text);
@@ -29,7 +29,7 @@ export function parseUsdLimit(input: string): UsdAmountParse {
   if (fraction.length > 6) return { ok: false, error: "too_many_decimals" };
   const whole = match[1].replaceAll(",", "") || "0";
   const micros = BigInt(whole) * 1_000_000n + BigInt(fraction.padEnd(6, "0"));
-  if (micros <= 0n) return { ok: false, error: "too_small" };
+  if (micros === 0n && !allowZero) return { ok: false, error: "too_small" };
   if (micros > USD_LIMIT_MAX_MICROS) return { ok: false, error: "too_large" };
   return { ok: true, micros: String(micros) };
 }
@@ -379,6 +379,37 @@ export async function getValueQuotaStatus(shareId: string, signal?: AbortSignal)
 export async function getMyValueQuotaStatus(shareId: string, signal?: AbortSignal) {
   const result = await parseJson<{items: unknown}>(await authFetch(`/v1/me/share-value-quotas?shareId=${encodeURIComponent(shareId)}`, {signal}));
   return {items: normalizeValueStatuses(result?.items)};
+}
+/**
+ * A rental's realized value this paid period: rent against the API list-price
+ * value of what the renter actually used. An estimate from Router request
+ * logs; `partial` marks a lower bound.
+ */
+export type RentalValueUsage = {
+  subscriptionId: string;
+  periodStart?: string;
+  periodEnd?: string;
+  rentMicros?: string;
+  valueUsedMicros?: string;
+  pricedCoveragePercent: number;
+  ratioBps?: number;
+  partial: boolean;
+  reason?: "trial" | "no_paid_period" | "no_usage" | string;
+  pricingRevision: string;
+  pricedAt: number;
+};
+export async function getRentalValueUsage(subscriptionId: string, signal?: AbortSignal) {
+  return parseJson<RentalValueUsage>(await authFetch(
+    `/v1/share-market/subscriptions/${encodeURIComponent(subscriptionId)}/value-usage`, {signal, cache: "no-store"}));
+}
+
+/** Why a Share cannot sell a USD-equivalent seat quota right now, if it cannot. */
+export type MarketValueQuotaReadiness = {ready: boolean; valueTrialReady?: boolean; reason?: string};
+export async function getMarketValueQuotaReadiness(shareId: string, signal?: AbortSignal) {
+  const result = await parseJson<MarketValueQuotaReadiness>(await authFetch(
+    `/v1/shares/${encodeURIComponent(shareId)}/market-value-quota-readiness`, {signal, cache: "no-store"}));
+  if (!result || typeof result.ready !== "boolean") throw new ValueQuotaClientError("quota_server_invalid_response");
+  return {ready: result.ready, valueTrialReady: result.valueTrialReady === true, reason: typeof result.reason === "string" ? result.reason : undefined};
 }
 export type ValueUsageEdit = {
   action: "set" | "clear"; targetPicos?: string; expectedGrantRevision: number; windowId: string;

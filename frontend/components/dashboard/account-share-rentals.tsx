@@ -16,7 +16,7 @@ import { MarketPagination } from "@/components/dashboard/share-market/market-pag
 import { paginateListings } from "@/components/dashboard/share-market/buyer-catalog-utils";
 import { subdomainTunnelUrl } from "@/components/dashboard/share-dashboard-utils";
 import {
-  formatTokenLimit,
+  formatSeatQuota,
   grantFailureMessageKey,
   integrityReasonText,
   integrityStatusKey,
@@ -35,8 +35,12 @@ import { trialHours, walletLifecycleKey } from "@/lib/client-checkout";
 import { shareMarketHref } from "@/lib/dashboard-nav";
 import { shareTrialSummary } from "@/lib/share-trial";
 import { compareAccountRecords } from "@/lib/account-market-records";
+import { realizedValueText, useQuotaActor, useRentalValueUsage } from "@/components/dashboard/share-market/seat-value-quota";
+import { getShareUserLimitStatus } from "@/lib/api";
+import { formatQuotaPicos, formatUsdLimit, getMyValueQuotaStatus } from "@/lib/share-value-quota";
+import { valueReadinessActor } from "@/lib/use-value-quota-readiness";
 import type { ShareMarketSubscription } from "@/lib/types";
-import { cn } from "@/lib/utils";
+import { cn, compactTokens } from "@/lib/utils";
 
 type Translate = ReturnType<typeof useLocaleText>["t"];
 
@@ -109,6 +113,48 @@ function StatusDetails({ subscription, t }: { subscription: ShareMarketSubscript
   );
 }
 
+/**
+ * What the renter has used of the seat's own quota this period. Token seats
+ * read the Share's usage rows; USD seats read only the renter's private row.
+ */
+function useRentalUsage(subscription: ShareMarketSubscription) {
+  const { locale, t } = useLocaleText();
+  const actor = useQuotaActor();
+  const [usage, setUsage] = React.useState<{ key: string; text: string } | null>(null);
+  const { id, updatedAt, shareId, status, tokenLimit, tokenPeriod, renterEmail } = subscription;
+  const valueLimit = subscription.valueQuota?.limitUsdMicros;
+  const key = JSON.stringify([actor, id, updatedAt, valueLimit, tokenLimit, tokenPeriod, status, locale]);
+  React.useEffect(() => {
+    setUsage(null);
+    if (status === "released" || (valueLimit == null && tokenLimit == null)) return;
+    const controller = new AbortController();
+    const period = t(`shareMarket.period.${tokenPeriod}`);
+    const email = renterEmail?.trim().toLowerCase();
+    const current = () => !controller.signal.aborted && actor === valueReadinessActor();
+    if (valueLimit != null) {
+      void getMyValueQuotaStatus(shareId, controller.signal)
+        .then(({ items }) => {
+          if (!current()) return;
+          const row = items.find((item) => item.email === email && item.limitUsdMicros === valueLimit
+            && item.tokenPeriod === tokenPeriod);
+          const used = row ? formatQuotaPicos(row.usedPicos) : t("shareMarket.quota.syncing");
+          setUsage({ key, text: `${used} / ${formatUsdLimit(valueLimit)} · ${period}` });
+        })
+        .catch(() => undefined);
+    } else if (tokenLimit != null) {
+      void getShareUserLimitStatus(shareId)
+        .then((page) => {
+          const row = email ? page.rows?.find((item) => item.email.trim().toLowerCase() === email) : undefined;
+          if (!current() || !row) return;
+          setUsage({ key, text: `${compactTokens(row.tokensUsed || 0, locale)} / ${compactTokens(tokenLimit, locale)} · ${period}` });
+        })
+        .catch(() => undefined);
+    }
+    return () => controller.abort();
+  }, [shareId, status, tokenLimit, tokenPeriod, renterEmail, valueLimit, locale, t, actor, key]);
+  return usage?.key === key && actor === valueReadinessActor() ? usage.text : null;
+}
+
 function RentalDetail({
   subscription,
   busy,
@@ -122,6 +168,12 @@ function RentalDetail({
 }) {
   const { locale, t } = useLocaleText();
   const trial = shareTrialSummary(subscription, locale, t);
+  const usage = useRentalUsage(subscription);
+  const realized = realizedValueText(
+    useRentalValueUsage(subscription.id, subscription.status !== "released" && subscription.cyclePriceMinor != null, subscription.updatedAt),
+    locale,
+    t,
+  );
   const started = subscription.serviceStartedAt
     ? `${t("shareMarket.serviceDuration.started")}: ${formatDateTime(subscription.serviceStartedAt, locale)}`
     : t("account.share.activationPending");
@@ -133,8 +185,10 @@ function RentalDetail({
         { label: t("account.share.offer"), value: `${rentalPrice(subscription, locale, t)} · ${rentalServiceTerm(subscription, t)}` },
         { label: t("account.market.detail.limits"), value: [
           t("shareMarket.parallelShort", { value: subscription.parallelLimit == null ? "∞" : subscription.parallelLimit }),
-          formatTokenLimit(subscription, locale, t("common.unlimited"), (period) => t(`shareMarket.period.${period}`)),
+          formatSeatQuota(subscription, locale, t("common.unlimited"), (period) => t(`shareMarket.period.${period}`), (amount) => t("shareMarket.quota.usdAmount", { amount })),
         ].join(" · ") },
+        ...(usage ? [{ label: t("shareMarket.quota.usedThisPeriod"), value: <span className="font-mono tabular-nums">{usage}</span> }] : []),
+        ...(realized ? [{ label: t("shareMarket.realized.label"), value: realized }] : []),
         { label: t("account.market.detail.service"), value: `${started} · ${rentalTermText(subscription, locale, t)}` },
         ...(subscription.releasedAt ? [{ label: t("account.market.detail.expires"), value: formatDateTime(subscription.releasedAt, locale) }] : []),
         ...(trial ? [{ label: t("account.market.detail.trial"), value: trial }] : []),

@@ -266,6 +266,7 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/healthz", get(health))
         .merge(crate::market_fx::router())
         .merge(crate::share_value_quotas::router())
+        .merge(crate::share_market_value_usage::router())
         .route("/v1/public/map-points", get(public_map_points))
         .route("/v1/public/network-stats", get(public_network_stats))
         .route("/v1/public/usage/global", get(public_usage_global))

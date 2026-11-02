@@ -191,7 +191,7 @@ Router 不接受长效 SSH 凭据。每次建链前 Server 申请一次性 lease
 - Share Market 最低版本仍为 v5（`MIN_SHARE_MARKET_CONTRACT_VERSION=5`），不因账号周期的协商扩展抬高。reader 上限、普通 descriptor 版本与市场最低版本是三项独立约束。
 - v8增加`tokenPeriod=accountReset`及userGrants只读`accountQuotaCycle/accountResetCapability/accountUsageBaseline`、`usageQuota.usageWatermark`。安装heartbeat响应同时返回`shareContractVersion=10,capabilities=["accountResetV1","marketTrialV1","usdEquivalentQuotaV1","cacheCreationTtlV1"]`；Server同时检查显式能力、Router URL/installation绑定和300秒有效期。普通v7必须省略新嵌套字段，v7携带accountReset/新字段拒绝，不能静默转换为sevenDays；市场报价不开放动态周期。
 - v9 的 `marketEntitlements` 按 entitlement ID 返回 `trialScopeId/email/phase/active/trialTokenAllowance/trialTokenLimit/trialTokensUsed/usageRevision/usageUncertain/appliedAtMs/paidStartedAtMs`。`phase=trial|paid`，Token cap 缺省表示仅时长试用，不能写普通 `tokenLimit:0`。试用累计数和修订只增不减，与普通日／周／月 quota 分开；使用量变化不提升静态 descriptor generation。完整 descriptor 的 Notify＋周期重放持续携带动态试用水位。v9 以下不得携带非空试用状态。
-- v10 的普通用户 `policy.valueQuota={limitUsdMicros:"10000000",tariffPolicyId:"api-equivalent-v1"}` 与 `tokenLimit` 互斥，共用原 `tokenPeriod` 和 anchor。它是模型 API 标价等值使用限额，不是钱包余额或 Provider 账单。缺省仍为不限额；零额度非法。grant 可带 Server-owned `valueMetering={quotaPolicyEpoch,valueMeteredFromMs,effectiveFromMs,pricingRevision}` 和 `pendingValueQuota={policy,effectiveFromMs,retainAccess}`；`valueMetering` 只出现在金额模式或已排期金额策略的授权上，Token 授权不带（见 §13.2）。切换到未完整覆盖的自然窗口时保留原 policy，到边界后持久化启用；新授权等待期间不提供无限制访问。首次累计模式从确认的计量起点开始，之后删加授权、改策略、切换单位均不能重设该起点或清空同窗口消费。v7–v9 不接受这些字段；活跃市场托管授权不允许金额模式。
+- v10 的普通用户 `policy.valueQuota={limitUsdMicros:"10000000",tariffPolicyId:"api-equivalent-v1"}` 与 `tokenLimit` 互斥，共用原 `tokenPeriod` 和 anchor。它是模型 API 标价等值使用限额，不是钱包余额或 Provider 账单。缺省仍为不限额；零额度非法。grant 可带 Server-owned `valueMetering={quotaPolicyEpoch,valueMeteredFromMs,effectiveFromMs,pricingRevision}` 和 `pendingValueQuota={policy,effectiveFromMs,retainAccess}`；`valueMetering` 只出现在金额模式或已排期金额策略的授权上，Token 授权不带（见 §13.2）。切换到未完整覆盖的自然窗口时保留原 policy，到边界后持久化启用；新授权等待期间不提供无限制访问。首次累计模式从确认的计量起点开始，之后删加授权、改策略、切换单位均不能重设该起点或清空同窗口消费。v7–v9 不接受这些字段。市场托管授权可携带 `valueQuota`（见 §7.1 美元等值车位），但不得带 `pendingValueQuota`：车位额度按合同计量，Server 在该合同首次下发金额策略时以当时为计量起点立即生效，同一 entitlement 的后续 upsert（试用转正式、欠费暂停后恢复、App 范围升级）沿用该起点，新合同重新开始；金额校准对托管授权仍然禁止。
 - `cacheCreationTtlV1` 是独立的请求日志能力，不能从 reader v10 或 `usdEquivalentQuotaV1` 推断。协商后可同时附 `cacheCreation5mTokens`、`cacheCreation1hTokens`，两者非负且和等于原 `cacheCreationTokens`；两者必须同时缺省或同时出现。历史合并值保持 unknown TTL，不能虚构拆分；原四桶 Token 总数不变。
 - managed upsert 可附 `marketPhase/trialScopeId/trialTokenAllowance/trialTokenLimit`；revoke 不附这些字段。相同 entitlement 不得改变 scope、重新赋予试用或增加原始预算。Server 在转发前持久化请求所属 entitlement 和 phase，迟到试用用量不能计入正式额度。正式授权回执确认后 Router 才从预留款捕获首期费用；失败或未知回执先撤权，确认清理后才释放预留。`usageUncertain` 表示崩溃等情况下消费不能证明完整，须安全回收，不能当作零用量续试。
 - `accountQuotaCycle`包含`streamIncarnation/sourceRef/sourceEpoch/bucketId/cycleId/cycleSequence/cycleRevision/startsAtMs/endsAtMs/basis/observedAtMs/eventId`，UTC毫秒半开区间，end可空。缺完整历史时`usageQuota=null`而非0；Router不按本机时间外推窗口，不把本地历史加回Server权威账号quota，不用跨周期max。
@@ -344,6 +344,7 @@ Server 要求:
 | `POST` | `/v1/share-market/seats/:id/rent` | 租用 |
 | `POST` | `/v1/share-market/subscriptions/:id/release` | 租客归还 |
 | `POST` | `/v1/share-market/subscriptions/:id/force-revoke` | Owner 强制回收,可同时拒绝该买家后续 Share 租用 |
+| `GET` | `/v1/share-market/subscriptions/:id/value-usage` | 当前付费账期的 API 等值估算；仅该租约买家或卖家，所有响应 `private, no-store` |
 
 `alreadyListed` 作为兼容字段,在当前 owner 有 active listing 或 Share 仍有非终态订阅时为 true；新 UI 以 `canCreateListing`、`activeListingId` 与 `reopenListingId` 决定动作。只要存在未删除的 closed listing,`POST /listings` 返回 `share_market_reopen_required` 及原 `listingId`,不得创建重复 listing。
 
@@ -351,7 +352,21 @@ Server 要求:
 
 停止挂售是幂等且可逆的。首次停止将 `available` 车位改为 `disabled` 并递增 `offerRevision`,同时把该 listing 下所有 active rent quote 改为 `expired`；重复停止不会再次递增 revision 或重复写审计事件。恢复旧车位时再次递增 revision,因此停止前生成的 quote 即使仍在客户端内存中也不能在恢复后提交。
 
-免费和付费拼车位都可通过 `serviceDurationDays` 设置 `1..=365` 天固定服务期限；省略或传 `null` 表示无固定期限。`tokenLimit` 省略时 Router 忽略提交的 `tokenPeriod` 并归一为 `lifetime`；只有设置 Token 限额时才校验该 Server 支持的周期。报价参数在租用时冻结到 Subscription；固定期限从 Server 首次应用该 managed grant 时开始计算：Router 只下发相对的 `durationSeconds`，Server 以 `appliedAtMs + durationSeconds` 写入绝对 `expiresAt`，Router 在 edit-ack 中校验一致后冻结到 Subscription。授权下发前的等待不消耗期限，账单暂停不顺延。Router 在到期前 24 小时写入一次 `service_term_expiring`，到期后终止付费合约并根据控制操作是否可能已送达选择直接释放或安全 revoke；付费尾段会精确结算到 `expiresAt`，账务与 Share worker 的先后顺序既不会漏计也不会越界计费。`grant_pending`、活跃、账单暂停、恢复中及控制失败状态均不得在到期后重新获得访问，回收失败时也不会把座位提前恢复为可租。
+**美元等值车位**：车位条款可用 `valueQuota={limitUsdMicros,tariffPolicyId:"api-equivalent-v1"}` 代替 `tokenLimit`（二者互斥，共用 `tokenPeriod`，同样不接受 `accountReset`），表示按请求时模型 API 标价折算的用量上限，不是租金或钱包余额。发布、加车位、编辑、恢复与报价含美元车位时，Router 先经 `/_ctl/preview_value_quota` 确认该 Share 的金额能力（存储、价目、文本运行时）全部就绪，且 Server 在 `checks[]` 中声明 `{"code":"market_seat_quota","ready":true}`；否则返回 409 `share_market_value_quota_unavailable`（`details.reason` 为未通过的检查或 `server_upgrade_required` 等）。额度与条款一起冻结到报价和 Subscription（`value_limit_usd_micros`），报价时的已发布价目修订只记录审计（`valuePricingRevision`），执行始终使用 Server 当前已确认价目。旧式计时试用先执行冻结的试用 Token cap，结束后切换为车位额度；新的一次性试用按下文跟随车位单位，普通周期额度同时生效。金额模式下买家并发为 `min(parallelLimit,4)`，单个已准入请求可能小幅超出（软上限）。
+
+**试用跟随单位**：`GET /v1/market-trials/policy` 与 Owner 的 `GET/PUT /v1/admin/market/trial-policy` 增加 `shareValueUsdMicros`（规范非负十进制 micros，默认 `"1000000"` 即 US$1；上限 `"1000000000000000"`）。旧管理客户端 PUT 省略此字段时保留当前值，不覆盖回默认。美元车位的 `trialValueLimitUsdMicros` 覆盖该默认，省略／null 继承，`"0"` 仅按时长；不得同时携带 `trialTokenLimit`，Token／无限量车位不得携带美元试用覆盖。0 小时关闭试用；所有规则变化仅作用于新报价，旧快照与合同不重写。
+
+- `trial` 冻结条款保留 v1，增加可选 `valueAllowanceUsdMicros`、`valueBudgetUsdMicros`、`valueInherited`、`unitLocked`。美元条款成对出现，Token 额度为 0；旧 Token 快照继续按原语义解析。首次有试用时长的合同锁定「买家 + Provider + Share」的预算单位；改租另一单位只给剩余时长，报价标记 `unitLocked=true`，不得领第二份预算。旧请求迟到结算耗尽原单位预算时，Router 对账同样结束已切换单位的时间试用。
+- 有正金额预算的美元试用额外要求 Server preview 声明 `{"code":"market_trial_value","ready":true}`；缺失返回同一 409、`details.reason=server_trial_upgrade_required`，不静默降为时间试用。`market-value-quota-readiness` 的 `valueTrialReady` 与基础 `ready` 分开。纯时间、免费和旧冻结 Token 试用不要求该新增声明。
+- managed grant／`marketEntitlements` 增加可选 `trialValueAllowanceUsdMicros`、`trialValueLimitUsdMicros`，正金额成对且 `limit <= allowance`，与 Token 试用字段互斥；entitlement 另带单调 `trialValueUsedPicos`（默认 0，零时省略），和 Token 共用 `usageRevision`。转 paid 操作不再下发预算，但 Server 保留原冻结字段，迟到 trial 请求仍计入原预算；不能改单位、用户、scope，不能从 paid 回 trial。
+- Server 在同一 SQLite IMMEDIATE 事务中检查周期额度、当前试用合同和原 scope 的累计预算，扣除各自已结算与在途预占，按最小剩余量预占；重试不重复预占。Market 周期账本 scope 带 `entitlementId`，新合同不混入旧合同（包括同毫秒及迟到结算）；普通授权 scope 保持不变。试用累计索引跨合同保留，不依赖可裁剪请求日志。结算水位持久镜像，启动／清扫器补偿恢复，较低修订不能重新开放预算。
+- 时长或预算耗尽沿用 trial → activating → paid：先冻结首期资金、确认付费授权生效后才扣款；资金不足安全撤权。Subscription 的 `trial` 返回可选 `valueAllowanceUsdMicros`、`valueUsedUsdMicros`、`valueRemainingUsdMicros`；已用向上、剩余向下取整至 micros，不把金额用量误显示为钱包扣费。
+
+**折扣与价值估算**：标称折扣 = 30 天租金 / 30 天满额 API 价值；day ×30、week／sevenDays ×30/7、calendarMonth／thirtyDays ×1，lifetime、免费或 Token 车位不显示标称折扣。旧日租按日价 ×30。BigInt 计算，正租金不显示 100% 免费；比例不低于 100% 时只中性说明，不显示折扣徽标。它不是实际使用折扣或收益承诺。
+
+`value-usage` 仅估算当前钱包日历月账期，从 `max(periodStart,paidStartedAt)` 到 `min(now,periodEnd,endedAt?,releasedAt?)`（结束／释放时间存在时截断，避免计入后续租用），以 Router 保留日志和同源模型目录计价（按窗口末端有效价，不是每个请求的 Server 冻结执行价）。返回 `subscriptionId`、`periodStart/End`、`rentMicros`、`valueUsedMicros`、`ratioBps`、`pricedCoveragePercent`、`pricingRevision`、`pricedAt`、`partial` 及可选 `reason`（`trial`／`no_paid_period`／`no_usage`／`unpriced_usage`）。有用量但均未定价时不伪造 0；超保留期／部分未定价标记 partial。当前 grant 被停用或移除不抹掉冻结区间里的保留记录。买卖双方界面始终标注“估算”，不参与 Server 权威额度、扣款、退款或 Provider 结算。
+
+免费和付费拼车位都可通过 `serviceDurationDays` 设置 `1..=365` 天固定服务期限；省略或传 `null` 表示无固定期限。`tokenLimit` 与 `valueQuota` 均省略时 Router 忽略提交的 `tokenPeriod` 并归一为 `lifetime`；只有设置 Token 限额或美元等值额度时才校验该 Server 支持的周期。报价参数在租用时冻结到 Subscription；固定期限从 Server 首次应用该 managed grant 时开始计算：Router 只下发相对的 `durationSeconds`，Server 以 `appliedAtMs + durationSeconds` 写入绝对 `expiresAt`，Router 在 edit-ack 中校验一致后冻结到 Subscription。授权下发前的等待不消耗期限，账单暂停不顺延。Router 在到期前 24 小时写入一次 `service_term_expiring`，到期后终止付费合约并根据控制操作是否可能已送达选择直接释放或安全 revoke；付费尾段会精确结算到 `expiresAt`，账务与 Share worker 的先后顺序既不会漏计也不会越界计费。`grant_pending`、活跃、账单暂停、恢复中及控制失败状态均不得在到期后重新获得访问，回收失败时也不会把座位提前恢复为可租。
 
 ### Client Market 钱包购买与展示契约
 
@@ -773,6 +788,7 @@ Gemini 的金额模式仅覆盖 `generateContent`／`streamGenerateContent`；�
 | `GET /v1/me/share-value-quotas?shareId=…` | 仅当前用户自己的投影；每行自包含 |
 | `POST /v1/shares/:share_id/value-quota-preview` | Share Owner / Router Owner；`expectedConfigRevision` + `policies`，经 `/_ctl/preview_value_quota` 只读取得权威预览 |
 | `POST /v1/shares/:share_id/value-usage-edits` | Share Owner / Router Owner；`expectedConfigRevision` + `edits`，经 `/_ctl/edit_value_usage` 执行独立金额校准 |
+| `GET /v1/shares/:share_id/market-value-quota-readiness` | Share Owner / Router Owner；`{ready}` 或 `{ready:false,reason}`，与发布／编辑／恢复／报价美元车位时的同一就绪门槛 |
 | `GET /v1/admin/share-value-pricing/health` | Router Owner；启用／待生效／遗留绑定（`shadowGrants`，仅统计尚未被新 descriptor 覆盖的旧 shadow 绑定）／延迟及价目 ACK 数，无用户邮箱 |
 
 成功与错误响应（含 401/403/404 与提取器拒绝）一律带 `Cache-Control: private, no-store`。两个状态接口的 `items[]` 在 `status` 字段之外附加 `tokenPeriod`、`pendingLimitUsdMicros`、`pendingTokenPeriod`、`pendingEffectiveFromMs`（无排期时为 null），因此前端无需授权对象即可展示 `limitUsdMicros/usedPicos/pendingRiskPicos/windowStartsAtMs/resetsAtMs/meteredFromMs/meteringStatus/syncedAtMs` 与排期。当前策略非金额模式、只有待生效金额策略且尚无当前窗口投影的有效授权，返回仅由已存 descriptor 构造的最小行 `{email,meteringStatus:"scheduled",tokenPeriod,pendingLimitUsdMicros,pendingTokenPeriod,pendingEffectiveFromMs}`；用量、窗口、`limitUsdMicros` 与 `syncedAtMs` 字段缺省，绝不伪造 $0 用量。

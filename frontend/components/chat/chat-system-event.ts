@@ -4,6 +4,7 @@ import {
   formatUsdCnyMoney,
   usdMinorToCnyMinor,
 } from "@/lib/market-money";
+import { formatUsdLimit } from "@/lib/share-value-quota";
 import type { ClientChatMessage, ClientChatMessagePreview } from "@/lib/types";
 
 type TFn = (key: MessageKey, values?: Record<string, string | number>) => string;
@@ -79,6 +80,7 @@ const DETAIL_LABELS: Record<string, MessageKey> = {
   supplierEmail: "chat.detail.supplierEmail",
   token: "chat.detail.token",
   tokenLimit: "chat.detail.tokenLimit",
+  valueLimitUsdMicros: "chat.detail.valueLimit",
   tokenPeriod: "chat.detail.tokenPeriod",
   parallelLimit: "chat.detail.parallelLimit",
   releaseReason: "chat.detail.releaseReason",
@@ -127,6 +129,7 @@ const DETAIL_FIELDS_BY_EVENT: Record<string, readonly string[]> = {
     "dailyRateMinor",
     "currency",
     "tokenLimit",
+    "valueLimitUsdMicros",
     "tokenPeriod",
     "parallelLimit",
     "serviceDurationDays",
@@ -394,6 +397,7 @@ function detailScalar(
   if (typeof value !== "string") return String(value);
   if (!value.trim()) return undefined;
   if (containsCredentialFragment(value)) return "[credential omitted]";
+  if (key === "valueLimitUsdMicros") return formatUsdLimit(value);
   if (key.endsWith("At")) {
     const date = new Date(value);
     if (Number.isFinite(date.getTime())) {

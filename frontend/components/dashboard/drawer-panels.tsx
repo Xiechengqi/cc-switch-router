@@ -1606,7 +1606,8 @@ export function ShareUserLimitsTable({
                         periodLabel={periodLabels[period] || period}
                         nowMs={nowMs}
                         stale={valueQuotaStale}
-                        onReconcile={onValueReconcile ? () => onValueReconcile(row.email) : undefined}
+                        // Seat contracts are never calibrated by hand.
+                        onReconcile={onValueReconcile && grant?.manager !== "routerShareMarket" ? () => onValueReconcile(row.email) : undefined}
                         t={t}
                       />
                       {valueView?.scheduled ? <ScheduledValueQuotaLine scheduled={valueView.scheduled} t={t} /> : null}

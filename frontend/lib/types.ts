@@ -2715,9 +2715,14 @@ export type CreateClientRegionsPersist = {
   codes: string[];
 };
 
+/** A USD-equivalent quota: API list-price usage, never money. */
+export type ShareValueQuota = NonNullable<ShareUserPolicy["valueQuota"]>;
+
 export type ShareMarketSeatInput = {
   parallelLimit?: number;
   tokenLimit?: number;
+  /** Mutually exclusive with `tokenLimit`; shares `tokenPeriod`. */
+  valueQuota?: ShareValueQuota;
   tokenPeriod: ShareTokenPeriod;
   dailyRateMinor?: number;
   cyclePriceMinor?: number;
@@ -2725,10 +2730,12 @@ export type ShareMarketSeatInput = {
   serviceDurationDays?: number;
   trialHours?: number;
   trialTokenLimit?: number;
+  /** USD seats only; omitted inherits the default, "0" means time-only. */
+  trialValueLimitUsdMicros?: string;
 };
 
 export type ShareMarketSubscription = {
-  trial?: { phase: "trial" | "activating" | "paid" | "revoking"; tokenAllowance: number; tokensUsed: number; tokensRemaining: number | null; endReason?: string };
+  trial?: { phase: "trial" | "activating" | "paid" | "revoking"; tokenAllowance: number; tokensUsed: number; tokensRemaining: number | null; endReason?: string; valueAllowanceUsdMicros?: string; valueUsedUsdMicros?: string; valueRemainingUsdMicros?: string | null };
   id: string;
   seatId: string;
   listingId: string;
@@ -2749,6 +2756,7 @@ export type ShareMarketSubscription = {
   seatPosition: number;
   parallelLimit?: number;
   tokenLimit?: number;
+  valueQuota?: ShareValueQuota;
   tokenPeriod: ShareTokenPeriod;
   dailyRateMinor?: number;
   pricingModel: MarketPricingModel;
@@ -2762,6 +2770,7 @@ export type ShareMarketSubscription = {
   serviceDurationDays?: number;
   trialHours?: number;
   trialTokenLimit?: number;
+  trialValueLimitUsdMicros?: string;
   offerRevision: number;
   activatedAt?: string;
   serviceStartedAt?: string;
@@ -2783,6 +2792,7 @@ export type ShareMarketSubscription = {
 export type ShareMarketSeat = ShareMarketSeatInput & {
   trialHoursOverride?: number | null;
   trialTokenLimitOverride?: number | null;
+  trialValueLimitUsdMicrosOverride?: string | null;
   id: string;
   position: number;
   status: string;
@@ -2955,6 +2965,9 @@ export type ShareMarketRentQuote = {
     seatPosition: number;
     parallelLimit?: number;
     tokenLimit?: number;
+    valueQuota?: ShareValueQuota;
+    /** Tariff published when quoted; audit only. */
+    valuePricingRevision?: string;
     tokenPeriod: ShareTokenPeriod;
     dailyRateMinor?: number;
     pricingModel: MarketPricingModel;
@@ -2964,7 +2977,8 @@ export type ShareMarketRentQuote = {
     serviceDurationDays?: number;
     trialHours?: number;
     trialTokenLimit?: number;
-    trial?: { version: number; policyVersion: number; hoursInherited: boolean; tokensInherited: boolean; tokenAllowance: number; tokenBudget: number };
+    trialValueLimitUsdMicros?: string;
+    trial?: { version: number; policyVersion: number; hoursInherited: boolean; tokensInherited: boolean; tokenAllowance: number; tokenBudget: number; valueAllowanceUsdMicros?: string; valueBudgetUsdMicros?: string; valueInherited?: boolean; unitLocked?: boolean };
     offerRevision: number;
     service: ShareMarketRentService;
   };

@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) const MAX_HOURS: i64 = 720;
 pub(crate) const MAX_TOKENS: u64 = 9_007_199_254_740_991;
+/// Default one-time trial budget of a USD-equivalent seat: US$1.00.
+pub(crate) const DEFAULT_SHARE_VALUE_USD_MICROS: &str = "1000000";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,12 +25,31 @@ pub(crate) struct TrialPolicy {
     pub client_hours: i64,
     pub share_hours: i64,
     pub share_tokens: u64,
+    /// One-time trial budget of USD-equivalent seats, canonical decimal
+    /// micros. "0" means time-only.
+    pub share_value_usd_micros: String,
 }
 
 pub(crate) fn policy_tx(conn: &Connection) -> Result<TrialPolicy, AppError> {
-    conn.query_row("SELECT version, client_hours, share_hours, share_tokens FROM market_trial_policy WHERE id = 1", [], |r| Ok(TrialPolicy {
+    conn.query_row("SELECT version, client_hours, share_hours, share_tokens, share_value_usd_micros FROM market_trial_policy WHERE id = 1", [], |r| Ok(TrialPolicy {
         version: r.get(0)?, client_hours: r.get(1)?, share_hours: r.get(2)?, share_tokens: r.get(3)?,
+        share_value_usd_micros: r.get(4)?,
     })).map_err(db_error("read market trial policy"))
+}
+
+/// A USD trial budget (policy default or seat override) in micros: a
+/// canonical nonnegative decimal within the same upper bound as seat quotas. Zero is
+/// valid and means time-only.
+pub(crate) fn parse_value_micros(raw: &str) -> Result<i128, AppError> {
+    crate::share_value_pricing::unsigned_decimal(raw)
+        .ok()
+        .filter(|micros| *micros <= crate::share_value_pricing::MAX_LIMIT_MICROS)
+        .ok_or_else(|| {
+            AppError::BadRequest(
+                "trial USD-equivalent budget must be a canonical nonnegative decimal of micros"
+                    .into(),
+            )
+        })
 }
 
 pub(crate) fn validate(hours: i64, tokens: u64) -> Result<(), AppError> {
@@ -78,6 +99,9 @@ struct SetPolicy {
     client_hours: i64,
     share_hours: i64,
     share_tokens: u64,
+    /// Omitted keeps the current USD default (older admin clients).
+    #[serde(default)]
+    share_value_usd_micros: Option<String>,
 }
 
 async fn set_policy(
@@ -88,13 +112,16 @@ async fn set_policy(
     let actor = crate::api::require_owner_session(&state, &headers).await?;
     validate(input.client_hours, input.share_tokens)?;
     validate(input.share_hours, input.share_tokens)?;
+    if let Some(value) = input.share_value_usd_micros.as_deref() {
+        parse_value_micros(value)?;
+    }
     let conn = state.store.conn.lock().await;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin trial policy"))?;
     let before = policy_tx(&tx)?;
     let now = crate::market_wallet::now();
-    if tx.execute("UPDATE market_trial_policy SET version = version + 1, client_hours = ?2, share_hours = ?3, share_tokens = ?4, updated_at = ?5 WHERE id = 1 AND version = ?1", params![input.expected_version, input.client_hours, input.share_hours, input.share_tokens, now]).map_err(db_error("update trial policy"))? != 1 {
+    if tx.execute("UPDATE market_trial_policy SET version = version + 1, client_hours = ?2, share_hours = ?3, share_tokens = ?4, share_value_usd_micros = COALESCE(?6, share_value_usd_micros), updated_at = ?5 WHERE id = 1 AND version = ?1", params![input.expected_version, input.client_hours, input.share_hours, input.share_tokens, now, input.share_value_usd_micros]).map_err(db_error("update trial policy"))? != 1 {
         return Err(AppError::Conflict("trial policy changed; reload before saving".into()));
     }
     let after = policy_tx(&tx)?;
@@ -123,5 +150,21 @@ mod tests {
         assert!(validate(721, 1).is_err());
         assert!(validate(-1, 1).is_err());
         assert!(validate(12, MAX_TOKENS + 1).is_err());
+    }
+
+    #[test]
+    fn usd_trial_budget_is_canonical_bounded_and_zero_is_time_only() {
+        assert_eq!(parse_value_micros("0").unwrap(), 0);
+        assert_eq!(
+            parse_value_micros(DEFAULT_SHARE_VALUE_USD_MICROS).unwrap(),
+            1_000_000
+        );
+        assert_eq!(
+            parse_value_micros("1000000000000000").unwrap(),
+            crate::share_value_pricing::MAX_LIMIT_MICROS
+        );
+        for invalid in ["", "00", "01", "1.5", "-1", "1000000000000001", " 1"] {
+            assert!(parse_value_micros(invalid).is_err(), "{invalid:?}");
+        }
     }
 }

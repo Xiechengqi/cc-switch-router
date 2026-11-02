@@ -24,6 +24,7 @@ use crate::models::{
     ShareManagedGrantAction, ShareManagedGrantOperation, ShareSettingsPatch, ShareSupport,
     ShareTokenPeriod, ShareUpstreamQuotaTierHint, ShareUserGrant, ShareUserPolicy,
 };
+use crate::share_value_pricing::ValueQuota;
 use crate::store::{AppStore, ShareRouteTarget, fetch_share_runtime_snapshot_from_route};
 
 const DEFAULT_TRIAL_HOURS: i64 = crate::market_common::DEFAULT_TRIAL_HOURS;
@@ -326,6 +327,8 @@ pub struct SeatView {
     pub parallel_limit: Option<u32>,
     pub token_limit: Option<u64>,
     pub token_period: ShareTokenPeriod,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_quota: Option<ValueQuota>,
     pub daily_rate_minor: Option<i64>,
     pub pricing_model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -340,6 +343,11 @@ pub struct SeatView {
     pub trial_token_limit: Option<u64>,
     pub trial_hours_override: Option<i64>,
     pub trial_token_limit_override: Option<u64>,
+    /// USD-equivalent paid seats: effective one-time trial budget (decimal
+    /// micros, "0" = time-only) and the seat's own override (null inherits).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_value_limit_usd_micros: Option<String>,
+    pub trial_value_limit_usd_micros_override: Option<String>,
     pub offer_revision: i64,
     pub is_free: bool,
     pub can_rent: bool,
@@ -385,6 +393,8 @@ pub struct SubscriptionView {
     pub parallel_limit: Option<u32>,
     pub token_limit: Option<u64>,
     pub token_period: ShareTokenPeriod,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_quota: Option<ValueQuota>,
     pub daily_rate_minor: Option<i64>,
     pub pricing_model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -465,6 +475,9 @@ pub struct OwnedShareView {
 pub struct SeatInput {
     pub parallel_limit: Option<u32>,
     pub token_limit: Option<u64>,
+    /// USD-equivalent quota; mutually exclusive with `token_limit`.
+    #[serde(default)]
+    pub value_quota: Option<ValueQuota>,
     #[serde(default)]
     pub token_period: ShareTokenPeriod,
     pub daily_rate_minor: Option<i64>,
@@ -477,6 +490,10 @@ pub struct SeatInput {
     pub trial_hours: Option<i64>,
     #[serde(default)]
     pub trial_token_limit: Option<u64>,
+    /// USD-equivalent seats only: one-time trial budget in decimal micros;
+    /// "0" means time-only, omitted inherits the Router default.
+    #[serde(default)]
+    pub trial_value_limit_usd_micros: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -669,6 +686,11 @@ pub struct RentQuoteSnapshot {
     pub parallel_limit: Option<u32>,
     pub token_limit: Option<u64>,
     pub token_period: ShareTokenPeriod,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_quota: Option<ValueQuota>,
+    /// Tariff revision published when quoted; audit only, never enforced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_pricing_revision: Option<String>,
     pub daily_rate_minor: Option<i64>,
     #[serde(default = "default_free_pricing_model")]
     pub pricing_model: String,
@@ -682,6 +704,10 @@ pub struct RentQuoteSnapshot {
     pub trial_hours: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trial_token_limit: Option<u64>,
+    /// USD-equivalent paid seats: the effective trial budget offered (decimal
+    /// micros, "0" = time-only), before the buyer's scope consumption.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_value_limit_usd_micros: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trial: Option<crate::market_share_trials::TrialQuote>,
     pub offer_revision: i64,
@@ -701,6 +727,7 @@ struct RentOfferTerms {
     parallel_limit: Option<u32>,
     token_limit: Option<u64>,
     token_period: ShareTokenPeriod,
+    value_quota: Option<ValueQuota>,
     daily_rate_minor: Option<i64>,
     pricing_model: String,
     cycle_price_minor: Option<i64>,
@@ -709,6 +736,7 @@ struct RentOfferTerms {
     service_duration_days: Option<u32>,
     trial_hours: Option<i64>,
     trial_token_limit: Option<u64>,
+    trial_value_limit_usd_micros: Option<String>,
 }
 
 impl RentOfferTerms {
@@ -719,6 +747,7 @@ impl RentOfferTerms {
             parallel_limit: snapshot.parallel_limit,
             token_limit: snapshot.token_limit,
             token_period: snapshot.token_period,
+            value_quota: snapshot.value_quota.clone(),
             daily_rate_minor: snapshot.daily_rate_minor,
             pricing_model: snapshot.pricing_model.clone(),
             cycle_price_minor: snapshot.cycle_price_minor,
@@ -727,6 +756,7 @@ impl RentOfferTerms {
             service_duration_days: snapshot.service_duration_days,
             trial_hours: snapshot.trial_hours,
             trial_token_limit: snapshot.trial_token_limit,
+            trial_value_limit_usd_micros: snapshot.trial_value_limit_usd_micros.clone(),
         }
     }
 }
@@ -772,6 +802,7 @@ struct NormalizedSeat {
     parallel_limit: Option<u32>,
     token_limit: Option<u64>,
     token_period: ShareTokenPeriod,
+    value_quota: Option<ValueQuota>,
     daily_rate_minor: Option<i64>,
     pricing_model: String,
     cycle_price_minor: Option<i64>,
@@ -780,11 +811,17 @@ struct NormalizedSeat {
     service_duration_days: Option<u32>,
     trial_hours: Option<i64>,
     trial_token_limit: Option<u64>,
+    trial_value_limit_usd_micros: Option<String>,
 }
 
 impl NormalizedSeat {
     fn is_free(&self) -> bool {
         self.daily_rate_minor.is_none() && self.cycle_price_minor.is_none()
+    }
+
+    /// A Token limit or a USD-equivalent quota; either one needs a period.
+    fn has_quota(&self) -> bool {
+        self.token_limit.is_some() || self.value_quota.is_some()
     }
 }
 
@@ -861,6 +898,7 @@ fn normalize_seat(input: SeatInput) -> Result<NormalizedSeat, AppError> {
     {
         return Err(AppError::BadRequest("seat token limit is too large".into()));
     }
+    let value_quota = normalize_seat_value_quota(input.value_quota, input.token_limit)?;
     let daily_rate_minor = input.daily_rate_minor;
     let cycle_price_minor = input.cycle_price_minor;
     if daily_rate_minor.is_some() && cycle_price_minor.is_some() {
@@ -876,7 +914,7 @@ fn normalize_seat(input: SeatInput) -> Result<NormalizedSeat, AppError> {
             "serviceDurationDays must be between 1 and {MAX_SERVICE_DURATION_DAYS}, or null for permanent"
         )));
     }
-    let token_period = if input.token_limit.is_some() {
+    let token_period = if input.token_limit.is_some() || value_quota.is_some() {
         input.token_period
     } else {
         ShareTokenPeriod::Lifetime
@@ -888,15 +926,19 @@ fn normalize_seat(input: SeatInput) -> Result<NormalizedSeat, AppError> {
     let price_minor = cycle_price_minor.or(daily_rate_minor);
     let pricing_empty = price_minor.is_none() && currency.is_none();
     if pricing_empty {
-        if input.trial_hours.is_some() || input.trial_token_limit.is_some() {
+        if input.trial_hours.is_some()
+            || input.trial_token_limit.is_some()
+            || input.trial_value_limit_usd_micros.is_some()
+        {
             return Err(AppError::BadRequest(
-                "trial hours and trial token limit apply only to paid seats".into(),
+                "trial hours and trial budgets apply only to paid seats".into(),
             ));
         }
         return Ok(NormalizedSeat {
             parallel_limit: input.parallel_limit,
             token_limit: input.token_limit,
             token_period,
+            value_quota,
             daily_rate_minor: None,
             pricing_model: crate::market_common::PRICING_FREE.into(),
             cycle_price_minor: None,
@@ -905,6 +947,7 @@ fn normalize_seat(input: SeatInput) -> Result<NormalizedSeat, AppError> {
             service_duration_days: input.service_duration_days,
             trial_hours: None,
             trial_token_limit: None,
+            trial_value_limit_usd_micros: None,
         });
     }
     let price_minor = price_minor.ok_or_else(|| {
@@ -936,10 +979,16 @@ fn normalize_seat(input: SeatInput) -> Result<NormalizedSeat, AppError> {
             "trial token limit is too large".into(),
         ));
     }
+    let trial_value_limit_usd_micros = normalize_trial_value_limit(
+        &value_quota,
+        trial_token_limit,
+        input.trial_value_limit_usd_micros,
+    )?;
     Ok(NormalizedSeat {
         parallel_limit: input.parallel_limit,
         token_limit: input.token_limit,
         token_period,
+        value_quota,
         daily_rate_minor,
         pricing_model: if cycle_price_minor.is_some() {
             crate::market_common::PRICING_PREPAID_CALENDAR_MONTH.into()
@@ -957,7 +1006,153 @@ fn normalize_seat(input: SeatInput) -> Result<NormalizedSeat, AppError> {
         },
         trial_hours,
         trial_token_limit,
+        trial_value_limit_usd_micros,
     })
+}
+
+/// A paid seat's one-time trial budget uses the seat's quota unit: Token and
+/// unlimited seats may set only `trialTokenLimit`, USD-equivalent seats only
+/// `trialValueLimitUsdMicros` (canonical micros; "0" = time-only).
+fn normalize_trial_value_limit(
+    value_quota: &Option<ValueQuota>,
+    trial_token_limit: Option<u64>,
+    trial_value_limit_usd_micros: Option<String>,
+) -> Result<Option<String>, AppError> {
+    if value_quota.is_none() {
+        if trial_value_limit_usd_micros.is_some() {
+            return Err(AppError::BadRequest(
+                "a USD-equivalent trial budget applies only to USD-equivalent seats".into(),
+            ));
+        }
+        return Ok(None);
+    }
+    if trial_token_limit.is_some() {
+        return Err(AppError::BadRequest(
+            "a USD-equivalent seat sets its trial budget in USD, not Tokens".into(),
+        ));
+    }
+    trial_value_limit_usd_micros
+        .map(|raw| crate::market_trial_policy::parse_value_micros(&raw).map(|_| raw))
+        .transpose()
+}
+
+fn seat_trial_value_limit_tx(conn: &Connection, seat_id: &str) -> Result<Option<String>, AppError> {
+    conn.query_row(
+        "SELECT trial_value_limit_usd_micros FROM share_market_seats WHERE id = ?1",
+        params![seat_id],
+        |row| row.get(0),
+    )
+    .map_err(map_db("read Share seat USD trial budget"))
+}
+
+/// Frozen trial terms of a quote in the seat's unit. A scope locked to the
+/// other unit freezes a zero budget: the buyer gets only the remaining time.
+fn trial_quote_terms(
+    policy_version: i64,
+    hours_inherited: bool,
+    tokens_inherited: bool,
+    value_inherited: bool,
+    allowance: crate::market_share_trials::TrialAllowance,
+    remaining: &crate::market_share_trials::TrialRemaining,
+) -> crate::market_share_trials::TrialQuote {
+    let locked = remaining.unit_locked;
+    let mut quote = crate::market_share_trials::TrialQuote {
+        version: 1,
+        policy_version,
+        hours_inherited,
+        tokens_inherited: false,
+        token_allowance: 0,
+        token_budget: 0,
+        value_allowance_usd_micros: None,
+        value_budget_usd_micros: None,
+        value_inherited: false,
+        unit_locked: locked,
+    };
+    match allowance {
+        crate::market_share_trials::TrialAllowance::Tokens(tokens) => {
+            quote.tokens_inherited = tokens_inherited;
+            if !locked {
+                quote.token_allowance = tokens;
+                quote.token_budget = remaining.token_budget;
+            }
+        }
+        crate::market_share_trials::TrialAllowance::UsdMicros(micros) => {
+            quote.value_inherited = value_inherited;
+            let (allowance, budget) = if locked {
+                (0, 0)
+            } else {
+                (micros, remaining.value_budget_micros)
+            };
+            quote.value_allowance_usd_micros = Some(allowance.to_string());
+            quote.value_budget_usd_micros = Some(budget.to_string());
+        }
+    }
+    quote
+}
+
+/// The trial budget a seat offers before scope consumption, in its unit.
+/// Overrides win; otherwise the Router default for that unit applies.
+fn seat_trial_allowance(
+    value_seat: bool,
+    trial_token_limit: Option<i64>,
+    trial_value_limit_usd_micros: Option<&str>,
+    policy: &crate::market_trial_policy::TrialPolicy,
+) -> Result<crate::market_share_trials::TrialAllowance, AppError> {
+    if value_seat {
+        let raw = trial_value_limit_usd_micros.unwrap_or(&policy.share_value_usd_micros);
+        return crate::market_trial_policy::parse_value_micros(raw)
+            .map(crate::market_share_trials::TrialAllowance::UsdMicros)
+            .map_err(|_| AppError::Internal("stored USD trial budget is invalid".into()));
+    }
+    Ok(crate::market_share_trials::TrialAllowance::Tokens(
+        trial_token_limit
+            .and_then(|value| u64::try_from(value).ok())
+            .unwrap_or(policy.share_tokens),
+    ))
+}
+
+/// A seat sells either a Token count or a USD-equivalent quota, never both.
+/// The amount is validated against the same bounds as ordinary Share grants.
+fn normalize_seat_value_quota(
+    value_quota: Option<ValueQuota>,
+    token_limit: Option<u64>,
+) -> Result<Option<ValueQuota>, AppError> {
+    let Some(value_quota) = value_quota else {
+        return Ok(None);
+    };
+    if token_limit.is_some() {
+        return Err(AppError::BadRequest(
+            "a seat sells either a Token limit or a USD-equivalent quota, not both".into(),
+        ));
+    }
+    value_quota.limit_picos().map_err(|_| {
+        AppError::BadRequest("seat USD-equivalent quota is outside the supported range".into())
+    })?;
+    Ok(Some(value_quota))
+}
+
+/// Seats and contracts store only the amount; the tariff policy is fixed.
+fn stored_value_quota(limit_usd_micros: Option<String>) -> Option<ValueQuota> {
+    limit_usd_micros.map(|limit_usd_micros| ValueQuota {
+        limit_usd_micros,
+        tariff_policy_id: crate::share_value_pricing::TARIFF_POLICY.into(),
+    })
+}
+
+fn value_quota_column(value_quota: &Option<ValueQuota>) -> Option<&str> {
+    value_quota
+        .as_ref()
+        .map(|quota| quota.limit_usd_micros.as_str())
+}
+
+fn published_value_pricing_revision_tx(conn: &Connection) -> Result<Option<String>, AppError> {
+    conn.query_row(
+        "SELECT revision FROM share_value_pricing_config WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(map_db("read published USD tariff revision"))
 }
 
 fn trial_seconds_from_hours(hours: i64) -> Result<i64, AppError> {
@@ -1793,6 +1988,7 @@ fn ensure_fixed_service_term_fulfillable_tx(
 }
 
 fn contract_policy(record: &SubscriptionRecord) -> Result<ShareUserPolicy, AppError> {
+    let grant_quota = grant_quota(record);
     let token_period: ShareTokenPeriod = serde_json::from_str(&record.token_period_json)
         .map_err(|_| AppError::Internal("stored seat token period is invalid".into()))?;
     let service_started_at = record
@@ -1806,8 +2002,8 @@ fn contract_policy(record: &SubscriptionRecord) -> Result<ShareUserPolicy, AppEr
         parallel_limit: record
             .parallel_limit
             .and_then(|value| u32::try_from(value).ok()),
-        token_limit: grant_token_limit(record),
-        value_quota: None,
+        token_limit: grant_quota.0,
+        value_quota: grant_quota.1,
         token_period,
         token_period_anchor_at_ms: service_started_at
             .and_then(|started_at| token_period_anchor_at_ms(token_period, started_at)),
@@ -1821,21 +2017,24 @@ fn contract_policy(record: &SubscriptionRecord) -> Result<ShareUserPolicy, AppEr
     })
 }
 
-fn grant_token_limit(record: &SubscriptionRecord) -> Option<u64> {
-    if should_apply_trial_tokens(record) {
-        return record
+/// The quota the Server enforces now: a legacy trial's Token cap while it
+/// runs (Token seats only), otherwise the seat's frozen Token limit or
+/// USD-equivalent quota.
+fn grant_quota(record: &SubscriptionRecord) -> (Option<u64>, Option<ValueQuota>) {
+    if should_apply_trial_tokens(record)
+        && let Some(trial_tokens) = record
             .trial_token_limit
             .filter(|value| *value > 0)
             .and_then(|value| u64::try_from(value).ok())
-            .or_else(|| {
-                record
-                    .token_limit
-                    .and_then(|value| u64::try_from(value).ok())
-            });
+    {
+        return (Some(trial_tokens), None);
     }
-    record
-        .token_limit
-        .and_then(|value| u64::try_from(value).ok())
+    (
+        record
+            .token_limit
+            .and_then(|value| u64::try_from(value).ok()),
+        stored_value_quota(record.value_limit_usd_micros.clone()),
+    )
 }
 
 pub(crate) fn enqueue_trial_paid_activation_tx(
@@ -1882,8 +2081,11 @@ pub(crate) fn validate_trial_paid_activation_tx(
     Ok(())
 }
 
+/// The legacy timed trial is Token-only: a USD-equivalent seat is never
+/// offered it and uses only the one-time trial path.
 fn should_apply_trial_tokens(record: &SubscriptionRecord) -> bool {
     if record.one_time_trial
+        || record.value_limit_usd_micros.is_some()
         || (record.daily_rate_minor.is_none() && record.cycle_price_minor.is_none())
         || record.trial_hours.unwrap_or(0) <= 0
     {
@@ -2986,7 +3188,8 @@ fn share_seat_event_snapshot_tx(
         .query_row(
             "SELECT position, status, parallel_limit, token_limit, token_period_json,
                     daily_rate_minor, currency, service_duration_days, trial_hours,
-                    trial_token_limit, offer_revision, retired_at
+                    trial_token_limit, offer_revision, retired_at, value_limit_usd_micros,
+                    trial_value_limit_usd_micros
              FROM share_market_seats WHERE id = ?1",
             params![seat_id],
             |row| {
@@ -3003,6 +3206,8 @@ fn share_seat_event_snapshot_tx(
                     row.get::<_, Option<i64>>(9)?,
                     row.get::<_, i64>(10)?,
                     row.get::<_, Option<String>>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Option<String>>(13)?,
                 ))
             },
         )
@@ -3022,8 +3227,10 @@ fn share_seat_event_snapshot_tx(
             trial_token_limit,
             offer_revision,
             retired_at,
+            value_limit_usd_micros,
+            trial_value_limit_usd_micros,
         )| {
-            let value = serde_json::json!({
+            let mut value = serde_json::json!({
                 "seatPosition": position,
                 "seatStatus": status,
                 "parallelLimit": parallel_limit,
@@ -3037,6 +3244,12 @@ fn share_seat_event_snapshot_tx(
                 "offerRevision": offer_revision,
                 "retiredAt": retired_at,
             });
+            if let Some(limit) = value_limit_usd_micros {
+                value["valueLimitUsdMicros"] = limit.into();
+            }
+            if let Some(limit) = trial_value_limit_usd_micros {
+                value["trialValueLimitUsdMicros"] = limit.into();
+            }
             Ok(value
                 .as_object()
                 .expect("Share seat event snapshot is an object")
@@ -3056,7 +3269,7 @@ fn share_subscription_event_snapshot_tx(
                     parallel_limit, token_limit, token_period_json, daily_rate_minor,
                     currency, service_duration_days, trial_hours, trial_token_limit,
                     offer_revision, release_reason, created_at,
-                    activated_at, expires_at, released_at
+                    activated_at, expires_at, released_at, value_limit_usd_micros
              FROM share_market_subscriptions WHERE id = ?1",
             params![subscription_id],
             |row| {
@@ -3080,6 +3293,7 @@ fn share_subscription_event_snapshot_tx(
                     row.get::<_, Option<String>>(16)?,
                     row.get::<_, Option<String>>(17)?,
                     row.get::<_, Option<String>>(18)?,
+                    row.get::<_, Option<String>>(19)?,
                 ))
             },
         )
@@ -3106,6 +3320,7 @@ fn share_subscription_event_snapshot_tx(
             activated_at,
             expires_at,
             released_at,
+            value_limit_usd_micros,
         )| {
             let payment_contacts = conn
                 .query_row(
@@ -3140,6 +3355,10 @@ fn share_subscription_event_snapshot_tx(
                 "releasedAt": released_at,
                 "paymentContacts": payment_contacts,
             });
+            let mut value = value;
+            if let Some(limit) = value_limit_usd_micros {
+                value["valueLimitUsdMicros"] = limit.into();
+            }
             Ok(ShareSubscriptionEventSnapshot {
                 owner_user_id,
                 renter_user_id,
@@ -3607,6 +3826,7 @@ pub(crate) fn enqueue_subscription_lifecycle_event_tx(
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(test, derive(Default))]
 struct SubscriptionRecord {
     id: String,
     seat_id: String,
@@ -3630,6 +3850,7 @@ struct SubscriptionRecord {
     parallel_limit: Option<i64>,
     token_limit: Option<i64>,
     token_period_json: String,
+    value_limit_usd_micros: Option<String>,
     daily_rate_minor: Option<i64>,
     pricing_model: String,
     cycle_price_minor: Option<i64>,
@@ -3778,7 +3999,8 @@ fn subscription_record(
                      LIMIT 1),
                 sub.pricing_model, sub.cycle_price_minor, sub.billing_interval,
                 EXISTS(SELECT 1 FROM market_share_trial_contracts t JOIN market_platform_contracts c ON c.id=t.contract_id WHERE c.product_ref=sub.id AND c.product_kind='share'),
-                (SELECT t.paid_applied_at FROM market_share_trial_contracts t JOIN market_platform_contracts c ON c.id=t.contract_id WHERE c.product_ref=sub.id AND c.product_kind='share')
+                (SELECT t.paid_applied_at FROM market_share_trial_contracts t JOIN market_platform_contracts c ON c.id=t.contract_id WHERE c.product_ref=sub.id AND c.product_kind='share'),
+                sub.value_limit_usd_micros
          FROM share_market_subscriptions sub
          LEFT JOIN shares s ON s.share_id = sub.share_id
          WHERE sub.id = ?1",
@@ -3835,6 +4057,7 @@ fn subscription_record(
                 billing_interval: row.get(44)?,
                 one_time_trial: row.get(45)?,
                 paid_quota_started_at: row.get(46)?,
+                value_limit_usd_micros: row.get(47)?,
             })
         },
     )
@@ -3982,7 +4205,8 @@ fn catalog_subscription_records(
                      LIMIT 1),
                 sub.pricing_model, sub.cycle_price_minor, sub.billing_interval,
                 EXISTS(SELECT 1 FROM market_share_trial_contracts t JOIN market_platform_contracts c ON c.id=t.contract_id WHERE c.product_ref=sub.id AND c.product_kind='share'),
-                (SELECT t.paid_applied_at FROM market_share_trial_contracts t JOIN market_platform_contracts c ON c.id=t.contract_id WHERE c.product_ref=sub.id AND c.product_kind='share')
+                (SELECT t.paid_applied_at FROM market_share_trial_contracts t JOIN market_platform_contracts c ON c.id=t.contract_id WHERE c.product_ref=sub.id AND c.product_kind='share'),
+                sub.value_limit_usd_micros
          FROM share_market_subscriptions sub
          LEFT JOIN shares share ON share.share_id = sub.share_id
          WHERE {filter}"
@@ -4045,6 +4269,7 @@ fn catalog_subscription_records(
                         billing_interval: row.get(44)?,
                         one_time_trial: row.get(45)?,
                         paid_quota_started_at: row.get(46)?,
+                        value_limit_usd_micros: row.get(47)?,
                     };
                     Ok((record.id.clone(), record))
                 })?
@@ -4061,6 +4286,7 @@ struct CatalogSeatRecord {
     parallel_limit: Option<i64>,
     token_limit: Option<i64>,
     token_period_json: String,
+    value_limit_usd_micros: Option<String>,
     daily_rate_minor: Option<i64>,
     pricing_model: String,
     cycle_price_minor: Option<i64>,
@@ -4069,6 +4295,7 @@ struct CatalogSeatRecord {
     service_duration_days: Option<i64>,
     trial_hours: Option<i64>,
     trial_token_limit: Option<i64>,
+    trial_value_limit_usd_micros: Option<String>,
     offer_revision: i64,
     current_subscription_id: Option<String>,
     retired_subscription_id: Option<String>,
@@ -4292,7 +4519,8 @@ fn catalog_seats(
                 seat.retired_subscription_id, seat.retired_at,
                 seat.pricing_model, seat.cycle_price_minor, seat.billing_interval,
                 (SELECT COUNT(*) FROM share_market_subscriptions subscription
-                 WHERE subscription.seat_id = seat.id), seat.funding_rail
+                 WHERE subscription.seat_id = seat.id), seat.funding_rail,
+                seat.value_limit_usd_micros, seat.trial_value_limit_usd_micros
          FROM share_market_seats seat
          JOIN share_market_listings listing ON listing.id = seat.listing_id
          LEFT JOIN shares share ON share.share_id = listing.share_id
@@ -4331,6 +4559,8 @@ fn catalog_seats(
                             billing_interval: row.get(18)?,
                             subscription_count: row.get(19)?,
                             funding_rail: row.get(20)?,
+                            value_limit_usd_micros: row.get(21)?,
+                            trial_value_limit_usd_micros: row.get(22)?,
                         },
                     ))
                 })?
@@ -4812,6 +5042,7 @@ fn subscription_view(
             .and_then(|value| u64::try_from(value).ok()),
         token_period: serde_json::from_str(&record.token_period_json)
             .unwrap_or(ShareTokenPeriod::Lifetime),
+        value_quota: stored_value_quota(record.value_limit_usd_micros),
         daily_rate_minor: record.daily_rate_minor,
         pricing_model: record.pricing_model,
         cycle_price_minor: record.cycle_price_minor,
@@ -5414,6 +5645,13 @@ impl AppStore {
                     && seat.status == SEAT_DISABLED
                     && seat.retired_at.is_none()
                     && seat.current_subscription_id.is_none();
+                // A seat's trial budget follows its quota unit; a stale Token
+                // override on a USD seat is never offered.
+                let value_seat = seat.value_limit_usd_micros.is_some();
+                let seat_trial_token_limit = seat
+                    .trial_token_limit
+                    .filter(|_| !value_seat)
+                    .and_then(|value| u64::try_from(value).ok());
                 seats.push(SeatView {
                     id: seat.id,
                     position: seat.position,
@@ -5428,6 +5666,7 @@ impl AppStore {
                     token_limit: seat.token_limit.and_then(|value| u64::try_from(value).ok()),
                     token_period: serde_json::from_str(&seat.token_period_json)
                         .unwrap_or(ShareTokenPeriod::Lifetime),
+                    value_quota: stored_value_quota(seat.value_limit_usd_micros),
                     daily_rate_minor: seat.daily_rate_minor,
                     pricing_model: seat.pricing_model,
                     cycle_price_minor: seat.cycle_price_minor,
@@ -5445,22 +5684,26 @@ impl AppStore {
                     } else {
                         None
                     },
-                    trial_token_limit: if offer_price_minor.is_some() {
+                    trial_token_limit: if offer_price_minor.is_some() && !value_seat {
                         Some(
-                            seat.trial_token_limit
-                                .and_then(|value| u64::try_from(value).ok())
-                                .unwrap_or(
-                                    crate::market_trial_policy::policy_tx(&conn)?.share_tokens,
-                                ),
+                            seat_trial_token_limit.unwrap_or(
+                                crate::market_trial_policy::policy_tx(&conn)?.share_tokens,
+                            ),
                         )
                     } else {
                         None
                     },
+                    trial_value_limit_usd_micros: if offer_price_minor.is_some() && value_seat {
+                        Some(seat.trial_value_limit_usd_micros.clone().unwrap_or(
+                            crate::market_trial_policy::policy_tx(&conn)?.share_value_usd_micros,
+                        ))
+                    } else {
+                        None
+                    },
+                    trial_value_limit_usd_micros_override: seat.trial_value_limit_usd_micros,
                     offer_revision: seat.offer_revision,
                     trial_hours_override: seat.trial_hours,
-                    trial_token_limit_override: seat
-                        .trial_token_limit
-                        .and_then(|value| u64::try_from(value).ok()),
+                    trial_token_limit_override: seat_trial_token_limit,
                     is_free: offer_price_minor.is_none(),
                     can_rent,
                     rent_prerequisites_met: base_rent_prerequisites,
@@ -5887,9 +6130,10 @@ fn insert_seat_tx(
             token_period_json, daily_rate_minor, currency, service_duration_days,
             trial_hours, trial_token_limit,
             offer_revision, current_subscription_id, created_at, updated_at,
-            pricing_model, cycle_price_minor, billing_interval
+            pricing_model, cycle_price_minor, billing_interval, value_limit_usd_micros,
+            trial_value_limit_usd_micros
          ) VALUES (?1, ?2, ?3, 'available', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                   1, NULL, ?12, ?12, ?13, ?14, ?15)",
+                   1, NULL, ?12, ?12, ?13, ?14, ?15, ?16, ?17)",
         params![
             id,
             listing_id,
@@ -5907,6 +6151,8 @@ fn insert_seat_tx(
             seat.pricing_model,
             seat.cycle_price_minor,
             seat.billing_interval,
+            value_quota_column(&seat.value_quota),
+            seat.trial_value_limit_usd_micros,
         ],
     )
     .map_err(map_db("insert Share Market seat"))?;
@@ -6086,9 +6332,10 @@ fn validate_publish_seats_tx(
     context: &ListingPublishContext,
     seats: &[NormalizedSeat],
 ) -> Result<(), AppError> {
-    if seats.iter().any(|seat| {
-        seat.token_limit.is_some() && !context.supported_periods.contains(&seat.token_period)
-    }) {
+    if seats
+        .iter()
+        .any(|seat| seat.has_quota() && !context.supported_periods.contains(&seat.token_period))
+    {
         return Err(AppError::BadRequest(
             "a seat uses a token period unsupported by this Server".into(),
         ));
@@ -6236,6 +6483,50 @@ impl AppStore {
         Ok(listing.0)
     }
 
+    /// The Share behind a seat; ownership is still checked by the update.
+    async fn share_market_seat_share_id(&self, seat_id: &str) -> Result<String, AppError> {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "SELECT listing.share_id FROM share_market_seats seat
+             JOIN share_market_listings listing ON listing.id = seat.listing_id
+             WHERE seat.id = ?1",
+            params![seat_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(map_db("read Share Market seat target"))?
+        .ok_or_else(|| AppError::NotFound("Share seat not found".into()))
+    }
+
+    /// The Share behind a seat that currently sells a USD-equivalent quota,
+    /// and whether the seat offers a budgeted USD trial.
+    async fn share_market_value_seat_share_id(
+        &self,
+        seat_id: &str,
+    ) -> Result<Option<(String, bool)>, AppError> {
+        let conn = self.conn.lock().await;
+        let row: Option<(String, bool, Option<i64>, Option<String>)> = conn
+            .query_row(
+                "SELECT listing.share_id,
+                        seat.daily_rate_minor IS NOT NULL OR seat.cycle_price_minor IS NOT NULL,
+                        seat.trial_hours, seat.trial_value_limit_usd_micros
+                 FROM share_market_seats seat
+                 JOIN share_market_listings listing ON listing.id = seat.listing_id
+                 WHERE seat.id = ?1 AND seat.value_limit_usd_micros IS NOT NULL",
+                params![seat_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(map_db("read Share Market USD seat target"))?;
+        let Some((share_id, paid, trial_hours, trial_value)) = row else {
+            return Ok(None);
+        };
+        let policy = crate::market_trial_policy::policy_tx(&conn)?;
+        let value_trial =
+            value_trial_offered(paid, true, trial_hours, trial_value.as_deref(), &policy);
+        Ok(Some((share_id, value_trial)))
+    }
+
     pub async fn share_market_create_listing(
         &self,
         session: &AuthSession,
@@ -6345,7 +6636,7 @@ impl AppStore {
             .unwrap_or_else(|_| vec![ShareTokenPeriod::Lifetime]);
         if seats
             .iter()
-            .any(|seat| seat.token_limit.is_some() && !supported.contains(&seat.token_period))
+            .any(|seat| seat.has_quota() && !supported.contains(&seat.token_period))
         {
             return Err(AppError::BadRequest(
                 "a seat uses a token period unsupported by this Server".into(),
@@ -6681,6 +6972,7 @@ impl AppStore {
                          token_period_json = ?5, daily_rate_minor = ?6, currency = ?7,
                          service_duration_days = ?8, trial_hours = ?9, trial_token_limit = ?10,
                          pricing_model = ?13, cycle_price_minor = ?14, billing_interval = ?15,
+                         value_limit_usd_micros = ?16, trial_value_limit_usd_micros = ?17,
                          offer_revision = offer_revision + 1,
                          updated_at = ?11
                      WHERE id = ?1 AND listing_id = ?2 AND status = 'disabled'
@@ -6703,6 +6995,8 @@ impl AppStore {
                         seat.pricing_model,
                         seat.cycle_price_minor,
                         seat.billing_interval,
+                        value_quota_column(&seat.value_quota),
+                        seat.trial_value_limit_usd_micros,
                     ],
                 )
                 .map_err(map_db("republish stopped Share seat"))?;
@@ -6865,7 +7159,7 @@ impl AppStore {
         }
         let supported: Vec<ShareTokenPeriod> = serde_json::from_str(&periods_json)
             .unwrap_or_else(|_| vec![ShareTokenPeriod::Lifetime]);
-        if seat.token_limit.is_some() && !supported.contains(&seat.token_period) {
+        if seat.has_quota() && !supported.contains(&seat.token_period) {
             return Err(AppError::BadRequest(
                 "token period is unsupported by this Server".into(),
             ));
@@ -6889,6 +7183,7 @@ impl AppStore {
                  daily_rate_minor = ?5, currency = ?6, service_duration_days = ?7,
                  trial_hours = ?8, trial_token_limit = ?9,
                  pricing_model = ?12, cycle_price_minor = ?13, billing_interval = ?14,
+                 value_limit_usd_micros = ?15, trial_value_limit_usd_micros = ?16,
                  offer_revision = offer_revision + 1, updated_at = ?10
              WHERE id = ?1 AND status = 'available' AND offer_revision = ?11",
                 params![
@@ -6907,6 +7202,8 @@ impl AppStore {
                     seat.pricing_model,
                     seat.cycle_price_minor,
                     seat.billing_interval,
+                    value_quota_column(&seat.value_quota),
+                    seat.trial_value_limit_usd_micros,
                 ],
             )
             .map_err(map_db("update Share seat"))?;
@@ -7280,6 +7577,39 @@ async fn refresh_share_runtime_before_market_publish(
     state.store.record_share_runtime_snapshot(snapshot).await
 }
 
+/// Whether a paid USD seat offers a budgeted one-time USD trial: trial hours
+/// and the USD budget, each overridden or inherited, are both non-zero.
+fn value_trial_offered(
+    paid: bool,
+    value_seat: bool,
+    trial_hours: Option<i64>,
+    trial_value_limit_usd_micros: Option<&str>,
+    policy: &crate::market_trial_policy::TrialPolicy,
+) -> bool {
+    paid && value_seat
+        && trial_hours.unwrap_or(policy.share_hours) > 0
+        && trial_value_limit_usd_micros.unwrap_or(&policy.share_value_usd_micros) != "0"
+}
+
+async fn seats_offer_value_trial<'a>(
+    state: &ServerState,
+    seats: impl IntoIterator<Item = &'a SeatInput>,
+) -> Result<bool, AppError> {
+    let policy = {
+        let conn = state.store.conn.lock().await;
+        crate::market_trial_policy::policy_tx(&conn)?
+    };
+    Ok(seats.into_iter().any(|seat| {
+        value_trial_offered(
+            seat.daily_rate_minor.is_some() || seat.cycle_price_minor.is_some(),
+            seat.value_quota.is_some(),
+            seat.trial_hours,
+            seat.trial_value_limit_usd_micros.as_deref(),
+            &policy,
+        )
+    }))
+}
+
 async fn create_listing(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -7291,6 +7621,11 @@ async fn create_listing(
         return Err(AppError::BadRequest("shareId is required".into()));
     }
     refresh_share_runtime_before_market_publish(&state, &session, share_id).await?;
+    if input.seats.iter().any(|seat| seat.value_quota.is_some()) {
+        let value_trial = seats_offer_value_trial(&state, &input.seats).await?;
+        crate::share_value_quotas::ensure_market_value_quota_ready(&state, share_id, value_trial)
+            .await?;
+    }
     let id = state
         .store
         .share_market_create_listing(&session, input)
@@ -7310,6 +7645,11 @@ async fn add_seat(
         .share_market_listing_share_id_for_owner(&session, &listing_id)
         .await?;
     refresh_share_runtime_before_market_publish(&state, &session, &share_id).await?;
+    if input.value_quota.is_some() {
+        let value_trial = seats_offer_value_trial(&state, std::slice::from_ref(&input)).await?;
+        crate::share_value_quotas::ensure_market_value_quota_ready(&state, &share_id, value_trial)
+            .await?;
+    }
     let id = state
         .store
         .share_market_add_seat(&session, &listing_id, input)
@@ -7329,6 +7669,17 @@ async fn reopen_listing(
         .share_market_listing_share_id_for_owner(&session, &listing_id)
         .await?;
     refresh_share_runtime_before_market_publish(&state, &session, &share_id).await?;
+    let seats: Vec<&SeatInput> = input
+        .existing_seats
+        .iter()
+        .map(|existing| &existing.seat)
+        .chain(&input.new_seats)
+        .collect();
+    if seats.iter().any(|seat| seat.value_quota.is_some()) {
+        let value_trial = seats_offer_value_trial(&state, seats.iter().copied()).await?;
+        crate::share_value_quotas::ensure_market_value_quota_ready(&state, &share_id, value_trial)
+            .await?;
+    }
     Ok(Json(
         state
             .store
@@ -7344,6 +7695,13 @@ async fn update_seat(
     Json(input): Json<UpdateSeatRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let session = require_session(&state, &headers).await?;
+    if input.seat.value_quota.is_some() {
+        let share_id = state.store.share_market_seat_share_id(&seat_id).await?;
+        let value_trial =
+            seats_offer_value_trial(&state, std::slice::from_ref(&input.seat)).await?;
+        crate::share_value_quotas::ensure_market_value_quota_ready(&state, &share_id, value_trial)
+            .await?;
+    }
     state
         .store
         .share_market_update_seat(&session, &seat_id, input)
@@ -7787,6 +8145,7 @@ impl AppStore {
             i64,
             i64,
             i64,
+            Option<String>,
         )> = tx
             .query_row(
                 "SELECT seat.listing_id, listing.share_id, COALESCE(share.share_name, listing.share_id),
@@ -7800,7 +8159,7 @@ impl AppStore {
                         COALESCE(share.enabled_claude, 0), COALESCE(share.enabled_codex, 0),
                         COALESCE(share.enabled_gemini, 0), share.app_runtimes_json,
                         share.app_providers_json, share.app_type, share.parallel_limit,
-                        share.token_limit, share.tokens_used
+                        share.token_limit, share.tokens_used, seat.value_limit_usd_micros
                  FROM share_market_seats seat
                  JOIN share_market_listings listing ON listing.id = seat.listing_id
                  JOIN shares share ON share.share_id = listing.share_id
@@ -7816,6 +8175,7 @@ impl AppStore {
                         row.get(15)?, row.get(16)?, row.get(17)?, row.get(18)?, row.get(19)?,
                         row.get(20)?, row.get(21)?, row.get(22)?, row.get(23)?, row.get(24)?,
                         row.get(25)?, row.get(26)?, row.get(27)?, row.get(28)?, row.get(29)?,
+                        row.get(30)?,
                     ))
                 },
             )
@@ -7852,6 +8212,7 @@ impl AppStore {
             share_parallel_limit,
             share_token_limit,
             share_tokens_used,
+            value_limit_usd_micros,
         )) = row
         else {
             return Err(AppError::coded_conflict(
@@ -7915,14 +8276,29 @@ impl AppStore {
         } else {
             None
         };
-        let quoted_trial_token_limit = if offer_price_minor.is_some() {
-            Some(
-                trial_token_limit
-                    .and_then(|value| u64::try_from(value).ok())
-                    .unwrap_or(trial_policy.share_tokens),
-            )
-        } else {
-            None
+        // The trial budget follows the seat's quota unit.
+        let value_seat = value_limit_usd_micros.is_some();
+        let trial_token_limit = trial_token_limit.filter(|_| !value_seat);
+        let trial_value_limit = seat_trial_value_limit_tx(&tx, seat_id)?;
+        let quoted_trial_allowance = offer_price_minor
+            .map(|_| {
+                seat_trial_allowance(
+                    value_seat,
+                    trial_token_limit,
+                    trial_value_limit.as_deref(),
+                    &trial_policy,
+                )
+            })
+            .transpose()?;
+        let quoted_trial_token_limit = match quoted_trial_allowance {
+            Some(crate::market_share_trials::TrialAllowance::Tokens(tokens)) => Some(tokens),
+            _ => None,
+        };
+        let quoted_trial_value_limit = match quoted_trial_allowance {
+            Some(crate::market_share_trials::TrialAllowance::UsdMicros(micros)) => {
+                Some(micros.to_string())
+            }
+            _ => None,
         };
         if offer_price_minor.is_some() {
             let current_rail: String = tx
@@ -7942,25 +8318,28 @@ impl AppStore {
                     "wallet-funded Share seats must be priced in USD".into(),
                 ));
             }
-            let (trial, token_budget) = crate::market_share_trials::remaining_tx(
+            let remaining = crate::market_share_trials::remaining_in_unit_tx(
                 &tx,
                 &session.user_id,
                 &owner_user_id,
                 &share_id,
                 trial_seconds_from_hours(quoted_trial_hours.unwrap_or(0))?,
-                quoted_trial_token_limit.unwrap_or(0),
+                quoted_trial_allowance
+                    .unwrap_or(crate::market_share_trials::TrialAllowance::Tokens(0)),
             )?;
+            let trial = remaining.seconds;
             if trial > 0 {
                 crate::market_share_trials::require_capability_tx(&tx, &share_id)?;
             }
-            trial_quote = Some(crate::market_share_trials::TrialQuote {
-                version: 1,
-                policy_version: trial_policy.version,
-                hours_inherited: trial_hours.is_none(),
-                tokens_inherited: trial_token_limit.is_none(),
-                token_allowance: quoted_trial_token_limit.unwrap_or(0),
-                token_budget,
-            });
+            trial_quote = Some(trial_quote_terms(
+                trial_policy.version,
+                trial_hours.is_none(),
+                trial_token_limit.is_none(),
+                trial_value_limit.is_none(),
+                quoted_trial_allowance
+                    .unwrap_or(crate::market_share_trials::TrialAllowance::Tokens(0)),
+                &remaining,
+            ));
             let funding = crate::market_wallet::wallet_quote_funding_tx(
                 &tx,
                 &session.user_id,
@@ -8033,6 +8412,11 @@ impl AppStore {
             token_limit: token_limit.and_then(|value| u64::try_from(value).ok()),
             token_period: serde_json::from_str(&token_period_json)
                 .unwrap_or(ShareTokenPeriod::Lifetime),
+            value_pricing_revision: match value_limit_usd_micros {
+                Some(_) => published_value_pricing_revision_tx(&tx)?,
+                None => None,
+            },
+            value_quota: stored_value_quota(value_limit_usd_micros),
             daily_rate_minor,
             pricing_model: pricing_model.clone(),
             cycle_price_minor,
@@ -8042,6 +8426,7 @@ impl AppStore {
                 .and_then(|value| u32::try_from(value).ok()),
             trial_hours: quoted_trial_hours,
             trial_token_limit: quoted_trial_token_limit,
+            trial_value_limit_usd_micros: quoted_trial_value_limit,
             trial: trial_quote,
             offer_revision,
             funding_rail: "platform_wallet".into(),
@@ -8727,6 +9112,7 @@ impl AppStore {
             i64,
             i64,
             i64,
+            Option<String>,
         )> = tx
             .query_row(
                 "SELECT seat.listing_id, listing.share_id, listing.owner_user_id,
@@ -8742,7 +9128,7 @@ impl AppStore {
                         COALESCE(s.enabled_claude, 0), COALESCE(s.enabled_codex, 0),
                         COALESCE(s.enabled_gemini, 0), s.app_runtimes_json,
                         s.app_providers_json, s.app_type, s.parallel_limit,
-                        s.token_limit, s.tokens_used
+                        s.token_limit, s.tokens_used, seat.value_limit_usd_micros
                  FROM share_market_seats seat
                  JOIN share_market_listings listing ON listing.id = seat.listing_id
                  JOIN shares s ON s.share_id = listing.share_id
@@ -8784,6 +9170,7 @@ impl AppStore {
                         row.get(29)?,
                         row.get(30)?,
                         row.get(31)?,
+                        row.get(32)?,
                     ))
                 },
             )
@@ -8822,12 +9209,14 @@ impl AppStore {
             share_parallel_limit,
             share_token_limit,
             share_tokens_used,
+            value_limit_usd_micros,
         )) = row
         else {
             return Err(AppError::Conflict(
                 "seat or its active Share is unavailable".into(),
             ));
         };
+        let value_quota = stored_value_quota(value_limit_usd_micros.clone());
         if listing_status != "active" || seat_status != SEAT_AVAILABLE {
             return Err(AppError::Conflict("seat is no longer available".into()));
         }
@@ -8931,12 +9320,24 @@ impl AppStore {
         } else {
             None
         };
-        let rented_trial_token_limit = if offer_price_minor.is_some() {
+        // The trial budget follows the seat's quota unit: a USD seat never
+        // carries a Token trial cap and a Token seat never a USD one.
+        let value_seat = value_quota.is_some();
+        let rented_trial_token_limit = if offer_price_minor.is_some() && !value_seat {
             Some(
                 trial_token_limit
                     .and_then(|value| u64::try_from(value).ok())
                     .or_else(|| quote_snapshot.and_then(|s| s.trial_token_limit))
                     .unwrap_or(trial_policy.share_tokens),
+            )
+        } else {
+            None
+        };
+        let rented_trial_value_limit = if offer_price_minor.is_some() && value_seat {
+            Some(
+                seat_trial_value_limit_tx(tx, seat_id)?
+                    .or_else(|| quote_snapshot.and_then(|s| s.trial_value_limit_usd_micros.clone()))
+                    .unwrap_or_else(|| trial_policy.share_value_usd_micros.clone()),
             )
         } else {
             None
@@ -8947,6 +9348,7 @@ impl AppStore {
             parallel_limit: parallel_limit.and_then(|value| u32::try_from(value).ok()),
             token_limit: token_limit.and_then(|value| u64::try_from(value).ok()),
             token_period,
+            value_quota: value_quota.clone(),
             daily_rate_minor,
             pricing_model: pricing_model.clone(),
             cycle_price_minor,
@@ -8955,6 +9357,7 @@ impl AppStore {
             service_duration_days,
             trial_hours: rented_trial_hours,
             trial_token_limit: rented_trial_token_limit,
+            trial_value_limit_usd_micros: rented_trial_value_limit,
         };
         let current_service = build_rent_service_snapshot(
             &bindings_json,
@@ -9025,21 +9428,30 @@ impl AppStore {
             serde_json::to_string(&current_service.supported_apps).map_err(|error| {
                 AppError::Internal(format!("encode Share contract Apps failed: {error}"))
             })?;
-        let grant_token_limit = if offer_price_minor.is_some()
+        // A legacy timed trial (Token seats only) enforces its Token cap
+        // first; the seat's own Token limit applies once it ends. USD seats
+        // use only the one-time trial path.
+        let legacy_trial_tokens = if offer_price_minor.is_some()
+            && !value_seat
             && quote_snapshot.is_none_or(|snapshot| snapshot.trial.is_none())
             && rented_trial_hours.unwrap_or(0) > 0
             && quoted_trial_seconds.unwrap_or(i64::MAX) > 0
         {
-            rented_trial_token_limit
-                .filter(|tokens| *tokens > 0)
-                .or_else(|| token_limit.and_then(|value| u64::try_from(value).ok()))
+            rented_trial_token_limit.filter(|tokens| *tokens > 0)
         } else {
-            token_limit.and_then(|value| u64::try_from(value).ok())
+            None
+        };
+        let (grant_token_limit, grant_value_quota) = match legacy_trial_tokens {
+            Some(tokens) => (Some(tokens), None),
+            None => (
+                token_limit.and_then(|value| u64::try_from(value).ok()),
+                value_quota.clone(),
+            ),
         };
         let policy = ShareUserPolicy {
             parallel_limit: parallel_limit.and_then(|value| u32::try_from(value).ok()),
             token_limit: grant_token_limit,
-            value_quota: None,
+            value_quota: grant_value_quota,
             token_period,
             token_period_anchor_at_ms: None,
             expires_at: None,
@@ -9056,11 +9468,12 @@ impl AppStore {
                 activated_at, expires_at, created_at, updated_at, released_at,
                 free_usage_seconds, rent_quote_id, idempotency_key, request_fingerprint,
                 required_app, service_snapshot_json, contract_apps_json
-                , pricing_model, cycle_price_minor, billing_interval
+                , pricing_model, cycle_price_minor, billing_interval,
+                value_limit_usd_micros, value_pricing_revision
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'grant_pending',
                        ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
                        NULL, NULL, ?20, ?21, ?21, NULL, ?22, ?23, ?24, ?25,
-                       ?26, ?27, ?28, ?29, ?30, ?31)",
+                       ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)",
             params![
                 subscription_id,
                 seat_id,
@@ -9093,6 +9506,8 @@ impl AppStore {
                 pricing_model,
                 cycle_price_minor,
                 billing_interval,
+                value_limit_usd_micros,
+                quote_snapshot.and_then(|snapshot| snapshot.value_pricing_revision.as_deref()),
             ],
         )
         .map_err(|error| {
@@ -9526,6 +9941,14 @@ async fn quote_seat(
 ) -> Result<Json<RentQuoteView>, AppError> {
     let session = require_session(&state, &headers).await?;
     ensure_share_market_seat_online(&state, &seat_id).await?;
+    if let Some((share_id, value_trial)) = state
+        .store
+        .share_market_value_seat_share_id(&seat_id)
+        .await?
+    {
+        crate::share_value_quotas::ensure_market_value_quota_ready(&state, &share_id, value_trial)
+            .await?;
+    }
     let quote = state
         .store
         .share_market_create_rent_quote(
@@ -9723,9 +10146,10 @@ fn validate_effective_initial_policy(
     let expected_parallel = record
         .parallel_limit
         .and_then(|value| u32::try_from(value).ok());
-    let expected_tokens = grant_token_limit(record);
+    let (expected_tokens, expected_value_quota) = grant_quota(record);
     if effective_policy.parallel_limit != expected_parallel
         || effective_policy.token_limit != expected_tokens
+        || effective_policy.value_quota != expected_value_quota
         || effective_policy.token_period != token_period
         || effective_policy.token_period_anchor_at_ms != expected_anchor
         || effective_policy.expires_at != expected_expiry
@@ -9761,9 +10185,10 @@ fn validate_effective_resume_policy(
     let expected_parallel = record
         .parallel_limit
         .and_then(|value| u32::try_from(value).ok());
-    let expected_tokens = grant_token_limit(record);
+    let (expected_tokens, expected_value_quota) = grant_quota(record);
     if effective_policy.parallel_limit != expected_parallel
         || effective_policy.token_limit != expected_tokens
+        || effective_policy.value_quota != expected_value_quota
         || effective_policy.token_period != token_period
         || effective_policy.token_period_anchor_at_ms != expected_anchor
         || effective_policy.expires_at != expected_expiry
@@ -11403,10 +11828,10 @@ impl AppStore {
                 && record.contract_trial_seconds_remaining == Some(0)
             {
                 if let Some(grant) = entitlement_grant.as_ref() {
-                    let paid_tokens = record
-                        .token_limit
-                        .and_then(|value| u64::try_from(value).ok());
-                    if grant.policy.token_limit != paid_tokens {
+                    let (paid_tokens, paid_value_quota) = grant_quota(&record);
+                    if grant.policy.token_limit != paid_tokens
+                        || grant.policy.value_quota != paid_value_quota
+                    {
                         let policy = contract_policy(&record)?;
                         enqueue_control_operation_tx(
                             &tx,
@@ -11664,6 +12089,16 @@ impl AppStore {
                     },
                     trial_token_allowance: if action == "upsert" {
                         crate::market_share_trials::control_scope_tx(&tx, &subscription_id)?.1
+                    } else {
+                        None
+                    },
+                    trial_value_allowance_usd_micros: if action == "upsert" {
+                        crate::market_share_trials::control_value_terms_tx(&tx, &subscription_id)?.0
+                    } else {
+                        None
+                    },
+                    trial_value_limit_usd_micros: if action == "upsert" {
+                        crate::market_share_trials::control_value_terms_tx(&tx, &subscription_id)?.1
                     } else {
                         None
                     },
@@ -12822,6 +13257,7 @@ mod tests {
         SeatInput {
             parallel_limit: Some(2),
             token_limit: Some(10_000),
+            value_quota: None,
             token_period: ShareTokenPeriod::Day,
             daily_rate_minor: None,
             cycle_price_minor: None,
@@ -12829,6 +13265,7 @@ mod tests {
             service_duration_days: Some(1),
             trial_hours: None,
             trial_token_limit: None,
+            trial_value_limit_usd_micros: None,
         }
     }
 
@@ -15476,6 +15913,8 @@ mod tests {
             parallel_limit: Some(3),
             token_limit: Some(40_000),
             token_period: ShareTokenPeriod::SevenDays,
+            value_quota: None,
+            value_pricing_revision: None,
             daily_rate_minor: Some(1_200),
             pricing_model: crate::market_common::PRICING_LEGACY_METERED_DAILY.into(),
             cycle_price_minor: None,
@@ -15484,6 +15923,7 @@ mod tests {
             service_duration_days: Some(30),
             trial_hours: Some(12),
             trial_token_limit: Some(1_000_000),
+            trial_value_limit_usd_micros: None,
             trial: None,
             offer_revision: 7,
             funding_rail: default_legacy_funding_rail(),
@@ -15529,6 +15969,14 @@ mod tests {
         assert_changed!(service_duration_days, Some(31));
         assert_changed!(trial_hours, Some(6));
         assert_changed!(trial_token_limit, Some(2_000_000));
+        assert_changed!(trial_value_limit_usd_micros, Some("1000000".into()));
+        assert_changed!(
+            value_quota,
+            Some(ValueQuota {
+                limit_usd_micros: "10000000".into(),
+                tariff_policy_id: crate::share_value_pricing::TARIFF_POLICY.into(),
+            })
+        );
     }
 
     #[test]
@@ -16124,7 +16572,7 @@ mod tests {
             .unwrap();
         activate_subscription(&store, &subscription, Utc::now()).await;
         let state=store.conn.lock().await.query_row("SELECT t.scope_id,t.token_allowance,t.token_budget FROM market_share_trial_contracts t JOIN market_platform_contracts c ON c.id=t.contract_id WHERE c.product_ref=?1",params![subscription],|r|Ok(crate::models::ShareMarketEntitlement {
-            trial_scope_id:r.get(0)?,trial_token_allowance:Some(r.get(1)?),email:buyer.email.clone(),phase:crate::models::ShareMarketPhase::Trial,active:true,trial_token_limit:Some(r.get(2)?),trial_tokens_used:0,usage_revision:0,usage_uncertain:false,applied_at_ms:Utc::now().timestamp_millis(),paid_started_at_ms:None
+            trial_scope_id:r.get(0)?,trial_token_allowance:Some(r.get(1)?),email:buyer.email.clone(),phase:crate::models::ShareMarketPhase::Trial,active:true,trial_token_limit:Some(r.get(2)?),trial_tokens_used:0,trial_value_allowance_usd_micros:None,trial_value_limit_usd_micros:None,trial_value_used_picos:"0".into(),usage_revision:0,usage_uncertain:false,applied_at_ms:Utc::now().timestamp_millis(),paid_started_at_ms:None
         })).unwrap();
         (store, owner, buyer, subscription, state)
     }
@@ -16868,6 +17316,623 @@ mod tests {
             anchor,
             dispatched_at.timestamp_millis().div_euclid(60_000) * 60_000
         );
+    }
+
+    fn usd_quota(limit_usd_micros: &str) -> ValueQuota {
+        ValueQuota {
+            limit_usd_micros: limit_usd_micros.into(),
+            tariff_policy_id: crate::share_value_pricing::TARIFF_POLICY.into(),
+        }
+    }
+
+    #[test]
+    fn usd_seat_quota_is_exclusive_bounded_and_keeps_its_period() {
+        let mut seat = free_seat();
+        seat.token_limit = None;
+        seat.value_quota = Some(usd_quota("10000000"));
+        let normalized = normalize_seat(seat.clone()).expect("USD seat");
+        assert_eq!(normalized.value_quota, Some(usd_quota("10000000")));
+        assert_eq!(normalized.token_period, ShareTokenPeriod::Day);
+        assert!(normalized.has_quota());
+
+        let mut both = seat.clone();
+        both.token_limit = Some(1);
+        assert!(normalize_seat(both).is_err());
+        for invalid in ["0", "010", "1000000000000001", "1.5", ""] {
+            let mut bad = seat.clone();
+            bad.value_quota = Some(usd_quota(invalid));
+            assert!(normalize_seat(bad).is_err(), "{invalid} must be rejected");
+        }
+        let mut wrong_policy = seat.clone();
+        wrong_policy.value_quota = Some(ValueQuota {
+            limit_usd_micros: "10000000".into(),
+            tariff_policy_id: "other".into(),
+        });
+        assert!(normalize_seat(wrong_policy).is_err());
+        let mut account_reset = seat;
+        account_reset.token_period = ShareTokenPeriod::AccountReset;
+        assert!(normalize_seat(account_reset).is_err());
+    }
+
+    #[test]
+    fn schema_keeps_seat_quotas_exclusive() {
+        let conn = Connection::open_in_memory().expect("memory database");
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        crate::schema::apply(&conn).expect("schema");
+        let insert = |token_limit: Option<i64>, value: Option<&str>| {
+            conn.execute(
+                "INSERT INTO share_market_seats (
+                    id, listing_id, position, status, token_limit, token_period_json,
+                    offer_revision, created_at, updated_at, value_limit_usd_micros
+                 ) VALUES ('seat-check', 'listing-check', 1, 'available', ?1, '\"day\"',
+                           1, 'now', 'now', ?2)",
+                params![token_limit, value],
+            )
+        };
+        insert(None, Some("10")).expect("a USD-only seat is valid");
+        conn.execute("DELETE FROM share_market_seats", []).unwrap();
+        for (token_limit, value) in [
+            (Some(1_i64), Some("10")),
+            (None, Some("0")),
+            (None, Some("1x")),
+            (None, Some("1000000000000001")),
+        ] {
+            assert!(
+                insert(token_limit, value).is_err(),
+                "{token_limit:?}/{value:?} must violate the seat CHECK"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn usd_seat_freezes_its_quota_into_the_contract_and_grant() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-usd", "owner-usd@example.com");
+        let renter = session("renter-usd", "renter-usd@example.com");
+        insert_share(&store, "share-usd", &owner.email, &[ShareTokenPeriod::Day]).await;
+        let mut seat = free_seat();
+        seat.token_limit = None;
+        seat.value_quota = Some(usd_quota("25000000"));
+        let (_, seat_id) = create_listing(&store, &owner, "share-usd", seat).await;
+
+        let subscription_id = store
+            .rent_fixture_share(&renter, &seat_id, RentSeatRequest { offer_revision: 1 })
+            .await
+            .expect("rent USD seat");
+        let conn = store.conn.lock().await;
+        let (token_limit, value_limit): (Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT token_limit, value_limit_usd_micros
+                 FROM share_market_subscriptions WHERE id = ?1",
+                params![subscription_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read frozen USD terms");
+        assert_eq!(token_limit, None);
+        assert_eq!(value_limit.as_deref(), Some("25000000"));
+        let policy_json: String = conn
+            .query_row(
+                "SELECT policy_json FROM share_control_operations
+                 WHERE subscription_id = ?1 AND action = 'upsert'",
+                params![subscription_id],
+                |row| row.get(0),
+            )
+            .expect("read USD grant policy");
+        let policy: ShareUserPolicy = serde_json::from_str(&policy_json).expect("decode policy");
+        assert_eq!(policy.token_limit, None);
+        assert_eq!(policy.value_quota, Some(usd_quota("25000000")));
+        assert_eq!(policy.token_period, ShareTokenPeriod::Day);
+
+        let record = subscription_record(&conn, &subscription_id)
+            .expect("read subscription")
+            .expect("subscription exists");
+        assert_eq!(grant_quota(&record), (None, Some(usd_quota("25000000"))));
+        let mut applied = contract_policy(&record).expect("contract policy");
+        applied.value_quota = Some(usd_quota("25000001"));
+        assert!(validate_effective_resume_policy(&record, &applied).is_err());
+    }
+
+    #[test]
+    fn legacy_trial_cap_never_replaces_a_usd_seat_quota() {
+        let record = SubscriptionRecord {
+            value_limit_usd_micros: Some("5000000".into()),
+            token_limit: None,
+            trial_token_limit: Some(2_000),
+            trial_hours: Some(12),
+            daily_rate_minor: Some(100),
+            contract_trial_seconds_remaining: Some(60),
+            one_time_trial: false,
+            ..SubscriptionRecord::default()
+        };
+        // The legacy timed trial is Token-only; a USD seat keeps its quota.
+        assert_eq!(grant_quota(&record), (None, Some(usd_quota("5000000"))));
+        let token_seat = SubscriptionRecord {
+            value_limit_usd_micros: None,
+            token_limit: Some(9_000),
+            ..record.clone()
+        };
+        assert_eq!(grant_quota(&token_seat), (Some(2_000), None));
+        let ended = SubscriptionRecord {
+            contract_trial_seconds_remaining: Some(0),
+            ..record
+        };
+        assert_eq!(grant_quota(&ended), (None, Some(usd_quota("5000000"))));
+    }
+
+    fn usd_trial_seat(trial_value: Option<&str>) -> SeatInput {
+        SeatInput {
+            token_limit: None,
+            value_quota: Some(usd_quota("25000000")),
+            trial_token_limit: None,
+            trial_value_limit_usd_micros: trial_value.map(str::to_string),
+            ..monthly_seat()
+        }
+    }
+
+    #[test]
+    fn seat_trial_budget_follows_the_quota_unit() {
+        let inherited = normalize_seat(usd_trial_seat(None)).expect("USD seat inherits");
+        assert_eq!(inherited.trial_value_limit_usd_micros, None);
+        assert_eq!(inherited.trial_token_limit, None);
+        for valid in ["0", "1", "2500000", "1000000000000000"] {
+            assert_eq!(
+                normalize_seat(usd_trial_seat(Some(valid)))
+                    .expect("valid USD trial budget")
+                    .trial_value_limit_usd_micros
+                    .as_deref(),
+                Some(valid),
+                "explicit {valid} overrides; 0 means time-only"
+            );
+        }
+        for invalid in ["", "00", "01", "1.5", "-1", "1000000000000001"] {
+            assert!(
+                normalize_seat(usd_trial_seat(Some(invalid))).is_err(),
+                "{invalid:?} must be rejected"
+            );
+        }
+        // A USD seat never carries a Token trial cap.
+        let mut token_cap_on_usd = usd_trial_seat(None);
+        token_cap_on_usd.trial_token_limit = Some(250);
+        assert!(normalize_seat(token_cap_on_usd).is_err());
+        let mut both = usd_trial_seat(Some("1000000"));
+        both.trial_token_limit = Some(0);
+        assert!(normalize_seat(both).is_err());
+        // Token and unlimited seats never carry a USD trial budget.
+        let mut token_seat = monthly_seat();
+        token_seat.trial_value_limit_usd_micros = Some("1000000".into());
+        assert!(normalize_seat(token_seat).is_err());
+        let mut unlimited = monthly_seat();
+        unlimited.token_limit = None;
+        unlimited.trial_token_limit = None;
+        unlimited.trial_value_limit_usd_micros = Some("0".into());
+        assert!(normalize_seat(unlimited).is_err());
+        // Token seats keep their Token trial cap unchanged.
+        assert_eq!(
+            normalize_seat(monthly_seat()).unwrap().trial_token_limit,
+            Some(250)
+        );
+        // Free seats carry no trial at all.
+        let mut free = free_seat();
+        free.token_limit = None;
+        free.value_quota = Some(usd_quota("25000000"));
+        free.trial_value_limit_usd_micros = Some("1000000".into());
+        assert!(normalize_seat(free).is_err());
+    }
+
+    #[test]
+    fn usd_trial_offer_needs_paid_hours_and_a_non_zero_budget() {
+        let policy = crate::market_trial_policy::TrialPolicy {
+            version: 1,
+            client_hours: 12,
+            share_hours: 12,
+            share_tokens: 1_000_000,
+            share_value_usd_micros: "1000000".into(),
+        };
+        assert!(value_trial_offered(true, true, None, None, &policy));
+        assert!(!value_trial_offered(false, true, None, None, &policy));
+        assert!(!value_trial_offered(true, false, None, None, &policy));
+        assert!(!value_trial_offered(true, true, Some(0), None, &policy));
+        assert!(!value_trial_offered(true, true, None, Some("0"), &policy));
+        let time_only = crate::market_trial_policy::TrialPolicy {
+            share_value_usd_micros: "0".into(),
+            ..policy.clone()
+        };
+        assert!(!value_trial_offered(true, true, None, None, &time_only));
+        assert!(value_trial_offered(true, true, None, Some("1"), &time_only));
+        assert_eq!(
+            seat_trial_allowance(true, Some(250), None, &policy).unwrap(),
+            crate::market_share_trials::TrialAllowance::UsdMicros(1_000_000),
+            "a stale Token override never applies to a USD seat"
+        );
+        assert_eq!(
+            seat_trial_allowance(false, None, Some("5"), &policy).unwrap(),
+            crate::market_share_trials::TrialAllowance::Tokens(1_000_000)
+        );
+    }
+
+    #[test]
+    fn quote_terms_freeze_only_the_seat_unit_and_a_locked_scope_is_time_only() {
+        use crate::market_share_trials::{TrialAllowance, TrialQuote, TrialRemaining};
+        let open = TrialRemaining {
+            seconds: 3600,
+            token_budget: 0,
+            value_budget_micros: 750_000,
+            unit_locked: false,
+        };
+        let usd = trial_quote_terms(
+            3,
+            false,
+            true,
+            true,
+            TrialAllowance::UsdMicros(1_000_000),
+            &open,
+        );
+        assert_eq!(
+            (usd.token_allowance, usd.token_budget, usd.tokens_inherited),
+            (0, 0, false)
+        );
+        assert_eq!(usd.value_allowance_usd_micros.as_deref(), Some("1000000"));
+        assert_eq!(usd.value_budget_usd_micros.as_deref(), Some("750000"));
+        assert!(usd.value_inherited && !usd.unit_locked);
+        let json = serde_json::to_value(&usd).unwrap();
+        assert_eq!(json["valueAllowanceUsdMicros"], "1000000");
+        assert_eq!(json["valueBudgetUsdMicros"], "750000");
+        assert!(json.get("unitLocked").is_none());
+
+        let locked = TrialRemaining {
+            seconds: 3600,
+            token_budget: 0,
+            value_budget_micros: 0,
+            unit_locked: true,
+        };
+        let usd_locked = trial_quote_terms(
+            3,
+            false,
+            true,
+            false,
+            TrialAllowance::UsdMicros(1_000_000),
+            &locked,
+        );
+        assert_eq!(usd_locked.value_allowance_usd_micros.as_deref(), Some("0"));
+        assert_eq!(usd_locked.value_budget_usd_micros.as_deref(), Some("0"));
+        assert!(usd_locked.unit_locked);
+        assert_eq!(
+            serde_json::to_value(&usd_locked).unwrap()["unitLocked"],
+            true
+        );
+        let tokens_locked = trial_quote_terms(
+            3,
+            true,
+            true,
+            true,
+            TrialAllowance::Tokens(1_000_000),
+            &locked,
+        );
+        assert_eq!(
+            (tokens_locked.token_allowance, tokens_locked.token_budget),
+            (0, 0)
+        );
+        assert!(tokens_locked.value_allowance_usd_micros.is_none());
+        assert!(!tokens_locked.value_inherited && tokens_locked.unit_locked);
+
+        // Quotes frozen before USD trials keep decoding unchanged.
+        let old: TrialQuote = serde_json::from_value(serde_json::json!({
+            "version": 1, "policyVersion": 1, "hoursInherited": true,
+            "tokensInherited": true, "tokenAllowance": 5, "tokenBudget": 5
+        }))
+        .unwrap();
+        assert!(old.value_allowance_usd_micros.is_none() && !old.unit_locked);
+    }
+
+    async fn usd_trial_fixture(
+        trial_value: Option<&str>,
+    ) -> (AppStore, AuthSession, String, String) {
+        let store = AppStore::new_in_memory_for_tests().unwrap();
+        let owner = session("usd-trial-provider", "usd-trial-provider@example.com");
+        let buyer = session("usd-trial-buyer", "usd-trial-buyer@example.com");
+        insert_share(
+            &store,
+            "usd-trial-share",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let (_, seat) = create_listing(
+            &store,
+            &owner,
+            "usd-trial-share",
+            usd_trial_seat(trial_value),
+        )
+        .await;
+        let quote = store
+            .share_market_create_rent_quote(&buyer, &seat, None)
+            .await
+            .expect("quote USD seat");
+        assert_eq!(quote.offer.trial_token_limit, None);
+        assert_eq!(
+            quote.offer.trial_value_limit_usd_micros.as_deref(),
+            Some(trial_value.unwrap_or(crate::market_trial_policy::DEFAULT_SHARE_VALUE_USD_MICROS))
+        );
+        let subscription = store
+            .rent_fixture_share(&buyer, &seat, RentSeatRequest { offer_revision: 1 })
+            .await
+            .unwrap();
+        activate_subscription(&store, &subscription, Utc::now()).await;
+        let contract: String = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT id FROM market_platform_contracts WHERE product_ref=?1",
+                params![subscription],
+                |r| r.get(0),
+            )
+            .unwrap();
+        (store, buyer, subscription, contract)
+    }
+
+    #[tokio::test]
+    async fn usd_trial_freezes_value_terms_and_sends_them_without_token_terms() {
+        let (store, buyer, subscription, _) = usd_trial_fixture(Some("2000000")).await;
+        let conn = store.conn.lock().await;
+        let (unit, token_allowance, value_allowance, value_budget): (
+            String,
+            i64,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT s.unit, t.token_allowance, t.value_allowance_usd_micros,
+                        t.value_budget_usd_micros
+                 FROM market_share_trial_contracts t
+                 JOIN market_share_trial_scopes s ON s.id = t.scope_id
+                 JOIN market_platform_contracts c ON c.id = t.contract_id
+                 WHERE c.product_ref = ?1",
+                params![subscription],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(unit, "usd", "the first trial contract locks the scope unit");
+        assert_eq!(token_allowance, 0);
+        assert_eq!(value_allowance.as_deref(), Some("2000000"));
+        assert_eq!(value_budget.as_deref(), Some("2000000"));
+        assert_eq!(
+            crate::market_share_trials::control_terms_tx(&conn, &subscription).unwrap(),
+            (Some(crate::models::ShareMarketPhase::Trial), None)
+        );
+        assert_eq!(
+            crate::market_share_trials::control_scope_tx(&conn, &subscription)
+                .unwrap()
+                .1,
+            None,
+            "a USD trial never sends a Token allowance"
+        );
+        assert_eq!(
+            crate::market_share_trials::control_value_terms_tx(&conn, &subscription).unwrap(),
+            (Some("2000000".into()), Some("2000000".into()))
+        );
+        let patch_json: String = conn
+            .query_row(
+                "SELECT patch_json FROM share_edit_requests WHERE share_id = 'usd-trial-share'
+                 ORDER BY revision LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let patch: serde_json::Value = serde_json::from_str(&patch_json).unwrap();
+        let grant = &patch["managedGrant"];
+        assert_eq!(grant["marketPhase"], "trial");
+        assert_eq!(grant["trialValueAllowanceUsdMicros"], "2000000");
+        assert_eq!(grant["trialValueLimitUsdMicros"], "2000000");
+        assert!(grant.get("trialTokenLimit").is_none());
+        assert!(grant.get("trialTokenAllowance").is_none());
+        assert!(grant["policy"]["valueQuota"].is_object());
+        let view = crate::market_share_trials::view_tx(&conn, &subscription)
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.value_allowance_usd_micros.as_deref(), Some("2000000"));
+        assert_eq!(view.value_remaining_usd_micros.as_deref(), Some("2000000"));
+        assert_eq!(view.tokens_remaining, None);
+        drop(conn);
+        // A Token seat on the same Share now gets only the remaining time.
+        let conn = store.conn.lock().await;
+        let token_side = crate::market_share_trials::remaining_in_unit_tx(
+            &conn,
+            &buyer.user_id,
+            "usd-trial-provider",
+            "usd-trial-share",
+            720 * 3600,
+            crate::market_share_trials::TrialAllowance::Tokens(9_000_000),
+        )
+        .unwrap();
+        assert!(token_side.unit_locked);
+        assert_eq!(token_side.token_budget, 0);
+        assert!(token_side.seconds > 0);
+    }
+
+    #[tokio::test]
+    async fn late_original_unit_usage_ends_a_switched_time_only_trial() {
+        let (store, _, _, contract) = usd_trial_fixture(Some("0")).await;
+        let conn = store.conn.lock().await;
+        let scope: String = conn
+            .query_row(
+                "SELECT scope_id FROM market_share_trial_contracts WHERE contract_id=?1",
+                params![contract],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // The old Token trial was returned with a request still in flight;
+        // its late completion reaches the original allowance only after the
+        // buyer has committed the time-only USD trial.
+        conn.execute(
+            "UPDATE market_share_trial_scopes SET unit='tokens' WHERE id=?1",
+            params![scope],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO market_platform_contracts(id,product_kind,product_ref,trial_scope_ref,quote_id,request_fingerprint,buyer_user_id,provider_user_id,offer_revision,billing_model,cycle_price_minor,renewal_policy,status,created_at,updated_at)
+            SELECT 'prior-token-contract','share','prior-token-rental',trial_scope_ref,'prior-quote','prior-request',buyer_user_id,provider_user_id,1,'calendar_month',cycle_price_minor,'manual','ended',created_at,updated_at
+            FROM market_platform_contracts WHERE id=?1", params![contract]).unwrap();
+        conn.execute("INSERT INTO market_share_trial_contracts(contract_id,scope_id,entitlement_id,token_allowance,token_budget,tokens_used,phase,created_at,updated_at)
+            VALUES('prior-token-contract',?1,'prior-token-entitlement',100,100,100,'revoking','before','before')", params![scope]).unwrap();
+        let now = Utc::now().to_rfc3339();
+        crate::market_share_trials::reconcile_tx(&conn, &contract, &now).unwrap();
+        let (phase, reason): (String, Option<String>) = conn
+            .query_row(
+                "SELECT phase,end_reason FROM market_share_trial_contracts WHERE contract_id=?1",
+                params![contract],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(phase, "activating");
+        assert_eq!(reason.as_deref(), Some("tokens"));
+    }
+
+    #[tokio::test]
+    async fn usd_trial_converts_to_paid_when_its_value_budget_is_exhausted() {
+        let (store, buyer, subscription, contract) = usd_trial_fixture(Some("2000000")).await;
+        let conn = store.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let record = subscription_record(&tx, &subscription).unwrap().unwrap();
+        let scope: String = tx
+            .query_row(
+                "SELECT scope_id FROM market_share_trial_contracts WHERE contract_id=?1",
+                params![contract],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let mut state = crate::models::ShareMarketEntitlement {
+            trial_scope_id: scope,
+            trial_token_allowance: None,
+            email: buyer.email.clone(),
+            phase: crate::models::ShareMarketPhase::Trial,
+            active: true,
+            trial_token_limit: None,
+            trial_tokens_used: 0,
+            trial_value_allowance_usd_micros: Some("2000000".into()),
+            trial_value_limit_usd_micros: Some("2000000".into()),
+            // One pico short of the US$2 budget.
+            trial_value_used_picos: "1999999999999".into(),
+            usage_revision: 1,
+            usage_uncertain: false,
+            applied_at_ms: Utc::now().timestamp_millis(),
+            paid_started_at_ms: None,
+        };
+        let write = |state: &crate::models::ShareMarketEntitlement| {
+            tx.execute(
+                "UPDATE shares SET market_entitlements_json=?1 WHERE share_id='usd-trial-share'",
+                params![
+                    serde_json::to_string(&BTreeMap::from([(
+                        record.entitlement_id.clone(),
+                        state.clone()
+                    )]))
+                    .unwrap()
+                ],
+            )
+            .unwrap();
+        };
+        write(&state);
+        let now = Utc::now().to_rfc3339();
+        assert!(!crate::market_share_trials::reconcile_tx(&tx, &contract, &now).unwrap());
+        let view = crate::market_share_trials::view_tx(&tx, &subscription)
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.phase, "trial");
+        // Used rounds up and remaining rounds down: one pico left is $0.
+        assert_eq!(view.value_used_usd_micros.as_deref(), Some("2000000"));
+        assert_eq!(view.value_remaining_usd_micros.as_deref(), Some("0"));
+        // A regressing watermark is rejected.
+        let mut regressed = state.clone();
+        regressed.trial_value_used_picos = "1".into();
+        regressed.usage_revision = 2;
+        write(&regressed);
+        assert!(crate::market_share_trials::reconcile_tx(&tx, &contract, &now).is_err());
+        state.trial_value_used_picos = "2000000000000".into();
+        state.usage_revision = 2;
+        write(&state);
+        assert!(crate::market_share_trials::reconcile_tx(&tx, &contract, &now).unwrap());
+        let (phase, reason, scope_reason): (String, Option<String>, Option<String>) = tx
+            .query_row(
+                "SELECT t.phase, t.end_reason, s.ended_reason FROM market_share_trial_contracts t
+                 JOIN market_share_trial_scopes s ON s.id=t.scope_id WHERE t.contract_id=?1",
+                params![contract],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(phase, "activating");
+        assert_eq!(reason.as_deref(), Some("value"));
+        assert_eq!(scope_reason.as_deref(), Some("value"));
+        assert!(
+            crate::market_share_trials::control_value_terms_tx(&tx, &subscription)
+                .unwrap()
+                .0
+                .is_none(),
+            "the paid activation carries no trial budget"
+        );
+        assert_eq!(
+            crate::market_share_trials::remaining_in_unit_tx(
+                &tx,
+                &buyer.user_id,
+                "usd-trial-provider",
+                "usd-trial-share",
+                720 * 3600,
+                crate::market_share_trials::TrialAllowance::UsdMicros(9_000_000),
+            )
+            .unwrap()
+            .seconds,
+            0,
+            "an exhausted USD scope cannot be revived by a larger default"
+        );
+    }
+
+    #[tokio::test]
+    async fn token_scope_lock_gives_a_later_usd_seat_only_the_remaining_time() {
+        let (store, _, buyer, subscription, _) = one_time_trial_fixture().await;
+        let conn = store.conn.lock().await;
+        let unit: String = conn
+            .query_row(
+                "SELECT s.unit FROM market_share_trial_scopes s
+                 JOIN market_share_trial_contracts t ON t.scope_id = s.id
+                 JOIN market_platform_contracts c ON c.id = t.contract_id
+                 WHERE c.product_ref = ?1",
+                params![subscription],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unit, "tokens");
+        let remaining = |allowance| {
+            crate::market_share_trials::remaining_in_unit_tx(
+                &conn,
+                &buyer.user_id,
+                "trial-provider",
+                "trial-share",
+                720 * 3600,
+                allowance,
+            )
+            .unwrap()
+        };
+        let usd = remaining(crate::market_share_trials::TrialAllowance::UsdMicros(
+            1_000_000,
+        ));
+        let time_only = remaining(crate::market_share_trials::TrialAllowance::Tokens(0));
+        assert!(usd.unit_locked);
+        assert_eq!((usd.value_budget_micros, usd.token_budget), (0, 0));
+        assert_eq!(
+            usd.seconds, time_only.seconds,
+            "only the remaining time applies"
+        );
+        assert!(usd.seconds > 0);
+        // Spending the locked Token budget ends the trial for every unit.
+        conn.execute(
+            "UPDATE market_share_trial_contracts SET tokens_used = token_allowance",
+            [],
+        )
+        .unwrap();
+        let usd = remaining(crate::market_share_trials::TrialAllowance::UsdMicros(
+            1_000_000,
+        ));
+        assert_eq!(usd.seconds, 0);
     }
 
     #[test]

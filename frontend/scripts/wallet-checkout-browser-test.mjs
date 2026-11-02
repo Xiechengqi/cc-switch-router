@@ -657,7 +657,7 @@ try {
   let policy = { version: 1, maintenanceFeeBps: 500, transfersEnabled: true,
     transfersPaused: false, transferMaxMinor: 500_000, transferDailyMaxMinor: 500_000,
     balanceRefundable: false, canEdit: true };
-  let trialPolicy = { version: 1, clientHours: 12, shareHours: 12, shareTokens: 1_000_000, canEdit: true };
+  let trialPolicy = { version: 1, clientHours: 12, shareHours: 12, shareTokens: 1_000_000, shareValueUsdMicros: "1000000", canEdit: true };
   let trialWrites = 0;
   let conflictTrial = false;
   let policyWrites = 0;
@@ -700,7 +700,7 @@ try {
       if (route.request().method() === "PUT") {
         trialWrites += 1;
         const input = route.request().postDataJSON();
-        assert.deepEqual(Object.keys(input).sort(), ["clientHours", "expectedVersion", "shareHours", "shareTokens"]);
+        assert.deepEqual(Object.keys(input).sort(), ["clientHours", "expectedVersion", "shareHours", "shareTokens", "shareValueUsdMicros"]);
         assert.equal(input.expectedVersion, trialPolicy.version);
         if (conflictTrial) {
           conflictTrial = false;

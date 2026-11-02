@@ -1376,6 +1376,13 @@ pub struct ShareManagedGrantOperation {
     /// None means time-only; zero is never a valid cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trial_token_limit: Option<u64>,
+    /// USD-equivalent seats only: the scope's original USD trial allowance and
+    /// this contract's remaining cap, canonical decimal micros. Both or
+    /// neither; exclusive with the Token trial fields; trial phase only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_value_allowance_usd_micros: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_value_limit_usd_micros: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -1383,6 +1390,14 @@ pub struct ShareManagedGrantOperation {
 pub enum ShareMarketPhase {
     Trial,
     Paid,
+}
+
+fn zero_decimal() -> String {
+    "0".into()
+}
+
+fn is_zero_decimal(value: &str) -> bool {
+    value == "0"
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -1397,6 +1412,14 @@ pub struct ShareMarketEntitlement {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trial_token_limit: Option<u64>,
     pub trial_tokens_used: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_value_allowance_usd_micros: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_value_limit_usd_micros: Option<String>,
+    /// Monotonic USD trial consumption in picos, under the same
+    /// `usageRevision` as `trialTokensUsed`.
+    #[serde(default = "zero_decimal", skip_serializing_if = "is_zero_decimal")]
+    pub trial_value_used_picos: String,
     pub usage_revision: u64,
     #[serde(default)]
     pub usage_uncertain: bool,

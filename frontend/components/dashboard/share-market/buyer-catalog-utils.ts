@@ -7,6 +7,7 @@ import type {
 import {
   PROVIDER_FAMILY_ORDER,
   listingIdleCount,
+  listingBestValueRatio,
   listingLowestDailyRate,
 } from "@/components/dashboard/share-market/market-utils";
 import {
@@ -220,7 +221,7 @@ export function sortMergedCatalogListings(
   });
 }
 
-export const MARKET_CATALOG_SORTS = ["recommended", "idle", "price", "uptime"] as const;
+export const MARKET_CATALOG_SORTS = ["recommended", "idle", "price", "discount", "uptime"] as const;
 
 export type MarketCatalogSort = (typeof MARKET_CATALOG_SORTS)[number];
 
@@ -231,6 +232,9 @@ function listingSortValue(listing: ShareMarketListing, sort: MarketCatalogSort) 
       return -listingIdleCount(listing);
     case "price":
       return listingLowestDailyRate(listing);
+    case "discount":
+      // Shares without a USD-equivalent seat have no comparable discount.
+      return listingBestValueRatio(listing);
     case "uptime":
       // Unknown uptime sorts below 0%: an unmeasured Share is not a good Share.
       return -(listing.reliability.onlineRate24h ?? -1);

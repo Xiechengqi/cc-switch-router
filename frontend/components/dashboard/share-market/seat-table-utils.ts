@@ -34,7 +34,7 @@ export type SeatRowLike = {
   };
   seat: Pick<
     ShareMarketSeat,
-    "position" | "parallelLimit" | "tokenLimit" | "dailyRateMinor" | "cyclePriceMinor" | "isFree" | "status" | "currency" | "readOnly"
+    "position" | "parallelLimit" | "tokenLimit" | "valueQuota" | "dailyRateMinor" | "cyclePriceMinor" | "isFree" | "status" | "currency" | "readOnly"
   >;
   subscription?: Pick<ShareMarketSubscription, "status">;
   statusKey: string;
@@ -50,6 +50,12 @@ export function toggleSeatSort(current: SeatSortPrefs, key: SeatSortKey): SeatSo
 function cmp(a: string | number, b: string | number) {
   if (typeof a === "number" && typeof b === "number") return a - b;
   return String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: "base" });
+}
+
+function seatQuotaSortKey(seat: Pick<ShareMarketSeat, "tokenLimit" | "valueQuota">): [number, number] {
+  if (seat.valueQuota) return [1, Number(seat.valueQuota.limitUsdMicros)];
+  if (seat.tokenLimit != null) return [0, seat.tokenLimit];
+  return [2, 0];
 }
 
 export function sortSeatRows<T extends SeatRowLike>(rows: T[], prefs: SeatSortPrefs): T[] {
@@ -76,12 +82,14 @@ export function sortSeatRows<T extends SeatRowLike>(rows: T[], prefs: SeatSortPr
           right.seat.parallelLimit ?? Number.POSITIVE_INFINITY,
         );
         break;
-      case "tokens":
-        result = cmp(
-          left.seat.tokenLimit ?? Number.POSITIVE_INFINITY,
-          right.seat.tokenLimit ?? Number.POSITIVE_INFINITY,
-        );
+      case "tokens": {
+        // Tokens and USD-equivalent amounts are not comparable: group by
+        // unit (Tokens, then USD, then unlimited), then order by amount.
+        const [leftUnit, leftAmount] = seatQuotaSortKey(left.seat);
+        const [rightUnit, rightAmount] = seatQuotaSortKey(right.seat);
+        result = leftUnit - rightUnit || cmp(leftAmount, rightAmount);
         break;
+      }
       case "amount":
         result = cmp(
           left.seat.isFree ? 0 : left.seat.cyclePriceMinor ?? (left.seat.dailyRateMinor ?? 0) * 30,

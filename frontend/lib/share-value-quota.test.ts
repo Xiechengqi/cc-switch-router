@@ -125,6 +125,11 @@ test("USD quota decimals are exact, bounded and independent of wallet currency",
   assert.equal(usdUsageToPicos("$1,000.5"), "1000500000000000");
   assert.equal(usdUsageToPicos("1.0000000000001"), undefined);
   assert.equal(usdUsageToPicos(""), undefined);
+  assert.deepEqual(parseUsdLimit("0", { allowZero: true }), { ok: true, micros: "0" });
+  assert.deepEqual(parseUsdLimit("$0.000000", { allowZero: true }), { ok: true, micros: "0" });
+  assert.deepEqual(parseUsdLimit("0.000001", { allowZero: true }), { ok: true, micros: "1" });
+  assert.deepEqual(parseUsdLimit("", { allowZero: true }), { ok: false, error: "empty" });
+  assert.deepEqual(parseUsdLimit("1.0000001", { allowZero: true }), { ok: false, error: "too_many_decimals" });
   assert.equal(formatQuotaPicos("1"), "< US$0.000001");
   assert.equal(formatQuotaPicos("18000000000"), "US$0.018");
   assert.equal(formatQuotaPicos("1500000000000"), "US$1.50");

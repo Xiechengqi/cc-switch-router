@@ -32,8 +32,26 @@ import {
   MarketShareCard,
   listingCardId,
 } from "@/components/dashboard/share-market/market-share-card";
+import { QuotaUnitSwitch, type QuotaUnit } from "@/components/dashboard/share-edit/value-quota-fields";
+import {
+  MarketValueReadinessLine,
+  SellerDiscountPreview,
+  SellerRealizedValue,
+  UsdSeatTerms,
+  useMarketValueQuotaReadiness,
+  useQuotaActor,
+} from "@/components/dashboard/share-market/seat-value-quota";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getMarketTrialPolicy, type MarketTrialPolicy } from "@/lib/market-trial-policy";
+import {
+  formatQuotaPicos,
+  formatUsdLimit,
+  getValueQuotaStatus,
+  microsToUsdInput,
+  parseUsdLimit,
+  usdAmountErrorKey,
+  type ValueQuotaStatus,
+} from "@/lib/share-value-quota";
 import {
   addShareMarketSeat,
   closeShareMarketListing,
@@ -48,6 +66,7 @@ import {
   updateShareMarketSeat,
 } from "@/lib/api";
 import { MARKET_CURRENCY } from "@/lib/market-money";
+import { valueReadinessActor } from "@/lib/use-value-quota-readiness";
 
 import {
   formatTokenMillions,
@@ -67,7 +86,7 @@ import type {
 import { cn, compactTokens } from "@/lib/utils";
 import {
   formatSeatPrice,
-  formatTokenLimit,
+  formatSeatQuota,
   grantFailureMessageKey,
   integrityReasonText,
   integrityStatusKey,
@@ -92,17 +111,21 @@ type TFn = ReturnType<typeof useLocaleText>["t"];
 
 type SeatDraft = {
   parallelLimit: string;
+  quotaUnit: QuotaUnit;
   tokenLimit: string;
+  /** USD input as typed; used only while `quotaUnit` is `usdEquivalent`. */
+  valueLimit: string;
   tokenPeriod: ShareTokenPeriod;
   paid: boolean;
   price: string;
   trialHours: string;
   trialTokenLimit: string;
+  trialValueLimit: string;
   serviceDurationMode: "fixed" | "permanent";
   serviceDurationDays: string;
   serviceDurationTouched: boolean;
 };
-type SeatDraftField = "parallelLimit" | "tokenLimit" | "price" | "trialHours" | "trialTokenLimit" | "serviceDurationDays";
+type SeatDraftField = "parallelLimit" | "tokenLimit" | "valueLimit" | "price" | "trialHours" | "trialTokenLimit" | "trialValueLimit" | "serviceDurationDays";
 type SeatDraftValidation = {
   message: string;
   field?: SeatDraftField;
@@ -138,12 +161,15 @@ class SeatDraftError extends Error {
 function emptySeat(periods: ShareTokenPeriod[] = TOKEN_PERIODS): SeatDraft {
   return {
     parallelLimit: "",
+    quotaUnit: "tokens",
     tokenLimit: "",
+    valueLimit: "",
     tokenPeriod: periods.includes("lifetime") ? "lifetime" : periods[0] || "lifetime",
     paid: false,
     price: "",
     trialHours: "",
     trialTokenLimit: "",
+    trialValueLimit: "",
     serviceDurationMode: "fixed",
     serviceDurationDays: "1",
     serviceDurationTouched: false,
@@ -153,9 +179,12 @@ function emptySeat(periods: ShareTokenPeriod[] = TOKEN_PERIODS): SeatDraft {
 function seatDraft(seat: ShareMarketSeat): SeatDraft {
   const hours = seat.trialHoursOverride === undefined ? seat.trialHours : seat.trialHoursOverride;
   const tokens = seat.trialTokenLimitOverride === undefined ? seat.trialTokenLimit : seat.trialTokenLimitOverride;
+  const trialValue = seat.trialValueLimitUsdMicrosOverride === undefined ? seat.trialValueLimitUsdMicros : seat.trialValueLimitUsdMicrosOverride;
   return {
     parallelLimit: seat.parallelLimit == null ? "" : String(seat.parallelLimit),
+    quotaUnit: seat.valueQuota ? "usdEquivalent" : "tokens",
     tokenLimit: seat.tokenLimit == null ? "" : tokensToMillionsInput(seat.tokenLimit),
+    valueLimit: seat.valueQuota ? microsToUsdInput(seat.valueQuota.limitUsdMicros) : "",
     tokenPeriod: seat.tokenPeriod,
     paid: !seat.isFree,
     price: seat.cyclePriceMinor != null
@@ -163,6 +192,7 @@ function seatDraft(seat: ShareMarketSeat): SeatDraft {
       : "",
     trialHours: hours == null ? "" : String(hours),
     trialTokenLimit: tokens == null ? "" : tokensToMillionsInput(tokens),
+    trialValueLimit: trialValue == null ? "" : microsToUsdInput(trialValue),
     serviceDurationMode: !seat.isFree || seat.serviceDurationDays == null ? "permanent" : "fixed",
     serviceDurationDays: String(seat.serviceDurationDays ?? 1),
     serviceDurationTouched: true,
@@ -198,6 +228,33 @@ function positiveOptionalTokenMillions(value: string, label: string, t: TFn) {
   return parsed;
 }
 
+/** A USD seat always has a positive amount; unlimited seats use Token mode. */
+function optionalUsdQuota(value: string, t: TFn): ShareMarketSeatInput["valueQuota"] {
+  const parsed = parseUsdLimit(value);
+  if (!parsed.ok) throw new SeatDraftError("valueLimit", t(usdAmountErrorKey(parsed.error)));
+  return { limitUsdMicros: parsed.micros, tariffPolicyId: "api-equivalent-v1" };
+}
+
+/** The draft as a paid USD seat, once its amount and monthly price parse. */
+function draftDiscountSeat(draft: SeatDraft) {
+  if (draft.quotaUnit !== "usdEquivalent" || !draft.paid) return null;
+  const limit = parseUsdLimit(draft.valueLimit);
+  const price = draft.price.trim();
+  if (!limit.ok || !/^\d+(?:\.\d{1,2})?$/.test(price) || Number(price) <= 0) return null;
+  return {
+    isFree: false,
+    valueQuota: { limitUsdMicros: limit.micros, tariffPolicyId: "api-equivalent-v1" as const },
+    tokenPeriod: draft.tokenPeriod,
+    cyclePriceMinor: Math.round(Number(price) * 100),
+    dailyRateMinor: undefined,
+  };
+}
+
+/** Whether the draft limits usage at all, in the unit it is set to. */
+function draftHasQuota(draft: SeatDraft) {
+  return (draft.quotaUnit === "usdEquivalent" ? draft.valueLimit : draft.tokenLimit).trim() !== "";
+}
+
 function normalizedSeat(draft: SeatDraft, t: TFn): ShareMarketSeatInput {
   const parallelLimit = positiveOptional(
     draft.parallelLimit,
@@ -205,7 +262,9 @@ function normalizedSeat(draft: SeatDraft, t: TFn): ShareMarketSeatInput {
     "parallelLimit",
     t,
   );
-  const tokenLimit = positiveOptionalTokenMillions(draft.tokenLimit, t("shareMarket.tokens"), t);
+  const usd = draft.quotaUnit === "usdEquivalent";
+  const tokenLimit = usd ? undefined : positiveOptionalTokenMillions(draft.tokenLimit, t("shareMarket.tokens"), t);
+  const valueQuota = usd ? optionalUsdQuota(draft.valueLimit, t) : undefined;
   const serviceDurationDays = draft.paid || draft.serviceDurationMode === "permanent"
     ? undefined
     : positiveOptional(
@@ -223,7 +282,8 @@ function normalizedSeat(draft: SeatDraft, t: TFn): ShareMarketSeatInput {
   const base: ShareMarketSeatInput = {
     parallelLimit,
     tokenLimit,
-    tokenPeriod: tokenLimit == null ? "lifetime" : draft.tokenPeriod,
+    valueQuota,
+    tokenPeriod: tokenLimit == null && valueQuota == null ? "lifetime" : draft.tokenPeriod,
     serviceDurationDays,
   };
   if (!draft.paid) return base;
@@ -241,6 +301,12 @@ function normalizedSeat(draft: SeatDraft, t: TFn): ShareMarketSeatInput {
   }
   if (trialHours === 0) {
     return { ...base, serviceDurationDays: undefined, cyclePriceMinor, currency: MARKET_CURRENCY, trialHours, trialTokenLimit: undefined };
+  }
+  if (usd) {
+    const trialValue = draft.trialValueLimit.trim() === "" ? undefined : parseUsdLimit(draft.trialValueLimit, { allowZero: true });
+    if (trialValue && !trialValue.ok) throw new SeatDraftError("trialValueLimit", t(usdAmountErrorKey(trialValue.error)));
+    return { ...base, serviceDurationDays: undefined, cyclePriceMinor, currency: MARKET_CURRENCY, trialHours,
+      trialValueLimitUsdMicros: trialValue?.ok ? trialValue.micros : undefined };
   }
   if (draft.trialTokenLimit.trim() !== "" && !validTokenMillionsInput(draft.trialTokenLimit, { allowZero: true })) {
     throw new SeatDraftError("trialTokenLimit", t("shareMarket.error.nonNegativeMillions", { field: t("shareMarket.dialog.trialTokenLimit") }));
@@ -290,12 +356,15 @@ function fieldClass(invalid = false) {
 
 function SeatFields({
   draft,
+  shareId,
   supportedPeriods,
   disabled = false,
   validation = { message: "" },
   onChange,
 }: {
   draft: SeatDraft;
+  /** Enables the Token / USD-equivalent switch, gated on this Share's Server. */
+  shareId?: string;
   supportedPeriods?: ShareTokenPeriod[];
   disabled?: boolean;
   validation?: SeatDraftValidation;
@@ -306,46 +375,80 @@ function SeatFields({
   const [trialError, setTrialError] = React.useState("");
   React.useEffect(() => { let active = true; getMarketTrialPolicy().then((p) => { if (active) setTrialPolicy(p); }).catch((e) => { if (active) setTrialError(e instanceof Error ? e.message : String(e)); }); return () => { active = false; }; }, []);
   const errorId = React.useId();
+  const readinessId = React.useId();
+  const usdState = useMarketValueQuotaReadiness(shareId);
+  const usdReady = usdState.readiness?.ready === true;
   const periods = supportedPeriods?.length ? supportedPeriods : TOKEN_PERIODS;
   const patch = (value: Partial<SeatDraft>) => onChange({ ...draft, ...value });
   const invalid = (field: SeatDraftField) => validation.field === field;
   const describedBy = (field: SeatDraftField) => invalid(field) ? errorId : undefined;
+  const usd = draft.quotaUnit === "usdEquivalent";
+  const trialAmountField = usd ? "trialValueLimit" : "trialTokenLimit";
+  const amountField: SeatDraftField = usd ? "valueLimit" : "tokenLimit";
+  const hasQuota = draftHasQuota(draft);
+  const effectiveTrialHours = draft.trialHours.trim() === "" ? trialPolicy?.shareHours : Number(draft.trialHours);
+  const effectiveTrialValue = draft.trialValueLimit.trim() === "" ? trialPolicy?.shareValueUsdMicros
+    : (() => { const parsed = parseUsdLimit(draft.trialValueLimit, { allowZero: true }); return parsed.ok ? parsed.micros : undefined; })();
+  const needsValueTrialUpgrade = usd && usdReady && usdState.readiness?.valueTrialReady !== true
+    && effectiveTrialHours != null && effectiveTrialHours > 0 && effectiveTrialValue != null && effectiveTrialValue !== "0";
   return (
     <div className="grid min-w-0 gap-3">
-      <div className={cn("grid min-w-0 gap-3", draft.tokenLimit.trim() ? "sm:grid-cols-3" : "sm:grid-cols-2")}>
+      {shareId ? (
+        <div className="grid gap-1.5">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span className="text-xs text-slate-500">{t("shareMarket.quota.unit")}</span>
+            <div className="w-full sm:w-64">
+              <QuotaUnitSwitch
+                value={draft.quotaUnit}
+                onChange={(quotaUnit) => patch({ quotaUnit })}
+                usdDisabled={!usdReady}
+                disabled={disabled}
+                readinessId={readinessId}
+                t={t}
+              />
+            </div>
+          </div>
+          <MarketValueReadinessLine id={readinessId} state={usdState} quiet={!usd} />
+        </div>
+      ) : null}
+      <div className={cn("grid min-w-0 gap-3", hasQuota ? "sm:grid-cols-3" : "sm:grid-cols-2")}>
         <label className="grid gap-1 text-xs text-slate-500">
           {t("shareMarket.parallel")}
           <input className={fieldClass(invalid("parallelLimit"))} inputMode="numeric" disabled={disabled} aria-invalid={invalid("parallelLimit")} aria-describedby={describedBy("parallelLimit")} value={draft.parallelLimit} placeholder={t("shareMarket.dialog.unlimited")} onChange={(event) => patch({ parallelLimit: event.target.value })} />
         </label>
         <label className="grid gap-1 text-xs text-slate-500">
-          {t("shareMarket.tokensMillions")}
-          <input
-            className={fieldClass(invalid("tokenLimit"))}
-            inputMode="decimal"
-            disabled={disabled}
-            aria-invalid={invalid("tokenLimit")}
-            aria-describedby={describedBy("tokenLimit")}
-            value={draft.tokenLimit}
-            placeholder={t("shareMarket.dialog.unlimited")}
-            onChange={(event) => {
-              const tokenLimit = event.target.value;
-              patch({
-                tokenLimit,
-                tokenPeriod: tokenLimit.trim() && !periods.includes(draft.tokenPeriod)
-                  ? periods[0] || "lifetime"
-                  : draft.tokenPeriod,
-              });
-            }}
-          />
+          {usd ? t("shareMarket.quota.usdLimit") : t("shareMarket.tokensMillions")}
+          <span className="relative block">
+            {usd ? <span aria-hidden="true" className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-sm text-slate-400">$</span> : null}
+            <input
+              className={cn(fieldClass(invalid(amountField)), "w-full", usd && "pl-6")}
+              inputMode="decimal"
+              autoComplete="off"
+              disabled={disabled}
+              aria-invalid={invalid(amountField)}
+              aria-describedby={describedBy(amountField)}
+              value={usd ? draft.valueLimit : draft.tokenLimit}
+              placeholder={t("shareMarket.dialog.unlimited")}
+              onChange={(event) => {
+                const amount = event.target.value;
+                patch({
+                  ...(usd ? { valueLimit: amount } : { tokenLimit: amount }),
+                  tokenPeriod: amount.trim() && !periods.includes(draft.tokenPeriod)
+                    ? periods[0] || "lifetime"
+                    : draft.tokenPeriod,
+                });
+              }}
+            />
+          </span>
         </label>
-        {draft.tokenLimit.trim() ? (
+        {hasQuota ? (
           <label className="grid gap-1 text-xs text-slate-500">
-            {t("shareMarket.tokenPeriod")}
+            {t(usd ? "shareMarket.quota.period" : "shareMarket.tokenPeriod")}
             <CompactSelect
               value={draft.tokenPeriod}
               options={periods.map((period) => ({ value: period, label: t(`shareMarket.period.${period}`) }))}
               onChange={(value) => patch({ tokenPeriod: value as ShareTokenPeriod })}
-              ariaLabel={t("shareMarket.tokenPeriod")}
+              ariaLabel={t(usd ? "shareMarket.quota.period" : "shareMarket.tokenPeriod")}
               disabled={disabled}
               className="w-full"
               triggerClassName="h-10 w-full text-sm"
@@ -353,6 +456,7 @@ function SeatFields({
           </label>
         ) : null}
       </div>
+      {usd ? <UsdSeatTerms parallelLimit={draft.parallelLimit} /> : null}
       <SegmentedControl
         value={draft.paid ? "paid" : "free"}
         onChange={(value) => {
@@ -388,6 +492,7 @@ function SeatFields({
             </div>
           </div>
           <ProviderCommissionPreview price={draft.price} />
+          <SellerDiscountPreview seat={draftDiscountSeat(draft)} />
           <div className="grid gap-3 sm:grid-cols-2">
             <label className="grid gap-1 text-xs text-slate-500">
               {t("shareMarket.dialog.trialHours")}
@@ -407,24 +512,28 @@ function SeatFields({
               />
             </label>
             <label className="grid gap-1 text-xs text-slate-500">
-              {t("shareMarket.dialog.trialTokenLimit")}
+              {t(usd ? "shareMarket.dialog.trialValueLimit" : "shareMarket.dialog.trialTokenLimit")}
+              <span className="relative block">
+              {usd ? <span aria-hidden="true" className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-sm text-slate-400">$</span> : null}
               <input
-                className={fieldClass(invalid("trialTokenLimit"))}
+                className={cn(fieldClass(invalid(trialAmountField)), "w-full", usd && "pl-6")}
                 placeholder={t("clientMarket.trialInherit")}
                 inputMode="decimal"
                 disabled={disabled || draft.trialHours === "0"}
-                aria-invalid={invalid("trialTokenLimit")}
-                aria-describedby={describedBy("trialTokenLimit")}
-                value={draft.trialTokenLimit}
+                aria-invalid={invalid(trialAmountField)}
+                aria-describedby={describedBy(trialAmountField)}
+                value={usd ? draft.trialValueLimit : draft.trialTokenLimit}
                 onChange={(event) => {
-                  const trialTokenLimit = event.target.value;
-                  patch({ trialTokenLimit });
+                  patch(usd ? { trialValueLimit: event.target.value } : { trialTokenLimit: event.target.value });
                 }}
               />
+              </span>
             </label>
           </div>
           <p className="text-xs leading-6 text-muted-foreground">{t("marketTrial.overrideHelp")}</p>
-          {trialPolicy ? <p className="text-xs text-muted-foreground">{t("marketTrial.defaults", { hours: trialPolicy.shareHours, tokens: trialPolicy.shareTokens > 0 ? formatTokenMillions(trialPolicy.shareTokens, locale) : t("marketTrial.timeOnly") })}</p> : null}
+          {usd && draft.valueLimit.trim() ? <p className="text-xs leading-5 text-muted-foreground">{t("shareMarket.quota.usdTrial")}</p> : null}
+          {needsValueTrialUpgrade ? <p role="alert" className="text-xs text-danger">{t("shareMarket.quota.usdTrialUpgrade")}</p> : null}
+          {trialPolicy ? <p className="text-xs text-muted-foreground">{t(usd ? "marketTrial.valueDefaults" : "marketTrial.defaults", { hours: trialPolicy.shareHours, tokens: trialPolicy.shareTokens > 0 ? formatTokenMillions(trialPolicy.shareTokens, locale) : t("marketTrial.timeOnly"), amount: trialPolicy.shareValueUsdMicros !== "0" ? formatUsdLimit(trialPolicy.shareValueUsdMicros) : t("marketTrial.timeOnly") })}</p> : null}
           {trialError ? <p role="alert" className="text-xs text-danger">{trialError}</p> : null}
         </>
       ) : null}
@@ -608,7 +717,7 @@ export function ShareMarketAddListingDialog({
                           {seats.length > 1 ? <Button isIconOnly size="sm" variant="ghost" aria-label={t("common.delete")} isDisabled={busy} onClick={() => setSeats((items) => items.filter((_, itemIndex) => itemIndex !== index))}><X className="h-4 w-4" /></Button> : null}
                         </div>
                       </div>
-                      <SeatFields draft={seat} supportedPeriods={selected?.supportedUserTokenPeriods} disabled={busy} validation={seatErrors[index]} onChange={(next) => setSeats((items) => items.map((item, itemIndex) => itemIndex === index ? next : item))} />
+                      <SeatFields draft={seat} shareId={selected?.shareId} supportedPeriods={selected?.supportedUserTokenPeriods} disabled={busy} validation={seatErrors[index]} onChange={(next) => setSeats((items) => items.map((item, itemIndex) => itemIndex === index ? next : item))} />
                     </section>
                   ))}
                   {seats.length < 20 ? <Button variant="outline" isDisabled={busy} onClick={() => setSeats((items) => [...items, emptySeat(selected?.supportedUserTokenPeriods)])}><Plus className="h-4 w-4" />{t("shareMarket.dialog.addSeat")}</Button> : null}
@@ -789,6 +898,7 @@ function ReopenListingDialog({
                         </div>
                         <SeatFields
                           draft={item.draft}
+                          shareId={listing.shareId}
                           supportedPeriods={listing.supportedUserTokenPeriods}
                           disabled={busy || !item.selected}
                           validation={existingErrors[index]}
@@ -815,7 +925,7 @@ function ReopenListingDialog({
                             <Button isIconOnly size="sm" variant="ghost" aria-label={t("common.delete")} isDisabled={busy} onClick={() => setNewSeats((items) => items.filter((_, itemIndex) => itemIndex !== index))}><X className="h-4 w-4" /></Button>
                           </div>
                         </div>
-                        <SeatFields draft={seat} supportedPeriods={listing.supportedUserTokenPeriods} disabled={busy} validation={newSeatErrors[index]} onChange={(next) => setNewSeats((items) => items.map((current, itemIndex) => itemIndex === index ? next : current))} />
+                        <SeatFields draft={seat} shareId={listing.shareId} supportedPeriods={listing.supportedUserTokenPeriods} disabled={busy} validation={newSeatErrors[index]} onChange={(next) => setNewSeats((items) => items.map((current, itemIndex) => itemIndex === index ? next : current))} />
                       </section>
                     ))}
                   </section>
@@ -901,7 +1011,7 @@ function SeatDialog({
           <Modal.Header><Modal.Heading>{seat ? t("shareMarket.manage") : template ? t("shareMarket.createFromSeat") : t("shareMarket.addSeat")}</Modal.Heading></Modal.Header>
           <Modal.Body className="grid max-h-[75vh] gap-4 overflow-y-auto">
             {listing ? <ShareCapacitySummary parallelLimit={listing.parallelLimit} tokenLimit={listing.tokenLimit} /> : null}
-            <SeatFields draft={draft} supportedPeriods={listing?.supportedUserTokenPeriods} disabled={busy} validation={validation} onChange={setDraft} />
+            <SeatFields draft={draft} shareId={listing?.shareId} supportedPeriods={listing?.supportedUserTokenPeriods} disabled={busy} validation={validation} onChange={setDraft} />
             {draft.paid ? <PaidOfferReadinessNotice readiness={paidReadiness} /> : null}
             {error ? <p className="text-sm text-rose-700">{error}</p> : null}
           </Modal.Body>
@@ -918,7 +1028,7 @@ function SeatDialog({
 function seatQuotaLabel(seat: ShareMarketSeat, locale: string, t: TFn) {
   return [
     t("shareMarket.parallelShort", { value: seat.parallelLimit == null ? "∞" : seat.parallelLimit }),
-    formatTokenLimit(seat, locale, t("common.unlimited"), (period) => t(`shareMarket.period.${period}`)),
+    formatSeatQuota(seat, locale, t("common.unlimited"), (period) => t(`shareMarket.period.${period}`), (amount) => t("shareMarket.quota.usdAmount", { amount })),
   ].join(" · ");
 }
 
@@ -939,6 +1049,17 @@ function rentedSeatTokenUsage(
     `${compactTokens(used, locale)} / ${limited ? compactTokens(limit, locale) : t("common.unlimited")}`,
     t(`shareMarket.period.${period}`),
   ].join(" · ");
+}
+
+/** A rented USD seat's API-value usage, or a note that it has not synced yet. */
+function rentedSeatValueUsage(seat: ShareMarketSeat, rows: ValueQuotaStatus[], t: TFn) {
+  const email = seat.subscription?.renterEmail?.trim().toLowerCase();
+  if (!seat.valueQuota) return null;
+  const row = email ? rows.find((item) => item.email.trim().toLowerCase() === email
+    && item.limitUsdMicros === seat.valueQuota?.limitUsdMicros && item.tokenPeriod === seat.tokenPeriod) : undefined;
+  const limit = formatUsdLimit(seat.valueQuota.limitUsdMicros);
+  if (!row) return `${t("shareMarket.quota.syncing")} / ${limit}`;
+  return [`${formatQuotaPicos(row.usedPicos)} / ${limit}`, t(`shareMarket.period.${seat.tokenPeriod}`)].join(" · ");
 }
 
 function seatStatusLabel(seat: ShareMarketSeat, t: TFn) {
@@ -973,7 +1094,9 @@ export function ShareMarketOwnerWorkspace({
   const [family, setFamily] = React.useState<ShareMarketProviderFamily | "all">("all");
   const [query, setQuery] = React.useState("");
   const [selectedId, setSelectedId] = React.useState<string | null>(null);
-  const [limitRows, setLimitRows] = React.useState<ShareUserLimitStatusRow[]>([]);
+  const actor = useQuotaActor();
+  const [limitSnapshot, setLimitSnapshot] = React.useState<{ key: string; rows: ShareUserLimitStatusRow[] } | null>(null);
+  const [valueSnapshot, setValueSnapshot] = React.useState<{ key: string; rows: ValueQuotaStatus[] } | null>(null);
   const focusedRef = React.useRef("");
   const interactionActive = addOpen || !!reopenListing || !!seatDialog || !!confirm || busy;
   const filteredListings = React.useMemo(
@@ -986,6 +1109,9 @@ export function ShareMarketOwnerWorkspace({
   );
   const hasListings = listings.length > 0;
   const selected = selectedId ? listings.find((listing) => listing.id === selectedId) || null : null;
+  const usageKey = JSON.stringify([actor, selected?.shareId, selected?.updatedAt]);
+  const limitRows = limitSnapshot?.key === usageKey && actor === valueReadinessActor() ? limitSnapshot.rows : [];
+  const valueRows = valueSnapshot?.key === usageKey && actor === valueReadinessActor() ? valueSnapshot.rows : [];
   const attentionShareIds = attentionIds;
 
   React.useEffect(() => {
@@ -1000,22 +1126,36 @@ export function ShareMarketOwnerWorkspace({
 
   React.useEffect(() => {
     const shareId = selected?.shareId;
+    setLimitSnapshot(null);
     if (!shareId) {
-      setLimitRows([]);
       return;
     }
     let cancelled = false;
     void getShareUserLimitStatus(shareId)
       .then((page) => {
-        if (!cancelled) setLimitRows(page.rows || []);
+        if (!cancelled && actor === valueReadinessActor()) setLimitSnapshot({ key: usageKey, rows: page.rows || [] });
       })
       .catch(() => {
-        if (!cancelled) setLimitRows([]);
+        if (!cancelled && actor === valueReadinessActor()) setLimitSnapshot(null);
       });
     return () => {
       cancelled = true;
     };
-  }, [selected?.shareId]);
+  }, [selected?.shareId, usageKey, actor]);
+
+  const selectedSellsUsd = !!selected?.seats.some((seat) => seat.valueQuota && seat.subscription);
+  React.useEffect(() => {
+    const shareId = selected?.shareId;
+    setValueSnapshot(null);
+    if (!shareId || !selectedSellsUsd) return;
+    const controller = new AbortController();
+    void getValueQuotaStatus(shareId, controller.signal)
+      .then((page) => {
+        if (!controller.signal.aborted && actor === valueReadinessActor()) setValueSnapshot({ key: usageKey, rows: page.items });
+      })
+      .catch(() => undefined);
+    return () => controller.abort();
+  }, [selected?.shareId, selectedSellsUsd, usageKey, actor]);
 
   React.useEffect(() => {
     if (!focusedShareId || loading || focusedRef.current === focusedShareId) return;
@@ -1482,9 +1622,18 @@ const renderSeatActions = (listing: ShareMarketListing, seat: ShareMarketSeat) =
                                   <div className="grid gap-0.5">
                                     <span>{seatQuotaLabel(seat, locale, t)}</span>
                                     {seat.subscription && !isSeatIdle(seat) ? (
-                                      <span className="font-mono text-[11px] text-slate-600">
-                                        {t("dashboard.userLimit.token")}: {rentedSeatTokenUsage(seat, limitRows, locale, t) || `${compactTokens(0, locale)} / ${seat.tokenLimit == null ? t("common.unlimited") : compactTokens(seat.tokenLimit, locale)}`}
-                                      </span>
+                                      seat.valueQuota ? (
+                                        <span className="font-mono text-[11px] text-slate-600">
+                                          {t("shareMarket.quota.usdShort")}: {rentedSeatValueUsage(seat, valueRows, t)}
+                                        </span>
+                                      ) : (
+                                        <span className="font-mono text-[11px] text-slate-600">
+                                          {t("dashboard.userLimit.token")}: {rentedSeatTokenUsage(seat, limitRows, locale, t) || `${compactTokens(0, locale)} / ${seat.tokenLimit == null ? t("common.unlimited") : compactTokens(seat.tokenLimit, locale)}`}
+                                        </span>
+                                      )
+                                    ) : null}
+                                    {seat.subscription && !isSeatIdle(seat) && !seat.isFree ? (
+                                      <SellerRealizedValue subscriptionId={seat.subscription.id} refreshKey={seat.subscription.updatedAt} />
                                     ) : null}
                                   </div>
                                 </td>

@@ -391,6 +391,20 @@ enum ValueOutcome {
 }
 
 impl AppStore {
+    /// The Share configuration revision a Server control preview must echo.
+    pub(crate) async fn share_config_revision(&self, share_id: &str) -> Result<u64, AppError> {
+        let conn = self.conn.lock().await;
+        let revision: i64 = conn
+            .query_row(
+                "SELECT config_revision FROM shares WHERE share_id=?1",
+                params![share_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_error)?
+            .ok_or_else(|| AppError::NotFound("Share not found".into()))?;
+        Ok(u64::try_from(revision).unwrap_or_default())
+    }
     /// Latest publication is reported separately from the Server's active tariff.
     /// A future publication must not invalidate an already acknowledged active one.
     pub(crate) async fn value_pricing_readiness(

@@ -69,6 +69,7 @@ mod secure_file;
 mod server_logs;
 mod server_state;
 mod share_market;
+mod share_market_value_usage;
 mod share_model_health;
 mod share_value_pricing;
 mod share_value_quotas;

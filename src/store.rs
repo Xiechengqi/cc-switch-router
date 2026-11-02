@@ -9615,6 +9615,18 @@ impl AppStore {
         share_id: &str,
         email_filter: Option<&str>,
     ) -> Result<crate::models::ShareUserUsageBreakdownResponse, AppError> {
+        self.share_user_usage_breakdown_in_window(share_id, email_filter, None)
+            .await
+    }
+
+    /// The same priced breakdown over an explicit `[start, end)` window
+    /// instead of each grant's quota window (a market billing period).
+    pub(crate) async fn share_user_usage_breakdown_in_window(
+        &self,
+        share_id: &str,
+        email_filter: Option<&str>,
+        window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    ) -> Result<crate::models::ShareUserUsageBreakdownResponse, AppError> {
         use crate::model_pricing::{
             ContextTier, PricingNote, ServiceTier, TokenSplit, price_usage_in_tier,
         };
@@ -9642,13 +9654,23 @@ impl AppStore {
             .map_err(|e| AppError::Internal(format!("parse share user grants failed: {e}")))?;
         let mut grants: Vec<ShareUserGrant> = user_grants
             .into_values()
-            .filter(|grant| grant.active)
+            .filter(|grant| grant.active || window.is_some())
             .filter(|grant| {
                 wanted.as_deref().is_none_or(|wanted| {
                     normalize_usage_email(&grant.email).as_deref() == Some(wanted)
                 })
             })
             .collect();
+        // A rental's frozen billing window is independent of today's grant
+        // (which may have been revoked on suspension or release).
+        if window.is_some() && grants.is_empty() {
+            if let Some(email) = wanted.as_ref() {
+                grants.push(ShareUserGrant {
+                    email: email.clone(),
+                    ..Default::default()
+                });
+            }
+        }
         grants.sort_by(|left, right| {
             left.email
                 .to_ascii_lowercase()
@@ -9660,7 +9682,10 @@ impl AppStore {
         let mut targets = Vec::with_capacity(grants.len());
         let mut windows = Vec::with_capacity(grants.len());
         for grant in &grants {
-            let (start, end) = grant_quota_window(grant, now)?;
+            let (start, end) = match window {
+                Some((start, end)) => (Some(start), Some(end)),
+                None => grant_quota_window(grant, now)?,
+            };
             let email = normalize_usage_email(&grant.email)
                 .unwrap_or_else(|| grant.email.trim().to_ascii_lowercase());
             targets.push(UsageBreakdownTarget {
@@ -15378,11 +15403,13 @@ fn normalize_share_descriptor_fields(share: &mut ShareDescriptor) -> Result<(), 
                 "USD-equivalent quota fields require Share contract v10".into(),
             ));
         }
+        // A seat's USD-equivalent quota is metered per contract from the
+        // grant start; the Server never schedules one for the next window.
         if grant.manager == crate::models::ShareGrantManager::RouterShareMarket
-            && (grant.policy.value_quota.is_some() || grant.pending_value_quota.is_some())
+            && grant.pending_value_quota.is_some()
         {
             return Err(AppError::BadRequest(
-                "Share Market managed terms cannot use USD-equivalent quotas".into(),
+                "Share Market managed terms cannot schedule a USD-equivalent quota".into(),
             ));
         }
         if grant.policy.value_quota.is_some() && grant.value_metering.is_none() {
@@ -15848,6 +15875,7 @@ fn validate_share_descriptor_bindings(share: &ShareDescriptor) -> Result<(), App
                 .is_some_and(|(budget, total)| {
                     budget == 0 || budget > total || total > crate::market_trial_policy::MAX_TOKENS
                 })
+            || !crate::market_share_trials::valid_entitlement_value_terms(state)
             || (state.phase == crate::models::ShareMarketPhase::Paid
                 && state.paid_started_at_ms.is_none_or(|at| at <= 0))
             || (state.phase == crate::models::ShareMarketPhase::Trial
@@ -34323,6 +34351,11 @@ pub(crate) mod tests {
         market.user_grants.get_mut(email).unwrap().manager =
             crate::models::ShareGrantManager::RouterShareMarket;
         assert!(normalize_share_descriptor_fields(&mut market).is_err());
+        // A seat's USD quota applies at once; only scheduling it is refused.
+        let market_grant = market.user_grants.get_mut(email).unwrap();
+        market_grant.policy = requested.policy.clone();
+        market_grant.pending_value_quota = None;
+        normalize_share_descriptor_fields(&mut market).expect("managed seat USD quota");
         let mut mixed = requested.policy.clone();
         mixed.token_limit = Some(1);
         assert!(validate_share_user_policy(&mixed, Utc::now().timestamp_millis()).is_err());
@@ -35824,6 +35857,70 @@ pub(crate) mod tests {
         assert!(breakdown.rows[0].by_model[0].priced);
         assert!(breakdown.rows[0].equivalent_usd_micros.is_some());
 
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn rental_breakdown_retains_revoked_and_removed_users_in_the_frozen_window() {
+        let (store, config) = setup_store("rental-breakdown-revoked").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "rental-share", "rental-sub", "active").await;
+        let now = Utc::now().timestamp();
+        {
+            let conn = store.conn.lock().await;
+            let mut grant = lifetime_grant("user@example.com", "shareto", 20_000);
+            grant.active = false;
+            set_share_grants(
+                &conn,
+                "rental-share",
+                BTreeMap::from([("user@example.com".into(), grant)]),
+            );
+            for (id, at, tokens, email) in [
+                ("before", now - 101, 1_000, "user@example.com"),
+                ("inside", now - 50, 25, "user@example.com"),
+                ("end", now, 2_000, "user@example.com"),
+                ("another", now - 50, 3_000, "other@example.com"),
+            ] {
+                let mut log = test_share_request_log_entry(id, "rental-share", at);
+                log.user_email = Some(email.into());
+                log.input_tokens = tokens;
+                log.output_tokens = 0;
+                log.cache_read_tokens = 0;
+                log.cache_creation_tokens = 0;
+                log.quota_tokens = Some(tokens);
+                upsert_share_request_log_tx(&conn, "inst-1", log).unwrap();
+            }
+        }
+        assert!(
+            store
+                .share_user_usage_breakdown("rental-share", Some("user@example.com"))
+                .await
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+        let window = Some((
+            DateTime::from_timestamp(now - 100, 0).unwrap(),
+            DateTime::from_timestamp(now, 0).unwrap(),
+        ));
+        let frozen = store
+            .share_user_usage_breakdown_in_window("rental-share", Some("user@example.com"), window)
+            .await
+            .unwrap();
+        assert_eq!(frozen.rows[0].observed_totals.total, 25);
+        {
+            let conn = store.conn.lock().await;
+            set_share_grants(&conn, "rental-share", BTreeMap::new());
+        }
+        let removed = store
+            .share_user_usage_breakdown_in_window("rental-share", Some("user@example.com"), window)
+            .await
+            .unwrap();
+        assert_eq!(removed.rows[0].observed_totals.total, 25);
+        assert_eq!(
+            removed.rows[0].equivalent_usd_micros,
+            frozen.rows[0].equivalent_usd_micros
+        );
         let _ = std::fs::remove_file(&config.database.path);
     }
 

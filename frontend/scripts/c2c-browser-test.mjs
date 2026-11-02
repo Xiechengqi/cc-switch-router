@@ -63,7 +63,7 @@ try {
       if (p === "/v1/market-wallet/transfer-capacity") return json(route, { transferableUnits: actor === "seller" ? sellerUnits : "0", committedUnits: "0", dailyRemainingUnits: "43200000000", enabled: true, verified: true, blockers: [] });
       if (p === "/v1/market-wallet/commission-policy") return json(route, { version: 1, current: { policyVersion: 1, rateBps: 1000, effectiveAt: "2026-01-01T00:00:00Z" }, scheduled: null, increaseNoticeDays: 7, canEdit: false });
       if (p === "/v1/market-wallet/policy") return json(route, { version: 1, maintenanceFeeBps: 500, transfersEnabled: true, transfersPaused: false, transferMaxMinor: 500000, transferDailyMaxMinor: 500000, balanceRefundable: false });
-      if (p === "/v1/market-trials/policy") return json(route, { version: 1, clientHours: 12, shareHours: 12, shareTokens: 1_000_000 });
+      if (p === "/v1/market-trials/policy") return json(route, { version: 1, clientHours: 12, shareHours: 12, shareTokens: 1_000_000, shareValueUsdMicros: "1000000" });
       if (["/v1/account/payment-profile", "/v1/market-billing/dashboard"].includes(p)) { retiredSetupRequests++; return json(route, { message: "retired setup" }, 410); }
       if (p === "/v1/client-market/hosts") return json(route, [publicationHost]);
       if (p === "/v1/client-market/my-rentals") return json(route, []);
@@ -152,7 +152,7 @@ try {
       if (p === "/v1/admin/market-finance/readiness") return json(route, { mode: "shadow", version: 1, newOrdersPaused: false, newTopupsPaused: false, codeIntegrated: true, criticalCases: 0, staleTopupReviews: 0, verifiedLiveTopups: 1, paymentChannelBlockers: [], canEnable: false });
       if (p === "/v1/admin/market-finance/overview") return json(route, overview);
       if (p === "/v1/admin/market-finance/wallet-policy") return json(route, { version: 1, maintenanceFeeBps: 500, transfersEnabled: true, transfersPaused: false, transferMaxMinor: 500000, transferDailyMaxMinor: 500000, balanceRefundable: false, canEdit: true });
-      if (p === "/v1/admin/market/trial-policy") return json(route, { version: 1, clientHours: 12, shareHours: 12, shareTokens: 1_000_000, canEdit: true });
+      if (p === "/v1/admin/market/trial-policy") return json(route, { version: 1, clientHours: 12, shareHours: 12, shareTokens: 1_000_000, shareValueUsdMicros: "1000000", canEdit: true });
       if (p === "/v1/admin/market/client-termination-policy") return json(route, { version: 1, rateBps: 1000, canEdit: actor === "owner" });
       if (p === "/v1/admin/market-finance/commission-policy") return json(route, { version: 1, current: { policyVersion: 1, rateBps: 1000, effectiveAt: "2026-01-01T00:00:00Z" }, scheduled: null, increaseNoticeDays: 7, canEdit: true });
       if (p === "/v1/admin/market-finance/c2c/policy") {

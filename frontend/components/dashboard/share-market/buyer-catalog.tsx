@@ -57,12 +57,13 @@ import type {
   ShareMarketSubscription,
 } from "@/lib/types";
 import { formatTokenMillions } from "@/lib/token-units";
+import { formatUsdLimit } from "@/lib/share-value-quota";
 import { cn } from "@/lib/utils";
 import {
   PROVIDER_FAMILY_KEYS,
   activeSubscriptionForShare,
   formatSeatPrice,
-  formatTokenLimit,
+  formatSeatQuota,
   isCoreShareApp,
   isSeatIdle,
   listingIdleCount,
@@ -83,6 +84,7 @@ import {
   sortCatalogListings,
   type MarketCatalogSort,
 } from "@/components/dashboard/share-market/buyer-catalog-utils";
+import { SeatDiscountNote, USD_SEAT_PARALLEL_CAP, UsdSeatRentTerms } from "@/components/dashboard/share-market/seat-value-quota";
 import { MarketListingFilters } from "@/components/dashboard/share-market/market-listing-filters";
 import { MarketPagination } from "@/components/dashboard/share-market/market-pagination";
 import {
@@ -237,8 +239,9 @@ function SeatChoice({ seat, selected, onSelect }: { seat: ShareMarketSeat; selec
         <span className="mt-1 block text-slate-600">
           {t("shareMarket.parallelShort", { value: seat.parallelLimit == null ? "∞" : seat.parallelLimit })}
           {" · "}
-          {formatTokenLimit(seat, locale, t("common.unlimited"), (period) => t(`shareMarket.period.${period}`))}
+          {formatSeatQuota(seat, locale, t("common.unlimited"), (period) => t(`shareMarket.period.${period}`), (amount) => t("shareMarket.quota.usdAmount", { amount }))}
         </span>
+        <SeatDiscountNote seat={seat} />
         <span className="mt-0.5 block text-slate-500">
           {seat.pricingModel === "prepaid_calendar_month"
             ? t("shareMarket.serviceDuration.monthlyManaged")
@@ -553,7 +556,10 @@ export function ShareMarketBuyerCatalog({
     )
     : "";
   const rentTrialBudget = rentOffer?.trial?.tokenBudget ?? rentOffer?.trialTokenLimit ?? 0;
-  const rentTrialTokens = rentTrialBudget > 0
+  const rentTrialValue = rentOffer?.trial?.valueBudgetUsdMicros ?? rentOffer?.trialValueLimitUsdMicros;
+  const rentTrialTokens = rentTrialValue != null && rentTrialValue !== "0"
+    ? t("shareMarket.rentConfirm.trialValueCompact", { amount: formatUsdLimit(rentTrialValue) })
+    : rentTrialBudget > 0
     ? t("shareMarket.rentConfirm.trialTokenCompact", {
       tokens: formatTokenMillions(rentTrialBudget, locale),
     })
@@ -565,15 +571,19 @@ export function ShareMarketBuyerCatalog({
       tokens: rentTrialTokens,
     });
   const rentQuotaSummary = rentOffer
-    ? t("shareMarket.rentConfirm.quotaSummary", {
-      parallel: rentTarget.quote.offer.parallelLimit == null
-        ? t("common.unlimited")
-        : rentTarget.quote.offer.parallelLimit,
-      tokens: formatTokenLimit(
+    ? t(rentOffer.valueQuota ? "shareMarket.rentConfirm.quotaSummaryUsd" : "shareMarket.rentConfirm.quotaSummary", {
+      // A USD-equivalent seat runs at most USD_SEAT_PARALLEL_CAP requests at once.
+      parallel: rentOffer.valueQuota
+        ? Math.min(rentOffer.parallelLimit ?? USD_SEAT_PARALLEL_CAP, USD_SEAT_PARALLEL_CAP)
+        : rentOffer.parallelLimit == null
+          ? t("common.unlimited")
+          : rentOffer.parallelLimit,
+      tokens: formatSeatQuota(
         rentOffer,
         locale,
         t("common.unlimited"),
         (period) => t(`shareMarket.period.${period}`),
+        (amount) => t("shareMarket.quota.usdAmount", { amount }),
       ),
     })
     : "";
@@ -601,6 +611,12 @@ export function ShareMarketBuyerCatalog({
         });
   const rentTrialHours = rentOffer?.trialHours ?? catalog.trialHours;
   const rentTrialTokenLimit = rentOffer?.trialTokenLimit ?? 0;
+  const rentTrialValueLimit = rentOffer?.trialValueLimitUsdMicros;
+  const rentTrialBudgetDetails = rentTrialValueLimit != null && rentTrialValueLimit !== "0"
+    ? t("shareMarket.rentConfirm.trialValue", { amount: formatUsdLimit(rentTrialValueLimit) })
+    : rentTrialTokenLimit > 0
+      ? t("shareMarket.rentConfirm.trialTokens", { tokens: formatTokenMillions(rentTrialTokenLimit, locale) })
+      : "";
   const rentBillingDetails = !rentOffer
     ? ""
     : rentIsFree
@@ -608,20 +624,12 @@ export function ShareMarketBuyerCatalog({
       : rentOffer.pricingModel === "prepaid_calendar_month"
         ? t("shareMarket.rentConfirm.prepaidMonthly", {
           hours: rentTrialHours,
-          tokens: rentTrialTokenLimit > 0
-            ? t("shareMarket.rentConfirm.trialTokens", {
-              tokens: formatTokenMillions(rentTrialTokenLimit, locale),
-            })
-            : "",
+          tokens: rentTrialBudgetDetails,
         })
       : rentTrialHours > 0 || rentTrialTokenLimit > 0
         ? t("shareMarket.rentConfirm.postpaid", {
           hours: rentTrialHours,
-          tokens: rentTrialTokenLimit > 0
-            ? t("shareMarket.rentConfirm.trialTokens", {
-              tokens: formatTokenMillions(rentTrialTokenLimit, locale),
-            })
-            : "",
+          tokens: rentTrialBudgetDetails,
         })
         : t("shareMarket.rentConfirm.noTrial");
   const closeRentDialog = () => {
@@ -836,7 +844,9 @@ export function ShareMarketBuyerCatalog({
                         <p className="truncate text-xs text-slate-500" title={rentTermsSummary}>{rentTermsSummary}</p>
                       </section>
 
-                      {rentTarget.quote.trialSecondsRemaining > 0 ? <p className="rounded-lg bg-emerald-50 px-3 py-3 text-xs leading-6 text-emerald-900">{t("marketTrial.checkout", { hours: (rentTarget.quote.trialSecondsRemaining / 3600).toFixed(1), tokens: rentTrialBudget > 0 ? formatTokenMillions(rentTrialBudget, locale) : t("marketTrial.timeOnly") })}</p> : null}
+                      {rentTarget.quote.trialSecondsRemaining > 0 ? <p className="rounded-lg bg-emerald-50 px-3 py-3 text-xs leading-6 text-emerald-900">{t("marketTrial.checkout", { hours: (rentTarget.quote.trialSecondsRemaining / 3600).toFixed(1), tokens: rentTrialValue != null && rentTrialValue !== "0" ? `${formatUsdLimit(rentTrialValue)} ${t("shareMarket.quota.apiValue")}` : rentTrialBudget > 0 ? formatTokenMillions(rentTrialBudget, locale) : t("marketTrial.timeOnly") })}</p> : null}
+                      {rentOffer?.trial?.unitLocked ? <p className="text-xs leading-5 text-muted-foreground">{t("shareMarket.rentConfirm.trialUnitLocked")}</p> : null}
+                      {rentOffer?.valueQuota ? <UsdSeatRentTerms offer={rentOffer} /> : null}
                       {rentCheckout.unsupported ? <p role="alert" className="rounded-md bg-rose-50 p-3 text-sm text-rose-800">{t("clientCheckout.unsupported")}</p> : null}
                       {rentWalletFunding ? (
                         <section className="grid gap-2 rounded-lg bg-muted/50 px-3 py-3 text-sm" aria-live="polite">

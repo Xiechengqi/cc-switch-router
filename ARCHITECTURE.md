@@ -98,6 +98,7 @@ Direct Share:
 Share Market 内建于 Router,不注册为外部 `router_markets`。Share owner 只能从 Router 的 Share Market 页面通过「添加 Share」选择自己当前 active、尚未挂售的 Share,候选项同时展示 subdomain、owner 和已绑定应用，并创建最多 20 个拼车位。每个拼车位独立配置用户 Token/并发限制、价格、试用和服务期限。新发布的付费拼车位按自然月计价（`prepaid_calendar_month`）；默认试用从独立的「市场试用规则」继承（初始 12 小时、100 万 Token），车位可分别覆盖，0 小时关闭试用、0 Token 表示仅时长。同一买家／Provider／Share 的一次性预算跨车位和租约累计，耗尽不复活；不是周期性用户 quota。按日计价（`legacy_metered_daily`）只为既有车位与合同保留。详情见 [市场试用规则](docs/market-trial-rules.md)。
 
 - Token 限额留空表示不限额，此时周期固定归一为累计且 UI 不显示周期；设置限额后才选择累计不重置、每天、自然周、每 7 天、自然月或每 30 天。Token 重置周期与服务期限相互独立。
+- 用量限额可按「Token 数量」或「美元等值」设置（二者互斥，共用同一周期）。美元等值是按请求时模型 API 标价折算的用量上限，不是租金或钱包余额；只有该 Share 的 Server 金额能力就绪且声明支持车位金额额度时才能发布、编辑、恢复或报价，Server 按合同计量（从该合同首次应用金额策略起，新合同重新开始），买家并发不超过 4，达到上限只拒绝新请求。试用的 Token 预算照常单独生效。买家在租用确认中看到完整折算规则，在「我的租用」看到本期已用。
 - 免费拼车位与按日计价的付费拼车位可设置 1–365 天固定服务期限或无固定期限；按月计价的付费拼车位按自然月续期，不设固定期限。固定期限从 Server 首次应用该授权时开始：Router 在 managed grant 中下发相对期限 `durationSeconds`，Server 按自身的 `appliedAtMs` 写入绝对 `expiresAt`，Router 校验一致后冻结到 Subscription。授权下发前的等待不消耗期限，账单暂停也不会顺延，到期后任何状态都不得恢复服务。
 - 价格留空时是免费拼车位，不进入任何资金流程。付费固定期限到期时会立即终止账务合约，并通过现有 revoke 流程安全回收授权；回收失败时座位不会提前恢复为可租。
 - 准入按 `share/free`、`share/paid`、`client_host/free`、`client_host/paid` 四个作用域独立配置。免费默认黑名单，未知用户可先体验；付费默认白名单，需 Owner 明确允许。所有付费商品包括试用都要求完整首期可用余额。
