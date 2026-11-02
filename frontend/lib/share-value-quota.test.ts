@@ -71,10 +71,25 @@ test("readiness roots skip consequences and follow the fix-first order",()=>{
 
 test("execution model coverage is a separate pricing blocker with dependency-aware guidance",()=>{
   const base=["router_protocol","sqlite_authority","metering_storage","acknowledged_tariff","text_surface"].map(code=>({code,ready:true}));
+  const preview:ValueQuotaPreview={ready:true,capabilityReady:true,checks:base,configRevision:1,rows:[]};
   const check:ValueReadinessCheck={code:"model_price_coverage",ready:false,model:"qiniu/conatus-free",reasonCode:"tariff_not_effective",scope:"configured_model",effectiveFromMs:100};
-  assert.equal(valueCapabilityReady({ready:false,checks:[...base,check],configRevision:1,rows:[]}),false);
+  assert.equal(valueCapabilityReady(preview),true);
+  assert.equal(valueCapabilityReady({...preview,checks:[...base,check]}),false,"model coverage blocks even when the generic readiness flags pass");
   assert.equal(valueReadinessSummary([...base,check]).root?.code,"model_price_coverage");
-  assert.equal(valueCapabilityReady({ready:true,checks:[...base,{code:"model_price_coverage",ready:true,scope:"request_time"}],configRevision:1,rows:[]}),true);
+  for(const coverage of [
+    {code:"model_price_coverage",ready:true,scope:"configured_model",model:check.model},
+    {code:"model_price_coverage",ready:true,scope:"request_time"},
+  ]) {
+    const ready={...preview,checks:[...base,coverage]};
+    assert.equal(valueCapabilityReady(ready),true,coverage.scope);
+    for(const capabilityReady of [false,undefined]) {
+      assert.equal(valueCapabilityReady({...ready,capabilityReady}),false,"passing checks cannot replace an affirmative Server capability declaration");
+    }
+  }
+  const waiting=[...base.map(item=>item.code==="acknowledged_tariff"?{...item,ready:false}:item),{...check,blockedBy:"acknowledged_tariff"}];
+  assert.deepEqual(valueReadinessItems(waiting).map(item=>[item.check.code,item.waitingOn]),
+    [["acknowledged_tariff",undefined],["model_price_coverage","acknowledged_tariff"]]);
+  assert.equal(valueReadinessSummary(waiting).more,0,"a dependent price check is not a second root cause");
   for(const messages of [valueQuotaMessagesEn,valueQuotaMessagesZh]) {
     assert.ok(messages["dashboard.userLimit.value.readiness.model_price_coverage"]);
     assert.ok(messages["dashboard.userLimit.value.readiness.short.model_price_coverage"]);

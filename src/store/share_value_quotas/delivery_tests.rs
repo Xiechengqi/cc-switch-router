@@ -2,7 +2,12 @@ fn fixture() -> Connection {
     let conn = crate::test_support::database().unwrap();
     conn.pragma_update(None, "foreign_keys", "ON").unwrap();
     for id in ["server-a", "server-b", "no-share"] {
-        conn.execute("INSERT INTO installations(id,public_key,platform,app_version,created_at,last_seen_at,control_secret_b64) VALUES(?1,'key','fixture','1',?2,?2,'fixture')",params![id,Utc::now().to_rfc3339()]).unwrap();
+        // Match production's one-public-key-per-installation constraint.
+        conn.execute(
+            "INSERT INTO installations(id,public_key,platform,app_version,created_at,last_seen_at,control_secret_b64) VALUES(?1,?2,'fixture','1',?3,?3,'fixture')",
+            params![id, format!("fixture-key-{id}"), Utc::now().to_rfc3339()],
+        )
+        .unwrap();
     }
     for (id, installation) in [("share-a", "server-a"), ("share-b", "server-b")] {
         conn.execute("INSERT INTO shares(share_id,capacity_pool_id,installation_id,share_name,subdomain,app_type,enabled_claude,enabled_codex,enabled_gemini,token_limit,parallel_limit,tokens_used,requests_count,share_status,created_at,expires_at,updated_at)
