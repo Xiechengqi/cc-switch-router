@@ -730,15 +730,26 @@ Server 使用通用 installation Ed25519 envelope（`protocolEpoch/installationI
 | --- | --- | --- |
 | `POST /v1/shares/value-pricing/fetch` | `share_value_pricing_fetch` | `{}` 或 `{knownRevision}` |
 | `POST /v1/shares/value-pricing/ack` | `share_value_pricing_ack` | `{revision,storageSchema:3}` |
+| `POST /v1/shares/value-pricing/active` | `share_value_pricing_active` | `{revision,storageSchema:3}`；需协商 `valuePricingActivationV1` |
 | `POST /v1/shares/:share_id/value-quota-watermarks` | `share_value_quota_watermark` | `{shareId,status}` |
 
-**签名 payload 规范化**：上述三个 action 的 payload 是请求体中除 envelope 五个字段外的全部字段，签名串中的 `<payload_json>` 必须是其**规范 JSON**：所有层级对象的键按 UTF-8 字节序排序、无任何空白、数字与字符串按 serde_json 默认格式输出。Router 将收到的 payload 解析为 JSON 值后重新序列化验签（Router 的 serde_json 未开启 `preserve_order`，输出即为排序形式），因此请求体线上的键顺序和空白无关，但 Server 必须对规范形式签名。双仓共用夹具 `tests/fixtures/share-value-signed-payload-v1.json`（`canonical` 字段）。Router 先在不持有写锁的情况下读取 installation 公钥并完成时间戳、Ed25519 验签与 payload 校验，再在 IMMEDIATE 事务中复核公钥、消费 nonce 并执行；nonce 防重放语义不变，验签或校验失败不消耗 nonce。
+**签名 payload 规范化**：上述四个 action 的 payload 是请求体中除 envelope 五个字段外的全部字段，签名串中的 `<payload_json>` 必须是其**规范 JSON**：所有层级对象的键按 UTF-8 字节序排序、无任何空白、数字与字符串按 serde_json 默认格式输出。Router 将收到的 payload 解析为 JSON 值后重新序列化验签（Router 的 serde_json 未开启 `preserve_order`，输出即为排序形式），因此请求体线上的键顺序和空白无关，但 Server 必须对规范形式签名。双仓共用夹具 `tests/fixtures/share-value-signed-payload-v1.json`（`canonical` 字段）。Router 先在不持有写锁的情况下读取 installation 公钥并完成时间戳、Ed25519 验签与 payload 校验，再在 IMMEDIATE 事务中复核公钥、消费 nonce 并执行；nonce 防重放语义不变，验签或校验失败不消耗 nonce。
 
 fetch payload 只允许 `{}` 或 `{"knownRevision":"<rev>"}`，其他键 400。Router 的发布修订是全局唯一的（不按 installation 区分），ACK 按 `(installation, revision)` 记录。`knownRevision` 等于当前发布修订**且**本 installation 已有该修订的 ACK 行时，只返回 `{"unchanged":true,"revision":"<rev>"}`，不构造、不序列化快照；本 installation 没有 ACK 行时返回完整清单（与无 `knownRevision` 时相同），以便 Server 重新安装并重新 ACK。旧 Router 对 `knownRevision` 返回 400 时，Server 回退为 `{}` 重新 fetch。ACK 幂等：同一 `(installation, revision)` 重复 ACK 返回成功，但保留首次 `acknowledgedAtMs`。
 
 fetch 返回 null 或 `{installationId,revision,effectiveFromMs,snapshot}`。Server 校验绑定、大小及散列后立即安装到 committed SQLite 并 ACK，即使 `effectiveFromMs` 在未来；未来生效的价目由 Server 在 `effectiveFrom` 到达时激活，此前继续使用已激活的旧修订。无快照时不开启美元模式。断连时继续使用最后确认的本地快照，不能接受无法核验的新修订。调价只作用于新准入请求；历史使用量保留冻结修订和费率。
 
+到期激活不依赖下一次 heartbeat：Server 每秒本地检查一次；准入 IMMEDIATE 事务再次检查到期排期，并在同一事务选择／冻结执行修订。重启、断连和并发激活均从本地 committed SQLite 收敛；已有 attempt 的幂等重放仍用原冻结修订。ACK 只证明安装成功，不证明正在执行。Router heartbeat 增量声明 `valuePricingKnownRevisionV1` 和 `valuePricingActivationV1`；协商后一并上报当前实际 active revision。Router 只接受本 installation 已 ACK 且 Router 时钟已过生效时间的 signed active 回执，按签名时间拒绝旧报告覆盖新证据。旧 Server 不发回执时只显示“激活未确认”，不阻止已有有效快照运行；旧 Router 不支持该能力时 Server 不调用新端点。部署顺序为 Router → Server。
+
+Router 每 15 秒重试执行价目发布失败，并检查目录内未来价格代际是否到期；保留原 60 秒缓冲，不假定“保存成功”即“Server 生效”。价格保存响应附 `executionTariff={state,revision,effectiveFromMs}`，`state=pending|published|unknown`。迁移 0106 仅新增发布进度及 activation receipt 表，不改钱包、金额配额、历史 ACK 或计费记录。
+
+健康接口增加 `serverTimeMs`、`publication.state` 及 `delivery={expectedInstallations,acknowledgedInstallations,activatedInstallations,unconfirmedInstallations}`。统计对象为有 Share 的 active installations；只有回执匹配最新发布修订、回执和 heartbeat 均在 180 秒内才计为已激活。无回执、离线或过期均不推断已激活。模型价格页自动轮询（页面隐藏时停止、账号切换清除、次数有界并可手动重查），仅依据 Router 时钟区分待生效／待 ACK／待确认／部分及全部激活。
+
 ### 13.2 精度、准入和动态水位
+
+预览与用户主动保存 USD 策略增加 `model_price_coverage`：对启用且已验证的 Single 模型绑定，检查实际 upstream model 在当前激活快照的 standard tier 中可定价；排期含价但未生效时返回 `reasonCode=tariff_not_effective`。Passthrough 无法静态枚举，标 `scope=request_time`，每个请求仍检查实际模型与 tier。缺价拒绝新的 USD 编辑，不阻断与策略无关的后台保存，不重置原授权。预览最多推进已到期的本地价目元数据，不写配额／用量。
+
+发送前的 `price_unavailable` 错误附 `reasonCode=model_unpriced|tier_unpriced|tier_unknown|tariff_not_effective`、有界的 `model/tier`、`activePricingRevision/pendingPricingRevision/effectiveFromMs`。OpenAI／Anthropic 放在 `error.details`，Gemini 放在 `ErrorInfo.metadata`；未知字段可忽略。人类可读消息不重复错误码，也不含完整 payload／凭据。日志记录 request/share 与修订事实及 `upstream_sent=false`，不记录请求内容。
 
 额度 `limitUsdMicros` 必须大于零且最多 `1000000000000000`。累计量使用整数 picos 字符串，`1 USD=10^12 picos`；每分类贡献直接为 `tokens × rateMicrosPer1m`，不先截断成美分。cache write 只有合并量时使用已证明的两档最高价并标记 `conservative`；没有可信上界则不可用。
 

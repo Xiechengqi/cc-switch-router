@@ -69,6 +69,18 @@ test("readiness roots skip consequences and follow the fix-first order",()=>{
   assert.equal(valueReadinessSummary(shuffled).more,7);
 });
 
+test("execution model coverage is a separate pricing blocker with dependency-aware guidance",()=>{
+  const base=["router_protocol","sqlite_authority","metering_storage","acknowledged_tariff","text_surface"].map(code=>({code,ready:true}));
+  const check:ValueReadinessCheck={code:"model_price_coverage",ready:false,model:"qiniu/conatus-free",reasonCode:"tariff_not_effective",scope:"configured_model",effectiveFromMs:100};
+  assert.equal(valueCapabilityReady({ready:false,checks:[...base,check],configRevision:1,rows:[]}),false);
+  assert.equal(valueReadinessSummary([...base,check]).root?.code,"model_price_coverage");
+  assert.equal(valueCapabilityReady({ready:true,checks:[...base,{code:"model_price_coverage",ready:true,scope:"request_time"}],configRevision:1,rows:[]}),true);
+  for(const messages of [valueQuotaMessagesEn,valueQuotaMessagesZh]) {
+    assert.ok(messages["dashboard.userLimit.value.readiness.model_price_coverage"]);
+    assert.ok(messages["dashboard.userLimit.value.readiness.short.model_price_coverage"]);
+  }
+});
+
 test("a blocker that passed or is missing leaves its check a root; chains resolve to the end",()=>{
   const passed:ValueReadinessCheck[]=[{code:"sqlite_authority",ready:true},{code:"acknowledged_tariff",ready:false,blockedBy:"sqlite_authority"}];
   assert.deepEqual(valueReadinessRoots(passed).map(c=>c.code),["acknowledged_tariff"]);

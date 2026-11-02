@@ -136,7 +136,8 @@ export type ValueQuotaPreview = {
   invalidRows?: ValuePreviewInvalidRow[]; reason?: string | null; reasonCode?: string | null; activePricingRevision?: string | null; configRevision: number;
   capabilityReady?: boolean;
   checks?: ValueReadinessCheck[];
-  pricing?: {publishedRevision: string | null; effectiveFromMs: number | null; acknowledgedAtMs: number | null; version: number};
+  pricing?: {publishedRevision: string | null; effectiveFromMs: number | null; acknowledgedAtMs: number | null; version: number;
+    activation?: {activePricingRevision?: string; confirmedAtMs?: number; current: boolean}; publication?: {state: string}};
   rows: ValuePreviewRow[];
 };
 export type ValueRowOutcome = "scheduled" | "meteredFromNow" | "ready" | "blocked";
@@ -186,11 +187,12 @@ export function renderValueQuotaMessage(message: ValueQuotaMessage, t: ValueQuot
 }
 
 export type ValueReadinessCheck = {code: string; ready: boolean; state?: string; app?: string; profileId?: string | null; driverId?: string | null;
+  model?: string; scope?: string; reasonCode?: string; effectiveFromMs?: number | null;
   /** The `code` of another check this one only waits on, e.g. an unacknowledged tariff waiting on an unpublished one. */
   blockedBy?: string | null};
 /** Most fundamental first: what an operator should fix before anything else. */
 export const VALUE_READINESS_ORDER = ["router_protocol", "sqlite_authority", "metering_storage", "tariff_published",
-  "acknowledged_tariff", "text_surface"] as const;
+  "acknowledged_tariff", "text_surface", "model_price_coverage"] as const;
 export type ValueReadinessCode = typeof VALUE_READINESS_ORDER[number];
 export function knownReadinessCode(code: unknown): ValueReadinessCode | undefined {
   return VALUE_READINESS_ORDER.find(known => known === code);

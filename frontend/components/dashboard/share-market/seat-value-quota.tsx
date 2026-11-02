@@ -89,7 +89,7 @@ export function useMarketValueQuotaReadiness(shareId: string | undefined): Marke
   };
 }
 
-const CHECK_REASONS = ["router_protocol", "sqlite_authority", "metering_storage", "tariff_published", "acknowledged_tariff", "text_surface"];
+const CHECK_REASONS = ["router_protocol", "sqlite_authority", "metering_storage", "tariff_published", "acknowledged_tariff", "text_surface", "model_price_coverage"];
 const REQUEST_REASONS: Record<string, string> = {
   quota_server_offline: "offline",
   quota_server_timeout: "timeout",

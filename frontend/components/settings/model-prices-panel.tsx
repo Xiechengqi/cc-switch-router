@@ -46,6 +46,7 @@ function formatRate(value: number | undefined, locale: string) {
 export function ModelPricesPanel() {
   const { locale, t } = useLocaleText();
   const [data, setData] = React.useState<AdminModelPriceList | null>(null);
+  const [tariffRefresh, setTariffRefresh] = React.useState(0);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState("");
   const [query, setQuery] = React.useState("");
@@ -64,7 +65,7 @@ export function ModelPricesPanel() {
   const load = React.useCallback(async () => {
     setLoading(true);
     setError("");
-    try { setData(await getAdminModelPrices()); }
+    try { setData(await getAdminModelPrices()); setTariffRefresh(n=>n+1); }
     catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
     finally { setLoading(false); }
   }, []);
@@ -142,7 +143,7 @@ export function ModelPricesPanel() {
         <div className="flex gap-2"><Button variant="outline" onClick={() => { const model = { modelKey: "", displayName: "", priced: false, discoveredFrom: [] } satisfies AdminModelPriceListItem; openEditor(model); }}><Plus className="h-4 w-4" />{t("settings.modelPrices.add")}</Button><Button variant="outline" onClick={() => void load()} isDisabled={loading || busy}>{loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}{t("common.reload")}</Button></div>
       </div>
       {error ? <Alert status="danger">{error}</Alert> : null}
-      <ValueTariffStatus unpriced={data?.unpriced} onShowUnpriced={() => setFilter("unpriced")} />
+      <ValueTariffStatus unpriced={data?.unpriced} onShowUnpriced={() => setFilter("unpriced")} refreshRevision={tariffRefresh} />
       <div className="grid grid-cols-2 overflow-hidden rounded-md border bg-background sm:grid-cols-4">
         {([["total", data?.total], ["priced", data?.priced], ["unpriced", data?.unpriced], ["overrides", data?.adminOverrides]] as const).map(([key, value]) => <div key={key} className="border-r p-4 last:border-r-0"><div className="text-2xl font-semibold tabular-nums">{value ?? "—"}</div><div className="text-xs text-muted-foreground">{t(`settings.modelPrices.stat.${key}`)}</div></div>)}
       </div>

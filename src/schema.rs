@@ -361,6 +361,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         105,
         include_str!("../schema/0105_client_rental_buyer_history.sql"),
     ),
+    (
+        106,
+        include_str!("../schema/0106_value_tariff_delivery.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -871,7 +875,98 @@ mod tests {
     use super::*;
 
     // Migration 0102 dropped the write-only `dashboard_ux_events` table.
-    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 265;
+    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 267;
+
+    #[test]
+    fn migration_106_preserves_prices_acks_projections_and_money_without_fabricating_activation() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 105);
+        conn.execute("INSERT INTO installations(id,public_key,platform,app_version,created_at,last_seen_at,control_secret_b64) VALUES('server','key','test','1','before','before','fixture')",[]).unwrap();
+        conn.execute(
+            "INSERT INTO share_value_pricing_snapshots VALUES('old','{}',1,'owner',1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO share_value_pricing_config VALUES(1,'old',7)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO share_value_pricing_acks VALUES('server','old',5)",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO share_value_quota_projections VALUES('server','share','user@example.test','epoch','window',2,'{}',6)",[]).unwrap();
+        crate::market_wallet::credit_verified_topup_tx(
+            &conn, "buyer", "topup", 100, "receipt", "before",
+        )
+        .unwrap();
+        let wallet = crate::market_wallet::wallet_snapshot_tx(&conn, "buyer").unwrap();
+        let postings = |conn: &Connection| {
+            conn.prepare(
+                "SELECT id,journal_id,signed_units FROM market_journal_postings ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<crate::db::Result<Vec<_>>>()
+            .unwrap()
+        };
+        let before = postings(&conn);
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        assert_eq!(postings(&conn), before);
+        assert_eq!(
+            serde_json::to_value(crate::market_wallet::wallet_snapshot_tx(&conn, "buyer").unwrap())
+                .unwrap(),
+            serde_json::to_value(wallet).unwrap()
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT revision,version FROM share_value_pricing_config",
+                [],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            )
+            .unwrap(),
+            ("old".into(), 7)
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT acknowledged_at_ms FROM share_value_pricing_acks",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            5
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT usage_watermark,synced_at_ms FROM share_value_quota_projections",
+                [],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            )
+            .unwrap(),
+            (2, 6)
+        );
+        for table in [
+            "share_value_pricing_activations",
+            "share_value_pricing_publication",
+        ] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+    }
 
     #[test]
     fn migration_103_keeps_token_seats_and_frozen_rentals_without_inventing_value_usage() {
@@ -930,22 +1025,15 @@ mod tests {
             [],
         )
         .unwrap();
-        let before: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
         apply(&conn).unwrap();
         assert_eq!(
             conn.query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
                 [],
                 |r| r.get::<_, i64>(0)
             )
             .unwrap(),
-            before
+            CURRENT_SCHEMA_TABLE_COUNT
         );
         assert_eq!(conn.query_row("SELECT buyer_user_id||':'||created_at FROM client_market_rental_identities WHERE id='history'", [], |r| r.get::<_,String>(0)).unwrap(),"buyer:before");
         assert_eq!(
@@ -1055,9 +1143,7 @@ mod tests {
             )
             .unwrap()
         };
-        let before = tables(&conn);
         apply(&conn).unwrap();
-        assert_eq!(tables(&conn), before - 1);
         assert_eq!(tables(&conn), CURRENT_SCHEMA_TABLE_COUNT);
         let remaining: i64 = conn
             .query_row(

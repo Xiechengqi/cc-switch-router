@@ -3,6 +3,7 @@ use super::*;
 use crate::share_value_pricing::{
     PricingManifest, PricingSnapshot, ValueQuotaStatus, unsigned_decimal,
 };
+mod delivery;
 
 /// Metering states a Server may report. `unavailable` is also the safe
 /// display value for any state this Router does not recognise yet.
@@ -32,7 +33,7 @@ const PROJECTION_FRESH_MS: i64 = 180_000;
 /// signature covers its canonical JSON (keys sorted by byte order, no
 /// whitespace), which is exactly `serde_json::to_string(&payload)` because this
 /// crate's `serde_json` does not enable `preserve_order`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SignedValueRequest {
     pub protocol_epoch: String,
@@ -324,6 +325,7 @@ struct WatermarkPayload {
 enum ValueOperation {
     Fetch(FetchPayload),
     Ack(AckPayload),
+    Active(AckPayload),
     Watermark(WatermarkPayload),
 }
 fn bad_payload(error: serde_json::Error) -> AppError {
@@ -338,14 +340,18 @@ fn parse_value_operation(
         "share_value_pricing_fetch" => FetchPayload::deserialize(payload)
             .map(ValueOperation::Fetch)
             .map_err(bad_payload),
-        "share_value_pricing_ack" => {
+        "share_value_pricing_ack" | "share_value_pricing_active" => {
             let ack = AckPayload::deserialize(payload).map_err(bad_payload)?;
             if ack.storage_schema < 3 {
                 return Err(AppError::BadRequest(
                     "committed value quota storage is required".into(),
                 ));
             }
-            Ok(ValueOperation::Ack(ack))
+            Ok(if action == "share_value_pricing_active" {
+                ValueOperation::Active(ack)
+            } else {
+                ValueOperation::Ack(ack)
+            })
         }
         "share_value_quota_watermark" => {
             let mut report = WatermarkPayload::deserialize(payload).map_err(bad_payload)?;
@@ -417,9 +423,15 @@ impl AppStore {
             "SELECT acknowledged_at_ms FROM share_value_pricing_acks WHERE installation_id=?1 AND revision=?2",
             params![installation, settings.revision], |row| row.get(0),
         ).optional().map_err(db_error)?;
+        let activation = delivery::installation_activation(
+            &conn,
+            installation,
+            settings.revision.as_deref(),
+            Utc::now().timestamp_millis(),
+        )?;
         Ok(serde_json::json!({"publishedRevision":settings.revision,
             "effectiveFromMs":settings.effective_from_ms,"acknowledgedAtMs":acknowledged_at,
-            "version":settings.version}))
+            "version":settings.version,"activation":activation,"publication":delivery::publication_status(&conn,self.pricing_catalog().revision(),Utc::now().timestamp())?}))
     }
     pub(crate) async fn value_quota_health(&self) -> Result<serde_json::Value, AppError> {
         let conn = self.conn.lock().await;
@@ -507,11 +519,14 @@ impl AppStore {
                 |r| r.get(0),
             )
             .map_err(db_error)?;
+        let delivery =
+            delivery::delivery_health(&conn, settings.revision.as_deref(), now.timestamp_millis())?;
         // `shadowGrants` is retained for older UIs: shadow metering was removed,
         // so it only counts legacy bindings awaiting the next descriptor sync.
         Ok(
             serde_json::json!({"activeUsdGrants":enabled,"scheduledGrants":scheduled,"shadowGrants":legacy_bindings,"staleGrants":stale,"acknowledgedInstallations":acknowledgements,
-                "publishedRevision":settings.revision,"effectiveFromMs":settings.effective_from_ms}),
+                "publishedRevision":settings.revision,"effectiveFromMs":settings.effective_from_ms,
+                "serverTimeMs":now.timestamp_millis(),"delivery":delivery,"publication":delivery::publication_status(&conn,self.pricing_catalog().revision(),now.timestamp())?}),
         )
     }
     /// The USD-equivalent tariff follows the model price catalog: whenever the
@@ -526,6 +541,13 @@ impl AppStore {
         }
         let derived_from = catalog.revision().to_string();
         let now = Utc::now();
+        {
+            let conn = self.conn.lock().await;
+            if self.pricing_catalog().revision() != derived_from {
+                return Ok(None);
+            }
+            delivery::mark_target(&conn, &derived_from, now.timestamp_millis())?;
+        }
         let at_unix = now.timestamp();
         // Deriving and hashing a few MiB is CPU work; keep it off the runtime.
         let (json, revision) = tokio::task::spawn_blocking(move || {
@@ -548,6 +570,16 @@ impl AppStore {
         if self.pricing_catalog().revision() != derived_from {
             return Ok(None);
         }
+        // Two derivations of the same catalog may straddle a future price
+        // generation. A slower, earlier derivation must not overwrite one
+        // that has already published using a later catalog time.
+        let last_publication: Option<i64> = tx.query_row(
+            "SELECT updated_at_ms FROM share_value_pricing_publication WHERE singleton=1 AND target_catalog_revision=?1 AND published_catalog_revision=?1",
+            params![derived_from],|r|r.get(0),
+        ).optional().map_err(db_error)?;
+        if last_publication.is_some_and(|published_at| published_at > now_ms) {
+            return Ok(None);
+        }
         let current = read_settings_meta(&tx)?;
         let changed = current.revision.as_deref() != Some(revision.as_str());
         if changed {
@@ -558,7 +590,9 @@ impl AppStore {
             };
             // A content revision is immutable, including its initial activation time.
             tx.execute(
-                "INSERT OR IGNORE INTO share_value_pricing_snapshots VALUES(?1,?2,?3,'model-prices',?4)",
+                "INSERT INTO share_value_pricing_snapshots VALUES(?1,?2,?3,'model-prices',?4)
+                 ON CONFLICT(revision) DO UPDATE SET payload_json=excluded.payload_json
+                 WHERE share_value_pricing_snapshots.payload_json='{}'",
                 params![revision, json, effective_from_ms, now_ms],
             )
             .map_err(db_error)?;
@@ -572,6 +606,8 @@ impl AppStore {
             params![revision, now_ms - TARIFF_PAYLOAD_RETENTION_MS],
         )
         .map_err(db_error)?;
+        tx.execute("UPDATE share_value_pricing_publication SET published_catalog_revision=?1,updated_at_ms=?2 WHERE singleton=1 AND target_catalog_revision=?1",
+            params![derived_from,now_ms]).map_err(db_error)?;
         tx.commit().map_err(db_error)?;
         if changed {
             tracing::info!(%revision, "published the USD quota tariff derived from model prices");
@@ -645,7 +681,10 @@ impl AppStore {
         }
         if !matches!(
             action,
-            "share_value_pricing_fetch" | "share_value_pricing_ack" | "share_value_quota_watermark"
+            "share_value_pricing_fetch"
+                | "share_value_pricing_ack"
+                | "share_value_pricing_active"
+                | "share_value_quota_watermark"
         ) {
             return Err(AppError::BadRequest(
                 "unsupported value quota action".into(),
@@ -690,7 +729,8 @@ impl AppStore {
                 &input.nonce,
                 Utc::now(),
             )?;
-            let outcome = apply_value_operation(&tx, &input.installation_id, operation)?;
+            let outcome =
+                apply_value_operation(&tx, &input.installation_id, operation, input.timestamp_ms)?;
             tx.commit().map_err(db_error)?;
             outcome
         };
@@ -809,6 +849,7 @@ fn apply_value_operation(
     tx: &Connection,
     installation_id: &str,
     operation: ValueOperation,
+    signed_at_ms: i64,
 ) -> Result<ValueOutcome, AppError> {
     match operation {
         ValueOperation::Fetch(fetch) => {
@@ -853,6 +894,10 @@ fn apply_value_operation(
             Ok(ValueOutcome::Ready(
                 serde_json::json!({"ok":true,"revision":ack.revision}),
             ))
+        }
+        ValueOperation::Active(ack) => {
+            delivery::apply_activation(tx, installation_id, &ack.revision, signed_at_ms)
+                .map(ValueOutcome::Ready)
         }
         ValueOperation::Watermark(report) => {
             apply_watermark(tx, installation_id, report).map(ValueOutcome::Ready)

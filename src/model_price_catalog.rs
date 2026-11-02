@@ -52,6 +52,7 @@ pub struct AdminModelPriceResult {
     pub display_name: String,
     pub effective_from: i64,
     pub pricing_revision: String,
+    pub execution_tariff: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize)]

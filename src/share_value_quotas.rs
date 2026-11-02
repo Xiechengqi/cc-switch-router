@@ -19,6 +19,7 @@ pub fn router() -> Router<ServerState> {
         .route("/v1/admin/share-value-pricing/health", get(health))
         .route("/v1/shares/value-pricing/fetch", post(fetch))
         .route("/v1/shares/value-pricing/ack", post(ack))
+        .route("/v1/shares/value-pricing/active", post(active))
         .route(
             "/v1/shares/:share_id/value-quota-watermarks",
             post(watermark),
@@ -445,6 +446,17 @@ async fn ack(
         state
             .store
             .signed_value_operation("share_value_pricing_ack", input)
+            .await?,
+    ))
+}
+async fn active(
+    State(state): State<ServerState>,
+    Json(input): Json<SignedValueRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(
+        state
+            .store
+            .signed_value_operation("share_value_pricing_active", input)
             .await?,
     ))
 }

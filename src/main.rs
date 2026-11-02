@@ -911,6 +911,12 @@ async fn main() -> Result<()> {
         background_shutdown_rx.clone(),
         async move { crate::market_fx::run_service(market_fx_store, market_fx_shutdown_rx).await },
     );
+    let value_tariff_store = state.store.clone();
+    let value_tariff_task = spawn_background_task(
+        "USD tariff delivery",
+        background_shutdown_rx.clone(),
+        async move { value_tariff_store.run_value_tariff_delivery().await },
+    );
     let market_payments_task = tokio::spawn({
         let shutdown = market_payments_shutdown_rx;
         async move { crate::market_payments::run_service(market_payments_state, shutdown).await }
@@ -1012,6 +1018,7 @@ async fn main() -> Result<()> {
         ("Share Market", share_market_task),
         ("Market wallet delivery", market_platform_task),
         ("USD/CNY market FX", market_fx_task),
+        ("USD tariff delivery", value_tariff_task),
         ("Market payments", market_payments_task),
         ("Market notifications", market_notifications_task),
         (

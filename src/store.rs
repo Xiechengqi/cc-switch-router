@@ -2145,7 +2145,7 @@ impl AppStore {
             Err(poisoned) => *poisoned.into_inner() = Arc::clone(&catalog),
         }
         // A price edit is also a USD quota tariff edit; failing to republish
-        // keeps the previous tariff and is retried on the next start or edit.
+        // keeps the previous tariff and is retried by the delivery worker.
         if let Err(error) = self.sync_value_tariff_from_catalog().await {
             tracing::warn!(%error, "USD quota tariff was not republished after a price change");
         }
@@ -2166,6 +2166,10 @@ impl AppStore {
             display_name: input.display_name,
             effective_from,
             pricing_revision: crate::model_price_catalog::qualified_revision(catalog.revision()),
+            execution_tariff: self.value_tariff_publication().await.unwrap_or_else(|error| {
+                tracing::warn!(%error,"model prices saved; execution tariff delivery status unavailable");
+                serde_json::json!({"state":"unknown"})
+            }),
         })
     }
 
@@ -3593,6 +3597,8 @@ impl AppStore {
                 "marketTrialV1".into(),
                 "usdEquivalentQuotaV1".into(),
                 "cacheCreationTtlV1".into(),
+                "valuePricingKnownRevisionV1".into(),
+                "valuePricingActivationV1".into(),
             ],
         })
     }
@@ -29094,6 +29100,7 @@ fn gateway_share_label(share_id: &str) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    include!("store/share_value_quotas/signed_delivery_tests.rs");
     use crate::config::Config;
     use crate::models::{
         InstallationUpgradeLogEntry, ShareEditAckEnvelope, ShareEditAckPayload, ShareSyncOperation,

@@ -1032,6 +1032,7 @@ export type AdminModelPriceResult = {
   displayName: string;
   effectiveFrom: number;
   pricingRevision: string;
+  executionTariff?: {state: "pending" | "published" | "unknown"; revision: string | null; effectiveFromMs: number | null};
 };
 
 export type AdminModelPriceRates = {

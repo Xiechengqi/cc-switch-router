@@ -5351,6 +5351,11 @@ mod tests {
     }
 
     #[test]
+    fn probe_error_detail_does_not_duplicate_a_structured_pricing_code() {
+        assert_eq!(probe_error_detail(br#"{"error":{"message":"price_unavailable: no active price","code":"price_unavailable"}}"#).as_deref(),Some("price_unavailable: no active price"));
+    }
+
+    #[test]
     fn probe_error_detail_reads_the_flatter_shapes_too() {
         assert_eq!(
             probe_error_detail(br#"{"error":"upstream refused"}"#).as_deref(),
@@ -9006,6 +9011,7 @@ fn probe_error_detail(preview: &[u8]) -> Option<String> {
         )
     });
     let detail = match code {
+        Some(code) if message.starts_with(&format!("{code}:")) => message,
         Some(code) => format!("{code}: {message}"),
         None => message,
     };
