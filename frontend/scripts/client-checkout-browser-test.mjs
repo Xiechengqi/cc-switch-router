@@ -1,5 +1,6 @@
 import { chromium } from "playwright";
 import assert from "node:assert/strict";
+import { emptyClientRentalsPage } from "./client-rental-fixtures.mjs";
 import { mkdir, readFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { extname, resolve, sep } from "node:path";
@@ -106,6 +107,7 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
       }
       else if (path === "/v1/client-market/hosts") body = [host];
       else if (path === "/v1/client-market/my-rentals") body = rentals;
+      else if (path === "/v1/client-market/me/rentals") body = emptyClientRentalsPage(req.url());
       else if (path.endsWith("/usage-history")) body = [];
       else if (path === "/v1/notifications") body = { items: [], nextCursor: null, unread: 0, readThrough: null };
       else if (path === "/v1/client-market/quotes") {
@@ -500,7 +502,7 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
     const statusCell = rentalRow.locator("td").first();
     assert.doesNotMatch(await statusCell.textContent(), /Ends on|Renews on|Platform wallet/);
     await statusCell.getByText("Client online", { exact: true }).waitFor();
-    const expandRental = rentalRow.getByRole("button", { name: "Show rental details and usage history", exact: true });
+    const expandRental = rentalRow.getByRole("button", { name: "Show rental details", exact: true });
     await expandRental.focus();
     await page.keyboard.press("Enter");
     const rentalDetails = page.getByRole("region", { name: "Current rental", exact: true });
@@ -508,7 +510,7 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
     await rentalDetails.getByText(/^Ends on /).waitFor();
     await rentalDetails.locator("[data-next-rental-trial]").waitFor();
     assert.equal(await rentalDetails.getByRole("link", { name: "Platform wallet", exact: true }).count(), 0);
-    const collapseRental = rentalRow.getByRole("button", { name: "Hide rental details and usage history", exact: true });
+    const collapseRental = rentalRow.getByRole("button", { name: "Hide rental details", exact: true });
     assert.equal(await collapseRental.getAttribute("aria-expanded"), "true");
     assert.equal(await page.locator(`[id="${await collapseRental.getAttribute("aria-controls")}"]`).count(), 1);
     await collapseRental.click();

@@ -11404,7 +11404,7 @@ mod tests {
             tx.commit().unwrap();
         }
         let history = store
-            .client_market_host_usage_history(&host.id)
+            .client_market_host_usage_history(&host.id, "history-provider", false)
             .await
             .unwrap();
         assert_eq!(history.len(), 2);
@@ -11486,7 +11486,7 @@ mod tests {
         }
 
         let history = store
-            .client_market_host_usage_history(&host.id)
+            .client_market_host_usage_history(&host.id, "provider-history", false)
             .await
             .expect("load Host usage history");
         assert_eq!(history.len(), 2);
@@ -11501,6 +11501,30 @@ mod tests {
         assert_eq!(history[1].client_subdomain.as_deref(), Some("old-client"));
         assert_eq!(history[1].status, "released");
         assert!(history[1].ended_at.is_some());
+
+        for viewer in ["client-owner", "stranger", "unrelated-provider"] {
+            assert!(
+                matches!(
+                    store
+                        .client_market_host_usage_history(&host.id, viewer, false)
+                        .await,
+                    Err(AppError::Forbidden(_))
+                ),
+                "{viewer} must not read other renters' history"
+            );
+        }
+        let owner_history = store
+            .client_market_host_usage_history(&host.id, "router-owner", true)
+            .await
+            .unwrap();
+        assert_eq!(owner_history.len(), history.len());
+        assert_eq!(owner_history[0].installation_id, history[0].installation_id);
+        assert!(matches!(
+            store
+                .client_market_host_usage_history("missing-host", "router-owner", true)
+                .await,
+            Err(AppError::NotFound(_))
+        ));
 
         drop(store);
         let _ = std::fs::remove_dir_all(root);

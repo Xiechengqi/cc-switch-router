@@ -42,6 +42,7 @@ export function ExpandableRecordTable<T>({
   ariaLabel,
   empty,
   focusKey,
+  onExpandedChange,
 }: {
   rows: readonly T[];
   rowKey: (row: T) => string;
@@ -54,12 +55,18 @@ export function ExpandableRecordTable<T>({
   empty?: React.ReactNode;
   /** Opens and scrolls to this row once it appears, for deep links. */
   focusKey?: string | null;
+  onExpandedChange?: (expanded: boolean) => void;
 }) {
   const { t } = useLocaleText();
   const [expanded, setExpanded] = React.useState<ReadonlySet<string>>(() => new Set(focusKey ? [focusKey] : []));
   const focusedRef = React.useRef<string | null>(null);
   const rootRef = React.useRef<HTMLDivElement>(null);
   const tableId = React.useId();
+  const hasExpandedRows = rows.some(row => expanded.has(rowKey(row)));
+  React.useEffect(() => {
+    onExpandedChange?.(hasExpandedRows);
+    return () => onExpandedChange?.(false);
+  }, [hasExpandedRows, onExpandedChange]);
 
   const toggle = React.useCallback((key: string) => {
     setExpanded((current) => {

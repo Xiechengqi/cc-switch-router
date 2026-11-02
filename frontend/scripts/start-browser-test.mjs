@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { emptyClientRentalsPage } from "./client-rental-fixtures.mjs";
 import { chromium } from "playwright";
 
 // Exercises the start page against the mocked home API. No screenshots or payments.
@@ -40,6 +41,7 @@ async function openPage(locale) {
     if (path === "/v1/market-wallet") return json(route, { assetCode: "USD", postedUnits: "0", heldUnits: "0", availableUnits: "0", version: 1, mode: "enabled", canTopup: false, hasWalletActivity: false });
     if (path === "/v1/market/config") return json(route, { usdCnyRateMicros: 7_000_000, fxRateFresh: true });
     if (path === "/v1/client-market/hosts" || path === "/v1/client-market/my-rentals") return json(route, []);
+    if (path === "/v1/client-market/me/rentals") return json(route, emptyClientRentalsPage(route.request().url()));
     if (path === "/v1/share-market/listings") return json(route, { listings: [], trialHours: 0 });
     if (path === "/v1/share-market/me/listings" || path === "/v1/share-market/me/rented-listings") return json(route, { listings: [] });
     if (path.startsWith("/v1/share-market/me/subscriptions")) return json(route, { subscriptions: [] });

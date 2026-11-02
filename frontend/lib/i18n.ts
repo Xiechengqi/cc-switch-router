@@ -15,6 +15,7 @@ import { clientTerminationMessagesEn, clientTerminationMessagesZh } from "@/lib/
 import { clientTrialMessagesEn, clientTrialMessagesZh } from "@/lib/client-trial-messages";
 import { notificationCenterMessagesEn, notificationCenterMessagesZh } from "@/lib/notification-center-messages";
 import { rentalAuditMessagesEn, rentalAuditMessagesZh } from "@/lib/client-rental-audit-messages";
+import { clientRentalsMessagesEn, clientRentalsMessagesZh } from "@/lib/client-rentals-messages";
 import { accountMarketMessagesEn, accountMarketMessagesZh } from "@/lib/account-market-messages";
 import { accountSectionMessagesEn, accountSectionMessagesZh } from "@/lib/account-section-messages";
 import { walletActionsMessagesEn, walletActionsMessagesZh } from "@/lib/wallet-actions-messages";
@@ -30,6 +31,7 @@ export type MessageKey = keyof typeof messages.en;
 export const messages = {
   en: {
     ...rentalAuditMessagesEn,
+    ...clientRentalsMessagesEn,
     ...notificationCenterMessagesEn,
     ...clientTrialMessagesEn,
     ...clientTerminationMessagesEn,
@@ -1358,8 +1360,8 @@ export const messages = {
     "clientMarket.usageHistory.charges": "Charges",
     "clientMarket.usageHistory.returned": "Returned to wallet {amount}",
     "clientMarket.usageHistory.ongoing": "Ongoing",
-    "clientMarket.usageHistory.expand": "Show rental details and usage history",
-    "clientMarket.usageHistory.collapse": "Hide rental details and usage history",
+    "clientMarket.usageHistory.expand": "Show rental details",
+    "clientMarket.usageHistory.collapse": "Hide rental details",
     "clientMarket.sortBy": "Sort by {column}",
     "clientMarket.sortAsc": "Sorted ascending",
     "clientMarket.sortDesc": "Sorted descending",
@@ -3494,6 +3496,7 @@ export const messages = {
   },
   "zh-CN": {
     ...rentalAuditMessagesZh,
+    ...clientRentalsMessagesZh,
     ...notificationCenterMessagesZh,
     ...clientTrialMessagesZh,
     ...clientTerminationMessagesZh,
@@ -4794,8 +4797,8 @@ export const messages = {
     "clientMarket.usageHistory.charges": "费用",
     "clientMarket.usageHistory.returned": "已退回余额 {amount}",
     "clientMarket.usageHistory.ongoing": "进行中",
-    "clientMarket.usageHistory.expand": "展开租用详情与使用历史",
-    "clientMarket.usageHistory.collapse": "收起租用详情与使用历史",
+    "clientMarket.usageHistory.expand": "展开租用详情",
+    "clientMarket.usageHistory.collapse": "收起租用详情",
     "clientMarket.sortBy": "按{column}排序",
     "clientMarket.sortAsc": "升序",
     "clientMarket.sortDesc": "降序",

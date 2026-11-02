@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { emptyClientRentalsPage } from "./client-rental-fixtures.mjs";
 import { createServer } from "node:http";
 import { readFile, mkdir } from "node:fs/promises";
 import { extname, resolve, sep } from "node:path";
@@ -74,6 +75,7 @@ try {
       pricingModel: "prepaid_calendar_month", cyclePriceMinor: 5, offerRevision: 1, eligibility: { allowed: true }, contacts: [],
     }] : []);
     if (path === "/v1/client-market/my-rentals" || path.endsWith("/usage-history")) return json(route, []);
+    if (path === "/v1/client-market/me/rentals") return json(route, emptyClientRentalsPage(url));
     if (path.startsWith("/v1/client-market/termination-workspace")) {
       reads.push({ actor, path, query: url.search });
       if (!actor) anonymousPrivateReads++;

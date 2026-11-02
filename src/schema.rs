@@ -357,6 +357,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         104,
         include_str!("../schema/0104_share_market_value_trials.sql"),
     ),
+    (
+        105,
+        include_str!("../schema/0105_client_rental_buyer_history.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -913,6 +917,51 @@ mod tests {
                 []
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn migration_105_indexes_personal_history_without_rewriting_identities_or_finances() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 104);
+        conn.execute(
+            "INSERT INTO client_market_rental_identities(id,buyer_user_id,provenance,created_at)
+            VALUES('history','buyer','historical_record','before')",
+            [],
+        )
+        .unwrap();
+        let before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        apply(&conn).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            before
+        );
+        assert_eq!(conn.query_row("SELECT buyer_user_id||':'||created_at FROM client_market_rental_identities WHERE id='history'", [], |r| r.get::<_,String>(0)).unwrap(),"buyer:before");
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM market_journal_postings", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='idx_client_rental_history_buyer'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
         );
     }
 

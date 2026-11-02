@@ -30,6 +30,7 @@ import { compareAccountRecords } from "@/lib/account-market-records";
 import { terminationCanRespond } from "@/lib/client-termination";
 import type { ClientMarketHost, ClientMarketRental } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { ClientRentalRecords } from "@/components/dashboard/client-market/rental-records";
 
 type ClientMonitorTab = AccountMarketRole;
 
@@ -399,7 +400,9 @@ function MonitorTable({
 export function AccountClientSection({ role, focusKey }: { role: ClientMonitorTab; focusKey?: string | null }) {
   const { session } = useAuth();
   const actor = session?.authenticated ? session.user?.id || session.user?.email : undefined;
-  return <AccountClientWorkspace key={actor || "anonymous"} tab={role} focusKey={focusKey ?? null} />;
+  return role === "user"
+    ? <ClientRentalRecords focusKey={focusKey} />
+    : <AccountClientWorkspace key={actor || "anonymous"} tab={role} focusKey={focusKey ?? null} />;
 }
 
 function AccountClientWorkspace({ tab, focusKey }: { tab: ClientMonitorTab; focusKey: string | null }) {

@@ -33,15 +33,24 @@ pub(super) fn detail_tx(conn: &Connection, id: &str, q: &DetailQuery) -> Result<
             "invalid rental audit detail cursor".into(),
         ));
     }
-    let mut record = conn
+    let facts = facts(ReadScope::Owner);
+    let record = conn
         .query_row(
-            &format!("{FACTS}SELECT {COLUMNS} FROM records WHERE id=?1"),
+            &format!("{facts}SELECT {COLUMNS} FROM records WHERE id=?1"),
             params![id],
             record_row,
         )
         .optional()
         .map_err(db_error("read rental audit detail"))?
         .ok_or_else(|| AppError::NotFound("rental audit record not found".into()))?;
+    record_detail_tx(conn, record, q)
+}
+
+pub(super) fn record_detail_tx(
+    conn: &Connection,
+    mut record: Value,
+    q: &DetailQuery,
+) -> Result<Value, AppError> {
     attach_money(conn, std::slice::from_mut(&mut record))?;
     let contract = record["contractId"].as_str();
     let (periods, periods_next) = periods_tx(conn, contract, q.period_cursor)?;

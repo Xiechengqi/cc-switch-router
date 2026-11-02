@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import { Button, Modal } from "@heroui/react";
-import { ChevronLeft, ChevronRight, Loader2, RefreshCw, RotateCcw, Search, SlidersHorizontal } from "lucide-react";
+import { ChevronDown, ChevronLeft, ChevronRight, Loader2, RefreshCw, RotateCcw, Search, SlidersHorizontal } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { CompactSelect } from "@/components/common/compact-select";
 import { useLocaleText } from "@/components/i18n/locale-provider";
@@ -28,10 +28,22 @@ function Field({ label, children, as: Tag = "label" }: { label: string; children
 export function ClientRentalAuditPanel({ onTerminationOpen, revision = 0 }: { onTerminationOpen: (id: string) => void; revision?: number }) {
   const { session } = useAuth();
   const actor = session?.authenticated && session.canAuditClientMarket === true ? session.user?.id : undefined;
-  return actor ? <AuditWorkspace key={actor} onTerminationOpen={onTerminationOpen} revision={revision} /> : null;
+  return actor ? <AuditDisclosure key={actor} onTerminationOpen={onTerminationOpen} revision={revision} /> : null;
 }
 
-function AuditWorkspace({ onTerminationOpen, revision }: { onTerminationOpen: (id: string) => void; revision: number }) {
+function AuditDisclosure(props: { onTerminationOpen: (id: string) => void; revision: number }) {
+  const { t } = useLocaleText();
+  const [expanded, setExpanded] = React.useState(false);
+  const contentId = React.useId();
+  return <section className="grid min-w-0 gap-2" data-testid="client-rental-audit-disclosure">
+    <h2><button type="button" className="flex min-h-11 w-full items-center justify-between gap-2 rounded-lg border border-border bg-card px-3 text-left text-sm font-semibold hover:bg-muted/40 focus-visible:outline-2 focus-visible:outline-ring"
+      aria-expanded={expanded} aria-controls={contentId} aria-label={t(expanded ? "clientRentals.auditCollapse" : "clientRentals.auditExpand")}
+      onClick={() => setExpanded(value => !value)}><span>{t("rentalAudit.title")}</span><ChevronDown aria-hidden className={`h-4 w-4 shrink-0 ${expanded ? "rotate-180" : ""}`} /></button></h2>
+    <div id={contentId} hidden={!expanded}><AuditWorkspace {...props} active={expanded} /></div>
+  </section>;
+}
+
+function AuditWorkspace({ onTerminationOpen, revision, active }: { onTerminationOpen: (id: string) => void; revision: number; active: boolean }) {
   const { t } = useLocaleText();
   const [draft, setDraft] = React.useState(INITIAL);
   const [filters, setFilters] = React.useState<AuditFilters>({});
@@ -58,6 +70,10 @@ function AuditWorkspace({ onTerminationOpen, revision }: { onTerminationOpen: (i
     setSelected(null); setFiltersOpen(false);
   }, [scope]);
   React.useEffect(() => {
+    if (!active) {
+      request.current?.abort(); setRead(null); setSelected(null); setFiltersOpen(false);
+      return;
+    }
     const controller = new AbortController();
     request.current = controller;
     setRead({ scope, page: null, state: "loading" });
@@ -71,7 +87,7 @@ function AuditWorkspace({ onTerminationOpen, revision }: { onTerminationOpen: (i
       setRead({ scope, page: null, state: "error" });
     });
     return () => controller.abort();
-  }, [filters, requestedPage, refresh, revision, scope]);
+  }, [active, filters, requestedPage, refresh, revision, scope]);
   // Clear, rather than merely hide, the previous page's selection: returning
   // to that page must never reopen a stale detail dialog.
   React.useEffect(() => { setSelected(null); }, [scope]);
@@ -92,9 +108,10 @@ function AuditWorkspace({ onTerminationOpen, revision }: { onTerminationOpen: (i
     if (number !== null) { setJump(String(number)); setRequestedPage(number); }
   };
   const resetDisabled = !Object.values(draft).some(Boolean) && !Object.values(filters).some(Boolean);
+  if (!active) return null;
   return <section aria-labelledby="client-rental-audit-title" className="grid h-[44rem] min-w-0 grid-rows-[2.75rem_8.5rem_1.25rem_19.75rem_minmax(0,1fr)] gap-3 rounded-xl border border-border bg-card p-3 sm:h-[37rem] sm:grid-rows-[2.75rem_4rem_1.25rem_19.75rem_minmax(0,1fr)] sm:p-4" data-testid="client-rental-audit">
     <div className="flex min-w-0 items-center justify-between gap-2">
-      <div><h2 id="client-rental-audit-title" className="text-base font-semibold">{t("rentalAudit.title")}</h2><p className="text-xs text-muted-foreground">{t("rentalAudit.ownerOnly")}</p></div>
+      <div><h3 id="client-rental-audit-title" className="sr-only">{t("rentalAudit.title")}</h3><p className="text-xs text-muted-foreground">{t("rentalAudit.ownerOnly")}</p></div>
       <Button size="sm" variant="outline" className={ACTION} aria-label={t("rentalAudit.refresh")} isDisabled={loading} onPress={() => { setRequestedPage(1); setRefresh(n => n + 1); }}><RefreshCw aria-hidden className="h-3.5 w-3.5" /><span className="hidden sm:inline">{t("rentalAudit.refresh")}</span></Button>
     </div>
     <form onSubmit={apply} className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-end gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,0.65fr)_auto]">

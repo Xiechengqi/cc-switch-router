@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { emptyClientRentalsPage } from "./client-rental-fixtures.mjs";
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { extname, resolve, sep } from "node:path";
@@ -47,6 +48,7 @@ try {
     if (path === "/v1/auth/session/me") return json(route, { authenticated: !!actor, isAdmin: actor === "admin", canAuditClientMarket: actor === "owner", user: actor ? { id: actor, email: `${actor}@example.test` } : null, password: { hasPassword: true, version: 1 } });
     if (path === "/v1/auth/home") return json(route, { hasActivity: true, entry: null, source: null });
     if (path === "/v1/client-market/hosts" || path === "/v1/client-market/my-rentals" || path === "/v1/regions") return json(route, []);
+    if (path === "/v1/client-market/me/rentals") return json(route, emptyClientRentalsPage(url));
     if (path === "/v1/client-market/termination-workspace") return json(route, { hosts: [], actionRequiredCount: 0, canAdjudicate: actor === "owner", serverNow: at });
     if (path.startsWith("/v1/admin/client-market/rental-audit")) {
       requests.push({ actor, path, query: url.search });
@@ -86,9 +88,26 @@ try {
   const detail = () => page.getByTestId("rental-audit-detail");
   const detailDialog = () => page.getByRole("dialog", { name: "Rental audit details", exact: true });
   const toggle = () => rows().first().getByRole("button");
-  const goto = locale => page.goto(`${base}/client-market/?testLocale=${locale || "en"}`);
+  const openAudit = async () => {
+    const trigger = page.getByTestId("client-rental-audit-disclosure").getByRole("button");
+    await trigger.waitFor();
+    if (await trigger.getAttribute("aria-expanded") === "false") await trigger.click();
+  };
+  const goto = async (locale, expand = true) => {
+    await page.goto(`${base}/client-market/?testLocale=${locale || "en"}`);
+    if (expand) await openAudit();
+  };
   const switchActor = async next => { actor = next; await page.evaluate(() => window.dispatchEvent(new Event("router-auth-changed"))); };
-  await goto(); await panel().getByText("53 matching records · page 1 / 11", { exact: true }).waitFor();
+  await goto(undefined, false);
+  await page.getByTestId("client-rental-audit-disclosure").waitFor();
+  assert.equal(await panel().count(), 0, "audit data is absent until explicitly expanded");
+  assert.equal(requests.length, 0, "collapsed audit must not prefetch lists, details or counts");
+  await openAudit(); await panel().getByText("53 matching records · page 1 / 11", { exact: true }).waitFor();
+  const initialReads = requests.length;
+  await page.getByTestId("client-rental-audit-disclosure").getByRole("button", { name: "Collapse rental audit", exact: true }).click();
+  assert.equal(await panel().count(), 0, "collapsing clears the visible private records");
+  assert.equal(requests.length, initialReads, "collapsing must not issue an audit read");
+  await openAudit(); await panel().getByText("53 matching records · page 1 / 11", { exact: true }).waitFor();
   assert.equal(await rows().count(), 5);
   assert.equal(await detail().count(), 0, "rental details are loaded only on demand");
   assert.equal(requests.filter(r => r.path !== "/v1/admin/client-market/rental-audit").length, 0, "summary rows must not fetch private detail individually");
@@ -174,8 +193,8 @@ try {
   releaseDetail?.(); holdDetail = false;
   await switchActor("admin"); await page.getByRole("button", { name: "Add host", exact: true }).waitFor();
   assert.equal(await panel().count(), 0);
-  await switchActor(""); await goto(); assert.equal(await panel().count(), 0);
-  await switchActor("owner"); await panel().getByText("53 matching records · page 1 / 11", { exact: true }).waitFor();
+  await switchActor(""); await goto(undefined, false); assert.equal(await panel().count(), 0);
+  await switchActor("owner"); await openAudit(); await panel().getByText("53 matching records · page 1 / 11", { exact: true }).waitFor();
   assert.equal(requests.filter(r => r.actor !== "owner").length, 0, "non-owners must not issue audit reads");
   assert.equal(await page.evaluate(() => Object.values(localStorage).some(v => v.includes("original-buyer@example.test") || v.includes("original-provider@example.test"))), false);
   for (const locale of ["en", "zh-CN"]) for (const width of [320, 375, 414, 640, 768, 1366]) {

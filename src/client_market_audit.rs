@@ -14,6 +14,8 @@ use crate::db::{Connection, OptionalExtension, params, types::Value as SqlValue}
 use crate::error::AppError;
 
 mod detail;
+mod personal;
+pub(crate) use personal::private_response;
 #[cfg(test)]
 mod tests;
 
@@ -83,6 +85,8 @@ pub fn router() -> Router<ServerState> {
     Router::new()
         .route("/v1/admin/client-market/rental-audit", get(list))
         .route("/v1/admin/client-market/rental-audit/:id", get(detail::get))
+        .merge(personal::router())
+        .layer(axum::middleware::from_fn(private_response))
 }
 fn no_store() -> [(header::HeaderName, &'static str); 1] {
     [(header::CACHE_CONTROL, "private, no-store")]
@@ -118,18 +122,39 @@ async fn list(
 
 // No join to today's Host ownership or active installation. These CTEs carry
 // cheap lifecycle facts only; amounts are batch-aggregated AFTER pagination.
-const FACTS: &str = "WITH facts AS (
+enum ReadScope {
+    Owner,
+    Buyer,
+}
+
+// Scope the immutable identity source BEFORE joins, counts and monetary reads.
+// The buyer ID is always the first bound parameter, never an email or URL role.
+fn facts(scope: ReadScope) -> String {
+    let predicate = match scope {
+        ReadScope::Owner => "",
+        ReadScope::Buyer => " WHERE buyer_user_id=?1",
+    };
+    format!(
+        "WITH rental_identities AS (SELECT * FROM client_market_rental_identities{predicate}), {LIFECYCLE}"
+    )
+}
+
+const LIFECYCLE: &str = "facts AS (
  SELECT a.id,a.job_id,a.installation_id,COALESCE(a.host_id,s.host_id,j.host_id) AS host_id,
         a.buyer_user_id,a.provider_user_id,a.buyer_email,a.provider_email,
         a.client_subdomain,a.host_ip,a.host_port,a.country_code,a.provenance,a.created_at,
         s.status AS subscription_status,s.activated_at,
-        COALESCE(t.cutoff_at,c.ended_at,s.released_at) AS ended_at,
+        COALESCE(t.cutoff_at,c.ended_at,s.released_at,
+          CASE WHEN s.status IN ('releasing','release_failed','released') THEN s.updated_at END,
+          CASE WHEN j.status='failed' AND s.activated_at IS NULL THEN j.updated_at END) AS ended_at,
         c.id AS contract_id,c.status AS contract_status,
         COALESCE(s.pricing_model,qi.pricing_model) AS pricing_model,
         COALESCE(s.cycle_price_minor,qi.cycle_price_minor,c.cycle_price_minor) AS cycle_price_minor,
         COALESCE(s.daily_rate_minor,qi.daily_rate_minor,c.daily_rate_minor) AS daily_rate_minor,
         COALESCE(s.offer_revision,qi.offer_revision,c.offer_revision) AS offer_revision,
         c.trial_seconds_remaining,c.renewal_policy,
+        (SELECT p.period_end FROM market_platform_periods p WHERE p.contract_id=c.id
+         AND p.sequence=c.current_period_sequence) AS period_end,s.expires_at,s.free_duration_days,
         j.status AS job_status,t.id AS termination_id,t.status AS termination_status,
         t.responsibility,t.dispute_used,t.provider_responded_at,
         COALESCE(t.cleanup_confirmed_at,r.confirmed_at) AS cleanup_confirmed_at,
@@ -137,7 +162,7 @@ const FACTS: &str = "WITH facts AS (
          WHERE cleanup.installation_id=a.installation_id AND cleanup.type='cleanup'
          ORDER BY cleanup.created_at DESC,cleanup.id DESC LIMIT 1) AS cleanup_job_status,
         EXISTS(SELECT 1 FROM router_ssh_hosts h WHERE h.id=COALESCE(a.host_id,s.host_id,j.host_id)) AS host_present
- FROM client_market_rental_identities a
+ FROM rental_identities a
  LEFT JOIN client_market_subscriptions s ON s.installation_id=a.installation_id
  LEFT JOIN provisioning_jobs j ON j.id=a.job_id
  LEFT JOIN client_market_allocation_quote_items qi ON qi.quote_id=j.quote_id AND qi.host_id=COALESCE(a.host_id,s.host_id,j.host_id)
@@ -149,7 +174,7 @@ const FACTS: &str = "WITH facts AS (
 ), lifecycle AS (
  SELECT facts.*,
   CASE WHEN (job_status='failed' AND activated_at IS NULL) OR contract_status='activation_failed' THEN 'activation_failed'
-       WHEN subscription_status IN ('releasing','release_failed','released') OR contract_status IN ('ending','ended') THEN 'ended'
+       WHEN ended_at IS NOT NULL OR subscription_status IN ('releasing','release_failed','released') OR contract_status IN ('ending','ended') THEN 'ended'
        WHEN contract_status='trialing' THEN 'trialing'
        WHEN contract_status IN ('suspended','review_required') OR subscription_status='billing_suspended' THEN 'paused'
        WHEN contract_status='active' THEN 'paid'
@@ -164,6 +189,7 @@ const FACTS: &str = "WITH facts AS (
  FROM facts
 ), records AS (
  SELECT lifecycle.*,
+  CASE WHEN rental_status IN ('ended','activation_failed') THEN 'history' ELSE 'current' END AS rental_group,
   CASE WHEN termination_status='finance_pending' OR contract_status='review_required' THEN 'finance_review'
        WHEN dispute_used=1 AND responsibility='undetermined' THEN
           CASE WHEN provider_responded_at IS NULL THEN 'waiting_provider' ELSE 'owner_decision' END
@@ -279,7 +305,8 @@ fn filters(q: &AuditQuery) -> Result<(String, Vec<SqlValue>), AppError> {
 const COLUMNS: &str = "id,job_id,installation_id,host_id,buyer_email,provider_email,client_subdomain,
  host_ip,host_port,country_code,provenance,created_at,activated_at,ended_at,contract_id,
  rental_status,cleanup_status,attention,termination_id,host_present,pricing_model,
- cycle_price_minor,daily_rate_minor,offer_revision,trial_seconds_remaining,renewal_policy,cleanup_confirmed_at";
+ cycle_price_minor,daily_rate_minor,offer_revision,trial_seconds_remaining,renewal_policy,cleanup_confirmed_at,
+ rental_group,period_end,expires_at,free_duration_days,contract_status";
 
 fn record_row(r: &crate::db::Row<'_>) -> crate::db::Result<Value> {
     Ok(json!({
@@ -292,11 +319,14 @@ fn record_row(r: &crate::db::Row<'_>) -> crate::db::Result<Value> {
         "terminationId":r.get::<_,Option<String>>(18)?,"hostPresent":r.get::<_,bool>(19)?,"pricingModel":r.get::<_,Option<String>>(20)?,
         "cyclePriceMinor":r.get::<_,Option<i64>>(21)?,"dailyRateMinor":r.get::<_,Option<i64>>(22)?,"offerRevision":r.get::<_,Option<i64>>(23)?,
         "trialSecondsRemaining":r.get::<_,Option<i64>>(24)?,"renewalPolicy":r.get::<_,Option<String>>(25)?,"cleanupConfirmedAt":r.get::<_,Option<String>>(26)?,
+        "group":r.get::<_,String>(27)?,"periodEnd":r.get::<_,Option<String>>(28)?,"expiresAt":r.get::<_,Option<String>>(29)?,
+        "freeDurationDays":r.get::<_,Option<i64>>(30)?,"contractStatus":r.get::<_,Option<String>>(31)?,
         "money":null
     }))
 }
 
 fn list_tx(conn: &Connection, q: &AuditQuery) -> Result<Value, AppError> {
+    let facts = facts(ReadScope::Owner);
     let requested_page = q.page.unwrap_or(1);
     if requested_page == 0 {
         return Err(AppError::BadRequest("invalid rental audit page".into()));
@@ -304,7 +334,7 @@ fn list_tx(conn: &Connection, q: &AuditQuery) -> Result<Value, AppError> {
     let (predicate, mut args) = filters(q)?;
     let total: i64 = conn
         .query_row(
-            &format!("{FACTS}SELECT COUNT(*) FROM records WHERE {predicate}"),
+            &format!("{facts}SELECT COUNT(*) FROM records WHERE {predicate}"),
             args.clone(),
             |r| r.get(0),
         )
@@ -318,7 +348,7 @@ fn list_tx(conn: &Connection, q: &AuditQuery) -> Result<Value, AppError> {
     let limit_arg = args.len();
     args.push(SqlValue::Integer((page - 1) * LIST_PAGE_SIZE));
     let offset_arg = args.len();
-    let mut statement=conn.prepare(&format!("{FACTS}SELECT {COLUMNS} FROM records WHERE {predicate} ORDER BY created_at DESC,id DESC LIMIT ?{limit_arg} OFFSET ?{offset_arg}"))
+    let mut statement=conn.prepare(&format!("{facts}SELECT {COLUMNS} FROM records WHERE {predicate} ORDER BY created_at DESC,id DESC LIMIT ?{limit_arg} OFFSET ?{offset_arg}"))
         .map_err(db_error("prepare rental audit records"))?;
     let mut items = statement
         .query_map(args, record_row)

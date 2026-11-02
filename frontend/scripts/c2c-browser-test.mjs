@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { emptyClientRentalsPage } from "./client-rental-fixtures.mjs";
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { extname, resolve, sep } from "node:path";
@@ -22,6 +23,7 @@ let browser;
 try {
   browser = await chromium.launch({ executablePath: process.env.CHROME_BIN || "/usr/bin/google-chrome", headless: true, args: ["--no-sandbox"] });
   const errors = []; const orders = []; const keys = []; const loginCodeRequests = []; const terminationReads = []; let counter = 0; let quoteCounter = 0; let quoteLifetimeMs = 300000; let uncertain = false; let heartbeat = 0; let released = 0; let resolution = 0; let manualAcceptRequests = 0;
+  const personalRentalReads = [];
   let policy = { version: 1, enabled: true, admissionMinor: 10000, minMinor: 100, maxMinor: 500000, paymentMinutes: 30 };
   let profile = null; let sellerUnits = "1728000000"; let available = true; let pauseCount = 0; let financeFailure = false; let terminationFailure = false; let sellerReadFailure = false; let heldIncome = false;
   let topupMode = "shadow"; let publicationReady = true; let retiredSetupRequests = 0; let offerWrites = 0; let expectedTrialHours = null;
@@ -67,6 +69,10 @@ try {
       if (["/v1/account/payment-profile", "/v1/market-billing/dashboard"].includes(p)) { retiredSetupRequests++; return json(route, { message: "retired setup" }, 410); }
       if (p === "/v1/client-market/hosts") return json(route, [publicationHost]);
       if (p === "/v1/client-market/my-rentals") return json(route, []);
+      if (p === "/v1/client-market/me/rentals") {
+        personalRentalReads.push({ actor, view: url.searchParams.get("view") });
+        return json(route, emptyClientRentalsPage(url));
+      }
       // The Provider center opens on what is rented out, Share listings included.
       if (p === "/v1/share-market/me/listings") return json(route, { listings: [] });
       if (p === "/v1/share-market/me/subscriptions") return json(route, { subscriptions: [], nextCursor: null, historyTotal: 0 });
@@ -616,7 +622,8 @@ try {
   assert.equal(await guest.page.locator("#income").count(), 0);
   assert.equal(guestFinanceRequests, 0, "anonymous income has a sign-in state and never fetches private finances");
   assert.equal(terminationReads.some(read => read.actor === "guest"), false, "anonymous viewers never fetch private termination history");
-  for (const [actor, role] of [["buyer", "buyer"], ["seller", "provider"], ["owner", "owner"]]) {
+  assert.ok(personalRentalReads.some(read => read.actor === "buyer" && read.view === "history"), "buyer history uses its personal scoped API");
+  for (const [actor, role] of [["seller", "provider"], ["owner", "owner"]]) {
     assert.ok(terminationReads.some(read => read.actor === actor && read.role === role), `${role} termination history uses its scoped API`);
   }
   assert.deepEqual(errors, []);

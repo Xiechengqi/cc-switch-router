@@ -3,7 +3,7 @@ use crate::market_platform_contracts::{self as contracts, BillingModel, PrepareC
 use crate::market_wallet::units_from_minor;
 const START: &str = "2026-01-01T00:00:00Z";
 
-fn rental(conn: &Connection, n: usize, status: &str) -> String {
+pub(super) fn rental(conn: &Connection, n: usize, status: &str) -> String {
     let host = format!("host-{n:04}");
     let job = format!("job-{n:04}");
     let installation = format!("client-{n:04}");
@@ -28,7 +28,7 @@ fn rental(conn: &Connection, n: usize, status: &str) -> String {
     format!("job:{job}")
 }
 
-fn paid(trial: i64) -> (Connection, String, String) {
+pub(super) fn paid(trial: i64) -> (Connection, String, String) {
     let conn = crate::test_support::database().unwrap();
     conn.execute(
         "UPDATE market_finance_control SET mode='enabled',cutover_approved_at=?1",
@@ -506,7 +506,7 @@ fn failed_delivery_is_not_a_successfully_completed_rental() {
     assert_eq!(record["record"]["money"]["chargedUnits"], "0");
 }
 
-fn accept_voluntary_exit(conn: &Connection, at: &str, reason: &str) {
+pub(super) fn accept_voluntary_exit(conn: &Connection, at: &str, reason: &str) {
     conn.execute("INSERT INTO client_termination_previews
         SELECT 'audit-preview',s.installation_id,s.client_user_id,p.id,COALESCE(t.policy_version,0),'2026-02-01T00:00:00Z'
         FROM client_market_subscriptions s JOIN market_platform_contracts c ON c.id=s.platform_contract_id
@@ -691,8 +691,9 @@ fn audit_lifecycle_uses_indexed_job_lookups_before_page_scoped_money() {
     rental(&conn, 1, "released");
     let mut statement = conn
         .prepare(&format!(
-            "EXPLAIN QUERY PLAN {FACTS}SELECT {COLUMNS} FROM records
-         WHERE attention!='none' ORDER BY created_at DESC,id DESC LIMIT 5 OFFSET 10"
+            "EXPLAIN QUERY PLAN {}SELECT {COLUMNS} FROM records
+         WHERE attention!='none' ORDER BY created_at DESC,id DESC LIMIT 5 OFFSET 10",
+            facts(ReadScope::Owner)
         ))
         .unwrap();
     let plan = statement
@@ -706,7 +707,6 @@ fn audit_lifecycle_uses_indexed_job_lookups_before_page_scoped_money() {
     // Amount sources must only be accessed by attach_money, after LIMIT 5.
     for source in [
         "market_delivery_slices",
-        "market_platform_periods",
         "market_provider_earning_lots",
         "market_usage_posting_batches",
     ] {
@@ -715,4 +715,7 @@ fn audit_lifecycle_uses_indexed_job_lookups_before_page_scoped_money() {
             "premature global monetary aggregation: {plan}"
         );
     }
+    // A current-period end is an indexed scalar lookup, not an amount aggregate.
+    assert!(!LIFECYCLE.contains("SUM("));
+    assert!(!plan.contains("SCAN p"), "{plan}");
 }

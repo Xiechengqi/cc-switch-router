@@ -444,7 +444,9 @@ pub fn router() -> Router<ServerState> {
         .route("/v1/client-market/my-rentals", get(list_my_rentals))
         .route(
             "/v1/client-market/hosts/:id/usage-history",
-            get(list_host_usage_history),
+            get(list_host_usage_history).layer(axum::middleware::from_fn(
+                crate::client_market_audit::private_response,
+            )),
         )
         .route("/v1/client-market/clients", post(commit_client_batch))
         .route(
@@ -1117,12 +1119,15 @@ async fn list_my_rentals(
 
 async fn list_host_usage_history(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     AxumPath(host_id): AxumPath<String>,
 ) -> Result<Json<Vec<HostUsageHistoryEntry>>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    let owner = crate::api::is_finance_owner(&state.config, &session.email);
     Ok(Json(
         state
             .store
-            .client_market_host_usage_history(&host_id)
+            .client_market_host_usage_history(&host_id, &session.user_id, owner)
             .await?,
     ))
 }
@@ -3369,20 +3374,27 @@ impl AppStore {
     pub async fn client_market_host_usage_history(
         &self,
         host_id: &str,
+        viewer_user_id: &str,
+        router_owner: bool,
     ) -> Result<Vec<HostUsageHistoryEntry>, AppError> {
         let conn = self.conn.lock().await;
-        let host_exists: Option<i64> = conn
+        let is_provider: Option<bool> = conn
             .query_row(
-                "SELECT 1 FROM router_ssh_hosts WHERE id = ?1",
-                params![host_id],
+                "SELECT COALESCE(provider_id = ?2,0) FROM router_ssh_hosts WHERE id = ?1",
+                params![host_id, viewer_user_id],
                 |row| row.get(0),
             )
             .optional()
             .map_err(|error| {
                 AppError::Internal(format!("read Host for usage history failed: {error}"))
             })?;
-        if host_exists.is_none() {
+        if is_provider.is_none() {
             return Err(AppError::NotFound("host not found".into()));
+        }
+        if !router_owner && is_provider != Some(true) {
+            return Err(AppError::Forbidden(
+                "Host rental history requires its Provider or Router owner".into(),
+            ));
         }
         let mut statement = conn
             .prepare(
@@ -4103,7 +4115,7 @@ struct RentalRow {
     updated_at: String,
 }
 
-fn load_rental_views(
+pub(crate) fn load_rental_views(
     conn: &Connection,
     installation_id: Option<&str>,
     session: &AuthSession,
@@ -4154,7 +4166,11 @@ fn load_rental_views(
           AND a.client_user_id = s.client_user_id"
         .to_string();
     if installation_id.is_some() {
-        sql.push_str(" WHERE s.installation_id = ?1");
+        sql.push_str(
+            " WHERE s.installation_id = ?1 AND (s.client_user_id = ?2 OR s.provider_id = ?2)",
+        );
+    } else {
+        sql.push_str(" WHERE s.client_user_id = ?1 OR s.provider_id = ?1");
     }
     sql.push_str(" ORDER BY s.updated_at DESC, s.installation_id");
     let mut statement = conn
@@ -4196,12 +4212,12 @@ fn load_rental_views(
     };
     let rows = if let Some(installation_id) = installation_id {
         statement
-            .query_map(params![installation_id], mapper)
+            .query_map(params![installation_id, session.user_id], mapper)
             .map_err(|error| AppError::Internal(format!("query rental failed: {error}")))?
             .collect::<Result<Vec<_>, _>>()
     } else {
         statement
-            .query_map([], mapper)
+            .query_map(params![session.user_id], mapper)
             .map_err(|error| AppError::Internal(format!("query rental list failed: {error}")))?
             .collect::<Result<Vec<_>, _>>()
     }

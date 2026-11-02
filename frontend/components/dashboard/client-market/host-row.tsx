@@ -114,7 +114,11 @@ function HostRowImpl({
   const isClientOwner = host.isClientOwner === true;
   const canCleanup = hostCanCleanup(host, viewerEmail);
   const canClientRelease = hostCanClientRelease(host, rental);
-  const showRenterRental = clientMarketRentalHasBanner(rental);
+  const showRenterRental = !!session?.authenticated &&
+    rental?.clientOwnerEmail.toLowerCase() === viewerEmail?.toLowerCase() && clientMarketRentalHasBanner(rental);
+  const canReadHostHistory = !!session?.authenticated &&
+    (host.isHostOwner === true && host.providerId === session.user?.id || session.canAuditClientMarket === true);
+  const canExpandDetails = canReadHostHistory || showRenterRental;
   const isRetryCleanup =
     canCleanup && (host.status === "unreachable" || host.status === "draining");
   const canReverify = hostCanReverify(host, viewerEmail);
@@ -208,7 +212,7 @@ function HostRowImpl({
   };
 
   React.useEffect(() => {
-    if (!historyOpen) return;
+    if (!historyOpen || !canReadHostHistory) return;
     const controller = new AbortController();
     setHistoryLoading(true);
     setHistoryError("");
@@ -225,7 +229,10 @@ function HostRowImpl({
         if (!controller.signal.aborted) setHistoryLoading(false);
       });
     return () => controller.abort();
-  }, [historyOpen, host.id]);
+  }, [historyOpen, host.id, canReadHostHistory, session?.user?.id]);
+  React.useEffect(() => {
+    setHistory(null); setHistoryError(""); setHistoryOpen(false);
+  }, [session?.user?.id, canReadHostHistory]);
 
   const rentalStatusLabelKey = (status: string) => {
     switch (status) {
@@ -365,6 +372,7 @@ function HostRowImpl({
           pointerDownRef.current = { x: event.clientX, y: event.clientY };
         }}
         onClick={(event) => {
+          if (!canExpandDetails) return;
           const start = pointerDownRef.current;
           pointerDownRef.current = null;
           if (start) {
@@ -511,7 +519,7 @@ function HostRowImpl({
             </Button>{terminationSummary.responseDeadlineAt && terminationSummary.attention === "provider_response" ? <time dateTime={terminationSummary.responseDeadlineAt} className="text-[10px] text-muted-foreground" title={t("clientTermination.responseDeadline")}>
               {t("clientTermination.respondBy", { time: new Intl.DateTimeFormat(locale, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(terminationSummary.responseDeadlineAt)) })}
             </time> : null}</div> : null}
-            <Button
+            {canExpandDetails ? <Button
               variant="ghost"
               size="sm"
               isIconOnly
@@ -525,7 +533,7 @@ function HostRowImpl({
                 className={`h-4 w-4 shrink-0 text-muted-foreground transition-transform ${historyOpen ? "rotate-180" : ""}`}
                 aria-hidden="true"
               />
-            </Button>
+            </Button> : null}
             {host.installationId ? (
               <span className="relative inline-flex" title={t("clientMarket.openGroupChat")}>
                 <Button
@@ -651,7 +659,7 @@ function HostRowImpl({
                   <ClientMarketRentalBanner rental={rental} onChanged={onChanged} readOnly showManageLink={false} />
                 </section>
               ) : null}
-              <div className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+              {canReadHostHistory ? <><div className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
                 {t("clientMarket.usageHistory.title")}
               </div>
               {historyLoading ? (
@@ -695,7 +703,7 @@ function HostRowImpl({
                     </tbody>
                   </table>
                 </div>
-              )}
+              )}</> : null}
             </div>
           </td>
         </tr>

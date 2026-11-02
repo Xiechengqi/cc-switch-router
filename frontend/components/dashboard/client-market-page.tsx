@@ -31,6 +31,7 @@ import { useBatchOperations } from "@/components/dashboard/client-market/use-bat
 import { AddHostDialog } from "@/components/dashboard/client-market/add-host-dialog";
 import { HostRow } from "@/components/dashboard/client-market/host-row";
 import { ClientRentalAuditPanel } from "@/components/dashboard/client-market/rental-audit-panel";
+import { ClientRentalRecords } from "@/components/dashboard/client-market/rental-records";
 import { HostSortHeader } from "@/components/dashboard/client-market/host-sort-header";
 import { ClientTerminationDialog } from "@/components/market/client-termination-dialog";
 import { useClientTerminationWorkspace } from "@/components/market/use-client-termination-workspace";
@@ -99,6 +100,7 @@ export function ClientMarketPage() {
   viewKeyRef.current = viewKey;
   const [hosts, setHosts] = React.useState<ClientMarketHost[]>(remembered?.hosts ?? []);
   const [rentals, setRentals] = React.useState<ClientMarketRental[]>(remembered?.rentals ?? []);
+  const [rentalRevision, setRentalRevision] = React.useState(0);
   const [loading, setLoading] = React.useState(!remembered);
   // The view key whose data the state holds; only that key may remember it.
   const [loadedKey, setLoadedKey] = React.useState<string | null>(remembered ? viewKey : null);
@@ -205,9 +207,13 @@ export function ClientMarketPage() {
   );
 
   const silentRefresh = React.useCallback(() => load({ silent: true }), [load]);
+  const onRentalChanged = React.useCallback(async () => {
+    setRentalRevision(value => value + 1);
+    await silentRefresh();
+  }, [silentRefresh]);
   const onTerminationChanged = React.useCallback(() => {
-    void silentRefresh(); void terminationWork.refresh(true);
-  }, [silentRefresh, terminationWork.refresh]);
+    void onRentalChanged(); void terminationWork.refresh(true);
+  }, [onRentalChanged, terminationWork.refresh]);
   const terminationByHost = React.useMemo(() => new Map(terminationWork.workspace?.hosts.map(item => [item.hostId, item]) || []), [terminationWork.workspace]);
   React.useEffect(() => {
     setTerminationId(null); terminationLinkApplied.current = null;
@@ -362,7 +368,7 @@ export function ClientMarketPage() {
     pagedHosts,
     viewerEmail,
     authed,
-    onChanged: () => void silentRefresh(),
+    onChanged: () => void onRentalChanged(),
   });
 
   // Background polling must not yank state out from under an open dialog, an
@@ -897,7 +903,7 @@ export function ClientMarketPage() {
                     selected={batch.selectedIds.has(host.id)}
                     onSelectedChange={batch.setHostSelected}
                     selectionDisabled={batch.batchBusy}
-                    onChanged={silentRefresh}
+                    onChanged={onRentalChanged}
                     onCreate={openCreateForHost}
                     onUiBusyChange={setRowUiBusy}
                   />
@@ -965,13 +971,14 @@ export function ClientMarketPage() {
         </div>
       )}
 
-      <ClientRentalAuditPanel onTerminationOpen={setTerminationId} revision={terminationWork.revision} />
+      <ClientRentalRecords historyOnly focusKey={searchParams.get("rentalId")} onTerminationOpen={setTerminationId} revision={terminationWork.revision + rentalRevision} />
+      <ClientRentalAuditPanel onTerminationOpen={setTerminationId} revision={terminationWork.revision + rentalRevision} />
       <AddHostDialog open={addOpen} onOpenChange={setAddOpen} onAdded={() => void silentRefresh()} />
       <CreateClientDialog
         open={!!fixedHost}
         onOpenChange={(next) => { if (!next) setFixedHost(null); }}
         fixedHost={fixedHost}
-        onCreated={() => void silentRefresh()}
+        onCreated={() => void onRentalChanged()}
         onMarketEligibilityRequired={(host, eligibility) => setAccessDialog({ host, eligibility })}
       />
       <MarketAccessDialog
