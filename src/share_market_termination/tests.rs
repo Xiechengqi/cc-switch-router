@@ -50,6 +50,32 @@ fn fixture_with_trial(terms: bool, trial: i64) -> (Connection, String, String) {
         START,
     )
     .unwrap();
+    if trial > 0 {
+        c.execute(
+            "UPDATE shares SET share_access_policy_version=?1 WHERE share_id='share'",
+            params![i64::from(crate::models::SHARE_TRIAL_CONTRACT_VERSION)],
+        )
+        .unwrap();
+        crate::market_share_trials::prepare_tx(
+            &c,
+            &contract,
+            "entitlement",
+            &crate::market_share_trials::TrialQuote {
+                version: 1,
+                policy_version: 1,
+                hours_inherited: false,
+                tokens_inherited: false,
+                token_allowance: 0,
+                token_budget: 0,
+                value_allowance_usd_micros: None,
+                value_budget_usd_micros: None,
+                value_inherited: false,
+                unit_locked: false,
+            },
+            START,
+        )
+        .unwrap();
+    }
     contracts::activate_contract_tx(&c, &contract, START, START).unwrap();
     if trial > 0 {
         return (
@@ -346,7 +372,7 @@ fn normalized_recurring_and_lifetime_quota_do_not_multiply_time_earning() {
 }
 
 #[test]
-fn uncharged_trial_releases_the_first_payment_hold_without_compensation() {
+fn uncharged_trial_ends_without_reserving_rent_or_compensation() {
     let (c, contract, at) = fixture_with_trial(true, 3600);
     assert_eq!(
         c.query_row(
@@ -357,8 +383,9 @@ fn uncharged_trial_releases_the_first_payment_hold_without_compensation() {
         .unwrap(),
         "trialing"
     );
-    let held = crate::market_wallet::wallet_snapshot_tx(&c, "buyer").unwrap();
-    assert!(held.held_units > 0);
+    let before = crate::market_wallet::wallet_snapshot_tx(&c, "buyer").unwrap();
+    assert_eq!(before.held_units, 0, "a free trial must not reserve rent");
+    assert_eq!(before.available_units, before.posted_units);
     let t = accept(&c, &at, "provider_issue");
     assert!(t.period_id.is_none());
     assert_eq!(t.compensation_cap_units, 0);
@@ -374,7 +401,84 @@ fn uncharged_trial_releases_the_first_payment_hold_without_compensation() {
     );
     let wallet = crate::market_wallet::wallet_snapshot_tx(&c, "buyer").unwrap();
     assert_eq!(wallet.held_units, 0);
-    assert_eq!(wallet.posted_units, held.posted_units);
+    assert_eq!(wallet.posted_units, before.posted_units);
+    assert_eq!(wallet.available_units, before.available_units);
+    assert_eq!(
+        c.query_row(
+            "SELECT COUNT(*) FROM market_platform_periods WHERE contract_id=?1",
+            params![contract],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0,
+        "ending a free trial must not create a paid period or refund"
+    );
+    assert!(evidence_valid_tx(&c, &t.id).unwrap());
+}
+
+#[test]
+fn uncharged_conversion_releases_the_first_payment_hold_without_compensation() {
+    let (c, contract, _) = fixture_with_trial(true, 3600);
+    let at = (time(START).unwrap() + Duration::hours(1)).to_rfc3339();
+    crate::market_share_trials::request_conversion_tx(&c, &contract, "time", &at).unwrap();
+    let hold: String = c.query_row(
+        "SELECT conversion_hold_id FROM market_share_trial_contracts WHERE contract_id=?1 AND phase='activating'",
+        params![contract], |r| r.get(0)
+    ).unwrap();
+    let before = crate::market_wallet::wallet_snapshot_tx(&c, "buyer").unwrap();
+    assert_eq!(
+        before.held_units,
+        crate::market_wallet::units_from_minor(10000).unwrap()
+    );
+    let t = accept(&c, &at, "provider_issue");
+    assert!(t.period_id.is_none());
+    assert_eq!(t.compensation_cap_units, 0);
+    assert_eq!(
+        crate::market_wallet::wallet_snapshot_tx(&c, "buyer")
+            .unwrap()
+            .held_units,
+        before.held_units,
+        "the conversion hold remains until the original entitlement is confirmed revoked"
+    );
+    let mut r = receipt(&c, &t, "0");
+    r.windows.clear();
+    record_receipt_tx(&c, "installation", &r, &at).unwrap();
+    finish_tx(&c, "sub", &at).unwrap();
+    let t = load(&c, &t.id).unwrap();
+    assert_eq!(t.status, "completed");
+    assert_eq!(
+        (t.compensation_units, t.returned_units, t.held_units),
+        (0, 0, 0)
+    );
+    let wallet = crate::market_wallet::wallet_snapshot_tx(&c, "buyer").unwrap();
+    assert_eq!(wallet.held_units, 0);
+    assert_eq!(wallet.posted_units, before.posted_units);
+    assert_eq!(wallet.available_units, before.posted_units);
+    assert_eq!(
+        c.query_row(
+            "SELECT status FROM market_wallet_holds WHERE id=?1",
+            params![hold],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "released"
+    );
+    assert_eq!(
+        c.query_row(
+            "SELECT COUNT(*) FROM market_platform_periods WHERE contract_id=?1",
+            params![contract],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    finish_tx(&c, "sub", &at).unwrap();
+    assert_eq!(
+        crate::market_wallet::wallet_snapshot_tx(&c, "buyer")
+            .unwrap()
+            .available_units,
+        wallet.available_units
+    );
     assert!(evidence_valid_tx(&c, &t.id).unwrap());
 }
 
@@ -403,6 +507,13 @@ fn partial_waiver_returns_credit_then_owner_timeout_waives_only_the_remaining_ho
     assert_eq!(t.held_units, award);
     assert_eq!(t.compensation_units, 0);
     assert!(t.provider_responded_at.is_some());
+    // Repeated partial waivers must not duplicate or replace the Owner notice.
+    notify_owner_review(
+        &c,
+        &t,
+        &(time(&at).unwrap() + Duration::hours(1)).to_rfc3339(),
+    )
+    .unwrap();
     assert_eq!(
         c.query_row(
             "SELECT COUNT(*) FROM user_notification_events WHERE id=?1",
@@ -412,6 +523,16 @@ fn partial_waiver_returns_credit_then_owner_timeout_waives_only_the_remaining_ho
         .unwrap(),
         1
     );
+    let (scope, category, created_at_ms): (String, String, i64) = c
+        .query_row(
+            "SELECT scope,category,created_at_ms FROM user_notification_events WHERE id=?1",
+            params![format!("share-termination-review:{}", t.id)],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(scope, "owner");
+    assert_eq!(category, "system");
+    assert_eq!(created_at_ms, time(&at).unwrap().timestamp_millis());
     let due = (time(&at).unwrap() + Duration::days(7)).to_rfc3339();
     maintain_isolated(&c, &due, 200).unwrap();
     let t = load(&c, &t.id).unwrap();

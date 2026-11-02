@@ -32,7 +32,9 @@ const VISIBLE: &str = "WITH visible AS (
         'market' AS source, rowid AS source_rowid
     FROM market_notification_outbox WHERE recipient_user_id = ?1
     UNION ALL
-    SELECT e.id, e.category, e.event_kind, e.object_kind, e.object_id,
+    SELECT e.id,
+        CASE WHEN e.event_kind = 'share_termination_updated' THEN 'service' ELSE e.category END AS category,
+        e.event_kind, e.object_kind, e.object_id,
         e.payload_json, r.read_at, e.created_at_ms AS sort_at, 'event' AS source, e.rowid AS source_rowid
     FROM user_notification_events e
     LEFT JOIN user_notification_reads r ON r.notification_id = e.id AND r.user_id = ?1
@@ -563,6 +565,61 @@ mod tests {
         assert!(feed_tx(&c, &buyer(), Some("alert:one")).is_err());
         assert!(mark_read_tx(&c, &buyer(), "alert:one", &ReadRequest::default()).is_err());
         assert!(mark_read_tx(&c, &buyer(), "client:other", &ReadRequest::default()).is_err());
+    }
+
+    #[test]
+    fn notification_center_projects_share_adjudication_as_an_owner_only_service_action() {
+        let c = memory();
+        c.execute(
+            "INSERT INTO user_notification_events
+            (id,scope,category,event_kind,object_kind,object_id,payload_json,created_at_ms)
+            VALUES ('share-review','owner','system','share_termination_updated',
+                'share_termination','termination',?1,1793145600000)",
+            params![json!({"terminationId":"termination","stage":"owner_review"}).to_string()],
+        )
+        .unwrap();
+        owner_event(&c, "alert:one", 1793145601000);
+        let feed = feed_tx(&c, &owner(), None).unwrap();
+        assert_eq!(feed.unread, 2);
+        let review = feed
+            .items
+            .iter()
+            .find(|item| item.id == "share-review")
+            .unwrap();
+        assert_eq!(review.category, "service");
+        assert_eq!(review.object_kind, "share_termination");
+        assert_eq!(review.payload["terminationId"], "termination");
+        assert_eq!(
+            feed.items[0].category, "system",
+            "alerts retain their own category"
+        );
+        for viewer in [
+            buyer(),
+            Viewer {
+                owner: false,
+                ..owner()
+            },
+        ] {
+            assert!(feed_tx(&c, &viewer, None).unwrap().items.is_empty());
+            assert!(feed_tx(&c, &viewer, Some("share-review")).is_err());
+            assert!(mark_read_tx(&c, &viewer, "share-review", &ReadRequest::default()).is_err());
+        }
+        assert_eq!(
+            mark_read_tx(&c, &owner(), "share-review", &ReadRequest::default())
+                .unwrap()
+                .unread,
+            1
+        );
+        assert!(
+            feed_tx(&c, &owner(), None)
+                .unwrap()
+                .items
+                .iter()
+                .find(|item| item.id == "share-review")
+                .unwrap()
+                .read_at
+                .is_some()
+        );
     }
 
     #[test]

@@ -833,8 +833,12 @@ fn authorized(t: &Termination, actor: &AuthSession, owner: bool) -> bool {
     t.buyer_user_id == actor.user_id || t.provider_user_id == actor.user_id || owner
 }
 fn notify_owner_review(c: &Connection, t: &Termination, at: &str) -> Result<(), AppError> {
-    c.execute("INSERT OR IGNORE INTO user_notification_events(id,scope,category,event_kind,object_kind,object_id,payload_json,created_at_ms)
-        VALUES(?1,'owner','service','share_termination_updated','share_termination',?2,?3,?4)",params![format!("share-termination-review:{}",t.id),t.id,json!({"terminationId":t.id,"shareId":t.share_id,"shareName":t.share_name,"stage":"owner_review"}).to_string(),time(at)?.timestamp_millis()]).map_err(db_error("notify Share compensation adjudicator"))?;
+    // The event store accepts client/system categories. The notification feed
+    // projects this event as a service action, including for non-admin Owners.
+    // Ignore only duplicate event IDs, never invalid notification rows.
+    c.execute("INSERT INTO user_notification_events(id,scope,category,event_kind,object_kind,object_id,payload_json,created_at_ms)
+        VALUES(?1,'owner','system','share_termination_updated','share_termination',?2,?3,?4)
+        ON CONFLICT(id) DO NOTHING",params![format!("share-termination-review:{}",t.id),t.id,json!({"terminationId":t.id,"shareId":t.share_id,"shareName":t.share_name,"stage":"owner_review"}).to_string(),time(at)?.timestamp_millis()]).map_err(db_error("notify Share compensation adjudicator"))?;
     Ok(())
 }
 fn view(
