@@ -365,6 +365,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         106,
         include_str!("../schema/0106_value_tariff_delivery.sql"),
     ),
+    (
+        107,
+        include_str!("../schema/0107_share_market_termination.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -875,7 +879,67 @@ mod tests {
     use super::*;
 
     // Migration 0102 dropped the write-only `dashboard_ux_events` table.
-    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 267;
+    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 276;
+
+    #[test]
+    fn migration_107_adds_share_settlement_without_rewriting_wallets_or_old_terms() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 106);
+        crate::market_wallet::credit_verified_topup_tx(
+            &conn, "buyer", "topup", 100, "receipt", "before",
+        )
+        .unwrap();
+        let wallet =
+            serde_json::to_value(crate::market_wallet::wallet_snapshot_tx(&conn, "buyer").unwrap())
+                .unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM market_journal_postings", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        assert_eq!(
+            serde_json::to_value(crate::market_wallet::wallet_snapshot_tx(&conn, "buyer").unwrap())
+                .unwrap(),
+            wallet
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM market_journal_postings", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            count
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT rate_bps FROM share_termination_policies WHERE version=1",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1000
+        );
+        for table in [
+            "share_termination_quote_terms",
+            "share_termination_contract_terms",
+            "share_termination_period_terms",
+            "share_market_terminations",
+            "share_termination_receipts",
+            "share_termination_income",
+        ] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0,
+                "{table}"
+            );
+        }
+        assert!(
+            conn.execute("UPDATE share_termination_policies SET rate_bps=0", [])
+                .is_err()
+        );
+    }
 
     #[test]
     fn migration_106_preserves_prices_acks_projections_and_money_without_fabricating_activation() {

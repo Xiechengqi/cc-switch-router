@@ -779,6 +779,7 @@ pub(crate) fn prepare_contract_tx(
         now,
     )?;
     crate::client_market_termination::freeze_contract_tx(conn, &id, input.quote_id)?;
+    crate::share_market_termination::freeze_contract_tx(conn, &id, input.quote_id)?;
     if input.billing_model == BillingModel::Metered
         && let Some(hold) = hold_id.as_deref()
     {
@@ -902,6 +903,7 @@ pub(crate) fn activate_contract_tx(
         )
         .map_err(db_error("create first wallet service period"))?;
         crate::market_client_trials::paid_month_tx(conn, contract_id, &period_id, now)?;
+        crate::share_market_termination::freeze_period_tx(conn, contract_id, &period_id)?;
         crate::client_market_termination::freeze_period_tx(
             conn,
             contract_id,
@@ -1123,6 +1125,7 @@ pub(crate) fn start_paid_trial_tx(
         )
         .map_err(db_error("create first paid period after trial"))?;
         crate::market_client_trials::paid_month_tx(conn, contract_id, &period_id, now)?;
+        crate::share_market_termination::freeze_period_tx(conn, contract_id, &period_id)?;
         crate::client_market_termination::freeze_period_tx(
             conn,
             contract_id,
@@ -1792,6 +1795,14 @@ pub(crate) fn terminate_after_cleanup_tx(
     cleanup_confirmed: bool,
     now: &str,
 ) -> Result<ContractTermination, AppError> {
+    if let Some(result) = crate::share_market_termination::finalize_contract_tx(
+        conn,
+        contract_id,
+        cleanup_confirmed,
+        now,
+    )? {
+        return Ok(result);
+    }
     if cleanup_confirmed
         && let Some(result) =
             crate::client_market_termination::finalize_recorded_month_tx(conn, contract_id, now)?
@@ -1814,7 +1825,7 @@ pub(crate) fn terminate_after_cleanup_tx(
     let result = terminate_after_cleanup_inner_tx(conn, contract_id, cleanup_confirmed, now)?;
     let client_notice: bool = conn
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM client_market_terminations WHERE contract_id=?1)",
+            "SELECT EXISTS(SELECT 1 FROM client_market_terminations WHERE contract_id=?1) OR EXISTS(SELECT 1 FROM share_market_terminations WHERE contract_id=?1)",
             params![contract_id],
             |r| r.get(0),
         )
@@ -2216,6 +2227,23 @@ pub(crate) fn settle_monthly_segment_tx(
     if period_status != "open" {
         return Err(AppError::Conflict(
             "monthly period is already closed".into(),
+        ));
+    }
+    if product_kind == "share"
+        && crate::share_market_termination::for_subscription_tx(
+            conn,
+            &conn
+                .query_row(
+                    "SELECT product_ref FROM market_platform_contracts WHERE id=?1",
+                    params![contract_id],
+                    |r| r.get::<_, String>(0),
+                )
+                .map_err(db_error("read fenced Share product"))?,
+        )?
+        .is_some()
+    {
+        return Err(AppError::Conflict(
+            "Share time delivery is frozen at the accepted termination cutoff".into(),
         ));
     }
     let first = parse_time(&period_start)?;
@@ -2621,6 +2649,7 @@ pub(crate) fn renew_monthly_contract_tx(
     )
     .map_err(db_error("create renewed monthly period"))?;
     crate::market_client_trials::paid_month_tx(conn, contract_id, &next_id, now)?;
+    crate::share_market_termination::freeze_period_tx(conn, contract_id, &next_id)?;
     crate::client_market_termination::freeze_period_tx(
         conn,
         contract_id,
@@ -3262,6 +3291,33 @@ fn health_observed_after_control_fence_tx(
     let fence = parse_time(&fence)?;
     let earliest = fence.timestamp() + i64::from(fence.timestamp_subsec_nanos() > 0);
     Ok(checked_at.is_some_and(|checked_at| checked_at >= earliest))
+}
+
+/// Settle only already-paid Share service, excluding later cleanup latency.
+pub(crate) fn settle_share_termination_tail_tx(
+    c: &Connection,
+    id: &str,
+    at: &str,
+) -> Result<(), AppError> {
+    let row = c.query_row("SELECT product_ref,COALESCE(service_ref,''),billing_model,status,last_evaluated_at,trial_seconds_remaining FROM market_platform_contracts WHERE id=?1 AND product_kind='share'", params![id], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,i64>(5)?))).optional().map_err(db_error("read Share termination tail"))?;
+    if let Some((product, service, model, status, Some(cursor), remaining)) = row {
+        if status == "active" {
+            reconcile_service_interval_tx(
+                c,
+                id,
+                "share",
+                &product,
+                &service,
+                &model,
+                &status,
+                &cursor,
+                remaining,
+                parse_time(at)?,
+                None,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Settle observed Client service through the accepted cutoff, including its

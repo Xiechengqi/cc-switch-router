@@ -25,7 +25,7 @@ const VISIBLE: &str = "WITH visible AS (
         CASE WHEN event_kind IN (
             'contract_suspended', 'contract_resumed', 'contract_terminating_soon',
             'contract_terminated', 'service_status_summary', 'dispute_resolved',
-            'client_termination_claim', 'client_termination_settled'
+            'client_termination_claim', 'client_termination_settled', 'share_termination_updated'
         ) THEN 'service' ELSE 'wallet' END AS category,
         event_kind, object_kind, object_id, payload_json, read_at,
         CAST(ROUND((julianday(created_at) - 2440587.5) * 86400000) AS INTEGER) AS sort_at,

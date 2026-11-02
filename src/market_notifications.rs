@@ -61,6 +61,12 @@ pub(crate) struct NotificationKind {
 
 pub(crate) const KINDS: &[NotificationKind] = &[
     NotificationKind {
+        kind: "share_termination_updated",
+        mandatory: true,
+        subject_en: "Share rental termination updated",
+        subject_zh: "Share 退租进度更新",
+    },
+    NotificationKind {
         kind: "client_termination_claim",
         mandatory: true,
         subject_en: "Client termination compensation claim",
@@ -251,6 +257,10 @@ struct OwnerSignal {
 
 fn owner_signal(kind: &str) -> OwnerSignal {
     let (severity, title) = match kind {
+        "share_termination_finance_pending" => (
+            "warning",
+            "Share revoked; financial settlement requires review",
+        ),
         "finance_critical_case" => ("critical", "Market finance reconciliation required"),
         "finance_audit_mismatch" => ("critical", "Market finance audit found mismatches"),
         "payment_secret_unreadable" => ("critical", "Payment channel secret cannot be decrypted"),

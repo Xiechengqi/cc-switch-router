@@ -370,6 +370,9 @@ pub struct SeatView {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubscriptionView {
+    pub can_terminate_immediately: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub termination_id: Option<String>,
     pub id: String,
     pub seat_id: String,
     pub listing_id: String,
@@ -677,6 +680,8 @@ struct ShareAvailabilityRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RentQuoteSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub termination_policy: Option<crate::share_market_termination::Policy>,
     pub seat_id: String,
     pub listing_id: String,
     pub share_id: String,
@@ -2015,6 +2020,68 @@ fn contract_policy(record: &SubscriptionRecord) -> Result<ShareUserPolicy, AppEr
             .map(|value| value.timestamp_millis()),
         allowed_apps: market_allowed_apps(),
     })
+}
+
+pub(crate) fn termination_policy_tx(
+    c: &Connection,
+    sub: &str,
+) -> Result<ShareUserPolicy, AppError> {
+    let record = subscription_record(c, sub)?
+        .ok_or_else(|| AppError::NotFound("Share subscription not found".into()))?;
+    contract_policy(&record)
+}
+
+pub(crate) fn request_termination_revoke_tx(
+    c: &Connection,
+    sub: &str,
+    at: &str,
+) -> Result<(), AppError> {
+    let r = subscription_record(c, sub)?
+        .ok_or_else(|| AppError::NotFound("Share subscription not found".into()))?;
+    retire_unconfirmed_grant_tx(c, sub, "immediate_termination", at)?;
+    request_revoke_tx(
+        c,
+        sub,
+        &r.share_id,
+        &r.seat_id,
+        &r.entitlement_id,
+        &r.renter_email,
+        "immediate_termination",
+        at,
+    )?;
+    apply_control_grant_effect(
+        c,
+        &r.share_id,
+        "revoke",
+        &r.renter_email,
+        &r.entitlement_id,
+        None,
+        Some(parse_time(at)?.timestamp_millis()),
+        at,
+    )
+}
+
+pub(crate) fn retry_termination_revoke_tx(
+    c: &Connection,
+    sub: &str,
+    at: &str,
+) -> Result<(), AppError> {
+    let r = subscription_record(c, sub)?
+        .ok_or_else(|| AppError::NotFound("Share subscription not found".into()))?;
+    if !has_terminal_revoke_operation_tx(c, sub)? {
+        return Ok(());
+    }
+    c.execute("UPDATE share_control_operations SET dead_lettered_at=NULL WHERE subscription_id=?1 AND action='revoke' AND status='rejected'",params![sub]).map_err(map_db("retire Share termination dead letter"))?;
+    request_revoke_tx(
+        c,
+        sub,
+        &r.share_id,
+        &r.seat_id,
+        &r.entitlement_id,
+        &r.renter_email,
+        "immediate_termination",
+        at,
+    )
 }
 
 /// The quota the Server enforces now: a legacy trial's Token cap while it
@@ -5017,6 +5084,10 @@ fn subscription_view(
         false
     };
     Ok(SubscriptionView {
+        can_terminate_immediately: is_renter
+            && crate::share_market_termination::can_terminate_tx(conn, &record.id)?,
+        termination_id: crate::share_market_termination::for_subscription_tx(conn, &record.id)?
+            .map(|t| t.id),
         id: record.id.clone(),
         seat_id: record.seat_id,
         listing_id: record.listing_id,
@@ -8402,6 +8473,7 @@ impl AppStore {
             ));
         }
         let snapshot = RentQuoteSnapshot {
+            termination_policy: crate::share_market_termination::quote_policy_tx(&tx, &share_id)?,
             seat_id: seat_id.to_string(),
             listing_id: listing_id.clone(),
             share_id: share_id.clone(),
@@ -8433,6 +8505,11 @@ impl AppStore {
             service: service.clone(),
         };
         let quote_id = Uuid::new_v4().to_string();
+        crate::share_market_termination::freeze_quote_tx(
+            &tx,
+            &quote_id,
+            snapshot.termination_policy.as_ref(),
+        )?;
         if offer_price_minor.is_some() {
             crate::market_commission::freeze_quote_tx(&tx, &quote_id, &owner_user_id, &now)?;
         }
@@ -10798,7 +10875,9 @@ fn finish_release_tx(
     reason: &str,
     now: &str,
 ) -> Result<(), AppError> {
-    if let Some(contract_id) =
+    if crate::share_market_termination::for_subscription_tx(tx, subscription_id)?.is_some() {
+        crate::share_market_termination::finish_tx(tx, subscription_id, now)?;
+    } else if let Some(contract_id) =
         crate::market_platform_contracts::contract_for_product_tx(tx, "share", subscription_id)?
     {
         let settlement = crate::market_platform_contracts::terminate_after_cleanup_tx(
@@ -11531,6 +11610,22 @@ impl AppStore {
                 record.status.as_str(),
                 SUB_REVOKE_PENDING | SUB_REVOKE_FAILED
             ) {
+                if crate::share_market_termination::for_subscription_tx(&tx, &record.id)?.is_some()
+                {
+                    // Absence from a descriptor is not a final consumption receipt.
+                    let ready: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM share_termination_receipts r JOIN share_market_terminations t ON t.id=r.termination_id WHERE t.subscription_id=?1)", params![record.id], |r| r.get(0)).map_err(map_db("check Share termination receipt"))?;
+                    if ready {
+                        finish_release_tx(
+                            &tx,
+                            &record.id,
+                            &record.seat_id,
+                            &record.listing_id,
+                            "immediate_termination",
+                            &now,
+                        )?;
+                    }
+                    continue;
+                }
                 if share.is_none() {
                     confirm_control_effect_tx(&tx, &record.id, "revoke", &now)?;
                     finish_release_tx(
@@ -12064,6 +12159,11 @@ impl AppStore {
             };
             let patch = ShareSettingsPatch {
                 managed_grant: Some(ShareManagedGrantOperation {
+                    termination: if action == "revoke" {
+                        crate::share_market_termination::fence_tx(&tx, &subscription_id)?
+                    } else {
+                        None
+                    },
                     operation_id: operation_id.clone(),
                     entitlement_id,
                     share_sequence,
@@ -12318,6 +12418,13 @@ pub(crate) fn handle_control_edit_ack_with_effect(
         return Ok(());
     }
     if status == "applied" {
+        if action == "upsert"
+            && crate::share_market_termination::for_subscription_tx(conn, &subscription_id)?
+                .is_some()
+        {
+            conn.execute("UPDATE share_control_operations SET status='applied',applied_at=?2,updated_at=?2 WHERE id=?1 AND status='dispatched'",params![operation_id,now]).map_err(map_db("record fenced late Share upsert"))?;
+            return Ok(());
+        }
         let stored_policy = policy_json
             .as_deref()
             .map(serde_json::from_str::<ShareUserPolicy>)
@@ -12741,8 +12848,10 @@ fn apply_control_grant_effect(
                     grant.manager == ShareGrantManager::RouterShareMarket
                         && grant.entitlement_id.as_deref() == Some(entitlement_id)
                 })
-                .map(|(key, _)| key.clone())
-                .unwrap_or_else(|| email.clone());
+                .map(|(key, _)| key.clone());
+            let Some(target_email) = target_email else {
+                return Ok(());
+            };
             if let Some(grant) = grants.get_mut(&target_email) {
                 grant.active = false;
                 grant.updated_at_ms = now_ms;
@@ -15904,6 +16013,7 @@ mod tests {
     #[test]
     fn rent_quote_offer_comparison_covers_every_frozen_term() {
         let quoted = RentQuoteSnapshot {
+            termination_policy: None,
             seat_id: "seat-terms".into(),
             listing_id: "listing-terms".into(),
             share_id: "share-terms".into(),

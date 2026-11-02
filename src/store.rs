@@ -3599,6 +3599,7 @@ impl AppStore {
                 "cacheCreationTtlV1".into(),
                 "valuePricingKnownRevisionV1".into(),
                 "valuePricingActivationV1".into(),
+                "shareTerminationV1".into(),
             ],
         })
     }
@@ -11803,6 +11804,23 @@ impl AppStore {
             input.ack.current_config_revision,
             input.ack.current_share.as_ref(),
         )?;
+        if status == "rejected"
+            && input.ack.error_code.as_deref() == Some("market_termination_pending")
+            && edit.patch.managed_grant.as_ref().is_some_and(|op| {
+                op.termination.is_some()
+                    && op.action == crate::models::ShareManagedGrantAction::Revoke
+            })
+            && edit.installation_id == input.installation_id
+            && edit.revision == input.ack.revision
+            && edit.status == "pending"
+        {
+            // The revoke itself may already be applied. Keep exactly the same
+            // signed edit/fingerprint while pre-cutoff requests drain, rather
+            // than creating a different replay payload or exhausting retries.
+            tx.execute("UPDATE share_control_operations SET last_error='final consumption evidence pending',updated_at=?2 WHERE edit_id=?1 AND status='dispatched'",params![ack_edit_id,now]).map_err(|e|AppError::Internal(e.to_string()))?;
+            tx.commit().map_err(|e| AppError::Internal(e.to_string()))?;
+            return Ok(());
+        }
         let changed = tx
             .execute(
                 "UPDATE share_edit_requests
@@ -11839,6 +11857,45 @@ impl AppStore {
             if existing_status.as_deref() != Some(status) {
                 return Err(AppError::Conflict(
                     "share edit ack did not match an active or identically resolved edit".into(),
+                ));
+            }
+        }
+        if status == "applied" {
+            if let Some(op) = edit
+                .patch
+                .managed_grant
+                .as_ref()
+                .filter(|op| op.termination.is_some())
+            {
+                if edit.installation_id != input.installation_id
+                    || edit.revision != input.ack.revision
+                {
+                    return Err(AppError::Conflict(
+                        "termination ACK installation/revision mismatch".into(),
+                    ));
+                }
+                let receipt = input.ack.termination_receipt.as_ref().ok_or_else(|| {
+                    AppError::Conflict("termination ACK requires final consumption evidence".into())
+                })?;
+                let fence = op.termination.as_ref().expect("filtered termination");
+                if op.action != crate::models::ShareManagedGrantAction::Revoke
+                    || receipt.operation_id != op.operation_id
+                    || receipt.termination_id != fence.termination_id
+                    || receipt.share_id != edit.share_id
+                {
+                    return Err(AppError::Conflict(
+                        "termination ACK operation mismatch".into(),
+                    ));
+                }
+                crate::share_market_termination::record_receipt_tx(
+                    &tx,
+                    &input.installation_id,
+                    receipt,
+                    &now,
+                )?;
+            } else if input.ack.termination_receipt.is_some() {
+                return Err(AppError::BadRequest(
+                    "unexpected Share termination receipt".into(),
                 ));
             }
         }
@@ -16309,6 +16366,17 @@ fn upsert_share_tx(
     mut share: ShareDescriptor,
 ) -> Result<(), AppError> {
     normalize_share_descriptor_fields(&mut share)?;
+    // A refreshed/stale descriptor must not resurrect an accepted termination.
+    for grant in share
+        .user_grants
+        .values_mut()
+        .filter(|g| g.active && g.entitlement_id.is_some())
+    {
+        let fenced:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM share_market_terminations WHERE entitlement_id=?1 AND share_id=?2)",params![grant.entitlement_id,share.share_id],|r|r.get(0)).map_err(|e|AppError::Internal(e.to_string()))?;
+        if fenced {
+            grant.active = false;
+        }
+    }
     validate_share_descriptor_bindings(&share)?;
     ensure_value_pricing_acknowledged(conn, installation_id, &share)?;
     let new_quota_stream = merge_account_quota_projections(conn, &mut share)?;
@@ -16501,6 +16569,11 @@ fn upsert_share_tx(
     )
     .map_err(map_share_constraint_error)?;
     if share_changed > 0 {
+        conn.execute(
+            "UPDATE shares SET termination_archive_since_ms=?2 WHERE share_id=?1",
+            params![chat_share_id, share.termination_archive_since_ms],
+        )
+        .map_err(|e| AppError::Internal(format!("save Share termination capability: {e}")))?;
         conn.execute(
             "UPDATE shares SET market_entitlements_json = ?2 WHERE share_id = ?1",
             params![
@@ -21894,7 +21967,8 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppE
                     COALESCE(s.previous_response_cache_enabled, 0), COALESCE(s.free_access, 0),
                     COALESCE(s.grok_image_generation_enabled, 0),
                     COALESCE(s.grok_image_edit_enabled, 0),
-                    COALESCE(s.grok_video_generation_enabled, 0), s.market_entitlements_json
+                    COALESCE(s.grok_video_generation_enabled, 0), s.market_entitlements_json,
+                    s.termination_archive_since_ms
              FROM shares s
              INNER JOIN installations i ON i.id = s.installation_id
              WHERE i.lifecycle = 'active'
@@ -21907,6 +21981,7 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppE
             Ok((
                 row.get(0)?,
                 ShareDescriptor {
+                    termination_archive_since_ms: row.get(38)?,
                     contract_version: SHARE_CONTRACT_VERSION,
                     share_id: row.get(1)?,
                     capacity_pool_id: row.get(25)?,
@@ -29223,6 +29298,7 @@ pub(crate) mod tests {
 
         let edit_ack = ShareEditAckEnvelope {
             ack: ShareEditAckPayload {
+                termination_receipt: None,
                 settings_receipt: None,
                 edit_id: "edit-42".to_string(),
                 revision: 7,
@@ -34177,6 +34253,7 @@ pub(crate) mod tests {
             test_share_host(subdomain)
         };
         ShareDescriptor {
+            termination_archive_since_ms: None,
             contract_version: SHARE_CONTRACT_VERSION,
             share_id: share_id.into(),
             capacity_pool_id: format!("pool-{share_id}"),
@@ -47049,6 +47126,7 @@ pub(crate) mod tests {
         .await;
 
         let share = ShareDescriptor {
+            termination_archive_since_ms: None,
             contract_version: SHARE_CONTRACT_VERSION,
             share_id: "share-1".into(),
             capacity_pool_id: "pool-share-1".into(),
@@ -47147,6 +47225,7 @@ pub(crate) mod tests {
         assert!(replay_err.to_string().contains("nonce already used"));
 
         let tampered_share = ShareDescriptor {
+            termination_archive_since_ms: None,
             subdomain: test_share_host("tampered"),
             ..share
         };
@@ -47922,6 +48001,7 @@ pub(crate) mod tests {
         .await;
 
         let share = ShareDescriptor {
+            termination_archive_since_ms: None,
             contract_version: SHARE_CONTRACT_VERSION,
             share_id: "share-minimal".into(),
             capacity_pool_id: "pool-share-minimal".into(),
@@ -48022,6 +48102,7 @@ pub(crate) mod tests {
         let signing_key = insert_signed_installation(&store, "inst-mismatch").await;
 
         let share = ShareDescriptor {
+            termination_archive_since_ms: None,
             contract_version: SHARE_CONTRACT_VERSION,
             share_id: "share-mismatch".into(),
             capacity_pool_id: "pool-share-mismatch".into(),
@@ -48118,6 +48199,7 @@ pub(crate) mod tests {
         .await;
 
         let share = ShareDescriptor {
+            termination_archive_since_ms: None,
             contract_version: SHARE_CONTRACT_VERSION,
             share_id: "share-new".into(),
             capacity_pool_id: "pool-share-new".into(),
@@ -48251,6 +48333,7 @@ pub(crate) mod tests {
         }
 
         let share = ShareDescriptor {
+            termination_archive_since_ms: None,
             contract_version: SHARE_CONTRACT_VERSION,
             share_id: "share-heal".into(),
             capacity_pool_id: "pool-share-heal".into(),
@@ -48527,6 +48610,7 @@ pub(crate) mod tests {
         insert_share(&store, "inst-same", "share-old", &reused_host, "paused").await;
 
         let share = ShareDescriptor {
+            termination_archive_since_ms: None,
             contract_version: SHARE_CONTRACT_VERSION,
             share_id: "share-new".into(),
             capacity_pool_id: "pool-share-new".into(),
@@ -48642,6 +48726,7 @@ pub(crate) mod tests {
         .await;
 
         let share = ShareDescriptor {
+            termination_archive_since_ms: None,
             contract_version: SHARE_CONTRACT_VERSION,
             share_id: "share-batch-1".into(),
             capacity_pool_id: "pool-share-batch-1".into(),
@@ -48749,6 +48834,7 @@ pub(crate) mod tests {
         let tampered_ops = vec![ShareSyncOperation {
             kind: "upsert".into(),
             share: Some(ShareDescriptor {
+                termination_archive_since_ms: None,
                 share_name: "Batch Share Tampered".into(),
                 ..share
             }),
@@ -48767,6 +48853,7 @@ pub(crate) mod tests {
                         &vec![ShareSyncOperation {
                             kind: "upsert".into(),
                             share: Some(ShareDescriptor {
+                                termination_archive_since_ms: None,
                                 share_name: "Different".into(),
                                 ..tampered_ops[0].share.clone().expect("share")
                             }),
@@ -52382,6 +52469,7 @@ pub(crate) mod tests {
         returned.descriptor_generation = 1;
         returned.descriptor_fingerprint = "a".repeat(64);
         let ack = ShareEditAckPayload {
+            termination_receipt: None,
             settings_receipt: Some(crate::models::ShareSettingsReceipt {
                 operation_id: response.edit.id.clone(),
                 patch_fingerprint: crate::models::share_settings_fingerprint(

@@ -316,6 +316,7 @@ Router **从不改写** Server 返回的 descriptor,只做校验(`store::apply_s
 | `patch.managedGrant.entitlementId` | 稳定 entitlement ID,与订阅绑定 |
 | `patch.managedGrant.policy` | 拼车位并行/Token 限制、周期及显式 `allowedApps`(upsert 必填) |
 | `patch.managedGrant.durationSeconds` | 有固定服务期限时的相对时长；Server 在应用授权时按 `appliedAtMs` 写入绝对 `expiresAt`，policy 本身不得携带 `expiresAt`；revoke 不得携带 |
+| `patch.managedGrant.termination` | 协商 `shareTerminationV1` 后，仅 revoke 可带的原租约结算 fence，详见下文 |
 | Server 落库 `userGrants[].manager` | 固定为 `routerShareMarket` |
 
 Server 要求:
@@ -324,6 +325,22 @@ Server 要求:
 2. pending-edit 应用路径接受 managed grant,写入/移除 `routerShareMarket` grant。
 3. 普通用户编辑不得修改或删除 **仍为 active** 且 `manager=routerShareMarket` 的 grant。撤销后的 tombstone（`active=false`）保留作历史/用量 deprecated 标记，不再占用该邮箱；普通编辑可将同一邮箱写成新的 Manual `shareto`。不得把 tombstone 重新点亮为市场授权；再次出租仍只走 `managedGrant.upsert`。
 4. edit-ack(`POST /v1/shares/edit-ack`)成功后,Router 将订阅从 `grant_pending` 推进到 `active_free` 或 `active_postpaid`,或完成 revoke 后释放座位。
+
+#### Share 立即退租的最终消费回执
+
+`shareTerminationV1` 是独立能力，不可从 reader v10 或 `marketTrialV1` 推断。heartbeat 的 capability 缓存仍须绑定 Router URL、installation，最多有效 300 秒。协商后，SQLite **committed** Server 才能在权威读取和常规 Share 同步中附 `terminationArchiveSinceMs`（UTC 毫秒）。归档起点是持久化能力的真实起点，不能回填到付费周期之前；旧 Router 必须省略该字段。该能力变化进入静态描述符指纹。发布顺序为 Router → Server，与普通设置补丁的升级顺序独立。
+
+`managedGrant.termination={terminationId,cutoffAtMs,periodStartMs,periodEndMs,policy}`，policy 是原租约冻结的执行额度，而非管理员当前展示价目；只允许 revoke，满足 `0 <= periodStartMs <= cutoffAtMs <= periodEndMs`。Server 先持久化原 entitlement 撤权，并保留 pending ACK 标记，直到原操作的成功 ACK 被 Router 接收。
+
+applied ACK 必须带 `terminationReceipt={terminationId,entitlementId,shareId,email,operationId,cutoffAtMs,periodStartMs,periodEndMs,revokedAtMs,archiveSinceMs,quotaUsedBeforePeriod,windows}`。`windows=[{startsAtMs,endsAtMs,used}]` 是不重叠且排序的执行额度窗口；累计额度使用付费周期边界。`used`、`quotaUsedBeforePeriod` 均为规范十进制字符串：Token 模式为数量，美元模式为已结算 USD picos，**都不是钱包金额**。前者只汇总本周期截止前正式付费的请求，后者是更早付费请求的累计消耗，用于累计额度的期初剩余额度。
+
+独立归档保留每次 admission 的 request、原 entitlement、邮箱、阶段、开始时间、修订及最终状态，不依赖有限展示日志或 Share 内 35 天保留窗口。必须排空所有原 entitlement 的请求，包括试用和截止附近竞态；USD 读取执行 ledger 的全部已结算尝试，缺价格／未结算／不确定不能当作零。只有具备最终失败且零消费凭据的未执行请求才能证明零值。
+
+等待期间返回 rejected ACK，`errorCode=market_termination_pending,retryable=true`。这表示操作可能已在 Server 撤权，**不能**删除 Server 的原操作回放记录，或使 Router 改写同一 operation 的 expectedRevision。Router 保持原 pending edit 和 dispatched operation 重试；成功回执按原 installation、edit revision、operation、租约、计费区间验证并不可变落库。普通描述符缺 grant 或 Share 删除不能替代回执。Server 在活跃市场授权或该成功 ACK 未确认期间拒绝删除 Share，错误码 `cc_switch_share_market_settlement_pending`。
+
+Server 发出最终 applied ACK 前须将其写入绑定原 Router URL／installation 的持久化 outbox。重启后即使 Router 已不再返回该 pending edit，仍重放原 ACK；Router 幂等确认后，先持久化清理 Server 的 pending 标记，最后删除 outbox。不能仅靠内存中的 HTTP 成功结果解除或永久遗留删除门禁。
+
+最终回执确认后，安全回收和财务结算是独立提交点：财务异常保留已确认撤权及原负债，不阻止车位复用，不允许责任裁决绕过资金对账。钱包资金、额度折算、补偿比例、争议及成熟期仍只由 Router 管理，完整规则见 [Share 退租](docs/share-market-immediate-termination.md)。
 
 一个拼车位授权整个 Share,不出售单一 App。报价会冻结当时全部已启用 App 的供应商与模型条款(`service.apps[]`),租客不能再通过 `requiredApp` 收窄授权；该旧请求字段仅作为兼容输入保留并被忽略。Router-managed grant 对三个核心 App 显式下发 `allowedApps=[claude,codex,gemini]`,Server 再以目标 App 当前是否已绑定且启用作为实际可调用边界，因此 Share 后续启用的核心 App 无需重建租约即可使用。升级前的单 App 活跃 grant 通过幂等 upsert 原地扩权,不 revoke、不暂停服务或账单；迁移时已经在途的 v1 初次授权或恢复授权可完成一次旧范围确认，但不会标记为扩权完成，下一轮立即原地扩权。v2 租约不接受该兼容行为。
 

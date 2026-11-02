@@ -1,6 +1,6 @@
 # Client Market 立即退租与补偿
 
-本次改造只适用于 Client Market。Share Market 的到期退出、计量和结算规则不变，也没有增加 Share 退租补偿。余额退回均为平台内信用的返还，不新增外部退款、提现或二次邮箱验证码。
+本文描述 Client Market 的独立退租规则。Share Market 的立即退租、最终额度消费及补偿见 [Share Market 立即退租](share-market-immediate-termination.md)，不共用策略版本。余额退回均为平台内信用的返还，不新增外部退款、提现或二次邮箱验证码。
 
 ## 用户操作
 

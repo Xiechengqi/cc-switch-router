@@ -159,11 +159,15 @@ function RentalDetail({
   subscription,
   busy,
   onRelease,
+  onTerminate,
+  onViewTermination,
   onChanged,
 }: {
   subscription: ShareMarketSubscription;
   busy: boolean;
   onRelease?: () => void;
+  onTerminate?: () => void;
+  onViewTermination?: () => void;
   onChanged: () => Promise<void> | void;
 }) {
   const { locale, t } = useLocaleText();
@@ -199,9 +203,9 @@ function RentalDetail({
       {subscription.status !== "released" && subscription.walletContract?.id && subscription.cyclePriceMinor != null ? (
         <MarketWalletRenewalCard contractId={subscription.walletContract.id} refreshKey={subscription.updatedAt} compact onChanged={onChanged} />
       ) : null}
-      {subscription.status !== "released" || subscription.openWalletDispute ? <MarketServiceDisputeControl contractId={subscription.walletContractId} initiallyOpen={subscription.openWalletDispute} onChanged={onChanged} /> : null}
+      {subscription.status !== "released" || subscription.openWalletDispute || subscription.terminationId ? <MarketServiceDisputeControl contractId={subscription.walletContractId} initiallyOpen={subscription.openWalletDispute} onChanged={onChanged} /> : null}
       <div className="flex flex-wrap items-center justify-end gap-2">
-        <RentalActions subscription={subscription} t={t} busy={busy} onRelease={onRelease} />
+        <RentalActions subscription={subscription} t={t} busy={busy} onRelease={onRelease} onTerminate={onTerminate} onViewTermination={onViewTermination} />
         <Link href={shareMarketHref({ shareId: subscription.shareId })} className={LINK_CLASS}>
           {t("account.share.manageInMarket")}<ArrowUpRight className="h-3.5 w-3.5" aria-hidden />
         </Link>
@@ -357,7 +361,7 @@ export function AccountShareRentals({
           focusKey={focusId}
           renderDetail={(subscription) => {
             const actions = rentals.rowActions(subscription);
-            return <RentalDetail subscription={subscription} busy={rentals.busyId === subscription.id} onRelease={actions.onRelease} onChanged={onChanged} />;
+            return <RentalDetail subscription={subscription} busy={rentals.busyId === subscription.id} {...actions} onChanged={onChanged} />;
           }}
           empty={(
             <div className="grid justify-items-center gap-2 rounded-md border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">
@@ -372,7 +376,7 @@ export function AccountShareRentals({
         <ExpandableRecordTable rows={pagedHistory?.items ?? history} rowKey={(item) => item.id} rowLabel={(item) => item.shareName}
           columns={columns.filter((column) => column.id !== "open")}
           ariaLabel={t("account.share.history")} focusKey={focusId}
-          renderDetail={(subscription) => <RentalDetail subscription={subscription} busy={false} onChanged={onChanged} />}
+          renderDetail={(subscription) => <RentalDetail subscription={subscription} busy={false} {...rentals.rowActions(subscription)} onChanged={onChanged} />}
           empty={<p className="text-sm text-muted-foreground">{t("account.share.historyEmpty")}</p>} />
         {pagedHistory ? <MarketPagination page={pagedHistory.page} pageCount={pagedHistory.pageCount} onPageChange={changeHistoryPage} />
           : nextCursor && onLoadMore ? <Button variant="ghost" className="min-h-11 justify-self-start" isDisabled={loadingMore} onPress={() => void onLoadMore()}>{t(loadingMore ? "common.loading" : "marketWallet.more")}</Button> : null}

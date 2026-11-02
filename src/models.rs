@@ -1356,6 +1356,8 @@ pub enum ShareManagedGrantAction {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareManagedGrantOperation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub termination: Option<crate::share_market_termination_contract::TerminationFence>,
     pub operation_id: String,
     pub entitlement_id: String,
     pub share_sequence: i64,
@@ -1811,6 +1813,8 @@ pub struct SharePendingEditsResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareEditAckPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub termination_receipt: Option<crate::share_market_termination_contract::TerminationReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings_receipt: Option<ShareSettingsReceipt>,
     pub edit_id: String,
@@ -3316,6 +3320,9 @@ pub struct ShareRuntimeSnapshotResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareDescriptor {
+    /// Specific capability; absent on legacy/non-authoritative Servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub termination_archive_since_ms: Option<i64>,
     pub contract_version: u16,
     pub share_id: String,
     pub capacity_pool_id: String,

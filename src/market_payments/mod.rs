@@ -7581,6 +7581,9 @@ async fn run_finance_audit(state: &ServerState) {
 /// lot cannot hold back the rest of the batch.
 async fn unlock_due_earnings(state: &ServerState) {
     let conn = state.store.conn.lock().await;
+    if crate::share_market_termination::maintain_isolated(&conn, &now(), 200).is_err() {
+        tracing::warn!("Share termination recovery/deadlines/earning credit deferred");
+    }
     if crate::client_market_termination::expire_disputes_isolated(&conn, &now(), 200).is_err() {
         tracing::warn!("Client compensation timeout waiver deferred");
     }

@@ -326,7 +326,7 @@ export type MarketEarningHold = {
 
 export type MarketProviderEarningLot = {
   id: string;
-  incomeKind?: "service" | "client_termination";
+  incomeKind?: "service" | "client_termination" | "share_termination";
   amountUnits: string;
   grossUnits: string;
   commissionUnits: string;

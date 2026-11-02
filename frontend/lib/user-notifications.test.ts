@@ -20,7 +20,7 @@ test("notification center labels cover every category and known new kind in both
   for (const category of ["wallet", "service", "client", "system"] as const) {
     for (const locale of ["en", "zh-CN"] as const) assert.ok(messages[locale][`notificationCenter.category.${category}`]);
   }
-  for (const kind of ["topup_credited", "contract_suspended", "client_offline", "client_recovered", "client_registered", "client_removed", "operator_alert_firing", "operator_alert_resolved", "client_termination_started", "client_termination_decision_required"]) {
+  for (const kind of ["topup_credited", "contract_suspended", "client_offline", "client_recovered", "client_registered", "client_removed", "operator_alert_firing", "operator_alert_resolved", "client_termination_started", "client_termination_decision_required", "share_termination_updated"]) {
     const key = notificationKindKey(kind);
     assert.notEqual(key, "notificationCenter.other");
     assert.ok(messages.en[key]);
@@ -37,6 +37,8 @@ test("notification links use existing local routes and cannot follow payload URL
   assert.equal(client.searchParams.get("focusId"), "one&two");
   assert.equal(client.searchParams.get("drawerId"), "one&two");
   assert.equal(notificationHref({ ...item, eventKind: "client_termination_claim" }), "/client-market/?terminationId=one");
+  assert.equal(notificationHref({ ...item, eventKind: "share_termination_updated", payload: { terminationId: "old/id?x=1", href: "https://evil.test" } }), "/share-market/?terminationId=old%2Fid%3Fx%3D1");
+  assert.equal(notificationHref({ ...item, objectKind: "share_termination", objectId: "original", payload: { terminationId: 42 } }), "/share-market/?terminationId=original");
   assert.equal(notificationHref({ ...item, category: "system", objectKind: "client_termination", objectId: "old/id?x=1", payload: { href: "https://evil.test" } }), "/client-market/?terminationId=old%2Fid%3Fx%3D1");
   assert.equal(notificationHref({ ...item, category: "system" }), "/metrics/?tab=alerts");
 });

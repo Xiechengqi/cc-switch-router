@@ -11,6 +11,7 @@ import { catalogNeedsRuntimeSync } from "@/components/dashboard/share-market/buy
 import { shareMarketMutationError } from "@/components/dashboard/share-market/market-utils";
 import { mergeShareMarketSubscriptionPage, subscriptionsNeedGrantPolling } from "@/components/dashboard/share-market/subscription-utils";
 import { ShareMarketOwnerWorkspace } from "@/components/dashboard/share-market/owner-workspace";
+import { ShareTerminationDialog } from "@/components/market/share-termination-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   getShareMarketCatalog,
@@ -102,6 +103,7 @@ export function ShareMarketWorkspace() {
   const expandedSubscriptionHistoryRef = React.useRef(false);
   const subscriptionHistoryGenerationRef = React.useRef(0);
   const focusedShareId = searchParams.get("focus") || undefined;
+  const linkedTermination = searchParams.get("terminationId");
   const marketProviderId = searchParams.get("provider") || undefined;
   const initialMine = mineFromQuery(searchParams.get("view") || searchParams.get("tab"));
 
@@ -340,6 +342,7 @@ export function ShareMarketWorkspace() {
 
   return (
     <main className="mx-auto grid w-full max-w-7xl gap-5 px-1 pb-10">
+      <ShareTerminationDialog selection={authed && linkedTermination ? { id: linkedTermination } : null} onClose={() => replaceCurrentSearch(params => params.delete("terminationId"))} onChanged={() => { void load({ scope: workspace, silent: true }); }} />
       <h1 className="sr-only">{t("shareMarket.title")}</h1>
       <div className="flex min-w-0 flex-wrap items-center justify-between gap-3 border-b border-slate-200 pb-3">
         {authed ? (

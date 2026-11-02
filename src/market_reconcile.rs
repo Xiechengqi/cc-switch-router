@@ -30,6 +30,8 @@ const CRITICAL_CODES: &[&str] = &[
     "c2c_orphan_journal",
     "client_termination_evidence_mismatch",
     "client_termination_orphan_journal",
+    "share_termination_evidence_mismatch",
+    "share_termination_orphan_journal",
 ];
 
 pub(crate) fn case_tx(
@@ -127,6 +129,10 @@ fn scope_blocked_tx(conn: &Connection, scope: FinanceScope<'_>) -> Result<bool, 
     if broken_termination {
         return Ok(true);
     }
+    let broken_share:bool=conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM market_finance_reconciliation_cases c JOIN share_market_terminations t ON t.id=c.object_id WHERE c.status='open' AND c.code='share_termination_evidence_mismatch' AND {predicate} AND ?1 IS NOT NULL)"),params![id],|r|r.get(0)).map_err(db_error("check Share termination finance scope"))?;
+    if broken_share {
+        return Ok(true);
+    }
     let (sql, subject): (&str, Option<&str>) = match scope {
         FinanceScope::User(user) => (
             "SELECT EXISTS(SELECT 1 FROM market_finance_reconciliation_cases c
@@ -199,7 +205,7 @@ pub(crate) fn ensure_finance_scopes_safe_tx(
     let global: bool = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM market_finance_reconciliation_cases
-             WHERE status = 'open' AND code IN ('journal_unsealed', 'wallet_transfer_orphan_journal', 'commission_orphan_journal', 'earning_conversion_orphan_journal', 'c2c_orphan_journal','client_termination_orphan_journal'))",
+             WHERE status = 'open' AND code IN ('journal_unsealed', 'wallet_transfer_orphan_journal', 'commission_orphan_journal', 'earning_conversion_orphan_journal', 'c2c_orphan_journal','client_termination_orphan_journal','share_termination_orphan_journal'))",
             [],
             |row| row.get(0),
         )
@@ -256,6 +262,8 @@ fn critical_case_still_failed_tx(
             WHERE j.id=?1 AND j.source_kind IN ('client_termination','client_compensation')
             AND NOT EXISTS(SELECT 1 FROM client_termination_events e WHERE e.journal_id=j.id))",params![object_id],|r|r.get(0))
             .map_err(db_error("recheck Client termination orphan journal")),
+        ("share_termination_evidence_mismatch","share_termination") => Ok(!crate::share_market_termination::evidence_valid_tx(conn,object_id)?),
+        ("share_termination_orphan_journal","journal") => conn.query_row("SELECT EXISTS(SELECT 1 FROM market_journal_transactions j WHERE id=?1 AND source_kind IN('share_termination','share_compensation') AND NOT EXISTS(SELECT 1 FROM share_termination_events e WHERE e.journal_id=j.id))",params![object_id],|r|r.get(0)).map_err(db_error("recheck Share orphan journal")),
         ("c2c_evidence_mismatch", "c2c_order") => Ok(!crate::market_c2c::evidence_valid_tx(conn, object_id)?),
         ("c2c_orphan_journal", "journal") => crate::market_c2c::orphan_journal_tx(conn, object_id),
         ("earning_conversion_allocation_mismatch", "earning_lot") =>
@@ -300,7 +308,7 @@ fn critical_case_still_failed_tx(
         ("period_unfulfilled_mismatch", "period") => {
             let projection = conn
                 .query_row(
-                    "SELECT period.amount_units - period.fulfilled_units - period.refunded_units - period.termination_compensation_units,
+                    "SELECT period.amount_units - period.fulfilled_units - period.refunded_units - period.termination_compensation_units - period.share_quota_units,
                         COALESCE((SELECT SUM(signed_units) FROM market_journal_postings
                                   WHERE account_kind = 'unfulfilled' AND subject_id = period.id), 0)
                      FROM market_platform_periods period WHERE period.id = ?1",
@@ -529,6 +537,54 @@ pub(crate) fn resolve_case_tx(
 
 pub(crate) fn audit_finance_tx(conn: &Connection, now: &str) -> Result<usize, AppError> {
     let mut opened = crate::market_c2c::audit_tx_cases(conn, now)?;
+    let cursor: String = conn
+        .query_row(
+            "SELECT share_termination_audit_cursor FROM market_finance_control WHERE id=1",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(db_error("read Share audit cursor"))?;
+    let ids = {
+        let mut q = conn
+            .prepare("SELECT id FROM share_market_terminations WHERE id>?1 ORDER BY id LIMIT 100")
+            .map_err(db_error("scan Share audit"))?;
+        q.query_map(params![cursor], |r| r.get::<_, String>(0))
+            .map_err(db_error("query Share audit"))?
+            .collect::<crate::db::Result<Vec<_>>>()
+            .map_err(db_error("read Share audit"))?
+    };
+    for id in &ids {
+        if !crate::share_market_termination::evidence_valid_tx(conn, id).unwrap_or(false) {
+            opened += case_tx(
+                conn,
+                "share_termination_evidence_mismatch",
+                "share_termination",
+                id,
+                now,
+            )?;
+        }
+    }
+    conn.execute(
+        "UPDATE market_finance_control SET share_termination_audit_cursor=?1 WHERE id=1",
+        params![ids.last().map(String::as_str).unwrap_or("")],
+    )
+    .map_err(db_error("advance Share audit cursor"))?;
+    let ids = {
+        let mut q=conn.prepare("SELECT id FROM market_journal_transactions j WHERE source_kind IN('share_termination','share_compensation') AND NOT EXISTS(SELECT 1 FROM share_termination_events e WHERE e.journal_id=j.id) LIMIT 100").map_err(db_error("scan Share orphan journals"))?;
+        q.query_map([], |r| r.get::<_, String>(0))
+            .map_err(db_error("query Share orphan journals"))?
+            .collect::<crate::db::Result<Vec<_>>>()
+            .map_err(db_error("read Share orphan journals"))?
+    };
+    for id in ids {
+        opened += case_tx(
+            conn,
+            "share_termination_orphan_journal",
+            "journal",
+            &id,
+            now,
+        )?;
+    }
     let termination_ids = {
         let mut s = conn
             .prepare("SELECT id FROM client_market_terminations")
@@ -610,6 +666,7 @@ pub(crate) fn audit_finance_tx(conn: &Connection, now: &str) -> Result<usize, Ap
         .prepare(
             "SELECT provider_user_id FROM market_provider_earning_lots
          UNION SELECT provider_user_id FROM client_termination_compensations
+         UNION SELECT provider_user_id FROM share_termination_income
          UNION SELECT subject_id FROM market_journal_postings
            WHERE account_kind IN ('provider_pending', 'provider_available', 'provider_held')",
         )
@@ -656,7 +713,7 @@ pub(crate) fn audit_finance_tx(conn: &Connection, now: &str) -> Result<usize, Ap
            ON posting.account_kind = 'unfulfilled' AND posting.subject_id = period.id
          GROUP BY period.id
          HAVING COALESCE(SUM(posting.signed_units), 0)
-             != -(period.amount_units - period.fulfilled_units - period.refunded_units - period.termination_compensation_units)
+             != -(period.amount_units - period.fulfilled_units - period.refunded_units - period.termination_compensation_units - period.share_quota_units)
          LIMIT 100",
         )
         .map_err(db_error("prepare unfulfilled audit"))?;

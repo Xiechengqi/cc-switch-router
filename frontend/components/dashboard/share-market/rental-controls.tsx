@@ -7,6 +7,7 @@ import { useAuth } from "@/components/auth/auth-provider";
 import { Button } from "@heroui/react";
 import { Loader2, RotateCcw } from "lucide-react";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
+import { ShareTerminationDialog, type ShareTerminationSelection } from "@/components/market/share-termination-dialog";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import { rentalTermProgress } from "@/components/dashboard/share-market/subscription-utils";
 import { useLocaleText } from "@/components/i18n/locale-provider";
@@ -130,12 +131,16 @@ export function RentalActions({
   t,
   busy,
   onRelease,
+  onTerminate,
+  onViewTermination,
 
 }: {
   subscription: ShareMarketSubscription;
   t: Translate;
   busy?: boolean;
   onRelease?: () => void;
+  onTerminate?: () => void;
+  onViewTermination?: () => void;
 
 }) {
 
@@ -145,9 +150,11 @@ export function RentalActions({
       {subscription.canRelease && !walletReleaseScheduled(subscription.walletContract, subscription.pricingModel) && onRelease ? (
         <Button size="sm" variant="outline" className="h-7 min-w-0 px-2 text-xs" isDisabled={busy} onClick={onRelease}>
           {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RotateCcw className="h-3.5 w-3.5" />}
-          {t("shareMarket.release")}
+          {t(subscription.pricingModel === "prepaid_calendar_month" ? "shareTermination.renewalOff" : "shareMarket.release")}
         </Button>
       ) : null}
+      {subscription.canTerminateImmediately && onTerminate ? <Button size="sm" variant="danger" className="h-7 min-w-0 px-2 text-xs" isDisabled={busy} onPress={onTerminate}>{t("shareTermination.title")}</Button> : null}
+      {subscription.terminationId && onViewTermination ? <Button size="sm" variant="outline" className="h-7 min-w-0 px-2 text-xs" onPress={onViewTermination}>{t("shareTermination.view")}</Button> : null}
     </div>
   );
 }
@@ -167,6 +174,8 @@ export function useShareMarketRentalActions(onChanged: () => Promise<void> | voi
   const [busyId, setBusyId] = React.useState("");
   const [action, setAction] = React.useState<PendingAction | null>(null);
   const [error, setError] = React.useState("");
+  const [termination, setTermination] = React.useState<ShareTerminationSelection | null>(null);
+  React.useEffect(() => { setTermination(null); }, [session?.user?.id]);
 
   const run = async (subscriptionId: string, operation: () => Promise<unknown>) => {
     if (busyId) return;
@@ -185,6 +194,8 @@ export function useShareMarketRentalActions(onChanged: () => Promise<void> | voi
   };
 
   const rowActions = (subscription: ShareMarketSubscription) => ({
+    onTerminate: subscription.canTerminateImmediately ? () => setTermination({ subscriptionId: subscription.id }) : undefined,
+    onViewTermination: subscription.terminationId ? () => setTermination({ id: subscription.terminationId! }) : undefined,
     onRelease: subscription.canRelease
       && !walletReleaseScheduled(subscription.walletContract, subscription.pricingModel)
       ? () => setAction({
@@ -201,7 +212,7 @@ export function useShareMarketRentalActions(onChanged: () => Promise<void> | voi
 
   });
 
-  const dialog = (
+  const dialog = (<>
     <ConfirmAlertDialog
       open={!!action}
       title={action?.title || ""}
@@ -213,6 +224,8 @@ export function useShareMarketRentalActions(onChanged: () => Promise<void> | voi
       onConfirm={() => action && void run(action.subscriptionId, action.run)}
       onOpenChange={(open) => !open && !busyId && setAction(null)}
     />
+    <ShareTerminationDialog selection={termination} onClose={() => setTermination(null)} onChanged={() => { void onChanged(); }} />
+    </>
   );
 
   return {
@@ -221,6 +234,6 @@ export function useShareMarketRentalActions(onChanged: () => Promise<void> | voi
     setError,
     rowActions,
     dialog,
-    interactionActive: !!busyId || !!action,
+    interactionActive: !!busyId || !!action || !!termination,
   };
 }

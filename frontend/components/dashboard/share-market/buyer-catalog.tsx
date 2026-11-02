@@ -150,6 +150,8 @@ function seatAction(
 }
 
 type RentalCardActions = {
+  onTerminate?: () => void;
+  onViewTermination?: () => void;
   onRelease?: () => void;
   onAcceptPrice?: () => void;
   onRejectPrice?: () => void;
@@ -204,6 +206,8 @@ function ListingCard({
                 t={t}
                 busy={busy}
                 onRelease={actions?.onRelease}
+                onTerminate={actions?.onTerminate}
+                onViewTermination={actions?.onViewTermination}
 
               />
             </div>
@@ -846,6 +850,7 @@ export function ShareMarketBuyerCatalog({
 
                       {rentTarget.quote.trialSecondsRemaining > 0 ? <p className="rounded-lg bg-emerald-50 px-3 py-3 text-xs leading-6 text-emerald-900">{t("marketTrial.checkout", { hours: (rentTarget.quote.trialSecondsRemaining / 3600).toFixed(1), tokens: rentTrialValue != null && rentTrialValue !== "0" ? `${formatUsdLimit(rentTrialValue)} ${t("shareMarket.quota.apiValue")}` : rentTrialBudget > 0 ? formatTokenMillions(rentTrialBudget, locale) : t("marketTrial.timeOnly") })}</p> : null}
                       {rentOffer?.trial?.unitLocked ? <p className="text-xs leading-5 text-muted-foreground">{t("shareMarket.rentConfirm.trialUnitLocked")}</p> : null}
+                      {rentOffer ? <p className="text-xs leading-5 text-muted-foreground">{rentOffer.terminationPolicy ? t("shareTermination.quote", { rate: rentOffer.terminationPolicy.rateBps / 100 }) : t("shareTermination.legacy")}</p> : null}
                       {rentOffer?.valueQuota ? <UsdSeatRentTerms offer={rentOffer} /> : null}
                       {rentCheckout.unsupported ? <p role="alert" className="rounded-md bg-rose-50 p-3 text-sm text-rose-800">{t("clientCheckout.unsupported")}</p> : null}
                       {rentWalletFunding ? (

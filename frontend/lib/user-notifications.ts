@@ -61,6 +61,9 @@ export function notificationKindKey(kind: string): MessageKey {
 
 /** Links are constructed locally; never follow a URL from notification payloads. */
 export function notificationHref(item: UserNotification): string {
+  if (item.objectKind === "share_termination" || item.eventKind === "share_termination_updated") {
+    return `/share-market/?terminationId=${encodeURIComponent(typeof item.payload.terminationId === "string" ? item.payload.terminationId : item.objectId)}`;
+  }
   if (item.objectKind === "client_termination" || item.eventKind.startsWith("client_termination_")) {
     return clientTerminationHref(typeof item.payload.terminationId === "string" ? item.payload.terminationId : item.objectId);
   }

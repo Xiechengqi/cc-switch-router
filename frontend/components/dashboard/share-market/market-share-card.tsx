@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import { ShareTerminationRowAction } from "@/components/market/share-termination-dialog";
 import { UserRound } from "lucide-react";
 import { ShareProviderStatusPanel } from "@/components/dashboard/share-provider-status-panel";
 import { MarketProviderLogos } from "@/components/dashboard/share-market/market-share-identity";
@@ -413,6 +414,7 @@ export function MarketShareCard({
         </p>
       </div>
       {footer}
+      <ShareTerminationRowAction shareId={listing.shareId} />
     </article>
   );
 }

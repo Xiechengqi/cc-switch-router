@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import { ShareTerminationRowAction } from "@/components/market/share-termination-dialog";
 import { ProviderCommissionPreview } from "@/components/market/provider-commission-preview";
 import { Button, Modal } from "@heroui/react";
 import {
@@ -1639,6 +1640,7 @@ const renderSeatActions = (listing: ShareMarketListing, seat: ShareMarketSeat) =
                                 </td>
                                 <td className="px-2 py-2">
                                   <div className="flex justify-end">{renderSeatActions(selected, seat)}</div>
+                                  <ShareTerminationRowAction shareId={selected.shareId} seatId={seat.id} />
                                 </td>
                               </tr>
                             );

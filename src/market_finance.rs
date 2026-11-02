@@ -398,6 +398,90 @@ pub(crate) fn record_monthly_delivery_tx(
     )
 }
 
+/// Quantity-based delivery on an immediately terminated Share. Uses the same
+/// commission, maturity, evidence and service-dispute rail as delivered time,
+/// but a distinct source kind; it does not invent a future service interval.
+pub(crate) fn record_share_quota_delivery_tx(
+    conn: &Connection,
+    t: &crate::share_market_termination::Termination,
+    units: i64,
+    at: &str,
+) -> Result<(), AppError> {
+    if units == 0 {
+        return Ok(());
+    }
+    let period = t
+        .period_id
+        .as_deref()
+        .ok_or_else(|| AppError::Internal("Share quota period missing".into()))?;
+    let contract = t
+        .contract_id
+        .as_deref()
+        .ok_or_else(|| AppError::Internal("Share quota contract missing".into()))?;
+    let (debit,debited,start):(String,String,String) = conn.query_row("SELECT debit_journal_id,debited_at,period_start FROM market_platform_periods WHERE id=?1 AND contract_id=?2",params![period,contract],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(db_error("read Share quantity delivery funding"))?;
+    if existing_slice_tx(
+        conn,
+        "share_quota",
+        &t.id,
+        &t.buyer_user_id,
+        &t.provider_user_id,
+        units,
+    )?
+    .is_some()
+    {
+        return Ok(());
+    }
+    validate_slice("share", &start, &t.cutoff_at, units)?;
+    if liability_balance_tx(conn, "unfulfilled", period)? < units {
+        return Err(AppError::Conflict(
+            "insufficient funded Share quota delivery".into(),
+        ));
+    }
+    let j = post_journal_tx(
+        conn,
+        "share_quota",
+        &t.id,
+        "earn",
+        &format!("{period}:{units}"),
+        &[
+            Posting {
+                kind: "unfulfilled",
+                subject_id: period,
+                signed_units: units,
+            },
+            Posting {
+                kind: "provider_pending",
+                subject_id: &t.provider_user_id,
+                signed_units: -units,
+            },
+        ],
+        at,
+    )?;
+    if !j.inserted {
+        return Err(AppError::Internal(
+            "Share quota earning evidence missing".into(),
+        ));
+    }
+    insert_slice_and_lot_tx(
+        conn,
+        "share",
+        contract,
+        "share_quota",
+        &t.id,
+        Some(period),
+        &t.buyer_user_id,
+        &t.provider_user_id,
+        &start,
+        &t.cutoff_at,
+        units,
+        &debit,
+        &j.id,
+        &debited,
+        at,
+    )?;
+    Ok(())
+}
+
 /// Recompute the `disputed` projection of the given lots from their active
 /// holds. Every hold change goes through this projection.
 fn recompute_lot_holds_tx(
@@ -733,6 +817,11 @@ pub(crate) fn provider_summary_tx(
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .map_err(db_error("read Client compensation summary"))?;
+    summary.gross_earned_units += gross;
+    summary.net_earned_units += gross;
+    summary.pending_units += pending;
+    summary.converted_units += credited;
+    let (gross,pending,credited):(i64,i64,i64)=conn.query_row("SELECT COALESCE(SUM(amount_units-commission_units),0),COALESCE(SUM(amount_units-commission_units-credited_units),0),COALESCE(SUM(credited_units),0) FROM share_termination_income WHERE provider_user_id=?1",params![provider_user_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(db_error("read Share compensation summary"))?;
     summary.gross_earned_units += gross;
     summary.net_earned_units += gross;
     summary.pending_units += pending;

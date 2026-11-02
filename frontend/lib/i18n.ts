@@ -12,6 +12,7 @@ import { earningConversionMessagesEn, earningConversionMessagesZh } from "@/lib/
 import { marketC2CMessagesEn, marketC2CMessagesZh } from "@/lib/market-c2c-messages";
 import { passwordMessagesEn, passwordMessagesZh } from "@/lib/password-messages";
 import { clientTerminationMessagesEn, clientTerminationMessagesZh } from "@/lib/client-termination-messages";
+import { shareTerminationMessagesEn, shareTerminationMessagesZh } from "@/lib/share-termination-messages";
 import { clientTrialMessagesEn, clientTrialMessagesZh } from "@/lib/client-trial-messages";
 import { notificationCenterMessagesEn, notificationCenterMessagesZh } from "@/lib/notification-center-messages";
 import { rentalAuditMessagesEn, rentalAuditMessagesZh } from "@/lib/client-rental-audit-messages";
@@ -35,6 +36,7 @@ export const messages = {
     ...notificationCenterMessagesEn,
     ...clientTrialMessagesEn,
     ...clientTerminationMessagesEn,
+    ...shareTerminationMessagesEn,
     ...passwordMessagesEn,
     "marketAccess.decision.inherit": "Use default",
     "marketAccess.decision.allow": "Allow",
@@ -3500,6 +3502,7 @@ export const messages = {
     ...notificationCenterMessagesZh,
     ...clientTrialMessagesZh,
     ...clientTerminationMessagesZh,
+    ...shareTerminationMessagesZh,
     ...passwordMessagesZh,
     "marketAccess.decision.inherit": "使用默认策略",
     "marketAccess.decision.allow": "允许",

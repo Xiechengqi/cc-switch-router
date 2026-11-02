@@ -152,6 +152,7 @@ jobs:
       - name: Test all market contracts
         # market_ does not match modules named share_market / client_market.
         # Keep full service-control coverage, not just wallet helper tests.
+        # market_ includes share_market_termination and its exact arithmetic.
         run: |
           bash scripts/ci/timed.sh 'Market contracts' cargo test --locked market_ -- --skip schema::tests
           bash scripts/ci/timed.sh 'Share rental contracts' cargo test --locked share_market::tests

@@ -2736,6 +2736,8 @@ export type ShareMarketSeatInput = {
 };
 
 export type ShareMarketSubscription = {
+  canTerminateImmediately?: boolean;
+  terminationId?: string;
   trial?: { phase: "trial" | "activating" | "paid" | "revoking"; tokenAllowance: number; tokensUsed: number; tokensRemaining: number | null; endReason?: string; valueAllowanceUsdMicros?: string; valueUsedUsdMicros?: string; valueRemainingUsdMicros?: string | null };
   id: string;
   seatId: string;
@@ -2958,6 +2960,7 @@ export type ShareMarketRentQuote = {
 
   walletFunding?: MarketWalletQuoteFunding;
   offer: {
+    terminationPolicy?: { version: number; rateBps: number };
     seatId: string;
     listingId: string;
     shareId: string;
