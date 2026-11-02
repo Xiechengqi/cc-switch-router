@@ -17289,12 +17289,18 @@ fn merge_account_quota_projections(
             }
             // Only a binding that was enforcing/scheduling USD fixes the
             // origin; legacy Token shadow bindings never did.
-            if let Some(previous) = previous
+            if let Some(prior) = previous
                 .get(&grant.email)
                 .filter(|g| g.policy.value_quota.is_some() || g.pending_value_quota.is_some())
-                .and_then(|g| g.value_metering.as_ref())
             {
-                if previous.value_metered_from_ms != binding.value_metered_from_ms {
+                if prior.value_metering.as_ref().is_some_and(|previous| {
+                    previous.value_metered_from_ms != binding.value_metered_from_ms
+                }) && !share_value_quotas::is_new_market_metering_scope(
+                    conn,
+                    &share.share_id,
+                    prior,
+                    grant,
+                )? {
                     return Err(AppError::Conflict(
                         "value metering origin is immutable".into(),
                     ));
@@ -29176,6 +29182,7 @@ fn gateway_share_label(share_id: &str) -> String {
 pub(crate) mod tests {
     use super::*;
     include!("store/share_value_quotas/signed_delivery_tests.rs");
+    include!("store/share_value_quotas/metering_scope_tests.rs");
     use crate::config::Config;
     use crate::models::{
         InstallationUpgradeLogEntry, ShareEditAckEnvelope, ShareEditAckPayload, ShareSyncOperation,

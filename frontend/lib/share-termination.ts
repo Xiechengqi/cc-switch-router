@@ -1,5 +1,21 @@
 import { authFetch } from "@/lib/auth";
 import { parseJson } from "@/lib/api";
+import type { MessageKey } from "@/lib/i18n";
+import type { ShareTerminationBlockedReason } from "@/lib/types";
+
+const BLOCKED_MESSAGES: Record<ShareTerminationBlockedReason, MessageKey> = {
+  service_not_started: "shareTermination.blocked.serviceNotStarted",
+  legacy_paid_period: "shareTermination.blocked.legacyPaidPeriod",
+  archive_unavailable: "shareTermination.blocked.archiveUnavailable",
+  archive_incomplete: "shareTermination.blocked.archiveIncomplete",
+  lifetime_archive_incomplete: "shareTermination.blocked.lifetimeArchiveIncomplete",
+  paid_period_expired: "shareTermination.blocked.paidPeriodExpired",
+  paid_period_rolling_over: "shareTermination.blocked.paidPeriodRollingOver",
+};
+
+export function shareTerminationBlockedMessage(reason: ShareTerminationBlockedReason | undefined) {
+  return reason && Object.hasOwn(BLOCKED_MESSAGES, reason) ? BLOCKED_MESSAGES[reason] : null;
+}
 
 export type ShareTerminationPolicy = { version: number; rateBps: number; canEdit?: boolean };
 export type ShareTerminationReason = "voluntary" | "provider_issue" | "platform_issue";

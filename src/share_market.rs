@@ -372,6 +372,9 @@ pub struct SeatView {
 pub struct SubscriptionView {
     pub can_terminate_immediately: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub termination_blocked_reason:
+        Option<crate::share_market_termination::TerminationBlockedReason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub termination_id: Option<String>,
     pub id: String,
     pub seat_id: String,
@@ -4904,6 +4907,9 @@ fn redact_public_subscription(subscription: &mut SubscriptionView) {
     subscription.wallet_contract_id = None;
     subscription.open_wallet_dispute = false;
     subscription.can_release = false;
+    subscription.can_terminate_immediately = false;
+    subscription.termination_blocked_reason = None;
+    subscription.termination_id = None;
     subscription.can_force_revoke = false;
     subscription.can_retry_grant = false;
     subscription.failure_code = None;
@@ -5083,11 +5089,19 @@ fn subscription_view(
     } else {
         false
     };
+    let (can_terminate_immediately, termination_blocked_reason) = if is_renter {
+        crate::share_market_termination::availability_tx(conn, &record.id)?
+    } else {
+        (false, None)
+    };
     Ok(SubscriptionView {
-        can_terminate_immediately: is_renter
-            && crate::share_market_termination::can_terminate_tx(conn, &record.id)?,
-        termination_id: crate::share_market_termination::for_subscription_tx(conn, &record.id)?
-            .map(|t| t.id),
+        can_terminate_immediately,
+        termination_blocked_reason,
+        termination_id: if is_renter || is_owner {
+            crate::share_market_termination::for_subscription_tx(conn, &record.id)?.map(|t| t.id)
+        } else {
+            None
+        },
         id: record.id.clone(),
         seat_id: record.seat_id,
         listing_id: record.listing_id,
@@ -14789,6 +14803,10 @@ mod tests {
         assert_eq!(idle.status, SEAT_AVAILABLE);
         assert!(idle.subscription.is_none());
         assert_ne!(rented.status, SEAT_AVAILABLE);
+        let public_subscription = rented.subscription.as_ref().unwrap();
+        assert!(!public_subscription.can_terminate_immediately);
+        assert!(public_subscription.termination_blocked_reason.is_none());
+        assert!(public_subscription.termination_id.is_none());
         assert_eq!(
             rented
                 .subscription

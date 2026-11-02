@@ -253,7 +253,54 @@ fn basis(c: &Connection, sub: &str, at: &str) -> Result<Termination, AppError> {
     )?;
     Ok(t)
 }
-fn eligible(c: &Connection, t: &Termination) -> Result<(), AppError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminationBlockedReason {
+    ServiceNotStarted,
+    LegacyPaidPeriod,
+    ArchiveUnavailable,
+    ArchiveIncomplete,
+    LifetimeArchiveIncomplete,
+    PaidPeriodExpired,
+    PaidPeriodRollingOver,
+}
+
+impl TerminationBlockedReason {
+    fn message(self) -> &'static str {
+        match self {
+            Self::ServiceNotStarted => {
+                "Share access is still being activated; the unstarted rental can be returned without a termination charge"
+            }
+            Self::LegacyPaidPeriod => {
+                "this historical paid period retains its original end-of-period cancellation terms"
+            }
+            Self::ArchiveUnavailable => {
+                "Share immediate termination requires an authoritative Server settlement archive"
+            }
+            Self::ArchiveIncomplete => {
+                "Share immediate termination requires an authoritative Server settlement archive covering this period"
+            }
+            Self::LifetimeArchiveIncomplete => {
+                "lifetime quota requires archive coverage from the first paid admission"
+            }
+            Self::PaidPeriodExpired => {
+                "paid interval expired; refresh the rental before terminating"
+            }
+            Self::PaidPeriodRollingOver => {
+                "paid period is rolling over; refresh before terminating"
+            }
+        }
+    }
+}
+
+fn blocked_reason(
+    c: &Connection,
+    t: &Termination,
+) -> Result<Option<TerminationBlockedReason>, AppError> {
+    use TerminationBlockedReason::*;
+    if t.period_id.is_some() && t.policy_version == 0 {
+        return Ok(Some(LegacyPaidPeriod));
+    }
     let since: Option<i64> = c
         .query_row(
             "SELECT termination_archive_since_ms FROM shares WHERE share_id=?1",
@@ -263,19 +310,14 @@ fn eligible(c: &Connection, t: &Termination) -> Result<(), AppError> {
         .optional()
         .map_err(db_error("verify Share settlement capability"))?
         .flatten();
-    if since.is_none_or(|since| since > t.period_start_ms) {
-        return Err(AppError::Conflict("Share immediate termination requires an authoritative Server settlement archive covering this period".into()));
-    }
-    if t.period_id.is_some() && t.policy_version == 0 {
-        return Err(AppError::Conflict(
-            "this historical paid period retains its original end-of-period cancellation terms"
-                .into(),
-        ));
+    let Some(since) = since else {
+        return Ok(Some(ArchiveUnavailable));
+    };
+    if since > t.period_start_ms {
+        return Ok(Some(ArchiveIncomplete));
     }
     if t.period_id.is_some() && time(&t.cutoff_at)?.timestamp_millis() > t.period_end_ms {
-        return Err(AppError::Conflict(
-            "paid interval expired; refresh the rental before terminating".into(),
-        ));
+        return Ok(Some(PaidPeriodExpired));
     }
     if let Some(contract) = t.contract_id.as_deref() {
         let (model, paid): (String, Option<String>) = c
@@ -286,31 +328,54 @@ fn eligible(c: &Connection, t: &Termination) -> Result<(), AppError> {
             )
             .map_err(db_error("verify Share billing phase"))?;
         if model == "calendar_month" && paid.is_some() && t.period_id.is_none() {
-            return Err(AppError::Conflict(
-                "paid period is rolling over; refresh before terminating".into(),
-            ));
+            return Ok(Some(PaidPeriodRollingOver));
         }
         if t.policy.token_period == crate::models::ShareTokenPeriod::Lifetime
             && paid
                 .as_deref()
                 .map(time)
                 .transpose()?
-                .is_some_and(|start| since.is_none_or(|s| s > start.timestamp_millis()))
+                .is_some_and(|start| since > start.timestamp_millis())
         {
-            return Err(AppError::Conflict(
-                "lifetime quota requires archive coverage from the first paid admission".into(),
-            ));
+            return Ok(Some(LifetimeArchiveIncomplete));
         }
+    }
+    Ok(None)
+}
+
+fn eligible(c: &Connection, t: &Termination) -> Result<(), AppError> {
+    if let Some(reason) = blocked_reason(c, t)? {
+        return Err(AppError::Conflict(reason.message().into()));
     }
     Ok(())
 }
-pub(crate) fn can_terminate_tx(c: &Connection, sub: &str) -> Result<bool, AppError> {
+
+pub(crate) fn availability_tx(
+    c: &Connection,
+    sub: &str,
+) -> Result<(bool, Option<TerminationBlockedReason>), AppError> {
     if for_subscription_tx(c, sub)?.is_some() {
-        return Ok(false);
+        return Ok((false, None));
     }
     match basis(c, sub, &Utc::now().to_rfc3339()) {
-        Ok(t) => Ok(eligible(c, &t).is_ok()),
-        Err(AppError::NotFound(_)) => Ok(false),
+        Ok(t) => {
+            let reason = blocked_reason(c, &t)?;
+            Ok((reason.is_none(), reason))
+        }
+        Err(AppError::NotFound(_)) => {
+            let pending: bool = c
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM share_market_subscriptions WHERE id=?1
+                    AND service_started_at IS NULL AND status NOT IN ('released','grant_failed'))",
+                    params![sub],
+                    |r| r.get(0),
+                )
+                .map_err(db_error("read Share activation state"))?;
+            Ok((
+                false,
+                pending.then_some(TerminationBlockedReason::ServiceNotStarted),
+            ))
+        }
         Err(e) => Err(e),
     }
 }

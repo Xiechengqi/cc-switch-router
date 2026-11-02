@@ -7,6 +7,7 @@ import {
   listingForRentalShare,
   needsRentalAttention,
   partitionShareMarketSubscriptions,
+  rentalReleaseMode,
   sortShareMarketSubscriptions,
   subscriptionsNeedGrantPolling,
 } from "./subscription-utils";
@@ -37,6 +38,21 @@ test("grant polling stays on until pending grants finish", () => {
     subscription("live", "active_free"),
     subscription("pending", "grant_pending"),
   ]), true);
+});
+
+test("monthly trials and pending activations are returned now while paid cancellation only disables renewal", () => {
+  const monthly = subscription("monthly", "active_postpaid", {
+    canRelease: true,
+    pricingModel: "prepaid_calendar_month",
+    walletContract: { id: "contract", status: "active", renewalPolicy: "automatic" } as ShareMarketSubscription["walletContract"],
+  });
+  assert.equal(rentalReleaseMode(monthly), "period_end");
+  assert.equal(rentalReleaseMode({ ...monthly, walletContract: { ...monthly.walletContract!, renewalPolicy: "manual" } }), null);
+  for (const status of ["trialing", "pending_activation", "suspended", "ending"] as const) {
+    assert.equal(rentalReleaseMode({ ...monthly, walletContract: { ...monthly.walletContract!, status } }), "immediate");
+  }
+  assert.equal(rentalReleaseMode({ ...monthly, pricingModel: "free", walletContract: undefined }), "immediate");
+  assert.equal(rentalReleaseMode({ ...monthly, canRelease: false }), null);
 });
 
 test("attention covers failures and integrity", () => {

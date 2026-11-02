@@ -143,6 +143,55 @@ fn db_error(error: impl std::fmt::Display) -> AppError {
     AppError::Internal(format!("Share value quota storage: {error}"))
 }
 
+/// A new Market rental owns a new metering origin, even when the email and
+/// Share are unchanged. Only a Router-issued replacement of a finished rental
+/// qualifies; changing a policy epoch or inventing an entitlement is not a reset.
+pub(super) fn is_new_market_metering_scope(
+    conn: &Connection,
+    share_id: &str,
+    prior: &ShareUserGrant,
+    next: &ShareUserGrant,
+) -> Result<bool, AppError> {
+    use crate::models::ShareGrantManager::RouterShareMarket;
+    if prior.manager != RouterShareMarket
+        || next.manager != RouterShareMarket
+        || prior.email != next.email
+    {
+        return Ok(false);
+    }
+    let (Some(previous_id), Some(next_id)) = (
+        prior.entitlement_id.as_deref(),
+        next.entitlement_id.as_deref(),
+    ) else {
+        return Ok(false);
+    };
+    if previous_id.is_empty() || next_id.is_empty() || previous_id == next_id {
+        return Ok(false);
+    }
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM share_market_subscriptions old
+            JOIN share_market_subscriptions next ON next.share_id=old.share_id
+                AND next.installation_id=old.installation_id
+                AND next.renter_user_id=old.renter_user_id
+                AND next.renter_email=old.renter_email
+            JOIN shares sh ON sh.share_id=next.share_id
+                AND sh.installation_id=next.installation_id
+            JOIN share_control_operations op ON op.subscription_id=next.id
+                AND op.entitlement_id=next.entitlement_id AND op.share_id=next.share_id
+                AND op.email=next.renter_email
+                AND op.action='upsert' AND op.attempts>0
+            WHERE old.share_id=?1 AND old.entitlement_id=?2
+                AND old.status IN ('released','grant_failed')
+                AND next.entitlement_id=?3 AND next.renter_email=?4
+                AND julianday(next.created_at)>=julianday(old.created_at)
+        )",
+        params![share_id, previous_id, next_id, next.email],
+        |r| r.get(0),
+    )
+    .map_err(db_error)
+}
+
 struct SettingsMeta {
     version: i64,
     revision: Option<String>,

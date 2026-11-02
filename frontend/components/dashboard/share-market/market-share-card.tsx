@@ -176,17 +176,26 @@ export function CatalogSeatPreview({
     <div
       role={interactive ? "button" : undefined}
       tabIndex={interactive ? 0 : undefined}
+      aria-haspopup={interactive ? "dialog" : undefined}
+      data-no-card-open={interactive || undefined}
+      data-catalog-seat={seat.id}
       className={cn(
         className,
         interactive
           ? "cursor-pointer hover:bg-slate-50 active:bg-slate-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
           : null,
       )}
-      onClick={interactive ? onSelect : undefined}
+      onClick={interactive ? (event) => {
+        event.stopPropagation();
+        onSelect?.();
+      } : undefined}
       onKeyDown={interactive ? (event) => {
+        // A nested Rent button owns its keyboard activation, not the seat row.
+        if (event.target !== event.currentTarget) return;
         if (event.key === "Enter" || event.key === " ") {
           event.preventDefault();
-          onSelect?.();
+          event.stopPropagation();
+          if (!event.repeat) onSelect?.();
         }
       } : undefined}
     >

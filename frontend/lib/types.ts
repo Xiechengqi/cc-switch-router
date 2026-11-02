@@ -2735,8 +2735,18 @@ export type ShareMarketSeatInput = {
   trialValueLimitUsdMicros?: string;
 };
 
+export type ShareTerminationBlockedReason =
+  | "service_not_started"
+  | "legacy_paid_period"
+  | "archive_unavailable"
+  | "archive_incomplete"
+  | "lifetime_archive_incomplete"
+  | "paid_period_expired"
+  | "paid_period_rolling_over";
+
 export type ShareMarketSubscription = {
   canTerminateImmediately?: boolean;
+  terminationBlockedReason?: ShareTerminationBlockedReason;
   terminationId?: string;
   trial?: { phase: "trial" | "activating" | "paid" | "revoking"; tokenAllowance: number; tokensUsed: number; tokensRemaining: number | null; endReason?: string; valueAllowanceUsdMicros?: string; valueUsedUsdMicros?: string; valueRemainingUsdMicros?: string | null };
   id: string;

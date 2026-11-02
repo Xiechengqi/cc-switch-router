@@ -1,5 +1,5 @@
 "use client";
-import { walletLifecycleKey, walletReleaseScheduled, trialHours } from "@/lib/client-checkout";
+import { walletLifecycleKey, trialHours } from "@/lib/client-checkout";
 import { shareTrialSummary } from "@/lib/share-trial";
 
 import * as React from "react";
@@ -9,7 +9,7 @@ import { Loader2, RotateCcw } from "lucide-react";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { ShareTerminationDialog, type ShareTerminationSelection } from "@/components/market/share-termination-dialog";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
-import { rentalTermProgress } from "@/components/dashboard/share-market/subscription-utils";
+import { rentalReleaseMode, rentalTermProgress } from "@/components/dashboard/share-market/subscription-utils";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { releaseShareMarketSubscription } from "@/lib/api";
 import { formatUsdMoney } from "@/lib/market-money";
@@ -17,6 +17,7 @@ import { notifyMarketBalanceChanged } from "@/lib/market-balance-events";
 import { SHARE_APP_LABELS } from "@/lib/share-app";
 import type { ShareMarketSubscription } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { shareTerminationBlockedMessage } from "@/lib/share-termination";
 import {
   isCoreShareApp,
   shareMarketMutationError,
@@ -144,17 +145,23 @@ export function RentalActions({
 
 }) {
 
+  const releaseMode = rentalReleaseMode(subscription);
+  const blockedMessage = !subscription.canTerminateImmediately && !subscription.terminationId
+    && subscription.status !== "revoke_pending" && subscription.status !== "revoke_failed"
+    ? shareTerminationBlockedMessage(subscription.terminationBlockedReason)
+    : null;
   return (
     <div className="flex shrink-0 flex-wrap items-center justify-end gap-1">
 
-      {subscription.canRelease && !walletReleaseScheduled(subscription.walletContract, subscription.pricingModel) && onRelease ? (
+      {releaseMode && onRelease ? (
         <Button size="sm" variant="outline" className="h-7 min-w-0 px-2 text-xs" isDisabled={busy} onClick={onRelease}>
           {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RotateCcw className="h-3.5 w-3.5" />}
-          {t(subscription.pricingModel === "prepaid_calendar_month" ? "shareTermination.renewalOff" : "shareMarket.release")}
+          {t(releaseMode === "period_end" ? "shareTermination.renewalOff" : "shareMarket.release")}
         </Button>
       ) : null}
       {subscription.canTerminateImmediately && onTerminate ? <Button size="sm" variant="danger" className="h-7 min-w-0 px-2 text-xs" isDisabled={busy} onPress={onTerminate}>{t("shareTermination.title")}</Button> : null}
       {subscription.terminationId && onViewTermination ? <Button size="sm" variant="outline" className="h-7 min-w-0 px-2 text-xs" onPress={onViewTermination}>{t("shareTermination.view")}</Button> : null}
+      {blockedMessage ? <p className="basis-full text-xs leading-5 text-muted-foreground">{t(blockedMessage)}</p> : null}
     </div>
   );
 }
@@ -196,15 +203,15 @@ export function useShareMarketRentalActions(onChanged: () => Promise<void> | voi
   const rowActions = (subscription: ShareMarketSubscription) => ({
     onTerminate: subscription.canTerminateImmediately ? () => setTermination({ subscriptionId: subscription.id }) : undefined,
     onViewTermination: subscription.terminationId ? () => setTermination({ id: subscription.terminationId! }) : undefined,
-    onRelease: subscription.canRelease
-      && !walletReleaseScheduled(subscription.walletContract, subscription.pricingModel)
+    onRelease: rentalReleaseMode(subscription)
       ? () => setAction({
         subscriptionId: subscription.id,
-        title: t(subscription.walletContract?.status === "active" && subscription.pricingModel === "prepaid_calendar_month"
-          ? "shareMarket.confirm.releaseMonthlyTitle" : "shareMarket.confirm.releaseTitle"),
-        description: subscription.walletContract?.status === "active" && subscription.pricingModel === "prepaid_calendar_month"
-          ? t("shareMarket.confirm.releaseMonthlyDescription", { share: subscription.shareName, time: formatUtcDateTime(subscription.walletContract.periodEnd, locale) })
-          : t("shareMarket.confirm.releaseDescription", { share: subscription.shareName }),
+        title: t(rentalReleaseMode(subscription) === "period_end"
+          ? "shareMarket.confirm.releaseMonthlyTitle"
+          : subscription.pricingModel === "prepaid_calendar_month" ? "shareMarket.confirm.releaseImmediateTitle" : "shareMarket.confirm.releaseTitle"),
+        description: rentalReleaseMode(subscription) === "period_end"
+          ? t("shareMarket.confirm.releaseMonthlyDescription", { share: subscription.shareName, time: formatUtcDateTime(subscription.walletContract?.periodEnd, locale) })
+          : t(subscription.pricingModel === "prepaid_calendar_month" ? "shareMarket.confirm.releaseImmediateDescription" : "shareMarket.confirm.releaseDescription", { share: subscription.shareName }),
         label: t("shareMarket.release"),
         run: () => releaseShareMarketSubscription(subscription.id),
       })

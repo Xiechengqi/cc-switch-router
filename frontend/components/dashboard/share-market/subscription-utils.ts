@@ -22,6 +22,17 @@ function isTerminalSubscription(status: string) {
   return status === "released" || status === "grant_failed";
 }
 
+/** A monthly trial/pending activation is returned now, not cancelled at expiry. */
+export function rentalReleaseMode(subscription: Pick<ShareMarketSubscription,
+  "canRelease" | "pricingModel" | "walletContract"
+>): "period_end" | "immediate" | null {
+  if (!subscription.canRelease) return null;
+  if (subscription.pricingModel === "prepaid_calendar_month" && subscription.walletContract?.status === "active") {
+    return subscription.walletContract.renewalPolicy === "manual" ? null : "period_end";
+  }
+  return "immediate";
+}
+
 export function isHistorySubscription(status: string) {
   return status === "released";
 }

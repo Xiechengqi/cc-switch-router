@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseShareTermination, parseShareTerminationPreview, shareTerminationHref, shareTerminationNoteValid, shareTerminationUnits, type ShareTermination } from "./share-termination";
+import { parseShareTermination, parseShareTerminationPreview, shareTerminationBlockedMessage, shareTerminationHref, shareTerminationNoteValid, shareTerminationUnits, type ShareTermination } from "./share-termination";
 import { shareTerminationMessagesEn, shareTerminationMessagesZh } from "./share-termination-messages";
 
 const at = "2026-11-02T00:00:00Z";
@@ -42,4 +42,20 @@ test("Share explanation bounds are UTF-8 bytes and deep links cannot escape thei
 test("Share termination messages have complete bilingual coverage", () => {
   assert.deepEqual(Object.keys(shareTerminationMessagesEn).sort(), Object.keys(shareTerminationMessagesZh).sort());
   for (const [key, value] of Object.entries(shareTerminationMessagesZh)) assert.ok(value, key);
+});
+
+test("Share termination blockers explain unavailable actions without guessing missing or unknown capabilities", () => {
+  assert.equal(shareTerminationBlockedMessage(undefined), null);
+  for (const [reason, suffix] of [
+    ["service_not_started", "serviceNotStarted"], ["legacy_paid_period", "legacyPaidPeriod"],
+    ["archive_unavailable", "archiveUnavailable"], ["archive_incomplete", "archiveIncomplete"],
+    ["lifetime_archive_incomplete", "lifetimeArchiveIncomplete"], ["paid_period_expired", "paidPeriodExpired"],
+    ["paid_period_rolling_over", "paidPeriodRollingOver"],
+  ] as const) {
+    assert.equal(shareTerminationBlockedMessage(reason), `shareTermination.blocked.${suffix}`);
+    const key = shareTerminationBlockedMessage(reason)! as keyof typeof shareTerminationMessagesEn;
+    assert.ok(shareTerminationMessagesEn[key]);
+    assert.ok(shareTerminationMessagesZh[key]);
+  }
+  assert.equal(shareTerminationBlockedMessage("future_reason" as Parameters<typeof shareTerminationBlockedMessage>[0]), null);
 });

@@ -38,6 +38,7 @@ import {
 } from "@/components/dashboard/share-market/market-share-card";
 import { ShareModelHealthHeatmap } from "@/components/dashboard/share-model-health-heatmap";
 import { ListingPricingCard } from "@/components/dashboard/share-market/listing-pricing-card";
+import { CatalogSeatDialog } from "@/components/dashboard/share-market/catalog-seat-dialog";
 import { drawerDialogClassName } from "@/components/dashboard/share-dashboard-utils";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ApiError, quoteShareMarketSeat, rentShareMarketSeat } from "@/lib/api";
@@ -72,6 +73,8 @@ import {
 } from "@/components/dashboard/share-market/market-utils";
 import {
   catalogOwnerOptions,
+  catalogSeatSubscription,
+  catalogSeatTarget,
   filterMergedCatalogListings,
   initialCatalogSeat,
   MARKET_CATALOG_PAGE_SIZE,
@@ -82,6 +85,7 @@ import {
   rentedShareIdsFromSubscriptions,
   showRentQuoteCountdown,
   sortCatalogListings,
+  type CatalogSeatSelection,
   type MarketCatalogSort,
 } from "@/components/dashboard/share-market/buyer-catalog-utils";
 import { SeatDiscountNote, USD_SEAT_PARALLEL_CAP, UsdSeatRentTerms } from "@/components/dashboard/share-market/seat-value-quota";
@@ -161,6 +165,7 @@ function ListingCard({
   listing,
   focused,
   onOpen,
+  onOpenSeat,
   onRent,
   subscription,
   busy,
@@ -168,7 +173,8 @@ function ListingCard({
 }: {
   listing: ShareMarketListing;
   focused: boolean;
-  onOpen: (seat?: ShareMarketSeat) => void;
+  onOpen: () => void;
+  onOpenSeat: (seat: ShareMarketSeat) => void;
   onRent?: (seat: ShareMarketSeat) => void;
   subscription?: ShareMarketSubscription;
   busy?: boolean;
@@ -190,7 +196,7 @@ function ListingCard({
           <CatalogSeatPreviewList
             listing={listing}
             seats={listing.seats}
-            onOpen={onOpen}
+            onOpen={(seat) => seat ? onOpenSeat(seat) : onOpen()}
             onRent={onRent}
             preferredSeatIds={mineSeatIds}
             mineSeatIds={mineSeatIds}
@@ -314,6 +320,7 @@ export function ShareMarketBuyerCatalog({
   const [sort, setSort] = React.useState<MarketCatalogSort>("recommended");
   const [page, setPage] = React.useState(1);
   const [selected, setSelected] = React.useState<SelectedListing | null>(null);
+  const [seatSelection, setSeatSelection] = React.useState<CatalogSeatSelection | null>(null);
   const [rentTarget, setRentTarget] = React.useState<RentTarget | null>(null);
   const [rentAutoRenew, setRentAutoRenew] = React.useState(false);
   const [accessTarget, setAccessTarget] = React.useState<(SeatCard & { eligibility: MarketEligibility }) | null>(null);
@@ -325,7 +332,7 @@ export function ShareMarketBuyerCatalog({
   const focusedRef = React.useRef("");
   const skipPageResetRef = React.useRef(false);
   const rentals = useShareMarketRentalActions(onChanged);
-  const pausePolling = !!rentTarget || !!accessTarget || !!busySeatId || rentals.interactionActive;
+  const pausePolling = !!seatSelection || !!rentTarget || !!accessTarget || !!busySeatId || rentals.interactionActive;
 
   React.useEffect(() => {
     onInteractionChange?.(pausePolling);
@@ -347,6 +354,13 @@ export function ShareMarketBuyerCatalog({
     () => mergeCatalogWithRentedListings(catalog.listings, authed ? rentedListings : []),
     [authed, catalog.listings, rentedListings],
   );
+  const seatTarget = React.useMemo(
+    () => catalogSeatTarget(mergedListings, seatSelection),
+    [mergedListings, seatSelection],
+  );
+  React.useEffect(() => {
+    if (seatSelection && !seatTarget) setSeatSelection(null);
+  }, [seatSelection, seatTarget]);
   const filteredListings = React.useMemo(
     () => sortCatalogListings(
       filterMergedCatalogListings(mergedListings, {
@@ -404,27 +418,52 @@ export function ShareMarketBuyerCatalog({
     const nextPage = pageForShareId(filteredListings, focusedShareId, MARKET_CATALOG_PAGE_SIZE);
     skipPageResetRef.current = true;
     setPage(nextPage);
+    setSeatSelection(null);
     setSelected({ listing });
     window.requestAnimationFrame(() => document.getElementById(`share-market-catalog-${focusedShareId}`)?.scrollIntoView({ block: "start" }));
   }, [filteredListings, focusedShareId, mergedListings]);
 
-  const openListing = (listing: ShareMarketListing, seat?: ShareMarketSeat) => {
+  const closeDetails = () => {
+    setSelected(null);
+    setSeatSelection(null);
+  };
+
+  const openListing = (listing: ShareMarketListing) => {
     setError("");
     setRentNotice("");
     setRentQuoteInvalidated(false);
+    setSeatSelection(null);
     setSelected({
       listing,
-      seat: initialCatalogSeat(listing.seats, seat),
+      seat: initialCatalogSeat(listing.seats),
     });
+    void onChanged();
+  };
+
+  const openSeat = (listing: ShareMarketListing, seat: ShareMarketSeat) => {
+    setError("");
+    setRentNotice("");
+    setRentQuoteInvalidated(false);
+    setSelected(null);
+    setSeatSelection({ shareId: listing.shareId, seatId: seat.id });
     void onChanged();
   };
 
   const triggerSeat = async (item: SeatCard) => {
     const action = seatAction(item.listing, item.seat, subscriptions, authed);
-    if (action === "login") return window.dispatchEvent(new Event("router-open-login"));
-    if (action === "selling") return onSwitchSelling?.();
+    if (action === "login") {
+      closeDetails();
+      return window.dispatchEvent(new Event("router-open-login"));
+    }
+    if (action === "selling") {
+      closeDetails();
+      return onSwitchSelling?.();
+    }
     if (action === "rented" || action === "granting") return;
-    if (action === "approval") return setAccessTarget({ ...item, eligibility: item.seat.eligibility });
+    if (action === "approval") {
+      closeDetails();
+      return setAccessTarget({ ...item, eligibility: item.seat.eligibility });
+    }
     if (action !== "rent" || busySeatId) return;
     setBusySeatId(item.seat.id);
     setError("");
@@ -433,12 +472,14 @@ export function ShareMarketBuyerCatalog({
       const quote = await quoteShareMarketSeat(item.seat.id);
       setRentQuoteInvalidated(false);
       setRentAutoRenew(false);
-
+      closeDetails();
       setRentTarget({ ...item, quote, idempotencyKey: `share-rent:${quote.id}:${crypto.randomUUID()}` });
     } catch (reason) {
       const eligibility = marketEligibilityFromError(reason);
-      if (eligibility) setAccessTarget({ ...item, eligibility });
-      else setError(shareMarketMutationError(reason, t));
+      if (eligibility) {
+        closeDetails();
+        setAccessTarget({ ...item, eligibility });
+      } else setError(shareMarketMutationError(reason, t));
     } finally {
       setBusySeatId("");
     }
@@ -521,6 +562,22 @@ export function ShareMarketBuyerCatalog({
     }
   };
 
+  const selectedSubscription = selected
+    ? activeSubscriptionForShare(subscriptions, selected.listing.shareId)
+    : undefined;
+  const selectedRentalActions = selectedSubscription ? rentals.rowActions(selectedSubscription) : undefined;
+  const runRentalDetailAction = (action?: () => void) => {
+    if (!action) return;
+    closeDetails();
+    action();
+  };
+  const seatSubscription = catalogSeatSubscription(subscriptions, seatSelection);
+  const seatRentalActions = seatSubscription ? rentals.rowActions(seatSubscription) : undefined;
+  const detailSeatAction = seatTarget
+    ? !seatTarget.listing.isOwner && !isSeatIdle(seatTarget.seat)
+      ? "unavailable"
+      : seatAction(seatTarget.listing, seatTarget.seat, subscriptions, authed)
+    : "unavailable";
   const selectedAction = selected?.seat
     ? seatAction(selected.listing, selected.seat, subscriptions, authed)
     : "unavailable";
@@ -696,7 +753,8 @@ export function ShareMarketBuyerCatalog({
               key={listing.id}
               listing={listing}
               focused={focusedShareId === listing.shareId}
-              onOpen={(seat) => openListing(listing, seat)}
+              onOpen={() => openListing(listing)}
+              onOpenSeat={(seat) => openSeat(listing, seat)}
               onRent={(seat) => void triggerSeat({ listing, seat })}
               subscription={subscription}
               busy={subscription ? rentals.busyId === subscription.id : false}
@@ -734,7 +792,7 @@ export function ShareMarketBuyerCatalog({
                 <Drawer.Heading className="truncate text-base">{selected?.listing.shareName}</Drawer.Heading>
               </div>
             </Drawer.Header>
-            <Drawer.Body className="overflow-y-auto pb-28">
+            <Drawer.Body className="min-h-0 overflow-y-auto">
               {selected ? (
                 <div className="grid gap-5">
                   <section className="grid gap-3">
@@ -778,24 +836,59 @@ export function ShareMarketBuyerCatalog({
               ) : null}
             </Drawer.Body>
             {selected ? (
-              <div className="absolute inset-x-0 bottom-0 flex items-center justify-between gap-3 border-t border-slate-200 bg-white px-5 py-4">
+              <div className="grid shrink-0 gap-3 border-t border-slate-200 bg-white pt-4">
                 <div className="min-w-0">
-                  <strong className="block truncate text-sm">{selected.seat ? `${t("shareMarket.catalog.seatPosition", { position: selected.seat.position })} · ${formatSeatPrice(selected.seat, locale, t("shareMarket.free"), t("market.day"))}` : t("shareMarket.catalog.selectSeatFirst")}</strong>
-                  <span className="text-xs text-slate-500">{selected.seat?.rentBlockReason ? t(rentBlockReasonKey(selected.seat.rentBlockReason)) : t("shareMarket.catalog.frozenTermsHint")}</span>
+                  <strong className="block truncate text-sm">{selectedSubscription
+                    ? `${t("shareMarket.catalog.seatPosition", { position: selectedSubscription.seatPosition })} · ${actionLabel("rented", t)}`
+                    : selected.seat ? `${t("shareMarket.catalog.seatPosition", { position: selected.seat.position })} · ${formatSeatPrice(selected.seat, locale, t("shareMarket.free"), t("market.day"))}` : t("shareMarket.catalog.selectSeatFirst")}</strong>
+                  {selectedSubscription ? <RentalTermLine subscription={selectedSubscription} />
+                    : <span className="text-xs text-slate-500">{selected.seat?.rentBlockReason ? t(rentBlockReasonKey(selected.seat.rentBlockReason)) : t("shareMarket.catalog.frozenTermsHint")}</span>}
                 </div>
-                <Button
+                {selectedSubscription ? <RentalActions
+                  subscription={selectedSubscription}
+                  t={t}
+                  busy={rentals.busyId === selectedSubscription.id}
+                  onRelease={selectedRentalActions?.onRelease ? () => runRentalDetailAction(selectedRentalActions.onRelease) : undefined}
+                  onTerminate={selectedRentalActions?.onTerminate ? () => runRentalDetailAction(selectedRentalActions.onTerminate) : undefined}
+                  onViewTermination={selectedRentalActions?.onViewTermination ? () => runRentalDetailAction(selectedRentalActions.onViewTermination) : undefined}
+                /> : <Button
                   variant="primary"
                   isDisabled={!selected.seat || selectedAction === "unavailable" || selectedAction === "rented" || selectedAction === "granting" || !!busySeatId}
                   onClick={() => selected.seat && void triggerSeat({ listing: selected.listing, seat: selected.seat })}
                 >
                   {busySeatId || selectedAction === "granting" ? <Loader2 className="h-4 w-4 animate-spin" /> : selectedAction === "approval" ? <Send className="h-4 w-4" /> : selectedAction === "login" ? <LogIn className="h-4 w-4" /> : selectedAction === "rented" ? <Check className="h-4 w-4" /> : <ShoppingCart className="h-4 w-4" />}
                   {selected.seat ? actionLabel(selectedAction, t) : t("shareMarket.catalog.chooseSeat")}
-                </Button>
+                </Button>}
               </div>
             ) : null}
           </Drawer.Dialog>
         </Drawer.Content>
       </Drawer.Backdrop>
+
+      <CatalogSeatDialog
+        target={seatTarget}
+        subscription={seatSubscription}
+        busy={!!busySeatId || !!seatSubscription && rentals.busyId === seatSubscription.id}
+        error={error}
+        blockedReason={!seatSubscription && seatTarget?.seat.rentBlockReason
+          ? t(rentBlockReasonKey(seatTarget.seat.rentBlockReason)) : undefined}
+        onClose={() => !busySeatId && setSeatSelection(null)}
+        action={seatSubscription ? <RentalActions
+          subscription={seatSubscription}
+          t={t}
+          busy={rentals.busyId === seatSubscription.id}
+          onRelease={seatRentalActions?.onRelease ? () => runRentalDetailAction(seatRentalActions.onRelease) : undefined}
+          onTerminate={seatRentalActions?.onTerminate ? () => runRentalDetailAction(seatRentalActions.onTerminate) : undefined}
+          onViewTermination={seatRentalActions?.onViewTermination ? () => runRentalDetailAction(seatRentalActions.onViewTermination) : undefined}
+        /> : <Button
+          variant="primary"
+          isDisabled={!seatTarget || detailSeatAction === "unavailable" || detailSeatAction === "rented" || detailSeatAction === "granting" || !!busySeatId}
+          onClick={() => seatTarget && void triggerSeat(seatTarget)}
+        >
+          {busySeatId ? <Loader2 className="h-4 w-4 animate-spin" /> : detailSeatAction === "approval" ? <Send className="h-4 w-4" /> : detailSeatAction === "login" ? <LogIn className="h-4 w-4" /> : <ShoppingCart className="h-4 w-4" />}
+          {actionLabel(detailSeatAction, t)}
+        </Button>}
+      />
 
       <Modal.Backdrop isOpen={!!rentTarget} onOpenChange={(open) => !open && closeRentDialog()}>
         <Modal.Container placement="center">

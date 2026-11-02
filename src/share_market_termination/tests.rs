@@ -142,6 +142,10 @@ fn receipt(c: &Connection, t: &Termination, used: &str) -> TerminationReceipt {
 fn historical_periods_gain_no_terms_and_new_terms_are_immutable() {
     let (c, contract, at) = fixture(false);
     assert!(preview_tx(&c, "sub", "buyer", &at).is_err());
+    assert_eq!(
+        blocked_reason(&c, &basis(&c, "sub", &at).unwrap()).unwrap(),
+        Some(TerminationBlockedReason::LegacyPaidPeriod)
+    );
     assert_eq!(c.query_row("SELECT COUNT(*) FROM share_termination_period_terms WHERE period_id IN(SELECT id FROM market_platform_periods WHERE contract_id=?1)",params![contract],|r|r.get::<_,i64>(0)).unwrap(),0);
     let (c, _, at) = fixture(true);
     let t = basis(&c, "sub", &at).unwrap();
@@ -155,6 +159,76 @@ fn historical_periods_gain_no_terms_and_new_terms_are_immutable() {
             .is_err()
     );
 }
+
+#[test]
+fn termination_blockers_distinguish_missing_archive_incomplete_history_and_expired_periods() {
+    use TerminationBlockedReason::*;
+    let (c, _, at) = fixture(true);
+    let mut t = basis(&c, "sub", &at).unwrap();
+    assert_eq!(blocked_reason(&c, &t).unwrap(), None);
+    c.execute(
+        "UPDATE shares SET termination_archive_since_ms=NULL WHERE share_id='share'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(blocked_reason(&c, &t).unwrap(), Some(ArchiveUnavailable));
+    c.execute(
+        "UPDATE shares SET termination_archive_since_ms=?1 WHERE share_id='share'",
+        params![t.period_start_ms + 1],
+    )
+    .unwrap();
+    assert_eq!(blocked_reason(&c, &t).unwrap(), Some(ArchiveIncomplete));
+    t.period_start_ms += 86_400_000;
+    c.execute(
+        "UPDATE shares SET termination_archive_since_ms=?1 WHERE share_id='share'",
+        params![t.period_start_ms],
+    )
+    .unwrap();
+    assert_eq!(
+        blocked_reason(&c, &t).unwrap(),
+        Some(LifetimeArchiveIncomplete)
+    );
+    c.execute(
+        "UPDATE shares SET termination_archive_since_ms=0 WHERE share_id='share'",
+        [],
+    )
+    .unwrap();
+    t.cutoff_at = chrono::DateTime::from_timestamp_millis(t.period_end_ms + 1)
+        .unwrap()
+        .to_rfc3339();
+    assert_eq!(blocked_reason(&c, &t).unwrap(), Some(PaidPeriodExpired));
+    assert_eq!(
+        serde_json::to_value(ArchiveIncomplete).unwrap(),
+        "archive_incomplete"
+    );
+}
+
+#[test]
+fn unstarted_rental_reports_return_path_and_existing_termination_does_not_offer_a_second_request() {
+    let (c, _, at) = fixture_with_trial(true, 3600);
+    c.execute(
+        "UPDATE share_market_subscriptions SET service_started_at=NULL WHERE id='sub'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        availability_tx(&c, "sub").unwrap(),
+        (false, Some(TerminationBlockedReason::ServiceNotStarted))
+    );
+    c.execute(
+        "UPDATE share_market_subscriptions SET service_started_at=?1 WHERE id='sub'",
+        params![START],
+    )
+    .unwrap();
+    accept(&c, &at, "voluntary");
+    assert_eq!(availability_tx(&c, "sub").unwrap(), (false, None));
+    let empty = Connection::open_in_memory().unwrap();
+    assert!(matches!(
+        availability_tx(&empty, "sub"),
+        Err(AppError::Internal(_))
+    ));
+}
+
 #[test]
 fn no_return_without_final_original_receipt_and_replay_is_idempotent() {
     let (c, _, at) = fixture(true);

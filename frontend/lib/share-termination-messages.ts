@@ -40,6 +40,13 @@ export const shareTerminationMessagesEn = {
   "shareTermination.eventWaive": "Provider reduced compensation", "shareTermination.eventResolve": "Owner decision recorded",
   "shareTermination.eventWithdraw": "Buyer closed claim", "shareTermination.eventTimeout": "Compensation waived after deadline",
   "shareTermination.eventUpdated": "Progress updated",
+  "shareTermination.blocked.serviceNotStarted": "Access is being activated. Use Return to cancel this unstarted rental.",
+  "shareTermination.blocked.legacyPaidPeriod": "This paid period predates immediate-termination terms. You can stop renewal at expiry.",
+  "shareTermination.blocked.archiveUnavailable": "Immediate termination needs the Provider's Server settlement support. You can still stop renewal.",
+  "shareTermination.blocked.archiveIncomplete": "The Server archive does not cover this paid period. An immediate return cannot be calculated safely.",
+  "shareTermination.blocked.lifetimeArchiveIncomplete": "Lifetime-quota usage before this period is not fully archived. Immediate settlement is unavailable.",
+  "shareTermination.blocked.paidPeriodExpired": "This paid period has ended. Refresh the rental status.",
+  "shareTermination.blocked.paidPeriodRollingOver": "The next paid period is being confirmed. Refresh shortly to end the rental.",
 } as const;
 export const shareTerminationMessagesZh: Record<keyof typeof shareTerminationMessagesEn, string> = {
   "shareTermination.title": "立即退租 Share", "shareTermination.details": "Share 退租结算",
@@ -81,4 +88,11 @@ export const shareTerminationMessagesZh: Record<keyof typeof shareTerminationMes
   "shareTermination.eventWaive": "Provider 已减免补偿", "shareTermination.eventResolve": "Owner 已裁决",
   "shareTermination.eventWithdraw": "用户已关闭追讨", "shareTermination.eventTimeout": "超时自动免除补偿",
   "shareTermination.eventUpdated": "进度已更新",
+  "shareTermination.blocked.serviceNotStarted": "正在开通授权，可点击「归还」取消尚未开始的租用。",
+  "shareTermination.blocked.legacyPaidPeriod": "本付费周期早于立即退租条款生效，当前可选择到期不续租。",
+  "shareTermination.blocked.archiveUnavailable": "供应方 Server 尚未提供退租结算支持，当前仍可关闭续租。",
+  "shareTermination.blocked.archiveIncomplete": "Server 归档未覆盖本付费周期，暂无法安全计算立即退租返还金额。",
+  "shareTermination.blocked.lifetimeArchiveIncomplete": "累计额度缺少此前的完整用量归档，暂无法立即结算退租。",
+  "shareTermination.blocked.paidPeriodExpired": "本付费周期已结束，请刷新租用状态。",
+  "shareTermination.blocked.paidPeriodRollingOver": "正在确认下一付费周期，请稍后刷新再退租。",
 };

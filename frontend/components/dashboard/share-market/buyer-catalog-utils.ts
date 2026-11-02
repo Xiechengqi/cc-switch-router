@@ -6,6 +6,7 @@ import type {
 } from "@/lib/types";
 import {
   PROVIDER_FAMILY_ORDER,
+  isTerminalSubscription,
   listingIdleCount,
   listingBestValueRatio,
   listingLowestDailyRate,
@@ -16,6 +17,31 @@ import {
 } from "@/components/dashboard/share-market/subscription-utils";
 
 type SelectableSeat = Pick<ShareMarketSeat, "id" | "status" | "readOnly">;
+
+export type CatalogSeatSelection = { shareId: string; seatId: string };
+
+/** Resolve only the clicked seat against current data, never a different idle seat. */
+export function catalogSeatTarget(
+  listings: ShareMarketListing[],
+  selection: CatalogSeatSelection | null,
+) {
+  if (!selection) return null;
+  const listing = listings.find((item) => item.shareId === selection.shareId);
+  const seat = listing?.seats.find((item) => item.id === selection.seatId);
+  return listing && seat ? { listing, seat } : null;
+}
+
+export function catalogSeatSubscription(
+  subscriptions: ShareMarketSubscription[],
+  selection: CatalogSeatSelection | null,
+) {
+  if (!selection) return undefined;
+  return subscriptions.find((subscription) =>
+    subscription.shareId === selection.shareId
+    && subscription.seatId === selection.seatId
+    && !isTerminalSubscription(subscription.status)
+  );
+}
 
 export function catalogNeedsRuntimeSync(
   listings: Array<Pick<ShareMarketListing, "serviceBlockReason">>,
