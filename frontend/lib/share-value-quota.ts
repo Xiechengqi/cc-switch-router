@@ -1,8 +1,9 @@
 import { authFetch, readAuthState } from "./auth";
 import { parseJson } from "./api";
-import type { ShareUserPolicy, ShareUserGrant } from "./types";
+import type { ShareUserPolicy, ShareUserGrant, ShareUserValueUsageInitializationMap } from "./types";
 import type { valueQuotaMessagesEn } from "./share-value-quota-messages";
 import { sharePolicyFingerprint } from "./share-settings";
+import { sameLoginContext } from "./password-auth";
 
 export type ValueQuotaMessageKey = keyof typeof valueQuotaMessagesEn;
 type ValueQuotaT = (key: ValueQuotaMessageKey, values?: Record<string, string | number>) => string;
@@ -128,6 +129,7 @@ export function knownReasonCode(code: unknown): ValuePreviewReasonCode | undefin
   return VALUE_PREVIEW_REASON_CODES.find(known => known === code);
 }
 export type ValuePreviewRow = {email: string; usedPicos?: string | null; effectiveFromMs: number; meteredFromMs: number;
+  windowId?: string; canInitializeUsage?: boolean;
   reason?: string | null; reasonCode?: string | null; ready?: boolean | null};
 /** A requested policy the Server rejected outright (bad amount, period, user…). */
 export type ValuePreviewInvalidRow = {email: string; reasonCode?: string | null; reason?: string | null};
@@ -418,9 +420,11 @@ export type ValueUsageEdit = {
   expectedWatermark: number; operationId: string; reason: string;
 };
 export async function editValueUsage(shareId: string, expectedConfigRevision: number, edits: Record<string, ValueUsageEdit>) {
+  const actor = readAuthState();
   const result = await parseJson<{items: unknown}>(await authFetch(`/v1/shares/${encodeURIComponent(shareId)}/value-usage-edits`, {
     method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({expectedConfigRevision,edits}),
-  }));
+  }, actor));
+  if (!sameLoginContext(actor, readAuthState())) throw new DOMException("The signed-in user changed", "AbortError");
   return splitValueStatusRows(result?.items);
 }
 /** Usage targets share the limit parser's leniency but keep pico precision. */
@@ -432,4 +436,23 @@ export function usdUsageToPicos(input: string): string | undefined {
   if (!match || (!match[1] && !match[2])) return undefined;
   const picos = BigInt(match[1].replaceAll(",", "") || "0")*1_000_000_000_000n+BigInt((match[2] ?? "").padEnd(12,"0"));
   return picos <= 1_000_000_000_000_000_000_000n ? String(picos) : undefined;
+}
+
+/** Editing must retain every pico; formatted display values may be rounded. */
+export function picosToUsdInput(input: string | undefined): string {
+  if (!input || !/^(0|[1-9]\d{0,21})$/.test(input)) return "";
+  const n = BigInt(input), scale = 1_000_000_000_000n;
+  const fraction = String(n % scale).padStart(12, "0").replace(/0+$/, "");
+  return `${n / scale}${fraction ? `.${fraction}` : ""}`;
+}
+
+export function parseInitialValueUsage(preview: ValueQuotaPreview, email: string, raw: string, reason: string, existing: boolean):
+  {ok: true; initialization?: ShareUserValueUsageInitializationMap[string]} | {ok: false} {
+  if (!raw.trim()) return {ok: true};
+  const amount = usdUsageToPicos(raw), row = preview.rows.find(row => row.email === email);
+  if (existing || amount == null || row?.canInitializeUsage !== true || typeof row.windowId !== "string" || !row.windowId || row.windowId.length > 512
+    || !preview.ready || !preview.checks?.some(check => check.code === "value_usage_initialization" && check.ready)
+    || ["scheduled", "blocked"].includes(valuePreviewRowOutcome(row))
+    || (amount !== "0" && (!reason.trim() || new TextEncoder().encode(reason).length > 1000))) return {ok: false};
+  return {ok: true, ...(amount !== "0" ? {initialization: {targetPicos: amount, windowId: row.windowId, reason: reason.trim()}} : {})};
 }

@@ -4,6 +4,7 @@ import type {
   ShareUserGrantMap,
   ShareUserPolicy,
   ShareUserUsageEditMap,
+  ShareUserValueUsageInitializationMap,
   ShareView,
 } from "@/lib/types";
 import { buildOrdinaryUserGrantsPatch, changedShareSettings } from "@/lib/share-settings";
@@ -41,6 +42,7 @@ export type ShareEditDraft = {
   expiresPermanent: boolean;
   userGrants: ShareUserGrantMap;
   userUsageEdits: ShareUserUsageEditMap;
+  userValueUsageInitializations: ShareUserValueUsageInitializationMap;
   enabledApps: Record<PriceApp, boolean>;
 };
 
@@ -96,6 +98,7 @@ export function buildShareEditDraft(share: ShareView): ShareEditDraft {
     expiresPermanent: permanent,
     userGrants,
     userUsageEdits: {},
+    userValueUsageInitializations: {},
     enabledApps: {
       claude: activeShareApps.includes("claude") && (share.support ? share.support.claude !== false : true),
       codex: activeShareApps.includes("codex") && (share.support ? share.support.codex !== false : true),
@@ -107,7 +110,7 @@ export function buildShareEditDraft(share: ShareView): ShareEditDraft {
 export function buildShareEditPatch(draft: ShareEditDraft, share: ShareView, activeShareApps: PriceApp[]): ShareSettingsPatch {
   const baseline = fullShareEditPatch(buildShareEditDraft(share), share);
   baseline.userGrants = { ...share.userGrants, ...baseline.userGrants };
-  return changedShareSettings(fullShareEditPatch(draft, share), baseline, draft.userUsageEdits);
+  return changedShareSettings(fullShareEditPatch(draft, share), baseline, draft.userUsageEdits, draft.userValueUsageInitializations);
 }
 
 function fullShareEditPatch(draft: ShareEditDraft, share: ShareView): ShareSettingsPatch {

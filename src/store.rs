@@ -11344,6 +11344,10 @@ impl AppStore {
             operation_id: id.clone(),
             expected_config_revision: base_config_revision
                 .unwrap_or(current_config_revision.max(0) as u64),
+            actor: patch
+                .user_value_usage_initializations
+                .as_ref()
+                .map(|_| current_user_email.clone()),
         });
         let patch_json = serde_json::to_string(&patch).map_err(|e| {
             AppError::Internal(format!("serialize share settings patch failed: {e}"))
@@ -22299,6 +22303,7 @@ fn share_settings_patch_is_empty(patch: &ShareSettingsPatch) -> bool {
         && patch.support.is_none()
         && patch.user_grants.is_none()
         && patch.user_usage_edits.is_none()
+        && patch.user_value_usage_initializations.is_none()
         && patch.user_grant_edits.is_none()
         && patch.managed_grant.is_none()
 }
@@ -22683,6 +22688,44 @@ fn normalize_share_settings_patch(
         ));
     }
     let current_owner_email = owner_email.unwrap_or("");
+    if let Some(initializations) = &patch.user_value_usage_initializations {
+        if initializations.is_empty() || initializations.len() > 500 {
+            return Err(AppError::BadRequest(
+                "invalid USD usage initialization batch".into(),
+            ));
+        }
+        for (email, initialization) in initializations {
+            let amount = crate::share_value_pricing::unsigned_decimal(&initialization.target_picos)
+                .map_err(|_| AppError::BadRequest("invalid initial USD usage".into()))?;
+            let policy = patch
+                .user_grant_edits
+                .as_ref()
+                .and_then(|edits| edits.get(email))
+                .and_then(|edit| edit.policy.as_ref())
+                .or_else(|| {
+                    patch
+                        .user_grants
+                        .as_ref()
+                        .and_then(|grants| grants.get(email))
+                        .map(|grant| &grant.policy)
+                });
+            if normalize_email(email)? != *email
+                || existing_user_grants.is_some_and(|grants| grants.contains_key(email))
+                || policy.is_none_or(|policy| policy.value_quota.is_none())
+                || patch
+                    .user_usage_edits
+                    .as_ref()
+                    .is_some_and(|edits| edits.contains_key(email))
+                || amount > crate::share_value_pricing::MAX_LIMIT_MICROS * 1_000_000
+                || initialization.window_id.is_empty()
+                || initialization.window_id.len() > 512
+                || initialization.reason.trim().is_empty()
+                || initialization.reason.len() > 1000
+            {
+                return Err(AppError::BadRequest("USD usage can only be initialized for a new USD-quota user with a valid window and reason".into()));
+            }
+        }
+    }
     let user_grants = match patch.user_grants {
         Some(values) => Some(normalize_share_user_grants_preserving(
             values,
@@ -22755,10 +22798,131 @@ fn normalize_share_settings_patch(
         support,
         user_grants,
         user_usage_edits: patch.user_usage_edits,
+        user_value_usage_initializations: patch.user_value_usage_initializations,
         user_grant_edits: patch.user_grant_edits,
         edit_context: None,
         managed_grant: None,
     })
+}
+
+#[cfg(test)]
+mod value_usage_initialization_tests {
+    use super::*;
+
+    fn opening_patch() -> ShareSettingsPatch {
+        serde_json::from_value(serde_json::json!({
+            "userGrantEdits":{"new@example.test":{"expectedRevision":0,"policy":{"tokenPeriod":"day","valueQuota":{"limitUsdMicros":"1000000","tariffPolicyId":"api-equivalent-v1"}}}},
+            "userValueUsageInitializations":{"new@example.test":{"targetPicos":"123456789123","windowId":"Day:1:2","reason":"Opening usage"}}
+        })).unwrap()
+    }
+
+    #[test]
+    fn normalizes_opening_usd_usage_without_converting_it_to_tokens() {
+        let normalized = normalize_share_settings_patch(
+            opening_patch(),
+            Some("owner@example.test"),
+            None,
+            Some(&BTreeMap::new()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            normalized.user_value_usage_initializations.unwrap()["new@example.test"].target_picos,
+            "123456789123"
+        );
+        assert!(normalized.user_usage_edits.is_none());
+        let legacy: crate::models::ShareSettingsEditContext = serde_json::from_value(
+            serde_json::json!({"operationId":"legacy-edit","expectedConfigRevision":1}),
+        )
+        .unwrap();
+        assert!(serde_json::to_value(legacy).unwrap().get("actor").is_none());
+    }
+
+    #[test]
+    fn opening_usd_usage_rejects_existing_users_and_malformed_or_mixed_amounts() {
+        let old = BTreeMap::from([(
+            "new@example.test".into(),
+            ShareUserGrant {
+                email: "new@example.test".into(),
+                active: false,
+                ..Default::default()
+            },
+        )]);
+        assert!(
+            normalize_share_settings_patch(
+                opening_patch(),
+                Some("owner@example.test"),
+                None,
+                Some(&old),
+                None
+            )
+            .is_err()
+        );
+        for amount in ["-1", "01", "1.0", "1000000000000000000001"] {
+            let mut patch = opening_patch();
+            patch
+                .user_value_usage_initializations
+                .as_mut()
+                .unwrap()
+                .get_mut("new@example.test")
+                .unwrap()
+                .target_picos = amount.into();
+            assert!(
+                normalize_share_settings_patch(
+                    patch,
+                    Some("owner@example.test"),
+                    None,
+                    Some(&BTreeMap::new()),
+                    None
+                )
+                .is_err(),
+                "{amount}"
+            );
+        }
+        for invalid in [
+            serde_json::json!({"userUsageEdits":{"new@example.test":{"action":"set","targetTokens":1}}}),
+            serde_json::json!({"userValueUsageInitializations":{}}),
+            serde_json::json!({"userValueUsageInitializations":{"new@example.test":{"targetPicos":"1","windowId":"Day:1:2","reason":""}}}),
+            serde_json::json!({"userValueUsageInitializations":{"new@example.test":{"targetPicos":"1","windowId":"Day:1:2","reason":"中".repeat(334)}}}),
+            serde_json::json!({"userValueUsageInitializations":{"new@example.test":{"targetPicos":"1","windowId":"","reason":"Opening usage"}}}),
+        ] {
+            let mut value = serde_json::to_value(opening_patch()).unwrap();
+            for (key, field) in invalid.as_object().unwrap() {
+                value[key] = field.clone();
+            }
+            assert!(
+                normalize_share_settings_patch(
+                    serde_json::from_value(value).unwrap(),
+                    Some("owner@example.test"),
+                    None,
+                    Some(&BTreeMap::new()),
+                    None,
+                )
+                .is_err()
+            );
+        }
+        let mut patch = opening_patch();
+        patch
+            .user_grant_edits
+            .as_mut()
+            .unwrap()
+            .get_mut("new@example.test")
+            .unwrap()
+            .policy
+            .as_mut()
+            .unwrap()
+            .value_quota = None;
+        assert!(
+            normalize_share_settings_patch(
+                patch,
+                Some("owner@example.test"),
+                None,
+                Some(&BTreeMap::new()),
+                None
+            )
+            .is_err()
+        );
+    }
 }
 
 fn supported_apps_from_providers(providers: &ShareAppProviders) -> Vec<String> {

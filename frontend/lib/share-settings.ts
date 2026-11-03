@@ -4,6 +4,7 @@ import type {
   ShareUserGrantMap,
   ShareUserPolicy,
   ShareUserUsageEditMap,
+  ShareUserValueUsageInitializationMap,
   ShareView,
 } from "@/lib/types";
 
@@ -23,6 +24,7 @@ export type ShareSettingsDraft = {
   expiresAt: string;
   userGrants: ShareUserGrantMap;
   userUsageEdits: ShareUserUsageEditMap;
+  userValueUsageInitializations: ShareUserValueUsageInitializationMap;
 };
 
 export function isRouterShareMarketManagedGrant(
@@ -168,6 +170,7 @@ export function draftFromShare(share: ShareView): ShareSettingsDraft {
     expiresAt: share.expiresAt || PERMANENT_EXPIRES_AT_ISO,
     userGrants,
     userUsageEdits: {},
+    userValueUsageInitializations: {},
   };
 }
 
@@ -189,7 +192,7 @@ export function buildShareSettingsPatch(
   });
   const baseline = full(draftFromShare(share));
   baseline.userGrants = { ...share.userGrants, ...baseline.userGrants };
-  return changedShareSettings(full(draft), baseline, draft.userUsageEdits);
+  return changedShareSettings(full(draft), baseline, draft.userUsageEdits, draft.userValueUsageInitializations);
 }
 
 /** Every policy field the Server enforces, USD quota included. */
@@ -235,15 +238,21 @@ export function changedUserGrants(next: ShareUserGrantMap, baseline: ShareUserGr
   return edits;
 }
 
-export function changedShareSettings(next: ShareSettingsPatch, baseline: ShareSettingsPatch, usageEdits: ShareUserUsageEditMap = {}): ShareSettingsPatch {
+export function changedShareSettings(next: ShareSettingsPatch, baseline: ShareSettingsPatch, usageEdits: ShareUserUsageEditMap = {}, initializations: ShareUserValueUsageInitializationMap = {}): ShareSettingsPatch {
   const patch = Object.fromEntries(Object.entries(next).filter(([key, value]) =>
-    key !== "userGrants" && key !== "userUsageEdits" && JSON.stringify(value) !== JSON.stringify(baseline[key as keyof ShareSettingsPatch]),
+    key !== "userGrants" && key !== "userUsageEdits" && key !== "userValueUsageInitializations" && JSON.stringify(value) !== JSON.stringify(baseline[key as keyof ShareSettingsPatch]),
   )) as ShareSettingsPatch;
   const userGrantEdits = changedUserGrants(next.userGrants ?? {}, baseline.userGrants ?? {});
   if (Object.keys(userGrantEdits).length) patch.userGrantEdits = userGrantEdits;
   const activeUsageEdits = Object.fromEntries(Object.entries(usageEdits).filter(([email]) =>
     next.userGrants?.[email]?.active !== false && !!next.userGrants?.[email] && !isRouterShareMarketManagedGrant(next.userGrants[email])));
   if (Object.keys(activeUsageEdits).length) patch.userUsageEdits = activeUsageEdits;
+  const activeInitializations = Object.fromEntries(Object.entries(initializations).filter(([email]) =>
+    next.userGrants?.[email]?.active !== false && !!next.userGrants?.[email]?.policy.valueQuota
+      && !isRouterShareMarketManagedGrant(next.userGrants[email])));
+  // If a concurrent save made this user historical, forward the intent so the
+  // Server rejects it explicitly instead of silently losing an opening amount.
+  if (Object.keys(activeInitializations).length) patch.userValueUsageInitializations = activeInitializations;
   if (Object.values(userGrantEdits).some((edit) => edit.policy?.tokenPeriod === "accountReset") ||
       Object.values(activeUsageEdits).some((edit) => edit.expectedAccountCycle)) {
     patch.expectedAccountCycle = Object.values(next.userGrants ?? {}).find((grant) => grant.active !== false && grant.policy.tokenPeriod === "accountReset")?.accountQuotaCycle;

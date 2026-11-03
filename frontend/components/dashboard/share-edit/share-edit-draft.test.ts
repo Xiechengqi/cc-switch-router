@@ -62,6 +62,25 @@ test("unchanged settings send no grants, runtime snapshots, or market tombstones
   assert.deepEqual(patch, {});
 });
 
+test("opening USD usage travels with only a new active ordinary USD grant, never as Token usage", () => {
+  const share = shareView({"existing@example.com": grant("existing@example.com", {revision: 2})});
+  const draft = buildShareEditDraft(share);
+  const valueQuota = {limitUsdMicros: "1000000", tariffPolicyId: "api-equivalent-v1" as const};
+  draft.userGrants["new@example.com"] = grant("new@example.com", {policy: {tokenPeriod: "day", valueQuota}});
+  const opening = {targetPicos: "123456789123", windowId: "Day:1:2", reason: "Opening amount"};
+  draft.userValueUsageInitializations = {"new@example.com": opening, "existing@example.com": opening, "removed@example.com": opening};
+  const patch = buildShareEditPatch(draft, share, ["claude"]);
+  assert.deepEqual(patch.userValueUsageInitializations, {"new@example.com": opening});
+  assert.equal(patch.userGrantEdits?.["new@example.com"].expectedRevision, 0);
+  assert.equal(patch.userUsageEdits, undefined);
+  draft.userGrants["new@example.com"].policy = {tokenPeriod: "day", tokenLimit: 100};
+  assert.equal(buildShareEditPatch(draft, share, ["claude"]).userValueUsageInitializations, undefined);
+  assert.deepEqual(buildShareEditDraft(share).userValueUsageInitializations, {});
+  draft.userGrants["existing@example.com"].policy = {tokenPeriod: "day", valueQuota};
+  assert.deepEqual(buildShareEditPatch(draft, share, ["claude"]).userValueUsageInitializations,
+    {"existing@example.com": opening}, "never silently drop a stale initialization; the Server must reject it");
+});
+
 test("account quota background updates do not dirty an open draft; usage edits keep the frozen cycle", () => {
   const cycle: NonNullable<ShareUserGrant["accountQuotaCycle"]> = { streamIncarnation: "stream", sourceRef: "opaque",
     sourceEpoch: 1, bucketId: "weekly", cycleId: "cycle", cycleSequence: 1, cycleRevision: 1,

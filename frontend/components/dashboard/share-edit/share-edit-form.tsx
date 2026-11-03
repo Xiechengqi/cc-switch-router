@@ -439,6 +439,11 @@ export function ShareEditFormBody({
           shareId={displayShare.shareId}
           configRevision={displayShare.configRevision}
           usageEdits={draft.userUsageEdits}
+          valueUsageInitializations={draft.userValueUsageInitializations}
+          onValueUsageInitializationsChange={(userValueUsageInitializations) =>
+            form.onDraftChange((current) => ({ ...current, userValueUsageInitializations }))
+          }
+          savedGrants={displayShare.userGrants}
           onUsageEditsChange={(userUsageEdits) =>
             form.onDraftChange((current) => ({ ...current, userUsageEdits }))
           }

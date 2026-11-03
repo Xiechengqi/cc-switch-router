@@ -55,6 +55,7 @@ export function ShareValueUsageAdjustment({shareId,revision,grant,status,t,onUpd
       {result?<span role="status" className="text-success">{result}</span>:null}
     </div>
     {open?<div id={`${id}-panel`} className="grid gap-2 rounded-md border bg-muted/20 p-2.5">
+      <p className="text-muted-foreground">{t("dashboard.userLimit.value.applyNowHint")}</p>
       <p className="text-muted-foreground">{t("dashboard.userLimit.value.observed")}: {formatQuotaPicos(status.observedPicos)} · {t("dashboard.userLimit.value.offset")}: {formatQuotaPicos(status.manualOffsetPicos)}</p>
       <div className="grid gap-2 sm:grid-cols-2">
         <label className="grid gap-1" htmlFor={`${id}-target`}><span className="text-muted-foreground">{t("dashboard.userLimit.value.target")}</span>

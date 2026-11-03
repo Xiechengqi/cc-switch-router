@@ -319,6 +319,9 @@ function ShareSettingsForm({
           shareId={share.shareId}
           disabled={busy || !!pendingEditId || share.activeEdit?.status === "pending"}
           usageEdits={draft.userUsageEdits}
+          savedGrants={baseline.userGrants}
+          valueUsageInitializations={draft.userValueUsageInitializations}
+          onValueUsageInitializationsChange={(userValueUsageInitializations) => setDraft((current) => ({ ...current, userValueUsageInitializations }))}
           onUsageEditsChange={(userUsageEdits) => setDraft((current) => ({ ...current, userUsageEdits }))}
           onChange={(userGrants) =>
             setDraft((current) => ({ ...current, userGrants }))

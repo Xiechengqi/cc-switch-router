@@ -832,4 +832,12 @@ Gemini 的金额模式仅覆盖 `generateContent`／`streamGenerateContent`；�
 
 金额校准为独立 `set|clear`，携带 grant revision、windowId、observed watermark、operationId 和审计原因；set 不得低于真实观测，clear 仅清人工偏移。批量全成或全败。金额校准永不返回 500：前置条件失败为 400/409（`quota_target_invalid`、`quota_revision_conflict`、`value_quota_not_active`），未知 Share／用户为 404，存储不可用为 503；成功响应 `items[]` 中不可读的行带 `error:{code}`，Router 原样转发。`set` 同时是对账（reconcile）操作：Server 先收敛已超过请求最大超时加余量（与 sweeper 同一阈值）仍未结算的 attempt（较新的在途 attempt 保持预占）、重建检查点，并清除该 scope 的阻断／restore fence；`expectedWatermark` 不再要求精确等于当前水位，幂等只依赖 `operationId`，且 `target >= 当前已观测`。旧 Token `usageRebase/userUsageEdits` 不承载金额；活跃市场 managed grant 仍只读。原公开用量 API 不附加私人金额策略；客户端切账号清理响应，超过 180 秒标注同步延迟，缺状态不显示伪造的零。
 
+新增普通授权的**初始已用金额**与上述即时校准是不同操作。新版预览增加构建能力 `checks[]={code:"value_usage_initialization",ready:true}`；仅同时满足新用户、无任何历史用量／人工补录／恢复 fence、USD 策略当前立即生效时，该用户行返回 `canInitializeUsage:true` 和绑定的 `windowId`。能力缺省时不得发送初始化字段，不能仅凭 reader v10 推断支持。
+
+初始化随普通 `ShareSettingsPatch.userValueUsageInitializations` 保存，形如 `{"new@example.com":{"targetPicos":"123456789123","windowId":"Day:…:…","reason":"Verified opening usage"}}`。金额为规范非负 picoUSD 整数字符串（此例为 $0.123456789123，最高 $1,000,000,000）；UI 留空或零不发送补录。非零金额须审计原因（最多 1000 UTF-8 字节），批次最多 500 个用户。必须同时提交对应新用户的 USD policy；不能与同用户的 Token `userUsageEdits` 混用。已有、已撤销、市场托管或曾有请求／保留汇总／金额历史的用户不能初始化；待下一周期生效时不能提前初始化，切换单位也不清零历史。
+
+Router 仅在包含初始化时，为 `editContext` 加入可信 `actor`（实际登录用户，忽略浏览器提供值）；普通旧补丁不发送该新增键。Server 本地管理补丁使用本地 Owner 身份，原生 `save_provider_bundle_share` 使用已认证操作人／本地 Owner，不能由表单伪造。原生命令携带同名初始化 map 与稳定的 `valueUsageOperationId`，已有 Share 的 config CAS 规则不变。新授权、初始金额偏移、审计、水位、整份 Share 与幂等回执在同一个 SQLite IMMEDIATE 事务提交；外层取消不补录，任一步失败全部回滚这些内容，提交后响应丢失可原样重试且不重复补录。相同操作 ID 的不同 payload 拒绝；窗口变化必须重新预览。能力／绑定准备不属于金额提交，失败时可能保留安全 coverage 证据，但不能留下部分授权、金额或保存回执。
+
+编辑弹窗区分“当前周期已消耗额度”和新用户可选初始金额：已有用户读取权威状态，未知或待生效不伪造零；可展开独立“立即校准”，明确不随外层 Share 保存／取消回滚。金额输入保留完整 pico 精度；只展示的格式化金额不得作为编辑值回填。初始化不从旧 Token 用量反推、不修改钱包、租金或市场账本。
+
 Server 金额检查点和幂等身份不依赖 Router 30 天请求日志。托管恢复在覆盖数据库前写独立 restore fence；旧窗口证据不全则拒绝金额模式，不能删安全标记或通过切换单位重置真实用量。新旧二进制降级前必须撤销／切换并确认所有金额策略与在途数据；不允许旧版本忽略字段变成不限额。

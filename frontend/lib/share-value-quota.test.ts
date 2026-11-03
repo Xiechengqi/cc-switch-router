@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  usdLimitToMicros, microsToUsdInput, usdUsageToPicos, formatQuotaPicos,
+  usdLimitToMicros, microsToUsdInput, usdUsageToPicos, formatQuotaPicos, picosToUsdInput, parseInitialValueUsage,
   mergeValueStatuses, compatibleValueStatus, valueStatusTextKey, valueQuotaAvailability, type ValueQuotaStatus,
   valueCapabilityReady,valueReadinessError,type ValueQuotaPreview,
   previewValueQuota, parseUsdLimit, formatUsdLimit, valuePreviewRowOutcome, valuePreviewNeedsAcknowledgement,
@@ -217,6 +217,23 @@ test("a higher authoritative revision may lower usage; stale windows and waterma
   assert.equal(valueStatusTextKey(undefined), "dashboard.userLimit.value.unsynced");
 });
 const money = {limitUsdMicros: "1000000", tariffPolicyId: "api-equivalent-v1" as const};
+test("opening USD usage needs explicit support and a new immediately active window", () => {
+  const row = {email: "new@example.test", effectiveFromMs: 0, meteredFromMs: 0, reasonCode: "ready", windowId: "Lifetime:0:0", canInitializeUsage: true};
+  const preview: ValueQuotaPreview = {ready: true, configRevision: 1, checks: [{code: "value_usage_initialization", ready: true}], rows: [row]};
+  const parse = (raw: string, reason = " Reviewed ", existing = false, p = preview) => parseInitialValueUsage(p, row.email, raw, reason, existing);
+  assert.deepEqual(parse(""), {ok: true});
+  assert.deepEqual(parse("0", ""), {ok: true});
+  assert.deepEqual(parse("0.000000000001"), {ok: true, initialization: {targetPicos: "1", windowId: row.windowId, reason: "Reviewed"}});
+  for (const raw of ["-1", "1e3", "0.0000000000001", "1000000001"]) assert.deepEqual(parse(raw), {ok: false});
+  assert.deepEqual(parse("1", ""), {ok: false});
+  assert.deepEqual(parse("1", "x".repeat(1001)), {ok: false});
+  assert.deepEqual(parse("1", "中".repeat(334)), {ok: false});
+  assert.deepEqual(parse("1", "reason", true), {ok: false});
+  for (const p of [{...preview, checks: []}, {...preview, ready: false}, {...preview, rows: [{...row, canInitializeUsage: false}]},
+    {...preview, rows: [{...row, windowId: undefined}]}, {...preview, rows: [{...row, reasonCode: "scheduled_next_window"}]},
+    {...preview, rows: [{...row, reasonCode: "blocked_needs_reconcile"}]}]) assert.deepEqual(parse("1", "reason", false, p), {ok: false});
+  for (const value of ["0", "1", "123456789123", "1000000000000000000000"]) assert.equal(usdUsageToPicos(picosToUsdInput(value)), value);
+});
 const grant: ShareUserGrant = {
   email: status.email, role: "shareto", active: true,
   policy: {tokenPeriod: "day", valueQuota: money},

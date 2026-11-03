@@ -525,6 +525,7 @@ export type ShareSettingsPatch = {
   support?: ShareSupport;
   userGrants?: ShareUserGrantMap;
   userUsageEdits?: ShareUserUsageEditMap;
+  userValueUsageInitializations?: ShareUserValueUsageInitializationMap;
   userGrantEdits?: Record<string, { expectedRevision: number; policy: ShareUserPolicy | null }>;
   managedGrant?: {
     operationId: string;
@@ -536,6 +537,12 @@ export type ShareSettingsPatch = {
     policy?: ShareUserPolicy;
   };
 };
+
+export type ShareUserValueUsageInitializationMap = Record<string, {
+  targetPicos: string;
+  windowId: string;
+  reason: string;
+}>;
 
 export type ShareApiAuthResponse = {
   authenticated: boolean;
