@@ -1,13 +1,34 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync } from "node:fs";
-import { clientSeatAction, clientSeatGroups, clientShareHref, parseClientSeatContext, parseClientShareEntries, type ClientShareSeatContext } from "./client-share-market";
+import { clientSeatAction, clientSeatGroups, clientShareEntryLabel, clientShareHref, parseClientSeatContext, parseClientOwnerSeatContext, parseClientShareEntries, type ClientShareSeatContext } from "./client-share-market";
 import type { ShareMarketSeat } from "./types";
 
 const entry = { shareId: "share", entryKind: "rent", resourceState: "listed", vacantSeats: 1, subdomain: "owner--share" };
 test("batched entry projections reject malformed or incomplete snapshots", () => {
   assert.equal(parseClientShareEntries({ items: [entry], nextCursor: null }, ["share"]).items.length, 1);
   for (const value of [{items:[],nextCursor:null}, {items:[entry,entry],nextCursor:null}, {items:[{...entry,entryKind:"buy"}],nextCursor:null}, {items:[{...entry,vacantSeats:-1}],nextCursor:null}, {items:[{...entry,shareId:"other"}],nextCursor:null}]) assert.throws(() => parseClientShareEntries(value,["share"]));
+});
+test("owner management has its own typed entry and never masquerades as Rent", () => {
+  const owner = { ...entry, entryKind: "manage", vacantSeats: 0, resourceState: "unlisted" };
+  assert.equal(parseClientShareEntries({ items: [owner], nextCursor: null }, ["share"]).items[0].entryKind, "manage");
+  for (const [kind, label] of [["manage", "clientShares.manage"], ["rent", "clientShares.rent"], ["rental", "clientShares.mine"], ["settlement", "clientShares.settlement"]] as const) {
+    assert.equal(clientShareEntryLabel(kind), label);
+  }
+});
+test("owner seat context is Share-scoped and validates private subscriptions separately from public seats", () => {
+  const seat = { id: "seat", position: 1, status: "occupied", canDelete: false, readOnly: false,
+    subscription: { id: "sub", shareId: "share", listingId: "listing", seatId: "seat" } };
+  const listing = { id: "listing", shareId: "share", isOwner: true, ownerEmail: "owner@example.test", seats: [seat] };
+  const context = { shareId: "share", listings: [listing] };
+  assert.equal(parseClientOwnerSeatContext(context, "share").listings[0].seats[0].subscription?.id, "sub");
+  for (const value of [
+    { ...context, shareId: "other" }, { ...context, listings: [] }, { ...context, listings: [listing, listing] },
+    { ...context, listings: [{ ...listing, shareId: "other" }] }, { ...context, listings: [{ ...listing, isOwner: false }] },
+    { ...context, listings: [{ ...listing, seats: [seat, seat] }] },
+    ...["shareId", "listingId", "seatId"].map(key => ({ ...context, listings: [{ ...listing, seats: [{ ...seat, subscription: { ...seat.subscription, [key]: "other" } }] }] })),
+  ]) assert.throws(() => parseClientOwnerSeatContext(value, "share"));
+  assert.throws(() => parseClientSeatContext({ shareId: "share", resourceState: "listed", nextCursor: null, subscriptions: [], listing }, "share"), "owner data must not enter the public seat projection");
 });
 test("private seat context cannot contain another renter's subscription", () => {
   const context = { shareId:"share",resourceState:"listed",nextCursor:null,subscriptions:[], listing:{id:"listing",shareId:"share",seats:[{id:"seat",position:1,status:"occupied",canRent:false}]} };
@@ -50,4 +71,23 @@ test("homepage integration batches cards, preserves missing-resource contexts an
   assert.match(provider,/event.stopPropagation\(\)/);
   assert.match(source("../components/dashboard/client-board.tsx"),/ClientShareRecoveryCards knownShareIds=\{mineShares.map/);
   assert.match(source("../components/dashboard/share-card.tsx"),/ClientShareMarketEntryButton shareId=\{share.shareId\}/);
+});
+test("both management entrances reuse the same manager with cancellation and no implicit writes", () => {
+  const source = (file: string) => readFileSync(new URL(file, import.meta.url), "utf8");
+  const provider = source("../components/dashboard/client-share-market.tsx");
+  const owner = source("../components/dashboard/client-share-owner-management.tsx");
+  const workspace = source("../components/dashboard/share-market/owner-workspace.tsx");
+  assert.match(provider, /entries.get\(selection.shareId\)\?\.entryKind === "manage"/);
+  assert.match(provider, /!shareId \|\| ownerMode \|\| waitingForEntry/);
+  assert.match(provider, /key=\{`\$\{actor\}:\$\{selection.shareId\}`\}/);
+  assert.match(owner, /getClientOwnerSeatContext\(shareId, controller.signal\)/);
+  assert.match(owner, /request.current\?\.abort\(\)/);
+  assert.match(owner, /actor === valueReadinessActor\(\)/);
+  assert.match(owner, /setContext\(null\)/);
+  assert.match(owner, /<ShareMarketOwnerSeatManager/);
+  assert.match(workspace, /<ShareMarketOwnerSeatManager key=\{actor\}/);
+  assert.match(workspace, /ownedSeatSections\(selected\)/);
+  assert.match(workspace, /<details key=\{selected.id\}/);
+  assert.match(owner, /<CompactSelect/);
+  assert.doesNotMatch(owner, /localStorage|sessionStorage|createShareMarketListing|addShareMarketSeat|updateShareMarketSeat/);
 });

@@ -39,6 +39,13 @@ pub(super) struct SeatContext {
     pub next_cursor: Option<String>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct OwnerSeatContext {
+    pub share_id: String,
+    pub listings: Vec<ListingView>,
+}
+
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct EntryQuery {
@@ -118,6 +125,10 @@ pub(super) fn router() -> Router<ServerState> {
         .route("/v1/share-market/client-entries", get(entries))
         .route("/v1/share-market/me/client-rental-contexts", get(contexts))
         .route("/v1/share-market/shares/:id/seat-context", get(seats))
+        .route(
+            "/v1/share-market/shares/:id/owner-seat-context",
+            get(owner_seats),
+        )
 }
 
 async fn entries(
@@ -174,6 +185,20 @@ async fn seats(
     client_context_json(&headers, &context)
 }
 
+async fn owner_seats(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Response, AppError> {
+    let viewer = require_session(&state, &headers).await?;
+    let online = state.proxy.active_subdomains().await;
+    let context = state
+        .store
+        .client_owner_seat_context(&viewer, &id, &online)
+        .await?;
+    client_context_json(&headers, &context)
+}
+
 fn client_context_json<T: Serialize>(headers: &HeaderMap, value: &T) -> Result<Response, AppError> {
     let mut response = private_etag_json(headers, value)?;
     response.headers_mut().insert(
@@ -206,7 +231,10 @@ fn entries_tx(
         EXISTS(SELECT 1 FROM share_market_listings listing WHERE listing.share_id=requested.value
             AND listing.deleted_at IS NULL AND ({public})),
         EXISTS(SELECT 1 FROM share_market_listings listing WHERE listing.share_id=requested.value
-            AND (listing.owner_user_id=?2 OR lower(listing.owner_email)=lower(?3)))
+            AND (listing.owner_user_id=?2 OR lower(listing.owner_email)=lower(?3))),
+        EXISTS(SELECT 1 FROM share_market_listings listing WHERE listing.share_id=requested.value
+            AND listing.deleted_at IS NULL AND listing.owner_user_id=?2
+            AND lower(listing.owner_email)=lower(?3) AND lower(COALESCE(s.owner_email,''))=lower(?3))
         FROM json_each(?1) requested LEFT JOIN shares s ON s.share_id=requested.value ORDER BY requested.value");
     conn.prepare(&sql)
         .and_then(|mut st| {
@@ -222,6 +250,7 @@ fn entries_tx(
                     let vacant: i64 = r.get(6)?;
                     let public: bool = r.get(7)?;
                     let owner: bool = r.get(8)?;
+                    let manage = viewer.is_some() && r.get::<_, bool>(9)?;
                     let grants: BTreeMap<String, ShareUserGrant> = r
                         .get::<_, Option<String>>(3)?
                         .and_then(|v| serde_json::from_str(&v).ok())
@@ -231,7 +260,9 @@ fn entries_tx(
                             .get(&v.email.to_ascii_lowercase())
                             .is_some_and(|g| g.active)
                     });
-                    let kind = if live {
+                    let kind = if manage {
+                        "manage"
+                    } else if live {
                         "rental"
                     } else if pending {
                         "settlement"
@@ -242,7 +273,7 @@ fn entries_tx(
                     };
                     let status: Option<String> = r.get(2)?;
                     // Private resource existence/identity is not exposed just by guessing IDs.
-                    let related = live || pending;
+                    let related = live || pending || manage;
                     Ok(ClientEntry {
                         share_id: r.get(0)?,
                         entry_kind: kind.into(),
@@ -269,6 +300,53 @@ fn entries_tx(
 }
 
 impl AppStore {
+    pub(super) async fn client_owner_seat_context(
+        &self,
+        viewer: &AuthSession,
+        id: &str,
+        online: &[String],
+    ) -> Result<OwnerSeatContext, AppError> {
+        if id.is_empty() || id.len() > 256 {
+            return Err(AppError::BadRequest("invalid Share ID".into()));
+        }
+        let ids = [id.to_owned()];
+        let verify = |conn: &Connection| -> Result<(), AppError> {
+            if entries_tx(conn, Some(viewer), &ids)?
+                .iter()
+                .any(|entry| entry.entry_kind == "manage")
+            {
+                Ok(())
+            } else {
+                Err(AppError::NotFound("Share seats not found".into()))
+            }
+        };
+        {
+            let conn = self.conn.lock().await;
+            verify(&conn)?;
+        }
+        // The public seat context intentionally strips subscriptions and mutation
+        // capabilities. Use the existing Owner projection, scoped to one Share.
+        let catalog = self
+            .share_market_catalog_filtered(
+                Some(viewer),
+                online,
+                ShareMarketCatalogScope::Owner,
+                Some(&ids),
+            )
+            .await?;
+        // Ownership may have changed while building the projection.
+        let conn = self.conn.lock().await;
+        verify(&conn)?;
+        Ok(OwnerSeatContext {
+            share_id: id.into(),
+            listings: catalog
+                .listings
+                .into_iter()
+                .filter(|listing| listing.owner_email.eq_ignore_ascii_case(&viewer.email))
+                .collect(),
+        })
+    }
+
     pub(super) async fn client_share_entries(
         &self,
         viewer: Option<&AuthSession>,

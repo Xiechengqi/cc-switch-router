@@ -95,6 +95,15 @@ export function isCompletedSeat(
     || seat.subscription?.status === "released";
 }
 
+/** Unlike catalog previews, management must also include disabled seats. */
+export function ownedSeatSections(listing: Pick<ShareMarketListing, "seats">) {
+  const sorted = [...listing.seats].sort((a, b) => a.position - b.position || a.id.localeCompare(b.id));
+  return {
+    current: sorted.filter((seat) => !isCompletedSeat(seat)),
+    history: sorted.filter(isCompletedSeat),
+  };
+}
+
 export function needsOwnedSeatAttention(
   seat: Pick<ShareMarketSeat, "subscription">,
 ) {

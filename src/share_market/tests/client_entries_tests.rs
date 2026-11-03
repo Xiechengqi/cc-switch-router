@@ -124,7 +124,7 @@ async fn client_entry_vacancies_do_not_offer_a_second_seat_to_owners_or_direct_g
             .await
             .unwrap()[0]
             .entry_kind,
-        "none"
+        "manage"
     );
     store
         .conn
@@ -145,6 +145,284 @@ async fn client_entry_vacancies_do_not_offer_a_second_seat_to_owners_or_direct_g
             .unwrap()[0]
             .entry_kind,
         "none"
+    );
+}
+
+#[tokio::test]
+async fn client_owner_entry_and_context_include_full_stopped_and_disabled_seats_but_stay_private() {
+    let (store, owner, buyer, listing, seat, sub) = fixture().await;
+    let ids = ["entry-share".to_string()];
+    let entry = store
+        .client_share_entries(Some(&owner), &ids)
+        .await
+        .unwrap();
+    assert_eq!(entry[0].entry_kind, "manage");
+    assert_eq!(entry[0].vacant_seats, 0, "full listings remain manageable");
+    let context = store
+        .client_owner_seat_context(&owner, "entry-share", &[])
+        .await
+        .unwrap();
+    assert_eq!(context.listings.len(), 1);
+    assert_eq!(context.listings[0].id, listing);
+    let owned_seat = &context.listings[0].seats[0];
+    assert_eq!(owned_seat.id, seat);
+    assert_eq!(owned_seat.subscription.as_ref().unwrap().id, sub);
+    assert_eq!(
+        owned_seat.subscription.as_ref().unwrap().renter_email,
+        buyer.email
+    );
+    assert!(owned_seat.subscription.as_ref().unwrap().can_force_revoke);
+    assert!(
+        store
+            .client_owner_seat_context(&buyer, "entry-share", &[])
+            .await
+            .is_err()
+    );
+    // Possessing the owner's email alone, or their ID with another email,
+    // must not turn a session into this listing's manager.
+    assert!(
+        store
+            .client_owner_seat_context(&session("other-id", &owner.email), "entry-share", &[])
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .client_owner_seat_context(
+                &session(&owner.user_id, "other@example.test"),
+                "entry-share",
+                &[]
+            )
+            .await
+            .is_err()
+    );
+    {
+        let conn = store.conn.lock().await;
+        conn.execute(
+            "UPDATE share_market_listings SET status='closed' WHERE id=?1",
+            params![listing],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE share_market_seats SET status='disabled' WHERE id=?1",
+            params![seat],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE shares SET share_status='paused' WHERE share_id='entry-share'",
+            [],
+        )
+        .unwrap();
+    }
+    let entry = store
+        .client_share_entries(Some(&owner), &ids)
+        .await
+        .unwrap();
+    assert_eq!(entry[0].entry_kind, "manage");
+    assert_eq!(entry[0].resource_state, "inactive");
+    assert!(entry[0].subdomain.is_some());
+    let context = store
+        .client_owner_seat_context(&owner, "entry-share", &[])
+        .await
+        .unwrap();
+    assert_eq!(context.listings[0].status, "closed");
+    assert_eq!(context.listings[0].seats[0].status, "disabled");
+    let outsider = store.client_share_entries(None, &ids).await.unwrap();
+    assert_eq!(outsider[0].entry_kind, "none");
+    assert!(outsider[0].subdomain.is_none());
+    assert!(
+        store
+            .client_seat_context(None, "entry-share", &[], None, None)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn client_owner_management_is_share_scoped_read_only_and_revoked_on_owner_change_or_deletion()
+{
+    let (store, owner, _, listing, _, _) = fixture().await;
+    insert_share(
+        &store,
+        "other-share",
+        &owner.email,
+        &[ShareTokenPeriod::Day],
+    )
+    .await;
+    create_listing(&store, &owner, "other-share", free_seat()).await;
+    insert_share(
+        &store,
+        "never-listed",
+        &owner.email,
+        &[ShareTokenPeriod::Day],
+    )
+    .await;
+    let before: i64 = store
+        .conn
+        .lock()
+        .await
+        .query_row("SELECT total_changes()", [], |r| r.get(0))
+        .unwrap();
+    let context = store
+        .client_owner_seat_context(&owner, "entry-share", &[])
+        .await
+        .unwrap();
+    assert_eq!(context.listings.len(), 1);
+    assert_eq!(context.listings[0].share_id, "entry-share");
+    assert!(
+        store
+            .client_owner_seat_context(&owner, "never-listed", &[])
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .client_owner_seat_context(&owner, "unknown", &[])
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .client_share_entries(Some(&owner), &["never-listed".into()])
+            .await
+            .unwrap()[0]
+            .entry_kind,
+        "none"
+    );
+    let after: i64 = store
+        .conn
+        .lock()
+        .await
+        .query_row("SELECT total_changes()", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        before, after,
+        "management reads cannot grant, charge or mutate anything"
+    );
+    store
+        .conn
+        .lock()
+        .await
+        .execute(
+            "UPDATE shares SET owner_email='new-owner@example.test' WHERE share_id='entry-share'",
+            [],
+        )
+        .unwrap();
+    assert_ne!(
+        store
+            .client_share_entries(Some(&owner), &["entry-share".into()])
+            .await
+            .unwrap()[0]
+            .entry_kind,
+        "manage"
+    );
+    assert!(
+        store
+            .client_owner_seat_context(&owner, "entry-share", &[])
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .client_owner_seat_context(
+                &session("new-owner", "new-owner@example.test"),
+                "entry-share",
+                &[]
+            )
+            .await
+            .is_err(),
+        "new ownership must not inherit somebody else's listing"
+    );
+    store
+        .conn
+        .lock()
+        .await
+        .execute(
+            "UPDATE shares SET owner_email=?1 WHERE share_id='entry-share'",
+            params![owner.email],
+        )
+        .unwrap();
+    store
+        .conn
+        .lock()
+        .await
+        .execute(
+            "UPDATE share_market_listings SET deleted_at=?1 WHERE id=?2",
+            params![Utc::now().to_rfc3339(), listing],
+        )
+        .unwrap();
+    assert_ne!(
+        store
+            .client_share_entries(Some(&owner), &["entry-share".into()])
+            .await
+            .unwrap()[0]
+            .entry_kind,
+        "manage"
+    );
+    assert!(
+        store
+            .client_owner_seat_context(&owner, "entry-share", &[])
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn client_owner_management_keeps_retired_history_and_empty_listings_without_offering_self_rental()
+ {
+    let (store, owner, _, listing, seat, sub) = fixture().await;
+    {
+        let conn = store.conn.lock().await;
+        conn.execute(
+            "UPDATE share_market_subscriptions SET status='released' WHERE id=?1",
+            params![sub],
+        )
+        .unwrap();
+        conn.execute("UPDATE share_market_seats SET status='disabled',current_subscription_id=NULL,retired_subscription_id=?1,retired_at=?2 WHERE id=?3", params![sub, Utc::now().to_rfc3339(), seat]).unwrap();
+    }
+    let history = store
+        .client_owner_seat_context(&owner, "entry-share", &[])
+        .await
+        .unwrap();
+    assert_eq!(history.listings[0].id, listing);
+    assert_eq!(history.listings[0].seats.len(), 1);
+    assert!(history.listings[0].seats[0].read_only);
+    assert!(!history.listings[0].seats[0].can_rent);
+    assert!(!history.listings[0].seats[0].can_republish);
+    assert_eq!(
+        history.listings[0].seats[0]
+            .subscription
+            .as_ref()
+            .unwrap()
+            .id,
+        sub
+    );
+    insert_share(
+        &store,
+        "empty-listing",
+        &owner.email,
+        &[ShareTokenPeriod::Day],
+    )
+    .await;
+    let (_, empty_seat) = create_listing(&store, &owner, "empty-listing", free_seat()).await;
+    store
+        .share_market_delete_seat(&owner, &empty_seat)
+        .await
+        .unwrap();
+    let entry = store
+        .client_share_entries(Some(&owner), &["empty-listing".into()])
+        .await
+        .unwrap();
+    assert_eq!(entry[0].entry_kind, "manage");
+    assert_eq!(entry[0].vacant_seats, 0);
+    let empty = store
+        .client_owner_seat_context(&owner, "empty-listing", &[])
+        .await
+        .unwrap();
+    assert_eq!(empty.listings.len(), 1);
+    assert!(
+        empty.listings[0].seats.is_empty(),
+        "the Owner can still add seats to an empty listing"
     );
 }
 

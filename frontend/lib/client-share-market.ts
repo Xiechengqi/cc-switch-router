@@ -1,10 +1,11 @@
 import { authFetch, readAuthState } from "./auth";
 import { parseJson } from "./api";
+import { sameLoginContext } from "./password-auth";
 import type { ShareMarketListing, ShareMarketSeat, ShareMarketSubscription } from "./types";
 
 export type ClientShareEntry = {
   shareId: string;
-  entryKind: "none" | "rent" | "rental" | "settlement";
+  entryKind: "none" | "rent" | "rental" | "settlement" | "manage";
   vacantSeats: number;
   subdomain: string | null;
   resourceState: "listed" | "unlisted" | "inactive" | "missing" | "unavailable";
@@ -17,6 +18,7 @@ export type ClientShareSeatContext = {
   subscriptions: ShareMarketSubscription[];
   nextCursor: string | null;
 };
+export type ClientShareOwnerContext = { shareId: string; listings: ShareMarketListing[] };
 const object = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
 const id = (v: unknown): v is string => typeof v === "string" && v.length > 0 && v.length <= 256 && !/[\u0000-\u001f\u007f,]/.test(v);
 const cursor = (v: unknown): v is string | null => v === null || typeof v === "string" && v.length > 0 && v.length <= 2048;
@@ -27,7 +29,7 @@ export function parseClientShareEntries(value: unknown, requested?: readonly str
   const seen = new Set<string>();
   for (const v of value.items) {
     if (!object(v) || !id(v.shareId) || seen.has(v.shareId) || requested && !requested.includes(v.shareId)
-      || !["none", "rent", "rental", "settlement"].includes(v.entryKind as string)
+      || !["none", "rent", "rental", "settlement", "manage"].includes(v.entryKind as string)
       || !Number.isSafeInteger(v.vacantSeats) || (v.vacantSeats as number) < 0 || !resource(v.resourceState)
       || !(v.subdomain === null || typeof v.subdomain === "string")) throw new Error("Invalid Share entry");
     seen.add(v.shareId);
@@ -60,9 +62,39 @@ export function parseClientSeatContext(value: unknown, shareId: string): ClientS
   return value as ClientShareSeatContext;
 }
 
+/** This is a separate, authenticated projection. Never relax the public seat
+ * parser's prohibition on another renter's subscription to support management. */
+export function parseClientOwnerSeatContext(value: unknown, shareId: string): ClientShareOwnerContext {
+  if (!object(value) || value.shareId !== shareId || !Array.isArray(value.listings) || !value.listings.length) {
+    throw new Error("Invalid Share management context");
+  }
+  const listings = new Set<string>();
+  for (const listing of value.listings) {
+    if (!object(listing) || !id(listing.id) || listings.has(listing.id) || listing.shareId !== shareId
+      || listing.isOwner !== true || typeof listing.ownerEmail !== "string" || !Array.isArray(listing.seats)) {
+      throw new Error("Invalid owned Share listing");
+    }
+    listings.add(listing.id);
+    const seats = new Set<string>();
+    for (const seat of listing.seats) {
+      if (!object(seat) || !id(seat.id) || seats.has(seat.id) || !Number.isSafeInteger(seat.position)
+        || typeof seat.status !== "string" || typeof seat.readOnly !== "boolean" || typeof seat.canDelete !== "boolean"
+        || seat.subscription != null && (!object(seat.subscription) || seat.subscription.shareId !== shareId
+          || seat.subscription.listingId !== listing.id || seat.subscription.seatId !== seat.id)) {
+        throw new Error("Invalid owned Share seat");
+      }
+      seats.add(seat.id);
+    }
+  }
+  return value as ClientShareOwnerContext;
+}
+
 async function get(path: string, signal?: AbortSignal) {
   const timeout = AbortSignal.timeout(12_000);
-  return parseJson<unknown>(await authFetch(path, { cache: "no-store", signal: signal ? AbortSignal.any([signal, timeout]) : timeout }, readAuthState()));
+  const started = readAuthState();
+  const result = await parseJson<unknown>(await authFetch(path, { cache: "no-store", signal: signal ? AbortSignal.any([signal, timeout]) : timeout }, started));
+  if (!sameLoginContext(started, readAuthState())) throw new DOMException("Sign-in session changed", "AbortError");
+  return result;
 }
 export async function getClientShareEntries(ids: readonly string[], signal?: AbortSignal) {
   const unique = [...new Set(ids)].sort();
@@ -82,6 +114,19 @@ export async function getClientSeatContext(shareId: string, options: { cursor?: 
   if (options.cursor) q.set("cursor", options.cursor);
   if (options.subscriptionId) q.set("subscriptionId", options.subscriptionId);
   return parseClientSeatContext(await get(`/v1/share-market/shares/${encodeURIComponent(shareId)}/seat-context?${q}`, signal), shareId);
+}
+export async function getClientOwnerSeatContext(shareId: string, signal?: AbortSignal) {
+  if (!id(shareId)) throw new Error("Invalid Share ID");
+  return parseClientOwnerSeatContext(await get(`/v1/share-market/shares/${encodeURIComponent(shareId)}/owner-seat-context`, signal), shareId);
+}
+
+export function clientShareEntryLabel(kind: ClientShareEntry["entryKind"]) {
+  switch (kind) {
+    case "manage": return "clientShares.manage";
+    case "rent": return "clientShares.rent";
+    case "rental": return "clientShares.mine";
+    default: return "clientShares.settlement";
+  }
 }
 
 export function clientShareHref(shareId: string, seatId?: string, subscriptionId?: string) {

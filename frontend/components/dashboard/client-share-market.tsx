@@ -2,17 +2,18 @@
 
 import * as React from "react";
 import { Button, Modal } from "@heroui/react";
-import { Loader2, ShoppingCart } from "lucide-react";
+import { Loader2, Settings2, ShoppingCart } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useClientChat } from "@/components/chat/client-chat";
 import { MarketAccessDialog } from "@/components/common/seller-approval-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ShareRentalDetail } from "./account-share-rentals";
+import { ClientShareOwnerManagement } from "./client-share-owner-management";
 import { useShareMarketRentalActions } from "./share-market/rental-controls";
 import { useShareSeatCheckout, type ShareCheckoutSeat } from "./share-market/share-seat-checkout";
 import { useQuotaActor } from "./share-market/seat-value-quota";
 import { formatSeatPrice, formatSeatQuota, subscriptionStatusKey } from "./share-market/market-utils";
-import { clientSeatAction, clientSeatGroups, clientShareHref, getClientRentalContexts, getClientSeatContext, getClientShareEntries,
+import { clientSeatAction, clientSeatGroups, clientShareEntryLabel, clientShareHref, getClientRentalContexts, getClientSeatContext, getClientShareEntries,
   type ClientShareEntry, type ClientShareSeatContext } from "@/lib/client-share-market";
 import { readAuthState } from "@/lib/auth";
 import { valueReadinessActor } from "@/lib/use-value-quota-readiness";
@@ -103,7 +104,10 @@ function ClientShareMarketSession({ children, actor, userId, onChanged }: {
       setIds([...map.keys()].sort());
     };
   }, []);
-  const idsKey = ids.join(",");
+  // Include deep-linked Shares even when their card has not mounted yet.
+  const idsKey = [...new Set([...ids, ...(selection ? [selection.shareId] : [])])].sort().join(",");
+  const ownerMode = !!selection && !selection.subscriptionId && entries.get(selection.shareId)?.entryKind === "manage";
+  const waitingForEntry = !!selection && !entries.has(selection.shareId) && !summaryError;
   const changed = async () => {
     if (!current()) return;
     retry();
@@ -125,11 +129,11 @@ function ClientShareMarketSession({ children, actor, userId, onChanged }: {
     return () => window.removeEventListener("router-login-dialog-changed", changed);
   }, []);
   React.useEffect(() => {
-    const timer = window.setInterval(() => { if (document.visibilityState !== "hidden" && !blocked && current()) retry(); }, POLL_MS);
-    const visible = () => { if (document.visibilityState !== "hidden" && !blocked && current()) retry(); };
+    const timer = window.setInterval(() => { if (document.visibilityState !== "hidden" && !blocked && !ownerMode && current()) retry(); }, POLL_MS);
+    const visible = () => { if (document.visibilityState !== "hidden" && !blocked && !ownerMode && current()) retry(); };
     document.addEventListener("visibilitychange", visible);
     return () => { window.clearInterval(timer); document.removeEventListener("visibilitychange", visible); };
-  }, [blocked, current]);
+  }, [blocked, ownerMode, current]);
   React.useEffect(() => {
     const controller = new AbortController();
     // Batch the mounted cards, rather than one request for each card.
@@ -164,7 +168,7 @@ function ClientShareMarketSession({ children, actor, userId, onChanged }: {
   const shareId = selection?.shareId;
   const selectedSub = selection?.subscriptionId;
   React.useEffect(() => {
-    if (!shareId) { setDetail(null); return; }
+    if (!shareId || ownerMode || waitingForEntry) { setDetail(null); return; }
     const controller = new AbortController();
     setDetailLoading(true); setDetailError(false);
     // Never display the preceding Share's records during a new request.
@@ -185,7 +189,7 @@ function ClientShareMarketSession({ children, actor, userId, onChanged }: {
     })().catch(() => { if (!controller.signal.aborted && current()) setDetailError(true); })
       .finally(() => { if (!controller.signal.aborted && current()) setDetailLoading(false); });
     return () => controller.abort();
-  }, [shareId, selectedSub, detailPages, tick, userId, current]);
+  }, [shareId, selectedSub, detailPages, tick, userId, current, ownerMode, waitingForEntry]);
   // Restore only a non-sensitive top-up draft; always obtain a fresh quote,
   // and never submit merely because a return link was opened.
   const restored = React.useRef("");
@@ -228,12 +232,13 @@ function ClientShareMarketSession({ children, actor, userId, onChanged }: {
   const state = detail?.resourceState;
   return <MarketContext.Provider value={{ entries: entryMap, recovery, recoveryError, summaryError, more, loading, loadMore: () => setPages(n => n + 1), retry, register, open }}>
     {children}
-    <Modal.Backdrop isOpen={!!selection && !blocked && current()} onOpenChange={value => !value && close()}>
+    {ownerMode && selection && !blocked && current() ? <ClientShareOwnerManagement key={`${actor}:${selection.shareId}`} shareId={selection.shareId} actor={actor} onClose={close} onChanged={changed} /> : null}
+    <Modal.Backdrop isOpen={!!selection && !ownerMode && !blocked && current()} onOpenChange={value => !value && close()}>
       <Modal.Container placement="center">
         <Modal.Dialog className="light max-h-[calc(100dvh-1rem)] w-[min(620px,calc(100vw-1rem))] max-w-none overflow-hidden !bg-white !text-slate-900">
           <Modal.Header><div className="min-w-0"><Modal.Heading>{t("clientShares.title")}</Modal.Heading><p className="mt-1 break-all text-xs text-slate-500">{detail?.listing?.shareName || entryMap.get(shareId ?? "")?.subdomain || shareId}</p></div></Modal.Header>
           <Modal.Body className="grid min-h-0 gap-4 overflow-y-auto">
-            {detailLoading ? <p role="status" className="flex gap-2 text-sm"><Loader2 className="h-4 w-4 animate-spin" />{t("common.loading")}</p> : null}
+            {detailLoading || waitingForEntry ? <p role="status" className="flex gap-2 text-sm"><Loader2 className="h-4 w-4 animate-spin" />{t("common.loading")}</p> : null}
             {detailError || checkout.error || rentals.error ? <p role="alert" className="text-sm text-danger">{detailError ? t("clientShares.loadError") : checkout.error || rentals.error}</p> : null}
             {state && state !== "listed" ? <p className="text-xs text-muted-foreground">{t(state === "missing" ? "clientShares.missing" : "clientShares.unlisted")}</p> : null}
             {sub ? <ShareRentalDetail subscription={sub} busy={detailLoading || detailError || rentals.busyId === sub.id} {...(!detailError ? rentals.rowActions(sub) : {})} onChanged={changed} /> : groups ? <>
@@ -275,7 +280,8 @@ export function ClientShareMarketEntryButton({ shareId }: { shareId: string }) {
   React.useEffect(() => register?.(shareId), [register, shareId]);
   const entry = context?.entries.get(shareId);
   if (!entry || entry.entryKind === "none") return null;
-  return <button type="button" data-no-row-drawer className="inline-flex min-h-9 items-center gap-1.5 rounded-md px-3 text-xs font-semibold text-primary hover:bg-primary/5 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring" onClick={event => { event.stopPropagation(); context?.open({ shareId }); }}><ShoppingCart className="size-3.5" />{t(entry.entryKind === "rent" ? "clientShares.rent" : entry.entryKind === "rental" ? "clientShares.mine" : "clientShares.settlement")}</button>;
+  const Icon = entry.entryKind === "manage" ? Settings2 : ShoppingCart;
+  return <button type="button" data-no-row-drawer className="inline-flex min-h-9 items-center gap-1.5 rounded-md px-3 text-xs font-semibold text-primary hover:bg-primary/5 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring" onClick={event => { event.stopPropagation(); context?.open({ shareId }); }}><Icon className="size-3.5" />{t(clientShareEntryLabel(entry.entryKind))}</button>;
 }
 
 export function useClientShareRecoveryCount(knownShareIds: string[]) {
@@ -291,7 +297,7 @@ export function ClientShareRecoveryCards({ knownShareIds }: { knownShareIds: str
   if (!missing.length && !context.recoveryError && !context.summaryError && !context.more) return null;
   return <section className="grid gap-3" aria-label={t("clientShares.recovery")}>
     {context.recoveryError || context.summaryError ? <div role="alert" className="flex flex-wrap items-center justify-between gap-2 text-sm text-danger"><span>{t("clientShares.contextError")}</span><Button size="sm" variant="outline" onPress={context.retry}>{t("common.retry")}</Button></div> : null}
-    <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">{missing.map(entry => <article key={entry.shareId} className="flex min-w-0 flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-background p-4"><div className="min-w-0"><p className="break-all text-sm font-medium">{entry.subdomain || entry.shareId}</p><p className="mt-1 text-xs text-muted-foreground">{t(entry.resourceState === "missing" ? "clientShares.missing" : entry.resourceState === "listed" ? "clientShares.recovery" : "clientShares.unlisted")}</p></div><Button variant="outline" size="sm" onPress={() => context.open({ shareId: entry.shareId })}>{t(entry.entryKind === "rental" ? "clientShares.mine" : "clientShares.settlement")}</Button></article>)}</div>
+    <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">{missing.map(entry => <article key={entry.shareId} className="flex min-w-0 flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-background p-4"><div className="min-w-0"><p className="break-all text-sm font-medium">{entry.subdomain || entry.shareId}</p><p className="mt-1 text-xs text-muted-foreground">{t(entry.resourceState === "missing" ? "clientShares.missing" : entry.resourceState === "listed" ? "clientShares.recovery" : "clientShares.unlisted")}</p></div><Button variant="outline" size="sm" onPress={() => context.open({ shareId: entry.shareId })}>{t(clientShareEntryLabel(entry.entryKind))}</Button></article>)}</div>
     {context.more ? <Button variant="outline" isDisabled={context.loading} onPress={context.loadMore}>{context.loading ? t("common.loading") : t("clientShares.more")}</Button> : null}
   </section>;
 }

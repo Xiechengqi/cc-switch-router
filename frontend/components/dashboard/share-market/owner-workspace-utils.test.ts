@@ -24,6 +24,7 @@ import {
   needsOwnedSeatAttention,
   ownedShareBlockedReasonKey,
   ownedShareReopenListingId,
+  ownedSeatSections,
   partitionOwnedListings,
   reopenableListingSeats,
 } from "./owner-workspace-utils";
@@ -47,6 +48,7 @@ test("owned-seat action groups and labels stay within their fixed-width table co
     assert.ok(!classes.includes("shrink-0"), "actions must not force their intrinsic width past the column");
   }
   assert.match(source, /overflow-x-auto rounded-md border border-slate-200[\s\S]*min-w-\[36rem\] table-fixed/, "small screens scroll the table rather than clipping actions");
+  assert.match(source, /!isSeatIdle\(seat\) && !isCompletedSeat\(seat\)/, "historical rentals must not be labeled with today's grant usage");
 });
 
 function seat(
@@ -198,6 +200,21 @@ test("partitions grant_failed into attention and released out of live seats", ()
 function occupiedSeat() {
   return rentedSeat("rent", "occupied", { subscriptionStatus: "active_free" });
 }
+
+test("owner management includes disabled and failed seats while completed seats are collapsed separately", () => {
+  const current = listing("all-seats", "closed", [
+    rentedSeat("retired", "retired", { position: 5, readOnly: true }),
+    rentedSeat("disabled", "disabled", { position: 3 }),
+    rentedSeat("failed", "occupied", { position: 2, subscriptionStatus: "grant_failed" }),
+    rentedSeat("available", "available", { position: 1 }),
+    rentedSeat("released", "occupied", { position: 4, subscriptionStatus: "released" }),
+  ]);
+  const original = current.seats.map(seat => seat.id);
+  const sections = ownedSeatSections(current);
+  assert.deepEqual(sections.current.map(seat => seat.id), ["available", "failed", "disabled"]);
+  assert.deepEqual(sections.history.map(seat => seat.id), ["released", "retired"]);
+  assert.deepEqual(current.seats.map(seat => seat.id), original, "partitioning must not reorder the source snapshot");
+});
 
 test("occupancy counts use live seats and ignore completed history", () => {
   const idle = rentedSeat("idle", "available", { position: 1 });

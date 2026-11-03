@@ -192,7 +192,7 @@ function SettlementHistory({ record }: { record: ShareTermination }) {
 
 /** Only actionable, party-scoped rows get a red processing button. No queue
  * banner or permanent "view termination" button is added to every resource. */
-export function ShareTerminationRowAction({ shareId, seatId }: { shareId: string; seatId?: string }) {
+export function ShareTerminationRowAction({ shareId, seatId, onChanged }: { shareId: string; seatId?: string; onChanged?: () => Promise<void> | void }) {
   const { session } = useAuth(); const { t } = useLocaleText();
   const actor = session?.authenticated ? session.user?.id : null;
   const identity = JSON.stringify([actor, shareId, seatId]);
@@ -216,6 +216,6 @@ export function ShareTerminationRowAction({ shareId, seatId }: { shareId: string
   return <div data-no-card-open className="flex min-w-0 max-w-full flex-wrap gap-1">
     {items.map(i => <Button key={i.id} size="sm" variant="danger" className="h-auto min-h-9 min-w-0 max-w-full whitespace-normal break-words text-xs [overflow-wrap:anywhere]" onPress={() => setSelected({ identity, id: i.id })}>{t(i.permissions.resolve ? "shareTermination.adjudicate" : "shareTermination.handle")}{items.length > 1 ? ` · ${i.buyerEmail}` : ""}</Button>)}
     {error ? <span className="min-w-0 max-w-full" title={error}><Button variant="ghost" size="sm" className="h-auto min-h-9 min-w-0 max-w-full whitespace-normal break-words text-xs" onPress={() => refresh()}>{t("shareTermination.unavailable")}</Button></span> : null}
-    <ShareTerminationDialog selection={selected?.identity === identity ? { id: selected.id } : null} onClose={() => setSelected(null)} onChanged={() => refresh()} />
+    <ShareTerminationDialog selection={selected?.identity === identity ? { id: selected.id } : null} onClose={() => setSelected(null)} onChanged={() => { refresh(); void Promise.resolve(onChanged?.()).catch(() => {}); }} />
   </div>;
 }
