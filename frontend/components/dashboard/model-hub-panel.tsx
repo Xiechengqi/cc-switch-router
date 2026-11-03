@@ -648,7 +648,7 @@ export function ModelHubPanel({
                         maxLength={200}
                         disabled={controller.busy}
                         onChange={(event) => controller.updateRoute(route.clientId, { requestedModel: event.target.value })}
-                        className="h-9 min-w-0 rounded-md border border-border bg-white px-3 text-xs outline-none focus:border-primary/60 focus:ring-2 focus:ring-primary/10"
+                        className="h-9 min-w-0 rounded-md border border-border bg-white px-3 text-xs outline-none focus:border-primary/60 focus:ring-2 focus:ring-inset focus:ring-primary/10"
                         aria-label={t("modelHub.model")}
                         placeholder={t("modelHub.modelPlaceholder")}
                       />
@@ -712,7 +712,7 @@ export function ModelHubPanel({
                     ...current,
                     [activeProtocol]: event.target.value,
                   }))}
-                  className="h-9 min-w-0 rounded-md border border-border bg-white px-3 text-xs text-foreground outline-none focus:border-primary/60 focus:ring-2 focus:ring-primary/10 disabled:bg-slate-50"
+                  className="h-9 min-w-0 rounded-md border border-border bg-white px-3 text-xs text-foreground outline-none focus:border-primary/60 focus:ring-2 focus:ring-inset focus:ring-primary/10 disabled:bg-slate-50"
                   placeholder={t("modelHub.modelPlaceholder")}
                 />
               </label>

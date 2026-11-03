@@ -222,7 +222,7 @@ export function HostKeyRotationDialog({
                         placeholder="SHA256:..."
                         spellCheck={false}
                         autoComplete="off"
-                        className="h-10 min-w-0 rounded-md border border-slate-300 px-3 font-mono text-xs outline-none focus:border-primary focus:ring-2 focus:ring-primary/20"
+                        className="h-10 min-w-0 rounded-md border border-slate-300 px-3 font-mono text-xs outline-none focus:border-primary focus:ring-2 focus:ring-inset focus:ring-primary/20"
                       />
                       {confirmedFingerprint && !fingerprintMatches ? (
                         <span className="text-xs text-rose-600">

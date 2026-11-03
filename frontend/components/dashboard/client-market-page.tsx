@@ -1014,7 +1014,7 @@ export function ClientMarketPage() {
                 onChange={(event) => setImportText(event.target.value)}
                 placeholder={t("clientMarket.importPlaceholder")}
                 spellCheck={false}
-                className="min-h-56 w-full resize-y rounded-lg border border-border bg-white px-3 py-2 font-mono text-xs leading-5 text-foreground outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                className="min-h-56 w-full resize-y rounded-lg border border-border bg-white px-3 py-2 font-mono text-xs leading-5 text-foreground outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent"
               />
             </Modal.Body>
             <Modal.Footer>

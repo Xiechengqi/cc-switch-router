@@ -414,7 +414,7 @@ export function AddHostDialog({
                     <input
                       value={ip}
                       onChange={(e) => setIp(e.target.value)}
-                      className="h-11 w-full rounded-lg border border-border bg-white px-3 text-slate-900 outline-none focus:ring-2 focus:ring-primary/30"
+                      className="h-11 w-full rounded-lg border border-border bg-white px-3 text-slate-900 outline-none focus:ring-2 focus:ring-inset focus:ring-primary/30"
                       autoComplete="off"
                     />
                   </label>
@@ -423,7 +423,7 @@ export function AddHostDialog({
                     <input
                       value={port}
                       onChange={(e) => setPort(e.target.value)}
-                      className="h-11 w-full rounded-lg border border-border bg-white px-3 text-slate-900 outline-none focus:ring-2 focus:ring-primary/30"
+                      className="h-11 w-full rounded-lg border border-border bg-white px-3 text-slate-900 outline-none focus:ring-2 focus:ring-inset focus:ring-primary/30"
                       inputMode="numeric"
                       min={1}
                       max={65535}
@@ -437,7 +437,7 @@ export function AddHostDialog({
                       type="password"
                       value={rootPassword}
                       onChange={(e) => setRootPassword(e.target.value)}
-                      className="h-11 rounded-lg border border-border bg-white px-3 text-slate-900 outline-none focus:ring-2 focus:ring-primary/30"
+                      className="h-11 rounded-lg border border-border bg-white px-3 text-slate-900 outline-none focus:ring-2 focus:ring-inset focus:ring-primary/30"
                       autoComplete="new-password"
                     />
                     <span className="text-xs text-muted-foreground">{t("clientMarket.rootPasswordHint")}</span>
@@ -458,7 +458,7 @@ export function AddHostDialog({
                   <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_7rem]">
                     <label className="grid gap-1 text-sm">
                       <span className="text-muted-foreground">{t("clientMarket.monthlyPrice")}</span>
-                      <input value={priceUsd} onChange={(event) => setPriceUsd(event.target.value)} inputMode="decimal" className="h-11 rounded-lg border border-border bg-white px-3 text-slate-900 outline-none focus:ring-2 focus:ring-primary/30" />
+                      <input value={priceUsd} onChange={(event) => setPriceUsd(event.target.value)} inputMode="decimal" className="h-11 rounded-lg border border-border bg-white px-3 text-slate-900 outline-none focus:ring-2 focus:ring-inset focus:ring-primary/30" />
                     </label>
                     <label className="grid gap-1 text-sm">
                       <span className="text-muted-foreground">{t("clientMarket.rentalCurrency")}</span>
@@ -481,7 +481,7 @@ export function AddHostDialog({
                     {freeDurationMode === "fixed" ? (
                       <label className="grid gap-1 text-sm">
                         <span className="text-muted-foreground">{t("clientMarket.freeDuration.days")}</span>
-                        <input type="number" min={1} max={365} step={1} value={freeDurationDays} onChange={(event) => setFreeDurationDays(event.target.value)} className="h-11 rounded-lg border border-border bg-white px-3 text-slate-900 outline-none focus:ring-2 focus:ring-primary/30" />
+                        <input type="number" min={1} max={365} step={1} value={freeDurationDays} onChange={(event) => setFreeDurationDays(event.target.value)} className="h-11 rounded-lg border border-border bg-white px-3 text-slate-900 outline-none focus:ring-2 focus:ring-inset focus:ring-primary/30" />
                       </label>
                     ) : null}
                   </div>
@@ -515,7 +515,7 @@ export function AddHostDialog({
                   <input
                     value={note}
                     onChange={(e) => setNote(e.target.value)}
-                    className="h-11 rounded-lg border border-border bg-white px-3 text-slate-900 outline-none focus:ring-2 focus:ring-primary/30"
+                    className="h-11 rounded-lg border border-border bg-white px-3 text-slate-900 outline-none focus:ring-2 focus:ring-inset focus:ring-primary/30"
                     maxLength={500}
                   />
                 </label>
