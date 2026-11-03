@@ -1267,12 +1267,27 @@ export type ShareUpstreamProvider = {
       modelFamily?: string;
       relativeWeeklyCapacity?: number;
       source?: string;
+      expiresAt?: string;
     }>;
     unobservedTiers?: ShareUpstreamQuotaTierHint[];
     bankedReset?: {
       availableCount: number;
       detailsAvailable: boolean;
       expiresAt?: string[];
+    };
+    providerUsage?: {
+      status: "complete" | "unavailable";
+      source: "buddy_official_request_usage";
+      scope: "account";
+      timezone: "UTC" | "Asia/Shanghai";
+      collectedAt: number;
+      rangeStart?: string;
+      rangeEnd?: string;
+      usageToday?: number;
+      usage7Days?: number;
+      usageThisMonth?: number;
+      usageTotal?: number;
+      requestCount?: number;
     };
   };
   models?: Array<{

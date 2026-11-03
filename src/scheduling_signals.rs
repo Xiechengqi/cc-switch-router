@@ -354,6 +354,7 @@ mod tests {
             }],
             unobserved_tiers: Vec::new(),
             banked_reset: None,
+            provider_usage: None,
         };
         // Only short window → fall back to neutral.
         assert_eq!(compute_quota_health(Some(&quota), Utc::now()), 0.5);
@@ -393,6 +394,7 @@ mod tests {
             ],
             unobserved_tiers: Vec::new(),
             banked_reset: None,
+            provider_usage: None,
         };
         let v = compute_quota_health(Some(&quota), Utc::now());
         // The 95%-utilized daily tier dominates softmin, so result is near 0.05..0.1.
@@ -434,6 +436,7 @@ mod tests {
             ],
             unobserved_tiers: Vec::new(),
             banked_reset: None,
+            provider_usage: None,
         };
 
         let generic = compute_quota_health(Some(&quota), now);
@@ -472,6 +475,7 @@ mod tests {
             }],
             unobserved_tiers: Vec::new(),
             banked_reset: None,
+            provider_usage: None,
         };
         let generic_before = compute_quota_health(Some(&quota), now);
         let fable_before =

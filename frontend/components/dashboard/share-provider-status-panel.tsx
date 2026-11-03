@@ -49,7 +49,7 @@ export function ShareProviderStatusPanel({
       <span
         className={cn(
           "min-w-0 font-semibold leading-4",
-          wrapPrimaryLine ? "whitespace-normal break-words" : "truncate",
+          wrapPrimaryLine ? "whitespace-pre-line break-words" : "truncate",
           view.primaryMonospace && "font-mono text-[10px]",
         )}
         title={view.primaryTitle || view.primaryLine}

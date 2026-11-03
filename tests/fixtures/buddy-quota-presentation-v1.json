@@ -1,0 +1,44 @@
+{
+  "status": "ok",
+  "plan": "CodeBuddy个人版拉新权益包",
+  "queriedAt": 1793706177823,
+  "availability": "available",
+  "tiers": [
+    {
+      "label": "CodeBuddy个人版拉新权益包",
+      "utilization": 0.0,
+      "resetsAt": "2026-12-02T09:18:24+00:00",
+      "used": 0.0,
+      "limit": 1500.0,
+      "unit": "credits",
+      "scope": "account",
+      "source": "codebuddy_billing_resource_v2",
+      "expiresAt": "2026-12-02T09:18:24+00:00"
+    },
+    {
+      "label": "CodeBuddy个人体验版",
+      "utilization": 0.1,
+      "resetsAt": "2026-11-30T15:59:59+00:00",
+      "used": 0.5,
+      "limit": 500.0,
+      "unit": "credits",
+      "scope": "account",
+      "source": "codebuddy_billing_resource_v2",
+      "expiresAt": "2035-02-01T00:00:00+00:00"
+    }
+  ],
+  "providerUsage": {
+    "status": "complete",
+    "source": "buddy_official_request_usage",
+    "scope": "account",
+    "timezone": "Asia/Shanghai",
+    "collectedAt": 1793704378549,
+    "rangeStart": "2026-10-04",
+    "rangeEnd": "2026-11-03",
+    "usageToday": 0.45,
+    "usage7Days": 0.45,
+    "usageThisMonth": 0.45,
+    "usageTotal": 0.45,
+    "requestCount": 132
+  }
+}

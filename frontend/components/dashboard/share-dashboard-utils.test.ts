@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFileSync } from "node:fs";
 
 import {
   formatCompactQuotaTier,
@@ -8,13 +9,96 @@ import {
   providerAccountLevel,
   providerAccountTierLabel,
   providerQuotaStatusLine,
+  providerStatusIdentity,
   quotaSummary,
   recentSharePerformance,
   shareAppProviderRuntime,
   utilizationPercentForDisplay,
+  buddyOfficialUsageText,
 } from "@/components/dashboard/share-dashboard-utils";
 import type { ShareUpstreamProvider } from "@/lib/types";
 import type { ShareRequestLog } from "@/lib/types";
+
+const buddyQuota = JSON.parse(readFileSync(new URL("../../../tests/fixtures/buddy-quota-presentation-v1.json", import.meta.url), "utf8")) as NonNullable<ShareUpstreamProvider["quota"]>;
+
+test("Buddy quota cards retain both accounting views, official names, times and account scope", () => {
+  for (const product of ["workbuddy_oauth", "codebuddy_oauth"]) {
+    for (const app of ["claude", "codex", "gemini"]) {
+      const runtime: ShareUpstreamProvider = { providerType: product, kind: "official_oauth", app, quota: structuredClone(buddyQuota) };
+      const text = quotaSummary(runtime, "zh-CN");
+      assert.match(text, /资源包额度（账号）/);
+      assert.match(text, /CodeBuddy个人体验版 0.5\/500 credits 0.1%/);
+      assert.match(text, /今日 0.45 · 7 日 0.45 · 本月 0.45 credits/);
+      assert.match(text, /2026-10-04 – 2026-11-03 · 132 次/);
+      assert.match(text, /2026-11-03 19:12:58 UTC\+8/);
+      assert.match(text, /2026-11-03 19:42:57 UTC\+8/);
+      assert.match(text, /包含其他 share 和客户端/);
+      assert.match(text, /周期结束/);
+      assert.match(text, /到期/);
+      assert.doesNotMatch(text, /codebuddy package/);
+      const english = quotaSummary(runtime, "en");
+      assert.match(english, /Official request usage \(account\)/);
+      assert.match(english, /including other shares and clients/);
+    }
+  }
+});
+
+test("Buddy card identity uses the bound account ID across app-provider projections", () => {
+  for (const providerType of ["workbuddy_oauth", "codebuddy_oauth"]) {
+    for (const app of ["claude", "codex", "gemini"]) {
+      const accountId = `${providerType}-account-fixture`;
+      const runtime = shareAppProviderRuntime({
+        id: "buddy-provider", name: "WorkBuddy", kind: providerType, providerType, app,
+        accountLabel: accountId, accountEmail: "owner@example.com",
+      });
+      assert.equal(providerAccountIdentity(runtime), accountId);
+      assert.equal(providerStatusIdentity(runtime), accountId);
+      assert.equal(providerStatusIdentity({ ...runtime, providerName: "Renamed provider" }), accountId);
+    }
+  }
+});
+
+test("Buddy cards with missing account IDs never substitute provider names or email", () => {
+  for (const providerType of ["workbuddy_oauth", "codebuddy_oauth"]) {
+    for (const accountLabel of [undefined, "", "   "]) {
+      const runtime = { providerType, providerName: "WorkBuddy", accountLabel, accountEmail: "legacy@example.com" };
+      assert.equal(providerAccountIdentity(runtime), "-");
+      assert.equal(providerStatusIdentity(runtime), "-");
+      assert.equal(providerStatusIdentity({ ...runtime, providerType: undefined, kind: providerType }), "-");
+    }
+  }
+  assert.equal(providerStatusIdentity({ providerType: "codex_oauth", providerName: "OpenAI Official" }), "OpenAI Official");
+});
+
+test("Buddy credits are unknown when incomplete, and explicit zero remains zero", () => {
+  assert.equal(buddyOfficialUsageText(undefined, "en"), "");
+  const incomplete = { ...buddyQuota.providerUsage!, usage7Days: undefined };
+  assert.match(buddyOfficialUsageText(incomplete, "en"), /usage is unavailable/);
+  assert.doesNotMatch(buddyOfficialUsageText(incomplete, "en"), /today 0.00/);
+  const zero = { ...buddyQuota.providerUsage!, usageToday: 0, usage7Days: 0, usageThisMonth: 0, usageTotal: 0, requestCount: 0 };
+  assert.match(buddyOfficialUsageText(zero, "en"), /today 0.00/);
+  assert.match(buddyOfficialUsageText(zero, "en"), /0 requests/);
+  const old = { ...buddyQuota, providerUsage: undefined };
+  assert.doesNotMatch(quotaSummary({ providerType: "workbuddy_oauth", quota: old }, "en"), /Official request usage/);
+});
+
+test("Buddy tiny utilization stays visible and other providers keep existing precision", () => {
+  assert.match(formatCompactQuotaTier({ label: "package", utilization: 0.01 }, "en", 1, true), /<0.1%/);
+  assert.match(formatCompactQuotaTier({ label: "package", utilization: 0 }, "en", 1, true), /0%/);
+  assert.equal(formatCompactQuotaTier({ label: "1w", utilization: 1.4 }), "7d 1%");
+});
+
+test("Buddy package refresh failure keeps the independent official request ledger visible", () => {
+  for (const providerType of ["workbuddy_oauth", "codebuddy_oauth"]) {
+    const runtime = { providerType, quota: { ...buddyQuota, status: "failed" } };
+    const text = quotaSummary(runtime, "en");
+    assert.match(text, /Resource package data is unavailable/);
+    assert.match(text, /today 0.45/);
+    assert.doesNotMatch(text, /0.5\/500/);
+    assert.match(quotaSummary(runtime, "zh-CN"), /资源包数据暂不可用/);
+    assert.equal(quotaSummary({ ...runtime, providerType: "codex_oauth" }, "en"), "");
+  }
+});
 
 function cursorApiKeyRuntime(
   overrides: Partial<ShareUpstreamProvider> = {},

@@ -2883,6 +2883,8 @@ pub struct ShareUpstreamQuotaTier {
     pub relative_weekly_capacity: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
 }
 
 /// A quota pool which the Server can prove exists, but for which the upstream
@@ -2934,6 +2936,76 @@ pub struct ShareUpstreamQuota {
     pub unobserved_tiers: Vec<ShareUpstreamQuotaTierHint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub banked_reset: Option<ShareBankedResetSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_usage: Option<BuddyOfficialUsageSummary>,
+}
+
+/// Account-wide, display-only request-credit aggregates. Never scheduling input.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BuddyOfficialUsageSummary {
+    pub status: String,
+    pub source: String,
+    pub scope: String,
+    pub timezone: String,
+    pub collected_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_start: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_end: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_today: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage7_days: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_this_month: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_total: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_count: Option<u64>,
+}
+
+impl BuddyOfficialUsageSummary {
+    pub fn is_valid(&self) -> bool {
+        let numbers = [
+            self.usage_today,
+            self.usage7_days,
+            self.usage_this_month,
+            self.usage_total,
+        ];
+        if self.source != "buddy_official_request_usage"
+            || self.scope != "account"
+            || !matches!(self.timezone.as_str(), "UTC" | "Asia/Shanghai")
+            || self.collected_at <= 0
+            || chrono::DateTime::from_timestamp_millis(self.collected_at).is_none()
+        {
+            return false;
+        }
+        match self.status.as_str() {
+            "unavailable" => {
+                numbers.iter().all(Option::is_none)
+                    && self.request_count.is_none()
+                    && self.range_start.is_none()
+                    && self.range_end.is_none()
+            }
+            "complete" => {
+                let date = |value: &Option<String>| {
+                    value
+                        .as_ref()
+                        .filter(|date| date.len() == 10)
+                        .and_then(|date| chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
+                };
+                numbers
+                    .iter()
+                    .all(|n| n.is_some_and(|n| n.is_finite() && n >= 0.0))
+                    && self.request_count.is_some()
+                    && date(&self.range_start)
+                        .zip(date(&self.range_end))
+                        .is_some_and(|(start, end)| (0..=30).contains(&(end - start).num_days()))
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Read-only display evidence; deliberately separate from quota tiers.

@@ -585,6 +585,11 @@ function normalizedProviderType(runtime?: ShareUpstreamProvider) {
     .toLowerCase();
 }
 
+function isBuddyOAuthRuntime(runtime?: ShareUpstreamProvider) {
+  const providerType = normalizedProviderType(runtime);
+  return providerType === "workbuddy_oauth" || providerType === "codebuddy_oauth";
+}
+
 function normalizedProviderName(runtime?: ShareUpstreamProvider) {
   return String(runtime?.providerName || "")
     .trim()
@@ -881,19 +886,28 @@ export function formatCompactQuotaTier(
     used?: number;
     limit?: number;
     unit?: string;
+    expiresAt?: string;
   },
   locale: AppLocale = "en",
   maximumUtilizationFractionDigits = 0,
+  buddyPackage = false,
 ) {
   const label = normalizeCompactTierLabel(tier.label || tier.name, locale);
   const utilization =
     typeof tier.utilization === "number" && Number.isFinite(tier.utilization)
-      ? `${utilizationPercentForDisplay(
+      ? buddyPackage && tier.utilization > 0 && tier.utilization < 0.1 ? "<0.1%" : `${utilizationPercentForDisplay(
           tier.utilization,
           maximumUtilizationFractionDigits,
         )}%`
       : "";
-  const countdown = countdownStr(tier.resetsAt);
+  const deadline = (at: string | undefined, key: "quota.buddy.cycleEnds" | "quota.buddy.expires") => {
+    if (!at || !Number.isFinite(Date.parse(at))) return "";
+    return `${messages[locale][key]} ${countdownStr(at) || messages[locale]["quota.buddy.expired"]}`;
+  };
+  const countdown = buddyPackage
+    ? [tier.resetsAt !== tier.expiresAt ? deadline(tier.resetsAt, "quota.buddy.cycleEnds") : "",
+      deadline(tier.expiresAt, "quota.buddy.expires")].filter(Boolean).join(" · ")
+    : countdownStr(tier.resetsAt);
   const amount = formatQuotaUsageAmount(tier, locale);
   return [label, amount, utilization, countdown].filter(Boolean).join(" ");
 }
@@ -1133,8 +1147,15 @@ export function quotaSummary(
     return "";
   const quota = runtime.quota;
   const status = String(quota?.status || "").toLowerCase();
-  if (!quota || (status && !["ok", "success", "valid"].includes(status)))
-    return "";
+  const buddy = isBuddyOAuthRuntime(runtime);
+  if (!quota) return "";
+  if (status && !["ok", "success", "valid"].includes(status)) {
+    if (!buddy) return "";
+    return [messages[locale]["quota.buddy.packagesUnavailable"],
+      `${messages[locale]["quota.buddy.packageCollected"]} ${formatBuddyQuotaTime(quota.queriedAt, quota.providerUsage?.timezone, locale)}`,
+      buddyOfficialUsageText(quota.providerUsage, locale),
+    ].filter(Boolean).join("\n");
+  }
   const observedTiers = (quota.tiers || [])
     .map((tier) => ({ ...tier, label: tier.label || tier.name }))
     .filter((tier) => tier.label);
@@ -1148,6 +1169,7 @@ export function quotaSummary(
   }
   const tierText = tiers
     .map((tier) => {
+      if (buddy) return formatCompactQuotaTier(tier, locale, 1, true);
       if (!isOllamaCloudRuntime(runtime)) {
         return formatCompactQuotaTier(tier, locale);
       }
@@ -1177,6 +1199,13 @@ export function quotaSummary(
   const resetText = runtime.providerType === "codex_oauth"
     ? bankedResetSummary(quota.bankedReset, locale)
     : "";
+  if (buddy) {
+    const packageLine = [messages[locale]["quota.buddy.packages"],
+      [...tierText, ...unobservedTierText].join(" · "),
+      `${messages[locale]["quota.buddy.packageCollected"]} ${formatBuddyQuotaTime(quota.queriedAt, quota.providerUsage?.timezone, locale)}`,
+    ].filter(Boolean).join(" · ");
+    return [packageLine, buddyOfficialUsageText(quota.providerUsage, locale)].filter(Boolean).join("\n");
+  }
   return [
     quotaPlanLabel(runtime, quota.plan || quota.credentialMessage),
     expireText,
@@ -1186,6 +1215,34 @@ export function quotaSummary(
   ]
     .filter(Boolean)
     .join(" · ");
+}
+
+export function formatBuddyQuotaTime(timestamp: number | undefined, timezone: string | undefined, locale: AppLocale) {
+  if (typeof timestamp !== "number" || timestamp <= 0 || !Number.isFinite(new Date(timestamp).getTime()))
+    return messages[locale]["quota.buddy.unknown"];
+  const zone = timezone === "Asia/Shanghai" ? timezone : "UTC";
+  return `${new Intl.DateTimeFormat("sv-SE", {
+    timeZone: zone, year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23",
+  }).format(timestamp)} ${zone === "UTC" ? "UTC" : "UTC+8"}`;
+}
+
+export function buddyOfficialUsageText(usage: NonNullable<ShareUpstreamProvider["quota"]>["providerUsage"], locale: AppLocale) {
+  // Old peers have no aggregate field. Absence is unknown, never zero.
+  if (!usage) return "";
+  const m = messages[locale];
+  const complete = usage.status === "complete" && usage.scope === "account"
+    && usage.source === "buddy_official_request_usage"
+    && (usage.timezone === "UTC" || usage.timezone === "Asia/Shanghai")
+    && typeof usage.collectedAt === "number" && usage.collectedAt > 0 && Number.isFinite(new Date(usage.collectedAt).getTime())
+    && [usage.usageToday, usage.usage7Days, usage.usageThisMonth, usage.usageTotal]
+      .every((n) => typeof n === "number" && Number.isFinite(n) && n >= 0)
+    && Number.isSafeInteger(usage.requestCount) && usage.requestCount! >= 0
+    && /^\d{4}-\d{2}-\d{2}$/.test(usage.rangeStart ?? "") && /^\d{4}-\d{2}-\d{2}$/.test(usage.rangeEnd ?? "");
+  const text = complete
+    ? `${m["quota.buddy.usage"]} ${m["quota.buddy.today"]} ${usage.usageToday!.toFixed(2)} · ${m["quota.buddy.week"]} ${usage.usage7Days!.toFixed(2)} · ${m["quota.buddy.month"]} ${usage.usageThisMonth!.toFixed(2)} credits\n${m["quota.buddy.range"]} ${usage.rangeStart} – ${usage.rangeEnd} · ${usage.requestCount} ${m["quota.buddy.requests"]} · ${usage.timezone}`
+    : m["quota.buddy.unavailable"];
+  return `${text}\n${m["quota.buddy.usageCollected"]} ${formatBuddyQuotaTime(usage.collectedAt, usage.timezone, locale)}\n${m["quota.buddy.scope"]}`;
 }
 
 export function providerSubscriptionExpiry(
@@ -1229,6 +1286,9 @@ export function providerAccountIdentity(runtime?: ShareUpstreamProvider) {
   if (isApiProviderRuntime(runtime)) {
     return "-";
   }
+  if (isBuddyOAuthRuntime(runtime)) {
+    return String(runtime?.accountLabel || "").trim() || "-";
+  }
   if (isCursorApiKeyRuntime(runtime)) {
     const account = String(
       runtime?.accountLabel || runtime?.accountEmail || "",
@@ -1248,6 +1308,7 @@ export function providerAccountIdentity(runtime?: ShareUpstreamProvider) {
 
 export function providerStatusIdentity(runtime?: ShareUpstreamProvider) {
   const identity = providerAccountIdentity(runtime);
+  if (isBuddyOAuthRuntime(runtime)) return identity;
   if (identity && identity !== "-") return identity;
   const name = String(runtime?.providerName || "").trim();
   return name || "-";

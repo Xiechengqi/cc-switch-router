@@ -241,7 +241,7 @@ export function ShareAppSupportCard({
     >
       <span className="min-w-0 self-start font-mono uppercase">{label}</span>
       <span className="grid min-w-0 gap-0.5 overflow-hidden text-right">
-        <span className="min-w-0 whitespace-normal break-words font-semibold">
+        <span className="min-w-0 whitespace-pre-line break-words font-semibold">
           {accountLevel}
         </span>
         {accountEmail && accountEmail !== "-" && accountEmail !== accountLevel ? (

@@ -3601,6 +3601,7 @@ impl AppStore {
                 "valuePricingActivationV1".into(),
                 "shareTerminationV1".into(),
                 "providerIdentityV1".into(),
+                "buddyQuotaPresentationV1".into(),
             ],
         })
     }
@@ -15149,6 +15150,12 @@ impl AppStore {
         &self,
         mut snapshot: ShareRuntimeSnapshotResponse,
     ) -> Result<(), AppError> {
+        validate_buddy_quota_projections(
+            SHARE_CONTRACT_VERSION,
+            None,
+            &snapshot.app_runtimes,
+            &snapshot.app_providers,
+        )?;
         let closes_model_probe_epoch = snapshot
             .share_status
             .as_deref()
@@ -15526,9 +15533,71 @@ fn normalize_share_descriptor_fields(share: &mut ShareDescriptor) -> Result<(), 
         }
     }
     share.parallel_limit = normalize_share_limit_value(share.parallel_limit);
+    validate_buddy_quota_presentation(share)?;
     validate_share_model_probes(share)?;
     if share.expires_at == LEGACY_PERMANENT_SHARE_EXPIRES_AT {
         share.expires_at = PERMANENT_SHARE_EXPIRES_AT.to_string();
+    }
+    Ok(())
+}
+
+fn validate_buddy_quota_presentation(share: &ShareDescriptor) -> Result<(), AppError> {
+    validate_buddy_quota_projections(
+        share.contract_version,
+        share.upstream_provider.as_ref(),
+        &share.app_runtimes,
+        &share.app_providers,
+    )
+}
+
+fn validate_buddy_quota_projections(
+    contract_version: u16,
+    upstream_provider: Option<&ShareUpstreamProvider>,
+    app_runtimes: &ShareAppRuntimes,
+    app_providers: &ShareAppProviders,
+) -> Result<(), AppError> {
+    let check = |provider_type: Option<&str>, quota: Option<&crate::models::ShareUpstreamQuota>| {
+        let Some(quota) = quota else {
+            return Ok(());
+        };
+        let extended = quota.provider_usage.is_some()
+            || quota.tiers.iter().any(|tier| tier.expires_at.is_some());
+        if !extended {
+            return Ok(());
+        }
+        if contract_version < 7
+            || !matches!(provider_type, Some("workbuddy_oauth" | "codebuddy_oauth"))
+            || quota
+                .provider_usage
+                .as_ref()
+                .is_some_and(|usage| !usage.is_valid())
+            || quota
+                .tiers
+                .iter()
+                .filter_map(|tier| tier.expires_at.as_ref())
+                .any(|date| chrono::DateTime::parse_from_rfc3339(date).is_err())
+        {
+            return Err(AppError::BadRequest(
+                "invalid Buddy quota presentation".into(),
+            ));
+        }
+        Ok(())
+    };
+    for runtime in upstream_provider
+        .into_iter()
+        .chain(app_runtimes.claude.iter())
+        .chain(app_runtimes.codex.iter())
+        .chain(app_runtimes.gemini.iter())
+    {
+        check(runtime.provider_type.as_deref(), runtime.quota.as_ref())?;
+    }
+    for provider in app_providers
+        .claude
+        .iter()
+        .chain(&app_providers.codex)
+        .chain(&app_providers.gemini)
+    {
+        check(provider.provider_type.as_deref(), provider.quota.as_ref())?;
     }
     Ok(())
 }
@@ -24332,6 +24401,7 @@ mod quota_runtime_filter_tests {
                 tiers: Vec::new(),
                 unobserved_tiers: Vec::new(),
                 banked_reset: None,
+                provider_usage: None,
             }),
             models: Vec::new(),
             ..Default::default()
@@ -24367,6 +24437,7 @@ mod quota_runtime_filter_tests {
                 }],
                 unobserved_tiers: Vec::new(),
                 banked_reset: None,
+                provider_usage: None,
             }),
             models: Vec::new(),
             ..Default::default()
@@ -24405,6 +24476,7 @@ mod quota_runtime_filter_tests {
                     .collect(),
                 unobserved_tiers: Vec::new(),
                 banked_reset: None,
+                provider_usage: None,
             }),
             models: Vec::new(),
             ..Default::default()
@@ -39966,6 +40038,252 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn buddy_quota_golden_contract_is_strict_display_only_and_round_trips() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/buddy-quota-presentation-v1.json"
+        ))
+        .unwrap();
+        let quota: crate::models::ShareUpstreamQuota =
+            serde_json::from_value(fixture.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&quota).unwrap(), fixture);
+        // Same frozen wire digest is checked by the independent Server writer.
+        assert_eq!(
+            hex::encode(Sha256::digest(serde_json::to_vec(&quota).unwrap())),
+            "3c15dd018d21c15638a93b134a42c76d23cccda145a1a2b51fe1ee6faefb7ea8"
+        );
+        let now = Utc::now();
+        let health = crate::scheduling_signals::compute_quota_health(Some(&quota), now);
+        let mut no_usage = quota.clone();
+        no_usage.provider_usage = None;
+        for tier in &mut no_usage.tiers {
+            tier.expires_at = None;
+        }
+        assert_eq!(
+            crate::scheduling_signals::compute_quota_health(Some(&no_usage), now),
+            health
+        );
+        for product in ["workbuddy_oauth", "codebuddy_oauth"] {
+            let mut descriptor = test_share_descriptor("buddy-share", "buddy-sub");
+            descriptor.contract_version = 7;
+            descriptor.upstream_provider = Some(ShareUpstreamProvider {
+                kind: "official_oauth".into(),
+                app: "codex".into(),
+                provider_type: Some(product.into()),
+                quota: Some(quota.clone()),
+                ..Default::default()
+            });
+            normalize_share_descriptor_fields(&mut descriptor).unwrap();
+            let decoded: ShareDescriptor =
+                serde_json::from_str(&serde_json::to_string(&descriptor).unwrap()).unwrap();
+            assert_eq!(
+                serde_json::to_value(decoded.upstream_provider.unwrap().quota.unwrap()).unwrap(),
+                fixture
+            );
+            descriptor.contract_version = 6;
+            assert!(normalize_share_descriptor_fields(&mut descriptor).is_err());
+        }
+        let mut invalid = fixture.clone();
+        invalid["providerUsage"]["requests"] = serde_json::json!([{"prompt":"private"}]);
+        assert!(serde_json::from_value::<crate::models::ShareUpstreamQuota>(invalid).is_err());
+        for (key, value) in [
+            ("usageToday", serde_json::json!(-1)),
+            ("scope", serde_json::json!("share")),
+            ("rangeEnd", serde_json::json!("2027-12-31")),
+            ("timezone", serde_json::json!("unknown")),
+        ] {
+            let mut invalid = fixture["providerUsage"].clone();
+            invalid[key] = value;
+            let summary: crate::models::BuddyOfficialUsageSummary =
+                serde_json::from_value(invalid).unwrap();
+            assert!(!summary.is_valid(), "{key}");
+        }
+    }
+
+    #[tokio::test]
+    async fn buddy_quota_signed_dynamic_update_persists_at_the_same_descriptor_revision() {
+        for product in ["workbuddy_oauth", "codebuddy_oauth"] {
+            let (store, config) = setup_store("buddy-quota-dynamic-sync").await;
+            let installation_id = "inst-buddy-quota";
+            let signing_key = insert_signed_installation(&store, installation_id).await;
+            insert_client_tunnel(
+                &store,
+                installation_id,
+                "owner@example.com",
+                TEST_CLIENT_SUBDOMAIN,
+            )
+            .await;
+            let quota: crate::models::ShareUpstreamQuota = serde_json::from_str(include_str!(
+                "../tests/fixtures/buddy-quota-presentation-v1.json"
+            ))
+            .unwrap();
+            let mut descriptor = test_share_descriptor("buddy-quota-persist", "buddy-quota");
+            descriptor.contract_version = 7;
+            descriptor.config_revision = 4;
+            descriptor.descriptor_generation = 2;
+            descriptor.descriptor_fingerprint = "a".repeat(64);
+            descriptor.upstream_provider = Some(ShareUpstreamProvider {
+                kind: "official_oauth".into(),
+                app: "codex".into(),
+                provider_type: Some(product.into()),
+                quota: Some(quota),
+                ..Default::default()
+            });
+            let request = |share: ShareDescriptor| {
+                let ops = vec![ShareSyncOperation {
+                    kind: "upsert".into(),
+                    share: Some(share),
+                    share_id: None,
+                }];
+                let at = Utc::now().timestamp_millis();
+                let nonce = Uuid::new_v4().to_string();
+                let signature = sign_test_payload(
+                    &signing_key,
+                    installation_id,
+                    "share_descriptor_batch_sync",
+                    &ops,
+                    at,
+                    &nonce,
+                );
+                ShareBatchSyncRequest::from_ops(installation_id, at, &nonce, &signature, ops)
+            };
+            for amount in [0.45, 0.75] {
+                descriptor
+                    .upstream_provider
+                    .as_mut()
+                    .unwrap()
+                    .quota
+                    .as_mut()
+                    .unwrap()
+                    .provider_usage
+                    .as_mut()
+                    .unwrap()
+                    .usage_today = Some(amount);
+                store
+                    .batch_sync_share_descriptors(
+                        request(descriptor.clone()),
+                        ClientMetadata {
+                            ip: Some("127.0.0.1".into()),
+                            country_code: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let conn = store.conn.lock().await;
+                let persisted: (String, u64, u64, String) = conn.query_row(
+                    "SELECT upstream_provider_json, config_revision, descriptor_generation, descriptor_fingerprint FROM shares WHERE share_id='buddy-quota-persist'",
+                    [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                ).unwrap();
+                let runtime: ShareUpstreamProvider = serde_json::from_str(&persisted.0).unwrap();
+                let quota = runtime.quota.unwrap();
+                assert_eq!(quota.provider_usage.unwrap().usage_today, Some(amount));
+                assert_eq!(
+                    quota.tiers[1].expires_at.as_deref(),
+                    Some("2035-02-01T00:00:00+00:00")
+                );
+                assert_eq!(
+                    (persisted.1, persisted.2, persisted.3),
+                    (4, 2, "a".repeat(64))
+                );
+            }
+            drop(store);
+            let restored = AppStore::new(&config).unwrap();
+            let conn = restored.conn.lock().await;
+            let json: String = conn.query_row(
+                "SELECT upstream_provider_json FROM shares WHERE share_id='buddy-quota-persist'",
+                [], |row| row.get(0),
+            ).unwrap();
+            let runtime: ShareUpstreamProvider = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                runtime.quota.unwrap().provider_usage.unwrap().usage_today,
+                Some(0.75)
+            );
+            let _ = std::fs::remove_file(&config.database.path);
+        }
+    }
+
+    #[tokio::test]
+    async fn buddy_quota_runtime_refresh_rejects_invalid_aggregates_before_persistence() {
+        let (store, config) = setup_store("buddy-quota-runtime-validation").await;
+        insert_installation(&store, "inst-buddy-runtime").await;
+        insert_share(
+            &store,
+            "inst-buddy-runtime",
+            "buddy-runtime-share",
+            "buddy-runtime",
+            "active",
+        )
+        .await;
+        let quota: crate::models::ShareUpstreamQuota = serde_json::from_str(include_str!(
+            "../tests/fixtures/buddy-quota-presentation-v1.json"
+        ))
+        .unwrap();
+        let runtime = ShareUpstreamProvider {
+            kind: "official_oauth".into(),
+            app: "codex".into(),
+            provider_type: Some("workbuddy_oauth".into()),
+            quota: Some(quota),
+            ..Default::default()
+        };
+        let mut snapshot = ShareRuntimeSnapshotResponse {
+            share_id: "buddy-runtime-share".into(),
+            queried_at: Utc::now().timestamp(),
+            token_limit: None,
+            tokens_used: None,
+            requests_count: None,
+            share_status: None,
+            support: ShareSupport {
+                codex: true,
+                ..Default::default()
+            },
+            app_runtimes: ShareAppRuntimes {
+                codex: Some(runtime),
+                ..Default::default()
+            },
+            app_providers: ShareAppProviders::default(),
+            model_health: ShareModelHealthSummary::default(),
+        };
+        store
+            .record_share_runtime_snapshot(snapshot.clone())
+            .await
+            .unwrap();
+        let valid: String = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT app_runtimes_json FROM shares WHERE share_id='buddy-runtime-share'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        snapshot
+            .app_runtimes
+            .codex
+            .as_mut()
+            .unwrap()
+            .quota
+            .as_mut()
+            .unwrap()
+            .provider_usage
+            .as_mut()
+            .unwrap()
+            .usage_today = Some(-1.0);
+        assert!(store.record_share_runtime_snapshot(snapshot).await.is_err());
+        let persisted: String = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT app_runtimes_json FROM shares WHERE share_id='buddy-runtime-share'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(persisted, valid);
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[test]
     fn upstream_provider_field_order_matches_server_signer() {
         use crate::models::{
             ProviderModelProbe, ShareProviderModelPolicy, ShareProviderModelPolicyScope,
@@ -39997,6 +40315,7 @@ pub(crate) mod tests {
                 tiers: vec![],
                 unobserved_tiers: Vec::new(),
                 banked_reset: None,
+                provider_usage: None,
             }),
             api_url: Some("https://example.com".into()),
             models: vec![ShareUpstreamModel {
