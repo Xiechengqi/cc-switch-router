@@ -14,3 +14,9 @@ export function shareCheckoutState(quote?: ShareMarketRentQuote) {
 export function isWalletQuoteConflict(error: unknown) {
   return error instanceof ApiError && error.code === "MARKET_WALLET_REQUIRED";
 }
+
+/** The same request must be replayed until its outcome is known, even after
+ * quote expiry. A timeout or a server error is not proof that no money moved. */
+export function isUnknownShareCheckoutError(error: unknown) {
+  return !(error instanceof ApiError) || error.status === 0 || error.status >= 500 || error.status === 408;
+}

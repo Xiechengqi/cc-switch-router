@@ -65,7 +65,7 @@ try {
   });
   await page.route("**/v1/**", async route => {
     const url = new URL(route.request().url()), path = url.pathname, method = route.request().method();
-    if (path === "/v1/auth/home") return json(route, { hasActivity: true, entry: null, source: null });
+    if (path === "/v1/ui/context") return json(route, { mode: "router" });
     // Finance authority comes from server capabilities, not the general admin flag.
     if (path === "/v1/auth/session/me") return json(route, { authenticated: !!actor, isAdmin: false, user: actor ? { id: actor, email: `${actor}@example.test` } : null, password: { hasPassword: true, version: 1 } });
     if (path === "/v1/client-market/hosts") return json(route, hostPresent ? [{

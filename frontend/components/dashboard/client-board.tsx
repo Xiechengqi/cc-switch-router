@@ -10,6 +10,7 @@ import { ShareConnectDialog } from "@/components/dashboard/share-connect-dialog"
 import { ClientOnlineHeatmap } from "@/components/dashboard/client-online-heatmap";
 import { ShareModelHealthHeatmap } from "@/components/dashboard/share-model-health-heatmap";
 import { ShareCard } from "@/components/dashboard/share-card";
+import { ClientShareRecoveryCards, useClientShareRecoveryCount } from "./client-share-market";
 import { ClientUpgradeButton } from "@/components/dashboard/client-upgrade-button";
 import { ClientRemovalSchedule, clientOperationalSummary, OperationalDiagnosis, operationalReasonLabel, operationalStateLabel, shareIsEnabled, shareOperationalSummary, summarizeShareAvailability, useStableOperationalRanks } from "@/components/dashboard/operational-status";
 import { useClientConsole } from "@/components/dashboard/client-console";
@@ -743,6 +744,7 @@ export function ClientBoard({
       routedEligibleShareIds,
     ));
   }, [hasViewerIdentity, routedEligibleShareIds, sessionEmail, shares, sortedClients]);
+  const recoveryShareCount = useClientShareRecoveryCount(mineShares.map(share => share.shareId));
   const clientById = React.useMemo(() => new Map(clients.map((client) => [client.installation.id, client])), [clients]);
   const canViewClientLogs = React.useCallback(
     (client: DashboardClient) => Boolean(client.logCollectionEnabled),
@@ -847,14 +849,14 @@ export function ClientBoard({
   const clientSummary = React.useMemo(() => {
     const states = sortedClients.map((client) => clientOperationalSummary(client, sharesForClient(client)).state);
     return {
-      mine: mineShares.length,
+      mine: mineShares.length + recoveryShareCount,
       online: states.filter((state) => state === "online").length,
       reconnecting: states.filter((state) => state === "reconnecting").length,
       degraded: states.filter((state) => state === "degraded").length,
       offline: states.filter((state) => state === "offline").length,
       issues: states.filter((state) => state !== "online").length,
     };
-  }, [mineShares.length, sharesForClient, sortedClients]);
+  }, [mineShares.length, recoveryShareCount, sharesForClient, sortedClients]);
 
   const visibleMineShares = React.useMemo(() => {
     if (statusFilter !== "mine") return [];
@@ -1082,7 +1084,7 @@ export function ClientBoard({
     { value: "degraded", label: t("dashboard.degraded"), count: clientSummary.degraded },
     { value: "offline", label: t("common.offline"), count: clientSummary.offline },
   ];
-  const mineIsEmpty = statusFilter === "mine" && mineShares.length === 0;
+  const mineIsEmpty = statusFilter === "mine" && mineShares.length + recoveryShareCount === 0;
   const mineFilterEmpty = statusFilter === "mine" && !mineIsEmpty && visibleMineShares.length === 0;
 
   return (
@@ -1185,6 +1187,10 @@ export function ClientBoard({
       </div>
 
       {statusFilter === "mine" ? (
+        <ClientShareRecoveryCards knownShareIds={mineShares.map(share => share.shareId)} />
+      ) : null}
+
+      {statusFilter === "mine" ? (
         <ModelHubPanel controller={modelRouting} forceExpanded={hubForceExpanded} focusProtocol={hubFocusProtocol} />
       ) : null}
 
@@ -1201,7 +1207,7 @@ export function ClientBoard({
               modelRoutesByShareId={modelRoutesByShareId}
               onAddModelRoute={addModelRouteForShare}
             />
-          ) : (
+          ) : recoveryShareCount && mineShares.length === 0 ? null : (
             <EmptyBlock>
               <div className="grid justify-items-center gap-2">
                 <span>{mineIsEmpty ? t("dashboard.noMyShares") : t("dashboard.noFilterResults")}</span>

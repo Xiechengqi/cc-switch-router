@@ -181,3 +181,8 @@ test("wallet recharge amounts round up to cents and respect merchant limits", ()
   assert.match(walletTopupHref("8640001", "/client-market/"), /amount=1\.01/);
   assert.match(walletTopupHref("864000000000000", "/client-market/"), /amount=1000\.00/);
 });
+
+test("homepage recharge return paths admit only one safe Share selection without wallet dispatch loops", () => {
+  assert.equal(safeMarketReturnPath("/?marketShare=share-1&seatId=seat_2&subscriptionId=sub-3"), "/?marketShare=share-1&seatId=seat_2&subscriptionId=sub-3");
+  for (const path of ["/", "/?seatId=s", "/?marketShare=s&topup=t", "/?marketShare=s&amount=5", "/?marketShare=s&c2cOrder=o", "/?marketShare=s&returnTo=%2F", "/?marketShare=s&marketShare=x", "/?marketShare=%2F%2Fevil", "/?marketShare=", "/\\evil/?marketShare=s"]) assert.equal(safeMarketReturnPath(path),null,path);
+});

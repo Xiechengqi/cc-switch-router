@@ -62,7 +62,7 @@ test("retired account addresses keep their role, market and focus", () => {
   assert.equal(legacyAccountHref("/account/share", ""), "/account/rentals/?market=share");
   assert.equal(legacyAccountHref("/account/share/", "?tab=provider"), "/account/provider-settings/?tab=listings&market=share");
   assert.equal(legacyAccountHref("/account/api-keys/"), "/account/security/");
-  assert.equal(legacyAccountHref("/account/home/"), "/account/security/#home-entry");
+  assert.equal(legacyAccountHref("/account/home/"), "/account/security/");
   assert.equal(legacyAccountHref("/account/provider-usage/"), "/account/usage/?view=provider");
   assert.equal(legacyAccountHref("/account/consumer-usage/"), "/account/usage/?view=consumer");
   assert.equal(legacyAccountHref("/account/market-access/"), "/account/provider-settings/?tab=access");

@@ -7989,6 +7989,124 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn clients_home_http_keeps_router_share_and_client_web_hosts_separate() {
+        let config = proxy_test_config("clients-home");
+        let proxy = Arc::new(ProxyRegistry::default());
+        proxy
+            .set_route(
+                "share-ui".into(),
+                "127.0.0.1:9".into(),
+                None,
+                Some("share-ui-id".into()),
+                Some("Share UI".into()),
+                false,
+                -1,
+                None,
+            )
+            .await;
+        proxy
+            .set_route_with_kind(
+                "client-ui".into(),
+                "127.0.0.1:9".into(),
+                RouteKind::ClientWeb,
+                Some("client-installation".into()),
+                None,
+                None,
+                None,
+                false,
+                -1,
+                None,
+            )
+            .await;
+        let state = proxy_test_state(&config, proxy);
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                crate::api::router(state).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let base = format!("http://{addr}");
+        let router = client
+            .get(format!("{base}/v1/ui/context"))
+            .header("host", "router.test")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(router.status(), StatusCode::OK);
+        assert_eq!(
+            router.headers().get("cache-control").unwrap(),
+            "private, no-store"
+        );
+        assert_eq!(
+            router.json::<serde_json::Value>().await.unwrap()["mode"],
+            "router"
+        );
+        let share = client
+            .get(format!("{base}/v1/ui/context"))
+            .header("host", "share-ui.router.test")
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap();
+        assert_eq!(share["mode"], "share");
+        assert_eq!(share["shareId"], "share-ui-id");
+        assert_eq!(
+            client
+                .get(format!("{base}/v1/ui/context"))
+                .header("host", "client-ui.router.test")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            client
+                .get(format!("{base}/v1/ui/context"))
+                .header("host", "unknown.test")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        let alias = client
+            .get(format!("{base}/clients/?marketShare=s&seatId=p"))
+            .header("host", "router.test")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(alias.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(
+            alias.headers().get("location").unwrap(),
+            "/?marketShare=s&seatId=p"
+        );
+        // A Share host's old path remains a Share proxy request, never a
+        // Router alias; the disconnected fixture backend yields a proxy error.
+        let share_alias = client
+            .get(format!("{base}/clients/"))
+            .header("host", "share-ui.router.test")
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(share_alias.status(), StatusCode::PERMANENT_REDIRECT);
+        server.abort();
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
     fn proxy_test_config(name: &str) -> Config {
         let data_dir = std::env::temp_dir();
         let db_path = data_dir.join(format!(

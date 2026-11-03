@@ -414,8 +414,8 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/auth/session/refresh", post(refresh_session))
         .route("/v1/auth/session/logout", post(logout_session))
         .route("/v1/auth/session/me", get(session_me))
-        .route("/v1/auth/home", get(get_home_entry).put(put_home_entry))
         .route("/share-api/context", get(share_api_context))
+        .route("/v1/ui/context", get(ui_context))
         .route("/share-api/share", get(share_api_share))
         .route("/share-api/auth/me", get(share_api_auth_me))
         .route(
@@ -1897,6 +1897,45 @@ async fn admin_announcement_update(
     Ok(Json(updated))
 }
 
+fn is_router_ui_host(host: &axum::http::uri::Authority, tunnel_domain: &str) -> bool {
+    let name = host
+        .host()
+        .trim_matches(|c| c == '[' || c == ']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    crate::config::tunnel_domain_host(tunnel_domain).is_some_and(|configured| name == configured)
+        || matches!(name.as_str(), "localhost" | "127.0.0.1" | "::1")
+}
+
+async fn ui_context(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.parse::<axum::http::uri::Authority>().ok())
+        .ok_or_else(|| AppError::BadRequest("invalid UI host".into()))?;
+    if let Some(route) = state
+        .proxy
+        .backend_for_host(host.as_str(), &state.config.tunnel_domain)
+        .await
+    {
+        if let Some(share_id) = route.share_id() {
+            return Ok(([(header::CACHE_CONTROL, "private, no-store")], Json(serde_json::json!({"mode":"share","shareId":share_id,"subdomain":route.subdomain()}))).into_response());
+        }
+        return Err(AppError::NotFound("not a Router UI host".into()));
+    }
+    if is_router_ui_host(&host, &state.config.tunnel_domain) {
+        return Ok((
+            [(header::CACHE_CONTROL, "private, no-store")],
+            Json(serde_json::json!({"mode":"router"})),
+        )
+            .into_response());
+    }
+    Err(AppError::NotFound("UI host not found".into()))
+}
+
 async fn share_api_context(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -3370,42 +3409,6 @@ async fn logout_session(
     ))
 }
 
-async fn require_session_user(
-    state: &ServerState,
-    headers: &HeaderMap,
-) -> Result<AuthSession, AppError> {
-    resolve_router_session(state, headers)
-        .await?
-        .ok_or_else(|| AppError::Unauthorized("authenticated owner session required".into()))
-}
-
-async fn get_home_entry(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-) -> Result<Json<crate::models::HomeEntryStatus>, AppError> {
-    let session = require_session_user(&state, &headers).await?;
-    Ok(Json(
-        state
-            .store
-            .home_entry_status(&session.user_id, &session.email)
-            .await?,
-    ))
-}
-
-async fn put_home_entry(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Json(input): Json<crate::models::PutHomeEntryRequest>,
-) -> Result<Json<crate::models::HomeEntryStatus>, AppError> {
-    let session = require_session_user(&state, &headers).await?;
-    Ok(Json(
-        state
-            .store
-            .set_home_entry(&session.user_id, &session.email, input.entry, input.source)
-            .await?,
-    ))
-}
-
 async fn session_me(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -3604,11 +3607,22 @@ async fn ui_or_proxy_handler(
         return proxy_handler(State(state), ConnectInfo(peer), req).await;
     }
     if matches!(*req.method(), Method::GET | Method::HEAD) {
+        if let Some(destination) = legacy_clients_destination(req.uri()) {
+            return axum::response::Redirect::permanent(&destination).into_response();
+        }
         if let Some(response) = ui_response_for_request_path(req.uri().path(), req.headers()) {
             return response;
         }
     }
     proxy_handler(State(state), ConnectInfo(peer), req).await
+}
+
+fn legacy_clients_destination(uri: &axum::http::Uri) -> Option<String> {
+    matches!(uri.path(), "/clients" | "/clients/").then(|| {
+        uri.query()
+            .map(|q| format!("/?{q}"))
+            .unwrap_or_else(|| "/".into())
+    })
 }
 
 fn is_router_share_ui_path(path: &str) -> bool {
@@ -4435,6 +4449,56 @@ mod tests {
             assert!(
                 !is_router_share_ui_path(path),
                 "{path} should not be router UI"
+            );
+        }
+    }
+
+    #[test]
+    fn clients_home_alias_is_exact_and_preserves_encoded_task_queries() {
+        for path in ["/clients", "/clients/"] {
+            assert_eq!(
+                legacy_clients_destination(&path.parse().unwrap()).as_deref(),
+                Some("/")
+            );
+            assert_eq!(
+                legacy_clients_destination(
+                    &format!("{path}?marketShare=s&seatId=p&chat=a%2Fb")
+                        .parse()
+                        .unwrap()
+                )
+                .as_deref(),
+                Some("/?marketShare=s&seatId=p&chat=a%2Fb")
+            );
+        }
+        for path in ["/", "/client-market/", "/clients-extra", "/clients/child"] {
+            assert!(legacy_clients_destination(&path.parse().unwrap()).is_none());
+        }
+    }
+
+    #[test]
+    fn router_ui_host_supports_configured_ports_and_local_development_not_unrelated_hosts() {
+        for host in [
+            "router.test",
+            "ROUTER.test:443",
+            "router.test.",
+            "localhost:3000",
+            "127.0.0.1:8787",
+            "[::1]:8787",
+        ] {
+            assert!(
+                is_router_ui_host(&host.parse().unwrap(), "router.test:443"),
+                "{host}"
+            );
+        }
+        for host in [
+            "unknown.test",
+            "s.router.test",
+            "api.router.test",
+            "router.test.evil",
+        ] {
+            assert!(
+                !is_router_ui_host(&host.parse().unwrap(), "router.test"),
+                "{host}"
             );
         }
     }

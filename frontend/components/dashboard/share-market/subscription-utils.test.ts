@@ -8,6 +8,7 @@ import {
   needsRentalAttention,
   partitionShareMarketSubscriptions,
   rentalReleaseMode,
+  rentalShareLabel,
   sortShareMarketSubscriptions,
   subscriptionsNeedGrantPolling,
 } from "./subscription-utils";
@@ -25,6 +26,30 @@ const subscription = (
   integrityState: extra.integrityState || "compatible",
   ...extra,
 }) as ShareMarketSubscription;
+
+test("rental Share labels use subdomains even when display names are Provider emails", () => {
+  for (const status of ["active_postpaid", "released"]) {
+    const rentals = ["pearltoo--r0pu9iwq81", "another-share"].map((subdomain) => subscription(subdomain, status, {
+      shareId: `share-${subdomain}`,
+      shareName: "provider@example.com",
+      ownerEmail: "provider@example.com",
+      subdomain: ` ${subdomain} `,
+    }));
+    assert.deepEqual(rentals.map(rentalShareLabel), ["pearltoo--r0pu9iwq81", "another-share"]);
+  }
+});
+
+test("rentals without a subdomain fall back to Share ID, never Provider email", () => {
+  for (const subdomain of [undefined, "", " \t "]) {
+    const rental = subscription("history", "released", {
+      shareId: "share-archived",
+      shareName: "provider@example.com",
+      ownerEmail: "provider@example.com",
+      subdomain,
+    });
+    assert.equal(rentalShareLabel(rental), "share-archived");
+  }
+});
 
 test("history is completed releases only", () => {
   assert.equal(isHistorySubscription("released"), true);

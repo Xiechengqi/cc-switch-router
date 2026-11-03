@@ -123,8 +123,10 @@ test("catalog wiring separates seat dialogs from Share drawers and isolates nest
   assert.match(catalog, /onOpen=\{\(seat\) => seat \? onOpenSeat\(seat\) : onOpen\(\)\}/);
   assert.match(catalog, /onOpenSeat=\{\(seat\) => openSeat\(listing, seat\)\}/);
   assert.match(catalog, /setSelected\(null\);\s*setSeatSelection\(\{ shareId: listing\.shareId, seatId: seat\.id \}\)/);
-  assert.match(catalog, /closeDetails\(\);\s*setRentTarget\(/);
-  assert.match(catalog, /<CatalogSeatDialog\s+target=\{seatTarget\}/);
+  assert.match(catalog, /const checkout = useShareSeatCheckout\(/);
+  assert.match(catalog, /onPresented: \(\) => \{ setSelected\(null\); setSeatSelection\(null\); \}/);
+  assert.match(catalog, /await checkout.open\(item\)/);
+  assert.match(catalog, /<CatalogSeatDialog\s+target=\{checkout.interactionActive \|\| accessTarget \? null : seatTarget\}/);
   assert.match(catalog, /const pausePolling = !!seatSelection \|\|/);
   const dialog = source("./catalog-seat-dialog.tsx");
   assert.match(dialog, /const terms = subscription \?\? seat/);

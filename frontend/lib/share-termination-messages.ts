@@ -1,4 +1,5 @@
 export const shareTerminationMessagesEn = {
+  "shareTermination.immediate": "End rental now",
   "shareTermination.title": "End Share rental now",
   "shareTermination.details": "Share rental settlement",
   "shareTermination.help": "Access and billing stop now. Remaining rent returns to your platform balance after the original seat access and final usage are confirmed. Other riders are unaffected.",
@@ -49,6 +50,7 @@ export const shareTerminationMessagesEn = {
   "shareTermination.blocked.paidPeriodRollingOver": "The next paid period is being confirmed. Refresh shortly to end the rental.",
 } as const;
 export const shareTerminationMessagesZh: Record<keyof typeof shareTerminationMessagesEn, string> = {
+  "shareTermination.immediate": "立即退租",
   "shareTermination.title": "立即退租 Share", "shareTermination.details": "Share 退租结算",
   "shareTermination.help": "立即停止访问与计费。原车位授权撤销、最终用量确认后，剩余租金退回平台余额，不影响其他拼车用户。",
   "shareTermination.estimate": "当前为预估：最终消费可能减少返还金额。已交付租金按服务时长与额度消耗两者取高，不重复相加。",

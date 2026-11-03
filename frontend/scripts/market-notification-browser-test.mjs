@@ -52,7 +52,7 @@ try {
     const url = new URL(route.request().url());
     const path = url.pathname;
     if (route.request().method() !== "GET") { writes.push(path); return json(route, {}, 405); }
-    if (path === "/v1/auth/home") return json(route, { hasActivity: true, entry: null, source: null });
+    if (path === "/v1/ui/context") return json(route, { mode: "router" });
     if (path === "/v1/auth/session/me") return json(route, { authenticated: true, isAdmin: admin,
       user: { id: "admin", email: "admin@example.test" }, password: { hasPassword: true, version: 1 } });
     if (path === "/v1/admin/market-notifications") {
@@ -141,7 +141,7 @@ try {
   const centerWrites = [], feedRequests = [];
   await inbox.route("**/v1/**", async route => {
     const url = new URL(route.request().url()), path = url.pathname;
-    if (path === "/v1/auth/home") return json(route, { hasActivity: true, entry: null, source: null });
+    if (path === "/v1/ui/context") return json(route, { mode: "router" });
     if (path === "/v1/auth/session/me") return json(route, { authenticated: !!actor, isAdmin: false,
       user: actor ? { id: actor, email: `${actor}@example.test` } : null, password: { hasPassword: true, version: 1 } });
     if (path === "/v1/notifications") {

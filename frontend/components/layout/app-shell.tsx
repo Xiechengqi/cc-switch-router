@@ -300,6 +300,10 @@ function Topbar({ active }: { active: DashboardShellActive }) {
   }, []);
 
   React.useEffect(() => {
+    window.dispatchEvent(new CustomEvent("router-login-dialog-changed", { detail: { open: loginOpen } }));
+  }, [loginOpen]);
+
+  React.useEffect(() => {
     if (!clientRedirect || loading || !authed || loginOpen || passwordSettingsOpen || redirectStartedRef.current) return;
     redirectStartedRef.current = true;
     refreshAccessToken()

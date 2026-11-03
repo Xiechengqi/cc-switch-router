@@ -4,11 +4,11 @@ import { usePathname } from "next/navigation";
 import * as React from "react";
 import { AppShell } from "@/components/layout/app-shell";
 import { DashboardLayout } from "@/components/layout/dashboard-layout";
-import { StartGate } from "@/components/start/start-gate";
+import { RootPage } from "@/components/root-page";
 import { pathnameForDashboardShell } from "@/lib/dashboard-nav";
 
 export function DashboardRouteLayout({ children }: { children: React.ReactNode }) {
-  const pathname = usePathname() || "/clients/";
+  const pathname = usePathname() || "/";
   const active = pathnameForDashboardShell(pathname);
   const previousPathnameRef = React.useRef(pathname);
 
@@ -22,10 +22,10 @@ export function DashboardRouteLayout({ children }: { children: React.ReactNode }
   }, [pathname]);
 
   return (
-    <StartGate>
+    <RootPage>
       <AppShell active={active}>
         <DashboardLayout>{children}</DashboardLayout>
       </AppShell>
-    </StartGate>
+    </RootPage>
   );
 }

@@ -68,7 +68,7 @@ export function notificationHref(item: UserNotification): string {
     return clientTerminationHref(typeof item.payload.terminationId === "string" ? item.payload.terminationId : item.objectId);
   }
   if (item.category === "system") return "/metrics/?tab=alerts";
-  if (item.category === "client") return `/clients/?focusKind=client&focusId=${encodeURIComponent(item.objectId)}&drawerKind=client&drawerId=${encodeURIComponent(item.objectId)}`;
+  if (item.category === "client") return `/?focusKind=client&focusId=${encodeURIComponent(item.objectId)}&drawerKind=client&drawerId=${encodeURIComponent(item.objectId)}`;
   if (item.eventKind === "c2c_order_updated" && typeof item.payload.orderId === "string") {
     return `/account/wallet/?c2cOrder=${encodeURIComponent(item.payload.orderId)}`;
   }

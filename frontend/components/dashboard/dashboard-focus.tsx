@@ -96,7 +96,7 @@ function focusExists(data: DashboardResponse, target: DashboardFocusTarget) {
 
 export function DashboardFocusProvider({ data, children }: { data: DashboardResponse | null; children: React.ReactNode }) {
   const router = useRouter();
-  const pathname = usePathname() || "/clients/";
+  const pathname = usePathname() || "/";
   const [target, setTarget] = React.useState<DashboardFocusTarget | null>(null);
   const [drawerTarget, setDrawerTarget] = React.useState<{ kind: "client" | "share"; id: string } | null>(null);
   const restoredRef = React.useRef(false);

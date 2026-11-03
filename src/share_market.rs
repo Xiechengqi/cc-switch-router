@@ -27,6 +27,7 @@ use crate::models::{
 use crate::share_value_pricing::ValueQuota;
 use crate::store::{AppStore, ShareRouteTarget, fetch_share_runtime_snapshot_from_route};
 
+mod client_entries;
 pub(crate) mod control_policy;
 mod control_recovery;
 pub(crate) use control_recovery::reject_invalid_reply_tx;
@@ -848,6 +849,7 @@ fn default_free_pricing_model() -> String {
 
 pub fn router() -> Router<ServerState> {
     Router::new()
+        .merge(client_entries::router())
         .route(
             "/v1/share-market/listings",
             get(list_catalog).post(create_listing),
@@ -4148,6 +4150,7 @@ fn catalog_subscription_records(
     conn: &Connection,
     viewer_user_id: &str,
     scope: ShareMarketCatalogScope,
+    share_ids_json: Option<&str>,
 ) -> Result<HashMap<String, SubscriptionRecord>, AppError> {
     let visibility = catalog_visibility_predicate(scope, "share");
     let (cte, filter) = match scope {
@@ -4288,12 +4291,13 @@ fn catalog_subscription_records(
                 sub.value_limit_usd_micros
          FROM share_market_subscriptions sub
          LEFT JOIN shares share ON share.share_id = sub.share_id
-         WHERE {filter}"
+         WHERE ({filter})
+           AND (?2 IS NULL OR sub.share_id IN (SELECT value FROM json_each(?2)))"
     );
     conn.prepare(&sql)
         .and_then(|mut statement| {
             statement
-                .query_map(params![viewer_user_id], |row| {
+                .query_map(params![viewer_user_id, share_ids_json], |row| {
                     let record = SubscriptionRecord {
                         id: row.get(0)?,
                         seat_id: row.get(1)?,
@@ -4582,6 +4586,7 @@ fn catalog_seats(
     conn: &Connection,
     viewer_user_id: &str,
     scope: ShareMarketCatalogScope,
+    share_ids_json: Option<&str>,
 ) -> Result<HashMap<String, Vec<CatalogSeatRecord>>, AppError> {
     let visibility = catalog_visibility_predicate(scope, "share");
     let public_seat_filter = if scope == ShareMarketCatalogScope::Public {
@@ -4605,6 +4610,7 @@ fn catalog_seats(
          LEFT JOIN shares share ON share.share_id = listing.share_id
          WHERE seat.status != 'deleted' AND listing.deleted_at IS NULL
            AND ({visibility})
+           AND (?2 IS NULL OR listing.share_id IN (SELECT value FROM json_each(?2)))
            {public_seat_filter}
          ORDER BY seat.listing_id,
                   CASE WHEN seat.retired_at IS NULL THEN 0 ELSE 1 END,
@@ -4614,7 +4620,7 @@ fn catalog_seats(
         .prepare(&sql)
         .and_then(|mut statement| {
             statement
-                .query_map(params![viewer_user_id], |row| {
+                .query_map(params![viewer_user_id, share_ids_json], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         CatalogSeatRecord {
@@ -5452,6 +5458,21 @@ impl AppStore {
         active_subdomains: &[String],
         scope: ShareMarketCatalogScope,
     ) -> Result<ShareMarketCatalog, AppError> {
+        self.share_market_catalog_filtered(viewer, active_subdomains, scope, None)
+            .await
+    }
+
+    async fn share_market_catalog_filtered(
+        &self,
+        viewer: Option<&AuthSession>,
+        active_subdomains: &[String],
+        scope: ShareMarketCatalogScope,
+        share_ids: Option<&[String]>,
+    ) -> Result<ShareMarketCatalog, AppError> {
+        let share_ids_json = share_ids
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| AppError::Internal(format!("encode catalog filter: {error}")))?;
         let conn = self.conn.lock().await;
         let visibility = catalog_visibility_predicate(scope, "s");
         let listings_sql = format!(
@@ -5471,6 +5492,7 @@ impl AppStore {
              LEFT JOIN shares s ON s.share_id = listing.share_id
              WHERE listing.deleted_at IS NULL
                AND ({visibility})
+               AND (?2 IS NULL OR listing.share_id IN (SELECT value FROM json_each(?2)))
              ORDER BY listing.created_at DESC"
         );
         let mut listings_statement = conn
@@ -5478,7 +5500,7 @@ impl AppStore {
             .map_err(map_db("prepare Share Market catalog"))?;
         let viewer_user_id = viewer.map(|value| value.user_id.as_str()).unwrap_or("");
         let listing_rows = listings_statement
-            .query_map(params![viewer_user_id], |row| {
+            .query_map(params![viewer_user_id, share_ids_json], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -5519,8 +5541,10 @@ impl AppStore {
             .collect::<HashSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        let mut seats_by_listing = catalog_seats(&conn, viewer_user_id, scope)?;
-        let subscription_records = catalog_subscription_records(&conn, viewer_user_id, scope)?;
+        let mut seats_by_listing =
+            catalog_seats(&conn, viewer_user_id, scope, share_ids_json.as_deref())?;
+        let subscription_records =
+            catalog_subscription_records(&conn, viewer_user_id, scope, share_ids_json.as_deref())?;
         let related_user_ids = listing_rows
             .iter()
             .map(|row| row.4.clone())
@@ -13342,6 +13366,7 @@ pub async fn run_service(state: ServerState) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod client_entries_tests;
     mod control_recovery_tests;
     mod provider_presentation_tests;
 

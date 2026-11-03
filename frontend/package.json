@@ -40,7 +40,7 @@
     "test:client-rental-audit-browser": "node scripts/client-rental-audit-browser-test.mjs",
     "test:wallet-checkout-browser": "node scripts/wallet-checkout-browser-test.mjs",
     "test:navbar-wallet-browser": "node scripts/navbar-wallet-browser-test.mjs",
-    "test:start-browser": "node scripts/start-browser-test.mjs",
+    "test:client-share-home": "tsx --test lib/home-entry.test.ts lib/client-share-market.test.ts lib/share-checkout-recovery.test.ts",
     "test:auth-password": "tsx --test lib/password-auth.test.ts lib/password-auth-transport.test.ts",
     "test:market-notifications": "tsx --test lib/market-notification-diagnostics.test.ts lib/user-notifications.test.ts",
     "test:market-notifications-browser": "node scripts/market-notification-browser-test.mjs",

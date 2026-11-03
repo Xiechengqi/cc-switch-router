@@ -2,6 +2,8 @@
 
 import { Alert } from "@heroui/react";
 import { Loader2 } from "lucide-react";
+import Link from "next/link";
+import { ClientShareMarketProvider } from "./client-share-market";
 import { ClientBoard } from "@/components/dashboard/client-board";
 import { LiveMap } from "@/components/dashboard/live-map";
 import { useDashboardData } from "@/components/dashboard/dashboard-data";
@@ -24,9 +26,11 @@ export function ClientsPage() {
   }
 
   return (
+    <ClientShareMarketProvider onChanged={refresh}>
     <main className="mx-auto grid min-w-0 w-[calc(100%-2rem)] max-w-7xl grid-cols-[minmax(0,1fr)] gap-5 pb-6" aria-busy={refreshing}>
       <h1 className="sr-only">{t("nav.clientsTab")}</h1>
       {error ? <Alert status="danger" className="!text-slate-900">{error}</Alert> : null}
+      {data && !data.clients.length && !data.shares?.length ? <section className="flex flex-wrap items-center gap-3 rounded-lg border border-border p-4 text-sm"><h2 className="font-medium">{t("home.empty")}</h2><Link href="/share-market/" className="text-primary hover:underline">{t("home.buyShare")}</Link><Link href="/client-market/" className="text-primary hover:underline">{t("home.rentClient")}</Link></section> : null}
       <LiveMap data={data} />
       <ClientBoard
         clients={data?.clients || []}
@@ -34,5 +38,6 @@ export function ClientsPage() {
         onChanged={refresh}
       />
     </main>
+    </ClientShareMarketProvider>
   );
 }

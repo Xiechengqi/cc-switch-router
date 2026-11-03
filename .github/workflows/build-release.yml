@@ -69,6 +69,7 @@ jobs:
           npm run test:market-wallet
           npm run test:market-notifications
           npm run test:share-market
+          npm run test:client-share-home
           npm run test:client-market
           npm run test:providers
           npm run test:share-model-probe

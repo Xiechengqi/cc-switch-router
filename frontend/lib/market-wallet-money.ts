@@ -137,7 +137,14 @@ export function safeMarketReturnPath(raw: string | null): string | null {
   try {
     const url = new URL(raw, "https://router.invalid");
     if (url.origin !== "https://router.invalid") return null;
-    if (url.pathname !== "/share-market/" && url.pathname !== "/client-market/") return null;
+    if (url.pathname === "/") {
+      const keys = [...url.searchParams.keys()];
+      if (!url.searchParams.has("marketShare") || keys.some(key => !["marketShare", "seatId", "subscriptionId"].includes(key))) return null;
+      for (const key of keys) {
+        const values = url.searchParams.getAll(key);
+        if (values.length !== 1 || !/^[A-Za-z0-9_-]{1,256}$/.test(values[0])) return null;
+      }
+    } else if (url.pathname !== "/share-market/" && url.pathname !== "/client-market/") return null;
     return `${url.pathname}${url.search}`;
   } catch {
     return null;

@@ -46,7 +46,7 @@ try {
     // read-only audit. Every other mutation remains forbidden in this test.
     if (route.request().method() !== "GET" && path !== "/v1/dashboard/presence") writes.push(path);
     if (path === "/v1/auth/session/me") return json(route, { authenticated: !!actor, isAdmin: actor === "admin", canAuditClientMarket: actor === "owner", user: actor ? { id: actor, email: `${actor}@example.test` } : null, password: { hasPassword: true, version: 1 } });
-    if (path === "/v1/auth/home") return json(route, { hasActivity: true, entry: null, source: null });
+    if (path === "/v1/ui/context") return json(route, { mode: "router" });
     if (path === "/v1/client-market/hosts" || path === "/v1/client-market/my-rentals" || path === "/v1/regions") return json(route, []);
     if (path === "/v1/client-market/me/rentals") return json(route, emptyClientRentalsPage(url));
     if (path === "/v1/client-market/termination-workspace") return json(route, { hosts: [], actionRequiredCount: 0, canAdjudicate: actor === "owner", serverNow: at });

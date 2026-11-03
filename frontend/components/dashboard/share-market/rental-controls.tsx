@@ -4,6 +4,9 @@ import { shareTrialSummary } from "@/lib/share-trial";
 
 import * as React from "react";
 import { useAuth } from "@/components/auth/auth-provider";
+import { readAuthState } from "@/lib/auth";
+import { sameLoginContext } from "@/lib/password-auth";
+import { useQuotaActor } from "./seat-value-quota";
 import { Button } from "@heroui/react";
 import { Loader2, RotateCcw } from "lucide-react";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
@@ -159,7 +162,7 @@ export function RentalActions({
           {t(releaseMode === "period_end" ? "shareTermination.renewalOff" : "shareMarket.release")}
         </Button>
       ) : null}
-      {subscription.canTerminateImmediately && onTerminate ? <Button size="sm" variant="danger" className="h-7 min-w-0 px-2 text-xs" isDisabled={busy} onPress={onTerminate}>{t("shareTermination.title")}</Button> : null}
+      {subscription.canTerminateImmediately && onTerminate ? <Button size="sm" variant="danger" className="h-7 min-w-0 px-2 text-xs" isDisabled={busy} onPress={onTerminate}>{t("shareTermination.immediate")}</Button> : null}
       {subscription.terminationId && onViewTermination ? <Button size="sm" variant="outline" className="h-7 min-w-0 px-2 text-xs" onPress={onViewTermination}>{t("shareTermination.view")}</Button> : null}
       {blockedMessage ? <p className="basis-full text-xs leading-5 text-muted-foreground">{t(blockedMessage)}</p> : null}
     </div>
@@ -182,21 +185,33 @@ export function useShareMarketRentalActions(onChanged: () => Promise<void> | voi
   const [action, setAction] = React.useState<PendingAction | null>(null);
   const [error, setError] = React.useState("");
   const [termination, setTermination] = React.useState<ShareTerminationSelection | null>(null);
-  React.useEffect(() => { setTermination(null); }, [session?.user?.id]);
+  const actor = useQuotaActor();
+  const generation = React.useRef(0);
+  const flight = React.useRef(false);
+  React.useEffect(() => {
+    ++generation.current; flight.current = false;
+    setTermination(null); setAction(null); setBusyId(""); setError("");
+    return () => { ++generation.current; };
+  }, [actor, session?.user?.id]);
 
   const run = async (subscriptionId: string, operation: () => Promise<unknown>) => {
-    if (busyId) return;
+    if (flight.current) return;
+    const epoch = generation.current;
+    const auth = readAuthState();
+    const current = () => epoch === generation.current && sameLoginContext(auth, readAuthState());
+    flight.current = true;
     setBusyId(subscriptionId);
     setError("");
     try {
       await operation();
+      if (!current()) return;
       if (session?.user?.id) notifyMarketBalanceChanged(session.user.id);
       setAction(null);
       await onChanged();
     } catch (reason) {
-      setError(shareMarketMutationError(reason, t));
+      if (current()) setError(shareMarketMutationError(reason, t));
     } finally {
-      setBusyId("");
+      if (current()) { flight.current = false; setBusyId(""); }
     }
   };
 

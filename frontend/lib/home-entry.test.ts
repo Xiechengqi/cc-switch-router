@@ -1,85 +1,34 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { defaultDashboardRouteFromSearch } from "./dashboard-nav";
-import { HOME_ENTRIES, isGatedHomePath, isHomeTaskAddress, isSettledHomeEntryStatus, parseHomeEntryStatus, pathForHomeEntry, rememberHomeEntryStatus, resolveHomeGate, settledHomeEntryStatus } from "./home-entry";
+import { existsSync, readFileSync } from "node:fs";
+import { isClientsRoute, DASHBOARD_CLIENTS_PATH, defaultDashboardRouteFromSearch } from "./dashboard-nav";
+import { legacyClientsHref, parseUiContext, rootTaskHref } from "./home-entry";
 
-test("only the bare home and clients addresses can show the start page", () => {
-  assert.equal(isGatedHomePath("/"), true);
-  assert.equal(isGatedHomePath("/clients"), true);
-  assert.equal(isGatedHomePath("/clients/"), true);
-  assert.equal(isGatedHomePath("/client-market/"), false);
-  assert.equal(isGatedHomePath("/operations/"), false);
-  assert.equal(isHomeTaskAddress("/", ""), false);
-  assert.equal(isHomeTaskAddress("/clients/", ""), false);
-  assert.equal(isHomeTaskAddress("/", "?drawerKind=market"), true);
-  assert.equal(isHomeTaskAddress("/account/wallet/", "?topup=1"), true);
-  assert.equal(defaultDashboardRouteFromSearch("?topup=1"), "/account/wallet/");
-  assert.equal(defaultDashboardRouteFromSearch("?c2cSell=1"), "/account/wallet/");
-  assert.equal(defaultDashboardRouteFromSearch("?drawerKind=market"), "/share-market/");
-  assert.equal(defaultDashboardRouteFromSearch(""), "/clients/");
-});
-
-test("a saved entry maps to its page and rejects an unknown response", () => {
-  assert.equal(pathForHomeEntry("wallet"), "/account/wallet/");
-  assert.equal(pathForHomeEntry("providers"), "/account/provider-settings/");
-  assert.deepEqual(parseHomeEntryStatus({ hasActivity: false, entry: "providers", source: "choice" }), {
-    hasActivity: false,
-    entry: "providers",
-    source: "choice",
-  });
-  assert.equal(parseHomeEntryStatus({ hasActivity: false, entry: "elsewhere", source: "choice" }), null);
-  assert.equal(parseHomeEntryStatus({ hasActivity: true }), null);
-});
-
-test("explicit Clients navigation never returns to a saved market entry, with or without a trailing slash", () => {
-  for (const pathname of ["/clients", "/clients/"]) {
-    for (const entry of HOME_ENTRIES) {
-      assert.deepEqual(resolveHomeGate({ pathname, search: "", authed: true, loading: false, home: { hasActivity: false, entry, source: "choice" } }), {
-        screen: "content", redirect: null, needsHome: true,
-      });
-    }
-    for (const authed of [false, true]) {
-      const result = resolveHomeGate({ pathname, search: "", authed, loading: false, home: "failed" });
-      assert.equal(result.screen, "content");
-      assert.equal(result.redirect, null);
-    }
-    assert.equal(resolveHomeGate({ pathname, search: "", authed: true, loading: false, home: { hasActivity: true, entry: null, source: null } }).screen, "content");
+test("Clients is the real root page; exact legacy aliases retain queries and anchors", () => {
+  assert.equal(DASHBOARD_CLIENTS_PATH, "/");
+  assert.equal(defaultDashboardRouteFromSearch(""), "/");
+  for (const path of ["/clients", "/clients/"]) {
+    assert.equal(legacyClientsHref(path, "?chat=i&marketShare=s", "#details"), "/?chat=i&marketShare=s#details");
+    assert.equal(isClientsRoute(path), true);
   }
-});
-
-test("only the bare root applies saved entry preferences and safe fallbacks", () => {
-  for (const entry of HOME_ENTRIES) assert.equal(resolveHomeGate({ pathname: "/", search: "", authed: true, loading: false, home: { hasActivity: true, entry, source: "choice" } }).redirect, pathForHomeEntry(entry));
-  for (const authed of [false, true]) assert.equal(resolveHomeGate({ pathname: "/", search: "", authed, loading: false, home: "failed" }).redirect, "/clients/");
-  assert.equal(resolveHomeGate({ pathname: "/client-market/", search: null, authed: true, loading: false, home: null }).screen, "content");
-});
-
-test("first-use guidance, loading and task deep links retain their independent behavior", () => {
-  const base = { pathname: "/", search: "", authed: true, loading: false, home: null } as const;
-  assert.deepEqual(resolveHomeGate(base), { screen: "loading", redirect: null, needsHome: true });
-  assert.equal(resolveHomeGate({ ...base, loading: true }).needsHome, false);
-  assert.equal(resolveHomeGate({ ...base, search: null }).needsHome, false);
-  for (const pathname of ["/", "/clients", "/clients/"]) {
-    assert.equal(resolveHomeGate({ ...base, pathname, home: { hasActivity: false, entry: null, source: null } }).screen, "start");
+  for (const path of ["/client-market/", "/clients-extra", "/clients/child"]) {
+    assert.equal(legacyClientsHref(path), null);
+    assert.equal(isClientsRoute(path), false);
   }
-  assert.equal(resolveHomeGate({ ...base, search: "?topup=1" }).redirect, "/account/wallet/?topup=1");
-  assert.equal(resolveHomeGate({ ...base, search: "?drawerKind=market" }).redirect, "/share-market/?drawerKind=market");
-  assert.deepEqual(resolveHomeGate({ ...base, pathname: "/clients/", search: "?focusId=one" }), { screen: "content", redirect: null, needsHome: false });
+  assert.equal(isClientsRoute("/"), true);
+  assert.match(readFileSync(new URL("../app/(dashboard)/page.tsx", import.meta.url), "utf8"), /ClientsPage/);
+  assert.equal(existsSync(new URL("../app/page.tsx", import.meta.url)), false);
+  assert.equal(existsSync(new URL("../components/start/start-gate.tsx", import.meta.url)), false);
 });
-
-test("only settled home statuses are remembered across navigations", () => {
-  const firstUse = { hasActivity: false, entry: null, source: null } as const;
-  const chosen = { hasActivity: false, entry: "wallet", source: "choice" } as const;
-  const active = { hasActivity: true, entry: null, source: null } as const;
-  assert.equal(isSettledHomeEntryStatus(firstUse), false);
-  assert.equal(isSettledHomeEntryStatus(chosen), true);
-  assert.equal(isSettledHomeEntryStatus(active), true);
-
-  rememberHomeEntryStatus("user-a", firstUse);
-  assert.equal(settledHomeEntryStatus("user-a"), null);
-  rememberHomeEntryStatus("user-a", chosen);
-  assert.deepEqual(settledHomeEntryStatus("user-a"), chosen);
-  assert.equal(settledHomeEntryStatus("user-b"), null);
-  assert.equal(settledHomeEntryStatus(""), null);
-  rememberHomeEntryStatus("", active);
-  assert.equal(settledHomeEntryStatus(""), null);
+test("only explicit task links dispatch away from the root", () => {
+  for (const search of ["", "?tab=mine", "?chat=i", "?marketShare=s&seatId=p", "?drawerKind=share&drawerId=s"]) assert.equal(rootTaskHref(search), null);
+  assert.equal(rootTaskHref("?amount=10&returnTo=%2Fshare-market%2F"), "/account/wallet/?amount=10&returnTo=%2Fshare-market%2F");
+  assert.equal(rootTaskHref("?topup=t"), "/account/wallet/?topup=t");
+  assert.equal(rootTaskHref("?c2cOrder=o"), "/account/wallet/?c2cOrder=o");
+  assert.equal(rootTaskHref("?drawerKind=market&focus=s"), "/share-market/?drawerKind=market&focus=s");
+});
+test("host context fails closed and never mistakes an outage for a Router host", () => {
+  assert.deepEqual(parseUiContext({ mode: "router" }), { mode: "router" });
+  assert.deepEqual(parseUiContext({ mode: "share", shareId: "s", subdomain: "owner--s" }), { mode: "share", shareId: "s", subdomain: "owner--s" });
+  for (const value of [null, {}, {mode:"client"}, {mode:"share"}, {mode:"share",shareId:"",subdomain:"x"}]) assert.throws(() => parseUiContext(value));
 });

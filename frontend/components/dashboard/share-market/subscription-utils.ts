@@ -18,6 +18,11 @@ const ANOMALY_RANK = [
   "grant_pending",
 ];
 
+/** Display names may contain the Provider email; rental rows use routing identity. */
+export function rentalShareLabel(subscription: Pick<ShareMarketSubscription, "subdomain" | "shareId">) {
+  return subscription.subdomain?.trim() || subscription.shareId;
+}
+
 function isTerminalSubscription(status: string) {
   return status === "released" || status === "grant_failed";
 }

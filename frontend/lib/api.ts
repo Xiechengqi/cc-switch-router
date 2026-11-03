@@ -1744,11 +1744,14 @@ export async function deleteShareMarketListing(listingId: string) {
   );
 }
 
-export async function quoteShareMarketSeat(seatId: string) {
+export async function quoteShareMarketSeat(seatId: string, signal?: AbortSignal) {
+  const actor = readAuthState();
+  const timeout = AbortSignal.timeout(15_000);
   return parseJson<ShareMarketRentQuote>(
     await authFetch(`/v1/share-market/seats/${encodeURIComponent(seatId)}/quote`, {
       method: "POST",
-    }),
+      signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+    }, actor),
   );
 }
 
@@ -1758,20 +1761,23 @@ export async function rentShareMarketSeat(
   idempotencyKey: string,
   autoRenew = false,
 ) {
+  const actor = readAuthState();
   return parseJson<{ ok: true; subscriptionId: string; replayed: boolean }>(
     await authFetch(`/v1/share-market/seats/${encodeURIComponent(seatId)}/rent`, {
       method: "POST",
+      signal: AbortSignal.timeout(25_000),
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ quoteId, idempotencyKey, autoRenew }),
-    }),
+    }, actor),
   );
 }
 
 export async function releaseShareMarketSubscription(subscriptionId: string) {
+  const actor = readAuthState();
   return parseJson<{ ok: true }>(
     await authFetch(`/v1/share-market/subscriptions/${encodeURIComponent(subscriptionId)}/release`, {
       method: "POST",
-    }),
+    }, actor),
   );
 }
 

@@ -213,9 +213,9 @@ export function ShareTerminationRowAction({ shareId, seatId }: { shareId: string
     return () => { live = false; c?.abort(); window.clearInterval(timer); };
   }, [actor, shareId, seatId, revision, identity]);
   const items = data && data.identity === identity ? data.items : [];
-  return <div data-no-card-open className="flex flex-wrap gap-1">
-    {items.map(i => <Button key={i.id} size="sm" variant="danger" className="min-h-9 whitespace-nowrap text-xs" onPress={() => setSelected({ identity, id: i.id })}>{t(i.permissions.resolve ? "shareTermination.adjudicate" : "shareTermination.handle")}{items.length > 1 ? ` · ${i.buyerEmail}` : ""}</Button>)}
-    {error ? <span title={error}><Button variant="ghost" size="sm" onPress={() => refresh()}>{t("shareTermination.unavailable")}</Button></span> : null}
+  return <div data-no-card-open className="flex min-w-0 max-w-full flex-wrap gap-1">
+    {items.map(i => <Button key={i.id} size="sm" variant="danger" className="h-auto min-h-9 min-w-0 max-w-full whitespace-normal break-words text-xs [overflow-wrap:anywhere]" onPress={() => setSelected({ identity, id: i.id })}>{t(i.permissions.resolve ? "shareTermination.adjudicate" : "shareTermination.handle")}{items.length > 1 ? ` · ${i.buyerEmail}` : ""}</Button>)}
+    {error ? <span className="min-w-0 max-w-full" title={error}><Button variant="ghost" size="sm" className="h-auto min-h-9 min-w-0 max-w-full whitespace-normal break-words text-xs" onPress={() => refresh()}>{t("shareTermination.unavailable")}</Button></span> : null}
     <ShareTerminationDialog selection={selected?.identity === identity ? { id: selected.id } : null} onClose={() => setSelected(null)} onChanged={() => refresh()} />
   </div>;
 }

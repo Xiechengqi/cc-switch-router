@@ -30,7 +30,7 @@ import {
   rentalServiceTerm,
   useShareMarketRentalActions,
 } from "@/components/dashboard/share-market/rental-controls";
-import { needsRentalAttention, partitionShareMarketSubscriptions } from "@/components/dashboard/share-market/subscription-utils";
+import { needsRentalAttention, partitionShareMarketSubscriptions, rentalShareLabel } from "@/components/dashboard/share-market/subscription-utils";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { trialHours, walletLifecycleKey } from "@/lib/client-checkout";
 import { shareMarketHref } from "@/lib/dashboard-nav";
@@ -217,6 +217,8 @@ function RentalDetail({
   );
 }
 
+export { RentalDetail as ShareRentalDetail };
+
 export function AccountShareRentals({
   subscriptions,
   onChanged,
@@ -293,7 +295,7 @@ export function AccountShareRentals({
         <div className="grid min-w-0 gap-0.5">
           <span className="flex min-w-0 items-center gap-2">
             <span className="hidden sm:inline-flex"><RentalApps subscription={subscription} size={14} /></span>
-            <span className="min-w-0 truncate font-medium">{subscription.shareName}</span>
+            <span className="min-w-0 truncate font-medium" title={rentalShareLabel(subscription)}>{rentalShareLabel(subscription)}</span>
             <OnlineDot online={subscription.shareOnline} />
           </span>
           <span className="truncate text-xs text-muted-foreground md:hidden">{subscription.ownerEmail}</span>
@@ -337,7 +339,7 @@ export function AccountShareRentals({
       cell: (subscription) => {
         const url = subdomainTunnelUrl(subscription.subdomain);
         return url ? (
-          <a href={url} target="_blank" rel="noopener noreferrer" aria-label={`${t("account.share.openShare")} · ${subscription.shareName}`} title={t("account.share.openShare")}
+          <a href={url} target="_blank" rel="noopener noreferrer" aria-label={`${t("account.share.openShare")} · ${rentalShareLabel(subscription)}`} title={t("account.share.openShare")}
             className="inline-flex size-9 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring">
             <ExternalLink className="h-4 w-4" aria-hidden />
           </a>
@@ -357,7 +359,7 @@ export function AccountShareRentals({
         <ExpandableRecordTable
           rows={current}
           rowKey={(subscription) => subscription.id}
-          rowLabel={(subscription) => subscription.shareName}
+          rowLabel={rentalShareLabel}
           ariaLabel={t("account.share.active")}
           columns={columns}
           rowTone={(subscription) => needsRentalAttention(subscription) ? "attention" : undefined}
@@ -376,7 +378,7 @@ export function AccountShareRentals({
       </section> : null}
       <section className="grid min-w-0 gap-2" aria-labelledby="account-share-rentals-history">
         <h4 id="account-share-rentals-history" className="text-sm font-semibold text-muted-foreground">{t("account.share.history")} · {historyCount}</h4>
-        <ExpandableRecordTable rows={pagedHistory?.items ?? history} rowKey={(item) => item.id} rowLabel={(item) => item.shareName}
+        <ExpandableRecordTable rows={pagedHistory?.items ?? history} rowKey={(item) => item.id} rowLabel={rentalShareLabel}
           columns={columns.filter((column) => column.id !== "open")}
           ariaLabel={t("account.share.history")} focusKey={focusId}
           renderDetail={(subscription) => <RentalDetail subscription={subscription} busy={false} {...rentals.rowActions(subscription)} onChanged={onChanged} />}

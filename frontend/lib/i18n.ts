@@ -22,6 +22,7 @@ import { accountSectionMessagesEn, accountSectionMessagesZh } from "@/lib/accoun
 import { walletActionsMessagesEn, walletActionsMessagesZh } from "@/lib/wallet-actions-messages";
 import { valueQuotaMessagesEn, valueQuotaMessagesZh } from "@/lib/share-value-quota-messages";
 import { providerRankMessagesEn, providerRankMessagesZh } from "@/lib/provider-rank-messages";
+import { clientShareMessagesEn, clientShareMessagesZh } from "@/lib/client-share-messages";
 
 export const LOCALE_STORAGE_KEY = "cc_switch_router_locale_v1";
 export const SUPPORTED_LOCALES = ["en", "zh-CN"] as const;
@@ -31,6 +32,7 @@ export type MessageKey = keyof typeof messages.en;
 
 export const messages = {
   en: {
+    ...clientShareMessagesEn,
     ...rentalAuditMessagesEn,
     ...clientRentalsMessagesEn,
     ...notificationCenterMessagesEn,
@@ -107,19 +109,6 @@ export const messages = {
     "nav.dashboardSections": "Dashboard sections",
     "nav.logout": "Logout",
     "nav.login": "Login",
-    "start.title": "What do you want to do first?",
-    "start.summary": "Rent a client, buy a shared allowance, manage your balance, or list something for sale.",
-    "start.recommended": "Suggested first step",
-    "start.rentClient": "Rent a client",
-    "start.buyShare": "Buy a shared allowance",
-    "start.addBalance": "Add balance",
-    "start.sell": "List something for sale",
-    "start.skip": "Skip for now",
-    "start.error": "That choice could not be saved. Try again.",
-    "start.home.title": "Home entry",
-    "start.home.clients": "Clients",
-    "start.home.save": "Save home entry",
-    "start.home.saved": "Saved.",
     "dashboard.emptyClients.rent": "Rent one in Client Market",
     "dashboard.emptyClients.balance": "Add balance",
     "clientLogs.button": "Logs",
@@ -3504,6 +3493,7 @@ export const messages = {
     ...providerRankMessagesEn,
   },
   "zh-CN": {
+    ...clientShareMessagesZh,
     ...rentalAuditMessagesZh,
     ...clientRentalsMessagesZh,
     ...notificationCenterMessagesZh,
@@ -3578,19 +3568,6 @@ export const messages = {
     "nav.dashboardSections": "控制台分区",
     "nav.logout": "退出登录",
     "nav.login": "登录",
-    "start.title": "先做哪一件？",
-    "start.summary": "这里可以租客户端、买共享额度、管理余额，也可以发布出售。",
-    "start.recommended": "建议的第一步",
-    "start.rentClient": "租一个客户端",
-    "start.buyShare": "买一段共享额度",
-    "start.addBalance": "充值或购入余额",
-    "start.sell": "发布并出售",
-    "start.skip": "先跳过",
-    "start.error": "这次选择没有保存，请再试一次。",
-    "start.home.title": "更改首页入口",
-    "start.home.clients": "客户端",
-    "start.home.save": "保存首页入口",
-    "start.home.saved": "已保存。",
     "dashboard.emptyClients.rent": "去 Client 市场租一个",
     "dashboard.emptyClients.balance": "去平台余额充值",
     "clientLogs.button": "日志",

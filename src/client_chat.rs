@@ -135,14 +135,14 @@ fn chat_room_url(dashboard_url: &str, installation_id: &str) -> String {
     Url::parse(dashboard_url)
         .ok()
         .map(|mut url| {
-            url.set_path("/clients");
+            url.set_path("/");
             url.set_query(None);
             url.query_pairs_mut().append_pair("chat", installation_id);
             url.to_string()
         })
         .unwrap_or_else(|| {
             format!(
-                "{}/clients?chat={installation_id}",
+                "{}/?chat={installation_id}",
                 dashboard_url.trim_end_matches('/')
             )
         })
@@ -321,6 +321,6 @@ mod tests {
         assert!(rendered.html.contains("second"));
         assert!(rendered.text.contains("[alice]"));
         assert!(rendered.text.contains("[bob]"));
-        assert!(rendered.html.contains("/clients?chat=client-1"));
+        assert!(rendered.html.contains("/?chat=client-1"));
     }
 }

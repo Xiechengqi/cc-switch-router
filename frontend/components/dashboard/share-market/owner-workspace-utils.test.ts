@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import type {
   ShareMarketListing,
@@ -28,6 +29,25 @@ import {
 } from "./owner-workspace-utils";
 import { shareMarketMutationError } from "./market-utils";
 import { ApiError } from "@/lib/api";
+
+test("owned-seat action groups and labels stay within their fixed-width table column", () => {
+  const source = readFileSync(new URL("./owner-workspace.tsx", import.meta.url), "utf8");
+  const button = source.slice(source.indexOf("const renderActionButton ="), source.indexOf("const renderActionGroup ="));
+  assert.match(button, /<span key=\{action.key\} className="min-w-0 max-w-full"/);
+  assert.match(button, /"min-w-0 max-w-full"/);
+  assert.match(button, /h-auto min-h-7 whitespace-normal break-words/);
+  assert.match(button, /aria-label=\{action.label\}/, "wrapping preserves the full accessible label");
+
+  const group = source.slice(source.indexOf("const renderActionGroup ="), source.indexOf("const renderSeatActions ="));
+  const groupClasses = [...group.matchAll(/className="([^"]+)"/g)].map((match) => match[1].split(" "));
+  assert.equal(groupClasses.length, 3, "outer group and both action subgroups are constrained");
+  assert.ok(groupClasses[0].includes("w-full"));
+  for (const classes of groupClasses) {
+    for (const required of ["min-w-0", "max-w-full", "flex-wrap"]) assert.ok(classes.includes(required), required);
+    assert.ok(!classes.includes("shrink-0"), "actions must not force their intrinsic width past the column");
+  }
+  assert.match(source, /overflow-x-auto rounded-md border border-slate-200[\s\S]*min-w-\[36rem\] table-fixed/, "small screens scroll the table rather than clipping actions");
+});
 
 function seat(
   id: string,

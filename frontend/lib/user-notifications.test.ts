@@ -33,7 +33,7 @@ test("notification links use existing local routes and cannot follow payload URL
   assert.equal(notificationHref({ ...item, payload: { href: "javascript:alert(1)" } }), "/account/wallet/");
   assert.equal(notificationHref({ ...item, eventKind: "c2c_order_updated", payload: { orderId: "one/two?x=1" } }), "/account/wallet/?c2cOrder=one%2Ftwo%3Fx%3D1");
   const client = new URL(notificationHref({ ...item, category: "client", objectId: "one&two" }), "https://router.test");
-  assert.equal(client.pathname, "/clients/");
+  assert.equal(client.pathname, "/");
   assert.equal(client.searchParams.get("focusId"), "one&two");
   assert.equal(client.searchParams.get("drawerId"), "one&two");
   assert.equal(notificationHref({ ...item, eventKind: "client_termination_claim" }), "/client-market/?terminationId=one");

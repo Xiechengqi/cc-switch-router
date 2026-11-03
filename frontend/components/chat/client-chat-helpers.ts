@@ -134,7 +134,7 @@ export function mergeMessages(current: LocalChatMessage[], incoming: ClientChatM
 export function chatRoomUrl(room: Pick<ClientChatRoom, "installationId">) {
   const url = new URL(window.location.href);
   url.search = "";
-  url.pathname = "/clients/";
+  url.pathname = "/";
   url.searchParams.set("chat", room.installationId);
   return url.toString();
 }

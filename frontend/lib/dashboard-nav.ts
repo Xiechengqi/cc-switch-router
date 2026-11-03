@@ -1,4 +1,4 @@
-export const DASHBOARD_CLIENTS_PATH = "/clients/";
+export const DASHBOARD_CLIENTS_PATH = "/";
 export const DASHBOARD_SHARE_MARKET_PATH = "/share-market/";
 export const DASHBOARD_CLIENT_MARKET_PATH = "/client-market/";
 export const DASHBOARD_PROVIDERS_PATH = "/providers/";
@@ -12,9 +12,6 @@ export const DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH = "/account/provider-setti
 export const DASHBOARD_ACCOUNT_USAGE_PATH = "/account/usage/";
 export const DASHBOARD_ACCOUNT_SECURITY_PATH = "/account/security/";
 export const DASHBOARD_ACCOUNT_NOTIFICATIONS_PATH = "/account/notifications/";
-/** The security page card that holds the home entry choice. */
-export const HOME_ENTRY_SECTION_ID = "home-entry";
-export const DASHBOARD_ACCOUNT_HOME_HREF = `${DASHBOARD_ACCOUNT_SECURITY_PATH}#${HOME_ENTRY_SECTION_ID}`;
 
 export const PROVIDER_INCOME_HREF = `${DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH}?tab=income`;
 export const PROVIDER_ACCESS_HREF = `${DASHBOARD_ACCOUNT_PROVIDER_SETTINGS_PATH}?tab=access`;
@@ -73,7 +70,7 @@ export function legacyAccountHref(pathname: string, search = ""): string | null 
   }
   switch (path) {
     case "/account/api-keys": return DASHBOARD_ACCOUNT_SECURITY_PATH;
-    case "/account/home": return DASHBOARD_ACCOUNT_HOME_HREF;
+    case "/account/home": return DASHBOARD_ACCOUNT_SECURITY_PATH;
     case "/account/consumer-usage": return `${DASHBOARD_ACCOUNT_USAGE_PATH}?view=consumer`;
     case "/account/provider-usage": return `${DASHBOARD_ACCOUNT_USAGE_PATH}?view=provider`;
     case "/account/market-access": return PROVIDER_ACCESS_HREF;
@@ -116,7 +113,7 @@ export function normalizeDashboardPath(pathname: string): DashboardRoute | null 
   // Keep old Token Market bookmarks safe, but land them on the built-in
   // Share Market rather than exposing a retired registry state.
   if (pathname.startsWith("/markets")) return DASHBOARD_SHARE_MARKET_PATH;
-  if (pathname.startsWith("/clients")) return DASHBOARD_CLIENTS_PATH;
+  if (isClientsRoute(pathname)) return DASHBOARD_CLIENTS_PATH;
   return null;
 }
 
@@ -157,7 +154,7 @@ export function pathnameForDashboardShell(pathname: string): DashboardShellActiv
 }
 
 export function isClientsRoute(pathname: string) {
-  return pathname.startsWith("/clients");
+  return pathname === "/" || /^\/clients\/?$/.test(pathname);
 }
 
 export function isClientMarketRoute(pathname: string) {

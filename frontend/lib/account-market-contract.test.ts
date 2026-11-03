@@ -44,6 +44,15 @@ test("record details mount lazily and use stable identity across refreshes", () 
   assert.match(source("components/dashboard/account-client-section.tsx"), /renderDetail=\{\(entry\) =>/);
 });
 
+test("Share rental tables and accessible labels use the subdomain identity", () => {
+  const rentals = source("components/dashboard/account-share-rentals.tsx");
+  const shareColumn = rentals.slice(rentals.indexOf('id: "share"'), rentals.indexOf('id: "provider"'));
+  assert.match(shareColumn, /title=\{rentalShareLabel\(subscription\)\}>\{rentalShareLabel\(subscription\)\}/);
+  assert.equal(rentals.match(/rowLabel=\{rentalShareLabel\}/g)?.length, 2, "current rentals and history share the same identity");
+  assert.doesNotMatch(rentals, /(?:subscription|item)\.shareName/);
+  assert.match(rentals, /title=\{subscription\.ownerEmail\}>\{subscription\.ownerEmail\}/, "Provider identity stays in its own column");
+});
+
 test("navbar actions are lazy and refocus the existing wallet instead of duplicating it", () => {
   const navbar = source("components/layout/navbar-wallet-balance.tsx");
   assert.match(navbar, /React\.lazy/);

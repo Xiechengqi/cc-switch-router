@@ -6,16 +6,15 @@ import * as React from "react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { AccountSectionHeader } from "@/components/dashboard/account-section";
 import { ApiTokenCard } from "@/components/dashboard/api-token-card";
-import { HomeEntryCard } from "@/components/dashboard/home-entry-card";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 
-/** Account & security: how scripts and people sign in, and where they land. */
+/** Account & security: how scripts and people sign in. */
 export function AccountSecurityPage() {
   const { t } = useLocaleText();
   const { session, openPasswordSettings } = useAuth();
   const password = session?.password;
 
-  // A link to the home entry card arrives with its anchor before the card exists.
+  // Preserve ordinary section anchors without a separate home-preference gate.
   React.useEffect(() => {
     const id = window.location.hash.slice(1);
     if (id) document.getElementById(id)?.scrollIntoView({ block: "start" });
@@ -42,7 +41,6 @@ export function AccountSecurityPage() {
           </Button>
         </section>
       ) : null}
-      <HomeEntryCard />
     </div>
   );
 }

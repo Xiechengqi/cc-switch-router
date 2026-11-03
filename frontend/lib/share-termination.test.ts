@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { parseShareTermination, parseShareTerminationPreview, shareTerminationBlockedMessage, shareTerminationHref, shareTerminationNoteValid, shareTerminationUnits, type ShareTermination } from "./share-termination";
 import { shareTerminationMessagesEn, shareTerminationMessagesZh } from "./share-termination-messages";
 
@@ -42,6 +43,28 @@ test("Share explanation bounds are UTF-8 bytes and deep links cannot escape thei
 test("Share termination messages have complete bilingual coverage", () => {
   assert.deepEqual(Object.keys(shareTerminationMessagesEn).sort(), Object.keys(shareTerminationMessagesZh).sort());
   for (const [key, value] of Object.entries(shareTerminationMessagesZh)) assert.ok(value, key);
+});
+
+test("Share rental buttons use concise copy while the confirmation keeps Share context", () => {
+  assert.equal(shareTerminationMessagesZh["shareTermination.immediate"], "立即退租");
+  assert.equal(shareTerminationMessagesEn["shareTermination.immediate"], "End rental now");
+  assert.match(shareTerminationMessagesZh["shareTermination.title"], /Share/);
+  const actions = readFileSync(new URL("../components/dashboard/share-market/rental-controls.tsx", import.meta.url), "utf8");
+  assert.match(actions, /onPress=\{onTerminate\}>\{t\("shareTermination.immediate"\)\}/);
+  assert.doesNotMatch(actions, /t\("shareTermination.title"\)/);
+});
+
+test("Share termination processing and recovery buttons wrap in narrow seat columns", () => {
+  const source = readFileSync(new URL("../components/market/share-termination-dialog.tsx", import.meta.url), "utf8");
+  const action = source.slice(source.indexOf("export function ShareTerminationRowAction"));
+  assert.match(action, /className="flex min-w-0 max-w-full flex-wrap gap-1"/);
+  const buttons = [...action.matchAll(/<Button[^>]+className="([^"]+)"/g)];
+  assert.equal(buttons.length, 2, "both the processing and failed-status retry buttons are bounded");
+  for (const [, className] of buttons) {
+    const classes = className.split(" ");
+    for (const required of ["h-auto", "min-w-0", "max-w-full", "whitespace-normal", "break-words"]) assert.ok(classes.includes(required), required);
+  }
+  assert.match(action, /\[overflow-wrap:anywhere\]/, "long buyer email addresses can wrap too");
 });
 
 test("Share termination blockers explain unavailable actions without guessing missing or unknown capabilities", () => {

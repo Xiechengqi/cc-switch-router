@@ -116,7 +116,7 @@ export function ClientTerminationRecord({ item, role, onOpen }: {
           <p>{t(item.providerRespondedAt ? "clientTermination.responded" : terminationTimeoutDue(item) ? "clientTermination.autoWaiverPending" : "clientTermination.claimHelp")}</p>
           {role === "provider" && !item.providerRespondedAt ? <p>{t("clientTermination.responseHelp")}</p> : null}
         </div> : item.resolution ? <p>{t(`clientTermination.${item.resolution}`)}</p> : null}
-        {item.disputeUsed && item.chatAvailable ? <div className="grid gap-1"><p className="text-muted-foreground">{t("clientTermination.chatHelp")}</p><a href={`/clients/?chat=${encodeURIComponent(item.installationId)}`} target="_blank" rel="noopener noreferrer" className="justify-self-start underline">{t("clientTermination.chat")}</a></div> : null}
+        {item.disputeUsed && item.chatAvailable ? <div className="grid gap-1"><p className="text-muted-foreground">{t("clientTermination.chatHelp")}</p><a href={`/?chat=${encodeURIComponent(item.installationId)}`} target="_blank" rel="noopener noreferrer" className="justify-self-start underline">{t("clientTermination.chat")}</a></div> : null}
         <div className="flex flex-wrap gap-2">
           <Button size="sm" variant="ghost" className="min-h-11" onPress={() => open(item)}>{t("clientTermination.rowHistory")}</Button>
           {(role === "buyer" ? terminationCanDispute(item) : terminationCanDecide(item)) ? <Button size="sm" variant="ghost" className="min-h-11" onPress={() => open(item, role === "buyer" ? "dispute" : "decision")}>{t(role === "buyer" ? "clientTermination.dispute" : role === "provider" ? "clientTermination.waive" : "clientTermination.resolve")}</Button> : null}

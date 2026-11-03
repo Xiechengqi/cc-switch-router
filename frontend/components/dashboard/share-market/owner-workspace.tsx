@@ -1228,12 +1228,12 @@ const renderActionButton = (action: {
     iconOnly?: boolean;
     onClick: () => void;
   }) => (
-    <span key={action.key} title={action.label}>
+    <span key={action.key} className="min-w-0 max-w-full" title={action.label}>
       <Button
         isIconOnly={action.iconOnly}
         size="sm"
         variant="ghost"
-        className={cn("h-7 min-w-0", action.iconOnly ? "w-7 px-0" : "px-2 text-xs")}
+        className={cn("min-w-0 max-w-full", action.iconOnly ? "h-7 w-7 px-0" : "h-auto min-h-7 whitespace-normal break-words px-2 py-1 text-xs leading-4")}
         aria-label={action.label}
         isDisabled={busy}
         onClick={action.onClick}
@@ -1249,14 +1249,14 @@ const renderActionGroup = (
   ) => {
     if (!compact.length && !destructive.length) return null;
     return (
-      <div data-no-card-open data-no-row-toggle className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+      <div data-no-card-open data-no-row-toggle className="flex w-full min-w-0 max-w-full flex-wrap items-center justify-end gap-2">
         {compact.length ? (
-          <div className="flex flex-wrap items-center justify-end gap-1">
+          <div className="flex min-w-0 max-w-full flex-wrap items-center justify-end gap-1">
             {compact.map(renderActionButton)}
           </div>
         ) : null}
         {destructive.length ? (
-          <div className="flex flex-wrap items-center justify-end gap-1">
+          <div className="flex min-w-0 max-w-full flex-wrap items-center justify-end gap-1">
             {destructive.map(renderActionButton)}
           </div>
         ) : null}
@@ -1623,7 +1623,7 @@ const renderSeatActions = (listing: ShareMarketListing, seat: ShareMarketSeat) =
                                 </td>
                                 <td className="px-2 py-2 tabular-nums">{formatSeatPrice(seat, locale, t("shareMarket.free"), t("market.day"))}</td>
                                 <td className="px-2 py-2 text-slate-500">
-                                  <div className="grid gap-0.5">
+                                  <div className="grid min-w-0 gap-0.5 break-words">
                                     <span>{seatQuotaLabel(seat, locale, t)}</span>
                                     {seat.subscription && !isSeatIdle(seat) ? (
                                       seat.valueQuota ? (
@@ -1642,7 +1642,7 @@ const renderSeatActions = (listing: ShareMarketListing, seat: ShareMarketSeat) =
                                   </div>
                                 </td>
                                 <td className="px-2 py-2">
-                                  <div className="flex justify-end">{renderSeatActions(selected, seat)}</div>
+                                  <div className="flex min-w-0 justify-end">{renderSeatActions(selected, seat)}</div>
                                   <ShareTerminationRowAction shareId={selected.shareId} seatId={seat.id} />
                                 </td>
                               </tr>

@@ -1,5 +1,7 @@
 "use client";
 
+import { ClientShareMarketEntryButton } from "./client-share-market";
+
 import { Card, toast } from "@heroui/react";
 import { Copy, Eye, Link2, Pencil, Plus, Route } from "lucide-react";
 import * as React from "react";
@@ -494,6 +496,7 @@ export const ShareCard = React.memo(function ShareCard({
             </div>
           </div>
         </div>
+        <div className="flex justify-end" data-no-row-drawer><ClientShareMarketEntryButton shareId={share.shareId} /></div>
       </Card.Content>
     </Card>
   );

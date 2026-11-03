@@ -94,7 +94,7 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
       const req = route.request(),
         path = new URL(req.url()).pathname;
       let body = {};
-      if (path === "/v1/auth/home") body = { hasActivity: true, entry: null, source: null };
+      if (path === "/v1/ui/context") body = { mode: "router" };
       else if (path === "/v1/auth/session/me")
         body = {
           authenticated: true,

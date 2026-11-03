@@ -22,7 +22,7 @@ export function ClientChatRoomHeader({
 }) {
   const { t } = useLocaleText();
   const router = useRouter();
-  const pathname = usePathname() || "/clients/";
+  const pathname = usePathname() || "/";
   const focus = useDashboardFocus();
 
   async function copyLink() {
