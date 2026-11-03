@@ -5,6 +5,15 @@ Provider icons bundled in `frontend/public/provider-icons` are vendored from
 under the MIT License. Brand names and logos remain trademarks of their
 respective owners.
 
+The frozen `provider-presentation.json` catalog is an explicit release export of
+TokenSwitch's shared provider display data and existing Server icon assets (not
+UI components). Its LobeHub assets retain the MIT attribution above. CodeBuddy
+is attributed to LobeHub 1.95.1; the exact WorkBuddy package version is not
+established. WorkBuddy includes a viewBox adjustment. Each asset has a content
+hash; no build, test or runtime reads another checkout or fetches icon URLs.
+Historical MIT-licensed icon collection adaptations retain
+Copyright (c) 2025 Jason Young; this attribution does not add a technical input.
+
 ```text
 MIT License
 

@@ -15,39 +15,12 @@ import { formatUsdLimit, USD_LIMIT_MAX_MICROS } from "@/lib/share-value-quota";
 import type {
   ShareMarketAppCapability,
   ShareMarketListing,
-  ShareMarketProviderFamily,
   ShareMarketSeat,
   ShareMarketSubscription,
   ShareTokenPeriod,
   ShareUpstreamProvider,
 } from "@/lib/types";
 import { formatTokenMillions } from "@/lib/token-units";
-
-export const PROVIDER_FAMILY_ORDER: ShareMarketProviderFamily[] = [
-  "anthropic",
-  "openai",
-  "google",
-  "xai",
-  "cursor",
-  "kiro",
-  "copilot",
-  "api",
-  "multi",
-  "other",
-];
-
-export const PROVIDER_FAMILY_KEYS: Record<ShareMarketProviderFamily, MessageKey> = {
-  anthropic: "shareMarket.family.anthropic",
-  openai: "shareMarket.family.openai",
-  google: "shareMarket.family.google",
-  xai: "shareMarket.family.xai",
-  cursor: "shareMarket.family.cursor",
-  kiro: "shareMarket.family.kiro",
-  copilot: "shareMarket.family.copilot",
-  api: "shareMarket.family.api",
-  multi: "shareMarket.family.multi",
-  other: "shareMarket.family.other",
-};
 
 export const CORE_SHARE_APPS = ["claude", "codex", "gemini"] as const;
 export type CoreShareApp = (typeof CORE_SHARE_APPS)[number];

@@ -3600,6 +3600,7 @@ impl AppStore {
                 "valuePricingKnownRevisionV1".into(),
                 "valuePricingActivationV1".into(),
                 "shareTerminationV1".into(),
+                "providerIdentityV1".into(),
             ],
         })
     }
@@ -8863,6 +8864,7 @@ impl AppStore {
         };
         let (tokens_used_by_app, requests_count_by_app) = authoritative_share_usage_by_app(&share);
         let mut view = ShareView {
+            provider_identity: crate::provider_presentation::identity_for_share(&share),
             router_id: "main".to_string(),
             share_id: share.share_id,
             capacity_pool_id: share.capacity_pool_id,
@@ -12419,6 +12421,7 @@ impl AppStore {
                         .unwrap_or_default()
                 };
                 let mut view = ShareView {
+                    provider_identity: crate::provider_presentation::identity_for_share(&share),
                     router_id: "main".to_string(),
                     share_id: share.share_id,
                     capacity_pool_id: share.capacity_pool_id,
@@ -15176,7 +15179,7 @@ impl AppStore {
 
     pub async fn record_share_runtime_snapshot(
         &self,
-        snapshot: ShareRuntimeSnapshotResponse,
+        mut snapshot: ShareRuntimeSnapshotResponse,
     ) -> Result<(), AppError> {
         let closes_model_probe_epoch = snapshot
             .share_status
@@ -15184,8 +15187,6 @@ impl AppStore {
             .is_some_and(|status| status != "active");
         let app_runtimes_json = serde_json::to_string(&snapshot.app_runtimes)
             .map_err(|e| AppError::Internal(format!("serialize app runtimes failed: {e}")))?;
-        let app_providers_json = serde_json::to_string(&snapshot.app_providers)
-            .map_err(|e| AppError::Internal(format!("serialize app providers failed: {e}")))?;
         let refreshed_at = DateTime::<Utc>::from_timestamp(snapshot.queried_at, 0)
             .unwrap_or_else(Utc::now)
             .to_rfc3339();
@@ -15197,6 +15198,13 @@ impl AppStore {
             .map_err(|e| {
                 AppError::Internal(format!("begin share runtime snapshot tx failed: {e}"))
             })?;
+        let stored_apps = stored_provider_presentation(&tx, &snapshot.share_id)?;
+        crate::provider_presentation::preserve_runtime_identities(
+            &mut snapshot.app_providers,
+            &stored_apps,
+        );
+        let app_providers_json = serde_json::to_string(&snapshot.app_providers)
+            .map_err(|e| AppError::Internal(format!("serialize app providers failed: {e}")))?;
         tx.execute(
             "UPDATE shares
              SET app_runtimes_json = ?2,
@@ -16188,7 +16196,10 @@ fn share_model_probe_epoch_matches(
     stored: &StoredShareModelProbeEpoch,
     input: &ShareModelProbeEpochInput,
 ) -> bool {
-    stored.evidence_version == 2 && stored.input == *input
+    // A display rename is not a new execution/health epoch.
+    let mut execution = input.clone();
+    execution.provider_name = stored.input.provider_name.clone();
+    stored.evidence_version == 2 && stored.input == execution
 }
 
 fn read_open_share_model_probe_epoch(
@@ -16425,12 +16436,39 @@ fn ensure_value_pricing_acknowledged(
     ))
 }
 
+fn stored_provider_presentation(
+    conn: &Connection,
+    share_id: &str,
+) -> Result<ShareAppProviders, AppError> {
+    let json: Option<Option<String>> = conn
+        .query_row(
+            "SELECT app_providers_json FROM shares WHERE share_id = ?1",
+            params![share_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| AppError::Internal(format!("read provider presentation failed: {e}")))?;
+    json.flatten()
+        .map(|json| {
+            serde_json::from_str(&json).map_err(|e| {
+                AppError::Internal(format!("decode provider presentation failed: {e}"))
+            })
+        })
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
 fn upsert_share_tx(
     conn: &Connection,
     installation_id: &str,
     mut share: ShareDescriptor,
 ) -> Result<(), AppError> {
     normalize_share_descriptor_fields(&mut share)?;
+    let stored_apps = stored_provider_presentation(conn, &share.share_id)?;
+    crate::provider_presentation::merge_descriptor_identities(
+        &mut share.app_providers,
+        &stored_apps,
+    );
     // A refreshed/stale descriptor must not resurrect an accepted termination.
     for grant in share
         .user_grants
@@ -28853,6 +28891,7 @@ fn load_user_model_routing_response(
             .filter_map(|app| user_model_routing_share_capability(&share, app))
             .collect();
         eligible_shares.push(UserModelRoutingShareView {
+            provider_identity: crate::provider_presentation::identity_for_share(&share),
             share_id: share.share_id,
             share_name: share.share_name,
             subdomain: share.subdomain.clone(),
@@ -33167,6 +33206,21 @@ pub(crate) mod tests {
             policy_mode: Some("single".into()),
             health_fingerprint: health_fingerprint.into(),
         }
+    }
+
+    #[test]
+    fn provider_display_rename_does_not_rotate_the_health_epoch() {
+        let mut input = model_probe_epoch_input("pool", "health");
+        let stored = StoredShareModelProbeEpoch {
+            epoch_id: "epoch".into(),
+            starts_at_slot: 0,
+            input: input.clone(),
+            evidence_version: 2,
+        };
+        input.provider_name = Some("Renamed".into());
+        assert!(share_model_probe_epoch_matches(&stored, &input));
+        input.health_fingerprint = "changed-execution".into();
+        assert!(!share_model_probe_epoch_matches(&stored, &input));
     }
 
     fn test_provider_model_probe(api_type: &str, model: &str) -> crate::models::ProviderModelProbe {

@@ -5,6 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import { auditProviderPresentation } from "./audit-provider-presentation.mjs";
 
 const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -136,13 +137,11 @@ export function auditProviderIconProvenance(root = repoRoot) {
       );
     }
   }
-  for (const requiredSvg of ["cursor.svg", "kiro.svg"]) {
-    if (!referencedIcons.has(`${iconDirectory}/${requiredSvg}`)) {
-      violations.push(
-        `frontend/components/dashboard/share-provider-logo.tsx: ${requiredSvg} reference missing`,
-      );
-    }
+  // Share provider logos now use the common catalog, not a separate brand lookup.
+  if (!logoComponent.includes('from "@/lib/provider-presentation"')) {
+    violations.push("share provider logo must consume the frozen presentation catalog");
   }
+  violations.push(...auditProviderPresentation(root));
   return violations;
 }
 
@@ -151,7 +150,7 @@ function main() {
   if (violations.length > 0) {
     throw new Error(`Provider icon provenance violations:\n${violations.join("\n")}`);
   }
-  console.log("provider icon provenance ok: 12 vendored SVG assets verified");
+  console.log("provider icon provenance ok: 12 legacy SVG assets and shared presentation catalog verified");
 }
 
 if (

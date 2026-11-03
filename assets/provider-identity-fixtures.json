@@ -1,0 +1,1780 @@
+[
+  {
+    "name": "family.claude_oauth",
+    "bindings": {
+      "claude": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "Claude OAuth",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.claude_oauth",
+            "category": "anthropic",
+            "displayName": "Claude OAuth",
+            "icon": "claude",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "anthropic"
+  },
+  {
+    "name": "family.anthropic_api_key",
+    "bindings": {
+      "claude": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "Anthropic API Key",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.anthropic_api_key",
+            "category": "anthropic",
+            "displayName": "Anthropic API Key",
+            "icon": "claude",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "anthropic"
+  },
+  {
+    "name": "family.openai_oauth",
+    "bindings": {
+      "claude": "fixture-provider",
+      "codex": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "OpenAI OAuth",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.openai_oauth",
+            "category": "openai",
+            "displayName": "OpenAI OAuth",
+            "icon": "openai",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "codex": [
+        {
+          "id": "fixture-provider",
+          "name": "OpenAI OAuth",
+          "app": "codex",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.openai_oauth",
+            "category": "openai",
+            "displayName": "OpenAI OAuth",
+            "icon": "openai",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "openai"
+  },
+  {
+    "name": "family.google_oauth",
+    "bindings": {
+      "claude": "fixture-provider",
+      "gemini": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "Google OAuth",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.google_oauth",
+            "category": "google",
+            "displayName": "Google OAuth",
+            "icon": "gemini",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "gemini": [
+        {
+          "id": "fixture-provider",
+          "name": "Google OAuth",
+          "app": "gemini",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.google_oauth",
+            "category": "google",
+            "displayName": "Google OAuth",
+            "icon": "gemini",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "google"
+  },
+  {
+    "name": "family.grok_oauth",
+    "bindings": {
+      "claude": "fixture-provider",
+      "codex": "fixture-provider",
+      "gemini": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "Grok OAuth",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.grok_oauth",
+            "category": "xai",
+            "displayName": "Grok OAuth",
+            "icon": "grok",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "codex": [
+        {
+          "id": "fixture-provider",
+          "name": "Grok OAuth",
+          "app": "codex",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.grok_oauth",
+            "category": "xai",
+            "displayName": "Grok OAuth",
+            "icon": "grok",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "gemini": [
+        {
+          "id": "fixture-provider",
+          "name": "Grok OAuth",
+          "app": "gemini",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.grok_oauth",
+            "category": "xai",
+            "displayName": "Grok OAuth",
+            "icon": "grok",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "xai"
+  },
+  {
+    "name": "family.kimi_code",
+    "bindings": {
+      "claude": "fixture-provider",
+      "codex": "fixture-provider",
+      "gemini": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "Kimi OAuth",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.kimi_code",
+            "category": "kimi",
+            "displayName": "Kimi OAuth",
+            "icon": "kimi",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "codex": [
+        {
+          "id": "fixture-provider",
+          "name": "Kimi OAuth",
+          "app": "codex",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.kimi_code",
+            "category": "kimi",
+            "displayName": "Kimi OAuth",
+            "icon": "kimi",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "gemini": [
+        {
+          "id": "fixture-provider",
+          "name": "Kimi OAuth",
+          "app": "gemini",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.kimi_code",
+            "category": "kimi",
+            "displayName": "Kimi OAuth",
+            "icon": "kimi",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "kimi"
+  },
+  {
+    "name": "family.qoder_cosy",
+    "bindings": {
+      "claude": "fixture-provider",
+      "codex": "fixture-provider",
+      "gemini": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "Qoder OAuth",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.qoder_cosy",
+            "category": "qoder",
+            "displayName": "Qoder OAuth",
+            "icon": "qoder",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "codex": [
+        {
+          "id": "fixture-provider",
+          "name": "Qoder OAuth",
+          "app": "codex",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.qoder_cosy",
+            "category": "qoder",
+            "displayName": "Qoder OAuth",
+            "icon": "qoder",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "gemini": [
+        {
+          "id": "fixture-provider",
+          "name": "Qoder OAuth",
+          "app": "gemini",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.qoder_cosy",
+            "category": "qoder",
+            "displayName": "Qoder OAuth",
+            "icon": "qoder",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "qoder"
+  },
+  {
+    "name": "family.codebuddy_oauth",
+    "bindings": {
+      "claude": "fixture-provider",
+      "codex": "fixture-provider",
+      "gemini": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "CodeBuddy",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.codebuddy_oauth",
+            "category": "codebuddy",
+            "displayName": "CodeBuddy",
+            "icon": "codebuddy",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "codex": [
+        {
+          "id": "fixture-provider",
+          "name": "CodeBuddy",
+          "app": "codex",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.codebuddy_oauth",
+            "category": "codebuddy",
+            "displayName": "CodeBuddy",
+            "icon": "codebuddy",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "gemini": [
+        {
+          "id": "fixture-provider",
+          "name": "CodeBuddy",
+          "app": "gemini",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.codebuddy_oauth",
+            "category": "codebuddy",
+            "displayName": "CodeBuddy",
+            "icon": "codebuddy",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "codebuddy"
+  },
+  {
+    "name": "family.workbuddy_oauth",
+    "bindings": {
+      "claude": "fixture-provider",
+      "codex": "fixture-provider",
+      "gemini": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "WorkBuddy",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.workbuddy_oauth",
+            "category": "workbuddy",
+            "displayName": "WorkBuddy",
+            "icon": "workbuddy",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "codex": [
+        {
+          "id": "fixture-provider",
+          "name": "WorkBuddy",
+          "app": "codex",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.workbuddy_oauth",
+            "category": "workbuddy",
+            "displayName": "WorkBuddy",
+            "icon": "workbuddy",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "gemini": [
+        {
+          "id": "fixture-provider",
+          "name": "WorkBuddy",
+          "app": "gemini",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.workbuddy_oauth",
+            "category": "workbuddy",
+            "displayName": "WorkBuddy",
+            "icon": "workbuddy",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "workbuddy"
+  },
+  {
+    "name": "family.trae_solo",
+    "bindings": {
+      "claude": "fixture-provider",
+      "codex": "fixture-provider",
+      "gemini": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "Trae CN Solo",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.trae_solo",
+            "category": "trae",
+            "displayName": "Trae CN Solo",
+            "icon": "custom",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "codex": [
+        {
+          "id": "fixture-provider",
+          "name": "Trae CN Solo",
+          "app": "codex",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.trae_solo",
+            "category": "trae",
+            "displayName": "Trae CN Solo",
+            "icon": "custom",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "gemini": [
+        {
+          "id": "fixture-provider",
+          "name": "Trae CN Solo",
+          "app": "gemini",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.trae_solo",
+            "category": "trae",
+            "displayName": "Trae CN Solo",
+            "icon": "custom",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "trae"
+  },
+  {
+    "name": "family.kiro_oauth",
+    "bindings": {
+      "claude": "fixture-provider",
+      "codex": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "Kiro OAuth",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.kiro_oauth",
+            "category": "kiro",
+            "displayName": "Kiro OAuth",
+            "icon": "kiro",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "codex": [
+        {
+          "id": "fixture-provider",
+          "name": "Kiro OAuth",
+          "app": "codex",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.kiro_oauth",
+            "category": "kiro",
+            "displayName": "Kiro OAuth",
+            "icon": "kiro",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "kiro"
+  },
+  {
+    "name": "family.amazon_q_oauth",
+    "bindings": {
+      "claude": "fixture-provider",
+      "codex": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "Amazon Q Developer",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.amazon_q_oauth",
+            "category": "amazon_q",
+            "displayName": "Amazon Q Developer",
+            "icon": "aws",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "codex": [
+        {
+          "id": "fixture-provider",
+          "name": "Amazon Q Developer",
+          "app": "codex",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.amazon_q_oauth",
+            "category": "amazon_q",
+            "displayName": "Amazon Q Developer",
+            "icon": "aws",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "amazon_q"
+  },
+  {
+    "name": "family.ollama_cloud",
+    "bindings": {
+      "claude": "fixture-provider",
+      "codex": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "Ollama API Key",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.ollama_cloud",
+            "category": "ollama",
+            "displayName": "Ollama API Key",
+            "icon": "ollama",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "codex": [
+        {
+          "id": "fixture-provider",
+          "name": "Ollama API Key",
+          "app": "codex",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.ollama_cloud",
+            "category": "ollama",
+            "displayName": "Ollama API Key",
+            "icon": "ollama",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "ollama"
+  },
+  {
+    "name": "family.cursor_oauth",
+    "bindings": {
+      "claude": "fixture-provider",
+      "codex": "fixture-provider",
+      "gemini": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "Cursor OAuth",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.cursor_oauth",
+            "category": "cursor",
+            "displayName": "Cursor OAuth",
+            "icon": "cursor",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "codex": [
+        {
+          "id": "fixture-provider",
+          "name": "Cursor OAuth",
+          "app": "codex",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.cursor_oauth",
+            "category": "cursor",
+            "displayName": "Cursor OAuth",
+            "icon": "cursor",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "gemini": [
+        {
+          "id": "fixture-provider",
+          "name": "Cursor OAuth",
+          "app": "gemini",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.cursor_oauth",
+            "category": "cursor",
+            "displayName": "Cursor OAuth",
+            "icon": "cursor",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "cursor"
+  },
+  {
+    "name": "family.cursor_api_key",
+    "bindings": {
+      "claude": "fixture-provider",
+      "codex": "fixture-provider",
+      "gemini": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "Cursor API Key",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.cursor_api_key",
+            "category": "cursor",
+            "displayName": "Cursor API Key",
+            "icon": "cursor",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "codex": [
+        {
+          "id": "fixture-provider",
+          "name": "Cursor API Key",
+          "app": "codex",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.cursor_api_key",
+            "category": "cursor",
+            "displayName": "Cursor API Key",
+            "icon": "cursor",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "gemini": [
+        {
+          "id": "fixture-provider",
+          "name": "Cursor API Key",
+          "app": "gemini",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.cursor_api_key",
+            "category": "cursor",
+            "displayName": "Cursor API Key",
+            "icon": "cursor",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "cursor"
+  },
+  {
+    "name": "family.antigravity_oauth",
+    "bindings": {
+      "claude": "fixture-provider",
+      "gemini": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "Antigravity OAuth",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.antigravity_oauth",
+            "category": "antigravity",
+            "displayName": "Antigravity OAuth",
+            "icon": "gemini",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "gemini": [
+        {
+          "id": "fixture-provider",
+          "name": "Antigravity OAuth",
+          "app": "gemini",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.antigravity_oauth",
+            "category": "antigravity",
+            "displayName": "Antigravity OAuth",
+            "icon": "gemini",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "antigravity"
+  },
+  {
+    "name": "family.antigravity_cli",
+    "bindings": {
+      "claude": "fixture-provider",
+      "gemini": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "Antigravity CLI (agy)",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.antigravity_cli",
+            "category": "antigravity",
+            "displayName": "Antigravity CLI (agy)",
+            "icon": "gemini",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "gemini": [
+        {
+          "id": "fixture-provider",
+          "name": "Antigravity CLI (agy)",
+          "app": "gemini",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.antigravity_cli",
+            "category": "antigravity",
+            "displayName": "Antigravity CLI (agy)",
+            "icon": "gemini",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "antigravity"
+  },
+  {
+    "name": "family.github_copilot",
+    "bindings": {
+      "claude": "fixture-provider",
+      "codex": "fixture-provider",
+      "gemini": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "GitHub Copilot",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.github_copilot",
+            "category": "copilot",
+            "displayName": "GitHub Copilot",
+            "icon": "githubcopilot",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "codex": [
+        {
+          "id": "fixture-provider",
+          "name": "GitHub Copilot",
+          "app": "codex",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.github_copilot",
+            "category": "copilot",
+            "displayName": "GitHub Copilot",
+            "icon": "githubcopilot",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "gemini": [
+        {
+          "id": "fixture-provider",
+          "name": "GitHub Copilot",
+          "app": "gemini",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.github_copilot",
+            "category": "copilot",
+            "displayName": "GitHub Copilot",
+            "icon": "githubcopilot",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "copilot"
+  },
+  {
+    "name": "family.deepseek_account",
+    "bindings": {
+      "claude": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "DeepSeek Official",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.deepseek_account",
+            "category": "deepseek",
+            "displayName": "DeepSeek Official",
+            "icon": "deepseek",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "deepseek"
+  },
+  {
+    "name": "family.aws_bedrock_aksk",
+    "bindings": {
+      "claude": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "AWS Bedrock AK/SK",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.aws_bedrock_aksk",
+            "category": "aws",
+            "displayName": "AWS Bedrock AK/SK",
+            "icon": "aws",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "aws"
+  },
+  {
+    "name": "family.aws_bedrock_api_key",
+    "bindings": {
+      "claude": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "AWS Bedrock API Key",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.aws_bedrock_api_key",
+            "category": "aws",
+            "displayName": "AWS Bedrock API Key",
+            "icon": "aws",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "aws"
+  },
+  {
+    "name": "family.openrouter",
+    "bindings": {
+      "claude": "fixture-provider",
+      "codex": "fixture-provider",
+      "gemini": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "OpenRouter",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.openrouter",
+            "category": "openrouter",
+            "displayName": "OpenRouter",
+            "icon": "openrouter",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "codex": [
+        {
+          "id": "fixture-provider",
+          "name": "OpenRouter",
+          "app": "codex",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.openrouter",
+            "category": "openrouter",
+            "displayName": "OpenRouter",
+            "icon": "openrouter",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "gemini": [
+        {
+          "id": "fixture-provider",
+          "name": "OpenRouter",
+          "app": "gemini",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.openrouter",
+            "category": "openrouter",
+            "displayName": "OpenRouter",
+            "icon": "openrouter",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "openrouter"
+  },
+  {
+    "name": "family.nvidia",
+    "bindings": {
+      "claude": "fixture-provider",
+      "codex": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "NVIDIA",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.nvidia",
+            "category": "nvidia",
+            "displayName": "NVIDIA",
+            "icon": "nvidia",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "codex": [
+        {
+          "id": "fixture-provider",
+          "name": "NVIDIA",
+          "app": "codex",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.nvidia",
+            "category": "nvidia",
+            "displayName": "NVIDIA",
+            "icon": "nvidia",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "nvidia"
+  },
+  {
+    "name": "family.deepseek_api",
+    "bindings": {
+      "claude": "fixture-provider",
+      "codex": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "DeepSeek API",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.deepseek_api",
+            "category": "deepseek",
+            "displayName": "DeepSeek API",
+            "icon": "deepseek",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "codex": [
+        {
+          "id": "fixture-provider",
+          "name": "DeepSeek API",
+          "app": "codex",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.deepseek_api",
+            "category": "deepseek",
+            "displayName": "DeepSeek API",
+            "icon": "deepseek",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "deepseek"
+  },
+  {
+    "name": "family.openai_api_key",
+    "bindings": {
+      "codex": "fixture-provider"
+    },
+    "appProviders": {
+      "codex": [
+        {
+          "id": "fixture-provider",
+          "name": "OpenAI API Key",
+          "app": "codex",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.openai_api_key",
+            "category": "openai",
+            "displayName": "OpenAI API Key",
+            "icon": "openai",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "openai"
+  },
+  {
+    "name": "family.gemini_api_key",
+    "bindings": {
+      "gemini": "fixture-provider"
+    },
+    "appProviders": {
+      "gemini": [
+        {
+          "id": "fixture-provider",
+          "name": "Google Gemini API Key",
+          "app": "gemini",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.gemini_api_key",
+            "category": "google",
+            "displayName": "Google Gemini API Key",
+            "icon": "gemini",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "google"
+  },
+  {
+    "name": "family.kimi_coding_api_key",
+    "bindings": {
+      "claude": "fixture-provider",
+      "codex": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "Kimi API Key",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.kimi_coding_api_key",
+            "category": "kimi",
+            "displayName": "Kimi API Key",
+            "icon": "kimi",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "codex": [
+        {
+          "id": "fixture-provider",
+          "name": "Kimi API Key",
+          "app": "codex",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.kimi_coding_api_key",
+            "category": "kimi",
+            "displayName": "Kimi API Key",
+            "icon": "kimi",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "kimi"
+  },
+  {
+    "name": "family.zhipu_glm_cn",
+    "bindings": {
+      "claude": "fixture-provider",
+      "codex": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "Zhipu (China)",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.zhipu_glm_cn",
+            "category": "zhipu",
+            "displayName": "Zhipu (China)",
+            "icon": "zhipu",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "codex": [
+        {
+          "id": "fixture-provider",
+          "name": "Zhipu (China)",
+          "app": "codex",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.zhipu_glm_cn",
+            "category": "zhipu",
+            "displayName": "Zhipu (China)",
+            "icon": "zhipu",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "zhipu"
+  },
+  {
+    "name": "family.zhipu_glm_global",
+    "bindings": {
+      "claude": "fixture-provider",
+      "codex": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "Zhipu (Global)",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.zhipu_glm_global",
+            "category": "zhipu",
+            "displayName": "Zhipu (Global)",
+            "icon": "zhipu",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "codex": [
+        {
+          "id": "fixture-provider",
+          "name": "Zhipu (Global)",
+          "app": "codex",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.zhipu_glm_global",
+            "category": "zhipu",
+            "displayName": "Zhipu (Global)",
+            "icon": "zhipu",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "zhipu"
+  },
+  {
+    "name": "family.bailian_coding_plan_cn",
+    "bindings": {
+      "claude": "fixture-provider",
+      "codex": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "Bailian",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.bailian_coding_plan_cn",
+            "category": "bailian",
+            "displayName": "Bailian",
+            "icon": "bailian",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "codex": [
+        {
+          "id": "fixture-provider",
+          "name": "Bailian",
+          "app": "codex",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.bailian_coding_plan_cn",
+            "category": "bailian",
+            "displayName": "Bailian",
+            "icon": "bailian",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "bailian"
+  },
+  {
+    "name": "family.bailian_coding_plan_global",
+    "bindings": {
+      "claude": "fixture-provider",
+      "codex": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "Bailian",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.bailian_coding_plan_global",
+            "category": "bailian",
+            "displayName": "Bailian",
+            "icon": "bailian",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "codex": [
+        {
+          "id": "fixture-provider",
+          "name": "Bailian",
+          "app": "codex",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.bailian_coding_plan_global",
+            "category": "bailian",
+            "displayName": "Bailian",
+            "icon": "bailian",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "bailian"
+  },
+  {
+    "name": "family.minimax_cn",
+    "bindings": {
+      "claude": "fixture-provider",
+      "codex": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "MiniMax (China)",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.minimax_cn",
+            "category": "minimax",
+            "displayName": "MiniMax (China)",
+            "icon": "minimax",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "codex": [
+        {
+          "id": "fixture-provider",
+          "name": "MiniMax (China)",
+          "app": "codex",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.minimax_cn",
+            "category": "minimax",
+            "displayName": "MiniMax (China)",
+            "icon": "minimax",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "minimax"
+  },
+  {
+    "name": "family.minimax_global",
+    "bindings": {
+      "claude": "fixture-provider",
+      "codex": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "MiniMax (Global)",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.minimax_global",
+            "category": "minimax",
+            "displayName": "MiniMax (Global)",
+            "icon": "minimax",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "codex": [
+        {
+          "id": "fixture-provider",
+          "name": "MiniMax (Global)",
+          "app": "codex",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.minimax_global",
+            "category": "minimax",
+            "displayName": "MiniMax (Global)",
+            "icon": "minimax",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "minimax"
+  },
+  {
+    "name": "family.volcengine_coding_plan",
+    "bindings": {
+      "claude": "fixture-provider",
+      "codex": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "Volcengine",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.volcengine_coding_plan",
+            "category": "volcengine",
+            "displayName": "Volcengine",
+            "icon": "bytedance",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "codex": [
+        {
+          "id": "fixture-provider",
+          "name": "Volcengine",
+          "app": "codex",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.volcengine_coding_plan",
+            "category": "volcengine",
+            "displayName": "Volcengine",
+            "icon": "bytedance",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "volcengine"
+  },
+  {
+    "name": "family.xiaomi_mimo_token_plan",
+    "bindings": {
+      "claude": "fixture-provider",
+      "codex": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "Xiaomi MiMo (China)",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.xiaomi_mimo_token_plan",
+            "category": "xiaomi",
+            "displayName": "Xiaomi MiMo (China)",
+            "icon": "xiaomimimo",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "codex": [
+        {
+          "id": "fixture-provider",
+          "name": "Xiaomi MiMo (China)",
+          "app": "codex",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.xiaomi_mimo_token_plan",
+            "category": "xiaomi",
+            "displayName": "Xiaomi MiMo (China)",
+            "icon": "xiaomimimo",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "xiaomi"
+  },
+  {
+    "name": "family.xiaomi_mimo_token_plan_sgp",
+    "bindings": {
+      "claude": "fixture-provider",
+      "codex": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "Xiaomi MiMo (Singapore)",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.xiaomi_mimo_token_plan_sgp",
+            "category": "xiaomi",
+            "displayName": "Xiaomi MiMo (Singapore)",
+            "icon": "xiaomimimo",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "codex": [
+        {
+          "id": "fixture-provider",
+          "name": "Xiaomi MiMo (Singapore)",
+          "app": "codex",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.xiaomi_mimo_token_plan_sgp",
+            "category": "xiaomi",
+            "displayName": "Xiaomi MiMo (Singapore)",
+            "icon": "xiaomimimo",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "xiaomi"
+  },
+  {
+    "name": "family.custom_http",
+    "bindings": {
+      "claude": "fixture-provider",
+      "codex": "fixture-provider",
+      "gemini": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "Custom",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.custom_http",
+            "category": "custom",
+            "displayName": "Custom",
+            "icon": "custom",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "codex": [
+        {
+          "id": "fixture-provider",
+          "name": "Custom",
+          "app": "codex",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.custom_http",
+            "category": "custom",
+            "displayName": "Custom",
+            "icon": "custom",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "gemini": [
+        {
+          "id": "fixture-provider",
+          "name": "Custom",
+          "app": "gemini",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.custom_http",
+            "category": "custom",
+            "displayName": "Custom",
+            "icon": "custom",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "custom"
+  }
+]

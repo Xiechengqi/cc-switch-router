@@ -1,16 +1,16 @@
 import type {
   ShareMarketListing,
-  ShareMarketProviderFamily,
+  ShareProviderCategory,
   ShareMarketSeat,
   ShareMarketSubscription,
 } from "@/lib/types";
 import {
-  PROVIDER_FAMILY_ORDER,
   isTerminalSubscription,
   listingIdleCount,
   listingBestValueRatio,
   listingLowestDailyRate,
 } from "@/components/dashboard/share-market/market-utils";
+import { PROVIDER_CATEGORY_ORDER, providerCategory } from "@/lib/provider-presentation";
 import {
   groupActiveRentalsByShare,
   sortShareMarketSubscriptions,
@@ -101,12 +101,11 @@ export function marketShareCardSeatPreview<T extends SelectableSeat>(
 }
 
 export function listingMatchesFamily(
-  listing: Pick<ShareMarketListing, "providerFamily" | "providerFamilies">,
-  family: ShareMarketProviderFamily | "all",
+  listing: Pick<ShareMarketListing, "providerIdentity">,
+  family: ShareProviderCategory | "all",
 ) {
   return family === "all"
-    || listing.providerFamily === family
-    || listing.providerFamilies.includes(family);
+    || providerCategory(listing.providerIdentity) === family;
 }
 
 export function listingMatchesQuery(
@@ -172,7 +171,7 @@ export function catalogOwnerOptions(
 }
 
 export function listingFamilyTabs(listings: ShareMarketListing[]) {
-  return PROVIDER_FAMILY_ORDER.map((value) => ({
+  return PROVIDER_CATEGORY_ORDER.map((value) => ({
     value,
     idle: listings.reduce((sum, listing) => {
       if (!listingMatchesFamily(listing, value)) return sum;
@@ -183,7 +182,7 @@ export function listingFamilyTabs(listings: ShareMarketListing[]) {
 
 export function filterMarketListings(
   listings: ShareMarketListing[],
-  family: ShareMarketProviderFamily | "all",
+  family: ShareProviderCategory | "all",
   query: string,
   owner: string | string[] = [],
 ) {
@@ -313,7 +312,7 @@ export function filterMergedCatalogListings(
   }: {
     mine: boolean;
     idleOnly?: boolean;
-    family: ShareMarketProviderFamily | "all";
+    family: ShareProviderCategory | "all";
     query: string;
     owner?: string | string[];
     marketProviderId?: string;

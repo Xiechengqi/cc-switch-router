@@ -1,7 +1,6 @@
 "use client";
 
 import {
-  resolveShareProviderLogo,
   ShareProviderLogo,
 } from "@/components/dashboard/share-provider-logo";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
@@ -14,7 +13,7 @@ import {
 } from "@/components/dashboard/share-dashboard-utils";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import type { AppLocale } from "@/lib/i18n";
-import type { ShareUpstreamProvider } from "@/lib/types";
+import type { PublicProviderIdentity, ShareUpstreamProvider } from "@/lib/types";
 
 type ShareIdentityProvider = {
   app: string;
@@ -27,6 +26,7 @@ type ShareIdentityProvider = {
 };
 
 type ShareIdentitySource = {
+  providerIdentity?: PublicProviderIdentity;
   subdomain?: string;
   shareName?: string;
   supportedApps?: string[];
@@ -67,11 +67,9 @@ function uniqueProviderCapabilities(source: ShareIdentitySource) {
     return hasProvider && isCoreShareApp(item.app) && (!enabledApps.size || enabledApps.has(item.app));
   });
   return capabilities.reduce<ShareIdentityProvider[]>((result, capability) => {
-    const logo = resolveShareProviderLogo(capability);
-    const key = logo?.key || capability.providerType || capability.kind || capability.providerName || capability.app;
+    const key = capability.providerType || capability.kind || capability.providerName || capability.app;
     if (!result.some((item) => {
-      const itemLogo = resolveShareProviderLogo(item);
-      return (itemLogo?.key || item.providerType || item.kind || item.providerName || item.app) === key;
+      return (item.providerType || item.kind || item.providerName || item.app) === key;
     })) result.push(capability);
     return result;
   }, []);
@@ -84,19 +82,8 @@ export function MarketProviderLogos({
   source: ShareIdentitySource;
   size?: number;
 }) {
-  const entries = uniqueProviderCapabilities(source);
-  if (!entries.length) return null;
   return (
-    <span className="inline-flex shrink-0 items-center gap-1">
-      {entries.slice(0, 3).map((capability) => (
-        <ShareProviderLogo
-          key={`${capability.app}:${capability.providerType || capability.providerName || "provider"}`}
-          provider={capability}
-          fallbackApp={capability.app as "claude" | "codex" | "gemini"}
-          size={size}
-        />
-      ))}
-    </span>
+    <ShareProviderLogo provider={{ providerIdentity: source.providerIdentity }} size={size} />
   );
 }
 

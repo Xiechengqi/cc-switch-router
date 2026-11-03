@@ -435,6 +435,7 @@ pub struct UserModelRouteView {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserModelRoutingShareView {
+    pub provider_identity: crate::provider_presentation::PublicProviderIdentity,
     pub share_id: String,
     pub share_name: String,
     pub subdomain: String,
@@ -3157,6 +3158,8 @@ pub struct ShareAppProvider {
     pub app: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_identity: Option<crate::provider_presentation::ProviderIdentity>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supported_apps: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3210,6 +3213,7 @@ impl Default for ShareAppProvider {
             name: String::new(),
             app: String::new(),
             bundle_id: None,
+            provider_identity: None,
             supported_apps: Vec::new(),
             kind: None,
             provider_type: None,
@@ -4000,6 +4004,7 @@ pub struct CapacityAppAvailabilityEntry {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareView {
+    pub provider_identity: crate::provider_presentation::PublicProviderIdentity,
     pub router_id: String,
     pub share_id: String,
     pub capacity_pool_id: String,

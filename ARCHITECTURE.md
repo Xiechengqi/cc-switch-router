@@ -115,6 +115,12 @@ Share Market 内建于 Router,不注册为外部 `router_markets`。Share owner 
 
 Share 的 token/并发限制、请求 usage、用户 `usageRebase` 重基线、模型健康和容量池是 Share/Router 运行时能力，不等于外部 Token Market 的用户账本。普通 Share 的旧官方价格比例已退役；Share Market 报价只属于 listing/seat。Router 只保存本地 Share/seat entitlement、脱敏 observation 和服务账务；未来外部平台的下游用户、API key、token 售价、余额与 token settlement 必须留在平台自身。用户周期重基线由 Server 保存并通过 descriptor 下发，Router 不拥有编辑权。
 
+Share 的供应商品牌展示由 Server Registry 派生的 `providerIdentityV1` 提供，Router 按真实
+Bundle 绑定聚合，不从 Claude/Codex/Gemini API、兼容类型或名称猜测。Client 卡片、抽屉、
+模型入口和市场消费同一公开身份及本地冻结图标 catalog；市场每个 Share 只有一个展示
+分类。此展示维度不改变路由、健康、计费或租约不可变 `providerFamily` 快照。旧 reader
+通过 heartbeat 能力协商隔离；未知和历史多源分别中性显示，不做破坏性迁移。
+
 ### ② 中性 Gateway 容量适配
 
 `/v1/gateways/register`、`/v1/gateway/*` 与 `/_gateway/proxy/*` 是未来跨 Router 容量消费者的基础入口。Gateway 使用 Ed25519 公钥、timestamp、nonce、原始 body SHA-256 和 scope；当前 self-reported owner email 仅用于本地审计，绝不参与授权。完整 tenant/seat/grant contract 尚未形成，而旧 `forSale=Yes + marketAccessMode=all` 已退役，因此当前 Gateway Share inventory/proxy 对普通 Share 整体 fail-closed。它是**适配层**而不是第三个交易面，也不能被描述为已完成的 Token Market。

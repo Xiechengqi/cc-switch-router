@@ -421,6 +421,7 @@ export type ShareUserGrant = {
 export type ShareUserGrantMap = Record<string, ShareUserGrant>;
 
 export type ShareView = {
+  providerIdentity?: PublicProviderIdentity;
   routerId?: string;
   shareId: string;
   capacityPoolId: string;
@@ -612,6 +613,7 @@ export type UserModelRoutingShareCapability = {
 };
 
 export type UserModelRoutingShare = {
+  providerIdentity?: PublicProviderIdentity;
   shareId: string;
   shareName: string;
   subdomain: string;
@@ -1277,6 +1279,7 @@ export type ShareUpstreamProvider = {
 };
 
 export type ShareAppProvider = {
+  providerIdentity?: PublicProviderIdentity & { revision: number };
   id: string;
   name: string;
   app: "claude" | "codex" | "gemini" | string;
@@ -2844,6 +2847,18 @@ export type ShareMarketProviderFamily =
   | "multi"
   | "other";
 
+/** Display classification is independent of the immutable rental providerFamily snapshot. */
+export type ShareProviderCategory = keyof typeof import("./generated/provider-presentation.json").categories;
+export type PublicProviderIdentity = {
+  schemaVersion: number;
+  familyId?: string;
+  category: ShareProviderCategory | string;
+  displayName: string;
+  icon?: string;
+  iconColor?: string;
+  catalogVersion: string;
+};
+
 export type ShareMarketProviderHealthState =
   | "healthy"
   | "degraded"
@@ -2904,6 +2919,7 @@ export type ShareMarketReliability = {
 };
 
 export type ShareMarketListing = {
+  providerIdentity?: PublicProviderIdentity;
   id: string;
   marketProviderId?: string;
   rankState?: "ranked" | "collecting" | "unranked" | string;
@@ -3042,6 +3058,7 @@ export type ShareControlDeadLetterPage = {
 };
 
 export type ShareMarketOwnedShare = {
+  providerIdentity?: PublicProviderIdentity;
   shareId: string;
   shareName: string;
   appType: string;

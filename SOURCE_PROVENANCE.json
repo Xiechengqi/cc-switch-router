@@ -18,6 +18,16 @@
   ],
   "vendoredSources": [
     {
+      "id": "tokenswitch-provider-presentation-v1",
+      "repository": "cc-switch-server (reviewed, explicit frozen release export)",
+      "license": "MIT",
+      "copyright": "Copyright LobeHub; Copyright (c) 2025 Jason Young (historical collection adaptations); repository-owned Custom Provider icon",
+      "scope": ["assets/provider-presentation.json", "frontend/lib/generated/provider-presentation.json"],
+      "technicalInput": false,
+      "notice": "THIRD_PARTY_NOTICES.md",
+      "note": "Data and icon assets only, no UI code. Each asset has a SHA-256 in the frozen catalog; both local copies are audited without another checkout. WorkBuddy and CodeBuddy retain the Server's existing LobeHub attribution, including the unestablished exact WorkBuddy package version."
+    },
+    {
       "id": "lobehub-icons-static-svg",
       "repository": "https://github.com/lobehub/lobe-icons",
       "package": "@lobehub/icons-static-svg@1.91.0",

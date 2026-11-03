@@ -57,6 +57,7 @@ mod namespace;
 mod notification_channels;
 mod notifications;
 mod process_lock;
+mod provider_presentation;
 mod provision_ssh;
 mod proxy;
 mod proxy_stream;

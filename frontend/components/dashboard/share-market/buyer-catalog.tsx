@@ -51,7 +51,7 @@ import type {
   MarketEligibility,
   ShareMarketCatalog,
   ShareMarketListing,
-  ShareMarketProviderFamily,
+  ShareProviderCategory,
   ShareMarketRentAppService,
   ShareMarketRentQuote,
   ShareMarketSeat,
@@ -60,8 +60,8 @@ import type {
 import { formatTokenMillions } from "@/lib/token-units";
 import { formatUsdLimit } from "@/lib/share-value-quota";
 import { cn } from "@/lib/utils";
+import { providerCategory, providerCategoryLabel } from "@/lib/provider-presentation";
 import {
-  PROVIDER_FAMILY_KEYS,
   activeSubscriptionForShare,
   formatSeatPrice,
   formatSeatQuota,
@@ -314,7 +314,7 @@ export function ShareMarketBuyerCatalog({
   const chat = useClientChat();
   const [query, setQuery] = React.useState("");
   const [owners, setOwners] = React.useState<string[]>([]);
-  const [family, setFamily] = React.useState<ShareMarketProviderFamily | "all">("all");
+  const [family, setFamily] = React.useState<ShareProviderCategory | "all">("all");
   const [mine, setMine] = React.useState(initialMine);
   const [idleOnly, setIdleOnly] = React.useState(false);
   const [sort, setSort] = React.useState<MarketCatalogSort>("recommended");
@@ -1022,7 +1022,7 @@ export function ShareMarketBuyerCatalog({
                                 {rentTarget.quote.offer.service.apps.map((service) => (
                                   <div key={service.app} className="grid min-w-0 gap-0.5">
                                     <strong className="font-medium text-slate-800">{rentAppLabel(service.app)}</strong>
-                                    <span className="break-words text-slate-600">{t(PROVIDER_FAMILY_KEYS[service.providerFamily])}{service.providerType ? ` · ${service.providerType}` : ""}</span>
+                                    <span className="break-words text-slate-600">{providerCategoryLabel(providerCategory(rentTarget.listing.providerIdentity), locale)}{service.providerType ? ` · ${service.providerType}` : ""}</span>
                                     <span className="break-words text-slate-500">{rentAppModel(service, t)}</span>
                                   </div>
                                 ))}

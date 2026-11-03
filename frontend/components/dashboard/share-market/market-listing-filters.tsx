@@ -4,11 +4,9 @@ import type { ReactNode } from "react";
 import { CircleDot, Search, X } from "lucide-react";
 import { CompactSelect } from "@/components/common/compact-select";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import type { ShareMarketListing, ShareMarketProviderFamily } from "@/lib/types";
+import type { ShareMarketListing, ShareProviderCategory } from "@/lib/types";
 import { cn } from "@/lib/utils";
-import {
-  PROVIDER_FAMILY_KEYS,
-} from "@/components/dashboard/share-market/market-utils";
+import { providerCategoryLabel } from "@/lib/provider-presentation";
 import {
   MARKET_CATALOG_SORTS,
   listingFamilyTabs,
@@ -37,11 +35,11 @@ export function MarketListingFilters({
   onSortChange,
 }: {
   listings: ShareMarketListing[];
-  family: ShareMarketProviderFamily | "all";
+  family: ShareProviderCategory | "all";
   query: string;
   owners?: string[];
   ownerOptions?: Array<{ value: string; label: string; rented?: boolean }>;
-  onFamilyChange: (family: ShareMarketProviderFamily | "all") => void;
+  onFamilyChange: (family: ShareProviderCategory | "all") => void;
   onQueryChange: (query: string) => void;
   onOwnersChange?: (owners: string[]) => void;
   leading?: ReactNode;
@@ -55,7 +53,7 @@ export function MarketListingFilters({
   sort?: MarketCatalogSort;
   onSortChange?: (sort: MarketCatalogSort) => void;
 }) {
-  const { t } = useLocaleText();
+  const { t, locale } = useLocaleText();
   const familyTabs = listingFamilyTabs(listings);
   const showMine = !!onMineChange;
   const showIdleOnly = !!onIdleOnlyChange;
@@ -100,7 +98,7 @@ export function MarketListingFilters({
               type="button"
               role="tab"
               aria-selected={selectedFamily}
-              title={t("shareMarket.catalog.familyIdleHint", { family: t(PROVIDER_FAMILY_KEYS[item.value]), count: item.idle })}
+              title={t("shareMarket.catalog.familyIdleHint", { family: providerCategoryLabel(item.value, locale), count: item.idle })}
               className={cn(
                 "inline-flex h-9 shrink-0 items-center gap-1.5 rounded-lg px-2.5 text-xs transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary",
                 selectedFamily
@@ -109,7 +107,7 @@ export function MarketListingFilters({
               )}
               onClick={() => onFamilyChange(selectedFamily ? "all" : item.value)}
             >
-              <span>{t(PROVIDER_FAMILY_KEYS[item.value])}</span>
+              <span>{providerCategoryLabel(item.value, locale)}</span>
               <span className={cn("tabular-nums", selectedFamily ? "text-sky-600" : "text-slate-400")}>{item.idle}</span>
             </button>
           );

@@ -270,6 +270,7 @@ pub struct ShareMarketReliability {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListingView {
+    pub provider_identity: crate::provider_presentation::PublicProviderIdentity,
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub market_provider_id: Option<String>,
@@ -454,6 +455,7 @@ pub struct SubscriptionView {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OwnedShareView {
+    pub provider_identity: crate::provider_presentation::PublicProviderIdentity,
     pub share_id: String,
     pub share_name: String,
     pub app_type: String,
@@ -5294,6 +5296,10 @@ impl AppStore {
                     "available"
                 };
                 Ok(OwnedShareView {
+                    provider_identity: crate::provider_presentation::identity_from_json(
+                        &bindings_json,
+                        app_providers_json.as_deref(),
+                    ),
                     share_id: row.get(0)?,
                     share_name: row.get(1)?,
                     app_type: app_type.clone(),
@@ -5843,6 +5849,10 @@ impl AppStore {
             let rank_position = rank.and_then(|projection| projection.rank_position);
             let provider_score_bps = rank.and_then(|projection| projection.score_bps);
             listings.push(ListingView {
+                provider_identity: crate::provider_presentation::identity_from_json(
+                    &bindings_json,
+                    app_providers_json.as_deref(),
+                ),
                 id,
                 market_provider_id,
                 rank_state,
@@ -13333,6 +13343,7 @@ pub async fn run_service(state: ServerState) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     mod control_recovery_tests;
+    mod provider_presentation_tests;
 
     #[test]
     fn banked_reset_is_accepted_in_share_contract_but_not_public_market_quota() {

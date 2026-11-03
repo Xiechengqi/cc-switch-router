@@ -79,7 +79,7 @@ import {
 import type {
   ShareMarketListing,
   ShareMarketOwnedShare,
-  ShareMarketProviderFamily,
+  ShareProviderCategory,
   ShareMarketSeat,
   ShareMarketSeatInput,
   ShareTokenPeriod,
@@ -1093,7 +1093,7 @@ export function ShareMarketOwnerWorkspace({
   const [confirm, setConfirm] = React.useState<ConfirmAction | null>(null);
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
-  const [family, setFamily] = React.useState<ShareMarketProviderFamily | "all">("all");
+  const [family, setFamily] = React.useState<ShareProviderCategory | "all">("all");
   const [query, setQuery] = React.useState("");
   const [selectedId, setSelectedId] = React.useState<string | null>(null);
   const actor = useQuotaActor();
