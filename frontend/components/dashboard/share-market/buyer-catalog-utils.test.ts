@@ -254,10 +254,10 @@ test("provider panel reproduces quota, provider identity and enabled app model r
   assert.match(view.toneClassName, /emerald/);
 });
 
-test("Buddy public market panels do not substitute private account IDs, emails or product names", () => {
+test("Buddy public market panels do not substitute private account labels or product names", () => {
   for (const providerType of ["workbuddy_oauth", "codebuddy_oauth"]) {
     for (const app of ["claude", "codex", "gemini"]) {
-      for (const accountHint of ["private-buddy-account", "owner@example.com", undefined, "", "   "]) {
+      for (const accountHint of ["private-buddy-account", "owner@example.com", "中文昵称", "138****0000", undefined, "", "   "]) {
         const view = marketProviderStatusView(
           {
             supportedApps: [app],

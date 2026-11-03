@@ -3156,7 +3156,7 @@ fn public_app_capabilities(
                 .flatten()
                 .any(|value| matches!(value.trim(), "workbuddy_oauth" | "codebuddy_oauth"));
             let account_hint = if buddy {
-                // Buddy accountLabel carries a private managed-account ID.
+                // Buddy accountLabel carries private display metadata or an internal ID.
                 // Public listings must not publish it or substitute an email.
                 None
             } else {
