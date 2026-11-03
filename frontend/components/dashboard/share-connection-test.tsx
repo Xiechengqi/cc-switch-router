@@ -336,6 +336,11 @@ export function ShareConnectionTestRow({
               <span className="text-slate-500">
                 {t("dashboard.connectDialog.test.durationMs", { ms: String(result.durationMs) })}
               </span>
+              {result.success && result.terminalEvent === "response.incomplete" ? (
+                <span className="text-emerald-700">
+                  {t("dashboard.connectDialog.test.outputLimitReached")}
+                </span>
+              ) : null}
               {!result.success && result.terminalEvent ? (
                 <>
                   <span className="text-slate-400">·</span>

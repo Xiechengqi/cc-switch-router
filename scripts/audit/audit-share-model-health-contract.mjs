@@ -82,7 +82,7 @@ requireMarkers("src/api.rs", [
   '"/v1/shares/:share_id/model-health-calendar"',
   "share_model_probe_for_app",
   "probe.response_mode",
-  "read_probe_body(resp, response_mode)",
+  "read_probe_body(resp, response_mode, prepared.expected_output_limit)",
 ]);
 requireMarkers("src/schema.rs", [
   'include_str!("../schema/0027_share_model_health_slots.sql")',

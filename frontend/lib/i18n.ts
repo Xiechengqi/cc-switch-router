@@ -2918,6 +2918,7 @@ export const messages = {
       "Usage refresh failed: {message}",
     "dashboard.connectDialog.test.schedulingRecovered": "Scheduling recovered",
     "dashboard.connectDialog.test.terminalEvent": "Terminal event {event}",
+    "dashboard.connectDialog.test.outputLimitReached": "Connection successful · test output limit reached",
     "dashboard.connectDialog.test.notBound": "App not bound to this share",
     "dashboard.connectDialog.test.needAuth": "Sign in to test",
     "dashboard.connectDialog.test.needPermission":
@@ -6317,6 +6318,7 @@ export const messages = {
     "dashboard.connectDialog.test.refreshUsageError": "用量刷新失败：{message}",
     "dashboard.connectDialog.test.schedulingRecovered": "已恢复调度",
     "dashboard.connectDialog.test.terminalEvent": "终止事件 {event}",
+    "dashboard.connectDialog.test.outputLimitReached": "连接成功 · 达到测试输出上限",
     "dashboard.connectDialog.test.notBound": "该 share 未绑定此 app",
     "dashboard.connectDialog.test.needAuth": "登录后可测试",
     "dashboard.connectDialog.test.needPermission": "当前账号没有调用该 Share 的权限",

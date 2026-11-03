@@ -509,6 +509,8 @@ Client 页和 Share Market 页的 Share 侧边栏使用同一个日历组件:日
 
 “连接”弹窗把手动操作明确标为**端到端连接测试**,对每个已启用 App 只显示一条 Server-authoritative 模型请求。Curl 的 method、path、body、流式 header 和测试模型全部由对应 `appRuntimes.<app>.modelProbe` 生成；Router 的手动 `test-connection` 经公开 Share 路由执行这份 probe 并按 `responseMode` 校验 JSON 或 SSE 完成事件。半小时定时探针则由 Server 在内部对绑定 Provider 执行同一测试模型。两者共用模型/策略来源,但证据范围不同,前端和 Router 后端不得保留硬编码的 GPT、Claude 或 Gemini 测试模型表。
 
+Responses 文字流测试仅在完整终态 JSON 证明 `status=incomplete`、`reason=max_output_tokens`、整数 `usage.output_tokens` 达到本次实际请求的正整数输出预算时，接受 `response.incomplete` 为连接成功；保留真实 `terminalEvent`。必须读完整条流，HTTP 错误、协议错误、读取失败、取消或后续失败均优先于成功。`[DONE]` 本身不能证明成功，也不要求 Responses 流包含它。该规则只用于手动连接测试，不修改生产代理的终态。
+
 模型策略提示同样读取 Provider 投影:`passthrough` 明确说明模型名会透传到具体供应商,调用方应使用该供应商支持的模型名；`single` 明确说明任意请求模型都会映射到固定上游模型。弹窗展示的“测试模型”、Curl 以及半小时周期使用同一个 Server 配置来源。
 
 Grok Share 的手动测试另支持 `image_generation`、`image_edit`、`video_generation`。媒体操作只允许 Codex binding，只在 `grokMediaPolicy` 对应权限开启时展示和执行；Router 使用固定安全 prompt、内置合法 1×1 PNG 和固定 6s/720p/16:9 视频参数。Router 发出的 dashboard 测试只有在 loopback peer、精确内部 User-Agent 和内部 marker 三项同时满足时才把签名 `IngressContext.isHealthCheck` 设为 `true`；公网同名 header 会被剥离，不能伪造 HealthProbe。

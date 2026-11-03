@@ -5257,6 +5257,104 @@ mod tests {
         assert!(error.unwrap().contains("before required terminal event"));
     }
 
+    fn output_limited_probe_event(usage: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"type":"response.incomplete", "response":{
+            "status":"incomplete", "incomplete_details":{"reason":"max_output_tokens"},
+            "usage":{"output_tokens":usage}
+        }})
+    }
+
+    #[test]
+    fn responses_probe_accepts_verified_limit_across_chunks_without_done() {
+        let payload = output_limited_probe_event(serde_json::json!(1));
+        let text = format!("event: response.incomplete\r\ndata: {payload}\r\n\r\n");
+        let mut tracker =
+            ProbeSseTracker::with_output_limit(ProbeResponseMode::ResponsesSse, Some(1));
+        for chunk in text.as_bytes().chunks(7) {
+            tracker.push(chunk);
+        }
+        let (terminal, error) = tracker.finish();
+        assert_eq!(terminal.as_deref(), Some("response.incomplete"));
+        assert!(error.is_none(), "{error:?}");
+        let mut tracker =
+            ProbeSseTracker::with_output_limit(ProbeResponseMode::ResponsesSse, Some(1));
+        tracker.push(format!("event: response.incomplete\rdata: {payload}\r\r").as_bytes());
+        assert!(tracker.finish().1.is_none());
+    }
+
+    #[test]
+    fn responses_probe_rejects_unproven_limits() {
+        let valid = output_limited_probe_event(serde_json::json!(1));
+        let mut cases = vec![
+            (valid.clone(), None),
+            (valid.clone(), Some(0)),
+            (valid.clone(), Some(2)),
+        ];
+        for usage in [
+            serde_json::Value::Null,
+            serde_json::json!("1"),
+            serde_json::json!(1.0),
+            serde_json::json!(-1),
+        ] {
+            cases.push((output_limited_probe_event(usage), Some(1)));
+        }
+        for (pointer, value) in [
+            ("/response/status", serde_json::json!("completed")),
+            (
+                "/response/incomplete_details/reason",
+                serde_json::json!("content_filter"),
+            ),
+            ("/response/usage", serde_json::Value::Null),
+        ] {
+            let mut event = valid.clone();
+            *event.pointer_mut(pointer).unwrap() = value;
+            cases.push((event, Some(1)));
+        }
+        for (event, cap) in cases {
+            let mut tracker =
+                ProbeSseTracker::with_output_limit(ProbeResponseMode::ResponsesSse, cap);
+            tracker.push(format!("data: {event}\n\n").as_bytes());
+            assert!(
+                tracker.finish().1.is_some(),
+                "accepted {event}, cap={cap:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn responses_probe_errors_and_conflicting_terminals_override_limit_success() {
+        let event = output_limited_probe_event(serde_json::json!(1));
+        for suffix in [
+            "data: {\"type\":\"response.failed\"}\n\n",
+            "data: {\"type\":\"response.cancelled\"}\n\n",
+            "data: {\"type\":\"error\",\"error\":{\"message\":\"failed\"}}\n\n",
+            "data: {\"type\":\"response.completed\"}\n\n",
+            "data: {\"type\":\"response.completed\"\n\n",
+        ] {
+            let mut tracker =
+                ProbeSseTracker::with_output_limit(ProbeResponseMode::ResponsesSse, Some(1));
+            tracker.push(format!("data: {event}\n\n{suffix}").as_bytes());
+            assert!(tracker.finish().1.is_some(), "accepted suffix {suffix}");
+        }
+        let mut tracker =
+            ProbeSseTracker::with_output_limit(ProbeResponseMode::ResponsesSse, Some(1));
+        tracker.push(format!("event: response.completed\ndata: {event}\n\n").as_bytes());
+        assert!(tracker.finish().1.is_some());
+    }
+
+    #[test]
+    fn responses_probe_parses_multiline_data_and_rejects_oversized_events() {
+        let mut tracker =
+            ProbeSseTracker::with_output_limit(ProbeResponseMode::ResponsesSse, Some(1));
+        tracker.push(b"data: {\"type\":\"response.incomplete\",\ndata: \"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"output_tokens\":1}}}\n\n");
+        assert!(tracker.finish().1.is_none());
+        let mut tracker = ProbeSseTracker::new(ProbeResponseMode::ResponsesSse);
+        tracker.push(b"data: {\"type\":\"response.completed\",\"padding\":\"");
+        tracker.push(&vec![b'x'; TEST_JSON_PARSE_CAP]);
+        tracker.push(b"\"}\n\n");
+        assert!(tracker.finish().1.unwrap().contains("validation limit"));
+    }
+
     #[test]
     fn anthropic_and_gemini_probes_use_their_protocol_terminals() {
         let mut anthropic = ProbeSseTracker::new(ProbeResponseMode::AnthropicSse);
@@ -5297,13 +5395,42 @@ mod tests {
         let response = reqwest::get(format!("http://{address}/probe"))
             .await
             .expect("request probe response");
-        let body = read_probe_body(response, ProbeResponseMode::ResponsesSse).await;
+        let body = read_probe_body(response, ProbeResponseMode::ResponsesSse, None).await;
         server.abort();
 
         assert_eq!(body.preview.len(), TEST_BODY_CAP);
         assert!(body.total_bytes > body.preview.len());
         assert_eq!(body.terminal_event.as_deref(), Some("response.completed"));
         assert!(body.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn output_limited_probe_still_fails_when_transport_breaks_after_terminal() {
+        let app = Router::new().route(
+            "/probe",
+            get(|| async {
+                let first = futures_util::stream::once(async {
+                    Ok::<_, std::io::Error>(bytes::Bytes::from(format!(
+                        "data: {}\n\n",
+                        output_limited_probe_event(serde_json::json!(1))
+                    )))
+                });
+                let last = futures_util::stream::once(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    Err::<bytes::Bytes, _>(std::io::Error::other("fixture transport failure"))
+                });
+                Body::from_stream(first.chain(last))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let response = reqwest::get(format!("http://{address}/probe"))
+            .await
+            .unwrap();
+        let body = read_probe_body(response, ProbeResponseMode::ResponsesSse, Some(1)).await;
+        assert!(body.error.unwrap().contains("response body read failed"));
+        server.abort();
     }
 
     #[tokio::test]
@@ -5331,7 +5458,7 @@ mod tests {
         let response = reqwest::get(format!("http://{address}/probe"))
             .await
             .expect("request image JSON probe response");
-        let body = read_probe_body(response, ProbeResponseMode::ImageJson).await;
+        let body = read_probe_body(response, ProbeResponseMode::ImageJson, None).await;
         server.abort();
 
         assert_eq!(body.preview.len(), TEST_BODY_CAP);
@@ -5449,7 +5576,7 @@ mod tests {
             .expect("request rate limited probe response");
         // The probe asked for a Responses stream and got a JSON refusal: the old
         // reading blamed the provider for a missing `response.completed`.
-        let body = read_probe_body(response, ProbeResponseMode::ResponsesSse).await;
+        let body = read_probe_body(response, ProbeResponseMode::ResponsesSse, None).await;
         server.abort();
 
         assert_eq!(body.terminal_event, None);
@@ -8597,6 +8724,7 @@ struct PreparedConnectionTest {
     echo_body: String,
     body: ConnectionTestBody,
     response_mode: ProbeResponseMode,
+    expected_output_limit: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -8793,28 +8921,54 @@ struct ProbeSseTracker {
     mode: ProbeResponseMode,
     line: Vec<u8>,
     line_truncated: bool,
+    skip_lf: bool,
     success_event: Option<String>,
     failure_event: Option<String>,
     saw_done: bool,
+    expected_output_limit: Option<u64>,
+    response_event: Option<String>,
+    response_data: Vec<u8>,
+    protocol_error: Option<String>,
 }
 
 impl ProbeSseTracker {
+    #[cfg(test)]
     fn new(mode: ProbeResponseMode) -> Self {
+        Self::with_output_limit(mode, None)
+    }
+
+    fn with_output_limit(mode: ProbeResponseMode, expected_output_limit: Option<u64>) -> Self {
         Self {
             mode,
             line: Vec::new(),
             line_truncated: false,
+            skip_lf: false,
             success_event: None,
             failure_event: None,
             saw_done: false,
+            expected_output_limit: expected_output_limit.filter(|limit| *limit > 0),
+            response_event: None,
+            response_data: Vec::new(),
+            protocol_error: None,
         }
     }
 
     fn push(&mut self, bytes: &[u8]) {
         for byte in bytes {
-            if *byte == b'\n' {
+            if *byte == b'\n' && self.skip_lf {
+                self.skip_lf = false;
+                continue;
+            }
+            self.skip_lf = *byte == b'\r';
+            if matches!(*byte, b'\r' | b'\n') {
                 self.finish_line();
-            } else if self.line.len() < TEST_SSE_LINE_SCAN_CAP {
+            } else if self.line.len()
+                < if self.mode == ProbeResponseMode::ResponsesSse {
+                    TEST_JSON_PARSE_CAP
+                } else {
+                    TEST_SSE_LINE_SCAN_CAP
+                }
+            {
                 self.line.push(*byte);
             } else {
                 self.line_truncated = true;
@@ -8825,6 +8979,12 @@ impl ProbeSseTracker {
     fn finish(mut self) -> (Option<String>, Option<String>) {
         if !self.line.is_empty() || self.line_truncated {
             self.finish_line();
+        }
+        if self.mode == ProbeResponseMode::ResponsesSse {
+            self.finish_response_event();
+        }
+        if let Some(error) = self.protocol_error {
+            return (self.failure_event.or(self.success_event), Some(error));
         }
         if let Some(event) = self.failure_event {
             return (
@@ -8856,6 +9016,10 @@ impl ProbeSseTracker {
         }
         let line = std::mem::take(&mut self.line);
         let truncated = std::mem::replace(&mut self.line_truncated, false);
+        if self.mode == ProbeResponseMode::ResponsesSse {
+            self.response_line(&line, truncated);
+            return;
+        }
         if let Some(event) = line.strip_prefix(b"event:") {
             self.observe_event(String::from_utf8_lossy(event).trim());
             return;
@@ -8877,6 +9041,122 @@ impl ProbeSseTracker {
         if let Some(event) = sse_json_event_type(data, truncated) {
             self.observe_event(&event);
         }
+    }
+
+    // Responses terminals need the complete JSON payload: the SSE event name
+    // alone cannot distinguish an expected output cap from a real failure.
+    fn response_line(&mut self, line: &[u8], truncated: bool) {
+        if truncated {
+            self.protocol_error
+                .get_or_insert_with(|| "Responses SSE event exceeds validation limit".into());
+        }
+        if line.is_empty() {
+            self.finish_response_event();
+        } else if let Some(event) = line.strip_prefix(b"event:") {
+            match std::str::from_utf8(event) {
+                Ok(event) => self.response_event = Some(event.trim().to_string()),
+                Err(_) => {
+                    self.protocol_error
+                        .get_or_insert_with(|| "Responses SSE event is not valid UTF-8".into());
+                }
+            }
+        } else if let Some(data) = line.strip_prefix(b"data:") {
+            let data = data.strip_prefix(b" ").unwrap_or(data);
+            if self.response_data.len().saturating_add(data.len() + 1) > TEST_JSON_PARSE_CAP {
+                self.protocol_error
+                    .get_or_insert_with(|| "Responses SSE event exceeds validation limit".into());
+            } else {
+                self.response_data.extend_from_slice(data);
+                self.response_data.push(b'\n');
+            }
+        }
+    }
+
+    fn finish_response_event(&mut self) {
+        let event = self.response_event.take();
+        let data = std::mem::take(&mut self.response_data);
+        let data = trim_ascii(&data);
+        if data.is_empty() && event.is_none() {
+            return;
+        }
+        if data == b"[DONE]" {
+            self.saw_done = true;
+            return;
+        }
+        let value = match serde_json::from_slice::<serde_json::Value>(data) {
+            Ok(value) => value,
+            Err(_) => {
+                self.protocol_error
+                    .get_or_insert_with(|| "Responses SSE event is not valid JSON".into());
+                return;
+            }
+        };
+        let Some(kind) = value.get("type").and_then(serde_json::Value::as_str) else {
+            self.protocol_error
+                .get_or_insert_with(|| "Responses SSE event has no type".into());
+            return;
+        };
+        if event
+            .as_deref()
+            .is_some_and(|event| !event.is_empty() && event != kind)
+        {
+            self.protocol_error
+                .get_or_insert_with(|| "Responses SSE event and JSON type disagree".into());
+        }
+        let response = value.get("response");
+        if value.get("error").is_some_and(|error| !error.is_null())
+            || response
+                .and_then(|response| response.get("error"))
+                .is_some_and(|error| !error.is_null())
+        {
+            self.observe_event("error");
+        }
+        if kind == "response.incomplete" {
+            let expected_cap = self.expected_output_limit;
+            let expected_limit = expected_cap.is_some()
+                && response
+                    .and_then(|r| r.get("status"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("incomplete")
+                && response
+                    .and_then(|r| r.pointer("/incomplete_details/reason"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("max_output_tokens")
+                && response
+                    .and_then(|r| r.pointer("/usage/output_tokens"))
+                    .and_then(serde_json::Value::as_u64)
+                    .zip(expected_cap)
+                    .is_some_and(|(used, cap)| used >= cap);
+            if expected_limit {
+                self.record_response_success(kind);
+            } else {
+                self.observe_event(kind);
+            }
+        } else if kind == "response.completed" {
+            if response
+                .and_then(|r| r.get("status"))
+                .is_some_and(|status| status.as_str() != Some("completed"))
+            {
+                self.protocol_error.get_or_insert_with(|| {
+                    "Responses completed event has a conflicting status".into()
+                });
+            }
+            self.record_response_success(kind);
+        } else {
+            self.observe_event(kind);
+        }
+    }
+
+    fn record_response_success(&mut self, kind: &str) {
+        if self
+            .success_event
+            .as_deref()
+            .is_some_and(|previous| previous != kind)
+        {
+            self.protocol_error
+                .get_or_insert_with(|| "Responses stream has conflicting terminal events".into());
+        }
+        self.success_event.get_or_insert_with(|| kind.to_string());
     }
 
     fn observe_event(&mut self, event: &str) {
@@ -9068,7 +9348,11 @@ fn probe_status_error(
     }
 }
 
-async fn read_probe_body(resp: reqwest::Response, mode: ProbeResponseMode) -> ProbeBodyRead {
+async fn read_probe_body(
+    resp: reqwest::Response,
+    mode: ProbeResponseMode,
+    expected_output_limit: Option<u64>,
+) -> ProbeBodyRead {
     // A non-2xx answer is already the diagnosis, so its body is read for the
     // preview only. Running it through the SSE or JSON validators as well would
     // overwrite "429 Too Many Requests" with "stream ended before required
@@ -9094,7 +9378,7 @@ async fn read_probe_body(resp: reqwest::Response, mode: ProbeResponseMode) -> Pr
     };
     let mut sse_tracker = (validate_body
         && !matches!(mode, ProbeResponseMode::Json | ProbeResponseMode::ImageJson))
-    .then(|| ProbeSseTracker::new(mode));
+    .then(|| ProbeSseTracker::with_output_limit(mode, expected_output_limit));
 
     while let Some(chunk) = stream.next().await {
         let chunk = match chunk {
@@ -9584,6 +9868,11 @@ async fn test_share_connection(
             echo_body: body.clone(),
             body: ConnectionTestBody::Json(body),
             response_mode: probe_response_mode(&probe.response_mode)?,
+            expected_output_limit: probe
+                .body
+                .get("max_output_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|limit| *limit > 0),
         }
     } else {
         if app != "codex" {
@@ -9617,6 +9906,7 @@ async fn test_share_connection(
                     echo_body: body.clone(),
                     body: ConnectionTestBody::Json(body),
                     response_mode: ProbeResponseMode::ImageSse,
+                    expected_output_limit: None,
                 }
             }
             "image_edit" => {
@@ -9632,6 +9922,7 @@ async fn test_share_connection(
                     echo_body: "<multipart: model=grok-imagine, prompt, image=test.png>".into(),
                     body: ConnectionTestBody::ImageEdit(image),
                     response_mode: ProbeResponseMode::ImageSse,
+                    expected_output_limit: None,
                 }
             }
             "video_generation" => {
@@ -9649,6 +9940,7 @@ async fn test_share_connection(
                     echo_body: body.clone(),
                     body: ConnectionTestBody::Json(body),
                     response_mode: ProbeResponseMode::Json,
+                    expected_output_limit: None,
                 }
             }
             _ => unreachable!("operation was validated"),
@@ -9799,7 +10091,7 @@ async fn test_share_connection(
                 .iter()
                 .map(|(k, v)| [k.as_str().to_string(), v.to_str().unwrap_or("").to_string()])
                 .collect();
-            let body = read_probe_body(resp, response_mode).await;
+            let body = read_probe_body(resp, response_mode, prepared.expected_output_limit).await;
             let duration_ms = started.elapsed().as_millis() as u64;
             let body_truncated = body.total_bytes > body.preview.len();
             let body_text = String::from_utf8_lossy(&body.preview).into_owned();
