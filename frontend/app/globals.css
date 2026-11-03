@@ -94,8 +94,10 @@
 
 :is(.input, .textarea, .select__trigger, .input-otp__slot, .input-group, .combo-box__input, .number-field__input):focus-visible,
 :is(.input, .textarea, .select__trigger, .input-otp__slot)[data-focus-visible="true"] {
-  outline: 2px solid rgb(var(--router-ring) / 0.45);
-  outline-offset: 2px;
+  /* Draw inside the border box. An offset outline is clipped by modal overflow. */
+  outline: none;
+  outline-offset: 0;
+  box-shadow: inset 0 0 0 2px rgb(var(--router-ring) / 0.45);
 }
 
 /* Chinese locale: put the loaded Noto Sans SC face first. English keeps the
