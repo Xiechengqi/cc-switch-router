@@ -3144,6 +3144,29 @@ fn public_app_capabilities(
                     bound_provider
                         .and_then(|value| value.health.as_ref().map(|health| health.healthy))
                 });
+            let provider_types = [
+                runtime.and_then(|value| value.provider_type.as_deref()),
+                runtime.map(|value| value.kind.as_str()),
+                bound_provider.and_then(|provider| provider.provider_type.as_deref()),
+                bound_provider.and_then(|provider| provider.kind.as_deref()),
+            ];
+            let provider_type = first_nonempty(provider_types);
+            let buddy = provider_types
+                .into_iter()
+                .flatten()
+                .any(|value| matches!(value.trim(), "workbuddy_oauth" | "codebuddy_oauth"));
+            let account_hint = if buddy {
+                // Buddy accountLabel carries a private managed-account ID.
+                // Public listings must not publish it or substitute an email.
+                None
+            } else {
+                first_nonempty([
+                    runtime.and_then(|value| value.account_label.as_deref()),
+                    runtime.and_then(|value| value.account_email.as_deref()),
+                    bound_provider.and_then(|value| value.account_label.as_deref()),
+                    bound_provider.and_then(|value| value.account_email.as_deref()),
+                ])
+            };
             ShareMarketAppCapability {
                 app,
                 provider_family,
@@ -3151,12 +3174,7 @@ fn public_app_capabilities(
                     runtime.and_then(|value| value.provider_name.as_deref()),
                     bound_provider.map(|provider| provider.name.as_str()),
                 ]),
-                provider_type: first_nonempty([
-                    runtime.and_then(|value| value.provider_type.as_deref()),
-                    runtime.map(|value| value.kind.as_str()),
-                    bound_provider.and_then(|provider| provider.provider_type.as_deref()),
-                    bound_provider.and_then(|provider| provider.kind.as_deref()),
-                ]),
+                provider_type,
                 subscription_level: first_nonempty([
                     runtime.and_then(|value| value.subscription_level.as_deref()),
                     runtime.and_then(|value| {
@@ -3182,12 +3200,7 @@ fn public_app_capabilities(
                             ),
                     )
                 },
-                account_hint: first_nonempty([
-                    runtime.and_then(|value| value.account_label.as_deref()),
-                    runtime.and_then(|value| value.account_email.as_deref()),
-                    bound_provider.and_then(|value| value.account_label.as_deref()),
-                    bound_provider.and_then(|value| value.account_email.as_deref()),
-                ]),
+                account_hint,
                 quota: public_provider_quota(
                     runtime_quota.or(bound_quota),
                     runtime
@@ -14185,6 +14198,61 @@ mod tests {
         assert!(!public_json.contains("https://secret.invalid/v1"));
         assert!(!public_json.contains("accountEmail"));
         assert!(!public_json.contains("apiUrl"));
+    }
+
+    #[test]
+    fn buddy_public_capabilities_do_not_publish_private_account_ids_or_email() {
+        for product in ["workbuddy_oauth", "codebuddy_oauth"] {
+            for app in ["claude", "codex", "gemini"] {
+                let bindings = serde_json::json!({ (app): "buddy-provider" }).to_string();
+                let mut runtimes = serde_json::json!({ (app): {
+                    "kind": product,
+                    "providerType": product,
+                    "app": app,
+                    "providerName": "Buddy product name",
+                    "accountLabel": "bound-buddy-account",
+                    "accountEmail": "share-owner@example.com"
+                }});
+                let mut providers = serde_json::json!({ (app): [{
+                    "id": "buddy-provider",
+                    "name": "Buddy product name",
+                    "app": app,
+                    "kind": product,
+                    "providerType": product,
+                    "enabled": true,
+                    "accountLabel": "bound-buddy-account",
+                    "accountEmail": "account@example.com"
+                }]});
+                let hints = |runtimes: &serde_json::Value, providers: &serde_json::Value| {
+                    public_app_capabilities(
+                        &bindings,
+                        Some(&runtimes.to_string()),
+                        Some(&providers.to_string()),
+                        app,
+                    )
+                    .into_iter()
+                    .map(|capability| capability.account_hint)
+                    .collect::<Vec<_>>()
+                };
+                assert_eq!(hints(&runtimes, &providers), vec![None]);
+                // Legacy generic runtime kinds cannot bypass the bound product's privacy.
+                runtimes[app]["providerType"] = serde_json::Value::Null;
+                runtimes[app]["kind"] = serde_json::json!("official_oauth");
+                assert_eq!(hints(&runtimes, &providers), vec![None]);
+                runtimes[app]["providerType"] = serde_json::json!(product);
+                runtimes[app]["kind"] = serde_json::json!(product);
+                // Bound Provider IDs and emails remain private without a runtime ID.
+                runtimes[app]["accountLabel"] = serde_json::Value::Null;
+                assert_eq!(hints(&runtimes, &providers), vec![None]);
+                providers[app][0]["accountLabel"] = serde_json::Value::Null;
+                assert_eq!(hints(&runtimes, &providers), vec![None]);
+                // Neither an unbound Provider nor a stale runtime can supply an ID.
+                providers[app][0]["accountLabel"] = serde_json::json!("unbound-account");
+                providers[app][0]["id"] = serde_json::json!("other-provider");
+                runtimes[app]["accountLabel"] = serde_json::json!("stale-account");
+                assert_eq!(hints(&runtimes, &providers), vec![None]);
+            }
+        }
     }
 
     #[test]

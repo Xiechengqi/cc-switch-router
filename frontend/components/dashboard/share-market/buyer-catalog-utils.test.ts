@@ -254,6 +254,30 @@ test("provider panel reproduces quota, provider identity and enabled app model r
   assert.match(view.toneClassName, /emerald/);
 });
 
+test("Buddy public market panels do not substitute private account IDs, emails or product names", () => {
+  for (const providerType of ["workbuddy_oauth", "codebuddy_oauth"]) {
+    for (const app of ["claude", "codex", "gemini"]) {
+      for (const accountHint of ["private-buddy-account", "owner@example.com", undefined, "", "   "]) {
+        const view = marketProviderStatusView(
+          {
+            supportedApps: [app],
+            appCapabilities: [capability({
+              app,
+              providerFamily: "other",
+              providerType,
+              providerName: "WorkBuddy",
+              accountHint,
+            })],
+          },
+          "en",
+          { unknown: "Unknown", passthrough: "Passthrough" },
+        );
+        assert.equal(view.identityLine, "-");
+      }
+    }
+  }
+});
+
 test("provider panel preserves unobserved Fable quota hints", () => {
   const view = marketProviderStatusView(
     {
