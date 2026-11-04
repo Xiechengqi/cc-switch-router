@@ -176,6 +176,7 @@ jobs:
           bash scripts/ci/timed.sh 'Share value pricing and signed projections' cargo test --locked share_value
           bash scripts/ci/timed.sh 'Share reader compatibility' cargo test --locked share_contract_reader
           bash scripts/ci/timed.sh 'Share authorization contracts' cargo test --locked share_user
+          bash scripts/ci/timed.sh 'Share browser API CORS' cargo test --locked browser_share_cors
           bash scripts/ci/timed.sh 'Share USD usage initialization' cargo test --locked value_usage_initialization_tests
 
   build:

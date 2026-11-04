@@ -5,14 +5,14 @@ import { Button, Modal } from "@heroui/react";
 import { Check, Copy, ExternalLink, LogIn, Mail } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { getUserApiToken } from "@/lib/api";
+import { useShareConnectionToken } from "@/lib/use-share-connection-token";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import { ShareConnectionTestRow } from "@/components/dashboard/share-connection-test";
 import {
   shareEnabledApps,
   SHARE_APP_LABELS,
 } from "@/lib/share-app";
-import type { ShareView, UserApiTokenStatus } from "@/lib/types";
+import type { ShareView } from "@/lib/types";
 
 const ROUTER_OPEN_LOGIN_EVENT = "router-open-login";
 
@@ -35,6 +35,11 @@ export const ShareConnectDialog = React.memo(function ShareConnectDialog({
   const { session, loading } = useAuth();
   const authenticated = !!session?.authenticated;
   const canViewSecret = !!share?.canViewSecret;
+  const credentials = useShareConnectionToken(
+    open && !loading && authenticated,
+    session?.user?.id,
+    session?.user?.email,
+  );
 
   const baseUrl = React.useMemo(() => {
     if (!share?.subdomain) return "";
@@ -44,38 +49,10 @@ export const ShareConnectDialog = React.memo(function ShareConnectDialog({
     return `https://${share.subdomain}.${host}`;
   }, [share?.subdomain]);
 
-  const [token, setToken] = React.useState<UserApiTokenStatus | null>(null);
-  const [apiTokenPlain, setApiTokenPlain] = React.useState<string>("");
-  const [tokenError, setTokenError] = React.useState<string>("");
-  const [tokenBusy, setTokenBusy] = React.useState(false);
-
-  React.useEffect(() => {
-    if (!open || !authenticated) {
-      setToken(null);
-      setApiTokenPlain("");
-      setTokenError("");
-      return;
-    }
-    let cancelled = false;
-    setTokenBusy(true);
-    setTokenError("");
-    getUserApiToken()
-      .then((response) => {
-        if (cancelled) return;
-        setToken(response.token);
-        setApiTokenPlain(response.apiToken || "");
-      })
-      .catch((err) => {
-        if (cancelled) return;
-        setTokenError(err instanceof Error ? err.message : String(err));
-      })
-      .finally(() => {
-        if (!cancelled) setTokenBusy(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [open, authenticated]);
+  const token = credentials.value?.token;
+  const apiTokenPlain = credentials.value?.apiToken || "";
+  const tokenBusy = credentials.loading || authenticated && !credentials.matchesActor;
+  const tokenError = credentials.error ? t("dashboard.connectDialog.localTest.keyUnavailable") : "";
 
   const apiKeyDisplay = React.useMemo(() => {
     // 优先明文；缺明文（老库没补 plaintext 列）才回落到 prefix + 遮罩 + 提示。
@@ -147,6 +124,11 @@ export const ShareConnectDialog = React.memo(function ShareConnectDialog({
                   tokenError={tokenError}
                   requestLogin={requestLogin}
                 />
+                {credentials.error ? (
+                  <Button variant="ghost" size="sm" className="justify-self-start" onPress={credentials.retry}>
+                    {t("common.retry")}
+                  </Button>
+                ) : null}
               </ConnectSection>
               <ConnectSection title={t("dashboard.connectDialog.test.section")}>
                 {authenticated && !canViewSecret ? (
@@ -169,13 +151,16 @@ export const ShareConnectDialog = React.memo(function ShareConnectDialog({
                 <div className="divide-y divide-slate-100">
                   {shareApps.map((app) => (
                     <ShareConnectionTestRow
-                      key={`${share.shareId}:${app}:${share.appRuntimes?.[app]?.modelProbe?.healthFingerprint || "no-probe"}`}
+                      key={`${credentials.actor}:${token?.prefix || "no-key"}:${share.shareId}:${app}:${share.appRuntimes?.[app]?.modelProbe?.healthFingerprint || "no-probe"}`}
                       share={share}
                       app={app}
                       apiToken={apiTokenPlain}
                       baseUrl={baseUrl}
                       authenticated={authenticated}
-                      canExecute={authenticated && canViewSecret}
+                      canExecute={authenticated && canViewSecret && credentials.matchesActor}
+                      tokenLoading={tokenBusy}
+                      tokenError={credentials.error}
+                      isCurrentActor={credentials.isCurrent}
                     />
                   ))}
                 </div>

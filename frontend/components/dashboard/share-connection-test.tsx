@@ -2,13 +2,15 @@
 
 import * as React from "react";
 import { Button } from "@heroui/react";
-import { Check, ChevronDown, Copy, Loader2, RefreshCw } from "lucide-react";
+import { Check, ChevronDown, Copy, ExternalLink, Loader2, RefreshCw } from "lucide-react";
 import { CompactSelect } from "@/components/common/compact-select";
+import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { recoverShareAccountRateLimit, refreshShareUsage, testShareConnection } from "@/lib/api";
 import { SHARE_APP_LABELS } from "@/lib/share-app";
 import { buildShareProbeCurl } from "@/lib/share-model-probe";
+import { openShareLocalTest, SHARE_LOCAL_TEST_ORIGIN, shareLocalTestUnavailable } from "@/lib/share-local-test";
 import type {
   ShareConnectionTestResponse,
   ShareUpstreamProvider,
@@ -89,6 +91,9 @@ export function ShareConnectionTestRow({
   baseUrl,
   authenticated,
   canExecute,
+  tokenLoading,
+  tokenError,
+  isCurrentActor,
 }: {
   share: ShareView;
   app: TestApp;
@@ -96,6 +101,9 @@ export function ShareConnectionTestRow({
   baseUrl: string;
   authenticated: boolean;
   canExecute: boolean;
+  tokenLoading: boolean;
+  tokenError: boolean;
+  isCurrentActor: () => boolean;
 }) {
   const { t } = useLocaleText();
   const [testState, setTestState] = React.useState<TestState>("idle");
@@ -106,10 +114,32 @@ export function ShareConnectionTestRow({
   const [operation, setOperation] = React.useState<TestOperation>("text");
   const [recoveryState, setRecoveryState] = React.useState<TestState>("idle");
   const [recoveryMsg, setRecoveryMsg] = React.useState("");
+  const [localConfirmation, setLocalConfirmation] = React.useState<string | null>(null);
+  const [localOpenFailed, setLocalOpenFailed] = React.useState(false);
 
   const isBound = !!(share.bindings?.[app]);
   const runtime = runtimeForApp(share, app);
   const probe = runtime?.modelProbe;
+  const localInput = { app, operation, baseUrl, apiToken, probe, authenticated, canExecute, isBound, tokenLoading, tokenError };
+  const localUnavailable = shareLocalTestUnavailable(localInput);
+  const localIdentity = JSON.stringify([share.shareId, app, operation, baseUrl, probe?.requestedModel, probe?.healthFingerprint]);
+  const confirmLocalTest = () => {
+    if (localConfirmation !== localIdentity || localUnavailable || !isCurrentActor()) {
+      setLocalConfirmation(null);
+      return;
+    }
+    try {
+      if (!openShareLocalTest(localInput, isCurrentActor)) {
+        setLocalOpenFailed(true);
+        return;
+      }
+      setLocalConfirmation(null);
+      setLocalOpenFailed(false);
+    } catch {
+      // Do not expose a browser exception that could contain the sensitive URL.
+      setLocalOpenFailed(true);
+    }
+  };
   const curlCmd = React.useMemo(
     () => (baseUrl && probe ? buildShareProbeCurl(baseUrl, probe, apiToken) : ""),
     [baseUrl, probe, apiToken],
@@ -222,7 +252,7 @@ export function ShareConnectionTestRow({
 
   return (
     <div className="grid gap-2.5 py-3 text-sm">
-      <div className="flex items-center justify-between gap-2">
+      <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex min-w-0 items-center gap-2">
           <ShareAppLogo app={app} size={14} />
           <span className="shrink-0 font-medium text-slate-900">{SHARE_APP_LABELS[app]}</span>
@@ -230,11 +260,14 @@ export function ShareConnectionTestRow({
         {disabledReason ? (
           <span className="text-xs text-slate-400">{disabledReason}</span>
         ) : (
-          <div className="flex shrink-0 items-center gap-1.5">
+          <div className="flex min-w-0 max-w-full flex-wrap items-center gap-1.5">
             {app === "codex" ? (
               <CompactSelect
                 value={operation}
-                onChange={(value) => setOperation(value as TestOperation)}
+                onChange={(value) => {
+                  setLocalConfirmation(null);
+                  setOperation(value as TestOperation);
+                }}
                 disabled={running}
                 ariaLabel={t("dashboard.connectDialog.test.operationText")}
                 triggerClassName="h-8 min-h-8"
@@ -277,9 +310,35 @@ export function ShareConnectionTestRow({
                 t("dashboard.connectDialog.test.button")
               )}
             </Button>
+            <span className="inline-flex" title={localUnavailable ? t(localUnavailable) : t("dashboard.connectDialog.localTest.hint")}>
+              <Button size="sm" variant="outline" isDisabled={!!localUnavailable}
+                aria-label={`${t("dashboard.connectDialog.localTest.button")} · ${t("dashboard.connectDialog.localTest.hint")}`}
+                onPress={() => {
+                  if (localUnavailable || !isCurrentActor()) return;
+                  setLocalOpenFailed(false);
+                  setLocalConfirmation(localIdentity);
+                }}>
+                {t("dashboard.connectDialog.localTest.button")}
+                <ExternalLink className="size-3.5" aria-hidden="true" />
+              </Button>
+            </span>
           </div>
         )}
       </div>
+
+      <ConfirmAlertDialog
+        open={localConfirmation === localIdentity && !localUnavailable && isCurrentActor()}
+        title={t("dashboard.connectDialog.localTest.title")}
+        description={t("dashboard.connectDialog.localTest.warning", { origin: SHARE_LOCAL_TEST_ORIGIN })}
+        extra={<>
+          <p className="break-all font-mono text-xs">{baseUrl} · {probe?.requestedModel}</p>
+          {localOpenFailed ? <p role="alert" className="mt-2 text-danger">{t("dashboard.connectDialog.localTest.openFailed")}</p> : null}
+        </>}
+        confirmLabel={t("dashboard.connectDialog.localTest.confirm")}
+        cancelLabel={t("common.cancel")}
+        onOpenChange={open => { if (!open) setLocalConfirmation(null); }}
+        onConfirm={confirmLocalTest}
+      />
 
       {operation === "text" && probe ? (
         <p className="text-xs leading-5 text-slate-500">

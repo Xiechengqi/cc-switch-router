@@ -13399,6 +13399,18 @@ impl AppStore {
         Ok(())
     }
 
+    /// Recognize an offline Share API host without acquiring a route or exposing
+    /// Client Web/Router management paths to browser API CORS.
+    pub(crate) async fn has_share_api_subdomain(&self, subdomain: &str) -> Result<bool, AppError> {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM shares WHERE subdomain = ?1)",
+            params![subdomain],
+            |row| row.get(0),
+        )
+        .map_err(|error| AppError::Internal(format!("query Share API host failed: {error}")))
+    }
+
     pub async fn list_share_route_targets(&self) -> Result<Vec<ShareRouteTarget>, AppError> {
         let conn = self.conn.lock().await;
         let mut stmt = conn

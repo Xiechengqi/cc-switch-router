@@ -86,8 +86,9 @@ use crate::notifications::{
 };
 use crate::proxy::{
     ReleasedShareRequest, RouteAvailability, build_user_model_route_test_probe,
-    execute_user_model_route_test, gateway_proxy_handler, is_user_model_api_host, proxy_handler,
-    unified_model_test_curl, user_model_proxy_handler, with_unified_api_cors,
+    execute_user_model_route_test, gateway_proxy_handler, is_direct_share_model_api_request,
+    is_user_model_api_host, proxy_handler, unified_api_preflight_response, unified_model_test_curl,
+    user_model_proxy_handler, with_unified_api_cors,
 };
 use crate::recent_traffic::{RecentRequestEvent, RecentTrafficSnapshot};
 use crate::scheduling_signals::{
@@ -697,6 +698,14 @@ async fn ip_blacklist_middleware(
 ) -> Response {
     let is_user_model_api =
         is_user_model_api_host(request_host(&req).as_str(), &state.config.tunnel_domain);
+    let is_direct_share_model_api = !is_user_model_api
+        && is_direct_share_model_api_request(
+            &state,
+            &request_host(&req),
+            req.method(),
+            req.uri().path(),
+        )
+        .await;
     // Telegram's webhook senders live in ranges the operator does not control
     // and cannot enumerate; a blacklist entry that happens to cover one would
     // break account binding silently. The route carries its own authentication
@@ -738,7 +747,7 @@ async fn ip_blacklist_middleware(
     {
         state.ip_blacklist_stats.record(ip, req.uri().path());
         let response = (StatusCode::FORBIDDEN, "IP blacklisted").into_response();
-        return if is_user_model_api {
+        return if is_user_model_api || is_direct_share_model_api {
             with_unified_api_cors(response)
         } else {
             response
@@ -755,6 +764,15 @@ async fn ip_blacklist_middleware(
             .map(|info| info.0)
             .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
         return user_model_proxy_handler(State(state), ConnectInfo(peer), req).await;
+    }
+    if is_direct_share_model_api {
+        // Browser preflight carries no API Key. It must never reach Share
+        // authentication, abuse counters, upstream calls, billing, or admission.
+        // Actual requests still traverse the unchanged authenticated proxy.
+        if req.method() == Method::OPTIONS {
+            return with_unified_api_cors(unified_api_preflight_response(req.headers()));
+        }
+        return with_unified_api_cors(next.run(req).await);
     }
     next.run(req).await
 }

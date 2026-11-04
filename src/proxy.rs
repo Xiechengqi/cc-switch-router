@@ -3187,7 +3187,7 @@ pub(crate) fn with_unified_api_cors(mut response: Response) -> Response {
     response
 }
 
-fn unified_api_preflight_response(request_headers: &HeaderMap) -> Response {
+pub(crate) fn unified_api_preflight_response(request_headers: &HeaderMap) -> Response {
     let mut response = Response::new(Body::empty());
     *response.status_mut() = StatusCode::NO_CONTENT;
     response.headers_mut().insert(
@@ -3214,6 +3214,51 @@ fn unified_api_preflight_response(request_headers: &HeaderMap) -> Response {
         HeaderValue::from_static("Access-Control-Request-Headers"),
     );
     response
+}
+
+fn is_browser_share_model_api_path(method: &axum::http::Method, path: &str) -> bool {
+    use axum::http::Method;
+    if matches!(*method, Method::GET | Method::OPTIONS)
+        && matches!(
+            path,
+            "/v1/models" | "/v1beta/models" | "/gemini/v1beta/models"
+        )
+    {
+        return true;
+    }
+    matches!(*method, Method::POST | Method::OPTIONS)
+        && infer_user_model_request_app(path).is_some()
+}
+
+pub(crate) async fn is_direct_share_model_api_request(
+    state: &ServerState,
+    host: &str,
+    method: &axum::http::Method,
+    path: &str,
+) -> bool {
+    if !is_browser_share_model_api_path(method, path) {
+        return false;
+    }
+    let Some(subdomain) = subdomain_for_host(host, &state.config.tunnel_domain) else {
+        return false;
+    };
+    if subdomain == "api" {
+        return false;
+    }
+    if let Some(route) = state
+        .proxy
+        .backend_for_host(host, &state.config.tunnel_domain)
+        .await
+    {
+        return route.is_share();
+    }
+    // Offline/reconnecting Share errors must be readable too. This indexed
+    // existence query is only used when no active route can classify the host.
+    state
+        .store
+        .has_share_api_subdomain(&subdomain)
+        .await
+        .unwrap_or(false)
 }
 
 pub async fn proxy_handler(
@@ -8897,6 +8942,335 @@ mod tests {
                 .headers()
                 .contains_key(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
         );
+    }
+
+    #[test]
+    fn browser_share_cors_only_covers_public_model_api_methods_and_paths() {
+        use axum::http::Method;
+        for path in [
+            "/v1/chat/completions",
+            "/v1/responses",
+            "/v1/messages",
+            "/v1/messages/count_tokens",
+            "/v1/embeddings",
+            "/v1beta/models/test:generateContent",
+        ] {
+            assert!(is_browser_share_model_api_path(&Method::POST, path));
+            assert!(is_browser_share_model_api_path(&Method::OPTIONS, path));
+            assert!(!is_browser_share_model_api_path(&Method::DELETE, path));
+            assert!(!is_browser_share_model_api_path(&Method::GET, path));
+        }
+        for path in ["/v1/models", "/v1beta/models", "/gemini/v1beta/models"] {
+            assert!(is_browser_share_model_api_path(&Method::GET, path));
+            assert!(is_browser_share_model_api_path(&Method::OPTIONS, path));
+            assert!(!is_browser_share_model_api_path(&Method::POST, path));
+        }
+        for path in [
+            "/",
+            "/_ctl/state",
+            "/_share-router/health",
+            "/web-api/invoke/test",
+            "/v1/auth/session/me",
+            "/v1/admin/settings",
+            "/v1/me/api-token",
+            "/v1/chat/completions/other",
+            "/v1beta/models/test:unknownAction",
+        ] {
+            for method in [Method::GET, Method::POST, Method::OPTIONS] {
+                assert!(
+                    !is_browser_share_model_api_path(&method, path),
+                    "{method} {path}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn browser_share_cors_preserves_success_and_error_statuses_without_cookies() {
+        for status in [
+            StatusCode::OK,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let mut response = simple_response(status, "fixture response");
+            response.headers_mut().insert(
+                header::SET_COOKIE,
+                HeaderValue::from_static("fixture=private"),
+            );
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("30"));
+            let response = with_unified_api_cors(response);
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                    .unwrap(),
+                "*"
+            );
+            assert_eq!(
+                response.headers().get(header::CACHE_CONTROL).unwrap(),
+                "no-store"
+            );
+            assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "30");
+            assert!(!response.headers().contains_key(header::SET_COOKIE));
+            assert!(
+                !response
+                    .headers()
+                    .contains_key(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_share_cors_preflight_never_authenticates_or_calls_upstream_and_actual_acl_stays_enforced()
+     {
+        let config = proxy_test_config("browser-share-cors");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let backend_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+        let backend_app = axum::Router::new()
+            .fallback(any(|State(hits): State<Arc<AtomicUsize>>| async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                StatusCode::OK
+            }))
+            .with_state(hits.clone());
+        let backend_server = tokio::spawn(async move {
+            axum::serve(backend_listener, backend_app).await.unwrap();
+        });
+        let proxy = Arc::new(ProxyRegistry::default());
+        proxy
+            .set_route(
+                "cors-share".into(),
+                backend_addr.to_string(),
+                None,
+                Some("cors-share".into()),
+                None,
+                false,
+                -1,
+                None,
+            )
+            .await;
+        proxy
+            .set_route(
+                "cors-client".into(),
+                backend_addr.to_string(),
+                None,
+                None,
+                None,
+                false,
+                -1,
+                None,
+            )
+            .await;
+        let state = proxy_test_state(&config, proxy.clone());
+        {
+            let conn = state.store.conn.lock().await;
+            for (id, subdomain) in [
+                ("cors-share", "cors-share"),
+                ("offline-share", "offline-share"),
+            ] {
+                conn.execute(
+                    "INSERT INTO shares (share_id, capacity_pool_id, installation_id, share_name,
+                     subdomain, owner_email, app_type, enabled_codex, token_limit, parallel_limit,
+                     tokens_used, requests_count, share_status, created_at, expires_at, updated_at)
+                     VALUES (?1, ?1, 'fixture-installation', 'CORS fixture', ?2, 'owner@example.test',
+                     'codex', 1, -1, -1, 0, 0, 'active', '2026-01-01T00:00:00Z',
+                     '2099-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                    crate::db::params![id, subdomain],
+                ).unwrap();
+            }
+            conn.execute("INSERT INTO share_bindings (share_id, app_type, provider_id) VALUES ('cors-share', 'codex', 'fixture-provider')", []).unwrap();
+        }
+        let outsider_key = state
+            .store
+            .get_default_api_token("outsider@example.test")
+            .await
+            .unwrap()
+            .api_token
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let router_state = state.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                crate::api::router(router_state)
+                    .into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let client = reqwest::Client::new();
+        let url = format!("http://{address}/v1/chat/completions");
+        for _ in 0..12 {
+            let preflight = client
+                .request(reqwest::Method::OPTIONS, &url)
+                .header("host", "cors-share.router.test")
+                .header("origin", "https://llm-api-test.xiecq.top")
+                .header("access-control-request-method", "POST")
+                .header(
+                    "access-control-request-headers",
+                    "authorization, content-type",
+                )
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(preflight.status(), StatusCode::NO_CONTENT);
+            assert_eq!(
+                preflight
+                    .headers()
+                    .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                    .unwrap(),
+                "*"
+            );
+            assert_eq!(
+                preflight
+                    .headers()
+                    .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
+                    .unwrap(),
+                "authorization, content-type"
+            );
+            assert!(
+                !preflight
+                    .headers()
+                    .contains_key(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+            );
+        }
+        assert!(state.abuse.ban_remaining("127.0.0.1").await.is_none());
+        assert_eq!(
+            proxy
+                .route_by_share_id("cors-share")
+                .await
+                .unwrap()
+                .transport
+                .inflight
+                .load(Ordering::SeqCst),
+            0
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        for (key, expected, body) in [
+            (None, StatusCode::UNAUTHORIZED, "missing-router-api-token"),
+            (
+                Some("ccrt_invalid-fixture"),
+                StatusCode::UNAUTHORIZED,
+                "invalid-router-api-token",
+            ),
+            (
+                Some(outsider_key.as_str()),
+                StatusCode::FORBIDDEN,
+                "share-not-authorized-for-user",
+            ),
+        ] {
+            let mut request = client
+                .post(&url)
+                .header("host", "cors-share.router.test")
+                .header("origin", "https://llm-api-test.xiecq.top")
+                .json(&serde_json::json!({"model":"fixture-model","messages":[]}));
+            if let Some(key) = key {
+                request = request.bearer_auth(key);
+            }
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status(), expected);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                    .unwrap(),
+                "*"
+            );
+            assert_eq!(response.text().await.unwrap(), body);
+        }
+        for host in [
+            "cors-client.router.test",
+            "unknown.router.test",
+            "router.test",
+            "cors-share.router.test.evil.test",
+        ] {
+            let response = client
+                .request(reqwest::Method::OPTIONS, &url)
+                .header("host", host)
+                .send()
+                .await
+                .unwrap();
+            assert_ne!(response.status(), StatusCode::NO_CONTENT, "{host}");
+            assert!(
+                !response
+                    .headers()
+                    .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+                "{host}"
+            );
+        }
+        for path in [
+            "/_ctl/state",
+            "/_share-router/health",
+            "/v1/auth/session/me",
+            "/v1/admin/settings",
+            "/web-api/context",
+        ] {
+            let response = client
+                .request(reqwest::Method::OPTIONS, format!("http://{address}{path}"))
+                .header("host", "cors-share.router.test")
+                .send()
+                .await
+                .unwrap();
+            assert_ne!(response.status(), StatusCode::NO_CONTENT, "{path}");
+            assert!(
+                !response
+                    .headers()
+                    .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+                "{path}"
+            );
+        }
+        let offline_preflight = client
+            .request(reqwest::Method::OPTIONS, &url)
+            .header("host", "offline-share.router.test")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(offline_preflight.status(), StatusCode::NO_CONTENT);
+        let offline = client
+            .post(&url)
+            .header("host", "offline-share.router.test")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(offline.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            offline
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "*"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        state.dynamic.write().await.security.ip_blacklist =
+            crate::dynamic_settings::parse_ip_blacklist("127.0.0.1");
+        let blocked = client
+            .post(&url)
+            .header("host", "cors-share.router.test")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            blocked
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "*"
+        );
+        assert_eq!(blocked.text().await.unwrap(), "IP blacklisted");
+        server.abort();
+        backend_server.abort();
+        let _ = std::fs::remove_file(&config.database.path);
     }
 
     #[test]

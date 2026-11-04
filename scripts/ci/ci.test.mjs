@@ -61,6 +61,7 @@ test("parallel CI retains every existing financial gate and separates profile ca
   assert.match(job("rust-tests"), /cargo test --locked schema::tests/);
   assert.match(job("rust-tests"), /cargo test --locked test_support::tests/);
   assert.match(job("rust-tests"), /cargo test --locked db::tests/);
+  assert.match(job("rust-tests"), /cargo test --locked browser_share_cors/);
   assert.match(job("frontend"), /npm run test:share-value-quota/);
   for (const suite of ["share_value", "share_contract_reader", "share_user", "value_usage_initialization_tests"]) {
     assert.ok(job("rust-tests").includes(`cargo test --locked ${suite}`), `lost Share quota gate: ${suite}`);

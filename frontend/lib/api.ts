@@ -1,4 +1,5 @@
 import { authFetch, readAuthState } from "@/lib/auth";
+import { sameLoginContext } from "@/lib/password-auth";
 import type {
   DashboardResponse,
   ClearMetricsResponse,
@@ -470,8 +471,22 @@ export async function getShareListingPricing(listingId: string) {
   );
 }
 
-export async function getUserApiToken() {
-  return parseJson<UserApiTokenResponse>(await authFetch("/v1/me/api-token", { cache: "no-store" }));
+export async function getUserApiToken(signal?: AbortSignal) {
+  const started = readAuthState();
+  const timeout = AbortSignal.timeout(12_000);
+  const requestSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+  requestSignal.throwIfAborted();
+  const result = await parseJson<UserApiTokenResponse>(await authFetch("/v1/me/api-token", {
+    cache: "no-store", signal: requestSignal,
+  }, started));
+  requestSignal.throwIfAborted();
+  if (!sameLoginContext(started, readAuthState())) throw new DOMException("Sign-in session changed", "AbortError");
+  if (!result || !result.token || typeof result.token.prefix !== "string"
+    || !Array.isArray(result.token.scopes) || !result.token.scopes.every(scope => typeof scope === "string")
+    || result.apiToken != null && typeof result.apiToken !== "string") {
+    throw new Error("Invalid API Key response");
+  }
+  return result;
 }
 
 export async function resetUserApiToken() {
