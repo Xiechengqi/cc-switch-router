@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Button } from "@heroui/react";
+import { Button, Checkbox } from "@heroui/react";
 import { Check, ChevronDown, Copy, ExternalLink, Loader2, RefreshCw } from "lucide-react";
 import { CompactSelect } from "@/components/common/compact-select";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
@@ -11,6 +11,7 @@ import { recoverShareAccountRateLimit, refreshShareUsage, testShareConnection } 
 import { SHARE_APP_LABELS } from "@/lib/share-app";
 import { buildShareProbeCurl } from "@/lib/share-model-probe";
 import { openShareLocalTest, SHARE_LOCAL_TEST_ORIGIN, shareLocalTestUnavailable } from "@/lib/share-local-test";
+import { forgetShareLocalTestConsent, hasShareLocalTestConsent, rememberShareLocalTestConsent } from "@/lib/share-local-test-consent";
 import type {
   ShareConnectionTestResponse,
   ShareUpstreamProvider,
@@ -94,6 +95,7 @@ export function ShareConnectionTestRow({
   tokenLoading,
   tokenError,
   isCurrentActor,
+  accountId,
 }: {
   share: ShareView;
   app: TestApp;
@@ -104,6 +106,7 @@ export function ShareConnectionTestRow({
   tokenLoading: boolean;
   tokenError: boolean;
   isCurrentActor: () => boolean;
+  accountId: string;
 }) {
   const { t } = useLocaleText();
   const [testState, setTestState] = React.useState<TestState>("idle");
@@ -116,6 +119,12 @@ export function ShareConnectionTestRow({
   const [recoveryMsg, setRecoveryMsg] = React.useState("");
   const [localConfirmation, setLocalConfirmation] = React.useState<string | null>(null);
   const [localOpenFailed, setLocalOpenFailed] = React.useState(false);
+  const [rememberLocalTest, setRememberLocalTest] = React.useState(false);
+  const [localTrusted, setLocalTrusted] = React.useState(false);
+
+  React.useEffect(() => {
+    setLocalTrusted(hasShareLocalTestConsent(accountId));
+  }, [accountId]);
 
   const isBound = !!(share.bindings?.[app]);
   const runtime = runtimeForApp(share, app);
@@ -123,8 +132,9 @@ export function ShareConnectionTestRow({
   const localInput = { app, operation, baseUrl, apiToken, probe, authenticated, canExecute, isBound, tokenLoading, tokenError };
   const localUnavailable = shareLocalTestUnavailable(localInput);
   const localIdentity = JSON.stringify([share.shareId, app, operation, baseUrl, probe?.requestedModel, probe?.healthFingerprint]);
-  const confirmLocalTest = () => {
-    if (localConfirmation !== localIdentity || localUnavailable || !isCurrentActor()) {
+  const localDialogOpen = localConfirmation === localIdentity && !localUnavailable && isCurrentActor();
+  const launchLocalTest = (remember: boolean) => {
+    if (localUnavailable || !isCurrentActor()) {
       setLocalConfirmation(null);
       return;
     }
@@ -135,10 +145,20 @@ export function ShareConnectionTestRow({
       }
       setLocalConfirmation(null);
       setLocalOpenFailed(false);
+      if (remember && isCurrentActor()) {
+        setLocalTrusted(rememberShareLocalTestConsent(accountId));
+      }
     } catch {
       // Do not expose a browser exception that could contain the sensitive URL.
       setLocalOpenFailed(true);
     }
+  };
+  const confirmLocalTest = () => {
+    if (localConfirmation !== localIdentity) {
+      setLocalConfirmation(null);
+      return;
+    }
+    launchLocalTest(rememberLocalTest);
   };
   const curlCmd = React.useMemo(
     () => (baseUrl && probe ? buildShareProbeCurl(baseUrl, probe, apiToken) : ""),
@@ -316,6 +336,12 @@ export function ShareConnectionTestRow({
                 onPress={() => {
                   if (localUnavailable || !isCurrentActor()) return;
                   setLocalOpenFailed(false);
+                  if (hasShareLocalTestConsent(accountId)) {
+                    setLocalTrusted(true);
+                    launchLocalTest(false);
+                    return;
+                  }
+                  setRememberLocalTest(false);
                   setLocalConfirmation(localIdentity);
                 }}>
                 {t("dashboard.connectDialog.localTest.button")}
@@ -327,18 +353,35 @@ export function ShareConnectionTestRow({
       </div>
 
       <ConfirmAlertDialog
-        open={localConfirmation === localIdentity && !localUnavailable && isCurrentActor()}
+        open={localDialogOpen}
         title={t("dashboard.connectDialog.localTest.title")}
         description={t("dashboard.connectDialog.localTest.warning", { origin: SHARE_LOCAL_TEST_ORIGIN })}
         extra={<>
           <p className="break-all font-mono text-xs">{baseUrl} · {probe?.requestedModel}</p>
-          {localOpenFailed ? <p role="alert" className="mt-2 text-danger">{t("dashboard.connectDialog.localTest.openFailed")}</p> : null}
+          <Checkbox isSelected={rememberLocalTest} onChange={setRememberLocalTest} className="mt-3 items-start">
+            <Checkbox.Control className="mt-0.5 border border-slate-300 bg-white shadow-none">
+              <Checkbox.Indicator />
+            </Checkbox.Control>
+            <Checkbox.Content className="text-sm text-slate-700">{t("dashboard.connectDialog.localTest.remember")}</Checkbox.Content>
+          </Checkbox>
+          {localOpenFailed ? <p role="alert" className="mt-2 text-xs text-danger">{t("dashboard.connectDialog.localTest.openFailed")}</p> : null}
         </>}
         confirmLabel={t("dashboard.connectDialog.localTest.confirm")}
         cancelLabel={t("common.cancel")}
         onOpenChange={open => { if (!open) setLocalConfirmation(null); }}
         onConfirm={confirmLocalTest}
       />
+
+      {!localUnavailable ? (
+        <p className="text-xs leading-5 text-slate-500">
+          {t("dashboard.connectDialog.localTest.billingHint")}
+          {localTrusted ? <>{" · "}<button type="button" className="underline underline-offset-2 hover:text-slate-900 focus-visible:outline-2 focus-visible:outline-ring"
+            onClick={() => { forgetShareLocalTestConsent(accountId); setLocalTrusted(false); }}>
+            {t("dashboard.connectDialog.localTest.resetConsent")}
+          </button></> : null}
+        </p>
+      ) : null}
+      {localOpenFailed && !localDialogOpen ? <p role="alert" className="text-xs text-danger">{t("dashboard.connectDialog.localTest.openFailed")}</p> : null}
 
       {operation === "text" && probe ? (
         <p className="text-xs leading-5 text-slate-500">

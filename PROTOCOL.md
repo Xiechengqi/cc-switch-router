@@ -580,7 +580,7 @@ x-goog-api-key: <router-user-api-key>
 
 公开 `GET/HEAD /v1/healthz` 不要求 Key。除 CORS `OPTIONS` 外，其余统一入口能力必须先通过 API Key 鉴权：
 
-Share 直连 Host 的公开模型 API 与模型列表也提供无 Cookie 的 Bearer CORS；合法 OPTIONS 预检不要求 Key、不调用上游、不计量、不计入无效鉴权。实际请求仍执行原有 API Key、Share ACL、配额与计费检查，成功和错误响应均带跨域头。该能力不覆盖 Router 管理接口、`/_ctl/**`、`/_share-router/**` 或 Client Web。连接弹窗可经用户明确确认后，把 Share Chat Completions 地址、当前用户 Key 和测试模型传给外部本地测试站；查询参数的凭证风险见 `docs/share-local-test.md`。
+Share 直连 Host 的公开模型 API 与模型列表也提供无 Cookie 的 Bearer CORS；合法 OPTIONS 预检不要求 Key、不调用上游、不计量、不计入无效鉴权。实际请求仍执行原有 API Key、Share ACL、配额与计费检查，成功和错误响应均带跨域头。该能力不覆盖 Router 管理接口、`/_ctl/**`、`/_share-router/**` 或 Client Web。连接弹窗经用户确认（可按账号和目标站点记住选择）后，用 URL fragment 把 Share Chat Completions 地址、当前用户 Key 和测试模型传给外部本地测试站；配套工具以独立临时会话导入，不自动保存或调用模型，历史凭证脱敏。安全边界和两端发布顺序见 `docs/share-local-test.md`。
 
 | App | 统一 Host 允许的完整推理路径白名单 | requested model 来源 | 模型列表 |
 |---|---|---|---|

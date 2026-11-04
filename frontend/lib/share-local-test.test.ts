@@ -18,10 +18,12 @@ test("local test targets the exact Share's Chat endpoint and displayed model, ne
   const url = new URL(buildShareLocalTestUrl(input)!);
   assert.equal(url.origin, SHARE_LOCAL_TEST_ORIGIN);
   assert.equal(url.pathname, "/");
-  assert.deepEqual([...url.searchParams.keys()], ["api", "key", "model"]);
-  assert.equal(url.searchParams.get("api"), "https://share.router.example:8443/v1/chat/completions");
-  assert.equal(url.searchParams.get("key"), input.apiToken);
-  assert.equal(url.searchParams.get("model"), input.probe!.requestedModel);
+  assert.equal(url.search, "", "credentials must not reach the static host/CDN request URL");
+  const fragment = new URLSearchParams(url.hash.slice(1));
+  assert.deepEqual([...fragment.keys()], ["api", "key", "model"]);
+  assert.equal(fragment.get("api"), "https://share.router.example:8443/v1/chat/completions");
+  assert.equal(fragment.get("key"), input.apiToken);
+  assert.equal(fragment.get("model"), input.probe!.requestedModel);
   assert.ok(!url.href.includes(input.probe!.wireModel));
   assert.ok(!url.href.includes("/v1/responses"));
 });
@@ -30,10 +32,12 @@ test("URLSearchParams encodes nested URLs, Keys and model identifiers exactly on
   const apiToken = "ccrt_fixture+&=?/#%";
   const model = "vendor/model+name@high?reasoning=on&x=%23#模型";
   const url = new URL(buildShareLocalTestUrl({ ...input, apiToken, probe: { ...input.probe!, requestedModel: model } })!);
-  assert.equal(url.searchParams.size, 3);
-  assert.equal(url.searchParams.get("key"), apiToken);
-  assert.equal(url.searchParams.get("model"), model);
-  assert.equal(url.searchParams.get("api"), "https://share.router.example:8443/v1/chat/completions");
+  const fragment = new URLSearchParams(url.hash.slice(1));
+  assert.equal(url.search, "");
+  assert.equal(fragment.size, 3);
+  assert.equal(fragment.get("key"), apiToken);
+  assert.equal(fragment.get("model"), model);
+  assert.equal(fragment.get("api"), "https://share.router.example:8443/v1/chat/completions");
 });
 
 for (const [name, overrides, reason] of [
@@ -78,7 +82,9 @@ test("explicit launch opens one isolated new tab without fetching, storage, or n
     assert.equal(openShareLocalTest(input, () => true), true);
     assert.equal(opened.length, 1);
     assert.deepEqual(opened[0].slice(1), ["_blank", "noopener,noreferrer"]);
-    assert.equal(new URL(String(opened[0][0])).searchParams.get("key"), input.apiToken);
+    const url = new URL(String(opened[0][0]));
+    assert.equal(url.search, "");
+    assert.equal(new URLSearchParams(url.hash.slice(1)).get("key"), input.apiToken);
   } finally {
     if (original) Object.defineProperty(globalThis, "window", original);
     else Reflect.deleteProperty(globalThis, "window");
@@ -87,7 +93,7 @@ test("explicit launch opens one isolated new tab without fetching, storage, or n
 
 test("local test labels, warnings and recovery copy exist in both locales without example credentials", () => {
   const keys = Object.keys(messages.en).filter(key => key.startsWith("dashboard.connectDialog.localTest."));
-  assert.equal(keys.length, 10);
+  assert.equal(keys.length, 13);
   for (const key of keys) {
     assert.equal(typeof messages["zh-CN"][key as keyof typeof messages.en], "string");
     for (const locale of ["en", "zh-CN"] as const) {

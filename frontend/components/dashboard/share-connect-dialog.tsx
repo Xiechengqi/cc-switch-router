@@ -161,6 +161,7 @@ export const ShareConnectDialog = React.memo(function ShareConnectDialog({
                       tokenLoading={tokenBusy}
                       tokenError={credentials.error}
                       isCurrentActor={credentials.isCurrent}
+                      accountId={session?.user?.id || ""}
                     />
                   ))}
                 </div>

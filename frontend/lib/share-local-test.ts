@@ -43,15 +43,19 @@ export function shareLocalTestUnavailable(input: ShareLocalTestInput) {
   return null;
 }
 
-/** Build only inside the explicit confirmation handler. Never put this URL in
+/** Build only inside the explicit user gesture. Never put this URL in
  * rendered hrefs, application history, storage, error messages, or telemetry. */
 export function buildShareLocalTestUrl(input: ShareLocalTestInput): string | null {
   if (shareLocalTestUnavailable(input)) return null;
   const url = new URL("/", SHARE_LOCAL_TEST_ORIGIN);
-  url.searchParams.set("api", shareEndpoint(input.baseUrl)!.href);
-  url.searchParams.set("key", input.apiToken);
+  const fragment = new URLSearchParams();
+  fragment.set("api", shareEndpoint(input.baseUrl)!.href);
+  fragment.set("key", input.apiToken);
   // This is the model shown to the caller, not the Provider's wire/upstream model.
-  url.searchParams.set("model", input.probe!.requestedModel);
+  fragment.set("model", input.probe!.requestedModel);
+  // Fragments stay in the browser; unlike query parameters they are not sent
+  // with the initial request to the static host/CDN. The target JS can read it.
+  url.hash = fragment.toString();
   return url.href;
 }
 
