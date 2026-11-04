@@ -27,10 +27,10 @@ test("Buddy quota cards append cycle countdowns and official usage without a lin
     for (const app of ["claude", "codex", "gemini"]) {
       const runtime: ShareUpstreamProvider = { providerType: product, kind: "official_oauth", app, quota: structuredClone(buddyQuota) };
       const text = quotaSummary(runtime, "zh-CN");
-      assert.equal(text, "资源包： CodeBuddy个人版拉新权益包 0/1500 credits 28d9h · CodeBuddy个人体验版 0.5/500 credits 26d15h · 官方用量（账号）： 今日 0.45 · 本月 0.45 credits");
+      assert.equal(text, "CodeBuddy个人版拉新权益包 0/1500 credits 28d9h · CodeBuddy个人体验版 0.5/500 credits 26d15h · 官方用量（账号）： 今日 0.45 · 本月 0.45 credits");
       assert.doesNotMatch(text, /codebuddy package|%|采集|范围|7 日|周期结束|到期|UTC|2026-|其他 share/);
       const english = quotaSummary(runtime, "en");
-      assert.match(english, /Resource packages: CodeBuddy个人版拉新权益包 0\/1500 credits/);
+      assert.match(english, /^CodeBuddy个人版拉新权益包 0\/1500 credits/);
       assert.match(english, /Official usage \(account\): today 0.45 · this month 0.45 credits/);
       assert.equal(english.split("\n").length, 1);
     }

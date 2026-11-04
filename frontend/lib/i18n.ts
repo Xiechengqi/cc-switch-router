@@ -32,7 +32,6 @@ export type MessageKey = keyof typeof messages.en;
 
 export const messages = {
   en: {
-    "quota.buddy.packages": "Resource packages:",
     "quota.buddy.packagesUnavailable": "Resource package data is unavailable",
     "quota.buddy.numericNotExposed": "Numeric quota not exposed",
     "quota.buddy.usage": "Official usage (account):",
@@ -3514,7 +3513,6 @@ export const messages = {
     ...providerRankMessagesEn,
   },
   "zh-CN": {
-    "quota.buddy.packages": "资源包：",
     "quota.buddy.packagesUnavailable": "资源包数据暂不可用",
     "quota.buddy.numericNotExposed": "未提供数值额度",
     "quota.buddy.usage": "官方用量（账号）：",

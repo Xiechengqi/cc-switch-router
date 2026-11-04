@@ -1195,8 +1195,7 @@ export function quotaSummary(
   if (buddy) {
     const packageText = [...tierText, ...unobservedTierText].join(" · ")
       || messages[locale]["quota.buddy.numericNotExposed"];
-    const packageLine = `${messages[locale]["quota.buddy.packages"]} ${packageText}`;
-    return [packageLine, buddyOfficialUsageText(quota.providerUsage, locale)].filter(Boolean).join(" · ");
+    return [packageText, buddyOfficialUsageText(quota.providerUsage, locale)].filter(Boolean).join(" · ");
   }
   return [
     quotaPlanLabel(runtime, quota.plan || quota.credentialMessage),
