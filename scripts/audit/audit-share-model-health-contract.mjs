@@ -35,6 +35,8 @@ const models = requireMarkers("src/models.rs", [
   "pub observed_checks: u16",
   "pub monitoring_gap_checks: u16",
   "pub struct ShareModelHealthProbeEpoch",
+  "pub struct ShareModelHealthStatus",
+  "pub model_health_status: ShareModelHealthStatus",
 ]);
 const store = requireMarkers("src/store.rs", [
   "validate_share_model_probes(share)?",
@@ -53,7 +55,23 @@ const store = requireMarkers("src/store.rs", [
   "outcome = 'unobserved'",
   "share_model_probe_observations",
   "can_view_share_model_health_calendar",
+  "model_health::current_status",
+  "model_health::has_canonical_check",
 ]);
+requireMarkers("src/store/model_health.rs", [
+  "automatic_share_probe(support, runtimes, bindings)",
+  "o.observation_id = s.observation_id",
+  "s.probe_epoch_id = ?1",
+  "FRESH_FOR_SECS: i64 = 65 * 60",
+  "probe_stale",
+  "probe_recovering",
+]);
+requireMarkers("src/share_market.rs", ["model_health::current_status"]);
+requireMarkers("frontend/lib/share-health.ts", [
+  "modelHealthPresentation", "status?.staleAt", "dashboard.modelHealth.stale",
+]);
+requireMarkers("frontend/components/dashboard/share-dashboard-utils.ts", ["share.modelHealthStatus"]);
+requireMarkers("frontend/components/dashboard/share-market/market-utils.ts", ["listing.modelHealthStatus"]);
 const scheduler = requireMarkers("src/share_model_health.rs", [
   "SLOT_SECONDS: i64 = 30 * 60",
   "SLOT_RETENTION_DAYS: i64 = 400",
@@ -174,6 +192,8 @@ const protocol = requireMarkers("PROTOCOL.md", [
   "pending claim 超过 10 分钟",
   "共享 7 分钟总预算",
   "每批最多回退一次",
+  "modelHealthStatus",
+  "65 分钟",
 ]);
 const { errors: versionErrors, versions } = auditShareContractVersions(models, protocol);
 errors.push(...versionErrors);
@@ -186,6 +206,7 @@ requireMarkers(".github/workflows/build-release.yml", [
   "npm run test:share-model-probe",
   "npm run test:share-model-health-heatmap",
   "npm run audit:share-model-health-contract",
+  "cargo test --locked model_health",
 ]);
 
 if (errors.length) {

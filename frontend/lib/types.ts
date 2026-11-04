@@ -465,6 +465,7 @@ export type ShareView = {
   appRuntimes?: ShareAppRuntimes;
   appProviders?: ShareAppProviders;
   modelHealth?: ShareModelHealthSummary;
+  modelHealthStatus?: ShareModelHealthStatus;
   operationalSummary?: OperationalSummary;
   /** 后端权威的服务就绪结果；缺失时兼容旧 Router 响应。 */
   serviceReadiness?: ShareServiceReadiness;
@@ -1206,6 +1207,18 @@ export type ShareModelHealthSummary = {
   claude?: ModelHealthSummary[];
   codex?: ModelHealthSummary[];
   gemini?: ModelHealthSummary[];
+};
+
+export type ShareModelHealthStatus = {
+  state: "healthy" | "degraded" | "unavailable" | "unknown";
+  appType?: string;
+  model?: string;
+  healthFingerprint?: string;
+  checkedAt?: number;
+  staleAt?: number;
+  statusCode?: number;
+  reasonCode: string;
+  recentResults: string[];
 };
 
 export type ShareProviderModelPolicyScope = "global" | "per_app";
@@ -2959,6 +2972,7 @@ export type ShareMarketListing = {
   providerFamily: ShareMarketProviderFamily;
   providerFamilies: ShareMarketProviderFamily[];
   appCapabilities: ShareMarketAppCapability[];
+  modelHealthStatus?: ShareModelHealthStatus;
   ownerEmail: string;
   status: string;
   shareStatus: string;

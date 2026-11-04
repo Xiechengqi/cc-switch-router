@@ -108,6 +108,7 @@ use crate::registration_admission::{
 };
 
 pub(crate) mod client_chat;
+pub(crate) mod model_health;
 pub(crate) mod password_auth;
 pub(crate) mod share_value_quotas;
 
@@ -295,26 +296,6 @@ fn unix_timestamp_rfc3339(value: i64) -> Option<String> {
         .map(|timestamp| timestamp.to_rfc3339())
 }
 
-fn share_model_health_failed(share: &ShareView) -> bool {
-    let entries = match share.app_type.trim().to_ascii_lowercase().as_str() {
-        "claude" => &share.model_health.claude,
-        "codex" => &share.model_health.codex,
-        "gemini" => &share.model_health.gemini,
-        _ => return false,
-    };
-    !entries.is_empty()
-        && entries.iter().all(|entry| {
-            let recent = entry
-                .recent_results
-                .iter()
-                .rev()
-                .take(3)
-                .collect::<Vec<_>>();
-            (!recent.is_empty() && recent.iter().all(|result| result.as_str() == "failed"))
-                || matches!(entry.status.as_str(), "failed" | "unavailable" | "blocked")
-        })
-}
-
 fn representative_recent_latency(
     requests: &[ShareRequestLogEntry],
 ) -> Option<(u64, Option<String>)> {
@@ -355,7 +336,11 @@ fn service_readiness_from_reasons(reasons: &[OperationalReason]) -> ShareService
         .filter(|reason| {
             !matches!(
                 reason.code.as_str(),
-                "expires_soon" | "medium_latency" | "high_latency"
+                "expires_soon"
+                    | "medium_latency"
+                    | "high_latency"
+                    | "provider_degraded"
+                    | "model_health_unknown"
             )
         })
         .map(|reason| {
@@ -491,19 +476,24 @@ fn share_operational_evaluation(
         }
     }
 
-    if share_model_health_failed(share) {
-        let checked_at = share
-            .recent_model_health_checks
-            .iter()
-            .map(|entry| entry.checked_at)
-            .max()
-            .and_then(unix_timestamp_rfc3339);
+    let model_health = &share.model_health_status;
+    if model_health.app_type.is_some() && model_health.state != "healthy" {
+        let checked_at = model_health.checked_at.and_then(unix_timestamp_rfc3339);
+        let (code, severity) = match model_health.state.as_str() {
+            "unavailable" => ("provider_unavailable", "critical"),
+            "degraded" => ("provider_degraded", "warning"),
+            _ => ("model_health_unknown", "warning"),
+        };
         reasons.push(operational_reason(
-            "provider_unavailable",
-            "critical",
+            code,
+            severity,
             checked_at,
             Some("provider"),
-            share.provider_id.as_deref(),
+            model_health
+                .app_type
+                .as_ref()
+                .and_then(|app| share.bindings.get(app))
+                .map(String::as_str),
             None,
             None,
         ));
@@ -8829,6 +8819,14 @@ impl AppStore {
         };
         let (tokens_used_by_app, requests_count_by_app) = authoritative_share_usage_by_app(&share);
         let mut view = ShareView {
+            model_health_status: model_health::current_status(
+                &conn,
+                &share.share_id,
+                &share.support,
+                &share.app_runtimes,
+                &share.bindings,
+                Utc::now(),
+            )?,
             provider_identity: crate::provider_presentation::identity_for_share(&share),
             router_id: "main".to_string(),
             share_id: share.share_id,
@@ -12198,12 +12196,28 @@ impl AppStore {
             recent_logs,
             recent_model_health_checks,
             model_health_by_share,
+            model_health_status_by_share,
             client_tunnels,
         ) = {
             let conn = self.conn.lock().await;
+            let shares = list_shares(&conn)?;
+            let statuses = shares
+                .iter()
+                .map(|(_, share)| {
+                    model_health::current_status(
+                        &conn,
+                        &share.share_id,
+                        &share.support,
+                        &share.app_runtimes,
+                        &share.bindings,
+                        now,
+                    )
+                    .map(|status| (share.share_id.clone(), status))
+                })
+                .collect::<Result<HashMap<_, _>, _>>()?;
             (
                 list_installations(&conn)?,
-                list_shares(&conn)?,
+                shares,
                 list_active_share_edits(&conn)?,
                 list_health_checks(&conn, 10)?,
                 list_share_health_timeline_24h(&conn, now)?,
@@ -12216,6 +12230,7 @@ impl AppStore {
                 list_recent_share_request_logs(&conn, SHARE_REQUEST_LOG_RECOVERY_LIMIT)?,
                 list_recent_share_model_health_checks(&conn, SHARE_MODEL_HEALTH_CHECK_LIMIT)?,
                 list_model_health_summaries(&conn)?,
+                statuses,
                 list_client_tunnels(&conn)?,
             )
         };
@@ -12390,6 +12405,10 @@ impl AppStore {
                         .unwrap_or_default()
                 };
                 let mut view = ShareView {
+                    model_health_status: model_health_status_by_share
+                        .get(&share.share_id)
+                        .cloned()
+                        .unwrap_or_default(),
                     provider_identity: crate::provider_presentation::identity_for_share(&share),
                     router_id: "main".to_string(),
                     share_id: share.share_id,
@@ -23368,6 +23387,9 @@ fn record_runtime_model_health_snapshot_conn(
                 .clone()
                 .unwrap_or_else(|| "cc-switch-scheduled".to_string()),
         };
+        if model_health::has_canonical_check(conn, &check)? {
+            continue;
+        }
         record_share_model_health_check_conn(conn, &check)?;
         if !summary.recent_results.is_empty() {
             let recent_json = serde_json::to_string(&summary.recent_results).map_err(|e| {
@@ -23401,6 +23423,14 @@ fn record_runtime_model_health_snapshot_conn(
             "DELETE FROM share_model_health_state
              WHERE share_id = ?1
                AND app_type = ?2
+               AND NOT EXISTS (SELECT 1 FROM share_model_health_slots s
+                   JOIN share_model_probe_observations o ON o.observation_id = s.observation_id
+                   WHERE s.share_id = share_model_health_state.share_id
+                     AND s.slot_start BETWEEN share_model_health_state.last_checked_at - 2400
+                                          AND share_model_health_state.last_checked_at + 300
+                     AND o.checked_at = share_model_health_state.last_checked_at
+                     AND o.app_type = share_model_health_state.app_type
+                     AND o.requested_model = share_model_health_state.requested_model)
                AND last_checked_at <= ?3",
             params![snapshot.share_id, app_type, snapshot.queried_at],
         )
@@ -23425,6 +23455,14 @@ fn record_runtime_model_health_snapshot_conn(
                 "DELETE FROM share_model_health_state
                  WHERE share_id = ?
                    AND app_type = ?
+                   AND NOT EXISTS (SELECT 1 FROM share_model_health_slots s
+                       JOIN share_model_probe_observations o ON o.observation_id = s.observation_id
+                       WHERE s.share_id = share_model_health_state.share_id
+                         AND s.slot_start BETWEEN share_model_health_state.last_checked_at - 2400
+                                              AND share_model_health_state.last_checked_at + 300
+                         AND o.checked_at = share_model_health_state.last_checked_at
+                         AND o.app_type = share_model_health_state.app_type
+                         AND o.requested_model = share_model_health_state.requested_model)
                    AND last_checked_at <= CAST(? AS INTEGER)
                    AND lower(trim(requested_model)) NOT IN ({placeholders})",
             ),
@@ -24937,10 +24975,26 @@ fn list_recent_share_model_health_checks(
             "SELECT request_id, share_id, subdomain, app_type, requested_model, actual_model,
                     status, status_code, latency_ms, first_token_ms, error_message, checked_at, source
              FROM (
-                 SELECT request_id, share_id, subdomain, app_type, requested_model, actual_model,
-                        status, status_code, latency_ms, first_token_ms, error_message, checked_at, source,
-                        ROW_NUMBER() OVER (PARTITION BY share_id ORDER BY checked_at DESC, request_id DESC) AS row_num
-                 FROM share_model_health_checks
+                 SELECT c.request_id, c.share_id, c.subdomain, c.app_type, c.requested_model,
+                        COALESCE(o.actual_model, c.actual_model) AS actual_model,
+                        COALESCE(o.status, c.status) AS status,
+                        CASE WHEN o.observation_id IS NOT NULL THEN o.status_code ELSE c.status_code END AS status_code,
+                        COALESCE(o.latency_ms, c.latency_ms) AS latency_ms,
+                        CASE WHEN o.observation_id IS NOT NULL THEN NULL ELSE c.first_token_ms END AS first_token_ms,
+                        CASE WHEN o.outcome = 'failure' THEN s.error_message
+                             WHEN o.observation_id IS NOT NULL THEN NULL ELSE c.error_message END AS error_message,
+                        c.checked_at,
+                        CASE WHEN o.observation_id IS NOT NULL
+                             THEN 'cc-switch-router-cycle:' || o.cycle_id ELSE c.source END AS source,
+                        ROW_NUMBER() OVER (PARTITION BY c.share_id ORDER BY c.checked_at DESC, c.request_id DESC) AS row_num
+                 FROM share_model_health_checks c
+                 LEFT JOIN share_model_health_slots s ON s.share_id = c.share_id
+                     AND s.slot_start BETWEEN c.checked_at - 2400 AND c.checked_at + 300
+                     AND s.checked_at = c.checked_at AND s.app_type = c.app_type
+                     AND s.requested_model = c.requested_model AND s.observation_id IS NOT NULL
+                 LEFT JOIN share_model_probe_observations o ON o.observation_id = s.observation_id
+                     AND o.checked_at = c.checked_at AND o.app_type = c.app_type
+                     AND o.requested_model = c.requested_model AND o.slot_start = s.slot_start
              )
              WHERE row_num <= ?1
              ORDER BY checked_at DESC, request_id DESC",
@@ -29415,6 +29469,7 @@ fn gateway_share_label(share_id: &str) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    mod model_health_status;
     mod share_market_control;
     include!("store/share_value_quotas/signed_delivery_tests.rs");
     include!("store/share_value_quotas/metering_scope_tests.rs");
@@ -51946,7 +52001,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn service_readiness_ignores_only_expiry_and_latency_advisories() {
+    fn service_readiness_ignores_expiry_latency_and_non_terminal_health_advisories() {
         let expires_soon = operational_reason(
             "expires_soon",
             "warning",
@@ -51975,8 +52030,19 @@ pub(crate) mod tests {
             Some(DASHBOARD_HIGH_LATENCY_MS.to_string()),
         );
 
-        let advisory_only =
-            service_readiness_from_reasons(&[expires_soon.clone(), medium_latency, high_latency]);
+        let mut advisories = vec![expires_soon.clone(), medium_latency, high_latency];
+        for code in ["provider_degraded", "model_health_unknown"] {
+            advisories.push(operational_reason(
+                code,
+                "warning",
+                None,
+                Some("provider"),
+                Some("provider-1"),
+                None,
+                None,
+            ));
+        }
+        let advisory_only = service_readiness_from_reasons(&advisories);
         assert!(advisory_only.ready);
         assert!(advisory_only.primary_blocker.is_none());
 

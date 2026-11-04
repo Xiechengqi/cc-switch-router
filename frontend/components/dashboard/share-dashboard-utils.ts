@@ -15,6 +15,7 @@ import type {
   ShareView,
 } from "@/lib/types";
 import { compactTokens, formatDateTime } from "@/lib/utils";
+import { modelHealthPresentation } from "@/lib/share-health";
 
 export function modelHealthCheckedAt(
   entry: Pick<ModelHealthSummary, "checkedAt" | "lastCheckedAt">,
@@ -1432,9 +1433,26 @@ export function providerActualModelNames(
 
 export function modelHealthTone(
   share: ShareView,
-  key: "claude" | "codex" | "gemini",
+  key?: "claude" | "codex" | "gemini",
+  locale: AppLocale = "en",
 ) {
+  if (share.modelHealthStatus) {
+    const status = share.modelHealthStatus;
+    const fingerprint = key ? share.appRuntimes?.[key]?.modelProbe?.healthFingerprint : undefined;
+    const applies = !key || (status.appType === key
+      && !!fingerprint && fingerprint === status.healthFingerprint);
+    return modelHealthPresentation(applies ? status : undefined, locale);
+  }
+  if (!key) return modelHealthPresentation(undefined, locale);
   const entries = relevantModelHealthEntries(share, key);
+  const now = Date.now() / 1000;
+  if (!entries.length || entries.some((entry) => {
+    const checkedAt = modelHealthCheckedAt(entry);
+    return !Number.isSafeInteger(checkedAt) || checkedAt <= 0
+      || checkedAt > now || checkedAt + 65 * 60 <= now;
+  })) {
+    return modelHealthPresentation(undefined, locale);
+  }
   if (entries.some((entry) => isAppLevelQuotaBlockedModelHealth(entry, key))) {
     return {
       className: "border-red-200 bg-red-50 text-red-700",
@@ -1445,12 +1463,9 @@ export function modelHealthTone(
     (entry.recentResults || []).slice(0, 3),
   );
   if (!results.length) {
-    return {
-      className: "border-emerald-200 bg-emerald-50 text-emerald-700",
-      label: "healthy",
-    };
+    return modelHealthPresentation(undefined, locale);
   }
-  const failures = results.filter((result) => result === "failed").length;
+  const failures = results.filter((result) => result !== "success").length;
   const allModelsFailed =
     entries.length > 0 &&
     entries.every((entry) => {
@@ -1479,10 +1494,15 @@ export function modelHealthTone(
 
 export function modelHealthTitle(
   share: ShareView,
-  key: "claude" | "codex" | "gemini",
+  key?: "claude" | "codex" | "gemini",
+  locale: AppLocale = "en",
 ) {
+  if (share.modelHealthStatus || !key) {
+    const tone = modelHealthTone(share, key, locale);
+    return "title" in tone ? tone.title : tone.label;
+  }
   const entries = relevantModelHealthEntries(share, key);
-  if (!entries.length) return "No failures recorded yet";
+  if (!entries.length) return modelHealthPresentation(undefined, locale).title;
   return entries
     .map((entry) => {
       const recent = (entry.recentResults || []).join(" / ") || entry.status;

@@ -4042,6 +4042,44 @@ pub struct CapacityAppAvailabilityEntry {
     pub recent_results: Vec<String>,
 }
 
+/// Display-only model monitoring result, independent of tunnel connectivity
+/// and the Server's transient-failure scheduling policy.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareModelHealthStatus {
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checked_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_code: Option<u16>,
+    pub reason_code: String,
+    pub recent_results: Vec<String>,
+}
+
+impl Default for ShareModelHealthStatus {
+    fn default() -> Self {
+        Self {
+            state: "unknown".into(),
+            app_type: None,
+            model: None,
+            health_fingerprint: None,
+            checked_at: None,
+            stale_at: None,
+            status_code: None,
+            reason_code: "not_monitored".into(),
+            recent_results: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareView {
@@ -4112,6 +4150,7 @@ pub struct ShareView {
     pub recent_model_health_checks: Vec<ShareModelHealthCheckEntry>,
     #[serde(default)]
     pub model_health: ShareModelHealthSummary,
+    pub model_health_status: ShareModelHealthStatus,
     pub operational_summary: OperationalSummary,
     pub service_readiness: ShareServiceReadiness,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

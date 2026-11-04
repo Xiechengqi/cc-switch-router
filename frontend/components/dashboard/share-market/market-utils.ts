@@ -21,6 +21,7 @@ import type {
   ShareUpstreamProvider,
 } from "@/lib/types";
 import { formatTokenMillions } from "@/lib/token-units";
+import { modelHealthPresentation } from "@/lib/share-health";
 
 export const CORE_SHARE_APPS = ["claude", "codex", "gemini"] as const;
 export type CoreShareApp = (typeof CORE_SHARE_APPS)[number];
@@ -365,7 +366,7 @@ export function marketCapabilityRuntime(
 }
 
 export function marketProviderStatusView(
-  listing: Pick<ShareMarketListing, "appCapabilities" | "supportedApps">,
+  listing: Pick<ShareMarketListing, "appCapabilities" | "supportedApps" | "modelHealthStatus">,
   locale: AppLocale,
   labels: { unknown: string; passthrough: string },
 ): ShareProviderStatusPanelView {
@@ -390,13 +391,14 @@ export function marketProviderStatusView(
       : [];
   })
     .join(" · ");
-  const healthState =
-    primary.healthState ||
-    (primary.available === false
-      ? "unavailable"
-      : primary.available === true
-        ? "healthy"
-        : "unknown");
+  // Identity/price detail richness is not a health signal. Never let a healthy
+  // primary App conceal another enabled App's failure on a legacy Router.
+  const healthState = capabilities.some((item) => item.healthState === "unavailable")
+    ? "unavailable" : capabilities.some((item) => item.healthState === "degraded")
+      ? "degraded" : capabilities.every((item) => item.healthState === "healthy")
+        ? "healthy" : "unknown";
+  const health = listing.modelHealthStatus
+    ? modelHealthPresentation(listing.modelHealthStatus, locale) : undefined;
   return {
     primaryLine: isApiProvider
       ? primary.providerName || primary.providerType || labels.unknown
@@ -404,7 +406,8 @@ export function marketProviderStatusView(
     identityLine: isApiProvider ? "-" : accountLine,
     modelsLine:
       modelsLine || capabilityModelLabel(primary, labels.passthrough, labels.unknown),
-    toneClassName: marketProviderHealthTone(healthState),
+    panelTitle: health?.title,
+    toneClassName: health?.className ?? marketProviderHealthTone(healthState),
   };
 }
 

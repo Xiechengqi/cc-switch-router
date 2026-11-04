@@ -508,6 +508,10 @@ v2 每条结果必须携带 `observationId`、`outcome`、`failureDomain`、`rea
 
 每次监测配置的有效期由 probe epoch 精确表达,包含 App、Provider、容量池、测试模型、模型策略和 health fingerprint。启用、暂停、恢复或配置切换均开启/关闭 epoch；当前槽已经被领取时,切换从下一槽生效。完整资格日分母为 48；首次启用日、暂停日和恢复日仅计算实际落在 epoch 内且已经开始的槽。Share 运行前、暂停窗口和未来槽不进分母。
 
+Dashboard Share 与 Share Market listing 同时返回 Router 只读投影 `modelHealthStatus`，包含 `state`、可选的 `appType/model/healthFingerprint/checkedAt/staleAt/statusCode`、`reasonCode` 和最新优先的 `recentResults`。两处使用与自动调度相同的代表 App，不用 Share 主 App、信息最丰富的 App 或隧道在线状态代替模型检查。只读取匹配当前配置、当前资格 epoch、installation、容量池和模型的 v2 immutable observation：最近三次实际检查全失败为 `unavailable`（红），存在失败或 degraded 为 `degraded`（黄），已取得的最近检查全成功为 `healthy`（绿）。恢复时保留最近失败的黄色窗口，直到其退出最近三次；控制面 monitoring gap 与 pending 不算实际成功或失败。最新实际检查满 65 分钟、没有当前证据、配置已切换或不支持探针时为 `unknown`（灰），不得按缺失数据默认绿色。`checkedAt/staleAt` 为 Unix 秒；摘要不包含原始上游错误、账号或凭据。
+
+该监测投影与 Server 的调度容错分开：首个瞬态 429 可以暂时保留调度资格，但检查仍为 failed，不可改写为 success。Router 的 runtime 摘要不能覆盖固定槽已有的 canonical 检查，也不能因省略对应模型而删除其状态；历史上被错误 runtime 摘要覆盖的检查展示按 immutable observation 还原读取，不改写原始证据。模型降级或待验证仅为 service readiness 提示，三次确认失败仍为 `provider_unavailable` 阻断提示；不引入新的调度或限流策略，不修改资金结算。
+
 `GET /v1/shares/:share_id/model-health-calendar?days=N` 返回 UTC 日历聚合,`N` 被限制在 1..400,Dashboard 默认读取 365 天。每个 active 日同时返回 eligible、completed、observed、successful、已确认上游侧失败、monitoring gap、成功率和覆盖率；成功率固定为 `successful / eligible`,覆盖率为 `observed / eligible`,缺失检查不能算成功。历史槽、canonical observation 与已结束 epoch 保留 400 天。日历只对以下调用方可见:活跃公开 Share Market listing 的访客、Share Owner、管理员、活跃 ShareTo 用户。
 
 Client 页和 Share Market 页的 Share 侧边栏使用同一个日历组件:日期方块按红、黄、浅绿、绿表达上游模型可用率,并显示月份横轴和星期纵轴。Tooltip 必须同时说明已观测数、确认的上游侧失败、监测缺口、覆盖率和同日配置切换；共享结果只标记“共享上游探针”,不披露其他 Share 数量。这一图表不能混用 30 秒连通率。

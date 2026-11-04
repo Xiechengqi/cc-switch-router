@@ -226,7 +226,7 @@ export function ShareAppSupportCard({
   const enabled = !!share.support?.[app];
   const runtime = resolveShareAppRuntime(share, app);
   const tone = enabled
-    ? modelHealthTone(share, app)
+    ? modelHealthTone(share, app, locale)
     : { className: "bg-slate-50 text-muted-foreground", label: "" };
   const accountEmail = enabled ? providerAccountIdentity(runtime) : "";
   const accountLevel = enabled ? providerAccountLevel(runtime, locale) : "";
@@ -236,7 +236,7 @@ export function ShareAppSupportCard({
   return (
     <div
       data-no-row-drawer
-      title={enabled ? modelHealthTitle(share, app) : undefined}
+      title={enabled ? modelHealthTitle(share, app, locale) : undefined}
       className={`select-text grid min-w-0 grid-cols-[56px_minmax(0,1fr)] gap-2 overflow-hidden rounded-lg border px-2 py-1.5 text-[11px] ${tone.className}`}
     >
       <span className="min-w-0 self-start font-mono uppercase">{label}</span>
@@ -716,7 +716,7 @@ function shareProviderStatusView({
   const isApiProvider = isApiProviderRuntime(runtime);
   const apiEndpoint = providerApiEndpoint(runtime);
   const healthTone = share
-    ? modelHealthTone(share, primary.app)
+    ? modelHealthTone(share, undefined, locale)
     : { className: "bg-slate-50 text-muted-foreground", label: "" };
   return {
     primaryLine: isApiProvider ? apiEndpoint : quotaStatusLine,
@@ -727,7 +727,7 @@ function shareProviderStatusView({
       : quotaStatusLine,
     identityTitle: isApiProvider ? "-" : accountLine,
     modelsTitle: modelsLine,
-    panelTitle: share ? modelHealthTitle(share, primary.app) : undefined,
+    panelTitle: share ? modelHealthTitle(share, undefined, locale) : undefined,
     primaryMonospace: isApiProvider,
     toneClassName: healthTone.className,
   };

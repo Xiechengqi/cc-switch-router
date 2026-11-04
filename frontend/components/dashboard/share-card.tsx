@@ -155,9 +155,7 @@ export const ShareCard = React.memo(function ShareCard({
     providerEnabled && runtime ? isApiProviderRuntime(runtime) : false;
   const apiEndpoint =
     providerEnabled && runtime ? providerApiEndpoint(runtime) : "-";
-  const healthTone = app
-    ? modelHealthTone(share, app)
-    : { className: "bg-slate-50 text-muted-foreground", label: "" };
+  const healthTone = modelHealthTone(share, undefined, locale);
   const providerPanelView = {
     primaryLine: isApiProvider ? apiEndpoint : quotaStatusLine,
     identityLine: isApiProvider ? "-" : accountLine,
@@ -167,7 +165,7 @@ export const ShareCard = React.memo(function ShareCard({
       : quotaStatusLine,
     identityTitle: isApiProvider ? "-" : accountLine,
     modelsTitle: actualModels,
-    panelTitle: app ? modelHealthTitle(share, app) : undefined,
+    panelTitle: modelHealthTitle(share, undefined, locale),
     primaryMonospace: isApiProvider,
     toneClassName: healthTone.className,
   };

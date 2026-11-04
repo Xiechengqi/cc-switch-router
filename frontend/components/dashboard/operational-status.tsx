@@ -170,6 +170,8 @@ export function operationalReasonLabel(reason: OperationalReason | undefined, t:
     case "expired": return t("dashboard.reason.expired");
     case "expires_soon": return t("dashboard.reason.expiresSoon");
     case "provider_unavailable": return t("dashboard.reason.providerUnavailable");
+    case "provider_degraded": return t("dashboard.reason.providerDegraded");
+    case "model_health_unknown": return t("dashboard.reason.modelHealthUnknown");
     case "medium_latency": return t("dashboard.reason.mediumLatency", { value: formatOperationalLatencyValue(current) });
     case "high_latency": return t("dashboard.reason.highLatency", { value: formatOperationalLatencyValue(current) });
     case "edit_pending": return t("dashboard.reason.editPending");

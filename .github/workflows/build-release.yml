@@ -150,6 +150,9 @@ jobs:
           bash scripts/ci/timed.sh 'Notification center' cargo test --locked user_notifications::tests
           bash scripts/ci/timed.sh 'Incident export' cargo test --locked alerting::store::tests
 
+      - name: Test Share model health evidence and display status
+        run: bash scripts/ci/timed.sh 'Share model health' cargo test --locked model_health
+
       - name: Test all market contracts
         # market_ does not match modules named share_market / client_market.
         # Keep full service-control coverage, not just wallet helper tests.
