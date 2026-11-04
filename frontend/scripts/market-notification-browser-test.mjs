@@ -137,7 +137,7 @@ try {
     notice("market:service", "service", "contract_suspended"),
     notice("client:offline", "client", "client_offline", { clientLabel: "<script>not-html</script>" })];
   const older = notice("client:older", "client", "client_recovered", { clientLabel: "older-client" });
-  const system = notice("alert:owner", "system", "operator_alert_firing", { title: "FD pressure" });
+  const system = notice("alert:owner", "system", "operator_alert_firing", { title: "FD pressure", titleZh: "FD 压力告警", summaryZh: "FD 用量已达进程上限的 75%。" });
   const centerWrites = [], feedRequests = [];
   await inbox.route("**/v1/**", async route => {
     const url = new URL(route.request().url()), path = url.pathname;
@@ -233,7 +233,7 @@ try {
   assert.equal(await center.getByText(/^Client is offline/).count(), 0, "old-account response cannot repopulate the new inbox");
   await inbox.getByRole("button", { name: "Language", exact: true }).click();
   await inbox.getByRole("button", { name: /^通知，/ }).click();
-  await inbox.getByRole("region", { name: "通知中心", exact: true }).getByText(/^系统告警/).waitFor();
+  await inbox.getByRole("region", { name: "通知中心", exact: true }).getByText("FD 压力告警", { exact: true }).waitFor();
   actor = "";
   await inbox.evaluate(() => window.dispatchEvent(new Event("router-auth-changed")));
   await inbox.getByRole("button", { name: /^通知/ }).waitFor({ state: "hidden" });
