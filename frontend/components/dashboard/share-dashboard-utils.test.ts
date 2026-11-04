@@ -21,17 +21,18 @@ import type { ShareRequestLog } from "@/lib/types";
 
 const buddyQuota = JSON.parse(readFileSync(new URL("../../../tests/fixtures/buddy-quota-presentation-v1.json", import.meta.url), "utf8")) as NonNullable<ShareUpstreamProvider["quota"]>;
 
-test("Buddy quota cards show package amounts and today's/monthly account usage in two lines", () => {
+test("Buddy quota cards append cycle countdowns and official usage without a line break", (t) => {
+  t.mock.method(Date, "now", () => Date.parse("2026-11-04T00:00:00Z"));
   for (const product of ["workbuddy_oauth", "codebuddy_oauth"]) {
     for (const app of ["claude", "codex", "gemini"]) {
       const runtime: ShareUpstreamProvider = { providerType: product, kind: "official_oauth", app, quota: structuredClone(buddyQuota) };
       const text = quotaSummary(runtime, "zh-CN");
-      assert.equal(text, "资源包： CodeBuddy个人版拉新权益包 0/1500 credits · CodeBuddy个人体验版 0.5/500 credits\n官方用量（账号）： 今日 0.45 · 本月 0.45 credits");
+      assert.equal(text, "资源包： CodeBuddy个人版拉新权益包 0/1500 credits 28d9h · CodeBuddy个人体验版 0.5/500 credits 26d15h · 官方用量（账号）： 今日 0.45 · 本月 0.45 credits");
       assert.doesNotMatch(text, /codebuddy package|%|采集|范围|7 日|周期结束|到期|UTC|2026-|其他 share/);
       const english = quotaSummary(runtime, "en");
       assert.match(english, /Resource packages: CodeBuddy个人版拉新权益包 0\/1500 credits/);
       assert.match(english, /Official usage \(account\): today 0.45 · this month 0.45 credits/);
-      assert.equal(english.split("\n").length, 2);
+      assert.equal(english.split("\n").length, 1);
     }
   }
 });
@@ -76,8 +77,14 @@ test("Buddy credits are unknown when incomplete, and explicit zero remains zero"
   assert.doesNotMatch(quotaSummary({ providerType: "workbuddy_oauth", quota: old }, "en"), /Official usage/);
 });
 
-test("Buddy packages prefer amounts and retain tiny percentages only when amounts are missing", () => {
-  assert.equal(formatCompactQuotaTier({ label: "package", used: 0.5, limit: 500, unit: "credits", utilization: 0.1, resetsAt: "2035-01-01T00:00:00Z" }, "en", 1, true), "package 0.5/500 credits");
+test("Buddy package countdowns prefer cycle ends, use expiry only when absent, and never fabricate times", (t) => {
+  t.mock.method(Date, "now", () => Date.parse("2026-11-04T00:00:00Z"));
+  const packageTier = { label: "package", used: 0.5, limit: 500, unit: "credits", utilization: 0.1, resetsAt: "2026-11-24T12:00:00Z", expiresAt: "2035-01-01T00:00:00Z" };
+  assert.equal(formatCompactQuotaTier(packageTier, "en", 1, true), "package 0.5/500 credits 20d12h");
+  assert.equal(formatCompactQuotaTier({ ...packageTier, resetsAt: undefined, expiresAt: "2026-11-24T12:00:00Z" }, "en", 1, true), "package 0.5/500 credits 20d12h");
+  for (const resetsAt of ["invalid", "2026-11-03T00:00:00Z"]) {
+    assert.equal(formatCompactQuotaTier({ ...packageTier, resetsAt }, "en", 1, true), "package 0.5/500 credits");
+  }
   assert.equal(formatCompactQuotaTier({ label: "package", used: 0, limit: 1500, unit: "credits", utilization: 0 }, "en", 1, true), "package 0/1500 credits");
   assert.match(formatCompactQuotaTier({ label: "package", utilization: 0.01 }, "en", 1, true), /<0.1%/);
   assert.match(formatCompactQuotaTier({ label: "package", utilization: 0 }, "en", 1, true), /0%/);

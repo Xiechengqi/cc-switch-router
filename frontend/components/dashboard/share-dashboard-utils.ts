@@ -894,7 +894,8 @@ export function formatCompactQuotaTier(
 ) {
   const label = normalizeCompactTierLabel(tier.label || tier.name, locale);
   const amount = formatQuotaUsageAmount(tier, locale);
-  if (buddyPackage && amount) return [label, amount].filter(Boolean).join(" ");
+  const countdown = countdownStr(buddyPackage ? tier.resetsAt || tier.expiresAt : tier.resetsAt);
+  if (buddyPackage && amount) return [label, amount, countdown].filter(Boolean).join(" ");
   const utilization =
     typeof tier.utilization === "number" && Number.isFinite(tier.utilization)
       ? buddyPackage && tier.utilization > 0 && tier.utilization < 0.1 ? "<0.1%" : `${utilizationPercentForDisplay(
@@ -902,7 +903,6 @@ export function formatCompactQuotaTier(
           maximumUtilizationFractionDigits,
         )}%`
       : "";
-  const countdown = buddyPackage ? "" : countdownStr(tier.resetsAt);
   return [label, amount, utilization, countdown].filter(Boolean).join(" ");
 }
 
@@ -1147,7 +1147,7 @@ export function quotaSummary(
     if (!buddy) return "";
     return [messages[locale]["quota.buddy.packagesUnavailable"],
       buddyOfficialUsageText(quota.providerUsage, locale),
-    ].filter(Boolean).join("\n");
+    ].filter(Boolean).join(" · ");
   }
   const observedTiers = (quota.tiers || [])
     .map((tier) => ({ ...tier, label: tier.label || tier.name }))
@@ -1196,7 +1196,7 @@ export function quotaSummary(
     const packageText = [...tierText, ...unobservedTierText].join(" · ")
       || messages[locale]["quota.buddy.numericNotExposed"];
     const packageLine = `${messages[locale]["quota.buddy.packages"]} ${packageText}`;
-    return [packageLine, buddyOfficialUsageText(quota.providerUsage, locale)].filter(Boolean).join("\n");
+    return [packageLine, buddyOfficialUsageText(quota.providerUsage, locale)].filter(Boolean).join(" · ");
   }
   return [
     quotaPlanLabel(runtime, quota.plan || quota.credentialMessage),
