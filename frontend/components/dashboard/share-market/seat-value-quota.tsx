@@ -276,7 +276,7 @@ export function useRentalValueUsage(subscriptionId: string | undefined, enabled:
       .catch(() => undefined);
     return () => controller.abort();
   }, [subscriptionId, enabled, refreshKey, actor, key]);
-  return enabled && usage?.subscriptionId === subscriptionId && actor === valueReadinessActor() ? usage.usage : null;
+  return enabled && usage && usage.subscriptionId === subscriptionId && actor === valueReadinessActor() ? usage.usage : null;
 }
 
 /**

@@ -1109,8 +1109,8 @@ export function ShareMarketOwnerSeatManager({
   const [valueSnapshot, setValueSnapshot] = React.useState<{ shareId: string; rows: ValueQuotaStatus[] } | null>(null);
   const interactionActive = !!reopenListing || !!seatDialog || !!confirm || busy;
   const usageKey = JSON.stringify([actor, selected?.shareId, selected?.updatedAt]);
-  const limitRows = limitSnapshot?.shareId === selected?.shareId && actor === valueReadinessActor() ? limitSnapshot.rows : [];
-  const valueRows = valueSnapshot?.shareId === selected?.shareId && actor === valueReadinessActor() ? valueSnapshot.rows : [];
+  const limitRows = limitSnapshot && limitSnapshot.shareId === selected?.shareId && actor === valueReadinessActor() ? limitSnapshot.rows : [];
+  const valueRows = valueSnapshot && valueSnapshot.shareId === selected?.shareId && actor === valueReadinessActor() ? valueSnapshot.rows : [];
 
   React.useEffect(() => {
     onInteractionChange?.(interactionActive);
