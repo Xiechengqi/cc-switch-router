@@ -67,7 +67,7 @@ test("homepage integration batches cards, preserves missing-resource contexts an
   assert.match(provider,/requested.slice\(i \* 100, \(i \+ 1\) \* 100\)/);
   assert.match(provider,/document.visibilityState !== "hidden"/);
   assert.match(provider,/key=\{`\$\{userId\}:\$\{actor\}`\}/);
-  assert.match(provider,/!ownLive && !detailLoading && !detailError/);
+  assert.match(provider,/!ownLive && !detailError && \["login", "rent", "approval"\]/);
   assert.match(provider,/event.stopPropagation\(\)/);
   assert.match(source("../components/dashboard/client-board.tsx"),/ClientShareRecoveryCards knownShareIds=\{mineShares.map/);
   assert.match(source("../components/dashboard/share-card.tsx"),/ClientShareMarketEntryButton shareId=\{share.shareId\}/);

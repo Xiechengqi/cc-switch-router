@@ -267,17 +267,16 @@ export function UsdSeatRentTerms({ offer }: { offer: ShareMarketRentQuote["offer
 export function useRentalValueUsage(subscriptionId: string | undefined, enabled: boolean, refreshKey?: string) {
   const actor = useQuotaActor();
   const key = `${actor}:${subscriptionId ?? ""}:${refreshKey ?? ""}`;
-  const [usage, setUsage] = React.useState<{ key: string; usage: RentalValueUsage } | null>(null);
+  const [usage, setUsage] = React.useState<{ subscriptionId: string; usage: RentalValueUsage } | null>(null);
   React.useEffect(() => {
-    setUsage(null);
     if (!subscriptionId || !enabled) return;
     const controller = new AbortController();
     void getRentalValueUsage(subscriptionId, controller.signal)
-      .then((next) => { if (!controller.signal.aborted && actor === valueReadinessActor()) setUsage({key, usage: next}); })
+      .then((next) => { if (!controller.signal.aborted && actor === valueReadinessActor()) setUsage({ subscriptionId, usage: next }); })
       .catch(() => undefined);
     return () => controller.abort();
   }, [subscriptionId, enabled, refreshKey, actor, key]);
-  return enabled && usage?.key === key && actor === valueReadinessActor() ? usage.usage : null;
+  return enabled && usage?.subscriptionId === subscriptionId && actor === valueReadinessActor() ? usage.usage : null;
 }
 
 /**

@@ -123,12 +123,11 @@ function StatusDetails({ subscription, t }: { subscription: ShareMarketSubscript
 function useRentalUsage(subscription: ShareMarketSubscription) {
   const { locale, t } = useLocaleText();
   const actor = useQuotaActor();
-  const [usage, setUsage] = React.useState<{ key: string; text: string } | null>(null);
+  const [usage, setUsage] = React.useState<{ subscriptionId: string; text: string } | null>(null);
   const { id, updatedAt, shareId, status, tokenLimit, tokenPeriod, renterEmail } = subscription;
   const valueLimit = subscription.valueQuota?.limitUsdMicros;
   const key = JSON.stringify([actor, id, updatedAt, valueLimit, tokenLimit, tokenPeriod, status, locale]);
   React.useEffect(() => {
-    setUsage(null);
     if (status === "released" || (valueLimit == null && tokenLimit == null)) return;
     const controller = new AbortController();
     const period = t(`shareMarket.period.${tokenPeriod}`);
@@ -141,7 +140,7 @@ function useRentalUsage(subscription: ShareMarketSubscription) {
           const row = items.find((item) => item.email === email && item.limitUsdMicros === valueLimit
             && item.tokenPeriod === tokenPeriod);
           const used = row ? formatQuotaPicos(row.usedPicos) : t("shareMarket.quota.syncing");
-          setUsage({ key, text: `${used} / ${formatUsdLimit(valueLimit)} · ${period}` });
+          setUsage({ subscriptionId: id, text: `${used} / ${formatUsdLimit(valueLimit)} · ${period}` });
         })
         .catch(() => undefined);
     } else if (tokenLimit != null) {
@@ -149,13 +148,16 @@ function useRentalUsage(subscription: ShareMarketSubscription) {
         .then((page) => {
           const row = email ? page.rows?.find((item) => item.email.trim().toLowerCase() === email) : undefined;
           if (!current() || !row) return;
-          setUsage({ key, text: `${compactTokens(row.tokensUsed || 0, locale)} / ${compactTokens(tokenLimit, locale)} · ${period}` });
+          setUsage({ subscriptionId: id, text: `${compactTokens(row.tokensUsed || 0, locale)} / ${compactTokens(tokenLimit, locale)} · ${period}` });
         })
         .catch(() => undefined);
     }
     return () => controller.abort();
   }, [shareId, status, tokenLimit, tokenPeriod, renterEmail, valueLimit, locale, t, actor, key]);
-  return usage?.key === key && actor === valueReadinessActor() ? usage.text : null;
+  // Same rental keeps its last figure while a newer snapshot is in flight.
+  // A different rental never reuses it.
+  if (status === "released" || (valueLimit == null && tokenLimit == null)) return null;
+  return usage?.subscriptionId === id && actor === valueReadinessActor() ? usage.text : null;
 }
 
 function RentalDetail({

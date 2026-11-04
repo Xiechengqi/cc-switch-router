@@ -22,31 +22,44 @@ export function ClientShareOwnerManagement({ shareId, actor, onClose, onChanged 
   const [context, setContext] = React.useState<ClientShareOwnerContext | null>(null);
   const [selectedId, setSelectedId] = React.useState<string | null>(null);
   const [loading, setLoading] = React.useState(true);
+  const [refreshing, setRefreshing] = React.useState(false);
   const [error, setError] = React.useState(false);
   const request = React.useRef<AbortController | null>(null);
+  const contextRef = React.useRef<ClientShareOwnerContext | null>(null);
   const mounted = React.useRef(false);
   const interaction = React.useRef(false);
   const interactionChanged = React.useCallback((active: boolean) => { interaction.current = active; }, []);
   const current = React.useCallback(() => mounted.current && actor === valueReadinessActor(), [actor]);
-  const reload = React.useCallback(async () => {
+  const reload = React.useCallback(async (options?: { silent?: boolean }) => {
     if (!current()) return;
     request.current?.abort();
     const controller = new AbortController();
     request.current = controller;
-    setLoading(true);
-    setError(false);
+    // Keep the open seat table in place. The first load still shows the spinner.
+    const silent = options?.silent && contextRef.current != null;
+    if (silent) setRefreshing(true);
+    else {
+      setLoading(true);
+      setRefreshing(false);
+      setError(false);
+    }
     try {
       const next = await getClientOwnerSeatContext(shareId, controller.signal);
-      if (!controller.signal.aborted && current()) setContext(next);
+      if (!controller.signal.aborted && current()) {
+        contextRef.current = next;
+        setContext(next);
+        setError(false);
+      }
     } catch {
       if (!controller.signal.aborted && current()) {
         // Never leave mutation buttons or renter data from an earlier success
         // on screen after an authorization or refresh failure.
+        contextRef.current = null;
         setContext(null);
         setError(true);
       }
     } finally {
-      if (!controller.signal.aborted && current()) setLoading(false);
+      if (!controller.signal.aborted && current()) { setLoading(false); setRefreshing(false); }
       if (request.current === controller) request.current = null;
     }
   }, [shareId, current]);
@@ -54,7 +67,7 @@ export function ClientShareOwnerManagement({ shareId, actor, onClose, onChanged 
     mounted.current = true;
     void reload();
     const refresh = () => {
-      if (document.visibilityState === "visible" && !interaction.current && !request.current) void reload();
+      if (document.visibilityState === "visible" && !interaction.current && !request.current) void reload({ silent: true });
     };
     const timer = window.setInterval(refresh, 15_000);
     document.addEventListener("visibilitychange", refresh);
@@ -66,7 +79,7 @@ export function ClientShareOwnerManagement({ shareId, actor, onClose, onChanged 
     };
   }, [reload]);
   const changed = async () => {
-    await reload();
+    await reload({ silent: true });
     if (current()) await onChanged();
   };
   const listings = context?.listings ?? [];
@@ -74,9 +87,9 @@ export function ClientShareOwnerManagement({ shareId, actor, onClose, onChanged 
     ?? listings.find(listing => listing.status === "active") ?? listings[0] ?? null;
   if (actor !== valueReadinessActor()) return null;
   if (context && selected) return <ShareMarketOwnerSeatManager
-    listings={listings} selected={selected} refreshing={loading} onClose={onClose} onChanged={changed} onInteractionChange={interactionChanged}
+    listings={listings} selected={selected} refreshing={refreshing} onClose={onClose} onChanged={changed} onInteractionChange={interactionChanged}
     selector={listings.length > 1 ? <CompactSelect ariaLabel={t("clientShares.listing")} value={selected.id}
-      disabled={loading} onChange={setSelectedId} options={listings.map(listing => ({ value: listing.id,
+      disabled={refreshing} onChange={setSelectedId} options={listings.map(listing => ({ value: listing.id,
         label: `${t(listing.status === "active" ? "shareMarket.listings.active" : "shareMarket.closed")} · ${formatDateTime(listing.createdAt, locale)}`,
       }))} /> : undefined}
   />;

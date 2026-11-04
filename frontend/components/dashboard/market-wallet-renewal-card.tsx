@@ -32,9 +32,14 @@ export function MarketWalletRenewalCard({
   const [error, setError] = React.useState("");
   const [attempt, setAttempt] = React.useState(0);
 
+  const contractIdRef = React.useRef(contractId);
   React.useEffect(() => {
     let active = true;
-    setContract(null);
+    // A refresh of the same contract keeps the card. Switching contracts does not.
+    if (contractIdRef.current !== contractId) {
+      contractIdRef.current = contractId;
+      setContract(null);
+    }
     setError("");
     void getMarketWalletRenewal(contractId).then((value) => {
       if (active) setContract(value);

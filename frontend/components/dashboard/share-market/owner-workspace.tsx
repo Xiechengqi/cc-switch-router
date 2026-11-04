@@ -1105,12 +1105,12 @@ export function ShareMarketOwnerSeatManager({
   const [error, setError] = React.useState("");
   const [historyExpanded, setHistoryExpanded] = React.useState(false);
   const actor = useQuotaActor();
-  const [limitSnapshot, setLimitSnapshot] = React.useState<{ key: string; rows: ShareUserLimitStatusRow[] } | null>(null);
-  const [valueSnapshot, setValueSnapshot] = React.useState<{ key: string; rows: ValueQuotaStatus[] } | null>(null);
+  const [limitSnapshot, setLimitSnapshot] = React.useState<{ shareId: string; rows: ShareUserLimitStatusRow[] } | null>(null);
+  const [valueSnapshot, setValueSnapshot] = React.useState<{ shareId: string; rows: ValueQuotaStatus[] } | null>(null);
   const interactionActive = !!reopenListing || !!seatDialog || !!confirm || busy;
   const usageKey = JSON.stringify([actor, selected?.shareId, selected?.updatedAt]);
-  const limitRows = limitSnapshot?.key === usageKey && actor === valueReadinessActor() ? limitSnapshot.rows : [];
-  const valueRows = valueSnapshot?.key === usageKey && actor === valueReadinessActor() ? valueSnapshot.rows : [];
+  const limitRows = limitSnapshot?.shareId === selected?.shareId && actor === valueReadinessActor() ? limitSnapshot.rows : [];
+  const valueRows = valueSnapshot?.shareId === selected?.shareId && actor === valueReadinessActor() ? valueSnapshot.rows : [];
 
   React.useEffect(() => {
     onInteractionChange?.(interactionActive);
@@ -1121,14 +1121,14 @@ export function ShareMarketOwnerSeatManager({
 
   React.useEffect(() => {
     const shareId = selected?.shareId;
-    setLimitSnapshot(null);
     if (!shareId) {
+      setLimitSnapshot(null);
       return;
     }
     let cancelled = false;
     void getShareUserLimitStatus(shareId)
       .then((page) => {
-        if (!cancelled && actor === valueReadinessActor()) setLimitSnapshot({ key: usageKey, rows: page.rows || [] });
+        if (!cancelled && actor === valueReadinessActor()) setLimitSnapshot({ shareId, rows: page.rows || [] });
       })
       .catch(() => {
         if (!cancelled && actor === valueReadinessActor()) setLimitSnapshot(null);
@@ -1141,12 +1141,14 @@ export function ShareMarketOwnerSeatManager({
   const selectedSellsUsd = !!selected?.seats.some((seat) => seat.valueQuota && seat.subscription);
   React.useEffect(() => {
     const shareId = selected?.shareId;
-    setValueSnapshot(null);
-    if (!shareId || !selectedSellsUsd) return;
+    if (!shareId || !selectedSellsUsd) {
+      setValueSnapshot(null);
+      return;
+    }
     const controller = new AbortController();
     void getValueQuotaStatus(shareId, controller.signal)
       .then((page) => {
-        if (!controller.signal.aborted && actor === valueReadinessActor()) setValueSnapshot({ key: usageKey, rows: page.items });
+        if (!controller.signal.aborted && actor === valueReadinessActor()) setValueSnapshot({ shareId, rows: page.items });
       })
       .catch(() => undefined);
     return () => controller.abort();
@@ -1219,7 +1221,7 @@ const renderActionButton = (action: {
         variant="ghost"
         className={cn("min-w-0 max-w-full", action.iconOnly ? "h-7 w-7 px-0" : "h-auto min-h-7 whitespace-normal break-words px-2 py-1 text-xs leading-4")}
         aria-label={action.label}
-        isDisabled={busy || refreshing || actor !== valueReadinessActor()}
+        isDisabled={busy || actor !== valueReadinessActor()}
         onClick={action.onClick}
       >
         {action.icon}
@@ -1417,7 +1419,7 @@ const renderSeatActions = (listing: ShareMarketListing, seat: ShareMarketSeat) =
                   variant="ghost"
                   className={cn("h-7 min-w-0", action.iconOnly ? "w-7 px-0" : "px-2 text-xs")}
                   aria-label={action.label}
-                  isDisabled={busy || refreshing || (action.key === "reopen" && reopenDisabled)}
+                  isDisabled={busy || (action.key === "reopen" && reopenDisabled)}
                   onClick={action.onClick}
                 >
                   {action.icon}
@@ -1511,7 +1513,7 @@ const renderSeatActions = (listing: ShareMarketListing, seat: ShareMarketSeat) =
             </Modal.Header>
             <Modal.Body className="grid min-h-0 max-h-[75vh] content-start gap-3 overflow-y-auto">
               {selector}
-              {refreshing ? <p role="status" className="text-xs text-slate-500">{t("common.loading")}</p> : null}
+              {refreshing && !selected ? <p role="status" className="text-xs text-slate-500">{t("common.loading")}</p> : null}
               {error ? <p role="alert" className="text-sm text-rose-700">{error}</p> : null}
               {selected ? (
                 <>
@@ -1535,7 +1537,7 @@ const renderSeatActions = (listing: ShareMarketListing, seat: ShareMarketSeat) =
             {selected ? (
               <Modal.Footer className="flex-wrap">
                 {renderListingActions(selected)}
-                <Button variant="outline" isDisabled={busy || refreshing} onClick={() => void onChanged()}>{t("common.reload")}</Button>
+                <Button variant="outline" isDisabled={busy} onClick={() => void onChanged()}>{t("common.reload")}</Button>
                 <Button variant="ghost" isDisabled={busy} onClick={onClose}>{t("common.close")}</Button>
               </Modal.Footer>
             ) : null}

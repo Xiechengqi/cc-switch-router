@@ -88,6 +88,8 @@ function ClientShareMarketSession({ children, actor, userId, onChanged }: {
   const [tick, retry] = React.useReducer(n => n + 1, 0);
   const [selection, setSelection] = React.useState<Selection | null>(null);
   const [detail, setDetail] = React.useState<ClientShareSeatContext | null>(null);
+  const detailRef = React.useRef<ClientShareSeatContext | null>(null);
+  detailRef.current = detail;
   const [detailPages, setDetailPages] = React.useState(1);
   const [detailError, setDetailError] = React.useState(false);
   const [detailLoading, setDetailLoading] = React.useState(false);
@@ -170,9 +172,13 @@ function ClientShareMarketSession({ children, actor, userId, onChanged }: {
   React.useEffect(() => {
     if (!shareId || ownerMode || waitingForEntry) { setDetail(null); return; }
     const controller = new AbortController();
-    setDetailLoading(true); setDetailError(false);
-    // Never display the preceding Share's records during a new request.
-    setDetail(previous => previous?.shareId === shareId ? previous : null);
+    // A Share that is already on screen stays there. Only the first load,
+    // or a switch to another Share, replaces the body with the loading row.
+    if (detailRef.current?.shareId !== shareId) {
+      setDetailLoading(true);
+      setDetail(null);
+      setDetailError(false);
+    }
     void (async () => {
       let cursor: string | null = null;
       let result: ClientShareSeatContext | null = null;
@@ -185,7 +191,7 @@ function ClientShareMarketSession({ children, actor, userId, onChanged }: {
         if (seen.has(cursor)) throw new Error("Repeated seat cursor");
         seen.add(cursor);
       }
-      if (!controller.signal.aborted && current()) setDetail(result);
+      if (!controller.signal.aborted && current()) { setDetail(result); setDetailError(false); }
     })().catch(() => { if (!controller.signal.aborted && current()) setDetailError(true); })
       .finally(() => { if (!controller.signal.aborted && current()) setDetailLoading(false); });
     return () => controller.abort();
@@ -238,16 +244,16 @@ function ClientShareMarketSession({ children, actor, userId, onChanged }: {
         <Modal.Dialog className="light max-h-[calc(100dvh-1rem)] w-[min(620px,calc(100vw-1rem))] max-w-none overflow-hidden !bg-white !text-slate-900">
           <Modal.Header><div className="min-w-0"><Modal.Heading>{t("clientShares.title")}</Modal.Heading><p className="mt-1 break-all text-xs text-slate-500">{detail?.listing?.shareName || entryMap.get(shareId ?? "")?.subdomain || shareId}</p></div></Modal.Header>
           <Modal.Body className="grid min-h-0 gap-4 overflow-y-auto">
-            {detailLoading || waitingForEntry ? <p role="status" className="flex gap-2 text-sm"><Loader2 className="h-4 w-4 animate-spin" />{t("common.loading")}</p> : null}
+            {(detailLoading || waitingForEntry) && !sub && !groups ? <p role="status" className="flex gap-2 text-sm"><Loader2 className="h-4 w-4 animate-spin" />{t("common.loading")}</p> : null}
             {detailError || checkout.error || rentals.error ? <p role="alert" className="text-sm text-danger">{detailError ? t("clientShares.loadError") : checkout.error || rentals.error}</p> : null}
             {state && state !== "listed" ? <p className="text-xs text-muted-foreground">{t(state === "missing" ? "clientShares.missing" : "clientShares.unlisted")}</p> : null}
-            {sub ? <ShareRentalDetail subscription={sub} busy={detailLoading || detailError || rentals.busyId === sub.id} {...(!detailError ? rentals.rowActions(sub) : {})} onChanged={changed} /> : groups ? <>
+            {sub ? <ShareRentalDetail subscription={sub} busy={detailError || rentals.busyId === sub.id} {...(!detailError ? rentals.rowActions(sub) : {})} onChanged={changed} /> : groups ? <>
               {groups.mine.length ? <section className="grid gap-2"><h3 className="text-sm font-semibold">{t("clientShares.mine")}</h3>{groups.mine.map(s => <Button key={s.id} variant="outline" className="min-h-11 justify-between whitespace-normal" onPress={() => showRental(s.id, s.seatId)}><span>#{s.seatPosition}</span><span>{t(subscriptionStatusKey(s.status) ?? "shareMarket.unavailable")}</span></Button>)}</section> : null}
               {detail?.listing ? <>{[["clientShares.available", groups.available], ["clientShares.occupied", groups.occupied]].map(([heading, items]) => {
                 const seats = items as typeof groups.available;
                 return seats.length ? <section key={heading as string} className="grid gap-2"><h3 className="text-sm font-semibold">{t(heading as "clientShares.available")}</h3>{seats.map(seat => {
                   const action = clientSeatAction(seat, !!userId);
-                  const canAct = !ownLive && !detailLoading && !detailError && ["login", "rent", "approval"].includes(action);
+                  const canAct = !ownLive && !detailError && ["login", "rent", "approval"].includes(action);
                   return <div key={seat.id} data-client-share-seat={seat.id} className="flex min-w-0 flex-wrap items-center justify-between gap-3 rounded-md border border-border p-3">
                     <div className="min-w-0"><p className="text-sm font-medium">#{seat.position} · {formatSeatPrice(seat, locale, t("shareMarket.free"), t("market.day"))}</p><p className="mt-1 break-words text-xs text-muted-foreground">{formatSeatQuota(seat, locale, t("common.unlimited"), p => t(`shareMarket.period.${p}`), amount => t("shareMarket.quota.usdAmount", { amount }))}</p></div>
                     <Button size="sm" variant="primary" isDisabled={!canAct} onPress={() => detail?.listing && trigger({ listing: detail.listing, seat })}>{t(SEAT_ACTION_KEYS[action])}</Button>
@@ -257,13 +263,13 @@ function ClientShareMarketSession({ children, actor, userId, onChanged }: {
               {ownLive && groups.available.length ? <p className="text-xs text-muted-foreground">{t("clientShares.otherRental")}</p> : null}
               {groups.history.length ? <section className="grid gap-2"><h3 className="text-sm font-semibold">{t("clientShares.history")}</h3>{groups.history.map(s => <Button key={s.id} variant="outline" className="min-h-11 justify-between whitespace-normal" onPress={() => showRental(s.id, s.seatId)}><span>#{s.seatPosition}</span><span>{t("clientShares.settlement")}</span></Button>)}</section> : null}
               {!groups.mine.length && !groups.available.length && !groups.occupied.length && !groups.history.length && !detailLoading ? <p className="text-sm text-muted-foreground">{t("clientShares.empty")}</p> : null}
-              {detail?.nextCursor ? <Button variant="outline" isDisabled={detailLoading} onPress={() => setDetailPages(n => n + 1)}>{t("clientShares.more")}</Button> : null}
+              {detail?.nextCursor ? <Button variant="outline" onPress={() => setDetailPages(n => n + 1)}>{t("clientShares.more")}</Button> : null}
             </> : null}
           </Modal.Body>
           <Modal.Footer className="flex-wrap">
             {sub ? <Button variant="outline" onPress={() => { const next = { shareId: shareId! }; setSelection(next); replaceSelection(next); }}>{t("clientShares.previous")}</Button> : null}
             <Button variant="ghost" onPress={close}>{t("common.close")}</Button>
-            <Button variant="outline" isDisabled={detailLoading} onPress={retry}>{t("common.reload")}</Button>
+            <Button variant="outline" onPress={retry}>{t("common.reload")}</Button>
           </Modal.Footer>
         </Modal.Dialog>
       </Modal.Container>
