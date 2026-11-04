@@ -410,6 +410,14 @@ pub struct UserModelRoutingShareCapability {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription_level: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_policy: Option<ShareProviderModelPolicy>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<ShareUpstreamModel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota: Option<ShareUpstreamQuota>,
 }
 

@@ -19,7 +19,7 @@ import * as React from "react";
 import { CompactSelect } from "@/components/common/compact-select";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { SegmentedControl } from "@/components/common/segmented-control";
-import { MarketShareIdentity } from "@/components/dashboard/share-market/market-share-identity";
+import { MarketShareApps, MarketProviderLogos } from "@/components/dashboard/share-market/market-share-identity";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
@@ -46,6 +46,7 @@ import {
   groupModelRoutesByProtocol,
   isWildcardModel,
   MAX_USER_MODEL_ROUTES,
+  modelRoutingShareAccountLines,
   newDraftModelRoute,
   patchDraftModelRoute,
   preferredModelRoutingApp,
@@ -296,14 +297,43 @@ export function useModelRoutingController(active: boolean): ModelRoutingControll
 function shareSelectOptions(
   shares: UserModelRoutingShare[],
   currentId: string,
+  locale: ReturnType<typeof useLocaleText>["locale"],
   t: ReturnType<typeof useLocaleText>["t"],
   includeUnset?: { value: string; label: string },
 ) {
-  const eligible = shares.map((share) => ({
-    value: share.shareId,
-    label: share.subdomain || share.shareName,
-    content: <MarketShareIdentity source={share} showStatusLine />,
-  }));
+  const eligible = shares.map((share) => {
+    const label = share.subdomain || share.shareName;
+    const lines = modelRoutingShareAccountLines(
+      share,
+      locale,
+      t("dashboard.modelPolicyPassthrough"),
+      t("dashboard.providerUnavailable"),
+    );
+    const rows = [lines.primaryLine, lines.identityLine, lines.modelsLine];
+    return {
+      value: share.shareId,
+      label,
+      description: rows.join(" "),
+      content: (
+        <span className="grid min-w-0 gap-0.5">
+          <span className="inline-flex min-w-0 items-center gap-1.5">
+            <MarketProviderLogos source={share} size={16} />
+            {label ? (
+              <strong className="min-w-0 truncate font-mono text-xs font-semibold text-slate-800" title={label}>
+                {label}
+              </strong>
+            ) : null}
+            <MarketShareApps apps={share.apps} size={14} />
+          </span>
+          {rows.map((row, index) => (
+            <span key={index} className="min-w-0 truncate text-[11px] font-normal text-slate-400" title={row}>
+              {row}
+            </span>
+          ))}
+        </span>
+      ),
+    };
+  });
   const options = includeUnset
     ? [{ value: includeUnset.value, label: includeUnset.label }, ...eligible]
     : eligible;
@@ -342,7 +372,7 @@ export function ModelHubPanel({
   forceExpanded?: boolean;
   focusProtocol?: ModelRoutingProtocol | null;
 }) {
-  const { t } = useLocaleText();
+  const { locale, t } = useLocaleText();
   const [copied, setCopied] = React.useState<"endpoint" | "token" | "curl" | "">("");
   const [resetConfirmOpen, setResetConfirmOpen] = React.useState(false);
   const [leaveConfirmOpen, setLeaveConfirmOpen] = React.useState(false);
@@ -472,6 +502,7 @@ export function ModelHubPanel({
   const passthroughOptions = shareSelectOptions(
     shares,
     activeSlot?.passthrough?.targetShareId || "",
+    locale,
     t,
     { value: PASSTHROUGH_UNSET, label: t("modelHub.passthroughUnset") },
   );
@@ -640,7 +671,7 @@ export function ModelHubPanel({
                   </Button>
                 </div>
                 {activeSlot?.exact.length ? activeSlot.exact.map((route) => {
-                  const options = shareSelectOptions(shares, route.targetShareId, t);
+                  const options = shareSelectOptions(shares, route.targetShareId, locale, t);
                   return (
                     <div key={route.clientId} className="grid min-w-0 items-center gap-2 sm:grid-cols-[minmax(140px,1fr)_minmax(160px,1.3fr)_32px]">
                       <input

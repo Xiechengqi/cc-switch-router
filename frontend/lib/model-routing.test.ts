@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   buildUnifiedModelCurl,
+  modelRoutingShareAccountLines,
   canonicalModelRoutes,
   clientBelongsToViewer,
   listViewerShares,
@@ -476,6 +477,79 @@ test("the first protocol tab prefers attention, then a configured protocol, then
     { clientId: "2", appType: "codex", requestedModel: "*", targetShareId: "share-codex" },
   ]);
   assert.equal(defaultTestModelForProtocol(slots[1]), "gpt-5.6");
+});
+
+test("routing share options reuse the share card's three account lines", () => {
+  const base = {
+    shareId: "share-codex",
+    shareName: "Codex",
+    subdomain: "codex-share",
+    directApiUrl: "https://codex-share.example.com",
+    access: "owner",
+    freeAccess: false,
+    isOnline: true,
+  };
+  const quota = modelRoutingShareAccountLines({
+    ...base,
+    apps: ["codex"],
+    appCapabilities: [{
+      app: "codex",
+      providerName: "OpenAI",
+      providerType: "official_oauth",
+      kind: "official_oauth",
+      accountLabel: "owner@example.com",
+      modelPolicy: { mode: "single", upstreamModel: "gpt-5" },
+      models: [{ actualModel: "gpt-5" }],
+      quota: { status: "ok", plan: "Plus", tiers: [{ label: "weekly", utilization: 55 }] },
+    }],
+  }, "en", "Passthrough", "Provider details unavailable");
+  assert.match(quota.primaryLine, /Plus/);
+  assert.match(quota.primaryLine, /weekly 55%/);
+  assert.equal(quota.identityLine, "owner@example.com");
+  assert.equal(quota.modelsLine, "Codex: gpt-5");
+
+  const api = modelRoutingShareAccountLines({
+    ...base,
+    apps: ["codex"],
+    appCapabilities: [{
+      app: "codex",
+      providerName: "Private",
+      providerType: "openai_apikey",
+      kind: "openai_apikey",
+      apiUrl: "https://api.example.com/v1",
+      accountLabel: "hidden@example.com",
+      modelPolicy: { mode: "single", upstreamModel: "gpt-5" },
+    }],
+  }, "en", "Passthrough", "Provider details unavailable");
+  assert.equal(api.primaryLine, "https://api.example.com/v1");
+  assert.equal(api.identityLine, "-");
+
+  const passthrough = modelRoutingShareAccountLines({
+    ...base,
+    apps: ["claude"],
+    appCapabilities: [{
+      app: "claude",
+      providerName: "Anthropic",
+      providerType: "claude_oauth",
+      kind: "claude_oauth",
+      accountLabel: "claude@example.com",
+      modelPolicy: { mode: "passthrough" },
+    }],
+  }, "en", "Passthrough", "Provider details unavailable");
+  assert.equal(passthrough.modelsLine, "Claude: Passthrough");
+
+  const ordered = modelRoutingShareAccountLines({
+    ...base,
+    apps: ["codex", "claude"],
+    appCapabilities: [
+      { app: "codex", providerName: "OpenAI", providerType: "codex_oauth", kind: "codex_oauth", modelPolicy: { mode: "single", upstreamModel: "gpt-5" } },
+      { app: "claude", providerName: "Anthropic", providerType: "claude_oauth", kind: "claude_oauth", modelPolicy: { mode: "single", upstreamModel: "opus" } },
+    ],
+  }, "en", "Passthrough", "Provider details unavailable");
+  assert.ok(ordered.modelsLine.indexOf("Claude:") < ordered.modelsLine.indexOf("Codex:"));
+
+  const missing = modelRoutingShareAccountLines({ ...base, apps: ["codex"] }, "en", "Passthrough", "Provider details unavailable");
+  assert.deepEqual(missing, { primaryLine: "-", identityLine: "Provider details unavailable", modelsLine: "-" });
 });
 
 test("protocol share pickers stay inside the enabled app and prefer the first eligible Share", () => {

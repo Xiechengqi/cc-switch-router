@@ -28930,11 +28930,35 @@ fn user_model_routing_share_capability(
     let quota = runtime
         .and_then(|value| value.quota.clone())
         .or_else(|| bound_provider.and_then(|provider| provider.quota.clone()));
+    let account_label = first_nonempty_owned([
+        runtime.and_then(|value| value.account_label.clone()),
+        bound_provider.and_then(|provider| provider.account_label.clone()),
+    ]);
+    let account_email = first_nonempty_owned([
+        runtime.and_then(|value| value.account_email.clone()),
+        bound_provider.and_then(|provider| provider.account_email.clone()),
+    ]);
+    let model_policy = runtime
+        .and_then(|value| value.model_policy.clone())
+        .or_else(|| bound_provider.and_then(|provider| provider.model_policy.clone()));
+    let mut models = runtime
+        .map(|value| value.models.clone())
+        .filter(|models| !models.is_empty())
+        .unwrap_or_else(|| {
+            bound_provider
+                .map(|provider| provider.models.clone())
+                .unwrap_or_default()
+        });
+    models.retain(|model| !model.actual_model.trim().is_empty());
     if provider_name.is_none()
         && provider_type.is_none()
         && kind.is_none()
         && api_url.is_none()
         && subscription_level.is_none()
+        && account_label.is_none()
+        && account_email.is_none()
+        && model_policy.is_none()
+        && models.is_empty()
         && quota.is_none()
     {
         return None;
@@ -28946,6 +28970,10 @@ fn user_model_routing_share_capability(
         kind,
         api_url,
         subscription_level,
+        account_label,
+        account_email,
+        model_policy,
+        models,
         quota,
     })
 }
@@ -31785,7 +31813,7 @@ pub(crate) mod tests {
                 "UPDATE shares SET app_runtimes_json = ?2 WHERE share_id = ?1",
                 params![
                     "share-routing-a",
-                    r#"{"codex":{"kind":"codex_oauth","app":"codex","providerName":"OpenAI Official","providerType":"codex_oauth","quota":{"status":"ok","plan":"Plus","tiers":[{"label":"weekly","utilization":0.55}]}}}"#,
+                    r#"{"codex":{"kind":"codex_oauth","app":"codex","providerName":"OpenAI Official","providerType":"codex_oauth","accountLabel":"owner@example.com","accountEmail":"legacy@example.com","modelPolicy":{"mode":"single","upstreamModel":"gpt-5"},"models":[{"slot":"default","actualModel":"gpt-5"}],"quota":{"status":"ok","plan":"Plus","tiers":[{"label":"weekly","utilization":0.55}]}},"claude":{"kind":"claude_oauth","app":"claude","providerName":"Anthropic","providerType":"claude_oauth","modelPolicy":{"mode":"passthrough"}}}"#,
                 ],
             )
             .expect("set routing share runtime identity");
@@ -31799,24 +31827,37 @@ pub(crate) mod tests {
             .iter()
             .find(|share| share.share_id == "share-routing-a")
             .expect("owner share remains eligible");
-        assert_eq!(identified.app_capabilities.len(), 1);
-        assert_eq!(identified.app_capabilities[0].app, "codex");
+        assert_eq!(identified.app_capabilities.len(), 2);
+        let codex = identified
+            .app_capabilities
+            .iter()
+            .find(|capability| capability.app == "codex")
+            .expect("codex capability");
+        assert_eq!(codex.provider_type.as_deref(), Some("codex_oauth"));
+        assert_eq!(codex.provider_name.as_deref(), Some("OpenAI Official"));
         assert_eq!(
-            identified.app_capabilities[0].provider_type.as_deref(),
-            Some("codex_oauth")
-        );
-        assert_eq!(
-            identified.app_capabilities[0].provider_name.as_deref(),
-            Some("OpenAI Official")
-        );
-        assert_eq!(
-            identified.app_capabilities[0]
-                .quota
-                .as_ref()
-                .and_then(|quota| quota.plan.as_deref()),
+            codex.quota.as_ref().and_then(|quota| quota.plan.as_deref()),
             Some("Plus")
         );
-        assert_eq!(identified.app_capabilities[0].api_url, None);
+        assert_eq!(codex.account_label.as_deref(), Some("owner@example.com"));
+        assert_eq!(codex.account_email.as_deref(), Some("legacy@example.com"));
+        assert_eq!(
+            codex.model_policy,
+            Some(crate::models::ShareProviderModelPolicy::Single {
+                upstream_model: "gpt-5".into(),
+            })
+        );
+        assert_eq!(codex.models[0].actual_model, "gpt-5");
+        assert_eq!(codex.api_url, None);
+        let claude = identified
+            .app_capabilities
+            .iter()
+            .find(|capability| capability.app == "claude")
+            .expect("claude capability");
+        assert_eq!(
+            claude.model_policy,
+            Some(crate::models::ShareProviderModelPolicy::Passthrough)
+        );
 
         let first = store
             .replace_user_model_routing(

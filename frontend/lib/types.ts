@@ -616,6 +616,10 @@ export type UserModelRoutingShareCapability = {
   kind?: string;
   apiUrl?: string;
   subscriptionLevel?: string;
+  accountLabel?: string;
+  accountEmail?: string;
+  modelPolicy?: ShareProviderModelPolicy;
+  models?: Array<{ slot?: string; actualModel?: string }>;
   quota?: ShareUpstreamProvider["quota"];
 };
 

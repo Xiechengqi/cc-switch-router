@@ -1,12 +1,23 @@
 import type {
   DashboardClient,
   ModelRoutingApp,
+  ShareUpstreamProvider,
   ShareView,
   UserModelRouteInput,
   UserModelRoutingResponse,
   UserModelRoutingShare,
+  UserModelRoutingShareCapability,
 } from "@/lib/types";
 import { shellQuote } from "@/lib/share-model-probe";
+import type { AppLocale } from "@/lib/i18n";
+import {
+  isApiProviderRuntime,
+  providerActualModelNames,
+  providerApiEndpoint,
+  providerQuotaStatusLine,
+  providerStatusIdentity,
+} from "@/components/dashboard/share-dashboard-utils";
+import { CORE_SHARE_APPS, SHARE_APP_LABELS } from "@/lib/share-app";
 
 export const MAX_USER_MODEL_ROUTES = 100;
 /**
@@ -119,6 +130,57 @@ export function sharesForProtocol(
   appType: ModelRoutingApp,
 ) {
   return shares.filter((share) => share.apps.includes(appType));
+}
+
+export type ModelRoutingShareAccountLines = {
+  primaryLine: string;
+  identityLine: string;
+  modelsLine: string;
+};
+
+function routingCapabilityRuntime(
+  capability: UserModelRoutingShareCapability,
+): ShareUpstreamProvider {
+  return {
+    app: capability.app,
+    kind: capability.kind || capability.providerType,
+    providerType: capability.providerType || capability.kind,
+    providerName: capability.providerName,
+    accountLabel: capability.accountLabel,
+    accountEmail: capability.accountEmail,
+    apiUrl: capability.apiUrl,
+    subscriptionLevel: capability.subscriptionLevel,
+    quota: capability.quota,
+    models: capability.models,
+    modelPolicy: capability.modelPolicy,
+  };
+}
+
+/** The three account-card lines used by a Share card, built from the routing projection. */
+export function modelRoutingShareAccountLines(
+  share: UserModelRoutingShare,
+  locale: AppLocale,
+  passthroughLabel: string,
+  unavailableLabel: string,
+): ModelRoutingShareAccountLines {
+  const apps = CORE_SHARE_APPS.filter((app) => share.apps.includes(app));
+  const capabilities = apps.flatMap((app) => {
+    const capability = share.appCapabilities?.find((item) => item.app === app);
+    return capability ? [{ app, runtime: routingCapabilityRuntime(capability) }] : [];
+  });
+  const primary = capabilities[0]?.runtime;
+  if (!primary) {
+    return { primaryLine: "-", identityLine: unavailableLabel, modelsLine: "-" };
+  }
+  const apiProvider = isApiProviderRuntime(primary);
+  const models = capabilities
+    .map(({ app, runtime }) => `${SHARE_APP_LABELS[app]}: ${providerActualModelNames(runtime, passthroughLabel)}`)
+    .join(" · ");
+  return {
+    primaryLine: apiProvider ? providerApiEndpoint(primary) : providerQuotaStatusLine(primary, locale),
+    identityLine: apiProvider ? "-" : providerStatusIdentity(primary),
+    modelsLine: models || providerActualModelNames(primary, passthroughLabel),
+  };
 }
 
 export function firstShareForProtocol(
