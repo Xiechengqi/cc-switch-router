@@ -8,11 +8,33 @@ import {
   valuePreviewBlocker, valueQuotaErrorMessage, valueQuotaView, normalizeValueStatuses, ValueQuotaClientError,
   splitValueStatusRows, upsertValueStatuses, valueStatusReason, formatQuotaTime, VALUE_STATUS_STALE_MS,
   valueReadinessItems, valueReadinessRoots, valueReadinessSummary, type ValueReadinessCheck,
+  parseMarketValueReadiness, getMarketValueQuotaReadiness,
 } from "./share-value-quota";
 import { valueQuotaMessagesEn, valueQuotaMessagesZh } from "./share-value-quota-messages";
 import { applyShareUserPolicyBatch } from "../components/dashboard/share-edit/share-user-policy-batch";
 import { buildShareSettingsPatch, draftFromShare, stageUserPolicy } from "./share-settings";
 import type { ShareUserGrant, ShareView } from "./types";
+
+test("market readiness keeps actionable binding/model evidence without trusting malformed success or arbitrary messages",async()=>{
+  const check={code:"model_price_coverage",ready:false,app:"claude",providerId:"provider-a",profileId:"claude.workbuddy_oauth",
+    driverId:"special.workbuddy_oauth",model:"auto",reasonCode:"model_unresolved"};
+  assert.deepEqual(parseMarketValueReadiness({ready:false,reason:"model_price_coverage",checks:[{...check,secret:"private",message:"upstream"}]}),
+    {ready:false,valueTrialReady:false,reason:"model_price_coverage",checks:[check]});
+  for(const malformed of [null,{},[],{ready:"true"},{ready:true,checks:[]},{ready:true,checks:[check]},
+    {ready:false,checks:[null]},{ready:false,checks:[{code:"text_surface",ready:1}]}]) {
+    assert.throws(()=>parseMarketValueReadiness(malformed),ValueQuotaClientError);
+  }
+  const original=globalThis.fetch; const controller=new AbortController();
+  try {
+    globalThis.fetch=async(url,init)=>{
+      assert.equal(url,"/v1/shares/share%2Ftest/market-value-quota-readiness");
+      assert.equal(init?.signal,controller.signal); assert.equal(init?.cache,"no-store");
+      return Response.json({ready:false,reason:"model_price_coverage",checks:[check]});
+    };
+    assert.equal((await getMarketValueQuotaReadiness("share/test",controller.signal)).checks?.[0].model,"auto");
+  }finally{globalThis.fetch=original;}
+  for(const messages of [valueQuotaMessagesEn,valueQuotaMessagesZh]) assert.ok(messages["dashboard.userLimit.value.readiness.model_unresolved"]);
+});
 
 test("readiness transport carries cancellation and rejects malformed or stale authoritative previews",async()=>{
   const original=globalThis.fetch;const controller=new AbortController();

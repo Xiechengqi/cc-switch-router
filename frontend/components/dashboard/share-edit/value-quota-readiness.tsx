@@ -12,6 +12,7 @@ const shortPhrase = (code: string, t: TFn) => {
   return known ? t(`dashboard.userLimit.value.readiness.short.${known}`) : t("dashboard.userLimit.value.readiness.short.unknown", {code});
 };
 const actionSentence = (check: ValueReadinessCheck, t: TFn) => {
+  if (check.reasonCode === "model_unresolved") return t("dashboard.userLimit.value.readiness.model_unresolved");
   const known = knownReadinessCode(check.code);
   return known ? t(`dashboard.userLimit.value.readiness.${known}`) : t("dashboard.userLimit.value.readiness.unknown", {code: check.code});
 };
@@ -54,8 +55,8 @@ export function ValueQuotaReadiness({state, t, id}: {state:ReturnType<typeof use
               <span className="text-muted-foreground"> — {t("dashboard.userLimit.value.readiness.waitingOn", {root: shortPhrase(waitingOn, t)})}</span>
             </> : actionSentence(check, t)}
             {check.code === "sqlite_authority" && check.state ? <span className="font-mono"> ({check.state})</span> : null}
-            {check.code === "text_surface" ? <span className="break-all font-mono"> {check.app} · {check.profileId ?? "—"} / {check.driverId ?? "—"}</span> : null}
-            {check.code === "model_price_coverage" && check.model ? <span className="break-all font-mono"> {check.app} · {check.model}</span> : null}
+            {check.code === "text_surface" ? <span className="break-all font-mono"> {check.app} · {check.providerId ?? "—"} · {check.profileId ?? "—"} / {check.driverId ?? "—"}</span> : null}
+            {check.code === "model_price_coverage" && check.model ? <span className="break-all font-mono"> {check.app} · {check.providerId ?? "—"} · {check.model} · {check.profileId ?? "—"} / {check.driverId ?? "—"}</span> : null}
           </span>)}</span>
         </> : null}
         {pricing?.publishedRevision && !state.preview?.activePricingRevision

@@ -8,10 +8,13 @@
 import * as React from "react";
 import { Loader2, RotateCw } from "lucide-react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
+import { InfoHint } from "@/components/common/info-hint";
 import {
   formatUsdLimit,
   getMarketValueQuotaReadiness,
   getRentalValueUsage,
+  valueReadinessItems,
+  valueReadinessSummary,
   type MarketValueQuotaReadiness,
   type RentalValueUsage,
 } from "@/lib/share-value-quota";
@@ -137,11 +140,24 @@ export function MarketValueReadinessLine({ id, state, quiet = false }: {
     );
   }
   if (!state.readiness || state.readiness.ready) return null;
-  const reason = marketValueReadinessReason(state.readiness.reason, t);
+  const items = valueReadinessItems(state.readiness.checks);
+  const {root} = valueReadinessSummary(state.readiness.checks);
+  const reason = marketValueReadinessReason(root?.code ?? state.readiness.reason, t);
+  const diagnostics = items.length ? <InfoHint label={t("dashboard.userLimit.value.readiness.blocked")}>
+    <span className="grid gap-2">{items.map(({check, waitingOn}, index) => {
+      const guidance = marketValueReadinessReason(check.code, t);
+      return <span key={`${check.code}:${index}`} className="grid gap-0.5">
+        <span>{check.reasonCode === "model_unresolved" ? t("dashboard.userLimit.value.readiness.model_unresolved") : guidance.detail ?? guidance.short}</span>
+        {check.app || check.profileId || check.model ? <span className="break-all font-mono">{[check.app, check.providerId, check.profileId, check.driverId, check.model].filter(Boolean).join(" · ")}</span> : null}
+        {waitingOn ? <span>{t("dashboard.userLimit.value.readiness.waitingOn", {root:marketValueReadinessReason(waitingOn,t).short})}</span> : null}
+      </span>;
+    })}</span>
+  </InfoHint> : null;
   if (quiet) {
     return (
       <p id={id} className="flex flex-wrap items-center gap-x-2 text-xs leading-5 text-muted-foreground">
         <span>{t("shareMarket.quota.usdUnavailable", { reason: reason.short })}</span>
+        {diagnostics}
         <button
           type="button"
           onClick={state.retry}
@@ -157,6 +173,7 @@ export function MarketValueReadinessLine({ id, state, quiet = false }: {
     <div id={id} className="grid gap-1 rounded-lg border border-amber-200 bg-amber-50/70 px-3 py-2 text-xs leading-5 text-amber-900">
       <span className="flex flex-wrap items-center justify-between gap-2">
         <span className="font-medium">{t("shareMarket.quota.usdUnavailable", { reason: reason.short })}</span>
+        {diagnostics}
         <button
           type="button"
           onClick={state.retry}

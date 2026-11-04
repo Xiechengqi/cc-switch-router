@@ -285,6 +285,66 @@ fn market_value_unavailable(reason: String) -> AppError {
         serde_json::json!({ "reason": reason }),
     )
 }
+fn market_value_unavailable_checks(reason: String, checks: &[serde_json::Value]) -> AppError {
+    AppError::coded_conflict(
+        "share_market_value_quota_unavailable",
+        "this Share cannot sell a USD-equivalent quota right now",
+        serde_json::json!({"reason":reason,"checks":checks}),
+    )
+}
+/// Only bounded diagnostic identities cross the control-plane boundary. Never
+/// return arbitrary upstream messages, credentials, or unrecognized fields.
+fn market_readiness_checks(
+    response: &serde_json::Value,
+    revision: u64,
+) -> Option<Vec<serde_json::Value>> {
+    if response["configRevision"].as_u64() != Some(revision)
+        || !response["capabilityReady"].is_boolean()
+    {
+        return None;
+    }
+    let checks = response["checks"].as_array()?;
+    if checks.is_empty() || checks.len() > 128 {
+        return None;
+    }
+    checks
+        .iter()
+        .map(|check| {
+            let code = check["code"].as_str()?;
+            if code.is_empty()
+                || code.len() > 64
+                || !code.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            {
+                return None;
+            }
+            let mut safe = serde_json::json!({"code":code,"ready":check["ready"].as_bool()?});
+            for key in [
+                "app",
+                "providerId",
+                "profileId",
+                "driverId",
+                "model",
+                "state",
+                "scope",
+                "reasonCode",
+                "blockedBy",
+            ] {
+                if let Some(value) = check[key].as_str().filter(|value| {
+                    !value.is_empty()
+                        && value.len() <= 256
+                        && value.trim() == *value
+                        && !value.chars().any(char::is_control)
+                }) {
+                    safe[key] = value.into();
+                }
+            }
+            if let Some(at) = check["effectiveFromMs"].as_u64() {
+                safe["effectiveFromMs"] = at.into();
+            }
+            Some(safe)
+        })
+        .collect()
+}
 fn check_ready(checks: &[serde_json::Value], code: &str) -> bool {
     checks
         .iter()
@@ -338,24 +398,42 @@ async fn market_value_quota_checks(
         ),
         _ => unavailable("quota_unavailable".into()),
     })?;
-    let checks = response["checks"].as_array().cloned().unwrap_or_default();
+    let mut checks = market_readiness_checks(&response, revision)
+        .ok_or_else(|| unavailable("quota_server_invalid_response".into()))?;
     if !check_ready(&checks, MARKET_SEAT_QUOTA_CHECK) {
-        return Err(unavailable("server_upgrade_required".into()));
+        return Err(market_value_unavailable_checks(
+            "server_upgrade_required".into(),
+            &checks,
+        ));
     }
-    if response["capabilityReady"] != true {
-        let failed = checks
-            .iter()
-            .find(|check| check["ready"] != true)
-            .and_then(|check| check["code"].as_str())
-            .unwrap_or("quota_unavailable");
-        return Err(unavailable(failed.to_string()));
-    }
+    // Diagnose an unpublished Router tariff even when the Server already
+    // reports a dependent ACK/model failure; expose the actionable root.
     let pricing = state
         .store
         .value_pricing_readiness(&target.installation)
         .await?;
     if !response_pricing_published(&pricing) {
-        return Err(unavailable("tariff_published".into()));
+        checks.push(serde_json::json!({"code":"tariff_published","ready":false}));
+        mark_blocked_by_tariff(&mut checks);
+    }
+    if response["capabilityReady"] != true
+        || checks.iter().any(|check| check["ready"] != true)
+        || [
+            "router_protocol",
+            "sqlite_authority",
+            "metering_storage",
+            "acknowledged_tariff",
+            "text_surface",
+        ]
+        .iter()
+        .any(|code| !check_ready(&checks, code))
+    {
+        let failed = checks
+            .iter()
+            .find(|check| check["ready"] != true)
+            .and_then(|check| check["code"].as_str())
+            .unwrap_or("quota_unavailable");
+        return Err(market_value_unavailable_checks(failed.to_string(), &checks));
     }
     Ok(checks)
 }
@@ -373,12 +451,15 @@ async fn market_readiness(
             Ok(checks) => serde_json::json!({
                 "ready": true,
                 "valueTrialReady": check_ready(&checks, MARKET_TRIAL_VALUE_CHECK),
+                "checks": checks,
             }),
             Err(AppError::Coded {
                 code: "share_market_value_quota_unavailable",
                 details,
                 ..
-            }) => serde_json::json!({ "ready": false, "reason": details["reason"] }),
+            }) => {
+                serde_json::json!({ "ready": false, "reason": details["reason"], "checks":details["checks"] })
+            }
             Err(error) => return Err(error),
         },
     ))
@@ -510,6 +591,41 @@ async fn mine(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn market_value_readiness_retains_only_bounded_diagnostics_and_valid_revisions() {
+        let response = serde_json::json!({"configRevision":7,"capabilityReady":false,"checks":[
+            {"code":"text_surface","ready":false,"app":"claude","providerId":"provider-1",
+                "profileId":"claude.workbuddy_oauth","driverId":"special.workbuddy_oauth",
+                "reasonCode":"runtime_unsupported","secret":"never forward","message":"upstream body"},
+            {"code":"model_price_coverage","ready":false,"app":"codex","model":"auto","reasonCode":"model_unresolved",
+                "effectiveFromMs":123,"state":"bad\nstate"}]});
+        let checks = market_readiness_checks(&response, 7).unwrap();
+        assert_eq!(checks[0]["providerId"], "provider-1");
+        assert_eq!(checks[1]["reasonCode"], "model_unresolved");
+        assert_eq!(checks[1]["model"], "auto");
+        assert_eq!(checks[1]["effectiveFromMs"], 123);
+        assert!(checks[0].get("secret").is_none());
+        assert!(checks[0].get("message").is_none());
+        assert!(checks[1].get("state").is_none());
+        assert!(market_readiness_checks(&response, 8).is_none());
+        for checks in [
+            serde_json::json!([]),
+            serde_json::json!([null]),
+            serde_json::json!([{"code":"text_surface","ready":"true"}]),
+        ] {
+            let mut invalid = response.clone();
+            invalid["checks"] = checks;
+            assert!(market_readiness_checks(&invalid, 7).is_none());
+        }
+        if let AppError::Coded { details, .. } =
+            market_value_unavailable_checks("text_surface".into(), &checks)
+        {
+            assert_eq!(details["checks"][0]["app"], "claude");
+            assert!(!details.to_string().contains("never forward"));
+        } else {
+            panic!("expected structured error");
+        }
+    }
     #[tokio::test]
     async fn share_value_errors_are_private_and_offline_is_structured() {
         use axum::response::IntoResponse;

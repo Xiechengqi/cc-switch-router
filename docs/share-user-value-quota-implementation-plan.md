@@ -352,7 +352,7 @@ sgptokenswitch 的只读排查确认三个独立阻塞：Server marker 是 `shad
 ### 12.2 实际交付
 
 - Server 返回协议、SQLite authority、存储健康、激活价目和每个绑定的实际 profile／driver 检查。能力失败仍返回所有原因，不因查询用户 ledger 提前变成笼统 500；版本冲突仍保留 409。
-- 普通自定义文本仅开放协议表列出的四种组合；预览、保存、真实发送共用白名单（原 shadow 路径已于第二轮取消）。OAuth、Web Session、Coding Plan、跨协议组合、媒体、内置付费工具、多 attempt 和未知用量继续 fail closed。
+- 当时普通自定义文本仅开放协议表列出的四种组合；预览、保存、真实发送共用白名单（原 shadow 路径已于第二轮取消）。后续 WorkBuddy、已实现跨协议组合及已证明免费重试的增量范围见 §14；其他 OAuth、Web Session、Coding Plan、媒体与内置付费工具仍 fail closed。
 - Router 加入本 installation 的最新发布／ACK 元数据，不让其他 Server 的 ACK 冒充本机就绪；待发布的新版本不否定旧有效价目。
 - 两端配额编辑分别维护基础能力和显式用户策略预览，支持重新检查及可见页面周期刷新；取消旧请求／忽略旧账号与 Share 响应，后台查询不冲掉二次确认。离线、超时、旧 Server、控制授权、响应异常和版本冲突可区分。
 - Router 添加／编辑／批量弹窗使用自身 light surface，关闭按钮采用现有深色文字、浅底、hover／focus 样式，不依赖父弹窗的 portal 继承。
@@ -455,3 +455,38 @@ WP5 预留的扩展已实施：Share Market 车位可出售美元等值额度，
 - Review 额外核对并覆盖：提交时重新检查窗口，防写锁等待跨周期；原生 Bundle 重试保持完整 payload，Share 删除后不假成功；初始化不能越过历史／恢复 fence；校准迟到结果不得进入已切换账号的页面，Router 也不会借新会话重试。旧补丁的 actor 缺省序列化及跨仓指纹保持兼容。
 
 以上仅为本地逻辑、后端夹具、编译和静态验证；未截图，未执行浏览器／UI 自动化，未做真实 Provider、生产数据库或线上人工验收，未提交、推送或部署。
+
+## 14. WorkBuddy 与既有跨协议金额计量补全（2026-11-04）
+
+本节落实远程诊断后的新增范围，不改变原有 Token 用量、钱包、租金、Provider 收益或历史合同；没有新增迁移，也不自动切换任何生产授权或 Provider 模型。
+
+### 14.1 已落地范围
+
+1. Server 能力函数精确覆盖 Registry 已实现的 Custom HTTP 转换：Claude／Gemini 各四种上游协议，Codex 三种（不含 Gemini），共 11 对 profile／driver、14 个下游入口组合。保存、预览和发网前准入共用同一能力判断，不凭兼容 ProviderType 放行。
+2. WorkBuddy 三 App、四个入口（Messages／Chat／Responses／Gemini），包括流式和非流式，专用分支实际接入 SQLite admission／终结守卫，而非仅解除白名单。最终模型、tier、payload 确定后，生成发网前写入 durable attempt。
+3. 固定模型提前检查价格；WorkBuddy 模型标识按真实 resolver 规范化。`auto` 只有解析到具体且已定价模型才能执行；不透明的 `auto/default/default-model` 返回 `model_unresolved`，不会猜模型、自动选择便宜模型或采用 WorkBuddy 积分。
+4. 原始响应转换前捕获真实模型、tier 与 usage；缓存显式零优先，累计帧不双计。错误 HTTP body、同一分片先输出后报错、缓冲后下游转换失败、流截断与取消都保留用量证据；合成补写的模型不能证明真实上游身份。
+5. 免费认证重试先同步终结旧 attempt，再以新 attempt 重新准入；已观测输出／用量不得自动重放。结果未知按既有风险规则保守结算，守卫随真实 body 生命周期，清扫器仍可在重启后收敛。
+6. 普通 USD 授权、Market entitlement 和美元试用共用原账本及预算，继续受并发和试用 scope 限制。CodeBuddy、其他 OAuth、Web Session、Coding Plan、媒体、服务端付费工具保持不可用；Token 模式不新增美元消费。
+
+### 14.2 Router 诊断与兼容
+
+市场就绪接口及发布／编辑／报价门槛共用配置 revision 与检查校验；返回安全、限长的 `checks`，可定位 App／Provider／profile／driver／model。不转发凭据、任意上游 message 或未知字段。基础检查缺失、失败或结构非法均不能被顶层成功标志覆盖。
+
+市场和普通配额编辑器继续用现有折叠提示，按依赖优先显示根因；不透明模型引导选择具体模型，缺价引导配置价格，未覆盖 driver 引导更新支持路径。保留原 `reason` 和旧无 `checks` 响应兼容；账号／Share 切换的私有响应隔离与缓存键不变。Server Web 同步四种语言及内嵌构建产物。
+
+### 14.3 部署和验收边界
+
+先 Router 后 Server；等待该 installation 的价格快照安装／ACK／激活，再重新检查 Share。具体 WorkBuddy 模型须管理员按真实需求配置和定价，升级不保证不透明默认别名立即变为可用。不应删除 ledger、重建授权或改历史价格解决能力提示。
+
+本轮只做本地后端夹具、纯逻辑测试、编译、构建与静态 review，不做截图、浏览器／UI 自动化、真实 Provider 推理／付款、远程配置修改或部署。真实各入口／模型／tier 仍需遵守第 9 节的灰度验收，状态保持 `live_pending`。
+
+### 14.4 本轮验证与整体 review
+
+- Router：`cargo check --locked --tests`、金额相关回归 31/31、市场回归 543/543 通过；前端金额与传输 34/34、Share Market 85/85 通过。类型检查、格式、settings／i18n／市场计费／Token 单位／模型价格审计通过。Webpack 生产构建通过；默认 Turbopack 构建曾因 Google Fonts 下载连接失败，不能记为通过。
+- Server：`value_` 回归 90 项通过，1 项显式 opt-in 的十万请求容量测试未运行；WorkBuddy／CodeBuddy 完整 HTTP 回归 46/46、流用量解析 138/138、Usage Store 33/33、流日志更新 5/5 通过。严格 Clippy（all targets、warnings as errors）及包含 `include!` 的全部 Rust 源文件格式检查通过。原生与自定义 HTTP 共 18 个下游入口组合覆盖流式／非流式和正常／异常模型；WorkBuddy 四入口覆盖缓存、试用预算、取消、认证恢复和异常证据。
+- Server Web 四个纯 Node 环境测试文件 41/41 通过，完整后端 Node 审计 2128/2128 通过。两端生产构建及类型检查通过，Server 内嵌 `web-dist` 已同步；Provider writer 证据、覆盖矩阵、文档索引、SQLite 权威边界、Web 边界／i18n／运行时契约、转换覆盖及产物体积审计通过。
+
+整体 review 额外修正：未读取响应体就取消时，中断守卫必须已存在，不能因已有 pending 日志而只等待清扫；被协议转换过滤的模型／tier 预告帧仍须计入原始证据；同分片输出后报错、HTTP 错误中的完整消息或部分用量不能免费或自动重放；明确无生成／无用量的上游拒绝仍按零结算，不能与传输超时混同。缓存累计量不双计、显式零优先、合成模型不作证据、重试先终结旧 attempt、市场合同隔离及旧 Token 模式均已复核。
+
+Review 后未发现尚未解决的阻断性代码问题。以上套件存在重叠，不累加为一个总测试数，也不等同两仓全部 Rust 测试或生产验收。离线 release-readiness 为 `failures=0`、`blocked_inputs`：聚合全量测试显式跳过，缺真实凭据与部署输入；不能写成发布门禁通过。本轮未截图、未运行浏览器／UI 自动化，未提交、推送或部署。

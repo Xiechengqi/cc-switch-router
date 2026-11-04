@@ -1,4 +1,5 @@
 export const valueQuotaMessagesEn = {
+  "dashboard.userLimit.value.readiness.model_unresolved": "Select a concrete WorkBuddy model instead of auto/default, then configure its price in Router settings. Opaque model aliases cannot be priced safely.",
   "dashboard.userLimit.value.readiness.blocked": "USD-equivalent quota is not ready",
   "dashboard.userLimit.value.readiness.retry": "Check again",
   "dashboard.userLimit.value.readiness.failed": "Readiness could not be checked. Retry or check Server diagnostics.",
@@ -127,6 +128,7 @@ export const valueQuotaMessagesEn = {
   "dashboard.userLimit.value.details": "USD quota details",
 };
 export const valueQuotaMessagesZh: Record<keyof typeof valueQuotaMessagesEn, string> = {
+  "dashboard.userLimit.value.readiness.model_unresolved": "请为 WorkBuddy 选择具体模型（不用 auto/default），并在 Router 设置中为其定价。不透明的模型别名无法安全计价。",
   "dashboard.userLimit.value.readiness.blocked": "美元等值额度尚未就绪",
   "dashboard.userLimit.value.readiness.retry": "重新检查",
   "dashboard.userLimit.value.readiness.failed": "检查失败，请重试或查看 Server 诊断。",

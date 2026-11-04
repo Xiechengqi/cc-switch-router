@@ -188,7 +188,7 @@ export function renderValueQuotaMessage(message: ValueQuotaMessage, t: ValueQuot
   return "raw" in message ? message.raw : t(message.key, message.values);
 }
 
-export type ValueReadinessCheck = {code: string; ready: boolean; state?: string; app?: string; profileId?: string | null; driverId?: string | null;
+export type ValueReadinessCheck = {code: string; ready: boolean; state?: string; app?: string; providerId?: string; profileId?: string | null; driverId?: string | null;
   model?: string; scope?: string; reasonCode?: string; effectiveFromMs?: number | null;
   /** The `code` of another check this one only waits on, e.g. an unacknowledged tariff waiting on an unpublished one. */
   blockedBy?: string | null};
@@ -408,12 +408,37 @@ export async function getRentalValueUsage(subscriptionId: string, signal?: Abort
 }
 
 /** Why a Share cannot sell a USD-equivalent seat quota right now, if it cannot. */
-export type MarketValueQuotaReadiness = {ready: boolean; valueTrialReady?: boolean; reason?: string};
+export type MarketValueQuotaReadiness = {ready: boolean; valueTrialReady?: boolean; reason?: string; checks?: ValueReadinessCheck[]};
+/** Bounded structured facts only; never render an arbitrary upstream message. */
+export function parseMarketValueReadiness(raw: unknown): MarketValueQuotaReadiness {
+  const invalid = () => new ValueQuotaClientError("quota_server_invalid_response");
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw invalid();
+  const value = raw as Record<string, unknown>;
+  if (typeof value.ready !== "boolean") throw invalid();
+  let checks: ValueReadinessCheck[] | undefined;
+  if (value.checks != null) {
+    if (!Array.isArray(value.checks) || value.checks.length > 128) throw invalid();
+    checks = value.checks.map((raw: unknown) => {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw invalid();
+      const item = raw as Record<string, unknown>;
+      if (typeof item.code !== "string" || !/^[a-zA-Z0-9_]{1,64}$/.test(item.code) || typeof item.ready !== "boolean") throw invalid();
+      const safe: Record<string, unknown> = {code:item.code, ready:item.ready};
+      for (const key of ["app","providerId","profileId","driverId","model","state","scope","reasonCode","blockedBy"]) {
+        const text = item[key];
+        if (typeof text === "string" && text.length > 0 && text.length <= 256 && text.trim() === text && !/[\u0000-\u001f\u007f]/.test(text)) safe[key] = text;
+      }
+      if (Number.isSafeInteger(item.effectiveFromMs) && (item.effectiveFromMs as number) >= 0) safe.effectiveFromMs = item.effectiveFromMs;
+      return safe as ValueReadinessCheck;
+    });
+    if (value.ready && (checks.length === 0 || checks.some(check => !check.ready))) throw invalid();
+  }
+  return {ready:value.ready, valueTrialReady:value.ready && value.valueTrialReady === true,
+    reason:typeof value.reason === "string" && /^[a-zA-Z0-9_]{1,64}$/.test(value.reason) ? value.reason : undefined, checks};
+}
 export async function getMarketValueQuotaReadiness(shareId: string, signal?: AbortSignal) {
   const result = await parseJson<MarketValueQuotaReadiness>(await authFetch(
     `/v1/shares/${encodeURIComponent(shareId)}/market-value-quota-readiness`, {signal, cache: "no-store"}));
-  if (!result || typeof result.ready !== "boolean") throw new ValueQuotaClientError("quota_server_invalid_response");
-  return {ready: result.ready, valueTrialReady: result.valueTrialReady === true, reason: typeof result.reason === "string" ? result.reason : undefined};
+  return parseMarketValueReadiness(result);
 }
 export type ValueUsageEdit = {
   action: "set" | "clear"; targetPicos?: string; expectedGrantRevision: number; windowId: string;
