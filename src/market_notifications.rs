@@ -255,43 +255,21 @@ struct OwnerSignal {
     title: &'static str,
 }
 
+/// Severity and wording come from the notification kind registry; an
+/// unregistered market kind fails closed to a record-only (never paged)
+/// signal, so a new producer must register its wording explicitly.
 fn owner_signal(kind: &str) -> OwnerSignal {
-    let (severity, title) = match kind {
-        "share_termination_finance_pending" => (
-            "warning",
-            "Share revoked; financial settlement requires review",
+    let registered = crate::notification_kinds::describe(&format!("market_{kind}"));
+    OwnerSignal {
+        severity: crate::notification_kinds::severity_for_level(
+            registered
+                .map(|entry| entry.level)
+                .unwrap_or(crate::notification_kinds::NoticeLevel::Record),
         ),
-        "finance_critical_case" => ("critical", "Market finance reconciliation required"),
-        "finance_audit_mismatch" => ("critical", "Market finance audit found mismatches"),
-        "payment_secret_unreadable" => ("critical", "Payment channel secret cannot be decrypted"),
-        "payment_channel_auth_failed" => ("critical", "Payment channel credentials rejected"),
-        "topup_reconcile_failing" => ("warning", "Top-up reconciliation keeps failing"),
-        "topup_review_stale" => ("warning", "Top-ups need owner review"),
-        "gateway_identity_conflict" => ("warning", "Payment gateway identity conflict"),
-        "gateway_orphan_paid_order" => ("warning", "Paid gateway order without Router top-up"),
-        "gateway_external_refund" => ("warning", "Merchant recorded a gateway refund"),
-        "duplicate_external_reference" => ("critical", "Duplicate external transfer reference"),
-        "channel_promoted_live" => ("info", "Payment channel promoted to live"),
-        "refund_requested" => ("info", "Buyer balance refund requested"),
-        "dispute_opened" => ("info", "Service dispute opened"),
-        "c2c_dispute" => ("warning", "C2C balance trade needs evidence review"),
-        "client_compensation_dispute" => {
-            ("warning", "Client termination compensation needs review")
-        }
-        "client_compensation_dispute_overdue" => (
-            "warning",
-            "Client termination compensation decision is overdue",
-        ),
-        "client_cleanup_finalization_failed" => (
-            "warning",
-            "Client is clean but financial finalization needs review",
-        ),
-        "earning_hold_legacy" => ("warning", "Earnings hold needs review"),
-        "earning_unlock_failed" => ("warning", "Provider earning lot failed to unlock"),
-        "service_notice_circuit" => ("warning", "Service notification safety policy activated"),
-        _ => ("warning", "Marketplace finance notice"),
-    };
-    OwnerSignal { severity, title }
+        title: registered
+            .map(|entry| entry.copy.title_en)
+            .unwrap_or("Marketplace finance notice"),
+    }
 }
 
 /// Raise (or, with `resolved`, clear) an Owner alert through the operator

@@ -36,6 +36,7 @@ pub struct AlertingService {
     telegram_http: reqwest::Client,
     bark_http: reqwest::Client,
     dashboard_url: String,
+    region: String,
 }
 
 impl AlertingService {
@@ -62,7 +63,15 @@ impl AlertingService {
             telegram_http,
             bark_http,
             dashboard_url,
+            region: crate::notification_kinds::region_for_domain(
+                include_str!("../../regions"),
+                &config.tunnel_domain,
+            ),
         }))
+    }
+
+    pub fn region(&self) -> &str {
+        &self.region
     }
 
     pub fn store(&self) -> &AlertStore {
@@ -145,11 +154,21 @@ impl AlertingService {
             )));
         }
         let tested_at = Utc::now().timestamp();
+        let when = chrono::DateTime::from_timestamp(tested_at, 0)
+            .map(|value| {
+                value
+                    .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
+                    .format("%m-%d %H:%M")
+                    .to_string()
+            })
+            .unwrap_or_else(|| tested_at.to_string());
+        let region = if self.region.is_empty() {
+            "default"
+        } else {
+            self.region.as_str()
+        };
         let text = format!(
-            "[CC-Switch Router] Alert channel test\nChannel: {channel}\nTime: {}\nDashboard: {}/settings/",
-            chrono::DateTime::from_timestamp(tested_at, 0)
-                .map(|value| value.to_rfc3339())
-                .unwrap_or_else(|| tested_at.to_string()),
+            "✅ 通知渠道测试通过\nChannel: {channel}\nTokenSwitch Router · {region} · {when} (UTC+8)\n{}/settings/",
             self.dashboard_url.trim_end_matches('/')
         );
         let test_id = format!("alert-channel-test-{channel}-{}", Uuid::new_v4());
@@ -249,6 +268,7 @@ impl AlertingService {
         AlertDeliveryPolicy {
             enabled: settings.enabled,
             dashboard_url: self.dashboard_url.clone(),
+            region: self.region.clone(),
             channels: delivery_channels,
         }
     }
@@ -511,12 +531,10 @@ fn configured(value: Option<&str>) -> bool {
     value.is_some_and(|value| !value.trim().is_empty())
 }
 
+/// Channel thresholds are notice levels; legacy severity names map onto the
+/// matching tier so stored settings keep working.
 fn normalize_min_severity(value: &str) -> &'static str {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "critical" => "critical",
-        "info" => "info",
-        _ => "warning",
-    }
+    crate::notification_kinds::NoticeLevel::parse(value).as_str()
 }
 
 fn retry_delay_secs(attempts: u32, stable_id: &str) -> i64 {

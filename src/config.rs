@@ -520,11 +520,11 @@ impl Default for AlertingSettings {
             telegram_bot_token: None,
             telegram_chat_id: None,
             telegram_topic_id: None,
-            telegram_min_severity: "warning".into(),
+            telegram_min_severity: "action".into(),
             bark_enabled: false,
             bark_server_url: DEFAULT_BARK_SERVER_URL.into(),
             bark_device_key: None,
-            bark_min_severity: "warning".into(),
+            bark_min_severity: "action".into(),
         }
     }
 }

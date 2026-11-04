@@ -33,6 +33,9 @@ pub struct OperatorAlertSignal {
 pub struct AlertDeliveryPolicy {
     pub enabled: bool,
     pub dashboard_url: String,
+    /// Deployment region resolved from the tunnel domain; stamped into every
+    /// channel frame so a multi-region operator can tell Routers apart.
+    pub region: String,
     pub channels: Vec<AlertChannelPolicy>,
 }
 
@@ -85,7 +88,9 @@ pub struct AlertTransition {
     pub occurred_at: i64,
 }
 
-/// Minimal, secret-free projection for the Owner's in-app notification center.
+/// Secret-free projection for the Owner's in-app notification center.
+/// Carries the registered kind and display-ready facts so the center renders
+/// a translated title and summary without re-reading the incident.
 #[derive(Debug, Clone)]
 pub struct InAppAlertEvent {
     pub id: String,
@@ -93,6 +98,8 @@ pub struct InAppAlertEvent {
     pub transition: String,
     pub severity: String,
     pub title: String,
+    pub kind: String,
+    pub details: serde_json::Value,
     pub occurred_at: i64,
     pub related_user_event_id: Option<String>,
 }
@@ -186,6 +193,11 @@ pub struct AlertChannelTestResponse {
     pub tested_at: i64,
 }
 
+/// Accepts both the legacy severity bands and the notice levels; both names
+/// for the same tier rank equal so stored settings and new ones interoperate.
+/// Ranks the legacy severity bands. Channel thresholds are compared by
+/// [`crate::notification_kinds::NoticeLevel`] instead; this stays for incident
+/// escalation ordering.
 pub fn severity_rank(value: &str) -> u8 {
     match value {
         "critical" => 3,

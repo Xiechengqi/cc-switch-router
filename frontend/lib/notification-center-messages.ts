@@ -13,8 +13,7 @@ export const notificationCenterMessagesEn = {
   "notificationCenter.kind.client_offline": "Client is offline",
   "notificationCenter.kind.client_recovered": "Client is back online",
   "notificationCenter.kind.client_removed": "Client monitoring ended",
-  "notificationCenter.kind.operator_alert_firing": "System alert",
-  "notificationCenter.kind.operator_alert_resolved": "System alert resolved",
+  "notificationCenter.resolvedBadge": "Recovered",
   "clientMarket.currentRental.title": "Current rental",
 } as const;
 
@@ -33,7 +32,6 @@ export const notificationCenterMessagesZh: Record<keyof typeof notificationCente
   "notificationCenter.kind.client_offline": "Client 已离线",
   "notificationCenter.kind.client_recovered": "Client 已恢复在线",
   "notificationCenter.kind.client_removed": "Client 监控已结束",
-  "notificationCenter.kind.operator_alert_firing": "系统告警",
-  "notificationCenter.kind.operator_alert_resolved": "系统告警已恢复",
+  "notificationCenter.resolvedBadge": "已恢复",
   "clientMarket.currentRental.title": "当前租用",
 };

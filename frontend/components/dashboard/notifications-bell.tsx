@@ -19,6 +19,19 @@ function payloadAmount(payload: Record<string, unknown>) {
   return null;
 }
 
+/** Localized title/summary for an Owner alert, straight from the mirrored
+ * payload the Router writes; legacy rows keep the raw English title. */
+function systemAlertCopy(payload: Record<string, unknown>, locale: string) {
+  const zh = locale.startsWith("zh");
+  const title = zh && typeof payload.titleZh === "string" && payload.titleZh
+    ? payload.titleZh
+    : typeof payload.title === "string" ? payload.title : null;
+  const summary = zh && typeof payload.summaryZh === "string" && payload.summaryZh
+    ? payload.summaryZh
+    : null;
+  return { title, summary };
+}
+
 /** A business-event feed, independent from email delivery and chat unread state. */
 export function NotificationsBell() {
   const { session } = useAuth();
@@ -197,7 +210,15 @@ export function NotificationsBell() {
                   {!item.readAt ? <span className="sr-only"> · {t("marketNotifications.unread")}</span> : null}
                 </p>
                 {item.category === "client" && typeof item.payload.clientLabel === "string" ? <p className="mt-1 break-words text-xs text-muted-foreground">{item.payload.clientLabel}</p> : null}
-                {item.category === "system" && typeof item.payload.title === "string" ? <p className="mt-1 break-words text-xs text-muted-foreground">{item.payload.title}</p> : null}
+                {item.category === "system" ? (() => {
+                  const copy = systemAlertCopy(item.payload, locale);
+                  const resolved = item.eventKind === "operator_alert_resolved";
+                  return <>
+                    {copy.title ? <p className="mt-1 break-words text-xs text-muted-foreground">{copy.title}</p> : null}
+                    {copy.summary ? <p className="mt-0.5 break-words text-xs leading-5 text-muted-foreground">{copy.summary}</p> : null}
+                    {resolved ? <span className="mt-1 inline-flex items-center rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-300">{t("notificationCenter.resolvedBadge")}</span> : null}
+                  </>;
+                })() : null}
                 <p className="mt-0.5 text-xs text-muted-foreground">
                   {amount ? <span className="tabular-nums">{amount} · </span> : null}
                   {new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(item.createdAt))}

@@ -103,14 +103,19 @@ async fn send_bark(
         failure_details: None,
     })?;
     let body = truncate_utf8(text, 3_000);
+    // The payload's first line carries "icon + concrete title"; use it as the
+    // Bark list title so a phone shows what fired instead of a generic label.
+    let title = text.lines().next().unwrap_or("TokenSwitch Router alert");
+    let title = truncate_utf8(title, 100);
+    let level = if text.starts_with('🔴') { "critical" } else { "active" };
     let request = crate::bark::PushRequest {
         device_key,
-        title: "CC-Switch Router alert",
+        title: &title,
         body: &body,
-        group: "CC-Switch Router",
+        group: "TokenSwitch Router",
         url: dashboard_url,
         id: message_id,
-        level: "active",
+        level,
     };
     let success = crate::bark::send(http, &settings.bark_server_url, &request).await?;
     Ok(ChannelSendSuccess {

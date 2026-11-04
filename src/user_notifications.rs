@@ -359,21 +359,43 @@ pub(crate) async fn store_owner_alerts(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin Owner notification batch"))?;
     for alert in alerts {
+        let level = crate::notification_kinds::level_for(&alert.kind);
+        let registered = crate::notification_kinds::describe(&alert.kind);
+        let summary_zh = registered
+            .map(|entry| crate::notification_kinds::fill(entry.copy.summary_zh, &alert.details))
+            .unwrap_or_default();
+        let payload = json!({
+            "title": alert.title.chars().take(200).collect::<String>(),
+            "titleZh": registered.map(|entry| entry.copy.title_zh),
+            "severity": alert.severity,
+            "level": level.as_str(),
+            "kind": alert.kind,
+            "state": alert.transition,
+            "summaryZh": summary_zh,
+            "clientEventId": alert.related_user_event_id,
+        })
+        .to_string();
+        // One row per incident: a resolve updates the firing row instead of
+        // stacking a second entry, and a flap re-fire refreshes the same row.
+        let row_id = format!("alert-incident:{}", alert.incident_id);
+        let event_kind = if alert.transition == "resolved" {
+            "operator_alert_resolved"
+        } else {
+            "operator_alert_firing"
+        };
         tx.execute(
-            "INSERT OR IGNORE INTO user_notification_events
+            "INSERT INTO user_notification_events
             (id, scope, category, event_kind, object_kind, object_id, payload_json, created_at_ms)
-            VALUES (?1, 'owner', 'system', ?2, 'incident', ?3, ?4, ?5)",
+            VALUES (?1, 'owner', 'system', ?2, 'incident', ?3, ?4, ?5)
+            ON CONFLICT(id) DO UPDATE SET
+                event_kind = excluded.event_kind,
+                payload_json = excluded.payload_json,
+                created_at_ms = excluded.created_at_ms",
             params![
-                format!("alert:{}", alert.id),
-                if alert.transition == "resolved" {
-                    "operator_alert_resolved"
-                } else {
-                    "operator_alert_firing"
-                },
+                row_id,
+                event_kind,
                 alert.incident_id,
-                json!({ "title": alert.title.chars().take(200).collect::<String>(),
-                    "severity": alert.severity, "clientEventId": alert.related_user_event_id })
-                .to_string(),
+                payload,
                 alert.occurred_at.saturating_mul(1000)
             ],
         )
@@ -450,6 +472,8 @@ mod tests {
             transition: "firing".into(),
             severity: "critical".into(),
             title: "Client offline".into(),
+            kind: "client_offline".into(),
+            details: serde_json::json!({"clientLabel": "client-one"}),
             occurred_at: 1793145600,
             related_user_event_id: Some("client:mine".into()),
         };
@@ -475,10 +499,10 @@ mod tests {
         };
         assert_eq!(
             feed_tx(&c, &next_owner, None).unwrap().items[0].id,
-            "alert:one"
+            "alert-incident:incident"
         );
         assert_eq!(
-            mark_read_tx(&c, &next_owner, "alert:one", &ReadRequest::default())
+            mark_read_tx(&c, &next_owner, "alert-incident:incident", &ReadRequest::default())
                 .unwrap()
                 .unread,
             0
@@ -498,7 +522,7 @@ mod tests {
         {
             let conn = store.conn.lock().await;
             conn.execute_batch("CREATE TRIGGER reject_second_notification BEFORE INSERT ON user_notification_events
-                WHEN NEW.id = 'alert:second' BEGIN SELECT RAISE(ABORT, 'test batch failure'); END;").unwrap();
+                WHEN NEW.id = 'alert-incident:incident-two' BEGIN SELECT RAISE(ABORT, 'test batch failure'); END;").unwrap();
         }
         let first = crate::alerting::models::InAppAlertEvent {
             id: "first".into(),
@@ -506,6 +530,8 @@ mod tests {
             transition: "firing".into(),
             severity: "warning".into(),
             title: "Test alert".into(),
+            kind: "llm_error_rate".into(),
+            details: serde_json::json!({}),
             occurred_at: 1793145600,
             related_user_event_id: None,
         };
@@ -513,6 +539,7 @@ mod tests {
             first.clone(),
             crate::alerting::models::InAppAlertEvent {
                 id: "second".into(),
+                incident_id: "incident-two".into(),
                 ..first
             },
         ];
@@ -527,6 +554,46 @@ mod tests {
         store_owner_alerts(&store, &alerts).await.unwrap();
         let conn = store.conn.lock().await;
         assert_eq!(feed_tx(&conn, &owner(), None).unwrap().unread, 2);
+    }
+
+    #[tokio::test]
+    async fn owner_alert_resolves_fold_into_one_entry_and_flap_refires_refresh_it() {
+        let store = crate::store::AppStore::new_in_memory_for_tests().unwrap();
+        let firing = crate::alerting::models::InAppAlertEvent {
+            id: "t1".into(),
+            incident_id: "incident-x".into(),
+            transition: "firing".into(),
+            severity: "critical".into(),
+            title: "LLM request error rate".into(),
+            kind: "llm_error_rate".into(),
+            details: serde_json::json!({"errorRate": 0.32, "rpm": 18.0}),
+            occurred_at: 1793145600,
+            related_user_event_id: None,
+        };
+        store_owner_alerts(&store, std::slice::from_ref(&firing))
+            .await
+            .unwrap();
+        let resolved = crate::alerting::models::InAppAlertEvent {
+            id: "t2".into(),
+            transition: "resolved".into(),
+            occurred_at: 1793145660,
+            ..firing.clone()
+        };
+        store_owner_alerts(&store, std::slice::from_ref(&resolved))
+            .await
+            .unwrap();
+        let conn = store.conn.lock().await;
+        let feed = feed_tx(&conn, &owner(), None).unwrap();
+        assert_eq!(feed.items.len(), 1, "firing + resolved fold into one entry");
+        assert_eq!(feed.items[0].event_kind, "operator_alert_resolved");
+        assert_eq!(feed.items[0].payload["level"], "attention");
+        assert!(
+            feed.items[0].payload["summaryZh"]
+                .as_str()
+                .unwrap()
+                .contains("32%"),
+            "summary renders translated facts"
+        );
     }
 
     #[test]

@@ -55,6 +55,8 @@ mod model_pricing;
 mod models;
 mod namespace;
 mod notification_channels;
+mod notification_compose;
+mod notification_kinds;
 mod notifications;
 mod process_lock;
 mod provider_presentation;

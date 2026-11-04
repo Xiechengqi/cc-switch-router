@@ -4718,8 +4718,9 @@ pub fn apply_updates_to_dynamic(
                 current.alerting.telegram_topic_id = value.and_then(|value| value.parse().ok());
             }
             "CC_SWITCH_ROUTER_ALERT_TELEGRAM_MIN_SEVERITY" => {
-                current.alerting.telegram_min_severity =
-                    value.unwrap_or("warning").to_ascii_lowercase();
+                current.alerting.telegram_min_severity = value
+                    .map(str::to_ascii_lowercase)
+                    .unwrap_or_else(|| "action".into());
             }
             "CC_SWITCH_ROUTER_ALERT_BARK_ENABLED" => {
                 current.alerting.bark_enabled = value.map(parse_bool_truthy).unwrap_or(false);
@@ -4733,8 +4734,9 @@ pub fn apply_updates_to_dynamic(
                 current.alerting.bark_device_key = value.map(str::to_string);
             }
             "CC_SWITCH_ROUTER_ALERT_BARK_MIN_SEVERITY" => {
-                current.alerting.bark_min_severity =
-                    value.unwrap_or("warning").to_ascii_lowercase();
+                current.alerting.bark_min_severity = value
+                    .map(str::to_ascii_lowercase)
+                    .unwrap_or_else(|| "action".into());
             }
             "CC_SWITCH_ROUTER_CLIENT_EMAIL_NOTIFICATIONS_ENABLED" => {
                 current.client_notifications.enabled = value.map(parse_bool_truthy).unwrap_or(true);

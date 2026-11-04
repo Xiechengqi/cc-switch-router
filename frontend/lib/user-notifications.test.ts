@@ -20,9 +20,17 @@ test("notification center labels cover every category and known new kind in both
   for (const category of ["wallet", "service", "client", "system"] as const) {
     for (const locale of ["en", "zh-CN"] as const) assert.ok(messages[locale][`notificationCenter.category.${category}`]);
   }
-  for (const kind of ["topup_credited", "contract_suspended", "client_offline", "client_recovered", "client_registered", "client_removed", "operator_alert_firing", "operator_alert_resolved", "client_termination_started", "client_termination_decision_required", "share_termination_updated"]) {
+  // Owner alerts render their localized title from the payload, so the kind
+  // label may fall back to the generic account update.
+  const labeled = ["topup_credited", "contract_suspended", "client_offline", "client_recovered", "client_registered", "client_removed", "client_termination_started", "client_termination_decision_required", "share_termination_updated"];
+  for (const kind of labeled) {
     const key = notificationKindKey(kind);
     assert.notEqual(key, "notificationCenter.other");
+    assert.ok(messages.en[key]);
+    assert.ok(messages["zh-CN"][key]);
+  }
+  for (const kind of ["operator_alert_firing", "operator_alert_resolved"]) {
+    const key = notificationKindKey(kind);
     assert.ok(messages.en[key]);
     assert.ok(messages["zh-CN"][key]);
   }

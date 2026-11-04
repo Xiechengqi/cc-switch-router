@@ -148,6 +148,7 @@ impl AlertStore {
             let conn = store.open()?;
             let mut statement = conn.prepare(
                 "SELECT t.id, t.incident_id, t.transition, t.severity, i.title, t.occurred_at,
+                    i.kind, t.details_json,
                     CASE
                         WHEN t.source_event_id LIKE 'client_presence:offline:%'
                             THEN 'client:client_offline:' || SUBSTR(t.source_event_id, LENGTH('client_presence:offline:') + 1)
@@ -160,10 +161,16 @@ impl AlertStore {
                  WHERE t.in_app_synced_at IS NULL AND t.transition IN ('firing', 'escalated', 'resolved')
                  ORDER BY t.occurred_at, t.id LIMIT 100"
             ).map_err(|error| AppError::Internal(format!("prepare in-app alerts failed: {error}")))?;
-            statement.query_map([], |row| Ok(super::models::InAppAlertEvent {
+            statement.query_map([], |row| {
+                let raw_details: String = row.get(7)?;
+                Ok(super::models::InAppAlertEvent {
                 id: row.get(0)?, incident_id: row.get(1)?, transition: row.get(2)?,
-                severity: row.get(3)?, title: row.get(4)?, occurred_at: row.get(5)?, related_user_event_id: row.get(6)?,
-            })).map_err(|error| AppError::Internal(format!("query in-app alerts failed: {error}")))?
+                severity: row.get(3)?, title: row.get(4)?, occurred_at: row.get(5)?,
+                kind: row.get(6)?,
+                details: serde_json::from_str(&raw_details)
+                    .unwrap_or_else(|_| serde_json::json!({})),
+                related_user_event_id: row.get(8)?,
+            })}).map_err(|error| AppError::Internal(format!("query in-app alerts failed: {error}")))?
                 .collect::<Result<Vec<_>, _>>().map_err(|error| AppError::Internal(format!("read in-app alerts failed: {error}")))
         }).await.map_err(|error| AppError::Internal(format!("in-app alerts task failed: {error}")))?
     }
@@ -645,6 +652,7 @@ impl AlertStore {
                 &AlertDeliveryPolicy {
                     enabled: false,
                     dashboard_url: String::new(),
+                    region: String::new(),
                     channels: Vec::new(),
                 },
             )?;
@@ -1289,6 +1297,7 @@ fn init_alert_db(conn: &Connection) -> Result<(), AppError> {
     )
     .map_err(|error| AppError::Internal(format!("init alert database failed: {error}")))?;
     for (table, column, definition) in [
+        ("alert_incidents", "last_resolved_at", "INTEGER"),
         ("alert_transitions", "in_app_synced_at", "INTEGER"),
         ("alert_delivery_attempts", "failure_code", "TEXT"),
         ("alert_delivery_attempts", "failure_hint", "TEXT"),
@@ -1357,9 +1366,14 @@ fn observe_condition_tx(
     repeat_interval_secs: i64,
     policy: &AlertDeliveryPolicy,
 ) -> Result<Option<AlertTransition>, AppError> {
+    // One severity source of truth: the registry level, not whatever string a
+    // producer happened to pass.
+    let condition_severity = crate::notification_kinds::severity_for_level(
+        crate::notification_kinds::level_for(&condition.kind),
+    );
     let Some(mut incident) = load_active_incident_by_fingerprint_tx(tx, &condition.fingerprint)?
     else {
-        if condition.severity != "critical" {
+        if condition_severity != "critical" {
             tx.execute(
                 "INSERT INTO alert_condition_candidates (
                     fingerprint, scope, first_seen_at, last_seen_at
@@ -1399,6 +1413,54 @@ fn observe_condition_tx(
             params![condition.fingerprint],
         )
         .map_err(|error| AppError::Internal(format!("promote alert candidate failed: {error}")))?;
+        // Flap suppression: a condition that resolved moments ago and fires
+        // again is the same episode, not a new one. Fold the re-fire into the
+        // recently resolved incident (fresh timestamps, occurrence +1) instead
+        // of opening a new incident and paging again.
+        let flap_window = crate::notification_kinds::flap_suppress_secs_for(&condition.kind);
+        if flap_window > 0 {
+            let recent: Option<(String, i64)> = tx
+                .query_row(
+                    "SELECT id, last_resolved_at FROM alert_incidents
+                     WHERE fingerprint = ?1 AND resolved_at IS NOT NULL
+                     ORDER BY resolved_at DESC LIMIT 1",
+                    params![condition.fingerprint],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(|error| {
+                    AppError::Internal(format!("read recent alert incident failed: {error}"))
+                })?;
+            if let Some((incident_id, last_resolved_at)) = recent
+                && now.saturating_sub(last_resolved_at) < flap_window
+            {
+                let registry_severity = crate::notification_kinds::severity_for_level(
+                    crate::notification_kinds::level_for(&condition.kind),
+                );
+                tx.execute(
+                    "UPDATE alert_incidents
+                     SET severity = ?2, status = 'firing', title = ?3, message = ?4,
+                         details_json = ?5, occurrence_count = occurrence_count + 1,
+                         last_seen_at = ?6, last_transition_at = ?6,
+                         resolved_at = NULL, acknowledged_at = NULL, acknowledged_by = NULL,
+                         acknowledgement_note = NULL, silenced_at = NULL, silenced_until = NULL,
+                         silenced_by = NULL, silence_note = NULL
+                     WHERE id = ?1",
+                    params![
+                        incident_id,
+                        registry_severity,
+                        condition.title,
+                        condition.message,
+                        condition.details.to_string(),
+                        now,
+                    ],
+                )
+                .map_err(|error| {
+                    AppError::Internal(format!("reopen flapping alert incident failed: {error}"))
+                })?;
+                return Ok(None);
+            }
+        }
         return create_incident_tx(tx, condition, None, now, policy).map(Some);
     };
 
@@ -1406,7 +1468,7 @@ fn observe_condition_tx(
     let previous_status = incident.status.clone();
     let silence_expired =
         previous_status == "silenced" && incident.silenced_until.is_some_and(|until| until <= now);
-    let escalated = severity_rank(&condition.severity) > severity_rank(&previous_severity);
+    let escalated = severity_rank(condition_severity) > severity_rank(&previous_severity);
     let next_status = if silence_expired || (escalated && previous_status == "acknowledged") {
         "firing"
     } else {
@@ -1427,7 +1489,7 @@ fn observe_condition_tx(
          WHERE id = ?1",
         params![
             incident.id,
-            condition.severity,
+            condition_severity,
             next_status,
             condition.title,
             condition.message,
@@ -1439,7 +1501,7 @@ fn observe_condition_tx(
     )
     .map_err(|error| AppError::Internal(format!("update active alert incident failed: {error}")))?;
 
-    incident.severity = condition.severity.clone();
+    incident.severity = condition_severity.into();
     incident.status = next_status.into();
     incident.title = condition.title.clone();
     incident.message = condition.message.clone();
@@ -1579,7 +1641,12 @@ fn create_incident_tx(
         kind: condition.kind.clone(),
         entity_kind: condition.entity_kind.clone(),
         entity_id: condition.entity_id.clone(),
-        severity: normalize_severity(&condition.severity).into(),
+        // Severity follows the registered kind's level so a producer cannot
+        // pair an attention kind with a critical page.
+        severity: crate::notification_kinds::severity_for_level(
+            crate::notification_kinds::level_for(&condition.kind),
+        )
+        .into(),
         status: "firing".into(),
         title: condition.title.clone(),
         message: condition.message.clone(),
@@ -1648,7 +1715,8 @@ fn resolve_incident_tx(
     let updated = tx
         .execute(
             "UPDATE alert_incidents
-             SET status = 'resolved', resolved_at = ?2, last_seen_at = ?2,
+             SET status = 'resolved', resolved_at = ?2, last_resolved_at = ?2,
+                 last_seen_at = ?2,
                  last_transition_at = ?2, message = ?3, details_json = ?4
              WHERE id = ?1 AND resolved_at IS NULL",
             params![incident.id, now, message, details.to_string()],
@@ -1733,7 +1801,7 @@ fn enqueue_deliveries_tx(
     transition: &AlertTransition,
     policy: &AlertDeliveryPolicy,
 ) -> Result<(), AppError> {
-    let payload = render_delivery_payload(incident, transition, &policy.dashboard_url);
+    let payload = render_delivery_payload(incident, transition, policy);
     for channel in &policy.channels {
         let recovery_for_previously_targeted_channel = transition.transition == "resolved"
             && tx
@@ -1751,8 +1819,11 @@ fn enqueue_deliveries_tx(
                     ))
                 })?
                 != 0;
-        if severity_rank(&transition.severity) < severity_rank(&channel.min_severity)
-            && !recovery_for_previously_targeted_channel
+        let transition_level =
+            crate::notification_kinds::level_for(&incident.kind);
+        if !transition_level.meets(crate::notification_kinds::NoticeLevel::parse(
+            &channel.min_severity,
+        )) && !recovery_for_previously_targeted_channel
         {
             continue;
         }
@@ -1799,51 +1870,29 @@ fn supersede_stale_deliveries_tx(
     Ok(())
 }
 
+/// Every operator alert now renders through the shared composer so Bark,
+/// Telegram and the in-app center show the same title, facts and frame.
 fn render_delivery_payload(
     incident: &StoredIncident,
     transition: &AlertTransition,
-    dashboard_url: &str,
+    policy: &AlertDeliveryPolicy,
 ) -> String {
-    let state = transition.transition.to_ascii_uppercase();
-    let severity = incident.severity.to_ascii_uppercase();
-    let mut lines = vec![
-        format!("[CC-Switch Router] {severity} · {state}"),
-        incident.title.clone(),
-        transition.message.clone(),
-        format!("Kind: {}", incident.kind),
-    ];
-    if let Some(entity_id) = incident.entity_id.as_deref() {
-        lines.push(format!("Entity: {} / {entity_id}", incident.entity_kind));
-    }
-    lines.push(format!(
-        "Started: {}",
-        format_timestamp(incident.started_at)
-    ));
-    lines.push(format!(
-        "Updated: {}",
-        format_timestamp(transition.occurred_at)
-    ));
-    if !dashboard_url.trim().is_empty() {
-        lines.push(format!(
-            "Dashboard: {}/metrics/",
-            dashboard_url.trim_end_matches('/')
-        ));
-    }
-    lines.join("\n")
-}
-
-fn format_timestamp(timestamp: i64) -> String {
-    chrono::DateTime::from_timestamp(timestamp, 0)
-        .map(|value| value.to_rfc3339())
-        .unwrap_or_else(|| timestamp.to_string())
-}
-
-fn normalize_severity(value: &str) -> &'static str {
-    match value {
-        "critical" => "critical",
-        "info" => "info",
-        _ => "warning",
-    }
+    let href = if policy.dashboard_url.trim().is_empty() {
+        String::new()
+    } else {
+        format!("{}/metrics/?tab=alerts", policy.dashboard_url.trim_end_matches('/'))
+    };
+    crate::notification_compose::ComposedNotice::for_alert(
+        &incident.kind,
+        &incident.title,
+        &transition.transition,
+        &transition.details,
+        href,
+        transition.occurred_at,
+        policy.region.clone(),
+        policy.dashboard_url.trim_start_matches("https://").trim_start_matches("http://").to_string(),
+    )
+    .bark_body_with_header()
 }
 
 fn latest_notification_transition_at_tx(
@@ -2102,17 +2151,34 @@ mod tests {
         }
     }
 
+    /// A critical action-level kind: registry-derived severity stays critical
+    /// regardless of the producer-provided severity string.
     fn condition() -> AlertCondition {
         AlertCondition {
-            fingerprint: "fd_pressure:router:router".into(),
+            fingerprint: "route_lifecycle:router:router".into(),
             scope: "metrics".into(),
-            kind: "fd_pressure".into(),
+            kind: "route_lifecycle".into(),
             entity_kind: "router".into(),
             entity_id: Some("router".into()),
             severity: "critical".into(),
-            title: "FD pressure".into(),
-            message: "FD usage is elevated".into(),
-            details: serde_json::json!({ "percent": 75 }),
+            title: "Route lifecycle mismatch".into(),
+            message: "Route lifecycle mismatch".into(),
+            details: serde_json::json!({ "mismatches": 3 }),
+        }
+    }
+
+    /// An attention-level kind: severity normalizes to warning.
+    fn warning_condition() -> AlertCondition {
+        AlertCondition {
+            fingerprint: "host_disk_pressure:router:router".into(),
+            scope: "metrics".into(),
+            kind: "host_disk_pressure".into(),
+            entity_kind: "router".into(),
+            entity_id: Some("router".into()),
+            severity: "warning".into(),
+            title: "Disk pressure".into(),
+            message: "Disk usage is elevated".into(),
+            details: serde_json::json!({ "diskUsagePercent": 91.0 }),
         }
     }
 
@@ -2123,6 +2189,7 @@ mod tests {
         let policy = AlertDeliveryPolicy {
             enabled: false,
             dashboard_url: "https://router.test".into(),
+            region: String::new(),
             channels: vec![],
         };
         let signal = |id: &str, transition: &str, time| OperatorAlertSignal {
@@ -2228,8 +2295,7 @@ mod tests {
     #[tokio::test]
     async fn warning_condition_requires_a_stable_firing_window() {
         let store = test_store("warning-firing-grace");
-        let mut warning = condition();
-        warning.severity = "warning".into();
+        let warning = warning_condition();
         store
             .reconcile_conditions(
                 "metrics".into(),
@@ -2251,8 +2317,7 @@ mod tests {
     #[tokio::test]
     async fn warning_candidate_does_not_age_through_a_monitoring_gap() {
         let store = test_store("warning-candidate-gap");
-        let mut warning = condition();
-        warning.severity = "warning".into();
+        let warning = warning_condition();
         store
             .reconcile_conditions(
                 "metrics".into(),
@@ -2285,6 +2350,7 @@ mod tests {
         AlertDeliveryPolicy {
             enabled: false,
             dashboard_url: "https://router.example.com".into(),
+            region: String::new(),
             channels: Vec::new(),
         }
     }
@@ -2338,8 +2404,7 @@ mod tests {
         assert_eq!(reminders, 2);
 
         let warning_store = test_store("warning-no-reminders");
-        let mut warning = condition();
-        warning.severity = "warning".into();
+        let warning = warning_condition();
         for now in [2_000, 2_030, 10_000] {
             warning_store
                 .reconcile_conditions(
@@ -2429,6 +2494,7 @@ mod tests {
         let policy = AlertDeliveryPolicy {
             enabled: true,
             dashboard_url: "https://router.example.com".into(),
+            region: String::new(),
             channels: vec![AlertChannelPolicy {
                 channel: "telegram".into(),
                 min_severity: "warning".into(),
@@ -2444,7 +2510,11 @@ mod tests {
             .unwrap()
             .expect("claim delivery");
         assert_eq!(claim.channel, "telegram");
-        assert!(claim.payload_text.contains("FD pressure"));
+        assert!(
+            claim.payload_text.contains("SSH 路由生命周期不一致"),
+            "payload: {}",
+            claim.payload_text
+        );
         assert!(
             store
                 .claim_delivery("worker".into(), 101, 30)
@@ -2460,6 +2530,7 @@ mod tests {
         let policy = AlertDeliveryPolicy {
             enabled: true,
             dashboard_url: "https://router.example.com".into(),
+            region: String::new(),
             channels: vec![AlertChannelPolicy {
                 channel: "telegram".into(),
                 min_severity: "warning".into(),
@@ -2578,6 +2649,7 @@ mod tests {
         let policy = AlertDeliveryPolicy {
             enabled: true,
             dashboard_url: "https://router.example.com".into(),
+            region: String::new(),
             channels: vec![AlertChannelPolicy {
                 channel: "telegram".into(),
                 min_severity: "critical".into(),
@@ -2613,7 +2685,11 @@ mod tests {
             .await
             .unwrap()
             .expect("recovery delivery must retain the previously targeted channel");
-        assert!(recovery.payload_text.contains("RESOLVED"));
+        assert!(
+            recovery.payload_text.contains("已恢复"),
+            "payload: {}",
+            recovery.payload_text
+        );
 
         let counts = store.overview_counts().await.unwrap();
         assert_eq!(counts.active, 0);

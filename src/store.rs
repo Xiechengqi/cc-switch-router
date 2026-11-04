@@ -20073,7 +20073,9 @@ fn enqueue_client_presence_operator_signal_tx(
         "client_offline",
         "client",
         Some(installation_id),
-        "critical",
+        crate::notification_kinds::severity_for_level(crate::notification_kinds::level_for(
+            "client_offline",
+        )),
         title,
         &message,
         serde_json::json!({
