@@ -256,6 +256,157 @@ async fn canonical_health_is_yellow_then_red_and_recovers_without_using_primary_
 }
 
 #[tokio::test]
+async fn model_routing_health_is_protocol_scoped_authorized_read_only_and_configuration_bound() {
+    let mut f = Fixture::new().await;
+    let config = test_config("model-routing-health");
+    let mut claude_probe = test_provider_model_probe("anthropic", "claude-test");
+    claude_probe.health_fingerprint = "b".repeat(64);
+    f.runtimes.claude = Some(ShareUpstreamProvider {
+        account_email: Some("claude-only@example.test".into()),
+        model_probe: Some(claude_probe),
+        ..Default::default()
+    });
+    f.runtimes.codex.as_mut().unwrap().account_email = Some("codex-only@example.test".into());
+    f.ingest_manual(f.manual("success", Utc::now().timestamp() - 1))
+        .await;
+    let observation_count = || async {
+        let conn = f.store.conn.lock().await;
+        conn.query_row(
+            "SELECT COUNT(*) FROM share_model_live_observations",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+    };
+    let before = observation_count().await;
+    let routing = f
+        .store
+        .get_user_model_routing(&config, "owner@example.com", &HashSet::new())
+        .await
+        .unwrap();
+    let share = &routing.eligible_shares[0];
+    assert!(
+        !share.is_online,
+        "offline authorized Shares can still be configured"
+    );
+    let codex = share
+        .app_capabilities
+        .iter()
+        .find(|cap| cap.app == "codex")
+        .unwrap();
+    let claude = share
+        .app_capabilities
+        .iter()
+        .find(|cap| cap.app == "claude")
+        .unwrap();
+    assert_eq!(
+        codex.account_email.as_deref(),
+        Some("codex-only@example.test")
+    );
+    assert_eq!(
+        codex.live_model_health_status.as_ref().unwrap().state,
+        "healthy"
+    );
+    assert_eq!(
+        claude.account_email.as_deref(),
+        Some("claude-only@example.test")
+    );
+    assert!(claude.model_health_status.is_none());
+    assert!(
+        claude.live_model_health_status.is_none(),
+        "Codex cannot lend its green status to Claude"
+    );
+    let denied = f
+        .store
+        .get_user_model_routing(&config, "outsider@example.test", &HashSet::new())
+        .await
+        .unwrap();
+    assert!(denied.eligible_shares.is_empty());
+    assert_eq!(
+        observation_count().await,
+        before,
+        "reading routing must not launch or synthesize probes"
+    );
+
+    // Incomplete metadata still exposes the current capability fingerprint.
+    // Removing the execution policy must invalidate prior green evidence even
+    // when the runtime still reports the same fingerprint.
+    f.runtimes.codex = Some(ShareUpstreamProvider {
+        model_probe: f.runtimes.codex.as_ref().unwrap().model_probe.clone(),
+        ..Default::default()
+    });
+    {
+        let conn = f.store.conn.lock().await;
+        conn.execute(
+            "UPDATE shares SET app_runtimes_json=?1 WHERE share_id='health-share'",
+            params![serde_json::to_string(&f.runtimes).unwrap()],
+        )
+        .unwrap();
+    }
+    let partial = f
+        .store
+        .get_user_model_routing(&config, "owner@example.com", &HashSet::new())
+        .await
+        .unwrap();
+    let codex = partial.eligible_shares[0]
+        .app_capabilities
+        .iter()
+        .find(|cap| cap.app == "codex")
+        .unwrap();
+    assert_eq!(
+        codex.live_model_health_status.as_ref().unwrap().state,
+        "unknown"
+    );
+    assert_eq!(
+        codex.health_fingerprint.as_deref(),
+        Some(HEALTH_FINGERPRINT)
+    );
+
+    f.runtimes
+        .codex
+        .as_mut()
+        .unwrap()
+        .model_probe
+        .as_mut()
+        .unwrap()
+        .health_fingerprint = "c".repeat(64);
+    {
+        let conn = f.store.conn.lock().await;
+        conn.execute(
+            "UPDATE shares SET app_runtimes_json=?1 WHERE share_id='health-share'",
+            params![serde_json::to_string(&f.runtimes).unwrap()],
+        )
+        .unwrap();
+    }
+    let changed = f
+        .store
+        .get_user_model_routing(&config, "owner@example.com", &HashSet::new())
+        .await
+        .unwrap();
+    let codex = changed.eligible_shares[0]
+        .app_capabilities
+        .iter()
+        .find(|cap| cap.app == "codex")
+        .unwrap();
+    assert_eq!(
+        codex.health_fingerprint.as_deref(),
+        Some("c".repeat(64).as_str())
+    );
+    assert!(
+        codex
+            .live_model_health_status
+            .as_ref()
+            .is_none_or(|status| status.state == "unknown")
+    );
+    assert!(
+        codex
+            .model_health_status
+            .as_ref()
+            .is_none_or(|status| status.state == "unknown")
+    );
+}
+
+#[tokio::test]
 async fn canonical_health_is_unknown_when_stale_or_provider_model_fingerprint_changes() {
     let mut f = Fixture::new().await;
     f.push(0, "success").await;
@@ -551,6 +702,32 @@ async fn dashboard_market_and_share_url_expose_the_same_health_without_public_er
             .await
             .unwrap();
         let share = &dashboard.shares[0];
+        let routing = f
+            .store
+            .get_user_model_routing(
+                &config,
+                "owner@example.com",
+                &HashSet::from(["health-sub".into()]),
+            )
+            .await
+            .unwrap();
+        let capability = routing.eligible_shares[0]
+            .app_capabilities
+            .iter()
+            .find(|capability| capability.app == "codex")
+            .unwrap();
+        assert_eq!(
+            capability.model_health_status.as_ref(),
+            Some(&share.model_health_status)
+        );
+        assert_eq!(
+            capability.live_model_health_status.as_ref(),
+            Some(&share.live_model_health_status)
+        );
+        assert_eq!(
+            capability.health_fingerprint.as_deref(),
+            Some(HEALTH_FINGERPRINT)
+        );
         assert_eq!(share.live_model_health_status.state, "degraded");
         assert_eq!(
             share.live_model_health_status.reason_code,

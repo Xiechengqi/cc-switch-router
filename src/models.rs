@@ -407,6 +407,14 @@ pub struct UserModelRoutingShareView {
 #[serde(rename_all = "camelCase")]
 pub struct UserModelRoutingShareCapability {
     pub app: String,
+    /// Current execution identity; observations from another App/configuration
+    /// must never color this protocol's account panel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_health_status: Option<ShareModelHealthStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_model_health_status: Option<ShareModelHealthStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -20,7 +20,8 @@ import { CompactSelect } from "@/components/common/compact-select";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { SegmentedControl } from "@/components/common/segmented-control";
 import { CandidateList } from "@/components/dashboard/model-hub-candidates";
-import { MarketShareApps, MarketProviderLogos } from "@/components/dashboard/share-market/market-share-identity";
+import { RoutingShareSummary } from "@/components/dashboard/model-hub-share-summary";
+import { SharePoolPicker } from "@/components/dashboard/model-hub-share-picker";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
@@ -40,31 +41,33 @@ import type {
 } from "@/lib/types";
 import {
   buildUnifiedModelCurl,
-  canonicalModelRoutes,
   defaultModelRoutingProtocol,
   defaultTestModelForProtocol,
   firstShareForProtocol,
   groupModelRoutesByProtocol,
   isWildcardModel,
   MAX_USER_MODEL_ROUTES,
-  modelRoutingShareAccountLines,
+  MAX_MODEL_ROUTE_CANDIDATES,
+  MODEL_ROUTING_PROTOCOLS,
+  modelRouteTargets,
+  moveModelRouteTarget,
+  replacePassthroughTargets,
   newDraftModelRoute,
   patchDraftModelRoute,
   preferredModelRoutingApp,
   protocolHasAttention,
   protocolSlotMode,
   sharesForProtocol,
-  validateModelRoutes,
   WILDCARD_MODEL,
   type DraftModelRoute,
   type ModelRoutingProtocol,
   type ModelRoutingProtocolMode,
 } from "@/lib/model-routing";
+import { ModelRoutingSession, routingDrafts, routingDraftIsDirty } from "@/lib/model-routing-session";
 import { usePersistentState } from "@/lib/use-persistent-state";
 import { cn } from "@/lib/utils";
 import type { MessageKey } from "@/lib/i18n";
 
-const PASSTHROUGH_UNSET = "__model_hub_passthrough_unset__";
 const PROTOCOL_TITLE_KEYS: Record<ModelRoutingProtocol, MessageKey> = {
   claude: "modelHub.protocol.claude",
   codex: "modelHub.protocol.codex",
@@ -89,17 +92,21 @@ export type ModelRoutingController = {
   loading: boolean;
   busy: boolean;
   error: string;
+  refreshError: string;
+  conflict: boolean;
   dirty: boolean;
   rawToken: string;
   token: UserApiTokenStatus | null;
   showToken: boolean;
   setShowToken: React.Dispatch<React.SetStateAction<boolean>>;
   load: () => Promise<void>;
+  discardChanges: () => Promise<boolean>;
+  refresh: () => Promise<void>;
   save: () => Promise<void>;
   resetToken: () => Promise<boolean>;
   addRouteForShare: (shareId: string) => ModelRoutingApp | undefined;
   addExactRoute: (appType: ModelRoutingApp, shareId?: string) => void;
-  setPassthroughShare: (appType: ModelRoutingApp, shareId: string) => void;
+  setPassthroughTargets: (appType: ModelRoutingApp, shareIds: string[]) => void;
   updateRoute: (clientId: string, patch: Partial<UserModelRouteInput>) => void;
   removeRoute: (clientId: string) => void;
   addCandidate: (clientId: string, shareId: string) => void;
@@ -108,303 +115,115 @@ export type ModelRoutingController = {
 };
 
 function toDraftRoutes(profile: UserModelRoutingResponse): DraftModelRoute[] {
-  return profile.routes.map((route) => ({
-    clientId: route.id,
-    appType: route.appType,
-    requestedModel: route.requestedModel,
-    targetShareId: route.targetShareId,
-    candidates: route.candidates || [],
-  }));
+  return routingDrafts(profile);
 }
 
-export function useModelRoutingController(active: boolean): ModelRoutingController {
+export function useModelRoutingController(active: boolean, viewerKey: string): ModelRoutingController {
   const { t } = useLocaleText();
-  const [profile, setProfile] = React.useState<UserModelRoutingResponse | null>(null);
-  const [routes, setRoutes] = React.useState<DraftModelRoute[]>([]);
-  const [token, setToken] = React.useState<UserApiTokenStatus | null>(null);
-  const [rawToken, setRawToken] = React.useState("");
-  const [showToken, setShowToken] = React.useState(false);
-  const [loading, setLoading] = React.useState(false);
-  const [busy, setBusy] = React.useState(false);
-  const [error, setError] = React.useState("");
-  const autoLoadStartedRef = React.useRef(false);
-
-  const load = React.useCallback(async () => {
-    if (!active) return;
-    setLoading(true);
-    setError("");
-    try {
-      const [routing, apiToken] = await Promise.all([
-        getUserModelRouting(),
-        getUserApiToken(),
-      ]);
-      setProfile(routing);
-      setRoutes(toDraftRoutes(routing));
-      setToken(apiToken.token);
-      setRawToken(apiToken.apiToken || "");
-      setShowToken(false);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setLoading(false);
-    }
-  }, [active]);
+  const session = React.useMemo(() => new ModelRoutingSession({
+    getRouting: getUserModelRouting, getToken: getUserApiToken,
+    replaceRouting: replaceUserModelRouting, resetToken: resetUserApiToken,
+  }), [active, viewerKey]);
+  const state = React.useSyncExternalStore(session.subscribe, session.getSnapshot, session.getSnapshot);
 
   React.useEffect(() => {
-    if (!active) {
-      autoLoadStartedRef.current = false;
-      setProfile(null);
-      setRoutes([]);
-      setRawToken("");
-      setToken(null);
-      setError("");
-      return;
-    }
-    if (!autoLoadStartedRef.current) {
-      autoLoadStartedRef.current = true;
-      void load();
-    }
-  }, [active, load]);
-
-  const dirty = React.useMemo(() => {
-    if (!profile) return false;
-    return JSON.stringify(canonicalModelRoutes(routes)) !== JSON.stringify(canonicalModelRoutes(profile.routes));
-  }, [profile, routes]);
+    if (!active) return;
+    session.start();
+    void session.load();
+    const refresh = () => {
+      if (document.visibilityState === "visible") void session.refresh();
+    };
+    const timer = window.setInterval(refresh, 15_000);
+    document.addEventListener("visibilitychange", refresh);
+    window.addEventListener("focus", refresh);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", refresh);
+      window.removeEventListener("focus", refresh);
+      session.stop();
+    };
+  }, [active, session]);
 
   const addExactRoute = React.useCallback((appType: ModelRoutingApp, shareId?: string) => {
-    const shares = profile?.eligibleShares || [];
-    const targetShareId = shareId
-      || firstShareForProtocol(shares, appType)?.shareId
-      || "";
-    if (shareId && !shares.some((share) => share.shareId === shareId && share.apps.includes(appType))) {
-      return;
-    }
-    setRoutes((current) => current.length >= MAX_USER_MODEL_ROUTES
-      ? current
-      : [...current, newDraftModelRoute(appType, "", targetShareId)]);
-    setError("");
-  }, [profile]);
-
+    const shares = session.getSnapshot().profile?.eligibleShares || [];
+    if (shareId && !shares.some(share => share.shareId === shareId && share.apps.includes(appType))) return;
+    session.edit(current => current.length >= MAX_USER_MODEL_ROUTES ? current : [
+      ...current, newDraftModelRoute(appType, "", shareId || firstShareForProtocol(shares, appType)?.shareId || ""),
+    ]);
+  }, [session]);
   const addRouteForShare = React.useCallback((shareId: string) => {
-    const share = profile?.eligibleShares.find((candidate) => candidate.shareId === shareId);
+    const share = session.getSnapshot().profile?.eligibleShares.find(item => item.shareId === shareId);
     if (!share) return;
-    const appType = preferredModelRoutingApp(share);
-    addExactRoute(appType, shareId);
-    return appType;
-  }, [addExactRoute, profile]);
-
-  const setPassthroughShare = React.useCallback((appType: ModelRoutingApp, shareId: string) => {
-    setRoutes((current) => {
-      const without = current.filter((route) =>
-        !(route.appType === appType && isWildcardModel(route.requestedModel)),
-      );
-      if (!shareId) return without;
-      const existing = current.find((route) =>
-        route.appType === appType && isWildcardModel(route.requestedModel),
-      );
-      if (without.length >= MAX_USER_MODEL_ROUTES && !existing) return current;
-      return [
-        ...without,
-        existing
-          ? { ...existing, targetShareId: shareId }
-          : newDraftModelRoute(appType, WILDCARD_MODEL, shareId),
-      ];
-    });
-    setError("");
-  }, []);
-
+    const app = preferredModelRoutingApp(share);
+    addExactRoute(app, shareId);
+    return app;
+  }, [addExactRoute, session]);
+  const setPassthroughTargets = React.useCallback((app: ModelRoutingApp, ids: string[]) => {
+    session.edit(current => replacePassthroughTargets(current, app, ids));
+  }, [session]);
   const updateRoute = React.useCallback((clientId: string, patch: Partial<UserModelRouteInput>) => {
-    setRoutes((current) => patchDraftModelRoute(
-      current,
-      clientId,
-      patch,
-      profile?.eligibleShares || [],
-    ));
-    setError("");
-  }, [profile]);
-
+    session.edit(current => patchDraftModelRoute(current, clientId, patch, session.getSnapshot().profile?.eligibleShares || []));
+  }, [session]);
   const removeRoute = React.useCallback((clientId: string) => {
-    setRoutes((current) => current.filter((route) => route.clientId !== clientId));
-    setError("");
-  }, []);
-
+    session.edit(current => current.filter(route => route.clientId !== clientId));
+  }, [session]);
   const addCandidate = React.useCallback((clientId: string, shareId: string) => {
-    setRoutes((current) =>
-      current.map((route) => {
-        if (route.clientId !== clientId) return route;
-        const candidates = route.candidates || [];
-        if (candidates.length >= 5) return route;
-        if (shareId === route.targetShareId || candidates.includes(shareId)) return route;
-        return { ...route, candidates: [...candidates, shareId] };
-      }),
-    );
-    setError("");
-  }, []);
-
+    session.edit(current => current.map(route => {
+      if (route.clientId !== clientId) return route;
+      const candidates = route.candidates || [];
+      if (candidates.length >= MAX_MODEL_ROUTE_CANDIDATES || modelRouteTargets(route).includes(shareId)
+        || !session.getSnapshot().profile?.eligibleShares.some(share => share.shareId === shareId && share.apps.includes(route.appType))) return route;
+      return { ...route, candidates: [...candidates, shareId] };
+    }));
+  }, [session]);
   const removeCandidate = React.useCallback((clientId: string, index: number) => {
-    setRoutes((current) =>
-      current.map((route) => {
-        if (route.clientId !== clientId) return route;
-        const candidates = (route.candidates || []).filter((_, i) => i !== index);
-        return { ...route, candidates };
-      }),
-    );
-    setError("");
-  }, []);
+    session.edit(current => current.map(route => route.clientId !== clientId ? route
+      : { ...route, candidates: (route.candidates || []).filter((_, i) => i !== index) }));
+  }, [session]);
+  const moveCandidate = React.useCallback((clientId: string, from: number, to: number) => {
+    session.edit(current => current.map(route => route.clientId !== clientId ? route
+      : { ...route, candidates: moveModelRouteTarget(route.candidates || [], from, to) }));
+  }, [session]);
 
-  const moveCandidate = React.useCallback(
-    (clientId: string, fromIndex: number, toIndex: number) => {
-      setRoutes((current) =>
-        current.map((route) => {
-          if (route.clientId !== clientId) return route;
-          const candidates = [...(route.candidates || [])];
-          if (
-            fromIndex < 0 ||
-            fromIndex >= candidates.length ||
-            toIndex < 0 ||
-            toIndex >= candidates.length ||
-            fromIndex === toIndex
-          ) {
-            return route;
-          }
-          const [moved] = candidates.splice(fromIndex, 1);
-          candidates.splice(toIndex, 0, moved);
-          return { ...route, candidates };
-        }),
-      );
-      setError("");
-    },
-    [],
-  );
-
-  const save = React.useCallback(async () => {
-    if (!profile || busy) return;
-    const validation = validateModelRoutes(routes);
-    if (validation) {
-      setError(t(
-        validation === "duplicate"
-          ? "modelHub.validationDuplicate"
-          : validation === "too_many"
-            ? "modelHub.validationTooMany"
-            : validation === "pattern"
-              ? "modelHub.validationPattern"
-              : "modelHub.validationRequired",
-      ));
-      return;
-    }
-    const normalized = canonicalModelRoutes(routes);
-    setBusy(true);
-    setError("");
-    try {
-      const updated = await replaceUserModelRouting({
-        expectedRevision: profile.revision,
-        routes: normalized,
-      });
-      setProfile(updated);
-      setRoutes(toDraftRoutes(updated));
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(false);
-    }
-  }, [busy, profile, routes, t]);
-
-  const resetToken = React.useCallback(async () => {
-    if (busy) return false;
-    setBusy(true);
-    setError("");
-    try {
-      const updated = await resetUserApiToken();
-      setToken(updated.token);
-      setRawToken(updated.apiToken);
-      setShowToken(true);
-      return true;
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-      return false;
-    } finally {
-      setBusy(false);
-    }
-  }, [busy]);
-
+  const validationKeys: Record<NonNullable<typeof state.validation>, MessageKey> = {
+    required: "modelHub.validationRequired", duplicate: "modelHub.validationDuplicate",
+    too_many: "modelHub.validationTooMany", pattern: "modelHub.validationPattern",
+    too_many_candidates: "modelHub.validationTooManyCandidates",
+    duplicate_candidate: "modelHub.validationDuplicateCandidate",
+    target_unavailable: "modelHub.targetUnavailable",
+  };
   return {
-    profile,
-    routes,
-    loading,
-    busy,
-    error,
-    dirty,
-    rawToken,
-    token,
-    showToken,
-    setShowToken,
-    load,
-    save,
-    resetToken,
-    addRouteForShare,
-    addExactRoute,
-    setPassthroughShare,
-    updateRoute,
-    removeRoute,
-    addCandidate,
-    removeCandidate,
-    moveCandidate,
+    ...state,
+    error: state.error || (state.validation ? t(validationKeys[state.validation]) : ""),
+    dirty: routingDraftIsDirty(state),
+    setShowToken: session.setShowToken,
+    load: async () => { await session.load(); },
+    discardChanges: () => session.load(true),
+    refresh: session.refresh,
+    save: session.save,
+    resetToken: session.resetToken,
+    addExactRoute, addRouteForShare, setPassthroughTargets, updateRoute, removeRoute,
+    addCandidate, removeCandidate, moveCandidate,
   };
 }
 
 function shareSelectOptions(
   shares: UserModelRoutingShare[],
-  currentId: string,
+  selectedIds: string[],
+  app: ModelRoutingApp,
   locale: ReturnType<typeof useLocaleText>["locale"],
   t: ReturnType<typeof useLocaleText>["t"],
-  includeUnset?: { value: string; label: string },
 ) {
-  const eligible = shares.map((share) => {
-    const label = share.subdomain || share.shareName;
-    const lines = modelRoutingShareAccountLines(
-      share,
-      locale,
-      t("dashboard.modelPolicyPassthrough"),
-      t("dashboard.providerUnavailable"),
-    );
-    const rows = [lines.primaryLine, lines.identityLine, lines.modelsLine];
-    return {
-      value: share.shareId,
-      label,
-      description: rows.join(" "),
-      content: (
-        <span className="grid min-w-0 gap-0.5">
-          <span className="inline-flex min-w-0 items-center gap-1.5">
-            <MarketProviderLogos source={share} size={16} />
-            {label ? (
-              <strong className="min-w-0 truncate font-mono text-xs font-semibold text-slate-800" title={label}>
-                {label}
-              </strong>
-            ) : null}
-            <MarketShareApps apps={share.apps} size={14} />
-          </span>
-          {rows.map((row, index) => (
-            <span key={index} className="min-w-0 truncate text-[11px] font-normal text-slate-400" title={row}>
-              {row}
-            </span>
-          ))}
-        </span>
-      ),
-    };
-  });
-  const options = includeUnset
-    ? [{ value: includeUnset.value, label: includeUnset.label }, ...eligible]
-    : eligible;
-  if (currentId && !options.some((option) => option.value === currentId)) {
-    options.splice(includeUnset ? 1 : 0, 0, {
-      value: currentId,
-      label: currentId,
-      content: (
-        <span className="inline-flex min-w-0 items-center gap-1.5 text-amber-800">
-          <span className="min-w-0 truncate font-mono text-xs">{currentId}</span>
-          <span className="shrink-0 text-[11px]">{t("modelHub.targetUnavailable")}</span>
-        </span>
-      ),
+  const options = shares.map(share => ({
+    value: share.shareId,
+    label: share.subdomain || share.shareName,
+    description: share.appCapabilities?.find(cap => cap.app === app)?.providerName,
+    content: <RoutingShareSummary share={share} shareId={share.shareId} app={app} locale={locale} t={t} />,
+  }));
+  for (const id of selectedIds) {
+    if (id && !options.some(option => option.value === id)) options.push({
+      value: id, label: id, description: t("modelHub.targetUnavailable"),
+      content: <RoutingShareSummary shareId={id} app={app} locale={locale} t={t} />,
     });
   }
   return options;
@@ -439,13 +258,14 @@ export function ModelHubPanel({
   const [copied, setCopied] = React.useState<"endpoint" | "token" | "curl" | "">("");
   const [resetConfirmOpen, setResetConfirmOpen] = React.useState(false);
   const [leaveConfirmOpen, setLeaveConfirmOpen] = React.useState(false);
+  const [reloadConfirmOpen, setReloadConfirmOpen] = React.useState(false);
   const [persistedExpanded, setPersistedExpanded, expandedHydrated] = usePersistentState<boolean>(
     "cc_switch_router_model_hub_expanded_v1",
     false,
   );
-  const [persistedProtocol, setPersistedProtocol, protocolHydrated] = usePersistentState<ModelRoutingProtocol>(
+  const [persistedProtocol, setPersistedProtocol, protocolHydrated] = usePersistentState<ModelRoutingProtocol | null>(
     "cc_switch_router_model_hub_protocol_v1",
-    "codex",
+    null,
   );
   const [expanded, setExpandedState] = React.useState(controller.dirty || forceExpanded);
   const [activeProtocol, setActiveProtocolState] = React.useState<ModelRoutingProtocol>("codex");
@@ -457,6 +277,7 @@ export function ModelHubPanel({
   const [testState, setTestState] = React.useState<"idle" | "running" | "done" | "error">("idle");
   const [testResult, setTestResult] = React.useState<UserModelRoutingTestResponse | null>(null);
   const [testError, setTestError] = React.useState("");
+  const testRequestRef = React.useRef(0);
   const protocolInitializedRef = React.useRef(false);
   const lastFocusProtocolRef = React.useRef<ModelRoutingProtocol | null>(null);
 
@@ -487,13 +308,13 @@ export function ModelHubPanel({
   React.useEffect(() => {
     if (!expandedHydrated || expandedHydratedRef.current) return;
     expandedHydratedRef.current = true;
-    if (persistedExpanded) setExpandedState(true);
+    if (persistedExpanded === true) setExpandedState(true);
   }, [expandedHydrated, persistedExpanded]);
 
   // Restore persisted protocol before the default-protocol effect runs.
   React.useEffect(() => {
     if (!protocolHydrated || protocolInitializedRef.current) return;
-    setActiveProtocolState(persistedProtocol);
+    if (persistedProtocol && MODEL_ROUTING_PROTOCOLS.includes(persistedProtocol)) setActiveProtocolState(persistedProtocol);
   }, [protocolHydrated, persistedProtocol]);
 
   const profile = controller.profile;
@@ -533,7 +354,8 @@ export function ModelHubPanel({
     if (!profile || protocolInitializedRef.current || !protocolHydrated) return;
     // No one-shot override: honor the persisted tab if the user picked one
     // before, otherwise fall back to the computed default.
-    setActiveProtocolState(persistedProtocol ?? defaultModelRoutingProtocol(controller.routes, profile.eligibleShares));
+    setActiveProtocolState(persistedProtocol && MODEL_ROUTING_PROTOCOLS.includes(persistedProtocol)
+      ? persistedProtocol : defaultModelRoutingProtocol(controller.routes, profile.eligibleShares));
     protocolInitializedRef.current = true;
   }, [controller.routes, focusProtocol, profile, protocolHydrated, persistedProtocol]);
 
@@ -554,10 +376,13 @@ export function ModelHubPanel({
   }, [controller.routes, profile]);
 
   React.useEffect(() => {
+    testRequestRef.current++;
     setTestState("idle");
     setTestResult(null);
     setTestError("");
   }, [activeProtocol, profile?.revision]);
+
+  React.useEffect(() => () => { testRequestRef.current++; }, []);
 
   const copy = React.useCallback(async (kind: "endpoint" | "token" | "curl", value: string) => {
     if (!value) return;
@@ -574,23 +399,28 @@ export function ModelHubPanel({
   const runTest = React.useCallback(async () => {
     if (testState === "running") return;
     const model = testModel.trim();
-    if (controller.dirty || !savedSlot || protocolSlotMode(savedSlot) === "empty") return;
+    if (controller.dirty || controller.conflict || controller.loading || controller.busy
+      || !savedSlot || protocolSlotMode(savedSlot) === "empty") return;
     if (!model || isWildcardModel(model)) return;
     setTestState("running");
     setTestResult(null);
     setTestError("");
+    const request = ++testRequestRef.current;
     try {
       const response = await testUserModelRouting({
         appType: activeProtocol,
         requestedModel: model,
       });
+      if (request !== testRequestRef.current) return;
       setTestResult(response);
       setTestState(response.success ? "done" : "error");
+      void controller.refresh();
     } catch (err) {
+      if (request !== testRequestRef.current) return;
       setTestError(err instanceof Error ? err.message : String(err));
       setTestState("error");
     }
-  }, [activeProtocol, controller.dirty, savedSlot, testModel, testState]);
+  }, [activeProtocol, controller, savedSlot, testModel, testState]);
 
   if (controller.loading && !profile) {
     return (
@@ -609,16 +439,12 @@ export function ModelHubPanel({
   const mode = activeSlot ? protocolSlotMode(activeSlot) : "empty";
   const shares = sharesForProtocol(profile?.eligibleShares || [], activeProtocol);
   const attention = protocolHasAttention(controller.routes, profile?.eligibleShares || [], activeProtocol);
-  const passthroughOptions = shareSelectOptions(
-    shares,
-    activeSlot?.passthrough?.targetShareId || "",
-    locale,
-    t,
-    { value: PASSTHROUGH_UNSET, label: t("modelHub.passthroughUnset") },
-  );
   const savedMode = savedSlot ? protocolSlotMode(savedSlot) : "empty";
-  const canTest = !controller.dirty && savedMode !== "empty" && !!testModel.trim() && !isWildcardModel(testModel);
-  const testDisabledReason = controller.dirty
+  const canTest = !controller.dirty && !controller.conflict && !controller.loading && !controller.busy
+    && savedMode !== "empty" && !!testModel.trim() && !isWildcardModel(testModel);
+  const testDisabledReason = controller.conflict
+    ? t("modelHub.remoteChanged")
+    : controller.dirty
     ? t("modelHub.test.saveFirst")
     : savedMode === "empty"
       ? t("modelHub.test.empty")
@@ -664,7 +490,7 @@ export function ModelHubPanel({
             <ChevronDown className={cn("h-4 w-4 transition-transform", expanded && "rotate-180")} />
             {expanded ? t("modelHub.collapseRoutes") : t("modelHub.expandRoutes")}
           </Button>
-          <Button variant="primary" size="sm" isDisabled={!controller.dirty || controller.busy} onClick={() => void controller.save()}>
+          <Button variant="primary" size="sm" isDisabled={!controller.dirty || controller.busy || controller.loading || controller.conflict} onClick={() => void controller.save()}>
             {controller.busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
             {t("common.save")}
           </Button>
@@ -691,7 +517,7 @@ export function ModelHubPanel({
             <button type="button" disabled={!controller.rawToken} className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-white hover:text-foreground disabled:opacity-40" title={t("common.copy")} aria-label={t("common.copy")} onClick={() => void copy("token", controller.rawToken)}>
               <Copy className="h-3.5 w-3.5" />
             </button>
-            <button type="button" disabled={controller.busy} className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-rose-600 hover:bg-white disabled:opacity-40" title={t("account.apiKeys.reset")} aria-label={t("account.apiKeys.reset")} onClick={() => setResetConfirmOpen(true)}>
+            <button type="button" disabled={controller.busy || controller.loading || !profile} className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-rose-600 hover:bg-white disabled:opacity-40" title={t("account.apiKeys.reset")} aria-label={t("account.apiKeys.reset")} onClick={() => setResetConfirmOpen(true)}>
               <RotateCcw className="h-3.5 w-3.5" />
             </button>
           </div>
@@ -703,6 +529,14 @@ export function ModelHubPanel({
           {controller.error}
         </div>
       ) : null}
+
+      {controller.conflict ? (
+        <div role="alert" className="flex flex-wrap items-center gap-2 rounded-md border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800">
+          <span>{t("modelHub.remoteChanged")}</span>
+          <Button size="sm" variant="outline" isDisabled={controller.loading || controller.busy} onClick={() => setReloadConfirmOpen(true)}>{t("common.reload")}</Button>
+        </div>
+      ) : null}
+      {controller.refreshError ? <p role="status" className="text-xs text-muted-foreground">{t("modelHub.refreshFailed")}</p> : null}
 
       {expanded ? (
         <div className="grid min-w-0 gap-3">
@@ -737,7 +571,7 @@ export function ModelHubPanel({
             })}
           />
 
-          <div className="grid min-w-0 gap-3 lg:grid-cols-[minmax(0,1.15fr)_minmax(280px,0.85fr)]">
+          <div className="grid min-w-0 gap-3">
             <section className={cn(
               "grid min-w-0 content-start gap-3 rounded-lg border bg-slate-50/60 p-3",
               attention ? "border-amber-200" : "border-border",
@@ -756,41 +590,28 @@ export function ModelHubPanel({
                 <p className="text-xs text-muted-foreground">{t("modelHub.emptyProtocol")}</p>
               ) : null}
               <p className="text-[11px] leading-4 text-slate-500">{t("modelHub.priorityHint")}</p>
-              <label className="grid min-w-0 gap-1.5 text-xs text-muted-foreground">
-                {t("modelHub.passthrough")}
-                <CompactSelect
-                  value={activeSlot?.passthrough?.targetShareId || PASSTHROUGH_UNSET}
-                  options={passthroughOptions}
-                  onChange={(value) => controller.setPassthroughShare(activeProtocol, value === PASSTHROUGH_UNSET ? "" : value)}
-                  ariaLabel={t("modelHub.passthrough")}
-                  disabled={controller.busy}
-                  className="w-full"
-                  triggerClassName="min-h-11 w-full py-1.5"
+              <div className="grid min-w-0 gap-3">
+                <h4 className="text-xs font-medium text-muted-foreground">{t("modelHub.passthrough")}</h4>
+                <SharePoolPicker
+                  key={activeProtocol}
+                  routeKey={activeProtocol}
+                  app={activeProtocol}
+                  shares={shares}
+                  selected={modelRouteTargets(activeSlot?.passthrough)}
+                  disabled={controller.busy || controller.loading || !profile}
+                  addBlockedReason={!activeSlot?.passthrough && controller.routes.length >= MAX_USER_MODEL_ROUTES ? t("modelHub.validationTooMany") : undefined}
+                  onChange={ids => controller.setPassthroughTargets(activeProtocol, ids)}
+                  locale={locale}
+                  t={t}
                 />
-                {activeSlot?.passthrough ? (
-                  <>
-                    <span>{t(activeSlot.exact.length ? "modelHub.passthroughHint.mixed" : "modelHub.passthroughHint.none")}</span>
-                    <CandidateList
-                      routeClientId={activeSlot.passthrough.clientId}
-                      primaryShareId={activeSlot.passthrough.targetShareId}
-                      candidates={activeSlot.passthrough.candidates || []}
-                      shareOptions={passthroughOptions.filter((option) => option.value !== PASSTHROUGH_UNSET)}
-                      disabled={controller.busy}
-                      t={t}
-                      onAdd={(shareId) => controller.addCandidate(activeSlot.passthrough!.clientId, shareId)}
-                      onRemove={(index) => controller.removeCandidate(activeSlot.passthrough!.clientId, index)}
-                      onMove={(from, to) => controller.moveCandidate(activeSlot.passthrough!.clientId, from, to)}
-                    />
-                  </>
-                ) : null}
-              </label>
+              </div>
               <div className="grid min-w-0 gap-2">
                 <div className="flex items-center justify-between gap-2">
                   <span className="text-xs font-medium text-slate-600">{t("modelHub.exactModels")}</span>
                   <Button
                     size="sm"
                     variant="outline"
-                    isDisabled={controller.busy || controller.routes.length >= MAX_USER_MODEL_ROUTES}
+                    isDisabled={controller.busy || controller.loading || !profile || controller.routes.length >= MAX_USER_MODEL_ROUTES}
                     onClick={() => controller.addExactRoute(activeProtocol)}
                   >
                     <Plus className="h-3.5 w-3.5" />
@@ -798,13 +619,13 @@ export function ModelHubPanel({
                   </Button>
                 </div>
                 {activeSlot?.exact.length ? activeSlot.exact.map((route) => {
-                  const options = shareSelectOptions(shares, route.targetShareId, locale, t);
+                  const options = shareSelectOptions(shares, modelRouteTargets(route), activeProtocol, locale, t);
                   return (
-                    <div key={route.clientId} className="grid min-w-0 items-center gap-2 sm:grid-cols-[minmax(140px,1fr)_minmax(160px,1.3fr)_32px]">
+                    <div key={route.clientId} className="grid min-w-0 items-center gap-2 lg:grid-cols-[minmax(140px,1fr)_minmax(0,22rem)_44px]">
                       <input
                         value={route.requestedModel}
                         maxLength={200}
-                        disabled={controller.busy}
+                        disabled={controller.busy || controller.loading}
                         onChange={(event) => controller.updateRoute(route.clientId, { requestedModel: event.target.value })}
                         className="h-9 min-w-0 rounded-md border border-border bg-white px-3 text-xs outline-none focus:border-primary/60 focus:ring-2 focus:ring-inset focus:ring-primary/10"
                         aria-label={t("modelHub.model")}
@@ -815,13 +636,13 @@ export function ModelHubPanel({
                         options={options}
                         onChange={(value) => controller.updateRoute(route.clientId, { targetShareId: value })}
                         ariaLabel={t("modelHub.targetShare")}
-                        disabled={controller.busy || !options.length}
+                        disabled={controller.busy || controller.loading || !options.length}
                         className="w-full"
                         triggerClassName="min-h-11 w-full py-1.5"
                       />
                       <button
                         type="button"
-                        disabled={controller.busy}
+                        disabled={controller.busy || controller.loading}
                         className="inline-flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground hover:bg-rose-50 hover:text-rose-700 disabled:opacity-40"
                         title={t("modelHub.removeRoute")}
                         aria-label={t("modelHub.removeRoute")}
@@ -829,13 +650,13 @@ export function ModelHubPanel({
                       >
                         <Trash2 className="h-4 w-4" />
                       </button>
-                      <div className="sm:col-span-3">
+                      <div className="lg:col-span-3">
                         <CandidateList
                           routeClientId={route.clientId}
                           primaryShareId={route.targetShareId}
                           candidates={route.candidates || []}
                           shareOptions={options}
-                          disabled={controller.busy}
+                          disabled={controller.busy || controller.loading}
                           t={t}
                           onAdd={(shareId) => controller.addCandidate(route.clientId, shareId)}
                           onRemove={(index) => controller.removeCandidate(route.clientId, index)}
@@ -981,12 +802,20 @@ export function ModelHubPanel({
         cancelLabel={t("common.cancel")}
         tone="warning"
         onConfirm={() => {
-          void controller.load();
-          setExpanded(false);
-          setLeaveConfirmOpen(false);
+          void controller.discardChanges().then(loaded => {
+            if (!loaded) return;
+            setExpanded(false);
+            setLeaveConfirmOpen(false);
+          });
         }}
+        busy={controller.loading || controller.busy}
         onOpenChange={setLeaveConfirmOpen}
       />
+      <ConfirmAlertDialog open={reloadConfirmOpen} title={t("modelHub.unsavedTitle")}
+        description={t("modelHub.reloadDiscardDescription")} confirmLabel={t("common.reload")} cancelLabel={t("common.cancel")}
+        tone="warning" busy={controller.loading || controller.busy}
+        onConfirm={() => void controller.discardChanges().then(loaded => loaded && setReloadConfirmOpen(false))}
+        onOpenChange={setReloadConfirmOpen} />
     </section>
   );
 }

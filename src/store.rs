@@ -7894,42 +7894,53 @@ impl AppStore {
             let unchanged_target = existing_by_key
                 .get(&(route.app_type.clone(), route.requested_model.clone()))
                 .is_some_and(|existing| existing.target_share_id == route.target_share_id);
-            if unchanged_target {
-                continue;
+            if !unchanged_target {
+                match inspect_model_route_target(
+                    &tx,
+                    &email,
+                    &route.target_share_id,
+                    &route.app_type,
+                )? {
+                    ModelRouteTargetAccess::Eligible { .. } => {}
+                    ModelRouteTargetAccess::Missing => {
+                        return Err(model_routing_error(
+                            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                            "user_model_route_target_unavailable",
+                            "target Share does not exist",
+                            serde_json::json!({ "targetShareId": route.target_share_id }),
+                        ));
+                    }
+                    ModelRouteTargetAccess::AppUnavailable => {
+                        return Err(model_routing_error(
+                            axum::http::StatusCode::CONFLICT,
+                            "user_model_route_app_unavailable",
+                            "target Share does not support this app",
+                            serde_json::json!({
+                                "targetShareId": route.target_share_id,
+                                "appType": route.app_type,
+                            }),
+                        ));
+                    }
+                    ModelRouteTargetAccess::Unauthorized => {
+                        return Err(model_routing_error(
+                            axum::http::StatusCode::FORBIDDEN,
+                            "user_model_route_unauthorized",
+                            "target Share is not authorized for this user",
+                            serde_json::json!({ "targetShareId": route.target_share_id }),
+                        ));
+                    }
+                }
             }
-            match inspect_model_route_target(&tx, &email, &route.target_share_id, &route.app_type)?
-            {
-                ModelRouteTargetAccess::Eligible { .. } => {}
-                ModelRouteTargetAccess::Missing => {
-                    return Err(model_routing_error(
-                        axum::http::StatusCode::UNPROCESSABLE_ENTITY,
-                        "user_model_route_target_unavailable",
-                        "target Share does not exist",
-                        serde_json::json!({ "targetShareId": route.target_share_id }),
-                    ));
-                }
-                ModelRouteTargetAccess::AppUnavailable => {
-                    return Err(model_routing_error(
-                        axum::http::StatusCode::CONFLICT,
-                        "user_model_route_app_unavailable",
-                        "target Share does not support this app",
-                        serde_json::json!({
-                            "targetShareId": route.target_share_id,
-                            "appType": route.app_type,
-                        }),
-                    ));
-                }
-                ModelRouteTargetAccess::Unauthorized => {
-                    return Err(model_routing_error(
-                        axum::http::StatusCode::FORBIDDEN,
-                        "user_model_route_unauthorized",
-                        "target Share is not authorized for this user",
-                        serde_json::json!({ "targetShareId": route.target_share_id }),
-                    ));
-                }
-            }
-            // Failover candidates get the same live validation as the primary.
+            // Keeping the primary must not skip validation of newly added
+            // backups. Preserve old unavailable entries so unrelated routes
+            // can still be repaired; invocation always rechecks live access.
             for candidate in &route.candidates {
+                if existing_by_key
+                    .get(&(route.app_type.clone(), route.requested_model.clone()))
+                    .is_some_and(|existing| existing.candidates.contains(candidate))
+                {
+                    continue;
+                }
                 match inspect_model_route_target(&tx, &email, candidate, &route.app_type)? {
                     ModelRouteTargetAccess::Eligible { .. } => {}
                     ModelRouteTargetAccess::Missing => {
@@ -29093,8 +29104,8 @@ fn list_user_model_routes(
         })
         .map_err(|e| AppError::Internal(format!("query route candidates failed: {e}")))?;
     for row in rows {
-        let (route_id, target) = row
-            .map_err(|e| AppError::Internal(format!("read route candidates failed: {e}")))?;
+        let (route_id, target) =
+            row.map_err(|e| AppError::Internal(format!("read route candidates failed: {e}")))?;
         if let Some(index) = index_by_id.get(&route_id) {
             routes[*index].candidates.push(target);
         }
@@ -29211,6 +29222,10 @@ fn user_model_routing_share_capability(
                 .unwrap_or_default()
         });
     models.retain(|model| !model.actual_model.trim().is_empty());
+    let health_fingerprint = runtime
+        .and_then(|runtime| runtime.model_probe.as_ref())
+        .map(|probe| probe.health_fingerprint.clone())
+        .filter(|fingerprint| !fingerprint.is_empty());
     if provider_name.is_none()
         && provider_type.is_none()
         && kind.is_none()
@@ -29221,11 +29236,15 @@ fn user_model_routing_share_capability(
         && model_policy.is_none()
         && models.is_empty()
         && quota.is_none()
+        && health_fingerprint.is_none()
     {
         return None;
     }
     Some(UserModelRoutingShareCapability {
         app: app.to_string(),
+        health_fingerprint,
+        model_health_status: None,
+        live_model_health_status: None,
         provider_name,
         provider_type,
         kind,
@@ -29285,10 +29304,46 @@ fn load_user_model_routing_response(
         if apps.is_empty() {
             continue;
         }
-        let app_capabilities = apps
+        let mut app_capabilities: Vec<_> = apps
             .iter()
             .filter_map(|app| user_model_routing_share_capability(&share, app))
             .collect();
+        // Read-only projection of the same evidence used by Share cards. The
+        // current monitor observes one representative App: do not infer health
+        // for other enabled protocols or consult legacy mutable summaries.
+        let now = DateTime::from_timestamp_millis(now_ms)
+            .ok_or_else(|| AppError::Internal("invalid model routing clock".into()))?;
+        let canonical = model_health::current_status(
+            conn,
+            &share.share_id,
+            &share.support,
+            &share.app_runtimes,
+            &share.bindings,
+            now,
+        )?;
+        let live = model_health::live_status(
+            conn,
+            &share.share_id,
+            &share.support,
+            &share.app_runtimes,
+            &share.bindings,
+            now,
+            &canonical,
+        )?;
+        for capability in &mut app_capabilities {
+            let applies = |status: &crate::models::ShareModelHealthStatus| {
+                status.app_type.as_deref() == Some(capability.app.as_str())
+                    && capability
+                        .health_fingerprint
+                        .as_deref()
+                        .is_some_and(|fingerprint| {
+                            !fingerprint.is_empty()
+                                && status.health_fingerprint.as_deref() == Some(fingerprint)
+                        })
+            };
+            capability.model_health_status = applies(&canonical).then(|| canonical.clone());
+            capability.live_model_health_status = applies(&live).then(|| live.clone());
+        }
         eligible_shares.push(UserModelRoutingShareView {
             provider_identity: crate::provider_presentation::identity_for_share(&share),
             share_id: share.share_id,
@@ -32526,9 +32581,30 @@ pub(crate) mod tests {
     async fn failover_candidates_resolve_in_order_and_skip_ineligible() {
         let (store, config) = setup_store("user-model-routing-candidates").await;
         insert_installation(&store, "inst-candidates").await;
-        insert_share(&store, "inst-candidates", "share-cand-a", "cand-a", "active").await;
-        insert_share(&store, "inst-candidates", "share-cand-b", "cand-b", "active").await;
-        insert_share(&store, "inst-candidates", "share-cand-c", "cand-c", "active").await;
+        insert_share(
+            &store,
+            "inst-candidates",
+            "share-cand-a",
+            "cand-a",
+            "active",
+        )
+        .await;
+        insert_share(
+            &store,
+            "inst-candidates",
+            "share-cand-b",
+            "cand-b",
+            "active",
+        )
+        .await;
+        insert_share(
+            &store,
+            "inst-candidates",
+            "share-cand-c",
+            "cand-c",
+            "active",
+        )
+        .await;
         let active_subdomains = HashSet::from([
             "cand-a".to_string(),
             "cand-b".to_string(),
@@ -32641,6 +32717,143 @@ pub(crate) mod tests {
             .expect("wildcard hit after clear");
         assert!(resolution.candidates.is_empty());
 
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn failover_candidates_validate_new_backups_even_with_an_unchanged_primary() {
+        let (store, config) = setup_store("model-routing-backup-permissions").await;
+        insert_installation(&store, "candidate-installation").await;
+        for id in ["primary", "backup", "unauthorized", "wrong-app"] {
+            insert_share(&store, "candidate-installation", id, id, "active").await;
+        }
+        {
+            let conn = store.conn.lock().await;
+            conn.execute("UPDATE shares SET owner_email='another@example.test' WHERE share_id='unauthorized'", []).unwrap();
+            conn.execute(
+                "UPDATE shares SET enabled_codex=0 WHERE share_id='wrong-app'",
+                [],
+            )
+            .unwrap();
+        }
+        let route = UserModelRouteInput {
+            app_type: "codex".into(),
+            requested_model: "*".into(),
+            target_share_id: "primary".into(),
+            candidates: vec![],
+        };
+        store
+            .replace_user_model_routing(
+                &config,
+                "owner@example.com",
+                0,
+                vec![route.clone()],
+                &HashSet::new(),
+            )
+            .await
+            .unwrap();
+        for target in ["unauthorized", "wrong-app", "missing"] {
+            let changed = UserModelRouteInput {
+                candidates: vec![target.into()],
+                ..route.clone()
+            };
+            assert!(
+                store
+                    .replace_user_model_routing(
+                        &config,
+                        "owner@example.com",
+                        1,
+                        vec![changed],
+                        &HashSet::new()
+                    )
+                    .await
+                    .is_err(),
+                "new backup {target} must be authorized"
+            );
+            let current = store
+                .get_user_model_routing(&config, "owner@example.com", &HashSet::new())
+                .await
+                .unwrap();
+            assert_eq!(current.revision, 1, "failed edits are atomic");
+            assert!(current.routes[0].candidates.is_empty());
+        }
+        let route = UserModelRouteInput {
+            candidates: vec!["backup".into()],
+            ..route
+        };
+        store
+            .replace_user_model_routing(
+                &config,
+                "owner@example.com",
+                1,
+                vec![route.clone()],
+                &HashSet::new(),
+            )
+            .await
+            .unwrap();
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET owner_email='another@example.test' WHERE share_id='backup'",
+                [],
+            )
+            .unwrap();
+        }
+        let other = UserModelRouteInput {
+            requested_model: "another-model".into(),
+            candidates: vec![],
+            ..route.clone()
+        };
+        let retained = store
+            .replace_user_model_routing(
+                &config,
+                "owner@example.com",
+                2,
+                vec![route.clone(), other],
+                &HashSet::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            retained.revision, 3,
+            "a saved stale backup must not block unrelated repairs"
+        );
+        assert!(
+            !retained
+                .eligible_shares
+                .iter()
+                .any(|share| share.share_id == "backup")
+        );
+        let user = store
+            .ensure_user_by_email("owner@example.com")
+            .await
+            .unwrap();
+        let resolution = store
+            .resolve_user_model_route(&user.id, "owner@example.com", "codex", "not-exact")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            resolution.candidates.is_empty(),
+            "retained unavailable backups are never invoked"
+        );
+        let promoted = UserModelRouteInput {
+            target_share_id: "backup".into(),
+            candidates: vec![],
+            ..route
+        };
+        assert!(
+            store
+                .replace_user_model_routing(
+                    &config,
+                    "owner@example.com",
+                    3,
+                    vec![promoted],
+                    &HashSet::new()
+                )
+                .await
+                .is_err()
+        );
         let _ = std::fs::remove_file(&config.database.path);
     }
 

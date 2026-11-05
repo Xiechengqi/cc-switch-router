@@ -669,6 +669,7 @@ export function ClientBoard({
   );
   const modelRouting = useModelRoutingController(
     hasViewerIdentity && statusFilter === "mine",
+    sessionEmail,
   );
   const [sortOrder, setSortOrder] = usePersistentState("cc_switch_router_client_sort_v1", "tokens");
   const [expandedClientIds, setExpandedClientIds] = usePersistentState<string[] | null>(
@@ -1069,8 +1070,10 @@ export function ClientBoard({
   const modelRoutesByShareId = React.useMemo(() => {
     const byShare = new Map<string, DraftModelRoute[]>();
     for (const route of modelRouting.routes) {
-      const current = byShare.get(route.targetShareId) || [];
-      byShare.set(route.targetShareId, [...current, route]);
+      for (const shareId of new Set([route.targetShareId, ...(route.candidates || [])])) {
+        const current = byShare.get(shareId) || [];
+        byShare.set(shareId, [...current, route]);
+      }
     }
     return byShare;
   }, [modelRouting.routes]);
@@ -1191,7 +1194,7 @@ export function ClientBoard({
       ) : null}
 
       {statusFilter === "mine" ? (
-        <ModelHubPanel controller={modelRouting} forceExpanded={hubForceExpanded} focusProtocol={hubFocusProtocol} />
+        <ModelHubPanel key={sessionEmail} controller={modelRouting} forceExpanded={hubForceExpanded} focusProtocol={hubFocusProtocol} />
       ) : null}
 
       <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-4">

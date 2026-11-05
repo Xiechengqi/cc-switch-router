@@ -386,9 +386,10 @@ export const ShareCard = React.memo(function ShareCard({
                   <span
                     key={route.clientId}
                     className="max-w-full truncate rounded-md border border-primary/15 bg-primary/5 px-1.5 py-0.5 text-[9px] font-medium text-primary"
-                    title={`${SHARE_APP_LABELS[route.appType]} · ${route.requestedModel || t("modelHub.modelPending")}`}
+                    title={`${SHARE_APP_LABELS[route.appType]} · ${route.requestedModel || t("modelHub.modelPending")} · ${route.targetShareId === share.shareId ? t("modelHub.candidatePrimary") : t("modelHub.candidateOrder", { order: (route.candidates || []).indexOf(share.shareId) + 2 })}`}
                   >
                     {SHARE_APP_LABELS[route.appType]} · {route.requestedModel || t("modelHub.modelPending")}
+                    {" · "}{route.targetShareId === share.shareId ? t("modelHub.candidatePrimary") : t("modelHub.candidateOrder", { order: (route.candidates || []).indexOf(share.shareId) + 2 })}
                   </span>
                 )) : (
                   <span className="truncate text-[10px] text-muted-foreground">

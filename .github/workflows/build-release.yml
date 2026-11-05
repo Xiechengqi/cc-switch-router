@@ -74,6 +74,7 @@ jobs:
           npm run test:providers
           npm run test:share-model-probe
           npm run test:share-model-health-heatmap
+          npm run test:model-routing
           npm run test:share-settings
           npm run test:share-value-quota
 
@@ -164,6 +165,12 @@ jobs:
           bash scripts/ci/timed.sh 'Share rental contracts' cargo test --locked share_market::
           bash scripts/ci/timed.sh 'Client rental contracts' cargo test --locked client_market::tests
           bash scripts/ci/timed.sh 'Termination chat contracts' cargo test --locked client_termination_chat_
+
+      - name: Test user routing and ordered failover
+        run: |
+          bash scripts/ci/timed.sh 'Model routing' cargo test --locked model_rout
+          bash scripts/ci/timed.sh 'Candidate access' cargo test --locked failover_candidates
+          bash scripts/ci/timed.sh 'Route breakers' cargo test --locked route_breaker
 
       - name: Test password authentication and administrator CLI
         run: |

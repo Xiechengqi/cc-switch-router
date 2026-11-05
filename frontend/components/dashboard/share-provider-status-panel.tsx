@@ -33,13 +33,15 @@ export function ShareProviderStatusPanel({
   view,
   className,
   wrapPrimaryLine = false,
+  as: Tag = "div",
 }: {
   view: ShareProviderStatusPanelView;
   className?: string;
   wrapPrimaryLine?: boolean;
+  as?: "div" | "span";
 }) {
   return (
-    <div
+    <Tag
       className={cn(
         "grid min-h-[4.125rem] min-w-0 content-center gap-1 rounded-md border px-2 py-1.5 text-[11px]",
         view.toneClassName,
@@ -70,6 +72,6 @@ export function ShareProviderStatusPanel({
         {view.modelsLine}
       </span>
       {view.healthLabel ? <span className="min-w-0 truncate text-[10px] font-medium" title={view.panelTitle}>{view.healthLabel}</span> : null}
-    </div>
+    </Tag>
   );
 }

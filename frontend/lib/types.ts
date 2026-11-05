@@ -615,6 +615,9 @@ export type UserModelRoute = UserModelRouteInput & {
 
 export type UserModelRoutingShareCapability = {
   app: ModelRoutingApp | string;
+  healthFingerprint?: string;
+  modelHealthStatus?: ShareModelHealthStatus;
+  liveModelHealthStatus?: ShareModelHealthStatus;
   providerName?: string;
   providerType?: string;
   kind?: string;

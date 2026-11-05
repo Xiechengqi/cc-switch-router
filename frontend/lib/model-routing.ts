@@ -9,7 +9,8 @@ import type {
   UserModelRoutingShareCapability,
 } from "@/lib/types";
 import { shellQuote } from "@/lib/share-model-probe";
-import type { AppLocale } from "@/lib/i18n";
+import type { AppLocale, MessageKey } from "@/lib/i18n";
+import type { Announcements } from "@dnd-kit/core";
 import {
   isApiProviderRuntime,
   providerActualModelNames,
@@ -18,8 +19,12 @@ import {
   providerStatusIdentity,
 } from "@/components/dashboard/share-dashboard-utils";
 import { CORE_SHARE_APPS, SHARE_APP_LABELS } from "@/lib/share-app";
+import { modelHealthPresentation } from "@/lib/share-health";
+import type { ShareProviderStatusPanelView } from "@/components/dashboard/share-provider-status-panel";
 
 export const MAX_USER_MODEL_ROUTES = 100;
+export const MAX_MODEL_ROUTE_CANDIDATES = 5;
+export const MAX_MODEL_ROUTE_TARGETS = MAX_MODEL_ROUTE_CANDIDATES + 1;
 /**
  * Reserved `requestedModel` value meaning "every model for this app".
  *
@@ -39,6 +44,51 @@ export const CLIENT_LIST_TABS = [
 
 export type ClientListTab = (typeof CLIENT_LIST_TABS)[number];
 export type DraftModelRoute = UserModelRouteInput & { clientId: string };
+
+/** One ordered queue, including the primary. Never sort candidate IDs. */
+export function modelRouteTargets(route?: UserModelRouteInput | null): string[] {
+  return route ? [route.targetShareId, ...(route.candidates || [])].filter(Boolean) : [];
+}
+
+export function moveModelRouteTarget(ids: string[], from: number, to: number): string[] {
+  if (!Number.isInteger(from) || !Number.isInteger(to) || from < 0 || to < 0
+    || from >= ids.length || to >= ids.length || from === to) return ids;
+  const next = [...ids];
+  next.splice(to, 0, next.splice(from, 1)[0]);
+  return next;
+}
+
+export function modelRouteDragAnnouncements(
+  ids: string[], names: string[], firstOrder: number,
+  t: (key: MessageKey, params?: Record<string, string | number>) => string,
+): Announcements {
+  const name = (id: string | number) => names[ids.indexOf(String(id))] || "Share";
+  return {
+    onDragStart: ({ active }) => t("modelHub.dragStarted", { name: name(active.id) }),
+    onDragOver: ({ active, over }) => over ? t("modelHub.dragPosition", {
+      name: name(active.id), order: ids.indexOf(String(over.id)) + firstOrder,
+    }) : undefined,
+    onDragEnd: ({ active, over }) => over ? t("modelHub.moved", {
+      name: name(active.id), order: ids.indexOf(String(over.id)) + firstOrder,
+    }) : t("modelHub.dragCancelled"),
+    onDragCancel: () => t("modelHub.dragCancelled"),
+  };
+}
+
+export function replacePassthroughTargets(
+  routes: DraftModelRoute[], app: ModelRoutingApp, ids: string[],
+): DraftModelRoute[] {
+  if (ids.length > MAX_MODEL_ROUTE_TARGETS || ids.some(id => !id.trim())
+    || new Set(ids).size !== ids.length) return routes;
+  const existing = routes.find(route => route.appType === app && isWildcardModel(route.requestedModel));
+  if (!ids.length) return routes.filter(route => route !== existing);
+  if (!existing && routes.length >= MAX_USER_MODEL_ROUTES) return routes;
+  const next = {
+    ...(existing || newDraftModelRoute(app, WILDCARD_MODEL, ids[0])),
+    targetShareId: ids[0], candidates: ids.slice(1),
+  };
+  return existing ? routes.map(route => route === existing ? next : route) : [...routes, next];
+}
 export type ModelRouteValidationError =
   | "required"
   | "duplicate"
@@ -80,9 +130,23 @@ export function protocolHasAttention(
   return routes.some(
     (route) =>
       route.appType === appType &&
-      route.targetShareId &&
-      !eligibleIds.has(route.targetShareId),
+      modelRouteTargets(route).some(id => !eligibleIds.has(id)),
   );
+}
+
+/** Preserve saved stale entries for repair, but never introduce an unavailable
+ * target under a new protocol/model key or promote an unavailable backup. */
+export function hasNewUnavailableRouteTarget(
+  routes: UserModelRouteInput[], profile: UserModelRoutingResponse,
+): boolean {
+  const key = (route: UserModelRouteInput) => `${route.appType}\u0000${route.requestedModel}`;
+  const saved = new Map(canonicalModelRoutes(profile.routes).map(route => [key(route), route]));
+  return canonicalModelRoutes(routes).some(route => {
+    const previous = saved.get(key(route));
+    const eligible = new Set(sharesForProtocol(profile.eligibleShares, route.appType).map(share => share.shareId));
+    return (previous?.targetShareId !== route.targetShareId && !eligible.has(route.targetShareId))
+      || (route.candidates || []).some(id => !previous?.candidates?.includes(id) && !eligible.has(id));
+  });
 }
 
 /**
@@ -122,7 +186,9 @@ export function groupModelRoutesByProtocol(
   return MODEL_ROUTING_PROTOCOLS.map((appType) => {
     const forApp = routes.filter((route) => route.appType === appType);
     const passthrough = forApp.find((route) => isWildcardModel(route.requestedModel)) || null;
-    const exact = forApp.filter((route) => !isWildcardModel(route.requestedModel));
+    // A user can type a second `*` into an exact-model draft. Keep that invalid
+    // row visible for repair instead of hiding it behind the first queue.
+    const exact = forApp.filter((route) => route !== passthrough);
     return { appType, passthrough, exact };
   });
 }
@@ -164,8 +230,9 @@ export function modelRoutingShareAccountLines(
   locale: AppLocale,
   passthroughLabel: string,
   unavailableLabel: string,
+  appType?: ModelRoutingApp,
 ): ModelRoutingShareAccountLines {
-  const apps = CORE_SHARE_APPS.filter((app) => share.apps.includes(app));
+  const apps = CORE_SHARE_APPS.filter((app) => share.apps.includes(app) && (!appType || app === appType));
   const capabilities = apps.flatMap((app) => {
     const capability = share.appCapabilities?.find((item) => item.app === app);
     return capability ? [{ app, runtime: routingCapabilityRuntime(capability) }] : [];
@@ -182,6 +249,31 @@ export function modelRoutingShareAccountLines(
     primaryLine: apiProvider ? providerApiEndpoint(primary) : providerQuotaStatusLine(primary, locale),
     identityLine: apiProvider ? "-" : providerStatusIdentity(primary),
     modelsLine: models || providerActualModelNames(primary, passthroughLabel),
+  };
+}
+
+/** Routing is protocol-scoped; a representative App cannot lend its green
+ * status (or its account) to another protocol. Legacy responses stay unknown. */
+export function modelRoutingShareAccountView(
+  share: UserModelRoutingShare,
+  app: ModelRoutingApp,
+  locale: AppLocale,
+  labels: { passthrough: string; unavailable: string },
+  now = Date.now(),
+): ShareProviderStatusPanelView {
+  const capability = share.apps.includes(app)
+    ? share.appCapabilities?.find(item => item.app === app) : undefined;
+  const status = capability?.liveModelHealthStatus || capability?.modelHealthStatus;
+  const applies = status?.appType === app && !!capability?.healthFingerprint
+    && status.healthFingerprint === capability.healthFingerprint;
+  const health = modelHealthPresentation(applies ? status : undefined, locale, now);
+  const lines = modelRoutingShareAccountLines(share, locale, labels.passthrough, labels.unavailable, app);
+  return {
+    ...lines,
+    primaryMonospace: !!capability && isApiProviderRuntime(routingCapabilityRuntime(capability)),
+    toneClassName: health.className,
+    panelTitle: health.title,
+    healthLabel: [health.label, health.detailLabel !== health.label ? health.detailLabel : ""].filter(Boolean).join(" · "),
   };
 }
 
@@ -326,7 +418,7 @@ export function validateModelRoutes(
   // primary target, and within the per-route cap.
   for (const route of normalized) {
     const candidates = route.candidates || [];
-    if (candidates.length > 5) return "too_many_candidates";
+    if (candidates.length > MAX_MODEL_ROUTE_CANDIDATES) return "too_many_candidates";
     const seen = new Set([route.targetShareId]);
     for (const candidate of candidates) {
       if (seen.has(candidate)) return "duplicate_candidate";
@@ -353,6 +445,9 @@ export function patchDraftModelRoute(
   return routes.map((route) => {
     if (route.clientId !== clientId) return route;
     const next = { ...route, ...patch };
+    if (patch.targetShareId && patch.targetShareId !== route.targetShareId) {
+      next.candidates = (next.candidates || []).filter(id => id !== patch.targetShareId);
+    }
     if (patch.appType) {
       const currentShare = eligibleShares.find(
         (share) => share.shareId === next.targetShareId,
@@ -474,13 +569,11 @@ export function configuredEligibleRouteShareIds(
   profile: UserModelRoutingResponse | null,
 ): ReadonlySet<string> {
   if (!profile) return new Set<string>();
-  const eligible = new Set(
-    profile.eligibleShares.map((share) => share.shareId),
-  );
   return new Set(
     profile.routes
-      .map((route) => route.targetShareId)
-      .filter((shareId) => eligible.has(shareId)),
+      .flatMap((route) => modelRouteTargets(route).filter(id =>
+        profile.eligibleShares.some(share => share.shareId === id && share.apps.includes(route.appType)),
+      )),
   );
 }
 

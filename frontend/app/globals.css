@@ -5,6 +5,22 @@
 
 @custom-variant dark (&:is(.dark *));
 
+/* Hallmark · component: routing account · theme: existing Router system
+ * states: default / hover / focus / active / disabled / loading / error / success
+ * Fixed account geometry; status colors come from the shared health presenter.
+ */
+.model-route-account {
+  width: var(--router-route-account-width);
+  max-width: 100%;
+  min-width: 0;
+}
+.model-route-health {
+  grid-template-rows: repeat(4, 1rem);
+}
+@media (prefers-reduced-motion: reduce) {
+  .model-route-sortable { transition: none !important; }
+}
+
 @theme inline {
   --color-background: rgb(var(--router-background));
   --color-foreground: rgb(var(--router-foreground));

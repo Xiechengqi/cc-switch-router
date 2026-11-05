@@ -2655,20 +2655,26 @@ async fn user_model_proxy_handler_inner(
         resolution.target_share_id.clone(),
         resolution.subdomain.clone(),
     ))
-    .chain(
-        resolution
-            .candidates
-            .iter()
-            .map(|candidate| (candidate.target_share_id.clone(), candidate.subdomain.clone())),
-    )
+    .chain(resolution.candidates.iter().map(|candidate| {
+        (
+            candidate.target_share_id.clone(),
+            candidate.subdomain.clone(),
+        )
+    }))
     .collect();
     let max_attempts = candidates.len().min(4);
+    let mut attempts = 0;
     let mut last_response: Option<Response> = None;
 
-    for (attempt, (target_share_id, subdomain)) in
-        candidates.iter().take(max_attempts).enumerate()
-    {
-        let permit = state.route_breakers.acquire(&resolution.route_id, target_share_id);
+    // The budget counts actual forwards, not queue positions. Offline/open
+    // targets must not make the fifth/sixth configured candidate unreachable.
+    for (priority, (target_share_id, subdomain)) in candidates.iter().enumerate() {
+        if attempts >= max_attempts {
+            break;
+        }
+        let permit = state
+            .route_breakers
+            .acquire(&resolution.route_id, target_share_id);
         if matches!(permit, crate::route_breaker::BreakerPermit::Rejected) {
             debug!(
                 route_id = %resolution.route_id,
@@ -2694,7 +2700,7 @@ async fn user_model_proxy_handler_inner(
                 was_probe,
                 None,
             );
-            if attempt == 0 {
+            if priority == 0 {
                 debug!(
                     route_id = %resolution.route_id,
                     target_share_id = %target_share_id,
@@ -2704,7 +2710,7 @@ async fn user_model_proxy_handler_inner(
             continue;
         }
 
-        if attempt == 0 {
+        if attempts == 0 {
             debug!(
                 user_id = %principal.user_id,
                 app_type = %app_type,
@@ -2722,6 +2728,7 @@ async fn user_model_proxy_handler_inner(
             route_id: resolution.route_id.clone(),
             candidates: Vec::new(),
         };
+        attempts += 1;
         let response = forward_to_selected_share(
             state.clone(),
             peer,
@@ -2748,7 +2755,7 @@ async fn user_model_proxy_handler_inner(
                 | StatusCode::FORBIDDEN
         );
 
-        if failoverable && attempt + 1 < max_attempts {
+        if failoverable && attempts < max_attempts && priority + 1 < candidates.len() {
             state.route_breakers.record_failure(
                 &resolution.route_id,
                 target_share_id,
@@ -2759,7 +2766,7 @@ async fn user_model_proxy_handler_inner(
                 route_id = %resolution.route_id,
                 target_share_id = %target_share_id,
                 status = %status.as_u16(),
-                attempt = attempt + 1,
+                attempt = attempts,
                 "model route candidate failed, advancing"
             );
             state.metrics.record_model_route_failover();
@@ -2769,11 +2776,9 @@ async fn user_model_proxy_handler_inner(
 
         // Committed: success, non-failoverable error, or last candidate.
         if status.is_success() || status.is_redirection() {
-            state.route_breakers.record_success(
-                &resolution.route_id,
-                target_share_id,
-                was_probe,
-            );
+            state
+                .route_breakers
+                .record_success(&resolution.route_id, target_share_id, was_probe);
         } else {
             // A non-failoverable failure (4xx request fault) still counts
             // against the breaker so a persistently broken candidate opens.
@@ -7729,6 +7734,8 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
+
+    mod model_routing;
 
     fn signed_registration_request(
         signing_key: &ed25519_dalek::SigningKey,

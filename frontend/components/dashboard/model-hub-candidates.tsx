@@ -21,6 +21,7 @@ import { ChevronDown, ChevronUp, GripVertical, Plus, X } from "lucide-react";
 import { CompactSelect } from "@/components/common/compact-select";
 import { cn } from "@/lib/utils";
 import type { MessageKey } from "@/lib/i18n";
+import { MAX_MODEL_ROUTE_CANDIDATES, modelRouteDragAnnouncements } from "@/lib/model-routing";
 
 type CandidateListProps = {
   routeClientId: string;
@@ -66,7 +67,7 @@ function SortableCandidateRow({
     transform,
     transition,
     isDragging,
-  } = useSortable({ id });
+  } = useSortable({ id, disabled });
 
   const style: React.CSSProperties = {
     transform: CSS.Transform.toString(transform),
@@ -80,66 +81,58 @@ function SortableCandidateRow({
       ref={setNodeRef}
       style={style}
       className={cn(
-        "flex min-w-0 items-center gap-1.5 rounded-md border border-border bg-white px-2 py-1",
+        "model-route-account model-route-sortable grid gap-1 rounded-md bg-white p-1",
         isDragging && "shadow-lg ring-1 ring-primary/30",
       )}
     >
-      <button
-        type="button"
-        className="inline-flex h-6 w-5 shrink-0 cursor-grab items-center justify-center text-slate-400 hover:text-slate-600 active:cursor-grabbing disabled:opacity-30"
-        disabled={disabled}
-        aria-label={t("modelHub.dragCandidate")}
-        {...attributes}
-        {...listeners}
-      >
-        <GripVertical className="h-3.5 w-3.5" />
-      </button>
-      <span className="w-4 shrink-0 text-center text-[10px] font-medium text-slate-400">
-        {index + 1}
-      </span>
-      <div className="min-w-0 flex-1">
-        <CompactSelect
-          value={shareId}
-          options={options}
-          onChange={() => {}}
-          ariaLabel={t("modelHub.candidateOrder", { order: index + 1 })}
-          disabled
-          className="w-full"
-          triggerClassName="min-h-8 w-full py-0.5 border-transparent bg-transparent shadow-none"
-        />
-      </div>
-      <div className="flex shrink-0 items-center gap-0.5">
+      <div className="flex min-w-0 items-center gap-1">
         <button
           type="button"
-          disabled={disabled || isFirst}
-          className="inline-flex h-6 w-5 items-center justify-center rounded text-slate-400 hover:bg-slate-100 hover:text-slate-700 disabled:opacity-30"
-          title={t("modelHub.candidateOrder", { order: index })}
-          aria-label={t("modelHub.candidateOrder", { order: index })}
-          onClick={onMoveUp}
-        >
-          <ChevronUp className="h-3 w-3" />
-        </button>
-        <button
-          type="button"
-          disabled={disabled || isLast}
-          className="inline-flex h-6 w-5 items-center justify-center rounded text-slate-400 hover:bg-slate-100 hover:text-slate-700 disabled:opacity-30"
-          title={t("modelHub.candidateOrder", { order: index + 2 })}
-          aria-label={t("modelHub.candidateOrder", { order: index + 2 })}
-          onClick={onMoveDown}
-        >
-          <ChevronDown className="h-3 w-3" />
-        </button>
-        <button
-          type="button"
+          className="inline-flex h-11 w-11 touch-none shrink-0 cursor-grab items-center justify-center rounded text-muted-foreground hover:bg-secondary active:cursor-grabbing focus-visible:outline-2 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-40"
           disabled={disabled}
-          className="inline-flex h-6 w-5 items-center justify-center rounded text-slate-400 hover:bg-rose-50 hover:text-rose-600 disabled:opacity-30"
-          title={t("modelHub.removeCandidate")}
-          aria-label={t("modelHub.removeCandidate")}
-          onClick={onRemove}
+          aria-label={t("modelHub.dragCandidate")}
+          {...attributes}
+          {...listeners}
         >
-          <X className="h-3 w-3" />
+          <GripVertical className="h-3.5 w-3.5" />
         </button>
+        <span className="min-w-0 flex-1 text-xs font-medium tabular-nums text-muted-foreground">
+          {index + 2}
+        </span>
+        <div className="flex shrink-0 items-center gap-0.5">
+          <button
+            type="button"
+            disabled={disabled || isFirst}
+            className="inline-flex h-11 w-11 items-center justify-center rounded text-muted-foreground hover:bg-secondary active:bg-secondary focus-visible:outline-2 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-40"
+            title={t("modelHub.moveUp")}
+            aria-label={t("modelHub.moveUp")}
+            onClick={onMoveUp}
+          >
+            <ChevronUp className="h-3 w-3" />
+          </button>
+          <button
+            type="button"
+            disabled={disabled || isLast}
+            className="inline-flex h-11 w-11 items-center justify-center rounded text-muted-foreground hover:bg-secondary active:bg-secondary focus-visible:outline-2 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-40"
+            title={t("modelHub.moveDown")}
+            aria-label={t("modelHub.moveDown")}
+            onClick={onMoveDown}
+          >
+            <ChevronDown className="h-3 w-3" />
+          </button>
+          <button
+            type="button"
+            disabled={disabled}
+            className="inline-flex h-11 w-11 items-center justify-center rounded text-muted-foreground hover:text-destructive active:bg-secondary focus-visible:outline-2 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-40"
+            title={t("modelHub.removeCandidate")}
+            aria-label={t("modelHub.removeCandidate")}
+            onClick={onRemove}
+          >
+            <X className="h-3 w-3" />
+          </button>
+        </div>
       </div>
+      <div className="min-w-0">{options.find(option => option.value === shareId)?.content || shareId}</div>
     </div>
   );
 }
@@ -161,19 +154,20 @@ export function CandidateList({
   );
 
   const itemIds = React.useMemo(
-    () => candidates.map((_, index) => `${routeClientId}-candidate-${index}`),
+    () => candidates.map(shareId => JSON.stringify([routeClientId, shareId])),
     [candidates, routeClientId],
   );
 
   const handleDragEnd = React.useCallback(
     (event: DragEndEvent) => {
+      if (disabled) return;
       const { active, over } = event;
       if (!over || active.id === over.id) return;
       const fromIndex = itemIds.indexOf(String(active.id));
       const toIndex = itemIds.indexOf(String(over.id));
       if (fromIndex >= 0 && toIndex >= 0) onMove(fromIndex, toIndex);
     },
-    [itemIds, onMove],
+    [disabled, itemIds, onMove],
   );
 
   const availableOptions = shareOptions.filter(
@@ -181,12 +175,18 @@ export function CandidateList({
   );
 
   const [pickerValue, setPickerValue] = React.useState("");
+  const validPickerValue = availableOptions.some(option => option.value === pickerValue)
+    ? pickerValue : availableOptions[0]?.value || "";
 
   return (
     <div className="grid min-w-0 gap-1.5">
       <span className="text-[11px] font-medium text-slate-500">{t("modelHub.candidatesList")}</span>
       {candidates.length > 0 ? (
-        <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+        <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}
+          accessibility={{
+            screenReaderInstructions: { draggable: t("modelHub.dragInstructions") },
+            announcements: modelRouteDragAnnouncements(itemIds, candidates.map(id => shareOptions.find(option => option.value === id)?.label || id), 2, t)
+          }}>
           <SortableContext items={itemIds} strategy={verticalListSortingStrategy}>
             <div className="grid min-w-0 gap-1">
               {candidates.map((shareId, index) => {
@@ -216,11 +216,11 @@ export function CandidateList({
           </SortableContext>
         </DndContext>
       ) : null}
-      {candidates.length < 5 && availableOptions.length > 0 ? (
+      {candidates.length < MAX_MODEL_ROUTE_CANDIDATES && availableOptions.length > 0 ? (
         <div className="flex min-w-0 items-center gap-1.5">
           <div className="min-w-0 flex-1">
             <CompactSelect
-              value={pickerValue}
+              value={validPickerValue}
               options={availableOptions}
               onChange={setPickerValue}
               ariaLabel={t("modelHub.addCandidate")}
@@ -231,11 +231,11 @@ export function CandidateList({
           </div>
           <button
             type="button"
-            disabled={disabled || !pickerValue}
-            className="inline-flex h-7 shrink-0 items-center gap-1 rounded-md border border-border bg-white px-2 text-[11px] font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-40"
+            disabled={disabled || !validPickerValue}
+            className="inline-flex min-h-11 shrink-0 items-center gap-1 whitespace-nowrap rounded-md border border-border bg-white px-2 text-xs font-medium text-muted-foreground hover:bg-secondary active:bg-secondary focus-visible:outline-2 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-40"
             onClick={() => {
-              if (!pickerValue) return;
-              onAdd(pickerValue);
+              if (!validPickerValue) return;
+              onAdd(validPickerValue);
               setPickerValue("");
             }}
           >

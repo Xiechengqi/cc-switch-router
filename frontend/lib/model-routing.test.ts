@@ -3,6 +3,11 @@ import test from "node:test";
 import {
   buildUnifiedModelCurl,
   modelRoutingShareAccountLines,
+  modelRoutingShareAccountView,
+  modelRouteTargets,
+  moveModelRouteTarget,
+  replacePassthroughTargets,
+  MAX_MODEL_ROUTE_TARGETS,
   canonicalModelRoutes,
   clientBelongsToViewer,
   listViewerShares,
@@ -31,6 +36,7 @@ import {
 } from "@/lib/model-routing";
 import type {
   DashboardClient,
+  ShareModelHealthStatus,
   ShareView,
   UserModelRoutingResponse,
   UserModelRoutingShare,
@@ -94,8 +100,8 @@ test("model route keys are trimmed, deterministic, and case-sensitive", () => {
     { appType: "claude", requestedModel: "sonnet", targetShareId: "two" },
   ]);
   assert.deepEqual(routes, [
-    { appType: "claude", requestedModel: "sonnet", targetShareId: "two" },
-    { appType: "codex", requestedModel: "GPT-5.6", targetShareId: "one" },
+    { appType: "claude", requestedModel: "sonnet", targetShareId: "two", candidates: [] },
+    { appType: "codex", requestedModel: "GPT-5.6", targetShareId: "one", candidates: [] },
   ]);
   assert.equal(
     validateModelRoutes([
@@ -564,4 +570,120 @@ test("protocol share pickers stay inside the enabled app and prefer the first el
   );
   assert.equal(firstShareForProtocol(mixed, "gemini"), null);
   assert.equal(firstShareForProtocol(mixed, "claude")?.shareId, "share-multi");
+});
+
+test("default queues atomically promote, reorder, remove and clear without changing other protocols", () => {
+  const exact: DraftModelRoute = { clientId: "exact", appType: "codex", requestedModel: "model", targetShareId: "exact-share" };
+  const other: DraftModelRoute = { clientId: "other", appType: "claude", requestedModel: "*", targetShareId: "claude-share" };
+  const original = [exact, other];
+  const added = replacePassthroughTargets(original, "codex", ["one", "two", "three"]);
+  const slot = () => groupModelRoutesByProtocol(added)[1].passthrough!;
+  assert.deepEqual(modelRouteTargets(slot()), ["one", "two", "three"]);
+  assert.deepEqual(original, [exact, other]);
+  const id = slot().clientId;
+  const reordered = replacePassthroughTargets(added, "codex", moveModelRouteTarget(modelRouteTargets(slot()), 2, 0));
+  assert.deepEqual(modelRouteTargets(reordered[2]), ["three", "one", "two"]);
+  assert.equal(reordered[2].clientId, id);
+  assert.equal(reordered[0], exact);
+  assert.equal(reordered[1], other);
+  const removedPrimary = replacePassthroughTargets(reordered, "codex", modelRouteTargets(reordered[2]).slice(1));
+  assert.equal(removedPrimary[2].targetShareId, "one");
+  assert.deepEqual(removedPrimary[2].candidates, ["two"]);
+  assert.deepEqual(replacePassthroughTargets(removedPrimary, "codex", []), original);
+});
+
+test("duplicate wildcard drafts remain visible and deletable instead of disappearing", () => {
+  const routes: DraftModelRoute[] = [
+    { clientId: "first", appType: "codex", requestedModel: "*", targetShareId: "a" },
+    { clientId: "duplicate", appType: "codex", requestedModel: " * ", targetShareId: "b" },
+  ];
+  const slot = groupModelRoutesByProtocol(routes)[1];
+  assert.equal(slot.passthrough?.clientId, "first");
+  assert.deepEqual(slot.exact.map(route => route.clientId), ["duplicate"]);
+  assert.equal(validateModelRoutes(routes), "duplicate");
+  assert.equal(validateModelRoutes([slot.passthrough!]), null);
+});
+
+test("queue limits mean six total targets, with no duplicate or implicit seventh target", () => {
+  const six = Array.from({ length: 6 }, (_, i) => `share-${i}`);
+  assert.equal(MAX_MODEL_ROUTE_TARGETS, 6);
+  const routes = replacePassthroughTargets([], "codex", six);
+  assert.equal(validateModelRoutes(routes), null);
+  for (const invalid of [[...six, "seventh"], ["one", "one"], ["one", " "]]) {
+    assert.equal(replacePassthroughTargets(routes, "codex", invalid), routes);
+  }
+  const full: DraftModelRoute[] = Array.from({ length: 100 }, (_, i) => ({
+    clientId: String(i), appType: "codex", requestedModel: `model-${i}`, targetShareId: "one",
+  }));
+  assert.equal(replacePassthroughTargets(full, "codex", ["two"]), full);
+  const withWildcard = [...full.slice(1), routes[0]];
+  assert.equal(replacePassthroughTargets(withWildcard, "codex", ["two"])[99].targetShareId, "two");
+  for (const [from, to] of [[-1, 0], [0, 7], [0.5, 1], [NaN, 0], [1, 1]]) {
+    assert.equal(moveModelRouteTarget(six, from, to), six);
+  }
+  assert.deepEqual(canonicalModelRoutes(routes)[0].candidates, six.slice(1));
+});
+
+test("changing a primary removes it from backups, and validation catches duplicate and oversized backups", () => {
+  const original: DraftModelRoute[] = [{ clientId: "r", appType: "codex", requestedModel: "m", targetShareId: "a", candidates: ["b", "c"] }];
+  const updated = patchDraftModelRoute(original, "r", { targetShareId: "b" }, shares);
+  assert.deepEqual(modelRouteTargets(updated[0]), ["b", "c"]);
+  assert.deepEqual(modelRouteTargets(original[0]), ["a", "b", "c"]);
+  assert.equal(validateModelRoutes([{ ...original[0], candidates: ["a"] }]), "duplicate_candidate");
+  assert.equal(validateModelRoutes([{ ...original[0], candidates: ["b", " b "] }]), "duplicate_candidate");
+  assert.equal(validateModelRoutes([{ ...original[0], candidates: ["1", "2", "3", "4", "5", "6"] }]), "too_many_candidates");
+});
+
+test("backup eligibility drives attention and mine membership with protocol isolation", () => {
+  const route = { id: "r", appType: "codex" as const, requestedModel: "*", targetShareId: "share-codex", candidates: ["backup"], createdAt: "", updatedAt: "" };
+  const backup: UserModelRoutingShare = { ...shares[0], shareId: "backup", isOnline: false };
+  assert.equal(protocolHasAttention([route], [...shares, backup], "codex"), false, "offline is still configurable");
+  assert.equal(protocolHasAttention([route], shares, "codex"), true);
+  assert.equal(protocolHasAttention([route], shares, "claude"), false);
+  const profile: UserModelRoutingResponse = { enabled: true, apiBaseUrl: "", revision: 1, routes: [route], eligibleShares: [...shares, backup] };
+  assert.deepEqual([...configuredEligibleRouteShareIds(profile)], ["share-codex", "backup"]);
+  profile.eligibleShares = [...shares, { ...backup, apps: ["claude"] }];
+  assert.deepEqual([...configuredEligibleRouteShareIds(profile)], ["share-codex"]);
+  assert.equal(protocolHasAttention([route], profile.eligibleShares, "codex"), true);
+});
+
+test("routing account lines and health belong to the selected protocol and current fingerprint only", () => {
+  const now = 1_800_000_000_000;
+  const health: ShareModelHealthStatus = { state: "healthy", checkedAt: now / 1000 - 10, staleAt: now / 1000 + 3900, appType: "codex", healthFingerprint: "current", source: "server_manual", reasonCode: "probe_success", recentResults: [] };
+  const share: UserModelRoutingShare = {
+    ...shares[0], apps: ["codex", "claude"], appCapabilities: [
+      { app: "codex", kind: "codex_oauth", accountEmail: "codex@example.test", healthFingerprint: "current", liveModelHealthStatus: health, modelPolicy: { mode: "single", upstreamModel: "codex-model" } },
+      { app: "claude", kind: "claude_oauth", accountEmail: "claude@example.test", healthFingerprint: "claude-fingerprint", modelPolicy: { mode: "single", upstreamModel: "claude-model" } },
+    ],
+  };
+  const labels = { passthrough: "Passthrough", unavailable: "Unavailable" };
+  const view = () => modelRoutingShareAccountView(share, "codex", "en", labels, now);
+  assert.match(view().toneClassName!, /bg-emerald-50/);
+  assert.equal(view().identityLine, "codex@example.test");
+  assert.equal(view().modelsLine, "Codex: codex-model");
+  const claude = modelRoutingShareAccountView(share, "claude", "en", labels, now);
+  assert.equal(claude.identityLine, "claude@example.test");
+  assert.equal(claude.modelsLine, "Claude: claude-model");
+  assert.match(claude.toneClassName!, /bg-slate-50/);
+  for (const [state, tone] of [["degraded", "amber"], ["unavailable", "red"], ["unknown", "slate"]] as const) {
+    share.appCapabilities![0].liveModelHealthStatus = { ...health, state };
+    assert.match(view().toneClassName!, new RegExp(`bg-${tone}-50`));
+    assert.ok(view().healthLabel, "health is conveyed in text, not color alone");
+  }
+  for (const invalid of [
+    { ...health, appType: "claude" }, { ...health, healthFingerprint: "old" },
+    { ...health, staleAt: now / 1000 - 1 }, { ...health, checkedAt: now / 1000 + 1 },
+    { ...health, checkedAt: undefined },
+  ]) {
+    share.appCapabilities![0].liveModelHealthStatus = invalid;
+    assert.match(view().toneClassName!, /bg-slate-50/);
+  }
+  delete share.appCapabilities![0].liveModelHealthStatus;
+  share.appCapabilities![0].modelHealthStatus = health;
+  assert.match(view().toneClassName!, /bg-emerald-50/);
+  delete share.appCapabilities![0].healthFingerprint;
+  assert.match(view().toneClassName!, /bg-slate-50/);
+  delete share.appCapabilities;
+  assert.match(view().toneClassName!, /bg-slate-50/);
+  assert.equal(view().identityLine, "Unavailable");
 });
