@@ -640,6 +640,9 @@ export type UserModelRoutingShare = {
   freeAccess: boolean;
   apps: ModelRoutingApp[];
   appCapabilities?: UserModelRoutingShareCapability[];
+  /** Share-level account health, shared with the All view; appType is the observed protocol. */
+  modelHealthStatus?: ShareModelHealthStatus;
+  liveModelHealthStatus?: ShareModelHealthStatus;
   isOnline: boolean;
 };
 

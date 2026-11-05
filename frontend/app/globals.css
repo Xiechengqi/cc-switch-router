@@ -21,6 +21,50 @@
   .model-route-sortable { transition: none !important; }
 }
 
+/* Transfer keeps the account panel's existing geometry and health colors.
+ * Container-aware stacking works inside both narrow and full-width panels. */
+.model-route-transfer {
+  container-type: inline-size;
+  max-width: calc(var(--router-route-account-width) * 2 + 14rem);
+}
+.model-route-transfer-grid {
+  display: grid;
+  min-width: 0;
+  gap: 0.75rem;
+}
+.model-route-transfer-pane {
+  min-width: 0;
+  border: 1px solid var(--color-provider-rule);
+  border-radius: var(--radius-provider-md);
+  background: var(--color-provider-surface);
+  color: var(--color-provider-ink);
+}
+.model-route-transfer-list {
+  display: grid;
+  align-content: start;
+  gap: 0.5rem;
+  height: min(28rem, 65svh);
+  min-height: 12rem;
+  min-width: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0.25rem;
+}
+.model-route-transfer-actions {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+}
+.model-route-transfer-horizontal { display: none; }
+@container (min-width: 44rem) {
+  .model-route-transfer-grid { grid-template-columns: minmax(0, 1fr) 5.5rem minmax(0, 1fr); }
+  .model-route-transfer-actions { flex-direction: column; }
+  .model-route-transfer-actions > button { width: 100%; }
+  .model-route-transfer-horizontal { display: block; }
+  .model-route-transfer-vertical { display: none; }
+}
+
 @theme inline {
   --color-background: rgb(var(--router-background));
   --color-foreground: rgb(var(--router-foreground));

@@ -400,6 +400,10 @@ pub struct UserModelRoutingShareView {
     pub apps: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub app_capabilities: Vec<UserModelRoutingShareCapability>,
+    /// Share-level status, identical to the account panel in the All view.
+    /// app_type still identifies the observed protocol, not every routed App.
+    pub model_health_status: ShareModelHealthStatus,
+    pub live_model_health_status: ShareModelHealthStatus,
     pub is_online: bool,
 }
 
@@ -407,8 +411,8 @@ pub struct UserModelRoutingShareView {
 #[serde(rename_all = "camelCase")]
 pub struct UserModelRoutingShareCapability {
     pub app: String,
-    /// Current execution identity; observations from another App/configuration
-    /// must never color this protocol's account panel.
+    /// Current execution identity for protocol-specific evidence. The account
+    /// panel uses the parent Share's status, without relabelling this evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -9,6 +9,21 @@ const tones = {
   unknown: "border-slate-200 bg-slate-50 text-slate-600",
 };
 
+/** The Share account panel is a Share-level observation, not an assertion that
+ * every protocol was tested. Preserve the observed App/source in the title. */
+export function shareAccountHealthPresentation(
+  status: ShareModelHealthStatus | undefined,
+  currentFingerprint: string | undefined,
+  locale: AppLocale = "en",
+  now = Date.now(),
+) {
+  return modelHealthPresentation(
+    !currentFingerprint || currentFingerprint === status?.healthFingerprint ? status : undefined,
+    locale,
+    now,
+  );
+}
+
 export function modelHealthPresentation(
   status?: ShareModelHealthStatus,
   locale: AppLocale = "en",

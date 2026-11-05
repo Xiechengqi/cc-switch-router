@@ -4,40 +4,58 @@ import * as React from "react";
 import { DndContext, KeyboardSensor, PointerSensor, closestCenter, useSensor, useSensors, type DragEndEvent } from "@dnd-kit/core";
 import { SortableContext, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { ChevronDown, ChevronUp, GripVertical, Plus, X } from "lucide-react";
+import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ChevronDown, ChevronUp, GripVertical } from "lucide-react";
 import { RoutingShareDetails, RoutingShareSummary, type RoutingShareSummaryProps } from "./model-hub-share-summary";
-import { MAX_MODEL_ROUTE_TARGETS, modelRouteDragAnnouncements, moveModelRouteTarget, sharesForProtocol } from "@/lib/model-routing";
+import { MAX_MODEL_ROUTE_TARGETS, modelRouteDragAnnouncements, modelRouteTransferSelection, moveModelRouteTarget, sharesForProtocol, transferModelRouteTargets } from "@/lib/model-routing";
 import type { ModelRoutingApp, UserModelRoutingShare } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
-const controlClass = "inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-secondary active:bg-secondary focus-visible:outline-2 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-40";
+// Hallmark · component: Transfer · existing Router tokens · keyboard/native checkboxes
+// Pre-emit critique: P4 H4 E4 S5 R5 V4. No page-level redesign or added animation.
+const controlClass = "inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-secondary active:bg-secondary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-40";
+const selectionClass = "flex min-h-11 min-w-0 cursor-pointer items-start gap-2 rounded-md p-2 hover:bg-secondary active:bg-secondary has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-ring has-[:disabled]:cursor-not-allowed";
 
-function TargetRow({ id, index, total, disabled, onMove, onRemove, handleRef, ...summary }: RoutingShareSummaryProps & {
-  id: string; index: number; total: number; disabled: boolean;
-  handleRef: (node: HTMLButtonElement | null) => void;
-  onMove: (from: number, to: number) => void; onRemove: () => void;
+function TransferCheckbox({ checked, mixed = false, disabled, label, onChange, inputRef }: {
+  checked: boolean; mixed?: boolean; disabled: boolean; label: string;
+  onChange: (checked: boolean) => void; inputRef?: (node: HTMLInputElement | null) => void;
 }) {
-  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id, disabled });
+  return <input type="checkbox" checked={checked} disabled={disabled} aria-label={label}
+    aria-checked={mixed ? "mixed" : checked}
+    ref={node => { if (node) node.indeterminate = mixed; inputRef?.(node); }}
+    className="mt-0.5 size-4 shrink-0 accent-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:cursor-not-allowed"
+    onChange={event => onChange(event.target.checked)} />;
+}
+
+function TargetRow({ id, index, total, disabled, selectionDisabled, sortDisabled, checked, onCheck, onMove, inputRef, ...summary }: RoutingShareSummaryProps & {
+  id: string; index: number; total: number; disabled: boolean;
+  selectionDisabled: boolean; sortDisabled: boolean;
+  checked: boolean; onCheck: (checked: boolean) => void;
+  inputRef: (node: HTMLInputElement | null) => void;
+  onMove: (from: number, to: number) => void;
+}) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id, disabled: disabled || sortDisabled });
   return (
     <li ref={setNodeRef} style={{ transform: CSS.Transform.toString(transform), transition }}
-      className={cn("model-route-account model-route-sortable grid gap-1 rounded-lg", isDragging && "relative z-10 bg-card outline-2 outline-primary")}>
+      className={cn("model-route-sortable grid min-w-0 gap-1 rounded-md", checked && "bg-secondary", isDragging && "relative z-10 bg-card outline-2 outline-primary")}>
       <div className="flex min-w-0 items-center">
-        <button ref={handleRef} {...attributes} {...listeners} type="button" disabled={disabled}
+        <button {...attributes} {...listeners} type="button" disabled={disabled || sortDisabled}
           aria-label={summary.t("modelHub.dragCandidate")} className={cn(controlClass, "touch-none cursor-grab active:cursor-grabbing")}>
           <GripVertical className="h-4 w-4" aria-hidden />
         </button>
         <span className="min-w-0 flex-1 truncate text-xs font-medium tabular-nums">
           {index === 0 ? summary.t("modelHub.candidatePrimary") : summary.t("modelHub.candidateOrder", { order: index + 1 })}
         </span>
-        <button type="button" disabled={disabled || index === 0} onClick={() => onMove(index, index - 1)}
+        <button type="button" disabled={selectionDisabled || sortDisabled || index === 0} onClick={() => onMove(index, index - 1)}
           className={controlClass} aria-label={summary.t("modelHub.moveUp")}><ChevronUp className="h-4 w-4" aria-hidden /></button>
-        <button type="button" disabled={disabled || index === total - 1} onClick={() => onMove(index, index + 1)}
+        <button type="button" disabled={selectionDisabled || sortDisabled || index === total - 1} onClick={() => onMove(index, index + 1)}
           className={controlClass} aria-label={summary.t("modelHub.moveDown")}><ChevronDown className="h-4 w-4" aria-hidden /></button>
-        <button type="button" disabled={disabled} onClick={onRemove} className={cn(controlClass, "hover:text-destructive")}
-          aria-label={summary.t("modelHub.removeCandidate")}><X className="h-4 w-4" aria-hidden /></button>
       </div>
-      <RoutingShareSummary {...summary} />
-      <RoutingShareDetails {...summary} />
+      <label className={selectionClass}>
+        <TransferCheckbox checked={checked} disabled={selectionDisabled} onChange={onCheck} inputRef={inputRef}
+          label={summary.t("modelHub.checkShare", { name: summary.share?.subdomain || summary.shareId })} />
+        <RoutingShareSummary {...summary} />
+      </label>
+      <div className="min-w-0 px-2"><RoutingShareDetails {...summary} /></div>
     </li>
   );
 }
@@ -46,15 +64,21 @@ export function SharePoolPicker({ shares, selected, app, routeKey, disabled, add
   shares: UserModelRoutingShare[]; selected: string[]; app: ModelRoutingApp; routeKey: string;
   disabled: boolean; addBlockedReason?: string; onChange: (ids: string[]) => void;
 } & Pick<RoutingShareSummaryProps, "locale" | "t">) {
-  const [query, setQuery] = React.useState("");
+  const [leftQuery, setLeftQuery] = React.useState("");
+  const [rightQuery, setRightQuery] = React.useState("");
+  const [leftChecked, setLeftChecked] = React.useState<string[]>([]);
+  const [rightChecked, setRightChecked] = React.useState<string[]>([]);
   const [announcement, setAnnouncement] = React.useState("");
   const [dragging, setDragging] = React.useState(false);
-  const handles = React.useRef(new Map<string, HTMLButtonElement>());
-  const searchRef = React.useRef<HTMLInputElement>(null);
-  const pendingFocus = React.useRef<string | null>(null);
+  const inputs = React.useRef(new Map<string, HTMLInputElement>());
+  const leftSearchRef = React.useRef<HTMLInputElement>(null);
+  const rightSearchRef = React.useRef<HTMLInputElement>(null);
+  const pendingFocus = React.useRef<{ side: "left" | "right"; id: string } | null>(null);
   React.useLayoutEffect(() => {
-    if (pendingFocus.current === null) return;
-    (handles.current.get(pendingFocus.current) || searchRef.current)?.focus();
+    const pending = pendingFocus.current;
+    if (!pending) return;
+    (inputs.current.get(`${pending.side}:${pending.id}`)
+      || (pending.side === "left" ? leftSearchRef.current : rightSearchRef.current))?.focus();
     pendingFocus.current = null;
   }, [selected]);
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
@@ -62,15 +86,55 @@ export function SharePoolPicker({ shares, selected, app, routeKey, disabled, add
   const eligible = sharesForProtocol(shares, app);
   const byId = new Map(eligible.map(share => [share.shareId, share]));
   const remaining = eligible.filter(share => !selected.includes(share.shareId));
-  const needle = query.trim().toLocaleLowerCase();
-  const available = remaining.filter(share => [
-    share.subdomain, share.shareName,
-    share.appCapabilities?.find(cap => cap.app === app)?.providerName || "",
-  ].join(" ").toLocaleLowerCase().includes(needle));
+  const matches = (id: string, query: string) => {
+    const share = byId.get(id);
+    return [id, share?.subdomain, share?.shareName, share?.appCapabilities?.find(cap => cap.app === app)?.providerName]
+      .filter(Boolean).join(" ").toLocaleLowerCase().includes(query.trim().toLocaleLowerCase());
+  };
+  const available = remaining.filter(share => matches(share.shareId, leftQuery));
+  const availableIds = available.map(share => share.shareId);
+  const visibleSelected = selected.filter(id => matches(id, rightQuery));
+  const checkedIn = modelRouteTransferSelection(availableIds, leftChecked);
+  const checkedOut = modelRouteTransferSelection(visibleSelected, rightChecked);
+  // Drop disappeared selections so a later metadata refresh cannot silently
+  // re-select a revoked Share. Filtering also resets only that side's checks.
+  const leftMembership = JSON.stringify(availableIds);
+  const rightMembership = JSON.stringify(visibleSelected);
+  React.useEffect(() => {
+    setLeftChecked(current => {
+      const next = modelRouteTransferSelection(JSON.parse(leftMembership), current);
+      return JSON.stringify(next) === JSON.stringify(current) ? current : next;
+    });
+    setRightChecked(current => {
+      const next = modelRouteTransferSelection(JSON.parse(rightMembership), current);
+      return JSON.stringify(next) === JSON.stringify(current) ? current : next;
+    });
+  }, [leftMembership, rightMembership]);
   const full = selected.length >= MAX_MODEL_ROUTE_TARGETS;
+  const remainingSlots = Math.max(0, MAX_MODEL_ROUTE_TARGETS - selected.length);
+  const overCapacity = checkedIn.length > remainingSlots;
+  const inputId = React.useId();
+  const hintId = `${inputId}-hint`;
+  const locked = disabled || dragging;
+  const setChecked = (side: "left" | "right", id: string, checked: boolean) => {
+    if (locked) return;
+    (side === "left" ? setLeftChecked : setRightChecked)(current => checked ? [...new Set([...current, id])] : current.filter(value => value !== id));
+  };
+  const moveChecked = (direction: "in" | "out") => {
+    if (locked || (direction === "in" && (!!addBlockedReason || overCapacity))) return;
+    const checked = direction === "in" ? checkedIn : checkedOut;
+    const next = transferModelRouteTargets(selected, availableIds, checked, direction);
+    if (next === selected) return;
+    const side = direction === "in" ? "right" : "left";
+    pendingFocus.current = { side, id: checked[0] };
+    if (direction === "in") { setLeftChecked([]); setRightQuery(""); setRightChecked(checked); }
+    else { setRightChecked([]); setLeftQuery(""); setLeftChecked(checked); }
+    onChange(next);
+    setAnnouncement(t(direction === "in" ? "modelHub.transferredIn" : "modelHub.transferredOut", { count: checked.length }));
+  };
   const ids = selected.map(id => JSON.stringify([routeKey, id]));
   const move = (from: number, to: number) => {
-    if (disabled) return;
+    if (disabled || rightQuery.trim()) return;
     const next = moveModelRouteTarget(selected, from, to);
     if (next !== selected) {
       onChange(next);
@@ -83,37 +147,63 @@ export function SharePoolPicker({ shares, selected, app, routeKey, disabled, add
   };
 
   return (
-    <div className="grid min-w-0 gap-4 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]" data-model-route-picker>
-      <section className="grid min-w-0 content-start gap-2" aria-label={t("modelHub.availableShares")}>
-        <h4 className="text-xs font-semibold text-foreground">{t("modelHub.availableShares")} · {remaining.length}</h4>
-        <input ref={searchRef} value={query} onChange={event => setQuery(event.target.value)} type="search"
-          className="model-route-account h-11 rounded-md border border-input bg-card px-3 text-xs focus-visible:outline-2 focus-visible:outline-ring"
-          aria-label={t("modelHub.searchShares")} placeholder={t("modelHub.searchShares")} />
-        {full ? <p className="text-xs text-muted-foreground">{t("modelHub.queueFull")}</p> : null}
-        {addBlockedReason ? <p role="status" className="text-xs text-muted-foreground">{addBlockedReason}</p> : null}
-        <ul className="grid max-h-[32rem] min-w-0 content-start gap-3 overflow-y-auto overscroll-contain p-1">
+    <div className="model-route-transfer grid min-w-0 gap-2" data-model-route-picker>
+      <p id={hintId} className="text-xs text-muted-foreground">{t("modelHub.transferHint")}</p>
+      <div className="model-route-transfer-grid">
+      <section className="model-route-transfer-pane" aria-label={t("modelHub.availableShares")}>
+        <div className="grid gap-2 border-b border-border p-2">
+          <h5 className="px-2 text-xs font-semibold text-foreground">{t("modelHub.availableShares")} · {remaining.length}</h5>
+          <label className={cn(selectionClass, "items-center text-xs text-muted-foreground")}>
+            <TransferCheckbox checked={!!availableIds.length && checkedIn.length === availableIds.length} mixed={checkedIn.length > 0 && checkedIn.length < availableIds.length}
+              disabled={locked || !availableIds.length} label={t("modelHub.checkVisible", { list: t("modelHub.availableShares") })}
+              onChange={checked => { if (!locked) setLeftChecked(checked ? availableIds : []); }} />
+            {t("modelHub.checkedCount", { count: checkedIn.length })}
+          </label>
+          <input ref={leftSearchRef} value={leftQuery} onChange={event => { setLeftQuery(event.target.value); setLeftChecked([]); }} type="search"
+            className="h-11 min-w-0 w-full rounded-md border border-input bg-card px-3 text-xs focus-visible:outline-2 focus-visible:outline-ring"
+            aria-label={t("modelHub.searchList", { list: t("modelHub.availableShares") })} placeholder={t("modelHub.searchShares")} />
+        </div>
+        <ul className="model-route-transfer-list" aria-label={t("modelHub.availableShares")}>
           {available.map(share => (
-            <li key={share.shareId} className="model-route-account grid gap-1">
-              <button type="button" disabled={disabled || full || dragging || !!addBlockedReason} aria-label={t("modelHub.addShare", { name: share.subdomain || share.shareName })}
-                className="grid min-w-0 gap-1 rounded-md text-left hover:outline hover:outline-border active:bg-secondary focus-visible:outline-2 focus-visible:outline-ring disabled:cursor-not-allowed"
-                onClick={() => {
-                  if (disabled || full || dragging || addBlockedReason || selected.includes(share.shareId)) return;
-                  pendingFocus.current = share.shareId;
-                  onChange([...selected, share.shareId]);
-                  setAnnouncement(t("modelHub.added", { name: share.subdomain || share.shareName }));
-                }}>
-                <span className={cn("flex h-11 items-center gap-1 px-2 text-xs font-medium", disabled || full || !!addBlockedReason ? "text-muted-foreground" : "text-primary")}><Plus className="h-4 w-4" aria-hidden />{t("common.add")}</span>
+            <li key={share.shareId} className={cn("grid min-w-0 gap-1 rounded-md", checkedIn.includes(share.shareId) && "bg-secondary")}>
+              <label className={selectionClass}>
+                <TransferCheckbox checked={checkedIn.includes(share.shareId)} disabled={locked}
+                  label={t("modelHub.checkShare", { name: share.subdomain || share.shareName })}
+                  inputRef={node => { const key = `left:${share.shareId}`; if (node) inputs.current.set(key, node); else inputs.current.delete(key); }}
+                  onChange={checked => setChecked("left", share.shareId, checked)} />
                 <RoutingShareSummary share={share} shareId={share.shareId} app={app} locale={locale} t={t} />
-              </button>
-              <RoutingShareDetails share={share} shareId={share.shareId} app={app} locale={locale} t={t} />
+              </label>
+              <div className="min-w-0 px-2"><RoutingShareDetails share={share} shareId={share.shareId} app={app} locale={locale} t={t} /></div>
             </li>
           ))}
+          {!available.length ? <li className="px-2 py-4 text-xs text-muted-foreground">{t(!eligible.length ? "modelHub.noEligibleShares" : !remaining.length ? "modelHub.allSharesSelected" : "modelHub.noSearchResults")}</li> : null}
         </ul>
-        {!available.length ? <p className="text-xs text-muted-foreground">{t(!eligible.length ? "modelHub.noEligibleShares" : !remaining.length ? "modelHub.allSharesSelected" : "modelHub.noSearchResults")}</p> : null}
       </section>
-      <section className="grid min-w-0 content-start gap-2" aria-label={t("modelHub.selectedShares")}>
-        <h4 className="text-xs font-semibold text-foreground">{t("modelHub.selectedShares")} · {selected.length}/{MAX_MODEL_ROUTE_TARGETS}</h4>
-        <p className="model-route-account min-h-11 text-xs leading-5 text-muted-foreground">{t("modelHub.queueHint")}</p>
+      <div className="model-route-transfer-actions" role="group" aria-describedby={hintId} aria-label={t("modelHub.transferHint")}>
+        <button type="button" disabled={locked || !checkedIn.length || overCapacity || !!addBlockedReason}
+          className="inline-flex h-11 items-center justify-center gap-1 whitespace-nowrap rounded-md border border-input bg-card px-3 text-xs text-foreground hover:bg-secondary active:bg-secondary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-40"
+          onClick={() => moveChecked("in")} aria-label={t("modelHub.transferInLabel", { count: checkedIn.length })}>
+          <ArrowRight className="model-route-transfer-horizontal size-4" aria-hidden /><ArrowDown className="model-route-transfer-vertical size-4" aria-hidden />{t("modelHub.transferIn")}
+        </button>
+        <button type="button" disabled={locked || !checkedOut.length}
+          className="inline-flex h-11 items-center justify-center gap-1 whitespace-nowrap rounded-md border border-input bg-card px-3 text-xs text-foreground hover:bg-secondary active:bg-secondary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-40"
+          onClick={() => moveChecked("out")} aria-label={t("modelHub.transferOutLabel", { count: checkedOut.length })}>
+          <ArrowLeft className="model-route-transfer-horizontal size-4" aria-hidden /><ArrowUp className="model-route-transfer-vertical size-4" aria-hidden />{t("modelHub.transferOut")}
+        </button>
+      </div>
+      <section className="model-route-transfer-pane" aria-label={t("modelHub.selectedShares")}>
+        <div className="grid gap-2 border-b border-border p-2">
+          <h5 className="px-2 text-xs font-semibold text-foreground">{t("modelHub.selectedShares")} · {selected.length}/{MAX_MODEL_ROUTE_TARGETS}</h5>
+          <label className={cn(selectionClass, "items-center text-xs text-muted-foreground")}>
+            <TransferCheckbox checked={!!visibleSelected.length && checkedOut.length === visibleSelected.length} mixed={checkedOut.length > 0 && checkedOut.length < visibleSelected.length}
+              disabled={locked || !visibleSelected.length} label={t("modelHub.checkVisible", { list: t("modelHub.selectedShares") })}
+              onChange={checked => { if (!locked) setRightChecked(checked ? visibleSelected : []); }} />
+            {t("modelHub.checkedCount", { count: checkedOut.length })}
+          </label>
+          <input ref={rightSearchRef} value={rightQuery} onChange={event => { setRightQuery(event.target.value); setRightChecked([]); }} type="search"
+            className="h-11 min-w-0 w-full rounded-md border border-input bg-card px-3 text-xs focus-visible:outline-2 focus-visible:outline-ring"
+            aria-label={t("modelHub.searchList", { list: t("modelHub.selectedShares") })} placeholder={t("modelHub.searchShares")} />
+        </div>
         <DndContext sensors={sensors} collisionDetection={closestCenter}
           onDragStart={() => setDragging(true)} onDragCancel={() => setDragging(false)} onDragEnd={dragEnd}
           accessibility={{
@@ -121,21 +211,21 @@ export function SharePoolPicker({ shares, selected, app, routeKey, disabled, add
             announcements: modelRouteDragAnnouncements(ids, selected.map(id => byId.get(id)?.subdomain || id), 1, t)
           }}>
           <SortableContext items={ids} strategy={verticalListSortingStrategy}>
-            <ol className="grid max-h-[32rem] min-w-0 content-start gap-3 overflow-y-auto overscroll-contain p-1">
-              {selected.map((shareId, index) => <TargetRow key={ids[index]} id={ids[index]} index={index} total={selected.length}
+            <ol className="model-route-transfer-list" aria-label={t("modelHub.selectedShares")}>
+              {visibleSelected.map(shareId => { const index = selected.indexOf(shareId); return <TargetRow key={ids[index]} id={ids[index]} index={index} total={selected.length}
                 share={byId.get(shareId)} shareId={shareId} app={app} locale={locale} t={t}
-                handleRef={node => { if (node) handles.current.set(shareId, node); else handles.current.delete(shareId); }}
-                disabled={disabled} onMove={move} onRemove={() => {
-                  if (disabled || dragging) return;
-                  pendingFocus.current = selected[index + 1] || selected[index - 1] || "";
-                  onChange(selected.filter(id => id !== shareId));
-                  setAnnouncement(t("modelHub.removed", { name: byId.get(shareId)?.subdomain || shareId }));
-                }} />)}
+                inputRef={node => { const key = `right:${shareId}`; if (node) inputs.current.set(key, node); else inputs.current.delete(key); }}
+                checked={checkedOut.includes(shareId)} onCheck={checked => setChecked("right", shareId, checked)}
+                disabled={disabled} selectionDisabled={locked} sortDisabled={!!rightQuery.trim()} onMove={move} />; })}
+              {!visibleSelected.length ? <li className="px-2 py-4 text-xs text-muted-foreground">{t(!selected.length ? "modelHub.emptyQueue" : "modelHub.noSearchResults")}</li> : null}
             </ol>
           </SortableContext>
         </DndContext>
-        {!selected.length ? <p className="text-xs text-muted-foreground">{t("modelHub.emptyQueue")}</p> : null}
       </section>
+      </div>
+      <div className="min-h-5 text-xs text-muted-foreground" role="status">
+        {addBlockedReason || (overCapacity ? t("modelHub.transferCapacity", { count: checkedIn.length, remaining: remainingSlots }) : full ? t("modelHub.queueFull") : rightQuery.trim() ? t("modelHub.sortSearchHint") : t("modelHub.queueHint"))}
+      </div>
       <span className="sr-only" role="status">{announcement}</span>
     </div>
   );

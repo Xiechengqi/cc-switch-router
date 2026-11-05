@@ -572,9 +572,9 @@ Server 通过签名接口 `POST /v1/share-request-logs/batch-sync` 上送同一 
 | `routes[]` | 当前映射（精确或 `*` 全量）及稳定 route ID / 时间戳 |
 | `eligibleShares[]` | 当前用户可选的 Owner、有效 ShareTo 或 Free Share，以及其已开启 App、直连 URL 和在线状态 |
 
-`eligibleShares[].appCapabilities[]` 按协议投影账号信息，可选字段 `healthFingerprint`、`modelHealthStatus`、`liveModelHealthStatus` 复用 Share 卡片的健康证据。状态必须与该 capability 的 App 和当前执行指纹同时匹配；当前健康监控仍选择一个代表 App，并非所有协议均独立探测，不能将代表 App 的绿色状态复制到其他协议。未观察、指纹不匹配、过期或旧版本缺字段时显示灰色。读此接口不启动探测，不修改探测记录，不扩大 Share 访问权限。
+`eligibleShares[]` 顶层的 `modelHealthStatus`、`liveModelHealthStatus` 与「全部」Share 卡片投影同一份 Share 级健康证据，路由中 Claude/Codex/Gemini 的账号背景统一采用该状态（live 优先，canonical 回退），状态文字标明 Share，详情保留实际观测 App、来源和时间；这不代表各协议均独立测试成功。`appCapabilities[]` 仍按协议投影账号信息，兼容字段 `healthFingerprint`、`modelHealthStatus`、`liveModelHealthStatus` 只包含与该 capability 的 App 和当前执行指纹匹配的证据，不跨协议伪造观测。未观察、指纹不匹配、过期时显示灰色；旧 Router 无 Share 级字段时，仅使用严格匹配的本协议证据。读此接口不启动探测，不修改探测记录，不扩大 Share 访问权限。
 
-Clients「我的－路由」的默认出口采用双栏：左侧可选 Share，右侧完整有序队列（1 个首选 + 最多 5 个备选）。账号面板基准宽度 18rem，窄容器内收缩，保留 Share 标识、当前协议、在线文字及健康文字/背景。移动首项即改变首选，删除首项由下一项递补，清空队列删除该协议的 `*`；指定模型路由继续独立编辑。所有变更留在草稿中，显式保存后生效；可配置有权限但离线的 Share，不按健康颜色自动重排。后台只在页面可见时每 15 秒刷新授权元数据，焦点恢复和路由测试完成也触发刷新；它不重新取 API Key、不覆盖未保存草稿。远端 revision 变动时阻止旧草稿保存并要求显式重新加载；切换账号或权限失效立即清空该会话缓存。
+Clients「我的－路由」的默认出口采用穿梭框（Transfer）：左侧可选 Share，右侧完整有序队列（1 个首选 + 最多 5 个备选），勾选后通过中间按钮批量移入/移出。两侧独立搜索，全选仅作用于当前搜索结果；批量移入按列表顺序追加，超过剩余容量时整批阻止，不静默截断。右侧支持拖拽及上下按钮排序，搜索期间禁用排序，避免隐藏项造成优先级歧义。账号面板基准宽度 18rem，窄容器内收缩并上下排列穿梭框，保留 Share 标识、当前协议、在线文字及健康文字/背景。移动首项即改变首选，移出首项由下一项递补，清空队列删除该协议的 `*`；指定模型路由继续独立编辑。所有变更留在草稿中，显式保存后生效；可配置有权限但离线的 Share，不按健康颜色自动重排。后台只在页面可见时每 15 秒刷新授权元数据，焦点恢复和路由测试完成也触发刷新；它不重新取 API Key、不覆盖未保存草稿。远端 revision 变动时阻止旧草稿保存并要求显式重新加载；切换账号或权限失效立即清空该会话缓存。
 
 `PUT` body 是 `{ expectedRevision, routes }`，整组 routes 在一个 Immediate 事务中原子替换；revision 不匹配返回 `409 model_routing_revision_conflict`，不会部分保存。最多 100 条。映射键固定为 `(appType, requestedModel)`，其中 `appType` 只允许 `claude | codex | gemini`，模型名 trim 后长度为 1–200、禁止控制字符并按 Unicode 字符串精确区分大小写。同一键只能指向一个 Share。
 

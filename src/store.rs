@@ -29354,6 +29354,8 @@ fn load_user_model_routing_response(
             free_access: share.free_access,
             apps,
             app_capabilities,
+            model_health_status: canonical,
+            live_model_health_status: live,
             is_online: active_subdomains.contains(&share.subdomain),
         });
     }

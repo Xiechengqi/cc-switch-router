@@ -6,6 +6,8 @@ import {
   modelRoutingShareAccountView,
   modelRouteTargets,
   moveModelRouteTarget,
+  modelRouteTransferSelection,
+  transferModelRouteTargets,
   replacePassthroughTargets,
   MAX_MODEL_ROUTE_TARGETS,
   canonicalModelRoutes,
@@ -41,6 +43,7 @@ import type {
   UserModelRoutingResponse,
   UserModelRoutingShare,
 } from "@/lib/types";
+import { modelHealthTone, modelHealthTitle } from "@/components/dashboard/share-dashboard-utils";
 
 const shares: UserModelRoutingShare[] = [
   {
@@ -647,7 +650,7 @@ test("backup eligibility drives attention and mine membership with protocol isol
   assert.equal(protocolHasAttention([route], profile.eligibleShares, "codex"), true);
 });
 
-test("routing account lines and health belong to the selected protocol and current fingerprint only", () => {
+test("legacy routing responses retain strict per-protocol account and health matching", () => {
   const now = 1_800_000_000_000;
   const health: ShareModelHealthStatus = { state: "healthy", checkedAt: now / 1000 - 10, staleAt: now / 1000 + 3900, appType: "codex", healthFingerprint: "current", source: "server_manual", reasonCode: "probe_success", recentResults: [] };
   const share: UserModelRoutingShare = {
@@ -686,4 +689,59 @@ test("routing account lines and health belong to the selected protocol and curre
   delete share.appCapabilities;
   assert.match(view().toneClassName!, /bg-slate-50/);
   assert.equal(view().identityLine, "Unavailable");
+});
+
+test("Transfer batches preserve queue order, filter stale checks and enforce capacity atomically", () => {
+  const selected = ["primary", "backup"];
+  const available = ["one", "two", "three", "four", "five"];
+  assert.deepEqual(modelRouteTransferSelection(available, ["two", "revoked", "one", "one"]), ["one", "two"]);
+  assert.deepEqual(transferModelRouteTargets(selected, available, ["two", "one", "revoked"], "in"), ["primary", "backup", "one", "two"]);
+  assert.equal(transferModelRouteTargets(selected, available, available, "in"), selected, "never silently truncate an over-capacity transfer");
+  assert.equal(transferModelRouteTargets(selected, available, ["revoked", "primary"], "in"), selected);
+  const six = transferModelRouteTargets(selected, available, available.slice(0, 4), "in");
+  assert.equal(six.length, MAX_MODEL_ROUTE_TARGETS);
+  assert.deepEqual(transferModelRouteTargets(six, [], ["primary", "two", "revoked"], "out"), ["backup", "one", "three", "four"]);
+  assert.deepEqual(transferModelRouteTargets(six, [], six, "out"), []);
+  assert.deepEqual(transferModelRouteTargets(["revoked"], [], ["revoked"], "out"), [], "unavailable targets remain removable");
+  assert.equal(transferModelRouteTargets(selected, available, [], "out"), selected);
+  const filtered = ["two"];
+  assert.deepEqual(transferModelRouteTargets(selected, filtered, ["one", "two"], "in"), ["primary", "backup", "two"], "only visible checked results move");
+  assert.deepEqual(selected, ["primary", "backup"], "inputs stay immutable");
+});
+
+test("all routing protocols reuse the All card Share health without changing their own account identity", (t) => {
+  const now = 1_800_000_000_000;
+  t.mock.method(Date, "now", () => now);
+  const health: ShareModelHealthStatus = { state: "healthy", checkedAt: now / 1000 - 10, staleAt: now / 1000 + 3900, appType: "codex", model: "observed-codex-model", healthFingerprint: "current", source: "server_manual", reasonCode: "probe_success", recentResults: [] };
+  const apps = ["claude", "codex", "gemini"] as const;
+  const share: UserModelRoutingShare = {
+    ...shares[0], apps: [...apps], modelHealthStatus: { ...health, state: "unavailable" }, liveModelHealthStatus: health,
+    appCapabilities: apps.map(app => ({ app, kind: "official_oauth", accountEmail: `${app}@example.test`, healthFingerprint: app === "codex" ? "current" : `${app}-fingerprint`, modelPolicy: { mode: "single", upstreamModel: `${app}-model` } })),
+  };
+  const overview = { appType: "claude", appRuntimes: { codex: { modelProbe: { healthFingerprint: "current" } } } } as unknown as ShareView;
+  const labels = { passthrough: "Passthrough", unavailable: "Unavailable" };
+  const cases: ShareModelHealthStatus[] = [
+    health, { ...health, state: "degraded", reasonCode: "probe_slow" },
+    { ...health, state: "unavailable", reasonCode: "upstream_rate_limited", statusCode: 429 },
+    { ...health, state: "unknown" }, { ...health, staleAt: now / 1000 - 1 },
+    { ...health, checkedAt: now / 1000 + 1 }, { ...health, healthFingerprint: "old" },
+    { ...health, source: "router_connection_test" }, { ...health, source: "periodic" },
+  ];
+  for (const status of cases) {
+    share.liveModelHealthStatus = status;
+    overview.modelHealthStatus = share.modelHealthStatus;
+    overview.liveModelHealthStatus = status;
+    for (const locale of ["en", "zh-CN"] as const) for (const app of apps) {
+      const view = modelRoutingShareAccountView(share, app, locale, labels, now);
+      assert.equal(view.toneClassName, modelHealthTone(overview, undefined, locale).className, `${app} ${status.state}`);
+      assert.equal(view.panelTitle, modelHealthTitle(overview, undefined, locale));
+      assert.equal(view.identityLine, `${app}@example.test`);
+      assert.match(view.modelsLine, new RegExp(`${app}-model`));
+      assert.match(view.healthLabel!, /^Share · /, "the label identifies Share health, not an unobserved protocol check");
+    }
+  }
+  delete share.liveModelHealthStatus;
+  for (const app of apps) assert.match(modelRoutingShareAccountView(share, app, "en", labels, now).toneClassName!, /bg-red-50/, "canonical fallback is also shared");
+  share.liveModelHealthStatus = { ...health, state: "unknown", checkedAt: undefined, staleAt: undefined };
+  for (const app of apps) assert.match(modelRoutingShareAccountView(share, app, "en", labels, now).toneClassName!, /bg-slate-50/, "unknown live evidence cannot be replaced by old canonical color");
 });

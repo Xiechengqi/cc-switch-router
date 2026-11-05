@@ -15,7 +15,7 @@ import type {
   ShareView,
 } from "@/lib/types";
 import { compactTokens, formatDateTime } from "@/lib/utils";
-import { modelHealthPresentation } from "@/lib/share-health";
+import { modelHealthPresentation, shareAccountHealthPresentation } from "@/lib/share-health";
 
 export function modelHealthCheckedAt(
   entry: Pick<ModelHealthSummary, "checkedAt" | "lastCheckedAt">,
@@ -1441,8 +1441,8 @@ export function modelHealthTone(
     const app = key || (status.appType === "claude" || status.appType === "codex" || status.appType === "gemini"
       ? status.appType : undefined);
     const fingerprint = app ? share.appRuntimes?.[app]?.modelProbe?.healthFingerprint : undefined;
-    const applies = key ? status.appType === key && !!fingerprint && fingerprint === status.healthFingerprint
-      : !fingerprint || fingerprint === status.healthFingerprint;
+    if (!key) return shareAccountHealthPresentation(status, fingerprint, locale);
+    const applies = status.appType === key && !!fingerprint && fingerprint === status.healthFingerprint;
     return modelHealthPresentation(applies ? status : undefined, locale);
   }
   if (!key) return modelHealthPresentation(undefined, locale);

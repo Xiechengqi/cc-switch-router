@@ -19,7 +19,7 @@ import {
   providerStatusIdentity,
 } from "@/components/dashboard/share-dashboard-utils";
 import { CORE_SHARE_APPS, SHARE_APP_LABELS } from "@/lib/share-app";
-import { modelHealthPresentation } from "@/lib/share-health";
+import { modelHealthPresentation, shareAccountHealthPresentation } from "@/lib/share-health";
 import type { ShareProviderStatusPanelView } from "@/components/dashboard/share-provider-status-panel";
 
 export const MAX_USER_MODEL_ROUTES = 100;
@@ -56,6 +56,25 @@ export function moveModelRouteTarget(ids: string[], from: number, to: number): s
   const next = [...ids];
   next.splice(to, 0, next.splice(from, 1)[0]);
   return next;
+}
+
+/** Transfer uses list order, not checkbox click order. Stale selections never
+ * reintroduce revoked/removed items; capacity failures are atomic. */
+export function modelRouteTransferSelection(ids: string[], checked: string[]): string[] {
+  const wanted = new Set(checked);
+  return [...new Set(ids)].filter(id => wanted.has(id));
+}
+
+export function transferModelRouteTargets(
+  selected: string[], eligible: string[], checked: string[], direction: "in" | "out",
+): string[] {
+  if (direction === "out") {
+    const removed = new Set(modelRouteTransferSelection(selected, checked));
+    return removed.size ? selected.filter(id => !removed.has(id)) : selected;
+  }
+  const added = modelRouteTransferSelection(eligible, checked).filter(id => id.trim() && !selected.includes(id));
+  if (!added.length || selected.length + added.length > MAX_MODEL_ROUTE_TARGETS) return selected;
+  return [...selected, ...added];
 }
 
 export function modelRouteDragAnnouncements(
@@ -252,8 +271,8 @@ export function modelRoutingShareAccountLines(
   };
 }
 
-/** Routing is protocol-scoped; a representative App cannot lend its green
- * status (or its account) to another protocol. Legacy responses stay unknown. */
+/** Account content follows the selected protocol; its background follows the
+ * same Share-level observation as All. Never relabel the observation's App. */
 export function modelRoutingShareAccountView(
   share: UserModelRoutingShare,
   app: ModelRoutingApp,
@@ -263,17 +282,23 @@ export function modelRoutingShareAccountView(
 ): ShareProviderStatusPanelView {
   const capability = share.apps.includes(app)
     ? share.appCapabilities?.find(item => item.app === app) : undefined;
-  const status = capability?.liveModelHealthStatus || capability?.modelHealthStatus;
-  const applies = status?.appType === app && !!capability?.healthFingerprint
-    && status.healthFingerprint === capability.healthFingerprint;
-  const health = modelHealthPresentation(applies ? status : undefined, locale, now);
+  const shareStatus = share.liveModelHealthStatus || share.modelHealthStatus;
+  const observedCapability = share.appCapabilities?.find(item => item.app === shareStatus?.appType);
+  // Old Router responses only carry per-App evidence. Keep that compatibility
+  // path strict; do not synthesize a Share observation from another App.
+  const legacyStatus = capability?.liveModelHealthStatus || capability?.modelHealthStatus;
+  const legacyApplies = legacyStatus?.appType === app && !!capability?.healthFingerprint
+    && legacyStatus.healthFingerprint === capability.healthFingerprint;
+  const health = shareStatus
+    ? shareAccountHealthPresentation(shareStatus, observedCapability?.healthFingerprint, locale, now)
+    : modelHealthPresentation(legacyApplies ? legacyStatus : undefined, locale, now);
   const lines = modelRoutingShareAccountLines(share, locale, labels.passthrough, labels.unavailable, app);
   return {
     ...lines,
     primaryMonospace: !!capability && isApiProviderRuntime(routingCapabilityRuntime(capability)),
     toneClassName: health.className,
     panelTitle: health.title,
-    healthLabel: [health.label, health.detailLabel !== health.label ? health.detailLabel : ""].filter(Boolean).join(" · "),
+    healthLabel: [shareStatus ? "Share" : "", health.label, health.detailLabel !== health.label ? health.detailLabel : ""].filter(Boolean).join(" · "),
   };
 }
 

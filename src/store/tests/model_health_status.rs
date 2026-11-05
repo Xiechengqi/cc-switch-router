@@ -285,6 +285,19 @@ async fn model_routing_health_is_protocol_scoped_authorized_read_only_and_config
         .await
         .unwrap();
     let share = &routing.eligible_shares[0];
+    assert_eq!(share.live_model_health_status.state, "healthy");
+    assert_eq!(
+        share.live_model_health_status.app_type.as_deref(),
+        Some("codex")
+    );
+    assert_eq!(
+        serde_json::to_value(&share.live_model_health_status).unwrap(),
+        serde_json::to_value(f.live_at(Utc::now()).await).unwrap(),
+        "routing exposes the same Share-level account health as the All view"
+    );
+    let wire = serde_json::to_value(share).unwrap();
+    assert_eq!(wire["liveModelHealthStatus"]["state"], "healthy");
+    assert!(wire.get("modelHealthStatus").is_some());
     assert!(
         !share.is_online,
         "offline authorized Shares can still be configured"
@@ -314,7 +327,7 @@ async fn model_routing_health_is_protocol_scoped_authorized_read_only_and_config
     assert!(claude.model_health_status.is_none());
     assert!(
         claude.live_model_health_status.is_none(),
-        "Codex cannot lend its green status to Claude"
+        "Share background may be shared, but per-App evidence must not pretend Claude was tested"
     );
     let denied = f
         .store
@@ -354,6 +367,10 @@ async fn model_routing_health_is_protocol_scoped_authorized_read_only_and_config
         .find(|cap| cap.app == "codex")
         .unwrap();
     assert_eq!(
+        partial.eligible_shares[0].live_model_health_status.state,
+        "unknown"
+    );
+    assert_eq!(
         codex.live_model_health_status.as_ref().unwrap().state,
         "unknown"
     );
@@ -388,6 +405,10 @@ async fn model_routing_health_is_protocol_scoped_authorized_read_only_and_config
         .iter()
         .find(|cap| cap.app == "codex")
         .unwrap();
+    assert_eq!(
+        changed.eligible_shares[0].live_model_health_status.state,
+        "unknown"
+    );
     assert_eq!(
         codex.health_fingerprint.as_deref(),
         Some("c".repeat(64).as_str())

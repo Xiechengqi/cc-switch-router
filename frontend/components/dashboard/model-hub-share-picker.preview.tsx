@@ -5,7 +5,7 @@ import { interpolate, messages, type MessageKey } from "@/lib/i18n";
 import type { UserModelRoutingShare } from "@/lib/types";
 import { SharePoolPicker } from "./model-hub-share-picker";
 
-/** Hallmark · component: routing queue · genre: modern-minimal
+/** Hallmark · component: routing Transfer · genre: modern-minimal
  * Existing Router tokens, no new page theme. Development fixtures only;
  * not imported by a production route and never requests accounts or API keys.
  * Eight-state preview is supplied for optional human inspection, not a claim
@@ -46,7 +46,7 @@ function StatePreview({ state }: { state: (typeof states)[number] }) {
 export function ModelHubSharePickerPreview() {
   return (
     <div className="grid min-w-0 gap-6 bg-background p-4 text-foreground">
-      <h2 className="text-base font-semibold">Routing queue — development fixtures</h2>
+      <h2 className="text-base font-semibold">Routing Transfer — development fixtures</h2>
       <style>{`
         .route-state-preview.is-hover button:not(:disabled),
         .route-state-preview.is-active button:not(:disabled) { background: var(--color-provider-paper); }
