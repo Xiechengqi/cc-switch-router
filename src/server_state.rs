@@ -67,6 +67,9 @@ pub struct ServerState {
     /// In-memory rolling tracker of proxy traffic by user origin. Drives the dashboard
     /// "demand" overlay and burst-arc animation; not persisted across restarts.
     pub recent_traffic: RecentTraffic,
+    /// Circuit breakers for model-route failover candidates. In-memory,
+    /// traffic-driven; see [`crate::route_breaker`].
+    pub route_breakers: Arc<crate::route_breaker::RouteBreakerRegistry>,
     /// In-memory temporary ban tracker for repeated invalid API authentication.
     pub abuse: Arc<AbuseTracker>,
     /// Share-scoped client abuse windows and the hot cache of persisted active bans.

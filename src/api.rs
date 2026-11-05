@@ -3925,6 +3925,56 @@ mod tests {
     }
 
     #[test]
+    fn connection_live_health_respects_dynamic_latency_policy_and_ignores_caller_errors() {
+        assert_eq!(
+            connection_test_live_health_result(true, 200, 11321, Some(6000), None, "p"),
+            Some("degraded")
+        );
+        assert_eq!(
+            connection_test_live_health_result(true, 200, 11321, Some(15000), None, "p"),
+            Some("success")
+        );
+        assert_eq!(
+            connection_test_live_health_result(true, 200, 6000, Some(6000), None, "p"),
+            Some("success")
+        );
+        assert_eq!(
+            connection_test_live_health_result(true, 200, 10, None, None, "p"),
+            None
+        );
+        for code in [401, 402, 403, 429, 500, 502, 503] {
+            assert_eq!(
+                connection_test_live_health_result(false, code, 100, Some(6000), None, "p"),
+                None
+            );
+        }
+        let body = r#"{"error":{"code":"cc_switch_rate_limited","details":{"scope":"account_rate_limit","providerId":"p"}}}"#;
+        let mut failure = parse_share_connection_failure(429, body).unwrap();
+        assert_eq!(
+            connection_test_live_health_result(false, 429, 100, None, Some(&failure), "p"),
+            Some("failed")
+        );
+        assert_eq!(
+            connection_test_live_health_result(false, 429, 100, None, Some(&failure), "other"),
+            None
+        );
+        for scope in [
+            "user",
+            "share",
+            "share_user",
+            "quota",
+            "wallet",
+            "parallel_limit",
+        ] {
+            failure.scope = Some(scope.into());
+            assert_eq!(
+                connection_test_live_health_result(false, 429, 100, None, Some(&failure), "p"),
+                None
+            );
+        }
+    }
+
+    #[test]
     fn admin_model_price_decimal_parser_is_exact_and_bounded() {
         assert_eq!(parse_usd_per1m_micros("input", "15").unwrap(), 15_000_000);
         assert_eq!(
@@ -8728,6 +8778,35 @@ struct ShareConnectionTestResponse {
     scheduling_recovery: Option<crate::store::ShareSchedulingRecovery>,
 }
 
+fn connection_test_live_health_result(
+    success: bool,
+    status_code: u16,
+    duration_ms: u64,
+    threshold_ms: Option<u64>,
+    failure: Option<&ShareConnectionFailure>,
+    provider_id: &str,
+) -> Option<&'static str> {
+    if success {
+        return threshold_ms.map(|threshold| {
+            if duration_ms > threshold {
+                "degraded"
+            } else {
+                "success"
+            }
+        });
+    }
+    // Only an explicit Provider-account cooldown is attributable here. HTTP
+    // status alone cannot distinguish a user's quota from an upstream outage.
+    failure
+        .filter(|failure| {
+            status_code == 429
+                && failure.code == "cc_switch_rate_limited"
+                && failure.scope.as_deref() == Some("account_rate_limit")
+                && failure.provider_id.as_deref() == Some(provider_id)
+        })
+        .map(|_| "failed")
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ShareConnectionFailure {
@@ -9919,6 +9998,25 @@ async fn test_share_connection(
             "share does not enable the {app} API"
         )));
     }
+    let live_health_context = if operation == "text" {
+        if let Some(probe) = share_model_probe_for_app(&share, &app) {
+            match state
+                .store
+                .prepare_connection_test_health(&share_id, &app, probe)
+                .await
+            {
+                Ok(context) => context,
+                Err(error) => {
+                    tracing::warn!(share_id = %share_id, %error, "prepare connection test live health failed");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let prepared = if operation == "text" {
         let probe = share_model_probe_for_app(&share, &app)
             .cloned()
@@ -10179,6 +10277,26 @@ async fn test_share_connection(
             let body_text = String::from_utf8_lossy(&body.preview).into_owned();
             let success = (200..300).contains(&status_code) && body.error.is_none();
             let failure = parse_share_connection_failure(status_code, &body_text);
+            if let Some(context) = &live_health_context {
+                if let Some(status) = connection_test_live_health_result(
+                    success,
+                    status_code,
+                    duration_ms,
+                    context.degraded_threshold_ms,
+                    failure.as_ref(),
+                    share.bindings.get(&app).map(String::as_str).unwrap_or(""),
+                ) {
+                    // Health persistence must not turn a completed successful
+                    // inference into a failed test (and an accidental retry).
+                    if let Err(error) = state
+                        .store
+                        .finish_connection_test_health(context, status, status_code, duration_ms)
+                        .await
+                    {
+                        tracing::warn!(share_id = %share_id, %error, "record connection test live health failed");
+                    }
+                }
+            }
 
             tracing::info!(
                 tag = "test-connection",

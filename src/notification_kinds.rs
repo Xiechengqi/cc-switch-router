@@ -196,6 +196,16 @@ pub const KINDS: &[NoticeKind] = &[
         Some("Requests to affected Shares may be dropped; inspect recent tunnel churn."),
         Some("受影响的 Share 请求可能被丢弃，请检查最近的隧道变动。"),
     ),
+    attention(
+        "route_failover",
+        NO_FLAP,
+        "Model route failover",
+        "模型路由候选切换",
+        "A request failed over from the primary Share to a fallback candidate.",
+        "一次请求从主 Share 切换到了候选 Share。",
+        Some("Check the primary Share's health; the circuit breaker will auto-recover."),
+        Some("检查主 Share 状态；熔断器会在冷却后自动恢复。"),
+    ),
     record(
         "db_error",
         METRIC_FLAP_SECS,

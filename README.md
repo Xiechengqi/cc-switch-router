@@ -70,7 +70,7 @@ Client Market 新付费租用按日历月从平台余额预付。供应商月租
 
 每个区域额外提供一个可选的共享入口 `https://api.<TUNNEL_DOMAIN>`。用户在 Clients 页「我的」分页的「模型中枢」中维护精确的 `(App, 请求模型) → Share` 映射，同一把 Router API Key 可据此调用多个当前有权限的 Share。App 固定为 Claude、Codex、Gemini；模型名区分大小写且不会被 Router 改写。
 
-该入口不会替代 Share 子域名。`https://<share-subdomain>.<TUNNEL_DOMAIN>` 的直连调用继续生效，用户不配置任何模型路由时也不受影响。统一入口不存在默认 Share、隐式选择、fallback 或跨 Share 重试；映射只负责选择目标，不能授予权限。每次调用仍重新检查目标 Share 的 Owner / ShareTo / Free 权限、App 开启状态与在线路由，并复用原有 Share 代理链，所以地图、Share 侧边栏、请求日志、用量、限额和账务仍全部归属目标 Share。
+该入口不会替代 Share 子域名。`https://<share-subdomain>.<TUNNEL_DOMAIN>` 的直连调用继续生效，用户不配置任何模型路由时也不受影响。统一入口不存在默认 Share 或隐式选择；映射只负责选择目标，不能授予权限。每条映射可附加用户显式配置的有序候选列表，当前候选失败（连接错误/超时/可重试状态码）时按序切换，响应字节流出后即锁死，候选耗尽仍 fail closed。每次调用仍重新检查目标 Share 的 Owner / ShareTo / Free 权限、App 开启状态与在线路由，并复用原有 Share 代理链，所以地图、Share 侧边栏、请求日志、用量、限额和账务仍全部归属目标 Share。
 
 配置控制面为 Session 鉴权的 `GET/PUT /v1/me/model-routing`，推理面接受同一用户 API Key 的 `Authorization: Bearer`、`x-api-key` 或 `x-goog-api-key`。完整路径与错误契约见 [PROTOCOL.md](PROTOCOL.md)。
 

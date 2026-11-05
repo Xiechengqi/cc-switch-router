@@ -373,6 +373,14 @@ const MIGRATIONS: &[(i64, &str)] = &[
         108,
         include_str!("../schema/0108_share_control_recovery.sql"),
     ),
+    (
+        109,
+        include_str!("../schema/0109_share_live_model_health.sql"),
+    ),
+    (
+        110,
+        include_str!("../schema/0110_user_model_route_candidates.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -882,8 +890,86 @@ fn migration_checksum(sql: &str) -> String {
 mod tests {
     use super::*;
 
-    // Migration 0102 dropped the write-only `dashboard_ux_events` table.
-    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 276;
+    // Includes live-health evidence (0109) and ordered route candidates (0110).
+    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 278;
+
+    #[test]
+    fn migration_109_adds_live_health_without_inventing_evidence_or_rewriting_cycles_and_money() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 108);
+        conn.execute_batch(
+            "INSERT INTO shares (share_id,capacity_pool_id,installation_id,share_name,app_type,
+                 token_limit,tokens_used,requests_count,share_status,created_at,expires_at,updated_at)
+             VALUES ('health-share','pool','server','Share','codex',100,25,3,'active',
+                 'before','2099-01-01T00:00:00Z','before');
+             INSERT INTO share_model_health_slots (share_id,slot_start,claim_token,claimed_at,
+                 app_type,api_type,requested_model,status,checked_at,source,updated_at)
+             VALUES ('health-share',1800,'claim',1800,'codex','openai','model',
+                 'failed',1810,'cc-switch-router-cycle:utc-1800',1810);",
+        )
+        .unwrap();
+        crate::market_wallet::credit_verified_topup_tx(
+            &conn,
+            "buyer",
+            "health-topup",
+            1234,
+            "receipt",
+            "before",
+        )
+        .unwrap();
+        let wallet =
+            serde_json::to_value(crate::market_wallet::wallet_snapshot_tx(&conn, "buyer").unwrap())
+                .unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT model_health_degraded_threshold_ms,tokens_used,requests_count,updated_at FROM shares WHERE share_id='health-share'", [],
+                |r| Ok((r.get::<_,Option<i64>>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?))).unwrap(),
+            (None,25,3,"before".into())
+        );
+        assert_eq!(
+            conn.query_row("SELECT status,checked_at,source FROM share_model_health_slots WHERE share_id='health-share'", [],
+                |r| Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?))).unwrap(),
+            ("failed".into(),1810,"cc-switch-router-cycle:utc-1800".into())
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM share_model_live_observations",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            serde_json::to_value(crate::market_wallet::wallet_snapshot_tx(&conn, "buyer").unwrap())
+                .unwrap(),
+            wallet
+        );
+        for invalid in [999, 30001] {
+            assert!(
+                conn.execute(
+                    "UPDATE shares SET model_health_degraded_threshold_ms=?1",
+                    params![invalid]
+                )
+                .is_err()
+            );
+        }
+        conn.execute(
+            "UPDATE shares SET model_health_degraded_threshold_ms=6000",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap(),
+            CURRENT_SCHEMA_TABLE_COUNT
+        );
+    }
 
     #[test]
     fn migration_107_adds_share_settlement_without_rewriting_wallets_or_old_terms() {

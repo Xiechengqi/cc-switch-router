@@ -19,6 +19,7 @@ import * as React from "react";
 import { CompactSelect } from "@/components/common/compact-select";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { SegmentedControl } from "@/components/common/segmented-control";
+import { CandidateList } from "@/components/dashboard/model-hub-candidates";
 import { MarketShareApps, MarketProviderLogos } from "@/components/dashboard/share-market/market-share-identity";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import { useLocaleText } from "@/components/i18n/locale-provider";
@@ -59,6 +60,7 @@ import {
   type ModelRoutingProtocol,
   type ModelRoutingProtocolMode,
 } from "@/lib/model-routing";
+import { usePersistentState } from "@/lib/use-persistent-state";
 import { cn } from "@/lib/utils";
 import type { MessageKey } from "@/lib/i18n";
 
@@ -100,6 +102,9 @@ export type ModelRoutingController = {
   setPassthroughShare: (appType: ModelRoutingApp, shareId: string) => void;
   updateRoute: (clientId: string, patch: Partial<UserModelRouteInput>) => void;
   removeRoute: (clientId: string) => void;
+  addCandidate: (clientId: string, shareId: string) => void;
+  removeCandidate: (clientId: string, index: number) => void;
+  moveCandidate: (clientId: string, fromIndex: number, toIndex: number) => void;
 };
 
 function toDraftRoutes(profile: UserModelRoutingResponse): DraftModelRoute[] {
@@ -108,6 +113,7 @@ function toDraftRoutes(profile: UserModelRoutingResponse): DraftModelRoute[] {
     appType: route.appType,
     requestedModel: route.requestedModel,
     targetShareId: route.targetShareId,
+    candidates: route.candidates || [],
   }));
 }
 
@@ -222,6 +228,55 @@ export function useModelRoutingController(active: boolean): ModelRoutingControll
     setError("");
   }, []);
 
+  const addCandidate = React.useCallback((clientId: string, shareId: string) => {
+    setRoutes((current) =>
+      current.map((route) => {
+        if (route.clientId !== clientId) return route;
+        const candidates = route.candidates || [];
+        if (candidates.length >= 5) return route;
+        if (shareId === route.targetShareId || candidates.includes(shareId)) return route;
+        return { ...route, candidates: [...candidates, shareId] };
+      }),
+    );
+    setError("");
+  }, []);
+
+  const removeCandidate = React.useCallback((clientId: string, index: number) => {
+    setRoutes((current) =>
+      current.map((route) => {
+        if (route.clientId !== clientId) return route;
+        const candidates = (route.candidates || []).filter((_, i) => i !== index);
+        return { ...route, candidates };
+      }),
+    );
+    setError("");
+  }, []);
+
+  const moveCandidate = React.useCallback(
+    (clientId: string, fromIndex: number, toIndex: number) => {
+      setRoutes((current) =>
+        current.map((route) => {
+          if (route.clientId !== clientId) return route;
+          const candidates = [...(route.candidates || [])];
+          if (
+            fromIndex < 0 ||
+            fromIndex >= candidates.length ||
+            toIndex < 0 ||
+            toIndex >= candidates.length ||
+            fromIndex === toIndex
+          ) {
+            return route;
+          }
+          const [moved] = candidates.splice(fromIndex, 1);
+          candidates.splice(toIndex, 0, moved);
+          return { ...route, candidates };
+        }),
+      );
+      setError("");
+    },
+    [],
+  );
+
   const save = React.useCallback(async () => {
     if (!profile || busy) return;
     const validation = validateModelRoutes(routes);
@@ -291,6 +346,9 @@ export function useModelRoutingController(active: boolean): ModelRoutingControll
     setPassthroughShare,
     updateRoute,
     removeRoute,
+    addCandidate,
+    removeCandidate,
+    moveCandidate,
   };
 }
 
@@ -356,11 +414,16 @@ function protocolStatusLabel(
   mode: ModelRoutingProtocolMode,
   exactCount: number,
   t: ReturnType<typeof useLocaleText>["t"],
+  candidateCount = 0,
 ) {
-  if (mode === "exact" || mode === "mixed") {
-    return t(PROTOCOL_STATUS_KEYS[mode], { count: exactCount });
+  const base =
+    mode === "exact" || mode === "mixed"
+      ? t(PROTOCOL_STATUS_KEYS[mode], { count: exactCount })
+      : t(PROTOCOL_STATUS_KEYS[mode]);
+  if (candidateCount > 0) {
+    return `${base} · ${t("modelHub.candidates", { count: candidateCount })}`;
   }
-  return t(PROTOCOL_STATUS_KEYS[mode]);
+  return base;
 }
 
 export function ModelHubPanel({
@@ -376,8 +439,16 @@ export function ModelHubPanel({
   const [copied, setCopied] = React.useState<"endpoint" | "token" | "curl" | "">("");
   const [resetConfirmOpen, setResetConfirmOpen] = React.useState(false);
   const [leaveConfirmOpen, setLeaveConfirmOpen] = React.useState(false);
-  const [expanded, setExpanded] = React.useState(controller.dirty || forceExpanded);
-  const [activeProtocol, setActiveProtocol] = React.useState<ModelRoutingProtocol>("codex");
+  const [persistedExpanded, setPersistedExpanded, expandedHydrated] = usePersistentState<boolean>(
+    "cc_switch_router_model_hub_expanded_v1",
+    false,
+  );
+  const [persistedProtocol, setPersistedProtocol, protocolHydrated] = usePersistentState<ModelRoutingProtocol>(
+    "cc_switch_router_model_hub_protocol_v1",
+    "codex",
+  );
+  const [expanded, setExpandedState] = React.useState(controller.dirty || forceExpanded);
+  const [activeProtocol, setActiveProtocolState] = React.useState<ModelRoutingProtocol>("codex");
   const [testModels, setTestModels] = React.useState<Record<ModelRoutingProtocol, string>>({
     claude: "",
     codex: "",
@@ -388,6 +459,43 @@ export function ModelHubPanel({
   const [testError, setTestError] = React.useState("");
   const protocolInitializedRef = React.useRef(false);
   const lastFocusProtocolRef = React.useRef<ModelRoutingProtocol | null>(null);
+
+  // Wrap setters to also persist user choices. One-shot overrides (dirty
+  // auto-expand, focusProtocol deep-link) call the raw state setters so they
+  // do not overwrite the stored preference.
+  const setExpanded = React.useCallback(
+    (value: boolean | ((open: boolean) => boolean)) => {
+      setExpandedState((open) => {
+        const next = typeof value === "function" ? value(open) : value;
+        setPersistedExpanded(next);
+        return next;
+      });
+    },
+    [setPersistedExpanded],
+  );
+  const setActiveProtocol = React.useCallback(
+    (value: ModelRoutingProtocol) => {
+      setActiveProtocolState(value);
+      setPersistedProtocol(value);
+    },
+    [setPersistedProtocol],
+  );
+
+  // Restore persisted expanded state after hydration (dirty/forceExpanded can
+  // still force it open afterwards via the effect below).
+  const expandedHydratedRef = React.useRef(false);
+  React.useEffect(() => {
+    if (!expandedHydrated || expandedHydratedRef.current) return;
+    expandedHydratedRef.current = true;
+    if (persistedExpanded) setExpandedState(true);
+  }, [expandedHydrated, persistedExpanded]);
+
+  // Restore persisted protocol before the default-protocol effect runs.
+  React.useEffect(() => {
+    if (!protocolHydrated || protocolInitializedRef.current) return;
+    setActiveProtocolState(persistedProtocol);
+  }, [protocolHydrated, persistedProtocol]);
+
   const profile = controller.profile;
   const slots = React.useMemo(
     () => groupModelRoutesByProtocol(controller.routes),
@@ -412,20 +520,22 @@ export function ModelHubPanel({
   );
 
   React.useEffect(() => {
-    if (controller.dirty || forceExpanded) setExpanded(true);
+    if (controller.dirty || forceExpanded) setExpandedState(true);
   }, [controller.dirty, forceExpanded]);
 
   React.useEffect(() => {
     if (focusProtocol && lastFocusProtocolRef.current !== focusProtocol) {
-      setActiveProtocol(focusProtocol);
+      setActiveProtocolState(focusProtocol);
       lastFocusProtocolRef.current = focusProtocol;
       protocolInitializedRef.current = true;
       return;
     }
-    if (!profile || protocolInitializedRef.current) return;
-    setActiveProtocol(defaultModelRoutingProtocol(controller.routes, profile.eligibleShares));
+    if (!profile || protocolInitializedRef.current || !protocolHydrated) return;
+    // No one-shot override: honor the persisted tab if the user picked one
+    // before, otherwise fall back to the computed default.
+    setActiveProtocolState(persistedProtocol ?? defaultModelRoutingProtocol(controller.routes, profile.eligibleShares));
     protocolInitializedRef.current = true;
-  }, [controller.routes, focusProtocol, profile]);
+  }, [controller.routes, focusProtocol, profile, protocolHydrated, persistedProtocol]);
 
   React.useEffect(() => {
     if (!profile) {
@@ -604,6 +714,9 @@ export function ModelHubPanel({
             items={slots.map((slot) => {
               const slotMode = protocolSlotMode(slot);
               const slotAttention = protocolHasAttention(controller.routes, profile?.eligibleShares || [], slot.appType);
+              const slotCandidates =
+                (slot.passthrough?.candidates?.length || 0) +
+                slot.exact.reduce((sum, route) => sum + (route.candidates?.length || 0), 0);
               return {
                 id: slot.appType,
                 label: (
@@ -614,7 +727,7 @@ export function ModelHubPanel({
                       "hidden rounded px-1 py-px text-[10px] font-medium sm:inline",
                       slotAttention ? "bg-amber-100 text-amber-800" : slotMode === "empty" ? "text-slate-400" : "text-sky-700",
                     )}>
-                      {slotAttention ? t("modelHub.status.attention") : protocolStatusLabel(slotMode, slot.exact.length, t)}
+                      {slotAttention ? t("modelHub.status.attention") : protocolStatusLabel(slotMode, slot.exact.length, t, slotCandidates)}
                     </span>
                   </span>
                 ),
@@ -642,6 +755,7 @@ export function ModelHubPanel({
               {mode === "empty" ? (
                 <p className="text-xs text-muted-foreground">{t("modelHub.emptyProtocol")}</p>
               ) : null}
+              <p className="text-[11px] leading-4 text-slate-500">{t("modelHub.priorityHint")}</p>
               <label className="grid min-w-0 gap-1.5 text-xs text-muted-foreground">
                 {t("modelHub.passthrough")}
                 <CompactSelect
@@ -654,7 +768,20 @@ export function ModelHubPanel({
                   triggerClassName="min-h-11 w-full py-1.5"
                 />
                 {activeSlot?.passthrough ? (
-                  <span>{t(activeSlot.exact.length ? "modelHub.passthroughHint.mixed" : "modelHub.passthroughHint.none")}</span>
+                  <>
+                    <span>{t(activeSlot.exact.length ? "modelHub.passthroughHint.mixed" : "modelHub.passthroughHint.none")}</span>
+                    <CandidateList
+                      routeClientId={activeSlot.passthrough.clientId}
+                      primaryShareId={activeSlot.passthrough.targetShareId}
+                      candidates={activeSlot.passthrough.candidates || []}
+                      shareOptions={passthroughOptions.filter((option) => option.value !== PASSTHROUGH_UNSET)}
+                      disabled={controller.busy}
+                      t={t}
+                      onAdd={(shareId) => controller.addCandidate(activeSlot.passthrough!.clientId, shareId)}
+                      onRemove={(index) => controller.removeCandidate(activeSlot.passthrough!.clientId, index)}
+                      onMove={(from, to) => controller.moveCandidate(activeSlot.passthrough!.clientId, from, to)}
+                    />
+                  </>
                 ) : null}
               </label>
               <div className="grid min-w-0 gap-2">
@@ -702,6 +829,19 @@ export function ModelHubPanel({
                       >
                         <Trash2 className="h-4 w-4" />
                       </button>
+                      <div className="sm:col-span-3">
+                        <CandidateList
+                          routeClientId={route.clientId}
+                          primaryShareId={route.targetShareId}
+                          candidates={route.candidates || []}
+                          shareOptions={options}
+                          disabled={controller.busy}
+                          t={t}
+                          onAdd={(shareId) => controller.addCandidate(route.clientId, shareId)}
+                          onRemove={(index) => controller.removeCandidate(route.clientId, index)}
+                          onMove={(from, to) => controller.moveCandidate(route.clientId, from, to)}
+                        />
+                      </div>
                     </div>
                   );
                 }) : (

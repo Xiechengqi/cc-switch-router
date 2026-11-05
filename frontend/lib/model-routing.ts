@@ -43,7 +43,9 @@ export type ModelRouteValidationError =
   | "required"
   | "duplicate"
   | "too_many"
-  | "pattern";
+  | "pattern"
+  | "too_many_candidates"
+  | "duplicate_candidate";
 export const MODEL_ROUTING_PROTOCOLS = ["claude", "codex", "gemini"] as const;
 export type ModelRoutingProtocol = (typeof MODEL_ROUTING_PROTOCOLS)[number];
 export type ModelRoutingProtocolMode =
@@ -282,6 +284,7 @@ export function canonicalModelRoutes(
       appType: route.appType,
       requestedModel: route.requestedModel.trim(),
       targetShareId: route.targetShareId.trim(),
+      candidates: (route.candidates || []).map((candidate) => candidate.trim()).filter(Boolean),
     }))
     .sort((left, right) => {
       if (left.appType !== right.appType) {
@@ -318,7 +321,19 @@ export function validateModelRoutes(
       (route) => `${route.appType}\u0000${route.requestedModel}`,
     ),
   );
-  return keys.size === normalized.length ? null : "duplicate";
+  if (keys.size !== normalized.length) return "duplicate";
+  // Failover candidates: no duplicates within a route, none equal to the
+  // primary target, and within the per-route cap.
+  for (const route of normalized) {
+    const candidates = route.candidates || [];
+    if (candidates.length > 5) return "too_many_candidates";
+    const seen = new Set([route.targetShareId]);
+    for (const candidate of candidates) {
+      if (seen.has(candidate)) return "duplicate_candidate";
+      seen.add(candidate);
+    }
+  }
+  return null;
 }
 
 export function preferredModelRoutingApp(

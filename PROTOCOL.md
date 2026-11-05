@@ -512,6 +512,10 @@ Dashboard Share 与 Share Market listing 同时返回 Router 只读投影 `model
 
 该监测投影与 Server 的调度容错分开：首个瞬态 429 可以暂时保留调度资格，但检查仍为 failed，不可改写为 success。Router 的 runtime 摘要不能覆盖固定槽已有的 canonical 检查，也不能因省略对应模型而删除其状态；历史上被错误 runtime 摘要覆盖的检查展示按 immutable observation 还原读取，不改写原始证据。模型降级或待验证仅为 service readiness 提示，三次确认失败仍为 `provider_unavailable` 阻断提示；不引入新的调度或限流策略，不修改资金结算。
 
+客户端、Share 直达页和 Share Market 另返回只用于卡片展示的 `liveModelHealthStatus`。它以 `modelHealthStatus` 为基线，可采用时间更新且匹配当前 installation、代表 App、Provider、模型策略、请求/执行模型、health fingerprint 和当前 epoch 的手动证据。`source` 为 `periodic`、`server_manual` 或 `router_connection_test`，可携带 `latencyMs`。手动结果有效期同为 65 分钟；配置切换、暂停/恢复后不能复用旧 epoch 的结果。新配置即使要到下一半小时槽才开始周期监测，也可先显示可信的手动验证结果。首次正常验证为绿，响应慢为黄，真实失败先黄；已有近期失败时，手动成功仅显示黄“恢复中”，重复点击不能清除恢复窗口或制造三个周期成功。更新的周期结果优先。周期统计、service readiness、调度及资金仍只使用各自原有证据，不读取该实时展示投影。
+
+`GET /_share-router/share-runtime` 根对象新增可选 `manualModelHealth` 数组与 `modelHealthDegradedThresholdMs`（1000..30000，来自 Server 当前配置）。每条手动证据包含 `observationId/appType/providerId/healthFingerprint/requestedModel/actualModel/status/statusCode/latencyMs/checkedAt`，不含账号、凭据或原始错误。仅从当前配置已接受的真实 `cc-switch-manual` 检查日志生成，发送最新结果及有效期内最新的非正常结果（去重，最多两条），不从调度容错后的 `healthy/available` 推断。Router 经受认证的控制 RPC 接收，幂等存入独立展示表，保留七天，不回填半小时槽。旧 Router 忽略这两个根字段；旧 Server 缺字段时新 Router 回退周期结果，不把旧摘要当作可信手动证据。Share descriptor 及其签名结构不增加字段。
+
 `GET /v1/shares/:share_id/model-health-calendar?days=N` 返回 UTC 日历聚合,`N` 被限制在 1..400,Dashboard 默认读取 365 天。每个 active 日同时返回 eligible、completed、observed、successful、已确认上游侧失败、monitoring gap、成功率和覆盖率；成功率固定为 `successful / eligible`,覆盖率为 `observed / eligible`,缺失检查不能算成功。历史槽、canonical observation 与已结束 epoch 保留 400 天。日历只对以下调用方可见:活跃公开 Share Market listing 的访客、Share Owner、管理员、活跃 ShareTo 用户。
 
 Client 页和 Share Market 页的 Share 侧边栏使用同一个日历组件:日期方块按红、黄、浅绿、绿表达上游模型可用率,并显示月份横轴和星期纵轴。Tooltip 必须同时说明已观测数、确认的上游侧失败、监测缺口、覆盖率和同日配置切换；共享结果只标记“共享上游探针”,不披露其他 Share 数量。这一图表不能混用 30 秒连通率。
@@ -519,6 +523,8 @@ Client 页和 Share Market 页的 Share 侧边栏使用同一个日历组件:日
 ### 8.2 连接示例与手动测试
 
 “连接”弹窗把手动操作明确标为**端到端连接测试**,对每个已启用 App 只显示一条 Server-authoritative 模型请求。Curl 的 method、path、body、流式 header 和测试模型全部由对应 `appRuntimes.<app>.modelProbe` 生成；Router 的手动 `test-connection` 经公开 Share 路由执行这份 probe 并按 `responseMode` 校验 JSON 或 SSE 完成事件。半小时定时探针则由 Server 在内部对绑定 Provider 执行同一测试模型。两者共用模型/策略来源,但证据范围不同,前端和 Router 后端不得保留硬编码的 GPT、Claude 或 Gemini 测试模型表。
+
+完整成功的文字连接测试可记为 `router_connection_test` 实时展示证据，慢响应阈值使用 Server 经控制面提供的配置；旧 Server 未提供阈值时，成功结果不提升实时健康状态。测试前后须核对配置 revision、epoch、绑定和健康指纹，配置或阈值已变化则不记入展示证据。只有当前代表 App 影响概览颜色，其他接口成功不证明代表接口正常。失败不按 HTTP 状态直接归罪 Provider：用户自身余额、授权、配额、并发及控制链路错误不写全局健康失败；仅明确归属于当前 Provider 的账号限流可写失败。媒体测试和外部“本地测试”不写文字模型健康。健康记录为 best-effort，不得阻断连接测试或把已完成推理变成失败。测试完成后刷新 Dashboard，不伪造前端成功颜色。
 
 Responses 文字流测试仅在完整终态 JSON 证明 `status=incomplete`、`reason=max_output_tokens`、整数 `usage.output_tokens` 达到本次实际请求的正整数输出预算时，接受 `response.incomplete` 为连接成功；保留真实 `terminalEvent`。必须读完整条流，HTTP 错误、协议错误、读取失败、取消或后续失败均优先于成功。`[DONE]` 本身不能证明成功，也不要求 Responses 流包含它。该规则只用于手动连接测试，不修改生产代理的终态。
 
@@ -607,7 +613,9 @@ Router 先从协议路径确定 App，再用 `(user_id, app, requested model)` �
 
 优先级是静态的、一次查询即定终局的确定性选路，不是失败后的回退：第 1 级命中时第 2 级不参与，第 1 级未命中时也不存在“先试再退”的过程。两级都没有映射直接失败。
 
-无论命中哪一级，转发给 Share 的模型名**恒等于**客户端请求的模型名——Router 不改写请求体中的 `model`，由目标 Share 自行决定固定上游或继续透传。除用户显式写入的 `*` 记录外，绝不做模型改写、系统推断的默认 Share、按在线状态选 Share、前缀/后缀/正则/大小写不敏感匹配、fallback 或跨 Share retry。`*` 命中的请求与精确命中走完全相同的 Share 存在性、App 开启状态、用户 ACL 与活动路由校验，同样 fail closed。找到映射后仍在当前数据库快照中重新检查 Share 存在性、App 开启状态和用户 ACL，再确认相同 Share ID 的活动内存路由，最后把请求交给既有 `proxy_handler`。后者会再次执行 Share edge ACL、并发、请求体限制、IngressContext、流式生命周期和响应清洗。
+无论命中哪一级，转发给 Share 的模型名**恒等于**客户端请求的模型名——Router 不改写请求体中的 `model`，由目标 Share 自行决定固定上游或继续透传。除用户显式写入的 `*` 记录外，绝不做模型改写、系统推断的默认 Share、按在线状态选 Share、前缀/后缀/正则/大小写不敏感匹配。`*` 命中的请求与精确命中走完全相同的 Share 存在性、App 开启状态、用户 ACL 与活动路由校验，同样 fail closed。找到映射后仍在当前数据库快照中重新检查 Share 存在性、App 开启状态和用户 ACL，再确认相同 Share ID 的活动内存路由，最后把请求交给既有 `proxy_handler`。后者会再次执行 Share edge ACL、并发、请求体限制、IngressContext、流式生命周期和响应清洗。
+
+**候选切换（failover）**——每条路由可携带用户显式配置的有序候选目标列表（主目标为优先级 0，候选为优先级 1..=n）。转发时按优先级升序尝试：当前候选连接失败、超时或返回可重试状态码（401/403/429/5xx）时，自动切换到下一个候选。一旦任何响应字节已发给客户端，该次请求即锁死在当前候选，绝不切换（避免客户端收到拼接的两段响应）。候选耗尽时报错，fail closed——绝不臆造列表之外的目标。每个候选目标配有进程内存态熔断器（连续失败 3 次开启，冷却 60s 后半开单路探测），熔断仅由真实转发流量驱动，与 Share 健康探测解耦。候选列表是用户显式声明的，可见、可审计、可删除，不属于"系统推断的默认 Share"。
 
 模型列表分两种模式，取决于该用户在该 App 下的路由配置形态。
 

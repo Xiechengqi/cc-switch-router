@@ -687,6 +687,17 @@ pub struct UserModelRouteResolution {
     /// this app instead of matching an exact model name. Observability only —
     /// the forwarded request is byte-identical either way.
     pub matched_wildcard: bool,
+    /// The route row this resolution came from. Feeds the circuit breaker key.
+    pub route_id: String,
+    /// Ordered failover candidates after the primary target. Each carries its
+    /// own subdomain so the proxy can advance without another query.
+    pub candidates: Vec<RouteCandidate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteCandidate {
+    pub target_share_id: String,
+    pub subdomain: String,
 }
 
 #[derive(Debug, Clone)]
@@ -7854,6 +7865,7 @@ impl AppStore {
                 app_type: route.app_type.clone(),
                 requested_model: route.requested_model.clone(),
                 target_share_id: route.target_share_id.clone(),
+                candidates: route.candidates.clone(),
             })
             .collect::<Vec<_>>();
         if current_routes == routes {
@@ -7916,6 +7928,39 @@ impl AppStore {
                     ));
                 }
             }
+            // Failover candidates get the same live validation as the primary.
+            for candidate in &route.candidates {
+                match inspect_model_route_target(&tx, &email, candidate, &route.app_type)? {
+                    ModelRouteTargetAccess::Eligible { .. } => {}
+                    ModelRouteTargetAccess::Missing => {
+                        return Err(model_routing_error(
+                            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                            "user_model_route_target_unavailable",
+                            "candidate Share does not exist",
+                            serde_json::json!({ "targetShareId": candidate }),
+                        ));
+                    }
+                    ModelRouteTargetAccess::AppUnavailable => {
+                        return Err(model_routing_error(
+                            axum::http::StatusCode::CONFLICT,
+                            "user_model_route_app_unavailable",
+                            "candidate Share does not support this app",
+                            serde_json::json!({
+                                "targetShareId": candidate,
+                                "appType": route.app_type,
+                            }),
+                        ));
+                    }
+                    ModelRouteTargetAccess::Unauthorized => {
+                        return Err(model_routing_error(
+                            axum::http::StatusCode::FORBIDDEN,
+                            "user_model_route_unauthorized",
+                            "candidate Share is not authorized for this user",
+                            serde_json::json!({ "targetShareId": candidate }),
+                        ));
+                    }
+                }
+            }
         }
 
         let next_revision = current_revision
@@ -7944,14 +7989,15 @@ impl AppStore {
         for route in &routes {
             let existing =
                 existing_by_key.get(&(route.app_type.clone(), route.requested_model.clone()));
+            let route_id = existing
+                .map(|record| record.id.clone())
+                .unwrap_or_else(|| Uuid::new_v4().to_string());
             tx.execute(
                 "INSERT INTO user_model_routes (
                     id, user_id, app_type, requested_model, target_share_id, created_at, updated_at
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
-                    existing
-                        .map(|record| record.id.clone())
-                        .unwrap_or_else(|| Uuid::new_v4().to_string()),
+                    route_id,
                     user.id,
                     route.app_type,
                     route.requested_model,
@@ -7963,6 +8009,23 @@ impl AppStore {
                 ],
             )
             .map_err(|e| AppError::Internal(format!("insert model route failed: {e}")))?;
+            // Ordered failover candidates (priority 1..=n after the primary).
+            for (index, candidate) in route.candidates.iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO user_model_route_candidates (
+                        id, route_id, target_share_id, priority, created_at, updated_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        Uuid::new_v4().to_string(),
+                        route_id,
+                        candidate,
+                        (index + 1) as i64,
+                        now_text,
+                        now_text,
+                    ],
+                )
+                .map_err(|e| AppError::Internal(format!("insert route candidate failed: {e}")))?;
+            }
         }
         let routes_json = serde_json::to_string(&routes)
             .map_err(|e| AppError::Internal(format!("serialize model routes failed: {e}")))?;
@@ -8060,11 +8123,24 @@ impl AppStore {
         // equality; that is the same target the wildcard would have selected, so
         // report it as a wildcard hit rather than an exact one.
         let matched_wildcard = matched_model == WILDCARD_REQUESTED_MODEL;
+        // The primary target is settled above; now load the route's ordered
+        // failover candidates so the proxy can advance without another query.
+        let route_id: String = conn
+            .query_row(
+                "SELECT id FROM user_model_routes
+                 WHERE user_id = ?1 AND app_type = ?2 AND requested_model = ?3",
+                params![user_id, app_type, matched_model],
+                |row| row.get(0),
+            )
+            .map_err(|e| AppError::Internal(format!("resolve route id failed: {e}")))?;
+        let candidates = load_route_candidates(&conn, &route_id, &email, &app_type)?;
         match classify_model_route_target(target, &email, &app_type) {
             ModelRouteTargetAccess::Eligible { subdomain } => Ok(Some(UserModelRouteResolution {
                 target_share_id,
                 subdomain,
                 matched_wildcard,
+                route_id,
+                candidates,
             })),
             ModelRouteTargetAccess::Missing => Err(model_routing_error(
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -8158,11 +8234,28 @@ impl AppStore {
         // erroring: the catalog endpoint stays best-effort, while the inference
         // path still fails closed with the precise reason.
         match classify_model_route_target(target, &email, &app_type) {
-            ModelRouteTargetAccess::Eligible { subdomain } => Ok(Some(UserModelRouteResolution {
-                target_share_id,
-                subdomain,
-                matched_wildcard: true,
-            })),
+            ModelRouteTargetAccess::Eligible { subdomain } => {
+                // Surface the route id + ordered candidates so a forwarded
+                // catalog request can advance on failure just like inference.
+                let route_id: String = conn
+                    .query_row(
+                        "SELECT id FROM user_model_routes
+                         WHERE user_id = ?1 AND app_type = ?2 AND requested_model = ?3",
+                        params![user_id, app_type, WILDCARD_REQUESTED_MODEL],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| {
+                        AppError::Internal(format!("resolve passthrough route id failed: {e}"))
+                    })?;
+                let candidates = load_route_candidates(&conn, &route_id, &email, &app_type)?;
+                Ok(Some(UserModelRouteResolution {
+                    target_share_id,
+                    subdomain,
+                    matched_wildcard: true,
+                    route_id,
+                    candidates,
+                }))
+            }
             _ => Ok(None),
         }
     }
@@ -8818,15 +8911,27 @@ impl AppStore {
                 .unwrap_or_default()
         };
         let (tokens_used_by_app, requests_count_by_app) = authoritative_share_usage_by_app(&share);
+        let health_now = Utc::now();
+        let model_health_status = model_health::current_status(
+            &conn,
+            &share.share_id,
+            &share.support,
+            &share.app_runtimes,
+            &share.bindings,
+            health_now,
+        )?;
+        let live_model_health_status = model_health::live_status(
+            &conn,
+            &share.share_id,
+            &share.support,
+            &share.app_runtimes,
+            &share.bindings,
+            health_now,
+            &model_health_status,
+        )?;
         let mut view = ShareView {
-            model_health_status: model_health::current_status(
-                &conn,
-                &share.share_id,
-                &share.support,
-                &share.app_runtimes,
-                &share.bindings,
-                Utc::now(),
-            )?,
+            model_health_status,
+            live_model_health_status,
             provider_identity: crate::provider_presentation::identity_for_share(&share),
             router_id: "main".to_string(),
             share_id: share.share_id,
@@ -12197,6 +12302,7 @@ impl AppStore {
             recent_model_health_checks,
             model_health_by_share,
             model_health_status_by_share,
+            live_model_health_status_by_share,
             client_tunnels,
         ) = {
             let conn = self.conn.lock().await;
@@ -12211,6 +12317,21 @@ impl AppStore {
                         &share.app_runtimes,
                         &share.bindings,
                         now,
+                    )
+                    .map(|status| (share.share_id.clone(), status))
+                })
+                .collect::<Result<HashMap<_, _>, _>>()?;
+            let live_statuses = shares
+                .iter()
+                .map(|(_, share)| {
+                    model_health::live_status(
+                        &conn,
+                        &share.share_id,
+                        &share.support,
+                        &share.app_runtimes,
+                        &share.bindings,
+                        now,
+                        &statuses[&share.share_id],
                     )
                     .map(|status| (share.share_id.clone(), status))
                 })
@@ -12231,6 +12352,7 @@ impl AppStore {
                 list_recent_share_model_health_checks(&conn, SHARE_MODEL_HEALTH_CHECK_LIMIT)?,
                 list_model_health_summaries(&conn)?,
                 statuses,
+                live_statuses,
                 list_client_tunnels(&conn)?,
             )
         };
@@ -12405,6 +12527,10 @@ impl AppStore {
                         .unwrap_or_default()
                 };
                 let mut view = ShareView {
+                    live_model_health_status: live_model_health_status_by_share
+                        .get(&share.share_id)
+                        .cloned()
+                        .unwrap_or_default(),
                     model_health_status: model_health_status_by_share
                         .get(&share.share_id)
                         .cloned()
@@ -14834,6 +14960,11 @@ impl AppStore {
 
     pub async fn prune_share_model_health_slots(&self, before: i64) -> Result<usize, AppError> {
         let conn = self.conn.lock().await;
+        conn.execute(
+            "DELETE FROM share_model_live_observations WHERE checked_at < ?1",
+            params![Utc::now().timestamp().saturating_sub(7 * 86_400)],
+        )
+        .map_err(|error| AppError::Internal(format!("prune live model health: {error}")))?;
         let deleted = conn
             .execute(
                 "DELETE FROM share_model_health_slots WHERE slot_start < ?1",
@@ -15220,6 +15351,7 @@ impl AppStore {
                  tokens_used = COALESCE(?6, tokens_used),
                  requests_count = COALESCE(?7, requests_count),
                  share_status = COALESCE(?8, share_status),
+                 model_health_degraded_threshold_ms = ?10,
                  updated_at = ?9
              WHERE share_id = ?1",
             params![
@@ -15232,6 +15364,9 @@ impl AppStore {
                 snapshot.requests_count,
                 snapshot.share_status,
                 observed_at.to_rfc3339(),
+                snapshot
+                    .model_health_degraded_threshold_ms
+                    .filter(|value| (1000..=30000).contains(value)),
             ],
         )
         .map_err(|e| AppError::Internal(format!("update share runtime snapshot failed: {e}")))?;
@@ -15240,6 +15375,7 @@ impl AppStore {
             sync_share_model_probe_epoch_tx(&tx, &snapshot.share_id, slot_start, None)?;
         }
         record_runtime_model_health_snapshot_conn(&tx, &snapshot)?;
+        model_health::record_server_manual(&tx, &snapshot, observed_at)?;
         crate::share_market::reconcile_share_contract_integrity_tx(
             &tx,
             &snapshot.share_id,
@@ -15492,10 +15628,24 @@ pub async fn fetch_share_runtime_snapshot_from_route(
         )));
     }
 
-    response
+    let snapshot = response
         .json::<ShareRuntimeSnapshotResponse>()
         .await
-        .map_err(|e| AppError::Internal(format!("decode share runtime failed: {e}")))
+        .map_err(|e| AppError::Internal(format!("decode share runtime failed: {e}")))?;
+    validate_share_runtime_snapshot_target(&snapshot, share_id)?;
+    Ok(snapshot)
+}
+
+fn validate_share_runtime_snapshot_target(
+    snapshot: &ShareRuntimeSnapshotResponse,
+    expected_share_id: &str,
+) -> Result<(), AppError> {
+    if snapshot.share_id != expected_share_id {
+        return Err(AppError::Internal(
+            "Share runtime response identity does not match the requested Share".into(),
+        ));
+    }
+    Ok(())
 }
 
 const LEGACY_PERMANENT_SHARE_EXPIRES_AT: &str = "2100-01-01T00:00:00Z";
@@ -28768,6 +28918,9 @@ fn user_api_token_status(record: UserApiTokenRecord) -> UserApiTokenStatus {
 
 const MAX_USER_MODEL_ROUTES: usize = 100;
 const MAX_USER_MODEL_ROUTE_EVENTS_PER_USER: usize = 100;
+/// Cap on failover candidates per route (after the primary target). Keeps the
+/// retry loop bounded and the UI list manageable.
+pub(crate) const MAX_USER_MODEL_ROUTE_CANDIDATES: usize = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ModelRouteTargetAccess {
@@ -28856,10 +29009,31 @@ fn normalize_user_model_routes(
                 "duplicate model route for {app_type}/{requested_model}"
             )));
         }
+        if route.candidates.len() > MAX_USER_MODEL_ROUTE_CANDIDATES {
+            return Err(AppError::BadRequest(format!(
+                "at most {MAX_USER_MODEL_ROUTE_CANDIDATES} failover candidates per route"
+            )));
+        }
+        let mut seen_candidates = HashSet::with_capacity(route.candidates.len());
+        seen_candidates.insert(target_share_id.clone());
+        let mut candidates = Vec::with_capacity(route.candidates.len());
+        for candidate in &route.candidates {
+            let candidate = candidate.trim().to_string();
+            if candidate.is_empty() || candidate.chars().count() > 200 {
+                return Err(AppError::BadRequest("invalid candidate Share id".into()));
+            }
+            if !seen_candidates.insert(candidate.clone()) {
+                return Err(AppError::BadRequest(
+                    "duplicate Share in failover candidates".into(),
+                ));
+            }
+            candidates.push(candidate);
+        }
         normalized.push(UserModelRouteInput {
             app_type,
             requested_model,
             target_share_id,
+            candidates,
         });
     }
     normalized.sort_by(|left, right| {
@@ -28882,20 +29056,51 @@ fn list_user_model_routes(
              ORDER BY app_type ASC, requested_model ASC",
         )
         .map_err(|e| AppError::Internal(format!("prepare model routes failed: {e}")))?;
-    statement
+    let mut routes = statement
         .query_map(params![user_id], |row| {
             Ok(UserModelRouteView {
                 id: row.get(0)?,
                 app_type: row.get(1)?,
                 requested_model: row.get(2)?,
                 target_share_id: row.get(3)?,
+                candidates: Vec::new(),
                 created_at: parse_dt_sql(&row.get::<_, String>(4)?)?,
                 updated_at: parse_dt_sql(&row.get::<_, String>(5)?)?,
             })
         })
         .map_err(|e| AppError::Internal(format!("query model routes failed: {e}")))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| AppError::Internal(format!("read model routes failed: {e}")))
+        .map_err(|e| AppError::Internal(format!("read model routes failed: {e}")))?;
+    drop(statement);
+    // Attach ordered failover candidates in one pass.
+    let mut index_by_id: HashMap<String, usize> = routes
+        .iter()
+        .enumerate()
+        .map(|(index, route)| (route.id.clone(), index))
+        .collect();
+    let mut candidates_stmt = conn
+        .prepare(
+            "SELECT c.route_id, c.target_share_id
+             FROM user_model_route_candidates c
+             JOIN user_model_routes r ON r.id = c.route_id
+             WHERE r.user_id = ?1
+             ORDER BY c.route_id ASC, c.priority ASC",
+        )
+        .map_err(|e| AppError::Internal(format!("prepare route candidates failed: {e}")))?;
+    let rows = candidates_stmt
+        .query_map(params![user_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| AppError::Internal(format!("query route candidates failed: {e}")))?;
+    for row in rows {
+        let (route_id, target) = row
+            .map_err(|e| AppError::Internal(format!("read route candidates failed: {e}")))?;
+        if let Some(index) = index_by_id.get(&route_id) {
+            routes[*index].candidates.push(target);
+        }
+    }
+    index_by_id.clear();
+    Ok(routes)
 }
 
 fn active_share_grant_for_email(
@@ -29220,6 +29425,59 @@ fn inspect_model_route_target(
         .optional()
         .map_err(|e| AppError::Internal(format!("inspect model route target failed: {e}")))?;
     Ok(classify_model_route_target(record, email, app_type))
+}
+
+/// Loads the ordered failover candidates for one route, each live-validated
+/// against the current Share snapshot. Ineligible candidates are skipped so
+/// the proxy's retry loop only walks usable targets.
+fn load_route_candidates(
+    conn: &Connection,
+    route_id: &str,
+    email: &str,
+    app_type: &str,
+) -> Result<Vec<RouteCandidate>, AppError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT c.target_share_id,
+                    s.share_id IS NOT NULL,
+                    COALESCE(s.subdomain, ''),
+                    s.owner_email,
+                    COALESCE(s.user_grants_json, '{}'),
+                    COALESCE(s.free_access, 0),
+                    COALESCE(s.enabled_claude, 0),
+                    COALESCE(s.enabled_codex, 0),
+                    COALESCE(s.enabled_gemini, 0),
+                    EXISTS (
+                        SELECT 1 FROM share_bindings b
+                        WHERE b.share_id = c.target_share_id AND b.app_type = ?3
+                    )
+             FROM user_model_route_candidates c
+             LEFT JOIN shares s ON s.share_id = c.target_share_id
+             WHERE c.route_id = ?1
+             ORDER BY c.priority ASC",
+        )
+        .map_err(|e| AppError::Internal(format!("prepare route candidates failed: {e}")))?;
+    let rows = statement
+        .query_map(params![route_id, email, app_type], |row| {
+            let target_share_id = row.get::<_, String>(0)?;
+            let target = read_model_route_target(row, 1)?;
+            Ok((target_share_id, target))
+        })
+        .map_err(|e| AppError::Internal(format!("query route candidates failed: {e}")))?;
+    let mut candidates = Vec::new();
+    for row in rows {
+        let (target_share_id, target) =
+            row.map_err(|e| AppError::Internal(format!("read route candidates failed: {e}")))?;
+        if let ModelRouteTargetAccess::Eligible { subdomain } =
+            classify_model_route_target(target, email, app_type)
+        {
+            candidates.push(RouteCandidate {
+                target_share_id,
+                subdomain,
+            });
+        }
+    }
+    Ok(candidates)
 }
 
 fn get_default_user_api_token(
@@ -31925,6 +32183,7 @@ pub(crate) mod tests {
                     app_type: "codex".into(),
                     requested_model: "GPT-5.6".into(),
                     target_share_id: "share-routing-a".into(),
+                    candidates: Vec::new(),
                 }],
                 &active_subdomains,
             )
@@ -31945,6 +32204,7 @@ pub(crate) mod tests {
                     app_type: "codex".into(),
                     requested_model: " GPT-5.6 ".into(),
                     target_share_id: "share-routing-a".into(),
+                    candidates: Vec::new(),
                 }],
                 &active_subdomains,
             )
@@ -31963,6 +32223,7 @@ pub(crate) mod tests {
                     app_type: "codex".into(),
                     requested_model: "GPT-5.6".into(),
                     target_share_id: "share-routing-b".into(),
+                    candidates: Vec::new(),
                 }],
                 &active_subdomains,
             )
@@ -32000,11 +32261,13 @@ pub(crate) mod tests {
                         app_type: "codex".into(),
                         requested_model: "same".into(),
                         target_share_id: "share-routing-a".into(),
+                        candidates: Vec::new(),
                     },
                     UserModelRouteInput {
                         app_type: "codex".into(),
                         requested_model: " same ".into(),
                         target_share_id: "share-routing-b".into(),
+                        candidates: Vec::new(),
                     },
                 ],
                 &active_subdomains,
@@ -32023,11 +32286,13 @@ pub(crate) mod tests {
                         app_type: "codex".into(),
                         requested_model: "GPT-5.6".into(),
                         target_share_id: "share-routing-a".into(),
+                        candidates: Vec::new(),
                     },
                     UserModelRouteInput {
                         app_type: "codex".into(),
                         requested_model: "gpt-5.6".into(),
                         target_share_id: "share-routing-b".into(),
+                        candidates: Vec::new(),
                     },
                 ],
                 &active_subdomains,
@@ -32119,16 +32384,19 @@ pub(crate) mod tests {
                         app_type: "codex".into(),
                         requested_model: "gpt-5.6-sol".into(),
                         target_share_id: "share-wild-a".into(),
+                        candidates: Vec::new(),
                     },
                     UserModelRouteInput {
                         app_type: "codex".into(),
                         requested_model: "gpt-5.5".into(),
                         target_share_id: "share-wild-b".into(),
+                        candidates: Vec::new(),
                     },
                     UserModelRouteInput {
                         app_type: "codex".into(),
                         requested_model: "*".into(),
                         target_share_id: "share-wild-c".into(),
+                        candidates: Vec::new(),
                     },
                 ],
                 &active_subdomains,
@@ -32204,21 +32472,25 @@ pub(crate) mod tests {
                         app_type: "codex".into(),
                         requested_model: "gpt-5.6-sol".into(),
                         target_share_id: "share-wild-a".into(),
+                        candidates: Vec::new(),
                     },
                     UserModelRouteInput {
                         app_type: "codex".into(),
                         requested_model: "gpt-5.5".into(),
                         target_share_id: "share-wild-b".into(),
+                        candidates: Vec::new(),
                     },
                     UserModelRouteInput {
                         app_type: "codex".into(),
                         requested_model: "*".into(),
                         target_share_id: "share-wild-c".into(),
+                        candidates: Vec::new(),
                     },
                     UserModelRouteInput {
                         app_type: "claude".into(),
                         requested_model: "*".into(),
                         target_share_id: "share-wild-d".into(),
+                        candidates: Vec::new(),
                     },
                 ],
                 &active_subdomains,
@@ -32251,6 +32523,128 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn failover_candidates_resolve_in_order_and_skip_ineligible() {
+        let (store, config) = setup_store("user-model-routing-candidates").await;
+        insert_installation(&store, "inst-candidates").await;
+        insert_share(&store, "inst-candidates", "share-cand-a", "cand-a", "active").await;
+        insert_share(&store, "inst-candidates", "share-cand-b", "cand-b", "active").await;
+        insert_share(&store, "inst-candidates", "share-cand-c", "cand-c", "active").await;
+        let active_subdomains = HashSet::from([
+            "cand-a".to_string(),
+            "cand-b".to_string(),
+            "cand-c".to_string(),
+        ]);
+
+        // Wildcard route with two failover candidates after the primary.
+        let saved = store
+            .replace_user_model_routing(
+                &config,
+                "owner@example.com",
+                0,
+                vec![UserModelRouteInput {
+                    app_type: "codex".into(),
+                    requested_model: "*".into(),
+                    target_share_id: "share-cand-a".into(),
+                    candidates: vec!["share-cand-b".into(), "share-cand-c".into()],
+                }],
+                &active_subdomains,
+            )
+            .await
+            .expect("save route with candidates");
+        assert_eq!(saved.routes.len(), 1);
+        assert_eq!(
+            saved.routes[0].candidates,
+            vec!["share-cand-b".to_string(), "share-cand-c".to_string()],
+            "candidates round-trip in priority order"
+        );
+
+        let user_id = {
+            let conn = store.conn.lock().await;
+            conn.query_row(
+                "SELECT id FROM users WHERE email_normalized = 'owner@example.com'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read routing user id")
+        };
+
+        let resolution = store
+            .resolve_user_model_route(&user_id, "owner@example.com", "codex", "gpt-5.6")
+            .await
+            .expect("resolve")
+            .expect("wildcard hit");
+        assert_eq!(resolution.target_share_id, "share-cand-a");
+        assert!(resolution.matched_wildcard);
+        assert_eq!(resolution.candidates.len(), 2);
+        assert_eq!(resolution.candidates[0].target_share_id, "share-cand-b");
+        assert_eq!(resolution.candidates[0].subdomain, "cand-b");
+        assert_eq!(resolution.candidates[1].target_share_id, "share-cand-c");
+        assert_eq!(resolution.candidates[1].subdomain, "cand-c");
+
+        // Duplicate candidate ids are rejected.
+        let duplicate = store
+            .replace_user_model_routing(
+                &config,
+                "owner@example.com",
+                1,
+                vec![UserModelRouteInput {
+                    app_type: "codex".into(),
+                    requested_model: "*".into(),
+                    target_share_id: "share-cand-a".into(),
+                    candidates: vec!["share-cand-b".into(), "share-cand-b".into()],
+                }],
+                &active_subdomains,
+            )
+            .await
+            .expect_err("duplicate candidate must fail");
+        assert!(matches!(duplicate, AppError::BadRequest(_)));
+
+        // A candidate that duplicates the primary is also rejected.
+        let primary_dup = store
+            .replace_user_model_routing(
+                &config,
+                "owner@example.com",
+                1,
+                vec![UserModelRouteInput {
+                    app_type: "codex".into(),
+                    requested_model: "*".into(),
+                    target_share_id: "share-cand-a".into(),
+                    candidates: vec!["share-cand-a".into()],
+                }],
+                &active_subdomains,
+            )
+            .await
+            .expect_err("candidate equal to primary must fail");
+        assert!(matches!(primary_dup, AppError::BadRequest(_)));
+
+        // Removing candidates returns to single-target legacy behaviour.
+        let cleared = store
+            .replace_user_model_routing(
+                &config,
+                "owner@example.com",
+                1,
+                vec![UserModelRouteInput {
+                    app_type: "codex".into(),
+                    requested_model: "*".into(),
+                    target_share_id: "share-cand-a".into(),
+                    candidates: Vec::new(),
+                }],
+                &active_subdomains,
+            )
+            .await
+            .expect("clear candidates");
+        assert!(cleared.routes[0].candidates.is_empty());
+        let resolution = store
+            .resolve_user_model_route(&user_id, "owner@example.com", "codex", "gpt-5.6")
+            .await
+            .expect("resolve after clear")
+            .expect("wildcard hit after clear");
+        assert!(resolution.candidates.is_empty());
+
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
     async fn wildcard_routes_reject_patterns_and_stay_fail_closed_on_target_loss() {
         let (store, config) = setup_store("user-model-routing-wildcard-guards").await;
         insert_installation(&store, "inst-wildcard-guard").await;
@@ -32277,6 +32671,7 @@ pub(crate) mod tests {
                         app_type: "codex".into(),
                         requested_model: pattern.into(),
                         target_share_id: "share-guard".into(),
+                        candidates: Vec::new(),
                     }],
                     &active_subdomains,
                 )
@@ -32301,6 +32696,7 @@ pub(crate) mod tests {
                     app_type: "codex".into(),
                     requested_model: "*".into(),
                     target_share_id: "share-guard".into(),
+                    candidates: Vec::new(),
                 }],
                 &active_subdomains,
             )
@@ -32323,6 +32719,7 @@ pub(crate) mod tests {
                     app_type: "codex".into(),
                     requested_model: "*".into(),
                     target_share_id: "share-guard".into(),
+                    candidates: Vec::new(),
                 }],
                 &active_subdomains,
             )
@@ -32414,11 +32811,13 @@ pub(crate) mod tests {
                         app_type: "codex".into(),
                         requested_model: "gpt-5.6-sol".into(),
                         target_share_id: "share-catalog-exact".into(),
+                        candidates: Vec::new(),
                     },
                     UserModelRouteInput {
                         app_type: "codex".into(),
                         requested_model: "*".into(),
                         target_share_id: "share-catalog-wild".into(),
+                        candidates: Vec::new(),
                     },
                 ],
                 &active_subdomains,
@@ -32570,6 +32969,7 @@ pub(crate) mod tests {
             app_type: "codex".into(),
             requested_model: "*".into(),
             target_share_id: "share-pt-wild".into(),
+            candidates: Vec::new(),
         }];
         let save = |routes: Vec<UserModelRouteInput>, revision: u64| {
             let store = &store;
@@ -32626,11 +33026,13 @@ pub(crate) mod tests {
                     app_type: "codex".into(),
                     requested_model: "*".into(),
                     target_share_id: "share-pt-wild".into(),
+                    candidates: Vec::new(),
                 },
                 UserModelRouteInput {
                     app_type: "codex".into(),
                     requested_model: "gpt-5.6-sol".into(),
                     target_share_id: "share-pt-exact".into(),
+                    candidates: Vec::new(),
                 },
             ],
             1,
@@ -32650,6 +33052,7 @@ pub(crate) mod tests {
                 app_type: "codex".into(),
                 requested_model: "gpt-5.6-sol".into(),
                 target_share_id: "share-pt-exact".into(),
+                candidates: Vec::new(),
             }],
             2,
         )
@@ -32670,11 +33073,13 @@ pub(crate) mod tests {
                     app_type: "codex".into(),
                     requested_model: "*".into(),
                     target_share_id: "share-pt-wild".into(),
+                    candidates: Vec::new(),
                 },
                 UserModelRouteInput {
                     app_type: "claude".into(),
                     requested_model: "claude-opus-5".into(),
                     target_share_id: "share-pt-exact".into(),
+                    candidates: Vec::new(),
                 },
             ],
             3,
@@ -32743,6 +33148,7 @@ pub(crate) mod tests {
                     app_type: "codex".into(),
                     requested_model: "gpt-audit".into(),
                     target_share_id: "share-routing-audit".into(),
+                    candidates: Vec::new(),
                 }]
             } else {
                 Vec::new()
@@ -32844,6 +33250,7 @@ pub(crate) mod tests {
                     app_type: "codex".into(),
                     requested_model: "shared-model".into(),
                     target_share_id: "share-shared".into(),
+                    candidates: Vec::new(),
                 }],
                 &active_subdomains,
             )
@@ -32906,6 +33313,7 @@ pub(crate) mod tests {
                     app_type: "gemini".into(),
                     requested_model: "gemini-exact".into(),
                     target_share_id: "share-private".into(),
+                    candidates: Vec::new(),
                 }],
                 &active_subdomains,
             )
@@ -32945,6 +33353,7 @@ pub(crate) mod tests {
                     app_type: "claude".into(),
                     requested_model: "free-model".into(),
                     target_share_id: "share-free".into(),
+                    candidates: Vec::new(),
                 }],
                 &active_subdomains,
             )
@@ -32996,11 +33405,13 @@ pub(crate) mod tests {
                         app_type: "claude".into(),
                         requested_model: "free-model".into(),
                         target_share_id: "removed-share".into(),
+                        candidates: Vec::new(),
                     },
                     UserModelRouteInput {
                         app_type: "codex".into(),
                         requested_model: "new-free-model".into(),
                         target_share_id: "share-free".into(),
+                        candidates: Vec::new(),
                     },
                 ],
                 &active_subdomains,
@@ -33020,11 +33431,13 @@ pub(crate) mod tests {
                         app_type: "claude".into(),
                         requested_model: "free-model".into(),
                         target_share_id: "share-private".into(),
+                        candidates: Vec::new(),
                     },
                     UserModelRouteInput {
                         app_type: "codex".into(),
                         requested_model: "new-free-model".into(),
                         target_share_id: "share-free".into(),
+                        candidates: Vec::new(),
                     },
                 ],
                 &active_subdomains,
@@ -34075,6 +34488,8 @@ pub(crate) mod tests {
 
         store
             .record_share_runtime_snapshot(ShareRuntimeSnapshotResponse {
+                manual_model_health: Vec::new(),
+                model_health_degraded_threshold_ms: None,
                 share_id: "health-pause-share".into(),
                 queried_at: now.timestamp(),
                 support: ShareSupport {
@@ -40335,6 +40750,8 @@ pub(crate) mod tests {
             ..Default::default()
         };
         let mut snapshot = ShareRuntimeSnapshotResponse {
+            manual_model_health: Vec::new(),
+            model_health_degraded_threshold_ms: None,
             share_id: "buddy-runtime-share".into(),
             queried_at: Utc::now().timestamp(),
             token_limit: None,
@@ -55061,6 +55478,8 @@ pub(crate) mod tests {
 
         store
             .record_share_runtime_snapshot(ShareRuntimeSnapshotResponse {
+                manual_model_health: Vec::new(),
+                model_health_degraded_threshold_ms: None,
                 share_id: "share-1".into(),
                 queried_at: now,
                 support: ShareSupport {
@@ -55139,6 +55558,8 @@ pub(crate) mod tests {
 
         let error = store
             .record_share_runtime_snapshot(ShareRuntimeSnapshotResponse {
+                manual_model_health: Vec::new(),
+                model_health_degraded_threshold_ms: None,
                 share_id: "share-1".into(),
                 queried_at: now,
                 support: ShareSupport {
@@ -55224,6 +55645,8 @@ pub(crate) mod tests {
 
         store
             .record_share_runtime_snapshot(ShareRuntimeSnapshotResponse {
+                manual_model_health: Vec::new(),
+                model_health_degraded_threshold_ms: None,
                 share_id: "share-1".into(),
                 queried_at: now,
                 support: ShareSupport {
@@ -55317,6 +55740,8 @@ pub(crate) mod tests {
         let now = Utc::now().timestamp();
         store
             .record_share_runtime_snapshot(ShareRuntimeSnapshotResponse {
+                manual_model_health: Vec::new(),
+                model_health_degraded_threshold_ms: None,
                 share_id: "share-1".into(),
                 queried_at: now,
                 support: ShareSupport {
@@ -55405,6 +55830,8 @@ pub(crate) mod tests {
         // does the cleanup pass.
         store
             .record_share_runtime_snapshot(ShareRuntimeSnapshotResponse {
+                manual_model_health: Vec::new(),
+                model_health_degraded_threshold_ms: None,
                 share_id: "share-1".into(),
                 queried_at: now,
                 support: ShareSupport {
@@ -55453,6 +55880,8 @@ pub(crate) mod tests {
 
         store
             .record_share_runtime_snapshot(ShareRuntimeSnapshotResponse {
+                manual_model_health: Vec::new(),
+                model_health_degraded_threshold_ms: None,
                 share_id: "share-1".into(),
                 queried_at: now,
                 token_limit: Some(-1),
@@ -55564,6 +55993,8 @@ pub(crate) mod tests {
         current_summary.last_checked_at = Some(now);
         store
             .record_share_runtime_snapshot(ShareRuntimeSnapshotResponse {
+                manual_model_health: Vec::new(),
+                model_health_degraded_threshold_ms: None,
                 share_id: "share-1".into(),
                 queried_at: now,
                 support: ShareSupport {
@@ -55592,6 +56023,8 @@ pub(crate) mod tests {
         stale_summary.last_checked_at = Some(now - 60);
         store
             .record_share_runtime_snapshot(ShareRuntimeSnapshotResponse {
+                manual_model_health: Vec::new(),
+                model_health_degraded_threshold_ms: None,
                 share_id: "share-1".into(),
                 queried_at: now - 60,
                 support: ShareSupport {

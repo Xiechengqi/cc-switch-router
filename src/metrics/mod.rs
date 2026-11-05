@@ -98,6 +98,9 @@ pub struct MetricsRegistry {
     ssh_bridge_half_close_idle_total: AtomicU64,
     ssh_bridge_io_errors_total: AtomicU64,
     ssh_forward_capacity_rejected_total: AtomicU64,
+    /// Failover advances: a model-route request moved from one candidate to
+    /// the next after a retryable failure.
+    model_route_failover_total: AtomicU64,
 }
 
 impl MetricsRegistry {
@@ -151,6 +154,7 @@ impl MetricsRegistry {
             ssh_bridge_half_close_idle_total: AtomicU64::new(0),
             ssh_bridge_io_errors_total: AtomicU64::new(0),
             ssh_forward_capacity_rejected_total: AtomicU64::new(0),
+            model_route_failover_total: AtomicU64::new(0),
         })
     }
 
@@ -479,6 +483,11 @@ impl MetricsRegistry {
 
     pub fn record_proxy_stream_idle_timeout(&self) {
         self.proxy_stream_idle_timeout_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_model_route_failover(&self) {
+        self.model_route_failover_total
             .fetch_add(1, Ordering::Relaxed);
     }
 

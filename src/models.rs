@@ -366,6 +366,11 @@ pub struct UserModelRouteInput {
     pub app_type: String,
     pub requested_model: String,
     pub target_share_id: String,
+    /// Ordered failover candidates after the primary target. Each entry is a
+    /// Share id; the primary `target_share_id` is priority 0, these follow at
+    /// priority 1..=n. Empty = single-target legacy behaviour.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -375,6 +380,9 @@ pub struct UserModelRouteView {
     pub app_type: String,
     pub requested_model: String,
     pub target_share_id: String,
+    /// Ordered failover candidates after the primary target (Share ids).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -3360,6 +3368,27 @@ pub struct ShareRuntimeSnapshotResponse {
     pub app_providers: ShareAppProviders,
     #[serde(default)]
     pub model_health: ShareModelHealthSummary,
+    #[serde(default)]
+    pub manual_model_health: Vec<ShareManualModelHealthObservation>,
+    #[serde(default)]
+    pub model_health_degraded_threshold_ms: Option<u64>,
+}
+
+/// Authenticated Server control-response evidence, separate from cycle history.
+/// Intentionally excludes error text, account identity and credentials.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShareManualModelHealthObservation {
+    pub observation_id: String,
+    pub app_type: String,
+    pub provider_id: String,
+    pub health_fingerprint: String,
+    pub requested_model: String,
+    pub actual_model: String,
+    pub status: String,
+    pub status_code: Option<u16>,
+    pub latency_ms: u64,
+    pub checked_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4062,6 +4091,10 @@ pub struct ShareModelHealthStatus {
     pub status_code: Option<u16>,
     pub reason_code: String,
     pub recent_results: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
 }
 
 impl Default for ShareModelHealthStatus {
@@ -4076,6 +4109,8 @@ impl Default for ShareModelHealthStatus {
             status_code: None,
             reason_code: "not_monitored".into(),
             recent_results: Vec::new(),
+            source: None,
+            latency_ms: None,
         }
     }
 }
@@ -4151,6 +4186,7 @@ pub struct ShareView {
     #[serde(default)]
     pub model_health: ShareModelHealthSummary,
     pub model_health_status: ShareModelHealthStatus,
+    pub live_model_health_status: ShareModelHealthStatus,
     pub operational_summary: OperationalSummary,
     pub service_readiness: ShareServiceReadiness,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

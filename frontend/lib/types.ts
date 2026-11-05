@@ -466,6 +466,7 @@ export type ShareView = {
   appProviders?: ShareAppProviders;
   modelHealth?: ShareModelHealthSummary;
   modelHealthStatus?: ShareModelHealthStatus;
+  liveModelHealthStatus?: ShareModelHealthStatus;
   operationalSummary?: OperationalSummary;
   /** 后端权威的服务就绪结果；缺失时兼容旧 Router 响应。 */
   serviceReadiness?: ShareServiceReadiness;
@@ -602,6 +603,8 @@ export type UserModelRouteInput = {
   appType: ModelRoutingApp;
   requestedModel: string;
   targetShareId: string;
+  /** Ordered failover Share ids after the primary target. */
+  candidates?: string[];
 };
 
 export type UserModelRoute = UserModelRouteInput & {
@@ -1219,6 +1222,8 @@ export type ShareModelHealthStatus = {
   statusCode?: number;
   reasonCode: string;
   recentResults: string[];
+  source?: "periodic" | "server_manual" | "router_connection_test";
+  latencyMs?: number;
 };
 
 export type ShareProviderModelPolicyScope = "global" | "per_app";
@@ -2973,6 +2978,7 @@ export type ShareMarketListing = {
   providerFamilies: ShareMarketProviderFamily[];
   appCapabilities: ShareMarketAppCapability[];
   modelHealthStatus?: ShareModelHealthStatus;
+  liveModelHealthStatus?: ShareModelHealthStatus;
   ownerEmail: string;
   status: string;
   shareStatus: string;

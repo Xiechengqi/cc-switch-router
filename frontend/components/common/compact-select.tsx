@@ -80,7 +80,10 @@ export function CompactSelect({
         UNSTABLE_portalContainer={portalContainer}
         className="light min-w-[var(--trigger-width)] max-w-[calc(100vw-2rem)] bg-white text-foreground"
       >
-        <ListBox aria-label={ariaLabel}>
+        <ListBox
+          aria-label={ariaLabel}
+          className="max-h-64 overflow-y-auto"
+        >
           {options.map((option) => (
             <ListBox.Item
               key={option.value || EMPTY_KEY}

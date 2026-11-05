@@ -47,6 +47,9 @@
     "test:auth-password-browser": "node scripts/auth-password-browser-test.mjs"
   },
   "dependencies": {
+    "@dnd-kit/core": "^6.3.1",
+    "@dnd-kit/sortable": "^10.0.0",
+    "@dnd-kit/utilities": "^3.2.2",
     "@heroui/react": "^3.0.4",
     "@heroui/styles": "^3.0.4",
     "@xterm/addon-fit": "^0.11.0",
@@ -60,12 +63,12 @@
     "tailwind-merge": "^3.3.1"
   },
   "devDependencies": {
-    "esbuild": "^0.28.2",
     "@resvg/resvg-wasm": "^2.6.2",
     "@tailwindcss/postcss": "latest",
     "@types/node": "latest",
     "@types/react": "latest",
     "@types/react-dom": "latest",
+    "esbuild": "^0.28.2",
     "playwright": "^1.64.1",
     "tailwindcss": "latest",
     "tsx": "^4.20.5",

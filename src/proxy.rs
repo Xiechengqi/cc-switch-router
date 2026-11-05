@@ -2645,34 +2645,159 @@ async fn user_model_proxy_handler_inner(
         return requested_model_blocked_response(&app_type, &requested_model);
     }
 
-    let target_active = state
-        .proxy
-        .route_by_share_id(&resolution.target_share_id)
-        .await
-        .is_some_and(|route| route.subdomain() == resolution.subdomain);
-    if !target_active {
-        return unified_api_error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "user_model_route_target_unavailable",
-            "configured target Share is offline or reconnecting",
-            serde_json::json!({ "targetShareId": resolution.target_share_id }),
+    // Failover loop: walk the primary target then the ordered candidates.
+    // Every attempt is gated on the per-route circuit breaker; a candidate
+    // that fails with a retryable error marks its breaker and the loop
+    // advances. Once any response bytes have been sent to the client the
+    // attempt is committed — a stream can never be retried mid-flight.
+    let body_bytes = axum::body::Bytes::from(body_bytes);
+    let candidates: Vec<(String, String)> = std::iter::once((
+        resolution.target_share_id.clone(),
+        resolution.subdomain.clone(),
+    ))
+    .chain(
+        resolution
+            .candidates
+            .iter()
+            .map(|candidate| (candidate.target_share_id.clone(), candidate.subdomain.clone())),
+    )
+    .collect();
+    let max_attempts = candidates.len().min(4);
+    let mut last_response: Option<Response> = None;
+
+    for (attempt, (target_share_id, subdomain)) in
+        candidates.iter().take(max_attempts).enumerate()
+    {
+        let permit = state.route_breakers.acquire(&resolution.route_id, target_share_id);
+        if matches!(permit, crate::route_breaker::BreakerPermit::Rejected) {
+            debug!(
+                route_id = %resolution.route_id,
+                target_share_id = %target_share_id,
+                "model route candidate skipped: circuit open"
+            );
+            continue;
+        }
+        let was_probe = matches!(
+            permit,
+            crate::route_breaker::BreakerPermit::Allowed { was_probe: true }
         );
+
+        let target_active = state
+            .proxy
+            .route_by_share_id(target_share_id)
+            .await
+            .is_some_and(|route| route.subdomain() == *subdomain);
+        if !target_active {
+            state.route_breakers.record_failure(
+                &resolution.route_id,
+                target_share_id,
+                was_probe,
+                None,
+            );
+            if attempt == 0 {
+                debug!(
+                    route_id = %resolution.route_id,
+                    target_share_id = %target_share_id,
+                    "model route primary target offline, advancing to candidates"
+                );
+            }
+            continue;
+        }
+
+        if attempt == 0 {
+            debug!(
+                user_id = %principal.user_id,
+                app_type = %app_type,
+                requested_model = %requested_model,
+                target_share_id = %target_share_id,
+                wildcard = resolution.matched_wildcard,
+                "unified API resolved model route"
+            );
+        }
+
+        let attempt_resolution = UserModelRouteResolution {
+            target_share_id: target_share_id.clone(),
+            subdomain: subdomain.clone(),
+            matched_wildcard: resolution.matched_wildcard,
+            route_id: resolution.route_id.clone(),
+            candidates: Vec::new(),
+        };
+        let response = forward_to_selected_share(
+            state.clone(),
+            peer,
+            parts.clone(),
+            Body::from(body_bytes.clone()),
+            &attempt_resolution,
+        )
+        .await;
+
+        let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(std::time::Duration::from_secs);
+        let failoverable = matches!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS
+                | StatusCode::BAD_GATEWAY
+                | StatusCode::SERVICE_UNAVAILABLE
+                | StatusCode::GATEWAY_TIMEOUT
+                | StatusCode::UNAUTHORIZED
+                | StatusCode::FORBIDDEN
+        );
+
+        if failoverable && attempt + 1 < max_attempts {
+            state.route_breakers.record_failure(
+                &resolution.route_id,
+                target_share_id,
+                was_probe,
+                retry_after,
+            );
+            tracing::info!(
+                route_id = %resolution.route_id,
+                target_share_id = %target_share_id,
+                status = %status.as_u16(),
+                attempt = attempt + 1,
+                "model route candidate failed, advancing"
+            );
+            state.metrics.record_model_route_failover();
+            last_response = Some(response);
+            continue;
+        }
+
+        // Committed: success, non-failoverable error, or last candidate.
+        if status.is_success() || status.is_redirection() {
+            state.route_breakers.record_success(
+                &resolution.route_id,
+                target_share_id,
+                was_probe,
+            );
+        } else {
+            // A non-failoverable failure (4xx request fault) still counts
+            // against the breaker so a persistently broken candidate opens.
+            state.route_breakers.record_failure(
+                &resolution.route_id,
+                target_share_id,
+                was_probe,
+                retry_after,
+            );
+        }
+        return response;
     }
 
-    // Distinguishes "the user mapped this exact model" from "the wildcard route
-    // absorbed it" when diagnosing an upstream unknown-model error. The forwarded
-    // request is identical in both cases; only the reason for picking this Share
-    // differs.
-    debug!(
-        user_id = %principal.user_id,
-        app_type = %app_type,
-        requested_model = %requested_model,
-        target_share_id = %resolution.target_share_id,
-        wildcard = resolution.matched_wildcard,
-        "unified API resolved model route"
-    );
-
-    forward_to_selected_share(state, peer, parts, Body::from(body_bytes), &resolution).await
+    // Every candidate was skipped by an open breaker or failed retryably.
+    // Return the last failure response when we have one, else fail closed.
+    if let Some(response) = last_response {
+        return response;
+    }
+    unified_api_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "user_model_route_target_unavailable",
+        "configured target Share is offline or reconnecting",
+        serde_json::json!({ "targetShareId": resolution.target_share_id }),
+    )
 }
 
 /// Hands a request to the selected Share exactly as a direct connection would.
@@ -8013,6 +8138,7 @@ mod tests {
             market_wallet_controls: Arc::new(Mutex::new(())),
             market_payments: Arc::new(crate::market_payments::MarketPaymentsRuntime::for_test()),
             recent_traffic: RecentTraffic::new(),
+            route_breakers: Arc::new(crate::route_breaker::RouteBreakerRegistry::new()),
             abuse: Arc::new(crate::abuse::AbuseTracker::new()),
             share_abuse: Arc::new(crate::abuse::ShareAbuseTracker::new([])),
             ip_blacklist_stats: Arc::new(crate::ip_blacklist_stats::IpBlacklistStats::new()),
@@ -8575,6 +8701,7 @@ mod tests {
                     app_type: "codex".into(),
                     requested_model: "*".into(),
                     target_share_id: "share-pt".into(),
+                    candidates: Vec::new(),
                 }],
                 &active_subdomains,
             )
@@ -8603,11 +8730,13 @@ mod tests {
                         app_type: "codex".into(),
                         requested_model: "*".into(),
                         target_share_id: "share-pt".into(),
+                        candidates: Vec::new(),
                     },
                     UserModelRouteInput {
                         app_type: "codex".into(),
                         requested_model: "gpt-5.6-sol".into(),
                         target_share_id: "share-pt".into(),
+                        candidates: Vec::new(),
                     },
                 ],
                 &active_subdomains,

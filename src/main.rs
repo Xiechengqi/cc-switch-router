@@ -66,6 +66,7 @@ mod proxy_stream;
 mod public_hosts;
 mod recent_traffic;
 mod registration_admission;
+mod route_breaker;
 mod scheduling_signals;
 mod schema;
 mod secure_file;
@@ -317,6 +318,7 @@ async fn main() -> Result<()> {
         market_wallet_controls: Arc::new(Mutex::new(())),
         market_payments,
         recent_traffic: RecentTraffic::new(),
+        route_breakers: Arc::new(crate::route_breaker::RouteBreakerRegistry::new()),
         abuse: Arc::new(AbuseTracker::new()),
         share_abuse,
         ip_blacklist_stats: Arc::new(IpBlacklistStats::new()),
