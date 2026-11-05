@@ -20,7 +20,7 @@ import { CompactSelect } from "@/components/common/compact-select";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { SegmentedControl } from "@/components/common/segmented-control";
 import { CandidateList } from "@/components/dashboard/model-hub-candidates";
-import { RoutingShareSummary } from "@/components/dashboard/model-hub-share-summary";
+import { RoutingShareOption } from "@/components/dashboard/model-hub-share-summary";
 import { SharePoolPicker } from "@/components/dashboard/model-hub-share-picker";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import { useLocaleText } from "@/components/i18n/locale-provider";
@@ -218,12 +218,14 @@ function shareSelectOptions(
     value: share.shareId,
     label: share.subdomain || share.shareName,
     description: share.appCapabilities?.find(cap => cap.app === app)?.providerName,
-    content: <RoutingShareSummary share={share} shareId={share.shareId} app={app} locale={locale} t={t} />,
+    content: <RoutingShareOption share={share} shareId={share.shareId} app={app} locale={locale} t={t} />,
+    summarizeContent: true,
   }));
   for (const id of selectedIds) {
     if (id && !options.some(option => option.value === id)) options.push({
       value: id, label: id, description: t("modelHub.targetUnavailable"),
-      content: <RoutingShareSummary shareId={id} app={app} locale={locale} t={t} />,
+      content: <RoutingShareOption shareId={id} app={app} locale={locale} t={t} />,
+      summarizeContent: true,
     });
   }
   return options;
@@ -621,36 +623,26 @@ export function ModelHubPanel({
                 {activeSlot?.exact.length ? activeSlot.exact.map((route) => {
                   const options = shareSelectOptions(shares, modelRouteTargets(route), activeProtocol, locale, t);
                   return (
-                    <div key={route.clientId} className="grid min-w-0 items-center gap-2 lg:grid-cols-[minmax(140px,1fr)_minmax(0,22rem)_44px]">
+                    <div key={route.clientId} className="grid min-w-0 items-start gap-2 lg:grid-cols-[minmax(9rem,14rem)_minmax(0,1fr)_2.75rem]">
                       <input
                         value={route.requestedModel}
                         maxLength={200}
                         disabled={controller.busy || controller.loading}
                         onChange={(event) => controller.updateRoute(route.clientId, { requestedModel: event.target.value })}
-                        className="h-9 min-w-0 rounded-md border border-border bg-white px-3 text-xs outline-none focus:border-primary/60 focus:ring-2 focus:ring-inset focus:ring-primary/10"
+                        className="h-11 min-w-0 rounded-md border border-border bg-white px-3 text-xs outline-none focus:border-primary/60 focus:ring-2 focus:ring-inset focus:ring-primary/10"
                         aria-label={t("modelHub.model")}
                         placeholder={t("modelHub.modelPlaceholder")}
                       />
-                      <CompactSelect
-                        value={route.targetShareId}
-                        options={options}
-                        onChange={(value) => controller.updateRoute(route.clientId, { targetShareId: value })}
-                        ariaLabel={t("modelHub.targetShare")}
-                        disabled={controller.busy || controller.loading || !options.length}
-                        className="w-full"
-                        triggerClassName="min-h-11 w-full py-1.5"
-                      />
-                      <button
-                        type="button"
-                        disabled={controller.busy || controller.loading}
-                        className="inline-flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground hover:bg-rose-50 hover:text-rose-700 disabled:opacity-40"
-                        title={t("modelHub.removeRoute")}
-                        aria-label={t("modelHub.removeRoute")}
-                        onClick={() => controller.removeRoute(route.clientId)}
-                      >
-                        <Trash2 className="h-4 w-4" />
-                      </button>
-                      <div className="lg:col-span-3">
+                      <div className="grid min-w-0 gap-1.5">
+                        <CompactSelect
+                          value={route.targetShareId}
+                          options={options}
+                          onChange={(value) => controller.updateRoute(route.clientId, { targetShareId: value })}
+                          ariaLabel={t("modelHub.targetShare")}
+                          disabled={controller.busy || controller.loading || !options.length}
+                          className="w-full"
+                          triggerClassName="h-11 w-full"
+                        />
                         <CandidateList
                           routeClientId={route.clientId}
                           primaryShareId={route.targetShareId}
@@ -663,6 +655,16 @@ export function ModelHubPanel({
                           onMove={(from, to) => controller.moveCandidate(route.clientId, from, to)}
                         />
                       </div>
+                      <button
+                        type="button"
+                        disabled={controller.busy || controller.loading}
+                        className="inline-flex h-11 w-11 items-center justify-center rounded-md text-muted-foreground hover:bg-rose-50 hover:text-rose-700 disabled:opacity-40"
+                        title={t("modelHub.removeRoute")}
+                        aria-label={t("modelHub.removeRoute")}
+                        onClick={() => controller.removeRoute(route.clientId)}
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </button>
                     </div>
                   );
                 }) : (

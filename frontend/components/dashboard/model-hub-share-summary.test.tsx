@@ -47,7 +47,10 @@ for (const locale of ["en", "zh-CN"] as const) {
     assert.ok(html.includes(t("modelHub.targetUnavailable")));
     assert.match(html, /offline-subdomain/);
     assert.match(html, /2\/6/);
-    assert.equal([...html.matchAll(/type="search"/g)].length, 2);
+    assert.equal([...html.matchAll(/type="search"/g)].length, 0, "search stays hidden while both lists fit");
+    const many = Array.from({ length: 8 }, (_, index) => ({ ...share, shareId: `extra-${index}`, subdomain: `extra-${index}` }));
+    const crowded = renderToStaticMarkup(<SharePoolPicker shares={many} selected={["extra-0"]} app="codex" routeKey="codex" disabled={false} onChange={() => { }} locale={locale} t={t} />);
+    assert.equal([...crowded.matchAll(/type="search"/g)].length, 2);
     assert.equal([...html.matchAll(/type="checkbox"/g)].length, 5);
     assert.doesNotMatch(html, / checked=""/, "all transfer selections start unchecked");
     assert.ok(html.includes(t("modelHub.transferInLabel", { count: 0 })));

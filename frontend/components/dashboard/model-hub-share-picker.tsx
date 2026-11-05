@@ -77,9 +77,21 @@ export function SharePoolPicker({ shares, selected, app, routeKey, disabled, add
   React.useLayoutEffect(() => {
     const pending = pendingFocus.current;
     if (!pending) return;
-    (inputs.current.get(`${pending.side}:${pending.id}`)
-      || (pending.side === "left" ? leftSearchRef.current : rightSearchRef.current))?.focus();
-    pendingFocus.current = null;
+    const moved = inputs.current.get(`${pending.side}:${pending.id}`);
+    if (moved) {
+      moved.focus();
+      pendingFocus.current = null;
+      return;
+    }
+    // The moved row's checkbox commits after this effect. Retry once on the
+    // next frame before falling back to a search box that may be unmounted.
+    const frame = requestAnimationFrame(() => {
+      const node = inputs.current.get(`${pending.side}:${pending.id}`)
+        || (pending.side === "left" ? leftSearchRef.current : rightSearchRef.current);
+      node?.focus();
+      if (pendingFocus.current === pending) pendingFocus.current = null;
+    });
+    return () => cancelAnimationFrame(frame);
   }, [selected]);
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }));
@@ -110,11 +122,14 @@ export function SharePoolPicker({ shares, selected, app, routeKey, disabled, add
       return JSON.stringify(next) === JSON.stringify(current) ? current : next;
     });
   }, [leftMembership, rightMembership]);
+  const searchable = eligible.length > MAX_MODEL_ROUTE_TARGETS;
   const full = selected.length >= MAX_MODEL_ROUTE_TARGETS;
   const remainingSlots = Math.max(0, MAX_MODEL_ROUTE_TARGETS - selected.length);
   const overCapacity = checkedIn.length > remainingSlots;
-  const inputId = React.useId();
-  const hintId = `${inputId}-hint`;
+  const statusText = addBlockedReason
+    || (overCapacity ? t("modelHub.transferCapacity", { count: checkedIn.length, remaining: remainingSlots }) : "")
+    || (full ? t("modelHub.queueFull") : "")
+    || (rightQuery.trim() ? t("modelHub.sortSearchHint") : "");
   const locked = disabled || dragging;
   const setChecked = (side: "left" | "right", id: string, checked: boolean) => {
     if (locked) return;
@@ -148,7 +163,6 @@ export function SharePoolPicker({ shares, selected, app, routeKey, disabled, add
 
   return (
     <div className="model-route-transfer grid min-w-0 gap-2" data-model-route-picker>
-      <p id={hintId} className="text-xs text-muted-foreground">{t("modelHub.transferHint")}</p>
       <div className="model-route-transfer-grid">
       <section className="model-route-transfer-pane" aria-label={t("modelHub.availableShares")}>
         <div className="grid gap-2 border-b border-border p-2">
@@ -159,9 +173,11 @@ export function SharePoolPicker({ shares, selected, app, routeKey, disabled, add
               onChange={checked => { if (!locked) setLeftChecked(checked ? availableIds : []); }} />
             {t("modelHub.checkedCount", { count: checkedIn.length })}
           </label>
-          <input ref={leftSearchRef} value={leftQuery} onChange={event => { setLeftQuery(event.target.value); setLeftChecked([]); }} type="search"
-            className="h-11 min-w-0 w-full rounded-md border border-input bg-card px-3 text-xs focus-visible:outline-2 focus-visible:outline-ring"
-            aria-label={t("modelHub.searchList", { list: t("modelHub.availableShares") })} placeholder={t("modelHub.searchShares")} />
+          {searchable || leftQuery ? (
+            <input ref={leftSearchRef} value={leftQuery} onChange={event => { setLeftQuery(event.target.value); setLeftChecked([]); }} type="search"
+              className="h-11 min-w-0 w-full rounded-md border border-input bg-card px-3 text-xs focus-visible:outline-2 focus-visible:outline-ring"
+              aria-label={t("modelHub.searchList", { list: t("modelHub.availableShares") })} placeholder={t("modelHub.searchShares")} />
+          ) : null}
         </div>
         <ul className="model-route-transfer-list" aria-label={t("modelHub.availableShares")}>
           {available.map(share => (
@@ -179,7 +195,7 @@ export function SharePoolPicker({ shares, selected, app, routeKey, disabled, add
           {!available.length ? <li className="px-2 py-4 text-xs text-muted-foreground">{t(!eligible.length ? "modelHub.noEligibleShares" : !remaining.length ? "modelHub.allSharesSelected" : "modelHub.noSearchResults")}</li> : null}
         </ul>
       </section>
-      <div className="model-route-transfer-actions" role="group" aria-describedby={hintId} aria-label={t("modelHub.transferHint")}>
+      <div className="model-route-transfer-actions" role="group" aria-label={t("modelHub.transferHint")}>
         <button type="button" disabled={locked || !checkedIn.length || overCapacity || !!addBlockedReason}
           className="inline-flex h-11 items-center justify-center gap-1 whitespace-nowrap rounded-md border border-input bg-card px-3 text-xs text-foreground hover:bg-secondary active:bg-secondary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-40"
           onClick={() => moveChecked("in")} aria-label={t("modelHub.transferInLabel", { count: checkedIn.length })}>
@@ -200,9 +216,11 @@ export function SharePoolPicker({ shares, selected, app, routeKey, disabled, add
               onChange={checked => { if (!locked) setRightChecked(checked ? visibleSelected : []); }} />
             {t("modelHub.checkedCount", { count: checkedOut.length })}
           </label>
-          <input ref={rightSearchRef} value={rightQuery} onChange={event => { setRightQuery(event.target.value); setRightChecked([]); }} type="search"
-            className="h-11 min-w-0 w-full rounded-md border border-input bg-card px-3 text-xs focus-visible:outline-2 focus-visible:outline-ring"
-            aria-label={t("modelHub.searchList", { list: t("modelHub.selectedShares") })} placeholder={t("modelHub.searchShares")} />
+          {searchable || rightQuery ? (
+            <input ref={rightSearchRef} value={rightQuery} onChange={event => { setRightQuery(event.target.value); setRightChecked([]); }} type="search"
+              className="h-11 min-w-0 w-full rounded-md border border-input bg-card px-3 text-xs focus-visible:outline-2 focus-visible:outline-ring"
+              aria-label={t("modelHub.searchList", { list: t("modelHub.selectedShares") })} placeholder={t("modelHub.searchShares")} />
+          ) : null}
         </div>
         <DndContext sensors={sensors} collisionDetection={closestCenter}
           onDragStart={() => setDragging(true)} onDragCancel={() => setDragging(false)} onDragEnd={dragEnd}
@@ -223,9 +241,7 @@ export function SharePoolPicker({ shares, selected, app, routeKey, disabled, add
         </DndContext>
       </section>
       </div>
-      <div className="min-h-5 text-xs text-muted-foreground" role="status">
-        {addBlockedReason || (overCapacity ? t("modelHub.transferCapacity", { count: checkedIn.length, remaining: remainingSlots }) : full ? t("modelHub.queueFull") : rightQuery.trim() ? t("modelHub.sortSearchHint") : t("modelHub.queueHint"))}
-      </div>
+      {statusText ? <div className="text-xs text-muted-foreground" role="status">{statusText}</div> : null}
       <span className="sr-only" role="status">{announcement}</span>
     </div>
   );

@@ -14,6 +14,9 @@
   max-width: 100%;
   min-width: 0;
 }
+.model-route-transfer .model-route-account {
+  width: 100%;
+}
 .model-route-health {
   grid-template-rows: repeat(4, 1rem);
 }
@@ -25,7 +28,6 @@
  * Container-aware stacking works inside both narrow and full-width panels. */
 .model-route-transfer {
   container-type: inline-size;
-  max-width: calc(var(--router-route-account-width) * 2 + 14rem);
 }
 .model-route-transfer-grid {
   display: grid;
@@ -43,8 +45,7 @@
   display: grid;
   align-content: start;
   gap: 0.5rem;
-  height: min(28rem, 65svh);
-  min-height: 12rem;
+  max-height: min(28rem, 65svh);
   min-width: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
@@ -57,7 +58,7 @@
   gap: 0.5rem;
 }
 .model-route-transfer-horizontal { display: none; }
-@container (min-width: 44rem) {
+@container (min-width: 36rem) {
   .model-route-transfer-grid { grid-template-columns: minmax(0, 1fr) 5.5rem minmax(0, 1fr); }
   .model-route-transfer-actions { flex-direction: column; }
   .model-route-transfer-actions > button { width: 100%; }

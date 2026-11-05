@@ -40,6 +40,25 @@ export function RoutingShareSummary(props: RoutingShareSummaryProps) {
   );
 }
 
+/** Open menu item. The closed trigger shows the Share name only. */
+export function RoutingShareOption(props: RoutingShareSummaryProps) {
+  const { share, shareId, app } = props;
+  const label = share?.subdomain || share?.shareName || shareId;
+  const view = accountView(props);
+  return (
+    <span className="grid min-w-0 gap-0.5 text-left">
+      <span className="flex min-w-0 items-center gap-1.5">
+        {share ? <MarketProviderLogos source={share} size={14} /> : null}
+        <strong className="min-w-0 flex-1 truncate font-mono text-xs text-foreground" title={label}>{label}</strong>
+        <ShareAppLogo app={app} size={12} />
+      </span>
+      <span className="truncate text-[11px] text-slate-500" title={view.primaryLine}>{view.primaryLine}</span>
+      <span className="truncate text-[11px] text-slate-500" title={view.identityLine}>{view.identityLine}</span>
+      <span className="truncate text-[11px] text-slate-500" title={view.modelsLine}>{view.modelsLine}</span>
+    </span>
+  );
+}
+
 /** Details stay outside the add/remove/drag controls: touch can inspect long
  * account text without accidentally adding a Share to the queue. */
 export function RoutingShareDetails(props: RoutingShareSummaryProps) {

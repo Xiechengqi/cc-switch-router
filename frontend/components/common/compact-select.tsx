@@ -9,6 +9,8 @@ type CompactSelectOption = {
   label: string;
   description?: string;
   content?: React.ReactNode;
+  /** When this option is selected, the closed trigger shows `label` only. */
+  summarizeContent?: boolean;
 };
 
 const EMPTY_KEY = "__router_empty_select_value__";
@@ -56,12 +58,14 @@ export function CompactSelect({
         autoFocus={autoFocus}
         className={cn(
           "min-h-9 gap-3 rounded-lg border bg-white px-3 text-xs shadow-sm",
-          selected?.content ? undefined : selected?.description && "py-2",
+          !(selected?.content && !selected.summarizeContent) && selected?.description && "py-2",
           triggerClassName,
         )}
       >
         <Select.Value className="min-w-0 flex-1 pr-3 text-left text-xs text-foreground">
-          {selected?.content ? (
+          {selected?.content && selected.summarizeContent ? (
+            <span className="block min-w-0 truncate font-medium">{selected.label}</span>
+          ) : selected?.content ? (
             <span className="block min-w-0">{selected.content}</span>
           ) : (
             <span className="grid min-w-0 gap-0.5">

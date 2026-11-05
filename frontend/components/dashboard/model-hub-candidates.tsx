@@ -132,7 +132,7 @@ function SortableCandidateRow({
           </button>
         </div>
       </div>
-      <div className="min-w-0">{options.find(option => option.value === shareId)?.content || shareId}</div>
+      <div className="min-w-0 truncate px-1 text-xs">{options.find(option => option.value === shareId)?.label || shareId}</div>
     </div>
   );
 }
@@ -177,11 +177,20 @@ export function CandidateList({
   const [pickerValue, setPickerValue] = React.useState("");
   const validPickerValue = availableOptions.some(option => option.value === pickerValue)
     ? pickerValue : availableOptions[0]?.value || "";
+  const [open, setOpen] = React.useState(false);
 
   return (
     <div className="grid min-w-0 gap-1.5">
-      <span className="text-[11px] font-medium text-slate-500">{t("modelHub.candidatesList")}</span>
-      {candidates.length > 0 ? (
+      <button
+        type="button"
+        className="inline-flex min-h-8 w-fit items-center gap-1 rounded px-1 text-[11px] font-medium text-slate-500 hover:bg-secondary focus-visible:outline-2 focus-visible:outline-ring"
+        aria-expanded={open}
+        onClick={() => setOpen(current => !current)}
+      >
+        <ChevronDown className={cn("h-3 w-3 shrink-0 transition-transform", open && "rotate-180")} />
+        {t("modelHub.candidates", { count: candidates.length })}
+      </button>
+      {open && candidates.length > 0 ? (
         <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}
           accessibility={{
             screenReaderInstructions: { draggable: t("modelHub.dragInstructions") },
@@ -216,7 +225,7 @@ export function CandidateList({
           </SortableContext>
         </DndContext>
       ) : null}
-      {candidates.length < MAX_MODEL_ROUTE_CANDIDATES && availableOptions.length > 0 ? (
+      {open && candidates.length < MAX_MODEL_ROUTE_CANDIDATES && availableOptions.length > 0 ? (
         <div className="flex min-w-0 items-center gap-1.5">
           <div className="min-w-0 flex-1">
             <CompactSelect
