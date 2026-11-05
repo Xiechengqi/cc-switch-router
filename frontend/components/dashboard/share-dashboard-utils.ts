@@ -1436,11 +1436,13 @@ export function modelHealthTone(
   key?: "claude" | "codex" | "gemini",
   locale: AppLocale = "en",
 ) {
-  if (share.modelHealthStatus) {
-    const status = share.modelHealthStatus;
-    const fingerprint = key ? share.appRuntimes?.[key]?.modelProbe?.healthFingerprint : undefined;
-    const applies = !key || (status.appType === key
-      && !!fingerprint && fingerprint === status.healthFingerprint);
+  if (share.liveModelHealthStatus || share.modelHealthStatus) {
+    const status = share.liveModelHealthStatus || share.modelHealthStatus!;
+    const app = key || (status.appType === "claude" || status.appType === "codex" || status.appType === "gemini"
+      ? status.appType : undefined);
+    const fingerprint = app ? share.appRuntimes?.[app]?.modelProbe?.healthFingerprint : undefined;
+    const applies = key ? status.appType === key && !!fingerprint && fingerprint === status.healthFingerprint
+      : !fingerprint || fingerprint === status.healthFingerprint;
     return modelHealthPresentation(applies ? status : undefined, locale);
   }
   if (!key) return modelHealthPresentation(undefined, locale);
@@ -1497,7 +1499,7 @@ export function modelHealthTitle(
   key?: "claude" | "codex" | "gemini",
   locale: AppLocale = "en",
 ) {
-  if (share.modelHealthStatus || !key) {
+  if (share.liveModelHealthStatus || share.modelHealthStatus || !key) {
     const tone = modelHealthTone(share, key, locale);
     return "title" in tone ? tone.title : tone.label;
   }

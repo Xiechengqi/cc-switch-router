@@ -1,7 +1,23 @@
 use super::*;
-use crate::models::{ShareModelHealthStatus, ShareProviderModelPolicy};
+use crate::models::{
+    ShareManualModelHealthObservation, ShareModelHealthStatus, ShareProviderModelPolicy,
+};
 
 const HEALTH_FINGERPRINT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+#[test]
+fn model_health_runtime_control_rejects_cross_share_responses_and_accepts_old_server_fields() {
+    let legacy: ShareRuntimeSnapshotResponse = serde_json::from_value(serde_json::json!({
+        "shareId": "health-share",
+        "queriedAt": 1,
+        "support": {"claude": false, "codex": true, "gemini": false}
+    }))
+    .unwrap();
+    assert!(legacy.manual_model_health.is_empty());
+    assert_eq!(legacy.model_health_degraded_threshold_ms, None);
+    assert!(validate_share_runtime_snapshot_target(&legacy, "health-share").is_ok());
+    assert!(validate_share_runtime_snapshot_target(&legacy, "another-share").is_err());
+}
 
 fn health_result(status: &str, checked_at: i64) -> ShareModelHealthSlotResult {
     let mut result =
@@ -20,6 +36,64 @@ struct Fixture {
 }
 
 impl Fixture {
+    fn manual(&self, status: &str, checked_at: i64) -> ShareManualModelHealthObservation {
+        ShareManualModelHealthObservation {
+            observation_id: Uuid::new_v4().to_string(),
+            app_type: "codex".into(),
+            provider_id: "provider-test".into(),
+            health_fingerprint: HEALTH_FINGERPRINT.into(),
+            requested_model: "server-test-model@low".into(),
+            actual_model: "server-test-model".into(),
+            status: status.into(),
+            status_code: Some(if status == "failed" { 429 } else { 200 }),
+            latency_ms: if status == "degraded" { 11321 } else { 120 },
+            checked_at,
+        }
+    }
+
+    async fn ingest_manual(&self, evidence: ShareManualModelHealthObservation) {
+        self.store
+            .record_share_runtime_snapshot(ShareRuntimeSnapshotResponse {
+                share_id: "health-share".into(),
+                queried_at: Utc::now().timestamp(),
+                token_limit: None,
+                tokens_used: None,
+                requests_count: None,
+                share_status: None,
+                support: self.support.clone(),
+                app_runtimes: self.runtimes.clone(),
+                app_providers: Default::default(),
+                model_health: Default::default(),
+                manual_model_health: vec![evidence],
+                model_health_degraded_threshold_ms: Some(6000),
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn live_at(&self, now: DateTime<Utc>) -> ShareModelHealthStatus {
+        let conn = self.store.conn.lock().await;
+        let canonical = model_health::current_status(
+            &conn,
+            "health-share",
+            &self.support,
+            &self.runtimes,
+            &self.bindings,
+            now,
+        )
+        .unwrap();
+        model_health::live_status(
+            &conn,
+            "health-share",
+            &self.support,
+            &self.runtimes,
+            &self.bindings,
+            now,
+            &canonical,
+        )
+        .unwrap()
+    }
+
     async fn new() -> Self {
         Self::new_at(Utc::now().timestamp() / 1800 * 1800 - 18000).await
     }
@@ -233,6 +307,8 @@ async fn canonical_health_ignores_runtime_success_overwrite_and_repairs_historic
     }
     let checked_at = f.start + 2 * 1800 + 10;
     let snapshot = ShareRuntimeSnapshotResponse {
+        manual_model_health: Vec::new(),
+        model_health_degraded_threshold_ms: None,
         share_id: "health-share".into(),
         queried_at: checked_at + 20,
         token_limit: None,
@@ -459,6 +535,8 @@ async fn dashboard_market_and_share_url_expose_the_same_health_without_public_er
     f.push(0, "failed").await;
     for offset in 1..3 {
         f.push(offset, "failed").await;
+        f.ingest_manual(f.manual("success", Utc::now().timestamp() - 1))
+            .await;
         let dashboard = f
             .store
             .dashboard_snapshot(
@@ -473,6 +551,15 @@ async fn dashboard_market_and_share_url_expose_the_same_health_without_public_er
             .await
             .unwrap();
         let share = &dashboard.shares[0];
+        assert_eq!(share.live_model_health_status.state, "degraded");
+        assert_eq!(
+            share.live_model_health_status.reason_code,
+            "probe_recovering"
+        );
+        assert_eq!(
+            share.live_model_health_status.source.as_deref(),
+            Some("server_manual")
+        );
         let catalog = f
             .store
             .share_market_catalog(None, &["health-sub".into()])
@@ -494,6 +581,14 @@ async fn dashboard_market_and_share_url_expose_the_same_health_without_public_er
             .await
             .unwrap();
         assert_eq!(direct.model_health_status, share.model_health_status);
+        assert_eq!(
+            direct.live_model_health_status,
+            share.live_model_health_status
+        );
+        assert_eq!(
+            catalog.listings[0].live_model_health_status,
+            share.live_model_health_status
+        );
         let expected_reason = if offset < 2 {
             "provider_degraded"
         } else {
@@ -507,4 +602,353 @@ async fn dashboard_market_and_share_url_expose_the_same_health_without_public_er
         assert!(!public.contains("fixture-secret"));
         assert!(!public.contains("private@example.test"));
     }
+}
+
+#[tokio::test]
+async fn live_health_accepts_server_manual_success_before_first_cycle_without_inventing_history() {
+    let f = Fixture::new().await;
+    let now = Utc::now();
+    f.ingest_manual(f.manual("success", now.timestamp() - 1))
+        .await;
+    let status = f.live_at(now).await;
+    assert_eq!(status.state, "healthy");
+    assert_eq!(status.source.as_deref(), Some("server_manual"));
+    assert_eq!(status.reason_code, "manual_probe_verified");
+    let conn = f.store.conn.lock().await;
+    for table in ["share_model_health_slots", "share_model_probe_observations"] {
+        let count: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+    assert_eq!(
+        model_health::current_status(
+            &conn,
+            "health-share",
+            &f.support,
+            &f.runtimes,
+            &f.bindings,
+            now
+        )
+        .unwrap()
+        .state,
+        "unknown"
+    );
+}
+
+#[tokio::test]
+async fn live_health_acknowledges_manual_success_during_next_slot_configuration_transition() {
+    let now = Utc::now();
+    let mut f = Fixture::new_at(now.timestamp().div_euclid(1800) * 1800).await;
+    f.push(0, "failed").await;
+    let mut changed = f.runtimes.clone();
+    changed
+        .codex
+        .as_mut()
+        .unwrap()
+        .model_probe
+        .as_mut()
+        .unwrap()
+        .health_fingerprint = "b".repeat(64);
+    f.runtimes = changed;
+    let mut evidence = f.manual("success", now.timestamp());
+    evidence.health_fingerprint = "b".repeat(64);
+    f.ingest_manual(evidence).await;
+    let live = f.live_at(now).await;
+    assert_eq!(live.state, "healthy");
+    let conn = f.store.conn.lock().await;
+    let starts: i64 = conn
+        .query_row(
+            "SELECT starts_at_slot FROM share_model_probe_epochs WHERE ends_at_slot IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(starts, f.start + 1800);
+    let canonical = model_health::current_status(
+        &conn,
+        "health-share",
+        &f.support,
+        &f.runtimes,
+        &f.bindings,
+        now,
+    )
+    .unwrap();
+    assert_eq!(canonical.reason_code, "awaiting_probe");
+    let old: String = conn
+        .query_row("SELECT status FROM share_model_health_slots", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(old, "failed");
+}
+
+#[tokio::test]
+async fn live_health_preserves_cycle_failure_window_and_repeated_clicks_cannot_clear_recovery() {
+    let now = Utc::now();
+    let f = Fixture::new_at(now.timestamp().div_euclid(1800) * 1800 - 5400).await;
+    for offset in 0..3 {
+        f.push(offset, "failed").await;
+    }
+    // Ensure the latest cycle timestamp is before the current manual result.
+    let now = Utc.timestamp_opt(f.start + 3612, 0).unwrap();
+    for _ in 0..4 {
+        f.ingest_manual(f.manual("success", now.timestamp())).await;
+    }
+    let live = f.live_at(now).await;
+    assert_eq!(live.state, "degraded");
+    assert_eq!(live.reason_code, "probe_recovering");
+    assert_eq!(f.status(2).await.state, "unavailable");
+    assert_eq!(live.recent_results, ["failed", "failed", "failed"]);
+}
+
+#[tokio::test]
+async fn live_health_preserves_manual_failures_across_repeated_successful_tests() {
+    let f = Fixture::new().await;
+    let now = Utc::now();
+    f.ingest_manual(f.manual("failed", now.timestamp() - 2))
+        .await;
+    assert_eq!(f.live_at(now).await.state, "degraded");
+    for _ in 0..3 {
+        f.ingest_manual(f.manual("success", now.timestamp() - 1))
+            .await;
+    }
+    let live = f.live_at(now).await;
+    assert_eq!(live.state, "degraded");
+    assert_eq!(live.reason_code, "probe_recovering");
+}
+
+#[tokio::test]
+async fn live_health_newer_cycle_success_supersedes_manual_failures_and_clears_their_guard() {
+    let now = Utc::now();
+    let f = Fixture::new_at(now.timestamp().div_euclid(1800) * 1800 - 3600).await;
+    let failure_at = f.start + 1805;
+    f.ingest_manual(f.manual("failed", failure_at)).await;
+    assert_eq!(f.live_at(now).await.state, "degraded");
+    f.push(1, "success").await;
+    let live = f.live_at(now).await;
+    assert_eq!(live.state, "healthy");
+    assert_eq!(live.source.as_deref(), Some("periodic"));
+    assert_eq!(live.checked_at, Some(f.start + 1810));
+    f.ingest_manual(f.manual("success", now.timestamp() - 1))
+        .await;
+    let live = f.live_at(now).await;
+    assert_eq!(live.state, "healthy");
+    assert_eq!(live.source.as_deref(), Some("server_manual"));
+}
+
+#[tokio::test]
+async fn live_health_expired_cycle_failure_does_not_poison_a_new_manual_success() {
+    let now = Utc::now();
+    let f = Fixture::new_at(now.timestamp().div_euclid(1800) * 1800 - 5400).await;
+    f.push(0, "failed").await;
+    assert_eq!(f.live_at(now).await.reason_code, "probe_stale");
+    f.ingest_manual(f.manual("success", now.timestamp() - 1))
+        .await;
+    let live = f.live_at(now).await;
+    assert_eq!(live.state, "healthy");
+    assert_eq!(live.reason_code, "manual_probe_verified");
+    assert_eq!(live.recent_results, ["failed"]);
+}
+
+#[tokio::test]
+async fn live_health_rejects_mismatched_expired_future_and_invalid_server_evidence() {
+    let now = Utc::now();
+    let mut f = Fixture::new().await;
+    for variant in 0..9 {
+        let mut evidence = f.manual("success", now.timestamp() - 1);
+        match variant {
+            0 => evidence.app_type = "claude".into(),
+            1 => evidence.provider_id = "other".into(),
+            2 => evidence.health_fingerprint = "other".into(),
+            3 => evidence.requested_model = "other".into(),
+            4 => evidence.actual_model = "other".into(),
+            5 => evidence.checked_at = now.timestamp() - 3900,
+            6 => evidence.checked_at = now.timestamp() + 3600,
+            7 => evidence.status_code = Some(429),
+            _ => evidence.observation_id.clear(),
+        }
+        f.ingest_manual(evidence).await;
+    }
+    assert_eq!(f.live_at(now).await.state, "unknown");
+    let evidence = f.manual("degraded", now.timestamp() - 1);
+    f.ingest_manual(evidence.clone()).await;
+    let live = f.live_at(now).await;
+    assert_eq!(live.state, "degraded");
+    assert_eq!(live.reason_code, "probe_slow");
+    assert_eq!(live.status_code, Some(200));
+    assert_eq!(
+        f.live_at(Utc.timestamp_opt(evidence.checked_at + 3900, 0).unwrap())
+            .await
+            .state,
+        "unknown"
+    );
+    f.runtimes.codex.as_mut().unwrap().model_policy = Some(ShareProviderModelPolicy::Passthrough);
+    assert_eq!(f.live_at(now).await.state, "unknown");
+}
+
+#[tokio::test]
+async fn live_health_deduplicates_replays_and_late_results_never_replace_newer_evidence() {
+    let f = Fixture::new().await;
+    let now = Utc::now();
+    let evidence = f.manual("success", now.timestamp() - 1);
+    f.ingest_manual(evidence.clone()).await;
+    let mut drifted = evidence.clone();
+    drifted.status = "failed".into();
+    drifted.status_code = Some(429);
+    f.ingest_manual(drifted).await;
+    f.ingest_manual(f.manual("failed", now.timestamp() - 5))
+        .await;
+    let live = f.live_at(now).await;
+    assert_eq!(live.checked_at, Some(evidence.checked_at));
+    assert_eq!(live.status_code, Some(200));
+    assert_eq!(live.reason_code, "probe_recovering");
+    let conn = f.store.conn.lock().await;
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM share_model_live_observations",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 2);
+}
+
+#[tokio::test]
+async fn live_health_connection_tests_honor_dynamic_threshold_and_configuration_races() {
+    let f = Fixture::new().await;
+    f.ingest_manual(f.manual("success", Utc::now().timestamp() - 1))
+        .await;
+    let probe = f
+        .runtimes
+        .codex
+        .as_ref()
+        .unwrap()
+        .model_probe
+        .as_ref()
+        .unwrap();
+    assert!(
+        f.store
+            .prepare_connection_test_health("health-share", "claude", probe)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let context = f
+        .store
+        .prepare_connection_test_health("health-share", "codex", probe)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(context.degraded_threshold_ms, Some(6000));
+    assert!(
+        f.store
+            .finish_connection_test_health(&context, "degraded", 200, 11321)
+            .await
+            .unwrap()
+    );
+    let live = f.live_at(Utc::now()).await;
+    assert_eq!(live.source.as_deref(), Some("router_connection_test"));
+    assert_eq!(live.reason_code, "probe_slow");
+    f.store
+        .conn
+        .lock()
+        .await
+        .execute(
+            "UPDATE shares SET model_health_degraded_threshold_ms=15000",
+            [],
+        )
+        .unwrap();
+    assert!(
+        !f.store
+            .finish_connection_test_health(&context, "success", 200, 100)
+            .await
+            .unwrap()
+    );
+    let context = f
+        .store
+        .prepare_connection_test_health("health-share", "codex", probe)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(context.degraded_threshold_ms, Some(15000));
+    f.store
+        .conn
+        .lock()
+        .await
+        .execute("UPDATE shares SET config_revision=config_revision+1", [])
+        .unwrap();
+    assert!(
+        !f.store
+            .finish_connection_test_health(&context, "success", 200, 100)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn live_health_reopened_epochs_cannot_reuse_cached_manual_results() {
+    let f = Fixture::new().await;
+    let evidence = f.manual("success", Utc::now().timestamp() - 1);
+    f.ingest_manual(evidence.clone()).await;
+    let slot = Utc::now().timestamp().div_euclid(1800) * 1800;
+    f.store
+        .sync_share_model_probe_epoch("health-share", slot, None)
+        .await
+        .unwrap();
+    f.ingest_manual(evidence).await;
+    assert_eq!(f.live_at(Utc::now()).await.state, "unknown");
+}
+
+#[tokio::test]
+async fn live_health_replacing_empty_epochs_preserves_replay_guards_without_restoring_old_color() {
+    let mut f = Fixture::new_at(Utc::now().timestamp().div_euclid(1800) * 1800).await;
+    let old = f.manual("success", Utc::now().timestamp() - 5);
+    f.ingest_manual(old.clone()).await;
+    f.runtimes
+        .codex
+        .as_mut()
+        .unwrap()
+        .model_probe
+        .as_mut()
+        .unwrap()
+        .health_fingerprint = "b".repeat(64);
+    let mut changed = f.manual("success", Utc::now().timestamp() - 4);
+    changed.health_fingerprint = "b".repeat(64);
+    f.ingest_manual(changed).await;
+    f.runtimes
+        .codex
+        .as_mut()
+        .unwrap()
+        .model_probe
+        .as_mut()
+        .unwrap()
+        .health_fingerprint = HEALTH_FINGERPRINT.into();
+    f.ingest_manual(old.clone()).await;
+    let mut undelivered = old;
+    undelivered.observation_id = "earlier-undelivered-check".into();
+    f.ingest_manual(undelivered).await;
+    assert_eq!(f.live_at(Utc::now()).await.state, "unknown");
+    {
+        let conn = f.store.conn.lock().await;
+        let retained: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM share_model_live_observations WHERE probe_epoch_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, 2);
+        let epochs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM share_model_probe_epochs", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(epochs, 1);
+    }
+    f.ingest_manual(f.manual("success", Utc::now().timestamp()))
+        .await;
+    assert_eq!(f.live_at(Utc::now()).await.state, "healthy");
 }

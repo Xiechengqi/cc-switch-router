@@ -25,6 +25,14 @@ export function modelHealthPresentation(
     ? status.state : "unknown";
   const copy = messages[locale];
   const label = stale ? copy["dashboard.modelHealth.stale"] : copy[`dashboard.modelHealth.${state}`];
+  const manual = state !== "unknown" && (status?.source === "server_manual" || status?.source === "router_connection_test");
+  const slow = state === "degraded" && (status?.reasonCode === "probe_slow" || status?.reasonCode === "probe_degraded");
+  const recovering = state === "degraded" && status?.reasonCode === "probe_recovering";
+  const manualFailed = manual && (status?.reasonCode === "manual_probe_failed" || status?.reasonCode === "upstream_rate_limited");
+  const detailLabel = state === "unknown"
+    ? status?.reasonCode === "awaiting_probe" && !stale ? copy["dashboard.modelHealth.awaiting"] : label
+    : [manual ? copy[manualFailed ? "dashboard.modelHealth.manualFailed" : "dashboard.modelHealth.manual"] : "", slow ? copy["dashboard.modelHealth.slow"] : "",
+        recovering ? copy["dashboard.modelHealth.recoveringShort"] : ""].filter(Boolean).join(" · ");
   const title = [
     label,
     [status?.appType, status?.model].filter(Boolean).join(" · "),
@@ -32,6 +40,10 @@ export function modelHealthPresentation(
     status?.checkedAt ? formatDateTime(status.checkedAt * 1000, locale) : "",
     status?.reasonCode === "upstream_rate_limited" ? copy["dashboard.modelHealth.rateLimited"] : "",
     status?.reasonCode === "probe_recovering" ? copy["dashboard.modelHealth.recovering"] : "",
+    manual ? copy[`dashboard.modelHealth.source.${status!.source as "server_manual" | "router_connection_test"}`] : "",
+    slow ? copy["dashboard.modelHealth.slow"] : "",
+    Number.isSafeInteger(status?.latencyMs) && Number(status?.latencyMs) >= 0
+      ? `${(Number(status?.latencyMs) / 1000).toFixed(2)}s` : "",
   ].filter(Boolean).join(" · ");
-  return { className: tones[state], label, title };
+  return { className: tones[state], label, title, detailLabel };
 }

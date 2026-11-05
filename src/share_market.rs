@@ -289,6 +289,7 @@ pub struct ListingView {
     pub provider_families: Vec<String>,
     pub app_capabilities: Vec<ShareMarketAppCapability>,
     pub model_health_status: crate::models::ShareModelHealthStatus,
+    pub live_model_health_status: crate::models::ShareModelHealthStatus,
     pub owner_email: String,
     pub status: String,
     pub share_status: String,
@@ -5637,6 +5638,18 @@ impl AppStore {
                 .iter()
                 .map(|capability| capability.app.clone())
                 .collect::<Vec<_>>();
+            let live_model_health_status = crate::store::model_health::live_status(
+                &conn,
+                &share_id,
+                &support,
+                &app_runtimes_json
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str(json).ok())
+                    .unwrap_or_default(),
+                &serde_json::from_str(&bindings_json).unwrap_or_default(),
+                Utc::now(),
+                &model_health_status,
+            )?;
             let mut app_availability = Vec::with_capacity(supported_apps.len());
             for app in &supported_apps {
                 app_availability.push(evaluate_share_market_service_availability_tx(
@@ -5916,6 +5929,7 @@ impl AppStore {
                 provider_families,
                 app_capabilities,
                 model_health_status,
+                live_model_health_status,
                 owner_email,
                 status,
                 share_status,

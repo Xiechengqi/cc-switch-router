@@ -151,7 +151,9 @@ jobs:
           bash scripts/ci/timed.sh 'Incident export' cargo test --locked alerting::store::tests
 
       - name: Test Share model health evidence and display status
-        run: bash scripts/ci/timed.sh 'Share model health' cargo test --locked model_health
+        run: |
+          bash scripts/ci/timed.sh 'Share model health' cargo test --locked model_health
+          bash scripts/ci/timed.sh 'Connection test live health policy' cargo test --locked connection_live_health
 
       - name: Test all market contracts
         # market_ does not match modules named share_market / client_market.

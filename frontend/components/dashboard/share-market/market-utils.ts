@@ -366,7 +366,7 @@ export function marketCapabilityRuntime(
 }
 
 export function marketProviderStatusView(
-  listing: Pick<ShareMarketListing, "appCapabilities" | "supportedApps" | "modelHealthStatus">,
+  listing: Pick<ShareMarketListing, "appCapabilities" | "supportedApps" | "modelHealthStatus" | "liveModelHealthStatus">,
   locale: AppLocale,
   labels: { unknown: string; passthrough: string },
 ): ShareProviderStatusPanelView {
@@ -397,8 +397,8 @@ export function marketProviderStatusView(
     ? "unavailable" : capabilities.some((item) => item.healthState === "degraded")
       ? "degraded" : capabilities.every((item) => item.healthState === "healthy")
         ? "healthy" : "unknown";
-  const health = listing.modelHealthStatus
-    ? modelHealthPresentation(listing.modelHealthStatus, locale) : undefined;
+  const status = listing.liveModelHealthStatus || listing.modelHealthStatus;
+  const health = status ? modelHealthPresentation(status, locale) : undefined;
   return {
     primaryLine: isApiProvider
       ? primary.providerName || primary.providerType || labels.unknown
@@ -408,6 +408,7 @@ export function marketProviderStatusView(
       modelsLine || capabilityModelLabel(primary, labels.passthrough, labels.unknown),
     panelTitle: health?.title,
     toneClassName: health?.className ?? marketProviderHealthTone(healthState),
+    healthLabel: health?.detailLabel,
   };
 }
 

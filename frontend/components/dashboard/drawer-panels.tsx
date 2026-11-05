@@ -730,6 +730,7 @@ function shareProviderStatusView({
     panelTitle: share ? modelHealthTitle(share, undefined, locale) : undefined,
     primaryMonospace: isApiProvider,
     toneClassName: healthTone.className,
+    healthLabel: "detailLabel" in healthTone && typeof healthTone.detailLabel === "string" ? healthTone.detailLabel : undefined,
   };
 }
 

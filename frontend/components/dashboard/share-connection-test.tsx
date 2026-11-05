@@ -6,6 +6,7 @@ import { Check, ChevronDown, Copy, ExternalLink, Loader2, RefreshCw } from "luci
 import { CompactSelect } from "@/components/common/compact-select";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
+import { useDashboardData } from "@/components/dashboard/dashboard-data";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { recoverShareAccountRateLimit, refreshShareUsage, testShareConnection } from "@/lib/api";
 import { SHARE_APP_LABELS } from "@/lib/share-app";
@@ -109,6 +110,7 @@ export function ShareConnectionTestRow({
   accountId: string;
 }) {
   const { t } = useLocaleText();
+  const { refresh: refreshDashboard } = useDashboardData();
   const [testState, setTestState] = React.useState<TestState>("idle");
   const [result, setResult] = React.useState<ShareConnectionTestResponse | null>(null);
   const [errorMsg, setErrorMsg] = React.useState("");
@@ -181,13 +183,16 @@ export function ShareConnectionTestRow({
         operation,
         timeoutMs: 30000,
       });
+      if (!isCurrentActor()) return;
       setResult(response);
       setTestState(response.success ? "done" : "error");
+      void refreshDashboard();
     } catch (err) {
+      if (!isCurrentActor()) return;
       setErrorMsg(err instanceof Error ? err.message : String(err));
       setTestState("error");
     }
-  }, [canExecute, isBound, probe, testState, share.shareId, app, operation]);
+  }, [canExecute, isBound, probe, testState, share.shareId, app, operation, isCurrentActor, refreshDashboard]);
 
   const runUsageRefresh = React.useCallback(async () => {
     if (!canExecute || !isBound || refreshState === "running") return;
@@ -222,12 +227,15 @@ export function ShareConnectionTestRow({
     setRecoveryMsg("");
     try {
       const recovery = await recoverShareAccountRateLimit(share.shareId, app);
+      if (!isCurrentActor()) return;
       if (recovery.outcome === "recovered" || recovery.outcome === "not_blocked") {
         setRecoveryState("done");
         setRecoveryMsg(t("dashboard.connectDialog.test.recoveryDone"));
         const response = await testShareConnection(share.shareId, { app, operation, timeoutMs: 30000 });
+        if (!isCurrentActor()) return;
         setResult(response);
         setTestState(response.success ? "done" : "error");
+        void refreshDashboard();
       } else {
         setRecoveryState("error");
         setRecoveryMsg(recovery.outcome === "still_rate_limited"
@@ -235,10 +243,11 @@ export function ShareConnectionTestRow({
           : recovery.message);
       }
     } catch (err) {
+      if (!isCurrentActor()) return;
       setRecoveryState("error");
       setRecoveryMsg(err instanceof Error ? err.message : String(err));
     }
-  }, [app, operation, recoveryState, share.canManage, share.shareId, t]);
+  }, [app, operation, recoveryState, share.canManage, share.shareId, t, isCurrentActor, refreshDashboard]);
 
   const running = testState === "running";
   const refreshing = refreshState === "running";

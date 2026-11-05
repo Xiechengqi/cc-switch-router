@@ -36,6 +36,7 @@ test("Claude-primary share uses actual Codex probe for the overview, not an empt
   assert.match(modelHealthTitle(share, undefined, "zh-CN"), /HTTP 429/);
   share.appRuntimes!.codex!.modelProbe!.healthFingerprint = "changed";
   assert.match(modelHealthTone(share, "codex").className, /bg-slate-50/);
+  assert.match(modelHealthTone(share).className, /bg-slate-50/);
 });
 
 test("missing and stale legacy model checks are never green", (t) => {
@@ -45,6 +46,47 @@ test("missing and stale legacy model checks are never green", (t) => {
   share.modelHealth!.claude = [{ appType: "claude", actualModel: "model", requestedModel: "model",
     status: "success", checkedAt: now / 1000 - 4000, recentResults: ["success"] }];
   assert.match(modelHealthTone(share, "claude").className, /bg-slate-50/);
+});
+
+test("live manual health changes display without replacing canonical cycle evidence", (t) => {
+  t.mock.method(Date,"now",()=>now);
+  const canonical=status({state:"unknown",checkedAt:undefined,staleAt:undefined,recentResults:[]});
+  const live=status({state:"healthy",source:"server_manual",reasonCode:"manual_probe_verified",recentResults:[],latencyMs:123});
+  const share={modelHealthStatus:canonical,liveModelHealthStatus:live,
+    appRuntimes:{codex:{modelProbe:{healthFingerprint:"current"}}}} as unknown as ShareView;
+  assert.match(modelHealthTone(share).className,/bg-emerald-50/);
+  assert.equal(share.modelHealthStatus?.state,"unknown");
+  assert.match(modelHealthTitle(share,undefined,"zh-CN"),/Server 模型测试/);
+  assert.match(modelHealthTone(share,"claude").className,/bg-slate-50/);
+  const presentation=modelHealthPresentation(live,"zh-CN",now);
+  assert.match(presentation.detailLabel,/手动验证/);
+  assert.match(presentation.title,/0\.12s/);
+  live.state="degraded"; live.reasonCode="probe_slow";
+  assert.match(modelHealthTone(share).className,/bg-amber-50/);
+  assert.match(modelHealthPresentation(live,"zh-CN",now).detailLabel,/响应较慢/);
+  live.reasonCode="probe_recovering";
+  assert.match(modelHealthPresentation(live,"en",now).detailLabel,/Recovering/);
+  live.reasonCode="manual_probe_failed";
+  assert.equal(modelHealthPresentation(live,"zh-CN",now).detailLabel,"手动检查异常");
+  assert.doesNotMatch(modelHealthPresentation(live,"en",now).detailLabel,/verified/i);
+  live.reasonCode="upstream_rate_limited";
+  assert.equal(modelHealthPresentation(live,"en",now).detailLabel,"Manual check failed");
+  live.staleAt=now/1000;
+  assert.match(modelHealthTone(share).className,/bg-slate-50/);
+});
+
+test("market uses the same live evidence and explains waiting and slow periodic checks", (t) => {
+  t.mock.method(Date,"now",()=>now);
+  const listing={supportedApps:["codex"],appCapabilities:[{app:"codex",providerName:"P",healthState:"healthy"}],
+    modelHealthStatus:status(),liveModelHealthStatus:status({state:"degraded",source:"router_connection_test",reasonCode:"probe_slow"})} as ShareMarketListing;
+  const view=marketProviderStatusView(listing,"zh-CN",{unknown:"-",passthrough:"透传"});
+  assert.match(view.toneClassName,/bg-amber-50/);
+  assert.match(view.healthLabel!,/响应较慢/);
+  assert.match(view.panelTitle!,/Router 端到端测试/);
+  const waiting=modelHealthPresentation(status({state:"unknown",checkedAt:undefined,staleAt:undefined,reasonCode:"awaiting_probe"}),"zh-CN",now);
+  assert.equal(waiting.detailLabel,"等待周期检查");
+  const slow=modelHealthPresentation(status({state:"degraded",reasonCode:"probe_degraded"}),"en",now);
+  assert.equal(slow.detailLabel,"Slow response");
 });
 
 test("market identity richness cannot mask authoritative health or an enabled App failure", (t) => {

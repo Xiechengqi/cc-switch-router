@@ -168,6 +168,7 @@ export const ShareCard = React.memo(function ShareCard({
     panelTitle: modelHealthTitle(share, undefined, locale),
     primaryMonospace: isApiProvider,
     toneClassName: healthTone.className,
+    healthLabel: "detailLabel" in healthTone ? healthTone.detailLabel : undefined,
   };
   const summary = shareOperationalSummary(share);
   const issue = summary.primaryReason

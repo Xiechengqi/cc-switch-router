@@ -11,6 +11,7 @@ export type ShareProviderStatusPanelView = {
   panelTitle?: string;
   primaryMonospace?: boolean;
   toneClassName: string;
+  healthLabel?: string;
 };
 
 export function marketProviderHealthTone(
@@ -68,6 +69,7 @@ export function ShareProviderStatusPanel({
       >
         {view.modelsLine}
       </span>
+      {view.healthLabel ? <span className="min-w-0 truncate text-[10px] font-medium" title={view.panelTitle}>{view.healthLabel}</span> : null}
     </div>
   );
 }

@@ -37,6 +37,10 @@ const models = requireMarkers("src/models.rs", [
   "pub struct ShareModelHealthProbeEpoch",
   "pub struct ShareModelHealthStatus",
   "pub model_health_status: ShareModelHealthStatus",
+  "pub live_model_health_status: ShareModelHealthStatus",
+  "pub struct ShareManualModelHealthObservation",
+  "pub manual_model_health: Vec<ShareManualModelHealthObservation>",
+  "pub model_health_degraded_threshold_ms: Option<u64>",
 ]);
 const store = requireMarkers("src/store.rs", [
   "validate_share_model_probes(share)?",
@@ -57,6 +61,9 @@ const store = requireMarkers("src/store.rs", [
   "can_view_share_model_health_calendar",
   "model_health::current_status",
   "model_health::has_canonical_check",
+  "model_health::live_status",
+  "model_health::record_server_manual",
+  "validate_share_runtime_snapshot_target(&snapshot, share_id)?",
 ]);
 requireMarkers("src/store/model_health.rs", [
   "automatic_share_probe(support, runtimes, bindings)",
@@ -65,13 +72,19 @@ requireMarkers("src/store/model_health.rs", [
   "FRESH_FOR_SECS: i64 = 65 * 60",
   "probe_stale",
   "probe_recovering",
+  "share_model_live_observations",
+  "prepare_connection_test_health",
+  "finish_connection_test_health",
+  "recent_manual_failure",
+  "canonical.checked_at",
+  "ON CONFLICT(share_id,source,observation_id) DO NOTHING",
 ]);
-requireMarkers("src/share_market.rs", ["model_health::current_status"]);
+requireMarkers("src/share_market.rs", ["model_health::current_status", "model_health::live_status"]);
 requireMarkers("frontend/lib/share-health.ts", [
   "modelHealthPresentation", "status?.staleAt", "dashboard.modelHealth.stale",
 ]);
-requireMarkers("frontend/components/dashboard/share-dashboard-utils.ts", ["share.modelHealthStatus"]);
-requireMarkers("frontend/components/dashboard/share-market/market-utils.ts", ["listing.modelHealthStatus"]);
+requireMarkers("frontend/components/dashboard/share-dashboard-utils.ts", ["share.modelHealthStatus", "share.liveModelHealthStatus"]);
+requireMarkers("frontend/components/dashboard/share-market/market-utils.ts", ["listing.modelHealthStatus", "listing.liveModelHealthStatus"]);
 const scheduler = requireMarkers("src/share_model_health.rs", [
   "SLOT_SECONDS: i64 = 30 * 60",
   "SLOT_RETENTION_DAYS: i64 = 400",
@@ -101,10 +114,14 @@ requireMarkers("src/api.rs", [
   "share_model_probe_for_app",
   "probe.response_mode",
   "read_probe_body(resp, response_mode, prepared.expected_output_limit)",
+  "connection_test_live_health_result",
+  "prepare_connection_test_health",
+  "finish_connection_test_health",
 ]);
 requireMarkers("src/schema.rs", [
   'include_str!("../schema/0027_share_model_health_slots.sql")',
   'include_str!("../schema/0028_share_model_health_evidence.sql")',
+  'include_str!("../schema/0109_share_live_model_health.sql")',
 ]);
 requireMarkers("schema/0027_share_model_health_slots.sql", [
   "CREATE TABLE share_model_health_slots",
@@ -118,6 +135,13 @@ requireMarkers("schema/0028_share_model_health_evidence.sql", [
   "evidence_scope",
   "failure_domain",
   "idx_share_model_health_slots_observation",
+]);
+requireMarkers("schema/0109_share_live_model_health.sql", [
+  "CREATE TABLE share_model_live_observations",
+  "PRIMARY KEY (share_id, source, observation_id)",
+  "model_health_degraded_threshold_ms BETWEEN 1000 AND 30000",
+  "idx_share_live_health_current",
+  "idx_share_live_health_retention",
 ]);
 
 const selection = store.slice(store.indexOf("pub(crate) fn automatic_share_probe"), store.indexOf("pub(crate) fn model_probe_actual_model"));
@@ -194,6 +218,9 @@ const protocol = requireMarkers("PROTOCOL.md", [
   "每批最多回退一次",
   "modelHealthStatus",
   "65 分钟",
+  "liveModelHealthStatus",
+  "manualModelHealth",
+  "modelHealthDegradedThresholdMs",
 ]);
 const { errors: versionErrors, versions } = auditShareContractVersions(models, protocol);
 errors.push(...versionErrors);
