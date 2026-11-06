@@ -9,7 +9,7 @@ export type ClientUpgradeState = {
   recoveryReason?: ClientUpgradeRecoveryReason;
   statusUnavailable?: boolean;
   retryBlocked?: boolean;
-  /** Commit observed when this attempt started; used to drop a same-tab failed latch. */
+  /** Commit observed when this attempt started; used to clear an obsolete attempt. */
   observedCommitId?: string;
 };
 
@@ -34,6 +34,13 @@ export function isClientUpgradeActive(state: ClientUpgradeState) {
   return ["starting", "recovering", "running"].includes(state.phase);
 }
 
+/** An unavailable status can be retried: the Client returns its existing task
+ * while an upgrade is running. Keep the POST itself and confirmed tasks locked. */
+export function isClientUpgradeLocked(state: ClientUpgradeState) {
+  return isClientUpgradeActive(state)
+    && (state.phase === "starting" || !state.statusUnavailable || state.retryBlocked === true);
+}
+
 export function isPersistedClientUpgradePhase(phase: ClientUpgradePhase) {
   return phase === "starting" || phase === "recovering" || phase === "running";
 }
@@ -48,21 +55,14 @@ export function upgradeCommitsMatch(
 ): boolean {
   const leftNorm = left?.trim().toLowerCase() ?? "";
   const rightNorm = right?.trim().toLowerCase() ?? "";
-  if (
-    leftNorm.length < 7
-    || leftNorm.length > 40
-    || rightNorm.length < 7
-    || rightNorm.length > 40
-    || ![...leftNorm].every((char) => isAsciiHex(char))
-    || ![...rightNorm].every((char) => isAsciiHex(char))
-  ) {
+  if (!isUpgradeCommitId(leftNorm) || !isUpgradeCommitId(rightNorm)) {
     return false;
   }
   return leftNorm.startsWith(rightNorm) || rightNorm.startsWith(leftNorm);
 }
 
-function isAsciiHex(char: string) {
-  return (char >= "0" && char <= "9") || (char >= "a" && char <= "f");
+function isUpgradeCommitId(value: string) {
+  return /^[a-f0-9]{7,40}$/.test(value);
 }
 
 export function isClientUpgradeState(value: unknown): value is ClientUpgradeState {
@@ -139,19 +139,22 @@ export function writeClientUpgradeSessionState(
 }
 
 /**
- * Drop a same-tab failed latch only when the live Client reports a different
- * commit than the attempt that failed, and the tunnel is online. Does not use
- * updateAvailable (already-latest + preflight fail would wipe the diagnostic).
+ * Clear a failed or unavailable attempt when the online Client reports a
+ * different commit. A confirmed running task and an in-flight POST stay locked.
+ * Does not use updateAvailable (already-latest + preflight fail would wipe the
+ * diagnostic).
  * Circuit-open retryBlocked stays until the operator leaves the tab.
  */
-export function shouldClearFailedUpgradeLatch(
+export function shouldClearClientUpgradeLatch(
   state: ClientUpgradeState,
   facts: ClientUpgradeObservedFacts,
 ): boolean {
-  if (state.phase !== "failed" || state.retryBlocked) return false;
+  const unavailable = state.statusUnavailable === true
+    && (state.phase === "running" || state.phase === "recovering");
+  if ((state.phase !== "failed" && !unavailable) || state.retryBlocked) return false;
   if (!facts.tunnelOnline) return false;
-  const baseline = state.observedCommitId?.trim();
-  const observed = facts.observedCommitId?.trim();
-  if (!baseline || !observed) return false;
+  const baseline = state.observedCommitId?.trim().toLowerCase() ?? "";
+  const observed = facts.observedCommitId?.trim().toLowerCase() ?? "";
+  if (!isUpgradeCommitId(baseline) || !isUpgradeCommitId(observed)) return false;
   return !upgradeCommitsMatch(baseline, observed);
 }

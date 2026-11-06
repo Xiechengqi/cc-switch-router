@@ -2944,8 +2944,11 @@ export const messages = {
     "dashboard.clientUpgradeFailed": "{target} upgrade failed",
     "dashboard.clientUpgradeFailedButton": "Retry upgrade",
     "dashboard.clientUpgradeRecovering": "Checking upgrade status",
-    "dashboard.clientUpgradeStatusUnavailable": "Upgrade status is unavailable; retrying",
-    "dashboard.clientUpgradeStatusUnavailableButton": "Status unavailable",
+    "dashboard.clientUpgradeStatusUnavailable":
+      "Upgrade status is unavailable. Status checks will continue; you can also retry the upgrade.",
+    "dashboard.clientUpgradeStatusUnavailableButton": "Retry upgrade",
+    "dashboard.clientUpgradeStatusRetryConfirm":
+      "Retry the upgrade request for {target}. If the Client is still upgrading, Router will follow that task. Otherwise, the Client will pull the latest release and may restart after upgrading.",
     "dashboard.clientUpgradeStartUncertain":
       "The upgrade request result is uncertain. Router is checking whether the Client accepted it.",
     "dashboard.clientUpgradeStartUnconfirmed":
@@ -6465,8 +6468,11 @@ export const messages = {
     "dashboard.clientUpgradeFailed": "{target} 升级失败",
     "dashboard.clientUpgradeFailedButton": "重试升级",
     "dashboard.clientUpgradeRecovering": "正在确认升级状态",
-    "dashboard.clientUpgradeStatusUnavailable": "升级状态暂不可达，正在重试",
-    "dashboard.clientUpgradeStatusUnavailableButton": "状态暂不可达",
+    "dashboard.clientUpgradeStatusUnavailable":
+      "升级状态暂不可达，将继续查询；也可以点击重试升级。",
+    "dashboard.clientUpgradeStatusUnavailableButton": "重试升级",
+    "dashboard.clientUpgradeStatusRetryConfirm":
+      "将为 {target} 重试升级请求。如果 Client 仍在升级，Router 会继续跟踪原任务；否则会重新拉取最新版本，升级完成后可能自动重启服务。",
     "dashboard.clientUpgradeStartUncertain":
       "升级请求结果暂不确定，Router 正在确认 Client 是否已接受任务。",
     "dashboard.clientUpgradeStartUnconfirmed":

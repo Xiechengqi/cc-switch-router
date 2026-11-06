@@ -789,6 +789,9 @@ location.reload();
 | D-08c | 承 D-08a | 刷新同一标签 | 无 running task 时回到普通「升级」，不得从 sessionStorage 恢复「重试升级」 |
 | D-08d | 承 D-08a 后，机器已换成不同 commit 且隧道在线 | 等 Dashboard 刷新 | 同 tab 静默回到普通「升级」，不再 toast 成功 |
 | D-09 | 承 D-08 | 升级中刷新页面 | 进行中状态从 `cc_switch_router_client_upgrade_v3:` 恢复 |
+| D-09a | Client 在线，升级状态查询超时或失败 | 观察按钮并点「重试升级」 | 自动查询继续；按钮可操作，确认后重发请求；Client 原任务仍运行时继续跟踪同一 taskId，不重复启动 |
+| D-09b | 承 D-09a | 确认重试时让旧查询返回 | 旧查询结果不覆盖新请求；请求发送期间按钮及确认项锁定，连续确认只发送一次请求 |
+| D-09c | 状态不可达，Client 已切到不同有效 commit 且隧道在线 | 等 Dashboard 刷新 | 静默清除旧状态并恢复普通「升级」；相同 commit、无效 commit、离线、已确认进行中或熔断状态不据此解除 |
 | D-10 | 任意开通/清理作业 | 观察 `ProvisionJobLog` | 日志实时追加,可滚动;失败时高亮 |
 
 ---

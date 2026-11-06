@@ -5,10 +5,12 @@ import {
   clientUpgradeStorageKey,
   clientUpgradeStorageKeyV2,
   IDLE_CLIENT_UPGRADE_STATE,
+  isClientUpgradeActive,
+  isClientUpgradeLocked,
   parsePersistedClientUpgradeState,
   persistedClientUpgradeState,
   readClientUpgradeSessionState,
-  shouldClearFailedUpgradeLatch,
+  shouldClearClientUpgradeLatch,
   upgradeCommitsMatch,
   writeClientUpgradeSessionState,
   type ClientUpgradeState,
@@ -21,6 +23,28 @@ const failed: ClientUpgradeState = {
   errorMessage: "[resource_preflight/resource_preflight_failed] cgroup memory headroom is 0 MiB",
   observedCommitId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 };
+
+test("unavailable tasks remain tracked but permit an explicit retry", () => {
+  const running: ClientUpgradeState = {
+    phase: "running", startedAt: 12, taskId: "task-1", statusUnavailable: true,
+  };
+  const recovering: ClientUpgradeState = {
+    phase: "recovering", startedAt: 12, recoveryReason: "start", statusUnavailable: true,
+  };
+  for (const state of [running, recovering]) {
+    assert.equal(isClientUpgradeActive(state), true, "keep polling the uncertain attempt");
+    assert.deepEqual(persistedClientUpgradeState(state), state, "refresh must retain recovery");
+    assert.equal(isClientUpgradeLocked(state), false, "a status outage must not disable retry");
+    assert.equal(isClientUpgradeLocked({ ...state, statusUnavailable: false }), true);
+    assert.equal(isClientUpgradeLocked({ ...state, retryBlocked: true }), true);
+  }
+  assert.equal(isClientUpgradeLocked({ phase: "starting", startedAt: 12 }), true);
+  assert.equal(isClientUpgradeLocked({
+    phase: "starting", startedAt: 12, statusUnavailable: true,
+  }), true, "an in-flight POST must never permit another click");
+  assert.equal(isClientUpgradeLocked(failed), false);
+  assert.equal(isClientUpgradeLocked(IDLE_CLIENT_UPGRADE_STATE), false);
+});
 
 test("upgrade commits match full SHA against a 12-char prefix", () => {
   assert.equal(
@@ -62,6 +86,7 @@ test("stored starting is recovered as start-recovery; failed storage is ignored"
   assert.equal(recovered?.phase, "recovering");
   assert.equal(recovered?.recoveryReason, "start");
   assert.equal(recovered?.statusUnavailable, true);
+  assert.equal(isClientUpgradeLocked(recovered!), false, "a restored POST can be retried safely");
   assert.equal(parsePersistedClientUpgradeState(failed), null);
   assert.equal(parsePersistedClientUpgradeState(IDLE_CLIENT_UPGRADE_STATE), null);
 });
@@ -113,7 +138,7 @@ test("legacy v2 failed latches are dropped on read; only in-flight v3 states per
 
 test("same-tab failed latch clears only after a different live commit while online", () => {
   assert.equal(
-    shouldClearFailedUpgradeLatch(failed, {
+    shouldClearClientUpgradeLatch(failed, {
       observedCommitId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       tunnelOnline: true,
     }),
@@ -121,21 +146,21 @@ test("same-tab failed latch clears only after a different live commit while onli
     "already-latest preflight failure must keep the diagnostic",
   );
   assert.equal(
-    shouldClearFailedUpgradeLatch(failed, {
+    shouldClearClientUpgradeLatch(failed, {
       observedCommitId: "bead3d3fb28c879925d2b2316304fafb8be49e87",
       tunnelOnline: true,
     }),
     true,
   );
   assert.equal(
-    shouldClearFailedUpgradeLatch(failed, {
+    shouldClearClientUpgradeLatch(failed, {
       observedCommitId: "bead3d3fb28c879925d2b2316304fafb8be49e87",
       tunnelOnline: false,
     }),
     false,
   );
   assert.equal(
-    shouldClearFailedUpgradeLatch(
+    shouldClearClientUpgradeLatch(
       { ...failed, retryBlocked: true },
       {
         observedCommitId: "bead3d3fb28c879925d2b2316304fafb8be49e87",
@@ -145,7 +170,7 @@ test("same-tab failed latch clears only after a different live commit while onli
     false,
   );
   assert.equal(
-    shouldClearFailedUpgradeLatch(
+    shouldClearClientUpgradeLatch(
       { ...failed, observedCommitId: undefined },
       {
         observedCommitId: "bead3d3fb28c879925d2b2316304fafb8be49e87",
@@ -155,7 +180,7 @@ test("same-tab failed latch clears only after a different live commit while onli
     false,
   );
   assert.equal(
-    shouldClearFailedUpgradeLatch(
+    shouldClearClientUpgradeLatch(
       { ...failed, phase: "running" },
       {
         observedCommitId: "bead3d3fb28c879925d2b2316304fafb8be49e87",
@@ -164,4 +189,45 @@ test("same-tab failed latch clears only after a different live commit while onli
     ),
     false,
   );
+});
+
+test("a different online Client commit clears an unavailable attempt without unlocking confirmed work", () => {
+  const baseline = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const observed = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const running: ClientUpgradeState = {
+    phase: "running", startedAt: 12, taskId: "task-1", statusUnavailable: true,
+    observedCommitId: baseline,
+  };
+  const recovering: ClientUpgradeState = {
+    phase: "recovering", startedAt: 12, recoveryReason: "start", statusUnavailable: true,
+    observedCommitId: baseline,
+  };
+  for (const state of [running, recovering]) {
+    assert.equal(shouldClearClientUpgradeLatch(state, {
+      observedCommitId: observed, tunnelOnline: true,
+    }), true);
+    assert.equal(shouldClearClientUpgradeLatch(state, {
+      observedCommitId: baseline.slice(0, 12), tunnelOnline: true,
+    }), false, "a matching abbreviated commit is not a new binary");
+    assert.equal(shouldClearClientUpgradeLatch(state, {
+      observedCommitId: observed, tunnelOnline: false,
+    }), false);
+    for (const invalid of [undefined, "unknown", "gpt5mini", "123", "g".repeat(40)]) {
+      assert.equal(shouldClearClientUpgradeLatch(state, {
+        observedCommitId: invalid, tunnelOnline: true,
+      }), false);
+      assert.equal(shouldClearClientUpgradeLatch({ ...state, observedCommitId: invalid }, {
+        observedCommitId: observed, tunnelOnline: true,
+      }), false);
+    }
+    assert.equal(shouldClearClientUpgradeLatch({ ...state, retryBlocked: true }, {
+      observedCommitId: observed, tunnelOnline: true,
+    }), false);
+    assert.equal(shouldClearClientUpgradeLatch({ ...state, statusUnavailable: false }, {
+      observedCommitId: observed, tunnelOnline: true,
+    }), false, "keep following a confirmed active task through replacement checks");
+  }
+  assert.equal(shouldClearClientUpgradeLatch({
+    phase: "starting", startedAt: 12, statusUnavailable: true, observedCommitId: baseline,
+  }, { observedCommitId: observed, tunnelOnline: true }), false);
 });

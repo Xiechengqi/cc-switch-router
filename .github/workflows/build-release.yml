@@ -71,6 +71,7 @@ jobs:
           npm run test:share-market
           npm run test:client-share-home
           npm run test:client-market
+          npm run test:client-upgrade-state
           npm run test:providers
           npm run test:share-model-probe
           npm run test:share-model-health-heatmap
