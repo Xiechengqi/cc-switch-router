@@ -436,6 +436,10 @@ pub fn router(state: ServerState) -> Router {
         )
         .route("/v1/me/model-routing/test", post(test_my_model_routing))
         .route(
+            "/v1/me/model-routing/traffic",
+            get(get_my_model_routing_traffic),
+        )
+        .route(
             "/v1/me/usage-card",
             get(get_my_usage_card_settings).patch(update_my_usage_card_settings),
         )
@@ -3472,6 +3476,35 @@ pub(crate) async fn get_my_model_routing(
             state
                 .store
                 .get_user_model_routing(&state.config, &email, &active_subdomains)
+                .await?,
+        ),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ModelRoutingTrafficQuery {
+    after: Option<String>,
+    instance: Option<String>,
+}
+
+/// Plan P5-1: the caller's own unified-API route executions, incremental by cursor.
+pub(crate) async fn get_my_model_routing_traffic(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<ModelRoutingTrafficQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let email = require_session_email(&state, &headers).await?;
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(
+            state
+                .store
+                .get_user_model_routing_traffic(
+                    &email,
+                    query.after.as_deref(),
+                    query.instance.as_deref(),
+                )
                 .await?,
         ),
     ))

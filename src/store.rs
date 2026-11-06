@@ -955,6 +955,8 @@ pub struct AppStore {
     /// Shared by all Store clones: configuration commits fence late outcomes.
     pub route_breakers: Arc<crate::route_breaker::RouteBreakerRegistry>,
     pub model_route_runtime: Arc<crate::model_route_runtime::ModelRouteRuntime>,
+    /// Plan P5-1: bounded per-user record of unified-API route executions.
+    pub model_route_traffic: Arc<crate::model_route_traffic::ModelRouteTraffic>,
     database_health: DatabaseHealthHandle,
     database_sync: DatabaseSyncHandle,
     auth_email_send_locks: Arc<Mutex<HashMap<(String, String), Weak<Mutex<()>>>>>,
@@ -1772,6 +1774,7 @@ impl AppStore {
             conn: Arc::new(Mutex::new(conn)),
             route_breakers: Arc::new(crate::route_breaker::RouteBreakerRegistry::new()),
             model_route_runtime: Arc::new(crate::model_route_runtime::ModelRouteRuntime::default()),
+            model_route_traffic: Arc::new(crate::model_route_traffic::ModelRouteTraffic::default()),
             database_health,
             database_sync,
             auth_email_send_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -2031,6 +2034,7 @@ impl AppStore {
             conn: Arc::new(Mutex::new(conn)),
             route_breakers: Arc::new(crate::route_breaker::RouteBreakerRegistry::new()),
             model_route_runtime: Arc::new(crate::model_route_runtime::ModelRouteRuntime::default()),
+            model_route_traffic: Arc::new(crate::model_route_traffic::ModelRouteTraffic::default()),
             database_health,
             database_sync,
             auth_email_send_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -7855,6 +7859,22 @@ impl AppStore {
         let now = Utc::now();
         let conn = self.conn.lock().await;
         upsert_user_by_email(&conn, &email, now)
+    }
+
+    /// Plan P5-1. Read-only: an unknown email has no events and is not created.
+    pub async fn get_user_model_routing_traffic(
+        &self,
+        current_user_email: &str,
+        after: Option<&str>,
+        instance: Option<&str>,
+    ) -> Result<crate::model_route_traffic::ModelRouteTrafficSnapshot, AppError> {
+        let email = normalize_email(current_user_email)?;
+        let user = {
+            let conn = self.conn.lock().await;
+            get_user_by_email(&conn, &email)?
+        };
+        let user_id = user.map(|user| user.id).unwrap_or_default();
+        Ok(self.model_route_traffic.snapshot(&user_id, after, instance))
     }
 
     pub async fn get_user_model_routing(

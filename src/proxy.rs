@@ -2639,6 +2639,26 @@ async fn user_model_proxy_handler_inner(
     };
 
     drop(decoded);
+    let traffic_start = |route: Option<&UserModelRouteResolution>| {
+        crate::model_route_traffic::ModelRouteTrafficStart {
+            app_type: app_type.clone(),
+            requested_model: requested_model.clone(),
+            route_id: route.map(|route| route.route_id.clone()),
+            revision: route.map(|route| route.revision),
+            matched_wildcard: route.is_some_and(|route| route.matched_wildcard),
+        }
+    };
+    let record_rejection = |status: StatusCode, code: &'static str| {
+        if let Some(sequence) = observation_sequence {
+            state.store.model_route_traffic.rejected(
+                &principal.user_id,
+                sequence,
+                traffic_start(None),
+                status.as_u16(),
+                code,
+            );
+        }
+    };
     let resolution = match state
         .store
         .resolve_user_model_route(
@@ -2651,6 +2671,7 @@ async fn user_model_proxy_handler_inner(
     {
         Ok(Some(resolution)) => resolution,
         Ok(None) => {
+            record_rejection(StatusCode::NOT_FOUND, "user_model_route_not_configured");
             return unified_api_error_response(
                 StatusCode::NOT_FOUND,
                 "user_model_route_not_configured",
@@ -2667,6 +2688,7 @@ async fn user_model_proxy_handler_inner(
             message,
             details,
         }) => {
+            record_rejection(status, code);
             return unified_api_error_response(status, code, &message, details);
         }
         Err(error) => return error.into_response(),
@@ -2677,6 +2699,14 @@ async fn user_model_proxy_handler_inner(
             .store
             .begin_user_model_route_observation(&resolution, sequence);
     }
+    // Dropped unfinished (caller gone mid-routing) it records an interruption.
+    let traffic = observation_sequence.and_then(|sequence| {
+        state.store.model_route_traffic.begin(
+            &principal.user_id,
+            sequence,
+            traffic_start(Some(&resolution)),
+        )
+    });
     let execution = execute_resolved_model_route(
         &state,
         peer,
@@ -2694,7 +2724,19 @@ async fn user_model_proxy_handler_inner(
             execution.observation(&resolution, sequence, "request", None),
         );
     }
-    execution.response
+    match traffic {
+        Some(traffic) => {
+            traffic.headers(crate::model_route_traffic::ModelRouteTrafficHeaders {
+                status_code: execution.response.status().as_u16(),
+                target_share_id: execution.target_share_id.clone(),
+                position: execution.position,
+                continued_search: execution.continued_search,
+                attempts: execution.attempts.clone(),
+            });
+            traffic.attach(execution.response)
+        }
+        None => execution.response,
+    }
 }
 
 #[derive(Clone)]

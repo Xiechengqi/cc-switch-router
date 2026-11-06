@@ -699,6 +699,40 @@ Host 判断必须精确匹配 `api.<tunnel_domain>`（含配置中的端口语�
 
 `routeRecentResults` 是当前实例每条规则最近一次观测，最多 4096 条、保留一小时。普通请求仅记录响应头事实，诊断另记录正文读取状态。请求开始序号、账号及配置 revision 的内存代次隔离迟到结果，配置保存清理旧结果。进行中的请求不清空上一条已完成观测；新请求取消也不允许更早请求覆盖它。过期由服务端判断，客户端时钟不参与。继续寻找候选（continuedSearch）与返回备选响应头（usedBackup）均不代表完整调用成功；重启清空，多实例记录不完整。没有记录显示未知，不推断备选已接管。
 
+### 9.5 实时路径（只读）
+
+`GET /v1/me/model-routing/traffic?after=<cursor>&instance=<instanceId>`，Session 鉴权，`Cache-Control: no-store`，实现在 `src/model_route_traffic.rs`。
+
+**记录范围：** 返回当前用户经统一入口发出、且已解析出请求模型的推理请求；每次执行记一条事件。不记录直连 Share URL、模型列表、`/test` 诊断，也不记录认证、路径、请求体或缺少模型等更早的拒绝。规则解析阶段被拒的请求（未配置、首选不可用等）记为已结束的事件，带 `statusCode`/`errorCode`，没有 `routeId`。
+
+**存储与容量：** 只在进程内存中保存，按结束时间保留 15 分钟，仍在进行中的事件一直保留。每个用户最多 200 条；全局最多 20,000 条，满时淘汰事件最多那个用户的最早事件；最多 4,096 个用户，满时不再记录新用户，也不驱逐已有用户。重启后清空，多实例之间互不可见。
+
+**事件字段：**
+
+- `sequence`：与 `routeRecentResults` 共用同一个请求序号。
+- 规则：`appType`、`requestedModel`、`routeId`、`revision`、`matchedWildcard`。
+- 进度：`startedAt`、`phase`，以及最终 `statusCode`、`errorCode`。
+- 落点：`targetShareId`、`position`、`continuedSearch`，以及 `attempts`（与 `/test` saved_route 结构相同，最多 6 项）。
+- 耗时：`headersMs`（到最终响应头）、`durationMs`（到正文结束）。
+
+事件不含正文、Key、IP、邮箱或上游错误内容。
+
+**阶段（`phase`）：**
+
+- `routing`：正在尝试候选。
+- `streaming`：最终响应头已返回，正文仍在传输。
+- `complete`：Router 看到正文正常结束。
+- `interrupted`：正文出错，或调用方在结束前断开。
+
+阶段只前进不回退。`complete` 只说明字节流正常结束，不保证模型输出完整。为跟踪正文结束，Router 用一个仅透传数据帧的包装体替换最终响应体，状态码、响应头和数据都不变。
+
+**增量读取：** 响应为 `{ instanceId, cursor, reset, windowSeconds, perUserCapacity, events }`。每次写入（创建、收到响应头、正文结束）都会推进全局版本号。
+
+- 返回 `reset: true` 和该用户的全部事件：首次读取、`instance` 与当前进程不一致、`after` 无法解析或大于当前版本（进程已重启），或 `after` 早于该用户被容量淘汰的事件。
+- 其余情况只返回版本号大于 `after` 的事件（包括阶段推进），客户端按 `sequence` 合并。
+
+客户端应先用 JSON 结构判断是否为该接口：旧 Router 对未知路径返回前端页面，不是 404。
+
 ---
 
 ## 10. 身份注入:IngressContext

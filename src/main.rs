@@ -53,6 +53,7 @@ mod metrics;
 mod model_price_catalog;
 mod model_pricing;
 mod model_route_runtime;
+mod model_route_traffic;
 mod models;
 mod namespace;
 mod notification_channels;
