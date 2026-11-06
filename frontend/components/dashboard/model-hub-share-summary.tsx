@@ -1,10 +1,8 @@
-import { ShareProviderStatusPanel } from "@/components/dashboard/share-provider-status-panel";
 import { MarketProviderLogos } from "@/components/dashboard/share-market/market-share-identity";
-import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
-import { modelRoutingShareAccountView } from "@/lib/model-routing";
+import { modelRoutingShareAccountView, modelRoutingShareCompactLine } from "@/lib/model-routing";
 import type { AppLocale, MessageKey } from "@/lib/i18n";
 import type { ModelRoutingApp, UserModelRoutingShare } from "@/lib/types";
-import { RoutingShareDependencies } from "./model-hub-dependencies";
+import { cn } from "@/lib/utils";
 
 export type RoutingShareSummaryProps = {
   share?: UserModelRoutingShare;
@@ -14,67 +12,47 @@ export type RoutingShareSummaryProps = {
   t: (key: MessageKey, params?: Record<string, string | number>) => string;
 };
 
-function accountView({ share, app, locale, t }: RoutingShareSummaryProps) {
-  return share ? modelRoutingShareAccountView(share, app, locale, {
+const DOT_TONES = {
+  healthy: "bg-emerald-500",
+  degraded: "bg-amber-500",
+  unavailable: "bg-red-500",
+  unknown: "bg-sky-400",
+} as const;
+
+/** Phrasing-only markup: rows sit next to buttons, never inside them. The
+ * second line names provider and models; quota, account identity and the
+ * health detail stay in the native tooltip instead of a third panel. */
+export function RoutingShareSummary({ share, shareId, app, locale, t }: RoutingShareSummaryProps) {
+  const label = share?.subdomain || share?.shareName || shareId;
+  if (!share) {
+    return (
+      <span className="grid min-w-0 gap-0.5 text-left">
+        <strong className="min-w-0 truncate font-mono text-[13px] font-medium text-muted-foreground line-through decoration-slate-300" title={label}>{label}</strong>
+        <span className="truncate text-xs text-red-600">{t("modelHub.targetUnavailable")}</span>
+      </span>
+    );
+  }
+  const view = modelRoutingShareAccountView(share, app, locale, {
     passthrough: t("dashboard.modelPolicyPassthrough"), unavailable: t("dashboard.providerUnavailable"),
-  }) : {
-    primaryLine: "—", identityLine: t("modelHub.targetUnavailable"), modelsLine: "—",
-    toneClassName: "border-slate-200 bg-slate-50 text-slate-600",
-    healthLabel: t("modelHub.targetUnavailable"),
-  };
-}
-
-/** Phrasing-only markup is safe inside both buttons and CompactSelect options. */
-export function RoutingShareSummary(props: RoutingShareSummaryProps) {
-  const { share, shareId, app, t } = props;
-  const label = share?.subdomain || share?.shareName || shareId;
+  });
+  const compact = modelRoutingShareCompactLine(share, app, t("dashboard.modelPolicyPassthrough"));
+  const status = t(share.isOnline ? "common.online" : "common.offline");
+  // panelTitle keeps the observed protocol: Share health may come from another App.
+  const tooltip = [label, view.primaryLine, view.identityLine, view.modelsLine,
+    [view.healthLabel, view.panelTitle].filter(Boolean).join(" — ")]
+    .filter(line => line && line !== "-").join("\n");
+  const tone = share.isOnline ? DOT_TONES[view.healthState || "unknown"] : "bg-slate-300";
   return (
-    <span className="model-route-account grid gap-2 text-left">
-      <span className="flex min-w-0 items-center gap-1.5">
-        {share ? <MarketProviderLogos source={share} size={16} /> : null}
-        <strong className="min-w-0 flex-1 truncate font-mono text-xs text-foreground" title={label}>{label}</strong>
-        <ShareAppLogo app={app} size={14} />
-        {share ? <span className="shrink-0 text-[11px] text-muted-foreground">{t(share.isOnline ? "common.online" : "common.offline")}</span> : null}
+    <span className="grid min-w-0 gap-0.5 text-left" title={tooltip}>
+      <span className="flex min-w-0 items-center gap-2">
+        <MarketProviderLogos source={share} size={16} />
+        <strong className="min-w-0 truncate font-mono text-[13px] font-medium text-foreground">{label}</strong>
+        <span className="inline-flex shrink-0 items-center gap-1 text-[11px] text-muted-foreground">
+          <span className={cn("model-route-dot", tone, share.isOnline && view.healthState === "healthy" && "model-route-dot-live")} aria-hidden />
+          {status}
+        </span>
       </span>
-      <ShareProviderStatusPanel as="span" view={accountView(props)} className="model-route-health" />
+      <span className="truncate pl-6 text-xs text-muted-foreground">{compact || view.healthLabel}</span>
     </span>
-  );
-}
-
-/** Open menu item. The closed trigger shows the Share name only. */
-export function RoutingShareOption(props: RoutingShareSummaryProps) {
-  const { share, shareId, app } = props;
-  const label = share?.subdomain || share?.shareName || shareId;
-  const view = accountView(props);
-  return (
-    <span className="grid min-w-0 gap-0.5 text-left">
-      <span className="flex min-w-0 items-center gap-1.5">
-        {share ? <MarketProviderLogos source={share} size={14} /> : null}
-        <strong className="min-w-0 flex-1 truncate font-mono text-xs text-foreground" title={label}>{label}</strong>
-        <ShareAppLogo app={app} size={12} />
-      </span>
-      <span className="truncate text-[11px] text-slate-500" title={view.primaryLine}>{view.primaryLine}</span>
-      <span className="truncate text-[11px] text-slate-500" title={view.identityLine}>{view.identityLine}</span>
-      <span className="truncate text-[11px] text-slate-500" title={view.modelsLine}>{view.modelsLine}</span>
-    </span>
-  );
-}
-
-/** Details stay outside the add/remove/drag controls: touch can inspect long
- * account text without accidentally adding a Share to the queue. */
-export function RoutingShareDetails(props: RoutingShareSummaryProps) {
-  const view = accountView(props);
-  return (
-    <details className="model-route-account text-xs text-muted-foreground">
-      <summary className="flex min-h-11 cursor-pointer items-center rounded px-2 underline underline-offset-4 hover:bg-secondary active:bg-secondary focus-visible:outline-2 focus-visible:outline-ring">
-        {props.t("modelHub.accountDetails")}
-      </summary>
-      <div className="grid gap-1 break-words px-2 pb-2 [overflow-wrap:anywhere]">
-        <span>{props.share?.subdomain || props.share?.shareName || props.shareId}</span>
-        <span>{view.primaryLine}</span><span>{view.identityLine}</span><span>{view.modelsLine}</span>
-        <span>{view.panelTitle || view.healthLabel}</span>
-        <RoutingShareDependencies shareId={props.shareId} t={props.t} />
-      </div>
-    </details>
   );
 }

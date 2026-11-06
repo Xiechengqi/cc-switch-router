@@ -501,6 +501,18 @@ export async function getUserModelRouting(signal?: AbortSignal) {
   );
 }
 
+/** Plan P5-1. Older Routers answer this path with the web app, not JSON;
+ * callers must check the shape (see `isModelRouteTrafficSnapshot`). */
+export async function getUserModelRoutingTraffic(cursor: { after?: string; instance?: string }, signal?: AbortSignal) {
+  const search = new URLSearchParams();
+  if (cursor.after) search.set("after", cursor.after);
+  if (cursor.instance) search.set("instance", cursor.instance);
+  const query = search.toString();
+  return parseJson<unknown>(
+    await authFetch(`/v1/me/model-routing/traffic${query ? `?${query}` : ""}`, { cache: "no-store", signal }),
+  );
+}
+
 export async function replaceUserModelRouting(input: ReplaceUserModelRoutingRequest) {
   return parseJson<UserModelRoutingResponse>(
     await authFetch("/v1/me/model-routing", {

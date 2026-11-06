@@ -3,7 +3,6 @@
  */
 
 :root {
-  --router-route-account-width: 18rem;
   /* Portable aliases only: the Router palette remains owned by globals.css. */
   --color-provider-paper: rgb(var(--router-background));
   --color-provider-surface: rgb(var(--router-card));

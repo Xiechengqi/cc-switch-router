@@ -298,9 +298,24 @@ export function modelRoutingShareAccountView(
     ...lines,
     primaryMonospace: !!capability && isApiProviderRuntime(routingCapabilityRuntime(capability)),
     toneClassName: health.className,
+    healthState: health.state,
     panelTitle: health.title,
     healthLabel: [shareStatus ? "Share" : "", health.label, health.detailLabel !== health.label ? health.detailLabel : ""].filter(Boolean).join(" · "),
   };
+}
+
+/** One muted line for compact Share rows: provider, then the models this
+ * protocol actually reaches. Full quota and account text stays in the title. */
+export function modelRoutingShareCompactLine(
+  share: UserModelRoutingShare,
+  app: ModelRoutingApp,
+  passthroughLabel: string,
+) {
+  const capability = share.apps.includes(app)
+    ? share.appCapabilities?.find(item => item.app === app) : undefined;
+  const provider = capability?.providerName || share.providerIdentity?.displayName || "";
+  const models = capability ? providerActualModelNames(routingCapabilityRuntime(capability), passthroughLabel) : "";
+  return [provider, models].filter(value => value && value !== "-").join(" · ");
 }
 
 export function firstShareForProtocol(
@@ -625,30 +640,6 @@ export function modelRoutingSuggestions(profile: UserModelRoutingResponse, app: 
   return [];
 }
 
-export type ShareRouteDependency = {
-  appType: ModelRoutingApp; routeClientId: string; requestedModel: string; position: number;
-  nextEligibleOnlineCandidateShareId: string | null;
-};
-export type ShareDependencySummary = {
-  shareId: string; dependencies: ShareRouteDependency[]; primaryCount: number; noNextEligibleOnlineCandidateCount: number;
-};
-export function buildShareDependencies(view: "saved" | "draft", routes: DraftModelRoute[], eligibleShares: UserModelRoutingShare[]): Map<string, ShareDependencySummary> {
-  // `view` is intentionally explicit at call sites; no mixing saved/draft inputs.
-  void view;
-  const result = new Map<string, ShareDependencySummary>();
-  for (const route of routes) {
-    const ids = modelRouteTargets(route);
-    ids.forEach((shareId, position) => {
-      const nextEligibleOnlineCandidateShareId = ids.slice(position + 1).find(id => eligibleShares.some(share =>
-        share.shareId === id && share.apps.includes(route.appType) && share.isOnline === true)) || null;
-      const summary = result.get(shareId) || { shareId, dependencies: [], primaryCount: 0, noNextEligibleOnlineCandidateCount: 0 };
-      summary.dependencies.push({ appType: route.appType, routeClientId: route.clientId, requestedModel: route.requestedModel, position, nextEligibleOnlineCandidateShareId });
-      if (position === 0) { summary.primaryCount++; if (!nextEligibleOnlineCandidateShareId) summary.noNextEligibleOnlineCandidateCount++; }
-      result.set(shareId, summary);
-    });
-  }
-  return result;
-}
 
 export function patchDraftModelRoute(
   routes: DraftModelRoute[],

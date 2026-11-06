@@ -60,5 +60,5 @@ export function modelHealthPresentation(
     Number.isSafeInteger(status?.latencyMs) && Number(status?.latencyMs) >= 0
       ? `${(Number(status?.latencyMs) / 1000).toFixed(2)}s` : "",
   ].filter(Boolean).join(" · ");
-  return { className: tones[state], label, title, detailLabel };
+  return { className: tones[state], state: state as keyof typeof tones, label, title, detailLabel };
 }

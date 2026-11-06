@@ -1,6 +1,9 @@
 "use client";
 
 import { ModelHubRecentResult } from "./model-hub-recent-result";
+import { ModelHubTraffic } from "./model-hub-traffic";
+import { routeShareTraffic } from "@/lib/model-routing-traffic";
+import { useModelRoutingTraffic } from "@/lib/use-model-routing-traffic";
 
 import { Button, toast } from "@heroui/react";
 import {
@@ -54,7 +57,6 @@ import { ModelRoutingSession, routingDrafts, routingDraftIsDirty } from "@/lib/m
 import { usePersistentState } from "@/lib/use-persistent-state";
 import { cn } from "@/lib/utils";
 import { ModelHubRuleEditor, modelRouteEditorId } from "./model-hub-rule-editor";
-import { ModelHubDependencyProvider } from "./model-hub-dependencies";
 import { ModelHubTestDrawer } from "./model-hub-test-drawer";
 import type { MessageKey } from "@/lib/i18n";
 
@@ -303,17 +305,6 @@ export function ModelHubPanel({
   const activeSlot = slots.find((slot) => slot.appType === activeProtocol) || slots[1];
   const savedDrafts = React.useMemo(() => profile ? routingDrafts(profile) : [], [profile]);
   const changes = React.useMemo(() => diffModelRoutes(savedDrafts, controller.routes), [savedDrafts, controller.routes]);
-  const locateRule = (clientId: string) => {
-    const route = controller.routes.find(item => item.clientId === clientId);
-    setExpandedState(true);
-    if (!route) return;
-    // A jump is a one-shot override; it must not replace the remembered tab.
-    setActiveProtocolState(route.appType as ModelRoutingProtocol);
-    requestAnimationFrame(() => {
-      const node = document.getElementById(modelRouteEditorId(clientId));
-      node?.scrollIntoView({ block: "nearest" }); node?.focus({ preventScroll: true });
-    });
-  };
   const maskedToken = controller.rawToken
     ? `${controller.rawToken.slice(0, 8)}${"*".repeat(16)}${controller.rawToken.slice(-4)}`
     : controller.token?.prefix
@@ -366,9 +357,14 @@ export function ModelHubPanel({
     }
   }, [t]);
 
+  // Plan P5-1: polled only while the hub is open; a new viewer starts empty.
+  const { traffic, status: trafficStatus } = useModelRoutingTraffic(expanded && !!profile, controller.actorKey);
+  const trafficFor = (routeId?: string) => trafficStatus === "ready" && routeId && !routeId.startsWith("new:")
+    ? routeShareTraffic(traffic.events, routeId, Date.now()) : undefined;
+
   if (controller.loading && !profile) {
     return (
-      <section id="model-hub" className="flex min-h-32 items-center justify-center border-y border-border bg-white px-4 py-6 text-sm text-muted-foreground">
+      <section id="model-hub" className="flex min-h-32 items-center justify-center rounded-2xl border border-border bg-card px-4 py-6 text-sm text-muted-foreground">
         <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden />
         {t("common.loading")}
       </section>
@@ -382,107 +378,111 @@ export function ModelHubPanel({
   }).join(" · ");
   const mode = activeSlot ? protocolSlotMode(activeSlot) : "empty";
   const shares = sharesForProtocol(profile?.eligibleShares || [], activeProtocol);
-  const attention = protocolHasAttention(controller.routes, profile?.eligibleShares || [], activeProtocol);
+
+  const busy = controller.busy || controller.loading;
+  const iconAction = "inline-flex size-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors duration-200 hover:bg-secondary hover:text-foreground disabled:pointer-events-none disabled:opacity-40 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring pointer-coarse:size-11";
+  const field = "flex h-11 min-w-0 items-center gap-1 rounded-lg border border-border bg-card pl-3 pr-1 shadow-[0_1px_3px_rgba(0,0,0,0.04)]";
+  const fieldLabel = "flex items-center gap-1.5 font-mono text-[11px] uppercase tracking-[0.12em] text-muted-foreground";
 
   return (
-    <section id="model-hub" className="grid min-w-0 gap-4 border-y border-border bg-white px-4 py-4 sm:px-5">
-      <div className="flex min-w-0 flex-wrap items-start justify-between gap-3">
-        <div className="min-w-0">
-          <h2 className="flex items-center gap-2 text-sm font-semibold text-foreground">
-            <Network className="h-4 w-4 text-primary" aria-hidden />
-            {t("modelHub.title")}
-          </h2>
-          <p className="mt-1 min-w-0 truncate text-xs text-muted-foreground" title={summary}>{summary}</p>
+    <section id="model-hub" className="grid min-w-0 overflow-hidden rounded-2xl border border-border bg-card shadow-[0_4px_6px_rgba(0,0,0,0.07)]">
+      <header className="relative flex min-w-0 flex-wrap items-center justify-between gap-3 px-4 py-4 sm:px-5">
+        {/* Ambient accent glow: felt, not seen. */}
+        <span aria-hidden className="pointer-events-none absolute -left-16 -top-24 size-56 rounded-full bg-primary/[0.06] blur-3xl" />
+        <div className="relative flex min-w-0 items-center gap-3">
+          <span className="grid size-10 shrink-0 place-items-center rounded-xl bg-gradient-to-br from-accent to-accent-secondary text-primary-foreground shadow-[0_4px_14px_rgba(0,82,255,0.25)]">
+            <Network className="size-5" aria-hidden />
+          </span>
+          <div className="min-w-0">
+            <h2 className="text-base font-semibold tracking-[-0.01em] text-foreground">{t("modelHub.title")}</h2>
+            {/* Expanded, the protocol tabs carry the per-protocol status; do not repeat it here. */}
+            <p className="mt-0.5 min-w-0 truncate text-xs text-muted-foreground" title={expanded ? undefined : summary}>
+              {expanded ? t("modelHub.priorityHint") : summary}
+            </p>
+          </div>
         </div>
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            className="inline-flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground hover:bg-slate-100 hover:text-foreground disabled:opacity-40"
-            disabled={controller.loading || controller.busy}
-            title={t("common.reload")}
-            aria-label={t("common.reload")}
-            onClick={() => void controller.load()}
-          >
-            <RefreshCw className={`h-4 w-4 ${controller.loading ? "animate-spin" : ""}`} />
+        <div className="relative flex items-center gap-2">
+          <button type="button" className={iconAction} disabled={busy} title={t("common.reload")} aria-label={t("common.reload")}
+            onClick={() => void controller.load()}>
+            <RefreshCw className={cn("size-4", controller.loading && "animate-spin")} aria-hidden />
           </button>
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={() => {
-              setExpanded((open) => !open);
-            }}
-          >
-            <ChevronDown className={cn("h-4 w-4 transition-transform", expanded && "rotate-180")} />
+          <Button size="sm" variant="outline" onClick={() => setExpanded(open => !open)} aria-expanded={expanded}>
+            <ChevronDown className={cn("size-4 transition-transform duration-200", expanded && "rotate-180")} aria-hidden />
             {expanded ? t("modelHub.collapseRoutes") : t("modelHub.expandRoutes")}
           </Button>
-          <Button variant="primary" size="sm" isDisabled={!controller.dirty || controller.busy || controller.loading || controller.conflict} onClick={() => void controller.save()}>
-            {controller.busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+          <Button variant="primary" size="sm" isDisabled={!controller.dirty || busy || controller.conflict} onClick={() => void controller.save()}>
+            {controller.busy ? <Loader2 className="size-4 animate-spin" aria-hidden /> : <Save className="size-4" aria-hidden />}
             {t("common.save")}
-            {changes.length ? <span className="tabular-nums">({changes.length})</span> : null}
+            {changes.length ? <span className="rounded-full bg-white/25 px-1.5 text-[11px] tabular-nums">{changes.length}</span> : null}
           </Button>
         </div>
-      </div>
+      </header>
 
-      <div className="grid min-w-0 gap-3 lg:grid-cols-2">
+      <div className="grid min-w-0 gap-3 border-t border-border bg-secondary/40 px-4 py-3 sm:px-5 lg:grid-cols-2">
         <div className="grid min-w-0 gap-1.5">
-          <span className="text-[11px] font-medium text-muted-foreground">{t("modelHub.endpoint")}</span>
-          <div className="flex min-w-0 items-center gap-2 rounded-md border border-border bg-slate-50 px-3 py-2">
-            <code className="min-w-0 flex-1 truncate text-xs text-foreground" title={profile?.apiBaseUrl}>{profile?.apiBaseUrl || "-"}</code>
-            <button type="button" className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-white hover:text-foreground" title={t("common.copy")} aria-label={t("common.copy")} onClick={() => void copy("endpoint", profile?.apiBaseUrl || "")}>
-              <Copy className="h-3.5 w-3.5" />
+          <span className={fieldLabel}>{t("modelHub.endpoint")}</span>
+          <div className={field}>
+            <code className="min-w-0 flex-1 truncate font-mono text-xs text-foreground" title={profile?.apiBaseUrl}>{profile?.apiBaseUrl || "-"}</code>
+            <button type="button" className={iconAction} title={t("common.copy")} aria-label={t("common.copy")} onClick={() => void copy("endpoint", profile?.apiBaseUrl || "")}>
+              <Copy className="size-3.5" aria-hidden />
             </button>
           </div>
         </div>
         <div className="grid min-w-0 gap-1.5">
-          <span className="flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground"><KeyRound className="h-3.5 w-3.5" />{t("modelHub.apiKey")}</span>
-          <div className="flex min-w-0 items-center gap-1 rounded-md border border-border bg-slate-50 px-3 py-2">
-            <code className="min-w-0 flex-1 truncate text-xs text-foreground">{controller.showToken && controller.rawToken ? controller.rawToken : maskedToken}</code>
-            <button type="button" disabled={!controller.rawToken} className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-white hover:text-foreground disabled:opacity-40" title={controller.showToken ? t("account.apiKeys.hideToken") : t("account.apiKeys.showToken")} aria-label={controller.showToken ? t("account.apiKeys.hideToken") : t("account.apiKeys.showToken")} onClick={() => controller.setShowToken((value) => !value)}>
-              {controller.showToken ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+          <span className={fieldLabel}><KeyRound className="size-3.5" aria-hidden />{t("modelHub.apiKey")}</span>
+          <div className={field}>
+            <code className="min-w-0 flex-1 truncate font-mono text-xs text-foreground">{controller.showToken && controller.rawToken ? controller.rawToken : maskedToken}</code>
+            <button type="button" disabled={!controller.rawToken} className={iconAction} title={controller.showToken ? t("account.apiKeys.hideToken") : t("account.apiKeys.showToken")} aria-label={controller.showToken ? t("account.apiKeys.hideToken") : t("account.apiKeys.showToken")} onClick={() => controller.setShowToken(value => !value)}>
+              {controller.showToken ? <EyeOff className="size-3.5" aria-hidden /> : <Eye className="size-3.5" aria-hidden />}
             </button>
-            <button type="button" disabled={!controller.rawToken} className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-white hover:text-foreground disabled:opacity-40" title={t("common.copy")} aria-label={t("common.copy")} onClick={() => void copy("token", controller.rawToken)}>
-              <Copy className="h-3.5 w-3.5" />
+            <button type="button" disabled={!controller.rawToken} className={iconAction} title={t("common.copy")} aria-label={t("common.copy")} onClick={() => void copy("token", controller.rawToken)}>
+              <Copy className="size-3.5" aria-hidden />
             </button>
-            <button type="button" disabled={controller.busy || controller.loading || !profile} className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-rose-600 hover:bg-white disabled:opacity-40" title={t("account.apiKeys.reset")} aria-label={t("account.apiKeys.reset")} onClick={() => setResetConfirmOpen(true)}>
-              <RotateCcw className="h-3.5 w-3.5" />
+            <button type="button" disabled={busy || !profile} className={cn(iconAction, "text-rose-600 hover:bg-rose-50 hover:text-rose-700")} title={t("account.apiKeys.reset")} aria-label={t("account.apiKeys.reset")} onClick={() => setResetConfirmOpen(true)}>
+              <RotateCcw className="size-3.5" aria-hidden />
             </button>
           </div>
         </div>
       </div>
 
-      {controller.error ? (
-        <div className="border-l-2 border-rose-500 bg-rose-50 px-3 py-2 text-sm text-rose-700" role="alert">
-          {controller.error}
+      {controller.error || controller.conflict || controller.refreshError || changes.length ? (
+        <div className="grid min-w-0 gap-2 border-t border-border px-4 py-3 sm:px-5">
+          {controller.error ? (
+            <div className="rounded-lg border-l-2 border-rose-500 bg-rose-50 px-3 py-2 text-sm text-rose-700" role="alert">{controller.error}</div>
+          ) : null}
+          {controller.conflict ? (
+            <div role="alert" className="flex flex-wrap items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800">
+              <span>{t("modelHub.remoteChanged")}</span>
+              <Button size="sm" variant="outline" isDisabled={busy} onClick={() => setReloadConfirmOpen(true)}>{t("common.reload")}</Button>
+            </div>
+          ) : null}
+          {controller.refreshError ? <p role="status" className="text-xs text-muted-foreground">{t("modelHub.refreshFailed")}</p> : null}
+          {changes.length ? <details className="group min-w-0 rounded-lg border border-primary/20 bg-primary/[0.03] px-3 text-xs">
+            <summary className="flex min-h-11 cursor-pointer list-none items-center gap-2 font-medium text-foreground focus-visible:outline-2 focus-visible:outline-ring [&::-webkit-details-marker]:hidden">
+              <span className="size-1.5 rounded-full bg-primary" aria-hidden />
+              {t("modelHub.changes.title", { count: changes.length })}
+              <ChevronDown className="ml-auto size-4 text-muted-foreground transition-transform duration-200 group-open:rotate-180" aria-hidden />
+            </summary>
+            <ul className="grid gap-1 pb-2">{changes.map(change => <li key={change.changeId} className="flex min-w-0 flex-wrap items-center justify-between gap-2 border-t border-primary/10 pt-1">
+              <span className="min-w-0 break-words text-muted-foreground [overflow-wrap:anywhere]">
+                <span className="font-medium text-foreground">{t(`modelHub.changes.${change.kind}`)}</span> · {protocolLabel((change.after || change.before)!.appType, t)} · <span className="font-mono">{(change.after || change.before)?.requestedModel || "—"}</span>
+              </span>
+              <Button size="sm" variant="ghost" className="min-h-11 whitespace-nowrap" isDisabled={busy || controller.conflict}
+                onClick={() => controller.command({ kind: "restore_change", changeId: change.changeId, baseRevision: profile!.revision,
+                  draftFingerprint: modelRoutesDraftFingerprint(controller.routes) })}>{t("modelHub.changes.restore")}</Button>
+            </li>)}</ul>
+          </details> : null}
         </div>
       ) : null}
 
-      {controller.conflict ? (
-        <div role="alert" className="flex flex-wrap items-center gap-2 rounded-md border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800">
-          <span>{t("modelHub.remoteChanged")}</span>
-          <Button size="sm" variant="outline" isDisabled={controller.loading || controller.busy} onClick={() => setReloadConfirmOpen(true)}>{t("common.reload")}</Button>
-        </div>
-      ) : null}
-      {controller.refreshError ? <p role="status" className="text-xs text-muted-foreground">{t("modelHub.refreshFailed")}</p> : null}
-
-      {changes.length ? <details className="min-w-0 border-t border-border py-2 text-xs">
-        <summary className="min-h-11 cursor-pointer py-3 font-medium focus-visible:outline-2 focus-visible:outline-ring">{t("modelHub.changes.title", { count: changes.length })}</summary>
-        <ul className="grid gap-2">{changes.map(change => <li key={change.changeId} className="flex min-w-0 flex-wrap items-center justify-between gap-2">
-          <span className="min-w-0 break-words [overflow-wrap:anywhere]">{t(`modelHub.changes.${change.kind}`)} · {protocolLabel((change.after || change.before)!.appType, t)} · {(change.after || change.before)?.requestedModel || "—"}</span>
-          <Button size="sm" variant="outline" className="min-h-11 whitespace-nowrap" isDisabled={controller.busy || controller.loading || controller.conflict}
-            onClick={() => controller.command({ kind: "restore_change", changeId: change.changeId, baseRevision: profile!.revision,
-              draftFingerprint: modelRoutesDraftFingerprint(controller.routes) })}>{t("modelHub.changes.restore")}</Button>
-        </li>)}</ul>
-      </details> : null}
-
-      <ModelHubDependencyProvider saved={savedDrafts} draft={controller.routes} shares={profile?.eligibleShares || []}
-        dirty={controller.dirty} onLocate={locateRule} locale={locale} t={t}>
       {expanded ? (
-        <div className="grid min-w-0 gap-3">
+        <div className="grid min-w-0 gap-6 border-t border-border px-4 py-5 sm:px-5">
           <SegmentedControl
             value={activeProtocol}
             onChange={setActiveProtocol}
             ariaLabel={t("modelHub.protocolTabs")}
             fullWidth
+            size="lg"
             items={slots.map((slot) => {
               const slotMode = protocolSlotMode(slot);
               const slotAttention = protocolHasAttention(controller.routes, profile?.eligibleShares || [], slot.appType);
@@ -493,11 +493,11 @@ export function ModelHubPanel({
                 id: slot.appType,
                 label: (
                   <span className="inline-flex min-w-0 items-center justify-center gap-1.5">
-                    <ShareAppLogo app={slot.appType} size={12} />
+                    <ShareAppLogo app={slot.appType} size={14} />
                     <span className="truncate">{t(PROTOCOL_TITLE_KEYS[slot.appType])}</span>
                     <span className={cn(
-                      "hidden rounded px-1 py-px text-[10px] font-medium sm:inline",
-                      slotAttention ? "bg-amber-100 text-amber-800" : slotMode === "empty" ? "text-slate-400" : "text-sky-700",
+                      "hidden rounded-full px-1.5 py-px text-[10px] font-medium sm:inline",
+                      slotAttention ? "bg-amber-100 text-amber-800" : slotMode === "empty" ? "text-slate-400" : "bg-primary/10 text-primary",
                     )}>
                       {slotAttention ? t("modelHub.status.attention") : protocolStatusLabel(slotMode, slot.exact.length, t, slotCandidates)}
                     </span>
@@ -509,74 +509,59 @@ export function ModelHubPanel({
             })}
           />
 
-          <div className="grid min-w-0 gap-3">
-            <section className={cn(
-              "grid min-w-0 content-start gap-3 rounded-lg border bg-slate-50/60 p-3",
-              attention ? "border-amber-200" : "border-border",
-            )}>
-              <div className="flex min-w-0 items-center gap-2">
-                <ShareAppLogo app={activeProtocol} size={14} />
-                <h3 className="text-sm font-semibold text-foreground">{t("modelHub.configTitle")}</h3>
-                <span className={cn(
-                  "rounded-md px-1.5 py-0.5 text-[11px] font-medium",
-                  attention ? "bg-amber-100 text-amber-800" : mode === "empty" ? "bg-slate-200 text-slate-600" : "bg-sky-100 text-sky-800",
-                )}>
-                  {attention ? t("modelHub.status.attention") : protocolStatusLabel(mode, activeSlot?.exact.length || 0, t)}
-                </span>
-              </div>
-              {mode === "empty" ? (
-                <p className="text-xs text-muted-foreground">{t("modelHub.emptyProtocol")}</p>
-              ) : null}
-              <p className="text-[11px] leading-4 text-slate-500">{t("modelHub.priorityHint")}</p>
-              <div className="grid min-w-0 gap-3">
-                <h4 className="text-xs font-medium text-muted-foreground">{t("modelHub.passthrough")}</h4>
-                <ModelHubRuleEditor kind="default" route={activeSlot?.passthrough} app={activeProtocol} appLabel={t(PROTOCOL_TITLE_KEYS[activeProtocol])} shares={shares}
-                  disabled={controller.busy || controller.loading || !profile}
-                  addBlockedReason={!activeSlot?.passthrough && controller.routes.length >= MAX_USER_MODEL_ROUTES ? t("modelHub.validationTooMany") : undefined}
-                  onAction={action => {
-                    if (activeSlot?.passthrough) return !!controller.command({ ...action, clientId: activeSlot.passthrough.clientId }, { focus: false })?.changed;
-                    return action.kind === "append_targets" && controller.setPassthroughTargets(activeProtocol, action.shareIds, { focus: false });
-                  }} onTargets={ids => controller.setPassthroughTargets(activeProtocol, ids)} locale={locale} t={t} />
-                {activeSlot?.passthrough ? <ModelHubRecentResult profile={controller.dirty ? null : profile} routeId={activeSlot.passthrough.clientId} locale={locale} t={t} /> : null}
-                {!activeSlot?.passthrough && shares.length === 1 ? <Button variant="outline" className="min-h-11 w-fit whitespace-nowrap"
-                  isDisabled={controller.busy || controller.loading} onClick={() => controller.setPassthroughTargets(activeProtocol, [shares[0].shareId])}>{t("modelHub.setDefault")}</Button> : null}
-                <p className="text-xs text-muted-foreground">{t("modelHub.passthroughHint.none")}</p>
-              </div>
-              <div className="grid min-w-0 gap-2">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-xs font-medium text-slate-600">{t("modelHub.exactModels")}</span>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    isDisabled={controller.busy || controller.loading || !profile || controller.routes.length >= MAX_USER_MODEL_ROUTES}
-                    data-add-model-route onClick={() => controller.addExactRoute(activeProtocol)}
-                  >
-                    <Plus className="h-3.5 w-3.5" />
-                    {t("modelHub.addRoute")}
-                  </Button>
-                </div>
-                {activeSlot?.exact.length ? <div className="divide-y divide-border">{activeSlot.exact.map((route, index) => (
-                  <div key={route.clientId}>
-                  <ModelHubRuleEditor kind="exact" position={index + 1} route={route} app={activeProtocol} appLabel={t(PROTOCOL_TITLE_KEYS[activeProtocol])} shares={shares}
-                    disabled={controller.busy || controller.loading}
-                    duplicate={!!route.requestedModel.trim() && controller.routes.some(other => other.clientId !== route.clientId && other.appType === route.appType && other.requestedModel.trim() === route.requestedModel.trim())}
-                    onAction={action => !!controller.command({ ...action, clientId: route.clientId }, { focus: false })?.changed}
-                    onTargets={shareIds => controller.command({ kind: "set_targets", clientId: route.clientId, shareIds })}
-                    onModel={value => controller.command({ kind: "set_model", clientId: route.clientId, value })}
-                    onRemove={() => controller.removeRoute(route.clientId)} locale={locale} t={t} />
-                  <ModelHubRecentResult profile={controller.dirty ? null : profile} routeId={route.clientId} locale={locale} t={t} />
-                  </div>
-                ))}</div> : <p className="text-xs text-muted-foreground">{t("modelHub.exactEmpty")}</p>}
-              </div>
-              <p className="text-[11px] leading-5 text-slate-500">{t(LIST_MODE_KEYS[mode])}</p>
-            </section>
+          {mode === "empty" ? (
+            <p className="rounded-lg border border-dashed border-border px-3 py-2 text-xs text-muted-foreground">{t("modelHub.emptyProtocol")}</p>
+          ) : null}
 
-            <Button variant="outline" className="min-h-11 w-fit whitespace-nowrap" isDisabled={!profile || controller.loading}
+          <section className="grid min-w-0 gap-3" aria-labelledby="model-hub-traffic-heading">
+            <RouteBlockHeading id="model-hub-traffic-heading" label={t("modelHub.traffic.title")} hint={t("modelHub.traffic.scope")}
+              live={trafficStatus === "ready" && traffic.events.some(event => event.appType === activeProtocol && (event.phase === "routing" || event.phase === "streaming"))} />
+            <ModelHubTraffic events={traffic.events} app={activeProtocol} shares={profile?.eligibleShares || []}
+              status={trafficStatus} locale={locale} t={t} />
+          </section>
+
+          <section className="grid min-w-0 gap-3" aria-labelledby="model-hub-default-heading">
+            <RouteBlockHeading id="model-hub-default-heading" label={t("modelHub.passthrough")} hint={t("modelHub.passthroughHint.none")} live={!!activeSlot?.passthrough} />
+            <ModelHubRuleEditor kind="default" route={activeSlot?.passthrough} app={activeProtocol} appLabel={t(PROTOCOL_TITLE_KEYS[activeProtocol])} shares={shares}
+              disabled={busy || !profile} traffic={trafficFor(activeSlot?.passthrough?.clientId)}
+              addBlockedReason={!activeSlot?.passthrough && controller.routes.length >= MAX_USER_MODEL_ROUTES ? t("modelHub.validationTooMany") : undefined}
+              onAction={action => {
+                if (activeSlot?.passthrough) return !!controller.command({ ...action, clientId: activeSlot.passthrough.clientId }, { focus: false })?.changed;
+                return action.kind === "append_targets" && controller.setPassthroughTargets(activeProtocol, action.shareIds, { focus: false });
+              }} onTargets={ids => controller.setPassthroughTargets(activeProtocol, ids)} locale={locale} t={t} />
+            {activeSlot?.passthrough ? <ModelHubRecentResult profile={controller.dirty ? null : profile} routeId={activeSlot.passthrough.clientId} locale={locale} t={t} /> : null}
+            {!activeSlot?.passthrough && shares.length === 1 ? <Button variant="outline" className="min-h-11 w-fit whitespace-nowrap"
+              isDisabled={busy} onClick={() => controller.setPassthroughTargets(activeProtocol, [shares[0].shareId])}>{t("modelHub.setDefault")}</Button> : null}
+          </section>
+
+          <section className="grid min-w-0 gap-3" aria-labelledby="model-hub-exact-heading">
+            <RouteBlockHeading id="model-hub-exact-heading" label={t("modelHub.exactModels")} count={activeSlot?.exact.length || 0}
+              live={!!activeSlot?.exact.length}
+              action={<Button size="sm" variant="outline" isDisabled={busy || !profile || controller.routes.length >= MAX_USER_MODEL_ROUTES}
+                data-add-model-route onClick={() => controller.addExactRoute(activeProtocol)}>
+                <Plus className="size-3.5" aria-hidden />{t("modelHub.addRoute")}
+              </Button>} />
+            {activeSlot?.exact.length ? <div className="grid min-w-0 gap-3">{activeSlot.exact.map((route, index) => (
+              <div key={route.clientId} className="grid min-w-0 gap-2 rounded-xl border border-border bg-secondary/30 p-3 sm:p-4">
+                <ModelHubRuleEditor kind="exact" position={index + 1} route={route} app={activeProtocol} appLabel={t(PROTOCOL_TITLE_KEYS[activeProtocol])} shares={shares}
+                  disabled={busy} traffic={trafficFor(route.clientId)}
+                  duplicate={!!route.requestedModel.trim() && controller.routes.some(other => other.clientId !== route.clientId && other.appType === route.appType && other.requestedModel.trim() === route.requestedModel.trim())}
+                  onAction={action => !!controller.command({ ...action, clientId: route.clientId }, { focus: false })?.changed}
+                  onTargets={shareIds => controller.command({ kind: "set_targets", clientId: route.clientId, shareIds })}
+                  onModel={value => controller.command({ kind: "set_model", clientId: route.clientId, value })}
+                  onRemove={() => controller.removeRoute(route.clientId)} locale={locale} t={t} />
+                <ModelHubRecentResult profile={controller.dirty ? null : profile} routeId={route.clientId} locale={locale} t={t} />
+              </div>
+            ))}</div> : <p className="rounded-xl border border-dashed border-border px-4 py-5 text-center text-xs text-muted-foreground">{t("modelHub.exactEmpty")}</p>}
+          </section>
+
+          <footer className="flex min-w-0 flex-wrap items-center justify-between gap-3 border-t border-border pt-4">
+            <p className="min-w-0 flex-1 text-[11px] leading-5 text-muted-foreground">{t(LIST_MODE_KEYS[mode])}</p>
+            <Button variant="outline" className="min-h-11 whitespace-nowrap" isDisabled={!profile || controller.loading}
               onClick={() => setTestOpen(true)}>{t("modelHub.test.open")}</Button>
-          </div>
+          </footer>
         </div>
       ) : null}
-      </ModelHubDependencyProvider>
       <ModelHubTestDrawer open={testOpen} onOpenChange={setTestOpen} actorKey={controller.actorKey} app={activeProtocol}
         profile={profile} disabled={controller.dirty || controller.conflict || controller.busy || controller.loading}
         model={testModel} onModel={value => setTestModels(current => ({ ...current, [activeProtocol]: value }))} onComplete={controller.refresh} />
@@ -588,5 +573,24 @@ export function ModelHubPanel({
         onConfirm={() => void controller.discardChanges().then(loaded => loaded && setReloadConfirmOpen(false))}
         onOpenChange={setReloadConfirmOpen} />
     </section>
+  );
+}
+
+/** Section label in the Router's pill style; the dot pulses once the block routes traffic. */
+function RouteBlockHeading({ id, label, hint, count, live, action }: {
+  id: string; label: string; hint?: string; count?: number; live: boolean; action?: React.ReactNode;
+}) {
+  return (
+    <div className="flex min-w-0 flex-wrap items-center justify-between gap-x-3 gap-y-2">
+      <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
+        <h3 id={id} className="inline-flex items-center gap-2 rounded-full border border-primary/25 bg-primary/5 px-3 py-1 text-xs font-medium text-primary">
+          <span className={cn("model-route-dot", live ? "bg-primary model-route-dot-live" : "bg-primary/40")} aria-hidden />
+          {label}
+          {count ? <span className="font-mono text-[11px] tabular-nums text-primary/70">{count}</span> : null}
+        </h3>
+        {hint ? <p className="min-w-0 text-xs text-muted-foreground">{hint}</p> : null}
+      </div>
+      {action}
+    </div>
   );
 }

@@ -675,6 +675,19 @@ export type ModelRouteAttempt = {
     | "model_blocked" | "breaker_open" | "offline" | "response" | "budget_exhausted" | "ingress_rejected";
   statusCode?: number; durationMs: number;
 };
+/** Plan P5-1: one unified-API request as the Router executed it. */
+export type ModelRouteTrafficPhase = "routing" | "streaming" | "complete" | "interrupted";
+export type ModelRouteTrafficEvent = {
+  sequence: string; appType: ModelRoutingApp; requestedModel: string;
+  routeId?: string; revision?: number; matchedWildcard: boolean; startedAt: string;
+  phase: ModelRouteTrafficPhase; statusCode?: number; errorCode?: string;
+  targetShareId?: string; position?: number; continuedSearch: boolean;
+  attempts: ModelRouteAttempt[]; headersMs?: number; durationMs?: number;
+};
+export type ModelRouteTrafficSnapshot = {
+  instanceId: string; cursor: string; reset: boolean;
+  windowSeconds: number; perUserCapacity: number; events: ModelRouteTrafficEvent[];
+};
 export type ModelRouteRecentResult = {
   routeId: string; revision: number; requestSequence: string; observedAt: string;
   source: "request" | "diagnostic"; phase: "response_headers" | "body_complete" | "body_incomplete";

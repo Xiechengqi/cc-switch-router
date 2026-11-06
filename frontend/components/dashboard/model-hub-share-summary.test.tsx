@@ -3,7 +3,7 @@ import test from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import { messages, type AppLocale, type MessageKey } from "@/lib/i18n";
 import type { UserModelRoutingShare } from "@/lib/types";
-import { RoutingShareDetails, RoutingShareSummary } from "./model-hub-share-summary";
+import { RoutingShareSummary } from "./model-hub-share-summary";
 import { SharePoolPicker } from "./model-hub-share-picker";
 import { ModelHubRuleEditor } from "./model-hub-rule-editor";
 import { ModelHubRecentResult } from "./model-hub-recent-result";
@@ -24,23 +24,26 @@ const share: UserModelRoutingShare = {
 
 for (const locale of ["en", "zh-CN"] as const) {
   const t = translator(locale);
-  test(`${locale}: summary uses a fixed-width, text-labelled health panel with phrasing-only markup`, () => {
+  test(`${locale}: summary is a two-line, phrasing-only row with account detail in the tooltip`, () => {
     const props = { share, shareId: share.shareId, app: "codex" as const, locale, t };
     const html = renderToStaticMarkup(<RoutingShareSummary {...props} />);
-    assert.match(html, /model-route-account/);
-    assert.match(html, /model-route-health/);
-    assert.match(html, /bg-emerald-50/);
-    assert.ok(html.includes(t("dashboard.modelHealth.healthy")));
-    assert.match(html, /protocol-account@example.test/);
-    assert.doesNotMatch(html, /other-protocol@example.test|<div|<button|<details|<input|<a /);
-    assert.match(renderToStaticMarkup(<RoutingShareDetails {...props} />), /<details[\s\S]*<summary/);
+    assert.match(html, /fixture-subdomain/);
+    assert.match(html, />[^<]*test-model[^<]*</, "second line names the model this protocol reaches");
+    assert.match(html, /model-route-dot[^"]*bg-emerald-500[^"]*model-route-dot-live/);
+    assert.ok(html.includes(t("common.online")));
+    assert.match(html, /title="[^"]*protocol-account@example.test/, "account identity moves to the tooltip");
+    assert.doesNotMatch(html, />[^<]*protocol-account@example.test/, "account identity is not rendered as row text");
+    assert.doesNotMatch(html, /other-protocol@example.test|bg-emerald-50(?!0)|<div|<button|<details|<input|<a /);
     const revoked = renderToStaticMarkup(<RoutingShareSummary {...props} share={undefined} />);
-    assert.match(revoked, /bg-slate-50/);
     assert.ok(revoked.includes(t("modelHub.targetUnavailable")));
+    assert.match(revoked, />fixture</, "a missing target still shows its id so it can be removed");
     assert.doesNotMatch(revoked, /protocol-account|fixture-subdomain/);
+    const offline = renderToStaticMarkup(<RoutingShareSummary {...props} share={{ ...share, isOnline: false }} />);
+    assert.ok(offline.includes(t("common.offline")));
+    assert.doesNotMatch(offline, /model-route-dot-live|bg-emerald-500/);
   });
 
-  test(`${locale}: Transfer exposes checked lists and central actions, including offline and missing targets`, () => {
+  test(`${locale}: every row carries its own arrow toward the other pane; no checkboxes or central actions`, () => {
     const offline = { ...share, shareId: "offline", subdomain: "offline-subdomain", isOnline: false };
     const html = renderToStaticMarkup(<SharePoolPicker shares={[share, offline]} selected={[share.shareId, "revoked"]} app="codex" routeKey="codex" disabled={false} onChange={() => { throw new Error("static render must not mutate"); }} locale={locale} t={t} />);
     assert.ok(html.includes(t("modelHub.availableShares")));
@@ -49,48 +52,39 @@ for (const locale of ["en", "zh-CN"] as const) {
     assert.ok(html.includes(t("modelHub.targetUnavailable")));
     assert.match(html, /offline-subdomain/);
     assert.match(html, /2\/6/);
-    assert.equal([...html.matchAll(/type="search"/g)].length, 0, "search stays hidden while both lists fit");
-    const many = Array.from({ length: 8 }, (_, index) => ({ ...share, shareId: `extra-${index}`, subdomain: `extra-${index}` }));
-    const crowded = renderToStaticMarkup(<SharePoolPicker shares={many} selected={["extra-0"]} app="codex" routeKey="codex" disabled={false} onChange={() => { }} locale={locale} t={t} />);
-    assert.equal([...crowded.matchAll(/type="search"/g)].length, 2);
-    assert.equal([...html.matchAll(/type="checkbox"/g)].length, 5);
-    assert.doesNotMatch(html, / checked=""/, "all transfer selections start unchecked");
-    assert.ok(html.includes(t("modelHub.transferInLabel", { count: 0 })));
-    assert.ok(html.includes(t("modelHub.transferOutLabel", { count: 0 })));
-    assert.match(html, /model-route-transfer-actions/);
+    assert.equal([...html.matchAll(/type="checkbox"/g)].length, 0);
+    assert.doesNotMatch(html, /model-route-transfer-actions/);
+    assert.equal([...html.matchAll(/type="search"/g)].length, 0, "search stays hidden while the pool fits");
+    assert.ok(html.includes(`aria-label="${t("modelHub.addToQueue", { name: "offline-subdomain" })}"`));
+    assert.ok(html.includes(`aria-label="${t("modelHub.removeFromQueue", { name: "fixture-subdomain" })}"`));
+    assert.ok(html.includes(`aria-label="${t("modelHub.removeFromQueue", { name: "revoked" })}"`), "missing targets stay removable");
     assert.match(html, /<ol[\s\S]*fixture-subdomain[\s\S]*revoked/);
     for (const button of html.matchAll(/<button\b[\s\S]*?<\/button>/g)) {
       assert.doesNotMatch(button[0].slice(7), /<button\b|<details\b|<summary\b/);
     }
+    const many = Array.from({ length: 8 }, (_, index) => ({ ...share, shareId: `extra-${index}`, subdomain: `extra-${index}` }));
+    const crowded = renderToStaticMarkup(<SharePoolPicker shares={many} selected={["extra-0"]} app="codex" routeKey="codex" disabled={false} onChange={() => { }} locale={locale} t={t} />);
+    assert.equal([...crowded.matchAll(/type="search"/g)].length, 1, "only the pool is searchable; the queue holds at most six");
+    const full = renderToStaticMarkup(<SharePoolPicker shares={many} selected={many.slice(0, 6).map(item => item.shareId)} app="codex" routeKey="codex" disabled={false} onChange={() => { }} locale={locale} t={t} />);
+    assert.ok(full.includes(t("modelHub.queueFull")));
+    for (const add of full.matchAll(/<button\b[^>]*aria-label="[^"]*extra-[67][^"]*"[^>]*>/g)) assert.match(add[0], /disabled=""/);
     const blocked = renderToStaticMarkup(<SharePoolPicker shares={[share]} selected={[]} app="codex" routeKey="codex" disabled={false} addBlockedReason={t("modelHub.validationTooMany")} onChange={() => { }} locale={locale} t={t} />);
     assert.ok(blocked.includes(t("modelHub.validationTooMany")));
     assert.match(blocked, /<button[^>]*disabled=""/);
     const locked = renderToStaticMarkup(<SharePoolPicker shares={[share, offline]} selected={[share.shareId]} app="codex" routeKey="codex" disabled onChange={() => { }} locale={locale} t={t} />);
-    for (const input of locked.matchAll(/<input\b[^>]*type="checkbox"[^>]*>/g)) assert.match(input[0], /disabled=""/);
+    for (const button of locked.matchAll(/<button\b[^>]*>/g)) assert.match(button[0], /disabled=""/);
   });
 
-  test(`${locale}: all protocol summaries use the Share account color while preserving observed-protocol attribution`, () => {
+  test(`${locale}: all protocol summaries keep the observed-protocol attribution in the tooltip`, () => {
     const source = { ...share, liveModelHealthStatus: share.appCapabilities![0].liveModelHealthStatus };
     const html = renderToStaticMarkup(<RoutingShareSummary share={source} shareId={share.shareId} app="claude" locale={locale} t={t} />);
-    assert.match(html, /bg-emerald-50/);
-    assert.match(html, /other-protocol@example.test/);
+    assert.match(html, /bg-emerald-500/);
+    assert.match(html, /title="[^"]*other-protocol@example.test/);
     assert.doesNotMatch(html, /protocol-account@example.test/);
-    assert.match(html, /Share · /);
+    assert.match(html, /title="[^"]*Share · /);
     assert.match(html, /title="[^"]*codex/);
   });
 }
-
-test("collapsed dependency views do not mount repeated full reference lists", async () => {
-  const { RoutingDependencyContext, RoutingShareDependencies } = await import("./model-hub-dependencies");
-  const { buildShareDependencies } = await import("@/lib/model-routing");
-  const routes = Array.from({ length: 50 }, (_, index) => ({ clientId: `r${index}`, appType: "codex" as const, requestedModel: `unique-model-${index}`, targetShareId: share.shareId, candidates: ["b", "c"] }));
-  const summaries = buildShareDependencies("saved", routes, [share]);
-  const html = renderToStaticMarkup(<RoutingDependencyContext.Provider value={{ summaries, shares: [share], view: "saved", onLocate: () => {} }}>
-    <RoutingShareDependencies shareId={share.shareId} t={translator("en")} />
-  </RoutingDependencyContext.Provider>);
-  assert.ok(html.includes("50"));
-  assert.doesNotMatch(html, /unique-model-|<li/);
-});
 
 test("recent observations are independent of the browser clock", async () => {
   const { currentModelRouteResult } = await import("./model-hub-recent-result");

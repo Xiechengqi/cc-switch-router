@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { applyModelRouteCommand, buildShareDependencies, diffModelRoutes, modelRoutesDraftFingerprint, type DraftModelRoute } from "./model-routing";
+import { applyModelRouteCommand, diffModelRoutes, modelRoutesDraftFingerprint, type DraftModelRoute } from "./model-routing";
 import type { UserModelRoutingShare } from "./types";
 const saved: DraftModelRoute[] = [{ clientId: "r", appType: "codex", requestedModel: "model", targetShareId: "a", candidates: ["b", "c"] }];
 const shares: UserModelRoutingShare[] = ["a", "b", "c"].map(shareId => ({ shareId, shareName: shareId, subdomain: shareId, apps: ["codex"], access: "owner", directApiUrl: "", freeAccess: false, isOnline: shareId !== "b" }));
@@ -20,12 +20,6 @@ test("restore is fenced by revision and draft fingerprint", () => {
   const command = { kind: "restore_change" as const, changeId: change.changeId, baseRevision: 1, draftFingerprint: modelRoutesDraftFingerprint(draft) };
   assert.deepEqual(applyModelRouteCommand(draft, command, context).routes, saved);
   assert.equal(applyModelRouteCommand(draft, { ...command, baseRevision: 0 }, context).routes, draft);
-});
-test("dependency candidates require both eligibility and online status", () => {
-  assert.equal(buildShareDependencies("saved", saved, shares).get("a")?.dependencies[0].nextEligibleOnlineCandidateShareId, "c");
-  const unknown = buildShareDependencies("saved", saved, shares.filter(share => share.shareId !== "c"));
-  assert.equal(unknown.get("a")?.noNextEligibleOnlineCandidateCount, 1);
-  assert.equal(unknown.get("a")?.dependencies[0].nextEligibleOnlineCandidateShareId, null);
 });
 
 test("CI registers routing regressions and Rust runtime, metrics and notification coverage", async () => {

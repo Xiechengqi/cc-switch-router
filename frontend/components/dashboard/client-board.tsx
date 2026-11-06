@@ -1,9 +1,5 @@
 "use client";
 
-import { RoutingDependencyContext } from "./model-hub-dependencies";
-import { buildShareDependencies } from "@/lib/model-routing";
-import { modelRouteEditorId } from "./model-hub-rule-editor";
-
 import { Button, Card, Drawer, toast } from "@heroui/react";
 import { ArrowRightLeft, ChevronDown, Copy, ListFilter, MessageCircle, Plus, ScrollText, Search, Terminal, X } from "lucide-react";
 import * as React from "react";
@@ -1080,22 +1076,6 @@ export function ClientBoard({
     return byShare;
   }, [modelRouting.routes]);
 
-  const dependencySummaries = React.useMemo(() => buildShareDependencies(
-    modelRouting.dirty ? "draft" : "saved", modelRouting.routes, modelRouting.profile?.eligibleShares || []),
-    [modelRouting.dirty, modelRouting.routes, modelRouting.profile?.eligibleShares]);
-  const locateDependencyRule = (clientId: string) => {
-    const route = modelRouting.routes.find(item => item.clientId === clientId);
-    // A rule deleted in the draft has no editor left; fall back to the rule list.
-    if (route) setHubFocusProtocol(route.appType as ModelRoutingProtocol);
-    setHubForceExpanded(value => value + 1);
-    const focus = (retry = true) => {
-      const node = document.getElementById(route ? modelRouteEditorId(clientId) : "model-hub");
-      if (!node && retry) { requestAnimationFrame(() => focus(false)); return; }
-      node?.scrollIntoView({ block: "nearest" });
-      node?.focus({ preventScroll: true });
-    };
-    requestAnimationFrame(() => focus());
-  };
   const activeFilterCount = regionFilters.length;
   const clientTabs: Array<{ value: ClientListTab; label: string; count: number }> = [
     ...(hasViewerIdentity ? [{ value: "mine" as const, label: t("dashboard.mine"), count: clientSummary.mine }] : []),
@@ -1109,7 +1089,6 @@ export function ClientBoard({
   const mineFilterEmpty = statusFilter === "mine" && !mineIsEmpty && visibleMineShares.length === 0;
 
   return (
-    <RoutingDependencyContext.Provider value={statusFilter === "mine" ? { summaries: dependencySummaries, shares: modelRouting.profile?.eligibleShares || [], view: modelRouting.dirty ? "draft" : "saved", onLocate: locateDependencyRule } : null}>
     <section className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-4">
       <div className="flex min-w-0 flex-wrap items-center justify-between gap-4">
         <div className="flex w-full min-w-0 flex-wrap items-center gap-3 sm:w-auto">
@@ -1411,6 +1390,5 @@ export function ClientBoard({
         onOpenChange={(open) => !open && setLogClientId("")}
       />
     </section>
-    </RoutingDependencyContext.Provider>
   );
 }

@@ -11,6 +11,8 @@ export type ShareProviderStatusPanelView = {
   panelTitle?: string;
   primaryMonospace?: boolean;
   toneClassName: string;
+  /** Machine-readable tone for compact renderers that show a dot, not the panel. */
+  healthState?: "healthy" | "degraded" | "unavailable" | "unknown";
   healthLabel?: string;
 };
 
