@@ -3,7 +3,6 @@
 // Hallmark · component: rule editor · modern-minimal · existing Router tokens
 // Pre-emit critique: P4 H4 E4 S5 R5 V4. Keyboard actions complement dragging.
 import * as React from "react";
-import { Button } from "@heroui/react";
 import { Trash2 } from "lucide-react";
 import { SharePoolPicker, type PickerAction } from "./model-hub-share-picker";
 import { modelRouteTargets, type DraftModelRoute } from "@/lib/model-routing";
@@ -35,8 +34,12 @@ export function ModelHubRuleEditor({ kind, position = 1, route, app, appLabel, s
           className="h-11 min-w-0 rounded-md border border-input bg-card px-3 text-sm text-foreground hover:bg-secondary focus-visible:outline-2 focus-visible:outline-ring disabled:opacity-50"
           placeholder={t("modelHub.modelPlaceholder")} />
       </label>
-      <Button isIconOnly size="sm" variant="ghost" className="h-11 w-11 text-danger" isDisabled={disabled}
-        aria-label={t("modelHub.removeRoute")} onClick={onRemove}><Trash2 className="size-4" aria-hidden /></Button>
+      {/* Native control, like the Transfer list: @heroui/react is ESM-only and
+          would stop the server-rendered editor tests from loading under tsx. */}
+      <button type="button" disabled={disabled} aria-label={t("modelHub.removeRoute")} onClick={onRemove}
+        className="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-md text-danger hover:bg-secondary active:bg-secondary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-40">
+        <Trash2 className="size-4" aria-hidden />
+      </button>
     </div> : null}
     <SharePoolPicker shares={shares} selected={modelRouteTargets(route)} app={app} routeKey={route?.clientId || `default:${app}`}
       disabled={disabled} addBlockedReason={addBlockedReason} onChange={onTargets} onAction={onAction} locale={locale} t={t} />
