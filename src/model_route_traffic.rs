@@ -107,10 +107,30 @@ struct Entry {
 #[derive(Debug, Default)]
 struct UserLog {
     entries: VecDeque<Entry>,
-    /// Highest version dropped by a capacity limit. A reader whose cursor is
-    /// older missed it and must reset; time-window expiry needs no reset
-    /// because readers apply the same window locally.
+    /// A reader whose cursor is older must reset. An ended event dropped by a
+    /// capacity limit sets its own last version: a reader that saw it keeps a
+    /// true fact until its local window expires it, like time-window expiry.
+    /// A dropped unfinished event never changes again, so it sets a fresh
+    /// version and every reader that may still show it in progress resets.
     evicted_version: u64,
+}
+
+impl UserLog {
+    /// Drops what the window no longer retains; returns how many entries went.
+    fn sweep(&mut self, now: Instant, version: &mut u64) -> usize {
+        let before = self.entries.len();
+        let mut abandoned = false;
+        self.entries.retain(|entry| {
+            let keep = retained(entry, now);
+            abandoned |= !keep && entry.ended.is_none();
+            keep
+        });
+        if abandoned {
+            *version += 1;
+            self.evicted_version = *version;
+        }
+        before - self.entries.len()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -118,6 +138,10 @@ struct State {
     users: HashMap<String, UserLog>,
     total: usize,
     version: u64,
+    /// Highest `evicted_version` of a log removed for being empty. A reader
+    /// with no log behind it, or whose log was recreated since, compares
+    /// against this so a removal never hides a needed reset.
+    removed_version: u64,
 }
 
 #[derive(Debug)]
@@ -149,27 +173,41 @@ impl State {
     }
     fn sweep_user(&mut self, user: &str, now: Instant) {
         if let Some(log) = self.users.get_mut(user) {
-            let before = log.entries.len();
-            log.entries.retain(|entry| retained(entry, now));
-            self.total -= before - log.entries.len();
+            self.total -= log.sweep(now, &mut self.version);
         }
     }
     fn sweep(&mut self, now: Instant) {
-        let mut total = 0;
+        let (mut total, mut removed) = (0, self.removed_version);
+        let version = &mut self.version;
         self.users.retain(|_, log| {
-            log.entries.retain(|entry| retained(entry, now));
+            log.sweep(now, version);
             total += log.entries.len();
+            if log.entries.is_empty() {
+                removed = removed.max(log.evicted_version);
+            }
             !log.entries.is_empty()
         });
         self.total = total;
+        self.removed_version = removed;
     }
     fn evict_front(&mut self, user: &str) {
         if let Some(log) = self.users.get_mut(user) {
             if let Some(entry) = log.entries.pop_front() {
-                log.evicted_version = log.evicted_version.max(entry.version);
+                let needed = if entry.ended.is_some() {
+                    entry.version
+                } else {
+                    self.version += 1;
+                    self.version
+                };
+                log.evicted_version = log.evicted_version.max(needed);
                 self.total -= 1;
             }
         }
+    }
+    fn reset_before(&self, user: &str) -> u64 {
+        self.users
+            .get(user)
+            .map_or(self.removed_version, |log| log.evicted_version)
     }
     fn find(&mut self, user: &str, sequence: u64) -> Option<&mut Entry> {
         self.users
@@ -223,10 +261,14 @@ impl ModelRouteTraffic {
             }
         }
         let version = state.bump();
+        let removed_version = state.removed_version;
         state
             .users
             .entry(user.to_string())
-            .or_default()
+            .or_insert_with(|| UserLog {
+                evicted_version: removed_version,
+                ..UserLog::default()
+            })
             .entries
             .push_back(Entry {
                 event,
@@ -355,11 +397,10 @@ impl ModelRouteTraffic {
         state.sweep_user(user, Instant::now());
         let cursor = state.version;
         let after = after.and_then(|value| value.parse::<u64>().ok());
+        let reset_before = state.reset_before(user);
         let log = state.users.get(user);
         let reset = instance != Some(self.instance_id.as_str())
-            || after.is_none_or(|after| {
-                after > cursor || log.is_some_and(|log| after < log.evicted_version)
-            });
+            || after.is_none_or(|after| after > cursor || after < reset_before);
         let events = log
             .map(|log| {
                 log.entries
@@ -607,8 +648,12 @@ mod tests {
     #[test]
     fn model_route_traffic_capacity_evicts_oldest_and_forces_reset() {
         let traffic = Arc::new(ModelRouteTraffic::default());
-        traffic.rejected("u", 1, start(None), 404, "user_model_route_not_configured");
+        let first = traffic.begin("u", 1, start(Some("r"))).unwrap();
+        // The reader last saw the event still routing; it then ends and is
+        // evicted before the next poll, so an incremental reply would leave it
+        // stuck in the reader's view.
         let snapshot = traffic.snapshot("u", None, None);
+        first.finish(ModelRouteTrafficPhase::Complete);
         for sequence in 2..=(PER_USER_CAPACITY as u64 + 1) {
             traffic.rejected(
                 "u",
@@ -626,6 +671,78 @@ mod tests {
         let next = traffic.snapshot("u", Some(&snapshot.cursor), Some(&snapshot.instance_id));
         assert!(next.reset, "the reader's cursor predates an evicted event");
         assert_eq!(next.events.len(), PER_USER_CAPACITY);
+    }
+
+    #[test]
+    fn model_route_traffic_dropping_an_unfinished_event_resets_readers_that_saw_it() {
+        let fill = |traffic: &ModelRouteTraffic, sequences: std::ops::RangeInclusive<u64>| {
+            for sequence in sequences {
+                traffic.rejected(
+                    "u",
+                    sequence,
+                    start(None),
+                    404,
+                    "user_model_route_not_configured",
+                );
+            }
+        };
+        let cap = PER_USER_CAPACITY as u64;
+
+        // An ended event the reader already saw is a fact it may keep.
+        let ended = Arc::new(ModelRouteTraffic::default());
+        fill(&ended, 1..=cap);
+        let seen = ended.snapshot("u", None, None);
+        fill(&ended, cap + 1..=cap + 1);
+        let next = ended.snapshot("u", Some(&seen.cursor), Some(&seen.instance_id));
+        assert!(!next.reset);
+        assert_eq!(next.events.len(), 1);
+
+        // An unfinished one will never be updated, so even an up-to-date
+        // reader must drop it.
+        let unfinished = Arc::new(ModelRouteTraffic::default());
+        let guard = unfinished.begin("u", 1, start(Some("r"))).unwrap();
+        fill(&unfinished, 2..=cap);
+        let seen = unfinished.snapshot("u", None, None);
+        fill(&unfinished, cap + 1..=cap + 1);
+        let next = unfinished.snapshot("u", Some(&seen.cursor), Some(&seen.instance_id));
+        assert!(
+            next.reset,
+            "the evicted request would stay in progress forever"
+        );
+        assert_eq!(next.events.len(), PER_USER_CAPACITY);
+        assert!(next.events.iter().all(|event| event.sequence != "1"));
+        let after = unfinished.snapshot("u", Some(&next.cursor), Some(&next.instance_id));
+        assert!(!after.reset, "the reset cursor covers the eviction");
+        drop(guard);
+    }
+
+    #[test]
+    fn model_route_traffic_stale_inflight_sweep_resets_even_after_the_log_is_removed() {
+        let traffic = Arc::new(ModelRouteTraffic::default());
+        let guard = traffic.begin("u", 1, start(Some("r"))).unwrap();
+        let seen = traffic.snapshot("u", None, None);
+        let instance = Some(seen.instance_id.as_str());
+        traffic
+            .lock()
+            .sweep(Instant::now() + STALE_INFLIGHT + Duration::from_secs(1));
+        assert!(!traffic.lock().users.contains_key("u"));
+
+        let gone = traffic.snapshot("u", Some(&seen.cursor), instance);
+        assert!(
+            gone.reset,
+            "a removed log still tells the reader to drop it"
+        );
+        assert!(gone.events.is_empty());
+        assert!(!traffic.snapshot("u", Some(&gone.cursor), instance).reset);
+
+        traffic.rejected("u", 2, start(None), 404, "user_model_route_not_configured");
+        let recreated = traffic.snapshot("u", Some(&seen.cursor), instance);
+        assert!(recreated.reset, "a recreated log keeps the removal's reset");
+        assert_eq!(recreated.events.len(), 1);
+        let incremental = traffic.snapshot("u", Some(&gone.cursor), instance);
+        assert!(!incremental.reset);
+        assert_eq!(incremental.events.len(), 1);
+        drop(guard);
     }
 
     #[test]

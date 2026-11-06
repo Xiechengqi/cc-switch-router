@@ -462,7 +462,7 @@ function buildShareDependencies(
   "windowSeconds": 900, "perUserCapacity": 200, "events": [] }
 ```
 
-- 首次请求、`instance` 与当前进程不符、`after` 无法解析，或 `after` 早于该用户被容量淘汰的最大版本时，返回 `reset: true` 和该用户的全部事件，前端整体替换。
+- 首次请求、`instance` 与当前进程不符、`after` 无法解析，或 `after` 早于该用户的淘汰标记时（已结束事件取其最后版本；未结束事件被淘汰或超时清理时推进到新版本，使所有读到它的客户端重置；记录清空后标记仍保留），返回 `reset: true` 和该用户的全部事件，前端整体替换。
 - 其余情况返回 `version > after` 的事件（新增和阶段推进都在内），前端按 `sequence` 合并。
 - `cursor` 为本次读取时的全局版本号。
 
