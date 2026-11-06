@@ -198,13 +198,13 @@ pub const KINDS: &[NoticeKind] = &[
     ),
     attention(
         "route_failover",
-        NO_FLAP,
-        "Model route failover",
-        "模型路由候选切换",
-        "A request failed over from the primary Share to a fallback candidate.",
-        "一次请求从主 Share 切换到了候选 Share。",
-        Some("Check the primary Share's health; the circuit breaker will auto-recover."),
-        Some("检查主 Share 状态；熔断器会在冷却后自动恢复。"),
+        METRIC_FLAP_SECS,
+        "Model route retry forwards",
+        "模型路由重试转发增多",
+        "In approximately 10 minutes, {count} retry forwards started after failed attempts.",
+        "最近约 10 分钟有 {count} 次失败后的实际重试转发。",
+        Some("Inspect upstream errors. This count does not prove that fallback succeeded."),
+        Some("请检查上游错误；该次数不代表备选已成功处理请求。"),
     ),
     record(
         "db_error",
@@ -627,7 +627,9 @@ pub fn describe(kind: &str) -> Option<&'static NoticeKind> {
 /// in-app center (never paged) so an oversight fails quiet, not loud — while
 /// `severity_for` below is strict for the operator pipeline.
 pub fn level_for(kind: &str) -> NoticeLevel {
-    describe(kind).map(|entry| entry.level).unwrap_or(NoticeLevel::Record)
+    describe(kind)
+        .map(|entry| entry.level)
+        .unwrap_or(NoticeLevel::Record)
 }
 
 pub fn flap_suppress_secs_for(kind: &str) -> i64 {
@@ -639,7 +641,10 @@ pub fn flap_suppress_secs_for(kind: &str) -> i64 {
 /// The region whose domain matches this Router's tunnel domain; empty when
 /// the deployment uses a custom domain outside the built-in region list.
 pub fn region_for_domain(regions_file: &str, tunnel_domain: &str) -> String {
-    let domain = tunnel_domain.trim().trim_start_matches("*.").to_ascii_lowercase();
+    let domain = tunnel_domain
+        .trim()
+        .trim_start_matches("*.")
+        .to_ascii_lowercase();
     regions_file
         .lines()
         .map(str::trim)
@@ -748,6 +753,7 @@ mod tests {
             "host_memory_pressure",
             "host_disk_pressure",
             "route_lifecycle",
+            "route_failover",
             "db_error",
             "ssh_emfile",
             "ssh_bridge_write_stall",
@@ -802,12 +808,23 @@ mod tests {
     #[test]
     fn fill_formats_rates_and_percents() {
         let facts = serde_json::json!({"errorRate": 0.32, "rpm": 18.0, "summary": "三笔订单"});
-        assert_eq!(
-            fill("rate {errorRate} at {rpm}", &facts),
-            "rate 32% at 18"
-        );
+        assert_eq!(fill("rate {errorRate} at {rpm}", &facts), "rate 32% at 18");
         assert_eq!(fill("{summary}", &facts), "三笔订单");
         assert_eq!(fill("[{missing}]", &facts), "[]");
+    }
+
+    #[test]
+    fn route_failover_copy_is_aggregated_bilingual_and_flap_suppressed() {
+        let kind = describe("route_failover").unwrap();
+        assert_eq!(kind.flap_suppress_secs, METRIC_FLAP_SECS);
+        let facts = serde_json::json!({"count": 20, "windowSeconds": 600});
+        for copy in [kind.copy.summary_en, kind.copy.summary_zh] {
+            let rendered = fill(copy, &facts);
+            assert!(rendered.contains("20"));
+            assert!(!rendered.contains('{'));
+        }
+        assert!(kind.copy.action_en.unwrap().contains("does not prove"));
+        assert!(kind.copy.action_zh.unwrap().contains("不代表"));
     }
 
     #[test]

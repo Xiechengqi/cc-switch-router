@@ -495,9 +495,9 @@ export async function resetUserApiToken() {
   );
 }
 
-export async function getUserModelRouting() {
+export async function getUserModelRouting(signal?: AbortSignal) {
   return parseJson<UserModelRoutingResponse>(
-    await authFetch("/v1/me/model-routing", { cache: "no-store" }),
+    await authFetch("/v1/me/model-routing", { cache: "no-store", signal }),
   );
 }
 

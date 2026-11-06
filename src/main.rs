@@ -52,6 +52,7 @@ mod market_wallet_transfers;
 mod metrics;
 mod model_price_catalog;
 mod model_pricing;
+mod model_route_runtime;
 mod models;
 mod namespace;
 mod notification_channels;
@@ -330,7 +331,6 @@ async fn main() -> Result<()> {
         market_wallet_controls: Arc::new(Mutex::new(())),
         market_payments,
         recent_traffic: RecentTraffic::new(),
-        route_breakers: Arc::new(crate::route_breaker::RouteBreakerRegistry::new()),
         abuse: Arc::new(AbuseTracker::new()),
         share_abuse,
         ip_blacklist_stats: Arc::new(IpBlacklistStats::new()),

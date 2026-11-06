@@ -1,30 +1,17 @@
-//! In-memory circuit breaker for model-route failover candidates.
-//!
-//! Design borrowed from cc-switch's three-state breaker, scoped to
-//! (user, route, target Share). Driven exclusively by real forwarded traffic —
-//! deliberately decoupled from the share_model_health probing pipeline, which
-//! serves display and never gates routing.
-//!
-//! States:
-//! - **Closed**: traffic flows; consecutive failures are counted.
-//! - **Open**: requests skip this candidate until the cooldown elapses.
-//! - **HalfOpen**: one probe request is admitted (permit semantics); success
-//!   closes the breaker, failure re-opens with a fresh cooldown.
-//!
-//! All state is process-local. A restart simply re-derives it from live
-//! traffic, which is acceptable: thresholds are small (3 failures) and the
-//! cooldown (60s) is short.
-
-use std::collections::HashMap;
-use std::sync::RwLock;
+//! Process-local, bounded circuit breakers for explicit model-route candidates.
+//! Only routed attempts drive it: a real response, or a tunnel found offline at
+//! dispatch time. Share health probes never do. Store serializes configuration
+//! changes and result writes (Store connection -> registry, never the reverse).
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-/// Failures before the breaker opens.
 const FAILURE_THRESHOLD: u32 = 3;
-/// Base cooldown while open.
 const COOLDOWN: Duration = Duration::from_secs(60);
-/// Hard cap when a 429 carries a Retry-After hint.
 const MAX_COOLDOWN: Duration = Duration::from_secs(600);
+const IDLE_TTL: Duration = Duration::from_secs(3600);
+pub const SWEEP_INTERVAL: Duration = Duration::from_secs(600);
+const MAX_BREAKER_STATES: usize = 16_384;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BreakerPhase {
@@ -37,256 +24,411 @@ enum BreakerPhase {
 struct BreakerState {
     phase: BreakerPhase,
     consecutive_failures: u32,
-    /// When the current Open phase ends.
     open_until: Option<Instant>,
-    /// Whether the single HalfOpen probe permit is currently checked out.
-    probe_in_flight: bool,
+    probe: Option<u64>,
+    last_touched_at: Instant,
 }
-
 impl BreakerState {
-    fn new() -> Self {
+    fn new(now: Instant) -> Self {
         Self {
             phase: BreakerPhase::Closed,
             consecutive_failures: 0,
             open_until: None,
-            probe_in_flight: false,
+            probe: None,
+            last_touched_at: now,
         }
     }
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct BreakerKey {
     route_id: String,
     target_share_id: String,
 }
-
-/// Whether a caller may send traffic to this candidate right now, and if so
-/// whether the attempt holds the HalfOpen probe permit (which must be released
-/// via `record_success` / `record_failure` with `was_probe: true`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl BreakerKey {
+    fn new(route: &str, target: &str) -> Self {
+        Self {
+            route_id: route.into(),
+            target_share_id: target.into(),
+        }
+    }
+}
+#[derive(Debug, Default)]
+struct RegistryInner {
+    states: HashMap<BreakerKey, BreakerState>,
+    next_probe: u64,
+    capacity_dropped: u64,
+    last_capacity_warning: Option<Instant>,
+}
+/// Not Clone/Copy: dropping an unfinished probe releases precisely its permit.
+#[derive(Debug)]
+pub struct ProbePermitGuard {
+    inner: Arc<RwLock<RegistryInner>>,
+    key: BreakerKey,
+    generation: u64,
+    armed: bool,
+}
+impl Drop for ProbePermitGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(state) = inner.states.get_mut(&self.key) {
+            if state.probe == Some(self.generation) {
+                state.probe = None;
+                // Cancellation is neutral, not a success or a fresh cooldown.
+                state.phase = BreakerPhase::HalfOpen;
+            }
+        }
+    }
+}
+#[derive(Debug)]
 pub enum BreakerPermit {
-    /// Closed, or HalfOpen with the probe permit granted.
-    Allowed { was_probe: bool },
-    /// Open — skip this candidate.
+    Allowed { guard: Option<ProbePermitGuard> },
     Rejected,
 }
-
-#[derive(Debug, Default)]
-pub struct RouteBreakerRegistry {
-    states: RwLock<HashMap<BreakerKey, BreakerState>>,
+#[derive(Debug, Clone, Copy)]
+pub enum BreakerOutcome {
+    Success,
+    Failure { retry_after: Option<Duration> },
+    Neutral,
 }
-
+#[derive(Debug)]
+pub struct RouteBreakerRegistry {
+    inner: Arc<RwLock<RegistryInner>>,
+    capacity: usize,
+}
+impl Default for RouteBreakerRegistry {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(RegistryInner::default())),
+            capacity: MAX_BREAKER_STATES,
+        }
+    }
+}
 impl RouteBreakerRegistry {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Ask whether a candidate may be used. The caller must pair every
-    /// `Allowed` with exactly one `record_success`/`record_failure`.
-    pub fn acquire(&self, route_id: &str, target_share_id: &str) -> BreakerPermit {
-        let key = BreakerKey {
-            route_id: route_id.to_string(),
-            target_share_id: target_share_id.to_string(),
+    pub fn acquire(&self, route: &str, target: &str) -> BreakerPermit {
+        self.acquire_at(route, target, Instant::now())
+    }
+    fn acquire_at(&self, route: &str, target: &str, now: Instant) -> BreakerPermit {
+        let key = BreakerKey::new(route, target);
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let Some(state) = inner.states.get_mut(&key) else {
+            return BreakerPermit::Allowed { guard: None };
         };
-        let mut states = self.states.write().unwrap_or_else(|p| p.into_inner());
-        let state = states.entry(key).or_insert_with(BreakerState::new);
-        let now = Instant::now();
+        state.last_touched_at = now;
         match state.phase {
-            BreakerPhase::Closed => BreakerPermit::Allowed { was_probe: false },
-            BreakerPhase::Open => {
-                if state.open_until.is_some_and(|until| now < until) {
-                    return BreakerPermit::Rejected;
-                }
-                // Cooldown elapsed: transition to HalfOpen and grant the probe.
-                state.phase = BreakerPhase::HalfOpen;
-                state.probe_in_flight = true;
-                BreakerPermit::Allowed { was_probe: true }
+            BreakerPhase::Closed => return BreakerPermit::Allowed { guard: None },
+            BreakerPhase::Open if state.open_until.is_some_and(|until| now < until) => {
+                return BreakerPermit::Rejected;
             }
-            BreakerPhase::HalfOpen => {
-                if state.probe_in_flight {
-                    // Another request holds the probe permit; skip.
-                    return BreakerPermit::Rejected;
-                }
-                state.probe_in_flight = true;
-                BreakerPermit::Allowed { was_probe: true }
-            }
+            _ if state.probe.is_some() => return BreakerPermit::Rejected,
+            _ => {}
+        }
+        // Exhaustion is fail-closed; never recycle an old permit number (ABA).
+        let Some(generation) = inner.next_probe.checked_add(1) else {
+            return BreakerPermit::Rejected;
+        };
+        inner.next_probe = generation;
+        let state = inner
+            .states
+            .get_mut(&key)
+            .expect("state under the same lock");
+        state.phase = BreakerPhase::HalfOpen;
+        state.probe = Some(generation);
+        BreakerPermit::Allowed {
+            guard: Some(ProbePermitGuard {
+                inner: self.inner.clone(),
+                key,
+                generation,
+                armed: true,
+            }),
         }
     }
 
-    /// Release a local rejection without treating it as upstream health evidence.
-    pub fn record_neutral(&self, route_id: &str, target_share_id: &str, was_probe: bool) {
-        if !was_probe {
-            return;
-        }
-        let key = BreakerKey {
-            route_id: route_id.into(),
-            target_share_id: target_share_id.into(),
-        };
-        let mut states = self.states.write().unwrap_or_else(|p| p.into_inner());
-        if let Some(state) = states.get_mut(&key) {
-            state.probe_in_flight = false;
+    pub fn needs_record(&self, route: &str, target: &str, outcome: BreakerOutcome) -> bool {
+        match outcome {
+            BreakerOutcome::Neutral => false,
+            BreakerOutcome::Failure { .. } => true,
+            BreakerOutcome::Success => self
+                .inner
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .states
+                .contains_key(&BreakerKey::new(route, target)),
         }
     }
 
-    pub fn record_success(&self, route_id: &str, target_share_id: &str, was_probe: bool) {
-        let key = BreakerKey {
-            route_id: route_id.to_string(),
-            target_share_id: target_share_id.to_string(),
-        };
-        let mut states = self.states.write().unwrap_or_else(|p| p.into_inner());
-        let Some(state) = states.get_mut(&key) else {
-            return;
-        };
-        if was_probe {
-            state.probe_in_flight = false;
-        }
-        state.phase = BreakerPhase::Closed;
-        state.consecutive_failures = 0;
-        state.open_until = None;
-    }
-
-    /// `retry_after` from a 429 response shortens/lengthens the cooldown when
-    /// present, capped at [`MAX_COOLDOWN`].
-    pub fn record_failure(
+    pub fn record(
         &self,
-        route_id: &str,
-        target_share_id: &str,
-        was_probe: bool,
-        retry_after: Option<Duration>,
+        route: &str,
+        target: &str,
+        guard: Option<ProbePermitGuard>,
+        outcome: BreakerOutcome,
     ) {
-        let key = BreakerKey {
-            route_id: route_id.to_string(),
-            target_share_id: target_share_id.to_string(),
-        };
-        let mut states = self.states.write().unwrap_or_else(|p| p.into_inner());
-        let state = states.entry(key).or_insert_with(BreakerState::new);
-        if was_probe {
-            state.probe_in_flight = false;
+        self.record_at(route, target, guard, outcome, Instant::now());
+    }
+    fn record_at(
+        &self,
+        route: &str,
+        target: &str,
+        mut guard: Option<ProbePermitGuard>,
+        outcome: BreakerOutcome,
+        now: Instant,
+    ) {
+        if matches!(outcome, BreakerOutcome::Neutral) {
+            return;
+        } // guard Drop
+        let key = BreakerKey::new(route, target);
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(permit) = &guard {
+            // Removal/recreation, or a stale result, must not consume a new probe.
+            if permit.key != key
+                || inner.states.get(&key).and_then(|s| s.probe) != Some(permit.generation)
+            {
+                return;
+            }
+        } else if inner
+            .states
+            .get(&key)
+            .is_some_and(|s| s.phase != BreakerPhase::Closed)
+        {
+            // A Closed request that completed after the breaker opened cannot
+            // release/overwrite its later probe or erase the new cooldown.
+            return;
         }
+        if let Some(permit) = &mut guard {
+            permit.armed = false;
+        }
+        if matches!(outcome, BreakerOutcome::Success) {
+            inner.states.remove(&key);
+            return;
+        }
+        if !inner.states.contains_key(&key) && inner.states.len() >= self.capacity {
+            Self::sweep_inner(&mut inner, now);
+            if inner.states.len() >= self.capacity {
+                inner.capacity_dropped = inner.capacity_dropped.saturating_add(1);
+                if inner
+                    .last_capacity_warning
+                    .is_none_or(|last| now.saturating_duration_since(last) >= SWEEP_INTERVAL)
+                {
+                    tracing::warn!(
+                        dropped = inner.capacity_dropped,
+                        "model route breaker capacity reached; new keys are temporarily untracked"
+                    );
+                    inner.last_capacity_warning = Some(now);
+                }
+                return;
+            }
+        }
+        let state = inner
+            .states
+            .entry(key)
+            .or_insert_with(|| BreakerState::new(now));
+        state.last_touched_at = now;
+        state.probe = None;
         state.consecutive_failures = state.consecutive_failures.saturating_add(1);
         if state.phase == BreakerPhase::HalfOpen || state.consecutive_failures >= FAILURE_THRESHOLD
         {
-            let cooldown = retry_after
-                .map(|value| value.min(MAX_COOLDOWN))
-                .unwrap_or(COOLDOWN);
+            let BreakerOutcome::Failure { retry_after } = outcome else {
+                unreachable!()
+            };
             state.phase = BreakerPhase::Open;
-            state.open_until = Some(Instant::now() + cooldown);
+            state.open_until = Some(now + retry_after.unwrap_or(COOLDOWN).min(MAX_COOLDOWN));
         }
     }
-
-    /// Test/observability helper: is this candidate currently skipped?
+    pub fn sweep(&self) {
+        Self::sweep_inner(
+            &mut self.inner.write().unwrap_or_else(|e| e.into_inner()),
+            Instant::now(),
+        );
+    }
+    fn sweep_inner(inner: &mut RegistryInner, now: Instant) {
+        inner.states.retain(|_, state| {
+            state.probe.is_some()
+                || now.saturating_duration_since(state.last_touched_at) < IDLE_TTL
+                || (state.phase != BreakerPhase::Closed
+                    && state
+                        .open_until
+                        .is_none_or(|until| now.saturating_duration_since(until) < IDLE_TTL))
+        });
+    }
+    /// Called only after a successful commit while the Store connection is held.
+    pub fn retain_configuration(
+        &self,
+        old_routes: &HashSet<String>,
+        current: &HashSet<(String, String)>,
+    ) {
+        self.inner
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .states
+            .retain(|key, _| {
+                !old_routes.contains(&key.route_id)
+                    || current.contains(&(key.route_id.clone(), key.target_share_id.clone()))
+            });
+    }
     #[cfg(test)]
-    pub fn is_open(&self, route_id: &str, target_share_id: &str) -> bool {
-        let key = BreakerKey {
-            route_id: route_id.to_string(),
-            target_share_id: target_share_id.to_string(),
-        };
-        let states = self.states.read().unwrap_or_else(|p| p.into_inner());
-        matches!(states.get(&key).map(|s| s.phase), Some(BreakerPhase::Open))
+    pub fn is_open(&self, route: &str, target: &str) -> bool {
+        self.inner
+            .read()
+            .unwrap()
+            .states
+            .get(&BreakerKey::new(route, target))
+            .is_some_and(|s| s.phase == BreakerPhase::Open)
+    }
+    #[cfg(test)]
+    pub fn record_failure(&self, route: &str, target: &str, retry_after: Option<Duration>) {
+        self.record(route, target, None, BreakerOutcome::Failure { retry_after });
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn local_rejection_releases_half_open_probe_without_resetting_failures() {
-        let registry = RouteBreakerRegistry::new();
-        for _ in 0..FAILURE_THRESHOLD {
-            registry.record_failure("r", "s", false, Some(Duration::ZERO));
-        }
-        assert_eq!(
-            registry.acquire("r", "s"),
-            BreakerPermit::Allowed { was_probe: true }
-        );
-        registry.record_neutral("r", "s", true);
-        assert_eq!(
-            registry.acquire("r", "s"),
-            BreakerPermit::Allowed { was_probe: true }
-        );
-        let states = registry.states.read().unwrap();
-        let state = states
-            .get(&BreakerKey {
-                route_id: "r".into(),
-                target_share_id: "s".into(),
-            })
-            .unwrap();
-        assert_eq!(state.phase, BreakerPhase::HalfOpen);
-        assert_eq!(state.consecutive_failures, FAILURE_THRESHOLD);
-    }
-
-    #[test]
-    fn closed_allows_traffic() {
-        let registry = RouteBreakerRegistry::new();
-        assert_eq!(
-            registry.acquire("r1", "s1"),
-            BreakerPermit::Allowed { was_probe: false }
+    fn failure(registry: &RouteBreakerRegistry, now: Instant) {
+        registry.record_at(
+            "r",
+            "s",
+            None,
+            BreakerOutcome::Failure { retry_after: None },
+            now,
         );
     }
-
-    #[test]
-    fn opens_after_threshold_failures() {
-        let registry = RouteBreakerRegistry::new();
-        for _ in 0..FAILURE_THRESHOLD {
-            let permit = registry.acquire("r1", "s1");
-            assert!(matches!(permit, BreakerPermit::Allowed { .. }));
-            registry.record_failure("r1", "s1", false, None);
+    fn probe(registry: &RouteBreakerRegistry, now: Instant) -> ProbePermitGuard {
+        match registry.acquire_at("r", "s", now) {
+            BreakerPermit::Allowed { guard: Some(guard) } => guard,
+            _ => panic!("expected probe"),
         }
-        assert!(registry.is_open("r1", "s1"));
-        assert_eq!(registry.acquire("r1", "s1"), BreakerPermit::Rejected);
     }
-
     #[test]
-    fn success_resets_failure_count() {
-        let registry = RouteBreakerRegistry::new();
-        registry.record_failure("r1", "s1", false, None);
-        registry.record_failure("r1", "s1", false, None);
-        registry.record_success("r1", "s1", false);
-        registry.record_failure("r1", "s1", false, None);
-        // Only one consecutive failure: still closed.
-        assert!(!registry.is_open("r1", "s1"));
+    fn route_breaker_success_only_leaves_no_state() {
+        let r = RouteBreakerRegistry::new();
+        assert!(matches!(
+            r.acquire("r", "s"),
+            BreakerPermit::Allowed { guard: None }
+        ));
+        r.record("r", "s", None, BreakerOutcome::Success);
+        assert!(r.inner.read().unwrap().states.is_empty());
+        assert!(!r.needs_record("r", "s", BreakerOutcome::Success));
     }
-
     #[test]
-    fn half_open_admits_single_probe_then_closes_on_success() {
-        let registry = RouteBreakerRegistry::new();
-        for _ in 0..FAILURE_THRESHOLD {
-            registry.record_failure("r1", "s1", false, None);
+    fn route_breaker_cancel_and_neutral_release_exact_probe() {
+        let r = RouteBreakerRegistry::new();
+        let now = Instant::now();
+        for _ in 0..3 {
+            failure(&r, now);
         }
-        assert!(registry.is_open("r1", "s1"));
-        // Force cooldown expiry by opening with a zero-length retry-after…
-        // instead simulate: manually flip via internal state is not exposed, so
-        // use a fresh registry with an elapsed open_until is not possible. The
-        // half-open transition is covered indirectly: after cooldown the next
-        // acquire grants a probe. We cannot sleep 60s in a unit test, so this
-        // test asserts the permit contract on a manually-constructed state.
-        // (Cooldown timing is exercised in integration.)
+        let guard = probe(&r, now + COOLDOWN);
+        assert!(matches!(
+            r.acquire_at("r", "s", now + COOLDOWN),
+            BreakerPermit::Rejected
+        ));
+        drop(guard);
+        let guard = probe(&r, now + COOLDOWN);
+        r.record("r", "s", Some(guard), BreakerOutcome::Neutral);
+        let guard = probe(&r, now + COOLDOWN);
+        r.record("r", "s", Some(guard), BreakerOutcome::Success);
+        assert!(r.inner.read().unwrap().states.is_empty());
     }
-
     #[test]
-    fn retry_after_caps_at_max() {
-        let registry = RouteBreakerRegistry::new();
-        for _ in 0..FAILURE_THRESHOLD {
-            registry.record_failure("r1", "s1", false, Some(Duration::from_secs(3600)));
+    fn route_breaker_old_guard_and_ordinary_result_cannot_release_new_probe() {
+        let r = RouteBreakerRegistry::new();
+        let now = Instant::now();
+        for _ in 0..3 {
+            failure(&r, now);
         }
-        let states = registry.states.read().unwrap();
-        let key = BreakerKey {
-            route_id: "r1".into(),
-            target_share_id: "s1".into(),
+        let old = probe(&r, now + COOLDOWN);
+        r.retain_configuration(&HashSet::from(["r".into()]), &HashSet::new());
+        for _ in 0..3 {
+            failure(&r, now);
+        }
+        let current = probe(&r, now + COOLDOWN);
+        drop(old);
+        r.record("r", "s", None, BreakerOutcome::Success);
+        assert!(matches!(
+            r.acquire_at("r", "s", now + COOLDOWN),
+            BreakerPermit::Rejected
+        ));
+        drop(current);
+        drop(probe(&r, now + COOLDOWN));
+    }
+    #[test]
+    fn route_breaker_ttl_covers_partial_failures_and_protects_live_probes() {
+        let r = RouteBreakerRegistry::new();
+        let now = Instant::now();
+        failure(&r, now);
+        RouteBreakerRegistry::sweep_inner(&mut r.inner.write().unwrap(), now + IDLE_TTL);
+        assert!(r.inner.read().unwrap().states.is_empty());
+        for _ in 0..3 {
+            failure(&r, now);
+        }
+        RouteBreakerRegistry::sweep_inner(&mut r.inner.write().unwrap(), now + IDLE_TTL);
+        assert!(r.is_open("r", "s")); // cooldown ended less than an hour ago
+        let guard = probe(&r, now + COOLDOWN);
+        RouteBreakerRegistry::sweep_inner(&mut r.inner.write().unwrap(), now + IDLE_TTL * 3);
+        assert_eq!(r.inner.read().unwrap().states.len(), 1);
+        drop(guard);
+        RouteBreakerRegistry::sweep_inner(&mut r.inner.write().unwrap(), now + IDLE_TTL * 3);
+        assert!(r.inner.read().unwrap().states.is_empty());
+    }
+    #[test]
+    fn route_breaker_capacity_does_not_evict_valid_state_and_reclaims_expiry() {
+        let r = RouteBreakerRegistry {
+            capacity: 1,
+            ..Default::default()
         };
-        let open_until = states.get(&key).unwrap().open_until.unwrap();
-        assert!(open_until <= Instant::now() + MAX_COOLDOWN);
-    }
-
-    #[test]
-    fn independent_targets_do_not_share_state() {
-        let registry = RouteBreakerRegistry::new();
-        for _ in 0..FAILURE_THRESHOLD {
-            registry.record_failure("r1", "s1", false, None);
+        let now = Instant::now();
+        for _ in 0..3 {
+            failure(&r, now);
         }
-        assert!(registry.is_open("r1", "s1"));
-        assert!(!registry.is_open("r1", "s2"));
-        assert!(!registry.is_open("r2", "s1"));
+        r.record_at(
+            "other",
+            "target",
+            None,
+            BreakerOutcome::Failure { retry_after: None },
+            now,
+        );
+        assert_eq!(r.inner.read().unwrap().states.len(), 1);
+        assert_eq!(r.inner.read().unwrap().capacity_dropped, 1);
+        assert!(r.is_open("r", "s"));
+        r.record_at(
+            "other",
+            "target",
+            None,
+            BreakerOutcome::Failure { retry_after: None },
+            now + IDLE_TTL * 2,
+        );
+        assert_eq!(r.inner.read().unwrap().states.len(), 1);
+        assert!(!r.is_open("r", "s"));
+    }
+    #[test]
+    fn route_breaker_retry_after_caps_and_targets_are_independent() {
+        let r = RouteBreakerRegistry::new();
+        let now = Instant::now();
+        for _ in 0..3 {
+            r.record_at(
+                "r",
+                "s",
+                None,
+                BreakerOutcome::Failure {
+                    retry_after: Some(Duration::from_secs(3600)),
+                },
+                now,
+            );
+        }
+        assert!(matches!(
+            r.acquire_at("r", "s", now + MAX_COOLDOWN - Duration::from_secs(1)),
+            BreakerPermit::Rejected
+        ));
+        assert!(matches!(
+            r.acquire("other", "s"),
+            BreakerPermit::Allowed { guard: None }
+        ));
+        drop(probe(&r, now + MAX_COOLDOWN));
     }
 }

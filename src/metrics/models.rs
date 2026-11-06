@@ -107,6 +107,11 @@ pub struct RouterMetricsStatus {
     /// Live ingress counters and retained memory; absent on historical rows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_request_body: Option<crate::proxy_request_body::BodyMetrics>,
+    /// Live-only process counters. Historical metrics rows have no such data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_route_failover_total: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_route_failover_window_count: Option<u64>,
     pub active_routes: u64,
     pub pending_routes: u64,
     pub health_probe_failure_cache: u64,

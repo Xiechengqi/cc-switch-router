@@ -268,3 +268,175 @@ test("invalid drafts never reach the server and subscribers see immutable snapsh
   f.edit();
   assert.equal(updates, count);
 });
+
+test("suspending an unfinished initial load allows resume without a stuck loading flag", async () => {
+  const f = fixture();
+  const old = deferred<UserModelRoutingResponse>();
+  f.services.getRouting = () => old.promise;
+  const loading = f.session.load();
+  f.session.suspend();
+  assert.equal(f.session.getSnapshot().loading, false);
+  f.services.getRouting = async () => profile(2);
+  await f.session.resume();
+  old.resolve(profile(1));
+  await loading;
+  assert.equal(f.session.getSnapshot().profile?.revision, 2);
+  assert.equal(f.session.getSnapshot().loading, false);
+});
+
+test("suspend retains dirty draft, clears plaintext and resume refetches credentials", async () => {
+  const f = fixture();
+  await f.session.load();
+  f.edit();
+  const routes = f.session.getSnapshot().routes;
+  f.session.suspend();
+  assert.equal(f.session.getSnapshot().rawToken, "");
+  assert.equal(f.session.getSnapshot().routes, routes);
+  await f.session.resume();
+  assert.equal(f.session.getSnapshot().routes, routes);
+  assert.equal(f.session.getSnapshot().rawToken, "fixture-only-secret");
+  assert.equal(f.calls.token, 2);
+  assert.equal(f.calls.replace, 0);
+});
+
+test("saving does not invalidate an in-progress credential read", async () => {
+  const f = fixture();
+  await f.session.load();
+  f.edit();
+  f.session.suspend();
+  const key = deferred<{ token: typeof f.token; apiToken: string }>();
+  f.services.getToken = () => key.promise;
+  const resuming = f.session.resume();
+  await f.session.save();
+  key.resolve({ token: f.token, apiToken: "resumed-secret" });
+  await resuming;
+  assert.equal(f.session.getSnapshot().rawToken, "resumed-secret");
+  assert.equal(f.calls.replace, 1);
+});
+
+test("saving across suspend commits configuration without exposing credentials", async () => {
+  const f = fixture();
+  await f.session.load();
+  f.edit();
+  const result = deferred<UserModelRoutingResponse>();
+  f.services.replaceRouting = () => result.promise;
+  const saving = f.session.save();
+  f.session.suspend();
+  result.resolve(profile(2));
+  await saving;
+  assert.equal(f.session.getSnapshot().profile?.revision, 2);
+  assert.equal(f.session.getSnapshot().busy, false);
+  assert.equal(f.session.getSnapshot().rawToken, "");
+});
+
+test("authorization failure suspends automatic reads until explicit recovery", async () => {
+  const f = fixture();
+  await f.session.load();
+  let reads = 0;
+  f.services.getRouting = async () => { reads++; throw Object.assign(new Error("expired"), { status: 401 }); };
+  await f.session.refresh();
+  for (let index = 0; index < 3; index++) { await f.session.refresh(); await f.session.resume(); }
+  assert.equal(reads, 1);
+  f.services.getRouting = async () => { reads++; return profile(3); };
+  assert.equal(await f.session.load(), true);
+  assert.equal(reads, 2);
+});
+
+test("explicit discard supersedes background reads and their late finally", async () => {
+  const f = fixture();
+  await f.session.load();
+  f.edit();
+  const old = deferred<UserModelRoutingResponse>();
+  f.services.getRouting = () => old.promise;
+  const refreshing = f.session.refresh();
+  f.services.getRouting = async () => profile(3);
+  assert.equal(await f.session.load(true), true);
+  old.resolve(profile(2));
+  await refreshing;
+  assert.equal(f.session.getSnapshot().profile?.revision, 3);
+  assert.equal(routingDraftIsDirty(f.session.getSnapshot()), false);
+  assert.equal(f.session.getSnapshot().loading, false);
+});
+
+test("authentication recovery remains explicit after hiding and showing the panel", async () => {
+  for (const status of [401, 403]) {
+    const f = fixture();
+    await f.session.load();
+    let reads = 0;
+    f.services.getRouting = async () => { reads++; throw Object.assign(new Error("expired"), { status }); };
+    await f.session.refresh();
+    f.session.suspend();
+    await f.session.resume();
+    await f.session.refresh();
+    assert.equal(reads, 1);
+    assert.equal(await f.session.load(), false);
+    await f.session.resume();
+    assert.equal(reads, 2, "failed explicit recovery must not re-enable automatic reads");
+    f.services.getRouting = async () => { reads++; return profile(3); };
+    assert.equal(await f.session.load(), true);
+    assert.equal(reads, 3);
+  }
+});
+
+test("dirty drafts retain their baseline while capabilities track the current server", async () => {
+  const f = fixture();
+  const capabilities = { savedRoute: true, revisionCheck: true, totalTimeoutMs: 30000, maxAttempts: 4, responsePreviewBytes: 16384 };
+  f.services.getRouting = async () => ({ ...profile(), testCapabilities: capabilities });
+  await f.session.load();
+  f.edit();
+  const draft = f.session.getSnapshot().routes;
+  f.services.getRouting = async () => profile();
+  await f.session.refresh();
+  assert.equal(f.session.getSnapshot().profile?.testCapabilities, undefined);
+  assert.equal(f.session.getSnapshot().routes, draft);
+  f.services.getRouting = async () => ({ ...profile(2), testCapabilities: capabilities });
+  await f.session.refresh();
+  assert.equal(f.session.getSnapshot().profile?.testCapabilities, capabilities);
+  assert.equal(f.session.getSnapshot().profile?.revision, 1);
+  assert.equal(f.session.getSnapshot().conflict, true);
+  assert.equal(f.session.getSnapshot().routes, draft);
+});
+
+test("a failed save across suspend retains drafts and resume coalesces the deferred refresh", async () => {
+  const f = fixture();
+  await f.session.load();
+  f.edit();
+  const draft = f.session.getSnapshot().routes;
+  const pending = deferred<UserModelRoutingResponse>();
+  f.services.replaceRouting = () => pending.promise;
+  const saving = f.session.save();
+  f.session.suspend();
+  await f.session.resume();
+  await f.session.resume();
+  assert.equal(f.calls.routing, 1);
+  pending.reject(new Error("offline"));
+  await saving;
+  await Promise.resolve();
+  assert.equal(f.session.getSnapshot().routes, draft);
+  assert.equal(f.session.getSnapshot().error, "offline");
+  assert.equal(f.session.getSnapshot().busy, false);
+  assert.equal(f.calls.routing, 2);
+  assert.equal(f.calls.token, 2);
+});
+
+test("resetting the key fences old credential reads across visibility changes", async () => {
+  const f = fixture();
+  await f.session.load();
+  f.session.suspend();
+  const old = deferred<{ token: typeof f.token; apiToken: string }>();
+  f.services.getToken = () => old.promise;
+  const resuming = f.session.resume();
+  const reset = deferred<UserApiTokenResetResponse>();
+  f.services.resetToken = () => reset.promise;
+  const resetting = f.session.resetToken();
+  f.session.suspend();
+  old.resolve({ token: f.token, apiToken: "obsolete-secret" });
+  reset.resolve({ token: f.token, apiToken: "reset-secret" });
+  await resuming;
+  assert.equal(await resetting, true);
+  assert.equal(f.session.getSnapshot().rawToken, "");
+  assert.equal(f.session.getSnapshot().showToken, false);
+  f.services.getToken = async () => ({ token: f.token, apiToken: "reset-secret" });
+  await f.session.resume();
+  assert.equal(f.session.getSnapshot().rawToken, "reset-secret");
+});

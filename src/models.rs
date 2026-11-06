@@ -451,6 +451,77 @@ pub struct UserModelRoutingResponse {
     pub eligible_shares: Vec<UserModelRoutingShareView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<DateTime<Utc>>,
+    pub test_capabilities: ModelRouteTestCapabilities,
+    pub route_recent_results: Vec<ModelRouteRecentResult>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRouteTestCapabilities {
+    pub saved_route: bool,
+    pub revision_check: bool,
+    pub total_timeout_ms: u64,
+    pub max_attempts: usize,
+    pub response_preview_bytes: usize,
+}
+impl Default for ModelRouteTestCapabilities {
+    fn default() -> Self {
+        Self {
+            saved_route: true,
+            revision_check: true,
+            total_timeout_ms: 30_000,
+            max_attempts: 4,
+            response_preview_bytes: 16 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelRouteTestMode {
+    #[default]
+    Primary,
+    SavedRoute,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelRouteBodyState {
+    Complete,
+    Truncated,
+    ReadError,
+    Timeout,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRouteAttempt {
+    pub target_share_id: String,
+    pub position: usize,
+    pub outcome: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_code: Option<u16>,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRouteRecentResult {
+    pub route_id: String,
+    pub revision: u64,
+    pub request_sequence: String,
+    pub observed_at: DateTime<Utc>,
+    pub source: &'static str,
+    pub phase: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_share_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<usize>,
+    pub status_code: u16,
+    pub continued_search: bool,
+    pub used_backup: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_state: Option<ModelRouteBodyState>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -465,6 +536,10 @@ pub struct ReplaceUserModelRoutingRequest {
 pub struct UserModelRoutingTestRequest {
     pub app_type: String,
     pub requested_model: String,
+    #[serde(default)]
+    pub mode: ModelRouteTestMode,
+    #[serde(default)]
+    pub expected_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -484,6 +559,15 @@ pub struct UserModelRoutingTestResponse {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
+    pub mode: ModelRouteTestMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempts: Option<Vec<ModelRouteAttempt>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_state: Option<ModelRouteBodyState>,
 }
 
 #[derive(Debug, Clone, Serialize)]

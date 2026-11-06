@@ -64,8 +64,9 @@ test("parallel CI retains every existing financial gate and separates profile ca
   assert.match(job("rust-tests"), /cargo test --locked browser_share_cors/);
   assert.match(job("frontend"), /npm run test:share-value-quota/);
   assert.match(job("frontend"), /npm run test:model-routing/);
-  for (const suite of ["model_rout", "failover_candidates", "route_breaker"]) {
+  for (const suite of ["model_rout", "failover_candidates", "route_breaker", "metrics::tests", "notification_kinds::tests"]) {
     assert.ok(job("rust-tests").includes(`cargo test --locked ${suite}`), `lost routing gate: ${suite}`);
+    assert.ok(job("rust-tests").includes(`require-tests.sh cargo test --locked ${suite}`), `routing gate allows zero tests: ${suite}`);
   }
   for (const suite of ["proxy_request_body::tests", "config::tests::request_body_", "admin::settings::tests::request_body_settings_", "proxy::tests::model_routing::request_body"]) {
     assert.ok(job("rust-tests").includes(`require-tests.sh cargo test --locked ${suite}`), `missing guarded ingress gate: ${suite}`);

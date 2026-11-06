@@ -89,9 +89,9 @@ Direct Share:
     -> 原 Share 代理链
 ```
 
-统一入口是薄选择层，不是新的 Share、市场或计量主体。映射键固定为 `(appType, requestedModel)`；除精确模型名外，用户可为每个 App 显式配置一条 `*` 全量路由，优先级固定为精确映射 > `*`，不支持前缀、后缀或正则匹配。它不分配每用户子域名，不改写模型，不从用户可见 Share 中自动挑选，也不在失败时 fallback / 重试其他 Share。映射不授予访问权；Owner、有效 ShareTo grant 或 Free 权限及目标 App 可用性在每次请求时重新判定。选中后请求继续走 `proxy_handler`、IngressContext、并发和流式生命周期，因此请求日志、usage、地图归因、限额和账务都只记录在目标 Share 层。直接 Share URL 始终保留，用户没有配置映射时系统行为与此前一致。
+统一入口是薄选择层，不是新的 Share、市场或计量主体。映射键固定为 `(appType, requestedModel)`；精确规则优先于用户显式配置的 `*` 默认出口，不支持其他模式匹配，也不跨规则兜底。规则内可保存首选与最多 5 个备选，按用户顺序检查授权、模型禁用、路由级熔断和隧道在线，最多实际转发 4 次；可切换状态为 401/403/429/500/502/503/504。收到最终响应头即锁定，不重放流。它不分配每用户子域名、不改写模型、不从列表外自动挑选。映射不授予访问权；每次请求重新判定 ACL 和 App。实际转发继续走原 `proxy_handler`、IngressContext、并发及计量链，请求日志、usage、额度和账务归实际 Share。直接 Share URL 保留，没有配置时行为不变。熔断、诊断限流及最近结果都是有界实例内状态；详见 `PROTOCOL.md` 第 9.2 节。
 
-控制面使用 `user_model_routing_profiles` 的 revision 做乐观并发控制，`user_model_routes` 保存区分大小写的精确键，`user_model_route_events` 按用户保留最近 100 次原子替换审计。Share 删除不级联删除 route：失效目标必须在 UI 中保持可见并在运行时 fail closed，不能静默变成未配置或换到其他 Share。
+控制面使用 `user_model_routing_profiles` 的 revision 做乐观并发控制，`user_model_routes` 保存区分大小写的精确键，`user_model_route_events` 按用户保留最近 100 次原子替换审计。Share 删除不级联删除 route：失效目标必须在 UI 中保持可见；运行时跳过失效首选，继续尝试用户保存队列内的合法备选。全部目标失效时 fail closed，不能静默变成未配置或选择队列外的 Share。
 
 ### ① Share Market —— 固定拼车位租用
 

@@ -653,6 +653,8 @@ export type UserModelRoutingResponse = {
   routes: UserModelRoute[];
   eligibleShares: UserModelRoutingShare[];
   updatedAt?: string;
+  testCapabilities?: { savedRoute: boolean; revisionCheck: boolean; totalTimeoutMs: number; maxAttempts: number; responsePreviewBytes: number };
+  routeRecentResults?: ModelRouteRecentResult[];
 };
 
 export type ReplaceUserModelRoutingRequest = {
@@ -663,6 +665,21 @@ export type ReplaceUserModelRoutingRequest = {
 export type UserModelRoutingTestRequest = {
   appType: ModelRoutingApp;
   requestedModel: string;
+  mode?: "primary" | "saved_route";
+  expectedRevision?: number;
+};
+
+export type ModelRouteBodyState = "complete" | "truncated" | "read_error" | "timeout";
+export type ModelRouteAttempt = {
+  targetShareId: string; position: number; outcome: "missing" | "app_unavailable" | "unauthorized"
+    | "model_blocked" | "breaker_open" | "offline" | "response" | "budget_exhausted" | "ingress_rejected";
+  statusCode?: number; durationMs: number;
+};
+export type ModelRouteRecentResult = {
+  routeId: string; revision: number; requestSequence: string; observedAt: string;
+  source: "request" | "diagnostic"; phase: "response_headers" | "body_complete" | "body_incomplete";
+  targetShareId?: string; position?: number; statusCode?: number;
+  continuedSearch: boolean; usedBackup: boolean; bodyState?: ModelRouteBodyState;
 };
 
 export type UserModelRoutingTestHttp = {
@@ -684,6 +701,11 @@ export type UserModelRoutingTestResponse = {
   durationMs: number;
   error?: string;
   code?: string;
+  mode?: "primary" | "saved_route";
+  revision?: number;
+  routeId?: string;
+  attempts?: ModelRouteAttempt[];
+  bodyState?: ModelRouteBodyState;
 };
 
 export type NotificationChannelSettings = {

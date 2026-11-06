@@ -51,6 +51,7 @@ async fn ingress_long_session_timeout_then_same_history_retry_does_not_dispatch_
     for index in 0..6 {
         assert!(
             !f.state
+                .store
                 .route_breakers
                 .is_open(&f.route_id, &format!("queue-{index}"))
         );
@@ -240,17 +241,44 @@ async fn ingress_local_capacity_errors_never_open_breakers_or_try_other_accounts
         )
         .await
         .unwrap();
+    let principal = f
+        .state
+        .store
+        .resolve_user_api_token(&f.token, "share:invoke")
+        .await
+        .unwrap()
+        .unwrap();
+    let resolution = f
+        .state
+        .store
+        .resolve_user_model_route(
+            &principal.user_id,
+            "owner@example.com",
+            "codex",
+            "fixture-model",
+        )
+        .await
+        .unwrap()
+        .unwrap();
     for _ in 0..4 {
-        let response = user_model_proxy_handler(
-            State(f.state.clone()),
-            peer(),
-            request(&f, "api", Body::from(r#"{"model":"fixture-model"}"#)),
+        let req = request(&f, "api", Body::empty());
+        let execution = execute_resolved_model_route(
+            &f.state,
+            peer().0,
+            req.into_parts().0,
+            Bytes::from_static(br#"{"model":"fixture-model"}"#),
+            &resolution,
+            "codex",
+            "fixture-model",
         )
         .await;
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(execution.response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(execution.attempts.len(), 1);
+        assert_eq!(execution.attempts[0].outcome, "ingress_rejected");
+        assert!(execution.target_share_id.is_none());
     }
     assert_eq!(f.counts(), vec![0; 6]);
-    assert!(!f.state.route_breakers.is_open(&f.route_id, "queue-0"));
+    assert!(!f.state.store.route_breakers.is_open(&f.route_id, "queue-0"));
     assert!(f.state.proxy.inflight_by_share().await.is_empty());
     assert_eq!(f.state.proxy.request_body_metrics().memory_used_bytes, 0);
 }

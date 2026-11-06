@@ -15,11 +15,11 @@ import { cn } from "@/lib/utils";
 const controlClass = "inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-secondary active:bg-secondary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-40";
 const selectionClass = "flex min-h-11 min-w-0 cursor-pointer items-start gap-2 rounded-md p-2 hover:bg-secondary active:bg-secondary has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-ring has-[:disabled]:cursor-not-allowed";
 
-function TransferCheckbox({ checked, mixed = false, disabled, label, onChange, inputRef }: {
+function TransferCheckbox({ checked, mixed = false, disabled, label, onChange, inputRef, targetId }: {
   checked: boolean; mixed?: boolean; disabled: boolean; label: string;
-  onChange: (checked: boolean) => void; inputRef?: (node: HTMLInputElement | null) => void;
+  onChange: (checked: boolean) => void; inputRef?: (node: HTMLInputElement | null) => void; targetId?: string;
 }) {
-  return <input type="checkbox" checked={checked} disabled={disabled} aria-label={label}
+  return <input type="checkbox" checked={checked} disabled={disabled} aria-label={label} data-model-route-target={targetId}
     aria-checked={mixed ? "mixed" : checked}
     ref={node => { if (node) node.indeterminate = mixed; inputRef?.(node); }}
     className="mt-0.5 size-4 shrink-0 accent-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:cursor-not-allowed"
@@ -51,7 +51,7 @@ function TargetRow({ id, index, total, disabled, selectionDisabled, sortDisabled
           className={controlClass} aria-label={summary.t("modelHub.moveDown")}><ChevronDown className="h-4 w-4" aria-hidden /></button>
       </div>
       <label className={selectionClass}>
-        <TransferCheckbox checked={checked} disabled={selectionDisabled} onChange={onCheck} inputRef={inputRef}
+        <TransferCheckbox checked={checked} disabled={selectionDisabled} onChange={onCheck} inputRef={inputRef} targetId={summary.shareId}
           label={summary.t("modelHub.checkShare", { name: summary.share?.subdomain || summary.shareId })} />
         <RoutingShareSummary {...summary} />
       </label>
@@ -60,9 +60,14 @@ function TargetRow({ id, index, total, disabled, selectionDisabled, sortDisabled
   );
 }
 
-export function SharePoolPicker({ shares, selected, app, routeKey, disabled, addBlockedReason, onChange, locale, t }: {
+export type PickerAction = { kind: "append_targets" | "remove_targets"; shareIds: string[] }
+  | { kind: "move_target"; from: number; to: number };
+
+export function SharePoolPicker({ shares, selected, app, routeKey, disabled, addBlockedReason, onChange, onAction, locale, t }: {
   shares: UserModelRoutingShare[]; selected: string[]; app: ModelRoutingApp; routeKey: string;
   disabled: boolean; addBlockedReason?: string; onChange: (ids: string[]) => void;
+  /** Returns whether the draft accepted the change; rejected commands keep the checks and stay silent here. */
+  onAction?: (action: PickerAction) => boolean;
 } & Pick<RoutingShareSummaryProps, "locale" | "t">) {
   const [leftQuery, setLeftQuery] = React.useState("");
   const [rightQuery, setRightQuery] = React.useState("");
@@ -138,22 +143,25 @@ export function SharePoolPicker({ shares, selected, app, routeKey, disabled, add
   const moveChecked = (direction: "in" | "out") => {
     if (locked || (direction === "in" && (!!addBlockedReason || overCapacity))) return;
     const checked = direction === "in" ? checkedIn : checkedOut;
-    const next = transferModelRouteTargets(selected, availableIds, checked, direction);
-    if (next === selected) return;
-    const side = direction === "in" ? "right" : "left";
-    pendingFocus.current = { side, id: checked[0] };
+    if (!checked.length) return;
+    const accepted = onAction
+      ? onAction({ kind: direction === "in" ? "append_targets" : "remove_targets", shareIds: checked })
+      : (onChange(transferModelRouteTargets(selected, availableIds, checked, direction)), true);
+    // The panel's error banner reports a rejection; announcing success here
+    // or clearing the checks would contradict it.
+    if (!accepted) return;
+    pendingFocus.current = { side: direction === "in" ? "right" : "left", id: checked[0] };
     if (direction === "in") { setLeftChecked([]); setRightQuery(""); setRightChecked(checked); }
     else { setRightChecked([]); setLeftQuery(""); setLeftChecked(checked); }
-    onChange(next);
     setAnnouncement(t(direction === "in" ? "modelHub.transferredIn" : "modelHub.transferredOut", { count: checked.length }));
   };
   const ids = selected.map(id => JSON.stringify([routeKey, id]));
   const move = (from: number, to: number) => {
     if (disabled || rightQuery.trim()) return;
-    const next = moveModelRouteTarget(selected, from, to);
-    if (next !== selected) {
-      onChange(next);
-      setAnnouncement(t("modelHub.moved", { name: byId.get(selected[from])?.subdomain || selected[from], order: to + 1 }));
+    if (from >= 0 && to >= 0 && from < selected.length && to < selected.length && from !== to) {
+      const accepted = onAction ? onAction({ kind: "move_target", from, to })
+        : (onChange(moveModelRouteTarget(selected, from, to)), true);
+      if (accepted) setAnnouncement(t("modelHub.moved", { name: byId.get(selected[from])?.subdomain || selected[from], order: to + 1 }));
     }
   };
   const dragEnd = ({ active, over }: DragEndEvent) => {
@@ -164,7 +172,7 @@ export function SharePoolPicker({ shares, selected, app, routeKey, disabled, add
   return (
     <div className="model-route-transfer grid min-w-0 gap-2" data-model-route-picker>
       <div className="model-route-transfer-grid">
-      <section className="model-route-transfer-pane" aria-label={t("modelHub.availableShares")}>
+      <div className="model-route-transfer-pane">
         <div className="grid gap-2 border-b border-border p-2">
           <h5 className="px-2 text-xs font-semibold text-foreground">{t("modelHub.availableShares")} · {remaining.length}</h5>
           <label className={cn(selectionClass, "items-center text-xs text-muted-foreground")}>
@@ -194,7 +202,7 @@ export function SharePoolPicker({ shares, selected, app, routeKey, disabled, add
           ))}
           {!available.length ? <li className="px-2 py-4 text-xs text-muted-foreground">{t(!eligible.length ? "modelHub.noEligibleShares" : !remaining.length ? "modelHub.allSharesSelected" : "modelHub.noSearchResults")}</li> : null}
         </ul>
-      </section>
+      </div>
       <div className="model-route-transfer-actions" role="group" aria-label={t("modelHub.transferHint")}>
         <button type="button" disabled={locked || !checkedIn.length || overCapacity || !!addBlockedReason}
           className="inline-flex h-11 items-center justify-center gap-1 whitespace-nowrap rounded-md border border-input bg-card px-3 text-xs text-foreground hover:bg-secondary active:bg-secondary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-40"
@@ -207,7 +215,7 @@ export function SharePoolPicker({ shares, selected, app, routeKey, disabled, add
           <ArrowLeft className="model-route-transfer-horizontal size-4" aria-hidden /><ArrowUp className="model-route-transfer-vertical size-4" aria-hidden />{t("modelHub.transferOut")}
         </button>
       </div>
-      <section className="model-route-transfer-pane" aria-label={t("modelHub.selectedShares")}>
+      <div className="model-route-transfer-pane">
         <div className="grid gap-2 border-b border-border p-2">
           <h5 className="px-2 text-xs font-semibold text-foreground">{t("modelHub.selectedShares")} · {selected.length}/{MAX_MODEL_ROUTE_TARGETS}</h5>
           <label className={cn(selectionClass, "items-center text-xs text-muted-foreground")}>
@@ -239,7 +247,7 @@ export function SharePoolPicker({ shares, selected, app, routeKey, disabled, add
             </ol>
           </SortableContext>
         </DndContext>
-      </section>
+      </div>
       </div>
       {statusText ? <div className="text-xs text-muted-foreground" role="status">{statusText}</div> : null}
       <span className="sr-only" role="status">{announcement}</span>

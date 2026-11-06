@@ -76,9 +76,9 @@ use crate::models::{
     TunnelStateRequest, TunnelStateResponse, UpdateNotificationSettingsRequest,
     UpdateUsageCardSettingsRequest, UpgradeInstallationRequest, UpgradeInstallationResponse,
     UpgradeInstallationStatusResponse, UsageCardSettingsResponse, UserApiTokenResetResponse,
-    UserApiTokenResponse, UserModelRoutingResponse, UserModelRoutingTestHttp,
-    UserModelRoutingTestRequest, UserModelRoutingTestResponse, UserSharesResponse,
-    VerifyEmailCodeRequest, VerifyEmailCodeResponse,
+    UserApiTokenResponse, UserModelRoutingTestHttp, UserModelRoutingTestRequest,
+    UserModelRoutingTestResponse, UserSharesResponse, VerifyEmailCodeRequest,
+    VerifyEmailCodeResponse,
 };
 use crate::notifications::{
     ClientNotificationDeliveriesResponse, ClientNotificationPolicy, NotificationTemplateContext,
@@ -87,8 +87,9 @@ use crate::notifications::{
 use crate::proxy::{
     ReleasedShareRequest, RouteAvailability, build_user_model_route_test_probe,
     execute_user_model_route_test, gateway_proxy_handler, is_direct_share_model_api_request,
-    is_user_model_api_host, proxy_handler, unified_api_preflight_response, unified_model_test_curl,
-    user_model_proxy_handler, with_unified_api_cors,
+    is_user_model_api_host, model_route_test_timeout, proxy_handler,
+    unified_api_preflight_response, unified_model_test_curl, user_model_proxy_handler,
+    with_unified_api_cors,
 };
 use crate::recent_traffic::{RecentRequestEvent, RecentTrafficSnapshot};
 use crate::scheduling_signals::{
@@ -3459,38 +3460,45 @@ async fn reset_default_api_token(
     Ok(Json(state.store.reset_default_api_token(&email).await?))
 }
 
-async fn get_my_model_routing(
+pub(crate) async fn get_my_model_routing(
     State(state): State<ServerState>,
     headers: HeaderMap,
-) -> Result<Json<UserModelRoutingResponse>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     let email = require_session_email(&state, &headers).await?;
     let active_subdomains = state.proxy.active_subdomains().await.into_iter().collect();
-    Ok(Json(
-        state
-            .store
-            .get_user_model_routing(&state.config, &email, &active_subdomains)
-            .await?,
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(
+            state
+                .store
+                .get_user_model_routing(&state.config, &email, &active_subdomains)
+                .await?,
+        ),
     ))
 }
 
-async fn replace_my_model_routing(
+pub(crate) async fn replace_my_model_routing(
     State(state): State<ServerState>,
     headers: HeaderMap,
     Json(input): Json<ReplaceUserModelRoutingRequest>,
-) -> Result<Json<UserModelRoutingResponse>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     let email = require_session_email(&state, &headers).await?;
     let active_subdomains = state.proxy.active_subdomains().await.into_iter().collect();
-    Ok(Json(
-        state
-            .store
-            .replace_user_model_routing(
-                &state.config,
-                &email,
-                input.expected_revision,
-                input.routes,
-                &active_subdomains,
-            )
-            .await?,
+    // Same body as GET, including per-user recent results.
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(
+            state
+                .store
+                .replace_user_model_routing(
+                    &state.config,
+                    &email,
+                    input.expected_revision,
+                    input.routes,
+                    &active_subdomains,
+                )
+                .await?,
+        ),
     ))
 }
 
@@ -3500,18 +3508,55 @@ async fn test_my_model_routing(
     headers: HeaderMap,
     Json(input): Json<UserModelRoutingTestRequest>,
 ) -> Result<Json<UserModelRoutingTestResponse>, AppError> {
-    let email = require_session_email(&state, &headers).await?;
-    let user = state.store.ensure_user_by_email(&email).await?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    test_my_model_routing_at(state, peer, headers, input, deadline).await
+}
+
+pub(crate) async fn test_my_model_routing_at(
+    state: ServerState,
+    peer: SocketAddr,
+    headers: HeaderMap,
+    input: UserModelRoutingTestRequest,
+    deadline: tokio::time::Instant,
+) -> Result<Json<UserModelRoutingTestResponse>, AppError> {
     let probe = build_user_model_route_test_probe(&input.app_type, &input.requested_model)?;
     let curl = unified_model_test_curl(&state.config.tunnel_url("api"), &probe);
     let started = std::time::Instant::now();
-    match execute_user_model_route_test(state, peer, &user.id, &email, &probe).await {
+    let identity = tokio::time::timeout_at(deadline, async {
+        let email = require_session_email(&state, &headers).await?;
+        let user = state.store.ensure_user_by_email(&email).await?;
+        Ok::<_, AppError>((email, user))
+    })
+    .await
+    .unwrap_or_else(|_| Err(model_route_test_timeout()));
+    let outcome = match identity {
+        Ok((email, user)) => {
+            execute_user_model_route_test(
+                state,
+                peer,
+                &user.id,
+                &email,
+                &probe,
+                input.mode,
+                input.expected_revision,
+                deadline,
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    };
+    match outcome {
         Ok(outcome) => Ok(Json(UserModelRoutingTestResponse {
             success: outcome.success,
             app_type: probe.app_type,
             requested_model: probe.requested_model,
             curl,
-            target_share_id: Some(outcome.target_share_id),
+            target_share_id: outcome.target_share_id,
+            mode: input.mode,
+            revision: Some(outcome.revision),
+            route_id: Some(outcome.route_id),
+            attempts: Some(outcome.attempts),
+            body_state: Some(outcome.body_state),
             matched_wildcard: outcome.matched_wildcard,
             response: Some(UserModelRoutingTestHttp {
                 status_code: outcome.status_code,
@@ -3529,18 +3574,27 @@ async fn test_my_model_routing(
             code,
             message,
             details: _,
-        }) => Ok(Json(UserModelRoutingTestResponse {
-            success: false,
-            app_type: probe.app_type,
-            requested_model: probe.requested_model,
-            curl,
-            target_share_id: None,
-            matched_wildcard: false,
-            response: None,
-            duration_ms: started.elapsed().as_millis() as u64,
-            error: Some(message),
-            code: Some(code.to_string()),
-        })),
+        }) if input.mode == crate::models::ModelRouteTestMode::Primary
+            && input.expected_revision.is_none() =>
+        {
+            Ok(Json(UserModelRoutingTestResponse {
+                success: false,
+                app_type: probe.app_type,
+                requested_model: probe.requested_model,
+                curl,
+                target_share_id: None,
+                matched_wildcard: false,
+                response: None,
+                duration_ms: started.elapsed().as_millis() as u64,
+                error: Some(message),
+                code: Some(code.to_string()),
+                mode: input.mode,
+                revision: None,
+                route_id: None,
+                attempts: None,
+                body_state: None,
+            }))
+        }
         Err(error) => Err(error),
     }
 }

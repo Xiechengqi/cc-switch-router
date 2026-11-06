@@ -619,11 +619,17 @@ Router 先从协议路径确定 App，再用 `(user_id, app, requested model)` �
 
 优先级是静态的、一次查询即定终局的确定性选路，不是失败后的回退：第 1 级命中时第 2 级不参与，第 1 级未命中时也不存在“先试再退”的过程。两级都没有映射直接失败。
 
-无论命中哪一级，转发给 Share 的模型名**恒等于**客户端请求的模型名——Router 不改写请求体中的 `model`，由目标 Share 自行决定固定上游或继续透传。除用户显式写入的 `*` 记录外，绝不做模型改写、系统推断的默认 Share、按在线状态选 Share、前缀/后缀/正则/大小写不敏感匹配。`*` 命中的请求与精确命中走完全相同的 Share 存在性、App 开启状态、用户 ACL 与活动路由校验，同样 fail closed。找到映射后仍在当前数据库快照中重新检查 Share 存在性、App 开启状态和用户 ACL，再确认相同 Share ID 的活动内存路由，最后把请求交给既有 `proxy_handler`。后者会再次执行 Share edge ACL、并发、请求体限制、IngressContext、流式生命周期和响应清洗。
+无论命中哪一级，转发给 Share 的模型名**恒等于**客户端请求的模型名——Router 不改写请求体中的 `model`，由目标 Share 自行决定固定上游或继续透传。除用户显式写入的 `*` 记录外，绝不做模型改写、系统推断的默认 Share、按在线状态选 Share、前缀/后缀/正则/大小写不敏感匹配。`*` 命中的请求与精确命中走完全相同的 Share 存在性、App 开启状态、用户 ACL 与活动路由校验，同样 fail closed。找到映射后仍在当前数据库快照中对队列里每个目标重新检查 Share 存在性、App 开启状态和用户 ACL，转发前再确认该目标 Share ID 的活动内存路由，最后把请求交给既有 `proxy_handler`（队列语义见下文“候选切换”）。后者会再次执行 Share edge ACL、并发、请求体限制、IngressContext、流式生命周期和响应清洗。
 
-**候选切换（failover）**——每条路由可携带用户显式配置的有序候选目标列表（主目标为优先级 0，候选为优先级 1..=n）。转发时按优先级升序尝试：当前候选连接失败、超时或返回可重试状态码（401/403/429/5xx）时，自动切换到下一个候选。一旦任何响应字节已发给客户端，该次请求即锁死在当前候选，绝不切换（避免客户端收到拼接的两段响应）。候选耗尽时报错，fail closed——绝不臆造列表之外的目标。每个候选目标配有进程内存态熔断器（连续失败 3 次开启，冷却 60s 后半开单路探测），熔断仅由真实转发流量驱动，与 Share 健康探测解耦。候选列表是用户显式声明的，可见、可审计、可删除，不属于"系统推断的默认 Share"。
+**候选切换（failover）**——每条路由可携带用户显式配置的有序目标队列（首选位置 0，备选位置 1..=5）。按保存顺序检查资格、模型禁用、熔断和隧道在线状态。首选与备选被删除、撤权或 App 关闭时均跳过，不授权列表外目标。真实响应 401/403/429/500/502/503/504 可继续搜索后续候选，不包含 501/505。收到不可继续切换的响应头（包括 2xx）即锁定目标，不等待首个正文 byte；流式正文中断不切换、不拼接、不重放。上游可能已经部分执行失败尝试，用量按实际 Share 链路计量。
 
-队列最多 6 个目标，但每次推理请求最多执行 4 次实际转发尝试。离线、熔断或权限校验后排除的目标不消耗实际转发预算，因此队首若被跳过，仍可以尝试第五、第六项；四次转发均失败后不会继续尝试。该规则不改变模型列表的首选 Share 透传语义、既有状态码分类或流式响应锁定规则。
+熔断键是路由 ID 与 Share ID，实例内连续 3 次失败开启，冷却默认 60 秒，Retry-After 最长 600 秒，之后仅允许一个半开探测。离线跳过记失败；除 401/403/429 外的请求侧 4xx 为中性结果，不重置或增加计数。模型禁用在队列层提前跳过，底层再次检查以防竞态，本地拒绝不当作上游 403。取消、超时或中性探测会通过不可复制的代次许可释放占用，不会永久卡在半开。
+
+内存熔断状态最多 16384 个键；纯成功请求不建记录。Closed 空闲一小时清除；Open/HalfOpen 必须空闲及冷却结束均满一小时，且无在途许可才可清除。每 10 分钟清理，满额先清过期键，不驱逐有效状态；仍满时新键暂不跟踪并限频告警。保存成功后只移除删除规则/移除目标的键，单纯调序保留；旧 revision 回包不能复活配置已移除的键。重启清空，跨实例不共享。
+
+队列最多 6 个目标，每次推理请求最多 4 次实际转发，普通转发与图像流式提交均在上游发送点记账。资格、模型禁用、离线或熔断跳过不消耗预算。耗尽后优先返回最后一次真实尝试的响应；无真实响应但有未禁用目标离线/熔断时为 503；只有模型禁用及资格失效时为模型禁用 403；全部资格失效保留首选原错误。精确规则耗尽不跨到 `*`。模型列表透传与旧版 primary 测试仍只用首选。
+
+实时 metrics 可选导出 `modelRouteFailoverTotal` 与 `modelRouteFailoverWindowCount`；后者为实例内最近约 10 分钟的一秒桶有界窗口。计数表示可切换失败后实际开始的下一次上游转发；资格失效、模型禁用、熔断或离线跳过不增加计数。它不保证备选成功，continuedSearch 仍独立表示继续搜索事实。窗口达到 20 次产生 Router Owner 聚合告警（15 分钟防抖），不含用户/Share/模型；恢复仅表示滚动窗口低于阈值。历史 metrics 没有该字段，显示未知，不补 0，不变更 metrics schema。
 
 模型列表分两种模式，取决于该用户在该 App 下的路由配置形态。
 
@@ -659,9 +665,10 @@ Router 先从协议路径确定 App，再用 `(user_id, app, requested model)` �
 | 422 | `user_model_route_model_required` | 无法取得非空 requested model |
 | 400 | `user_model_route_model_pattern_unsupported` | 配置的模型名含 `*` 但不等于 `*`；Router 不支持模式匹配 |
 | 404 | `user_model_route_not_configured` | 精确键与该 App 的 `*` 全量路由都没有映射 |
-| 403 | `user_model_route_unauthorized` | 映射目标的用户权限已失效 |
-| 409 | `user_model_route_app_unavailable` | 目标不再绑定或开启该 App |
-| 503 | `user_model_route_target_unavailable` | Share 记录、subdomain 或活动路由不可用 |
+| 403 | `share_requested_model_blocked` | 队列中所有未失效目标都禁用了该模型，且没有离线或熔断的目标 |
+| 403 | `user_model_route_unauthorized` | 首选的用户权限已失效，且所有备选也都失效；只要有一个目标仍有资格就不返回该错误 |
+| 409 | `user_model_route_app_unavailable` | 首选不再绑定或开启该 App，且所有备选也都失效 |
+| 503 | `user_model_route_target_unavailable` | 首选 Share 已删除且所有备选失效；或仍有资格的目标全部离线、熔断，且没有可返回的真实上游响应 |
 
 Host 判断必须精确匹配 `api.<tunnel_domain>`（含配置中的端口语义），`nested.api...`、后缀拼接域名或不同端口都不能进入该分支。该 host 不提供 Dashboard、Session 控制面、Share Web、Client Web、`/_ctl/*` 或 `/_share-router/*`；未知路径不得落回静态 UI/catch-all。
 
@@ -670,6 +677,27 @@ Host 判断必须精确匹配 `api.<tunnel_domain>`（含配置中的端口语�
 入口请求体由统一 collector 读取一次并复用于模型路由、模型封禁检查和转发。默认首字节/有效数据空闲/上传总时限分别为 30/30/300 秒；旧 `REQUEST_BODY_TIMEOUT_SECS` 仍是总时限别名，新 `REQUEST_BODY_MAX_DURATION_SECS` 优先。入口错误的 `details.phase` 区分 `first_byte_timeout`、`idle_timeout`、`hard_timeout` 等；`requestId` 与响应 `x-cc-switch-ingress-request-id` 对应，`upstreamSent: false` 表示尚未发送到 Share。
 
 需要读取 JSON model/stream 时支持单层 `gzip`、`deflate`（zlib）和 `zstd` 的有界检查视图，保留原始 wire bytes、Content-Encoding、Content-Length 参与转发和 IngressContext 签名；图片 stream 提交沿用显式 JSON 重写路径，对重写后的内容签名。HTTP/1.x 对未读完 body 的早退响应关闭连接；HTTP/2 不发送 `Connection: close`，不关闭其他流。升级、观测及验收说明见 [入口上传超时运行手册](docs/runbook-ingress-body-timeouts.md)。
+
+
+### 9.4 模型路由测试与最近结果
+
+`GET /v1/me/model-routing` 通过 `testCapabilities` 协商测试能力。没有能力字段时，前端仅发送旧的 `{appType, requestedModel}` 首选测试请求，不自动降级或重放诊断请求。`POST /v1/me/model-routing/test` 的 `mode` 缺省为 `primary`；`saved_route` 必须带 `expectedRevision`，并与生产请求共用候选执行器和熔断状态。版本校验和选路读取同一快照，冲突返回外层 409，不调用上游。saved_route 每用户每实例 60 秒最多 3 次，限流返回 429 和 `Retry-After`，最多保留 4096 个窗口。
+
+旧两字段 primary 请求（无 `mode`、无 `expectedRevision`）的所有带错误码的失败——包括 403/404/409/503 选路错误和响应头超时——仍沿用旧形状：外层 200、`success=false`、`code` 为原错误码（超时为 `user_model_route_test_timeout`）。saved_route 或携带 `expectedRevision` 的 primary 按下表返回外层状态。GET 与 PUT `/v1/me/model-routing` 响应都带 `Cache-Control: no-store`。诊断限流在 Key 读取及请求构造成功后、候选执行前占用；开始执行后的失败不退额度。
+
+新形状测试请求（saved_route，或带 `expectedRevision` 的 primary）的外层错误：
+
+| HTTP | code | 场景 |
+|---|---|---|
+| 422 | — | `saved_route` 缺少 `expectedRevision` |
+| 409 | `model_routing_revision_conflict` | 已保存 revision 与 `expectedRevision` 不一致；`details` 含两者，不调用上游 |
+| 429 | — | saved_route 诊断限流，附 `Retry-After` |
+| 504 | `user_model_route_test_timeout` | 30 秒总时限内未拿到响应头；`details.incomplete`、`details.mayHaveUsage` 为 true |
+| 403/404/409/503 | 同 9.3 推理错误表 | 选路失败；primary 模式报告首选自身的错误 |
+
+测试使用正常用户 Key，正常计量；三个协议都设置 32 个输出 token 上限，这不是总用量或费用上限。测试从 API 执行开始共享 30 秒绝对 deadline，覆盖认证与用户查询（包括等待 Store 锁）、选路、Key 获取、候选转发和正文读取。等待响应头超时返回 504，并标注 `incomplete`、`mayHaveUsage`。正文预览至多 16 KiB，`bodyState` 区分 complete/truncated/read_error/timeout；只有 HTTP 2xx 且正文完整才标记 success。正文超时保留已有响应头和预览。网络失败不自动重试。
+
+`routeRecentResults` 是当前实例每条规则最近一次观测，最多 4096 条、保留一小时。普通请求仅记录响应头事实，诊断另记录正文读取状态。请求开始序号、账号及配置 revision 的内存代次隔离迟到结果，配置保存清理旧结果。进行中的请求不清空上一条已完成观测；新请求取消也不允许更早请求覆盖它。过期由服务端判断，客户端时钟不参与。继续寻找候选（continuedSearch）与返回备选响应头（usedBackup）均不代表完整调用成功；重启清空，多实例记录不完整。没有记录显示未知，不推断备选已接管。
 
 ---
 

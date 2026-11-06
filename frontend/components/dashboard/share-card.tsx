@@ -1,5 +1,7 @@
 "use client";
 
+import { RoutingShareDependencies } from "./model-hub-dependencies";
+
 import { ClientShareMarketEntryButton } from "./client-share-market";
 
 import { Card, toast } from "@heroui/react";
@@ -349,6 +351,7 @@ export const ShareCard = React.memo(function ShareCard({
         </div>
 
         <ShareProviderStatusPanel view={providerPanelView} wrapPrimaryLine />
+        <div data-no-row-drawer><RoutingShareDependencies shareId={share.shareId} t={t} /></div>
 
         {directApiUrl ? (
           <div className="grid min-w-0 gap-1.5 border-t border-slate-100 pt-2">

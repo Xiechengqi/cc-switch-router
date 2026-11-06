@@ -1,5 +1,9 @@
 "use client";
 
+import { RoutingDependencyContext } from "./model-hub-dependencies";
+import { buildShareDependencies } from "@/lib/model-routing";
+import { modelRouteEditorId } from "./model-hub-rule-editor";
+
 import { Button, Card, Drawer, toast } from "@heroui/react";
 import { ArrowRightLeft, ChevronDown, Copy, ListFilter, MessageCircle, Plus, ScrollText, Search, Terminal, X } from "lucide-react";
 import * as React from "react";
@@ -669,7 +673,7 @@ export function ClientBoard({
   );
   const modelRouting = useModelRoutingController(
     hasViewerIdentity && statusFilter === "mine",
-    sessionEmail,
+    hasViewerIdentity ? sessionEmail : "",
   );
   const [sortOrder, setSortOrder] = usePersistentState("cc_switch_router_client_sort_v1", "tokens");
   const [expandedClientIds, setExpandedClientIds] = usePersistentState<string[] | null>(
@@ -680,11 +684,13 @@ export function ClientBoard({
   const lastLocatedFocusRef = React.useRef("");
   const consumedModelRouteDeepLinkRef = React.useRef("");
 
-  const selectClientListTab = React.useCallback((tab: ClientListTab) => {
+  const selectClientListTab = React.useCallback((tab: ClientListTab, options?: { issuesOnly?: boolean }) => {
+    if (options?.issuesOnly != null) setIssuesOnly(options.issuesOnly);
+    else if (tab === "mine" || tab === "online") setIssuesOnly(false);
     if (tab !== "mine") setStatusFilter(tab);
     setUrlMine(tab === "mine");
     replaceClientListTabQuery(tab);
-  }, [setStatusFilter]);
+  }, [setStatusFilter, setIssuesOnly]);
 
   const loadMarketRentals = React.useCallback(async () => {
     if (!authed) {
@@ -718,10 +724,6 @@ export function ClientBoard({
   React.useEffect(() => {
     setUrlMine(windowHasMineClientListTab());
   }, []);
-
-  React.useEffect(() => {
-    if (issuesOnly) selectClientListTab("all");
-  }, [issuesOnly, selectClientListTab]);
 
   const sortedClients = React.useMemo(() => sortClients(clients), [clients]);
   const defaultExpandedClientId = sortedClients.reduce<DashboardClient | undefined>((best, client) => {
@@ -1013,7 +1015,7 @@ export function ClientBoard({
     return () => window.removeEventListener("pointerdown", onPointerDown);
   }, [filtersOpen]);
 
-  const [hubForceExpanded, setHubForceExpanded] = React.useState(false);
+  const [hubForceExpanded, setHubForceExpanded] = React.useState(0);
   const [hubFocusProtocol, setHubFocusProtocol] = React.useState<ModelRoutingProtocol | null>(null);
   const addModelRouteForShare = React.useCallback((shareId: string) => {
     if (modelRouting.routes.length >= MAX_USER_MODEL_ROUTES) {
@@ -1022,7 +1024,7 @@ export function ClientBoard({
     }
     const appType = modelRouting.addRouteForShare(shareId);
     if (appType) setHubFocusProtocol(appType);
-    setHubForceExpanded(true);
+    setHubForceExpanded(value => value + 1);
     window.requestAnimationFrame(() => {
       document.getElementById("model-hub")?.scrollIntoView({
         behavior: preferredScrollBehavior(),
@@ -1078,6 +1080,22 @@ export function ClientBoard({
     return byShare;
   }, [modelRouting.routes]);
 
+  const dependencySummaries = React.useMemo(() => buildShareDependencies(
+    modelRouting.dirty ? "draft" : "saved", modelRouting.routes, modelRouting.profile?.eligibleShares || []),
+    [modelRouting.dirty, modelRouting.routes, modelRouting.profile?.eligibleShares]);
+  const locateDependencyRule = (clientId: string) => {
+    const route = modelRouting.routes.find(item => item.clientId === clientId);
+    // A rule deleted in the draft has no editor left; fall back to the rule list.
+    if (route) setHubFocusProtocol(route.appType as ModelRoutingProtocol);
+    setHubForceExpanded(value => value + 1);
+    const focus = (retry = true) => {
+      const node = document.getElementById(route ? modelRouteEditorId(clientId) : "model-hub");
+      if (!node && retry) { requestAnimationFrame(() => focus(false)); return; }
+      node?.scrollIntoView({ block: "nearest" });
+      node?.focus({ preventScroll: true });
+    };
+    requestAnimationFrame(() => focus());
+  };
   const activeFilterCount = regionFilters.length;
   const clientTabs: Array<{ value: ClientListTab; label: string; count: number }> = [
     ...(hasViewerIdentity ? [{ value: "mine" as const, label: t("dashboard.mine"), count: clientSummary.mine }] : []),
@@ -1091,12 +1109,13 @@ export function ClientBoard({
   const mineFilterEmpty = statusFilter === "mine" && !mineIsEmpty && visibleMineShares.length === 0;
 
   return (
+    <RoutingDependencyContext.Provider value={statusFilter === "mine" ? { summaries: dependencySummaries, shares: modelRouting.profile?.eligibleShares || [], view: modelRouting.dirty ? "draft" : "saved", onLocate: locateDependencyRule } : null}>
     <section className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-4">
       <div className="flex min-w-0 flex-wrap items-center justify-between gap-4">
         <div className="flex w-full min-w-0 flex-wrap items-center gap-3 sm:w-auto">
           <div className="inline-flex max-w-full overflow-x-auto rounded-lg bg-slate-100 p-1 text-[11px]">
             {clientTabs.map(({ value, label, count }) => (
-              <button key={value} type="button" aria-pressed={statusFilter === value} onClick={() => { selectClientListTab(value); if (value === "mine" || value === "online") setIssuesOnly(false); }} className={`rounded-md px-2.5 py-1.5 transition-colors ${statusFilter === value ? "bg-white font-medium text-foreground shadow-sm" : value === "mine" ? "text-primary" : value === "offline" ? "text-rose-700" : value === "reconnecting" ? "text-sky-700" : value === "degraded" ? "text-amber-700" : "text-muted-foreground"}`}>{label} · {count}</button>
+              <button key={value} type="button" aria-pressed={statusFilter === value} onClick={() => selectClientListTab(value)} className={`rounded-md px-2.5 py-1.5 transition-colors ${statusFilter === value ? "bg-white font-medium text-foreground shadow-sm" : value === "mine" ? "text-primary" : value === "offline" ? "text-rose-700" : value === "reconnecting" ? "text-sky-700" : value === "degraded" ? "text-amber-700" : "text-muted-foreground"}`}>{label} · {count}</button>
             ))}
           </div>
           {statusFilter === "mine" ? null : (
@@ -1392,5 +1411,6 @@ export function ClientBoard({
         onOpenChange={(open) => !open && setLogClientId("")}
       />
     </section>
+    </RoutingDependencyContext.Provider>
   );
 }

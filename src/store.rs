@@ -681,6 +681,10 @@ pub struct UserApiTokenPrincipal {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserModelRouteResolution {
+    pub observation_generation: Option<u64>,
+    pub user_id: String,
+    pub revision: u64,
+    pub primary_unavailable: Option<ModelRoutePrimaryUnavailable>,
     pub target_share_id: String,
     pub subdomain: String,
     /// True when the request fell through to the user's explicit `*` route for
@@ -698,6 +702,44 @@ pub struct UserModelRouteResolution {
 pub struct RouteCandidate {
     pub target_share_id: String,
     pub subdomain: String,
+    pub priority: usize,
+    pub unavailable: Option<ModelRoutePrimaryUnavailable>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelRoutePrimaryUnavailable {
+    Missing,
+    AppUnavailable,
+    Unauthorized,
+}
+
+impl ModelRoutePrimaryUnavailable {
+    pub fn error(self, target: &str, app: &str) -> AppError {
+        use axum::http::StatusCode;
+        let (status, code, message) = match self {
+            Self::Missing => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "user_model_route_target_unavailable",
+                "configured target Share is unavailable",
+            ),
+            Self::AppUnavailable => (
+                StatusCode::CONFLICT,
+                "user_model_route_app_unavailable",
+                "configured target Share no longer supports this app",
+            ),
+            Self::Unauthorized => (
+                StatusCode::FORBIDDEN,
+                "user_model_route_unauthorized",
+                "configured target Share is no longer authorized for this user",
+            ),
+        };
+        let details = if self == Self::AppUnavailable {
+            serde_json::json!({"targetShareId": target, "appType": app})
+        } else {
+            serde_json::json!({"targetShareId": target})
+        };
+        model_routing_error(status, code, message, details)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -910,6 +952,9 @@ fn build_dashboard_country_aggregation(
 #[derive(Clone)]
 pub struct AppStore {
     pub(crate) conn: Arc<Mutex<Connection>>,
+    /// Shared by all Store clones: configuration commits fence late outcomes.
+    pub route_breakers: Arc<crate::route_breaker::RouteBreakerRegistry>,
+    pub model_route_runtime: Arc<crate::model_route_runtime::ModelRouteRuntime>,
     database_health: DatabaseHealthHandle,
     database_sync: DatabaseSyncHandle,
     auth_email_send_locks: Arc<Mutex<HashMap<(String, String), Weak<Mutex<()>>>>>,
@@ -1725,6 +1770,8 @@ impl AppStore {
         let database_sync = conn.sync_handle();
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            route_breakers: Arc::new(crate::route_breaker::RouteBreakerRegistry::new()),
+            model_route_runtime: Arc::new(crate::model_route_runtime::ModelRouteRuntime::default()),
             database_health,
             database_sync,
             auth_email_send_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -1982,6 +2029,8 @@ impl AppStore {
         let database_sync = conn.sync_handle();
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            route_breakers: Arc::new(crate::route_breaker::RouteBreakerRegistry::new()),
+            model_route_runtime: Arc::new(crate::model_route_runtime::ModelRouteRuntime::default()),
             database_health,
             database_sync,
             auth_email_send_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -7818,7 +7867,14 @@ impl AppStore {
         let now = Utc::now();
         let conn = self.conn.lock().await;
         let user = upsert_user_by_email(&conn, &email, now)?;
-        load_user_model_routing_response(&conn, config, &user.id, &email, active_subdomains)
+        load_user_model_routing_response(
+            &conn,
+            config,
+            &user.id,
+            &email,
+            active_subdomains,
+            &self.model_route_runtime,
+        )
     }
 
     pub async fn replace_user_model_routing(
@@ -7878,6 +7934,7 @@ impl AppStore {
                 &user.id,
                 &email,
                 active_subdomains,
+                &self.model_route_runtime,
             );
         }
         let existing_by_key = existing
@@ -7889,6 +7946,10 @@ impl AppStore {
                 )
             })
             .collect::<HashMap<_, _>>();
+
+        let old_route_ids: HashSet<String> =
+            existing_by_key.values().map(|r| r.id.clone()).collect();
+        let mut current_breaker_keys = HashSet::new();
 
         for route in &routes {
             let unchanged_target = existing_by_key
@@ -7932,12 +7993,16 @@ impl AppStore {
                 }
             }
             // Keeping the primary must not skip validation of newly added
-            // backups. Preserve old unavailable entries so unrelated routes
-            // can still be repaired; invocation always rechecks live access.
+            // backups. Preserve old unavailable entries, including a primary
+            // demoted to a backup, so routes can still be repaired; invocation
+            // always rechecks live access.
             for candidate in &route.candidates {
                 if existing_by_key
                     .get(&(route.app_type.clone(), route.requested_model.clone()))
-                    .is_some_and(|existing| existing.candidates.contains(candidate))
+                    .is_some_and(|existing| {
+                        existing.target_share_id == *candidate
+                            || existing.candidates.contains(candidate)
+                    })
                 {
                     continue;
                 }
@@ -8003,6 +8068,10 @@ impl AppStore {
             let route_id = existing
                 .map(|record| record.id.clone())
                 .unwrap_or_else(|| Uuid::new_v4().to_string());
+            current_breaker_keys.insert((route_id.clone(), route.target_share_id.clone()));
+            for target in &route.candidates {
+                current_breaker_keys.insert((route_id.clone(), target.clone()));
+            }
             tx.execute(
                 "INSERT INTO user_model_routes (
                     id, user_id, app_type, requested_model, target_share_id, created_at, updated_at
@@ -8066,7 +8135,83 @@ impl AppStore {
         tx.commit()
             .map_err(|e| AppError::Internal(format!("commit model routing update failed: {e}")))?;
 
-        load_user_model_routing_response(&conn, config, &user.id, &email, active_subdomains)
+        self.route_breakers
+            .retain_configuration(&old_route_ids, &current_breaker_keys);
+        self.model_route_runtime.remove_routes(&old_route_ids);
+
+        load_user_model_routing_response(
+            &conn,
+            config,
+            &user.id,
+            &email,
+            active_subdomains,
+            &self.model_route_runtime,
+        )
+    }
+
+    /// Lock order is Store -> registry. No registry lock is held across await.
+    pub async fn record_user_model_route_outcome(
+        &self,
+        resolution: &UserModelRouteResolution,
+        target: &str,
+        guard: Option<crate::route_breaker::ProbePermitGuard>,
+        outcome: crate::route_breaker::BreakerOutcome,
+    ) {
+        if !self
+            .route_breakers
+            .needs_record(&resolution.route_id, target, outcome)
+        {
+            return;
+        }
+        let conn = self.conn.lock().await;
+        let current = conn.query_row(
+            "SELECT p.revision FROM user_model_routing_profiles p
+             JOIN user_model_routes r ON r.user_id = p.user_id
+             WHERE r.id = ?1 AND r.user_id = ?2
+               AND (r.target_share_id = ?3 OR EXISTS (
+                 SELECT 1 FROM user_model_route_candidates c WHERE c.route_id = r.id AND c.target_share_id = ?3))",
+            params![resolution.route_id, resolution.user_id, target], |row| row.get::<_, i64>(0),
+        ).optional();
+        match current {
+            Ok(Some(revision)) if u64::try_from(revision).ok() == Some(resolution.revision) => {
+                self.route_breakers
+                    .record(&resolution.route_id, target, guard, outcome);
+            }
+            Ok(_) => {} // Old configuration: guard Drop releases only its own probe.
+            Err(error) => {
+                if self.model_route_runtime.should_warn_error() {
+                    tracing::warn!(%error, "model route outcome version check failed; further warnings suppressed for 60s");
+                }
+            }
+        }
+    }
+
+    pub fn begin_user_model_route_observation(
+        &self,
+        resolution: &UserModelRouteResolution,
+        sequence: u64,
+    ) {
+        self.model_route_runtime.begin(
+            &resolution.user_id,
+            &resolution.route_id,
+            resolution.revision,
+            resolution.observation_generation,
+            sequence,
+        );
+    }
+
+    pub fn record_user_model_route_observation(
+        &self,
+        resolution: &UserModelRouteResolution,
+        sequence: u64,
+        result: crate::models::ModelRouteRecentResult,
+    ) {
+        self.model_route_runtime.finish(
+            &resolution.user_id,
+            resolution.observation_generation,
+            sequence,
+            result,
+        );
     }
 
     pub async fn resolve_user_model_route(
@@ -8076,10 +8221,49 @@ impl AppStore {
         app_type: &str,
         requested_model: &str,
     ) -> Result<Option<UserModelRouteResolution>, AppError> {
+        self.resolve_user_model_route_at_revision(
+            user_id,
+            user_email,
+            app_type,
+            requested_model,
+            None,
+        )
+        .await
+    }
+
+    pub async fn resolve_user_model_route_at_revision(
+        &self,
+        user_id: &str,
+        user_email: &str,
+        app_type: &str,
+        requested_model: &str,
+        expected_revision: Option<u64>,
+    ) -> Result<Option<UserModelRouteResolution>, AppError> {
         let email = normalize_email(user_email)?;
         let app_type = normalize_share_app(app_type)?;
         let requested_model = normalize_requested_model(requested_model)?;
         let conn = self.conn.lock().await;
+        if let Some(expected) = expected_revision {
+            let revision = conn
+                .query_row(
+                    "SELECT revision FROM user_model_routing_profiles WHERE user_id = ?1",
+                    params![user_id],
+                    |row| row.get::<_, u64>(0),
+                )
+                .optional()
+                .map_err(|error| {
+                    AppError::Internal(format!("read model routing revision failed: {error}"))
+                })?
+                .unwrap_or(0);
+            if revision != expected {
+                return Err(model_routing_error(
+                    axum::http::StatusCode::CONFLICT,
+                    "model_routing_revision_conflict",
+                    "model routing was changed; reload before testing",
+                    serde_json::json!({"expectedRevision":expected,"currentRevision":revision}),
+                ));
+            }
+        }
         // One statement covers route selection *and* the target's current Share
         // state. Every inference request takes the single global connection lock,
         // so halving the round trips under it halves the serialized work on the
@@ -8110,7 +8294,9 @@ impl AppStore {
                         EXISTS (
                             SELECT 1 FROM share_bindings b
                             WHERE b.share_id = r.target_share_id AND b.app_type = ?2
-                        )
+                        ),
+                        r.id,
+                        COALESCE((SELECT revision FROM user_model_routing_profiles p WHERE p.user_id = r.user_id), 0)
                  FROM user_model_routes r
                  LEFT JOIN shares s ON s.share_id = r.target_share_id
                  WHERE r.user_id = ?1 AND r.app_type = ?2
@@ -8122,12 +8308,12 @@ impl AppStore {
                     let matched_model = row.get::<_, String>(0)?;
                     let target_share_id = row.get::<_, String>(1)?;
                     let target = read_model_route_target(row, 2)?;
-                    Ok((matched_model, target_share_id, target))
+                    Ok((matched_model, target_share_id, target, row.get::<_, String>(11)?, row.get::<_, u64>(12)?))
                 },
             )
             .optional()
             .map_err(|e| AppError::Internal(format!("resolve user model route failed: {e}")))?;
-        let Some((matched_model, target_share_id, target)) = matched else {
+        let Some((matched_model, target_share_id, target, route_id, revision)) = matched else {
             return Ok(None);
         };
         // A client asking literally for `*` matches the wildcard row by exact
@@ -8136,45 +8322,43 @@ impl AppStore {
         let matched_wildcard = matched_model == WILDCARD_REQUESTED_MODEL;
         // The primary target is settled above; now load the route's ordered
         // failover candidates so the proxy can advance without another query.
-        let route_id: String = conn
-            .query_row(
-                "SELECT id FROM user_model_routes
-                 WHERE user_id = ?1 AND app_type = ?2 AND requested_model = ?3",
-                params![user_id, app_type, matched_model],
-                |row| row.get(0),
-            )
-            .map_err(|e| AppError::Internal(format!("resolve route id failed: {e}")))?;
         let candidates = load_route_candidates(&conn, &route_id, &email, &app_type)?;
-        match classify_model_route_target(target, &email, &app_type) {
-            ModelRouteTargetAccess::Eligible { subdomain } => Ok(Some(UserModelRouteResolution {
-                target_share_id,
-                subdomain,
-                matched_wildcard,
-                route_id,
-                candidates,
-            })),
-            ModelRouteTargetAccess::Missing => Err(model_routing_error(
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                "user_model_route_target_unavailable",
-                "configured target Share is unavailable",
-                serde_json::json!({ "targetShareId": target_share_id }),
-            )),
-            ModelRouteTargetAccess::AppUnavailable => Err(model_routing_error(
-                axum::http::StatusCode::CONFLICT,
-                "user_model_route_app_unavailable",
-                "configured target Share no longer supports this app",
-                serde_json::json!({
-                    "targetShareId": target_share_id,
-                    "appType": app_type,
-                }),
-            )),
-            ModelRouteTargetAccess::Unauthorized => Err(model_routing_error(
-                axum::http::StatusCode::FORBIDDEN,
-                "user_model_route_unauthorized",
-                "configured target Share is no longer authorized for this user",
-                serde_json::json!({ "targetShareId": target_share_id }),
-            )),
+        let (subdomain, primary_unavailable) =
+            match classify_model_route_target(target, &email, &app_type) {
+                ModelRouteTargetAccess::Eligible { subdomain } => (subdomain, None),
+                ModelRouteTargetAccess::Missing => {
+                    (String::new(), Some(ModelRoutePrimaryUnavailable::Missing))
+                }
+                ModelRouteTargetAccess::AppUnavailable => (
+                    String::new(),
+                    Some(ModelRoutePrimaryUnavailable::AppUnavailable),
+                ),
+                ModelRouteTargetAccess::Unauthorized => (
+                    String::new(),
+                    Some(ModelRoutePrimaryUnavailable::Unauthorized),
+                ),
+            };
+        if !candidates
+            .iter()
+            .any(|candidate| candidate.unavailable.is_none())
+        {
+            if let Some(reason) = primary_unavailable {
+                return Err(reason.error(&target_share_id, &app_type));
+            }
         }
+        Ok(Some(UserModelRouteResolution {
+            observation_generation: self
+                .model_route_runtime
+                .register(user_id, &route_id, revision),
+            user_id: user_id.into(),
+            revision,
+            primary_unavailable,
+            target_share_id,
+            subdomain,
+            matched_wildcard,
+            route_id,
+            candidates,
+        }))
     }
 
     /// Resolves the target of a *pure passthrough* app, if this is one.
@@ -8246,8 +8430,8 @@ impl AppStore {
         // path still fails closed with the precise reason.
         match classify_model_route_target(target, &email, &app_type) {
             ModelRouteTargetAccess::Eligible { subdomain } => {
-                // Surface the route id + ordered candidates so a forwarded
-                // catalog request can advance on failure just like inference.
+                // Catalog passthrough uses only the primary; candidates do not
+                // change the selected Share's catalog or its failure response.
                 let route_id: String = conn
                     .query_row(
                         "SELECT id FROM user_model_routes
@@ -8260,6 +8444,20 @@ impl AppStore {
                     })?;
                 let candidates = load_route_candidates(&conn, &route_id, &email, &app_type)?;
                 Ok(Some(UserModelRouteResolution {
+                    observation_generation: None,
+                    user_id: user_id.into(),
+                    revision: conn
+                        .query_row(
+                            "SELECT revision FROM user_model_routing_profiles WHERE user_id = ?1",
+                            params![user_id],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                        .map_err(|e| {
+                            AppError::Internal(format!("read route revision failed: {e}"))
+                        })?
+                        .unwrap_or(0),
+                    primary_unavailable: None,
                     target_share_id,
                     subdomain,
                     matched_wildcard: true,
@@ -29273,6 +29471,7 @@ fn load_user_model_routing_response(
     user_id: &str,
     email: &str,
     active_subdomains: &HashSet<String>,
+    runtime: &crate::model_route_runtime::ModelRouteRuntime,
 ) -> Result<UserModelRoutingResponse, AppError> {
     let profile = conn
         .query_row(
@@ -29364,6 +29563,12 @@ fn load_user_model_routing_response(
             .cmp(&right.share_name)
             .then_with(|| left.share_id.cmp(&right.share_id))
     });
+    let revision = profile
+        .as_ref()
+        .and_then(|(revision, _)| u64::try_from(*revision).ok())
+        .unwrap_or_default();
+    let route_ids = routes.iter().map(|route| route.id.clone()).collect();
+    let route_recent_results = runtime.results(user_id, revision, &route_ids);
     Ok(UserModelRoutingResponse {
         enabled: !routes.is_empty(),
         api_base_url: config.tunnel_url("api"),
@@ -29374,6 +29579,8 @@ fn load_user_model_routing_response(
         routes,
         eligible_shares,
         updated_at: profile.map(|(_, updated_at)| updated_at),
+        test_capabilities: crate::models::ModelRouteTestCapabilities::default(),
+        route_recent_results,
     })
 }
 
@@ -29485,8 +29692,8 @@ fn inspect_model_route_target(
 }
 
 /// Loads the ordered failover candidates for one route, each live-validated
-/// against the current Share snapshot. Ineligible candidates are skipped so
-/// the proxy's retry loop only walks usable targets.
+/// against the current Share snapshot. Retain ineligible entries and their
+/// original priority so diagnostics never invent positions after filtering.
 fn load_route_candidates(
     conn: &Connection,
     route_id: &str,
@@ -29507,7 +29714,8 @@ fn load_route_candidates(
                     EXISTS (
                         SELECT 1 FROM share_bindings b
                         WHERE b.share_id = c.target_share_id AND b.app_type = ?3
-                    )
+                    ),
+                    c.priority
              FROM user_model_route_candidates c
              LEFT JOIN shares s ON s.share_id = c.target_share_id
              WHERE c.route_id = ?1
@@ -29518,21 +29726,33 @@ fn load_route_candidates(
         .query_map(params![route_id, email, app_type], |row| {
             let target_share_id = row.get::<_, String>(0)?;
             let target = read_model_route_target(row, 1)?;
-            Ok((target_share_id, target))
+            Ok((target_share_id, target, row.get::<_, usize>(10)?))
         })
         .map_err(|e| AppError::Internal(format!("query route candidates failed: {e}")))?;
     let mut candidates = Vec::new();
     for row in rows {
-        let (target_share_id, target) =
+        let (target_share_id, target, priority) =
             row.map_err(|e| AppError::Internal(format!("read route candidates failed: {e}")))?;
-        if let ModelRouteTargetAccess::Eligible { subdomain } =
-            classify_model_route_target(target, email, app_type)
-        {
-            candidates.push(RouteCandidate {
-                target_share_id,
-                subdomain,
-            });
-        }
+        let (subdomain, unavailable) = match classify_model_route_target(target, email, app_type) {
+            ModelRouteTargetAccess::Eligible { subdomain } => (subdomain, None),
+            ModelRouteTargetAccess::Missing => {
+                (String::new(), Some(ModelRoutePrimaryUnavailable::Missing))
+            }
+            ModelRouteTargetAccess::AppUnavailable => (
+                String::new(),
+                Some(ModelRoutePrimaryUnavailable::AppUnavailable),
+            ),
+            ModelRouteTargetAccess::Unauthorized => (
+                String::new(),
+                Some(ModelRoutePrimaryUnavailable::Unauthorized),
+            ),
+        };
+        candidates.push(RouteCandidate {
+            target_share_id,
+            subdomain,
+            priority,
+            unavailable,
+        });
     }
     Ok(candidates)
 }
@@ -32726,7 +32946,7 @@ pub(crate) mod tests {
     async fn failover_candidates_validate_new_backups_even_with_an_unchanged_primary() {
         let (store, config) = setup_store("model-routing-backup-permissions").await;
         insert_installation(&store, "candidate-installation").await;
-        for id in ["primary", "backup", "unauthorized", "wrong-app"] {
+        for id in ["primary", "backup", "unauthorized", "wrong-app", "healthy"] {
             insert_share(&store, "candidate-installation", id, id, "active").await;
         }
         {
@@ -32836,8 +33056,11 @@ pub(crate) mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            resolution.candidates.is_empty(),
-            "retained unavailable backups are never invoked"
+            resolution
+                .candidates
+                .iter()
+                .all(|candidate| candidate.unavailable.is_some()),
+            "retained unavailable backups are explicit skips"
         );
         let promoted = UserModelRouteInput {
             target_share_id: "backup".into(),
@@ -32855,6 +33078,34 @@ pub(crate) mod tests {
                 )
                 .await
                 .is_err()
+        );
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET owner_email='another@example.test' WHERE share_id='primary'",
+                [],
+            )
+            .unwrap();
+        }
+        let demoted = store
+            .replace_user_model_routing(
+                &config,
+                "owner@example.com",
+                3,
+                vec![UserModelRouteInput {
+                    app_type: "codex".into(),
+                    requested_model: "*".into(),
+                    target_share_id: "healthy".into(),
+                    candidates: vec!["primary".into(), "backup".into()],
+                }],
+                &HashSet::new(),
+            )
+            .await
+            .expect("a kept unavailable primary may move down to a backup");
+        assert_eq!(demoted.revision, 4);
+        assert_eq!(
+            demoted.routes[0].candidates,
+            vec!["primary".to_string(), "backup".to_string()]
         );
         let _ = std::fs::remove_file(&config.database.path);
     }
@@ -58999,5 +59250,222 @@ pub(crate) mod tests {
         assert!(store.is_requested_model_blocked("share-1", "claude", "claude-opus-4-6"));
         assert!(!store.is_requested_model_blocked("share-1", "claude", "Claude-Opus-4-6"));
         assert!(!store.is_requested_model_blocked("share-1", "codex", "claude-opus-4-6"));
+    }
+    #[tokio::test]
+    async fn model_routing_store_revision_and_configuration_cleanup_preserve_only_current_keys() {
+        let (store, config) = setup_store("model-routing-runtime-fences").await;
+        insert_installation(&store, "runtime-inst").await;
+        for id in ["a", "b", "c"] {
+            insert_share(&store, "runtime-inst", id, id, "active").await;
+        }
+        let mut route = UserModelRouteInput {
+            app_type: "codex".into(),
+            requested_model: "*".into(),
+            target_share_id: "a".into(),
+            candidates: vec!["b".into(), "c".into()],
+        };
+        let first = store
+            .replace_user_model_routing(
+                &config,
+                "owner@example.com",
+                0,
+                vec![route.clone()],
+                &HashSet::new(),
+            )
+            .await
+            .unwrap();
+        let user = store
+            .ensure_user_by_email("owner@example.com")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .resolve_user_model_route_at_revision(
+                    &user.id,
+                    "owner@example.com",
+                    "codex",
+                    "model",
+                    Some(0)
+                )
+                .await
+                .is_err()
+        );
+        let old = store
+            .resolve_user_model_route_at_revision(
+                &user.id,
+                "owner@example.com",
+                "codex",
+                "model",
+                Some(1),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        for id in ["a", "b", "c"] {
+            for _ in 0..3 {
+                store
+                    .route_breakers
+                    .record_failure(&first.routes[0].id, id, None);
+            }
+        }
+        route.candidates = vec!["c".into(), "b".into()];
+        let reordered = store
+            .replace_user_model_routing(
+                &config,
+                "owner@example.com",
+                1,
+                vec![route.clone()],
+                &HashSet::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reordered.routes[0].id, first.routes[0].id);
+        for id in ["a", "b", "c"] {
+            assert!(store.route_breakers.is_open(&old.route_id, id));
+        }
+        let current = store
+            .resolve_user_model_route_at_revision(
+                &user.id,
+                "owner@example.com",
+                "codex",
+                "model",
+                Some(2),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(old.observation_generation, current.observation_generation);
+        let seq = store.model_route_runtime.next_sequence().unwrap();
+        store.begin_user_model_route_observation(&current, seq);
+        store.begin_user_model_route_observation(&old, seq + 1);
+        let make_result = |resolution: &UserModelRouteResolution, sequence: u64| {
+            crate::models::ModelRouteRecentResult {
+                route_id: resolution.route_id.clone(),
+                revision: resolution.revision,
+                request_sequence: sequence.to_string(),
+                observed_at: Utc::now(),
+                source: "request",
+                phase: "response_headers",
+                target_share_id: Some("a".into()),
+                position: Some(0),
+                status_code: 200,
+                continued_search: false,
+                used_backup: false,
+                body_state: None,
+            }
+        };
+        store.record_user_model_route_observation(&old, seq + 1, make_result(&old, seq + 1));
+        store.record_user_model_route_observation(&current, seq, make_result(&current, seq));
+        assert_eq!(
+            store
+                .model_route_runtime
+                .results(&user.id, 2, &HashSet::from([old.route_id.clone()]))
+                .len(),
+            1
+        );
+        // A no-op save preserves both the revision and process-local state.
+        let unchanged = store
+            .replace_user_model_routing(
+                &config,
+                "owner@example.com",
+                2,
+                vec![route.clone()],
+                &HashSet::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unchanged.revision, 2);
+        assert_eq!(unchanged.route_recent_results.len(), 1);
+        // An actual database rollback, even after replacing route rows, must not
+        // publish a generation or clean up breakers/observations.
+        {
+            let conn = store.conn.lock().await;
+            conn.execute("CREATE TRIGGER reject_model_route_event BEFORE INSERT ON user_model_route_events BEGIN SELECT RAISE(ABORT, 'fixture rollback'); END", []).unwrap();
+        }
+        assert!(
+            store
+                .replace_user_model_routing(
+                    &config,
+                    "owner@example.com",
+                    2,
+                    vec![],
+                    &HashSet::new(),
+                )
+                .await
+                .is_err()
+        );
+        {
+            let conn = store.conn.lock().await;
+            conn.execute("DROP TRIGGER reject_model_route_event", [])
+                .unwrap();
+        }
+        let rolled_back = store
+            .get_user_model_routing(&config, "owner@example.com", &HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(rolled_back.revision, 2);
+        assert_eq!(rolled_back.routes[0].id, old.route_id);
+        assert_eq!(rolled_back.route_recent_results.len(), 1);
+        for id in ["a", "b", "c"] {
+            assert!(store.route_breakers.is_open(&old.route_id, id));
+        }
+        // A rejected revision must not invalidate the current generation either.
+        assert!(
+            store
+                .replace_user_model_routing(
+                    &config,
+                    "owner@example.com",
+                    1,
+                    vec![],
+                    &HashSet::new()
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .resolve_user_model_route(&user.id, "owner@example.com", "codex", "model")
+                .await
+                .unwrap()
+                .unwrap()
+                .observation_generation,
+            current.observation_generation
+        );
+        route.target_share_id = "b".into();
+        route.candidates = vec!["c".into()];
+        store
+            .replace_user_model_routing(
+                &config,
+                "owner@example.com",
+                2,
+                vec![route],
+                &HashSet::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!store.route_breakers.is_open(&old.route_id, "a"));
+        assert!(store.route_breakers.is_open(&old.route_id, "b"));
+        store
+            .record_user_model_route_outcome(
+                &current,
+                "a",
+                None,
+                crate::route_breaker::BreakerOutcome::Failure { retry_after: None },
+            )
+            .await;
+        assert!(!store.route_breakers.is_open(&old.route_id, "a"));
+        store
+            .replace_user_model_routing(&config, "owner@example.com", 3, vec![], &HashSet::new())
+            .await
+            .unwrap();
+        assert!(!store.route_breakers.is_open(&old.route_id, "b"));
+        store.record_user_model_route_observation(&current, seq, make_result(&current, seq));
+        assert!(
+            store
+                .model_route_runtime
+                .results(&user.id, 2, &HashSet::from([old.route_id]))
+                .is_empty()
+        );
+        let _ = std::fs::remove_file(&config.database.path);
     }
 }

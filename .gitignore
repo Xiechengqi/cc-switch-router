@@ -16,3 +16,7 @@
 # Local key for short-lived password confirmation emails.
 password-notice-key
 .password-notice-key.*.tmp
+
+# Local conversation exports are not source artifacts.
+/codex-session-*.md
+/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-*.txt

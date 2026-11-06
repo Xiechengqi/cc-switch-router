@@ -25,6 +25,53 @@ use self::models::{
 };
 use self::store::MetricsStore;
 
+/// A bounded, one-second resolution window of actual retry forwards after
+/// failures. It does not establish fallback success and is never persisted.
+#[derive(Debug)]
+struct RouteFailoverWindow {
+    origin: Instant,
+    buckets: [(u64, u64); 600],
+    last_total: u64,
+    last_second: u64,
+}
+impl Default for RouteFailoverWindow {
+    fn default() -> Self {
+        Self {
+            origin: Instant::now(),
+            buckets: [(0, 0); 600],
+            last_total: 0,
+            last_second: 0,
+        }
+    }
+}
+impl RouteFailoverWindow {
+    fn prepare(&mut self, second: u64, total: u64) {
+        if total < self.last_total
+            || second < self.last_second
+            || second.saturating_sub(self.last_second) >= 600
+        {
+            self.buckets.fill((0, 0));
+        }
+        self.last_total = total;
+        self.last_second = second;
+    }
+    fn record_at(&mut self, second: u64, total: u64) {
+        self.prepare(second, total);
+        let bucket = &mut self.buckets[(second % 600) as usize];
+        if bucket.0 != second {
+            *bucket = (second, 0);
+        }
+        bucket.1 = bucket.1.saturating_add(1);
+    }
+    fn count_at(&mut self, second: u64, total: u64) -> u64 {
+        self.prepare(second, total);
+        self.buckets
+            .iter()
+            .filter(|(stamp, _)| *stamp <= second && second - *stamp < 600)
+            .fold(0u64, |sum, (_, count)| sum.saturating_add(*count))
+    }
+}
+
 #[derive(Debug, Default)]
 struct AlertRouterBaselineState {
     committed: Option<RouterMetricsStatus>,
@@ -98,9 +145,9 @@ pub struct MetricsRegistry {
     ssh_bridge_half_close_idle_total: AtomicU64,
     ssh_bridge_io_errors_total: AtomicU64,
     ssh_forward_capacity_rejected_total: AtomicU64,
-    /// Failover advances: a model-route request moved from one candidate to
-    /// the next after a retryable failure.
+    /// Actual upstream retry forwards after a retryable model-route failure.
     model_route_failover_total: AtomicU64,
+    model_route_failover_window: std::sync::Mutex<RouteFailoverWindow>,
 }
 
 impl MetricsRegistry {
@@ -155,6 +202,7 @@ impl MetricsRegistry {
             ssh_bridge_io_errors_total: AtomicU64::new(0),
             ssh_forward_capacity_rejected_total: AtomicU64::new(0),
             model_route_failover_total: AtomicU64::new(0),
+            model_route_failover_window: std::sync::Mutex::new(RouteFailoverWindow::default()),
         })
     }
 
@@ -310,8 +358,19 @@ impl MetricsRegistry {
     pub async fn router_status(&self, proxy: &ProxyRegistry) -> RouterMetricsStatus {
         let counts = proxy.counts().await;
         let share_requests = proxy.share_request_registry_snapshot().await;
+        let (failover_total, failover_count) = {
+            let mut window = self
+                .model_route_failover_window
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let total = self.model_route_failover_total.load(Ordering::Relaxed);
+            let second = window.origin.elapsed().as_secs();
+            (total, window.count_at(second, total))
+        };
         RouterMetricsStatus {
             proxy_request_body: Some(proxy.request_body_metrics()),
+            model_route_failover_total: Some(failover_total),
+            model_route_failover_window_count: Some(failover_count),
             active_routes: counts.active_routes as u64,
             pending_routes: counts.pending_routes as u64,
             health_probe_failure_cache: counts.health_probe_failure_cache as u64,
@@ -487,9 +546,22 @@ impl MetricsRegistry {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
+    pub(crate) fn model_route_failover_total_for_tests(&self) -> u64 {
+        self.model_route_failover_total.load(Ordering::Relaxed)
+    }
+
     pub fn record_model_route_failover(&self) {
-        self.model_route_failover_total
-            .fetch_add(1, Ordering::Relaxed);
+        let mut window = self
+            .model_route_failover_window
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let total = self
+            .model_route_failover_total
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        let second = window.origin.elapsed().as_secs();
+        window.record_at(second, total);
     }
 
     pub fn record_proxy_stream_parser_overflow(&self) {
@@ -869,8 +941,15 @@ pub async fn run_collector(
     ));
     let prune_every = Duration::from_secs(3600);
     let mut last_prune = Instant::now();
+    let mut last_breaker_sweep = Instant::now();
     loop {
         interval.tick().await;
+        // Breaker retention is independent of metrics persistence/alerting.
+        if last_breaker_sweep.elapsed() >= crate::route_breaker::SWEEP_INTERVAL {
+            app_store.route_breakers.sweep();
+            app_store.model_route_runtime.sweep();
+            last_breaker_sweep = Instant::now();
+        }
         if !config.metrics.enabled {
             continue;
         }
@@ -1052,6 +1131,18 @@ fn build_alert_conditions(
                 "forwardListeners": router.ssh_forward_listeners,
                 "activeRoutes": router.active_routes,
             }),
+        );
+    }
+    if let Some(count) = router
+        .model_route_failover_window_count
+        .filter(|count| *count >= 20)
+    {
+        push(
+            "route_failover",
+            "warning",
+            "Model route retry forwards",
+            "Upstream retry forwards started after failed attempts",
+            serde_json::json!({"count": count, "windowSeconds": 600}),
         );
     }
     if let Some(previous) = previous_router {
@@ -1279,6 +1370,71 @@ mod tests {
         MetricsRegistry, RouterMetricsStatus, build_alert_conditions, error_kind_from_status,
         normalize_llm_status, run_sample_sinks,
     };
+
+    #[test]
+    fn route_failover_window_expires_buckets_and_resets_without_negative_deltas() {
+        let mut window = super::RouteFailoverWindow::default();
+        window.record_at(0, 1);
+        window.record_at(1, 2);
+        assert_eq!(window.count_at(599, 2), 2);
+        assert_eq!(window.count_at(600, 2), 1);
+        assert_eq!(window.count_at(601, 2), 0);
+        window.record_at(602, 3);
+        assert_eq!(window.count_at(602, 0), 0); // counter reset
+        window.record_at(603, 1);
+        assert_eq!(window.count_at(1, 1), 0); // injected clock rollback
+        window.record_at(2, 2);
+        assert_eq!(window.count_at(602, 2), 0); // long idle gap
+        assert_eq!(window.buckets.len(), 600);
+    }
+
+    #[test]
+    fn route_failover_alert_uses_window_not_lifetime_and_contains_no_target_identity() {
+        let make = |count| {
+            build_alert_conditions(
+                &HostMetricsStatus {
+                    timestamp: 0,
+                    uptime_secs: None,
+                    cpu_percent: None,
+                    load_1: None,
+                    load_5: None,
+                    load_15: None,
+                    memory_used_bytes: None,
+                    memory_total_bytes: None,
+                    memory_available_bytes: None,
+                    swap_used_bytes: None,
+                    swap_total_bytes: None,
+                    disks: Vec::new(),
+                    network: NetworkMetricsStatus::default(),
+                    process: ProcessMetricsStatus::default(),
+                },
+                &RouterMetricsStatus {
+                    model_route_failover_total: Some(10_000),
+                    model_route_failover_window_count: count,
+                    ..Default::default()
+                },
+                None,
+                &LlmMetricsSnapshot::default(),
+                None,
+            )
+        };
+        for count in [None, Some(0), Some(19)] {
+            assert!(
+                !make(count)
+                    .iter()
+                    .any(|condition| condition.kind == "route_failover")
+            );
+        }
+        let conditions = make(Some(20));
+        let alert = conditions
+            .iter()
+            .find(|condition| condition.kind == "route_failover")
+            .unwrap();
+        assert_eq!(
+            alert.details,
+            serde_json::json!({"count":20,"windowSeconds":600})
+        );
+    }
 
     #[test]
     fn alert_baseline_retains_deltas_until_reconciliation_commits() {

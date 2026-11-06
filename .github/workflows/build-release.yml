@@ -168,9 +168,11 @@ jobs:
 
       - name: Test user routing and ordered failover
         run: |
-          bash scripts/ci/timed.sh 'Model routing' cargo test --locked model_rout
-          bash scripts/ci/timed.sh 'Candidate access' cargo test --locked failover_candidates
-          bash scripts/ci/timed.sh 'Route breakers' cargo test --locked route_breaker
+          bash scripts/ci/timed.sh 'Model routing' bash scripts/ci/require-tests.sh cargo test --locked model_rout
+          bash scripts/ci/timed.sh 'Candidate access' bash scripts/ci/require-tests.sh cargo test --locked failover_candidates
+          bash scripts/ci/timed.sh 'Route breakers' bash scripts/ci/require-tests.sh cargo test --locked route_breaker
+          bash scripts/ci/timed.sh 'Routing metrics windows' bash scripts/ci/require-tests.sh cargo test --locked metrics::tests
+          bash scripts/ci/timed.sh 'Notification kinds' bash scripts/ci/require-tests.sh cargo test --locked notification_kinds::tests
 
       - name: Test ingress upload and resource lifecycle
         run: |

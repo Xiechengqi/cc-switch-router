@@ -4,6 +4,7 @@ import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import { modelRoutingShareAccountView } from "@/lib/model-routing";
 import type { AppLocale, MessageKey } from "@/lib/i18n";
 import type { ModelRoutingApp, UserModelRoutingShare } from "@/lib/types";
+import { RoutingShareDependencies } from "./model-hub-dependencies";
 
 export type RoutingShareSummaryProps = {
   share?: UserModelRoutingShare;
@@ -62,7 +63,6 @@ export function RoutingShareOption(props: RoutingShareSummaryProps) {
 /** Details stay outside the add/remove/drag controls: touch can inspect long
  * account text without accidentally adding a Share to the queue. */
 export function RoutingShareDetails(props: RoutingShareSummaryProps) {
-  if (!props.share) return null;
   const view = accountView(props);
   return (
     <details className="model-route-account text-xs text-muted-foreground">
@@ -70,9 +70,10 @@ export function RoutingShareDetails(props: RoutingShareSummaryProps) {
         {props.t("modelHub.accountDetails")}
       </summary>
       <div className="grid gap-1 break-words px-2 pb-2 [overflow-wrap:anywhere]">
-        <span>{props.share.subdomain || props.share.shareName}</span>
+        <span>{props.share?.subdomain || props.share?.shareName || props.shareId}</span>
         <span>{view.primaryLine}</span><span>{view.identityLine}</span><span>{view.modelsLine}</span>
         <span>{view.panelTitle || view.healthLabel}</span>
+        <RoutingShareDependencies shareId={props.shareId} t={props.t} />
       </div>
     </details>
   );

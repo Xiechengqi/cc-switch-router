@@ -23,7 +23,7 @@
     "test:share-value-quota": "tsx --test lib/share-value-quota.test.ts lib/share-value-usage-transport.test.ts lib/value-tariff-delivery.test.ts",
     "test:share-settings-browser": "node scripts/share-settings-browser-test.mjs",
     "test:share-model-probe": "tsx --test lib/share-model-probe.test.ts lib/share-local-test.test.ts lib/share-local-test-consent.test.ts lib/share-connection-token.test.ts",
-    "test:model-routing": "tsx --test lib/model-routing.test.ts lib/model-routing-session.test.ts components/dashboard/model-hub-share-summary.test.tsx",
+    "test:model-routing": "tsx --test lib/model-routing.test.ts lib/model-routing-session.test.ts lib/model-routing-test-session.test.ts lib/model-routing-commands.test.ts components/dashboard/model-hub-share-summary.test.tsx",
     "test:model-price-effectivity": "tsx --test lib/model-price-effectivity.test.ts",
     "test:share-model-health-heatmap": "tsx --test lib/share-health.test.ts components/dashboard/share-model-health-heatmap.test.ts components/dashboard/client-online-heatmap.test.ts",
     "test:client-upgrade-state": "tsx --test components/dashboard/client-upgrade-state.test.ts",

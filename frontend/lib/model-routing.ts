@@ -164,7 +164,8 @@ export function hasNewUnavailableRouteTarget(
     const previous = saved.get(key(route));
     const eligible = new Set(sharesForProtocol(profile.eligibleShares, route.appType).map(share => share.shareId));
     return (previous?.targetShareId !== route.targetShareId && !eligible.has(route.targetShareId))
-      || (route.candidates || []).some(id => !previous?.candidates?.includes(id) && !eligible.has(id));
+      // Demoting a kept unavailable primary to a backup is not a new grant.
+      || (route.candidates || []).some(id => !previous?.candidates?.includes(id) && previous?.targetShareId !== id && !eligible.has(id));
   });
 }
 
@@ -364,7 +365,7 @@ export function buildUnifiedModelCurl(
   const model = !requested || requested === WILDCARD_MODEL ? "<MODEL>" : requested;
   let url = `${baseUrl}/v1/responses`;
   let authHeader = `Authorization: Bearer ${apiKey}`;
-  let body: unknown = { model, input: "Hello" };
+  let body: unknown = { model, input: "Hello", max_output_tokens: 32 };
 
   const extraHeaders: string[] = [];
   if (route?.appType === "claude") {
@@ -380,7 +381,7 @@ export function buildUnifiedModelCurl(
     const wireModel = model === "<MODEL>" ? model : encodeURIComponent(model);
     url = `${baseUrl}/v1beta/models/${wireModel}:generateContent`;
     authHeader = `x-goog-api-key: ${apiKey}`;
-    body = { contents: [{ parts: [{ text: "Hello" }] }] };
+    body = { contents: [{ parts: [{ text: "Hello" }] }], generationConfig: { maxOutputTokens: 32 } };
   }
 
   return [
@@ -419,7 +420,8 @@ export function validateModelRoutes(
   if (normalized.length > MAX_USER_MODEL_ROUTES) return "too_many";
   if (
     normalized.some(
-      (route) => !route.requestedModel || !route.targetShareId,
+      (route) => !route.requestedModel || !route.targetShareId
+        || Array.from(route.requestedModel).length > 200 || /[\p{Cc}]/u.test(route.requestedModel),
     )
   ) {
     return "required";
@@ -459,6 +461,193 @@ export function preferredModelRoutingApp(
   if (share?.apps.includes("codex")) return "codex";
   if (share?.apps.includes("claude")) return "claude";
   return share?.apps[0] || "gemini";
+}
+
+export type ModelRouteCommand =
+  | { kind: "add_exact"; clientId: string; appType: ModelRoutingApp; shareId?: string }
+  | { kind: "set_model"; clientId: string; value: string }
+  | { kind: "remove_rule"; clientId: string }
+  | { kind: "set_targets"; clientId: string; shareIds: string[] }
+  | { kind: "set_default_targets"; appType: ModelRoutingApp; clientId: string; shareIds: string[] }
+  | { kind: "append_targets" | "remove_targets"; clientId: string; shareIds: string[] }
+  | { kind: "move_target"; clientId: string; from: number; to: number }
+  | { kind: "restore_change"; changeId: string; baseRevision: number; draftFingerprint: string };
+export type ModelRouteCommandError = "route_missing" | "unsupported_protocol" | "invalid_index"
+  | "too_many_routes" | "too_many_targets" | "duplicate_target" | "target_unavailable"
+  | "invalid_target_id" | "duplicate_model" | "change_missing" | "stale_diff" | "restore_conflict";
+export type ModelRouteCommandResult = {
+  routes: DraftModelRoute[]; changed: boolean;
+  error?: { code: ModelRouteCommandError; clientId?: string };
+  focus?: { clientId: string; shareId?: string; control: "model" | "target" | "add" };
+};
+export type ModelRouteChange = {
+  changeId: string; clientId: string; kind: "added" | "removed" | "model" | "targets";
+  before?: DraftModelRoute; after?: DraftModelRoute;
+};
+export function modelRoutesDraftFingerprint(routes: DraftModelRoute[]): string {
+  return JSON.stringify(routes.map(route => [route.clientId, route.appType, route.requestedModel, modelRouteTargets(route)]));
+}
+export function diffModelRoutes(saved: DraftModelRoute[], draft: DraftModelRoute[]): ModelRouteChange[] {
+  const changes: ModelRouteChange[] = [];
+  const add = (kind: ModelRouteChange["kind"], before?: DraftModelRoute, after?: DraftModelRoute) => {
+    const clientId = (before || after)!.clientId;
+    changes.push({ changeId: `${encodeURIComponent(clientId)}:${kind}`, clientId, kind, before, after });
+  };
+  const current = new Map(draft.map(route => [route.clientId, route]));
+  for (const before of saved) {
+    const after = current.get(before.clientId);
+    if (!after) add("removed", before);
+    else {
+      if (before.requestedModel.trim() !== after.requestedModel.trim() || before.appType !== after.appType) add("model", before, after);
+      if (JSON.stringify(modelRouteTargets(before)) !== JSON.stringify(modelRouteTargets(after))) add("targets", before, after);
+    }
+  }
+  const ids = new Set(saved.map(route => route.clientId));
+  for (const after of draft) if (!ids.has(after.clientId)) add("added", undefined, after);
+  return changes;
+}
+
+/** All editor mutations are atomic; no network, clock, UUID or DOM access. */
+export function applyModelRouteCommand(routes: DraftModelRoute[], command: ModelRouteCommand, context: {
+  eligibleShares: UserModelRoutingShare[]; savedRoutes: DraftModelRoute[]; baseRevision: number;
+}): ModelRouteCommandResult {
+  const unchanged = (code?: ModelRouteCommandError): ModelRouteCommandResult => ({ routes, changed: false,
+    ...(code ? { error: { code, ...("clientId" in command ? { clientId: command.clientId } : {}) } } : {}) });
+  let next = routes;
+  let affectedId = "clientId" in command ? command.clientId : "";
+  let restoring = false;
+  let focusControl: "model" | "target" = command.kind === "add_exact" || command.kind === "set_model" ? "model" : "target";
+  const previous = routes.find(route => route.clientId === affectedId);
+  const setTargets = (route: DraftModelRoute, ids: string[]) => {
+    const updated = { ...route, targetShareId: ids[0] || "", candidates: ids.slice(1) };
+    return !ids.length && isWildcardModel(route.requestedModel)
+      ? routes.filter(item => item.clientId !== route.clientId)
+      : routes.map(item => item.clientId === route.clientId ? updated : item);
+  };
+  if (command.kind === "restore_change") {
+    if (command.baseRevision !== context.baseRevision || command.draftFingerprint !== modelRoutesDraftFingerprint(routes)) return unchanged("stale_diff");
+    const change = diffModelRoutes(context.savedRoutes, routes).find(item => item.changeId === command.changeId);
+    if (!change) return unchanged("change_missing");
+    restoring = true;
+    affectedId = change.clientId;
+    if (change.kind === "model" || change.kind === "removed" && !isWildcardModel(change.before!.requestedModel)) focusControl = "model";
+    if (change.kind === "added") next = routes.filter(route => route.clientId !== change.clientId);
+    else if (change.kind === "removed") {
+      const savedIndex = context.savedRoutes.findIndex(route => route.clientId === change.clientId);
+      const following = context.savedRoutes.slice(savedIndex + 1).find(route => routes.some(item => item.clientId === route.clientId));
+      const preceding = context.savedRoutes.slice(0, savedIndex).reverse().find(route => routes.some(item => item.clientId === route.clientId));
+      const index = following ? routes.findIndex(route => route.clientId === following.clientId)
+        : preceding ? routes.findIndex(route => route.clientId === preceding.clientId) + 1 : routes.length;
+      next = [...routes.slice(0, index), { ...change.before!, candidates: [...(change.before!.candidates || [])] }, ...routes.slice(index)];
+    } else next = routes.map(route => route.clientId !== change.clientId ? route : change.kind === "model"
+      ? { ...route, appType: change.before!.appType, requestedModel: change.before!.requestedModel }
+      : { ...route, targetShareId: change.before!.targetShareId, candidates: [...(change.before!.candidates || [])] });
+  } else if (command.kind === "add_exact") {
+    if (previous) return unchanged("duplicate_model");
+    next = [...routes, { clientId: command.clientId, appType: command.appType, requestedModel: "",
+      targetShareId: command.shareId || firstShareForProtocol(context.eligibleShares, command.appType)?.shareId || "", candidates: [] }];
+  } else if (command.kind === "set_default_targets") {
+    const existing = routes.find(route => route.appType === command.appType && isWildcardModel(route.requestedModel));
+    affectedId = existing?.clientId || command.clientId;
+    if (existing) next = setTargets(existing, command.shareIds);
+    else if (command.shareIds.length) {
+      if (previous) return unchanged("duplicate_model");
+      next = [...routes, { clientId: affectedId, appType: command.appType, requestedModel: WILDCARD_MODEL,
+        targetShareId: command.shareIds[0], candidates: command.shareIds.slice(1) }];
+    }
+  } else {
+    if (!previous) return unchanged("route_missing");
+    if (!MODEL_ROUTING_PROTOCOLS.includes(previous.appType as ModelRoutingProtocol)) return unchanged("unsupported_protocol");
+    const ids = modelRouteTargets(previous);
+    switch (command.kind) {
+      case "remove_rule": next = routes.filter(route => route !== previous); break;
+      case "set_model": next = routes.map(route => route === previous ? { ...route, requestedModel: command.value } : route); break;
+      case "set_targets": next = setTargets(previous, command.shareIds); break;
+      case "append_targets": {
+        if (command.shareIds.some(id => ids.includes(id)) || new Set(command.shareIds).size !== command.shareIds.length) return unchanged("duplicate_target");
+        next = setTargets(previous, [...ids, ...modelRouteTransferSelection(command.shareIds, command.shareIds)]); break;
+      }
+      case "remove_targets": next = setTargets(previous, transferModelRouteTargets(ids, [], command.shareIds, "out")); break;
+      case "move_target": {
+        if (![command.from, command.to].every(index => Number.isInteger(index) && index >= 0 && index < ids.length)) return unchanged("invalid_index");
+        next = setTargets(previous, moveModelRouteTarget(ids, command.from, command.to)); break;
+      }
+    }
+  }
+  if (next === routes || modelRoutesDraftFingerprint(next) === modelRoutesDraftFingerprint(routes)) return unchanged();
+  const error = (code: ModelRouteCommandError) => unchanged(restoring ? "restore_conflict" : code);
+  const affected = next.find(route => route.clientId === affectedId);
+  if (affected && !MODEL_ROUTING_PROTOCOLS.includes(affected.appType as ModelRoutingProtocol)) return error("unsupported_protocol");
+  const rawIds = affected ? [affected.targetShareId, ...(affected.candidates || [])].filter(id => id !== "") : [];
+  if (rawIds.some(id => !id.trim() || id !== id.trim() || /[\p{Cc}]/u.test(id))) return error("invalid_target_id");
+  if (new Set(rawIds).size !== rawIds.length) return error("duplicate_target");
+  if (next.length > MAX_USER_MODEL_ROUTES) return error("too_many_routes");
+  if (rawIds.length > MAX_MODEL_ROUTE_TARGETS) return error("too_many_targets");
+  if (command.kind !== "set_model" && affected?.requestedModel.trim() && next.some(route => route.clientId !== affectedId && route.appType === affected.appType
+    && route.requestedModel.trim() === affected.requestedModel.trim())) return error("duplicate_model");
+  if (affected && command.kind !== "set_model") {
+    const saved = context.savedRoutes.find(route => route.clientId === affectedId && route.appType === affected.appType
+      && route.requestedModel.trim() === affected.requestedModel.trim());
+    const old = routes.find(route => route.clientId === affectedId && route.appType === affected.appType
+      && route.requestedModel.trim() === affected.requestedModel.trim());
+    const eligible = new Set(sharesForProtocol(context.eligibleShares, affected.appType).map(share => share.shareId));
+    // An unavailable target may stay or move down the queue, never up into
+    // the primary slot it did not already hold.
+    for (const [index, id] of modelRouteTargets(affected).entries()) {
+      if (eligible.has(id)) continue;
+      const preserved = index === 0 ? saved?.targetShareId === id && (restoring || old?.targetShareId === id)
+        : modelRouteTargets(saved).includes(id) && (restoring || modelRouteTargets(old).includes(id));
+      if (!preserved) return error("target_unavailable");
+    }
+  }
+  if (!affected) {
+    const removed = routes.find(route => route.clientId === affectedId);
+    const index = routes.findIndex(route => route === removed);
+    const neighbors = next.filter(route => route.appType === removed?.appType);
+    const neighbor = neighbors.find(route => routes.indexOf(route) >= index) || neighbors.at(-1);
+    return { routes: next, changed: true, focus: { clientId: neighbor?.clientId || affectedId,
+      control: neighbor ? isWildcardModel(neighbor.requestedModel) ? "target" : "model" : "add" } };
+  }
+  const ids = modelRouteTargets(affected);
+  let shareId = ids[0];
+  if (command.kind === "move_target") shareId = modelRouteTargets(previous)[command.from];
+  else if (command.kind === "append_targets") shareId = command.shareIds[0];
+  else if (command.kind === "remove_targets") {
+    const index = modelRouteTargets(previous).findIndex(id => command.shareIds.includes(id));
+    shareId = ids[Math.min(Math.max(0, index), ids.length - 1)];
+  }
+  return { routes: next, changed: true, focus: { clientId: affectedId, shareId, control: focusControl } };
+}
+
+/** Only request-side evidence is offered; fixed actualModel values are not. */
+export function modelRoutingSuggestions(profile: UserModelRoutingResponse, app: ModelRoutingApp, routes: DraftModelRoute[]): string[] {
+  void profile; void app; void routes;
+  return [];
+}
+
+export type ShareRouteDependency = {
+  appType: ModelRoutingApp; routeClientId: string; requestedModel: string; position: number;
+  nextEligibleOnlineCandidateShareId: string | null;
+};
+export type ShareDependencySummary = {
+  shareId: string; dependencies: ShareRouteDependency[]; primaryCount: number; noNextEligibleOnlineCandidateCount: number;
+};
+export function buildShareDependencies(view: "saved" | "draft", routes: DraftModelRoute[], eligibleShares: UserModelRoutingShare[]): Map<string, ShareDependencySummary> {
+  // `view` is intentionally explicit at call sites; no mixing saved/draft inputs.
+  void view;
+  const result = new Map<string, ShareDependencySummary>();
+  for (const route of routes) {
+    const ids = modelRouteTargets(route);
+    ids.forEach((shareId, position) => {
+      const nextEligibleOnlineCandidateShareId = ids.slice(position + 1).find(id => eligibleShares.some(share =>
+        share.shareId === id && share.apps.includes(route.appType) && share.isOnline === true)) || null;
+      const summary = result.get(shareId) || { shareId, dependencies: [], primaryCount: 0, noNextEligibleOnlineCandidateCount: 0 };
+      summary.dependencies.push({ appType: route.appType, routeClientId: route.clientId, requestedModel: route.requestedModel, position, nextEligibleOnlineCandidateShareId });
+      if (position === 0) { summary.primaryCount++; if (!nextEligibleOnlineCandidateShareId) summary.noNextEligibleOnlineCandidateCount++; }
+      result.set(shareId, summary);
+    });
+  }
+  return result;
 }
 
 export function patchDraftModelRoute(

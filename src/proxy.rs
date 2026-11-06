@@ -2542,6 +2542,8 @@ async fn user_model_proxy_handler_inner(
         Err(response) => return response,
     };
 
+    let observation_sequence = state.store.model_route_runtime.next_sequence();
+
     if method == axum::http::Method::GET {
         if let Some(app_type) = unified_model_list_app(&path, &parts.headers) {
             // When this app is a pure passthrough to one Share, the entry point is
@@ -2670,183 +2672,316 @@ async fn user_model_proxy_handler_inner(
         Err(error) => return error.into_response(),
     };
 
-    if state.store.is_requested_model_blocked(
-        &resolution.target_share_id,
+    if let Some(sequence) = observation_sequence {
+        state
+            .store
+            .begin_user_model_route_observation(&resolution, sequence);
+    }
+    let execution = execute_resolved_model_route(
+        &state,
+        peer,
+        parts,
+        body_bytes,
+        &resolution,
         &app_type,
         &requested_model,
-    ) {
-        return requested_model_blocked_response(&app_type, &requested_model);
+    )
+    .await;
+    if let Some(sequence) = observation_sequence {
+        state.store.record_user_model_route_observation(
+            &resolution,
+            sequence,
+            execution.observation(&resolution, sequence, "request", None),
+        );
     }
+    execution.response
+}
 
-    // Failover loop: walk the primary target then the ordered candidates.
-    // Every attempt is gated on the per-route circuit breaker; a candidate
-    // that fails with a retryable error marks its breaker and the loop
-    // advances. Once any response bytes have been sent to the client the
-    // attempt is committed — a stream can never be retried mid-flight.
-    let body_bytes = axum::body::Bytes::from(body_bytes);
-    let candidates: Vec<(String, String)> = std::iter::once((
+#[derive(Clone)]
+struct ModelRouteDispatch {
+    retry: bool,
+    started: Arc<AtomicBool>,
+}
+impl ModelRouteDispatch {
+    fn start(&self, metrics: &MetricsRegistry, cancellation: &CancellationToken) {
+        if !cancellation.is_cancelled() && !self.started.swap(true, Ordering::Relaxed) && self.retry
+        {
+            metrics.record_model_route_failover();
+        }
+    }
+}
+
+struct ResolvedModelRouteExecution {
+    response: Response,
+    attempts: Vec<crate::models::ModelRouteAttempt>,
+    target_share_id: Option<String>,
+    position: Option<usize>,
+    continued_search: bool,
+}
+impl ResolvedModelRouteExecution {
+    fn observation(
+        &self,
+        resolution: &UserModelRouteResolution,
+        sequence: u64,
+        source: &'static str,
+        body_state: Option<crate::models::ModelRouteBodyState>,
+    ) -> crate::models::ModelRouteRecentResult {
+        use crate::models::ModelRouteBodyState;
+        crate::models::ModelRouteRecentResult {
+            route_id: resolution.route_id.clone(),
+            revision: resolution.revision,
+            request_sequence: sequence.to_string(),
+            observed_at: chrono::Utc::now(),
+            source,
+            phase: match body_state {
+                None => "response_headers",
+                Some(ModelRouteBodyState::Complete) => "body_complete",
+                _ => "body_incomplete",
+            },
+            target_share_id: self.target_share_id.clone(),
+            position: self.position,
+            status_code: self.response.status().as_u16(),
+            continued_search: self.continued_search,
+            used_backup: self.position.is_some_and(|position| position > 0),
+            body_state,
+        }
+    }
+}
+
+/// Production and saved-rule diagnostics share this exact candidate loop.
+/// Header commitment, budget and ACL/usage attribution are identical.
+async fn execute_resolved_model_route(
+    state: &ServerState,
+    peer: SocketAddr,
+    parts: axum::http::request::Parts,
+    body_bytes: Bytes,
+    resolution: &UserModelRouteResolution,
+    app_type: &str,
+    requested_model: &str,
+) -> ResolvedModelRouteExecution {
+    use crate::route_breaker::{BreakerOutcome, BreakerPermit};
+    use crate::store::ModelRoutePrimaryUnavailable;
+    let candidates: Vec<_> = std::iter::once((
         resolution.target_share_id.clone(),
         resolution.subdomain.clone(),
+        0,
+        resolution.primary_unavailable,
     ))
     .chain(resolution.candidates.iter().map(|candidate| {
         (
             candidate.target_share_id.clone(),
             candidate.subdomain.clone(),
+            candidate.priority,
+            candidate.unavailable,
         )
     }))
     .collect();
-    let max_attempts = candidates.len().min(4);
-    let mut attempts = 0;
-    let mut last_response: Option<Response> = None;
-
-    // The budget counts actual forwards, not queue positions. Offline/open
-    // targets must not make the fifth/sixth configured candidate unreachable.
-    for (priority, (target_share_id, subdomain)) in candidates.iter().enumerate() {
-        if attempts >= max_attempts {
-            break;
-        }
-        let permit = state
-            .route_breakers
-            .acquire(&resolution.route_id, target_share_id);
-        if matches!(permit, crate::route_breaker::BreakerPermit::Rejected) {
-            debug!(
-                route_id = %resolution.route_id,
-                target_share_id = %target_share_id,
-                "model route candidate skipped: circuit open"
-            );
+    let mut trace = Vec::with_capacity(candidates.len());
+    let mut forwards = 0;
+    let mut last_response: Option<(Response, String, usize)> = None;
+    let mut model_blocked = false;
+    let mut runtime_unavailable = false;
+    let mut continued_search = false;
+    let mut previous_forward = false;
+    for (index, (target_share_id, subdomain, priority, unavailable)) in
+        candidates.iter().enumerate()
+    {
+        let started = Instant::now();
+        let mut attempt = crate::models::ModelRouteAttempt {
+            target_share_id: target_share_id.clone(),
+            position: *priority,
+            outcome: "response",
+            status_code: None,
+            duration_ms: 0,
+        };
+        if let Some(reason) = unavailable {
+            attempt.outcome = match reason {
+                ModelRoutePrimaryUnavailable::Missing => "missing",
+                ModelRoutePrimaryUnavailable::AppUnavailable => "app_unavailable",
+                ModelRoutePrimaryUnavailable::Unauthorized => "unauthorized",
+            };
+            trace.push(attempt);
             continue;
         }
-        let was_probe = matches!(
-            permit,
-            crate::route_breaker::BreakerPermit::Allowed { was_probe: true }
-        );
-
-        let target_active = state
+        if forwards >= 4 {
+            attempt.outcome = "budget_exhausted";
+            trace.push(attempt);
+            continue;
+        }
+        if state
+            .store
+            .is_requested_model_blocked(target_share_id, app_type, requested_model)
+        {
+            model_blocked = true;
+            attempt.outcome = "model_blocked";
+            trace.push(attempt);
+            continue;
+        }
+        let guard = match state
+            .store
+            .route_breakers
+            .acquire(&resolution.route_id, target_share_id)
+        {
+            BreakerPermit::Rejected => {
+                runtime_unavailable = true;
+                attempt.outcome = "breaker_open";
+                trace.push(attempt);
+                continue;
+            }
+            BreakerPermit::Allowed { guard } => guard,
+        };
+        let active = state
             .proxy
             .route_by_share_id(target_share_id)
             .await
             .is_some_and(|route| route.subdomain() == *subdomain);
-        if !target_active {
-            state.route_breakers.record_failure(
-                &resolution.route_id,
-                target_share_id,
-                was_probe,
-                None,
-            );
-            if priority == 0 {
-                debug!(
-                    route_id = %resolution.route_id,
-                    target_share_id = %target_share_id,
-                    "model route primary target offline, advancing to candidates"
-                );
-            }
+        if !active {
+            runtime_unavailable = true;
+            attempt.outcome = "offline";
+            trace.push(attempt);
+            state
+                .store
+                .record_user_model_route_outcome(
+                    resolution,
+                    target_share_id,
+                    guard,
+                    BreakerOutcome::Failure { retry_after: None },
+                )
+                .await;
             continue;
         }
-
-        if attempts == 0 {
-            debug!(
-                user_id = %principal.user_id,
-                app_type = %app_type,
-                requested_model = %requested_model,
-                target_share_id = %target_share_id,
-                wildcard = resolution.matched_wildcard,
-                "unified API resolved model route"
-            );
-        }
-
         let attempt_resolution = UserModelRouteResolution {
             target_share_id: target_share_id.clone(),
             subdomain: subdomain.clone(),
-            matched_wildcard: resolution.matched_wildcard,
-            route_id: resolution.route_id.clone(),
+            primary_unavailable: None,
             candidates: Vec::new(),
+            ..resolution.clone()
         };
-        attempts += 1;
+        let mut attempt_parts = parts.clone();
+        let dispatched = Arc::new(AtomicBool::new(false));
+        attempt_parts.extensions.insert(ModelRouteDispatch {
+            retry: previous_forward,
+            started: dispatched.clone(),
+        });
         let response = forward_to_selected_share(
             state.clone(),
             peer,
-            parts.clone(),
+            attempt_parts,
             Body::from(body_bytes.clone()),
             &attempt_resolution,
         )
         .await;
-
         if response
             .extensions()
             .get::<crate::proxy_request_body::LocalIngressFailure>()
             .is_some()
         {
-            state
-                .route_breakers
-                .record_neutral(&resolution.route_id, target_share_id, was_probe);
-            return response;
+            // No backend saw this request. Router memory/decode failures must
+            // not trip a Share breaker or trigger cross-account retries.
+            drop(guard);
+            attempt.outcome = "ingress_rejected";
+            attempt.status_code = Some(response.status().as_u16());
+            attempt.duration_ms = started.elapsed().as_millis() as u64;
+            trace.push(attempt);
+            return ResolvedModelRouteExecution {
+                response,
+                attempts: trace,
+                target_share_id: None,
+                position: None,
+                continued_search,
+            };
         }
-
+        if response
+            .extensions()
+            .get::<LocalRequestedModelBlocked>()
+            .is_some()
+        {
+            model_blocked = true;
+            attempt.outcome = "model_blocked";
+            trace.push(attempt);
+            drop(guard);
+            continue;
+        }
+        let did_forward = dispatched.load(Ordering::Relaxed);
+        previous_forward |= did_forward;
+        forwards += usize::from(did_forward);
         let status = response.status();
+        attempt.status_code = Some(status.as_u16());
+        attempt.duration_ms = started.elapsed().as_millis() as u64;
+        trace.push(attempt);
         let retry_after = response
             .headers()
             .get(header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok())
-            .map(std::time::Duration::from_secs);
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_secs);
         let failoverable = matches!(
             status,
-            StatusCode::TOO_MANY_REQUESTS
+            StatusCode::INTERNAL_SERVER_ERROR
+                | StatusCode::UNAUTHORIZED
+                | StatusCode::FORBIDDEN
+                | StatusCode::TOO_MANY_REQUESTS
                 | StatusCode::BAD_GATEWAY
                 | StatusCode::SERVICE_UNAVAILABLE
                 | StatusCode::GATEWAY_TIMEOUT
-                | StatusCode::UNAUTHORIZED
-                | StatusCode::FORBIDDEN
         );
-
-        if failoverable && attempts < max_attempts && priority + 1 < candidates.len() {
-            state.route_breakers.record_failure(
-                &resolution.route_id,
-                target_share_id,
-                was_probe,
-                retry_after,
-            );
-            tracing::info!(
-                route_id = %resolution.route_id,
-                target_share_id = %target_share_id,
-                status = %status.as_u16(),
-                attempt = attempts,
-                "model route candidate failed, advancing"
-            );
-            state.metrics.record_model_route_failover();
-            last_response = Some(response);
+        let outcome = if status.is_success() || status.is_redirection() {
+            BreakerOutcome::Success
+        } else if status.is_client_error()
+            && !matches!(
+                status,
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS
+            )
+        {
+            BreakerOutcome::Neutral
+        } else {
+            BreakerOutcome::Failure { retry_after }
+        };
+        state
+            .store
+            .record_user_model_route_outcome(resolution, target_share_id, guard, outcome)
+            .await;
+        if failoverable && forwards < 4 && index + 1 < candidates.len() {
+            continued_search = true;
+            last_response = Some((response, target_share_id.clone(), *priority));
             continue;
         }
-
-        // Committed: success, non-failoverable error, or last candidate.
-        if status.is_success() || status.is_redirection() {
-            state
-                .route_breakers
-                .record_success(&resolution.route_id, target_share_id, was_probe);
+        return ResolvedModelRouteExecution {
+            response,
+            attempts: trace,
+            target_share_id: Some(target_share_id.clone()),
+            position: Some(*priority),
+            continued_search,
+        };
+    }
+    let (response, target_share_id, position) =
+        if let Some((response, target, position)) = last_response {
+            (response, Some(target), Some(position))
+        } else if !runtime_unavailable && model_blocked {
+            (
+                requested_model_blocked_response(app_type, requested_model),
+                None,
+                None,
+            )
         } else {
-            // A non-failoverable failure (4xx request fault) still counts
-            // against the breaker so a persistently broken candidate opens.
-            state.route_breakers.record_failure(
-                &resolution.route_id,
-                target_share_id,
-                was_probe,
-                retry_after,
-            );
-        }
-        return response;
+            (
+                unified_api_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "user_model_route_target_unavailable",
+                    "configured target Share is offline or reconnecting",
+                    serde_json::json!({ "targetShareId": resolution.target_share_id }),
+                ),
+                None,
+                None,
+            )
+        };
+    ResolvedModelRouteExecution {
+        response,
+        attempts: trace,
+        target_share_id,
+        position,
+        continued_search,
     }
-
-    // Every candidate was skipped by an open breaker or failed retryably.
-    // Return the last failure response when we have one, else fail closed.
-    if let Some(response) = last_response {
-        return response;
-    }
-    unified_api_error_response(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "user_model_route_target_unavailable",
-        "configured target Share is offline or reconnecting",
-        serde_json::json!({ "targetShareId": resolution.target_share_id }),
-    )
 }
 
 /// Hands a request to the selected Share exactly as a direct connection would.
@@ -3052,7 +3187,6 @@ fn unified_model_list_response(app_type: &str, models: Vec<String>) -> Response 
 }
 
 const USER_MODEL_ROUTE_TEST_BODY_LIMIT: usize = 16 * 1024;
-const USER_MODEL_ROUTE_TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct UserModelRouteTestProbe {
@@ -3105,6 +3239,7 @@ pub fn build_user_model_route_test_probe(
                 format!("/v1beta/models/{encoded}:generateContent"),
                 serde_json::json!({
                     "contents": [{ "parts": [{ "text": "Hello" }] }],
+                    "generationConfig": { "maxOutputTokens": 32 },
                 })
                 .to_string(),
             )
@@ -3114,6 +3249,7 @@ pub fn build_user_model_route_test_probe(
             serde_json::json!({
                 "model": requested_model,
                 "input": "Hello",
+                "max_output_tokens": 32,
             })
             .to_string(),
         ),
@@ -3162,100 +3298,187 @@ pub async fn execute_user_model_route_test(
     user_id: &str,
     user_email: &str,
     probe: &UserModelRouteTestProbe,
+    mode: crate::models::ModelRouteTestMode,
+    expected_revision: Option<u64>,
+    deadline: tokio::time::Instant,
 ) -> Result<UserModelRouteTestOutcome, AppError> {
-    let resolution = match state
-        .store
-        .resolve_user_model_route(user_id, user_email, &probe.app_type, &probe.requested_model)
-        .await?
-    {
-        Some(resolution) => resolution,
-        None => {
-            return Err(AppError::Coded {
-                status: StatusCode::NOT_FOUND,
-                code: "user_model_route_not_configured",
-                message: "no Share is configured for this app and model".into(),
-                details: serde_json::json!({
-                    "appType": probe.app_type,
-                    "requestedModel": probe.requested_model,
-                }),
-            });
-        }
-    };
-    let target_active = state
-        .proxy
-        .route_by_share_id(&resolution.target_share_id)
-        .await
-        .is_some_and(|route| route.subdomain() == resolution.subdomain);
-    if !target_active {
-        return Err(AppError::Coded {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            code: "user_model_route_target_unavailable",
-            message: "configured target Share is offline or reconnecting".into(),
-            details: serde_json::json!({ "targetShareId": resolution.target_share_id }),
-        });
-    }
-
-    let api_token = state
-        .store
-        .get_default_api_token(user_email)
-        .await?
-        .api_token
-        .ok_or_else(|| {
-            AppError::Internal("api token plaintext not available; reset your token first".into())
-        })?;
-    let mut parts = axum::http::Request::new(Body::from(probe.body.clone()))
-        .into_parts()
-        .0;
-    parts.method = axum::http::Method::POST;
-    parts.uri = probe
-        .path
-        .parse()
-        .map_err(|_| AppError::Internal("invalid unified model test path".into()))?;
-    parts.headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    let (auth_name, auth_value) = match probe.app_type.as_str() {
-        "claude" => ("x-api-key", api_token.clone()),
-        "gemini" => ("x-goog-api-key", api_token.clone()),
-        _ => ("authorization", format!("Bearer {api_token}")),
-    };
-    parts.headers.insert(
-        HeaderName::from_static(auth_name),
-        HeaderValue::from_str(&auth_value)
-            .map_err(|_| AppError::Internal("invalid unified model test auth header".into()))?,
-    );
-    if probe.app_type == "claude" {
-        parts.headers.insert(
-            HeaderName::from_static("anthropic-version"),
-            HeaderValue::from_static("2023-06-01"),
-        );
-    }
-
-    let started = Instant::now();
-    let forwarded = forward_to_selected_share(
+    execute_user_model_route_test_inner(
         state,
         peer,
-        parts,
-        Body::from(probe.body.clone()),
-        &resolution,
-    );
-    let response = match tokio::time::timeout(USER_MODEL_ROUTE_TEST_TIMEOUT, forwarded).await {
-        Ok(response) => response,
-        Err(_) => {
-            return Err(AppError::Coded {
-                status: StatusCode::GATEWAY_TIMEOUT,
-                code: "user_model_route_test_timeout",
-                message: "unified model test timed out".into(),
-                details: serde_json::json!({
-                    "appType": probe.app_type,
-                    "requestedModel": probe.requested_model,
-                    "targetShareId": resolution.target_share_id,
-                }),
-            });
+        user_id,
+        user_email,
+        probe,
+        mode,
+        expected_revision,
+        deadline,
+    )
+    .await
+}
+
+pub(crate) fn model_route_test_timeout() -> AppError {
+    AppError::Coded {
+        status: StatusCode::GATEWAY_TIMEOUT,
+        code: "user_model_route_test_timeout",
+        message: "unified model test timed out; result unknown and usage may have occurred".into(),
+        details: serde_json::json!({ "incomplete": true, "mayHaveUsage": true }),
+    }
+}
+
+async fn execute_user_model_route_test_inner(
+    state: ServerState,
+    peer: SocketAddr,
+    user_id: &str,
+    user_email: &str,
+    probe: &UserModelRouteTestProbe,
+    mode: crate::models::ModelRouteTestMode,
+    expected_revision: Option<u64>,
+    deadline: tokio::time::Instant,
+) -> Result<UserModelRouteTestOutcome, AppError> {
+    use crate::models::{ModelRouteBodyState, ModelRouteTestMode};
+    if tokio::time::Instant::now() >= deadline {
+        return Err(model_route_test_timeout());
+    }
+    let started = Instant::now();
+    let sequence = state.store.model_route_runtime.next_sequence();
+    if mode == ModelRouteTestMode::SavedRoute && expected_revision.is_none() {
+        return Err(AppError::UnprocessableEntity(
+            "saved_route requires expectedRevision".into(),
+        ));
+    }
+    let (resolution, mut execution) = tokio::time::timeout_at(deadline, async {
+        let resolution = match state
+            .store
+            .resolve_user_model_route_at_revision(
+                user_id,
+                user_email,
+                &probe.app_type,
+                &probe.requested_model,
+                expected_revision,
+            )
+            .await?
+        {
+            Some(resolution) => resolution,
+            None => {
+                return Err(AppError::Coded {
+                    status: StatusCode::NOT_FOUND,
+                    code: "user_model_route_not_configured",
+                    message: "no Share is configured for this app and model".into(),
+                    details: serde_json::json!({
+                        "appType": probe.app_type,
+                        "requestedModel": probe.requested_model,
+                    }),
+                });
+            }
+        };
+        if mode == ModelRouteTestMode::Primary {
+            if let Some(reason) = resolution.primary_unavailable {
+                return Err(reason.error(&resolution.target_share_id, &probe.app_type));
+            }
+            let target_active = state
+                .proxy
+                .route_by_share_id(&resolution.target_share_id)
+                .await
+                .is_some_and(|route| route.subdomain() == resolution.subdomain);
+            if !target_active {
+                return Err(AppError::Coded {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    code: "user_model_route_target_unavailable",
+                    message: "configured target Share is offline or reconnecting".into(),
+                    details: serde_json::json!({ "targetShareId": resolution.target_share_id }),
+                });
+            }
         }
-    };
-    let duration_ms = started.elapsed().as_millis() as u64;
+
+        let api_token = state
+            .store
+            .get_default_api_token(user_email)
+            .await?
+            .api_token
+            .ok_or_else(|| {
+                AppError::Internal(
+                    "api token plaintext not available; reset your token first".into(),
+                )
+            })?;
+        let mut parts = axum::http::Request::new(Body::from(probe.body.clone()))
+            .into_parts()
+            .0;
+        parts.method = axum::http::Method::POST;
+        parts.uri = probe
+            .path
+            .parse()
+            .map_err(|_| AppError::Internal("invalid unified model test path".into()))?;
+        parts.headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        let (auth_name, auth_value) = match probe.app_type.as_str() {
+            "claude" => ("x-api-key", api_token.clone()),
+            "gemini" => ("x-goog-api-key", api_token.clone()),
+            _ => ("authorization", format!("Bearer {api_token}")),
+        };
+        parts.headers.insert(
+            HeaderName::from_static(auth_name),
+            HeaderValue::from_str(&auth_value)
+                .map_err(|_| AppError::Internal("invalid unified model test auth header".into()))?,
+        );
+        if probe.app_type == "claude" {
+            parts.headers.insert(
+                HeaderName::from_static("anthropic-version"),
+                HeaderValue::from_static("2023-06-01"),
+            );
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return Err(model_route_test_timeout());
+        }
+        if mode == ModelRouteTestMode::SavedRoute {
+            state
+                .store
+                .model_route_runtime
+                .admit_diagnostic(user_id)
+                .map_err(|retry_after_secs| AppError::RateLimited {
+                    message: "saved route diagnostic limit reached".into(),
+                    retry_after_secs,
+                })?;
+            if let Some(sequence) = sequence {
+                state
+                    .store
+                    .begin_user_model_route_observation(&resolution, sequence);
+            }
+        }
+        let execution = if mode == ModelRouteTestMode::SavedRoute {
+            execute_resolved_model_route(
+                &state,
+                peer,
+                parts,
+                Bytes::from(probe.body.clone()),
+                &resolution,
+                &probe.app_type,
+                &probe.requested_model,
+            )
+            .await
+        } else {
+            let response = forward_to_selected_share(
+                state.clone(),
+                peer,
+                parts,
+                Body::from(probe.body.clone()),
+                &resolution,
+            )
+            .await;
+            ResolvedModelRouteExecution {
+                response,
+                attempts: vec![],
+                target_share_id: Some(resolution.target_share_id.clone()),
+                position: Some(0),
+                continued_search: false,
+            }
+        };
+        Ok::<_, AppError>((resolution, execution))
+    })
+    .await
+    .map_err(|_| model_route_test_timeout())??;
+    let response = std::mem::replace(&mut execution.response, Response::new(Body::empty()));
     let status = response.status();
     let headers = response
         .headers()
@@ -3264,23 +3487,28 @@ pub async fn execute_user_model_route_test(
             Some([name.as_str().to_string(), value.to_str().ok()?.to_string()])
         })
         .collect::<Vec<_>>();
-    let (raw, body_truncated) = match axum::body::to_bytes(
-        response.into_body(),
-        USER_MODEL_ROUTE_TEST_BODY_LIMIT + 1,
-    )
-    .await
-    {
-        Ok(raw) => {
-            let truncated = raw.len() > USER_MODEL_ROUTE_TEST_BODY_LIMIT;
-            (raw, truncated)
+    let (raw, body_state) = read_model_route_test_preview(response.into_body(), deadline).await;
+    let body_truncated = body_state != ModelRouteBodyState::Complete;
+    let body_text = String::from_utf8_lossy(&raw).into_owned();
+    if mode == ModelRouteTestMode::SavedRoute {
+        if let Some(sequence) = sequence {
+            let mut observation =
+                execution.observation(&resolution, sequence, "diagnostic", Some(body_state));
+            observation.status_code = status.as_u16();
+            // Pure memory bookkeeping also records body timeouts after deadline.
+            state
+                .store
+                .record_user_model_route_observation(&resolution, sequence, observation);
         }
-        Err(_) => (Bytes::new(), true),
-    };
-    let preview_len = raw.len().min(USER_MODEL_ROUTE_TEST_BODY_LIMIT);
-    let body_text = String::from_utf8_lossy(&raw[..preview_len]).into_owned();
+    }
+    let duration_ms = started.elapsed().as_millis() as u64;
     Ok(UserModelRouteTestOutcome {
-        success: status.is_success(),
-        target_share_id: resolution.target_share_id,
+        success: status.is_success() && !body_truncated,
+        target_share_id: execution.target_share_id,
+        revision: resolution.revision,
+        route_id: resolution.route_id,
+        attempts: execution.attempts,
+        body_state,
         matched_wildcard: resolution.matched_wildcard,
         status_code: status.as_u16(),
         status_text: status.canonical_reason().unwrap_or("").to_string(),
@@ -3288,7 +3516,9 @@ pub async fn execute_user_model_route_test(
         body_text,
         body_truncated,
         duration_ms,
-        error: if status.is_success() {
+        error: if body_truncated {
+            Some("response incomplete; usage may have occurred".into())
+        } else if status.is_success() {
             None
         } else {
             Some(format!(
@@ -3299,10 +3529,37 @@ pub async fn execute_user_model_route_test(
     })
 }
 
+async fn read_model_route_test_preview(
+    body: Body,
+    deadline: tokio::time::Instant,
+) -> (Vec<u8>, crate::models::ModelRouteBodyState) {
+    use crate::models::ModelRouteBodyState;
+    let mut stream = body.into_data_stream();
+    let mut preview = Vec::new();
+    loop {
+        match tokio::time::timeout_at(deadline, stream.next()).await {
+            Err(_) => return (preview, ModelRouteBodyState::Timeout),
+            Ok(None) => return (preview, ModelRouteBodyState::Complete),
+            Ok(Some(Err(_))) => return (preview, ModelRouteBodyState::ReadError),
+            Ok(Some(Ok(chunk))) => {
+                let remaining = USER_MODEL_ROUTE_TEST_BODY_LIMIT - preview.len();
+                preview.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                if chunk.len() > remaining {
+                    return (preview, ModelRouteBodyState::Truncated);
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UserModelRouteTestOutcome {
     pub success: bool,
-    pub target_share_id: String,
+    pub target_share_id: Option<String>,
+    pub revision: u64,
+    pub route_id: String,
+    pub attempts: Vec<crate::models::ModelRouteAttempt>,
+    pub body_state: crate::models::ModelRouteBodyState,
     pub matched_wildcard: bool,
     pub status_code: u16,
     pub status_text: String,
@@ -3445,6 +3702,7 @@ pub async fn proxy_handler(
 async fn proxy_handler_inner(state: ServerState, peer: SocketAddr, req: Request) -> Response {
     let (parts, mut body) = req.into_parts();
     let body_context = parts.extensions.get::<Arc<BodyContext>>().unwrap().clone();
+    let model_route_dispatch = parts.extensions.get::<ModelRouteDispatch>().cloned();
     let method = parts.method.clone();
     let host = parts
         .headers
@@ -3983,6 +4241,7 @@ async fn proxy_handler_inner(state: ServerState, peer: SocketAddr, req: Request)
                 user_ip,
                 user_country.to_string(),
                 request_source,
+                model_route_dispatch,
             )
             .await;
         }
@@ -4340,6 +4599,9 @@ async fn proxy_handler_inner(state: ServerState, peer: SocketAddr, req: Request)
     let share_proxy_started = Instant::now();
     let share_request_app = infer_share_request_app(&path);
 
+    if let Some(dispatch) = model_route_dispatch {
+        dispatch.start(&state.metrics, &share_cancellation);
+    }
     let upstream = match send_proxy_upstream_request(
         builder.body(body),
         Duration::from_secs(state.config.proxy_stream.response_header_timeout_secs),
@@ -4627,6 +4889,9 @@ async fn proxy_handler_inner(state: ServerState, peer: SocketAddr, req: Request)
     response
 }
 
+#[derive(Debug, Clone)]
+struct LocalRequestedModelBlocked;
+
 fn requested_model_blocked_response(app_type: &str, requested_model: &str) -> Response {
     let mut response = unified_api_error_response(
         StatusCode::FORBIDDEN,
@@ -4641,6 +4906,7 @@ fn requested_model_blocked_response(app_type: &str, requested_model: &str) -> Re
     response
         .headers_mut()
         .insert("x-cc-switch-error-scope", HeaderValue::from_static("share"));
+    response.extensions_mut().insert(LocalRequestedModelBlocked);
     response
 }
 
@@ -4864,6 +5130,7 @@ async fn handle_image_generation_stream_submit(
     user_ip: String,
     user_country: String,
     request_source: &str,
+    model_route_dispatch: Option<ModelRouteDispatch>,
 ) -> Response {
     let Some(share_id) = route.share_id.as_deref() else {
         return json_error_response(StatusCode::NOT_FOUND, "share-not-found");
@@ -5118,6 +5385,9 @@ async fn handle_image_generation_stream_submit(
     ));
 
     let request_started = Instant::now();
+    if let Some(dispatch) = model_route_dispatch {
+        dispatch.start(&state.metrics, &share_cancellation);
+    }
     let upstream = match send_proxy_upstream_request(
         builder.body(upstream_body),
         Duration::from_secs(state.config.proxy_stream.response_header_timeout_secs),
@@ -8181,7 +8451,6 @@ mod tests {
             market_wallet_controls: Arc::new(Mutex::new(())),
             market_payments: Arc::new(crate::market_payments::MarketPaymentsRuntime::for_test()),
             recent_traffic: RecentTraffic::new(),
-            route_breakers: Arc::new(crate::route_breaker::RouteBreakerRegistry::new()),
             abuse: Arc::new(crate::abuse::AbuseTracker::new()),
             share_abuse: Arc::new(crate::abuse::ShareAbuseTracker::new([])),
             ip_blacklist_stats: Arc::new(crate::ip_blacklist_stats::IpBlacklistStats::new()),

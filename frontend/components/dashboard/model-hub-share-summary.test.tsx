@@ -5,6 +5,8 @@ import { messages, type AppLocale, type MessageKey } from "@/lib/i18n";
 import type { UserModelRoutingShare } from "@/lib/types";
 import { RoutingShareDetails, RoutingShareSummary } from "./model-hub-share-summary";
 import { SharePoolPicker } from "./model-hub-share-picker";
+import { ModelHubRuleEditor } from "./model-hub-rule-editor";
+import { ModelHubRecentResult } from "./model-hub-recent-result";
 
 // Static markup only: no browser, screenshots, layout engine or UI automation.
 function translator(locale: AppLocale) {
@@ -75,5 +77,74 @@ for (const locale of ["en", "zh-CN"] as const) {
     assert.doesNotMatch(html, /protocol-account@example.test/);
     assert.match(html, /Share · /);
     assert.match(html, /title="[^"]*codex/);
+  });
+}
+
+test("collapsed dependency views do not mount repeated full reference lists", async () => {
+  const { RoutingDependencyContext, RoutingShareDependencies } = await import("./model-hub-dependencies");
+  const { buildShareDependencies } = await import("@/lib/model-routing");
+  const routes = Array.from({ length: 50 }, (_, index) => ({ clientId: `r${index}`, appType: "codex" as const, requestedModel: `unique-model-${index}`, targetShareId: share.shareId, candidates: ["b", "c"] }));
+  const summaries = buildShareDependencies("saved", routes, [share]);
+  const html = renderToStaticMarkup(<RoutingDependencyContext.Provider value={{ summaries, shares: [share], view: "saved", onLocate: () => {} }}>
+    <RoutingShareDependencies shareId={share.shareId} t={translator("en")} />
+  </RoutingDependencyContext.Provider>);
+  assert.ok(html.includes("50"));
+  assert.doesNotMatch(html, /unique-model-|<li/);
+});
+
+test("recent observations are independent of the browser clock", async () => {
+  const { currentModelRouteResult } = await import("./model-hub-recent-result");
+  const result = { routeId: "r", revision: 1, requestSequence: "2", observedAt: "2099-01-01T00:00:00Z", source: "request" as const, phase: "response_headers" as const, continuedSearch: false, usedBackup: false };
+  const profile = { enabled: true, revision: 1, apiBaseUrl: "", eligibleShares: [], routes: [{ id: "r", appType: "codex" as const, requestedModel: "*", targetShareId: "s", createdAt: "", updatedAt: "" }], routeRecentResults: [result] };
+  assert.equal(currentModelRouteResult(profile, "r", 0), result);
+  assert.equal(currentModelRouteResult(profile, "r", Number.MAX_SAFE_INTEGER), result);
+  assert.equal(currentModelRouteResult({ ...profile, revision: 2 }, "r"), undefined);
+  assert.equal(currentModelRouteResult({ ...profile, routes: [] }, "r"), undefined);
+  assert.equal(currentModelRouteResult({ ...profile, routeRecentResults: [{ ...result, observedAt: "invalid" }] }, "r"), undefined);
+});
+
+for (const locale of ["en", "zh-CN"] as const) {
+  const t = translator(locale);
+  test(`${locale}: rule labels, duplicate errors and target focus anchors are distinct`, () => {
+    const html = renderToStaticMarkup(<>{["new:first", "new:second"].map((clientId, index) => <ModelHubRuleEditor key={clientId}
+      kind="exact" position={index + 1} route={{ clientId, appType: "codex", requestedModel: "", targetShareId: share.shareId }} app="codex"
+      appLabel={t("modelHub.protocol.codex")} shares={[share]} disabled={false} duplicate onAction={() => false} onTargets={() => {}} locale={locale} t={t} />)}</>);
+    const labels = [...html.matchAll(/<section\b[^>]*aria-label="([^"]+)"/g)].map(match => match[1]);
+    assert.deepEqual(labels, [1, 2].map(order => `${t("modelHub.protocol.codex")} · ${t("modelHub.unnamedRule", { order })}`));
+    assert.doesNotMatch(html, /aria-label="[^"]*new:|aria-label="codex/, "labels never expose client ids or raw protocol values");
+    assert.equal([...html.matchAll(/aria-invalid="true"/g)].length, 2);
+    assert.ok(html.includes(t("modelHub.validationDuplicate")));
+    assert.equal([...html.matchAll(/data-model-route-target="fixture"/g)].length, 2);
+    const descriptions = [...html.matchAll(/<input\b[^>]*aria-invalid="true"[^>]*aria-describedby="([^"]+)"/g)].map(match => match[1]);
+    assert.equal(new Set(descriptions).size, descriptions.length);
+    assert.equal(descriptions.length, 2);
+    for (const id of descriptions) assert.ok(html.includes(`id="${id}"`));
+  });
+
+  test(`${locale}: an exact rule whose draft model is * keeps its model input and delete button`, () => {
+    const route = { clientId: "exact", appType: "codex" as const, requestedModel: "*", targetShareId: share.shareId };
+    const exact = renderToStaticMarkup(<ModelHubRuleEditor kind="exact" route={route} app="codex" appLabel={t("modelHub.protocol.codex")}
+      shares={[share]} disabled={false} duplicate onAction={() => false} onTargets={() => {}} onRemove={() => {}} locale={locale} t={t} />);
+    assert.match(exact, /<input\b[^>]*value="\*"/);
+    assert.ok(exact.includes(`aria-label="${t("modelHub.removeRoute")}"`));
+    const fallback = renderToStaticMarkup(<ModelHubRuleEditor kind="default" route={route} app="codex" appLabel={t("modelHub.protocol.codex")}
+      shares={[share]} disabled={false} onAction={() => false} onTargets={() => {}} locale={locale} t={t} />);
+    assert.doesNotMatch(fallback, /value="\*"/);
+    assert.ok(!fallback.includes(`aria-label="${t("modelHub.removeRoute")}"`));
+  });
+
+  test(`${locale}: recent diagnostics separate response headers from body completion and localize time`, () => {
+    const result = { routeId: "r", revision: 1, requestSequence: "2", observedAt: "2099-01-01T13:45:00Z", source: "diagnostic" as const,
+      phase: "body_incomplete" as const, statusCode: 200, continuedSearch: true, usedBackup: true, bodyState: "timeout" as const };
+    const profile = { enabled: true, revision: 1, apiBaseUrl: "", eligibleShares: [], routes: [{ id: "r", appType: "codex" as const, requestedModel: "*", targetShareId: "s", createdAt: "", updatedAt: "" }], routeRecentResults: [result] };
+    const html = renderToStaticMarkup(<ModelHubRecentResult profile={profile} routeId="r" locale={locale} t={t} />);
+    assert.match(html, /HTTP 200/);
+    assert.ok(html.includes(t("modelHub.recent.body_incomplete")));
+    assert.ok(html.includes(t("modelHub.recent.backup")));
+    assert.match(html, /dateTime="2099-01-01T13:45:00Z"/i);
+    assert.ok(html.includes(new Date(result.observedAt).toLocaleString(locale)));
+    assert.doesNotMatch(html, />2099-01-01T13:45:00Z<|body_incomplete|snapshot_mismatch|breaker_open/);
+    const headers = renderToStaticMarkup(<ModelHubRecentResult profile={{ ...profile, routeRecentResults: [{ ...result, source: "request", phase: "response_headers" }] }} routeId="r" locale={locale} t={t} />);
+    assert.ok(headers.includes(t("modelHub.recent.response_headers")));
   });
 }
