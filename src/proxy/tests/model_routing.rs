@@ -1,6 +1,8 @@
 use super::*;
 use crate::models::UserModelRouteInput;
 
+mod request_body;
+
 /// Real proxy requests, but only to loopback fixtures; no model calls or UI.
 struct QueueFixture {
     config: Config,

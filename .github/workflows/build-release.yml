@@ -172,6 +172,14 @@ jobs:
           bash scripts/ci/timed.sh 'Candidate access' cargo test --locked failover_candidates
           bash scripts/ci/timed.sh 'Route breakers' cargo test --locked route_breaker
 
+      - name: Test ingress upload and resource lifecycle
+        run: |
+          bash scripts/ci/timed.sh 'Ingress body collector' bash scripts/ci/require-tests.sh cargo test --locked proxy_request_body::tests
+          bash scripts/ci/timed.sh 'Ingress timeout configuration' bash scripts/ci/require-tests.sh cargo test --locked config::tests::request_body_
+          bash scripts/ci/timed.sh 'Ingress settings migration' bash scripts/ci/require-tests.sh cargo test --locked admin::settings::tests::request_body_settings_
+
+          bash scripts/ci/timed.sh 'Ingress proxy integration' bash scripts/ci/require-tests.sh cargo test --locked proxy::tests::model_routing::request_body
+
       - name: Test password authentication and administrator CLI
         run: |
           bash scripts/ci/timed.sh 'Password credentials' cargo test --locked password_auth::tests

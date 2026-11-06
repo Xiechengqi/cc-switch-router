@@ -1803,6 +1803,20 @@ export type ClockHealthStatus = {
 };
 
 export type RouterMetricsStatus = {
+  proxyRequestBody?: {
+    memoryLimitBytes: number;
+    memoryUsedBytes: number;
+    memoryPeakBytes: number;
+    completedTotal: number;
+    firstByteTimeoutTotal: number;
+    idleTimeoutTotal: number;
+    hardTimeoutTotal: number;
+    tooLargeTotal: number;
+    readErrorTotal: number;
+    capacityRejectedTotal: number;
+    decodeRejectedTotal: number;
+    cancelledTotal: number;
+  };
   activeRoutes: number;
   pendingRoutes: number;
   healthProbeFailureCache: number;

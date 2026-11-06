@@ -104,6 +104,9 @@ pub struct ProcessMetricsStatus {
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RouterMetricsStatus {
+    /// Live ingress counters and retained memory; absent on historical rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_request_body: Option<crate::proxy_request_body::BodyMetrics>,
     pub active_routes: u64,
     pub pending_routes: u64,
     pub health_probe_failure_cache: u64,

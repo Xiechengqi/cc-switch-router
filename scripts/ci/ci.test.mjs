@@ -67,6 +67,9 @@ test("parallel CI retains every existing financial gate and separates profile ca
   for (const suite of ["model_rout", "failover_candidates", "route_breaker"]) {
     assert.ok(job("rust-tests").includes(`cargo test --locked ${suite}`), `lost routing gate: ${suite}`);
   }
+  for (const suite of ["proxy_request_body::tests", "config::tests::request_body_", "admin::settings::tests::request_body_settings_", "proxy::tests::model_routing::request_body"]) {
+    assert.ok(job("rust-tests").includes(`require-tests.sh cargo test --locked ${suite}`), `missing guarded ingress gate: ${suite}`);
+  }
   for (const suite of ["share_value", "share_contract_reader", "share_user", "value_usage_initialization_tests"]) {
     assert.ok(job("rust-tests").includes(`cargo test --locked ${suite}`), `lost Share quota gate: ${suite}`);
   }
@@ -87,6 +90,21 @@ test("timing wrapper preserves failures, argument boundaries and summary output"
   assert.match(success.stdout, /a b;\$literal/);
   assert.match(readFileSync(summary, "utf8"), /A check: \d+s \(exit 23\)/);
   assert.equal(run("missing command").status, 2);
+});
+
+test("Rust filter guard rejects empty matches and preserves runner failures", t => {
+  const directory = temporary(t);
+  const summary = join(directory, "summary");
+  const run = body => spawnSync("bash", [join(root, "scripts/ci/require-tests.sh"), process.execPath, "-e", body], {
+    encoding: "utf8", env: { ...process.env, GITHUB_STEP_SUMMARY: summary },
+  });
+  assert.equal(run('console.log("test result: ok. 0 passed; 0 failed; 1 ignored;")').status, 1);
+  assert.equal(run('console.log("compilation only")').status, 1);
+  assert.equal(run('console.log("test result: ok. 2 passed; 0 failed;"); process.exit(23)').status, 23);
+  const success = run('console.log("test result: ok. 2 passed; 0 failed;\\ntest result: ok. 0 passed; 0 failed;")');
+  assert.equal(success.status, 0, success.stderr);
+  assert.match(success.stdout, /executed 2 passing tests/);
+  assert.match(readFileSync(summary, "utf8"), /2 passed/);
 });
 
 test("artifact verification rejects stale build identity and missing or stale embedded assets", t => {

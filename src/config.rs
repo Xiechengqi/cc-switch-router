@@ -28,7 +28,10 @@ pub const DEFAULT_SSH_BRIDGE_WRITE_STALL_TIMEOUT_SECS: u64 = 300;
 pub const DEFAULT_SSH_BRIDGE_HALF_CLOSE_IDLE_TIMEOUT_SECS: u64 = 300;
 pub const DEFAULT_SSH_MAX_FORWARD_CONNECTIONS: usize = 2_048;
 pub const DEFAULT_SSH_MAX_FORWARD_CONNECTIONS_PER_TUNNEL: usize = 256;
-pub const DEFAULT_PROXY_REQUEST_BODY_TIMEOUT_SECS: u64 = 30;
+pub const DEFAULT_PROXY_REQUEST_BODY_MAX_DURATION_SECS: u64 = 300;
+pub const DEFAULT_PROXY_REQUEST_BODY_FIRST_BYTE_TIMEOUT_SECS: u64 = 30;
+pub const DEFAULT_PROXY_REQUEST_BODY_IDLE_TIMEOUT_SECS: u64 = 30;
+pub const DEFAULT_PROXY_REQUEST_MEMORY_BUDGET_MB: u64 = 256;
 pub const DEFAULT_PROXY_RESPONSE_HEADER_TIMEOUT_SECS: u64 = 120;
 pub const DEFAULT_PROXY_STREAM_FIRST_EVENT_TIMEOUT_SECS: u64 = 120;
 pub const DEFAULT_PROXY_STREAM_IDLE_TIMEOUT_SECS: u64 = 900;
@@ -290,7 +293,12 @@ impl SshTransportConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxyStreamConfig {
+    /// Effective hard deadline. The deprecated TIMEOUT key remains a hard
+    /// deadline alias; MAX_DURATION, when set, takes precedence over it.
     pub request_body_timeout_secs: u64,
+    pub request_body_first_byte_timeout_secs: u64,
+    pub request_body_idle_timeout_secs: u64,
+    pub request_memory_budget_mb: u64,
     pub response_header_timeout_secs: u64,
     pub first_event_timeout_secs: u64,
     pub idle_timeout_secs: u64,
@@ -304,7 +312,11 @@ pub struct ProxyStreamConfig {
 impl Default for ProxyStreamConfig {
     fn default() -> Self {
         Self {
-            request_body_timeout_secs: DEFAULT_PROXY_REQUEST_BODY_TIMEOUT_SECS,
+            request_body_timeout_secs: DEFAULT_PROXY_REQUEST_BODY_MAX_DURATION_SECS,
+            request_body_first_byte_timeout_secs:
+                DEFAULT_PROXY_REQUEST_BODY_FIRST_BYTE_TIMEOUT_SECS,
+            request_body_idle_timeout_secs: DEFAULT_PROXY_REQUEST_BODY_IDLE_TIMEOUT_SECS,
+            request_memory_budget_mb: DEFAULT_PROXY_REQUEST_MEMORY_BUDGET_MB,
             response_header_timeout_secs: DEFAULT_PROXY_RESPONSE_HEADER_TIMEOUT_SECS,
             first_event_timeout_secs: DEFAULT_PROXY_STREAM_FIRST_EVENT_TIMEOUT_SECS,
             idle_timeout_secs: DEFAULT_PROXY_STREAM_IDLE_TIMEOUT_SECS,
@@ -318,9 +330,13 @@ impl Default for ProxyStreamConfig {
 }
 
 impl ProxyStreamConfig {
-    /// Buffered request body ceiling for ordinary text APIs (`/v1/responses`,
-    /// `/v1/messages`, ...). Bodies are read fully into memory, so the worst
-    /// case resident size is this value times the in-flight request count.
+    pub fn request_memory_budget_bytes(&self) -> usize {
+        mb_to_bytes(self.request_memory_budget_mb)
+    }
+
+    /// Per-request wire/decoded inspection ceiling for ordinary text APIs.
+    /// Retained capacities, copies and JSON scratch have a separate shared
+    /// memory budget; this is not an estimate of total process RSS.
     pub fn request_body_limit_bytes(&self) -> usize {
         mb_to_bytes(self.request_body_limit_mb)
     }
@@ -338,10 +354,28 @@ impl ProxyStreamConfig {
 
     pub fn validate(&self) -> std::result::Result<(), String> {
         validate_u64_range(
-            "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_TIMEOUT_SECS",
+            "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_MAX_DURATION_SECS",
             self.request_body_timeout_secs,
             5,
-            300,
+            3_600,
+        )?;
+        for (key, value) in [
+            (
+                "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_FIRST_BYTE_TIMEOUT_SECS",
+                self.request_body_first_byte_timeout_secs,
+            ),
+            (
+                "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_IDLE_TIMEOUT_SECS",
+                self.request_body_idle_timeout_secs,
+            ),
+        ] {
+            validate_u64_range(key, value, 5, 300)?;
+        }
+        validate_u64_range(
+            "CC_SWITCH_ROUTER_PROXY_REQUEST_MEMORY_BUDGET_MB",
+            self.request_memory_budget_mb,
+            16,
+            65_536,
         )?;
         validate_u64_range(
             "CC_SWITCH_ROUTER_PROXY_RESPONSE_HEADER_TIMEOUT_SECS",
@@ -375,6 +409,8 @@ impl ProxyStreamConfig {
         )?;
         let longest_phase_timeout = self
             .request_body_timeout_secs
+            .max(self.request_body_first_byte_timeout_secs)
+            .max(self.request_body_idle_timeout_secs)
             .max(self.response_header_timeout_secs)
             .max(self.first_event_timeout_secs)
             .max(self.idle_timeout_secs)
@@ -945,9 +981,23 @@ impl Config {
                 ),
             },
             proxy_stream: ProxyStreamConfig {
-                request_body_timeout_secs: env_u64(
-                    "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_TIMEOUT_SECS",
-                    DEFAULT_PROXY_REQUEST_BODY_TIMEOUT_SECS,
+                request_body_timeout_secs: resolve_request_body_max_duration_secs(
+                    env_var("CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_MAX_DURATION_SECS")
+                        .and_then(|value| value.parse().ok()),
+                    env_var("CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_TIMEOUT_SECS")
+                        .and_then(|value| value.parse().ok()),
+                ),
+                request_body_first_byte_timeout_secs: env_u64(
+                    "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_FIRST_BYTE_TIMEOUT_SECS",
+                    DEFAULT_PROXY_REQUEST_BODY_FIRST_BYTE_TIMEOUT_SECS,
+                ),
+                request_body_idle_timeout_secs: env_u64(
+                    "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_IDLE_TIMEOUT_SECS",
+                    DEFAULT_PROXY_REQUEST_BODY_IDLE_TIMEOUT_SECS,
+                ),
+                request_memory_budget_mb: env_u64(
+                    "CC_SWITCH_ROUTER_PROXY_REQUEST_MEMORY_BUDGET_MB",
+                    DEFAULT_PROXY_REQUEST_MEMORY_BUDGET_MB,
                 ),
                 response_header_timeout_secs: env_u64(
                     "CC_SWITCH_ROUTER_PROXY_RESPONSE_HEADER_TIMEOUT_SECS",
@@ -1272,6 +1322,10 @@ impl Config {
     pub fn validate_proxy_stream_config(&self) -> std::result::Result<(), String> {
         for key in [
             "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_TIMEOUT_SECS",
+            "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_MAX_DURATION_SECS",
+            "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_FIRST_BYTE_TIMEOUT_SECS",
+            "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_IDLE_TIMEOUT_SECS",
+            "CC_SWITCH_ROUTER_PROXY_REQUEST_MEMORY_BUDGET_MB",
             "CC_SWITCH_ROUTER_PROXY_RESPONSE_HEADER_TIMEOUT_SECS",
             "CC_SWITCH_ROUTER_PROXY_STREAM_FIRST_EVENT_TIMEOUT_SECS",
             "CC_SWITCH_ROUTER_PROXY_STREAM_IDLE_TIMEOUT_SECS",
@@ -1279,6 +1333,16 @@ impl Config {
             "CC_SWITCH_ROUTER_PROXY_MAX_REQUEST_LIFETIME_SECS",
         ] {
             validate_optional_env_u64(key)?;
+        }
+        if let Some(value) = env_var("CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_TIMEOUT_SECS") {
+            validate_u64_range(
+                "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_TIMEOUT_SECS",
+                value
+                    .parse()
+                    .map_err(|_| "invalid legacy request body timeout".to_string())?,
+                5,
+                300,
+            )?;
         }
         self.proxy_stream.validate()
     }
@@ -1516,7 +1580,11 @@ CC_SWITCH_ROUTER_SSH_BRIDGE_WRITE_STALL_TIMEOUT_SECS=300
 CC_SWITCH_ROUTER_SSH_BRIDGE_HALF_CLOSE_IDLE_TIMEOUT_SECS=300
 CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS=2048
 CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS_PER_TUNNEL=256
-CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_TIMEOUT_SECS=30
+CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_TIMEOUT_SECS=
+CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_MAX_DURATION_SECS=300
+CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_FIRST_BYTE_TIMEOUT_SECS=30
+CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_IDLE_TIMEOUT_SECS=30
+CC_SWITCH_ROUTER_PROXY_REQUEST_MEMORY_BUDGET_MB=256
 CC_SWITCH_ROUTER_PROXY_RESPONSE_HEADER_TIMEOUT_SECS=120
 CC_SWITCH_ROUTER_PROXY_STREAM_FIRST_EVENT_TIMEOUT_SECS=120
 CC_SWITCH_ROUTER_PROXY_STREAM_IDLE_TIMEOUT_SECS=900
@@ -1657,6 +1725,17 @@ fn env_var(key: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+pub fn legacy_request_body_timeout_in_use() -> bool {
+    env_var("CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_TIMEOUT_SECS").is_some()
+        && env_var("CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_MAX_DURATION_SECS").is_none()
+}
+
+pub fn resolve_request_body_max_duration_secs(primary: Option<u64>, legacy: Option<u64>) -> u64 {
+    primary
+        .or(legacy)
+        .unwrap_or(DEFAULT_PROXY_REQUEST_BODY_MAX_DURATION_SECS)
 }
 
 fn env_bool(key: &str, default: bool) -> bool {
@@ -2120,7 +2199,10 @@ mod tests {
     #[test]
     fn proxy_stream_defaults_and_env_surface_are_valid() {
         let defaults = ProxyStreamConfig::default();
-        assert_eq!(defaults.request_body_timeout_secs, 30);
+        assert_eq!(defaults.request_body_timeout_secs, 300);
+        assert_eq!(defaults.request_body_first_byte_timeout_secs, 30);
+        assert_eq!(defaults.request_body_idle_timeout_secs, 30);
+        assert_eq!(defaults.request_memory_budget_mb, 256);
         assert_eq!(defaults.response_header_timeout_secs, 120);
         assert_eq!(defaults.first_event_timeout_secs, 120);
         assert_eq!(defaults.idle_timeout_secs, 900);
@@ -2136,7 +2218,11 @@ mod tests {
 
         let contents = default_env_contents();
         for expected in [
-            "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_TIMEOUT_SECS=30",
+            "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_TIMEOUT_SECS=",
+            "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_MAX_DURATION_SECS=300",
+            "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_FIRST_BYTE_TIMEOUT_SECS=30",
+            "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_IDLE_TIMEOUT_SECS=30",
+            "CC_SWITCH_ROUTER_PROXY_REQUEST_MEMORY_BUDGET_MB=256",
             "CC_SWITCH_ROUTER_PROXY_RESPONSE_HEADER_TIMEOUT_SECS=120",
             "CC_SWITCH_ROUTER_PROXY_STREAM_FIRST_EVENT_TIMEOUT_SECS=120",
             "CC_SWITCH_ROUTER_PROXY_STREAM_IDLE_TIMEOUT_SECS=900",
@@ -2148,6 +2234,67 @@ mod tests {
         ] {
             assert!(contents.contains(expected), "missing default: {expected}");
         }
+    }
+
+    #[test]
+    fn request_body_deadline_migration_preserves_explicit_legacy_semantics() {
+        assert_eq!(resolve_request_body_max_duration_secs(None, None), 300);
+        assert_eq!(resolve_request_body_max_duration_secs(None, Some(30)), 30);
+        assert_eq!(resolve_request_body_max_duration_secs(None, Some(120)), 120);
+        assert_eq!(
+            resolve_request_body_max_duration_secs(Some(300), Some(30)),
+            300
+        );
+        assert_eq!(resolve_request_body_max_duration_secs(Some(600), None), 600);
+    }
+
+    #[test]
+    fn request_body_phase_and_memory_settings_are_validated() {
+        for value in [0, 4, 301] {
+            assert!(
+                ProxyStreamConfig {
+                    request_body_first_byte_timeout_secs: value,
+                    ..Default::default()
+                }
+                .validate()
+                .is_err()
+            );
+            assert!(
+                ProxyStreamConfig {
+                    request_body_idle_timeout_secs: value,
+                    ..Default::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        for value in [0, 15, 65_537] {
+            assert!(
+                ProxyStreamConfig {
+                    request_memory_budget_mb: value,
+                    ..Default::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        assert!(
+            ProxyStreamConfig {
+                request_body_timeout_secs: 3600,
+                ..Default::default()
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            ProxyStreamConfig {
+                request_body_timeout_secs: 3600,
+                max_request_lifetime_secs: 3600,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     #[test]
@@ -2224,7 +2371,7 @@ mod tests {
             };
             assert!(config.validate().is_err());
         }
-        for request_body_timeout_secs in [0, 4, 301] {
+        for request_body_timeout_secs in [0, 4, 3_601] {
             let config = ProxyStreamConfig {
                 request_body_timeout_secs,
                 ..Default::default()

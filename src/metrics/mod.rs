@@ -311,6 +311,7 @@ impl MetricsRegistry {
         let counts = proxy.counts().await;
         let share_requests = proxy.share_request_registry_snapshot().await;
         RouterMetricsStatus {
+            proxy_request_body: Some(proxy.request_body_metrics()),
             active_routes: counts.active_routes as u64,
             pending_routes: counts.pending_routes as u64,
             health_probe_failure_cache: counts.health_probe_failure_cache as u64,

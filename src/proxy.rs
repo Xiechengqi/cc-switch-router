@@ -26,6 +26,7 @@ use crate::config::{Config, ProxyStreamConfig};
 use crate::error::AppError;
 use crate::metrics::models::LlmRequestMetric;
 use crate::metrics::{MetricsPermit, MetricsRegistry};
+use crate::proxy_request_body::{BodyBudget, BodyContext, BodyFailure};
 use crate::proxy_stream::{
     MAX_PROXY_IMAGE_STREAM_EVENT_BYTES, ProxyStreamDetector, ProxyStreamFailure,
     ProxyStreamParseError, ProxyStreamProtocol, proxy_stream_error_frame,
@@ -1165,6 +1166,7 @@ impl KeyedConcurrencyLimiter {
 
 #[derive(Debug, Default)]
 pub struct ProxyRegistry {
+    request_body_budget: Arc<BodyBudget>,
     routes: Arc<RwLock<HashMap<String, LogicalRoute>>>,
     pending_routes: RwLock<HashMap<String, PendingRouteEntry>>,
     health_probe_failures: Mutex<HashMap<String, Instant>>,
@@ -1181,6 +1183,15 @@ pub struct ProxyRegistryCounts {
 }
 
 impl ProxyRegistry {
+    pub(crate) fn request_body_metrics(&self) -> crate::proxy_request_body::BodyMetrics {
+        self.request_body_budget.snapshot()
+    }
+
+    pub(crate) fn configure_request_body_budget(&self, config: &ProxyStreamConfig) {
+        self.request_body_budget
+            .configure(config.request_memory_budget_bytes());
+    }
+
     pub async fn set_route(
         &self,
         subdomain: String,
@@ -2007,9 +2018,19 @@ fn shutdown_logical_route(route: Option<LogicalRoute>) {
 pub async fn gateway_proxy_handler(
     State(state): State<ServerState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    mut req: Request,
+) -> Response {
+    let context = BodyContext::attach(&mut req, peer);
+    context.finish(gateway_proxy_handler_inner(state, peer, req).await)
+}
+
+async fn gateway_proxy_handler_inner(
+    state: ServerState,
+    peer: SocketAddr,
     req: Request,
 ) -> Response {
     let (parts, body) = req.into_parts();
+    let body_context = parts.extensions.get::<Arc<BodyContext>>().unwrap().clone();
     let method = parts.method.clone();
     let host = parts
         .headers
@@ -2034,33 +2055,25 @@ pub async fn gateway_proxy_handler(
     let user_country = client_metadata.country_code.as_deref().unwrap_or("-");
     let user_asn = trusted_asn_header(&parts.headers, peer);
     let user_agent = header_str(&parts.headers, "user-agent");
+    // Gateway prefixes must not accidentally select the ordinary text limit
+    // for an image/video submission.
+    let body_limit_path = path
+        .strip_prefix("/_gateway/proxy/")
+        .and_then(|rest| rest.split_once('/'))
+        .map(|(_, path)| path)
+        .unwrap_or(&path);
     let body_bytes = match read_proxy_request_body(
+        &state,
+        &body_context,
+        &parts.headers,
         body,
-        proxy_request_body_limit(&path, &state.config.proxy_stream),
-        Duration::from_secs(state.config.proxy_stream.request_body_timeout_secs),
+        body_limit_path,
+        "gateway",
     )
     .await
     {
         Ok(bytes) => bytes,
-        Err(ProxyRequestBodyReadError::Timeout) => {
-            state.metrics.record_proxy_request_body_timeout();
-            warn!(method = %method, host = %host, path = %path, "gateway proxy request body timed out");
-            return simple_response(StatusCode::REQUEST_TIMEOUT, "request-body-timeout");
-        }
-        Err(ProxyRequestBodyReadError::Rejected(err)) => {
-            warn!(
-                method = %method,
-                host = %host,
-                path = %path,
-                client_ip = %user_ip,
-                client_country = %user_country,
-                client_asn = %user_asn,
-                user_agent = %user_agent,
-                error = %err,
-                "gateway proxy request body read failed"
-            );
-            return simple_response(StatusCode::PAYLOAD_TOO_LARGE, "request-body-too-large");
-        }
+        Err(error) => return body_context.error_response(&error, false),
     };
     let body_hash = crate::api::sha256_hex(&body_bytes);
     let gateway = match authenticate_gateway_proxy(&state, &parts.headers, &body_hash).await {
@@ -2131,13 +2144,28 @@ pub async fn gateway_proxy_handler(
         return simple_response(StatusCode::FORBIDDEN, "share-not-authorized-for-gateway");
     }
 
-    if let Some(requested_model) =
-        extract_user_model_request_model(&request_app, &forwarded_path, &body_bytes)
-        && state
-            .store
-            .is_requested_model_blocked(&share_id, &request_app, &requested_model)
-    {
-        return requested_model_blocked_response(&request_app, &requested_model);
+    if state.store.share_has_requested_model_blocks(&share_id) {
+        let decoded = match inspect_proxy_request_body(
+            &state,
+            &body_context,
+            &parts.headers,
+            &body_bytes,
+            &forwarded_path,
+            "gateway_model_block",
+        )
+        .await
+        {
+            Ok(decoded) => decoded,
+            Err(error) => return body_context.error_response(&error, false),
+        };
+        if let Some(requested_model) =
+            extract_user_model_request_model(&request_app, &forwarded_path, &decoded)
+            && state
+                .store
+                .is_requested_model_blocked(&share_id, &request_app, &requested_model)
+        {
+            return requested_model_blocked_response(&request_app, &requested_model);
+        }
     }
 
     let Some((route, route_inflight_guard)) = state.proxy.route_for_share_request(&share_id).await
@@ -2460,9 +2488,12 @@ pub(crate) fn is_user_model_api_host(host: &str, tunnel_domain: &str) -> bool {
 pub async fn user_model_proxy_handler(
     State(state): State<ServerState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    req: Request,
+    mut req: Request,
 ) -> Response {
-    with_unified_api_cors(user_model_proxy_handler_inner(state, peer, req).await)
+    let context = BodyContext::attach(&mut req, peer);
+    context.finish(with_unified_api_cors(
+        user_model_proxy_handler_inner(state, peer, req).await,
+    ))
 }
 
 async fn user_model_proxy_handler_inner(
@@ -2471,6 +2502,7 @@ async fn user_model_proxy_handler_inner(
     req: Request,
 ) -> Response {
     let (parts, body) = req.into_parts();
+    let body_context = parts.extensions.get::<Arc<BodyContext>>().unwrap().clone();
     let method = parts.method.clone();
     let path = parts.uri.path().to_string();
 
@@ -2567,32 +2599,32 @@ async fn user_model_proxy_handler_inner(
     }
 
     let body_bytes = match read_proxy_request_body(
+        &state,
+        &body_context,
+        &parts.headers,
         body,
-        proxy_request_body_limit(&path, &state.config.proxy_stream),
-        Duration::from_secs(state.config.proxy_stream.request_body_timeout_secs),
+        &path,
+        "unified",
     )
     .await
     {
         Ok(body) => body,
-        Err(ProxyRequestBodyReadError::Timeout) => {
-            state.metrics.record_proxy_request_body_timeout();
-            return unified_api_error_response(
-                StatusCode::REQUEST_TIMEOUT,
-                "user_model_route_request_body_timeout",
-                "request body timed out",
-                serde_json::json!({}),
-            );
-        }
-        Err(ProxyRequestBodyReadError::Rejected(_)) => {
-            return unified_api_error_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "user_model_route_request_body_too_large",
-                "request body is too large",
-                serde_json::json!({}),
-            );
-        }
+        Err(error) => return body_context.error_response(&error, true),
     };
-    let requested_model = match extract_user_model_request_model(&app_type, &path, &body_bytes) {
+    let decoded = match inspect_proxy_request_body(
+        &state,
+        &body_context,
+        &parts.headers,
+        &body_bytes,
+        &path,
+        "unified",
+    )
+    .await
+    {
+        Ok(bytes) => bytes,
+        Err(error) => return body_context.error_response(&error, true),
+    };
+    let requested_model = match extract_user_model_request_model(&app_type, &path, &decoded) {
         Some(model) => model,
         None => {
             return unified_api_error_response(
@@ -2604,6 +2636,7 @@ async fn user_model_proxy_handler_inner(
         }
     };
 
+    drop(decoded);
     let resolution = match state
         .store
         .resolve_user_model_route(
@@ -2737,6 +2770,17 @@ async fn user_model_proxy_handler_inner(
             &attempt_resolution,
         )
         .await;
+
+        if response
+            .extensions()
+            .get::<crate::proxy_request_body::LocalIngressFailure>()
+            .is_some()
+        {
+            state
+                .route_breakers
+                .record_neutral(&resolution.route_id, target_share_id, was_probe);
+            return response;
+        }
 
         let status = response.status();
         let retry_after = response
@@ -2897,9 +2941,7 @@ pub(crate) fn extract_user_model_request_model(
             .ok()?;
         return normalize_extracted_user_model(&model);
     }
-    let payload = serde_json::from_slice::<Value>(body).ok()?;
-    let model = payload.get("model")?.as_str()?;
-    normalize_extracted_user_model(model)
+    crate::proxy_request_body::json_model(&crate::proxy_request_body::json_fields(body)?)
 }
 
 fn normalize_extracted_user_model(model: &str) -> Option<String> {
@@ -3311,7 +3353,7 @@ pub(crate) fn with_unified_api_cors(mut response: Response) -> Response {
     response.headers_mut().insert(
         header::ACCESS_CONTROL_EXPOSE_HEADERS,
         HeaderValue::from_static(
-            "x-request-id, x-cc-switch-request-id, x-cc-switch-error-code, x-cc-switch-error-scope, x-share-router-error, retry-after",
+            "x-request-id, x-cc-switch-request-id, x-cc-switch-ingress-request-id, x-cc-switch-error-code, x-cc-switch-error-scope, x-share-router-error, retry-after",
         ),
     );
     response
@@ -3394,9 +3436,15 @@ pub(crate) async fn is_direct_share_model_api_request(
 pub async fn proxy_handler(
     State(state): State<ServerState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    req: Request,
+    mut req: Request,
 ) -> Response {
+    let context = BodyContext::attach(&mut req, peer);
+    context.finish(proxy_handler_inner(state, peer, req).await)
+}
+
+async fn proxy_handler_inner(state: ServerState, peer: SocketAddr, req: Request) -> Response {
     let (parts, mut body) = req.into_parts();
+    let body_context = parts.extensions.get::<Arc<BodyContext>>().unwrap().clone();
     let method = parts.method.clone();
     let host = parts
         .headers
@@ -3478,12 +3526,6 @@ pub async fn proxy_handler(
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .simple(status, reason)
-    };
-    let json_error_response = |status: StatusCode, message: &str| {
-        error_capture
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .json_message(status, message)
     };
     if !host_matches_tunnel_domain(&host, &state.config.tunnel_domain) {
         tracing::debug!(
@@ -3857,26 +3899,32 @@ pub async fn proxy_handler(
         && let Some(app_type) = infer_share_request_app(&path)
     {
         let body_bytes = match read_proxy_request_body(
+            &state,
+            &body_context,
+            &parts.headers,
             body,
-            proxy_request_body_limit(&path, &state.config.proxy_stream),
-            Duration::from_secs(state.config.proxy_stream.request_body_timeout_secs),
+            &path,
+            "model_block",
         )
         .await
         {
             Ok(body) => body,
-            Err(ProxyRequestBodyReadError::Timeout) => {
-                state.metrics.record_proxy_request_body_timeout();
-                return json_error_response(StatusCode::REQUEST_TIMEOUT, "request-body-timeout");
-            }
-            Err(ProxyRequestBodyReadError::Rejected(_)) => {
-                return json_error_response(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "request-body-too-large",
-                );
-            }
+            Err(error) => return body_context.error_response(&error, false),
         };
-        if let Some(requested_model) =
-            extract_user_model_request_model(&app_type, &path, &body_bytes)
+        let decoded = match inspect_proxy_request_body(
+            &state,
+            &body_context,
+            &parts.headers,
+            &body_bytes,
+            &path,
+            "model_block",
+        )
+        .await
+        {
+            Ok(bytes) => bytes,
+            Err(error) => return body_context.error_response(&error, false),
+        };
+        if let Some(requested_model) = extract_user_model_request_model(&app_type, &path, &decoded)
             && state
                 .store
                 .is_requested_model_blocked(share_id, &app_type, &requested_model)
@@ -3890,43 +3938,47 @@ pub async fn proxy_handler(
         && is_image_generation_submit_path(&path)
     {
         let body_bytes = match read_proxy_request_body(
+            &state,
+            &body_context,
+            &parts.headers,
             body,
-            proxy_request_body_limit(&path, &state.config.proxy_stream),
-            Duration::from_secs(state.config.proxy_stream.request_body_timeout_secs),
+            &path,
+            "image",
         )
         .await
         {
             Ok(body) => body,
-            Err(ProxyRequestBodyReadError::Timeout) => {
-                state.metrics.record_proxy_request_body_timeout();
-                warn!(method = %method, host = %host, path = %path_and_query, "image generation request body timed out");
-                return json_error_response(StatusCode::REQUEST_TIMEOUT, "request-body-timeout");
-            }
-            Err(ProxyRequestBodyReadError::Rejected(err)) => {
-                warn!(
-                    method = %method,
-                    host = %host,
-                    path = %path_and_query,
-                    backend = %backend,
-                    client_ip = %user_ip,
-                    client_country = %user_country,
-                    client_asn = %user_asn,
-                    user_agent = %user_agent,
-                    error = %err,
-                    "image generation request body read failed"
-                );
-                return json_error_response(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "request-body-too-large",
-                );
-            }
+            Err(error) => return body_context.error_response(&error, false),
         };
-        if image_generation_request_wants_stream(&body_bytes) {
+        let decoded = match inspect_proxy_request_body(
+            &state,
+            &body_context,
+            &parts.headers,
+            &body_bytes,
+            &path,
+            "image",
+        )
+        .await
+        {
+            Ok(bytes) => bytes,
+            Err(error) => return body_context.error_response(&error, false),
+        };
+        if image_generation_request_wants_stream(&decoded) {
+            let prepared = match body_context.rewrite_image(
+                &decoded,
+                &parts.headers,
+                &state.config.proxy_stream,
+                &state.proxy.request_body_budget,
+            ) {
+                Ok(prepared) => prepared,
+                Err(error) => return body_context.error_response(&error, false),
+            };
+            drop(decoded);
             return handle_image_generation_stream_submit(
                 &state,
                 &route,
                 route_inflight_guard,
-                body_bytes,
+                prepared,
                 api_user_email,
                 user_ip,
                 user_country.to_string(),
@@ -4010,36 +4062,13 @@ pub async fn proxy_handler(
     let admission_request_id =
         (!skips_share_edge_auth && route.is_share()).then(|| Uuid::new_v4().to_string());
 
-    let body = match read_proxy_request_body(
-        body,
-        proxy_request_body_limit(&path, &state.config.proxy_stream),
-        Duration::from_secs(state.config.proxy_stream.request_body_timeout_secs),
-    )
-    .await
-    {
-        Ok(body) => body,
-        Err(ProxyRequestBodyReadError::Timeout) => {
-            state.metrics.record_proxy_request_body_timeout();
-            warn!(method = %method, host = %host, path = %path_and_query, "proxy request body timed out");
-            return simple_response(StatusCode::REQUEST_TIMEOUT, "request-body-timeout");
-        }
-        Err(ProxyRequestBodyReadError::Rejected(err)) => {
-            warn!(
-                method = %method,
-                host = %host,
-                path = %path_and_query,
-                backend = %backend,
-                share_id = %log_share_id,
-                client_ip = %user_ip,
-                client_country = %user_country,
-                client_asn = %user_asn,
-                user_agent = %user_agent,
-                error = %err,
-                "proxy request body read failed"
-            );
-            return simple_response(StatusCode::PAYLOAD_TOO_LARGE, "request-body-too-large");
-        }
-    };
+    let body =
+        match read_proxy_request_body(&state, &body_context, &parts.headers, body, &path, "direct")
+            .await
+        {
+            Ok(body) => body,
+            Err(error) => return body_context.error_response(&error, false),
+        };
     let share_permit = if skips_share_edge_auth {
         None
     } else if let Some(share_id) = route.share_id.as_deref() {
@@ -4683,22 +4712,66 @@ fn proxy_request_body_limit(path_and_query: &str, limits: &ProxyStreamConfig) ->
     }
 }
 
-#[derive(Debug)]
-enum ProxyRequestBodyReadError {
-    Timeout,
-    Rejected(axum::Error),
+async fn read_proxy_request_body(
+    state: &ServerState,
+    context: &BodyContext,
+    headers: &HeaderMap,
+    body: Body,
+    path: &str,
+    surface: &str,
+) -> Result<Bytes, BodyFailure> {
+    let result = context
+        .collect(
+            body,
+            headers,
+            proxy_request_body_limit(path, &state.config.proxy_stream),
+            &state.config.proxy_stream,
+            &state.proxy.request_body_budget,
+            surface,
+        )
+        .await;
+    if result.as_ref().is_err_and(|error| error.kind.is_timeout()) {
+        state.metrics.record_proxy_request_body_timeout();
+    }
+    result
 }
 
-async fn read_proxy_request_body(
-    body: Body,
-    limit: usize,
-    timeout: Duration,
-) -> Result<Bytes, ProxyRequestBodyReadError> {
-    match tokio::time::timeout(timeout, axum::body::to_bytes(body, limit)).await {
-        Ok(Ok(bytes)) => Ok(bytes),
-        Ok(Err(error)) => Err(ProxyRequestBodyReadError::Rejected(error)),
-        Err(_) => Err(ProxyRequestBodyReadError::Timeout),
+struct InspectedRequestBody {
+    bytes: Bytes,
+    _workspace: crate::proxy_request_body::JsonWorkspace,
+}
+impl std::ops::Deref for InspectedRequestBody {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.bytes
     }
+}
+
+async fn inspect_proxy_request_body(
+    state: &ServerState,
+    context: &BodyContext,
+    headers: &HeaderMap,
+    wire: &Bytes,
+    path: &str,
+    surface: &str,
+) -> Result<InspectedRequestBody, BodyFailure> {
+    let config = &state.config.proxy_stream;
+    let budget = &state.proxy.request_body_budget;
+    let bytes = context
+        .decoded(
+            wire,
+            headers,
+            proxy_request_body_limit(path, config),
+            config,
+            budget,
+            surface,
+        )
+        .await?;
+    let workspace = context.json_workspace(&bytes, headers, config, budget, surface)?;
+    Ok(InspectedRequestBody {
+        bytes,
+        _workspace: workspace,
+    })
 }
 
 async fn await_share_request_or_cancel<F>(
@@ -4776,9 +4849,9 @@ async fn read_proxy_upstream_body(
 }
 
 fn image_generation_request_wants_stream(body: &[u8]) -> bool {
-    serde_json::from_slice::<Value>(body)
-        .ok()
-        .and_then(|value| value.get("stream").and_then(Value::as_bool))
+    crate::proxy_request_body::json_fields(body)
+        .and_then(|fields| fields.stream)
+        .and_then(|raw| serde_json::from_str::<bool>(raw.get()).ok())
         .unwrap_or(false)
 }
 
@@ -4786,7 +4859,7 @@ async fn handle_image_generation_stream_submit(
     state: &ServerState,
     route: &RouteEntry,
     route_inflight_guard: RouteInflightGuard,
-    body: axum::body::Bytes,
+    prepared: (Bytes, String, String),
     api_user_email: Option<String>,
     user_ip: String,
     user_country: String,
@@ -4937,48 +5010,11 @@ async fn handle_image_generation_stream_submit(
     share_permit.register_keyed_permit(&image_permit);
     let share_cancellation = share_permit.cancellation_token();
 
-    let mut payload = match serde_json::from_slice::<Value>(&body) {
-        Ok(Value::Object(map)) => map,
-        Ok(_) => {
-            return json_error_response(
-                StatusCode::BAD_REQUEST,
-                "image request body must be a JSON object",
-            );
-        }
-        Err(err) => {
-            return json_error_response(
-                StatusCode::BAD_REQUEST,
-                &format!("invalid image request json: {err}"),
-            );
-        }
-    };
-    let model = payload
-        .get("model")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("gpt-5.5")
-        .to_string();
+    let (upstream_body, model, output_format) = prepared;
     // Keep the legacy result-log schema readable, but do not persist prompts
     // for new image requests. Unified media Usage is intentionally metadata-only.
     let prompt_preview = None;
-    let output_format = payload
-        .get("output_format")
-        .or_else(|| payload.get("format"))
-        .and_then(Value::as_str)
-        .map(normalize_image_output_format)
-        .unwrap_or_else(|| "png".to_string());
-    payload.insert("stream".into(), Value::Bool(true));
-    payload.insert("response_format".into(), Value::String("b64_json".into()));
-    let upstream_body = match serde_json::to_vec(&Value::Object(payload)) {
-        Ok(body) => body,
-        Err(err) => {
-            return json_error_response(
-                StatusCode::BAD_REQUEST,
-                &format!("serialize image request failed: {err}"),
-            );
-        }
-    };
+    let output_format = normalize_image_output_format(&output_format);
 
     let log_meta = ImageStreamLogMeta {
         request_id: admission_request_id.clone(),
@@ -11443,14 +11479,8 @@ data: {"type":"image_generation.completed","b64_json":"iVBORw0KGgo="}
 
     #[tokio::test]
     async fn request_body_and_response_header_reads_are_bounded() {
-        let body = Body::from_stream(futures_util::stream::pending::<
-            Result<Bytes, std::convert::Infallible>,
-        >());
-        assert!(matches!(
-            read_proxy_request_body(body, 1024, Duration::from_millis(20)).await,
-            Err(ProxyRequestBodyReadError::Timeout)
-        ));
-
+        // Body first-byte/idle/hard deadlines have independent virtual-clock
+        // coverage in proxy_request_body::tests.
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();

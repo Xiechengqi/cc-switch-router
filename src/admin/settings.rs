@@ -2161,14 +2161,66 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
     },
     SettingsField {
         key: "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_TIMEOUT_SECS",
-        label: "Request body timeout (seconds)",
+        label: "Legacy request body hard timeout (seconds)",
+        group: "Proxy streaming",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: None,
+        description: "Deprecated hard upload deadline alias (5-300 seconds), not an idle timeout. MAX_DURATION takes precedence. Existing explicit 30 still caps uploads at 30 seconds; set MAX_DURATION=300 to migrate.",
+        placeholder: Some("30"),
+        dynamic_group: None,
+        tier: SettingsTier::Advanced,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_MAX_DURATION_SECS",
+        label: "Request body hard deadline (seconds)",
+        group: "Proxy streaming",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("300"),
+        description: "Absolute upload deadline (5-3600 seconds). Overrides the legacy TIMEOUT key; absent both, defaults to 300. Progress does not extend it.",
+        placeholder: Some("300"),
+        dynamic_group: None,
+        tier: SettingsTier::Advanced,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_FIRST_BYTE_TIMEOUT_SECS",
+        label: "Request body first byte timeout (seconds)",
         group: "Proxy streaming",
         field_type: FieldType::Int,
         required: false,
         restart_required: true,
         default: Some("30"),
-        description: "Stop reading a downstream request body after this interval (5-300 seconds). Share concurrency is acquired only after the body is complete.",
+        description: "Maximum wait for the first nonempty body data (5-300 seconds). Empty frames do not count as progress.",
         placeholder: Some("30"),
+        dynamic_group: None,
+        tier: SettingsTier::Advanced,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_IDLE_TIMEOUT_SECS",
+        label: "Request body idle timeout (seconds)",
+        group: "Proxy streaming",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("30"),
+        description: "Maximum gap between nonempty body data (5-300 seconds). A progressing upload may exceed 30 seconds, up to the hard deadline.",
+        placeholder: Some("30"),
+        dynamic_group: None,
+        tier: SettingsTier::Advanced,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_PROXY_REQUEST_MEMORY_BUDGET_MB",
+        label: "Request body process memory budget (MiB)",
+        group: "Proxy streaming",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("256"),
+        description: "Fail-fast shared ingress memory budget (16-65536 MiB) for retained buffers, copies, decompression and JSON inspection. Capacity exhaustion is 503, not 413. Not a process RSS limit.",
+        placeholder: Some("256"),
         dynamic_group: None,
         tier: SettingsTier::Advanced,
     },
@@ -2546,7 +2598,11 @@ fn constraints_for_field(key: &str) -> FieldConstraints {
         "CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS" => Some((1.0, 65_536.0)),
         "CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS_PER_TUNNEL" => Some((1.0, 4_096.0)),
         "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_TIMEOUT_SECS"
+        | "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_FIRST_BYTE_TIMEOUT_SECS"
+        | "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_IDLE_TIMEOUT_SECS"
         | "CC_SWITCH_ROUTER_PROXY_DOWNSTREAM_STALL_TIMEOUT_SECS" => Some((5.0, 300.0)),
+        "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_MAX_DURATION_SECS" => Some((5.0, 3_600.0)),
+        "CC_SWITCH_ROUTER_PROXY_REQUEST_MEMORY_BUDGET_MB" => Some((16.0, 65_536.0)),
         "CC_SWITCH_ROUTER_PROXY_RESPONSE_HEADER_TIMEOUT_SECS"
         | "CC_SWITCH_ROUTER_PROXY_STREAM_FIRST_EVENT_TIMEOUT_SECS" => Some((5.0, 600.0)),
         "CC_SWITCH_ROUTER_PROXY_STREAM_IDLE_TIMEOUT_SECS" => Some((30.0, 3_600.0)),
@@ -3982,6 +4038,10 @@ fn validate_proxy_stream_relations(
         "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_LIMIT_MB",
         "CC_SWITCH_ROUTER_PROXY_MEDIA_REQUEST_BODY_LIMIT_MB",
         "CC_SWITCH_ROUTER_PROXY_IMAGE_REQUEST_BODY_LIMIT_MB",
+        "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_MAX_DURATION_SECS",
+        "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_FIRST_BYTE_TIMEOUT_SECS",
+        "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_IDLE_TIMEOUT_SECS",
+        "CC_SWITCH_ROUTER_PROXY_REQUEST_MEMORY_BUDGET_MB",
     ];
     if !keys.iter().any(|key| updates.contains_key(*key)) {
         return Ok(());
@@ -3990,8 +4050,31 @@ fn validate_proxy_stream_relations(
         request_body_timeout_secs: resolved_ssh_u64(
             next,
             updates,
-            keys[0],
-            crate::config::DEFAULT_PROXY_REQUEST_BODY_TIMEOUT_SECS,
+            keys[9],
+            resolved_ssh_u64(
+                next,
+                updates,
+                keys[0],
+                crate::config::DEFAULT_PROXY_REQUEST_BODY_MAX_DURATION_SECS,
+            )?,
+        )?,
+        request_body_first_byte_timeout_secs: resolved_ssh_u64(
+            next,
+            updates,
+            keys[10],
+            crate::config::DEFAULT_PROXY_REQUEST_BODY_FIRST_BYTE_TIMEOUT_SECS,
+        )?,
+        request_body_idle_timeout_secs: resolved_ssh_u64(
+            next,
+            updates,
+            keys[11],
+            crate::config::DEFAULT_PROXY_REQUEST_BODY_IDLE_TIMEOUT_SECS,
+        )?,
+        request_memory_budget_mb: resolved_ssh_u64(
+            next,
+            updates,
+            keys[12],
+            crate::config::DEFAULT_PROXY_REQUEST_MEMORY_BUDGET_MB,
         )?,
         response_header_timeout_secs: resolved_ssh_u64(
             next,
@@ -5422,6 +5505,70 @@ mod tests {
     }
 
     #[test]
+    fn request_body_settings_migrate_legacy_deadline_and_validate_new_ranges() {
+        let existing = HashMap::from([(
+            "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_TIMEOUT_SECS".into(),
+            "30".into(),
+        )]);
+        let updates = BTreeMap::from([
+            (
+                "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_MAX_DURATION_SECS".into(),
+                Some("300".into()),
+            ),
+            (
+                "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_FIRST_BYTE_TIMEOUT_SECS".into(),
+                Some("30".into()),
+            ),
+            (
+                "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_IDLE_TIMEOUT_SECS".into(),
+                Some("30".into()),
+            ),
+            (
+                "CC_SWITCH_ROUTER_PROXY_REQUEST_MEMORY_BUDGET_MB".into(),
+                Some("256".into()),
+            ),
+        ]);
+        assert!(validate_and_diff(&existing, &updates).is_ok());
+        for (key, invalid) in [
+            (
+                "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_MAX_DURATION_SECS",
+                "3601",
+            ),
+            (
+                "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_FIRST_BYTE_TIMEOUT_SECS",
+                "4",
+            ),
+            (
+                "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_IDLE_TIMEOUT_SECS",
+                "301",
+            ),
+            ("CC_SWITCH_ROUTER_PROXY_REQUEST_MEMORY_BUDGET_MB", "15"),
+            ("CC_SWITCH_ROUTER_PROXY_REQUEST_MEMORY_BUDGET_MB", "65537"),
+            ("CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_TIMEOUT_SECS", "301"),
+        ] {
+            assert!(
+                validate_and_diff(
+                    &existing,
+                    &BTreeMap::from([(key.into(), Some(invalid.into()))])
+                )
+                .is_err(),
+                "{key}"
+            );
+        }
+        let updates = BTreeMap::from([
+            (
+                "CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_MAX_DURATION_SECS".into(),
+                Some("3600".into()),
+            ),
+            (
+                "CC_SWITCH_ROUTER_PROXY_MAX_REQUEST_LIFETIME_SECS".into(),
+                Some("3600".into()),
+            ),
+        ]);
+        assert!(validate_and_diff(&existing, &updates).is_err());
+    }
+
+    #[test]
     fn turso_mode_requires_url_and_secret_token() {
         let existing = HashMap::new();
         let mut updates =
@@ -5925,8 +6072,8 @@ mod tests {
     #[test]
     fn settings_contract_places_every_field_in_one_section() {
         let schema = schema_response();
-        assert_eq!(SETTINGS_FIELDS.len(), 133);
-        assert_eq!(schema.fields.len(), 133);
+        assert_eq!(SETTINGS_FIELDS.len(), 137);
+        assert_eq!(schema.fields.len(), 137);
         assert_eq!(schema.categories.len(), SettingsCategory::ALL.len());
         assert!(
             SETTINGS_FIELDS

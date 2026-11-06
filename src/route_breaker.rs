@@ -113,13 +113,30 @@ impl RouteBreakerRegistry {
         }
     }
 
+    /// Release a local rejection without treating it as upstream health evidence.
+    pub fn record_neutral(&self, route_id: &str, target_share_id: &str, was_probe: bool) {
+        if !was_probe {
+            return;
+        }
+        let key = BreakerKey {
+            route_id: route_id.into(),
+            target_share_id: target_share_id.into(),
+        };
+        let mut states = self.states.write().unwrap_or_else(|p| p.into_inner());
+        if let Some(state) = states.get_mut(&key) {
+            state.probe_in_flight = false;
+        }
+    }
+
     pub fn record_success(&self, route_id: &str, target_share_id: &str, was_probe: bool) {
         let key = BreakerKey {
             route_id: route_id.to_string(),
             target_share_id: target_share_id.to_string(),
         };
         let mut states = self.states.write().unwrap_or_else(|p| p.into_inner());
-        let Some(state) = states.get_mut(&key) else { return };
+        let Some(state) = states.get_mut(&key) else {
+            return;
+        };
         if was_probe {
             state.probe_in_flight = false;
         }
@@ -147,8 +164,7 @@ impl RouteBreakerRegistry {
             state.probe_in_flight = false;
         }
         state.consecutive_failures = state.consecutive_failures.saturating_add(1);
-        if state.phase == BreakerPhase::HalfOpen
-            || state.consecutive_failures >= FAILURE_THRESHOLD
+        if state.phase == BreakerPhase::HalfOpen || state.consecutive_failures >= FAILURE_THRESHOLD
         {
             let cooldown = retry_after
                 .map(|value| value.min(MAX_COOLDOWN))
@@ -166,16 +182,39 @@ impl RouteBreakerRegistry {
             target_share_id: target_share_id.to_string(),
         };
         let states = self.states.read().unwrap_or_else(|p| p.into_inner());
-        matches!(
-            states.get(&key).map(|s| s.phase),
-            Some(BreakerPhase::Open)
-        )
+        matches!(states.get(&key).map(|s| s.phase), Some(BreakerPhase::Open))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_rejection_releases_half_open_probe_without_resetting_failures() {
+        let registry = RouteBreakerRegistry::new();
+        for _ in 0..FAILURE_THRESHOLD {
+            registry.record_failure("r", "s", false, Some(Duration::ZERO));
+        }
+        assert_eq!(
+            registry.acquire("r", "s"),
+            BreakerPermit::Allowed { was_probe: true }
+        );
+        registry.record_neutral("r", "s", true);
+        assert_eq!(
+            registry.acquire("r", "s"),
+            BreakerPermit::Allowed { was_probe: true }
+        );
+        let states = registry.states.read().unwrap();
+        let state = states
+            .get(&BreakerKey {
+                route_id: "r".into(),
+                target_share_id: "s".into(),
+            })
+            .unwrap();
+        assert_eq!(state.phase, BreakerPhase::HalfOpen);
+        assert_eq!(state.consecutive_failures, FAILURE_THRESHOLD);
+    }
 
     #[test]
     fn closed_allows_traffic() {

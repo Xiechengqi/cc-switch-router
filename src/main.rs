@@ -62,6 +62,7 @@ mod process_lock;
 mod provider_presentation;
 mod provision_ssh;
 mod proxy;
+mod proxy_request_body;
 mod proxy_stream;
 mod public_hosts;
 mod recent_traffic;
@@ -154,6 +155,12 @@ async fn main() -> Result<()> {
 
     let config = Config::from_env();
     validate_runtime_config(&config)?;
+    if crate::config::legacy_request_body_timeout_in_use() {
+        tracing::warn!(
+            effective_hard_timeout_secs = config.proxy_stream.request_body_timeout_secs,
+            "legacy request body TIMEOUT is still an absolute upload deadline; set CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_MAX_DURATION_SECS=300 to enable longer progressing uploads"
+        );
+    }
     let _process_lock = crate::process_lock::ProcessLock::acquire(&config.data_dir)?;
     let server_geo = resolve_server_geo().await;
     info!(
@@ -172,7 +179,10 @@ async fn main() -> Result<()> {
         ssh_max_forward_connections_per_tunnel = config
             .ssh_transport
             .max_forward_connections_per_tunnel,
-        proxy_request_body_timeout_secs = config.proxy_stream.request_body_timeout_secs,
+        proxy_request_body_max_duration_secs = config.proxy_stream.request_body_timeout_secs,
+        proxy_request_body_first_byte_timeout_secs = config.proxy_stream.request_body_first_byte_timeout_secs,
+        proxy_request_body_idle_timeout_secs = config.proxy_stream.request_body_idle_timeout_secs,
+        proxy_request_memory_budget_mb = config.proxy_stream.request_memory_budget_mb,
         proxy_response_header_timeout_secs = config.proxy_stream.response_header_timeout_secs,
         proxy_stream_first_event_timeout_secs = config.proxy_stream.first_event_timeout_secs,
         proxy_stream_idle_timeout_secs = config.proxy_stream.idle_timeout_secs,
@@ -289,13 +299,15 @@ async fn main() -> Result<()> {
     let share_abuse = Arc::new(ShareAbuseTracker::new(
         store.load_active_share_client_bans().await?,
     ));
+    let proxy = Arc::new(ProxyRegistry::default());
+    proxy.configure_request_body_budget(&config.proxy_stream);
     let state = ServerState {
         config: config.clone(),
         server_geo: server_geo.clone(),
         store,
         server_logs,
         client_logs: Arc::new(crate::client_logs::ClientLogAccessLimiter::default()),
-        proxy: Arc::new(ProxyRegistry::default()),
+        proxy,
         proxy_http,
         resend,
         resend_usage_cache: Arc::new(Mutex::new(None)),
@@ -1678,7 +1690,11 @@ Environment:
   CC_SWITCH_ROUTER_SSH_BRIDGE_HALF_CLOSE_IDLE_TIMEOUT_SECS Half-close idle timeout, default 300
   CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS Global pending + active forward limit, default 2048
   CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS_PER_TUNNEL Per-tunnel pending + active limit, default 256
-  CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_TIMEOUT_SECS Downstream request body timeout, default 30
+  CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_TIMEOUT_SECS Deprecated hard deadline alias (5-300); MAX_DURATION overrides it
+  CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_MAX_DURATION_SECS Upload hard deadline, default 300 (legacy alias fallback)
+  CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_FIRST_BYTE_TIMEOUT_SECS First nonempty body data timeout, default 30
+  CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_IDLE_TIMEOUT_SECS Body data idle timeout, default 30
+  CC_SWITCH_ROUTER_PROXY_REQUEST_MEMORY_BUDGET_MB Shared ingress buffer/workspace budget, default 256 MiB
   CC_SWITCH_ROUTER_PROXY_RESPONSE_HEADER_TIMEOUT_SECS Upstream response header timeout, default 120
   CC_SWITCH_ROUTER_PROXY_STREAM_FIRST_EVENT_TIMEOUT_SECS Share stream first business-event timeout, default 120
   CC_SWITCH_ROUTER_PROXY_STREAM_IDLE_TIMEOUT_SECS Share stream business-idle timeout, default 900

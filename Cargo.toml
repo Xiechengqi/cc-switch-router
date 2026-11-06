@@ -9,7 +9,7 @@ anyhow = "1"
 argon2 = { version = "0.5", features = ["zeroize"] }
 async-stream = "0.3"
 async-trait = "0.1"
-axum = { version = "0.7", features = ["json", "ws"] }
+axum = { version = "0.7", features = ["json", "ws", "http2"] }
 base64 = "0.22"
 bs58 = { version = "0.5", features = ["check"] }
 bytes = "1"
@@ -23,6 +23,8 @@ hmac = "0.12"
 httpdate = "1"
 hex = "0.4"
 http = "1"
+http-body = "1"
+http-body-util = "0.1"
 libsql = { version = "=0.9.30", default-features = false, features = ["replication", "tls"] }
 libc = "0.2"
 portable-pty = "0.8"
@@ -47,6 +49,12 @@ url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 zeroize = { version = "1", features = ["derive", "serde"] }
 rpassword = "7"
+zstd = "0.13"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+hyper = { version = "1", features = ["client", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 
 [build-dependencies]
 flate2 = "1"

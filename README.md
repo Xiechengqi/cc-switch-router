@@ -163,14 +163,18 @@ CI 的并行任务、缓存边界、测试数据库模板与耗时排查见 [构
 | `CC_SWITCH_ROUTER_SSH_BRIDGE_HALF_CLOSE_IDLE_TIMEOUT_SECS` | `300` | 单向 EOF 后剩余方向无进展的超时，范围 30-3600 秒 |
 | `CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS` | `2048` | 全局等待通道建立与活动 bridge 的 forwarded TCP 连接总上限，范围 1-65536 |
 | `CC_SWITCH_ROUTER_SSH_MAX_FORWARD_CONNECTIONS_PER_TUNNEL` | `256` | 单 SSH 隧道等待通道建立与活动 bridge 的连接总上限，范围 1-4096 且不得超过全局上限 |
-| `CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_TIMEOUT_SECS` | `30` | 下游请求体读取超时，范围 5-300 秒；请求体完成后才占用 Share 并发 |
+| `CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_TIMEOUT_SECS` | 未设置 | 已弃用的总上传时限别名，保留原语义（5-300 秒），不是空闲超时。新 `MAX_DURATION` 变量优先；显式旧值 `30` 仍限制上传总时长 30 秒，升级时需迁移 |
+| `CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_MAX_DURATION_SECS` | `300` | 上传硬时限，范围 5-3600 秒；优先于旧变量，两者均未设置时为 300 秒；持续进度也不能延长 |
+| `CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_FIRST_BYTE_TIMEOUT_SECS` | `30` | 等待首个非空请求体数据的超时，范围 5-300 秒 |
+| `CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_IDLE_TIMEOUT_SECS` | `30` | 非空上传数据之间的空闲超时，范围 5-300 秒；持续有进度的长会话上传可超过 30 秒。空帧和 trailers 不续期 |
+| `CC_SWITCH_ROUTER_PROXY_REQUEST_MEMORY_BUDGET_MB` | `256` | 所有代理入口共享的内存准入预算，范围 16-65536 MiB，覆盖缓冲容量、扩容复制、解压和 JSON 工作区；预算不足快速返回 503，不等待内存、不切账号；不是进程 RSS 上限 |
 | `CC_SWITCH_ROUTER_PROXY_RESPONSE_HEADER_TIMEOUT_SECS` | `120` | 上游响应头等待超时，范围 5-600 秒 |
 | `CC_SWITCH_ROUTER_PROXY_STREAM_FIRST_EVENT_TIMEOUT_SECS` | `120` | Share 流首个协议业务事件超时，范围 5-600 秒；SSE 注释与 keepalive 不会续期 |
 | `CC_SWITCH_ROUTER_PROXY_STREAM_IDLE_TIMEOUT_SECS` | `900` | Share 流后续协议业务事件空闲超时，范围 30-3600 秒；SSE 注释与 keepalive 不会续期 |
 | `CC_SWITCH_ROUTER_PROXY_DOWNSTREAM_STALL_TIMEOUT_SECS` | `120` | 下游停止消费有界响应缓冲区时的终止超时，范围 5-600 秒 |
 | `CC_SWITCH_ROUTER_PROXY_MAX_REQUEST_LIFETIME_SECS` | `7200` | Share 请求绝对生存时长，范围 60-86400 秒，必须大于所有阶段超时 |
-| `CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_LIMIT_MB` | `10` | 普通 API（`/v1/responses`、`/v1/messages` 等）请求体上限，范围 1-64 MB；超限在占用 Share 并发前返回 413。请求体整体驻留内存，峰值内存 ≈ 该值 × 并发请求数。该值会随每个转发请求声明给 Client（`x-cc-switch-ingress-body-limit`），Client 取 `min(本地上限, 声明值)`；新版 Client 本地默认已是该范围上限，因此通常只调这里即可 |
-| `CC_SWITCH_ROUTER_PROXY_MEDIA_REQUEST_BODY_LIMIT_MB` | `32` | `/v1/videos/generations` 请求体上限，范围 1-256 MB，且不得小于普通 API 上限。同样随请求声明给 Client，取 `min(本地上限, 声明值)`。超过约 100 MB 时通常先被边缘代理（如 Cloudflare）拦下；大体积上传也可能先撞 `CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_TIMEOUT_SECS` |
+| `CC_SWITCH_ROUTER_PROXY_REQUEST_BODY_LIMIT_MB` | `10` | 普通 API（`/v1/responses`、`/v1/messages` 等）请求体上限，范围 1-64 MB；超限在占用 Share 并发前返回 413。检查压缩体时 wire/decoded 大小均受此限制；内存还包括 JSON 工作区等，受共享预算约束。该值随转发请求声明给 Client（`x-cc-switch-ingress-body-limit`），Client 取 `min(本地上限, 声明值)` |
+| `CC_SWITCH_ROUTER_PROXY_MEDIA_REQUEST_BODY_LIMIT_MB` | `32` | `/v1/videos/generations` 请求体上限，范围 1-256 MB，且不得小于普通 API 上限。同样随请求声明给 Client，取 `min(本地上限, 声明值)`。超过约 100 MB 时通常先被边缘代理（如 Cloudflare）拦下；上传仍受空闲超时和 `MAX_DURATION` 硬时限约束 |
 | `CC_SWITCH_ROUTER_PROXY_IMAGE_REQUEST_BODY_LIMIT_MB` | `48` | `/v1/images/generations` 与 `/v1/images/edits` 请求体上限（含内联 base64 附件），范围 1-256 MB，且不得小于普通 API 上限。同样随请求声明给 Client，取 `min(本地上限, 声明值)`。注意 multipart 形式的 `/v1/images/edits` 另受 Client 内容层限制（单张 20 MiB、合计 32 MiB、最多 16 张，超限返回 400），该值调到 32 MB 以上不会放宽这条路径 |
 | `CC_SWITCH_ROUTER_OWNER_EMAIL` | `router@{TUNNEL_DOMAIN}` | Client Market 默认选中的官方 Host Provider 邮箱 |
 | `CC_SWITCH_ROUTER_USE_LOCALHOST` | `false` | 为 `false` 时 tunnel URL 使用 `https://` |
