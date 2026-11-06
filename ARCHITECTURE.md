@@ -273,7 +273,9 @@ Router 默认邮箱验证码登录，可选密码登录。`store::password_auth`
 | Share 级滥用 | 同一 Share 10 分钟 10 次违规 → 封禁 1 小时 | 业务库 `share_client_bans`(`ShareAbuseTracker`) |
 | 请求体体积 | 三档上限:普通 10 MB / 视频 32 MB / 图片 48 MB(可配置) | 内存缓冲上限(`proxy.rs` `proxy_request_body_limit()`) |
 
-请求体体积不是速率限制,而是**内存缓冲天花板**:请求体经 `axum::body::to_bytes` 一次性读入内存,峰值内存 ≈ 单档上限 × 并发请求数。三档由 `CC_SWITCH_ROUTER_PROXY_{,MEDIA_,IMAGE_}REQUEST_BODY_LIMIT_MB` 配置(MB 为单位,改后需重启)。读取发生在 `try_acquire_share_permit` 之前,因此超限请求返回 413 且不消耗 Share 并发额度;读取超过 30 秒返回 408。
+请求体体积不是速率限制。`proxy_request_body.rs` 为统一 API、Share、Gateway 和图片/模型封禁前置检查提供一次读取、共享缓存及全局内存准入。三档大小由 `CC_SWITCH_ROUTER_PROXY_{,MEDIA_,IMAGE_}REQUEST_BODY_LIMIT_MB` 配置；默认首字节/有效数据空闲/上传硬时限为 30/30/300 秒，有进度的长历史上传可以超过 30 秒。旧 `REQUEST_BODY_TIMEOUT_SECS` 保持总时限别名语义，新 `REQUEST_BODY_MAX_DURATION_SECS` 优先。
+
+请求体读取与有界 JSON 检查发生在 Share 并发准入之前，大小超限 413、读取/长度错误 400、超时 408、内存或解压容量不足 503，不能据此给账号记故障或换账号。缓冲容量、扩容复制、解压工作集、JSON scratch 和图片重写结果受共享预算约束；lease 跟随 `Bytes` 的最后一个副本及转发生命周期释放。JSON 路由仅检查有界解压视图，常规转发/签名仍使用原始 wire bytes，HTTP/1.x 未读完 body 时显式关闭连接，HTTP/2 仅隔离当前流。配置迁移与验收见 [运行手册](docs/runbook-ingress-body-timeouts.md)。
 
 Router 转发到 Client 时,会在签名头旁再写一个**不参与签名**的 `x-cc-switch-ingress-body-limit`(十进制字节,值 = 该请求命中的档位),Client 取 `min(本地上限, 声明值)` 作为本次 ingress 的生效上限。因此:
 

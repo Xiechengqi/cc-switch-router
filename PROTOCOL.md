@@ -652,6 +652,10 @@ Router 先从协议路径确定 App，再用 `(user_id, app, requested model)` �
 | 405 | `user_model_route_method_not_allowed` | 推理路径不是 POST |
 | 408 | `user_model_route_request_body_timeout` | 请求体读取超时 |
 | 413 | `user_model_route_request_body_too_large` | 命中 Router 对应请求体上限 |
+| 400 | `user_model_route_request_body_read_error` / `user_model_route_request_body_invalid_content_length` | 请求体截断、读取失败或长度不符，不伪装成 413 |
+| 400 | `user_model_route_request_body_invalid_content_encoding` | 压缩数据损坏或超过允许的解压窗口 |
+| 415 | `user_model_route_request_body_unsupported_content_encoding` | 需要检查 JSON 时遇到不支持或多层 Content-Encoding |
+| 503 | `user_model_route_request_body_memory_budget_exhausted` / `user_model_route_request_body_decode_capacity_exhausted` / `user_model_route_request_body_decode_timeout` | Router 入口资源不足或解压超过预算，附 `Retry-After: 1`；不得归因 Share、切账号或触发其熔断 |
 | 422 | `user_model_route_model_required` | 无法取得非空 requested model |
 | 400 | `user_model_route_model_pattern_unsupported` | 配置的模型名含 `*` 但不等于 `*`；Router 不支持模式匹配 |
 | 404 | `user_model_route_not_configured` | 精确键与该 App 的 `*` 全量路由都没有映射 |
@@ -662,6 +666,10 @@ Router 先从协议路径确定 App，再用 `(user_id, app, requested model)` �
 Host 判断必须精确匹配 `api.<tunnel_domain>`（含配置中的端口语义），`nested.api...`、后缀拼接域名或不同端口都不能进入该分支。该 host 不提供 Dashboard、Session 控制面、Share Web、Client Web、`/_ctl/*` 或 `/_share-router/*`；未知路径不得落回静态 UI/catch-all。
 
 所有统一入口实际响应带 `Access-Control-Allow-Origin: *`、`Cache-Control: no-store` 并暴露公开 request/error headers。`OPTIONS` 无需 Key，返回 `204`、`GET, POST, OPTIONS`，并回显浏览器请求的 `Access-Control-Request-Headers`；不启用 credentialed cookies。DNS/证书必须覆盖 `api.<tunnel_domain>`，部署约束见 [README.md](README.md)。
+
+入口请求体由统一 collector 读取一次并复用于模型路由、模型封禁检查和转发。默认首字节/有效数据空闲/上传总时限分别为 30/30/300 秒；旧 `REQUEST_BODY_TIMEOUT_SECS` 仍是总时限别名，新 `REQUEST_BODY_MAX_DURATION_SECS` 优先。入口错误的 `details.phase` 区分 `first_byte_timeout`、`idle_timeout`、`hard_timeout` 等；`requestId` 与响应 `x-cc-switch-ingress-request-id` 对应，`upstreamSent: false` 表示尚未发送到 Share。
+
+需要读取 JSON model/stream 时支持单层 `gzip`、`deflate`（zlib）和 `zstd` 的有界检查视图，保留原始 wire bytes、Content-Encoding、Content-Length 参与转发和 IngressContext 签名；图片 stream 提交沿用显式 JSON 重写路径，对重写后的内容签名。HTTP/1.x 对未读完 body 的早退响应关闭连接；HTTP/2 不发送 `Connection: close`，不关闭其他流。升级、观测及验收说明见 [入口上传超时运行手册](docs/runbook-ingress-body-timeouts.md)。
 
 ---
 
