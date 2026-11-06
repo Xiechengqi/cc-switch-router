@@ -132,7 +132,10 @@ test("production transfer events use edit commands and focus targets have DOM an
   assert.match(picker, /onAction\(\{ kind: direction === "in" \? "append_targets" : "remove_targets"/);
   assert.match(picker, /onAction\(\{ kind: "move_target", from, to \}\)/);
   assert.match(editor, /onAction=\{onAction\}/);
-  assert.match(panel, /controller\.command\(\{ \.\.\.action, clientId: route\.clientId \}\)/);
+  // Transfer owns focus after moving rows, including the first default rule.
+  assert.match(panel, /controller\.command\(\{\s*\.\.\.action,\s*clientId:\s*route\.clientId\s*\},\s*\{\s*focus:\s*false\s*\}\)/);
+  assert.match(panel, /controller\.command\(\{\s*\.\.\.action,\s*clientId:\s*activeSlot\.passthrough\.clientId\s*\},\s*\{\s*focus:\s*false\s*\}\)/);
+  assert.match(panel, /controller\.setPassthroughTargets\(activeProtocol,\s*action\.shareIds,\s*\{\s*focus:\s*false\s*\}\)/);
   assert.match(picker, /data-model-route-target=\{targetId\}/);
   assert.match(panel, /node\.dataset\.modelRouteTarget === focus\.shareId/);
   assert.match(panel, /lastFocusRequestRef\.current\.request !== forceExpanded/);
