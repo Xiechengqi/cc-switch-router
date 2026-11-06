@@ -116,4 +116,4 @@ Market host-provisioning flow, and can also be run manually.
 
 The router ↔ `cc-switch-server` contract — registration, leases, tunnel
 establishment, the control plane, and ingress identity injection — is documented
-in [PROTOCOL.md](PROTOCOL.md).
+in [PROTOCOL.md](../PROTOCOL.md).

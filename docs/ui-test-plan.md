@@ -2,8 +2,8 @@
 
 手动 UI 回归清单。目标是**每个用户可触达的控件都有对应用例**,并且在代码改动后能快速定位需要重跑的用例。
 
-- 界面实现见 [ARCHITECTURE.md](ARCHITECTURE.md) 第 9 节
-- 后端接口契约见 [PROTOCOL.md](PROTOCOL.md)
+- 界面实现见 [ARCHITECTURE.md](../ARCHITECTURE.md) 第 9 节
+- 后端接口契约见 [PROTOCOL.md](../PROTOCOL.md)
 
 ---
 

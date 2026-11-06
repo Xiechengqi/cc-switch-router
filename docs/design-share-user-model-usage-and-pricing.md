@@ -1197,7 +1197,7 @@ historical attribution，**不得**登记为 `vendoredSources`（否则会触发
 
 ### 14.4 UI_TEST_PLAN
 
-在 `UI_TEST_PLAN.md` §11 Share 相关(S) 新增用例（现有最大编号 S-46，故新增自 S-47 起），并同步 §18 反查索引与 §19 API 覆盖核对：
+在 [ui-test-plan.md](ui-test-plan.md) §11 Share 相关(S) 新增用例（现有最大编号 S-46，故新增自 S-47 起），并同步 §18 反查索引与 §19 API 覆盖核对：
 
 | 用例 | 前置 | 操作 | 期望 |
 |---|---|---|---|

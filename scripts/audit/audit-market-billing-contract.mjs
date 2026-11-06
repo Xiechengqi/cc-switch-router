@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 const scriptPath = fileURLToPath(import.meta.url);
 const root = path.resolve(path.dirname(scriptPath), "../..");
 const sourceRoots = ["src", "frontend/app", "frontend/components", "frontend/lib"];
-const documentFiles = ["ARCHITECTURE.md", "PROTOCOL.md", "README.md", "UI_TEST_PLAN.md"];
+const documentFiles = ["ARCHITECTURE.md", "PROTOCOL.md", "README.md", "docs/ui-test-plan.md"];
 const allowedExtensions = new Set([".rs", ".ts", ".tsx"]);
 
 const legacyRules = [

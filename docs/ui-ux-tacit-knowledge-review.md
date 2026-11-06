@@ -2,7 +2,7 @@
 
 日期：2026-07-11
 
-对应计划：`UI_UX_POLANYI_IMPLEMENTATION_PLAN.md`
+对应计划：[ui-ux-tacit-knowledge-plan.md](ui-ux-tacit-knowledge-plan.md)
 结论：工程实施完成，无已知阻断问题
 
 ## 1. 实施结果

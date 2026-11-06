@@ -16,8 +16,8 @@ TokenSwitch 的公共汇聚层。为 `cc-switch-server` 实例提供公网子域
 
 - 架构与实现现状 → [ARCHITECTURE.md](ARCHITECTURE.md)
 - 与客户端的接口契约 → [PROTOCOL.md](PROTOCOL.md)
-- 手动 UI 回归清单 → [UI_TEST_PLAN.md](UI_TEST_PLAN.md)
-- 历史改名与迁移 → [MIGRATION.md](MIGRATION.md)
+- 手动 UI 回归清单 → [docs/ui-test-plan.md](docs/ui-test-plan.md)
+- 历史改名与迁移 → [docs/migration-history.md](docs/migration-history.md)
 
 ## 技术架构
 
@@ -48,7 +48,7 @@ TokenSwitch 的公共汇聚层。为 `cc-switch-server` 实例提供公网子域
 
 **`cc-switch-server` 是本 Router 的唯一客户端。** 它是无桌面依赖的 Rust server,自身为 Claude Code / Codex CLI / Gemini CLI 提供本地反代,并通过本 Router 获得公网可达性。
 
-早期的 `cc-switch` Tauri 桌面版已不再作为客户端,相关兼容代码已移除,详见 [MIGRATION.md](MIGRATION.md)。
+早期的 `cc-switch` Tauri 桌面版已不再作为客户端,相关兼容代码已移除,详见 [docs/migration-history.md](docs/migration-history.md)。
 
 远程主机上的部署由仓库内 `install-client.sh` 负责,它会下载 `cc-switch-server` 二进制并完成初始化。Router 的 `/install-client.sh` 会在请求时写入 Settings 中当前选择的 Server Release；默认值是 `latest`，也可固定为已经通过 Server 手动发布流程生成的 7 位 Commit Release。脚本严格识别 AMD64/ARM64，同时下载同一 Release、同一下载源的 binary 与 `.sha256`，在覆盖现有文件前完成 checksum；固定 Commit 时还会检查 staged binary 的 `version --json`。任一步失败都会终止，不会回退 `latest`。此设置只影响之后下载的安装脚本，不会修改已安装 Server，Server 自升级仍保持使用 `latest`。
 
