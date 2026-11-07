@@ -1,5 +1,7 @@
 "use client";
 
+import { buddyQuotaPresentation } from "@/lib/buddy-quota-summary";
+
 import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { messages, type AppLocale, type MessageKey } from "@/lib/i18n";
@@ -895,7 +897,7 @@ export function formatCompactQuotaTier(
 ) {
   const label = normalizeCompactTierLabel(tier.label || tier.name, locale);
   const amount = formatQuotaUsageAmount(tier, locale);
-  const countdown = countdownStr(buddyPackage ? tier.resetsAt || tier.expiresAt : tier.resetsAt);
+  const countdown = countdownStr(buddyPackage ? tier.expiresAt : tier.resetsAt);
   if (buddyPackage && amount) return [label, amount, countdown].filter(Boolean).join(" ");
   const utilization =
     typeof tier.utilization === "number" && Number.isFinite(tier.utilization)
@@ -1163,7 +1165,7 @@ export function quotaSummary(
   }
   const tierText = tiers
     .map((tier) => {
-      if (buddy) return formatCompactQuotaTier(tier, locale, 1, true);
+      if (buddy) return "";
       if (!isOllamaCloudRuntime(runtime)) {
         return formatCompactQuotaTier(tier, locale);
       }
@@ -1194,7 +1196,7 @@ export function quotaSummary(
     ? bankedResetSummary(quota.bankedReset, locale)
     : "";
   if (buddy) {
-    const packageText = [...tierText, ...unobservedTierText].join(" · ")
+    const packageText = [buddyQuotaPresentation(tiers, locale, Date.now(), unobservedTierText.length > 0).text, ...unobservedTierText].filter(Boolean).join(" · ")
       || messages[locale]["quota.buddy.numericNotExposed"];
     return [packageText, buddyOfficialUsageText(quota.providerUsage, locale)].filter(Boolean).join(" · ");
   }
@@ -1600,4 +1602,13 @@ export function clientTotalTokensUsed(shares: ShareView[]) {
 
 export function clientTotalTokensLabel(shares: ShareView[]) {
   return compactTokens(clientTotalTokensUsed(shares));
+}
+
+export function providerQuotaDetails(runtime?: ShareUpstreamProvider, locale: AppLocale = "en") {
+  if (!runtime || !isBuddyOAuthRuntime(runtime) || !runtime.quota) return providerQuotaStatusLine(runtime, locale);
+  const status = String(runtime.quota.status || "").toLowerCase();
+  if (status && !["ok", "success", "valid"].includes(status)) return quotaSummary(runtime, locale);
+  return [buddyQuotaPresentation(runtime.quota.tiers || [], locale).details,
+    ...(runtime.quota.unobservedTiers || []).map(tier => formatUnobservedQuotaTier(tier, locale)),
+    buddyOfficialUsageText(runtime.quota.providerUsage, locale)].filter(Boolean).join("\n");
 }

@@ -1,3 +1,4 @@
+import { buddyQuotaPresentation } from "@/lib/buddy-quota-summary";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync } from "node:fs";
@@ -11,6 +12,7 @@ import {
   providerQuotaStatusLine,
   providerStatusIdentity,
   quotaSummary,
+  providerQuotaDetails,
   recentSharePerformance,
   shareAppProviderRuntime,
   utilizationPercentForDisplay,
@@ -21,16 +23,16 @@ import type { ShareRequestLog } from "@/lib/types";
 
 const buddyQuota = JSON.parse(readFileSync(new URL("../../../tests/fixtures/buddy-quota-presentation-v1.json", import.meta.url), "utf8")) as NonNullable<ShareUpstreamProvider["quota"]>;
 
-test("Buddy quota cards append cycle countdowns and official usage without a line break", (t) => {
+test("Buddy quota cards compact packages and use actual expiry without a line break", (t) => {
   t.mock.method(Date, "now", () => Date.parse("2026-11-04T00:00:00Z"));
   for (const product of ["workbuddy_oauth", "codebuddy_oauth"]) {
     for (const app of ["claude", "codex", "gemini"]) {
       const runtime: ShareUpstreamProvider = { providerType: product, kind: "official_oauth", app, quota: structuredClone(buddyQuota) };
       const text = quotaSummary(runtime, "zh-CN");
-      assert.equal(text, "CodeBuddy个人版拉新权益包 0/1500 credits 28d9h · CodeBuddy个人体验版 0.5/500 credits 26d15h · 官方用量（账号）： 今日 0.45 · 本月 0.45 credits");
-      assert.doesNotMatch(text, /codebuddy package|%|采集|范围|7 日|周期结束|到期|UTC|2026-|其他 share/);
+      assert.equal(text, "注册积分奖励 0/1500 credits · 基础积分 0.5/500 credits · 最近到期 28d9h · 官方用量（账号）： 今日 0.45 · 本月 0.45 credits");
+      assert.doesNotMatch(text, /codebuddy package|%|采集|范围|7 日|周期结束|UTC|2026-|其他 share/);
       const english = quotaSummary(runtime, "en");
-      assert.match(english, /^CodeBuddy个人版拉新权益包 0\/1500 credits/);
+      assert.match(english, /^Registration reward 0\/1500 credits/);
       assert.match(english, /Official usage \(account\): today 0.45 · this month 0.45 credits/);
       assert.equal(english.split("\n").length, 1);
     }
@@ -77,17 +79,13 @@ test("Buddy credits are unknown when incomplete, and explicit zero remains zero"
   assert.doesNotMatch(quotaSummary({ providerType: "workbuddy_oauth", quota: old }, "en"), /Official usage/);
 });
 
-test("Buddy package countdowns prefer cycle ends, use expiry only when absent, and never fabricate times", (t) => {
+test("Buddy package detail countdowns use expiry, never cycle reset", (t) => {
   t.mock.method(Date, "now", () => Date.parse("2026-11-04T00:00:00Z"));
-  const packageTier = { label: "package", used: 0.5, limit: 500, unit: "credits", utilization: 0.1, resetsAt: "2026-11-24T12:00:00Z", expiresAt: "2035-01-01T00:00:00Z" };
-  assert.equal(formatCompactQuotaTier(packageTier, "en", 1, true), "package 0.5/500 credits 20d12h");
-  assert.equal(formatCompactQuotaTier({ ...packageTier, resetsAt: undefined, expiresAt: "2026-11-24T12:00:00Z" }, "en", 1, true), "package 0.5/500 credits 20d12h");
-  for (const resetsAt of ["invalid", "2026-11-03T00:00:00Z"]) {
-    assert.equal(formatCompactQuotaTier({ ...packageTier, resetsAt }, "en", 1, true), "package 0.5/500 credits");
+  const tier = { label: "package", used: 0.5, limit: 500, unit: "credits", utilization: 0.1, resetsAt: "2026-11-05T00:00:00Z", expiresAt: "2026-11-24T12:00:00Z" };
+  assert.equal(formatCompactQuotaTier(tier, "en", 1, true), "package 0.5/500 credits 20d12h");
+  for (const expiresAt of [undefined, "invalid", "2026-11-03T00:00:00Z"]) {
+    assert.equal(formatCompactQuotaTier({ ...tier, expiresAt }, "en", 1, true), "package 0.5/500 credits");
   }
-  assert.equal(formatCompactQuotaTier({ label: "package", used: 0, limit: 1500, unit: "credits", utilization: 0 }, "en", 1, true), "package 0/1500 credits");
-  assert.match(formatCompactQuotaTier({ label: "package", utilization: 0.01 }, "en", 1, true), /<0.1%/);
-  assert.match(formatCompactQuotaTier({ label: "package", utilization: 0 }, "en", 1, true), /0%/);
   assert.equal(formatCompactQuotaTier({ label: "1w", utilization: 1.4 }), "7d 1%");
 });
 
@@ -373,4 +371,76 @@ test("observed Fable quota wins over a duplicate unobserved hint", () => {
 
   assert.match(line, /Fable 7d 41%/);
   assert.doesNotMatch(line, /awaiting observation/);
+});
+
+test("Buddy summary matches Server rules for the reported account and retains batch details", (t) => {
+  t.mock.method(Date, "now", () => Date.parse("2026-11-07T00:00:00Z"));
+  const tiers = [
+    buddyTier("CodeBuddy个人版拉新权益包", 1084.52, 1500, 25 * 24 + 4),
+    buddyTier(checkinLabel, 0, 100, 27 * 24 + 20),
+    buddyTier(checkinLabel, 0, 100, 28 * 24 + 20),
+    buddyTier(checkinLabel, 0, 100, 29 * 24 + 20),
+    buddyTier("CodeBuddy个人体验版", 500, 500, 23 * 24 + 11),
+  ];
+  const before = JSON.stringify(tiers);
+  for (const providerType of ["workbuddy_oauth", "codebuddy_oauth"]) {
+    for (const app of ["claude", "codex", "gemini"]) {
+      const runtime = { providerType, app, quota: { ...structuredClone(buddyQuota), tiers,
+        providerUsage: { ...buddyQuota.providerUsage!, usageToday: 1.67, usageThisMonth: 1584.45 } } };
+      assert.equal(quotaSummary(runtime, "zh-CN"), "注册积分奖励 1084.52/1500 credits · 签到 0/300 credits · 基础积分 500/500 credits · 最近到期 25d4h · 官方用量（账号）： 今日 1.67 · 本月 1584.45 credits");
+      const details = providerQuotaDetails(runtime, "zh-CN");
+      assert.equal(details.split(checkinLabel).length - 1, 3);
+      assert.match(details, /剩余 415.48 credits/);
+      assert.match(details, /积分到期：/);
+      assert.match(quotaSummary(runtime, "en"), /Check-in 0\/300 credits/);
+    }
+  }
+  assert.equal(JSON.stringify(tiers), before);
+});
+
+const checkinLabel = "CodeBuddy个人版国内运营裂变包";
+function buddyTier(label: string, used = 0, limit = 100, hours = 24) {
+  return { label, used, limit, unit: "credits", utilization: used / limit * 100,
+    source: "codebuddy_billing_resource_v2", expiresAt: new Date(Date.now() + hours * 3600000).toISOString() };
+}
+
+test("Buddy merging preserves duplicate batches and excludes invalid values and units", (t) => {
+  t.mock.method(Date, "now", () => Date.parse("2026-11-07T00:00:00Z"));
+  const tiers = [buddyTier(checkinLabel, 12.34, 80, 48), buddyTier(checkinLabel, 1.11, 120), buddyTier(checkinLabel, 1.11, 120)];
+  assert.equal(buddyQuotaPresentation(tiers, "zh-CN").text, "签到 14.56/320 credits · 最近到期 1d0h");
+  const text = buddyQuotaPresentation([buddyTier(checkinLabel), { ...buddyTier(checkinLabel), unit: "USD" },
+    { ...buddyTier(checkinLabel), used: NaN, utilization: 0.01 }], "zh-CN").text;
+  assert.match(text, /签到 0\/100 credits · 签到 0\/100 USD · 签到 <0.1%/);
+  assert.match(text, /最近已知到期/);
+});
+
+test("Buddy expiry uses remaining balances, not percentages or resets, and marks uncertainty", (t) => {
+  t.mock.method(Date, "now", () => Date.parse("2026-11-07T00:00:00Z"));
+  const known = buddyTier(checkinLabel, 0, 100, 240);
+  const unknown = { ...buddyTier(checkinLabel), expiresAt: undefined, resetsAt: new Date(Date.now() + 3600000).toISOString() };
+  assert.equal(buddyQuotaPresentation([unknown], "zh-CN").text, "签到 0/100 credits · 到期时间未知");
+  assert.match(buddyQuotaPresentation([known, unknown], "zh-CN").text, /最近已知到期 10d0h/);
+  assert.match(buddyQuotaPresentation([known], "zh-CN", Date.now(), true).text, /最近已知到期/);
+  assert.equal(buddyQuotaPresentation([buddyTier(checkinLabel, 100)], "zh-CN").text, "签到 100/100 credits");
+  assert.match(buddyQuotaPresentation([{ ...known, used: 99.9999, utilization: 100 }], "zh-CN").text, /最近到期/);
+  assert.match(buddyQuotaPresentation([{ ...known, expiresAt: "invalid" }], "zh-CN").text, /到期时间未知/);
+  assert.match(buddyQuotaPresentation([unknown], "en").details, /Cycle resets:/);
+});
+
+test("Buddy exact expiry boundary hides expired batches but preserves details", (t) => {
+  t.mock.method(Date, "now", () => Date.parse("2026-11-07T00:00:00Z"));
+  const expired = buddyTier(checkinLabel, 20, 100, 0);
+  const result = buddyQuotaPresentation([expired, buddyTier(checkinLabel)], "zh-CN");
+  assert.equal(result.text, "签到 0/100 credits · 最近到期 1d0h · 到期状态待刷新");
+  assert.match(result.details, /20\/100 credits/);
+  assert.equal(buddyQuotaPresentation([expired], "zh-CN").text, "到期状态待刷新");
+  assert.match(buddyQuotaPresentation([expired], "zh-CN", Date.now() - 1).text, /最近到期 1m/);
+});
+
+test("Buddy aliases require reviewed evidence; unknown plans stay separate", () => {
+  const text = buddyQuotaPresentation([buddyTier("CodeBuddy 个人体验版"), buddyTier("New Plan"), buddyTier("New Plan"),
+    { ...buddyTier(checkinLabel), source: undefined }, { ...buddyTier(checkinLabel), name: "premium" }], "zh-CN").text;
+  assert.match(text, /基础积分/);
+  assert.equal(text.split("New Plan").length - 1, 2);
+  assert.equal(text.split(checkinLabel).length - 1, 2);
 });

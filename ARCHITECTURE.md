@@ -482,3 +482,9 @@ Next.js 静态导出(`output: "export"`),`build.rs` 遍历 `frontend/out/` 生�
 7. `setsid -f` 派生子进程延时重启
 
 进度经 broadcast channel 以 SSE 流式推送至前端。第 1–4 步失败都在交换二进制之前 `return Err`,进程继续运行旧版本;交换之后若调度重启失败会返回错误但不自动回滚,需手动 `rollback_to_previous_binary()`。前端只在收到 `status=success` 的 done 事件后才轮询健康并刷新页面,失败时保留日志弹窗并把最后一条 error 显示为告警。
+
+### Buddy 积分摘要展示（2026-11-07）
+
+Router 使用 `frontend/lib/buddy-quota-summary.ts` 在展示层简写已核对的国内积分包名称、合并签到批次金额，并仅显示仍有余额的最近失效时间。Share descriptor 不含内部 package name 时，仅凭已核对的 `codebuddy_billing_resource_v2` 来源识别名称映射；未知名称不合并。失效时间仅使用 expiresAt，不以周期 resetsAt 替代。期限不完整提示最近已知到期，已过期批次隐藏并提示待刷新；原始批次、余额及期限仍保留在卡片/详情/市场状态行的 title 中。同步协议和服务端额度数据不变。该本地实现不依赖 Server 源码或构建产物；规则与 Server Web 对齐，回归覆盖双产品和三种 App 投影。
+
+本轮验证：摘要相关 24 项及完整前端 532 项测试通过，TypeScript 类型检查与 git diff --check 通过。生产构建尝试因 Google Fonts 下载 TLS 连接失败而阻塞，独立 curl 复核亦失败；未更改字体配置，未部署，不能据此声明线上生效。

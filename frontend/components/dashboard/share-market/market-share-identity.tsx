@@ -10,6 +10,7 @@ import {
   isApiProviderRuntime,
   providerApiEndpoint,
   providerQuotaStatusLine,
+  providerQuotaDetails,
 } from "@/components/dashboard/share-dashboard-utils";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import type { AppLocale } from "@/lib/i18n";
@@ -46,7 +47,7 @@ function capabilityRuntime(capability: ShareIdentityProvider): ShareUpstreamProv
   };
 }
 
-function providerStatusPrimaryLine(source: ShareIdentitySource, locale: AppLocale) {
+function providerStatusPrimaryLine(source: ShareIdentitySource, locale: AppLocale, details = false) {
   const enabledApps = source.supportedApps || source.apps || [];
   const preferredApp = CORE_SHARE_APPS.find((app) => enabledApps.includes(app)) || enabledApps[0];
   const capability =
@@ -56,7 +57,7 @@ function providerStatusPrimaryLine(source: ShareIdentitySource, locale: AppLocal
   const runtime = capabilityRuntime(capability);
   const line = isApiProviderRuntime(runtime)
     ? providerApiEndpoint(runtime)
-    : providerQuotaStatusLine(runtime, locale);
+    : details ? providerQuotaDetails(runtime, locale) : providerQuotaStatusLine(runtime, locale);
   return line && line !== "-" ? line : "";
 }
 
@@ -128,7 +129,7 @@ export function MarketShareIdentity({
         <MarketShareApps apps={apps} size={Math.max(12, size - 2)} />
       </span>
       {statusLine ? (
-        <span className="min-w-0 truncate text-[11px] font-normal text-slate-400" title={statusLine}>
+        <span className="min-w-0 truncate text-[11px] font-normal text-slate-400" title={providerStatusPrimaryLine(source, locale, true)}>
           {statusLine}
         </span>
       ) : null}

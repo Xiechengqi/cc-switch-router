@@ -86,6 +86,7 @@ import {
   providerApiEndpoint,
   providerModelMap,
   providerQuotaStatusLine,
+  providerQuotaDetails,
   providerStatusIdentity,
   requestBelongsToApp,
   requestModelRoute,
@@ -724,7 +725,7 @@ function shareProviderStatusView({
     modelsLine,
     primaryTitle: isApiProvider
       ? `${t("dashboard.apiRequestUrl")}: ${apiEndpoint}`
-      : quotaStatusLine,
+      : providerQuotaDetails(runtime, locale),
     identityTitle: isApiProvider ? "-" : accountLine,
     modelsTitle: modelsLine,
     panelTitle: share ? modelHealthTitle(share, undefined, locale) : undefined,

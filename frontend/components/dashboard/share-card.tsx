@@ -23,6 +23,7 @@ import {
   providerActualModelNames,
   providerApiEndpoint,
   providerQuotaStatusLine,
+  providerQuotaDetails,
   providerStatusIdentity,
   isApiProviderRuntime,
   recentSharePerformance,
@@ -163,7 +164,7 @@ export const ShareCard = React.memo(function ShareCard({
     modelsLine: actualModels,
     primaryTitle: isApiProvider
       ? `${t("dashboard.apiRequestUrl")}: ${apiEndpoint}`
-      : quotaStatusLine,
+      : providerEnabled && runtime ? providerQuotaDetails(runtime, locale) : quotaStatusLine,
     identityTitle: isApiProvider ? "-" : accountLine,
     modelsTitle: actualModels,
     panelTitle: modelHealthTitle(share, undefined, locale),
