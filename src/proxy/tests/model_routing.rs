@@ -10,8 +10,6 @@ struct QueueFixture {
     token: String,
     route_id: String,
     hits: Vec<Arc<AtomicUsize>>,
-    /// `(share index, X-CC-Switch-Request-Id)` in arrival order.
-    request_ids: Arc<std::sync::Mutex<Vec<(usize, String)>>>,
     servers: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -54,7 +52,6 @@ impl QueueFixture {
             }
         }
         let mut hits = Vec::new();
-        let request_ids = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut servers = Vec::new();
         for index in 0..6 {
             let count = Arc::new(AtomicUsize::new(0));
@@ -64,18 +61,10 @@ impl QueueFixture {
                 .unwrap();
             let address = listener.local_addr().unwrap();
             let status = statuses[index];
-            let seen = request_ids.clone();
-            let upstream = axum::Router::new().fallback(any(move |headers: HeaderMap| {
+            let upstream = axum::Router::new().fallback(any(move || {
                 let count = count.clone();
-                let seen = seen.clone();
                 async move {
                     count.fetch_add(1, AtomicOrdering::SeqCst);
-                    if let Some(id) = headers
-                        .get("x-cc-switch-request-id")
-                        .and_then(|value| value.to_str().ok())
-                    {
-                        seen.lock().unwrap().push((index, id.to_string()));
-                    }
                     status
                 }
             }));
@@ -130,7 +119,6 @@ impl QueueFixture {
             token,
             route_id: profile.routes[0].id.clone(),
             hits,
-            request_ids,
             servers,
         }
     }
@@ -202,16 +190,6 @@ async fn model_route_queue_forwards_to_every_target_once() {
     let f = QueueFixture::new([true; 6], [StatusCode::SERVICE_UNAVAILABLE; 6]).await;
     assert_eq!(f.request().await.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(f.counts(), vec![1; 6]);
-}
-
-#[tokio::test]
-async fn model_route_queue_starts_no_forward_after_the_failover_deadline() {
-    let mut f = QueueFixture::new([true; 6], [StatusCode::OK; 6]).await;
-    // Header wait and failover deadline are the same setting; zero makes the
-    // first forward time out (504) and leaves no time to start another.
-    f.state.config.proxy_stream.response_header_timeout_secs = 0;
-    assert_eq!(f.request().await.status(), StatusCode::GATEWAY_TIMEOUT);
-    assert_eq!(&f.counts()[1..], &[0; 5]);
 }
 
 #[tokio::test]
@@ -305,46 +283,6 @@ async fn model_route_queue_tries_deferred_probes_before_failing() {
             (2, "response"),
         ]
     );
-}
-
-#[tokio::test]
-async fn model_route_traffic_takes_usage_only_from_the_answering_attempt() {
-    use crate::model_route_traffic::ModelRouteTrafficUsage;
-    let mut statuses = [StatusCode::OK; 6];
-    statuses[0] = StatusCode::BAD_GATEWAY;
-    let f = QueueFixture::new([true; 6], statuses).await;
-    let response = f.request().await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let _ = axum::body::to_bytes(response.into_body(), 4096).await;
-    let ids = f.request_ids.lock().unwrap().clone();
-    assert_eq!(
-        ids.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
-        vec![0, 1]
-    );
-    let usage = ModelRouteTrafficUsage {
-        input_tokens: 7,
-        output_tokens: 3,
-        cache_read_tokens: 0,
-        cache_write_tokens: 0,
-        total_tokens: 10,
-        actual_model: None,
-        cost_micros: None,
-        estimated: false,
-    };
-    let traffic = &f.state.store.model_route_traffic;
-    // The failed attempt's report, and a report naming the wrong Share, are ignored.
-    traffic.record_usage(&ids[0].1, "queue-0", || unreachable!("not the answer"));
-    traffic.record_usage(&ids[1].1, "queue-0", || unreachable!("wrong Share"));
-    traffic.record_usage(&ids[1].1, "queue-1", || usage.clone());
-    let user = f
-        .state
-        .store
-        .ensure_user_by_email("owner@example.com")
-        .await
-        .unwrap();
-    let snapshot = traffic.snapshot(&user.id, None, None);
-    assert_eq!(snapshot.events.len(), 1);
-    assert_eq!(snapshot.events[0].usage, Some(usage));
 }
 
 #[tokio::test]

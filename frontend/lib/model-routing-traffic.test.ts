@@ -61,26 +61,8 @@ test("protocol summary counts only facts the Router recorded", () => {
     event(1), event(2, { statusCode: 429, continuedSearch: true }), event(3, { phase: "streaming" }),
     event(4, { phase: "interrupted", statusCode: 200 }), event(5, { appType: "claude" }),
   ], "codex");
-  assert.deepEqual(summary, { total: 4, ended: 3, succeeded: 1, continued: 1, inflight: 1, tokens: 0, costMicros: 0n, priced: 0, unpriced: 0 },
+  assert.deepEqual(summary, { total: 4, ended: 3, succeeded: 1, continued: 1, inflight: 1 },
     "an interrupted 200 is not counted as a 2xx completion");
-});
-
-test("usage totals add reported tokens; cost sums exact micros and counts what it left out", () => {
-  const usage = { inputTokens: 100, outputTokens: 20, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 120, estimated: false };
-  const summary = protocolTrafficSummary([
-    event(1, { usage: { ...usage, costMicros: "250000" } }), event(2, { usage: { ...usage, costMicros: "9007199254740993" } }),
-    event(3, { usage }), event(4),
-  ], "codex");
-  assert.deepEqual([summary.tokens, summary.costMicros, summary.priced, summary.unpriced], [360, 9007199254990993n, 2, 1],
-    "BigInt keeps micros above 2^53 exact; a request with no report is neither priced nor unpriced");
-});
-
-test("a later usage report replaces the event it belongs to", () => {
-  const first = applyTrafficSnapshot(EMPTY_TRAFFIC, snapshot([event(1)], { reset: true }), now);
-  const usage = { inputTokens: 1, outputTokens: 2, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 3, estimated: false };
-  const next = applyTrafficSnapshot(first, snapshot([event(1, { usage })], { cursor: "11" }), now);
-  assert.equal(next.events.length, 1);
-  assert.deepEqual(next.events[0].usage, usage);
 });
 
 test("rule kinds come from the event, never from current configuration", () => {

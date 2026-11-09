@@ -817,15 +817,6 @@ export function clientOwnedByViewer(
   );
 }
 
-/** Shares running on clients the viewer owns. */
-function viewerHostedShareIds(clients: DashboardClient[], viewerEmail: string) {
-  return new Set(
-    clients
-      .filter((client) => clientOwnedByViewer(client, viewerEmail))
-      .flatMap((client) => client.shareIds || []),
-  );
-}
-
 export function shareBelongsToViewer(
   share: ShareView,
   viewerEmailValue: string,
@@ -850,7 +841,11 @@ export function listViewerShares(
 ) {
   const viewerEmail = normalizeEmail(viewerEmailValue);
   if (!viewerEmail) return [];
-  const hostedShareIds = viewerHostedShareIds(clients, viewerEmail);
+  const hostedShareIds = new Set(
+    clients
+      .filter((client) => clientOwnedByViewer(client, viewerEmail))
+      .flatMap((client) => client.shareIds || []),
+  );
   const seen = new Set<string>();
   return shares.filter((share) => {
     if (seen.has(share.shareId)) return false;
@@ -861,61 +856,6 @@ export function listViewerShares(
     seen.add(share.shareId);
     return true;
   });
-}
-
-/** IDs of the viewer's Shares they own or host, as opposed to ones they only use
- * (granted, rented or routed to). Ownership, not access, decides the group. */
-export function ownedViewerShareIds(
-  shares: ShareView[],
-  clients: DashboardClient[],
-  viewerEmailValue: string,
-): Set<string> {
-  const viewerEmail = normalizeEmail(viewerEmailValue);
-  if (!viewerEmail) return new Set();
-  const hosted = viewerHostedShareIds(clients, viewerEmail);
-  return new Set(
-    shares
-      .filter((share) => hosted.has(share.shareId) || normalizeEmail(share.ownerEmail) === viewerEmail)
-      .map((share) => share.shareId),
-  );
-}
-
-/** One rule as seen from a Share card: its place in that rule's queue. */
-export type ShareRouteChip = {
-  clientId: string;
-  appType: ModelRoutingApp;
-  requestedModel: string;
-  /** 0 is the primary target. */
-  order: number;
-  /** The draft differs from what is saved for this Share in this rule. */
-  draft: boolean;
-};
-
-/** Per-Share rule chips for the draft, flagging what saving would change. */
-export function shareRouteChips(
-  draft: DraftModelRoute[],
-  saved: DraftModelRoute[],
-): Map<string, ShareRouteChip[]> {
-  const key = (route: DraftModelRoute, shareId: string, order: number) =>
-    JSON.stringify([route.clientId, route.appType, route.requestedModel, shareId, order]);
-  const savedKeys = new Set(
-    saved.flatMap((route) => modelRouteTargets(route).map((shareId, order) => key(route, shareId, order))),
-  );
-  const byShare = new Map<string, ShareRouteChip[]>();
-  for (const route of draft) {
-    modelRouteTargets(route).forEach((shareId, order) => {
-      const chips = byShare.get(shareId) || [];
-      chips.push({
-        clientId: route.clientId,
-        appType: route.appType,
-        requestedModel: route.requestedModel,
-        order,
-        draft: !savedKeys.has(key(route, shareId, order)),
-      });
-      byShare.set(shareId, chips);
-    });
-  }
-  return byShare;
 }
 
 export function clientBelongsToViewer(

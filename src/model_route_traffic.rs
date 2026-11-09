@@ -1,8 +1,7 @@
 //! Bounded, process-local record of each user's unified-API route executions
 //! (plan P5-1). Facts the executor already computed: matched rule, attempts,
 //! final target and stream phase. No credentials, bodies, IPs or emails, and no
-//! schema: a restart or another Router instance starts empty. Token usage and
-//! its catalog price arrive later, when the target Share reports the request.
+//! schema: a restart or another Router instance starts empty.
 use crate::models::ModelRouteAttempt;
 use axum::body::{Body, Bytes};
 use chrono::{DateTime, Utc};
@@ -63,28 +62,6 @@ pub struct ModelRouteTrafficEvent {
     pub headers_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
-    /// Absent until the target Share reports usage for the final attempt.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub usage: Option<ModelRouteTrafficUsage>,
-}
-
-/// Usage as the target Share reported it for the request that answered.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ModelRouteTrafficUsage {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cache_read_tokens: u64,
-    pub cache_write_tokens: u64,
-    pub total_tokens: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub actual_model: Option<String>,
-    /// Catalog list price in micro-USD, a decimal string like every other
-    /// amount on the wire; absent when the model has no price.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cost_micros: Option<String>,
-    /// The counts were not observed from upstream (dashboard rule).
-    pub estimated: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -116,8 +93,6 @@ pub struct ModelRouteTrafficHeaders {
     pub position: Option<usize>,
     pub continued_search: bool,
     pub attempts: Vec<ModelRouteAttempt>,
-    /// Upstream request ID of the final attempt, used to match its usage report.
-    pub request_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -127,16 +102,6 @@ struct Entry {
     version: u64,
     started: Instant,
     ended: Option<Instant>,
-    request_id: Option<String>,
-}
-
-/// Upstream request ID -> (user, sequence) of a retained entry.
-type RequestIndex = HashMap<String, (String, u64)>;
-
-fn unindex(index: &mut RequestIndex, entry: &Entry) {
-    if let Some(request_id) = &entry.request_id {
-        index.remove(request_id);
-    }
 }
 
 #[derive(Debug, Default)]
@@ -152,15 +117,12 @@ struct UserLog {
 
 impl UserLog {
     /// Drops what the window no longer retains; returns how many entries went.
-    fn sweep(&mut self, now: Instant, version: &mut u64, index: &mut RequestIndex) -> usize {
+    fn sweep(&mut self, now: Instant, version: &mut u64) -> usize {
         let before = self.entries.len();
         let mut abandoned = false;
         self.entries.retain(|entry| {
             let keep = retained(entry, now);
             abandoned |= !keep && entry.ended.is_none();
-            if !keep {
-                unindex(index, entry);
-            }
             keep
         });
         if abandoned {
@@ -180,7 +142,6 @@ struct State {
     /// with no log behind it, or whose log was recreated since, compares
     /// against this so a removal never hides a needed reset.
     removed_version: u64,
-    by_request: RequestIndex,
 }
 
 #[derive(Debug)]
@@ -212,14 +173,14 @@ impl State {
     }
     fn sweep_user(&mut self, user: &str, now: Instant) {
         if let Some(log) = self.users.get_mut(user) {
-            self.total -= log.sweep(now, &mut self.version, &mut self.by_request);
+            self.total -= log.sweep(now, &mut self.version);
         }
     }
     fn sweep(&mut self, now: Instant) {
         let (mut total, mut removed) = (0, self.removed_version);
-        let (version, index) = (&mut self.version, &mut self.by_request);
+        let version = &mut self.version;
         self.users.retain(|_, log| {
-            log.sweep(now, version, index);
+            log.sweep(now, version);
             total += log.entries.len();
             if log.entries.is_empty() {
                 removed = removed.max(log.evicted_version);
@@ -232,7 +193,6 @@ impl State {
     fn evict_front(&mut self, user: &str) {
         if let Some(log) = self.users.get_mut(user) {
             if let Some(entry) = log.entries.pop_front() {
-                unindex(&mut self.by_request, &entry);
                 let needed = if entry.ended.is_some() {
                     entry.version
                 } else {
@@ -316,7 +276,6 @@ impl ModelRouteTraffic {
                 version,
                 started: now,
                 ended: ended.then_some(now),
-                request_id: None,
             });
         state.total += 1;
         true
@@ -344,7 +303,6 @@ impl ModelRouteTraffic {
             attempts: Vec::new(),
             headers_ms: None,
             duration_ms: None,
-            usage: None,
         }
     }
 
@@ -400,8 +358,6 @@ impl ModelRouteTraffic {
         if entry.event.phase != ModelRouteTrafficPhase::Routing {
             return;
         }
-        let request_id = headers.request_id;
-        entry.request_id = request_id.clone();
         let event = &mut entry.event;
         event.phase = ModelRouteTrafficPhase::Streaming;
         event.status_code = Some(headers.status_code);
@@ -410,40 +366,6 @@ impl ModelRouteTraffic {
         event.continued_search = headers.continued_search;
         event.attempts = headers.attempts;
         event.headers_ms = Some(elapsed.as_millis() as u64);
-        entry.version = version;
-        state.version = version;
-        if let Some(request_id) = request_id {
-            state
-                .by_request
-                .insert(request_id, (user.to_string(), sequence));
-        }
-    }
-
-    /// Attaches a Share's usage report to the request it answered. Reports for
-    /// other requests, another Share, or events already gone are ignored;
-    /// `usage` runs only on a match. A later report replaces an earlier one.
-    pub fn record_usage(
-        &self,
-        request_id: &str,
-        share_id: &str,
-        usage: impl FnOnce() -> ModelRouteTrafficUsage,
-    ) {
-        let mut state = self.lock();
-        let Some((user, sequence)) = state.by_request.get(request_id).cloned() else {
-            return;
-        };
-        let version = state.version + 1;
-        let Some(entry) = state.find(&user, sequence) else {
-            return;
-        };
-        if entry.event.target_share_id.as_deref() != Some(share_id) {
-            return;
-        }
-        let usage = Some(usage());
-        if entry.event.usage == usage {
-            return;
-        }
-        entry.event.usage = usage;
         entry.version = version;
         state.version = version;
     }
@@ -642,25 +564,6 @@ mod tests {
                     duration_ms: 5,
                 },
             ],
-            request_id: Some(format!("req-{status}")),
-        }
-    }
-    fn usage(output: u64) -> ModelRouteTrafficUsage {
-        ModelRouteTrafficUsage {
-            input_tokens: 10,
-            output_tokens: output,
-            cache_read_tokens: 0,
-            cache_write_tokens: 0,
-            total_tokens: 10 + output,
-            actual_model: None,
-            cost_micros: Some("10000".into()),
-            estimated: false,
-        }
-    }
-    impl ModelRouteTrafficGuard {
-        fn finish_with(self, headers: ModelRouteTrafficHeaders) {
-            self.headers(headers);
-            self.finish(ModelRouteTrafficPhase::Complete);
         }
     }
     fn phase(traffic: &ModelRouteTraffic, user: &str, sequence: u64) -> ModelRouteTrafficPhase {
@@ -688,72 +591,6 @@ mod tests {
 
         drop(traffic.begin("u", 2, start(Some("r"))).unwrap());
         assert_eq!(phase(&traffic, "u", 2), ModelRouteTrafficPhase::Interrupted);
-    }
-
-    #[test]
-    fn model_route_traffic_usage_reaches_readers_and_only_matches_its_share() {
-        let traffic = Arc::new(ModelRouteTraffic::default());
-        traffic
-            .begin("u", 1, start(Some("r")))
-            .unwrap()
-            .finish_with(headers(200));
-        let full = traffic.snapshot("u", None, None);
-        let instance = Some(full.instance_id.as_str());
-        traffic.record_usage("req-200", "a", || unreachable!("another Share"));
-        traffic.record_usage("unknown", "b", || unreachable!("another request"));
-        assert!(
-            traffic
-                .snapshot("u", Some(&full.cursor), instance)
-                .events
-                .is_empty()
-        );
-        traffic.record_usage("req-200", "b", || usage(5));
-        let changed = traffic.snapshot("u", Some(&full.cursor), instance);
-        assert!(!changed.reset);
-        assert_eq!(changed.events.len(), 1);
-        assert_eq!(changed.events[0].usage, Some(usage(5)));
-        traffic.record_usage("req-200", "b", || usage(5));
-        assert!(
-            traffic
-                .snapshot("u", Some(&changed.cursor), instance)
-                .events
-                .is_empty(),
-            "an identical report is not a change"
-        );
-        traffic.record_usage("req-200", "b", || usage(9));
-        let revised = traffic.snapshot("u", Some(&changed.cursor), instance);
-        assert_eq!(revised.events[0].usage, Some(usage(9)));
-    }
-
-    #[test]
-    fn model_route_traffic_request_index_follows_eviction_and_sweep() {
-        let traffic = Arc::new(ModelRouteTraffic::default());
-        traffic
-            .begin("u", 0, start(Some("r")))
-            .unwrap()
-            .finish_with(headers(200));
-        for sequence in 1..=PER_USER_CAPACITY as u64 {
-            traffic.rejected(
-                "u",
-                sequence,
-                start(None),
-                404,
-                "user_model_route_not_configured",
-            );
-        }
-        assert!(traffic.lock().by_request.is_empty(), "eviction unindexes");
-        traffic
-            .begin("v", 1, start(Some("r")))
-            .unwrap()
-            .finish_with(headers(201));
-        assert_eq!(traffic.lock().by_request.len(), 1);
-        traffic
-            .lock()
-            .sweep(Instant::now() + WINDOW + Duration::from_secs(1));
-        assert!(
-            traffic.lock().by_request.is_empty(),
-            "window expiry unindexes"
-        );
     }
 
     #[test]

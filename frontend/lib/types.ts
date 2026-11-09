@@ -673,7 +673,7 @@ export type ModelRouteBodyState = "complete" | "truncated" | "read_error" | "tim
 export type ModelRouteAttempt = {
   targetShareId: string; position: number; outcome: "missing" | "app_unavailable" | "unauthorized"
     | "model_blocked" | "breaker_open" | "offline" | "response" | "ingress_rejected"
-    /** Failover ran out of time (older Routers: out of forwards) before this target. */
+    /** Only from Routers that still capped forwards at four. */
     | "budget_exhausted";
   statusCode?: number; durationMs: number;
 };
@@ -685,14 +685,6 @@ export type ModelRouteTrafficEvent = {
   phase: ModelRouteTrafficPhase; statusCode?: number; errorCode?: string;
   targetShareId?: string; position?: number; continuedSearch: boolean;
   attempts: ModelRouteAttempt[]; headersMs?: number; durationMs?: number;
-  /** Arrives after the target Share reports the request; older Routers omit it. */
-  usage?: ModelRouteTrafficUsage;
-};
-export type ModelRouteTrafficUsage = {
-  inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number;
-  totalTokens: number; actualModel?: string;
-  /** Catalog list price, micro-USD decimal string; absent when the model has no price. */
-  costMicros?: string; estimated: boolean;
 };
 export type ModelRouteTrafficSnapshot = {
   instanceId: string; cursor: string; reset: boolean;

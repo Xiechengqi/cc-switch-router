@@ -2732,7 +2732,6 @@ async fn user_model_proxy_handler_inner(
                 position: execution.position,
                 continued_search: execution.continued_search,
                 attempts: execution.attempts.clone(),
-                request_id: execution.request_id.clone(),
             });
             traffic.attach(execution.response)
         }
@@ -2744,19 +2743,9 @@ async fn user_model_proxy_handler_inner(
 struct ModelRouteDispatch {
     retry: bool,
     started: Arc<AtomicBool>,
-    /// The ID sent upstream; the Share's later usage report carries it back.
-    request_id: Arc<std::sync::OnceLock<String>>,
 }
 impl ModelRouteDispatch {
-    fn start(
-        &self,
-        metrics: &MetricsRegistry,
-        cancellation: &CancellationToken,
-        request_id: Option<&str>,
-    ) {
-        if let Some(request_id) = request_id {
-            let _ = self.request_id.set(request_id.to_string());
-        }
+    fn start(&self, metrics: &MetricsRegistry, cancellation: &CancellationToken) {
         if !cancellation.is_cancelled() && !self.started.swap(true, Ordering::Relaxed) && self.retry
         {
             metrics.record_model_route_failover();
@@ -2770,8 +2759,6 @@ struct ResolvedModelRouteExecution {
     target_share_id: Option<String>,
     position: Option<usize>,
     continued_search: bool,
-    /// Upstream request ID of the response returned to the caller.
-    request_id: Option<String>,
 }
 impl ResolvedModelRouteExecution {
     fn observation(
@@ -2809,9 +2796,7 @@ impl ResolvedModelRouteExecution {
 /// Targets run in the saved order, each forwarded at most once. Only one target
 /// whose cooldown ended is probed per request; the others are deferred to the
 /// end of the queue. A probe therefore never keeps a request from a working
-/// target, and a request with nothing else left still tries them all. With no
-/// count cap, time bounds the search instead: once failover has outlasted one
-/// response-header wait, no further forward starts. The
+/// target, and a request with nothing else left still tries them all. The
 /// trace stays in execution order with one entry per target: a retried
 /// deferral replaces its earlier `breaker_open` entry at the end.
 async fn execute_resolved_model_route(
@@ -2844,10 +2829,7 @@ async fn execute_resolved_model_route(
     let mut queue: VecDeque<usize> = (0..candidates.len()).collect();
     let mut deferred = vec![false; candidates.len()];
     let mut probed = false;
-    let search_started = Instant::now();
-    let failover_deadline =
-        Duration::from_secs(state.config.proxy_stream.response_header_timeout_secs);
-    let mut last_response: Option<(Response, String, usize, Option<String>)> = None;
+    let mut last_response: Option<(Response, String, usize)> = None;
     let mut model_blocked = false;
     let mut runtime_unavailable = false;
     let mut continued_search = false;
@@ -2875,11 +2857,6 @@ async fn execute_resolved_model_route(
                 ModelRoutePrimaryUnavailable::AppUnavailable => "app_unavailable",
                 ModelRoutePrimaryUnavailable::Unauthorized => "unauthorized",
             };
-            trace.push(attempt);
-            continue;
-        }
-        if previous_forward && search_started.elapsed() >= failover_deadline {
-            attempt.outcome = "budget_exhausted";
             trace.push(attempt);
             continue;
         }
@@ -2943,11 +2920,9 @@ async fn execute_resolved_model_route(
         };
         let mut attempt_parts = parts.clone();
         let dispatched = Arc::new(AtomicBool::new(false));
-        let request_id = Arc::new(std::sync::OnceLock::new());
         attempt_parts.extensions.insert(ModelRouteDispatch {
             retry: previous_forward,
             started: dispatched.clone(),
-            request_id: request_id.clone(),
         });
         let response = forward_to_selected_share(
             state.clone(),
@@ -2975,7 +2950,6 @@ async fn execute_resolved_model_route(
                 target_share_id: None,
                 position: None,
                 continued_search,
-                request_id: None,
             };
         }
         if response
@@ -3031,12 +3005,7 @@ async fn execute_resolved_model_route(
             .await;
         if failoverable && !queue.is_empty() {
             continued_search = true;
-            last_response = Some((
-                response,
-                target_share_id.clone(),
-                *priority,
-                request_id.get().cloned(),
-            ));
+            last_response = Some((response, target_share_id.clone(), *priority));
             continue;
         }
         return ResolvedModelRouteExecution {
@@ -3045,16 +3014,14 @@ async fn execute_resolved_model_route(
             target_share_id: Some(target_share_id.clone()),
             position: Some(*priority),
             continued_search,
-            request_id: request_id.get().cloned(),
         };
     }
-    let (response, target_share_id, position, request_id) =
-        if let Some((response, target, position, request_id)) = last_response {
-            (response, Some(target), Some(position), request_id)
+    let (response, target_share_id, position) =
+        if let Some((response, target, position)) = last_response {
+            (response, Some(target), Some(position))
         } else if !runtime_unavailable && model_blocked {
             (
                 requested_model_blocked_response(app_type, requested_model),
-                None,
                 None,
                 None,
             )
@@ -3068,7 +3035,6 @@ async fn execute_resolved_model_route(
                 ),
                 None,
                 None,
-                None,
             )
         };
     ResolvedModelRouteExecution {
@@ -3077,7 +3043,6 @@ async fn execute_resolved_model_route(
         target_share_id,
         position,
         continued_search,
-        request_id,
     }
 }
 
@@ -3569,7 +3534,6 @@ async fn execute_user_model_route_test_inner(
                 target_share_id: Some(resolution.target_share_id.clone()),
                 position: Some(0),
                 continued_search: false,
-                request_id: None,
             }
         };
         Ok::<_, AppError>((resolution, execution))
@@ -4698,11 +4662,7 @@ async fn proxy_handler_inner(state: ServerState, peer: SocketAddr, req: Request)
     let share_request_app = infer_share_request_app(&path);
 
     if let Some(dispatch) = model_route_dispatch {
-        dispatch.start(
-            &state.metrics,
-            &share_cancellation,
-            live_request_id.as_deref(),
-        );
+        dispatch.start(&state.metrics, &share_cancellation);
     }
     let upstream = match send_proxy_upstream_request(
         builder.body(body),
@@ -5488,7 +5448,7 @@ async fn handle_image_generation_stream_submit(
 
     let request_started = Instant::now();
     if let Some(dispatch) = model_route_dispatch {
-        dispatch.start(&state.metrics, &share_cancellation, Some(&request_id));
+        dispatch.start(&state.metrics, &share_cancellation);
     }
     let upstream = match send_proxy_upstream_request(
         builder.body(upstream_body),

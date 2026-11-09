@@ -135,25 +135,3 @@ test("production transfer events use edit commands and focus targets have DOM an
   assert.match(panel, /node\.dataset\.modelRouteTarget === focus\.shareId/);
   assert.match(panel, /lastFocusRequestRef\.current\.request !== forceExpanded/);
 });
-
-test("share route chips mark only what saving would change", async () => {
-  const { shareRouteChips } = await import("./model-routing");
-  const draft: DraftModelRoute[] = [
-    { ...saved[0], candidates: ["c", "b"] },
-    { clientId: "new:1", appType: "codex", requestedModel: "fresh", targetShareId: "b" },
-  ];
-  const chips = shareRouteChips(draft, saved);
-  assert.deepEqual(chips.get("a")?.map(chip => [chip.order, chip.draft]), [[0, false]], "unchanged primary");
-  assert.deepEqual(chips.get("c")?.map(chip => [chip.order, chip.draft]), [[1, true]], "moved up a place");
-  assert.deepEqual(chips.get("b")?.map(chip => [chip.clientId, chip.order, chip.draft]), [["r", 2, true], ["new:1", 0, true]]);
-});
-
-test("owned Shares are hosted by or registered to the viewer; access alone is use", async () => {
-  const { ownedViewerShareIds } = await import("./model-routing");
-  const share = (shareId: string, ownerEmail: string) => ({ shareId, ownerEmail }) as never;
-  const client = { installation: { ownerEmail: "Me@Example.com" }, shareIds: ["hosted"] } as never;
-  const owned = ownedViewerShareIds([share("hosted", "x@example.com"), share("mine", "me@example.com"), share("granted", "x@example.com")],
-    [client], "me@example.com");
-  assert.deepEqual([...owned].sort(), ["hosted", "mine"]);
-  assert.equal(ownedViewerShareIds([share("mine", "me@example.com")], [], "").size, 0);
-});

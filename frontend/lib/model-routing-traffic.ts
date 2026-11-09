@@ -2,7 +2,6 @@
 // executions. Everything shown is a fact the Router observed; nothing here
 // predicts where a future request will land.
 import type { ModelRouteTrafficEvent, ModelRouteTrafficSnapshot, ModelRoutingApp } from "@/lib/types";
-import { parseUsdMicros } from "@/lib/usd-micros";
 
 export const TRAFFIC_WINDOW_MS = 15 * 60_000;
 export const TRAFFIC_CAPACITY = 200;
@@ -58,25 +57,13 @@ export function trafficRuleKind(event: ModelRouteTrafficEvent): "default" | "exa
 
 const is2xx = (status?: number) => !!status && status >= 200 && status < 300;
 
-export type ProtocolTrafficSummary = {
-  total: number; ended: number; succeeded: number; continued: number; inflight: number;
-  /** Reported usage only; requests still waiting for a report add nothing. */
-  tokens: number;
-  /** Sum over `priced` requests only; `unpriced` reported usage has no amount. */
-  costMicros: bigint; priced: number; unpriced: number;
-};
+export type ProtocolTrafficSummary = { total: number; ended: number; succeeded: number; continued: number; inflight: number };
 
 export function protocolTrafficSummary(events: ModelRouteTrafficEvent[], app: ModelRoutingApp): ProtocolTrafficSummary {
-  const summary = { total: 0, ended: 0, succeeded: 0, continued: 0, inflight: 0, tokens: 0, costMicros: 0n, priced: 0, unpriced: 0 };
+  const summary = { total: 0, ended: 0, succeeded: 0, continued: 0, inflight: 0 };
   for (const event of events) {
     if (event.appType !== app) continue;
     summary.total += 1;
-    if (event.usage) {
-      summary.tokens += event.usage.totalTokens;
-      const cost = parseUsdMicros(event.usage.costMicros);
-      if (cost == null) summary.unpriced += 1;
-      else { summary.costMicros += cost; summary.priced += 1; }
-    }
     if (event.continuedSearch) summary.continued += 1;
     if (!trafficEnded(event)) { summary.inflight += 1; continue; }
     summary.ended += 1;
