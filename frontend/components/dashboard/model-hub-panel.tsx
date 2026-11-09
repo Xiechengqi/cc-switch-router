@@ -58,6 +58,7 @@ import { usePersistentState } from "@/lib/use-persistent-state";
 import { cn } from "@/lib/utils";
 import { ModelHubRuleEditor, modelRouteEditorId } from "./model-hub-rule-editor";
 import { ModelHubTestDrawer } from "./model-hub-test-drawer";
+import { SectionHeading } from "./section-heading";
 import type { MessageKey } from "@/lib/i18n";
 
 const PROTOCOL_TITLE_KEYS: Record<ModelRoutingProtocol, MessageKey> = {
@@ -100,7 +101,8 @@ export type ModelRoutingController = {
   refresh: () => Promise<void>;
   save: () => Promise<void>;
   resetToken: () => Promise<boolean>;
-  addRouteForShare: (shareId: string) => ModelRoutingApp | undefined;
+  /** Leaves focus alone: the caller reveals the new rule once it renders. */
+  addRouteForShare: (shareId: string) => { appType: ModelRoutingApp; clientId: string } | undefined;
   addExactRoute: (appType: ModelRoutingApp, shareId?: string) => void;
   /** Returns whether the draft accepted the new queue. */
   setPassthroughTargets: (appType: ModelRoutingApp, shareIds: string[], options?: { focus?: boolean }) => boolean;
@@ -179,10 +181,11 @@ export function useModelRoutingController(active: boolean, viewerKey: string): M
   const addRouteForShare = React.useCallback((shareId: string) => {
     const share = session.getSnapshot().profile?.eligibleShares.find(item => item.shareId === shareId);
     if (!share) return;
-    const app = preferredModelRoutingApp(share);
-    addExactRoute(app, shareId);
-    return app;
-  }, [addExactRoute, session]);
+    const appType = preferredModelRoutingApp(share);
+    const clientId = `new:${crypto.randomUUID()}`;
+    const result = runCommand({ kind: "add_exact", clientId, appType, shareId }, { focus: false });
+    return result?.changed ? { appType, clientId } : undefined;
+  }, [runCommand, session]);
   const setPassthroughTargets = React.useCallback((app: ModelRoutingApp, ids: string[], options?: { focus?: boolean }) =>
     !!runCommand({ kind: "set_default_targets", appType: app, clientId: `new:${crypto.randomUUID()}`, shareIds: ids }, options)?.changed,
   [runCommand]);
@@ -258,6 +261,15 @@ export function ModelHubPanel({
     gemini: "",
   });
   const [testOpen, setTestOpen] = React.useState(false);
+  const headerRef = React.useRef<HTMLElement>(null);
+  const [headerInView, setHeaderInView] = React.useState(true);
+  React.useEffect(() => {
+    const header = headerRef.current;
+    if (!header || typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver(([entry]) => setHeaderInView(entry.isIntersecting));
+    observer.observe(header);
+    return () => observer.disconnect();
+  }, [controller.loading, !!controller.profile]);
   const protocolInitializedRef = React.useRef(false);
   const lastFocusRequestRef = React.useRef<{ protocol: ModelRoutingProtocol; request: boolean | number } | null>(null);
 
@@ -386,7 +398,7 @@ export function ModelHubPanel({
 
   return (
     <section id="model-hub" className="grid min-w-0 overflow-hidden rounded-2xl border border-border bg-card shadow-[0_4px_6px_rgba(0,0,0,0.07)]">
-      <header className="relative flex min-w-0 flex-wrap items-center justify-between gap-3 px-4 py-4 sm:px-5">
+      <header ref={headerRef} className="relative flex min-w-0 flex-wrap items-center justify-between gap-3 px-4 py-4 sm:px-5">
         {/* Ambient accent glow: felt, not seen. */}
         <span aria-hidden className="pointer-events-none absolute -left-16 -top-24 size-56 rounded-full bg-primary/[0.06] blur-3xl" />
         <div className="relative flex min-w-0 items-center gap-3">
@@ -514,14 +526,14 @@ export function ModelHubPanel({
           ) : null}
 
           <section className="grid min-w-0 gap-3" aria-labelledby="model-hub-traffic-heading">
-            <RouteBlockHeading id="model-hub-traffic-heading" label={t("modelHub.traffic.title")} hint={t("modelHub.traffic.scope")}
+            <SectionHeading id="model-hub-traffic-heading" label={t("modelHub.traffic.title")} hint={t("modelHub.traffic.scope")}
               live={trafficStatus === "ready" && traffic.events.some(event => event.appType === activeProtocol && (event.phase === "routing" || event.phase === "streaming"))} />
             <ModelHubTraffic events={traffic.events} app={activeProtocol} shares={profile?.eligibleShares || []}
               status={trafficStatus} locale={locale} t={t} />
           </section>
 
           <section className="grid min-w-0 gap-3" aria-labelledby="model-hub-default-heading">
-            <RouteBlockHeading id="model-hub-default-heading" label={t("modelHub.passthrough")} hint={t("modelHub.passthroughHint.none")} live={!!activeSlot?.passthrough} />
+            <SectionHeading id="model-hub-default-heading" label={t("modelHub.passthrough")} hint={t("modelHub.passthroughHint.none")} live={!!activeSlot?.passthrough} />
             <ModelHubRuleEditor kind="default" route={activeSlot?.passthrough} app={activeProtocol} appLabel={t(PROTOCOL_TITLE_KEYS[activeProtocol])} shares={shares}
               disabled={busy || !profile} traffic={trafficFor(activeSlot?.passthrough?.clientId)}
               addBlockedReason={!activeSlot?.passthrough && controller.routes.length >= MAX_USER_MODEL_ROUTES ? t("modelHub.validationTooMany") : undefined}
@@ -535,7 +547,7 @@ export function ModelHubPanel({
           </section>
 
           <section className="grid min-w-0 gap-3" aria-labelledby="model-hub-exact-heading">
-            <RouteBlockHeading id="model-hub-exact-heading" label={t("modelHub.exactModels")} count={activeSlot?.exact.length || 0}
+            <SectionHeading id="model-hub-exact-heading" label={t("modelHub.exactModels")} count={activeSlot?.exact.length || 0}
               live={!!activeSlot?.exact.length}
               action={<Button size="sm" variant="outline" isDisabled={busy || !profile || controller.routes.length >= MAX_USER_MODEL_ROUTES}
                 data-add-model-route onClick={() => controller.addExactRoute(activeProtocol)}>
@@ -556,10 +568,32 @@ export function ModelHubPanel({
           </section>
 
           <footer className="flex min-w-0 flex-wrap items-center justify-between gap-3 border-t border-border pt-4">
-            <p className="min-w-0 flex-1 text-[11px] leading-5 text-muted-foreground">{t(LIST_MODE_KEYS[mode])}</p>
+            <div className="grid min-w-0 flex-1 gap-1 text-[11px] leading-5 text-muted-foreground">
+              <p>{t(LIST_MODE_KEYS[mode])}</p>
+              <p>{t("modelHub.recent.scope")}</p>
+            </div>
             <Button variant="outline" className="min-h-11 whitespace-nowrap" isDisabled={!profile || controller.loading}
               onClick={() => setTestOpen(true)}>{t("modelHub.test.open")}</Button>
           </footer>
+        </div>
+      ) : null}
+      {/* The header's Save scrolls away on long queues; unsaved work keeps a reachable Save. */}
+      {controller.dirty && !headerInView ? (
+        <div role="region" aria-label={t("modelHub.unsavedBar")}
+          className="fixed inset-x-4 bottom-4 z-40 mx-auto flex max-w-xl flex-wrap items-center justify-between gap-3 rounded-2xl border border-border bg-card/95 px-4 py-3 shadow-[0_20px_25px_rgba(0,0,0,0.1)] backdrop-blur">
+          <span className="inline-flex min-w-0 items-center gap-2 text-sm font-medium text-foreground">
+            <span className="model-route-dot model-route-dot-live bg-primary" aria-hidden />
+            {t("modelHub.changes.title", { count: changes.length })}
+          </span>
+          <span className="flex items-center gap-2">
+            <Button size="sm" variant="ghost" className="min-h-11 sm:min-h-9" isDisabled={busy} onClick={() => setReloadConfirmOpen(true)}>
+              {t("modelHub.discardChanges")}
+            </Button>
+            <Button size="sm" variant="primary" className="min-h-11 sm:min-h-9" isDisabled={busy || controller.conflict} onClick={() => void controller.save()}>
+              {controller.busy ? <Loader2 className="size-4 animate-spin" aria-hidden /> : <Save className="size-4" aria-hidden />}
+              {t("common.save")}
+            </Button>
+          </span>
         </div>
       ) : null}
       <ModelHubTestDrawer open={testOpen} onOpenChange={setTestOpen} actorKey={controller.actorKey} app={activeProtocol}
@@ -576,21 +610,3 @@ export function ModelHubPanel({
   );
 }
 
-/** Section label in the Router's pill style; the dot pulses once the block routes traffic. */
-function RouteBlockHeading({ id, label, hint, count, live, action }: {
-  id: string; label: string; hint?: string; count?: number; live: boolean; action?: React.ReactNode;
-}) {
-  return (
-    <div className="flex min-w-0 flex-wrap items-center justify-between gap-x-3 gap-y-2">
-      <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
-        <h3 id={id} className="inline-flex items-center gap-2 rounded-full border border-primary/25 bg-primary/5 px-3 py-1 text-xs font-medium text-primary">
-          <span className={cn("model-route-dot", live ? "bg-primary model-route-dot-live" : "bg-primary/40")} aria-hidden />
-          {label}
-          {count ? <span className="font-mono text-[11px] tabular-nums text-primary/70">{count}</span> : null}
-        </h3>
-        {hint ? <p className="min-w-0 text-xs text-muted-foreground">{hint}</p> : null}
-      </div>
-      {action}
-    </div>
-  );
-}

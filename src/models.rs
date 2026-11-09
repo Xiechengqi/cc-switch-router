@@ -470,7 +470,7 @@ impl Default for ModelRouteTestCapabilities {
             saved_route: true,
             revision_check: true,
             total_timeout_ms: 30_000,
-            max_attempts: 4,
+            max_attempts: crate::store::MAX_USER_MODEL_ROUTE_CANDIDATES + 1,
             response_preview_bytes: 16 * 1024,
         }
     }

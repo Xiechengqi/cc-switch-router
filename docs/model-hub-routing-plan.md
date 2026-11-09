@@ -63,7 +63,7 @@
 | D3 | 草稿生命周期跟随账号，不跟随标签 | session 的创建依赖和读写有效性要一起调整；暂停读取不取消保存，凭据明文仍随隐藏清除，无需给标签切换增加确认弹窗 |
 | D4 | 撤销/重做改为待保存修改清单，单项还原必须原子化 | 规则草稿最多 100 条，差异清单更好理解；失败时不产生半条规则或部分还原 |
 | D5 | 不设“极简/完整”模式 | 用空状态操作和空区块折叠实现渐进展示，少一个状态维度 |
-| D6 | 诊断改为 `/test` 的同步 `saved_route` 模式，加用户限流 | 最多 4 次转发，受输出上限和整次 deadline 约束；网络失败不自动重放，不引入异步去重或进程粘性。输出上限不是总 token 或费用上限 |
+| D6 | 诊断改为 `/test` 的同步 `saved_route` 模式，加用户限流 | 每个目标最多转发一次（最多 6 次），受输出上限和整次 deadline 约束；网络失败不自动重放，不引入异步去重或进程粘性。输出上限不是总 token 或费用上限 |
 | D7 | 运行观测从已有计数器和有界内存窗口做起；每条规则只保留最近一次结果 | 不新增 metrics schema，不把“继续寻找候选”的计数说成切换成功；确认有需求再做完整快照 |
 | D8 | 验证由 CI 执行 | 本机是共享环境，agent 只跑 `cargo check` 和 TypeScript 类型检查，并补测试文件；不截图，不做 UI 自动化 |
 
@@ -386,12 +386,12 @@ function buildShareDependencies(
 
 #### v2.2 开工冻结契约（本轮自动采用）
 
-- GET 的 `testCapabilities` 为 `{ savedRoute: true, revisionCheck: true, totalTimeoutMs: 30000, maxAttempts: 4, responsePreviewBytes: 16384 }`。缺失时只能发送旧版两字段 primary 请求。已确认 revisionCheck 时 primary 也可以携带 mode/expectedRevision；混合版本拒绝新字段时不降级重放。
+- GET 的 `testCapabilities` 为 `{ savedRoute: true, revisionCheck: true, totalTimeoutMs: 30000, maxAttempts: 6, responsePreviewBytes: 16384 }`。缺失时只能发送旧版两字段 primary 请求。已确认 revisionCheck 时 primary 也可以携带 mode/expectedRevision；混合版本拒绝新字段时不降级重放。
 - `/test` 的 `mode` 缺省 `primary`；saved_route 必须带 expectedRevision。Store 在同一连接锁内校验 profile revision 并解析原始队列，409 不发上游。primary 带 expectedRevision 时同样校验；旧 primary 的 Coded 错误继续保留 200/success=false 的兼容形式。
 - saved_route 的控制面错误保持外层 401/403/404/409/422；实例限流外层 429，`Retry-After` 为当前 60 秒窗口剩余秒数（向上取整）。每用户 3 次/60 秒；最多 4096 个活跃用户窗口，先清过期窗口，满额拒绝新键并返回 429，不驱逐现有额度。重启清空，多实例不保证全局额度。限流在解析后、开始转发前执行；拒绝不消耗调用。
 - saved_route 上游的 HTTP 错误仍用外层 200 包装诊断结果（内层真实 statusCode，success=false）。等响应头超时外层 504，details 含 incomplete/mayHaveUsage；正文读取超时保留已收到的头和预览，bodyState=timeout、success=false。primary 同时修复总时限与预览读取边界，但不扩大候选、熔断或限流范围。
 - 30 秒绝对 deadline 从 API 开始执行计算，包含选路、Key 获取、所有候选和正文读取。预览只收集 16 KiB + 1 字节，超过后立即停止。`bodyState` 为 complete/truncated/read_error/timeout；仅 HTTP 2xx 且正文完整时 success=true。截断、读失败和超时均标记 incomplete，不能把收到 200 当成文本完整成功。
-- 新响应可选字段：mode、revision（来自执行快照）、routeId、attempts、bodyState。attempts 每项含 targetShareId、position（原 priority，0 为首选）、outcome、可选 statusCode 和 durationMs。outcome 穷举 missing/app_unavailable/unauthorized/model_blocked/breaker_open/offline/response/budget_exhausted。最多六项；不得包含 Key、正文或内部错误堆栈。
+- 新响应可选字段：mode、revision（来自执行快照）、routeId、attempts、bodyState。attempts 每项含 targetShareId、position（原 priority，0 为首选）、outcome、可选 statusCode 和 durationMs。outcome 穷举 missing/app_unavailable/unauthorized/model_blocked/breaker_open/offline/response/ingress_rejected（转发次数上限已取消，改为时间约束：搜索超过一个响应头等待时长后其余目标记 budget_exhausted；被延后的半开探测记为 breaker_open，回头尝试时该项移到末尾）。最多六项；不得包含 Key、正文或内部错误堆栈。
 - 最近结果为实例内每条路由一条，最多 4096 条，写入前清理超过 1 小时的记录；容量仍满时淘汰请求开始序号最小的记录。全局单调序号以十进制字符串输出。只在当前账号、同 revision、路由仍存在时输出；新请求开始即预留顺序围栏，旧慢请求不能覆盖新请求，即使新请求已被取消。超过 1 小时不再输出。没有记录就是未知；不在 UI 拼接跨实例历史。
 - `routeRecentResults` 每项为 routeId/revision/requestSequence/observedAt/source/phase/可选 targetShareId/position/statusCode/continuedSearch/usedBackup/可选 bodyState。source=request 或 diagnostic；phase=response_headers/body_complete/body_incomplete。普通请求仅记录头阶段事实；continuedSearch 和 usedBackup 单独记录，均不等同完整成功。
 - 前端请求状态按账号 lifetime、协议、本地 revision 和发起序号隔离。关闭、改模型、切协议、草稿变脏后丢弃展示；仍在进行的请求不允许并行重复点击。网络失败不自动重试；明确提示结果未知、可能计量。能力缺失不发新字段，也不擅自改测首选。

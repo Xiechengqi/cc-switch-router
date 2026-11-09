@@ -19,9 +19,12 @@
   display: grid;
   align-content: start;
   gap: 0.375rem;
-  max-height: min(28rem, 65svh);
+  /* Exact three-row cap is measured in SharePoolPicker; this is the pre-measure bound. */
+  max-height: 14rem;
   min-width: 0;
   overflow-y: auto;
+  /* Rows measure their offsets against the list itself. */
+  position: relative;
   overscroll-behavior: contain;
   padding: 0.5rem;
 }

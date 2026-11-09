@@ -19,6 +19,8 @@ const events: ModelRouteTrafficEvent[] = [
     attempts: [{ targetShareId: "a", position: 0, outcome: "response", statusCode: 200, durationMs: 800 }] },
   { sequence: "2", appType: "codex", requestedModel: "gpt-pinned", routeId: "r2", revision: 1, matchedWildcard: false, startedAt,
     phase: "complete", statusCode: 200, targetShareId: "b", position: 1, continuedSearch: true, headersMs: 2_400, durationMs: 9_100,
+    usage: { inputTokens: 1_200, outputTokens: 340, cacheReadTokens: 8_100, cacheWriteTokens: 0, totalTokens: 9_640,
+      actualModel: "gpt-pinned-2026", costMicros: "30", estimated: true },
     attempts: [
       { targetShareId: "a", position: 0, outcome: "response", statusCode: 429, durationMs: 300 },
       { targetShareId: "b", position: 1, outcome: "response", statusCode: 200, durationMs: 2_100 },
@@ -40,6 +42,16 @@ for (const locale of ["en", "zh-CN"] as const) {
     assert.ok(html.includes(t("modelHub.traffic.inflight", { count: 1 })));
     assert.ok(html.includes(t("modelHub.traffic.headers", { seconds: "2.4" })));
     assert.match(html, /model-route-dot-live/, "a streaming request is shown as in progress");
+    assert.ok(html.includes("$0.00003"), "a tiny catalog price stays distinguishable from zero");
+    assert.ok(html.includes(t("modelHub.traffic.usage.cacheRead")), "non-zero cache reads are shown");
+    assert.ok(!html.includes(t("modelHub.traffic.usage.cacheWrite")), "zero cache writes stay out of the way");
+    assert.ok(html.includes(t("modelHub.traffic.usage.estimated")));
+    assert.ok(html.includes(t("modelHub.traffic.usage.actualModel", { model: "gpt-pinned-2026" })));
+    const pending = renderToStaticMarkup(<ModelHubTraffic events={[{ ...events[1], usage: undefined }]} app="codex" shares={shares} status="ready" locale={locale} t={t} />);
+    assert.ok(pending.includes(t("modelHub.traffic.usage.pending")), "a finished 2xx without a report says so");
+    const unpriced = { ...events[1], sequence: "4", usage: { ...events[1].usage!, costMicros: undefined, totalTokens: 500_000 } };
+    const partial = renderToStaticMarkup(<ModelHubTraffic events={[unpriced, events[1]]} app="codex" shares={shares} status="ready" locale={locale} t={t} />);
+    assert.ok(partial.includes(locale === "en" ? "excludes 1" : "不含 1"), "the excluded count is disclosed");
     assert.doesNotMatch(html, /接管|主力|切换成功|took over|switched successfully/i, "no inferred failover claims");
     const claude = renderToStaticMarkup(<ModelHubTraffic events={events} app="claude" shares={shares} status="ready" locale={locale} t={t} />);
     assert.ok(claude.includes(t("modelHub.traffic.empty", { minutes: 15 })), "other protocols' events are not shown");

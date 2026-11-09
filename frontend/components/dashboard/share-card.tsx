@@ -9,6 +9,7 @@ import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   operationalReasonLabel,
+  operationalStateLabel,
   shareOperationalSummary,
 } from "@/components/dashboard/operational-status";
 import { useDashboardFocus } from "@/components/dashboard/dashboard-focus";
@@ -51,7 +52,7 @@ import {
 import { shareEditPendingLabel } from "@/components/dashboard/share-edit/share-edit-section";
 import { SubdomainCopyButton } from "@/components/dashboard/subdomain-copy-button";
 import { ShareProviderStatusPanel } from "@/components/dashboard/share-provider-status-panel";
-import type { DraftModelRoute } from "@/lib/model-routing";
+import type { ShareRouteChip } from "@/lib/model-routing";
 
 function requestBelongsToApp(request: ShareRequestLog, app: CoreShareApp) {
   const appType = (request.appType || "").trim().toLowerCase();
@@ -100,7 +101,7 @@ export const ShareCard = React.memo(function ShareCard({
   onEdit: (share: ShareView) => void;
   onConnect: (share: ShareView) => void;
   directApiUrl?: string;
-  modelRoutes?: DraftModelRoute[];
+  modelRoutes?: ShareRouteChip[];
   onAddModelRoute?: (shareId: string) => void;
 }) {
   const { locale, t } = useLocaleText();
@@ -207,21 +208,21 @@ export const ShareCard = React.memo(function ShareCard({
   const dimmed = Boolean(focus.target) && !related;
   const stateTone =
     summary.state === "offline"
-      ? "border-rose-200"
+      ? "border-red-200"
       : summary.state === "reconnecting"
         ? "border-sky-300"
         : summary.state === "degraded"
           ? "border-amber-300"
           : summary.state === "disabled"
-            ? "border-slate-300 opacity-70"
-            : "border-slate-200";
+            ? "border-border opacity-70"
+            : "border-border";
   const statusDot =
     summary.state === "offline"
-      ? "bg-rose-500"
+      ? "bg-red-500"
       : summary.state === "reconnecting"
         ? "bg-sky-500"
         : summary.state === "degraded"
-          ? "bg-amber-400"
+          ? "bg-amber-500"
           : summary.state === "disabled"
             ? "bg-slate-400"
             : "bg-emerald-500";
@@ -233,8 +234,26 @@ export const ShareCard = React.memo(function ShareCard({
       : share.canManage
         ? t("common.edit")
         : t("common.view");
-  const secondaryActionClass =
-    "inline-flex h-6 max-w-[160px] items-center gap-1 rounded-md border border-slate-200 bg-white px-2 text-[10px] font-semibold text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50";
+  // Touch screens get 44px targets; a mouse keeps the compact 32px row.
+  const actionClass =
+    "inline-flex h-8 shrink-0 items-center gap-1 rounded-lg border px-2.5 text-[11px] font-semibold transition-colors duration-200 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-60 pointer-coarse:h-11";
+  const iconActionClass =
+    "inline-flex size-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors duration-200 hover:bg-secondary hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring pointer-coarse:size-11";
+  const metricLabel = "block text-[11px] text-muted-foreground";
+  const metricValue = "block truncate text-[13px] font-semibold tabular-nums text-foreground";
+  // Healthy states need no words; every other state says why in text, not only color.
+  const statusLabel =
+    summary.state === "online" || summary.state === "available"
+      ? ""
+      : issue || operationalStateLabel(summary.state, t);
+  const statusPill =
+    summary.state === "offline"
+      ? "bg-red-50 text-red-700"
+      : summary.state === "reconnecting"
+        ? "bg-sky-50 text-sky-700"
+        : summary.state === "degraded"
+          ? "bg-amber-50 text-amber-800"
+          : "bg-secondary text-muted-foreground";
 
   const openShareDrawer = React.useCallback(() => {
     focus.setFocus({
@@ -258,7 +277,7 @@ export const ShareCard = React.memo(function ShareCard({
     <Card
       ref={cardRef}
       data-share-id={share.shareId}
-      className={`w-full min-w-0 overflow-visible rounded-xl border bg-white p-0 shadow-sm transition-[border-color,box-shadow,opacity] hover:border-primary/35 ${focused ? "border-primary ring-2 ring-primary/20" : related ? "border-primary/35" : stateTone} ${dimmed ? "opacity-40" : "opacity-100"}`}
+      className={`w-full min-w-0 overflow-visible rounded-xl border bg-card p-0 shadow-[0_1px_3px_rgba(0,0,0,0.06)] transition-[border-color,box-shadow,opacity,transform] duration-200 ease-out hover:-translate-y-0.5 hover:border-primary/30 hover:shadow-[0_10px_15px_rgba(0,0,0,0.08)] motion-reduce:transform-none ${focused ? "border-primary ring-2 ring-primary/20" : related ? "border-primary/35" : stateTone} ${dimmed ? "opacity-40" : "opacity-100"}`}
       onMouseDown={(event) => {
         pointerDownRef.current = { x: event.clientX, y: event.clientY };
       }}
@@ -268,20 +287,27 @@ export const ShareCard = React.memo(function ShareCard({
         openShareDrawer();
       }}
     >
-      <Card.Content className="grid min-h-[150px] min-w-0 cursor-pointer select-text grid-rows-[auto_auto_1fr] gap-2.5 p-3">
-        <div className="grid min-w-0 gap-1">
-          <div className="flex min-w-0 items-center justify-between gap-2">
+      <Card.Content className="grid min-w-0 cursor-pointer select-text gap-3 p-3.5">
+        <div className="grid min-w-0 gap-1.5">
+          <div className="flex min-w-0 items-start justify-between gap-2">
             <div className="flex min-w-0 items-center gap-1.5">
               <span
                 className={`h-2 w-2 shrink-0 rounded-full ${statusDot}`}
-                title={issue || summary.state}
+                aria-hidden
               />
-              <strong
-                className="min-w-0 truncate text-sm font-semibold text-foreground"
+              {/* The card opens on click; this is the same action for keyboards and screen readers. */}
+              <button
+                type="button"
+                className="min-w-0 truncate rounded text-left text-sm font-semibold tracking-[-0.01em] text-foreground hover:text-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
                 title={title}
+                aria-label={t("dashboard.openShareDetails", { name: title })}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  openShareDrawer();
+                }}
               >
                 {title}
-              </strong>
+              </button>
               {hasSubdomain ? (
                 <SubdomainCopyButton subdomain={subdomain} />
               ) : null}
@@ -306,13 +332,13 @@ export const ShareCard = React.memo(function ShareCard({
                 title={
                   connectDisabled ? issue || t("common.disabled") : undefined
                 }
-                className="inline-flex h-6 items-center gap-1 rounded-md border border-primary/20 bg-primary/5 px-2 text-[10px] font-semibold text-primary hover:bg-primary/10 disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-50 disabled:text-slate-400"
+                className={`${actionClass} border-primary/20 bg-primary/5 text-primary hover:bg-primary/10 disabled:border-border disabled:bg-secondary disabled:text-muted-foreground`}
                 onClick={(event) => {
                   event.stopPropagation();
                   if (!connectDisabled) onConnect(share);
                 }}
               >
-                <Link2 className="h-3 w-3" />
+                <Link2 className="h-3.5 w-3.5" aria-hidden />
                 {t("dashboard.connect")}
               </button>
               <button
@@ -325,24 +351,29 @@ export const ShareCard = React.memo(function ShareCard({
                       t("dashboard.applyFailedFallback")
                     : undefined
                 }
-                className={secondaryActionClass}
+                className={`${actionClass} max-w-[160px] border-border bg-card text-foreground hover:bg-secondary`}
                 onClick={(event) => {
                   event.stopPropagation();
                   if (!editPending) onEdit(share);
                 }}
               >
                 {share.canManage ? (
-                  <Pencil className="h-3 w-3" />
+                  <Pencil className="h-3.5 w-3.5" aria-hidden />
                 ) : (
-                  <Eye className="h-3 w-3" />
+                  <Eye className="h-3.5 w-3.5" aria-hidden />
                 )}
                 <span className="truncate">{editLabel}</span>
               </button>
             </div>
           </div>
+          {statusLabel ? (
+            <span className={`inline-flex w-fit max-w-full items-center truncate rounded-full px-2 py-0.5 text-[11px] font-medium ${statusPill}`} title={statusLabel}>
+              {statusLabel}
+            </span>
+          ) : null}
           {description ? (
             <span
-              className="block truncate text-[10px] text-muted-foreground"
+              className="block truncate text-xs text-muted-foreground"
               title={description}
             >
               {description}
@@ -353,13 +384,13 @@ export const ShareCard = React.memo(function ShareCard({
         <ShareProviderStatusPanel view={providerPanelView} wrapPrimaryLine />
 
         {directApiUrl ? (
-          <div className="grid min-w-0 gap-1.5 border-t border-slate-100 pt-2">
+          <div className="grid min-w-0 gap-2 border-t border-border pt-2.5">
             <div className="flex min-w-0 items-center gap-1.5">
-              <span className="shrink-0 text-[10px] font-medium text-muted-foreground">
+              <span className="shrink-0 text-[11px] font-medium text-muted-foreground">
                 {t("modelHub.directEndpoint")}
               </span>
               <code
-                className="min-w-0 flex-1 truncate text-[10px] text-foreground"
+                className="min-w-0 flex-1 truncate font-mono text-[11px] text-foreground"
                 title={directApiUrl}
               >
                 {directApiUrl}
@@ -367,7 +398,7 @@ export const ShareCard = React.memo(function ShareCard({
               <button
                 type="button"
                 data-no-row-drawer
-                className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-slate-100 hover:text-foreground"
+                className={iconActionClass}
                 title={t("common.copy")}
                 aria-label={t("common.copy")}
                 onClick={(event) => {
@@ -378,39 +409,42 @@ export const ShareCard = React.memo(function ShareCard({
                   );
                 }}
               >
-                <Copy className="h-3 w-3" />
+                <Copy className="h-3.5 w-3.5" aria-hidden />
               </button>
             </div>
             <div className="flex min-w-0 items-center gap-1.5">
-              <Route className="h-3 w-3 shrink-0 text-primary" aria-hidden />
-              <div className="flex min-w-0 flex-1 flex-wrap gap-1">
-                {modelRoutes.length ? modelRoutes.map((route) => (
-                  <span
-                    key={route.clientId}
-                    className="max-w-full truncate rounded-md border border-primary/15 bg-primary/5 px-1.5 py-0.5 text-[9px] font-medium text-primary"
-                    title={`${SHARE_APP_LABELS[route.appType]} · ${route.requestedModel || t("modelHub.modelPending")} · ${route.targetShareId === share.shareId ? t("modelHub.candidatePrimary") : t("modelHub.candidateOrder", { order: (route.candidates || []).indexOf(share.shareId) + 2 })}`}
-                  >
-                    {SHARE_APP_LABELS[route.appType]} · {route.requestedModel || t("modelHub.modelPending")}
-                    {" · "}{route.targetShareId === share.shareId ? t("modelHub.candidatePrimary") : t("modelHub.candidateOrder", { order: (route.candidates || []).indexOf(share.shareId) + 2 })}
-                  </span>
-                )) : (
-                  <span className="truncate text-[10px] text-muted-foreground">
+              <Route className="h-3.5 w-3.5 shrink-0 text-primary" aria-hidden />
+              <ul className="flex min-w-0 flex-1 flex-wrap gap-1" aria-label={t("modelHub.routesForShare")}>
+                {modelRoutes.length ? modelRoutes.map((chip) => {
+                  const label = `${SHARE_APP_LABELS[chip.appType]} · ${chip.requestedModel || t("modelHub.modelPending")} · ${chip.order === 0 ? t("modelHub.candidatePrimary") : t("modelHub.candidateOrder", { order: chip.order + 1 })}`;
+                  return (
+                    <li
+                      key={chip.clientId}
+                      className={`max-w-full truncate rounded-md border px-1.5 py-0.5 text-[11px] font-medium ${chip.draft ? "border-dashed border-amber-300 bg-amber-50 text-amber-800" : "border-primary/15 bg-primary/5 text-primary"}`}
+                      title={chip.draft ? `${label} · ${t("modelHub.routeUnsaved")}` : label}
+                    >
+                      {label}
+                      {chip.draft ? <span className="font-normal"> · {t("modelHub.routeUnsaved")}</span> : null}
+                    </li>
+                  );
+                }) : (
+                  <li className="truncate text-[11px] text-muted-foreground">
                     {t("modelHub.noRoutesForShare")}
-                  </span>
+                  </li>
                 )}
-              </div>
+              </ul>
               {onAddModelRoute ? (
                 <button
                   type="button"
                   data-no-row-drawer
-                  className="inline-flex h-6 shrink-0 items-center gap-1 rounded-md px-1.5 text-[9px] font-semibold text-primary hover:bg-primary/5"
+                  className={`${actionClass} border-transparent px-2 text-primary hover:bg-primary/5`}
                   title={t("modelHub.addRouteForShare")}
                   onClick={(event) => {
                     event.stopPropagation();
                     onAddModelRoute(share.shareId);
                   }}
                 >
-                  <Plus className="h-3 w-3" />
+                  <Plus className="h-3.5 w-3.5" aria-hidden />
                   {t("modelHub.mapModel")}
                 </button>
               ) : null}
@@ -418,87 +452,77 @@ export const ShareCard = React.memo(function ShareCard({
           </div>
         ) : null}
 
-        <div className="grid gap-2 text-[11px]">
-          <div className="grid grid-cols-2 gap-2">
-            <div className="min-w-0">
-              <span className="block text-muted-foreground">
-                {t("dashboard.usage")}
-              </span>
-              <strong className="tabular-nums">
-                {compactTokens(tokensUsed)} /{" "}
-                {isUnlimited(tokenLimit) ? "∞" : compactTokens(tokenLimit)}
-              </strong>
-              {usagePercent != null ? (
-                <div className="mt-1 h-1 overflow-hidden rounded-full bg-slate-100">
-                  <div
-                    className={`h-full rounded-full ${usagePercent >= 90 ? "bg-rose-500" : "bg-primary/70"}`}
-                    style={{ width: `${usagePercent}%` }}
-                  />
-                </div>
-              ) : null}
-            </div>
-            <div className="min-w-0" title={parallelTitle}>
-              <span className="block text-muted-foreground">
-                {t("dashboard.parallel")}
-              </span>
-              <strong className="cursor-help tabular-nums">
-                {activeRequests}
-                <span className="text-muted-foreground">
-                  /{isUnlimited(parallelLimit) ? "∞" : parallelLimit || 0}
-                </span>
-              </strong>
-            </div>
+        <div className="grid gap-1.5">
+          <div className="flex items-baseline justify-between gap-2">
+            <span className={metricLabel}>{t("dashboard.usage")}</span>
+            <strong className="text-[13px] font-semibold tabular-nums text-foreground">
+              {compactTokens(tokensUsed)}
+              <span className="font-normal text-muted-foreground"> / {isUnlimited(tokenLimit) ? "∞" : compactTokens(tokenLimit)}</span>
+            </strong>
           </div>
-          <div className="grid grid-cols-2 gap-2">
-            <div className="min-w-0">
-              <span className="block text-muted-foreground">
-                {t("dashboard.expires")}
-              </span>
-              <strong className="tabular-nums" title={expiryHint}>
-                {expiryLabel}
-              </strong>
+          {usagePercent != null ? (
+            <div
+              role="progressbar"
+              aria-label={t("dashboard.usage")}
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={Math.round(usagePercent)}
+              className="h-1.5 overflow-hidden rounded-full bg-secondary"
+            >
+              <div
+                className={`h-full rounded-full ${usagePercent >= 90 ? "bg-red-500" : "bg-gradient-to-r from-accent to-accent-secondary"}`}
+                style={{ width: `${usagePercent}%` }}
+              />
             </div>
-            <div className="min-w-0">
-              <span className="block text-muted-foreground">
-                {t("dashboard.uptime24h")}
-              </span>
-              <strong
-                className={`tabular-nums ${onlineRate < 90 ? "text-amber-700" : "text-emerald-700"}`}
-                title={onlineTitle}
-              >
-                {onlineRate.toFixed(1)}%
-              </strong>
-            </div>
-          </div>
-          <div className="grid grid-cols-2 gap-2">
-            <div className="min-w-0">
-              <span className="block text-muted-foreground">
-                {t("dashboard.response")}
-              </span>
-              <strong
-                className={`block truncate tabular-nums font-medium ${latencyResponseToneClass(averageLatency)}`}
-                title={formatLatencySeconds(averageLatency)}
-              >
-                {formatLatencySeconds(averageLatency)}
-              </strong>
-            </div>
-            <div className="min-w-0">
-              <span className="block text-muted-foreground">
-                {t("dashboard.totalThroughput")}
-              </span>
-              <strong
-                className="block truncate tabular-nums font-medium text-foreground"
-                title={t("dashboard.ttftTpsHint", {
-                  ttftSamples: performance.ttftSampleCount,
-                  tpsSamples: performance.tpsSampleCount,
-                })}
-              >
-                {formatTtftTps(performance)}
-              </strong>
-            </div>
-          </div>
+          ) : null}
         </div>
-        <div className="flex justify-end" data-no-row-drawer><ClientShareMarketEntryButton shareId={share.shareId} /></div>
+        <dl className="grid grid-cols-2 gap-x-3 gap-y-2 border-t border-border pt-2.5">
+          <div className="min-w-0" title={parallelTitle}>
+            <dt className={metricLabel}>{t("dashboard.parallel")}</dt>
+            <dd className={metricValue}>
+              {activeRequests}
+              <span className="font-normal text-muted-foreground">
+                /{isUnlimited(parallelLimit) ? "∞" : parallelLimit || 0}
+              </span>
+            </dd>
+          </div>
+          <div className="min-w-0">
+            <dt className={metricLabel}>{t("dashboard.uptime24h")}</dt>
+            <dd
+              className={`${metricValue} ${observedMinutes > 0 ? (onlineRate < 90 ? "text-amber-700" : "text-emerald-700") : "text-muted-foreground"}`}
+              title={onlineTitle}
+            >
+              {observedMinutes > 0 ? `${onlineRate.toFixed(1)}%` : "—"}
+            </dd>
+          </div>
+          <div className="min-w-0">
+            <dt className={metricLabel}>{t("dashboard.response")}</dt>
+            <dd
+              className={`${metricValue} ${latencyResponseToneClass(averageLatency)}`}
+              title={formatLatencySeconds(averageLatency)}
+            >
+              {formatLatencySeconds(averageLatency)}
+            </dd>
+          </div>
+          <div className="min-w-0">
+            <dt className={metricLabel}>{t("dashboard.totalThroughput")}</dt>
+            <dd
+              className={metricValue}
+              title={t("dashboard.ttftTpsHint", {
+                ttftSamples: performance.ttftSampleCount,
+                tpsSamples: performance.tpsSampleCount,
+              })}
+            >
+              {formatTtftTps(performance)}
+            </dd>
+          </div>
+        </dl>
+        <div className="flex min-w-0 items-center justify-between gap-2" data-no-row-drawer>
+          <span className="min-w-0 truncate text-[11px] text-muted-foreground" title={expiryHint}>
+            {t("dashboard.expires")} · <span className="tabular-nums text-foreground">{expiryLabel}</span>
+          </span>
+          <ClientShareMarketEntryButton shareId={share.shareId} />
+        </div>
       </Card.Content>
     </Card>
   );

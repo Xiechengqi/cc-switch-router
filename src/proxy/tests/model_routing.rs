@@ -10,6 +10,8 @@ struct QueueFixture {
     token: String,
     route_id: String,
     hits: Vec<Arc<AtomicUsize>>,
+    /// `(share index, X-CC-Switch-Request-Id)` in arrival order.
+    request_ids: Arc<std::sync::Mutex<Vec<(usize, String)>>>,
     servers: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -52,6 +54,7 @@ impl QueueFixture {
             }
         }
         let mut hits = Vec::new();
+        let request_ids = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut servers = Vec::new();
         for index in 0..6 {
             let count = Arc::new(AtomicUsize::new(0));
@@ -61,10 +64,18 @@ impl QueueFixture {
                 .unwrap();
             let address = listener.local_addr().unwrap();
             let status = statuses[index];
-            let upstream = axum::Router::new().fallback(any(move || {
+            let seen = request_ids.clone();
+            let upstream = axum::Router::new().fallback(any(move |headers: HeaderMap| {
                 let count = count.clone();
+                let seen = seen.clone();
                 async move {
                     count.fetch_add(1, AtomicOrdering::SeqCst);
+                    if let Some(id) = headers
+                        .get("x-cc-switch-request-id")
+                        .and_then(|value| value.to_str().ok())
+                    {
+                        seen.lock().unwrap().push((index, id.to_string()));
+                    }
                     status
                 }
             }));
@@ -119,6 +130,7 @@ impl QueueFixture {
             token,
             route_id: profile.routes[0].id.clone(),
             hits,
+            request_ids,
             servers,
         }
     }
@@ -131,6 +143,13 @@ impl QueueFixture {
                 None,
             );
         }
+    }
+
+    fn end_cooldown(&self, index: usize) {
+        self.state
+            .store
+            .route_breakers
+            .end_cooldown(&self.route_id, &format!("queue-{index}"));
     }
 
     fn counts(&self) -> Vec<usize> {
@@ -179,14 +198,157 @@ async fn model_route_queue_reaches_the_tail_after_offline_and_open_targets() {
 }
 
 #[tokio::test]
-async fn model_route_queue_caps_actual_forwards_at_four() {
+async fn model_route_queue_forwards_to_every_target_once() {
     let f = QueueFixture::new([true; 6], [StatusCode::SERVICE_UNAVAILABLE; 6]).await;
     assert_eq!(f.request().await.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(f.counts(), vec![1, 1, 1, 1, 0, 0]);
+    assert_eq!(f.counts(), vec![1; 6]);
 }
 
 #[tokio::test]
-async fn model_route_image_stream_caps_actual_forwards_and_counts_retries() {
+async fn model_route_queue_starts_no_forward_after_the_failover_deadline() {
+    let mut f = QueueFixture::new([true; 6], [StatusCode::OK; 6]).await;
+    // Header wait and failover deadline are the same setting; zero makes the
+    // first forward time out (504) and leaves no time to start another.
+    f.state.config.proxy_stream.response_header_timeout_secs = 0;
+    assert_eq!(f.request().await.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(&f.counts()[1..], &[0; 5]);
+}
+
+#[tokio::test]
+async fn model_route_queue_first_request_reaches_the_sixth_past_five_failing_targets() {
+    let mut statuses = [StatusCode::BAD_GATEWAY; 6];
+    statuses[1] = StatusCode::TOO_MANY_REQUESTS;
+    statuses[5] = StatusCode::OK;
+    let f = QueueFixture::new([true; 6], statuses).await;
+    assert_eq!(f.request().await.status(), StatusCode::OK);
+    assert_eq!(f.counts(), vec![1; 6]);
+}
+
+#[tokio::test]
+async fn model_route_queue_probes_one_cooled_target_per_request_and_rotates() {
+    let mut statuses = [StatusCode::BAD_GATEWAY; 6];
+    statuses[5] = StatusCode::OK;
+    let f = QueueFixture::new([true; 6], statuses).await;
+    for index in 0..5 {
+        f.open(index);
+    }
+    for index in 0..4 {
+        f.end_cooldown(index);
+    }
+    // queue-0 is probed and reopens; 1-3 wait their turn instead of burning
+    // the request; queue-4 is still cooling down; queue-5 serves.
+    assert_eq!(f.request().await.status(), StatusCode::OK);
+    assert_eq!(f.counts(), vec![1, 0, 0, 0, 0, 1]);
+    assert!(f.state.store.route_breakers.is_open(&f.route_id, "queue-0"));
+    assert_eq!(f.request().await.status(), StatusCode::OK);
+    assert_eq!(f.counts(), vec![1, 1, 0, 0, 0, 2]);
+}
+
+#[tokio::test]
+async fn model_route_queue_offline_probe_does_not_use_up_the_probe() {
+    let f = QueueFixture::new([false, true, true, true, true, true], [StatusCode::OK; 6]).await;
+    f.open(0);
+    f.open(1);
+    f.end_cooldown(0);
+    f.end_cooldown(1);
+    assert_eq!(f.request().await.status(), StatusCode::OK);
+    assert_eq!(f.counts(), vec![0, 1, 0, 0, 0, 0]);
+    assert!(!f.state.store.route_breakers.is_open(&f.route_id, "queue-1"));
+}
+
+#[tokio::test]
+async fn model_route_queue_tries_deferred_probes_before_failing() {
+    use crate::models::ModelRouteTestMode;
+    let mut statuses = [StatusCode::OK; 6];
+    statuses[0] = StatusCode::BAD_GATEWAY;
+    let f = QueueFixture::new([true; 6], statuses).await;
+    for index in 0..6 {
+        f.open(index);
+    }
+    f.end_cooldown(0);
+    f.end_cooldown(2);
+    let user = f
+        .state
+        .store
+        .ensure_user_by_email("owner@example.com")
+        .await
+        .unwrap();
+    let probe = build_user_model_route_test_probe("codex", "fixture-model").unwrap();
+    let outcome = execute_user_model_route_test(
+        f.state.clone(),
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 9999)),
+        &user.id,
+        "owner@example.com",
+        &probe,
+        ModelRouteTestMode::SavedRoute,
+        Some(1),
+        tokio::time::Instant::now() + Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    assert!(outcome.success);
+    assert_eq!(outcome.target_share_id.as_deref(), Some("queue-2"));
+    assert_eq!(f.counts(), vec![1, 0, 1, 0, 0, 0]);
+    // One entry per target in execution order; the retried deferral moved last.
+    assert_eq!(
+        outcome
+            .attempts
+            .iter()
+            .map(|attempt| (attempt.position, attempt.outcome))
+            .collect::<Vec<_>>(),
+        vec![
+            (0, "response"),
+            (1, "breaker_open"),
+            (3, "breaker_open"),
+            (4, "breaker_open"),
+            (5, "breaker_open"),
+            (2, "response"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn model_route_traffic_takes_usage_only_from_the_answering_attempt() {
+    use crate::model_route_traffic::ModelRouteTrafficUsage;
+    let mut statuses = [StatusCode::OK; 6];
+    statuses[0] = StatusCode::BAD_GATEWAY;
+    let f = QueueFixture::new([true; 6], statuses).await;
+    let response = f.request().await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(response.into_body(), 4096).await;
+    let ids = f.request_ids.lock().unwrap().clone();
+    assert_eq!(
+        ids.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    let usage = ModelRouteTrafficUsage {
+        input_tokens: 7,
+        output_tokens: 3,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        total_tokens: 10,
+        actual_model: None,
+        cost_micros: None,
+        estimated: false,
+    };
+    let traffic = &f.state.store.model_route_traffic;
+    // The failed attempt's report, and a report naming the wrong Share, are ignored.
+    traffic.record_usage(&ids[0].1, "queue-0", || unreachable!("not the answer"));
+    traffic.record_usage(&ids[1].1, "queue-0", || unreachable!("wrong Share"));
+    traffic.record_usage(&ids[1].1, "queue-1", || usage.clone());
+    let user = f
+        .state
+        .store
+        .ensure_user_by_email("owner@example.com")
+        .await
+        .unwrap();
+    let snapshot = traffic.snapshot(&user.id, None, None);
+    assert_eq!(snapshot.events.len(), 1);
+    assert_eq!(snapshot.events[0].usage, Some(usage));
+}
+
+#[tokio::test]
+async fn model_route_image_stream_forwards_to_every_target_and_counts_retries() {
     let f = QueueFixture::new([true; 6], [StatusCode::INTERNAL_SERVER_ERROR; 6]).await;
     {
         let conn = f.state.store.conn.lock().await;
@@ -222,8 +384,8 @@ async fn model_route_image_stream_caps_actual_forwards_and_counts_retries() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(f.counts(), vec![1, 1, 1, 1, 0, 0]);
-    assert_eq!(f.state.metrics.model_route_failover_total_for_tests(), 3);
+    assert_eq!(f.counts(), vec![1; 6]);
+    assert_eq!(f.state.metrics.model_route_failover_total_for_tests(), 5);
 }
 
 #[tokio::test]

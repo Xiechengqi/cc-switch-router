@@ -84,8 +84,13 @@ impl Drop for ProbePermitGuard {
 }
 #[derive(Debug)]
 pub enum BreakerPermit {
-    Allowed { guard: Option<ProbePermitGuard> },
+    Allowed {
+        guard: Option<ProbePermitGuard>,
+    },
     Rejected,
+    /// The cooldown is over and the probe is free, but the caller declined to
+    /// probe now. The probe stays free for a later acquire to take.
+    ProbeDeferred,
 }
 #[derive(Debug, Clone, Copy)]
 pub enum BreakerOutcome {
@@ -111,10 +116,17 @@ impl RouteBreakerRegistry {
         Self::default()
     }
 
-    pub fn acquire(&self, route: &str, target: &str) -> BreakerPermit {
-        self.acquire_at(route, target, Instant::now())
+    /// `allow_probe: false` returns `ProbeDeferred` instead of taking a probe.
+    pub fn acquire(&self, route: &str, target: &str, allow_probe: bool) -> BreakerPermit {
+        self.acquire_at(route, target, allow_probe, Instant::now())
     }
-    fn acquire_at(&self, route: &str, target: &str, now: Instant) -> BreakerPermit {
+    fn acquire_at(
+        &self,
+        route: &str,
+        target: &str,
+        allow_probe: bool,
+        now: Instant,
+    ) -> BreakerPermit {
         let key = BreakerKey::new(route, target);
         let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
         let Some(state) = inner.states.get_mut(&key) else {
@@ -127,6 +139,7 @@ impl RouteBreakerRegistry {
                 return BreakerPermit::Rejected;
             }
             _ if state.probe.is_some() => return BreakerPermit::Rejected,
+            _ if !allow_probe => return BreakerPermit::ProbeDeferred,
             _ => {}
         }
         // Exhaustion is fail-closed; never recycle an old permit number (ABA).
@@ -281,6 +294,19 @@ impl RouteBreakerRegistry {
             .get(&BreakerKey::new(route, target))
             .is_some_and(|s| s.phase == BreakerPhase::Open)
     }
+    /// Ends the cooldown now, as if it had run out.
+    #[cfg(test)]
+    pub fn end_cooldown(&self, route: &str, target: &str) {
+        if let Some(state) = self
+            .inner
+            .write()
+            .unwrap()
+            .states
+            .get_mut(&BreakerKey::new(route, target))
+        {
+            state.open_until = Some(Instant::now());
+        }
+    }
     #[cfg(test)]
     pub fn record_failure(&self, route: &str, target: &str, retry_after: Option<Duration>) {
         self.record(route, target, None, BreakerOutcome::Failure { retry_after });
@@ -300,7 +326,7 @@ mod tests {
         );
     }
     fn probe(registry: &RouteBreakerRegistry, now: Instant) -> ProbePermitGuard {
-        match registry.acquire_at("r", "s", now) {
+        match registry.acquire_at("r", "s", true, now) {
             BreakerPermit::Allowed { guard: Some(guard) } => guard,
             _ => panic!("expected probe"),
         }
@@ -309,7 +335,7 @@ mod tests {
     fn route_breaker_success_only_leaves_no_state() {
         let r = RouteBreakerRegistry::new();
         assert!(matches!(
-            r.acquire("r", "s"),
+            r.acquire("r", "s", true),
             BreakerPermit::Allowed { guard: None }
         ));
         r.record("r", "s", None, BreakerOutcome::Success);
@@ -325,7 +351,7 @@ mod tests {
         }
         let guard = probe(&r, now + COOLDOWN);
         assert!(matches!(
-            r.acquire_at("r", "s", now + COOLDOWN),
+            r.acquire_at("r", "s", true, now + COOLDOWN),
             BreakerPermit::Rejected
         ));
         drop(guard);
@@ -334,6 +360,35 @@ mod tests {
         let guard = probe(&r, now + COOLDOWN);
         r.record("r", "s", Some(guard), BreakerOutcome::Success);
         assert!(r.inner.read().unwrap().states.is_empty());
+    }
+    #[test]
+    fn route_breaker_declined_probe_changes_nothing() {
+        let r = RouteBreakerRegistry::new();
+        let now = Instant::now();
+        assert!(matches!(
+            r.acquire_at("r", "s", false, now),
+            BreakerPermit::Allowed { guard: None }
+        ));
+        for _ in 0..3 {
+            failure(&r, now);
+        }
+        assert!(matches!(
+            r.acquire_at("r", "s", false, now),
+            BreakerPermit::Rejected
+        ));
+        for _ in 0..2 {
+            assert!(matches!(
+                r.acquire_at("r", "s", false, now + COOLDOWN),
+                BreakerPermit::ProbeDeferred
+            ));
+        }
+        assert!(r.is_open("r", "s"));
+        let guard = probe(&r, now + COOLDOWN);
+        assert!(matches!(
+            r.acquire_at("r", "s", false, now + COOLDOWN),
+            BreakerPermit::Rejected
+        ));
+        drop(guard);
     }
     #[test]
     fn route_breaker_old_guard_and_ordinary_result_cannot_release_new_probe() {
@@ -351,7 +406,7 @@ mod tests {
         drop(old);
         r.record("r", "s", None, BreakerOutcome::Success);
         assert!(matches!(
-            r.acquire_at("r", "s", now + COOLDOWN),
+            r.acquire_at("r", "s", true, now + COOLDOWN),
             BreakerPermit::Rejected
         ));
         drop(current);
@@ -422,11 +477,11 @@ mod tests {
             );
         }
         assert!(matches!(
-            r.acquire_at("r", "s", now + MAX_COOLDOWN - Duration::from_secs(1)),
+            r.acquire_at("r", "s", true, now + MAX_COOLDOWN - Duration::from_secs(1)),
             BreakerPermit::Rejected
         ));
         assert!(matches!(
-            r.acquire("other", "s"),
+            r.acquire("other", "s", true),
             BreakerPermit::Allowed { guard: None }
         ));
         drop(probe(&r, now + MAX_COOLDOWN));

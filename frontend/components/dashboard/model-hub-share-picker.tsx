@@ -21,6 +21,39 @@ const iconButton = cn("inline-flex size-9 shrink-0 items-center justify-center r
 const arrowButton = cn("inline-flex size-9 shrink-0 items-center justify-center rounded-full border bg-card shadow-[0_1px_3px_rgba(0,0,0,0.06)] transition-all duration-200 ease-out hover:-translate-y-0.5 active:scale-95 disabled:pointer-events-none disabled:opacity-30 motion-reduce:transform-none pointer-coarse:size-11", focusRing);
 const addButton = cn(arrowButton, "border-border text-primary group-hover/row:border-primary/40 hover:border-transparent hover:bg-gradient-to-r hover:from-accent hover:to-accent-secondary hover:text-primary-foreground hover:shadow-[0_4px_14px_rgba(0,82,255,0.25)]");
 const removeButton = cn(arrowButton, "border-border text-muted-foreground hover:border-red-200 hover:bg-red-50 hover:text-red-600");
+/** Rows a pane shows before it scrolls. */
+const VISIBLE_ROWS = 3;
+
+/** Caps a list at `rows` rows by measuring them, so the cap follows whatever a
+ * row holds (a traffic line, touch-sized buttons, a larger font). Offsets are
+ * layout positions, so drag and layout-animation transforms do not move it.
+ * Work happens only when a row is added, removed or resized. */
+function useVisibleRows<T extends HTMLElement>(rows: number) {
+  const ref = React.useRef<T>(null);
+  React.useLayoutEffect(() => {
+    const list = ref.current;
+    if (!list || typeof ResizeObserver === "undefined") return;
+    const fit = () => {
+      const last = list.children[rows - 1] as HTMLElement | undefined;
+      // "none", not "": an empty value would fall back to the stylesheet's pre-measure cap.
+      if (list.children.length <= rows || !last) { list.style.maxHeight = "none"; return; }
+      const bottom = parseFloat(getComputedStyle(list).paddingBottom) || 0;
+      list.style.maxHeight = `${last.offsetTop + last.offsetHeight + bottom}px`;
+    };
+    const resize = new ResizeObserver(fit);
+    const observeRows = () => {
+      resize.disconnect();
+      resize.observe(list);
+      for (const child of Array.from(list.children)) resize.observe(child);
+    };
+    const mutation = new MutationObserver(() => { observeRows(); fit(); });
+    mutation.observe(list, { childList: true });
+    observeRows();
+    fit();
+    return () => { resize.disconnect(); mutation.disconnect(); };
+  }, [rows]);
+  return ref;
+}
 
 function DirectionIcon({ toward }: { toward: "queue" | "pool" }) {
   // Side by side the arrow points across; stacked (narrow) it points up/down.
@@ -97,6 +130,8 @@ export function SharePoolPicker({ shares, selected, app, routeKey, disabled, add
   const [query, setQuery] = React.useState("");
   const [announcement, setAnnouncement] = React.useState("");
   const [dragging, setDragging] = React.useState(false);
+  const poolList = useVisibleRows<HTMLUListElement>(VISIBLE_ROWS);
+  const queueList = useVisibleRows<HTMLOListElement>(VISIBLE_ROWS);
   const buttons = React.useRef(new Map<string, HTMLButtonElement>());
   const pendingFocus = React.useRef<string[] | null>(null);
   React.useLayoutEffect(() => {
@@ -184,7 +219,7 @@ export function SharePoolPicker({ shares, selected, app, routeKey, disabled, add
                     aria-label={t("modelHub.searchList", { list: t("modelHub.availableShares") })} placeholder={t("modelHub.searchShares")} />
                 </div>
               ) : null}
-              <ul className="model-route-transfer-list" aria-label={t("modelHub.availableShares")}>
+              <ul ref={poolList} className="model-route-transfer-list" aria-label={t("modelHub.availableShares")}>
                 {available.map(share => {
                   const name = share.subdomain || share.shareName;
                   return (
@@ -221,7 +256,7 @@ export function SharePoolPicker({ shares, selected, app, routeKey, disabled, add
                   announcements: modelRouteDragAnnouncements(ids, selected.map(nameOf), 1, t)
                 }}>
                 <SortableContext items={ids} strategy={verticalListSortingStrategy}>
-                  <ol className="model-route-transfer-list" aria-label={t("modelHub.selectedShares")}>
+                  <ol ref={queueList} className="model-route-transfer-list" aria-label={t("modelHub.selectedShares")}>
                     {selected.map((shareId, index) => <QueueRow key={ids[index]} id={ids[index]} index={index} total={selected.length}
                       share={byId.get(shareId)} shareId={shareId} app={app} locale={locale} t={t} layoutKey={layoutKey}
                       traffic={traffic ? { stats: traffic.get(shareId) } : undefined}

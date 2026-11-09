@@ -14,7 +14,8 @@ import {
 import type { ModelRouteAttempt, ModelRouteTrafficEvent, ModelRoutingApp, UserModelRoutingShare } from "@/lib/types";
 import type { ModelRoutingTrafficStatus } from "@/lib/use-model-routing-traffic";
 import type { AppLocale, MessageKey } from "@/lib/i18n";
-import { cn } from "@/lib/utils";
+import { cn, compactTokens } from "@/lib/utils";
+import { formatUsdMicros } from "@/lib/usd-micros";
 
 type T = (key: MessageKey, params?: Record<string, string | number>) => string;
 const VISIBLE_ROWS = 5;
@@ -101,6 +102,44 @@ function TrafficResult({ event, now, t }: { event: ModelRouteTrafficEvent; now: 
   </span>;
 }
 
+/** What the answering Share reported. Zero cache counters stay out of the way. */
+function TrafficUsage({ event, locale, t }: { event: ModelRouteTrafficEvent; locale: AppLocale; t: T }) {
+  const usage = event.usage;
+  if (!usage) {
+    return event.targetShareId && event.phase === "complete" && is2xx(event.statusCode)
+      ? <span className="text-[11px] text-muted-foreground/80">{t("modelHub.traffic.usage.pending")}</span> : null;
+  }
+  const exact = (value: number) => value.toLocaleString(locale);
+  const items: [string, number][] = [
+    [t("modelHub.traffic.usage.input"), usage.inputTokens],
+    [t("modelHub.traffic.usage.output"), usage.outputTokens],
+    ...(usage.cacheReadTokens ? [[t("modelHub.traffic.usage.cacheRead"), usage.cacheReadTokens] as [string, number]] : []),
+    ...(usage.cacheWriteTokens ? [[t("modelHub.traffic.usage.cacheWrite"), usage.cacheWriteTokens] as [string, number]] : []),
+    [t("modelHub.traffic.usage.total"), usage.totalTokens],
+  ];
+  const actualModel = usage.actualModel && usage.actualModel !== event.requestedModel ? usage.actualModel : "";
+  const cost = formatUsdMicros(usage.costMicros, locale);
+  return (
+    <span className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-[11px]">
+      {items.map(([label, value]) => (
+        <span key={label} className="whitespace-nowrap" title={`${label} ${exact(value)}`}>
+          <span className="text-muted-foreground">{label}</span>{" "}
+          <span className="font-mono tabular-nums text-foreground">{compactTokens(value, locale)}</span>
+        </span>
+      ))}
+      <span title={t("modelHub.traffic.usage.costHint")}
+        className={cn("inline-flex h-5 items-center rounded-full px-1.5 font-mono font-semibold tabular-nums",
+          cost ? "bg-primary/10 text-primary" : "bg-secondary text-muted-foreground")}>
+        {cost ?? t("modelHub.traffic.usage.unpriced")}
+      </span>
+      {usage.estimated ? <span className="rounded-full bg-amber-50 px-1.5 py-0.5 text-amber-700">{t("modelHub.traffic.usage.estimated")}</span> : null}
+      {actualModel ? <span className="min-w-0 max-w-[16rem] truncate text-muted-foreground" title={actualModel}>
+        {t("modelHub.traffic.usage.actualModel", { model: actualModel })}
+      </span> : null}
+    </span>
+  );
+}
+
 /** Live, read-only list of the viewer's own unified-API requests for one protocol. */
 export function ModelHubTraffic({ events, app, shares, status, locale, t }: {
   events: ModelRouteTrafficEvent[]; app: ModelRoutingApp; shares: UserModelRoutingShare[];
@@ -128,6 +167,13 @@ export function ModelHubTraffic({ events, app, shares, status, locale, t }: {
           {summary.ended ? <span className={stat}>{t("modelHub.traffic.successRate", { rate: Math.round((summary.succeeded / summary.ended) * 100) })}</span> : null}
           {summary.continued ? <span className={cn(stat, "bg-amber-50 text-amber-700")}>{t("modelHub.traffic.continued", { count: summary.continued })}</span> : null}
           {summary.inflight ? <span className={cn(stat, "bg-primary/10 text-primary")}>{t("modelHub.traffic.inflight", { count: summary.inflight })}</span> : null}
+          {summary.tokens ? <span className={stat} title={t("modelHub.traffic.usage.costHint")}>
+            {summary.priced
+              ? t(summary.unpriced ? "modelHub.traffic.usage.summaryPartial" : "modelHub.traffic.usage.summary", {
+                tokens: compactTokens(summary.tokens, locale), cost: formatUsdMicros(summary.costMicros, locale) || "—", unpriced: summary.unpriced,
+              })
+              : t("modelHub.traffic.usage.summaryTokens", { tokens: compactTokens(summary.tokens, locale) })}
+          </span> : null}
           {status === "error" ? <span role="status" className="text-amber-700">{t("modelHub.traffic.error")}</span> : null}
         </div>
         {rows.length ? (
@@ -149,6 +195,7 @@ export function ModelHubTraffic({ events, app, shares, status, locale, t }: {
                   </span>
                   <TrafficPath event={event} names={names} t={t} />
                   <span className="sm:justify-self-end"><TrafficResult event={event} now={now} t={t} /></span>
+                  <span className="min-w-0 empty:hidden sm:col-span-3 sm:col-start-2"><TrafficUsage event={event} locale={locale} t={t} /></span>
                 </motion.li>
               ))}
             </AnimatePresence>

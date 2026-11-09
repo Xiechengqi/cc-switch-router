@@ -8206,6 +8206,24 @@ impl AppStore {
         }
     }
 
+    /// Hands committed Share usage reports to the unified-API traffic records
+    /// of the requests they answered. Callers pass only logs the database
+    /// accepted, so a stale revision never replaces a newer one. Pending and
+    /// not-applicable (e.g. image jobs) reports carry no token counts.
+    fn record_route_traffic_usage(&self, logs: &[ShareRequestLogEntry]) {
+        let catalog = self.pricing_catalog();
+        let now = Utc::now().timestamp();
+        for log in logs.iter().filter(|log| {
+            !log.is_health_check
+                && !matches!(log.usage_state.as_str(), "pending" | "not_applicable")
+        }) {
+            self.model_route_traffic
+                .record_usage(&log.request_id, &log.share_id, || {
+                    route_traffic_usage(&catalog, log, now)
+                });
+        }
+    }
+
     pub fn begin_user_model_route_observation(
         &self,
         resolution: &UserModelRouteResolution,
@@ -12435,6 +12453,7 @@ impl AppStore {
         tx.commit().map_err(|e| {
             AppError::Internal(format!("commit request log batch sync failed: {e}"))
         })?;
+        self.record_route_traffic_usage(&accepted_logs);
         Ok(ShareRequestLogBatchSyncResult {
             acks,
             accepted_logs,
@@ -13248,8 +13267,12 @@ impl AppStore {
                 "begin share request log recovery tx failed: {error}"
             ))
         })?;
+        let mut accepted = Vec::with_capacity(logs.len());
         for log in logs {
-            upsert_share_request_log_tx(&tx, installation_id, log.clone())?;
+            // A stale revision is refused here; it must not reach route traffic either.
+            if upsert_share_request_log_tx(&tx, installation_id, log.clone())? {
+                accepted.push(log.clone());
+            }
         }
         tx.execute(
             "INSERT INTO share_request_log_recovery_cursors (
@@ -13273,7 +13296,9 @@ impl AppStore {
             AppError::Internal(format!(
                 "commit share request log recovery tx failed: {error}"
             ))
-        })
+        })?;
+        self.record_route_traffic_usage(&accepted);
+        Ok(())
     }
 
     pub async fn cleanup_expired_data(
@@ -17639,6 +17664,53 @@ pub(crate) fn retire_share_tx(
         .map_err(|e| AppError::Internal(format!("delete {description} failed: {e}")))?;
     }
     Ok(true)
+}
+
+/// Prices one request exactly as the Share usage dashboard does: actual model
+/// (else the logged model), the first non-empty service tier (unparseable means
+/// Standard), and `price_usage`'s long-context rule.
+fn route_traffic_usage(
+    catalog: &crate::model_price_catalog::PricingCatalog,
+    log: &ShareRequestLogEntry,
+    pricing_at: i64,
+) -> crate::model_route_traffic::ModelRouteTrafficUsage {
+    use crate::model_pricing::{ServiceTier, TokenSplit, price_usage};
+    let split = TokenSplit {
+        input: log.input_tokens.into(),
+        output: log.output_tokens.into(),
+        cache_read: log.cache_read_tokens.into(),
+        cache_write: log.cache_creation_tokens.into(),
+    };
+    let model = [log.actual_model.trim(), log.model.trim()]
+        .into_iter()
+        .find(|model| !model.is_empty());
+    let tier = [&log.effective_service_tier, &log.client_service_tier]
+        .into_iter()
+        .flatten()
+        .map(|tier| tier.trim())
+        .find(|tier| !tier.is_empty())
+        .and_then(ServiceTier::parse)
+        .unwrap_or(ServiceTier::Standard);
+    let representative_input = split
+        .input
+        .saturating_add(split.cache_read)
+        .saturating_add(split.cache_write);
+    let cost_micros = model
+        .filter(|_| !split.is_empty())
+        .and_then(|model| catalog.lookup(&model.to_lowercase(), pricing_at))
+        .and_then(|(_, price)| price_usage(price, tier, &split, representative_input))
+        .map(|priced| priced.total_micros.to_string());
+    crate::model_route_traffic::ModelRouteTrafficUsage {
+        input_tokens: split.input,
+        output_tokens: split.output,
+        cache_read_tokens: split.cache_read,
+        cache_write_tokens: split.cache_write,
+        total_tokens: split.total(),
+        actual_model: model.map(str::to_string),
+        cost_micros,
+        // Same rule as the dashboard: anything not observed upstream is an estimate.
+        estimated: log.usage_state != "observed" || log.usage_estimated,
+    }
 }
 
 fn upsert_share_request_log_tx(
@@ -36772,6 +36844,54 @@ pub(crate) mod tests {
             Some(("gateway", 999))
         );
 
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn route_traffic_usage_prices_the_actual_model_and_sums_all_tokens() {
+        use crate::model_pricing::{ContextTier, ServiceTier, TokenSplit, price_usage_in_tier};
+        let (store, config) = setup_store("route-traffic-usage-price").await;
+        let now = Utc::now().timestamp();
+        let mut log = test_share_request_log_entry("req", "share", now);
+        log.model = "requested-alias".into();
+        log.actual_model = "claude-4-sonnet-20250514".into();
+        log.effective_service_tier = Some("standard".into());
+        log.input_tokens = 100;
+        log.output_tokens = 20;
+        log.cache_read_tokens = 5;
+        log.cache_creation_tokens = 0;
+        let catalog = store.pricing_catalog();
+        let usage = route_traffic_usage(&catalog, &log, now);
+        let (_, price) = catalog
+            .lookup("claude-4-sonnet-20250514", now)
+            .expect("known official price");
+        let split = TokenSplit {
+            input: 100,
+            output: 20,
+            cache_read: 5,
+            cache_write: 0,
+        };
+        let expected = price_usage_in_tier(price, ServiceTier::Standard, ContextTier::Base, &split)
+            .expect("priced usage")
+            .total_micros
+            .to_string();
+        assert_eq!(usage.cost_micros, Some(expected));
+        assert!(!usage.estimated, "observed usage is not an estimate");
+        assert_eq!(usage.total_tokens, 125);
+        assert_eq!(
+            usage.actual_model.as_deref(),
+            Some("claude-4-sonnet-20250514")
+        );
+        log.actual_model = "unpriced-model-for-route-traffic".into();
+        log.model = String::new();
+        let unpriced = route_traffic_usage(&catalog, &log, now);
+        assert_eq!(
+            unpriced.cost_micros, None,
+            "no catalog price means no amount, not zero"
+        );
+        log.usage_state = "interrupted".into();
+        assert!(route_traffic_usage(&catalog, &log, now).estimated);
+        assert_eq!(unpriced.total_tokens, 125);
         let _ = std::fs::remove_file(&config.database.path);
     }
 
