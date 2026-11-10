@@ -3653,6 +3653,7 @@ impl AppStore {
                 "cacheCreationTtlV1".into(),
                 "valuePricingKnownRevisionV1".into(),
                 "valuePricingActivationV1".into(),
+                "resourceValueQuotaV2".into(),
                 "shareTerminationV1".into(),
                 "providerIdentityV1".into(),
                 "buddyQuotaPresentationV1".into(),
@@ -15917,6 +15918,25 @@ fn normalize_share_descriptor_fields(share: &mut ShareDescriptor) -> Result<(), 
         {
             return Err(AppError::BadRequest(
                 "USD-equivalent quota fields require Share contract v10".into(),
+            ));
+        }
+        if share.contract_version < 11
+            && grant
+                .policy
+                .value_quota
+                .iter()
+                .chain(
+                    grant
+                        .pending_value_quota
+                        .iter()
+                        .filter_map(|pending| pending.policy.value_quota.as_ref()),
+                )
+                .any(|quota| {
+                    quota.tariff_policy_id == crate::share_value_pricing::RESOURCE_TARIFF_POLICY
+                })
+        {
+            return Err(AppError::BadRequest(
+                "resource quotas require Share contract v11".into(),
             ));
         }
         // A seat's USD-equivalent quota is metered per contract from the

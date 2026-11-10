@@ -364,6 +364,7 @@ impl PricingCatalog {
                 continue;
             }
             let model = ExecutionModelPrice {
+                resources: Default::default(),
                 context_input_basis: ContextInputBasis::RawInput,
                 long_context_threshold: price.long_context_threshold,
                 long_context_inclusive: price.long_context_inclusive,

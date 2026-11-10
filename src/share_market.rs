@@ -1152,12 +1152,38 @@ fn normalize_seat_value_quota(
     Ok(Some(value_quota))
 }
 
-/// Seats and contracts store only the amount; the tariff policy is fixed.
-fn stored_value_quota(limit_usd_micros: Option<String>) -> Option<ValueQuota> {
+/// Seats and frozen contracts preserve the explicit tariff policy and amount.
+fn stored_value_quota(limit_usd_micros: Option<String>, tariff_policy: &str) -> Option<ValueQuota> {
     limit_usd_micros.map(|limit_usd_micros| ValueQuota {
         limit_usd_micros,
-        tariff_policy_id: crate::share_value_pricing::TARIFF_POLICY.into(),
+        tariff_policy_id: if tariff_policy.is_empty() {
+            crate::share_value_pricing::TARIFF_POLICY
+        } else {
+            tariff_policy
+        }
+        .into(),
     })
+}
+
+fn resource_quota(quota: &Option<ValueQuota>) -> bool {
+    quota.as_ref().is_some_and(|quota| {
+        quota.tariff_policy_id == crate::share_value_pricing::RESOURCE_TARIFF_POLICY
+    })
+}
+fn value_tariff_column(quota: &Option<ValueQuota>) -> &str {
+    quota
+        .as_ref()
+        .map_or(crate::share_value_pricing::TARIFF_POLICY, |quota| {
+            quota.tariff_policy_id.as_str()
+        })
+}
+fn seat_tariff(conn: &Connection, seat_id: &str) -> Result<String, AppError> {
+    conn.query_row(
+        "SELECT value_tariff_policy_id FROM share_market_seats WHERE id=?1",
+        params![seat_id],
+        |r| r.get(0),
+    )
+    .map_err(map_db("read seat tariff policy"))
 }
 
 fn value_quota_column(value_quota: &Option<ValueQuota>) -> Option<&str> {
@@ -1166,9 +1192,16 @@ fn value_quota_column(value_quota: &Option<ValueQuota>) -> Option<&str> {
         .map(|quota| quota.limit_usd_micros.as_str())
 }
 
-fn published_value_pricing_revision_tx(conn: &Connection) -> Result<Option<String>, AppError> {
+fn published_value_pricing_revision_tx(
+    conn: &Connection,
+    resources: bool,
+) -> Result<Option<String>, AppError> {
     conn.query_row(
-        "SELECT revision FROM share_value_pricing_config WHERE singleton = 1",
+        if resources {
+            "SELECT revision FROM share_value_resource_pricing_config WHERE singleton = 1"
+        } else {
+            "SELECT revision FROM share_value_pricing_config WHERE singleton = 1"
+        },
         [],
         |row| row.get(0),
     )
@@ -2116,7 +2149,10 @@ fn grant_quota(record: &SubscriptionRecord) -> (Option<u64>, Option<ValueQuota>)
         record
             .token_limit
             .and_then(|value| u64::try_from(value).ok()),
-        stored_value_quota(record.value_limit_usd_micros.clone()),
+        stored_value_quota(
+            record.value_limit_usd_micros.clone(),
+            &record.value_tariff_policy_id,
+        ),
     )
 }
 
@@ -3342,6 +3378,14 @@ fn share_seat_event_snapshot_tx(
             });
             if let Some(limit) = value_limit_usd_micros {
                 value["valueLimitUsdMicros"] = limit.into();
+                value["valueTariffPolicyId"] = conn
+                    .query_row(
+                        "SELECT value_tariff_policy_id FROM share_market_seats WHERE id=?1",
+                        params![seat_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .map_err(map_db("read event quota policy"))?
+                    .into();
             }
             if let Some(limit) = trial_value_limit_usd_micros {
                 value["trialValueLimitUsdMicros"] = limit.into();
@@ -3454,6 +3498,14 @@ fn share_subscription_event_snapshot_tx(
             let mut value = value;
             if let Some(limit) = value_limit_usd_micros {
                 value["valueLimitUsdMicros"] = limit.into();
+                value["valueTariffPolicyId"] = conn
+                    .query_row(
+                        "SELECT value_tariff_policy_id FROM share_market_subscriptions WHERE id=?1",
+                        params![subscription_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .map_err(map_db("read subscription event quota policy"))?
+                    .into();
             }
             Ok(ShareSubscriptionEventSnapshot {
                 owner_user_id,
@@ -3972,6 +4024,7 @@ struct SubscriptionRecord {
     updated_at: String,
     contract_apps_json: String,
     service_schema_version: u32,
+    value_tariff_policy_id: String,
 }
 
 fn subscription_contract_apps(record: &SubscriptionRecord) -> Vec<String> {
@@ -4096,7 +4149,7 @@ fn subscription_record(
                 sub.pricing_model, sub.cycle_price_minor, sub.billing_interval,
                 EXISTS(SELECT 1 FROM market_share_trial_contracts t JOIN market_platform_contracts c ON c.id=t.contract_id WHERE c.product_ref=sub.id AND c.product_kind='share'),
                 (SELECT t.paid_applied_at FROM market_share_trial_contracts t JOIN market_platform_contracts c ON c.id=t.contract_id WHERE c.product_ref=sub.id AND c.product_kind='share'),
-                sub.value_limit_usd_micros
+                sub.value_limit_usd_micros, sub.value_tariff_policy_id
          FROM share_market_subscriptions sub
          LEFT JOIN shares s ON s.share_id = sub.share_id
          WHERE sub.id = ?1",
@@ -4154,6 +4207,7 @@ fn subscription_record(
                 one_time_trial: row.get(45)?,
                 paid_quota_started_at: row.get(46)?,
                 value_limit_usd_micros: row.get(47)?,
+                value_tariff_policy_id: row.get(48)?,
             })
         },
     )
@@ -4303,7 +4357,7 @@ fn catalog_subscription_records(
                 sub.pricing_model, sub.cycle_price_minor, sub.billing_interval,
                 EXISTS(SELECT 1 FROM market_share_trial_contracts t JOIN market_platform_contracts c ON c.id=t.contract_id WHERE c.product_ref=sub.id AND c.product_kind='share'),
                 (SELECT t.paid_applied_at FROM market_share_trial_contracts t JOIN market_platform_contracts c ON c.id=t.contract_id WHERE c.product_ref=sub.id AND c.product_kind='share'),
-                sub.value_limit_usd_micros
+                sub.value_limit_usd_micros, sub.value_tariff_policy_id
          FROM share_market_subscriptions sub
          LEFT JOIN shares share ON share.share_id = sub.share_id
          WHERE ({filter})
@@ -4368,6 +4422,7 @@ fn catalog_subscription_records(
                         one_time_trial: row.get(45)?,
                         paid_quota_started_at: row.get(46)?,
                         value_limit_usd_micros: row.get(47)?,
+                        value_tariff_policy_id: row.get(48)?,
                     };
                     Ok((record.id.clone(), record))
                 })?
@@ -4400,6 +4455,7 @@ struct CatalogSeatRecord {
     retired_at: Option<String>,
     subscription_count: i64,
     funding_rail: String,
+    value_tariff_policy_id: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4619,7 +4675,7 @@ fn catalog_seats(
                 seat.pricing_model, seat.cycle_price_minor, seat.billing_interval,
                 (SELECT COUNT(*) FROM share_market_subscriptions subscription
                  WHERE subscription.seat_id = seat.id), seat.funding_rail,
-                seat.value_limit_usd_micros, seat.trial_value_limit_usd_micros
+                seat.value_limit_usd_micros, seat.trial_value_limit_usd_micros, seat.value_tariff_policy_id
          FROM share_market_seats seat
          JOIN share_market_listings listing ON listing.id = seat.listing_id
          LEFT JOIN shares share ON share.share_id = listing.share_id
@@ -4661,6 +4717,7 @@ fn catalog_seats(
                             funding_rail: row.get(20)?,
                             value_limit_usd_micros: row.get(21)?,
                             trial_value_limit_usd_micros: row.get(22)?,
+                            value_tariff_policy_id: row.get(23)?,
                         },
                     ))
                 })?
@@ -5164,7 +5221,10 @@ fn subscription_view(
             .and_then(|value| u64::try_from(value).ok()),
         token_period: serde_json::from_str(&record.token_period_json)
             .unwrap_or(ShareTokenPeriod::Lifetime),
-        value_quota: stored_value_quota(record.value_limit_usd_micros),
+        value_quota: stored_value_quota(
+            record.value_limit_usd_micros,
+            &record.value_tariff_policy_id,
+        ),
         daily_rate_minor: record.daily_rate_minor,
         pricing_model: record.pricing_model,
         cycle_price_minor: record.cycle_price_minor,
@@ -5833,7 +5893,10 @@ impl AppStore {
                     token_limit: seat.token_limit.and_then(|value| u64::try_from(value).ok()),
                     token_period: serde_json::from_str(&seat.token_period_json)
                         .unwrap_or(ShareTokenPeriod::Lifetime),
-                    value_quota: stored_value_quota(seat.value_limit_usd_micros),
+                    value_quota: stored_value_quota(
+                        seat.value_limit_usd_micros,
+                        &seat.value_tariff_policy_id,
+                    ),
                     daily_rate_minor: seat.daily_rate_minor,
                     pricing_model: seat.pricing_model,
                     cycle_price_minor: seat.cycle_price_minor,
@@ -6304,9 +6367,9 @@ fn insert_seat_tx(
             trial_hours, trial_token_limit,
             offer_revision, current_subscription_id, created_at, updated_at,
             pricing_model, cycle_price_minor, billing_interval, value_limit_usd_micros,
-            trial_value_limit_usd_micros
+            trial_value_limit_usd_micros, value_tariff_policy_id
          ) VALUES (?1, ?2, ?3, 'available', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                   1, NULL, ?12, ?12, ?13, ?14, ?15, ?16, ?17)",
+                   1, NULL, ?12, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         params![
             id,
             listing_id,
@@ -6326,6 +6389,7 @@ fn insert_seat_tx(
             seat.billing_interval,
             value_quota_column(&seat.value_quota),
             seat.trial_value_limit_usd_micros,
+            value_tariff_column(&seat.value_quota),
         ],
     )
     .map_err(map_db("insert Share Market seat"))?;
@@ -6676,28 +6740,32 @@ impl AppStore {
     async fn share_market_value_seat_share_id(
         &self,
         seat_id: &str,
-    ) -> Result<Option<(String, bool)>, AppError> {
+    ) -> Result<Option<(String, bool, bool)>, AppError> {
         let conn = self.conn.lock().await;
-        let row: Option<(String, bool, Option<i64>, Option<String>)> = conn
+        let row: Option<(String, bool, Option<i64>, Option<String>, String)> = conn
             .query_row(
                 "SELECT listing.share_id,
                         seat.daily_rate_minor IS NOT NULL OR seat.cycle_price_minor IS NOT NULL,
-                        seat.trial_hours, seat.trial_value_limit_usd_micros
+                        seat.trial_hours, seat.trial_value_limit_usd_micros, seat.value_tariff_policy_id
                  FROM share_market_seats seat
                  JOIN share_market_listings listing ON listing.id = seat.listing_id
                  WHERE seat.id = ?1 AND seat.value_limit_usd_micros IS NOT NULL",
                 params![seat_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .optional()
             .map_err(map_db("read Share Market USD seat target"))?;
-        let Some((share_id, paid, trial_hours, trial_value)) = row else {
+        let Some((share_id, paid, trial_hours, trial_value, tariff)) = row else {
             return Ok(None);
         };
         let policy = crate::market_trial_policy::policy_tx(&conn)?;
         let value_trial =
             value_trial_offered(paid, true, trial_hours, trial_value.as_deref(), &policy);
-        Ok(Some((share_id, value_trial)))
+        Ok(Some((
+            share_id,
+            value_trial,
+            tariff == crate::share_value_pricing::RESOURCE_TARIFF_POLICY,
+        )))
     }
 
     pub async fn share_market_create_listing(
@@ -7145,7 +7213,7 @@ impl AppStore {
                          token_period_json = ?5, daily_rate_minor = ?6, currency = ?7,
                          service_duration_days = ?8, trial_hours = ?9, trial_token_limit = ?10,
                          pricing_model = ?13, cycle_price_minor = ?14, billing_interval = ?15,
-                         value_limit_usd_micros = ?16, trial_value_limit_usd_micros = ?17,
+                         value_limit_usd_micros = ?16, trial_value_limit_usd_micros = ?17, value_tariff_policy_id = ?18,
                          offer_revision = offer_revision + 1,
                          updated_at = ?11
                      WHERE id = ?1 AND listing_id = ?2 AND status = 'disabled'
@@ -7170,6 +7238,7 @@ impl AppStore {
                         seat.billing_interval,
                         value_quota_column(&seat.value_quota),
                         seat.trial_value_limit_usd_micros,
+                        value_tariff_column(&seat.value_quota),
                     ],
                 )
                 .map_err(map_db("republish stopped Share seat"))?;
@@ -7356,7 +7425,7 @@ impl AppStore {
                  daily_rate_minor = ?5, currency = ?6, service_duration_days = ?7,
                  trial_hours = ?8, trial_token_limit = ?9,
                  pricing_model = ?12, cycle_price_minor = ?13, billing_interval = ?14,
-                 value_limit_usd_micros = ?15, trial_value_limit_usd_micros = ?16,
+                 value_limit_usd_micros = ?15, trial_value_limit_usd_micros = ?16, value_tariff_policy_id = ?17,
                  offer_revision = offer_revision + 1, updated_at = ?10
              WHERE id = ?1 AND status = 'available' AND offer_revision = ?11",
                 params![
@@ -7377,6 +7446,7 @@ impl AppStore {
                     seat.billing_interval,
                     value_quota_column(&seat.value_quota),
                     seat.trial_value_limit_usd_micros,
+                    value_tariff_column(&seat.value_quota),
                 ],
             )
             .map_err(map_db("update Share seat"))?;
@@ -7796,8 +7866,16 @@ async fn create_listing(
     refresh_share_runtime_before_market_publish(&state, &session, share_id).await?;
     if input.seats.iter().any(|seat| seat.value_quota.is_some()) {
         let value_trial = seats_offer_value_trial(&state, &input.seats).await?;
-        crate::share_value_quotas::ensure_market_value_quota_ready(&state, share_id, value_trial)
-            .await?;
+        crate::share_value_quotas::ensure_market_value_quota_ready(
+            &state,
+            share_id,
+            value_trial,
+            input
+                .seats
+                .iter()
+                .any(|seat| resource_quota(&seat.value_quota)),
+        )
+        .await?;
     }
     let id = state
         .store
@@ -7820,8 +7898,13 @@ async fn add_seat(
     refresh_share_runtime_before_market_publish(&state, &session, &share_id).await?;
     if input.value_quota.is_some() {
         let value_trial = seats_offer_value_trial(&state, std::slice::from_ref(&input)).await?;
-        crate::share_value_quotas::ensure_market_value_quota_ready(&state, &share_id, value_trial)
-            .await?;
+        crate::share_value_quotas::ensure_market_value_quota_ready(
+            &state,
+            &share_id,
+            value_trial,
+            resource_quota(&input.value_quota),
+        )
+        .await?;
     }
     let id = state
         .store
@@ -7850,8 +7933,13 @@ async fn reopen_listing(
         .collect();
     if seats.iter().any(|seat| seat.value_quota.is_some()) {
         let value_trial = seats_offer_value_trial(&state, seats.iter().copied()).await?;
-        crate::share_value_quotas::ensure_market_value_quota_ready(&state, &share_id, value_trial)
-            .await?;
+        crate::share_value_quotas::ensure_market_value_quota_ready(
+            &state,
+            &share_id,
+            value_trial,
+            seats.iter().any(|seat| resource_quota(&seat.value_quota)),
+        )
+        .await?;
     }
     Ok(Json(
         state
@@ -7872,8 +7960,13 @@ async fn update_seat(
         let share_id = state.store.share_market_seat_share_id(&seat_id).await?;
         let value_trial =
             seats_offer_value_trial(&state, std::slice::from_ref(&input.seat)).await?;
-        crate::share_value_quotas::ensure_market_value_quota_ready(&state, &share_id, value_trial)
-            .await?;
+        crate::share_value_quotas::ensure_market_value_quota_ready(
+            &state,
+            &share_id,
+            value_trial,
+            resource_quota(&input.seat.value_quota),
+        )
+        .await?;
     }
     state
         .store
@@ -8587,10 +8680,14 @@ impl AppStore {
             token_period: serde_json::from_str(&token_period_json)
                 .unwrap_or(ShareTokenPeriod::Lifetime),
             value_pricing_revision: match value_limit_usd_micros {
-                Some(_) => published_value_pricing_revision_tx(&tx)?,
+                Some(_) => published_value_pricing_revision_tx(
+                    &tx,
+                    seat_tariff(&tx, seat_id)?
+                        == crate::share_value_pricing::RESOURCE_TARIFF_POLICY,
+                )?,
                 None => None,
             },
-            value_quota: stored_value_quota(value_limit_usd_micros),
+            value_quota: stored_value_quota(value_limit_usd_micros, &seat_tariff(&conn, seat_id)?),
             daily_rate_minor,
             pricing_model: pricing_model.clone(),
             cycle_price_minor,
@@ -9395,7 +9492,8 @@ impl AppStore {
                 "seat or its active Share is unavailable".into(),
             ));
         };
-        let value_quota = stored_value_quota(value_limit_usd_micros.clone());
+        let value_quota =
+            stored_value_quota(value_limit_usd_micros.clone(), &seat_tariff(&tx, seat_id)?);
         if listing_status != "active" || seat_status != SEAT_AVAILABLE {
             return Err(AppError::Conflict("seat is no longer available".into()));
         }
@@ -9648,11 +9746,11 @@ impl AppStore {
                 free_usage_seconds, rent_quote_id, idempotency_key, request_fingerprint,
                 required_app, service_snapshot_json, contract_apps_json
                 , pricing_model, cycle_price_minor, billing_interval,
-                value_limit_usd_micros, value_pricing_revision
+                value_limit_usd_micros, value_pricing_revision, value_tariff_policy_id
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'grant_pending',
                        ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
                        NULL, NULL, ?20, ?21, ?21, NULL, ?22, ?23, ?24, ?25,
-                       ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)",
+                       ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34)",
             params![
                 subscription_id,
                 seat_id,
@@ -9687,6 +9785,7 @@ impl AppStore {
                 billing_interval,
                 value_limit_usd_micros,
                 quote_snapshot.and_then(|snapshot| snapshot.value_pricing_revision.as_deref()),
+                value_tariff_column(&value_quota),
             ],
         )
         .map_err(|error| {
@@ -10120,13 +10219,18 @@ async fn quote_seat(
 ) -> Result<Json<RentQuoteView>, AppError> {
     let session = require_session(&state, &headers).await?;
     ensure_share_market_seat_online(&state, &seat_id).await?;
-    if let Some((share_id, value_trial)) = state
+    if let Some((share_id, value_trial, resources)) = state
         .store
         .share_market_value_seat_share_id(&seat_id)
         .await?
     {
-        crate::share_value_quotas::ensure_market_value_quota_ready(&state, &share_id, value_trial)
-            .await?;
+        crate::share_value_quotas::ensure_market_value_quota_ready(
+            &state,
+            &share_id,
+            value_trial,
+            resources,
+        )
+        .await?;
     }
     let quote = state
         .store
@@ -17744,6 +17848,45 @@ mod tests {
         let mut applied = contract_policy(&record).expect("contract policy");
         applied.value_quota = Some(usd_quota("25000001"));
         assert!(validate_effective_resume_policy(&record, &applied).is_err());
+    }
+
+    #[tokio::test]
+    async fn resource_seat_policy_is_frozen_when_the_offer_changes() {
+        let store = AppStore::new_in_memory_for_tests().unwrap();
+        let owner = session("owner-resources", "owner-resources@example.test");
+        let renter = session("renter-resources", "renter-resources@example.test");
+        insert_share(
+            &store,
+            "share-resources",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let quota = ValueQuota {
+            limit_usd_micros: "25000000".into(),
+            tariff_policy_id: crate::share_value_pricing::RESOURCE_TARIFF_POLICY.into(),
+        };
+        let mut seat = free_seat();
+        seat.token_limit = None;
+        seat.value_quota = Some(quota.clone());
+        let (_, seat_id) = create_listing(&store, &owner, "share-resources", seat).await;
+        let subscription = store
+            .rent_fixture_share(&renter, &seat_id, RentSeatRequest { offer_revision: 1 })
+            .await
+            .unwrap();
+        let conn = store.conn.lock().await;
+        conn.execute(
+            "UPDATE share_market_seats SET value_tariff_policy_id='api-equivalent-v1' WHERE id=?1",
+            params![seat_id],
+        )
+        .unwrap();
+        let record = subscription_record(&conn, &subscription).unwrap().unwrap();
+        assert_eq!(grant_quota(&record), (None, Some(quota.clone())));
+        let mut policy = contract_policy(&record).unwrap();
+        assert_eq!(policy.value_quota, Some(quota));
+        policy.value_quota.as_mut().unwrap().tariff_policy_id =
+            crate::share_value_pricing::TARIFF_POLICY.into();
+        assert!(validate_effective_resume_policy(&record, &policy).is_err());
     }
 
     #[test]

@@ -62,7 +62,7 @@ export type MarketValueReadinessState = {
   retry: () => void;
 };
 
-export function useMarketValueQuotaReadiness(shareId: string | undefined): MarketValueReadinessState {
+export function useMarketValueQuotaReadiness(shareId: string | undefined, resources = false): MarketValueReadinessState {
   const actor = useQuotaActor();
   const key = `${actor}:${shareId ?? ""}`;
   const [result, setResult] = React.useState<{ key: string; readiness: MarketValueQuotaReadiness } | null>(null);
@@ -84,7 +84,10 @@ export function useMarketValueQuotaReadiness(shareId: string | undefined): Marke
     const timer = window.setInterval(() => refresh(), READINESS_TTL_MS);
     return () => { active = false; window.clearInterval(timer); document.removeEventListener("visibilitychange", visible); };
   }, [shareId, attempt, actor, key]);
-  const readiness = result?.key === key && actor === valueReadinessActor() ? result.readiness : undefined;
+  const base = result?.key === key && actor === valueReadinessActor() ? result.readiness : undefined;
+  const readiness: MarketValueQuotaReadiness | undefined = resources && base?.ready && !base.resourceReady
+    ? {...base, ready:false, reason:"resource_upgrade_required", checks:[...(base.checks ?? []), {code:"resource_metering",ready:false,reasonCode:"resource_upgrade_required"}]}
+    : base;
   return {
     readiness,
     loading: !!shareId && !readiness,
@@ -92,7 +95,7 @@ export function useMarketValueQuotaReadiness(shareId: string | undefined): Marke
   };
 }
 
-const CHECK_REASONS = ["router_protocol", "sqlite_authority", "metering_storage", "tariff_published", "acknowledged_tariff", "text_surface", "model_price_coverage"];
+const CHECK_REASONS = ["router_protocol", "sqlite_authority", "metering_storage", "tariff_published", "acknowledged_tariff", "resource_metering", "text_surface", "model_price_coverage"];
 const REQUEST_REASONS: Record<string, string> = {
   quota_server_offline: "offline",
   quota_server_timeout: "timeout",
@@ -104,6 +107,7 @@ const REQUEST_REASONS: Record<string, string> = {
 
 /** Short reason plus, for Server checks, the owner-facing fix. */
 export function marketValueReadinessReason(reason: string | undefined, t: (key: MessageKey) => string) {
+  if (reason === "resource_upgrade_required") reason = "resource_metering";
   if (reason === "server_upgrade_required" || reason === "server_trial_upgrade_required") {
     return { short: t(reason === "server_trial_upgrade_required" ? "shareMarket.quota.usdTrialUpgrade" : "shareMarket.quota.usdServerUpgrade"), detail: undefined };
   }
@@ -121,7 +125,7 @@ export function marketValueReadinessReason(reason: string | undefined, t: (key: 
 }
 
 /**
- * Why `$` is off for this Share, with a way to check again. `quiet` is the
+ * What must be configured before saving USD quotas, with a way to check again. `quiet` is the
  * one-line form shown while the seat still sells Tokens.
  */
 export function MarketValueReadinessLine({ id, state, quiet = false }: {

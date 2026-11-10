@@ -11,7 +11,7 @@ import { useShareUserUsageBreakdown } from "@/lib/use-share-user-usage-breakdown
 import { useValueQuotaReadiness } from "@/lib/use-value-quota-readiness";
 import { useValueQuotaPreview } from "@/lib/use-value-quota-preview";
 import { ValueQuotaReadiness } from "./value-quota-readiness";
-import { QuotaLimitField, QuotaUnitSwitch, ValuePreviewLine } from "./value-quota-fields";
+import { ValueResourceToggle, QuotaLimitField, QuotaUnitSwitch, ValuePreviewLine } from "./value-quota-fields";
 import type {
   ShareTokenPeriod,
   ShareUserGrant,
@@ -45,6 +45,7 @@ import {
 
 type GrantDraft = {
   quotaUnit: "tokens" | "usdEquivalent";
+  resourceMetering: boolean;
   email: string;
   parallelLimit: string;
   tokenLimit: string;
@@ -89,6 +90,7 @@ function parseUtcDateTime(value: string) {
 function makeDraft(email: string, policy: ShareUserPolicy): GrantDraft {
   return {
     email,
+    resourceMetering: policy.valueQuota?.tariffPolicyId === "api-equivalent-v2",
     quotaUnit: policy.valueQuota ? "usdEquivalent" : "tokens",
     parallelLimit: policy.parallelLimit == null ? "" : String(policy.parallelLimit),
     tokenLimit: policy.valueQuota ? microsToUsdInput(policy.valueQuota.limitUsdMicros) : policy.tokenLimit == null ? "" : tokensToMillionsInput(policy.tokenLimit),
@@ -213,6 +215,7 @@ function makeBatchDraft(grant: ShareUserGrant): BatchGrantDraft {
   const draft = makeDraft(grant.email, grant.policy);
   return {
     quotaUnit: draft.quotaUnit,
+    resourceMetering: draft.resourceMetering,
     parallelLimit: draft.parallelLimit,
     tokenLimit: draft.tokenLimit,
     tokenPeriod: draft.tokenPeriod,
@@ -244,7 +247,7 @@ function anchorInvalid(period: ShareTokenPeriod, anchorAtMs: number | undefined)
  * The exact policy a valid USD draft saves. Preview and save both use it, so
  * the previewed intent is byte-for-byte what is applied.
  */
-function usdDraftPolicy(draft: Pick<GrantDraft, "parallelLimit" | "tokenLimit" | "tokenPeriod" | "tokenPeriodAnchor" | "expiresAt">): ShareUserPolicy | undefined {
+function usdDraftPolicy(draft: Pick<GrantDraft, "resourceMetering" | "parallelLimit" | "tokenLimit" | "tokenPeriod" | "tokenPeriodAnchor" | "expiresAt">): ShareUserPolicy | undefined {
   const amount = parseUsdLimit(draft.tokenLimit);
   if (!amount.ok) return undefined;
   const parallelLimit = draft.parallelLimit.trim() ? Number(draft.parallelLimit) : undefined;
@@ -255,7 +258,7 @@ function usdDraftPolicy(draft: Pick<GrantDraft, "parallelLimit" | "tokenLimit" |
   return {
     parallelLimit,
     tokenLimit: undefined,
-    valueQuota: { limitUsdMicros: amount.micros, tariffPolicyId: "api-equivalent-v1" },
+    valueQuota: { limitUsdMicros: amount.micros, tariffPolicyId: draft.resourceMetering ? "api-equivalent-v2" : "api-equivalent-v1" },
     tokenPeriod: draft.tokenPeriod,
     tokenPeriodAnchorAtMs,
     expiresAt,
@@ -457,7 +460,7 @@ export function ShareUserGrantsEditor({
       ...(draft.applyParallelLimit ? { parallelLimit: { value: parallelLimit } } : {}),
       ...(draft.applyTokenLimit ? { tokenLimit: {
         value: tokenLimit ?? undefined,
-        ...(amount?.ok ? { valueQuota: { limitUsdMicros: amount.micros, tariffPolicyId: "api-equivalent-v1" as const } } : {}),
+        ...(amount?.ok ? { valueQuota: { limitUsdMicros: amount.micros, tariffPolicyId: draft.resourceMetering ? "api-equivalent-v2" as const : "api-equivalent-v1" as const } } : {}),
         period: draft.tokenPeriod,
         periodAnchorAtMs,
       } } : {}),
@@ -1158,6 +1161,7 @@ export function ShareUserGrantsEditor({
                   <QuotaLimitField id={`${fieldId}-limit`} t={t} unit={grantDraft?.quotaUnit || "tokens"} value={grantDraft?.tokenLimit || ""}
                     error={limitError(grantDraft?.quotaUnit || "tokens", grantDraft?.tokenLimit || "")}
                     onChange={(tokenLimit) => grantDraft && setGrantDraft({ ...grantDraft, tokenLimit })} />
+                  {grantDraft?.quotaUnit === "usdEquivalent" ? <ValueResourceToggle t={t} value={grantDraft.resourceMetering} onChange={resourceMetering=>setGrantDraft({...grantDraft,resourceMetering})} /> : null}
                   {grantDraft?.quotaUnit === "usdEquivalent" ? <ValuePreviewLine state={singlePreview} t={t} /> : null}
                 </div>
                 <div className={grantDraft?.quotaUnit === "usdEquivalent" ? "hidden" : "grid gap-1.5 sm:col-span-2"}>
@@ -1343,6 +1347,7 @@ export function ShareUserGrantsEditor({
                 <QuotaLimitField id={`${fieldId}-batch-limit`} labelHidden t={t} disabled={!batchDraft?.applyTokenLimit} unit={batchDraft?.quotaUnit || "tokens"}
                   value={batchDraft?.tokenLimit || ""} error={batchDraft?.applyTokenLimit ? limitError(batchDraft.quotaUnit, batchDraft.tokenLimit) : undefined}
                   onChange={(tokenLimit) => batchDraft && setBatchDraft({ ...batchDraft, tokenLimit })} />
+                {batchDraft?.applyTokenLimit && batchDraft.quotaUnit === "usdEquivalent" ? <ValueResourceToggle t={t} value={batchDraft.resourceMetering} onChange={resourceMetering=>setBatchDraft({...batchDraft,resourceMetering})} /> : null}
                 {batchDraft?.applyTokenLimit && batchDraft.quotaUnit === "usdEquivalent" ? <ValuePreviewLine state={batchPreview} t={t} /> : null}
               </div>
               <div className="grid gap-1.5">

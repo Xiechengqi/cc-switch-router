@@ -34,7 +34,7 @@ import {
   MarketShareCard,
   listingCardId,
 } from "@/components/dashboard/share-market/market-share-card";
-import { QuotaUnitSwitch, type QuotaUnit } from "@/components/dashboard/share-edit/value-quota-fields";
+import { ValueResourceToggle, QuotaUnitSwitch, type QuotaUnit } from "@/components/dashboard/share-edit/value-quota-fields";
 import {
   MarketValueReadinessLine,
   SellerDiscountPreview,
@@ -115,6 +115,7 @@ type TFn = ReturnType<typeof useLocaleText>["t"];
 type SeatDraft = {
   parallelLimit: string;
   quotaUnit: QuotaUnit;
+  resourceMetering: boolean;
   tokenLimit: string;
   /** USD input as typed; used only while `quotaUnit` is `usdEquivalent`. */
   valueLimit: string;
@@ -165,6 +166,7 @@ function emptySeat(periods: ShareTokenPeriod[] = TOKEN_PERIODS): SeatDraft {
   return {
     parallelLimit: "",
     quotaUnit: "tokens",
+    resourceMetering: false,
     tokenLimit: "",
     valueLimit: "",
     tokenPeriod: periods.includes("lifetime") ? "lifetime" : periods[0] || "lifetime",
@@ -186,6 +188,7 @@ function seatDraft(seat: ShareMarketSeat): SeatDraft {
   return {
     parallelLimit: seat.parallelLimit == null ? "" : String(seat.parallelLimit),
     quotaUnit: seat.valueQuota ? "usdEquivalent" : "tokens",
+    resourceMetering: seat.valueQuota?.tariffPolicyId === "api-equivalent-v2",
     tokenLimit: seat.tokenLimit == null ? "" : tokensToMillionsInput(seat.tokenLimit),
     valueLimit: seat.valueQuota ? microsToUsdInput(seat.valueQuota.limitUsdMicros) : "",
     tokenPeriod: seat.tokenPeriod,
@@ -232,10 +235,10 @@ function positiveOptionalTokenMillions(value: string, label: string, t: TFn) {
 }
 
 /** A USD seat always has a positive amount; unlimited seats use Token mode. */
-function optionalUsdQuota(value: string, t: TFn): ShareMarketSeatInput["valueQuota"] {
+function optionalUsdQuota(value: string, t: TFn, resources: boolean): ShareMarketSeatInput["valueQuota"] {
   const parsed = parseUsdLimit(value);
   if (!parsed.ok) throw new SeatDraftError("valueLimit", t(usdAmountErrorKey(parsed.error)));
-  return { limitUsdMicros: parsed.micros, tariffPolicyId: "api-equivalent-v1" };
+  return { limitUsdMicros: parsed.micros, tariffPolicyId: resources ? "api-equivalent-v2" : "api-equivalent-v1" };
 }
 
 /** The draft as a paid USD seat, once its amount and monthly price parse. */
@@ -246,7 +249,7 @@ function draftDiscountSeat(draft: SeatDraft) {
   if (!limit.ok || !/^\d+(?:\.\d{1,2})?$/.test(price) || Number(price) <= 0) return null;
   return {
     isFree: false,
-    valueQuota: { limitUsdMicros: limit.micros, tariffPolicyId: "api-equivalent-v1" as const },
+    valueQuota: { limitUsdMicros: limit.micros, tariffPolicyId: draft.resourceMetering ? "api-equivalent-v2" as const : "api-equivalent-v1" as const },
     tokenPeriod: draft.tokenPeriod,
     cyclePriceMinor: Math.round(Number(price) * 100),
     dailyRateMinor: undefined,
@@ -267,7 +270,7 @@ function normalizedSeat(draft: SeatDraft, t: TFn): ShareMarketSeatInput {
   );
   const usd = draft.quotaUnit === "usdEquivalent";
   const tokenLimit = usd ? undefined : positiveOptionalTokenMillions(draft.tokenLimit, t("shareMarket.tokens"), t);
-  const valueQuota = usd ? optionalUsdQuota(draft.valueLimit, t) : undefined;
+  const valueQuota = usd ? optionalUsdQuota(draft.valueLimit, t, draft.resourceMetering) : undefined;
   const serviceDurationDays = draft.paid || draft.serviceDurationMode === "permanent"
     ? undefined
     : positiveOptional(
@@ -379,7 +382,7 @@ function SeatFields({
   React.useEffect(() => { let active = true; getMarketTrialPolicy().then((p) => { if (active) setTrialPolicy(p); }).catch((e) => { if (active) setTrialError(e instanceof Error ? e.message : String(e)); }); return () => { active = false; }; }, []);
   const errorId = React.useId();
   const readinessId = React.useId();
-  const usdState = useMarketValueQuotaReadiness(shareId);
+  const usdState = useMarketValueQuotaReadiness(shareId, draft.resourceMetering);
   const usdReady = usdState.readiness?.ready === true;
   const periods = supportedPeriods?.length ? supportedPeriods : TOKEN_PERIODS;
   const patch = (value: Partial<SeatDraft>) => onChange({ ...draft, ...value });
@@ -411,6 +414,7 @@ function SeatFields({
               />
             </div>
           </div>
+          {usd ? <ValueResourceToggle t={t} value={draft.resourceMetering} onChange={(resourceMetering) => patch({ resourceMetering })} disabled={disabled} /> : null}
           <MarketValueReadinessLine id={readinessId} state={usdState} quiet={!usd} />
         </div>
       ) : null}

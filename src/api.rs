@@ -520,6 +520,21 @@ pub fn router(state: ServerState) -> Router {
         )
         .route("/v1/admin/model-prices", get(admin_list_model_prices))
         .route(
+            "/v1/admin/resource-prices",
+            get(admin_resource_prices)
+                .put(admin_edit_resource_prices)
+                .layer(DefaultBodyLimit::max(1024 * 1024))
+                .layer(middleware::map_response(
+                    |mut response: Response| async move {
+                        response.headers_mut().insert(
+                            header::CACHE_CONTROL,
+                            HeaderValue::from_static("private, no-store"),
+                        );
+                        response
+                    },
+                )),
+        )
+        .route(
             "/v1/admin/model-prices/:model_key",
             get(admin_model_price_detail)
                 .put(admin_upsert_model_price)
@@ -10548,4 +10563,25 @@ async fn recover_share_account_rate_limit(
         )
         .await;
     Ok(Json(reply))
+}
+
+async fn admin_resource_prices(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_admin_session(&state, &headers).await?;
+    Ok(Json(state.store.resource_price_settings().await?))
+}
+async fn admin_edit_resource_prices(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<crate::store::share_value_quotas::resource_tariff::ResourcePriceEdit>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let session = require_admin_session(&state, &headers).await?;
+    Ok(Json(
+        state
+            .store
+            .edit_resource_prices(input, &session.email)
+            .await?,
+    ))
 }

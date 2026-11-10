@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
+#[allow(dead_code)] // Mirrored execution domain; settlement runs on Server.
+mod resources;
+pub use resources::*;
+
 pub const TARIFF_POLICY: &str = "api-equivalent-v1";
 pub const PICOS_PER_MICRO: i128 = 1_000_000;
 pub const PICOS_PER_USD: i128 = 1_000_000_000_000;
@@ -111,7 +115,12 @@ pub struct ValueQuota {
 impl ValueQuota {
     pub fn limit_picos(&self) -> Result<i128, ValueError> {
         let micros = unsigned_decimal(&self.limit_usd_micros)?;
-        if self.tariff_policy_id != TARIFF_POLICY || micros == 0 || micros > MAX_LIMIT_MICROS {
+        if !matches!(
+            self.tariff_policy_id.as_str(),
+            TARIFF_POLICY | RESOURCE_TARIFF_POLICY
+        ) || micros == 0
+            || micros > MAX_LIMIT_MICROS
+        {
             return Err(ValueError::InvalidPolicy);
         }
         micros
@@ -270,10 +279,20 @@ pub struct ExecutionModelPrice {
     pub long_context_inclusive: bool,
     #[serde(deserialize_with = "unique_map")]
     pub rates: BTreeMap<String, ExecutionRates>,
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "unique_map"
+    )]
+    pub resources: BTreeMap<String, String>,
 }
 impl ExecutionModelPrice {
     pub fn validate(&self) -> Result<(), ValueError> {
-        if self.long_context_threshold == Some(0) || self.rates.is_empty() || self.rates.len() > 6 {
+        validate_resource_rates(&self.resources)?;
+        if self.long_context_threshold == Some(0)
+            || (self.rates.is_empty() && self.resources.is_empty())
+            || self.rates.len() > 6
+        {
             return Err(ValueError::InvalidSnapshot);
         }
         for (key, rates) in &self.rates {
@@ -353,8 +372,14 @@ pub(crate) fn valid_model_key(key: &str) -> bool {
 }
 impl PricingSnapshot {
     fn validate_fields(&self) -> Result<(), ValueError> {
-        if self.schema_version != 1
-            || self.tariff_policy_id != TARIFF_POLICY
+        if !matches!(
+            (self.schema_version, self.tariff_policy_id.as_str()),
+            (1, TARIFF_POLICY) | (2, RESOURCE_TARIFF_POLICY)
+        ) || (self.schema_version == 1
+            && self
+                .models
+                .values()
+                .any(|model| !model.resources.is_empty()))
             || self.currency != "USD"
             || self.models.is_empty()
             || self.models.len() > MAX_MODELS
@@ -462,6 +487,7 @@ mod tests {
             cache_write_policy: CacheWritePolicy::Unavailable,
         };
         let model = ExecutionModelPrice {
+            resources: Default::default(),
             context_input_basis: ContextInputBasis::RawInput,
             long_context_threshold: None,
             long_context_inclusive: false,
@@ -595,6 +621,7 @@ mod tests {
         let mut long = rates();
         long.input = Some("6000000".into());
         let p = ExecutionModelPrice {
+            resources: Default::default(),
             context_input_basis: ContextInputBasis::RawInput,
             long_context_threshold: Some(200_000),
             long_context_inclusive: false,
@@ -644,6 +671,7 @@ mod tests {
             models: BTreeMap::from([(
                 "test-model".into(),
                 ExecutionModelPrice {
+                    resources: Default::default(),
                     context_input_basis: ContextInputBasis::RawInput,
                     long_context_threshold: None,
                     long_context_inclusive: false,

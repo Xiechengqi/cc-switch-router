@@ -1846,3 +1846,17 @@ export async function requeueShareControlDeadLetter(operationId: string) {
     }),
   );
 }
+
+export async function getAdminResourcePrices() {
+  return parseJson<import("./resource-prices").ResourcePriceState>(
+    await authFetch("/v1/admin/resource-prices", { cache: "no-store" }),
+  );
+}
+export async function updateAdminResourcePrices(expectedRevision: number, settings: import("./resource-prices").ResourcePriceSettings) {
+  return parseJson<import("./resource-prices").ResourcePriceState>(
+    await authFetch("/v1/admin/resource-prices", {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expectedRevision, settings }),
+    }),
+  );
+}

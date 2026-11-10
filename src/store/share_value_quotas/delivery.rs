@@ -69,9 +69,15 @@ pub(super) fn delivery_health(
     now: i64,
 ) -> Result<serde_json::Value, AppError> {
     let (expected,acknowledged,activated):(i64,i64,i64)=conn.query_row(
-        "SELECT count(*),coalesce(sum(EXISTS(SELECT 1 FROM share_value_pricing_acks a WHERE a.installation_id=i.id AND a.revision=?1)),0),
-        coalesce(sum(EXISTS(SELECT 1 FROM share_value_pricing_activations a WHERE a.installation_id=i.id AND a.revision=?1 AND a.confirmed_at_ms>=?2 AND i.last_seen_at>=?3)),0)
-        FROM installations i WHERE i.lifecycle='active' AND EXISTS(SELECT 1 FROM shares s WHERE s.installation_id=i.id)",
+        "WITH targets AS (
+          SELECT i.id,i.last_seen_at,CASE WHEN coalesce(c.resources,0)=1
+            THEN (SELECT revision FROM share_value_resource_pricing_config WHERE singleton=1) ELSE ?1 END AS revision
+          FROM installations i LEFT JOIN installation_value_capabilities c ON c.installation_id=i.id
+          WHERE i.lifecycle='active' AND EXISTS(SELECT 1 FROM shares s WHERE s.installation_id=i.id)
+        )
+        SELECT count(*),coalesce(sum(EXISTS(SELECT 1 FROM share_value_pricing_acks a WHERE a.installation_id=i.id AND a.revision=i.revision)),0),
+        coalesce(sum(EXISTS(SELECT 1 FROM share_value_pricing_activations a WHERE a.installation_id=i.id AND a.revision=i.revision AND a.confirmed_at_ms>=?2 AND i.last_seen_at>=?3)),0)
+        FROM targets i",
         params![published,now-PROJECTION_FRESH_MS,DateTime::<Utc>::from_timestamp_millis(now-PROJECTION_FRESH_MS).map(|v|v.to_rfc3339()).unwrap_or_default()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(db_error)?;
     Ok(
         serde_json::json!({"expectedInstallations":expected,"acknowledgedInstallations":acknowledged,"activatedInstallations":activated,"unconfirmedInstallations":expected-activated}),

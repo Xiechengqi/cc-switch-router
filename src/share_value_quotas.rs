@@ -361,8 +361,12 @@ pub(crate) async fn ensure_market_value_quota_ready(
     state: &ServerState,
     share_id: &str,
     value_trial: bool,
+    resources: bool,
 ) -> Result<(), AppError> {
     let checks = market_value_quota_checks(state, share_id).await?;
+    if resources && !check_ready(&checks, "resource_metering") {
+        return Err(market_value_unavailable("resource_upgrade_required".into()));
+    }
     if value_trial && !check_ready(&checks, MARKET_TRIAL_VALUE_CHECK) {
         return Err(market_value_unavailable(
             SERVER_TRIAL_UPGRADE_REQUIRED.into(),
@@ -451,6 +455,7 @@ async fn market_readiness(
             Ok(checks) => serde_json::json!({
                 "ready": true,
                 "valueTrialReady": check_ready(&checks, MARKET_TRIAL_VALUE_CHECK),
+                "resourceReady": check_ready(&checks, "resource_metering"),
                 "checks": checks,
             }),
             Err(AppError::Coded {

@@ -122,7 +122,7 @@ export function normalizeValueStatuses(items: unknown): ValueQuotaStatus[] {
 }
 
 export const VALUE_PREVIEW_REASON_CODES = ["ready", "scheduled_next_window", "metered_from_now", "unverified_surface",
-  "pricing_unavailable", "storage_unavailable", "router_upgrade_required", "blocked_needs_reconcile", "invalid_policy"] as const;
+  "pricing_unavailable", "storage_unavailable", "router_upgrade_required", "blocked_needs_reconcile", "invalid_policy", "resource_upgrade_required"] as const;
 export type ValuePreviewReasonCode = typeof VALUE_PREVIEW_REASON_CODES[number];
 const BLOCKING_REASONS: ReadonlySet<string> = new Set(VALUE_PREVIEW_REASON_CODES.slice(3));
 export function knownReasonCode(code: unknown): ValuePreviewReasonCode | undefined {
@@ -194,7 +194,7 @@ export type ValueReadinessCheck = {code: string; ready: boolean; state?: string;
   blockedBy?: string | null};
 /** Most fundamental first: what an operator should fix before anything else. */
 export const VALUE_READINESS_ORDER = ["router_protocol", "sqlite_authority", "metering_storage", "tariff_published",
-  "acknowledged_tariff", "text_surface", "model_price_coverage"] as const;
+  "acknowledged_tariff", "resource_metering", "text_surface", "model_price_coverage"] as const;
 export type ValueReadinessCode = typeof VALUE_READINESS_ORDER[number];
 export function knownReadinessCode(code: unknown): ValueReadinessCode | undefined {
   return VALUE_READINESS_ORDER.find(known => known === code);
@@ -408,7 +408,7 @@ export async function getRentalValueUsage(subscriptionId: string, signal?: Abort
 }
 
 /** Why a Share cannot sell a USD-equivalent seat quota right now, if it cannot. */
-export type MarketValueQuotaReadiness = {ready: boolean; valueTrialReady?: boolean; reason?: string; checks?: ValueReadinessCheck[]};
+export type MarketValueQuotaReadiness = {ready: boolean; valueTrialReady?: boolean; resourceReady?: boolean; reason?: string; checks?: ValueReadinessCheck[]};
 /** Bounded structured facts only; never render an arbitrary upstream message. */
 export function parseMarketValueReadiness(raw: unknown): MarketValueQuotaReadiness {
   const invalid = () => new ValueQuotaClientError("quota_server_invalid_response");
@@ -433,6 +433,7 @@ export function parseMarketValueReadiness(raw: unknown): MarketValueQuotaReadine
     if (value.ready && (checks.length === 0 || checks.some(check => !check.ready))) throw invalid();
   }
   return {ready:value.ready, valueTrialReady:value.ready && value.valueTrialReady === true,
+    resourceReady:value.ready && value.resourceReady === true && checks?.some(check=>check.code === "resource_metering" && check.ready) === true,
     reason:typeof value.reason === "string" && /^[a-zA-Z0-9_]{1,64}$/.test(value.reason) ? value.reason : undefined, checks};
 }
 export async function getMarketValueQuotaReadiness(shareId: string, signal?: AbortSignal) {

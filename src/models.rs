@@ -11,7 +11,7 @@ pub const MIN_SHARE_CONTRACT_VERSION: u16 = 2;
 /// v7 only add quota presentation metadata, so v5 market records remain valid
 /// during a rolling Server/Router deployment.
 pub const MIN_SHARE_MARKET_CONTRACT_VERSION: u16 = 5;
-pub const SHARE_CONTRACT_VERSION: u16 = 10;
+pub const SHARE_CONTRACT_VERSION: u16 = 11;
 pub const SHARE_TRIAL_CONTRACT_VERSION: u16 = 9;
 
 #[derive(Debug)]

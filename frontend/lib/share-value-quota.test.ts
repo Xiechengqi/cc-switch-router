@@ -19,7 +19,11 @@ test("market readiness keeps actionable binding/model evidence without trusting 
   const check={code:"model_price_coverage",ready:false,app:"claude",providerId:"provider-a",profileId:"claude.workbuddy_oauth",
     driverId:"special.workbuddy_oauth",model:"auto",reasonCode:"model_unresolved"};
   assert.deepEqual(parseMarketValueReadiness({ready:false,reason:"model_price_coverage",checks:[{...check,secret:"private",message:"upstream"}]}),
-    {ready:false,valueTrialReady:false,reason:"model_price_coverage",checks:[check]});
+    {ready:false,valueTrialReady:false,resourceReady:false,reason:"model_price_coverage",checks:[check]});
+  const readyCheck = {code:"resource_metering",ready:true};
+  assert.equal(parseMarketValueReadiness({ready:true,resourceReady:true,checks:[readyCheck]}).resourceReady,true);
+  assert.equal(parseMarketValueReadiness({ready:true,checks:[readyCheck]}).resourceReady,false,"older responses cannot imply resource capability");
+  assert.equal(parseMarketValueReadiness({ready:true,resourceReady:true,checks:[{code:"text_surface",ready:true}]}).resourceReady,false,"resource readiness needs explicit evidence");
   for(const malformed of [null,{},[],{ready:"true"},{ready:true,checks:[]},{ready:true,checks:[check]},
     {ready:false,checks:[null]},{ready:false,checks:[{code:"text_surface",ready:1}]}]) {
     assert.throws(()=>parseMarketValueReadiness(malformed),ValueQuotaClientError);

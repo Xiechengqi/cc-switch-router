@@ -4,6 +4,7 @@ use crate::share_value_pricing::{
     PricingManifest, PricingSnapshot, ValueQuotaStatus, unsigned_decimal,
 };
 mod delivery;
+pub(crate) mod resource_tariff;
 
 /// Metering states a Server may report. `unavailable` is also the safe
 /// display value for any state this Router does not recognise yet.
@@ -358,6 +359,8 @@ fn current_projection(
 struct FetchPayload {
     #[serde(default)]
     known_revision: Option<String>,
+    #[serde(default)]
+    supported_tariff_policies: Vec<String>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -467,7 +470,7 @@ impl AppStore {
         installation: &str,
     ) -> Result<serde_json::Value, AppError> {
         let conn = self.conn.lock().await;
-        let settings = read_settings_meta(&conn)?;
+        let settings = resource_tariff::installation_meta(&conn, installation)?;
         let acknowledged_at: Option<i64> = conn.query_row(
             "SELECT acknowledged_at_ms FROM share_value_pricing_acks WHERE installation_id=?1 AND revision=?2",
             params![installation, settings.revision], |row| row.get(0),
@@ -561,15 +564,9 @@ impl AppStore {
             }
         }
         let settings = read_settings_meta(&conn)?;
-        let acknowledgements: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM share_value_pricing_acks WHERE revision=?1",
-                params![settings.revision],
-                |r| r.get(0),
-            )
-            .map_err(db_error)?;
         let delivery =
             delivery::delivery_health(&conn, settings.revision.as_deref(), now.timestamp_millis())?;
+        let acknowledgements = delivery["acknowledgedInstallations"].as_i64().unwrap_or(0);
         // `shadowGrants` is retained for older UIs: shadow metering was removed,
         // so it only counts legacy bindings awaiting the next descriptor sync.
         Ok(
@@ -597,12 +594,17 @@ impl AppStore {
             }
             delivery::mark_target(&conn, &derived_from, now.timestamp_millis())?;
         }
+        let (resource_revision, resource_settings) = {
+            let conn = self.conn.lock().await;
+            resource_tariff::resource_settings(&conn)?
+        };
         let at_unix = now.timestamp();
         // Deriving and hashing a few MiB is CPU work; keep it off the runtime.
         let (json, revision) = tokio::task::spawn_blocking(move || {
-            let json = catalog
-                .execution_snapshot(at_unix)
-                .and_then(|snapshot| snapshot.canonical_json())
+            let mut snapshot = catalog.execution_snapshot(at_unix).map_err(db_error)?;
+            resource_tariff::overlay_text_mappings(&mut snapshot, &resource_settings)?;
+            let json = snapshot
+                .canonical_json()
                 .map_err(|e| AppError::Internal(format!("derive USD quota tariff failed: {e}")))?;
             let revision = PricingSnapshot::revision_of_canonical_json(&json);
             Ok::<_, AppError>((json, revision))
@@ -616,7 +618,9 @@ impl AppStore {
             .map_err(db_error)?;
         // A concurrent price edit swapped the catalog meanwhile; its own sync
         // publishes the newer prices, and this older derivation must not win.
-        if self.pricing_catalog().revision() != derived_from {
+        if self.pricing_catalog().revision() != derived_from
+            || resource_tariff::resource_settings(&tx)?.0 != resource_revision
+        {
             return Ok(None);
         }
         // Two derivations of the same catalog may straddle a future price
@@ -649,9 +653,10 @@ impl AppStore {
                 ON CONFLICT(singleton) DO UPDATE SET revision=excluded.revision,version=excluded.version",
                 params![revision,current.version.checked_add(1).ok_or_else(|| db_error("configuration version overflow"))?]).map_err(db_error)?;
         }
+        resource_tariff::publish(&tx, now_ms)?;
         tx.execute(
             "UPDATE share_value_pricing_snapshots SET payload_json='{}'
-             WHERE revision<>?1 AND created_at_ms<?2 AND payload_json<>'{}'",
+             WHERE revision<>?1 AND revision NOT IN (SELECT revision FROM share_value_resource_pricing_config) AND created_at_ms<?2 AND payload_json<>'{}'",
             params![revision, now_ms - TARIFF_PAYLOAD_RETENTION_MS],
         )
         .map_err(db_error)?;
@@ -894,6 +899,30 @@ fn revision_acknowledged(
     .map_err(db_error)
 }
 
+fn require_resource_storage(
+    conn: &Connection,
+    installation: &str,
+    ack: &AckPayload,
+) -> Result<(), AppError> {
+    let resource: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM share_value_resource_pricing_revisions WHERE revision=?1)
+             OR EXISTS(SELECT 1 FROM share_value_pricing_snapshots WHERE revision=?1 AND json_extract(payload_json,'$.schemaVersion')=2)",
+            params![ack.revision],
+            |r| r.get(0),
+        )
+        .map_err(db_error)?;
+    if resource
+        && (ack.storage_schema < 5
+            || !resource_tariff::installation_supports_resources(conn, installation)?)
+    {
+        return Err(AppError::Conflict(
+            "resource tariff requires negotiated support and storageSchema >= 5".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn apply_value_operation(
     tx: &Connection,
     installation_id: &str,
@@ -902,7 +931,20 @@ fn apply_value_operation(
 ) -> Result<ValueOutcome, AppError> {
     match operation {
         ValueOperation::Fetch(fetch) => {
-            let meta = read_settings_meta(tx)?;
+            if fetch.supported_tariff_policies.len() > 8 {
+                return Err(AppError::BadRequest("too many tariff policies".into()));
+            }
+            let resources = fetch
+                .supported_tariff_policies
+                .iter()
+                .any(|policy| policy == crate::share_value_pricing::RESOURCE_TARIFF_POLICY);
+            tx.execute("INSERT INTO installation_value_capabilities VALUES(?1,?2,?3) ON CONFLICT(installation_id) DO UPDATE SET resources=excluded.resources,updated_at_ms=excluded.updated_at_ms WHERE excluded.updated_at_ms>installation_value_capabilities.updated_at_ms",params![installation_id,resources,signed_at_ms]).map_err(db_error)?;
+            let resources = resource_tariff::installation_supports_resources(tx, installation_id)?;
+            let meta = if resources {
+                resource_tariff::read_resource_settings_meta(tx)?
+            } else {
+                read_settings_meta(tx)?
+            };
             match (fetch.known_revision, meta.revision) {
                 (_, None) => Ok(ValueOutcome::Ready(serde_json::Value::Null)),
                 // `unchanged` only when this installation's ACK row exists too;
@@ -918,11 +960,16 @@ fn apply_value_operation(
                 }
                 _ => Ok(ValueOutcome::Manifest {
                     installation_id: installation_id.to_string(),
-                    raw: read_settings_raw(tx)?,
+                    raw: if resources {
+                        resource_tariff::read_resource_settings_raw(tx)?
+                    } else {
+                        read_settings_raw(tx)?
+                    },
                 }),
             }
         }
         ValueOperation::Ack(ack) => {
+            require_resource_storage(tx, installation_id, &ack)?;
             let exists: bool = tx
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM share_value_pricing_snapshots WHERE revision=?1)",
@@ -945,6 +992,7 @@ fn apply_value_operation(
             ))
         }
         ValueOperation::Active(ack) => {
+            require_resource_storage(tx, installation_id, &ack)?;
             delivery::apply_activation(tx, installation_id, &ack.revision, signed_at_ms)
                 .map(ValueOutcome::Ready)
         }
@@ -1131,7 +1179,8 @@ mod tests {
         assert!(matches!(
             parse_value_operation("share_value_pricing_fetch", &serde_json::json!({})),
             Ok(ValueOperation::Fetch(FetchPayload {
-                known_revision: None
+                known_revision: None,
+                ..
             }))
         ));
         assert!(matches!(
@@ -1139,7 +1188,7 @@ mod tests {
                 "share_value_pricing_fetch",
                 &serde_json::json!({"knownRevision":"sha256:abc"})
             ),
-            Ok(ValueOperation::Fetch(FetchPayload { known_revision: Some(r) })) if r == "sha256:abc"
+            Ok(ValueOperation::Fetch(FetchPayload { known_revision: Some(r), .. })) if r == "sha256:abc"
         ));
         assert!(
             parse_value_operation(

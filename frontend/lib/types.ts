@@ -353,7 +353,7 @@ export type AccountResetPreview = {
 export type ShareUserPolicy = {
   parallelLimit?: number;
   tokenLimit?: number;
-  valueQuota?: { limitUsdMicros: string; tariffPolicyId: "api-equivalent-v1" };
+  valueQuota?: { limitUsdMicros: string; tariffPolicyId: "api-equivalent-v1" | "api-equivalent-v2" };
   tokenPeriod: ShareTokenPeriod;
   tokenPeriodAnchorAtMs?: number;
   expiresAt?: number;

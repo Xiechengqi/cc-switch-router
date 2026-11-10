@@ -381,6 +381,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         110,
         include_str!("../schema/0110_user_model_route_candidates.sql"),
     ),
+    (
+        111,
+        include_str!("../schema/0111_universal_value_resources.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {

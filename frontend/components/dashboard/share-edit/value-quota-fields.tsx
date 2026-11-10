@@ -17,13 +17,13 @@ export type QuotaUnit = "tokens" | "usdEquivalent";
 
 export function QuotaUnitSwitch({value, onChange, usdDisabled, disabled, readinessId, t}: {
   value: QuotaUnit; onChange: (unit: QuotaUnit) => void; usdDisabled?: boolean; disabled?: boolean;
-  /** Id of the visible "USD quota unavailable" line, read with the disabled `$`. */
+  /** Id of the visible USD setup diagnostics. */
   readinessId?: string; t: TFn;
 }) {
   const reasonId = React.useId();
-  const usdOff = !!usdDisabled && value !== "usdEquivalent";
+  const needsSetup = !!usdDisabled;
   // `title` alone is not announced reliably; the reason is real text, linked by id.
-  const describedBy = usdOff ? [reasonId, readinessId].filter(Boolean).join(" ") : undefined;
+  const describedBy = needsSetup ? [reasonId, readinessId].filter(Boolean).join(" ") : undefined;
   return <>
   <SegmentedControl<QuotaUnit>
     ariaLabel={t("dashboard.userLimit.value.unit")}
@@ -36,10 +36,10 @@ export function QuotaUnitSwitch({value, onChange, usdDisabled, disabled, readine
     items={[
       {id: "tokens", label: t("dashboard.userLimit.value.tokens")},
       {id: "usdEquivalent", label: t("dashboard.userLimit.value.unitUsdShort"), ariaLabel: t("dashboard.userLimit.value.usd"),
-        title: t("dashboard.userLimit.value.usd"), disabled: usdOff, describedBy},
+        title: t("dashboard.userLimit.value.usd"), describedBy},
     ]}
   />
-  {usdOff ? <span id={reasonId} className="sr-only">{t("dashboard.userLimit.value.usdDisabledReason")}</span> : null}
+  {needsSetup ? <span id={reasonId} className="sr-only">{t("dashboard.userLimit.value.usdDisabledReason")}</span> : null}
   </>;
 }
 
@@ -146,4 +146,11 @@ export function ValuePreviewLine({state, t}: {state: ValuePreviewState; t: TFn})
       {preview.rows.map(row => <li key={row.email} className="min-w-0"><RowOutcome row={row} t={t} locale={locale} withEmail /></li>)}
     </ul>
   </div>;
+}
+
+export function ValueResourceToggle({value,onChange,disabled,t}: {value:boolean;onChange:(value:boolean)=>void;disabled?:boolean;t:TFn}) {
+  return <label className="flex items-start gap-2 text-xs text-muted-foreground">
+    <input type="checkbox" className="mt-0.5" checked={value} disabled={disabled} onChange={event=>onChange(event.target.checked)} />
+    <span>{t("dashboard.userLimit.value.resources")}<span className="mt-1 block">{t("dashboard.userLimit.value.resourcesHint")}</span></span>
+  </label>;
 }
