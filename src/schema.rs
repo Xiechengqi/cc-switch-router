@@ -894,8 +894,9 @@ fn migration_checksum(sql: &str) -> String {
 mod tests {
     use super::*;
 
-    // Includes live-health evidence (0109) and ordered route candidates (0110).
-    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 278;
+    // Includes live-health evidence (0109), ordered route candidates (0110),
+    // and resource tariffs/capabilities (0111).
+    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 283;
 
     #[test]
     fn migration_109_adds_live_health_without_inventing_evidence_or_rewriting_cycles_and_money() {
