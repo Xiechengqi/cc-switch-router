@@ -5923,14 +5923,21 @@ async fn get_share_settings_edit(
     State(state): State<ServerState>,
     headers: HeaderMap,
     Path((share_id, edit_id)): Path<(String, String)>,
-) -> Result<Json<crate::models::ShareEditView>, AppError> {
+) -> Result<Json<serde_json::Value>, AppError> {
     let email = require_user_email(&state, &headers, "share:write").await?;
-    Ok(Json(
+    let edit = state
+        .store
+        .share_settings_edit_for_owner(&share_id, &edit_id, &email)
+        .await?;
+    let mut response = serde_json::to_value(edit).map_err(|e| AppError::Internal(e.to_string()))?;
+    response["quotaConversions"] = serde_json::to_value(
         state
             .store
-            .share_settings_edit_for_owner(&share_id, &edit_id, &email)
+            .share_quota_conversion_receipts_for_owner(&share_id, &edit_id, &email)
             .await?,
-    ))
+    )
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(Json(response))
 }
 
 async fn preview_share_account_reset(
@@ -6535,12 +6542,19 @@ async fn update_share_settings_with_email(
         )
         .await
         {
-            Ok((returned_share, receipt)) => {
+            Ok((returned_share, receipt, quota_result)) => {
                 state
                     .store
-                    .apply_share_edit_with_receipt(&response.edit.id, returned_share, receipt)
+                    .apply_share_edit_with_quota_result(
+                        &response.edit.id,
+                        returned_share,
+                        receipt,
+                        &quota_result,
+                    )
                     .await?;
                 response.applied_synchronously = true;
+                response.quota_conversions = quota_result.quota_conversions;
+                response.value_quota_statuses = quota_result.value_quota_statuses;
                 response.edit = state
                     .store
                     .share_settings_edit_for_owner(share_id, &response.edit.id, current_user_email)

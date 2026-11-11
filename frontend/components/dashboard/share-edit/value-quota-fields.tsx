@@ -8,7 +8,7 @@ import { SegmentedControl } from "@/components/common/segmented-control";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { cn } from "@/lib/utils";
 import {
-  formatQuotaPicos, formatQuotaTime, renderValueQuotaMessage, valuePreviewBlocker, valuePreviewRowOutcome, valueQuotaErrorMessage,
+  calibratedConversionRow, formatQuotaPicos, formatQuotaTime, renderValueQuotaMessage, valuePreviewBlocker, valuePreviewRowOutcome, valueQuotaErrorMessage,
   type ValuePreviewInvalidRow, type ValuePreviewRow,
 } from "@/lib/share-value-quota";
 import type { ValuePreviewState } from "@/lib/use-value-quota-preview";
@@ -74,8 +74,10 @@ export function QuotaLimitField({id, unit, value, onChange, error, disabled, lab
 
 function RowOutcome({row, t, locale, withEmail}: {row: ValuePreviewRow; t: TFn; locale: string; withEmail?: boolean}) {
   const outcome = valuePreviewRowOutcome(row);
-  const used = formatQuotaPicos(row.usedPicos ?? "0");
-  const text = outcome === "scheduled"
+  const used = formatQuotaPicos(row.usedPicos);
+  const text = row.conversionRequired && row.targetUnit === "tokens" ? t("dashboard.userLimit.value.convertedTokens", {tokens: row.effectiveTokens == null ? "—" : (row.effectiveTokens / 1_000_000).toLocaleString(locale, {maximumFractionDigits: 6}), pending: row.pendingTokens == null ? "—" : (row.pendingTokens / 1_000_000).toLocaleString(locale), remaining: row.remainingTokens == null ? "—" : (row.remainingTokens / 1_000_000).toLocaleString(locale)})
+    : row.conversionRequired ? t("dashboard.userLimit.value.convertedUsd", {used, pending: formatQuotaPicos(row.pendingRiskPicos), remaining: formatQuotaPicos(row.remainingPicos)})
+    : outcome === "scheduled"
     ? t("dashboard.userLimit.value.previewStarts", {date: formatQuotaTime(row.effectiveFromMs, locale, "short"), used})
     : outcome === "meteredFromNow" ? t("dashboard.userLimit.value.previewMeteredFromNow")
       : t("dashboard.userLimit.value.previewApplies", {used});
@@ -86,6 +88,7 @@ function RowOutcome({row, t, locale, withEmail}: {row: ValuePreviewRow; t: TFn; 
     {withEmail ? null : <InfoHint label={t("dashboard.userLimit.value.preview")}>
       <span className="grid gap-1">
         <span>{t(hint)}</span>
+        {row.coverage ? <span>{t("dashboard.userLimit.value.pricingBasis", {revision: row.coverage.pricingBasis?.slice(0, 12) ?? t("dashboard.userLimit.value.originalPrices")})} · {row.coverage.status?.meteringStatus}</span> : null}
         <span className="text-muted-foreground">{t("dashboard.userLimit.value.meteredSince", {time: formatQuotaTime(row.meteredFromMs, locale)})}</span>
       </span>
     </InfoHint>}
@@ -101,12 +104,12 @@ function invalidRowReason(row: ValuePreviewInvalidRow, t: TFn) {
  * One line under the amount: when the policy starts and what it carries over.
  * Batches add a compact per-user list. Blocking reasons are translated per row.
  */
-export function ValuePreviewLine({state, t}: {state: ValuePreviewState; t: TFn}) {
+export function ValuePreviewLine({state, t, calibrations}: {state: ValuePreviewState; t: TFn; calibrations?: Record<string, {amount: string; reason: string}>}) {
   const {locale} = useLocaleText();
   if (!state.intent) return null;
-  if (state.loading) return <p className="text-xs text-muted-foreground" role="status">{t("dashboard.userLimit.value.previewLoading")}</p>;
+  if (state.loading) return <p className="text-xs text-muted-foreground" role="status">{state.preparedRecords == null ? t("dashboard.userLimit.value.previewLoading") : t("dashboard.userLimit.value.preparationProgress", {count: state.preparedRecords})}</p>;
   if (state.error) return <p className="text-xs text-red-600" role="alert">{renderValueQuotaMessage(valueQuotaErrorMessage(state.error), t)}</p>;
-  const preview = state.preview;
+  const preview = state.preview && {...state.preview, rows: state.preview.rows.map(row => calibratedConversionRow(row, calibrations?.[row.email]))};
   if (!preview) return null;
   const blocker = valuePreviewBlocker(preview);
   const invalid = preview.invalidRows ?? [];
@@ -125,6 +128,7 @@ export function ValuePreviewLine({state, t}: {state: ValuePreviewState; t: TFn})
     const reason = renderValueQuotaMessage(blocker.message, t);
     return <p className="text-xs text-red-600" role="alert">
       {blocker.email && (preview.rows.length + invalid.length) > 1 ? t("dashboard.userLimit.value.rowReason", {email: blocker.email, reason}) : reason}
+      {preview.rows.filter(row=>row.coverage && (!blocker.email || row.email===blocker.email)).map(row=><span key={row.email} className="mt-1 block">{t("dashboard.userLimit.value.evidence",{tokens:row.coverage!.evidenceTokens,requests:row.coverage!.evidenceRequests,missing:row.coverage!.missingFacts})}</span>)}
     </p>;
   }
   if (preview.rows.length <= 1) {

@@ -187,7 +187,7 @@ Router 不接受长效 SSH 凭据。每次建链前 Server 申请一次性 lease
 
 `ShareDescriptor` 面向全新部署时必须满足以下约束:
 
-- Router 当前 reader 支持 **Share Contract v2..v11**。Server 普通未协商 descriptor 保持 **Share Contract v7**；账号周期 v8、一次性市场试用 v9、美元等值配额 v10、资源配额 v11 须显式能力。v4 引入本节 `modelProbe`（Router 仅对 v4 以上执行探针），v5 引入 Grok 媒体权限，v6 增加 scoped quota metadata，v7 增加只展示的 `unobservedTiers` 及 Codex `bankedReset`；它们不参与调度/限流/容量评分。连接测试/模型健康检查保留 v7 兼容。
+- Router 当前 reader 支持 **Share Contract v2..v12**。Server 普通未协商 descriptor 保持 **Share Contract v7**；账号周期 v8、一次性市场试用 v9、美元等值配额 v10、资源配额 v11、即时单位转换 v12 须显式能力。v4 引入本节 `modelProbe`（Router 仅对 v4 以上执行探针），v5 引入 Grok 媒体权限，v6 增加 scoped quota metadata，v7 增加只展示的 `unobservedTiers` 及 Codex `bankedReset`；它们不参与调度/限流/容量评分。连接测试/模型健康检查保留 v7 兼容。
 - Share Market 最低版本仍为 v5（`MIN_SHARE_MARKET_CONTRACT_VERSION=5`），不因账号周期的协商扩展抬高。reader 上限、普通 descriptor 版本与市场最低版本是三项独立约束。
 - v8增加`tokenPeriod=accountReset`及userGrants只读`accountQuotaCycle/accountResetCapability/accountUsageBaseline`、`usageQuota.usageWatermark`。当前安装heartbeat响应同时返回`shareContractVersion=11,capabilities=["accountResetV1","marketTrialV1","usdEquivalentQuotaV1","cacheCreationTtlV1","resourceValueQuotaV2"]`；Server同时检查显式能力、Router URL/installation绑定和300秒有效期。普通v7必须省略新嵌套字段，v7携带accountReset/新字段拒绝，不能静默转换为sevenDays；市场报价不开放动态周期。
 - v9 的 `marketEntitlements` 按 entitlement ID 返回 `trialScopeId/email/phase/active/trialTokenAllowance/trialTokenLimit/trialTokensUsed/usageRevision/usageUncertain/appliedAtMs/paidStartedAtMs`。`phase=trial|paid`，Token cap 缺省表示仅时长试用，不能写普通 `tokenLimit:0`。试用累计数和修订只增不减，与普通日／周／月 quota 分开；使用量变化不提升静态 descriptor generation。完整 descriptor 的 Notify＋周期重放持续携带动态试用水位。v9 以下不得携带非空试用状态。
@@ -832,7 +832,7 @@ Share 直连隧道另有独立白名单:`/v1`、`/v1/`、`/v1beta/`、`/gemini/v
 - 上述 Share sync/claim/edit-ack 控制请求为兼容旧 Server 可省略 `protocolEpoch`；一旦出现就必须是当前 epoch 的非空字符串，`null` 与错误 epoch 都拒绝
 - Share descriptor、其嵌套权威对象和 batch operation 都拒绝未知字段；契约扩展必须提升 `contractVersion` 并先部署 Router。Server 的 `shareSha256` 请求必须同样遵循 Router-first 发布顺序
 
-## 13. Share v10/v11 美元等值额度
+## 13. Share v10/v11/v12 美元等值额度
 
 此功能与钱包、充值、市场租金完全独立。完整实现规格和真实灰度门槛见 [实施计划](docs/share-user-value-quota-implementation-plan.md)。当前只声明本地／夹具验证；真实转发面保持 `live_pending`。
 
@@ -873,9 +873,9 @@ Router 每 15 秒重试执行价目发布失败，并检查目录内未来价格
 
 Server 在真正发上游前以 IMMEDIATE SQLite 事务校验并写入风险占用。`spent + pendingRisk >= limit` 拒绝新请求，已准入请求自然结束，可超过额度，是请求级软上限而非绝对硬上限。每个请求的风险预占有界（不再预占全部剩余额度）；同一用户的金额模式并发为 `min(parallelLimit, 4)`（未设并发即 4），超出时返回 `value_quota_busy`。
 
-**不再有 shadow 计量**：Token 模式授权不再获得 `valueMetering` 绑定，Server 也不为其记录金额。只有 `policy.valueQuota` 生效或携带 `pendingValueQuota` 的授权才有绑定；Router 在 descriptor 同步时丢弃其他授权上残留的旧绑定，且只对这些授权检查价目 ACK。缺少 ACK 时整份 descriptor 返回 409 `value_pricing_ack_missing`，`details.revisions` 列出（去重后）未 ACK 的修订；Server 对这些修订重新 ACK 后自动重试一次同步。作为兜底，Router 在 fetch 的 `knownRevision` 匹配但本 installation 无 ACK 行时返回完整清单（见 §13.1），使 Server 重新安装并 ACK。计量起点只在同为金额模式（启用或排期）的前后绑定之间不可变。
+**单位无关事实**：所有生成持久记录不含正文的模型、tier、Token 分类、资源与结果事实。Token 模式有价时可选冻结金额，缺价不影响 Token 请求；缺历史不能按零处理。v12 转换后的 Token grant 保留 `quotaConversionId/valueMetering`，计量起点只能向历史扩展。旧无 marker 的非 USD binding 仍按旧规则丢弃。USD 及保留的转换 binding 继续校验价目 ACK，丢失时返回 409 `value_pricing_ack_missing`，Server 重 ACK 后只重试一次。
 
-**启用规则**：自然周期（day/week/sevenDays/calendarMonth/thirtyDays）从下一个窗口开始执行，除非该用户当前窗口已经是金额计量，或该用户在当前窗口内尚无任何已记录请求（全新用户）——此时 Server 立即启用，`meteredFrom` 为当前窗口起点；`lifetime` 与 `accountReset` 立即开始，`meteredFrom=now`。
+**启用规则**：普通授权的单位、USD 周期或 anchor 改动必须使用 §13.5 签名预览，保存立即承接当前窗口消费与在途风险。只改同窗口 USD 额度直接生效，消费不重算。缺历史或无法证明在途上界时拒绝转换。旧 `pendingValueQuota` 继续按原时刻后台激活，主动替换排期走 v12；新建 Share 的初始兼容初始化与市场托管合同保留原规则。
 
 **按结果结算**：未发出上游请求，或明确认证拒绝且无任何 usage/生成证据 → $0；HTTP 错误、EOF、未观察到输出不能单独证明免费。流式中断 → 已观测部分 usage 加按已流出文本估算的输出，标记 `conservative`；结果未知 → `max(已观测, 预占)`，标记 `conservative`。超时未结算的 pending 记录由 Server 的清扫任务按上述规则收敛，不会永久占用风险。
 
@@ -899,7 +899,7 @@ Server 在真正发上游前以 IMMEDIATE SQLite 事务校验并写入风险占�
 
 原生 Gemini 的执行模型取自真实 URL，而非客户端 JSON `model`。上游响应模型证据与用量原子落盘；流式分片中的矛盾模型不能被后续正常帧抹去。响应模型与执行模型不同，仅冻结快照明确声明的 exact alias 可证明同一身份，不使用同族／日期后缀猜测。异常响应保留风险并暂停该窗口的新美元请求，不能先释放风险、再异步补记异常。
 
-Gemini 的金额模式仅覆盖 `generateContent`／`streamGenerateContent`；辅助 `countTokens`、embedding、batch 等未覆盖动作在金额预占和发网前返回 `quota_unavailable`，不改变旧 Token 模式的可用动作。
+Gemini 的金额模式仅覆盖 `generateContent`／`streamGenerateContent`；辅助 `countTokens` 不生成金额 attempt；embedding、batch 等未覆盖动作在金额预占和发网前返回 `quota_unavailable`，不改变旧 Token 模式的可用动作。
 
 ### 13.3 私有读取与校准
 
@@ -949,3 +949,27 @@ v2 快照沿用不可变 hash 与金额算法，仅给每个模型增加 `resour
 Router migration 111 同时保存 v1/v2 发布指针、永久资源修订标记及 installation 能力；历史快照正文清理后，资源修订仍要求 schema 5 的 ACK/active。Server schema 5 保存异步关联；既有文本价格、授权与市场租约不自动升级。市场 seat/subscription 冻结 tariffPolicyId，报价、租用、续约、试用转换不得重新采用后来编辑的策略。资源未协商、价目未激活/ACK、模型未解析、资源缺价分别诊断为 resource_upgrade_required/model_unresolved/resource_unpriced 等原因。旧 Router 能力丢失时隔离受影响 Share，不能阻塞同批其他 Share 或将新合同静默切回 Token。
 
 交付验证仅编译、类型、格式和静态审计；CI 回归及生产灰度保持待完成，99 对真实验收均 live_pending。部署 Router → Server，确认协商与 active receipt 后显式启用资源策略；存在 v2 合同或 schema 5 数据时不得直接降级到旧二进制。
+
+### 13.5 v12 普通授权即时单位转换
+
+Router reader ≥12 与 heartbeat `quotaUnitConversionV1` 同时满足才启用。Server 缓存能力绑定 Router URL / installation，最长 300 秒；带 `quotaConversionId` 的 Share descriptor 必须 v12，能力丢失隔离该 Share，不影响同批无关 Share。Marker 为非空、最长 128 字节的 Server operation ID；不得用于市场托管授权，不得同时保留待生效策略，必须有完整 `valueMetering`。转换后的 Token binding 不清理，origin 不得向前移动。默认普通 descriptor 仍为 v7，旧 v10/v11 USD / resource 合同继续读取。
+
+只读 `POST /v1/shares/:share_id/value-quota-preview` 沿用 owner 权限与 `{expectedConfigRevision,policies}`。单位或 USD 窗口变更的每用户 row 额外返回：
+
+- `conversionRequired/sourceUnit/targetUnit/conversionCredential/credentialExpiresAtMs/calibrationRequired`。
+- `windowId/windowStartsAtMs/resetsAtMs/meteredFromMs`，`usedPicos/pendingRiskPicos/remainingPicos`，`observedTokens/effectiveTokens/pendingTokens/remainingTokens` 与 `tokenLimit/limitUsdMicros`。
+- `coverage`：完整性、缺事实数量、Token / 请求对账量、准备进度、冻结迁移价目及原始金额状态。无法读取 / 证明时金额为 null，界面显示未知。
+
+`reasonCode=history_incomplete|history_preparing|pending_evidence_missing|conversion_upgrade_required|blocked_needs_reconcile|ready`。历史准备是单独显式写接口：`POST /v1/shares/:share_id/quota-history-prepare`，body `{expectedConfigRevision,emails,restart?}`，owner 权限，转发签名 `/_ctl/prepare_quota_history`。Server 每用户每页最多 500 条日志或 facts，回复 `{shareId,configRevision,items:[{email,preparation:{state,processed,pricingRevision}}]}`；游标持久保存，幂等恢复。Server Web 对应 `prepare_share_quota_history`。预览不能暗中补价。
+
+凭据最长 15 分钟且不跨窗口结束，HMAC 绑定当前 scope / 配置与 grant revision / 源目标 policy / 窗口与账号 cycle revision / origin / 人工调整身份 / 迁移与 active 价目 / 到期。消费水位不参与 CAS；保存时并入最新消费。旧金额保留原价，只有从未入账的事实可冻结迁移价目。AccountReset 按 source / epoch / bucket 与周期边界取数，禁止跨账号或使用混源 calendar 汇总。
+
+设置 patch 新增 `userQuotaConversions:{[normalizedEmail]:{credential,targetUsedPicos?,targetUsedTokens?,reason?}}`，须匹配同批普通 active policy edit，并带原有 `editContext.operationId/expectedConfigRevision/actor`。两种校准单位互斥，不得给该用户混发 Token usage edit；市场授权拒绝。来源人工调整无跨单位映射，或资源 / 保守金额无天然 Token 对应时，必须输入目标已用及审计原因。目标不得小于预览真实观测；offset 按预览观测计算，后续消费仍叠加。正反映射只应用一次。
+
+Server schema 6 在同一 SQLite IMMEDIATE 事务重验历史与窗口，写策略、binding / Token baseline、金额调整与映射、完整转换回执及永久 settings receipt；失败整个批次回滚，提交后发布内存。准入共享短提交 gate，发网上游不持 gate。保存期间已准入的生成按原窗口、attempt 与冻结价结算；可证明的在途风险转换为目标风险，无法证明则拒绝。切回 Token 后其准入也扣除在途 Token。目标额度低于已用可保存，剩余为 0，新生成立即拦截。
+
+同步 apply response 和异步 Share edit ACK 新增 `quotaConversions:[]`、`valueQuotaStatuses:[]`，空数组省略以保持旧签名。每个 receipt 包含 `operationId/email/sourceUnit/targetUnit/windowId/meteredFromMs/effectiveFromMs/targetLimit/status/committed`。`status` 为提交时 USD 状态（Token 目标为 null）；独立当前状态允许后续使用。Router 必须验证完整、无重复、同 operation 的 receipt 批次，并在单一事务内保存 descriptor、迁移 112 的 receipt 镜像、当前窗口水位和 applied edit；旧窗口延迟回执只归档，不能覆盖新策略。
+
+owner 读取现有 settings edit 结果时追加 `quotaConversions`，用于响应丢失后恢复。Server `/_ctl/quota_conversion_receipt` 与 Web `get_share_quota_conversion` 接收 `{shareId,operationId}`，返回 `{committed,settingsReceipt,quotaConversions,valueQuotaStatuses}`；回执查询绑定当前 Router / installation / Share。永久回执独立于 4096 条内存 settings cache；同 operation 同 fingerprint 重放只返回已有结果，不同 fingerprint 拒绝。scope、证据及回执独立于报表 retention、普通撤销和 Share 替换，不可为重获额度而清除。
+
+控制面错误 `QUOTA_CONVERSION_*` 映射为类型化 409，包含 stale / invalid credential、revision / window / operation conflict、history / pending evidence missing、calibration required / below observed、restore fenced、managed read only 或 Router upgrade required。保留当前策略与编辑草稿，补配置 / 历史或重新预览后重试。恢复 fence、来源缺证据和不可证明历史不能由浏览器提交的“0”解除。

@@ -39,7 +39,7 @@ import { applyShareUserPolicyBatch, patchedUserPolicy, type ShareUserPolicyBatch
 import { ShareValueUsageAdjustment } from "./share-value-usage-adjustment";
 import { publishValueQuotaStatuses, useShareValueQuotaSnapshot } from "@/lib/use-share-value-quota";
 import {
-  formatQuotaPicos, formatUsdLimit, microsToUsdInput, parseUsdLimit, picosToUsdInput, parseInitialValueUsage, usdUsageToPicos, valuePreviewRowOutcome, valueStatusTextKey,
+  quotaConversionNeeded, quotaConversionInput, formatQuotaPicos, formatUsdLimit, microsToUsdInput, parseUsdLimit, picosToUsdInput, parseInitialValueUsage, usdUsageToPicos, valuePreviewRowOutcome, valueStatusTextKey,
   usdAmountErrorKey, valuePreviewBlocker, valuePreviewNeedsAcknowledgement, valueQuotaView, type ValueQuotaPreview, type ValueQuotaStatus,
 } from "@/lib/share-value-quota";
 
@@ -59,7 +59,9 @@ type GrantDraft = {
   usageAction: "unchanged" | "set" | "clear";
 };
 
-type BatchGrantDraft = Omit<GrantDraft, "email" | "consumedValue" | "valueReason" | "unitDrafts"> & {
+type BatchGrantDraft = Omit<GrantDraft, "email" | "consumedValue" | "valueReason"> & {
+  calibrations?: Record<string, {amount: string; reason: string}>;
+  calibrationDrafts?: Partial<Record<"tokens" | "usdEquivalent", Record<string,{amount:string;reason:string}>>>;
   applyParallelLimit: boolean;
   applyTokenLimit: boolean;
   applyConsumedTokens: boolean;
@@ -468,16 +470,23 @@ export function ShareUserGrantsEditor({
     };
   };
   const singleUsdPolicies = (() => {
-    if (grantDraft?.quotaUnit !== "usdEquivalent") return undefined;
+    if (!grantDraft) return undefined;
     const email = grantDraft.email.trim().toLowerCase();
-    const policy = validEmail(email) ? usdDraftPolicy(grantDraft) : undefined;
-    return policy ? { [email]: policy } : undefined;
+    if (!validEmail(email)) return undefined;
+    const policy: ShareUserPolicy | undefined = grantDraft.quotaUnit === "usdEquivalent" ? usdDraftPolicy(grantDraft) : {
+      parallelLimit: grantDraft.parallelLimit.trim() ? Number(grantDraft.parallelLimit) : undefined,
+      tokenLimit: grantDraft.tokenLimit.trim() ? millionsInputToTokens(grantDraft.tokenLimit) ?? undefined : undefined,
+      tokenPeriod: grantDraft.tokenPeriod,
+      tokenPeriodAnchorAtMs: ANCHORED_PERIODS.has(grantDraft.tokenPeriod) ? parseUtcDateTime(grantDraft.tokenPeriodAnchor) : undefined,
+      expiresAt: grantDraft.expiresAt ? new Date(grantDraft.expiresAt).getTime() : undefined,
+    };
+    return policy && (policy.valueQuota || quotaConversionNeeded(savedGrants[email], policy)) ? { [email]: policy } : undefined;
   })();
   const batchUsdPolicies = (() => {
-    if (!batchDraft?.applyTokenLimit || batchDraft.quotaUnit !== "usdEquivalent" || !selectedEditableEmails.size) return undefined;
+    if (!batchDraft?.applyTokenLimit || !selectedEditableEmails.size) return undefined;
     const patch = batchPatchFor(batchDraft);
     const parallel = patch.parallelLimit?.value;
-    if (!patch.tokenLimit?.valueQuota || anchorInvalid(batchDraft.tokenPeriod, patch.tokenLimit.periodAnchorAtMs)
+    if (!patch.tokenLimit || (batchDraft.quotaUnit === "usdEquivalent" && !patch.tokenLimit.valueQuota) || anchorInvalid(batchDraft.tokenPeriod, patch.tokenLimit.periodAnchorAtMs)
       || (parallel != null && (!Number.isInteger(parallel) || parallel < 1))
       || (patch.expiresAt?.value != null && !Number.isFinite(patch.expiresAt.value))) return undefined;
     // Preview the requested policy, not what staging keeps in force.
@@ -674,12 +683,17 @@ export function ShareUserGrantsEditor({
     const next: ShareUserGrant = stageUserPolicy(ordinaryShareUserGrant(email, normalizedOwner, previous, target), target,
       previous && !reuseMarketTombstone ? previous.policy : target);
     let initialization: ShareUserValueUsageInitializationMap[string] | undefined;
-    if (target.valueQuota) {
+    if (target.valueQuota || quotaConversionNeeded(savedGrants[email], target)) {
       setError("");
       const preview = await resolveValuePreview(singlePreview);
       if (!preview) return;
       if (currentGrantDraft.current !== grantDraft) return;
-      const parsed = parseInitialValueUsage(preview, email, grantDraft.consumedValue, grantDraft.valueReason, !!savedGrants[email]);
+      const row = preview.rows.find(row => row.email === email);
+      try {
+        next.quotaUnitConversion = row && quotaConversionInput(row, {amount: grantDraft.quotaUnit === "usdEquivalent" ? grantDraft.consumedValue : grantDraft.consumedTokens, reason: grantDraft.valueReason});
+        next.quotaUnitConversionPolicy = next.quotaUnitConversion ? sharePolicyFingerprint(target) : undefined;
+      } catch { setError(t("dashboard.userLimit.value.conversionCalibrationRequired")); return; }
+      const parsed = parseInitialValueUsage(preview, email, row?.calibrationRequired ? "" : grantDraft.consumedValue, grantDraft.valueReason, !!savedGrants[email]);
       if (!parsed.ok || (parsed.initialization && !onValueUsageInitializationsChange)) {
         setError(t("dashboard.userLimit.value.initialInvalid")); return;
       }
@@ -689,7 +703,7 @@ export function ShareUserGrantsEditor({
       next.accountQuotaCycle = previous?.policy.tokenPeriod === "accountReset" ? draftCycle : accountCycle;
       next.accountResetCapability = accountCapability;
     }
-    if (grantDraft.quotaUnit === "tokens" && grantDraft.usageAction === "set" && consumedTokens != null) {
+    if (!next.quotaUnitConversion && grantDraft.quotaUnit === "tokens" && grantDraft.usageAction === "set" && consumedTokens != null) {
       const previousQuota = previous?.usageQuota;
       next.usageQuota = {
         period: grantDraft.tokenPeriod,
@@ -702,7 +716,7 @@ export function ShareUserGrantsEditor({
         observedRequestsCount: previousQuota?.observedRequestsCount ?? 0,
         rebaseApplies: true,
       };
-    } else if (grantDraft.quotaUnit === "tokens" && grantDraft.usageAction === "clear") {
+    } else if (!next.quotaUnitConversion && grantDraft.quotaUnit === "tokens" && grantDraft.usageAction === "clear") {
       const previousQuota = previous?.usageQuota;
       next.usageRebase = undefined;
       next.usageQuota = previousQuota
@@ -729,8 +743,8 @@ export function ShareUserGrantsEditor({
     if (onUsageEditsChange) {
       const nextEdits: ShareUserUsageEditMap = { ...usageEdits };
       if (editingEmail && editingEmail !== email) delete nextEdits[editingEmail];
-      if (grantDraft.quotaUnit === "usdEquivalent") delete nextEdits[email];
-      if (grantDraft.quotaUnit === "tokens" && grantDraft.usageAction === "set" && consumedTokens != null) {
+      if (grantDraft.quotaUnit === "usdEquivalent" || next.quotaUnitConversion) delete nextEdits[email];
+      if (!next.quotaUnitConversion && grantDraft.quotaUnit === "tokens" && grantDraft.usageAction === "set" && consumedTokens != null) {
         nextEdits[email] = {
           action: "set",
           targetTokens: consumedTokens,
@@ -740,7 +754,7 @@ export function ShareUserGrantsEditor({
           anchorAtMs: tokenPeriodAnchorAtMs,
           source: usageEdits[editingEmail || email]?.source ?? "manual",
         };
-      } else if (grantDraft.quotaUnit === "tokens" && grantDraft.usageAction === "clear") {
+      } else if (!next.quotaUnitConversion && grantDraft.quotaUnit === "tokens" && grantDraft.usageAction === "clear") {
         nextEdits[email] = {
           action: "clear",
           expectedGrantRevision: previous?.revision,
@@ -838,13 +852,22 @@ export function ShareUserGrantsEditor({
     }
 
     const nextGrants = applyShareUserPolicyBatch(batchSourceGrants(), selectedEditableEmails, batchPatchFor(batchDraft));
-    if (batchDraft.applyTokenLimit && valueQuota) {
+    if (batchDraft.applyTokenLimit && batchUsdPolicies) {
       setError("");
-      if (!await resolveValuePreview(batchPreview)) return;
+      const preview = await resolveValuePreview(batchPreview);
+      if (!preview) return;
+      try {
+        for (const row of preview.rows) {
+          const grant = nextGrants[row.email];
+          grant.quotaUnitConversion = quotaConversionInput(row, batchDraft.calibrations?.[row.email]);
+          grant.quotaUnitConversionPolicy = grant.quotaUnitConversion ? sharePolicyFingerprint(grant.policy) : undefined;
+        }
+      } catch { setError(t("dashboard.userLimit.value.conversionCalibrationRequired")); return; }
     }
     if (batchDraft.applyConsumedTokens && !valueQuota) {
       for (const grant of selectedGrants) {
         const current = nextGrants[grant.email] ?? grant;
+        if (current.quotaUnitConversion) continue;
         const observed = observedGrantTokens(grant);
         const period = batchDraft.applyTokenLimit
           ? batchDraft.tokenPeriod
@@ -896,7 +919,7 @@ export function ShareUserGrantsEditor({
       const nextEdits: ShareUserUsageEditMap = { ...usageEdits };
       for (const grant of selectedGrants) {
         const email = grant.email.trim().toLowerCase();
-        if (nextGrants[email]?.policy.valueQuota || (batchDraft.applyTokenLimit && batchDraft.quotaUnit === "usdEquivalent")) { delete nextEdits[email]; continue; }
+        if (nextGrants[email]?.quotaUnitConversion || nextGrants[email]?.policy.valueQuota || (batchDraft.applyTokenLimit && batchDraft.quotaUnit === "usdEquivalent")) { delete nextEdits[email]; continue; }
         const period = batchDraft.applyTokenLimit ? batchDraft.tokenPeriod : grant.policy.tokenPeriod;
         if (batchDraft.applyConsumedTokens && batchDraft.usageAction === "set" && consumedTokens != null) {
           nextEdits[email] = {
@@ -1162,7 +1185,7 @@ export function ShareUserGrantsEditor({
                     error={limitError(grantDraft?.quotaUnit || "tokens", grantDraft?.tokenLimit || "")}
                     onChange={(tokenLimit) => grantDraft && setGrantDraft({ ...grantDraft, tokenLimit })} />
                   {grantDraft?.quotaUnit === "usdEquivalent" ? <ValueResourceToggle t={t} value={grantDraft.resourceMetering} onChange={resourceMetering=>setGrantDraft({...grantDraft,resourceMetering})} /> : null}
-                  {grantDraft?.quotaUnit === "usdEquivalent" ? <ValuePreviewLine state={singlePreview} t={t} /> : null}
+                  {singleUsdPolicies ? <ValuePreviewLine state={singlePreview} t={t} calibrations={grantDraft ? {[editedEmail]:{amount: grantDraft.quotaUnit === "usdEquivalent" ? grantDraft.consumedValue : grantDraft.consumedTokens, reason: grantDraft.valueReason}} : undefined} /> : null}
                 </div>
                 <div className={grantDraft?.quotaUnit === "usdEquivalent" ? "hidden" : "grid gap-1.5 sm:col-span-2"}>
                   <span className="mono-label text-muted-foreground">{t("dashboard.userLimit.consumedTokens")}</span>
@@ -1205,7 +1228,16 @@ export function ShareUserGrantsEditor({
                     <p className="text-xs text-muted-foreground">{t("dashboard.userLimit.newConsumedHint")}</p>
                   )}
                 </div>
-                {grantDraft?.quotaUnit === "usdEquivalent" ? <div className="grid gap-2 sm:col-span-2">
+                {initialPreviewRow?.calibrationRequired && grantDraft ? <div className="grid gap-2 sm:col-span-2">
+                  <label className="text-xs">{t("dashboard.userLimit.value.conversionCalibrationRequired")}
+                    <Input inputMode="decimal" aria-label={t("dashboard.userLimit.value.conversionCalibrationRequired")}
+                      value={grantDraft.quotaUnit === "usdEquivalent" ? grantDraft.consumedValue : grantDraft.consumedTokens}
+                      onChange={event => setGrantDraft({...grantDraft, ...(grantDraft.quotaUnit === "usdEquivalent" ? {consumedValue: event.target.value} : {consumedTokens: event.target.value})})} />
+                  </label>
+                  <Input maxLength={1000} aria-label={t("dashboard.userLimit.value.reason")} placeholder={t("dashboard.userLimit.value.reason")}
+                    value={grantDraft.valueReason} onChange={event => setGrantDraft({...grantDraft, valueReason: event.target.value})} />
+                </div> : null}
+                {grantDraft?.quotaUnit === "usdEquivalent" && !initialPreviewRow?.calibrationRequired ? <div className="grid gap-2 sm:col-span-2">
                   <span id={`${fieldId}-value-label`} className="mono-label text-muted-foreground">{t("dashboard.userLimit.value.consumed")}</span>
                   {!savedGrant ? <>
                     <Input id={`${fieldId}-initial-value`} inputMode="decimal" autoComplete="off" placeholder="0"
@@ -1342,13 +1374,24 @@ export function ShareUserGrantsEditor({
                   </Checkbox.Content>
                 </Checkbox>
                 <QuotaUnitSwitch t={t} disabled={!batchDraft?.applyTokenLimit} value={batchDraft?.quotaUnit || "tokens"} usdDisabled={readiness.unavailable} readinessId={`${fieldId}-batch-readiness`}
-                  onChange={(unit) => { if (!batchDraft || unit === batchDraft.quotaUnit) return; setAmountAttempted(false); setBatchDraft({ ...batchDraft, quotaUnit: unit, tokenLimit: "", applyConsumedTokens: false }); }} />
+                  onChange={(unit) => { if (!batchDraft || unit === batchDraft.quotaUnit) return; setAmountAttempted(false); setBatchDraft({...batchDraft, quotaUnit:unit, applyConsumedTokens:false,
+                    unitDrafts:{...batchDraft.unitDrafts,[batchDraft.quotaUnit]:{tokenLimit:batchDraft.tokenLimit,consumedTokens:batchDraft.consumedTokens,usageAction:batchDraft.usageAction}},
+                    ...(batchDraft.unitDrafts?.[unit] ?? {tokenLimit:"",consumedTokens:"",usageAction:"unchanged"}),
+                    calibrationDrafts:{...batchDraft.calibrationDrafts,[batchDraft.quotaUnit]:batchDraft.calibrations ?? {}},calibrations:batchDraft.calibrationDrafts?.[unit] ?? {}}); }} />
                 {batchDraft?.applyTokenLimit ? <ValueQuotaReadiness state={readiness} t={t} id={`${fieldId}-batch-readiness`} /> : null}
                 <QuotaLimitField id={`${fieldId}-batch-limit`} labelHidden t={t} disabled={!batchDraft?.applyTokenLimit} unit={batchDraft?.quotaUnit || "tokens"}
                   value={batchDraft?.tokenLimit || ""} error={batchDraft?.applyTokenLimit ? limitError(batchDraft.quotaUnit, batchDraft.tokenLimit) : undefined}
                   onChange={(tokenLimit) => batchDraft && setBatchDraft({ ...batchDraft, tokenLimit })} />
                 {batchDraft?.applyTokenLimit && batchDraft.quotaUnit === "usdEquivalent" ? <ValueResourceToggle t={t} value={batchDraft.resourceMetering} onChange={resourceMetering=>setBatchDraft({...batchDraft,resourceMetering})} /> : null}
-                {batchDraft?.applyTokenLimit && batchDraft.quotaUnit === "usdEquivalent" ? <ValuePreviewLine state={batchPreview} t={t} /> : null}
+                {batchUsdPolicies ? <ValuePreviewLine state={batchPreview} t={t} calibrations={batchDraft?.calibrations} /> : null}
+                {batchDraft && batchPreview.preview?.rows.filter(row=>row.calibrationRequired).map(row=><div key={row.email} className="grid gap-2">
+                  <label className="text-xs">{row.email} · {t("dashboard.userLimit.value.conversionCalibrationRequired")}
+                    <Input inputMode="decimal" aria-label={`${row.email} ${t("dashboard.userLimit.value.conversionCalibrationRequired")}`} value={batchDraft.calibrations?.[row.email]?.amount ?? ""}
+                      onChange={event=>setBatchDraft({...batchDraft,calibrations:{...batchDraft.calibrations,[row.email]:{amount:event.target.value,reason:batchDraft.calibrations?.[row.email]?.reason ?? ""}}})} />
+                  </label>
+                  <Input maxLength={1000} aria-label={`${row.email} ${t("dashboard.userLimit.value.reason")}`} placeholder={t("dashboard.userLimit.value.reason")} value={batchDraft.calibrations?.[row.email]?.reason ?? ""}
+                    onChange={event=>setBatchDraft({...batchDraft,calibrations:{...batchDraft.calibrations,[row.email]:{amount:batchDraft.calibrations?.[row.email]?.amount ?? "",reason:event.target.value}}})} />
+                </div>)}
               </div>
               <div className="grid gap-1.5">
                 <span className="mono-label text-muted-foreground">

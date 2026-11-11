@@ -398,7 +398,12 @@ export type ShareUserUsageEdit = {
 
 export type ShareUserUsageEditMap = Record<string, ShareUserUsageEdit>;
 
+export type ShareUserQuotaConversion = { credential: string; targetUsedPicos?: string; targetUsedTokens?: number; reason?: string };
 export type ShareUserGrant = {
+  quotaConversionId?: string;
+  /** Local draft only; the save builder emits an explicit conversion input. */
+  quotaUnitConversion?: ShareUserQuotaConversion;
+  quotaUnitConversionPolicy?: string;
   valueMetering?: { quotaPolicyEpoch: string; valueMeteredFromMs: number; effectiveFromMs: number; pricingRevision: string };
   pendingValueQuota?: { policy: ShareUserPolicy; effectiveFromMs: number; retainAccess: boolean };
   accountQuotaCycle?: AccountQuotaCycle;
@@ -528,6 +533,7 @@ export type ShareSettingsPatch = {
   userGrants?: ShareUserGrantMap;
   userUsageEdits?: ShareUserUsageEditMap;
   userValueUsageInitializations?: ShareUserValueUsageInitializationMap;
+  userQuotaConversions?: Record<string, ShareUserQuotaConversion>;
   userGrantEdits?: Record<string, { expectedRevision: number; policy: ShareUserPolicy | null }>;
   managedGrant?: {
     operationId: string;

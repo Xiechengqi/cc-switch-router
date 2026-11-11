@@ -1002,6 +1002,134 @@ fn apply_value_operation(
     }
 }
 
+pub(super) fn apply_conversion_result(
+    tx: &Connection,
+    edit: &crate::models::ShareEditView,
+    result: &crate::ctl_client::QuotaConversionResult,
+) -> Result<(), AppError> {
+    let Some(conversions) = &edit.patch.user_quota_conversions else {
+        if !result.quota_conversions.is_empty() {
+            return Err(AppError::Conflict(
+                "unexpected quota conversion receipt".into(),
+            ));
+        }
+        return Ok(());
+    };
+    let actual = result
+        .quota_conversions
+        .iter()
+        .filter_map(|r| r["email"].as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    if actual.len() != conversions.len()
+        || actual.len() != result.quota_conversions.len()
+        || conversions.keys().any(|e| !actual.contains(e.as_str()))
+    {
+        return Err(AppError::Conflict(
+            "incomplete quota conversion receipt batch".into(),
+        ));
+    }
+    for receipt in &result.quota_conversions {
+        let email = receipt["email"]
+            .as_str()
+            .ok_or_else(|| AppError::BadRequest("invalid conversion receipt".into()))?;
+        if receipt["operationId"].as_str() != Some(&edit.id)
+            || !conversions.contains_key(email)
+            || receipt["committed"] != true
+        {
+            return Err(AppError::Conflict(
+                "quota conversion receipt does not match edit".into(),
+            ));
+        }
+        let policy = edit
+            .patch
+            .user_grant_edits
+            .as_ref()
+            .and_then(|edits| edits.get(email))
+            .and_then(|edit| edit.policy.as_ref())
+            .or_else(|| {
+                edit.patch
+                    .user_grants
+                    .as_ref()
+                    .and_then(|grants| grants.get(email))
+                    .map(|grant| &grant.policy)
+            })
+            .ok_or_else(|| {
+                AppError::Conflict("conversion receipt has no matching policy edit".into())
+            })?;
+        let expected_unit = if policy.value_quota.is_some() {
+            "usdEquivalent"
+        } else {
+            "tokens"
+        };
+        if receipt["targetUnit"].as_str() != Some(expected_unit) {
+            return Err(AppError::Conflict(
+                "conversion receipt target does not match edit".into(),
+            ));
+        }
+        let previous: Option<String> = tx.query_row("SELECT payload_json FROM share_quota_conversion_receipts WHERE installation_id=?1 AND share_id=?2 AND operation_id=?3 AND email=?4",
+            params![edit.installation_id,edit.share_id,edit.id,email],|r|r.get(0)).optional().map_err(db_error)?;
+        if previous.as_ref().is_some_and(|old| {
+            serde_json::from_str::<serde_json::Value>(old).ok().as_ref() != Some(receipt)
+        }) {
+            return Err(AppError::Conflict(
+                "conversion receipt changed after commit".into(),
+            ));
+        }
+        tx.execute(
+            "INSERT INTO share_quota_conversion_receipts VALUES(?1,?2,?3,?4,?5,?6)
+            ON CONFLICT(installation_id,share_id,operation_id,email) DO NOTHING",
+            params![
+                edit.installation_id,
+                edit.share_id,
+                edit.id,
+                email,
+                receipt.to_string(),
+                Utc::now().timestamp_millis()
+            ],
+        )
+        .map_err(db_error)?;
+    }
+    for row in &result.value_quota_statuses {
+        if row["policyEpoch"].is_null() {
+            continue;
+        }
+        let mut row = row.clone();
+        if let Some(object) = row.as_object_mut() {
+            object.remove("reasonCode");
+            object.remove("pendingValueQuota");
+        }
+        let status: ValueQuotaStatus = serde_json::from_value(row).map_err(bad_payload)?;
+        if !conversions.contains_key(&status.email) {
+            continue;
+        }
+        // A delayed receipt can arrive after another policy/window has won.
+        // Keep the durable receipt; only project a status matching current terms.
+        let grants: Option<String> = tx
+            .query_row(
+                "SELECT user_grants_json FROM shares WHERE share_id=?1 AND installation_id=?2",
+                params![edit.share_id, edit.installation_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        let grants = parse_share_user_grants(grants).map_err(db_error)?;
+        if grants
+            .get(&status.email)
+            .is_some_and(|g| current_projection(g, &status, Utc::now()).is_ok())
+        {
+            apply_watermark(
+                tx,
+                &edit.installation_id,
+                WatermarkPayload {
+                    share_id: edit.share_id.clone(),
+                    status,
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn apply_watermark(
     tx: &Connection,
     installation_id: &str,
@@ -1341,5 +1469,83 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn conversion_receipt_batches_are_complete_atomic_and_immutable() {
+        use crate::ctl_client::QuotaConversionResult;
+        let mut db = Connection::open_in_memory().unwrap();
+        db.execute_batch(include_str!("../../schema/0112_quota_unit_conversions.sql"))
+            .unwrap();
+        let patch:crate::models::ShareSettingsPatch=serde_json::from_value(serde_json::json!({
+            "userQuotaConversions":{"a@example.test":{"credential":"signed-a"},"z@example.test":{"credential":"signed-z"}},
+            "userGrantEdits":{"a@example.test":{"expectedRevision":0,"policy":{"tokenLimit":100}},"z@example.test":{"expectedRevision":0,"policy":{"tokenLimit":100}}}
+        })).unwrap();
+        let edit = ShareEditView {
+            id: "operation".into(),
+            share_id: "share".into(),
+            installation_id: "installation".into(),
+            revision: 1,
+            status: "pending".into(),
+            patch,
+            created_by_email: "owner@example.test".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            applied_at: None,
+            error_message: None,
+        };
+        let receipt = |email: &str| serde_json::json!({"email":email,"operationId":"operation","targetUnit":"tokens","committed":true});
+        let valid = QuotaConversionResult {
+            quota_conversions: vec![receipt("a@example.test"), receipt("z@example.test")],
+            value_quota_statuses: vec![],
+        };
+        for rows in [
+            vec![receipt("a@example.test")],
+            vec![receipt("a@example.test"), receipt("a@example.test")],
+            vec![
+                receipt("a@example.test"),
+                serde_json::json!({"email":"z@example.test","operationId":"other","committed":true}),
+            ],
+        ] {
+            let tx = db.transaction().unwrap();
+            assert!(
+                apply_conversion_result(
+                    &tx,
+                    &edit,
+                    &QuotaConversionResult {
+                        quota_conversions: rows,
+                        value_quota_statuses: vec![]
+                    }
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM share_quota_conversion_receipts",
+                [],
+                |r| r.get::<_, u64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        let tx = db.transaction().unwrap();
+        apply_conversion_result(&tx, &edit, &valid).unwrap();
+        tx.commit().unwrap();
+        let tx = db.transaction().unwrap();
+        apply_conversion_result(&tx, &edit, &valid).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM share_quota_conversion_receipts",
+                [],
+                |r| r.get::<_, u64>(0)
+            )
+            .unwrap(),
+            2
+        );
+        let mut changed = valid;
+        changed.quota_conversions[0]["windowId"] = serde_json::json!("changed");
+        let tx = db.transaction().unwrap();
+        assert!(apply_conversion_result(&tx, &edit, &changed).is_err());
     }
 }

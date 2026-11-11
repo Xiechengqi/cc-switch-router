@@ -1,3 +1,4 @@
+import { quotaConversionInput, quotaConversionNeeded, calibratedConversionRow, type ValuePreviewRow } from "./share-value-quota";
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
@@ -338,12 +339,12 @@ test("a grantee's USD grant without a status row reads as unsynced, never 0 / un
   assert.deepEqual(valueQuotaView(undefined, grant.email, minimal, true), {scheduled: {limitMicros: "2000000", effectiveFromMs: 77}});
   assert.equal(valueQuotaView({...grant, policy: {tokenPeriod: "day", tokenLimit: 5}}, grant.email, [], true), undefined);
 });
-test("staging a different policy drops the schedule; re-applying the schedule keeps it", () => {
+test("an explicit policy application replaces a legacy schedule", () => {
   const pending = {policy: grant.policy, effectiveFromMs: 5000, retainAccess: true};
   const scheduled = {...grant, policy: {tokenPeriod: "day" as const, tokenLimit: 100}, pendingValueQuota: pending};
   const kept = stageUserPolicy(scheduled, {...grant.policy});
-  assert.equal(kept.pendingValueQuota, pending);
-  assert.equal(kept.policy.tokenLimit, 100);
+  assert.equal(kept.pendingValueQuota, undefined);
+  assert.deepEqual(kept.policy, grant.policy);
   const tokens = stageUserPolicy(scheduled, {tokenPeriod: "day", tokenLimit: 300});
   assert.equal(tokens.pendingValueQuota, undefined);
   assert.equal(tokens.policy.tokenLimit, 300);
@@ -386,4 +387,20 @@ test("status reasons and invalid preview rows are surfaced", () => {
   assert.deepEqual(valuePreviewBlocker(preview), {email: "a@example.test", message: {key: "dashboard.userLimit.value.reason.invalid_policy"}});
   assert.equal(formatQuotaTime(Number.NaN, "en"), "—");
   assert.equal(formatQuotaTime(Date.UTC(2026, 0, 2), "zh-CN"), new Date(Date.UTC(2026, 0, 2)).toLocaleString("zh-CN"));
+});
+
+
+test("unit conversion keeps a current credential and previews calibrated batch balances exactly", () => {
+  const usd:ValuePreviewRow={email:"a@example.test",effectiveFromMs:1,meteredFromMs:0,conversionRequired:true,conversionCredential:"signed",credentialExpiresAtMs:Date.now()+60_000,ready:true,calibrationRequired:true,targetUnit:"usdEquivalent",usedPicos:"42000000000000",pendingRiskPicos:"2000000000000",limitUsdMicros:"100000000",coverage:{complete:true,missingFacts:0,evidenceTokens:30_000_000,evidenceRequests:1,status:{meteringStatus:"observed",observedPicos:"42000000000000"}}};
+  const calibration={amount:"50.000000000001",reason:"Reviewed"};
+  assert.deepEqual(quotaConversionInput(usd,calibration),{credential:"signed",targetUsedPicos:"50000000000001",reason:"Reviewed"});
+  assert.equal(calibratedConversionRow(usd,calibration).remainingPicos,"47999999999999");
+  for(const bad of [{amount:"41",reason:"Reviewed"},{amount:"50",reason:""},{amount:"50",reason:"中".repeat(334)}]) assert.throws(()=>quotaConversionInput(usd,bad));
+  assert.throws(()=>quotaConversionInput({...usd,credentialExpiresAtMs:0},calibration));
+  const token={...usd,targetUnit:"tokens" as const,observedTokens:30_000_000,tokenLimit:100_000_000,pendingTokens:5_000_000};
+  assert.equal(quotaConversionInput(token,{amount:"40.000001",reason:"Reviewed"})?.targetUsedTokens,40_000_001);
+  assert.equal(calibratedConversionRow(token,{amount:"40.000001",reason:"Reviewed"}).remainingTokens,54_999_999);
+  assert.throws(()=>quotaConversionInput(token,{amount:"29",reason:"Reviewed"}));
+  assert.equal(quotaConversionNeeded({policy:{tokenPeriod:"day",valueQuota:{limitUsdMicros:"100000000",tariffPolicyId:"api-equivalent-v1"}}},{tokenPeriod:"day",tokenLimit:100_000_000}),true);
+  assert.equal(quotaConversionNeeded({policy:{tokenPeriod:"day",tokenLimit:100}},{tokenPeriod:"day",tokenLimit:200}),false);
 });

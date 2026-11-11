@@ -27,6 +27,10 @@ pub fn router() -> Router<ServerState> {
         .route("/v1/shares/:share_id/value-quota-status", get(status))
         .route("/v1/me/share-value-quotas", get(mine))
         .route("/v1/shares/:share_id/value-quota-preview", post(preview))
+        .route(
+            "/v1/shares/:share_id/quota-history-prepare",
+            post(prepare_history),
+        )
         .route("/v1/shares/:share_id/value-usage-edits", post(edit_usage))
         .route(
             "/v1/shares/:share_id/market-value-quota-readiness",
@@ -205,6 +209,45 @@ async fn health(
     crate::api::require_owner_session(&state, &headers).await?;
     Ok(Json(state.store.value_quota_health().await?))
 }
+async fn prepare_history(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(share_id): Path<String>,
+    Json(input): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_share_manager(&state, &headers, &share_id).await?;
+    let revision = input
+        .get("expectedConfigRevision")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| AppError::BadRequest("expectedConfigRevision is required".into()))?;
+    let emails: Vec<String> = serde_json::from_value(
+        input
+            .get("emails")
+            .cloned()
+            .ok_or_else(|| AppError::BadRequest("emails are required".into()))?,
+    )
+    .map_err(|e| AppError::BadRequest(e.to_string()))?;
+    if emails.is_empty() || emails.len() > 500 {
+        return Err(AppError::BadRequest("invalid users".into()));
+    }
+    let target = control_target(&state, &share_id).await?;
+    crate::ctl_client::prepare_quota_history(
+        &target.backend,
+        &target.installation,
+        &target.secret,
+        &share_id,
+        revision,
+        &emails,
+        input
+            .get("restart")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    )
+    .await
+    .map(Json)
+    .map_err(control_error)
+}
+
 async fn preview(
     State(state): State<ServerState>,
     headers: HeaderMap,

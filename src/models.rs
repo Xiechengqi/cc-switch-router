@@ -11,7 +11,7 @@ pub const MIN_SHARE_CONTRACT_VERSION: u16 = 2;
 /// v7 only add quota presentation metadata, so v5 market records remain valid
 /// during a rolling Server/Router deployment.
 pub const MIN_SHARE_MARKET_CONTRACT_VERSION: u16 = 5;
-pub const SHARE_CONTRACT_VERSION: u16 = 11;
+pub const SHARE_CONTRACT_VERSION: u16 = 12;
 pub const SHARE_TRIAL_CONTRACT_VERSION: u16 = 9;
 
 #[derive(Debug)]
@@ -1315,11 +1315,26 @@ pub struct ShareSettingsPatch {
     pub user_value_usage_initializations:
         Option<BTreeMap<String, ShareUserValueUsageInitialization>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_quota_conversions: Option<BTreeMap<String, ShareUserQuotaConversion>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_grant_edits: Option<BTreeMap<String, ShareUserGrantEdit>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edit_context: Option<ShareSettingsEditContext>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed_grant: Option<ShareManagedGrantOperation>,
+}
+
+/// Server-signed preview binds the target policy and window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShareUserQuotaConversion {
+    pub credential: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_used_picos: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_used_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1775,6 +1790,9 @@ pub struct ShareUserGrant {
     pub value_metering: Option<crate::share_value_pricing::ValueMeteringBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_value_quota: Option<PendingValueQuota>,
+    /// Last atomic quota conversion; requires Share contract v12.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_conversion_id: Option<String>,
     #[serde(default)]
     pub usage: ShareUserUsage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1859,6 +1877,10 @@ pub struct ShareSettingsUpdateResponse {
     /// the online client. False means it was queued (client offline / control
     /// channel unavailable) and will apply on the next client sync.
     pub applied_synchronously: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub quota_conversions: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub value_quota_statuses: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1887,6 +1909,10 @@ pub struct SharePendingEditsResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareEditAckPayload {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quota_conversions: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub value_quota_statuses: Vec<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub termination_receipt: Option<crate::share_market_termination_contract::TerminationReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

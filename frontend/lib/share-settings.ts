@@ -213,15 +213,14 @@ function grantPolicyFingerprint(grant: ShareUserGrant) {
 
 /**
  * Stage an edited policy on a grant that may carry a scheduled USD policy.
- * Re-applying exactly the scheduled policy keeps the schedule and leaves
- * `current` in force. Any other policy replaces the schedule — Server
- * recomputes one on save if it is still needed — while the metering binding
- * stays, so usage is never reset.
+ * Applying a policy is explicit immediate intent. Its signed conversion is
+ * staged separately; ordinary unchanged saves retain the existing schedule.
+ * The Server-owned metering binding and consumption survive the edit.
  */
 export function stageUserPolicy(grant: ShareUserGrant, policy: ShareUserPolicy, current: ShareUserPolicy = grant.policy): ShareUserGrant {
-  const pending = grant.pendingValueQuota;
-  if (pending?.policy && sharePolicyFingerprint(pending.policy) === sharePolicyFingerprint(policy)) return { ...grant, policy: current };
-  return { ...grant, policy, pendingValueQuota: undefined };
+  return { ...grant, policy, pendingValueQuota: undefined,
+    quotaUnitConversion: grant.quotaUnitConversionPolicy === sharePolicyFingerprint(policy) ? grant.quotaUnitConversion : undefined,
+  };
 }
 
 export function changedUserGrants(next: ShareUserGrantMap, baseline: ShareUserGrantMap): NonNullable<ShareSettingsPatch["userGrantEdits"]> {
@@ -253,6 +252,13 @@ export function changedShareSettings(next: ShareSettingsPatch, baseline: ShareSe
   // If a concurrent save made this user historical, forward the intent so the
   // Server rejects it explicitly instead of silently losing an opening amount.
   if (Object.keys(activeInitializations).length) patch.userValueUsageInitializations = activeInitializations;
+  const conversions = Object.fromEntries(Object.entries(next.userGrants ?? {}).flatMap(([email, grant]) => {
+    if (!grant.active || !grant.quotaUnitConversion) return [];
+    if (grant.quotaUnitConversionPolicy !== sharePolicyFingerprint(grant.policy)) throw new Error("quota_conversion_preview_stale");
+    delete activeUsageEdits[email];
+    return [[email, grant.quotaUnitConversion]];
+  }));
+  if (Object.keys(conversions).length) patch.userQuotaConversions = conversions;
   if (Object.values(userGrantEdits).some((edit) => edit.policy?.tokenPeriod === "accountReset") ||
       Object.values(activeUsageEdits).some((edit) => edit.expectedAccountCycle)) {
     patch.expectedAccountCycle = Object.values(next.userGrants ?? {}).find((grant) => grant.active !== false && grant.policy.tokenPeriod === "accountReset")?.accountQuotaCycle;

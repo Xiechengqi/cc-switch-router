@@ -50,6 +50,16 @@ struct ApplyShareSettingsReply {
     share: Option<ShareDescriptor>,
     #[serde(default)]
     settings_receipt: Option<crate::models::ShareSettingsReceipt>,
+    #[serde(flatten)]
+    quota_result: QuotaConversionResult,
+}
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaConversionResult {
+    #[serde(default)]
+    pub quota_conversions: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub value_quota_statuses: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -384,6 +394,19 @@ pub async fn preview_value_quota(
     post_control(backend,installation_id,control_secret,"/_ctl/preview_value_quota",
         serde_json::json!({"shareId":share_id,"expectedConfigRevision":expected_config_revision,"policies":policies}).to_string()).await
 }
+pub async fn prepare_quota_history(
+    backend: &str,
+    installation_id: &str,
+    control_secret: &str,
+    share_id: &str,
+    expected_config_revision: u64,
+    emails: &[String],
+    restart: bool,
+) -> Result<serde_json::Value, CtlError> {
+    post_control(backend,installation_id,control_secret,"/_ctl/prepare_quota_history",
+        serde_json::json!({"shareId":share_id,"expectedConfigRevision":expected_config_revision,"emails":emails,"restart":restart}).to_string()).await
+}
+
 pub async fn edit_value_usage(
     backend: &str,
     installation_id: &str,
@@ -508,7 +531,14 @@ pub async fn apply_share_settings(
     control_secret: &str,
     share_id: &str,
     patch: &ShareSettingsPatch,
-) -> Result<(ShareDescriptor, Option<crate::models::ShareSettingsReceipt>), CtlError> {
+) -> Result<
+    (
+        ShareDescriptor,
+        Option<crate::models::ShareSettingsReceipt>,
+        QuotaConversionResult,
+    ),
+    CtlError,
+> {
     let body = serde_json::to_string(&ApplyShareSettingsBody { share_id, patch })
         .map_err(|e| CtlError::Malformed(format!("serialize control body failed: {e}")))?;
     let reply: ApplyShareSettingsReply = post_control(
@@ -525,7 +555,7 @@ pub async fn apply_share_settings(
     let share = reply
         .share
         .ok_or_else(|| CtlError::Malformed("client reply missing share".into()))?;
-    Ok((share, reply.settings_receipt))
+    Ok((share, reply.settings_receipt, reply.quota_result))
 }
 
 pub async fn refresh_share_usage(

@@ -337,7 +337,7 @@ export async function updateShareSettings(
   patch: ShareSettingsPatch,
   baseConfigRevision?: number,
 ) {
-  return parseJson<{ ok: boolean; edit: ShareEditView; appliedSynchronously: boolean }>(
+  return parseJson<{ ok: boolean; edit: ShareEditView; appliedSynchronously: boolean; quotaConversions?: unknown[]; valueQuotaStatuses?: import("./share-value-quota").ValueQuotaStatus[] }>(
     await authFetch(`/v1/shares/${encodeURIComponent(shareId)}/settings`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },

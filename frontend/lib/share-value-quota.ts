@@ -122,13 +122,17 @@ export function normalizeValueStatuses(items: unknown): ValueQuotaStatus[] {
 }
 
 export const VALUE_PREVIEW_REASON_CODES = ["ready", "scheduled_next_window", "metered_from_now", "unverified_surface",
-  "pricing_unavailable", "storage_unavailable", "router_upgrade_required", "blocked_needs_reconcile", "invalid_policy", "resource_upgrade_required"] as const;
+  "pricing_unavailable", "storage_unavailable", "router_upgrade_required", "blocked_needs_reconcile", "invalid_policy", "resource_upgrade_required", "history_incomplete", "history_preparing", "pending_evidence_missing", "conversion_upgrade_required"] as const;
 export type ValuePreviewReasonCode = typeof VALUE_PREVIEW_REASON_CODES[number];
 const BLOCKING_REASONS: ReadonlySet<string> = new Set(VALUE_PREVIEW_REASON_CODES.slice(3));
 export function knownReasonCode(code: unknown): ValuePreviewReasonCode | undefined {
   return VALUE_PREVIEW_REASON_CODES.find(known => known === code);
 }
-export type ValuePreviewRow = {email: string; usedPicos?: string | null; effectiveFromMs: number; meteredFromMs: number;
+export type ValuePreviewRow = {
+  conversionRequired?: boolean; conversionCredential?: string; credentialExpiresAtMs?: number; calibrationRequired?: boolean;
+  sourceUnit?: "tokens" | "usdEquivalent"; targetUnit?: "tokens" | "usdEquivalent";
+  tokenLimit?: number | null; limitUsdMicros?: string | null; observedTokens?: number; effectiveTokens?: number; pendingTokens?: number; remainingTokens?: number | null; pendingRiskPicos?: string; remainingPicos?: string | null;
+  coverage?: { status?: {meteringStatus: string; observedPicos: string}; complete: boolean; missingFacts: number; evidenceTokens: number; evidenceRequests: number; pricingBasis?: string; preparationState?: string; processed?: number };email: string; usedPicos?: string | null; effectiveFromMs: number; meteredFromMs: number;
   windowId?: string; canInitializeUsage?: boolean;
   reason?: string | null; reasonCode?: string | null; ready?: boolean | null};
 /** A requested policy the Server rejected outright (bad amount, period, user…). */
@@ -363,6 +367,12 @@ export function valueMeteringState(status: ValueQuotaStatus): ValueMeteringStatu
   const states = ["observed", "conservative", "pending", "blocked", "unavailable", "scheduled"] as const;
   return states.find(state => state === status.meteringStatus) ?? "unavailable";
 }
+export async function prepareQuotaHistory(shareId: string, expectedConfigRevision: number, emails: string[], signal?: AbortSignal) {
+  return parseJson<{items: {email: string; preparation: {state: "preparing" | "complete"; processed: number}}[]}>(await authFetch(`/v1/shares/${encodeURIComponent(shareId)}/quota-history-prepare`, {
+    method: "POST", headers: {"content-type": "application/json"}, signal,
+    body: JSON.stringify({expectedConfigRevision, emails}),
+  }));
+}
 export async function previewValueQuota(shareId: string, expectedConfigRevision: number, policies: Record<string, ShareUserPolicy> = {}, signal?: AbortSignal) {
   const result = await parseJson<ValueQuotaPreview>(await authFetch(`/v1/shares/${encodeURIComponent(shareId)}/value-quota-preview`, {
     method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify({expectedConfigRevision,policies}),
@@ -481,4 +491,50 @@ export function parseInitialValueUsage(preview: ValueQuotaPreview, email: string
     || ["scheduled", "blocked"].includes(valuePreviewRowOutcome(row))
     || (amount !== "0" && (!reason.trim() || new TextEncoder().encode(reason).length > 1000))) return {ok: false};
   return {ok: true, ...(amount !== "0" ? {initialization: {targetPicos: amount, windowId: row.windowId, reason: reason.trim()}} : {})};
+}
+
+/** Structural unit/window changes require the signed, current-window preview. */
+export function quotaConversionNeeded(previous: {policy: import("./types").ShareUserPolicy} | undefined,
+  policy: import("./types").ShareUserPolicy) {
+  return !!previous?.policy.valueQuota !== !!policy.valueQuota || (!!policy.valueQuota && !!previous
+    && ((previous.policy.tokenPeriod || "lifetime") !== (policy.tokenPeriod || "lifetime")
+      || (previous.policy.tokenPeriodAnchorAtMs ?? null) !== (policy.tokenPeriodAnchorAtMs ?? null)));
+}
+export function quotaConversionInput(row: ValuePreviewRow, calibration?: {amount: string; reason: string}) {
+  if (!row.conversionRequired) return undefined;
+  if (!row.conversionCredential || row.ready === false || (row.credentialExpiresAtMs ?? 0) <= Date.now()) throw new Error("quota_conversion_preview_stale");
+  const input: import("./types").ShareUserQuotaConversion = {credential: row.conversionCredential};
+  if (row.calibrationRequired) {
+    if (!calibration?.amount.trim() || !calibration.reason.trim() || new TextEncoder().encode(calibration.reason.trim()).length > 1000) throw new Error("quota_conversion_calibration_required");
+    if (row.targetUnit === "usdEquivalent") {
+      const amount = usdUsageToPicos(calibration.amount);
+      if (amount == null || BigInt(amount) < BigInt(row.coverage?.status?.observedPicos ?? "0")) throw new Error("quota_conversion_calibration_invalid");
+      input.targetUsedPicos = amount;
+    } else {
+      const raw = calibration.amount.trim();
+      if (!/^\d+(?:\.\d{1,6})?$/.test(raw)) throw new Error("quota_conversion_calibration_invalid");
+      const [whole, fraction = ""] = raw.split(".");
+      const amount = BigInt(whole) * 1_000_000n + BigInt(fraction.padEnd(6, "0"));
+      if (amount > BigInt(Number.MAX_SAFE_INTEGER) || amount < BigInt(row.observedTokens ?? 0)) throw new Error("quota_conversion_calibration_invalid");
+      input.targetUsedTokens = Number(amount);
+    }
+    input.reason = calibration.reason.trim();
+  }
+  return input;
+}
+
+/** Preview a valid local calibration; pending usage remains independently reserved. */
+export function calibratedConversionRow(row: ValuePreviewRow, calibration?: {amount: string; reason: string}): ValuePreviewRow {
+  if (!row.calibrationRequired || !calibration) return row;
+  try {
+    const input = quotaConversionInput(row, calibration);
+    if (input?.targetUsedPicos != null) {
+      const used = BigInt(input.targetUsedPicos), pending = BigInt(row.pendingRiskPicos ?? "0");
+      const remaining = row.limitUsdMicros == null ? null : BigInt(row.limitUsdMicros) * 1_000_000n - used - pending;
+      return {...row, usedPicos: used.toString(), remainingPicos: remaining == null ? null : (remaining < 0n ? 0n : remaining).toString()};
+    }
+    if (input?.targetUsedTokens != null) return {...row, effectiveTokens: input.targetUsedTokens,
+      remainingTokens: row.tokenLimit == null ? null : Math.max(0, row.tokenLimit-input.targetUsedTokens-(row.pendingTokens ?? 0))};
+  } catch { /* Invalid drafts keep the authoritative preview until corrected. */ }
+  return row;
 }

@@ -13061,6 +13061,7 @@ fn apply_control_grant_effect(
                         })
                         .and_then(|grant| grant.value_metering.clone()),
                     pending_value_quota: None,
+                    quota_conversion_id: None,
                     usage: previous
                         .as_ref()
                         .map(|grant| grant.usage.clone())
@@ -13418,7 +13419,7 @@ async fn try_apply_dispatched_edit_via_ctl(
     )
     .await
     {
-        Ok((returned_share, receipt)) => {
+        Ok((returned_share, receipt, _quota_result)) => {
             state
                 .store
                 .apply_share_edit_with_receipt(&edit.id, returned_share, receipt)
@@ -13806,6 +13807,7 @@ mod tests {
         let grant = ShareUserGrant {
             value_metering: None,
             pending_value_quota: None,
+            quota_conversion_id: None,
             account_quota_cycle: None,
             account_reset_capability: None,
             account_usage_baseline: None,
@@ -22229,6 +22231,7 @@ mod tests {
                         ShareUserGrant {
                             value_metering: None,
                             pending_value_quota: None,
+                            quota_conversion_id: None,
                             account_quota_cycle: None,
                             account_reset_capability: None,
                             account_usage_baseline: None,

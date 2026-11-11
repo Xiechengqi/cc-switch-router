@@ -385,6 +385,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         111,
         include_str!("../schema/0111_universal_value_resources.sql"),
     ),
+    (
+        112,
+        include_str!("../schema/0112_quota_unit_conversions.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -896,7 +900,7 @@ mod tests {
 
     // Includes live-health evidence (0109), ordered route candidates (0110),
     // and resource tariffs/capabilities (0111).
-    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 283;
+    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 284;
 
     #[test]
     fn migration_109_adds_live_health_without_inventing_evidence_or_rewriting_cycles_and_money() {

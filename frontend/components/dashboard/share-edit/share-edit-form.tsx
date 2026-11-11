@@ -12,6 +12,7 @@ import {
 import { resolveShareCoreApp, shareProviderSupportedApps } from "@/lib/share-app";
 import type { ShareView } from "@/lib/types";
 import { getShareSettingsEdit, updateShareSettings } from "@/lib/api";
+import { publishValueQuotaStatuses } from "@/lib/use-share-value-quota";
 import { millionsInputToTokens, tokensToMillionsInput } from "@/lib/token-units";
 import { formatDateTime } from "@/lib/utils";
 import {
@@ -314,6 +315,7 @@ export function useShareEditForm({
           baseShare?.configRevision,
         );
         if (session !== sessionRef.current) return;
+        if (res.valueQuotaStatuses) publishValueQuotaStatuses(liveShare.shareId, res.valueQuotaStatuses);
         await onSaved({ appliedSynchronously: res.appliedSynchronously });
         if (session !== sessionRef.current) return;
         if (res.appliedSynchronously) {

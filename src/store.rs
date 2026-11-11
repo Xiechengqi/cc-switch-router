@@ -3654,6 +3654,7 @@ impl AppStore {
                 "valuePricingKnownRevisionV1".into(),
                 "valuePricingActivationV1".into(),
                 "resourceValueQuotaV2".into(),
+                "quotaUnitConversionV1".into(),
                 "shareTerminationV1".into(),
                 "providerIdentityV1".into(),
                 "buddyQuotaPresentationV1".into(),
@@ -11678,10 +11679,9 @@ impl AppStore {
             operation_id: id.clone(),
             expected_config_revision: base_config_revision
                 .unwrap_or(current_config_revision.max(0) as u64),
-            actor: patch
-                .user_value_usage_initializations
-                .as_ref()
-                .map(|_| current_user_email.clone()),
+            actor: (patch.user_value_usage_initializations.is_some()
+                || patch.user_quota_conversions.is_some())
+            .then(|| current_user_email.clone()),
         });
         let patch_json = serde_json::to_string(&patch).map_err(|e| {
             AppError::Internal(format!("serialize share settings patch failed: {e}"))
@@ -11709,21 +11709,60 @@ impl AppStore {
             ok: true,
             edit,
             applied_synchronously: false,
+            quota_conversions: Vec::new(),
+            value_quota_statuses: Vec::new(),
         })
     }
 
-    /// Applies a share-settings edit using the descriptor the client returned
-    /// from its `/_ctl/apply_share_settings` call. The client remains
-    /// authoritative — the server only writes what the client reported and
-    /// only after verifying that report actually satisfies every field the
-    /// pending edit requested. A report that drops a requested field (e.g. an
-    /// owner transfer that forgot to demote the old owner into `shareto`) is
-    /// rejected, the edit is marked `rejected`, and `shares` is left untouched.
+    /// Read the installation-bound receipt mirror after verifying the current
+    /// owner can access this exact Share and edit.
+    pub async fn share_quota_conversion_receipts_for_owner(
+        &self,
+        share_id: &str,
+        edit_id: &str,
+        email: &str,
+    ) -> Result<Vec<serde_json::Value>, AppError> {
+        let edit = self
+            .share_settings_edit_for_owner(share_id, edit_id, email)
+            .await?;
+        let conn = self.conn.lock().await;
+        let mut q=conn.prepare("SELECT payload_json FROM share_quota_conversion_receipts WHERE installation_id=?1 AND share_id=?2 AND operation_id=?3 ORDER BY email").map_err(|e|AppError::Internal(e.to_string()))?;
+        let rows = q
+            .query_map(params![edit.installation_id, share_id, edit_id], |r| {
+                r.get::<_, String>(0)
+            })
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        rows.map(|r| {
+            r.map_err(|e| AppError::Internal(e.to_string()))
+                .and_then(|j| {
+                    serde_json::from_str(&j).map_err(|e| AppError::Internal(e.to_string()))
+                })
+        })
+        .collect()
+    }
+
     pub async fn apply_share_edit_with_receipt(
+        &self,
+        edit_id: &str,
+        returned_share: ShareDescriptor,
+        receipt: Option<crate::models::ShareSettingsReceipt>,
+    ) -> Result<(), AppError> {
+        self.apply_share_edit_with_quota_result(
+            edit_id,
+            returned_share,
+            receipt,
+            &crate::ctl_client::QuotaConversionResult::default(),
+        )
+        .await
+    }
+    /// Apply only the authoritative descriptor that satisfies the pending
+    /// patch, and commit its conversion receipts and projections atomically.
+    pub async fn apply_share_edit_with_quota_result(
         &self,
         edit_id: &str,
         mut returned_share: ShareDescriptor,
         receipt: Option<crate::models::ShareSettingsReceipt>,
+        quota_result: &crate::ctl_client::QuotaConversionResult,
     ) -> Result<(), AppError> {
         let now = Utc::now();
         let conn = self.conn.lock().await;
@@ -11834,6 +11873,7 @@ impl AppStore {
             .and_then(normalize_email)?;
         normalize_self_reported_share_owner(&mut returned_share, &installation_owner)?;
         upsert_share_tx(&tx, &edit.installation_id, returned_share)?;
+        share_value_quotas::apply_conversion_result(&tx, &edit, quota_result)?;
         let changed = tx
             .execute(
                 "UPDATE share_edit_requests
@@ -12153,6 +12193,21 @@ impl AppStore {
                 normalize_self_reported_share_owner(&mut share, &normalize_email(owner)?)?;
                 upsert_share_tx(&tx, &edit.installation_id, share)?;
             }
+        }
+        if status == "applied" && edit.patch.user_quota_conversions.is_some() {
+            if input.ack.current_share.is_none() {
+                return Err(AppError::Conflict(
+                    "quota conversion ACK requires an authoritative Share".into(),
+                ));
+            }
+            share_value_quotas::apply_conversion_result(
+                &tx,
+                &edit,
+                &crate::ctl_client::QuotaConversionResult {
+                    quota_conversions: input.ack.quota_conversions.clone(),
+                    value_quota_statuses: input.ack.value_quota_statuses.clone(),
+                },
+            )?;
         }
         apply_revision_conflict_snapshot_tx(
             &tx,
@@ -15900,6 +15955,25 @@ fn normalize_share_descriptor_fields(share: &mut ShareDescriptor) -> Result<(), 
     share.token_limit = normalize_share_limit_value(share.token_limit);
     for grant in share.user_grants.values() {
         validate_share_user_policy(&grant.policy, Utc::now().timestamp_millis())?;
+        if let Some(operation) = &grant.quota_conversion_id {
+            if operation.is_empty()
+                || operation.len() > 128
+                || operation.trim() != operation
+                || operation.chars().any(char::is_control)
+                || grant.pending_value_quota.is_some()
+                || grant.manager == crate::models::ShareGrantManager::RouterShareMarket
+                || grant.value_metering.as_ref().is_none_or(|b| {
+                    b.quota_policy_epoch.is_empty()
+                        || b.pricing_revision.is_empty()
+                        || b.value_metered_from_ms < 0
+                        || b.effective_from_ms < b.value_metered_from_ms
+                })
+            {
+                return Err(AppError::BadRequest(
+                    "invalid quota conversion binding".into(),
+                ));
+            }
+        }
         if let Some(pending) = &grant.pending_value_quota {
             validate_share_user_policy(&pending.policy, Utc::now().timestamp_millis())?;
             if pending.policy.value_quota.is_none()
@@ -15957,8 +16031,21 @@ fn normalize_share_descriptor_fields(share: &mut ShareDescriptor) -> Result<(), 
     // Only grants that enforce or schedule a USD policy carry a metering
     // binding. Older Servers also bound Token grants (shadow metering); those
     // bindings are not authoritative and must not gate descriptor sync.
+    if share.contract_version < 12
+        && share
+            .user_grants
+            .values()
+            .any(|g| g.quota_conversion_id.is_some())
+    {
+        return Err(AppError::BadRequest(
+            "quota conversion requires Share contract v12".into(),
+        ));
+    }
     for grant in share.user_grants.values_mut() {
-        if grant.policy.value_quota.is_none() && grant.pending_value_quota.is_none() {
+        if grant.policy.value_quota.is_none()
+            && grant.pending_value_quota.is_none()
+            && (share.contract_version < 12 || grant.quota_conversion_id.is_none())
+        {
             grant.value_metering = None;
         }
     }
@@ -17868,10 +17955,14 @@ fn merge_account_quota_projections(
             // origin; legacy Token shadow bindings never did.
             if let Some(prior) = previous
                 .get(&grant.email)
-                .filter(|g| g.policy.value_quota.is_some() || g.pending_value_quota.is_some())
+                .filter(|g| g.value_metering.is_some())
             {
                 if prior.value_metering.as_ref().is_some_and(|previous| {
-                    previous.value_metered_from_ms != binding.value_metered_from_ms
+                    if share.contract_version >= 12 && grant.quota_conversion_id.is_some() {
+                        previous.value_metered_from_ms < binding.value_metered_from_ms
+                    } else {
+                        previous.value_metered_from_ms != binding.value_metered_from_ms
+                    }
                 }) && !share_value_quotas::is_new_market_metering_scope(
                     conn,
                     &share.share_id,
@@ -22805,6 +22896,7 @@ fn share_settings_patch_is_empty(patch: &ShareSettingsPatch) -> bool {
         && patch.user_grants.is_none()
         && patch.user_usage_edits.is_none()
         && patch.user_value_usage_initializations.is_none()
+        && patch.user_quota_conversions.is_none()
         && patch.user_grant_edits.is_none()
         && patch.managed_grant.is_none()
 }
@@ -22856,6 +22948,18 @@ fn validate_returned_share_against_patch(
                         && grant.manager != crate::models::ShareGrantManager::RouterShareMarket
                         && grant.revision >= edit.expected_revision => {}
                 _ => return Err("userGrantEdits"),
+            }
+        }
+    }
+    if let Some(conversions) = &patch.user_quota_conversions {
+        for email in conversions.keys() {
+            let grant = share.user_grants.get(email).ok_or("userQuotaConversions")?;
+            if share.contract_version < 12
+                || grant.pending_value_quota.is_some()
+                || grant.quota_conversion_id.as_deref()
+                    != patch.edit_context.as_ref().map(|c| c.operation_id.as_str())
+            {
+                return Err("userQuotaConversions");
             }
         }
     }
@@ -23183,6 +23287,36 @@ fn normalize_share_settings_patch(
             }
         }
     }
+    if let Some(conversions) = &patch.user_quota_conversions {
+        if conversions.is_empty() || conversions.len() > 500 {
+            return Err(AppError::BadRequest(
+                "invalid quota conversion batch".into(),
+            ));
+        }
+        for (email, input) in conversions {
+            if normalize_email(email)? != *email
+                || input.credential.is_empty()
+                || input.credential.len() > 32768
+                || input.reason.as_ref().is_some_and(|s| s.len() > 1000)
+                || patch
+                    .user_usage_edits
+                    .as_ref()
+                    .is_some_and(|edits| edits.contains_key(email))
+                || !(patch
+                    .user_grant_edits
+                    .as_ref()
+                    .is_some_and(|edits| edits.get(email).is_some_and(|e| e.policy.is_some()))
+                    || patch
+                        .user_grants
+                        .as_ref()
+                        .is_some_and(|grants| grants.get(email).is_some_and(|g| g.active)))
+            {
+                return Err(AppError::BadRequest(
+                    "invalid quota conversion input".into(),
+                ));
+            }
+        }
+    }
     if patch.owner_email.is_some() {
         return Err(AppError::Conflict(
             "share owner is managed by the installation owner".into(),
@@ -23300,6 +23434,7 @@ fn normalize_share_settings_patch(
         user_grants,
         user_usage_edits: patch.user_usage_edits,
         user_value_usage_initializations: patch.user_value_usage_initializations,
+        user_quota_conversions: patch.user_quota_conversions,
         user_grant_edits: patch.user_grant_edits,
         edit_context: None,
         managed_grant: None,
@@ -30172,6 +30307,8 @@ pub(crate) mod tests {
 
         let edit_ack = ShareEditAckEnvelope {
             ack: ShareEditAckPayload {
+                quota_conversions: Vec::new(),
+                value_quota_statuses: Vec::new(),
                 termination_receipt: None,
                 settings_receipt: None,
                 edit_id: "edit-42".to_string(),
@@ -35546,6 +35683,38 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn converted_token_binding_requires_v12_and_valid_server_marker() {
+        let mut descriptor = test_share_descriptor("converted", "converted-sub");
+        let grant:ShareUserGrant=serde_json::from_value(serde_json::json!({"email":"a@example.test","active":true,"quotaConversionId":"operation","policy":{"tokenLimit":100000000,"tokenPeriod":"lifetime"},"valueMetering":{"quotaPolicyEpoch":"epoch","valueMeteredFromMs":0,"effectiveFromMs":1,"pricingRevision":"frozen"}})).unwrap();
+        descriptor.user_grants.insert(grant.email.clone(), grant);
+        descriptor.contract_version = 12;
+        normalize_share_descriptor_fields(&mut descriptor).unwrap();
+        assert!(
+            descriptor.user_grants["a@example.test"]
+                .value_metering
+                .is_some()
+        );
+        let mut old = descriptor.clone();
+        old.contract_version = 11;
+        assert!(normalize_share_descriptor_fields(&mut old).is_err());
+        for invalid in ["", " ", "has\ncontrol"] {
+            let mut bad = descriptor.clone();
+            bad.user_grants
+                .get_mut("a@example.test")
+                .unwrap()
+                .quota_conversion_id = Some(invalid.into());
+            assert!(normalize_share_descriptor_fields(&mut bad).is_err());
+        }
+        let mut unbound = descriptor;
+        unbound
+            .user_grants
+            .get_mut("a@example.test")
+            .unwrap()
+            .value_metering = None;
+        assert!(normalize_share_descriptor_fields(&mut unbound).is_err());
+    }
+
     #[tokio::test]
     async fn grok_media_policy_defaults_closed_and_round_trips_all_permissions() {
         let (store, config) = setup_store("grok-media-policy-round-trip").await;
@@ -35592,6 +35761,7 @@ pub(crate) mod tests {
 
     fn test_share_user_grant(email: &str, role: &str, token_limit: u64) -> ShareUserGrant {
         ShareUserGrant {
+            quota_conversion_id: None,
             value_metering: None,
             pending_value_quota: None,
             account_quota_cycle: None,
@@ -53977,6 +54147,8 @@ pub(crate) mod tests {
         returned.descriptor_generation = 1;
         returned.descriptor_fingerprint = "a".repeat(64);
         let ack = ShareEditAckPayload {
+            quota_conversions: Vec::new(),
+            value_quota_statuses: Vec::new(),
             termination_receipt: None,
             settings_receipt: Some(crate::models::ShareSettingsReceipt {
                 operation_id: response.edit.id.clone(),
@@ -54187,6 +54359,61 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(description, "changed");
+        let conversion =
+            serde_json::json!({"operationId":edit.id,"email":"a@example.test","committed":true});
+        {
+            let conn = store.conn.lock().await;
+            for (installation, payload) in [
+                ("inst-1", conversion.clone()),
+                (
+                    "unrelated-installation",
+                    serde_json::json!({"mustNotLeak":true}),
+                ),
+            ] {
+                conn.execute(
+                    "INSERT INTO share_quota_conversion_receipts VALUES(?1,?2,?3,?4,?5,0)",
+                    params![
+                        installation,
+                        "share-receipt",
+                        edit.id,
+                        "a@example.test",
+                        payload.to_string()
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(
+            store
+                .share_quota_conversion_receipts_for_owner(
+                    "share-receipt",
+                    &edit.id,
+                    "owner@example.com"
+                )
+                .await
+                .unwrap(),
+            vec![conversion]
+        );
+        assert!(
+            store
+                .share_quota_conversion_receipts_for_owner(
+                    "share-receipt",
+                    &edit.id,
+                    "stranger@example.com"
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .share_quota_conversion_receipts_for_owner(
+                    "other-share",
+                    &edit.id,
+                    "owner@example.com"
+                )
+                .await
+                .is_err()
+        );
         let _ = std::fs::remove_file(&config.database.path);
     }
 
