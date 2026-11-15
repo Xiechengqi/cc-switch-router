@@ -229,7 +229,7 @@ export function ShareAppSupportCard({
   const tone = enabled
     ? modelHealthTone(share, app, locale)
     : { className: "bg-slate-50 text-muted-foreground", label: "" };
-  const accountEmail = enabled ? providerAccountIdentity(runtime) : "";
+  const accountEmail = enabled ? providerAccountIdentity(runtime, share.canManage === true) : "";
   const accountLevel = enabled ? providerAccountLevel(runtime, locale) : "";
   const modelSummary = enabled
     ? providerModelMap(runtime, t("dashboard.modelPolicyPassthrough"))
@@ -606,6 +606,7 @@ const PROVIDER_APPS: Array<{ key: CoreShareApp; label: string }> = [
 type GroupedProvider = {
   key: string;
   providers: Partial<Record<CoreShareApp, ShareAppProvider>>;
+  sources: Partial<Record<CoreShareApp, ShareView>>;
   supportedApps: CoreShareApp[];
 };
 
@@ -627,22 +628,24 @@ function providerGroupKey(provider: ShareAppProvider, app: CoreShareApp) {
 }
 
 function groupProviders(
-  entries: Array<{ app: CoreShareApp; provider: ShareAppProvider }>,
+  entries: Array<{ app: CoreShareApp; provider: ShareAppProvider; source?: ShareView }>,
 ): GroupedProvider[] {
   const groups = new Map<string, GroupedProvider>();
-  entries.forEach(({ app, provider }) => {
-    const key = providerGroupKey(provider, app);
+  entries.forEach(({ app, provider, source }) => {
+    const key = `${providerGroupKey(provider, app)}:${source?.canManage ? "owner" : "masked"}`;
     const existing = groups.get(key);
     const supportedApps = normalizeProviderApps(provider, [app]);
     if (!existing) {
       groups.set(key, {
         key,
         providers: { [app]: provider },
+        sources: source ? { [app]: source } : {},
         supportedApps,
       });
       return;
     }
     existing.providers[app] = provider;
+    if (source) existing.sources[app] = source;
     existing.supportedApps = normalizeProviderApps(provider, [
       ...existing.supportedApps,
       ...supportedApps,
@@ -675,12 +678,14 @@ export function providerMetaLabel(provider: ShareAppProvider) {
 function shareProviderStatusView({
   share,
   providers,
+  sources,
   appRuntimes,
   t,
   locale,
 }: {
   share?: ShareView;
   providers: Partial<Record<CoreShareApp, ShareAppProvider>>;
+  sources?: Partial<Record<CoreShareApp, ShareView>>;
   appRuntimes: ShareAppRuntimes | undefined;
   t: TFn;
   locale: AppLocale;
@@ -693,7 +698,7 @@ function shareProviderStatusView({
         app,
         runtime: mergeStandaloneOAuthRuntime(
           providerRuntime(provider),
-          appRuntimes,
+          sources?.[app]?.appRuntimes || appRuntimes,
           provider,
         ),
       },
@@ -703,7 +708,8 @@ function shareProviderStatusView({
   if (!primary) return null;
   const { runtime } = primary;
   const quotaStatusLine = providerQuotaStatusLine(runtime, locale);
-  const accountLine = providerStatusIdentity(runtime);
+  const source = sources?.[primary.app] || share;
+  const accountLine = providerStatusIdentity(runtime, source?.canManage === true);
   const modelsLine =
     entries
       .map(
@@ -746,7 +752,7 @@ export function ShareProvidersPanel({ share }: { share?: ShareView }) {
       const provider =
         providers.find((item) => item.id === boundProviderId) ||
         providers.find((item) => item.isCurrent);
-      return provider ? [{ app, provider }] : [];
+      return provider ? [{ app, provider, source: share }] : [];
     });
     return groupProviders(entries);
   }, [share]);
@@ -761,6 +767,7 @@ export function ShareProvidersPanel({ share }: { share?: ShareView }) {
             const view = shareProviderStatusView({
               share,
               providers: item.providers,
+              sources: item.sources,
               appRuntimes: runtimes,
               t,
               locale,
@@ -2067,20 +2074,17 @@ export function ClientProvidersPanel({ shares }: { shares: ShareView[] }) {
   const { locale, t } = useLocaleText();
 
   const merged = React.useMemo(() => {
-    const entries: Array<{ app: CoreShareApp; provider: ShareAppProvider }> =
+    const entries: Array<{ app: CoreShareApp; provider: ShareAppProvider; source: ShareView }> =
       [];
     shares.forEach((share) => {
       PROVIDER_APPS.forEach(({ key: app }) => {
         (share.appProviders?.[app] || []).forEach((provider) => {
-          entries.push({ app, provider });
+          entries.push({ app, provider, source: share });
         });
       });
     });
     return groupProviders(entries);
   }, [shares]);
-
-  // appRuntimes 也是 installation 级，取第一个有数据的 share 即可。
-  const runtimes = shares.find((s) => s.appRuntimes)?.appRuntimes;
 
   return (
     <div className="grid gap-3">
@@ -2089,13 +2093,12 @@ export function ClientProvidersPanel({ shares }: { shares: ShareView[] }) {
       ) : (
         <div className="grid gap-2">
           {merged.map((item) => {
-            const share = shares.find((entry) =>
-              PROVIDER_APPS.some(({ key }) => item.providers[key] && entry.appProviders?.[key]),
-            );
+            const share = PROVIDER_APPS.map(({ key }) => item.sources[key]).find(Boolean);
             const view = shareProviderStatusView({
               share,
               providers: item.providers,
-              appRuntimes: runtimes,
+              sources: item.sources,
+              appRuntimes: undefined,
               t,
               locale,
             });

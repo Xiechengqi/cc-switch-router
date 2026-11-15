@@ -13,6 +13,7 @@
     "typecheck": "tsc --noEmit",
     "test:operational-status": "tsx --test components/dashboard/operational-status.test.ts",
     "test:share-dashboard-utils": "tsx --test components/dashboard/share-dashboard-utils.test.ts",
+    "test:share-account-identity": "tsx --test components/dashboard/share-dashboard-utils.test.ts components/dashboard/share-account-identity.test.tsx lib/share-account-identity-transport.test.ts",
     "test:share-email-usage": "tsx --test components/dashboard/share-email-usage.test.tsx",
     "test:share-market": "tsx --test lib/provider-presentation.test.ts components/dashboard/share-market/buyer-catalog-utils.test.ts lib/share-checkout.test.ts lib/share-termination.test.ts lib/share-control-progress.test.ts lib/market-trial-policy.test.ts components/dashboard/share-market/owner-workspace-utils.test.ts components/dashboard/share-market/subscription-utils.test.ts components/dashboard/share-market/seat-quota.test.ts",
     "test:token-units": "tsx --test lib/token-units.test.ts",

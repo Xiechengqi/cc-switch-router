@@ -423,18 +423,30 @@ export function SharePage() {
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState("");
   const [currentHost, setCurrentHost] = React.useState("");
+  const loadSequence = React.useRef(0);
+  const loadedCredentials = React.useRef(readShareApiCredentials());
   const editable = Boolean(auth?.canManage && share?.canEditSettings);
 
   const load = React.useCallback(async () => {
+    const sequence = ++loadSequence.current;
+    const credentials = readShareApiCredentials();
+    if (credentials.email !== loadedCredentials.current.email || credentials.token !== loadedCredentials.current.token) {
+      setShare(null);
+      setAuth(null);
+      loadedCredentials.current = credentials;
+    }
     setLoading(true);
     try {
       const shareContext = await getShareContext();
+      if (sequence !== loadSequence.current) return;
       setContext(shareContext);
       const shareResponse = await getSharePageShare();
+      if (sequence !== loadSequence.current) return;
       setShare(shareResponse.share);
       setAuth(shareResponse.auth);
       setError("");
     } catch (err) {
+      if (sequence !== loadSequence.current || (err instanceof DOMException && err.name === "AbortError")) return;
       if (err instanceof ShareApiError && (err.status === 401 || err.status === 403)) {
         setShare(null);
         setAuth({ authenticated: false, canManage: false });
@@ -443,7 +455,7 @@ export function SharePage() {
         setError(err instanceof Error ? err.message : String(err));
       }
     } finally {
-      setLoading(false);
+      if (sequence === loadSequence.current) setLoading(false);
     }
   }, []);
 

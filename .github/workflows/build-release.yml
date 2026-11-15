@@ -75,6 +75,7 @@ jobs:
           npm run test:providers
           npm run test:share-model-probe
           npm run test:share-model-health-heatmap
+          npm run test:share-account-identity
           npm run test:model-routing
           npm run test:share-settings
           npm run test:share-value-quota
@@ -199,6 +200,7 @@ jobs:
           bash scripts/ci/timed.sh 'Share value pricing and signed projections' cargo test --locked share_value
           bash scripts/ci/timed.sh 'Share reader compatibility' cargo test --locked share_contract_reader
           bash scripts/ci/timed.sh 'Share authorization contracts' cargo test --locked share_user
+          bash scripts/ci/timed.sh 'Share account identity privacy' bash scripts/ci/require-tests.sh cargo test --locked share_account_identity
           bash scripts/ci/timed.sh 'Share browser API CORS' cargo test --locked browser_share_cors
           bash scripts/ci/timed.sh 'Share USD usage initialization' cargo test --locked value_usage_initialization_tests
 

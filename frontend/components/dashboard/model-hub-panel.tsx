@@ -55,6 +55,7 @@ import {
 } from "@/lib/model-routing";
 import { ModelRoutingSession, routingDrafts, routingDraftIsDirty } from "@/lib/model-routing-session";
 import { usePersistentState } from "@/lib/use-persistent-state";
+import { useLoginContextKey } from "@/lib/use-login-context";
 import { cn } from "@/lib/utils";
 import { ModelHubRuleEditor, modelRouteEditorId } from "./model-hub-rule-editor";
 import { ModelHubTestDrawer } from "./model-hub-test-drawer";
@@ -112,10 +113,11 @@ export type ModelRoutingController = {
 
 export function useModelRoutingController(active: boolean, viewerKey: string): ModelRoutingController {
   const { t } = useLocaleText();
+  const loginContext = useLoginContextKey();
   const session = React.useMemo(() => new ModelRoutingSession({
     getRouting: getUserModelRouting, getToken: getUserApiToken,
     replaceRouting: replaceUserModelRouting, resetToken: resetUserApiToken,
-  }), [viewerKey]);
+  }), [viewerKey, loginContext]);
   const state = React.useSyncExternalStore(session.subscribe, session.getSnapshot, session.getSnapshot);
 
   React.useEffect(() => {
@@ -199,7 +201,7 @@ export function useModelRoutingController(active: boolean, viewerKey: string): M
   };
   return {
     ...state,
-    actorKey: viewerKey,
+    actorKey: JSON.stringify([viewerKey, loginContext]),
     error: state.error || (state.validation ? t(validationKeys[state.validation]) : "")
       || (state.commandError ? t(`modelHub.command.${state.commandError}` as MessageKey) : ""),
     dirty: routingDraftIsDirty(state),

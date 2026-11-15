@@ -75,6 +75,7 @@ mod schema;
 mod secure_file;
 mod server_logs;
 mod server_state;
+mod share_account_identity;
 mod share_market;
 mod share_market_termination;
 mod share_market_termination_contract;

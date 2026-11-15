@@ -39,6 +39,13 @@ export function clearShareApiCredentials() {
   sessionStorage.removeItem(TOKEN_KEY);
 }
 
+function assertCurrentShareCredentials(started: ReturnType<typeof readShareApiCredentials>) {
+  const current = readShareApiCredentials();
+  if (started.email !== current.email || started.token !== current.token) {
+    throw new DOMException("Share sign-in session changed", "AbortError");
+  }
+}
+
 function shareAuthHeaders(token?: string): Record<string, string> {
   const actual = token || readShareApiCredentials().token;
   return actual ? { Authorization: `Bearer ${actual}` } : {};
@@ -54,21 +61,27 @@ export async function getShareContext() {
 }
 
 export async function getShareApiAuth(email?: string, token?: string) {
-  return parseShareJson<ShareApiAuthResponse>(
+  const started = readShareApiCredentials();
+  const result = await parseShareJson<ShareApiAuthResponse>(
     await fetch(`/share-api/auth/me${shareEmailParam(email)}`, {
       cache: "no-store",
       headers: shareAuthHeaders(token),
     }),
   );
+  assertCurrentShareCredentials(started);
+  return result;
 }
 
 export async function getSharePageShare(email?: string, token?: string) {
-  return parseShareJson<ShareApiShareResponse>(
+  const started = readShareApiCredentials();
+  const result = await parseShareJson<ShareApiShareResponse>(
     await fetch(`/share-api/share${shareEmailParam(email)}`, {
       cache: "no-store",
       headers: shareAuthHeaders(token),
     }),
   );
+  assertCurrentShareCredentials(started);
+  return result;
 }
 
 export async function updateSharePageSettings(patch: ShareSettingsPatch, baseConfigRevision?: number) {

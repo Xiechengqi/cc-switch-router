@@ -1844,7 +1844,7 @@ async fn tunnel_state(
 async fn dashboard(
     State(state): State<ServerState>,
     headers: HeaderMap,
-) -> Result<Json<DashboardResponse>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     let viewer_email = extract_dashboard_session_email(&state, &headers).await?;
     let mut runtime_config = state.config.clone();
     let viewer_is_admin = {
@@ -1874,7 +1874,10 @@ async fn dashboard(
     response.user_country_counts = confirmed_country_counts;
     response.recent_request_events = confirmed_events;
     apply_dashboard_request_log_visibility(&mut response, viewer_is_admin);
-    Ok(Json(response))
+    Ok((
+        [(header::CACHE_CONTROL, "private, no-store")],
+        Json(response),
+    ))
 }
 
 async fn map_display_get(
@@ -2008,7 +2011,7 @@ async fn share_api_share(
     State(state): State<ServerState>,
     headers: HeaderMap,
     Query(query): Query<ShareApiAuthQuery>,
-) -> Result<Json<ShareApiShareResponse>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     let route = share_route_from_headers(&state, &headers).await?;
     let share_id = route
         .share_id()
@@ -2033,7 +2036,10 @@ async fn share_api_share(
             viewer_email,
         )
         .await?;
-    Ok(Json(ShareApiShareResponse { share, auth }))
+    Ok((
+        [(header::CACHE_CONTROL, "private, no-store")],
+        Json(ShareApiShareResponse { share, auth }),
+    ))
 }
 
 async fn share_api_get_settings_edit(

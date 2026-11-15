@@ -17,8 +17,8 @@ const now = Math.floor(Date.now() / 1000);
 const share: UserModelRoutingShare = {
   shareId: "fixture", shareName: "Fixture", subdomain: "fixture-subdomain", directApiUrl: "https://fixture.example.test", access: "shared", freeAccess: false, isOnline: true, apps: ["codex", "claude"],
   appCapabilities: [
-    { app: "codex", kind: "official_oauth", accountEmail: "protocol-account@example.test", modelPolicy: { mode: "single", upstreamModel: "test-model" }, healthFingerprint: "current", liveModelHealthStatus: { state: "healthy", appType: "codex", healthFingerprint: "current", checkedAt: now - 5, staleAt: now + 3900, reasonCode: "probe_success", recentResults: [], source: "periodic" } },
-    { app: "claude", kind: "claude_oauth", accountEmail: "other-protocol@example.test" },
+    { app: "codex", kind: "official_oauth", accountEmail: "p***t@example.test", modelPolicy: { mode: "single", upstreamModel: "test-model" }, healthFingerprint: "current", liveModelHealthStatus: { state: "healthy", appType: "codex", healthFingerprint: "current", checkedAt: now - 5, staleAt: now + 3900, reasonCode: "probe_success", recentResults: [], source: "periodic" } },
+    { app: "claude", kind: "claude_oauth", accountEmail: "o***l@example.test" },
   ],
 };
 
@@ -31,13 +31,13 @@ for (const locale of ["en", "zh-CN"] as const) {
     assert.match(html, />[^<]*test-model[^<]*</, "second line names the model this protocol reaches");
     assert.match(html, /model-route-dot[^"]*bg-emerald-500[^"]*model-route-dot-live/);
     assert.ok(html.includes(t("common.online")));
-    assert.match(html, /title="[^"]*protocol-account@example.test/, "account identity moves to the tooltip");
-    assert.doesNotMatch(html, />[^<]*protocol-account@example.test/, "account identity is not rendered as row text");
-    assert.doesNotMatch(html, /other-protocol@example.test|bg-emerald-50(?!0)|<div|<button|<details|<input|<a /);
+    assert.match(html, /title="[^"]*p\*\*\*t@example.test/, "masked account identity moves to the tooltip");
+    assert.doesNotMatch(html, />[^<]*p\*\*\*t@example.test/, "account identity is not rendered as row text");
+    assert.doesNotMatch(html, /protocol-account@example.test|other-protocol@example.test|o\*\*\*l@example.test|bg-emerald-50(?!0)|<div|<button|<details|<input|<a /);
     const revoked = renderToStaticMarkup(<RoutingShareSummary {...props} share={undefined} />);
     assert.ok(revoked.includes(t("modelHub.targetUnavailable")));
     assert.match(revoked, />fixture</, "a missing target still shows its id so it can be removed");
-    assert.doesNotMatch(revoked, /protocol-account|fixture-subdomain/);
+    assert.doesNotMatch(revoked, /p\*\*\*t@example.test|fixture-subdomain/);
     const offline = renderToStaticMarkup(<RoutingShareSummary {...props} share={{ ...share, isOnline: false }} />);
     assert.ok(offline.includes(t("common.offline")));
     assert.doesNotMatch(offline, /model-route-dot-live|bg-emerald-500/);
@@ -79,8 +79,8 @@ for (const locale of ["en", "zh-CN"] as const) {
     const source = { ...share, liveModelHealthStatus: share.appCapabilities![0].liveModelHealthStatus };
     const html = renderToStaticMarkup(<RoutingShareSummary share={source} shareId={share.shareId} app="claude" locale={locale} t={t} />);
     assert.match(html, /bg-emerald-500/);
-    assert.match(html, /title="[^"]*other-protocol@example.test/);
-    assert.doesNotMatch(html, /protocol-account@example.test/);
+    assert.match(html, /title="[^"]*o\*\*\*l@example.test/);
+    assert.doesNotMatch(html, /p\*\*\*t@example.test|other-protocol@example.test/);
     assert.match(html, /title="[^"]*Share · /);
     assert.match(html, /title="[^"]*codex/);
   });

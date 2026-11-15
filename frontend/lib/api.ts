@@ -1,5 +1,5 @@
-import { authFetch, readAuthState } from "@/lib/auth";
-import { sameLoginContext } from "@/lib/password-auth";
+import { authFetch, readAuthState, type AuthState } from "@/lib/auth";
+import { loginContextKey, sameLoginContext } from "@/lib/password-auth";
 import type {
   DashboardResponse,
   ClearMetricsResponse,
@@ -152,7 +152,7 @@ const shareMarketGetInflight = new Map<string, Promise<unknown>>();
 let shareMarketCacheActor: string | undefined;
 
 function selectShareMarketCacheActor() {
-  return readAuthState().email?.trim().toLowerCase() || "anonymous";
+  return loginContextKey(readAuthState());
 }
 
 function synchronizeShareMarketCacheActor(actor: string) {
@@ -178,6 +178,13 @@ function callerAbortError() {
     : new DOMException("request aborted", "AbortError");
 }
 
+function assertCurrentLoginContext(started: AuthState) {
+  const current = readAuthState();
+  if (!sameLoginContext(started, current) || loginContextKey(started) !== loginContextKey(current)) {
+    throw callerAbortError();
+  }
+}
+
 function waitForCaller<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return promise;
   if (signal.aborted) return Promise.reject(callerAbortError());
@@ -189,6 +196,7 @@ function waitForCaller<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T>
 }
 
 async function fetchShareMarketCached<T>(url: string, signal?: AbortSignal): Promise<T> {
+  const started = readAuthState();
   const actor = selectShareMarketCacheActor();
   synchronizeShareMarketCacheActor(actor);
   const key = `${actor}\n${url}`;
@@ -199,13 +207,15 @@ async function fetchShareMarketCached<T>(url: string, signal?: AbortSignal): Pro
       const request = async (etag?: string) => authFetch(url, {
         cache: "no-cache",
         headers: etag ? { "If-None-Match": etag } : undefined,
-      });
+      }, started);
       let response = await request(cached?.etag);
+      assertCurrentLoginContext(started);
       if (response.status === 304) {
         if (cached) return cached.body as T;
         response = await request();
       }
       const body = await parseJson<T>(response);
+      assertCurrentLoginContext(started);
       if (shareMarketCacheActor === actor) {
         storeShareMarketCacheEntry(key, {
           etag: response.headers.get("etag") || undefined,
@@ -223,9 +233,12 @@ async function fetchShareMarketCached<T>(url: string, signal?: AbortSignal): Pro
 }
 
 export async function getDashboard(signal?: AbortSignal) {
-  return parseJson<DashboardResponse>(
-    await authFetch("/v1/dashboard", { cache: "no-store", signal }),
+  const started = readAuthState();
+  const body = await parseJson<DashboardResponse>(
+    await authFetch("/v1/dashboard", { cache: "no-store", signal }, started),
   );
+  assertCurrentLoginContext(started);
+  return body;
 }
 
 export async function getClientLogs(installationId: string, signal?: AbortSignal) {
@@ -496,9 +509,12 @@ export async function resetUserApiToken() {
 }
 
 export async function getUserModelRouting(signal?: AbortSignal) {
-  return parseJson<UserModelRoutingResponse>(
-    await authFetch("/v1/me/model-routing", { cache: "no-store", signal }),
+  const started = readAuthState();
+  const body = await parseJson<UserModelRoutingResponse>(
+    await authFetch("/v1/me/model-routing", { cache: "no-store", signal }, started),
   );
+  assertCurrentLoginContext(started);
+  return body;
 }
 
 /** Plan P5-1. Older Routers answer this path with the web app, not JSON;
@@ -514,13 +530,16 @@ export async function getUserModelRoutingTraffic(cursor: { after?: string; insta
 }
 
 export async function replaceUserModelRouting(input: ReplaceUserModelRoutingRequest) {
-  return parseJson<UserModelRoutingResponse>(
+  const started = readAuthState();
+  const body = await parseJson<UserModelRoutingResponse>(
     await authFetch("/v1/me/model-routing", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(input),
-    }),
+    }, started),
   );
+  assertCurrentLoginContext(started);
+  return body;
 }
 
 export async function testUserModelRouting(input: UserModelRoutingTestRequest) {

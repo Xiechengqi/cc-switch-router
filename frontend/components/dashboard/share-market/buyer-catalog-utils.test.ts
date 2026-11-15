@@ -204,7 +204,7 @@ const capability = (
 test("provider panel prefers a capability with public account status", () => {
   const detailed = capability({
     app: "codex",
-    accountHint: "private@example.com",
+    accountHint: "p***e@example.com",
     quota: {
       status: "ok",
       plan: "Plus",
@@ -226,7 +226,7 @@ test("provider panel reproduces quota, provider identity and enabled app model r
       supportedApps: ["claude", "codex"],
       appCapabilities: [
         capability({
-          accountHint: "private@example.com",
+          accountHint: "p***e@example.com",
           quota: {
             status: "ok",
             plan: "Plus",
@@ -248,7 +248,7 @@ test("provider panel reproduces quota, provider identity and enabled app model r
   );
   assert.match(view.primaryLine, /Plus/);
   assert.match(view.primaryLine, /weekly 55%/i);
-  assert.equal(view.identityLine, "private@example.com");
+  assert.equal(view.identityLine, "p***e@example.com");
   assert.match(view.modelsLine, /Claude: grok-4\.6/);
   assert.match(view.modelsLine, /Codex: gpt-5/);
   assert.match(view.toneClassName, /emerald/);
@@ -406,7 +406,7 @@ test("provider panel survives omitted models on passthrough listings", () => {
   );
 
   assert.equal(view.modelsLine, "Claude: Passthrough");
-  assert.equal(view.identityLine, "Claude OAuth");
+  assert.equal(view.identityLine, "-", "missing public account hints do not fall back to Provider names");
   assert.equal(view.primaryLine, "Claude Pro");
 });
 
@@ -427,7 +427,7 @@ test("provider panel survives omitted models on fixed listings without an upstre
   );
 
   assert.equal(view.modelsLine, "Codex: Unknown");
-  assert.equal(view.identityLine, "OpenAI Official");
+  assert.equal(view.identityLine, "-", "missing public account hints do not fall back to Provider names");
 });
 
 test("contract integrity reasons are localized without exposing internal codes", () => {

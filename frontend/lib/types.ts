@@ -629,6 +629,7 @@ export type UserModelRoutingShareCapability = {
   kind?: string;
   apiUrl?: string;
   subscriptionLevel?: string;
+  /** Browser projection: complete for the current Share owner, masked for other viewers. */
   accountLabel?: string;
   accountEmail?: string;
   modelPolicy?: ShareProviderModelPolicy;
@@ -1310,6 +1311,7 @@ export type ShareUpstreamProvider = {
   kind?: string;
   app?: string;
   providerType?: string;
+  /** Read-only display values: masked by Router for non-owner viewers. */
   accountLabel?: string;
   accountEmail?: string;
   subscriptionLevel?: string;
@@ -1383,6 +1385,7 @@ export type ShareAppProvider = {
   isCurrent?: boolean;
   enabled?: boolean;
   codexImageGenerationEnabled?: boolean;
+  /** Read-only display values: masked by Router for non-owner viewers. */
   accountLabel?: string;
   accountEmail?: string;
   subscriptionLevel?: string;

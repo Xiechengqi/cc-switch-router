@@ -64,7 +64,8 @@ test("Buddy cards with missing account labels never substitute provider names or
       assert.equal(providerStatusIdentity({ ...runtime, providerType: undefined, kind: providerType }), "-");
     }
   }
-  assert.equal(providerStatusIdentity({ providerType: "codex_oauth", providerName: "OpenAI Official" }), "OpenAI Official");
+  assert.equal(providerStatusIdentity({ providerType: "codex_oauth", providerName: "OpenAI Official" }), "-");
+  assert.equal(providerStatusIdentity({ providerType: "codex_oauth", providerName: "OpenAI Official" }, true), "OpenAI Official");
 });
 
 test("Buddy credits are unknown when incomplete, and explicit zero remains zero", () => {
@@ -131,14 +132,15 @@ test("Cursor API-key cards use the account as the level when no plan is known", 
   assert.equal(providerAccountTierLabel(runtime), "owner@example.com");
 });
 
-test("legacy Cursor API-key descriptors keep their provider-name fallback", () => {
+test("only owner legacy Cursor API-key views allow their provider-name fallback", () => {
   const runtime = cursorApiKeyRuntime({
     accountLabel: undefined,
     accountEmail: undefined,
     subscriptionLevel: undefined,
   });
 
-  assert.equal(providerAccountIdentity(runtime), "Cursor API Key");
+  assert.equal(providerAccountIdentity(runtime), "-");
+  assert.equal(providerAccountIdentity(runtime, true), "Cursor API Key");
   assert.equal(providerAccountLevel(runtime), "Cursor API Key");
   assert.equal(providerAccountTierLabel(runtime), "Cursor API Key");
 });

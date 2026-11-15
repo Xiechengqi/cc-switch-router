@@ -7,6 +7,11 @@ type LoginContext = {
   refreshToken?: string | null;
 };
 
+/** A non-secret cache scope; token rotation keeps the same login epoch. */
+export function loginContextKey(context: LoginContext) {
+  return JSON.stringify([context.email?.trim().toLowerCase() || "", context.loginEpoch || "", !!context.accessToken]);
+}
+
 // Token rotation is not a new login. Explicit login/logout changes the epoch,
 // including when signing into the same account again in another tab.
 export function sameLoginContext(started: LoginContext, current: LoginContext) {

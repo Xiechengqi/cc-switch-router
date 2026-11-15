@@ -7,7 +7,7 @@ use crate::db::{
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use base64::Engine as _;
@@ -3077,6 +3077,44 @@ fn public_app_capabilities(
     app_providers_json: Option<&str>,
     fallback_app: &str,
 ) -> Vec<ShareMarketAppCapability> {
+    app_capabilities_for_viewer(
+        bindings_json,
+        app_runtimes_json,
+        app_providers_json,
+        fallback_app,
+        false,
+    )
+}
+
+fn provider_identity_for_viewer(
+    bindings: &str,
+    runtimes: Option<&str>,
+    providers: Option<&str>,
+    reveal_account: bool,
+) -> crate::provider_presentation::PublicProviderIdentity {
+    let mut identity = crate::provider_presentation::identity_from_json(bindings, providers);
+    if !reveal_account {
+        let runtimes = runtimes
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        let providers = providers
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        let aliases = crate::share_account_identity::AccountAliases::from_metadata(
+            None, &runtimes, &providers,
+        );
+        identity.display_name = aliases.display_text(&identity.display_name);
+    }
+    identity
+}
+
+fn app_capabilities_for_viewer(
+    bindings_json: &str,
+    app_runtimes_json: Option<&str>,
+    app_providers_json: Option<&str>,
+    fallback_app: &str,
+    reveal_account: bool,
+) -> Vec<ShareMarketAppCapability> {
     let apps = supported_share_apps(bindings_json, fallback_app);
     let bindings =
         serde_json::from_str::<BTreeMap<String, String>>(bindings_json).unwrap_or_default();
@@ -3205,7 +3243,16 @@ fn public_app_capabilities(
                     bound_provider.and_then(|value| value.account_email.as_deref()),
                 ])
             };
-            ShareMarketAppCapability {
+            let mut aliases = crate::share_account_identity::AccountAliases::default();
+            for value in [
+                runtime.and_then(|value| value.account_label.as_deref()),
+                runtime.and_then(|value| value.account_email.as_deref()),
+                bound_provider.and_then(|value| value.account_label.as_deref()),
+                bound_provider.and_then(|value| value.account_email.as_deref()),
+            ] {
+                aliases.add(value);
+            }
+            let mut capability = ShareMarketAppCapability {
                 app,
                 provider_family,
                 provider_name: first_nonempty([
@@ -3248,7 +3295,28 @@ fn public_app_capabilities(
                                 .and_then(|value| value.subscription_expires_at.as_deref())
                         }),
                 ),
+            };
+            if !reveal_account {
+                capability.account_hint = capability
+                    .account_hint
+                    .as_deref()
+                    .map(crate::share_account_identity::mask_account_identity);
+                capability.provider_name = capability
+                    .provider_name
+                    .as_deref()
+                    .map(|value| aliases.display_text(value));
+                capability.subscription_level = capability
+                    .subscription_level
+                    .as_deref()
+                    .map(|value| aliases.display_text(value));
+                if let Some(quota) = &mut capability.quota {
+                    quota.plan = quota
+                        .plan
+                        .as_deref()
+                        .map(|value| aliases.display_text(value));
+                }
             }
+            capability
         })
         .collect()
 }
@@ -5339,13 +5407,17 @@ impl AppStore {
                     codex: row.get::<_, i64>(13)? != 0,
                     gemini: row.get::<_, i64>(14)? != 0,
                 };
-                let app_capabilities = enabled_public_app_capabilities(
+                // This query is scoped to the authenticated current Share owner.
+                let app_capabilities = app_capabilities_for_viewer(
                     &bindings_json,
                     app_runtimes_json.as_deref(),
                     app_providers_json.as_deref(),
                     &app_type,
-                    &support,
-                );
+                    true,
+                )
+                .into_iter()
+                .filter(|capability| share_supports_app(&support, &capability.app))
+                .collect();
                 let create_blocked_reason = if active_listing_id.is_some() {
                     Some("active_listing")
                 } else if reopen_listing_id.is_some() {
@@ -5676,13 +5748,22 @@ impl AppStore {
                 codex: enabled_codex != 0,
                 gemini: enabled_gemini != 0,
             };
-            let app_capabilities = enabled_public_app_capabilities(
+            // Historical listing ownership is not authority over the current
+            // Share's upstream account, including after an owner transfer.
+            let reveal_account = crate::share_account_identity::is_share_owner(
+                Some(&current_owner_email),
+                viewer.map(|value| value.email.as_str()),
+            );
+            let app_capabilities = app_capabilities_for_viewer(
                 &bindings_json,
                 app_runtimes_json.as_deref(),
                 app_providers_json.as_deref(),
                 &app_type,
-                &support,
-            );
+                reveal_account,
+            )
+            .into_iter()
+            .filter(|capability| share_supports_app(&support, &capability.app))
+            .collect::<Vec<_>>();
             let model_health_status = crate::store::model_health::current_status(
                 &conn,
                 &share_id,
@@ -5974,9 +6055,11 @@ impl AppStore {
             let rank_position = rank.and_then(|projection| projection.rank_position);
             let provider_score_bps = rank.and_then(|projection| projection.score_bps);
             listings.push(ListingView {
-                provider_identity: crate::provider_presentation::identity_from_json(
+                provider_identity: provider_identity_for_viewer(
                     &bindings_json,
+                    app_runtimes_json.as_deref(),
                     app_providers_json.as_deref(),
+                    reveal_account,
                 ),
                 id,
                 market_provider_id,
@@ -6333,9 +6416,12 @@ async fn requeue_control_dead_letter(
 async fn list_owned_shares(
     State(state): State<ServerState>,
     headers: HeaderMap,
-) -> Result<Json<Vec<OwnedShareView>>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     let session = require_session(&state, &headers).await?;
-    Ok(Json(state.store.share_market_owned_shares(&session).await?))
+    Ok((
+        [(header::CACHE_CONTROL, "private, no-store")],
+        Json(state.store.share_market_owned_shares(&session).await?),
+    ))
 }
 
 fn ensure_paid_seat_setup_tx(
@@ -13511,6 +13597,7 @@ pub async fn run_service(state: ServerState) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod account_identity_tests;
     mod client_entries_tests;
     mod control_recovery_tests;
     mod provider_presentation_tests;
@@ -14323,11 +14410,11 @@ mod tests {
         assert_eq!(capability.health_state, "healthy");
         assert_eq!(
             capability.account_hint.as_deref(),
-            Some("secret-account@example.com")
+            Some("s***t@example.com")
         );
 
         let public_json = serde_json::to_string(&capabilities).expect("encode public capability");
-        assert!(public_json.contains("secret-account@example.com"));
+        assert!(!public_json.contains("secret-account@example.com"));
         assert!(!public_json.contains("https://secret.invalid/v1"));
         assert!(!public_json.contains("accountEmail"));
         assert!(!public_json.contains("apiUrl"));
@@ -14389,7 +14476,7 @@ mod tests {
     }
 
     #[test]
-    fn public_capabilities_include_structured_quota_and_full_account_email() {
+    fn public_capabilities_include_structured_quota_and_masked_account_email() {
         let bindings = serde_json::json!({ "codex": "openai-provider" }).to_string();
         let runtimes_json = serde_json::json!({
             "codex": {
@@ -14431,7 +14518,7 @@ mod tests {
         let quota = capability.quota.as_ref().expect("public quota");
         assert_eq!(
             capability.account_hint.as_deref(),
-            Some("private@example.com")
+            Some("p***e@example.com")
         );
         assert_eq!(capability.health_state, "healthy");
         assert_eq!(quota.status.as_deref(), Some("ok"));
@@ -14445,7 +14532,7 @@ mod tests {
         );
 
         let public_json = serde_json::to_string(capability).expect("encode public capability");
-        assert!(public_json.contains("private@example.com"));
+        assert!(!public_json.contains("private@example.com"));
         assert!(!public_json.contains("accountEmail"));
         assert!(!public_json.contains("apiUrl"));
     }

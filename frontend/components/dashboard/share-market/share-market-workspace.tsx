@@ -27,6 +27,7 @@ import type {
   ShareMarketSubscription,
 } from "@/lib/types";
 import { replaceCurrentSearch } from "@/lib/url-search";
+import { useLoginContextKey } from "@/lib/use-login-context";
 
 type Workspace = "catalog" | "selling";
 type LoadScope = Workspace | "all";
@@ -76,10 +77,12 @@ export function ShareMarketWorkspace() {
   const { t } = useLocaleText();
   const { session, loading: authLoading } = useAuth();
   const searchParams = useSearchParams();
+  const loginContext = useLoginContextKey();
   const authed = !!session?.authenticated;
-  const actorKey = authed
+  const userKey = authed
     ? session?.user?.id || session?.user?.email?.toLowerCase() || "authenticated"
     : "anonymous";
+  const actorKey = JSON.stringify([userKey, loginContext]);
   const { remembered, takeSeed } = useRememberedView<ShareMarketView>(authLoading ? null : shareMarketViewKey(actorKey));
   const [catalog, setCatalog] = React.useState<ShareMarketCatalog | null>(remembered?.catalog ?? null);
   const [ownedListings, setOwnedListings] = React.useState<ShareMarketListing[]>(remembered?.ownedListings ?? []);
@@ -315,7 +318,7 @@ export function ShareMarketWorkspace() {
     void load({ scope: next });
   };
 
-  const actorDataCurrent = loadedActorKey === actorKey;
+  const actorDataCurrent = !authLoading && loadedActorKey === actorKey;
   const visibleCatalog = actorDataCurrent ? catalog : null;
   const visibleOwnedListings = actorDataCurrent ? ownedListings : [];
   const visibleRentedListings = actorDataCurrent ? rentedListings : [];

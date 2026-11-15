@@ -9223,6 +9223,7 @@ impl AppStore {
         };
         (view.operational_summary, view.service_readiness) =
             share_operational_evaluation(&view, active_edit.as_ref(), Utc::now());
+        crate::share_account_identity::project_share(&mut view, viewer_email);
         Ok(view)
     }
 
@@ -12882,6 +12883,7 @@ impl AppStore {
                 };
                 (view.operational_summary, view.service_readiness) =
                     share_operational_evaluation(&view, active_edit.as_ref(), Utc::now());
+                crate::share_account_identity::project_share(&mut view, viewer_email);
                 view
             })
             .collect::<Vec<_>>();
@@ -29508,11 +29510,7 @@ fn share_model_routing_access(
     email: &str,
     now_ms: i64,
 ) -> Option<&'static str> {
-    if share
-        .owner_email
-        .as_deref()
-        .is_some_and(|owner| owner.eq_ignore_ascii_case(email))
-    {
+    if crate::share_account_identity::is_share_owner(share.owner_email.as_deref(), Some(email)) {
         Some("owner")
     } else if active_share_grant_for_email(&share.user_grants, email, now_ms) {
         Some("shared")
@@ -29682,6 +29680,18 @@ fn load_user_model_routing_response(
             .iter()
             .filter_map(|app| user_model_routing_share_capability(&share, app))
             .collect();
+        let mut provider_identity = crate::provider_presentation::identity_for_share(&share);
+        if access != "owner" {
+            let aliases = crate::share_account_identity::AccountAliases::from_metadata(
+                share.upstream_provider.as_ref(),
+                &share.app_runtimes,
+                &share.app_providers,
+            );
+            for capability in &mut app_capabilities {
+                crate::share_account_identity::project_routing_capability(capability, &aliases);
+            }
+            provider_identity.display_name = aliases.display_text(&provider_identity.display_name);
+        }
         // Read-only projection of the same evidence used by Share cards. The
         // current monitor observes one representative App: do not infer health
         // for other enabled protocols or consult legacy mutable summaries.
@@ -29719,7 +29729,7 @@ fn load_user_model_routing_response(
             capability.live_model_health_status = applies(&live).then(|| live.clone());
         }
         eligible_shares.push(UserModelRoutingShareView {
-            provider_identity: crate::provider_presentation::identity_for_share(&share),
+            provider_identity,
             share_id: share.share_id,
             share_name: share.share_name,
             subdomain: share.subdomain.clone(),
@@ -30110,13 +30120,7 @@ fn share_visible_to_email(share: &ShareDescriptor, viewer_email: Option<&str>) -
 }
 
 fn can_manage_share(share: &ShareDescriptor, viewer_email: Option<&str>) -> bool {
-    let Some(viewer_email) = viewer_email else {
-        return false;
-    };
-    share
-        .owner_email
-        .as_deref()
-        .is_some_and(|owner| owner.eq_ignore_ascii_case(viewer_email))
+    crate::share_account_identity::is_share_owner(share.owner_email.as_deref(), viewer_email)
 }
 
 fn share_supports_app(support: &ShareSupport, app: &str) -> bool {
@@ -30182,6 +30186,7 @@ fn gateway_share_label(share_id: &str) -> String {
 pub(crate) mod tests {
     use super::*;
     mod model_health_status;
+    mod share_account_identity;
     mod share_market_control;
     include!("store/share_value_quotas/signed_delivery_tests.rs");
     include!("store/share_value_quotas/metering_scope_tests.rs");

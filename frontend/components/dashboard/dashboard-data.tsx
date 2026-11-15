@@ -3,6 +3,9 @@
 import * as React from "react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { getDashboard } from "@/lib/api";
+import { readAuthState } from "@/lib/auth";
+import { loginContextKey } from "@/lib/password-auth";
+import { useLoginContextKey } from "@/lib/use-login-context";
 import type { DashboardResponse } from "@/lib/types";
 
 type DashboardDataValue = {
@@ -37,11 +40,12 @@ export function DashboardDataProvider({ enabled, children }: { enabled: boolean;
   const inFlightRef = React.useRef<DashboardRefreshFlight | null>(null);
   const dataRef = React.useRef<DashboardResponse | null>(null);
   const dataContextRef = React.useRef("");
+  const actor = useLoginContextKey();
   const { loading: authLoading, session } = useAuth();
-  const refreshContextKey = `${session?.authenticated ? "authenticated" : "anonymous"}:${session?.user?.email?.trim().toLowerCase() || "-"}`;
+  const refreshContextKey = `${session?.authenticated ? "authenticated" : "anonymous"}:${session?.user?.email?.trim().toLowerCase() || "-"}:${actor}`;
 
   const refresh = React.useCallback(() => {
-    if (!enabled || authLoading) return Promise.resolve();
+    if (!enabled || authLoading || actor !== loginContextKey(readAuthState())) return Promise.resolve();
     const active = inFlightRef.current;
     if (active?.contextKey === refreshContextKey) return active.promise;
     active?.controller.abort();
@@ -80,7 +84,7 @@ export function DashboardDataProvider({ enabled, children }: { enabled: boolean;
     });
     inFlightRef.current = { contextKey: refreshContextKey, controller, promise: operation };
     return operation;
-  }, [authLoading, enabled, refreshContextKey]);
+  }, [actor, authLoading, enabled, refreshContextKey]);
 
   React.useEffect(() => {
     requestSeq.current += 1;
@@ -114,11 +118,15 @@ export function DashboardDataProvider({ enabled, children }: { enabled: boolean;
     };
   }, [authLoading, enabled, refresh, refreshContextKey]);
 
-  const generatedAt = data ? Date.parse(data.generatedAt) : 0;
-  const fresh = Boolean(data && !error && Number.isFinite(generatedAt) && clock - generatedAt < 20_000);
+  // Gate during render as well as in the effect: the effect runs after paint,
+  // and an old owner snapshot must not flash under a new login context.
+  const current = !authLoading && actor === loginContextKey(readAuthState()) && dataContextRef.current === refreshContextKey;
+  const visibleData = current ? data : null;
+  const generatedAt = visibleData ? Date.parse(visibleData.generatedAt) : 0;
+  const fresh = Boolean(visibleData && !error && Number.isFinite(generatedAt) && clock - generatedAt < 20_000);
   const value = React.useMemo(
-    () => ({ data, stale, error, loading, refreshing, fresh, refresh }),
-    [data, error, fresh, loading, refresh, refreshing, stale],
+    () => ({ data: visibleData, stale: current && stale, error: current ? error : "", loading: !current || loading, refreshing: current && refreshing, fresh, refresh }),
+    [current, visibleData, error, fresh, loading, refresh, refreshing, stale],
   );
   return <DashboardDataContext.Provider value={value}>{children}</DashboardDataContext.Provider>;
 }

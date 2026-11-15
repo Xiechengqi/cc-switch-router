@@ -1265,7 +1265,7 @@ export function providerAccountLevel(
   );
 }
 
-export function providerAccountIdentity(runtime?: ShareUpstreamProvider) {
+export function providerAccountIdentity(runtime?: ShareUpstreamProvider, allowDisplayFallback = false) {
   if (isApiProviderRuntime(runtime)) {
     return "-";
   }
@@ -1277,6 +1277,7 @@ export function providerAccountIdentity(runtime?: ShareUpstreamProvider) {
       runtime?.accountLabel || runtime?.accountEmail || "",
     ).trim();
     if (account && !account.startsWith("cursor_apikey_")) return account;
+    if (!allowDisplayFallback) return "-";
     const message = String(runtime?.quota?.credentialMessage || "").trim();
     if (message) return message;
     const name = String(runtime?.providerName || "").trim();
@@ -1289,10 +1290,11 @@ export function providerAccountIdentity(runtime?: ShareUpstreamProvider) {
   return account;
 }
 
-export function providerStatusIdentity(runtime?: ShareUpstreamProvider) {
-  const identity = providerAccountIdentity(runtime);
+export function providerStatusIdentity(runtime?: ShareUpstreamProvider, allowDisplayFallback = false) {
+  const identity = providerAccountIdentity(runtime, allowDisplayFallback);
   if (isBuddyOAuthRuntime(runtime)) return identity;
   if (identity && identity !== "-") return identity;
+  if (!allowDisplayFallback) return "-";
   const name = String(runtime?.providerName || "").trim();
   return name || "-";
 }
