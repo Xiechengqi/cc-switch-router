@@ -9,7 +9,6 @@ import { SHARE_APP_LABELS, type CoreShareApp } from "@/lib/share-app";
 import {
   type ShareEditDraft,
 } from "./share-edit-draft";
-import { FieldGroup } from "./share-edit-shared";
 import { ShareEditSection } from "./share-edit-section";
 import {
   ShareRequestedModelBlocksPanel,
@@ -33,48 +32,6 @@ function providerTitle(runtime?: ShareUpstreamProvider) {
   const title = String(runtime?.providerName || runtime?.kind || runtime?.providerType || "").trim();
   if (!title || looksLikeEmail(title)) return "";
   return title;
-}
-
-export type ShareEditSaleAccessFieldsProps = {
-  t: TFn;
-  draft: ShareEditDraft;
-  disabled?: boolean;
-  onDraftChange: (updater: (current: ShareEditDraft) => ShareEditDraft) => void;
-};
-
-export function ShareEditSaleAccessFields({
-  t,
-  draft,
-  disabled,
-  onDraftChange,
-}: ShareEditSaleAccessFieldsProps) {
-  return (
-    <FieldGroup
-      label={t("dashboard.field.freeAccess")}
-      hint={t("dashboard.hint.freeAccess")}
-    >
-      <Checkbox
-        isSelected={draft.freeAccess}
-        isDisabled={disabled}
-        onChange={(freeAccess: boolean) =>
-          onDraftChange((current) => ({
-            ...current,
-            freeAccess,
-          }))
-        }
-      >
-        <Checkbox.Control>
-          <Checkbox.Indicator />
-        </Checkbox.Control>
-        <Checkbox.Content>
-          <span className="text-sm">{t("dashboard.freeAccessLabel")}</span>
-        </Checkbox.Content>
-      </Checkbox>
-      {draft.freeAccess ? (
-        <p className="text-xs text-amber-700">{t("dashboard.hint.freeAccessUserOverrides")}</p>
-      ) : null}
-    </FieldGroup>
-  );
 }
 
 export type ShareEditMarketFieldsProps = {

@@ -42,7 +42,7 @@ import {
   formatNumber,
   formatRelativeTime,
 } from "@/lib/utils";
-import { formatTokenMillions, formatTokenMillionsFixed } from "@/lib/token-units";
+import { formatTokenAmount, formatTokenMillions, formatTokenMillionsFixed } from "@/lib/token-units";
 import { valueQuotaView, type ValueQuotaStatus } from "@/lib/share-value-quota";
 import { EnforcedValueQuotaCell, ScheduledValueQuotaLine } from "@/components/dashboard/share-value-quota-cell";
 import { isPermanentUserPolicyExpiry } from "@/lib/share-settings";
@@ -983,6 +983,22 @@ function ShareUserUsageBreakdownPanel({
         </div>
       ) : null}
 
+      {/* The list-price equivalent lives here, beside its coverage and window:
+          on the quota row it read as the cost of the whole period. */}
+      <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
+        <span>
+          {row.windowStartsAt
+            ? t("dashboard.userLimit.byModel.windowSince", { time: formatDateTime(row.windowStartsAt, locale) })
+            : t("dashboard.userLimit.byModel.windowRetained")}
+        </span>
+        <ShareUsageEquivalent
+          amount={formatUsdMicros(row.equivalentUsdMicros, locale) ?? null}
+          coverage={row.pricedCoveragePercent}
+          t={t}
+          summary
+        />
+      </div>
+
       <table className="w-full table-fixed border-collapse text-[11px]">
         <colgroup>
           <col className="w-[36%]" />
@@ -1232,10 +1248,8 @@ export function ShareUserLimitsTable({
   };
   renderEmailMeta?: (row: ShareUserLimitStatusRow) => React.ReactNode;
   /**
-   * §12.3: both breakdown props are optional and, when absent, the table
-   * renders byte-for-byte as before. That is the whole point — two call sites
-   * (the editor and the read view) share this component, and neither should
-   * change until it opts in.
+   * §12.3: both breakdown props are optional; without them the table shows
+   * no expand column. The editor, the read view and the drawer share it.
    */
   breakdown?: ShareUserUsageBreakdownMap;
   breakdownRevision?: string;
@@ -1243,7 +1257,7 @@ export function ShareUserLimitsTable({
   breakdownErrors?: Record<string, string>;
   /** Successful fetch with no matching email still counts as loaded (empty, not loading). */
   breakdownLoaded?: Record<string, true>;
-  /** Lazy load: fired on first expand only, never on mount. */
+  /** Loads (or retries) one email's breakdown when its row expands. */
   onExpand?: (email: string) => void;
   onPriceSaved?: (email: string) => void;
 }) {
@@ -1291,7 +1305,7 @@ export function ShareUserLimitsTable({
     Boolean(onExpand) || Object.keys(breakdown || {}).length > 0;
   const locale = useLocaleText().locale;
   const columnCount =
-    4 + (leading ? 1 : 0) + (trailing ? 1 : 0) + (expandable ? 1 : 0);
+    3 + (leading ? 1 : 0) + (trailing ? 1 : 0) + (expandable ? 1 : 0);
 
   const toggleExpanded = React.useCallback(
     (email: string) => {
@@ -1317,27 +1331,27 @@ export function ShareUserLimitsTable({
   }, [hasCountdown]);
 
   return (
-    <div className="overflow-hidden rounded-md border">
-      <table className="w-full table-fixed border-collapse text-[11px]">
+    <div className="overflow-x-auto rounded-lg border border-border">
+      <table className="w-full min-w-[30rem] table-fixed border-collapse text-xs">
         <colgroup>
           {leading ? <col className="w-10" /> : null}
-          {expandable ? <col className="w-6" /> : null}
-          <col className="w-[34%]" />
-          <col className="w-[12%]" />
-          <col className="w-[34%]" />
-          {trailing ? <col /> : <col className="w-[20%]" />}
+          {expandable ? <col className="w-7" /> : null}
+          <col className="w-[36%]" />
+          <col className="w-[13%]" />
+          <col />
           {trailing ? <col className="w-16" /> : null}
         </colgroup>
-        <thead className="bg-muted/50 text-left font-mono uppercase tracking-[0.08em] text-muted-foreground">
+        <thead className="bg-muted/50 text-left text-xs font-medium text-muted-foreground">
           <tr>
-            {leading ? <th className="px-1.5 py-2">{leading.header}</th> : null}
-            {expandable ? <th className="w-6 px-0 py-2" /> : null}
-            <th className="px-1.5 py-2">{t("dashboard.usageEmail.email")}</th>
-            <th className="px-1.5 py-2">{t("dashboard.userLimit.parallel")}</th>
-            <th className="px-1.5 py-2">{t("dashboard.userLimit.token")}</th>
-            <th className="px-1.5 py-2">{t("dashboard.userLimit.reset")}</th>
+            {leading ? <th className="px-2 py-2">{leading.header}</th> : null}
+            {expandable ? <th className="w-7 px-0 py-2" /> : null}
+            <th className="px-2 py-2 font-medium">{t("dashboard.usageEmail.email")}</th>
+            <th className="px-2 py-2 font-medium">{t("dashboard.userLimit.parallel")}</th>
+            <th className="px-2 py-2 font-medium">{t("dashboard.userLimit.quota")}</th>
             {trailing ? (
-              <th className="w-16 px-0 py-2 text-center">{trailing.header}</th>
+              <th className="w-16 px-0 py-2 text-center">
+                {trailing.header ?? <span className="sr-only">{t("common.actions")}</span>}
+              </th>
             ) : null}
           </tr>
         </thead>
@@ -1358,20 +1372,18 @@ export function ShareUserLimitsTable({
             const emailKey = row.email.trim().toLowerCase();
             const isExpanded = expanded.has(emailKey);
             const breakdownRow = breakdown?.[emailKey];
-            const equivalent = breakdownRow
-              ? formatUsdMicros(breakdownRow.equivalentUsdMicros, locale)
-              : null;
+            const resetLine = countdown ? t("dashboard.userLimit.resetIn", { time: countdown }) : null;
             return (
               <React.Fragment key={`${row.role}:${row.email}`}>
-              <tr className="border-t">
+              <tr className="border-t border-border">
                 {leading ? (
-                  <td className="px-1.5 py-2 align-middle">{leading.cell(row)}</td>
+                  <td className="px-2 py-2.5 align-middle">{leading.cell(row)}</td>
                 ) : null}
                 {expandable ? (
-                  <td className="w-6 px-0 py-2 align-top">
+                  <td className="w-7 px-0 py-2.5 align-top">
                     <button
                       type="button"
-                      className="flex h-5 w-5 items-center justify-center rounded text-muted-foreground transition hover:text-foreground focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1"
+                      className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground transition hover:text-foreground focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1"
                       aria-expanded={isExpanded}
                       aria-label={t(
                         isExpanded
@@ -1381,16 +1393,16 @@ export function ShareUserLimitsTable({
                       onClick={() => toggleExpanded(row.email)}
                     >
                       {isExpanded ? (
-                        <ChevronDown className="h-3.5 w-3.5" />
+                        <ChevronDown className="h-3.5 w-3.5" aria-hidden />
                       ) : (
-                        <ChevronRight className="h-3.5 w-3.5" />
+                        <ChevronRight className="h-3.5 w-3.5" aria-hidden />
                       )}
                     </button>
                   </td>
                 ) : null}
-                <td className="px-1.5 py-2">
+                <td className="px-2 py-2.5 align-top">
                   <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-                    <span className="min-w-0 whitespace-normal break-all font-medium leading-4">
+                    <span className="min-w-0 font-medium leading-5 text-foreground [overflow-wrap:anywhere]">
                       {row.email}
                     </span>
                     <Chip
@@ -1403,10 +1415,10 @@ export function ShareUserLimitsTable({
                     {renderEmailMeta?.(row)}
                   </div>
                 </td>
-                <td className="overflow-hidden px-1.5 py-2 font-mono">
+                <td className="overflow-hidden px-2 py-2.5 align-top tabular-nums">
                   {displayUserLimitValue(row.parallelLimit, unlimited)}
                 </td>
-                <td className="overflow-hidden px-1.5 py-2">
+                <td className="overflow-hidden px-2 py-2.5 align-top">
                   {usd ? (
                     <>
                       <EnforcedValueQuotaCell
@@ -1418,37 +1430,31 @@ export function ShareUserLimitsTable({
                         onReconcile={onValueReconcile && grant?.manager !== "routerShareMarket" ? () => onValueReconcile(row.email) : undefined}
                         t={t}
                       />
+                      {resetLine ? <div className="mt-0.5 text-[11px] text-muted-foreground">{resetLine}</div> : null}
                       {valueView?.scheduled ? <ScheduledValueQuotaLine scheduled={valueView.scheduled} t={t} /> : null}
                     </>
                   ) : row.limitUnknown ? (
                     <>
-                      <div className="font-mono leading-4">
-                        <strong>— / —</strong>
+                      <div className="leading-5 tabular-nums">
+                        <span className="font-medium text-foreground">— / —</span>
                         <span className="text-muted-foreground">{" · "}{periodLabels[period] || period}</span>
                       </div>
                       {valueView?.scheduled ? <ScheduledValueQuotaLine scheduled={valueView.scheduled} t={t} /> : null}
                     </>
                   ) : (
                     <>
-                      <div className="font-mono leading-4">
-                        <strong>
-                          {quotaPending ? t("quota.awaitingObservation") : compactTokens(used)}
+                      <div className="leading-5 tabular-nums">
+                        <span className="font-medium text-foreground">
+                          {quotaPending ? t("quota.awaitingObservation") : formatTokenAmount(used, locale)}
                           {" / "}
-                          {limited ? compactTokens(limit!) : "∞"}
-                        </strong>
+                          {limited ? formatTokenMillions(limit!, locale) : unlimited}
+                        </span>
                         <span className="text-muted-foreground">
                           {" · "}
                           {periodLabels[period] || period}
+                          {resetLine ? ` · ${resetLine}` : null}
                         </span>
                       </div>
-                      {equivalent ? (
-                        <div
-                          className="mt-0.5 font-mono text-[10px] leading-4 text-muted-foreground"
-                          title={t("dashboard.userLimit.equivalent.hint")}
-                        >
-                          ≈ {equivalent}
-                        </div>
-                      ) : null}
                       {limited && !quotaPending ? (
                         <UsageBar
                           used={used}
@@ -1458,11 +1464,11 @@ export function ShareUserLimitsTable({
                         />
                       ) : null}
                       {pct >= 100 ? (
-                        <div className="mt-0.5 text-[10px] text-danger">
+                        <div className="mt-0.5 text-[11px] text-danger">
                           {t("dashboard.userLimit.atLimit")}
                         </div>
                       ) : pct >= 80 ? (
-                        <div className="mt-0.5 text-[10px] text-warning">
+                        <div className="mt-0.5 text-[11px] text-warning">
                           {t("dashboard.userLimit.nearLimit")}
                         </div>
                       ) : null}
@@ -1470,19 +1476,14 @@ export function ShareUserLimitsTable({
                     </>
                   )}
                   {row.expiresAt != null && !isPermanentUserPolicyExpiry(row.expiresAt) ? (
-                    <div className="mt-0.5 text-[10px] text-muted-foreground">
+                    <div className="mt-0.5 text-[11px] text-muted-foreground">
                       {t("dashboard.userLimit.expiry")}:{" "}
                       {displayUserLimitExpiry(row.expiresAt, permanent)}
                     </div>
                   ) : null}
                 </td>
-                <td className="overflow-hidden px-1.5 py-2 font-mono text-muted-foreground">
-                  {countdown
-                    ? t("dashboard.userLimit.resetIn", { time: countdown })
-                    : t("dashboard.userLimit.noReset")}
-                </td>
                 {trailing ? (
-                  <td className="w-16 overflow-hidden px-0 py-2 text-center align-middle">
+                  <td className="w-16 overflow-hidden px-0 py-2.5 text-center align-top">
                     {trailing.cell(row)}
                   </td>
                 ) : null}

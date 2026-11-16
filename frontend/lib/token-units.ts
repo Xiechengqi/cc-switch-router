@@ -74,3 +74,24 @@ export function formatTokenMillionsFixed(value: number, locale?: string, fractio
   }).format(value / scale);
   return `${formatted}${unit}`;
 }
+
+/**
+ * A Token amount for reading, in the same unit the locale shows everywhere
+ * else (万/亿 in Chinese, M otherwise) with at most two decimals and no
+ * trailing zeros. Digits are cut, not rounded, so usage never reads as more
+ * than it is (99,999,999 stays under 1亿) and a small non-zero amount reads
+ * "<0.01", never 0. Use `formatTokenMillions` where the exact value matters,
+ * such as a configured limit.
+ */
+export function formatTokenAmount(value: number, locale?: string) {
+  if (!Number.isSafeInteger(value) || value < 0) return "-";
+  const [scale, unit] = isChineseLocale(locale)
+    ? value >= TOKENS_PER_YI
+      ? [TOKENS_PER_YI, "亿"] as const
+      : [TOKENS_PER_WAN, "万"] as const
+    : [TOKENS_PER_MILLION, " M"] as const;
+  const hundredths = Math.floor(value / (scale / 100));
+  const format = new Intl.NumberFormat(locale, { minimumFractionDigits: 0, maximumFractionDigits: 2 });
+  if (value > 0 && hundredths === 0) return `<${format.format(0.01)}${unit}`;
+  return `${format.format(hundredths / 100)}${unit}`;
+}

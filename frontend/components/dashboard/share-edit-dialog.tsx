@@ -50,7 +50,7 @@ export function ShareEditDialog({
                 {readOnly && liveShare ? (
                   <ShareEditReadView share={liveShare} t={t} />
                 ) : liveShare && form ? (
-                  <div className="grid gap-7">
+                  <div className="grid grid-cols-[minmax(0,1fr)] gap-7">
                     <ShareEditStatusBanner share={liveShare} t={t} />
                     {form.locked ? (
                       <Alert status="warning" className="!text-slate-900">

@@ -28,9 +28,12 @@ import type {
 } from "@/lib/types";
 import { formatDateTime } from "@/lib/utils";
 import {
-  ReadOnlyField,
   ShareEditSection,
+  ShareEditSubheading,
 } from "./share-edit-section";
+import { AccountResetStatus, ShareAccessModeField, ShareAccessQuotaSection } from "./share-access-quota";
+import { accountResetInUse } from "@/lib/account-reset-display";
+import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ShareRecentErrorsPanel } from "./share-recent-errors-panel";
 import { ShareRequestedModelBlocksPanel } from "./share-requested-model-blocks-panel";
 
@@ -64,6 +67,7 @@ export function ShareEditReadView({
   share: ShareView;
   t: TFn;
 }) {
+  const { locale } = useLocaleText();
   const boundApps = shareProviderSupportedApps(share);
   const shareApp = resolveShareCoreApp(share) ?? boundApps[0];
 
@@ -134,7 +138,7 @@ export function ShareEditReadView({
   const description = share.description?.trim() || "";
 
   return (
-    <div className="grid gap-6">
+    <div className="grid grid-cols-[minmax(0,1fr)] gap-6">
       {description ? (
         <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-900">
           {description}
@@ -191,16 +195,34 @@ export function ShareEditReadView({
       </ShareEditSection>
 
       {shareApp ? (
-        <>
-          <ShareEditSection title={t("dashboard.shareEdit.section.access")}>
-            {freeAccess ? (
-              <ReadOnlyField
-                label={t("dashboard.field.freeAccess")}
-                value={t("dashboard.freeAccessEnabled")}
-              />
-            ) : null}
-            <div className="grid gap-2">
-              <div className="text-sm font-semibold text-slate-900">{t("dashboard.userLimit.title")}</div>
+        <ShareAccessQuotaSection
+          t={t}
+          access={<ShareAccessModeField t={t} freeAccess={Boolean(freeAccess)} />}
+          ceiling={
+            <ShareCeilingBar
+              t={t}
+              tokenDisplay={formatShareCeilingToken(tokenLimit, tokenUnlimited, t, locale)}
+              parallelDisplay={formatShareCeilingParallel(parallelLimit, parallelUnlimited, t)}
+              expiryDisplay={
+                expiryTitle(share.expiresAt) === "∞"
+                  ? t("dashboard.userLimit.permanent")
+                  : formatDateTime(share.expiresAt, locale) || "—"
+              }
+            />
+          }
+          users={
+            <div className="grid gap-3">
+              <ShareEditSubheading hint={t("dashboard.userLimit.parallelScopeHint")}>
+                {t("dashboard.userLimit.usersHeading")}
+              </ShareEditSubheading>
+              {freeAccess ? <p className="text-xs leading-relaxed text-muted-foreground">{t("dashboard.access.publicUsersNote")}</p> : null}
+              {accountResetInUse(limitGrants) ? (
+                <AccountResetStatus
+                  t={t}
+                  capability={limitGrants.find((grant) => grant.accountResetCapability)?.accountResetCapability}
+                  cycle={limitGrants.find((grant) => grant.accountQuotaCycle)?.accountQuotaCycle}
+                />
+              ) : null}
               {limitRows?.length || limitGrants.length ? (
                 <ShareUserLimitsTable
                   rows={limitRows || undefined}
@@ -221,18 +243,8 @@ export function ShareEditReadView({
                 <EmptyBlock>{t("dashboard.userLimit.empty")}</EmptyBlock>
               )}
             </div>
-            <ShareCeilingBar
-              t={t}
-              tokenDisplay={formatShareCeilingToken(tokenLimit, tokenUnlimited, t)}
-              parallelDisplay={formatShareCeilingParallel(parallelLimit, parallelUnlimited, t)}
-              expiryDisplay={
-                expiryTitle(share.expiresAt) === "∞"
-                  ? t("dashboard.userLimit.permanent")
-                  : formatDateTime(share.expiresAt) || "—"
-              }
-            />
-          </ShareEditSection>
-        </>
+          }
+        />
       ) : (
         <EmptyBlock>{t("dashboard.shareEditNoAppType")}</EmptyBlock>
       )}

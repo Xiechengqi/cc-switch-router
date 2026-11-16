@@ -6,17 +6,20 @@ import { Info } from "lucide-react";
 import type { TFn } from "@/components/dashboard/share-dashboard-utils";
 import type { ShareEditView, ShareView } from "@/lib/types";
 
-export function ReadOnlyField({
-  label,
-  value,
+/** A block heading inside a section: one step below the section title. */
+export function ShareEditSubheading({
+  children,
+  hint,
+  id,
 }: {
-  label: string;
-  value: React.ReactNode;
+  children: React.ReactNode;
+  hint?: string;
+  id?: string;
 }) {
   return (
-    <div className="grid gap-1">
-      <span className="text-xs font-medium uppercase tracking-wide text-slate-500">{label}</span>
-      <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-900">{value}</div>
+    <div className="flex min-w-0 items-center gap-1">
+      <h4 id={id} className="truncate text-[13px] font-semibold text-foreground">{children}</h4>
+      {hint ? <ShareEditHint label={hint} /> : null}
     </div>
   );
 }
@@ -52,9 +55,10 @@ export function ShareEditSection({
   children: React.ReactNode;
 }) {
   return (
-    <section className="grid gap-3 rounded-2xl border border-slate-200/80 bg-white p-4">
+    <section className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-4 rounded-2xl border border-border bg-card p-4 sm:p-5">
       <div className="flex min-w-0 items-center justify-between gap-2">
-        <h3 className="flex min-w-0 items-center gap-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-slate-500">
+        <h3 className="flex min-w-0 items-center gap-2 text-sm font-semibold text-foreground">
+          <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-accent" aria-hidden />
           <span className="truncate">{title}</span>
           {hint ? <ShareEditHint label={hint} /> : null}
         </h3>

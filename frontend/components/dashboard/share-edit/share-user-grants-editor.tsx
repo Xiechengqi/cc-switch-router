@@ -1,11 +1,13 @@
 "use client";
 
-import { Button, Checkbox, Input, ListBox, Modal, Select, Tooltip } from "@heroui/react";
-import { Info, Pencil, Plus, Trash2 } from "lucide-react";
+import { Button, Checkbox, Input, ListBox, Modal, Select } from "@heroui/react";
+import { Pencil, Plus, Trash2 } from "lucide-react";
 import * as React from "react";
 
 import { ShareUserLimitsTable } from "@/components/dashboard/drawer-panels";
 import type { TFn } from "@/components/dashboard/share-dashboard-utils";
+import { useLocaleText } from "@/components/i18n/locale-provider";
+import { accountCycleEnded, accountResetErrorText, accountResetInUse } from "@/lib/account-reset-display";
 import { getShareUserLimitStatus, previewShareAccountReset } from "@/lib/api";
 import { useShareUserUsageBreakdown } from "@/lib/use-share-user-usage-breakdown";
 import { useValueQuotaReadiness } from "@/lib/use-value-quota-readiness";
@@ -37,6 +39,9 @@ import {
 } from "@/lib/token-units";
 import { applyShareUserPolicyBatch, patchedUserPolicy, type ShareUserPolicyBatchPatch } from "./share-user-policy-batch";
 import { ShareValueUsageAdjustment } from "./share-value-usage-adjustment";
+import { AccountResetStatus } from "./share-access-quota";
+import { ShareEditSubheading } from "./share-edit-section";
+import { FIELD_LABEL_CLASS, TokenInputEcho } from "./share-edit-shared";
 import { publishValueQuotaStatuses, useShareValueQuotaSnapshot } from "@/lib/use-share-value-quota";
 import {
   quotaConversionNeeded, quotaConversionInput, formatQuotaPicos, formatUsdLimit, microsToUsdInput, parseUsdLimit, picosToUsdInput, parseInitialValueUsage, usdUsageToPicos, valuePreviewRowOutcome, valueStatusTextKey,
@@ -281,6 +286,7 @@ export function ShareUserGrantsEditor({
   valueUsageInitializations = {},
   onValueUsageInitializationsChange,
   savedGrants = value,
+  freeAccess = false,
   onChange,
 }: {
   value: ShareUserGrantMap;
@@ -296,8 +302,11 @@ export function ShareUserGrantsEditor({
   valueUsageInitializations?: ShareUserValueUsageInitializationMap;
   onValueUsageInitializationsChange?: (value: ShareUserValueUsageInitializationMap) => void;
   savedGrants?: ShareUserGrantMap;
+  /** Public Shares treat the list as personal limits, not an allowlist. */
+  freeAccess?: boolean;
   onChange: (value: ShareUserGrantMap) => void;
 }) {
+  const { locale } = useLocaleText();
   const normalizedOwner = ownerEmail.trim().toLowerCase();
   const [accountPreview, setAccountPreview] = React.useState<AccountResetPreview>();
   const { items: valueStatuses, stale: valueStatusesStale } = useShareValueQuotaSnapshot(shareId, true);
@@ -315,8 +324,14 @@ export function ShareUserGrantsEditor({
     try {
       const preview = await previewShareAccountReset(shareId, configRevision, policies);
       setAccountPreview(preview);
+      // A cycle that already ended cannot be applied, even if an older Server
+      // still reports it ready.
+      if (accountCycleEnded(preview.accountQuotaCycle, Date.now())) throw new Error("cycle_expired");
       if (preview.accountResetCapability.syncStatus !== "ready" || preview.rows.some((row) => row.reason)) {
-        throw new Error(preview.accountResetCapability.reason || t("dashboard.userLimit.accountReset.notReady"));
+        // Codes read as copy where the error is shown.
+        throw new Error(preview.accountResetCapability.reason
+          || preview.rows.find((row) => row.reason)?.reason
+          || "ACCOUNT_RESET_NOT_READY");
       }
       setPreviewIntent(intent);
       return false;
@@ -549,7 +564,8 @@ export function ShareUserGrantsEditor({
     setDraftCycle(accountCycle);
     setEditingEmail(null);
     setError("");
-    setGrantDraft(makeDraft("", { ...defaultPolicy, tokenPeriod: accountCapability?.syncStatus === "ready" && supported.has("accountReset") ? "accountReset" : defaultPolicy.tokenPeriod }));
+    setGrantDraft(makeDraft("", { ...defaultPolicy, tokenPeriod: accountCapability?.syncStatus === "ready" && !accountCycleEnded(accountCycle, Date.now())
+      && supported.has("accountReset") ? "accountReset" : defaultPolicy.tokenPeriod }));
   };
 
   const openEdit = (grant: ShareUserGrant) => {
@@ -589,14 +605,32 @@ export function ShareUserGrantsEditor({
   };
 
   const applyGrants = (userGrants: ShareUserGrantMap) => onChange(userGrants);
+  const singleAccountIntent = grantDraft ? JSON.stringify(grantDraft) : "";
+  const batchAccountIntent = batchDraft ? JSON.stringify([batchDraft, [...selectedEditableEmails].sort()]) : "";
+  /** A shown projection waits for a second press, and the button says so. */
+  const accountPreviewShown = (intent: string) => !!intent && previewIntent === intent
+    && accountPreview?.accountResetCapability.syncStatus === "ready";
+  const accountInUse = accountResetInUse(grants);
+  const capacityWarning = accountPreview?.ledgerHealth?.capacityWarning
+    ? { count: accountPreview.ledgerHealth.revisionCount, limit: accountPreview.ledgerHealth.admissionLimit }
+    : undefined;
+  const accountStatus = <AccountResetStatus t={t} capability={accountCapability} cycle={accountCycle} capacityWarning={capacityWarning} />;
 
   const save = async () => {
     if (!grantDraft) return;
-    if (grantDraft.tokenPeriod === "accountReset" && grantDraft.quotaUnit !== "usdEquivalent") {
+    // Parallel or expiry edits on a user already on the account cycle do not
+    // change its quota, so they need no projection (and still save while the
+    // cycle is out of date).
+    const savedAccountGrant = editingEmail ? savedGrants[editingEmail] : undefined;
+    const accountQuotaUnchanged = !!savedAccountGrant && savedAccountGrant.active !== false
+      && savedAccountGrant.policy.tokenPeriod === "accountReset" && !savedAccountGrant.policy.valueQuota
+      && (savedAccountGrant.policy.tokenLimit ?? null) === (millionsInputToTokens(grantDraft.tokenLimit) ?? null)
+      && grantDraft.usageAction === "unchanged";
+    if (grantDraft.tokenPeriod === "accountReset" && grantDraft.quotaUnit !== "usdEquivalent" && !accountQuotaUnchanged) {
       try {
         if (!await confirmAccountPreview({ [grantDraft.email]: { tokenPeriod: "accountReset",
           tokenLimit: millionsInputToTokens(grantDraft.tokenLimit) ?? undefined } }, JSON.stringify(grantDraft))) return;
-      } catch (error) { setError(errorText(error)); return; }
+      } catch (error) { setError(accountResetErrorText(error, t)); return; }
     }
     const email = grantDraft.email.trim().toLowerCase();
     const parallelLimit = grantDraft.parallelLimit.trim()
@@ -661,7 +695,7 @@ export function ShareUserGrantsEditor({
       setError(
         consumedTokens != null && consumedTokens < observedTokens
           ? t("dashboard.userLimit.consumedBelowObserved", {
-              observed: formatTokenMillions(observedTokens),
+              observed: formatTokenMillions(observedTokens, locale),
             })
           : t("dashboard.userLimit.invalidUsage"),
       );
@@ -780,8 +814,8 @@ export function ShareUserGrantsEditor({
           (batchDraft.applyTokenLimit ? batchDraft.tokenPeriod : grant.policy.tokenPeriod) === "accountReset")
           .map((grant) => [grant.email, { ...grant.policy, tokenPeriod: "accountReset" as const,
             tokenLimit: batchDraft.applyTokenLimit ? millionsInputToTokens(batchDraft.tokenLimit) ?? undefined : grant.policy.tokenLimit }]));
-        if (!await confirmAccountPreview(policies, JSON.stringify([batchDraft, [...selectedEditableEmails].sort()]))) return;
-      } catch (error) { setError(errorText(error)); return; }
+        if (!await confirmAccountPreview(policies, batchAccountIntent)) return;
+      } catch (error) { setError(accountResetErrorText(error, t)); return; }
     }
     const parallelLimit = batchDraft.parallelLimit.trim()
       ? Number(batchDraft.parallelLimit)
@@ -843,7 +877,7 @@ export function ShareUserGrantsEditor({
         usageInvalid
           ? consumedTokens != null && consumedTokens < usageFloor
             ? t("dashboard.userLimit.consumedBelowObserved", {
-                observed: formatTokenMillions(usageFloor),
+                observed: formatTokenMillions(usageFloor, locale),
               })
             : t("dashboard.userLimit.invalidUsage")
           : t("dashboard.userLimit.invalidPolicy"),
@@ -970,37 +1004,21 @@ export function ShareUserGrantsEditor({
     }
   };
 
-  const previewPanel = previewIntent && accountPreview ? <div role="status" className="text-xs">
-    {t("dashboard.userLimit.accountReset.preview")}
-    {accountPreview.rows.map((row) => <div key={row.email}>{row.email}: {row.currentTokens ?? "—"} → {row.expectedTokens ?? "—"}{row.wouldExceed ? ` · ${t("dashboard.userLimit.accountReset.exceeded")}` : ""}</div>)}
+  const formatPreviewTokens = (value?: number | null) => value == null ? "—" : formatTokenMillions(value, locale);
+  const previewPanel = previewIntent && accountPreview ? <div role="status" className="mx-6 grid gap-1 rounded-xl bg-muted/40 px-3 py-2 text-xs">
+    <p className="text-muted-foreground">{t("dashboard.userLimit.accountReset.preview")}</p>
+    {accountPreview.rows.map((row) => <div key={row.email} className="tabular-nums [overflow-wrap:anywhere]">
+      <span className="font-medium text-foreground">{row.email}</span>
+      {": "}{formatPreviewTokens(row.currentTokens)} → {formatPreviewTokens(row.expectedTokens)}
+      {row.wouldExceed ? <span className="text-warning">{` · ${t("dashboard.userLimit.accountReset.exceeded")}`}</span> : null}
+    </div>)}
   </div> : null;
   return (
-    <div className="grid gap-3">
-      <div className="text-xs text-muted-foreground" role="status">
-        {t("dashboard.userLimit.periodAccountReset")}: {accountCapability?.syncStatus ?? t("dashboard.userLimit.accountReset.pending")}{accountCapability?.reason ? ` · ${accountCapability.reason}` : ""}
-        {accountCycle ? <div>{accountCycle.bucketId} · {new Date(accountCycle.startsAtMs).toISOString()} → {accountCycle.endsAtMs ? new Date(accountCycle.endsAtMs).toISOString() : t("dashboard.userLimit.accountReset.noEnd")}
-          {" · "}{accountCycle.basis} · {t("dashboard.userLimit.accountReset.observed")} {new Date(accountCycle.observedAtMs).toISOString()}</div> : null}
-        {t("dashboard.userLimit.accountReset.caveat")}
-        {accountPreview?.ledgerHealth?.capacityWarning ? <div role="status">quota_ledger_capacity_warning ({accountPreview.ledgerHealth.revisionCount}/{accountPreview.ledgerHealth.admissionLimit})</div> : null}
-      </div>
+    <div className="grid grid-cols-[minmax(0,1fr)] gap-3">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-center gap-1">
-          <div className="mono-label text-muted-foreground">{t("dashboard.userLimit.title")}</div>
-          <Tooltip>
-            <Tooltip.Trigger>
-              <Button
-                isIconOnly
-                size="sm"
-                variant="ghost"
-                className="h-6 w-6 min-w-6 text-muted-foreground"
-                aria-label={t("dashboard.userLimit.parallelScopeHint")}
-              >
-                <Info className="h-3.5 w-3.5" />
-              </Button>
-            </Tooltip.Trigger>
-            <Tooltip.Content>{t("dashboard.userLimit.parallelScopeHint")}</Tooltip.Content>
-          </Tooltip>
-        </div>
+        <ShareEditSubheading hint={t("dashboard.userLimit.parallelScopeHint")}>
+          {t("dashboard.userLimit.usersHeading")}
+        </ShareEditSubheading>
         <div className="flex flex-wrap items-center justify-end gap-2">
           {selecting ? (
             <Button size="sm" variant="ghost" onClick={exitSelecting}>
@@ -1028,6 +1046,8 @@ export function ShareUserGrantsEditor({
           </Button>
         </div>
       </div>
+      {freeAccess ? <p className="text-xs leading-relaxed text-muted-foreground">{t("dashboard.access.publicUsersNote")}</p> : null}
+      {accountInUse ? accountStatus : null}
 
       {grants.length ? (
         <ShareUserLimitsTable
@@ -1119,7 +1139,7 @@ export function ShareUserGrantsEditor({
                       isDisabled={disabled}
                       onClick={() => removeGrant(grant)}
                     >
-                      <Trash2 className="h-3.5 w-3.5 text-red-600" />
+                      <Trash2 className="h-3.5 w-3.5 text-danger" aria-hidden />
                     </Button>
                   ) : null}
                 </div>
@@ -1160,15 +1180,16 @@ export function ShareUserGrantsEditor({
               </Modal.Header>
               <Modal.Body className="grid gap-4 !text-slate-900 sm:grid-cols-2">
                 <div className="grid gap-1.5 sm:col-span-2">
-                  <label htmlFor={`${fieldId}-email`} className="mono-label text-muted-foreground">Email</label>
+                  <label htmlFor={`${fieldId}-email`} className={FIELD_LABEL_CLASS}>{t("dashboard.usageEmail.email")}</label>
                   <Input id={`${fieldId}-email`} type="email" value={grantDraft?.email || ""} disabled={!!editingEmail} onChange={(event) => grantDraft && setGrantDraft({ ...grantDraft, email: event.target.value })} />
+                  {!editingEmail ? <p className="text-xs text-muted-foreground">{t("dashboard.userLimit.defaultsHint")}</p> : null}
                 </div>
                 <div className="grid content-start gap-1.5">
-                  <label htmlFor={`${fieldId}-parallel`} className="mono-label text-muted-foreground">{t("dashboard.field.parallelLimit")}</label>
+                  <label htmlFor={`${fieldId}-parallel`} className={FIELD_LABEL_CLASS}>{t("dashboard.field.parallelLimit")}</label>
                   <Input id={`${fieldId}-parallel`} type="number" min={1} placeholder={t("common.unlimited")} value={grantDraft?.parallelLimit || ""} onChange={(event) => grantDraft && setGrantDraft({ ...grantDraft, parallelLimit: event.target.value })} />
                 </div>
                 <div className="grid content-start gap-1.5">
-                  <span className="mono-label text-muted-foreground">{t("dashboard.userLimit.value.unit")}</span>
+                  <span className={FIELD_LABEL_CLASS}>{t("dashboard.userLimit.value.unit")}</span>
                   <QuotaUnitSwitch t={t} value={grantDraft?.quotaUnit || "tokens"} usdDisabled={readiness.unavailable} readinessId={`${fieldId}-readiness`}
                     onChange={(unit) => {
                       if (!grantDraft || unit === grantDraft.quotaUnit) return;
@@ -1188,7 +1209,7 @@ export function ShareUserGrantsEditor({
                   {singleUsdPolicies ? <ValuePreviewLine state={singlePreview} t={t} calibrations={grantDraft ? {[editedEmail]:{amount: grantDraft.quotaUnit === "usdEquivalent" ? grantDraft.consumedValue : grantDraft.consumedTokens, reason: grantDraft.valueReason}} : undefined} /> : null}
                 </div>
                 <div className={grantDraft?.quotaUnit === "usdEquivalent" ? "hidden" : "grid gap-1.5 sm:col-span-2"}>
-                  <span className="mono-label text-muted-foreground">{t("dashboard.userLimit.consumedTokens")}</span>
+                  <span className={FIELD_LABEL_CLASS}>{t("dashboard.userLimit.consumedTokens")}</span>
                   <div className="flex items-center gap-2">
                     <Input
                       type="text"
@@ -1217,11 +1238,12 @@ export function ShareUserGrantsEditor({
                       {t("dashboard.userLimit.clearRebase")}
                     </Button>
                   </div>
+                  <TokenInputEcho value={grantDraft?.consumedTokens || ""} />
                   {editingEmail && value[editingEmail] ? (
                     <p className="text-xs text-muted-foreground">
                       {t("dashboard.userLimit.consumedHint", {
-                        effective: formatTokenMillions(currentGrantTokens(value[editingEmail])),
-                        observed: formatTokenMillions(observedGrantTokens(value[editingEmail])),
+                        effective: formatTokenMillions(currentGrantTokens(value[editingEmail]), locale),
+                        observed: formatTokenMillions(observedGrantTokens(value[editingEmail]), locale),
                       })}
                     </p>
                   ) : (
@@ -1238,7 +1260,7 @@ export function ShareUserGrantsEditor({
                     value={grantDraft.valueReason} onChange={event => setGrantDraft({...grantDraft, valueReason: event.target.value})} />
                 </div> : null}
                 {grantDraft?.quotaUnit === "usdEquivalent" && !initialPreviewRow?.calibrationRequired ? <div className="grid gap-2 sm:col-span-2">
-                  <span id={`${fieldId}-value-label`} className="mono-label text-muted-foreground">{t("dashboard.userLimit.value.consumed")}</span>
+                  <span id={`${fieldId}-value-label`} className={FIELD_LABEL_CLASS}>{t("dashboard.userLimit.value.consumed")}</span>
                   {!savedGrant ? <>
                     <Input id={`${fieldId}-initial-value`} inputMode="decimal" autoComplete="off" placeholder="0"
                       aria-labelledby={`${fieldId}-value-label`}
@@ -1260,7 +1282,7 @@ export function ShareUserGrantsEditor({
                   </>}
                 </div> : null}
                 <div className="grid gap-1.5">
-                  <span className="mono-label text-muted-foreground">{t("dashboard.userLimit.period")}</span>
+                  <span className={FIELD_LABEL_CLASS}>{t("dashboard.userLimit.period")}</span>
                   <Select aria-label={t("dashboard.userLimit.period")} selectedKey={grantDraft?.tokenPeriod || "lifetime"} onSelectionChange={(key) => {
                     if (!grantDraft) return;
                     const tokenPeriod = String(key || "lifetime") as ShareTokenPeriod;
@@ -1278,9 +1300,10 @@ export function ShareUserGrantsEditor({
                     </Select.Popover>
                   </Select>
                 </div>
+                {grantDraft?.tokenPeriod === "accountReset" ? <div className="sm:col-span-2">{accountStatus}</div> : null}
                 {grantDraft && ANCHORED_PERIODS.has(grantDraft.tokenPeriod) ? (
                   <div className="grid gap-1.5 sm:col-span-2">
-                    <span className="mono-label text-muted-foreground">{t("dashboard.userLimit.anchor")}</span>
+                    <span className={FIELD_LABEL_CLASS}>{t("dashboard.userLimit.anchor")}</span>
                     <Input
                       type="datetime-local"
                       step={60}
@@ -1291,16 +1314,17 @@ export function ShareUserGrantsEditor({
                   </div>
                 ) : null}
                 <div className="grid gap-1.5">
-                  <label htmlFor={`${fieldId}-expires`} className="mono-label text-muted-foreground">{t("dashboard.field.expiresAt")}</label>
+                  <label htmlFor={`${fieldId}-expires`} className={FIELD_LABEL_CLASS}>{t("dashboard.field.expiresAt")}</label>
                   <Input id={`${fieldId}-expires`} type="datetime-local" value={grantDraft?.expiresAt || ""} onChange={(event) => grantDraft && setGrantDraft({ ...grantDraft, expiresAt: event.target.value })} />
                 </div>
-                {error ? <p className="text-sm text-red-600 sm:col-span-2">{error}</p> : null}
+                {error ? <p role="alert" className="text-sm text-danger sm:col-span-2">{error}</p> : null}
               </Modal.Body>
               {previewPanel}
               <Modal.Footer>
                 <Button variant="outline" onClick={() => setGrantDraft(null)}>{t("common.cancel")}</Button>
                 <Button variant="primary" isDisabled={previewBusy || applying} aria-busy={applying || undefined} onClick={() => void save()}>
-                  {grantDraft?.quotaUnit === "usdEquivalent" && needsAcknowledgement(singlePreview) ? t("dashboard.userLimit.value.confirmApply") : t("common.apply")}
+                  {(grantDraft?.quotaUnit === "usdEquivalent" && needsAcknowledgement(singlePreview)) || accountPreviewShown(singleAccountIntent)
+                    ? t("dashboard.userLimit.value.confirmApply") : t("common.apply")}
                 </Button>
               </Modal.Footer>
             </Modal.Dialog>
@@ -1339,7 +1363,7 @@ export function ShareUserGrantsEditor({
                     <Checkbox.Indicator />
                   </Checkbox.Control>
                   <Checkbox.Content>
-                    <span className="mono-label text-muted-foreground">
+                    <span className={FIELD_LABEL_CLASS}>
                       {t("dashboard.field.parallelLimit")}
                     </span>
                   </Checkbox.Content>
@@ -1368,7 +1392,7 @@ export function ShareUserGrantsEditor({
                     <Checkbox.Indicator />
                   </Checkbox.Control>
                   <Checkbox.Content>
-                    <span className="mono-label text-muted-foreground">
+                    <span className={FIELD_LABEL_CLASS}>
                       {t(batchDraft?.quotaUnit === "usdEquivalent" ? "dashboard.userLimit.value.limit" : "dashboard.field.tokenLimit")}
                     </span>
                   </Checkbox.Content>
@@ -1394,18 +1418,21 @@ export function ShareUserGrantsEditor({
                 </div>)}
               </div>
               <div className="grid gap-1.5">
-                <span className="mono-label text-muted-foreground">
+                <span className={FIELD_LABEL_CLASS}>
                   {t("dashboard.userLimit.period")}
                 </span>
+                {/* The period belongs to the Token limit it resets: it applies only
+                    with that box checked, and changing it never checks the box,
+                    which would copy the first user's limit onto everyone. */}
                 <Select
                   aria-label={t("dashboard.userLimit.period")}
+                  isDisabled={!batchDraft?.applyTokenLimit}
                   selectedKey={batchDraft?.tokenPeriod || "lifetime"}
                   onSelectionChange={(key) => {
                     if (!batchDraft) return;
                     const tokenPeriod = String(key || "lifetime") as ShareTokenPeriod;
                     setBatchDraft({
                       ...batchDraft,
-                      applyTokenLimit: true,
                       tokenPeriod,
                       tokenPeriodAnchor: ANCHORED_PERIODS.has(tokenPeriod)
                         ? (batchDraft.tokenPeriodAnchor || toUtcDateTime())
@@ -1438,7 +1465,7 @@ export function ShareUserGrantsEditor({
                     <Checkbox.Indicator />
                   </Checkbox.Control>
                   <Checkbox.Content>
-                    <span className="mono-label text-muted-foreground">
+                    <span className={FIELD_LABEL_CLASS}>
                       {t("dashboard.userLimit.consumedTokens")}
                     </span>
                   </Checkbox.Content>
@@ -1469,13 +1496,15 @@ export function ShareUserGrantsEditor({
                     {t("dashboard.userLimit.clearRebase")}
                   </Button>
                 </div>
+                <TokenInputEcho value={batchDraft?.consumedTokens || ""} />
                 <p className="text-xs text-muted-foreground">
                   {t("dashboard.userLimit.batchConsumedHint")}
                 </p>
               </div>
+              {batchDraft?.applyTokenLimit && batchDraft.tokenPeriod === "accountReset" ? <div className="sm:col-span-2">{accountStatus}</div> : null}
               {batchDraft?.applyTokenLimit && ANCHORED_PERIODS.has(batchDraft.tokenPeriod) ? (
                 <div className="grid gap-1.5 sm:col-span-2">
-                  <span className="mono-label text-muted-foreground">
+                  <span className={FIELD_LABEL_CLASS}>
                     {t("dashboard.userLimit.anchor")}
                   </span>
                   <Input
@@ -1504,7 +1533,7 @@ export function ShareUserGrantsEditor({
                     <Checkbox.Indicator />
                   </Checkbox.Control>
                   <Checkbox.Content>
-                    <span className="mono-label text-muted-foreground">
+                    <span className={FIELD_LABEL_CLASS}>
                       {t("dashboard.field.expiresAt")}
                     </span>
                   </Checkbox.Content>
@@ -1519,7 +1548,7 @@ export function ShareUserGrantsEditor({
                   })}
                 />
               </div>
-              {error ? <p className="text-sm text-red-600 sm:col-span-2">{error}</p> : null}
+              {error ? <p role="alert" className="text-sm text-danger sm:col-span-2">{error}</p> : null}
             </Modal.Body>
             {previewPanel}
             <Modal.Footer>
@@ -1538,7 +1567,8 @@ export function ShareUserGrantsEditor({
                   !batchDraft.applyExpiresAt)}
                 onClick={saveBatch}
               >
-                {batchDraft?.applyTokenLimit && batchDraft.quotaUnit === "usdEquivalent" && needsAcknowledgement(batchPreview)
+                {(batchDraft?.applyTokenLimit && batchDraft.quotaUnit === "usdEquivalent" && needsAcknowledgement(batchPreview))
+                  || accountPreviewShown(batchAccountIntent)
                   ? t("dashboard.userLimit.value.confirmApply")
                   : t("dashboard.userLimit.batchApply", { count: selectedEditableEmails.size })}
               </Button>

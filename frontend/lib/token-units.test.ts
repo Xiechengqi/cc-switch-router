@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  formatTokenAmount,
   formatTokenMillions,
   formatTokenMillionsFixed,
   millionsInputToTokens,
@@ -21,6 +22,18 @@ test("formatTokenMillionsFixed keeps a stable display precision", () => {
   assert.equal(formatTokenMillionsFixed(1_250_000, "en"), "1.3 M");
   assert.equal(formatTokenMillionsFixed(12_500, "zh-CN"), "1.3万");
   assert.equal(formatTokenMillionsFixed(150_000_000, "zh-CN"), "1.5亿");
+});
+
+test("formatTokenAmount reads in the locale's unit, cut rather than rounded", () => {
+  assert.equal(formatTokenAmount(46_052_134, "zh-CN"), "4,605.21万");
+  assert.equal(formatTokenAmount(100_000_000, "zh-CN"), "1亿");
+  assert.equal(formatTokenAmount(99_999_999, "zh-CN"), "9,999.99万");
+  assert.equal(formatTokenAmount(1_250_000, "en"), "1.25 M");
+  assert.equal(formatTokenAmount(99_996_000, "en"), "99.99 M");
+  assert.equal(formatTokenAmount(0, "en"), "0 M");
+  assert.equal(formatTokenAmount(4_000, "en"), "<0.01 M");
+  assert.equal(formatTokenAmount(40, "zh-CN"), "<0.01万");
+  assert.equal(formatTokenAmount(-1, "en"), "-");
 });
 
 test("parses million inputs without floating point rounding", () => {

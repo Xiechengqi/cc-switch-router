@@ -12,6 +12,7 @@ import {
   type ValuePreviewInvalidRow, type ValuePreviewRow,
 } from "@/lib/share-value-quota";
 import type { ValuePreviewState } from "@/lib/use-value-quota-preview";
+import { FIELD_LABEL_CLASS, TokenInputEcho } from "./share-edit-shared";
 
 export type QuotaUnit = "tokens" | "usdEquivalent";
 
@@ -51,9 +52,10 @@ export function QuotaLimitField({id, unit, value, onChange, error, disabled, lab
 }) {
   const usd = unit === "usdEquivalent";
   const errorId = `${id}-error`;
+  const echoId = `${id}-echo`;
   return <div className="grid gap-1.5">
     <span className={cn("flex items-center gap-1", labelHidden && !usd && "sr-only")}>
-      <label htmlFor={id} className={cn("mono-label text-muted-foreground", labelHidden && "sr-only")}>
+      <label htmlFor={id} className={cn(FIELD_LABEL_CLASS, labelHidden && "sr-only")}>
         {t(usd ? "dashboard.userLimit.value.limit" : "dashboard.field.tokenLimit")}
       </label>
       {usd ? <InfoHint label={t("dashboard.userLimit.value.details")}>
@@ -65,10 +67,11 @@ export function QuotaLimitField({id, unit, value, onChange, error, disabled, lab
       <Input id={id} type="text" inputMode="decimal" autoComplete="off" disabled={disabled}
         className={cn("w-full", usd && "pl-6")}
         placeholder={usd ? t("dashboard.userLimit.value.amountPlaceholder") : t("common.unlimited")}
-        aria-invalid={error ? true : undefined} aria-describedby={error ? errorId : undefined}
+        aria-invalid={error ? true : undefined} aria-describedby={error ? errorId : usd ? undefined : echoId}
         value={value} onChange={event => onChange(event.target.value)} />
     </div>
-    {error ? <p id={errorId} className="text-xs text-red-600">{error}</p> : null}
+    {!usd && !error ? <TokenInputEcho id={echoId} value={value} /> : null}
+    {error ? <p id={errorId} className="text-xs text-danger">{error}</p> : null}
   </div>;
 }
 
