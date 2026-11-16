@@ -34,12 +34,15 @@ test("CI registers routing regressions and Rust runtime, metrics and notificatio
   }
 });
 
-test("controller lifetime follows authenticated identity while visibility only suspends reads", async () => {
+test("controller lifetime follows viewer and login context while visibility only suspends reads", async () => {
   const { readFileSync } = await import("node:fs");
   const board = readFileSync(new URL("../components/dashboard/client-board.tsx", import.meta.url), "utf8");
   const panel = readFileSync(new URL("../components/dashboard/model-hub-panel.tsx", import.meta.url), "utf8");
   assert.match(board, /hasViewerIdentity \? sessionEmail : ""/);
-  assert.match(panel, /\}\), \[viewerKey\]\)/);
+  assert.match(panel, /const loginContext = useLoginContextKey\(\)/);
+  assert.match(panel, /\}\),\s*\[\s*viewerKey\s*,\s*loginContext\s*\]\s*\)/,
+    "signing in again must replace the routing session even when the viewer stays the same");
+  assert.match(panel, /actorKey:\s*JSON\.stringify\(\[viewerKey,\s*loginContext\]\)/);
   assert.match(panel, /session\.suspend\(\)/);
 });
 
