@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import { LocaleProvider } from "@/components/i18n/locale-provider";
-import { ClientProvidersPanel, ShareProvidersPanel } from "./drawer-panels";
+import { ClientProvidersPanel, ShareProvidersPanel } from "./share-providers-panel";
 import { ShareProviderStatusPanel } from "./share-provider-status-panel";
 import { modelRoutingShareAccountView } from "@/lib/model-routing";
 import type { ShareView, UserModelRoutingShare } from "@/lib/types";
