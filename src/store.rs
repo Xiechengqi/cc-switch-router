@@ -11651,15 +11651,24 @@ impl AppStore {
         ensure_free_access_market_exclusive_tx(&conn, share_id, effective_free_access)?;
         let supported_user_token_periods =
             parse_supported_user_token_periods(&supported_user_token_periods_json);
+        let period_allowed = |email: &str, period: ShareTokenPeriod| {
+            user_token_period_allowed(
+                &supported_user_token_periods,
+                &existing_user_grants,
+                email,
+                period,
+            )
+        };
         if patch.user_grant_edits.as_ref().is_some_and(|edits| {
-            edits
-                .values()
-                .filter_map(|edit| edit.policy.as_ref())
-                .any(|policy| !supported_user_token_periods.contains(&policy.token_period))
+            edits.iter().any(|(email, edit)| {
+                edit.policy
+                    .as_ref()
+                    .is_some_and(|policy| !period_allowed(email, policy.token_period))
+            })
         }) || patch.user_grants.as_ref().is_some_and(|grants| {
             grants
-                .values()
-                .any(|grant| !supported_user_token_periods.contains(&grant.policy.token_period))
+                .iter()
+                .any(|(email, grant)| !period_allowed(email, grant.policy.token_period))
         }) {
             return Err(AppError::BadRequest(
                 "selected token period is not supported by this client".into(),
@@ -22727,6 +22736,25 @@ fn legacy_supported_user_token_periods() -> Vec<ShareTokenPeriod> {
     ]
 }
 
+/// A Client drops accountReset from its offer while the account cycle is not
+/// ready. An active grant already on that period keeps it, so the rest of the
+/// Share stays editable; switching a grant onto accountReset, or restoring a
+/// revoked one, still needs the offer.
+fn user_token_period_allowed(
+    supported: &[ShareTokenPeriod],
+    existing: &BTreeMap<String, ShareUserGrant>,
+    email: &str,
+    period: ShareTokenPeriod,
+) -> bool {
+    supported.contains(&period)
+        || (period == ShareTokenPeriod::AccountReset
+            && existing
+                .get(&email.trim().to_ascii_lowercase())
+                .is_some_and(|grant| {
+                    grant.active && grant.policy.token_period == ShareTokenPeriod::AccountReset
+                }))
+}
+
 fn parse_supported_user_token_periods(value: &str) -> Vec<ShareTokenPeriod> {
     serde_json::from_str::<Vec<ShareTokenPeriod>>(value)
         .ok()
@@ -30188,6 +30216,7 @@ pub(crate) mod tests {
     mod model_health_status;
     mod share_account_identity;
     mod share_market_control;
+    mod share_token_periods;
     include!("store/share_value_quotas/signed_delivery_tests.rs");
     include!("store/share_value_quotas/metering_scope_tests.rs");
     use crate::config::Config;
