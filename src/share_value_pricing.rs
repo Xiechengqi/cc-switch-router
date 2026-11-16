@@ -60,7 +60,19 @@ pub struct ValueQuotaStatus {
     pub pending_risk_picos: String,
     pub metering_status: String,
     pub synced_at_ms: i64,
+    /// Attempts in this window metered at $0 for a price-type reason. Sent
+    /// only to Routers advertising `valueQuotaUnpricedV1`; absent fields keep
+    /// older projections byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unpriced_requests: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unpriced_tokens: Option<u64>,
+    /// Distinct effective model names, at most 20, sorted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unpriced_models: Option<Vec<String>>,
 }
+/// Upper bound on `unpricedModels` a Server may report.
+pub const MAX_UNPRICED_MODELS: usize = 20;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PricingManifest {
@@ -424,6 +436,18 @@ impl PricingSnapshot {
     /// (`anthropic.`, `publishers/…/models/`, `-thinking`, `[1m]`, `-v1:0`,
     /// date stamps), each candidate matched as an exact alias or model key.
     pub fn model(&self, effective_model: &str) -> Result<&ExecutionModelPrice, ValueError> {
+        self.resolve(effective_model, |key| self.models.get(key))
+            .ok_or(ValueError::PriceUnavailable)
+    }
+    /// [`Self::model`]'s candidate order with a caller-chosen hit test on the
+    /// model key each candidate names (after exact aliases). A price set
+    /// layered on this snapshot (owner prices) resolves through it exactly as
+    /// the materialized overlay would, without cloning the snapshot.
+    pub fn resolve<T>(
+        &self,
+        effective_model: &str,
+        mut hit: impl FnMut(&str) -> Option<T>,
+    ) -> Option<T> {
         std::iter::once(effective_model.to_string())
             .chain(crate::model_price_catalog::identity_candidates(
                 effective_model,
@@ -434,9 +458,8 @@ impl PricingSnapshot {
                     .get(&candidate)
                     .map(String::as_str)
                     .unwrap_or(&candidate);
-                self.models.get(key)
+                hit(key)
             })
-            .ok_or(ValueError::PriceUnavailable)
     }
 }
 

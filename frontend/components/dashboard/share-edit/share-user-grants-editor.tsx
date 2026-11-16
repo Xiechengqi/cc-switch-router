@@ -353,6 +353,7 @@ export function ShareUserGrantsEditor({
     refresh: refreshBreakdown,
     errors: breakdownErrors,
     loaded: breakdownLoaded,
+    priceCapabilities,
   } = useShareUserUsageBreakdown(shareId);
   const supported = new Set<ShareTokenPeriod>(
     supportedPeriods?.length
@@ -1067,6 +1068,8 @@ export function ShareUserGrantsEditor({
           breakdownLoaded={shareId ? breakdownLoaded : undefined}
           onExpand={shareId ? onExpand : undefined}
           onPriceSaved={shareId ? refreshBreakdown : undefined}
+          // Only Share managers reach this editor.
+          modelPricing={shareId ? { shareId, capabilities: priceCapabilities, canManage: true } : undefined}
           leading={selecting ? {
             header: (
               <Checkbox

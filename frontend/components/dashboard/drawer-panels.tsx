@@ -1,7 +1,7 @@
 "use client";
 
 import { ChevronDown, ChevronRight, Eye, Link2, Maximize2, Pencil } from "lucide-react";
-import { Button, Card, Chip, Input, Modal, ProgressBar, Tabs } from "@heroui/react";
+import { Button, Card, Chip, Modal, ProgressBar, Tabs } from "@heroui/react";
 import * as React from "react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useShareValueQuotaSnapshot } from "@/lib/use-share-value-quota";
@@ -17,9 +17,11 @@ import {
   getShareRequestLogs,
   getShareUsageByEmail,
   getShareUserLimitStatus,
-  upsertAdminModelPrice,
 } from "@/lib/api";
-import { useShareUserUsageBreakdown } from "@/lib/use-share-user-usage-breakdown";
+import { useShareUserUsageBreakdown, type SharePriceCapabilities } from "@/lib/use-share-user-usage-breakdown";
+import { sharePriceAccess } from "@/lib/share-model-prices";
+import { InfoHint } from "@/components/common/info-hint";
+import { ShareModelPriceDialog, type ModelPriceSaved, type ModelPriceTarget } from "@/components/dashboard/share-model-price-dialog";
 import { ShareUsageEquivalent, ShareUsageTable, visibleShareEmailUsage } from "@/components/dashboard/share-email-usage-table";
 import type { AppLocale } from "@/lib/i18n";
 import type {
@@ -639,6 +641,7 @@ export function ShareEmailUsagePanel({
     refresh: refreshBreakdown,
     errors: breakdownErrors,
     loaded: breakdownLoaded,
+    priceCapabilities,
   } = useShareUserUsageBreakdown(share.shareId);
 
   React.useEffect(() => {
@@ -776,6 +779,7 @@ export function ShareEmailUsagePanel({
           breakdownLoaded={breakdownLoaded}
           onExpand={onExpand}
           onPriceSaved={refreshBreakdown}
+          modelPricing={{ shareId: share.shareId, capabilities: priceCapabilities, canManage: !!share.canManage }}
         />
       ) : null}
       {showLimits && !(limitRows?.length || limitGrants.length) && loading ? (
@@ -948,24 +952,45 @@ function ShareUserUsageNoteList({
   );
 }
 
+/** Where the breakdown may price a model: the Share, what the Router says the caller may do, and the pre-capability fallback. */
+export type ShareModelPricing = {
+  shareId?: string;
+  capabilities?: SharePriceCapabilities;
+  /** Used only when the Router predates `canSetPrice`. */
+  canManage?: boolean;
+};
+
 function ShareUserUsageBreakdownPanel({
   row,
   locale,
   t,
+  pricing,
   onPriceSaved,
 }: {
   row: ShareUserUsageBreakdownRow;
   locale: AppLocale;
   t: TFn;
+  pricing?: ShareModelPricing;
   onPriceSaved?: (email: string) => void;
 }) {
   const { session } = useAuth();
   const [openLines, setOpenLines] = React.useState<string | null>(null);
-  const [priceModel, setPriceModel] = React.useState<ShareUserUsageBreakdownRow["byModel"][number] | null>(null);
-  const [priceDraft, setPriceDraft] = React.useState({ input: "", output: "", cacheRead: "", cacheWrite5m: "", cacheWrite1h: "" });
-  const [priceError, setPriceError] = React.useState("");
-  const [priceBusy, setPriceBusy] = React.useState(false);
+  const [priceTarget, setPriceTarget] = React.useState<ModelPriceTarget | null>(null);
+  const [priceNotice, setPriceNotice] = React.useState("");
+  const access = sharePriceAccess(pricing?.capabilities, { canManage: pricing?.canManage, isAdmin: session?.isAdmin });
+  const canPrice = (access.client && !!pricing?.shareId) || access.global;
   const unattributed = row.observedTotals.unattributed;
+  const unpricedModelCount = (row.unpricedTokens ?? 0) > 0
+    ? row.unpricedModels?.length || new Set(row.byModel.filter((model) => model.unpriced).map((model) => model.modelKey)).size
+    : 0;
+  const zeroAmount = formatUsdMicros("0", locale) ?? NO_AMOUNT;
+  const onSaved = (result: ModelPriceSaved) => {
+    setPriceTarget(null);
+    setPriceNotice(t(result.removed ? "dashboard.modelPrice.removed" : "dashboard.modelPrice.saved", {
+      time: formatDateTime(result.effectiveFromMs, locale),
+    }));
+    onPriceSaved?.(row.email);
+  };
 
   if (!row.byModel.length && !unattributed) {
     return (
@@ -991,13 +1016,29 @@ function ShareUserUsageBreakdownPanel({
             ? t("dashboard.userLimit.byModel.windowSince", { time: formatDateTime(row.windowStartsAt, locale) })
             : t("dashboard.userLimit.byModel.windowRetained")}
         </span>
-        <ShareUsageEquivalent
-          amount={formatUsdMicros(row.equivalentUsdMicros, locale) ?? null}
-          coverage={row.pricedCoveragePercent}
-          t={t}
-          summary
-        />
+        <span className="inline-flex flex-wrap items-baseline justify-end gap-x-1.5">
+          <ShareUsageEquivalent
+            amount={formatUsdMicros(row.equivalentUsdMicros, locale) ?? null}
+            coverage={row.pricedCoveragePercent}
+            t={t}
+            summary
+          />
+          {unpricedModelCount ? (
+            <span className="text-[10px] text-amber-800">
+              {t(
+                unpricedModelCount === 1 ? "dashboard.modelPrice.summaryUnpricedSingle" : "dashboard.modelPrice.summaryUnpriced",
+                { count: unpricedModelCount },
+              )}
+            </span>
+          ) : null}
+        </span>
       </div>
+      {priceNotice ? (
+        <p role="status" className="flex items-center gap-1.5 text-[11px] text-foreground/80">
+          <span aria-hidden className="h-1.5 w-1.5 shrink-0 rounded-full bg-accent" />
+          {priceNotice}
+        </p>
+      ) : null}
 
       <table className="w-full table-fixed border-collapse text-[11px]">
         <colgroup>
@@ -1037,6 +1078,11 @@ function ShareUserUsageBreakdownPanel({
             const amount = model.priced
               ? formatUsdMicros(model.equivalentUsdMicros, locale)
               : null;
+            // Older Routers send no `unpriced`; their unpriced rows were blocked, not metered at $0.
+            const meteredAtZero = model.unpriced === true;
+            const unpriced = meteredAtZero || (model.unpriced == null && !model.priced);
+            const ownerPriced = model.priced && model.priceSource === "owner";
+            const priceable = canPrice && !!model.modelKey && (unpriced || (ownerPriced && access.client && !!pricing?.shareId));
             const linesOpen = openLines === key;
             return (
               <React.Fragment key={key}>
@@ -1056,14 +1102,41 @@ function ShareUserUsageBreakdownPanel({
                           {model.serviceTier}
                         </Chip>
                       ) : null}
-                      {!model.priced ? (
-                        <Chip size="sm" variant="tertiary" className="shrink-0 text-amber-800">
-                          {t("dashboard.userLimit.byModel.unpriced")}
-                        </Chip>
+                      {unpriced ? (
+                        <span className="inline-flex shrink-0 items-center">
+                          <Chip size="sm" variant="soft" color="warning" className="shrink-0">
+                            {t("dashboard.userLimit.byModel.unpriced")}
+                          </Chip>
+                          {meteredAtZero ? (
+                            <InfoHint label={t("dashboard.userLimit.byModel.unpriced")}>
+                              {t("dashboard.modelPrice.unpricedHint")}
+                            </InfoHint>
+                          ) : null}
+                        </span>
                       ) : null}
-                      {session?.isAdmin && !model.priced && model.modelKey ? (
-                        <Button size="sm" variant="ghost" className="h-6 min-w-0 px-1.5 text-[10px]" onClick={() => { setPriceModel(model); setPriceError(""); setPriceDraft({ input: "", output: "", cacheRead: "", cacheWrite5m: "", cacheWrite1h: "" }); }}>
-                          {t("dashboard.userLimit.price.configure")}
+                      {ownerPriced ? (
+                        <span className="inline-flex shrink-0 items-center">
+                          <span className="rounded-full border border-accent/30 bg-accent/5 px-1.5 font-mono text-[10px] uppercase leading-4 tracking-[0.08em] text-accent">
+                            {t("dashboard.modelPrice.custom")}
+                          </span>
+                          <InfoHint label={t("dashboard.modelPrice.custom")}>
+                            {t("dashboard.modelPrice.customHint")}
+                          </InfoHint>
+                        </span>
+                      ) : null}
+                      {priceable ? (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="h-6 min-w-0 px-1.5 text-[10px] text-accent"
+                          onPress={() => setPriceTarget({
+                            // An owner price lives under the key the usage resolved to, which
+                            // can differ from the wire model; CAS and removal need that key.
+                            modelKey: ownerPriced ? model.priceKey || model.modelKey : model.modelKey,
+                            displayName: model.displayName,
+                          })}
+                        >
+                          {t(ownerPriced ? "dashboard.userLimit.price.edit" : "dashboard.userLimit.price.configure")}
                         </Button>
                       ) : null}
                       {model.notes
@@ -1105,6 +1178,8 @@ function ShareUserUsageBreakdownPanel({
                       >
                         {amount}
                       </button>
+                    ) : meteredAtZero ? (
+                      <span className="text-amber-800">{zeroAmount}</span>
                     ) : (
                       <span className="text-muted-foreground">{NO_AMOUNT}</span>
                     )}
@@ -1175,37 +1250,15 @@ function ShareUserUsageBreakdownPanel({
       </table>
 
       <ShareUserUsageNoteList notes={row.notes} t={t} />
-      <Modal.Backdrop isOpen={!!priceModel} onOpenChange={(open) => !open && !priceBusy && setPriceModel(null)}>
-        <Modal.Container placement="center">
-          <Modal.Dialog className="light w-[min(560px,calc(100vw-2rem))] !bg-white !text-slate-900">
-            <Modal.CloseTrigger />
-            <Modal.Header><Modal.Heading>{t("dashboard.userLimit.price.title")}</Modal.Heading></Modal.Header>
-            <Modal.Body className="grid gap-3">
-              <p className="text-xs text-amber-700">{t("dashboard.userLimit.price.globalHint")}</p>
-              <Input value={priceModel?.modelKey || ""} disabled aria-label={t("dashboard.userLimit.byModel.model")} />
-              {(["input", "output", "cacheRead", "cacheWrite5m", "cacheWrite1h"] as const).map((field) => (
-                <label key={field} className="grid gap-1 text-xs">
-                  <span>{t(`dashboard.userLimit.price.${field}`)}</span>
-                  <Input inputMode="decimal" value={priceDraft[field]} placeholder="0" onChange={(event) => setPriceDraft((current) => ({ ...current, [field]: event.target.value }))} />
-                </label>
-              ))}
-              {priceError ? <p className="text-xs text-red-600">{priceError}</p> : null}
-            </Modal.Body>
-            <Modal.Footer>
-              <Button variant="outline" isDisabled={priceBusy} onClick={() => setPriceModel(null)}>{t("common.cancel")}</Button>
-              <Button variant="primary" isDisabled={priceBusy || !priceDraft.input || !priceDraft.output || !priceDraft.cacheRead || !priceDraft.cacheWrite5m} onClick={async () => {
-                if (!priceModel) return;
-                setPriceBusy(true); setPriceError("");
-                try {
-                  await upsertAdminModelPrice(priceModel.modelKey, { displayName: priceModel.displayName || priceModel.modelKey, expectUnpriced: true, rates: { inputUsdPer1m: priceDraft.input, outputUsdPer1m: priceDraft.output, cacheReadUsdPer1m: priceDraft.cacheRead, cacheWrite5mUsdPer1m: priceDraft.cacheWrite5m, ...(priceDraft.cacheWrite1h.trim() ? { cacheWrite1hUsdPer1m: priceDraft.cacheWrite1h } : {}) } });
-                  setPriceModel(null); onPriceSaved?.(row.email);
-                } catch (error) { setPriceError(error instanceof Error ? error.message : String(error)); }
-                finally { setPriceBusy(false); }
-              }}>{t("common.save")}</Button>
-            </Modal.Footer>
-          </Modal.Dialog>
-        </Modal.Container>
-      </Modal.Backdrop>
+      {canPrice ? (
+        <ShareModelPriceDialog
+          target={priceTarget}
+          shareId={pricing?.shareId}
+          access={access}
+          onClose={() => setPriceTarget(null)}
+          onSaved={onSaved}
+        />
+      ) : null}
     </div>
   );
 }
@@ -1223,6 +1276,7 @@ export function ShareUserLimitsTable({
   breakdownLoaded,
   onExpand,
   onPriceSaved,
+  modelPricing,
   valueQuotaStatuses,
   valueQuotaStale,
   selfContainedValueQuota,
@@ -1260,6 +1314,8 @@ export function ShareUserLimitsTable({
   /** Loads (or retries) one email's breakdown when its row expands. */
   onExpand?: (email: string) => void;
   onPriceSaved?: (email: string) => void;
+  /** Lets the breakdown price unpriced models for this Share's client (or Router-wide for admins). */
+  modelPricing?: ShareModelPricing;
 }) {
   const unlimited = t("common.unlimited");
   const permanent = t("dashboard.userLimit.permanent");
@@ -1498,6 +1554,7 @@ export function ShareUserLimitsTable({
                         row={breakdownRow}
                         locale={locale}
                         t={t}
+                        pricing={modelPricing}
                         onPriceSaved={onPriceSaved}
                       />
                     ) : breakdownErrors?.[emailKey] ? (

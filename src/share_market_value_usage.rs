@@ -217,8 +217,11 @@ async fn rental_value_usage(
         .await?;
     let row = breakdown.rows.into_iter().next();
     let rent_micros = i128::from(amount_units) * MICROS_PER_MINOR / UNITS_PER_MINOR;
+    // A window with only unpriced usage reports "0" (metered at $0); for a
+    // rental that is still unpriced usage, not a free period.
     let value_micros = row
         .as_ref()
+        .filter(|row| row.by_model.iter().any(|model| model.priced))
         .and_then(|row| row.equivalent_usd_micros.as_deref())
         .and_then(|value| value.parse::<i128>().ok())
         .filter(|value| *value >= 0);

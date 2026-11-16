@@ -389,6 +389,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         112,
         include_str!("../schema/0112_quota_unit_conversions.sql"),
     ),
+    (
+        113,
+        include_str!("../schema/0113_share_value_owner_prices.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {

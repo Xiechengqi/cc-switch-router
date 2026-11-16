@@ -214,6 +214,28 @@ pub struct PricingCatalog {
 }
 
 impl PricingCatalog {
+    /// A catalog of always-effective prices, for tests that need no database.
+    #[cfg(test)]
+    pub(crate) fn for_tests(prices: Vec<ModelPrice>) -> Self {
+        Self {
+            revision: "test".into(),
+            models: prices
+                .into_iter()
+                .map(|price| {
+                    (
+                        price.price_key.clone(),
+                        vec![Generation {
+                            effective_from: 0,
+                            effective_to: None,
+                            price,
+                        }],
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
     pub fn revision(&self) -> &str {
         &self.revision
     }

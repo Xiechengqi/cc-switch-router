@@ -2545,6 +2545,10 @@ pub struct ShareUserUsageBreakdownResponse {
     pub pricing_revision: String,
     pub priced_at: i64,
     pub rows: Vec<ShareUserUsageBreakdownRow>,
+    /// The caller manages the Share and may set owner prices for its client.
+    pub can_set_price: bool,
+    /// The caller is a Router admin and may set Router-wide catalog prices.
+    pub can_set_global_price: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2557,7 +2561,9 @@ pub struct ShareUserUsageBreakdownRow {
     /// quota number and the sum of `observedTotals` legitimately differ.
     pub rebase_applied: bool,
     pub observed_totals: ShareUserUsageTotals,
-    /// Point estimate; cache writes priced at the 5m rate (§11.1).
+    /// Point estimate; cache writes priced at the 5m rate (§11.1). `"0"` when
+    /// the window has only unpriced usage (metered at $0); absent when it has
+    /// no billable usage at all.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub equivalent_usd_micros: Option<String>,
     /// Priced tokens / total tokens, 0-100. Makes §6.4 measurable.
@@ -2565,6 +2571,10 @@ pub struct ShareUserUsageBreakdownRow {
     pub estimated_request_percent: f64,
     pub by_model: Vec<ShareUserUsageModelRow>,
     pub notes: Vec<String>,
+    /// Billable tokens without an amount; the quota meters them at $0.
+    pub unpriced_tokens: u64,
+    /// Distinct models of those tokens, sorted, at most 20.
+    pub unpriced_models: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -2601,7 +2611,13 @@ pub struct ShareUserUsageModelRow {
     pub unattributed: u64,
     pub total: u64,
     pub request_count: u64,
+    /// An amount was actually computed (a price exists for this tier).
     pub priced: bool,
+    /// `catalog` | `owner`; absent when unpriced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price_source: Option<&'static str>,
+    /// `!priced` with billable tokens: the quota meters this row at $0.
+    pub unpriced: bool,
     /// `null` when `priced` is false — never `"0"`, which would read as free.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub equivalent_usd_micros: Option<String>,

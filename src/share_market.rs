@@ -1192,21 +1192,25 @@ fn value_quota_column(value_quota: &Option<ValueQuota>) -> Option<&str> {
         .map(|quota| quota.limit_usd_micros.as_str())
 }
 
+/// The tariff revision the Share's installation is served: the global one, or
+/// its owner-price overlay when the owner priced models on that client.
 fn published_value_pricing_revision_tx(
     conn: &Connection,
+    share_id: &str,
     resources: bool,
 ) -> Result<Option<String>, AppError> {
-    conn.query_row(
-        if resources {
-            "SELECT revision FROM share_value_resource_pricing_config WHERE singleton = 1"
-        } else {
-            "SELECT revision FROM share_value_pricing_config WHERE singleton = 1"
-        },
-        [],
-        |row| row.get(0),
+    let installation: String = conn
+        .query_row(
+            "SELECT installation_id FROM shares WHERE share_id = ?1",
+            params![share_id],
+            |row| row.get(0),
+        )
+        .map_err(map_db("read Share installation"))?;
+    crate::store::share_value_quotas::owner_prices::installation_tariff_revision(
+        conn,
+        &installation,
+        resources,
     )
-    .optional()
-    .map_err(map_db("read published USD tariff revision"))
 }
 
 fn trial_seconds_from_hours(hours: i64) -> Result<i64, AppError> {
@@ -8768,6 +8772,7 @@ impl AppStore {
             value_pricing_revision: match value_limit_usd_micros {
                 Some(_) => published_value_pricing_revision_tx(
                     &tx,
+                    &share_id,
                     seat_tariff(&tx, seat_id)?
                         == crate::share_value_pricing::RESOURCE_TARIFF_POLICY,
                 )?,

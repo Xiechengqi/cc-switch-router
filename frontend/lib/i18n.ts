@@ -22,6 +22,7 @@ import { accountSectionMessagesEn, accountSectionMessagesZh } from "@/lib/accoun
 import { walletActionsMessagesEn, walletActionsMessagesZh } from "@/lib/wallet-actions-messages";
 import { valueQuotaMessagesEn, valueQuotaMessagesZh } from "@/lib/share-value-quota-messages";
 import { shareAccessQuotaMessagesEn, shareAccessQuotaMessagesZh } from "@/lib/share-access-quota-messages";
+import { shareModelPriceMessagesEn, shareModelPriceMessagesZh } from "@/lib/share-model-price-messages";
 import { providerRankMessagesEn, providerRankMessagesZh } from "@/lib/provider-rank-messages";
 import { clientShareMessagesEn, clientShareMessagesZh } from "@/lib/client-share-messages";
 
@@ -3627,6 +3628,7 @@ export const messages = {
     ...walletActionsMessagesEn,
     ...valueQuotaMessagesEn,
     ...shareAccessQuotaMessagesEn,
+    ...shareModelPriceMessagesEn,
     ...providerRankMessagesEn,
   },
   "zh-CN": {
@@ -7127,6 +7129,7 @@ export const messages = {
     ...walletActionsMessagesZh,
     ...valueQuotaMessagesZh,
     ...shareAccessQuotaMessagesZh,
+    ...shareModelPriceMessagesZh,
     ...providerRankMessagesZh,
   },
 } as const;

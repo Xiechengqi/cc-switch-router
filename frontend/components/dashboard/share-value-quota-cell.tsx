@@ -6,8 +6,9 @@ import { InfoHint } from "@/components/common/info-hint";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   VALUE_STATUS_STALE_MS, formatQuotaPicos, formatQuotaTime, formatUsdLimit, renderValueQuotaMessage, valueMeteringState,
-  valueQuotaAvailability, valueStatusReason, valueStatusTextKey, type ValueQuotaView,
+  valueQuotaAvailability, valueStatusReason, valueStatusTextKey, valueStatusUnpriced, type UnpricedUsage, type ValueQuotaView,
 } from "@/lib/share-value-quota";
+import { formatTokenAmount } from "@/lib/token-units";
 
 /** A thin bar like the token rows', fed by exact BigInt basis points. */
 function ValueBar({basisPoints, t}: {basisPoints: number; t: TFn}) {
@@ -30,6 +31,26 @@ export function ScheduledValueQuotaLine({scheduled, t}: {scheduled: NonNullable<
 }
 
 /**
+ * "Includes unpriced usage": requests of models without a price were counted
+ * at $0 in this window. A warning, not an error; the ⓘ names the models and
+ * says that pricing them re-prices the current window.
+ */
+export function UnpricedUsageHint({usage, t}: {usage: UnpricedUsage; t: TFn}) {
+  const {locale} = useLocaleText();
+  return <div className="mt-0.5 flex min-w-0 items-center gap-1 text-[10px] text-amber-800">
+    <span aria-hidden="true" className="h-1.5 w-1.5 shrink-0 rounded-full bg-warning" />
+    <span className="min-w-0">{t("dashboard.userLimit.value.unpriced.quotaBadge")}</span>
+    <InfoHint label={t("dashboard.userLimit.value.unpriced.quotaBadge")}>
+      <span className="grid gap-1">
+        <span>{t("dashboard.userLimit.value.unpriced.quotaDetail", {count: usage.requests, tokens: formatTokenAmount(usage.tokens, locale)})}</span>
+        {usage.models.length ? <span className="break-all font-mono">{t("dashboard.userLimit.value.unpriced.models", {models: usage.models.join(", ")})}</span> : null}
+        <span className="text-muted-foreground">{t("dashboard.userLimit.value.unpriced.reprice")}</span>
+      </span>
+    </InfoHint>
+  </div>;
+}
+
+/**
  * The enforced USD row: one line of used / limit, a bar, and only the state
  * that needs action. Metering state, sync time and the soft-cap rule sit
  * behind the ⓘ.
@@ -45,6 +66,7 @@ export function EnforcedValueQuotaCell({enforced, periodLabel, nowMs, stale, onR
   const blocked = !!status && valueMeteringState(status) === "blocked";
   const delayed = !!status && (stale || nowMs - status.syncedAtMs > VALUE_STATUS_STALE_MS);
   const risk = status?.pendingRiskPicos && /^[1-9]\d*$/.test(status.pendingRiskPicos) ? status.pendingRiskPicos : undefined;
+  const unpriced = valueStatusUnpriced(status);
   return <>
     <div className="flex min-w-0 items-center gap-0.5 font-mono leading-4">
       <span className="min-w-0">
@@ -74,6 +96,7 @@ export function EnforcedValueQuotaCell({enforced, periodLabel, nowMs, stale, onR
       : availability?.exhausted ? <div className="mt-0.5 text-[10px] text-danger">{t("dashboard.userLimit.atLimit")}</div>
         : availability?.nearLimit ? <div className="mt-0.5 text-[10px] text-warning">{t("dashboard.userLimit.nearLimit")}</div> : null}
     {reason ? <div className="mt-0.5 break-words text-[10px] text-muted-foreground">{renderValueQuotaMessage(reason, t)}</div> : null}
+    {unpriced ? <UnpricedUsageHint usage={unpriced} t={t} /> : null}
     {delayed ? <div className="mt-0.5 text-[10px] italic text-muted-foreground">{t("dashboard.userLimit.value.syncDelayed")}</div> : null}
   </>;
 }

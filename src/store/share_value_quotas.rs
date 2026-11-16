@@ -4,6 +4,7 @@ use crate::share_value_pricing::{
     PricingManifest, PricingSnapshot, ValueQuotaStatus, unsigned_decimal,
 };
 mod delivery;
+pub(crate) mod owner_prices;
 pub(crate) mod resource_tariff;
 
 /// Metering states a Server may report. `unavailable` is also the safe
@@ -420,6 +421,7 @@ fn parse_value_operation(
             {
                 return Err(AppError::BadRequest("invalid value quota watermark".into()));
             }
+            sanitize_unpriced_models(status);
             if !METERING_STATUSES.contains(&status.metering_status.as_str()) {
                 // A newer Server state must neither break projection sync nor
                 // be rendered as usable quota.
@@ -435,6 +437,22 @@ fn parse_value_operation(
         _ => Err(AppError::BadRequest(
             "unsupported value quota action".into(),
         )),
+    }
+}
+
+/// `unpricedModels` is display-only: keep at most the documented 20 distinct,
+/// sorted, printable names instead of rejecting the whole projection.
+fn sanitize_unpriced_models(status: &mut ValueQuotaStatus) {
+    if let Some(models) = status.unpriced_models.as_mut() {
+        models.retain(|model| {
+            !model.is_empty()
+                && model.len() <= 256
+                && model.trim() == model
+                && !model.chars().any(char::is_control)
+        });
+        models.sort();
+        models.dedup();
+        models.truncate(crate::share_value_pricing::MAX_UNPRICED_MODELS);
     }
 }
 
@@ -567,10 +585,17 @@ impl AppStore {
         let delivery =
             delivery::delivery_health(&conn, settings.revision.as_deref(), now.timestamp_millis())?;
         let acknowledgements = delivery["acknowledgedInstallations"].as_i64().unwrap_or(0);
+        let owner_priced: i64 = conn
+            .query_row(
+                "SELECT count(DISTINCT installation_id) FROM share_value_owner_model_prices",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(db_error)?;
         // `shadowGrants` is retained for older UIs: shadow metering was removed,
         // so it only counts legacy bindings awaiting the next descriptor sync.
         Ok(
-            serde_json::json!({"activeUsdGrants":enabled,"scheduledGrants":scheduled,"shadowGrants":legacy_bindings,"staleGrants":stale,"acknowledgedInstallations":acknowledgements,
+            serde_json::json!({"activeUsdGrants":enabled,"scheduledGrants":scheduled,"shadowGrants":legacy_bindings,"staleGrants":stale,"acknowledgedInstallations":acknowledgements,"ownerPricedInstallations":owner_priced,
                 "publishedRevision":settings.revision,"effectiveFromMs":settings.effective_from_ms,
                 "serverTimeMs":now.timestamp_millis(),"delivery":delivery,"publication":delivery::publication_status(&conn,self.pricing_catalog().revision(),now.timestamp())?}),
         )
@@ -581,6 +606,16 @@ impl AppStore {
     /// first. Superseded payloads older than 30 days are compacted to `{}`;
     /// their rows stay because ACKs and Share bindings reference them.
     pub(crate) async fn sync_value_tariff_from_catalog(&self) -> Result<Option<String>, AppError> {
+        let published = self.publish_value_tariff_from_catalog().await;
+        // Owner-price overlays follow in their own short transaction, derived
+        // off the lock; until then each keeps its previous (valid) revision.
+        // Every sync, including the one at startup, re-checks them.
+        if let Err(error) = self.rederive_owner_tariffs().await {
+            tracing::warn!(%error, "owner-price USD quota tariffs keep their previous revisions");
+        }
+        published
+    }
+    async fn publish_value_tariff_from_catalog(&self) -> Result<Option<String>, AppError> {
         let catalog = self.pricing_catalog();
         if catalog.is_empty() {
             return Ok(None);
@@ -656,7 +691,9 @@ impl AppStore {
         resource_tariff::publish(&tx, now_ms)?;
         tx.execute(
             "UPDATE share_value_pricing_snapshots SET payload_json='{}'
-             WHERE revision<>?1 AND revision NOT IN (SELECT revision FROM share_value_resource_pricing_config) AND created_at_ms<?2 AND payload_json<>'{}'",
+             WHERE revision<>?1 AND revision NOT IN (SELECT revision FROM share_value_resource_pricing_config)
+             AND revision NOT IN (SELECT revision FROM share_value_pricing_installation_tariffs)
+             AND created_at_ms<?2 AND payload_json<>'{}'",
             params![revision, now_ms - TARIFF_PAYLOAD_RETENTION_MS],
         )
         .map_err(db_error)?;
@@ -940,11 +977,9 @@ fn apply_value_operation(
                 .any(|policy| policy == crate::share_value_pricing::RESOURCE_TARIFF_POLICY);
             tx.execute("INSERT INTO installation_value_capabilities VALUES(?1,?2,?3) ON CONFLICT(installation_id) DO UPDATE SET resources=excluded.resources,updated_at_ms=excluded.updated_at_ms WHERE excluded.updated_at_ms>installation_value_capabilities.updated_at_ms",params![installation_id,resources,signed_at_ms]).map_err(db_error)?;
             let resources = resource_tariff::installation_supports_resources(tx, installation_id)?;
-            let meta = if resources {
-                resource_tariff::read_resource_settings_meta(tx)?
-            } else {
-                read_settings_meta(tx)?
-            };
+            // Owner prices give an installation its own overlay revision;
+            // every other installation is served the global one.
+            let meta = owner_prices::installation_tariff_meta(tx, installation_id, resources)?;
             match (fetch.known_revision, meta.revision) {
                 (_, None) => Ok(ValueOutcome::Ready(serde_json::Value::Null)),
                 // `unchanged` only when this installation's ACK row exists too;
@@ -960,11 +995,7 @@ fn apply_value_operation(
                 }
                 _ => Ok(ValueOutcome::Manifest {
                     installation_id: installation_id.to_string(),
-                    raw: if resources {
-                        resource_tariff::read_resource_settings_raw(tx)?
-                    } else {
-                        read_settings_raw(tx)?
-                    },
+                    raw: owner_prices::installation_tariff_raw(tx, installation_id, resources)?,
                 }),
             }
         }
@@ -977,7 +1008,7 @@ fn apply_value_operation(
                     |r| r.get(0),
                 )
                 .map_err(db_error)?;
-            if !exists {
+            if !exists || !owner_prices::revision_issued_to(tx, installation_id, &ack.revision)? {
                 return Err(AppError::NotFound("pricing revision not found".into()));
             }
             // Idempotent: a repeated ACK keeps the original acknowledgement time.
@@ -1098,7 +1129,8 @@ pub(super) fn apply_conversion_result(
             object.remove("reasonCode");
             object.remove("pendingValueQuota");
         }
-        let status: ValueQuotaStatus = serde_json::from_value(row).map_err(bad_payload)?;
+        let mut status: ValueQuotaStatus = serde_json::from_value(row).map_err(bad_payload)?;
+        sanitize_unpriced_models(&mut status);
         if !conversions.contains_key(&status.email) {
             continue;
         }
@@ -1411,6 +1443,9 @@ mod tests {
             pending_risk_picos: "0".into(),
             metering_status: "observed".into(),
             synced_at_ms: now.timestamp_millis(),
+            unpriced_requests: None,
+            unpriced_tokens: None,
+            unpriced_models: None,
         };
         assert!(current_projection(&grant, &status, now).is_ok());
         assert!(current_projection(&grant, &status, now + Duration::days(1)).is_err());

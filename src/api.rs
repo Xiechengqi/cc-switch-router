@@ -6198,7 +6198,10 @@ async fn unban_share_client(
 // ---------------------------------------------------------------------------
 // Per-buyer usage surface: unauthenticated on purpose.
 //
-// These three read no credentials by design. Market transparency is the
+// `usage-by-email` and `user-limit-status` read no credentials by design.
+// `user-usage-breakdown` no longer belongs here: it is priced with the Share
+// owner's private per-client prices and offers price editing, so it requires
+// a session (see its handler). The rest of this note covers the other two. Market transparency is the
 // product decision here: which buyers a Share serves, what they spent it on
 // and the official-price equivalent are meant to be readable by anyone
 // holding the Share id, the same way the listing itself is. Do not "fix" this
@@ -6255,31 +6258,89 @@ async fn share_user_limit_status(
     Ok(Json(state.store.share_user_limit_status(&share_id).await?))
 }
 
-/// The owner dashboard's per-user equivalent-USD breakdown (§9.1).
+/// The per-user equivalent-USD breakdown (§9.1), priced with the Share
+/// installation's effective prices (catalog + owner prices).
 ///
-/// Public, like the two above it — see the banner on `share_usage_by_email`
-/// for why, and for what `share_id` is and is not doing as the only gate.
+/// Session required. A Share manager (owner or Router owner) reads any user;
+/// any other signed-in user reads only their own row: an omitted `email` means
+/// "mine", another email is forbidden. Anonymous callers get 401. The only
+/// browser caller is the dashboard Share drawer, whose grants are already
+/// redacted to the viewer's own for non-managers; logged out, the drawer keeps
+/// its token table and simply omits the USD column.
 async fn share_user_usage_breakdown(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     Path(share_id): Path<String>,
     Query(query): Query<ShareUserUsageBreakdownQuery>,
-) -> Result<Json<crate::models::ShareUserUsageBreakdownResponse>, AppError> {
-    Ok(Json(
-        state
-            .store
-            .share_user_usage_breakdown(&share_id, query.email.as_deref())
-            .await?,
-    ))
+) -> Result<(HeaderMap, Json<crate::models::ShareUserUsageBreakdownResponse>), AppError> {
+    let session = resolve_router_session(&state, &headers)
+        .await?
+        .ok_or_else(|| AppError::Unauthorized("login required".into()))?;
+    let manager =
+        crate::share_value_quotas::session_manages_share(&state, &session, &share_id).await?;
+    let own = session.email.trim().to_ascii_lowercase();
+    let email = match query.email.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
+        Some(email) if manager || email.eq_ignore_ascii_case(&own) => Some(email.to_string()),
+        Some(_) => {
+            return Err(AppError::coded_forbidden(
+                "SHARE_FORBIDDEN",
+                "only a Share manager can read another user's usage",
+                serde_json::json!({}),
+            ));
+        }
+        None if manager => None,
+        None => Some(own),
+    };
+    let mut response = state
+        .store
+        .share_user_usage_breakdown(&share_id, email.as_deref())
+        .await?;
+    response.can_set_price = manager;
+    response.can_set_global_price = state.dynamic.read().await.is_admin(&session.email);
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    Ok((response_headers, Json(response)))
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct AdminModelPriceRatesRequest {
+pub(crate) struct AdminModelPriceRatesRequest {
     input_usd_per1m: String,
     output_usd_per1m: String,
     cache_read_usd_per1m: String,
     cache_write5m_usd_per1m: String,
     cache_write1h_usd_per1m: Option<String>,
+}
+
+/// Decimal USD per 1M tokens → micro-USD per 1M, shared by the admin and the
+/// Share owner price editors. A blank 1h rate means "charge the 5m rate".
+pub(crate) fn parse_model_price_rates(
+    rates: &AdminModelPriceRatesRequest,
+) -> Result<crate::store::share_value_quotas::owner_prices::OwnerRates, AppError> {
+    let cache_write_5m =
+        parse_usd_per1m_micros("cacheWrite5mUsdPer1m", &rates.cache_write5m_usd_per1m)?;
+    let cache_write_1h = rates
+        .cache_write1h_usd_per1m
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| parse_usd_per1m_micros("cacheWrite1hUsdPer1m", value))
+        .transpose()?;
+    if cache_write_1h.is_some_and(|value| value < cache_write_5m) {
+        return Err(AppError::BadRequest(
+            "cacheWrite1hUsdPer1m must be at least cacheWrite5mUsdPer1m".into(),
+        ));
+    }
+    Ok(crate::store::share_value_quotas::owner_prices::OwnerRates {
+        input: parse_usd_per1m_micros("inputUsdPer1m", &rates.input_usd_per1m)?,
+        output: parse_usd_per1m_micros("outputUsdPer1m", &rates.output_usd_per1m)?,
+        cache_read: parse_usd_per1m_micros("cacheReadUsdPer1m", &rates.cache_read_usd_per1m)?,
+        cache_write_5m,
+        cache_write_1h,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -6337,25 +6398,14 @@ async fn admin_upsert_model_price(
     {
         return Err(AppError::BadRequest("invalid model display name".into()));
     }
-    let cache_write_5m =
-        parse_usd_per1m_micros("cacheWrite5mUsdPer1m", &input.rates.cache_write5m_usd_per1m)?;
-    let cache_write_1h = input
-        .rates
-        .cache_write1h_usd_per1m
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| parse_usd_per1m_micros("cacheWrite1hUsdPer1m", value))
-        .transpose()?;
-    if cache_write_1h.is_some_and(|value| value < cache_write_5m) {
-        return Err(AppError::BadRequest(
-            "cacheWrite1hUsdPer1m must be at least cacheWrite5mUsdPer1m".into(),
-        ));
-    }
-    let input_rate = parse_usd_per1m_micros("inputUsdPer1m", &input.rates.input_usd_per1m)?;
-    let output_rate = parse_usd_per1m_micros("outputUsdPer1m", &input.rates.output_usd_per1m)?;
-    let cache_read_rate =
-        parse_usd_per1m_micros("cacheReadUsdPer1m", &input.rates.cache_read_usd_per1m)?;
+    let rates = parse_model_price_rates(&input.rates)?;
+    let (input_rate, output_rate, cache_read_rate, cache_write_5m, cache_write_1h) = (
+        rates.input,
+        rates.output,
+        rates.cache_read,
+        rates.cache_write_5m,
+        rates.cache_write_1h,
+    );
     let before_pricing_revision = state
         .store
         .list_admin_model_prices()

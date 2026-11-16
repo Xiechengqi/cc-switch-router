@@ -10,6 +10,7 @@ import {
   splitValueStatusRows, upsertValueStatuses, valueStatusReason, formatQuotaTime, VALUE_STATUS_STALE_MS,
   valueReadinessItems, valueReadinessRoots, valueReadinessSummary, type ValueReadinessCheck,
   parseMarketValueReadiness, getMarketValueQuotaReadiness,
+  valuePreviewUnpriced, valueStatusUnpriced, valueReadinessWarnings, valueReadinessReasonKey, UNPRICED_REASON_CODES,
 } from "./share-value-quota";
 import { valueQuotaMessagesEn, valueQuotaMessagesZh } from "./share-value-quota-messages";
 import { applyShareUserPolicyBatch } from "../components/dashboard/share-edit/share-user-policy-batch";
@@ -25,6 +26,10 @@ test("market readiness keeps actionable binding/model evidence without trusting 
   assert.equal(parseMarketValueReadiness({ready:true,resourceReady:true,checks:[readyCheck]}).resourceReady,true);
   assert.equal(parseMarketValueReadiness({ready:true,checks:[readyCheck]}).resourceReady,false,"older responses cannot imply resource capability");
   assert.equal(parseMarketValueReadiness({ready:true,resourceReady:true,checks:[{code:"text_surface",ready:true}]}).resourceReady,false,"resource readiness needs explicit evidence");
+  // Owner grants meter an unpriced model at $0 (`ready:true, state:"unpriced"`); a Market seat may not sell it.
+  const unpriced={code:"model_price_coverage",ready:true,state:"unpriced",app:"codex",model:"kimi-k3-1",reasonCode:"model_unpriced"};
+  assert.deepEqual(parseMarketValueReadiness({ready:true,checks:[{code:"text_surface",ready:true},unpriced]}),
+    {ready:false,valueTrialReady:false,resourceReady:false,reason:"model_price_coverage",checks:[{code:"text_surface",ready:true},{...unpriced,ready:false}]});
   for(const malformed of [null,{},[],{ready:"true"},{ready:true,checks:[]},{ready:true,checks:[check]},
     {ready:false,checks:[null]},{ready:false,checks:[{code:"text_surface",ready:1}]}]) {
     assert.throws(()=>parseMarketValueReadiness(malformed),ValueQuotaClientError);
@@ -403,4 +408,48 @@ test("unit conversion keeps a current credential and previews calibrated batch b
   assert.throws(()=>quotaConversionInput(token,{amount:"29",reason:"Reviewed"}));
   assert.equal(quotaConversionNeeded({policy:{tokenPeriod:"day",valueQuota:{limitUsdMicros:"100000000",tariffPolicyId:"api-equivalent-v1"}}},{tokenPeriod:"day",tokenLimit:100_000_000}),true);
   assert.equal(quotaConversionNeeded({policy:{tokenPeriod:"day",tokenLimit:100}},{tokenPeriod:"day",tokenLimit:200}),false);
+});
+
+test("unpriced usage on a ready row is a note, never a blocker",()=>{
+  const row={email:"a@example.test",effectiveFromMs:0,meteredFromMs:0,usedPicos:"0",reasonCode:"ready",ready:true,
+    coverage:{complete:true,missingFacts:0,evidenceTokens:2_000_000,evidenceRequests:9,unpricedFacts:3,unpricedTokens:1_500_000,unpricedModels:["zeta-1","alpha-2"]}};
+  const preview:ValueQuotaPreview={ready:true,configRevision:1,rows:[row]};
+  assert.equal(valuePreviewBlocker(preview,0),undefined,"$0 rows do not block conversion");
+  assert.deepEqual(valuePreviewUnpriced(preview.rows,0),{requests:3,tokens:1_500_000,models:["alpha-2","zeta-1"]});
+  const second={...row,email:"b@example.test",coverage:{...row.coverage,unpricedFacts:2,unpricedTokens:10,unpricedModels:["alpha-2"]}};
+  assert.deepEqual(valuePreviewUnpriced([row,second],0),{requests:5,tokens:1_500_010,models:["alpha-2","zeta-1"]},"models are deduplicated across rows");
+  const blocked={...second,reasonCode:"history_incomplete",ready:false};
+  assert.deepEqual(valuePreviewUnpriced([row,blocked],0)?.requests,3,"a blocked row explains itself; its $0 facts are not summed");
+  assert.equal(valuePreviewBlocker({...preview,rows:[row,blocked]},0)?.email,blocked.email,"genuine evidence holes still block");
+  assert.equal(valuePreviewUnpriced([{...row,coverage:{...row.coverage,unpricedFacts:0}}],0),undefined);
+  assert.equal(valuePreviewUnpriced([{...row,coverage:{complete:true,missingFacts:0,evidenceTokens:0,evidenceRequests:0}}],0),undefined,"older Servers omit the fields");
+});
+
+test("window status exposes $0 usage only when requests were counted",()=>{
+  const status={email:"a@example.test",unpricedRequests:4,unpricedTokens:800,unpricedModels:["m-2","m-1",""]} as unknown as ValueQuotaStatus;
+  assert.deepEqual(valueStatusUnpriced(status),{requests:4,tokens:800,models:["m-1","m-2"]});
+  assert.equal(valueStatusUnpriced({...status,unpricedRequests:0}),undefined);
+  assert.equal(valueStatusUnpriced({...status,unpricedRequests:undefined}),undefined,"older Servers omit the fields");
+  assert.equal(valueStatusUnpriced(undefined),undefined);
+});
+
+test("an unpriced model check passes readiness and warns with model-specific copy",()=>{
+  const base=["router_protocol","sqlite_authority","metering_storage","acknowledged_tariff","text_surface"].map(code=>({code,ready:true}));
+  const unpriced:ValueReadinessCheck={code:"model_price_coverage",ready:true,state:"unpriced",reasonCode:"model_unpriced",model:"vendor/new-model",app:"codex"};
+  const preview:ValueQuotaPreview={ready:true,capabilityReady:true,checks:[...base,unpriced],configRevision:1,rows:[]};
+  assert.equal(valueCapabilityReady(preview),true,"ready:true never blocks");
+  assert.deepEqual(valueReadinessItems(preview.checks),[],"a warning is not a failed check");
+  assert.deepEqual(valueReadinessWarnings(preview.checks),[unpriced]);
+  assert.deepEqual(valueReadinessWarnings([{code:"model_price_coverage",ready:true}]),[],"a plain pass does not warn");
+  assert.deepEqual(valueReadinessWarnings([{...unpriced,ready:false}]),[],"a Market blocker is not a warning");
+  assert.equal(valueReadinessReasonKey(unpriced),"dashboard.userLimit.value.unpriced.reason.model_unpriced");
+  assert.equal(valueReadinessReasonKey({...unpriced,ready:false,state:undefined}),"dashboard.userLimit.value.readiness.model_unpriced");
+  assert.equal(valueReadinessReasonKey({code:"model_price_coverage",ready:false,reasonCode:"something_else"}),undefined);
+  const en:Record<string,string>=valueQuotaMessagesEn, zh:Record<string,string>=valueQuotaMessagesZh;
+  for(const reason of UNPRICED_REASON_CODES) {
+    for(const ready of [true,false]) {
+      const key=valueReadinessReasonKey({code:"model_price_coverage",ready,reasonCode:reason})!;
+      assert.ok(en[key],key); assert.ok(zh[key],key);
+    }
+  }
 });

@@ -14,6 +14,7 @@ import {
   getMarketValueQuotaReadiness,
   getRentalValueUsage,
   valueReadinessItems,
+  valueReadinessReasonKey,
   valueReadinessSummary,
   type MarketValueQuotaReadiness,
   type RentalValueUsage,
@@ -150,8 +151,9 @@ export function MarketValueReadinessLine({ id, state, quiet = false }: {
   const diagnostics = items.length ? <InfoHint label={t("dashboard.userLimit.value.readiness.blocked")}>
     <span className="grid gap-2">{items.map(({check, waitingOn}, index) => {
       const guidance = marketValueReadinessReason(check.code, t);
+      const reasonKey = valueReadinessReasonKey(check);
       return <span key={`${check.code}:${index}`} className="grid gap-0.5">
-        <span>{check.reasonCode === "model_unresolved" ? t("dashboard.userLimit.value.readiness.model_unresolved") : guidance.detail ?? guidance.short}</span>
+        <span>{reasonKey ? t(reasonKey) : guidance.detail ?? guidance.short}</span>
         {check.app || check.profileId || check.model ? <span className="break-all font-mono">{[check.app, check.providerId, check.profileId, check.driverId, check.model].filter(Boolean).join(" · ")}</span> : null}
         {waitingOn ? <span>{t("dashboard.userLimit.value.readiness.waitingOn", {root:marketValueReadinessReason(waitingOn,t).short})}</span> : null}
       </span>;

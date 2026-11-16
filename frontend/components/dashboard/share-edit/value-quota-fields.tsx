@@ -8,9 +8,10 @@ import { SegmentedControl } from "@/components/common/segmented-control";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { cn } from "@/lib/utils";
 import {
-  calibratedConversionRow, formatQuotaPicos, formatQuotaTime, renderValueQuotaMessage, valuePreviewBlocker, valuePreviewRowOutcome, valueQuotaErrorMessage,
-  type ValuePreviewInvalidRow, type ValuePreviewRow,
+  calibratedConversionRow, formatQuotaPicos, formatQuotaTime, renderValueQuotaMessage, valuePreviewBlocker, valuePreviewRowOutcome, valuePreviewUnpriced, valueQuotaErrorMessage,
+  type UnpricedUsage, type ValuePreviewInvalidRow, type ValuePreviewRow,
 } from "@/lib/share-value-quota";
+import { formatTokenAmount } from "@/lib/token-units";
 import type { ValuePreviewState } from "@/lib/use-value-quota-preview";
 import { FIELD_LABEL_CLASS, TokenInputEcho } from "./share-edit-shared";
 
@@ -98,6 +99,19 @@ function RowOutcome({row, t, locale, withEmail}: {row: ValuePreviewRow; t: TFn; 
   </span>;
 }
 
+/** Non-blocking: carried-over requests of unpriced models count as $0 and are re-priced once priced. */
+function UnpricedPreviewNote({usage, t}: {usage: UnpricedUsage; t: TFn}) {
+  const {locale} = useLocaleText();
+  return <span className="flex min-w-0 items-start gap-1.5 text-amber-800">
+    <span aria-hidden="true" className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-warning" />
+    <span className="min-w-0 break-words">
+      {t("dashboard.userLimit.value.unpriced.previewNote", {count: usage.requests})}
+      {usage.tokens ? <span className="font-mono"> · {formatTokenAmount(usage.tokens, locale)}</span> : null}
+      {usage.models.length ? <span className="block break-all font-mono text-[11px]">{t("dashboard.userLimit.value.unpriced.models", {models: usage.models.join(", ")})}</span> : null}
+    </span>
+  </span>;
+}
+
 function invalidRowReason(row: ValuePreviewInvalidRow, t: TFn) {
   const blocker = valuePreviewBlocker({ready: false, configRevision: 0, rows: [], invalidRows: [row]});
   return blocker ? renderValueQuotaMessage(blocker.message, t) : "";
@@ -131,11 +145,16 @@ export function ValuePreviewLine({state, t, calibrations}: {state: ValuePreviewS
     const reason = renderValueQuotaMessage(blocker.message, t);
     return <p className="text-xs text-red-600" role="alert">
       {blocker.email && (preview.rows.length + invalid.length) > 1 ? t("dashboard.userLimit.value.rowReason", {email: blocker.email, reason}) : reason}
-      {preview.rows.filter(row=>row.coverage && (!blocker.email || row.email===blocker.email)).map(row=><span key={row.email} className="mt-1 block">{t("dashboard.userLimit.value.evidence",{tokens:row.coverage!.evidenceTokens,requests:row.coverage!.evidenceRequests,missing:row.coverage!.missingFacts})}</span>)}
+      {preview.rows.filter(row=>row.coverage && (!blocker.email || row.email===blocker.email)).map(row=><span key={row.email} className="mt-1 block">{t("dashboard.userLimit.value.evidence",{tokens:formatTokenAmount(row.coverage!.evidenceTokens,locale),requests:row.coverage!.evidenceRequests,missing:row.coverage!.missingFacts})}</span>)}
     </p>;
   }
+  const unpriced = valuePreviewUnpriced(preview.rows);
   if (preview.rows.length <= 1) {
-    return preview.rows[0] ? <p className="text-xs text-muted-foreground" role="status"><RowOutcome row={preview.rows[0]} t={t} locale={locale} /></p> : null;
+    if (!preview.rows[0]) return null;
+    return <div className="grid gap-1 text-xs text-muted-foreground" role="status">
+      <span><RowOutcome row={preview.rows[0]} t={t} locale={locale} /></span>
+      {unpriced ? <UnpricedPreviewNote usage={unpriced} t={t} /> : null}
+    </div>;
   }
   const scheduled = preview.rows.filter(row => valuePreviewRowOutcome(row) === "scheduled").length;
   const fromNow = preview.rows.filter(row => valuePreviewRowOutcome(row) === "meteredFromNow").length;
@@ -152,6 +171,7 @@ export function ValuePreviewLine({state, t, calibrations}: {state: ValuePreviewS
     <ul className="grid max-h-28 gap-0.5 overflow-auto rounded-md border bg-muted/20 px-2 py-1.5">
       {preview.rows.map(row => <li key={row.email} className="min-w-0"><RowOutcome row={row} t={t} locale={locale} withEmail /></li>)}
     </ul>
+    {unpriced ? <UnpricedPreviewNote usage={unpriced} t={t} /> : null}
   </div>;
 }
 

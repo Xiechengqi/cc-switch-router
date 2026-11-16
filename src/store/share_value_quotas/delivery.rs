@@ -32,10 +32,15 @@ pub(super) fn apply_activation(
             "pricing revision was not acknowledged".into(),
         ));
     }
+    // A revision re-issued to this installation (owner prices) carries its
+    // own, later activation time; content-addressed rows keep the first one.
     let effective: i64 = conn
         .query_row(
-            "SELECT effective_from_ms FROM share_value_pricing_snapshots WHERE revision=?1",
-            params![revision],
+            "SELECT max(s.effective_from_ms,coalesce((SELECT r.effective_from_ms
+                FROM share_value_pricing_installation_revisions r
+                WHERE r.installation_id=?2 AND r.revision=s.revision),0))
+             FROM share_value_pricing_snapshots s WHERE s.revision=?1",
+            params![revision, installation],
             |r| r.get(0),
         )
         .map_err(db_error)?;
@@ -70,8 +75,11 @@ pub(super) fn delivery_health(
 ) -> Result<serde_json::Value, AppError> {
     let (expected,acknowledged,activated):(i64,i64,i64)=conn.query_row(
         "WITH targets AS (
-          SELECT i.id,i.last_seen_at,CASE WHEN coalesce(c.resources,0)=1
-            THEN (SELECT revision FROM share_value_resource_pricing_config WHERE singleton=1) ELSE ?1 END AS revision
+          SELECT i.id,i.last_seen_at,coalesce(
+            (SELECT t.revision FROM share_value_pricing_installation_tariffs t WHERE t.installation_id=i.id
+              AND t.tariff_kind=CASE WHEN coalesce(c.resources,0)=1 THEN 'resource' ELSE 'text' END),
+            CASE WHEN coalesce(c.resources,0)=1
+            THEN (SELECT revision FROM share_value_resource_pricing_config WHERE singleton=1) ELSE ?1 END) AS revision
           FROM installations i LEFT JOIN installation_value_capabilities c ON c.installation_id=i.id
           WHERE i.lifecycle='active' AND EXISTS(SELECT 1 FROM shares s WHERE s.installation_id=i.id)
         )

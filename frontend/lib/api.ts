@@ -24,6 +24,11 @@ import type {
   ShareListingPricingResponse,
   ShareUserLimitStatusResponse,
   ShareUserUsageBreakdownResponse,
+  ShareModelPriceRates,
+  ShareModelPricesResponse,
+  ShareModelPriceUpsertResult,
+  ShareModelPriceDeleteResult,
+  ShareModelPriceSuggestionsResponse,
   UserApiTokenResponse,
   UserApiTokenResetResponse,
   UserModelRoutingResponse,
@@ -425,11 +430,61 @@ export async function getShareUserLimitStatus(shareId: string) {
 
 export async function getShareUserUsageBreakdown(shareId: string, email?: string) {
   const query = email ? `?email=${encodeURIComponent(email)}` : "";
+  // Signed in only: managers see any user, others only themselves.
   return parseJson<ShareUserUsageBreakdownResponse>(
-    await fetch(
+    await authFetch(
       `/v1/shares/${encodeURIComponent(shareId)}/user-usage-breakdown${query}`,
       { cache: "no-store" },
     ),
+  );
+}
+
+function shareModelPricesUrl(shareId: string, modelKey?: string) {
+  const base = `/v1/shares/${encodeURIComponent(shareId)}/model-prices`;
+  return modelKey == null ? base : `${base}/${encodeURIComponent(modelKey)}`;
+}
+
+/** Owner prices of the Share's client; they apply to every Share on it. */
+export async function getShareModelPrices(shareId: string, signal?: AbortSignal) {
+  return parseJson<ShareModelPricesResponse>(
+    await authFetch(shareModelPricesUrl(shareId), { cache: "no-store", signal }),
+  );
+}
+
+/**
+ * Creates (`expectedVersion` null) or replaces (`expectedVersion` = the loaded
+ * version) an owner price. A stale version answers 409
+ * `MODEL_PRICE_VERSION_CONFLICT`.
+ */
+export async function upsertShareModelPrice(
+  shareId: string,
+  modelKey: string,
+  input: { displayName?: string; rates: ShareModelPriceRates; expectedVersion: number | null },
+) {
+  return parseJson<ShareModelPriceUpsertResult>(
+    await authFetch(shareModelPricesUrl(shareId, modelKey), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input),
+    }),
+  );
+}
+
+export async function deleteShareModelPrice(shareId: string, modelKey: string, expectedVersion: number) {
+  const query = new URLSearchParams({ expectedVersion: String(expectedVersion) });
+  return parseJson<ShareModelPriceDeleteResult>(
+    await authFetch(`${shareModelPricesUrl(shareId, modelKey)}?${query}`, { method: "DELETE" }),
+  );
+}
+
+/**
+ * Up to five catalog models with similar names, as a starting point. A
+ * sibling of `model-prices` so that a model named "suggestions" stays priceable.
+ */
+export async function getShareModelPriceSuggestions(shareId: string, modelKey: string, signal?: AbortSignal) {
+  const query = new URLSearchParams({ model: modelKey });
+  return parseJson<ShareModelPriceSuggestionsResponse>(
+    await authFetch(`/v1/shares/${encodeURIComponent(shareId)}/model-price-suggestions?${query}`, { cache: "no-store", signal }),
   );
 }
 

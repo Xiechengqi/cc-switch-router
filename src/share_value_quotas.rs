@@ -6,7 +6,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, header},
     middleware,
     response::Response,
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use serde::Deserialize;
 
@@ -35,6 +35,16 @@ pub fn router() -> Router<ServerState> {
         .route(
             "/v1/shares/:share_id/market-value-quota-readiness",
             get(market_readiness),
+        )
+        .route("/v1/shares/:share_id/model-prices", get(list_model_prices))
+        // A sibling path, so every model key (even `suggestions`) is priceable.
+        .route(
+            "/v1/shares/:share_id/model-price-suggestions",
+            get(model_price_suggestions),
+        )
+        .route(
+            "/v1/shares/:share_id/model-prices/:model_key",
+            put(upsert_model_price).delete(delete_model_price),
         )
         .layer(DefaultBodyLimit::max(CONTROL_BODY_LIMIT))
         // Every response here, including errors and extractor rejections, is private.
@@ -66,6 +76,39 @@ async fn require_share_manager(
     {
         return Err(AppError::Forbidden(
             "Share owner or Router owner required".into(),
+        ));
+    }
+    Ok(session)
+}
+/// Whether a signed-in user manages the Share (same rule as
+/// [`require_share_manager`]); a missing Share is a 404.
+pub(crate) async fn session_manages_share(
+    state: &ServerState,
+    session: &crate::models::AuthSession,
+    share_id: &str,
+) -> Result<bool, AppError> {
+    let owner = state
+        .store
+        .lookup_share_owner_email(share_id)
+        .await?
+        .ok_or_else(crate::store::share_value_quotas::owner_prices::share_not_found)?;
+    Ok(owner.eq_ignore_ascii_case(&session.email)
+        || crate::api::is_finance_owner(&state.config, &session.email))
+}
+/// [`require_share_manager`] with the owner price editor's coded errors.
+async fn require_price_manager(
+    state: &ServerState,
+    headers: &HeaderMap,
+    share_id: &str,
+) -> Result<crate::models::AuthSession, AppError> {
+    let session = crate::api::resolve_router_session(state, headers)
+        .await?
+        .ok_or_else(|| AppError::Unauthorized("login required".into()))?;
+    if !session_manages_share(state, &session, share_id).await? {
+        return Err(AppError::coded_forbidden(
+            "SHARE_FORBIDDEN",
+            "Share owner or Router owner required",
+            serde_json::json!({}),
         ));
     }
     Ok(session)
@@ -384,9 +427,30 @@ fn market_readiness_checks(
             if let Some(at) = check["effectiveFromMs"].as_u64() {
                 safe["effectiveFromMs"] = at.into();
             }
+            // Money is bound to Market seats: usage the Server would meter at
+            // $0 for an owner grant is refused for a paid seat, so a missing
+            // price blocks every Market gate (publish, edit, reopen, quote).
+            if unpriced_for_market(check) {
+                safe["ready"] = false.into();
+            }
             Some(safe)
         })
         .collect()
+}
+/// Price-type reasons the Server meters at $0 for owner-managed grants only.
+const UNPRICED_REASONS: [&str; 5] = [
+    "model_unpriced",
+    "model_unresolved",
+    "tier_unpriced",
+    "resource_unpriced",
+    "tariff_not_effective",
+];
+fn unpriced_for_market(check: &serde_json::Value) -> bool {
+    check["state"] == "unpriced"
+        || (check["code"] == "model_price_coverage"
+            && check["reasonCode"]
+                .as_str()
+                .is_some_and(|reason| UNPRICED_REASONS.contains(&reason)))
 }
 fn check_ready(checks: &[serde_json::Value], code: &str) -> bool {
     checks
@@ -636,6 +700,123 @@ async fn mine(
     ))
 }
 
+async fn list_model_prices(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(share_id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_price_manager(&state, &headers, &share_id).await?;
+    let (installation_id, prices) = state.store.owner_model_prices(&share_id).await?;
+    Ok(Json(
+        serde_json::json!({"installationId":installation_id,"prices":prices}),
+    ))
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OwnerPriceRequest {
+    #[serde(default)]
+    display_name: Option<String>,
+    rates: crate::api::AdminModelPriceRatesRequest,
+    /// Absent or null: the price must not exist yet.
+    #[serde(default)]
+    expected_version: Option<i64>,
+}
+async fn upsert_model_price(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path((share_id, model_key)): Path<(String, String)>,
+    body: Result<Json<OwnerPriceRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::store::share_value_quotas::owner_prices::{OwnerPriceEdit, price_invalid};
+    let session = require_price_manager(&state, &headers, &share_id).await?;
+    let Json(input) = body.map_err(|rejection| {
+        price_invalid(
+            "body_invalid",
+            serde_json::json!({"detail": rejection.body_text()}),
+        )
+    })?;
+    let rates = crate::api::parse_model_price_rates(&input.rates).map_err(|error| {
+        price_invalid("rate_invalid", serde_json::json!({"detail": error.to_string()}))
+    })?;
+    let (price, effective_from_ms) = state
+        .store
+        .upsert_owner_model_price(
+            &share_id,
+            OwnerPriceEdit {
+                model_key,
+                display_name: input.display_name,
+                rates,
+                expected_version: input.expected_version,
+            },
+            &session.email,
+        )
+        .await?;
+    Ok(Json(
+        serde_json::json!({"price":price,"effectiveFromMs":effective_from_ms}),
+    ))
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DeletePriceQuery {
+    expected_version: i64,
+}
+async fn delete_model_price(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path((share_id, model_key)): Path<(String, String)>,
+    query: Result<Query<DeletePriceQuery>, axum::extract::rejection::QueryRejection>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let session = require_price_manager(&state, &headers, &share_id).await?;
+    let Query(query) = query.map_err(|rejection| {
+        crate::store::share_value_quotas::owner_prices::price_invalid(
+            "expected_version_required",
+            serde_json::json!({"detail": rejection.body_text()}),
+        )
+    })?;
+    let effective_from_ms = state
+        .store
+        .delete_owner_model_price(&share_id, &model_key, query.expected_version, &session.email)
+        .await?;
+    Ok(Json(
+        serde_json::json!({"deleted":true,"effectiveFromMs":effective_from_ms}),
+    ))
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SuggestionQuery {
+    model: String,
+}
+/// Catalog rates only, so Router admins (who price Router-wide from the same
+/// dialog) may read them as well as Share managers.
+async fn model_price_suggestions(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(share_id): Path<String>,
+    Query(query): Query<SuggestionQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let session = crate::api::resolve_router_session(&state, &headers)
+        .await?
+        .ok_or_else(|| AppError::Unauthorized("login required".into()))?;
+    if !session_manages_share(&state, &session, &share_id).await?
+        && !state.dynamic.read().await.is_admin(&session.email)
+    {
+        return Err(AppError::coded_forbidden(
+            "SHARE_FORBIDDEN",
+            "Share owner, Router owner or Router admin required",
+            serde_json::json!({}),
+        ));
+    }
+    if query.model.len() > 256 {
+        return Err(crate::store::share_value_quotas::owner_prices::price_invalid(
+            "model_key_invalid",
+            serde_json::json!({"field": "model"}),
+        ));
+    }
+    Ok(Json(
+        serde_json::json!({"suggestions":state.store.owner_model_price_suggestions(&query.model)}),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -674,6 +855,26 @@ mod tests {
             panic!("expected structured error");
         }
     }
+    #[test]
+    fn share_value_unpriced_coverage_is_forwarded_and_blocks_market_seats() {
+        // Owner grants meter it at $0 (`ready:true`), but a paid seat would be
+        // refused by the Server, so every Market gate treats it as blocking.
+        let response = serde_json::json!({"configRevision":3,"capabilityReady":true,"checks":[
+            {"code":"model_price_coverage","ready":true,"state":"unpriced","app":"codex",
+                "model":"kimi-k3-1","reasonCode":"model_unpriced"},
+            {"code":"model_price_coverage","ready":true,"app":"claude",
+                "model":"house-model","reasonCode":"tariff_not_effective"},
+            {"code":"model_price_coverage","ready":true,"app":"gemini","model":"gemini-3-pro"}]});
+        let checks = market_readiness_checks(&response, 3).unwrap();
+        assert_eq!(checks[0]["state"], "unpriced");
+        assert_eq!(checks[0]["reasonCode"], "model_unpriced");
+        assert_eq!(checks[0]["model"], "kimi-k3-1");
+        assert_eq!(checks[0]["ready"], false);
+        assert_eq!(checks[1]["ready"], false);
+        assert_eq!(checks[2]["ready"], true, "a priced model stays ready");
+        assert!(checks.iter().any(|check| check["ready"] != true));
+    }
+
     #[tokio::test]
     async fn share_value_errors_are_private_and_offline_is_structured() {
         use axum::response::IntoResponse;

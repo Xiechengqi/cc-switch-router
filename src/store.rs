@@ -3658,6 +3658,9 @@ impl AppStore {
                 "shareTerminationV1".into(),
                 "providerIdentityV1".into(),
                 "buddyQuotaPresentationV1".into(),
+                // Unpriced owner-managed usage is metered at $0 and reported
+                // through the optional `unpriced*` value quota status fields.
+                "valueQuotaUnpricedV1".into(),
             ],
         })
     }
@@ -9941,14 +9944,34 @@ impl AppStore {
         };
 
         let catalog = self.pricing_catalog();
-        let conn = self.conn.lock().await;
-        let Some(user_grants_json): Option<String> = conn
+        // Resolve models exactly as the Server meters this installation: its
+        // served tariff plus the owner prices filling models it cannot price.
+        // Read (and parsed off the runtime, cached) before the main lock.
+        let installation_id: Option<String> = self
+            .conn
+            .lock()
+            .await
             .query_row(
-                "SELECT COALESCE(user_grants_json, '{}')
+                "SELECT installation_id FROM shares WHERE share_id = ?1",
+                params![share_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| AppError::Internal(format!("query share installation failed: {e}")))?;
+        let Some(installation_id) = installation_id else {
+            return Err(AppError::NotFound("share not found".into()));
+        };
+        let effective = self
+            .installation_effective_prices(&installation_id)
+            .await?;
+        let conn = self.conn.lock().await;
+        let Some((installation_id, user_grants_json)): Option<(String, String)> = conn
+            .query_row(
+                "SELECT installation_id, COALESCE(user_grants_json, '{}')
                  FROM shares
                  WHERE share_id = ?1",
                 params![share_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(|e| {
@@ -9956,6 +9979,23 @@ impl AppStore {
             })?
         else {
             return Err(AppError::NotFound("share not found".into()));
+        };
+        // The resolved key's rates come from the generation in force at the
+        // pricing time: the owner price history, else the catalog.
+        let owner_prices =
+            share_value_quotas::owner_prices::owner_price_generations(&conn, &installation_id)?;
+        let effective_lookup = |model_text: &str, at_unix: i64| {
+            let (key, owner) = effective.resolve(model_text)?;
+            let price = if owner {
+                share_value_quotas::owner_prices::owner_price_at(
+                    &owner_prices,
+                    &key,
+                    at_unix.saturating_mul(1000),
+                )
+            } else {
+                catalog.price_at(&key, at_unix)
+            }?;
+            Some((key, price, owner))
         };
 
         let wanted = email_filter.and_then(normalize_usage_email);
@@ -10018,7 +10058,7 @@ impl AppStore {
             .map_or(now_unix, |end| end.min(now_unix));
         let mut thresholds: Vec<(String, i64, bool)> = Vec::new();
         for model_key in &model_keys {
-            if let Some((_, price)) = catalog.lookup(model_key, pricing_at)
+            if let Some((_, price, _)) = effective_lookup(model_key, pricing_at)
                 && let Some(threshold) = price.long_context_threshold
             {
                 thresholds.push((
@@ -10050,6 +10090,8 @@ impl AppStore {
             let mut estimated_count: u64 = 0;
             let mut equivalent: i128 = 0;
             let mut any_priced = false;
+            let mut unpriced_tokens: u64 = 0;
+            let mut unpriced_models = BTreeSet::new();
 
             for group in by_email.remove(&email).unwrap_or_default() {
                 let split = TokenSplit {
@@ -10087,7 +10129,7 @@ impl AppStore {
                     ContextTier::Base
                 };
 
-                let resolved = catalog.lookup(&group.model_key, pricing_at);
+                let resolved = effective_lookup(&group.model_key, pricing_at);
                 // Unattributed-only groups have no billable split. Pricing
                 // them would emit a confident $0, which §6.4 forbids; the
                 // amount stays absent and the unattributed row carries the
@@ -10095,11 +10137,13 @@ impl AppStore {
                 let priced = if split.total() == 0 {
                     None
                 } else {
-                    resolved.and_then(|(_, price)| price_usage_in_tier(price, tier, ctx, &split))
+                    resolved
+                        .as_ref()
+                        .and_then(|(_, price, _)| price_usage_in_tier(price, tier, ctx, &split))
                 };
 
-                let (price_key, display_name) = match resolved {
-                    Some((key, price)) => (
+                let (price_key, display_name) = match &resolved {
+                    Some((key, price, _)) => (
                         Some(key.to_string()),
                         if price.display_name.is_empty() {
                             group.model_key.clone()
@@ -10142,6 +10186,13 @@ impl AppStore {
 
                 notes.sort();
                 notes.dedup();
+                // Usage the quota meters at $0: billable tokens without an
+                // amount (no price, or a price missing the tier).
+                let unpriced = priced.is_none() && split.total() > 0;
+                if unpriced {
+                    unpriced_tokens = unpriced_tokens.saturating_add(split.total());
+                    unpriced_models.insert(group.model_key.clone());
+                }
                 by_model.push(crate::models::ShareUserUsageModelRow {
                     model_key: group.model_key.clone(),
                     price_key,
@@ -10156,7 +10207,11 @@ impl AppStore {
                     unattributed: group.unattributed,
                     total: group_total,
                     request_count: group.request_count,
-                    priced: resolved.is_some(),
+                    priced: priced.is_some(),
+                    price_source: priced.as_ref().and(resolved.as_ref()).map(|(_, _, owner)| {
+                        if *owner { "owner" } else { "catalog" }
+                    }),
+                    unpriced,
                     equivalent_usd_micros: amount,
                     lines,
                     notes: notes.iter().map(|note| note.as_str().to_string()).collect(),
@@ -10201,11 +10256,19 @@ impl AppStore {
                 // fabricating an attribution for a scalar offset.
                 rebase_applied,
                 observed_totals: totals,
-                equivalent_usd_micros: any_priced.then(|| equivalent.to_string()),
+                // Unpriced usage is metered at $0: a window with only unpriced
+                // tokens shows "0" like its $0 model lines, never "no amount".
+                equivalent_usd_micros: (any_priced || unpriced_tokens > 0)
+                    .then(|| equivalent.to_string()),
                 priced_coverage_percent,
                 estimated_request_percent,
                 by_model,
                 notes: row_notes,
+                unpriced_tokens,
+                unpriced_models: unpriced_models
+                    .into_iter()
+                    .take(crate::share_value_pricing::MAX_UNPRICED_MODELS)
+                    .collect(),
             });
         }
 
@@ -10214,6 +10277,8 @@ impl AppStore {
             pricing_revision: crate::model_price_catalog::qualified_revision(catalog.revision()),
             priced_at: now_unix,
             rows,
+            can_set_price: false,
+            can_set_global_price: false,
         })
     }
 
@@ -30217,6 +30282,7 @@ pub(crate) mod tests {
     mod share_account_identity;
     mod share_market_control;
     mod share_token_periods;
+    mod share_value_owner_prices;
     include!("store/share_value_quotas/signed_delivery_tests.rs");
     include!("store/share_value_quotas/metering_scope_tests.rs");
     use crate::config::Config;
@@ -37591,7 +37657,10 @@ pub(crate) mod tests {
         assert!(!model.priced);
         assert!(model.equivalent_usd_micros.is_none());
         assert!(model.notes.iter().any(|note| note == "priceKeyNotFound"));
-        assert!(breakdown.rows[0].equivalent_usd_micros.is_none());
+        assert!(model.unpriced);
+        // Unpriced usage is metered at $0, so the window total reads "0".
+        assert_eq!(breakdown.rows[0].equivalent_usd_micros.as_deref(), Some("0"));
+        assert_eq!(breakdown.rows[0].priced_coverage_percent, 0.0);
 
         let _ = std::fs::remove_file(&config.database.path);
     }
@@ -38621,6 +38690,9 @@ pub(crate) mod tests {
             pending_risk_picos: "0".into(),
             metering_status: "observed".into(),
             synced_at_ms: Utc::now().timestamp_millis(),
+            unpriced_requests: None,
+            unpriced_tokens: None,
+            unpriced_models: None,
         };
         let report = |status: &ValueQuotaStatus| json!({"shareId":"value-share","status":status});
         assert!(

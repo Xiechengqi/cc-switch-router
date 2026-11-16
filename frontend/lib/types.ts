@@ -1058,7 +1058,15 @@ export type ShareUserUsageModelRow = {
   unattributed: number;
   total: number;
   requestCount: number;
+  /** An amount was actually computed for this row. */
   priced: boolean;
+  /** Which price set produced the amount; absent when unpriced or from an older Router. */
+  priceSource?: "catalog" | "owner";
+  /**
+   * The row has tokens but no price: it is metered at $0. Absent from older
+   * Routers, which still blocked such usage instead.
+   */
+  unpriced?: boolean;
   equivalentUsdMicros?: string;
   lines: ShareUserUsagePriceLine[];
   notes: ShareUsagePricingNote[];
@@ -1085,6 +1093,9 @@ export type ShareUserUsageBreakdownRow = {
   estimatedRequestPercent: number;
   byModel: ShareUserUsageModelRow[];
   notes: ShareUsagePricingNote[];
+  /** Tokens of this window metered at $0 because their model has no price. */
+  unpricedTokens?: number;
+  unpricedModels?: string[];
 };
 
 export type ShareUserUsageBreakdownResponse = {
@@ -1092,6 +1103,59 @@ export type ShareUserUsageBreakdownResponse = {
   pricingRevision: string;
   pricedAt: number;
   rows: ShareUserUsageBreakdownRow[];
+  /** The caller manages the Share and may set prices for its client. */
+  canSetPrice?: boolean;
+  /** The caller is a Router admin and may set Router-wide prices. */
+  canSetGlobalPrice?: boolean;
+};
+
+/** Decimal USD per 1M tokens, exactly as typed; never parsed with `Number`. */
+export type ShareModelPriceRates = {
+  inputUsdPer1m: string;
+  outputUsdPer1m: string;
+  cacheReadUsdPer1m: string;
+  cacheWrite5mUsdPer1m: string;
+  cacheWrite1hUsdPer1m?: string;
+};
+
+/** A price the Share owner set for one model on the Share's client (installation). */
+export type OwnerModelPrice = {
+  modelKey: string;
+  displayName: string;
+  rates: ShareModelPriceRates;
+  version: number;
+  updatedAtMs: number;
+  updatedBy: string;
+  /**
+   * The catalog prices this model now, so this owner price no longer applies
+   * (owner prices only fill models the catalog doesn't price). Absent on older Routers.
+   */
+  shadowed?: boolean;
+};
+
+export type ShareModelPricesResponse = {
+  installationId: string;
+  prices: OwnerModelPrice[];
+};
+
+export type ShareModelPriceUpsertResult = {
+  price: OwnerModelPrice;
+  effectiveFromMs: number;
+};
+
+export type ShareModelPriceDeleteResult = {
+  deleted: true;
+  effectiveFromMs: number;
+};
+
+export type ShareModelPriceSuggestion = {
+  modelKey: string;
+  displayName: string;
+  rates: ShareModelPriceRates;
+};
+
+export type ShareModelPriceSuggestionsResponse = {
+  suggestions: ShareModelPriceSuggestion[];
 };
 
 export type AdminModelPriceResult = {

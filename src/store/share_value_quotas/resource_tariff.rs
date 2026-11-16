@@ -171,11 +171,11 @@ pub(super) fn installation_supports_resources(
         .unwrap_or(false))
 }
 pub(super) fn installation_meta(conn: &Connection, id: &str) -> Result<SettingsMeta, AppError> {
-    if installation_supports_resources(conn, id)? {
-        read_resource_settings_meta(conn)
-    } else {
-        read_settings_meta(conn)
-    }
+    super::owner_prices::installation_tariff_meta(
+        conn,
+        id,
+        installation_supports_resources(conn, id)?,
+    )
 }
 impl AppStore {
     pub(crate) async fn resource_price_settings(&self) -> Result<Value, AppError> {
@@ -247,6 +247,7 @@ impl AppStore {
             )
             .map_err(db_error)?;
             publish(&tx, now)?;
+            // Owner-price overlays are re-derived by the sync below, off the lock.
             // Alias changes also affect text-only installations; force their
             // normal publication worker to derive v1 again.
             tx.execute("UPDATE share_value_pricing_publication SET published_catalog_revision=NULL WHERE singleton=1",[]).map_err(db_error)?;

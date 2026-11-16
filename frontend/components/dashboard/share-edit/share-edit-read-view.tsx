@@ -85,6 +85,7 @@ export function ShareEditReadView({
     refresh: refreshBreakdown,
     errors: breakdownErrors,
     loaded: breakdownLoaded,
+    priceCapabilities,
   } = useShareUserUsageBreakdown(share.shareId);
   const [limitRows, setLimitRows] = React.useState<ShareUserLimitStatusRow[] | null>(null);
   const [limitLoading, setLimitLoading] = React.useState(false);
@@ -234,6 +235,7 @@ export function ShareEditReadView({
                   breakdownLoaded={breakdownLoaded}
                   onExpand={onExpand}
                   onPriceSaved={refreshBreakdown}
+                  modelPricing={{ shareId: share.shareId, capabilities: priceCapabilities, canManage: !!share.canManage }}
                 />
               ) : limitLoading ? (
                 <EmptyBlock>{t("dashboard.userLimit.loading")}</EmptyBlock>

@@ -90,6 +90,8 @@ export type ValueQuotaStatus = {
   tokenPeriod?: string | null; pendingTokenPeriod?: string | null;
   /** Why the window is not plainly observed, e.g. on `unavailable` rows. */
   reasonCode?: string | null;
+  /** Attempts in this window metered at $0 because no price applied (older Servers omit these). */
+  unpricedRequests?: number; unpricedTokens?: number; unpricedModels?: string[];
 };
 /** A per-user failure returned in place of a status row (e.g. by a correction). */
 export type ValueStatusRowError = {email: string; code: string};
@@ -132,7 +134,9 @@ export type ValuePreviewRow = {
   conversionRequired?: boolean; conversionCredential?: string; credentialExpiresAtMs?: number; calibrationRequired?: boolean;
   sourceUnit?: "tokens" | "usdEquivalent"; targetUnit?: "tokens" | "usdEquivalent";
   tokenLimit?: number | null; limitUsdMicros?: string | null; observedTokens?: number; effectiveTokens?: number; pendingTokens?: number; remainingTokens?: number | null; pendingRiskPicos?: string; remainingPicos?: string | null;
-  coverage?: { status?: {meteringStatus: string; observedPicos: string}; complete: boolean; missingFacts: number; evidenceTokens: number; evidenceRequests: number; pricingBasis?: string; preparationState?: string; processed?: number };email: string; usedPicos?: string | null; effectiveFromMs: number; meteredFromMs: number;
+  coverage?: { status?: {meteringStatus: string; observedPicos: string}; complete: boolean; missingFacts: number; evidenceTokens: number; evidenceRequests: number; pricingBasis?: string; preparationState?: string; processed?: number;
+    /** Requests carried over at $0 because their model has no price; never a blocker on their own. */
+    unpricedFacts?: number; unpricedTokens?: number; unpricedModels?: string[] };email: string; usedPicos?: string | null; effectiveFromMs: number; meteredFromMs: number;
   windowId?: string; canInitializeUsage?: boolean;
   reason?: string | null; reasonCode?: string | null; ready?: boolean | null};
 /** A requested policy the Server rejected outright (bad amount, period, user…). */
@@ -180,6 +184,30 @@ export function valuePreviewBlocker(preview: ValueQuotaPreview, now = Date.now()
     ? {key: "dashboard.userLimit.value.notReady"} : reasonMessage(preview.reasonCode, preview.reason)};
   return undefined;
 }
+/** Usage counted at $0 for want of a price, summed over the given counts; undefined when there is none. */
+export type UnpricedUsage = {requests: number; tokens: number; models: string[]};
+const positiveCount = (value: unknown) => typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : 0;
+const modelNames = (value: unknown) => Array.isArray(value) ? value.filter((name): name is string => typeof name === "string" && !!name.trim()) : [];
+function unpricedUsage(parts: {requests?: unknown; tokens?: unknown; models?: unknown}[]): UnpricedUsage | undefined {
+  let requests = 0, tokens = 0;
+  const models = new Set<string>();
+  for (const part of parts) {
+    const count = positiveCount(part.requests);
+    if (!count) continue;
+    requests += count; tokens += positiveCount(part.tokens);
+    for (const name of modelNames(part.models)) models.add(name);
+  }
+  return requests ? {requests, tokens, models: [...models].sort()} : undefined;
+}
+/** A window's $0 usage: the status still counts it, the badge only explains it. */
+export function valueStatusUnpriced(status: ValueQuotaStatus | undefined): UnpricedUsage | undefined {
+  return status ? unpricedUsage([{requests: status.unpricedRequests, tokens: status.unpricedTokens, models: status.unpricedModels}]) : undefined;
+}
+/** $0 carry-over across the preview rows that will apply; blocked rows say why on their own. */
+export function valuePreviewUnpriced(rows: readonly ValuePreviewRow[], now = Date.now()): UnpricedUsage | undefined {
+  return unpricedUsage(rows.filter(row => valuePreviewRowOutcome(row, now) !== "blocked")
+    .map(row => ({requests: row.coverage?.unpricedFacts, tokens: row.coverage?.unpricedTokens, models: row.coverage?.unpricedModels})));
+}
 /** Why a status row is not plainly observed; nothing for confirmed usage. */
 export function valueStatusReason(status: ValueQuotaStatus | undefined): ValueQuotaMessage | undefined {
   const code = status?.reasonCode?.trim();
@@ -196,6 +224,22 @@ export type ValueReadinessCheck = {code: string; ready: boolean; state?: string;
   model?: string; scope?: string; reasonCode?: string; effectiveFromMs?: number | null;
   /** The `code` of another check this one only waits on, e.g. an unacknowledged tariff waiting on an unpublished one. */
   blockedBy?: string | null};
+/** Why a model's usage has no price. Owner-managed quotas meter it at $0; Market seats block on it. */
+export const UNPRICED_REASON_CODES = ["model_unpriced", "model_unresolved", "tier_unpriced", "resource_unpriced", "tariff_not_effective"] as const;
+export type UnpricedReasonCode = typeof UNPRICED_REASON_CODES[number];
+export function knownUnpricedReason(code: unknown): UnpricedReasonCode | undefined {
+  return UNPRICED_REASON_CODES.find(known => known === code);
+}
+/** Passed checks that still warn: usage of that model counts as $0 until it is priced. */
+export function valueReadinessWarnings(checks: readonly ValueReadinessCheck[] | null | undefined): ValueReadinessCheck[] {
+  return (checks ?? []).filter(check => check.ready === true && check.state === "unpriced");
+}
+/** The specific sentence for a check whose reason names a missing price, blocking or not. */
+export function valueReadinessReasonKey(check: ValueReadinessCheck): ValueQuotaMessageKey | undefined {
+  const reason = knownUnpricedReason(check.reasonCode);
+  if (!reason) return undefined;
+  return check.ready === true ? `dashboard.userLimit.value.unpriced.reason.${reason}` : `dashboard.userLimit.value.readiness.${reason}`;
+}
 /** Most fundamental first: what an operator should fix before anything else. */
 export const VALUE_READINESS_ORDER = ["router_protocol", "sqlite_authority", "metering_storage", "tariff_published",
   "acknowledged_tariff", "resource_metering", "text_surface", "model_price_coverage"] as const;
@@ -426,6 +470,7 @@ export function parseMarketValueReadiness(raw: unknown): MarketValueQuotaReadine
   const value = raw as Record<string, unknown>;
   if (typeof value.ready !== "boolean") throw invalid();
   let checks: ValueReadinessCheck[] | undefined;
+  let unpricedBlocker: ValueReadinessCheck | undefined;
   if (value.checks != null) {
     if (!Array.isArray(value.checks) || value.checks.length > 128) throw invalid();
     checks = value.checks.map((raw: unknown) => {
@@ -438,13 +483,24 @@ export function parseMarketValueReadiness(raw: unknown): MarketValueQuotaReadine
         if (typeof text === "string" && text.length > 0 && text.length <= 256 && text.trim() === text && !/[\u0000-\u001f\u007f]/.test(text)) safe[key] = text;
       }
       if (Number.isSafeInteger(item.effectiveFromMs) && (item.effectiveFromMs as number) >= 0) safe.effectiveFromMs = item.effectiveFromMs;
+      // A paid seat is refused for usage an owner grant would meter at $0: always a blocker here.
+      if (safe.ready && marketUnpriced(safe as ValueReadinessCheck)) {
+        safe.ready = false;
+        unpricedBlocker ??= safe as ValueReadinessCheck;
+      }
       return safe as ValueReadinessCheck;
     });
-    if (value.ready && (checks.length === 0 || checks.some(check => !check.ready))) throw invalid();
   }
-  return {ready:value.ready, valueTrialReady:value.ready && value.valueTrialReady === true,
-    resourceReady:value.ready && value.resourceReady === true && checks?.some(check=>check.code === "resource_metering" && check.ready) === true,
-    reason:typeof value.reason === "string" && /^[a-zA-Z0-9_]{1,64}$/.test(value.reason) ? value.reason : undefined, checks};
+  const ready = value.ready && !unpricedBlocker;
+  if (ready && checks && (checks.length === 0 || checks.some(check => !check.ready))) throw invalid();
+  const reason = typeof value.reason === "string" && /^[a-zA-Z0-9_]{1,64}$/.test(value.reason) ? value.reason : undefined;
+  return {ready, valueTrialReady:ready && value.valueTrialReady === true,
+    resourceReady:ready && value.resourceReady === true && checks?.some(check=>check.code === "resource_metering" && check.ready) === true,
+    reason:reason ?? (unpricedBlocker ? unpricedBlocker.code : undefined), checks};
+}
+/** A missing price, which owner grants meter at $0 but Market seats must not sell. */
+function marketUnpriced(check: ValueReadinessCheck) {
+  return check.state === "unpriced" || (check.code === "model_price_coverage" && !!knownUnpricedReason(check.reasonCode));
 }
 export async function getMarketValueQuotaReadiness(shareId: string, signal?: AbortSignal) {
   const result = await parseJson<MarketValueQuotaReadiness>(await authFetch(
