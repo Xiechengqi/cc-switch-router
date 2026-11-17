@@ -61,6 +61,36 @@ pub(crate) struct NotificationKind {
 
 pub(crate) const KINDS: &[NotificationKind] = &[
     NotificationKind {
+        kind: "wallet_transfer_return_requested",
+        mandatory: true,
+        subject_en: "Balance return requested",
+        subject_zh: "余额退回申请待确认",
+    },
+    NotificationKind {
+        kind: "wallet_transfer_return_resolved",
+        mandatory: true,
+        subject_en: "Balance return resolved",
+        subject_zh: "余额退回申请已处理",
+    },
+    NotificationKind {
+        kind: "wallet_passkey_registered",
+        mandatory: true,
+        subject_en: "Wallet Passkey registered",
+        subject_zh: "钱包 Passkey 已登记",
+    },
+    NotificationKind {
+        kind: "wallet_passkey_recovery",
+        mandatory: true,
+        subject_en: "Wallet security recovery",
+        subject_zh: "钱包安全凭据已恢复",
+    },
+    NotificationKind {
+        kind: "c2c_buyer_restriction_changed",
+        mandatory: true,
+        subject_en: "C2C purchase restriction updated",
+        subject_zh: "C2C 购买限制已更新",
+    },
+    NotificationKind {
         kind: "share_termination_updated",
         mandatory: true,
         subject_en: "Share rental termination updated",

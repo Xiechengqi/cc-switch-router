@@ -153,6 +153,7 @@ pub struct ClientMetadata {
 
 #[derive(Debug, Clone)]
 pub struct AuthSession {
+    pub financial_proof_id: Option<String>,
     pub session_id: String,
     pub user_id: String,
     pub email: String,

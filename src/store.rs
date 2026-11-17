@@ -107,6 +107,7 @@ use crate::registration_admission::{
     RegistrationAdmissionPolicy, RegistrationQuotaWindow, registration_source_scope,
 };
 
+mod browser_sessions;
 pub(crate) mod client_chat;
 pub(crate) mod model_health;
 pub(crate) mod password_auth;
@@ -7218,6 +7219,7 @@ impl AppStore {
         let access_expires_at = now + Duration::seconds(config.auth_session_ttl_secs);
         let refresh_expires_at = now + Duration::seconds(config.auth_refresh_ttl_secs);
         let session = AuthSession {
+            financial_proof_id: None,
             session_id: Uuid::new_v4().to_string(),
             user_id: user.id.clone(),
             email: user.email.clone(),
@@ -7294,6 +7296,7 @@ impl AppStore {
         }
 
         let replacement = AuthSession {
+            financial_proof_id: None,
             session_id: Uuid::new_v4().to_string(),
             user_id: current.user_id.clone(),
             email: user.email.clone(),
@@ -29341,6 +29344,7 @@ fn persist_session(conn: &Connection, session: &AuthSession) -> Result<(), AppEr
 
 fn map_auth_session_row(row: &crate::db::Row<'_>) -> crate::db::Result<AuthSession> {
     Ok(AuthSession {
+        financial_proof_id: None,
         session_id: row.get(0)?,
         user_id: row.get(1)?,
         auth_source_kind: row.get(2)?,
@@ -43410,6 +43414,7 @@ pub(crate) mod tests {
             persist_session(
                 &conn,
                 &AuthSession {
+                    financial_proof_id: None,
                     session_id: "existing-session".into(),
                     user_id: user.id.clone(),
                     email: user.email.clone(),
@@ -43504,6 +43509,7 @@ pub(crate) mod tests {
                 persist_session(
                     &conn,
                     &AuthSession {
+                        financial_proof_id: None,
                         session_id: kind.into(),
                         user_id: user.id.clone(),
                         email: user.email.clone(),
@@ -49066,6 +49072,7 @@ pub(crate) mod tests {
             persist_session(
                 &conn,
                 &AuthSession {
+                    financial_proof_id: None,
                     session_id: Uuid::new_v4().to_string(),
                     user_id: user.id,
                     email: email.into(),
@@ -49616,6 +49623,7 @@ pub(crate) mod tests {
             persist_session(
                 &conn,
                 &AuthSession {
+                    financial_proof_id: None,
                     session_id: Uuid::new_v4().to_string(),
                     user_id: user.id,
                     email: new_email.into(),
@@ -57086,6 +57094,7 @@ pub(crate) mod tests {
     fn chat_test_session(user_id: &str, email: &str) -> AuthSession {
         let now = Utc::now();
         AuthSession {
+            financial_proof_id: None,
             session_id: format!("session-{user_id}"),
             user_id: user_id.to_string(),
             email: email.to_string(),

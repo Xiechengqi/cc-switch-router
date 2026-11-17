@@ -7134,7 +7134,8 @@ fn is_internal_upstream_response_header(name: &str) -> bool {
 fn copy_upstream_response_headers(source: &HeaderMap, target: &mut HeaderMap) {
     let connection_listed_headers = connection_listed_header_names(source);
     for (name, value) in source {
-        if is_hop_by_hop_header(name.as_str())
+        if name == header::SET_COOKIE
+            || is_hop_by_hop_header(name.as_str())
             || is_internal_upstream_response_header(name.as_str())
             || connection_listed_headers.contains(name.as_str())
         {
@@ -7364,9 +7365,38 @@ fn should_strip_direct_proxy_internal_header(
 
 fn is_sensitive_upstream_credential_header(name: &str) -> bool {
     name.eq_ignore_ascii_case("authorization")
+        || name.eq_ignore_ascii_case("cookie")
         || name.eq_ignore_ascii_case("x-api-key")
         || name.eq_ignore_ascii_case("x-goog-api-key")
         || name.eq_ignore_ascii_case("api-key")
+}
+
+#[cfg(test)]
+mod credential_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn all_tunnel_forwarders_strip_browser_credentials_in_both_directions() {
+        assert!(is_sensitive_upstream_credential_header("cookie"));
+        assert!(is_sensitive_upstream_credential_header("Cookie"));
+        assert!(is_sensitive_upstream_credential_header("Authorization"));
+        let mut upstream = HeaderMap::new();
+        upstream.append(
+            header::SET_COOKIE,
+            "cc_switch_router_access=forged; Domain=.router.test"
+                .parse()
+                .unwrap(),
+        );
+        upstream.append(
+            header::SET_COOKIE,
+            "ordinary=also-untrusted".parse().unwrap(),
+        );
+        upstream.insert(header::CONTENT_TYPE, "text/html".parse().unwrap());
+        let mut browser = HeaderMap::new();
+        copy_upstream_response_headers(&upstream, &mut browser);
+        assert!(!browser.contains_key(header::SET_COOKIE));
+        assert!(browser.contains_key(header::CONTENT_TYPE));
+    }
 }
 
 fn is_internal_share_router_path(path: &str) -> bool {
@@ -8104,6 +8134,203 @@ mod tests {
     use super::*;
 
     mod model_routing;
+
+    #[tokio::test]
+    async fn financial_http_signatures_fence_tampering_replay_and_share_control_hosts() {
+        let config = proxy_test_config("financial-http");
+        let state = proxy_test_state(&config, Arc::new(ProxyRegistry::default()));
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[41; 32]);
+        let token = "financial-http-access";
+        {
+            let conn = state.store.conn.lock().await;
+            let actor = crate::market_finance_auth::test_session(&conn, "http-buyer");
+            let public = base64::engine::general_purpose::STANDARD
+                .encode(signing.verifying_key().as_bytes());
+            conn.execute("INSERT INTO auth_devices(id,public_key,kind,platform,app_version,status,created_at,last_seen_at) VALUES('financial-device',?1,'browser','test','test','active','2020-01-01','2020-01-01')",crate::db::params![public]).unwrap();
+            conn.execute("UPDATE user_sessions SET auth_source_id='financial-device',access_token_hash=?2 WHERE id=?1",crate::db::params![actor.session_id,base64::engine::general_purpose::STANDARD.encode(Sha256::digest(token))]).unwrap();
+        }
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = crate::api::router(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let client = reqwest::Client::new();
+        let path = "/v1/market-wallet/transfer-quotes";
+        let url = format!("http://{addr}{path}");
+        let body = r#"{"recipientEmail":"nobody@example.test","amountMinor":100}"#;
+        let nonce = Uuid::new_v4().to_string();
+        let timestamp = Utc::now().timestamp_millis().to_string();
+        let canonical = format!(
+            "market-finance-v1\nhttp://router.test\nfinancial-device\n{}\nPOST\n{path}\n{}\nfinancial-idem\n{timestamp}\n{nonce}",
+            hex::encode(Sha256::digest(token)),
+            hex::encode(Sha256::digest(body))
+        );
+        let signature = base64::engine::general_purpose::STANDARD
+            .encode(signing.sign(canonical.as_bytes()).to_bytes());
+        let request = || {
+            client
+                .post(&url)
+                .header("host", "router.test")
+                .bearer_auth(token)
+                .header("content-type", "application/json")
+                .header("idempotency-key", "financial-idem")
+                .header("x-router-device", "financial-device")
+                .header("x-router-request-time", &timestamp)
+                .header("x-router-request-nonce", &nonce)
+                .header("x-router-request-signature", &signature)
+                .body(body)
+        };
+        let unsigned = client
+            .post(&url)
+            .header("host", "router.test")
+            .bearer_auth(token)
+            .header("x-router-verified-financial-proof", "forged")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unsigned.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            unsigned.json::<serde_json::Value>().await.unwrap()["code"],
+            "FINANCIAL_DEVICE_PROOF_REQUIRED"
+        );
+        for altered in [
+            request().body("{}"),
+            request().header("idempotency-key", "changed"),
+        ] {
+            let response = altered.send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(
+                response.json::<serde_json::Value>().await.unwrap()["code"],
+                "FINANCIAL_SIGNATURE_INVALID"
+            );
+        }
+        let foreign = request()
+            .header("origin", "http://malicious.router.test")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(foreign.status(), StatusCode::FORBIDDEN);
+        let valid = request().send().await.unwrap();
+        assert_eq!(
+            valid.json::<serde_json::Value>().await.unwrap()["code"],
+            "WALLET_TRANSFER_RECIPIENT_UNAVAILABLE",
+            "valid signed request reaches recipient lookup"
+        );
+        let replay = request().send().await.unwrap();
+        assert_eq!(
+            replay.json::<serde_json::Value>().await.unwrap()["code"],
+            "FINANCIAL_REQUEST_REPLAY"
+        );
+        for private_path in [
+            "/v1/auth/session/me",
+            "/v1/market-wallet",
+            "/v1/admin/market-finance/mode",
+        ] {
+            let response = client
+                .get(format!("http://{addr}{private_path}"))
+                .header("host", "malicious.router.test")
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{private_path}");
+        }
+        let rotation = client
+            .post(format!(
+                "http://{addr}/v1/admin/market-payment-channels/c/webhook-secret"
+            ))
+            .header("host", "router.test")
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rotation.status(), StatusCode::FORBIDDEN);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn share_http_never_forwards_cookies_or_accepts_upstream_set_cookie() {
+        let config = proxy_test_config("share-cookie-boundary");
+        let backend_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+        let backend = axum::Router::new().fallback(any(|headers: HeaderMap| async move {
+            assert!(!headers.contains_key(header::COOKIE));
+            assert!(!headers.contains_key(header::AUTHORIZATION));
+            (
+                [(
+                    header::SET_COOKIE,
+                    "cc_switch_router_access=forged; Domain=.router.test",
+                )],
+                "upstream reached",
+            )
+        }));
+        let upstream =
+            tokio::spawn(async move { axum::serve(backend_listener, backend).await.unwrap() });
+        let proxy = Arc::new(ProxyRegistry::default());
+        let state = proxy_test_state(&config, proxy.clone());
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[42_u8; 32]);
+        let registered = state
+            .store
+            .register_installation(
+                signed_registration_request(&signing_key, "nonce-share-cookie-boundary"),
+                crate::models::ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+            )
+            .await
+            .unwrap();
+        proxy
+            .set_route_with_kind(
+                "cookie-share".into(),
+                backend_addr.to_string(),
+                RouteKind::Share,
+                Some(registered.installation_id),
+                None,
+                Some("cookie-share".into()),
+                None,
+                false,
+                -1,
+                None,
+            )
+            .await;
+        let request = Request::builder()
+            .uri("/")
+            .header("host", "cookie-share.router.test")
+            .header(
+                header::COOKIE,
+                "cc_switch_router_access=exposed-old-session; unrelated=also-secret",
+            )
+            .header(header::AUTHORIZATION, "Bearer caller-secret")
+            .body(Body::empty())
+            .unwrap();
+        let response = proxy_handler(
+            State(state),
+            ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))),
+            request,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key(header::SET_COOKIE));
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap(),
+            "upstream reached"
+        );
+        upstream.abort();
+    }
 
     fn signed_registration_request(
         signing_key: &ed25519_dalek::SigningKey,

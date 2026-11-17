@@ -1,3 +1,4 @@
+import { installFinancialBrowserIdentity } from "./financial-browser-fixture.mjs";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
@@ -107,6 +108,7 @@ try {
     return release;
   };
 
+  await installFinancialBrowserIdentity(page);
   await page.goto(`${baseUrl}/account/security/`);
   await page.getByRole("button", { name: "Login", exact: true }).waitFor();
   assert.equal(await balance.count(), 0);

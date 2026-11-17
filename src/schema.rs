@@ -393,6 +393,15 @@ const MIGRATIONS: &[(i64, &str)] = &[
         113,
         include_str!("../schema/0113_share_value_owner_prices.sql"),
     ),
+    (
+        114,
+        include_str!("../schema/0114_router_browser_session_isolation.sql"),
+    ),
+    (
+        115,
+        include_str!("../schema/0115_financial_request_security.sql"),
+    ),
+    (116, include_str!("../schema/0116_wallet_risk_recovery.sql")),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -903,8 +912,44 @@ mod tests {
     use super::*;
 
     // Includes live-health evidence (0109), ordered route candidates (0110),
-    // resource tariffs/capabilities (0111) and owner model prices (0113).
-    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 288;
+    // resource tariffs/capabilities (0111), owner model prices (0113), and
+    // browser/financial credentials, risk evidence and recovery (0114–0116).
+    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 301;
+
+    #[test]
+    fn migration_114_revokes_existing_sessions_and_rotation_grace_only_once() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 113);
+        let old = crate::market_finance_auth::test_session(&conn, "pre-isolation");
+        conn.execute(
+            "UPDATE user_sessions SET rotated_at='2099-01-01T00:00:00Z' WHERE id=?1",
+            params![old.session_id],
+        )
+        .unwrap();
+        let version: i64 = conn
+            .query_row(
+                "SELECT auth_version FROM users WHERE id=?1",
+                params![old.user_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        apply(&conn).unwrap();
+        let retired: (bool, Option<String>, i64) = conn.query_row("SELECT s.revoked_at IS NOT NULL,s.rotated_at,u.auth_version FROM user_sessions s JOIN users u ON u.id=s.user_id WHERE s.id=?1", params![old.session_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(retired, (true, None, version + 1));
+        let fresh = crate::market_finance_auth::test_session(&conn, "post-isolation");
+        apply(&conn).unwrap();
+        crate::market_finance_auth::require_live_session_tx(&conn, &fresh, "2026-11-17T12:00:00Z")
+            .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT auth_version FROM users WHERE id=?1",
+                params![old.user_id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            version + 1
+        );
+    }
 
     #[test]
     fn migration_109_adds_live_health_without_inventing_evidence_or_rewriting_cycles_and_money() {
@@ -1521,10 +1566,23 @@ mod tests {
         let conn = memory_connection();
         install_schema_through(&conn, 97);
         let tables: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND (name LIKE 'market_%' OR name LIKE 'client_termination%')", [], |r| r.get(0)).unwrap();
+        // Scope the no-new-tables guarantee to migration 98. Later wallet
+        // security migrations intentionally introduce financial evidence.
+        let (_, sql) = MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == 98)
+            .unwrap();
+        conn.execute_batch(sql).unwrap();
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN ('idx_client_termination_host_history','idx_client_termination_provider_work')", [], |r| r.get::<_,i64>(0)).unwrap(), 2);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND (name LIKE 'market_%' OR name LIKE 'client_termination%')", [], |r| r.get::<_,i64>(0)).unwrap(), tables);
+        conn.execute(
+            "INSERT INTO schema_migrations(version,checksum,applied_at) VALUES(98,?1,'test')",
+            params![migration_checksum(sql)],
+        )
+        .unwrap();
         apply(&conn).unwrap();
         apply(&conn).unwrap();
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN ('idx_client_termination_host_history','idx_client_termination_provider_work')", [], |r| r.get::<_,i64>(0)).unwrap(), 2);
-        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND (name LIKE 'market_%' OR name LIKE 'client_termination%')", [], |r| r.get::<_,i64>(0)).unwrap(), tables);
     }
 
     #[test]
@@ -1809,7 +1867,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_90_adds_optional_passwords_without_rewriting_sessions_tokens_or_money() {
+    fn migration_90_preserves_legacy_credentials_and_money_through_session_isolation() {
         let conn = memory_connection();
         install_schema_through(&conn, 89);
         let at = "2026-10-27T00:00:00Z";
@@ -1838,10 +1896,10 @@ mod tests {
                 |r| r.get::<_, i64>(0)
             )
             .unwrap(),
-            0
+            1 // Migration 114 retires pre-isolation logins, once.
         );
-        let session: (String, String, i64, String, Option<String>, Option<String>, Option<String>) = conn.query_row(
-            "SELECT access_token_hash,refresh_token_hash,auth_version,auth_method,email_authenticated_at,login_event_id,revoked_at FROM user_sessions WHERE id='old-session'", [],
+        let session: (String, String, i64, String, Option<String>, Option<String>, bool) = conn.query_row(
+            "SELECT access_token_hash,refresh_token_hash,auth_version,auth_method,email_authenticated_at,login_event_id,revoked_at IS NOT NULL FROM user_sessions WHERE id='old-session'", [],
             |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).unwrap();
         assert_eq!(
             session,
@@ -1852,7 +1910,7 @@ mod tests {
                 "legacy".into(),
                 None,
                 None,
-                None
+                true
             )
         );
         assert_eq!(
@@ -1966,7 +2024,7 @@ mod tests {
     fn migration_85_session_evidence_survives_session_lifecycle_and_rejects_invalid_times() {
         let conn = memory_connection();
         apply(&conn).unwrap();
-        let session = crate::market_finance_auth::test_session("sender");
+        let session = crate::market_finance_auth::test_session(&conn, "sender");
         let proof = crate::market_finance_auth::record_tx(
             &conn,
             &session,

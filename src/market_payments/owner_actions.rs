@@ -377,7 +377,7 @@ pub(super) async fn credit_manual_claim(
     Path(order_id): Path<String>,
     Json(input): Json<ManualCreditRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let session = crate::api::require_owner_session(&state, &headers).await?;
+    let session = crate::market_finance_auth::write_owner_session(&state, &headers).await?;
     if !valid_reason_code(&input.reason_code)
         || !valid_reference(&input.evidence_reference)
         || !valid_reference(&input.tx_hash)
@@ -391,6 +391,7 @@ pub(super) async fn credit_manual_claim(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin manual top-up credit"))?;
+    crate::market_finance_auth::require_live_session_tx(&tx, &session, &now())?;
     let view = apply_manual_credit_tx(
         &tx,
         &order_id,
@@ -555,7 +556,7 @@ pub(super) async fn reverse_external_refund(
     Path(order_id): Path<String>,
     Json(input): Json<ReverseRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let session = crate::api::require_owner_session(&state, &headers).await?;
+    let session = crate::market_finance_auth::write_owner_session(&state, &headers).await?;
     if !valid_reason_code(&input.reason_code) || !valid_reference(&input.evidence_reference) {
         return Err(AppError::BadRequest(
             "reason code and evidence reference are required".into(),
@@ -565,6 +566,7 @@ pub(super) async fn reverse_external_refund(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin top-up reversal"))?;
+    crate::market_finance_auth::require_live_session_tx(&tx, &session, &now())?;
     let view = apply_reversal_tx(&tx, &order_id, &session.user_id, &input, &now())?;
     tx.commit().map_err(db_error("commit top-up reversal"))?;
     Ok((no_store(), Json(view)))

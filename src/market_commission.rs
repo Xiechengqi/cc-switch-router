@@ -528,11 +528,12 @@ async fn set_policy(
     headers: HeaderMap,
     Json(input): Json<SetPolicyRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let actor = crate::api::require_owner_session(&state, &headers).await?;
+    let actor = crate::market_finance_auth::write_owner_session(&state, &headers).await?;
     let conn = state.store.conn.lock().await;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin commission policy"))?;
+    crate::market_finance_auth::require_live_session_tx(&tx, &actor, &crate::market_wallet::now())?;
     let view = set_policy_tx(
         &tx,
         input.expected_version,

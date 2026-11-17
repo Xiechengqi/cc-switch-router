@@ -26,6 +26,13 @@ const MAX_FRAME: u64 = 8192;
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
+    FinanceSecurity {
+        email: String,
+        operation: String,
+        key_id: Option<String>,
+        session_id: Option<String>,
+        operation_id: String,
+    },
     Status {
         email: String,
     },
@@ -142,6 +149,31 @@ pub(crate) async fn serve(listener: AdminListener, store: AppStore, config: Conf
 
 async fn handle(store: &AppStore, config: &Config, request: Request, actor: &str) -> Result<Reply> {
     match request {
+        Request::FinanceSecurity {
+            email,
+            operation,
+            key_id,
+            session_id,
+            operation_id,
+        } => {
+            let conn = store.conn.lock().await;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            financial_recovery(
+                &tx,
+                &email,
+                &operation,
+                key_id.as_deref(),
+                session_id.as_deref(),
+                actor,
+                &operation_id,
+            )?;
+            tx.commit()?;
+            Ok(Reply {
+                status: None,
+                operation_id: Some(operation_id),
+                error: None,
+            })
+        }
         Request::Status { email } => {
             let conn = store.conn.lock().await;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -464,6 +496,9 @@ async fn call_online(config: &Config, request: Request) -> Result<Reply> {
 }
 
 pub(crate) async fn run(args: Vec<String>) -> Result<()> {
+    if args.first().is_some_and(|s| s == "finance-passkey") {
+        return run_financial(args.into_iter().skip(1).collect()).await;
+    }
     let options = parse(args)?;
     let env_file = options
         .env_file
@@ -508,6 +543,30 @@ pub(crate) async fn run(args: Vec<String>) -> Result<()> {
             #[cfg(not(unix))]
             let actor = "unsupported";
             match request {
+                Request::FinanceSecurity {
+                    email,
+                    operation,
+                    key_id,
+                    session_id,
+                    operation_id,
+                } => {
+                    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    financial_recovery(
+                        &tx,
+                        &email,
+                        &operation,
+                        key_id.as_deref(),
+                        session_id.as_deref(),
+                        &actor,
+                        &operation_id,
+                    )?;
+                    tx.commit()?;
+                    Ok(Reply {
+                        status: None,
+                        operation_id: Some(operation_id),
+                        error: None,
+                    })
+                }
                 Request::Status { email } => {
                     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                     let status = password_auth::status(&tx, &email)?;
@@ -628,6 +687,146 @@ pub(crate) async fn run(args: Vec<String>) -> Result<()> {
         bail!("{error}");
     }
     println!("Password updated. All previous login sessions have been revoked.");
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn financial_recovery(
+    conn: &Connection,
+    email: &str,
+    operation: &str,
+    key: Option<&str>,
+    session: Option<&str>,
+    actor: &str,
+    id: &str,
+) -> Result<()> {
+    match operation {
+        "approve" if session.is_none() => crate::market_security::local_approve_tx(
+            conn,
+            email,
+            key.context("--key-id required")?,
+            actor,
+            id,
+            &Utc::now().to_rfc3339(),
+        )?,
+        "recover" if key.is_none() => crate::market_security::local_recover_tx(
+            conn,
+            email,
+            session.context("--session-id required")?,
+            actor,
+            id,
+            &Utc::now().to_rfc3339(),
+        )?,
+        _ => bail!("use approve --key-id KEY or recover --session-id SESSION"),
+    }
+    Ok(())
+}
+async fn run_financial(args: Vec<String>) -> Result<()> {
+    let mut args = args.into_iter();
+    let operation = args
+        .next()
+        .context("use finance-passkey <approve|recover>")?;
+    anyhow::ensure!(
+        matches!(operation.as_str(), "approve" | "recover"),
+        "unknown wallet security operation"
+    );
+    let mut email = None;
+    let mut key = None;
+    let mut session = None;
+    let mut env_file = None;
+    let mut offline = false;
+    let mut id = None;
+    let mut seen = std::collections::HashSet::new();
+    while let Some(arg) = args.next() {
+        anyhow::ensure!(seen.insert(arg.clone()), "duplicate wallet security option");
+        match arg.as_str() {
+            "--email" => email = Some(args.next().context("--email requires a value")?),
+            "--key-id" => key = Some(args.next().context("--key-id requires a value")?),
+            "--session-id" => session = Some(args.next().context("--session-id requires a value")?),
+            "--env-file" => {
+                env_file = Some(PathBuf::from(
+                    args.next().context("--env-file requires a path")?,
+                ))
+            }
+            "--operation-id" => id = Some(args.next().context("--operation-id requires a UUID")?),
+            "--offline" => offline = true,
+            _ => bail!("unsupported wallet security option"),
+        }
+    }
+    anyhow::ensure!(email.is_some(), "--email is required");
+    anyhow::ensure!(
+        if operation == "approve" {
+            key.is_some() && session.is_none()
+        } else {
+            session.is_some() && key.is_none()
+        },
+        "identify exactly one pending key for approve or fresh login session for recover"
+    );
+    let id = id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    Uuid::parse_str(&id).context("invalid operation UUID")?;
+    let env_file = env_file.unwrap_or_else(crate::config::default_env_path);
+    anyhow::ensure!(
+        env_file.is_file(),
+        "configuration file not found; use --env-file"
+    );
+    crate::config::load_env_file(&env_file)?;
+    let config = Config::from_env();
+    config
+        .validate_database_config()
+        .map_err(anyhow::Error::msg)?;
+    eprintln!(
+        "Wallet security operation: {}\nRouter: {}\nDatabase: {}",
+        id,
+        config.tunnel_domain,
+        config.database.path.display()
+    );
+    let request = Request::FinanceSecurity {
+        email: email.context("missing email")?,
+        operation,
+        key_id: key,
+        session_id: session,
+        operation_id: id.clone(),
+    };
+    #[cfg(unix)]
+    {
+        if offline {
+            check_offline_target(&config)?;
+            let _lock = crate::process_lock::ProcessLock::acquire(&config.data_dir)?;
+            let conn = open_offline(&config)?;
+            let Request::FinanceSecurity {
+                email,
+                operation,
+                key_id,
+                session_id,
+                operation_id,
+            } = request
+            else {
+                unreachable!()
+            };
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            financial_recovery(
+                &tx,
+                &email,
+                &operation,
+                key_id.as_deref(),
+                session_id.as_deref(),
+                &format!("uid:{}", uid()),
+                &operation_id,
+            )?;
+            tx.commit()?;
+        } else {
+            let reply = call_online(&config, request).await?;
+            if let Some(e) = reply.error {
+                bail!("{e}")
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (request, config, offline);
+        bail!("wallet security administration requires Unix");
+    }
+    println!("Wallet security operation completed: {id}");
     Ok(())
 }
 

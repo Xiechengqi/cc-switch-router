@@ -21,6 +21,9 @@ const CRITICAL_CODES: &[&str] = &[
     "paid_payout_missing_evidence",
     "wallet_transfer_missing_evidence",
     "wallet_transfer_orphan_journal",
+    "wallet_transfer_return_missing_evidence",
+    "wallet_transfer_return_orphan_journal",
+    "financial_request_proof_invalid",
     "commission_evidence_mismatch",
     "commission_orphan_journal",
     "earning_conversion_missing_evidence",
@@ -143,6 +146,10 @@ fn scope_blocked_tx(conn: &Connection, scope: FinanceScope<'_>) -> Result<bool, 
                  OR (c.code = 'wallet_transfer_missing_evidence' AND c.object_id IN
                      (SELECT id FROM market_wallet_transfers
                       WHERE sender_user_id = ?1 OR recipient_user_id = ?1))
+                 OR (c.code = 'wallet_transfer_return_missing_evidence' AND c.object_id IN
+                     (SELECT r.id FROM market_transfer_returns r JOIN market_wallet_transfers t ON t.id=r.transfer_id WHERE t.sender_user_id=?1 OR t.recipient_user_id=?1))
+                 OR (c.code = 'financial_request_proof_invalid' AND c.object_id IN
+                     (SELECT id FROM market_financial_request_proofs WHERE user_id=?1))
                  OR (c.code = 'c2c_evidence_mismatch' AND c.object_id IN
                      (SELECT id FROM market_c2c_orders WHERE buyer_id = ?1 OR seller_id = ?1))
                  OR (c.code = 'earning_conversion_missing_evidence' AND c.object_id IN
@@ -205,7 +212,7 @@ pub(crate) fn ensure_finance_scopes_safe_tx(
     let global: bool = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM market_finance_reconciliation_cases
-             WHERE status = 'open' AND code IN ('journal_unsealed', 'wallet_transfer_orphan_journal', 'commission_orphan_journal', 'earning_conversion_orphan_journal', 'c2c_orphan_journal','client_termination_orphan_journal','share_termination_orphan_journal'))",
+             WHERE status = 'open' AND code IN ('journal_unsealed', 'wallet_transfer_return_orphan_journal', 'wallet_transfer_orphan_journal', 'commission_orphan_journal', 'earning_conversion_orphan_journal', 'c2c_orphan_journal','client_termination_orphan_journal','share_termination_orphan_journal'))",
             [],
             |row| row.get(0),
         )
@@ -340,6 +347,12 @@ fn critical_case_still_failed_tx(
         ("wallet_transfer_missing_evidence", "wallet_transfer") => {
             conn.query_row("SELECT NOT EXISTS (SELECT 1 FROM market_verified_wallet_transfer_evidence WHERE id = ?1)",
                 params![object_id], |row| row.get(0)).map_err(db_error("recheck wallet transfer"))
+        }
+        ("wallet_transfer_return_missing_evidence","wallet_transfer_return") => conn.query_row("SELECT NOT EXISTS(SELECT 1 FROM market_verified_transfer_return_evidence WHERE id=?1)",params![object_id],|r|r.get(0)).map_err(db_error("recheck transfer return")),
+        ("wallet_transfer_return_orphan_journal","journal") => conn.query_row("SELECT NOT EXISTS(SELECT 1 FROM market_transfer_returns r JOIN market_verified_transfer_return_evidence e ON e.id=r.id WHERE r.journal_id=?1)",params![object_id],|r|r.get(0)).map_err(db_error("recheck orphan return")),
+        ("financial_request_proof_invalid","financial_request_proof") => {
+            let (key,sig,payload):(String,String,String)=conn.query_row("SELECT public_key,signature,canonical FROM market_financial_request_proofs WHERE id=?1",params![object_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(db_error("recheck request signature"))?;
+            Ok(crate::market_security::verify_signature(&key,&sig,&payload).is_err())
         }
         ("wallet_transfer_orphan_journal", "journal") => {
             conn.query_row("SELECT NOT EXISTS (SELECT 1 FROM market_wallet_transfers t
@@ -535,6 +548,48 @@ pub(crate) fn resolve_case_tx(
     Ok(())
 }
 
+/// Durable keyset pagination over findings, with wraparound. Persistent bad
+/// rows in the first page cannot hide a later finding from an audit run.
+fn fair_ids_tx(
+    conn: &Connection,
+    name: &str,
+    sql: &str,
+    values: Vec<crate::db::types::Value>,
+    time: &str,
+) -> Result<Vec<String>, AppError> {
+    let cursor: String = conn
+        .query_row(
+            "SELECT last_id FROM market_financial_audit_cursors WHERE name=?1",
+            params![name],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(db_error("read audit cursor"))?
+        .unwrap_or_default();
+    let base = sql.trim().trim_end_matches("LIMIT 100").trim();
+    let query = format!(
+        "WITH candidates(id) AS ({base}) SELECT DISTINCT id FROM candidates WHERE id>?{} ORDER BY id LIMIT 100",
+        values.len() + 1
+    );
+    let read = |after: &str| -> Result<Vec<String>, AppError> {
+        let mut args = values.clone();
+        args.push(crate::db::types::Value::Text(after.into()));
+        let mut q = conn
+            .prepare(&query)
+            .map_err(db_error("prepare fair finance audit"))?;
+        q.query_map(args, |r| r.get(0))
+            .map_err(db_error("query fair finance audit"))?
+            .collect::<crate::db::Result<Vec<_>>>()
+            .map_err(db_error("read fair finance audit"))
+    };
+    let mut ids = read(&cursor)?;
+    if ids.is_empty() && !cursor.is_empty() {
+        ids = read("")?;
+    }
+    conn.execute("INSERT INTO market_financial_audit_cursors(name,last_id,updated_at) VALUES(?1,?2,?3) ON CONFLICT(name) DO UPDATE SET last_id=excluded.last_id,updated_at=excluded.updated_at",params![name,ids.last().map(String::as_str).unwrap_or(""),time]).map_err(db_error("advance finance audit cursor"))?;
+    Ok(ids)
+}
+
 pub(crate) fn audit_finance_tx(conn: &Connection, now: &str) -> Result<usize, AppError> {
     let mut opened = crate::market_c2c::audit_tx_cases(conn, now)?;
     let cursor: String = conn
@@ -569,13 +624,13 @@ pub(crate) fn audit_finance_tx(conn: &Connection, now: &str) -> Result<usize, Ap
         params![ids.last().map(String::as_str).unwrap_or("")],
     )
     .map_err(db_error("advance Share audit cursor"))?;
-    let ids = {
-        let mut q=conn.prepare("SELECT id FROM market_journal_transactions j WHERE source_kind IN('share_termination','share_compensation') AND NOT EXISTS(SELECT 1 FROM share_termination_events e WHERE e.journal_id=j.id) LIMIT 100").map_err(db_error("scan Share orphan journals"))?;
-        q.query_map([], |r| r.get::<_, String>(0))
-            .map_err(db_error("query Share orphan journals"))?
-            .collect::<crate::db::Result<Vec<_>>>()
-            .map_err(db_error("read Share orphan journals"))?
-    };
+    let ids = fair_ids_tx(
+        conn,
+        "share_orphan_journals",
+        "SELECT id FROM market_journal_transactions j WHERE source_kind IN('share_termination','share_compensation') AND NOT EXISTS(SELECT 1 FROM share_termination_events e WHERE e.journal_id=j.id)",
+        vec![],
+        now,
+    )?;
     for id in ids {
         opened += case_tx(
             conn,
@@ -605,19 +660,13 @@ pub(crate) fn audit_finance_tx(conn: &Connection, now: &str) -> Result<usize, Ap
             )?;
         }
     }
-    let orphan_ids = {
-        let mut s = conn
-            .prepare(
-                "SELECT id FROM market_journal_transactions j
-        WHERE source_kind IN ('client_termination','client_compensation') AND NOT EXISTS
-          (SELECT 1 FROM client_termination_events e WHERE e.journal_id=j.id) LIMIT 100",
-            )
-            .map_err(db_error("prepare Client termination journal audit"))?;
-        s.query_map([], |r| r.get::<_, String>(0))
-            .map_err(db_error("query Client termination journal audit"))?
-            .collect::<crate::db::Result<Vec<_>>>()
-            .map_err(db_error("read Client termination journal audit"))?
-    };
+    let orphan_ids = fair_ids_tx(
+        conn,
+        "client_orphan_journals",
+        "SELECT id FROM market_journal_transactions j WHERE source_kind IN('client_termination','client_compensation') AND NOT EXISTS(SELECT 1 FROM client_termination_events e WHERE e.journal_id=j.id)",
+        vec![],
+        now,
+    )?;
     for id in orphan_ids {
         opened += case_tx(
             conn,
@@ -627,18 +676,13 @@ pub(crate) fn audit_finance_tx(conn: &Connection, now: &str) -> Result<usize, Ap
             now,
         )?;
     }
-    let mut journal = conn
-        .prepare(
-            "SELECT journal.id FROM market_journal_transactions journal
-         LEFT JOIN market_journal_seals seal ON seal.journal_id = journal.id
-         WHERE seal.journal_id IS NULL ORDER BY journal.id LIMIT 100",
-        )
-        .map_err(db_error("prepare unsealed market journals"))?;
-    let unsealed = journal
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(db_error("query unsealed market journals"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(db_error("read unsealed market journals"))?;
+    let unsealed = fair_ids_tx(
+        conn,
+        "unsealed_journals",
+        "SELECT j.id FROM market_journal_transactions j LEFT JOIN market_journal_seals s ON s.journal_id=j.id WHERE s.journal_id IS NULL",
+        vec![],
+        now,
+    )?;
     for id in unsealed {
         opened += case_tx(conn, "journal_unsealed", "journal", &id, now)?;
     }
@@ -706,39 +750,27 @@ pub(crate) fn audit_finance_tx(conn: &Connection, now: &str) -> Result<usize, Ap
         }
     }
 
-    let mut statement = conn
-        .prepare(
-            "SELECT period.id FROM market_platform_periods period
+    let mismatched_periods=fair_ids_tx(conn,"unfulfilled","SELECT period.id FROM market_platform_periods period
          LEFT JOIN market_journal_postings posting
            ON posting.account_kind = 'unfulfilled' AND posting.subject_id = period.id
          GROUP BY period.id
          HAVING COALESCE(SUM(posting.signed_units), 0)
              != -(period.amount_units - period.fulfilled_units - period.refunded_units - period.termination_compensation_units - period.share_quota_units)
-         LIMIT 100",
-        )
-        .map_err(db_error("prepare unfulfilled audit"))?;
-    let mismatched_periods = statement
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(db_error("query unfulfilled audit"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(db_error("read unfulfilled audit"))?;
+         LIMIT 100",vec![],now)?;
     for id in mismatched_periods {
         opened += case_tx(conn, "period_unfulfilled_mismatch", "period", &id, now)?;
     }
 
-    let mut statement = conn
-        .prepare(
-            "SELECT topup.id FROM market_topup_orders topup
+    let mismatched_topups = fair_ids_tx(
+        conn,
+        "credited_topups",
+        "SELECT topup.id FROM market_topup_orders topup
          WHERE topup.status = 'credited'
            AND NOT EXISTS (SELECT 1 FROM market_completed_topup_evidence e WHERE e.id = topup.id)
          LIMIT 100",
-        )
-        .map_err(db_error("prepare credited top-up audit"))?;
-    let mismatched_topups = statement
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(db_error("query credited top-up audit"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(db_error("read credited top-up audit"))?;
+        vec![],
+        now,
+    )?;
     for id in mismatched_topups {
         opened += case_tx(conn, "credited_topup_missing_evidence", "topup", &id, now)?;
     }
@@ -853,10 +885,7 @@ pub(crate) fn audit_finance_tx(conn: &Connection, now: &str) -> Result<usize, Ap
             AND NOT EXISTS (SELECT 1 FROM market_wallet_transfers t WHERE t.journal_id = j.id) LIMIT 100",
             "wallet_transfer_orphan_journal", "journal"),
     ] {
-        let mut statement = conn.prepare(sql).map_err(db_error("prepare wallet transfer audit"))?;
-        let ids = statement.query_map([], |row| row.get::<_, String>(0))
-            .map_err(db_error("query wallet transfer audit"))?
-            .collect::<Result<Vec<_>, _>>().map_err(db_error("read wallet transfer audit"))?;
+        let ids=fair_ids_tx(conn,code,sql,vec![],now)?;
         for id in ids { opened += case_tx(conn, code, kind, &id, now)?; }
     }
 
@@ -907,19 +936,52 @@ pub(crate) fn audit_finance_tx(conn: &Connection, now: &str) -> Result<usize, Ap
                            AND posting.subject_id = 'owner') != -payout.amount_units)
              LIMIT 100"
         );
-        let mut statement = conn
-            .prepare(&sql)
-            .map_err(db_error("prepare paid transfer audit"))?;
-        let mismatched = statement
-            .query_map(
-                params![kind, crate::market_common::MONEY_UNITS_PER_MINOR],
-                |row| row.get::<_, String>(0),
-            )
-            .map_err(db_error("query paid transfer audit"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(db_error("read paid transfer audit"))?;
+        let mismatched = fair_ids_tx(
+            conn,
+            &format!("paid_payout:{kind}"),
+            &sql,
+            vec![
+                crate::db::types::Value::Text(kind.into()),
+                crate::db::types::Value::Integer(crate::market_common::MONEY_UNITS_PER_MINOR),
+            ],
+            now,
+        )?;
         for id in mismatched {
             opened += case_tx(conn, "paid_payout_missing_evidence", kind, &id, now)?;
+        }
+    }
+    for (sql, code, kind) in [
+        (
+            "SELECT r.id FROM market_transfer_returns r WHERE r.status='approved' AND NOT EXISTS(SELECT 1 FROM market_verified_transfer_return_evidence e WHERE e.id=r.id)",
+            "wallet_transfer_return_missing_evidence",
+            "wallet_transfer_return",
+        ),
+        (
+            "SELECT j.id FROM market_journal_transactions j WHERE j.source_kind='wallet_transfer_return' AND NOT EXISTS(SELECT 1 FROM market_transfer_returns r WHERE r.journal_id=j.id)",
+            "wallet_transfer_return_orphan_journal",
+            "journal",
+        ),
+    ] {
+        for id in fair_ids_tx(conn, code, sql, vec![], now)? {
+            opened += case_tx(conn, code, kind, &id, now)?;
+        }
+    }
+    for id in fair_ids_tx(
+        conn,
+        "financial_proof_signatures",
+        "SELECT id FROM market_financial_request_proofs",
+        vec![],
+        now,
+    )? {
+        let (key,signature,canonical):(String,String,String)=conn.query_row("SELECT public_key,signature,canonical FROM market_financial_request_proofs WHERE id=?1",params![id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(db_error("read financial proof audit"))?;
+        if crate::market_security::verify_signature(&key, &signature, &canonical).is_err() {
+            opened += case_tx(
+                conn,
+                "financial_request_proof_invalid",
+                "financial_request_proof",
+                &id,
+                now,
+            )?;
         }
     }
     Ok(opened)
@@ -932,6 +994,20 @@ mod tests {
     use crate::market_wallet::{
         Posting, capture_hold_tx, credit_verified_topup_tx, post_journal_tx, reserve_wallet_tx,
     };
+
+    #[test]
+    fn financial_audit_cursor_reaches_findings_beyond_a_persistent_first_page() {
+        let c = crate::test_support::database().unwrap();
+        for n in 0..155 {
+            c.execute("INSERT INTO market_journal_transactions(id,source_kind,source_id,action,asset_code,fingerprint,created_at) VALUES(?1,'audit_test',?1,'bad','USD','f','2026-11-17T00:00:00Z')",params![format!("fair-{n:04}")]).unwrap();
+        }
+        audit_finance_tx(&c, "2026-11-17T00:00:01Z").unwrap();
+        assert_eq!(c.query_row("SELECT COUNT(*) FROM market_finance_reconciliation_cases WHERE code='journal_unsealed'",[],|r|r.get::<_,i64>(0)).unwrap(),100);
+        audit_finance_tx(&c, "2026-11-17T00:00:02Z").unwrap();
+        assert_eq!(c.query_row("SELECT COUNT(*) FROM market_finance_reconciliation_cases WHERE code='journal_unsealed'",[],|r|r.get::<_,i64>(0)).unwrap(),155);
+        audit_finance_tx(&c, "2026-11-17T00:00:03Z").unwrap();
+        assert_eq!(c.query_row("SELECT COUNT(*) FROM market_finance_reconciliation_cases WHERE code='journal_unsealed'",[],|r|r.get::<_,i64>(0)).unwrap(),155);
+    }
 
     #[test]
     fn internal_audit_finds_projection_drift_and_blocks_new_money() {

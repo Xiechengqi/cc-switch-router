@@ -109,7 +109,7 @@ async fn set_policy(
     headers: HeaderMap,
     Json(input): Json<SetPolicy>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let actor = crate::api::require_owner_session(&state, &headers).await?;
+    let actor = crate::market_finance_auth::write_owner_session(&state, &headers).await?;
     validate(input.client_hours, input.share_tokens)?;
     validate(input.share_hours, input.share_tokens)?;
     if let Some(value) = input.share_value_usd_micros.as_deref() {
@@ -119,6 +119,7 @@ async fn set_policy(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin trial policy"))?;
+    crate::market_finance_auth::require_live_session_tx(&tx, &actor, &crate::market_wallet::now())?;
     let before = policy_tx(&tx)?;
     let now = crate::market_wallet::now();
     if tx.execute("UPDATE market_trial_policy SET version = version + 1, client_hours = ?2, share_hours = ?3, share_tokens = ?4, share_value_usd_micros = COALESCE(?6, share_value_usd_micros), updated_at = ?5 WHERE id = 1 AND version = ?1", params![input.expected_version, input.client_hours, input.share_hours, input.share_tokens, now, input.share_value_usd_micros]).map_err(db_error("update trial policy"))? != 1 {

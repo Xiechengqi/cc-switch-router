@@ -1,4 +1,5 @@
 mod admin_finance;
+mod chain_verifier;
 mod chains;
 mod channel_settings;
 mod crypto;
@@ -541,11 +542,12 @@ async fn set_finance_mode(
     headers: HeaderMap,
     Json(request): Json<ModeRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let session = crate::api::require_owner_session(&state, &headers).await?;
+    let session = crate::market_finance_auth::write_owner_session(&state, &headers).await?;
     let conn = state.store.conn.lock().await;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin finance mode update"))?;
+    crate::market_finance_auth::require_live_session_tx(&tx, &session, &now())?;
     let changed_at = now();
     set_finance_mode_tx(&tx, &request, &changed_at)?;
     audit_tx(
@@ -620,11 +622,12 @@ async fn set_finance_pause(
     headers: HeaderMap,
     Json(request): Json<FinancePauseRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let session = crate::api::require_owner_session(&state, &headers).await?;
+    let session = crate::market_finance_auth::write_owner_session(&state, &headers).await?;
     let conn = state.store.conn.lock().await;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin finance pause update"))?;
+    crate::market_finance_auth::require_live_session_tx(&tx, &session, &now())?;
     let changed_at = now();
     set_finance_pause_tx(&tx, &request, &changed_at)?;
     // Describe the resulting state, not one flag of the request: the top-up
@@ -1192,6 +1195,7 @@ async fn save_channel(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin payment channel update"))?;
+    crate::market_finance_auth::require_live_session_tx(&tx, session, &now())?;
     let current_state = tx
         .query_row(
             "SELECT current_revision, version, archived_at FROM market_payment_channels WHERE id = ?1",
@@ -1365,7 +1369,7 @@ async fn create_channel(
     headers: HeaderMap,
     Json(input): Json<UpsertChannelRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let session = crate::api::require_owner_session(&state, &headers).await?;
+    let session = crate::market_finance_auth::write_owner_session(&state, &headers).await?;
     let view = save_channel(&state, &session, None, input).await?;
     Ok((no_store(), Json(view)))
 }
@@ -1376,7 +1380,7 @@ async fn replace_channel(
     Path(id): Path<String>,
     Json(input): Json<UpsertChannelRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let session = crate::api::require_owner_session(&state, &headers).await?;
+    let session = crate::market_finance_auth::write_owner_session(&state, &headers).await?;
     {
         let conn = state.store.conn.lock().await;
         let expected_version = input.expected_version.ok_or_else(|| {
@@ -1467,7 +1471,7 @@ async fn update_channel_details(
     Path(id): Path<String>,
     Json(input): Json<ChannelDetailsRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let session = crate::api::require_admin_session(&state, &headers).await?;
+    let session = crate::market_finance_auth::write_admin_session(&state, &headers).await?;
     if input.display_name.trim().is_empty() || input.display_name.len() > 80 {
         return Err(AppError::BadRequest(
             "invalid payment channel display name".into(),
@@ -1477,6 +1481,7 @@ async fn update_channel_details(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin payment channel details update"))?;
+    crate::market_finance_auth::require_live_session_tx(&tx, &session, &now())?;
     editable_revision_tx(&tx, &id, input.expected_version)?;
     let changed = tx.execute(
         "UPDATE market_payment_channels SET display_name = ?2, sort_order = ?3, version = version + 1, updated_at = ?4
@@ -1506,7 +1511,7 @@ async fn verify_channel_api(
     Path(id): Path<String>,
     Json(input): Json<VerifyChannelRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let session = crate::api::require_admin_session(&state, &headers).await?;
+    let session = crate::market_finance_auth::write_admin_session(&state, &headers).await?;
     let current_credentials = {
         let conn = state.store.conn.lock().await;
         let revision = editable_revision_tx(&conn, &id, input.expected_version)?;
@@ -1521,6 +1526,7 @@ async fn verify_channel_api(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin payment merchant reverification"))?;
+    crate::market_finance_auth::require_live_session_tx(&tx, &session, &now())?;
     let revision = editable_revision_tx(&tx, &id, input.expected_version)?;
     let current = load_revision(&tx, &state.market_payments, &id, revision)?;
     if merchant_id != current.merchant_id {
@@ -1626,7 +1632,7 @@ async fn rotate_channel_api(
     Path(id): Path<String>,
     Json(input): Json<RotateApiRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let session = crate::api::require_owner_session(&state, &headers).await?;
+    let session = crate::market_finance_auth::write_owner_session(&state, &headers).await?;
     if input.api_key_id.trim().is_empty()
         || input.api_key_id.len() > 200
         || input.api_secret.len() < 16
@@ -1650,6 +1656,7 @@ async fn rotate_channel_api(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin payment API rotation"))?;
+    crate::market_finance_auth::require_live_session_tx(&tx, &session, &now())?;
     let old_revision = editable_revision_tx(&tx, &id, input.expected_version)?;
     let old = load_revision(&tx, &state.market_payments, &id, old_revision)?;
     if merchant_id != old.merchant_id {
@@ -1703,7 +1710,7 @@ async fn rotate_channel_webhook(
     Path(id): Path<String>,
     Json(input): Json<RotateWebhookRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let session = crate::api::require_owner_session(&state, &headers).await?;
+    let session = crate::market_finance_auth::write_owner_session(&state, &headers).await?;
     if !matches!(input.webhook_mode.as_str(), "signed" | "poll_only")
         || (input.webhook_mode == "signed"
             && input
@@ -1732,6 +1739,7 @@ async fn rotate_channel_webhook(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin payment webhook rotation"))?;
+    crate::market_finance_auth::require_live_session_tx(&tx, &session, &now())?;
     let old_revision = editable_revision_tx(&tx, &id, input.expected_version)?;
     let old = load_revision(&tx, &state.market_payments, &id, old_revision)?;
     if verified_merchant_id != old.merchant_id {
@@ -1843,11 +1851,12 @@ async fn set_channel_archived(
     Path(id): Path<String>,
     Json(input): Json<ArchiveChannelRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let session = crate::api::require_owner_session(&state, &headers).await?;
+    let session = crate::market_finance_auth::write_owner_session(&state, &headers).await?;
     let conn = state.store.conn.lock().await;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin payment channel archive"))?;
+    crate::market_finance_auth::require_live_session_tx(&tx, &session, &now())?;
     let time = now();
     update_channel_archive_tx(&tx, &id, input.archived, input.expected_version, &time)?;
     audit_tx(
@@ -2013,11 +2022,12 @@ async fn set_channel_enabled(
     Path(id): Path<String>,
     Json(input): Json<SetEnabledRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let session = crate::api::require_owner_session(&state, &headers).await?;
+    let session = crate::market_finance_auth::write_owner_session(&state, &headers).await?;
     let conn = state.store.conn.lock().await;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin payment channel toggle"))?;
+    crate::market_finance_auth::require_live_session_tx(&tx, &session, &now())?;
     set_channel_enabled_tx(&tx, &id, input.enabled, input.expected_version, &now())?;
     audit_tx(
         &tx,
@@ -2108,11 +2118,12 @@ async fn rewrap_channel_secrets(
     State(state): State<ServerState>,
     headers: HeaderMap,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let session = crate::api::require_owner_session(&state, &headers).await?;
+    let session = crate::market_finance_auth::write_owner_session(&state, &headers).await?;
     let conn = state.store.conn.lock().await;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin payment secret rewrap"))?;
+    crate::market_finance_auth::require_live_session_tx(&tx, &session, &now())?;
     let count = rewrap_channel_secrets_tx(&tx, &state.market_payments)?;
     audit_tx(
         &tx,
@@ -2167,7 +2178,7 @@ async fn place_manual_earning_hold(
     headers: HeaderMap,
     Json(input): Json<ManualHoldRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let session = crate::api::require_owner_session(&state, &headers).await?;
+    let session = crate::market_finance_auth::write_owner_session(&state, &headers).await?;
     if !valid_reason_code(&input.reason_code) {
         return Err(AppError::BadRequest(
             "a short audit reason code is required".into(),
@@ -2177,6 +2188,7 @@ async fn place_manual_earning_hold(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin manual earning hold"))?;
+    crate::market_finance_auth::require_live_session_tx(&tx, &session, &now())?;
     let time = now();
     crate::market_finance::hold_contract_earnings_tx(&tx, &input.contract_id, "manual", &time)?;
     audit_tx(
@@ -2208,7 +2220,7 @@ async fn release_manual_earning_hold(
     headers: HeaderMap,
     Json(input): Json<ReleaseHoldRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let session = crate::api::require_owner_session(&state, &headers).await?;
+    let session = crate::market_finance_auth::write_owner_session(&state, &headers).await?;
     if !valid_reason_code(&input.reason_code) {
         return Err(AppError::BadRequest(
             "a short audit reason code is required".into(),
@@ -2223,6 +2235,7 @@ async fn release_manual_earning_hold(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin earning hold release"))?;
+    crate::market_finance_auth::require_live_session_tx(&tx, &session, &now())?;
     let time = now();
     let released = crate::market_finance::release_earning_holds_tx(
         &tx,
@@ -2408,12 +2421,13 @@ async fn resolve_finance_case(
     Path(id): Path<String>,
     Json(request): Json<ResolveFinanceCaseRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let actor = crate::api::require_admin_session(&state, &headers).await?;
+    let actor = crate::market_finance_auth::write_admin_session(&state, &headers).await?;
     let owner = crate::api::is_finance_owner(&state.config, &actor.email);
     let conn = state.store.conn.lock().await;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin finance case resolution"))?;
+    crate::market_finance_auth::require_live_session_tx(&tx, &actor, &now())?;
     ensure_general_case_can_resolve_tx(&tx, &id)?;
     if !owner && crate::market_reconcile::case_is_critical_tx(&tx, &id)? {
         return Err(AppError::Forbidden(
@@ -3176,7 +3190,7 @@ async fn recover_admin_topup(
     Path(order_id): Path<String>,
     Json(input): Json<RecoverTopupRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let actor = crate::api::require_admin_session(&state, &headers).await?;
+    let actor = crate::market_finance_auth::write_admin_session(&state, &headers).await?;
     if !(3..=64).contains(&input.reason_code.len())
         || !input
             .reason_code
@@ -3221,6 +3235,7 @@ async fn recover_admin_topup(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin owner top-up recovery"))?;
+    crate::market_finance_auth::require_live_session_tx(&tx, &actor, &now())?;
     let assessment = apply_owner_verified_recovery_tx(
         &tx,
         &order_id,
@@ -3260,11 +3275,64 @@ struct LoadedRevision {
     credentials: Credentials,
 }
 
+type RevisionSnapshot = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    String,
+    String,
+);
+fn revision_snapshot_tx(
+    conn: &Connection,
+    channel_id: &str,
+    revision: i64,
+) -> Result<RevisionSnapshot, AppError> {
+    conn.query_row(
+        "SELECT merchant_id, merchant_fingerprint, api_key_id, api_secret_ciphertext,
+                api_secret_nonce, webhook_secret_ciphertext, webhook_secret_nonce,
+                key_version, allowed_methods_json, webhook_mode
+         FROM market_payment_channel_revisions WHERE channel_id = ?1 AND revision = ?2",
+        params![channel_id, revision],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+            ))
+        },
+    )
+    .map_err(db_error("load payment channel revision"))
+}
 fn load_revision(
     conn: &Connection,
     runtime: &MarketPaymentsRuntime,
     channel_id: &str,
     revision: i64,
+) -> Result<LoadedRevision, AppError> {
+    open_revision(
+        runtime,
+        channel_id,
+        revision,
+        revision_snapshot_tx(conn, channel_id, revision)?,
+    )
+}
+fn open_revision(
+    runtime: &MarketPaymentsRuntime,
+    channel_id: &str,
+    revision: i64,
+    snapshot: RevisionSnapshot,
 ) -> Result<LoadedRevision, AppError> {
     let (
         merchant_id,
@@ -3277,40 +3345,7 @@ fn load_revision(
         key_version,
         methods_json,
         webhook_mode,
-    ): (
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        i64,
-        String,
-        String,
-    ) = conn
-        .query_row(
-            "SELECT merchant_id, merchant_fingerprint, api_key_id, api_secret_ciphertext,
-                api_secret_nonce, webhook_secret_ciphertext, webhook_secret_nonce,
-                key_version, allowed_methods_json, webhook_mode
-         FROM market_payment_channel_revisions WHERE channel_id = ?1 AND revision = ?2",
-            params![channel_id, revision],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                    row.get(8)?,
-                    row.get(9)?,
-                ))
-            },
-        )
-        .map_err(db_error("load payment channel revision"))?;
+    ) = snapshot;
     let api_secret = runtime.cipher.open(
         &api_ciphertext,
         &api_nonce,
@@ -3440,6 +3475,7 @@ async fn get_bound_gateway_order(
 /// The current merchant Webhook secret signs all order revisions. Only the
 /// immediately prior secret may be accepted, and only during a short explicit
 /// grace period. An emergency rotation clears that grace atomically.
+#[cfg(test)]
 fn verify_bound_webhook_tx(
     conn: &Connection,
     runtime: &MarketPaymentsRuntime,
@@ -3720,11 +3756,12 @@ async fn recheck_buyer_topup(
     headers: HeaderMap,
     Path(order_id): Path<String>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let session = require_session(&state, &headers).await?;
+    let session = crate::market_finance_auth::write_session(&state, &headers).await?;
     let conn = state.store.conn.lock().await;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin buyer top-up recheck"))?;
+    crate::market_finance_auth::require_live_session_tx(&tx, &session, &now())?;
     let queued = queue_buyer_recheck_tx(&tx, &order_id, &session.user_id)?;
     let order = read_topup(&tx, &order_id, &session.user_id)?;
     tx.commit()
@@ -4008,7 +4045,7 @@ async fn abandon_buyer_topup(
     headers: HeaderMap,
     Path(order_id): Path<String>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let session = require_session(&state, &headers).await?;
+    let session = crate::market_finance_auth::write_session(&state, &headers).await?;
     let (snapshot, loaded) = {
         let conn = state.store.conn.lock().await;
         let snapshot = cancel_topup_snapshot_tx(&conn, &order_id, Some(&session.user_id))?;
@@ -4043,6 +4080,7 @@ async fn abandon_buyer_topup(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin buyer top-up abandonment"))?;
+    crate::market_finance_auth::require_live_session_tx(&tx, &session, &now())?;
     let view = mark_buyer_abandoned_tx(
         &tx,
         &order_id,
@@ -4061,11 +4099,12 @@ async fn stop_buyer_topup(
     headers: HeaderMap,
     Path(order_id): Path<String>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let session = require_session(&state, &headers).await?;
+    let session = crate::market_finance_auth::write_session(&state, &headers).await?;
     let conn = state.store.conn.lock().await;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin buyer stop-payment request"))?;
+    crate::market_finance_auth::require_live_session_tx(&tx, &session, &now())?;
     let view = stop_buyer_topup_tx(&tx, &order_id, &session.user_id)?;
     tx.commit()
         .map_err(db_error("commit buyer stop-payment request"))?;
@@ -4276,6 +4315,7 @@ async fn cancel_topup_for_actor(
     order_id: &str,
     actor: &str,
     buyer_id: Option<&str>,
+    authorization: Option<&AuthSession>,
 ) -> Result<TopupView, AppError> {
     let (snapshot, loaded) = {
         let conn = state.store.conn.lock().await;
@@ -4311,6 +4351,9 @@ async fn cancel_topup_for_actor(
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db_error("begin gateway cancellation preflight"))?;
+        if let Some(session) = authorization {
+            crate::market_finance_auth::require_live_session_tx(&tx, session, &now())?;
+        }
         if matches!(
             gateway.status.as_str(),
             "canceled" | "cancelled" | "expired"
@@ -4421,6 +4464,9 @@ async fn cancel_topup_for_actor(
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db_error("begin verified gateway cancellation"))?;
+        if let Some(session) = authorization {
+            crate::market_finance_auth::require_live_session_tx(&tx, session, &now())?;
+        }
         let view =
             finish_gateway_cancel_tx(&tx, order_id, buyer_id, &loaded, &gateway, actor, &now())?;
         tx.commit()
@@ -4446,9 +4492,15 @@ async fn cancel_buyer_topup(
     headers: HeaderMap,
     Path(order_id): Path<String>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let actor = require_session(&state, &headers).await?;
-    let view =
-        cancel_topup_for_actor(&state, &order_id, &actor.user_id, Some(&actor.user_id)).await?;
+    let actor = crate::market_finance_auth::write_session(&state, &headers).await?;
+    let view = cancel_topup_for_actor(
+        &state,
+        &order_id,
+        &actor.user_id,
+        Some(&actor.user_id),
+        Some(&actor),
+    )
+    .await?;
     Ok((no_store(), Json(view)))
 }
 
@@ -4457,8 +4509,9 @@ async fn cancel_admin_topup(
     headers: HeaderMap,
     Path(order_id): Path<String>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let actor = crate::api::require_admin_session(&state, &headers).await?;
-    let view = cancel_topup_for_actor(&state, &order_id, &actor.user_id, None).await?;
+    let actor = crate::market_finance_auth::write_admin_session(&state, &headers).await?;
+    let view =
+        cancel_topup_for_actor(&state, &order_id, &actor.user_id, None, Some(&actor)).await?;
     Ok((no_store(), Json(view)))
 }
 
@@ -4827,7 +4880,7 @@ async fn create_topup(
     headers: HeaderMap,
     Json(input): Json<CreateTopupRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let session = require_session(&state, &headers).await?;
+    let session = crate::market_finance_auth::write_session(&state, &headers).await?;
     let client_ip = crate::client_meta::extract_client_metadata(&headers, peer)
         .ip
         .and_then(|value| value.parse::<IpAddr>().ok())
@@ -4861,6 +4914,7 @@ async fn create_topup(
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db_error("begin top-up"))?;
+        crate::market_finance_auth::require_live_session_tx(&tx, &session, &now())?;
         let quote = quotes::read_quote_tx(&tx, &session.user_id, &input.quote_id)?;
         if quote.channel_id != input.channel_id
             || quote.credit_minor != input.amount_minor
@@ -4975,6 +5029,13 @@ async fn create_topup(
                         "top-up IP rate limit reached".into(),
                     ));
                 }
+                crate::market_risk::require_topup_admission_tx(
+                    &tx,
+                    &session.user_id,
+                    &input.channel_id,
+                    quote.pay_minor,
+                    &now(),
+                )?;
                 let id = Uuid::new_v4().to_string();
                 let merchant_order_id = format!("router-{}", Uuid::new_v4().simple());
                 let (success_url, cancel_url) = topup_return_urls(&topup_base_url(&state), &id);
@@ -5110,6 +5171,7 @@ async fn create_topup(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin top-up create result"))?;
+    crate::market_finance_auth::require_live_session_tx(&tx, &session, &now())?;
     let view = match created {
         Ok(created) => {
             tx.execute(
@@ -5215,6 +5277,7 @@ fn paid_review_detail(error: &AppError) -> Option<&'static str> {
         AppError::Coded { code, details, .. } if *code == PAID_TERMS_CODE => {
             match details.get("detail").and_then(serde_json::Value::as_str) {
                 Some("paid_amount_short") => Some("paid_amount_short"),
+                Some("paid_amount_missing") => Some("paid_amount_missing"),
                 Some("paid_method_not_allowed") => Some("paid_method_not_allowed"),
                 Some("paid_confirmations_low") => Some("paid_confirmations_low"),
                 Some("paid_source_manual") => Some("paid_source_manual"),
@@ -5311,28 +5374,20 @@ fn validate_paid_terms_tx(
     if gateway.confirmations.unwrap_or(0) < rail.min_confirmations {
         return Err(paid_terms_error("paid_confirmations_low"));
     }
-    let payable = gateway
+    let payable = terms
         .payable_amount
         .as_deref()
-        .or(terms.payable_amount.as_deref());
-    if let (Some(payable), Some(settled)) = (payable, gateway.settled_amount.as_deref()) {
-        let fiat = format!(
-            "{}.{:02}",
-            gateway.fiat_amount_minor / 100,
-            gateway.fiat_amount_minor % 100
-        );
-        // `settled_amount` is compared with the locked on-chain amount. On a
-        // USD stablecoin a value exactly equal to the fiat amount is the
-        // gateway reporting in fiat terms and is accepted. On any other token
-        // the fiat figure is a different unit, so it never excuses a short
-        // payment.
-        let short = dujiaopay::compare_decimal(settled, payable)
-            .is_none_or(|ordering| ordering == std::cmp::Ordering::Less);
-        let fiat_terms = rail.usd_stable()
-            && dujiaopay::compare_decimal(settled, &fiat) == Some(std::cmp::Ordering::Equal);
-        if short && !fiat_terms {
-            return Err(paid_terms_error("paid_amount_short"));
-        }
+        .or(gateway.payable_amount.as_deref())
+        .ok_or_else(|| paid_terms_error("paid_amount_missing"))?;
+    let settled = gateway
+        .settled_amount
+        .as_deref()
+        .ok_or_else(|| paid_terms_error("paid_amount_missing"))?;
+    if dujiaopay::compare_decimal(payable, "0").is_none_or(|v| v != std::cmp::Ordering::Greater)
+        || dujiaopay::compare_decimal(settled, payable)
+            .is_none_or(|v| v == std::cmp::Ordering::Less)
+    {
+        return Err(paid_terms_error("paid_amount_short"));
     }
     Ok(())
 }
@@ -5465,8 +5520,8 @@ fn validate_paid_order_tx(
     let fingerprint = receipt_fingerprint(&loaded.merchant_fingerprint, gateway)?;
     let existing_receipt = conn
         .query_row(
-            "SELECT order_id FROM market_topup_receipts WHERE receipt_fingerprint = ?1",
-            params![fingerprint],
+            "SELECT order_id FROM market_topup_receipts WHERE receipt_fingerprint = ?1 OR (chain=?2 AND token_id=?3 AND (CASE WHEN chain='solana' THEN tx_id ELSE lower(tx_id) END)=?4) LIMIT 1",
+            params![fingerprint,gateway.chain,gateway.token_id,gateway.tx_id.as_deref().map(|s|if gateway.chain.as_deref()==Some("solana"){s.to_owned()}else{s.to_ascii_lowercase()})],
             |row| row.get::<_, String>(0),
         )
         .optional()
@@ -5516,6 +5571,27 @@ fn apply_paid_order_tx(
     else {
         return Ok(());
     };
+    if let Some(reason) = crate::market_risk::settlement_review_tx(
+        conn,
+        order_id,
+        channel_id,
+        validated.amount_minor,
+        &now(),
+    )? {
+        hold_topup_verification_failure_tx(conn, order_id, reason, &now())?;
+        return Ok(());
+    }
+    if crate::market_risk::policy_tx(conn)?.chain_verification_required
+        && !chain_verifier::evidence_matches_tx(conn, order_id, gateway)?
+    {
+        hold_topup_verification_failure_tx(
+            conn,
+            order_id,
+            "independent_chain_evidence_required",
+            &now(),
+        )?;
+        return Ok(());
+    }
     resolve_compatible_paid_holds_tx(conn, order_id, &now())?;
     if topup_has_manual_hold_tx(conn, order_id)? {
         return Err(AppError::Conflict(
@@ -5615,7 +5691,15 @@ fn compatible_paid_hold_ids_tx(
         .collect::<Result<Vec<_>, _>>()
         .map_err(db_error("read paid top-up holds"))?;
     if cases.iter().any(|(_, code, detail)| {
-        code != "topup_verification_failed" || detail != "gateway_terminal_payment_evidence"
+        code != "topup_verification_failed"
+            || !matches!(
+                detail.as_str(),
+                "gateway_terminal_payment_evidence"
+                    | "independent_chain_evidence_required"
+                    | "topup_velocity_exceeded"
+                    | "topup_circuit_open"
+                    | "topup_user_credit_limit"
+            )
     }) {
         return Ok(None);
     }
@@ -6236,8 +6320,8 @@ async fn handle_unbound_webhook(
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<bool, AppError> {
-    let conn = state.store.conn.lock().await;
     let candidates = {
+        let conn = state.store.conn.lock().await;
         let mut statement = conn
             .prepare(
                 "SELECT c.id, c.current_revision FROM market_payment_channels c
@@ -6248,17 +6332,24 @@ async fn handle_unbound_webhook(
                  ORDER BY c.rollout_state = 'off', c.sort_order, c.id LIMIT 16",
             )
             .map_err(db_error("prepare signed webhook channels"))?;
-        statement
+        let ids = statement
             .query_map(params![only_channel], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             })
             .map_err(db_error("query signed webhook channels"))?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(db_error("read signed webhook channels"))?
+            .map_err(db_error("read signed webhook channels"))?;
+        ids.into_iter()
+            .map(|(id, rev)| {
+                let snapshot = revision_snapshot_tx(&conn, &id, rev)?;
+                Ok((id, rev, snapshot))
+            })
+            .collect::<Result<Vec<_>, AppError>>()?
     };
     let now_unix = Utc::now().timestamp();
-    for (channel_id, revision) in candidates {
-        let Ok(loaded) = load_revision(&conn, &state.market_payments, &channel_id, revision) else {
+    for (channel_id, revision, snapshot) in candidates {
+        let Ok(loaded) = open_revision(&state.market_payments, &channel_id, revision, snapshot)
+        else {
             continue;
         };
         let Ok(event) =
@@ -6272,9 +6363,16 @@ async fn handle_unbound_webhook(
             event_type = %event.event_type,
             "verified unbound DujiaoPay event"
         );
+        let conn = state.store.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db_error("begin unbound webhook"))?;
+        let unchanged:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM market_payment_channels WHERE id=?1 AND current_revision=?2 AND archived_at IS NULL)",params![channel_id,revision],|r|r.get(0)).map_err(db_error("recheck unbound webhook epoch"))?;
+        if !unchanged {
+            return Err(AppError::Conflict(
+                "webhook credentials changed; retry".into(),
+            ));
+        }
         let time = now();
         match event.event_type.as_str() {
             "webhook.test" => {
@@ -6379,12 +6477,12 @@ async fn dujiaopay_webhook_hint(
                 |row| row.get(0),
             )
             .map_err(db_error("read callback channel"))?;
-        let loaded = load_revision(&conn, &state.market_payments, &channel_id, current_revision)?;
-        let bound = load_revision(&conn, &state.market_payments, &channel_id, bound_revision)?;
-        if loaded.merchant_fingerprint == bound.merchant_fingerprint {
-            loaded.credentials.webhook_secret.is_some()
+        let loaded = revision_snapshot_tx(&conn, &channel_id, current_revision)?;
+        let bound = revision_snapshot_tx(&conn, &channel_id, bound_revision)?;
+        if loaded.1 == bound.1 {
+            loaded.9 == "signed"
         } else {
-            bound.credentials.webhook_secret.is_some()
+            bound.9 == "signed"
         }
     };
     if signed {
@@ -6422,10 +6520,40 @@ fn mark_event_tx(
     Ok(())
 }
 
-/// Signed DujiaoPay events. The handler verifies, persists and binds the
-/// event, schedules an immediate authenticated lookup and returns 2xx at
-/// once; payment state changes only in reconciliation, from `GET
-/// /v1/orders/{id}`. Lookups therefore never hold the gateway's request open.
+/// Snapshot verification happens outside the lock. Rotation and grace expiry
+/// must be checked again when the verified event can actually be committed.
+fn recheck_webhook_epoch_tx(
+    conn: &Connection,
+    channel_id: &str,
+    expected: &(i64, Option<i64>, Option<String>),
+    used_previous_key: bool,
+    time: chrono::DateTime<Utc>,
+) -> Result<(), AppError> {
+    let observed: (i64, Option<i64>, Option<String>) = conn.query_row(
+        "SELECT current_revision,previous_webhook_revision,previous_webhook_valid_until FROM market_payment_channels WHERE id=?1",
+        params![channel_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    ).map_err(db_error("recheck webhook key epoch"))?;
+    if &observed != expected {
+        return Err(AppError::Conflict(
+            "webhook credentials changed; retry".into(),
+        ));
+    }
+    if used_previous_key
+        && !observed
+            .2
+            .as_deref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .is_some_and(|until| until >= time)
+    {
+        return Err(AppError::Unauthorized(
+            "previous webhook key expired".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Signed events schedule authenticated lookup, never credit a payment directly.
 async fn dujiaopay_webhook(
     State(state): State<ServerState>,
     Path(channel_id): Path<String>,
@@ -6449,56 +6577,94 @@ async fn dujiaopay_webhook(
             "ignored": !verified
         })));
     };
-    let conn = state.store.conn.lock().await;
-    let Some(bound) = bound_webhook_order_tx(&conn, &channel_id, &merchant_order_hint)? else {
-        // Unknown orders are acknowledged so the gateway does not retry an
-        // event this Router can never act on.
-        return Ok(Json(
-            serde_json::json!({ "accepted": true, "ignored": true }),
-        ));
+    let (bound, epoch, bound_snapshot, current_snapshot, previous_snapshot) = {
+        let conn = state.store.conn.lock().await;
+        let Some(bound) = bound_webhook_order_tx(&conn, &channel_id, &merchant_order_hint)? else {
+            return Ok(Json(serde_json::json!({"accepted":true,"ignored":true})));
+        };
+        let epoch:(i64,Option<i64>,Option<String>)=conn.query_row("SELECT current_revision,previous_webhook_revision,previous_webhook_valid_until FROM market_payment_channels WHERE id=?1",params![channel_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(db_error("snapshot webhook key epoch"))?;
+        let old = revision_snapshot_tx(&conn, &channel_id, bound.1)?;
+        let current = revision_snapshot_tx(&conn, &channel_id, epoch.0)?;
+        let previous = epoch
+            .1
+            .map(|rev| revision_snapshot_tx(&conn, &channel_id, rev).map(|s| (rev, s)))
+            .transpose()?;
+        (bound, epoch, old, current, previous)
     };
-    let current_revision: i64 = conn
-        .query_row(
-            "SELECT current_revision FROM market_payment_channels WHERE id = ?1",
-            params![channel_id],
-            |row| row.get(0),
-        )
-        .map_err(db_error("read callback channel"))?;
-    let current = load_revision(&conn, &state.market_payments, &channel_id, current_revision)?;
-    let historical = load_revision(&conn, &state.market_payments, &channel_id, bound.1)?;
-    let has_signed_key = if current.merchant_fingerprint == historical.merchant_fingerprint {
-        current.credentials.webhook_secret.is_some()
-    } else {
-        historical.credentials.webhook_secret.is_some()
-    };
-    if !has_signed_key {
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(db_error("begin callback lookup hint"))?;
-        queue_webhook_hint_tx(&tx, &bound.0, &now())?;
-        tx.commit()
-            .map_err(db_error("commit callback lookup hint"))?;
-        state.market_payments.wake_reconciler();
-        return Ok(Json(serde_json::json!({ "accepted": true })));
-    }
-    let (loaded, event, verified_current_revision) = verify_bound_webhook_tx(
-        &conn,
+    let loaded = open_revision(&state.market_payments, &channel_id, bound.1, bound_snapshot)?;
+    let current = open_revision(
         &state.market_payments,
         &channel_id,
-        bound.1,
-        &headers,
-        &body,
-        Utc::now().timestamp(),
+        epoch.0,
+        current_snapshot,
     )?;
+    let signing = if current.merchant_fingerprint == loaded.merchant_fingerprint {
+        &current
+    } else {
+        &loaded
+    };
+    let signed = signing.credentials.webhook_secret.is_some();
+    let (event, verified_current_revision, used_previous_key) = if signed {
+        match dujiaopay::verify_webhook(
+            &signing.credentials,
+            &headers,
+            &body,
+            Utc::now().timestamp(),
+        ) {
+            Ok(event) => (
+                Some(event),
+                (current.merchant_fingerprint == loaded.merchant_fingerprint).then_some(epoch.0),
+                false,
+            ),
+            Err(error) => {
+                if !matches!(error, AppError::Unauthorized(_)) {
+                    return Err(error);
+                }
+                let valid = epoch
+                    .2
+                    .as_deref()
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .is_some_and(|t| t >= Utc::now());
+                let Some((rev, snapshot)) = previous_snapshot.filter(|_| valid) else {
+                    return Err(error);
+                };
+                let previous = open_revision(&state.market_payments, &channel_id, rev, snapshot)?;
+                if previous.merchant_fingerprint != loaded.merchant_fingerprint {
+                    return Err(error);
+                }
+                (
+                    Some(dujiaopay::verify_webhook(
+                        &previous.credentials,
+                        &headers,
+                        &body,
+                        Utc::now().timestamp(),
+                    )?),
+                    None,
+                    true,
+                )
+            }
+        }
+    } else {
+        (None, None, false)
+    };
+    let conn = state.store.conn.lock().await;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_error("begin webhook event"))?;
+    recheck_webhook_epoch_tx(&tx, &channel_id, &epoch, used_previous_key, Utc::now())?;
+    if !signed {
+        queue_webhook_hint_tx(&tx, &bound.0, &now())?;
+        tx.commit().map_err(db_error("commit callback hint"))?;
+        state.market_payments.wake_reconciler();
+        return Ok(Json(serde_json::json!({"accepted":true})));
+    }
+    let event = event.ok_or_else(|| AppError::Internal("missing verified webhook".into()))?;
     if event.merchant_order_id != merchant_order_hint {
         return Err(AppError::Unauthorized(
             "DujiaoPay webhook not recognized".into(),
         ));
     }
     let (order_id, revision) = bound;
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(db_error("begin webhook event"))?;
     let time = now();
     persist_signed_event_tx(&tx, &order_id, &loaded.merchant_fingerprint, &event, &time)?;
     if let Some(current_revision) = verified_current_revision {
@@ -7216,6 +7382,18 @@ async fn reconcile_one_topup(state: &ServerState, pending: PendingTopup) -> Resu
         &gateway_id,
     )
     .await?;
+    // Independent network I/O is outside the global database lock.
+    let chain_evidence = if gateway.status == "paid" {
+        match chain_verifier::verify(&pending.channel_id, &gateway).await {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                tracing::warn!(order_id=%pending.id, error=%error, "independent chain verification pending");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let event = WebhookEvent {
         event_id: format!("reconcile-{}", pending.id),
         event_type: "order.paid".into(),
@@ -7257,6 +7435,9 @@ async fn reconcile_one_topup(state: &ServerState, pending: PendingTopup) -> Resu
             return Ok(());
         }
         return Err(error);
+    }
+    if let Some(evidence) = chain_evidence {
+        chain_verifier::save_tx(&tx, &pending.id, evidence, &now())?;
     }
     record_gateway_observation_tx(&tx, &pending.id, "reconcile", &gateway, &now())?;
     record_gateway_terms_tx(&tx, &pending.id, &gateway)?;
@@ -7370,7 +7551,7 @@ async fn reconcile_one_topup(state: &ServerState, pending: PendingTopup) -> Resu
     if can_auto_close {
         // The local deadline only triggers a verified gateway cancellation.
         // It is not itself proof that the checkout has stopped accepting funds.
-        cancel_topup_for_actor(state, &pending.id, "system", Some(&pending.user_id)).await?;
+        cancel_topup_for_actor(state, &pending.id, "system", Some(&pending.user_id), None).await?;
     }
     Ok(())
 }
@@ -9284,6 +9465,33 @@ mod tests {
     }
 
     #[test]
+    fn webhook_key_grace_is_rechecked_after_waiting_for_the_commit_lock() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        let deadline = "2026-11-17T12:00:00Z";
+        conn.execute(
+            "UPDATE market_payment_channels SET previous_webhook_revision=1,previous_webhook_valid_until=?1 WHERE id='channel'",
+            params![deadline],
+        ).unwrap();
+        let epoch = (1, Some(1), Some(deadline.to_string()));
+        let before = chrono::DateTime::parse_from_rfc3339("2026-11-17T11:59:59Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let after = before + chrono::Duration::seconds(2);
+        recheck_webhook_epoch_tx(&conn, "channel", &epoch, true, before).unwrap();
+        assert!(matches!(
+            recheck_webhook_epoch_tx(&conn, "channel", &epoch, true, after),
+            Err(AppError::Unauthorized(_))
+        ));
+        recheck_webhook_epoch_tx(&conn, "channel", &epoch, false, after).unwrap();
+        conn.execute("UPDATE market_payment_channels SET previous_webhook_revision=NULL,previous_webhook_valid_until=NULL WHERE id='channel'", []).unwrap();
+        assert!(matches!(
+            recheck_webhook_epoch_tx(&conn, "channel", &epoch, false, before),
+            Err(AppError::Conflict(_))
+        ));
+    }
+
+    #[test]
     fn current_merchant_keys_recover_old_orders_and_emergency_revokes_old_webhook_key() {
         let conn = memory();
         let runtime = MarketPaymentsRuntime::for_test();
@@ -9668,7 +9876,7 @@ mod tests {
             expires_at: None,
             selection_deadline: None,
             pay_address: None,
-            payable_amount: None,
+            payable_amount: Some("1.00".into()),
             fx_rate: None,
         }
     }
@@ -9694,6 +9902,101 @@ mod tests {
         }
     }
 
+    #[test]
+    fn aggregate_limits_include_aged_open_orders_and_trip_a_durable_credit_circuit() {
+        let c = memory();
+        fixture_revision(&c, 1);
+        fixture_topup(&c, "old-open", "old-open", "review_required", 1);
+        c.execute(
+            "UPDATE market_financial_risk_policy SET topup_user_day_minor=100 WHERE id=1",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            crate::market_risk::require_topup_admission_tx(
+                &c,
+                "buyer",
+                "channel",
+                100,
+                "2026-11-17T00:00:00Z"
+            )
+            .unwrap_err()
+            .code(),
+            Some("TOPUP_AGGREGATE_LIMIT")
+        );
+        c.execute("UPDATE market_financial_risk_policy SET topup_user_day_minor=200000,topup_global_hour_minor=100 WHERE id=1",[]).unwrap();
+        fixture_topup(&c, "credited-risk", "credited-risk", "credited", 1);
+        c.execute("UPDATE market_topup_receipts SET observed_at='2026-11-17T00:00:00Z' WHERE order_id='credited-risk'",[]).unwrap();
+        {
+            let tx = c
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            assert_eq!(
+                crate::market_risk::settlement_review_tx(
+                    &tx,
+                    "old-open",
+                    "channel",
+                    1,
+                    "2026-11-17T00:01:00Z"
+                )
+                .unwrap(),
+                Some("topup_velocity_exceeded")
+            );
+            tx.commit().unwrap();
+        }
+        assert!(
+            crate::market_risk::policy_tx(&c)
+                .unwrap()
+                .topup_circuit_open
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT COUNT(*) FROM market_financial_risk_events WHERE kind='topup_circuit_trip'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            crate::market_risk::settlement_review_tx(
+                &c,
+                "old-open",
+                "channel",
+                1,
+                "2026-11-17T00:02:00Z"
+            )
+            .unwrap(),
+            Some("topup_circuit_open")
+        );
+        assert_eq!(
+            read_topup(&c, "old-open", "buyer").unwrap().status,
+            "review_required"
+        );
+    }
+    #[test]
+    fn missing_payable_or_settled_amount_never_passes_paid_terms() {
+        let c = memory();
+        fixture_revision(&c, 1);
+        fixture_topup(&c, "missing-amount", "missing-amount", "pending", 1);
+        let mut g = paid_order("missing-amount", "missing-amount-tx");
+        g.payable_amount = None;
+        assert_eq!(
+            paid_review_detail(
+                &validate_paid_terms_tx(&c, "missing-amount", &loaded(), &g).unwrap_err()
+            ),
+            Some("paid_amount_missing")
+        );
+        g.payable_amount = Some("1.00".into());
+        g.settled_amount = None;
+        assert!(validate_paid_terms_tx(&c, "missing-amount", &loaded(), &g).is_err());
+        assert_eq!(
+            c.query_row("SELECT COUNT(*) FROM market_topup_receipts", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
     #[test]
     fn unsafe_checkout_keeps_the_gateway_id_without_exposing_a_payment_link() {
         let conn = memory();
@@ -12645,8 +12948,8 @@ mod tests {
         gateway.settled_amount = Some("1.00".into());
         assert_eq!(
             detail(&gateway),
-            None,
-            "a fiat-denominated settlement is accepted"
+            Some("paid_amount_short"),
+            "a fiat figure cannot excuse an incomplete on-chain amount"
         );
         gateway.settled_amount = Some("0.9".into());
         assert_eq!(detail(&gateway), Some("paid_amount_short"));

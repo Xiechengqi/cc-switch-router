@@ -1,3 +1,4 @@
+import { installFinancialBrowserIdentity } from "./financial-browser-fixture.mjs";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
@@ -74,6 +75,7 @@ try {
     if (path === "/v1/notifications") return json(route, { items: [], nextCursor: null, unread: 0, readThrough: null });
     return json(route, {});
   });
+  await installFinancialBrowserIdentity(page);
   await page.goto(`${base}/operations/?section=deliveries`);
   const panel = page.getByText("Marketplace email delivery", { exact: true }).locator("xpath=ancestor::*[.//table][1]");
   await panel.getByText("contract-first-page", { exact: true }).waitFor();

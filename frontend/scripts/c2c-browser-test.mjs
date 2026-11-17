@@ -1,3 +1,4 @@
+import { installFinancialBrowserIdentity } from "./financial-browser-fixture.mjs";
 import assert from "node:assert/strict";
 import { emptyClientRentalsPage } from "./client-rental-fixtures.mjs";
 import { createServer } from "node:http";
@@ -199,6 +200,7 @@ try {
       if (p.startsWith("/v1/admin/")) return json(route, []);
       return json(route, {});
     });
+    await installFinancialBrowserIdentity(page);
     return { page, context };
   };
   const geometry = async (page, selector) => {
@@ -258,7 +260,11 @@ try {
   await dialog.waitFor(); assert.equal(await dialog.getByRole("button", { name: "Create order" }).isDisabled(), true);
   await dialog.getByRole("checkbox").check();
   for (const width of [320, 375, 414, 768]) { await page.setViewportSize({ width, height: 900 }); await geometry(page, "dialog[open]"); }
-  uncertain = true; await dialog.getByRole("button", { name: "Create order" }).click();
+  uncertain = true;
+  await Promise.all([
+    page.waitForResponse(r => new URL(r.url()).pathname === "/v1/market-wallet/c2c/orders" && r.request().method() === "POST" && r.status() === 504),
+    dialog.getByRole("button", { name: "Create order" }).click(),
+  ]);
   await page.getByRole("button", { name: "Recover order" }).waitFor(); assert.equal(orders.length, 1); assert.equal(keys.length, 1);
   await page.reload(); await page.getByRole("tab", { name: "C2C", exact: true }).click();
   await page.getByRole("tab", { name: "Buy", exact: true }).click(); await page.getByRole("button", { name: "Recover order" }).click();
@@ -418,7 +424,12 @@ try {
   assert.equal(await adminPanel.isVisible(), false, "refresh preserves a later section choice instead of replaying the shortcut");
   await owner.page.goto(`${base}/settings/?panel=market_finance`);
   await adminPanel.getByText("C2C settings", { exact: true }).waitFor();
-  await adminPanel.getByLabel("Opening balance threshold (USD)").fill("150"); await adminPanel.getByRole("button", { name: "Save", exact: true }).click(); assert.equal(policy.admissionMinor, 15000);
+  await adminPanel.getByLabel("Opening balance threshold (USD)").fill("150");
+  await Promise.all([
+    owner.page.waitForResponse(r => new URL(r.url()).pathname === "/v1/admin/market-finance/c2c/policy" && r.request().method() === "PUT"),
+    adminPanel.getByRole("button", { name: "Save", exact: true }).click(),
+  ]);
+  assert.equal(policy.admissionMinor, 15000);
   await adminPanel.locator("summary").filter({ hasText: "C2C disputes & late payments" }).click(); await adminPanel.getByRole("button", { name: new RegExp(unpaid.id) }).click();
   const adjudication = owner.page.getByRole("dialog", { name: "Evidence-based resolution" });
   await adjudication.getByRole("button", { name: /Evidence-based resolution/ }).click();

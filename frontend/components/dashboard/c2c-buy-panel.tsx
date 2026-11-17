@@ -104,6 +104,7 @@ function C2CBuyWorkspace({ actor, onOrder, onBusyChange, inlineConfirmation = fa
       {reloadSignal === undefined && loaded && policy?.available && !quote && !pending && !recoveryBlocked ? <C2CAction type="button" secondary disabled={busy} aria-label={t("common.reload")} onClick={() => void run(() => load())}><RefreshCw className="size-4" aria-hidden="true" /></C2CAction> : null}
     </div>
     <C2CError>{!quote || pending ? error : ""}</C2CError>
+    {policy?.buyerLimits ? <p className="text-xs text-muted-foreground">{policy.buyerLimits.suspended || policy.buyerLimits.blockedUntil ? t("c2c.buyerRestricted") : t("c2c.buyerTier", { amount: (policy.buyerLimits.maxMinor / 100).toFixed(2), count: policy.buyerLimits.maxActive })}</p> : null}
     {recoveryBlocked ? <C2CAction type="button" phase={busy ? "loading" : "default"} onClick={() => void run(async () => {
       const page = await getC2COrders({ role: "buyer", status: "active" });
       if (!mounted.current) return;

@@ -353,6 +353,7 @@ fn row_actions_are_party_scoped_escalation_only_and_do_not_load_detail_history()
     let (c, _, at) = fixture(true);
     let t = accept(&c, &at, "provider_issue");
     let actor = |id: &str| AuthSession {
+        financial_proof_id: None,
         session_id: format!("session-{id}"),
         user_id: id.into(),
         email: format!("{id}@example.test"),

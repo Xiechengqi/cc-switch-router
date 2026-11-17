@@ -119,7 +119,7 @@ async fn set_policy(
     headers: HeaderMap,
     Json(input): Json<SetPolicyRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let actor = crate::api::require_owner_session(&state, &headers).await?;
+    let actor = crate::market_finance_auth::write_owner_session(&state, &headers).await?;
     if !(0..=10_000).contains(&input.maintenance_fee_bps)
         || !(1..=10_000_000).contains(&input.transfer_max_minor)
         || !(input.transfer_max_minor..=10_000_000).contains(&input.transfer_daily_max_minor)
@@ -130,6 +130,7 @@ async fn set_policy(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin wallet policy"))?;
+    crate::market_finance_auth::require_live_session_tx(&tx, &actor, &crate::market_wallet::now())?;
     let previous = policy_tx(&tx)?;
     let time = crate::market_wallet::now();
     let changed = tx

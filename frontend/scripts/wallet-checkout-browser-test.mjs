@@ -1,3 +1,4 @@
+import { installFinancialBrowserIdentity } from "./financial-browser-fixture.mjs";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
@@ -163,6 +164,7 @@ try {
     await route.fulfill({ contentType: "text/html", body: "<title>Mock checkout</title>" });
   });
 
+  await installFinancialBrowserIdentity(page);
   await page.goto(`${baseUrl}/wallet-checkout/?topup=order-1`);
   await page.waitForURL(checkoutUrl);
   assert.equal(gatewayCalls, 1);
@@ -835,8 +837,104 @@ try {
   assert.equal(await policyPanel.getByRole("button", { name: "Save", exact: true }).isDisabled(), true);
   assert.equal(await commissionInput.isDisabled(), true);
   assert.equal(await commissionPanel.getByRole("button", { name: "Save", exact: true }).isDisabled(), true);
+
+  // Exercise the exported wallet security and recipient-consent UI. The
+  // independent cryptographic/Passkey browser test verifies the 428 ceremony.
+  let risk = { version: 1, topupUserDayMinor: 200000, topupChannelDayMinor: 2000000,
+    topupGlobalDayMinor: 5000000, topupGlobalHourMinor: 1000000, incomingUserDayMinor: 1000000,
+    chainVerificationRequired: false, topupCircuitOpen: true };
+  let riskWrites = 0, rejectRisk = true, returnWrites = 0;
+  const keyId = "11111111-1111-4111-8111-111111111111";
+  const sentId = "22222222-2222-4222-8222-222222222222";
+  const receivedId = "33333333-3333-4333-8333-333333333333";
+  const time = new Date().toISOString();
+  let keys = [{ id: keyId, usableAfter: "2020-01-01T00:00:00Z", createdAt: time, revokedAt: null }];
+  const returns = new Map([[receivedId, { id: "return-received", transferId: receivedId,
+    requestedBy: "sender", reason: "Wrong registered recipient", status: "requested", version: 1,
+    journalId: null, createdAt: time, resolvedAt: null }]]);
+  const json = (route, data, status = 200) => route.fulfill({ status, contentType: "application/json", body: JSON.stringify(data) });
+  await page.context().route("**/v1/market-wallet/security", route => json(route, {
+    sessionReference: "test-wallet-session", canManageRiskPolicy: true, passkeys: keys,
+    coolingHours: 24, largeTransferMinor: 50000, firstRecipientRequiresPasskey: true,
+  }));
+  await page.context().route(`**/v1/market-wallet/security/passkeys/${keyId}/revoke`, async route => {
+    assert.ok(route.request().headers()["x-router-request-signature"]);
+    keys = keys.map(k => ({ ...k, revokedAt: time }));
+    await json(route, { revoked: true });
+  });
+  await page.context().route("**/v1/admin/market-finance/risk-policy", async route => {
+    if (route.request().method() === "PUT") {
+      riskWrites++;
+      assert.ok(route.request().headers()["x-router-request-signature"]);
+      const input = route.request().postDataJSON();
+      assert.equal(input.version, risk.version);
+      if (rejectRisk) { rejectRisk = false; risk = { ...risk, version: 2 }; return json(route, { message: "risk policy changed; reload" }, 409); }
+      risk = { ...input, version: risk.version + 1 };
+    }
+    await json(route, risk);
+  });
+  await page.context().route("**/v1/market-wallet/transfers?**", route => json(route, { total: 2, items: [
+    { id: sentId, senderEmail: "buyer@example.invalid", recipientEmail: "recipient@example.invalid", amountUnits: "8640000", journalId: "sent-journal", createdAt: time },
+    { id: receivedId, senderEmail: "sender@example.invalid", recipientEmail: "buyer@example.invalid", amountUnits: "8640000", journalId: "received-journal", createdAt: time },
+  ] }));
+  await page.context().route("**/v1/market-wallet/transfers/*/return**", async route => {
+    const match = new URL(route.request().url()).pathname.match(/transfers\/([^/]+)\/return(?:\/(approve|decline))?$/);
+    assert.ok(match);
+    const [, id, decision] = match;
+    if (route.request().method() === "POST") {
+      returnWrites++;
+      assert.ok(route.request().headers()["x-router-request-signature"]);
+      const input = route.request().postDataJSON();
+      if (decision) {
+        const previous = returns.get(id);
+        assert.equal(input.expectedVersion, previous.version);
+        returns.set(id, { ...previous, status: decision === "approve" ? "approved" : "declined", version: previous.version + 1, journalId: "compensating-journal", resolvedAt: time });
+      } else {
+        assert.equal(id, sentId);
+        returns.set(id, { id: "return-sent", transferId: id, requestedBy: "buyer", reason: input.reason,
+          status: "requested", version: 1, journalId: null, createdAt: time, resolvedAt: null });
+      }
+    }
+    await json(route, returns.get(id) || null);
+  });
+  await page.goto(`${baseUrl}/account/wallet/`);
+  const securityPanel = page.locator("details").filter({ has: page.locator("summary").getByText("Wallet security", { exact: true }) });
+  await securityPanel.locator("summary").click();
+  await securityPanel.getByText("Ready", { exact: true }).waitFor();
+  await securityPanel.getByLabel("Top-ups per user / 24 hours (USD)", { exact: true }).fill("2500");
+  await securityPanel.getByRole("button", { name: "Save risk policy", exact: true }).click();
+  await securityPanel.getByRole("alert").filter({ hasText: "risk policy changed" }).waitFor();
+  assert.equal(await securityPanel.getByLabel("Top-ups per user / 24 hours (USD)", { exact: true }).inputValue(), "2500");
+  await securityPanel.getByRole("button", { name: "Reload", exact: true }).click();
+  await securityPanel.getByLabel("Top-ups per user / 24 hours (USD)", { exact: true }).fill("2500");
+  await securityPanel.getByLabel("Pause new top-ups and automatic credits", { exact: true }).uncheck();
+  await securityPanel.getByRole("button", { name: "Save risk policy", exact: true }).click();
+  await securityPanel.getByRole("status").filter({ hasText: "Saved" }).waitFor();
+  assert.equal(riskWrites, 2);
+  assert.equal(risk.topupUserDayMinor, 250000);
+  assert.equal(risk.topupCircuitOpen, false);
+  await securityPanel.getByRole("button", { name: "Revoke", exact: true }).click();
+  await securityPanel.getByRole("button", { name: "Revoke", exact: true }).waitFor({ state: "detached" });
+  const corrections = page.locator("details").filter({ has: page.locator("summary").getByText("Transfer corrections", { exact: true }) });
+  await corrections.locator("summary").click();
+  const sent = corrections.locator("article").filter({ hasText: "recipient@example.invalid" });
+  const received = corrections.locator("article").filter({ hasText: "sender@example.invalid" });
+  await sent.getByLabel("Reason (8–1000 characters)", { exact: true }).fill("Wrong registered recipient");
+  await sent.getByRole("button", { name: "Request return", exact: true }).click();
+  await sent.getByText("Recipient decision pending", { exact: true }).waitFor();
+  assert.equal(returnWrites, 1);
+  assert.equal(await sent.getByRole("button", { name: /Return the full amount/ }).count(), 0);
+  await received.getByRole("button", { name: "Return the full amount", exact: true }).click();
+  assert.equal(returnWrites, 1, "opening recipient confirmation does not transfer funds");
+  await received.getByRole("button", { name: /Return the full amount.*\$1\.00/ }).click();
+  await received.getByText("Returned", { exact: true }).waitFor();
+  assert.equal(returnWrites, 2);
+  for (const width of [320, 375, 414, 768]) {
+    await page.setViewportSize({ width, height: 900 });
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `wallet security/correction page overflows at ${width}`);
+  }
   assert.deepEqual(pageErrors, []);
-  console.log("wallet checkout: fee-independent principal limits, exact boundary cents, dynamic 0%/5%/7.25%/100% fees, unavailable channels, stale-quote races, live fee refresh, safe new tabs, recheck/stop, exact transfer, idempotent retry without financial OTP, scoped access, automatic earnings credit, retired payout/manual-credit paths and Owner policy edits passed; four widths; no screenshots or real payments");
+  console.log("wallet checkout: principal limits, dynamic fees, stale-quote races, safe payment tabs, recheck/stop, exact transfer and idempotent retry, automatic earnings credit, Owner policies, wallet security, risk-policy CAS/recovery, Passkey revocation and recipient-consented transfer returns passed; four widths; no screenshots or real payments");
 } finally {
   await browser?.close();
   if (server) await new Promise((resolveStop, rejectStop) => {

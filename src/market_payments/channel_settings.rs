@@ -111,11 +111,12 @@ pub(super) async fn update_channel_settings(
     Path(id): Path<String>,
     Json(input): Json<ChannelSettingsRequest>,
 ) -> Result<(axum::http::HeaderMap, Json<ChannelView>), AppError> {
-    let session = crate::api::require_owner_session(&state, &headers).await?;
+    let session = crate::market_finance_auth::write_owner_session(&state, &headers).await?;
     let conn = state.store.conn.lock().await;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin payment channel settings"))?;
+    crate::market_finance_auth::require_live_session_tx(&tx, &session, &now())?;
     let time = now();
     update_channel_settings_tx(&tx, &id, &input, &time)?;
     audit_tx(

@@ -10,7 +10,7 @@ import { useLocaleText } from "@/components/i18n/locale-provider";
 import { C2CEvents } from "@/components/dashboard/c2c-orders-panel";
 import { C2CDescription } from "@/components/market/c2c-description";
 import { C2CAction, C2CCheck, C2CDialog, C2CError, C2CStatusLabel, C2C_INPUT } from "@/components/market/c2c-primitives";
-import { c2cErrorKey, c2cPayLabel, getAdminC2COrder, getAdminC2CPolicy, getAdminC2CSellers, getC2CEvents, getC2COrders, parseC2CMinor, resolveC2C, saveAdminC2CPolicy, suspendC2CSeller, getC2CDisputeHandlers, saveC2CDisputeHandler, type C2CDisputeHandler, type C2CAdminSeller, type C2COrder, type C2CPolicy } from "@/lib/market-c2c";
+import { clearC2CBuyerRestriction, c2cErrorKey, c2cPayLabel, getAdminC2COrder, getAdminC2CPolicy, getAdminC2CSellers, getC2CEvents, getC2COrders, parseC2CMinor, resolveC2C, saveAdminC2CPolicy, suspendC2CSeller, getC2CDisputeHandlers, saveC2CDisputeHandler, type C2CDisputeHandler, type C2CAdminSeller, type C2COrder, type C2CPolicy } from "@/lib/market-c2c";
 import { formatWalletUnits } from "@/lib/market-wallet-money";
 
 export function C2CFinanceSettings() {
@@ -109,9 +109,18 @@ function C2CResolutionDialog({ id, actor, onClose, onResolved }: { id: string; a
           if (alive.current) setDetail(current => current ? { ...current, events: { items: [...current.events.items, ...page.items.filter(e => !current.events.items.some(v => v.id === e.id))], next: page.next } } : current);
         }).catch(e => { if (alive.current) setError(t(c2cErrorKey(e))); }).finally(() => { lock.current = false; if (alive.current) setBusy(false); });
       }}>{t("common.next")}</C2CAction> : null}
+      {detail?.buyerRestriction && !detail.buyerRestriction.clearedAt ? <div className="grid gap-3">
+        <p className="text-sm text-muted-foreground">{t("c2c.clearRestrictionHelp")}</p>
+        <label className="grid gap-1 text-sm">{t("c2c.note")}<textarea className={C2C_INPUT} rows={3} value={evidence} maxLength={1500} disabled={!canManage || conflict || busy} onChange={e => setEvidence(e.target.value)} /></label>
+        <C2CCheck checked={ack} disabled={!canManage || conflict || busy} onChange={e => setAck(e.target.checked)}>{t("c2c.resolveAck")}</C2CCheck>
+        <C2CAction type="button" disabled={!canManage || conflict || busy || !ack || evidence.trim().length<8} onClick={() => {
+          if (lock.current || !detail.buyerRestriction) return; lock.current=true; setBusy(true); setError("");
+          void clearC2CBuyerRestriction(o.id, detail.buyerRestriction.decisionId, evidence).then(async () => { if (alive.current) {onResolved();await load();} }).catch(e => {if(alive.current)setError(t(c2cErrorKey(e)));}).finally(() => {lock.current=false;if(alive.current)setBusy(false);});
+        }}>{t("c2c.clearRestriction")}</C2CAction>
+      </div> : null}
       {mayResolve ? <>
         <CompactSelect ariaLabel={t("c2c.resolution")} className="w-full" triggerClassName="h-11" value={action} disabled={!canManage || conflict || busy || !detail?.evidenceValid} onChange={value => { setAction(value); setAck(false); }}
-          options={[{ value: "", label: "—" }, ...(o.status === "disputed" ? [{ value: "release", label: t("c2c.resolveRelease") }, { value: "return_to_seller", label: t("c2c.resolveReturn") }] : [{ value: "record_external_resolution", label: t("c2c.resolveExternal") }])]} />
+          options={[{ value: "", label: "—" }, ...(o.status === "disputed" ? [{ value: "release", label: t("c2c.resolveRelease") }, { value: "return_to_seller", label: t("c2c.resolveReturn") }, { value: "verified_false_payment", label: t("c2c.resolveFalsePayment") }] : [{ value: "record_external_resolution", label: t("c2c.resolveExternal") }])]} />
         <label className="grid gap-1 text-sm">{t("c2c.note")}<textarea className={C2C_INPUT} rows={4} value={evidence} maxLength={1500} disabled={!canManage || conflict || busy} onChange={e => setEvidence(e.target.value)} /></label>
         <C2CCheck checked={ack} disabled={!canManage || conflict || busy} onChange={e => setAck(e.target.checked)}>{t("c2c.resolveAck")}</C2CCheck>
         <C2CAction type="button" disabled={!canManage || conflict || busy || !ack || !action || !evidence.trim() || !detail?.evidenceValid} phase={busy ? "loading" : "default"} onClick={() => {

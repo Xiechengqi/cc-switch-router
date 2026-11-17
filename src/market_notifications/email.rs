@@ -187,6 +187,35 @@ pub(super) fn render(item: &Claimed, dashboard: &str) -> (String, String, String
             "Wallet credit adjusted",
             "An externally confirmed payment reversal was recorded. The corresponding wallet credit has been adjusted. This is not a platform cash-refund service.",
         ),
+        "wallet_transfer_return_requested" => (
+            "Transfer return requested",
+            "A return of a previous transfer was requested. Review the original transfer before deciding. Only the original recipient can consent; administrators cannot force a debit.",
+        ),
+        "wallet_transfer_return_resolved" => {
+            if p.get("approved").and_then(Value::as_bool) == Some(true) {
+                (
+                    "Transfer returned",
+                    "The original recipient approved the full return. A separate compensating entry was recorded; the original transfer remains in history.",
+                )
+            } else {
+                (
+                    "Return request declined",
+                    "The original recipient declined the return. No money moved; the original transfer remains in history.",
+                )
+            }
+        }
+        "wallet_passkey_registered" => (
+            "Wallet Passkey registered",
+            "A wallet Passkey was registered with a 24-hour cooling period. If this was not you, secure your account and contact your deployment administrator immediately.",
+        ),
+        "wallet_passkey_recovery" => (
+            "Wallet security recovery",
+            "The deployment administrator approved wallet recovery. Existing Passkeys and other sessions were revoked. If this was not you, contact your deployment administrator immediately.",
+        ),
+        "c2c_buyer_restriction_changed" => (
+            "C2C purchase restriction corrected",
+            "An independent handler corrected a false-payment restriction. The original decision is retained; any other active restrictions still apply.",
+        ),
         "wallet_transfer_sent" => (
             "Transfer sent",
             "Your platform credit was transferred to the recipient below. This transfer cannot be undone.",

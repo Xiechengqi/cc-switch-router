@@ -13,6 +13,7 @@ use crate::market_wallet::{
 use crate::market_wallet_policy::db_error;
 
 mod http;
+mod risk;
 pub use http::router;
 #[cfg(test)]
 mod tests;
@@ -138,7 +139,7 @@ fn seller_blockers_tx(
     Ok(blockers)
 }
 fn overdue_paid_orders_tx(conn: &Connection, user: &str, time: &str) -> Result<bool, AppError> {
-    conn.query_row("SELECT EXISTS(SELECT 1 FROM market_c2c_orders WHERE seller_id=?1 AND status IN ('paid','disputed') AND julianday(paid_at)<=julianday(?2)-60.0/1440)", params![user,time], |r|r.get(0)).map_err(db_error("check C2C overdue orders"))
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM market_c2c_orders WHERE seller_id=?1 AND status IN ('paid','disputed') AND julianday(paid_at)<=julianday(?2)-60.0/1440 AND NOT EXISTS(SELECT 1 FROM market_c2c_payment_reviews r WHERE r.order_id=market_c2c_orders.id))", params![user,time], |r|r.get(0)).map_err(db_error("check C2C overdue orders"))
 }
 fn save_policy_tx(
     conn: &Connection,
@@ -471,12 +472,11 @@ fn offers_tx(
         return Ok((vec![], None));
     }
     let p = policy_tx(conn)?;
-    let experienced:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM market_c2c_orders WHERE buyer_id=?1 AND status='released')",params![user],|r|r.get(0)).map_err(db_error("read C2C discovery purchase limit"))?;
-    let buyer_max = if experienced {
-        p.max_minor
-    } else {
-        p.max_minor.min(10000)
-    };
+    let limits = risk::buyer_limits_tx(conn, user, time)?;
+    if limits.suspended || limits.blocked_until.is_some() {
+        return Ok((vec![], None));
+    }
+    let buyer_max = p.max_minor.min(limits.max_minor);
     let mut stmt=conn.prepare("SELECT user_id FROM market_c2c_sellers WHERE enabled=1 AND suspended=0 AND auto_pause_reason IS NULL AND auto_accept_terms_version=3 AND auto_accept_consented_at IS NOT NULL AND user_id!=?1 AND user_id>?2 ORDER BY user_id LIMIT 101").map_err(db_error("list C2C sellers"))?;
     let mut ids = stmt
         .query_map(params![user, after], |r| r.get::<_, String>(0))
@@ -572,8 +572,16 @@ fn quote_tx(
             "too many C2C previews; try later".into(),
         ));
     }
+    let limits = risk::buyer_limits_tx(conn, buyer, time)?;
+    if limits.suspended || limits.blocked_until.is_some() {
+        return Err(problem(
+            "C2C_BUYER_RESTRICTED",
+            "new purchases are temporarily restricted",
+        ));
+    }
     let max = s
         .max_minor
+        .min(limits.max_minor)
         .min(p.max_minor)
         .min(stock_tx(conn, &s.user_id, time)? / 86400);
     if input.amount_minor < s.min_minor.max(p.min_minor) || input.amount_minor > max {
@@ -627,6 +635,8 @@ fn quote_tx(
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Order {
+    payment_reference: String,
+    payment_review: Option<serde_json::Value>,
     id: String,
     quote_id: String,
     buyer_id: String,
@@ -664,11 +674,14 @@ struct LegacyPayment {
 }
 fn order_tx(conn: &Connection, id: &str) -> Result<Order, AppError> {
     conn.query_row("SELECT o.id,o.quote_id,o.buyer_id,o.seller_id,o.amount_units,o.hold_id,o.status,o.version,o.payment_deadline,o.paid_at,o.released_at,o.late_payment_reported,o.late_payment_resolved,o.created_at,o.updated_at,
-       q.seller_name,q.pay_minor,q.currency,q.fx_micros,q.price_bps,q.contact,q.payment_method,q.payment_details,q.description,o.terms_version,o.acceptance_deadline,o.accepted_at
+       q.seller_name,q.pay_minor,q.currency,q.fx_micros,q.price_bps,q.contact,q.payment_method,q.payment_details,q.description,o.terms_version,o.acceptance_deadline,o.accepted_at,o.payment_reference,
+       (SELECT json_object('evidenceDueAt',r.evidence_due_at,'buyerEvidence',r.buyer_evidence,'evidenceAt',r.evidence_at,'escalatedAt',r.escalated_at,'resolvedAt',r.resolved_at) FROM market_c2c_payment_reviews r WHERE r.order_id=o.id)
        FROM market_c2c_orders o JOIN market_c2c_quotes q ON q.id=o.quote_id WHERE o.id=?1",params![id],|r| {
         let description: String = r.get(23)?;
         let legacy_payment = if description.is_empty() { Some(LegacyPayment { contact:r.get(20)?,payment_method:r.get(21)?,payment_details:r.get(22)? }) } else { None };
         Ok(Order {
+        payment_reference:r.get::<_,Option<String>>(27)?.unwrap_or_default(),
+        payment_review:r.get::<_,Option<String>>(28)?.map(|v| serde_json::from_str(&v)).transpose().map_err(|e| crate::db::Error::FromSqlConversionFailure(28,crate::db::types::Type::Text,Box::new(e)))?,
         id:r.get(0)?,quote_id:r.get(1)?,buyer_id:r.get(2)?,seller_id:r.get(3)?,amount_units:r.get(4)?,hold_id:r.get(5)?,status:r.get(6)?,version:r.get(7)?,payment_deadline:r.get(8)?,paid_at:r.get(9)?,released_at:r.get(10)?,late_payment_reported:r.get(11)?,late_payment_resolved:r.get(12)?,created_at:r.get(13)?,updated_at:r.get(14)?,seller_name:r.get(15)?,pay_minor:r.get(16)?,currency:r.get(17)?,fx_micros:r.get(18)?,price_bps:r.get(19)?,description:(!description.is_empty()).then_some(description),legacy_payment,flow_version:r.get(24)?,acceptance_deadline:r.get(25)?,accepted_at:r.get(26)?
     })}).optional().map_err(db_error("read C2C order"))?.ok_or_else(||AppError::NotFound("C2C order not found".into()))
 }
@@ -802,13 +815,7 @@ fn create_tx(
     if buyer_active >= 2 || seller_active >= 10 || ip_active >= 6 {
         return Err(problem("C2C_ORDER_LIMIT", "too many unfinished C2C orders"));
     }
-    let experienced:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM market_c2c_orders WHERE buyer_id=?1 AND status='released')",params![buyer],|r|r.get(0)).map_err(db_error("read C2C buyer limits"))?;
-    if !experienced && minor > 10000 {
-        return Err(problem(
-            "C2C_FIRST_ORDER_LIMIT",
-            "the first C2C purchase is limited to US$100",
-        ));
-    }
+    risk::admission_tx(conn, buyer, &seller, minor, time)?;
     let recent:i64=conn.query_row("SELECT COUNT(*) FROM market_c2c_attempts WHERE (user_id=?1 OR ip=?2) AND julianday(created_at)>=julianday(?3)-1.0/24",params![buyer,ip,time],|r|r.get(0)).map_err(db_error("rate limit C2C orders"))?;
     if recent >= 10 {
         return Err(AppError::TooManyRequests(
@@ -845,13 +852,24 @@ fn create_tx(
         "terms_v3_standing_auto_accept_authorization",
         time,
     )?;
-    Ok(o)
+    conn.execute(
+        "UPDATE market_c2c_orders SET payment_reference=?2 WHERE id=?1",
+        params![
+            id,
+            format!("C2C-{}", id.replace('-', "").to_ascii_uppercase())
+        ],
+    )
+    .map_err(db_error("bind C2C payment reference"))?;
+    order_tx(conn, &id)
 }
 
 fn change_tx(conn: &Connection, o: &Order, status: &str, time: &str) -> Result<Order, AppError> {
     let changed=conn.execute("UPDATE market_c2c_orders SET status=?3,version=version+1,updated_at=?4 WHERE id=?1 AND version=?2",params![o.id,o.version,status,time]).map_err(db_error("transition C2C order"))?;
     if changed != 1 {
         return Err(problem("C2C_STALE", "order version changed; reload"));
+    }
+    if matches!(status, "released" | "cancelled" | "expired") {
+        conn.execute("UPDATE market_c2c_payment_reviews SET resolved_at=COALESCE(resolved_at,?2) WHERE order_id=?1",params![o.id,time]).map_err(db_error("close terminal C2C payment review"))?;
     }
     order_tx(conn, &o.id)
 }
@@ -1029,6 +1047,16 @@ fn cancel_tx(
     crate::market_wallet::reconcile_wallet_tx(conn, &o.seller_id)?;
     crate::market_wallet::release_hold_tx(conn, &o.hold_id, time)?;
     crate::market_wallet::reconcile_wallet_tx(conn, &o.seller_id)?;
+    if !application && !o.late_payment_reported && (expired || actor == o.buyer_id) {
+        risk::strike_tx(
+            conn,
+            o,
+            "c2c_unpaid",
+            actor,
+            "closed_without_payment_declaration",
+            time,
+        )?;
+    }
     let o = change_tx(conn, o, if expired { "expired" } else { "cancelled" }, time)?;
     event_tx(
         conn,
@@ -1281,7 +1309,7 @@ fn resolve_tx(
     let evidence = text(evidence, 1500)?;
     let result = match (action, o.status.as_str()) {
         ("release", "disputed") => release_tx(conn, o, actor, time)?,
-        ("return_to_seller", "disputed") => {
+        ("return_to_seller" | "verified_false_payment", "disputed") => {
             safe_tx(conn, &o.seller_id, &o.buyer_id)?;
             if !evidence_valid_tx(conn, &o.id)? {
                 return Err(problem("MARKET_FINANCE_HOLD", "C2C evidence needs review"));
@@ -1289,6 +1317,9 @@ fn resolve_tx(
             crate::market_wallet::reconcile_wallet_tx(conn, &o.seller_id)?;
             crate::market_wallet::release_hold_tx(conn, &o.hold_id, time)?;
             crate::market_wallet::reconcile_wallet_tx(conn, &o.seller_id)?;
+            if action == "verified_false_payment" {
+                risk::strike_tx(conn, o, "c2c_false_payment", actor, &evidence, time)?;
+            }
             change_tx(conn, o, "cancelled", time)?
         }
         ("record_external_resolution", "expired" | "cancelled")
@@ -1306,6 +1337,7 @@ fn resolve_tx(
         )
         .map_err(db_error("resolve C2C exceptional payment claim"))?;
     }
+    conn.execute("UPDATE market_c2c_payment_reviews SET resolved_at=COALESCE(resolved_at,?2) WHERE order_id=?1", params![o.id,time]).map_err(db_error("close C2C adjudication review"))?;
     let result = order_tx(conn, &result.id)?;
     audit_tx(conn, actor, action, "c2c_order", &o.id, &evidence, time)?;
     event_tx(conn, &result, actor, action, &evidence, time)?;
@@ -1393,6 +1425,7 @@ pub(crate) fn audit_tx_cases(conn: &Connection, time: &str) -> Result<usize, App
     Ok(findings)
 }
 pub(crate) fn tick_tx(conn: &Connection, time: &str) -> Result<(), AppError> {
+    risk::tick_reviews_tx(conn, time)?;
     let cutoff = (at(time)? - Duration::minutes(2)).to_rfc3339();
     let mut stmt=conn.prepare("SELECT id FROM market_c2c_orders o WHERE ((status='awaiting_payment' AND julianday(payment_deadline)<=julianday(?1)) OR (status='awaiting_seller' AND julianday(acceptance_deadline)<=julianday(?2)))
         AND NOT EXISTS(SELECT 1 FROM market_finance_reconciliation_cases c WHERE c.status='open' AND ((c.object_id=o.id AND c.code='c2c_evidence_mismatch') OR (c.object_id=o.seller_id AND c.code='wallet_projection_mismatch')))
@@ -1451,7 +1484,7 @@ pub(crate) fn tick_tx(conn: &Connection, time: &str) -> Result<(), AppError> {
     }
     // Real overdue transactions, not browser presence, pause new intake.
     // Existing paid/disputed credit stays reserved until evidence is resolved.
-    let mut stmt=conn.prepare("SELECT id FROM market_c2c_orders WHERE status IN ('paid','disputed') AND seller_paused_at IS NULL AND julianday(paid_at)<=julianday(?1)-60.0/1440 ORDER BY paid_at,id LIMIT 100").map_err(db_error("prepare C2C nonresponse pause"))?;
+    let mut stmt=conn.prepare("SELECT id FROM market_c2c_orders WHERE status IN ('paid','disputed') AND seller_paused_at IS NULL AND NOT EXISTS(SELECT 1 FROM market_c2c_payment_reviews r WHERE r.order_id=market_c2c_orders.id) AND julianday(paid_at)<=julianday(?1)-60.0/1440 ORDER BY paid_at,id LIMIT 100").map_err(db_error("prepare C2C nonresponse pause"))?;
     let ids = stmt
         .query_map(params![time], |r| r.get::<_, String>(0))
         .map_err(db_error("query C2C nonresponse pause"))?

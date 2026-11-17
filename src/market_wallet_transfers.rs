@@ -21,6 +21,8 @@ use crate::{
     },
 };
 
+mod returns;
+
 fn no_store() -> [(header::HeaderName, &'static str); 1] {
     [(header::CACHE_CONTROL, "private, no-store")]
 }
@@ -43,6 +45,7 @@ async fn session(
 
 pub fn router() -> Router<ServerState> {
     Router::new()
+        .merge(returns::router())
         .route("/v1/market-wallet/transfer-capacity", get(capacity))
         .route("/v1/market-wallet/transfer-quotes", post(create_quote))
         .route("/v1/market-wallet/transfers", get(list).post(confirm))
@@ -132,6 +135,7 @@ fn require_transfer_tx(
     }
     require_user_tx(conn, sender)?;
     require_user_tx(conn, recipient)?;
+    crate::market_risk::require_incoming_tx(conn, recipient, amount, time, true)?;
     crate::market_reconcile::ensure_finance_scopes_safe_tx(
         conn,
         &[
@@ -171,6 +175,7 @@ pub(crate) fn prune_unused_tx(
     conn: &Connection,
     time: chrono::DateTime<Utc>,
 ) -> Result<(), AppError> {
+    crate::market_security::prune_tx(conn, &time.to_rfc3339())?;
     let old = (time - Duration::days(30)).to_rfc3339();
     conn.execute(
         "DELETE FROM market_earning_conversion_quotes WHERE id IN
@@ -211,6 +216,8 @@ struct QuoteRequest {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Quote {
+    recipient_hint: String,
+    first_recipient: bool,
     id: String,
     #[serde(skip)]
     sender: String,
@@ -223,8 +230,8 @@ struct Quote {
     expires_at: String,
 }
 fn read_quote_tx(conn: &Connection, sender: &str, id: &str) -> Result<Quote, AppError> {
-    conn.query_row("SELECT id, sender_user_id, recipient_user_id, sender_email, recipient_email, amount_units, expires_at FROM market_wallet_transfer_quotes WHERE id = ?1 AND sender_user_id = ?2",
-        params![id, sender], |row| Ok(Quote { id: row.get(0)?, sender: row.get(1)?, recipient: row.get(2)?, sender_email: row.get(3)?, recipient_email: row.get(4)?, amount_units: row.get(5)?, expires_at: row.get(6)? }))
+    conn.query_row("SELECT id, sender_user_id, recipient_user_id, sender_email, recipient_email, amount_units, expires_at, recipient_hint, first_recipient FROM market_wallet_transfer_quotes WHERE id = ?1 AND sender_user_id = ?2",
+        params![id, sender], |row| Ok(Quote { recipient_hint: row.get(7)?, first_recipient: row.get(8)?, id: row.get(0)?, sender: row.get(1)?, recipient: row.get(2)?, sender_email: row.get(3)?, recipient_email: row.get(4)?, amount_units: row.get(5)?, expires_at: row.get(6)? }))
         .optional().map_err(db_error("read wallet transfer quote"))?.ok_or_else(|| AppError::NotFound("wallet transfer quote not found".into()))
 }
 
@@ -267,6 +274,7 @@ async fn create_quote(
         .map_err(db_error("begin transfer quote"))?;
     let at = Utc::now();
     let time = at.to_rfc3339();
+    crate::market_finance_auth::require_live_session_tx(&tx, &user, &time)?;
     let recent: i64 = tx.query_row("SELECT COUNT(*) FROM market_wallet_transfer_quotes WHERE sender_user_id = ?1 AND created_at >= ?2",
         params![user.user_id, (at - Duration::hours(1)).to_rfc3339()], |row| row.get(0)).map_err(db_error("count transfer quotes"))?;
     if recent >= 30 {
@@ -283,7 +291,22 @@ async fn create_quote(
         None => capacity_tx(&tx, &user.user_id, &time)?.transferable_units,
     };
     require_transfer_tx(&tx, &user.user_id, &recipient, amount, &time)?;
+    let first_recipient:bool=tx.query_row("SELECT NOT EXISTS(SELECT 1 FROM market_wallet_transfers WHERE sender_user_id=?1 AND recipient_user_id=?2)",params![user.user_id,recipient],|r|r.get(0)).map_err(db_error("check first recipient"))?;
+    let hint = format!(
+        "{}***{}",
+        recipient.chars().take(2).collect::<String>(),
+        recipient
+            .chars()
+            .rev()
+            .take(2)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<String>()
+    );
     let quote = Quote {
+        recipient_hint: hint,
+        first_recipient,
         id: Uuid::new_v4().to_string(),
         sender: user.user_id,
         recipient,
@@ -292,8 +315,8 @@ async fn create_quote(
         amount_units: amount,
         expires_at: (at + Duration::minutes(15)).to_rfc3339(),
     };
-    tx.execute("INSERT INTO market_wallet_transfer_quotes (id, sender_user_id, recipient_user_id, sender_email, recipient_email, amount_units, expires_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![quote.id, quote.sender, quote.recipient, quote.sender_email, quote.recipient_email, quote.amount_units, quote.expires_at, time]).map_err(db_error("save transfer quote"))?;
+    tx.execute("INSERT INTO market_wallet_transfer_quotes (id, sender_user_id, recipient_user_id, sender_email, recipient_email, amount_units, expires_at, created_at, recipient_hint, first_recipient) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![quote.id, quote.sender, quote.recipient, quote.sender_email, quote.recipient_email, quote.amount_units, quote.expires_at, time,quote.recipient_hint,quote.first_recipient]).map_err(db_error("save transfer quote"))?;
     tx.commit().map_err(db_error("commit transfer quote"))?;
     Ok((no_store(), Json(quote)))
 }
@@ -536,7 +559,7 @@ pub(crate) fn verified_transfer_for_test(
         params![quote,sender,recipient,require_user_tx(conn,sender)?,require_user_tx(conn,recipient)?,amount,expiry,at]).unwrap();
     confirm_tx(
         conn,
-        &crate::market_finance_auth::test_session(sender),
+        &crate::market_finance_auth::test_session(conn, sender),
         sender,
         &Uuid::new_v4().to_string(),
         &ConfirmRequest { quote_id: quote },
@@ -549,7 +572,7 @@ pub(crate) fn verified_transfer_for_test(
 mod tests {
     use super::*;
     const AT: &str = "2026-10-01T00:01:00Z";
-    fn fixture() -> (Connection, crate::models::AuthSession) {
+    pub(super) fn fixture() -> (Connection, crate::models::AuthSession) {
         let conn = crate::test_support::database().unwrap();
         for (id, email) in [
             ("sender", "sender@example.test"),
@@ -566,9 +589,12 @@ mod tests {
             "2026-10-01T00:00:00Z",
         )
         .unwrap();
-        (conn, crate::market_finance_auth::test_session("sender"))
+        {
+            let session = crate::market_finance_auth::test_session(&conn, "sender");
+            (conn, session)
+        }
     }
-    fn quoted(conn: &Connection, amount: i64, id: &str) -> ConfirmRequest {
+    pub(super) fn quoted(conn: &Connection, amount: i64, id: &str) -> ConfirmRequest {
         conn.execute("INSERT INTO market_wallet_transfer_quotes(id,sender_user_id,recipient_user_id,sender_email,recipient_email,amount_units,expires_at,created_at) VALUES(?1,'sender','recipient','sender@example.test','recipient@example.test',?2,'2026-10-01T00:15:00Z','2026-10-01T00:00:00Z')",params![id,amount]).unwrap();
         ConfirmRequest {
             quote_id: id.into(),
@@ -657,7 +683,7 @@ mod tests {
         assert!(
             confirm_tx(
                 &conn,
-                &crate::market_finance_auth::test_session("recipient"),
+                &crate::market_finance_auth::test_session(&conn, "recipient"),
                 "sender",
                 "key-1",
                 &input,
@@ -672,7 +698,7 @@ mod tests {
         assert!(
             commit(
                 &conn,
-                &crate::market_finance_auth::test_session("sender"),
+                &crate::market_finance_auth::test_session(&conn, "sender"),
                 "key-1",
                 &input,
                 "2026-10-01T00:15:00Z"

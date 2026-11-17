@@ -13699,6 +13699,7 @@ mod tests {
     fn session(user_id: &str, email: &str) -> AuthSession {
         let now = Utc::now();
         AuthSession {
+            financial_proof_id: None,
             session_id: format!("session-{user_id}"),
             user_id: user_id.to_string(),
             email: email.to_ascii_lowercase(),

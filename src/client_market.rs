@@ -9897,6 +9897,7 @@ mod tests {
     fn market_session(user_id: &str, email: &str) -> crate::models::AuthSession {
         let now = Utc::now();
         crate::models::AuthSession {
+            financial_proof_id: None,
             session_id: format!("session-{user_id}"),
             user_id: user_id.to_string(),
             email: email.to_string(),

@@ -1498,7 +1498,7 @@ fn session_authorized_seller_release_is_owned_acknowledged_and_idempotent() {
     let c = fixture();
     offer(&c);
     let o = paid(&c, &order(&c, 1000));
-    let auth = crate::market_finance_auth::test_session("seller");
+    let auth = crate::market_finance_auth::test_session(&c, "seller");
     let mut a = http::ReleaseInput {
         expected_version: o.version,
         acknowledge_received: false,
@@ -1513,7 +1513,7 @@ fn session_authorized_seller_release_is_owned_acknowledged_and_idempotent() {
     assert!(
         transaction(&c, |c| http::release_authorized_tx(
             c,
-            &crate::market_finance_auth::test_session("buyer"),
+            &crate::market_finance_auth::test_session(&c, "buyer"),
             "buyer",
             &o.id,
             &a,
@@ -1734,7 +1734,7 @@ fn history_pages_and_audit_cursor_reach_orders_beyond_the_first_two_hundred() {
     let c = fixture();
     offer(&c);
     for i in 0..205 {
-        let time = (at(AT).unwrap() + Duration::hours(i)).to_rfc3339();
+        let time = (at(AT).unwrap() + Duration::days(i)).to_rfc3339();
         transaction(&c, |c| {
             let q = quote_tx(
                 c,
@@ -1870,7 +1870,16 @@ fn evidence_history_pages_are_complete_and_cannot_cross_order_boundaries() {
     let c = fixture();
     offer(&c);
     let o = order(&c, 1000);
-    let other = order(&c, 1000);
+    let q = preview(&c, "other", 1000);
+    let other = create_tx(
+        &c,
+        "other",
+        &input(&q),
+        "other-history-order",
+        "127.0.0.2",
+        AT,
+    )
+    .unwrap();
     for i in 0..55 {
         event_tx(&c, &o, "buyer", "note", &format!("Evidence {i}"), AT).unwrap();
     }
@@ -1893,87 +1902,130 @@ fn unfinished_order_and_creation_limits_cannot_be_evaded_with_new_previews() {
     let c = fixture();
     offer(&c);
     let a = order(&c, 1000);
-    let b = order(&c, 1000);
     let q = preview(&c, "buyer", 100);
     assert_eq!(
-        create_tx(
-            &c,
-            "buyer",
-            &input(&q),
-            "third-active-order",
-            "127.0.0.1",
-            AT
-        )
-        .unwrap_err()
-        .code(),
+        create_tx(&c, "buyer", &input(&q), "second-active", "127.0.0.1", AT)
+            .unwrap_err()
+            .code(),
         Some("C2C_ORDER_LIMIT")
     );
     cancel_tx(&c, &a, "buyer", false, AT).unwrap();
-    cancel_tx(&c, &b, "buyer", false, AT).unwrap();
-    for i in 2..10 {
+    for i in 1..3 {
         let q = preview(&c, "buyer", 100);
         let o = create_tx(
             &c,
             "buyer",
             &input(&q),
-            &format!("bounded-create-{i}"),
+            &format!("unpaid-{i}"),
             "127.0.0.1",
             AT,
         )
         .unwrap();
         cancel_tx(&c, &o, "buyer", false, AT).unwrap();
     }
+    assert_eq!(
+        preview_result(&c).unwrap_err().code(),
+        Some("C2C_BUYER_RESTRICTED")
+    );
+    assert_eq!(wallet_snapshot_tx(&c, "seller").unwrap().held_units, 0);
+    let tomorrow = (at(AT).unwrap() + Duration::hours(25)).to_rfc3339();
+    quote_tx(
+        &c,
+        "buyer",
+        &QuoteInput {
+            seller_id: "seller".into(),
+            amount_minor: 100,
+        },
+        &tomorrow,
+    )
+    .unwrap();
+}
+#[test]
+fn creation_rate_limits_still_bound_distinct_buyers_and_successful_orders() {
+    let c = fixture();
+    offer(&c);
+    for i in 0..10 {
+        let user = format!("rate-buyer-{i}");
+        c.execute("INSERT INTO users(id,email_normalized,status,email_verified_at,created_at,last_login_at) VALUES(?1,?2,'active',?3,?3,?3)",params![user,format!("{user}@example.test"),AT]).unwrap();
+        let q = preview(&c, &user, 100);
+        let o = create_tx(
+            &c,
+            &user,
+            &input(&q),
+            &format!("ip-rate-{i}"),
+            "127.0.0.5",
+            AT,
+        )
+        .unwrap();
+        cancel_tx(&c, &o, &user, false, AT).unwrap();
+    }
     let q = preview(&c, "other", 100);
     assert!(matches!(
-        create_tx(
-            &c,
-            "other",
-            &input(&q),
-            "same-ip-eleventh-order",
-            "127.0.0.1",
-            AT
-        ),
+        create_tx(&c, "other", &input(&q), "ip-eleventh", "127.0.0.5", AT),
         Err(AppError::TooManyRequests(_))
     ));
+    let c = fixture();
+    offer(&c);
+    for _ in 0..10 {
+        let o = paid(&c, &order(&c, 100));
+        release_tx(&c, &o, "seller", AT).unwrap();
+    }
     let q = preview(&c, "buyer", 100);
     assert!(matches!(
-        create_tx(&c, "buyer", &input(&q), "same-user-new-ip", "127.0.0.2", AT),
+        create_tx(&c, "buyer", &input(&q), "user-eleventh", "127.0.0.2", AT),
         Err(AppError::TooManyRequests(_))
     ));
-    assert_eq!(wallet_snapshot_tx(&c, "seller").unwrap().held_units, 0);
-    assert_eq!(
-        wallet_snapshot_tx(&c, "seller").unwrap().posted_units,
-        units_from_minor(20000).unwrap()
-    );
 }
-
 #[test]
 fn first_purchase_and_shared_ip_active_caps_are_enforced_before_reservation() {
     let c = fixture();
     offer(&c);
-    let q = preview(&c, "buyer", 10001);
     assert_eq!(
-        create_tx(
+        quote_tx(
             &c,
             "buyer",
-            &input(&q),
-            "first-purchase-limit",
-            "127.0.0.1",
+            &QuoteInput {
+                seller_id: "seller".into(),
+                amount_minor: 10001
+            },
             AT
         )
         .unwrap_err()
         .code(),
-        Some("C2C_FIRST_ORDER_LIMIT")
+        Some("C2C_STOCK")
     );
+    assert_eq!(wallet_snapshot_tx(&c, "seller").unwrap().held_units, 0);
+    for seller in ["other", "owner"] {
+        crate::market_wallet::credit_verified_topup_tx(
+            &c,
+            seller,
+            &format!("fixture-{seller}"),
+            20000,
+            "receipt",
+            AT,
+        )
+        .unwrap();
+        save_seller_tx(&c, seller, &terms(), AT).unwrap();
+    }
     for i in 0..7 {
         let user = format!("buyer-{i}");
         c.execute("INSERT INTO users(id,email_normalized,status,email_verified_at,created_at,last_login_at) VALUES(?1,?2,'active',?3,?3,?3)",params![user,format!("{user}@example.test"),AT]).unwrap();
-        let q = preview(&c, &user, 100);
+        let seller = ["seller", "other", "owner"][i % 3];
+        let q = quote_tx(
+            &c,
+            &user,
+            &QuoteInput {
+                seller_id: seller.into(),
+                amount_minor: 100,
+            },
+            AT,
+        )
+        .unwrap();
         let result = create_tx(
             &c,
             &user,
             &input(&q),
-            &format!("ip-active-cap-{i}"),
+            &format!("ip-active-{i}"),
             "127.0.0.2",
             AT,
         );
@@ -1983,10 +2035,11 @@ fn first_purchase_and_shared_ip_active_caps_are_enforced_before_reservation() {
             assert_eq!(result.unwrap_err().code(), Some("C2C_ORDER_LIMIT"));
         }
     }
-    assert_eq!(
-        wallet_snapshot_tx(&c, "seller").unwrap().held_units,
-        units_from_minor(600).unwrap()
-    );
+    let total: i64 = ["seller", "other", "owner"]
+        .into_iter()
+        .map(|u| wallet_snapshot_tx(&c, u).unwrap().held_units)
+        .sum();
+    assert_eq!(total, units_from_minor(600).unwrap());
 }
 
 #[test]
@@ -1994,7 +2047,7 @@ fn expired_sessions_wrong_actors_and_stale_versions_never_release() {
     let c = fixture();
     offer(&c);
     let o = paid(&c, &order(&c, 1000));
-    let mut auth = crate::market_finance_auth::test_session("seller");
+    let mut auth = crate::market_finance_auth::test_session(&c, "seller");
     let a = http::ReleaseInput {
         expected_version: o.version,
         acknowledge_received: true,
@@ -2011,7 +2064,7 @@ fn expired_sessions_wrong_actors_and_stale_versions_never_release() {
     assert!(
         transaction(&c, |c| http::release_authorized_tx(
             c,
-            &crate::market_finance_auth::test_session("other"),
+            &crate::market_finance_auth::test_session(&c, "other"),
             "seller",
             &o.id,
             &a,
@@ -2019,7 +2072,7 @@ fn expired_sessions_wrong_actors_and_stale_versions_never_release() {
         ))
         .is_err()
     );
-    let auth = crate::market_finance_auth::test_session("seller");
+    let auth = crate::market_finance_auth::test_session(&c, "seller");
     dispute_tx(
         &c,
         &o,
@@ -2093,5 +2146,144 @@ fn wallet_history_links_reservations_returns_and_both_delivery_sides_to_the_orde
             .as_array()
             .unwrap()
             .is_empty()
+    );
+}
+
+#[test]
+fn unpaid_cooldown_lasts_a_full_day_after_the_qualifying_strike() {
+    let c = crate::test_support::database().unwrap();
+    let actor = crate::market_finance_auth::test_session(&c, "cooldown-buyer");
+    for (order, time) in [
+        ("first", "2026-10-01T00:00:00Z"),
+        ("second", "2026-10-01T12:00:00Z"),
+        ("third", "2026-10-01T23:00:00Z"),
+    ] {
+        c.execute("INSERT INTO market_financial_risk_events(id,kind,subject_id,object_id,details_json,created_at) VALUES(?1,'c2c_unpaid',?2,?1,'{}',?3)",params![order,actor.user_id,time]).unwrap();
+    }
+    let during = risk::buyer_limits_tx(&c, &actor.user_id, "2026-10-02T12:30:00Z").unwrap();
+    assert_eq!(
+        at(during.blocked_until.as_deref().unwrap()).unwrap(),
+        at("2026-10-02T23:00:00Z").unwrap()
+    );
+    assert!(risk::admission_tx(&c, &actor.user_id, "seller", 100, "2026-10-02T12:30:00Z").is_err());
+    assert!(
+        risk::buyer_limits_tx(&c, &actor.user_id, "2026-10-02T23:00:00Z")
+            .unwrap()
+            .blocked_until
+            .is_none()
+    );
+}
+
+#[test]
+fn nonreceipt_deadline_never_returns_a_paid_buyers_credit_and_corrections_preserve_evidence() {
+    let c = fixture();
+    offer(&c);
+    let o = paid(&c, &order(&c, 1000));
+    let o = transaction(&c, |c| {
+        risk::nonreceipt_tx(
+            c,
+            &o,
+            "seller",
+            o.version,
+            "No matching receipt in bank account",
+            AT,
+        )
+    })
+    .unwrap();
+    assert_eq!(o.status, "disputed");
+    let later = (at(AT).unwrap() + Duration::hours(25)).to_rfc3339();
+    tick_tx(&c, &later).unwrap();
+    assert_eq!(order_tx(&c, &o.id).unwrap().status, "disputed");
+    assert_eq!(
+        wallet_snapshot_tx(&c, "seller").unwrap().held_units,
+        units_from_minor(1000).unwrap()
+    );
+    assert_eq!(
+        seller_tx(&c, "seller").unwrap().unwrap().auto_pause_reason,
+        None
+    );
+    risk::evidence_tx(
+        &c,
+        &o,
+        "buyer",
+        "Bank receipt supplied after the deadline",
+        &later,
+    )
+    .unwrap();
+    let o = transaction(&c, |c| {
+        resolve_tx(
+            c,
+            &o,
+            "owner",
+            o.version,
+            "verified_false_payment",
+            "Independently checked bank statement: receipt was fabricated",
+            true,
+            &later,
+        )
+    })
+    .unwrap();
+    assert_eq!(o.status, "cancelled");
+    assert!(
+        risk::buyer_limits_tx(&c, "buyer", &later)
+            .unwrap()
+            .suspended
+    );
+    let decision = risk::restriction_tx(&c, &o.id).unwrap().unwrap()["decisionId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let buyer = crate::market_finance_auth::test_session(&c, "buyer");
+    assert!(
+        risk::clear_restriction_tx(
+            &c,
+            &o,
+            &buyer,
+            &decision,
+            "Cannot self clear a decision",
+            true,
+            &later
+        )
+        .is_err()
+    );
+    let owner = crate::market_finance_auth::test_session(&c, "owner");
+    let corrected = transaction(&c, |c| {
+        risk::clear_restriction_tx(
+            c,
+            &o,
+            &owner,
+            &decision,
+            "Bank corrected its earlier statement; restriction was mistaken",
+            true,
+            &later,
+        )
+    })
+    .unwrap();
+    assert!(!corrected["clearedAt"].is_null());
+    transaction(&c, |c| {
+        risk::clear_restriction_tx(
+            c,
+            &o,
+            &owner,
+            &decision,
+            "Bank corrected its earlier statement; restriction was mistaken",
+            true,
+            &later,
+        )
+    })
+    .unwrap();
+    assert!(
+        !risk::buyer_limits_tx(&c, "buyer", &later)
+            .unwrap()
+            .suspended
+    );
+    assert_eq!(c.query_row("SELECT COUNT(*) FROM market_financial_risk_events WHERE kind='c2c_false_payment_cleared'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    assert!(evidence_valid_tx(&c, &o.id).unwrap());
+    assert!(
+        c.execute(
+            "DELETE FROM market_financial_risk_events WHERE id=?1",
+            params![decision]
+        )
+        .is_err()
     );
 }

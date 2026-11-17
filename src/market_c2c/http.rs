@@ -33,12 +33,14 @@ async fn session(
 }
 async fn write<T>(
     state: &ServerState,
+    actor: &crate::models::AuthSession,
     f: impl FnOnce(&Connection) -> Result<T, AppError>,
 ) -> Result<T, AppError> {
     let conn = state.store.conn.lock().await;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin C2C write"))?;
+    crate::market_finance_auth::require_live_session_tx(&tx, actor, &crate::market_wallet::now())?;
     let value = f(&tx)?;
     tx.commit().map_err(db_error("commit C2C write"))?;
     Ok(value)
@@ -62,6 +64,14 @@ pub fn router() -> Router<ServerState> {
         .route("/v1/market-wallet/c2c/orders/:id/reject", post(reject))
         .route("/v1/market-wallet/c2c/orders/:id/cancel", post(cancel))
         .route("/v1/market-wallet/c2c/orders/:id/dispute", post(dispute))
+        .route(
+            "/v1/market-wallet/c2c/orders/:id/nonreceipt",
+            post(nonreceipt),
+        )
+        .route(
+            "/v1/market-wallet/c2c/orders/:id/payment-evidence",
+            post(payment_evidence),
+        )
         .route("/v1/market-wallet/c2c/orders/:id/late-payment", post(late))
         .route("/v1/market-wallet/c2c/orders/:id/notes", post(note))
         .route("/v1/market-wallet/c2c/orders/:id/events", get(events))
@@ -79,6 +89,10 @@ pub fn router() -> Router<ServerState> {
         .route(
             "/v1/admin/market-finance/c2c/orders/:id/resolve",
             post(resolve),
+        )
+        .route(
+            "/v1/admin/market-finance/c2c/orders/:id/clear-buyer-restriction",
+            post(clear_buyer_restriction),
         )
         .route("/v1/admin/market-finance/c2c/sellers", get(admin_sellers))
         .route(
@@ -104,6 +118,7 @@ async fn policy(State(state): State<ServerState>, headers: HeaderMap) -> Reply<s
         serde_json::json!({"policy":policy_tx(&conn)?,"available":blockers.is_empty(),"blockers":blockers,
         "canManagePolicy":crate::api::is_finance_owner(&state.config,&u.email),
         "verified":verified,"termsVersion":TERMS_VERSION,"claimGraceSeconds":120,"firstPurchaseMaxMinor":10000,
+        "buyerLimits":risk::buyer_limits_tx(&conn,&u.user_id,&crate::market_wallet::now())?,
         "independentDisputeHandlerAvailable":independent_handler_tx(&conn,&admins,state.config.router_owner_email.as_deref())?}),
     ))
 }
@@ -149,7 +164,7 @@ async fn save_seller(
 ) -> Reply<Seller> {
     let u = crate::market_finance_auth::write_session(&state, &headers).await?;
     Ok(reply(
-        write(&state, |conn| {
+        write(&state, &u, |conn| {
             save_seller_tx(conn, &u.user_id, &input, &crate::market_wallet::now())
         })
         .await?,
@@ -170,7 +185,7 @@ async fn pause_seller(
 ) -> Reply<Seller> {
     let u = crate::market_finance_auth::write_session(&state, &headers).await?;
     Ok(reply(
-        write(&state, |conn| {
+        write(&state, &u, |conn| {
             pause_seller_tx(
                 conn,
                 &u.user_id,
@@ -188,7 +203,7 @@ async fn resume_seller(
 ) -> Reply<Seller> {
     let u = crate::market_finance_auth::write_session(&state, &headers).await?;
     Ok(reply(
-        write(&state, |c| {
+        write(&state, &u, |c| {
             resume_seller_tx(
                 c,
                 &u.user_id,
@@ -245,7 +260,7 @@ async fn quote(
 ) -> Reply<Quote> {
     let u = crate::market_finance_auth::write_session(&state, &headers).await?;
     Ok(reply(
-        write(&state, |conn| {
+        write(&state, &u, |conn| {
             quote_tx(conn, &u.user_id, &input, &crate::market_wallet::now())
         })
         .await?,
@@ -267,7 +282,7 @@ async fn create(
         .unwrap_or_else(|| peer.ip().to_string());
     // A successful replay remains available after finance was paused.
     Ok(reply(
-        write(&state, |conn| {
+        write(&state, &u, |conn| {
             create_tx(
                 conn,
                 &u.user_id,
@@ -363,7 +378,7 @@ async fn accept(
 ) -> Reply<Order> {
     let u = crate::market_finance_auth::write_session(&state, &headers).await?;
     Ok(reply(
-        write(&state, |c| {
+        write(&state, &u, |c| {
             let o = owned_tx(c, &id, &u.user_id)?;
             accept_tx(
                 c,
@@ -384,7 +399,7 @@ async fn reject(
 ) -> Reply<Order> {
     let u = crate::market_finance_auth::write_session(&state, &headers).await?;
     Ok(reply(
-        write(&state, |c| {
+        write(&state, &u, |c| {
             let o = owned_tx(c, &id, &u.user_id)?;
             if o.seller_id != u.user_id {
                 return Err(AppError::Forbidden(
@@ -411,7 +426,7 @@ async fn paid(
 ) -> Reply<Order> {
     let u = crate::market_finance_auth::write_session(&state, &headers).await?;
     Ok(reply(
-        write(&state, |c| {
+        write(&state, &u, |c| {
             let o = owned_tx(c, &id, &u.user_id)?;
             mark_paid_tx(
                 c,
@@ -432,7 +447,7 @@ async fn cancel(
 ) -> Reply<Order> {
     let u = crate::market_finance_auth::write_session(&state, &headers).await?;
     Ok(reply(
-        write(&state, |c| {
+        write(&state, &u, |c| {
             let o = owned_tx(c, &id, &u.user_id)?;
             if u.user_id != o.buyer_id || !a.acknowledge_unpaid {
                 return Err(AppError::Forbidden(
@@ -455,7 +470,7 @@ async fn dispute(
 ) -> Reply<Order> {
     let u = crate::market_finance_auth::write_session(&state, &headers).await?;
     Ok(reply(
-        write(&state, |c| {
+        write(&state, &u, |c| {
             let o = owned_tx(c, &id, &u.user_id)?;
             current(&o, &a)?;
             dispute_tx(c, &o, &u.user_id, &a.note, &crate::market_wallet::now())
@@ -471,7 +486,7 @@ async fn late(
 ) -> Reply<Order> {
     let u = crate::market_finance_auth::write_session(&state, &headers).await?;
     Ok(reply(
-        write(&state, |c| {
+        write(&state, &u, |c| {
             let o = owned_tx(c, &id, &u.user_id)?;
             current(&o, &a)?;
             late_payment_tx(c, &o, &u.user_id, &a.note, &crate::market_wallet::now())
@@ -486,7 +501,7 @@ async fn note(
     Json(a): Json<Action>,
 ) -> Reply<Order> {
     let u = crate::market_finance_auth::write_session(&state, &headers).await?;
-    Ok(reply(write(&state,|c| {
+    Ok(reply(write(&state, &u,|c| {
         let o=owned_tx(c,&id,&u.user_id)?;current(&o,&a)?;
         let time=crate::market_wallet::now();
         let count:i64=c.query_row("SELECT COUNT(*) FROM market_c2c_events WHERE actor_id=?1 AND action='note' AND julianday(created_at)>=julianday(?2)-1.0/24",params![u.user_id,time],|r|r.get(0)).map_err(db_error("limit C2C notes"))?;
@@ -601,7 +616,7 @@ async fn release(
 ) -> Reply<Order> {
     let u = crate::market_finance_auth::write_session(&state, &headers).await?;
     Ok(reply(
-        write(&state, |c| {
+        write(&state, &u, |c| {
             release_authorized_tx(c, &u, &u.user_id, &id, &a, &crate::market_wallet::now())
         })
         .await?,
@@ -673,7 +688,7 @@ async fn save_handler(
             "grant only to another existing administrator".into(),
         ));
     }
-    write(&state, |c| {
+    write(&state, &u, |c| {
         let user: String = c
             .query_row(
                 "SELECT id FROM users WHERE email_normalized=?1",
@@ -702,7 +717,7 @@ async fn save_policy(
 ) -> Reply<Policy> {
     let u = crate::market_finance_auth::write_owner_session(&state, &headers).await?;
     Ok(reply(
-        write(&state, |c| {
+        write(&state, &u, |c| {
             save_policy_tx(c, &u.user_id, &p, &crate::market_wallet::now())
         })
         .await?,
@@ -730,7 +745,7 @@ async fn admin_detail(
         && u.user_id != o.buyer_id
         && u.user_id != o.seller_id;
     Ok(reply(
-        serde_json::json!({"order":o,"events":events_tx(&c,&id,"")?,"evidenceValid":evidence_valid_tx(&c,&id)?,"canResolve":can_resolve}),
+        serde_json::json!({"order":o,"events":events_tx(&c,&id,"")?,"evidenceValid":evidence_valid_tx(&c,&id)?,"canResolve":can_resolve,"buyerRestriction":risk::restriction_tx(&c,&id)?}),
     ))
 }
 async fn admin_events(
@@ -760,7 +775,7 @@ async fn resolve(
 ) -> Reply<Order> {
     let u = crate::market_finance_auth::write_admin_session(&state, &headers).await?;
     Ok(reply(
-        write(&state, |c| {
+        write(&state, &u, |c| {
             if !crate::api::is_finance_owner(&state.config, &u.email)
                 && !dispute_handler_tx(c, &u.user_id)?
             {
@@ -815,7 +830,7 @@ async fn suspend(
     Json(a): Json<Suspension>,
 ) -> Reply<serde_json::Value> {
     let u = crate::market_finance_auth::write_owner_session(&state, &headers).await?;
-    write(&state,|c| {
+    write(&state, &u,|c| {
         let reason=text(&a.reason,500)?;
         let count=c.execute("UPDATE market_c2c_sellers SET suspended=?3,enabled=0,auto_pause_reason=NULL,auto_paused_at=NULL,auto_pause_order_id=NULL,version=version+1,updated_at=?4 WHERE user_id=?1 AND version=?2",params![id,a.expected_version,a.suspended,crate::market_wallet::now()]).map_err(db_error("suspend C2C seller"))?;
         if count!=1{return Err(problem("C2C_STALE","seller changed; reload"));}
@@ -857,4 +872,86 @@ mod tests {
         );
         assert!(at(response.headers()["x-router-server-time"].to_str().unwrap()).is_ok());
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PaymentReviewInput {
+    expected_version: i64,
+    note: String,
+}
+async fn nonreceipt(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<PaymentReviewInput>,
+) -> Reply<Order> {
+    let u = crate::market_finance_auth::write_session(&state, &headers).await?;
+    Ok(reply(
+        write(&state, &u, |c| {
+            let o = owned_tx(c, &id, &u.user_id)?;
+            risk::nonreceipt_tx(
+                c,
+                &o,
+                &u.user_id,
+                input.expected_version,
+                &input.note,
+                &crate::market_wallet::now(),
+            )
+        })
+        .await?,
+    ))
+}
+async fn payment_evidence(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<PaymentReviewInput>,
+) -> Reply<Order> {
+    let u = crate::market_finance_auth::write_session(&state, &headers).await?;
+    Ok(reply(
+        write(&state, &u, |c| {
+            let o = owned_tx(c, &id, &u.user_id)?;
+            risk::evidence_tx(c, &o, &u.user_id, &input.note, &crate::market_wallet::now())
+        })
+        .await?,
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RestrictionCorrection {
+    decision_id: String,
+    evidence: String,
+    attest_external_evidence: bool,
+}
+async fn clear_buyer_restriction(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<RestrictionCorrection>,
+) -> Reply<serde_json::Value> {
+    let actor = crate::market_finance_auth::write_admin_session(&state, &headers).await?;
+    Ok(reply(
+        write(&state, &actor, |conn| {
+            if !crate::api::is_finance_owner(&state.config, &actor.email)
+                && !dispute_handler_tx(conn, &actor.user_id)?
+            {
+                return Err(AppError::Forbidden(
+                    "independent C2C dispute-handler authorization required".into(),
+                ));
+            }
+            let order = order_tx(conn, &id)?;
+            risk::clear_restriction_tx(
+                conn,
+                &order,
+                &actor,
+                &input.decision_id,
+                &input.evidence,
+                input.attest_external_evidence,
+                &crate::market_wallet::now(),
+            )
+        })
+        .await?,
+    ))
 }

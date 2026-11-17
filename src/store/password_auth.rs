@@ -362,6 +362,7 @@ fn issue_session(
     let access_token = generate_secret(48);
     let refresh_token = generate_secret(64);
     let session = AuthSession {
+        financial_proof_id: None,
         session_id: Uuid::new_v4().to_string(),
         user_id: user.id.clone(),
         email: user.email.clone(),

@@ -621,7 +621,7 @@ async fn resolve_dispute(
     Path(id): Path<String>,
     Json(request): Json<ResolveRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let session = crate::api::require_admin_session(&state, &headers).await?;
+    let session = crate::market_finance_auth::write_admin_session(&state, &headers).await?;
     // Admins handle routine disputes; larger refunds move Owner money.
     if request.refund_amount_minor > OWNER_DISPUTE_REFUND_MINOR
         && !crate::api::is_finance_owner(&state.config, &session.email)
@@ -639,6 +639,11 @@ async fn resolve_dispute(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin service dispute resolution"))?;
+    crate::market_finance_auth::require_live_session_tx(
+        &tx,
+        &session,
+        &crate::market_wallet::now(),
+    )?;
     let result = resolve_dispute_tx(
         &tx,
         &id,

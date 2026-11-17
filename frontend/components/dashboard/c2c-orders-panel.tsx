@@ -19,7 +19,7 @@ import { messages, type MessageKey } from "@/lib/i18n";
 export function C2CEvents({ items }: { items: C2CEvent[] }) {
   const { t, locale } = useLocaleText();
   return <ul className="grid min-w-0 gap-3">
-    {items.map(e => { const key = `c2c.action.${e.action}` as MessageKey; return <li key={e.id} className="grid min-w-0 gap-1 text-xs"><span className="flex min-w-0 flex-wrap justify-between gap-2"><span>{key in messages.en ? t(key) : e.action}</span><time className="text-muted-foreground">{new Date(e.createdAt).toLocaleString(locale)}</time></span>{["note", "disputed", "late_payment_reported", "release", "return_to_seller", "record_external_resolution"].includes(e.action) && e.note ? <p className="whitespace-pre-wrap break-words text-muted-foreground [overflow-wrap:anywhere]">{e.note}</p> : null}</li>; })}
+    {items.map(e => { const key = `c2c.action.${e.action}` as MessageKey; return <li key={e.id} className="grid min-w-0 gap-1 text-xs"><span className="flex min-w-0 flex-wrap justify-between gap-2"><span>{key in messages.en ? t(key) : e.action}</span><time className="text-muted-foreground">{new Date(e.createdAt).toLocaleString(locale)}</time></span>{["note", "disputed", "late_payment_reported", "release", "return_to_seller", "record_external_resolution", "nonreceipt_reported", "payment_evidence_submitted", "verified_false_payment"].includes(e.action) && e.note ? <p className="whitespace-pre-wrap break-words text-muted-foreground [overflow-wrap:anywhere]">{e.note}</p> : null}</li>; })}
   </ul>;
 }
 export type C2CView = "buy" | "sell" | "orders";
@@ -258,6 +258,8 @@ function C2COrderDialog({ actor, id, onClose, onChanged }: { actor: string; id: 
       <div className="grid min-w-0 gap-1">
         <div className="flex flex-wrap items-center justify-between gap-3"><p className="text-2xl font-semibold tabular-nums">{formatWalletUnits(o.amountUnits)}</p><C2CStatusLabel status={o.status} /></div>
         <p className="break-all font-mono text-xs text-slate-600">{t("c2c.id")}: {o.id}</p>
+        {o.paymentReference ? <div className="grid gap-1 text-sm"><p>{t("c2c.paymentReference")}: <code className="select-all break-all">{o.paymentReference}</code></p><p className="text-xs text-muted-foreground">{t("c2c.paymentReferenceHelp")}</p></div> : null}
+        {o.paymentReview && !o.paymentReview.resolvedAt ? <p role="status" className="text-sm">{o.paymentReview.escalatedAt ? t("c2c.reviewEscalated") : t("c2c.reviewDeadline", { time: new Date(o.paymentReview.evidenceDueAt).toLocaleString(locale) })}</p> : null}
       </div>
       <dl className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-3 rounded-xl bg-muted/60 p-3 text-sm"><dt className="min-w-0 [overflow-wrap:anywhere]">{o.sellerName}</dt><dd className="font-semibold tabular-nums">{c2cPayLabel(o.payMinor, o.currency)}</dd></dl>
       {o.status === "awaiting_seller" ? <div className="grid gap-1 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
@@ -282,7 +284,10 @@ function C2COrderDialog({ actor, id, onClose, onChanged }: { actor: string; id: 
       {o.status === "awaiting_seller" && buyer ? <details className="group"><summary className="flex min-h-11 cursor-pointer list-none items-center gap-1.5 text-sm focus-visible:outline-2 focus-visible:outline-ring [&::-webkit-details-marker]:hidden"><ChevronDown className="size-4 text-muted-foreground transition-transform group-open:rotate-180 motion-reduce:transition-none" aria-hidden="true" />{t("c2c.earlyPayment")}</summary><div className="grid gap-2"><p className="text-sm text-muted-foreground">{t("c2c.earlyPaymentHelp")}</p>{noteField()}<C2CAction type="button" secondary className="justify-self-start" disabled={busy || !note.trim()} onClick={() => void run(() => actC2C(o, "late-payment", note))}>{t("c2c.reportEarlyPayment")}</C2CAction></div></details> : null}
       {(held || (closed && (buyer || o.latePaymentReported))) ? <div className="grid gap-2">
         {noteField(closed ? t("c2c.lateHint") : undefined)}
-        <div className="flex flex-wrap gap-2">{o.status === "paid" ? <C2CAction type="button" secondary disabled={!note.trim() || busy} onClick={() => void run(() => actC2C(o, "dispute", note))}>{t("c2c.dispute")}</C2CAction> : null}
+        <div className="flex flex-wrap gap-2">
+          {!buyer && held && !o.paymentReview ? <C2CAction type="button" secondary disabled={!note.trim() || busy} onClick={() => void run(() => actC2C(o, "nonreceipt", note))}>{t("c2c.nonreceipt")}</C2CAction> : null}
+          {buyer && o.paymentReview && !o.paymentReview.resolvedAt ? <C2CAction type="button" secondary disabled={!note.trim() || busy} onClick={() => void run(() => actC2C(o, "payment-evidence", note))}>{t("c2c.submitEvidence")}</C2CAction> : null}
+          {o.status === "paid" ? <C2CAction type="button" secondary disabled={!note.trim() || busy} onClick={() => void run(() => actC2C(o, "dispute", note))}>{t("c2c.dispute")}</C2CAction> : null}
           {buyer && closed && !o.latePaymentReported ? <C2CAction type="button" secondary disabled={!note.trim() || busy} onClick={() => void run(() => actC2C(o, "late-payment", note))}>{t("c2c.late")}</C2CAction> : null}
           {held || o.latePaymentReported ? <C2CAction type="button" secondary disabled={!note.trim() || busy} onClick={() => void run(() => actC2C(o, "notes", note))}>{t("c2c.addNote")}</C2CAction> : null}
         </div>

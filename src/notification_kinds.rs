@@ -144,6 +144,18 @@ const METRIC_FLAP_SECS: i64 = 15 * 60;
 /// health (`clock_health.rs`), plus market Owner signals
 /// (`market_notifications.rs`) and client-presence signals (`store.rs`).
 pub const KINDS: &[NoticeKind] = &[
+    action(
+        "market_topup_risk_circuit",
+        NO_FLAP,
+        "Top-up safety circuit opened",
+        "充值安全熔断已触发",
+        "Top-up credit velocity exceeded the configured aggregate limit. Review pending payments before resuming.",
+        "充值到账总额超过聚合限额。恢复前请核对待处理付款。",
+        Some(
+            "Review payment evidence and risk limits, then explicitly close the circuit in wallet settings.",
+        ),
+        Some("核对付款证据及风控限额，再在钱包设置中手动解除熔断。"),
+    ),
     // ---- Metrics: resource pressure. Attention unless sustained; flap a lot.
     attention(
         "fd_pressure",

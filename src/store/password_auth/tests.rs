@@ -19,6 +19,7 @@ async fn seed(store: &AppStore, key: &SigningKey) -> AuthSession {
     let user = upsert_user_by_email(&conn, "buyer@example.test", now).unwrap();
     record_verified_email_user(&conn, &user.id, now).unwrap();
     let session = AuthSession {
+        financial_proof_id: None,
         session_id: "email-session".into(),
         user_id: user.id,
         email: user.email,

@@ -23,7 +23,9 @@ pub(super) fn purpose(item: &Claimed) -> Option<&'static str> {
                         Some("c2c_review")
                     }
                 }
-                "return_to_seller" | "record_external_resolution" => Some("c2c_resolution"),
+                "return_to_seller" | "verified_false_payment" | "record_external_resolution" => {
+                    Some("c2c_resolution")
+                }
                 _ => None,
             }
         }
@@ -40,6 +42,11 @@ pub(super) fn purpose(item: &Claimed) -> Option<&'static str> {
         "topup_reversed" => Some("topup_adjustment"),
         "wallet_transfer_sent" => Some("transfer_sent_receipt"),
         "wallet_transfer_received" => Some("transfer_received_receipt"),
+        "wallet_transfer_return_requested" => Some("transfer_return_request"),
+        "wallet_transfer_return_resolved" => Some("transfer_return_receipt"),
+        "wallet_passkey_registered" => Some("wallet_passkey_registered"),
+        "wallet_passkey_recovery" => Some("wallet_passkey_recovery"),
+        "c2c_buyer_restriction_changed" => Some("c2c_buyer_restriction"),
         "commission_policy_changed" => Some("provider_fee_change"),
         "earnings_held" => Some("provider_hold"),
         "earnings_released" => Some("provider_hold_released"),

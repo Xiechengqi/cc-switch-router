@@ -1,3 +1,4 @@
+import { installFinancialBrowserIdentity } from "./financial-browser-fixture.mjs";
 import assert from "node:assert/strict";
 import { emptyClientRentalsPage } from "./client-rental-fixtures.mjs";
 import { createServer } from "node:http";
@@ -192,6 +193,7 @@ try {
   record = initial({ providerRespondedAt: iso() }); hostPresent = false;
   await goto();
   assert.equal(await page.getByRole("button", { name: /Termination tasks/ }).count(), 0);
+  await installFinancialBrowserIdentity(page);
   await page.goto(`${base}/client-market/?terminationId=old-termination`);
   await loaded(dialog()); await close();
   await page.waitForURL(url => !url.searchParams.has("terminationId"));

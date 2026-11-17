@@ -184,6 +184,8 @@ export function WalletTransferPanel({
       </h3>
       <div className="grid gap-2">
         <p className="break-all text-base font-medium">{quote.recipientEmail}</p>
+        {quote.recipientHint ? <p className="break-all text-sm text-muted-foreground">{t("walletTransfer.recipientHint", { hint: quote.recipientHint })}</p> : null}
+        {quote.firstRecipient ? <p className="text-sm text-muted-foreground">{t("walletTransfer.firstRecipient")}</p> : null}
         <p className="break-all text-3xl font-semibold tabular-nums">
           {formatWalletUnits(quote.amountUnits)}
         </p>

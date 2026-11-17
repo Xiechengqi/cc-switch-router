@@ -1,6 +1,6 @@
 # DujiaoPay 充值单恢复
 
-Router 只把 DujiaoPay 认证查单结果作为付款证据。收银台地址必须是官网当前文档给出的 `https://www.dujiaopay.com/checkout/{token}`；其他域名、路径及跳转参数均不展示。URL 不可用时保留已返回的网关订单 ID，并继续对账，不再产生一个不受追踪的新订单。正常的 `order.created`、`order.method_selected`、`order.confirming` 回调只用于绑定订单和触发查单，不证明付款，也不再误开人工核对单。
+Router 必须认证查询 DujiaoPay，并可按 Owner 策略要求额外独立链上证据；缺失链上应付/实付数量转人工核对。迁移 114–116 的签名、Passkey、聚合限额/熔断与恢复规则见 [钱包安全与异常恢复](market-wallet-security.md)。收银台地址必须是官网当前文档给出的 `https://www.dujiaopay.com/checkout/{token}`；其他域名、路径及跳转参数均不展示。URL 不可用时保留已返回的网关订单 ID，并继续对账，不再产生一个不受追踪的新订单。正常的 `order.created`、`order.method_selected`、`order.confirming` 回调只用于绑定订单和触发查单，不证明付款，也不再误开人工核对单。
 
 真实商户查单已观察到：`awaiting_payment` 和无付款的 `expired` 订单仍可能返回 `paid_source=chain`，同时没有交易号、付款时间、确认数或非零结算金额。因此仅在这些已知未付款阶段且其他付款字段均为空或为零时，把精确的 `chain` 视为支付渠道元数据；`merchant_claim`、其他未知来源及任何独立付款线索仍按付款证据隔离。此前仅由该字段误开的历史人工核对单，只有正常对账/Webhook 的脱敏网关观测摘要能逐条证明一直是同一无款 `chain` 快照、当前认证查单也是安全终态且本地无回执/账本/其他争议时，才自动结案并保留原核对记录；Owner 预览查询不能充当自动结案证据，不满足条件的继续由 Owner 核对。该规则不降低 `paid` 入账所需的链上回执校验。
 

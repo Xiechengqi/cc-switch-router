@@ -14,6 +14,7 @@ pub(super) fn notice_current_tx(
             params![item.recipient_user_id,item.payload.get("digestVersion").and_then(Value::as_i64)],|r|r.get(0))
             .map_err(db_error("recheck service status digest")),
         "c2c_order_updated" | "c2c_seller_changed" => super::c2c_notice_current_tx(conn,item,time),
+        "wallet_transfer_return_requested" => conn.query_row("SELECT EXISTS(SELECT 1 FROM market_transfer_returns r JOIN market_wallet_transfers t ON t.id=r.transfer_id WHERE r.id=?1 AND r.status='requested' AND t.recipient_user_id=?2)",params![field("returnId"),item.recipient_user_id],|r|r.get(0)).map_err(db_error("recheck return request")),
         "topup_credited" => conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM market_topup_orders t JOIN market_completed_topup_evidence e ON e.id=t.id WHERE t.id=?1 AND t.user_id=?2 AND t.status='credited')",
             params![field("orderId"),item.recipient_user_id],|r|r.get(0)).map_err(db_error("recheck top-up receipt")),

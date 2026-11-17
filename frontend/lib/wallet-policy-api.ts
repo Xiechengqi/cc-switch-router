@@ -66,6 +66,8 @@ export function parseTransferCapacity(value: unknown): TransferCapacity {
 }
 
 export type TransferQuote = {
+  recipientHint?: string;
+  firstRecipient?: boolean;
   id: string;
   senderEmail: string;
   recipientEmail: string;

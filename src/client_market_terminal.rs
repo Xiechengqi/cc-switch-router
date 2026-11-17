@@ -723,6 +723,7 @@ mod tests {
     fn session(user_id: &str, email: &str) -> crate::models::AuthSession {
         use chrono::Utc;
         crate::models::AuthSession {
+            financial_proof_id: None,
             session_id: "s".into(),
             user_id: user_id.into(),
             email: email.into(),

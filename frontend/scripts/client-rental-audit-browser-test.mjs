@@ -1,3 +1,4 @@
+import { installFinancialBrowserIdentity } from "./financial-browser-fixture.mjs";
 import assert from "node:assert/strict";
 import { emptyClientRentalsPage } from "./client-rental-fixtures.mjs";
 import { createServer } from "node:http";
@@ -94,7 +95,8 @@ try {
     if (await trigger.getAttribute("aria-expanded") === "false") await trigger.click();
   };
   const goto = async (locale, expand = true) => {
-    await page.goto(`${base}/client-market/?testLocale=${locale || "en"}`);
+    await installFinancialBrowserIdentity(page);
+  await page.goto(`${base}/client-market/?testLocale=${locale || "en"}`);
     if (expand) await openAudit();
   };
   const switchActor = async next => { actor = next; await page.evaluate(() => window.dispatchEvent(new Event("router-auth-changed"))); };

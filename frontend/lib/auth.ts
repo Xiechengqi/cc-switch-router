@@ -1,5 +1,7 @@
 "use client";
 
+import { isFinancialWrite, signedFinancialFetch } from "@/lib/financial-auth";
+
 import type { AuthResult, SessionStatus } from "@/lib/types";
 import { sameLoginContext } from "@/lib/password-auth";
 
@@ -391,8 +393,14 @@ export async function refreshAccessToken() {
 }
 
 function requestWithAccessToken(input: RequestInfo | URL, init: RequestInit, accessToken?: string | null) {
-  const headers = new Headers(init.headers || {});
+  const headers = new Headers(init.headers || (input instanceof Request ? input.headers : {}));
   if (accessToken) headers.set("Authorization", `Bearer ${accessToken}`);
+  if (accessToken && isFinancialWrite(input, init)) {
+    const context = readAuthState();
+    const device = authDeviceIdentityFromState(context);
+    if (!device) throw new AuthError("Sign in on this device to authorize financial operations.", "financial_device_missing");
+    return signedFinancialFetch(input, { ...init, headers }, accessToken, device, () => checkLoginContext(context));
+  }
   return fetch(input, { ...init, headers });
 }
 
@@ -404,6 +412,7 @@ function checkLoginContext(expected: AuthState | undefined, current = readAuthSt
 
 export async function authFetch(input: RequestInfo | URL, init: RequestInit = {}, expectedContext?: AuthState) {
   let state = readAuthState();
+  if (isFinancialWrite(input, init)) expectedContext ||= state;
   checkLoginContext(expectedContext, state);
   if (accessTokenExpiresSoon(state)) {
     await refreshAccessToken();

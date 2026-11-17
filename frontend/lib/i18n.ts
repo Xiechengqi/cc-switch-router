@@ -9,6 +9,7 @@ import { marketCheckoutMessagesEn, marketCheckoutMessagesZh } from "@/lib/market
 import { marketOwnerMessagesEn, marketOwnerMessagesZh } from "@/lib/market-owner-messages";
 import { walletPolicyMessagesEn, walletPolicyMessagesZh } from "@/lib/wallet-policy-messages";
 import { earningConversionMessagesEn, earningConversionMessagesZh } from "@/lib/earning-conversion-messages";
+import { walletSecurityMessagesEn, walletSecurityMessagesZh } from "@/lib/wallet-security-messages";
 import { marketC2CMessagesEn, marketC2CMessagesZh } from "@/lib/market-c2c-messages";
 import { passwordMessagesEn, passwordMessagesZh } from "@/lib/password-messages";
 import { clientTerminationMessagesEn, clientTerminationMessagesZh } from "@/lib/client-termination-messages";
@@ -64,6 +65,7 @@ export const messages = {
     "marketAccess.decision.allow": "Allow",
     "marketAccess.decision.deny": "Deny",
     ...marketC2CMessagesEn,
+    ...walletSecurityMessagesEn,
     ...earningConversionMessagesEn,
     "common.language": "Language",
     "common.currencySwitch": "Show prices in {currency}",
@@ -3662,6 +3664,7 @@ export const messages = {
     "marketAccess.decision.allow": "允许",
     "marketAccess.decision.deny": "拒绝",
     ...marketC2CMessagesZh,
+    ...walletSecurityMessagesZh,
     ...earningConversionMessagesZh,
     "common.language": "语言",
     "common.currencySwitch": "以{currency}显示价格",

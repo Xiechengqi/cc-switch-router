@@ -130,7 +130,9 @@ const REGIONS: &str = include_str!("../regions");
 const SHARE_EDIT_WAKE_RETRY_INTERVAL_SECS: u64 = 20;
 const SHARE_EDIT_WAKE_RETRY_ATTEMPTS: usize = 3;
 const DASHBOARD_REQUEST_TICKER_LIMIT: usize = 100;
-const ROUTER_ACCESS_COOKIE: &str = "cc_switch_router_access";
+const ROUTER_ACCESS_COOKIE: &str = "__Host-cc_switch_router_session";
+const ROUTER_LOCAL_ACCESS_COOKIE: &str = "cc_switch_router_session";
+const LEGACY_ROUTER_ACCESS_COOKIE: &str = "cc_switch_router_access";
 const INSTALLATION_CONTROL_BODY_LIMIT_BYTES: usize = 16 * 1024;
 const PASSWORD_BODY_LIMIT_BYTES: usize = 4096;
 const INSTALLATION_UPGRADE_TASK_PAYLOAD_BUDGET_BYTES: usize = 512 * 1024;
@@ -311,6 +313,8 @@ pub fn router(state: ServerState) -> Router {
         .merge(crate::market_wallet_transfers::router())
         .merge(crate::market_earning_conversions::router())
         .merge(crate::market_c2c::router())
+        .merge(crate::market_security::router())
+        .merge(crate::market_risk::router())
         .merge(crate::market_platform_contracts::router())
         .merge(crate::market_service_disputes::router())
         .merge(crate::market_providers::router())
@@ -705,6 +709,10 @@ pub fn router(state: ServerState) -> Router {
         )
         .route("/*path", any(ui_or_proxy_handler))
         .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::market_security::middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
             middleware_state,
             ip_blacklist_middleware,
         ))
@@ -716,6 +724,13 @@ async fn ip_blacklist_middleware(
     req: Request,
     next: Next,
 ) -> Response {
+    // Registered Axum routes otherwise also match user-controlled Share hosts.
+    // Keep private control-plane APIs outside those origins, before routing.
+    if private_control_plane_path(req.uri().path())
+        && !control_plane_host_allowed(&state.config, &request_host(&req))
+    {
+        return (StatusCode::NOT_FOUND, "not-found").into_response();
+    }
     let is_user_model_api =
         is_user_model_api_host(request_host(&req).as_str(), &state.config.tunnel_domain);
     let is_direct_share_model_api = !is_user_model_api
@@ -801,6 +816,28 @@ fn source_ip_from_request(req: &Request) -> Option<std::net::IpAddr> {
     let peer = req.extensions().get::<ConnectInfo<SocketAddr>>()?.0;
     let metadata = extract_client_metadata(req.headers(), peer);
     metadata.ip.as_deref()?.parse().ok()
+}
+
+fn private_control_plane_path(path: &str) -> bool {
+    path.starts_with("/v1/admin/")
+        || path.starts_with("/v1/auth/")
+        || path == "/v1/market-wallet"
+        || path.starts_with("/v1/market-wallet/")
+        || path.starts_with("/v1/market-provider-finance/")
+}
+
+fn control_plane_host_allowed(config: &crate::config::Config, host: &str) -> bool {
+    let Ok(host) = host.parse::<axum::http::uri::Authority>() else {
+        return false;
+    };
+    let expected = crate::config::tunnel_domain_host(&config.tunnel_domain);
+    let actual = host
+        .host()
+        .trim_matches(['[', ']'])
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    expected.is_some_and(|value| actual == value)
+        || (config.use_localhost && matches!(actual.as_str(), "localhost" | "127.0.0.1" | "::1"))
 }
 
 async fn favicon() -> StatusCode {
@@ -3358,7 +3395,7 @@ async fn verify_email_code(
     Json(input): Json<VerifyEmailCodeRequest>,
 ) -> Result<Response, AppError> {
     let response = state.store.verify_email_code(&state.config, input).await?;
-    Ok(with_session_cookie(&state, Json(response)))
+    with_session_cookie(&state, Json(response)).await
 }
 
 async fn password_login(
@@ -3387,7 +3424,7 @@ async fn password_login(
             extract_client_metadata(&headers, addr),
         )
         .await?;
-    Ok(with_session_cookie(&state, Json(response)))
+    with_session_cookie(&state, Json(response)).await
 }
 
 async fn update_password(
@@ -3408,7 +3445,7 @@ async fn update_password(
             metadata.ip.as_deref().unwrap_or("unknown"),
         )
         .await?;
-    Ok(with_session_cookie(&state, Json(response)))
+    with_session_cookie(&state, Json(response)).await
 }
 
 async fn verify_client_web_email_code(
@@ -3428,7 +3465,7 @@ async fn refresh_session(
     Json(input): Json<RefreshSessionRequest>,
 ) -> Result<Response, AppError> {
     let response = state.store.refresh_session(&state.config, input).await?;
-    Ok(with_session_cookie(&state, Json(response)))
+    with_session_cookie(&state, Json(response)).await
 }
 
 async fn logout_session(
@@ -3441,11 +3478,8 @@ async fn logout_session(
             .revoke_session_by_access_token(access_token)
             .await?;
     }
-    if let Some(access_token) = extract_router_access_cookie(&headers) {
-        state
-            .store
-            .revoke_session_by_access_token(access_token)
-            .await?;
+    if let Some(cookie) = extract_router_access_cookie(&headers, state.config.use_localhost) {
+        state.store.revoke_browser_session(cookie).await?;
     }
     Ok(with_clear_session_cookie(
         &state,
@@ -3457,11 +3491,16 @@ async fn session_me(
     State(state): State<ServerState>,
     headers: HeaderMap,
 ) -> Result<Json<SessionStatusResponse>, AppError> {
-    if dev_auth_bypass_enabled() && extract_session_token(&headers).is_none() {
+    if dev_auth_bypass_enabled()
+        && extract_bearer_token(&headers).is_none()
+        && extract_router_access_cookie(&headers, state.config.use_localhost).is_none()
+    {
         return Ok(Json(dev_session_status()));
     }
-    let session_token = resolve_session_auth_token(&state, &headers).await?;
-    let mut response = state.store.session_status(session_token.as_deref()).await?;
+    let mut response = match resolve_router_session(&state, &headers).await? {
+        Some(session) => state.store.resolved_session_status(&session).await?,
+        None => state.store.session_status(None).await?,
+    };
     if let Some(user) = response.user.as_ref() {
         response.is_admin = state.dynamic.read().await.is_admin(&user.email);
         response.can_audit_client_market = is_finance_owner(&state.config, &user.email);
@@ -4584,21 +4623,24 @@ mod tests {
     #[test]
     fn session_token_extraction_distinguishes_missing_cookie_and_bearer() {
         let mut headers = HeaderMap::new();
-        assert_eq!(extract_session_token(&headers), None);
+        assert_eq!(extract_router_access_cookie(&headers, false), None);
 
         headers.insert(
             axum::http::header::COOKIE,
-            "other=value; cc_switch_router_access=cookie-token"
+            "other=value; __Host-cc_switch_router_session=cookie-token"
                 .parse()
                 .unwrap(),
         );
-        assert_eq!(extract_session_token(&headers), Some("cookie-token"));
+        assert_eq!(
+            extract_router_access_cookie(&headers, false),
+            Some("cookie-token")
+        );
 
         headers.insert(
             axum::http::header::AUTHORIZATION,
             "Bearer bearer-token".parse().unwrap(),
         );
-        assert_eq!(extract_session_token(&headers), Some("bearer-token"));
+        assert_eq!(extract_bearer_token(&headers), Some("bearer-token"));
     }
 
     #[test]
@@ -4682,7 +4724,7 @@ mod tests {
     #[test]
     fn clear_session_cookie_covers_host_and_domain_cookie() {
         let cookies = build_clear_session_cookies("jptokenswitch.cc", false);
-        assert_eq!(cookies.len(), 2);
+        assert_eq!(cookies.len(), 3);
         assert!(cookies[0].contains("cc_switch_router_access="));
         assert!(cookies[0].contains("Max-Age=0"));
         assert!(!cookies[0].contains("Domain="));
@@ -4693,9 +4735,34 @@ mod tests {
     #[test]
     fn clear_session_cookie_omits_domain_for_localhost() {
         let cookies = build_clear_session_cookies("localhost", true);
-        assert_eq!(cookies.len(), 1);
+        assert_eq!(cookies.len(), 2);
         assert!(cookies[0].contains("Max-Age=0"));
         assert!(!cookies[0].contains("Domain="));
+    }
+
+    #[test]
+    fn browser_cookie_is_host_only_and_legacy_or_ambiguous_credentials_are_rejected() {
+        let cookie = build_session_cookie(
+            "router.test",
+            false,
+            "browser_secret",
+            Utc::now() + chrono::Duration::minutes(30),
+        );
+        assert!(cookie.starts_with("__Host-cc_switch_router_session=browser_secret;"));
+        assert!(cookie.contains("Secure"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(!cookie.contains("Domain="));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            "cc_switch_router_access=old-access".parse().unwrap(),
+        );
+        assert!(extract_router_access_cookie(&headers, false).is_none());
+        headers.insert(header::COOKIE, "__Host-cc_switch_router_session=browser_one; __Host-cc_switch_router_session=browser_two".parse().unwrap());
+        assert!(extract_router_access_cookie(&headers, false).is_none());
+        assert!(private_control_plane_path("/v1/admin/market-finance/mode"));
+        assert!(private_control_plane_path("/v1/market-wallet/transfers"));
+        assert!(!private_control_plane_path("/share-api/share"));
     }
 
     #[test]
@@ -6272,14 +6339,25 @@ async fn share_user_usage_breakdown(
     headers: HeaderMap,
     Path(share_id): Path<String>,
     Query(query): Query<ShareUserUsageBreakdownQuery>,
-) -> Result<(HeaderMap, Json<crate::models::ShareUserUsageBreakdownResponse>), AppError> {
+) -> Result<
+    (
+        HeaderMap,
+        Json<crate::models::ShareUserUsageBreakdownResponse>,
+    ),
+    AppError,
+> {
     let session = resolve_router_session(&state, &headers)
         .await?
         .ok_or_else(|| AppError::Unauthorized("login required".into()))?;
     let manager =
         crate::share_value_quotas::session_manages_share(&state, &session, &share_id).await?;
     let own = session.email.trim().to_ascii_lowercase();
-    let email = match query.email.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
+    let email = match query
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+    {
         Some(email) if manager || email.eq_ignore_ascii_case(&own) => Some(email.to_string()),
         Some(_) => {
             return Err(AppError::coded_forbidden(
@@ -6845,39 +6923,52 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
-fn extract_session_token(headers: &HeaderMap) -> Option<&str> {
-    extract_bearer_token(headers).or_else(|| extract_router_access_cookie(headers))
+fn extract_router_access_cookie(headers: &HeaderMap, use_localhost: bool) -> Option<&str> {
+    let expected = if use_localhost {
+        ROUTER_LOCAL_ACCESS_COOKIE
+    } else {
+        ROUTER_ACCESS_COOKIE
+    };
+    let mut found = None;
+    for value in headers.get_all(header::COOKIE) {
+        for part in value.to_str().ok()?.split(';') {
+            let Some((name, value)) = part.trim().split_once('=') else {
+                continue;
+            };
+            if name == expected {
+                if found.is_some() || value.trim().is_empty() {
+                    return None;
+                }
+                found = Some(value.trim());
+            }
+        }
+    }
+    found
 }
 
-fn extract_router_access_cookie(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(header::COOKIE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|cookie| {
-            cookie.split(';').find_map(|part| {
-                let (name, value) = part.trim().split_once('=')?;
-                (name == ROUTER_ACCESS_COOKIE)
-                    .then_some(value.trim())
-                    .filter(|value| !value.is_empty())
-            })
-        })
-}
-
-fn with_session_cookie(
+async fn with_session_cookie(
     state: &ServerState,
     Json(response): Json<VerifyEmailCodeResponse>,
-) -> Response {
+) -> Result<Response, AppError> {
+    let browser_cookie = state
+        .store
+        .issue_browser_cookie(&response.access_token)
+        .await?;
     let cookie = build_session_cookie(
         &state.config.tunnel_domain,
         state.config.use_localhost,
-        &response.access_token,
+        &browser_cookie,
         response.expires_at,
     );
-    let mut output = Json(response).into_response();
+    let mut output = with_clear_session_cookie(state, Json(response));
     if let Ok(value) = HeaderValue::from_str(&cookie) {
         output.headers_mut().append(header::SET_COOKIE, value);
     }
-    output
+    output.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    Ok(output)
 }
 
 fn with_clear_session_cookie<T: Serialize>(
@@ -6896,24 +6987,27 @@ fn with_clear_session_cookie<T: Serialize>(
 }
 
 fn build_session_cookie(
-    tunnel_domain: &str,
+    _tunnel_domain: &str,
     use_localhost: bool,
-    access_token: &str,
+    browser_cookie: &str,
     expires_at: chrono::DateTime<chrono::Utc>,
 ) -> String {
     let max_age = (expires_at - chrono::Utc::now()).num_seconds().max(0);
     let mut parts = vec![
-        format!("{ROUTER_ACCESS_COOKIE}={access_token}"),
+        format!(
+            "{}={browser_cookie}",
+            if use_localhost {
+                ROUTER_LOCAL_ACCESS_COOKIE
+            } else {
+                ROUTER_ACCESS_COOKIE
+            }
+        ),
         "Path=/".to_string(),
         "HttpOnly".to_string(),
         "SameSite=Lax".to_string(),
         format!("Max-Age={max_age}"),
     ];
-    if !use_localhost && cookie_domain_allowed(tunnel_domain) {
-        parts.push(format!(
-            "Domain=.{}",
-            tunnel_domain.trim().trim_end_matches('.')
-        ));
+    if !use_localhost {
         parts.push("Secure".to_string());
     }
     parts.join("; ")
@@ -6921,7 +7015,7 @@ fn build_session_cookie(
 
 fn build_clear_session_cookies(tunnel_domain: &str, use_localhost: bool) -> Vec<String> {
     let base = vec![
-        format!("{ROUTER_ACCESS_COOKIE}="),
+        format!("{LEGACY_ROUTER_ACCESS_COOKIE}="),
         "Path=/".to_string(),
         "HttpOnly".to_string(),
         "SameSite=Lax".to_string(),
@@ -6930,7 +7024,7 @@ fn build_clear_session_cookies(tunnel_domain: &str, use_localhost: bool) -> Vec<
     ];
     let mut cookies = vec![base.join("; ")];
     if !use_localhost && cookie_domain_allowed(tunnel_domain) {
-        let mut domain_cookie = base;
+        let mut domain_cookie = base.clone();
         domain_cookie.push(format!(
             "Domain=.{}",
             tunnel_domain.trim().trim_end_matches('.')
@@ -6938,6 +7032,19 @@ fn build_clear_session_cookies(tunnel_domain: &str, use_localhost: bool) -> Vec<
         domain_cookie.push("Secure".to_string());
         cookies.push(domain_cookie.join("; "));
     }
+    let mut current = base;
+    current[0] = format!(
+        "{}=",
+        if use_localhost {
+            ROUTER_LOCAL_ACCESS_COOKIE
+        } else {
+            ROUTER_ACCESS_COOKIE
+        }
+    );
+    if !use_localhost {
+        current.push("Secure".into());
+    }
+    cookies.push(current.join("; "));
     cookies
 }
 
@@ -7083,51 +7190,26 @@ struct ClientChatStreamQuery {
     after_seq: Option<i64>,
 }
 
-fn session_token_candidates(headers: &HeaderMap) -> Vec<&str> {
-    let mut candidates = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    if let Some(bearer) = extract_bearer_token(headers) {
-        seen.insert(bearer);
-        candidates.push(bearer);
-    }
-    if let Some(cookie) = extract_router_access_cookie(headers) {
-        if seen.insert(cookie) {
-            candidates.push(cookie);
-        }
-    }
-    candidates
-}
-
-async fn resolve_session_auth_token(
-    state: &ServerState,
-    headers: &HeaderMap,
-) -> Result<Option<String>, AppError> {
-    for token in session_token_candidates(headers) {
-        if state
-            .store
-            .resolve_session_by_access_token(token)
-            .await?
-            .is_some()
-        {
-            return Ok(Some(token.to_string()));
-        }
-    }
-    Ok(None)
-}
-
 pub(crate) async fn resolve_router_session(
     state: &ServerState,
     headers: &HeaderMap,
 ) -> Result<Option<AuthSession>, AppError> {
-    if session_token_candidates(headers).is_empty() {
-        return Ok(dev_auth_bypass_enabled().then(dev_auth_session));
-    }
-    for token in session_token_candidates(headers) {
-        if let Some(session) = state.store.resolve_session_by_access_token(token).await? {
-            return Ok(Some(session));
+    if headers.contains_key(header::AUTHORIZATION) {
+        let Some(bearer) = extract_bearer_token(headers)
+            .filter(|_| headers.get_all(header::AUTHORIZATION).iter().count() == 1)
+        else {
+            return Ok(None);
+        };
+        let mut session = state.store.resolve_session_by_access_token(bearer).await?;
+        if let Some(actor) = session.as_mut() {
+            crate::market_security::attach_proof(actor, headers);
         }
+        return Ok(session);
     }
-    Ok(None)
+    if let Some(cookie) = extract_router_access_cookie(headers, state.config.use_localhost) {
+        return state.store.resolve_browser_session(cookie).await;
+    }
+    Ok(dev_auth_bypass_enabled().then(dev_auth_session))
 }
 
 fn dev_auth_email() -> String {
@@ -7161,6 +7243,7 @@ fn dev_auth_session() -> AuthSession {
     let now = chrono::Utc::now();
     let email = dev_auth_email();
     AuthSession {
+        financial_proof_id: None,
         session_id: "dev-auth-bypass-session".into(),
         user_id: "dev-auth-bypass-user".into(),
         email,

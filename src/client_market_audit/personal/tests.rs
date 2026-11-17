@@ -4,6 +4,7 @@ use super::*;
 fn actor(id: &str) -> AuthSession {
     let now = Utc::now();
     AuthSession {
+        financial_proof_id: None,
         session_id: "personal-test".into(),
         user_id: id.into(),
         email: format!("{id}@example.test"),

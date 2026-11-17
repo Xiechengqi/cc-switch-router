@@ -1,3 +1,4 @@
+import { installFinancialBrowserIdentity } from "./financial-browser-fixture.mjs";
 import { chromium } from "playwright";
 import assert from "node:assert/strict";
 import { emptyClientRentalsPage } from "./client-rental-fixtures.mjs";
@@ -208,7 +209,8 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
         body: JSON.stringify(body),
       });
     });
-    await page.goto(baseUrl + "/client-market/?focusHost=host-1");
+    await installFinancialBrowserIdentity(page);
+  await page.goto(baseUrl + "/client-market/?focusHost=host-1");
     await page
       .getByRole("heading", { name: "配置并确认" })
       .waitFor({ timeout: 60000 });
