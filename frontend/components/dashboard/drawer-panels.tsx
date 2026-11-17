@@ -227,7 +227,7 @@ export function ShareAppSupportCard({
   const tone = enabled
     ? modelHealthTone(share, app, locale)
     : { className: "bg-slate-50 text-muted-foreground", label: "" };
-  const accountEmail = enabled ? providerAccountIdentity(runtime, share.canManage === true) : "";
+  const accountEmail = enabled ? providerAccountIdentity(runtime, share.canViewAccountIdentity ?? share.canManage === true) : "";
   const accountLevel = enabled ? providerAccountLevel(runtime, locale) : "";
   const modelSummary = enabled
     ? providerModelMap(runtime, t("dashboard.modelPolicyPassthrough"))

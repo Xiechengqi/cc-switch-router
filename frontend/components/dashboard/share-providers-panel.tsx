@@ -58,7 +58,8 @@ function groupProviders(
 ): GroupedProvider[] {
   const groups = new Map<string, GroupedProvider>();
   entries.forEach(({ app, provider, source }) => {
-    const key = `${providerGroupKey(provider, app)}:${source?.canManage ? "owner" : "masked"}`;
+    const revealAccount = source?.canViewAccountIdentity ?? source?.canManage === true;
+    const key = `${providerGroupKey(provider, app)}:${revealAccount ? "full" : "masked"}`;
     const existing = groups.get(key);
     const supportedApps = normalizeProviderApps(provider, [app]);
     if (!existing) {
@@ -135,7 +136,7 @@ function shareProviderStatusView({
   const { runtime } = primary;
   const quotaStatusLine = providerQuotaStatusLine(runtime, locale);
   const source = sources?.[primary.app] || share;
-  const accountLine = providerStatusIdentity(runtime, source?.canManage === true);
+  const accountLine = providerStatusIdentity(runtime, source?.canViewAccountIdentity ?? source?.canManage === true);
   const modelsLine =
     entries
       .map(

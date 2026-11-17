@@ -132,7 +132,7 @@ test("Cursor API-key cards use the account as the level when no plan is known", 
   assert.equal(providerAccountTierLabel(runtime), "owner@example.com");
 });
 
-test("only owner legacy Cursor API-key views allow their provider-name fallback", () => {
+test("authorized legacy Cursor API-key views allow their provider-name fallback", () => {
   const runtime = cursorApiKeyRuntime({
     accountLabel: undefined,
     accountEmail: undefined,

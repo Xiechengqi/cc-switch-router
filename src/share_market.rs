@@ -301,6 +301,7 @@ pub struct ListingView {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub service_reasons: Vec<String>,
     pub is_owner: bool,
+    pub can_view_account_identity: bool,
     pub can_delete: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delete_blocked_reason: Option<String>,
@@ -5638,7 +5639,7 @@ impl AppStore {
                     COALESCE(s.enabled_gemini, 0), s.app_runtimes_json,
                     s.app_providers_json, s.token_limit, s.parallel_limit,
                     COALESCE(s.tokens_used, 0), listing.installation_id,
-                    listing.market_provider_id
+                    listing.market_provider_id, COALESCE(s.free_access, 0)
              FROM share_market_listings listing
              LEFT JOIN shares s ON s.share_id = listing.share_id
              WHERE listing.deleted_at IS NULL
@@ -5678,6 +5679,7 @@ impl AppStore {
                     row.get::<_, i64>(22)?,
                     row.get::<_, String>(23)?,
                     row.get::<_, Option<String>>(24)?,
+                    row.get::<_, i64>(25)? != 0,
                 ))
             })
             .map_err(map_db("query Share Market catalog"))?
@@ -5743,6 +5745,7 @@ impl AppStore {
             tokens_used,
             installation_id,
             market_provider_id,
+            free_access,
         ) in listing_rows
         {
             let is_owner = viewer.is_some_and(|value| value.user_id == owner_user_id);
@@ -5754,9 +5757,16 @@ impl AppStore {
             };
             // Historical listing ownership is not authority over the current
             // Share's upstream account, including after an owner transfer.
-            let reveal_account = crate::share_account_identity::is_share_owner(
+            // Malformed grants cannot confer account access. Keep the public
+            // catalog available, without falling back to retired ACL columns.
+            let grants: BTreeMap<String, ShareUserGrant> =
+                serde_json::from_str(&grants_json).unwrap_or_default();
+            let reveal_account = crate::share_account_identity::can_view_account_identity(
                 Some(&current_owner_email),
+                free_access,
+                &grants,
                 viewer.map(|value| value.email.as_str()),
+                Utc::now().timestamp_millis(),
             );
             let app_capabilities = app_capabilities_for_viewer(
                 &bindings_json,
@@ -5834,8 +5844,6 @@ impl AppStore {
             let (provider_family, provider_families) = listing_provider_families(&app_capabilities);
             let viewer_already_renting = viewer_active_share_ids.contains(&share_id);
             let viewer_has_direct_grant = viewer.is_some_and(|session| {
-                let grants: BTreeMap<String, ShareUserGrant> =
-                    serde_json::from_str(&grants_json).unwrap_or_default();
                 grants
                     .get(&session.email.to_ascii_lowercase())
                     .is_some_and(|grant| grant.active)
@@ -6089,6 +6097,7 @@ impl AppStore {
                 service_block_reason,
                 service_reasons,
                 is_owner,
+                can_view_account_identity: reveal_account,
                 can_delete: delete_capability.can_delete,
                 delete_blocked_reason: delete_capability.blocked_reason.map(str::to_string),
                 can_reopen: reopen_capability.can_reopen,

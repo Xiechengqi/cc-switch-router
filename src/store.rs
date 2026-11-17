@@ -9123,6 +9123,13 @@ impl AppStore {
             .ok_or_else(|| AppError::NotFound("share not found".into()))?;
         let active_edit = get_dashboard_active_share_edit(&conn, share_id)?;
         let can_manage = can_manage_share(&share, viewer_email);
+        let can_view_account_identity = crate::share_account_identity::can_view_account_identity(
+            share.owner_email.as_deref(),
+            share.free_access,
+            &share.user_grants,
+            viewer_email,
+            Utc::now().timestamp_millis(),
+        );
         let can_edit_settings = can_manage
             && active_edit
                 .as_ref()
@@ -9176,6 +9183,7 @@ impl AppStore {
             free_access: share.free_access,
             subdomain: share.subdomain,
             can_view_secret: false,
+            can_view_account_identity,
             can_manage,
             can_edit_settings,
             active_edit: can_manage.then(|| active_edit.clone()).flatten(),
@@ -9226,7 +9234,7 @@ impl AppStore {
         };
         (view.operational_summary, view.service_readiness) =
             share_operational_evaluation(&view, active_edit.as_ref(), Utc::now());
-        crate::share_account_identity::project_share(&mut view, viewer_email);
+        crate::share_account_identity::project_share(&mut view);
         Ok(view)
     }
 
@@ -12862,6 +12870,14 @@ impl AppStore {
                 let observation_coverage_24h = observation_coverage(observed_minutes_24h);
                 let can_view_share = share_visible_to_email(&share, viewer_email);
                 let can_view_secret = can_view_share;
+                let can_view_account_identity =
+                    crate::share_account_identity::can_view_account_identity(
+                        share.owner_email.as_deref(),
+                        share.free_access,
+                        &share.user_grants,
+                        viewer_email,
+                        now.timestamp_millis(),
+                    );
                 let can_manage = can_manage_share(&share, viewer_email);
                 let active_edit = active_edits_by_share.get(&share.share_id).cloned();
                 let can_edit_settings = can_manage
@@ -12906,6 +12922,7 @@ impl AppStore {
                     subdomain: share.subdomain,
                     app_type: share.app_type,
                     can_view_secret,
+                    can_view_account_identity,
                     can_manage,
                     can_edit_settings,
                     active_edit: can_manage.then(|| active_edit.clone()).flatten(),
@@ -12957,7 +12974,7 @@ impl AppStore {
                 };
                 (view.operational_summary, view.service_readiness) =
                     share_operational_evaluation(&view, active_edit.as_ref(), Utc::now());
-                crate::share_account_identity::project_share(&mut view, viewer_email);
+                crate::share_account_identity::project_share(&mut view);
                 view
             })
             .collect::<Vec<_>>();
@@ -29587,15 +29604,7 @@ fn active_share_grant_for_email(
     email: &str,
     now_ms: i64,
 ) -> bool {
-    grants.iter().any(|(key, grant)| {
-        grant.active
-            && grant.role == "shareto"
-            && grant
-                .policy
-                .expires_at
-                .is_none_or(|expires_at| expires_at > now_ms)
-            && (key.eq_ignore_ascii_case(email) || grant.email.eq_ignore_ascii_case(email))
-    })
+    crate::share_account_identity::active_share_grant(grants, email, now_ms).is_some()
 }
 
 fn share_model_routing_access(
@@ -29774,7 +29783,14 @@ fn load_user_model_routing_response(
             .filter_map(|app| user_model_routing_share_capability(&share, app))
             .collect();
         let mut provider_identity = crate::provider_presentation::identity_for_share(&share);
-        if access != "owner" {
+        let can_view_account_identity = crate::share_account_identity::can_view_account_identity(
+            share.owner_email.as_deref(),
+            share.free_access,
+            &share.user_grants,
+            Some(email),
+            now_ms,
+        );
+        if !can_view_account_identity {
             let aliases = crate::share_account_identity::AccountAliases::from_metadata(
                 share.upstream_provider.as_ref(),
                 &share.app_runtimes,
@@ -29829,6 +29845,7 @@ fn load_user_model_routing_response(
             direct_api_url: config.tunnel_url(&share.subdomain),
             access: access.to_string(),
             free_access: share.free_access,
+            can_view_account_identity,
             apps,
             app_capabilities,
             model_health_status: canonical,

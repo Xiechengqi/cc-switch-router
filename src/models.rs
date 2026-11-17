@@ -397,6 +397,7 @@ pub struct UserModelRoutingShareView {
     pub direct_api_url: String,
     pub access: String,
     pub free_access: bool,
+    pub can_view_account_identity: bool,
     pub apps: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub app_capabilities: Vec<UserModelRoutingShareCapability>,
@@ -4268,6 +4269,8 @@ pub struct ShareView {
     pub free_access: bool,
     pub subdomain: String,
     pub can_view_secret: bool,
+    /// Browser display permission, independent of management/secret access.
+    pub can_view_account_identity: bool,
     pub can_manage: bool,
     pub can_edit_settings: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]

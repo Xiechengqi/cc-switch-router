@@ -436,6 +436,8 @@ export type ShareView = {
   freeAccess: boolean;
   subdomain: string;
   canViewSecret?: boolean;
+  /** Server-authorized account display permission; independent of management. */
+  canViewAccountIdentity?: boolean;
   canManage?: boolean;
   canEditSettings?: boolean;
   activeEdit?: ShareEditView;
@@ -629,7 +631,7 @@ export type UserModelRoutingShareCapability = {
   kind?: string;
   apiUrl?: string;
   subscriptionLevel?: string;
-  /** Browser projection: complete for the current Share owner, masked for other viewers. */
+  /** Browser projection: complete for authorized viewers, masked otherwise. */
   accountLabel?: string;
   accountEmail?: string;
   modelPolicy?: ShareProviderModelPolicy;
@@ -645,6 +647,7 @@ export type UserModelRoutingShare = {
   directApiUrl: string;
   access: "owner" | "shared" | "free" | string;
   freeAccess: boolean;
+  canViewAccountIdentity?: boolean;
   apps: ModelRoutingApp[];
   appCapabilities?: UserModelRoutingShareCapability[];
   /** Share-level account health, shared with the All view; appType is the observed protocol. */
@@ -1375,7 +1378,7 @@ export type ShareUpstreamProvider = {
   kind?: string;
   app?: string;
   providerType?: string;
-  /** Read-only display values: masked by Router for non-owner viewers. */
+  /** Read-only display values: masked by Router for unauthorized viewers. */
   accountLabel?: string;
   accountEmail?: string;
   subscriptionLevel?: string;
@@ -1449,7 +1452,7 @@ export type ShareAppProvider = {
   isCurrent?: boolean;
   enabled?: boolean;
   codexImageGenerationEnabled?: boolean;
-  /** Read-only display values: masked by Router for non-owner viewers. */
+  /** Read-only display values: masked by Router for unauthorized viewers. */
   accountLabel?: string;
   accountEmail?: string;
   subscriptionLevel?: string;
@@ -3118,6 +3121,7 @@ export type ShareMarketListing = {
   serviceBlockReason?: string;
   serviceReasons?: string[];
   isOwner: boolean;
+  canViewAccountIdentity?: boolean;
   canDelete: boolean;
   deleteBlockedReason?: string;
   canReopen: boolean;

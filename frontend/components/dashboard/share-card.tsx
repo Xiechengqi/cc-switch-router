@@ -143,7 +143,7 @@ export const ShareCard = React.memo(function ShareCard({
     providerEnabled && runtime ? providerQuotaStatusLine(runtime, locale) : "-";
   const accountLine =
     providerEnabled && runtime
-      ? providerStatusIdentity(runtime, share.canManage === true)
+      ? providerStatusIdentity(runtime, share.canViewAccountIdentity ?? share.canManage === true)
       : "-";
   const actualModels =
     modelPolicySummary ||

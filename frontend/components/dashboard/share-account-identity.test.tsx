@@ -18,19 +18,19 @@ test("masked routing identity is identical in account text and native tooltip", 
   assert.match(html, /title="a\*\*\*e@example\.test"[^>]*>a\*\*\*e@example\.test</);
   assert.doesNotMatch(html, /alice@example\.test/);
   const missing = modelRoutingShareAccountView({...share, appCapabilities: [{ app: "codex", kind: "codex_oauth", providerName: "legacy-private-account" }]}, "codex", "en", {passthrough: "Passthrough", unavailable: "Unavailable"});
-  assert.equal(missing.identityLine, "-", "non-owners cannot recover an identity through a display-name fallback");
+  assert.equal(missing.identityLine, "-", "unauthorized views cannot recover an identity through a display-name fallback");
 });
 
-function source(shareId: string, owner: boolean): ShareView {
+function source(shareId: string, owner: boolean, revealAccount = owner): ShareView {
   return {
     shareId, capacityPoolId: `pool-${shareId}`, shareName: shareId, subdomain: shareId,
-    freeAccess: false, canManage: owner, appType: "codex", support: { codex: true },
+    freeAccess: false, canManage: owner, canViewAccountIdentity: revealAccount, appType: "codex", support: { codex: true },
     tokenLimit: 0, parallelLimit: 1, tokensUsed: 0, requestsCount: 0,
     shareStatus: "active", createdAt: "2026-11-15T00:00:00Z", expiresAt: "2027-11-15T00:00:00Z",
     isOnline: true, routeState: "active", activeRequests: 0, onlineRate24h: 100,
     bindings: { codex: `provider-${shareId}` },
     appProviders: { codex: [{ id: `provider-${shareId}`, app: "codex", name: "Cursor", kind: "cursor_oauth", bundleId: "same-bundle" }] },
-    appRuntimes: { cursor: { kind: "cursor_oauth", accountLabel: owner ? "owner-account@example.test" : "m***d@example.test" } },
+    appRuntimes: { cursor: { kind: "cursor_oauth", accountLabel: revealAccount ? `${shareId}-account@example.test` : "m***d@example.test" } },
   };
 }
 
@@ -45,4 +45,35 @@ test("Client provider groups keep each Share's identity scope and standalone run
   const sharedOnly = renderToStaticMarkup(<LocaleProvider><ShareProvidersPanel share={shared} /></LocaleProvider>);
   assert.doesNotMatch(sharedOnly, /owner-account@example\.test/);
   assert.match(sharedOnly, /m\*\*\*d@example\.test/);
+});
+
+test("authorized shared and free account panels stay separate from masked panels in either order", () => {
+  for (const freeAccess of [false, true]) {
+    const authorized = { ...source("authorized", false, true), freeAccess };
+    const masked = source("anonymous", false, false);
+    for (const shares of [[authorized, masked], [masked, authorized]]) {
+      const html = renderToStaticMarkup(<LocaleProvider><ClientProvidersPanel shares={shares} /></LocaleProvider>);
+      assert.equal(html.match(/authorized-account@example\.test/g)?.length, 2);
+      assert.equal(html.match(/m\*\*\*d@example\.test/g)?.length, 2);
+    }
+    const html = renderToStaticMarkup(<LocaleProvider><ShareProvidersPanel share={authorized} /></LocaleProvider>);
+    assert.equal(html.match(/authorized-account@example\.test/g)?.length, 2, "shared users do not need management permission to see text and tooltip");
+  }
+});
+
+test("routing display follows the server account permission independently of access role", () => {
+  for (const access of ["shared", "free"]) {
+    const share: UserModelRoutingShare = {
+      shareId: "authorized", shareName: "Authorized", subdomain: "authorized", directApiUrl: "https://fixture.test",
+      access, freeAccess: access === "free", canViewAccountIdentity: true, apps: ["codex"], isOnline: true,
+      appCapabilities: [{ app: "codex", kind: "codex_oauth", accountLabel: "邵义强" }],
+    };
+    const labels = { passthrough: "Passthrough", unavailable: "Unavailable" };
+    const view = modelRoutingShareAccountView(share, "codex", "en", labels);
+    const html = renderToStaticMarkup(<ShareProviderStatusPanel view={view} />);
+    assert.match(html, /title="邵义强"[^>]*>邵义强</);
+    const legacy = { ...share, appCapabilities: [{ app: "codex", kind: "codex_oauth", providerName: "Legacy account" }] };
+    assert.equal(modelRoutingShareAccountView(legacy, "codex", "en", labels).identityLine, "Legacy account");
+    assert.equal(modelRoutingShareAccountView({ ...legacy, access: "owner", canViewAccountIdentity: false }, "codex", "en", labels).identityLine, "-", "an explicit permission overrides legacy owner fallbacks");
+  }
 });

@@ -94,7 +94,7 @@ fn assert_masked(value: &impl serde::Serialize) {
 }
 
 #[tokio::test]
-async fn share_account_identity_browser_views_are_owner_only_and_never_rewrite_storage() {
+async fn share_account_identity_browser_views_follow_authorization_and_never_rewrite_storage() {
     let (store, mut config) = fixture().await;
     config.admin_emails.insert("admin@example.com".into());
     let proxy = ProxyRegistry::default();
@@ -104,7 +104,6 @@ async fn share_account_identity_browser_views_are_owner_only_and_never_rewrite_s
     };
     for viewer in [
         None,
-        Some("shared@example.com"),
         Some("admin@example.com"),
         Some("stranger@example.com"),
     ] {
@@ -118,12 +117,7 @@ async fn share_account_identity_browser_views_are_owner_only_and_never_rewrite_s
             .find(|s| s.share_id == "identity-share")
             .unwrap();
         assert!(!share.can_manage);
-        if viewer == Some("shared@example.com") {
-            assert!(
-                share.can_view_secret,
-                "ShareTo access must not reveal the account"
-            );
-        }
+        assert!(!share.can_view_account_identity);
         assert_masked(share);
         assert_eq!(share.app_runtimes.codex.as_ref().unwrap().models.len(), 0);
         assert_eq!(
@@ -142,34 +136,45 @@ async fn share_account_identity_browser_views_are_owner_only_and_never_rewrite_s
             .unwrap();
         assert_masked(&standalone);
     }
-    let owner = store
-        .dashboard_snapshot(&config, &geo, &proxy, Some("Owner@Example.com"))
-        .await
-        .unwrap();
-    assert!(owner.shares[0].can_manage);
-    assert_eq!(
-        owner.shares[0]
-            .app_runtimes
-            .codex
-            .as_ref()
-            .unwrap()
-            .account_email
-            .as_deref(),
-        Some(PRIVATE_ACCOUNT)
-    );
-    let standalone = store
-        .share_view_for_share_url(
-            "identity-share",
-            &HashSet::new(),
-            &HashMap::new(),
-            Some("owner@example.com"),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        standalone.app_providers.codex[0].account_label.as_deref(),
-        Some(PRIVATE_PROVIDER_LABEL)
-    );
+    for viewer in ["Owner@Example.com", "shared@example.com"] {
+        let dashboard = store
+            .dashboard_snapshot(&config, &geo, &proxy, Some(viewer))
+            .await
+            .unwrap();
+        let standalone = store
+            .share_view_for_share_url(
+                "identity-share",
+                &HashSet::new(),
+                &HashMap::new(),
+                Some(viewer),
+            )
+            .await
+            .unwrap();
+        for share in [&dashboard.shares[0], &standalone] {
+            assert!(share.can_view_account_identity);
+            assert_eq!(share.can_manage, viewer == "Owner@Example.com");
+            assert_eq!(
+                share
+                    .app_runtimes
+                    .codex
+                    .as_ref()
+                    .unwrap()
+                    .account_email
+                    .as_deref(),
+                Some(PRIVATE_ACCOUNT)
+            );
+            assert_eq!(
+                share.app_providers.codex[0].account_label.as_deref(),
+                Some(PRIVATE_PROVIDER_LABEL)
+            );
+            if !share.can_manage {
+                assert_eq!(
+                    share.app_providers.codex[1].account_email.as_deref(),
+                    Some("u***e@example.test")
+                );
+            }
+        }
+    }
     let conn = store.conn.lock().await;
     let raw: (String, String, String) = conn.query_row(
         "SELECT upstream_provider_json, app_runtimes_json, app_providers_json FROM shares WHERE share_id='identity-share'",
@@ -184,7 +189,7 @@ async fn share_account_identity_browser_views_are_owner_only_and_never_rewrite_s
 }
 
 #[tokio::test]
-async fn model_routing_share_account_identity_masks_shared_free_and_transferred_owners() {
+async fn model_routing_share_account_identity_follows_shared_free_and_transferred_access() {
     let (store, config) = fixture().await;
     let shared = store
         .get_user_model_routing(&config, "shared@example.com", &HashSet::new())
@@ -192,7 +197,13 @@ async fn model_routing_share_account_identity_masks_shared_free_and_transferred_
         .unwrap();
     assert_eq!(shared.eligible_shares.len(), 1);
     assert_eq!(shared.eligible_shares[0].access, "shared");
-    assert_masked(&shared.eligible_shares[0]);
+    assert!(shared.eligible_shares[0].can_view_account_identity);
+    assert_eq!(
+        shared.eligible_shares[0].app_capabilities[0]
+            .account_email
+            .as_deref(),
+        Some(PRIVATE_ACCOUNT)
+    );
     store
         .conn
         .lock()
@@ -207,7 +218,13 @@ async fn model_routing_share_account_identity_masks_shared_free_and_transferred_
         .await
         .unwrap();
     assert_eq!(free.eligible_shares[0].access, "free");
-    assert_masked(&free.eligible_shares[0]);
+    assert!(free.eligible_shares[0].can_view_account_identity);
+    assert_eq!(
+        free.eligible_shares[0].app_capabilities[0]
+            .account_email
+            .as_deref(),
+        Some(PRIVATE_ACCOUNT)
+    );
     let owner = store
         .get_user_model_routing(&config, "owner@example.com", &HashSet::new())
         .await
@@ -231,7 +248,8 @@ async fn model_routing_share_account_identity_masks_shared_free_and_transferred_
         .get_user_model_routing(&config, "owner@example.com", &HashSet::new())
         .await
         .unwrap();
-    assert_masked(&previous.eligible_shares[0]);
+    assert_eq!(previous.eligible_shares[0].access, "free");
+    assert!(previous.eligible_shares[0].can_view_account_identity);
     let next = store
         .get_user_model_routing(&config, "next@example.com", &HashSet::new())
         .await
@@ -248,7 +266,7 @@ async fn model_routing_share_account_identity_masks_shared_free_and_transferred_
         .lock()
         .await
         .execute(
-            "UPDATE shares SET owner_email=NULL WHERE share_id='identity-share'",
+            "UPDATE shares SET owner_email=NULL, free_access=0 WHERE share_id='identity-share'",
             [],
         )
         .unwrap();
@@ -256,5 +274,142 @@ async fn model_routing_share_account_identity_masks_shared_free_and_transferred_
         .get_user_model_routing(&config, "next@example.com", &HashSet::new())
         .await
         .unwrap();
-    assert_masked(&missing.eligible_shares[0]);
+    assert!(missing.eligible_shares.is_empty());
+}
+
+#[tokio::test]
+async fn share_account_identity_rechecks_free_access_revocation_and_expiry_without_relogin() {
+    let (store, config) = fixture().await;
+    let proxy = ProxyRegistry::default();
+    let geo = ServerGeo {
+        lat: None,
+        lon: None,
+    };
+    let now = Utc::now().timestamp_millis();
+    for (free, active, expiry, viewer, expected) in [
+        (false, true, None, Some("shared@example.com"), true),
+        (false, false, None, Some("shared@example.com"), false),
+        (
+            false,
+            true,
+            Some(now - 1),
+            Some("shared@example.com"),
+            false,
+        ),
+        (
+            true,
+            true,
+            Some(now - 1),
+            Some("stranger@example.com"),
+            true,
+        ),
+        (true, true, None, None, false),
+        (false, true, None, Some("stranger@example.com"), false),
+    ] {
+        let grants = BTreeMap::from([(
+            "shared@example.com",
+            ShareUserGrant {
+                email: "shared@example.com".into(),
+                role: "shareto".into(),
+                active,
+                policy: crate::models::ShareUserPolicy {
+                    expires_at: expiry,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )]);
+        store.conn.lock().await.execute(
+            "UPDATE shares SET free_access=?1, user_grants_json=?2 WHERE share_id='identity-share'",
+            params![free, serde_json::to_string(&grants).unwrap()],
+        ).unwrap();
+        let dashboard = store
+            .dashboard_snapshot(&config, &geo, &proxy, viewer)
+            .await
+            .unwrap();
+        let standalone = store
+            .share_view_for_share_url("identity-share", &HashSet::new(), &HashMap::new(), viewer)
+            .await
+            .unwrap();
+        for share in [&dashboard.shares[0], &standalone] {
+            assert_eq!(share.can_view_account_identity, expected);
+            assert!(!share.can_manage);
+            if expected {
+                assert_eq!(
+                    share
+                        .app_runtimes
+                        .codex
+                        .as_ref()
+                        .unwrap()
+                        .account_email
+                        .as_deref(),
+                    Some(PRIVATE_ACCOUNT)
+                );
+            } else {
+                assert_masked(share);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn share_account_identity_shared_users_do_not_inherit_unrelated_standalone_accounts() {
+    let (store, _) = fixture().await;
+    let mut runtimes: serde_json::Value = serde_json::from_str(
+        &store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT app_runtimes_json FROM shares WHERE share_id='identity-share'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    // Matching a display name alone is not proof that two accounts are equal.
+    runtimes["cursor"]["accountEmail"] = serde_json::json!("unrelated-cursor@example.test");
+    store
+        .conn
+        .lock()
+        .await
+        .execute(
+            "UPDATE shares SET app_runtimes_json=?1 WHERE share_id='identity-share'",
+            params![runtimes.to_string()],
+        )
+        .unwrap();
+    let view = store
+        .share_view_for_share_url(
+            "identity-share",
+            &HashSet::new(),
+            &HashMap::new(),
+            Some("shared@example.com"),
+        )
+        .await
+        .unwrap();
+    assert!(view.can_view_account_identity);
+    assert_eq!(
+        view.app_runtimes
+            .codex
+            .as_ref()
+            .unwrap()
+            .account_email
+            .as_deref(),
+        Some(PRIVATE_ACCOUNT)
+    );
+    assert!(
+        !serde_json::to_string(&view)
+            .unwrap()
+            .contains("unrelated-cursor@example.test")
+    );
+    assert_eq!(
+        view.app_runtimes
+            .cursor
+            .as_ref()
+            .unwrap()
+            .account_email
+            .as_deref(),
+        Some("u***r@example.test")
+    );
 }

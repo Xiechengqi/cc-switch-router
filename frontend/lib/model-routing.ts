@@ -267,7 +267,7 @@ export function modelRoutingShareAccountLines(
     .join(" · ");
   return {
     primaryLine: apiProvider ? providerApiEndpoint(primary) : providerQuotaStatusLine(primary, locale),
-    identityLine: apiProvider ? "-" : providerStatusIdentity(primary, share.access === "owner"),
+    identityLine: apiProvider ? "-" : providerStatusIdentity(primary, share.canViewAccountIdentity ?? share.access === "owner"),
     modelsLine: models || providerActualModelNames(primary, passthroughLabel),
   };
 }
