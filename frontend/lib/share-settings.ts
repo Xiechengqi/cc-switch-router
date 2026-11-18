@@ -1,3 +1,4 @@
+import { preservesCapabilitySchedule } from "./share-capabilities";
 import type {ShareCapabilityPolicy,CapabilityConsent} from "./share-capabilities";
 import type {
   ShareSettingsPatch,
@@ -225,7 +226,7 @@ function grantPolicyFingerprint(grant: ShareUserGrant) {
  * The Server-owned metering binding and consumption survive the edit.
  */
 export function stageUserPolicy(grant: ShareUserGrant, policy: ShareUserPolicy, current: ShareUserPolicy = grant.policy): ShareUserGrant {
-  return { ...grant, policy, pendingValueQuota: undefined,
+  return { ...grant, policy, pendingValueQuota: preservesCapabilitySchedule(grant, policy) ? grant.pendingValueQuota : undefined,
     quotaUnitConversion: grant.quotaUnitConversionPolicy === sharePolicyFingerprint(policy) ? grant.quotaUnitConversion : undefined,
   };
 }

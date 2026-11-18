@@ -1,7 +1,7 @@
 "use client";
 
 import {ShareCapabilitiesEditor} from "@/components/dashboard/share-edit/share-capabilities-editor";
-import {capabilityIntent,capabilityQuotaContext} from "@/lib/share-capabilities";
+import {capabilityNeedsReview,reconcileCapabilityGrants,type CapabilityReviewHandle} from "@/lib/share-capabilities";
 import {previewSharePageCapabilities} from "@/lib/share-api";
 
 import * as React from "react";
@@ -210,12 +210,14 @@ function ShareSettingsForm({
       expiresAt,
     };
   }, [draft, expiryLocal, expiryPermanent, parallelUnlimited, tokenLimitInput, tokenUnlimited, baseline.expiresAt]);
+  const capabilitiesRef = React.useRef<CapabilityReviewHandle>(null);
   const settingsPatch = buildShareSettingsPatch(effectiveDraft, baseline);
-  const capabilityReviewNeeded=capabilityIntent(draft.capabilityPolicy)!==capabilityIntent(baseline.capabilityPolicy)||!!draft.capabilityPolicy?.allowedOperations.length&&capabilityQuotaContext(draft.capabilityPolicy,draft.userGrants,effectiveDraft.tokenLimit)!==capabilityQuotaContext(baseline.capabilityPolicy,baseline.userGrants??{},baseline.tokenLimit);
+  const capabilityReviewNeeded = capabilityNeedsReview(draft.capabilityPolicy, draft.userGrants, effectiveDraft.tokenLimit,
+    baseline.capabilityPolicy, baseline.userGrants ?? {}, baseline.tokenLimit);
   const dirty = Object.keys(settingsPatch).length > 0 || capabilityReviewNeeded;
   dirtyRef.current = dirty;
   const fieldErrors = shareSettingsFieldErrors(effectiveDraft);
-  const formInvalid = shareSettingsHasFieldErrors(fieldErrors)||(capabilityReviewNeeded&&(!draft.capabilityConsent||draft.capabilityConsentScope!==capabilityQuotaContext(draft.capabilityPolicy,draft.userGrants,effectiveDraft.tokenLimit)));
+  const formInvalid = shareSettingsHasFieldErrors(fieldErrors);
   const ceilingInvalid =
     fieldErrors.tokenLimit || fieldErrors.parallelLimit || fieldErrors.expiresAt;
   const firstValidationMessage = fieldErrors.description
@@ -249,7 +251,14 @@ function ShareSettingsForm({
     setError("");
     setNotice("");
     try {
-      const result = await updateSharePageSettings(settingsPatch, baseline.configRevision);
+      let reviewedDraft = effectiveDraft;
+      if (capabilityReviewNeeded) {
+        if (!capabilitiesRef.current) throw new Error("Capability editor is unavailable");
+        const approval = await capabilitiesRef.current.review();
+        if (!approval) return;
+        reviewedDraft = { ...effectiveDraft, capabilityPolicy: approval.policy, capabilityConsent: approval.consent };
+      }
+      const result = await updateSharePageSettings(buildShareSettingsPatch(reviewedDraft, baseline), baseline.configRevision);
       if (result.appliedSynchronously) refreshAfterSaveRef.current = true;
       else setPendingEditId(result.edit.id);
       setNotice(
@@ -300,12 +309,12 @@ function ShareSettingsForm({
         </label>
       </div>
 
-      {editable?<ShareCapabilitiesEditor shareId={share.shareId} revision={baseline.configRevision??0} policy={draft.capabilityPolicy} savedPolicy={baseline.capabilityPolicy} grants={draft.userGrants} tokenLimit={effectiveDraft.tokenLimit} disabled={busy||!!pendingEditId} previewCapabilities={previewSharePageCapabilities}
-        onGrantOperationsChange={(email,allowedOperations)=>setDraft(current=>({...current,capabilityConsent:undefined,userGrants:{...current.userGrants,[email]:{...current.userGrants[email],policy:{...current.userGrants[email].policy,allowedOperations}}}}))}
-        onChange={(capabilityPolicy,capabilityConsent)=>setDraft(current=>{
-          const userGrants=Object.fromEntries(Object.entries(current.userGrants).map(([email,g])=>[email,g.active&&g.manager!=="routerShareMarket"&&g.policy.valueQuota&&capabilityPolicy.allowedOperations.some(op=>g.policy.allowedOperations?.includes(op)??true)?{...g,policy:{...g.policy,valueQuota:{...g.policy.valueQuota,tariffPolicyId:"api-equivalent-v2" as const}}}:g]));
-          return {...current,capabilityPolicy,capabilityConsent,userGrants,capabilityConsentScope:capabilityConsent?capabilityQuotaContext(capabilityPolicy,userGrants,effectiveDraft.tokenLimit):undefined};
-        })}/>:null}
+      {editable ? <ShareCapabilitiesEditor shareId={share.shareId} revision={baseline.configRevision ?? 0}
+        policy={draft.capabilityPolicy} savedPolicy={baseline.capabilityPolicy} grants={draft.userGrants}
+        tokenLimit={effectiveDraft.tokenLimit} disabled={busy || !!pendingEditId} previewCapabilities={previewSharePageCapabilities} reviewRef={capabilitiesRef}
+        onChange={capabilityPolicy => setDraft(current => ({ ...current, capabilityPolicy, capabilityConsent: undefined,
+          userGrants: reconcileCapabilityGrants(capabilityPolicy, current.userGrants),
+        }))} /> : null}
 
       <ShareAccessQuotaSection
         t={t}
@@ -386,7 +395,7 @@ function ShareSettingsForm({
         }
         users={
           editable ? (
-            <ShareUserGrantsEditor independentCapabilities={!!draft.capabilityPolicy}
+            <ShareUserGrantsEditor independentCapabilities={!!draft.capabilityPolicy} shareOperations={draft.capabilityPolicy?.allowedOperations}
               value={draft.userGrants}
               ownerEmail={share.ownerEmail || ""}
               defaultPolicy={defaultUserPolicy}
@@ -400,7 +409,7 @@ function ShareSettingsForm({
               onValueUsageInitializationsChange={(userValueUsageInitializations) => setDraft((current) => ({ ...current, userValueUsageInitializations }))}
               onUsageEditsChange={(userUsageEdits) => setDraft((current) => ({ ...current, userUsageEdits }))}
               onChange={(userGrants) =>
-                setDraft((current) => ({ ...current, userGrants }))
+                setDraft((current) => ({ ...current, capabilityConsent: undefined, userGrants: current.capabilityPolicy ? reconcileCapabilityGrants(current.capabilityPolicy, userGrants) : userGrants }))
               }
               freeAccess={draft.freeAccess}
             />

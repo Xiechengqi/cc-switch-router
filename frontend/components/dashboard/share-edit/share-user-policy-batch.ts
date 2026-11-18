@@ -7,6 +7,7 @@ import type {
 import { stageUserPolicy } from "@/lib/share-settings";
 
 export type ShareUserPolicyBatchPatch = {
+  allowedOperations?: { value?: ShareUserPolicy["allowedOperations"] };
   parallelLimit?: { value?: number };
   tokenLimit?: {
     value?: number;
@@ -20,6 +21,7 @@ export type ShareUserPolicyBatchPatch = {
 /** The policy a batch patch asks for, built on the grant's scheduled policy when it has one. */
 export function patchedUserPolicy(grant: ShareUserGrant, patch: ShareUserPolicyBatchPatch): ShareUserPolicy {
   const policy = { ...(grant.pendingValueQuota?.policy ?? grant.policy) };
+  if (patch.allowedOperations) policy.allowedOperations = patch.allowedOperations.value;
   if (patch.parallelLimit) {
     policy.parallelLimit = patch.parallelLimit.value;
   }

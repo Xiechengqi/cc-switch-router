@@ -1,20 +1,28 @@
 "use client";
+/* Hallmark · pre-emit critique: P4 H4 E4 S5 R5 V3 */
 import * as React from "react";
-import { Button } from "@heroui/react";
+import { Button, Modal } from "@heroui/react";
 import { previewShareCapabilities } from "@/lib/api";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   capabilityAmount,
-  SHARE_OPERATIONS,
+  capabilityOptions,
+  capabilitySelectable,
+  capabilityStatus,
+  capabilityPricingText,
+  capabilityScopeLabel,
   OPERATION_LABELS,
   COVERAGE_LABELS,
   emptyCapabilityPolicy,
   type ShareCapabilityPolicy,
+  type CapabilityReviewHandle,
   type CapabilityConsent,
-  type CapabilityPreview,
+  type ShareOperation,
 } from "@/lib/share-capabilities";
+import { useCapabilityReview } from "@/lib/use-share-capabilities";
 import type { ShareUserGrantMap } from "@/lib/types";
 
+/** Share-wide intent only; individual restrictions live in the user quota editor. */
 export function ShareCapabilitiesEditor({
   shareId,
   revision,
@@ -24,601 +32,515 @@ export function ShareCapabilitiesEditor({
   tokenLimit,
   disabled,
   onChange,
-  onGrantOperationsChange,
   previewCapabilities = previewShareCapabilities,
+  reviewRef,
 }: {
-  previewCapabilities?: typeof previewShareCapabilities;
   shareId: string;
   revision: number;
   policy?: ShareCapabilityPolicy;
   savedPolicy?: ShareCapabilityPolicy;
   grants: ShareUserGrantMap;
   tokenLimit: number;
-  onGrantOperationsChange: (
-    email: string,
-    operations?: ShareCapabilityPolicy["allowedOperations"],
-  ) => void;
   disabled?: boolean;
   onChange: (
     policy: ShareCapabilityPolicy,
     consent?: CapabilityConsent,
   ) => void;
+  previewCapabilities?: typeof previewShareCapabilities;
+  reviewRef?: React.Ref<CapabilityReviewHandle>;
 }) {
   const { locale } = useLocaleText();
   const lang = locale.startsWith("zh") ? 0 : 1;
-  const [preview, setPreview] = React.useState<CapabilityPreview>();
-  const [error, setError] = React.useState("");
-  const [accepted, setAccepted] = React.useState<string[]>([]);
-  const [refresh, setRefresh] = React.useState(0);
-  const [bulkEmails, setBulkEmails] = React.useState<string[]>([]);
-  const [bulkOps, setBulkOps] = React.useState<
-    ShareCapabilityPolicy["allowedOperations"]
-  >([]);
-  const selected = policy?.allowedOperations ?? [];
-  const inheritedGrants = Object.values(grants).filter(
-    (grant) => grant.active && grant.policy.allowedOperations === undefined,
-  ).length;
-  const requestKey = JSON.stringify([
+  const review = useCapabilityReview({
     shareId,
     revision,
-    selected,
-    policy?.operationBindings,
-    Object.entries(grants)
-      .filter(([, g]) => g.active)
-      .map(([email, g]) => [email, g.policy]),
+    policy,
+    savedPolicy,
+    grants,
     tokenLimit,
-    refresh,
-  ]);
-  React.useEffect(() => {
-    const abort = new AbortController();
-    setPreview(undefined);
-    setAccepted([]);
-    setError("");
-    const input = {
-      expectedConfigRevision: revision,
-      replacePolicies: true,
-      policy: policy,
-      policies: Object.fromEntries(
-        Object.entries(grants)
-          .filter(([, g]) => g.active)
-          .map(([email, g]) => [email, g.policy]),
-      ),
-      shareTokenLimit: tokenLimit,
-    };
-    const timer = setTimeout(() => {
-      void previewCapabilities(shareId, input, abort.signal)
-        .then((value) => {
-          if (!abort.signal.aborted) setPreview(value);
-        })
-        .catch((err) => {
-          if (!abort.signal.aborted)
-            setError(err instanceof Error ? err.message : String(err));
-        });
-    }, 200);
-    return () => {
-      clearTimeout(timer);
-      abort.abort();
-    };
-    // The request key deliberately excludes server-owned audit fields / credentials.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [requestKey]);
-  const choose = (
-    operation: (typeof SHARE_OPERATIONS)[number],
-    checked: boolean,
-  ) => {
-    const bindings = { ...policy?.operationBindings };
+    request: previewCapabilities,
+    reviewRef,
+    lang,
+  });
+  const { preview } = review;
+  const options = capabilityOptions(preview, policy);
+  const main = options.filter((option) => option.available || option.selected);
+  const setup = options.filter(
+    (option) => !option.available && !option.selected && option.configurable,
+  );
+  const ready = review.current && preview?.ready && !review.loading;
+  const choose = (operation: ShareOperation, checked: boolean) => {
+    const current = policy ?? emptyCapabilityPolicy();
+    const bindings = { ...current.operationBindings };
     delete bindings[operation];
     onChange({
-      ...emptyCapabilityPolicy(),
+      ...current,
       operationBindings: bindings,
       allowedOperations: checked
-        ? [...selected, operation]
-        : selected.filter((op) => op !== operation),
+        ? [...current.allowedOperations, operation]
+        : current.allowedOperations.filter((op) => op !== operation),
     });
   };
-  const required =
-    preview?.requiredAcknowledgements.filter(
-      (ack) =>
-        !savedPolicy?.coverageAcknowledgements?.some(
-          (old) => old.condition === ack.condition,
-        ),
-    ) ?? [];
-  const expired = !!preview && preview.expiresAt <= Date.now();
+  const following = Object.values(grants).filter(
+    (g) =>
+      g.active &&
+      g.role !== "owner" &&
+      g.policy.allowedOperations === undefined &&
+      g.manager !== "routerShareMarket",
+  ).length;
   return (
     <section
-      className="grid gap-3 rounded-xl border border-slate-200 p-4"
+      className="grid min-w-0 gap-3 rounded-xl border border-border p-4 [overflow-wrap:anywhere]"
       aria-label={lang === 0 ? "扩展能力" : "Extended capabilities"}
     >
-      <div>
-        <h3 className="font-medium">
-          {lang === 0 ? "扩展能力" : "Extended capabilities"}
-        </h3>
-        <p className="mt-1 text-xs text-muted-foreground">
-          {lang === 0
-            ? "适用于 Token、美元和无限额调用。图片、文档、音频与视频理解输入继续可用。美元为 API 等值额度。"
-            : "Applies to Token, USD and unlimited usage. Image, document, audio and video understanding inputs remain available. USD means API-equivalent usage."}
-        </p>
-      </div>
-      <p className="text-xs text-muted-foreground">
-        {lang === 0
-          ? `${inheritedGrants} 个有效授权继承 Share 能力，保存后的权限变化将对这些授权生效。`
-          : `${inheritedGrants} active grants inherit Share capabilities and will follow the saved permissions.`}
-      </p>
-      {!policy && preview?.policy.allowedOperations.length ? (
-        <button
-          type="button"
-          className="text-left text-xs underline"
-          disabled={disabled}
-          onClick={() => onChange(preview.policy)}
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h3 className="font-medium">
+            {lang === 0 ? "扩展能力" : "Extended capabilities"}
+          </h3>
+          <p className="mt-1 text-xs text-muted-foreground">
+            {lang === 0
+              ? "选择此 Share 允许的生成能力与供应商工具。图片、文档、音频和视频理解输入不受这些开关影响。"
+              : "Choose generation capabilities and Provider-hosted tools. Image, document, audio and video understanding inputs are unaffected."}
+          </p>
+        </div>
+        <Button
+          size="sm"
+          variant="ghost"
+          isDisabled={disabled || review.loading}
+          onClick={review.refresh}
         >
-          {lang === 0
-            ? "载入旧 Grok 明确授权的迁移草稿"
-            : "Load migration draft for explicit legacy Grok permissions"}
-        </button>
-      ) : null}
-      {!savedPolicy ? (
-        <p className="text-xs text-amber-700">
-          {lang === 0
-            ? "旧授权策略：尚未独立控制。选择并确认后采用新策略；未勾选操作将关闭。"
-            : "Legacy authorization: independent control is not active. Confirming adopts the new policy and disables unchecked operations."}
+          {lang === 0 ? "刷新" : "Refresh"}
+        </Button>
+      </div>
+      {review.error ? (
+        <p role="alert" className="text-sm text-danger">
+          {review.error}
         </p>
       ) : null}
-      {error ? (
-        <p role="alert" className="text-sm text-red-600">
-          {error}
-        </p>
-      ) : null}
-      {!preview && !error ? (
-        <p role="status">
+      {review.loading ? (
+        <p role="status" className="text-xs text-muted-foreground">
           {lang === 0
-            ? "正在读取 Server 能力…"
-            : "Loading Server capabilities…"}
+            ? "正在检查当前供应商能力…"
+            : "Checking current Provider capabilities…"}
         </p>
       ) : null}
       {preview && !preview.ready ? (
-        <p role="alert" className="text-xs text-amber-700">
+        <p role="alert" className="text-xs text-warning">
           {lang === 0
-            ? "需要 Router / Server 支持新协议并启用权威存储，当前不能保存新策略。"
-            : "Router / Server protocol and authoritative storage must be ready before saving."}
+            ? "当前无法保存能力变更，请检查 Server 连接、协议版本与存储状态。"
+            : "Capability changes cannot be saved yet. Check the Server connection, protocol and storage."}
         </p>
       ) : null}
-      <div className="grid gap-3">
-        {SHARE_OPERATIONS.map((operation) => {
-          const rows =
-            preview?.rows.filter((row) => row.operation === operation) ?? [];
-          const available = rows.some((row) => row.controllable);
-          return (
-            <div key={operation} className="border-t border-slate-100 pt-2">
-              <label className="flex items-start gap-2 text-sm">
-                <input
-                  type="checkbox"
-                  checked={selected.includes(operation)}
-                  disabled={
-                    disabled ||
-                    !preview?.ready ||
-                    (!available && !selected.includes(operation))
-                  }
-                  onChange={(e) => choose(operation, e.target.checked)}
-                />
-                <span>{OPERATION_LABELS[operation][lang]}</span>
-              </label>
-              <div className="ml-6 text-xs text-muted-foreground">
-                {rows.length
-                  ? rows.map((row) => (
-                      <p key={row.app}>
-                        {selected.includes(operation) ? (
-                          <input
-                            aria-label={`${operation} ${row.app}`}
-                            type="checkbox"
-                            checked={row.selected ?? false}
-                            disabled={disabled || !row.controllable}
-                            onChange={(e) => {
-                              const bindings =
-                                preview?.policy.operationBindings[operation] ??
-                                [];
-                              onChange({
-                                ...preview!.policy,
-                                operationBindings: {
-                                  ...preview!.policy.operationBindings,
-                                  [operation]: e.target.checked
-                                    ? [
-                                        ...bindings.filter(
-                                          (b) => b.app !== row.app,
-                                        ),
-                                        {
-                                          app: row.app,
-                                          fingerprint: row.bindingFingerprint,
-                                        },
-                                      ]
-                                    : bindings.filter((b) => b.app !== row.app),
-                                },
-                              });
-                            }}
-                          />
-                        ) : null}
-                        {row.app} ·{" "}
-                        {row.execution === "supported"
-                          ? lang === 0
-                            ? "账号证据支持"
-                            : "Supported by account evidence"
-                          : row.execution === "unsupported"
-                            ? lang === 0
-                              ? "当前账号不支持"
-                              : "Unsupported by the current account"
-                            : row.controllable
-                              ? lang === 0
-                                ? "可拦截，账号待实测"
-                                : "Controllable; live verification pending"
-                              : lang === 0
-                                ? "当前运行时未实现或未启用"
-                                : "Not implemented or enabled on this runtime"}{" "}
-                        · {row.nativeUnit} ·{" "}
-                        {row.pricing === "explicit_free"
-                          ? lang === 0
-                            ? "资源价格明确为零"
-                            : "Resource rate explicitly zero"
-                          : row.pricing === "priced"
-                            ? lang === 0
-                              ? "已配置资源价"
-                              : "Resource price configured"
-                            : lang === 0
-                              ? "模型范围或资源价格未覆盖"
-                              : "Model range or resource pricing incomplete"}
-                      </p>
-                    ))
-                  : lang === 0
-                    ? "无可用运行时"
-                    : "No available runtime"}
-              </div>
-            </div>
-          );
-        })}
-      </div>
-      <details>
-        <summary className="cursor-pointer text-sm">
-          {lang === 0 ? "用户有效能力与权限范围" : "User capability scopes"}
-        </summary>
-        <div className="mt-2 grid gap-3">
-          {Object.entries(grants)
-            .filter(([, g]) => g.active)
-            .map(([email, g]) => (
-              <div key={email} className="text-xs">
-                <span>{email}</span>
-                {g.manager === "routerShareMarket" ? (
-                  <span>
-                    {" "}
-                    · {lang === 0 ? "市场合同固定" : "Frozen Market contract"}
-                  </span>
-                ) : (
-                  <>
-                    <select
-                      className="ml-2 rounded border p-1"
-                      aria-label={`${email} capabilities`}
-                      value={
-                        g.policy.allowedOperations === undefined
-                          ? "inherit"
-                          : "explicit"
-                      }
-                      disabled={disabled}
-                      onChange={(e) =>
-                        onGrantOperationsChange(
-                          email,
-                          e.target.value === "inherit" ? undefined : [],
-                        )
-                      }
-                    >
-                      <option value="inherit">
-                        {lang === 0 ? "继承 Share" : "Inherit Share"}
-                      </option>
-                      <option value="explicit">
-                        {lang === 0 ? "仅允许勾选项" : "Explicit subset"}
-                      </option>
-                    </select>
-                    {g.policy.allowedOperations !== undefined ? (
-                      <div className="mt-1 flex flex-wrap gap-2">
-                        {selected.map((op) => (
-                          <label key={op} className="flex gap-1">
-                            <input
-                              type="checkbox"
-                              checked={g.policy.allowedOperations?.includes(op)}
-                              disabled={disabled}
-                              onChange={(e) =>
-                                onGrantOperationsChange(
-                                  email,
-                                  e.target.checked
-                                    ? [...g.policy.allowedOperations!, op]
-                                    : g.policy.allowedOperations!.filter(
-                                        (v) => v !== op,
-                                      ),
-                                )
-                              }
-                            />
-                            {OPERATION_LABELS[op][lang]}
-                          </label>
-                        ))}
-                      </div>
-                    ) : null}
-                  </>
-                )}
-              </div>
-            ))}
-        </div>
-      </details>
-      <details>
-        <summary className="cursor-pointer text-xs">
-          {lang === 0 ? "批量修改能力权限" : "Batch capability permissions"}
-        </summary>
-        <div className="my-2 flex flex-wrap gap-3 text-xs">
-          {Object.entries(grants)
-            .filter(([, g]) => g.active && g.manager !== "routerShareMarket")
-            .map(([email]) => (
-              <label key={email} className="flex gap-1">
-                <input
-                  type="checkbox"
-                  checked={bulkEmails.includes(email)}
-                  disabled={disabled}
-                  onChange={(e) =>
-                    setBulkEmails((current) =>
-                      e.target.checked
-                        ? [...current, email]
-                        : current.filter((v) => v !== email),
-                    )
-                  }
-                />
-                {email}
-              </label>
-            ))}
-        </div>
-        <div className="my-2 flex flex-wrap gap-3 text-xs">
-          {selected.map((op) => (
-            <label key={op} className="flex gap-1">
-              <input
-                type="checkbox"
-                checked={bulkOps.includes(op)}
-                disabled={disabled}
-                onChange={(e) =>
-                  setBulkOps((current) =>
-                    e.target.checked
-                      ? [...current, op]
-                      : current.filter((v) => v !== op),
-                  )
-                }
-              />
-              {OPERATION_LABELS[op][lang]}
-            </label>
-          ))}
-        </div>
-        <div className="flex gap-3 text-xs">
-          <button
-            type="button"
-            disabled={disabled || !bulkEmails.length}
-            className="underline"
-            onClick={() =>
-              bulkEmails
-                .filter(
-                  (e) =>
-                    grants[e]?.active &&
-                    grants[e].manager !== "routerShareMarket",
-                )
-                .forEach((email) => onGrantOperationsChange(email, undefined))
-            }
-          >
-            {lang === 0 ? "选中用户继承 Share" : "Selected users inherit Share"}
-          </button>
-          <button
-            type="button"
-            disabled={disabled || !bulkEmails.length}
-            className="underline"
-            onClick={() =>
-              bulkEmails
-                .filter(
-                  (e) =>
-                    grants[e]?.active &&
-                    grants[e].manager !== "routerShareMarket",
-                )
-                .forEach((email) =>
-                  onGrantOperationsChange(
-                    email,
-                    bulkOps.filter((op) => selected.includes(op)),
-                  ),
-                )
-            }
-          >
-            {lang === 0
-              ? "选中用户仅允许勾选项（空表示禁用）"
-              : "Limit selected users to checked operations (empty disables)"}
-          </button>
-        </div>
-      </details>
-      {preview?.blockers?.some(
-        (b) => b.blocker === "VALUE_QUOTA_RESOURCE_POLICY_REQUIRED",
-      ) ? (
-        <button
-          type="button"
-          className="text-left text-xs underline"
-          disabled={disabled}
-          onClick={() => onChange(policy ?? emptyCapabilityPolicy())}
-        >
+      {preview?.unavailableBindings?.length ? (
+        <p role="alert" className="text-xs text-warning">
           {lang === 0
-            ? "为选中能力采用资源价卡并重新预览（保留缺价策略）"
-            : "Use resource tariff and preview again (preserves missing-price policy)"}
-        </button>
-      ) : null}
-      {preview?.blockers?.map((b, index) => (
-        <p
-          key={`${b.scope}-${index}`}
-          role="alert"
-          className="text-xs text-red-700"
-        >
-          {b.scope}:{" "}
-          {b.blocker === "VALUE_QUOTA_RESOURCE_POLICY_REQUIRED"
-            ? lang === 0
-              ? "需要先为美元授权采用资源价卡，再刷新预览。"
-              : "USD grants require a resource tariff before refreshing the preview."
-            : b.blocker}
+            ? "部分供应商绑定无法读取，已有选择保留；请处理供应商配置后重试。"
+            : "Some Provider bindings are unavailable. Existing choices are retained; check Provider settings and retry."}
         </p>
-      ))}
-      <details>
-        <summary className="cursor-pointer text-xs">
-          {lang === 0 ? "额度覆盖与计量说明" : "Quota coverage and measurement"}
-        </summary>
-        {preview?.rows
-          .filter((row) => selected.includes(row.operation))
-          .map((row) => (
-            <div key={`${row.app}-${row.operation}`} className="my-2 text-xs">
-              <p>
-                {row.app} · {OPERATION_LABELS[row.operation][lang]} ·{" "}
-                {lang === 0
-                  ? "数量可能估算，预占是软上限"
-                  : "Quantities may be estimated; reservation is a soft limit"}
-              </p>
-              {row.scopes.map((scope) => (
-                <p key={scope.scope}>
-                  {scope.scope} · {scope.quotaUnit} · {scope.coverage}:{" "}
-                  {COVERAGE_LABELS[scope.reason]?.[lang] ?? scope.reason}
-                </p>
-              ))}
-            </div>
-          ))}
-      </details>
-      {required.length ? (
-        <div className="grid max-h-64 gap-2 overflow-y-auto rounded-lg bg-amber-50 p-3 text-xs">
+      ) : null}
+      {!policy ? (
+        <div className="grid justify-items-start gap-2 text-sm">
           <p>
             {lang === 0
-              ? "以下消耗无法完整约束到所选额度。逐项确认仅适用于当前用户、单位和运行时；切换后需重新预览。"
-              : "The selected quotas do not fully cover these resources. Acceptance is scoped to the current user, unit and runtime."}
+              ? "此 Share 尚未设置独立能力权限。"
+              : "This Share has no independent capability policy yet."}
           </p>
-          {required.map((ack) => {
-            const detail = preview?.rows
-              .flatMap((row) => row.scopes)
-              .find((scope) => scope.condition === ack.condition);
-            return (
-              <label key={ack.condition} className="flex items-start gap-2">
-                <input
-                  type="checkbox"
-                  checked={accepted.includes(ack.condition)}
-                  disabled={disabled}
-                  onChange={(e) =>
-                    setAccepted((current) =>
-                      e.target.checked
-                        ? [...current, ack.condition]
-                        : current.filter((c) => c !== ack.condition),
-                    )
-                  }
-                />
-                <span>
-                  {ack.scope === "$default"
+          <Button
+            size="sm"
+            variant="outline"
+            isDisabled={disabled || !ready}
+            onClick={() => onChange(preview?.policy ?? emptyCapabilityPolicy())}
+          >
+            {lang === 0
+              ? "设置扩展能力权限"
+              : "Configure extension permissions"}
+          </Button>
+          <p className="text-xs text-muted-foreground">
+            {lang === 0
+              ? "开始配置后，保存时会确认本次允许和关闭的能力。"
+              : "After configuration, saving reviews which capabilities will be allowed or disabled."}
+          </p>
+        </div>
+      ) : (
+        <>
+          {preview && !options.length ? (
+            <p className="py-2 text-sm text-muted-foreground">
+              {lang === 0
+                ? "当前绑定没有可配置的扩展能力。"
+                : "The current bindings have no configurable extensions."}
+            </p>
+          ) : null}
+          {main.map((option) => (
+            <div
+              key={option.operation}
+              className="min-w-0 border-t border-border py-2"
+            >
+              <label className="flex cursor-pointer items-center justify-between gap-3 text-sm">
+                <span className="flex min-w-0 items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={option.selected}
+                    disabled={
+                      disabled ||
+                      !ready ||
+                      (!option.available && !option.selected)
+                    }
+                    onChange={(event) =>
+                      choose(option.operation, event.target.checked)
+                    }
+                    className="accent-primary focus-visible:outline-2 focus-visible:outline-offset-2 disabled:cursor-not-allowed"
+                  />
+                  {OPERATION_LABELS[option.operation][lang]}
+                </span>
+                <span className="text-xs text-muted-foreground">
+                  {!option.available
                     ? lang === 0
-                      ? "默认访问与 owner"
-                      : "Default access and owner"
-                    : ack.scope}{" "}
-                  · {OPERATION_LABELS[ack.operation][lang]} · {ack.quotaUnit}:{" "}
-                  {COVERAGE_LABELS[detail?.reason ?? ""]?.[lang] ??
-                    detail?.reason}
+                      ? "暂不可用"
+                      : "Unavailable"
+                    : option.rows.some(
+                          (row) =>
+                            capabilitySelectable(row) &&
+                            row.accountSupport !== "supported",
+                        )
+                      ? lang === 0
+                        ? "账号待验证"
+                        : "Verification pending"
+                      : lang === 0
+                        ? "账号已验证"
+                        : "Account verified"}
                 </span>
               </label>
-            );
-          })}
-        </div>
-      ) : null}
-      <div className="flex flex-wrap gap-2">
-        <Button
-          size="sm"
-          variant="outline"
-          isDisabled={disabled}
-          onClick={() => setRefresh((v) => v + 1)}
-        >
-          {lang === 0 ? "刷新预览" : "Refresh preview"}
-        </Button>
-        <Button
-          size="sm"
-          isDisabled={
-            disabled ||
-            !preview?.ready ||
-            expired ||
-            (preview?.blockers?.length ?? 0) > 0 ||
-            required.some((ack) => !accepted.includes(ack.condition))
-          }
-          onClick={() => {
-            if (preview?.previewCredential)
-              onChange(preview.policy, {
-                credential: preview.previewCredential,
-                acceptUncovered: accepted,
-              });
-          }}
-        >
-          {lang === 0 ? "确认本次能力配置" : "Confirm capability configuration"}
-        </Button>
-      </div>
+              <details className="mt-1 pl-6 text-xs text-muted-foreground">
+                <summary className="cursor-pointer">
+                  {lang === 0 ? "查看支持与计量" : "Support and metering"}
+                </summary>
+                <div className="mt-2 grid gap-2">
+                  {option.rows
+                    .filter((row) => row.implemented !== false || row.selected || option.selected)
+                    .map((row) => (
+                      <div key={row.app} className="grid gap-1">
+                        <p>
+                          {row.providerLabel ||
+                            (lang === 0
+                              ? "当前供应商"
+                              : "Current Provider")}{" "}
+                          · {row.app} · {capabilityStatus(row, lang)}
+                        </p>
+                        {row.model ? (
+                          <p>
+                            {lang === 0 ? "固定模型：" : "Fixed model: "}
+                            {row.model}
+                          </p>
+                        ) : (
+                          <p>
+                            {lang === 0
+                              ? "模型由实际请求决定"
+                              : "Model determined by each request"}
+                          </p>
+                        )}
+                        <p>{capabilityPricingText(row, lang)}</p>
+                        {option.selected &&
+                        (option.rows.filter(capabilitySelectable).length > 1 ||
+                          option.rows.some(
+                            (item) =>
+                              capabilitySelectable(item) && !item.selected,
+                          )) ? (
+                          <label className="flex items-center gap-2">
+                            <input
+                              type="checkbox"
+                              checked={row.selected ?? false}
+                              disabled={
+                                disabled || !ready || !capabilitySelectable(row)
+                              }
+                              aria-label={`${OPERATION_LABELS[option.operation][lang]} ${row.app}`}
+                              onChange={(event) => {
+                                if (!preview) return;
+                                const current =
+                                  preview.policy.operationBindings[
+                                    option.operation
+                                  ] ?? [];
+                                onChange({
+                                  ...preview.policy,
+                                  operationBindings: {
+                                    ...preview.policy.operationBindings,
+                                    [option.operation]: event.target.checked
+                                      ? [
+                                          ...current.filter(
+                                            (binding) =>
+                                              binding.app !== row.app,
+                                          ),
+                                          {
+                                            app: row.app,
+                                            fingerprint: row.bindingFingerprint,
+                                          },
+                                        ]
+                                      : current.filter(
+                                          (binding) => binding.app !== row.app,
+                                        ),
+                                  },
+                                });
+                              }}
+                            />
+                            {lang === 0
+                              ? `允许 ${row.app} 入口`
+                              : `Allow ${row.app} access`}
+                          </label>
+                        ) : null}
+                        {option.selected && row.selected ? (
+                          <div className="grid gap-1">
+                            {[
+                              ...new Map(
+                                row.scopes.map((scope) => [
+                                  JSON.stringify([
+                                    scope.quotaUnit,
+                                    scope.reason,
+                                  ]),
+                                  scope,
+                                ]),
+                              ).values(),
+                            ].map((scope) => (
+                              <p key={`${scope.quotaUnit}-${scope.reason}`}>
+                                {COVERAGE_LABELS[scope.reason]?.[lang] ??
+                                  (lang === 0
+                                    ? "计量状态尚未明确"
+                                    : "Measurement status unknown")}
+                              </p>
+                            ))}
+                          </div>
+                        ) : null}
+                      </div>
+                    ))}
+                  {!option.rows.length ? (
+                    <p>
+                      {lang === 0
+                        ? "原绑定已不可用，可取消此能力。"
+                        : "The previous binding is unavailable. You can disable this capability."}
+                    </p>
+                  ) : null}
+                </div>
+              </details>
+            </div>
+          ))}
+          {setup.length ? (
+            <details className="text-xs text-muted-foreground">
+              <summary className="cursor-pointer">
+                {lang === 0 ? "需先配置的能力" : "Capabilities requiring setup"}
+              </summary>
+              <div className="mt-2 grid gap-1">
+                {setup.map((option) => (
+                  <p key={option.operation}>
+                    {OPERATION_LABELS[option.operation][lang]} ·{" "}
+                    {lang === 0
+                      ? "需先在供应商设置中开启"
+                      : "Enable in Provider settings first"}
+                  </p>
+                ))}
+              </div>
+            </details>
+          ) : null}
+          {policy.allowedOperations.length ? (
+            <p className="text-xs text-muted-foreground">
+              {lang === 0
+                ? `分享用户默认跟随此设置${following ? `（当前 ${following} 人）` : ""}。单个用户可在“用户授权与配额”中进一步限制。`
+                : `Shared users follow these settings by default${following ? ` (${following} users)` : ""}. Restrict individuals under user access and quotas.`}
+            </p>
+          ) : null}
+        </>
+      )}
+      <p className="text-xs text-muted-foreground">
+        {lang === 0
+          ? "与本页其他修改一起保存，已消耗额度保留。"
+          : "Saved with the rest of this page. Consumed quota is retained."}
+      </p>
       {preview?.incidents?.length ? (
-        <div role="alert" className="rounded border border-red-300 p-2 text-xs">
+        <div role="alert" className="rounded border border-danger p-2 text-xs">
           <p>
             {lang === 0
-              ? "发现未计划的资源执行，受影响的用户与运行时已隔离。需修复控制路径后升级执行版本或重新绑定，再预览确认；历史用量与证据保留。"
-              : "Unplanned resource execution quarantined the affected user and runtime. Repair the control path, upgrade its execution version or rebind, then preview again. Historical usage and evidence are retained."}
+              ? "发现异常资源执行，相关调用已隔离。请先修复执行路径并重新核对绑定。"
+              : "Unexpected resource execution quarantined affected calls. Repair the execution path and review its binding."}
           </p>
-          {preview.incidents.map((item) => (
-            <p key={`${item.requestId}-${item.resource}`}>
-              {item.scope} · {item.resource} ·{" "}
-              {item.bindingFingerprint.slice(0, 12)}
-            </p>
-          ))}
+          <details>
+            <summary>{lang === 0 ? "异常证据" : "Incident evidence"}</summary>
+            {preview.incidents.map((item) => (
+              <p key={`${item.requestId}-${item.resource}`}>
+                {capabilityScopeLabel(item.scope, lang)} · {item.resource} ·{" "}
+                {item.bindingFingerprint.slice(0, 12)}
+              </p>
+            ))}
+          </details>
         </div>
       ) : null}
       {preview?.recentUsage?.length ? (
-        <details>
-          <summary className="cursor-pointer text-xs">
+        <details className="text-xs">
+          <summary className="cursor-pointer">
             {lang === 0
-              ? "最近执行与冻结计量明细"
-              : "Recent execution and frozen metering"}
+              ? "最近执行与计量明细"
+              : "Recent execution and metering"}
           </summary>
-          <div className="max-h-64 space-y-2 overflow-y-auto">
+          <div className="mt-2 grid max-h-64 gap-2 overflow-y-auto">
             {preview.recentUsage.map((item) => (
               <div
-                className="rounded border p-2 text-xs"
                 key={`${item.requestId}-${item.attempt}`}
+                className="border-t pt-2"
               >
                 <p>
-                  {item.scope} · #{item.attempt} ·{" "}
+                  {capabilityScopeLabel(item.scope, lang)} · #{item.attempt} ·{" "}
                   {item.meteringStatus === "not_in_usd_ledger"
                     ? lang === 0
                       ? "未记录美元扣减"
                       : "No USD quota debit recorded"
-                    : item.meteringStatus}{" "}
-                  ·{" "}
-                  {item.unpricedReason
-                    ? lang === 0
-                      ? "部分已计费"
-                      : "Partially billed"
-                    : lang === 0
-                      ? "等值计量金额"
-                      : "Equivalent metered value"}
-                  : {capabilityAmount(item.settledPicos)}
+                    : `${item.meteringStatus} · ${capabilityAmount(item.settledPicos)}`}
                 </p>
-                {item.dimensions.map((d) => (
-                  <p key={d.dimension}>
-                    {d.dimension}: {d.quantity} · {d.pricing} ·{" "}
-                    {capabilityAmount(d.amountPicos)}
-                    {item.estimated
+                {item.estimated ? (
+                  <p>
+                    {lang === 0
+                      ? "资源数量包含估算"
+                      : "Resource quantities include estimates"}
+                  </p>
+                ) : null}
+                {item.unpricedReason ? (
+                  <p>
+                    {lang === 0
+                      ? "含未定价用量："
+                      : "Includes unpriced usage: "}
+                    {item.unpricedReason}
+                  </p>
+                ) : null}
+                {item.pendingRiskPicos && item.pendingRiskPicos !== "0" ? (
+                  <p>
+                    {lang === 0
+                      ? "待结算风险预占："
+                      : "Pending risk reservation: "}
+                    {capabilityAmount(item.pendingRiskPicos)}
+                  </p>
+                ) : null}
+                {item.dimensions.map((dimension) => (
+                  <p key={dimension.dimension}>
+                    {dimension.dimension} · {dimension.quantity} ·{" "}
+                    {dimension.pricing === "not_in_usd_ledger"
                       ? lang === 0
-                        ? "（估算）"
-                        : " (estimated)"
-                      : null}
+                        ? "未记录美元扣减"
+                        : "No USD quota debit recorded"
+                      : dimension.pricing === "missing"
+                        ? lang === 0
+                          ? "未定价"
+                          : "Unpriced"
+                        : capabilityAmount(dimension.amountPicos)}
                   </p>
                 ))}
-                <p className="break-all text-muted-foreground">
-                  {item.pricingRevision}
-                </p>
+                {item.pricingRevision ? (
+                  <p className="break-all text-muted-foreground">
+                    {lang === 0 ? "冻结价目版本：" : "Frozen tariff revision: "}
+                    {item.pricingRevision}
+                  </p>
+                ) : null}
               </div>
             ))}
           </div>
         </details>
       ) : null}
-      <p className="text-xs text-muted-foreground">
-        {lang === 0
-          ? "确认后，与本页其他更改一起保存。能力变更不会清零已消耗额度。"
-          : "After confirming, save together with the other edits on this page. Capability changes preserve consumed usage."}
-      </p>
+      <Modal.Backdrop
+        isOpen={!!review.prompt}
+        onOpenChange={(open) => {
+          if (!open) review.cancel();
+        }}
+        className="z-[90]"
+      >
+        <Modal.Container placement="center" className="z-[90]">
+          <Modal.Dialog className="share-edit-surface light w-[min(560px,calc(100vw-2rem))] max-w-none max-h-[85dvh] overflow-y-auto bg-background text-foreground [overflow-wrap:anywhere]">
+            <Modal.Header>
+              <Modal.Heading>
+                {lang === 0 ? "确认扩展能力变更" : "Review extension changes"}
+              </Modal.Heading>
+            </Modal.Header>
+            <Modal.Body className="grid gap-4">
+              {review.prompt?.migration ? (
+                <p className="text-sm">
+                  {lang === 0
+                    ? "保存后开始独立控制扩展能力；未选择的能力将关闭。"
+                    : "Saving activates independent permissions. Unselected extensions will be disabled."}
+                </p>
+              ) : null}
+              <p className="text-sm">
+                {lang === 0 ? "允许：" : "Allow: "}
+                {review.prompt?.preview.policy.allowedOperations
+                  .map((op) => OPERATION_LABELS[op][lang])
+                  .join(lang === 0 ? "、" : ", ") ||
+                  (lang === 0 ? "无扩展能力" : "No extensions")}
+              </p>
+              {review.prompt?.groups.map((group) => (
+                <div
+                  key={group.key}
+                  className="grid gap-2 border-t pt-3 text-sm"
+                >
+                  <p>
+                    {COVERAGE_LABELS[group.reason]?.[lang] ??
+                      (lang === 0
+                        ? "部分资源无法完整计量或扣减额度。"
+                        : "Some resources cannot be fully measured or debited.")}
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    {group.operations
+                      .map((op) => OPERATION_LABELS[op][lang])
+                      .join(lang === 0 ? "、" : ", ")}
+                  </p>
+                  <details className="text-xs">
+                    <summary className="cursor-pointer">
+                      {lang === 0
+                        ? "查看受影响的用户与访问范围"
+                        : "Affected users and access"}
+                    </summary>
+                    {group.scopes.map((scope) => (
+                      <p className="break-all" key={scope}>
+                        {capabilityScopeLabel(scope, lang)}
+                      </p>
+                    ))}
+                  </details>
+                  <label className="flex items-start gap-2">
+                    <input
+                      type="checkbox"
+                      checked={review.accepted.includes(group.key)}
+                      onChange={(event) =>
+                        review.setAccepted((current) =>
+                          event.target.checked
+                            ? [...current, group.key]
+                            : current.filter((key) => key !== group.key),
+                        )
+                      }
+                    />
+                    {group.reason === "runtime_binding_changed"
+                      ? lang === 0
+                        ? "为当前绑定重新授权"
+                        : "Authorize the current binding"
+                      : lang === 0
+                        ? "我了解并允许上述未覆盖消耗"
+                        : "I understand and allow this uncovered usage"}
+                  </label>
+                </div>
+              ))}
+              <p className="text-xs text-muted-foreground">
+                {lang === 0
+                  ? "美元指 API 等值额度。估算与预占不能保证上游执行不会超量。"
+                  : "USD means API-equivalent quota. Estimates and reservations cannot guarantee an upstream execution limit."}
+              </p>
+            </Modal.Body>
+            <Modal.Footer>
+              <Button variant="ghost" onClick={review.cancel}>
+                {lang === 0 ? "返回修改" : "Back"}
+              </Button>
+              <Button
+                isDisabled={review.prompt?.groups.some(
+                  (group) => !review.accepted.includes(group.key),
+                )}
+                onClick={review.confirm}
+              >
+                {lang === 0 ? "确认并继续保存" : "Confirm and save"}
+              </Button>
+            </Modal.Footer>
+          </Modal.Dialog>
+        </Modal.Container>
+      </Modal.Backdrop>
     </section>
   );
 }

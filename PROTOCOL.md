@@ -1002,6 +1002,12 @@ owner 读取现有 settings edit 结果时追加 `quotaConversions`，用于响�
 
 输入为 `{expectedConfigRevision,policy?,policies?,replacePolicies?,shareTokenLimit?}`；输出含配置 revision、规范化 policy、逐绑定/操作 `rows`、`blockers`、`requiredAcknowledgements`、15 分钟 `previewCredential`、`recentUsage` 和 `incidents`。执行支持/不支持/未知与可拦截性分开；定价区分 priced / explicit_free / missing；数量估算与预占软上限明确展示。查询不触发上游请求。响应 private/no-store，浏览器在解析前后检查登录身份，并拒绝旧 Share / revision 的迟到或非法响应。
 
+显示诊断追加 `displayVersion:2`，不升级 v13 写协议。每个 row 增加 `implemented`（Driver 是否实现）、`providerEnabled`（Provider 配置是否开启）、`accountSupport:supported|unsupported|unknown`、`unavailableReason:driver_not_implemented|provider_disabled|runtime_unavailable|account_unsupported|null`、`requiredProviderOption`、`providerLabel`、`modelScope:fixed|request`、`pricingCoverage:base_rate|parameter_rates|request_dependent|missing|tariff_unavailable`。缺少运行时的 App 在 `unavailableBindings:[{app,reason:"runtime_unavailable"}]` 报告。协议目录不等于当前可执行集合，旧 row 的 `execution:unsupported` 不能被解释成账号明确不支持。显示事实不参与计价或替代准入校验；实际模型和参数仍逐请求校验。
+
+界面只展示可配置或已保存选择的操作；需要 Provider 开关的操作折叠显示。账号未知保持待验证，不触发付费探测。保存前重新取得签名预览，只有迁移、当前绑定重新授权或新增未覆盖条件才弹确认。同原因/单位可以合并展示，但 `acceptUncovered` 必须保留每一个 Server 条件标识。新增 App 不复用已有 App 的重新授权。
+
+普通用户在用户授权编辑中选择跟随 Share、指定子集或禁用；Share 收窄时同事务收窄普通用户，市场合同保持只读。已存在的延迟额度策略在仅修改能力或采用资源价目时保留激活时间、原金额/Token 上限及已用量，预览与提交同时检查当前和未来的覆盖条件；显式单位转换仍走 v12 签名转换，不因能力策略绕过。
+
 设置 patch 带 `capabilityPolicy` 和 `capabilityConsent={credential,acceptUncovered:[]}`，复用 `editContext`。Server HMAC 绑定 Share、配置 revision、完整策略、目标用户策略和价目修订；重新预览不同风险，不能复用旧确认。服务端写 actor/time，与用户额度、配置及永久回执同一 SQLite 事务提交；保存失败整批回滚，operation 重放先检查永久 fingerprint，不重新消费过期预览。不同 payload 冲突，已删除 Share 不得重建。
 
 有限 Token 额度不自然覆盖媒体/hosted tool 原生单位：只扣真实 Token，owner 必须按 scope/unit/operation/runtime 对未覆盖部分明确确认。USD 新选能力使用内部 v2 资源价卡，新草稿默认 `unpricedUsage=reject`；显式旧 zero 保留。reject 缺价不能被确认豁免；zero 只将缺价维度记为未定价，文本和其他有价维度照常扣减。显式资源零价合法。无限额展示为无限额，不能声称额度覆盖。确认不承诺上游执行上限，也不等于真实供应商账单。

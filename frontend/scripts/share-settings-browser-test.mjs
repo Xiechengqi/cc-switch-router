@@ -47,6 +47,7 @@ function Harness() {
   }}));
   window.replaceSession = () => setShare(current => ({ ...initial, shareId: "share-2" }));
   window.fullDialog = () => { setShare(structuredClone(initial)); setFull(true); };
+  window.capabilityDialog = () => { setShare({...structuredClone(initial), capabilityPolicy:{version:1,allowedOperations:[],operationBindings:{}}}); setFull(true); };
   if (full) return <ShareEditDialog share={share} onClose={onClose} onSaved={onSaved} />;
   if (!share || !form) return <div>Closed</div>;
   return <div data-editor>
@@ -93,6 +94,16 @@ try {
       return route.fulfill({ status: mode === "conflict" ? 409 : 200, json: mode === "conflict"
         ? { message: "share changed; reload the editor" }
         : { ok: true, appliedSynchronously: mode !== "queued", edit: { id: "edit-1", status: mode === "queued" ? "pending" : "applied" } } });
+    }
+    if (request.url().endsWith("/capability-preview")) {
+      const input = request.postDataJSON(), op = "tool.web_search", fingerprint = "a".repeat(64);
+      const selected = input.policy?.allowedOperations?.includes(op) || false;
+      const policy = { ...input.policy, operationBindings: selected ? {[op]:[{app:"codex",fingerprint}]} : {} };
+      const scopes = Object.entries(input.policies).filter(([,p])=>!p.allowedOperations || p.allowedOperations.includes(op)).map(([scope])=>({scope,quotaUnit:"tokens",coverage:"partial",reason:"resource_not_in_token_ledger",condition:"gap:"+scope}));
+      return route.fulfill({ json: {shareId:"share-1",configRevision:input.expectedConfigRevision,ready:true,legacy:false,displayVersion:2,policy,previewCredential:"save-ticket",expiresAt:Date.now()+900000,blockers:[],
+        requiredAcknowledgements:selected?scopes.map(s=>({...s,operation:op,bindingFingerprint:fingerprint,actor:"",acceptedAtMs:0})):[],
+        rows:[{app:"codex",operation:op,bindingFingerprint:fingerprint,controllable:true,implemented:true,providerEnabled:true,accountSupport:"unknown",unavailableReason:null,modelScope:"request",pricingCoverage:"request_dependent",execution:"unknown",measurement:"estimated",nativeUnit:op,pricing:"missing",admission:"estimated_reservation",selected,scopes}],
+      }});
     }
     if (request.url().includes("/v1/ui/context")) return route.fulfill({ json: { mode: "router" } });
     if (request.url().includes("/settings-edits/")) return route.fulfill({ json: { id: "edit-1", status, errorMessage: "revision conflict" } });
@@ -237,6 +248,25 @@ try {
   assert.equal(await page.getByRole("dialog").count(), 0);
   assert.equal(await page.evaluate(() => window.closedCount), 3);
   console.log("PASS actual nested Share dialogs apply locally and close once on persistence");
+  await page.evaluate(() => window.capabilityDialog());
+  await page.clock.runFor(1000);
+  const search = page.getByRole("checkbox", { name: /Web search.*Verification pending/ });
+  await search.waitFor();
+  await search.evaluate(element => element.click());
+  await page.clock.runFor(500);
+  const countBeforeCapabilities = writes.length;
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  const review = page.getByRole("dialog", { name: "Review extension changes" });
+  await review.waitFor();
+  assert.equal(writes.length, countBeforeCapabilities, "review occurs before persistence");
+  await review.getByRole("checkbox").evaluate(element => element.click());
+  await review.getByRole("button", { name: "Confirm and save", exact: true }).click();
+  await page.waitForFunction(() => window.closedCount === 4);
+  assert.equal(writes.length, countBeforeCapabilities + 1);
+  assert.deepEqual(writes.at(-1).patch.capabilityPolicy.allowedOperations, ["tool.web_search"]);
+  assert.equal(writes.at(-1).patch.capabilityConsent.credential, "save-ticket");
+  assert.deepEqual(writes.at(-1).patch.capabilityConsent.acceptUncovered.sort(), ["gap:a@example.com", "gap:b@example.com", "gap:owner@example.com"]);
+  console.log("PASS Dashboard save reviews capabilities once and persists signed policy with the settings transaction");
   assert.deepEqual(pageErrors, []);
 } finally {
   await browser?.close();
