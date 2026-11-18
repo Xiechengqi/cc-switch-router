@@ -38,7 +38,7 @@ import {
   millionsInputToTokens,
   tokensToMillionsInput,
 } from "@/lib/token-units";
-import { applyShareUserPolicyBatch, patchedUserPolicy, type ShareUserPolicyBatchPatch } from "./share-user-policy-batch";
+import { USD_PARALLEL_LIMIT, validParallelLimit, batchUsesUsd, applyShareUserPolicyBatch, patchedUserPolicy, type ShareUserPolicyBatchPatch } from "./share-user-policy-batch";
 import { ShareValueUsageAdjustment } from "./share-value-usage-adjustment";
 import { AccountResetStatus } from "./share-access-quota";
 import { ShareEditSubheading } from "./share-edit-section";
@@ -270,13 +270,13 @@ function valueQuotaPolicy(limitUsdMicros: string, draft: Pick<GrantDraft, "resou
  * The exact policy a valid USD draft saves. Preview and save both use it, so
  * the previewed intent is byte-for-byte what is applied.
  */
-function usdDraftPolicy(draft: Pick<GrantDraft, "allowedOperations" | "resourceMetering" | "rejectUnpriced" | "parallelLimit" | "tokenLimit" | "tokenPeriod" | "tokenPeriodAnchor" | "expiresAt">): ShareUserPolicy | undefined {
+function usdDraftPolicy(draft: Pick<GrantDraft, "allowedOperations" | "resourceMetering" | "rejectUnpriced" | "parallelLimit" | "tokenLimit" | "tokenPeriod" | "tokenPeriodAnchor" | "expiresAt">, previousParallel?: number): ShareUserPolicy | undefined {
   const amount = parseUsdLimit(draft.tokenLimit);
   if (!amount.ok) return undefined;
   const parallelLimit = draft.parallelLimit.trim() ? Number(draft.parallelLimit) : undefined;
   const expiresAt = draft.expiresAt ? new Date(draft.expiresAt).getTime() : undefined;
   const tokenPeriodAnchorAtMs = ANCHORED_PERIODS.has(draft.tokenPeriod) ? parseUtcDateTime(draft.tokenPeriodAnchor) : undefined;
-  if ((parallelLimit != null && (!Number.isInteger(parallelLimit) || parallelLimit < 1))
+  if (!validParallelLimit(parallelLimit, true, previousParallel)
     || (expiresAt != null && !Number.isFinite(expiresAt)) || anchorInvalid(draft.tokenPeriod, tokenPeriodAnchorAtMs)) return undefined;
   return {
     allowedOperations:draft.allowedOperations,
@@ -508,7 +508,7 @@ export function ShareUserGrantsEditor({
     if (!grantDraft) return undefined;
     const email = grantDraft.email.trim().toLowerCase();
     if (!validEmail(email)) return undefined;
-    const policy: ShareUserPolicy | undefined = grantDraft.quotaUnit === "usdEquivalent" ? usdDraftPolicy(grantDraft) : {
+    const policy: ShareUserPolicy | undefined = grantDraft.quotaUnit === "usdEquivalent" ? usdDraftPolicy(grantDraft, (savedGrants[email]?.pendingValueQuota?.policy ?? savedGrants[email]?.policy)?.parallelLimit) : {
       allowedOperations:grantDraft.allowedOperations,
       parallelLimit: grantDraft.parallelLimit.trim() ? Number(grantDraft.parallelLimit) : undefined,
       tokenLimit: grantDraft.tokenLimit.trim() ? millionsInputToTokens(grantDraft.tokenLimit) ?? undefined : undefined,
@@ -523,12 +523,13 @@ export function ShareUserGrantsEditor({
     const patch = batchPatchFor(batchDraft);
     const parallel = patch.parallelLimit?.value;
     if (!patch.tokenLimit || (batchDraft.quotaUnit === "usdEquivalent" && !patch.tokenLimit.valueQuota) || anchorInvalid(batchDraft.tokenPeriod, patch.tokenLimit.periodAnchorAtMs)
-      || (parallel != null && (!Number.isInteger(parallel) || parallel < 1))
+      || !([...selectedEditableEmails].every(email => validParallelLimit(parallel, batchUsesUsd(grants, selectedEditableEmails, patch), (savedGrants[email]?.pendingValueQuota?.policy ?? savedGrants[email]?.policy)?.parallelLimit)))
       || (patch.expiresAt?.value != null && !Number.isFinite(patch.expiresAt.value))) return undefined;
     // Preview the requested policy, not what staging keeps in force.
     const source = batchSourceGrants();
     return Object.fromEntries([...selectedEditableEmails].sort().map((email) => [email, patchedUserPolicy(source[email], patch)]));
   })();
+  const batchUsdParallel = !!batchDraft && batchUsesUsd(grants, selectedEditableEmails, batchPatchFor(batchDraft));
   const dialogOpen = !!grantDraft || !!batchDraft;
   const hasUsdGrant = grants.some((grant) => grant.policy.valueQuota || grant.pendingValueQuota);
   // Every grant with a USD limit in force, including one whose next USD limit is scheduled.
@@ -687,7 +688,7 @@ export function ShareUserGrantsEditor({
       return;
     }
     if (
-      (parallelLimit != null && (!Number.isInteger(parallelLimit) || parallelLimit < 1)) ||
+      !validParallelLimit(parallelLimit, grantDraft.quotaUnit === "usdEquivalent", (savedGrants[editingEmail || email]?.pendingValueQuota?.policy ?? savedGrants[editingEmail || email]?.policy)?.parallelLimit) ||
       (hasTokenLimit && (tokenLimit == null || tokenLimit < 1)) ||
       (expiresAt != null && !Number.isFinite(expiresAt)) ||
       (anchored && (
@@ -722,7 +723,7 @@ export function ShareUserGrantsEditor({
       );
       return;
     }
-    const usdPolicy = grantDraft.quotaUnit === "usdEquivalent" ? usdDraftPolicy(grantDraft) : undefined;
+    const usdPolicy = grantDraft.quotaUnit === "usdEquivalent" ? usdDraftPolicy(grantDraft, (savedGrants[email]?.pendingValueQuota?.policy ?? savedGrants[email]?.policy)?.parallelLimit) : undefined;
     if (grantDraft.quotaUnit === "usdEquivalent" && !usdPolicy) {
       // Never fall back to a Token policy while `$` is selected.
       setError(t("dashboard.userLimit.invalidPolicy"));
@@ -883,7 +884,7 @@ export function ShareUserGrantsEditor({
         (!(batchDraft.applyTokenLimit ? batchDraft.tokenPeriod === "accountReset" : selectedGrants.every((grant) => grant.policy.tokenPeriod === "accountReset")) && consumedTokens < usageFloor));
     if (
       (batchDraft.applyParallelLimit && parallelLimit != null &&
-        (!Number.isInteger(parallelLimit) || parallelLimit < 1)) ||
+        !([...selectedEditableEmails].every(email => validParallelLimit(parallelLimit, batchUsesUsd(grants, selectedEditableEmails, batchPatchFor(batchDraft)), (savedGrants[email]?.pendingValueQuota?.policy ?? savedGrants[email]?.policy)?.parallelLimit)))) ||
       (batchDraft.applyTokenLimit && hasTokenLimit &&
         (tokenLimit == null || tokenLimit < 1)) ||
       (batchDraft.applyExpiresAt && expiresAt != null && !Number.isFinite(expiresAt)) ||
@@ -1209,7 +1210,7 @@ export function ShareUserGrantsEditor({
                 </div>
                 <div className="grid content-start gap-1.5">
                   <label htmlFor={`${fieldId}-parallel`} className={FIELD_LABEL_CLASS}>{t("dashboard.field.parallelLimit")}</label>
-                  <Input id={`${fieldId}-parallel`} type="number" min={1} placeholder={t("common.unlimited")} value={grantDraft?.parallelLimit || ""} onChange={(event) => grantDraft && setGrantDraft({ ...grantDraft, parallelLimit: event.target.value })} />
+                  <Input id={`${fieldId}-parallel`} type="number" min={1} max={grantDraft?.quotaUnit === "usdEquivalent" ? USD_PARALLEL_LIMIT : undefined} placeholder={t("common.unlimited")} value={grantDraft?.parallelLimit || ""} onChange={(event) => grantDraft && setGrantDraft({ ...grantDraft, parallelLimit: event.target.value })} />
                   {grantDraft?.quotaUnit === "usdEquivalent" ? <p className="text-xs text-muted-foreground">{t("dashboard.userLimit.value.parallelCap")}</p> : null}
                 </div>
                 <div className="grid content-start gap-1.5">
@@ -1397,6 +1398,7 @@ export function ShareUserGrantsEditor({
                 <Input
                   type="number"
                   min={1}
+                  max={batchUsdParallel ? USD_PARALLEL_LIMIT : undefined}
                   disabled={!batchDraft?.applyParallelLimit}
                   placeholder={t("common.unlimited")}
                   value={batchDraft?.parallelLimit || ""}
@@ -1405,6 +1407,7 @@ export function ShareUserGrantsEditor({
                     parallelLimit: event.target.value,
                   })}
                 />
+                {batchUsdParallel ? <p className="text-xs text-muted-foreground">{t("dashboard.userLimit.value.parallelCap")}</p> : null}
               </div>
               <div className="grid gap-2">
                 <Checkbox

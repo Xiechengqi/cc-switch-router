@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { ShareUserGrant, ShareView } from "@/lib/types";
+import { validParallelLimit, batchUsesUsd } from "./share-user-policy-batch";
 import { buildShareEditDraft, buildShareEditPatch } from "./share-edit-draft";
 
 function grant(
@@ -154,4 +155,20 @@ test("revoking a user drops only that user's staged calibration", () => {
   assert.deepEqual(buildShareEditPatch(draft, share, ["claude"]), {
     userGrantEdits: { "a@example.com": { expectedRevision: 4, policy: null } },
   });
+});
+
+
+test("USD concurrency validation preserves legacy settings and caps new and mixed edits", () => {
+  assert.ok(validParallelLimit(8, false));
+  assert.ok(validParallelLimit(4, true));
+  assert.ok(validParallelLimit(undefined, true));
+  assert.ok(validParallelLimit(8, true, 8));
+  for (const n of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 5]) assert.equal(validParallelLimit(n, true), false);
+  assert.equal(validParallelLimit(9, true, 8), false);
+  const usd = grant("usd@example.com", {policy:{tokenPeriod:"day", valueQuota:{limitUsdMicros:"1000000", tariffPolicyId:"api-equivalent-v1"}}});
+  const token = grant("token@example.com");
+  const tokenPatch = {tokenLimit:{value:100, period:"day" as const}};
+  assert.ok(batchUsesUsd([usd,token], new Set([usd.email,token.email]), tokenPatch));
+  assert.equal(batchUsesUsd([usd,token], new Set([token.email]), tokenPatch), false);
+  assert.ok(batchUsesUsd([usd,token], new Set([token.email]), {tokenLimit:{period:"day",valueQuota:usd.policy.valueQuota}}));
 });

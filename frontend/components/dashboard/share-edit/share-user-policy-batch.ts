@@ -54,3 +54,17 @@ export function applyShareUserPolicyBatch(
 
   return updated;
 }
+
+export const USD_PARALLEL_LIMIT = 4;
+
+/** Retain a historical value when another field changes; never offer new USD limits above 4. */
+export function validParallelLimit(limit: number | undefined, usd: boolean, previous?: number): boolean {
+  return limit == null || (Number.isSafeInteger(limit) && limit >= 1
+    && (!usd || limit <= USD_PARALLEL_LIMIT || limit === previous));
+}
+
+/** Include active USD grants while a change of unit is still awaiting activation. */
+export function batchUsesUsd(grants: ShareUserGrant[], selected: ReadonlySet<string>, patch: ShareUserPolicyBatchPatch): boolean {
+  return selected.size > 0 && Boolean(patch.tokenLimit?.valueQuota || grants.some(grant =>
+    selected.has(grant.email) && (grant.policy.valueQuota || grant.pendingValueQuota?.policy.valueQuota)));
+}
