@@ -1156,6 +1156,7 @@ fn normalize_seat_value_quota(
 /// Seats and frozen contracts preserve the explicit tariff policy and amount.
 fn stored_value_quota(limit_usd_micros: Option<String>, tariff_policy: &str) -> Option<ValueQuota> {
     limit_usd_micros.map(|limit_usd_micros| ValueQuota {
+        unpriced_usage: Default::default(),
         limit_usd_micros,
         tariff_policy_id: if tariff_policy.is_empty() {
             crate::share_value_pricing::TARIFF_POLICY
@@ -16495,6 +16496,7 @@ mod tests {
         assert_changed!(
             value_quota,
             Some(ValueQuota {
+                unpriced_usage: Default::default(),
                 limit_usd_micros: "10000000".into(),
                 tariff_policy_id: crate::share_value_pricing::TARIFF_POLICY.into(),
             })
@@ -17842,6 +17844,7 @@ mod tests {
 
     fn usd_quota(limit_usd_micros: &str) -> ValueQuota {
         ValueQuota {
+            unpriced_usage: Default::default(),
             limit_usd_micros: limit_usd_micros.into(),
             tariff_policy_id: crate::share_value_pricing::TARIFF_POLICY.into(),
         }
@@ -17867,6 +17870,7 @@ mod tests {
         }
         let mut wrong_policy = seat.clone();
         wrong_policy.value_quota = Some(ValueQuota {
+            unpriced_usage: Default::default(),
             limit_usd_micros: "10000000".into(),
             tariff_policy_id: "other".into(),
         });
@@ -17967,6 +17971,7 @@ mod tests {
         )
         .await;
         let quota = ValueQuota {
+            unpriced_usage: Default::default(),
             limit_usd_micros: "25000000".into(),
             tariff_policy_id: crate::share_value_pricing::RESOURCE_TARIFF_POLICY.into(),
         };

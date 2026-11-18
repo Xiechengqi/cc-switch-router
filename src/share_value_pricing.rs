@@ -118,11 +118,30 @@ pub fn unsigned_decimal(raw: &str) -> Result<i128, ValueError> {
     raw.parse().map_err(|_| ValueError::OutOfRange)
 }
 
+/// What an owner-managed USD grant does with usage the tariff cannot price.
+/// Market seats always refuse it, whatever this says.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UnpricedUsage {
+    /// Serve and meter at `$0` under an explicit reason (the default).
+    #[default]
+    Zero,
+    /// Refuse before any upstream I/O.
+    Reject,
+}
+impl UnpricedUsage {
+    pub fn is_zero(&self) -> bool {
+        *self == Self::Zero
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ValueQuota {
     pub limit_usd_micros: String,
     pub tariff_policy_id: String,
+    /// Omitted (`zero`) keeps every pre-existing payload byte-identical.
+    #[serde(default, skip_serializing_if = "UnpricedUsage::is_zero")]
+    pub unpriced_usage: UnpricedUsage,
 }
 impl ValueQuota {
     pub fn limit_picos(&self) -> Result<i128, ValueError> {
@@ -495,6 +514,31 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Cross-repo pricing vectors: the identical digests are pinned in
+    /// cc-switch-server `domain/usage/value_pricing.rs`. A fixture change must land in both repos with both pins.
+    #[test]
+    fn shared_value_fixtures_match_the_cross_repo_pinned_digests() {
+        use sha2::{Digest, Sha256};
+        for (name, bytes, pinned) in [
+            (
+                "share-value-model-identity-v1.json",
+                include_bytes!("../tests/fixtures/share-value-model-identity-v1.json").as_slice(),
+                "7c708feb01af3cc5c96a33e3e855f1643280b5843fbcaa17064ea087820d597f",
+            ),
+            (
+                "share-value-pricing-v1.json",
+                include_bytes!("../tests/fixtures/share-value-pricing-v1.json").as_slice(),
+                "a6ffe5e0f1c96b1dc038e12d862176261e7d5626ad606ef7e7e95fa39076716a",
+            ),
+            (
+                "share-value-signed-payload-v1.json",
+                include_bytes!("../tests/fixtures/share-value-signed-payload-v1.json").as_slice(),
+                "3b770b55c552f9f61ff7f8f1ed011abdd0a00864734890ce5cb86139b8652715",
+            ),
+        ] {
+            assert_eq!(hex::encode(Sha256::digest(bytes)), pinned, "{name} drifted");
+        }
+    }
     #[test]
     fn model_identity_matches_shared_vectors() {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
@@ -669,6 +713,7 @@ mod tests {
         }
         assert_eq!(
             ValueQuota {
+                unpriced_usage: Default::default(),
                 limit_usd_micros: "10000000".into(),
                 tariff_policy_id: TARIFF_POLICY.into()
             }
@@ -678,6 +723,7 @@ mod tests {
         );
         assert!(
             ValueQuota {
+                unpriced_usage: Default::default(),
                 limit_usd_micros: "0".into(),
                 tariff_policy_id: TARIFF_POLICY.into()
             }

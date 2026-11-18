@@ -960,18 +960,48 @@ export type ShareModelPricing = {
   canManage?: boolean;
 };
 
+/**
+ * Who a new price for `modelKey` re-prices: users whose current window holds
+ * $0 usage of that model (projection `unpricedModels`), plus the row being
+ * priced when its own breakdown shows the model unpriced.
+ */
+function usersWithUnpricedModel(
+  statuses: ValueQuotaStatus[] | undefined,
+  modelKey: string,
+  row: ShareUserUsageBreakdownRow,
+): string[] {
+  const wanted = modelKey.trim().toLowerCase();
+  const emails = new Set(
+    (statuses ?? [])
+      .filter((status) => status.unpricedModels?.some((model) => model.trim().toLowerCase() === wanted))
+      .map((status) => status.email),
+  );
+  if (row.byModel.some((model) => model.unpriced && model.modelKey.trim().toLowerCase() === wanted)) {
+    emails.add(row.email);
+  }
+  return [...emails].sort();
+}
+
+/** Owner banner: users whose current window holds usage metered at $0 because it had no price. */
+function usersWithUnpricedUsage(statuses: ValueQuotaStatus[] | undefined): number {
+  return (statuses ?? []).filter((status) => (status.unpricedTokens ?? 0) > 0 || (status.unpricedRequests ?? 0) > 0).length;
+}
+
 function ShareUserUsageBreakdownPanel({
   row,
   locale,
   t,
   pricing,
   onPriceSaved,
+  valueQuotaStatuses,
 }: {
   row: ShareUserUsageBreakdownRow;
   locale: AppLocale;
   t: TFn;
   pricing?: ShareModelPricing;
   onPriceSaved?: (email: string) => void;
+  /** Owner view: every user's window projection, to show who a new price re-prices. */
+  valueQuotaStatuses?: ValueQuotaStatus[];
 }) {
   const { session } = useAuth();
   const [openLines, setOpenLines] = React.useState<string | null>(null);
@@ -1257,6 +1287,7 @@ function ShareUserUsageBreakdownPanel({
           access={access}
           onClose={() => setPriceTarget(null)}
           onSaved={onSaved}
+          affectedEmails={priceTarget ? usersWithUnpricedModel(valueQuotaStatuses, priceTarget.modelKey, row) : undefined}
         />
       ) : null}
     </div>
@@ -1386,7 +1417,15 @@ export function ShareUserLimitsTable({
     return () => window.clearInterval(timer);
   }, [hasCountdown]);
 
+  const unpricedUsers = selfContainedValueQuota ? 0 : usersWithUnpricedUsage(valueQuotaStatuses);
   return (
+    <>
+    {unpricedUsers ? (
+      <p role="status" className="mb-2 flex items-start gap-2 rounded-md border border-warning/40 bg-warning/5 px-3 py-2 text-xs leading-5 text-warning-foreground">
+        <span aria-hidden className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-warning" />
+        {t("dashboard.modelPrice.unpricedUsersBanner", { count: unpricedUsers })}
+      </p>
+    ) : null}
     <div className="overflow-x-auto rounded-lg border border-border">
       <table className="w-full min-w-[30rem] table-fixed border-collapse text-xs">
         <colgroup>
@@ -1556,6 +1595,7 @@ export function ShareUserLimitsTable({
                         t={t}
                         pricing={modelPricing}
                         onPriceSaved={onPriceSaved}
+                        valueQuotaStatuses={selfContainedValueQuota ? undefined : valueQuotaStatuses}
                       />
                     ) : breakdownErrors?.[emailKey] ? (
                       <div className="flex flex-wrap items-center gap-2 px-2 py-2 text-[11px] text-danger">
@@ -1588,6 +1628,7 @@ export function ShareUserLimitsTable({
         </tbody>
       </table>
     </div>
+    </>
   );
 }
 

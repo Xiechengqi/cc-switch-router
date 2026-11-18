@@ -47,10 +47,13 @@ export function ShareModelPriceDialog({
   access,
   onClose,
   onSaved,
+  affectedEmails,
 }: {
   target: ModelPriceTarget | null;
   shareId?: string;
   access: SharePriceAccess;
+  /** Users whose open window holds $0 usage of this model (re-priced on save). */
+  affectedEmails?: string[];
   onClose: () => void;
   onSaved: (result: ModelPriceSaved) => void;
 }) {
@@ -203,6 +206,15 @@ export function ShareModelPriceDialog({
             </div>
           </Modal.Header>
           <Modal.Body className="grid max-h-[min(72vh,640px)] gap-5 overflow-y-auto">
+            {affectedEmails?.length ? (
+              <p role="note" className="rounded-md border border-warning/40 bg-warning/5 px-3 py-2 text-xs leading-5 text-warning-foreground">
+                {t("dashboard.modelPrice.repriceImpact", {
+                  emails: affectedEmails.length > 5
+                    ? `${affectedEmails.slice(0, 5).join(", ")} +${affectedEmails.length - 5}`
+                    : affectedEmails.join(", "),
+                })}
+              </p>
+            ) : null}
             {clientAllowed && access.global ? (
               <section className="grid gap-2">
                 <span id={scopeHeadingId} className={FIELD_LABEL_CLASS}>{t("dashboard.modelPrice.scope")}</span>

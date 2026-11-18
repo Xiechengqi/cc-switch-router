@@ -175,6 +175,13 @@ export function ValuePreviewLine({state, t, calibrations}: {state: ValuePreviewS
   </div>;
 }
 
+/** Owner-managed USD grants: refuse usage the tariff cannot price instead of metering it at $0. */
+export function ValueUnpricedToggle({value,onChange,disabled,t}: {value:boolean;onChange:(value:boolean)=>void;disabled?:boolean;t:TFn}) {
+  return <label className="flex items-start gap-2 text-xs text-muted-foreground">
+    <input type="checkbox" className="mt-0.5" checked={value} disabled={disabled} onChange={event=>onChange(event.target.checked)} />
+    <span>{t("dashboard.userLimit.value.rejectUnpriced")}<span className="mt-1 block">{t("dashboard.userLimit.value.rejectUnpricedHint")}</span></span>
+  </label>;
+}
 export function ValueResourceToggle({value,onChange,disabled,t}: {value:boolean;onChange:(value:boolean)=>void;disabled?:boolean;t:TFn}) {
   return <label className="flex items-start gap-2 text-xs text-muted-foreground">
     <input type="checkbox" className="mt-0.5" checked={value} disabled={disabled} onChange={event=>onChange(event.target.checked)} />

@@ -15,6 +15,7 @@ async fn market_metering_scope_fixture() -> (AppStore, ShareDescriptor) {
     grant.active = false;
     grant.policy.token_limit = None;
     grant.policy.value_quota = Some(crate::share_value_pricing::ValueQuota {
+        unpriced_usage: Default::default(),
         limit_usd_micros: "1000000".into(),
         tariff_policy_id: crate::share_value_pricing::TARIFF_POLICY.into(),
     });

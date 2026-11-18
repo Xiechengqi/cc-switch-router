@@ -78,6 +78,7 @@ mod tests {
         let mut operation = operation;
         if usd {
             operation.policy.as_mut().unwrap().value_quota = Some(ValueQuota {
+                unpriced_usage: Default::default(),
                 limit_usd_micros: "100000000".into(),
                 tariff_policy_id: "api-equivalent-v1".into(),
             });

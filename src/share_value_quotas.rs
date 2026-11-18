@@ -24,6 +24,7 @@ pub fn router() -> Router<ServerState> {
             "/v1/shares/:share_id/value-quota-watermarks",
             post(watermark),
         )
+        .route("/v1/shares/value-quota-watermarks", post(watermarks))
         .route("/v1/shares/:share_id/value-quota-status", get(status))
         .route("/v1/me/share-value-quotas", get(mine))
         .route("/v1/shares/:share_id/value-quota-preview", post(preview))
@@ -670,6 +671,19 @@ async fn watermark(
             .await?,
     ))
 }
+/// Batched projections (`valueQuotaWatermarkBatchV1`): one signed request,
+/// one answer per item, each item applied on its own savepoint.
+async fn watermarks(
+    State(state): State<ServerState>,
+    Json(input): Json<SignedValueRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(
+        state
+            .store
+            .signed_value_operation("share_value_quota_watermarks", input)
+            .await?,
+    ))
+}
 async fn status(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -736,7 +750,10 @@ async fn upsert_model_price(
         )
     })?;
     let rates = crate::api::parse_model_price_rates(&input.rates).map_err(|error| {
-        price_invalid("rate_invalid", serde_json::json!({"detail": error.to_string()}))
+        price_invalid(
+            "rate_invalid",
+            serde_json::json!({"detail": error.to_string()}),
+        )
     })?;
     let (price, effective_from_ms) = state
         .store
@@ -775,7 +792,12 @@ async fn delete_model_price(
     })?;
     let effective_from_ms = state
         .store
-        .delete_owner_model_price(&share_id, &model_key, query.expected_version, &session.email)
+        .delete_owner_model_price(
+            &share_id,
+            &model_key,
+            query.expected_version,
+            &session.email,
+        )
         .await?;
     Ok(Json(
         serde_json::json!({"deleted":true,"effectiveFromMs":effective_from_ms}),
@@ -807,10 +829,12 @@ async fn model_price_suggestions(
         ));
     }
     if query.model.len() > 256 {
-        return Err(crate::store::share_value_quotas::owner_prices::price_invalid(
-            "model_key_invalid",
-            serde_json::json!({"field": "model"}),
-        ));
+        return Err(
+            crate::store::share_value_quotas::owner_prices::price_invalid(
+                "model_key_invalid",
+                serde_json::json!({"field": "model"}),
+            ),
+        );
     }
     Ok(Json(
         serde_json::json!({"suggestions":state.store.owner_model_price_suggestions(&query.model)}),

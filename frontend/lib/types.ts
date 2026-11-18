@@ -353,7 +353,8 @@ export type AccountResetPreview = {
 export type ShareUserPolicy = {
   parallelLimit?: number;
   tokenLimit?: number;
-  valueQuota?: { limitUsdMicros: string; tariffPolicyId: "api-equivalent-v1" | "api-equivalent-v2" };
+  /** `unpricedUsage` omitted means `zero` (serve and meter unpriced usage at $0). */
+  valueQuota?: { limitUsdMicros: string; tariffPolicyId: "api-equivalent-v1" | "api-equivalent-v2"; unpricedUsage?: "zero" | "reject" };
   tokenPeriod: ShareTokenPeriod;
   tokenPeriodAnchorAtMs?: number;
   expiresAt?: number;

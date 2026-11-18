@@ -199,6 +199,7 @@ export function buildShareSettingsPatch(
 export function sharePolicyFingerprint(policy: ShareUserPolicy) {
   return JSON.stringify([policy.parallelLimit ?? null, policy.tokenLimit ?? null,
     policy.valueQuota?.limitUsdMicros ?? null, policy.valueQuota?.tariffPolicyId ?? null,
+    policy.valueQuota ? policy.valueQuota.unpricedUsage ?? "zero" : null,
     policy.tokenPeriod || "lifetime", policy.tokenPeriodAnchorAtMs ?? null, policy.expiresAt ?? null]);
 }
 

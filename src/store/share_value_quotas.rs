@@ -375,11 +375,21 @@ struct WatermarkPayload {
     share_id: String,
     status: ValueQuotaStatus,
 }
+/// Projections per signed batch; each item is one `WatermarkPayload`.
+const MAX_WATERMARK_BATCH: usize = 64;
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WatermarkBatchPayload {
+    items: Vec<serde_json::Value>,
+}
+/// A rejected batch item: (shareId, email, reason).
+type RejectedWatermark = (String, String, String);
 enum ValueOperation {
     Fetch(FetchPayload),
     Ack(AckPayload),
     Active(AckPayload),
     Watermark(WatermarkPayload),
+    Watermarks(Vec<Result<WatermarkPayload, RejectedWatermark>>),
 }
 fn bad_payload(error: serde_json::Error) -> AppError {
     AppError::BadRequest(error.to_string())
@@ -406,33 +416,36 @@ fn parse_value_operation(
                 ValueOperation::Ack(ack)
             })
         }
-        "share_value_quota_watermark" => {
-            let mut report = WatermarkPayload::deserialize(payload).map_err(bad_payload)?;
-            let status = &mut report.status;
-            unsigned_decimal(&status.used_picos)
-                .and_then(|_| unsigned_decimal(&status.pending_risk_picos))
-                .map_err(|e| AppError::BadRequest(e.to_string()))?;
-            if status.email != status.email.trim().to_ascii_lowercase()
-                || status.window_id.is_empty()
-                || status.window_starts_at_ms < 0
-                || status
-                    .resets_at_ms
-                    .is_some_and(|end| end <= status.window_starts_at_ms)
-            {
-                return Err(AppError::BadRequest("invalid value quota watermark".into()));
+        "share_value_quota_watermark" => parse_watermark(payload).map(ValueOperation::Watermark),
+        "share_value_quota_watermarks" => {
+            let batch = WatermarkBatchPayload::deserialize(payload).map_err(bad_payload)?;
+            if batch.items.is_empty() || batch.items.len() > MAX_WATERMARK_BATCH {
+                return Err(AppError::BadRequest(format!(
+                    "a watermark batch carries 1..={MAX_WATERMARK_BATCH} items"
+                )));
             }
-            sanitize_unpriced_models(status);
-            if !METERING_STATUSES.contains(&status.metering_status.as_str()) {
-                // A newer Server state must neither break projection sync nor
-                // be rendered as usable quota.
-                tracing::warn!(
-                    share_id = %report.share_id,
-                    metering_status = %status.metering_status,
-                    "unknown Share value metering status stored as unavailable"
-                );
-                status.metering_status = "unavailable".into();
-            }
-            Ok(ValueOperation::Watermark(report))
+            // An invalid item is answered on its own; it never rejects the batch.
+            Ok(ValueOperation::Watermarks(
+                batch
+                    .items
+                    .iter()
+                    .map(|item| {
+                        parse_watermark(item).map_err(|error| {
+                            (
+                                item.get("shareId")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                item.pointer("/status/email")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                error.to_string(),
+                            )
+                        })
+                    })
+                    .collect(),
+            ))
         }
         _ => Err(AppError::BadRequest(
             "unsupported value quota action".into(),
@@ -440,6 +453,35 @@ fn parse_value_operation(
     }
 }
 
+/// One signed watermark projection, validated before any write lock.
+fn parse_watermark(payload: &serde_json::Value) -> Result<WatermarkPayload, AppError> {
+    let mut report = WatermarkPayload::deserialize(payload).map_err(bad_payload)?;
+    let status = &mut report.status;
+    unsigned_decimal(&status.used_picos)
+        .and_then(|_| unsigned_decimal(&status.pending_risk_picos))
+        .map_err(|e| AppError::BadRequest(e.to_string()))?;
+    if status.email != status.email.trim().to_ascii_lowercase()
+        || status.window_id.is_empty()
+        || status.window_starts_at_ms < 0
+        || status
+            .resets_at_ms
+            .is_some_and(|end| end <= status.window_starts_at_ms)
+    {
+        return Err(AppError::BadRequest("invalid value quota watermark".into()));
+    }
+    sanitize_unpriced_models(status);
+    if !METERING_STATUSES.contains(&status.metering_status.as_str()) {
+        // A newer Server state must neither break projection sync nor
+        // be rendered as usable quota.
+        tracing::warn!(
+            share_id = %report.share_id,
+            metering_status = %status.metering_status,
+            "unknown Share value metering status stored as unavailable"
+        );
+        status.metering_status = "unavailable".into();
+    }
+    Ok(report)
+}
 /// `unpricedModels` is display-only: keep at most the documented 20 distinct,
 /// sorted, printable names instead of rejecting the whole projection.
 fn sanitize_unpriced_models(status: &mut ValueQuotaStatus) {
@@ -776,6 +818,7 @@ impl AppStore {
                 | "share_value_pricing_ack"
                 | "share_value_pricing_active"
                 | "share_value_quota_watermark"
+                | "share_value_quota_watermarks"
         ) {
             return Err(AppError::BadRequest(
                 "unsupported value quota action".into(),
@@ -1029,6 +1072,42 @@ fn apply_value_operation(
         }
         ValueOperation::Watermark(report) => {
             apply_watermark(tx, installation_id, report).map(ValueOutcome::Ready)
+        }
+        // Each item commits or rolls back on its own savepoint, so one stale
+        // grant never blocks the projections of the others.
+        ValueOperation::Watermarks(items) => {
+            let mut results = Vec::with_capacity(items.len());
+            for item in items {
+                let result = match item {
+                    Ok(report) => {
+                        let (share_id, email) =
+                            (report.share_id.clone(), report.status.email.clone());
+                        tx.execute_batch("SAVEPOINT value_watermark")
+                            .map_err(db_error)?;
+                        match apply_watermark(tx, installation_id, report) {
+                            Ok(mut ack) => {
+                                tx.execute_batch("RELEASE value_watermark")
+                                    .map_err(db_error)?;
+                                ack["shareId"] = share_id.into();
+                                ack["email"] = email.into();
+                                ack
+                            }
+                            Err(error) => {
+                                tx.execute_batch(
+                                    "ROLLBACK TO value_watermark; RELEASE value_watermark",
+                                )
+                                .map_err(db_error)?;
+                                serde_json::json!({"shareId":share_id,"email":email,"ok":false,"error":error.to_string()})
+                            }
+                        }
+                    }
+                    Err((share_id, email, error)) => {
+                        serde_json::json!({"shareId":share_id,"email":email,"ok":false,"error":error})
+                    }
+                };
+                results.push(result);
+            }
+            Ok(ValueOutcome::Ready(serde_json::json!({"items":results})))
         }
     }
 }
@@ -1335,6 +1414,70 @@ mod tests {
     }
 
     #[test]
+    fn watermark_batches_answer_invalid_items_alone_and_are_bounded() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/share-value-signed-payload-v1.json"
+        ))
+        .unwrap();
+        let valid = fixture["payload"].clone();
+        let mut invalid = valid.clone();
+        invalid["status"]["email"] = "Mixed@Case.test".into();
+        let Ok(ValueOperation::Watermarks(items)) = parse_value_operation(
+            "share_value_quota_watermarks",
+            &serde_json::json!({"items":[valid.clone(), invalid]}),
+        ) else {
+            panic!("a batch with one invalid item still parses");
+        };
+        assert_eq!(items.len(), 2);
+        assert!(items[0].is_ok());
+        let Err((share_id, email, _)) = &items[1] else {
+            panic!("the invalid item is answered on its own");
+        };
+        assert_eq!(share_id, valid["shareId"].as_str().unwrap());
+        assert_eq!(email, "Mixed@Case.test");
+        for items in [Vec::new(), vec![valid; MAX_WATERMARK_BATCH + 1]] {
+            assert!(
+                parse_value_operation(
+                    "share_value_quota_watermarks",
+                    &serde_json::json!({"items":items})
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            parse_value_operation(
+                "share_value_quota_watermarks",
+                &serde_json::json!({"items":[],"extra":1})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn value_quota_unpriced_usage_defaults_to_zero_and_round_trips() {
+        use crate::share_value_pricing::{UnpricedUsage, ValueQuota};
+        let legacy: ValueQuota = serde_json::from_value(
+            serde_json::json!({"limitUsdMicros":"1000000","tariffPolicyId":"api-equivalent-v1"}),
+        )
+        .unwrap();
+        assert_eq!(legacy.unpriced_usage, UnpricedUsage::Zero);
+        // The default is never written: legacy payloads stay byte-identical.
+        assert_eq!(
+            serde_json::to_string(&legacy).unwrap(),
+            r#"{"limitUsdMicros":"1000000","tariffPolicyId":"api-equivalent-v1"}"#
+        );
+        let reject: ValueQuota = serde_json::from_value(serde_json::json!({
+            "limitUsdMicros":"1000000","tariffPolicyId":"api-equivalent-v1","unpricedUsage":"reject"
+        }))
+        .unwrap();
+        assert_eq!(reject.unpriced_usage, UnpricedUsage::Reject);
+        assert!(serde_json::from_value::<ValueQuota>(serde_json::json!({
+            "limitUsdMicros":"1000000","tariffPolicyId":"api-equivalent-v1","unpricedUsage":"fallback"
+        }))
+        .is_err());
+    }
+
+    #[test]
     fn fetch_payload_accepts_known_revision_and_rejects_unknown_keys() {
         assert!(matches!(
             parse_value_operation("share_value_pricing_fetch", &serde_json::json!({})),
@@ -1413,6 +1556,7 @@ mod tests {
             policy: ShareUserPolicy {
                 token_period: ShareTokenPeriod::Day,
                 value_quota: Some(crate::share_value_pricing::ValueQuota {
+                    unpriced_usage: Default::default(),
                     limit_usd_micros: "1000000".into(),
                     tariff_policy_id: crate::share_value_pricing::TARIFF_POLICY.into(),
                 }),

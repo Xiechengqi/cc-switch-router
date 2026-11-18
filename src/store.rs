@@ -3662,6 +3662,11 @@ impl AppStore {
                 // Unpriced owner-managed usage is metered at $0 and reported
                 // through the optional `unpriced*` value quota status fields.
                 "valueQuotaUnpricedV1".into(),
+                // `POST /v1/shares/value-quota-watermarks` accepts up to 64
+                // signed projections per request.
+                "valueQuotaWatermarkBatchV1".into(),
+                // `valueQuota.unpricedUsage` (`zero` | `reject`) is accepted.
+                "valueQuotaUnpricedPolicyV1".into(),
             ],
         })
     }
@@ -9972,9 +9977,7 @@ impl AppStore {
         let Some(installation_id) = installation_id else {
             return Err(AppError::NotFound("share not found".into()));
         };
-        let effective = self
-            .installation_effective_prices(&installation_id)
-            .await?;
+        let effective = self.installation_effective_prices(&installation_id).await?;
         let conn = self.conn.lock().await;
         let Some((installation_id, user_grants_json)): Option<(String, String)> = conn
             .query_row(
@@ -10219,9 +10222,10 @@ impl AppStore {
                     total: group_total,
                     request_count: group.request_count,
                     priced: priced.is_some(),
-                    price_source: priced.as_ref().and(resolved.as_ref()).map(|(_, _, owner)| {
-                        if *owner { "owner" } else { "catalog" }
-                    }),
+                    price_source: priced
+                        .as_ref()
+                        .and(resolved.as_ref())
+                        .map(|(_, _, owner)| if *owner { "owner" } else { "catalog" }),
                     unpriced,
                     equivalent_usd_micros: amount,
                     lines,
@@ -35932,6 +35936,7 @@ pub(crate) mod tests {
         let mut requested = old.clone();
         requested.policy.token_limit = None;
         requested.policy.value_quota = Some(ValueQuota {
+            unpriced_usage: Default::default(),
             limit_usd_micros: "1000000".into(),
             tariff_policy_id: TARIFF_POLICY.into(),
         });
@@ -37680,7 +37685,10 @@ pub(crate) mod tests {
         assert!(model.notes.iter().any(|note| note == "priceKeyNotFound"));
         assert!(model.unpriced);
         // Unpriced usage is metered at $0, so the window total reads "0".
-        assert_eq!(breakdown.rows[0].equivalent_usd_micros.as_deref(), Some("0"));
+        assert_eq!(
+            breakdown.rows[0].equivalent_usd_micros.as_deref(),
+            Some("0")
+        );
         assert_eq!(breakdown.rows[0].priced_coverage_percent, 0.0);
 
         let _ = std::fs::remove_file(&config.database.path);
@@ -38620,6 +38628,7 @@ pub(crate) mod tests {
         grant.policy.token_limit = None;
         grant.policy.token_period = ShareTokenPeriod::Lifetime;
         grant.policy.value_quota = Some(ValueQuota {
+            unpriced_usage: Default::default(),
             limit_usd_micros: "1000000".into(),
             tariff_policy_id: TARIFF_POLICY.into(),
         });
@@ -39091,6 +39100,7 @@ pub(crate) mod tests {
         pending_policy.token_limit = None;
         pending_policy.token_period = ShareTokenPeriod::Week;
         pending_policy.value_quota = Some(ValueQuota {
+            unpriced_usage: Default::default(),
             limit_usd_micros: "5000000".into(),
             tariff_policy_id: TARIFF_POLICY.into(),
         });
@@ -39395,6 +39405,7 @@ pub(crate) mod tests {
         usd.policy.token_limit = None;
         usd.policy.token_period = ShareTokenPeriod::Lifetime;
         usd.policy.value_quota = Some(ValueQuota {
+            unpriced_usage: Default::default(),
             limit_usd_micros: "1000000".into(),
             tariff_policy_id: TARIFF_POLICY.into(),
         });
