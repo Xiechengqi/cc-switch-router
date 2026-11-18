@@ -61,6 +61,9 @@ test("parallel CI retains every existing financial gate and separates profile ca
   assert.match(job("rust-tests"), /cargo test --locked schema::tests/);
   assert.match(job("rust-tests"), /cargo test --locked test_support::tests/);
   assert.match(job("rust-tests"), /cargo test --locked db::tests/);
+  for (const suite of ["model_pricing::tests", "model_price_catalog::tests", "share_listing_usage_rollup"]) {
+    assert.ok(job("rust-tests").includes(`require-tests.sh cargo test --locked ${suite}`), `missing database pricing gate: ${suite}`);
+  }
   assert.match(job("rust-tests"), /cargo test --locked browser_share_cors/);
   assert.match(job("frontend"), /npm run test:share-value-quota/);
   assert.match(job("frontend"), /npm run test:model-routing/);

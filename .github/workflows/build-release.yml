@@ -150,6 +150,12 @@ jobs:
           bash scripts/ci/timed.sh 'Database adapter' cargo test --locked db::tests
           bash scripts/ci/timed.sh 'Test database templates' cargo test --locked test_support::tests
 
+      - name: Test model price catalog and service tiers
+        run: |
+          bash scripts/ci/timed.sh 'Pricing kernel' bash scripts/ci/require-tests.sh cargo test --locked model_pricing::tests
+          bash scripts/ci/timed.sh 'Embedded price catalog database import' bash scripts/ci/require-tests.sh cargo test --locked model_price_catalog::tests
+          bash scripts/ci/timed.sh 'Listing usage service tiers' bash scripts/ci/require-tests.sh cargo test --locked share_listing_usage_rollup
+
       - name: Test notification center and incident export
         run: |
           bash scripts/ci/timed.sh 'Notification center' cargo test --locked user_notifications::tests

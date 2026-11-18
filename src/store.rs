@@ -9790,6 +9790,7 @@ impl AppStore {
                                 WHEN 'fast'     THEN 'priority'
                                 WHEN 'flex'     THEN 'flex'
                                 WHEN 'batch'    THEN 'flex'
+                                WHEN 'ultrafast' THEN 'ultrafast'
                                 ELSE 'standard' END AS service_tier,
                            lower(trim(COALESCE(sr.user_email, ''))) AS user_email,
                            COALESCE(sr.input_tokens, 0) AS input_tokens,
@@ -38031,6 +38032,73 @@ pub(crate) mod tests {
             .expect_err("unknown listing must 404");
         assert!(matches!(missing, AppError::NotFound(_)));
 
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
+    async fn share_listing_usage_rollup_keeps_ultrafast_separate_from_legacy_tiers() {
+        let (store, config) = setup_store("listing-rollup-ultrafast").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-tiers", "tiers-sub", "active").await;
+        let now = Utc::now().timestamp();
+        {
+            let conn = store.conn.lock().await;
+            for (index, (client, effective)) in [
+                ("ultrafast", None),
+                ("standard", Some(" ULTRAFAST ")),
+                ("ultrafast", Some("standard")),
+                ("ultrafast", Some("priority")),
+                ("fast", None),
+                ("unknown", None),
+                ("flex", None),
+                ("batch", None),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut log =
+                    test_share_request_log_entry(&format!("tier-{index}"), "share-tiers", now);
+                log.model = "rollup-model".into();
+                log.actual_model = "rollup-model".into();
+                log.input_tokens = 100;
+                log.output_tokens = 1;
+                log.client_service_tier = Some(client.into());
+                log.effective_service_tier = effective.map(str::to_string);
+                upsert_share_request_log_tx(&conn, "inst-1", log).unwrap();
+            }
+        }
+        for _ in 0..2 {
+            store.rebuild_share_listing_usage_rollup(31).await.unwrap();
+            let conn = store.conn.lock().await;
+            let actual = conn
+                .prepare(
+                    "SELECT service_tier,input_tokens,output_tokens,request_count
+                     FROM share_listing_usage_rollup WHERE share_id='share-tiers'
+                     ORDER BY service_tier",
+                )
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<crate::db::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(
+                actual,
+                vec![
+                    ("flex".into(), 200, 2, 2),
+                    ("priority".into(), 200, 2, 2),
+                    ("standard".into(), 200, 2, 2),
+                    ("ultrafast".into(), 200, 2, 2),
+                ]
+            );
+        }
+        drop(store);
         let _ = std::fs::remove_file(&config.database.path);
     }
 

@@ -406,6 +406,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         117,
         include_str!("../schema/0117_share_capability_policy.sql"),
     ),
+    (118, include_str!("../schema/0118_ultrafast_pricing.sql")),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -1631,6 +1632,7 @@ mod tests {
     mod control_recovery;
     mod notification_safety;
     mod suspension;
+    mod ultrafast;
 
     #[test]
     fn migration_95_freezes_new_client_terms_without_repricing_existing_periods() {
