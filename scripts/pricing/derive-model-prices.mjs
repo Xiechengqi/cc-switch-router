@@ -23,6 +23,7 @@ const SERVICE_TIERS = [
   { tier: "standard", suffix: "" },
   { tier: "priority", suffix: "_priority" },
   { tier: "flex", suffix: "_flex" },
+  { tier: "ultrafast", suffix: "_ultrafast" },
 ];
 
 const CATEGORY_STEMS = {
@@ -105,7 +106,7 @@ function readNumber(entry, key) {
 function detectThresholds(entry) {
   const found = new Set();
   for (const key of Object.keys(entry)) {
-    const match = /_above_(\d+)k_tokens(?:_priority|_flex)?$/.exec(key);
+    const match = /_above_(\d+)k_tokens(?:_priority|_flex|_ultrafast)?$/.exec(key);
     if (match) found.add(Number.parseInt(match[1], 10) * 1000);
   }
   if (found.size === 0) return null;
@@ -134,7 +135,7 @@ function prettifyName(priceKey) {
     .join(" ");
 }
 
-function buildRateRow(entry, tierSuffix, threshold) {
+export function buildRateRow(entry, tierSuffix, threshold) {
   const ctx = contextSuffix(threshold);
   const row = {};
   // Tracked per dimension: a long-context key proves nothing about the service
@@ -158,6 +159,9 @@ function buildRateRow(entry, tierSuffix, threshold) {
     let micros = null;
     const seen = new Set();
     for (const candidate of candidates) {
+      // Ultrafast is an independently priced tier: never borrow a standard
+      // dimension, including cache prices, to fabricate a partial row.
+      if (tierSuffix === "_ultrafast" && !candidate.tier) continue;
       if (seen.has(candidate.key)) continue;
       seen.add(candidate.key);
       const value = readNumber(entry, candidate.key);
@@ -167,6 +171,7 @@ function buildRateRow(entry, tierSuffix, threshold) {
       if (candidate.context) contextExplicit = true;
       break;
     }
+    if (tierSuffix === "_ultrafast" && micros === null && (readNumber(entry, stem) ?? 0n) > 0n) return null;
     row[category] = micros;
   }
   if (row.input === null || row.output === null) return null;
@@ -178,7 +183,7 @@ function buildRateRow(entry, tierSuffix, threshold) {
   // which requires 1h >= 5m for THIS row — on a long-context row the 5m price
   // is scaled up while the 1h price is not, and can exceed it. Emitting it
   // anyway would produce an "upper" bound below the point estimate.
-  const cacheWrite1h = readNumber(entry, "cache_creation_input_token_cost_above_1hr");
+  const cacheWrite1h = readNumber(entry, `cache_creation_input_token_cost_above_1hr${tierSuffix === "_ultrafast" ? tierSuffix : ""}`);
   row.cacheWrite1h = cacheWrite1h !== null && cacheWrite1h > row.cacheWrite5m ? cacheWrite1h : null;
   return { row, tierExplicit, contextExplicit };
 }

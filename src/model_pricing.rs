@@ -30,16 +30,19 @@ pub enum ServiceTier {
     Standard,
     Priority,
     Flex,
+    Ultrafast,
 }
 
 impl ServiceTier {
-    pub const ALL: [ServiceTier; 3] = [Self::Standard, Self::Priority, Self::Flex];
+    pub const LEGACY: [ServiceTier; 3] = [Self::Standard, Self::Priority, Self::Flex];
+    pub const ALL: [ServiceTier; 4] = [Self::Standard, Self::Priority, Self::Flex, Self::Ultrafast];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Standard => "standard",
             Self::Priority => "priority",
             Self::Flex => "flex",
+            Self::Ultrafast => "ultrafast",
         }
     }
 
@@ -55,6 +58,7 @@ impl ServiceTier {
             // `priority` for fast mode; `fast` is the client-facing spelling.
             "priority" | "fast" => Some(Self::Priority),
             "flex" | "batch" => Some(Self::Flex),
+            "ultrafast" => Some(Self::Ultrafast),
             _ => None,
         }
     }
@@ -288,7 +292,7 @@ pub fn resolve_rates(
             return Some((rates, vec![PricingNote::ContextTierFellBack]));
         }
     }
-    if tier != ServiceTier::Standard {
+    if tier != ServiceTier::Standard && tier != ServiceTier::Ultrafast {
         if let Some(rates) = price.rate_at(ServiceTier::Standard, ctx) {
             return Some((rates, vec![PricingNote::ServiceTierFellBack]));
         }
@@ -413,6 +417,29 @@ mod tests {
             cache_read: 1_000_000,
             cache_write: 1_000_000,
         }
+    }
+
+    #[test]
+    fn ultrafast_requires_its_own_rate_and_keeps_same_tier_context_fallback() {
+        let mut price = sonnet();
+        assert_eq!(
+            ServiceTier::parse("ultrafast"),
+            Some(ServiceTier::Ultrafast)
+        );
+        assert!(resolve_rates(&price, ServiceTier::Ultrafast, ContextTier::Base).is_none());
+        assert!(resolve_rates(&price, ServiceTier::Ultrafast, ContextTier::Long).is_none());
+        let mut rate = price
+            .rate_at(ServiceTier::Standard, ContextTier::Base)
+            .unwrap()
+            .clone();
+        rate.input_micros_per_1m = 123_000_000;
+        price
+            .rates
+            .insert((ServiceTier::Ultrafast, ContextTier::Base), rate);
+        let (rate, notes) =
+            resolve_rates(&price, ServiceTier::Ultrafast, ContextTier::Long).unwrap();
+        assert_eq!(rate.input_micros_per_1m, 123_000_000);
+        assert_eq!(notes, [PricingNote::ContextTierFellBack]);
     }
 
     #[test]

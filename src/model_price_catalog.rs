@@ -376,7 +376,7 @@ impl PricingCatalog {
                     );
                 }
             }
-            let complete = ServiceTier::ALL.iter().all(|tier| {
+            let complete = ServiceTier::LEGACY.iter().all(|tier| {
                 contexts.iter().all(|context| {
                     rates.contains_key(&format!("{}/{}", tier.as_str(), context.as_str()))
                 })
@@ -1066,6 +1066,7 @@ fn parse_service_tier(raw: &str) -> Option<ServiceTier> {
         "standard" => Some(ServiceTier::Standard),
         "priority" => Some(ServiceTier::Priority),
         "flex" => Some(ServiceTier::Flex),
+        "ultrafast" => Some(ServiceTier::Ultrafast),
         _ => None,
     }
 }
@@ -1371,6 +1372,45 @@ mod tests {
     }
 
     #[test]
+    fn execution_snapshots_keep_legacy_models_and_only_publish_explicit_ultrafast() {
+        let rates = RateSet {
+            input_micros_per_1m: 1_000_000,
+            output_micros_per_1m: 2_000_000,
+            cache_read_micros_per_1m: 100_000,
+            cache_write_5m_micros_per_1m: 0,
+            cache_write_1h_micros_per_1m: None,
+        };
+        let legacy = ModelPrice {
+            price_key: "legacy-test".into(),
+            display_name: "Legacy".into(),
+            long_context_threshold: None,
+            long_context_inclusive: false,
+            supports_cache_breakdown: false,
+            rates: BTreeMap::from([((ServiceTier::Standard, ContextTier::Base), rates.clone())]),
+        };
+        let mut modern = legacy.clone();
+        modern.price_key = "ultrafast-test".into();
+        modern.rates.insert(
+            (ServiceTier::Ultrafast, ContextTier::Base),
+            RateSet {
+                input_micros_per_1m: 9_000_000,
+                ..rates
+            },
+        );
+        let catalog = PricingCatalog::for_tests(vec![legacy, modern]);
+        let snapshot = catalog.execution_snapshot(1).unwrap();
+        let legacy = snapshot.model("legacy-test").unwrap();
+        assert_eq!(legacy.rates.len(), 3);
+        assert!(!legacy.supports_tier("ultrafast"));
+        let modern = snapshot.model("ultrafast-test").unwrap();
+        assert_eq!(
+            modern.rates["ultrafast/base"].input.as_deref(),
+            Some("9000000")
+        );
+        snapshot.revision().unwrap();
+    }
+
+    #[test]
     fn embedded_document_parses() {
         let document = parse_document(EMBEDDED_CATALOG).expect("parse embedded catalog");
         assert_eq!(document.schema_version, SUPPORTED_SCHEMA_VERSION);
@@ -1520,7 +1560,7 @@ mod tests {
             cache_read: 50_000,
             cache_write: 10_000,
         };
-        for tier in ServiceTier::ALL {
+        for tier in ServiceTier::LEGACY {
             let shown = price_usage(
                 display,
                 tier,

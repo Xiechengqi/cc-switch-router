@@ -1057,7 +1057,7 @@ export type ShareUserUsageModelRow = {
   priceKey?: string;
   displayName: string;
   appType: string;
-  serviceTier: "standard" | "priority" | "flex";
+  serviceTier: "standard" | "priority" | "flex" | "ultrafast";
   contextTier: "base" | "long";
   input: number;
   output: number;

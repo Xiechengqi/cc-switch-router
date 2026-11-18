@@ -222,7 +222,7 @@ pub(crate) fn apply_owner_prices(
                 context_input_basis: ContextInputBasis::RawInput,
                 long_context_threshold: None,
                 long_context_inclusive: false,
-                rates: ServiceTier::ALL
+                rates: ServiceTier::LEGACY
                     .iter()
                     .map(|tier| (format!("{}/base", tier.as_str()), rates.clone()))
                     .collect(),
@@ -251,7 +251,7 @@ pub(crate) fn owner_model_price(key: &str, display_name: &str, rates: &OwnerRate
         long_context_threshold: None,
         long_context_inclusive: false,
         supports_cache_breakdown: true,
-        rates: ServiceTier::ALL
+        rates: ServiceTier::LEGACY
             .iter()
             .map(|tier| ((*tier, ContextTier::Base), set))
             .collect(),

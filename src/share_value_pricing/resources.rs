@@ -139,7 +139,7 @@ impl super::ExecutionModelPrice {
                 _ => {}
             }
         }
-        if !matches!(tier, "standard" | "priority" | "flex") {
+        if !matches!(tier, "standard" | "priority" | "flex" | "ultrafast") {
             return Err(ValueError::PriceUnavailable);
         }
         let context = match self.context_input_basis {

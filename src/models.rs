@@ -2606,7 +2606,7 @@ pub struct ShareUserUsageModelRow {
     pub price_key: Option<String>,
     pub display_name: String,
     pub app_type: String,
-    /// `standard` | `priority` | `flex`. The same model at two tiers is two
+    /// `standard` | `priority` | `flex` | `ultrafast`. The same model at two tiers is two
     /// rows on purpose: priority runs about 2x standard, and merging them would
     /// hide where the cost came from.
     pub service_tier: String,
