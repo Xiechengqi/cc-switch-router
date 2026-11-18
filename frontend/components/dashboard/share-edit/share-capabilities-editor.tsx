@@ -2,11 +2,13 @@
 /* Hallmark · pre-emit critique: P4 H4 E4 S5 R5 V3 */
 import * as React from "react";
 import { Button, Modal } from "@heroui/react";
+import { InfoHint } from "@/components/common/info-hint";
 import { previewShareCapabilities } from "@/lib/api";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   capabilityAmount,
-  capabilityOptions,
+  capabilityPresentation,
+  capabilityWarnings,
   capabilitySelectable,
   capabilityStatus,
   capabilityPricingText,
@@ -63,12 +65,15 @@ export function ShareCapabilitiesEditor({
     lang,
   });
   const { preview } = review;
-  const options = capabilityOptions(preview, policy);
-  const main = options.filter((option) => option.available || option.selected);
-  const setup = options.filter(
-    (option) => !option.available && !option.selected && option.configurable,
-  );
-  const ready = review.current && preview?.ready && !review.loading;
+  const view = capabilityPresentation({
+    ...review,
+    policy,
+    savedPolicy,
+    reviewing: !!review.prompt,
+  });
+  const { main, setup } = view;
+  const ready =
+    review.current && preview?.ready && !review.loading && !review.error;
   const choose = (operation: ShareOperation, checked: boolean) => {
     const current = policy ?? emptyCapabilityPolicy();
     const bindings = { ...current.operationBindings };
@@ -81,28 +86,124 @@ export function ShareCapabilitiesEditor({
         : current.allowedOperations.filter((op) => op !== operation),
     });
   };
-  const following = Object.values(grants).filter(
-    (g) =>
-      g.active &&
-      g.role !== "owner" &&
-      g.policy.allowedOperations === undefined &&
-      g.manager !== "routerShareMarket",
-  ).length;
+  // Keep the review hook mounted even when there is no visible configuration.
+  if (view.mode === "hidden") return null;
+  const compact = view.mode === "compact";
+  const title = !compact
+    ? lang === 0
+      ? "扩展能力"
+      : "Extended capabilities"
+    : view.status === "loading"
+      ? lang === 0
+        ? "正在检查扩展能力…"
+        : "Checking extensions…"
+      : view.status === "unavailable"
+        ? view.blocked
+          ? lang === 0
+            ? "扩展能力暂不可保存"
+            : "Extension changes unavailable"
+          : lang === 0
+            ? "扩展能力暂无法读取"
+            : "Extensions unavailable"
+        : lang === 0
+          ? "扩展能力需配置"
+          : "Extensions need setup";
   return (
     <section
-      className="grid min-w-0 gap-3 rounded-xl border border-border p-4 [overflow-wrap:anywhere]"
+      className={`grid min-w-0 gap-2 [overflow-wrap:anywhere] ${compact ? "py-1" : "rounded-xl border border-border p-4"}`}
       aria-label={lang === 0 ? "扩展能力" : "Extended capabilities"}
+      data-capability-view={view.mode}
     >
-      <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0">
-          <h3 className="font-medium">
-            {lang === 0 ? "扩展能力" : "Extended capabilities"}
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex min-w-0 items-center gap-1.5">
+          <h3
+            className={
+              compact ? "text-xs text-muted-foreground" : "font-medium"
+            }
+            role={
+              view.status === "unavailable"
+                ? "alert"
+                : view.status === "loading"
+                  ? "status"
+                  : undefined
+            }
+          >
+            {title}
           </h3>
-          <p className="mt-1 text-xs text-muted-foreground">
-            {lang === 0
-              ? "选择此 Share 允许的生成能力与供应商工具。图片、文档、音频和视频理解输入不受这些开关影响。"
-              : "Choose generation capabilities and Provider-hosted tools. Image, document, audio and video understanding inputs are unaffected."}
-          </p>
+          <InfoHint label={lang === 0 ? "扩展能力说明" : "About extensions"}>
+            <span className="grid gap-1.5">
+              <span>
+                {lang === 0
+                  ? "控制此 Share 的生成能力和供应商工具。图片、文档、音频和视频理解输入不受影响。"
+                  : "Controls generation and Provider-hosted tools. Image, document, audio and video understanding inputs are unaffected."}
+              </span>
+              <span>
+                {lang === 0
+                  ? "用户默认跟随 Share，可在“用户授权与配额”中进一步限制。"
+                  : "Users follow the Share by default. Restrict individuals in user access and quotas."}
+              </span>
+              <span>
+                {lang === 0
+                  ? "与本页其他修改一起保存，已消耗额度保留。美元为 API 等值额度。"
+                  : "Saved with this page; consumed quota is retained. USD means API-equivalent quota."}
+              </span>
+              {!policy ? (
+                <span>
+                  {lang === 0
+                    ? "开始配置并保存后，未选择的扩展能力将关闭。"
+                    : "Once configured and saved, unselected extensions will be disabled."}
+                </span>
+              ) : null}
+              {view.status === "unavailable" ? (
+                <span>
+                  {view.blocked
+                    ? lang === 0
+                      ? "能力变更暂不可保存。请检查协议、存储或处理授权冲突后重试。"
+                      : "Changes cannot be saved yet. Check protocol, storage or conflicting permissions."
+                    : lang === 0
+                      ? "读取不完整，不能据此判断供应商没有扩展能力。已有选择保留，请检查供应商配置、Server 连接、协议与存储后重试。"
+                      : "The check is incomplete. Existing choices are retained. Check Provider settings, Server connectivity, protocol and storage, then retry."}
+                </span>
+              ) : null}
+              {preview?.blockers?.some(
+                (blocker) => blocker.blocker === "MARKET_CAPABILITY_CONFLICT",
+              ) ? (
+                <span>
+                  {lang === 0
+                    ? "已购买套餐限制本次变更，请先处理相关套餐。"
+                    : "An existing purchased plan prevents these changes. Resolve the affected plan first."}
+                </span>
+              ) : null}
+              {preview?.blockers?.some(
+                (blocker) =>
+                  blocker.blocker === "VALUE_QUOTA_RESOURCE_POLICY_REQUIRED",
+              ) ? (
+                <span>
+                  {lang === 0
+                    ? "相关美元授权需要先采用资源价目，请检查用户授权与配额。"
+                    : "Some USD grants require the resource tariff. Check user access and quotas."}
+                </span>
+              ) : null}
+              {preview && preview.displayVersion !== 2 ? (
+                <span>
+                  {lang === 0
+                    ? "请升级 Server 以读取完整能力信息。"
+                    : "Upgrade the Server for complete capability information."}
+                </span>
+              ) : null}
+              {preview?.unavailableBindings?.map((binding) => (
+                <span key={binding.app}>
+                  {binding.app} ·{" "}
+                  {lang === 0
+                    ? "供应商绑定无法读取"
+                    : "Provider binding unavailable"}
+                </span>
+              ))}
+              {review.error ? (
+                <span className="break-all">{review.error}</span>
+              ) : null}
+            </span>
+          </InfoHint>
         </div>
         <Button
           size="sm"
@@ -110,42 +211,35 @@ export function ShareCapabilitiesEditor({
           isDisabled={disabled || review.loading}
           onClick={review.refresh}
         >
-          {lang === 0 ? "刷新" : "Refresh"}
+          {view.status === "unavailable" && !view.blocked
+            ? lang === 0
+              ? "重试"
+              : "Retry"
+            : lang === 0
+              ? "刷新"
+              : "Refresh"}
         </Button>
       </div>
-      {review.error ? (
-        <p role="alert" className="text-sm text-danger">
-          {review.error}
-        </p>
-      ) : null}
-      {review.loading ? (
+      {!compact && view.status === "loading" ? (
         <p role="status" className="text-xs text-muted-foreground">
           {lang === 0
             ? "正在检查当前供应商能力…"
             : "Checking current Provider capabilities…"}
         </p>
       ) : null}
-      {preview && !preview.ready ? (
-        <p role="alert" className="text-xs text-warning">
-          {lang === 0
-            ? "当前无法保存能力变更，请检查 Server 连接、协议版本与存储状态。"
-            : "Capability changes cannot be saved yet. Check the Server connection, protocol and storage."}
+      {!compact && view.status === "unavailable" ? (
+        <p role="alert" className="text-xs text-muted-foreground">
+          {view.blocked
+            ? lang === 0
+              ? "能力变更暂不可保存。"
+              : "Extension changes cannot be saved yet."
+            : lang === 0
+              ? "部分能力暂无法读取，已有选择保留。"
+              : "Some extensions are unavailable. Existing choices are retained."}
         </p>
       ) : null}
-      {preview?.unavailableBindings?.length ? (
-        <p role="alert" className="text-xs text-warning">
-          {lang === 0
-            ? "部分供应商绑定无法读取，已有选择保留；请处理供应商配置后重试。"
-            : "Some Provider bindings are unavailable. Existing choices are retained; check Provider settings and retry."}
-        </p>
-      ) : null}
-      {!policy ? (
+      {!compact && !policy ? (
         <div className="grid justify-items-start gap-2 text-sm">
-          <p>
-            {lang === 0
-              ? "此 Share 尚未设置独立能力权限。"
-              : "This Share has no independent capability policy yet."}
-          </p>
           <Button
             size="sm"
             variant="outline"
@@ -156,19 +250,14 @@ export function ShareCapabilitiesEditor({
               ? "设置扩展能力权限"
               : "Configure extension permissions"}
           </Button>
-          <p className="text-xs text-muted-foreground">
-            {lang === 0
-              ? "开始配置后，保存时会确认本次允许和关闭的能力。"
-              : "After configuration, saving reviews which capabilities will be allowed or disabled."}
-          </p>
         </div>
-      ) : (
+      ) : !compact && policy ? (
         <>
-          {preview && !options.length ? (
-            <p className="py-2 text-sm text-muted-foreground">
+          {view.pending && !main.length ? (
+            <p className="text-xs text-muted-foreground">
               {lang === 0
-                ? "当前绑定没有可配置的扩展能力。"
-                : "The current bindings have no configurable extensions."}
+                ? "能力变更待保存。"
+                : "Extension changes await saving."}
             </p>
           ) : null}
           {main.map((option) => (
@@ -211,13 +300,39 @@ export function ShareCapabilitiesEditor({
                         : "Account verified"}
                 </span>
               </label>
+              {option.selected &&
+              capabilityWarnings(option.rows, lang).length ? (
+                <div className="mt-1 flex items-center gap-1.5 pl-6 text-xs font-medium text-foreground">
+                  <span>
+                    {capabilityWarnings(option.rows, lang)
+                      .map((warning) => warning.label)
+                      .join(" · ")}
+                  </span>
+                  <InfoHint
+                    label={
+                      lang === 0 ? "额度计量提醒" : "Quota metering notice"
+                    }
+                  >
+                    <span className="grid gap-1.5">
+                      {capabilityWarnings(option.rows, lang).map((warning) => (
+                        <span key={warning.reason}>{warning.detail}</span>
+                      ))}
+                    </span>
+                  </InfoHint>
+                </div>
+              ) : null}
               <details className="mt-1 pl-6 text-xs text-muted-foreground">
                 <summary className="cursor-pointer">
                   {lang === 0 ? "查看支持与计量" : "Support and metering"}
                 </summary>
                 <div className="mt-2 grid gap-2">
                   {option.rows
-                    .filter((row) => row.implemented !== false || row.selected || option.selected)
+                    .filter(
+                      (row) =>
+                        row.implemented !== false ||
+                        row.selected ||
+                        option.selected,
+                    )
                     .map((row) => (
                       <div key={row.app} className="grid gap-1">
                         <p>
@@ -322,37 +437,25 @@ export function ShareCapabilitiesEditor({
               </details>
             </div>
           ))}
-          {setup.length ? (
-            <details className="text-xs text-muted-foreground">
-              <summary className="cursor-pointer">
-                {lang === 0 ? "需先配置的能力" : "Capabilities requiring setup"}
-              </summary>
-              <div className="mt-2 grid gap-1">
-                {setup.map((option) => (
-                  <p key={option.operation}>
-                    {OPERATION_LABELS[option.operation][lang]} ·{" "}
-                    {lang === 0
-                      ? "需先在供应商设置中开启"
-                      : "Enable in Provider settings first"}
-                  </p>
-                ))}
-              </div>
-            </details>
-          ) : null}
-          {policy.allowedOperations.length ? (
-            <p className="text-xs text-muted-foreground">
-              {lang === 0
-                ? `分享用户默认跟随此设置${following ? `（当前 ${following} 人）` : ""}。单个用户可在“用户授权与配额”中进一步限制。`
-                : `Shared users follow these settings by default${following ? ` (${following} users)` : ""}. Restrict individuals under user access and quotas.`}
-            </p>
-          ) : null}
         </>
-      )}
-      <p className="text-xs text-muted-foreground">
-        {lang === 0
-          ? "与本页其他修改一起保存，已消耗额度保留。"
-          : "Saved with the rest of this page. Consumed quota is retained."}
-      </p>
+      ) : null}
+      {setup.length ? (
+        <details className="text-xs text-muted-foreground">
+          <summary className="cursor-pointer">
+            {lang === 0 ? "配置说明" : "Setup instructions"}
+          </summary>
+          <div className="mt-2 grid gap-1">
+            {setup.map((option) => (
+              <p key={option.operation}>
+                {OPERATION_LABELS[option.operation][lang]} ·{" "}
+                {lang === 0
+                  ? "需先在供应商设置中开启"
+                  : "Enable in Provider settings first"}
+              </p>
+            ))}
+          </div>
+        </details>
+      ) : null}
       {preview?.incidents?.length ? (
         <div role="alert" className="rounded border border-danger p-2 text-xs">
           <p>

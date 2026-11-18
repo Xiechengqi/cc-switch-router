@@ -123,6 +123,10 @@ export const OPERATION_LABELS: Record<ShareOperation, [string, string]> = {
   "tool.remote_mcp": ["远程 MCP 服务", "Remote MCP"],
 };
 export const COVERAGE_LABELS: Record<string, [string, string]> = {
+  measurement_unknown: [
+    "资源计量状态尚未明确，可能无法完整扣减额度",
+    "Resource metering is unknown and may not fully debit quotas",
+  ],
   runtime_binding_changed: [
     "账号或执行绑定已改变。确认后，将为上述能力重新授权当前绑定。",
     "The account or execution binding changed. Confirmation authorizes the current binding for these extensions.",
@@ -337,6 +341,100 @@ export function capabilityOptions(
   }).filter(
     (option) => option.available || option.selected || option.configurable,
   );
+}
+
+/** Only a complete, current runtime result can establish that there is nothing to configure. */
+export function capabilityPresentation({
+  preview,
+  policy,
+  savedPolicy,
+  current,
+  loading,
+  error,
+  reviewing,
+}: {
+  preview?: CapabilityPreview;
+  policy?: ShareCapabilityPolicy;
+  savedPolicy?: ShareCapabilityPolicy;
+  current: boolean;
+  loading: boolean;
+  error?: string;
+  reviewing?: boolean;
+}) {
+  const options = capabilityOptions(preview, policy);
+  const main = options.filter((option) => option.available || option.selected);
+  const setup = options.filter(
+    (option) => !option.available && !option.selected && option.configurable,
+  );
+  const pending = capabilityIntent(policy) !== capabilityIntent(savedPolicy);
+  const retained =
+    pending ||
+    reviewing ||
+    main.length > 0 ||
+    !!savedPolicy?.allowedOperations.length ||
+    !!preview?.policy.allowedOperations.length ||
+    !!preview?.requiredAcknowledgements.length ||
+    !!preview?.blockers?.length ||
+    !!preview?.incidents?.length ||
+    !!preview?.recentUsage?.length;
+  const blocked =
+    current &&
+    !loading &&
+    !!preview &&
+    (!preview.ready || !!preview.blockers?.length);
+  const status = error
+    ? "unavailable"
+    : loading || !current
+      ? "loading"
+      : !preview?.ready ||
+          preview.displayVersion !== 2 ||
+          preview.expiresAt <= Date.now() ||
+          !!preview.blockers?.length ||
+          !!preview.unavailableBindings?.length ||
+          preview.rows.some(
+            (row) => row.unavailableReason === "runtime_unavailable",
+          )
+        ? "unavailable"
+        : undefined;
+  return {
+    main,
+    setup,
+    pending,
+    blocked,
+    status,
+    mode: retained ? "full" : status || setup.length ? "compact" : "hidden",
+  } as const;
+}
+
+/** Keep financial gaps visible even when their detailed evidence is collapsed. */
+export function capabilityWarnings(rows: CapabilityRow[], lang: 0 | 1) {
+  const reasons = [
+    ...new Set(
+      rows
+        .filter((row) => row.selected)
+        .flatMap((row) => row.scopes.map((scope) => scope.reason)),
+    ),
+  ];
+  const labels: Record<string, [string, string]> = {
+    resource_not_in_token_ledger: [
+      "资源不计入 Token 限额",
+      "Resources do not debit Token quotas",
+    ],
+    model_or_resource_price_unknown: [
+      "缺价资源不扣美元额度",
+      "Unpriced resources do not debit USD quotas",
+    ],
+    estimated_resource_quantity: ["含估算用量", "Includes estimated usage"],
+    no_usage_limit: ["资源无用量上限", "Resources have no usage limit"],
+    measurement_unknown: ["资源计量待确认", "Resource metering unknown"],
+  };
+  return reasons
+    .filter((reason) => labels[reason])
+    .map((reason) => ({
+      reason,
+      label: labels[reason][lang],
+      detail: COVERAGE_LABELS[reason][lang],
+    }));
 }
 
 export function capabilityNeedsReview(

@@ -155,6 +155,8 @@ test("malformed or stale capability previews cannot crash the editor or authoriz
 
 import {
   capabilityOptions,
+  capabilityPresentation,
+  capabilityWarnings,
   capabilityStatus,
   capabilityPricingText,
   capabilityPermissionMode,
@@ -414,4 +416,150 @@ test("malformed display facts cannot turn unknown support or prices into verifie
       /invalid or stale/,
     );
   }
+});
+
+test("only a complete current result with no options or retained state hides the capability card", () => {
+  const preview = displayPreview();
+  preview.rows = [];
+  const policy = emptyCapabilityPolicy();
+  const input = {
+    preview,
+    policy,
+    savedPolicy: policy,
+    current: true,
+    loading: false,
+  };
+  assert.equal(capabilityPresentation(input).mode, "hidden");
+  for (const change of [
+    { current: false },
+    { loading: true },
+    { error: "offline" },
+    { preview: { ...preview, ready: false } },
+    { preview: { ...preview, displayVersion: undefined } },
+    { preview: { ...preview, expiresAt: 0 } },
+    {
+      preview: {
+        ...preview,
+        unavailableBindings: [{ app: "codex", reason: "runtime_unavailable" }],
+      },
+    },
+  ]) {
+    assert.equal(
+      capabilityPresentation({ ...input, ...change }).mode,
+      "compact",
+    );
+  }
+  assert.equal(
+    capabilityPresentation({
+      ...input,
+      current: false,
+      preview: undefined,
+      error: "offline",
+    }).status,
+    "unavailable",
+  );
+  const supported = capabilityPresentation({
+    ...input,
+    preview: displayPreview(),
+  });
+  assert.equal(
+    supported.mode,
+    "full",
+    "available but disabled capabilities remain configurable",
+  );
+  const setup = displayPreview();
+  setup.rows = setup.rows.filter((row) => row.operation === image);
+  assert.equal(
+    capabilityPresentation({ ...input, preview: setup }).mode,
+    "compact",
+  );
+});
+
+test("hiding never drops a pending removal, migration, historical evidence or save review", () => {
+  const preview = displayPreview();
+  preview.rows = [];
+  const policy = emptyCapabilityPolicy();
+  const input = {
+    preview,
+    policy,
+    savedPolicy: policy,
+    current: true,
+    loading: false,
+  };
+  const original = JSON.stringify(input);
+  for (const change of [
+    { savedPolicy: undefined },
+    { savedPolicy: { ...policy, allowedOperations: [search] } },
+    { reviewing: true },
+    {
+      preview: {
+        ...preview,
+        requiredAcknowledgements: [
+          {
+            condition: "review",
+            scope: "owner",
+            operation: search,
+            quotaUnit: "tokens",
+            bindingFingerprint: fingerprint,
+            actor: "",
+            acceptedAtMs: 0,
+          },
+        ],
+      },
+    },
+    {
+      preview: {
+        ...preview,
+        blockers: [{ scope: "owner", blocker: "MARKET_CAPABILITY_CONFLICT" }],
+      },
+    },
+    {
+      preview: {
+        ...preview,
+        incidents: [
+          {
+            scope: "owner",
+            bindingFingerprint: fingerprint,
+            requestId: "incident",
+            resource: "image.output",
+            detectedAtMs: 0,
+          },
+        ],
+      },
+    },
+    {
+      preview: {
+        ...preview,
+        recentUsage: [
+          {
+            scope: "owner",
+            requestId: "usage",
+            attempt: 1,
+            admittedAtMs: 0,
+            meteringStatus: "not_in_usd_ledger",
+            dimensions: [],
+          },
+        ],
+      },
+    },
+  ]) {
+    assert.equal(capabilityPresentation({ ...input, ...change }).mode, "full");
+  }
+  assert.equal(JSON.stringify(input), original);
+});
+
+test("selected capability metering gaps remain visible with deduplicated detail", () => {
+  const row = displayPreview().rows.find((row) => row.operation === search)!;
+  row.selected = true;
+  row.scopes = ["a", "b"].map((scope) => ({
+    scope,
+    quotaUnit: "tokens",
+    coverage: "partial",
+    reason: "resource_not_in_token_ledger",
+  }));
+  assert.equal(capabilityWarnings([row], 0).length, 1);
+  assert.match(capabilityWarnings([row], 0)[0].label, /不计入 Token/);
+  row.scopes[0].reason = "model_or_resource_price_unknown";
+  assert.match(capabilityWarnings([row], 0)[0].label, /不扣美元/);
+  assert.deepEqual(capabilityWarnings([{ ...row, selected: false }], 0), []);
 });
