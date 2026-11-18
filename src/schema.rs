@@ -402,6 +402,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../schema/0115_financial_request_security.sql"),
     ),
     (116, include_str!("../schema/0116_wallet_risk_recovery.sql")),
+    (
+        117,
+        include_str!("../schema/0117_share_capability_policy.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {

@@ -414,6 +414,7 @@ export function useShareSeatCheckout({
                                   </div>
                                 ))}
                               </dd>
+                              {rentTarget.quote.offer.service.measurementPolicy==="text-tokens-v1" ? <><dt className="text-slate-500">{locale.startsWith("zh")?"能力范围":"Capability scope"}</dt><dd>{locale.startsWith("zh")?"基础模型交互；图片、文档等理解输入可用。图片/视频生成、音频输出与供应商执行工具不包含在本合同中。":"Base model interaction with multimodal understanding inputs. Image/video generation, audio output and hosted tools are excluded from this contract."}</dd></>:null}
                               <dt className="text-slate-500">{t("shareMarket.catalog.shareCapacity")}</dt>
                               <dd>{rentTarget.quote.offer.service.shareParallelLimit == null ? t("common.unlimited") : t("shareMarket.parallelShort", { value: rentTarget.quote.offer.service.shareParallelLimit })}</dd>
                               <dt className="text-slate-500">{t("shareMarket.catalog.shareTokens")}</dt>

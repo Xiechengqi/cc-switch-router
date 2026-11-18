@@ -115,6 +115,7 @@ jobs:
           bash ../scripts/ci/timed.sh 'Navbar wallet browser' npm run test:navbar-wallet-browser
           bash ../scripts/ci/timed.sh 'Password authentication browser' npm run test:auth-password-browser
           bash ../scripts/ci/timed.sh 'Marketplace email diagnostics browser' npm run test:market-notifications-browser
+          bash ../scripts/ci/timed.sh 'Share capability policy browser' npm run test:share-capabilities-browser
 
   rust-tests:
     runs-on: ubuntu-22.04
@@ -207,6 +208,7 @@ jobs:
       - name: Test Share value quota contracts
         run: |
           bash scripts/ci/timed.sh 'Share value pricing and signed projections' cargo test --locked share_value
+          bash scripts/ci/timed.sh 'Share capability policy contract' bash scripts/ci/require-tests.sh cargo test --locked share_capabilities
           bash scripts/ci/timed.sh 'Share reader compatibility' cargo test --locked share_contract_reader
           bash scripts/ci/timed.sh 'Share authorization contracts' cargo test --locked share_user
           bash scripts/ci/timed.sh 'Share account identity privacy' bash scripts/ci/require-tests.sh cargo test --locked share_account_identity

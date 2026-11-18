@@ -1,3 +1,4 @@
+import type {ShareCapabilityPolicy, CapabilityConsent} from "@/lib/share-capabilities";
 import { shareProviderSupportedApps, SHARE_APP_LABELS, type CoreShareApp } from "@/lib/share-app";
 import type {
   ShareSettingsPatch,
@@ -30,6 +31,9 @@ export const PRICE_APPS: Array<{ key: PriceApp; label: string }> = [
 ];
 
 export type ShareEditDraft = {
+  capabilityPolicy?: ShareCapabilityPolicy;
+  capabilityConsent?: CapabilityConsent;
+  capabilityConsentScope?: string;
   description: string;
   freeAccess: boolean;
   tokenLimitInput: string;
@@ -86,6 +90,7 @@ export function buildShareEditDraft(share: ShareView): ShareEditDraft {
   const parallelUnlimited = isUnlimitedParallelLimit(parallelLimit);
   const permanent = isPermanentExpiryDate(share.expiresAt) || isUnlimitedExpiry(share.expiresAt);
   return {
+    capabilityPolicy: share.capabilityPolicy,
     description: share.description || "",
     freeAccess: share.freeAccess,
     tokenLimitInput: tokenUnlimited ? "" : tokensToMillionsInput(tokenLimit),
@@ -132,6 +137,7 @@ function fullShareEditPatch(draft: ShareEditDraft, share: ShareView): ShareSetti
     defaultPolicy,
   );
   const patch: ShareSettingsPatch = {
+    ...(draft.capabilityConsent ? {capabilityPolicy:draft.capabilityPolicy, capabilityConsent:draft.capabilityConsent}:{}),
     description: draft.description.trim() || null,
     freeAccess: draft.freeAccess,
     tokenLimit,

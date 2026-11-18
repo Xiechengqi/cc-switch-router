@@ -1,3 +1,4 @@
+import { parseCapabilityPreview } from "@/lib/share-capabilities";
 import { authFetch, readAuthState, type AuthState } from "@/lib/auth";
 import { loginContextKey, sameLoginContext } from "@/lib/password-auth";
 import type {
@@ -1933,4 +1934,14 @@ export async function updateAdminResourcePrices(expectedRevision: number, settin
       body: JSON.stringify({ expectedRevision, settings }),
     }),
   );
+}
+
+export async function previewShareCapabilities(shareId: string, input: unknown, signal?: AbortSignal): Promise<import("@/lib/share-capabilities").CapabilityPreview> {
+  const started = readAuthState();
+  const response = await authFetch(`/v1/shares/${encodeURIComponent(shareId)}/capability-preview`, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(input),signal,cache:"no-store"});
+  if (!sameLoginContext(started,readAuthState())) throw new DOMException("Sign-in session changed", "AbortError");
+  const result=await response.json();
+  if (!sameLoginContext(started,readAuthState())) throw new DOMException("Sign-in session changed", "AbortError");
+  if (!response.ok) throw new Error(result.message || "Capability preview failed");
+  return parseCapabilityPreview(result,shareId,input);
 }

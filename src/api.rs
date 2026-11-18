@@ -425,6 +425,10 @@ pub fn router(state: ServerState) -> Router {
         .route("/share-api/share", get(share_api_share))
         .route("/share-api/auth/me", get(share_api_auth_me))
         .route(
+            "/share-api/share/capability-preview",
+            post(share_api_capability_preview),
+        )
+        .route(
             "/share-api/share/settings",
             patch(share_api_update_settings),
         )
@@ -2137,6 +2141,27 @@ async fn share_api_update_settings(
     )
     .await?;
     Ok(Json(response))
+}
+
+async fn share_api_capability_preview(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<ShareApiAuthQuery>,
+    Json(input): Json<serde_json::Value>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let route = share_route_from_headers(&state, &headers).await?;
+    let share_id = route
+        .share_id()
+        .ok_or_else(|| AppError::NotFound("share route not found".into()))?;
+    let auth = share_api_auth_response(&state, &headers, share_id, query.email.as_deref()).await?;
+    if !auth.can_manage {
+        return Err(AppError::Forbidden(
+            "only share owner can preview capabilities".into(),
+        ));
+    }
+    let result =
+        crate::share_value_quotas::forward_capability_preview(&state, share_id, input).await?;
+    Ok(([(header::CACHE_CONTROL, "private, no-store")], Json(result)))
 }
 
 async fn share_route_from_headers(

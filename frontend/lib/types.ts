@@ -1,3 +1,4 @@
+import type { ShareOperation, ShareCapabilityPolicy, CapabilityConsent } from "@/lib/share-capabilities";
 export type AuthUser = {
   id: string;
   email: string;
@@ -351,6 +352,7 @@ export type AccountResetPreview = {
 };
 
 export type ShareUserPolicy = {
+  allowedOperations?: ShareOperation[];
   parallelLimit?: number;
   tokenLimit?: number;
   /** `unpricedUsage` omitted means `zero` (serve and meter unpriced usage at $0). */
@@ -427,6 +429,7 @@ export type ShareUserGrant = {
 export type ShareUserGrantMap = Record<string, ShareUserGrant>;
 
 export type ShareView = {
+  capabilityPolicy?: ShareCapabilityPolicy;
   providerIdentity?: PublicProviderIdentity;
   routerId?: string;
   shareId: string;
@@ -519,6 +522,7 @@ export type ShareClientUnbanResponse = {
 };
 
 export type ShareSettingsPatch = {
+  capabilityPolicy?: ShareCapabilityPolicy; capabilityConsent?: CapabilityConsent;
   expectedAccountCycle?: AccountQuotaCycle;
   ownerEmail?: string;
   description?: string | null;
@@ -3158,6 +3162,8 @@ export type ShareMarketRentAppService = {
 
 export type ShareMarketRentService = {
   schemaVersion: number;
+  allowedOperations?: import("./share-capabilities").ShareOperation[];
+  measurementPolicy?: string;
   supportedApps: string[];
   apps: ShareMarketRentAppService[];
   shareParallelLimit?: number;

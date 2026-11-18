@@ -1,5 +1,9 @@
 "use client";
 
+import {ShareCapabilitiesEditor} from "@/components/dashboard/share-edit/share-capabilities-editor";
+import {capabilityIntent,capabilityQuotaContext} from "@/lib/share-capabilities";
+import {previewSharePageCapabilities} from "@/lib/share-api";
+
 import * as React from "react";
 import { Alert, Button, Checkbox, Chip, Input, TextArea } from "@heroui/react";
 import { KeyRound, Loader2, LogOut, Save } from "lucide-react";
@@ -207,10 +211,11 @@ function ShareSettingsForm({
     };
   }, [draft, expiryLocal, expiryPermanent, parallelUnlimited, tokenLimitInput, tokenUnlimited, baseline.expiresAt]);
   const settingsPatch = buildShareSettingsPatch(effectiveDraft, baseline);
-  const dirty = Object.keys(settingsPatch).length > 0;
+  const capabilityReviewNeeded=capabilityIntent(draft.capabilityPolicy)!==capabilityIntent(baseline.capabilityPolicy)||!!draft.capabilityPolicy?.allowedOperations.length&&capabilityQuotaContext(draft.capabilityPolicy,draft.userGrants,effectiveDraft.tokenLimit)!==capabilityQuotaContext(baseline.capabilityPolicy,baseline.userGrants??{},baseline.tokenLimit);
+  const dirty = Object.keys(settingsPatch).length > 0 || capabilityReviewNeeded;
   dirtyRef.current = dirty;
   const fieldErrors = shareSettingsFieldErrors(effectiveDraft);
-  const formInvalid = shareSettingsHasFieldErrors(fieldErrors);
+  const formInvalid = shareSettingsHasFieldErrors(fieldErrors)||(capabilityReviewNeeded&&(!draft.capabilityConsent||draft.capabilityConsentScope!==capabilityQuotaContext(draft.capabilityPolicy,draft.userGrants,effectiveDraft.tokenLimit)));
   const ceilingInvalid =
     fieldErrors.tokenLimit || fieldErrors.parallelLimit || fieldErrors.expiresAt;
   const firstValidationMessage = fieldErrors.description
@@ -295,6 +300,13 @@ function ShareSettingsForm({
         </label>
       </div>
 
+      {editable?<ShareCapabilitiesEditor shareId={share.shareId} revision={baseline.configRevision??0} policy={draft.capabilityPolicy} savedPolicy={baseline.capabilityPolicy} grants={draft.userGrants} tokenLimit={effectiveDraft.tokenLimit} disabled={busy||!!pendingEditId} previewCapabilities={previewSharePageCapabilities}
+        onGrantOperationsChange={(email,allowedOperations)=>setDraft(current=>({...current,capabilityConsent:undefined,userGrants:{...current.userGrants,[email]:{...current.userGrants[email],policy:{...current.userGrants[email].policy,allowedOperations}}}}))}
+        onChange={(capabilityPolicy,capabilityConsent)=>setDraft(current=>{
+          const userGrants=Object.fromEntries(Object.entries(current.userGrants).map(([email,g])=>[email,g.active&&g.manager!=="routerShareMarket"&&g.policy.valueQuota&&capabilityPolicy.allowedOperations.some(op=>g.policy.allowedOperations?.includes(op)??true)?{...g,policy:{...g.policy,valueQuota:{...g.policy.valueQuota,tariffPolicyId:"api-equivalent-v2" as const}}}:g]));
+          return {...current,capabilityPolicy,capabilityConsent,userGrants,capabilityConsentScope:capabilityConsent?capabilityQuotaContext(capabilityPolicy,userGrants,effectiveDraft.tokenLimit):undefined};
+        })}/>:null}
+
       <ShareAccessQuotaSection
         t={t}
         access={
@@ -374,7 +386,7 @@ function ShareSettingsForm({
         }
         users={
           editable ? (
-            <ShareUserGrantsEditor
+            <ShareUserGrantsEditor independentCapabilities={!!draft.capabilityPolicy}
               value={draft.userGrants}
               ownerEmail={share.ownerEmail || ""}
               defaultPolicy={defaultUserPolicy}

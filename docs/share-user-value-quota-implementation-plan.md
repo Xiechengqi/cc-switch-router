@@ -1,7 +1,7 @@
 # Share 用户双口径用量限额：完整落地实施计划
 
 > 当前即时转换：§16 使用 Share v12 / Server schema 6，普通授权保存立即承接当前窗口消费。
-> 当前扩展：全供应商与资源计量已按 §15 的 v11/v2 合同接入；本轮只做编译、类型、格式与静态审计，产品测试留 CI，生产仍 `live_pending`，未部署。
+> 最新扩展（2026-11-17）：v13 独立扩展能力与分维度缺价处理已接入，详见本文末尾现行说明及 [能力实施记录](share-capability-policy-implementation-plan.md)。§15 的 v11/v2 和以下各阶段验证记录保留历史语义；生产仍 `live_pending`，未部署。
 >
 > 历史状态：**双仓本地实现，`local_verified / live_pending`；未部署**。规格制定于 2026-10-29，初次实施核对：2026-10-30。第 1–10 节保留设计目标与验收要求，第 11 节记录初次实施，第 12 节记录 2026-10-31 的能力诊断与自定义文本补强；不能把本地实现视为真实流量验收通过。
 >
@@ -528,3 +528,14 @@ CI 回归已覆盖历史承接、往返、在途、耗尽、缺证据、批次�
 - 生效时刻按 installation 记录在 `share_value_pricing_installation_revisions`：任何替换（包括回到更早出现过的内容 revision、删除最后一条价格回到全局 revision）都取 now+60s；manifest、readiness 与 active 回执都使用该时刻。ACK 只接受全局 revision 或已签发给本 installation 的叠加 revision。全局目录同步 / 资源价编辑提交后，在独立短事务中重算所有叠加：短锁读取输入，解析 / 克隆 / 序列化 / 哈希在 `spawn_blocking` 中进行（解析结果按 revision 进程内缓存），写入时逐 installation 开 SAVEPOINT 并复核基线 revision 与价格摘要未变，失败或竞态即回滚到 savepoint、保留旧 revision 并记日志，下次同步（含启动时）重试；基线与摘要不变时为空操作。拥有者编辑同样先锁外派生，再在短写事务内复核，竞态时重试至多 3 次，仍冲突返回 409 `MODEL_PRICE_TARIFF_CHANGED`。压缩跳过仍被 installation 引用的快照。回到全局且已生效后删除该行。健康检查按每个 installation 实际应获得的 revision 统计 ACK/激活，并给出 `ownerPricedInstallations`。市场报价冻结 Share 所在 installation 的实际 revision。
 - 用量明细：模型解析与 Server 计量完全一致——取 installation 实际获得的基线快照（协商 resource 时为 resource，否则 text；无发布时退回目录派生快照），以 `PricingSnapshot::model` 同一候选顺序在“基线 + 拥有者补价 key”上解析，不再有拥有者优先或目录前缀 alias 的额外路径；解析到拥有者补价 key 时 `priceSource="owner"`，否则 `"catalog"`。费率按窗口定价时刻取该 key 生效的一代（拥有者历史或目录）。`priced` 改为“实际算出金额”，新增 `priceSource`、`unpriced`、行级 `unpricedTokens / unpricedModels` 与响应级 `canSetPrice / canSetGlobalPrice`；窗口只有未定价用量时行级 `equivalentUsdMicros` 为 `"0"`（与 $0 模型行一致，`pricedCoveragePercent` 为 0），市场租用价值仍视为未定价。接口改为需要会话：Share 管理者可读任意用户，其他登录用户只读本人（省略 email 即本人，读他人 403），匿名 401；唯一浏览器调用方是 Dashboard Share 抽屉，未登录时仅缺少 USD 列。
 - 市场门槛：Server 对自有授权以 `ready:true, state:"unpriced"` 报告缺价，Router 在所有市场就绪路径（席位发布、编辑、重开、报价及 `market-value-quota-readiness`）将 `state:"unpriced"` 或 `model_price_coverage` 的缺价 `reasonCode`（`model_unpriced / model_unresolved / tier_unpriced / resource_unpriced / tariff_not_effective`）改为 `ready:false` 阻断，前端市场就绪解析同样视为阻断。
+
+
+## 现行补充：v13 独立扩展能力与部分计价（2026-11-17）
+
+Share 的图片生成/编辑、视频生成、音频输出与供应商执行工具，改由独立 `capabilityPolicy` 管理，适用于 Token、USD 和无限额。新 Share 全部关闭；旧无策略 Share 保持明确兼容态，须预览后显式采用。图片、PDF、音频、视频理解输入及客户端 function/custom tools 继续按原模型处理。能力变更与 Token/USD 切换均不清零历史消费。
+
+旧“包含图片、音频、视频与付费工具”布尔值不再作为可写的授权总开关；v1/v2 仅表示内部执行价卡。有限 Token 额度不能自然约束张数、秒数和工具次数，owner 必须按具体 scope/操作/运行时确认未覆盖部分。USD reject 缺实际模型或参数价格即拒绝；显式 zero 只对缺价维度不扣金额，有价文本与其他资源仍照常预占和结算。缺价不等于免费，缺数量保留保守风险。
+
+Router reader 为 13、迁移为 0117；Server 要求协商 `shareCapabilityPolicyV1` 和 committed schema 8。策略、grant、确认和永久保存回执原子提交，所有实际生成在发网前重验。市场 v13 首版冻结基础模型交互的空扩展操作集合，不继承 owner 后续打开的能力。旧活动市场合同无法证明等价时先阻止采用，须走原合同结束/迁移流程。
+
+详细实现、整体 review、测试结果以及未完成的真实灰度见 [完整实施记录](share-capability-policy-implementation-plan.md#14-实施与整体-review-记录2026-11-17)。本地验证不替代生产对账，API 等值额度不表示 OAuth 真实花费或钱包扣款。

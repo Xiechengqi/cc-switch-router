@@ -11,7 +11,7 @@ pub const MIN_SHARE_CONTRACT_VERSION: u16 = 2;
 /// v7 only add quota presentation metadata, so v5 market records remain valid
 /// during a rolling Server/Router deployment.
 pub const MIN_SHARE_MARKET_CONTRACT_VERSION: u16 = 5;
-pub const SHARE_CONTRACT_VERSION: u16 = 12;
+pub const SHARE_CONTRACT_VERSION: u16 = 13;
 pub const SHARE_TRIAL_CONTRACT_VERSION: u16 = 9;
 
 #[derive(Debug)]
@@ -1308,6 +1308,10 @@ pub struct ShareSettingsPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grok_media_policy: Option<GrokMediaPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_policy: Option<crate::share_capabilities::ShareCapabilityPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_consent: Option<crate::share_capabilities::CapabilityConsent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub support: Option<ShareSupport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_grants: Option<BTreeMap<String, ShareUserGrant>>,
@@ -1652,6 +1656,8 @@ pub struct ShareUserPolicy {
     pub expires_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_apps: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_operations: Option<Vec<crate::share_capabilities::ShareOperation>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -3590,6 +3596,8 @@ pub struct ShareDescriptor {
     pub previous_response_cache_enabled: bool,
     #[serde(default)]
     pub grok_media_policy: GrokMediaPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_policy: Option<crate::share_capabilities::ShareCapabilityPolicy>,
     #[serde(default, skip_serializing_if = "is_zero_revision")]
     pub config_revision: u64,
     #[serde(default, skip_serializing_if = "is_zero_revision")]
@@ -4352,6 +4360,8 @@ pub struct ShareView {
     pub previous_response_cache_enabled: bool,
     #[serde(default)]
     pub grok_media_policy: GrokMediaPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_policy: Option<crate::share_capabilities::ShareCapabilityPolicy>,
 }
 
 #[derive(Debug, Clone, Serialize)]

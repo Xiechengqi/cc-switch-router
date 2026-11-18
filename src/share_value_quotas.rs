@@ -29,6 +29,10 @@ pub fn router() -> Router<ServerState> {
         .route("/v1/me/share-value-quotas", get(mine))
         .route("/v1/shares/:share_id/value-quota-preview", post(preview))
         .route(
+            "/v1/shares/:share_id/capability-preview",
+            post(capability_preview),
+        )
+        .route(
             "/v1/shares/:share_id/quota-history-prepare",
             post(prepare_history),
         )
@@ -175,6 +179,28 @@ fn control_error(error: crate::ctl_client::CtlError) -> AppError {
         // A JSON error object (axum route-not-found has an empty body) means the
         // Server understood the route and rejected the target itself.
         let structured = code.is_some() || message.is_some();
+        if let Some(known) = [
+            "SHARE_CAPABILITY_DISABLED",
+            "CAPABILITY_NOT_SUPPORTED",
+            "CAPABILITY_CONTEXT_REQUIRED",
+            "CAPABILITY_REQUEST_INVALID",
+            "CAPABILITY_EXECUTION_QUARANTINED",
+            "CAPABILITY_STATE_CHANGED",
+            "CAPABILITY_UPGRADE_REQUIRED",
+            "QUOTA_COVERAGE_REQUIRED",
+            "CAPABILITY_PREVIEW_EXPIRED",
+            "MARKET_CAPABILITY_CONFLICT",
+        ]
+        .into_iter()
+        .find(|known| code.as_deref() == Some(*known))
+        {
+            return AppError::Coded {
+                status: StatusCode::from_u16(*status).unwrap_or(StatusCode::CONFLICT),
+                code: known,
+                message: known.into(),
+                details: serde_json::json!({"reasonCode":known,"previewRequired":true}),
+            };
+        }
         match *status {
             404 | 405 if !structured => return quota_unavailable("quota_server_upgrade_required"),
             401 | 403 => return quota_unavailable("quota_control_unauthorized"),
@@ -967,6 +993,41 @@ mod tests {
     }
 
     #[test]
+    fn capability_preview_errors_keep_codes_without_exposing_control_diagnostics() {
+        for (status, code) in [
+            (403, "SHARE_CAPABILITY_DISABLED"),
+            (409, "CAPABILITY_STATE_CHANGED"),
+            (409, "CAPABILITY_PREVIEW_EXPIRED"),
+            (409, "QUOTA_COVERAGE_REQUIRED"),
+            (503, "CAPABILITY_EXECUTION_QUARANTINED"),
+        ] {
+            let error = control_error(crate::ctl_client::CtlError::Rejected {
+                status,
+                body: "private upstream data".into(),
+                message: Some("private upstream data".into()),
+                code: Some(code.into()),
+                retryable: Some(false),
+                current_config_revision: None,
+                current_share: None,
+            });
+            assert_eq!(error.code(), Some(code));
+            let AppError::Coded {
+                status: actual,
+                details,
+                message,
+                ..
+            } = error
+            else {
+                panic!("expected structured capability error");
+            };
+            assert_eq!(actual.as_u16(), status);
+            assert_eq!(details["reasonCode"], code);
+            assert_eq!(details["previewRequired"], true);
+            assert!(!message.contains("private"));
+        }
+    }
+
+    #[test]
     fn usd_trial_capability_is_a_distinct_ready_check() {
         let old_server = vec![
             serde_json::json!({"code": MARKET_SEAT_QUOTA_CHECK, "ready": true}),
@@ -1100,4 +1161,41 @@ mod tests {
             assert_eq!(details["readinessCode"], readiness);
         }
     }
+}
+
+async fn capability_preview(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(share_id): Path<String>,
+    Json(input): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_share_manager(&state, &headers, &share_id).await?;
+    forward_capability_preview(&state, &share_id, input)
+        .await
+        .map(Json)
+}
+pub(crate) async fn forward_capability_preview(
+    state: &ServerState,
+    share_id: &str,
+    mut input: serde_json::Value,
+) -> Result<serde_json::Value, AppError> {
+    if !input.is_object() {
+        return Err(AppError::BadRequest("invalid capability preview".into()));
+    }
+    input["shareId"] = share_id.into();
+    let target = control_target(&state, &share_id).await?;
+    let result = crate::ctl_client::preview_share_capabilities(
+        &target.backend,
+        &target.installation,
+        &target.secret,
+        input,
+    )
+    .await
+    .map_err(control_error)?;
+    if result["shareId"] != share_id || !result["rows"].is_array() {
+        return Err(AppError::UnprocessableEntity(
+            "CAPABILITY_UPGRADE_REQUIRED".into(),
+        ));
+    }
+    Ok(result)
 }

@@ -1,3 +1,4 @@
+import type {ShareCapabilityPolicy,CapabilityConsent} from "./share-capabilities";
 import type {
   ShareSettingsPatch,
   ShareUserGrant,
@@ -17,6 +18,9 @@ export const MIN_BANKED_RESET_EXPIRY_LEAD_MINUTES = 10;
 export const MAX_BANKED_RESET_EXPIRY_LEAD_MINUTES = 7 * 24 * 60;
 
 export type ShareSettingsDraft = {
+  capabilityPolicy?:ShareCapabilityPolicy;
+  capabilityConsent?:CapabilityConsent;
+  capabilityConsentScope?:string;
   description: string;
   freeAccess: boolean;
   tokenLimit: number;
@@ -163,6 +167,7 @@ export function draftFromShare(share: ShareView): ShareSettingsDraft {
     };
   }
   return {
+    capabilityPolicy: share.capabilityPolicy,
     description: share.description || "",
     freeAccess: share.freeAccess,
     tokenLimit: Number.isFinite(share.tokenLimit) ? share.tokenLimit : UNLIMITED_TOKEN_LIMIT,
@@ -179,6 +184,7 @@ export function buildShareSettingsPatch(
   share: ShareView,
 ): ShareSettingsPatch {
   const full = (value: ShareSettingsDraft): ShareSettingsPatch => ({
+    ...(value.capabilityConsent?{capabilityPolicy:value.capabilityPolicy,capabilityConsent:value.capabilityConsent}:{}),
     description: value.description.trim() || null,
     freeAccess: value.freeAccess,
     tokenLimit: value.tokenLimit,
@@ -200,7 +206,7 @@ export function sharePolicyFingerprint(policy: ShareUserPolicy) {
   return JSON.stringify([policy.parallelLimit ?? null, policy.tokenLimit ?? null,
     policy.valueQuota?.limitUsdMicros ?? null, policy.valueQuota?.tariffPolicyId ?? null,
     policy.valueQuota ? policy.valueQuota.unpricedUsage ?? "zero" : null,
-    policy.tokenPeriod || "lifetime", policy.tokenPeriodAnchorAtMs ?? null, policy.expiresAt ?? null]);
+    policy.tokenPeriod || "lifetime", policy.tokenPeriodAnchorAtMs ?? null, policy.expiresAt ?? null, policy.allowedOperations ?? null]);
 }
 
 /**

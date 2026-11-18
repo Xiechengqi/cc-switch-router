@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "emptyPolicy": {
+    "version": 1,
+    "allowedOperations": [],
+    "operationBindings": {}
+  },
+  "explicitGrant": {
+    "tokenPeriod": "lifetime",
+    "allowedOperations": []
+  },
+  "operations": [
+    "image.generate",
+    "image.edit",
+    "video.generate",
+    "audio.generate",
+    "tool.web_search",
+    "tool.web_fetch",
+    "tool.file_search",
+    "tool.code_execution",
+    "tool.computer",
+    "tool.remote_mcp"
+  ]
+}

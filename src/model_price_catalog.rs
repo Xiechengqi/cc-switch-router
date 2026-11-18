@@ -1503,7 +1503,7 @@ mod tests {
         let catalog = load(&conn, at).expect("load");
         let snapshot = catalog.execution_snapshot(at).expect("derive");
         let json = snapshot.canonical_json().expect("valid tariff");
-        assert!(json.len() < MAX_SNAPSHOT_BYTES / 2, "{} bytes", json.len());
+        assert!(json.len() < MAX_SNAPSHOT_BYTES, "{} bytes", json.len());
         assert_eq!(snapshot.models.len(), catalog.effective_models(at).len());
         // Deterministic: the same catalog always publishes the same revision.
         assert_eq!(

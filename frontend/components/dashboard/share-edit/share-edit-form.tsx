@@ -1,4 +1,6 @@
 "use client";
+import {ShareCapabilitiesEditor} from "./share-capabilities-editor";
+import {capabilityIntent, capabilityQuotaContext} from "@/lib/share-capabilities";
 
 import { Checkbox, Input } from "@heroui/react";
 import * as React from "react";
@@ -275,8 +277,10 @@ export function useShareEditForm({
     !draft.parallelLimitUnlimited && (!Number.isFinite(parallelParsed) || parallelParsed <= 0);
   const expiryInvalid = !draft.expiresPermanent && !draft.expiresAtInput.trim();
   const appApiInvalid = !activeShareApps.some((app) => draft.enabledApps[app]);
+  const capabilityDirty = capabilityIntent(draft.capabilityPolicy) !== capabilityIntent(baseDraft.capabilityPolicy);
+  const capabilityReviewNeeded = capabilityDirty || (!!draft.capabilityPolicy?.allowedOperations.length && capabilityQuotaContext(draft.capabilityPolicy,draft.userGrants,draft.tokenLimitUnlimited?-1:tokenParsed??0)!==capabilityQuotaContext(baseDraft.capabilityPolicy,baseDraft.userGrants,baseDraft.tokenLimitUnlimited?-1:millionsInputToTokens(baseDraft.tokenLimitInput)??0));
   const formInvalid =
-    descriptionInvalid ||
+    (capabilityReviewNeeded && (!draft.capabilityConsent || draft.capabilityConsentScope!==capabilityQuotaContext(draft.capabilityPolicy,draft.userGrants,draft.tokenLimitUnlimited?-1:tokenParsed??0))) || descriptionInvalid ||
     tokenInvalid ||
     parallelInvalid ||
     expiryInvalid || appApiInvalid;
@@ -284,7 +288,7 @@ export function useShareEditForm({
   const currentPatch = buildShareEditPatch(draft, baseShare || liveShare, activeShareApps);
   const basePatch = buildShareEditPatch(baseDraft, baseShare || liveShare, activeShareApps);
   const settingsDirty = shareEditPatchFingerprint(currentPatch) !== shareEditPatchFingerprint(basePatch);
-  const isDirty = settingsDirty || blocksDirty;
+  const isDirty = settingsDirty || blocksDirty || capabilityDirty;
 
   const resetDraft = () => {
     if (!baseDraft || busy) return;
@@ -539,6 +543,14 @@ export function ShareEditFormBody({
         onDraftChange={form.onDraftChange}
       />
 
+      <ShareCapabilitiesEditor shareId={displayShare.shareId} revision={displayShare.configRevision??0}
+        policy={draft.capabilityPolicy} savedPolicy={displayShare.capabilityPolicy} grants={draft.userGrants}
+        tokenLimit={draft.tokenLimitUnlimited?-1:millionsInputToTokens(draft.tokenLimitInput)??0} disabled={fieldsDisabled}
+        onGrantOperationsChange={(email,allowedOperations)=>form.onDraftChange(current=>({...current,capabilityConsent:undefined,userGrants:{...current.userGrants,[email]:{...current.userGrants[email],policy:{...current.userGrants[email].policy,allowedOperations}}}}))}
+        onChange={(capabilityPolicy,capabilityConsent)=>form.onDraftChange(current=>{
+          const userGrants=Object.fromEntries(Object.entries(current.userGrants).map(([email,g])=>[email,g.active&&g.manager!=="routerShareMarket"&&g.policy.valueQuota&&capabilityPolicy.allowedOperations.some(op=>g.policy.allowedOperations?.includes(op)??true)?{...g,policy:{...g.policy,valueQuota:{...g.policy.valueQuota,tariffPolicyId:"api-equivalent-v2" as const}}}:g]));
+          return {...current,capabilityPolicy,capabilityConsent,userGrants,capabilityConsentScope:capabilityConsent?capabilityQuotaContext(capabilityPolicy,userGrants,current.tokenLimitUnlimited?-1:millionsInputToTokens(current.tokenLimitInput)??0):undefined};
+        })}/>
       <ShareAccessQuotaSection
         t={t}
         access={
@@ -551,7 +563,7 @@ export function ShareEditFormBody({
         }
         ceiling={ceiling}
         users={
-          <ShareUserGrantsEditor
+          <ShareUserGrantsEditor independentCapabilities={!!draft.capabilityPolicy}
             value={draft.userGrants}
             ownerEmail={displayShare.ownerEmail || ""}
             defaultPolicy={defaultUserPolicy}

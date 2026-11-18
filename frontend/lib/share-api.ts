@@ -1,3 +1,4 @@
+import { parseCapabilityPreview } from "./share-capabilities";
 import { parseJson } from "@/lib/api";
 import type { ShareApiAuthResponse, ShareApiContextResponse, ShareApiShareResponse, ShareSettingsPatch, ShareEditView } from "@/lib/types";
 
@@ -104,4 +105,10 @@ export async function getSharePageSettingsEdit(editId: string) {
     `/share-api/share/settings-edits/${encodeURIComponent(editId)}${shareEmailParam(email)}`,
     { headers: shareAuthHeaders(), cache: "no-store" },
   ));
+}
+
+export async function previewSharePageCapabilities(_shareId:string,input:unknown,signal?:AbortSignal):Promise<import("./share-capabilities").CapabilityPreview> {
+  const started=readShareApiCredentials();
+  const result=await parseShareJson<import("./share-capabilities").CapabilityPreview>(await fetch(`/share-api/share/capability-preview${shareEmailParam(started.email)}`,{method:"POST",headers:{"Content-Type":"application/json",...shareAuthHeaders(started.token)},body:JSON.stringify(input),signal,cache:"no-store"}));
+  assertCurrentShareCredentials(started);return parseCapabilityPreview(result,_shareId,input);
 }

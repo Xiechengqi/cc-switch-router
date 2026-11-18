@@ -1,5 +1,7 @@
 "use client";
 
+import {ShareCapabilitySummary} from "./share-capability-summary";
+
 
 import { ClientShareMarketEntryButton } from "./client-share-market";
 
@@ -340,6 +342,7 @@ export const ShareCard = React.memo(function ShareCard({
               </button>
             </div>
           </div>
+          <ShareCapabilitySummary policy={share.capabilityPolicy}/>
           {description ? (
             <span
               className="block truncate text-[10px] text-muted-foreground"

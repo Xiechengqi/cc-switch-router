@@ -946,3 +946,19 @@ mod tests {
         assert_eq!(error.client_message(), "authoritative revision conflict");
     }
 }
+
+pub async fn preview_share_capabilities(
+    backend: &str,
+    installation_id: &str,
+    control_secret: &str,
+    input: serde_json::Value,
+) -> Result<serde_json::Value, CtlError> {
+    post_control(
+        backend,
+        installation_id,
+        control_secret,
+        "/_ctl/preview_share_capabilities",
+        input.to_string(),
+    )
+    .await
+}

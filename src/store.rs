@@ -3656,6 +3656,7 @@ impl AppStore {
                 "valuePricingActivationV1".into(),
                 "resourceValueQuotaV2".into(),
                 "quotaUnitConversionV1".into(),
+                "shareCapabilityPolicyV1".into(),
                 "shareTerminationV1".into(),
                 "providerIdentityV1".into(),
                 "buddyQuotaPresentationV1".into(),
@@ -9239,6 +9240,12 @@ impl AppStore {
             banked_reset_expiry_lead_minutes: share.banked_reset_expiry_lead_minutes,
             previous_response_cache_enabled: share.previous_response_cache_enabled,
             grok_media_policy: share.grok_media_policy,
+            capability_policy: crate::share_capabilities::visible_policy(
+                share.capability_policy.as_ref(),
+                can_manage,
+                viewer_email,
+                &share.user_grants,
+            ),
         };
         (view.operational_summary, view.service_readiness) =
             share_operational_evaluation(&view, active_edit.as_ref(), Utc::now());
@@ -12978,6 +12985,12 @@ impl AppStore {
                     banked_reset_expiry_lead_minutes: share.banked_reset_expiry_lead_minutes,
                     previous_response_cache_enabled: share.previous_response_cache_enabled,
                     grok_media_policy: share.grok_media_policy,
+                    capability_policy: crate::share_capabilities::visible_policy(
+                        share.capability_policy.as_ref(),
+                        can_manage,
+                        viewer_email,
+                        &share.user_grants,
+                    ),
                 };
                 (view.operational_summary, view.service_readiness) =
                     share_operational_evaluation(&view, active_edit.as_ref(), Utc::now());
@@ -16052,6 +16065,19 @@ fn normalize_share_descriptor_fields(share: &mut ShareDescriptor) -> Result<(), 
             share.contract_version, MIN_SHARE_CONTRACT_VERSION, SHARE_CONTRACT_VERSION
         )));
     }
+    if share.contract_version >= 13 && share.capability_policy.is_none() {
+        return Err(AppError::BadRequest("v13 requires capabilityPolicy".into()));
+    }
+
+    if let Some(policy) = &share.capability_policy {
+        policy.validate().map_err(AppError::BadRequest)?;
+        if share.contract_version < 13 {
+            return Err(AppError::BadRequest(
+                "capability policy requires contract v13".into(),
+            ));
+        }
+    }
+
     share.token_limit = normalize_share_limit_value(share.token_limit);
     for grant in share.user_grants.values() {
         validate_share_user_policy(&grant.policy, Utc::now().timestamp_millis())?;
@@ -17118,6 +17144,10 @@ fn upsert_share_tx(
     mut share: ShareDescriptor,
 ) -> Result<(), AppError> {
     normalize_share_descriptor_fields(&mut share)?;
+    let adopted:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM shares WHERE share_id=?1 AND capability_policy_json IS NOT NULL)",params![share.share_id],|r|r.get(0)).map_err(|e|AppError::Internal(e.to_string()))?;
+    if adopted && share.capability_policy.is_none() {
+        return Err(AppError::Conflict("CAPABILITY_UPGRADE_REQUIRED".into()));
+    }
     let stored_apps = stored_provider_presentation(conn, &share.share_id)?;
     crate::provider_presentation::merge_descriptor_identities(
         &mut share.app_providers,
@@ -17326,6 +17356,19 @@ fn upsert_share_tx(
     )
     .map_err(map_share_constraint_error)?;
     if share_changed > 0 {
+        conn.execute(
+            "UPDATE shares SET capability_policy_json=?2 WHERE share_id=?1",
+            params![
+                chat_share_id,
+                share
+                    .capability_policy
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|e| AppError::Internal(e.to_string()))?
+            ],
+        )
+        .map_err(|e| AppError::Internal(format!("save capability policy: {e}")))?;
         conn.execute(
             "UPDATE shares SET termination_archive_since_ms=?2 WHERE share_id=?1",
             params![chat_share_id, share.termination_archive_since_ms],
@@ -21719,6 +21762,10 @@ fn token_period_window(
 }
 
 fn validate_share_user_policy(policy: &ShareUserPolicy, now_ms: i64) -> Result<(), AppError> {
+    if let Some(ops) = &policy.allowed_operations {
+        crate::share_capabilities::validate_operations(ops).map_err(AppError::BadRequest)?;
+    }
+
     if let Some(quota) = &policy.value_quota {
         if policy.token_limit.is_some() {
             return Err(AppError::BadRequest(
@@ -22744,7 +22791,7 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppE
                     COALESCE(s.grok_image_generation_enabled, 0),
                     COALESCE(s.grok_image_edit_enabled, 0),
                     COALESCE(s.grok_video_generation_enabled, 0), s.market_entitlements_json,
-                    s.termination_archive_since_ms
+                    s.termination_archive_since_ms, s.capability_policy_json
              FROM shares s
              INNER JOIN installations i ON i.id = s.installation_id
              WHERE i.lifecycle = 'active'
@@ -22758,7 +22805,24 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppE
                 row.get(0)?,
                 ShareDescriptor {
                     termination_archive_since_ms: row.get(38)?,
-                    contract_version: SHARE_CONTRACT_VERSION,
+                    capability_policy: row
+                        .get::<_, Option<String>>(39)?
+                        .map(|json| serde_json::from_str(&json))
+                        .transpose()
+                        .map_err(|e| {
+                            crate::db::Error::FromSqlConversionFailure(
+                                39,
+                                crate::db::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })?,
+                    // Stored legacy access-policy markers can be zero. This is
+                    // a reconstructed reader projection, not an incoming descriptor.
+                    contract_version: if row.get::<_, Option<String>>(39)?.is_some() {
+                        SHARE_CONTRACT_VERSION
+                    } else {
+                        12
+                    },
                     share_id: row.get(1)?,
                     capacity_pool_id: row.get(25)?,
                     share_name: row.get(2)?,
@@ -23011,6 +23075,8 @@ fn share_settings_patch_is_empty(patch: &ShareSettingsPatch) -> bool {
         && patch.banked_reset_expiry_lead_minutes.is_none()
         && patch.previous_response_cache_enabled.is_none()
         && patch.grok_media_policy.is_none()
+        && patch.capability_policy.is_none()
+        && patch.capability_consent.is_none()
         && patch.support.is_none()
         && patch.user_grants.is_none()
         && patch.user_usage_edits.is_none()
@@ -23150,6 +23216,15 @@ fn validate_returned_share_against_patch(
     if let Some(previous_response_cache_enabled) = patch.previous_response_cache_enabled {
         if previous_response_cache_enabled != share.previous_response_cache_enabled {
             return Err("previousResponseCacheEnabled");
+        }
+    }
+    if let Some(policy) = &patch.capability_policy {
+        let valid = share.capability_policy.as_ref().is_some_and(|saved| {
+            saved.allowed_operations == policy.allowed_operations
+                && saved.operation_bindings == policy.operation_bindings
+        });
+        if !valid {
+            return Err("client did not apply capability policy");
         }
     }
     if let Some(grok_media_policy) = patch.grok_media_policy {
@@ -23524,6 +23599,9 @@ fn normalize_share_settings_patch(
             )));
         }
     }
+    if let Some(policy) = &patch.capability_policy {
+        policy.validate().map_err(AppError::BadRequest)?;
+    }
     let support = match patch.support {
         Some(value) => Some(normalize_share_support(
             value,
@@ -23549,6 +23627,8 @@ fn normalize_share_settings_patch(
         banked_reset_expiry_lead_minutes: patch.banked_reset_expiry_lead_minutes,
         previous_response_cache_enabled: patch.previous_response_cache_enabled,
         grok_media_policy: patch.grok_media_policy,
+        capability_policy: patch.capability_policy,
+        capability_consent: patch.capability_consent,
         support,
         user_grants,
         user_usage_edits: patch.user_usage_edits,
@@ -35763,8 +35843,9 @@ pub(crate) mod tests {
             test_share_host(subdomain)
         };
         ShareDescriptor {
+            capability_policy: None,
             termination_archive_since_ms: None,
-            contract_version: SHARE_CONTRACT_VERSION,
+            contract_version: 12,
             share_id: share_id.into(),
             capacity_pool_id: format!("pool-{share_id}"),
             share_name: format!("share-{share_id}"),
@@ -35896,6 +35977,7 @@ pub(crate) mod tests {
             role: role.to_string(),
             active: true,
             policy: crate::models::ShareUserPolicy {
+                allowed_operations: None,
                 value_quota: None,
                 parallel_limit: Some(2),
                 token_limit: Some(token_limit),
@@ -41716,6 +41798,9 @@ pub(crate) mod tests {
         for version in 6..=SHARE_CONTRACT_VERSION {
             let mut descriptor = test_share_descriptor("share-readable", "share-readable-sub");
             descriptor.contract_version = version;
+            if version >= 13 {
+                descriptor.capability_policy = Some(Default::default());
+            }
             normalize_share_descriptor_fields(&mut descriptor)
                 .expect("supported ordinary Share descriptors remain readable");
         }
@@ -48933,8 +49018,9 @@ pub(crate) mod tests {
         .await;
 
         let share = ShareDescriptor {
+            capability_policy: None,
             termination_archive_since_ms: None,
-            contract_version: SHARE_CONTRACT_VERSION,
+            contract_version: 12,
             share_id: "share-1".into(),
             capacity_pool_id: "pool-share-1".into(),
             share_name: "Signed Share".into(),
@@ -49810,8 +49896,9 @@ pub(crate) mod tests {
         .await;
 
         let share = ShareDescriptor {
+            capability_policy: None,
             termination_archive_since_ms: None,
-            contract_version: SHARE_CONTRACT_VERSION,
+            contract_version: 12,
             share_id: "share-minimal".into(),
             capacity_pool_id: "pool-share-minimal".into(),
             share_name: "Signed Share".into(),
@@ -49911,8 +49998,9 @@ pub(crate) mod tests {
         let signing_key = insert_signed_installation(&store, "inst-mismatch").await;
 
         let share = ShareDescriptor {
+            capability_policy: None,
             termination_archive_since_ms: None,
-            contract_version: SHARE_CONTRACT_VERSION,
+            contract_version: 12,
             share_id: "share-mismatch".into(),
             capacity_pool_id: "pool-share-mismatch".into(),
             share_name: "Signed Share".into(),
@@ -50008,8 +50096,9 @@ pub(crate) mod tests {
         .await;
 
         let share = ShareDescriptor {
+            capability_policy: None,
             termination_archive_since_ms: None,
-            contract_version: SHARE_CONTRACT_VERSION,
+            contract_version: 12,
             share_id: "share-new".into(),
             capacity_pool_id: "pool-share-new".into(),
             share_name: "owner@example.com".into(),
@@ -50142,8 +50231,9 @@ pub(crate) mod tests {
         }
 
         let share = ShareDescriptor {
+            capability_policy: None,
             termination_archive_since_ms: None,
-            contract_version: SHARE_CONTRACT_VERSION,
+            contract_version: 12,
             share_id: "share-heal".into(),
             capacity_pool_id: "pool-share-heal".into(),
             share_name: "router@example.com".into(),
@@ -50419,8 +50509,9 @@ pub(crate) mod tests {
         insert_share(&store, "inst-same", "share-old", &reused_host, "paused").await;
 
         let share = ShareDescriptor {
+            capability_policy: None,
             termination_archive_since_ms: None,
-            contract_version: SHARE_CONTRACT_VERSION,
+            contract_version: 12,
             share_id: "share-new".into(),
             capacity_pool_id: "pool-share-new".into(),
             share_name: "owner@example.com".into(),
@@ -50535,8 +50626,9 @@ pub(crate) mod tests {
         .await;
 
         let share = ShareDescriptor {
+            capability_policy: None,
             termination_archive_since_ms: None,
-            contract_version: SHARE_CONTRACT_VERSION,
+            contract_version: 12,
             share_id: "share-batch-1".into(),
             capacity_pool_id: "pool-share-batch-1".into(),
             share_name: "Batch Share".into(),
@@ -52425,6 +52517,7 @@ pub(crate) mod tests {
             "kind": "upsert",
             "share": {
                 "contractVersion": SHARE_CONTRACT_VERSION,
+                "capabilityPolicy": {"version": 1, "allowedOperations": [], "operationBindings": {}},
                 "shareId": "share-batch-health-1",
                 "capacityPoolId": "pool-share-batch-health-1",
                 "shareName": "Batch Health Share",
@@ -52548,7 +52641,7 @@ pub(crate) mod tests {
             .into_iter()
             .find(|(_, share)| share.share_id == "share-multiple")
             .expect("persisted multi-app share");
-        assert_eq!(persisted.contract_version, SHARE_CONTRACT_VERSION);
+        assert_eq!(persisted.contract_version, 12);
         assert!(!persisted.free_access);
 
         let mut mismatched = test_share_descriptor("share-mismatch", "mismatch-sub");

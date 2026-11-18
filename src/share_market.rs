@@ -587,6 +587,10 @@ pub struct RentAppServiceSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct RentServiceSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_operations: Option<Vec<crate::share_capabilities::ShareOperation>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measurement_policy: Option<String>,
     pub schema_version: u32,
     /// Compatibility-only primary App for v1 consumers. It never narrows the
     /// Share-wide market entitlement in schema v2.
@@ -2074,6 +2078,7 @@ fn contract_policy(record: &SubscriptionRecord) -> Result<ShareUserPolicy, AppEr
             .transpose()?
             .map(|value| value.timestamp_millis()),
         allowed_apps: market_allowed_apps(),
+        allowed_operations: (record.service_schema_version >= 3).then(Vec::new),
     })
 }
 
@@ -3005,6 +3010,8 @@ fn build_rent_service_snapshot(
         .cloned()
         .ok_or_else(|| AppError::Internal("Share App bundle is unexpectedly empty".into()))?;
     Ok(RentServiceSnapshot {
+        allowed_operations: None,
+        measurement_policy: None,
         schema_version: 2,
         required_app: primary.app,
         supported_apps,
@@ -3029,23 +3036,25 @@ fn validate_service_snapshot_unchanged(
     quoted: &RentServiceSnapshot,
     current: &RentServiceSnapshot,
 ) -> Result<(), AppError> {
-    let unchanged = if quoted.schema_version >= 2 {
-        quoted.supported_apps == current.supported_apps
-            && quoted.apps == current.apps
-            && quoted.share_parallel_limit == current.share_parallel_limit
-            && quoted.share_token_limit == current.share_token_limit
-    } else {
-        quoted.required_app == current.required_app
-            && current.supported_apps.contains(&quoted.required_app)
-            && quoted.provider_family == current.provider_family
-            && quoted.provider_type == current.provider_type
-            && quoted.provider_binding_fingerprint == current.provider_binding_fingerprint
-            && quoted.model_mode == current.model_mode
-            && quoted.upstream_model == current.upstream_model
-            && quoted.models == current.models
-            && quoted.share_parallel_limit == current.share_parallel_limit
-            && quoted.share_token_limit == current.share_token_limit
-    };
+    let unchanged = quoted.allowed_operations == current.allowed_operations
+        && quoted.measurement_policy == current.measurement_policy
+        && if quoted.schema_version >= 2 {
+            quoted.supported_apps == current.supported_apps
+                && quoted.apps == current.apps
+                && quoted.share_parallel_limit == current.share_parallel_limit
+                && quoted.share_token_limit == current.share_token_limit
+        } else {
+            quoted.required_app == current.required_app
+                && current.supported_apps.contains(&quoted.required_app)
+                && quoted.provider_family == current.provider_family
+                && quoted.provider_type == current.provider_type
+                && quoted.provider_binding_fingerprint == current.provider_binding_fingerprint
+                && quoted.model_mode == current.model_mode
+                && quoted.upstream_model == current.upstream_model
+                && quoted.models == current.models
+                && quoted.share_parallel_limit == current.share_parallel_limit
+                && quoted.share_token_limit == current.share_token_limit
+        };
     if unchanged {
         return Ok(());
     }
@@ -8717,7 +8726,7 @@ impl AppStore {
         } else {
             (0, None)
         };
-        let service = build_rent_service_snapshot(
+        let mut service = build_rent_service_snapshot(
             &bindings_json,
             app_runtimes_json.as_deref(),
             app_providers_json.as_deref(),
@@ -8731,6 +8740,12 @@ impl AppStore {
             share_token_limit,
             share_tokens_used,
         )?;
+        let adopted:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM shares WHERE share_id=?1 AND capability_policy_json IS NOT NULL)",params![share_id],|row|row.get(0)).map_err(|e|AppError::Internal(e.to_string()))?;
+        if adopted {
+            service.schema_version = 3;
+            service.allowed_operations = Some(Vec::new());
+            service.measurement_policy = Some("text-tokens-v1".into());
+        }
         for app in &service.supported_apps {
             let availability = evaluate_share_market_service_availability_tx(
                 &tx,
@@ -9737,7 +9752,7 @@ impl AppStore {
             trial_token_limit: rented_trial_token_limit,
             trial_value_limit_usd_micros: rented_trial_value_limit,
         };
-        let current_service = build_rent_service_snapshot(
+        let mut current_service = build_rent_service_snapshot(
             &bindings_json,
             app_runtimes_json.as_deref(),
             app_providers_json.as_deref(),
@@ -9752,6 +9767,12 @@ impl AppStore {
             share_tokens_used,
         )?;
         let now_dt = parse_time(now)?;
+        let adopted:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM shares WHERE share_id=?1 AND capability_policy_json IS NOT NULL)",params![share_id],|row|row.get(0)).map_err(|e|AppError::Internal(e.to_string()))?;
+        if adopted {
+            current_service.schema_version = 3;
+            current_service.allowed_operations = Some(Vec::new());
+            current_service.measurement_policy = Some("text-tokens-v1".into());
+        }
         for app in &current_service.supported_apps {
             let availability = evaluate_share_market_service_availability_tx(
                 tx,
@@ -9834,6 +9855,7 @@ impl AppStore {
             token_period_anchor_at_ms: None,
             expires_at: None,
             allowed_apps: market_allowed_apps(),
+            allowed_operations: current_service.allowed_operations.clone(),
         };
         let subscription_id = Uuid::new_v4().to_string();
         let entitlement_id = Uuid::new_v4().to_string();
@@ -15628,6 +15650,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capability_market_contract_freezes_empty_permissions_and_rejects_legacy_quote_drift() {
+        let store = AppStore::new_in_memory_for_tests().unwrap();
+        let owner = session("cap-owner", "cap-owner@example.com");
+        let renter = session("cap-renter", "cap-renter@example.com");
+        insert_share(&store, "cap-market", &owner.email, &[ShareTokenPeriod::Day]).await;
+        let (_, seat) = create_listing(&store, &owner, "cap-market", free_seat()).await;
+        let legacy = store
+            .share_market_create_rent_quote(&renter, &seat, None)
+            .await
+            .unwrap();
+        assert!(legacy.offer.service.allowed_operations.is_none());
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE shares SET capability_policy_json=?1 WHERE share_id='cap-market'",
+                params![
+                    serde_json::json!({"version":1,"allowedOperations":[],"operationBindings":{}})
+                        .to_string(),
+                ],
+            )
+            .unwrap();
+        let rejected = store
+            .share_market_commit_rent_quote(&renter, &seat, &legacy.id, "cap-legacy")
+            .await
+            .unwrap_err();
+        assert_eq!(rejected.code(), Some("share_market_service_changed"));
+        let quote = store
+            .share_market_create_rent_quote(&renter, &seat, None)
+            .await
+            .unwrap();
+        assert_eq!(quote.offer.service.schema_version, 3);
+        assert_eq!(quote.offer.service.allowed_operations, Some(vec![]));
+        assert_eq!(
+            quote.offer.service.measurement_policy.as_deref(),
+            Some("text-tokens-v1")
+        );
+        // Enabling an owner's extension does not expand the frozen buyer contract.
+        store.conn.lock().await.execute("UPDATE shares SET capability_policy_json=?1 WHERE share_id='cap-market'", params![serde_json::json!({"version":1,"allowedOperations":["image.generate"],"operationBindings":{}}).to_string()]).unwrap();
+        let committed = store
+            .share_market_commit_rent_quote(&renter, &seat, &quote.id, "cap-frozen")
+            .await
+            .unwrap();
+        let conn = store.conn.lock().await;
+        let policy = termination_policy_tx(&conn, &committed.subscription_id).unwrap();
+        assert_eq!(policy.allowed_operations, Some(vec![]));
+    }
+
+    #[tokio::test]
     async fn rent_quote_commit_detects_term_drift_without_a_revision_change() {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
         let owner = session("owner-quote-drift", "owner-quote-drift@example.com");
@@ -16451,6 +16523,8 @@ mod tests {
             offer_revision: 7,
             funding_rail: default_legacy_funding_rail(),
             service: RentServiceSnapshot {
+                allowed_operations: None,
+                measurement_policy: None,
                 schema_version: 1,
                 required_app: "codex".into(),
                 supported_apps: vec!["codex".into()],
