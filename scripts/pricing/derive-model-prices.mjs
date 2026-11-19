@@ -16,6 +16,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -195,7 +196,7 @@ function main() {
   const upstream = JSON.parse(raw.toString("utf8"));
   const derivedAt = new Date().toISOString().slice(0, 10);
 
-  const models = [];
+  const modelsByKey = new Map();
   const aliases = [];
   const report = { skippedNoPrice: [], skippedMultiplierOnlyLongContext: [], multiThreshold: [] };
 
@@ -250,7 +251,7 @@ function main() {
     }
     if (threshold !== null && !rates.some((rate) => rate.contextTier === "long")) threshold = null;
 
-    models.push({
+    const model = {
       priceKey,
       displayName: prettifyName(priceKey),
       longContextThreshold: threshold,
@@ -258,9 +259,20 @@ function main() {
       // greater-than. Admin override exists for vendors that document otherwise.
       longContextInclusive: false,
       supportsCacheBreakdown: entry.cache_creation_input_token_cost_above_1hr !== undefined,
-      sourceNote: `derived from LiteLLM model_prices_and_context_window.json entry \`${rawKey}\` (sha256 ${sourceSha256.slice(0, 12)}) on ${derivedAt}`,
       rates,
-    });
+    };
+    const previous = modelsByKey.get(priceKey);
+    if (previous) {
+      if (!isDeepStrictEqual(previous.model, model)) {
+        throw new Error(`conflicting LiteLLM prices for ${priceKey} (${previous.rawKey}, ${rawKey})`);
+      }
+      // Prefer the exact normalized spelling for provenance, with a stable tie-break.
+      if (rawKey === priceKey || (previous.rawKey !== priceKey && rawKey < previous.rawKey)) {
+        previous.rawKey = rawKey;
+      }
+      continue;
+    }
+    modelsByKey.set(priceKey, { rawKey, model });
 
     const bare = priceKey.includes("/") ? priceKey.slice(priceKey.lastIndexOf("/") + 1) : null;
     if (bare && bare !== priceKey) {
@@ -268,6 +280,11 @@ function main() {
     }
   }
 
+  const models = [...modelsByKey.values()].map(({ rawKey, model: { rates, ...model } }) => ({
+    ...model,
+    sourceNote: `derived from LiteLLM model_prices_and_context_window.json entry \`${rawKey}\` (sha256 ${sourceSha256.slice(0, 12)}) on ${derivedAt}`,
+    rates,
+  }));
   models.sort((a, b) => (a.priceKey < b.priceKey ? -1 : a.priceKey > b.priceKey ? 1 : 0));
 
   // Preserve stable served priceKeys when LiteLLM retains the exact dated model
