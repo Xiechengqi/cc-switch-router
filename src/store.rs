@@ -52908,7 +52908,6 @@ pub(crate) mod tests {
             "kind": "upsert",
             "share": {
                 "contractVersion": SHARE_CONTRACT_VERSION,
-                "capabilityPolicy": {"version": 1, "allowedOperations": [], "operationBindings": {}},
                 "shareId": "share-batch-health-1",
                 "capacityPoolId": "pool-share-batch-health-1",
                 "shareName": "Batch Health Share",

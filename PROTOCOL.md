@@ -187,7 +187,7 @@ Router 不接受长效 SSH 凭据。每次建链前 Server 申请一次性 lease
 
 `ShareDescriptor` 面向全新部署时必须满足以下约束:
 
-- Router 当前 reader 支持 **Share Contract v2..v14**。未迁移且未启用新版能力的基础 Share 仍可使用 v7。已迁移的 Share 始终发布 v14，个人权限写入要求 `shareGrantCapabilitiesV1`。v4 引入本节 `modelProbe`（Router 仅对 v4 以上执行探针），v5 引入 Grok 媒体权限，v6 增加 scoped quota metadata，v7 增加只展示的 `unobservedTiers` 及 Codex `bankedReset`。展示字段不参与调度、限流和容量评分。连接测试与模型健康检查保留 v7 兼容。
+- Router 当前 reader 支持 **Share Contract v2..v14**。未迁移且未启用新版能力的基础 Share 仍可使用 **Share Contract v7**。已迁移的 Share 始终发布 v14，个人权限写入要求 `shareGrantCapabilitiesV1`。v4 引入本节 `modelProbe`（Router 仅对 v4 以上执行探针），v5 引入 Grok 媒体权限，v6 增加 scoped quota metadata，v7 增加只展示的 `unobservedTiers` 及 Codex `bankedReset`。展示字段不参与调度、限流和容量评分。连接测试与模型健康检查保留 v7 兼容。
 - Share Market 最低版本仍为 v5（`MIN_SHARE_MARKET_CONTRACT_VERSION=5`），不因账号周期的协商扩展抬高。reader 上限、普通 descriptor 版本与市场最低版本是三项独立约束。
 - v8 增加 `tokenPeriod=accountReset` 及 `userGrants` 的只读 `accountQuotaCycle/accountResetCapability/accountUsageBaseline` 与 `usageQuota.usageWatermark`。当前心跳返回 `shareContractVersion=14`，`capabilities` 含 `accountResetV1`、`marketTrialV1`、`usdEquivalentQuotaV1`、`cacheCreationTtlV1`、`resourceValueQuotaV2`、`quotaUnitConversionV1`、`shareCapabilityPolicyV1` 和 `shareGrantCapabilitiesV1`。Server 同时检查显式能力、Router URL 与安装实例的绑定及 300 秒有效期。v7 必须省略这些新字段，市场报价不开放动态周期。
 - v9 的 `marketEntitlements` 按 entitlement ID 返回 `trialScopeId/email/phase/active/trialTokenAllowance/trialTokenLimit/trialTokensUsed/usageRevision/usageUncertain/appliedAtMs/paidStartedAtMs`。`phase=trial|paid`，Token cap 缺省表示仅时长试用，不能写普通 `tokenLimit:0`。试用累计数和修订只增不减，与普通日／周／月 quota 分开；使用量变化不提升静态 descriptor generation。完整 descriptor 的 Notify＋周期重放持续携带动态试用水位。v9 以下不得携带非空试用状态。
