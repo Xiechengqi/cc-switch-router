@@ -1,3 +1,5 @@
+import { parseRequestMetering } from "./share-request-metering";
+import { parseGrantCapabilityPreview, type GrantCapabilityInput } from "./share-grant-capabilities";
 import { parseCapabilityPreview } from "./share-capabilities";
 import { parseJson } from "@/lib/api";
 import type { ShareApiAuthResponse, ShareApiContextResponse, ShareApiShareResponse, ShareSettingsPatch, ShareEditView } from "@/lib/types";
@@ -85,18 +87,26 @@ export async function getSharePageShare(email?: string, token?: string) {
   return result;
 }
 
-export async function updateSharePageSettings(patch: ShareSettingsPatch, baseConfigRevision?: number) {
-  const { email } = readShareApiCredentials();
-  return parseShareJson<{ ok: boolean; edit: ShareEditView; appliedSynchronously: boolean }>(
-    await fetch(`/share-api/share/settings${shareEmailParam(email)}`, {
+export async function updateSharePageSettings(
+  patch: ShareSettingsPatch,
+  baseConfigRevision?: number,
+  operationId?: string,
+  started = readShareApiCredentials(),
+) {
+  assertCurrentShareCredentials(started);
+  const result = await parseShareJson<{ ok: boolean; edit: ShareEditView; appliedSynchronously: boolean }>(
+    await fetch(`/share-api/share/settings${shareEmailParam(started.email)}`, {
       method: "PATCH",
       headers: {
         "Content-Type": "application/json",
-        ...shareAuthHeaders(),
+        ...shareAuthHeaders(started.token),
       },
-      body: JSON.stringify({ patch, baseConfigRevision }),
+      body: JSON.stringify({ patch, baseConfigRevision, operationId }),
     }),
   );
+  assertCurrentShareCredentials(started);
+  if (operationId && result?.edit?.id !== operationId) throw new Error("Invalid Share settings response");
+  return result;
 }
 
 export async function getSharePageSettingsEdit(editId: string) {
@@ -107,8 +117,38 @@ export async function getSharePageSettingsEdit(editId: string) {
   ));
 }
 
-export async function previewSharePageCapabilities(_shareId:string,input:unknown,signal?:AbortSignal):Promise<import("./share-capabilities").CapabilityPreview> {
+async function fetchCapabilityPreview(_shareId:string,input:unknown,signal?:AbortSignal):Promise<unknown> {
   const started=readShareApiCredentials();
   const result=await parseShareJson<import("./share-capabilities").CapabilityPreview>(await fetch(`/share-api/share/capability-preview${shareEmailParam(started.email)}`,{method:"POST",headers:{"Content-Type":"application/json",...shareAuthHeaders(started.token)},body:JSON.stringify(input),signal,cache:"no-store"}));
-  assertCurrentShareCredentials(started);return parseCapabilityPreview(result,_shareId,input);
+  assertCurrentShareCredentials(started);return result;
+}
+
+export async function previewSharePageCapabilities(shareId: string, input: unknown, signal?: AbortSignal) {
+  return parseCapabilityPreview(await fetchCapabilityPreview(shareId, input, signal), shareId, input);
+}
+
+export async function previewSharePageGrantCapabilities(shareId: string, input: GrantCapabilityInput, signal?: AbortSignal) {
+  return parseGrantCapabilityPreview(await fetchCapabilityPreview(shareId, input, signal), shareId, input);
+}
+
+export async function getSharePageRequestMetering(shareId: string, requestId: string, signal?: AbortSignal) {
+  const started = readShareApiCredentials();
+  const response = await fetch(`/share-api/share/request-metering${shareEmailParam(started.email)}`, {
+    method: "POST", headers: { ...shareAuthHeaders(started.token), "Content-Type": "application/json" },
+    body: JSON.stringify({requestId}), signal, cache: "no-store",
+  });
+  const result = await parseShareJson<unknown>(response);
+  assertCurrentShareCredentials(started);
+  return parseRequestMetering(result, shareId, requestId);
+}
+
+export async function getSharePageRequestLogs(signal?: AbortSignal) {
+  const started = readShareApiCredentials();
+  const result = await parseShareJson<import("./types").ShareRequestLogsPage>(
+    await fetch(`/share-api/share/request-logs${shareEmailParam(started.email)}`, {
+      headers: shareAuthHeaders(started.token), signal, cache: "no-store",
+    }),
+  );
+  assertCurrentShareCredentials(started);
+  return result.logs;
 }

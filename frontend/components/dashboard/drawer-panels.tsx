@@ -1,5 +1,8 @@
 "use client";
 
+import { ShareRequestMetering } from "./share-request-metering";
+import { getShareRequestMetering } from "@/lib/api";
+import type { RequestMeteringLoader } from "@/lib/share-request-metering";
 import { ChevronDown, ChevronRight, Eye, Link2, Maximize2, Pencil } from "lucide-react";
 import { Button, Card, Chip, Modal, ProgressBar, Tabs } from "@heroui/react";
 import * as React from "react";
@@ -2060,7 +2063,7 @@ export function ShareProviderRequestsPanel({
         </Tabs.List>
       </Tabs>
       <div className="grid gap-3">
-        <ShareRequestLogs logs={logs} imagePreviews={imagePreviews} />
+        <ShareRequestLogs logs={logs} imagePreviews={imagePreviews} meteringShareId={share.canManage ? share.shareId : undefined} />
         {error ? <EmptyBlock>{error}</EmptyBlock> : null}
       </div>
     </div>
@@ -2246,9 +2249,15 @@ export function ShareImageRequestLogs({ shareId }: { shareId: string }) {
 export function ShareRequestLogs({
   logs,
   imagePreviews = {},
+  meteringShareId,
+  meteringRequest = getShareRequestMetering,
+  meteringLogin,
 }: {
   logs: ShareRequestLog[];
   imagePreviews?: Record<string, ImageGenerationRequestLog>;
+  meteringShareId?: string;
+  meteringRequest?: RequestMeteringLoader;
+  meteringLogin?: string;
 }) {
   const { locale, t } = useLocaleText();
   if (!logs.length)
@@ -2367,6 +2376,8 @@ export function ShareRequestLogs({
                 </div>
               </div>
             )}
+            {meteringShareId && !log.isHealthCheck ? <ShareRequestMetering shareId={meteringShareId}
+              requestId={log.requestId} load={meteringRequest} zh={locale.startsWith("zh")} login={meteringLogin} /> : null}
             {log.errorMessage ? (
               <div className="truncate rounded-md bg-danger-50 px-2 py-1.5 text-xs text-danger-700" title={log.errorMessage}>
                 {log.errorMessage}

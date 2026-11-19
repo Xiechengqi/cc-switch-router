@@ -8740,7 +8740,10 @@ impl AppStore {
             share_token_limit,
             share_tokens_used,
         )?;
-        let adopted:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM shares WHERE share_id=?1 AND capability_policy_json IS NOT NULL)",params![share_id],|row|row.get(0)).map_err(|e|AppError::Internal(e.to_string()))?;
+        let adopted: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM shares WHERE share_id=?1 AND (capability_policy_json IS NOT NULL OR share_access_policy_version>=?2))",
+            params![share_id, crate::models::GRANT_CAPABILITY_CONTRACT_VERSION], |row| row.get(0),
+        ).map_err(|e| AppError::Internal(e.to_string()))?;
         if adopted {
             service.schema_version = 3;
             service.allowed_operations = Some(Vec::new());
@@ -9767,7 +9770,10 @@ impl AppStore {
             share_tokens_used,
         )?;
         let now_dt = parse_time(now)?;
-        let adopted:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM shares WHERE share_id=?1 AND capability_policy_json IS NOT NULL)",params![share_id],|row|row.get(0)).map_err(|e|AppError::Internal(e.to_string()))?;
+        let adopted: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM shares WHERE share_id=?1 AND (capability_policy_json IS NOT NULL OR share_access_policy_version>=?2))",
+            params![share_id, crate::models::GRANT_CAPABILITY_CONTRACT_VERSION], |row| row.get(0),
+        ).map_err(|e| AppError::Internal(e.to_string()))?;
         if adopted {
             current_service.schema_version = 3;
             current_service.allowed_operations = Some(Vec::new());
@@ -13172,6 +13178,7 @@ fn apply_control_grant_effect(
             grants.insert(
                 email.clone(),
                 ShareUserGrant {
+                    effective_operations: None,
                     email: email.clone(),
                     role: "shareto".to_string(),
                     active: true,
@@ -13930,6 +13937,7 @@ mod tests {
         let policy = materialize_initial_policy(&record, applied_at_ms, &stored_policy)
             .expect("materialize managed grant policy");
         let grant = ShareUserGrant {
+            effective_operations: None,
             value_metering: None,
             pending_value_quota: None,
             quota_conversion_id: None,
@@ -15688,10 +15696,17 @@ mod tests {
             quote.offer.service.measurement_policy.as_deref(),
             Some("text-tokens-v1")
         );
-        // Enabling an owner's extension does not expand the frozen buyer contract.
-        store.conn.lock().await.execute("UPDATE shares SET capability_policy_json=?1 WHERE share_id='cap-market'", params![serde_json::json!({"version":1,"allowedOperations":["image.generate"],"operationBindings":{}}).to_string()]).unwrap();
+        store.conn.lock().await.execute(
+            "UPDATE shares SET capability_policy_json=NULL, share_access_policy_version=14 WHERE share_id='cap-market'", [],
+        ).unwrap();
+        let migrated = store
+            .share_market_create_rent_quote(&renter, &seat, None)
+            .await
+            .unwrap();
+        assert_eq!(migrated.offer.service.schema_version, 3);
+        assert_eq!(migrated.offer.service.allowed_operations, Some(vec![]));
         let committed = store
-            .share_market_commit_rent_quote(&renter, &seat, &quote.id, "cap-frozen")
+            .share_market_commit_rent_quote(&renter, &seat, &migrated.id, "cap-frozen")
             .await
             .unwrap();
         let conn = store.conn.lock().await;
@@ -22410,6 +22425,7 @@ mod tests {
                     serde_json::to_string(&BTreeMap::from([(
                         granted.email.clone(),
                         ShareUserGrant {
+                            effective_operations: None,
                             value_metering: None,
                             pending_value_quota: None,
                             quota_conversion_id: None,

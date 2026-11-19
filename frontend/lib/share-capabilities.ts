@@ -522,19 +522,6 @@ export function capabilityPermissionChange(
         ? current.filter((op) => share.includes(op))
         : [...share];
 }
-export function capabilityPermissionSummary(
-  operations: ShareOperation[] | undefined,
-  lang: 0 | 1,
-) {
-  if (operations === undefined)
-    return lang === 0 ? "跟随 Share" : "Follow Share";
-  if (!operations.length)
-    return lang === 0 ? "不允许扩展能力" : "Extensions disabled";
-  return operations
-    .map((op) => OPERATION_LABELS[op][lang])
-    .join(lang === 0 ? "、" : ", ");
-}
-
 /** A single visible risk group still accepts each exact Server-owned condition. */
 export function capabilityRiskGroups(
   preview: CapabilityPreview,

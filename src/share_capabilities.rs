@@ -55,6 +55,29 @@ impl ShareOperation {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GrantCapabilityEdit {
+    pub operations: Vec<ShareOperation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reconfirm: Vec<ShareOperation>,
+    pub expected_revision: u64,
+}
+impl GrantCapabilityEdit {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_operations(&self.operations)?;
+        validate_operations(&self.reconfirm)?;
+        if self
+            .reconfirm
+            .iter()
+            .any(|op| !self.operations.contains(op))
+        {
+            return Err("reconfirmation requires an enabled operation".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OperationBinding {
     pub app: String,
     /// Opaque identity: provider, Driver, auth identity generation and policy.

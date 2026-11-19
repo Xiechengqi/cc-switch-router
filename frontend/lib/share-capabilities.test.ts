@@ -15,6 +15,18 @@ import {
   draftFromShare,
 } from "./share-settings";
 import type { ShareUserGrantMap, ShareView } from "./types";
+import { parseGrantCapabilityPreview } from "./share-grant-capabilities";
+
+test("v14 grant preview verifies scope and keeps a revocation separate from a reconfirmation", () => {
+  const fixture = JSON.parse(readFileSync(new URL("../../tests/fixtures/share-grant-capabilities-v14.json", import.meta.url), "utf8"));
+  const candidate = parseGrantCapabilityPreview(fixture.candidate, "share-v14", fixture.candidateRequest);
+  assert.equal(candidate.rows[0].needsReconfirm, true);
+  assert.equal(candidate.rows[1].available, false);
+  assert.throws(() => parseGrantCapabilityPreview(fixture.candidate, "share-v14", { ...fixture.candidateRequest, subject: "bob@example.com" }));
+  const review = parseGrantCapabilityPreview(fixture.review, "share-v14", fixture.reviewRequest);
+  assert.deepEqual(review.requiredAcknowledgements?.map(row => row.scope), ["alice@example.com"]);
+  assert.deepEqual(fixture.reviewRequest.grantCapabilityEdits["bob@example.com"].operations, []);
+});
 
 test("capability wire catalog matches the Rust fixture and explicit empty permissions survive a grant edit", () => {
   const fixture = JSON.parse(

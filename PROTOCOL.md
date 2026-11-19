@@ -187,9 +187,9 @@ Router 不接受长效 SSH 凭据。每次建链前 Server 申请一次性 lease
 
 `ShareDescriptor` 面向全新部署时必须满足以下约束:
 
-- Router 当前 reader 支持 **Share Contract v2..v13**。Server 普通未协商 descriptor 保持 **Share Contract v7**；账号周期 v8、一次性市场试用 v9、美元等值配额 v10、资源配额 v11、即时单位转换 v12、独立扩展能力 v13 须显式能力。v4 引入本节 `modelProbe`（Router 仅对 v4 以上执行探针），v5 引入 Grok 媒体权限，v6 增加 scoped quota metadata，v7 增加只展示的 `unobservedTiers` 及 Codex `bankedReset`；它们不参与调度/限流/容量评分。连接测试/模型健康检查保留 v7 兼容。
+- Router 当前 reader 支持 **Share Contract v2..v14**。未迁移且未启用新版能力的基础 Share 仍可使用 v7。已迁移的 Share 始终发布 v14，个人权限写入要求 `shareGrantCapabilitiesV1`。v4 引入本节 `modelProbe`（Router 仅对 v4 以上执行探针），v5 引入 Grok 媒体权限，v6 增加 scoped quota metadata，v7 增加只展示的 `unobservedTiers` 及 Codex `bankedReset`。展示字段不参与调度、限流和容量评分。连接测试与模型健康检查保留 v7 兼容。
 - Share Market 最低版本仍为 v5（`MIN_SHARE_MARKET_CONTRACT_VERSION=5`），不因账号周期的协商扩展抬高。reader 上限、普通 descriptor 版本与市场最低版本是三项独立约束。
-- v8增加`tokenPeriod=accountReset`及userGrants只读`accountQuotaCycle/accountResetCapability/accountUsageBaseline`、`usageQuota.usageWatermark`。当前安装heartbeat响应同时返回`shareContractVersion=13,capabilities=["accountResetV1","marketTrialV1","usdEquivalentQuotaV1","cacheCreationTtlV1","resourceValueQuotaV2","quotaUnitConversionV1","shareCapabilityPolicyV1"]`；Server同时检查显式能力、Router URL/installation绑定和300秒有效期。普通v7必须省略新嵌套字段，v7携带accountReset/新字段拒绝，不能静默转换为sevenDays；市场报价不开放动态周期。
+- v8 增加 `tokenPeriod=accountReset` 及 `userGrants` 的只读 `accountQuotaCycle/accountResetCapability/accountUsageBaseline` 与 `usageQuota.usageWatermark`。当前心跳返回 `shareContractVersion=14`，`capabilities` 含 `accountResetV1`、`marketTrialV1`、`usdEquivalentQuotaV1`、`cacheCreationTtlV1`、`resourceValueQuotaV2`、`quotaUnitConversionV1`、`shareCapabilityPolicyV1` 和 `shareGrantCapabilitiesV1`。Server 同时检查显式能力、Router URL 与安装实例的绑定及 300 秒有效期。v7 必须省略这些新字段，市场报价不开放动态周期。
 - v9 的 `marketEntitlements` 按 entitlement ID 返回 `trialScopeId/email/phase/active/trialTokenAllowance/trialTokenLimit/trialTokensUsed/usageRevision/usageUncertain/appliedAtMs/paidStartedAtMs`。`phase=trial|paid`，Token cap 缺省表示仅时长试用，不能写普通 `tokenLimit:0`。试用累计数和修订只增不减，与普通日／周／月 quota 分开；使用量变化不提升静态 descriptor generation。完整 descriptor 的 Notify＋周期重放持续携带动态试用水位。v9 以下不得携带非空试用状态。
 - v10 的普通用户 `policy.valueQuota={limitUsdMicros:"10000000",tariffPolicyId:"api-equivalent-v1"}` 与 `tokenLimit` 互斥，共用原 `tokenPeriod` 和 anchor。它是模型 API 标价等值使用限额，不是钱包余额或 Provider 账单。缺省仍为不限额；零额度非法。grant 可带 Server-owned `valueMetering={quotaPolicyEpoch,valueMeteredFromMs,effectiveFromMs,pricingRevision}` 和 `pendingValueQuota={policy,effectiveFromMs,retainAccess}`；`valueMetering` 只出现在金额模式或已排期金额策略的授权上，Token 授权不带（见 §13.2）。切换到未完整覆盖的自然窗口时保留原 policy，到边界后持久化启用；新授权等待期间不提供无限制访问。首次累计模式从确认的计量起点开始，之后删加授权、改策略、切换单位均不能重设该起点或清空同窗口消费。v7–v9 不接受这些字段。市场托管授权可携带 `valueQuota`（见 §7.1 美元等值车位），但不得带 `pendingValueQuota`：车位额度按合同计量，Server 在该合同首次下发金额策略时以当时为计量起点立即生效，同一 entitlement 的后续 upsert（试用转正式、欠费暂停后恢复、App 范围升级）沿用该起点，新合同重新开始；金额校准对托管授权仍然禁止。
 - `cacheCreationTtlV1` 是独立的请求日志能力，不能从 reader v10 或 `usdEquivalentQuotaV1` 推断。协商后可同时附 `cacheCreation5mTokens`、`cacheCreation1hTokens`，两者非负且和等于原 `cacheCreationTokens`；两者必须同时缺省或同时出现。历史合并值保持 unknown TTL，不能虚构拆分；原四桶 Token 总数不变。
@@ -840,7 +840,7 @@ Share 直连隧道另有独立白名单:`/v1`、`/v1/`、`/v1beta/`、`/gemini/v
 - 上述 Share sync/claim/edit-ack 控制请求为兼容旧 Server 可省略 `protocolEpoch`；一旦出现就必须是当前 epoch 的非空字符串，`null` 与错误 epoch 都拒绝
 - Share descriptor、其嵌套权威对象和 batch operation 都拒绝未知字段；契约扩展必须提升 `contractVersion` 并先部署 Router。Server 的 `shareSha256` 请求必须同样遵循 Router-first 发布顺序
 
-## 13. Share v10/v11/v12/v13 额度与扩展能力
+## 13. Share v10–v14 额度与媒体工具权限
 
 此功能与钱包、充值、市场租金完全独立。完整实现规格和真实灰度门槛见 [实施计划](docs/share-user-value-quota-implementation-plan.md)。当前只声明本地／夹具验证；真实转发面保持 `live_pending`。
 
@@ -1025,3 +1025,19 @@ Server 保存最多 30 天的能力 admission 及 24 小时续接索引；缺失
 错误为 `SHARE_CAPABILITY_DISABLED` 403、`CAPABILITY_REQUEST_INVALID` 400、`CAPABILITY_NOT_SUPPORTED` 422、`CAPABILITY_EXECUTION_QUARANTINED` 503；`CAPABILITY_CONTEXT_REQUIRED`、`CAPABILITY_STATE_CHANGED`、`CAPABILITY_UPGRADE_REQUIRED`、`QUOTA_COVERAGE_REQUIRED`、`CAPABILITY_PREVIEW_EXPIRED`、`MARKET_CAPABILITY_CONFLICT` 为 409。价格/额度错误保留既有语义。
 
 上线顺序 Router → Server → 协商/存储/价目核对 → 逐 Share 预览采用；不能把安装新版等同采用完成。保留兼容 v13/schema 8 的执行版本用于回退，不得删字段降级或恢复旧库抹去新消费。真实供应商验证、生产采用和灰度对账仍为 live_pending。
+
+### 13.7 v14 具名授权的媒体生成与工具
+
+v14 由 `shareGrantCapabilitiesV1` 协商。Server 对具名授权保存批准的操作与入口身份，额度策略没有执行权限权威。新建授权默认全关。公开免费访问只提供已认证调用者的基础模型交互，市场权限由原冻结合同决定。v14 描述符不接受旧 `capabilityPolicy`。Router 迁移 119 防止已升级 Share 降回旧权限语义。
+
+`userGrants[email].policy.allowedOperations` 在 v14 投影具名授权的保存意图，`effectiveOperations` 投影当前入口仍有效的子集。非管理者只获本人投影。两项均不是普通额度写入的权限来源。授权写入使用 `grantCapabilityEdits[email]={expectedRevision,operations,reconfirm?}`，可和普通 `userGrantEdits` 同事务。缺键不修改，`operations:[]` 明确撤销。新操作或显式重新确认使用当前服务端验证的全部入口。保持开启的旧项沿用已批准入口。
+
+授权查询使用 §13.6 的同一控制通道，输入 `{expectedConfigRevision,grantCapabilityEdits:{},subject}`，以 `displayVersion:3` 返回可配、已选和是否需重新确认。最终预览省略 subject，携带授权差量、额度差量及目标总 Token 上限。新增 Token 未覆盖条件统一确认一次，随设置提交准确条件和短期签名。Router 与 Server 都重验版本。永久回执与策略、额度转换和初始水位同一事务落盘。
+
+两个 Router 设置入口可在请求外层携带 UUID `operationId`。Router 绑定安装实例、Share、管理者、配置版本和原请求内容，并核对已有编辑后再检查配置冲突。响应丢失时以相同 ID 和内容恢复原操作，修改草稿后改用新 ID。`patch.editContext` 仍由 Router 生成。
+
+普通实际美元额度的未来尝试固定拒绝缺价。实际模型、档位和执行参数必须由当前价目覆盖。明确零价允许。Token 和无限额的美元估值证据不参与准入定价。历史记录继续使用原实际结算、回执和在途保护，读取时区分扣额、仅估值和不确定。授权改动保留额度周期和历史消费。
+
+管理者在请求详情按需读取 `POST /v1/shares/:share_id/request-metering` 或独立域名下 `POST /share-api/share/request-metering`，输入 `{requestId}`。结果绑定 Share、安装实例及尝试，并使用 private/no-store。授权预览不读取请求记录。
+
+发布先提供 v14 Router reader，再升级 Server 的权威 SQLite schema 10。旧具名有效操作只迁移已有证据的入口，公开权限不会继承。先在副本核对权限差集、旧合同、已用额度和在途回执，再恢复真实流量。

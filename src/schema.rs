@@ -407,6 +407,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../schema/0117_share_capability_policy.sql"),
     ),
     (118, include_str!("../schema/0118_ultrafast_pricing.sql")),
+    (
+        119,
+        include_str!("../schema/0119_grant_capability_contract.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {

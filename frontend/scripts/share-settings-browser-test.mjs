@@ -14,6 +14,7 @@ import { LocaleProvider, useLocaleText } from "@/components/i18n/locale-provider
 import { useShareEditForm } from "@/components/dashboard/share-edit/share-edit-form";
 import { ShareUserGrantsEditor } from "@/components/dashboard/share-edit/share-user-grants-editor";
 import { ShareEditDialog } from "@/components/dashboard/share-edit-dialog";
+import { SharePage } from "@/components/share/share-page";
 const grant = (email, tokens, revision) => ({
   email, role: email.startsWith("owner") ? "owner" : "shareto", active: true, revision,
   policy: { tokenPeriod: "lifetime", parallelLimit: 2, tokenLimit: 10000000 },
@@ -30,6 +31,7 @@ const initial = {
     "a@example.com": grant("a@example.com", 1000000, 3), "b@example.com": grant("b@example.com", 2000000, 4) },
 };
 window.closedCount = 0; window.savedCount = 0;
+window.shareFixture = initial;
 function Harness() {
   const { t } = useLocaleText();
   const [share, setShare] = React.useState(initial);
@@ -47,7 +49,7 @@ function Harness() {
   }}));
   window.replaceSession = () => setShare(current => ({ ...initial, shareId: "share-2" }));
   window.fullDialog = () => { setShare(structuredClone(initial)); setFull(true); };
-  window.capabilityDialog = () => { setShare({...structuredClone(initial), capabilityPolicy:{version:1,allowedOperations:[],operationBindings:{}}}); setFull(true); };
+  window.capabilityDialog = () => { setShare({...structuredClone(initial), grantCapabilityPolicy:true}); setFull(true); };
   if (full) return <ShareEditDialog share={share} onClose={onClose} onSaved={onSaved} />;
   if (!share || !form) return <div>Closed</div>;
   return <div data-editor>
@@ -60,7 +62,7 @@ function Harness() {
     <p data-error>{form.error}</p><p data-notice>{form.notice}</p>
   </div>;
 }
-createRoot(document.getElementById("root")).render(<React.StrictMode><LocaleProvider><Harness /></LocaleProvider></React.StrictMode>);
+createRoot(document.getElementById("root")).render(<React.StrictMode><LocaleProvider>{location.search === "?standalone" ? <SharePage /> : <Harness />}</LocaleProvider></React.StrictMode>);
 `;
 const bundle = await build({ stdin: { contents: source, loader: "tsx", resolveDir: root },
   absWorkingDir: root, bundle: true, write: false, format: "iife", platform: "browser",
@@ -81,31 +83,41 @@ try {
   await page.addInitScript(() => {
     localStorage.setItem("cc_switch_router_locale_v1", "en");
     localStorage.setItem("cc_switch_router_auth_v2", JSON.stringify({ accessToken: "test", expiresAt: "2099-01-01T00:00:00Z" }));
+    sessionStorage.setItem("cc_switch_share_api_token_v1", "share-token");
+    sessionStorage.setItem("cc_switch_share_api_email_v1", "owner@example.com");
   });
   const writes = [];
   let mode = "applied";
   let status = "pending";
   let release;
+  let reviews = 0;
   await page.route("**/v1/**", async route => {
     const request = route.request();
     if (request.method() === "PATCH") {
-      writes.push(request.postDataJSON());
+      const input = request.postDataJSON();
+      writes.push(input);
+      if (mode === "lost-response") {
+        mode = "applied";
+        return route.abort("connectionreset");
+      }
       if (mode === "held") await new Promise(resolve => { release = resolve; });
       return route.fulfill({ status: mode === "conflict" ? 409 : 200, json: mode === "conflict"
         ? { message: "share changed; reload the editor" }
-        : { ok: true, appliedSynchronously: mode !== "queued", edit: { id: "edit-1", status: mode === "queued" ? "pending" : "applied" } } });
+        : { ok: true, appliedSynchronously: mode !== "queued", edit: { id: input.operationId ?? "edit-1", status: mode === "queued" ? "pending" : "applied" } } });
     }
     if (request.url().endsWith("/capability-preview")) {
-      const input = request.postDataJSON(), op = "tool.web_search", fingerprint = "a".repeat(64);
-      const selected = input.policy?.allowedOperations?.includes(op) || false;
-      const policy = { ...input.policy, operationBindings: selected ? {[op]:[{app:"codex",fingerprint}]} : {} };
-      const scopes = Object.entries(input.policies).filter(([,p])=>!p.allowedOperations || p.allowedOperations.includes(op)).map(([scope])=>({scope,quotaUnit:"tokens",coverage:"partial",reason:"resource_not_in_token_ledger",condition:"gap:"+scope}));
-      return route.fulfill({ json: {shareId:"share-1",configRevision:input.expectedConfigRevision,ready:true,legacy:false,displayVersion:2,policy,previewCredential:"save-ticket",expiresAt:Date.now()+900000,blockers:[],
-        requiredAcknowledgements:selected?scopes.map(s=>({...s,operation:op,bindingFingerprint:fingerprint,actor:"",acceptedAtMs:0})):[],
-        rows:[{app:"codex",operation:op,bindingFingerprint:fingerprint,controllable:true,implemented:true,providerEnabled:true,accountSupport:"unknown",unavailableReason:null,modelScope:"request",pricingCoverage:"request_dependent",execution:"unknown",measurement:"estimated",nativeUnit:op,pricing:"missing",admission:"estimated_reservation",selected,scopes}],
-      }});
+      const input = request.postDataJSON(), operation = "tool.web_search";
+      if (!input.subject) reviews++;
+      return route.fulfill({ json: {
+        shareId: "share-1", configRevision: input.expectedConfigRevision, subject: input.subject,
+        ready: true, unavailable: false, displayVersion: 3, previewCredential: "save-ticket",
+        expiresAt: Date.now() + 900000,
+        rows: [{operation,available:true,selected:false,needsReconfirm:false}],
+        requiredAcknowledgements: Object.keys(input.grantCapabilityEdits).map(scope => ({
+          condition: "gap:" + scope, scope, operation,
+        })),
+      } });
     }
-    if (request.url().includes("/v1/ui/context")) return route.fulfill({ json: { mode: "router" } });
     if (request.url().includes("/settings-edits/")) return route.fulfill({ json: { id: "edit-1", status, errorMessage: "revision conflict" } });
     if (request.url().endsWith("/requested-model-blocks")) return route.fulfill({ json: { shareId: "share-1", revision: 1, blockedModelsByApp: {} } });
     return route.fulfill({ json: { rows: [], usdCnyRateMicros: 7000000, fxRateFresh: true } });
@@ -250,23 +262,81 @@ try {
   console.log("PASS actual nested Share dialogs apply locally and close once on persistence");
   await page.evaluate(() => window.capabilityDialog());
   await page.clock.runFor(1000);
-  const search = page.getByRole("checkbox", { name: /Web search.*Verification pending/ });
+  assert.equal(await page.getByRole("switch", { name: "Web search" }).count(), 0);
+  const aliceRow = page.getByRole("row").filter({ hasText: "a@example.com" });
+  await aliceRow.getByRole("button", { name: "Edit", exact: true }).click();
+  await page.clock.runFor(1000);
+  const search = page.getByRole("switch", { name: "Web search" });
   await search.waitFor();
-  await search.evaluate(element => element.click());
-  await page.clock.runFor(500);
+  await search.focus();
+  await search.press("Space");
+  assert.equal(await search.isChecked(), true);
+  const child = page.getByRole("dialog").last();
+  await child.getByRole("button", { name: "Apply", exact: true }).click();
   const countBeforeCapabilities = writes.length;
+  const reviewsBeforeCapabilities = reviews;
+  const confirms = [];
+  mode = "lost-response";
+  page.once("dialog", async dialog => { confirms.push(dialog.message()); await dialog.accept(); });
   await page.getByRole("button", { name: "Save", exact: true }).click();
-  const review = page.getByRole("dialog", { name: "Review extension changes" });
-  await review.waitFor();
-  assert.equal(writes.length, countBeforeCapabilities, "review occurs before persistence");
-  await review.getByRole("checkbox").evaluate(element => element.click());
-  await review.getByRole("button", { name: "Confirm and save", exact: true }).click();
+  await page.getByText("Failed to fetch", { exact: true }).waitFor();
+  await page.getByRole("button", { name: "Save", exact: true }).click();
   await page.waitForFunction(() => window.closedCount === 4);
-  assert.equal(writes.length, countBeforeCapabilities + 1);
-  assert.deepEqual(writes.at(-1).patch.capabilityPolicy.allowedOperations, ["tool.web_search"]);
-  assert.equal(writes.at(-1).patch.capabilityConsent.credential, "save-ticket");
-  assert.deepEqual(writes.at(-1).patch.capabilityConsent.acceptUncovered.sort(), ["gap:a@example.com", "gap:b@example.com", "gap:owner@example.com"]);
-  console.log("PASS Dashboard save reviews capabilities once and persists signed policy with the settings transaction");
+  assert.equal(writes.length, countBeforeCapabilities + 2);
+  assert.equal(reviews, reviewsBeforeCapabilities + 1);
+  assert.deepEqual(writes.at(-1), writes.at(-2));
+  assert.ok(writes.at(-1).operationId);
+  assert.deepEqual(writes.at(-1).patch.grantCapabilityEdits["a@example.com"].operations, ["tool.web_search"]);
+  assert.equal(Object.keys(writes.at(-1).patch.grantCapabilityEdits).length, 1);
+  assert.equal(writes.at(-1).patch.userGrantEdits, undefined);
+  assert.deepEqual(writes.at(-1).patch.capabilityConsent.acceptUncovered, ["gap:a@example.com"]);
+  assert.equal(confirms.length, 1);
+  assert.match(confirms[0], /a@example.com/);
+  assert.doesNotMatch(confirms[0], /b@example.com/);
+  console.log("PASS Dashboard authorizes only the selected grant and replays after one confirmation");
+
+  const standalone = await page.evaluate(() => ({ ...window.shareFixture, grantCapabilityPolicy: true }));
+  const auth = { authenticated: true, canManage: true, user: { email: standalone.ownerEmail } };
+  const directWrites = [];
+  await page.route("**/share-api/**", async route => {
+    const request = route.request();
+    const pathname = new URL(request.url()).pathname;
+    if (pathname === "/share-api/context") return route.fulfill({ json: { subdomain: standalone.subdomain } });
+    if (pathname === "/share-api/share") return route.fulfill({ json: { share: standalone, auth } });
+    if (pathname.endsWith("/capability-preview")) {
+      const input = request.postDataJSON();
+      return route.fulfill({ json: {
+        displayVersion: 3, shareId: standalone.shareId, configRevision: input.expectedConfigRevision,
+        subject: input.subject, ready: true, unavailable: false,
+        rows: [{ operation: "tool.web_search", selected: true, available: true, needsReconfirm: false }],
+        previewCredential: "standalone-ticket", expiresAt: Date.now() + 900000,
+      } });
+    }
+    if (pathname.endsWith("/settings")) {
+      const input = request.postDataJSON();
+      directWrites.push(input);
+      standalone.configRevision++;
+      standalone.userGrants["a@example.com"].policy.allowedOperations = [];
+      return route.fulfill({ json: { ok: true, appliedSynchronously: true, edit: { id: input.operationId, status: "applied" } } });
+    }
+    return route.fulfill({ json: {} });
+  });
+  standalone.userGrants["a@example.com"].policy.allowedOperations = ["tool.web_search"];
+  await page.goto(`http://127.0.0.1:${server.address().port}/?standalone`);
+  await page.getByRole("row").filter({ hasText: "a@example.com" }).getByRole("button", { name: "Edit", exact: true }).click();
+  const standaloneSearch = page.getByRole("switch", { name: "Web search" });
+  await standaloneSearch.waitFor();
+  await standaloneSearch.focus();
+  await standaloneSearch.press("Space");
+  assert.equal(await standaloneSearch.isChecked(), false);
+  await page.getByRole("dialog").getByRole("button", { name: "Apply", exact: true }).click();
+  await Promise.all([
+    page.waitForResponse(response => response.request().method() === "PATCH" && response.ok()),
+    page.getByRole("button", { name: "Save", exact: true }).click(),
+  ]);
+  assert.equal(directWrites.length, 1);
+  assert.deepEqual(directWrites[0].patch.grantCapabilityEdits, { "a@example.com": { expectedRevision: 3, operations: [] } });
+  console.log("PASS standalone Share revokes the selected grant");
   assert.deepEqual(pageErrors, []);
 } finally {
   await browser?.close();

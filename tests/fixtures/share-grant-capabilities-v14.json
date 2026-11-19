@@ -1,0 +1,39 @@
+{
+  "candidateRequest": {
+    "expectedConfigRevision": 7,
+    "subject": "alice@example.com",
+    "grantCapabilityEdits": {}
+  },
+  "candidate": {
+    "displayVersion": 3,
+    "shareId": "share-v14",
+    "configRevision": 7,
+    "subject": "alice@example.com",
+    "ready": true,
+    "unavailable": false,
+    "rows": [
+      { "operation": "tool.web_search", "available": true, "selected": true, "needsReconfirm": true },
+      { "operation": "image.generate", "available": false, "selected": true, "needsReconfirm": false }
+    ]
+  },
+  "reviewRequest": {
+    "expectedConfigRevision": 7,
+    "grantCapabilityEdits": {
+      "alice@example.com": { "expectedRevision": 3, "operations": ["tool.web_search"], "reconfirm": ["tool.web_search"] },
+      "bob@example.com": { "expectedRevision": 5, "operations": [] }
+    }
+  },
+  "review": {
+    "displayVersion": 3,
+    "shareId": "share-v14",
+    "configRevision": 7,
+    "ready": true,
+    "unavailable": false,
+    "rows": [],
+    "requiredAcknowledgements": [
+      { "scope": "alice@example.com", "operation": "tool.web_search", "condition": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" }
+    ],
+    "previewCredential": "fixture-only",
+    "expiresAt": 4070908800000
+  }
+}

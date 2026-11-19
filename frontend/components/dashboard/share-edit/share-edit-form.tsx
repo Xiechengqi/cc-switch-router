@@ -1,6 +1,5 @@
 "use client";
-import {ShareCapabilitiesEditor} from "./share-capabilities-editor";
-import { capabilityIntent, capabilityNeedsReview, reconcileCapabilityGrants, type CapabilityReviewHandle } from "@/lib/share-capabilities";
+import { needsGrantCapabilityReview, prepareGrantSettingsAttempt, type GrantSettingsAttempt } from "@/lib/share-grant-capabilities";
 
 import { Checkbox, Input } from "@heroui/react";
 import * as React from "react";
@@ -13,7 +12,9 @@ import {
 } from "@/components/dashboard/share-dashboard-utils";
 import { resolveShareCoreApp, shareProviderSupportedApps } from "@/lib/share-app";
 import type { ShareView } from "@/lib/types";
-import { getShareSettingsEdit, updateShareSettings } from "@/lib/api";
+import { ApiError, getShareSettingsEdit, previewShareGrantCapabilities, updateShareSettings } from "@/lib/api";
+import { readAuthState } from "@/lib/auth";
+import { loginContextKey, sameLoginContext } from "@/lib/password-auth";
 import { publishValueQuotaStatuses } from "@/lib/use-share-value-quota";
 import { millionsInputToTokens, tokensToMillionsInput } from "@/lib/token-units";
 import { formatDateTime } from "@/lib/utils";
@@ -79,7 +80,6 @@ export type ShareEditFormApi = {
   handleParallelUnlimited: (checked: boolean) => void;
   onBlocksStateChange: (state: { dirty: boolean }) => void;
   blocksRef: React.RefObject<ShareRequestedModelBlocksHandle | null>;
-  capabilitiesRef: React.RefObject<CapabilityReviewHandle | null>;
   resetDraft: () => void;
   save: () => Promise<void>;
 };
@@ -95,7 +95,7 @@ export function useShareEditForm({
   onSaved: (result: { appliedSynchronously: boolean }) => Promise<void>;
   onClose: () => void;
 }): ShareEditFormApi | null {
-  const capabilitiesRef = React.useRef<CapabilityReviewHandle>(null);
+  const { locale } = useLocaleText();
   const [draft, setDraft] = React.useState<ShareEditDraft | null>(null);
   const [baseDraft, setBaseDraft] = React.useState<ShareEditDraft | null>(null);
   const [baseShare, setBaseShare] = React.useState<ShareView | null>(null);
@@ -110,10 +110,12 @@ export function useShareEditForm({
   const baseShareRef = React.useRef<ShareView | null>(null);
   const blocksRef = React.useRef<ShareRequestedModelBlocksHandle | null>(null);
   const savingRef = React.useRef(false);
+  const grantSaveAttempt = React.useRef<GrantSettingsAttempt | undefined>(undefined);
   const sessionRef = React.useRef(0);
   React.useEffect(() => {
     sessionRef.current += 1;
     savingRef.current = false;
+    grantSaveAttempt.current = undefined;
     setBusy(false);
     setPendingEdit(null);
     return () => { sessionRef.current += 1; };
@@ -279,9 +281,6 @@ export function useShareEditForm({
     !draft.parallelLimitUnlimited && (!Number.isFinite(parallelParsed) || parallelParsed <= 0);
   const expiryInvalid = !draft.expiresPermanent && !draft.expiresAtInput.trim();
   const appApiInvalid = !activeShareApps.some((app) => draft.enabledApps[app]);
-  const capabilityDirty = capabilityIntent(draft.capabilityPolicy) !== capabilityIntent(baseDraft.capabilityPolicy);
-  const capabilityReviewNeeded = capabilityNeedsReview(draft.capabilityPolicy, draft.userGrants, draft.tokenLimitUnlimited ? -1 : tokenParsed ?? 0,
-    baseDraft.capabilityPolicy, baseDraft.userGrants, baseDraft.tokenLimitUnlimited ? -1 : millionsInputToTokens(baseDraft.tokenLimitInput) ?? 0);
   const formInvalid =
     descriptionInvalid ||
     tokenInvalid ||
@@ -291,10 +290,13 @@ export function useShareEditForm({
   const currentPatch = buildShareEditPatch(draft, baseShare || liveShare, activeShareApps);
   const basePatch = buildShareEditPatch(baseDraft, baseShare || liveShare, activeShareApps);
   const settingsDirty = shareEditPatchFingerprint(currentPatch) !== shareEditPatchFingerprint(basePatch);
-  const isDirty = settingsDirty || blocksDirty || capabilityDirty;
+  const capabilityReviewNeeded = !!(baseShare || liveShare).grantCapabilityPolicy
+    && needsGrantCapabilityReview(currentPatch, baseDraft.userGrants);
+  const isDirty = settingsDirty || blocksDirty;
 
   const resetDraft = () => {
     if (!baseDraft || busy) return;
+    grantSaveAttempt.current = undefined;
     const latest = share ? buildShareEditDraft(share) : baseDraft;
     if (share) setBaseShare(share);
     setBaseDraft(latest);
@@ -309,16 +311,24 @@ export function useShareEditForm({
     if (!liveShare || savingRef.current || busy || locked || formInvalid || !isDirty) return;
     savingRef.current = true;
     const session = sessionRef.current;
+    const auth = readAuthState();
+    const login = auth.loginEpoch ? loginContextKey(auth) : JSON.stringify([auth.accessToken, auth.refreshToken]);
+    const revision = (baseShare || liveShare).configRevision;
     setBusy(true);
     setError("");
     setNotice("");
     try {
-      let reviewedDraft = draft;
+      let patch = currentPatch;
+      let operationId: string | undefined;
       if (capabilityReviewNeeded) {
-        if (!capabilitiesRef.current) throw new Error("Capability editor is unavailable");
-        const approval = await capabilitiesRef.current.review();
-        if (!approval || session !== sessionRef.current) return;
-        reviewedDraft = { ...draft, capabilityPolicy: approval.policy, capabilityConsent: approval.consent };
+        const reviewed = await prepareGrantSettingsAttempt({
+          previous: grantSaveAttempt.current, request: previewShareGrantCapabilities,
+          shareId: liveShare.shareId, revision: revision ?? 0, patch, login, zh: locale.startsWith("zh"),
+        });
+        if (!reviewed || session !== sessionRef.current || !sameLoginContext(auth, readAuthState())) return;
+        grantSaveAttempt.current = reviewed;
+        patch = reviewed.patch;
+        operationId = reviewed.operationId;
       }
       if (blocksDirty) {
         await blocksRef.current?.save();
@@ -326,10 +336,13 @@ export function useShareEditForm({
       if (settingsDirty || capabilityReviewNeeded) {
         const res = await updateShareSettings(
           liveShare.shareId,
-          buildShareEditPatch(reviewedDraft, baseShare || liveShare, activeShareApps),
-          baseShare?.configRevision,
+          patch,
+          revision,
+          operationId,
+          auth,
         );
         if (session !== sessionRef.current) return;
+        grantSaveAttempt.current = undefined;
         if (res.valueQuotaStatuses) publishValueQuotaStatuses(liveShare.shareId, res.valueQuotaStatuses);
         await onSaved({ appliedSynchronously: res.appliedSynchronously });
         if (session !== sessionRef.current) return;
@@ -342,6 +355,9 @@ export function useShareEditForm({
       }
     } catch (err) {
       if (session === sessionRef.current) {
+        if (err instanceof ApiError && err.status < 500 && err.status !== 408) {
+          grantSaveAttempt.current = undefined;
+        }
         setError(err instanceof Error ? err.message : String(err));
         await onSaved({ appliedSynchronously: false }).catch(() => undefined);
       }
@@ -383,7 +399,6 @@ export function useShareEditForm({
     handleParallelUnlimited,
     onBlocksStateChange,
     blocksRef,
-    capabilitiesRef,
   };
 }
 
@@ -554,13 +569,6 @@ export function ShareEditFormBody({
         onDraftChange={form.onDraftChange}
       />
 
-      <ShareCapabilitiesEditor shareId={displayShare.shareId} revision={displayShare.configRevision ?? 0}
-        policy={draft.capabilityPolicy} savedPolicy={displayShare.capabilityPolicy} grants={draft.userGrants}
-        reviewRef={form.capabilitiesRef}
-        tokenLimit={draft.tokenLimitUnlimited ? -1 : millionsInputToTokens(draft.tokenLimitInput) ?? 0} disabled={fieldsDisabled}
-        onChange={capabilityPolicy => form.onDraftChange(current => ({ ...current, capabilityPolicy,
-          capabilityConsent: undefined, userGrants: reconcileCapabilityGrants(capabilityPolicy, current.userGrants),
-        }))} />
       <ShareAccessQuotaSection
         t={t}
         access={
@@ -573,7 +581,7 @@ export function ShareEditFormBody({
         }
         ceiling={ceiling}
         users={
-          <ShareUserGrantsEditor independentCapabilities={!!draft.capabilityPolicy} shareOperations={draft.capabilityPolicy?.allowedOperations}
+          <ShareUserGrantsEditor grantCapabilities={displayShare.grantCapabilityPolicy} shareTokenLimit={draft.tokenLimitUnlimited ? -1 : millionsInputToTokens(draft.tokenLimitInput) ?? 0}
             value={draft.userGrants}
             ownerEmail={displayShare.ownerEmail || ""}
             defaultPolicy={defaultUserPolicy}
@@ -592,7 +600,7 @@ export function ShareEditFormBody({
               form.onDraftChange((current) => ({ ...current, userUsageEdits }))
             }
             onChange={(userGrants) =>
-              form.onDraftChange((current) => ({ ...current, capabilityConsent: undefined, userGrants: current.capabilityPolicy ? reconcileCapabilityGrants(current.capabilityPolicy, userGrants) : userGrants }))
+              form.onDraftChange((current) => ({ ...current, capabilityConsent: undefined, userGrants }))
             }
             freeAccess={draft.freeAccess}
           />

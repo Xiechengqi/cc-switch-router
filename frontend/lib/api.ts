@@ -1,3 +1,5 @@
+import { parseRequestMetering } from "./share-request-metering";
+import { parseGrantCapabilityPreview, type GrantCapabilityInput } from "./share-grant-capabilities";
 import { parseCapabilityPreview } from "@/lib/share-capabilities";
 import { authFetch, readAuthState, type AuthState } from "@/lib/auth";
 import { loginContextKey, sameLoginContext } from "@/lib/password-auth";
@@ -355,14 +357,19 @@ export async function updateShareSettings(
   shareId: string,
   patch: ShareSettingsPatch,
   baseConfigRevision?: number,
+  operationId?: string,
+  started?: AuthState,
 ) {
-  return parseJson<{ ok: boolean; edit: ShareEditView; appliedSynchronously: boolean; quotaConversions?: unknown[]; valueQuotaStatuses?: import("./share-value-quota").ValueQuotaStatus[] }>(
+  const result = await parseJson<{ ok: boolean; edit: ShareEditView; appliedSynchronously: boolean; quotaConversions?: unknown[]; valueQuotaStatuses?: import("./share-value-quota").ValueQuotaStatus[] }>(
     await authFetch(`/v1/shares/${encodeURIComponent(shareId)}/settings`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ patch, baseConfigRevision }),
-    }),
+      body: JSON.stringify({ patch, baseConfigRevision, operationId }),
+    }, started),
   );
+  if (started) assertCurrentLoginContext(started);
+  if (operationId && result?.edit?.id !== operationId) throw new Error("Invalid Share settings response");
+  return result;
 }
 
 export async function getShareRequestedModelBlocks(shareId: string) {
@@ -1936,12 +1943,30 @@ export async function updateAdminResourcePrices(expectedRevision: number, settin
   );
 }
 
-export async function previewShareCapabilities(shareId: string, input: unknown, signal?: AbortSignal): Promise<import("@/lib/share-capabilities").CapabilityPreview> {
+async function fetchCapabilityPreview(shareId: string, input: unknown, signal?: AbortSignal): Promise<unknown> {
   const started = readAuthState();
   const response = await authFetch(`/v1/shares/${encodeURIComponent(shareId)}/capability-preview`, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(input),signal,cache:"no-store"});
   if (!sameLoginContext(started,readAuthState())) throw new DOMException("Sign-in session changed", "AbortError");
   const result=await response.json();
   if (!sameLoginContext(started,readAuthState())) throw new DOMException("Sign-in session changed", "AbortError");
   if (!response.ok) throw new Error(result.message || "Capability preview failed");
-  return parseCapabilityPreview(result,shareId,input);
+  return result;
+}
+
+export async function previewShareCapabilities(shareId: string, input: unknown, signal?: AbortSignal) {
+  return parseCapabilityPreview(await fetchCapabilityPreview(shareId, input, signal), shareId, input);
+}
+
+export async function previewShareGrantCapabilities(shareId: string, input: GrantCapabilityInput, signal?: AbortSignal) {
+  return parseGrantCapabilityPreview(await fetchCapabilityPreview(shareId, input, signal), shareId, input);
+}
+
+export async function getShareRequestMetering(shareId: string, requestId: string, signal?: AbortSignal) {
+  const started = readAuthState();
+  const response = await authFetch(`/v1/shares/${encodeURIComponent(shareId)}/request-metering`, {
+    method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify({requestId}), signal, cache: "no-store",
+  });
+  const result = await parseJson<unknown>(response);
+  if (!sameLoginContext(started, readAuthState())) throw new DOMException("Sign-in session changed", "AbortError");
+  return parseRequestMetering(result, shareId, requestId);
 }

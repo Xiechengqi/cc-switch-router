@@ -1,6 +1,7 @@
 "use client";
-import { capabilityPermissionSummary, preservesCapabilitySchedule, type ShareOperation } from "@/lib/share-capabilities";
-import { ShareCapabilityPermissionFields } from "./share-capability-permission-fields";
+import { preservesCapabilitySchedule, type ShareOperation } from "@/lib/share-capabilities";
+import { GrantCapabilityFields } from "./grant-capability-fields";
+import type { GrantCapabilityRequest } from "@/lib/share-grant-capabilities";
 
 import { Button, Checkbox, Input, ListBox, Modal, Select } from "@heroui/react";
 import { Pencil, Plus, Trash2 } from "lucide-react";
@@ -10,12 +11,12 @@ import { ShareUserLimitsTable } from "@/components/dashboard/drawer-panels";
 import type { TFn } from "@/components/dashboard/share-dashboard-utils";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { accountCycleEnded, accountResetErrorText, accountResetInUse } from "@/lib/account-reset-display";
-import { getShareUserLimitStatus, previewShareAccountReset } from "@/lib/api";
+import { getShareUserLimitStatus, previewShareAccountReset, previewShareGrantCapabilities } from "@/lib/api";
 import { useShareUserUsageBreakdown } from "@/lib/use-share-user-usage-breakdown";
 import { useValueQuotaReadiness } from "@/lib/use-value-quota-readiness";
 import { useValueQuotaPreview } from "@/lib/use-value-quota-preview";
 import { ValueQuotaReadiness } from "./value-quota-readiness";
-import { ValueResourceToggle, ValueUnpricedToggle, QuotaLimitField, QuotaUnitSwitch, ValuePreviewLine } from "./value-quota-fields";
+import { QuotaLimitField, QuotaUnitSwitch, ValuePreviewLine } from "./value-quota-fields";
 import type {
   ShareTokenPeriod,
   ShareUserGrant,
@@ -27,6 +28,7 @@ import type {
   AccountResetPreview,
 } from "@/lib/types";
 import {
+  grantQuotaTerms,
   isRevokedRouterShareMarketGrant,
   isPermanentUserPolicyExpiry,
   ordinaryShareUserGrant,
@@ -52,6 +54,7 @@ import {
 
 type GrantDraft = {
   allowedOperations?: ShareOperation[];
+  reconfirmOperations?: ShareOperation[];
   quotaUnit: "tokens" | "usdEquivalent";
   resourceMetering: boolean;
   /** USD only: refuse usage the tariff cannot price instead of metering it at $0. */
@@ -300,8 +303,9 @@ export function ShareUserGrantsEditor({
   supportedPeriods,
   t,
   disabled,
-  independentCapabilities,
-  shareOperations = [],
+  grantCapabilities,
+  shareTokenLimit = -1,
+  grantCapabilityRequest = previewShareGrantCapabilities,
   shareId,
   configRevision,
   usageEdits = {},
@@ -318,8 +322,9 @@ export function ShareUserGrantsEditor({
   supportedPeriods?: ShareTokenPeriod[];
   t: TFn;
   disabled?: boolean;
-  independentCapabilities?: boolean;
-  shareOperations?: ShareOperation[];
+  grantCapabilities?: boolean;
+  shareTokenLimit?: number;
+  grantCapabilityRequest?: GrantCapabilityRequest;
   shareId?: string;
   configRevision?: number;
   usageEdits?: ShareUserUsageEditMap;
@@ -500,7 +505,6 @@ export function ShareUserGrantsEditor({
     const expiresAt = draft.expiresAt ? new Date(draft.expiresAt).getTime() : undefined;
     const periodAnchorAtMs = ANCHORED_PERIODS.has(draft.tokenPeriod) ? parseUtcDateTime(draft.tokenPeriodAnchor) : undefined;
     return {
-      ...(draft.applyCapabilities ? { allowedOperations: { value: draft.allowedOperations } } : {}),
       ...(draft.applyParallelLimit ? { parallelLimit: { value: parallelLimit } } : {}),
       ...(draft.applyTokenLimit ? { tokenLimit: {
         value: tokenLimit ?? undefined,
@@ -523,7 +527,7 @@ export function ShareUserGrantsEditor({
       tokenPeriodAnchorAtMs: ANCHORED_PERIODS.has(grantDraft.tokenPeriod) ? parseUtcDateTime(grantDraft.tokenPeriodAnchor) : undefined,
       expiresAt: grantDraft.expiresAt ? new Date(grantDraft.expiresAt).getTime() : undefined,
     };
-    return policy && !(savedGrants[email] && preservesCapabilitySchedule(savedGrants[email], policy)) && (policy.valueQuota || quotaConversionNeeded(savedGrants[email], policy)) ? { [email]: policy } : undefined;
+    return policy && !(savedGrants[email] && preservesCapabilitySchedule(savedGrants[email], policy)) && (policy.valueQuota || quotaConversionNeeded(savedGrants[email], policy)) ? { [email]: grantCapabilities ? grantQuotaTerms(policy) : policy } : undefined;
   })();
   const batchUsdPolicies = (() => {
     if (!batchDraft?.applyTokenLimit || !selectedEditableEmails.size) return undefined;
@@ -534,7 +538,7 @@ export function ShareUserGrantsEditor({
       || (patch.expiresAt?.value != null && !Number.isFinite(patch.expiresAt.value))) return undefined;
     // Preview the requested policy, not what staging keeps in force.
     const source = batchSourceGrants();
-    return Object.fromEntries([...selectedEditableEmails].sort().map((email) => [email, patchedUserPolicy(source[email], patch)]));
+    return Object.fromEntries([...selectedEditableEmails].sort().map((email) => [email, grantCapabilities ? grantQuotaTerms(patchedUserPolicy(source[email], patch)) : patchedUserPolicy(source[email], patch)]));
   })();
   const batchUsdParallel = !!batchDraft && batchUsesUsd(grants, selectedEditableEmails, batchPatchFor(batchDraft));
   const dialogOpen = !!grantDraft || !!batchDraft;
@@ -608,6 +612,7 @@ export function ShareUserGrantsEditor({
     // Edit the policy the owner asked for; a scheduled one is that intent.
     setGrantDraft({
       ...makeDraft(grant.email, grant.pendingValueQuota?.policy ?? grant.policy),
+      ...(grantCapabilities ? { allowedOperations: grant.policy.allowedOperations, reconfirmOperations: grant.reconfirmOperations } : {}),
       ...usageEditForGrant(grant, usageEdits),
       consumedValue: picosToUsdInput(valueUsageInitializations[grant.email]?.targetPicos),
       valueReason: valueUsageInitializations[grant.email]?.reason ?? "",
@@ -746,6 +751,13 @@ export function ShareUserGrantsEditor({
     };
     const next: ShareUserGrant = stageUserPolicy(ordinaryShareUserGrant(email, normalizedOwner, previous, target), target,
       previous && !reuseMarketTombstone ? previous.policy : target);
+    if (grantCapabilities) {
+      next.reconfirmOperations = grantDraft.reconfirmOperations;
+      if (previous?.pendingValueQuota && preservesCapabilitySchedule(previous, target)) {
+        next.policy = { ...previous.policy, allowedOperations: target.allowedOperations };
+        next.pendingValueQuota = previous.pendingValueQuota;
+      }
+    }
     let initialization: ShareUserValueUsageInitializationMap[string] | undefined;
     if (!(savedGrants[email] && preservesCapabilitySchedule(savedGrants[email], target)) && (target.valueQuota || quotaConversionNeeded(savedGrants[email], target))) {
       setError("");
@@ -1146,11 +1158,14 @@ export function ShareUserGrantsEditor({
               const grant = grantByEmail.get(row.email);
               if (!grant) return null;
               const marketManaged = shareMarketManagedEmails.has(grant.email);
+              const operationCount = grant.policy.allowedOperations?.length ?? 0;
               return (
                 <div className="flex flex-wrap items-center justify-center gap-1">
-                  {independentCapabilities ? <span className="max-w-40 text-xs text-muted-foreground">{marketManaged
-                    ? locale.startsWith("zh") ? "由购买套餐决定" : "Purchased plan"
-                    : capabilityPermissionSummary(grant.policy.allowedOperations, locale.startsWith("zh") ? 0 : 1)}</span> : null}
+                  {grantCapabilities && (marketManaged || operationCount > 0) ? (
+                    <span className="text-xs text-muted-foreground">{marketManaged
+                      ? t("dashboard.grantMedia.marketPermission")
+                      : t("dashboard.grantMedia.selectedCount", { count: operationCount })}</span>
+                  ) : null}
                   {!marketManaged ? (
                     <Button
                       isIconOnly
@@ -1219,8 +1234,6 @@ export function ShareUserGrantsEditor({
                   <Input id={`${fieldId}-email`} type="email" value={grantDraft?.email || ""} disabled={!!editingEmail} onChange={(event) => grantDraft && setGrantDraft({ ...grantDraft, email: event.target.value })} />
                   {!editingEmail ? <p className="text-xs text-muted-foreground">{t("dashboard.userLimit.defaultsHint")}</p> : null}
                 </div>
-                {independentCapabilities && grantDraft ? <ShareCapabilityPermissionFields value={grantDraft.allowedOperations} available={shareOperations}
-                  onChange={allowedOperations => setGrantDraft({ ...grantDraft, allowedOperations })} /> : null}
                 <div className="grid content-start gap-1.5">
                   <label htmlFor={`${fieldId}-parallel`} className={FIELD_LABEL_CLASS}>{t("dashboard.field.parallelLimit")}</label>
                   <Input id={`${fieldId}-parallel`} type="number" min={1} max={grantDraft?.quotaUnit === "usdEquivalent" ? USD_PARALLEL_LIMIT : undefined} placeholder={t("common.unlimited")} value={grantDraft?.parallelLimit || ""} onChange={(event) => grantDraft && setGrantDraft({ ...grantDraft, parallelLimit: event.target.value })} />
@@ -1235,7 +1248,7 @@ export function ShareUserGrantsEditor({
                         tokenLimit: grantDraft.tokenLimit, consumedTokens: grantDraft.consumedTokens, usageAction: grantDraft.usageAction,
                       }};
                       setAmountAttempted(false); setGrantDraft({...grantDraft, quotaUnit: unit, unitDrafts,
-                        ...(independentCapabilities&&unit==="usdEquivalent"?{resourceMetering:true,rejectUnpriced:true}:{}),
+                        ...(unit==="usdEquivalent"?{rejectUnpriced:true}:{}),
                         ...(unitDrafts[unit] ?? {tokenLimit: "", usageAction: "unchanged", consumedTokens: ""})});
                     }} />
                   <ValueQuotaReadiness state={readiness} t={t} id={`${fieldId}-readiness`} />
@@ -1244,10 +1257,16 @@ export function ShareUserGrantsEditor({
                   <QuotaLimitField id={`${fieldId}-limit`} t={t} unit={grantDraft?.quotaUnit || "tokens"} value={grantDraft?.tokenLimit || ""}
                     error={limitError(grantDraft?.quotaUnit || "tokens", grantDraft?.tokenLimit || "")}
                     onChange={(tokenLimit) => grantDraft && setGrantDraft({ ...grantDraft, tokenLimit })} />
-                  {!independentCapabilities && grantDraft?.quotaUnit === "usdEquivalent" ? <ValueResourceToggle t={t} value={grantDraft.resourceMetering} onChange={resourceMetering=>setGrantDraft({...grantDraft,resourceMetering})} /> : null}
-                  {grantDraft?.quotaUnit === "usdEquivalent" ? <ValueUnpricedToggle t={t} value={grantDraft.rejectUnpriced} onChange={rejectUnpriced=>setGrantDraft({...grantDraft,rejectUnpriced})} /> : null}
                   {singleUsdPolicies ? <ValuePreviewLine state={singlePreview} t={t} calibrations={grantDraft ? {[editedEmail]:{amount: grantDraft.quotaUnit === "usdEquivalent" ? grantDraft.consumedValue : grantDraft.consumedTokens, reason: grantDraft.valueReason}} : undefined} /> : null}
                 </div>
+                {grantCapabilities && grantDraft ? <GrantCapabilityFields
+                  shareId={shareId} revision={configRevision} email={grantDraft.email.trim().toLowerCase()}
+                  request={grantCapabilityRequest} selected={grantDraft.allowedOperations ?? []} reconfirm={grantDraft.reconfirmOperations ?? []}
+                  quota={grantDraft.quotaUnit === "usdEquivalent" ? "usd" : grantDraft.tokenLimit.trim() || shareTokenLimit >= 0 ? "tokens" : "unlimited"}
+                  zh={locale.startsWith("zh")} disabled={disabled || applying}
+                  onChange={allowedOperations => setGrantDraft({ ...grantDraft, allowedOperations, reconfirmOperations: grantDraft.reconfirmOperations?.filter(op => allowedOperations.includes(op)) })}
+                  onReconfirm={operation => setGrantDraft({ ...grantDraft, reconfirmOperations: [...(grantDraft.reconfirmOperations ?? []), operation] })}
+                /> : null}
                 <div className={grantDraft?.quotaUnit === "usdEquivalent" ? "hidden" : "grid gap-1.5 sm:col-span-2"}>
                   <span className={FIELD_LABEL_CLASS}>{t("dashboard.userLimit.consumedTokens")}</span>
                   <div className="flex items-center gap-2">
@@ -1391,13 +1410,6 @@ export function ShareUserGrantsEditor({
               <p className="text-sm text-muted-foreground sm:col-span-2">
                 {t("dashboard.userLimit.batchHint", { count: selectedEditableEmails.size })}
               </p>
-              {independentCapabilities && batchDraft ? <div className="grid gap-2 sm:col-span-2">
-                <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={batchDraft.applyCapabilities}
-                  onChange={event => setBatchDraft({ ...batchDraft, applyCapabilities: event.target.checked })} />
-                  {locale.startsWith("zh") ? "修改扩展能力权限" : "Change extension permissions"}</label>
-                {batchDraft.applyCapabilities ? <ShareCapabilityPermissionFields value={batchDraft.allowedOperations} available={shareOperations}
-                  onChange={allowedOperations => setBatchDraft({ ...batchDraft, allowedOperations })} /> : null}
-              </div> : null}
               <div className="grid gap-2">
                 <Checkbox
                   isSelected={batchDraft?.applyParallelLimit || false}
@@ -1448,7 +1460,7 @@ export function ShareUserGrantsEditor({
                 </Checkbox>
                 <QuotaUnitSwitch t={t} disabled={!batchDraft?.applyTokenLimit} value={batchDraft?.quotaUnit || "tokens"} usdDisabled={readiness.unavailable} readinessId={`${fieldId}-batch-readiness`}
                   onChange={(unit) => { if (!batchDraft || unit === batchDraft.quotaUnit) return; setAmountAttempted(false); setBatchDraft({...batchDraft, quotaUnit:unit, applyConsumedTokens:false,
-                    ...(independentCapabilities&&unit==="usdEquivalent"?{resourceMetering:true,rejectUnpriced:true}:{}),
+                    ...(unit==="usdEquivalent"?{rejectUnpriced:true}:{}),
                     unitDrafts:{...batchDraft.unitDrafts,[batchDraft.quotaUnit]:{tokenLimit:batchDraft.tokenLimit,consumedTokens:batchDraft.consumedTokens,usageAction:batchDraft.usageAction}},
                     ...(batchDraft.unitDrafts?.[unit] ?? {tokenLimit:"",consumedTokens:"",usageAction:"unchanged"}),
                     calibrationDrafts:{...batchDraft.calibrationDrafts,[batchDraft.quotaUnit]:batchDraft.calibrations ?? {}},calibrations:batchDraft.calibrationDrafts?.[unit] ?? {}}); }} />
@@ -1456,8 +1468,6 @@ export function ShareUserGrantsEditor({
                 <QuotaLimitField id={`${fieldId}-batch-limit`} labelHidden t={t} disabled={!batchDraft?.applyTokenLimit} unit={batchDraft?.quotaUnit || "tokens"}
                   value={batchDraft?.tokenLimit || ""} error={batchDraft?.applyTokenLimit ? limitError(batchDraft.quotaUnit, batchDraft.tokenLimit) : undefined}
                   onChange={(tokenLimit) => batchDraft && setBatchDraft({ ...batchDraft, tokenLimit })} />
-                {!independentCapabilities && batchDraft?.applyTokenLimit && batchDraft.quotaUnit === "usdEquivalent" ? <ValueResourceToggle t={t} value={batchDraft.resourceMetering} onChange={resourceMetering=>setBatchDraft({...batchDraft,resourceMetering})} /> : null}
-                {batchDraft?.applyTokenLimit && batchDraft.quotaUnit === "usdEquivalent" ? <ValueUnpricedToggle t={t} value={batchDraft.rejectUnpriced} onChange={rejectUnpriced=>setBatchDraft({...batchDraft,rejectUnpriced})} /> : null}
                 {batchUsdPolicies ? <ValuePreviewLine state={batchPreview} t={t} calibrations={batchDraft?.calibrations} /> : null}
                 {batchDraft && batchPreview.preview?.rows.filter(row=>row.calibrationRequired).map(row=><div key={row.email} className="grid gap-2">
                   <label className="text-xs">{row.email} · {t("dashboard.userLimit.value.conversionCalibrationRequired")}

@@ -342,7 +342,8 @@ export const ShareCard = React.memo(function ShareCard({
               </button>
             </div>
           </div>
-          <ShareCapabilitySummary policy={share.capabilityPolicy}/>
+          <ShareCapabilitySummary operations={share.grantCapabilityPolicy && !share.canManage
+            ? Object.values(share.userGrants ?? {}).find(grant => grant.active)?.effectiveOperations : undefined} />
           {description ? (
             <span
               className="block truncate text-[10px] text-muted-foreground"

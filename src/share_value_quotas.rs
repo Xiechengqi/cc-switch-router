@@ -33,6 +33,10 @@ pub fn router() -> Router<ServerState> {
             post(capability_preview),
         )
         .route(
+            "/v1/shares/:share_id/request-metering",
+            post(request_metering),
+        )
+        .route(
             "/v1/shares/:share_id/quota-history-prepare",
             post(prepare_history),
         )
@@ -1174,6 +1178,47 @@ async fn capability_preview(
         .await
         .map(Json)
 }
+async fn request_metering(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(share_id): Path<String>,
+    Json(input): Json<RequestMeteringInput>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    require_share_manager(&state, &headers, &share_id).await?;
+    let result = forward_request_metering(&state, &share_id, input).await?;
+    Ok(([(header::CACHE_CONTROL, "private, no-store")], Json(result)))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RequestMeteringInput {
+    request_id: String,
+}
+
+pub(crate) async fn forward_request_metering(
+    state: &ServerState,
+    share_id: &str,
+    input: RequestMeteringInput,
+) -> Result<serde_json::Value, AppError> {
+    let request = input.request_id;
+    if request.is_empty()
+        || request.len() > 192
+        || request.trim() != request
+        || request.chars().any(char::is_control)
+    {
+        return Err(AppError::BadRequest("invalid request identity".into()));
+    }
+    let result =
+        forward_capability_preview(state, share_id, serde_json::json!({"requestId":request}))
+            .await?;
+    if result["shareId"] != share_id || result["requestId"] != request {
+        return Err(AppError::UnprocessableEntity(
+            "CAPABILITY_STATE_CHANGED".into(),
+        ));
+    }
+    Ok(result)
+}
+
 pub(crate) async fn forward_capability_preview(
     state: &ServerState,
     share_id: &str,

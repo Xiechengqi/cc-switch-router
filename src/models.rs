@@ -11,7 +11,8 @@ pub const MIN_SHARE_CONTRACT_VERSION: u16 = 2;
 /// v7 only add quota presentation metadata, so v5 market records remain valid
 /// during a rolling Server/Router deployment.
 pub const MIN_SHARE_MARKET_CONTRACT_VERSION: u16 = 5;
-pub const SHARE_CONTRACT_VERSION: u16 = 13;
+pub const SHARE_CONTRACT_VERSION: u16 = 14;
+pub const GRANT_CAPABILITY_CONTRACT_VERSION: u16 = 14;
 pub const SHARE_TRIAL_CONTRACT_VERSION: u16 = 9;
 
 #[derive(Debug)]
@@ -1312,6 +1313,9 @@ pub struct ShareSettingsPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability_consent: Option<crate::share_capabilities::CapabilityConsent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_capability_edits:
+        Option<BTreeMap<String, crate::share_capabilities::GrantCapabilityEdit>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub support: Option<ShareSupport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_grants: Option<BTreeMap<String, ShareUserGrant>>,
@@ -1787,6 +1791,8 @@ pub struct ShareAnchoredUsageBucket {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareUserGrant {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_operations: Option<Vec<crate::share_capabilities::ShareOperation>>,
     pub email: String,
     #[serde(default)]
     pub role: String,
@@ -1874,6 +1880,8 @@ pub struct ShareSettingsUpdateRequest {
     pub patch: ShareSettingsPatch,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_config_revision: Option<u64>,
+    #[serde(default)]
+    pub operation_id: Option<uuid::Uuid>,
 }
 
 #[derive(Debug, Serialize)]
@@ -4266,6 +4274,8 @@ impl Default for ShareModelHealthStatus {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareView {
+    #[serde(default)]
+    pub grant_capability_policy: bool,
     pub provider_identity: crate::provider_presentation::PublicProviderIdentity,
     pub router_id: String,
     pub share_id: String,

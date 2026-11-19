@@ -1,8 +1,8 @@
 "use client";
 
-import {ShareCapabilitiesEditor} from "@/components/dashboard/share-edit/share-capabilities-editor";
-import {capabilityNeedsReview,reconcileCapabilityGrants,type CapabilityReviewHandle} from "@/lib/share-capabilities";
-import {previewSharePageCapabilities} from "@/lib/share-api";
+import { needsGrantCapabilityReview, prepareGrantSettingsAttempt, type GrantSettingsAttempt } from "@/lib/share-grant-capabilities";
+import { ShareRequestLogs } from "@/components/dashboard/drawer-panels";
+import {getSharePageRequestLogs, getSharePageRequestMetering, previewSharePageGrantCapabilities} from "@/lib/share-api";
 
 import * as React from "react";
 import { Alert, Button, Checkbox, Chip, Input, TextArea } from "@heroui/react";
@@ -127,6 +127,32 @@ function AuthPanel({
   );
 }
 
+function SharePageRequestLogs({ shareId, login }: { shareId: string; login: string }) {
+  const { t } = useLocaleText();
+  const [open, setOpen] = React.useState(false);
+  const [logs, setLogs] = React.useState<import("@/lib/types").ShareRequestLog[]>();
+  const [error, setError] = React.useState(false);
+  const [retry, setRetry] = React.useState(0);
+  React.useEffect(() => {
+    if (!open) return;
+    const controller = new AbortController();
+    setError(false);
+    setLogs(undefined);
+    void getSharePageRequestLogs(controller.signal)
+      .then(rows => { if (!controller.signal.aborted) setLogs(rows); })
+      .catch(() => { if (!controller.signal.aborted) setError(true); });
+    return () => controller.abort();
+  }, [login, open, retry]);
+  return <details className="mt-4 border-t border-border pt-3" onToggle={event => setOpen(event.currentTarget.open)}>
+    <summary className="cursor-pointer text-sm font-medium">{t("dashboard.requestLogs")}</summary>
+    {open && <div className="mt-3">
+      {logs ? <ShareRequestLogs logs={logs} meteringShareId={shareId} meteringRequest={getSharePageRequestMetering} meteringLogin={login} />
+        : error ? <button type="button" className="text-sm underline" onClick={() => setRetry(n => n + 1)}>{t("common.retry")}</button>
+        : <p role="status" className="text-sm">{t("common.loading")}</p>}
+    </div>}
+  </details>;
+}
+
 function ShareSettingsForm({
   share,
   editable,
@@ -142,6 +168,7 @@ function ShareSettingsForm({
   const dirtyRef = React.useRef(false);
   const [reloadKey, setReloadKey] = React.useState(0);
   const savingRef = React.useRef(false);
+  const grantSaveAttempt = React.useRef<GrantSettingsAttempt | undefined>(undefined);
   const refreshAfterSaveRef = React.useRef(false);
   const [pendingEditId, setPendingEditId] = React.useState<string | null>(null);
   const [expiryPermanent, setExpiryPermanent] = React.useState(() => draft.expiresAt === PERMANENT_EXPIRES_AT_ISO || new Date(draft.expiresAt).getUTCFullYear() >= 2099);
@@ -210,10 +237,8 @@ function ShareSettingsForm({
       expiresAt,
     };
   }, [draft, expiryLocal, expiryPermanent, parallelUnlimited, tokenLimitInput, tokenUnlimited, baseline.expiresAt]);
-  const capabilitiesRef = React.useRef<CapabilityReviewHandle>(null);
   const settingsPatch = buildShareSettingsPatch(effectiveDraft, baseline);
-  const capabilityReviewNeeded = capabilityNeedsReview(draft.capabilityPolicy, draft.userGrants, effectiveDraft.tokenLimit,
-    baseline.capabilityPolicy, baseline.userGrants ?? {}, baseline.tokenLimit);
+  const capabilityReviewNeeded = !!baseline.grantCapabilityPolicy && needsGrantCapabilityReview(settingsPatch, baseline.userGrants ?? {});
   const dirty = Object.keys(settingsPatch).length > 0 || capabilityReviewNeeded;
   dirtyRef.current = dirty;
   const fieldErrors = shareSettingsFieldErrors(effectiveDraft);
@@ -247,18 +272,26 @@ function ShareSettingsForm({
   const save = async () => {
     if (!editable || busy || savingRef.current || pendingEditId || formInvalid || !dirty || share.activeEdit?.status === "pending") return;
     savingRef.current = true;
+    const auth = readShareApiCredentials();
     setBusy(true);
     setError("");
     setNotice("");
     try {
-      let reviewedDraft = effectiveDraft;
+      let patch = settingsPatch;
+      let operationId: string | undefined;
       if (capabilityReviewNeeded) {
-        if (!capabilitiesRef.current) throw new Error("Capability editor is unavailable");
-        const approval = await capabilitiesRef.current.review();
-        if (!approval) return;
-        reviewedDraft = { ...effectiveDraft, capabilityPolicy: approval.policy, capabilityConsent: approval.consent };
+        const reviewed = await prepareGrantSettingsAttempt({
+          previous: grantSaveAttempt.current, request: previewSharePageGrantCapabilities,
+          shareId: share.shareId, revision: baseline.configRevision ?? 0, patch,
+          login: JSON.stringify(auth), zh: locale.startsWith("zh"),
+        });
+        if (!reviewed) return;
+        grantSaveAttempt.current = reviewed;
+        patch = reviewed.patch;
+        operationId = reviewed.operationId;
       }
-      const result = await updateSharePageSettings(buildShareSettingsPatch(reviewedDraft, baseline), baseline.configRevision);
+      const result = await updateSharePageSettings(patch, baseline.configRevision, operationId, auth);
+      grantSaveAttempt.current = undefined;
       if (result.appliedSynchronously) refreshAfterSaveRef.current = true;
       else setPendingEditId(result.edit.id);
       setNotice(
@@ -268,6 +301,9 @@ function ShareSettingsForm({
       );
       await onSaved();
     } catch (err) {
+      if (err instanceof ShareApiError && err.status < 500 && err.status !== 408) {
+        grantSaveAttempt.current = undefined;
+      }
       setError(err instanceof Error ? err.message : String(err));
       await onSaved().catch(() => undefined);
     } finally {
@@ -283,7 +319,7 @@ function ShareSettingsForm({
       {dirty && baseline.configRevision !== share.configRevision ? (
         <Alert status="warning">
           {t("dashboard.shareEditRemoteChanged")}
-          <Button variant="ghost" onClick={() => { dirtyRef.current = false; setReloadKey((value) => value + 1); }} isDisabled={busy}>
+          <Button variant="ghost" onClick={() => { grantSaveAttempt.current = undefined; dirtyRef.current = false; setReloadKey((value) => value + 1); }} isDisabled={busy}>
             {t("common.reset")}
           </Button>
         </Alert>
@@ -309,12 +345,6 @@ function ShareSettingsForm({
         </label>
       </div>
 
-      {editable ? <ShareCapabilitiesEditor shareId={share.shareId} revision={baseline.configRevision ?? 0}
-        policy={draft.capabilityPolicy} savedPolicy={baseline.capabilityPolicy} grants={draft.userGrants}
-        tokenLimit={effectiveDraft.tokenLimit} disabled={busy || !!pendingEditId} previewCapabilities={previewSharePageCapabilities} reviewRef={capabilitiesRef}
-        onChange={capabilityPolicy => setDraft(current => ({ ...current, capabilityPolicy, capabilityConsent: undefined,
-          userGrants: reconcileCapabilityGrants(capabilityPolicy, current.userGrants),
-        }))} /> : null}
 
       <ShareAccessQuotaSection
         t={t}
@@ -395,7 +425,8 @@ function ShareSettingsForm({
         }
         users={
           editable ? (
-            <ShareUserGrantsEditor independentCapabilities={!!draft.capabilityPolicy} shareOperations={draft.capabilityPolicy?.allowedOperations}
+            <ShareUserGrantsEditor grantCapabilities={baseline.grantCapabilityPolicy} shareTokenLimit={effectiveDraft.tokenLimit}
+              grantCapabilityRequest={previewSharePageGrantCapabilities} configRevision={baseline.configRevision}
               value={draft.userGrants}
               ownerEmail={share.ownerEmail || ""}
               defaultPolicy={defaultUserPolicy}
@@ -409,7 +440,7 @@ function ShareSettingsForm({
               onValueUsageInitializationsChange={(userValueUsageInitializations) => setDraft((current) => ({ ...current, userValueUsageInitializations }))}
               onUsageEditsChange={(userUsageEdits) => setDraft((current) => ({ ...current, userUsageEdits }))}
               onChange={(userGrants) =>
-                setDraft((current) => ({ ...current, capabilityConsent: undefined, userGrants: current.capabilityPolicy ? reconcileCapabilityGrants(current.capabilityPolicy, userGrants) : userGrants }))
+                setDraft((current) => ({ ...current, capabilityConsent: undefined, userGrants }))
               }
               freeAccess={draft.freeAccess}
             />
@@ -536,6 +567,7 @@ export function SharePage() {
               </div>
             </div>
             <ShareSettingsForm share={share} editable={editable} onSaved={load} />
+            {auth?.canManage ? <SharePageRequestLogs key={share.shareId} shareId={share.shareId} login={JSON.stringify(loadedCredentials.current)} /> : null}
           </section>
         ) : null}
       </div>

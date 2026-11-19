@@ -3657,6 +3657,7 @@ impl AppStore {
                 "resourceValueQuotaV2".into(),
                 "quotaUnitConversionV1".into(),
                 "shareCapabilityPolicyV1".into(),
+                "shareGrantCapabilitiesV1".into(),
                 "shareTerminationV1".into(),
                 "providerIdentityV1".into(),
                 "buddyQuotaPresentationV1".into(),
@@ -9147,7 +9148,7 @@ impl AppStore {
         let is_online =
             share.share_status == "active" && active_subdomains.contains(&share.subdomain);
         let active_requests = inflight_by_share.get(&share.share_id).copied().unwrap_or(0);
-        let visible_user_grants = if can_manage {
+        let mut visible_user_grants = if can_manage {
             share.user_grants.clone()
         } else {
             viewer_email
@@ -9160,6 +9161,15 @@ impl AppStore {
                 })
                 .unwrap_or_default()
         };
+        if !can_manage && share.contract_version == crate::models::GRANT_CAPABILITY_CONTRACT_VERSION
+        {
+            for grant in visible_user_grants.values_mut() {
+                grant
+                    .policy
+                    .allowed_operations
+                    .clone_from(&grant.effective_operations);
+            }
+        }
         let (tokens_used_by_app, requests_count_by_app) = authoritative_share_usage_by_app(&share);
         let health_now = Utc::now();
         let model_health_status = model_health::current_status(
@@ -9180,6 +9190,8 @@ impl AppStore {
             &model_health_status,
         )?;
         let mut view = ShareView {
+            grant_capability_policy: share.contract_version
+                == crate::models::GRANT_CAPABILITY_CONTRACT_VERSION,
             model_health_status,
             live_model_health_status,
             provider_identity: crate::provider_presentation::identity_for_share(&share),
@@ -11654,7 +11666,7 @@ impl AppStore {
         current_user_email: &str,
         patch: ShareSettingsPatch,
     ) -> Result<ShareSettingsUpdateResponse, AppError> {
-        self.create_share_settings_edit_at_revision(share_id, current_user_email, patch, None)
+        self.create_share_settings_edit_at_revision(share_id, current_user_email, patch, None, None)
             .await
     }
 
@@ -11664,6 +11676,7 @@ impl AppStore {
         current_user_email: &str,
         patch: ShareSettingsPatch,
         base_config_revision: Option<u64>,
+        operation_id: Option<Uuid>,
     ) -> Result<ShareSettingsUpdateResponse, AppError> {
         let current_user_email = normalize_email(current_user_email)?;
         let now = Utc::now();
@@ -11677,6 +11690,7 @@ impl AppStore {
             user_grants_json,
             supported_user_token_periods_json,
             app_providers_json,
+            version,
         ): (
             String,
             String,
@@ -11686,13 +11700,14 @@ impl AppStore {
             String,
             String,
             String,
+            u16,
         ) = conn
             .query_row(
                 "SELECT installation_id, owner_email, COALESCE(free_access, 0),
                         COALESCE(bindings_json, '{}'), config_revision,
                         COALESCE(user_grants_json, '{}'),
                         COALESCE(supported_user_token_periods_json, '[]'),
-                        COALESCE(app_providers_json, '{}')
+                        COALESCE(app_providers_json, '{}'), share_access_policy_version
                  FROM shares WHERE share_id = ?1",
                 params![share_id],
                 |row| {
@@ -11705,6 +11720,7 @@ impl AppStore {
                         row.get(5)?,
                         row.get(6)?,
                         row.get(7)?,
+                        row.get(8)?,
                     ))
                 },
             )
@@ -11717,6 +11733,44 @@ impl AppStore {
                 "only share owner can edit share settings".into(),
             ));
         }
+        let id = operation_id.unwrap_or_else(Uuid::new_v4).to_string();
+        let request_fingerprint = operation_id.map(|_| {
+            let mut request = serde_json::json!([
+                share_id,
+                installation_id,
+                current_user_email,
+                base_config_revision,
+                patch
+            ]);
+            request.sort_all_objects();
+            hex::encode(Sha256::digest(request.to_string()))
+        });
+        if let Some(fingerprint) = &request_fingerprint {
+            let existing = conn
+                .query_row(
+                    "SELECT request_fingerprint FROM share_edit_requests WHERE id = ?1",
+                    params![id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map_err(|error| AppError::Internal(error.to_string()))?;
+            if let Some(existing) = existing {
+                if existing.as_ref() != Some(fingerprint) {
+                    return Err(AppError::Conflict(
+                        "settings operationId was reused with a different payload".into(),
+                    ));
+                }
+                let edit = get_share_edit_by_id(&conn, &id)?
+                    .ok_or_else(|| AppError::Internal("saved Share edit is missing".into()))?;
+                return Ok(ShareSettingsUpdateResponse {
+                    ok: true,
+                    applied_synchronously: edit.status == "applied",
+                    edit,
+                    quota_conversions: Vec::new(),
+                    value_quota_statuses: Vec::new(),
+                });
+            }
+        }
         if base_config_revision.is_some_and(|base| base != current_config_revision.max(0) as u64) {
             return Err(AppError::Conflict(
                 "share settings changed after this editor was opened; reload and try again".into(),
@@ -11727,6 +11781,39 @@ impl AppStore {
         let current_app_providers = parse_app_providers(Some(app_providers_json))
             .map_err(|e| AppError::Internal(format!("parse share app providers failed: {e}")))?;
         let supported_apps = supported_apps_from_providers(&current_app_providers);
+        let mut patch = patch;
+        let grant_policy = version == crate::models::GRANT_CAPABILITY_CONTRACT_VERSION;
+        if grant_policy {
+            if patch.capability_policy.is_some() || patch.grok_media_policy.is_some() {
+                return Err(AppError::Conflict("CAPABILITY_UPGRADE_REQUIRED".into()));
+            }
+            let normalize_terms = |policy: &mut crate::models::ShareUserPolicy| {
+                policy.allowed_operations = None;
+                if let Some(quota) = &mut policy.value_quota {
+                    quota.unpriced_usage = crate::share_value_pricing::UnpricedUsage::Reject;
+                }
+            };
+            if let Some(edits) = &mut patch.user_grant_edits {
+                edits
+                    .values_mut()
+                    .filter_map(|edit| edit.policy.as_mut())
+                    .for_each(normalize_terms);
+            }
+            if let Some(grants) = &mut patch.user_grants {
+                if grants.values().any(|grant| {
+                    grant.manager == crate::models::ShareGrantManager::RouterShareMarket
+                }) {
+                    return Err(AppError::Forbidden(
+                        "Share Market managed users are read-only".into(),
+                    ));
+                }
+                grants
+                    .values_mut()
+                    .for_each(|grant| normalize_terms(&mut grant.policy));
+            }
+        } else if patch.grant_capability_edits.is_some() {
+            return Err(AppError::Conflict("CAPABILITY_UPGRADE_REQUIRED".into()));
+        }
         let mut patch = normalize_share_settings_patch(
             patch,
             Some(&owner_email),
@@ -11772,13 +11859,13 @@ impl AppStore {
             )));
         }
         let revision = next_share_edit_revision(&conn, share_id)?;
-        let id = Uuid::new_v4().to_string();
         patch.edit_context = Some(crate::models::ShareSettingsEditContext {
             operation_id: id.clone(),
             expected_config_revision: base_config_revision
                 .unwrap_or(current_config_revision.max(0) as u64),
             actor: (patch.user_value_usage_initializations.is_some()
-                || patch.user_quota_conversions.is_some())
+                || patch.user_quota_conversions.is_some()
+                || patch.capability_consent.is_some())
             .then(|| current_user_email.clone()),
         });
         let patch_json = serde_json::to_string(&patch).map_err(|e| {
@@ -11787,8 +11874,8 @@ impl AppStore {
         conn.execute(
             "INSERT INTO share_edit_requests (
                 id, share_id, installation_id, owner_email, revision, status, patch_json,
-                created_by_email, created_at, updated_at, applied_at, error_message
-             ) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7, ?8, ?8, NULL, NULL)",
+                created_by_email, created_at, updated_at, applied_at, error_message, request_fingerprint
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7, ?8, ?8, NULL, NULL, ?9)",
             params![
                 id,
                 share_id,
@@ -11798,6 +11885,7 @@ impl AppStore {
                 patch_json,
                 current_user_email,
                 now.to_rfc3339(),
+                request_fingerprint,
             ],
         )
         .map_err(|e| AppError::Internal(format!("insert share settings edit failed: {e}")))?;
@@ -12904,7 +12992,7 @@ impl AppStore {
                     .get(&share.share_id)
                     .cloned()
                     .unwrap_or_default();
-                let visible_user_grants = if can_manage {
+                let mut visible_user_grants = if can_manage {
                     share.user_grants.clone()
                 } else {
                     viewer_email
@@ -12917,7 +13005,19 @@ impl AppStore {
                         })
                         .unwrap_or_default()
                 };
+                if !can_manage
+                    && share.contract_version == crate::models::GRANT_CAPABILITY_CONTRACT_VERSION
+                {
+                    for grant in visible_user_grants.values_mut() {
+                        grant
+                            .policy
+                            .allowed_operations
+                            .clone_from(&grant.effective_operations);
+                    }
+                }
                 let mut view = ShareView {
+                    grant_capability_policy: share.contract_version
+                        == crate::models::GRANT_CAPABILITY_CONTRACT_VERSION,
                     live_model_health_status: live_model_health_status_by_share
                         .get(&share.share_id)
                         .cloned()
@@ -16066,15 +16166,15 @@ fn normalize_share_descriptor_fields(share: &mut ShareDescriptor) -> Result<(), 
             share.contract_version, MIN_SHARE_CONTRACT_VERSION, SHARE_CONTRACT_VERSION
         )));
     }
-    if share.contract_version >= 13 && share.capability_policy.is_none() {
+    if share.contract_version == 13 && share.capability_policy.is_none() {
         return Err(AppError::BadRequest("v13 requires capabilityPolicy".into()));
     }
 
     if let Some(policy) = &share.capability_policy {
         policy.validate().map_err(AppError::BadRequest)?;
-        if share.contract_version < 13 {
+        if share.contract_version != 13 {
             return Err(AppError::BadRequest(
-                "capability policy requires contract v13".into(),
+                "Share-level capability policy requires contract v13".into(),
             ));
         }
     }
@@ -16082,6 +16182,25 @@ fn normalize_share_descriptor_fields(share: &mut ShareDescriptor) -> Result<(), 
     share.token_limit = normalize_share_limit_value(share.token_limit);
     for grant in share.user_grants.values() {
         validate_share_user_policy(&grant.policy, Utc::now().timestamp_millis())?;
+        if share.contract_version == crate::models::GRANT_CAPABILITY_CONTRACT_VERSION {
+            let operations = grant.effective_operations.as_deref().ok_or_else(|| {
+                AppError::BadRequest("v14 grant must project effectiveOperations".into())
+            })?;
+            crate::share_capabilities::validate_operations(operations)
+                .map_err(AppError::BadRequest)?;
+            let intent = grant
+                .policy
+                .allowed_operations
+                .as_deref()
+                .unwrap_or_default();
+            if (!grant.active && !operations.is_empty())
+                || operations.iter().any(|op| !intent.contains(op))
+            {
+                return Err(AppError::BadRequest(
+                    "effectiveOperations exceeds grant intent".into(),
+                ));
+            }
+        }
         if let Some(operation) = &grant.quota_conversion_id {
             if operation.is_empty()
                 || operation.len() > 128
@@ -17145,8 +17264,17 @@ fn upsert_share_tx(
     mut share: ShareDescriptor,
 ) -> Result<(), AppError> {
     normalize_share_descriptor_fields(&mut share)?;
-    let adopted:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM shares WHERE share_id=?1 AND capability_policy_json IS NOT NULL)",params![share.share_id],|r|r.get(0)).map_err(|e|AppError::Internal(e.to_string()))?;
-    if adopted && share.capability_policy.is_none() {
+    let previous_version: Option<i64> = conn
+        .query_row(
+            "SELECT share_access_policy_version FROM shares WHERE share_id=?1",
+            params![share.share_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    if previous_version
+        .is_some_and(|version| version >= 13 && version > i64::from(share.contract_version))
+    {
         return Err(AppError::Conflict("CAPABILITY_UPGRADE_REQUIRED".into()));
     }
     let stored_apps = stored_provider_presentation(conn, &share.share_id)?;
@@ -22792,7 +22920,7 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppE
                     COALESCE(s.grok_image_generation_enabled, 0),
                     COALESCE(s.grok_image_edit_enabled, 0),
                     COALESCE(s.grok_video_generation_enabled, 0), s.market_entitlements_json,
-                    s.termination_archive_since_ms, s.capability_policy_json
+                    s.termination_archive_since_ms, s.capability_policy_json, s.share_access_policy_version
              FROM shares s
              INNER JOIN installations i ON i.id = s.installation_id
              WHERE i.lifecycle = 'active'
@@ -22819,11 +22947,10 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppE
                         })?,
                     // Stored legacy access-policy markers can be zero. This is
                     // a reconstructed reader projection, not an incoming descriptor.
-                    contract_version: if row.get::<_, Option<String>>(39)?.is_some() {
-                        SHARE_CONTRACT_VERSION
-                    } else {
-                        12
-                    },
+                    contract_version: u16::try_from(row.get::<_, i64>(40)?)
+                        .ok()
+                        .filter(|version| *version >= MIN_SHARE_CONTRACT_VERSION)
+                        .unwrap_or(12),
                     share_id: row.get(1)?,
                     capacity_pool_id: row.get(25)?,
                     share_name: row.get(2)?,
@@ -23078,6 +23205,7 @@ fn share_settings_patch_is_empty(patch: &ShareSettingsPatch) -> bool {
         && patch.grok_media_policy.is_none()
         && patch.capability_policy.is_none()
         && patch.capability_consent.is_none()
+        && patch.grant_capability_edits.is_none()
         && patch.support.is_none()
         && patch.user_grants.is_none()
         && patch.user_usage_edits.is_none()
@@ -23119,18 +23247,27 @@ fn validate_returned_share_against_patch(
     patch: &ShareSettingsPatch,
     share: &ShareDescriptor,
 ) -> Result<(), &'static str> {
+    let quota_terms = |grant: &ShareUserGrant| {
+        let mut policy = grant
+            .pending_value_quota
+            .as_ref()
+            .map(|pending| &pending.policy)
+            .unwrap_or(&grant.policy)
+            .clone();
+        if share.contract_version == crate::models::GRANT_CAPABILITY_CONTRACT_VERSION
+            && grant.manager != crate::models::ShareGrantManager::RouterShareMarket
+        {
+            policy.allowed_operations = None;
+        }
+        policy
+    };
     if let Some(edits) = &patch.user_grant_edits {
         for (email, edit) in edits {
             let returned = share.user_grants.get(email).filter(|grant| grant.active);
             match (&edit.policy, returned) {
                 (None, None) => {}
                 (Some(policy), Some(grant))
-                    if grant
-                        .pending_value_quota
-                        .as_ref()
-                        .map(|pending| &pending.policy)
-                        .unwrap_or(&grant.policy)
-                        == policy
+                    if quota_terms(grant) == *policy
                         && grant.manager != crate::models::ShareGrantManager::RouterShareMarket
                         && grant.revision >= edit.expected_revision => {}
                 _ => return Err("userGrantEdits"),
@@ -23228,6 +23365,23 @@ fn validate_returned_share_against_patch(
             return Err("client did not apply capability policy");
         }
     }
+    if let Some(edits) = &patch.grant_capability_edits {
+        if share.contract_version != crate::models::GRANT_CAPABILITY_CONTRACT_VERSION
+            || edits.iter().any(|(email, edit)| {
+                share.user_grants.get(email).is_none_or(|grant| {
+                    !grant.active
+                        || grant.revision <= edit.expected_revision
+                        || grant.manager == crate::models::ShareGrantManager::RouterShareMarket
+                        || grant.policy.allowed_operations.as_ref().is_none_or(|ops| {
+                            ops.len() != edit.operations.len()
+                                || !ops.iter().all(|op| edit.operations.contains(op))
+                        })
+                })
+            })
+        {
+            return Err("client did not apply grant capability policy");
+        }
+    }
     if let Some(grok_media_policy) = patch.grok_media_policy {
         if grok_media_policy != share.grok_media_policy {
             return Err("grokMediaPolicy");
@@ -23259,12 +23413,7 @@ fn validate_returned_share_against_patch(
             };
             if returned.email != expected.email
                 || returned.role != expected.role
-                || returned
-                    .pending_value_quota
-                    .as_ref()
-                    .map(|pending| &pending.policy)
-                    .unwrap_or(&returned.policy)
-                    != &expected.policy
+                || quota_terms(returned) != expected.policy
             {
                 return Err("userGrants");
             }
@@ -23482,6 +23631,45 @@ fn normalize_share_settings_patch(
             }
         }
     }
+    if let Some(edits) = &patch.grant_capability_edits {
+        if edits.is_empty()
+            || edits.len() > 500
+            || patch.capability_consent.is_none()
+            || patch.user_grants.is_some()
+        {
+            return Err(AppError::BadRequest(
+                "invalid grant capability edits".into(),
+            ));
+        }
+        for (email, edit) in edits {
+            if normalize_email(email)? != *email {
+                return Err(AppError::BadRequest(
+                    "grant capability keys must be normalized emails".into(),
+                ));
+            }
+            edit.validate().map_err(AppError::BadRequest)?;
+            let previous = existing_user_grants.and_then(|grants| grants.get(email));
+            if previous.is_some_and(|g| {
+                g.active && g.manager == crate::models::ShareGrantManager::RouterShareMarket
+            }) {
+                return Err(AppError::Forbidden(
+                    "Share Market managed users are read-only".into(),
+                ));
+            }
+            let quota_edit = patch
+                .user_grant_edits
+                .as_ref()
+                .and_then(|edits| edits.get(email));
+            if previous.map_or(0, |g| g.revision) != edit.expected_revision
+                || !quota_edit.map_or_else(
+                    || previous.is_some_and(|g| g.active),
+                    |e| e.policy.is_some(),
+                )
+            {
+                return Err(AppError::Conflict("CAPABILITY_STATE_CHANGED".into()));
+            }
+        }
+    }
     if let Some(conversions) = &patch.user_quota_conversions {
         if conversions.is_empty() || conversions.len() > 500 {
             return Err(AppError::BadRequest(
@@ -23630,6 +23818,7 @@ fn normalize_share_settings_patch(
         grok_media_policy: patch.grok_media_policy,
         capability_policy: patch.capability_policy,
         capability_consent: patch.capability_consent,
+        grant_capability_edits: patch.grant_capability_edits,
         support,
         user_grants,
         user_usage_edits: patch.user_usage_edits,
@@ -35968,6 +36157,7 @@ pub(crate) mod tests {
 
     fn test_share_user_grant(email: &str, role: &str, token_limit: u64) -> ShareUserGrant {
         ShareUserGrant {
+            effective_operations: None,
             quota_conversion_id: None,
             value_metering: None,
             pending_value_quota: None,
@@ -36500,6 +36690,139 @@ pub(crate) mod tests {
         assert_eq!(
             validate_returned_share_against_patch(&patch, &returned),
             Err("userGrants")
+        );
+    }
+
+    #[test]
+    fn returned_v14_grant_verifies_permissions_and_quota_terms_independently() {
+        use crate::share_capabilities::{GrantCapabilityEdit, ShareOperation};
+
+        let email = "user@example.com";
+        let mut grant = test_share_user_grant(email, "shareto", 500);
+        let patch = ShareSettingsPatch {
+            user_grant_edits: Some(BTreeMap::from([(
+                email.to_string(),
+                crate::models::ShareUserGrantEdit {
+                    policy: Some(grant.policy.clone()),
+                    expected_revision: 1,
+                },
+            )])),
+            grant_capability_edits: Some(BTreeMap::from([(
+                email.to_string(),
+                GrantCapabilityEdit {
+                    operations: vec![ShareOperation::WebSearch],
+                    reconfirm: vec![],
+                    expected_revision: 1,
+                },
+            )])),
+            ..Default::default()
+        };
+        grant.revision = 2;
+        grant.policy.allowed_operations = Some(vec![ShareOperation::WebSearch]);
+        grant.effective_operations = Some(vec![ShareOperation::WebSearch]);
+        let mut descriptor = test_share_descriptor("share-grant", "share-grant-sub");
+        descriptor.contract_version = crate::models::GRANT_CAPABILITY_CONTRACT_VERSION;
+        descriptor.user_grants.insert(email.to_string(), grant);
+        normalize_share_descriptor_fields(&mut descriptor).unwrap();
+        assert_eq!(
+            validate_returned_share_against_patch(&patch, &descriptor),
+            Ok(())
+        );
+
+        let grant = descriptor.user_grants.get_mut(email).unwrap();
+        grant.effective_operations = Some(vec![ShareOperation::ImageGenerate]);
+        assert!(normalize_share_descriptor_fields(&mut descriptor).is_err());
+        let grant = descriptor.user_grants.get_mut(email).unwrap();
+        grant.policy.token_limit = Some(501);
+        assert_eq!(
+            validate_returned_share_against_patch(&patch, &descriptor),
+            Err("userGrantEdits")
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_share_settings_operation_replays_before_the_revision_check() {
+        let (store, _) = setup_store("share-edit-replay").await;
+        insert_installation(&store, "inst-edit-replay").await;
+        let share_id = "share-edit-replay";
+        insert_share(
+            &store,
+            "inst-edit-replay",
+            share_id,
+            "share-edit-replay-sub",
+            "active",
+        )
+        .await;
+        let email = "owner@example.com";
+        let operation = Uuid::new_v4();
+        let patch = ShareSettingsPatch {
+            token_limit: Some(100),
+            ..Default::default()
+        };
+        let base = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT config_revision FROM shares WHERE share_id = ?1",
+                params![share_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let original = store
+            .create_share_settings_edit_at_revision(
+                share_id,
+                email,
+                patch.clone(),
+                Some(base),
+                Some(operation),
+            )
+            .await
+            .unwrap();
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET config_revision = config_revision + 1 WHERE share_id = ?1",
+                params![share_id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE share_edit_requests SET status = 'applied' WHERE id = ?1",
+                params![original.edit.id],
+            )
+            .unwrap();
+        }
+        let replay = store
+            .create_share_settings_edit_at_revision(
+                share_id,
+                email,
+                patch,
+                Some(base),
+                Some(operation),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.edit.id, original.edit.id);
+        assert!(replay.applied_synchronously);
+        let different = ShareSettingsPatch {
+            token_limit: Some(200),
+            ..Default::default()
+        };
+        let error = store
+            .create_share_settings_edit_at_revision(
+                share_id,
+                email,
+                different,
+                Some(base),
+                Some(operation),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("reused with a different payload")
         );
     }
 
@@ -41866,7 +42189,7 @@ pub(crate) mod tests {
         for version in 6..=SHARE_CONTRACT_VERSION {
             let mut descriptor = test_share_descriptor("share-readable", "share-readable-sub");
             descriptor.contract_version = version;
-            if version >= 13 {
+            if version == 13 {
                 descriptor.capability_policy = Some(Default::default());
             }
             normalize_share_descriptor_fields(&mut descriptor)

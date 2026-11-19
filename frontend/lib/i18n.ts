@@ -35,6 +35,15 @@ export type MessageKey = keyof typeof messages.en;
 
 export const messages = {
   en: {
+    "dashboard.grantMedia.title": "Media generation and tools",
+    "dashboard.grantMedia.selectedCount": "Media and tools · {count}",
+    "dashboard.grantMedia.marketPermission": "Permissions set by purchase",
+    "dashboard.grantMedia.loading": "Loading available operations…",
+    "dashboard.grantMedia.unavailable": "Available operations could not be confirmed.",
+    "dashboard.grantMedia.reconfirm": "Entry points changed. Confirm to allow.",
+    "dashboard.grantMedia.remove": "Unavailable. You can remove permission.",
+    "dashboard.grantMedia.tokenHint": "Token limits do not cover media quantities or tool calls.",
+    "dashboard.grantMedia.usdHint": "Usage debits the USD limit. Requests without a price are rejected.",
     "quota.buddy.packagesUnavailable": "Resource package data is unavailable",
     "quota.buddy.buddyRegistrationCredits": "Registration reward",
     "quota.buddy.buddyCheckinCredits": "Check-in",
@@ -3641,6 +3650,15 @@ export const messages = {
     ...providerRankMessagesEn,
   },
   "zh-CN": {
+    "dashboard.grantMedia.title": "媒体生成与工具",
+    "dashboard.grantMedia.selectedCount": "媒体与工具已开启 {count} 项",
+    "dashboard.grantMedia.marketPermission": "权限由购买套餐决定",
+    "dashboard.grantMedia.loading": "正在读取可用操作…",
+    "dashboard.grantMedia.unavailable": "暂时无法确认可用操作。",
+    "dashboard.grantMedia.reconfirm": "入口有变化，确认后开放",
+    "dashboard.grantMedia.remove": "暂不可用，可关闭授权",
+    "dashboard.grantMedia.tokenHint": "图片张数、视频时长和工具次数不受 Token 限额控制。",
+    "dashboard.grantMedia.usdHint": "按实际用量扣美元额度，缺价会拒绝调用。",
     "quota.buddy.packagesUnavailable": "资源包数据暂不可用",
     "quota.buddy.buddyRegistrationCredits": "注册积分奖励",
     "quota.buddy.buddyCheckinCredits": "签到",

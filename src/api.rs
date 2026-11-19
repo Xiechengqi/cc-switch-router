@@ -71,14 +71,13 @@ use crate::models::{
     ShareEditEventSignaturePayload, ShareHeartbeatRequest, ShareModelHealthCalendarResponse,
     SharePendingEditsRequest, SharePruneRequest, ShareRequestLogBatchSyncRequest,
     ShareRequestLogBatchSyncResponse, ShareRequestLogEntry, ShareRuntimeRefreshRequest,
-    ShareSettingsPatch, ShareSettingsUpdateRequest, ShareSyncRequest,
-    SubdomainAvailabilityResponse, TelegramBindLinkResponse, TunnelActivateRequest,
-    TunnelStateRequest, TunnelStateResponse, UpdateNotificationSettingsRequest,
-    UpdateUsageCardSettingsRequest, UpgradeInstallationRequest, UpgradeInstallationResponse,
-    UpgradeInstallationStatusResponse, UsageCardSettingsResponse, UserApiTokenResetResponse,
-    UserApiTokenResponse, UserModelRoutingTestHttp, UserModelRoutingTestRequest,
-    UserModelRoutingTestResponse, UserSharesResponse, VerifyEmailCodeRequest,
-    VerifyEmailCodeResponse,
+    ShareSettingsUpdateRequest, ShareSyncRequest, SubdomainAvailabilityResponse,
+    TelegramBindLinkResponse, TunnelActivateRequest, TunnelStateRequest, TunnelStateResponse,
+    UpdateNotificationSettingsRequest, UpdateUsageCardSettingsRequest, UpgradeInstallationRequest,
+    UpgradeInstallationResponse, UpgradeInstallationStatusResponse, UsageCardSettingsResponse,
+    UserApiTokenResetResponse, UserApiTokenResponse, UserModelRoutingTestHttp,
+    UserModelRoutingTestRequest, UserModelRoutingTestResponse, UserSharesResponse,
+    VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 use crate::notifications::{
     ClientNotificationDeliveriesResponse, ClientNotificationPolicy, NotificationTemplateContext,
@@ -427,6 +426,11 @@ pub fn router(state: ServerState) -> Router {
         .route(
             "/share-api/share/capability-preview",
             post(share_api_capability_preview),
+        )
+        .route("/share-api/share/request-logs", get(share_api_request_logs))
+        .route(
+            "/share-api/share/request-metering",
+            post(share_api_request_metering),
         )
         .route(
             "/share-api/share/settings",
@@ -2132,14 +2136,7 @@ async fn share_api_update_settings(
         .user
         .map(|user| user.email)
         .ok_or_else(|| AppError::Unauthorized("api token required".into()))?;
-    let response = update_share_settings_with_email(
-        &state,
-        &share_id,
-        &email,
-        input.patch,
-        input.base_config_revision,
-    )
-    .await?;
+    let response = update_share_settings_with_email(&state, &share_id, &email, input).await?;
     Ok(Json(response))
 }
 
@@ -2161,6 +2158,57 @@ async fn share_api_capability_preview(
     }
     let result =
         crate::share_value_quotas::forward_capability_preview(&state, share_id, input).await?;
+    Ok(([(header::CACHE_CONTROL, "private, no-store")], Json(result)))
+}
+
+async fn share_api_request_logs(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<ShareApiAuthQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let route = share_route_from_headers(&state, &headers).await?;
+    let share_id = route
+        .share_id()
+        .ok_or_else(|| AppError::NotFound("share route not found".into()))?;
+    let auth = share_api_auth_response(&state, &headers, share_id, query.email.as_deref()).await?;
+    if !auth.can_manage {
+        return Err(AppError::Forbidden(
+            "only the Share owner can view request details here".into(),
+        ));
+    }
+    let mut page = state
+        .store
+        .list_share_request_logs_page(share_id, None, None, None, None, 10)
+        .await?;
+    remove_share_request_session_ids(&mut page.logs);
+    Ok((
+        [(header::CACHE_CONTROL, "private, no-store")],
+        Json(ShareRequestLogsResponse {
+            logs: page.logs,
+            next_cursor: page.next_cursor,
+            has_more: page.has_more,
+        }),
+    ))
+}
+
+async fn share_api_request_metering(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<ShareApiAuthQuery>,
+    Json(input): Json<crate::share_value_quotas::RequestMeteringInput>,
+) -> Result<impl IntoResponse, AppError> {
+    let route = share_route_from_headers(&state, &headers).await?;
+    let share_id = route
+        .share_id()
+        .ok_or_else(|| AppError::NotFound("share route not found".into()))?;
+    let auth = share_api_auth_response(&state, &headers, share_id, query.email.as_deref()).await?;
+    if !auth.can_manage {
+        return Err(AppError::Forbidden(
+            "only the Share owner can view request metering here".into(),
+        ));
+    }
+    let result =
+        crate::share_value_quotas::forward_request_metering(&state, share_id, input).await?;
     Ok(([(header::CACHE_CONTROL, "private, no-store")], Json(result)))
 }
 
@@ -6132,14 +6180,7 @@ async fn update_share_settings(
 ) -> Result<Json<crate::models::ShareSettingsUpdateResponse>, AppError> {
     let current_user_email = require_user_email(&state, &headers, "share:write").await?;
     Ok(Json(
-        update_share_settings_with_email(
-            &state,
-            &share_id,
-            &current_user_email,
-            input.patch,
-            input.base_config_revision,
-        )
-        .await?,
+        update_share_settings_with_email(&state, &share_id, &current_user_email, input).await?,
     ))
 }
 
@@ -6663,18 +6704,43 @@ async fn update_share_settings_with_email(
     state: &ServerState,
     share_id: &str,
     current_user_email: &str,
-    patch: ShareSettingsPatch,
-    base_config_revision: Option<u64>,
+    input: ShareSettingsUpdateRequest,
 ) -> Result<crate::models::ShareSettingsUpdateResponse, AppError> {
     let mut response = state
         .store
         .create_share_settings_edit_at_revision(
             share_id,
             current_user_email,
-            patch,
-            base_config_revision,
+            input.patch,
+            input.base_config_revision,
+            input.operation_id,
         )
         .await?;
+
+    match response.edit.status.as_str() {
+        "pending" => {}
+        "applied" => {
+            if response.edit.patch.user_quota_conversions.is_some() {
+                response.quota_conversions = state
+                    .store
+                    .share_quota_conversion_receipts_for_owner(
+                        share_id,
+                        &response.edit.id,
+                        current_user_email,
+                    )
+                    .await?;
+            }
+            return Ok(response);
+        }
+        _ => {
+            return Err(AppError::UnprocessableEntity(
+                response
+                    .edit
+                    .error_message
+                    .unwrap_or_else(|| format!("Share settings edit is {}", response.edit.status)),
+            ));
+        }
+    }
 
     // Happy path: if the owning installation is online and supports the control
     // API, apply the (normalized) patch synchronously by calling the client's

@@ -1,3 +1,4 @@
+import { changedGrantCapabilities } from "@/lib/share-grant-capabilities";
 import { preservesCapabilitySchedule } from "./share-capabilities";
 import type {ShareCapabilityPolicy,CapabilityConsent} from "./share-capabilities";
 import type {
@@ -154,7 +155,7 @@ export function draftFromShare(share: ShareView): ShareSettingsDraft {
       ...grant,
       email,
       role: email === ownerEmail ? "owner" : "shareto",
-      policy: grant.pendingValueQuota?.policy ?? grant.policy,
+      policy: share.grantCapabilityPolicy ? grant.policy : grant.pendingValueQuota?.policy ?? grant.policy,
     };
   }
   const defaultPolicy = defaultUserPolicy(share);
@@ -199,7 +200,7 @@ export function buildShareSettingsPatch(
   });
   const baseline = full(draftFromShare(share));
   baseline.userGrants = { ...share.userGrants, ...baseline.userGrants };
-  return changedShareSettings(full(draft), baseline, draft.userUsageEdits, draft.userValueUsageInitializations);
+  return changedShareSettings(full(draft), baseline, draft.userUsageEdits, draft.userValueUsageInitializations, share.grantCapabilityPolicy);
 }
 
 /** Every policy field the Server enforces, USD quota included. */
@@ -214,9 +215,10 @@ export function sharePolicyFingerprint(policy: ShareUserPolicy) {
  * The policy plus its scheduled USD policy: dropping a schedule (see
  * `stageUserPolicy`) is an edit even when the policy itself is unchanged.
  */
-function grantPolicyFingerprint(grant: ShareUserGrant) {
-  return JSON.stringify([sharePolicyFingerprint(grant.policy),
-    grant.pendingValueQuota?.policy ? sharePolicyFingerprint(grant.pendingValueQuota.policy) : null]);
+function grantPolicyFingerprint(grant: ShareUserGrant, grantCapabilities: boolean) {
+  const policy = grantCapabilities ? grantQuotaTerms : (value: ShareUserPolicy) => value;
+  return JSON.stringify([sharePolicyFingerprint(policy(grant.policy)),
+    grant.pendingValueQuota?.policy ? sharePolicyFingerprint(policy(grant.pendingValueQuota.policy)) : null]);
 }
 
 /**
@@ -231,7 +233,15 @@ export function stageUserPolicy(grant: ShareUserGrant, policy: ShareUserPolicy, 
   };
 }
 
-export function changedUserGrants(next: ShareUserGrantMap, baseline: ShareUserGrantMap): NonNullable<ShareSettingsPatch["userGrantEdits"]> {
+export function grantQuotaTerms(policy: ShareUserPolicy): ShareUserPolicy {
+  return {
+    ...policy,
+    allowedOperations: undefined,
+    ...(policy.valueQuota ? { valueQuota: { ...policy.valueQuota, unpricedUsage: "reject" } } : {}),
+  };
+}
+
+export function changedUserGrants(next: ShareUserGrantMap, baseline: ShareUserGrantMap, grantCapabilities = false): NonNullable<ShareSettingsPatch["userGrantEdits"]> {
   const edits: NonNullable<ShareSettingsPatch["userGrantEdits"]> = {};
   for (const email of [...new Set([...Object.keys(baseline), ...Object.keys(next)])].sort()) {
     const before = baseline[email];
@@ -239,17 +249,21 @@ export function changedUserGrants(next: ShareUserGrantMap, baseline: ShareUserGr
     if (isRouterShareMarketManagedGrant(before) || isRouterShareMarketManagedGrant(after)) continue;
     const wasActive = !!before && before.active !== false;
     const isActive = !!after && after.active !== false;
-    if (wasActive === isActive && (!isActive || grantPolicyFingerprint(before) === grantPolicyFingerprint(after))) continue;
-    edits[email] = { expectedRevision: before?.revision ?? 0, policy: isActive ? after.policy : null };
+    if (wasActive === isActive && (!isActive || grantPolicyFingerprint(before, grantCapabilities) === grantPolicyFingerprint(after, grantCapabilities))) continue;
+    edits[email] = { expectedRevision: before?.revision ?? 0, policy: isActive ? (grantCapabilities ? grantQuotaTerms(after.policy) : after.policy) : null };
   }
   return edits;
 }
 
-export function changedShareSettings(next: ShareSettingsPatch, baseline: ShareSettingsPatch, usageEdits: ShareUserUsageEditMap = {}, initializations: ShareUserValueUsageInitializationMap = {}): ShareSettingsPatch {
+export function changedShareSettings(next: ShareSettingsPatch, baseline: ShareSettingsPatch, usageEdits: ShareUserUsageEditMap = {}, initializations: ShareUserValueUsageInitializationMap = {}, grantCapabilities = false): ShareSettingsPatch {
   const patch = Object.fromEntries(Object.entries(next).filter(([key, value]) =>
     key !== "userGrants" && key !== "userUsageEdits" && key !== "userValueUsageInitializations" && JSON.stringify(value) !== JSON.stringify(baseline[key as keyof ShareSettingsPatch]),
   )) as ShareSettingsPatch;
-  const userGrantEdits = changedUserGrants(next.userGrants ?? {}, baseline.userGrants ?? {});
+  const userGrantEdits = changedUserGrants(next.userGrants ?? {}, baseline.userGrants ?? {}, grantCapabilities);
+  if (grantCapabilities) {
+    const edits = changedGrantCapabilities(next.userGrants ?? {}, baseline.userGrants ?? {});
+    if (Object.keys(edits).length) patch.grantCapabilityEdits = edits;
+  }
   if (Object.keys(userGrantEdits).length) patch.userGrantEdits = userGrantEdits;
   const activeUsageEdits = Object.fromEntries(Object.entries(usageEdits).filter(([email]) =>
     next.userGrants?.[email]?.active !== false && !!next.userGrants?.[email] && !isRouterShareMarketManagedGrant(next.userGrants[email])));

@@ -403,6 +403,9 @@ export type ShareUserUsageEditMap = Record<string, ShareUserUsageEdit>;
 
 export type ShareUserQuotaConversion = { credential: string; targetUsedPicos?: string; targetUsedTokens?: number; reason?: string };
 export type ShareUserGrant = {
+  /** Local draft only, sent as explicit permission intent when saved. */
+  reconfirmOperations?: import("./share-capabilities").ShareOperation[];
+  effectiveOperations?: import("./share-capabilities").ShareOperation[];
   quotaConversionId?: string;
   /** Local draft only; the save builder emits an explicit conversion input. */
   quotaUnitConversion?: ShareUserQuotaConversion;
@@ -429,6 +432,7 @@ export type ShareUserGrant = {
 export type ShareUserGrantMap = Record<string, ShareUserGrant>;
 
 export type ShareView = {
+  grantCapabilityPolicy?: boolean;
   capabilityPolicy?: ShareCapabilityPolicy;
   providerIdentity?: PublicProviderIdentity;
   routerId?: string;
@@ -522,6 +526,7 @@ export type ShareClientUnbanResponse = {
 };
 
 export type ShareSettingsPatch = {
+  grantCapabilityEdits?: Record<string, import("./share-grant-capabilities").GrantCapabilityEdit>;
   capabilityPolicy?: ShareCapabilityPolicy; capabilityConsent?: CapabilityConsent;
   expectedAccountCycle?: AccountQuotaCycle;
   ownerEmail?: string;

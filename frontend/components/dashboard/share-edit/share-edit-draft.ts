@@ -115,7 +115,7 @@ export function buildShareEditDraft(share: ShareView): ShareEditDraft {
 export function buildShareEditPatch(draft: ShareEditDraft, share: ShareView, activeShareApps: PriceApp[]): ShareSettingsPatch {
   const baseline = fullShareEditPatch(buildShareEditDraft(share), share);
   baseline.userGrants = { ...share.userGrants, ...baseline.userGrants };
-  return changedShareSettings(fullShareEditPatch(draft, share), baseline, draft.userUsageEdits, draft.userValueUsageInitializations);
+  return changedShareSettings(fullShareEditPatch(draft, share), baseline, draft.userUsageEdits, draft.userValueUsageInitializations, share.grantCapabilityPolicy);
 }
 
 function fullShareEditPatch(draft: ShareEditDraft, share: ShareView): ShareSettingsPatch {
