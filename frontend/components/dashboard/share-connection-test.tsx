@@ -11,6 +11,7 @@ import { useLocaleText } from "@/components/i18n/locale-provider";
 import { recoverShareAccountRateLimit, refreshShareUsage, testShareConnection } from "@/lib/api";
 import { SHARE_APP_LABELS } from "@/lib/share-app";
 import { buildShareProbeCurl } from "@/lib/share-model-probe";
+import { loadZenClaudeCodeCatalog, zenClaudeCodeCommand, type ZenClaudeCodeCatalog } from "@/lib/zen-claude-code";
 import { openShareLocalTest, SHARE_LOCAL_TEST_ORIGIN, shareLocalTestUnavailable } from "@/lib/share-local-test";
 import { forgetShareLocalTestConsent, hasShareLocalTestConsent, rememberShareLocalTestConsent } from "@/lib/share-local-test-consent";
 import type {
@@ -25,6 +26,88 @@ type TestOperation = "text" | "image_generation" | "image_edit" | "video_generat
 
 function runtimeForApp(share: ShareView, app: TestApp) {
   return share.appRuntimes?.[app];
+}
+
+function ZenClaudeCodeSetup({ baseUrl, apiToken, shareId, providerId, isCurrentActor, t }: {
+  baseUrl: string;
+  apiToken: string;
+  shareId: string;
+  providerId: string;
+  isCurrentActor: () => boolean;
+  t: TFn;
+}) {
+  const [catalog, setCatalog] = React.useState<ZenClaudeCodeCatalog>();
+  const [state, setState] = React.useState<"idle" | "loading" | "ready" | "error">("idle");
+  const [selectedId, setSelectedId] = React.useState("");
+  const request = React.useRef<AbortController | undefined>(undefined);
+  React.useEffect(() => () => request.current?.abort(), []);
+
+  const load = async () => {
+    if (!isCurrentActor() || request.current) return;
+    const controller = new AbortController();
+    request.current = controller;
+    setState("loading");
+    try {
+      const result = await loadZenClaudeCodeCatalog(baseUrl, window.location.host, apiToken, shareId, providerId, controller.signal);
+      if (!controller.signal.aborted && isCurrentActor()) {
+        setCatalog(result);
+        setSelectedId(result.models[0]?.id ?? "");
+        setState("ready");
+      }
+    } catch {
+      if (!controller.signal.aborted && isCurrentActor()) setState("error");
+    } finally {
+      if (request.current === controller) request.current = undefined;
+    }
+  };
+
+  const selected = state === "ready" ? catalog?.models.find(model => model.id === selectedId) : undefined;
+  return (
+    <details className="group" onToggle={event => {
+      if (event.currentTarget.open) {
+        void load();
+      } else {
+        request.current?.abort();
+        request.current = undefined;
+        setState("idle");
+      }
+    }}>
+      <summary className="cursor-pointer py-1 text-xs font-medium text-slate-700">
+        {t("dashboard.connectDialog.zenClaude.title")}
+      </summary>
+      <div className="grid gap-2 py-1 text-xs text-slate-600">
+        {state === "loading" ? <p role="status">{t("dashboard.connectDialog.zenClaude.loading")}</p> : null}
+        {(state === "error" || (state === "ready" && !selected)) ? (
+          <div className="flex items-center gap-2">
+            <p role="status">{t("dashboard.connectDialog.zenClaude.unavailable")}</p>
+            <Button size="sm" variant="ghost" onPress={() => void load()}>{t("common.retry")}</Button>
+          </div>
+        ) : null}
+        {selected && catalog ? (
+          <>
+            {catalog.fixed ? <p>{t("dashboard.connectDialog.test.policySingle", { model: selected.id })}</p> : (
+              <CompactSelect
+                value={selectedId}
+                onChange={setSelectedId}
+                ariaLabel={t("dashboard.connectDialog.zenClaude.model")}
+                options={catalog.models.map(model => ({ value: model.id, label: model.displayName }))}
+              />
+            )}
+            <p>{t("dashboard.connectDialog.zenClaude.hint")}</p>
+            <div className="flex items-center justify-between gap-2">
+              <span>{t("dashboard.connectDialog.zenClaude.start")}</span>
+              <InlineCopyButton t={t} value={zenClaudeCodeCommand(baseUrl, selected, false)} />
+            </div>
+            <pre className="max-h-44 overflow-auto rounded bg-slate-50 p-2 text-[11px]">{zenClaudeCodeCommand(baseUrl, selected, false)}</pre>
+            <div className="flex items-center justify-between gap-2">
+              <span>{t("dashboard.connectDialog.zenClaude.verify")}</span>
+              <InlineCopyButton t={t} value={zenClaudeCodeCommand(baseUrl, selected, true)} />
+            </div>
+          </>
+        ) : null}
+      </div>
+    </details>
+  );
 }
 
 function modelPolicyDescription(runtime: ShareUpstreamProvider | undefined, t: TFn) {
@@ -411,6 +494,18 @@ export function ShareConnectionTestRow({
             ? t("dashboard.connectDialog.test.refreshUsageError", { message: refreshMsg })
             : t("dashboard.connectDialog.test.refreshUsageOk", { target: refreshMsg })}
         </p>
+      ) : null}
+
+      {app === "claude" && runtime?.providerType === "opencode_zen" && canExecute && apiToken && baseUrl && share.bindings?.claude ? (
+        <ZenClaudeCodeSetup
+          key={JSON.stringify([baseUrl, share.shareId, share.bindings.claude, accountId, runtime.modelPolicy])}
+          baseUrl={baseUrl}
+          apiToken={apiToken}
+          shareId={share.shareId}
+          providerId={share.bindings.claude}
+          isCurrentActor={isCurrentActor}
+          t={t}
+        />
       ) : null}
 
       {operation === "text" && curlCmd ? (
