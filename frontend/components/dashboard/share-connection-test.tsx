@@ -11,7 +11,7 @@ import { useLocaleText } from "@/components/i18n/locale-provider";
 import { recoverShareAccountRateLimit, refreshShareUsage, testShareConnection } from "@/lib/api";
 import { SHARE_APP_LABELS } from "@/lib/share-app";
 import { buildShareProbeCurl } from "@/lib/share-model-probe";
-import { loadZenClaudeCodeCatalog, zenClaudeCodeCommand, type ZenClaudeCodeCatalog } from "@/lib/zen-claude-code";
+import { loadZenCliCatalog, zenClaudeCodeCommand, zenCodexCliCommand, ZenCliCatalogError, type ZenCliApp, type ZenCliCatalog } from "@/lib/zen-cli";
 import { openShareLocalTest, SHARE_LOCAL_TEST_ORIGIN, shareLocalTestUnavailable } from "@/lib/share-local-test";
 import { forgetShareLocalTestConsent, hasShareLocalTestConsent, rememberShareLocalTestConsent } from "@/lib/share-local-test-consent";
 import type {
@@ -28,7 +28,8 @@ function runtimeForApp(share: ShareView, app: TestApp) {
   return share.appRuntimes?.[app];
 }
 
-function ZenClaudeCodeSetup({ baseUrl, apiToken, shareId, providerId, isCurrentActor, t }: {
+function ZenCliSetup({ app, baseUrl, apiToken, shareId, providerId, isCurrentActor, t }: {
+  app: ZenCliApp;
   baseUrl: string;
   apiToken: string;
   shareId: string;
@@ -36,8 +37,10 @@ function ZenClaudeCodeSetup({ baseUrl, apiToken, shareId, providerId, isCurrentA
   isCurrentActor: () => boolean;
   t: TFn;
 }) {
-  const [catalog, setCatalog] = React.useState<ZenClaudeCodeCatalog>();
-  const [state, setState] = React.useState<"idle" | "loading" | "ready" | "error">("idle");
+  const [catalog, setCatalog] = React.useState<ZenCliCatalog>();
+  const text = app === "claude" ? "dashboard.connectDialog.zenClaude" : "dashboard.connectDialog.zenCodex";
+  const command = app === "claude" ? zenClaudeCodeCommand : zenCodexCliCommand;
+  const [state, setState] = React.useState<"idle" | "loading" | "ready" | "error" | ZenCliCatalogError["reason"]>("idle");
   const [selectedId, setSelectedId] = React.useState("");
   const request = React.useRef<AbortController | undefined>(undefined);
   React.useEffect(() => () => request.current?.abort(), []);
@@ -48,20 +51,25 @@ function ZenClaudeCodeSetup({ baseUrl, apiToken, shareId, providerId, isCurrentA
     request.current = controller;
     setState("loading");
     try {
-      const result = await loadZenClaudeCodeCatalog(baseUrl, window.location.host, apiToken, shareId, providerId, controller.signal);
+      const result = await loadZenCliCatalog(app, baseUrl, window.location.host, apiToken, shareId, providerId, controller.signal);
       if (!controller.signal.aborted && isCurrentActor()) {
         setCatalog(result);
         setSelectedId(result.models[0]?.id ?? "");
         setState("ready");
       }
-    } catch {
-      if (!controller.signal.aborted && isCurrentActor()) setState("error");
+    } catch (error) {
+      if (!controller.signal.aborted && isCurrentActor()) {
+        setState(error instanceof ZenCliCatalogError ? error.reason : "error");
+      }
     } finally {
       if (request.current === controller) request.current = undefined;
     }
   };
 
   const selected = state === "ready" ? catalog?.models.find(model => model.id === selectedId) : undefined;
+  const catalogError = state === "stale" || state === "bindingChanged"
+    ? t(`dashboard.connectDialog.zenCli.${state}`)
+    : state === "error" || (state === "ready" && !selected) ? t(`${text}.unavailable`) : "";
   return (
     <details className="group" onToggle={event => {
       if (event.currentTarget.open) {
@@ -73,13 +81,13 @@ function ZenClaudeCodeSetup({ baseUrl, apiToken, shareId, providerId, isCurrentA
       }
     }}>
       <summary className="cursor-pointer py-1 text-xs font-medium text-slate-700">
-        {t("dashboard.connectDialog.zenClaude.title")}
+        {t(`${text}.title`)}
       </summary>
       <div className="grid gap-2 py-1 text-xs text-slate-600">
-        {state === "loading" ? <p role="status">{t("dashboard.connectDialog.zenClaude.loading")}</p> : null}
-        {(state === "error" || (state === "ready" && !selected)) ? (
+        {state === "loading" ? <p role="status">{t(`${text}.loading`)}</p> : null}
+        {catalogError ? (
           <div className="flex items-center gap-2">
-            <p role="status">{t("dashboard.connectDialog.zenClaude.unavailable")}</p>
+            <p role="status">{catalogError}</p>
             <Button size="sm" variant="ghost" onPress={() => void load()}>{t("common.retry")}</Button>
           </div>
         ) : null}
@@ -89,19 +97,19 @@ function ZenClaudeCodeSetup({ baseUrl, apiToken, shareId, providerId, isCurrentA
               <CompactSelect
                 value={selectedId}
                 onChange={setSelectedId}
-                ariaLabel={t("dashboard.connectDialog.zenClaude.model")}
+                ariaLabel={t(`${text}.model`)}
                 options={catalog.models.map(model => ({ value: model.id, label: model.displayName }))}
               />
             )}
-            <p>{t("dashboard.connectDialog.zenClaude.hint")}</p>
+            <p>{t(`${text}.hint`)}</p>
             <div className="flex items-center justify-between gap-2">
-              <span>{t("dashboard.connectDialog.zenClaude.start")}</span>
-              <InlineCopyButton t={t} value={zenClaudeCodeCommand(baseUrl, selected, false)} />
+              <span>{t(`${text}.start`)}</span>
+              <InlineCopyButton t={t} value={command(baseUrl, selected, false)} />
             </div>
-            <pre className="max-h-44 overflow-auto rounded bg-slate-50 p-2 text-[11px]">{zenClaudeCodeCommand(baseUrl, selected, false)}</pre>
+            <pre className="max-h-44 overflow-auto rounded bg-slate-50 p-2 text-[11px]">{command(baseUrl, selected, false)}</pre>
             <div className="flex items-center justify-between gap-2">
-              <span>{t("dashboard.connectDialog.zenClaude.verify")}</span>
-              <InlineCopyButton t={t} value={zenClaudeCodeCommand(baseUrl, selected, true)} />
+              <span>{t(`${text}.verify`)}</span>
+              <InlineCopyButton t={t} value={command(baseUrl, selected, true)} />
             </div>
           </>
         ) : null}
@@ -496,13 +504,14 @@ export function ShareConnectionTestRow({
         </p>
       ) : null}
 
-      {app === "claude" && runtime?.providerType === "opencode_zen" && canExecute && apiToken && baseUrl && share.bindings?.claude ? (
-        <ZenClaudeCodeSetup
-          key={JSON.stringify([baseUrl, share.shareId, share.bindings.claude, accountId, runtime.modelPolicy])}
+      {(app === "claude" || app === "codex") && runtime?.providerType === "opencode_zen" && canExecute && apiToken && baseUrl && share.bindings?.[app] ? (
+        <ZenCliSetup
+          key={JSON.stringify([app, baseUrl, share.shareId, share.bindings[app], accountId, runtime.modelPolicy])}
+          app={app}
           baseUrl={baseUrl}
           apiToken={apiToken}
           shareId={share.shareId}
-          providerId={share.bindings.claude}
+          providerId={share.bindings[app]}
           isCurrentActor={isCurrentActor}
           t={t}
         />

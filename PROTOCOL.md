@@ -530,6 +530,8 @@ Client 页和 Share Market 页的 Share 侧边栏使用同一个日历组件:日
 
 OpenCode Zen 的 Claude 连接配置从绑定 Share 的 `GET /v1/models?app=claude&expectedShareId=…&expectedProviderId=…` 读取。Server 返回的可选 `claudeCode` 包含 `{fixed, models:[{id,displayName,maxOutputTokens,effort}]}`，值来自同一目录快照和该 Provider 的实际模型策略。Router 使用当前用户的 Share API Key 请求，绑定和来源校验通过后才生成命令，命令从 `TOKENSWITCH_API_KEY` 读取凭据。缺少扩展、目录过期或无推荐模型时只提示配置不可用。Share descriptor 和 `modelProbe` 继续用原有版本，Claude Code 验证由用户在终端运行。
 
+Codex CLI 同样从绑定 Share 的 `GET /v1/models?app=codex&expectedShareId=…&expectedProviderId=…` 读取可选的 `codexCli`，格式为 `{fixed, models:[{id,displayName,effort}]}`。命令选用目录里的实际模型 ID、HTTP Responses 和声明的推理档位，设置中性 verbosity 并关闭托管 Web 搜索。运行时从 `TOKENSWITCH_API_KEY` 取凭据。终端验证走实际 Codex CLI。
+
 完整成功的文字连接测试可记为 `router_connection_test` 实时展示证据，慢响应阈值使用 Server 经控制面提供的配置；旧 Server 未提供阈值时，成功结果不提升实时健康状态。测试前后须核对配置 revision、epoch、绑定和健康指纹，配置或阈值已变化则不记入展示证据。只有当前代表 App 影响概览颜色，其他接口成功不证明代表接口正常。失败不按 HTTP 状态直接归罪 Provider：用户自身余额、授权、配额、并发及控制链路错误不写全局健康失败；仅明确归属于当前 Provider 的账号限流可写失败。媒体测试和外部“本地测试”不写文字模型健康。健康记录为 best-effort，不得阻断连接测试或把已完成推理变成失败。测试完成后刷新 Dashboard，不伪造前端成功颜色。
 
 Responses 文字流测试仅在完整终态 JSON 证明 `status=incomplete`、`reason=max_output_tokens`、整数 `usage.output_tokens` 达到本次实际请求的正整数输出预算时，接受 `response.incomplete` 为连接成功；保留真实 `terminalEvent`。必须读完整条流，HTTP 错误、协议错误、读取失败、取消或后续失败均优先于成功。`[DONE]` 本身不能证明成功，也不要求 Responses 流包含它。该规则只用于手动连接测试，不修改生产代理的终态。
