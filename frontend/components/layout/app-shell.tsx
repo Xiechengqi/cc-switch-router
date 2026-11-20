@@ -4,7 +4,7 @@ import Image from "next/image";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { Button, Dropdown, Toast } from "@heroui/react";
-import { Activity, ChevronDown, KeyRound, LogOut, Monitor, Network, ServerCog, Settings, Share2, Trophy, UserRound } from "lucide-react";
+import { Activity, ChevronDown, KeyRound, Lock, LogOut, Monitor, Network, ServerCog, Settings, Share2, Trophy, UserRound } from "lucide-react";
 import * as React from "react";
 import { LoginDialog } from "@/components/auth/login-dialog";
 import { useAuth } from "@/components/auth/auth-provider";
@@ -364,7 +364,7 @@ function Topbar({ active }: { active: DashboardShellActive }) {
                       {t("account.apiKeys.title")}
                     </Dropdown.Item>
                     {session?.password ? <Dropdown.Item id="login-password" onAction={openPasswordSettings}>
-                      <KeyRound className="h-4 w-4" />
+                      <Lock className="h-4 w-4" />
                       {t(session.password.hasPassword ? "auth.password.changeTitle" : "auth.password.setTitle")}
                     </Dropdown.Item> : null}
                     {session?.isAdmin ? (
