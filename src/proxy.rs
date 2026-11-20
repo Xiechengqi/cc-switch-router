@@ -4004,6 +4004,22 @@ async fn proxy_handler_inner(state: ServerState, peer: SocketAddr, req: Request)
             );
             return simple_response(StatusCode::BAD_REQUEST, "query-token-not-allowed");
         }
+        if is_client_web_terminal_request(&path, parts.uri.query()) {
+            let market_client = match route.installation_id().as_deref() {
+                Some(installation_id) => state
+                    .store
+                    .installation_provision_source(installation_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    == Some(crate::client_market::PROVISION_SOURCE_ROUTER_MARKET),
+                None => false,
+            };
+            if market_client && !client_web_terminal_allowed(&state, &parts.headers).await {
+                return simple_response(StatusCode::FORBIDDEN, "client-web-forbidden");
+            }
+        }
         if is_client_web_auth_required_path(&path) {
             let owner_email = match state
                 .store
@@ -7595,6 +7611,25 @@ fn is_allowed_client_web_path(path: &str) -> bool {
         && !is_allowed_direct_share_api_path(path)
 }
 
+fn is_client_web_terminal_request(path: &str, query: Option<&str>) -> bool {
+    path == "/web-api/terminal" || path.starts_with("/web-api/terminal/") || query.is_some_and(|query| {
+        url::form_urlencoded::parse(query.as_bytes())
+            .any(|(name, value)| name == "view" && value == "terminal")
+    })
+}
+
+/// Market Client terminals stay with the Router owner. The iframe carries the
+/// browser session cookie, which is the credential checked here.
+async fn client_web_terminal_allowed(state: &ServerState, headers: &HeaderMap) -> bool {
+    let Ok(Some(session)) = crate::api::resolve_router_session(state, headers).await else {
+        return false;
+    };
+    state
+        .config
+        .official_provider_email()
+        .is_some_and(|owner| owner.eq_ignore_ascii_case(session.email.trim()))
+}
+
 fn is_client_web_auth_required_path(path: &str) -> bool {
     (path == "/web-api" || path.starts_with("/web-api/")) && !is_public_client_web_path(path)
 }
@@ -9044,6 +9079,14 @@ mod tests {
             .unwrap()
             .is_none()
         );
+        assert!(is_client_web_terminal_request("/web-api/terminal", None));
+        assert!(is_client_web_terminal_request(
+            "/web-api/terminal/session",
+            None
+        ));
+        assert!(is_client_web_terminal_request("/", Some("view=terminal&embed=1")));
+        assert!(!is_client_web_terminal_request("/web-api/context", None));
+        assert!(!is_client_web_terminal_request("/", Some("view=console")));
 
         let _ = std::fs::remove_file(&config.database.path);
     }

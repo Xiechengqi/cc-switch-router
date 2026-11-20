@@ -4134,6 +4134,10 @@ pub struct DashboardClientView {
     pub chat_available: bool,
     #[serde(default)]
     pub log_collection_enabled: bool,
+    /// Market Clients hide the Clients-page terminal from everyone except the
+    /// Router owner. Other Clients keep the button whenever a tunnel exists.
+    #[serde(default)]
+    pub can_open_client_terminal: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_tunnel: Option<DashboardClientTunnelView>,
     /// 该 installation 名下挂的所有 active share id 列表。

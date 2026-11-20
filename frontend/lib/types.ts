@@ -210,6 +210,7 @@ export type ShareServiceReadiness = {
 export type DashboardClient = {
   chatAvailable?: boolean;
   logCollectionEnabled?: boolean;
+  canOpenClientTerminal?: boolean;
   installation: {
     id: string;
     platform: string;

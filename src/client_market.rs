@@ -985,6 +985,12 @@ async fn list_hosts(
     } else {
         false
     };
+    let viewer_is_router_owner = viewer.as_ref().is_some_and(|session| {
+        state
+            .config
+            .official_provider_email()
+            .is_some_and(|owner| owner.eq_ignore_ascii_case(session.email.trim()))
+    });
     let hosts = state
         .store
         .client_market_list_hosts(
@@ -1139,17 +1145,22 @@ async fn list_hosts(
             } else {
                 crate::market_access::MarketEligibilityView::allowed()
             };
+            let reveal_ip = reveal_operations || viewer_is_router_owner;
             let ip_intel = host_ip_intel_for_viewer(
                 host.ip_intel_json.as_deref(),
                 &host.ip,
-                reveal_operations,
+                reveal_ip,
             );
-            // Market listings always show the full IP; only port stays owner-private.
+            // Full IP is host-owner and Router-owner only. Port stays host-owner only.
             RouterSshHostView {
                 id: host.id,
                 provider_id: host.provider_id,
                 market_provider_id: host.market_provider_id,
-                ip: Some(host.ip.clone()),
+                ip: Some(if reveal_ip {
+                    host.ip.clone()
+                } else {
+                    mask_host_ip(&host.ip)
+                }),
                 port: reveal_operations.then_some(host.port),
                 host_owner_email: host.host_owner_email,
                 daily_rate_minor: host.daily_rate_minor,
@@ -5634,15 +5645,38 @@ fn parse_host_ip_intel(raw: Option<&str>) -> Option<crate::ip_iq::HostIpIntel> {
     raw.and_then(|value| serde_json::from_str(value).ok())
 }
 
+/// Last IPv4 octet, or everything after the fourth IPv6 group, becomes `xx`.
+/// Unparseable values stay unchanged so notes are not rewritten by accident.
+pub(crate) fn mask_host_ip(value: &str) -> String {
+    let trimmed = value.trim();
+    if let Some(ipv4) = trimmed.parse::<std::net::Ipv4Addr>().ok() {
+        let octets = ipv4.octets();
+        return format!("{}.{}.{}.xx", octets[0], octets[1], octets[2]);
+    }
+    if trimmed.parse::<std::net::Ipv6Addr>().is_ok() {
+        let groups = trimmed
+            .split(':')
+            .filter(|group| !group.is_empty())
+            .take(4)
+            .collect::<Vec<_>>();
+        if groups.len() == 4 {
+            return format!("{}:{}:{}:{}:xx", groups[0], groups[1], groups[2], groups[3]);
+        }
+    }
+    trimmed.to_string()
+}
+
 /// Non-owners still see market-useful ISP / risk / classification.
-/// Full IP is public in the market list; geo coords and ownership stay redacted.
+/// The IP shown here follows the same mask as the listing. Geo coords and
+/// ownership stay redacted.
 fn public_host_ip_intel(
     intel: crate::ip_iq::HostIpIntel,
     host_ip: &str,
 ) -> crate::ip_iq::HostIpIntel {
+    let masked = mask_host_ip(host_ip);
     crate::ip_iq::HostIpIntel {
-        query: host_ip.to_string(),
-        ip: Some(host_ip.to_string()),
+        query: masked.clone(),
+        ip: Some(masked),
         location: intel.location,
         score: None,
         level: intel.level,
@@ -5689,7 +5723,11 @@ fn host_to_view(host: RouterSshHostRecord, reveal: bool) -> RouterSshHostView {
         id: host.id,
         provider_id: host.provider_id,
         market_provider_id: host.market_provider_id,
-        ip: Some(host.ip.clone()),
+        ip: Some(if reveal {
+            host.ip.clone()
+        } else {
+            mask_host_ip(&host.ip)
+        }),
         port: reveal.then_some(host.port),
         host_owner_email: host.host_owner_email,
         daily_rate_minor: host.daily_rate_minor,
@@ -11623,6 +11661,18 @@ mod tests {
     }
 
     #[test]
+    fn mask_host_ip_hides_the_last_ipv4_octet_and_ipv6_tail() {
+        assert_eq!(mask_host_ip("156.239.47.3"), "156.239.47.xx");
+        assert_eq!(mask_host_ip(" 203.0.113.9 "), "203.0.113.xx");
+        assert_eq!(
+            mask_host_ip("2606:4700:4700:1111::1"),
+            "2606:4700:4700:1111:xx"
+        );
+        assert_eq!(mask_host_ip("not-an-ip"), "not-an-ip");
+        assert_eq!(mask_host_ip(""), "");
+    }
+
+    #[test]
     fn host_approval_flag_only_marks_authenticated_non_owners_without_access() {
         let access = HashMap::from([
             (("allowed-provider".to_string(), "free".to_string()), true),
@@ -11726,10 +11776,10 @@ mod tests {
         ] {
             assert!(public.get(key).is_none(), "public view leaked {key}");
         }
-        // Full IP is public; only port and operational fields stay owner-private.
+        // Visitors see the masked IP. Port and operational fields stay owner-private.
         assert_eq!(
             public.get("ip").and_then(|value| value.as_str()),
-            Some("203.0.113.9")
+            Some("203.0.113.xx")
         );
         let public_intel = public
             .get("ipIntel")
@@ -11750,7 +11800,11 @@ mod tests {
         );
         assert_eq!(
             public_intel.get("ip").and_then(|value| value.as_str()),
-            Some("203.0.113.9")
+            Some("203.0.113.xx")
+        );
+        assert_eq!(
+            public_intel.get("query").and_then(|value| value.as_str()),
+            Some("203.0.113.xx")
         );
         assert!(public_intel.get("latitude").is_none());
         assert_eq!(

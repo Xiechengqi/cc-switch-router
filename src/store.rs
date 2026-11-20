@@ -797,6 +797,16 @@ fn dashboard_installation_ip(
     self_reported.or(router_observed).map(str::to_string)
 }
 
+fn visible_dashboard_ip(ip: Option<String>, reveal: bool) -> Option<String> {
+    ip.map(|value| {
+        if reveal {
+            value
+        } else {
+            crate::client_market::mask_host_ip(&value)
+        }
+    })
+}
+
 fn is_map_active_client(operational_state: &str) -> bool {
     operational_state != "offline"
 }
@@ -12741,6 +12751,11 @@ impl AppStore {
         proxy: &ProxyRegistry,
         viewer_email: Option<&str>,
     ) -> Result<DashboardResponse, AppError> {
+        let viewer_sees_full_client_ip = viewer_email.is_some_and(|email| {
+            config
+                .official_provider_email()
+                .is_some_and(|owner| owner.eq_ignore_ascii_case(email.trim()))
+        });
         let route_availability = proxy
             .route_availability_snapshots(crate::notifications::route_reconnect_grace(
                 &config.client_notifications,
@@ -12915,9 +12930,12 @@ impl AppStore {
                 owner_email: verified_owner_email,
                 region: installation.region.clone(),
                 country_code: installation.country_code.clone(),
-                public_ip: dashboard_installation_ip(
-                    installation.public_ip.as_deref(),
-                    installation.last_seen_ip.as_deref(),
+                public_ip: visible_dashboard_ip(
+                    dashboard_installation_ip(
+                        installation.public_ip.as_deref(),
+                        installation.last_seen_ip.as_deref(),
+                    ),
+                    viewer_sees_full_client_ip,
                 ),
                 created_at: installation.created_at,
                 last_seen_at: installation.last_seen_at,
@@ -13175,12 +13193,15 @@ impl AppStore {
                 if health_timeline.is_empty() && client_tunnel_online {
                     health_timeline = current_online_health_timeline(health_timeline_start);
                 }
+                let market_client = installation.provision_source.as_deref()
+                    == Some(crate::client_market::PROVISION_SOURCE_ROUTER_MARKET);
                 let mut view = DashboardClientView {
                     chat_available: installation.owner_email.is_some(),
                     log_collection_enabled: log_collection_by_installation
                         .get(&installation.id)
                         .copied()
                         .unwrap_or(false),
+                    can_open_client_terminal: !market_client || viewer_sees_full_client_ip,
                     share_count,
                     share_ids,
                     client_tunnel,
@@ -53605,6 +53626,41 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn dashboard_snapshot_masks_client_ip_except_for_the_router_owner() {
+        let (store, mut config) = setup_store("dashboard-client-ip").await;
+        config.router_owner_email = Some("router-owner@example.com".into());
+        insert_installation(&store, "inst-ip").await;
+        insert_client_tunnel(&store, "inst-ip", "renter@example.com", "ip-client").await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE installations
+                 SET public_ip = '203.0.113.10', provision_source = 'router_market'
+                 WHERE id = 'inst-ip'",
+                [],
+            )
+            .expect("set reported client ip");
+        }
+        let server_geo = ServerGeo { lat: None, lon: None };
+        let proxy = ProxyRegistry::default();
+        let masked = store
+            .dashboard_snapshot(&config, &server_geo, &proxy, Some("renter@example.com"))
+            .await
+            .expect("renter snapshot");
+        let client = masked.clients.iter().find(|client| client.installation.id == "inst-ip").expect("client");
+        assert_eq!(client.installation.public_ip.as_deref(), Some("203.0.113.xx"));
+        assert!(!client.can_open_client_terminal);
+        let revealed = store
+            .dashboard_snapshot(&config, &server_geo, &proxy, Some("router-owner@example.com"))
+            .await
+            .expect("owner snapshot");
+        let owner_client = revealed.clients.iter().find(|client| client.installation.id == "inst-ip").expect("owner client");
+        assert_eq!(owner_client.installation.public_ip.as_deref(), Some("203.0.113.10"));
+        assert!(owner_client.can_open_client_terminal);
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
     async fn dashboard_snapshot_does_not_count_paused_share_as_active() {
         let (store, config) = setup_store("dashboard-paused").await;
         insert_installation(&store, "inst-1").await;
@@ -53637,6 +53693,7 @@ pub(crate) mod tests {
         assert_eq!(snapshot.stats.active_shares, 0);
         assert_eq!(snapshot.stats.total_active_requests, 0);
         assert_eq!(snapshot.clients.len(), 1);
+        assert!(snapshot.clients[0].can_open_client_terminal);
         assert_eq!(
             snapshot.shares.first().expect("share view").share_status,
             "paused"

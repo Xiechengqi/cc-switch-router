@@ -197,7 +197,7 @@ function ClientTerminalButton({ client }: { client: DashboardClient }) {
   const { t } = useLocaleText();
   const { openConsole } = useClientConsole();
   const tunnelUrl = clientTunnelDisplayUrl(client.clientTunnel?.tunnelUrl);
-  if (!tunnelUrl) return null;
+  if (!tunnelUrl || client.canOpenClientTerminal === false) return null;
   const title = client.clientTunnel?.subdomain || tunnelUrl;
   return (
     <ClientHeaderInlineButton
@@ -535,7 +535,7 @@ function ClientCard({
                 showSchedule={false}
               />
               {tunnelUrl ? <ClientConsoleButton client={client} /> : null}
-              {tunnelUrl ? <ClientTerminalButton client={client} /> : null}
+              {tunnelUrl && client.canOpenClientTerminal !== false ? <ClientTerminalButton client={client} /> : null}
               <ClientUpgradeButton client={client} />
               {onOpenTakeover ? <ClientTakeoverButton onOpen={onOpenTakeover} /> : null}
               {client.logCollectionEnabled && onOpenLogs ? <ClientLogsButton onOpen={onOpenLogs} /> : null}
