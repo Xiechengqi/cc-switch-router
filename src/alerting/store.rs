@@ -1819,8 +1819,7 @@ fn enqueue_deliveries_tx(
                     ))
                 })?
                 != 0;
-        let transition_level =
-            crate::notification_kinds::level_for(&incident.kind);
+        let transition_level = crate::notification_kinds::level_for(&incident.kind);
         if !transition_level.meets(crate::notification_kinds::NoticeLevel::parse(
             &channel.min_severity,
         )) && !recovery_for_previously_targeted_channel
@@ -1880,7 +1879,10 @@ fn render_delivery_payload(
     let href = if policy.dashboard_url.trim().is_empty() {
         String::new()
     } else {
-        format!("{}/metrics/?tab=alerts", policy.dashboard_url.trim_end_matches('/'))
+        format!(
+            "{}/metrics/?tab=alerts",
+            policy.dashboard_url.trim_end_matches('/')
+        )
     };
     crate::notification_compose::ComposedNotice::for_alert(
         &incident.kind,
@@ -1890,7 +1892,11 @@ fn render_delivery_payload(
         href,
         transition.occurred_at,
         policy.region.clone(),
-        policy.dashboard_url.trim_start_matches("https://").trim_start_matches("http://").to_string(),
+        policy
+            .dashboard_url
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .to_string(),
     )
     .bark_body_with_header()
 }

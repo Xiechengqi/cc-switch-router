@@ -111,6 +111,14 @@ Client Web 邮箱登录使用 `/v1/client-web/auth/email/request-code` 和 `/v1/
 
 凭据更新原子提升用户 `auth_version` 并撤销全部旧 Session；网页更新返回替换 Session。CLI 更新不返回用户 Session。refresh 继承原认证方式、邮箱验证时间和 login event，不延长邮箱证明，也不能通过 rotation grace 恢复改密前的会话。历史 Session 的认证方式为 `legacy`，邮箱证明为空。CLI、限流与运维见 [密码登录文档](docs/password-authentication.md)。
 
+### 3.3 Client Web 窗口登录
+
+Router 主 Host 的 Session 鉴权 `POST /v1/auth/client-web-tickets` 接收 `{installationId,kind:"console"|"terminal",nonce}`，返回 `{ticket,origin}`，`Cache-Control: no-store`。ticket 60 秒有效且只兑换一次，绑定父 Session、当前 owner、Client Host revision、installation、nonce 和终端权限。自动身份只授予已验证的当前 Client owner，市场实例额外核对当前有效租约。市场终端继续限定 Router owner，非该 Client owner 的 Router owner 只得到窗口访问许可，须另行提供本地 Client 凭据。
+
+Client 嵌入页的 `routerOrigin` 查询参数只携带父 origin。子页通过 `postMessage` 发出 `cc-client-login-request` 和随机 nonce；父页核对准确的 origin 与 iframe `contentWindow` 后签发并返回 `cc-client-login-ticket`。子页在本 Client Host 上 POST `/web-api/auth/router-exchange`，请求 `{ticket,nonce}` 且 Origin 必须匹配目标 Host。此端点由 Router 自身处理。兑换结果 `{token,expiresAt}` 最长有效 10 分钟，且不超过父 access Session 期限。
+
+Client 请求通过 `x-cc-switch-client-web-session` 携带内存凭据。Router 每次重新校验父会话、owner、Host revision、隧道启用及市场租约，剥离窗口头后复用已有签名 IngressContext。事件流每 5 秒复核授权，撤销后关闭；新输入也逐次验证。`POST /web-api/auth/router-logout` 撤销对应窗口凭据。票据及窗口凭据不写 Cookie、localStorage、sessionStorage、URL 或业务日志。窗口刷新／恢复重新握手，旧客户端继续本地登录。
+
 ### 2.3 Gateway（中性容量接入身份）
 
 Gateway 不是 Client，也不是旧 Token Market 注册。它是一个外部容量消费者在**单个 Router**上的 Ed25519 公钥身份。当前注册接口仍是公开的基础注册；`ownerEmail` 是调用方自报、未验证的本地审计元数据，不参与 Share 可见性、proxy、headroom、feedback 或 observation 授权，也不会创建下游用户、API key、余额或 token 账本：

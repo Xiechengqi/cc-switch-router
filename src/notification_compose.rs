@@ -376,7 +376,26 @@ pub fn escape_html(value: &str) -> String {
 pub fn escape_markdown(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 8);
     for ch in value.chars() {
-        if matches!(ch, '_' | '*' | '[' | ']' | '(' | ')' | '~' | '`' | '>' | '#' | '+' | '-' | '=' | '|' | '{' | '}' | '.' | '!') {
+        if matches!(
+            ch,
+            '_' | '*'
+                | '['
+                | ']'
+                | '('
+                | ')'
+                | '~'
+                | '`'
+                | '>'
+                | '#'
+                | '+'
+                | '-'
+                | '='
+                | '|'
+                | '{'
+                | '}'
+                | '.'
+                | '!'
+        ) {
             out.push('\\');
         }
         out.push(ch);

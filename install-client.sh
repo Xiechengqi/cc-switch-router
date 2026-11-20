@@ -156,7 +156,11 @@ start_cc_switch_server() {
 main() {
 
 # check location
-countryCode=$(check_if_in_china)
+if [ -n "${CC_SWITCH_SERVER_PREPARED_BINARY:-}" ]; then
+  countryCode="Prepared"
+else
+  countryCode=$(check_if_in_china)
+fi
 [ ".${countryCode}" = "." ] && ERROR "Get country location fail ..."
 INFO "Location: ${countryCode}"
 
@@ -185,6 +189,7 @@ binary="cc-switch-server"
 if { command -v pgrep >/dev/null 2>&1 && pgrep -x "${binary}" >/dev/null 2>&1; } \
   || { command -v pidof >/dev/null 2>&1 && pidof "${binary}" >/dev/null 2>&1; }
 then
+[ -z "${CC_SWITCH_SERVER_PREPARED_BINARY:-}" ] || ERROR "cc-switch-server is already running; allocation must be rechecked"
 YELLOW "${binary} is running, exit installing ..."
 command -v pgrep >/dev/null 2>&1 && pgrep -ax "${binary}" 2>/dev/null || ps -ef | grep "[c]c-switch-server" || true
 exit 0
@@ -230,6 +235,17 @@ cleanup_download() {
   rm -rf "${download_dir}"
 }
 trap cleanup_download EXIT
+if [ -n "${CC_SWITCH_SERVER_PREPARED_BINARY:-}" ]; then
+  [ -f "${CC_SWITCH_SERVER_PREPARED_BINARY}" ] && [ ! -L "${CC_SWITCH_SERVER_PREPARED_BINARY}" ] \
+    || ERROR "Prepared cc-switch-server binary is missing"
+  expected_checksum="${CC_SWITCH_SERVER_EXPECTED_SHA256:-}"
+  printf '%s\n' "${expected_checksum}" | grep -E '^[0-9a-f]{64}$' >/dev/null \
+    || ERROR "Prepared binary requires an expected checksum"
+  printf '%s\n' "${CC_SWITCH_SERVER_EXPECTED_COMMIT:-}" | grep -E '^[0-9a-f]{40}$' >/dev/null \
+    || ERROR "Prepared binary requires a complete expected commit"
+  cp "${CC_SWITCH_SERVER_PREPARED_BINARY}" "${download_dir}/${asset}" \
+    || ERROR "Unable to stage prepared binary"
+else
 INFO "Downloading cc-switch-server release ${SERVER_RELEASE} (${asset})"
 curl --fail --show-error --silent --location "${downloadUrl}" -o "${download_dir}/${asset}" \
   || ERROR "Unable to download cc-switch-server release ${SERVER_RELEASE}"
@@ -245,6 +261,7 @@ expected_checksum=$(awk '
   || ERROR "cc-switch-server checksum file must contain exactly one digest"
 printf '%s\n' "${expected_checksum}" | grep -E '^[0-9a-f]{64}$' >/dev/null \
   || ERROR "cc-switch-server checksum file contains an invalid digest"
+fi
 actual_checksum_output=$(sha256sum "${download_dir}/${asset}") \
   || ERROR "Unable to calculate cc-switch-server checksum"
 actual_checksum=$(printf '%s\n' "${actual_checksum_output}" | awk '{print tolower($1)}')
@@ -254,9 +271,18 @@ chmod +x "${download_dir}/${asset}" || ERROR "Unable to mark staged cc-switch-se
 "${download_dir}/${asset}" -V >/dev/null \
   || ERROR "Staged cc-switch-server binary failed its version sanity check"
 
-if [ "${SERVER_RELEASE}" != "latest" ]; then
+if [ "${SERVER_RELEASE}" != "latest" ] || [ -n "${CC_SWITCH_SERVER_EXPECTED_COMMIT:-}" ]; then
   version_json=$("${download_dir}/${asset}" version --json 2>/dev/null) \
     || ERROR "Unable to read staged cc-switch-server build metadata"
+  actual_name=$(printf '%s\n' "${version_json}" | awk -F '"' '/^[[:space:]]*"name"[[:space:]]*:/ { value=$4; count++ } END { if(count!=1) exit 1; print value }') \
+    || ERROR "Staged binary has no unique product name"
+  [ "${actual_name}" = "cc-switch-server" ] || ERROR "Staged binary is not cc-switch-server"
+  actual_target=$(printf '%s\n' "${version_json}" | awk -F '"' '/^[[:space:]]*"target"[[:space:]]*:/ { value=$4; count++ } END { if(count!=1) exit 1; print value }') \
+    || ERROR "Staged binary has no unique build target"
+  case "${asset}:${actual_target}" in
+    cc-switch-server-linux-amd64:x86_64-*linux*|cc-switch-server-linux-arm64:aarch64-*linux*) ;;
+    *) ERROR "Staged binary target does not match the Host architecture" ;;
+  esac
   actual_commit=$(printf '%s\n' "${version_json}" | awk -F '"' '
     /^[[:space:]]*"commitId"[[:space:]]*:/ {
       commit=tolower($4)
@@ -269,14 +295,17 @@ if [ "${SERVER_RELEASE}" != "latest" ]; then
   ') || ERROR "Staged cc-switch-server build metadata has no unique commitId"
   printf '%s\n' "${actual_commit}" | grep -E '^[0-9a-f]{7,40}$' >/dev/null \
     || ERROR "Staged cc-switch-server build metadata contains an invalid commitId"
+  expected_commit="${CC_SWITCH_SERVER_EXPECTED_COMMIT:-${SERVER_RELEASE}}"
   case "${actual_commit}" in
-    "${SERVER_RELEASE}"*) ;;
+    "${expected_commit}"*) ;;
     *) ERROR "Staged cc-switch-server commit (${actual_commit:-unknown}) does not match release ${SERVER_RELEASE}" ;;
   esac
 fi
 
-install -m 0755 "${download_dir}/${asset}" "/usr/local/bin/${binary}" \
-  || ERROR "Unable to install cc-switch-server"
+installed_stage=$(mktemp "/usr/local/bin/.cc-switch-server.XXXXXX") || ERROR "Unable to stage installed binary"
+install -m 0755 "${download_dir}/${asset}" "${installed_stage}" \
+  && mv -f "${installed_stage}" "/usr/local/bin/${binary}" \
+  || { rm -f "${installed_stage}"; ERROR "Unable to install cc-switch-server"; }
 cleanup_download
 trap - EXIT
 EXEC "${binary} -V" && ${binary} -V
@@ -287,7 +316,9 @@ INFO "Client Web Password: configured"
 INFO "Client Register To Router: ${ROUTER}"
 [ ".${CLIENT_SUBDOMAIN}" != "." ] && INFO "Client Subdomain: ${CLIENT_SUBDOMAIN}"
 [ "${DISABLE_WEB_TERMINAL}" -eq 1 ] && INFO "Web Terminal: disabled"
-YELLOW "Check whether the above parameters are correct and start the installation in 3 seconds ..." && EXEC "sleep 3"
+if [ -z "${CC_SWITCH_SERVER_PREPARED_BINARY:-}" ]; then
+  YELLOW "Starting the installation in 3 seconds ..." && EXEC "sleep 3"
+fi
 
 cd $HOME &> /dev/null && ls .cc-switch-server &> /dev/null && INFO "Backup old local data ..." && EXEC "mv -v .cc-switch-server .cc-switch-server.bak.$(date +%s)"
 INIT_ARGS=(init --router-url "${ROUTER}" --owner-email "${OWNER}")
@@ -302,7 +333,6 @@ fi
 unset PASSWORD PASSWORD_ARG
 [ "${DISABLE_WEB_TERMINAL}" -eq 1 ] && disable_web_terminal
 start_cc_switch_server
-EXEC "sleep 3"
 INFO "Client process manager: ${SERVICE_MANAGER} (manual restart policy)"
 SUBDOMAIN=$(grep tunnelSubdomain $HOME/.cc-switch-server/server.json  | awk -F '"' '{print $(NF-1)}')
 SUBDOMAIN_URL=$(echo ${ROUTER} | sed "s/:\/\//:\/\/${SUBDOMAIN}\./")

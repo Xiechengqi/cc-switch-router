@@ -109,6 +109,7 @@ use crate::registration_admission::{
 
 mod browser_sessions;
 pub(crate) mod client_chat;
+pub(crate) mod client_web_sessions;
 pub(crate) mod model_health;
 pub(crate) mod password_auth;
 pub(crate) mod share_value_quotas;
@@ -963,6 +964,7 @@ fn build_dashboard_country_aggregation(
 #[derive(Clone)]
 pub struct AppStore {
     pub(crate) conn: Arc<Mutex<Connection>>,
+    client_web_sessions: Arc<Mutex<client_web_sessions::WindowSessions>>,
     /// Shared by all Store clones: configuration commits fence late outcomes.
     pub route_breakers: Arc<crate::route_breaker::RouteBreakerRegistry>,
     pub model_route_runtime: Arc<crate::model_route_runtime::ModelRouteRuntime>,
@@ -1783,6 +1785,7 @@ impl AppStore {
         let database_sync = conn.sync_handle();
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            client_web_sessions: Arc::new(Mutex::new(Default::default())),
             route_breakers: Arc::new(crate::route_breaker::RouteBreakerRegistry::new()),
             model_route_runtime: Arc::new(crate::model_route_runtime::ModelRouteRuntime::default()),
             model_route_traffic: Arc::new(crate::model_route_traffic::ModelRouteTraffic::default()),
@@ -2043,6 +2046,7 @@ impl AppStore {
         let database_sync = conn.sync_handle();
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            client_web_sessions: Arc::new(Mutex::new(Default::default())),
             route_breakers: Arc::new(crate::route_breaker::RouteBreakerRegistry::new()),
             model_route_runtime: Arc::new(crate::model_route_runtime::ModelRouteRuntime::default()),
             model_route_traffic: Arc::new(crate::model_route_traffic::ModelRouteTraffic::default()),
@@ -53641,21 +53645,43 @@ pub(crate) mod tests {
             )
             .expect("set reported client ip");
         }
-        let server_geo = ServerGeo { lat: None, lon: None };
+        let server_geo = ServerGeo {
+            lat: None,
+            lon: None,
+        };
         let proxy = ProxyRegistry::default();
         let masked = store
             .dashboard_snapshot(&config, &server_geo, &proxy, Some("renter@example.com"))
             .await
             .expect("renter snapshot");
-        let client = masked.clients.iter().find(|client| client.installation.id == "inst-ip").expect("client");
-        assert_eq!(client.installation.public_ip.as_deref(), Some("203.0.113.xx"));
+        let client = masked
+            .clients
+            .iter()
+            .find(|client| client.installation.id == "inst-ip")
+            .expect("client");
+        assert_eq!(
+            client.installation.public_ip.as_deref(),
+            Some("203.0.113.xx")
+        );
         assert!(!client.can_open_client_terminal);
         let revealed = store
-            .dashboard_snapshot(&config, &server_geo, &proxy, Some("router-owner@example.com"))
+            .dashboard_snapshot(
+                &config,
+                &server_geo,
+                &proxy,
+                Some("router-owner@example.com"),
+            )
             .await
             .expect("owner snapshot");
-        let owner_client = revealed.clients.iter().find(|client| client.installation.id == "inst-ip").expect("owner client");
-        assert_eq!(owner_client.installation.public_ip.as_deref(), Some("203.0.113.10"));
+        let owner_client = revealed
+            .clients
+            .iter()
+            .find(|client| client.installation.id == "inst-ip")
+            .expect("owner client");
+        assert_eq!(
+            owner_client.installation.public_ip.as_deref(),
+            Some("203.0.113.10")
+        );
         assert!(owner_client.can_open_client_terminal);
         let _ = std::fs::remove_file(&config.database.path);
     }

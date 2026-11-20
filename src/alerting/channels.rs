@@ -107,7 +107,11 @@ async fn send_bark(
     // Bark list title so a phone shows what fired instead of a generic label.
     let title = text.lines().next().unwrap_or("TokenSwitch Router alert");
     let title = truncate_utf8(title, 100);
-    let level = if text.starts_with('🔴') { "critical" } else { "active" };
+    let level = if text.starts_with('🔴') {
+        "critical"
+    } else {
+        "active"
+    };
     let request = crate::bark::PushRequest {
         device_key,
         title: &title,

@@ -3978,6 +3978,19 @@ async fn proxy_handler_inner(state: ServerState, peer: SocketAddr, req: Request)
     }
     let mut client_web_session: Option<(String, bool)> = None;
     if route.is_client_web() {
+        client_web_session = match state
+            .store
+            .client_window_principal(
+                &state.config,
+                &parts.headers,
+                route.installation_id().unwrap_or_default(),
+                &route.subdomain,
+            )
+            .await
+        {
+            Ok(principal) => principal,
+            Err(error) => return error.into_response(),
+        };
         if !is_internal_share_router_path && !is_allowed_client_web_path(&path) {
             debug!(
                 method = %method,
@@ -4006,21 +4019,36 @@ async fn proxy_handler_inner(state: ServerState, peer: SocketAddr, req: Request)
         }
         if is_client_web_terminal_request(&path, parts.uri.query()) {
             let market_client = match route.installation_id().as_deref() {
-                Some(installation_id) => state
-                    .store
-                    .installation_provision_source(installation_id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .as_deref()
-                    == Some(crate::client_market::PROVISION_SOURCE_ROUTER_MARKET),
+                Some(installation_id) => {
+                    state
+                        .store
+                        .installation_provision_source(installation_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .as_deref()
+                        == Some(crate::client_market::PROVISION_SOURCE_ROUTER_MARKET)
+                }
                 None => false,
             };
-            if market_client && !client_web_terminal_allowed(&state, &parts.headers).await {
+            let window_terminal = market_client
+                && state
+                    .store
+                    .client_window_terminal_allowed(
+                        &state.config,
+                        &parts.headers,
+                        route.installation_id().unwrap_or_default(),
+                        &route.subdomain,
+                    )
+                    .await;
+            if market_client
+                && !window_terminal
+                && !client_web_terminal_allowed(&state, &parts.headers).await
+            {
                 return simple_response(StatusCode::FORBIDDEN, "client-web-forbidden");
             }
         }
-        if is_client_web_auth_required_path(&path) {
+        if is_client_web_auth_required_path(&path) && client_web_session.is_none() {
             let owner_email = match state
                 .store
                 .resolve_client_tunnel_owner_email(
@@ -7368,6 +7396,7 @@ fn is_internal_share_context_header(name: &str) -> bool {
                 | crate::ingress_context::INGRESS_CONTEXT_HEADER
                 | crate::ingress_context::INGRESS_SIGNATURE_HEADER
                 | crate::ingress_context::INGRESS_BODY_LIMIT_HEADER
+                | crate::store::client_web_sessions::WINDOW_HEADER
         )
 }
 
@@ -7393,6 +7422,9 @@ mod credential_boundary_tests {
 
     #[test]
     fn all_tunnel_forwarders_strip_browser_credentials_in_both_directions() {
+        assert!(is_internal_share_context_header(
+            crate::store::client_web_sessions::WINDOW_HEADER
+        ));
         assert!(is_sensitive_upstream_credential_header("cookie"));
         assert!(is_sensitive_upstream_credential_header("Cookie"));
         assert!(is_sensitive_upstream_credential_header("Authorization"));
@@ -7612,10 +7644,12 @@ fn is_allowed_client_web_path(path: &str) -> bool {
 }
 
 fn is_client_web_terminal_request(path: &str, query: Option<&str>) -> bool {
-    path == "/web-api/terminal" || path.starts_with("/web-api/terminal/") || query.is_some_and(|query| {
-        url::form_urlencoded::parse(query.as_bytes())
-            .any(|(name, value)| name == "view" && value == "terminal")
-    })
+    path == "/web-api/terminal"
+        || path.starts_with("/web-api/terminal/")
+        || query.is_some_and(|query| {
+            url::form_urlencoded::parse(query.as_bytes())
+                .any(|(name, value)| name == "view" && value == "terminal")
+        })
 }
 
 /// Market Client terminals stay with the Router owner. The iframe carries the
@@ -8168,6 +8202,7 @@ mod tests {
 
     use super::*;
 
+    mod client_web_login;
     mod model_routing;
 
     #[tokio::test]
@@ -9084,7 +9119,10 @@ mod tests {
             "/web-api/terminal/session",
             None
         ));
-        assert!(is_client_web_terminal_request("/", Some("view=terminal&embed=1")));
+        assert!(is_client_web_terminal_request(
+            "/",
+            Some("view=terminal&embed=1")
+        ));
         assert!(!is_client_web_terminal_request("/web-api/context", None));
         assert!(!is_client_web_terminal_request("/", Some("view=console")));
 

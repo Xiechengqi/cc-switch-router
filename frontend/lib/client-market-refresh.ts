@@ -68,6 +68,7 @@ const sameHost = recordComparator<ClientMarketHost>({
   isClientOwner: "scalar",
   canRetireUnreachable: "scalar",
   clientConnection: "nested",
+  binaryPreparation: "nested",
   lastVerifiedAt: "scalar",
   lastError: "scalar",
   note: "scalar",

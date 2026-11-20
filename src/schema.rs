@@ -411,6 +411,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         119,
         include_str!("../schema/0119_grant_capability_contract.sql"),
     ),
+    (
+        120,
+        include_str!("../schema/0120_client_binary_preparation.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -923,7 +927,7 @@ mod tests {
     // Includes live-health evidence (0109), ordered route candidates (0110),
     // resource tariffs/capabilities (0111), owner model prices (0113), and
     // browser/financial credentials, risk evidence and recovery (0114–0116).
-    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 301;
+    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 302;
 
     #[test]
     fn migration_114_revokes_existing_sessions_and_rotation_grace_only_once() {

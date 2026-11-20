@@ -129,6 +129,8 @@ Bundle 绑定聚合，不从 Claude/Codex/Gemini API、兼容类型或名称猜�
 
 Host Provider 贡献一台 Linux 服务器,Router 用**专用外发 Ed25519 provision key**(与入站 SSH host key 相互独立,`src/provision_ssh.rs` `require_provision_ssh_keys()`)登录,安装依赖并部署 Server,使其成为 Client + Router 容量与 Share 服务的供给节点。
 
+主机入市后通过持久化的 `client_binary_preparations` 队列预下载所选 Server Release，只验证摘要，不运行程序。主机缓存独立于 `/usr/local/bin/cc-switch-server` 和租户数据，最多保留最近两份 binary。租用创建任务在启动前从 GitHub 重新确认发布的完整 commit 与摘要，使用 ETag 条件请求及并发合并，校验缓存后再次检查发布身份。正式安装从验证过的缓存原子替换，继续执行租户初始化和一次启动。预下载队列、状态和缓存失败均可恢复；实际租用仍要求当前 Release 可确认。
+
 主机状态机(`router_ssh_hosts.status`):
 
 ```
@@ -465,7 +467,7 @@ Next.js 静态导出(`output: "export"`),`build.rs` 遍历 `frontend/out/` 生�
 - **账户 → 通知设置**(`/account/notifications`)：邮件、Telegram、Bark 三选一，邮件始终可选；第三方渠道未绑定或 Provider 未就绪时不可选，已选渠道临时不可用时明确显示 Email 回落。Telegram 绑定按钮在 `await` 前先 `window.open("about:blank")` 保留用户手势，失败则回落为可复制深链与 `/start <token>`；页面以 3 秒间隔轮询 `GET /v1/me/notifications`，并以 `verifiedAt` 变化识别重新绑定，5 分钟后停止。Bark 表单使用密码输入接收完整 Push URL，验证成功后只显示 Server 与设备掩码，解绑与重新绑定均受后端 revision fence 保护
 - 设计 token 以 `--router-*` CSS 自定义属性承载(`frontend/app/globals.css`);当前 UI 只有浅色主题,没有可切换的暗色模式
 - **Router 自己的 Web 终端**:xterm.js ↔ WebSocket ↔ `portable-pty` 起 `ssh` 子进程(非 russh client),一次性 ticket + 每用户 2 会话上限 + 空闲/硬超时。**仅 Host Provider 本人可开**,租客与 Router 管理员均不可
-- **Client 自带的 Web 终端**(另一条链路):Clients 页条目上的「终端」按钮,与「控制台」共用同一套 iframe 窗口管理器(`components/dashboard/client-console/`)。它不经过 Router 的 PTY,而是把 client web URL 加上 `?view=terminal&embed=1`(`lib/client-web-view.ts`)后在 iframe 中打开,请求经 client tunnel 转发到 Server 的 `/web-api/terminal/*`,鉴权由 Server 自身的 Web 登录态负责。`embed=1` 让 Server 前端隐藏自己的页头、状态条和「结束会话」按钮,只渲染 xterm 画布——窗口标题栏和关闭按钮由 Router 这侧提供,不重复一遍。窗口按 `clientId + kind` 去重,因此同一 client 的控制台与终端各占一个窗口
+- **Client 自带的 Web 终端**(另一条链路):Clients 页条目上的「终端」按钮,与「控制台」共用同一套 iframe 窗口管理器(`components/dashboard/client-console/`)。它不经过 Router 的 PTY,而是把 client web URL 加上 `?view=terminal&embed=1`(`lib/client-web-view.ts`)后在 iframe 中打开,请求经 client tunnel 转发到 Server 的 `/web-api/terminal/*`,Client owner 通过短期、绑定父 Router Session 与当前 installation/Host/owner 的窗口凭据自动鉴权，Router 每次复核并注入签名身份；本地密码登录继续由 Server 管理。市场页面终端仅 Router owner 可访问。`embed=1` 让 Server 前端隐藏自己的页头、状态条和「结束会话」按钮,只渲染 xterm 画布——窗口标题栏和关闭按钮由 Router 这侧提供,不重复一遍。窗口按 `clientId + kind` 去重,因此同一 client 的控制台与终端各占一个窗口
 
 ---
 

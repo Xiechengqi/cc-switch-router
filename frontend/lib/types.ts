@@ -2415,6 +2415,7 @@ export type ClientMarketHost = {
   isClientOwner?: boolean;
   canRetireUnreachable?: boolean;
   clientConnection?: ClientMarketConnection;
+  binaryPreparation?: { status: "pending" | "running" | "ready" | "failed"; commitId?: string; updatedAt: string };
   lastVerifiedAt?: string;
   lastError?: string;
   note?: string;

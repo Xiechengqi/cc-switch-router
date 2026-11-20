@@ -50,7 +50,7 @@ TokenSwitch 的公共汇聚层。为 `cc-switch-server` 实例提供公网子域
 
 早期的 `cc-switch` Tauri 桌面版已不再作为客户端,相关兼容代码已移除,详见 [docs/migration-history.md](docs/migration-history.md)。
 
-远程主机上的部署由仓库内 `install-client.sh` 负责,它会下载 `cc-switch-server` 二进制并完成初始化。Router 的 `/install-client.sh` 会在请求时写入 Settings 中当前选择的 Server Release；默认值是 `latest`，也可固定为已经通过 Server 手动发布流程生成的 7 位 Commit Release。脚本严格识别 AMD64/ARM64，同时下载同一 Release、同一下载源的 binary 与 `.sha256`，在覆盖现有文件前完成 checksum；固定 Commit 时还会检查 staged binary 的 `version --json`。任一步失败都会终止，不会回退 `latest`。此设置只影响之后下载的安装脚本，不会修改已安装 Server，Server 自升级仍保持使用 `latest`。
+远程主机上的部署由仓库内 `install-client.sh` 负责,它会下载 `cc-switch-server` 二进制并完成初始化。Router 的 `/install-client.sh` 会在请求时写入 Settings 中当前选择的 Server Release；默认值是 `latest`，也可固定为已经通过 Server 手动发布流程生成的 7 位 Commit Release。脚本严格识别 AMD64/ARM64，同时下载同一 Release、同一下载源的 binary 与 `.sha256`，在覆盖现有文件前完成 checksum；固定 Commit 时还会检查 staged binary 的 `version --json`。任一步失败都会终止，不会回退 `latest`。Router 使用此设置选择之后的主机预下载和市场开通版本；Server 自升级使用 `latest`。
 
 Client Market 的首次开通会自动调用该脚本并启动一次进程；systemd unit 使用 `Restart=no` 且不启用开机启动，OpenRC 服务不配置 respawn 且不加入默认 runlevel，没有受支持的服务管理器时仅执行一次 `nohup`。
 
@@ -58,7 +58,9 @@ Client Market 的首次开通会自动调用该脚本并启动一次进程；sys
 
 客户端与 Router 之间的注册、lease、建链、控制平面与身份注入契约,见 [PROTOCOL.md](PROTOCOL.md)。
 
-Clients 页的每个 client 条目提供「控制台」和「终端」两个入口:两者都以 iframe 弹窗打开该 client 自己的 Web 界面,经由 client tunnel 转发,登录态由 client 自身管理。终端入口在 client web URL 上追加 `?view=terminal&embed=1`,client 登录后直接落到终端视图,并以无边框形态只显示终端本身(页头、连接状态和「结束会话」按钮都由弹窗自己的标题栏取代；结束会话直接在终端里 `exit` 即可)；若该 client 关闭了 `enableWebTerminal`,它会自行回落到默认视图。控制台与终端各自独立成窗,可同时打开。
+Clients 页的「控制台」和「终端」通过独立 iframe 窗口打开 Client Web。当前已验证的 Client owner 登录 Router 后，窗口以 60 秒、一次性、绑定 installation／Host／父会话的票据交换短期凭据，自动进入 Client。父子窗口严格核对 origin、窗口对象与 nonce，票据和凭据只保存在内存。每个请求重新验证父会话、owner、公开 Host revision 和市场租约，退出或撤权会在最多 5 秒内关闭已打开的委托事件流。市场 Client 控制台向当前租户本人提供自动登录，市场页面终端仍只向 Router owner 开放；Router owner 进入别人的市场 Client 仍需该 Client 的本地登录。旧 Client 保留原登录入口，升级 Server Web 后启用自动握手。
+
+Client Market 在主机添加、批量导入或重验证后，异步将所选 Server Release 下载到主机的 `/var/cache/cc-switch-router/server`，只校验文件摘要，不执行程序。独立队列持久化状态并在 Router 重启后恢复，失败时租用仍可补下载。租用开通先重新查询发布的 Release 与可信 SHA-256，检查本地缓存，下载后再次确认设置／Release；正式启动前核对 checksum、产品名、完整 commit 和架构。`latest` 的开通检查绕过设置页的五分钟缓存，发布切换或版本无法确认时可重试失败。缓存命中时省去 binary 下载和地区探测，初始化密码仍从 stdin 传入。退租清理删除正式安装与租户数据，保留不含租户配置的下载缓存。
 
 ## 边界策略
 

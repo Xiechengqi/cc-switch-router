@@ -82,6 +82,7 @@ test("Host prices, trial policy, Provider identity and metadata refresh without 
     trialHours: 0,
     defaultTrialHours: 24,
     hostname: "new-host",
+    binaryPreparation: { status: "ready", commitId: "abc1234", updatedAt: host.updatedAt! },
     canWebTerminal: true,
     eligibility: { allowed: false, status: "access_required" },
     clientConnection: { state: "online", lastHeartbeatAt: "2026-10-29T05:00:00Z" },

@@ -406,6 +406,11 @@ function HostRowImpl({
             <Chip size="sm" variant="soft" className="shrink-0">
               {t(statusLabelKey(host.status))}
             </Chip>
+            {host.status === "idle" && host.binaryPreparation ? (
+              <span className="mt-0.5 block text-[11px] leading-4 text-muted-foreground">
+                {t(`clientMarket.binary.${host.binaryPreparation.status}`)}
+              </span>
+            ) : null}
             {clientConnection ? (
               <span
                 className={`mt-0.5 block truncate text-[11px] leading-4 ${

@@ -295,6 +295,7 @@ pub fn router(state: ServerState) -> Router {
 
     Router::new()
         .merge(public_api)
+        .merge(crate::store::client_web_sessions::router())
         .merge(crate::client_market::router())
         .merge(crate::client_market_trade::router())
         .merge(crate::client_market_audit::router())
@@ -718,6 +719,10 @@ pub fn router(state: ServerState) -> Router {
         .route("/*path", any(ui_or_proxy_handler))
         .layer(middleware::from_fn_with_state(
             state.clone(),
+            crate::store::client_web_sessions::middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
             crate::market_security::middleware,
         ))
         .layer(middleware::from_fn_with_state(
@@ -920,7 +925,7 @@ async fn install_client_script(State(state): State<ServerState>, headers: Header
         .unwrap_or_else(|error| AppError::Internal(error.to_string()).into_response())
 }
 
-fn render_install_client_script(release: &str) -> Result<String, AppError> {
+pub(crate) fn render_install_client_script(release: &str) -> Result<String, AppError> {
     let release = crate::client_server_release::normalize_client_server_release(release)
         .map_err(AppError::Internal)?;
     let template = include_str!("../install-client.sh");

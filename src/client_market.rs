@@ -34,6 +34,8 @@ use crate::secure_file::atomic_replace_file_mode;
 use crate::store::AppStore;
 
 pub const PROVISION_SOURCE_ROUTER_MARKET: &str = "router_market";
+#[path = "client_market_binary.rs"]
+mod binary;
 
 const HOST_STATUS_IDLE: &str = "idle";
 const HOST_STATUS_ALLOCATED: &str = "allocated";
@@ -112,7 +114,7 @@ const STALE_RESERVED_AFTER: Duration = Duration::from_secs(10 * 60);
 
 const SUBDOMAIN_RESERVATION_TTL_MS: i64 = 30 * 60 * 1000;
 const PROVISION_POLL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-const PROVISION_POLL_INTERVAL: Duration = Duration::from_secs(15);
+const PROVISION_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const PROVISION_SECRET_TTL: Duration = Duration::from_secs(15 * 60);
 const PROVISION_REDEEM_RETRY_TTL: Duration = Duration::from_secs(2 * 60);
 const SSH_VERIFY_TIMEOUT: Duration = Duration::from_secs(180);
@@ -135,17 +137,21 @@ const MAX_NOTE_BYTES: usize = 500;
 /// Most Client Market hosts are Alpine Docker images without bash/curl by default.
 const REMOTE_ENSURE_CLIENT_MARKET_DEPS: &str = r#"
 ensure_client_market_deps() {
-  need_bash=0; need_curl=0; need_ping=0
+  need_bash=0; need_curl=0; need_ping=0; need_flock=0; need_sha=0
   command -v bash >/dev/null 2>&1 || need_bash=1
   command -v curl >/dev/null 2>&1 || need_curl=1
   command -v ping >/dev/null 2>&1 || need_ping=1
-  if [ "$need_bash$need_curl$need_ping" = "000" ]; then
+  command -v flock >/dev/null 2>&1 || need_flock=1
+  command -v sha256sum >/dev/null 2>&1 || need_sha=1
+  if [ "$need_bash$need_curl$need_ping$need_flock$need_sha" = "00000" ]; then
     return 0
   fi
   if command -v apk >/dev/null 2>&1; then
     set --
     [ "$need_bash" -eq 1 ] && set -- "$@" bash
     [ "$need_curl" -eq 1 ] && set -- "$@" curl ca-certificates
+    [ "$need_flock" -eq 1 ] && set -- "$@" util-linux
+    [ "$need_sha" -eq 1 ] && set -- "$@" coreutils
     [ "$need_ping" -eq 1 ] && set -- "$@" iputils
     echo "installing host dependencies via apk: $*" >&2
     apk add --no-cache "$@" || return 1
@@ -156,6 +162,8 @@ ensure_client_market_deps() {
     set --
     [ "$need_bash" -eq 1 ] && set -- "$@" bash
     [ "$need_curl" -eq 1 ] && set -- "$@" curl ca-certificates
+    [ "$need_flock" -eq 1 ] && set -- "$@" util-linux
+    [ "$need_sha" -eq 1 ] && set -- "$@" coreutils
     [ "$need_ping" -eq 1 ] && set -- "$@" iputils-ping
     echo "installing host dependencies via apt-get: $*" >&2
     export DEBIAN_FRONTEND=noninteractive
@@ -171,6 +179,8 @@ ensure_client_market_deps() {
   command -v bash >/dev/null 2>&1 || { echo "required command still missing: bash" >&2; return 127; }
   command -v curl >/dev/null 2>&1 || { echo "required command still missing: curl" >&2; return 127; }
   command -v ping >/dev/null 2>&1 || { echo "required command still missing: ping" >&2; return 127; }
+  command -v flock >/dev/null 2>&1 || { echo "required command still missing: flock" >&2; return 127; }
+  command -v sha256sum >/dev/null 2>&1 || { echo "required command still missing: sha256sum" >&2; return 127; }
   return 0
 }
 "#;
@@ -923,6 +933,8 @@ struct RouterSshHostView {
     #[serde(skip_serializing_if = "Option::is_none")]
     last_verified_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    binary_preparation: Option<binary::PreparationView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     last_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
@@ -999,6 +1011,7 @@ async fn list_hosts(
             query.status.as_deref(),
         )
         .await?;
+    let binary_preparations = binary::views(&state).await?;
     let hidden_paid_host_ids = {
         let conn = state.store.conn.lock().await;
         unavailable_paid_host_ids(&conn)?
@@ -1146,12 +1159,14 @@ async fn list_hosts(
                 crate::market_access::MarketEligibilityView::allowed()
             };
             let reveal_ip = reveal_operations || viewer_is_router_owner;
-            let ip_intel = host_ip_intel_for_viewer(
-                host.ip_intel_json.as_deref(),
-                &host.ip,
-                reveal_ip,
-            );
+            let ip_intel =
+                host_ip_intel_for_viewer(host.ip_intel_json.as_deref(), &host.ip, reveal_ip);
             // Full IP is host-owner and Router-owner only. Port stays host-owner only.
+            let binary_preparation = if reveal_operations || viewer_is_router_owner {
+                binary_preparations.get(&host.id).cloned()
+            } else {
+                None
+            };
             RouterSshHostView {
                 id: host.id,
                 provider_id: host.provider_id,
@@ -1197,6 +1212,7 @@ async fn list_hosts(
                 is_client_owner,
                 can_retire_unreachable,
                 client_connection,
+                binary_preparation,
                 last_verified_at: reveal_operations.then_some(host.last_verified_at).flatten(),
                 last_error: reveal_operations.then_some(host.last_error).flatten(),
                 note: reveal_operations.then_some(host.note).flatten(),
@@ -1612,6 +1628,7 @@ async fn create_host(
             trial_hours,
         )
         .await?;
+    binary::queue(&state, &host.id).await;
     Ok(Json(host_to_view(host, true)))
 }
 
@@ -1867,6 +1884,7 @@ async fn import_one_host(
                 pricing.trial_hours,
             )
             .await?;
+        binary::queue(&state, &host.id).await;
         Ok(Some(host.id))
     }
     .await;
@@ -1965,6 +1983,7 @@ async fn reverify_host(
         .store
         .client_market_complete_host_reverify(&id, hostname.as_deref(), fingerprint.as_deref())
         .await?;
+    binary::queue(&state, &updated.id).await;
     Ok(Json(host_to_view(updated, true)))
 }
 
@@ -2571,6 +2590,9 @@ pub async fn reconcile_interrupted_host_import_jobs(state: ServerState) -> Resul
 
 /// Periodic repair for stuck draining / remotely-clean unreachable hosts.
 pub async fn reconcile_stale_market_hosts(state: ServerState) -> Result<(), AppError> {
+    if let Err(error) = binary::reconcile(&state).await {
+        warn!(error = %error, "Client binary queue reconciliation failed");
+    }
     reconcile_expired_job_leases(&state, Utc::now()).await?;
     let finalized = state.store.client_market_finalize_failed_rentals().await?;
     if finalized > 0 {
@@ -3142,20 +3164,9 @@ async fn run_create_job_inner(state: &ServerState, job_id: &str) -> Result<(), A
             "create job is missing owner email or subdomain".into(),
         ));
     }
-    let router_url = router_public_url(&state.config);
-    let install_cmd = client_market_install_command(&router_url, &owner_email, &subdomain);
     let password_stdin = format!("{password}\n").into_bytes();
-    let install_result = ssh_run_remote_with_input(
-        &state.provision_ssh_key_path,
-        &known_hosts_path(&state.config),
-        &host.ip,
-        host.port,
-        &install_cmd,
-        Some(password_stdin),
-        SSH_INSTALL_TIMEOUT,
-        SshHostKeyPolicy::RequireKnown,
-    )
-    .await;
+    let install_result =
+        binary::install(state, &host, &owner_email, &subdomain, password_stdin).await;
     state
         .client_market_job_secrets
         .lock()
@@ -5581,23 +5592,6 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
-fn client_market_install_command(router_url: &str, owner_email: &str, subdomain: &str) -> String {
-    format!(
-        "{deps}\
-         set -eu; \
-         ensure_client_market_deps; \
-         mkdir -p /usr/local/bin /tmp; \
-         script=$(mktemp); trap 'rm -f \"$script\"' EXIT; \
-         curl --fail --silent --show-error --location --max-time 120 {} -o \"$script\"; \
-         bash \"$script\" {} {} --password-stdin {}",
-        shell_quote(&format!("{router_url}/install-client.sh")),
-        shell_quote(router_url),
-        shell_quote(owner_email),
-        shell_quote(subdomain),
-        deps = REMOTE_ENSURE_CLIENT_MARKET_DEPS,
-    )
-}
-
 fn sanitize_job_log_chunk(chunk: &str) -> String {
     let mut output = String::new();
     for line in chunk.lines().take(200) {
@@ -5755,6 +5749,7 @@ fn host_to_view(host: RouterSshHostRecord, reveal: bool) -> RouterSshHostView {
         is_client_owner: false,
         can_retire_unreachable: false,
         client_connection: None,
+        binary_preparation: None,
         last_verified_at: reveal.then_some(host.last_verified_at).flatten(),
         last_error: reveal.then_some(host.last_error).flatten(),
         note: reveal.then_some(host.note).flatten(),
@@ -9898,17 +9893,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn client_market_install_keeps_web_terminal_enabled() {
-        let command = client_market_install_command(
-            "https://sgptokenswitch.cc",
-            "owner@example.com",
-            "alpha-host",
-        );
-        assert!(command.contains("--password-stdin"));
-        assert!(!command.contains("disableWebTerminal"));
     }
 
     async fn add_host(

@@ -48,7 +48,8 @@
     "test:market-notifications-browser": "node scripts/market-notification-browser-test.mjs",
     "test:auth-password-browser": "node scripts/auth-password-browser-test.mjs",
     "test:share-capabilities": "tsx --test lib/share-capabilities.test.ts",
-    "test:share-capabilities-browser": "node scripts/share-capabilities-browser-test.mjs"
+    "test:share-capabilities-browser": "node scripts/share-capabilities-browser-test.mjs",
+    "test:client-web-login-browser": "node scripts/client-web-login-browser-test.mjs"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",

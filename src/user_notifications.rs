@@ -502,9 +502,14 @@ mod tests {
             "alert-incident:incident"
         );
         assert_eq!(
-            mark_read_tx(&c, &next_owner, "alert-incident:incident", &ReadRequest::default())
-                .unwrap()
-                .unread,
+            mark_read_tx(
+                &c,
+                &next_owner,
+                "alert-incident:incident",
+                &ReadRequest::default()
+            )
+            .unwrap()
+            .unread,
             0
         );
         assert_eq!(
