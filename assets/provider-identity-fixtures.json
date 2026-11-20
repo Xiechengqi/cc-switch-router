@@ -471,6 +471,52 @@
     "expectedCategory": "workbuddy"
   },
   {
+    "name": "family.opencode_zen",
+    "bindings": {
+      "claude": "fixture-provider",
+      "codex": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "OpenCode Zen",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.opencode_zen",
+            "category": "opencode_zen",
+            "displayName": "OpenCode Zen",
+            "icon": "opencode",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ],
+      "codex": [
+        {
+          "id": "fixture-provider",
+          "name": "OpenCode Zen",
+          "app": "codex",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.opencode_zen",
+            "category": "opencode_zen",
+            "displayName": "OpenCode Zen",
+            "icon": "opencode",
+            "iconColor": "#00A67E",
+            "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "opencode_zen"
+  },
+  {
     "name": "family.trae_solo",
     "bindings": {
       "claude": "fixture-provider",

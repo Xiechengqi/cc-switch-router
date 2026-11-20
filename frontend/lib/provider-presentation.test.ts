@@ -22,6 +22,10 @@ test("all provider families use the same frozen assets and categories", () => {
   assert.equal(providerCategoryLabel("openai", "zh-CN"), "OpenAI");
   assert.equal(providerCategoryLabel("anthropic", "en"), "Anthropic");
   assert.equal(providerCategoryLabel("minimax", "zh-CN"), "MiniMax");
+  assert.equal(providerCategoryLabel("opencode_zen", "zh-CN"), "OpenCode Zen");
+  const opencode = fixtures.find((fixture: { name: string }) => fixture.name === "family.opencode_zen").appProviders.codex[0].providerIdentity;
+  assert.equal(providerLogo(opencode)?.key, "opencode");
+  assert.match(providerLogo(opencode)?.content ?? "", /M384 416H128V96H384V416Z/);
 });
 
 test("one Bundle exposes one logo and one market category with multiple App APIs", () => {

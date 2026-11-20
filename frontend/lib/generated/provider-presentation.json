@@ -33,6 +33,10 @@
       "en": "WorkBuddy",
       "zh": "WorkBuddy"
     },
+    "opencode_zen": {
+      "en": "OpenCode Zen",
+      "zh": "OpenCode Zen"
+    },
     "trae": {
       "en": "Trae",
       "zh": "Trae"
@@ -146,6 +150,10 @@
     "family.workbuddy_oauth": {
       "category": "workbuddy",
       "icon": "workbuddy"
+    },
+    "family.opencode_zen": {
+      "category": "opencode_zen",
+      "icon": "opencode"
     },
     "family.trae_solo": {
       "category": "trae",
@@ -272,6 +280,12 @@
       "content": "<svg fill=\"currentColor\" fill-rule=\"evenodd\" height=\"1em\" style=\"flex:none;line-height:1\" viewBox=\"0 0 24 24\" width=\"1em\" xmlns=\"http://www.w3.org/2000/svg\"><title>Anthropic</title><path d=\"M13.827 3.52h3.603L24 20h-3.603l-6.57-16.48zm-7.258 0h3.767L16.906 20h-3.674l-1.343-3.461H5.017l-1.344 3.46H0L6.57 3.522zm4.132 9.959L8.453 7.687 6.205 13.48H10.7z\"></path></svg>",
       "defaultColor": "#D4915D",
       "sha256": "e833fdfa7e7187a86a05b870925067556a506dcd4239089aed73e1e58c9366a3"
+    },
+    "opencode": {
+      "mode": "inline",
+      "content": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 512 512\" fill=\"none\">\n<!-- OpenCode favicon glyph, https://opencode.ai/favicon.svg; colors inherit the host theme. -->\n<path d=\"M320 224V352H192V224H320Z\" fill=\"currentColor\" opacity=\".4\"/>\n<path fill-rule=\"evenodd\" clip-rule=\"evenodd\" d=\"M384 416H128V96H384V416ZM320 160H192V352H320V160Z\" fill=\"currentColor\"/>\n</svg>\n",
+      "defaultColor": "currentColor",
+      "sha256": "590ef9d7c06ca10e1ce0c49fcf2d99539ed25a1e27d8895a915897fa1626d6ed"
     },
     "custom": {
       "mode": "inline",
@@ -688,5 +702,5 @@
       "sha256": "a4813730fcfa95f5c97821b451c1e04a9e5f3626b895ebfd63bd30f146629f2e"
     }
   },
-  "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926"
+  "catalogVersion": "9cdd59f1b4b6b691c5181f8d3039da4b3d469243122d18444d3456b644190a92"
 }
