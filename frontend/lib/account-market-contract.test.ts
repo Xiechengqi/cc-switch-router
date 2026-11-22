@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import { accountMarketMessagesEn, accountMarketMessagesZh } from "./account-market-messages";
 import { walletPolicyMessagesEn, walletPolicyMessagesZh } from "./wallet-policy-messages";
+import { walletMessagesZh } from "./wallet-messages";
 
 const source = (path: string) => readFileSync(new URL(`../${path}`, import.meta.url), "utf8");
 
@@ -63,8 +64,8 @@ test("navbar actions are lazy and refocus the existing wallet instead of duplica
   assert.match(navbar, /<WalletQuickDialog key=\{actor\}/);
   const quick = source("components/market/wallet-quick-dialog.tsx");
   assert.match(quick, /setReady\(false\)/);
-  assert.match(quick, /getC2COrders\(\{ role: "buyer", status: "active" \}\)/);
-  assert.match(quick, /inlineConfirmation/);
+  // The quick dialog only tops up; sending and C2C live on the balance page.
+  assert.doesNotMatch(quick, /C2CBuyPanel|WalletTransferPanel|getC2COrders/);
   const c2c = source("components/dashboard/c2c-buy-panel.tsx");
   assert.match(c2c, /inline=\{inlineConfirmation\}/);
   assert.match(c2c, /previewForm\.current\?\.querySelector<HTMLButtonElement>/);
@@ -82,7 +83,10 @@ test("account labels have both languages and balance sending does not rename ext
   for (const value of [...Object.values(accountMarketMessagesEn), ...Object.values(accountMarketMessagesZh)]) assert.ok(value.trim());
   assert.equal(walletPolicyMessagesEn["walletTransfer.confirm"], "Send {amount}");
   assert.equal(walletPolicyMessagesZh["walletTransfer.confirm"], "转出 {amount}");
-  assert.match(source("lib/i18n.ts"), /"marketWallet\.reviewInvalidReceipt": "网关报告已付款，但回执未通过核验。请勿重复转账/);
+  // An external top-up payment is never called a balance transfer.
+  const topupCopy = Object.entries(walletMessagesZh).filter(([key]) => /^walletPage\.(topup|close|continuePay|feeIncluded)/.test(key));
+  assert.ok(topupCopy.length > 5);
+  for (const [key, value] of topupCopy) assert.doesNotMatch(value, /转账|转出/, key);
 });
 
 test("wallet action copy has both languages", async () => {
