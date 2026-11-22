@@ -25,7 +25,18 @@ function WalletDrawer({ open, onClose, busy, title, children }: {
           <Drawer.Header>
             <Drawer.Heading className="text-lg">{title}</Drawer.Heading>
           </Drawer.Header>
-          <Drawer.Body className="grid content-start gap-5 overflow-y-auto pb-8">{children}</Drawer.Body>
+          <Drawer.Body className="grid content-start gap-5 overflow-y-auto pb-8">
+            {/* Escape inside a native modal dialog (C2C order details, purchase
+                review) closes only that dialog, not the drawer around it. */}
+            <div
+              className="grid min-w-0 content-start gap-5"
+              onKeyDown={(event) => {
+                if (event.key === "Escape" && (event.target as HTMLElement).closest("dialog[open]")) event.stopPropagation();
+              }}
+            >
+              {children}
+            </div>
+          </Drawer.Body>
         </Drawer.Dialog>
       </Drawer.Content>
     </Drawer.Backdrop>
@@ -87,7 +98,7 @@ export function WalletC2CDrawer({ open, onClose, actor, view, onViewChange, orde
             items={C2C_VIEWS.map((item) => ({ id: item, ariaLabel: t(`c2c.tab.${item}`), label: t(`c2c.tab.${item}`) }))}
           />
           {view === "buy" ? (
-            <C2CBuyPanel key={`${actor}:buy`} actor={actor} inlineConfirmation onBusyChange={setBusy} onOrder={(order) => { onViewChange("orders"); onOrderChange(order.id); }} />
+            <C2CBuyPanel key={`${actor}:buy`} actor={actor} onBusyChange={setBusy} onOrder={(order) => { onViewChange("orders"); onOrderChange(order.id); }} />
           ) : null}
           <C2COrdersPanel key={actor} actor={actor} selectedId={orderId} onSelect={onOrderChange} view={view} onActiveCountChange={onActiveCountChange} />
         </div>

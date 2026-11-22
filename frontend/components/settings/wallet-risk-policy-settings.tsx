@@ -55,9 +55,12 @@ export function WalletRiskPolicySettings() {
       setSaved(true);
     } catch (cause) {
       setError(walletErrorText(cause, t, locale));
-      // Someone else saved first: show their values so the Owner can re-apply.
+      // Someone else saved first. Keep the Owner's draft and adopt the
+      // current version, so saving again is a deliberate overwrite.
       if (cause instanceof ApiError && cause.status === 409) {
-        await getFinancialRiskPolicy().then(accept).catch(() => {});
+        await getFinancialRiskPolicy()
+          .then((latest) => setPolicy((current) => current && { ...current, version: latest.version }))
+          .catch(() => {});
       }
     } finally {
       setBusy(false);
