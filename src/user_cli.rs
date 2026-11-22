@@ -147,7 +147,12 @@ pub(crate) async fn serve(listener: AdminListener, store: AppStore, config: Conf
     }
 }
 
-async fn handle(store: &AppStore, config: &Config, request: Request, actor: &str) -> Result<Reply> {
+async fn handle(
+    store: &AppStore,
+    _config: &Config,
+    request: Request,
+    actor: &str,
+) -> Result<Reply> {
     match request {
         Request::FinanceSecurity {
             email,
@@ -245,13 +250,6 @@ async fn handle(store: &AppStore, config: &Config, request: Request, actor: &str
                 actor,
                 &operation_id,
                 Utc::now(),
-            )?;
-            password_auth::queue_password_notice_tx(
-                &tx,
-                &config.data_dir,
-                &user.email,
-                &operation_id,
-                &password,
             )?;
             tx.commit()?;
             Ok(Reply {
@@ -606,13 +604,6 @@ pub(crate) async fn run(args: Vec<String>) -> Result<()> {
                         &operation_id,
                         Utc::now(),
                     )?;
-                    password_auth::queue_password_notice_tx(
-                        &tx,
-                        &config.data_dir,
-                        &status.email,
-                        &operation_id,
-                        &password,
-                    )?;
                     tx.commit()?;
                     Ok(Reply {
                         status: Some(status),
@@ -652,7 +643,7 @@ pub(crate) async fn run(args: Vec<String>) -> Result<()> {
         return Ok(());
     }
     eprintln!(
-        "User: {}\nAccount: {}\nExisting password: {}\nAll previous login sessions will be revoked.\nA confirmation email will include the new password. Keep the mailbox secure.",
+        "User: {}\nAccount: {}\nExisting password: {}\nAll previous login sessions will be revoked.\nA confirmation email (without the password) will be sent. A password set here can confirm wallet payments at once.",
         status.email, status.status, status.has_password
     );
     if !options.yes {
@@ -692,34 +683,20 @@ pub(crate) async fn run(args: Vec<String>) -> Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 fn financial_recovery(
-    conn: &Connection,
-    email: &str,
-    operation: &str,
-    key: Option<&str>,
-    session: Option<&str>,
-    actor: &str,
-    id: &str,
+    _conn: &Connection,
+    _email: &str,
+    _operation: &str,
+    _key: Option<&str>,
+    _session: Option<&str>,
+    _actor: &str,
+    _id: &str,
 ) -> Result<()> {
-    match operation {
-        "approve" if session.is_none() => crate::market_security::local_approve_tx(
-            conn,
-            email,
-            key.context("--key-id required")?,
-            actor,
-            id,
-            &Utc::now().to_rfc3339(),
-        )?,
-        "recover" if key.is_none() => crate::market_security::local_recover_tx(
-            conn,
-            email,
-            session.context("--session-id required")?,
-            actor,
-            id,
-            &Utc::now().to_rfc3339(),
-        )?,
-        _ => bail!("use approve --key-id KEY or recover --session-id SESSION"),
-    }
-    Ok(())
+    // Wallet Passkeys were replaced by login-password confirmation. A user who
+    // lost their password signs in with an email code and sets a new one; an
+    // administrator can use `user password set`.
+    bail!(
+        "finance-passkey was retired: wallet operations are confirmed with the login password; use `user password set` to reset a lost password"
+    )
 }
 async fn run_financial(args: Vec<String>) -> Result<()> {
     let mut args = args.into_iter();

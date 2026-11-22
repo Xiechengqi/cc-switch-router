@@ -1,5 +1,7 @@
 # 资金操作登录授权与通知契约
 
+> 迁移 121：Passkey 已由登录密码确认取代，“收款人同意退回”已由新收款人 24 小时待到账与撤回取代，并新增 `wallet_transfer_pending`、`wallet_transfer_cancelled` 两类必需通知。下文中 Passkey 与退回的描述为历史规则，现行契约见 [钱包安全](market-wallet-security.md)。
+
 本契约包含迁移 85、86 的通知规则及迁移 114–116 的安全更新。现行认证、Passkey、设备签名、限额和异常恢复以 [钱包安全与异常恢复](market-wallet-security.md) 为准；不恢复二次邮箱交易验证码、现金退款、提现或人工收益转入。
 
 ## 1. 交互与安全边界

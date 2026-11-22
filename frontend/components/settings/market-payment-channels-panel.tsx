@@ -14,6 +14,7 @@ import { CompactSelect } from "@/components/common/compact-select";
 import { CopyableCodeField } from "@/components/common/copyable-code-field";
 import { WalletBadge } from "@/components/market/wallet-primitives";
 import { WalletPolicySettings } from "@/components/settings/wallet-policy-settings";
+import { WalletRiskPolicySettings } from "@/components/settings/wallet-risk-policy-settings";
 import { MarketTrialSettings } from "@/components/settings/market-trial-settings";
 import { ClientTerminationSettings } from "@/components/settings/client-termination-settings";
 import { ShareTerminationSettings } from "@/components/settings/share-termination-settings";
@@ -260,6 +261,7 @@ export function MarketPaymentChannelsPanel() {
       {error && !dialog && !settingsChannel ? <Alert status="danger" role="alert">{error}</Alert> : null}
       <div aria-live="polite">{notice ? <Alert status="success">{notice}</Alert> : null}</div>
       <WalletPolicySettings />
+      <WalletRiskPolicySettings />
       <MarketTrialSettings />
       <ClientTerminationSettings />
       <ShareTerminationSettings />

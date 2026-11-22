@@ -11,7 +11,9 @@ test("full and quick wallets share one guarded top-up implementation", () => {
     const code = source(path);
     assert.match(code, /<WalletTopupForm\b/);
     assert.doesNotMatch(code, /createMarketWalletTopup\s*\(/);
-    assert.match(code, /hidden=\{task !== "topup"\}/, "switching tasks keeps the draft and idempotency key mounted");
+    // Top-up is the primary task: always mounted, never behind task tabs, so
+    // the draft and idempotency key survive opening the send/C2C drawers.
+    assert.doesNotMatch(code, /SegmentedControl|task === "topup"/);
   }
   const form = source("components/market/wallet-topup-form.tsx");
   assert.match(form, /!active \|\| !ready \|\| busyRef\.current/);

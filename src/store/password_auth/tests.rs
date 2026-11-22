@@ -682,15 +682,17 @@ async fn security_notices_are_frozen_leased_bounded_english_and_logged_once() {
             .contains("All previous login sessions were revoked")
     );
     assert!(first.envelope.html.contains("<html"));
+    // A password sealed before the change is never emailed.
+    assert!(!first.envelope.text.contains("new-password"));
+    assert!(!first.envelope.html.contains("new-password"));
+    assert!(!first.envelope.html.contains("<new-password>"));
+    // Set through the host operator's CLI: no wallet confirmation wait.
     assert!(
-        first
+        !first
             .envelope
             .text
-            .contains(&format!("New password: {password}\n"))
+            .contains("cannot confirm immediate wallet payments")
     );
-    assert!(first.envelope.html.contains("&lt;new-password&gt;"));
-    assert!(!first.envelope.html.contains("<new-password>"));
-    assert!(first.envelope.html.contains("Keep this email private"));
     assert!(
         !first
             .envelope

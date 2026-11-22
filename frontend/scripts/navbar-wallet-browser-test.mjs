@@ -256,8 +256,11 @@ try {
   const quick = page.getByRole("dialog", { name: "平台余额" });
   await quick.waitFor();
   await quick.getByText("$9.00").waitFor();
-  for (const name of ["充值", "C2C", "转出"]) await quick.getByRole("tab", { name, exact: true }).waitFor();
-  await quick.getByRole("link", { name: "查看完整余额与流水" }).click();
+  // The quick dialog is top-up only: no task tabs, no C2C or sending inside.
+  assert.equal(await quick.getByRole("tab").count(), 0, "quick dialog has no task tabs");
+  assert.equal(await quick.locator("#wallet-transfer").count(), 0, "sending lives on the balance page");
+  assert.equal(await quick.locator("[data-c2c-buy]").count(), 0, "C2C lives on the balance page");
+  await quick.getByRole("link", { name: "转账与 C2C 请到平台余额页" }).click();
   await page.waitForURL(`${baseUrl}/account/wallet/`);
   await page.locator("#wallet-actions").waitFor();
   await expectAmount("$9.00");
@@ -267,7 +270,7 @@ try {
   await page.waitForFunction(() => document.activeElement?.id === "wallet-actions");
   assert.equal(await page.getByRole("dialog").count(), 0);
   assert.deepEqual(errors, []);
-  console.log("PASS shared shortcut request, quick balance dialog, wallet navigation, retained balance across routes, and no browser exceptions");
+  console.log("PASS shared shortcut request, top-up-only quick dialog, wallet navigation, retained balance across routes, and no browser exceptions");
 } finally {
   await browser?.close();
   if (server) await new Promise((closed) => server.close(closed));

@@ -52,6 +52,84 @@ pub(super) fn buyer_limits_tx(
         suspended: false_claims > 0,
     })
 }
+/// The single "you can buy up to" figure shown to buyers. It combines the
+/// platform order range, the buyer's account tier, unfinished purchases and
+/// the rolling incoming-credit limit. Seller stock and per-seller new-buyer
+/// exposure stay per offer; order creation still enforces every rule itself.
+pub(super) fn buyer_max_now_minor_tx(
+    conn: &Connection,
+    user: &str,
+    time: &str,
+) -> Result<i64, AppError> {
+    let limits = buyer_limits_tx(conn, user, time)?;
+    let (count, amount) = active_purchases_tx(conn, user)?;
+    let cap = buyer_cap_minor(&limits, policy_tx(conn)?.max_minor, count, amount);
+    if cap <= 0 {
+        return Ok(0);
+    }
+    incoming_headroom_minor_tx(conn, user, cap, time)
+}
+/// Pure part of the buyer figure, kept separate so the arithmetic is testable.
+pub(super) fn buyer_cap_minor(
+    limits: &BuyerLimits,
+    platform_max_minor: i64,
+    active_count: i64,
+    active_minor: i64,
+) -> i64 {
+    if limits.suspended || limits.blocked_until.is_some() || active_count >= limits.max_active {
+        return 0;
+    }
+    let exposure = limits
+        .max_minor
+        .saturating_mul(limits.max_active)
+        .saturating_sub(active_minor);
+    limits
+        .max_minor
+        .min(platform_max_minor)
+        .min(exposure)
+        .max(0)
+}
+fn active_purchases_tx(conn: &Connection, buyer: &str) -> Result<(i64, i64), AppError> {
+    conn.query_row(&format!("SELECT COUNT(*),COALESCE(SUM(amount_units)/86400,0) FROM market_c2c_orders WHERE buyer_id=?1 AND status IN {ACTIVE}"),params![buyer],|r|Ok((r.get(0)?,r.get(1)?))).map_err(db_error("bound C2C buyer exposure"))
+}
+/// Largest amount (at most `cap`) the shared incoming-credit check accepts.
+/// Reuses that check instead of copying its SQL, so both can never drift.
+fn incoming_headroom_minor_tx(
+    conn: &Connection,
+    buyer: &str,
+    cap: i64,
+    time: &str,
+) -> Result<i64, AppError> {
+    let fits = |minor: i64| -> Result<bool, AppError> {
+        match crate::market_risk::require_incoming_tx(
+            conn,
+            buyer,
+            units_from_minor(minor)?,
+            time,
+            true,
+        ) {
+            Ok(()) => Ok(true),
+            Err(e) if e.code() == Some("WALLET_INCOMING_LIMIT") => Ok(false),
+            Err(e) => Err(e),
+        }
+    };
+    if fits(cap)? {
+        return Ok(cap);
+    }
+    if !fits(1)? {
+        return Ok(0);
+    }
+    let (mut low, mut high) = (1, cap - 1);
+    while low < high {
+        let mid = low + (high - low + 1) / 2;
+        if fits(mid)? {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    Ok(low)
+}
 fn require_buyer_tx(conn: &Connection, user: &str, time: &str) -> Result<BuyerLimits, AppError> {
     let limits = buyer_limits_tx(conn, user, time)?;
     if limits.suspended || limits.blocked_until.is_some() {
@@ -87,7 +165,7 @@ pub(super) fn admission_tx(
             "amount exceeds this buyer's account-age and completed-volume limit",
         ));
     }
-    let (count,amount):(i64,i64)=conn.query_row(&format!("SELECT COUNT(*),COALESCE(SUM(amount_units)/86400,0) FROM market_c2c_orders WHERE buyer_id=?1 AND status IN {ACTIVE}"),params![buyer],|r|Ok((r.get(0)?,r.get(1)?))).map_err(db_error("bound C2C buyer exposure"))?;
+    let (count, amount) = active_purchases_tx(conn, buyer)?;
     if count >= limits.max_active
         || amount.saturating_add(minor) > limits.max_minor * limits.max_active
     {

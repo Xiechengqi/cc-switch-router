@@ -166,6 +166,8 @@ export function walletTopupHref(shortfallUnits: string, returnTo: string): strin
 }
 
 export const TOPUP_PRESET_MINOR = [500, 1_000, 2_000, 5_000, 10_000] as const;
+/** Preselected top-up credit (US cents); the most common amount. */
+export const DEFAULT_TOPUP_MINOR = 2_000;
 const DEFAULT_TOPUP_MIN_MINOR = 100;
 const DEFAULT_TOPUP_MAX_MINOR = 100_000;
 

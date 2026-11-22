@@ -1,5 +1,7 @@
 //! Top-up limits apply to wallet credit. The cent-rounded maintenance fee is
-//! added afterwards and never reduces the permitted principal range.
+//! added afterwards and never reduces the permitted principal range. The
+//! product range is fixed (US$5–US$1,000); a channel can only narrow what a
+//! buyer sees when a legacy configuration is stricter.
 use super::{AppError, MAX_TOPUP_MINOR, MIN_TOPUP_MINOR, StatusCode};
 use crate::market_wallet_policy::topup_amounts;
 use serde::Serialize;
@@ -46,9 +48,8 @@ impl TopupAmountLimits {
         Err(AppError::Coded {
             status: StatusCode::BAD_REQUEST,
             code: "MARKET_TOPUP_AMOUNT_OUT_OF_RANGE",
-            message:
-                "wallet credit is outside this channel's range; the maintenance fee is additional"
-                    .into(),
+            message: "wallet credit is outside the top-up range; the maintenance fee is additional"
+                .into(),
             details: serde_json::json!({
                 "minTopupMinor": self.min_topup_minor, "maxTopupMinor": self.max_topup_minor,
                 "minCreditMinor": self.min_credit_minor, "maxCreditMinor": self.max_credit_minor,
@@ -56,6 +57,22 @@ impl TopupAmountLimits {
                 "payMinor": amounts.map(|(_, pay)| pay),
             }),
         })
+    }
+}
+
+/// The coded range error for an amount outside the fixed product range,
+/// raised before any channel is consulted.
+pub(super) fn out_of_fixed_range(credit: i64) -> AppError {
+    AppError::Coded {
+        status: StatusCode::BAD_REQUEST,
+        code: "MARKET_TOPUP_AMOUNT_OUT_OF_RANGE",
+        message: "wallet credit is outside the top-up range; the maintenance fee is additional"
+            .into(),
+        details: serde_json::json!({
+            "minTopupMinor": MIN_TOPUP_MINOR, "maxTopupMinor": MAX_TOPUP_MINOR,
+            "minCreditMinor": MIN_TOPUP_MINOR, "maxCreditMinor": MAX_TOPUP_MINOR,
+            "creditMinor": credit,
+        }),
     }
 }
 
@@ -67,15 +84,17 @@ mod tests {
     fn topup_credit_limits_exclude_fees_at_every_supported_rate() {
         for fee_bps in [0, 500, 10_000] {
             let limits = TopupAmountLimits::new(100, 100_000, fee_bps, 7).unwrap();
-            assert_eq!(limits.min_credit_minor, Some(100));
+            // A legacy US$1 channel minimum never lowers the fixed US$5 floor.
+            assert_eq!(limits.min_credit_minor, Some(500));
             assert_eq!(limits.max_credit_minor, Some(100_000));
-            for credit in [100, 95_238, 95_239, 96_000, 100_000] {
+            for credit in [500, 95_238, 95_239, 96_000, 100_000] {
                 assert_eq!(
                     limits.validate_credit(credit).unwrap(),
                     topup_amounts(credit, fee_bps).unwrap()
                 );
             }
-            assert!(limits.validate_credit(99).is_err());
+            assert!(limits.validate_credit(100).is_err());
+            assert!(limits.validate_credit(499).is_err());
             assert!(limits.validate_credit(100_001).is_err());
         }
         let limits = TopupAmountLimits::new(100, 100_000, 500, 7).unwrap();
@@ -86,7 +105,7 @@ mod tests {
     #[test]
     fn topup_credit_limits_preserve_channel_principal_bounds_and_round_fees_separately() {
         for fee_bps in [0, 1, 49, 50, 499, 500, 9_999, 10_000] {
-            for (min, max) in [(100, 100_000), (1_000, 5_000), (104, 105), (199, 201)] {
+            for (min, max) in [(500, 100_000), (1_000, 5_000), (504, 505), (599, 601)] {
                 let limits = TopupAmountLimits::new(min, max, fee_bps, 1).unwrap();
                 assert_eq!(
                     (limits.min_credit_minor, limits.max_credit_minor),
@@ -101,17 +120,33 @@ mod tests {
             }
         }
         assert_eq!(
-            TopupAmountLimits::new(100, 100, 500, 1)
+            TopupAmountLimits::new(500, 500, 500, 1)
                 .unwrap()
-                .validate_credit(100)
+                .validate_credit(500)
                 .unwrap(),
-            (5, 105)
+            (25, 525)
         );
     }
 
     #[test]
+    fn fixed_range_error_is_the_coded_buyer_range() {
+        let AppError::Coded { code, details, .. } = out_of_fixed_range(100) else {
+            panic!("expected coded range error")
+        };
+        assert_eq!(code, "MARKET_TOPUP_AMOUNT_OUT_OF_RANGE");
+        assert_eq!(details["minCreditMinor"], 500);
+        assert_eq!(details["maxCreditMinor"], 100_000);
+        assert_eq!(details["creditMinor"], 100);
+    }
+
+    #[test]
     fn topup_credit_limits_preserve_empty_ranges_and_reject_invalid_policy() {
-        for (min, max, fee) in [(1, 99, 500), (100_001, 200_000, 10_000), (500, 100, 0)] {
+        for (min, max, fee) in [
+            (1, 99, 500),
+            (100, 499, 500),
+            (100_001, 200_000, 10_000),
+            (500, 100, 0),
+        ] {
             let limits = TopupAmountLimits::new(min, max, fee, 1).unwrap();
             assert_eq!(
                 (limits.min_credit_minor, limits.max_credit_minor),

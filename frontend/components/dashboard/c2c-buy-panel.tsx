@@ -11,7 +11,7 @@ import { C2CAction, C2CCheck, C2CDialog, C2CError, C2C_INPUT } from "@/component
 import { C2CDescription } from "@/components/market/c2c-description";
 import { formatMinorUsd } from "@/lib/market-wallet-money";
 import { notifyMarketBalanceChanged } from "@/lib/market-balance-events";
-import { C2C_PENDING_PREFIX, c2cDefinitelyRejected, c2cErrorKey, c2cBlockerKey, c2cNow, c2cPayLabel, createC2C, getC2COffers, getC2COrders, getC2CPolicy, matchC2CPendingOrder, parseC2CMinor, quoteC2C, readC2CPending, writeC2CPending, type C2COffer, type C2COrder, type C2CPending, type C2CPolicyView, type C2CQuote } from "@/lib/market-c2c";
+import { C2C_PENDING_PREFIX, c2cDefinitelyRejected, c2cHasLegacyTerms, c2cErrorKey, c2cBlockerKey, c2cNow, c2cPayLabel, createC2C, getC2COffers, getC2COrders, getC2CPolicy, matchC2CPendingOrder, parseC2CMinor, quoteC2C, readC2CPending, writeC2CPending, type C2COffer, type C2COrder, type C2CPending, type C2CPolicyView, type C2CQuote } from "@/lib/market-c2c";
 
 // `reloadSignal` hands refreshing to the page; without it the panel shows its own reload.
 type C2CBuyProps = { actor: string; onOrder: (order: C2COrder) => void; onBusyChange?: (busy: boolean) => void; inlineConfirmation?: boolean; reloadSignal?: number };
@@ -31,7 +31,10 @@ function C2CBuyWorkspace({ actor, onOrder, onBusyChange, inlineConfirmation = fa
   const previewForm = React.useRef<HTMLFormElement>(null);
   const inlineWasOpen = React.useRef(false);
   const seller = offers.find(s => s.sellerId === sellerId); const minor = parseC2CMinor(amount);
-  const valid = !!seller && minor != null && minor >= seller.minMinor && minor <= seller.maxMinor;
+  // One buyer-wide ceiling (tier, unfinished purchases, incoming limit) narrows each offer.
+  const buyerMax = policy?.buyerMaxMinor;
+  const offerMax = (s: C2COffer) => buyerMax === undefined ? s.maxMinor : Math.min(s.maxMinor, buyerMax);
+  const valid = !!seller && minor != null && minor >= seller.minMinor && minor <= offerMax(seller);
   React.useEffect(() => {
     onBusyChange?.(busy || (!!quote && !pending));
     return () => onBusyChange?.(false);
@@ -104,7 +107,8 @@ function C2CBuyWorkspace({ actor, onOrder, onBusyChange, inlineConfirmation = fa
       {reloadSignal === undefined && loaded && policy?.available && !quote && !pending && !recoveryBlocked ? <C2CAction type="button" secondary disabled={busy} aria-label={t("common.reload")} onClick={() => void run(() => load())}><RefreshCw className="size-4" aria-hidden="true" /></C2CAction> : null}
     </div>
     <C2CError>{!quote || pending ? error : ""}</C2CError>
-    {policy?.buyerLimits ? <p className="text-xs text-muted-foreground">{policy.buyerLimits.suspended || policy.buyerLimits.blockedUntil ? t("c2c.buyerRestricted") : t("c2c.buyerTier", { amount: (policy.buyerLimits.maxMinor / 100).toFixed(2), count: policy.buyerLimits.maxActive })}</p> : null}
+    {policy?.buyerLimits ? <p className="text-xs text-muted-foreground">{policy.buyerLimits.suspended || policy.buyerLimits.blockedUntil ? t("c2c.buyerRestricted")
+      : buyerMax === undefined ? null : buyerMax > 0 ? t("c2c.buyerMax", { amount: formatMinorUsd(buyerMax) }) : t("c2c.buyerMaxNone")}</p> : null}
     {recoveryBlocked ? <C2CAction type="button" phase={busy ? "loading" : "default"} onClick={() => void run(async () => {
       const page = await getC2COrders({ role: "buyer", status: "active" });
       if (!mounted.current) return;
@@ -128,15 +132,15 @@ function C2CBuyWorkspace({ actor, onOrder, onBusyChange, inlineConfirmation = fa
                     <span aria-hidden="true" className={`grid size-4 shrink-0 place-items-center rounded-full border-2 ${selected ? "border-accent" : "border-slate-300"}`}>{selected ? <span className="size-1.5 rounded-full bg-accent" /> : null}</span>
                     <span className="min-w-0 truncate text-sm font-semibold">{s.displayName}</span>
                   </span>
-                  <span className="shrink-0 rounded-full bg-muted px-2.5 py-0.5 text-xs font-medium tabular-nums text-slate-700">{t("c2c.rate", { rate: s.priceBps / 100, currency: s.currency })}</span>
+                  {c2cHasLegacyTerms(s) ? <span className="shrink-0 rounded-full bg-muted px-2.5 py-0.5 text-xs font-medium tabular-nums text-slate-700">{t("c2c.rate", { rate: s.priceBps / 100, currency: s.currency })}</span> : null}
                 </span>
-                <span className="pl-[1.625rem] text-xs tabular-nums text-slate-600">{t("c2c.range", { min: formatMinorUsd(s.minMinor), max: formatMinorUsd(s.maxMinor) })} · {t("c2c.completed", { count: s.completedOrders })}</span>
+                <span className="pl-[1.625rem] text-xs tabular-nums text-slate-600">{t("c2c.range", { min: formatMinorUsd(s.minMinor), max: formatMinorUsd(Math.max(s.minMinor, offerMax(s))) })} · {t("c2c.completed", { count: s.completedOrders })}</span>
                 {!selected && s.description ? <span className="truncate pl-[1.625rem] text-xs text-slate-600">{s.description}</span> : null}
               </button>
               {selected ? <form ref={previewForm} className="grid min-w-0 gap-3 border-t border-accent/15 p-3" onSubmit={e => { e.preventDefault(); if (!valid || !minor) return; void run(async () => { const q = await quoteC2C(s.sellerId, minor); if (mounted.current) { setQuote(q); setNow(c2cNow()); setAck(false); } }); }}>
                 <C2CDescription value={s.description} />
                 <div className="flex min-w-0 flex-wrap items-end gap-2">
-                  <label className="grid min-w-[10rem] flex-1 gap-1 text-sm">{t("c2c.amount")}<input className={C2C_INPUT} inputMode="decimal" autoComplete="off" value={amount} onChange={e => setAmount(e.target.value)} placeholder={`${s.minMinor / 100}–${s.maxMinor / 100}`} disabled={busy} /></label>
+                  <label className="grid min-w-[10rem] flex-1 gap-1 text-sm">{t("c2c.amount")}<input className={C2C_INPUT} inputMode="decimal" autoComplete="off" value={amount} onChange={e => setAmount(e.target.value)} placeholder={`${s.minMinor / 100}–${Math.max(s.minMinor, offerMax(s)) / 100}`} disabled={busy} /></label>
                   <C2CAction type="submit" disabled={!valid || busy} phase={busy ? "loading" : "default"}>{t("c2c.preview")}</C2CAction>
                 </div>
               </form> : null}

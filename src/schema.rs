@@ -415,6 +415,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         120,
         include_str!("../schema/0120_client_binary_preparation.sql"),
     ),
+    (
+        121,
+        include_str!("../schema/0121_wallet_password_confirmation_pending_transfers.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -927,7 +931,7 @@ mod tests {
     // Includes live-health evidence (0109), ordered route candidates (0110),
     // resource tariffs/capabilities (0111), owner model prices (0113), and
     // browser/financial credentials, risk evidence and recovery (0114–0116).
-    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 302;
+    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 304;
 
     #[test]
     fn migration_114_revokes_existing_sessions_and_rotation_grace_only_once() {

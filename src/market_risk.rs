@@ -114,7 +114,7 @@ pub(crate) fn require_incoming_tx(
     include_reservations: bool,
 ) -> Result<(), AppError> {
     let p = policy_tx(conn)?;
-    let used:i64=conn.query_row("SELECT (SELECT COALESCE(SUM(amount_units),0) FROM market_wallet_transfers WHERE recipient_user_id=?1 AND julianday(created_at)>julianday(?2)-1)+(SELECT COALESCE(SUM(amount_units),0) FROM market_c2c_orders WHERE buyer_id=?1 AND ((status='released' AND julianday(released_at)>julianday(?2)-1) OR (?3=1 AND status IN ('awaiting_seller','awaiting_payment','paid','disputed'))))",params![user,time,include_reservations],|r|r.get(0)).map_err(db_error("sum wallet incoming risk"))?;
+    let used:i64=conn.query_row("SELECT (SELECT COALESCE(SUM(amount_units),0) FROM market_wallet_transfer_commitments WHERE recipient_user_id=?1 AND julianday(created_at)>julianday(?2)-1)+(SELECT COALESCE(SUM(amount_units),0) FROM market_c2c_orders WHERE buyer_id=?1 AND ((status='released' AND julianday(released_at)>julianday(?2)-1) OR (?3=1 AND status IN ('awaiting_seller','awaiting_payment','paid','disputed'))))",params![user,time,include_reservations],|r|r.get(0)).map_err(db_error("sum wallet incoming risk"))?;
     let max = crate::market_wallet::units_from_minor(p.incoming_user_day_minor)?;
     if used.checked_add(units).is_none_or(|v| v > max) {
         return Err(limit(

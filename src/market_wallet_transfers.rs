@@ -1,5 +1,11 @@
 //! Same-Router, non-cash wallet transfers. Quotes freeze exact ledger units;
 //! the existing Router login authorizes the reviewed quote without email OTP.
+//!
+//! Fixed rule: money sent to a recipient the sender has never exchanged credit
+//! with is reserved for [`crate::market_security::NEW_RECIPIENT_DELAY_HOURS`]
+//! and only then credits. Until then the sender can withdraw it without the
+//! recipient. Pending transfers are visible to the sender only, so nobody can
+//! present a withdrawable transfer as payment. Credited transfers are final.
 use axum::{
     Json, Router,
     extract::{ConnectInfo, Path, Query, State},
@@ -50,6 +56,11 @@ pub fn router() -> Router<ServerState> {
         .route("/v1/market-wallet/transfer-quotes", post(create_quote))
         .route("/v1/market-wallet/transfers", get(list).post(confirm))
         .route("/v1/market-wallet/transfers/:id", get(detail))
+        .route("/v1/market-wallet/transfers/pending", get(list_pending))
+        .route(
+            "/v1/market-wallet/transfers/pending/:id/cancel",
+            post(cancel_pending),
+        )
 }
 
 fn require_user_tx(conn: &Connection, user: &str) -> Result<String, AppError> {
@@ -78,7 +89,7 @@ fn capacity_tx(conn: &Connection, user: &str, time: &str) -> Result<Capacity, Ap
     let committed =
         crate::market_platform_contracts::prior_due_funding_units_tx(conn, user, None, time)?;
     let day = format!("{}T00:00:00+00:00", &time[..10]);
-    let sent: i64 = conn.query_row("SELECT COALESCE(SUM(amount_units), 0) FROM market_wallet_transfers WHERE sender_user_id = ?1 AND created_at >= ?2",
+    let sent: i64 = conn.query_row("SELECT COALESCE(SUM(amount_units), 0) FROM market_wallet_transfer_commitments WHERE sender_user_id = ?1 AND created_at >= ?2",
         params![user, day], |row| row.get(0)).map_err(db_error("sum daily wallet transfers"))?;
     let remaining = units_from_minor(policy.transfer_daily_max_minor)?
         .saturating_sub(sent)
@@ -192,7 +203,8 @@ pub(crate) fn prune_unused_tx(
     conn.execute("DELETE FROM market_wallet_transfer_quotes WHERE id IN
         (SELECT q.id FROM market_wallet_transfer_quotes q WHERE q.expires_at < ?1
          AND NOT EXISTS (SELECT 1 FROM market_wallet_transfer_challenges c WHERE c.quote_id = q.id)
-         AND NOT EXISTS (SELECT 1 FROM market_wallet_transfers t WHERE t.quote_id = q.id) LIMIT 2000)",
+         AND NOT EXISTS (SELECT 1 FROM market_wallet_transfers t WHERE t.quote_id = q.id)
+         AND NOT EXISTS (SELECT 1 FROM market_wallet_pending_transfers p WHERE p.quote_id = q.id) LIMIT 2000)",
         params![old]).map_err(db_error("prune unused transfer quotes"))?;
     conn.execute(
         "DELETE FROM market_topup_quotes WHERE id IN
@@ -228,10 +240,20 @@ struct Quote {
     #[serde(serialize_with = "serialize_units")]
     amount_units: i64,
     expires_at: String,
+    /// `delayed` for a new recipient: credits after the fixed waiting period.
+    delivery: &'static str,
+    delay_hours: i64,
+}
+fn delivery(first_recipient: bool) -> &'static str {
+    if first_recipient {
+        "delayed"
+    } else {
+        "instant"
+    }
 }
 fn read_quote_tx(conn: &Connection, sender: &str, id: &str) -> Result<Quote, AppError> {
     conn.query_row("SELECT id, sender_user_id, recipient_user_id, sender_email, recipient_email, amount_units, expires_at, recipient_hint, first_recipient FROM market_wallet_transfer_quotes WHERE id = ?1 AND sender_user_id = ?2",
-        params![id, sender], |row| Ok(Quote { recipient_hint: row.get(7)?, first_recipient: row.get(8)?, id: row.get(0)?, sender: row.get(1)?, recipient: row.get(2)?, sender_email: row.get(3)?, recipient_email: row.get(4)?, amount_units: row.get(5)?, expires_at: row.get(6)? }))
+        params![id, sender], |row| { let first: bool = row.get(8)?; Ok(Quote { recipient_hint: row.get(7)?, first_recipient: first, id: row.get(0)?, sender: row.get(1)?, recipient: row.get(2)?, sender_email: row.get(3)?, recipient_email: row.get(4)?, amount_units: row.get(5)?, expires_at: row.get(6)?, delivery: delivery(first), delay_hours: crate::market_security::NEW_RECIPIENT_DELAY_HOURS }) })
         .optional().map_err(db_error("read wallet transfer quote"))?.ok_or_else(|| AppError::NotFound("wallet transfer quote not found".into()))
 }
 
@@ -291,7 +313,8 @@ async fn create_quote(
         None => capacity_tx(&tx, &user.user_id, &time)?.transferable_units,
     };
     require_transfer_tx(&tx, &user.user_id, &recipient, amount, &time)?;
-    let first_recipient:bool=tx.query_row("SELECT NOT EXISTS(SELECT 1 FROM market_wallet_transfers WHERE sender_user_id=?1 AND recipient_user_id=?2)",params![user.user_id,recipient],|r|r.get(0)).map_err(db_error("check first recipient"))?;
+    let first_recipient =
+        !crate::market_security::known_recipient_tx(&tx, &user.user_id, &recipient)?;
     let hint = format!(
         "{}***{}",
         recipient.chars().take(2).collect::<String>(),
@@ -314,6 +337,8 @@ async fn create_quote(
         recipient_email: email,
         amount_units: amount,
         expires_at: (at + Duration::minutes(15)).to_rfc3339(),
+        delivery: delivery(first_recipient),
+        delay_hours: crate::market_security::NEW_RECIPIENT_DELAY_HOURS,
     };
     tx.execute("INSERT INTO market_wallet_transfer_quotes (id, sender_user_id, recipient_user_id, sender_email, recipient_email, amount_units, expires_at, created_at, recipient_hint, first_recipient) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![quote.id, quote.sender, quote.recipient, quote.sender_email, quote.recipient_email, quote.amount_units, quote.expires_at, time,quote.recipient_hint,quote.first_recipient]).map_err(db_error("save transfer quote"))?;
@@ -334,8 +359,12 @@ struct Transfer {
     recipient_email: String,
     #[serde(serialize_with = "serialize_units")]
     amount_units: i64,
-    journal_id: String,
+    /// Credit journal; absent while a delayed transfer is still pending.
+    journal_id: Option<String>,
     created_at: String,
+    /// `completed`, or for a delayed transfer `pending` / `cancelled`.
+    status: &'static str,
+    release_at: Option<String>,
 }
 const TRANSFER_SELECT: &str = "SELECT id, sender_email, recipient_email, amount_units, journal_id, created_at FROM market_wallet_transfers";
 fn transfer_row(row: &crate::db::Row<'_>) -> crate::db::Result<Transfer> {
@@ -344,9 +373,50 @@ fn transfer_row(row: &crate::db::Row<'_>) -> crate::db::Result<Transfer> {
         sender_email: row.get(1)?,
         recipient_email: row.get(2)?,
         amount_units: row.get(3)?,
-        journal_id: row.get(4)?,
+        journal_id: Some(row.get(4)?),
         created_at: row.get(5)?,
+        status: "completed",
+        release_at: None,
     })
+}
+const PENDING_SELECT: &str = "SELECT id, sender_email, recipient_email, amount_units, created_at, status, release_at FROM market_wallet_pending_transfers";
+fn pending_row(row: &crate::db::Row<'_>) -> crate::db::Result<Transfer> {
+    let status: String = row.get(5)?;
+    Ok(Transfer {
+        id: row.get(0)?,
+        sender_email: row.get(1)?,
+        recipient_email: row.get(2)?,
+        amount_units: row.get(3)?,
+        journal_id: None,
+        created_at: row.get(4)?,
+        status: match status.as_str() {
+            "pending" => "pending",
+            "released" => "completed",
+            _ => "cancelled",
+        },
+        release_at: Some(row.get(6)?),
+    })
+}
+/// A transfer as its sender sees it: a credited transfer wins over the pending
+/// record it was released from.
+fn sender_view_tx(conn: &Connection, sender: &str, id: &str) -> Result<Transfer, AppError> {
+    if let Some(done) = conn
+        .query_row(
+            &format!("{TRANSFER_SELECT} WHERE id = ?1 AND sender_user_id = ?2"),
+            params![id, sender],
+            transfer_row,
+        )
+        .optional()
+        .map_err(db_error("read transfer result"))?
+    {
+        return Ok(done);
+    }
+    conn.query_row(
+        &format!("{PENDING_SELECT} WHERE id = ?1 AND sender_user_id = ?2"),
+        params![id, sender],
+        pending_row,
+    )
+    .map_err(db_error("read pending transfer result"))
 }
 
 fn confirm_tx(
@@ -363,7 +433,10 @@ fn confirm_tx(
         ));
     }
     // A successful replay precedes quote expiry and funding pause checks.
-    let prior = conn.query_row("SELECT id, quote_id FROM market_wallet_transfers WHERE sender_user_id = ?1 AND (idempotency_key = ?2 OR quote_id = ?3) ORDER BY CASE WHEN idempotency_key = ?2 THEN 0 ELSE 1 END LIMIT 1",
+    let prior = conn.query_row("SELECT id, quote_id FROM (
+            SELECT id, quote_id, idempotency_key FROM market_wallet_transfers WHERE sender_user_id = ?1
+            UNION ALL SELECT id, quote_id, idempotency_key FROM market_wallet_pending_transfers WHERE sender_user_id = ?1)
+        WHERE idempotency_key = ?2 OR quote_id = ?3 ORDER BY CASE WHEN idempotency_key = ?2 THEN 0 ELSE 1 END LIMIT 1",
         params![sender, idem, input.quote_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
         .optional().map_err(db_error("read prior wallet transfer"))?;
     if let Some((id, quote)) = prior {
@@ -372,13 +445,7 @@ fn confirm_tx(
                 "wallet transfer idempotency conflict".into(),
             ));
         }
-        return conn
-            .query_row(
-                &format!("{TRANSFER_SELECT} WHERE id = ?1"),
-                params![id],
-                transfer_row,
-            )
-            .map_err(db_error("read prior transfer result"));
+        return sender_view_tx(conn, sender, &id);
     }
     let quote = read_quote_tx(conn, sender, &input.quote_id)?;
     if quote.expires_at.as_str() <= time {
@@ -420,28 +487,154 @@ fn confirm_tx(
         "transfer_confirmed",
         time,
     )?;
+    // A quote shown as delayed stays delayed even if the recipient became
+    // known meanwhile: the person confirmed a withdrawable transfer.
+    let instant = !quote.first_recipient
+        && crate::market_security::known_recipient_tx(conn, sender, &quote.recipient)?;
+    if instant {
+        if quote.amount_units >= units_from_minor(crate::market_security::LARGE_AMOUNT_MINOR)? {
+            // The request was classified before this transaction; check the
+            // confirmation and the password cooldown again where money moves.
+            crate::market_security::require_confirmed_tx(
+                conn,
+                authorization,
+                crate::market_security::Risk::Immediate,
+            )?;
+            crate::market_security::require_immediate_ready_tx(conn, sender, time)?;
+        }
+        let journal = post_transfer_tx(
+            conn,
+            &PostedTransfer {
+                id: &id,
+                sender,
+                recipient: &quote.recipient,
+                sender_email: &quote.sender_email,
+                recipient_email: &quote.recipient_email,
+                amount_units: quote.amount_units,
+                quote_id: &quote.id,
+                authorization_id: &authorization_id,
+                idempotency_key: idem,
+                fingerprint: &fingerprint,
+                created_at: time,
+            },
+            time,
+        )?;
+        return Ok(Transfer {
+            id,
+            sender_email: quote.sender_email,
+            recipient_email: quote.recipient_email,
+            amount_units: quote.amount_units,
+            journal_id: Some(journal),
+            created_at: time.into(),
+            status: "completed",
+            release_at: None,
+        });
+    }
+    // New recipient: reserve now, credit after the fixed waiting period.
+    crate::market_security::require_confirmed_tx(
+        conn,
+        authorization,
+        crate::market_security::Risk::Confirm,
+    )?;
+    let release_at = (chrono::DateTime::parse_from_rfc3339(time)
+        .map_err(|_| AppError::Internal("invalid transfer time".into()))?
+        .with_timezone(&Utc)
+        + Duration::hours(crate::market_security::NEW_RECIPIENT_DELAY_HOURS))
+    .to_rfc3339();
+    let hold = crate::market_wallet::reserve_wallet_tx(
+        conn,
+        sender,
+        PENDING_SOURCE,
+        &id,
+        "transfer",
+        quote.amount_units,
+        Some(&release_at),
+        time,
+    )
+    .map_err(|e| match e {
+        AppError::Conflict(_) => problem(
+            "WALLET_TRANSFER_INSUFFICIENT",
+            "available balance changed; review the transfer again",
+        ),
+        other => other,
+    })?;
+    conn.execute("INSERT INTO market_wallet_pending_transfers (id, sender_user_id, recipient_user_id, sender_email, recipient_email, amount_units, quote_id, authorization_id, hold_id, idempotency_key, fingerprint, status, release_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'pending', ?12, ?13)",
+        params![id, sender, quote.recipient, quote.sender_email, quote.recipient_email, quote.amount_units, quote.id, authorization_id, hold, idem, fingerprint, release_at, time]).map_err(db_error("save pending wallet transfer"))?;
+    crate::market_notifications::enqueue_user_notification_tx(
+        conn,
+        "buyer",
+        sender,
+        "wallet_transfer_pending",
+        "wallet_transfer",
+        &id,
+        &format!("wallet_transfer_pending:{id}"),
+        serde_json::json!({ "transferId": id, "amountUnits": quote.amount_units.to_string(), "recipientEmail": quote.recipient_email, "releaseAt": release_at }),
+        time,
+    )?;
+    Ok(Transfer {
+        id,
+        sender_email: quote.sender_email,
+        recipient_email: quote.recipient_email,
+        amount_units: quote.amount_units,
+        journal_id: None,
+        created_at: time.into(),
+        status: "pending",
+        release_at: Some(release_at),
+    })
+}
+
+/// Ledger source of the balance reservation behind a pending transfer.
+const PENDING_SOURCE: &str = "wallet_transfer_pending";
+
+struct PostedTransfer<'a> {
+    id: &'a str,
+    sender: &'a str,
+    recipient: &'a str,
+    sender_email: &'a str,
+    recipient_email: &'a str,
+    amount_units: i64,
+    quote_id: &'a str,
+    authorization_id: &'a str,
+    idempotency_key: &'a str,
+    fingerprint: &'a str,
+    /// Confirmation time; equals the authorization time for verified evidence.
+    created_at: &'a str,
+}
+
+/// Moves available credit from sender to recipient and records the immutable
+/// transfer. Returns the journal id.
+fn post_transfer_tx(
+    conn: &Connection,
+    t: &PostedTransfer<'_>,
+    time: &str,
+) -> Result<String, AppError> {
+    crate::market_wallet::ensure_wallet_tx(conn, t.recipient, time)?;
+    wallet_snapshot_tx(conn, t.recipient)?
+        .posted_units
+        .checked_add(t.amount_units)
+        .ok_or_else(|| AppError::Conflict("recipient wallet balance limit exceeded".into()))?;
     let journal = post_journal_tx(
         conn,
         "wallet_transfer",
-        &id,
+        t.id,
         "transfer",
-        &fingerprint,
+        t.fingerprint,
         &[
             Posting {
                 kind: "wallet_available",
-                subject_id: sender,
-                signed_units: quote.amount_units,
+                subject_id: t.sender,
+                signed_units: t.amount_units,
             },
             Posting {
                 kind: "wallet_available",
-                subject_id: &quote.recipient,
-                signed_units: -quote.amount_units,
+                subject_id: t.recipient,
+                signed_units: -t.amount_units,
             },
         ],
         time,
     )?;
     let changed = conn.execute("UPDATE market_wallet_accounts SET posted_units = posted_units - ?2, version = version + 1, updated_at = ?3 WHERE user_id = ?1 AND asset_code = 'USD' AND posted_units - held_units >= ?2",
-        params![sender, quote.amount_units, time]).map_err(db_error("debit wallet transfer"))?;
+        params![t.sender, t.amount_units, time]).map_err(db_error("debit wallet transfer"))?;
     if changed != 1 {
         return Err(problem(
             "WALLET_TRANSFER_INSUFFICIENT",
@@ -449,12 +642,12 @@ fn confirm_tx(
         ));
     }
     conn.execute("UPDATE market_wallet_accounts SET posted_units = posted_units + ?2, version = version + 1, updated_at = ?3 WHERE user_id = ?1 AND asset_code = 'USD'",
-        params![quote.recipient, quote.amount_units, time]).map_err(db_error("credit wallet transfer"))?;
+        params![t.recipient, t.amount_units, time]).map_err(db_error("credit wallet transfer"))?;
     conn.execute("INSERT INTO market_wallet_transfers (id, sender_user_id, recipient_user_id, sender_email, recipient_email, amount_units, quote_id, authorization_id, idempotency_key, fingerprint, journal_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-        params![id, sender, quote.recipient, quote.sender_email, quote.recipient_email, quote.amount_units, quote.id, authorization_id, idem, fingerprint, journal.id, time]).map_err(db_error("save wallet transfer"))?;
+        params![t.id, t.sender, t.recipient, t.sender_email, t.recipient_email, t.amount_units, t.quote_id, t.authorization_id, t.idempotency_key, t.fingerprint, journal.id, t.created_at]).map_err(db_error("save wallet transfer"))?;
     for (recipient, event) in [
-        (sender, "wallet_transfer_sent"),
-        (quote.recipient.as_str(), "wallet_transfer_received"),
+        (t.sender, "wallet_transfer_sent"),
+        (t.recipient, "wallet_transfer_received"),
     ] {
         crate::market_notifications::enqueue_user_notification_tx(
             conn,
@@ -462,20 +655,188 @@ fn confirm_tx(
             recipient,
             event,
             "wallet_transfer",
-            &id,
-            &format!("{event}:{id}"),
-            serde_json::json!({ "transferId": id, "amountUnits": quote.amount_units.to_string(), "senderEmail": quote.sender_email, "recipientEmail": quote.recipient_email }),
+            t.id,
+            &format!("{event}:{}", t.id),
+            serde_json::json!({ "transferId": t.id, "amountUnits": t.amount_units.to_string(), "senderEmail": t.sender_email, "recipientEmail": t.recipient_email }),
             time,
         )?;
     }
-    Ok(Transfer {
-        id,
-        sender_email: quote.sender_email,
-        recipient_email: quote.recipient_email,
-        amount_units: quote.amount_units,
-        journal_id: journal.id,
-        created_at: time.into(),
-    })
+    Ok(journal.id)
+}
+
+struct PendingRow {
+    id: String,
+    sender: String,
+    recipient: String,
+    sender_email: String,
+    recipient_email: String,
+    amount_units: i64,
+    quote_id: String,
+    authorization_id: String,
+    hold_id: String,
+    idempotency_key: String,
+    fingerprint: String,
+    created_at: String,
+}
+fn read_pending_tx(conn: &Connection, id: &str) -> Result<Option<PendingRow>, AppError> {
+    conn.query_row("SELECT id, sender_user_id, recipient_user_id, sender_email, recipient_email, amount_units, quote_id, authorization_id, hold_id, idempotency_key, fingerprint, created_at FROM market_wallet_pending_transfers WHERE id = ?1 AND status = 'pending'",
+        params![id], |r| Ok(PendingRow { id: r.get(0)?, sender: r.get(1)?, recipient: r.get(2)?, sender_email: r.get(3)?, recipient_email: r.get(4)?, amount_units: r.get(5)?, quote_id: r.get(6)?, authorization_id: r.get(7)?, hold_id: r.get(8)?, idempotency_key: r.get(9)?, fingerprint: r.get(10)?, created_at: r.get(11)? }))
+        .optional().map_err(db_error("read pending wallet transfer"))
+}
+
+fn cancel_pending_tx(
+    conn: &Connection,
+    row: &PendingRow,
+    reason: &str,
+    time: &str,
+) -> Result<(), AppError> {
+    crate::market_wallet::release_hold_tx(conn, &row.hold_id, time)?;
+    let changed = conn
+        .execute(
+            "UPDATE market_wallet_pending_transfers SET status = 'cancelled', cancel_reason = ?2, resolved_at = ?3 WHERE id = ?1 AND status = 'pending'",
+            params![row.id, reason, time],
+        )
+        .map_err(db_error("cancel pending wallet transfer"))?;
+    if changed != 1 {
+        return Err(AppError::Conflict(
+            "pending transfer already resolved".into(),
+        ));
+    }
+    crate::market_notifications::enqueue_user_notification_tx(
+        conn,
+        "buyer",
+        &row.sender,
+        "wallet_transfer_cancelled",
+        "wallet_transfer",
+        &row.id,
+        &format!("wallet_transfer_cancelled:{}", row.id),
+        serde_json::json!({ "transferId": row.id, "amountUnits": row.amount_units.to_string(), "recipientEmail": row.recipient_email, "reason": reason }),
+        time,
+    )?;
+    Ok(())
+}
+
+/// Outcome of trying to release one due pending transfer.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ReleaseOutcome {
+    Released,
+    Cancelled,
+    /// A finance safety hold covers one of the users; retry later.
+    Deferred,
+    NotDue,
+}
+
+/// Credits one due pending transfer, or returns it to the sender when the
+/// recipient can no longer receive credit. Run inside one transaction.
+pub(crate) fn release_pending_tx(
+    conn: &Connection,
+    id: &str,
+    time: &str,
+) -> Result<ReleaseOutcome, AppError> {
+    let Some(row) = read_pending_tx(conn, id)? else {
+        return Ok(ReleaseOutcome::NotDue);
+    };
+    let due: bool = conn
+        .query_row(
+            "SELECT julianday(release_at) <= julianday(?2) FROM market_wallet_pending_transfers WHERE id = ?1",
+            params![id, time],
+            |r| r.get(0),
+        )
+        .map_err(db_error("check pending transfer due time"))?;
+    if !due {
+        return Ok(ReleaseOutcome::NotDue);
+    }
+    match crate::market_reconcile::ensure_finance_scopes_safe_tx(
+        conn,
+        &[
+            crate::market_reconcile::FinanceScope::User(&row.sender),
+            crate::market_reconcile::FinanceScope::User(&row.recipient),
+        ],
+    ) {
+        Ok(()) => {}
+        Err(e) if crate::market_reconcile::is_finance_hold(&e) => {
+            return Ok(ReleaseOutcome::Deferred);
+        }
+        Err(e) => return Err(e),
+    }
+    let usable = |user: &str| match require_user_tx(conn, user) {
+        Ok(_) => Ok(true),
+        Err(e) if e.code() == Some("WALLET_TRANSFER_USER_UNVERIFIED") => Ok(false),
+        Err(e) => Err(e),
+    };
+    if !usable(&row.recipient)? {
+        cancel_pending_tx(conn, &row, "recipient_unavailable", time)?;
+        return Ok(ReleaseOutcome::Cancelled);
+    }
+    // A disabled sender, or one whose balance no longer covers the reserved
+    // amount (e.g. after a reversed top-up), gets the reservation back
+    // instead of a release that would fail on every pass.
+    let sender = wallet_snapshot_tx(conn, &row.sender)?;
+    if !usable(&row.sender)? || sender.available_units < 0 {
+        cancel_pending_tx(conn, &row, "sender_unavailable", time)?;
+        return Ok(ReleaseOutcome::Cancelled);
+    }
+    crate::market_wallet::release_hold_tx(conn, &row.hold_id, time)?;
+    post_transfer_tx(
+        conn,
+        &PostedTransfer {
+            id: &row.id,
+            sender: &row.sender,
+            recipient: &row.recipient,
+            sender_email: &row.sender_email,
+            recipient_email: &row.recipient_email,
+            amount_units: row.amount_units,
+            quote_id: &row.quote_id,
+            authorization_id: &row.authorization_id,
+            idempotency_key: &row.idempotency_key,
+            fingerprint: &row.fingerprint,
+            created_at: &row.created_at,
+        },
+        time,
+    )?;
+    conn.execute(
+        "UPDATE market_wallet_pending_transfers SET status = 'released', resolved_at = ?2 WHERE id = ?1 AND status = 'pending'",
+        params![row.id, time],
+    )
+    .map_err(db_error("mark pending transfer released"))?;
+    Ok(ReleaseOutcome::Released)
+}
+
+/// Releases due pending transfers, each in its own transaction so one failure
+/// cannot block the others. Returns how many were resolved.
+pub(crate) fn release_due_isolated(conn: &Connection, time: &str, limit: i64) -> usize {
+    let ids: Vec<String> = match conn
+        .prepare("SELECT id FROM market_wallet_pending_transfers WHERE status = 'pending' AND julianday(release_at) <= julianday(?1) ORDER BY release_at, id LIMIT ?2")
+        .and_then(|mut s| {
+            s.query_map(params![time, limit], |r| r.get::<_, String>(0))?
+                .collect::<crate::db::Result<Vec<_>>>()
+        }) {
+        Ok(ids) => ids,
+        Err(error) => {
+            tracing::warn!(error = %error, "pending wallet transfer scan failed");
+            return 0;
+        }
+    };
+    let mut resolved = 0;
+    for id in ids {
+        let result = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error("begin pending transfer release"))
+            .and_then(|tx| {
+                let outcome = release_pending_tx(&tx, &id, time)?;
+                tx.commit()
+                    .map_err(db_error("commit pending transfer release"))?;
+                Ok(outcome)
+            });
+        match result {
+            Ok(ReleaseOutcome::Released | ReleaseOutcome::Cancelled) => resolved += 1,
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(error = %error, transfer = %id, "pending wallet transfer release failed")
+            }
+        }
+    }
+    resolved
 }
 
 async fn confirm(
@@ -540,8 +901,80 @@ async fn detail(
     let user = session(&state, &headers).await?;
     let conn = state.store.conn.lock().await;
     let transfer = conn.query_row(&format!("{TRANSFER_SELECT} WHERE id = ?1 AND (sender_user_id = ?2 OR recipient_user_id = ?2)"), params![id, user.user_id], transfer_row)
-        .optional().map_err(db_error("read wallet transfer"))?.ok_or_else(|| AppError::NotFound("wallet transfer not found".into()))?;
+        .optional().map_err(db_error("read wallet transfer"))?;
+    let transfer = match transfer {
+        Some(found) => found,
+        // Only the sender can see a transfer that has not credited yet.
+        None => sender_view_tx(&conn, &user.user_id, &id)
+            .map_err(|_| AppError::NotFound("wallet transfer not found".into()))?,
+    };
     Ok((no_store(), Json(transfer)))
+}
+
+/// The sender's transfers that are still waiting to credit.
+async fn list_pending(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let user = session(&state, &headers).await?;
+    let conn = state.store.conn.lock().await;
+    let mut stmt = conn
+        .prepare(&format!("{PENDING_SELECT} WHERE sender_user_id = ?1 AND status = 'pending' ORDER BY release_at, id LIMIT 50"))
+        .map_err(db_error("prepare pending wallet transfers"))?;
+    let items = stmt
+        .query_map(params![user.user_id], pending_row)
+        .map_err(db_error("query pending wallet transfers"))?
+        .collect::<crate::db::Result<Vec<_>>>()
+        .map_err(db_error("read pending wallet transfers"))?;
+    Ok((no_store(), Json(serde_json::json!({ "items": items }))))
+}
+
+/// Withdraws a pending transfer back to the sender's available balance. Money
+/// only returns to its owner, so no password confirmation is needed.
+async fn cancel_pending(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let user = crate::market_finance_auth::write_session(&state, &headers).await?;
+    let conn = state.store.conn.lock().await;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_error("begin pending transfer withdrawal"))?;
+    let time = now();
+    crate::market_finance_auth::require_live_session_tx(&tx, &user, &time)?;
+    let result = withdraw_pending_tx(&tx, &user.user_id, &id, &time)?;
+    tx.commit()
+        .map_err(db_error("commit pending transfer withdrawal"))?;
+    Ok((no_store(), Json(result)))
+}
+
+fn withdraw_pending_tx(
+    conn: &Connection,
+    sender: &str,
+    id: &str,
+    time: &str,
+) -> Result<Transfer, AppError> {
+    match read_pending_tx(conn, id)? {
+        Some(row) if row.sender == sender => {
+            cancel_pending_tx(conn, &row, "sender_withdrew", time)?
+        }
+        Some(_) => return Err(AppError::NotFound("pending transfer not found".into())),
+        // Already credited or withdrawn: report the current state; a credited
+        // transfer cannot be withdrawn.
+        None => {
+            let current = sender_view_tx(conn, sender, id)
+                .map_err(|_| AppError::NotFound("pending transfer not found".into()))?;
+            if current.status == "completed" {
+                return Err(problem(
+                    "WALLET_TRANSFER_ALREADY_CREDITED",
+                    "the transfer has already credited and cannot be withdrawn",
+                ));
+            }
+            return Ok(current);
+        }
+    }
+    sender_view_tx(conn, sender, id)
 }
 
 #[cfg(test)]
@@ -557,7 +990,7 @@ pub(crate) fn verified_transfer_for_test(
         (chrono::DateTime::parse_from_rfc3339(at).unwrap() + Duration::minutes(15)).to_rfc3339();
     conn.execute("INSERT INTO market_wallet_transfer_quotes(id,sender_user_id,recipient_user_id,sender_email,recipient_email,amount_units,expires_at,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
         params![quote,sender,recipient,require_user_tx(conn,sender)?,require_user_tx(conn,recipient)?,amount,expiry,at]).unwrap();
-    confirm_tx(
+    let transfer = confirm_tx(
         conn,
         &crate::market_finance_auth::test_session(conn, sender),
         sender,
@@ -565,6 +998,17 @@ pub(crate) fn verified_transfer_for_test(
         &ConfirmRequest { quote_id: quote },
         at,
     )?;
+    // Fixtures want credited money; let a delayed transfer reach its release.
+    if let Some(release_at) = transfer
+        .release_at
+        .as_deref()
+        .filter(|_| transfer.status == "pending")
+    {
+        assert_eq!(
+            release_pending_tx(conn, &transfer.id, release_at)?,
+            ReleaseOutcome::Released
+        );
+    }
     Ok(())
 }
 
@@ -600,7 +1044,41 @@ mod tests {
             quote_id: id.into(),
         }
     }
+    /// Confirms and, for a new recipient, releases at the scheduled time.
+    pub(super) fn confirm_released(
+        conn: &Connection,
+        auth: &crate::models::AuthSession,
+        sender: &str,
+        key: &str,
+        input: &ConfirmRequest,
+        time: &str,
+    ) -> Result<Transfer, AppError> {
+        let t = confirm_tx(conn, auth, sender, key, input, time)?;
+        if t.status == "pending" {
+            let at = t.release_at.clone().unwrap();
+            assert_eq!(
+                release_pending_tx(conn, &t.id, &at)?,
+                ReleaseOutcome::Released
+            );
+            return sender_view_tx(conn, sender, &t.id);
+        }
+        Ok(t)
+    }
     fn commit(
+        conn: &Connection,
+        auth: &crate::models::AuthSession,
+        key: &str,
+        input: &ConfirmRequest,
+        time: &str,
+    ) -> Result<Transfer, AppError> {
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let result = confirm_released(&tx, auth, &auth.user_id, key, input, time)?;
+        tx.commit().unwrap();
+        Ok(result)
+    }
+    fn confirm_only(
         conn: &Connection,
         auth: &crate::models::AuthSession,
         key: &str,
@@ -647,11 +1125,12 @@ mod tests {
             .unwrap(),
             1
         );
+        // Scheduled (new recipient), then sent and received on release.
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM market_notification_outbox", [], |r| r
                 .get::<_, i64>(0))
                 .unwrap(),
-            2
+            3
         );
         assert_eq!(
             crate::market_reconcile::audit_finance_tx(&conn, "2026-10-02T00:00:00Z").unwrap(),
@@ -1053,5 +1532,170 @@ mod tests {
             wallet_snapshot_tx(&conn, "sender").unwrap().posted_units,
             units_from_minor(1000).unwrap()
         );
+    }
+
+    #[test]
+    fn a_new_recipient_waits_and_the_sender_can_withdraw_before_it_credits() {
+        let (conn, auth) = fixture();
+        let amount = units_from_minor(300).unwrap();
+        let first = confirm_only(
+            &conn,
+            &auth,
+            "pending-1",
+            &quoted(&conn, amount, "pending-q"),
+            AT,
+        )
+        .unwrap();
+        assert_eq!(first.status, "pending");
+        let release_at = first.release_at.clone().unwrap();
+        // Reserved, not credited; counted against the daily limit.
+        let sender = wallet_snapshot_tx(&conn, "sender").unwrap();
+        assert_eq!(sender.held_units, amount);
+        assert_eq!(
+            wallet_snapshot_tx(&conn, "recipient").unwrap().posted_units,
+            0
+        );
+        assert_eq!(
+            capacity_tx(&conn, "sender", AT)
+                .unwrap()
+                .daily_remaining_units,
+            units_from_minor(
+                crate::market_wallet_policy::policy_tx(&conn)
+                    .unwrap()
+                    .transfer_daily_max_minor
+            )
+            .unwrap()
+                - amount
+        );
+        // Not due yet; replay returns the same pending transfer.
+        assert_eq!(
+            release_pending_tx(&conn, &first.id, AT).unwrap(),
+            ReleaseOutcome::NotDue
+        );
+        let replay =
+            confirm_only(&conn, &auth, "pending-1", &quoted_existing("pending-q"), AT).unwrap();
+        assert_eq!(
+            (replay.id.as_str(), replay.status),
+            (first.id.as_str(), "pending")
+        );
+        // The recipient cannot see a withdrawable transfer.
+        assert!(sender_view_tx(&conn, "recipient", &first.id).is_err());
+        let withdrawn = withdraw_pending_tx(&conn, "sender", &first.id, AT).unwrap();
+        assert_eq!(withdrawn.status, "cancelled");
+        assert_eq!(
+            wallet_snapshot_tx(&conn, "sender").unwrap().available_units,
+            86400000
+        );
+        assert_eq!(
+            release_pending_tx(&conn, &first.id, &release_at).unwrap(),
+            ReleaseOutcome::NotDue
+        );
+        assert!(withdraw_pending_tx(&conn, "recipient", &first.id, AT).is_err());
+        crate::market_wallet::reconcile_wallet_tx(&conn, "sender").unwrap();
+        assert_eq!(
+            crate::market_reconcile::audit_finance_tx(&conn, &release_at).unwrap(),
+            0
+        );
+
+        // A second attempt releases on schedule; credited money is final and
+        // the recipient becomes known, so the next transfer is immediate.
+        let second = confirm_only(
+            &conn,
+            &auth,
+            "pending-2",
+            &quoted(&conn, amount, "pending-q2"),
+            AT,
+        )
+        .unwrap();
+        let due = second.release_at.clone().unwrap();
+        assert_eq!(release_due_isolated(&conn, &due, 10), 1);
+        assert_eq!(
+            wallet_snapshot_tx(&conn, "recipient").unwrap().posted_units,
+            amount
+        );
+        assert_eq!(
+            sender_view_tx(&conn, "sender", &second.id).unwrap().status,
+            "completed"
+        );
+        assert!(withdraw_pending_tx(&conn, "sender", &second.id, &due).is_err());
+        let instant_quote = quoted(&conn, 7, "instant-q");
+        // A quote made after the first credit is instant.
+        conn.execute(
+            "UPDATE market_wallet_transfer_quotes SET first_recipient=0 WHERE id='instant-q'",
+            [],
+        )
+        .unwrap();
+        let third = confirm_only(&conn, &auth, "instant", &instant_quote, &due);
+        assert_eq!(third.unwrap().status, "completed");
+        for user in ["sender", "recipient"] {
+            crate::market_wallet::reconcile_wallet_tx(&conn, user).unwrap();
+        }
+        assert_eq!(
+            crate::market_reconcile::audit_finance_tx(&conn, &due).unwrap(),
+            0
+        );
+        assert!(
+            conn.execute(
+                "UPDATE market_wallet_pending_transfers SET amount_units=1",
+                []
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute("DELETE FROM market_wallet_pending_transfers", [])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_pending_transfer_returns_when_the_recipient_can_no_longer_receive() {
+        let (conn, auth) = fixture();
+        let t = confirm_only(&conn, &auth, "gone-1", &quoted(&conn, 100, "gone-q"), AT).unwrap();
+        conn.execute("UPDATE users SET status='blocked' WHERE id='recipient'", [])
+            .unwrap();
+        let due = t.release_at.unwrap();
+        assert_eq!(
+            release_pending_tx(&conn, &t.id, &due).unwrap(),
+            ReleaseOutcome::Cancelled
+        );
+        assert_eq!(
+            wallet_snapshot_tx(&conn, "sender").unwrap().available_units,
+            86400000
+        );
+        assert_eq!(
+            wallet_snapshot_tx(&conn, "recipient").unwrap().posted_units,
+            0
+        );
+        let reason: String = conn
+            .query_row(
+                "SELECT cancel_reason FROM market_wallet_pending_transfers WHERE id=?1",
+                params![t.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason, "recipient_unavailable");
+    }
+
+    #[test]
+    fn a_finance_hold_defers_release_without_losing_the_transfer() {
+        let (conn, auth) = fixture();
+        let t = confirm_only(&conn, &auth, "held-1", &quoted(&conn, 100, "held-q"), AT).unwrap();
+        let due = t.release_at.unwrap();
+        crate::market_reconcile::case_tx(&conn, "journal_unsealed", "journal", "test-hold", AT)
+            .unwrap();
+        assert_eq!(
+            release_pending_tx(&conn, &t.id, &due).unwrap(),
+            ReleaseOutcome::Deferred
+        );
+        assert_eq!(
+            sender_view_tx(&conn, "sender", &t.id).unwrap().status,
+            "pending"
+        );
+    }
+
+    fn quoted_existing(id: &str) -> ConfirmRequest {
+        ConfirmRequest {
+            quote_id: id.into(),
+        }
     }
 }

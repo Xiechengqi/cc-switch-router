@@ -11,6 +11,7 @@ import {
 import type { AuthResult, SessionStatus } from "@/lib/types";
 import { sameLoginContext, shouldPromptForPassword } from "@/lib/password-auth";
 import { PasswordDialog } from "./password-dialog";
+import { FinancialConfirmDialog } from "./financial-confirm-dialog";
 
 type AuthContextValue = {
   session: SessionStatus | null;
@@ -116,6 +117,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }}
     >
       {children}
+      <FinancialConfirmDialog onPasswordRequired={openPasswordSettings} />
       <PasswordDialog
         open={passwordSettingsOpen}
         onOpenChange={(open) => {

@@ -23,7 +23,6 @@ export const walletPolicyMessagesEn = {
   "clientMarket.trialInvalid": "Enter 0–720 whole hours, or leave blank to use the Router default.",
   "clientCheckout.requiredBalance": "First-period balance required",
   "walletPolicy.clientTrialHours": "Default Client trial (hours)",
-  "walletPolicy.clientTrialHelp": "0–720 hours; 0 disables trials. Host owners can override this for their listings. Only new quotes inherit changes; existing rentals keep their allowance. Paid services require enough balance for the first billing period even during a trial.",
   "commission.title": "Provider service fee",
   "commission.help": "Deducted from fulfilled service revenue. Buyers pay the listing price; automatic balance credit has no extra fee.",
   "commission.rate": "Platform service fee (%)",
@@ -62,12 +61,8 @@ export const walletPolicyMessagesEn = {
   "walletPolicy.fee": "Maintenance fee ({rate}%)",
   "walletPolicy.total": "Payment total",
   "walletPolicy.pay": "Pay {amount}",
-  "walletPolicy.disclosure":
-    "Balance is for services or sending to other users, not cash refunds. The maintenance fee is charged only on top-up.",
-  "walletPolicy.quoting": "Calculating payment total…",
   "walletPolicy.quoteExpired":
     "The price has changed or expired. Review the new total, then pay again.",
-  "walletPolicy.orderBreakdown": "Fee {fee} · Paid {total}",
   "walletPolicy.title": "Balance & sending",
   "walletPolicy.help":
     "New top-ups use this fee. Existing orders keep their original price. Channel fees below are cost estimates, not buyer fees.",
@@ -88,7 +83,7 @@ export const walletPolicyMessagesEn = {
     "Sent. Reload the balance to see the latest amount available to send.",
   "walletTransfer.title": "Send balance",
   "walletTransfer.help":
-    "Free and instant on this Router. Verify the email carefully; sent balance cannot be recalled.",
+    "Free. Credits instantly to people you have sent money to before; a first transfer to someone credits after 24 hours and can be withdrawn until then.",
   "walletTransfer.email": "Recipient email",
   "walletTransfer.amount": "Amount (USD)",
   "walletTransfer.all": "Send all available",
@@ -96,9 +91,6 @@ export const walletPolicyMessagesEn = {
     "Funds already reserved or due for services cannot be sent. Limits may apply.",
   "walletTransfer.preview": "Review send",
   "walletTransfer.review": "Confirm recipient & amount",
-  "walletTransfer.exact": "Exact amount: {units} ledger units",
-  "walletTransfer.final":
-    "This sends platform balance; it is not a cash withdrawal. Check the recipient and amount before confirming.",
   "walletTransfer.confirm": "Send {amount}",
   "walletTransfer.expired":
     "This confirmation expired. Close it and review the send again.",
@@ -137,7 +129,6 @@ export const walletPolicyMessagesZh: Record<
   "marketTrial.releasing": "试用结束 · 正在回收授权",
   "marketTrial.checkout": "最多剩余 {hours} 小时及 {tokens} 免费试用，两者先耗尽即结束。正式授权确认生效后自动扣首期费用；关闭后续自动续费不影响首期转付费。余额不足将回收授权。",
   "walletPolicy.clientTrialHours": "Client 默认试用时长（小时）",
-  "walletPolicy.clientTrialHelp": "允许 0–720 小时，0 表示关闭试用。Host 所有者可以单独覆盖。仅新报价继承变更，已有租用额度不变。付费服务即使有试用，也必须具备首个计费周期所需余额才能租用。",
   "clientMarket.trialHours": "试用时长（小时，可选）",
   "clientMarket.trialInherit": "使用 Router 默认值",
   "clientMarket.trialDefault": "Router 默认：{hours} 小时",
@@ -180,11 +171,7 @@ export const walletPolicyMessagesZh: Record<
   "walletPolicy.fee": "维护费（{rate}%）",
   "walletPolicy.total": "实付总额",
   "walletPolicy.pay": "支付 {amount}",
-  "walletPolicy.disclosure":
-    "余额可用于消费或转出给其他用户，不支持提现退款。维护费仅在充值时收取。",
-  "walletPolicy.quoting": "正在计算实付金额…",
   "walletPolicy.quoteExpired": "报价已过期或发生变化，请核对新金额后重新支付。",
-  "walletPolicy.orderBreakdown": "维护费 {fee} · 实付 {total}",
   "walletPolicy.title": "余额与转出",
   "walletPolicy.help":
     "费率仅影响新充值单，已有订单金额不变。下方渠道费率仅用于估算成本，不是用户维护费。",
@@ -204,7 +191,7 @@ export const walletPolicyMessagesZh: Record<
     "转出已完成，请重新加载余额以查看最新可转出金额。",
   "walletTransfer.title": "转出余额",
   "walletTransfer.help":
-    "同一 Router 内免费即时到账。请核对邮箱，转出完成后无法撤回。",
+    "免费。向转过账的收款人即时到账；首次转给某人 24 小时后到账，到账前可撤回。",
   "walletTransfer.email": "收款用户邮箱",
   "walletTransfer.amount": "金额（美元）",
   "walletTransfer.all": "转出全部可转出余额",
@@ -212,9 +199,6 @@ export const walletPolicyMessagesZh: Record<
     "已预留或已到期应付的服务费用不可转出，并受转出限额约束。",
   "walletTransfer.preview": "核对转出",
   "walletTransfer.review": "确认收款人与金额",
-  "walletTransfer.exact": "精确金额：{units} 记账单位",
-  "walletTransfer.final":
-    "此操作为平台余额转出，不是提现。确认转出前请核对收款人和金额。",
   "walletTransfer.confirm": "转出 {amount}",
   "walletTransfer.expired": "确认信息已过期，请关闭后重新核对转出。",
   "walletTransfer.success": "已将 {amount} 转出给 {email}。",

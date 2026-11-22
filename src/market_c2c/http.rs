@@ -119,6 +119,7 @@ async fn policy(State(state): State<ServerState>, headers: HeaderMap) -> Reply<s
         "canManagePolicy":crate::api::is_finance_owner(&state.config,&u.email),
         "verified":verified,"termsVersion":TERMS_VERSION,"claimGraceSeconds":120,"firstPurchaseMaxMinor":10000,
         "buyerLimits":risk::buyer_limits_tx(&conn,&u.user_id,&crate::market_wallet::now())?,
+        "buyerMaxMinor":risk::buyer_max_now_minor_tx(&conn,&u.user_id,&crate::market_wallet::now())?,
         "independentDisputeHandlerAvailable":independent_handler_tx(&conn,&admins,state.config.router_owner_email.as_deref())?}),
     ))
 }

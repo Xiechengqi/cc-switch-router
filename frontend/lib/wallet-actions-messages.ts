@@ -5,19 +5,10 @@
 export const walletActionsMessagesEn = {
   "common.moreInfo": "More information",
 
-  "marketWallet.stat.held": "Set aside",
-  "marketWallet.stat.owed": "Due",
-  "marketWallet.stat.transferable": "Sendable",
-  "marketWallet.stat.heldHelp": "Reserved for open orders, C2C sales and disputes. It returns to your available balance when they settle.",
-  "marketWallet.stat.owedHelp": "Charges already due for services that are running. They come out of the available balance.",
-  "marketWallet.stat.transferableHelp": "What you can send or sell now: available balance minus amounts due, within the send limits.",
-  "marketWallet.amountRangeDetail": "This is the balance you receive. The maintenance fee is added on top and does not count toward this range.",
-  "walletPolicy.disclosureShort": "Balance can't be cashed out.",
 
-  "walletTransfer.helpShort": "Free and instant within this Router · can't be undone",
+  "walletTransfer.helpShort": "Free · first transfer to someone credits after 24 hours",
   "walletTransfer.allShort": "All",
   "walletTransfer.availableShort": "Sendable {amount}",
-  "walletTransfer.finalShort": "Sends can't be undone.",
 
   "c2c.tab.buy": "Buy",
   "c2c.tab.sell": "Sell",
@@ -41,19 +32,10 @@ export const walletActionsMessagesEn = {
 export const walletActionsMessagesZh: Record<keyof typeof walletActionsMessagesEn, string> = {
   "common.moreInfo": "查看说明",
 
-  "marketWallet.stat.held": "暂扣",
-  "marketWallet.stat.owed": "待扣",
-  "marketWallet.stat.transferable": "可转出",
-  "marketWallet.stat.heldHelp": "为进行中的订单、C2C 出售和争议暂时冻结，结束后自动回到可用余额。",
-  "marketWallet.stat.owedHelp": "运行中服务已产生、尚未结算的费用，会从可用余额中扣除。",
-  "marketWallet.stat.transferableHelp": "当前可转出或用于 C2C 出售的金额：可用余额扣除待扣费用，并受转出限额约束。",
-  "marketWallet.amountRangeDetail": "这是实际到账的余额。维护费另计，不计入此范围。",
-  "walletPolicy.disclosureShort": "余额不可提现。",
 
-  "walletTransfer.helpShort": "站内免费即时到账 · 转出后无法撤回",
+  "walletTransfer.helpShort": "免费 · 首次转给某人 24 小时后到账，到账前可撤回",
   "walletTransfer.allShort": "全部",
   "walletTransfer.availableShort": "可转出 {amount}",
-  "walletTransfer.finalShort": "转出后无法撤回。",
 
   "c2c.tab.buy": "购入",
   "c2c.tab.sell": "出售",

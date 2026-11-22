@@ -251,7 +251,7 @@ pub(crate) fn committed_transfer_units_tx(
 fn stock_tx(conn: &Connection, user: &str, time: &str) -> Result<i64, AppError> {
     let w = crate::market_wallet_policy::policy_tx(conn)?;
     let day = at(time)?.date_naive().to_string();
-    let sent:i64=conn.query_row("SELECT COALESCE(SUM(amount_units),0) FROM market_wallet_transfers WHERE sender_user_id=?1 AND date(created_at)>=?2",params![user,day],|r|r.get(0)).map_err(db_error("sum ordinary transfers"))?;
+    let sent:i64=conn.query_row("SELECT COALESCE(SUM(amount_units),0) FROM market_wallet_transfer_commitments WHERE sender_user_id=?1 AND date(created_at)>=?2",params![user,day],|r|r.get(0)).map_err(db_error("sum ordinary transfers"))?;
     let committed =
         crate::market_platform_contracts::prior_due_funding_units_tx(conn, user, None, time)?;
     let daily = units_from_minor(w.transfer_daily_max_minor)?
@@ -298,16 +298,53 @@ fn seller_tx(conn: &Connection, id: &str) -> Result<Option<Seller>, AppError> {
         user_id:r.get(0)?,version:r.get(1)?,enabled:r.get(2)?,suspended:r.get(3)?,display_name:r.get(4)?,description:r.get(5)?,currency:r.get(6)?,price_bps:r.get(7)?,min_minor:r.get(8)?,max_minor:r.get(9)?,auto_pause_reason:r.get(10)?,auto_paused_at:r.get(11)?,auto_pause_order_id:r.get(12)?,auto_accept_terms_version:r.get(13)?,auto_accept_consented_at:r.get(14)?
     })).optional().map_err(db_error("read C2C seller"))
 }
+/// R9 fixed seller terms. Every new or edited listing sells credit at face
+/// value, quoted in CNY at the verified rate frozen into each quote. Sellers no
+/// longer narrow the order range: the platform policy range (and the buyer's
+/// own limits) applies. Listings saved before these rules keep their stored
+/// terms until the seller next edits them.
+pub(crate) const FIXED_SELLER_CURRENCY: &str = "CNY";
+pub(crate) const FIXED_SELLER_PRICE_BPS: i64 = 10_000;
+const FIXED_SELLER_MIN_MINOR: i64 = 1;
+const FIXED_SELLER_MAX_MINOR: i64 = 10_000_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SellerTerms {
+    currency: &'static str,
+    price_bps: i64,
+    min_minor: i64,
+    max_minor: i64,
+}
+/// The only terms a seller can publish. Client-supplied currency, price and
+/// range are accepted for compatibility with older pages and then ignored.
+fn fixed_seller_terms() -> SellerTerms {
+    SellerTerms {
+        currency: FIXED_SELLER_CURRENCY,
+        price_bps: FIXED_SELLER_PRICE_BPS,
+        min_minor: FIXED_SELLER_MIN_MINOR,
+        max_minor: FIXED_SELLER_MAX_MINOR,
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SellerInput {
     expected_version: i64,
     enabled: bool,
     description: String,
-    currency: String,
-    price_bps: i64,
-    min_minor: i64,
-    max_minor: i64,
+    /// Retired seller-chosen terms. Older pages still send them; ignored.
+    #[serde(default)]
+    #[allow(dead_code)]
+    currency: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    price_bps: Option<i64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    min_minor: Option<i64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    max_minor: Option<i64>,
     acknowledge_external_payment: bool,
     auto_accept_terms_version: i64,
 }
@@ -324,16 +361,10 @@ fn save_seller_tx(
     if prior.as_ref().map_or(0, |s| s.version) != input.expected_version {
         return Err(problem("C2C_STALE", "seller settings changed; reload"));
     }
-    if !input.acknowledge_external_payment
-        || input.auto_accept_terms_version != TERMS_VERSION
-        || !matches!(input.currency.as_str(), "USD" | "CNY")
-        || !(5000..=20000).contains(&input.price_bps)
-        || input.min_minor < 1
-        || input.max_minor < input.min_minor
-        || input.max_minor > 10_000_000
-    {
+    if !input.acknowledge_external_payment || input.auto_accept_terms_version != TERMS_VERSION {
         return Err(AppError::BadRequest("invalid C2C seller terms".into()));
     }
+    let terms = fixed_seller_terms();
     if input
         .description
         .chars()
@@ -377,7 +408,7 @@ fn save_seller_tx(
          currency=excluded.currency,price_bps=excluded.price_bps,
          min_minor=excluded.min_minor,max_minor=excluded.max_minor,updated_at=excluded.updated_at,
          auto_accept_terms_version=3,auto_accept_consented_at=COALESCE(market_c2c_sellers.auto_accept_consented_at,excluded.auto_accept_consented_at)",
-        params![user,input.enabled,name,description,input.currency,input.price_bps,input.min_minor,input.max_minor,time]).map_err(db_error("save C2C seller"))?;
+        params![user,input.enabled,name,description,terms.currency,terms.price_bps,terms.min_minor,terms.max_minor,time]).map_err(db_error("save C2C seller"))?;
     audit_tx(
         conn,
         user,

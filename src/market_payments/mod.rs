@@ -1,4 +1,5 @@
 mod admin_finance;
+mod buyer_view;
 mod chain_verifier;
 mod chains;
 mod channel_settings;
@@ -40,8 +41,13 @@ use self::dujiaopay::{
 };
 use self::topup_bounds::TopupAmountLimits;
 
+/// Fixed product range for wallet credit (fee excluded): US$5–US$1,000.
+/// Channels may only widen it; buyers always see the intersection.
 const MAX_TOPUP_MINOR: i64 = 100_000;
-const MIN_TOPUP_MINOR: i64 = 100;
+const MIN_TOPUP_MINOR: i64 = 500;
+/// Smallest channel minimum an Owner may still store (legacy channels used
+/// US$1). It never lowers the buyer range below `MIN_TOPUP_MINOR`.
+const CHANNEL_MIN_FLOOR_MINOR: i64 = 100;
 const MAX_PENDING_ORDERS: i64 = 3;
 const MAX_ABANDONED_ORDERS: i64 = 3;
 const MAX_REVIEW_ORDERS: i64 = 10;
@@ -270,6 +276,10 @@ pub fn router() -> Router<ServerState> {
             post(abandon_buyer_topup),
         )
         .route("/v1/market-wallet/topups/:id/stop", post(stop_buyer_topup))
+        .route(
+            "/v1/market-wallet/topups/:id/close",
+            post(close_buyer_topup),
+        )
         .route(
             "/v1/admin/market-payment-channels",
             get(list_admin_channels).post(create_channel),
@@ -3583,6 +3593,10 @@ struct TopupView {
     has_payment_instructions: bool,
     local_close_reason: Option<String>,
     paid_at: Option<String>,
+    /// Four-state buyer projection with at most one action; see `buyer_view`.
+    buyer_view: buyer_view::BuyerTopupView,
+    /// True when create returned an existing payable order instead of a new one.
+    reused: bool,
 }
 
 /// One projection for every buyer top-up surface. A payment handle (hosted
@@ -3642,6 +3656,25 @@ const TOPUP_VIEW_SQL: &str = "SELECT id, channel_id, amount_minor, status,
 fn topup_view_row(row: &crate::db::Row<'_>) -> crate::db::Result<TopupView> {
     let status: String = row.get(3)?;
     let buyer_abandoned_at: Option<String> = row.get(7)?;
+    let mut view = topup_view_fields(row, status, buyer_abandoned_at)?;
+    view.buyer_view = buyer_view::buyer_topup_view(
+        &buyer_view::BuyerTopupFacts {
+            status: &view.status,
+            buyer_abandoned: view.buyer_abandoned_at.is_some(),
+            has_payment_handle: view.checkout_url.is_some() || view.has_payment_instructions,
+            last_gateway_status: view.last_gateway_status.as_deref(),
+            auto_close_at: view.auto_close_at.as_deref(),
+        },
+        Utc::now(),
+    );
+    Ok(view)
+}
+
+fn topup_view_fields(
+    row: &crate::db::Row<'_>,
+    status: String,
+    buyer_abandoned_at: Option<String>,
+) -> crate::db::Result<TopupView> {
     Ok(TopupView {
         id: row.get(0)?,
         channel_id: row.get(1)?,
@@ -3670,6 +3703,13 @@ fn topup_view_row(row: &crate::db::Row<'_>) -> crate::db::Result<TopupView> {
         has_payment_instructions: row.get::<_, i64>(16)? == 1,
         local_close_reason: row.get(17)?,
         paid_at: row.get(18)?,
+        buyer_view: buyer_view::BuyerTopupView {
+            state: "confirming",
+            can_pay: false,
+            can_close: false,
+            pay_until: None,
+        },
+        reused: false,
     })
 }
 
@@ -3762,6 +3802,18 @@ async fn recheck_buyer_topup(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error("begin buyer top-up recheck"))?;
     crate::market_finance_auth::require_live_session_tx(&tx, &session, &now())?;
+    // The wallet page calls this automatically when the buyer returns. A
+    // final order is answered as "not queued" instead of an error, and the
+    // per-order hint cooldown bounds gateway lookups (see queue_webhook_hint_tx).
+    let current = read_topup(&tx, &order_id, &session.user_id)?;
+    if is_final_topup_status(&current.status) {
+        tx.commit()
+            .map_err(db_error("commit buyer top-up recheck"))?;
+        return Ok((
+            no_store(),
+            Json(serde_json::json!({ "queued": false, "order": current })),
+        ));
+    }
     let queued = queue_buyer_recheck_tx(&tx, &order_id, &session.user_id)?;
     let order = read_topup(&tx, &order_id, &session.user_id)?;
     tx.commit()
@@ -3770,6 +3822,71 @@ async fn recheck_buyer_topup(
         no_store(),
         Json(serde_json::json!({ "queued": queued, "order": order })),
     ))
+}
+
+fn is_final_topup_status(status: &str) -> bool {
+    matches!(status, "credited" | "expired" | "cancelled")
+}
+
+/// R7: the buyer's single "不付了" action. The server chooses: an order the
+/// gateway can still cancel is cancelled there (network I/O outside the DB
+/// lock, exactly like `cancel_topup_for_actor`); anything else — or a cancel
+/// the gateway does not confirm — gets the local stop marker, which hides the
+/// payment entry while reconciliation keeps tracking a possible late payment.
+async fn close_buyer_topup(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(order_id): Path<String>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let session = crate::market_finance_auth::write_session(&state, &headers).await?;
+    let current = {
+        let conn = state.store.conn.lock().await;
+        read_topup(&conn, &order_id, &session.user_id)?
+    };
+    if current.buyer_abandoned_at.is_some() || is_final_topup_status(&current.status) {
+        return Ok((no_store(), Json(current)));
+    }
+    if current.status == "pending" {
+        let cancelable = topup_gateway_snapshot(&state, &order_id, &session.user_id)
+            .await
+            .map(|snapshot| snapshot.can_cancel)
+            .unwrap_or(false);
+        if cancelable
+            && let Ok(view) = cancel_topup_for_actor(
+                &state,
+                &order_id,
+                &session.user_id,
+                Some(&session.user_id),
+                Some(&session),
+            )
+            .await
+        {
+            return Ok((no_store(), Json(view)));
+        }
+    }
+    let conn = state.store.conn.lock().await;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_error("begin buyer top-up close"))?;
+    crate::market_finance_auth::require_live_session_tx(&tx, &session, &now())?;
+    let view = close_with_stop_tx(&tx, &order_id, &session.user_id)?;
+    tx.commit().map_err(db_error("commit buyer top-up close"))?;
+    Ok((no_store(), Json(view)))
+}
+
+/// The local half of `close`: stop the order, or report it as it is when it
+/// already became final or stopped meanwhile (for example a cancel that the
+/// gateway committed after our lookup).
+fn close_with_stop_tx(
+    conn: &Connection,
+    order_id: &str,
+    buyer_id: &str,
+) -> Result<TopupView, AppError> {
+    let current = read_topup(conn, order_id, buyer_id)?;
+    if current.buyer_abandoned_at.is_some() || is_final_topup_status(&current.status) {
+        return Ok(current);
+    }
+    stop_buyer_topup_tx(conn, order_id, buyer_id)
 }
 
 fn queue_buyer_recheck_tx(
@@ -4650,6 +4767,58 @@ fn ensure_pending_topup_capacity_tx(conn: &Connection, user_id: &str) -> Result<
     Ok(())
 }
 
+/// R6: before a buyer creates a different top-up, every other order that
+/// still shows a payment entry gets the buyer "stop" marker. The marker only
+/// hides the entry; reconciliation keeps tracking the order and credits a late
+/// payment. Orders already verifying, under review or cancel-requested are
+/// left untouched.
+fn supersede_payable_topups_tx(
+    conn: &Connection,
+    user_id: &str,
+    time: &str,
+) -> Result<usize, AppError> {
+    let ids = {
+        let mut statement = conn
+            .prepare(
+                "SELECT id FROM market_topup_orders
+                 WHERE user_id = ?1 AND buyer_abandoned_at IS NULL
+                   AND cancel_requested_at IS NULL
+                   AND status IN ('created', 'creating', 'create_unknown', 'pending')
+                 ORDER BY created_at, id",
+            )
+            .map_err(db_error("prepare superseded top-ups"))?;
+        statement
+            .query_map(params![user_id], |row| row.get::<_, String>(0))
+            .map_err(db_error("query superseded top-ups"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_error("read superseded top-ups"))?
+    };
+    for id in &ids {
+        let changed = conn
+            .execute(
+                "UPDATE market_topup_orders
+                 SET buyer_abandoned_at = ?2, updated_at = ?2, next_reconcile_at = ?2
+                 WHERE id = ?1 AND user_id = ?3 AND buyer_abandoned_at IS NULL
+                   AND cancel_requested_at IS NULL
+                   AND status IN ('created', 'creating', 'create_unknown', 'pending')",
+                params![id, time, user_id],
+            )
+            .map_err(db_error("supersede payable top-up"))?;
+        if changed == 1 {
+            audit_tx(
+                conn,
+                user_id,
+                "topup_superseded_by_new_order",
+                "topup",
+                id,
+                None,
+                time,
+            )?;
+        }
+    }
+    Ok(ids.len())
+}
+
 struct TopupChannelSettings {
     revision: i64,
     order_mode: String,
@@ -4898,9 +5067,7 @@ async fn create_topup(
         })
         .ok_or_else(|| AppError::BadRequest("valid Idempotency-Key required".into()))?;
     if !(MIN_TOPUP_MINOR..=MAX_TOPUP_MINOR).contains(&input.amount_minor) {
-        return Err(AppError::BadRequest(
-            "top-up amount outside supported range".into(),
-        ));
+        return Err(topup_bounds::out_of_fixed_range(input.amount_minor));
     }
     if input
         .token_id
@@ -4909,7 +5076,7 @@ async fn create_topup(
     {
         return Err(AppError::BadRequest("unsupported payment method".into()));
     }
-    let (order_id, merchant_order_id, revision, channel_id, loaded, existing_view, body) = {
+    let (order_id, merchant_order_id, revision, channel_id, loaded, existing_view, body, reused) = {
         let conn = state.store.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -4962,11 +5129,13 @@ async fn create_topup(
         // A browser reload or another tab has a new idempotency key. Reuse
         // the same active payment instead of filling the user's pending quota
         // with duplicate gateway orders for the same channel and amount.
+        let replay = prior.is_some();
         let prior = if prior.is_some() {
             prior
         } else {
             active_matching_topup_tx(&tx, &session.user_id, &request_fingerprint)?
         };
+        let reused = !replay && prior.is_some();
         let (id, merchant_order_id, revision, already_created, body) =
             if let Some((id, fingerprint, merchant_order_id, revision)) = prior {
                 if fingerprint != request_fingerprint {
@@ -5036,6 +5205,10 @@ async fn create_topup(
                     quote.pay_minor,
                     &now(),
                 )?;
+                // R6: one payable order. Capacity is checked first, so a
+                // superseded order never makes this creation fail; superseded
+                // orders keep reconciling and still credit late payments.
+                supersede_payable_topups_tx(&tx, &session.user_id, &now())?;
                 let id = Uuid::new_v4().to_string();
                 let merchant_order_id = format!("router-{}", Uuid::new_v4().simple());
                 let (success_url, cancel_url) = topup_return_urls(&topup_base_url(&state), &id);
@@ -5122,7 +5295,9 @@ async fn create_topup(
                 .map_err(db_error("read top-up stop marker"))?;
             if stopped {
                 tx.commit().map_err(db_error("commit top-up replay"))?;
-                return Ok((no_store(), Json(view.clone())));
+                let mut view = view.clone();
+                view.reused = reused;
+                return Ok((no_store(), Json(view)));
             }
         }
         tx.commit().map_err(db_error("commit top-up order"))?;
@@ -5134,14 +5309,16 @@ async fn create_topup(
             loaded,
             existing_view,
             body,
+            reused,
         )
     };
-    if let Some(view) = existing_view
+    if let Some(mut view) = existing_view
         && !matches!(
             view.status.as_str(),
             "created" | "creating" | "create_unknown"
         )
     {
+        view.reused = reused;
         return Ok((no_store(), Json(view)));
     }
     let body = match body {
@@ -5192,7 +5369,9 @@ async fn create_topup(
                 }
                 return Err(error);
             }
-            read_topup(&tx, &order_id, &session.user_id)?
+            let mut view = read_topup(&tx, &order_id, &session.user_id)?;
+            view.reused = reused;
+            view
         }
         Err(error) => {
             record_create_failure_tx(&tx, &order_id, &channel_id, &error, &now())?;
@@ -7946,7 +8125,7 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         let channels = buyer_channel_views(&conn, true).unwrap();
-        assert_eq!(channels[0].amount_limits.min_credit_minor, Some(100));
+        assert_eq!(channels[0].amount_limits.min_credit_minor, Some(500));
         assert_eq!(channels[0].amount_limits.max_credit_minor, Some(100_000));
         let quote = quotes::quote_tx(
             &conn,
@@ -7964,7 +8143,7 @@ mod tests {
             (quote.credit_minor, quote.fee_minor, quote.pay_minor),
             (100_000, 5_000, 105_000)
         );
-        for amount in [100, 95_239, 96_000] {
+        for amount in [500, 95_239, 96_000] {
             let valid = quotes::quote_tx(
                 &conn,
                 "buyer",
@@ -7980,7 +8159,7 @@ mod tests {
             assert_eq!(valid.credit_minor, amount);
             assert_eq!(valid.pay_minor, amount + valid.fee_minor);
         }
-        for amount in [99, 100_001, -1, i64::MAX] {
+        for amount in [100, 499, 100_001, -1, i64::MAX] {
             let error = quotes::quote_tx(
                 &conn,
                 "buyer",
@@ -8063,19 +8242,19 @@ mod tests {
             (100_000, 725, 7_250, 107_250)
         );
 
-        // Even an exact $1 principal range remains payable with a nonzero fee.
-        conn.execute("INSERT INTO market_payment_channel_settings (channel_id, max_topup_minor, updated_at) VALUES ('channel', 100, '2026-10-25')
-            ON CONFLICT (channel_id) DO UPDATE SET max_topup_minor = 100, version = market_payment_channel_settings.version + 1", []).unwrap();
+        // An exact US$5 principal range remains payable with a nonzero fee.
+        conn.execute("INSERT INTO market_payment_channel_settings (channel_id, max_topup_minor, updated_at) VALUES ('channel', 500, '2026-10-25')
+            ON CONFLICT (channel_id) DO UPDATE SET max_topup_minor = 500, version = market_payment_channel_settings.version + 1", []).unwrap();
         let channels = buyer_channel_views(&conn, true).unwrap();
-        assert_eq!(channels[0].amount_limits.min_credit_minor, Some(100));
-        assert_eq!(channels[0].amount_limits.max_credit_minor, Some(100));
+        assert_eq!(channels[0].amount_limits.min_credit_minor, Some(500));
+        assert_eq!(channels[0].amount_limits.max_credit_minor, Some(500));
         let minimum = quotes::quote_tx(
             &conn,
             "buyer",
             true,
             quotes::QuoteRequest {
                 channel_id: "channel".into(),
-                amount_minor: 100,
+                amount_minor: 500,
                 token_id: None,
             },
             at,
@@ -8083,7 +8262,26 @@ mod tests {
         .unwrap();
         assert_eq!(
             (minimum.credit_minor, minimum.fee_minor, minimum.pay_minor),
-            (100, 7, 107)
+            (500, 36, 536)
+        );
+        // A legacy channel narrower than the fixed floor offers no range at all.
+        conn.execute("UPDATE market_payment_channel_settings SET max_topup_minor = 100, version = version + 1 WHERE channel_id = 'channel'", []).unwrap();
+        let channels = buyer_channel_views(&conn, true).unwrap();
+        assert_eq!(channels[0].amount_limits.min_credit_minor, None);
+        assert_eq!(channels[0].amount_limits.max_credit_minor, None);
+        assert!(
+            quotes::quote_tx(
+                &conn,
+                "buyer",
+                true,
+                quotes::QuoteRequest {
+                    channel_id: "channel".into(),
+                    amount_minor: 100,
+                    token_id: None,
+                },
+                at,
+            )
+            .is_err()
         );
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM market_topup_quotes", [], |r| r
@@ -9185,8 +9383,8 @@ mod tests {
                     "tokenId": "tron-usdt", "chain": "tron", "chainName": "Tron",
                     "symbol": "USDT", "minConfirmations": 19
                 }],
-                "minTopupMinor": 100, "maxTopupMinor": 5000,
-                "minCreditMinor": 100, "maxCreditMinor": 5000,
+                "minTopupMinor": 500, "maxTopupMinor": 5000,
+                "minCreditMinor": 500, "maxCreditMinor": 5000,
                 "maintenanceFeeBps": 500, "policyVersion": 1,
                 "channelRevision": 7, "channelSettingsVersion": 3, "canary": false
             })
@@ -13039,5 +13237,142 @@ mod tests {
         let loaded = load_revision(&conn, &only_new, "channel", 1).unwrap();
         assert_eq!(loaded.credentials.api_secret.as_str(), "api-secret-0000000");
         assert!(loaded.credentials.webhook_secret.is_some());
+    }
+
+    fn audit_count(conn: &Connection, action: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM market_finance_audit_events WHERE action = ?1",
+            params![action],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_new_order_supersedes_only_orders_that_still_show_a_payment_entry() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        for (id, status) in [
+            ("payable", "pending"),
+            ("creating", "creating"),
+            ("cancel-requested", "pending"),
+            ("verifying", "verifying"),
+            ("review", "review_required"),
+            ("expired", "expired"),
+        ] {
+            fixture_topup(&conn, id, &format!("router-{id}"), status, 1);
+        }
+        conn.execute(
+            "UPDATE market_topup_orders
+             SET checkout_url = 'https://pay.example/payable', auto_close_at = '2999-01-01T00:00:00Z'
+             WHERE id = 'payable'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE market_topup_orders SET cancel_requested_at = '2026-10-01' WHERE id = 'cancel-requested'",
+            [],
+        )
+        .unwrap();
+        let before = read_topup(&conn, "payable", "buyer").unwrap();
+        assert_eq!(before.buyer_view.state, "awaiting_payment");
+        assert!(before.buyer_view.can_pay && before.buyer_view.can_close);
+        assert!(!before.reused);
+
+        let time = "2026-10-02T00:00:00+00:00";
+        assert_eq!(
+            supersede_payable_topups_tx(&conn, "buyer", time).unwrap(),
+            2
+        );
+        for id in ["payable", "creating"] {
+            let (abandoned, next): (Option<String>, Option<String>) = conn
+                .query_row(
+                    "SELECT buyer_abandoned_at, next_reconcile_at FROM market_topup_orders WHERE id = ?1",
+                    params![id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(abandoned.as_deref(), Some(time));
+            // Reconciliation keeps tracking a superseded order for late payment.
+            assert_eq!(next.as_deref(), Some(time));
+        }
+        for id in ["cancel-requested", "verifying", "review", "expired"] {
+            assert!(
+                read_topup(&conn, id, "buyer")
+                    .unwrap()
+                    .buyer_abandoned_at
+                    .is_none()
+            );
+        }
+        let after = read_topup(&conn, "payable", "buyer").unwrap();
+        assert!(after.checkout_url.is_none());
+        assert_eq!(after.buyer_view.state, "confirming");
+        assert!(!after.buyer_view.can_pay && !after.buyer_view.can_close);
+        assert_eq!(audit_count(&conn, "topup_superseded_by_new_order"), 2);
+        // Idempotent and scoped to the buyer.
+        assert_eq!(
+            supersede_payable_topups_tx(&conn, "buyer", time).unwrap(),
+            0
+        );
+        assert_eq!(
+            supersede_payable_topups_tx(&conn, "other", time).unwrap(),
+            0
+        );
+        assert_eq!(audit_count(&conn, "topup_superseded_by_new_order"), 2);
+    }
+
+    #[test]
+    fn superseding_never_makes_the_next_creation_hit_the_abandoned_limit_sooner() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        let recent = Utc::now().to_rfc3339();
+        // Before the fixed rule a buyer could open MAX_PENDING_ORDERS payable
+        // orders. Now each creation supersedes the previous one, and capacity
+        // is checked before superseding, so at least as many creations pass.
+        for index in 0..MAX_PENDING_ORDERS {
+            ensure_pending_topup_capacity_tx(&conn, "buyer").unwrap();
+            supersede_payable_topups_tx(&conn, "buyer", &recent).unwrap();
+            let id = format!("order-{index}");
+            fixture_topup(&conn, &id, &format!("router-{id}"), "pending", 1);
+            conn.execute(
+                "UPDATE market_topup_orders SET created_at = ?2 WHERE id = ?1",
+                params![id, recent],
+            )
+            .unwrap();
+        }
+        ensure_pending_topup_capacity_tx(&conn, "buyer").unwrap();
+        let payable: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM market_topup_orders
+                 WHERE user_id = 'buyer' AND buyer_abandoned_at IS NULL AND status = 'pending'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(payable, 1);
+    }
+
+    #[test]
+    fn closing_locally_stops_once_and_tolerates_final_orders() {
+        let conn = memory();
+        fixture_revision(&conn, 1);
+        fixture_topup(&conn, "open", "router-open", "pending", 1);
+        fixture_topup(&conn, "done", "router-done", "expired", 1);
+        let closed = close_with_stop_tx(&conn, "open", "buyer").unwrap();
+        assert!(closed.buyer_abandoned_at.is_some());
+        assert_eq!(closed.buyer_view.state, "confirming");
+        let again = close_with_stop_tx(&conn, "open", "buyer").unwrap();
+        assert_eq!(again.buyer_abandoned_at, closed.buyer_abandoned_at);
+        assert_eq!(audit_count(&conn, "topup_buyer_stopped_payment"), 1);
+        let done = close_with_stop_tx(&conn, "done", "buyer").unwrap();
+        assert_eq!(done.status, "expired");
+        assert!(done.buyer_abandoned_at.is_none());
+        assert_eq!(done.buyer_view.state, "closed");
+        assert!(matches!(
+            close_with_stop_tx(&conn, "open", "other"),
+            Err(AppError::NotFound(_))
+        ));
+        assert!(is_final_topup_status("credited"));
+        assert!(!is_final_topup_status("review_required"));
     }
 }

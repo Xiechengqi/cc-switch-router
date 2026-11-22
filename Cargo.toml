@@ -50,7 +50,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
 zeroize = { version = "1", features = ["derive", "serde"] }
 rpassword = "7"
 zstd = "0.13"
-webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation", "danger-credential-internals"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

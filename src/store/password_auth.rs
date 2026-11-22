@@ -161,6 +161,15 @@ async fn check_password(
     .await
 }
 
+/// Verifies a password against a stored credential with the login algorithm
+/// and cost. Callers reserve a [`reserve_attempt`] slot first.
+pub(crate) async fn verify_password_hash(
+    password: Zeroizing<String>,
+    hash: String,
+) -> Result<bool, AppError> {
+    check_password(password, Some(hash)).await
+}
+
 pub(crate) fn record_email_login(
     conn: &Connection,
     id: &str,
@@ -230,7 +239,7 @@ pub(crate) fn status(conn: &Connection, email: &str) -> Result<PasswordStatus, A
     })
 }
 
-fn reserve_attempt(
+pub(crate) fn reserve_attempt(
     conn: &Connection,
     email: &str,
     source: &str,
@@ -550,7 +559,8 @@ impl AppStore {
             &event,
             now,
         )?;
-        queue_password_notice_tx(&tx, &config.data_dir, &current.email, &event, &new_password)?;
+        // The confirmation email no longer contains the password: the password
+        // now also confirms money, so it must not sit in a mailbox.
         let (replacement, mut response) = issue_session(
             &tx,
             config,
@@ -603,6 +613,10 @@ fn notice_cipher(conn: &Connection, data_dir: &std::path::Path) -> anyhow::Resul
 
 /// Called in the same transaction as credential replacement, including by CLI.
 /// Mail can be configured later; only its short-lived encrypted seed is queued.
+/// Legacy sealing of a password into a queued notice. New password changes no
+/// longer queue the password; this remains for tests of notices sealed before
+/// that change, which are now rendered without it.
+#[cfg(test)]
 pub(crate) fn queue_password_notice_tx(
     conn: &Connection,
     data_dir: &std::path::Path,
@@ -640,6 +654,13 @@ fn render_notice(
         "<p>New password:</p><pre style=\"white-space:pre-wrap;overflow-wrap:anywhere;padding:16px;background:#f1f5f9;border-radius:8px;\">{}</pre><p>Keep this email private. Save your password in a password manager, then delete this email.</p>",
         escape_html(value)
     )).unwrap_or_default());
+    // Only a password set from a web session waits before it can confirm
+    // immediate wallet payments; the host operator's CLI is trusted at once.
+    let wallet_wait = if source == "local_cli" {
+        ""
+    } else {
+        " For your safety, the new password cannot confirm immediate wallet payments for 24 hours."
+    };
     NoticeEnvelope {
         from: sender.into(),
         recipient: email.into(),
@@ -647,16 +668,17 @@ fn render_notice(
             "Login password changed",
             "Your account security settings changed.",
             &format!(
-                "<p>Your TokenSwitch login password was changed.</p>{}<p>Recorded: {}</p><p>Source: {}</p><p>All previous login sessions were revoked.</p><p>If this was not you, sign in with an email code and reset your password, or contact the Router operator.</p><p><a href=\"{}\">Open TokenSwitch</a></p>",
+                "<p>Your TokenSwitch login password was changed.</p>{}<p>Recorded: {}</p><p>Source: {}</p><p>All previous login sessions were revoked.{}</p><p>If this was not you, sign in with an email code and reset your password, or contact the Router operator.</p><p><a href=\"{}\">Open TokenSwitch</a></p>",
                 &*password_html,
                 escape_html(at),
                 escape_html(source),
+                wallet_wait,
                 escape_html(&template.dashboard_url)
             ),
         ),
         text: format!(
-            "Your TokenSwitch login password was changed.\n{}Recorded: {at}\nSource: {source}\nAll previous login sessions were revoked.\nIf this was not you, sign in with an email code and reset your password, or contact the Router operator.\n{}",
-            &*password_text, template.dashboard_url
+            "Your TokenSwitch login password was changed.\n{}Recorded: {at}\nSource: {source}\nAll previous login sessions were revoked.{}\nIf this was not you, sign in with an email code and reset your password, or contact the Router operator.\n{}",
+            &*password_text, wallet_wait, template.dashboard_url
         ),
         reply_to: template.reply_to.clone(),
     }
@@ -762,14 +784,11 @@ fn claim_notice(
             let plaintext = cipher.open(frozen, &id, &email)?;
             match serde_json::from_str::<StoredNotice>(&plaintext)? {
                 StoredNotice::Envelope { envelope } => Ok(envelope),
-                StoredNotice::Password { password } => Ok(render_notice(
-                    sender,
-                    &email,
-                    &at,
-                    &source,
-                    Some(&password),
-                    template,
-                )),
+                // Notices sealed before passwords stopped being emailed are
+                // rendered without the password.
+                StoredNotice::Password { .. } => {
+                    Ok(render_notice(sender, &email, &at, &source, None, template))
+                }
             }
         })();
         // Never copy invalid payloads or transport diagnostics into last_error.

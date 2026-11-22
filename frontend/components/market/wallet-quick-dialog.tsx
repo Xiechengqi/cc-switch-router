@@ -2,25 +2,19 @@
 
 /* Hallmark · component: quick balance dialog · genre: modern-minimal · theme: existing Router system
  * states: loading · ready · error · busy (top-up in flight blocks closing)
- * Top-up, C2C purchase and sending without leaving the current page. The
- * balance page stays the place for history, order follow-up and selling.
+ * Top up without leaving the current page. Sending, C2C and history live on
+ * the balance page, one tap away.
  */
 
 import * as React from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
 import { Button, Modal } from "@heroui/react";
 import { ArrowUpRight, Loader2, WalletCards } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
-import { SegmentedControl } from "@/components/common/segmented-control";
-import { C2CBuyPanel } from "@/components/dashboard/c2c-buy-panel";
-import { WalletTransferPanel } from "@/components/dashboard/wallet-transfer-panel";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { WalletTopupForm } from "@/components/market/wallet-topup-form";
-import { C2CStatusLabel } from "@/components/market/c2c-primitives";
 import { DASHBOARD_ACCOUNT_WALLET_PATH } from "@/lib/dashboard-nav";
 import { notifyMarketBalanceChanged, subscribeMarketBalanceChanged } from "@/lib/market-balance-events";
-import { c2cErrorKey, getC2COrders, type C2COrder } from "@/lib/market-c2c";
 import {
   getMarketWallet,
   getMarketWalletTopups,
@@ -29,17 +23,13 @@ import {
 } from "@/lib/market-wallet-api";
 import { formatWalletUnits, formatWalletUnitsAsCny, safeMarketReturnPath } from "@/lib/market-wallet-money";
 
-const TASKS = ["topup", "c2c", "transfer"] as const;
-type Task = (typeof TASKS)[number];
 
 export function WalletQuickDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
   const { session } = useAuth();
-  const router = useRouter();
   const { locale, t, displayCurrency, fxRateFresh, fxRateMicros } = useLocaleText();
   const actor = session?.authenticated ? session.user?.id : undefined;
   const [snapshot, setSnapshot] = React.useState<{ actor: string; wallet: MarketWallet; topups: MarketWalletTopup[] } | null>(null);
   const [error, setError] = React.useState("");
-  const [task, setTask] = React.useState<Task>("topup");
   const [busy, setBusy] = React.useState(false);
   const [ready, setReady] = React.useState(false);
   const [returnPath, setReturnPath] = React.useState<string | null>(null);
@@ -123,62 +113,27 @@ export function WalletQuickDialog({ open, onOpenChange }: { open: boolean; onOpe
               </div>
             ) : null}
             {current && actor ? (
-              <>
-                <SegmentedControl
-                  value={task}
-                  onChange={setTask}
-                  ariaLabel={t("marketWallet.actions")}
-                  size="md"
-                  fullWidth
-                  disabled={busy}
-                  items={TASKS.map((id) => ({ id, label: t(`marketWallet.action.${id}`) }))}
+              <div className="grid min-w-0 gap-3">
+                <WalletTopupForm
+                  wallet={current.wallet}
+                  topups={current.topups}
+                  ready={ready}
+                  active={open}
+                  returnPath={returnPath}
+                  idPrefix="wallet-quick-topup"
+                  onBusyChange={setBusy}
+                  onOrderCreated={(order) => { loadVersion.current++; setSnapshot((value) => value && value.actor === actor
+                    ? { ...value, topups: [order, ...value.topups.filter((item) => item.id !== order.id)] }
+                    : value); }}
+                  onReload={reload}
                 />
-                <div role="tabpanel" aria-label={t(`marketWallet.action.${task}`)} className="min-w-0">
-                  <div hidden={task !== "topup"}>
-                    <WalletTopupForm
-                      wallet={current.wallet}
-                      topups={current.topups}
-                      ready={ready}
-                      active={open && task === "topup"}
-                      returnPath={returnPath}
-                      idPrefix="wallet-quick-topup"
-                      onBusyChange={setBusy}
-                      onOrderCreated={(order) => { loadVersion.current++; setSnapshot((value) => value && value.actor === actor
-                        ? { ...value, topups: [order, ...value.topups.filter((item) => item.id !== order.id)] }
-                        : value); }}
-                      onReload={reload}
-                    />
-                  </div>
-                  {task === "c2c" ? (
-                    <div className="grid min-w-0 gap-3">
-                      <p className="text-sm text-muted-foreground">{t("walletQuick.c2cHelp")}</p>
-                      <C2CBuyPanel
-                        actor={actor}
-                        inlineConfirmation
-                        onBusyChange={setBusy}
-                        onOrder={(order) => {
-                          onOpenChange(false);
-                          router.push(`${DASHBOARD_ACCOUNT_WALLET_PATH}?c2cOrder=${encodeURIComponent(order.id)}`);
-                        }}
-                      />
-                      <QuickC2CBuyerOrders actor={actor} onSelect={(id) => {
-                        if (busy) return;
-                        onOpenChange(false); router.push(`${DASHBOARD_ACCOUNT_WALLET_PATH}?c2cOrder=${encodeURIComponent(id)}`);
-                      }} disabled={busy} />
-                      <Link href={`${DASHBOARD_ACCOUNT_WALLET_PATH}?task=c2c`} aria-disabled={busy} tabIndex={busy ? -1 : undefined} onClick={(event) => { if (busy) event.preventDefault(); else close(); }} className="inline-flex min-h-11 items-center gap-1 justify-self-start text-sm font-medium text-primary underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring aria-disabled:opacity-50">
-                        {t("walletQuick.c2cOrders")}<ArrowUpRight className="size-4" aria-hidden />
-                      </Link>
-                    </div>
-                  ) : task === "transfer" ? (
-                    <WalletTransferPanel embedded inlineConfirmation onBusyChange={setBusy} walletVersion={current.wallet.version} onTransferred={reload} />
-                  ) : null}
-                </div>
-              </>
+                <p className="text-xs leading-5 text-muted-foreground">{t("walletPage.topupNote")}</p>
+              </div>
             ) : null}
           </Modal.Body>
           <Modal.Footer className="flex-wrap justify-between">
             <Link href={DASHBOARD_ACCOUNT_WALLET_PATH} tabIndex={busy ? -1 : undefined} onClick={(event) => { if (busy) event.preventDefault(); else close(); }} aria-disabled={busy} className="inline-flex min-h-11 items-center gap-1 text-sm font-medium text-primary underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring aria-disabled:pointer-events-none aria-disabled:opacity-50">
-              {t("walletQuick.fullPage")}<ArrowUpRight className="size-4" aria-hidden />
+              {t("walletPage.quickMore")}<ArrowUpRight className="size-4" aria-hidden />
             </Link>
             <Button variant="ghost" className="min-h-11" isDisabled={busy} onPress={close}>{t("common.close")}</Button>
           </Modal.Footer>
@@ -186,39 +141,4 @@ export function WalletQuickDialog({ open, onOpenChange }: { open: boolean; onOpe
       </Modal.Container>
     </Modal.Backdrop>
   );
-}
-
-function QuickC2CBuyerOrders({ actor, disabled, onSelect }: { actor: string; disabled: boolean; onSelect: (id: string) => void }) {
-  const { t, locale } = useLocaleText();
-  const [orders, setOrders] = React.useState<C2COrder[]>([]);
-  const [error, setError] = React.useState("");
-  const [loaded, setLoaded] = React.useState(false);
-  const [retry, setRetry] = React.useState(0);
-  React.useEffect(() => {
-    let active = true;
-    let reading = false;
-    const load = async () => {
-      if (reading || document.visibilityState !== "visible") return;
-      reading = true;
-      try {
-        const page = await getC2COrders({ role: "buyer", status: "active" });
-        if (page.items.some(item => item.buyerId !== actor)) throw new Error("C2C account changed");
-        if (active) { setOrders(page.items.slice(0, 3)); setError(""); setLoaded(true); }
-      } catch (cause) { if (active) setError(t(c2cErrorKey(cause))); }
-      finally { reading = false; }
-    };
-    void load();
-    const timer = window.setInterval(() => void load(), 15_000);
-    return () => { active = false; window.clearInterval(timer); };
-  }, [actor, retry, t]);
-  return <section className="grid min-w-0 gap-2 border-t border-border pt-3" aria-label={t("walletQuick.activeC2C")}>
-    <h3 className="text-sm font-semibold">{t("walletQuick.activeC2C")}</h3>
-    {error ? <div className="grid gap-2"><p role="alert" className="text-sm text-destructive">{error}</p><Button variant="ghost" isDisabled={disabled} onPress={() => setRetry(value => value + 1)}>{t("common.retry")}</Button></div>
-      : !loaded ? <p role="status" className="text-sm text-muted-foreground">{t("common.loading")}</p>
-        : !orders.length ? <p className="text-sm text-muted-foreground">{t("walletQuick.noActiveC2C")}</p>
-          : orders.map(order => <button key={order.id} type="button" disabled={disabled} onClick={() => onSelect(order.id)} className="grid min-h-11 min-w-0 gap-1 rounded-md bg-muted/50 p-3 text-left hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:opacity-50">
-            <span className="flex min-w-0 flex-wrap items-center justify-between gap-2 text-sm"><span className="min-w-0 truncate">{order.sellerName}</span><span className="tabular-nums">{formatWalletUnits(order.amountUnits, "$", locale)}</span></span>
-            <C2CStatusLabel status={order.status} />
-          </button>)}
-  </section>;
 }

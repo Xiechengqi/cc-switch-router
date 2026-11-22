@@ -69,6 +69,18 @@ export type MarketWalletTopup = {
   hasPaymentInstructions?: boolean;
   localCloseReason?: "never_created" | null;
   paidAt?: string | null;
+  /** Buyer-facing projection: four states and the actions allowed. */
+  buyerView?: MarketTopupBuyerView;
+  /** True when creation returned an existing payable order. */
+  reused?: boolean;
+};
+
+export type MarketTopupBuyerState = "awaiting_payment" | "confirming" | "credited" | "closed";
+export type MarketTopupBuyerView = {
+  state: MarketTopupBuyerState;
+  canPay: boolean;
+  canClose: boolean;
+  payUntil: string | null;
 };
 
 export type MarketTopupPayabilityReason = "payable" | "buyer_stopped" | "cancel_pending" | "order_changed"
@@ -430,6 +442,14 @@ export async function stopMarketWalletTopup(id: string) {
   );
 }
 
+/** "Don't pay": the server cancels at the payment provider when it can and
+ * otherwise stops the order; a payment already made still credits. */
+export async function closeMarketWalletTopup(id: string) {
+  return parseJson<MarketWalletTopup>(
+    await authFetch(`/v1/market-wallet/topups/${encodeURIComponent(id)}/close`, { method: "POST" }),
+  );
+}
+
 export async function cancelMarketWalletTopup(id: string) {
   return parseJson<MarketWalletTopup>(
     await authFetch(`/v1/market-wallet/topups/${encodeURIComponent(id)}/cancel`, { method: "POST" }),
@@ -775,6 +795,7 @@ export const MARKET_NOTIFICATION_KINDS = [
   "contract_terminating_soon", "contract_terminated", "refund_status", "dispute_resolved",
   "earnings_held", "earnings_released", "earnings_converted",
   "wallet_transfer_sent", "wallet_transfer_received",
+  "wallet_transfer_pending", "wallet_transfer_cancelled",
   "commission_policy_changed",
   "client_termination_settled",
   "client_termination_claim",

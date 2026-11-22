@@ -1,17 +1,35 @@
-import { authFetch, readAuthState } from "@/lib/auth";
+import { authFetch } from "@/lib/auth";
 import { parseJson } from "@/lib/api";
 import type { WalletTransfer } from "@/lib/wallet-policy-api";
-export type TransferReturn = { id: string; transferId: string; requestedBy: string; reason: string; status: "requested" | "approved" | "declined"; version: number; journalId: string | null; createdAt: string; resolvedAt: string | null };
-function validReturn(r: TransferReturn | null, transfer: string) {
-  if (r !== null && (!r || r.transferId !== transfer || !["requested", "approved", "declined"].includes(r.status) || !Number.isSafeInteger(r.version) || r.version < 1 || typeof r.reason !== "string" || typeof r.id !== "string" || !Number.isFinite(Date.parse(r.createdAt)))) throw new Error("Transfer return unavailable; reload.");
-  return r;
+
+/**
+ * Pending transfers and legacy return requests.
+ *
+ * A transfer to a new recipient waits before it credits and only its sender
+ * sees it until then. New return requests are retired; requests made earlier
+ * still wait for the recipient's decision.
+ */
+export type AwaitingReturn = { id: string; transferId: string; reason: string; version: number; createdAt: string; senderEmail: string; amountUnits: string };
+
+const UNITS = /^[1-9]\d{0,18}$/;
+const ID = /^[a-f0-9-]{36}$/;
+
+export async function getPendingTransfers(): Promise<WalletTransfer[]> {
+  const page = await parseJson<{ items: WalletTransfer[] }>(await authFetch("/v1/market-wallet/transfers/pending", { cache: "no-store" }));
+  if (!page || !Array.isArray(page.items) || page.items.some(t => !t || !ID.test(t.id) || !UNITS.test(t.amountUnits) || typeof t.recipientEmail !== "string" || typeof t.releaseAt !== "string")) throw new Error("Transfers unavailable; reload.");
+  return page.items;
 }
-export async function getTransferReturns(offset = 0) {
-  const context = readAuthState();
-  const page = await parseJson<{ items: WalletTransfer[]; total: number }>(await authFetch(`/v1/market-wallet/transfers?offset=${offset}&limit=20`, { cache: "no-store" }, context));
-  if (!page || !Array.isArray(page.items) || !Number.isSafeInteger(page.total) || page.total < 0 || page.items.some(t => !t || !/^[a-f0-9-]{36}$/.test(t.id) || typeof t.senderEmail !== "string" || typeof t.recipientEmail !== "string" || !/^[1-9]\d{0,18}$/.test(t.amountUnits) || BigInt(t.amountUnits) > 9_223_372_036_854_775_807n)) throw new Error("Transfers unavailable; reload.");
-  const items = await Promise.all(page.items.map(async transfer => ({ transfer, request: validReturn(await parseJson<TransferReturn | null>(await authFetch(`/v1/market-wallet/transfers/${transfer.id}/return`, { cache: "no-store" }, context)), transfer.id) })));
-  return { items, total: page.total };
+
+export async function withdrawPendingTransfer(id: string) {
+  return parseJson<WalletTransfer>(await authFetch(`/v1/market-wallet/transfers/pending/${encodeURIComponent(id)}/cancel`, { method: "POST" }));
 }
-export async function requestTransferReturn(id: string, reason: string) { return validReturn(await parseJson<TransferReturn>(await authFetch(`/v1/market-wallet/transfers/${encodeURIComponent(id)}/return`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ reason }) })), id)!; }
-export async function decideTransferReturn(id: string, version: number, approve: boolean) { return validReturn(await parseJson<TransferReturn>(await authFetch(`/v1/market-wallet/transfers/${encodeURIComponent(id)}/return/${approve ? "approve" : "decline"}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ expectedVersion: version }) })), id)!; }
+
+export async function getAwaitingReturns(): Promise<AwaitingReturn[]> {
+  const page = await parseJson<{ items: AwaitingReturn[] }>(await authFetch("/v1/market-wallet/transfer-returns/awaiting", { cache: "no-store" }));
+  if (!page || !Array.isArray(page.items) || page.items.some(r => !r || !ID.test(r.transferId) || !UNITS.test(r.amountUnits) || !Number.isSafeInteger(r.version))) throw new Error("Return requests unavailable; reload.");
+  return page.items;
+}
+
+export async function decideTransferReturn(transferId: string, version: number, approve: boolean) {
+  return parseJson<unknown>(await authFetch(`/v1/market-wallet/transfers/${encodeURIComponent(transferId)}/return/${approve ? "approve" : "decline"}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ expectedVersion: version }) }));
+}

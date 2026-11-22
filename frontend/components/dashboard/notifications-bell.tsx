@@ -223,7 +223,7 @@ export function NotificationsBell() {
                   {amount ? <span className="tabular-nums">{amount} · </span> : null}
                   {new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(item.createdAt))}
                 </p>
-                {item.eventKind === "wallet_transfer_sent" || item.eventKind === "wallet_transfer_received" ? <p className="mt-1 break-all text-xs text-muted-foreground">{String(item.payload[item.eventKind === "wallet_transfer_sent" ? "recipientEmail" : "senderEmail"] ?? "")}</p> : null}
+                {["wallet_transfer_sent", "wallet_transfer_received", "wallet_transfer_pending", "wallet_transfer_cancelled"].includes(item.eventKind) ? <p className="mt-1 break-all text-xs text-muted-foreground">{String(item.payload[item.eventKind === "wallet_transfer_received" ? "senderEmail" : "recipientEmail"] ?? "")}</p> : null}
                 {item.eventKind === "commission_policy_changed" && typeof item.payload.rateBps === "number" && typeof item.payload.effectiveAt === "string" && Number.isFinite(Date.parse(item.payload.effectiveAt)) ? <p className="mt-1 text-xs leading-5 text-muted-foreground">{t("commission.scheduled", { rate: (item.payload.rateBps / 100).toString(), time: new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(item.payload.effectiveAt)) })}</p> : null}
                 {item.category !== "system" || session?.isAdmin ? (
                   <a href={notificationHref(item)} className="mt-1 inline-flex min-h-8 items-center text-xs text-primary underline underline-offset-2">{t("notificationCenter.view")}</a>

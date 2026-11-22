@@ -1,10 +1,11 @@
+import { askFinancialPassword, requireFinancialPassword, type FinancialConfirmRisk } from "@/lib/financial-confirm";
+
 /** Financial signatures use exact request bytes; the device key is possession
- * proof. Independent user verification is supplied only by a wallet Passkey. */
+ * proof. Risky operations are additionally confirmed with the login password. */
 export type FinancialDevice = { authDeviceId: string; privateKey: string };
 const encoder = new TextEncoder();
 function bytes64(bytes: Uint8Array) { return btoa(Array.from(bytes, b => String.fromCharCode(b)).join("")); }
 function decode64(value: string) { return Uint8Array.from(atob(value.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0)); }
-function url64(value: ArrayBuffer) { return bytes64(new Uint8Array(value)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); }
 async function sha256(value: BufferSource) { return Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", value)), b => b.toString(16).padStart(2, "0")).join(""); }
 function requestUrl(input: RequestInfo | URL) { return new URL(input instanceof Request ? input.url : String(input), typeof location === "undefined" ? "https://router.invalid" : location.href); }
 export function isFinancialWrite(input: RequestInfo | URL, init: RequestInit = {}) {
@@ -12,19 +13,6 @@ export function isFinancialWrite(input: RequestInfo | URL, init: RequestInit = {
   const url = requestUrl(input);
   if (typeof location !== "undefined" && url.origin !== location.origin) return false;
   return !["GET", "HEAD", "OPTIONS"].includes(method) && (url.pathname.startsWith("/v1/market-wallet/") || url.pathname.startsWith("/v1/admin/market-") || url.pathname.startsWith("/v1/market-provider-finance/"));
-}
-type CredentialOptions = { publicKey: Record<string, unknown> };
-export function passkeyRequestOptions(options: CredentialOptions): CredentialRequestOptions {
-  const key = options.publicKey;
-  return { publicKey: { ...key, challenge: decode64(key.challenge as string), allowCredentials: (key.allowCredentials as { id: string; type: PublicKeyCredentialType; transports?: AuthenticatorTransport[] }[] | undefined)?.map(c => ({ ...c, id: decode64(c.id) })) } as PublicKeyCredentialRequestOptions };
-}
-export function passkeyCreationOptions(options: CredentialOptions): CredentialCreationOptions {
-  const key = options.publicKey;
-  return { publicKey: { ...key, challenge: decode64(key.challenge as string), user: { ...(key.user as object), id: decode64((key.user as { id: string }).id) }, excludeCredentials: (key.excludeCredentials as { id: string; type: PublicKeyCredentialType }[] | undefined)?.map(c => ({ ...c, id: decode64(c.id) })) } as unknown as PublicKeyCredentialCreationOptions };
-}
-export function serializePasskey(credential: PublicKeyCredential) {
-  const response = credential.response;
-  return { id: credential.id, rawId: url64(credential.rawId), type: credential.type, extensions: credential.getClientExtensionResults(), response: response instanceof AuthenticatorAttestationResponse ? { attestationObject: url64(response.attestationObject), clientDataJSON: url64(response.clientDataJSON), transports: response.getTransports() } : { authenticatorData: url64((response as AuthenticatorAssertionResponse).authenticatorData), clientDataJSON: url64(response.clientDataJSON), signature: url64((response as AuthenticatorAssertionResponse).signature), userHandle: (response as AuthenticatorAssertionResponse).userHandle ? url64((response as AuthenticatorAssertionResponse).userHandle!) : null } };
 }
 export async function signedFinancialFetch(input: RequestInfo | URL, init: RequestInit, token: string, device: FinancialDevice, guard: () => void): Promise<Response> {
   const url = requestUrl(input);
@@ -51,17 +39,33 @@ export async function signedFinancialFetch(input: RequestInfo | URL, init: Reque
     return fetch(request.clone(), { ...init, method, headers, body: bytes });
   };
   const response = await send();
+  if (response.status === 403) {
+    const denied = await response.clone().json().catch(() => null);
+    // Accounts without a password are guided to set one; the request still fails.
+    if (denied?.code === "FINANCIAL_PASSWORD_REQUIRED") requireFinancialPassword();
+    return response;
+  }
   if (response.status !== 428) return response;
   const challenge = await response.clone().json().catch(() => null);
-  if (challenge?.code !== "FINANCIAL_STEPUP_REQUIRED") return response;
-  if (!globalThis.PublicKeyCredential || !navigator.credentials) throw new Error("This operation requires a wallet Passkey in a supported browser.");
-  guard();
-  const credential = await navigator.credentials.get(passkeyRequestOptions(challenge.details.options)) as PublicKeyCredential | null;
-  if (!credential) throw new Error("Financial confirmation was cancelled.");
-  guard();
-  const verified = await signedFinancialFetch("/v1/market-wallet/security/authenticate", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ challengeId: challenge.details.challengeId, credential: serializePasskey(credential) }) }, token, device, guard);
-  const result = await verified.json().catch(() => ({}));
-  if (!verified.ok) throw new Error(result.message || "Passkey verification failed.");
-  guard();
-  return send(result.stepupId);
+  if (challenge?.code !== "FINANCIAL_STEPUP_REQUIRED" || challenge?.details?.method !== "password") return response;
+  const challengeId = String(challenge.details.challengeId || "");
+  const risk: FinancialConfirmRisk = challenge.details.risk === "immediate" ? "immediate" : "confirm";
+  let error: string | undefined;
+  // A mistyped password asks again for the same challenge; the server's
+  // password attempt budget bounds retries.
+  for (let attempt = 0; attempt < 5; attempt++) {
+    guard();
+    const password = await askFinancialPassword({ risk, error });
+    guard();
+    const verified = await signedFinancialFetch("/v1/market-wallet/security/confirm", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ challengeId, password }) }, token, device, guard);
+    if (verified.ok) {
+      const result = await verified.json().catch(() => ({}));
+      guard();
+      return send(String(result.stepupId || challengeId));
+    }
+    const failure = await verified.clone().json().catch(() => ({}));
+    if (failure?.code !== "FINANCIAL_PASSWORD_INVALID") return verified;
+    error = failure.code;
+  }
+  return response;
 }

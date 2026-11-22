@@ -9,8 +9,8 @@ use axum::http::HeaderMap;
 use serde::Deserialize;
 
 use super::{
-    ChannelView, MAX_TOPUP_MINOR, MIN_TOPUP_MINOR, ServerState, audit_tx, channel_view_tx,
-    db_error, no_store, now, token_rail,
+    CHANNEL_MIN_FLOOR_MINOR, ChannelView, MAX_TOPUP_MINOR, MIN_TOPUP_MINOR, ServerState, audit_tx,
+    channel_view_tx, db_error, no_store, now, token_rail,
 };
 use crate::db::{Connection, TransactionBehavior, params};
 use crate::error::AppError;
@@ -47,11 +47,16 @@ pub(super) fn validate_settings(input: &ChannelSettingsRequest) -> Result<Vec<St
     if input.order_mode == "direct" && methods.is_empty() {
         return invalid("direct checkout needs at least one payment method");
     }
-    let bounded = |value: Option<i64>| {
-        value.is_none_or(|amount| (MIN_TOPUP_MINOR..=MAX_TOPUP_MINOR).contains(&amount))
-    };
-    if !bounded(input.min_topup_minor) || !bounded(input.max_topup_minor) {
-        return invalid("top-up bounds are outside the supported range");
+    // A channel must accept the whole fixed buyer range (US$5–US$1,000);
+    // it may only be wider, so buyers never see channel-specific limits.
+    if input
+        .min_topup_minor
+        .is_some_and(|min| !(CHANNEL_MIN_FLOOR_MINOR..=MIN_TOPUP_MINOR).contains(&min))
+        || input
+            .max_topup_minor
+            .is_some_and(|max| max != MAX_TOPUP_MINOR)
+    {
+        return invalid("channel top-up bounds must cover the fixed US$5–US$1,000 range");
     }
     if let (Some(min), Some(max)) = (input.min_topup_minor, input.max_topup_minor)
         && min > max
@@ -145,7 +150,7 @@ mod tests {
             order_mode: order_mode.into(),
             allowed_methods: methods.iter().map(|m| m.to_string()).collect(),
             min_topup_minor: Some(500),
-            max_topup_minor: Some(50_000),
+            max_topup_minor: Some(100_000),
             fee_rate_bps: 100,
             fixed_fee_minor: 0,
             expected_version: 1,
@@ -169,6 +174,26 @@ mod tests {
         let mut too_small = request("cashier", &[]);
         too_small.min_topup_minor = Some(1);
         assert!(validate_settings(&too_small).is_err());
+    }
+
+    #[test]
+    fn channel_bounds_must_cover_the_fixed_buyer_range() {
+        let mut legacy_floor = request("cashier", &[]);
+        legacy_floor.min_topup_minor = Some(CHANNEL_MIN_FLOOR_MINOR);
+        assert!(validate_settings(&legacy_floor).is_ok());
+        let mut unset = request("cashier", &[]);
+        unset.min_topup_minor = None;
+        unset.max_topup_minor = None;
+        assert!(validate_settings(&unset).is_ok());
+        let mut narrow_min = request("cashier", &[]);
+        narrow_min.min_topup_minor = Some(MIN_TOPUP_MINOR + 1);
+        assert!(validate_settings(&narrow_min).is_err());
+        let mut narrow_max = request("cashier", &[]);
+        narrow_max.max_topup_minor = Some(MAX_TOPUP_MINOR - 1);
+        assert!(validate_settings(&narrow_max).is_err());
+        let mut too_large = request("cashier", &[]);
+        too_large.max_topup_minor = Some(MAX_TOPUP_MINOR + 1);
+        assert!(validate_settings(&too_large).is_err());
     }
 
     #[test]

@@ -188,13 +188,16 @@ try {
   assert.equal(gatewayCalls, 3);
   assert.equal(externalVisits, 1);
 
-  // A review hold must give the buyer an observable check result and a safe
-  // way to stop using Router's payment link without claiming gateway closure.
+  // Fixed rules on the balance page: credit $5–$1,000 (fee extra), $20
+  // preselected, one payment method means no picker, a confirming top-up needs
+  // nothing from the buyer and is re-checked automatically.
+  const view = (state, extra = {}) => ({ state, canPay: state === "awaiting_payment", canClose: state === "awaiting_payment",
+    payUntil: state === "awaiting_payment" ? new Date(Date.now() + 1_800_000).toISOString() : null, ...extra });
   let topup = {
     id: "order-2",
     channelId: "channel-1",
-    amountMinor: 105,
-    creditAmountMinor: 100, platformFeeMinor: 5, platformFeeRateBps: 500, policyVersion: 1,
+    amountMinor: 525,
+    creditAmountMinor: 500, platformFeeMinor: 25, platformFeeRateBps: 500, policyVersion: 1,
     status: "review_required",
     checkoutUrl: null,
     createdAt: new Date().toISOString(),
@@ -206,10 +209,13 @@ try {
     buyerRecheckResult: null,
     lastGatewayStatus: "expired",
     lastGatewayCheckedAt: new Date().toISOString(),
+    buyerView: view("confirming"),
   };
   let recheckCalls = 0;
-  let stopCalls = 0;
+  let closeCalls = 0;
   let transferCalls = 0;
+  let confirmCalls = 0;
+  let withdrawCalls = 0;
   let topupCreates = 0;
   let rejectNextTopupQuote = false;
   let feeBps = 500;
@@ -219,8 +225,10 @@ try {
   let activeChannel = "channel-1";
   let delayedQuote = null;
   const quoteRequests = [];
+  // The server returns the intersection of the fixed $5–$1,000 range and the
+  // channel's own settings.
   const channelLimits = (id, displayName, minTopupMinor, maxTopupMinor) => {
-    const lower = Math.max(100, minTopupMinor), upper = Math.min(100_000, maxTopupMinor);
+    const lower = Math.max(500, minTopupMinor), upper = Math.min(100_000, maxTopupMinor);
     const minCreditMinor = lower <= upper ? lower : null;
     const maxCreditMinor = lower <= upper ? upper : null;
     return { id, displayName, gatewayKind: "dujiaopay", methodCategory: "crypto", orderMode: "cashier", methods: [],
@@ -228,7 +236,16 @@ try {
       maintenanceFeeBps: feeBps, policyVersion, channelRevision: 1, channelSettingsVersion };
   };
   const transferKeys = [];
+  const transferStepups = [];
   let transferAmount = "8640001";
+  let pendingTransfers = [];
+  const until = async (check, label) => {
+    for (let i = 0; i < 100; i++) {
+      if (check()) return;
+      await page.waitForTimeout(50);
+    }
+    assert.fail(label);
+  };
   await page.context().route("**/v1/market-wallet/transfer-capacity", async (route) => {
     await route.fulfill({ contentType: "application/json", body: JSON.stringify({ transferableUnits: transferAmount, committedUnits: "0", dailyRemainingUnits: "86400000", enabled: true, verified: true, blockers: [] }) });
   });
@@ -236,28 +253,67 @@ try {
     const input = route.request().postDataJSON();
     assert.equal(input.recipientEmail, "recipient@example.invalid");
     assert.equal(input.all, true);
-    await route.fulfill({ contentType: "application/json", body: JSON.stringify({ id: "transfer-quote", senderEmail: "buyer@example.invalid", recipientEmail: input.recipientEmail, amountUnits: transferAmount, expiresAt: new Date(Date.now() + 900_000).toISOString() }) });
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify({ id: "transfer-quote", senderEmail: "buyer@example.invalid", recipientEmail: input.recipientEmail, amountUnits: transferAmount, expiresAt: new Date(Date.now() + 900_000).toISOString(), firstRecipient: true, delivery: "delayed", delayHours: 24 }) });
   });
   await page.context().route("**/v1/market-wallet/transfer-quotes/*/code", async () => {
     assert.fail("retired financial OTP endpoint must not be called");
   });
+  // First transfer to a new recipient: the server asks for the login password
+  // (428), the first response after confirmation is uncertain (504) and the
+  // retry replays the same business request with the same idempotency key.
   await page.context().route("**/v1/market-wallet/transfers", async (route) => {
     transferCalls += 1;
-    transferKeys.push(route.request().headers()["idempotency-key"]);
-    const input = route.request().postDataJSON();
-    assert.equal(input.quoteId, "transfer-quote");
-    assert.deepEqual(input, { quoteId: "transfer-quote" });
+    const headers = route.request().headers();
+    transferKeys.push(headers["idempotency-key"]);
+    transferStepups.push(headers["x-router-stepup"] || null);
+    assert.ok(headers["x-router-request-signature"], "transfers are signed by the login device");
+    assert.deepEqual(route.request().postDataJSON(), { quoteId: "transfer-quote" });
     if (transferCalls === 1) {
+      await route.fulfill({ status: 428, contentType: "application/json", body: JSON.stringify({
+        code: "FINANCIAL_STEPUP_REQUIRED", message: "confirm", details: { challengeId: "transfer-challenge", method: "password", risk: "confirm" },
+      }) });
+      return;
+    }
+    if (transferCalls === 2) {
+      assert.equal(headers["x-router-stepup"], "transfer-challenge");
       await route.fulfill({ status: 504, contentType: "application/json", body: JSON.stringify({ message: "response uncertain" }) });
       return;
     }
-    await route.fulfill({ contentType: "application/json", body: JSON.stringify({ id: "transfer-1", senderEmail: "buyer@example.invalid", recipientEmail: "recipient@example.invalid", amountUnits: transferAmount, journalId: "journal-1", createdAt: new Date().toISOString() }) });
+    const pending = { id: "11111111-1111-4111-8111-111111111111", senderEmail: "buyer@example.invalid", recipientEmail: "recipient@example.invalid",
+      amountUnits: transferAmount, journalId: null, createdAt: new Date().toISOString(), status: "pending",
+      releaseAt: new Date(Date.now() + 86_400_000).toISOString() };
+    pendingTransfers = [pending];
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify(pending) });
     transferAmount = "0";
+  });
+  await page.context().route("**/v1/market-wallet/security/confirm", async (route) => {
+    confirmCalls += 1;
+    assert.ok(route.request().headers()["x-router-request-signature"]);
+    const { challengeId, password } = route.request().postDataJSON();
+    assert.equal(challengeId, "transfer-challenge");
+    if (password !== "correct horse") {
+      await route.fulfill({ status: 403, contentType: "application/json", body: JSON.stringify({ code: "FINANCIAL_PASSWORD_INVALID", message: "password is incorrect" }) });
+      return;
+    }
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify({ stepupId: "transfer-challenge" }) });
+  });
+  await page.context().route("**/v1/market-wallet/transfers/pending", async (route) => {
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify({ items: pendingTransfers }) });
+  });
+  await page.context().route("**/v1/market-wallet/transfers/pending/*/cancel", async (route) => {
+    withdrawCalls += 1;
+    assert.ok(route.request().headers()["x-router-request-signature"]);
+    const withdrawn = { ...pendingTransfers[0], status: "cancelled" };
+    pendingTransfers = [];
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify(withdrawn) });
+  });
+  await page.context().route("**/v1/market-wallet/transfer-returns/awaiting", async (route) => {
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify({ items: [] }) });
   });
   await page.context().route("**/v1/market-wallet/topup-quotes", async (route) => {
     const { channelId, amountMinor } = route.request().postDataJSON();
     quoteRequests.push({ channelId, amountMinor });
-    const channel = channelId === "channel-2" ? channelLimits(channelId, "Bounded channel", 1000, 5000) : channelLimits(channelId, "DujiaoPay", 100, primaryMaxCreditMinor);
+    const channel = channelId === "channel-2" ? channelLimits(channelId, "Bounded channel", 1000, 5000) : channelLimits(channelId, "DujiaoPay", 500, primaryMaxCreditMinor);
     const feeMinor = Math.floor((amountMinor * feeBps + 5000) / 10000);
     const response = { id: `quote-${amountMinor}`, creditMinor: amountMinor, feeBps, feeMinor, payMinor: amountMinor + feeMinor, policyVersion, channelRevision: 1, channelSettingsVersion, expiresAt: new Date(Date.now() + 300_000).toISOString() };
     if (delayedQuote) {
@@ -287,17 +343,17 @@ try {
     await route.fulfill({ contentType: "application/json", body: JSON.stringify([
       activeChannel === "channel-2" ? channelLimits(activeChannel, "Bounded channel", 1000, 5000)
         : activeChannel === "channel-3" ? channelLimits(activeChannel, "Unavailable channel", 200, 100)
-          : channelLimits(activeChannel, "DujiaoPay", 100, primaryMaxCreditMinor),
-      channelLimits("legacy-duplicate", "Hidden merchant name", 100, 1000),
-      { ...channelLimits("unknown-category", "Unsupported method", 100, 1000), methodCategory: "unknown" },
+          : channelLimits(activeChannel, "DujiaoPay", 500, primaryMaxCreditMinor),
+      channelLimits("legacy-duplicate", "Hidden merchant name", 500, 1000),
+      { ...channelLimits("unknown-category", "Unsupported method", 500, 1000), methodCategory: "unknown" },
     ]) });
   });
   await page.context().route("**/v1/market-wallet/topups", async (route) => {
     if (route.request().method() === "POST") {
       topupCreates += 1;
       const input = route.request().postDataJSON();
-      assert.equal(input.quoteId, "quote-100");
-      assert.equal(input.amountMinor, 100);
+      assert.equal(input.quoteId, "quote-500");
+      assert.equal(input.amountMinor, 500);
       assert.equal(input.channelId, "channel-1");
       if (rejectNextTopupQuote) {
         rejectNextTopupQuote = false; feeBps = 600; policyVersion += 1;
@@ -335,82 +391,90 @@ try {
   });
   await page.context().route("**/v1/market-wallet/topups/order-2/recheck", async (route) => {
     recheckCalls += 1;
+    assert.ok(route.request().headers()["x-router-request-signature"]);
     topup = { ...topup, buyerRecheckRequestedAt: new Date().toISOString(), buyerRecheckResult: "queued" };
     await route.fulfill({ contentType: "application/json", body: JSON.stringify({ queued: true, order: topup }) });
   });
-  await page.context().route("**/v1/market-wallet/topups/order-2/stop", async (route) => {
-    stopCalls += 1;
-    topup = { ...topup, buyerAbandonedAt: new Date().toISOString(), checkoutUrl: null };
+  await page.context().route("**/v1/market-wallet/topups/order-1/close", async (route) => {
+    closeCalls += 1;
+    assert.ok(route.request().headers()["x-router-request-signature"]);
+    topup = { ...topup, buyerAbandonedAt: new Date().toISOString(), checkoutUrl: null, buyerView: view("confirming") };
     await route.fulfill({ contentType: "application/json", body: JSON.stringify(topup) });
   });
   await page.goto(`${baseUrl}/account/wallet/`);
   assert.equal(await page.getByRole("region", { name: "Client rental terminations", exact: true }).count(), 0, "termination actions belong to Client rentals, not balance history");
-  await page.getByRole("button", { name: "Check payment" }).waitFor();
+  for (const retired of ["Wallet security", "Transfer corrections"]) {
+    assert.equal(await page.getByText(retired, { exact: true }).count(), 0, `${retired} is a fixed server rule, not a page section`);
+  }
+  const attention = page.getByRole("region", { name: "Needs attention", exact: true });
+  await attention.getByText("Top-up $5.00 confirming", { exact: true }).waitFor();
+  await attention.getByText("It credits automatically once the payment is confirmed. Nothing to do.", { exact: true }).waitFor();
+  assert.equal(await attention.getByRole("button").count(), 0, "a confirming top-up offers no buyer actions");
   for (const width of [320, 375, 414, 768]) {
     await page.setViewportSize({ width, height: 900 });
     const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
     assert.ok(overflow <= 1, `wallet page overflows by ${overflow}px at ${width}px`);
   }
-  await page.getByRole("button", { name: "Check payment" }).click();
-  await page.getByText(/Payment verification is scheduled/i).waitFor();
-  assert.equal(recheckCalls, 1);
-  await page.getByRole("button", { name: "Stop paying" }).click();
-  await page.getByRole("button", { name: "Stop paying", exact: true }).last().click();
-  await page.getByRole("status").filter({ hasText: /You stopped paying in Router/i }).first().waitFor();
-  assert.equal(stopCalls, 1);
+  // Returning to the tab asks the server to look at confirming top-ups again.
+  await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
+  await until(() => recheckCalls === 1, "a confirming top-up is re-checked when the buyer returns");
   assert.equal(topup.status, "review_required");
 
-  // The full $1–$1,000 principal range excludes the additional maintenance fee.
+  // The fixed $5–$1,000 credit range excludes the maintenance fee.
   // Invalid inputs never request a quote or consume pending-order capacity.
   const amountInput = page.locator("#market-wallet-topup-amount");
   const amountHelp = page.locator("#market-wallet-topup-amount-help");
-  // Buyers choose a method, not a merchant. Simulate an Owner changing which
-  // merchant is active, then revalidate the form without losing its draft.
+  const payButton = (name) => page.getByRole("button", { name, exact: true });
+  await payButton("Pay $21.00").waitFor();
+  assert.equal(await amountInput.inputValue(), "20.00", "the common amount is preselected");
+  assert.equal(await page.getByRole("button", { name: "$20", exact: true }).getAttribute("aria-pressed"), "true");
+  await amountHelp.filter({ hasText: "Includes $1.00 maintenance fee · paid $21.00" }).waitFor();
+  // Buyers never choose a merchant. Simulate an Owner changing which merchant
+  // is active, then revalidate the form without losing its draft. Duplicate
+  // and unknown categories collapse to one method, so no picker is shown.
   const selectChannel = async name => {
     activeChannel = { DujiaoPay: "channel-1", "Bounded channel": "channel-2", "Unavailable channel": "channel-3" }[name];
     assert.ok(activeChannel);
     await page.evaluate(() => window.dispatchEvent(new Event("focus")));
     await page.waitForFunction(id => document.querySelector("form[data-topup-channel]")?.dataset.topupChannel === id, activeChannel);
-    await page.getByRole("button", { name: /Top-up method/ }).click();
-    assert.equal(await page.getByRole("option").count(), 1, "duplicate or unknown categories never become buyer choices");
-    await page.getByRole("option", { name: "Cryptocurrency", exact: true }).click();
+    assert.equal(await page.getByRole("button", { name: /Top-up method/ }).count(), 0, "one method needs no picker");
   };
-  await amountHelp.filter({ hasText: "$1.00–$1,000.00" }).waitFor();
+  assert.equal(await page.getByRole("button", { name: /Top-up method/ }).count(), 0);
   const requestsBeforeInvalid = quoteRequests.length;
-  for (const invalid of ["0.99", "1000.01"]) {
+  for (const invalid of ["4.99", "1000.01"]) {
     await amountInput.fill(invalid);
     await amountInput.blur();
-    await amountHelp.filter({ hasText: /\$1,000\.00/ }).waitFor();
+    await amountHelp.filter({ hasText: /\$5\.00 and \$1,000\.00/ }).waitFor();
     assert.equal(await amountInput.getAttribute("aria-invalid"), "true");
-    assert.equal(await page.getByRole("button", { name: "Continue to payment", exact: true }).isDisabled(), true);
+    assert.equal(await payButton("Continue to payment").isDisabled(), true);
     await page.waitForTimeout(600);
   }
   assert.equal(quoteRequests.length, requestsBeforeInvalid);
   assert.equal(topupCreates, 0);
   await amountInput.fill("960");
-  await page.getByRole("button", { name: "Pay $1,008.00", exact: true }).waitFor();
+  await payButton("Pay $1,008.00").waitFor();
   assert.equal(quoteRequests.at(-1).amountMinor, 96_000);
   await amountInput.fill("1000");
-  await page.getByRole("button", { name: "Pay $1,050.00", exact: true }).waitFor();
+  await payButton("Pay $1,050.00").waitFor();
   assert.equal(quoteRequests.at(-1).amountMinor, 100_000);
 
   await selectChannel("Bounded channel");
-  await amountHelp.filter({ hasText: /\$10\.00.*\$50\.00/ }).waitFor();
+  await amountHelp.filter({ hasText: /\$10\.00 and \$50\.00/ }).waitFor();
   assert.equal(await amountInput.inputValue(), "1000", "switching never silently clamps the requested credit");
   assert.equal(await page.getByRole("button", { name: "$5", exact: true }).isDisabled(), true);
+  assert.equal(await page.getByRole("button", { name: "$10", exact: true }).isDisabled(), false);
   assert.equal(await page.getByRole("button", { name: "$50", exact: true }).isDisabled(), false);
   assert.equal(await page.getByRole("button", { name: "$100", exact: true }).isDisabled(), true);
-  assert.equal(await page.getByRole("button", { name: "$10", exact: true }).isDisabled(), false);
   await amountInput.fill("9.99");
   assert.equal(await amountInput.getAttribute("aria-invalid"), "true");
   await amountInput.fill("10");
-  await page.getByRole("button", { name: "Pay $10.50", exact: true }).waitFor();
+  await payButton("Pay $10.50").waitFor();
   await amountInput.fill("50");
-  await page.getByRole("button", { name: "Pay $52.50", exact: true }).waitFor();
+  await payButton("Pay $52.50").waitFor();
   await selectChannel("Unavailable channel");
   await amountHelp.filter({ hasText: /no available top-up range/ }).waitFor();
   assert.equal(await amountInput.isDisabled(), true);
-  assert.equal(await page.getByRole("button", { name: "Continue to payment", exact: true }).isDisabled(), true);
+  assert.equal(await payButton("Continue to payment").isDisabled(), true);
 
   // An old, delayed quote must not win after switching channels.
   await selectChannel("DujiaoPay");
@@ -421,30 +485,30 @@ try {
   await amountInput.fill("10");
   await oldQuoteStarted;
   await selectChannel("Bounded channel");
-  await page.getByRole("button", { name: "Pay $10.50", exact: true }).waitFor();
+  await payButton("Pay $10.50").waitFor();
   releaseOldQuote();
   await page.waitForTimeout(100);
-  assert.match(await amountHelp.textContent(), /\$10\.00.*\$50\.00/);
-  assert.equal(await page.getByRole("button", { name: "Pay $10.50", exact: true }).isDisabled(), false);
+  assert.match(await amountHelp.textContent(), /paid \$10\.50/);
+  assert.equal(await payButton("Pay $10.50").isDisabled(), false);
 
   // A fee update invalidates the old quote as soon as current channel data
   // arrives, even if no new payment is being created. Input remains untouched.
   await selectChannel("DujiaoPay");
   await amountInput.fill("1000");
-  await page.getByRole("button", { name: "Pay $1,050.00", exact: true }).waitFor();
+  await payButton("Pay $1,050.00").waitFor();
   feeBps = 725; policyVersion += 1;
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
-  await page.getByRole("button", { name: "Pay $1,072.50", exact: true }).waitFor();
+  await payButton("Pay $1,072.50").waitFor();
   assert.equal(await amountInput.inputValue(), "1000");
   assert.equal(await amountInput.getAttribute("aria-invalid"), "false");
-  assert.match(await amountHelp.textContent(), /\$1\.00.*\$1,000\.00/);
+  await amountHelp.filter({ hasText: "Includes $72.50 maintenance fee · paid $1,072.50" }).waitFor();
   for (const [rate, total] of [[0, "$1,000.00"], [10_000, "$2,000.00"]]) {
     feeBps = rate; policyVersion += 1;
     await page.evaluate(() => window.dispatchEvent(new Event("focus")));
-    await page.getByRole("button", { name: `Pay ${total}`, exact: true }).waitFor();
+    await payButton(`Pay ${total}`).waitFor();
     assert.equal(await amountInput.inputValue(), "1000");
     assert.equal(await amountInput.getAttribute("aria-invalid"), "false");
-    assert.match(await amountHelp.textContent(), /\$1\.00.*\$1,000\.00/);
+    assert.doesNotMatch(await amountHelp.textContent(), /Enter a balance credit/);
   }
   assert.equal(topupCreates, 0, "fee refresh never submits an order automatically");
 
@@ -452,8 +516,8 @@ try {
   // limits and request a matching quote before enabling payment.
   feeBps = 500; policyVersion += 1;
   await amountInput.fill("10");
-  await page.getByRole("button", { name: "Pay $10.50", exact: true }).waitFor();
-  await amountHelp.filter({ hasText: /\$1,000\.00/ }).waitFor();
+  await payButton("Pay $10.50").waitFor();
+  await amountHelp.filter({ hasText: /paid \$10\.50/ }).waitFor();
 
   // Only an explicit channel principal-limit change narrows the input range.
   // An error refreshes that range without clamping the entered principal.
@@ -465,76 +529,106 @@ try {
   assert.equal(topupCreates, 0);
   primaryMaxCreditMinor = 100_000; channelSettingsVersion += 1;
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
-  await amountHelp.filter({ hasText: /\$1,000\.00/ }).waitFor();
+  await payButton("Pay $892.50").waitFor();
 
   // A committed order with no payable capability stays visible in the new
-  // tab. The wallet must not pretend it is ready to choose a payment method.
+  // tab, which explains why it cannot pay instead of redirecting.
   topup = {
-    id: "order-1", channelId: "channel-1", amountMinor: 105,
-    creditAmountMinor: 100, platformFeeMinor: 5, platformFeeRateBps: 500, policyVersion: 1,
+    id: "order-1", channelId: "channel-1", amountMinor: 525,
+    creditAmountMinor: 500, platformFeeMinor: 25, platformFeeRateBps: 500, policyVersion: 1,
     status: "pending", checkoutUrl,
     createdAt: new Date().toISOString(), autoCloseAt: null,
     buyerAbandonedAt: null, reviewReason: null,
     buyerRecheckRequestedAt: null, buyerRecheckCompletedAt: null,
     buyerRecheckResult: null, lastGatewayStatus: "pending",
     lastGatewayCheckedAt: new Date().toISOString(),
+    buyerView: view("awaiting_payment"),
   };
   canPay = false;
   expiresAt = new Date(Date.now() + 60_000).toISOString();
   await page.goto(`${baseUrl}/account/wallet/`);
-  await page.locator("#market-wallet-topup-amount").fill("1.00");
+  await amountInput.fill("5.00");
   const [blockedTab] = await Promise.all([
     page.waitForEvent("popup"),
-    page.getByRole("button", { name: "Pay $1.05", exact: true }).click(),
+    payButton("Pay $5.25").click(),
   ]);
   await blockedTab.getByText(/Payment or review evidence needs checking/i).waitFor();
   assert.match(blockedTab.url(), /\/wallet-checkout\/\?topup=order-1$/);
-  await page.getByText("Payment unavailable").waitFor();
-  assert.equal(await page.getByRole("link", { name: "Continue payment" }).count(), 0);
   assert.equal(externalVisits, 1);
   await blockedTab.close();
 
+  // The unpaid order waits under Needs attention with one way to pay and one
+  // way to stop; the checkout page re-checks payability before redirecting.
+  await attention.getByText("Top-up $5.00 awaiting payment", { exact: true }).waitFor();
   canPay = true;
-  await page.getByRole("button", { name: "Refresh gateway status" }).click();
-  const resumeLink = page.getByRole("link", { name: "Continue payment" });
-  await resumeLink.waitFor();
+  const resumeLink = attention.getByRole("link", { name: "Continue to pay" });
   const resumedTabPromise = page.waitForEvent("popup");
   await resumeLink.click();
   const resumedTab = await resumedTabPromise;
   await resumedTab.waitForURL(checkoutUrl);
   assert.equal(externalVisits, 2);
   await resumedTab.close();
+  await attention.getByRole("button", { name: "Don't pay", exact: true }).click();
+  await page.getByText("Stop this top-up?", { exact: true }).waitFor();
+  assert.equal(closeCalls, 0, "opening the confirmation does not stop the order");
+  await page.getByRole("button", { name: "Don't pay", exact: true }).last().click();
+  await attention.getByRole("status").filter({ hasText: /Stopped\. Any payment you already made still credits automatically/ }).waitFor();
+  assert.equal(closeCalls, 1);
+  assert.equal(await attention.getByText("Top-up $5.00 awaiting payment", { exact: true }).count(), 0);
 
-  // No real transfer is sent. The confirmation must retain exact sub-cent
-  // units, the frozen recipient, and one idempotency key across an uncertain response, without any OTP.
-  await page.getByRole("tab", { name: "Send", exact: true }).click();
+  // No real transfer is sent. A first transfer is delayed and withdrawable;
+  // the login password confirms it (one typo, then the right password) and an
+  // uncertain response is retried with the same idempotency key, without OTP.
+  await page.getByRole("button", { name: /^Send to someone/ }).click();
   const transferPanel = page.locator("#wallet-transfer");
   await transferPanel.getByLabel("Recipient email").fill("recipient@example.invalid");
   await transferPanel.getByRole("button", { name: "Send all available", exact: true }).click();
   await transferPanel.getByRole("button", { name: "Review send" }).click();
-  const transferDialog = page.getByRole("dialog", { name: "Confirm recipient & amount" });
-  await transferDialog.getByText("recipient@example.invalid", { exact: true }).waitFor();
-  await transferDialog.getByText("Exact amount: 8640001 ledger units", { exact: true }).waitFor();
+  const confirmation = page.getByRole("region", { name: "Confirm recipient & amount" });
+  await confirmation.getByText("recipient@example.invalid", { exact: true }).waitFor();
+  await confirmation.getByText("First transfer to this user: it credits in 24 hours and you can withdraw it until then.", { exact: true }).waitFor();
+  assert.equal(await confirmation.getByText(/ledger units/).count(), 0, "internal ledger units are never shown");
   for (const width of [320, 375, 414, 768]) {
     await page.setViewportSize({ width, height: 900 });
-    assert.ok(await transferDialog.evaluate((element) => element.scrollWidth <= element.clientWidth + 1), `transfer dialog overflow at ${width}`);
+    assert.ok(await confirmation.evaluate((element) => element.scrollWidth <= element.clientWidth + 1), `transfer confirmation overflow at ${width}`);
   }
-  assert.equal(await transferDialog.locator('input[autocomplete="one-time-code"]').count(), 0);
-  assert.equal(await transferDialog.getByRole("button", { name: /verification|code/i }).count(), 0);
-  await transferDialog.getByRole("button", { name: /^Send \$/ }).click();
-  await transferDialog.getByRole("alert").waitFor();
-  await transferDialog.getByRole("button", { name: /^Send \$/ }).click();
-  await transferPanel.getByRole("status").filter({ hasText: /Sent/ }).waitFor();
+  assert.equal(await confirmation.locator('input[autocomplete="one-time-code"]').count(), 0);
+  assert.equal(await confirmation.getByRole("button", { name: /verification|code/i }).count(), 0);
+  await confirmation.getByRole("button", { name: /^Send \$/ }).click();
+  const passwordDialog = page.getByRole("dialog", { name: "Confirm with your password" });
+  await passwordDialog.getByText(/A transfer to a new recipient credits after 24 hours/).waitFor();
+  await passwordDialog.getByLabel("Login password", { exact: true }).fill("typo");
+  await passwordDialog.getByRole("button", { name: "Confirm", exact: true }).click();
+  await passwordDialog.getByRole("alert").filter({ hasText: "The password is incorrect. Try again." }).waitFor();
+  await passwordDialog.getByLabel("Login password", { exact: true }).fill("correct horse");
+  await passwordDialog.getByRole("button", { name: "Confirm", exact: true }).click();
+  await passwordDialog.waitFor({ state: "hidden" });
+  await confirmation.getByRole("alert").waitFor();
+  assert.equal(confirmCalls, 2);
   assert.equal(transferCalls, 2);
+  await confirmation.getByRole("button", { name: /^Send \$/ }).click();
+  await transferPanel.getByRole("status").filter({ hasText: /Sent for recipient@example\.invalid/ }).waitFor();
+  assert.equal(transferCalls, 3);
   assert.ok(transferKeys[0]);
-  assert.equal(transferKeys[0], transferKeys[1]);
+  assert.deepEqual(new Set(transferKeys).size, 1, "one idempotency key across confirmation and retry");
+  assert.deepEqual(transferStepups, [null, "transfer-challenge", null]);
+
+  // The pending transfer can be withdrawn by its sender before it credits.
+  await page.keyboard.press("Escape");
+  await attention.getByText(/^To recipient@example\.invalid · /).waitFor();
+  await attention.getByText(/You can withdraw it until then/).waitFor();
+  await attention.getByRole("button", { name: "Withdraw", exact: true }).click();
+  await attention.getByRole("status").filter({ hasText: "Withdrawn. The amount is back in your available balance." }).waitFor();
+  assert.equal(withdrawCalls, 1);
+  assert.equal(await attention.getByText(/^To recipient@example\.invalid · /).count(), 0);
 
   // A changed policy refreshes the visible total but never silently submits
   // an order at the new price. A second user gesture is required.
-  await page.getByRole("tab", { name: "Top up", exact: true }).click();
+  await page.setViewportSize({ width: 1280, height: 900 });
   rejectNextTopupQuote = true;
-  await page.getByRole("button", { name: "Pay $1.05", exact: true }).click();
-  await page.getByRole("button", { name: "Pay $1.06", exact: true }).waitFor();
+  await amountInput.fill("5.00");
+  await payButton("Pay $5.25").click();
+  await payButton("Pay $5.30").waitFor();
   await page.getByRole("alert").filter({ hasText: /Review the new total/ }).waitFor();
   assert.equal(topupCreates, 2);
 
@@ -754,6 +848,26 @@ try {
     }
     await route.fulfill({ contentType: "application/json", body: JSON.stringify(data) });
   });
+  // Owner-only top-up limits and circuit breaker now live in Settings, not on
+  // the buyer's balance page. Saving is a signed finance write with CAS.
+  let risk = { version: 1, topupUserDayMinor: 200000, topupChannelDayMinor: 2000000,
+    topupGlobalDayMinor: 5000000, topupGlobalHourMinor: 1000000, incomingUserDayMinor: 1000000,
+    chainVerificationRequired: false, topupCircuitOpen: true };
+  let riskWrites = 0, rejectRisk = true;
+  await page.context().route("**/v1/admin/market-finance/risk-policy", async (route) => {
+    if (route.request().method() === "PUT") {
+      riskWrites++;
+      assert.ok(route.request().headers()["x-router-request-signature"]);
+      const input = route.request().postDataJSON();
+      assert.equal(input.version, risk.version);
+      if (rejectRisk) {
+        rejectRisk = false; risk = { ...risk, version: 2 };
+        return route.fulfill({ status: 409, contentType: "application/json", body: JSON.stringify({ message: "risk policy changed; reload" }) });
+      }
+      risk = { ...input, version: risk.version + 1 };
+    }
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify(risk) });
+  });
   await page.goto(`${baseUrl}/settings/`);
   await page.getByRole("button", { name: "Market & Billing", exact: true }).click();
   await page.getByRole("tab", { name: /^Wallet & payments/ }).click();
@@ -829,6 +943,21 @@ try {
   await commissionPanel.getByRole("button", { name: "Retry", exact: true }).click();
   await page.waitForFunction(() => [...document.querySelectorAll("input")].some((input) => input.value === "10.25" && !input.disabled));
   assert.equal(await commissionInput.inputValue(), "10.25");
+  const riskPanel = () => page.locator("section").filter({ has: page.getByRole("heading", { name: "Aggregate credit limits", exact: true }) }).last();
+  await riskPanel().getByLabel("Top-ups per user / 24 hours (USD)", { exact: true }).fill("2500");
+  await riskPanel().getByRole("button", { name: "Save risk policy", exact: true }).click();
+  await riskPanel().getByRole("alert").filter({ hasText: "risk policy changed" }).waitFor();
+  assert.equal(await riskPanel().getByLabel("Top-ups per user / 24 hours (USD)", { exact: true }).inputValue(), "2500", "a conflict keeps the Owner's draft");
+  // The panel has no in-place reload; a page reload reads the current version.
+  await page.reload();
+  await riskPanel().getByLabel("Top-ups per user / 24 hours (USD)", { exact: true }).waitFor();
+  await riskPanel().getByLabel("Top-ups per user / 24 hours (USD)", { exact: true }).fill("2500");
+  await riskPanel().getByLabel("Pause new top-ups and automatic credits", { exact: true }).uncheck();
+  await riskPanel().getByRole("button", { name: "Save risk policy", exact: true }).click();
+  await riskPanel().getByRole("status").filter({ hasText: "Saved" }).waitFor();
+  assert.equal(riskWrites, 2);
+  assert.equal(risk.topupUserDayMinor, 250000);
+  assert.equal(risk.topupCircuitOpen, false);
   policy = { ...policy, canEdit: false };
   commissionPolicy = { ...commissionPolicy, canEdit: false };
   await page.reload();
@@ -838,103 +967,67 @@ try {
   assert.equal(await commissionInput.isDisabled(), true);
   assert.equal(await commissionPanel.getByRole("button", { name: "Save", exact: true }).isDisabled(), true);
 
-  // Exercise the exported wallet security and recipient-consent UI. The
-  // independent cryptographic/Passkey browser test verifies the 428 ceremony.
-  let risk = { version: 1, topupUserDayMinor: 200000, topupChannelDayMinor: 2000000,
-    topupGlobalDayMinor: 5000000, topupGlobalHourMinor: 1000000, incomingUserDayMinor: 1000000,
-    chainVerificationRequired: false, topupCircuitOpen: true };
-  let riskWrites = 0, rejectRisk = true, returnWrites = 0;
-  const keyId = "11111111-1111-4111-8111-111111111111";
-  const sentId = "22222222-2222-4222-8222-222222222222";
-  const receivedId = "33333333-3333-4333-8333-333333333333";
+  // Retired: wallet security and transfer-correction requests. Requests made
+  // earlier still wait for the recipient under Needs attention, and any
+  // received transfer can be sent back as an ordinary transfer.
   const time = new Date().toISOString();
-  let keys = [{ id: keyId, usableAfter: "2020-01-01T00:00:00Z", createdAt: time, revokedAt: null }];
-  const returns = new Map([[receivedId, { id: "return-received", transferId: receivedId,
-    requestedBy: "sender", reason: "Wrong registered recipient", status: "requested", version: 1,
-    journalId: null, createdAt: time, resolvedAt: null }]]);
   const json = (route, data, status = 200) => route.fulfill({ status, contentType: "application/json", body: JSON.stringify(data) });
-  await page.context().route("**/v1/market-wallet/security", route => json(route, {
-    sessionReference: "test-wallet-session", canManageRiskPolicy: true, passkeys: keys,
-    coolingHours: 24, largeTransferMinor: 50000, firstRecipientRequiresPasskey: true,
-  }));
-  await page.context().route(`**/v1/market-wallet/security/passkeys/${keyId}/revoke`, async route => {
-    assert.ok(route.request().headers()["x-router-request-signature"]);
-    keys = keys.map(k => ({ ...k, revokedAt: time }));
-    await json(route, { revoked: true });
-  });
-  await page.context().route("**/v1/admin/market-finance/risk-policy", async route => {
-    if (route.request().method() === "PUT") {
-      riskWrites++;
-      assert.ok(route.request().headers()["x-router-request-signature"]);
-      const input = route.request().postDataJSON();
-      assert.equal(input.version, risk.version);
-      if (rejectRisk) { rejectRisk = false; risk = { ...risk, version: 2 }; return json(route, { message: "risk policy changed; reload" }, 409); }
-      risk = { ...input, version: risk.version + 1 };
-    }
-    await json(route, risk);
-  });
-  await page.context().route("**/v1/market-wallet/transfers?**", route => json(route, { total: 2, items: [
-    { id: sentId, senderEmail: "buyer@example.invalid", recipientEmail: "recipient@example.invalid", amountUnits: "8640000", journalId: "sent-journal", createdAt: time },
-    { id: receivedId, senderEmail: "sender@example.invalid", recipientEmail: "buyer@example.invalid", amountUnits: "8640000", journalId: "received-journal", createdAt: time },
-  ] }));
-  await page.context().route("**/v1/market-wallet/transfers/*/return**", async route => {
-    const match = new URL(route.request().url()).pathname.match(/transfers\/([^/]+)\/return(?:\/(approve|decline))?$/);
+  const receivedId = "33333333-3333-4333-8333-333333333333";
+  const otherId = "44444444-4444-4444-8444-444444444444";
+  let awaiting = [
+    { id: "return-1", transferId: receivedId, reason: "Wrong registered recipient", version: 1, createdAt: time, senderEmail: "sender@example.invalid", amountUnits: "8640000" },
+    { id: "return-2", transferId: otherId, reason: "Sent twice by mistake", version: 3, createdAt: time, senderEmail: "other@example.invalid", amountUnits: "17280000" },
+  ];
+  const decisions = [];
+  await page.context().route("**/v1/market-wallet/transfer-returns/awaiting", route => json(route, { items: awaiting }));
+  await page.context().route("**/v1/market-wallet/transfers/*/return/*", async route => {
+    const match = new URL(route.request().url()).pathname.match(/transfers\/([^/]+)\/return\/(approve|decline)$/);
     assert.ok(match);
     const [, id, decision] = match;
-    if (route.request().method() === "POST") {
-      returnWrites++;
-      assert.ok(route.request().headers()["x-router-request-signature"]);
-      const input = route.request().postDataJSON();
-      if (decision) {
-        const previous = returns.get(id);
-        assert.equal(input.expectedVersion, previous.version);
-        returns.set(id, { ...previous, status: decision === "approve" ? "approved" : "declined", version: previous.version + 1, journalId: "compensating-journal", resolvedAt: time });
-      } else {
-        assert.equal(id, sentId);
-        returns.set(id, { id: "return-sent", transferId: id, requestedBy: "buyer", reason: input.reason,
-          status: "requested", version: 1, journalId: null, createdAt: time, resolvedAt: null });
-      }
-    }
-    await json(route, returns.get(id) || null);
+    assert.equal(route.request().method(), "POST");
+    assert.ok(route.request().headers()["x-router-request-signature"]);
+    const request = awaiting.find(item => item.transferId === id);
+    assert.equal(route.request().postDataJSON().expectedVersion, request.version);
+    decisions.push([id, decision]);
+    awaiting = awaiting.filter(item => item.transferId !== id);
+    await json(route, { id: request.id, transferId: id, status: decision === "approve" ? "approved" : "declined" });
   });
+  await page.context().route("**/v1/market-wallet/transfers/*/return", async route => {
+    assert.notEqual(route.request().method(), "POST", "new return requests are retired");
+    await json(route, null);
+  });
+  await page.context().route("**/v1/market-wallet/transactions", route => json(route, { items: [{
+    id: "entry-received", sourceKind: "wallet_transfer", action: "transfer", deltaUnits: "8640000", heldDeltaUnits: "0",
+    createdAt: time, transferId: receivedId, counterpartyEmail: "sender@example.invalid", c2cOrderId: null,
+  }], nextCursor: null }));
   await page.goto(`${baseUrl}/account/wallet/`);
-  const securityPanel = page.locator("details").filter({ has: page.locator("summary").getByText("Wallet security", { exact: true }) });
-  await securityPanel.locator("summary").click();
-  await securityPanel.getByText("Ready", { exact: true }).waitFor();
-  await securityPanel.getByLabel("Top-ups per user / 24 hours (USD)", { exact: true }).fill("2500");
-  await securityPanel.getByRole("button", { name: "Save risk policy", exact: true }).click();
-  await securityPanel.getByRole("alert").filter({ hasText: "risk policy changed" }).waitFor();
-  assert.equal(await securityPanel.getByLabel("Top-ups per user / 24 hours (USD)", { exact: true }).inputValue(), "2500");
-  await securityPanel.getByRole("button", { name: "Reload", exact: true }).click();
-  await securityPanel.getByLabel("Top-ups per user / 24 hours (USD)", { exact: true }).fill("2500");
-  await securityPanel.getByLabel("Pause new top-ups and automatic credits", { exact: true }).uncheck();
-  await securityPanel.getByRole("button", { name: "Save risk policy", exact: true }).click();
-  await securityPanel.getByRole("status").filter({ hasText: "Saved" }).waitFor();
-  assert.equal(riskWrites, 2);
-  assert.equal(risk.topupUserDayMinor, 250000);
-  assert.equal(risk.topupCircuitOpen, false);
-  await securityPanel.getByRole("button", { name: "Revoke", exact: true }).click();
-  await securityPanel.getByRole("button", { name: "Revoke", exact: true }).waitFor({ state: "detached" });
-  const corrections = page.locator("details").filter({ has: page.locator("summary").getByText("Transfer corrections", { exact: true }) });
-  await corrections.locator("summary").click();
-  const sent = corrections.locator("article").filter({ hasText: "recipient@example.invalid" });
-  const received = corrections.locator("article").filter({ hasText: "sender@example.invalid" });
-  await sent.getByLabel("Reason (8–1000 characters)", { exact: true }).fill("Wrong registered recipient");
-  await sent.getByRole("button", { name: "Request return", exact: true }).click();
-  await sent.getByText("Recipient decision pending", { exact: true }).waitFor();
-  assert.equal(returnWrites, 1);
-  assert.equal(await sent.getByRole("button", { name: /Return the full amount/ }).count(), 0);
-  await received.getByRole("button", { name: "Return the full amount", exact: true }).click();
-  assert.equal(returnWrites, 1, "opening recipient confirmation does not transfer funds");
-  await received.getByRole("button", { name: /Return the full amount.*\$1\.00/ }).click();
-  await received.getByText("Returned", { exact: true }).waitFor();
-  assert.equal(returnWrites, 2);
+  for (const retired of ["Wallet security", "Transfer corrections", "Add Passkey", "Request return"]) {
+    assert.equal(await page.getByText(retired, { exact: true }).count(), 0, `${retired} is gone`);
+  }
+  const needs = page.getByRole("region", { name: "Needs attention", exact: true });
+  await needs.getByText("sender@example.invalid asks you to return $1.00", { exact: true }).waitFor();
+  await needs.getByText("Wrong registered recipient", { exact: true }).waitFor();
+  await needs.getByRole("button", { name: "Return $1.00", exact: true }).click();
+  await needs.getByText("sender@example.invalid asks you to return $1.00", { exact: true }).waitFor({ state: "detached" });
+  await needs.getByText("other@example.invalid asks you to return $2.00", { exact: true }).waitFor();
+  await needs.getByRole("button", { name: "Decline", exact: true }).click();
+  await needs.getByText("other@example.invalid asks you to return $2.00", { exact: true }).waitFor({ state: "detached" });
+  assert.deepEqual(decisions, [[receivedId, "approve"], [otherId, "decline"]]);
+  const activity = page.getByRole("region", { name: "Activity", exact: true });
+  await activity.getByText("Received from sender@example.invalid", { exact: true }).waitFor();
+  await activity.getByRole("button", { name: "Send back", exact: true }).click();
+  const sendBack = page.getByRole("dialog", { name: "Send back to sender@example.invalid" });
+  await sendBack.waitFor();
+  assert.equal(await sendBack.getByLabel("Recipient email").inputValue(), "sender@example.invalid");
+  assert.equal(await sendBack.locator("#wallet-transfer input[inputmode=decimal]").inputValue(), "1.00");
+  await page.keyboard.press("Escape");
+  await sendBack.waitFor({ state: "hidden" });
   for (const width of [320, 375, 414, 768]) {
     await page.setViewportSize({ width, height: 900 });
-    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `wallet security/correction page overflows at ${width}`);
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `wallet attention/activity page overflows at ${width}`);
   }
   assert.deepEqual(pageErrors, []);
-  console.log("wallet checkout: principal limits, dynamic fees, stale-quote races, safe payment tabs, recheck/stop, exact transfer and idempotent retry, automatic earnings credit, Owner policies, wallet security, risk-policy CAS/recovery, Passkey revocation and recipient-consented transfer returns passed; four widths; no screenshots or real payments");
+  console.log("wallet checkout: fixed $5–$1,000 range with $20 default, dynamic fees, stale-quote races, safe payment tabs, automatic recheck, Don't pay, password-confirmed delayed transfer with idempotent retry and withdraw, automatic earnings credit, Owner policies, risk-policy CAS in Settings, legacy return decisions and send-back passed; four widths; no screenshots or real payments");
 } finally {
   await browser?.close();
   if (server) await new Promise((resolveStop, rejectStop) => {

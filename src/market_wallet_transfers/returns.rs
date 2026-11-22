@@ -1,5 +1,10 @@
 //! A mistaken transfer is corrected by a new, recipient-consented journal.
 //! Administrators may assist a request but cannot confiscate another balance.
+//!
+//! Retired for new requests: a transfer to a new recipient now waits before it
+//! credits and can be withdrawn by its sender, and a recipient can send money
+//! back as an ordinary transfer. Requests created earlier can still be decided
+//! by their recipient.
 use super::*;
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -20,6 +25,7 @@ fn read_tx(c: &Connection, transfer: &str) -> Result<Option<Return>, AppError> {
 fn parties_tx(c: &Connection, id: &str) -> Result<(String, String, i64), AppError> {
     c.query_row("SELECT sender_user_id,recipient_user_id,amount_units FROM market_wallet_transfers WHERE id=?1",params![id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(db_error("read return parties"))?.ok_or_else(||AppError::NotFound("transfer not found".into()))
 }
+#[cfg_attr(not(test), allow(dead_code))]
 fn request_tx(
     c: &Connection,
     actor: &crate::models::AuthSession,
@@ -162,11 +168,6 @@ fn decide_tx(
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct RequestReturn {
-    reason: String,
-}
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct DecideReturn {
     expected_version: i64,
 }
@@ -174,8 +175,9 @@ pub(super) fn router() -> Router<ServerState> {
     Router::new()
         .route(
             "/v1/market-wallet/transfers/:id/return",
-            get(view).post(request),
+            get(view).post(request_retired),
         )
+        .route("/v1/market-wallet/transfer-returns/awaiting", get(awaiting))
         .route(
             "/v1/market-wallet/transfers/:id/return/approve",
             post(approve),
@@ -186,8 +188,44 @@ pub(super) fn router() -> Router<ServerState> {
         )
         .route(
             "/v1/admin/market-finance/transfers/:id/return-request",
-            post(owner_request),
+            post(request_retired),
         )
+}
+async fn request_retired() -> AppError {
+    AppError::Gone(
+        "Transfer return requests were retired. Withdraw a transfer before it credits, or ask the recipient to send it back.".into(),
+    )
+}
+/// Earlier return requests that still wait for this user, as recipient, to decide.
+async fn awaiting(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let a = session(&state, &headers).await?;
+    let c = state.store.conn.lock().await;
+    let mut stmt = c
+        .prepare(
+            "SELECT r.id,r.transfer_id,r.reason,r.version,r.created_at,t.sender_email,t.amount_units
+             FROM market_transfer_returns r JOIN market_wallet_transfers t ON t.id=r.transfer_id
+             WHERE t.recipient_user_id=?1 AND r.status='requested' ORDER BY r.created_at LIMIT 50",
+        )
+        .map_err(db_error("prepare awaiting returns"))?;
+    let items = stmt
+        .query_map(params![a.user_id], |r| {
+            Ok(serde_json::json!({
+                "id": r.get::<_, String>(0)?,
+                "transferId": r.get::<_, String>(1)?,
+                "reason": r.get::<_, String>(2)?,
+                "version": r.get::<_, i64>(3)?,
+                "createdAt": r.get::<_, String>(4)?,
+                "senderEmail": r.get::<_, String>(5)?,
+                "amountUnits": r.get::<_, i64>(6)?.to_string(),
+            }))
+        })
+        .map_err(db_error("query awaiting returns"))?
+        .collect::<crate::db::Result<Vec<_>>>()
+        .map_err(db_error("read awaiting returns"))?;
+    Ok((no_store(), Json(serde_json::json!({ "items": items }))))
 }
 async fn view(
     State(state): State<ServerState>,
@@ -201,42 +239,6 @@ async fn view(
         return Err(AppError::NotFound("transfer not found".into()));
     }
     Ok((no_store(), Json(read_tx(&c, &id)?)))
-}
-async fn do_request(
-    state: ServerState,
-    headers: HeaderMap,
-    id: String,
-    input: RequestReturn,
-    owner: bool,
-) -> Result<impl axum::response::IntoResponse, AppError> {
-    let a = if owner {
-        crate::market_finance_auth::write_owner_session(&state, &headers).await?
-    } else {
-        crate::market_finance_auth::write_session(&state, &headers).await?
-    };
-    let c = state.store.conn.lock().await;
-    let tx = c
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(db_error("begin return request"))?;
-    let r = request_tx(&tx, &a, &id, &input.reason, owner, &now())?;
-    tx.commit().map_err(db_error("commit return request"))?;
-    Ok((no_store(), Json(r)))
-}
-async fn request(
-    State(s): State<ServerState>,
-    h: HeaderMap,
-    Path(id): Path<String>,
-    Json(i): Json<RequestReturn>,
-) -> Result<impl axum::response::IntoResponse, AppError> {
-    do_request(s, h, id, i, false).await
-}
-async fn owner_request(
-    State(s): State<ServerState>,
-    h: HeaderMap,
-    Path(id): Path<String>,
-    Json(i): Json<RequestReturn>,
-) -> Result<impl axum::response::IntoResponse, AppError> {
-    do_request(s, h, id, i, true).await
 }
 async fn do_decide(
     state: ServerState,
@@ -277,7 +279,7 @@ mod tests {
     fn return_requires_recipient_consent_and_creates_one_compensating_journal() {
         let (c, a) = super::super::tests::fixture();
         let q = super::super::tests::quoted(&c, 8_640_000, "return-quote");
-        let t = super::super::confirm_tx(
+        let t = super::super::tests::confirm_released(
             &c,
             &a,
             &a.user_id,
@@ -319,7 +321,7 @@ mod tests {
     fn return_outbox_failure_rolls_back_consent_balances_and_journal() {
         let (c, a) = super::super::tests::fixture();
         let q = super::super::tests::quoted(&c, 8_640_000, "rollback-return-quote");
-        let t = super::super::confirm_tx(
+        let t = super::super::tests::confirm_released(
             &c,
             &a,
             &a.user_id,
@@ -377,7 +379,7 @@ mod tests {
     fn a_spent_recipient_balance_cannot_be_forced_negative_by_a_return() {
         let (c, a) = super::super::tests::fixture();
         let q = super::super::tests::quoted(&c, 8_640_000, "spent-return-quote");
-        let t = super::super::confirm_tx(
+        let t = super::super::tests::confirm_released(
             &c,
             &a,
             &a.user_id,

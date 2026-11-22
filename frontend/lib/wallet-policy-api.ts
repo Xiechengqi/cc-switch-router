@@ -73,14 +73,20 @@ export type TransferQuote = {
   recipientEmail: string;
   amountUnits: string;
   expiresAt: string;
+  /** `delayed`: first transfer to this recipient, credits after `delayHours`. */
+  delivery?: "instant" | "delayed";
+  delayHours?: number;
 };
 export type WalletTransfer = {
   id: string;
   senderEmail: string;
   recipientEmail: string;
   amountUnits: string;
-  journalId: string;
+  /** Absent while a delayed transfer has not credited. */
+  journalId: string | null;
   createdAt: string;
+  status?: "completed" | "pending" | "cancelled";
+  releaseAt?: string | null;
 };
 
 export async function getWalletPolicy(admin = false) {

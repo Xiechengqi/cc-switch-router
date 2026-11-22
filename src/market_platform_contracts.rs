@@ -4028,6 +4028,14 @@ pub(crate) async fn run_service(state: crate::ServerState) -> anyhow::Result<()>
             Ok(actions) => dispatch_platform_controls(&state, actions).await,
             Err(error) => tracing::warn!(error = %error, "wallet service reconciliation failed"),
         }
+        {
+            let conn = state.store.conn.lock().await;
+            crate::market_wallet_transfers::release_due_isolated(
+                &conn,
+                &Utc::now().to_rfc3339(),
+                50,
+            );
+        }
     }
 }
 

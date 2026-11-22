@@ -145,6 +145,18 @@ pub(crate) const KINDS: &[NotificationKind] = &[
         subject_zh: "余额已转入",
     },
     NotificationKind {
+        kind: "wallet_transfer_pending",
+        mandatory: true,
+        subject_en: "Transfer scheduled",
+        subject_zh: "转账已提交，等待到账",
+    },
+    NotificationKind {
+        kind: "wallet_transfer_cancelled",
+        mandatory: true,
+        subject_en: "Transfer withdrawn",
+        subject_zh: "转账已撤回",
+    },
+    NotificationKind {
         kind: "topup_credited",
         mandatory: true,
         subject_en: "Top-up credited",
@@ -873,13 +885,19 @@ fn render(item: &Claimed, dashboard: &str) -> (String, String) {
             ),
         );
     }
-    if item.event_kind == "wallet_transfer_sent" || item.event_kind == "wallet_transfer_received" {
+    if matches!(
+        item.event_kind.as_str(),
+        "wallet_transfer_sent"
+            | "wallet_transfer_received"
+            | "wallet_transfer_pending"
+            | "wallet_transfer_cancelled"
+    ) {
         let counterparty = item
             .payload
-            .get(if item.event_kind == "wallet_transfer_sent" {
-                "recipientEmail"
-            } else {
+            .get(if item.event_kind == "wallet_transfer_received" {
                 "senderEmail"
+            } else {
+                "recipientEmail"
             })
             .and_then(Value::as_str)
             .unwrap_or("");

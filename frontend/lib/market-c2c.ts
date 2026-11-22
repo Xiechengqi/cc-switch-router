@@ -7,14 +7,21 @@ export const C2C_TERMS_VERSION = 3;
 export type C2CPolicy = { version: number; enabled: boolean; admissionMinor: number; minMinor: number; maxMinor: number; paymentMinutes: number };
 export const C2C_BLOCKERS = ["C2C_DISABLED", "C2C_TRANSFERS_DISABLED", "C2C_TRANSFERS_PAUSED", "C2C_ACCOUNT_INACTIVE", "C2C_IDENTITY", "C2C_FINANCE_HOLD", "C2C_SUSPENDED", "C2C_ADMISSION", "C2C_OVERDUE_ORDERS"] as const;
 export type C2CBlocker = (typeof C2C_BLOCKERS)[number];
-export type C2CPolicyView = { buyerLimits?: { maxMinor: number; maxActive: number; tier: "new" | "regular" | "established"; blockedUntil: string | null; suspended: boolean }; policy: C2CPolicy; available: boolean; blockers: C2CBlocker[]; canManagePolicy: boolean; verified: boolean; termsVersion: number; claimGraceSeconds: number; firstPurchaseMaxMinor: number; independentDisputeHandlerAvailable: boolean };
+export type C2CPolicyView = { buyerMaxMinor?: number; buyerLimits?: { maxMinor: number; maxActive: number; tier: "new" | "regular" | "established"; blockedUntil: string | null; suspended: boolean }; policy: C2CPolicy; available: boolean; blockers: C2CBlocker[]; canManagePolicy: boolean; verified: boolean; termsVersion: number; claimGraceSeconds: number; firstPurchaseMaxMinor: number; independentDisputeHandlerAvailable: boolean };
 export type C2CSeller = {
   userId: string; version: number; enabled: boolean; suspended: boolean; displayName: string; description: string;
   currency: "USD" | "CNY"; priceBps: number; minMinor: number; maxMinor: number;
   autoPauseReason: "acceptance_timeout" | "paid_order_overdue" | null; autoPausedAt: string | null; autoPauseOrderId: string | null;
   autoAcceptTermsVersion: 0 | 3; autoAcceptConsentedAt: string | null;
 };
-export type C2CSellerInput = Omit<C2CSeller, "userId" | "version" | "suspended" | "displayName" | "autoPauseReason" | "autoPausedAt" | "autoPauseOrderId" | "autoAcceptTermsVersion" | "autoAcceptConsentedAt"> & { expectedVersion: number; acknowledgeExternalPayment: boolean; autoAcceptTermsVersion: 3 };
+// Sellers publish only availability and a description. Currency, price and
+// order range are fixed by the Router (face value, CNY, platform range).
+export type C2CSellerInput = Pick<C2CSeller, "enabled" | "description"> & { expectedVersion: number; acknowledgeExternalPayment: boolean; autoAcceptTermsVersion: 3 };
+export const C2C_FIXED_PRICE_BPS = 10000;
+export const C2C_FIXED_CURRENCY = "CNY";
+/** Listings saved before fixed terms keep their price until the seller edits them. */
+export const c2cHasLegacyTerms = (terms: { priceBps: number; currency: "USD" | "CNY" }) =>
+  terms.priceBps !== C2C_FIXED_PRICE_BPS || terms.currency !== C2C_FIXED_CURRENCY;
 export const C2C_SELLER_STATES = ["not_selling", "selling", "paused", "confirmation_required", "auto_paused", "suspended", "insufficient_stock", "unavailable", "order_limit"] as const;
 export type C2CSellerSnapshot = { seller: C2CSeller | null; admissionBalanceUnits: string; availableUnits: string; blockers: C2CBlocker[]; canEnable: boolean; state: (typeof C2C_SELLER_STATES)[number]; pendingOrders: number };
 export type C2COffer = Pick<C2CSeller, "version" | "displayName" | "description" | "currency" | "priceBps" | "minMinor" | "maxMinor"> & {
@@ -170,6 +177,7 @@ export async function getC2CPolicy() {
   const limits = p.buyerLimits;
   if (limits && (!integer(limits.maxMinor) || !integer(limits.maxActive) || !["new", "regular", "established"].includes(limits.tier) || (limits.blockedUntil !== null && !date(limits.blockedUntil)) || typeof limits.suspended !== "boolean")) invalid();
   if (typeof p.canManagePolicy !== "boolean") invalid();
+  if (p.buyerMaxMinor !== undefined && (!nonnegative(p.buyerMaxMinor) || p.buyerMaxMinor > 10_000_000)) invalid();
   return p;
 }
 export async function getC2CSeller() {

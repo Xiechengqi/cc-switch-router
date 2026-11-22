@@ -4,8 +4,6 @@ import * as React from "react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { PageSkeleton } from "@/components/common/page-skeleton";
 import { AccountSectionError } from "@/components/dashboard/account-section";
-import { WalletSecurityPanel } from "@/components/dashboard/wallet-security-panel";
-import { WalletTransferReturnsPanel } from "@/components/dashboard/wallet-transfer-returns-panel";
 import { PlatformWalletPanel } from "@/components/dashboard/platform-wallet-panel";
 import { rememberedView } from "@/lib/cached-resource";
 import { getMarketWallet, type MarketWallet } from "@/lib/market-wallet-api";
@@ -43,7 +41,7 @@ function WalletLoader({ actorId }: { actorId: string }) {
     return () => { active = false; };
   }, [attempt, needsFetch]);
 
-  if (wallet) return <div className="grid gap-4"><PlatformWalletPanel initialWallet={wallet} rememberKey={viewKey} /><WalletSecurityPanel /><WalletTransferReturnsPanel /></div>;
+  if (wallet) return <PlatformWalletPanel initialWallet={wallet} rememberKey={viewKey} />;
   if (error) return <AccountSectionError message={error} onRetry={() => setAttempt((value) => value + 1)} />;
   return <PageSkeleton inset />;
 }

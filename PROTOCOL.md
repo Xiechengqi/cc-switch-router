@@ -753,7 +753,7 @@ Host 判断必须精确匹配 `api.<tunnel_domain>`（含配置中的端口语�
 
 ## 10. 身份注入:IngressContext
 
-浏览器使用 host-only 的独立随机会话 Cookie，不把可充当 Bearer 的 access token 放入 Cookie；私有控制面 API 限 Router 主 Host。财务写入要求原登录设备对精确请求签名，高危操作要求 Passkey UV；迁移 114 会撤销所有旧登录并清除刷新宽限。协议、恢复与验收见 [钱包安全与异常恢复](docs/market-wallet-security.md)。
+浏览器使用 host-only 的独立随机会话 Cookie，不把可充当 Bearer 的 access token 放入 Cookie；私有控制面 API 限 Router 主 Host。财务写入要求原登录设备对精确请求签名，高危操作要求按请求输入登录密码确认（迁移 121 取代 Passkey），首次转给新收款人 24 小时后到账且可撤回；迁移 114 会撤销所有旧登录并清除刷新宽限。协议、恢复与验收见 [钱包安全与异常恢复](docs/market-wallet-security.md)。
 
 Router 的 Share/Gateway 转发剥离客户端 `authorization`、`x-api-key` 等凭据头，并注入签名身份上下文。所有隧道路由（含 Client Web）剥离 Cookie，上游 Set-Cookie 不回传浏览器，见 `src/proxy.rs`。
 

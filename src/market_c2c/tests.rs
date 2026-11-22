@@ -29,13 +29,38 @@ fn terms() -> SellerInput {
         expected_version: 0,
         enabled: true,
         description: "Bank transfer · contact seller@example.test".into(),
-        currency: "USD".into(),
-        price_bps: 10000,
-        min_minor: 100,
-        max_minor: 20000,
+        currency: Some("USD".into()),
+        price_bps: Some(10000),
+        min_minor: Some(100),
+        max_minor: Some(20000),
         acknowledge_external_payment: true,
         auto_accept_terms_version: TERMS_VERSION,
     }
+}
+/// Most flow tests predate R9 fixed terms and exercise listings priced in USD
+/// with seller-chosen ranges. Production saves always publish fixed terms;
+/// these tests then restore the requested terms, reproducing a grandfathered
+/// listing (a real state for rows saved before R9). Normalization itself is
+/// covered by the `fixed_terms_*` tests, which call `super::save_seller_tx`.
+fn save_seller_tx(
+    conn: &Connection,
+    user: &str,
+    input: &SellerInput,
+    time: &str,
+) -> Result<Seller, AppError> {
+    super::save_seller_tx(conn, user, input, time)?;
+    conn.execute(
+        "UPDATE market_c2c_sellers SET currency=?2,price_bps=?3,min_minor=?4,max_minor=?5 WHERE user_id=?1",
+        params![
+            user,
+            input.currency.clone().unwrap_or_else(|| "USD".into()),
+            input.price_bps.unwrap_or(10000),
+            input.min_minor.unwrap_or(100),
+            input.max_minor.unwrap_or(20000)
+        ],
+    )
+    .unwrap();
+    Ok(seller_tx(conn, user)?.expect("saved seller"))
 }
 fn offer(c: &Connection) {
     save_seller_tx(c, "seller", &terms(), AT).unwrap();
@@ -1243,7 +1268,7 @@ fn immutable_quote_freezes_terms_and_stale_seller_preview_cannot_commit() {
 fn cny_quotes_need_fresh_rate_and_integer_rounding_is_exact() {
     let c = fixture();
     let mut s = terms();
-    s.currency = "CNY".into();
+    s.currency = Some("CNY".into());
     save_seller_tx(&c, "seller", &s, AT).unwrap();
     assert_eq!(
         preview_result(&c).unwrap_err().code(),
@@ -1260,8 +1285,8 @@ fn cny_quotes_need_fresh_rate_and_integer_rounding_is_exact() {
     assert_eq!(o.pay_minor, 7123);
     // USD pricing also exercises non-integer minor rounding without floats.
     s.expected_version = 1;
-    s.currency = "USD".into();
-    s.price_bps = 10050;
+    s.currency = Some("USD".into());
+    s.price_bps = Some(10050);
     save_seller_tx(&c, "seller", &s, AT).unwrap();
     assert_eq!(preview(&c, "buyer", 100).pay_minor, 101);
 }
@@ -2286,4 +2311,124 @@ fn nonreceipt_deadline_never_returns_a_paid_buyers_credit_and_corrections_preser
         )
         .is_err()
     );
+}
+
+#[test]
+fn fixed_terms_ignore_client_currency_price_and_range() {
+    let c = fixture();
+    let mut input = terms();
+    input.currency = Some("USD".into());
+    input.price_bps = Some(15000);
+    input.min_minor = Some(500);
+    input.max_minor = Some(600);
+    let saved = super::save_seller_tx(&c, "seller", &input, AT).unwrap();
+    assert_eq!(saved.currency, FIXED_SELLER_CURRENCY);
+    assert_eq!(saved.price_bps, FIXED_SELLER_PRICE_BPS);
+    assert_eq!((saved.min_minor, saved.max_minor), (1, 10_000_000));
+    // The pages after R9 omit the retired fields entirely.
+    let json = serde_json::json!({"expectedVersion":1,"enabled":true,"description":"Alipay · contact seller","acknowledgeExternalPayment":true,"autoAcceptTermsVersion":3});
+    let lean: SellerInput = serde_json::from_value(json).unwrap();
+    let saved = super::save_seller_tx(&c, "seller", &lean, AT).unwrap();
+    assert_eq!(saved.currency, "CNY");
+    assert_eq!(saved.price_bps, 10000);
+    // Face value in CNY: the payable amount is the credit at the frozen rate.
+    let unix = at(AT).unwrap().timestamp();
+    c.execute("INSERT INTO market_fx_rate_cache(id,rate_micros,source_timestamp,fetched_at) VALUES(1,7000000,?1,?1)",params![unix]).unwrap();
+    let q = preview(&c, "buyer", 1000);
+    assert_eq!(
+        (q.currency.as_str(), q.price_bps, q.pay_minor),
+        ("CNY", 10000, 7000)
+    );
+    // The platform range applies once the seller no longer narrows it.
+    let max = policy_tx(&c)
+        .unwrap()
+        .max_minor
+        .min(risk::buyer_limits_tx(&c, "buyer", AT).unwrap().max_minor);
+    let offer = &offers_tx(&c, "buyer", "", AT).unwrap().0[0];
+    assert_eq!(offer.min_minor, policy_tx(&c).unwrap().min_minor);
+    assert_eq!(offer.max_minor, max.min(offer.available_minor));
+}
+
+#[test]
+fn fixed_terms_grandfather_existing_listings_until_the_next_edit() {
+    let c = fixture();
+    super::save_seller_tx(&c, "seller", &terms(), AT).unwrap();
+    c.execute("UPDATE market_c2c_sellers SET currency='USD',price_bps=12000,min_minor=200,max_minor=900 WHERE user_id='seller'",[]).unwrap();
+    // Background work and reads never rewrite a live listing's terms.
+    transaction(&c, |c| tick_tx(c, LATER)).unwrap();
+    let live = seller_tx(&c, "seller").unwrap().unwrap();
+    assert_eq!(
+        (
+            live.currency.as_str(),
+            live.price_bps,
+            live.min_minor,
+            live.max_minor
+        ),
+        ("USD", 12000, 200, 900)
+    );
+    assert_eq!(preview(&c, "buyer", 500).pay_minor, 600);
+    let mut edit = terms();
+    edit.expected_version = live.version;
+    let edited = super::save_seller_tx(&c, "seller", &edit, LATER).unwrap();
+    assert_eq!((edited.currency.as_str(), edited.price_bps), ("CNY", 10000));
+}
+
+#[test]
+fn buyer_cap_combines_tier_platform_range_and_unfinished_purchases() {
+    let limits = |max_minor, max_active| risk::BuyerLimits {
+        max_minor,
+        max_active,
+        tier: "regular",
+        blocked_until: None,
+        suspended: false,
+    };
+    assert_eq!(
+        risk::buyer_cap_minor(&limits(50000, 2), 500000, 0, 0),
+        50000
+    );
+    assert_eq!(risk::buyer_cap_minor(&limits(50000, 2), 20000, 0, 0), 20000);
+    // One unfinished order leaves only the remaining shared exposure.
+    assert_eq!(
+        risk::buyer_cap_minor(&limits(50000, 2), 500000, 1, 80000),
+        20000
+    );
+    assert_eq!(risk::buyer_cap_minor(&limits(50000, 2), 500000, 2, 1000), 0);
+    let mut restricted = limits(50000, 2);
+    restricted.suspended = true;
+    assert_eq!(risk::buyer_cap_minor(&restricted, 500000, 0, 0), 0);
+    let mut cooling = limits(50000, 2);
+    cooling.blocked_until = Some(LATER.into());
+    assert_eq!(risk::buyer_cap_minor(&cooling, 500000, 0, 0), 0);
+}
+
+#[test]
+fn buyer_max_now_respects_the_rolling_incoming_credit_limit() {
+    let c = fixture();
+    // A new buyer may buy up to US$100 per order.
+    assert_eq!(
+        risk::buyer_max_now_minor_tx(&c, "buyer", AT).unwrap(),
+        10000
+    );
+    c.execute(
+        "UPDATE market_financial_risk_policy SET incoming_user_day_minor=2500",
+        [],
+    )
+    .unwrap();
+    assert_eq!(risk::buyer_max_now_minor_tx(&c, "buyer", AT).unwrap(), 2500);
+    // The figure is the exact largest amount the shared incoming check accepts.
+    c.execute(
+        "UPDATE market_financial_risk_policy SET incoming_user_day_minor=4321",
+        [],
+    )
+    .unwrap();
+    assert_eq!(risk::buyer_max_now_minor_tx(&c, "buyer", AT).unwrap(), 4321);
+    c.execute(
+        "UPDATE market_financial_risk_policy SET incoming_user_day_minor=1",
+        [],
+    )
+    .unwrap();
+    assert_eq!(risk::buyer_max_now_minor_tx(&c, "buyer", AT).unwrap(), 1);
+    // A restricted buyer sees zero regardless of headroom.
+    c.execute("INSERT INTO market_financial_risk_events(id,kind,subject_id,object_id,details_json,created_at) VALUES('fp','c2c_false_payment','buyer','order','{}',?1)",params![AT]).unwrap();
+    assert_eq!(risk::buyer_max_now_minor_tx(&c, "buyer", AT).unwrap(), 0);
 }

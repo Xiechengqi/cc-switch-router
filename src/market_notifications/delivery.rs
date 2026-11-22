@@ -42,6 +42,8 @@ pub(super) fn purpose(item: &Claimed) -> Option<&'static str> {
         "topup_reversed" => Some("topup_adjustment"),
         "wallet_transfer_sent" => Some("transfer_sent_receipt"),
         "wallet_transfer_received" => Some("transfer_received_receipt"),
+        "wallet_transfer_pending" => Some("transfer_pending_receipt"),
+        "wallet_transfer_cancelled" => Some("transfer_cancelled_receipt"),
         "wallet_transfer_return_requested" => Some("transfer_return_request"),
         "wallet_transfer_return_resolved" => Some("transfer_return_receipt"),
         "wallet_passkey_registered" => Some("wallet_passkey_registered"),

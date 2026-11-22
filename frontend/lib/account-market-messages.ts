@@ -2,17 +2,11 @@
 export const accountMarketMessagesEn = {
   "marketWallet.topupMethod": "Top-up method",
   "marketWallet.topupMethod.crypto": "Cryptocurrency",
-  "marketWallet.noTopupMethod": "No top-up method available",
 
   "walletQuick.title": "Platform balance",
   "walletQuick.available": "Available",
   "walletQuick.open": "Platform balance: {amount}. Open balance actions",
-  "walletQuick.fullPage": "View full balance and history",
   "walletQuick.unavailable": "The balance could not be loaded.",
-  "walletQuick.c2cHelp": "Buy balance from another user here. Payment, confirmation and selling continue on the balance page.",
-  "walletQuick.c2cOrders": "C2C orders and selling",
-  "walletQuick.activeC2C": "Active C2C purchases",
-  "walletQuick.noActiveC2C": "No active purchases.",
 
   "recordTable.expand": "Show details for {name}",
   "recordTable.collapse": "Hide details for {name}",
@@ -61,17 +55,11 @@ export const accountMarketMessagesEn = {
 export const accountMarketMessagesZh: Record<keyof typeof accountMarketMessagesEn, string> = {
   "marketWallet.topupMethod": "充值方式",
   "marketWallet.topupMethod.crypto": "加密货币",
-  "marketWallet.noTopupMethod": "暂无可用充值方式",
 
   "walletQuick.title": "平台余额",
   "walletQuick.available": "可用余额",
   "walletQuick.open": "平台余额：{amount}。打开余额操作",
-  "walletQuick.fullPage": "查看完整余额与流水",
   "walletQuick.unavailable": "暂时无法读取余额。",
-  "walletQuick.c2cHelp": "在这里向其他用户购买余额；付款、确认和出售请在平台余额页继续。",
-  "walletQuick.c2cOrders": "C2C 订单与出售",
-  "walletQuick.activeC2C": "进行中的 C2C 购入",
-  "walletQuick.noActiveC2C": "暂无进行中的购入订单。",
 
   "recordTable.expand": "展开 {name} 的详情",
   "recordTable.collapse": "收起 {name} 的详情",

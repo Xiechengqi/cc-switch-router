@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { ApiError } from "./api";
-import { C2C_PENDING_PREFIX, C2CClock, c2cDescriptionParts, validC2CDescription, c2cDefinitelyRejected, c2cPaymentWindow, c2cPayLabel, matchC2COrder, matchC2CPendingOrder, parseC2CMinor, readC2CPending, writeC2CPending, validC2CEvent, validC2COrder, validC2CPolicy, validC2CQuote, validC2CSeller, type C2CEvent, type C2COrder, type C2CPending, type C2CSeller } from "./market-c2c";
+import { C2C_PENDING_PREFIX, C2CClock, c2cHasLegacyTerms, c2cDescriptionParts, validC2CDescription, c2cDefinitelyRejected, c2cPaymentWindow, c2cPayLabel, matchC2COrder, matchC2CPendingOrder, parseC2CMinor, readC2CPending, writeC2CPending, validC2CEvent, validC2COrder, validC2CPolicy, validC2CQuote, validC2CSeller, type C2CEvent, type C2COrder, type C2CPending, type C2CSeller } from "./market-c2c";
 import { marketC2CMessagesEn, marketC2CMessagesZh } from "./market-c2c-messages";
 import { C2C_BLOCKERS, c2cBlockerKey, validC2CCapability } from "./market-c2c";
 
@@ -174,4 +174,10 @@ test("v2 local submissions can still recover their original frozen order", () =>
   const s=storage(); writeC2CPending(s,old);
   assert.deepEqual(matchC2CPendingOrder(readC2CPending(s,"buyer")!,legacyOrder),legacyOrder);
   assert.throws(() => matchC2CPendingOrder(old,order));
+});
+
+test("only listings saved before fixed terms show a price label", () => {
+  assert.equal(c2cHasLegacyTerms({ priceBps: 10000, currency: "CNY" }), false);
+  assert.equal(c2cHasLegacyTerms({ priceBps: 10000, currency: "USD" }), true);
+  assert.equal(c2cHasLegacyTerms({ priceBps: 10500, currency: "CNY" }), true);
 });

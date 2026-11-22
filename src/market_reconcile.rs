@@ -12,6 +12,29 @@ fn db_error(context: &'static str) -> impl FnOnce(crate::db::Error) -> AppError 
     move |error| AppError::Internal(format!("{context} failed: {error}"))
 }
 
+/// A delayed transfer must match its balance reservation and, once released,
+/// the immutable transfer it became.
+const PENDING_TRANSFER_MISMATCH_SQL: &str = "SELECT p.id FROM market_wallet_pending_transfers p LEFT JOIN market_wallet_holds h ON h.id=p.hold_id
+            WHERE h.id IS NULL OR h.user_id!=p.sender_user_id OR h.amount_units!=p.amount_units
+               OR h.source_kind!='wallet_transfer_pending' OR h.source_id!=p.id
+               OR (p.status='pending' AND (h.status!='active' OR h.remaining_units!=p.amount_units))
+               OR (p.status!='pending' AND h.status='active')
+               OR (p.status='released' AND NOT EXISTS(SELECT 1 FROM market_wallet_transfers t WHERE t.id=p.id
+                    AND t.sender_user_id=p.sender_user_id AND t.recipient_user_id=p.recipient_user_id
+                    AND t.amount_units=p.amount_units AND t.quote_id=p.quote_id AND t.authorization_id=p.authorization_id
+                    AND t.created_at=p.created_at))
+               OR (p.status!='released' AND EXISTS(SELECT 1 FROM market_wallet_transfers t WHERE t.id=p.id))";
+const PENDING_TRANSFER_MISMATCH_LIMITED: &str = concat!("SELECT p.id FROM market_wallet_pending_transfers p LEFT JOIN market_wallet_holds h ON h.id=p.hold_id
+            WHERE h.id IS NULL OR h.user_id!=p.sender_user_id OR h.amount_units!=p.amount_units
+               OR h.source_kind!='wallet_transfer_pending' OR h.source_id!=p.id
+               OR (p.status='pending' AND (h.status!='active' OR h.remaining_units!=p.amount_units))
+               OR (p.status!='pending' AND h.status='active')
+               OR (p.status='released' AND NOT EXISTS(SELECT 1 FROM market_wallet_transfers t WHERE t.id=p.id
+                    AND t.sender_user_id=p.sender_user_id AND t.recipient_user_id=p.recipient_user_id
+                    AND t.amount_units=p.amount_units AND t.quote_id=p.quote_id AND t.authorization_id=p.authorization_id
+                    AND t.created_at=p.created_at))
+               OR (p.status!='released' AND EXISTS(SELECT 1 FROM market_wallet_transfers t WHERE t.id=p.id))", " LIMIT 100");
+
 const CRITICAL_CODES: &[&str] = &[
     "wallet_projection_mismatch",
     "provider_liability_mismatch",
@@ -21,6 +44,7 @@ const CRITICAL_CODES: &[&str] = &[
     "paid_payout_missing_evidence",
     "wallet_transfer_missing_evidence",
     "wallet_transfer_orphan_journal",
+    "wallet_pending_transfer_mismatch",
     "wallet_transfer_return_missing_evidence",
     "wallet_transfer_return_orphan_journal",
     "financial_request_proof_invalid",
@@ -148,6 +172,8 @@ fn scope_blocked_tx(conn: &Connection, scope: FinanceScope<'_>) -> Result<bool, 
                       WHERE sender_user_id = ?1 OR recipient_user_id = ?1))
                  OR (c.code = 'wallet_transfer_return_missing_evidence' AND c.object_id IN
                      (SELECT r.id FROM market_transfer_returns r JOIN market_wallet_transfers t ON t.id=r.transfer_id WHERE t.sender_user_id=?1 OR t.recipient_user_id=?1))
+                 OR (c.code = 'wallet_pending_transfer_mismatch' AND c.object_id IN
+                     (SELECT id FROM market_wallet_pending_transfers WHERE sender_user_id = ?1 OR recipient_user_id = ?1))
                  OR (c.code = 'financial_request_proof_invalid' AND c.object_id IN
                      (SELECT id FROM market_financial_request_proofs WHERE user_id=?1))
                  OR (c.code = 'c2c_evidence_mismatch' AND c.object_id IN
@@ -348,6 +374,13 @@ fn critical_case_still_failed_tx(
             conn.query_row("SELECT NOT EXISTS (SELECT 1 FROM market_verified_wallet_transfer_evidence WHERE id = ?1)",
                 params![object_id], |row| row.get(0)).map_err(db_error("recheck wallet transfer"))
         }
+        ("wallet_pending_transfer_mismatch", "wallet_transfer") => conn
+            .query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM ({PENDING_TRANSFER_MISMATCH_SQL}) WHERE id = ?1)"),
+                params![object_id],
+                |row| row.get(0),
+            )
+            .map_err(db_error("recheck pending wallet transfer")),
         ("wallet_transfer_return_missing_evidence","wallet_transfer_return") => conn.query_row("SELECT NOT EXISTS(SELECT 1 FROM market_verified_transfer_return_evidence WHERE id=?1)",params![object_id],|r|r.get(0)).map_err(db_error("recheck transfer return")),
         ("wallet_transfer_return_orphan_journal","journal") => conn.query_row("SELECT NOT EXISTS(SELECT 1 FROM market_transfer_returns r JOIN market_verified_transfer_return_evidence e ON e.id=r.id WHERE r.journal_id=?1)",params![object_id],|r|r.get(0)).map_err(db_error("recheck orphan return")),
         ("financial_request_proof_invalid","financial_request_proof") => {
@@ -884,6 +917,7 @@ pub(crate) fn audit_finance_tx(conn: &Connection, now: &str) -> Result<usize, Ap
         ("SELECT id FROM market_journal_transactions j WHERE source_kind = 'wallet_transfer'
             AND NOT EXISTS (SELECT 1 FROM market_wallet_transfers t WHERE t.journal_id = j.id) LIMIT 100",
             "wallet_transfer_orphan_journal", "journal"),
+        (PENDING_TRANSFER_MISMATCH_LIMITED, "wallet_pending_transfer_mismatch", "wallet_transfer"),
     ] {
         let ids=fair_ids_tx(conn,code,sql,vec![],now)?;
         for id in ids { opened += case_tx(conn, code, kind, &id, now)?; }

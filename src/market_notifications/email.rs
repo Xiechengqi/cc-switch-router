@@ -224,6 +224,14 @@ pub(super) fn render(item: &Claimed, dashboard: &str) -> (String, String, String
             "Transfer received",
             "Platform credit was transferred to your wallet and is ready to use.",
         ),
+        "wallet_transfer_pending" => (
+            "Transfer scheduled",
+            "This is your first transfer to the recipient below, so it credits after 24 hours. Until then you can withdraw it from your wallet page. If you did not send it, sign in with an email code, withdraw it and reset your password.",
+        ),
+        "wallet_transfer_cancelled" => (
+            "Transfer withdrawn",
+            "The scheduled transfer to the recipient below did not credit. The amount is back in your available balance.",
+        ),
         "c2c_order_updated" => match (action, field(p, "status").unwrap_or(""), role) {
             ("release_reminder", _, "seller") => (
                 "C2C payment awaiting your review",

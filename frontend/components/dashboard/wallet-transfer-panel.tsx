@@ -14,6 +14,7 @@ import {
   formatWalletUnits,
   parseNonNegativeUsdMinor,
 } from "@/lib/market-wallet-money";
+import { walletErrorText } from "@/lib/wallet-errors";
 import { WALLET_INPUT } from "@/components/market/wallet-primitives";
 import {
   confirmWalletTransfer,
@@ -29,17 +30,22 @@ export function WalletTransferPanel({
   embedded = false,
   onBusyChange,
   inlineConfirmation = false,
+  initialRecipient = "",
+  initialAmount = "",
 }: {
   onTransferred: () => Promise<void>;
   walletVersion: number;
   embedded?: boolean;
   onBusyChange?: (busy: boolean) => void;
   inlineConfirmation?: boolean;
+  /** Prefill for "send back" from a received transfer. */
+  initialRecipient?: string;
+  initialAmount?: string;
 }) {
-  const { t } = useLocaleText();
+  const { t, locale } = useLocaleText();
   const [capacity, setCapacity] = React.useState<TransferCapacity | null>(null);
-  const [recipient, setRecipient] = React.useState("");
-  const [amount, setAmount] = React.useState("");
+  const [recipient, setRecipient] = React.useState(initialRecipient);
+  const [amount, setAmount] = React.useState(initialAmount);
   const [all, setAll] = React.useState(false);
   const [quote, setQuote] = React.useState<TransferQuote | null>(null);
   const [busy, setBusy] = React.useState("");
@@ -109,9 +115,7 @@ export function WalletTransferPanel({
                 ? t("walletTransfer.paused")
                 : key === "WALLET_TRANSFER_QUOTE_EXPIRED"
                   ? t("walletTransfer.expired")
-                  : cause instanceof Error
-                    ? cause.message
-                    : String(cause),
+                  : walletErrorText(cause, t, locale),
     );
   };
   const run = async (name: string, action: () => Promise<void>) => {
@@ -157,10 +161,15 @@ export function WalletTransferPanel({
         keyRef.current,
       );
       setSuccess(
-        t("walletTransfer.success", {
-          amount: formatWalletUnits(value.amountUnits),
-          email: value.recipientEmail,
-        }),
+        value.status === "pending" && value.releaseAt
+          ? t("walletTransfer.pendingSuccess", {
+            email: value.recipientEmail,
+            time: new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value.releaseAt)),
+          })
+          : t("walletTransfer.success", {
+            amount: formatWalletUnits(value.amountUnits),
+            email: value.recipientEmail,
+          }),
       );
       setQuote(null);
       setAmount("");
@@ -185,16 +194,14 @@ export function WalletTransferPanel({
       <div className="grid gap-2">
         <p className="break-all text-base font-medium">{quote.recipientEmail}</p>
         {quote.recipientHint ? <p className="break-all text-sm text-muted-foreground">{t("walletTransfer.recipientHint", { hint: quote.recipientHint })}</p> : null}
-        {quote.firstRecipient ? <p className="text-sm text-muted-foreground">{t("walletTransfer.firstRecipient")}</p> : null}
         <p className="break-all text-3xl font-semibold tabular-nums">
           {formatWalletUnits(quote.amountUnits)}
         </p>
-        {BigInt(quote.amountUnits) % 86_400n !== 0n ? (
-          <p className="break-all text-xs text-muted-foreground">
-            {t("walletTransfer.exact", { units: quote.amountUnits })}
-          </p>
-        ) : null}
-        <p className="flex items-center gap-1 text-xs leading-5 text-muted-foreground">{t("walletTransfer.finalShort")}<InfoHint>{t("walletTransfer.final")}</InfoHint></p>
+        <p className={`text-sm leading-6 ${quote.delivery === "delayed" ? "rounded-lg bg-accent/5 px-3 py-2 text-accent" : "text-muted-foreground"}`}>
+          {quote.delivery === "delayed"
+            ? t("walletTransfer.delayed", { hours: quote.delayHours ?? 24 })
+            : t("walletTransfer.instant")}
+        </p>
       </div>
       {error ? <p role="alert" className="break-words text-sm text-destructive">{error}</p> : null}
       {expired ? <p role="status" className="text-sm text-destructive">{t("walletTransfer.expired")}</p> : null}
