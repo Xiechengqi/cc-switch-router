@@ -614,7 +614,13 @@ try {
   assert.deepEqual(transferStepups, [null, "transfer-challenge", null]);
 
   // The pending transfer can be withdrawn by its sender before it credits.
+  // Focus stays on the result inside the drawer, so Escape closes it.
+  const sendDrawer = page.getByRole("dialog", { name: "Send to someone" });
+  await transferPanel.getByRole("status").filter({ hasText: /Sent for recipient@example\.invalid/ }).evaluate((element) => {
+    if (document.activeElement !== element) throw new Error("send result is not focused");
+  });
   await page.keyboard.press("Escape");
+  await sendDrawer.waitFor({ state: "hidden" });
   await attention.getByText(/^To recipient@example\.invalid · /).waitFor();
   await attention.getByText(/You can withdraw it until then/).waitFor();
   await attention.getByRole("button", { name: "Withdraw", exact: true }).click();

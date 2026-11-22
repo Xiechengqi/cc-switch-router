@@ -964,13 +964,16 @@ mod tests {
             .unwrap(),
             Risk::Confirm
         );
-        conn.execute("UPDATE market_wallet_transfer_quotes SET first_recipient=0 WHERE id IN ('q-small','q-large')", []).unwrap();
+        // Quotes are immutable; quotes made after the credit are instant.
+        for (id, amount) in [("q-small", large - 1), ("q-large", large)] {
+            conn.execute("INSERT INTO market_wallet_transfer_quotes(id,sender_user_id,recipient_user_id,sender_email,recipient_email,amount_units,expires_at,created_at,first_recipient) VALUES(?1,?2,?3,?4,?5,?6,'2100-01-01','2020-01-01',0)",params![format!("{id}-known"),a.user_id,b.user_id,a.email,b.email,amount]).unwrap();
+        }
         assert_eq!(
             risk_tx(
                 &conn,
                 &a,
                 "/v1/market-wallet/transfers",
-                body("q-small").as_bytes()
+                body("q-small-known").as_bytes()
             )
             .unwrap(),
             Risk::None
@@ -980,7 +983,7 @@ mod tests {
                 &conn,
                 &a,
                 "/v1/market-wallet/transfers",
-                body("q-large").as_bytes()
+                body("q-large-known").as_bytes()
             )
             .unwrap(),
             Risk::Immediate

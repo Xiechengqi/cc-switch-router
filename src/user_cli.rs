@@ -954,15 +954,15 @@ mod tests {
         assert_eq!(recovered.status.unwrap().version, 1);
         {
             let conn = fixture.store.conn.lock().await;
-            let sealed: String = conn
+            // The confirmation email no longer carries the password.
+            let sealed: Option<String> = conn
                 .query_row(
                     "SELECT envelope_json FROM auth_password_notifications",
                     [],
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert!(sealed.starts_with("password-notice:v1:"));
-            assert!(!sealed.contains("cli123"));
+            assert_eq!(sealed, None);
             assert_eq!(
                 conn.query_row("SELECT COUNT(*) FROM auth_password_events", [], |r| r
                     .get::<_, i64>(0))

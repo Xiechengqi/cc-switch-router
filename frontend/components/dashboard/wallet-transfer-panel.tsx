@@ -57,6 +57,7 @@ export function WalletTransferPanel({
   const inlineRegion = React.useRef<HTMLElement>(null);
   const reviewForm = React.useRef<HTMLFormElement>(null);
   const inlineWasOpen = React.useRef(false);
+  const successRef = React.useRef<HTMLParagraphElement>(null);
   const busyRef = React.useRef(false);
   const keyRef = React.useRef("");
   const amountMinor = parseNonNegativeUsdMinor(amount);
@@ -97,6 +98,11 @@ export function WalletTransferPanel({
       dialog.current.showModal();
     if (!quote && dialog.current?.open) dialog.current.close();
   }, [busy, inlineConfirmation, quote]);
+  // The confirmation that held focus is gone after a send; keep keyboard focus
+  // (and Escape) inside the surrounding drawer or dialog on the result.
+  React.useEffect(() => {
+    if (success) successRef.current?.focus({ preventScroll: true });
+  }, [success]);
   React.useEffect(() => {
     if (!quote) return;
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
@@ -240,7 +246,7 @@ export function WalletTransferPanel({
         </p>
       ) : null}
       {success ? (
-        <p role="status" className="break-words text-sm">
+        <p ref={successRef} tabIndex={-1} role="status" className="break-words text-sm outline-none">
           {success}
         </p>
       ) : null}

@@ -1044,6 +1044,23 @@ mod tests {
             quote_id: id.into(),
         }
     }
+    /// A quote made at `created_at`, valid for 15 minutes. Quotes are
+    /// immutable, so whether it is for a new recipient is fixed here.
+    fn quoted_at(
+        conn: &Connection,
+        amount: i64,
+        id: &str,
+        first: bool,
+        created_at: &str,
+    ) -> ConfirmRequest {
+        let expires = (chrono::DateTime::parse_from_rfc3339(created_at).unwrap()
+            + Duration::minutes(15))
+        .to_rfc3339();
+        conn.execute("INSERT INTO market_wallet_transfer_quotes(id,sender_user_id,recipient_user_id,sender_email,recipient_email,amount_units,expires_at,created_at,first_recipient) VALUES(?1,'sender','recipient','sender@example.test','recipient@example.test',?2,?3,?4,?5)",params![id,amount,expires,created_at,first]).unwrap();
+        ConfirmRequest {
+            quote_id: id.into(),
+        }
+    }
     /// Confirms and, for a new recipient, releases at the scheduled time.
     pub(super) fn confirm_released(
         conn: &Connection,
@@ -1618,13 +1635,8 @@ mod tests {
             "completed"
         );
         assert!(withdraw_pending_tx(&conn, "sender", &second.id, &due).is_err());
-        let instant_quote = quoted(&conn, 7, "instant-q");
         // A quote made after the first credit is instant.
-        conn.execute(
-            "UPDATE market_wallet_transfer_quotes SET first_recipient=0 WHERE id='instant-q'",
-            [],
-        )
-        .unwrap();
+        let instant_quote = quoted_at(&conn, 7, "instant-q", false, &due);
         let third = confirm_only(&conn, &auth, "instant", &instant_quote, &due);
         assert_eq!(third.unwrap().status, "completed");
         for user in ["sender", "recipient"] {

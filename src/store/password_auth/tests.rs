@@ -1040,8 +1040,7 @@ async fn encrypted_password_notices_never_regenerate_a_missing_key_or_retain_cor
 }
 
 #[tokio::test]
-async fn password_change_rejects_missing_or_expired_sessions_and_rolls_back_if_mail_cannot_be_secured()
- {
+async fn password_change_rejects_missing_or_expired_sessions_and_never_queues_the_password() {
     let _hash = HASH_TEST_LOCK.lock().await;
     let (store, config, key) = fixture();
     let mut session = seed(&store, &key).await;
@@ -1086,29 +1085,24 @@ async fn password_change_rejects_missing_or_expired_sessions_and_rolls_back_if_m
         )
         .unwrap();
     }
-    // An unsafe key target must fail the whole change, not leave an unmailed password.
+    // The notice no longer carries the password, so no sealing key is needed:
+    // even an unusable key target cannot block or leak the change.
     std::fs::create_dir(config.data_dir.join("password-notice-key")).unwrap();
-    let error = store
+    store
         .update_password(&config, &session, input(), "192.0.2.1")
         .await
-        .unwrap_err();
-    assert!(error.to_string().contains("securely queue"));
+        .unwrap();
     let conn = store.conn.lock().await;
-    assert_eq!(status(&conn, &session.email).unwrap().version, 0);
-    assert!(!status(&conn, &session.email).unwrap().has_password);
-    assert!(
-        get_session_by_access_hash(&conn, &session.access_token_hash)
-            .unwrap()
-            .is_some()
-    );
-    for table in ["auth_password_events", "auth_password_notifications"] {
-        assert_eq!(
-            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
-                .get::<_, i64>(0))
-                .unwrap(),
-            0
-        );
-    }
+    assert_eq!(status(&conn, &session.email).unwrap().version, 1);
+    assert!(status(&conn, &session.email).unwrap().has_password);
+    let queued: Vec<Option<String>> = conn
+        .prepare("SELECT envelope_json FROM auth_password_notifications")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(queued, vec![None], "one notice, with nothing secret queued");
 }
 
 #[test]
