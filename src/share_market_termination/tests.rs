@@ -753,7 +753,7 @@ fn seller_rate_is_frozen_into_the_contract_and_period() {
     // Changing the seat afterwards never rewrites the accepted terms.
     c.execute("UPDATE share_market_seats SET termination_rate_bps=0", [])
         .unwrap();
-    let availability = availability_tx(&c, "sub").unwrap();
+    let availability = availability_at_tx(&c, "sub", &at).unwrap();
     assert!(availability.can_terminate && availability.can_report_issue);
     let t = accept(&c, &at, "voluntary");
     assert_eq!(t.rate_bps, 2000);
@@ -771,7 +771,7 @@ fn seller_rate_is_frozen_into_the_contract_and_period() {
 #[test]
 fn a_forbidden_seat_only_ends_early_through_a_service_claim_holding_all_unused_rent() {
     let (c, _, at) = fixture_with_terms(Some(Some(seat_terms(1000, "forbidden"))), 0);
-    let availability = availability_tx(&c, "sub").unwrap();
+    let availability = availability_at_tx(&c, "sub", &at).unwrap();
     assert_eq!(
         availability,
         Availability {

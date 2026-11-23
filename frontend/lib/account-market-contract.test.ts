@@ -63,7 +63,9 @@ test("navbar actions are lazy and refocus the existing wallet instead of duplica
   assert.match(navbar, /section\.focus\(\{ preventScroll: true \}\)/);
   assert.match(navbar, /<WalletQuickDialog key=\{actor\}/);
   const quick = source("components/market/wallet-quick-dialog.tsx");
-  assert.match(quick, /setReady\(false\)/);
+  // Reopening is a new read barrier: the shared snapshot hook resets readiness.
+  assert.match(quick, /useWalletSnapshot\(open\)/);
+  assert.match(source("components/market/in-place-topup.tsx"), /setReady\(false\)/);
   // The quick dialog only tops up; sending and C2C live on the balance page.
   assert.doesNotMatch(quick, /C2CBuyPanel|WalletTransferPanel|getC2COrders/);
   const c2c = source("components/dashboard/c2c-buy-panel.tsx");

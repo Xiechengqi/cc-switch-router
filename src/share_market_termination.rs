@@ -434,10 +434,15 @@ impl Availability {
 }
 
 pub(crate) fn availability_tx(c: &Connection, sub: &str) -> Result<Availability, AppError> {
+    availability_at_tx(c, sub, &Utc::now().to_rfc3339())
+}
+
+/// [`availability_tx`] at a given time.
+fn availability_at_tx(c: &Connection, sub: &str, at: &str) -> Result<Availability, AppError> {
     if for_subscription_tx(c, sub)?.is_some() {
         return Ok(Availability::blocked(None));
     }
-    match basis(c, sub, &Utc::now().to_rfc3339()) {
+    match basis(c, sub, at) {
         Ok(t) => Ok(match blocked_reason(c, &t)? {
             Some(reason) => Availability::blocked(Some(reason)),
             None if t.early_termination_forbidden => Availability {
