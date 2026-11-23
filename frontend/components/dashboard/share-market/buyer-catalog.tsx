@@ -395,11 +395,13 @@ export function ShareMarketBuyerCatalog({
     void onChanged();
   };
 
-  // A free seat goes straight to checkout; any other seat opens its Share
-  // drawer with that seat chosen, where rental actions live.
+  // A seat the buyer can act on (rent, log in, request access) goes straight
+  // to that flow; any other seat opens its Share drawer with the seat chosen,
+  // which explains why it can't be rented and holds the rental actions.
   const openSeat = (listing: ShareMarketListing, seat: ShareMarketSeat) => {
     setError("");
-    if (!listing.isOwner && isSeatIdle(seat)) return void triggerSeat({ listing, seat });
+    const action = seatAction(listing, seat, subscriptions, authed);
+    if (!listing.isOwner && isSeatIdle(seat) && ["rent", "login", "approval"].includes(action)) return void triggerSeat({ listing, seat });
     setSelected({ listing, seat });
     void onChanged();
   };

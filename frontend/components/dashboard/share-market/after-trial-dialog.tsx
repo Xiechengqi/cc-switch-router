@@ -100,7 +100,7 @@ export function ShareAfterTrialDialog({
                 suggestedAmount={suggestedTopupAmount(funding.shortfallUnits)}
                 idPrefix="share-after-trial-topup"
                 onBusyChange={setTopupBusy}
-                onFunded={() => { setFunding(null); setNotice(t("shareRent.topup.funded")); }}
+                onFunded={() => { setFunding(null); setNotice(t("shareRent.afterTrial.funded")); }}
               />
             ) : (
               <>

@@ -2016,7 +2016,10 @@ pub(crate) fn terminate_after_cleanup_tx(
     if result.finalized && !was_ended && !client_notice {
         let trial_only: bool = conn
             .query_row(
-                "SELECT after_trial='end' AND paid_started_at IS NULL FROM market_platform_contracts WHERE id=?1",
+                // Only a trial that ran out ended "with its trial"; an early
+                // release or a revocation keeps trial time and gets "ended".
+                "SELECT after_trial='end' AND paid_started_at IS NULL AND trial_seconds_remaining<=0
+                 FROM market_platform_contracts WHERE id=?1",
                 params![contract_id],
                 |r| r.get(0),
             )

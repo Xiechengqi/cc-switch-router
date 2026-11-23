@@ -271,10 +271,14 @@ function normalizedSeat(draft: SeatDraft, t: TFn): ShareMarketSeatInput {
   const seat = normalizedSeatTerms(draft, t);
   if (!draft.paid) return seat;
   const forbidden = draft.termination.earlyTermination === "forbidden";
-  const terminationRateBps = forbidden ? null : seatTerminationRateBps(draft.termination.terminationRate);
+  const terminationRateBps = seatTerminationRateBps(draft.termination.terminationRate);
   if (terminationRateBps === undefined) {
+    // The rate field is hidden while forbidden: keep the stored rate rather
+    // than block saving on a value the seller cannot see.
+    if (forbidden) return { ...seat, earlyTermination: "forbidden" };
     throw new SeatDraftError("terminationRate", t("shareSeatTerms.rateInvalid"));
   }
+  // Forbidding keeps the custom rate, so allowing again restores it.
   return { ...seat, earlyTermination: draft.termination.earlyTermination, terminationRateBps };
 }
 

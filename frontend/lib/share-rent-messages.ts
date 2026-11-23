@@ -47,6 +47,8 @@ export const shareRentMessagesEn = {
   "shareRent.success.rented": "Seat rented",
   "shareRent.success.trialOnlyBody": "The trial ends in about {hours} h and the seat is released. Nothing is charged.",
   "shareRent.success.trialBody": "After about {hours} h of trial, the first period is charged and the rental continues.",
+  "shareRent.success.trialOnlyBodyNoHours": "The seat is released when the trial ends. Nothing is charged.",
+  "shareRent.success.trialBodyNoHours": "When the trial ends, the first period is charged and the rental continues.",
   "shareRent.success.paidBody": "The seat is yours.",
   "shareRent.success.connect": "Connect",
   "shareRent.success.activation": "Access usually becomes active within a minute.",
@@ -67,6 +69,7 @@ export const shareRentMessagesEn = {
   "shareRent.afterTrial.continueAction": "Keep after trial",
   "shareRent.afterTrial.endAction": "Switch to trial only",
   "shareRent.afterTrial.topupPurpose": "Keeping this seat needs {missing} more",
+  "shareRent.afterTrial.funded": "Your balance arrived. Confirm to keep this seat after the trial.",
   "shareRent.issue.forbiddenNote": "This seat can't be ended early. If the service is broken, submit a service problem: all unused rent is held until the seller responds or the platform decides.",
 };
 
@@ -116,6 +119,8 @@ export const shareRentMessagesZh: Record<keyof typeof shareRentMessagesEn, strin
   "shareRent.success.rented": "租用成功",
   "shareRent.success.trialOnlyBody": "约 {hours} 小时后试用结束并自动释放车位，不扣费。",
   "shareRent.success.trialBody": "约 {hours} 小时试用后自动扣首期，转为正式租用。",
+  "shareRent.success.trialOnlyBodyNoHours": "试用结束后自动释放车位，不扣费。",
+  "shareRent.success.trialBodyNoHours": "试用结束后自动扣首期，转为正式租用。",
   "shareRent.success.paidBody": "车位已归你使用。",
   "shareRent.success.connect": "接入信息",
   "shareRent.success.activation": "授权通常在 1 分钟内生效。",
@@ -136,5 +141,6 @@ export const shareRentMessagesZh: Record<keyof typeof shareRentMessagesEn, strin
   "shareRent.afterTrial.continueAction": "确认继续租用",
   "shareRent.afterTrial.endAction": "改为仅试用",
   "shareRent.afterTrial.topupPurpose": "继续租用还差 {missing}",
+  "shareRent.afterTrial.funded": "余额已到账，请确认试用后继续租用。",
   "shareRent.issue.forbiddenNote": "此车位不支持中途退租。如服务异常，可提交服务问题：全部未用租金将暂扣，待商家回应或平台裁决。",
 };

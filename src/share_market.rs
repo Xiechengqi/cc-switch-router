@@ -534,14 +534,23 @@ pub struct SeatInput {
     /// "0" means time-only, omitted inherits the Router default.
     #[serde(default)]
     pub trial_value_limit_usd_micros: Option<String>,
-    /// Paid seats only: `allowed` (default) or `forbidden` voluntary early
-    /// termination of a paid period.
+    /// Paid seats only: `allowed` or `forbidden` voluntary early termination
+    /// of a paid period. Omitted keeps the stored rule (`allowed` for a new seat).
     #[serde(default)]
     pub early_termination: Option<String>,
     /// Paid seats only: the seller's compensation rate in basis points
-    /// (0–5000); null follows the Router owner's platform default.
-    #[serde(default)]
-    pub termination_rate_bps: Option<i64>,
+    /// (0–5000). Explicit null follows the Router owner's platform default;
+    /// omitted keeps the stored rate.
+    #[serde(default, deserialize_with = "deserialize_present_nullable_i64")]
+    pub termination_rate_bps: Option<Option<i64>>,
+}
+
+/// Distinguishes a missing field (`None`) from an explicit `null` (`Some(None)`).
+fn deserialize_present_nullable_i64<'de, D>(deserializer: D) -> Result<Option<Option<i64>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::<i64>::deserialize(deserializer)?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -878,8 +887,10 @@ struct NormalizedSeat {
     trial_hours: Option<i64>,
     trial_token_limit: Option<u64>,
     trial_value_limit_usd_micros: Option<String>,
-    early_termination: &'static str,
-    termination_rate_bps: Option<i64>,
+    /// `None` keeps the stored value on edit.
+    early_termination: Option<&'static str>,
+    /// `None` keeps the stored rate; `Some(None)` follows the platform.
+    termination_rate_bps: Option<Option<i64>>,
 }
 
 impl NormalizedSeat {
@@ -969,15 +980,16 @@ fn normalize_seat(input: SeatInput) -> Result<NormalizedSeat, AppError> {
     }
     let value_quota = normalize_seat_value_quota(input.value_quota, input.token_limit)?;
     let early_termination = match input.early_termination.as_deref() {
-        None | Some("allowed") => "allowed",
-        Some("forbidden") => "forbidden",
+        None => None,
+        Some("allowed") => Some("allowed"),
+        Some("forbidden") => Some("forbidden"),
         Some(_) => {
             return Err(AppError::BadRequest(
                 "earlyTermination must be allowed or forbidden".into(),
             ));
         }
     };
-    if input.termination_rate_bps.is_some_and(|rate| {
+    if input.termination_rate_bps.flatten().is_some_and(|rate| {
         !(0..=crate::share_market_termination::MAX_SEAT_RATE_BPS).contains(&rate)
     }) {
         return Err(AppError::BadRequest(
@@ -1019,7 +1031,7 @@ fn normalize_seat(input: SeatInput) -> Result<NormalizedSeat, AppError> {
                 "trial hours and trial budgets apply only to paid seats".into(),
             ));
         }
-        if early_termination != "allowed" || input.termination_rate_bps.is_some() {
+        if early_termination == Some("forbidden") || input.termination_rate_bps.flatten().is_some() {
             return Err(AppError::BadRequest(
                 "termination rules apply only to paid seats".into(),
             ));
@@ -1038,8 +1050,9 @@ fn normalize_seat(input: SeatInput) -> Result<NormalizedSeat, AppError> {
             trial_hours: None,
             trial_token_limit: None,
             trial_value_limit_usd_micros: None,
-            early_termination: "allowed",
-            termination_rate_bps: None,
+            // A free seat never keeps paid-seat termination rules.
+            early_termination: Some("allowed"),
+            termination_rate_bps: Some(None),
         });
     }
     let price_minor = price_minor.ok_or_else(|| {
@@ -1112,11 +1125,20 @@ fn write_seat_termination_tx(
     seat_id: &str,
     seat: &NormalizedSeat,
 ) -> Result<(), AppError> {
-    tx.execute(
-        "UPDATE share_market_seats SET early_termination = ?2, termination_rate_bps = ?3 WHERE id = ?1",
-        params![seat_id, seat.early_termination, seat.termination_rate_bps],
-    )
-    .map_err(map_db("save Share seat termination rules"))?;
+    if let Some(rule) = seat.early_termination {
+        tx.execute(
+            "UPDATE share_market_seats SET early_termination = ?2 WHERE id = ?1",
+            params![seat_id, rule],
+        )
+        .map_err(map_db("save Share seat early-termination rule"))?;
+    }
+    if let Some(rate) = seat.termination_rate_bps {
+        tx.execute(
+            "UPDATE share_market_seats SET termination_rate_bps = ?2 WHERE id = ?1",
+            params![seat_id, rate],
+        )
+        .map_err(map_db("save Share seat termination rate"))?;
+    }
     Ok(())
 }
 
@@ -13783,6 +13805,23 @@ mod tests {
     mod client_entries_tests;
     mod control_recovery_tests;
     mod provider_presentation_tests;
+
+    #[test]
+    fn seat_termination_fields_keep_stored_rules_unless_sent() {
+        let base = serde_json::json!({"parallelLimit": null, "tokenLimit": null,
+            "dailyRateMinor": null, "currency": "USD", "cyclePriceMinor": 1000});
+        let parse = |extra: serde_json::Value| {
+            let mut value = base.clone();
+            value.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            normalize_seat(serde_json::from_value::<SeatInput>(value).unwrap()).unwrap()
+        };
+        let omitted = parse(serde_json::json!({}));
+        assert_eq!((omitted.early_termination, omitted.termination_rate_bps), (None, None));
+        let reset = parse(serde_json::json!({"terminationRateBps": null}));
+        assert_eq!(reset.termination_rate_bps, Some(None));
+        let set = parse(serde_json::json!({"earlyTermination": "forbidden", "terminationRateBps": 2500}));
+        assert_eq!((set.early_termination, set.termination_rate_bps), (Some("forbidden"), Some(Some(2500))));
+    }
 
     #[test]
     fn public_account_quota_preserves_display_metadata_without_private_fields() {

@@ -79,7 +79,7 @@ test("catalog seat rows rent free seats directly, open the drawer otherwise, and
   const catalog = source("./buyer-catalog.tsx");
   assert.match(catalog, /onOpen=\{\(seat\) => seat \? onOpenSeat\(seat\) : onOpen\(\)\}/);
   assert.match(catalog, /onOpenSeat=\{\(seat\) => openSeat\(listing, seat\)\}/);
-  assert.match(catalog, /if \(!listing\.isOwner && isSeatIdle\(seat\)\) return void triggerSeat\(\{ listing, seat \}\);\s*setSelected\(\{ listing, seat \}\)/);
+  assert.match(catalog, /if \(!listing\.isOwner && isSeatIdle\(seat\) && \["rent", "login", "approval"\]\.includes\(action\)\) return void triggerSeat\(\{ listing, seat \}\);\s*setSelected\(\{ listing, seat \}\)/);
   assert.match(catalog, /const checkout = useShareSeatCheckout\(/);
   assert.match(catalog, /onPresented: \(\) => setSelected\(null\)/);
   assert.match(catalog, /await checkout.open\(item\)/);

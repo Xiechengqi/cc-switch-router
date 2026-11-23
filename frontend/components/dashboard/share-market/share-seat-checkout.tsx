@@ -201,6 +201,8 @@ export function useShareSeatCheckout({
   const autoRenewFor = (target: RentTarget | null) => !!target && target.quote.offer.pricingModel === "prepaid_calendar_month" && !trialOnlyFor(target);
   const outcomeFor = (target: RentTarget | null, request: { afterTrial?: ShareAfterTrial }): Outcome => {
     if (request.afterTrial === "end") return "trialOnly";
+    // Only seats with trial time left are sent with an after-trial choice.
+    if (request.afterTrial === "continue") return "trial";
     if (!target) return "paid";
     if (isFreeOffer(target.quote.offer)) return "free";
     return target.quote.trialSecondsRemaining > 0 ? "trial" : "paid";
@@ -277,11 +279,16 @@ export function useShareSeatCheckout({
     setError(""); setRentNotice(""); setStep("topup");
   };
   const funded = async () => {
-    if (!rentTarget) return;
-    setStep("confirm");
+    if (!rentTarget || flight.current) return;
     const current = guard();
-    const fresh = await requote(rentTarget, current);
-    if (fresh && !fresh.changed && current()) setRentNotice(t("shareRent.topup.funded"));
+    // Hold the flight so the expired-quote timer re-armed by this step change
+    // does not abort the re-quote below.
+    flight.current = true; setBusySeatId(rentTarget.seat.id); setError("");
+    setStep("confirm");
+    try {
+      const fresh = await requote(rentTarget, current);
+      if (fresh && !fresh.changed && current()) setRentNotice(t("shareRent.topup.funded"));
+    } finally { if (current()) { flight.current = false; setBusySeatId(""); } }
   };
 
   const closeRentDialog = () => {
@@ -570,8 +577,8 @@ function SuccessStep({ success }: { success: Success }) {
   return (
     <div className="grid gap-4">
       <p className="text-sm leading-6">
-        {success.outcome === "trialOnly" ? t("shareRent.success.trialOnlyBody", { hours: success.trialHours })
-          : success.outcome === "trial" ? t("shareRent.success.trialBody", { hours: success.trialHours })
+        {success.outcome === "trialOnly" ? (success.trialHours ? t("shareRent.success.trialOnlyBody", { hours: success.trialHours }) : t("shareRent.success.trialOnlyBodyNoHours"))
+          : success.outcome === "trial" ? (success.trialHours ? t("shareRent.success.trialBody", { hours: success.trialHours }) : t("shareRent.success.trialBodyNoHours"))
           : t("shareRent.success.paidBody")}
       </p>
       {subdomain ? (
