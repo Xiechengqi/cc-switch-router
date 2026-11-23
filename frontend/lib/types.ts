@@ -3057,6 +3057,8 @@ export type ShareMarketProviderHealthState =
 export type ShareMarketProviderQuota = {
   status?: string;
   plan?: string;
+  activityCost?: string;
+  providerUsage?: NonNullable<ShareUpstreamProvider["quota"]>["providerUsage"];
   subscriptionPeriodEnd?: string;
   tiers: Array<{
     label: string;
@@ -3070,6 +3072,7 @@ export type ShareMarketProviderQuota = {
     modelFamily?: string;
     relativeWeeklyCapacity?: number;
     source?: string;
+    expiresAt?: string;
   }>;
   unobservedTiers?: ShareUpstreamQuotaTierHint[];
 };

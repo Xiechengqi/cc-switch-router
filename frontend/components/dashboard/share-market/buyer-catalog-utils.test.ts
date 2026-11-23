@@ -1,3 +1,4 @@
+import { shareAccountPresentation } from "../share-account-presentation";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
@@ -29,6 +30,7 @@ import {
   integrityReasonText,
   marketProviderStatusView,
   primaryMarketCapability,
+  marketCapabilityRuntime,
   subscriptionStatusKey,
 } from "./market-utils";
 import { mergeShareMarketSubscriptionPage } from "./subscription-utils";
@@ -201,7 +203,7 @@ const capability = (
   ...overrides,
 });
 
-test("provider panel prefers a capability with public account status", () => {
+test("provider panel uses explicit App rather than account data richness", () => {
   const detailed = capability({
     app: "codex",
     accountHint: "p***e@example.com",
@@ -215,7 +217,7 @@ test("provider panel prefers a capability with public account status", () => {
     primaryMarketCapability([
       capability({ app: "claude", providerName: "Anthropic" }),
       detailed,
-    ]),
+    ], "codex"),
     detailed,
   );
 });
@@ -223,6 +225,7 @@ test("provider panel prefers a capability with public account status", () => {
 test("provider panel reproduces quota, provider identity and enabled app model rows", () => {
   const view = marketProviderStatusView(
     {
+      appType: "codex",
       supportedApps: ["claude", "codex"],
       appCapabilities: [
         capability({
@@ -340,6 +343,7 @@ test("provider panel keeps degraded and API providers safe", () => {
 test("provider panel uses subscription level and stable app order without quota", () => {
   const view = marketProviderStatusView(
     {
+      appType: "codex",
       supportedApps: ["claude", "codex"],
       appCapabilities: [
         capability({ app: "codex", subscriptionLevel: "Pro" }),
@@ -777,4 +781,36 @@ test("rental history page count uses the full total, not the loaded page", () =>
   assert.equal(rentalHistoryPageStart(1), 0);
   assert.equal(rentalHistoryPageStart(2), 5);
   assert.equal(rentalHistoryPageStart(2) >= loaded.length, true);
+});
+
+
+test("market and Client account views share Buddy summaries and batch details", () => {
+  const tiers = [100, 200].map(limit => ({ label: "CodeBuddy个人版国内运营裂变包", utilization: 0,
+    used: 0, limit, unit: "credits", source: "codebuddy_billing_resource_v2", expiresAt: "2099-01-01T00:00:00Z" }));
+  for (const providerType of ["workbuddy_oauth", "codebuddy_oauth"]) {
+    const input = capability({ providerType, quota: { status: "ok", tiers } });
+    const market = marketProviderStatusView({ appCapabilities: [input], supportedApps: [input.app] }, "zh-CN", { unknown: "未知", passthrough: "透传" });
+    const client = shareAccountPresentation({ app: input.app, providerType, quota: input.quota }, "zh-CN");
+    assert.equal(market.primaryLine, client.primaryLine);
+    assert.equal(market.primaryTitle, client.primaryTitle);
+    assert.match(market.primaryLine, /签到 0\/300 credits/);
+    assert.match(market.primaryTitle!, /100 credits/);
+    assert.match(market.primaryTitle!, /200 credits/);
+  }
+});
+
+test("market adapter retains public quota data for every provider", () => {
+  for (const providerType of ["ollama_cloud", "codex_oauth", "claude_oauth", "cursor_oauth", "workbuddy_oauth"]) {
+    const quota = { status: "ok", plan: "Plus", activityCost: "12.5", tiers: [{ label: "weekly", utilization: 25, source: "usage", scope: "account" as const }] };
+    const runtime = marketCapabilityRuntime(capability({ providerType, quota }));
+    assert.deepEqual(runtime.quota, quota);
+    assert.deepEqual(shareAccountPresentation(runtime, "en"), shareAccountPresentation({ providerType, quota }, "en"));
+  }
+});
+
+test("primary account stays stable when another App gains quota data", () => {
+  const primary = capability({ app: "claude" });
+  const other = capability({ app: "codex", quota: { status: "ok", tiers: [], plan: "Plus" } });
+  assert.equal(primaryMarketCapability([other, primary]), primary);
+  assert.equal(primaryMarketCapability([other, primary], "codex"), other);
 });

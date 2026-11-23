@@ -185,6 +185,18 @@ pub struct ShareMarketProviderQuotaTier {
     pub limit: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_pool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relative_weekly_capacity: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,6 +212,10 @@ pub struct ShareMarketProviderQuota {
     pub tiers: Vec<ShareMarketProviderQuotaTier>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unobserved_tiers: Vec<ShareUpstreamQuotaTierHint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_cost: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_usage: Option<crate::models::BuddyOfficialUsageSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2883,6 +2899,12 @@ fn public_provider_quota(
                     used: tier.used,
                     limit: tier.limit,
                     unit: tier.unit.clone(),
+                    source: tier.source.clone(),
+                    scope: tier.scope.clone(),
+                    capacity_pool: tier.capacity_pool.clone(),
+                    model_family: tier.model_family.clone(),
+                    relative_weekly_capacity: tier.relative_weekly_capacity,
+                    expires_at: tier.expires_at.clone(),
                 })
                 .collect::<Vec<_>>()
         })
@@ -2895,6 +2917,13 @@ fn public_provider_quota(
         && subscription_period_end.is_none()
         && tiers.is_empty()
         && unobserved_tiers.is_empty()
+        && quota
+            .and_then(|value| value.activity_cost.as_ref())
+            .is_none()
+        && quota
+            .and_then(|value| value.provider_usage.as_ref())
+            .filter(|value| value.is_valid())
+            .is_none()
     {
         return None;
     }
@@ -2904,6 +2933,11 @@ fn public_provider_quota(
         subscription_period_end,
         tiers,
         unobserved_tiers,
+        activity_cost: quota.and_then(|value| value.activity_cost.clone()),
+        provider_usage: quota
+            .and_then(|value| value.provider_usage.as_ref())
+            .filter(|value| value.is_valid())
+            .cloned(),
     })
 }
 
@@ -13645,6 +13679,56 @@ mod tests {
     mod client_entries_tests;
     mod control_recovery_tests;
     mod provider_presentation_tests;
+
+    #[test]
+    fn public_account_quota_preserves_display_metadata_without_private_fields() {
+        let quota: crate::models::ShareUpstreamQuota = serde_json::from_value(serde_json::json!({
+            "status": "ok", "activityCost": "12.5", "credentialMessage": "private-message",
+            "tiers": [{"label": "CodeBuddy个人版国内运营裂变包", "utilization": 0,
+                "used": 0, "limit": 100, "unit": "credits", "source": "codebuddy_billing_resource_v2",
+                "expiresAt": "2099-01-01T00:00:00Z", "scope": "account", "capacityPool": "weekly",
+                "modelFamily": "sonnet", "relativeWeeklyCapacity": 1.0}]
+        })).unwrap();
+        let public =
+            serde_json::to_value(public_provider_quota(Some(&quota), None).unwrap()).unwrap();
+        assert_eq!(public["activityCost"], "12.5");
+        for field in [
+            "source",
+            "expiresAt",
+            "scope",
+            "capacityPool",
+            "modelFamily",
+            "relativeWeeklyCapacity",
+        ] {
+            assert_eq!(
+                public["tiers"][0][field],
+                serde_json::to_value(&quota.tiers[0]).unwrap()[field]
+            );
+        }
+        assert!(public.get("credentialMessage").is_none());
+        assert!(public.get("bankedReset").is_none());
+    }
+
+    #[test]
+    fn public_account_quota_retains_only_valid_official_usage() {
+        let mut quota: crate::models::ShareUpstreamQuota = serde_json::from_value(serde_json::json!({
+            "status": "ok", "providerUsage": { "status": "unavailable", "source": "buddy_official_request_usage",
+                "scope": "account", "timezone": "Asia/Shanghai", "collectedAt": 1790000000000_i64 }
+        })).unwrap();
+        assert!(
+            public_provider_quota(Some(&quota), None)
+                .unwrap()
+                .provider_usage
+                .is_some()
+        );
+        quota.provider_usage.as_mut().unwrap().source = "untrusted".into();
+        assert!(
+            public_provider_quota(Some(&quota), None)
+                .unwrap()
+                .provider_usage
+                .is_none()
+        );
+    }
 
     #[test]
     fn banked_reset_is_accepted_in_share_contract_but_not_public_market_quota() {

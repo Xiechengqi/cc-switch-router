@@ -1,16 +1,15 @@
+import { shareAccountPresentation } from "../share-account-presentation";
 import type { AppLocale, MessageKey } from "@/lib/i18n";
 import { ApiError } from "@/lib/api";
 import { formatMarketPrice as formatUsdMoney } from "@/lib/market-money";
 import {
   isApiProviderRuntime,
-  providerQuotaStatusLine,
-  providerStatusIdentity,
 } from "@/components/dashboard/share-dashboard-utils";
 import {
   marketProviderHealthTone,
   type ShareProviderStatusPanelView,
 } from "@/components/dashboard/share-provider-status-panel";
-import { SHARE_APP_LABELS } from "@/lib/share-app";
+import { primaryShareAccountApp, SHARE_APP_LABELS } from "@/lib/share-app";
 import { formatUsdLimit, USD_LIMIT_MAX_MICROS } from "@/lib/share-value-quota";
 import type {
   ShareMarketAppCapability,
@@ -295,30 +294,9 @@ export function capabilityModelLabel(
   return models.join(" / ") || unknownLabel;
 }
 
-function capabilityDetailScore(capability: ShareMarketAppCapability) {
-  return (
-    Number(Boolean(capability.quota)) * 4 +
-    Number(Boolean(capability.subscriptionLevel)) * 3 +
-    Number(Boolean(capability.accountHint)) * 2 +
-    Number(Boolean(capability.providerName || capability.providerType))
-  );
-}
-
-export function primaryMarketCapability(
-  capabilities: ShareMarketAppCapability[],
-) {
-  const core = CORE_SHARE_APPS.flatMap((app) => {
-    const capability = capabilities.find((item) => item.app === app);
-    return capability ? [capability] : [];
-  });
-  const candidates = core.length ? core : capabilities;
-  return candidates.reduce<ShareMarketAppCapability | undefined>(
-    (best, capability) =>
-      !best || capabilityDetailScore(capability) > capabilityDetailScore(best)
-        ? capability
-        : best,
-    undefined,
-  );
+export function primaryMarketCapability<T extends { app: string }>(capabilities: T[], preferredApp?: string) {
+  const app = primaryShareAccountApp(capabilities.map((item) => item.app), preferredApp);
+  return capabilities.find((item) => item.app === app) || capabilities[0];
 }
 
 export function enabledMarketCapabilities(
@@ -329,32 +307,20 @@ export function enabledMarketCapabilities(
 }
 
 export function marketCapabilityRuntime(
-  capability: ShareMarketAppCapability,
+  capability: Omit<Partial<ShareMarketAppCapability>, "quota"> & { app: string; kind?: string; quota?: ShareUpstreamProvider["quota"] },
 ): ShareUpstreamProvider {
   const models = capabilityModels(capability);
   const upstreamModel = capability.upstreamModel || models[0] || "";
   return {
     app: capability.app,
-    kind: capability.providerType,
-    providerType: capability.providerType,
+    kind: capability.providerType || capability.kind,
+    providerType: capability.providerType || capability.kind,
     providerName: capability.providerName,
     accountEmail: capability.accountHint,
     subscriptionLevel: capability.subscriptionLevel,
-    quota: capability.quota
-      ? {
-          status: capability.quota.status,
-          plan: capability.quota.plan,
-          subscriptionPeriodEnd: capability.quota.subscriptionPeriodEnd,
-          tiers: capability.quota.tiers,
-          unobservedTiers: capability.quota.unobservedTiers,
-        }
-      : capability.subscriptionLevel
-        ? {
-            status: "ok",
-            plan: capability.subscriptionLevel,
-            tiers: [],
-          }
-        : undefined,
+    quota: capability.quota || (capability.subscriptionLevel
+      ? { status: "ok", plan: capability.subscriptionLevel, tiers: [] }
+      : undefined),
     models: models.map((actualModel) => ({ actualModel })),
     modelPolicy:
       capability.modelMode === "passthrough"
@@ -366,12 +332,12 @@ export function marketCapabilityRuntime(
 }
 
 export function marketProviderStatusView(
-  listing: Pick<ShareMarketListing, "appCapabilities" | "supportedApps" | "modelHealthStatus" | "liveModelHealthStatus">,
+  listing: Pick<ShareMarketListing, "appCapabilities" | "supportedApps" | "modelHealthStatus" | "liveModelHealthStatus"> & { appType?: string },
   locale: AppLocale,
   labels: { unknown: string; passthrough: string },
 ): ShareProviderStatusPanelView {
   const capabilities = enabledMarketCapabilities(listing);
-  const primary = primaryMarketCapability(capabilities);
+  const primary = primaryMarketCapability(capabilities, listing.appType);
   if (!primary) {
     return {
       primaryLine: labels.unknown,
@@ -383,7 +349,6 @@ export function marketProviderStatusView(
   const runtime = marketCapabilityRuntime(primary);
   const isApiProvider =
     primary.providerFamily === "api" || isApiProviderRuntime(runtime);
-  const accountLine = providerStatusIdentity(runtime);
   const modelsLine = CORE_SHARE_APPS.flatMap((app) => {
     const item = capabilities.find((capability) => capability.app === app);
     return item
@@ -400,10 +365,10 @@ export function marketProviderStatusView(
   const status = listing.liveModelHealthStatus || listing.modelHealthStatus;
   const health = status ? modelHealthPresentation(status, locale) : undefined;
   return {
-    primaryLine: isApiProvider
-      ? primary.providerName || primary.providerType || labels.unknown
-      : providerQuotaStatusLine(runtime, locale),
-    identityLine: isApiProvider ? "-" : accountLine,
+    ...shareAccountPresentation(runtime, locale, {
+      api: isApiProvider,
+      publicApiLabel: primary.providerName || primary.providerType || labels.unknown,
+    }),
     modelsLine:
       modelsLine || capabilityModelLabel(primary, labels.passthrough, labels.unknown),
     panelTitle: health?.title,

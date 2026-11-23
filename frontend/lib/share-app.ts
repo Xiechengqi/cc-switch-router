@@ -15,6 +15,13 @@ function asCoreShareApp(value: string | null | undefined): CoreShareApp | null {
   return CORE_SHARE_APPS.includes(app as CoreShareApp) ? (app as CoreShareApp) : null;
 }
 
+/** Stable account selection, independent of how much quota data an App reports. */
+export function primaryShareAccountApp(apps: readonly string[], preferred?: string): CoreShareApp | null {
+  const explicit = asCoreShareApp(preferred);
+  if (explicit && apps.includes(explicit)) return explicit;
+  return CORE_SHARE_APPS.find((app) => apps.includes(app)) ?? null;
+}
+
 export function resolveShareCoreApp(share: ShareView | null | undefined): CoreShareApp | null {
   if (!share) return null;
   const fromType = asCoreShareApp(share.appType);

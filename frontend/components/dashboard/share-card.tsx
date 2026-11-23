@@ -1,4 +1,5 @@
 "use client";
+import { shareAccountPresentation } from "./share-account-presentation";
 
 import {ShareCapabilitySummary} from "./share-capability-summary";
 
@@ -23,11 +24,6 @@ import {
   modelHealthTitle,
   modelHealthTone,
   providerActualModelNames,
-  providerApiEndpoint,
-  providerQuotaStatusLine,
-  providerQuotaDetails,
-  providerStatusIdentity,
-  isApiProviderRuntime,
   recentSharePerformance,
   resolveShareAppRuntime,
   shareDisplayTitle,
@@ -46,7 +42,7 @@ import {
   shareProviderLogoEntries,
 } from "@/components/dashboard/share-provider-logo";
 import {
-  resolveShareCoreApp,
+  primaryShareAccountApp,
   shareEnabledApps,
   SHARE_APP_LABELS,
 } from "@/lib/share-app";
@@ -110,7 +106,7 @@ export const ShareCard = React.memo(function ShareCard({
   const cardRef = React.useRef<HTMLDivElement | null>(null);
   const pointerDownRef = React.useRef<{ x: number; y: number } | null>(null);
   const apps = shareEnabledApps(share);
-  const app = resolveShareCoreApp(share);
+  const app = primaryShareAccountApp(apps, share.appType);
   const appRequests =
     apps.length === 1 && app
       ? (share.recentRequests || []).filter((request) =>
@@ -141,12 +137,6 @@ export const ShareCard = React.memo(function ShareCard({
     .map((entry) => `${SHARE_APP_LABELS[entry.app]}: ${entry.text}`)
     .join(" · ");
   const providerEnabled = app ? !!share.support?.[app] : !!runtime;
-  const quotaStatusLine =
-    providerEnabled && runtime ? providerQuotaStatusLine(runtime, locale) : "-";
-  const accountLine =
-    providerEnabled && runtime
-      ? providerStatusIdentity(runtime, share.canViewAccountIdentity ?? share.canManage === true)
-      : "-";
   const actualModels =
     modelPolicySummary ||
     (providerEnabled && runtime
@@ -155,22 +145,14 @@ export const ShareCard = React.memo(function ShareCard({
           t("dashboard.modelPolicyPassthrough"),
         )
       : "-");
-  const isApiProvider =
-    providerEnabled && runtime ? isApiProviderRuntime(runtime) : false;
-  const apiEndpoint =
-    providerEnabled && runtime ? providerApiEndpoint(runtime) : "-";
   const healthTone = modelHealthTone(share, undefined, locale);
   const providerPanelView = {
-    primaryLine: isApiProvider ? apiEndpoint : quotaStatusLine,
-    identityLine: isApiProvider ? "-" : accountLine,
+    ...shareAccountPresentation(providerEnabled ? runtime : undefined, locale, {
+      allowIdentityFallback: share.canViewAccountIdentity ?? share.canManage === true,
+    }),
     modelsLine: actualModels,
-    primaryTitle: isApiProvider
-      ? `${t("dashboard.apiRequestUrl")}: ${apiEndpoint}`
-      : providerEnabled && runtime ? providerQuotaDetails(runtime, locale) : quotaStatusLine,
-    identityTitle: isApiProvider ? "-" : accountLine,
     modelsTitle: actualModels,
     panelTitle: modelHealthTitle(share, undefined, locale),
-    primaryMonospace: isApiProvider,
     toneClassName: healthTone.className,
     healthLabel: "detailLabel" in healthTone ? healthTone.detailLabel : undefined,
   };

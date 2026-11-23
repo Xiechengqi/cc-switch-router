@@ -4,29 +4,19 @@ import {
   ShareProviderLogo,
 } from "@/components/dashboard/share-provider-logo";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
-import { CORE_SHARE_APPS, SHARE_APP_LABELS } from "@/lib/share-app";
+import { SHARE_APP_LABELS } from "@/lib/share-app";
 import { isCoreShareApp } from "@/components/dashboard/share-market/market-utils";
-import {
-  isApiProviderRuntime,
-  providerApiEndpoint,
-  providerQuotaStatusLine,
-  providerQuotaDetails,
-} from "@/components/dashboard/share-dashboard-utils";
+import { shareAccountPresentation } from "../share-account-presentation";
 import { useLocaleText } from "@/components/i18n/locale-provider";
+import { marketCapabilityRuntime, primaryMarketCapability } from "./market-utils";
 import type { AppLocale } from "@/lib/i18n";
-import type { PublicProviderIdentity, ShareUpstreamProvider } from "@/lib/types";
+import type { PublicProviderIdentity } from "@/lib/types";
 
-type ShareIdentityProvider = {
-  app: string;
-  providerName?: string;
-  providerType?: string;
-  kind?: string;
-  apiUrl?: string;
-  subscriptionLevel?: string;
-  quota?: ShareUpstreamProvider["quota"];
-};
+type ShareIdentityProvider = Pick<Parameters<typeof marketCapabilityRuntime>[0],
+  "app" | "providerName" | "providerType" | "kind" | "subscriptionLevel" | "quota">;
 
 type ShareIdentitySource = {
+  appType?: string;
   providerIdentity?: PublicProviderIdentity;
   subdomain?: string;
   shareName?: string;
@@ -35,45 +25,18 @@ type ShareIdentitySource = {
   appCapabilities?: ShareIdentityProvider[];
 };
 
-function capabilityRuntime(capability: ShareIdentityProvider): ShareUpstreamProvider {
-  return {
-    app: capability.app,
-    kind: capability.kind || capability.providerType,
-    providerType: capability.providerType || capability.kind,
-    providerName: capability.providerName,
-    apiUrl: capability.apiUrl,
-    subscriptionLevel: capability.subscriptionLevel,
-    quota: capability.quota,
-  };
-}
-
 function providerStatusPrimaryLine(source: ShareIdentitySource, locale: AppLocale, details = false) {
   const enabledApps = source.supportedApps || source.apps || [];
-  const preferredApp = CORE_SHARE_APPS.find((app) => enabledApps.includes(app)) || enabledApps[0];
-  const capability =
-    (source.appCapabilities || []).find((item) => item.app === preferredApp)
-    || uniqueProviderCapabilities(source)[0];
+  const capability = primaryMarketCapability((source.appCapabilities || []).filter(
+    item => !enabledApps.length || enabledApps.includes(item.app),
+  ), source.appType);
   if (!capability) return "";
-  const runtime = capabilityRuntime(capability);
-  const line = isApiProviderRuntime(runtime)
-    ? providerApiEndpoint(runtime)
-    : details ? providerQuotaDetails(runtime, locale) : providerQuotaStatusLine(runtime, locale);
-  return line && line !== "-" ? line : "";
-}
-
-function uniqueProviderCapabilities(source: ShareIdentitySource) {
-  const enabledApps = new Set(source.supportedApps || source.apps || []);
-  const capabilities = (source.appCapabilities || []).filter((item) => {
-    const hasProvider = !!(item.providerName?.trim() || item.providerType?.trim() || item.kind?.trim());
-    return hasProvider && isCoreShareApp(item.app) && (!enabledApps.size || enabledApps.has(item.app));
+  const runtime = marketCapabilityRuntime(capability);
+  const view = shareAccountPresentation(runtime, locale, {
+    publicApiLabel: capability.providerName || capability.providerType,
   });
-  return capabilities.reduce<ShareIdentityProvider[]>((result, capability) => {
-    const key = capability.providerType || capability.kind || capability.providerName || capability.app;
-    if (!result.some((item) => {
-      return (item.providerType || item.kind || item.providerName || item.app) === key;
-    })) result.push(capability);
-    return result;
-  }, []);
+  const line = details ? view.primaryTitle : view.primaryLine;
+  return line && line !== "-" ? line : "";
 }
 
 export function MarketProviderLogos({
