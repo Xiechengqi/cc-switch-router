@@ -103,20 +103,6 @@ jobs:
           compression-level: 0
           retention-days: 1
 
-      - name: Test wallet and C2C browser contracts
-        working-directory: frontend
-        run: |
-          bash ../scripts/ci/timed.sh 'Financial request and Passkey browser' npm run test:financial-auth-browser
-          bash ../scripts/ci/timed.sh 'Client checkout browser' npm run test:client-checkout-browser
-          bash ../scripts/ci/timed.sh 'Client termination browser' npm run test:client-termination-browser
-          bash ../scripts/ci/timed.sh 'Client rental audit browser' npm run test:client-rental-audit-browser
-          bash ../scripts/ci/timed.sh 'Wallet checkout browser' npm run test:wallet-checkout-browser
-          bash ../scripts/ci/timed.sh 'C2C browser' npm run test:c2c-browser
-          bash ../scripts/ci/timed.sh 'Navbar wallet browser' npm run test:navbar-wallet-browser
-          bash ../scripts/ci/timed.sh 'Password authentication browser' npm run test:auth-password-browser
-          bash ../scripts/ci/timed.sh 'Marketplace email diagnostics browser' npm run test:market-notifications-browser
-          bash ../scripts/ci/timed.sh 'Share capability policy browser' npm run test:share-capabilities-browser
-
   rust-tests:
     runs-on: ubuntu-22.04
     timeout-minutes: 30

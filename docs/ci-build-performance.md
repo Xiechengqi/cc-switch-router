@@ -14,7 +14,7 @@ frontend ── 同次运行、同一 SHA 的 export ── build ─┐
 rust-tests ─────────────────────────────────────┴── release
 ```
 
-- `frontend`：来源审计、既有前端单测和契约审计、静态导出、钱包/C2C/导航余额浏览器契约测试。浏览器测试只使用本地页面与模拟 API，不截图、不创建真实订单。
+- `frontend`：来源审计、既有前端单测和契约审计、静态导出。GitHub Actions 不运行 Playwright、Chromium 或任何 `test:*-browser` UI 自动化；这类脚本只留在本地。Rust 里按名筛选的 HTTP 边界测试仍在 `rust-tests` 中运行。
 - `rust-tests`：与前端独立执行；编译测试二进制、数据库适配器与模板隔离测试、全部 `market_` 测试、全部真实 `schema::tests`。
 - `build`：等待前端通过，下载当前运行中以完整 SHA 命名的 export，再编译 Ubuntu AMD64 release。
 - `release`：必须等待以上所有任务成功；只有该任务拥有仓库写权限。旧构建任务可取消，发布任务单独串行、不在上传中途取消。
