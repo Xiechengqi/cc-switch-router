@@ -5078,16 +5078,19 @@ mod tests {
             "resolved",
             "the review case closes"
         );
-        assert_eq!(
-            conn.query_row(
+        let transitions: Vec<(String, i64)> = conn
+            .prepare(
                 "SELECT transition, COUNT(*) FROM operator_alert_signal_outbox
                  WHERE kind = 'market_wallet_contract_reconcile_failed'
                  GROUP BY transition ORDER BY transition",
-                [],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
             )
-            .map(|row| vec![row])
-            .unwrap(),
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(
+            transitions,
             vec![("firing".to_string(), 1), ("resolved".to_string(), 1)],
             "closing the case clears the one Owner alert"
         );

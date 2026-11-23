@@ -1065,6 +1065,45 @@ mod tests {
     }
 
     #[test]
+    fn resolving_a_service_reconcile_case_clears_the_owner_alert() {
+        let conn = crate::test_support::database().unwrap();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let at = "2026-01-01T00:00:00+00:00";
+        case_tx(&tx, "wallet_service_reconcile_failed", "platform_contract", "c", at).unwrap();
+        let case_id: String = tx
+            .query_row(
+                "SELECT id FROM market_finance_reconciliation_cases
+                 WHERE code = 'wallet_service_reconcile_failed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        resolve_case_tx(&tx, &case_id, "owner", "cursor_repaired", at).unwrap();
+        assert_eq!(
+            tx.query_row(
+                "SELECT status FROM market_finance_reconciliation_cases WHERE id = ?1",
+                params![case_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "resolved"
+        );
+        let resolved: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM operator_alert_signal_outbox
+                 WHERE kind = 'market_wallet_contract_reconcile_failed'
+                   AND transition = 'resolved'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(resolved, 1, "closing the case clears the Owner alert");
+        tx.commit().unwrap();
+    }
+
+    #[test]
     fn internal_audit_finds_projection_drift_and_blocks_new_money() {
         let conn = crate::test_support::database().unwrap();
         let tx = conn
