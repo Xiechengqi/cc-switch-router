@@ -11,8 +11,9 @@ import { Button } from "@heroui/react";
 import { Loader2, RotateCcw } from "lucide-react";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { ShareTerminationDialog, type ShareTerminationSelection } from "@/components/market/share-termination-dialog";
+import { ShareAfterTrialDialog, type ShareAfterTrialTarget } from "@/components/dashboard/share-market/after-trial-dialog";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
-import { rentalReleaseMode, rentalTermProgress } from "@/components/dashboard/share-market/subscription-utils";
+import { rentalReleaseMode, rentalTermProgress, shareAfterTrialSwitch } from "@/components/dashboard/share-market/subscription-utils";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { releaseShareMarketSubscription } from "@/lib/api";
 import { formatUsdMoney } from "@/lib/market-money";
@@ -95,7 +96,7 @@ export function RentalTermLine({
   const contract = subscription.walletContract;
   const progress = rentalTermProgress(subscription, nowMs);
   const remaining = contract
-    ? t(walletLifecycleKey(contract), { date: formatUtcDateTime(contract.periodEnd, locale), hours: trialHours(contract.trialSecondsRemaining, locale) })
+    ? t(contract.afterTrial === "end" && contract.status === "trialing" ? "shareRent.lifecycle.trialOnly" : walletLifecycleKey(contract), { date: formatUtcDateTime(contract.periodEnd, locale), hours: trialHours(contract.trialSecondsRemaining, locale) })
     : progress.pending
       ? t("account.share.activationPending")
       : progress.expired
@@ -137,7 +138,8 @@ export function RentalActions({
   onRelease,
   onTerminate,
   onViewTermination,
-
+  onReportIssue,
+  onAfterTrial,
 }: {
   subscription: ShareMarketSubscription;
   t: Translate;
@@ -145,7 +147,9 @@ export function RentalActions({
   onRelease?: () => void;
   onTerminate?: () => void;
   onViewTermination?: () => void;
-
+  /** The seat forbids early termination; only a service problem can end it. */
+  onReportIssue?: () => void;
+  onAfterTrial?: () => void;
 }) {
 
   const releaseMode = rentalReleaseMode(subscription);
@@ -153,8 +157,14 @@ export function RentalActions({
     && subscription.status !== "revoke_pending" && subscription.status !== "revoke_failed"
     ? shareTerminationBlockedMessage(subscription.terminationBlockedReason)
     : null;
+  const afterTrial = shareAfterTrialSwitch(subscription);
   return (
     <div className="flex shrink-0 flex-wrap items-center justify-end gap-1">
+      {afterTrial && onAfterTrial ? (
+        <Button size="sm" variant={afterTrial === "continue" ? "primary" : "ghost"} className="h-7 min-w-0 px-2 text-xs" isDisabled={busy} onPress={onAfterTrial}>
+          {t(afterTrial === "continue" ? "shareRent.afterTrial.continueShort" : "shareRent.afterTrial.endShort")}
+        </Button>
+      ) : null}
 
       {releaseMode && onRelease ? (
         <Button size="sm" variant="outline" className="h-7 min-w-0 px-2 text-xs" isDisabled={busy} onClick={onRelease}>
@@ -163,6 +173,9 @@ export function RentalActions({
         </Button>
       ) : null}
       {subscription.canTerminateImmediately && onTerminate ? <Button size="sm" variant="danger" className="h-7 min-w-0 px-2 text-xs" isDisabled={busy} onPress={onTerminate}>{t("shareTermination.immediate")}</Button> : null}
+      {!subscription.canTerminateImmediately && subscription.canReportServiceIssue && !subscription.terminationId && onReportIssue
+        ? <Button size="sm" variant="outline" className="h-7 min-w-0 px-2 text-xs" isDisabled={busy} onPress={onReportIssue}>{t("shareRent.reportIssue")}</Button>
+        : null}
       {subscription.terminationId && onViewTermination ? <Button size="sm" variant="outline" className="h-7 min-w-0 px-2 text-xs" onPress={onViewTermination}>{t("shareTermination.view")}</Button> : null}
       {blockedMessage ? <p className="basis-full text-xs leading-5 text-muted-foreground">{t(blockedMessage)}</p> : null}
     </div>
@@ -185,12 +198,13 @@ export function useShareMarketRentalActions(onChanged: () => Promise<void> | voi
   const [action, setAction] = React.useState<PendingAction | null>(null);
   const [error, setError] = React.useState("");
   const [termination, setTermination] = React.useState<ShareTerminationSelection | null>(null);
+  const [afterTrial, setAfterTrial] = React.useState<ShareAfterTrialTarget | null>(null);
   const actor = useQuotaActor();
   const generation = React.useRef(0);
   const flight = React.useRef(false);
   React.useEffect(() => {
     ++generation.current; flight.current = false;
-    setTermination(null); setAction(null); setBusyId(""); setError("");
+    setTermination(null); setAfterTrial(null); setAction(null); setBusyId(""); setError("");
     return () => { ++generation.current; };
   }, [actor, session?.user?.id]);
 
@@ -218,6 +232,12 @@ export function useShareMarketRentalActions(onChanged: () => Promise<void> | voi
   const rowActions = (subscription: ShareMarketSubscription) => ({
     onTerminate: subscription.canTerminateImmediately ? () => setTermination({ subscriptionId: subscription.id }) : undefined,
     onViewTermination: subscription.terminationId ? () => setTermination({ id: subscription.terminationId! }) : undefined,
+    onReportIssue: !subscription.canTerminateImmediately && subscription.canReportServiceIssue && !subscription.terminationId
+      ? () => setTermination({ subscriptionId: subscription.id })
+      : undefined,
+    onAfterTrial: shareAfterTrialSwitch(subscription)
+      ? () => setAfterTrial({ subscription, to: shareAfterTrialSwitch(subscription)!, price: rentalPrice(subscription, locale, t) })
+      : undefined,
     onRelease: rentalReleaseMode(subscription)
       ? () => setAction({
         subscriptionId: subscription.id,
@@ -247,6 +267,7 @@ export function useShareMarketRentalActions(onChanged: () => Promise<void> | voi
       onOpenChange={(open) => !open && !busyId && setAction(null)}
     />
     <ShareTerminationDialog selection={termination} onClose={() => setTermination(null)} onChanged={() => { void onChanged(); }} />
+    <ShareAfterTrialDialog target={afterTrial} onClose={() => setAfterTrial(null)} onChanged={onChanged} />
     </>
   );
 
@@ -256,6 +277,6 @@ export function useShareMarketRentalActions(onChanged: () => Promise<void> | voi
     setError,
     rowActions,
     dialog,
-    interactionActive: !!busyId || !!action || !!termination,
+    interactionActive: !!busyId || !!action || !!termination || !!afterTrial,
   };
 }

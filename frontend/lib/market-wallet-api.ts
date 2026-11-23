@@ -235,6 +235,22 @@ export async function updateMarketWalletRenewal(contractId: string, autoRenew: b
   );
 }
 
+/**
+ * Switches a running Share trial between trial only (`end`: the seat returns
+ * when the trial ends, no balance needed) and continuing as a paid rental
+ * (`continue`: needs the first period's balance now, charged when the trial
+ * ends). A shortfall fails with `MARKET_WALLET_REQUIRED`.
+ */
+export async function updateShareAfterTrial(contractId: string, afterTrial: "continue" | "end", expected: "continue" | "end") {
+  return parseJson<import("./types").WalletLifecycle>(
+    await authFetch(`/v1/market-wallet/contracts/${encodeURIComponent(contractId)}/after-trial`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ afterTrial, expected }),
+    }),
+  );
+}
+
 export type MarketServiceDispute = {
   id: string;
   contractId: string;

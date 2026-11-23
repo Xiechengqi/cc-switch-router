@@ -32,6 +32,16 @@ Server 的未完成请求若跨进程重启，用量无法从权威日志恢复�
 
 旧租约释放后才发现未知试用用量时，隔离整个 eligibility scope，包括同 scope 已经开始的后续租约；不能只修改已结束的旧合同，而让新合同被扣款却无法使用。
 
+## Share 仅试用
+
+付费 Share 车位在买家仍有剩余试用时，租用弹窗默认选「仅试用」（迁移 122：`market_platform_contracts.after_trial='end'`）。仅试用：
+
+- 不检查、不预留钱包余额，也不计入后续应付款（`due_funding_claims_tx` 排除尚未开始付费的仅试用合同）；不能同时开启自动续费。
+- 试用耗尽时不进入 `activating`，而是 `revoking`／合同 `ending`，按原撤权链路回收车位，不扣款；结束通知原因为 `trial_completed`（“试用已结束，未扣费”）。
+- 每个买家最多同时 3 个进行中的仅试用租约（`SHARE_TRIAL_ONLY_LIMIT`）。买家已无剩余试用时拒绝（`SHARE_TRIAL_ONLY_UNAVAILABLE`）。
+- 试用期间（合同 `pending_activation`／`trialing`、phase 为 `trial`）可经 `PUT /v1/market-wallet/contracts/:id/after-trial` 切换：改为继续租用时按首期价款检查余额（不足返回 `MARKET_WALLET_REQUIRED` 及缺口，前端就地充值）；改回仅试用会关闭自动续费。试用结束后不可再改（`SHARE_TRIAL_ENDED`）。
+- 一次性试用预算与普通租用共用，仅试用不额外发放、也不重置 scope。
+
 ## 升级与验收
 
 新 Share 试用要求 `Share Contract v9`＋`marketTrialV1` 显式协商。普通未协商 descriptor 仍为 v7，市场整体最低版本仍 v5；旧 Server 的免费／关闭试用报价不受影响，真正试用报价明确提示升级，不降级成周期额度。

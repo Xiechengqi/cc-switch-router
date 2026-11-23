@@ -116,8 +116,7 @@ function ClientShareMarketSession({ children, actor, userId, onChanged }: {
     await onChanged();
   };
   const rentals = useShareMarketRentalActions(changed);
-  const checkout = useShareSeatCheckout({ onChanged: changed, onAccessRequired: (item, eligibility) => setAccess({ ...item, eligibility }),
-    returnTo: item => clientShareHref(item.listing.shareId, item.seat.id) });
+  const checkout = useShareSeatCheckout({ onChanged: changed, onAccessRequired: (item, eligibility) => setAccess({ ...item, eligibility }) });
   const blocked = checkout.interactionActive || rentals.interactionActive || !!access || passwordSettingsOpen || loginWaiting;
 
   React.useEffect(() => {

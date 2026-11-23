@@ -151,14 +151,56 @@ export function safeMarketReturnPath(raw: string | null): string | null {
   }
 }
 
+/** Fixed top-up range in US cents; the server enforces the same rule. */
+export const MIN_TOPUP_MINOR = 500;
+export const MAX_TOPUP_MINOR = 100_000;
+
+/** A shortfall in ledger units, rounded up to whole cents. */
+export function shortfallMinor(shortfallUnits: string): number {
+  const shortfall = BigInt(shortfallUnits);
+  if (shortfall <= 0n) return 0;
+  const minor = (shortfall + 86_399n) / 86_400n;
+  return minor > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(minor);
+}
+
+/**
+ * The top-up amount (dollars, two decimals) to suggest for a shortfall: the
+ * shortfall rounded up to cents, but never below the fixed minimum top-up.
+ */
+export function suggestedTopupAmount(shortfallUnits: string): string | null {
+  const minor = shortfallMinor(shortfallUnits);
+  if (minor <= 0) return null;
+  const capped = Math.min(MAX_TOPUP_MINOR, Math.max(MIN_TOPUP_MINOR, minor));
+  return (capped / 100).toFixed(2);
+}
+
+/**
+ * Ledger units shown as whole cents (`$0.91`), rounding up — for amounts a
+ * person needs to pay or still lacks. Exact amounts belong in the ledger.
+ */
+export function formatUnitsCentsUp(raw: string, currencySymbol = "$", locale = "en-US"): string {
+  const units = BigInt(raw);
+  const negative = units < 0n;
+  const absolute = negative ? -units : units;
+  const cents = (absolute + 86_399n) / 86_400n;
+  const whole = cents / 100n;
+  return `${negative ? "−" : ""}${currencySymbol}${whole.toLocaleString(locale)}.${(cents % 100n).toString().padStart(2, "0")}`;
+}
+
+/** Ledger units shown as whole cents, rounding down — for balances a person has. */
+export function formatUnitsCentsDown(raw: string, currencySymbol = "$", locale = "en-US"): string {
+  const units = BigInt(raw);
+  const negative = units < 0n;
+  const absolute = negative ? -units : units;
+  const cents = negative ? (absolute + 86_399n) / 86_400n : absolute / 86_400n;
+  const whole = cents / 100n;
+  return `${negative ? "−" : ""}${currencySymbol}${whole.toLocaleString(locale)}.${(cents % 100n).toString().padStart(2, "0")}`;
+}
+
 export function walletTopupHref(shortfallUnits: string, returnTo: string): string {
   const params = new URLSearchParams();
-  const shortfall = BigInt(shortfallUnits);
-  if (shortfall > 0n) {
-    const minor = (shortfall + 86_399n) / 86_400n;
-    const capped = minor < 100n ? 100n : minor > 100_000n ? 100_000n : minor;
-    params.set("amount", `${capped / 100n}.${(capped % 100n).toString().padStart(2, "0")}`);
-  }
+  const amount = suggestedTopupAmount(shortfallUnits);
+  if (amount) params.set("amount", amount);
   const path = safeMarketReturnPath(returnTo);
   if (path) params.set("returnTo", path);
   const query = params.toString();

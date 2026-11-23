@@ -869,6 +869,17 @@ fn render(item: &Claimed, dashboard: &str) -> (String, String) {
             ),
         );
     }
+    if item.event_kind == "contract_terminated"
+        && item.payload.get("reason").and_then(Value::as_str) == Some("trial_completed")
+    {
+        return (
+            "试用已结束 / Trial ended".into(),
+            format!(
+                "仅试用的 Share 车位已随试用结束自动退租，未扣费。\nYour trial-only Share rental ended with its trial. Nothing was charged.\n\n{}/share-market/",
+                dashboard.trim_end_matches('/')
+            ),
+        );
+    }
     if item.event_kind == "earnings_converted" {
         let id = item
             .payload

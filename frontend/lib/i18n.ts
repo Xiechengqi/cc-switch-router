@@ -28,6 +28,8 @@ import { shareModelPriceMessagesEn, shareModelPriceMessagesZh } from "@/lib/shar
 import { providerRankMessagesEn, providerRankMessagesZh } from "@/lib/provider-rank-messages";
 import { clientShareMessagesEn, clientShareMessagesZh } from "@/lib/client-share-messages";
 import { shareMeteringMessagesEn, shareMeteringMessagesZh } from "@/lib/share-metering-messages";
+import { shareRentMessagesEn, shareRentMessagesZh } from "@/lib/share-rent-messages";
+import { shareSeatTermsMessagesEn, shareSeatTermsMessagesZh } from "@/lib/share-seat-terms-messages";
 import { marketNotificationCopyEn, marketNotificationCopyZh } from "@/lib/market-notification-copy";
 
 export const LOCALE_STORAGE_KEY = "cc_switch_router_locale_v1";
@@ -66,6 +68,8 @@ export const messages = {
     "quota.buddy.unavailable": "Official usage is temporarily unavailable",
 
     ...clientShareMessagesEn,
+    ...shareRentMessagesEn,
+    ...shareSeatTermsMessagesEn,
     ...rentalAuditMessagesEn,
     ...clientRentalsMessagesEn,
     ...notificationCenterMessagesEn,
@@ -3644,6 +3648,8 @@ export const messages = {
     "quota.buddy.unavailable": "官方用量暂不可用",
 
     ...clientShareMessagesZh,
+    ...shareRentMessagesZh,
+    ...shareSeatTermsMessagesZh,
     ...rentalAuditMessagesZh,
     ...clientRentalsMessagesZh,
     ...notificationCenterMessagesZh,

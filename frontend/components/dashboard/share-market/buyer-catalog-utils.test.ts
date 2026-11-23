@@ -5,8 +5,6 @@ import test from "node:test";
 import {
   catalogNeedsRuntimeSync,
   catalogSeatPreview,
-  catalogSeatSubscription,
-  catalogSeatTarget,
   filterMarketListings,
   filterMergedCatalogListings,
   initialCatalogSeat,
@@ -23,7 +21,6 @@ import {
   paginateListings,
   preserveCatalogSeat,
   rentedShareIdsFromSubscriptions,
-  showRentQuoteCountdown,
   sortCatalogListings,
   sortMergedCatalogListings} from "./buyer-catalog-utils";
 import {
@@ -55,13 +52,6 @@ test("catalog runtime sync polling only activates for stale runtime evidence", (
   assert.equal(catalogNeedsRuntimeSync([{ serviceBlockReason: "runtime_stale" }]), true);
 });
 
-test("rent quote countdown stays quiet until action is useful", () => {
-  assert.equal(showRentQuoteCountdown(false, 90), false);
-  assert.equal(showRentQuoteCountdown(false, 31), false);
-  assert.equal(showRentQuoteCountdown(false, 30), true);
-  assert.equal(showRentQuoteCountdown(true, 90), true);
-});
-
 test("retired prepaid subscription states do not revive an old status label", () => {
   assert.equal(
     subscriptionStatusKey("active_prepaid"),
@@ -78,42 +68,7 @@ test("a selected seat is preserved by id without falling back", () => {
   assert.equal(preserveCatalogSeat([seat("a"), seat("b")], "b")?.id, "b");
 });
 
-test("seat details resolve the exact clicked seat against refreshed listings, including occupied seats", () => {
-  const idle = { ...seat("idle"), cyclePriceMinor: 100 } as ShareMarketSeat;
-  const occupied = { ...seat("busy", "occupied"), cyclePriceMinor: 200 } as ShareMarketSeat;
-  const listing = { id: "listing", shareId: "share", seats: [idle, occupied] } as ShareMarketListing;
-  const selection = { shareId: "share", seatId: "busy" };
-  assert.equal(catalogSeatTarget([listing], selection)?.seat, occupied);
-  const updated = { ...occupied, cyclePriceMinor: 300 };
-  const refreshed = { ...listing, seats: [idle, updated] };
-  assert.equal(catalogSeatTarget([refreshed], selection)?.listing, refreshed);
-  assert.equal(catalogSeatTarget([refreshed], selection)?.seat, updated);
-  assert.equal(catalogSeatTarget([{ ...listing, seats: [idle] }], selection), null);
-  assert.equal(catalogSeatTarget([{ ...listing, shareId: "other" }], selection), null);
-  assert.equal(catalogSeatTarget([], selection), null);
-  assert.equal(catalogSeatTarget([listing], null), null);
-});
-
-test("seat details expose personal rental actions only for that exact live seat and share", () => {
-  const subscription = { id: "rental", shareId: "share", seatId: "busy", status: "active_postpaid" } as ShareMarketSubscription;
-  const selection = { shareId: "share", seatId: "busy" };
-  const unrelated = [
-    { ...subscription, shareId: "other" },
-    { ...subscription, seatId: "other" },
-    { ...subscription, status: "released" },
-    { ...subscription, status: "grant_failed" },
-  ];
-  assert.equal(catalogSeatSubscription(unrelated, selection), undefined);
-  assert.equal(catalogSeatSubscription([...unrelated, subscription], selection), subscription);
-  assert.equal(catalogSeatSubscription([subscription], { ...selection, seatId: "idle" }), undefined);
-  assert.equal(catalogSeatSubscription([subscription], null), undefined);
-  for (const status of ["grant_pending", "revoke_pending", "revoke_failed", "billing_suspended"]) {
-    const pending = { ...subscription, status };
-    assert.equal(catalogSeatSubscription([pending], selection), pending);
-  }
-});
-
-test("catalog wiring separates seat dialogs from Share drawers and isolates nested Rent activation", () => {
+test("catalog seat rows rent free seats directly, open the drawer otherwise, and isolate nested Rent activation", () => {
   const source = (file: string) => readFileSync(new URL(file, import.meta.url), "utf8");
   const row = source("./market-share-card.tsx").split("export function CatalogSeatPreviewList")[0];
   assert.match(row, /data-no-card-open=\{interactive \|\| undefined\}/);
@@ -124,15 +79,12 @@ test("catalog wiring separates seat dialogs from Share drawers and isolates nest
   const catalog = source("./buyer-catalog.tsx");
   assert.match(catalog, /onOpen=\{\(seat\) => seat \? onOpenSeat\(seat\) : onOpen\(\)\}/);
   assert.match(catalog, /onOpenSeat=\{\(seat\) => openSeat\(listing, seat\)\}/);
-  assert.match(catalog, /setSelected\(null\);\s*setSeatSelection\(\{ shareId: listing\.shareId, seatId: seat\.id \}\)/);
+  assert.match(catalog, /if \(!listing\.isOwner && isSeatIdle\(seat\)\) return void triggerSeat\(\{ listing, seat \}\);\s*setSelected\(\{ listing, seat \}\)/);
   assert.match(catalog, /const checkout = useShareSeatCheckout\(/);
-  assert.match(catalog, /onPresented: \(\) => \{ setSelected\(null\); setSeatSelection\(null\); \}/);
+  assert.match(catalog, /onPresented: \(\) => setSelected\(null\)/);
   assert.match(catalog, /await checkout.open\(item\)/);
-  assert.match(catalog, /<CatalogSeatDialog\s+target=\{checkout.interactionActive \|\| accessTarget \? null : seatTarget\}/);
-  assert.match(catalog, /const pausePolling = !!seatSelection \|\|/);
-  const dialog = source("./catalog-seat-dialog.tsx");
-  assert.match(dialog, /const terms = subscription \?\? seat/);
-  assert.match(dialog, /data-catalog-seat-details=\{target\.seat\.id\}/);
+  assert.doesNotMatch(catalog, /CatalogSeatDialog|seatSelection/);
+  assert.match(catalog, /const pausePolling = checkout.interactionActive \|\|/);
 });
 
 test("compact cards preview at most two idle seats", () => {

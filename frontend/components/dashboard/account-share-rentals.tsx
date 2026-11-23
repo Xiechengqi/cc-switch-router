@@ -166,6 +166,8 @@ function RentalDetail({
   onRelease,
   onTerminate,
   onViewTermination,
+  onReportIssue,
+  onAfterTrial,
   onChanged,
 }: {
   subscription: ShareMarketSubscription;
@@ -173,6 +175,8 @@ function RentalDetail({
   onRelease?: () => void;
   onTerminate?: () => void;
   onViewTermination?: () => void;
+  onReportIssue?: () => void;
+  onAfterTrial?: () => void;
   onChanged: () => Promise<void> | void;
 }) {
   const { locale, t } = useLocaleText();
@@ -205,12 +209,12 @@ function RentalDetail({
         { label: t("account.share.updated"), value: formatDateTime(subscription.updatedAt, locale) },
       ]} />
       <StatusDetails subscription={subscription} t={t} />
-      {subscription.status !== "released" && subscription.walletContract?.id && subscription.cyclePriceMinor != null ? (
+      {subscription.status !== "released" && subscription.walletContract?.id && subscription.cyclePriceMinor != null && subscription.walletContract.afterTrial !== "end" ? (
         <MarketWalletRenewalCard contractId={subscription.walletContract.id} refreshKey={subscription.updatedAt} compact onChanged={onChanged} />
       ) : null}
       {subscription.status !== "released" || subscription.openWalletDispute || subscription.terminationId ? <MarketServiceDisputeControl contractId={subscription.walletContractId} initiallyOpen={subscription.openWalletDispute} onChanged={onChanged} /> : null}
       <div className="flex flex-wrap items-center justify-end gap-2">
-        <RentalActions subscription={subscription} t={t} busy={busy} onRelease={onRelease} onTerminate={onTerminate} onViewTermination={onViewTermination} />
+        <RentalActions subscription={subscription} t={t} busy={busy} onRelease={onRelease} onTerminate={onTerminate} onViewTermination={onViewTermination} onReportIssue={onReportIssue} onAfterTrial={onAfterTrial} />
         <Link href={shareMarketHref({ shareId: subscription.shareId })} className={LINK_CLASS}>
           {t("account.share.manageInMarket")}<ArrowUpRight className="h-3.5 w-3.5" aria-hidden />
         </Link>

@@ -338,3 +338,40 @@ function CopyButton({
 }
 
 export { ROUTER_OPEN_LOGIN_EVENT };
+
+/**
+ * Base URL and API Key for one Share, without the dialog chrome. Used right
+ * after renting a seat so the buyer can start immediately.
+ */
+export function ShareConnectCredentials({ subdomain }: { subdomain: string }) {
+  const { t } = useLocaleText();
+  const { session, loading } = useAuth();
+  const authenticated = !!session?.authenticated;
+  const credentials = useShareConnectionToken(!loading && authenticated, session?.user?.id, session?.user?.email);
+  const [baseUrl, setBaseUrl] = React.useState("");
+  React.useEffect(() => {
+    setBaseUrl(subdomain && window.location.host ? `https://${subdomain}.${window.location.host}` : "");
+  }, [subdomain]);
+  const token = credentials.value?.token;
+  const apiTokenPlain = credentials.value?.apiToken || "";
+  const tokenBusy = credentials.loading || (authenticated && !credentials.matchesActor);
+  const tokenError = credentials.error ? t("dashboard.connectDialog.localTest.keyUnavailable") : "";
+  const apiKeyDisplay = apiTokenPlain || (token?.prefix ? `${token.prefix}${"•".repeat(16)}` : "");
+  const requestLogin = () => window.dispatchEvent(new CustomEvent(ROUTER_OPEN_LOGIN_EVENT));
+  return (
+    <div className="grid gap-3">
+      <BaseUrlRow t={t} baseUrl={baseUrl} />
+      <ApiKeyRow
+        t={t}
+        state={loading || (authenticated && tokenBusy) ? "loading" : !authenticated ? "unauth" : tokenError ? "error" : "revealable"}
+        apiKeyDisplay={apiKeyDisplay}
+        apiKeyIsPlaintext={!!apiTokenPlain}
+        tokenError={tokenError}
+        requestLogin={requestLogin}
+      />
+      {credentials.error ? (
+        <Button variant="ghost" size="sm" className="justify-self-start" onPress={credentials.retry}>{t("common.retry")}</Button>
+      ) : null}
+    </div>
+  );
+}

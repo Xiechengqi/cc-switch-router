@@ -20,6 +20,8 @@ import { useClientChat } from "@/components/chat/client-chat";
 import { CompactSelect } from "@/components/common/compact-select";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { SegmentedControl } from "@/components/common/segmented-control";
+import { SeatTerminationFields } from "@/components/dashboard/share-market/seat-termination-fields";
+import { seatTerminationDraft, seatTerminationRateBps, type SeatTerminationDraft } from "@/lib/share-seat-terms";
 import {
   PaidOfferReadinessNotice,
   usePaidOfferReadiness,
@@ -128,8 +130,10 @@ type SeatDraft = {
   serviceDurationMode: "fixed" | "permanent";
   serviceDurationDays: string;
   serviceDurationTouched: boolean;
+  /** Paid seats only: how a buyer may end a paid period early. */
+  termination: SeatTerminationDraft;
 };
-type SeatDraftField = "parallelLimit" | "tokenLimit" | "valueLimit" | "price" | "trialHours" | "trialTokenLimit" | "trialValueLimit" | "serviceDurationDays";
+type SeatDraftField = "parallelLimit" | "tokenLimit" | "valueLimit" | "price" | "trialHours" | "trialTokenLimit" | "trialValueLimit" | "serviceDurationDays" | "terminationRate";
 type SeatDraftValidation = {
   message: string;
   field?: SeatDraftField;
@@ -178,6 +182,7 @@ function emptySeat(periods: ShareTokenPeriod[] = TOKEN_PERIODS): SeatDraft {
     serviceDurationMode: "fixed",
     serviceDurationDays: "1",
     serviceDurationTouched: false,
+    termination: seatTerminationDraft(),
   };
 }
 
@@ -202,6 +207,7 @@ function seatDraft(seat: ShareMarketSeat): SeatDraft {
     serviceDurationMode: !seat.isFree || seat.serviceDurationDays == null ? "permanent" : "fixed",
     serviceDurationDays: String(seat.serviceDurationDays ?? 1),
     serviceDurationTouched: true,
+    termination: seatTerminationDraft(seat),
   };
 }
 
@@ -262,6 +268,17 @@ function draftHasQuota(draft: SeatDraft) {
 }
 
 function normalizedSeat(draft: SeatDraft, t: TFn): ShareMarketSeatInput {
+  const seat = normalizedSeatTerms(draft, t);
+  if (!draft.paid) return seat;
+  const forbidden = draft.termination.earlyTermination === "forbidden";
+  const terminationRateBps = forbidden ? null : seatTerminationRateBps(draft.termination.terminationRate);
+  if (terminationRateBps === undefined) {
+    throw new SeatDraftError("terminationRate", t("shareSeatTerms.rateInvalid"));
+  }
+  return { ...seat, earlyTermination: draft.termination.earlyTermination, terminationRateBps };
+}
+
+function normalizedSeatTerms(draft: SeatDraft, t: TFn): ShareMarketSeatInput {
   const parallelLimit = positiveOptional(
     draft.parallelLimit,
     t("shareMarket.parallel"),
@@ -542,6 +559,14 @@ function SeatFields({
           {needsValueTrialUpgrade ? <p role="alert" className="text-xs text-danger">{t("shareMarket.quota.usdTrialUpgrade")}</p> : null}
           {trialPolicy ? <p className="text-xs text-muted-foreground">{t(usd ? "marketTrial.valueDefaults" : "marketTrial.defaults", { hours: trialPolicy.shareHours, tokens: trialPolicy.shareTokens > 0 ? formatTokenMillions(trialPolicy.shareTokens, locale) : t("marketTrial.timeOnly"), amount: trialPolicy.shareValueUsdMicros !== "0" ? formatUsdLimit(trialPolicy.shareValueUsdMicros) : t("marketTrial.timeOnly") })}</p> : null}
           {trialError ? <p role="alert" className="text-xs text-danger">{trialError}</p> : null}
+          <SeatTerminationFields
+            value={draft.termination}
+            disabled={disabled}
+            invalid={invalid("terminationRate")}
+            describedBy={describedBy("terminationRate")}
+            fieldClassName={fieldClass(invalid("terminationRate"))}
+            onChange={(termination) => patch({ termination })}
+          />
         </>
       ) : null}
       {!draft.paid ? <div className="grid gap-2">

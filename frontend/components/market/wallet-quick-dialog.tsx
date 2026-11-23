@@ -10,75 +10,23 @@ import * as React from "react";
 import Link from "next/link";
 import { Button, Modal } from "@heroui/react";
 import { ArrowUpRight, Loader2, WalletCards } from "lucide-react";
-import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { WalletTopupForm } from "@/components/market/wallet-topup-form";
+import { useWalletSnapshot } from "@/components/market/in-place-topup";
 import { DASHBOARD_ACCOUNT_WALLET_PATH } from "@/lib/dashboard-nav";
-import { notifyMarketBalanceChanged, subscribeMarketBalanceChanged } from "@/lib/market-balance-events";
-import {
-  getMarketWallet,
-  getMarketWalletTopups,
-  type MarketWallet,
-  type MarketWalletTopup,
-} from "@/lib/market-wallet-api";
 import { formatWalletUnits, formatWalletUnitsAsCny, safeMarketReturnPath } from "@/lib/market-wallet-money";
 
 
 export function WalletQuickDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
-  const { session } = useAuth();
   const { locale, t, displayCurrency, fxRateFresh, fxRateMicros } = useLocaleText();
-  const actor = session?.authenticated ? session.user?.id : undefined;
-  const [snapshot, setSnapshot] = React.useState<{ actor: string; wallet: MarketWallet; topups: MarketWalletTopup[] } | null>(null);
-  const [error, setError] = React.useState("");
+  const { actor, current, error, ready, load, reload, addOrder } = useWalletSnapshot(open);
   const [busy, setBusy] = React.useState(false);
-  const [ready, setReady] = React.useState(false);
   const [returnPath, setReturnPath] = React.useState<string | null>(null);
-  const loadVersion = React.useRef(0);
-
-  const load = React.useCallback(async () => {
-    if (!actor) return;
-    const version = ++loadVersion.current;
-    let wallet: MarketWallet;
-    let topups: Awaited<ReturnType<typeof getMarketWalletTopups>>;
-    try {
-      [wallet, topups] = await Promise.all([getMarketWallet(), getMarketWalletTopups()]);
-    } catch (cause) {
-      if (version === loadVersion.current) { setReady(false); setError(cause instanceof Error ? cause.message : String(cause)); }
-      return;
-    }
-    if (version !== loadVersion.current) return;
-    setSnapshot((current) => ({
-      actor,
-      wallet,
-      // Keep orders created in this dialog that the first page may not list yet.
-      topups: current?.actor === actor
-        ? [...topups.items, ...current.topups.filter((order) => !topups.items.some((item) => item.id === order.id))]
-        : topups.items,
-    }));
-    setError("");
-    setReady(true);
-  }, [actor]);
 
   React.useEffect(() => {
-    if (!open) return;
-    // Reopening is a new read barrier: cached history must not authorize a payment.
-    setReady(false);
-    setReturnPath(safeMarketReturnPath(`${window.location.pathname}${window.location.search}`));
-    const refresh = () => { if (document.visibilityState === "visible") void load(); };
-    refresh();
-    const timer = window.setInterval(refresh, 30_000);
-    window.addEventListener("focus", refresh);
-    document.addEventListener("visibilitychange", refresh);
-    const off = actor ? subscribeMarketBalanceChanged(actor, refresh) : () => {};
-    return () => { loadVersion.current++; window.clearInterval(timer); off(); window.removeEventListener("focus", refresh); document.removeEventListener("visibilitychange", refresh); };
-  }, [actor, load, open]);
+    if (open) setReturnPath(safeMarketReturnPath(`${window.location.pathname}${window.location.search}`));
+  }, [open]);
 
-  const reload = React.useCallback(async () => {
-    if (actor) notifyMarketBalanceChanged(actor);
-    await load();
-  }, [actor, load]);
-
-  const current = snapshot?.actor === actor ? snapshot : null;
   const amount = current
     ? displayCurrency === "CNY" && fxRateFresh
       ? formatWalletUnitsAsCny(current.wallet.availableUnits, fxRateMicros, locale)
@@ -109,7 +57,7 @@ export function WalletQuickDialog({ open, onOpenChange }: { open: boolean; onOpe
             {error ? (
               <div className="grid justify-items-start gap-2">
                 <p role="alert" className="text-sm text-destructive">{t("walletQuick.unavailable")} {error}</p>
-                <Button size="sm" variant="outline" onPress={() => void load().catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)))}>{t("common.retry")}</Button>
+                <Button size="sm" variant="outline" onPress={() => void load()}>{t("common.retry")}</Button>
               </div>
             ) : null}
             {current && actor ? (
@@ -122,9 +70,7 @@ export function WalletQuickDialog({ open, onOpenChange }: { open: boolean; onOpe
                   returnPath={returnPath}
                   idPrefix="wallet-quick-topup"
                   onBusyChange={setBusy}
-                  onOrderCreated={(order) => { loadVersion.current++; setSnapshot((value) => value && value.actor === actor
-                    ? { ...value, topups: [order, ...value.topups.filter((item) => item.id !== order.id)] }
-                    : value); }}
+                  onOrderCreated={addOrder}
                   onReload={reload}
                 />
                 <p className="text-xs leading-5 text-muted-foreground">{t("walletPage.topupNote")}</p>

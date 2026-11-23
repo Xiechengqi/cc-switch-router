@@ -54,6 +54,10 @@ export function shareMarketMutationError(reason: unknown, t: MarketTranslate) {
     share_market_seat_not_reopenable: "shareMarket.error.seatNotReopenable",
     share_market_offer_changed: "shareMarket.error.offerChanged",
     share_market_value_quota_unavailable: "shareMarket.error.valueQuotaUnavailable",
+    SHARE_TRIAL_ONLY_LIMIT: "shareRent.error.trialOnlyLimit",
+    SHARE_TRIAL_ONLY_UNAVAILABLE: "shareRent.error.trialOnlyUnavailable",
+    SHARE_EARLY_TERMINATION_FORBIDDEN: "shareRent.error.earlyTerminationForbidden",
+    SHARE_TRIAL_ENDED: "shareRent.error.trialEnded",
   };
   const codeKey = reason.code ? coded[reason.code] : undefined;
   if (codeKey) return t(codeKey);

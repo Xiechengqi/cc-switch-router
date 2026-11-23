@@ -26,7 +26,7 @@ export const shareTerminationMessagesEn = {
   "shareTermination.retry": "Retry original access revocation", "shareTermination.deadline": "Response deadline", "shareTermination.timeout": "Deadline reached; automatic waiver is being processed.",
   "shareTermination.chat": "Discuss in chat", "shareTermination.chatHelp": "Use the chat to discuss evidence. Chat messages do not count as a formal response or extend the deadline.",
   "shareTermination.history": "Settlement history", "shareTermination.unavailable": "Termination status unavailable",
-  "shareTermination.policyTitle": "Share rental termination compensation", "shareTermination.policyHelp": "Independent of Client Market. Default 10%. Applies to new accepted quotes only; existing paid periods and automatic renewals retain their accepted terms.",
+  "shareTermination.policyTitle": "Platform default early-ending compensation (used when a seller sets none)", "shareTermination.policyHelp": "Independent of Client Market. Default 10%. Sellers can set their own rate per seat (0–50%) or forbid ending early; this rate applies only to seats that set none. Changes apply to new accepted quotes only; existing paid periods and automatic renewals keep their accepted terms.",
   "marketNotifications.kind.share_termination_updated": "Share rental termination updated",
   "shareTermination.income": "Share termination compensation",
   "shareTermination.expired": "Preview expired. Reload before confirming.",
@@ -48,6 +48,7 @@ export const shareTerminationMessagesEn = {
   "shareTermination.blocked.lifetimeArchiveIncomplete": "Lifetime-quota usage before this period is not fully archived. Immediate settlement is unavailable.",
   "shareTermination.blocked.paidPeriodExpired": "This paid period has ended. Refresh the rental status.",
   "shareTermination.blocked.paidPeriodRollingOver": "The next paid period is being confirmed. Refresh shortly to end the rental.",
+  "shareTermination.blocked.earlyTerminationForbidden": "This seat can't be ended early. Turn off renewal and it ends with the paid period. If the service is broken, report it instead.",
 } as const;
 export const shareTerminationMessagesZh: Record<keyof typeof shareTerminationMessagesEn, string> = {
   "shareTermination.immediate": "立即退租",
@@ -76,7 +77,7 @@ export const shareTerminationMessagesZh: Record<keyof typeof shareTerminationMes
   "shareTermination.retry": "重试撤销原车位授权", "shareTermination.deadline": "处理截止时间", "shareTermination.timeout": "已到截止时间，正在自动免除补偿。",
   "shareTermination.chat": "前往聊天室沟通", "shareTermination.chatHelp": "可到聊天室沟通证据；聊天不算正式处理，也不会延长截止时间。",
   "shareTermination.history": "结算记录", "shareTermination.unavailable": "退租状态暂不可用",
-  "shareTermination.policyTitle": "Share Market 退租补偿", "shareTermination.policyHelp": "独立于 Client Market，默认 10%。仅适用于新接受的报价；已有付费周期及自动续租保留签订时的条款。",
+  "shareTermination.policyTitle": "平台默认退租补偿比例（商家未自定义时使用）", "shareTermination.policyHelp": "独立于 Client Market，默认 10%。商家可按车位自定义补偿比例（0–50%）或不允许中途退租；本比例只用于未自定义的车位。仅适用于新接受的报价；已有付费周期及自动续租保留签订时的条款。",
   "marketNotifications.kind.share_termination_updated": "Share 退租进度更新",
   "shareTermination.income": "Share 退租补偿",
   "shareTermination.expired": "预览已过期，请重新加载后确认。",
@@ -97,4 +98,5 @@ export const shareTerminationMessagesZh: Record<keyof typeof shareTerminationMes
   "shareTermination.blocked.lifetimeArchiveIncomplete": "累计额度缺少此前的完整用量归档，暂无法立即结算退租。",
   "shareTermination.blocked.paidPeriodExpired": "本付费周期已结束，请刷新租用状态。",
   "shareTermination.blocked.paidPeriodRollingOver": "正在确认下一付费周期，请稍后刷新再退租。",
+  "shareTermination.blocked.earlyTerminationForbidden": "此车位不支持中途退租。关闭续费后到期自动结束；如服务异常，请改为报告服务问题。",
 };

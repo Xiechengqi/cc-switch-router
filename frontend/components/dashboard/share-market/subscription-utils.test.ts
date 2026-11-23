@@ -9,6 +9,7 @@ import {
   partitionShareMarketSubscriptions,
   rentalReleaseMode,
   rentalShareLabel,
+  shareAfterTrialSwitch,
   sortShareMarketSubscriptions,
   subscriptionsNeedGrantPolling,
 } from "./subscription-utils";
@@ -146,4 +147,18 @@ test("active rentals group by share and ignore history", () => {
     )?.id,
     "listing-a",
   );
+});
+
+test("a running paid trial can switch between trial only and keeping the seat", () => {
+  const trial = (afterTrial: "continue" | "end", extra: Partial<NonNullable<ShareMarketSubscription["walletContract"]>> = {}) => subscription("trial", "active_postpaid", {
+    pricingModel: "prepaid_calendar_month",
+    walletContract: { id: "contract", status: "trialing", trialSecondsRemaining: 3_600, renewalPolicy: "manual", afterTrial, ...extra },
+  });
+  assert.equal(shareAfterTrialSwitch(trial("end")), "continue");
+  assert.equal(shareAfterTrialSwitch(trial("continue")), "end");
+  assert.equal(shareAfterTrialSwitch(trial("end", { status: "pending_activation" })), "continue");
+  assert.equal(shareAfterTrialSwitch(trial("end", { trialSecondsRemaining: 0 })), null);
+  assert.equal(shareAfterTrialSwitch(trial("continue", { status: "active" })), null);
+  assert.equal(shareAfterTrialSwitch(trial("end", { id: undefined })), null);
+  assert.equal(shareAfterTrialSwitch({ ...trial("end"), pricingModel: "free" }), null);
 });

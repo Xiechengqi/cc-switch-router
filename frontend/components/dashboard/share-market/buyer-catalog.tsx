@@ -34,7 +34,6 @@ import {
 } from "@/components/dashboard/share-market/market-share-card";
 import { ShareModelHealthHeatmap } from "@/components/dashboard/share-model-health-heatmap";
 import { ListingPricingCard } from "@/components/dashboard/share-market/listing-pricing-card";
-import { CatalogSeatDialog } from "@/components/dashboard/share-market/catalog-seat-dialog";
 import { drawerDialogClassName } from "@/components/dashboard/share-dashboard-utils";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import type { MessageKey } from "@/lib/i18n";
@@ -57,8 +56,6 @@ import {
 } from "@/components/dashboard/share-market/market-utils";
 import {
   catalogOwnerOptions,
-  catalogSeatSubscription,
-  catalogSeatTarget,
   filterMergedCatalogListings,
   initialCatalogSeat,
   MARKET_CATALOG_PAGE_SIZE,
@@ -68,7 +65,6 @@ import {
   preserveCatalogSeat,
   rentedShareIdsFromSubscriptions,
   sortCatalogListings,
-  type CatalogSeatSelection,
   type MarketCatalogSort,
 } from "@/components/dashboard/share-market/buyer-catalog-utils";
 import { SeatDiscountNote } from "@/components/dashboard/share-market/seat-value-quota";
@@ -131,6 +127,8 @@ type RentalCardActions = {
   onTerminate?: () => void;
   onViewTermination?: () => void;
   onRelease?: () => void;
+  onReportIssue?: () => void;
+  onAfterTrial?: () => void;
   onAcceptPrice?: () => void;
   onRejectPrice?: () => void;
 };
@@ -188,7 +186,8 @@ function ListingCard({
                 onRelease={actions?.onRelease}
                 onTerminate={actions?.onTerminate}
                 onViewTermination={actions?.onViewTermination}
-
+                onReportIssue={actions?.onReportIssue}
+                onAfterTrial={actions?.onAfterTrial}
               />
             </div>
           ) : null}
@@ -294,14 +293,13 @@ export function ShareMarketBuyerCatalog({
   const [sort, setSort] = React.useState<MarketCatalogSort>("recommended");
   const [page, setPage] = React.useState(1);
   const [selected, setSelected] = React.useState<SelectedListing | null>(null);
-  const [seatSelection, setSeatSelection] = React.useState<CatalogSeatSelection | null>(null);
   const [accessTarget, setAccessTarget] = React.useState<(SeatCard & { eligibility: MarketEligibility }) | null>(null);
   const focusedRef = React.useRef("");
   const skipPageResetRef = React.useRef(false);
   const rentals = useShareMarketRentalActions(onChanged);
   const checkout = useShareSeatCheckout({
     onChanged: async () => { setPage(1); await onChanged(); },
-    onPresented: () => { setSelected(null); setSeatSelection(null); },
+    onPresented: () => setSelected(null),
     onAccessRequired: (item, eligibility) => setAccessTarget({ ...item, eligibility }),
     restoreTarget: draft => {
       const listing = catalog.listings.find(l => l.shareId === draft.shareId);
@@ -310,7 +308,7 @@ export function ShareMarketBuyerCatalog({
     },
   });
   const { busySeatId, error, setError } = checkout;
-  const pausePolling = !!seatSelection || checkout.interactionActive || !!accessTarget || !!busySeatId || rentals.interactionActive;
+  const pausePolling = checkout.interactionActive || !!accessTarget || !!busySeatId || rentals.interactionActive;
 
   React.useEffect(() => {
     onInteractionChange?.(pausePolling);
@@ -325,13 +323,6 @@ export function ShareMarketBuyerCatalog({
     () => mergeCatalogWithRentedListings(catalog.listings, authed ? rentedListings : []),
     [authed, catalog.listings, rentedListings],
   );
-  const seatTarget = React.useMemo(
-    () => catalogSeatTarget(mergedListings, seatSelection),
-    [mergedListings, seatSelection],
-  );
-  React.useEffect(() => {
-    if (seatSelection && !seatTarget) setSeatSelection(null);
-  }, [seatSelection, seatTarget]);
   const filteredListings = React.useMemo(
     () => sortCatalogListings(
       filterMergedCatalogListings(mergedListings, {
@@ -389,19 +380,14 @@ export function ShareMarketBuyerCatalog({
     const nextPage = pageForShareId(filteredListings, focusedShareId, MARKET_CATALOG_PAGE_SIZE);
     skipPageResetRef.current = true;
     setPage(nextPage);
-    setSeatSelection(null);
     setSelected({ listing });
     window.requestAnimationFrame(() => document.getElementById(`share-market-catalog-${focusedShareId}`)?.scrollIntoView({ block: "start" }));
   }, [filteredListings, focusedShareId, mergedListings]);
 
-  const closeDetails = () => {
-    setSelected(null);
-    setSeatSelection(null);
-  };
+  const closeDetails = () => setSelected(null);
 
   const openListing = (listing: ShareMarketListing) => {
     setError("");
-    setSeatSelection(null);
     setSelected({
       listing,
       seat: initialCatalogSeat(listing.seats),
@@ -409,10 +395,12 @@ export function ShareMarketBuyerCatalog({
     void onChanged();
   };
 
+  // A free seat goes straight to checkout; any other seat opens its Share
+  // drawer with that seat chosen, where rental actions live.
   const openSeat = (listing: ShareMarketListing, seat: ShareMarketSeat) => {
     setError("");
-    setSelected(null);
-    setSeatSelection({ shareId: listing.shareId, seatId: seat.id });
+    if (!listing.isOwner && isSeatIdle(seat)) return void triggerSeat({ listing, seat });
+    setSelected({ listing, seat });
     void onChanged();
   };
 
@@ -444,13 +432,6 @@ export function ShareMarketBuyerCatalog({
     closeDetails();
     action();
   };
-  const seatSubscription = catalogSeatSubscription(subscriptions, seatSelection);
-  const seatRentalActions = seatSubscription ? rentals.rowActions(seatSubscription) : undefined;
-  const detailSeatAction = seatTarget
-    ? !seatTarget.listing.isOwner && !isSeatIdle(seatTarget.seat)
-      ? "unavailable"
-      : seatAction(seatTarget.listing, seatTarget.seat, subscriptions, authed)
-    : "unavailable";
   const selectedAction = selected?.seat
     ? seatAction(selected.listing, selected.seat, subscriptions, authed)
     : "unavailable";
@@ -602,6 +583,8 @@ export function ShareMarketBuyerCatalog({
                   onRelease={selectedRentalActions?.onRelease ? () => runRentalDetailAction(selectedRentalActions.onRelease) : undefined}
                   onTerminate={selectedRentalActions?.onTerminate ? () => runRentalDetailAction(selectedRentalActions.onTerminate) : undefined}
                   onViewTermination={selectedRentalActions?.onViewTermination ? () => runRentalDetailAction(selectedRentalActions.onViewTermination) : undefined}
+                  onReportIssue={selectedRentalActions?.onReportIssue ? () => runRentalDetailAction(selectedRentalActions.onReportIssue) : undefined}
+                  onAfterTrial={selectedRentalActions?.onAfterTrial ? () => runRentalDetailAction(selectedRentalActions.onAfterTrial) : undefined}
                 /> : <Button
                   variant="primary"
                   isDisabled={!selected.seat || selectedAction === "unavailable" || selectedAction === "rented" || selectedAction === "granting" || !!busySeatId}
@@ -616,30 +599,6 @@ export function ShareMarketBuyerCatalog({
         </Drawer.Content>
       </Drawer.Backdrop>
 
-      <CatalogSeatDialog
-        target={checkout.interactionActive || accessTarget ? null : seatTarget}
-        subscription={seatSubscription}
-        busy={!!busySeatId || !!seatSubscription && rentals.busyId === seatSubscription.id}
-        error={error}
-        blockedReason={!seatSubscription && seatTarget?.seat.rentBlockReason
-          ? t(rentBlockReasonKey(seatTarget.seat.rentBlockReason)) : undefined}
-        onClose={() => !busySeatId && setSeatSelection(null)}
-        action={seatSubscription ? <RentalActions
-          subscription={seatSubscription}
-          t={t}
-          busy={rentals.busyId === seatSubscription.id}
-          onRelease={seatRentalActions?.onRelease ? () => runRentalDetailAction(seatRentalActions.onRelease) : undefined}
-          onTerminate={seatRentalActions?.onTerminate ? () => runRentalDetailAction(seatRentalActions.onTerminate) : undefined}
-          onViewTermination={seatRentalActions?.onViewTermination ? () => runRentalDetailAction(seatRentalActions.onViewTermination) : undefined}
-        /> : <Button
-          variant="primary"
-          isDisabled={!seatTarget || detailSeatAction === "unavailable" || detailSeatAction === "rented" || detailSeatAction === "granting" || !!busySeatId}
-          onClick={() => seatTarget && void triggerSeat(seatTarget)}
-        >
-          {busySeatId ? <Loader2 className="h-4 w-4 animate-spin" /> : detailSeatAction === "approval" ? <Send className="h-4 w-4" /> : detailSeatAction === "login" ? <LogIn className="h-4 w-4" /> : <ShoppingCart className="h-4 w-4" />}
-          {actionLabel(detailSeatAction, t)}
-        </Button>}
-      />
 
       {checkout.dialog}
 

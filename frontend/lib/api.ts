@@ -1898,6 +1898,7 @@ export async function rentShareMarketSeat(
   quoteId: string,
   idempotencyKey: string,
   autoRenew = false,
+  afterTrial: "continue" | "end" = "continue",
 ) {
   const actor = readAuthState();
   return parseJson<{ ok: true; subscriptionId: string; replayed: boolean }>(
@@ -1905,7 +1906,7 @@ export async function rentShareMarketSeat(
       method: "POST",
       signal: AbortSignal.timeout(25_000),
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ quoteId, idempotencyKey, autoRenew }),
+      body: JSON.stringify({ quoteId, idempotencyKey, autoRenew, afterTrial }),
     }, actor),
   );
 }

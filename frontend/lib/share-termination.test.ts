@@ -73,7 +73,7 @@ test("Share termination blockers explain unavailable actions without guessing mi
     ["service_not_started", "serviceNotStarted"], ["legacy_paid_period", "legacyPaidPeriod"],
     ["archive_unavailable", "archiveUnavailable"], ["archive_incomplete", "archiveIncomplete"],
     ["lifetime_archive_incomplete", "lifetimeArchiveIncomplete"], ["paid_period_expired", "paidPeriodExpired"],
-    ["paid_period_rolling_over", "paidPeriodRollingOver"],
+    ["paid_period_rolling_over", "paidPeriodRollingOver"], ["early_termination_forbidden", "earlyTerminationForbidden"],
   ] as const) {
     assert.equal(shareTerminationBlockedMessage(reason), `shareTermination.blocked.${suffix}`);
     const key = shareTerminationBlockedMessage(reason)! as keyof typeof shareTerminationMessagesEn;
@@ -81,4 +81,12 @@ test("Share termination blockers explain unavailable actions without guessing mi
     assert.ok(shareTerminationMessagesZh[key]);
   }
   assert.equal(shareTerminationBlockedMessage("future_reason" as Parameters<typeof shareTerminationBlockedMessage>[0]), null);
+});
+
+test("a seat that forbids early ending only offers service-problem reasons and a report action", () => {
+  const dialog = readFileSync(new URL("../components/market/share-termination-dialog.tsx", import.meta.url), "utf8");
+  assert.match(dialog, /preview\.earlyTerminationForbidden \? \["provider_issue", "platform_issue"\] as const/);
+  assert.match(dialog, /if \(v\.earlyTerminationForbidden\) setReason/);
+  const actions = readFileSync(new URL("../components/dashboard/share-market/rental-controls.tsx", import.meta.url), "utf8");
+  assert.match(actions, /subscription\.canReportServiceIssue && !subscription\.terminationId && onReportIssue/);
 });

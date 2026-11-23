@@ -48,7 +48,11 @@ function DialogContent({ actor, selection, onClose, onChanged }: { actor: string
     try {
       const v = currentId ? await getShareTermination(currentId, c.signal) : await previewShareTermination(subscriptionId || "", c.signal);
       if (c.signal.aborted || !mounted.current) return;
-      if ("permissions" in v) setRecord(v); else { setPreview(v); attempt.current = null; }
+      if ("permissions" in v) setRecord(v);
+      else {
+        setPreview(v); attempt.current = null;
+        if (v.earlyTerminationForbidden) setReason((current) => current === "voluntary" ? "provider_issue" : current);
+      }
       requiresReview.current = false; dirty.current = false; setError("");
       received.current = Date.now(); setClock(Date.now());
     } catch (e) { if (!c.signal.aborted && mounted.current) setError(failure(e)); }
@@ -110,15 +114,15 @@ function DialogContent({ actor, selection, onClose, onChanged }: { actor: string
         {loading ? <p role="status">{t("common.loading")}</p> : null}
         {error ? <p role="alert" className="break-words text-sm text-danger">{error}</p> : null}
         {preview ? <>
-          <p className="text-sm leading-6 text-muted-foreground">{t("shareTermination.help")}</p>
+          <p className="text-sm leading-6 text-muted-foreground">{t(preview.earlyTerminationForbidden ? "shareRent.issue.forbiddenNote" : "shareTermination.help")}</p>
           <dl className="grid grid-cols-2 gap-2 text-sm tabular-nums">{([
             ["shareTermination.cycle", preview.periodAmountUnits], ["shareTermination.remaining", preview.remainingUnits],
             ["shareTermination.cap", preview.compensationCapUnits], ["shareTermination.return", preview.returnUnits],
           ] as const).map(([key, units]) => <React.Fragment key={key}><dt className="text-muted-foreground">{t(key)}</dt><dd className="text-right">{money(units)}</dd></React.Fragment>)}</dl>
           {preview.usagePending ? <p className="text-xs leading-5 text-amber-800">{t("shareTermination.estimate")}</p> : null}
-          <CompactSelect ariaLabel={t("shareTermination.reason")} value={reason} onChange={v => setReason(v as ShareTerminationReason)} disabled={busy || !!attempt.current} options={(["voluntary", "provider_issue", "platform_issue"] as const).map(value => ({ value, label: t(`shareTermination.${value}`) }))} />
+          <CompactSelect ariaLabel={t("shareTermination.reason")} value={reason} onChange={v => setReason(v as ShareTerminationReason)} disabled={busy || !!attempt.current} options={(preview.earlyTerminationForbidden ? ["provider_issue", "platform_issue"] as const : ["voluntary", "provider_issue", "platform_issue"] as const).map(value => ({ value, label: t(`shareTermination.${value}`) }))} />
           {reason !== "voluntary" ? <label className="grid gap-1 text-sm">{t("shareTermination.note")}<textarea className={WALLET_INPUT} value={note} maxLength={1500} disabled={busy || !!attempt.current} onChange={e => setNote(e.target.value)} /></label> : null}
-          <details className="text-xs leading-6 text-muted-foreground"><summary className="cursor-pointer">{t("shareTermination.rules")}</summary>{t("shareTermination.terms", { rate: preview.rateBps / 100 })}</details>
+          <details className="text-xs leading-6 text-muted-foreground"><summary className="cursor-pointer">{t("shareTermination.rules")}</summary>{preview.earlyTerminationForbidden ? t("shareRent.issue.forbiddenNote") : t("shareTermination.terms", { rate: preview.rateBps / 100 })}</details>
           {expired ? <p className="text-sm text-amber-800">{t("shareTermination.expired")}</p> : null}
           {attempt.current && error ? <p className="text-xs text-amber-800">{t("shareTermination.unknown")}</p> : null}
           <Button variant="danger" isDisabled={busy || loading || expired && !attempt.current} onPress={() => void mutate()}>{t(attempt.current && error ? "shareTermination.retrySubmit" : "shareTermination.confirm")}</Button>

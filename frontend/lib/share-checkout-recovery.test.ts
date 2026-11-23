@@ -13,6 +13,10 @@ test("recovery stores only a login-scoped draft and the exact original purchase 
   assert.equal(parseShareCheckoutRecovery({scope:"user:epoch",draft,pending},"user:new-login"),null);
   assert.equal(parseShareCheckoutRecovery({scope:"user:epoch",draft,pending:{...pending,autoRenew:false}},"user:epoch"),null);
   assert.equal(parseShareCheckoutRecovery({scope:"user:epoch",draft,pending:{...pending,quoteId:""}},"user:epoch"),null);
+  const trial = {...draft,autoRenew:false,afterTrial:"end" as const};
+  assert.deepEqual(parseShareCheckoutRecovery({scope:"user:epoch",draft:trial,pending:{...trial,quoteId:"q",idempotencyKey:"k"}},"user:epoch")?.pending?.afterTrial,"end");
+  assert.equal(parseShareCheckoutRecovery({scope:"user:epoch",draft:trial,pending},"user:epoch"),null);
+  assert.equal(parseShareCheckoutRecovery({scope:"user:epoch",draft:{...draft,afterTrial:"later"}},"user:epoch"),null);
 });
 test("network, timeout and server failures are unknown, but explicit business rejections are not", () => {
   assert.equal(isUnknownShareCheckoutError(new Error("network")),true);
@@ -22,11 +26,15 @@ test("network, timeout and server failures are unknown, but explicit business re
 test("both market surfaces share frozen purchase retries without automatic purchase on return", () => {
   const code=readFileSync(new URL("../components/dashboard/share-market/share-seat-checkout.tsx",import.meta.url),"utf8");
   assert.match(code,/pending.current \?\?/);
-  assert.match(code,/rentShareMarketSeat\(request.seatId, request.quoteId, request.idempotencyKey, request.autoRenew\)/);
+  assert.match(code,/rentShareMarketSeat\(request.seatId, request.quoteId, request.idempotencyKey, request.autoRenew, request.afterTrial \?\? "continue"\)/);
   assert.match(code,/saveShareCheckoutRecovery\(scope, request, request\)/);
   assert.match(code,/Promise.resolve\(\).then\(onChanged\)/);
   assert.match(code,/if \(recovery\?\.pending\)/);
   assert.match(code,/if \(flight.current \|\| pending.current\) return/);
+  // Trial only is the default, tops up in place and never shows a quote countdown.
+  assert.match(code,/React.useState<ShareAfterTrial>\("end"\)/);
+  assert.match(code,/<InPlaceTopup/);
+  assert.doesNotMatch(code,/walletTopupHref|expiresInShort/);
 });
 
 test("session-only storage preserves the original request across reload and isolates a new login", () => {

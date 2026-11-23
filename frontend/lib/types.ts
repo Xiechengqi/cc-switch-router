@@ -2793,6 +2793,8 @@ export type WalletLifecycle = {
   status: string;
   trialSecondsRemaining: number;
   renewalPolicy: string;
+  /** `end`: Share trial only — the seat returns when the trial ends. */
+  afterTrial?: "continue" | "end";
   periodEnd?: string | null;
   nextRentalTrial?: ClientTrialState;
 };
@@ -2925,6 +2927,20 @@ export type ShareMarketSeatInput = {
   trialTokenLimit?: number;
   /** USD seats only; omitted inherits the default, "0" means time-only. */
   trialValueLimitUsdMicros?: string;
+  /** Paid seats only: whether buyers may end a paid period early (default allowed). */
+  earlyTermination?: ShareEarlyTermination;
+  /** Paid seats only: seller's compensation rate in basis points (0–5000); null/omitted follows the platform. */
+  terminationRateBps?: number | null;
+};
+
+export type ShareEarlyTermination = "allowed" | "forbidden";
+
+/** Termination terms frozen when a rental is quoted. `version` is the platform policy version. */
+export type ShareTerminationTerms = {
+  version: number;
+  rateBps: number;
+  earlyTermination?: ShareEarlyTermination;
+  rateSource?: "router" | "seat";
 };
 
 export type ShareTerminationBlockedReason =
@@ -2934,7 +2950,8 @@ export type ShareTerminationBlockedReason =
   | "archive_incomplete"
   | "lifetime_archive_incomplete"
   | "paid_period_expired"
-  | "paid_period_rolling_over";
+  | "paid_period_rolling_over"
+  | "early_termination_forbidden";
 
 export type ShareMarketSubscription = {
   controlProgress?: {
@@ -2944,6 +2961,8 @@ export type ShareMarketSubscription = {
     errorCode?: string;
   };
   canTerminateImmediately?: boolean;
+  /** A service-problem claim can still end the rental when the seat forbids early termination. */
+  canReportServiceIssue?: boolean;
   terminationBlockedReason?: ShareTerminationBlockedReason;
   terminationId?: string;
   trial?: { phase: "trial" | "activating" | "paid" | "revoking"; tokenAllowance: number; tokensUsed: number; tokensRemaining: number | null; endReason?: string; valueAllowanceUsdMicros?: string; valueUsedUsdMicros?: string; valueRemainingUsdMicros?: string | null };
@@ -3001,6 +3020,8 @@ export type ShareMarketSubscription = {
 };
 
 export type ShareMarketSeat = ShareMarketSeatInput & {
+  /** Effective terms a new rental of this seat would get. */
+  terminationTerms?: ShareTerminationTerms;
   trialHoursOverride?: number | null;
   trialTokenLimitOverride?: number | null;
   trialValueLimitUsdMicrosOverride?: string | null;
@@ -3189,7 +3210,7 @@ export type ShareMarketRentQuote = {
 
   walletFunding?: MarketWalletQuoteFunding;
   offer: {
-    terminationPolicy?: { version: number; rateBps: number };
+    terminationPolicy?: ShareTerminationTerms;
     seatId: string;
     listingId: string;
     shareId: string;

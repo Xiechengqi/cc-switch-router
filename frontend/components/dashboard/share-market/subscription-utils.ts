@@ -176,3 +176,15 @@ export function mergeShareMarketSubscriptionPage(
   for (const subscription of incoming) merged.set(subscription.id, subscription);
   return [...merged.values()];
 }
+
+/**
+ * The after-trial change a running Share trial can still make: `continue`
+ * keeps the seat after a trial-only rental, `end` turns a rental back into
+ * trial only. Null once the trial is over or for free seats.
+ */
+export function shareAfterTrialSwitch(subscription: ShareMarketSubscription): "continue" | "end" | null {
+  const contract = subscription.walletContract;
+  if (!contract?.id || subscription.pricingModel === "free" || contract.trialSecondsRemaining <= 0) return null;
+  if (contract.status !== "trialing" && contract.status !== "pending_activation") return null;
+  return contract.afterTrial === "end" ? "continue" : "end";
+}

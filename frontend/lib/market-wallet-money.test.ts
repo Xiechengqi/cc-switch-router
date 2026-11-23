@@ -18,6 +18,10 @@ import {
   topupAutoCheckCountdown,
   formatTopupCountdown,
   walletTopupHref,
+  suggestedTopupAmount,
+  shortfallMinor,
+  formatUnitsCentsUp,
+  formatUnitsCentsDown,
 } from "./market-wallet-money";
 
 test("wallet money display uses integer units even above the JS safe-integer range", () => {
@@ -169,7 +173,7 @@ test("auto-check countdown warns before the durable deadline without claiming cl
 test("wallet recharge links preserve only local Market context", () => {
   assert.equal(
     walletTopupHref("86400", "/share-market/?focus=share-1"),
-    "/account/wallet/?amount=1.00&returnTo=%2Fshare-market%2F%3Ffocus%3Dshare-1",
+    "/account/wallet/?amount=5.00&returnTo=%2Fshare-market%2F%3Ffocus%3Dshare-1",
   );
   assert.equal(safeMarketReturnPath("//evil.example/share-market/"), null);
   assert.equal(safeMarketReturnPath("https://evil.example/client-market/"), null);
@@ -177,9 +181,21 @@ test("wallet recharge links preserve only local Market context", () => {
   assert.equal(safeMarketReturnPath("/client-market/?focusHost=host-1"), "/client-market/?focusHost=host-1");
 });
 
-test("wallet recharge amounts round up to cents and respect merchant limits", () => {
-  assert.match(walletTopupHref("8640001", "/client-market/"), /amount=1\.01/);
+test("wallet recharge amounts round up to cents and respect the fixed $5–$1,000 range", () => {
+  // Below the minimum top-up the suggestion is the minimum, never an invalid amount.
+  assert.match(walletTopupHref("8640001", "/client-market/"), /amount=5\.00/);
   assert.match(walletTopupHref("864000000000000", "/client-market/"), /amount=1000\.00/);
+  assert.equal(suggestedTopupAmount("0"), null);
+  assert.equal(suggestedTopupAmount(String(1234n * 86_400n + 1n)), "12.35");
+  assert.equal(shortfallMinor(String(90n * 86_400n + 1n)), 91);
+});
+
+test("display amounts round to cents in the person's disfavour only when it is safe", () => {
+  // Shortfall $0.907165 is shown as $0.91; a balance of $0.092834 as $0.09.
+  assert.equal(formatUnitsCentsUp(String(7_837_906n)), "$0.91");
+  assert.equal(formatUnitsCentsDown(String(802_086n)), "$0.09");
+  assert.equal(formatUnitsCentsUp("0"), "$0.00");
+  assert.equal(formatUnitsCentsDown(String(8_640_000n * 1234n), "$", "en-US"), "$1,234.00");
 });
 
 test("homepage recharge return paths admit only one safe Share selection without wallet dispatch loops", () => {

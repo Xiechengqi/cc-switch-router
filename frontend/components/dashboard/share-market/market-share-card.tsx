@@ -2,7 +2,6 @@
 
 import * as React from "react";
 import { ShareTerminationRowAction } from "@/components/market/share-termination-dialog";
-import { UserRound } from "lucide-react";
 import { ShareProviderStatusPanel } from "@/components/dashboard/share-provider-status-panel";
 import { MarketProviderLogos } from "@/components/dashboard/share-market/market-share-identity";
 import { SubdomainCopyButton } from "@/components/dashboard/subdomain-copy-button";
@@ -21,6 +20,7 @@ import {
   seatValueDiscount,
 } from "@/components/dashboard/share-market/market-utils";
 import { marketShareCardSeatPreview } from "@/components/dashboard/share-market/buyer-catalog-utils";
+import { USD_SEAT_PARALLEL_CAP } from "@/components/dashboard/share-market/seat-value-quota";
 
 // One column on phones: two columns at ~180px each turn the provider line, the price and
 // the seat rows into unreadable stubs, and the market's whole job is comparing those.
@@ -86,26 +86,28 @@ export function MarketShareCardMetric({
   );
 }
 
+type Translate = ReturnType<typeof useLocaleText>["t"];
+
+/** "US$10 API value/month · 4 parallel · 12h trial", in the seat's own units. */
 function compactSeatTerms(
   seat: Pick<ShareMarketSeat, "parallelLimit" | "tokenLimit" | "valueQuota" | "tokenPeriod" | "isFree" | "trialHours">,
   locale: string,
-  unlimited: string,
-  periodLabel: string,
-  trialLabel?: string,
-  valueLabel: (amount: string) => string = (amount) => amount,
+  t: Translate,
   discountLabel?: string | null,
 ) {
-  const parallel = seat.parallelLimit == null ? "P∞" : `P${seat.parallelLimit}`;
-  const tokens = seat.valueQuota
-    ? `${valueLabel(formatUsdLimit(seat.valueQuota.limitUsdMicros))}/${periodLabel}`
+  const period = t(`shareMarket.period.${seat.tokenPeriod}`);
+  const quota = seat.valueQuota
+    ? `${t("shareMarket.quota.usdAmount", { amount: formatUsdLimit(seat.valueQuota.limitUsdMicros) })}/${period}`
     : seat.tokenLimit == null
-      ? unlimited
-      : `${formatTokenMillions(seat.tokenLimit, locale)}/${periodLabel}`;
-  const trial = !seat.isFree && seat.trialHours != null && trialLabel
-    ? ` · ${trialLabel}`
-    : "";
-  const discount = discountLabel ? ` · ${discountLabel}` : "";
-  return `${parallel} · ${tokens}${discount}${trial}`;
+      ? t("shareSeatTerms.unlimitedQuota")
+      : `${formatTokenMillions(seat.tokenLimit, locale)}/${period}`;
+  // A USD-equivalent seat never runs more than USD_SEAT_PARALLEL_CAP requests at once.
+  const limit = seat.valueQuota
+    ? Math.min(seat.parallelLimit ?? USD_SEAT_PARALLEL_CAP, USD_SEAT_PARALLEL_CAP)
+    : seat.parallelLimit;
+  const parallel = limit == null ? t("shareSeatTerms.unlimitedParallel") : t("shareSeatTerms.parallel", { value: limit });
+  const trial = !seat.isFree && seat.trialHours ? t("shareSeatTerms.trial", { hours: seat.trialHours }) : "";
+  return [quota, parallel, discountLabel, trial].filter(Boolean).join(" · ");
 }
 
 export function CatalogSeatPreview({
@@ -127,6 +129,7 @@ export function CatalogSeatPreview({
   const idle = isSeatIdle(seat);
   const discount = seatValueDiscount(seat);
   const showRent = idle && !!onRent && !mine && seat.canRent !== false;
+  const terms = compactSeatTerms(seat, locale, t, discount ? formatSeatValueDiscount(discount, locale) : null);
   const className = cn(
     "grid min-w-0 items-center gap-2 rounded px-1.5 py-1 text-left text-[11px]",
     mine
@@ -143,19 +146,16 @@ export function CatalogSeatPreview({
           {t("shareMarket.catalog.mineSeat")}
         </span>
       ) : null}
-      <span className="truncate text-slate-500">
-        {compactSeatTerms(
-          seat,
-          locale,
-          t("common.unlimited"),
-          t(`shareMarket.period.${seat.tokenPeriod}`),
-          seat.trialHours != null ? `${seat.trialHours}h` : undefined,
-          (amount) => t("shareMarket.quota.usdAmount", { amount }),
-          discount ? formatSeatValueDiscount(discount, locale) : null,
-        )}
+      <span className="flex min-w-0 items-center gap-1">
+        <span className="truncate text-slate-500" title={terms}>{terms}</span>
+        {!seat.isFree && seat.terminationTerms?.earlyTermination === "forbidden" ? (
+          <span className="shrink-0 rounded bg-amber-50 px-1 text-[10px] font-medium leading-4 text-amber-800" title={t("shareSeatTerms.noEarlyEndHint")}>
+            {t("shareSeatTerms.noEarlyEndTag")}
+          </span>
+        ) : null}
       </span>
       <strong className="shrink-0 tabular-nums text-slate-800">
-        {formatSeatPrice(seat, locale, t("shareMarket.free"), t("market.day"))}
+        {formatSeatPrice(seat, locale, t("shareMarket.free"), t("market.day"), t("market.month"))}
       </strong>
       {showRent ? (
         <button
@@ -309,7 +309,7 @@ export function MarketShareCard({
   });
   const subdomain = listing.subdomain?.trim() || listing.shareName;
   const interactive = !!onOpen;
-  const price = listingPriceSummary(listing, locale, t("shareMarket.free"), t("market.day"));
+  const price = listingPriceSummary(listing, locale, t("shareMarket.free"), t("market.day"), t("market.month"));
   const priceLabel = price.isFrom
     ? t("shareMarket.catalog.fromPrice", { price: price.price })
     : price.price;
@@ -410,17 +410,12 @@ export function MarketShareCard({
             warning={uptimeWarning}
           />
           <MarketShareCardMetric
-            label="P50 TTFT/TPS"
+            label={t("shareSeatTerms.performanceLabel")}
             value={performance.label}
             title={t("shareMarket.catalog.performanceSamples", { ttft: listing.performance.ttftSampleCount, tps: listing.performance.tpsSampleCount })}
             warning={performanceWarning}
           />
         </dl>
-        <p className="mt-1 flex min-w-0 items-start gap-1 text-[10px] leading-4 text-slate-500">
-          <UserRound className="mt-0.5 h-3 w-3 shrink-0" aria-hidden />
-          <span className="shrink-0">{t("shareMarket.owner")}:</span>
-          <span className="min-w-0 break-all" title={listing.ownerEmail}>{listing.ownerEmail}</span>
-        </p>
       </div>
       {footer}
       <ShareTerminationRowAction shareId={listing.shareId} />

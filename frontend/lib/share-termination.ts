@@ -11,6 +11,7 @@ const BLOCKED_MESSAGES: Record<ShareTerminationBlockedReason, MessageKey> = {
   lifetime_archive_incomplete: "shareTermination.blocked.lifetimeArchiveIncomplete",
   paid_period_expired: "shareTermination.blocked.paidPeriodExpired",
   paid_period_rolling_over: "shareTermination.blocked.paidPeriodRollingOver",
+  early_termination_forbidden: "shareTermination.blocked.earlyTerminationForbidden",
 };
 
 export function shareTerminationBlockedMessage(reason: ShareTerminationBlockedReason | undefined) {
@@ -35,6 +36,8 @@ export type ShareTermination = {
 };
 export type ShareTerminationPreview = Pick<ShareTermination, "subscriptionId" | "periodAmountUnits" | "remainingUnits" | "compensationCapUnits" | "rateBps" | "policyVersion"> & {
   previewId: string; expiresAt: string; returnUnits: string; usagePending: boolean; serverNow: string;
+  /** The seat forbids voluntary early termination; only a service problem can end it. */
+  earlyTerminationForbidden?: boolean;
 };
 const object = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
 export const shareTerminationUnits = (v: unknown): v is string => typeof v === "string" && /^(0|[1-9]\d{0,18})$/.test(v) && BigInt(v) <= 9223372036854775807n;
@@ -107,6 +110,12 @@ export async function actOnShareTermination(record: ShareTermination, action: "r
   const v = parseShareTermination(await request(`${root}/terminations/${encodeURIComponent(record.id)}/${action}`, "POST", { expectedVersion: record.version, note, ...(awardUnits === undefined ? {} : { awardUnits }) }, signal));
   if (v.id !== record.id || v.subscriptionId !== record.subscriptionId) throw new Error("Share termination decision identity mismatch");
   return v;
+}
+/** The platform default rate sellers inherit when a seat sets none. */
+export async function getPublicShareTerminationPolicy(signal?: AbortSignal): Promise<{ version: number; rateBps: number }> {
+  const v = await request(`${root}/termination-policy`, "GET", undefined, signal);
+  if (!object(v) || !integer(v.version, 1) || !integer(v.rateBps, 0, 10000)) throw new Error("Invalid Share termination policy");
+  return { version: v.version as number, rateBps: v.rateBps as number };
 }
 export async function getShareTerminationPolicy(signal?: AbortSignal): Promise<ShareTerminationPolicy> {
   return parsePolicy(await request("/v1/admin/market/share-termination-policy", "GET", undefined, signal));

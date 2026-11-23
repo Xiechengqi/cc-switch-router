@@ -332,6 +332,10 @@ pub(super) fn render(item: &Claimed, dashboard: &str) -> (String, String, String
             "Service ending soon",
             "A paused service is approaching termination. Review the service and resolve its funding requirements before the deadline.",
         ),
+        "contract_terminated" if field(p, "reason") == Some("trial_completed") => (
+            "Trial ended",
+            "Your trial-only Share rental ended with its trial and the seat was released. Nothing was charged. You can rent it again from the Share Market.",
+        ),
         "contract_terminated" => (
             "Service ended",
             "A service has ended. Review its final status and records in your account.",
