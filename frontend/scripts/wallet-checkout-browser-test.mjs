@@ -215,7 +215,6 @@ try {
   let closeCalls = 0;
   let transferCalls = 0;
   let confirmCalls = 0;
-  let withdrawCalls = 0;
   let topupCreates = 0;
   let rejectNextTopupQuote = false;
   let feeBps = 500;
@@ -238,7 +237,6 @@ try {
   const transferKeys = [];
   const transferStepups = [];
   let transferAmount = "8640001";
-  let pendingTransfers = [];
   const until = async (check, label) => {
     for (let i = 0; i < 100; i++) {
       if (check()) return;
@@ -253,7 +251,7 @@ try {
     const input = route.request().postDataJSON();
     assert.equal(input.recipientEmail, "recipient@example.invalid");
     assert.equal(input.all, true);
-    await route.fulfill({ contentType: "application/json", body: JSON.stringify({ id: "transfer-quote", senderEmail: "buyer@example.invalid", recipientEmail: input.recipientEmail, amountUnits: transferAmount, expiresAt: new Date(Date.now() + 900_000).toISOString(), firstRecipient: true, delivery: "delayed", delayHours: 24 }) });
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify({ id: "transfer-quote", senderEmail: "buyer@example.invalid", recipientEmail: input.recipientEmail, amountUnits: transferAmount, expiresAt: new Date(Date.now() + 900_000).toISOString(), firstRecipient: true }) });
   });
   await page.context().route("**/v1/market-wallet/transfer-quotes/*/code", async () => {
     assert.fail("retired financial OTP endpoint must not be called");
@@ -279,11 +277,9 @@ try {
       await route.fulfill({ status: 504, contentType: "application/json", body: JSON.stringify({ message: "response uncertain" }) });
       return;
     }
-    const pending = { id: "11111111-1111-4111-8111-111111111111", senderEmail: "buyer@example.invalid", recipientEmail: "recipient@example.invalid",
-      amountUnits: transferAmount, journalId: null, createdAt: new Date().toISOString(), status: "pending",
-      releaseAt: new Date(Date.now() + 86_400_000).toISOString() };
-    pendingTransfers = [pending];
-    await route.fulfill({ contentType: "application/json", body: JSON.stringify(pending) });
+    const sent = { id: "11111111-1111-4111-8111-111111111111", senderEmail: "buyer@example.invalid", recipientEmail: "recipient@example.invalid",
+      amountUnits: transferAmount, journalId: "22222222-2222-4222-8222-222222222222", createdAt: new Date().toISOString(), status: "completed", releaseAt: null };
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify(sent) });
     transferAmount = "0";
   });
   await page.context().route("**/v1/market-wallet/security/confirm", async (route) => {
@@ -296,16 +292,6 @@ try {
       return;
     }
     await route.fulfill({ contentType: "application/json", body: JSON.stringify({ stepupId: "transfer-challenge" }) });
-  });
-  await page.context().route("**/v1/market-wallet/transfers/pending", async (route) => {
-    await route.fulfill({ contentType: "application/json", body: JSON.stringify({ items: pendingTransfers }) });
-  });
-  await page.context().route("**/v1/market-wallet/transfers/pending/*/cancel", async (route) => {
-    withdrawCalls += 1;
-    assert.ok(route.request().headers()["x-router-request-signature"]);
-    const withdrawn = { ...pendingTransfers[0], status: "cancelled" };
-    pendingTransfers = [];
-    await route.fulfill({ contentType: "application/json", body: JSON.stringify(withdrawn) });
   });
   await page.context().route("**/v1/market-wallet/transfer-returns/awaiting", async (route) => {
     await route.fulfill({ contentType: "application/json", body: JSON.stringify({ items: [] }) });
@@ -576,8 +562,8 @@ try {
   assert.equal(closeCalls, 1);
   assert.equal(await attention.getByText("Top-up $5.00 awaiting payment", { exact: true }).count(), 0);
 
-  // No real transfer is sent. A first transfer is delayed and withdrawable;
-  // the login password confirms it (one typo, then the right password) and an
+  // No real transfer is sent. A first transfer credits instantly once the
+  // login password confirms it (one typo, then the right password) and an
   // uncertain response is retried with the same idempotency key, without OTP.
   await page.getByRole("button", { name: /^Send to someone/ }).click();
   const transferPanel = page.locator("#wallet-transfer");
@@ -586,7 +572,8 @@ try {
   await transferPanel.getByRole("button", { name: "Review send" }).click();
   const confirmation = page.getByRole("region", { name: "Confirm recipient & amount" });
   await confirmation.getByText("recipient@example.invalid", { exact: true }).waitFor();
-  await confirmation.getByText("First transfer to this user: it credits in 24 hours and you can withdraw it until then.", { exact: true }).waitFor();
+  await confirmation.getByText("First transfer to this user: confirm it with your login password. It credits instantly and cannot be undone.", { exact: true }).waitFor();
+  assert.equal(await confirmation.getByText(/24 hours|withdraw/i).count(), 0, "a first transfer is never delayed");
   assert.equal(await confirmation.getByText(/ledger units/).count(), 0, "internal ledger units are never shown");
   for (const width of [320, 375, 414, 768]) {
     await page.setViewportSize({ width, height: 900 });
@@ -596,7 +583,7 @@ try {
   assert.equal(await confirmation.getByRole("button", { name: /verification|code/i }).count(), 0);
   await confirmation.getByRole("button", { name: /^Send \$/ }).click();
   const passwordDialog = page.getByRole("dialog", { name: "Confirm with your password" });
-  await passwordDialog.getByText(/A transfer to a new recipient credits after 24 hours/).waitFor();
+  await passwordDialog.getByText(/A transfer credits instantly and cannot be undone/).waitFor();
   await passwordDialog.getByLabel("Login password", { exact: true }).fill("typo");
   await passwordDialog.getByRole("button", { name: "Confirm", exact: true }).click();
   await passwordDialog.getByRole("alert").filter({ hasText: "The password is incorrect. Try again." }).waitFor();
@@ -607,26 +594,21 @@ try {
   assert.equal(confirmCalls, 2);
   assert.equal(transferCalls, 2);
   await confirmation.getByRole("button", { name: /^Send \$/ }).click();
-  await transferPanel.getByRole("status").filter({ hasText: /Sent for recipient@example\.invalid/ }).waitFor();
+  await transferPanel.getByRole("status").filter({ hasText: /^Sent .+ to recipient@example\.invalid\.$/ }).waitFor();
   assert.equal(transferCalls, 3);
   assert.ok(transferKeys[0]);
   assert.deepEqual(new Set(transferKeys).size, 1, "one idempotency key across confirmation and retry");
   assert.deepEqual(transferStepups, [null, "transfer-challenge", null]);
 
-  // The pending transfer can be withdrawn by its sender before it credits.
-  // Focus stays on the result inside the drawer, so Escape closes it.
+  // Focus stays on the result inside the drawer, so Escape closes it. Nothing
+  // is left waiting: the transfer has already credited.
   const sendDrawer = page.getByRole("dialog", { name: "Send to someone" });
-  await transferPanel.getByRole("status").filter({ hasText: /Sent for recipient@example\.invalid/ }).evaluate((element) => {
+  await transferPanel.getByRole("status").filter({ hasText: /to recipient@example\.invalid\.$/ }).evaluate((element) => {
     if (document.activeElement !== element) throw new Error("send result is not focused");
   });
   await page.keyboard.press("Escape");
   await sendDrawer.waitFor({ state: "hidden" });
-  await attention.getByText(/^To recipient@example\.invalid · /).waitFor();
-  await attention.getByText(/You can withdraw it until then/).waitFor();
-  await attention.getByRole("button", { name: "Withdraw", exact: true }).click();
-  await attention.getByRole("status").filter({ hasText: "Withdrawn. The amount is back in your available balance." }).waitFor();
-  assert.equal(withdrawCalls, 1);
-  assert.equal(await attention.getByText(/^To recipient@example\.invalid · /).count(), 0);
+  assert.equal(await page.getByText(/^To recipient@example\.invalid · /).count(), 0);
 
   // A changed policy refreshes the visible total but never silently submits
   // an order at the new price. A second user gesture is required.
@@ -1002,10 +984,23 @@ try {
     assert.notEqual(route.request().method(), "POST", "new return requests are retired");
     await json(route, null);
   });
-  await page.context().route("**/v1/market-wallet/transactions", route => json(route, { items: [{
-    id: "entry-received", sourceKind: "wallet_transfer", action: "transfer", deltaUnits: "8640000", heldDeltaUnits: "0",
-    createdAt: time, transferId: receivedId, counterpartyEmail: "sender@example.invalid", c2cOrderId: null,
-  }], nextCursor: null }));
+  // Twelve entries over two server pages: the Activity card pages them eight
+  // at a time and fetches the second server page only when it is needed.
+  const older = Array.from({ length: 11 }, (_, i) => ({
+    id: `entry-old-${i}`, sourceKind: "topup", action: "credit", deltaUnits: "8640000", heldDeltaUnits: "0",
+    createdAt: new Date(Date.parse(time) - (i + 1) * 60_000).toISOString(), transferId: null, counterpartyEmail: null, c2cOrderId: null,
+  }));
+  const ledgerCursors = [];
+  await page.context().route("**/v1/market-wallet/transactions*", route => {
+    const cursor = new URL(route.request().url()).searchParams.get("cursor");
+    ledgerCursors.push(cursor);
+    return json(route, cursor === "older"
+      ? { items: older.slice(7), nextCursor: null }
+      : { items: [{
+        id: "entry-received", sourceKind: "wallet_transfer", action: "transfer", deltaUnits: "8640000", heldDeltaUnits: "0",
+        createdAt: time, transferId: receivedId, counterpartyEmail: "sender@example.invalid", c2cOrderId: null,
+      }, ...older.slice(0, 7)], nextCursor: "older" });
+  });
   await page.goto(`${baseUrl}/account/wallet/`);
   for (const retired of ["Wallet security", "Transfer corrections", "Add Passkey", "Request return"]) {
     assert.equal(await page.getByText(retired, { exact: true }).count(), 0, `${retired} is gone`);
@@ -1028,12 +1023,26 @@ try {
   assert.equal(await sendBack.locator("#wallet-transfer input[inputmode=decimal]").inputValue(), "1.00");
   await page.keyboard.press("Escape");
   await sendBack.waitFor({ state: "hidden" });
+  const ledgerPanel = activity.getByRole("tabpanel");
+  const ledgerRows = ledgerPanel.locator("li");
+  assert.equal(await ledgerRows.count(), 8);
+  await activity.getByText("1–8", { exact: true }).waitFor();
+  assert.ok(!ledgerCursors.includes("older"), "older activity loads only when its page is opened");
+  const firstHeight = (await ledgerPanel.boundingBox()).height;
+  await activity.getByRole("button", { name: "Next page", exact: true }).click();
+  await activity.getByText("9–12 of 12", { exact: true }).waitFor();
+  assert.equal(await ledgerRows.count(), 4);
+  assert.equal((await ledgerPanel.boundingBox()).height, firstHeight, "Activity keeps a fixed height across pages");
+  assert.equal(await activity.getByRole("button", { name: "Next page", exact: true }).isDisabled(), true);
+  await activity.getByRole("button", { name: "Previous page", exact: true }).click();
+  await activity.getByText("1–8 of 12", { exact: true }).waitFor();
+  await activity.getByText("Received from sender@example.invalid", { exact: true }).waitFor();
   for (const width of [320, 375, 414, 768]) {
     await page.setViewportSize({ width, height: 900 });
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `wallet attention/activity page overflows at ${width}`);
   }
   assert.deepEqual(pageErrors, []);
-  console.log("wallet checkout: fixed $5–$1,000 range with $20 default, dynamic fees, stale-quote races, safe payment tabs, automatic recheck, Don't pay, password-confirmed delayed transfer with idempotent retry and withdraw, automatic earnings credit, Owner policies, risk-policy CAS in Settings, legacy return decisions and send-back passed; four widths; no screenshots or real payments");
+  console.log("wallet checkout: fixed $5–$1,000 range with $20 default, dynamic fees, stale-quote races, safe payment tabs, automatic recheck, Don't pay, password-confirmed instant first transfer with idempotent retry, automatic earnings credit, Owner policies, risk-policy CAS in Settings, legacy return decisions, send-back and fixed-height Activity paging passed; four widths; no screenshots or real payments");
 } finally {
   await browser?.close();
   if (server) await new Promise((resolveStop, rejectStop) => {

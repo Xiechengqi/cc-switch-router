@@ -14,7 +14,7 @@ export const passwordMessagesEn = {
   "auth.password.changeHint":
     "Your other login sessions will be signed out. API Tokens and rented services are unchanged.",
   "auth.password.emailNotice":
-    "We will email you that the password changed (the email does not contain it). The password also confirms transfers; a new password can confirm immediate payments after 24 hours.",
+    "We will email you that the password changed (the email does not contain it). The password also confirms transfers; a new password can confirm payments of US$500 or more after 24 hours.",
   "auth.password.new": "New password",
   "auth.password.confirm": "Confirm new password",
   "auth.password.later": "Not now",
@@ -56,7 +56,7 @@ export const passwordMessagesZh: Record<
   "auth.password.changeHint":
     "其他登录会话将退出，API Token 和已租服务不受影响。",
   "auth.password.emailNotice":
-    "修改后会发送通知邮件（不含密码）。登录密码也用于确认转账，新密码 24 小时后才能确认立即到账的付款。",
+    "修改后会发送通知邮件（不含密码）。登录密码也用于确认转账，新密码 24 小时后才能确认 500 美元及以上的付款。",
   "auth.password.new": "新密码",
   "auth.password.confirm": "确认新密码",
   "auth.password.later": "稍后设置",

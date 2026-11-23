@@ -9,11 +9,10 @@ import { parseJson } from "@/lib/api";
 export type WalletSecurity = {
   hasPassword: boolean;
   passwordSetAt: string | null;
-  /** Set while a fresh password cannot yet confirm immediate payments. */
+  /** Set while a fresh password cannot yet confirm US$500+ payments. */
   immediateUsableAt: string | null;
   canManageRiskPolicy: boolean;
   largeAmountMinor: number;
-  newRecipientDelayHours: number;
   passwordCooldownHours: number;
 };
 export type FinancialRiskPolicy = { version: number; topupUserDayMinor: number; topupChannelDayMinor: number; topupGlobalDayMinor: number; topupGlobalHourMinor: number; incomingUserDayMinor: number; chainVerificationRequired: boolean; topupCircuitOpen: boolean };
@@ -24,7 +23,7 @@ export async function getWalletSecurity(): Promise<WalletSecurity> {
   const value = await parseJson<WalletSecurity>(await authFetch("/v1/market-wallet/security", { cache: "no-store" }));
   if (!value || typeof value.hasPassword !== "boolean" || typeof value.canManageRiskPolicy !== "boolean"
     || !isTime(value.passwordSetAt) || !isTime(value.immediateUsableAt)
-    || ![value.largeAmountMinor, value.newRecipientDelayHours, value.passwordCooldownHours].every(Number.isSafeInteger)) {
+    || ![value.largeAmountMinor, value.passwordCooldownHours].every(Number.isSafeInteger)) {
     throw new Error("Wallet security unavailable; reload.");
   }
   return value;

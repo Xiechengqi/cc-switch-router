@@ -279,7 +279,7 @@ mod tests {
     fn return_requires_recipient_consent_and_creates_one_compensating_journal() {
         let (c, a) = super::super::tests::fixture();
         let q = super::super::tests::quoted(&c, 8_640_000, "return-quote");
-        let t = super::super::tests::confirm_released(
+        let t = super::super::confirm_tx(
             &c,
             &a,
             &a.user_id,
@@ -321,7 +321,7 @@ mod tests {
     fn return_outbox_failure_rolls_back_consent_balances_and_journal() {
         let (c, a) = super::super::tests::fixture();
         let q = super::super::tests::quoted(&c, 8_640_000, "rollback-return-quote");
-        let t = super::super::tests::confirm_released(
+        let t = super::super::confirm_tx(
             &c,
             &a,
             &a.user_id,
@@ -379,7 +379,7 @@ mod tests {
     fn a_spent_recipient_balance_cannot_be_forced_negative_by_a_return() {
         let (c, a) = super::super::tests::fixture();
         let q = super::super::tests::quoted(&c, 8_640_000, "spent-return-quote");
-        let t = super::super::tests::confirm_released(
+        let t = super::super::confirm_tx(
             &c,
             &a,
             &a.user_id,

@@ -6,12 +6,12 @@
 //!
 //! Fixed rules (no user configuration):
 //! - Top-ups and spending never ask for confirmation.
-//! - A transfer to a new recipient asks for the password and is then held for
-//!   [`NEW_RECIPIENT_DELAY_HOURS`] before it credits; the sender can withdraw it.
-//! - Operations that move money immediately and irreversibly (US$500+ to a known
-//!   recipient, US$500+ C2C release, Owner finance writes) ask for the password
-//!   and are unavailable for [`PASSWORD_COOLDOWN_HOURS`] after the password was
-//!   set or changed, because any live session may set a password.
+//! - Transfers credit at once. The first transfer to a recipient asks for the
+//!   password.
+//! - Large irreversible operations (US$500+ transfers to anyone, US$500+ C2C
+//!   release, Owner finance writes) ask for the password and are unavailable for
+//!   [`PASSWORD_COOLDOWN_HOURS`] after the password was set or changed from a
+//!   web session, because any live session may set a password.
 use crate::{
     ServerState,
     db::{Connection, OptionalExtension, TransactionBehavior, params},
@@ -44,8 +44,6 @@ const CONFIRMATION_TTL_MINUTES: i64 = 5;
 /// Hours after a password is set or changed before it may confirm money that
 /// moves immediately.
 pub(crate) const PASSWORD_COOLDOWN_HOURS: i64 = 24;
-/// Hours a transfer to a new recipient waits before it credits.
-pub(crate) const NEW_RECIPIENT_DELAY_HOURS: i64 = 24;
 /// Transfers and C2C releases at or above this many US cents need confirmation.
 pub(crate) const LARGE_AMOUNT_MINOR: i64 = 50_000;
 
@@ -246,17 +244,15 @@ pub(crate) fn risk_tx(
             // The handler rejects an unknown quote.
             return Ok(Risk::None);
         };
-        // A quote shown as delayed stays delayed, even if the recipient became
-        // known while the person was reviewing it.
-        return Ok(
-            if first || !known_recipient_tx(conn, &actor.user_id, &recipient)? {
-                Risk::Confirm
-            } else if amount >= large {
-                Risk::Immediate
-            } else {
-                Risk::None
-            },
-        );
+        // A quote shown as a first transfer keeps asking for the password,
+        // even if the recipient became known while the person reviewed it.
+        return Ok(if amount >= large {
+            Risk::Immediate
+        } else if first || !known_recipient_tx(conn, &actor.user_id, &recipient)? {
+            Risk::Confirm
+        } else {
+            Risk::None
+        });
     }
     if path.ends_with("/release") && path.contains("/c2c/orders/") {
         let id = decoded_segment(
@@ -719,7 +715,6 @@ async fn status(
             "immediateUsableAt": immediate_usable_at,
             "canManageRiskPolicy": crate::api::is_finance_owner(&state.config, &actor.email),
             "largeAmountMinor": LARGE_AMOUNT_MINOR,
-            "newRecipientDelayHours": NEW_RECIPIENT_DELAY_HOURS,
             "passwordCooldownHours": PASSWORD_COOLDOWN_HOURS,
         })),
     ))
@@ -906,7 +901,7 @@ mod tests {
     }
 
     #[test]
-    fn transfers_to_new_recipients_confirm_and_large_known_transfers_are_immediate() {
+    fn first_transfers_confirm_and_large_transfers_are_immediate() {
         let conn = crate::test_support::database().unwrap();
         let a = crate::market_finance_auth::test_session(&conn, "risk-sender");
         let b = crate::market_finance_auth::test_session(&conn, "risk-recipient");
@@ -915,10 +910,10 @@ mod tests {
             conn.execute("INSERT INTO market_wallet_transfer_quotes(id,sender_user_id,recipient_user_id,sender_email,recipient_email,amount_units,expires_at,created_at) VALUES(?1,?2,?3,?4,?5,?6,'2100-01-01','2020-01-01')",params![id,a.user_id,b.user_id,a.email,b.email,amount]).unwrap();
         }
         let body = |q: &str| format!("{{\"quoteId\":\"{q}\"}}");
-        for q in ["q-small", "q-large"] {
+        for (q, risk) in [("q-small", Risk::Confirm), ("q-large", Risk::Immediate)] {
             assert_eq!(
                 risk_tx(&conn, &a, "/v1/market-wallet/transfers", body(q).as_bytes()).unwrap(),
-                Risk::Confirm
+                risk
             );
         }
         assert!(!known_recipient_tx(&conn, &a.user_id, &b.user_id).unwrap());
@@ -953,18 +948,18 @@ mod tests {
         )
         .unwrap();
         assert!(known_recipient_tx(&conn, &a.user_id, &b.user_id).unwrap());
-        // A quote shown as delayed stays a confirmation, whatever happened since.
+        // A quote shown as a first transfer still asks for the password.
         assert_eq!(
             risk_tx(
                 &conn,
                 &a,
                 "/v1/market-wallet/transfers",
-                body("q-large").as_bytes()
+                body("q-small").as_bytes()
             )
             .unwrap(),
             Risk::Confirm
         );
-        // Quotes are immutable; quotes made after the credit are instant.
+        // Quotes are immutable; quotes made after the credit know the recipient.
         for (id, amount) in [("q-small", large - 1), ("q-large", large)] {
             conn.execute("INSERT INTO market_wallet_transfer_quotes(id,sender_user_id,recipient_user_id,sender_email,recipient_email,amount_units,expires_at,created_at,first_recipient) VALUES(?1,?2,?3,?4,?5,?6,'2100-01-01','2020-01-01',0)",params![format!("{id}-known"),a.user_id,b.user_id,a.email,b.email,amount]).unwrap();
         }
@@ -1134,7 +1129,7 @@ mod tests {
         password(&conn, &a.user_id, "2026-11-16T12:00:00+00:00");
         a.financial_proof_id = Some("p3".into());
         assert!(validate_proof_tx(&conn, &a, time).is_err());
-        // A delayed-delivery confirmation is not subject to the cooldown.
+        // A first-transfer confirmation is not subject to the cooldown.
         completed(&conn, &a, "step-3", "confirm");
         proof(&conn, &a, "p4", Some("step-3"));
         a.financial_proof_id = Some("p4".into());

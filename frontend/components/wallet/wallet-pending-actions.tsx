@@ -1,15 +1,14 @@
 "use client";
 
 import * as React from "react";
-import { ArrowRight, ArrowUpRight, Clock3, Undo2 } from "lucide-react";
+import { ArrowRight, ArrowUpRight, Clock3 } from "lucide-react";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { WALLET_SECONDARY_BUTTON, WalletSectionLabel } from "@/components/market/wallet-primitives";
 import { closeMarketWalletTopup, type MarketWalletTopup } from "@/lib/market-wallet-api";
 import { formatMinorUsd, formatWalletUnits, walletTopupCheckoutHref } from "@/lib/market-wallet-money";
 import { walletErrorText } from "@/lib/wallet-errors";
-import { decideTransferReturn, withdrawPendingTransfer, type AwaitingReturn } from "@/lib/wallet-transfer-returns";
-import type { WalletTransfer } from "@/lib/wallet-policy-api";
+import { decideTransferReturn, type AwaitingReturn } from "@/lib/wallet-transfer-returns";
 import { isOpenTopup } from "./use-wallet-data";
 
 const ROW = "flex min-w-0 flex-wrap items-center justify-between gap-x-4 gap-y-2 py-3 first:pt-0 last:pb-0";
@@ -17,12 +16,10 @@ const LINK_BUTTON = "inline-flex min-h-11 items-center gap-1 whitespace-nowrap r
 
 /**
  * Only what needs the person now: an unpaid top-up, a top-up being confirmed,
- * a transfer that can still be withdrawn, a legacy return request, or C2C
- * trades in progress. Renders nothing when there is nothing to do.
+ * a legacy return request, or C2C trades in progress. Renders nothing when there is nothing to do.
  */
 export function WalletPendingActions({
   topups,
-  pendingTransfers,
   awaitingReturns,
   c2cActive,
   onChanged,
@@ -30,7 +27,6 @@ export function WalletPendingActions({
   onTopupChanged,
 }: {
   topups: MarketWalletTopup[];
-  pendingTransfers: WalletTransfer[];
   awaitingReturns: AwaitingReturn[];
   c2cActive: number;
   onChanged: () => Promise<void>;
@@ -44,7 +40,7 @@ export function WalletPendingActions({
   const [error, setError] = React.useState("");
   const time = (value: string) => new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
   const open = topups.filter(isOpenTopup);
-  const count = open.length + pendingTransfers.length + awaitingReturns.length + (c2cActive > 0 ? 1 : 0);
+  const count = open.length + awaitingReturns.length + (c2cActive > 0 ? 1 : 0);
   if (!count && !notice && !error) return null;
 
   const run = async (id: string, work: () => Promise<unknown>, done?: string) => {
@@ -104,24 +100,6 @@ export function WalletPendingActions({
             </li>
           );
         })}
-        {pendingTransfers.map((transfer) => (
-          <li key={transfer.id} className={ROW}>
-            <div className="grid min-w-0 gap-0.5">
-              <p className="break-all text-sm font-semibold tabular-nums">
-                {t("walletPage.transferPending", { email: transfer.recipientEmail, amount: formatWalletUnits(transfer.amountUnits) })}
-              </p>
-              {transfer.releaseAt ? <p className="text-xs text-muted-foreground">{t("walletPage.transferPendingNote", { time: time(transfer.releaseAt) })}</p> : null}
-            </div>
-            <button
-              type="button"
-              className={WALLET_SECONDARY_BUTTON}
-              disabled={!!busy}
-              onClick={() => void run(transfer.id, () => withdrawPendingTransfer(transfer.id), t("walletPage.withdrawn"))}
-            >
-              <Undo2 className="size-4" aria-hidden />{t("walletPage.withdraw")}
-            </button>
-          </li>
-        ))}
         {awaitingReturns.map((request) => (
           <li key={request.id} className={ROW}>
             <div className="grid min-w-0 gap-0.5">

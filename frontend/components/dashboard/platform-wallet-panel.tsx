@@ -182,7 +182,6 @@ export function PlatformWalletPanel({ initialWallet, rememberKey }: { initialWal
         <div className="grid min-w-0 gap-6">
           <WalletPendingActions
             topups={data.topups}
-            pendingTransfers={data.pendingTransfers}
             awaitingReturns={data.awaitingReturns}
             c2cActive={data.c2cActive}
             onChanged={reload}

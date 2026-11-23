@@ -83,7 +83,7 @@ export const walletPolicyMessagesEn = {
     "Sent. Reload the balance to see the latest amount available to send.",
   "walletTransfer.title": "Send balance",
   "walletTransfer.help":
-    "Free. Credits instantly to people you have sent money to before; a first transfer to someone credits after 24 hours and can be withdrawn until then.",
+    "Free and credited instantly. A first transfer to someone, and any transfer of US$500 or more, is confirmed with your login password. Credited transfers cannot be undone.",
   "walletTransfer.email": "Recipient email",
   "walletTransfer.amount": "Amount (USD)",
   "walletTransfer.all": "Send all available",
@@ -191,7 +191,7 @@ export const walletPolicyMessagesZh: Record<
     "转出已完成，请重新加载余额以查看最新可转出金额。",
   "walletTransfer.title": "转出余额",
   "walletTransfer.help":
-    "免费。向转过账的收款人即时到账；首次转给某人 24 小时后到账，到账前可撤回。",
+    "免费，即时到账。首次转给某人或单笔 500 美元及以上，需输入登录密码确认。到账后不可撤回。",
   "walletTransfer.email": "收款用户邮箱",
   "walletTransfer.amount": "金额（美元）",
   "walletTransfer.all": "转出全部可转出余额",

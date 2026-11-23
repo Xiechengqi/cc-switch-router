@@ -6,7 +6,7 @@ export const walletActionsMessagesEn = {
   "common.moreInfo": "More information",
 
 
-  "walletTransfer.helpShort": "Free · first transfer to someone credits after 24 hours",
+  "walletTransfer.helpShort": "Free · credits instantly",
   "walletTransfer.allShort": "All",
   "walletTransfer.availableShort": "Sendable {amount}",
 
@@ -33,7 +33,7 @@ export const walletActionsMessagesZh: Record<keyof typeof walletActionsMessagesE
   "common.moreInfo": "查看说明",
 
 
-  "walletTransfer.helpShort": "免费 · 首次转给某人 24 小时后到账，到账前可撤回",
+  "walletTransfer.helpShort": "免费 · 即时到账",
   "walletTransfer.allShort": "全部",
   "walletTransfer.availableShort": "可转出 {amount}",
 

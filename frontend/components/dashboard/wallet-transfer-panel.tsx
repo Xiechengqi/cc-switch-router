@@ -167,15 +167,10 @@ export function WalletTransferPanel({
         keyRef.current,
       );
       setSuccess(
-        value.status === "pending" && value.releaseAt
-          ? t("walletTransfer.pendingSuccess", {
-            email: value.recipientEmail,
-            time: new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value.releaseAt)),
-          })
-          : t("walletTransfer.success", {
-            amount: formatWalletUnits(value.amountUnits),
-            email: value.recipientEmail,
-          }),
+        t("walletTransfer.success", {
+          amount: formatWalletUnits(value.amountUnits),
+          email: value.recipientEmail,
+        }),
       );
       setQuote(null);
       setAmount("");
@@ -203,10 +198,8 @@ export function WalletTransferPanel({
         <p className="break-all text-3xl font-semibold tabular-nums">
           {formatWalletUnits(quote.amountUnits)}
         </p>
-        <p className={`text-sm leading-6 ${quote.delivery === "delayed" ? "rounded-lg bg-accent/5 px-3 py-2 text-accent" : "text-muted-foreground"}`}>
-          {quote.delivery === "delayed"
-            ? t("walletTransfer.delayed", { hours: quote.delayHours ?? 24 })
-            : t("walletTransfer.instant")}
+        <p className={`text-sm leading-6 ${quote.firstRecipient ? "rounded-lg bg-accent/5 px-3 py-2 text-accent" : "text-muted-foreground"}`}>
+          {t(quote.firstRecipient ? "walletTransfer.firstRecipient" : "walletTransfer.instant")}
         </p>
       </div>
       {error ? <p role="alert" className="break-words text-sm text-destructive">{error}</p> : null}

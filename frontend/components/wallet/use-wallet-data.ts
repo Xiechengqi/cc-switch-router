@@ -16,8 +16,7 @@ import {
 import { rememberView } from "@/lib/cached-resource";
 import { isOpenTopup } from "@/lib/wallet-view";
 export { isOpenTopup };
-import { getAwaitingReturns, getPendingTransfers, type AwaitingReturn } from "@/lib/wallet-transfer-returns";
-import type { WalletTransfer } from "@/lib/wallet-policy-api";
+import { getAwaitingReturns, type AwaitingReturn } from "@/lib/wallet-transfer-returns";
 
 function mergeById<T extends { id: string }>(first: T[], rest: T[]): T[] {
   const seen = new Set(first.map((item) => item.id));
@@ -33,7 +32,6 @@ export type WalletData = {
   topupCursor: string | null;
   transactions: MarketWalletTransaction[];
   transactionCursor: string | null;
-  pendingTransfers: WalletTransfer[];
   awaitingReturns: AwaitingReturn[];
   c2cActive: number;
   ready: boolean;
@@ -45,8 +43,8 @@ export type WalletData = {
 };
 
 /**
- * One loader for the balance page: balance, recent top-ups and activity, the
- * sender's pending transfers, legacy return requests and active C2C trades.
+ * One loader for the balance page: balance, recent top-ups and activity,
+ * legacy return requests and active C2C trades.
  * It refreshes on balance-change signals and, while a top-up is open, on a
  * gentle interval and whenever the tab becomes visible.
  */
@@ -56,7 +54,6 @@ export function useWalletData(actorId: string, initialWallet: MarketWallet, reme
   const [topupCursor, setTopupCursor] = React.useState<string | null>(null);
   const [transactions, setTransactions] = React.useState<MarketWalletTransaction[]>([]);
   const [transactionCursor, setTransactionCursor] = React.useState<string | null>(null);
-  const [pendingTransfers, setPendingTransfers] = React.useState<WalletTransfer[]>([]);
   const [awaitingReturns, setAwaitingReturns] = React.useState<AwaitingReturn[]>([]);
   const [c2cActive, setC2CActive] = React.useState(0);
   const [ready, setReady] = React.useState(false);
@@ -70,12 +67,11 @@ export function useWalletData(actorId: string, initialWallet: MarketWallet, reme
 
   const reload = React.useCallback(async () => {
     const current = ++version.current;
-    const [nextWallet, nextTopups, nextTransactions, nextPending, nextReturns, nextC2C] = await Promise.all([
+    const [nextWallet, nextTopups, nextTransactions, nextReturns, nextC2C] = await Promise.all([
       getMarketWallet(),
       getMarketWalletTopups(),
       getMarketWalletTransactions(),
       // Secondary sections must not block the balance and top-up.
-      getPendingTransfers().catch(() => null),
       getAwaitingReturns().catch(() => null),
       getC2COrders({ status: "active" }).then((page) => page.items.length).catch(() => null),
     ]);
@@ -85,7 +81,6 @@ export function useWalletData(actorId: string, initialWallet: MarketWallet, reme
     if (!expanded.current.topups) setTopupCursor(nextTopups.nextCursor);
     setTransactions((existing) => mergeById(nextTransactions.items, existing));
     if (!expanded.current.transactions) setTransactionCursor(nextTransactions.nextCursor);
-    if (nextPending) setPendingTransfers(nextPending);
     if (nextReturns) setAwaitingReturns(nextReturns);
     if (nextC2C != null) setC2CActive(nextC2C);
     setReady(true);
@@ -159,7 +154,7 @@ export function useWalletData(actorId: string, initialWallet: MarketWallet, reme
   }, []);
 
   return {
-    wallet, topups, topupCursor, transactions, transactionCursor, pendingTransfers, awaitingReturns,
+    wallet, topups, topupCursor, transactions, transactionCursor, awaitingReturns,
     c2cActive, ready, error, reload, loadMore, replaceTopup, setC2CActive,
   };
 }

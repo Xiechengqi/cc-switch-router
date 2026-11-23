@@ -73,16 +73,13 @@ export type TransferQuote = {
   recipientEmail: string;
   amountUnits: string;
   expiresAt: string;
-  /** `delayed`: first transfer to this recipient, credits after `delayHours`. */
-  delivery?: "instant" | "delayed";
-  delayHours?: number;
 };
 export type WalletTransfer = {
   id: string;
   senderEmail: string;
   recipientEmail: string;
   amountUnits: string;
-  /** Absent while a delayed transfer has not credited. */
+  /** Absent only for a legacy delayed transfer that has not credited yet. */
   journalId: string | null;
   createdAt: string;
   status?: "completed" | "pending" | "cancelled";
