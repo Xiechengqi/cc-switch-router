@@ -29,7 +29,7 @@ import {
 import { expiryTitle } from "@/components/dashboard/share-dashboard-utils";
 import { filterMarketListings } from "@/components/dashboard/share-market/buyer-catalog-utils";
 import { MarketListingFilters } from "@/components/dashboard/share-market/market-listing-filters";
-import { MarketShareIdentity } from "@/components/dashboard/share-market/market-share-identity";
+import { MarketShareIdentity, OwnedShareOptionIdentity } from "@/components/dashboard/share-market/market-share-identity";
 import {
   CatalogSeatPreviewList,
   MARKET_SHARE_CARD_GRID_CLASS,
@@ -730,7 +730,7 @@ export function ShareMarketAddListingDialog({
                     options={eligibleShares.map((share) => ({
                       value: share.shareId,
                       label: share.subdomain || share.shareName,
-                      content: <MarketShareIdentity source={share} />,
+                      content: <OwnedShareOptionIdentity share={share} />,
                     }))}
                     onChange={(value) => {
                       const next = eligibleShares.find((share) => share.shareId === value);
@@ -739,7 +739,7 @@ export function ShareMarketAddListingDialog({
                     }}
                     ariaLabel={t("shareMarket.dialog.selectShare")}
                     className="w-full"
-                    triggerClassName="min-h-9 w-full text-sm"
+                    triggerClassName="min-h-9 w-full py-1.5 text-xs"
                   />
                 </label>
                 {selected ? <ShareCapacitySummary parallelLimit={selected.parallelLimit} tokenLimit={selected.tokenLimit} expiresAt={selected.expiresAt} /> : null}

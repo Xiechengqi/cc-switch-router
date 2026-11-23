@@ -234,7 +234,7 @@ location.reload();
 |---|---|---|---|
 | SM-01 | 任意 | 打开 `/share-market` | 顶部只显示 Share Market / Client Market；空 catalog 正常显示，不能出现旧 Token Market tab |
 | SM-02 | 未登录 | 点租用或添加 Share | 打开登录弹窗,不提交写请求 |
-| SM-03 | 已登录且拥有 active 私有 Share | 点添加 Share | 只列出允许新建 listing、未开启“公开免费使用”且没有 closed listing 的 Share；下拉每项展示 Share 名称、subdomain、owner 邮箱和全部已绑定应用；可一次添加 1-20 个拼车位 |
+| SM-03 | 已登录且拥有 active 私有 Share | 点添加 Share | 只列出允许新建 listing、未开启“公开免费使用”且没有 closed listing 的 Share；下拉每项第一行展示供应商图标、subdomain 和 Share 状态（含状态圆点），第二行展示每个已启用 API 类型的应用图标和模型（透传显示“透传”，固定模式显示上游模型，未知显示“未知”）；可一次添加 1-20 个拼车位 |
 | SM-04 | 添加拼车位 | 保持价格模式为免费 | 默认固定服务期限 1 天；请求中日费率和币种均为空，`serviceDurationDays=1` |
 | SM-05 | 添加付费拼车位 | 切到付费后输入三位以上小数、经 API 提交非 USD 币种,或未配置 USD 收款资料/付款宽限 | 切到付费时默认无固定期限；UI 固定使用 USD；非法报价被前后端阻止 |
 | SM-06 | 有可用拼车位 | 可信买家租用 | 座位进入 pending/occupied；同一用户不能重复租同一 Share；已有 direct grant 的用户不显示租用按钮 |
