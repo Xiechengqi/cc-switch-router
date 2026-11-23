@@ -384,9 +384,12 @@ try {
   assert.equal(codeRequests, 2, "password login never sends an OTP email");
   await changeMenu("Change login password");
   assert.equal(await dialog().getByLabel("Current password", { exact: true }).count(), 0);
+  // The notice email never contains the password; the password also confirms
+  // wallet payments.
   await dialog()
-    .getByText("A confirmation email will include your new password.", { exact: false })
+    .getByText("the email does not contain it", { exact: false })
     .waitFor();
+  assert.equal(await dialog().getByText("will include your new password", { exact: false }).count(), 0);
   await setNew("next06");
   await page
     .getByRole("heading", { name: "Password saved", exact: true })
@@ -552,8 +555,9 @@ try {
   assert.equal(await dialog().locator('input[type="password"]').count(), 2);
   await dialog().getByText("使用 6–128 个字符", { exact: false }).waitFor();
   await dialog()
-    .getByText("确认邮件将包含新密码明文", { exact: false })
+    .getByText("通知邮件（不含密码）", { exact: false })
     .waitFor();
+  assert.equal(await dialog().getByText("新密码明文", { exact: false }).count(), 0);
   await dialog().getByRole("button", { name: "取消", exact: true }).click();
   await dialog().waitFor({ state: "hidden" });
   assert.deepEqual(errors, []);
