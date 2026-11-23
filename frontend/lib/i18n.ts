@@ -1,4 +1,5 @@
 "use client";
+import { hostHealthMessagesEn, hostHealthMessagesZh } from "./host-health-messages";
 
 import {
   settingsMessagesEn,
@@ -40,6 +41,7 @@ export type MessageKey = keyof typeof messages.en;
 
 export const messages = {
   en: {
+    ...hostHealthMessagesEn,
     "dashboard.grantMedia.title": "Media generation and tools",
     "dashboard.grantMedia.selectedCount": "Media and tools · {count}",
     "dashboard.grantMedia.marketPermission": "Permissions set by purchase",
@@ -427,6 +429,9 @@ export const messages = {
       "After any trial, the first paid calendar month starts when healthy service begins. The same day anchors later renewals; leaving early does not refund the current month.",
 
     "shareMarket.status": "Status",
+    "shareMarket.shareStatus.active": "Active",
+    "shareMarket.shareStatus.paused": "Paused",
+    "shareMarket.shareStatus.expired": "Expired",
     "shareMarket.seat": "Seat {position}",
     "shareMarket.free": "Free",
     "shareMarket.permanent": "Permanent",
@@ -3620,6 +3625,7 @@ export const messages = {
     ...marketNotificationCopyEn,
   },
   "zh-CN": {
+    ...hostHealthMessagesZh,
     "dashboard.grantMedia.title": "媒体生成与工具",
     "dashboard.grantMedia.selectedCount": "媒体与工具已开启 {count} 项",
     "dashboard.grantMedia.marketPermission": "权限由购买套餐决定",
@@ -4000,6 +4006,9 @@ export const messages = {
       "试用结束后，首个付费日历月从健康服务开始时起算，该日期作为后续每月续费锚点；提前退出不退当期费用。",
 
     "shareMarket.status": "状态",
+    "shareMarket.shareStatus.active": "已启用",
+    "shareMarket.shareStatus.paused": "已暂停",
+    "shareMarket.shareStatus.expired": "已过期",
     "shareMarket.seat": "拼车位 {position}",
     "shareMarket.free": "免费",
     "shareMarket.permanent": "永久",
