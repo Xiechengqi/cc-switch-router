@@ -317,6 +317,10 @@ fn critical_case_still_failed_tx(
                 AND p.account_kind IN ('platform_commission_pending', 'platform_commission_revenue')
                 AND NOT EXISTS(SELECT 1 FROM market_provider_earning_lots l WHERE l.id = p.subject_id))",
             params![object_id], |r| r.get(0)).map_err(db_error("recheck orphan commission journal")),
+        // A service-reconcile failure is a transient settlement error, not a
+        // money mismatch; there is no invariant to recheck, so it is always
+        // resolvable (and the worker pages the Owner separately).
+        ("wallet_service_reconcile_failed", "platform_contract") => Ok(false),
         ("wallet_projection_mismatch", "wallet") => {
             Ok(reconcile_wallet_tx(conn, object_id).is_err())
         }

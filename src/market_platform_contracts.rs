@@ -5069,6 +5069,17 @@ mod tests {
         .unwrap();
         assert_eq!(
             conn.query_row(
+                "SELECT status FROM market_finance_reconciliation_cases
+                 WHERE object_id = ?1",
+                params![id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "resolved",
+            "the review case closes"
+        );
+        assert_eq!(
+            conn.query_row(
                 "SELECT transition, COUNT(*) FROM operator_alert_signal_outbox
                  WHERE kind = 'market_wallet_contract_reconcile_failed'
                  GROUP BY transition ORDER BY transition",
