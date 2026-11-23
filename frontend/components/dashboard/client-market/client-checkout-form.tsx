@@ -1,4 +1,5 @@
 "use client";
+import { HostHealthSummary } from "./host-health";
 
 import * as React from "react";
 import { Button } from "@heroui/react";
@@ -90,6 +91,8 @@ export function ClientCheckoutForm({
               </div>
               <strong className="shrink-0 text-sm tabular-nums">{price}</strong>
             </div>
+            <HostHealthSummary health={item.hostHealth} hostLabel={item.hostname || item.ip || item.hostId} />
+            <p className="text-xs text-muted-foreground">{t("hostHealth.consent")}</p>
             <div className="grid gap-1.5">
               <label htmlFor={addressId} className="text-sm font-medium">
                 {t("clientCheckout.address")}

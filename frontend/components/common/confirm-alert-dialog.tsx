@@ -64,7 +64,7 @@ export function ConfirmAlertDialog({
             <AlertDialog.Footer>
               <Button
                 variant="ghost"
-                className="!text-slate-700 hover:!bg-slate-100"
+                className="!min-h-11 !text-slate-700 hover:!bg-slate-100"
                 isDisabled={busy}
                 onClick={() => onOpenChange(false)}
               >
@@ -72,7 +72,7 @@ export function ConfirmAlertDialog({
               </Button>
               <Button
                 variant={confirmVariant}
-                className={confirmClassName}
+                className={`!min-h-11 ${confirmClassName}`}
                 isDisabled={busy || confirmDisabled}
                 onClick={onConfirm}
               >

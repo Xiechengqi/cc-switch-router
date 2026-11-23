@@ -129,12 +129,17 @@ Bundle 绑定聚合，不从 Claude/Codex/Gemini API、兼容类型或名称猜�
 
 Host Provider 贡献一台 Linux 服务器,Router 用**专用外发 Ed25519 provision key**(与入站 SSH host key 相互独立,`src/provision_ssh.rs` `require_provision_ssh_keys()`)登录,安装依赖并部署 Server,使其成为 Client + Router 容量与 Share 服务的供给节点。
 
-主机入市后通过持久化的 `client_binary_preparations` 队列预下载所选 Server Release，只验证摘要，不运行程序。主机缓存独立于 `/usr/local/bin/cc-switch-server` 和租户数据，最多保留最近两份 binary。租用创建任务在启动前从 GitHub 重新确认发布的完整 commit 与摘要，使用 ETag 条件请求及并发合并，校验缓存后再次检查发布身份。正式安装从验证过的缓存原子替换，继续执行租户初始化和一次启动。预下载队列、状态和缓存失败均可恢复；实际租用仍要求当前 Release 可确认。
+新 Host 以 `onboarding` 入队，准备 worker 预下载并校验 Release，再将它复制为独立的 `cc-switch-host-standby`，登记本机生成的公钥、安装低权限待机服务并交付首次排程。收到本代有效首报后才以事务转为 `idle`。待机服务每个 UTC 自然小时随机择时上报一次完整快照，租期内持续运行。市场主行、详情和报价使用同一健康投影，动态资源按采样所属租约裁剪。两仓共享 v1 协议样例，线格式见 [PROTOCOL.md](PROTOCOL.md)。
+
+下载缓存独立于待机副本、`/usr/local/bin/cc-switch-server` 和租户数据，最多保留最近两份 binary。租用任务重新确认所选 Release 的完整 commit 与摘要，继续执行租户初始化和一次启动。租后维护独立入队，和报价通过 Host 的数据库状态竞争执行权，远端维护及开通同时核对持久动作序号并使用同一排他锁。维护失败保留诊断和重试入口，租约释放和账务结案可以先完成。
 
 主机状态机(`router_ssh_hosts.status`):
 
 ```
-idle ──► locked ──► allocated ──► draining ──► idle
+onboarding ──有效首报──► idle ──► reserved ──► locked ──► allocated ──► draining ──► idle
+                         │                                                    │
+                         └──► maintaining ◄──待机维护领取──────────────────────┘
+                                 └──► idle
 
 异常态:unreachable / abnormal / disabled / reserved
 ```
@@ -154,7 +159,7 @@ idle ──► locked ──► allocated ──► draining ──► idle
 
 Host Provider 还可对不可达 Host 执行 `POST /v1/client-market/hosts/:id/retire-unreachable`,直接删除该 Host 记录。
 
-这里的后台重试仅覆盖 Router 自身的首次开通 job 和显式 cleanup job。首次开通脚本只启动一次 Client 进程，安装的 systemd/OpenRC 服务不启用开机启动、失败重启或 respawn。开通完成后，Router 不会因 tunnel 离线而通过 provision SSH 启动或重启 `cc-switch-server`；只记录 `online`、`reconnecting`、`offline`、`disabled` 连接状态并继续心跳、告警和 UI 提示。Client 进程生命周期完全由 Client owner 管理。
+租户 Client 的后台重试覆盖 Router 自身的首次开通 job 和显式 cleanup job。独立待机副本使用自己的 systemd/OpenRC 开机守护，只有 nohup 的环境向买家提示未配置开机自启。首次开通脚本只启动一次 Client 进程，安装的 systemd/OpenRC 服务不启用开机启动、失败重启或 respawn。开通完成后，Router 不会因 tunnel 离线而通过 provision SSH 启动或重启 `cc-switch-server`；只记录 `online`、`reconnecting`、`offline`、`disabled` 连接状态并继续心跳、告警和 UI 提示。Client 进程生命周期完全由 Client owner 管理。
 
 **准入与支付**：免费和付费 Host 分别执行 `client_host/free`、`client_host/paid` 准入。新付费租用始终从用户全站 USD 余额支付，不受官方充值模式影响；Provider 的收款方式不再作为商品支付渠道或筛选项，付费发布仅需有效的供应商身份，不要求任何外部提现地址。新付费报价采用日历月租，保留的按日计费也只使用平台钱包合同。Provider 自用按免费处理。
 

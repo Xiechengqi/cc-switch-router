@@ -102,7 +102,7 @@ function providerFreeIdle(provider: ClientMarketProvider) {
   if (typeof provider.countries?.[0]?.freeIdle === "number") {
     return provider.countries.reduce((sum, country) => sum + (country.freeIdle || 0), 0);
   }
-  return Math.max(0, (provider.freeHostTotal || 0) - (provider.freeAllocatedTotal || 0));
+  return 0;
 }
 
 export function recommendedClientMarketProviderId(
@@ -195,7 +195,7 @@ export function hostCanDelete(host: ClientMarketHost, viewerEmail?: string | nul
   return (
     hostCanManage(host, viewerEmail) &&
     !host.installationId &&
-    (host.status === "idle" || host.status === "disabled" || host.status === "abnormal")
+    (host.status === "onboarding" || host.status === "maintaining" || host.status === "idle" || host.status === "disabled" || host.status === "abnormal")
   );
 }
 
@@ -447,6 +447,8 @@ export function formatHostIpLocation(
 
 export function statusLabelKey(status: string): MessageKey {
   const known = {
+    onboarding: "clientMarket.status.onboarding",
+    maintaining: "clientMarket.status.maintaining",
     idle: "clientMarket.status.idle",
     reserved: "clientMarket.status.reserved",
     allocated: "clientMarket.status.allocated",
@@ -485,7 +487,7 @@ export function hostBelongsToViewer(host: {
 export const STATUS_GROUP_MEMBERS: Record<Exclude<HostStatusFilter, "all">, readonly string[]> = {
   idle: ["idle"],
   in_use: ["allocated", "locked", "reserved"],
-  needs_attention: ["draining", "unreachable", "abnormal", "disabled"],
+  needs_attention: ["onboarding", "maintaining", "draining", "unreachable", "abnormal", "disabled"],
 };
 
 export function statusGroupForHost(status: string): Exclude<HostStatusFilter, "all"> | null {

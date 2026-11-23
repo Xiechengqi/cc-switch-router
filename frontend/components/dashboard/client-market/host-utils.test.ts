@@ -53,7 +53,7 @@ function provider(providerId: string, freeIdle: number): ClientMarketProvider {
     anomalousHostRate: 0,
     successfulAllocations: 0,
 
-    countries: [],
+    countries: [{ code: "US", total: freeIdle, idle: freeIdle, freeIdle, freeTotal: freeIdle }],
   };
 }
 

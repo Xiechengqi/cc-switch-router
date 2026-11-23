@@ -1720,6 +1720,21 @@ export async function getClientMarketHostUsageHistory(
   );
 }
 
+export async function getClientMarketHostHealth(hostId: string, signal?: AbortSignal) {
+  return parseJson<import("./types").HostHealthDetail>(
+    await authFetch("/v1/client-market/hosts/" + encodeURIComponent(hostId) + "/health", { cache: "no-store", signal }),
+  );
+}
+
+export async function manageClientMarketHostHealth(hostId: string, action: "retry" | "rotate-key" | "replace", options?: { expectedMachineEpoch?: number; compromised?: boolean }) {
+  const input = action === "replace"
+    ? { expectedMachineEpoch: options?.expectedMachineEpoch }
+    : action === "rotate-key" ? { compromised: options?.compromised ?? false } : {};
+  return parseJson<{ queued: boolean }>(
+    await authFetch("/v1/client-market/hosts/" + encodeURIComponent(hostId) + "/health/" + action, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) }),
+  );
+}
+
 export async function grantClientMarketProviderTerminalAccess(
   installationId: string,
   durationMinutes: number,

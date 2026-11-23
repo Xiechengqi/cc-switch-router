@@ -5085,7 +5085,9 @@ mod tests {
                  GROUP BY transition ORDER BY transition",
             )
             .unwrap()
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
             .unwrap()
             .map(|row| row.unwrap())
             .collect();

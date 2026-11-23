@@ -12098,7 +12098,8 @@ mod tests {
     fn legacy_supply_is_not_an_official_topup_readiness_gate() {
         let conn = memory();
         let before = serde_json::to_value(finance_readiness_tx(&conn).unwrap()).unwrap();
-        conn.execute("INSERT INTO router_ssh_hosts(id,ip,port,host_owner_email,status,created_at,updated_at,daily_rate_minor,currency) VALUES('old-host','192.0.2.10',22,'provider@example.com','idle','2026-10-01','2026-10-01',100,'USD')", []).unwrap();
+        conn.execute("INSERT INTO router_ssh_hosts(id,ip,port,host_owner_email,status,created_at,updated_at,daily_rate_minor,currency) VALUES('old-host','192.0.2.10',22,'provider@example.com','onboarding','2026-10-01','2026-10-01',100,'USD')", []).unwrap();
+        crate::test_support::admit_fixture_hosts(&conn);
         conn.execute(
             "UPDATE router_ssh_hosts SET funding_rail='legacy_provider' WHERE id='old-host'",
             [],
@@ -12134,11 +12135,12 @@ mod tests {
             "INSERT INTO router_ssh_hosts
              (id, ip, port, host_owner_email, status, created_at, updated_at,
               daily_rate_minor, currency)
-             VALUES ('host', '192.0.2.10', 22, 'provider@example.com', 'idle',
+             VALUES ('host', '192.0.2.10', 22, 'provider@example.com', 'onboarding',
                      '2026-10-01', '2026-10-01', 100, 'USD')",
             [],
         )
         .unwrap();
+        crate::test_support::admit_fixture_hosts(&conn);
         let rails = || -> (String, String) {
             (
                 conn.query_row(

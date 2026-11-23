@@ -1071,7 +1071,14 @@ mod tests {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .unwrap();
         let at = "2026-01-01T00:00:00+00:00";
-        case_tx(&tx, "wallet_service_reconcile_failed", "platform_contract", "c", at).unwrap();
+        case_tx(
+            &tx,
+            "wallet_service_reconcile_failed",
+            "platform_contract",
+            "c",
+            at,
+        )
+        .unwrap();
         let case_id: String = tx
             .query_row(
                 "SELECT id FROM market_finance_reconciliation_cases

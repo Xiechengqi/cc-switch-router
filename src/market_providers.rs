@@ -1208,6 +1208,7 @@ mod tests {
                        'client-supplier');",
         )
         .expect("seed disabled public Client supply");
+        crate::test_support::admit_fixture_hosts(&conn);
         assert!(client_supply(&conn, "mp_client_supply").unwrap().is_empty());
 
         conn.execute(

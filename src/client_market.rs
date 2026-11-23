@@ -36,6 +36,8 @@ use crate::store::AppStore;
 pub const PROVISION_SOURCE_ROUTER_MARKET: &str = "router_market";
 #[path = "client_market_binary.rs"]
 mod binary;
+#[path = "client_market_health.rs"]
+pub(crate) mod health;
 
 const HOST_STATUS_IDLE: &str = "idle";
 const HOST_STATUS_ALLOCATED: &str = "allocated";
@@ -799,11 +801,19 @@ pub(crate) fn client_public_url(config: &Config, subdomain: &str) -> String {
 
 pub fn router() -> Router<ServerState> {
     Router::new()
+        .merge(health::routes())
         .route(
             "/v1/client-market/provision-ssh-key",
             get(get_provision_ssh_key),
         )
-        .route("/v1/client-market/hosts", get(list_hosts).post(create_host))
+        .route(
+            "/v1/client-market/hosts",
+            get(list_hosts)
+                .post(create_host)
+                .layer(axum::middleware::from_fn(
+                    crate::client_market_audit::private_response,
+                )),
+        )
         .route("/v1/client-market/hosts/export", get(export_hosts))
         .route("/v1/client-market/hosts/import", post(import_hosts))
         .route(
@@ -934,6 +944,7 @@ struct RouterSshHostView {
     last_verified_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     binary_preparation: Option<binary::PreparationView>,
+    host_health: Option<health::Summary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1012,6 +1023,7 @@ async fn list_hosts(
         )
         .await?;
     let binary_preparations = binary::views(&state).await?;
+    let health_views = health::views(&state, viewer.as_ref(), None).await?;
     let hidden_paid_host_ids = {
         let conn = state.store.conn.lock().await;
         unavailable_paid_host_ids(&conn)?
@@ -1019,6 +1031,14 @@ async fn list_hosts(
     let hosts = hosts
         .into_iter()
         .filter(|host| {
+            if matches!(host.status.as_str(), "onboarding" | "maintaining")
+                && !viewer_is_admin
+                && !viewer.as_ref().is_some_and(|session| {
+                    session_is_host_owner(session, host.provider_id.as_deref())
+                })
+            {
+                return false;
+            }
             !hidden_paid_host_ids.contains(&host.id)
                 || viewer_is_admin
                 || viewer.as_ref().is_some_and(|session| {
@@ -1168,6 +1188,7 @@ async fn list_hosts(
                 None
             };
             RouterSshHostView {
+                host_health: health_views.get(&host.id).cloned(),
                 id: host.id,
                 provider_id: host.provider_id,
                 market_provider_id: host.market_provider_id,
@@ -1925,7 +1946,11 @@ async fn reverify_host(
         .await?;
     if !matches!(
         host.status.as_str(),
-        HOST_STATUS_UNREACHABLE | HOST_STATUS_DISABLED | HOST_STATUS_IDLE | HOST_STATUS_ABNORMAL
+        HOST_STATUS_UNREACHABLE
+            | HOST_STATUS_DISABLED
+            | HOST_STATUS_IDLE
+            | HOST_STATUS_ABNORMAL
+            | "onboarding"
     ) {
         return Err(AppError::Conflict(
             "host cannot be reverified in its current state".into(),
@@ -2112,7 +2137,34 @@ async fn delete_host(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let session = require_session(&state, &headers).await?;
+    let host = state
+        .store
+        .client_market_get_host_for_operator(&id, &session)
+        .await?;
+    let sequence = state
+        .store
+        .conn
+        .lock()
+        .await
+        .query_row(
+            "SELECT operation_sequence+1 FROM client_host_agents WHERE host_id=?1",
+            params![id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| AppError::Internal(error.to_string()))?;
     state.store.client_market_delete_host(&id, &session).await?;
+    if let Some(sequence) = sequence {
+        tokio::spawn(async move {
+            let _guard = state
+                .client_market_actions
+                .lock(&format!("binary:{}", host.id))
+                .await;
+            if let Err(error) = health::uninstall(&state, &host, sequence).await {
+                warn!(host_id=%host.id, %error, "Host retired; remote standby removal deferred to revocation");
+            }
+        });
+    }
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -2590,6 +2642,8 @@ pub async fn reconcile_interrupted_host_import_jobs(state: ServerState) -> Resul
 
 /// Periodic repair for stuck draining / remotely-clean unreachable hosts.
 pub async fn reconcile_stale_market_hosts(state: ServerState) -> Result<(), AppError> {
+    // Health settlement runs on its own 10-second observer; a failure there must not
+    // skip the inventory repairs below.
     if let Err(error) = binary::reconcile(&state).await {
         warn!(error = %error, "Client binary queue reconciliation failed");
     }
@@ -3165,8 +3219,15 @@ async fn run_create_job_inner(state: &ServerState, job_id: &str) -> Result<(), A
         ));
     }
     let password_stdin = format!("{password}\n").into_bytes();
-    let install_result =
-        binary::install(state, &host, &owner_email, &subdomain, password_stdin).await;
+    let install_result = binary::install(
+        state,
+        &host,
+        job_id,
+        &owner_email,
+        &subdomain,
+        password_stdin,
+    )
+    .await;
     state
         .client_market_job_secrets
         .lock()
@@ -5750,6 +5811,7 @@ fn host_to_view(host: RouterSshHostRecord, reveal: bool) -> RouterSshHostView {
         can_retire_unreachable: false,
         client_connection: None,
         binary_preparation: None,
+        host_health: None,
         last_verified_at: reveal.then_some(host.last_verified_at).flatten(),
         last_error: reveal.then_some(host.last_error).flatten(),
         note: reveal.then_some(host.note).flatten(),
@@ -6507,7 +6569,7 @@ impl AppStore {
                 country_code,
                 hostname,
                 fingerprint,
-                HOST_STATUS_IDLE,
+                "onboarding",
                 now,
                 note,
                 ip_intel_json,
@@ -6548,6 +6610,8 @@ impl AppStore {
         if host.status != HOST_STATUS_IDLE
             && host.status != HOST_STATUS_DISABLED
             && host.status != HOST_STATUS_ABNORMAL
+            && host.status != "onboarding"
+            && host.status != "maintaining"
         {
             return Err(AppError::Conflict(
                 "host must be idle, disabled, or abnormal before deletion".into(),
@@ -7969,7 +8033,7 @@ impl AppStore {
         let changed = tx
             .execute(
                 "UPDATE router_ssh_hosts
-                 SET status = 'idle', installation_id = NULL, last_error = NULL, updated_at = ?3
+                 SET status = CASE WHEN EXISTS(SELECT 1 FROM client_host_agents a WHERE a.host_id=router_ssh_hosts.id AND (a.admitted_hour IS NOT NULL OR a.legacy=1) AND a.revoked=0 AND a.readmission_pending=0) THEN 'idle' ELSE 'maintaining' END, installation_id = NULL, last_error = NULL, updated_at = ?3
                  WHERE id = ?1 AND status = 'unreachable' AND installation_id = ?2",
                 params![host_id, installation_id, now],
             )
@@ -8031,6 +8095,11 @@ impl AppStore {
         last_error: &str,
     ) -> Result<bool, AppError> {
         let conn = self.conn.lock().await;
+        let status = if status == HOST_STATUS_IDLE {
+            health::reusable_status(&conn, host_id)?
+        } else {
+            status
+        };
         let changed = conn
             .execute(
                 "UPDATE router_ssh_hosts
@@ -8178,13 +8247,13 @@ impl AppStore {
                        SELECT 1 FROM installations i
                        WHERE i.id = router_ssh_hosts.installation_id
                    ))
-                   AND status IN ('idle', 'disabled', 'unreachable', 'abnormal')
+                   AND status IN ('onboarding', 'idle', 'disabled', 'unreachable', 'abnormal')
                    AND NOT EXISTS (
                        SELECT 1 FROM provisioning_jobs j
                        WHERE j.host_id = router_ssh_hosts.id
                          AND j.status IN ('pending', 'running')
                    )",
-                params![id, HOST_STATUS_IDLE, hostname, fingerprint, now],
+                params![id, if tx.query_row("SELECT EXISTS(SELECT 1 FROM client_host_agents WHERE host_id=?1 AND (admitted_hour IS NOT NULL OR legacy=1) AND revoked=0 AND readmission_pending=0)", params![id], |row| row.get::<_,bool>(0)).map_err(|e|AppError::Internal(e.to_string()))? { HOST_STATUS_IDLE } else { "onboarding" }, hostname, fingerprint, now],
             )
             .map_err(|e| AppError::Internal(format!("complete host reverify failed: {e}")))?;
         if changed != 1 {
@@ -8415,7 +8484,7 @@ impl AppStore {
         let now = Utc::now().to_rfc3339();
         if let Some(host_id) = host_id {
             let status = if release_to_idle {
-                HOST_STATUS_IDLE
+                health::reusable_status(&tx, host_id)?
             } else {
                 HOST_STATUS_UNREACHABLE
             };
@@ -8957,7 +9026,7 @@ impl AppStore {
                 "UPDATE router_ssh_hosts
              SET status = ?2, installation_id = NULL, last_error = NULL, updated_at = ?3
              WHERE id = ?1 AND status = 'draining'",
-                params![host_id, HOST_STATUS_IDLE, now],
+                params![host_id, health::reusable_status(&tx, host_id)?, now],
             )
             .map_err(|e| AppError::Internal(format!("reset host after cleanup failed: {e}")))?;
         if host_changed != 1 {
@@ -8986,6 +9055,11 @@ impl AppStore {
             host_id,
             Utc::now(),
         )?;
+        tx.execute(
+            "UPDATE client_host_agents SET maintenance_pending=1 WHERE host_id=?1",
+            params![host_id],
+        )
+        .map_err(|e| AppError::Internal(e.to_string()))?;
         tx.commit().map_err(|e| {
             AppError::Internal(format!("commit finish cleanup transaction failed: {e}"))
         })?;
@@ -9044,7 +9118,9 @@ impl AppStore {
             .is_some();
         if !installation_exists {
             if job_status == JOB_STATUS_SUCCEEDED {
-                if host_status == HOST_STATUS_IDLE && host_installation_id.is_none() {
+                if matches!(host_status.as_str(), HOST_STATUS_IDLE | "maintaining")
+                    && host_installation_id.is_none()
+                {
                     return Ok(());
                 }
                 return Err(AppError::Conflict(
@@ -9066,7 +9142,13 @@ impl AppStore {
                          AND j.host_id = router_ssh_hosts.id
                          AND j.status IN ('pending', 'running')
                    )",
-                    params![host_id, HOST_STATUS_IDLE, now, installation_id, job_id],
+                    params![
+                        host_id,
+                        health::reusable_status(&tx, host_id)?,
+                        now,
+                        installation_id,
+                        job_id
+                    ],
                 )
                 .map_err(|e| {
                     AppError::Internal(format!("recover purged cleanup host failed: {e}"))
@@ -9398,11 +9480,12 @@ mod tests {
                 "INSERT INTO router_ssh_hosts
                  (id, ip, port, host_owner_email, status, created_at, updated_at,
                   daily_rate_minor, currency)
-                 VALUES ('old-paid-host', '192.0.2.10', 22, 'owner@example.com', 'idle',
+                 VALUES ('old-paid-host', '192.0.2.10', 22, 'owner@example.com', 'onboarding',
                          '2026-10-01', '2026-10-01', 100, 'USD')",
                 [],
             )
             .unwrap();
+            crate::test_support::admit_fixture_hosts(&conn);
             // A historical paid offer remains unavailable in every recharge
             // mode until the Provider explicitly republishes its price.
             conn.execute("UPDATE router_ssh_hosts SET funding_rail = 'legacy_provider' WHERE id = 'old-paid-host'", []).unwrap();
@@ -9901,7 +9984,7 @@ mod tests {
         ip: &str,
         country: &str,
     ) -> RouterSshHostRecord {
-        store
+        let host = store
             .client_market_insert_host(
                 owner,
                 ip,
@@ -9913,7 +9996,13 @@ mod tests {
                 None,
             )
             .await
-            .expect("insert host")
+            .expect("insert host");
+        crate::test_support::admit_fixture_hosts(&*store.conn.lock().await);
+        store
+            .client_market_get_host(&host.id)
+            .await
+            .unwrap()
+            .unwrap()
     }
 
     fn market_session(user_id: &str, email: &str) -> crate::models::AuthSession {
@@ -9959,7 +10048,7 @@ mod tests {
             let conn = store.conn.lock().await;
             crate::market_access::configure_open_test_policy(&conn, &session, "USD", 50_000, &now);
         }
-        store
+        let host = store
             .client_market_insert_host_for_provider(
                 provider_id,
                 email,
@@ -9975,7 +10064,13 @@ mod tests {
                 None,
             )
             .await
-            .expect("insert Provider Host")
+            .expect("insert Provider Host");
+        crate::test_support::admit_fixture_hosts(&*store.conn.lock().await);
+        store
+            .client_market_get_host(&host.id)
+            .await
+            .unwrap()
+            .unwrap()
     }
 
     async fn create_started_job(
@@ -13881,11 +13976,12 @@ mod tests {
                     note, ip_intel_json, daily_rate_minor, offer_revision, created_at, updated_at
                  ) VALUES (
                     'orphan-host-1', NULL, '198.18.40.2', 22, 'peer@example.com', 'US', 'peer-host',
-                    'SHA256:peer', 'idle', NULL, NULL, NULL, NULL, NULL, NULL, 1, ?1, ?1
+                    'SHA256:peer', 'onboarding', NULL, NULL, NULL, NULL, NULL, NULL, 1, ?1, ?1
                  )",
                 params![Utc::now().to_rfc3339()],
             )
             .unwrap();
+            crate::test_support::admit_fixture_hosts(&conn);
         }
 
         let supply = store

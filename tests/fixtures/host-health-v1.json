@@ -1,0 +1,6 @@
+{
+  "body": "{\"reportVersion\":1,\"hostId\":\"host-fixture\",\"machineEpoch\":1,\"keyGeneration\":1,\"utcHour\":4,\"sampledAt\":\"1970-01-01T04:59:52Z\",\"buildVersion\":\"fixture-v1\",\"snapshot\":{\"os\":\"Linux\",\"arch\":\"x86_64\",\"effectiveVcpu\":{\"value\":0.5,\"unknownReason\":null},\"memoryTotalBytes\":{\"value\":536870912,\"unknownReason\":null},\"memoryAvailableBytes\":{\"value\":268435456,\"unknownReason\":null},\"dataVolumeTotalBytes\":{\"value\":10737418240,\"unknownReason\":null},\"dataVolumeAvailableBytes\":{\"value\":5368709120,\"unknownReason\":null},\"cpuUsagePct\":{\"value\":25,\"unknownReason\":null}}}",
+  "publicKey": "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw",
+  "signature": "nVviONflMxEXpszeW26joQy3gi_5UodzLCOmLv-RPg-R9CMlFALAB1XbXz9Tkw3i_N_sUlpTxKj_Ft-iekMZBA",
+  "scheduleOffsetSeconds": 3592
+}

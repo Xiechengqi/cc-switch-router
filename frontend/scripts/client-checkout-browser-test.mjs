@@ -57,6 +57,7 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
       cancels = 0;
     let retiredMoneyRequests = 0;
     let rentals = [];
+    const healthWrites = [];
     const host = {
       id: "host-1",
       providerId: "provider",
@@ -74,6 +75,19 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
       eligibility: { allowed: true },
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
+      hostHealth: {
+        state: "healthy", lastReceivedAt: "2026-11-01T10:59:59Z", sampledAt: "2026-11-01T10:59:58Z",
+        nextDueAt: "2026-11-01T11:59:00Z", received24h: 22, observable24h: 24, consecutiveMissed: 0,
+        supervision: "nohup", snapshot: {
+          os: "Linux", arch: "aarch64",
+          effectiveVcpu: { value: 1.5, unknownReason: null },
+          memoryTotalBytes: { value: 4 * 2 ** 30, unknownReason: null },
+          memoryAvailableBytes: { value: 2 * 2 ** 30, unknownReason: null },
+          dataVolumeTotalBytes: { value: 64 * 2 ** 30, unknownReason: null },
+          dataVolumeAvailableBytes: { value: 31 * 2 ** 30, unknownReason: null },
+          cpuUsagePct: { value: 25, unknownReason: null },
+        },
+      },
     };
     await page.addInitScript(() => {
       localStorage.setItem(
@@ -107,6 +121,15 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
         return route.fulfill({ status: 410, contentType: "application/json", body: JSON.stringify({ code: "RETIRED" }) });
       }
       else if (path === "/v1/client-market/hosts") body = [host];
+      else if (path === "/v1/client-market/termination-workspace") body = { hosts: [], actionRequiredCount: 0, canAdjudicate: false, serverNow: new Date().toISOString() };
+      else if (path === "/v1/client-market/hosts/host-1/health") body = {
+        machineEpoch: 1, hostHealth: host.hostHealth,
+        hours: [{ utcHour: 1, dueAt: "2026-11-01T10:59:59Z", receivedAt: "2026-11-01T10:59:59Z", state: "received", snapshot: null }],
+      };
+      else if (path.includes("/hosts/host-1/health/")) {
+        healthWrites.push({ action: path.split("/").at(-1), input: req.postDataJSON() });
+        body = { queued: true };
+      }
       else if (path === "/v1/client-market/my-rentals") body = rentals;
       else if (path === "/v1/client-market/me/rentals") body = emptyClientRentalsPage(req.url());
       else if (path.endsWith("/usage-history")) body = [];
@@ -214,7 +237,10 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
     await page
       .getByRole("heading", { name: "配置并确认" })
       .waitFor({ timeout: 60000 });
-    console.log("opened", quotes);
+    await page.getByRole("dialog").getByText("22/24 个可观测时段", { exact: true }).waitFor();
+    await page.getByRole("dialog").getByText("未配置开机自启", { exact: true }).waitFor();
+    await page.getByRole("dialog").getByText("aarch64 · 1.5 vCPU · 4 GiB 内存 · 64 GiB 磁盘", { exact: true }).waitFor();
+    console.log("opened with shared market and quote Host health", quotes);
     if (captureScreenshots) await page.screenshot({ path: artifacts + "/initial.png", fullPage: true });
     assert.equal(await page.locator('img[alt="Binance Pay"]').count(), 0);
     const trialSummary = page.locator("[data-client-trial]");
@@ -501,6 +527,8 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
     await page.goto(baseUrl + "/client-market/?tab=mine&testLocale=en");
     const rentalRow = page.locator("#client-market-host-client-one");
     await rentalRow.waitFor();
+    await rentalRow.getByText("22/24 observable hours", { exact: true }).waitFor();
+    await rentalRow.getByText("Automatic restart is not configured", { exact: true }).waitFor();
     const statusCell = rentalRow.locator("td").first();
     assert.doesNotMatch(await statusCell.textContent(), /Ends on|Renews on|Platform wallet/);
     await statusCell.getByText("Client online", { exact: true }).waitFor();
@@ -535,8 +563,34 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
     rentals[0].status = "release_failed";
     rentals[0].cleanupFailureKind = "cleanup_ssh_unreachable";
     await page.reload();
-    await rentalRow.getByText(/SSH|Host|unreachable|offline/).first().waitFor();
+    await statusCell.getByText(/^Router cannot reach the Host\./).waitFor();
     console.log("Client rows keep status/health and exception actions visible; expiry, renewal and restored trials live in expandable details");
+    Object.assign(host, { status: "idle", installationId: undefined, isHostOwner: true, isClientOwner: false, clientSubdomain: undefined, clientConnection: undefined });
+    rentals = [];
+    await page.goto(baseUrl + "/client-market/?tab=mine&testLocale=en");
+    await page.getByText("aarch64 · 1.5 vCPU · 4 GiB RAM · 64 GiB disk", { exact: true }).waitFor();
+    if (captureScreenshots) {
+      for (const width of [1440, 375]) {
+        await page.setViewportSize({ width, height: 900 });
+        await page.screenshot({ path: `${artifacts}/host-health-${width}.png`, fullPage: true });
+      }
+      await page.setViewportSize({ width: 1440, height: 900 });
+    }
+    const healthButton = page.getByRole("button", { name: "View hourly reports", exact: true });
+    await healthButton.click();
+    await page.getByText("Received", { exact: true }).waitFor();
+    await page.getByRole("button", { name: "Rotate reporter key at next idle maintenance", exact: true }).click();
+    await page.getByText("Host maintenance queued", { exact: true }).waitFor();
+    assert.deepEqual(healthWrites[0], { action: "rotate-key", input: { compromised: false } });
+    await page.getByRole("button", { name: "Revoke a compromised reporter key", exact: true }).click();
+    await page.getByRole("alertdialog").getByRole("button", { name: "Confirm", exact: true }).click();
+    await page.getByRole("alertdialog").waitFor({ state: "hidden" });
+    assert.deepEqual(healthWrites[1], { action: "rotate-key", input: { compromised: true } });
+    await page.getByRole("button", { name: "Confirm physical machine replacement", exact: true }).click();
+    await page.getByRole("alertdialog").getByRole("button", { name: "Confirm", exact: true }).click();
+    await page.getByRole("alertdialog").waitFor({ state: "hidden" });
+    assert.deepEqual(healthWrites[2], { action: "replace", input: { expectedMachineEpoch: 1 } });
+    console.log("Host hourly details, key rotation, immediate revocation and fenced machine replacement passed");
     assert.deepEqual(errors, []);
     console.log("free checkout passed; no browser exceptions");
     console.log(captureScreenshots ? `Screenshots: ${artifacts}` : "DOM and interaction checks only; no screenshots");

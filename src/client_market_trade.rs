@@ -251,6 +251,7 @@ pub struct QuoteItemView {
     pub trial_seconds_remaining: i64,
     pub trial_allowance_seconds: i64,
     pub trial_seconds_consumed: i64,
+    pub host_health: Option<crate::client_market::health::Summary>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -432,8 +433,24 @@ pub fn router() -> Router<ServerState> {
             "/v1/client-market/hosts/:id/offer",
             patch(update_host_offer),
         )
-        .route("/v1/client-market/quotes", post(create_quote))
-        .route("/v1/client-market/allocation-quotes", post(create_quote))
+        .route(
+            "/v1/client-market/quotes",
+            post(create_quote).layer(axum::middleware::from_fn(
+                crate::client_market_audit::private_response,
+            )),
+        )
+        .route(
+            "/v1/client-market/quotes/:id",
+            get(get_quote).layer(axum::middleware::from_fn(
+                crate::client_market_audit::private_response,
+            )),
+        )
+        .route(
+            "/v1/client-market/allocation-quotes",
+            post(create_quote).layer(axum::middleware::from_fn(
+                crate::client_market_audit::private_response,
+            )),
+        )
         .route(
             "/v1/client-market/allocation-quotes/:id",
             delete(cancel_quote),
@@ -956,6 +973,20 @@ async fn create_quote(
     Ok((
         [(axum::http::header::CACHE_CONTROL, "private, no-store")],
         Json(quote),
+    ))
+}
+
+async fn get_quote(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    Ok(Json(
+        state
+            .store
+            .client_market_quote_projection(&id, &session)
+            .await?,
     ))
 }
 
@@ -2640,6 +2671,10 @@ impl AppStore {
                     &now_rfc,
                 )?;
             }
+            // Freeze the buyer-visible projection while the Host is still `idle`;
+            // `public_summary` hides dynamic resources for any other status.
+            let host_health =
+                crate::client_market::health::public_summary(&tx, &candidate.host_id)?;
             let changed = tx
                 .execute(
                     "UPDATE router_ssh_hosts SET status = ?2, updated_at = ?3
@@ -2687,7 +2722,20 @@ impl AppStore {
                 ],
             )
             .map_err(|error| AppError::Internal(format!("insert quote item failed: {error}")))?;
+            tx.execute(
+                "UPDATE client_market_allocation_quote_items SET host_health_json=?2 WHERE id=?1",
+                params![
+                    item_id,
+                    host_health
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()
+                        .map_err(|e| AppError::Internal(e.to_string()))?
+                ],
+            )
+            .map_err(|e| AppError::Internal(e.to_string()))?;
             items.push(QuoteItemView {
+                host_health,
                 id: item_id,
                 host_id: candidate.host_id,
                 provider_id: candidate.provider_id,
@@ -2717,10 +2765,7 @@ impl AppStore {
             serde_json::json!({ "quoteId": quote_id, "count": items.len(), "fixedHostId": input.host_id }),
             now,
         )?;
-        tx.commit().map_err(|error| {
-            AppError::Internal(format!("commit allocation quote failed: {error}"))
-        })?;
-        Ok(AllocationQuoteView {
+        let view = AllocationQuoteView {
             id: quote_id,
             status: "active".into(),
             expires_at: expires_at.to_rfc3339(),
@@ -2728,7 +2773,44 @@ impl AppStore {
             wallet_funding,
             funding_rail: funding_rail.into(),
             termination_policy,
-        })
+        };
+        tx.execute(
+            "UPDATE client_market_allocation_quotes SET projection_json=?2 WHERE id=?1",
+            params![
+                view.id,
+                serde_json::to_string(&view)
+                    .map_err(|error| AppError::Internal(error.to_string()))?
+            ],
+        )
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!("commit allocation quote failed: {error}"))
+        })?;
+        Ok(view)
+    }
+
+    pub async fn client_market_quote_projection(
+        &self,
+        id: &str,
+        session: &AuthSession,
+    ) -> Result<serde_json::Value, AppError> {
+        let conn = self.conn.lock().await;
+        let row:Option<(Option<String>,String,String)>=conn.query_row("SELECT projection_json,status,expires_at FROM client_market_allocation_quotes WHERE id=?1 AND client_user_id=?2",params![id,session.user_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional().map_err(|error|AppError::Internal(error.to_string()))?;
+        let (projection, status, expires) =
+            row.ok_or_else(|| AppError::NotFound("Quote not found".into()))?;
+        let mut projection: serde_json::Value = serde_json::from_str(
+            &projection.ok_or_else(|| AppError::NotFound("Quote projection unavailable".into()))?,
+        )
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+        projection["status"] = serde_json::json!(if status == "active"
+            && DateTime::parse_from_rfc3339(&expires)
+                .is_ok_and(|end| end.timestamp() <= Utc::now().timestamp())
+        {
+            "expired"
+        } else {
+            status.as_str()
+        });
+        Ok(projection)
     }
 
     pub async fn client_market_commit_quote(
@@ -3200,7 +3282,7 @@ impl AppStore {
         }
         tx.execute(
             "UPDATE router_ssh_hosts
-             SET status = 'idle', updated_at = ?2
+             SET status = CASE WHEN EXISTS(SELECT 1 FROM client_host_agents a WHERE a.host_id=router_ssh_hosts.id AND (a.admitted_hour IS NOT NULL OR a.legacy=1) AND a.revoked=0 AND a.readmission_pending=0) THEN 'idle' ELSE 'maintaining' END, updated_at = ?2
              WHERE status = ?3 AND id IN (
                  SELECT host_id FROM client_market_allocation_quote_items WHERE quote_id = ?1
              )",
@@ -4009,7 +4091,7 @@ fn ratio(numerator: i64, denominator: i64) -> f64 {
 fn expire_quotes_tx(tx: &Transaction<'_>, now: DateTime<Utc>) -> Result<(), AppError> {
     tx.execute(
         "UPDATE router_ssh_hosts
-         SET status = 'idle', updated_at = ?1
+         SET status = CASE WHEN EXISTS(SELECT 1 FROM client_host_agents a WHERE a.host_id=router_ssh_hosts.id AND (a.admitted_hour IS NOT NULL OR a.legacy=1) AND a.revoked=0 AND a.readmission_pending=0) THEN 'idle' ELSE 'maintaining' END, updated_at = ?1
          WHERE status = ?2 AND id IN (
              SELECT qi.host_id
              FROM client_market_allocation_quote_items qi
@@ -4028,7 +4110,7 @@ fn expire_quotes_tx(tx: &Transaction<'_>, now: DateTime<Utc>) -> Result<(), AppE
     .map_err(|error| AppError::Internal(format!("expire allocation quotes failed: {error}")))?;
     tx.execute(
         "UPDATE router_ssh_hosts
-         SET status = 'idle', updated_at = ?1
+         SET status = CASE WHEN EXISTS(SELECT 1 FROM client_host_agents a WHERE a.host_id=router_ssh_hosts.id AND (a.admitted_hour IS NOT NULL OR a.legacy=1) AND a.revoked=0 AND a.readmission_pending=0) THEN 'idle' ELSE 'maintaining' END, updated_at = ?1
          WHERE status = ?2 AND NOT EXISTS (
              SELECT 1
              FROM client_market_allocation_quote_items qi
@@ -5560,6 +5642,7 @@ mod tests {
                 params![now],
             )
             .expect("insert terminal Host");
+            crate::test_support::admit_fixture_hosts(&conn);
             conn.execute(
                 "INSERT INTO client_market_subscriptions (
                     installation_id, host_id, provider_id, host_owner_email,

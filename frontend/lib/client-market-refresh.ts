@@ -38,6 +38,7 @@ function recordComparator<T extends object>(fields: Record<keyof T, "scalar" | "
 }
 
 const sameHost = recordComparator<ClientMarketHost>({
+  hostHealth: "nested",
   id: "scalar",
   providerId: "scalar",
   marketProviderId: "scalar",

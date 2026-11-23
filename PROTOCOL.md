@@ -1051,3 +1051,44 @@ v14 由 `shareGrantCapabilitiesV1` 协商。Server 对具名授权保存批准�
 管理者在请求详情按需读取 `POST /v1/shares/:share_id/request-metering` 或独立域名下 `POST /share-api/share/request-metering`，输入 `{requestId}`。结果绑定 Share、安装实例及尝试，并使用 private/no-store。授权预览不读取请求记录。
 
 发布先提供 v14 Router reader，再升级 Server 的权威 SQLite schema 10。旧具名有效操作只迁移已有证据的入口，公开权限不会继承。先在副本核对权限差集、旧合同、已用额度和在途回执，再恢复真实流量。
+
+## 托管 Host 小时健康报告 v1
+
+独立服务 `cc-switch-host-standby standby run` 在空闲和租用期间持续运行，向 `POST /v1/client-market/host-heartbeats` 发送 HTTPS 请求。Router 先部署，再安装 `version --json` 声明 `hostHealthProtocolVersion=1` 的 Server Release。
+
+### 请求、签名和时间
+
+原始 UTF-8 JSON 最多 8 KiB。五个头为 `X-CC-Report-Version`、`X-CC-Host-Id`、`X-CC-Machine-Epoch`、`X-CC-Key-Generation`、`X-CC-Report-Signature`。版本为十进制 1，身份和版本与正文一致，签名用无填充 base64url。
+
+Ed25519 输入是 UTF-8 域 `cc-switch-host-health/report/v1\n` 加原始正文 SHA-256 的 32 字节摘要，换行为 LF。两仓消费相同的原始正文、公钥和期望签名。[固定测试向量](tests/fixtures/host-health-v1.json)
+
+正文固定含 `reportVersion`、`hostId`、`machineEpoch`、`keyGeneration`、`utcHour`、`sampledAt`、`buildVersion`、`snapshot`。时间为 RFC 3339 UTC，`utcHour=floor(unixSeconds/3600)`。快照含 `os`、`arch`、`effectiveVcpu`、`memoryTotalBytes`、`memoryAvailableBytes`、`dataVolumeTotalBytes`、`dataVolumeAvailableBytes`、`cpuUsagePct`。架构为 `x86_64` 或 `aarch64`。容量用字节，vCPU 保留小数，CPU 用 0–100%。
+
+各数值字段使用 `{"value":数字或null,"unknownReason":字符串或null}`，两个键均须存在。已知值的原因填 null，未知原因可为 `scope_unverified`、`unavailable`、`counter_reset`，服务端裁剪还可返回 `private` 或 `expired`。身份、系统、架构及完整快照合法即可完成首报准入，未知容量在市场明示。
+
+排程取 `SHA-256("cc-switch-host-health/schedule/v1\n" + hostId + "\n" + decimal(utcHour))` 前八字节为无符号大端整数，对 3600 取模。Host `host-fixture` 在小时 4 得到偏移 3592 秒。新 Host 首报在就绪所在自然小时剩余时间内随机并持久保存，替代该小时常规排程。
+
+发送前持久记下已尝试 H，每 Host 每 UTC 小时至多一次主动 POST，关闭自动重试和重定向。接收窗口为 `[max(小时开始,dueAt−120秒),dueAt+300秒]`。10:59:59 发出的 10 点报告，11:00:01 收到仍归 10 点。接收宽限不延长发送期。时钟恢复保留已尝试时段。
+
+| HTTP | code | 含义 |
+|---|---|---|
+| 200 | accepted | 有效写入或同一时段同内容确认，保留首次接收时间 |
+| 400 | invalid_report / invalid_identity / unsupported_report_version | 非法报告或不支持的版本 |
+| 401 | invalid_signature / invalid_binding | 签名或绑定不符 |
+| 409 | hour_conflict | 同一 `(hostId,utcHour)` 内容冲突，保留首份并记录事件 |
+| 410 | host_agent_revoked | 验证原凭据后明确撤销，回显 Host、机器代次、凭据代次，三项匹配本代才停用 |
+| 413 | report_too_large | 原始正文超限 |
+| 422 | report_outside_window | 首次写入超窗或采样时间非法 |
+| 429 / 5xx | 临时故障 | 等下一时段，无补发 |
+
+Router 协议响应带 `routerTime`，已认证且结构有效的请求同时回显 `hostId`、`machineEpoch`、`keyGeneration`、`utcHour`。发送方只用四项均与当前请求匹配的可信响应校准后续时间基准；明确撤销也须匹配本次小时及本代身份才停用。未知 Host、普通 404、未知版本及迟到旧代响应保留后续排程。新钥经受信 SSH 上的持钥证明激活，小时额度跨凭据与机器代次保留。
+
+### 投影、准入和维护
+
+列表 `GET /v1/client-market/hosts` 和报价项共用 `hostHealth`，包含状态、绝对时间、24 小时收到／可观测计数、连续缺报、启动方式和裁剪后的快照。创建报价时冻结买家公开级投影。`GET /v1/client-market/hosts/:id/health` 按需返回当前代最多 7 天的小时记录和授权样本。状态即时更新，计数按各小时接收截止时刻推进，已知接收中断的无样本时段排除分母。
+
+租中报告继续计入上报记录。只有可证为空闲的动态资源可公开，租户只读本人当前租约的用量。跨租约或时钟归属不明时隐藏动态字段，清理租约后仍保留占用区间用于保护迟到报告。
+
+供应商调用 `POST /v1/client-market/hosts/:id/health/retry` 重试准备或维护，调用 `/health/rotate-key` 排队轮换（提交 `compromised=true` 会先立即撤销），调用 `/health/replace` 并提交 `expectedMachineEpoch` 排队确认物理换机。换机先关闭库存并撤销，旧发送方停止后新代从下一完整小时首报。删除先撤销，再按可信归属卸载。
+
+Host 从 `onboarding` 开始，经本代首报转 `idle`。维护与报价竞争 `idle→maintaining` 和 `idle→reserved`，远端维护、换机和安装共用锁与动作序号。支持 systemd、活动 OpenRC，以及作为容器 PID 1 运行且配置目录为 `/etc/supervisor/conf.d` 的 SupervisorD；仅检测到后台 SupervisorD 不能证明重启恢复，按 nohup 降级处理。降级环境在买家主行和报价提示未配置开机自启。[设计与验收计划](docs/client-market-host-health-plan.md)

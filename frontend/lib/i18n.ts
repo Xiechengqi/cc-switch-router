@@ -1,4 +1,5 @@
 "use client";
+import { hostHealthMessagesEn, hostHealthMessagesZh } from "./host-health-messages";
 
 import {
   settingsMessagesEn,
@@ -40,6 +41,7 @@ export type MessageKey = keyof typeof messages.en;
 
 export const messages = {
   en: {
+    ...hostHealthMessagesEn,
     "dashboard.grantMedia.title": "Media generation and tools",
     "dashboard.grantMedia.selectedCount": "Media and tools · {count}",
     "dashboard.grantMedia.marketPermission": "Permissions set by purchase",
@@ -3623,6 +3625,7 @@ export const messages = {
     ...marketNotificationCopyEn,
   },
   "zh-CN": {
+    ...hostHealthMessagesZh,
     "dashboard.grantMedia.title": "媒体生成与工具",
     "dashboard.grantMedia.selectedCount": "媒体与工具已开启 {count} 项",
     "dashboard.grantMedia.marketPermission": "权限由购买套餐决定",

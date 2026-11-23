@@ -38,6 +38,26 @@ fn database_error(error: crate::db::Error) -> AppError {
     AppError::Internal(format!("test database snapshot failed: {error}"))
 }
 
+/// Trading fixtures represent Hosts whose admission completed before the test.
+/// Health tests exercise the real signed ingestion path instead.
+pub(crate) fn admit_fixture_hosts(conn: &Connection) {
+    conn.execute(
+        "INSERT OR IGNORE INTO client_host_agents(host_id) SELECT id FROM router_ssh_hosts",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE client_host_agents SET admitted_hour=COALESCE(admitted_hour,0)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE router_ssh_hosts SET status='idle' WHERE status='onboarding'",
+        [],
+    )
+    .unwrap();
+}
+
 fn template() -> Result<&'static [u8], AppError> {
     static TEMPLATE: OnceLock<Result<Vec<u8>, String>> = OnceLock::new();
     TEMPLATE

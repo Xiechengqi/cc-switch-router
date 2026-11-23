@@ -1628,6 +1628,7 @@ mod tests {
                        'US', 'disabled', 'now', 'now', 'disabled-provider');",
         )
         .expect("seed disabled Client Host");
+        crate::test_support::admit_fixture_hosts(&conn);
         assert_eq!(
             generate_conn(&conn, Utc::now()).expect("generate disabled Host supply"),
             0
@@ -1744,6 +1745,7 @@ mod tests {
             [],
         )
         .expect("insert self-rental fulfillment attempt");
+        crate::test_support::admit_fixture_hosts(&conn);
         let activated_at = (Utc::now() - Duration::hours(1)).to_rfc3339();
         conn.execute(
             "INSERT INTO client_market_subscriptions (
@@ -1812,6 +1814,7 @@ mod tests {
                        'succeeded', 'now', 'now');",
         )
         .expect("seed transferred Client Host history");
+        crate::test_support::admit_fixture_hosts(&conn);
 
         let now = Utc::now();
         let tx = conn

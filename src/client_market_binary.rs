@@ -3,6 +3,7 @@ use super::*;
 use crate::client_server_release::InstallationRelease;
 
 static PREPARATION_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+static NEXT_RELEASE_CHECK: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -36,12 +37,25 @@ pub(super) async fn views(
         .map_err(|e| AppError::Internal(e.to_string()))
 }
 
+fn persist_queue(conn: &Connection, host_id: &str) -> Result<(), crate::db::Error> {
+    let tx = conn.transaction()?;
+    tx.execute(
+                "INSERT INTO client_binary_preparations(host_id,status,updated_at) VALUES(?1,'pending',?2)
+                 ON CONFLICT(host_id) DO UPDATE SET status='pending',attempts=0,last_error=NULL,updated_at=excluded.updated_at",
+                params![host_id, Utc::now().to_rfc3339()],
+            )?;
+    tx.execute(
+        "UPDATE client_host_agents SET maintenance_pending=1 WHERE host_id=?1",
+        params![host_id],
+    )?;
+    tx.commit()
+}
+
 pub(super) async fn queue(state: &ServerState, host_id: &str) {
-    let queued = state.store.conn.lock().await.execute(
-        "INSERT INTO client_binary_preparations(host_id,status,updated_at) VALUES(?1,'pending',?2)
-         ON CONFLICT(host_id) DO UPDATE SET status='pending',attempts=0,last_error=NULL,updated_at=excluded.updated_at",
-        params![host_id, Utc::now().to_rfc3339()],
-    );
+    let queued = {
+        let conn = state.store.conn.lock().await;
+        persist_queue(&conn, host_id)
+    };
     if let Err(error) = queued {
         warn!(host_id, error = %error, "Client binary queue update failed; persisted admission queue will retry");
         return;
@@ -53,18 +67,95 @@ pub(super) async fn queue(state: &ServerState, host_id: &str) {
     });
 }
 
+/// Maintenance on a Host that is already in the pool must not delist it for good.
+/// After the last attempt fails the Host returns to `idle` (its previous reporter
+/// keeps its admitted identity), and the task is retried after a six-hour pause.
+/// Onboarding Hosts, replacements and revoked credentials stay out of the pool.
+fn return_exhausted_maintenance(conn: &Connection, now: &str) -> Result<(), crate::db::Error> {
+    let tx = conn.transaction()?;
+    tx.execute(
+        "UPDATE router_ssh_hosts SET status='idle',updated_at=?1
+         WHERE status='maintaining' AND installation_id IS NULL AND id IN (
+             SELECT p.host_id FROM client_binary_preparations p JOIN client_host_agents a ON a.host_id=p.host_id
+             WHERE p.status='failed' AND p.attempts>=3 AND a.revoked=0 AND a.readmission_pending=0
+               AND a.replacement_pending=0 AND (a.admitted_hour IS NOT NULL OR a.legacy=1))",
+        params![now],
+    )?;
+    // Keep a pending rotation reason so the retry still issues a new key generation.
+    tx.execute(
+        "UPDATE client_host_agents SET maintenance_pending=0,
+             last_error=CASE WHEN last_error IN ('hour_conflict','rotation_requested') THEN last_error ELSE 'maintenance_failed' END
+         WHERE maintenance_pending=1 AND host_id IN (
+             SELECT p.host_id FROM client_binary_preparations p JOIN router_ssh_hosts h ON h.id=p.host_id
+             WHERE h.status='idle' AND p.status='failed' AND p.attempts>=3)",
+        [],
+    )?;
+    tx.execute(
+        "UPDATE client_host_agents SET maintenance_pending=1 WHERE revoked=0 AND host_id IN (
+             SELECT p.host_id FROM client_binary_preparations p JOIN router_ssh_hosts h ON h.id=p.host_id
+             WHERE h.status='idle' AND h.installation_id IS NULL AND p.status='failed' AND p.attempts>=3
+               AND julianday(p.updated_at)<julianday(?1)-0.25)",
+        params![now],
+    )?;
+    tx.execute(
+        "UPDATE client_binary_preparations SET status='pending',attempts=0,updated_at=?1
+         WHERE status='failed' AND attempts>=3 AND julianday(updated_at)<julianday(?1)-0.25
+           AND host_id IN (SELECT h.id FROM router_ssh_hosts h JOIN client_host_agents a ON a.host_id=h.id
+                           WHERE h.status='idle' AND h.installation_id IS NULL AND a.revoked=0)",
+        params![now],
+    )?;
+    tx.commit()
+}
+
 pub(super) async fn reconcile(state: &ServerState) -> Result<(), AppError> {
+    let now = Utc::now().timestamp();
+    let next = NEXT_RELEASE_CHECK.load(std::sync::atomic::Ordering::Relaxed);
+    if now >= next
+        && NEXT_RELEASE_CHECK
+            .compare_exchange(
+                next,
+                now + 3600,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+    {
+        let selector = state.dynamic.read().await.client_server_release.clone();
+        match state
+            .client_server_release_validator
+            .resolve_installation(&selector)
+            .await
+        {
+            Ok(release) => {
+                state.store.conn.lock().await.execute(
+                    "UPDATE client_host_agents SET maintenance_pending=1 WHERE host_id IN (
+                        SELECT p.host_id FROM client_binary_preparations p JOIN router_ssh_hosts h ON h.id=p.host_id
+                        WHERE h.status='idle' AND p.status='ready' AND p.commit_id<>?1
+                    )",
+                    params![release.commit],
+                ).map_err(|e|AppError::Internal(e.to_string()))?;
+            }
+            Err(error) => {
+                NEXT_RELEASE_CHECK.store(now + 60, std::sync::atomic::Ordering::Relaxed);
+                warn!(%error, "Host reporter Release check deferred");
+            }
+        }
+    }
     let ids = {
         let conn = state.store.conn.lock().await;
         conn.execute(
             "UPDATE client_binary_preparations SET status='failed',last_error='Preparation interrupted; allocation will retry',updated_at=?1
-             WHERE status='running' AND attempts>=3 AND julianday(updated_at)<julianday(?1)-10.0/1440",
+             WHERE status='running' AND attempts>=3 AND julianday(updated_at)<julianday(?1)-15.0/1440",
             params![Utc::now().to_rfc3339()],
         ).map_err(|error| AppError::Internal(format!("finalize interrupted binary preparation: {error}")))?;
+        return_exhausted_maintenance(&conn, &Utc::now().to_rfc3339()).map_err(|error| {
+            AppError::Internal(format!("recover exhausted Host maintenance: {error}"))
+        })?;
         let mut query = conn.prepare(
             "SELECT p.host_id FROM client_binary_preparations p JOIN router_ssh_hosts h ON h.id=p.host_id
-             WHERE h.status='idle' AND h.installation_id IS NULL AND p.attempts < 3
-               AND (p.status='pending' OR (p.status IN ('failed','running') AND julianday(p.updated_at)<julianday(?1)-10.0/1440))
+             JOIN client_host_agents a ON a.host_id=h.id
+             WHERE h.status IN ('onboarding','idle','maintaining') AND h.installation_id IS NULL AND p.attempts < 3
+               AND (p.status='pending' OR (p.status='ready' AND a.maintenance_pending=1) OR (p.status IN ('failed','running') AND julianday(p.updated_at)<julianday(?1)-15.0/1440))
              ORDER BY p.updated_at LIMIT 4"
         ).map_err(|e| AppError::Internal(format!("read binary preparation queue: {e}")))?;
         query
@@ -92,38 +183,38 @@ async fn prepare_queued(state: &ServerState, host_id: &str) {
         .client_market_actions
         .lock(&format!("binary:{host_id}"))
         .await;
+    let mut claim_sequence = None;
     let result = async {
-        let Some(host) = state.store.client_market_get_host(host_id).await? else { return Ok(()) };
-        if host.status != HOST_STATUS_IDLE || host.installation_id.is_some() { return Ok(()) }
-        let claimed = state.store.conn.lock().await.execute(
-            "UPDATE client_binary_preparations SET status='running',attempts=attempts+1,updated_at=?2
-             WHERE host_id=?1 AND attempts<3 AND (status='pending' OR (status IN ('running','failed') AND julianday(updated_at)<julianday(?2)-10.0/1440))",
-            params![host_id, Utc::now().to_rfc3339()],
-        ).map_err(|e| AppError::Internal(e.to_string()))?;
-        if claimed == 0 { return Ok(()) }
+        let Some(host) = state.store.client_market_get_host(host_id).await? else {
+            return Ok(());
+        };
+        let Some(sequence) = health::claim_preparation(&state.store, host_id).await? else {
+            return Ok(());
+        };
+        claim_sequence = Some(sequence);
         require_pinned_host_fingerprint(&host, &known_hosts_path(&state.config)).await?;
         let selector = state.dynamic.read().await.client_server_release.clone();
-        let release = state.client_server_release_validator.resolve_installation(&selector).await.map_err(AppError::ServiceUnavailable)?;
-        ssh_run_remote_with_input(&state.provision_ssh_key_path, &known_hosts_path(&state.config), &host.ip, host.port,
-            &prepare_command(&release, false), None, SSH_INSTALL_TIMEOUT, SshHostKeyPolicy::RequireKnown).await?;
-        state.store.conn.lock().await.execute(
-            "UPDATE client_binary_preparations SET status='ready',selector=?2,commit_id=?3,last_error=NULL,updated_at=?4 WHERE host_id=?1",
-            params![host_id, release.selector, release.commit, Utc::now().to_rfc3339()],
-        ).map_err(|e| AppError::Internal(e.to_string()))?;
+        let release = state
+            .client_server_release_validator
+            .resolve_installation(&selector)
+            .await
+            .map_err(AppError::ServiceUnavailable)?;
+        health::enroll(state, &host, &release, sequence).await?;
         Ok::<(), AppError>(())
-    }.await;
+    }
+    .await;
     if let Err(error) = result {
-        warn!(host_id, error = %error, "Client binary preparation failed; rental will retry the download");
+        warn!(host_id, error = %error, "Host standby preparation failed; persisted task will retry");
         let _ = state.store.conn.lock().await.execute(
-            "UPDATE client_binary_preparations SET status='failed',last_error=?2,updated_at=?3 WHERE host_id=?1",
-            params![host_id, "Binary preparation failed; retry scheduled", Utc::now().to_rfc3339()],
+            "UPDATE client_binary_preparations SET status='failed',last_error=?2,updated_at=?3 WHERE host_id=?1 AND EXISTS(SELECT 1 FROM client_host_agents WHERE host_id=?1 AND operation_sequence=?4)",
+            params![host_id, error.to_string().chars().take(500).collect::<String>(), Utc::now().to_rfc3339(), claim_sequence],
         );
     }
 }
 
 /// The checksum comes from Router's fresh Release lookup, never a Host manifest.
 /// Downloads are staged on the cache filesystem and shared with allocation.
-fn prepare_command(release: &InstallationRelease, run_version: bool) -> String {
+pub(super) fn prepare_command(release: &InstallationRelease, run_version: bool) -> String {
     let amd64 = &release.artifacts[0];
     let arm64 = &release.artifacts[1];
     format!(
@@ -192,6 +283,7 @@ export CC_SWITCH_SERVER_EXPECTED_SHA256="$expected"
 pub(super) async fn install(
     state: &ServerState,
     host: &RouterSshHostRecord,
+    job_id: &str,
     owner: &str,
     subdomain: &str,
     password: Vec<u8>,
@@ -242,9 +334,12 @@ pub(super) async fn install(
         AppError::ServiceUnavailable("Client release changed repeatedly; retry allocation".into())
     })?;
     state.store.conn.lock().await.execute(
-        "UPDATE client_binary_preparations SET status='ready',selector=?2,commit_id=?3,last_error=NULL,updated_at=?4 WHERE host_id=?1",
+        // A rental proves the Host is reachable again; clear exhausted maintenance attempts
+        // so the post-rental maintenance can still be claimed.
+        "UPDATE client_binary_preparations SET status='ready',attempts=0,selector=?2,commit_id=?3,last_error=NULL,updated_at=?4 WHERE host_id=?1",
         params![host.id, release.selector, release.commit, Utc::now().to_rfc3339()],
     ).map_err(|error| AppError::Internal(format!("save prepared Client release: {error}")))?;
+    let sequence = health::install_operation(state, &host.id, job_id).await?;
     let command = install_command(
         &release,
         &router_public_url(&state.config),
@@ -256,7 +351,7 @@ pub(super) async fn install(
         &known_hosts_path(&state.config),
         &host.ip,
         host.port,
-        &command,
+        &format!("{}\n{}", health::remote_fence(&host.id, sequence), command),
         Some(password),
         SSH_INSTALL_TIMEOUT,
         SshHostKeyPolicy::RequireKnown,
@@ -273,7 +368,7 @@ fn install_command(
     let script = crate::api::render_install_client_script(&release.selector)?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(script);
     Ok(format!(
-        "{}\nscript=$(mktemp); trap 'rm -f \"$script\"' EXIT\nprintf '%s' {} | base64 -d >\"$script\"\nbash \"$script\" {} {} --password-stdin {}",
+        "{}\nscript=$(mktemp); trap 'rm -f \"$script\"' EXIT\nprintf '%s' {} | base64 -d >\"$script\"\nbash \"$script\" {} {} --password-stdin {} 8>&- 9>&-",
         prepare_command(release, true),
         shell_quote(&encoded),
         shell_quote(router_url),
@@ -285,6 +380,52 @@ fn install_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reverify_queue_claims_admitted_idle_hosts_and_defers_reserved_hosts() {
+        let store = AppStore::new_in_memory_for_tests().unwrap();
+        {
+            let conn = store.conn.lock().await;
+            conn.execute("INSERT INTO router_ssh_hosts(id,ip,port,host_owner_email,status,created_at,updated_at) VALUES('host','192.0.2.1',22,'provider@example.test','onboarding','2026-01-01','2026-01-01')",[]).unwrap();
+            crate::test_support::admit_fixture_hosts(&conn);
+            conn.execute("UPDATE client_binary_preparations SET status='ready'", [])
+                .unwrap();
+            conn.execute("UPDATE router_ssh_hosts SET status='reserved'", [])
+                .unwrap();
+            persist_queue(&conn, "host").unwrap();
+        }
+        assert!(
+            health::claim_preparation(&store, "host")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE router_ssh_hosts SET status='idle' WHERE id='host'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            health::claim_preparation(&store, "host")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            store
+                .client_market_get_host("host")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "maintaining"
+        );
+    }
+
     use axum::{Router, routing::get};
     use std::sync::{
         Arc,
@@ -394,7 +535,8 @@ esac
         {
             let conn = Connection::open(&path).unwrap();
             crate::schema::apply(&conn).unwrap();
-            conn.execute("INSERT INTO router_ssh_hosts(id,ip,port,host_owner_email,status,created_at,updated_at) VALUES('host','203.0.113.1',22,'provider@example.test','idle',?1,?1)", params![Utc::now().to_rfc3339()]).unwrap();
+            conn.execute("INSERT INTO router_ssh_hosts(id,ip,port,host_owner_email,status,created_at,updated_at) VALUES('host','203.0.113.1',22,'provider@example.test','onboarding',?1,?1)", params![Utc::now().to_rfc3339()]).unwrap();
+            crate::test_support::admit_fixture_hosts(&conn);
         }
         {
             let conn = Connection::open(&path).unwrap();

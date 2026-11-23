@@ -1,4 +1,5 @@
 "use client";
+import { HostHealthSummary } from "./host-health";
 
 import * as React from "react";
 import { formatWalletUnits } from "@/lib/market-wallet-money";
@@ -403,9 +404,11 @@ function HostRowImpl({
         ) : null}
         <td className="max-w-[11rem] px-2 py-2 align-middle">
           <div className="min-w-0" title={statusGuidanceSubtitle || statusHint || undefined}>
+            <span className="mb-1 block break-all text-xs font-medium sm:hidden">{host.hostname || host.ip || host.id}</span>
             <Chip size="sm" variant="soft" className="shrink-0">
               {t(statusLabelKey(host.status))}
             </Chip>
+            <HostHealthSummary health={host.hostHealth} hostId={host.id} hostLabel={host.hostname || host.ip || host.id} viewerKey={[session?.user?.id || "anonymous", host.installationId || "", host.isClientOwner, host.isHostOwner, host.status, host.hostHealth?.snapshot?.cpuUsagePct.unknownReason || "known"].join(":")} canManage={host.isHostOwner} canReplace={!host.installationId && ["idle", "onboarding", "disabled", "abnormal"].includes(host.status)} preparing={host.status === "onboarding" || host.status === "maintaining"} hostStatus={host.status} onChanged={onChanged} />
             {host.status === "idle" && host.binaryPreparation ? (
               <span className="mt-0.5 block text-[11px] leading-4 text-muted-foreground">
                 {t(`clientMarket.binary.${host.binaryPreparation.status}`)}

@@ -2022,6 +2022,7 @@ fn dashboard_cache_invalidating_write(method: &Method, path: &str) -> bool {
 
 fn dashboard_machine_write_path(path: &str) -> bool {
     const EXACT: &[&str] = &[
+        "/v1/client-market/host-heartbeats",
         "/v1/auth/session/refresh",
         "/v1/dashboard/presence",
         "/v1/gateways/register",

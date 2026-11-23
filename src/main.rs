@@ -23,6 +23,7 @@ mod dynamic_settings;
 mod embed_usage;
 mod error;
 mod geo;
+mod host_health_protocol;
 mod ingress_context;
 mod ip_blacklist_stats;
 mod ip_iq;
@@ -966,6 +967,19 @@ async fn main() -> Result<()> {
         }
     });
     let (http_shutdown_tx, http_shutdown_rx) = watch::channel(false);
+    let health_state = state.clone();
+    let health_shutdown = http_shutdown_rx.clone();
+    tokio::spawn(async move {
+        while !*health_shutdown.borrow() {
+            match client_market::health::observe(health_state.clone(), health_shutdown.clone())
+                .await
+            {
+                Ok(()) => break,
+                Err(error) => tracing::error!(%error, "Host health observation will retry"),
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
     let (ssh_shutdown_tx, ssh_shutdown_rx) = watch::channel(false);
     let mut ssh_task = tokio::spawn(async move {
         ssh_server

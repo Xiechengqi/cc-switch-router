@@ -8,7 +8,8 @@ pub(super) fn rental(conn: &Connection, n: usize, status: &str) -> String {
     let job = format!("job-{n:04}");
     let installation = format!("client-{n:04}");
     conn.execute("INSERT INTO router_ssh_hosts (id,ip,port,host_owner_email,provider_id,status,created_at,updated_at)
-        VALUES (?1,?2,22,'provider@example.test','provider','idle',?3,?3)",params![host,format!("192.0.2.{n}"),START]).unwrap();
+        VALUES (?1,?2,22,'provider@example.test','provider','onboarding',?3,?3)",params![host,format!("192.0.2.{n}"),START]).unwrap();
+    crate::test_support::admit_fixture_hosts(&conn);
     conn.execute("INSERT INTO provisioning_jobs (id,type,host_id,host_owner_email,client_owner_email,client_owner_user_id,subdomain,status,phase,log_blob,created_at,updated_at)
         VALUES (?1,'create',?2,'provider@example.test','buyer@example.test','buyer',?3,'pending','locked','SECRET_LOG',?4,?4)",params![job,host,format!("client-{n:04}"),START]).unwrap();
     capture_job_identity_tx(conn, &job).unwrap();

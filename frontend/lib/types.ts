@@ -2330,7 +2330,39 @@ export type ShareUsageRefreshResponse = {
   }>;
 };
 
+export type HostHealthReading = { value: number | null; unknownReason: string | null };
+export type HostHealthSnapshot = {
+  os: string;
+  arch: string;
+  effectiveVcpu: HostHealthReading;
+  memoryTotalBytes: HostHealthReading;
+  memoryAvailableBytes: HostHealthReading;
+  dataVolumeTotalBytes: HostHealthReading;
+  dataVolumeAvailableBytes: HostHealthReading;
+  cpuUsagePct: HostHealthReading;
+};
+export type HostHealth = {
+  state: "awaiting_first" | "first_overdue" | "healthy" | "unknown" | "missed" | "revoked";
+  lastReceivedAt: string | null;
+  sampledAt: string | null;
+  nextDueAt: string | null;
+  received24h: number;
+  observable24h: number;
+  consecutiveMissed: number;
+  supervision: string;
+  clockSynchronized?: boolean;
+  snapshot: HostHealthSnapshot | null;
+  diagnostic?: string | null;
+};
+export type HostHealthDetail = {
+  machineEpoch: number;
+  hostHealth: HostHealth | null;
+  hours: Array<{ utcHour: number; dueAt: string; state: "received" | "pending" | "unknown" | "missed"; receivedAt: string | null; snapshot: HostHealthSnapshot | null }>;
+};
+
 export type ClientMarketHostStatus =
+  | "onboarding"
+  | "maintaining"
   | "idle"
   | "reserved"
   | "allocated"
@@ -2384,6 +2416,7 @@ export type MarketPricingModel =
 export type MarketBillingInterval = "calendar_month" | string;
 
 export type ClientMarketHost = {
+  hostHealth?: HostHealth | null;
   id: string;
   providerId?: string;
   marketProviderId?: string;
@@ -2736,6 +2769,7 @@ export type MyMarketProvider = {
 };
 
 export type ClientMarketQuoteItem = {
+  hostHealth?: HostHealth | null;
   id: string;
   hostId: string;
   providerId: string;

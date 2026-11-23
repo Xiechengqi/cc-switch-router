@@ -546,7 +546,9 @@ pub struct SeatInput {
 }
 
 /// Distinguishes a missing field (`None`) from an explicit `null` (`Some(None)`).
-fn deserialize_present_nullable_i64<'de, D>(deserializer: D) -> Result<Option<Option<i64>>, D::Error>
+fn deserialize_present_nullable_i64<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<i64>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -1031,7 +1033,8 @@ fn normalize_seat(input: SeatInput) -> Result<NormalizedSeat, AppError> {
                 "trial hours and trial budgets apply only to paid seats".into(),
             ));
         }
-        if early_termination == Some("forbidden") || input.termination_rate_bps.flatten().is_some() {
+        if early_termination == Some("forbidden") || input.termination_rate_bps.flatten().is_some()
+        {
             return Err(AppError::BadRequest(
                 "termination rules apply only to paid seats".into(),
             ));
@@ -13812,15 +13815,25 @@ mod tests {
             "dailyRateMinor": null, "currency": "USD", "cyclePriceMinor": 1000});
         let parse = |extra: serde_json::Value| {
             let mut value = base.clone();
-            value.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
             normalize_seat(serde_json::from_value::<SeatInput>(value).unwrap()).unwrap()
         };
         let omitted = parse(serde_json::json!({}));
-        assert_eq!((omitted.early_termination, omitted.termination_rate_bps), (None, None));
+        assert_eq!(
+            (omitted.early_termination, omitted.termination_rate_bps),
+            (None, None)
+        );
         let reset = parse(serde_json::json!({"terminationRateBps": null}));
         assert_eq!(reset.termination_rate_bps, Some(None));
-        let set = parse(serde_json::json!({"earlyTermination": "forbidden", "terminationRateBps": 2500}));
-        assert_eq!((set.early_termination, set.termination_rate_bps), (Some("forbidden"), Some(Some(2500))));
+        let set =
+            parse(serde_json::json!({"earlyTermination": "forbidden", "terminationRateBps": 2500}));
+        assert_eq!(
+            (set.early_termination, set.termination_rate_bps),
+            (Some("forbidden"), Some(Some(2500)))
+        );
     }
 
     #[test]

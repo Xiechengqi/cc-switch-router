@@ -427,6 +427,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         123,
         include_str!("../schema/0123_trial_conversion_cursor_repair.sql"),
     ),
+    (124, include_str!("../schema/0124_client_host_health.sql")),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -934,12 +935,68 @@ fn migration_checksum(sql: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn migration_124_preserves_existing_host_and_rental_facts() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 123);
+        conn.execute("INSERT INTO router_ssh_hosts(id,ip,port,host_owner_email,status,installation_id,created_at,updated_at)
+            VALUES('prior','192.0.2.10',22,'provider@example.test','allocated','prior-client','2026-01-01','2026-01-01')",[]).unwrap();
+        conn.execute("INSERT INTO client_market_subscriptions(installation_id,host_id,provider_id,host_owner_email,client_user_id,client_owner_email,status,offer_revision,created_at,updated_at)
+            VALUES('prior-client','prior','provider','provider@example.test','buyer','buyer@example.test','active',3,'2026-01-01','2026-01-01')",[]).unwrap();
+        apply(&conn).unwrap();
+        let facts:(String,String,i64)=conn.query_row("SELECT h.status,s.status,s.offer_revision FROM router_ssh_hosts h JOIN client_market_subscriptions s ON s.host_id=h.id WHERE h.id='prior'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(facts, ("allocated".into(), "active".into(), 3));
+        // Hosts listed before health reporting keep their availability and are queued
+        // for reporter installation; the legacy exemption ends at the first report.
+        let agent: (i64, i64, Option<i64>) = conn
+            .query_row(
+                "SELECT legacy,maintenance_pending,admitted_hour FROM client_host_agents WHERE host_id='prior'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(agent, (1, 1, None));
+        let queued: (String, i64) = conn
+            .query_row(
+                "SELECT status,attempts FROM client_binary_preparations WHERE host_id='prior'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(queued, ("pending".into(), 0));
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM client_host_tenancies WHERE installation_id='prior-client' AND host_id='prior'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        // Returning the legacy Host to the pool after its rental must not be rejected.
+        conn.execute(
+            "UPDATE router_ssh_hosts SET status='idle',installation_id=NULL WHERE id='prior'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM client_host_hour_reports", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
+        assert!(conn.execute("INSERT INTO router_ssh_hosts(id,ip,port,host_owner_email,status,created_at,updated_at) VALUES('new','192.0.2.11',22,'provider@example.test','idle','2026-01-01','2026-01-01')",[]).is_err());
+    }
+
     use super::*;
 
     // Includes live-health evidence (0109), ordered route candidates (0110),
     // resource tariffs/capabilities (0111), owner model prices (0113), and
     // browser/financial credentials, risk evidence and recovery (0114–0116).
-    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 304;
+    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 311;
 
     #[test]
     fn migration_114_revokes_existing_sessions_and_rotation_grace_only_once() {
@@ -2509,7 +2566,7 @@ mod tests {
             conn.execute(
                 "INSERT INTO router_ssh_hosts
                 (id,ip,port,host_owner_email,status,created_at,updated_at,daily_rate_minor,currency)
-                VALUES (?1,?2,22,'provider@example.test','idle','t','t',100,'USD')",
+                VALUES (?1,?2,22,'provider@example.test','onboarding','t','t',100,'USD')",
                 params![mode, format!("192.0.2.{}", i + 20)],
             )
             .unwrap();

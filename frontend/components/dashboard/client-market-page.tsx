@@ -97,6 +97,12 @@ export function ClientMarketPage() {
   const { remembered, takeSeed } = useRememberedView<ClientMarketView>(viewKey);
   const viewKeyRef = React.useRef(viewKey);
   viewKeyRef.current = viewKey;
+  const [onlyHealthy, setOnlyHealthy] = React.useState(false);
+  const [healthSort, setHealthSort] = React.useState(false);
+  const [healthArch, setHealthArch] = React.useState("");
+  const [minimumCpu, setMinimumCpu] = React.useState("");
+  const [minimumMemory, setMinimumMemory] = React.useState("");
+  const healthFiltersActive = onlyHealthy || Boolean(healthArch) || Boolean(minimumCpu) || Boolean(minimumMemory);
   const [hosts, setHosts] = React.useState<ClientMarketHost[]>(remembered?.hosts ?? []);
   const [rentals, setRentals] = React.useState<ClientMarketRental[]>(remembered?.rentals ?? []);
   const [rentalRevision, setRentalRevision] = React.useState(0);
@@ -332,10 +338,22 @@ export function ClientMarketPage() {
   }, [rentals]);
 
   const visibleHosts = React.useMemo(() => {
-    const filtered = scopedHosts.filter((host) => hostMatchesListTab(host, listTab));
+    const filtered = scopedHosts.filter((host) => {
+      const snapshot = host.hostHealth?.snapshot;
+      return hostMatchesListTab(host, listTab)
+        && (!onlyHealthy || host.hostHealth?.state === "healthy")
+        && (!healthArch || snapshot?.arch === healthArch)
+        && (!minimumCpu || (snapshot?.effectiveVcpu.value != null && snapshot.effectiveVcpu.value >= Number(minimumCpu)))
+        && (!minimumMemory || (snapshot?.memoryTotalBytes.value != null && snapshot.memoryTotalBytes.value >= Number(minimumMemory) * 2 ** 30));
+    });
     const sorted = sortHosts(filtered, sortPrefs);
+    if (healthSort) sorted.sort((left, right) => {
+      const record = (host: ClientMarketHost) => host.hostHealth?.observable24h ? host.hostHealth.received24h / host.hostHealth.observable24h : -1;
+      // Equal ratios rank the longer observed record first (24/24 before 1/1).
+      return record(right) - record(left) || (right.hostHealth?.observable24h || 0) - (left.hostHealth?.observable24h || 0);
+    });
     return listTab === "mine" ? prioritizeMineClientOwned(sorted) : sorted;
-  }, [listTab, scopedHosts, sortPrefs]);
+  }, [listTab, scopedHosts, sortPrefs, onlyHealthy, healthSort, healthArch, minimumCpu, minimumMemory]);
 
   const toggleHostSort = React.useCallback((key: HostSortKey) => {
     setSortPrefs((prev) => {
@@ -395,7 +413,7 @@ export function ClientMarketPage() {
 
   React.useEffect(() => {
     setPage(1);
-  }, [listTab, marketProviderId, ownerFilters, regionFilters, sortPrefs.dir, sortPrefs.key]);
+  }, [listTab, marketProviderId, ownerFilters, regionFilters, sortPrefs.dir, sortPrefs.key, healthSort]);
 
   React.useEffect(() => {
     setProviderScopedTab(marketProviderId ? "all" : null);
@@ -649,6 +667,14 @@ export function ClientMarketPage() {
         </div>
       </div>
 
+      <div className="flex flex-wrap items-end gap-3 text-xs">
+        <label className="flex min-h-11 items-center gap-2"><input type="checkbox" className="h-5 w-5 rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-background" checked={onlyHealthy} onChange={event => { setOnlyHealthy(event.target.checked); setPage(1); }} />{t("hostHealth.onlyHealthy")}</label>
+        <label className="flex min-h-11 items-center gap-2"><input type="checkbox" className="h-5 w-5 rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-background" checked={healthSort} onChange={event => setHealthSort(event.target.checked)} />{t("hostHealth.sort")}</label>
+        <label className="grid gap-1">{t("hostHealth.arch")}<select value={healthArch} onChange={event => { setHealthArch(event.target.value); setPage(1); }} className="h-12 rounded-lg border border-border bg-background px-3 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-background"><option value="">{t("hostHealth.allArch")}</option><option value="aarch64">ARM64</option><option value="x86_64">x86_64</option></select></label>
+        <label className="grid gap-1">{t("hostHealth.minCpu")}<input type="number" min="0" step="0.5" value={minimumCpu} onChange={event => { setMinimumCpu(event.target.value); setPage(1); }} className="h-12 w-28 rounded-lg border border-border bg-background px-3 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-background" /></label>
+        <label className="grid gap-1">{t("hostHealth.minMemory")}<input type="number" min="0" step="0.5" value={minimumMemory} onChange={event => { setMinimumMemory(event.target.value); setPage(1); }} className="h-12 w-28 rounded-lg border border-border bg-background px-3 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-background" /></label>
+      </div>
+
       {batch.selectionMode ? (
         <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-white px-3 py-2 text-sm">
           <span className="font-medium text-foreground">{t("clientMarket.batchSelected", { count: batch.selectedCount })}</span>
@@ -750,10 +776,10 @@ export function ClientMarketPage() {
         <div className="grid justify-items-center gap-2 rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">
           <span>
             {viewingMine
-              ? !ownerFilters.length && !regionFilters.length && !marketProviderId
+              ? !ownerFilters.length && !regionFilters.length && !marketProviderId && !healthFiltersActive
                 ? t("clientMarket.scopeMineEmpty")
                 : t("dashboard.noFilterResults")
-              : scopedHosts.length || ownerFilters.length || regionFilters.length || marketProviderId
+              : scopedHosts.length || ownerFilters.length || regionFilters.length || marketProviderId || healthFiltersActive
                 ? t("dashboard.noFilterResults")
                 : t("clientMarket.noHosts")}
           </span>
