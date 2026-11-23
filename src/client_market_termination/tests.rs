@@ -42,6 +42,7 @@ fn fixture_with_rate(price: i64, terms: bool, trial: i64, rate: i64) -> (Connect
     let id = contracts::prepare_contract_tx(
         &conn,
         &PrepareContract {
+            trial_only: false,
             product_kind: "client_host",
             product_ref: "job",
             trial_scope_ref: HOST,

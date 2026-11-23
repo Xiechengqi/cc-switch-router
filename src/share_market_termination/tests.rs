@@ -8,6 +8,11 @@ fn fixture(terms: bool) -> (Connection, String, String) {
     fixture_with_trial(terms, 0)
 }
 fn fixture_with_trial(terms: bool, trial: i64) -> (Connection, String, String) {
+    fixture_with_terms(terms.then_some(None), trial)
+}
+/// `terms`: None = legacy (no frozen terms); Some(None) = the platform
+/// policy; Some(Some(p)) = explicit seat terms.
+fn fixture_with_terms(terms: Option<Option<Policy>>, trial: i64) -> (Connection, String, String) {
     let c = crate::test_support::database().unwrap();
     c.execute(
         "UPDATE market_finance_control SET mode='enabled',cutover_approved_at=?1",
@@ -28,12 +33,14 @@ fn fixture_with_trial(terms: bool, trial: i64) -> (Connection, String, String) {
     crate::market_wallet::credit_verified_topup_tx(&c, "buyer", "topup", 10000, "receipt", START)
         .unwrap();
     crate::market_commission::freeze_quote_tx(&c, "quote", "provider", START).unwrap();
-    if terms {
-        freeze_quote_tx(&c, "quote", Some(&policy_tx(&c).unwrap())).unwrap();
+    if let Some(terms) = terms {
+        let policy = terms.unwrap_or_else(|| policy_tx(&c).unwrap());
+        freeze_quote_tx(&c, "quote", Some(&policy)).unwrap();
     }
     let contract = contracts::prepare_contract_tx(
         &c,
         &PrepareContract {
+            trial_only: false,
             product_kind: "share",
             product_ref: "sub",
             trial_scope_ref: "share",
@@ -213,7 +220,7 @@ fn unstarted_rental_reports_return_path_and_existing_termination_does_not_offer_
     .unwrap();
     assert_eq!(
         availability_tx(&c, "sub").unwrap(),
-        (false, Some(TerminationBlockedReason::ServiceNotStarted))
+        Availability::blocked(Some(TerminationBlockedReason::ServiceNotStarted))
     );
     c.execute(
         "UPDATE share_market_subscriptions SET service_started_at=?1 WHERE id='sub'",
@@ -221,7 +228,10 @@ fn unstarted_rental_reports_return_path_and_existing_termination_does_not_offer_
     )
     .unwrap();
     accept(&c, &at, "voluntary");
-    assert_eq!(availability_tx(&c, "sub").unwrap(), (false, None));
+    assert_eq!(
+        availability_tx(&c, "sub").unwrap(),
+        Availability::blocked(None)
+    );
     let empty = Connection::open_in_memory().unwrap();
     assert!(matches!(
         availability_tx(&empty, "sub"),
@@ -681,4 +691,115 @@ fn receipt_for_math(t: &Termination, used: &str) -> TerminationReceipt {
             used: used.into(),
         }],
     }
+}
+
+fn seat_terms(rate_bps: i64, early_termination: &str) -> Policy {
+    Policy {
+        version: 1,
+        rate_bps,
+        early_termination: early_termination.into(),
+        rate_source: "seat".into(),
+    }
+}
+
+#[test]
+fn seat_terms_follow_the_platform_until_the_seller_sets_them() {
+    let (c, _, _) = fixture(true);
+    let platform = seat_policy_tx(&c, "seat").unwrap();
+    assert_eq!(
+        (
+            platform.rate_bps,
+            platform.rate_source.as_str(),
+            platform.early_termination.as_str()
+        ),
+        (1000, "router", "allowed")
+    );
+    c.execute(
+        "UPDATE share_market_seats SET termination_rate_bps=2500, early_termination='forbidden' WHERE id='seat'",
+        [],
+    )
+    .unwrap();
+    let seller = seat_policy_tx(&c, "seat").unwrap();
+    assert_eq!(
+        (
+            seller.rate_bps,
+            seller.rate_source.as_str(),
+            seller.early_termination.as_str()
+        ),
+        (2500, "seat", "forbidden")
+    );
+    assert_eq!(seller.version, 1, "audit keeps the platform policy version");
+    for bad in [
+        "UPDATE share_market_seats SET termination_rate_bps=5001",
+        "UPDATE share_market_seats SET early_termination='sometimes'",
+    ] {
+        assert!(c.execute(bad, []).is_err(), "{bad}");
+    }
+    // A free seat (no quote terms) and an unknown seat fall back to the platform.
+    assert_eq!(seat_policy_tx(&c, "missing").unwrap().rate_source, "router");
+}
+
+#[test]
+fn seller_rate_is_frozen_into_the_contract_and_period() {
+    let (c, contract, at) = fixture_with_terms(Some(Some(seat_terms(2000, "allowed"))), 0);
+    let (rate, source): (i64, String) = c
+        .query_row(
+            "SELECT t.rate_bps,t.rate_source FROM share_termination_period_terms t JOIN market_platform_periods p ON p.id=t.period_id WHERE p.contract_id=?1",
+            params![contract],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((rate, source.as_str()), (2000, "seat"));
+    // Changing the seat afterwards never rewrites the accepted terms.
+    c.execute("UPDATE share_market_seats SET termination_rate_bps=0", [])
+        .unwrap();
+    let availability = availability_tx(&c, "sub").unwrap();
+    assert!(availability.can_terminate && availability.can_report_issue);
+    let t = accept(&c, &at, "voluntary");
+    assert_eq!(t.rate_bps, 2000);
+    assert_eq!(
+        t.compensation_cap_units,
+        crate::client_market_termination::compensation(
+            t.period_amount_units,
+            t.remaining_units,
+            2000
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn a_forbidden_seat_only_ends_early_through_a_service_claim_holding_all_unused_rent() {
+    let (c, _, at) = fixture_with_terms(Some(Some(seat_terms(1000, "forbidden"))), 0);
+    let availability = availability_tx(&c, "sub").unwrap();
+    assert_eq!(
+        availability,
+        Availability {
+            can_terminate: false,
+            can_report_issue: true,
+            blocked_reason: Some(TerminationBlockedReason::EarlyTerminationForbidden),
+        }
+    );
+    let preview = preview_tx(&c, "sub", "buyer", &at).unwrap();
+    assert_eq!(preview["earlyTerminationForbidden"], json!(true));
+    assert_eq!(preview["returnUnits"], json!("0"));
+    let voluntary = accept_tx(
+        &c,
+        "sub",
+        "buyer",
+        &Accept {
+            preview_id: preview["previewId"].as_str().unwrap().into(),
+            reason: "voluntary".into(),
+            claim: String::new(),
+        },
+        &at,
+    )
+    .unwrap_err();
+    assert_eq!(voluntary.code(), Some("SHARE_EARLY_TERMINATION_FORBIDDEN"));
+    assert!(for_subscription_tx(&c, "sub").unwrap().is_none());
+    let t = accept(&c, &at, "provider_issue");
+    assert_eq!(t.rate_bps, 10_000);
+    assert!(t.early_termination_forbidden);
+    assert_eq!(t.compensation_cap_units, t.remaining_units);
+    assert_eq!(t.responsibility, "undetermined");
 }

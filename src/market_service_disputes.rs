@@ -694,6 +694,7 @@ mod tests {
         let contract_id = prepare_contract_tx(
             &tx,
             &PrepareContract {
+                trial_only: false,
                 product_kind: "share",
                 product_ref: "share-subscription",
                 trial_scope_ref: "share",

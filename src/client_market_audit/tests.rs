@@ -53,6 +53,7 @@ pub(super) fn paid(trial: i64) -> (Connection, String, String) {
     let contract = contracts::prepare_contract_tx(
         &conn,
         &PrepareContract {
+            trial_only: false,
             product_kind: "client_host",
             product_ref: "job-0001",
             trial_scope_ref: "host-0001",

@@ -536,6 +536,7 @@ fn insert_pending_settlement(conn: &Connection, record: &SubscriptionRecord) {
         period_id: None,
         policy_version: 1,
         rate_bps: 1000,
+        early_termination_forbidden: false,
         period_amount_units: 0,
         time_earned_units: 0,
         prior_refunded_units: 0,

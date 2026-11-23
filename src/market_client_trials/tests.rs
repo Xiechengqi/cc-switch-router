@@ -23,6 +23,7 @@ fn prepare(conn: &Connection, job: &str, trial: i64, model: BillingModel) -> Str
     contracts::prepare_contract_tx(
         conn,
         &PrepareContract {
+            trial_only: false,
             product_kind: "client_host",
             product_ref: job,
             trial_scope_ref: "host",
@@ -251,6 +252,7 @@ fn a_failed_first_payment_does_not_restore_and_no_minimum_fee_is_required() {
     let id = contracts::prepare_contract_tx(
         &conn,
         &PrepareContract {
+            trial_only: false,
             product_kind: "client_host",
             product_ref: "tiny",
             trial_scope_ref: "host",
@@ -389,6 +391,7 @@ fn share_lifetime_trials_are_not_restored_by_rent_payment() {
     let id = contracts::prepare_contract_tx(
         &conn,
         &PrepareContract {
+            trial_only: false,
             product_kind: "share",
             product_ref: "share-rent",
             trial_scope_ref: "share",

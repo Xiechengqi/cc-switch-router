@@ -3089,6 +3089,7 @@ impl AppStore {
                 crate::market_platform_contracts::prepare_contract_tx(
                     &tx,
                     &crate::market_platform_contracts::PrepareContract {
+                        trial_only: false,
                         product_kind: "client_host",
                         product_ref: &job_id,
                         trial_scope_ref: &item.0,

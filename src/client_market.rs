@@ -11362,6 +11362,7 @@ mod tests {
                     VALUES(?1,?2,'history-provider','history-provider@example.com','history-buyer','history-buyer@example.com',?3,1,?4,?4)",
                     params![installation,host.id,status,start]).unwrap();
                 let input = PrepareContract {
+                    trial_only: false,
                     product_kind: "client_host",
                     product_ref: installation,
                     trial_scope_ref: &host.id,
@@ -12132,6 +12133,7 @@ mod tests {
             contracts::prepare_contract_tx(
                 &conn,
                 &PrepareContract {
+                    trial_only: false,
                     product_kind: "client_host",
                     product_ref: "previous-job",
                     trial_scope_ref: &host.id,
@@ -12833,6 +12835,7 @@ mod tests {
             let contract_id = crate::market_platform_contracts::prepare_contract_tx(
                 &tx,
                 &crate::market_platform_contracts::PrepareContract {
+                    trial_only: false,
                     product_kind: "client_host",
                     product_ref: &job_id,
                     trial_scope_ref: &host.id,
@@ -12989,6 +12992,7 @@ mod tests {
             let contract_id = crate::market_platform_contracts::prepare_contract_tx(
                 &tx,
                 &crate::market_platform_contracts::PrepareContract {
+                    trial_only: false,
                     product_kind: "client_host",
                     product_ref: &job_id,
                     trial_scope_ref: &host.id,

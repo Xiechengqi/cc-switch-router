@@ -36,11 +36,32 @@ fn no_store() -> [(header::HeaderName, &'static str); 1] {
     [(header::CACHE_CONTROL, "private, no-store")]
 }
 
+/// Highest compensation rate a seller may set on a seat. A seller who wants
+/// no refunds at all forbids early termination instead.
+pub(crate) const MAX_SEAT_RATE_BPS: i64 = 5_000;
+
+fn allowed() -> String {
+    "allowed".into()
+}
+fn router_source() -> String {
+    "router".into()
+}
+
+/// Termination terms. The platform policy carries the Router owner's default
+/// rate; a quote freezes the seat's effective terms. `version` is always the
+/// platform policy version in force when the terms were frozen.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Policy {
     pub version: i64,
     pub rate_bps: i64,
+    /// `allowed` or `forbidden`: whether the buyer may end a paid period early
+    /// for their own reasons. Service-problem claims stay available.
+    #[serde(default = "allowed")]
+    pub early_termination: String,
+    /// `router` (platform default) or `seat` (seller's own rate).
+    #[serde(default = "router_source")]
+    pub rate_source: String,
 }
 pub(crate) fn policy_tx(c: &Connection) -> Result<Policy, AppError> {
     c.query_row(
@@ -50,12 +71,38 @@ pub(crate) fn policy_tx(c: &Connection) -> Result<Policy, AppError> {
             Ok(Policy {
                 version: r.get(0)?,
                 rate_bps: r.get(1)?,
+                early_termination: allowed(),
+                rate_source: router_source(),
             })
         },
     )
     .map_err(db_error("read Share termination policy"))
 }
-pub(crate) fn quote_policy_tx(c: &Connection, share: &str) -> Result<Option<Policy>, AppError> {
+/// The seat's effective terms: its own rate or the platform default, and
+/// whether voluntary early termination is allowed.
+pub(crate) fn seat_policy_tx(c: &Connection, seat: &str) -> Result<Policy, AppError> {
+    let platform = policy_tx(c)?;
+    let (early, rate): (String, Option<i64>) = c
+        .query_row(
+            "SELECT early_termination,termination_rate_bps FROM share_market_seats WHERE id=?1",
+            params![seat],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(db_error("read Share seat termination terms"))?
+        .unwrap_or_else(|| (allowed(), None));
+    Ok(Policy {
+        version: platform.version,
+        rate_bps: rate.unwrap_or(platform.rate_bps),
+        early_termination: early,
+        rate_source: if rate.is_some() { "seat" } else { "router" }.into(),
+    })
+}
+pub(crate) fn quote_policy_tx(
+    c: &Connection,
+    share: &str,
+    seat: &str,
+) -> Result<Option<Policy>, AppError> {
     let since: Option<i64> = c
         .query_row(
             "SELECT termination_archive_since_ms FROM shares WHERE share_id=?1",
@@ -65,7 +112,7 @@ pub(crate) fn quote_policy_tx(c: &Connection, share: &str) -> Result<Option<Poli
         .optional()
         .map_err(db_error("read Share settlement capability"))?
         .flatten();
-    since.map(|_| policy_tx(c)).transpose()
+    since.map(|_| seat_policy_tx(c, seat)).transpose()
 }
 pub(crate) fn freeze_quote_tx(
     c: &Connection,
@@ -74,22 +121,26 @@ pub(crate) fn freeze_quote_tx(
 ) -> Result<(), AppError> {
     if let Some(p) = p {
         c.execute(
-            "INSERT INTO share_termination_quote_terms VALUES(?1,?2,?3)",
-            params![id, p.version, p.rate_bps],
+            "INSERT INTO share_termination_quote_terms(quote_id,policy_version,rate_bps,early_termination,rate_source)
+             VALUES(?1,?2,?3,?4,?5)",
+            params![id, p.version, p.rate_bps, p.early_termination, p.rate_source],
         )
         .map_err(db_error("freeze Share quote terms"))?;
     }
     Ok(())
 }
 pub(crate) fn freeze_contract_tx(c: &Connection, id: &str, quote: &str) -> Result<(), AppError> {
-    c.execute("INSERT INTO share_termination_contract_terms SELECT ?1,t.policy_version,t.rate_bps
+    c.execute("INSERT INTO share_termination_contract_terms(contract_id,policy_version,rate_bps,early_termination,rate_source)
+        SELECT ?1,t.policy_version,t.rate_bps,t.early_termination,t.rate_source
         FROM share_termination_quote_terms t JOIN market_platform_contracts c ON c.id=?1 AND c.product_kind='share' WHERE t.quote_id=?2",params![id,quote]).map_err(db_error("freeze Share contract terms"))?;
     Ok(())
 }
 pub(crate) fn freeze_period_tx(c: &Connection, id: &str, period: &str) -> Result<(), AppError> {
     // Keep the accepted contract's terms on automatic renewal. A changed
-    // global policy requires a new explicit quote, never silent consent.
-    c.execute("INSERT INTO share_termination_period_terms SELECT ?2,policy_version,rate_bps FROM share_termination_contract_terms WHERE contract_id=?1",params![id,period]).map_err(db_error("freeze Share period terms"))?;
+    // global policy or seat setting requires a new explicit quote, never
+    // silent consent.
+    c.execute("INSERT INTO share_termination_period_terms(period_id,policy_version,rate_bps,early_termination,rate_source)
+        SELECT ?2,policy_version,rate_bps,early_termination,rate_source FROM share_termination_contract_terms WHERE contract_id=?1",params![id,period]).map_err(db_error("freeze Share period terms"))?;
     Ok(())
 }
 
@@ -113,6 +164,10 @@ pub(crate) struct Termination {
     pub period_id: Option<String>,
     pub policy_version: i64,
     pub rate_bps: i64,
+    /// The paid period forbids voluntary early termination; only a
+    /// service-problem claim could end it, holding all unused rent.
+    #[serde(default)]
+    pub early_termination_forbidden: bool,
     pub period_amount_units: i64,
     pub time_earned_units: i64,
     pub prior_refunded_units: i64,
@@ -211,7 +266,8 @@ fn basis(c: &Connection, sub: &str, at: &str) -> Result<Termination, AppError> {
     let mut t=c.query_row("SELECT s.share_id,s.seat_id,s.listing_id,s.entitlement_id,s.installation_id,
         COALESCE(sh.share_name,''),COALESCE(sh.subdomain,''),s.renter_user_id,s.owner_user_id,s.renter_email,s.owner_email,
         co.id,p.id,COALESCE(terms.policy_version,0),COALESCE(terms.rate_bps,0),COALESCE(p.amount_units,0),
-        COALESCE(p.fulfilled_units,0),COALESCE(p.refunded_units,0),p.period_start,p.period_end
+        COALESCE(p.fulfilled_units,0),COALESCE(p.refunded_units,0),p.period_start,p.period_end,
+        COALESCE(terms.early_termination,'allowed')='forbidden'
         FROM share_market_subscriptions s LEFT JOIN shares sh ON sh.share_id=s.share_id
         LEFT JOIN market_platform_contracts co ON co.product_kind='share' AND co.product_ref=s.id
         LEFT JOIN market_platform_periods p ON p.contract_id=co.id AND p.sequence=co.current_period_sequence AND p.status='open'
@@ -224,6 +280,7 @@ fn basis(c: &Connection, sub: &str, at: &str) -> Result<Termination, AppError> {
             remaining_units:0,compensation_cap_units:0,returned_units:0,compensation_units:0,held_units:0,policy:Default::default(),
             period_start_ms:0,period_end_ms:0,cutoff_at:at.into(),revoked_at:None,status:"revoke_pending".into(),reason:"voluntary".into(),claim:String::new(),
             responsibility:"buyer".into(),dispute_opened_at:None,provider_responded_at:None,decision_note:None,decided_award_units:None,version:1,updated_at:at.into(),
+            early_termination_forbidden:r.get(20)?,
         })).optional().map_err(db_error("read Share termination basis"))?.ok_or_else(||AppError::NotFound("active Share rental not found".into()))?;
     if let Some(p) = t.period_id.as_deref() {
         let (start, end): (String, String) = c
@@ -263,6 +320,10 @@ pub enum TerminationBlockedReason {
     LifetimeArchiveIncomplete,
     PaidPeriodExpired,
     PaidPeriodRollingOver,
+    /// The seller does not allow ending a paid period early for the buyer's
+    /// own reasons. Renewal can still be turned off, and a service problem
+    /// can still be claimed.
+    EarlyTerminationForbidden,
 }
 
 impl TerminationBlockedReason {
@@ -288,6 +349,9 @@ impl TerminationBlockedReason {
             }
             Self::PaidPeriodRollingOver => {
                 "paid period is rolling over; refresh before terminating"
+            }
+            Self::EarlyTerminationForbidden => {
+                "this seat does not allow ending a paid period early; turn off renewal or report a service problem"
             }
         }
     }
@@ -350,18 +414,43 @@ fn eligible(c: &Connection, t: &Termination) -> Result<(), AppError> {
     Ok(())
 }
 
-pub(crate) fn availability_tx(
-    c: &Connection,
-    sub: &str,
-) -> Result<(bool, Option<TerminationBlockedReason>), AppError> {
+/// What a buyer may do to end a rental now. `can_terminate`: end it for any
+/// reason. `can_report_issue`: end it as a service-problem claim, which is
+/// still possible when the seller forbids voluntary early termination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Availability {
+    pub can_terminate: bool,
+    pub can_report_issue: bool,
+    pub blocked_reason: Option<TerminationBlockedReason>,
+}
+impl Availability {
+    fn blocked(reason: Option<TerminationBlockedReason>) -> Self {
+        Self {
+            can_terminate: false,
+            can_report_issue: false,
+            blocked_reason: reason,
+        }
+    }
+}
+
+pub(crate) fn availability_tx(c: &Connection, sub: &str) -> Result<Availability, AppError> {
     if for_subscription_tx(c, sub)?.is_some() {
-        return Ok((false, None));
+        return Ok(Availability::blocked(None));
     }
     match basis(c, sub, &Utc::now().to_rfc3339()) {
-        Ok(t) => {
-            let reason = blocked_reason(c, &t)?;
-            Ok((reason.is_none(), reason))
-        }
+        Ok(t) => Ok(match blocked_reason(c, &t)? {
+            Some(reason) => Availability::blocked(Some(reason)),
+            None if t.early_termination_forbidden => Availability {
+                can_terminate: false,
+                can_report_issue: true,
+                blocked_reason: Some(TerminationBlockedReason::EarlyTerminationForbidden),
+            },
+            None => Availability {
+                can_terminate: true,
+                can_report_issue: true,
+                blocked_reason: None,
+            },
+        }),
         Err(AppError::NotFound(_)) => {
             let pending: bool = c
                 .query_row(
@@ -371,8 +460,7 @@ pub(crate) fn availability_tx(
                     |r| r.get(0),
                 )
                 .map_err(db_error("read Share activation state"))?;
-            Ok((
-                false,
+            Ok(Availability::blocked(
                 pending.then_some(TerminationBlockedReason::ServiceNotStarted),
             ))
         }
@@ -380,14 +468,29 @@ pub(crate) fn availability_tx(
     }
 }
 
+/// A period that forbids voluntary early termination can only end through a
+/// service-problem claim, which holds all unused rent until it is decided.
+fn hold_all_unused_rent(t: &mut Termination) -> Result<(), AppError> {
+    t.rate_bps = 10_000;
+    t.compensation_cap_units = crate::client_market_termination::compensation(
+        t.period_amount_units,
+        t.remaining_units,
+        t.rate_bps,
+    )?;
+    Ok(())
+}
+
 fn preview_tx(c: &Connection, sub: &str, buyer: &str, at: &str) -> Result<Value, AppError> {
-    let t = basis(c, sub, at)?;
+    let mut t = basis(c, sub, at)?;
     if t.buyer_user_id != buyer {
         return Err(AppError::Forbidden(
             "Share rental belongs to another buyer".into(),
         ));
     }
     eligible(c, &t)?;
+    if t.early_termination_forbidden {
+        hold_all_unused_rent(&mut t)?;
+    }
     let id = Uuid::new_v4().to_string();
     let expires = (time(at)? + Duration::seconds(120)).to_rfc3339();
     c.execute("DELETE FROM share_termination_previews WHERE subscription_id=?1 OR id IN(SELECT id FROM share_termination_previews WHERE expires_at<=?2 LIMIT 200)",params![sub,at]).map_err(db_error("expire Share previews"))?;
@@ -453,6 +556,16 @@ fn accept_tx(
     }
     t = basis(c, sub, at)?;
     eligible(c, &t)?;
+    if t.early_termination_forbidden {
+        if input.reason == "voluntary" {
+            return Err(AppError::coded_conflict(
+                "SHARE_EARLY_TERMINATION_FORBIDDEN",
+                TerminationBlockedReason::EarlyTerminationForbidden.message(),
+                json!({}),
+            ));
+        }
+        hold_all_unused_rent(&mut t)?;
+    }
     t.reason = input.reason.clone();
     t.claim = input.claim.trim().into();
     if t.reason != "voluntary" && t.compensation_cap_units > 0 {
@@ -1036,6 +1149,8 @@ async fn set_policy(
         Json(Policy {
             version,
             rate_bps: i.rate_bps,
+            early_termination: allowed(),
+            rate_source: router_source(),
         }),
     ))
 }

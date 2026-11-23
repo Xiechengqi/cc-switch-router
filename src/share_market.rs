@@ -374,6 +374,8 @@ pub struct SeatView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trial_value_limit_usd_micros: Option<String>,
     pub trial_value_limit_usd_micros_override: Option<String>,
+    /// Effective termination terms a new rental of this seat would get.
+    pub termination_terms: crate::share_market_termination::Policy,
     pub offer_revision: i64,
     pub is_free: bool,
     pub can_rent: bool,
@@ -399,6 +401,9 @@ pub struct SubscriptionView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub control_progress: Option<control_recovery::ControlProgress>,
     pub can_terminate_immediately: bool,
+    /// A service-problem claim can end the rental even when the seat forbids
+    /// voluntary early termination.
+    pub can_report_service_issue: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub termination_blocked_reason:
         Option<crate::share_market_termination::TerminationBlockedReason>,
@@ -529,6 +534,14 @@ pub struct SeatInput {
     /// "0" means time-only, omitted inherits the Router default.
     #[serde(default)]
     pub trial_value_limit_usd_micros: Option<String>,
+    /// Paid seats only: `allowed` (default) or `forbidden` voluntary early
+    /// termination of a paid period.
+    #[serde(default)]
+    pub early_termination: Option<String>,
+    /// Paid seats only: the seller's compensation rate in basis points
+    /// (0–5000); null follows the Router owner's platform default.
+    #[serde(default)]
+    pub termination_rate_bps: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -821,6 +834,18 @@ pub struct CommitRentQuoteRequest {
     pub idempotency_key: String,
     #[serde(default)]
     pub auto_renew: bool,
+    /// `end`: trial only. No wallet balance is required and the seat returns
+    /// when the trial runs out. `continue` (default) converts to paid service.
+    #[serde(default)]
+    pub after_trial: AfterTrial,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AfterTrial {
+    #[default]
+    Continue,
+    End,
 }
 
 #[derive(Debug, Serialize)]
@@ -853,6 +878,8 @@ struct NormalizedSeat {
     trial_hours: Option<i64>,
     trial_token_limit: Option<u64>,
     trial_value_limit_usd_micros: Option<String>,
+    early_termination: &'static str,
+    termination_rate_bps: Option<i64>,
 }
 
 impl NormalizedSeat {
@@ -941,6 +968,22 @@ fn normalize_seat(input: SeatInput) -> Result<NormalizedSeat, AppError> {
         return Err(AppError::BadRequest("seat token limit is too large".into()));
     }
     let value_quota = normalize_seat_value_quota(input.value_quota, input.token_limit)?;
+    let early_termination = match input.early_termination.as_deref() {
+        None | Some("allowed") => "allowed",
+        Some("forbidden") => "forbidden",
+        Some(_) => {
+            return Err(AppError::BadRequest(
+                "earlyTermination must be allowed or forbidden".into(),
+            ));
+        }
+    };
+    if input.termination_rate_bps.is_some_and(|rate| {
+        !(0..=crate::share_market_termination::MAX_SEAT_RATE_BPS).contains(&rate)
+    }) {
+        return Err(AppError::BadRequest(
+            "terminationRateBps must be between 0 and 5000".into(),
+        ));
+    }
     let daily_rate_minor = input.daily_rate_minor;
     let cycle_price_minor = input.cycle_price_minor;
     if daily_rate_minor.is_some() && cycle_price_minor.is_some() {
@@ -976,6 +1019,11 @@ fn normalize_seat(input: SeatInput) -> Result<NormalizedSeat, AppError> {
                 "trial hours and trial budgets apply only to paid seats".into(),
             ));
         }
+        if early_termination != "allowed" || input.termination_rate_bps.is_some() {
+            return Err(AppError::BadRequest(
+                "termination rules apply only to paid seats".into(),
+            ));
+        }
         return Ok(NormalizedSeat {
             parallel_limit: input.parallel_limit,
             token_limit: input.token_limit,
@@ -990,6 +1038,8 @@ fn normalize_seat(input: SeatInput) -> Result<NormalizedSeat, AppError> {
             trial_hours: None,
             trial_token_limit: None,
             trial_value_limit_usd_micros: None,
+            early_termination: "allowed",
+            termination_rate_bps: None,
         });
     }
     let price_minor = price_minor.ok_or_else(|| {
@@ -1049,7 +1099,25 @@ fn normalize_seat(input: SeatInput) -> Result<NormalizedSeat, AppError> {
         trial_hours,
         trial_token_limit,
         trial_value_limit_usd_micros,
+        early_termination,
+        termination_rate_bps: input.termination_rate_bps,
     })
+}
+
+/// Stores a seat's termination rules. Seats are only edited while available,
+/// and every edit bumps the offer revision, so open quotes are invalidated
+/// and existing rentals keep the terms frozen when they were quoted.
+fn write_seat_termination_tx(
+    tx: &Transaction<'_>,
+    seat_id: &str,
+    seat: &NormalizedSeat,
+) -> Result<(), AppError> {
+    tx.execute(
+        "UPDATE share_market_seats SET early_termination = ?2, termination_rate_bps = ?3 WHERE id = ?1",
+        params![seat_id, seat.early_termination, seat.termination_rate_bps],
+    )
+    .map_err(map_db("save Share seat termination rules"))?;
+    Ok(())
 }
 
 /// A paid seat's one-time trial budget uses the seat's quota unit: Token and
@@ -5113,6 +5181,7 @@ fn redact_public_subscription(subscription: &mut SubscriptionView) {
     subscription.open_wallet_dispute = false;
     subscription.can_release = false;
     subscription.can_terminate_immediately = false;
+    subscription.can_report_service_issue = false;
     subscription.termination_blocked_reason = None;
     subscription.termination_id = None;
     subscription.can_force_revoke = false;
@@ -5299,15 +5368,18 @@ fn subscription_view(
     } else {
         false
     };
-    let (can_terminate_immediately, termination_blocked_reason) = if is_renter {
-        crate::share_market_termination::availability_tx(conn, &record.id)?
+    let availability = if is_renter {
+        Some(crate::share_market_termination::availability_tx(
+            conn, &record.id,
+        )?)
     } else {
-        (false, None)
+        None
     };
     Ok(SubscriptionView {
         control_progress,
-        can_terminate_immediately,
-        termination_blocked_reason,
+        can_terminate_immediately: availability.is_some_and(|a| a.can_terminate),
+        can_report_service_issue: availability.is_some_and(|a| a.can_report_issue),
+        termination_blocked_reason: availability.and_then(|a| a.blocked_reason),
         termination_id: if is_renter || is_owner {
             crate::share_market_termination::for_subscription_tx(conn, &record.id)?.map(|t| t.id)
         } else {
@@ -6016,7 +6088,10 @@ impl AppStore {
                     .trial_token_limit
                     .filter(|_| !value_seat)
                     .and_then(|value| u64::try_from(value).ok());
+                let termination_terms =
+                    crate::share_market_termination::seat_policy_tx(&conn, &seat.id)?;
                 seats.push(SeatView {
+                    termination_terms,
                     id: seat.id,
                     position: seat.position,
                     status: if read_only {
@@ -6536,6 +6611,7 @@ fn insert_seat_tx(
         ],
     )
     .map_err(map_db("insert Share Market seat"))?;
+    write_seat_termination_tx(tx, &id, seat)?;
     Ok(id)
 }
 
@@ -7392,6 +7468,7 @@ impl AppStore {
                     serde_json::json!({ "seatId": seat_id }),
                 ));
             }
+            write_seat_termination_tx(&tx, seat_id, seat)?;
             reopened_seat_ids.push(seat_id.clone());
         }
 
@@ -7600,6 +7677,7 @@ impl AppStore {
                 serde_json::json!({ "seatId": seat_id }),
             ));
         }
+        write_seat_termination_tx(&tx, seat_id, &seat)?;
         event_tx(
             &tx,
             None,
@@ -8820,7 +8898,9 @@ impl AppStore {
             ));
         }
         let snapshot = RentQuoteSnapshot {
-            termination_policy: crate::share_market_termination::quote_policy_tx(&tx, &share_id)?,
+            termination_policy: crate::share_market_termination::quote_policy_tx(
+                &tx, &share_id, seat_id,
+            )?,
             seat_id: seat_id.to_string(),
             listing_id: listing_id.clone(),
             share_id: share_id.clone(),
@@ -8957,6 +9037,7 @@ impl AppStore {
             quote_id,
             idempotency_key,
             false,
+            AfterTrial::Continue,
             share_online,
         )
         .await
@@ -8969,8 +9050,15 @@ impl AppStore {
         quote_id: &str,
         idempotency_key: &str,
         auto_renew: bool,
+        after_trial: AfterTrial,
         share_online: bool,
     ) -> Result<CommitRentQuoteResponse, AppError> {
+        let trial_only = after_trial == AfterTrial::End;
+        if trial_only && auto_renew {
+            return Err(AppError::BadRequest(
+                "a trial-only rental cannot renew automatically".into(),
+            ));
+        }
         let quote_id = quote_id.trim();
         let idempotency_key = idempotency_key.trim();
         if quote_id.is_empty() {
@@ -8987,7 +9075,11 @@ impl AppStore {
         // Renewal policy is part of the purchased terms. Reusing an
         // idempotency key with a different policy must not silently replay the
         // first request.
-        let fingerprint = format!("share-rent-v2:{quote_id}:{seat_id}:{auto_renew}");
+        let fingerprint = if trial_only {
+            format!("share-rent-v3:{quote_id}:{seat_id}:trial-only")
+        } else {
+            format!("share-rent-v2:{quote_id}:{seat_id}:{auto_renew}")
+        };
         let now_dt = Utc::now();
         let now = now_dt.to_rfc3339();
         let conn = self.conn.lock().await;
@@ -9132,6 +9224,13 @@ impl AppStore {
                 "Share rent quote App bundle is inconsistent".into(),
             ));
         }
+        if trial_only && trial_seconds_remaining <= 0 {
+            return Err(AppError::coded_conflict(
+                "SHARE_TRIAL_ONLY_UNAVAILABLE",
+                "this quote has no remaining trial; rent the seat as a paid rental",
+                serde_json::json!({}),
+            ));
+        }
         let metadata = RentCommitMetadata {
             quote_id: quote_id.to_string(),
             idempotency_key: idempotency_key.to_string(),
@@ -9146,6 +9245,7 @@ impl AppStore {
             Some(&snapshot),
             Some(trial_seconds_remaining),
             auto_renew,
+            trial_only,
             RentFunding::Wallet,
             &now,
         )?;
@@ -9214,6 +9314,7 @@ impl AppStore {
             metadata,
             None,
             None,
+            false,
             false,
             RentFunding::Wallet,
             &now,
@@ -9504,6 +9605,7 @@ impl AppStore {
         quote_snapshot: Option<&RentQuoteSnapshot>,
         quoted_trial_seconds: Option<i64>,
         auto_renew: bool,
+        trial_only: bool,
         funding: RentFunding,
         now: &str,
     ) -> Result<String, AppError> {
@@ -9981,6 +10083,7 @@ impl AppStore {
                     },
                     price_minor,
                     auto_renew: cycle_price_minor.is_some() && auto_renew,
+                    trial_only,
                     trial_seconds: quoted_trial_seconds.unwrap_or(0),
                     trial_allowance_seconds: trial_seconds_from_hours(
                         rented_trial_hours.unwrap_or(0),
@@ -10426,6 +10529,7 @@ async fn rent_seat(
             &input.quote_id,
             &input.idempotency_key,
             input.auto_renew,
+            input.after_trial,
             share_online,
         )
         .await?;
@@ -13830,6 +13934,8 @@ mod tests {
 
     fn free_seat() -> SeatInput {
         SeatInput {
+            early_termination: None,
+            termination_rate_bps: None,
             parallel_limit: Some(2),
             token_limit: Some(10_000),
             value_quota: None,
@@ -13846,6 +13952,8 @@ mod tests {
 
     fn paid_seat() -> SeatInput {
         SeatInput {
+            early_termination: None,
+            termination_rate_bps: None,
             daily_rate_minor: Some(1_200),
             currency: Some("USD".into()),
             service_duration_days: None,
@@ -13855,6 +13963,8 @@ mod tests {
 
     fn monthly_seat() -> SeatInput {
         SeatInput {
+            early_termination: None,
+            termination_rate_bps: None,
             daily_rate_minor: None,
             cycle_price_minor: Some(1_200),
             currency: Some("USD".into()),
@@ -15360,6 +15470,7 @@ mod tests {
             let contract = crate::market_platform_contracts::prepare_contract_tx(
                 &tx,
                 &crate::market_platform_contracts::PrepareContract {
+                    trial_only: false,
                     product_kind: "share",
                     product_ref: "prior-wallet-rental",
                     trial_scope_ref: "share-quote-trial",
@@ -18200,6 +18311,8 @@ mod tests {
 
     fn usd_trial_seat(trial_value: Option<&str>) -> SeatInput {
         SeatInput {
+            early_termination: None,
+            termination_rate_bps: None,
             token_limit: None,
             value_quota: Some(usd_quota("25000000")),
             trial_token_limit: None,
@@ -19562,6 +19675,8 @@ mod tests {
             &owner,
             "share-paid-reject",
             SeatInput {
+                early_termination: None,
+                termination_rate_bps: None,
                 trial_hours: Some(0),
                 trial_token_limit: Some(0),
                 ..monthly_seat()
@@ -23031,6 +23146,8 @@ mod tests {
             )
             .await;
             let terms = SeatInput {
+                early_termination: None,
+                termination_rate_bps: None,
                 trial_hours: Some(0),
                 trial_token_limit: Some(0),
                 ..monthly_seat()
@@ -23089,6 +23206,8 @@ mod tests {
         )
         .await;
         let terms = SeatInput {
+            early_termination: None,
+            termination_rate_bps: None,
             trial_hours: Some(0),
             trial_token_limit: Some(0),
             ..paid_seat()
@@ -23419,6 +23538,8 @@ mod tests {
         )
         .await;
         let terms = SeatInput {
+            early_termination: None,
+            termination_rate_bps: None,
             trial_hours: Some(0),
             trial_token_limit: Some(0),
             ..monthly_seat()

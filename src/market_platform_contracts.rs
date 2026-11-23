@@ -53,6 +53,9 @@ pub struct WalletLifecycleView {
     pub status: String,
     pub trial_seconds_remaining: i64,
     pub renewal_policy: String,
+    /// `continue` converts to paid service when the trial ends; `end` (Share
+    /// trial only) returns the seat instead.
+    pub after_trial: String,
     pub period_end: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_rental_trial: Option<crate::market_client_trials::TrialState>,
@@ -67,7 +70,8 @@ pub(crate) fn wallet_lifecycle_view_tx(
         .query_row(
             "SELECT status, trial_seconds_remaining, renewal_policy,
                 (SELECT period_end FROM market_platform_periods
-                 WHERE contract_id = contract.id AND sequence = contract.current_period_sequence)
+                 WHERE contract_id = contract.id AND sequence = contract.current_period_sequence),
+                after_trial
          FROM market_platform_contracts contract WHERE id = ?1 AND buyer_user_id = ?2",
             params![id, buyer],
             |row| {
@@ -76,6 +80,7 @@ pub(crate) fn wallet_lifecycle_view_tx(
                     status: row.get(0)?,
                     trial_seconds_remaining: row.get(1)?,
                     renewal_policy: row.get(2)?,
+                    after_trial: row.get(4)?,
                     period_end: row.get(3)?,
                     next_rental_trial: None,
                 })
@@ -159,6 +164,18 @@ fn set_wallet_renewal_tx(
         ));
     }
     if request.auto_renew {
+        let trial_only: bool = conn
+            .query_row(
+                "SELECT after_trial = 'end' AND paid_started_at IS NULL FROM market_platform_contracts WHERE id = ?1",
+                params![contract_id],
+                |row| row.get(0),
+            )
+            .map_err(db_error("read after-trial choice"))?;
+        if trial_only {
+            return Err(AppError::Conflict(
+                "a trial-only rental cannot renew; continue after the trial first".into(),
+            ));
+        }
         if let Some(end) = current.period_end.as_deref() {
             if parse_time(end)? <= parse_time(at)? {
                 return Err(AppError::Conflict(
@@ -226,11 +243,148 @@ async fn update_wallet_renewal(
     Ok(([(header::CACHE_CONTROL, "private, no-store")], Json(view)))
 }
 
+/// Most Share trial-only rentals one buyer may hold at once. They need no
+/// balance, so the cap keeps one account from parking many seats.
+pub(crate) const MAX_ACTIVE_TRIAL_ONLY: i64 = 3;
+
+pub(crate) fn require_trial_only_capacity_tx(
+    conn: &Connection,
+    buyer: &str,
+    except: Option<&str>,
+) -> Result<(), AppError> {
+    let active: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM market_platform_contracts
+             WHERE buyer_user_id = ?1 AND after_trial = 'end' AND paid_started_at IS NULL
+               AND status IN ('pending_activation', 'trialing') AND id IS NOT ?2",
+            params![buyer, except],
+            |row| row.get(0),
+        )
+        .map_err(db_error("count trial-only rentals"))?;
+    if active >= MAX_ACTIVE_TRIAL_ONLY {
+        return Err(AppError::coded_conflict(
+            "SHARE_TRIAL_ONLY_LIMIT",
+            "too many trial-only rentals are running; end one or rent as a paid rental",
+            serde_json::json!({ "limit": MAX_ACTIVE_TRIAL_ONLY }),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UpdateAfterTrialRequest {
+    after_trial: String,
+    expected: String,
+}
+
+/// Switches a running Share trial between trial-only and converting to paid
+/// service. Converting needs the first period's balance now, exactly like a
+/// paid rental; the debit still happens only when the trial ends.
+fn set_after_trial_tx(
+    conn: &Connection,
+    contract_id: &str,
+    buyer: &str,
+    request: &UpdateAfterTrialRequest,
+    at: &str,
+) -> Result<WalletLifecycleView, AppError> {
+    if !matches!(request.after_trial.as_str(), "continue" | "end")
+        || !matches!(request.expected.as_str(), "continue" | "end")
+    {
+        return Err(AppError::BadRequest("invalid after-trial choice".into()));
+    }
+    let row: Option<(String, String, i64, i64, Option<String>, String)> = conn
+        .query_row(
+            "SELECT c.product_kind, c.status, c.trial_seconds_remaining,
+                    COALESCE(c.cycle_price_minor, c.daily_rate_minor), c.paid_started_at, c.after_trial
+             FROM market_platform_contracts c WHERE c.id = ?1 AND c.buyer_user_id = ?2",
+            params![contract_id, buyer],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        )
+        .optional()
+        .map_err(db_error("read after-trial choice"))?;
+    let Some((kind, status, remaining, price, paid_started, current)) = row else {
+        return Err(AppError::NotFound("wallet contract not found".into()));
+    };
+    if current != request.expected {
+        return Err(AppError::Conflict(
+            "after-trial choice changed; reload before saving".into(),
+        ));
+    }
+    let phase: Option<String> = conn
+        .query_row(
+            "SELECT phase FROM market_share_trial_contracts WHERE contract_id = ?1",
+            params![contract_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db_error("read Share trial phase"))?;
+    if kind != "share"
+        || !matches!(status.as_str(), "pending_activation" | "trialing")
+        || remaining <= 0
+        || paid_started.is_some()
+        || phase.as_deref() != Some("trial")
+    {
+        return Err(AppError::coded_conflict(
+            "SHARE_TRIAL_ENDED",
+            "the trial has ended; this choice can no longer change",
+            serde_json::json!({}),
+        ));
+    }
+    if request.after_trial != current {
+        if request.after_trial == "continue" {
+            crate::market_reconcile::ensure_contract_finance_safe_tx(conn, contract_id)?;
+            crate::market_wallet::require_order_funding_tx(conn, buyer, price, at)?;
+        } else {
+            require_trial_only_capacity_tx(conn, buyer, Some(contract_id))?;
+        }
+        let changed = conn
+            .execute(
+                "UPDATE market_platform_contracts
+                 SET after_trial = ?3,
+                     renewal_policy = CASE WHEN ?3 = 'end' THEN 'manual' ELSE renewal_policy END,
+                     updated_at = ?4
+                 WHERE id = ?1 AND buyer_user_id = ?2 AND after_trial = ?5
+                   AND status IN ('pending_activation', 'trialing') AND paid_started_at IS NULL",
+                params![contract_id, buyer, request.after_trial, at, current],
+            )
+            .map_err(db_error("update after-trial choice"))?;
+        if changed != 1 {
+            return Err(AppError::Conflict(
+                "after-trial choice changed; reload before saving".into(),
+            ));
+        }
+    }
+    wallet_lifecycle_view_tx(conn, contract_id, buyer)?
+        .ok_or_else(|| AppError::NotFound("wallet contract not found".into()))
+}
+
+async fn update_after_trial(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<UpdateAfterTrialRequest>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let buyer = require_buyer(&state, &headers).await?;
+    let conn = state.store.conn.lock().await;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_error("begin after-trial update"))?;
+    let view = set_after_trial_tx(&tx, &id, &buyer.user_id, &request, &Utc::now().to_rfc3339())?;
+    tx.commit().map_err(db_error("commit after-trial update"))?;
+    Ok(([(header::CACHE_CONTROL, "private, no-store")], Json(view)))
+}
+
 pub fn router() -> Router<ServerState> {
-    Router::new().route(
-        "/v1/market-wallet/contracts/:id/renewal",
-        get(get_wallet_renewal).put(update_wallet_renewal),
-    )
+    Router::new()
+        .route(
+            "/v1/market-wallet/contracts/:id/renewal",
+            get(get_wallet_renewal).put(update_wallet_renewal),
+        )
+        .route(
+            "/v1/market-wallet/contracts/:id/after-trial",
+            axum::routing::put(update_after_trial),
+        )
 }
 
 /// Buyer cancellation of a paid month stops renewal, keeping already-paid access
@@ -328,6 +482,9 @@ pub(crate) struct PrepareContract<'a> {
     /// Cents per 24 hours for metered service, or cents per calendar month.
     pub price_minor: i64,
     pub auto_renew: bool,
+    /// Share trial only: needs no wallet balance and returns the seat when the
+    /// trial runs out instead of converting to paid service.
+    pub trial_only: bool,
     /// Healthy free-service seconds. A trial does not reserve buyer money.
     pub trial_seconds: i64,
     /// Full offered allowance frozen in the quote, before prior usage.
@@ -364,7 +521,9 @@ fn due_funding_claims_tx(
              FROM market_platform_contracts c
              LEFT JOIN market_wallet_holds h ON h.id = c.budget_hold_id
              WHERE c.buyer_user_id = ?1
-               AND c.status IN ('trialing', 'active', 'suspended', 'ending')",
+               AND c.status IN ('trialing', 'active', 'suspended', 'ending')
+               -- A trial-only rental never asks for money.
+               AND NOT (c.after_trial = 'end' AND c.paid_started_at IS NULL)",
         )
         .map_err(db_error("prepare buyer wallet funding claims"))?;
     let rows = statement
@@ -611,6 +770,8 @@ pub(crate) fn prepare_contract_tx(
         || !(0..=30 * 86_400).contains(&input.trial_seconds)
         || !(input.trial_seconds..=30 * 86_400).contains(&input.trial_allowance_seconds)
         || (input.billing_model == BillingModel::Metered && input.auto_renew)
+        || (input.trial_only
+            && (input.product_kind != "share" || input.trial_seconds <= 0 || input.auto_renew))
     {
         return Err(AppError::BadRequest("invalid platform contract".into()));
     }
@@ -629,7 +790,8 @@ pub(crate) fn prepare_contract_tx(
         input.price_minor,
         input.trial_seconds,
         input.trial_allowance_seconds,
-    ) + if input.auto_renew { ":auto" } else { ":manual" };
+    ) + if input.auto_renew { ":auto" } else { ":manual" }
+        + if input.trial_only { ":trial-only" } else { "" };
     let existing = conn
         .query_row(
             "SELECT id, request_fingerprint FROM market_platform_contracts
@@ -703,12 +865,16 @@ pub(crate) fn prepare_contract_tx(
         }
     }
     let id = Uuid::new_v4().to_string();
-    crate::market_wallet::require_order_funding_tx(
-        conn,
-        input.buyer_user_id,
-        input.price_minor,
-        now,
-    )?;
+    if input.trial_only {
+        require_trial_only_capacity_tx(conn, input.buyer_user_id, None)?;
+    } else {
+        crate::market_wallet::require_order_funding_tx(
+            conn,
+            input.buyer_user_id,
+            input.price_minor,
+            now,
+        )?;
+    }
     let hold_id = if input.trial_seconds == 0 {
         Some(reserve_wallet_tx(
             conn,
@@ -733,9 +899,9 @@ pub(crate) fn prepare_contract_tx(
             buyer_user_id, provider_user_id, offer_revision, billing_model,
             daily_rate_minor, cycle_price_minor, renewal_policy, status,
             activation_hold_id, budget_hold_id, budget_sequence,
-            trial_seconds_remaining, client_trial_epoch, created_at, updated_at
+            trial_seconds_remaining, client_trial_epoch, created_at, updated_at, after_trial
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                   'pending_activation', ?14, ?15, ?16, ?17, ?18, ?19, ?19)",
+                   'pending_activation', ?14, ?15, ?16, ?17, ?18, ?19, ?19, ?20)",
         params![
             id,
             input.product_kind,
@@ -768,6 +934,7 @@ pub(crate) fn prepare_contract_tx(
             input.trial_seconds,
             client_trial_epoch,
             now,
+            if input.trial_only { "end" } else { "continue" },
         ],
     )
     .map_err(db_error("create platform contract"))?;
@@ -1038,6 +1205,22 @@ pub(crate) fn start_paid_trial_tx(
         ));
     }
     crate::market_reconcile::ensure_contract_finance_safe_tx(conn, contract_id)?;
+    let trial_only: bool = conn
+        .query_row(
+            "SELECT after_trial = 'end' FROM market_platform_contracts WHERE id = ?1",
+            params![contract_id],
+            |row| row.get(0),
+        )
+        .map_err(db_error("read after-trial choice"))?;
+    if trial_only {
+        // Never charge a trial-only rental: it ends and returns the seat.
+        if crate::market_share_trials::is_managed_tx(conn, contract_id)? {
+            crate::market_share_trials::request_conversion_tx(conn, contract_id, "time", now)?;
+        } else {
+            mark_for_confirmed_cleanup_tx(conn, contract_id, now)?;
+        }
+        return Ok(false);
+    }
     let confirmed_hold = crate::market_share_trials::confirmed_hold_tx(conn, contract_id)?;
     if crate::market_share_trials::is_managed_tx(conn, contract_id)? && confirmed_hold.is_none() {
         crate::market_share_trials::request_conversion_tx(conn, contract_id, "time", now)?;
@@ -1831,7 +2014,19 @@ pub(crate) fn terminate_after_cleanup_tx(
         )
         .map_err(db_error("check Client termination settlement notice"))?;
     if result.finalized && !was_ended && !client_notice {
-        notify_contract_tx(conn, contract_id, "contract_terminated", "ended", now)?;
+        let trial_only: bool = conn
+            .query_row(
+                "SELECT after_trial='end' AND paid_started_at IS NULL FROM market_platform_contracts WHERE id=?1",
+                params![contract_id],
+                |r| r.get(0),
+            )
+            .map_err(db_error("read trial-only ending"))?;
+        let reason = if trial_only {
+            "trial_completed"
+        } else {
+            "ended"
+        };
+        notify_contract_tx(conn, contract_id, "contract_terminated", reason, now)?;
     }
     Ok(result)
 }
@@ -4167,6 +4362,7 @@ mod tests {
         assert_eq!(funding.committed_units, 4 * unit);
         assert_eq!(funding.shortfall_units, units_from_minor(50).unwrap());
         let order = PrepareContract {
+            trial_only: false,
             product_kind: "share",
             product_ref: "new-order",
             trial_scope_ref: "new-share",
@@ -4203,6 +4399,7 @@ mod tests {
 
     fn monthly<'a>(quote_id: &'a str, auto_renew: bool) -> PrepareContract<'a> {
         PrepareContract {
+            trial_only: false,
             product_kind: "share",
             product_ref: "subscription-1",
             trial_scope_ref: "share-1",
@@ -4261,6 +4458,7 @@ mod tests {
         credit_verified_topup_tx(&conn, "buyer", "pending-topup", 2000, "pending-receipt", at)
             .unwrap();
         let input = PrepareContract {
+            trial_only: false,
             billing_model: BillingModel::Metered,
             auto_renew: false,
             ..monthly("pending-quote", false)
@@ -4294,6 +4492,7 @@ mod tests {
     fn client_monthly_fixture(conn: &Connection, start: &str, trial_seconds: i64) -> String {
         credit_verified_topup_tx(conn, "buyer", "fixture-topup", 1_000, "receipt", start).unwrap();
         let input = PrepareContract {
+            trial_only: false,
             product_kind: "client_host",
             product_ref: "provision-job-1",
             trial_scope_ref: "host-1",
@@ -4342,11 +4541,27 @@ mod tests {
     }
 
     fn share_trial_fixture() -> (Connection, String, DateTime<Utc>) {
+        share_trial_fixture_with(false, 100)
+    }
+
+    fn share_trial_fixture_with(
+        trial_only: bool,
+        credit_minor: i64,
+    ) -> (Connection, String, DateTime<Utc>) {
         let conn = memory();
         let start = "2026-01-01T00:00:00+00:00";
         let end = parse_time(start).unwrap() + chrono::Duration::seconds(5);
-        credit_verified_topup_tx(&conn, "buyer", "share-trial-topup", 100, "receipt", start)
+        if credit_minor > 0 {
+            credit_verified_topup_tx(
+                &conn,
+                "buyer",
+                "share-trial-topup",
+                credit_minor,
+                "receipt",
+                start,
+            )
             .unwrap();
+        }
         conn.execute(
             "INSERT INTO share_market_listings
                 (id, share_id, installation_id, owner_user_id, owner_email,
@@ -4378,6 +4593,7 @@ mod tests {
         let contract_id = prepare_contract_tx(
             &conn,
             &PrepareContract {
+                trial_only,
                 product_kind: "share",
                 product_ref: "subscription-1",
                 trial_scope_ref: "share-1",
@@ -4403,6 +4619,129 @@ mod tests {
         )
         .unwrap();
         (conn, contract_id, end)
+    }
+
+    #[test]
+    fn a_trial_only_rental_needs_no_balance_never_charges_and_ends_with_the_trial() {
+        let (conn, id, end) = share_trial_fixture_with(true, 0);
+        let after: String = conn
+            .query_row(
+                "SELECT after_trial FROM market_platform_contracts WHERE id=?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, "end");
+        assert_eq!(
+            prior_due_funding_units_tx(&conn, "buyer", None, &end.to_rfc3339()).unwrap(),
+            0,
+            "a trial-only rental never claims wallet money"
+        );
+        let actions = reconcile_platform_contracts_tx(&conn, end).unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, PlatformControlKind::Terminate);
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM market_platform_contracts WHERE id=?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "ending");
+        let wallet = wallet_snapshot_tx(&conn, "buyer").unwrap();
+        assert_eq!((wallet.posted_units, wallet.held_units), (0, 0));
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM market_platform_periods", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        // The choice is fixed once the trial has ended.
+        assert!(
+            conn.execute(
+                "UPDATE market_platform_contracts SET after_trial='continue' WHERE id=?1",
+                params![id],
+            )
+            .is_err()
+        );
+        reconcile_wallet_tx(&conn, "buyer").unwrap();
+    }
+
+    #[test]
+    fn trial_only_is_share_only_capped_and_switchable_while_the_trial_runs() {
+        let at = "2026-01-01T00:00:00+00:00";
+        let conn = memory();
+        let input = |n: usize, kind: &'static str| PrepareContract {
+            trial_only: true,
+            product_kind: kind,
+            product_ref: Box::leak(format!("trial-only-{n}").into_boxed_str()),
+            trial_scope_ref: Box::leak(format!("scope-{n}").into_boxed_str()),
+            quote_id: Box::leak(format!("quote-{n}").into_boxed_str()),
+            price_minor: 100,
+            trial_seconds: 3600,
+            trial_allowance_seconds: 3600,
+            ..monthly("unused", false)
+        };
+        assert!(prepare_contract_tx(&conn, &input(0, "client_host"), at).is_err());
+        assert!(
+            prepare_contract_tx(
+                &conn,
+                &PrepareContract {
+                    trial_seconds: 0,
+                    trial_allowance_seconds: 0,
+                    ..input(0, "share")
+                },
+                at
+            )
+            .is_err(),
+            "trial-only needs a trial"
+        );
+        let ids: Vec<String> = (1..=MAX_ACTIVE_TRIAL_ONLY as usize)
+            .map(|n| {
+                let id = prepare_contract_tx(&conn, &input(n, "share"), at).unwrap();
+                activate_contract_tx(&conn, &id, at, at).unwrap();
+                id
+            })
+            .collect();
+        let over = prepare_contract_tx(&conn, &input(9, "share"), at).unwrap_err();
+        assert_eq!(over.code(), Some("SHARE_TRIAL_ONLY_LIMIT"));
+        // Managed Share trials keep a trial phase; mark the first one so.
+        conn.execute(
+            "INSERT INTO market_share_trial_scopes(id,buyer_user_id,provider_user_id,share_id) VALUES('scope','buyer','provider','scope-1')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO market_share_trial_contracts(contract_id,scope_id,entitlement_id,token_allowance,token_budget,created_at,updated_at) VALUES(?1,'scope','entitlement-1',0,0,?2,?2)",
+            params![ids[0], at],
+        )
+        .unwrap();
+        let continue_request = UpdateAfterTrialRequest {
+            after_trial: "continue".into(),
+            expected: "end".into(),
+        };
+        let unfunded =
+            set_after_trial_tx(&conn, &ids[0], "buyer", &continue_request, at).unwrap_err();
+        assert_eq!(unfunded.code(), Some("MARKET_WALLET_REQUIRED"));
+        assert!(set_after_trial_tx(&conn, &ids[0], "other", &continue_request, at).is_err());
+        credit_verified_topup_tx(&conn, "buyer", "continue", 100, "continue-receipt", at).unwrap();
+        let view = set_after_trial_tx(&conn, &ids[0], "buyer", &continue_request, at).unwrap();
+        assert_eq!(view.after_trial, "continue");
+        // A freed slot lets another trial-only rental start; going back is capped.
+        let fourth = prepare_contract_tx(&conn, &input(4, "share"), at).unwrap();
+        activate_contract_tx(&conn, &fourth, at, at).unwrap();
+        let back = UpdateAfterTrialRequest {
+            after_trial: "end".into(),
+            expected: "continue".into(),
+        };
+        assert_eq!(
+            set_after_trial_tx(&conn, &ids[0], "buyer", &back, at)
+                .unwrap_err()
+                .code(),
+            Some("SHARE_TRIAL_ONLY_LIMIT")
+        );
+        // Stale expectations are refused.
+        assert!(set_after_trial_tx(&conn, &ids[0], "buyer", &continue_request, at).is_err());
     }
 
     #[test]
@@ -5096,6 +5435,7 @@ mod tests {
         let id = prepare_contract_tx(
             &conn,
             &PrepareContract {
+                trial_only: false,
                 product_kind: "client_host",
                 product_ref: "metered-job",
                 trial_scope_ref: "metered-host",
@@ -5305,6 +5645,7 @@ mod tests {
         let invalid_id = prepare_contract_tx(
             &conn,
             &PrepareContract {
+                trial_only: false,
                 product_kind: "client_host",
                 product_ref: "unbound-job",
                 trial_scope_ref: "unbound-host",
@@ -5504,6 +5845,7 @@ mod tests {
         let now = "2026-01-01T00:00:00+00:00";
         credit_verified_topup_tx(&tx, "buyer", "topup", 200, "receipt", now).unwrap();
         let first = PrepareContract {
+            trial_only: false,
             product_kind: "client_host",
             product_ref: "job-1",
             trial_scope_ref: "host-1",
@@ -5518,6 +5860,7 @@ mod tests {
             trial_allowance_seconds: 0,
         };
         let second = PrepareContract {
+            trial_only: false,
             product_ref: "job-2",
             trial_scope_ref: "host-2",
             ..first
@@ -5542,6 +5885,7 @@ mod tests {
                     let conn = memory();
                     let at = "2026-01-01T00:00:00+00:00";
                     let input = PrepareContract {
+                        trial_only: false,
                         product_kind: kind,
                         billing_model: model,
                         price_minor: 100,
@@ -5601,6 +5945,7 @@ mod tests {
         let end = "2026-01-01T00:00:04+00:00";
         credit_verified_topup_tx(&conn, "buyer", "initial", 1000, "receipt", start).unwrap();
         let input = PrepareContract {
+            trial_only: false,
             trial_seconds: 10,
             trial_allowance_seconds: 10,
             ..monthly("first", false)
@@ -5619,6 +5964,7 @@ mod tests {
             6
         );
         let second = PrepareContract {
+            trial_only: false,
             product_ref: "subscription-2",
             quote_id: "second",
             trial_seconds: 7,
@@ -5629,6 +5975,7 @@ mod tests {
             Err(AppError::Conflict(_))
         ));
         let second = PrepareContract {
+            trial_only: false,
             trial_seconds: 6,
             ..second
         };
@@ -5765,6 +6112,7 @@ mod tests {
             let end = "2026-01-01T00:00:05+00:00";
             let funded_at = "2026-01-01T01:00:00+00:00";
             let input = PrepareContract {
+                trial_only: false,
                 billing_model: model,
                 trial_seconds: 5,
                 trial_allowance_seconds: 5,
@@ -6211,11 +6559,13 @@ mod tests {
         let second_end = "2026-02-02T00:00:00+00:00";
         credit_verified_topup_tx(&tx, "buyer", "topup", 3_000, "receipt", first_start).unwrap();
         let first = PrepareContract {
+            trial_only: false,
             product_ref: "first-service",
             trial_scope_ref: "first-share",
             ..monthly("first-quote", true)
         };
         let second = PrepareContract {
+            trial_only: false,
             product_ref: "second-service",
             trial_scope_ref: "second-share",
             ..monthly("second-quote", true)
@@ -6269,6 +6619,7 @@ mod tests {
         let contract = prepare_contract_tx(
             &tx,
             &PrepareContract {
+                trial_only: false,
                 product_kind: "share",
                 product_ref: "metered-subscription",
                 trial_scope_ref: "share-1",
@@ -6405,6 +6756,7 @@ mod tests {
         let id = prepare_contract_tx(
             &tx,
             &PrepareContract {
+                trial_only: false,
                 product_kind: "share",
                 product_ref: "metered-subscription",
                 trial_scope_ref: "share-1",
@@ -6474,6 +6826,7 @@ mod tests {
         let id = prepare_contract_tx(
             &tx,
             &PrepareContract {
+                trial_only: false,
                 product_kind: "share",
                 product_ref: "long-metered-subscription",
                 trial_scope_ref: "share-1",

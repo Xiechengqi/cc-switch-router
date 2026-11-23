@@ -955,6 +955,7 @@ mod tests {
         let contract = contracts::prepare_contract_tx(
             &conn,
             &PrepareContract {
+                trial_only: false,
                 product_kind: kind,
                 product_ref: "product",
                 trial_scope_ref: "service",
@@ -1596,6 +1597,7 @@ mod tests {
             let contract = contracts::prepare_contract_tx(
                 &conn,
                 &PrepareContract {
+                    trial_only: false,
                     product_kind: kind,
                     product_ref: "another-product",
                     trial_scope_ref: "provider-buying",

@@ -419,6 +419,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         121,
         include_str!("../schema/0121_wallet_password_confirmation_pending_transfers.sql"),
     ),
+    (
+        122,
+        include_str!("../schema/0122_share_trial_only_seat_termination.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {

@@ -573,6 +573,7 @@ mod tests {
         let id = prepare_contract_tx(
             &conn,
             &PrepareContract {
+                trial_only: false,
                 product_kind: kind,
                 product_ref: "product",
                 trial_scope_ref: "service",
@@ -1371,6 +1372,7 @@ mod tests {
         let id = prepare_contract_tx(
             &conn,
             &PrepareContract {
+                trial_only: false,
                 product_kind: "share",
                 product_ref: "legacy",
                 trial_scope_ref: "legacy",

@@ -561,6 +561,20 @@ pub(crate) fn request_conversion_tx(
         return Ok(());
     }
     conn.execute("UPDATE market_share_trial_scopes SET ended_reason=COALESCE(ended_reason,?2),ended_at=COALESCE(ended_at,?3) WHERE id=?1",params![scope,reason,now]).map_err(db_error("end Share trial eligibility"))?;
+    let trial_only: bool = conn
+        .query_row(
+            "SELECT after_trial='end' FROM market_platform_contracts WHERE id=?1",
+            params![contract],
+            |r| r.get(0),
+        )
+        .map_err(db_error("read Share after-trial choice"))?;
+    if trial_only {
+        // A trial-only rental returns the seat; no money is reserved or owed.
+        conn.execute("UPDATE market_platform_contracts SET trial_seconds_remaining=0,updated_at=?2 WHERE id=?1 AND status='trialing'",params![contract,now]).map_err(db_error("end Share trial"))?;
+        conn.execute("UPDATE market_share_trial_contracts SET phase='revoking',end_reason=?2,updated_at=?3 WHERE contract_id=?1",params![contract,reason,now]).map_err(db_error("end trial-only Share rental"))?;
+        crate::market_platform_contracts::mark_for_confirmed_cleanup_tx(conn, contract, now)?;
+        return Ok(());
+    }
     conn.execute("UPDATE market_platform_contracts SET trial_seconds_remaining=0,updated_at=?2 WHERE id=?1 AND status='trialing'",params![contract,now]).map_err(db_error("end Share trial"))?;
     crate::market_reconcile::ensure_contract_finance_safe_tx(conn, contract)?;
     let units = crate::market_wallet::units_from_minor(price)?;

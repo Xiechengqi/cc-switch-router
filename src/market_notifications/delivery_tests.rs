@@ -804,6 +804,7 @@ fn grouped_funding_reminders_recheck_current_wallet_and_current_contracts() {
         let id = prepare_contract_tx(
             &conn,
             &PrepareContract {
+                trial_only: false,
                 product_kind: "share",
                 product_ref: product,
                 trial_scope_ref: product,

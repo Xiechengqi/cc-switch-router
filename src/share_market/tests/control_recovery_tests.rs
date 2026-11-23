@@ -623,6 +623,8 @@ async fn paid_activation_hold_survives_recovery_and_is_released_only_after_confi
         &owner,
         "paid-recovery",
         SeatInput {
+            early_termination: None,
+            termination_rate_bps: None,
             trial_hours: Some(0),
             ..paid_seat()
         },
