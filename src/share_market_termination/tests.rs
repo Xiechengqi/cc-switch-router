@@ -803,3 +803,93 @@ fn a_forbidden_seat_only_ends_early_through_a_service_claim_holding_all_unused_r
     assert_eq!(t.compensation_cap_units, t.remaining_units);
     assert_eq!(t.responsibility, "undetermined");
 }
+
+#[test]
+fn stuck_billing_blocks_termination_until_the_contract_settles_again() {
+    let (c, contract, at) = fixture(true);
+    assert_eq!(
+        blocked_reason(&c, &basis(&c, "sub", &at).unwrap()).unwrap(),
+        None
+    );
+    let failed = (time(&at).unwrap() + Duration::seconds(5)).to_rfc3339();
+    c.execute(
+        "INSERT INTO market_finance_reconciliation_cases
+            (id,code,object_kind,object_id,status,detail_code,created_at)
+         VALUES('case','wallet_service_reconcile_failed','platform_contract',?1,'open',
+                'contract_requires_review',?2)",
+        params![contract, failed],
+    )
+    .unwrap();
+    let later = (time(&at).unwrap() + Duration::seconds(10)).to_rfc3339();
+    assert_eq!(
+        availability_at_tx(&c, "sub", &later).unwrap(),
+        Availability::blocked(Some(TerminationBlockedReason::BillingUnderReview))
+    );
+    assert_eq!(
+        preview_tx(&c, "sub", "buyer", &later).unwrap_err().code(),
+        Some("SHARE_BILLING_UNDER_REVIEW")
+    );
+    // Once the repaired contract settles past the case, the buyer can end it
+    // again without waiting for the case to be closed.
+    contracts::settle_monthly_segment_tx(&c, &contract, "after-repair", &at, &later, true, &later)
+        .unwrap();
+    c.execute(
+        "UPDATE market_platform_contracts SET last_evaluated_at=?2 WHERE id=?1",
+        params![contract, later],
+    )
+    .unwrap();
+    assert!(availability_at_tx(&c, "sub", &later).unwrap().can_terminate);
+}
+
+#[test]
+fn a_ledger_conflict_at_the_cutoff_is_reported_as_billing_review() {
+    let (c, contract, at) = fixture(true);
+    // The billing cursor lags the period's settled cursor, as a pre-fix trial
+    // conversion left it.
+    c.execute(
+        "UPDATE market_platform_contracts SET last_evaluated_at=?2 WHERE id=?1",
+        params![
+            contract,
+            (time(&at).unwrap() - Duration::seconds(5)).to_rfc3339()
+        ],
+    )
+    .unwrap();
+    let later = (time(&at).unwrap() + Duration::seconds(10)).to_rfc3339();
+    let p = preview_tx(&c, "sub", "buyer", &later).unwrap();
+    let error = accept_tx(
+        &c,
+        "sub",
+        "buyer",
+        &Accept {
+            preview_id: p["previewId"].as_str().unwrap().into(),
+            reason: "voluntary".into(),
+            claim: String::new(),
+        },
+        &later,
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), Some("SHARE_BILLING_UNDER_REVIEW"));
+    assert!(for_subscription_tx(&c, "sub").unwrap().is_none());
+}
+
+#[test]
+fn a_recovered_trial_conversion_gap_does_not_report_billing_review() {
+    let (c, contract, at) = fixture(true);
+    // A pre-fix contract repaired by migration 0123: the cursor already moved
+    // to the paid start and the gap is an audit row, not a settlement case.
+    c.execute(
+        "INSERT INTO market_platform_service_evidence
+            (id, contract_id, source_kind, started_at, ended_at,
+             observed_state, service_available, reason_code, created_at)
+         VALUES(?1||':trial-conversion-gap',?1,'share_control',?2,?3,'unknown',0,
+                'trial_conversion_gap',?3)",
+        params![
+            contract,
+            (time(&at).unwrap() - Duration::seconds(5)).to_rfc3339(),
+            at
+        ],
+    )
+    .unwrap();
+    let later = (time(&at).unwrap() + Duration::seconds(10)).to_rfc3339();
+    assert!(availability_at_tx(&c, "sub", &later).unwrap().can_terminate);
+}

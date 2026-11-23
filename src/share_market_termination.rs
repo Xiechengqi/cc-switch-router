@@ -324,6 +324,10 @@ pub enum TerminationBlockedReason {
     /// own reasons. Renewal can still be turned off, and a service problem
     /// can still be claimed.
     EarlyTerminationForbidden,
+    /// The rental's billing cannot currently be settled (an open
+    /// reconciliation case and no billing progress since it was opened), so
+    /// an immediate return cannot be calculated safely.
+    BillingUnderReview,
 }
 
 impl TerminationBlockedReason {
@@ -352,6 +356,9 @@ impl TerminationBlockedReason {
             }
             Self::EarlyTerminationForbidden => {
                 "this seat does not allow ending a paid period early; turn off renewal or report a service problem"
+            }
+            Self::BillingUnderReview => {
+                "this rental's billing is under platform review; ending it is temporarily unavailable"
             }
         }
     }
@@ -384,6 +391,9 @@ fn blocked_reason(
         return Ok(Some(PaidPeriodExpired));
     }
     if let Some(contract) = t.contract_id.as_deref() {
+        if billing_stuck_tx(c, contract)? {
+            return Ok(Some(BillingUnderReview));
+        }
         let (model, paid): (String, Option<String>) = c
             .query_row(
                 "SELECT billing_model,paid_started_at FROM market_platform_contracts WHERE id=?1",
@@ -407,11 +417,39 @@ fn blocked_reason(
     Ok(None)
 }
 
+/// The service worker records a case the first time a serving contract fails
+/// to settle. Billing counts as stuck while that case is open and the contract
+/// cursor has not moved past it; a repaired contract unblocks itself on its
+/// next successful tick, without waiting for the case to be closed.
+fn billing_stuck_tx(c: &Connection, contract: &str) -> Result<bool, AppError> {
+    c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM market_platform_contracts contract
+            JOIN market_finance_reconciliation_cases rc ON rc.object_kind='platform_contract'
+             AND rc.object_id=contract.id AND rc.code='wallet_service_reconcile_failed'
+             AND rc.status='open'
+            WHERE contract.id=?1 AND contract.status='active'
+              AND julianday(COALESCE(contract.last_evaluated_at,contract.activated_at))
+                  < julianday(rc.created_at))",
+        params![contract],
+        |r| r.get(0),
+    )
+    .map_err(db_error("read Share billing review state"))
+}
+
+fn billing_under_review() -> AppError {
+    AppError::coded_conflict(
+        "SHARE_BILLING_UNDER_REVIEW",
+        TerminationBlockedReason::BillingUnderReview.message(),
+        json!({}),
+    )
+}
+
 fn eligible(c: &Connection, t: &Termination) -> Result<(), AppError> {
-    if let Some(reason) = blocked_reason(c, t)? {
-        return Err(AppError::Conflict(reason.message().into()));
+    match blocked_reason(c, t)? {
+        Some(TerminationBlockedReason::BillingUnderReview) => Err(billing_under_review()),
+        Some(reason) => Err(AppError::Conflict(reason.message().into())),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// What a buyer may do to end a rental now. `can_terminate`: end it for any
@@ -557,7 +595,17 @@ fn accept_tx(
         ));
     }
     if let Some(contract) = t.contract_id.as_deref() {
-        crate::market_platform_contracts::settle_share_termination_tail_tx(c, contract, at)?;
+        // A ledger conflict here is a broken contract, not a buyer error:
+        // report it as billing review instead of leaking ledger internals.
+        // Finance holds and database failures keep their own responses.
+        crate::market_platform_contracts::settle_share_termination_tail_tx(c, contract, at)
+            .map_err(|error| match error {
+                AppError::Conflict(_) => {
+                    tracing::warn!(contract_id = %contract, error = %error, "Share termination tail settlement failed");
+                    billing_under_review()
+                }
+                other => other,
+            })?;
     }
     t = basis(c, sub, at)?;
     eligible(c, &t)?;

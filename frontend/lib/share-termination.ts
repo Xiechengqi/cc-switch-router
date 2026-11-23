@@ -1,5 +1,5 @@
 import { authFetch } from "@/lib/auth";
-import { parseJson } from "@/lib/api";
+import { ApiError, parseJson } from "@/lib/api";
 import type { MessageKey } from "@/lib/i18n";
 import type { ShareTerminationBlockedReason } from "@/lib/types";
 
@@ -12,10 +12,22 @@ const BLOCKED_MESSAGES: Record<ShareTerminationBlockedReason, MessageKey> = {
   paid_period_expired: "shareTermination.blocked.paidPeriodExpired",
   paid_period_rolling_over: "shareTermination.blocked.paidPeriodRollingOver",
   early_termination_forbidden: "shareTermination.blocked.earlyTerminationForbidden",
+  billing_under_review: "shareTermination.blocked.billingUnderReview",
 };
 
 export function shareTerminationBlockedMessage(reason: ShareTerminationBlockedReason | undefined) {
   return reason && Object.hasOwn(BLOCKED_MESSAGES, reason) ? BLOCKED_MESSAGES[reason] : null;
+}
+
+/** Coded termination refusals with localized copy; anything else keeps the server message. */
+const ERROR_MESSAGES: Record<string, MessageKey> = {
+  SHARE_BILLING_UNDER_REVIEW: "shareTermination.blocked.billingUnderReview",
+  SHARE_EARLY_TERMINATION_FORBIDDEN: "shareTermination.blocked.earlyTerminationForbidden",
+};
+
+export function shareTerminationErrorMessage(error: unknown): MessageKey | null {
+  const code = error instanceof ApiError ? error.code : undefined;
+  return code && Object.hasOwn(ERROR_MESSAGES, code) ? ERROR_MESSAGES[code] : null;
 }
 
 export type ShareTerminationPolicy = { version: number; rateBps: number; canEdit?: boolean };

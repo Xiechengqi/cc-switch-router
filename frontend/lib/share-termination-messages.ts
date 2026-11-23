@@ -49,6 +49,7 @@ export const shareTerminationMessagesEn = {
   "shareTermination.blocked.paidPeriodExpired": "This paid period has ended. Refresh the rental status.",
   "shareTermination.blocked.paidPeriodRollingOver": "The next paid period is being confirmed. Refresh shortly to end the rental.",
   "shareTermination.blocked.earlyTerminationForbidden": "This seat can't be ended early. Turn off renewal and it ends with the paid period. If the service is broken, report it instead.",
+  "shareTermination.blocked.billingUnderReview": "This rental's billing is being reviewed by the platform, so it can't be ended right now. Try again later or contact the platform.",
 } as const;
 export const shareTerminationMessagesZh: Record<keyof typeof shareTerminationMessagesEn, string> = {
   "shareTermination.immediate": "立即退租",
@@ -99,4 +100,5 @@ export const shareTerminationMessagesZh: Record<keyof typeof shareTerminationMes
   "shareTermination.blocked.paidPeriodExpired": "本付费周期已结束，请刷新租用状态。",
   "shareTermination.blocked.paidPeriodRollingOver": "正在确认下一付费周期，请稍后刷新再退租。",
   "shareTermination.blocked.earlyTerminationForbidden": "此车位不支持中途退租。关闭续费后到期自动结束；如服务异常，请改为报告服务问题。",
+  "shareTermination.blocked.billingUnderReview": "该租用的计费正在由平台核对，暂时无法退租。请稍后再试或联系平台。",
 };

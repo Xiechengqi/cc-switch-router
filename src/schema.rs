@@ -423,6 +423,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         122,
         include_str!("../schema/0122_share_trial_only_seat_termination.sql"),
     ),
+    (
+        123,
+        include_str!("../schema/0123_trial_conversion_cursor_repair.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {

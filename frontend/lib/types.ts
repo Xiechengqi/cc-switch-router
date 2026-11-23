@@ -2951,7 +2951,8 @@ export type ShareTerminationBlockedReason =
   | "lifetime_archive_incomplete"
   | "paid_period_expired"
   | "paid_period_rolling_over"
-  | "early_termination_forbidden";
+  | "early_termination_forbidden"
+  | "billing_under_review";
 
 export type ShareMarketSubscription = {
   controlProgress?: {

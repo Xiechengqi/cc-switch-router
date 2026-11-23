@@ -9,10 +9,14 @@ import { WALLET_INPUT } from "./wallet-primitives";
 import { formatWalletUnits } from "@/lib/market-wallet-money";
 import { notifyMarketBalanceChanged } from "@/lib/market-balance-events";
 import { parseTerminationAward } from "@/lib/client-termination";
-import { actOnShareTermination, getShareTermination, getShareTerminationEvents, getShareTerminations, previewShareTermination, terminateShare, shareTerminationNoteValid, type ShareTermination, type ShareTerminationEvent, type ShareTerminationPreview, type ShareTerminationReason } from "@/lib/share-termination";
+import type { MessageKey } from "@/lib/i18n";
+import { actOnShareTermination, getShareTermination, getShareTerminationEvents, getShareTerminations, previewShareTermination, terminateShare, shareTerminationErrorMessage, shareTerminationNoteValid, type ShareTermination, type ShareTerminationEvent, type ShareTerminationPreview, type ShareTerminationReason } from "@/lib/share-termination";
 
 export type ShareTerminationSelection = { id: string } | { subscriptionId: string };
-const failure = (e: unknown) => e instanceof Error ? e.message : String(e);
+const failure = (e: unknown, t: (key: MessageKey) => string) => {
+  const key = shareTerminationErrorMessage(e);
+  return key ? t(key) : e instanceof Error ? e.message : String(e);
+};
 export function ShareTerminationDialog({ selection, onClose, onChanged }: { selection: ShareTerminationSelection | null; onClose: () => void; onChanged?: () => void }) {
   const { session } = useAuth();
   const actor = session?.authenticated ? session.user?.id : null;
@@ -55,7 +59,7 @@ function DialogContent({ actor, selection, onClose, onChanged }: { actor: string
       }
       requiresReview.current = false; dirty.current = false; setError("");
       received.current = Date.now(); setClock(Date.now());
-    } catch (e) { if (!c.signal.aborted && mounted.current) setError(failure(e)); }
+    } catch (e) { if (!c.signal.aborted && mounted.current) setError(failure(e, t)); }
     finally { if (!c.signal.aborted && mounted.current) setLoading(false); }
   }, [currentId, subscriptionId]);
   React.useEffect(() => {
@@ -90,7 +94,7 @@ function DialogContent({ actor, selection, onClose, onChanged }: { actor: string
       received.current = Date.now(); setClock(Date.now()); notifyMarketBalanceChanged(actor); callbacks.current.onChanged?.();
     } catch (e) {
       if (mounted.current && !c.signal.aborted) {
-        setError(failure(e));
+        setError(failure(e, t));
         // On version conflicts, keep the edited input but disable decisions
         // until the user explicitly reloads and reviews the current record.
         setRecord(null);
@@ -137,7 +141,7 @@ function DialogContent({ actor, selection, onClose, onChanged }: { actor: string
           {record.claim ? <p className="whitespace-pre-wrap break-words text-sm">{record.claim}</p> : null}
           {record.decisionNote ? <p className="whitespace-pre-wrap break-words text-sm text-muted-foreground">{record.decisionNote}</p> : null}
           {record.responseDeadlineAt ? <p className="text-xs text-muted-foreground">{t("shareTermination.deadline")}: {new Date(record.responseDeadlineAt).toLocaleString(locale)}{due ? ` · ${t("shareTermination.timeout")}` : ""}</p> : null}
-          {record.reason !== "voluntary" ? <div className="grid gap-1"><Button variant="outline" onPress={() => void openChat(record.installationId).catch(e => setError(failure(e)))}>{t("shareTermination.chat")}</Button><p className="text-xs text-muted-foreground">{t("shareTermination.chatHelp")}</p></div> : null}
+          {record.reason !== "voluntary" ? <div className="grid gap-1"><Button variant="outline" onPress={() => void openChat(record.installationId).catch(e => setError(failure(e, t)))}>{t("shareTermination.chat")}</Button><p className="text-xs text-muted-foreground">{t("shareTermination.chatHelp")}</p></div> : null}
           {(p?.respond || p?.resolve || p?.waive) && !due ? <label className="grid gap-1 text-sm">{t("shareTermination.responseNote")}<textarea className={WALLET_INPUT} maxLength={1500} value={note} disabled={busy} onChange={e => { dirty.current = true; setNote(e.target.value); }} /></label> : null}
           <div className="flex flex-wrap gap-2">
             {p?.waive && !due ? <Button variant="outline" isDisabled={busy} onPress={() => void mutate("waive", "0")}>{t("shareTermination.waive")}</Button> : null}
@@ -172,7 +176,7 @@ function SettlementHistory({ record }: { record: ShareTermination }) {
       const v = await getShareTerminationEvents(record.id, cursor, c.signal);
       if (c.signal.aborted) return;
       loaded.current = true; setOlder(old => [...old, ...v.items]); setCursor(v.nextCursor);
-    } catch (e) { if (!c.signal.aborted) setError(failure(e)); }
+    } catch (e) { if (!c.signal.aborted) setError(failure(e, t)); }
     finally { controller.current = null; if (!c.signal.aborted) setBusy(false); }
   };
   const events = [...new Map([...older, ...record.events].map(e => [e.id, e])).values()]
@@ -211,7 +215,7 @@ export function ShareTerminationRowAction({ shareId, seatId, onChanged }: { shar
       if (document.visibilityState !== "visible") return;
       c?.abort(); c = new AbortController(); const current = c;
       try { const v = await getShareTerminations({ shareId, seatId, actionOnly: true }, current.signal); if (live && !current.signal.aborted) { setData({ identity, items: v.items.filter(i => i.actionRequired) }); setError(""); } }
-      catch (e) { if (live && !current.signal.aborted) { setData(null); setError(failure(e)); } }
+      catch (e) { if (live && !current.signal.aborted) { setData(null); setError(failure(e, t)); } }
     };
     void load(); const timer = window.setInterval(() => void load(), 15000);
     return () => { live = false; c?.abort(); window.clearInterval(timer); };

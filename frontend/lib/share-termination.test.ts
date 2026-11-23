@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { parseShareTermination, parseShareTerminationPreview, shareTerminationBlockedMessage, shareTerminationHref, shareTerminationNoteValid, shareTerminationUnits, type ShareTermination } from "./share-termination";
+import { ApiError } from "./api";
+import { parseShareTermination, parseShareTerminationPreview, shareTerminationBlockedMessage, shareTerminationErrorMessage, shareTerminationHref, shareTerminationNoteValid, shareTerminationUnits, type ShareTermination } from "./share-termination";
 import { shareTerminationMessagesEn, shareTerminationMessagesZh } from "./share-termination-messages";
 
 const at = "2026-11-02T00:00:00Z";
@@ -74,6 +75,7 @@ test("Share termination blockers explain unavailable actions without guessing mi
     ["archive_unavailable", "archiveUnavailable"], ["archive_incomplete", "archiveIncomplete"],
     ["lifetime_archive_incomplete", "lifetimeArchiveIncomplete"], ["paid_period_expired", "paidPeriodExpired"],
     ["paid_period_rolling_over", "paidPeriodRollingOver"], ["early_termination_forbidden", "earlyTerminationForbidden"],
+    ["billing_under_review", "billingUnderReview"],
   ] as const) {
     assert.equal(shareTerminationBlockedMessage(reason), `shareTermination.blocked.${suffix}`);
     const key = shareTerminationBlockedMessage(reason)! as keyof typeof shareTerminationMessagesEn;
@@ -81,6 +83,15 @@ test("Share termination blockers explain unavailable actions without guessing mi
     assert.ok(shareTerminationMessagesZh[key]);
   }
   assert.equal(shareTerminationBlockedMessage("future_reason" as Parameters<typeof shareTerminationBlockedMessage>[0]), null);
+});
+
+test("coded termination refusals are localized instead of showing ledger internals", () => {
+  assert.equal(shareTerminationErrorMessage(new ApiError(409, "raw", "SHARE_BILLING_UNDER_REVIEW")), "shareTermination.blocked.billingUnderReview");
+  assert.equal(shareTerminationErrorMessage(new ApiError(409, "raw", "SHARE_EARLY_TERMINATION_FORBIDDEN")), "shareTermination.blocked.earlyTerminationForbidden");
+  assert.equal(shareTerminationErrorMessage(new ApiError(409, "raw", "OTHER")), null);
+  assert.equal(shareTerminationErrorMessage(new Error("raw")), null);
+  const dialog = readFileSync(new URL("../components/market/share-termination-dialog.tsx", import.meta.url), "utf8");
+  assert.equal(dialog.match(/failure\(e\)/g), null, "every dialog error goes through the localized mapping");
 });
 
 test("a seat that forbids early ending only offers service-problem reasons and a report action", () => {

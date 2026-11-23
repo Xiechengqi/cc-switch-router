@@ -547,6 +547,23 @@ pub(crate) fn resolve_case_tx(
     if changed != 1 {
         return Err(AppError::Conflict("market finance case changed".into()));
     }
+    if code == "wallet_service_reconcile_failed" && kind == "platform_contract" {
+        // Resolution mirrors the signal raised when the case was opened. The
+        // identical fingerprint turns the alert into a single resolved event.
+        crate::market_notifications::owner_signal_tx(
+            conn,
+            "wallet_contract_reconcile_failed",
+            "platform_contract",
+            &object_id,
+            serde_json::json!({
+                "summary": format!("rental contract {object_id} review case resolved"),
+                "contractId": object_id,
+                "caseId": case_id,
+            }),
+            now,
+            true,
+        )?;
+    }
     conn.execute(
         "INSERT INTO market_finance_audit_events
             (id, actor_user_id, action, object_kind, object_id, reason_code, created_at)

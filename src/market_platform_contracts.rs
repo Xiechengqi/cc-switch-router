@@ -1171,17 +1171,20 @@ pub(crate) fn start_paid_trial_tx(
     at: &str,
     now: &str,
 ) -> Result<bool, AppError> {
-    let (buyer, model, price, status, remaining, paid_started): (
+    let (buyer, model, price, status, remaining, paid_started, product_kind, cursor): (
         String,
         String,
         i64,
         String,
         i64,
         Option<String>,
+        String,
+        Option<String>,
     ) = conn
         .query_row(
             "SELECT buyer_user_id, billing_model, COALESCE(cycle_price_minor, daily_rate_minor),
-                    status, trial_seconds_remaining, paid_started_at
+                    status, trial_seconds_remaining, paid_started_at, product_kind,
+                    last_evaluated_at
              FROM market_platform_contracts WHERE id = ?1",
             params![contract_id],
             |row| {
@@ -1192,6 +1195,8 @@ pub(crate) fn start_paid_trial_tx(
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
                 ))
             },
         )
@@ -1225,6 +1230,13 @@ pub(crate) fn start_paid_trial_tx(
     if crate::market_share_trials::is_managed_tx(conn, contract_id)? && confirmed_hold.is_none() {
         crate::market_share_trials::request_conversion_tx(conn, contract_id, "time", now)?;
         return Ok(false);
+    }
+    let paid_at = parse_time(at)?;
+    let trial_cursor = cursor.as_deref().map(parse_time).transpose()?;
+    if trial_cursor.is_some_and(|cursor| paid_at < cursor) {
+        return Err(AppError::Internal(
+            "paid service cannot start before the trial cursor".into(),
+        ));
     }
     let units = units_from_minor(price)?;
     let prior = if confirmed_hold.is_none() {
@@ -1271,8 +1283,14 @@ pub(crate) fn start_paid_trial_tx(
             now,
         )?
     };
+    // Paid billing resumes exactly where the paid period starts. A managed
+    // Share conversion is applied by Server a few seconds after the trial
+    // cursor stopped; that wait is neither trial nor paid service.
+    if let Some(cursor) = trial_cursor.filter(|cursor| *cursor < paid_at) {
+        record_trial_conversion_gap_tx(conn, contract_id, &product_kind, cursor, paid_at, now)?;
+    }
     if model == "calendar_month" {
-        let start = parse_time(at)?;
+        let start = paid_at;
         let end = crate::market_common::next_calendar_month_at(start, start.day())?;
         let period_id = Uuid::new_v4().to_string();
         let journal = capture_hold_tx(
@@ -1330,7 +1348,7 @@ pub(crate) fn start_paid_trial_tx(
                 "UPDATE market_platform_contracts
              SET status = 'active', activation_hold_id = ?2, paid_started_at = ?3,
                  current_period_sequence = 1, renewal_anchor_day = ?5,
-                 last_evaluated_at = CASE WHEN ?6 = 'suspended' THEN ?3 ELSE last_evaluated_at END,
+                 last_evaluated_at = ?3,
                  health_fence_at = CASE WHEN ?6 = 'suspended' THEN ?3 ELSE health_fence_at END,
                  updated_at = ?4
              WHERE id = ?1 AND status = ?6 AND trial_seconds_remaining = 0
@@ -1358,7 +1376,7 @@ pub(crate) fn start_paid_trial_tx(
                 "UPDATE market_platform_contracts
              SET status = 'active', activation_hold_id = ?2, budget_hold_id = ?2,
                  budget_sequence = 1, paid_started_at = ?3,
-                 last_evaluated_at = CASE WHEN ?5 = 'suspended' THEN ?3 ELSE last_evaluated_at END,
+                 last_evaluated_at = ?3,
                  health_fence_at = CASE WHEN ?5 = 'suspended' THEN ?3 ELSE health_fence_at END,
                  updated_at = ?4
              WHERE id = ?1 AND status = ?5 AND trial_seconds_remaining = 0
@@ -1377,6 +1395,40 @@ pub(crate) fn start_paid_trial_tx(
         ));
     }
     Ok(true)
+}
+
+/// Persist the unbilled wait between the exhausted trial cursor and the paid
+/// start acknowledged by the delivery rail. It is audit-only: no segment,
+/// earning or refund is derived from it.
+fn record_trial_conversion_gap_tx(
+    conn: &Connection,
+    contract_id: &str,
+    product_kind: &str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    now: &str,
+) -> Result<(), AppError> {
+    let kind = if product_kind == "share" {
+        "share_control"
+    } else {
+        "client_host_health"
+    };
+    conn.execute(
+        "INSERT OR IGNORE INTO market_platform_service_evidence
+            (id, contract_id, source_kind, started_at, ended_at,
+             observed_state, service_available, reason_code, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'unknown', 0, 'trial_conversion_gap', ?6)",
+        params![
+            format!("{contract_id}:trial-conversion-gap"),
+            contract_id,
+            kind,
+            start.to_rfc3339(),
+            end.to_rfc3339(),
+            now
+        ],
+    )
+    .map_err(db_error("persist trial conversion gap"))?;
+    Ok(())
 }
 
 /// Consume only observed healthy trial time. The caller splits an interval at
@@ -4099,20 +4151,44 @@ fn reconcile_platform_contracts_tx(
                      RELEASE SAVEPOINT wallet_service_contract",
                 )
                 .map_err(db_error("rollback wallet contract savepoint"))?;
-                conn.execute(
-                    "INSERT OR IGNORE INTO market_finance_reconciliation_cases
+                let opened = conn
+                    .execute(
+                        "INSERT OR IGNORE INTO market_finance_reconciliation_cases
                         (id, code, object_kind, object_id, status, detail_code, created_at)
                      VALUES (?1, 'wallet_service_reconcile_failed', 'platform_contract', ?2,
                              'open', 'contract_requires_review', ?3)",
-                    params![Uuid::new_v4().to_string(), id, now_text],
-                )
-                .map_err(db_error("record wallet contract reconciliation failure"))?;
+                        params![Uuid::new_v4().to_string(), id, now_text],
+                    )
+                    .map_err(db_error("record wallet contract reconciliation failure"))?
+                    == 1;
                 conn.execute(
                     "UPDATE market_platform_contracts SET updated_at = ?2 WHERE id = ?1",
                     params![id, now_text],
                 )
                 .map_err(db_error("rotate failed wallet contract"))?;
-                tracing::warn!(contract_id = %id, error = %error, "wallet contract requires review");
+                if opened {
+                    // The contract keeps serving while its billing is stuck, so
+                    // page the Owner once per open case instead of only logging.
+                    crate::market_notifications::owner_signal_tx(
+                        conn,
+                        "wallet_contract_reconcile_failed",
+                        "platform_contract",
+                        &id,
+                        serde_json::json!({
+                            "summary": format!("{kind} rental contract {id} cannot settle: {error}"),
+                            "contractId": id,
+                            "productKind": kind,
+                            "error": error.to_string(),
+                        }),
+                        &now_text,
+                        false,
+                    )?;
+                    tracing::warn!(contract_id = %id, error = %error, "wallet contract requires review");
+                } else {
+                    // Already open and signalled: the worker retries every
+                    // tick, so repeats stay out of the warning log.
+                    tracing::debug!(contract_id = %id, error = %error, "wallet contract still requires review");
+                }
             }
         }
     }
@@ -4824,6 +4900,207 @@ mod tests {
             reconcile_platform_contracts_tx(&conn, end + chrono::Duration::hours(1)).unwrap();
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].kind, PlatformControlKind::Terminate);
+    }
+
+    /// A managed Share conversion is acknowledged by Server a few seconds
+    /// after the trial cursor stopped at the exhausted trial.
+    fn share_trial_waiting_for_paid_ack() -> (Connection, String, DateTime<Utc>, DateTime<Utc>) {
+        let (conn, id, trial_end) = share_trial_fixture();
+        conn.execute(
+            "UPDATE market_platform_contracts
+             SET trial_seconds_remaining = 0, last_evaluated_at = ?2 WHERE id = ?1",
+            params![id, trial_end.to_rfc3339()],
+        )
+        .unwrap();
+        (
+            conn,
+            id,
+            trial_end,
+            trial_end + chrono::Duration::seconds(5),
+        )
+    }
+
+    fn healthy_share_at(conn: &Connection, at: DateTime<Utc>) {
+        conn.execute(
+            "INSERT INTO share_health_checks (share_id, checked_at, is_healthy, status, reason)
+             VALUES ('share-1', ?1, 1, 'healthy', 'route_healthy')",
+            params![at.timestamp()],
+        )
+        .unwrap();
+    }
+
+    fn billing_cursor(conn: &Connection, id: &str) -> (DateTime<Utc>, DateTime<Utc>) {
+        conn.query_row(
+            "SELECT contract.last_evaluated_at, period.settled_through_at
+             FROM market_platform_contracts contract
+             JOIN market_platform_periods period ON period.contract_id = contract.id
+              AND period.sequence = contract.current_period_sequence
+             WHERE contract.id = ?1",
+            params![id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .map(|(cursor, settled)| (parse_time(&cursor).unwrap(), parse_time(&settled).unwrap()))
+        .unwrap()
+    }
+
+    fn open_review_cases(conn: &Connection, id: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM market_finance_reconciliation_cases
+             WHERE object_id = ?1 AND code = 'wallet_service_reconcile_failed' AND status = 'open'",
+            params![id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_late_paid_acknowledgement_resumes_billing_at_the_paid_start() {
+        let (conn, id, trial_end, paid_at) = share_trial_waiting_for_paid_ack();
+        let paid_text = paid_at.to_rfc3339();
+        assert!(start_paid_trial_tx(&conn, &id, &paid_text, &paid_text).unwrap());
+        assert_eq!(billing_cursor(&conn, &id), (paid_at, paid_at));
+        let gap: (String, String, i64, String) = conn
+            .query_row(
+                "SELECT started_at, ended_at, service_available, reason_code
+                 FROM market_platform_service_evidence WHERE id = ?1",
+                params![format!("{id}:trial-conversion-gap")],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                parse_time(&gap.0).unwrap(),
+                parse_time(&gap.1).unwrap(),
+                gap.2,
+                gap.3.as_str()
+            ),
+            (trial_end, paid_at, 0, "trial_conversion_gap"),
+            "the wait for Server is recorded but never billed"
+        );
+        let next = paid_at + chrono::Duration::seconds(5);
+        healthy_share_at(&conn, next);
+        reconcile_platform_contracts_tx(&conn, next).unwrap();
+        assert_eq!(billing_cursor(&conn, &id), (next, next));
+        assert_eq!(open_review_cases(&conn, &id), 0);
+        let cutoff = next + chrono::Duration::seconds(2);
+        settle_share_termination_tail_tx(&conn, &id, &cutoff.to_rfc3339()).unwrap();
+        assert_eq!(billing_cursor(&conn, &id), (cutoff, cutoff));
+        reconcile_wallet_tx(&conn, "buyer").unwrap();
+    }
+
+    #[test]
+    fn paid_service_cannot_start_before_the_exhausted_trial_cursor() {
+        let (conn, id, trial_end, _) = share_trial_waiting_for_paid_ack();
+        let early = (trial_end - chrono::Duration::seconds(1)).to_rfc3339();
+        assert!(matches!(
+            start_paid_trial_tx(&conn, &id, &early, &early),
+            Err(AppError::Internal(_))
+        ));
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM market_platform_periods WHERE contract_id = ?1",
+                params![id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn migration_123_repairs_a_conversion_stuck_before_its_paid_start() {
+        let (conn, id, trial_end, paid_at) = share_trial_waiting_for_paid_ack();
+        let paid_text = paid_at.to_rfc3339();
+        start_paid_trial_tx(&conn, &id, &paid_text, &paid_text).unwrap();
+        // Recreate what the pre-fix conversion left behind.
+        conn.execute(
+            "DELETE FROM market_platform_service_evidence WHERE id = ?1",
+            params![format!("{id}:trial-conversion-gap")],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE market_platform_contracts SET last_evaluated_at = ?2 WHERE id = ?1",
+            params![id, trial_end.to_rfc3339()],
+        )
+        .unwrap();
+        let stuck = paid_at + chrono::Duration::seconds(5);
+        healthy_share_at(&conn, stuck);
+        reconcile_platform_contracts_tx(&conn, stuck).unwrap();
+        assert_eq!(
+            open_review_cases(&conn, &id),
+            1,
+            "the old state cannot settle"
+        );
+        assert_eq!(billing_cursor(&conn, &id), (trial_end, paid_at));
+        let signals: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM operator_alert_signal_outbox
+                 WHERE kind = 'market_wallet_contract_reconcile_failed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(signals, 1, "the Owner is paged once for a stuck contract");
+        reconcile_platform_contracts_tx(&conn, stuck + chrono::Duration::seconds(5)).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM operator_alert_signal_outbox
+                 WHERE kind = 'market_wallet_contract_reconcile_failed'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1,
+            "retries of an open case do not page again"
+        );
+        crate::market_reconcile::resolve_case_tx(
+            &conn,
+            &conn
+                .query_row(
+                    "SELECT id FROM market_finance_reconciliation_cases WHERE object_id = ?1",
+                    params![id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "owner",
+            "cursor_repaired",
+            &stuck.to_rfc3339(),
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT transition, COUNT(*) FROM operator_alert_signal_outbox
+                 WHERE kind = 'market_wallet_contract_reconcile_failed'
+                 GROUP BY transition ORDER BY transition",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .map(|row| vec![row])
+            .unwrap(),
+            vec![("firing".to_string(), 1), ("resolved".to_string(), 1)],
+            "closing the case clears the one Owner alert"
+        );
+
+        let repair = include_str!("../schema/0123_trial_conversion_cursor_repair.sql");
+        conn.execute_batch(repair).unwrap();
+        conn.execute_batch(repair).unwrap();
+        assert_eq!(billing_cursor(&conn, &id), (paid_at, paid_at));
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM market_platform_service_evidence
+                 WHERE contract_id = ?1 AND reason_code = 'trial_conversion_gap'
+                   AND service_available = 0",
+                params![id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        let resumed = stuck + chrono::Duration::seconds(10);
+        healthy_share_at(&conn, resumed);
+        reconcile_platform_contracts_tx(&conn, resumed).unwrap();
+        assert_eq!(billing_cursor(&conn, &id), (resumed, resumed));
+        reconcile_wallet_tx(&conn, "buyer").unwrap();
     }
 
     #[test]
