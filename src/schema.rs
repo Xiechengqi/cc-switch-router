@@ -996,7 +996,8 @@ mod tests {
     // Includes live-health evidence (0109), ordered route candidates (0110),
     // resource tariffs/capabilities (0111), owner model prices (0113), and
     // browser/financial credentials, risk evidence and recovery (0114–0116).
-    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 311;
+    // Migration 124 Host health adds eight tables, including retired Host IDs by address.
+    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 312;
 
     #[test]
     fn migration_114_revokes_existing_sessions_and_rotation_grace_only_once() {
