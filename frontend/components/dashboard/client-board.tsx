@@ -273,7 +273,7 @@ function ClientChatButton({ client }: { client: DashboardClient }) {
       <MessageCircle className="h-3 w-3" />
       <span>{t("dashboard.chat")}</span>
       {unread > 0 ? (
-        <span className="absolute -right-1 -top-1 inline-flex min-h-4 min-w-4 items-center justify-center rounded-full bg-red-500 px-1 text-[9px] font-semibold text-white">
+        <span className="absolute -right-1 -top-1 inline-flex min-h-4 min-w-4 items-center justify-center rounded-full bg-red-500 px-1 text-[10px] font-semibold text-white">
           {unread > 99 ? "99+" : unread}
         </span>
       ) : null}
@@ -612,7 +612,7 @@ function Metric({ label, value, title, tone = "default", preserveValue = false, 
   const valueClassName = `text-xs font-semibold ${preserveValue ? "font-mono whitespace-nowrap tabular-nums" : "truncate"} ${color}`;
   return (
     <div className="grid min-w-0 gap-1" title={title}>
-      <span className="font-mono text-[9px] uppercase tracking-[0.12em] text-slate-400">{label}</span>
+      <span className="font-mono text-[11px] uppercase tracking-[0.12em] text-muted-foreground">{label}</span>
       {onValueClick ? (
         <button
           type="button"

@@ -6,18 +6,39 @@ export function currentPageHref(href: string, update: (params: URLSearchParams) 
   return `${url.pathname}${search ? `?${search}` : ""}${dropHash ? "" : url.hash}`;
 }
 
+const NEXT_HISTORY_KEYS = ["__NA", "__PRIVATE_NEXTJS_INTERNALS_TREE"] as const;
+
+/**
+ * History state for a same-page query edit.
+ *
+ * Next 16 treats a `replaceState` whose data has no `__NA` as an external
+ * history change. It then restores the route, and a later Back/Forward reloads
+ * the document. Copy the markers that are already on the entry so the patched
+ * `replaceState` keeps the original call. Never invent them: an entry written
+ * before hydration has no tree, and a fake `__NA` makes Back look restorable.
+ */
+export function historyStateForQueryRewrite(state: unknown) {
+  if (!state || typeof state !== "object") return state ?? null;
+  const current = state as Record<string, unknown>;
+  const next: Record<string, unknown> = { ...current };
+  for (const key of NEXT_HISTORY_KEYS) {
+    if (key in current) next[key] = current[key];
+  }
+  return next;
+}
+
 /**
  * Rewrite the current page's query (tabs, filters, focus) without a router
- * navigation. The App Router still adopts the new URL, so `useSearchParams`
- * re-renders, but unlike `router.replace` no RSC payload is fetched: the
- * switch is instant and cannot fall back to a full page load.
+ * navigation. No RSC payload is fetched, so the edit cannot fall back to a
+ * full page load.
  *
- * The `null` state is deliberate: Next copies its own history state and
- * applies the URL. Passing `window.history.state` would bypass the router
- * and leave `useSearchParams` stale. Some pages still do that on purpose for
- * query keys they track in local state; reading the live address here keeps
- * those keys intact.
+ * `useSearchParams` does not see this write. Callers keep the value they just
+ * set in their own state; the address is what a reload or a shared link reads.
  */
 export function replaceCurrentSearch(update: (params: URLSearchParams) => void, options?: { dropHash?: boolean }) {
-  window.history.replaceState(null, "", currentPageHref(window.location.href, update, options));
+  window.history.replaceState(
+    historyStateForQueryRewrite(window.history.state),
+    "",
+    currentPageHref(window.location.href, update, options),
+  );
 }

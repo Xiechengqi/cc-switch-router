@@ -36,10 +36,17 @@ function ProviderCenterWorkspace({ actor }: { actor?: string }) {
   const searchParams = useSearchParams();
   const [hash, setHash] = React.useState("");
   const { pendingRequests, setPendingRequests } = useMarketAccessInboxSummary(actor);
-  const tab = providerCenterTab(searchParams.get("tab"), hash);
+  const [tab, setTabState] = React.useState(() => providerCenterTab(searchParams.get("tab"), hash));
 
   React.useEffect(() => {
-    const read = () => setHash(window.location.hash);
+    const read = () => {
+      const nextHash = window.location.hash;
+      setHash(nextHash);
+      const anchor = nextHash.replace(/^#/, "");
+      if (PROVIDER_CENTER_TABS.includes(anchor as ProviderCenterTab)) {
+        setTabState(anchor as ProviderCenterTab);
+      }
+    };
     read();
     window.addEventListener("hashchange", read);
     return () => window.removeEventListener("hashchange", read);
@@ -47,6 +54,7 @@ function ProviderCenterWorkspace({ actor }: { actor?: string }) {
 
   const setTab = (next: ProviderCenterTab) => {
     setHash("");
+    setTabState(next);
     replaceCurrentSearch((params) => {
       params.set("tab", next);
       // Market filter and focus belong to the listings tab.

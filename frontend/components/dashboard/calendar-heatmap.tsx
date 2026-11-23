@@ -146,7 +146,7 @@ export function CalendarHeatmapGrid<T extends CalendarHeatmapDay>({
             {labels.map((label) => (
               <span
                 key={label.key}
-                className="absolute top-0 whitespace-nowrap text-[9px] leading-3 text-slate-500"
+                className="absolute top-0 whitespace-nowrap text-[10px] leading-3 text-muted-foreground"
                 style={{ left: label.week * HEATMAP_WEEK_WIDTH }}
               >
                 {label.label}
@@ -155,7 +155,7 @@ export function CalendarHeatmapGrid<T extends CalendarHeatmapDay>({
           </div>
           <div className="flex gap-0">
             <div
-              className="grid w-7 shrink-0 pr-1 text-right text-[8px] leading-[9px] text-slate-400"
+              className="grid w-7 shrink-0 pr-1 text-right text-[10px] leading-[10px] text-muted-foreground"
               style={{ gridTemplateRows: `repeat(7, ${HEATMAP_CELL_SIZE}px)`, rowGap: HEATMAP_CELL_GAP }}
               aria-hidden
             >
@@ -192,7 +192,7 @@ export function CalendarHeatmapGrid<T extends CalendarHeatmapDay>({
           </div>
         </div>
       </div>
-      <div className="flex items-center justify-end gap-1.5 text-[9px] text-slate-400" aria-hidden>
+      <div className="flex items-center justify-end gap-1.5 text-[11px] text-muted-foreground" aria-hidden>
         <span>{lowerLabel}</span>
         {["bg-rose-500", "bg-amber-400", "bg-emerald-300", "bg-emerald-600"].map((color) => (
           <span

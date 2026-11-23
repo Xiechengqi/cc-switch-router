@@ -22,14 +22,17 @@ const SECTION_TITLES = {
 export function AccountMarketRecords({ role }: { role: AccountMarketRole }) {
   const { t } = useLocaleText();
   const searchParams = useSearchParams();
-  const market = accountMarketFilter(searchParams.get("market"));
-  const focus = searchParams.get("focus");
+  const [market, setMarketState] = React.useState(() => accountMarketFilter(searchParams.get("market")));
+  const focus = market === "all" ? null : searchParams.get("focus");
 
-  const setMarket = (next: AccountMarketFilter) => replaceCurrentSearch((params) => {
-    if (next === "all") params.delete("market");
-    else params.set("market", next);
-    params.delete("focus");
-  });
+  const setMarket = (next: AccountMarketFilter) => {
+    setMarketState(next);
+    replaceCurrentSearch((params) => {
+      if (next === "all") params.delete("market");
+      else params.set("market", next);
+      params.delete("focus");
+    });
+  };
 
   return (
     <div className="grid min-w-0 gap-6">

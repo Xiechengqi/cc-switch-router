@@ -27,6 +27,8 @@ import { shareAccessQuotaMessagesEn, shareAccessQuotaMessagesZh } from "@/lib/sh
 import { shareModelPriceMessagesEn, shareModelPriceMessagesZh } from "@/lib/share-model-price-messages";
 import { providerRankMessagesEn, providerRankMessagesZh } from "@/lib/provider-rank-messages";
 import { clientShareMessagesEn, clientShareMessagesZh } from "@/lib/client-share-messages";
+import { shareMeteringMessagesEn, shareMeteringMessagesZh } from "@/lib/share-metering-messages";
+import { marketNotificationCopyEn, marketNotificationCopyZh } from "@/lib/market-notification-copy";
 
 export const LOCALE_STORAGE_KEY = "cc_switch_router_locale_v1";
 export const SUPPORTED_LOCALES = ["en", "zh-CN"] as const;
@@ -86,6 +88,11 @@ export const messages = {
     "common.chinese": "中文",
     "common.loadingSession": "Loading session...",
     "common.reload": "Reload",
+    "common.uiUpdated": "Router was updated. Refresh to continue.",
+    "common.uiUpdatedAction": "Refresh",
+    "dashboard.grantCapability.confirmTitle": "Token limits do not cover the resource usage of these operations. Allow and save?",
+    "dashboard.grantCapability.confirmAction": "Allow and save",
+    "dashboard.grantCapability.previewExpired": "The permission review expired. Retry saving.",
     "common.save": "Save",
     "common.edit": "Edit",
     "common.view": "View",
@@ -3605,6 +3612,8 @@ export const messages = {
     ...shareAccessQuotaMessagesEn,
     ...shareModelPriceMessagesEn,
     ...providerRankMessagesEn,
+    ...shareMeteringMessagesEn,
+    ...marketNotificationCopyEn,
   },
   "zh-CN": {
     "dashboard.grantMedia.title": "媒体生成与工具",
@@ -3657,6 +3666,11 @@ export const messages = {
     "common.chinese": "中文",
     "common.loadingSession": "正在加载会话...",
     "common.reload": "重新加载",
+    "common.uiUpdated": "Router 已更新，刷新后继续",
+    "common.uiUpdatedAction": "刷新",
+    "dashboard.grantCapability.confirmTitle": "以下操作的资源用量不受 Token 限额控制。允许并保存？",
+    "dashboard.grantCapability.confirmAction": "允许并保存",
+    "dashboard.grantCapability.previewExpired": "授权预览已失效，请重试。",
     "common.save": "保存",
     "common.edit": "编辑",
     "common.view": "查看",
@@ -7079,6 +7093,8 @@ export const messages = {
     ...shareAccessQuotaMessagesZh,
     ...shareModelPriceMessagesZh,
     ...providerRankMessagesZh,
+    ...shareMeteringMessagesZh,
+    ...marketNotificationCopyZh,
   },
 } as const;
 

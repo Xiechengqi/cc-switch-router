@@ -822,7 +822,12 @@ async fn ip_blacklist_middleware(
         }
         return with_unified_api_cors(next.run(req).await);
     }
-    next.run(req).await
+    let invalidate_dashboard = dashboard_cache_invalidating_write(req.method(), req.uri().path());
+    let response = next.run(req).await;
+    if invalidate_dashboard && response.status().is_success() {
+        state.dashboard_cache.invalidate();
+    }
+    response
 }
 
 fn source_ip_from_request(req: &Request) -> Option<std::net::IpAddr> {
@@ -962,6 +967,7 @@ fn database_health_response(
         status,
         HealthResponse {
             ok: snapshot.available,
+            ui_build_id: ui_assets::UI_BUILD_ID,
             database: crate::models::DatabaseHealthResponse {
                 mode: snapshot.mode.as_str().to_string(),
                 available: snapshot.available,
@@ -1891,11 +1897,18 @@ async fn tunnel_state(
     ))
 }
 
+const DASHBOARD_CACHE_TTL: Duration = Duration::from_secs(2);
+
 async fn dashboard(
     State(state): State<ServerState>,
     headers: HeaderMap,
-) -> Result<impl IntoResponse, AppError> {
+) -> Result<Response, AppError> {
     let viewer_email = extract_dashboard_session_email(&state, &headers).await?;
+    let viewer_key = dashboard_viewer_cache_key(viewer_email.as_deref());
+    if let Some((body, etag)) = state.dashboard_cache.get(&viewer_key, DASHBOARD_CACHE_TTL) {
+        return Ok(dashboard_cached_response(&headers, body, etag));
+    }
+    let generation = state.dashboard_cache.generation();
     let mut runtime_config = state.config.clone();
     let viewer_is_admin = {
         let dynamic = state.dynamic.read().await;
@@ -1924,10 +1937,125 @@ async fn dashboard(
     response.user_country_counts = confirmed_country_counts;
     response.recent_request_events = confirmed_events;
     apply_dashboard_request_log_visibility(&mut response, viewer_is_admin);
-    Ok((
-        [(header::CACHE_CONTROL, "private, no-store")],
-        Json(response),
-    ))
+    let (body, etag) = dashboard_body_and_etag(&response)?;
+    state
+        .dashboard_cache
+        .insert_if_current(generation, viewer_key, body.clone(), etag.clone());
+    Ok(dashboard_cached_response(&headers, body, etag))
+}
+
+fn dashboard_viewer_cache_key(email: Option<&str>) -> String {
+    match email.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(email) => email.to_ascii_lowercase(),
+        None => "anonymous".to_string(),
+    }
+}
+
+/// Strong ETag of the dashboard minus `generatedAt`. That timestamp changes on
+/// every build, and the three maps would otherwise hash in unstable key order.
+fn dashboard_body_and_etag(response: &DashboardResponse) -> Result<(Vec<u8>, String), AppError> {
+    let mut value = serde_json::to_value(response).map_err(|error| {
+        AppError::Internal(format!("encode dashboard response failed: {error}"))
+    })?;
+    let fingerprint = canonical_json(&value);
+    if let Some(object) = value.as_object_mut() {
+        object.remove("generatedAt");
+    }
+    let etag = format!(
+        "\"{}\"",
+        sha256_hex(
+            &serde_json::to_vec(&canonical_json(&value)).map_err(|error| {
+                AppError::Internal(format!("encode dashboard etag failed: {error}"))
+            })?
+        )
+    );
+    let body = serde_json::to_vec(&fingerprint).map_err(|error| {
+        AppError::Internal(format!("encode dashboard response failed: {error}"))
+    })?;
+    Ok((body, etag))
+}
+
+fn canonical_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(entries) => {
+            let mut sorted = entries
+                .iter()
+                .map(|(key, child)| (key.clone(), canonical_json(child)))
+                .collect::<Vec<_>>();
+            sorted.sort_by(|left, right| left.0.cmp(&right.0));
+            serde_json::Value::Object(sorted.into_iter().collect())
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(canonical_json).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+fn dashboard_cached_response(headers: &HeaderMap, body: Vec<u8>, etag: String) -> Response {
+    let not_modified = crate::share_market::if_none_match_matches(headers, &etag);
+    let mut response = if not_modified {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        ([(header::CONTENT_TYPE, "application/json")], body).into_response()
+    };
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-cache"),
+    );
+    if let Ok(value) = HeaderValue::from_str(&etag) {
+        response.headers_mut().insert(header::ETAG, value);
+    }
+    response
+}
+
+/// Machine traffic keeps the short cache. A successful user write drops it.
+fn dashboard_cache_invalidating_write(method: &Method, path: &str) -> bool {
+    if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
+        return false;
+    }
+    if dashboard_machine_write_path(path) {
+        return false;
+    }
+    path.starts_with("/v1/") || path.starts_with("/share-api/")
+}
+
+fn dashboard_machine_write_path(path: &str) -> bool {
+    const EXACT: &[&str] = &[
+        "/v1/auth/session/refresh",
+        "/v1/dashboard/presence",
+        "/v1/gateways/register",
+        "/v1/gateway/shares/headroom",
+        "/v1/gateway/shares/feedback",
+        "/v1/gateway/request-logs/batch",
+        "/v1/installations/register",
+        "/v1/installations/heartbeat",
+        "/v1/installations/setup-completed",
+        "/v1/installations/report-status",
+        "/v1/installations/upgrade-task-report",
+        "/v1/auth/devices/register",
+        "/v1/tunnels/lease",
+        "/v1/tunnels/lease/renew",
+        "/v1/tunnels/activate",
+        "/v1/tunnels/state",
+        "/v1/shares/sync",
+        "/v1/shares/descriptor-batch-sync",
+        "/v1/shares/batch-sync",
+        "/v1/shares/runtime-refresh",
+        "/v1/shares/pending-edits",
+        "/v1/shares/edit-ack",
+        "/v1/shares/heartbeat",
+        "/v1/shares/delete",
+        "/v1/shares/prune",
+        "/v1/share-request-logs/batch-sync",
+        "/v1/chat/rooms/lookup",
+        "/v1/chat/visits/import",
+        "/v1/shares/value-pricing/fetch",
+        "/v1/shares/value-pricing/ack",
+        "/v1/shares/value-pricing/active",
+        "/v1/shares/value-quota-watermarks",
+    ];
+    EXACT.contains(&path) || path.starts_with("/_gateway/")
 }
 
 async fn map_display_get(
@@ -3856,8 +3984,43 @@ async fn ui_or_proxy_handler(
         if let Some(response) = ui_response_for_request_path(req.uri().path(), req.headers()) {
             return response;
         }
+        // A document that is not in this binary still belongs to the SPA.
+        // Falling through to the proxy turns a soft navigation into a 404
+        // `not-found` body, which the browser shows as its own error page.
+        // Hashed chunks stay missing: serving HTML for a script URL loads
+        // the wrong build into the running page.
+        return router_ui_miss_response(req.uri().path(), req.headers());
     }
     proxy_handler(State(state), ConnectInfo(peer), req).await
+}
+
+/// Page documents and their static-export flight files (`index.txt`) share
+/// one HTML shell. Anything else that is absent from the asset table is a
+/// real 404 and never a tunnel request.
+fn router_ui_miss_response(path: &str, request_headers: &HeaderMap) -> Response {
+    if ui_document_fallback_path(path) {
+        if let Some(response) = ui_response("index.html", request_headers) {
+            return response;
+        }
+    }
+    StatusCode::NOT_FOUND.into_response()
+}
+
+fn ui_document_fallback_path(path: &str) -> bool {
+    if path.starts_with("/_next/static/") || path.contains('\\') || path.contains('\0') {
+        return false;
+    }
+    let trimmed = path.trim_start_matches('/');
+    if trimmed
+        .split('/')
+        .any(|segment| segment == ".." || segment == ".")
+    {
+        return false;
+    }
+    trimmed.is_empty()
+        || path.ends_with('/')
+        || trimmed.ends_with(".txt")
+        || !trimmed.rsplit('/').next().unwrap_or(trimmed).contains('.')
 }
 
 fn legacy_clients_destination(uri: &axum::http::Uri) -> Option<String> {
@@ -4032,6 +4195,145 @@ mod tests {
     use chrono::Utc;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn dashboard_cache_etag_ignores_generated_at_and_map_key_order() {
+        let first = serde_json::json!({
+            "generatedAt": "2026-11-22T00:00:00Z",
+            "stats": { "clients": 1 },
+            "countryCounts": { "USA": 2, "CHN": 1 },
+        });
+        let second = serde_json::json!({
+            "countryCounts": { "CHN": 1, "USA": 2 },
+            "stats": { "clients": 1 },
+            "generatedAt": "2026-11-22T00:00:09Z",
+        });
+        let (body, etag) = dashboard_etag_from_value(&first);
+        let (other_body, other_etag) = dashboard_etag_from_value(&second);
+        assert_eq!(etag, other_etag);
+        assert_ne!(body, other_body);
+        assert!(
+            body.windows(b"2026-11-22T00:00:00Z".len())
+                .any(|window| window == b"2026-11-22T00:00:00Z")
+        );
+
+        let changed = serde_json::json!({
+            "generatedAt": "2026-11-22T00:00:00Z",
+            "stats": { "clients": 2 },
+            "countryCounts": { "USA": 2, "CHN": 1 },
+        });
+        assert_ne!(etag, dashboard_etag_from_value(&changed).1);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_NONE_MATCH, HeaderValue::from_str(&etag).unwrap());
+        let not_modified = dashboard_cached_response(&headers, body.clone(), etag.clone());
+        assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            not_modified.headers().get(header::ETAG).unwrap(),
+            &HeaderValue::from_str(&etag).unwrap()
+        );
+        let fresh = dashboard_cached_response(&HeaderMap::new(), body, etag.clone());
+        assert_eq!(fresh.status(), StatusCode::OK);
+        assert_eq!(
+            fresh.headers().get(header::CACHE_CONTROL).unwrap(),
+            "private, no-cache"
+        );
+    }
+
+    fn dashboard_etag_from_value(value: &serde_json::Value) -> (Vec<u8>, String) {
+        let mut value = value.clone();
+        let fingerprint = canonical_json(&value);
+        if let Some(object) = value.as_object_mut() {
+            object.remove("generatedAt");
+        }
+        let etag = format!(
+            "\"{}\"",
+            sha256_hex(&serde_json::to_vec(&canonical_json(&value)).unwrap())
+        );
+        (serde_json::to_vec(&fingerprint).unwrap(), etag)
+    }
+
+    #[test]
+    fn dashboard_cache_keeps_machine_traffic_and_drops_user_writes() {
+        let post = Method::POST;
+        let patch = Method::PATCH;
+        let get = Method::GET;
+        assert!(!dashboard_cache_invalidating_write(&get, "/v1/dashboard"));
+        assert!(!dashboard_cache_invalidating_write(
+            &post,
+            "/v1/installations/heartbeat"
+        ));
+        assert!(!dashboard_cache_invalidating_write(
+            &post,
+            "/v1/share-request-logs/batch-sync"
+        ));
+        assert!(!dashboard_cache_invalidating_write(
+            &post,
+            "/v1/tunnels/state"
+        ));
+        assert!(!dashboard_cache_invalidating_write(
+            &post,
+            "/v1/auth/session/refresh"
+        ));
+        assert!(dashboard_cache_invalidating_write(
+            &post,
+            "/v1/installations/inst-1/upgrade"
+        ));
+        assert!(dashboard_cache_invalidating_write(
+            &post,
+            "/v1/installations/client-subdomain-takeover"
+        ));
+        assert!(dashboard_cache_invalidating_write(
+            &patch,
+            "/share-api/share/settings"
+        ));
+        assert!(dashboard_cache_invalidating_write(
+            &post,
+            "/v1/shares/share-1/client-bans/ban-1/unban"
+        ));
+        assert_eq!(dashboard_viewer_cache_key(None), "anonymous");
+        assert_eq!(
+            dashboard_viewer_cache_key(Some(" Owner@Example.com ")),
+            "owner@example.com"
+        );
+    }
+
+    #[test]
+    fn dashboard_cache_generation_discards_a_snapshot_started_before_a_write() {
+        let cache = crate::server_state::DashboardSnapshotCache::new();
+        let started = cache.generation();
+        cache.insert_if_current(
+            started,
+            "anonymous".into(),
+            b"{}".to_vec(),
+            "\"one\"".into(),
+        );
+        assert!(cache.get("anonymous", Duration::from_secs(2)).is_some());
+        let after_write = cache.invalidate();
+        assert!(after_write > started);
+        assert!(cache.get("anonymous", Duration::from_secs(2)).is_none());
+        assert!(!cache.insert_if_current(
+            started,
+            "anonymous".into(),
+            b"{\"stale\":true}".to_vec(),
+            "\"stale\"".into(),
+        ));
+        assert!(cache.get("anonymous", Duration::from_secs(2)).is_none());
+        assert!(cache.insert_if_current(
+            after_write,
+            "anonymous".into(),
+            b"{\"fresh\":true}".to_vec(),
+            "\"fresh\"".into(),
+        ));
+        let (body, etag) = cache.get("anonymous", Duration::from_secs(2)).unwrap();
+        assert_eq!(body, b"{\"fresh\":true}");
+        assert_eq!(etag, "\"fresh\"");
+        assert!(
+            cache
+                .get("other@example.com", Duration::from_secs(2))
+                .is_none()
+        );
+    }
 
     #[test]
     fn quota_control_conflict_keeps_409_and_only_recoverable_fields() {
@@ -4396,6 +4698,44 @@ mod tests {
         assert_eq!(payload["database"]["consecutiveFailures"], 2);
         assert!(payload["database"].get("lastError").is_none());
         assert!(!payload.to_string().contains("secret remote detail"));
+        assert!(payload.get("uiBuildId").is_some());
+    }
+
+    #[test]
+    fn router_page_misses_fall_back_to_the_shell_and_hashed_assets_do_not() {
+        assert!(ui_document_fallback_path("/share-market/"));
+        assert!(ui_document_fallback_path("/share-market/index.txt"));
+        assert!(ui_document_fallback_path("/clients"));
+        assert!(!ui_document_fallback_path(
+            "/_next/static/chunks/missing.js"
+        ));
+        assert!(!ui_document_fallback_path("/flags/missing.svg"));
+        assert!(!ui_document_fallback_path("/share-market/../secret"));
+
+        let headers = HeaderMap::new();
+        for path in ["/share-market/", "/share-market/index.txt"] {
+            let response = router_ui_miss_response(path, &headers);
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get("X-UI-Asset")
+                    .and_then(|value| value.to_str().ok()),
+                Some("index.html"),
+                "{path}"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("no-cache"),
+                "{path}"
+            );
+        }
+        let missing = router_ui_miss_response("/_next/static/chunks/missing.js", &headers);
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert!(missing.headers().get("X-UI-Asset").is_none());
     }
 
     #[test]

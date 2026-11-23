@@ -262,7 +262,7 @@ export function MetricsPage() {
           <p className="mt-2 text-sm text-muted-foreground">{t("metrics.subtitle")}</p>
           <p className="mt-1 text-xs text-muted-foreground">
             {t("metrics.lastSample")}: {lastSample}
-            <span className="ml-2 font-mono text-[10px] uppercase text-muted-foreground/70">
+            <span className="ml-2 font-mono text-[11px] uppercase text-muted-foreground">
               {range} · {defaultStepLabel(range)} bucket
             </span>
           </p>

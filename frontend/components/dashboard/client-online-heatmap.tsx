@@ -48,11 +48,11 @@ export function ClientOnlineHeatmap({ installationId }: { installationId: string
           <h3 className="text-xs font-semibold text-slate-700">
             {t("dashboard.clientOnlineCalendar.title")}
           </h3>
-          <p className="mt-1 min-w-0 text-[10px] leading-4 text-slate-500">
+          <p className="mt-1 min-w-0 text-[11px] leading-4 text-muted-foreground">
             {t("dashboard.clientOnlineCalendar.hint")}
           </p>
         </div>
-        <span className="text-[10px] text-slate-400">
+        <span className="text-[11px] text-muted-foreground">
           {calendar
             ? t("dashboard.clientOnlineCalendar.schedule", {
                 days: observedDays,

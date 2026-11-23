@@ -56,23 +56,28 @@ export function needsGrantCapabilityReview(patch: ShareSettingsPatch, saved: Sha
     && !!grant.policy.allowedOperations?.length && (patch.tokenLimit != null || !!patch.userGrantEdits?.[email]?.policy));
 }
 
+export type GrantCapabilityConfirm = (labels: string[]) => Promise<boolean>;
+
 /** Review at the outer save boundary so sign-in or configuration changes cannot reuse a draft approval. */
 export async function reviewGrantCapabilities(
-  request: GrantCapabilityRequest, shareId: string, revision: number, patch: ShareSettingsPatch, zh: boolean,
+  request: GrantCapabilityRequest,
+  shareId: string,
+  revision: number,
+  patch: ShareSettingsPatch,
+  zh: boolean,
+  confirm: GrantCapabilityConfirm,
 ): Promise<CapabilityConsent | null> {
   const preview = await request(shareId, {
     expectedConfigRevision: revision, grantCapabilityEdits: patch.grantCapabilityEdits ?? {},
     userGrantEdits: patch.userGrantEdits, shareTokenLimit: patch.tokenLimit,
   });
   if (!preview.ready || !preview.previewCredential || !preview.expiresAt || preview.expiresAt <= Date.now()) {
-    throw new Error(zh ? "授权预览已失效，请重试。" : "The permission review expired. Retry saving.");
+    throw new Error("GRANT_PREVIEW_EXPIRED");
   }
   const conditions = preview.requiredAcknowledgements ?? [];
   if (conditions.length) {
     const labels = [...new Set(conditions.map(ack => ack.scope + " · " + OPERATION_LABELS[ack.operation][zh ? 0 : 1]))];
-    const title = zh ? "以下操作的资源用量不受 Token 限额控制。允许并保存？"
-      : "Token limits do not cover the resource usage of these operations. Allow and save?";
-    if (!window.confirm(title + "\n\n" + labels.join("\n"))) return null;
+    if (!await confirm(labels)) return null;
   }
   return { credential: preview.previewCredential, acceptUncovered: conditions.map(ack => ack.condition) };
 }
@@ -80,7 +85,7 @@ export async function reviewGrantCapabilities(
 export type GrantSettingsAttempt = { key: string; operationId: string; patch: ShareSettingsPatch };
 
 export async function prepareGrantSettingsAttempt({
-  previous, request, shareId, revision, patch, login, zh,
+  previous, request, shareId, revision, patch, login, zh, confirm,
 }: {
   previous?: GrantSettingsAttempt;
   request: GrantCapabilityRequest;
@@ -89,10 +94,11 @@ export async function prepareGrantSettingsAttempt({
   patch: ShareSettingsPatch;
   login: string;
   zh: boolean;
+  confirm: GrantCapabilityConfirm;
 }): Promise<GrantSettingsAttempt | null> {
   const key = JSON.stringify([shareId, revision, login, patch]);
   if (previous?.key === key) return previous;
-  const consent = await reviewGrantCapabilities(request, shareId, revision, patch, zh);
+  const consent = await reviewGrantCapabilities(request, shareId, revision, patch, zh, confirm);
   return consent ? {
     key, operationId: crypto.randomUUID(), patch: { ...patch, capabilityConsent: consent },
   } : null;

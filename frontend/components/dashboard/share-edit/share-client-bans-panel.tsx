@@ -3,6 +3,7 @@
 import { Alert, Button, toast } from "@heroui/react";
 import { Loader2, RefreshCw, ShieldBan, Unlock } from "lucide-react";
 import * as React from "react";
+import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { getShareClientBans, unbanShareClient } from "@/lib/api";
 import type { ShareClientBan } from "@/lib/types";
 import { formatDateTime } from "@/lib/utils";
@@ -38,6 +39,7 @@ export function ShareClientBansPanel({
   const [loadingMore, setLoadingMore] = React.useState(false);
   const [error, setError] = React.useState("");
   const [unbanningId, setUnbanningId] = React.useState<string | null>(null);
+  const [pendingBan, setPendingBan] = React.useState<ShareClientBan | null>(null);
 
   const load = React.useCallback(
     async (cursor?: string, signal?: AbortSignal) => {
@@ -71,16 +73,7 @@ export function ShareClientBansPanel({
   }, [load]);
 
   const handleUnban = async (ban: ShareClientBan) => {
-    if (
-      !window.confirm(
-        t("dashboard.shareClientBans.confirm", {
-          ip: ban.clientIp,
-          share: shareName,
-        }),
-      )
-    ) {
-      return;
-    }
+    setPendingBan(null);
     setUnbanningId(ban.id);
     try {
       await unbanShareClient(shareId, ban.id);
@@ -147,7 +140,7 @@ export function ShareClientBansPanel({
               <Button
                 size="sm"
                 variant="outline"
-                onClick={() => void handleUnban(ban)}
+                onClick={() => setPendingBan(ban)}
                 isDisabled={unbanningId !== null}
               >
                 {unbanningId === ban.id ? (
@@ -172,6 +165,16 @@ export function ShareClientBansPanel({
           ) : null}
         </div>
       )}
+      <ConfirmAlertDialog
+        open={pendingBan !== null}
+        title={t("dashboard.shareClientBans.unban")}
+        description={pendingBan ? t("dashboard.shareClientBans.confirm", { ip: pendingBan.clientIp, share: shareName }) : ""}
+        confirmLabel={t("dashboard.shareClientBans.unban")}
+        cancelLabel={t("common.cancel")}
+        tone="danger"
+        onConfirm={() => { if (pendingBan) void handleUnban(pendingBan); }}
+        onOpenChange={(open) => { if (!open) setPendingBan(null); }}
+      />
     </ShareEditSection>
   );
 }

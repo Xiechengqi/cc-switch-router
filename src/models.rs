@@ -2746,6 +2746,10 @@ pub struct IssueLeaseResponse {
 #[serde(rename_all = "camelCase")]
 pub struct HealthResponse {
     pub ok: bool,
+    /// Next static-export build id of the UI embedded in this binary.
+    /// An open tab compares it with the id it loaded and asks before reload.
+    #[serde(default, skip_serializing_if = "str::is_empty")]
+    pub ui_build_id: &'static str,
     pub database: DatabaseHealthResponse,
 }
 

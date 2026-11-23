@@ -108,7 +108,7 @@ function StatusDetails({ subscription, t }: { subscription: ShareMarketSubscript
     <div className="grid gap-0.5 border-l-2 border-rose-400 bg-rose-50 px-3 py-2 text-xs leading-5 text-rose-900">
       <ShareControlProgressDetails progress={subscription.controlProgress} />
       {grantFailed || grantContractViolation ? <p className="font-medium">{t(grantFailureMessageKey(subscription.failureCode))}</p> : null}
-      {subscription.failureCode ? <p className="break-all font-mono text-[10px] text-rose-800/70">{t("shareMarket.authorizationFailure.code", { code: subscription.failureCode })}</p> : null}
+      {subscription.failureCode ? <p className="break-all font-mono text-[11px] text-rose-800">{t("shareMarket.authorizationFailure.code", { code: subscription.failureCode })}</p> : null}
       {!subscription.controlProgress && subscription.grantAttempts != null ? <p>{t("shareMarket.authorizationFailure.attempts", { count: subscription.grantAttempts })}</p> : null}
       {subscription.releaseReason ? <p className="break-words text-rose-800/80">{t(grantFailed ? "shareMarket.authorizationFailure.reason" : "shareMarket.subscription.statusDetail", { reason: subscription.releaseReason })}</p> : null}
       {subscription.integrityState !== "compatible" ? <p>{t(integrityStatusKey(subscription.integrityState))}{subscription.integrityReason ? ` · ${integrityReasonText(subscription.integrityReason, t)}` : ""}</p> : null}

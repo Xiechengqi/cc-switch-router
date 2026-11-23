@@ -77,8 +77,11 @@ export function AccountNotificationsPanel() {
   const { session } = useAuth();
   const authed = !!session?.authenticated;
   const searchParams = useSearchParams();
-  const tab = notificationSettingsTab(searchParams.get("tab"));
-  const setTab = (next: NotificationSettingsTab) => replaceCurrentSearch((params) => params.set("tab", next));
+  const [tab, setTabState] = React.useState(() => notificationSettingsTab(searchParams.get("tab")));
+  const setTab = (next: NotificationSettingsTab) => {
+    setTabState(next);
+    replaceCurrentSearch((params) => params.set("tab", next));
+  };
 
   const [settings, setSettings] = React.useState<NotificationSettings | null>(null);
   const [bindLink, setBindLink] = React.useState<TelegramBindLink | null>(null);

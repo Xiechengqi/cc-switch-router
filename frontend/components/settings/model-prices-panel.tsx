@@ -4,6 +4,7 @@ import { History, Loader2, Pencil, Plus, RefreshCw, RotateCcw, Search } from "lu
 import { Alert, Button, Card, Chip, Input, Modal } from "@heroui/react";
 import * as React from "react";
 import { CompactSelect } from "@/components/common/compact-select";
+import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { ResourcePricesEditor } from "./resource-prices-editor";
 import { ValueTariffStatus } from "./value-tariff-status";
 import { useLocaleText } from "@/components/i18n/locale-provider";
@@ -47,6 +48,7 @@ function formatRate(value: number | undefined, locale: string) {
 export function ModelPricesPanel() {
   const { locale, t } = useLocaleText();
   const [data, setData] = React.useState<AdminModelPriceList | null>(null);
+  const [restoreTarget, setRestoreTarget] = React.useState<AdminModelPriceListItem | null>(null);
   const [tariffRefresh, setTariffRefresh] = React.useState(0);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState("");
@@ -130,7 +132,7 @@ export function ModelPricesPanel() {
 
   const restore = async (model: AdminModelPriceListItem) => {
     if (model.source !== "admin" || model.effectiveFrom == null) return;
-    if (!window.confirm(t("settings.modelPrices.restoreConfirm", { model: model.modelKey }))) return;
+    setRestoreTarget(null);
     setBusy(true); setError("");
     try { await restoreAdminModelPrice(model.modelKey, model.effectiveFrom); await load(); }
     catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
@@ -160,7 +162,7 @@ export function ModelPricesPanel() {
             <td className="px-3 py-2"><Chip size="sm" color={!model.priced ? "warning" : model.source === "admin" ? "accent" : "default"}>{t(`settings.modelPrices.source.${model.source || "unpriced"}`)}</Chip></td>
             {(["input", "output", "cacheRead", "cacheWrite5m", "cacheWrite1h"] as const).map((key) => <td key={key} className="px-3 py-2 tabular-nums">{formatRate(model.ratesMicrosPer1m?.[key], locale)}</td>)}
             <td className="px-3 py-2 whitespace-nowrap" title={isRetroactiveModelPrice(model.source, model.effectiveFrom) ? t("settings.modelPrices.effective.derivedHint") : undefined}>{formatModelPriceEffectiveFrom(model.source, model.effectiveFrom, locale, t("settings.modelPrices.effective.derived"))}</td>
-            <td className="px-3 py-2"><div className="flex gap-1"><Button isIconOnly size="sm" variant="ghost" aria-label={t("common.edit")} onClick={() => openEditor(model)}><Pencil className="h-3.5 w-3.5" /></Button>{model.priced ? <Button isIconOnly size="sm" variant="ghost" aria-label={t("settings.modelPrices.history")} onClick={() => void openHistory(model)}><History className="h-3.5 w-3.5" /></Button> : null}{model.source === "admin" ? <Button isIconOnly size="sm" variant="ghost" aria-label={t("settings.modelPrices.restore")} isDisabled={busy} onClick={() => void restore(model)}><RotateCcw className="h-3.5 w-3.5" /></Button> : null}</div></td>
+            <td className="px-3 py-2"><div className="flex gap-1"><Button isIconOnly size="sm" variant="ghost" aria-label={t("common.edit")} onClick={() => openEditor(model)}><Pencil className="h-3.5 w-3.5" /></Button>{model.priced ? <Button isIconOnly size="sm" variant="ghost" aria-label={t("settings.modelPrices.history")} onClick={() => void openHistory(model)}><History className="h-3.5 w-3.5" /></Button> : null}{model.source === "admin" ? <Button isIconOnly size="sm" variant="ghost" aria-label={t("settings.modelPrices.restore")} isDisabled={busy} onClick={() => setRestoreTarget(model)}><RotateCcw className="h-3.5 w-3.5" /></Button> : null}</div></td>
           </tr>)}</tbody>
         </table>
         {!loading && !visible.length ? <div className="p-10 text-center text-sm text-muted-foreground">{t("settings.modelPrices.empty")}</div> : null}
@@ -171,6 +173,17 @@ export function ModelPricesPanel() {
       <Modal.Backdrop isOpen={!!editing} onOpenChange={(open) => !open && !busy && setEditing(null)}><Modal.Container placement="center"><Modal.Dialog className="light w-[min(580px,calc(100vw-2rem))] !bg-white !text-slate-900"><Modal.CloseTrigger /><Modal.Header><Modal.Heading>{t("settings.modelPrices.editorTitle")}</Modal.Heading></Modal.Header><Modal.Body className="grid gap-3"><p className="text-xs text-amber-700">{t("dashboard.userLimit.price.globalHint")}</p><label className="grid gap-1 text-xs"><span>{t("settings.modelPrices.displayName")}</span><Input value={displayName} onChange={(event) => setDisplayName(event.target.value)} /></label><label className="grid gap-1 text-xs"><span>{t("settings.modelPrices.column.model")}</span><Input value={modelKey} disabled={!!editing?.modelKey} onChange={(event) => setModelKey(event.target.value)} /></label>{(["input", "output", "cacheRead", "cacheWrite5m", "cacheWrite1h"] as const).map((field) => <label key={field} className="grid gap-1 text-xs"><span>{t(`dashboard.userLimit.price.${field}`)}</span><Input inputMode="decimal" value={draft[field]} placeholder="0" onChange={(event) => setDraft((current) => ({ ...current, [field]: event.target.value }))} /></label>)}{dialogError ? <p className="text-xs text-red-600">{dialogError}</p> : null}</Modal.Body><Modal.Footer><Button variant="outline" isDisabled={busy} onClick={() => setEditing(null)}>{t("common.cancel")}</Button><Button variant="primary" isDisabled={busy || !modelKey.trim() || !displayName.trim() || !draft.input || !draft.output || !draft.cacheRead || !draft.cacheWrite5m} onClick={() => void save()}>{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}{t("common.save")}</Button></Modal.Footer></Modal.Dialog></Modal.Container></Modal.Backdrop>
 
       <Modal.Backdrop isOpen={!!historyModel} onOpenChange={(open) => !open && setHistoryModel(null)}><Modal.Container placement="center"><Modal.Dialog className="light w-[min(780px,calc(100vw-2rem))] !bg-white !text-slate-900"><Modal.CloseTrigger /><Modal.Header><Modal.Heading>{t("settings.modelPrices.historyTitle", { model: historyModel?.modelKey || "" })}</Modal.Heading></Modal.Header><Modal.Body className="max-h-[65vh] overflow-auto">{historyLoading ? <Loader2 className="mx-auto h-5 w-5 animate-spin" /> : <div className="grid gap-2">{history.map((item) => <div key={`${item.source}:${item.effectiveFrom}`} className="rounded-md border p-3 text-xs"><div className="flex flex-wrap justify-between gap-2"><div className="flex gap-2"><Chip size="sm">{t(`settings.modelPrices.source.${item.source}`)}</Chip>{item.current ? <Chip size="sm" color="success">{t("settings.modelPrices.current")}</Chip> : null}</div><span title={isRetroactiveModelPrice(item.source, item.effectiveFrom) ? t("settings.modelPrices.effective.derivedHint") : undefined}>{formatModelPriceHistoryRange(item, locale, t("settings.modelPrices.effective.derived"))}</span></div><div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-5">{(["input", "output", "cacheRead", "cacheWrite5m", "cacheWrite1h"] as const).map((key) => <div key={key}><div className="text-muted-foreground">{t(`settings.modelPrices.column.${key}`)}</div><div className="tabular-nums">{formatRate(item.ratesMicrosPer1m[key], locale)}</div></div>)}</div></div>)}</div>}</Modal.Body><Modal.Footer><Button variant="outline" onClick={() => setHistoryModel(null)}>{t("common.close")}</Button></Modal.Footer></Modal.Dialog></Modal.Container></Modal.Backdrop>
+      <ConfirmAlertDialog
+        open={restoreTarget !== null}
+        title={t("settings.modelPrices.restore")}
+        description={restoreTarget ? t("settings.modelPrices.restoreConfirm", { model: restoreTarget.modelKey }) : ""}
+        confirmLabel={t("settings.modelPrices.restore")}
+        cancelLabel={t("common.cancel")}
+        tone="danger"
+        busy={busy}
+        onConfirm={() => { if (restoreTarget) void restore(restoreTarget); }}
+        onOpenChange={(open) => { if (!open && !busy) setRestoreTarget(null); }}
+      />
       <ResourcePricesEditor />
     </section>
   );

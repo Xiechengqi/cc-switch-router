@@ -89,9 +89,8 @@ export function ClientMarketPage() {
   const viewerUserId = session?.user?.id;
   const viewerEmail = session?.user?.email;
   const terminationWork = useClientTerminationWorkspace(authed ? viewerUserId : undefined);
-  const [terminationId, setTerminationId] = React.useState<string | null>(null);
-  const terminationLinkApplied = React.useRef<string | null>(null);
-  const marketProviderId = searchParams.get("provider") || undefined;
+  const [terminationId, setTerminationId] = React.useState<string | null>(() => searchParams.get("terminationId"));
+  const [marketProviderId, setMarketProviderId] = React.useState(() => searchParams.get("provider") || undefined);
   const returnedHostId = searchParams.get("focusHost") || undefined;
 
   const viewKey = `client-market:${authed ? viewerUserId || "authenticated" : "anonymous"}`;
@@ -215,19 +214,10 @@ export function ClientMarketPage() {
     void onRentalChanged(); void terminationWork.refresh(true);
   }, [onRentalChanged, terminationWork.refresh]);
   const terminationByHost = React.useMemo(() => new Map(terminationWork.workspace?.hosts.map(item => [item.hostId, item]) || []), [terminationWork.workspace]);
-  React.useEffect(() => {
-    setTerminationId(null); terminationLinkApplied.current = null;
-  }, [viewerUserId]);
-  const linkedTermination = searchParams.get("terminationId");
-  React.useEffect(() => {
-    if (!linkedTermination) { terminationLinkApplied.current = null; return; }
-    if (!authed || !linkedTermination || terminationLinkApplied.current === linkedTermination) return;
-    terminationLinkApplied.current = linkedTermination; setTerminationId(linkedTermination);
-  }, [authed, viewerUserId, linkedTermination]);
   const closeTermination = React.useCallback(() => {
     setTerminationId(null);
-    if (linkedTermination) replaceCurrentSearch((params) => params.delete("terminationId"));
-  }, [linkedTermination]);
+    replaceCurrentSearch((params) => params.delete("terminationId"));
+  }, []);
 
   React.useEffect(() => {
     // A remembered view is already on screen; refresh it without a spinner
@@ -300,6 +290,7 @@ export function ClientMarketPage() {
   }, [hosts, marketProviderId, ownerFilters, regionFilters]);
 
   const clearMarketProvider = React.useCallback(() => {
+    setMarketProviderId(undefined);
     replaceCurrentSearch((params) => params.delete("provider"));
   }, []);
 
@@ -469,14 +460,15 @@ export function ClientMarketPage() {
 
   // `?addHost=1` (the Provider center's "Rent out a Host") opens the dialog
   // once; the flag leaves the address so a reload does not reopen it.
-  const addHostRequested = searchParams.get("addHost") === "1";
+  const addHostRequested = React.useRef(searchParams.get("addHost") === "1");
   React.useEffect(() => {
-    if (!addHostRequested || authLoading) return;
+    if (!addHostRequested.current || authLoading) return;
+    addHostRequested.current = false;
     replaceCurrentSearch((params) => params.delete("addHost"));
     openAddHost();
     // openAddHost reads the current sign-in state; run once per request.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [addHostRequested, authLoading]);
+  }, [authLoading]);
 
   const openExportDialog = async (selectedOnly: boolean) => {
     setTransferBusy(true);

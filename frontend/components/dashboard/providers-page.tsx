@@ -602,9 +602,9 @@ export function ProvidersPage() {
   const nameOf = useProviderName();
   useMinuteTick();
   const searchParams = useSearchParams();
-  const providerId = searchParams.get("provider") || "";
-  const marketFilter = providerMarketFilter(searchParams.get("market"));
-  const availableOnly = searchParams.get("available") === "1";
+  const [providerId, setProviderId] = React.useState(() => searchParams.get("provider") || "");
+  const [marketFilter, setMarketFilterState] = React.useState(() => providerMarketFilter(searchParams.get("market")));
+  const [availableOnly, setAvailableOnlyState] = React.useState(() => searchParams.get("available") === "1");
 
   // The public ranking needs no account scope; a remembered list renders at
   // once while it is re-read.
@@ -685,18 +685,21 @@ export function ProvidersPage() {
   }, [providerId]);
 
   const updateProviderQuery = React.useCallback((nextProviderId?: string) => {
+    setProviderId(nextProviderId || "");
     replaceCurrentSearch((params) => {
       if (nextProviderId) params.set("provider", nextProviderId);
       else params.delete("provider");
     });
   }, []);
   const setMarketFilter = React.useCallback((next: ProviderMarketFilter) => {
+    setMarketFilterState(next);
     replaceCurrentSearch((params) => {
       if (next === "all") params.delete("market");
       else params.set("market", next);
     });
   }, []);
   const setAvailableOnly = React.useCallback((next: boolean) => {
+    setAvailableOnlyState(next);
     replaceCurrentSearch((params) => {
       if (next) params.set("available", "1");
       else params.delete("available");
@@ -721,6 +724,8 @@ export function ProvidersPage() {
 
   const resetFilters = () => {
     setQuery("");
+    setMarketFilterState("all");
+    setAvailableOnlyState(false);
     replaceCurrentSearch((params) => {
       params.delete("market");
       params.delete("available");

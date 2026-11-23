@@ -8828,6 +8828,7 @@ mod tests {
                     crate::registration_admission::RegistrationAdmissionPolicy::default(),
                 ),
             ),
+            dashboard_cache: Arc::new(crate::server_state::DashboardSnapshotCache::new()),
         }
     }
 

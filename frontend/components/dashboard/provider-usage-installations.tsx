@@ -105,7 +105,7 @@ function InstallationBlock({ installation }: { installation: ProviderInstallatio
         )}
         <div className="min-w-0 flex-1">
           <div className="truncate text-sm font-semibold text-foreground">{label}</div>
-          <div className="truncate font-mono text-[11px] text-muted-foreground/80">
+          <div className="truncate font-mono text-[11px] text-muted-foreground">
             {installation.installationId}
           </div>
         </div>

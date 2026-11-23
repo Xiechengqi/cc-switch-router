@@ -73,6 +73,7 @@ export function ShareEditDialog({
                       </Alert>
                     ) : null}
                     <ShareEditFormBody share={liveShare} t={t} form={form} />
+                    {form.grantConfirmDialog}
                     <ShareRecentErrorsPanel shareId={liveShare.shareId} t={t} />
                     <ShareClientBansPanel
                       shareId={liveShare.shareId}

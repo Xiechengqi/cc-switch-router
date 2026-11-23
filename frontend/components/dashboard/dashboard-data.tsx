@@ -7,6 +7,7 @@ import { readAuthState } from "@/lib/auth";
 import { loginContextKey } from "@/lib/password-auth";
 import { useLoginContextKey } from "@/lib/use-login-context";
 import type { DashboardResponse } from "@/lib/types";
+import { bindVisibleInterval } from "@/lib/visible-interval";
 
 type DashboardDataValue = {
   data: DashboardResponse | null;
@@ -103,12 +104,11 @@ export function DashboardDataProvider({ enabled, children }: { enabled: boolean;
     setLoading(enabled && !authLoading && dataRef.current == null);
     setClock(Date.now());
     if (!enabled || authLoading) return;
-    void refresh();
-    const refreshId = window.setInterval(() => void refresh(), 5000);
-    const clockId = window.setInterval(() => setClock(Date.now()), 5000);
+    const stopRefresh = bindVisibleInterval(() => void refresh(), 5000);
+    const stopClock = bindVisibleInterval(() => setClock(Date.now()), 5000);
     return () => {
-      window.clearInterval(refreshId);
-      window.clearInterval(clockId);
+      stopRefresh();
+      stopClock();
       const active = inFlightRef.current;
       if (active?.contextKey === refreshContextKey) {
         requestSeq.current += 1;

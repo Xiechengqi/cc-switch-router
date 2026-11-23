@@ -62,19 +62,19 @@ export function ShareModelHealthHeatmap({ shareId }: { shareId: string }) {
         <div className="min-w-0">
           <h3 className="text-xs font-semibold text-slate-700">{t("dashboard.healthCalendar.title")}</h3>
           {calendar?.currentProbe ? (
-            <p className="mt-1 min-w-0 text-[10px] leading-4 text-slate-500">
+            <p className="mt-1 min-w-0 text-[11px] leading-4 text-muted-foreground">
               {t("dashboard.healthCalendar.currentProbe", {
                 app: appLabel(calendar.currentProbe.appType),
                 model: calendar.currentProbe.requestedModel,
               })}
             </p>
           ) : calendar ? (
-            <p className="mt-1 text-[10px] leading-4 text-slate-400">
+            <p className="mt-1 text-[11px] leading-4 text-muted-foreground">
               {t("dashboard.healthCalendar.inactiveNow")}
             </p>
           ) : null}
         </div>
-        <span className="text-[10px] text-slate-400">
+        <span className="text-[11px] text-muted-foreground">
           {calendar
             ? t("dashboard.healthCalendar.schedule", {
                 count: calendar.expectedChecksPerFullDay,
@@ -85,12 +85,12 @@ export function ShareModelHealthHeatmap({ shareId }: { shareId: string }) {
       </div>
 
       {calendar?.sharedProbe ? (
-        <p className="border-l-2 border-emerald-300 pl-2 text-[10px] leading-4 text-emerald-700">
+        <p className="border-l-2 border-emerald-300 pl-2 text-[11px] leading-4 text-emerald-700">
           {t("dashboard.healthCalendar.sharedProbe")}
         </p>
       ) : null}
       {calendar && calendar.evidenceVersion < 2 ? (
-        <p className="border-l-2 border-amber-300 pl-2 text-[10px] leading-4 text-amber-700">
+        <p className="border-l-2 border-amber-300 pl-2 text-[11px] leading-4 text-amber-700">
           {t("dashboard.healthCalendar.legacyEvidence")}
         </p>
       ) : null}

@@ -619,27 +619,27 @@ export function ShareConnectionTestRow({
               </summary>
               <div className="grid gap-3 py-1.5">
                 <div className="grid gap-0.5">
-                  <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">
+                  <span className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
                     {t("dashboard.connectDialog.test.headers")}
                   </span>
                   <div className="max-h-28 overflow-y-auto font-mono text-[11px] text-slate-700">
                     {result.response.headers.map(([k, v], i) => (
                       <div key={i} className="flex gap-2 leading-relaxed">
-                        <span className="shrink-0 text-slate-400">{k}:</span>
+                        <span className="shrink-0 text-muted-foreground">{k}:</span>
                         <span className="min-w-0 break-all">{v}</span>
                       </div>
                     ))}
                   </div>
                 </div>
                 <div className="grid gap-0.5">
-                  <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">
+                  <span className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
                     {t("dashboard.connectDialog.test.body")}
                   </span>
                   <pre className="max-h-48 overflow-y-auto whitespace-pre-wrap break-all text-[11px] leading-relaxed text-slate-800">
                     {result.response.bodyText || "(empty)"}
                   </pre>
                   {result.response.bodyTruncated ? (
-                    <span className="text-[10px] text-slate-400">
+                    <span className="text-[11px] text-muted-foreground">
                       {t("dashboard.connectDialog.test.bodyTruncated")}
                     </span>
                   ) : null}

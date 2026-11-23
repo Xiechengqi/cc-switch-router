@@ -100,7 +100,7 @@ export function ListingPricingCard({ listingId }: { listingId: string }) {
         <h3 className="text-xs font-semibold uppercase text-slate-500">
           {t("shareMarket.pricing.title")}
         </h3>
-        <span className="font-mono text-[10px] text-slate-400">
+        <span className="font-mono text-[11px] text-muted-foreground">
           {t("shareMarket.pricing.catalogRevision", {
             revision: pricing.catalogRevision.slice(0, 12),
           })}

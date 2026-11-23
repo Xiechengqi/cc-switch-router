@@ -168,7 +168,7 @@ export function ModelHubTraffic({ events, app, shares, status, locale, t }: {
 /** Queue-row counters: what this Share actually did for this rule in the window. */
 export function QueueRowTraffic({ traffic, t }: { traffic?: ShareRouteTraffic; t: T }) {
   if (!traffic || (!traffic.forwarded && !traffic.landedAfterFailure)) {
-    return <span className="block pl-6 text-[11px] text-muted-foreground/70">{t("modelHub.traffic.queue.idle", { minutes: WINDOW_MINUTES })}</span>;
+    return <span className="block pl-6 text-[11px] text-muted-foreground">{t("modelHub.traffic.queue.idle", { minutes: WINDOW_MINUTES })}</span>;
   }
   const peak = Math.max(1, ...traffic.buckets);
   return (

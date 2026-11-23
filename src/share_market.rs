@@ -6165,7 +6165,7 @@ impl AppStore {
     }
 }
 
-fn if_none_match_matches(headers: &HeaderMap, etag: &str) -> bool {
+pub(crate) fn if_none_match_matches(headers: &HeaderMap, etag: &str) -> bool {
     headers
         .get_all(header::IF_NONE_MATCH)
         .iter()

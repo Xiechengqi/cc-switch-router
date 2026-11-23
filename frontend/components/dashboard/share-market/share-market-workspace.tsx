@@ -106,11 +106,12 @@ export function ShareMarketWorkspace() {
   const expandedSubscriptionHistoryRef = React.useRef(false);
   const subscriptionHistoryGenerationRef = React.useRef(0);
   const focusedShareId = searchParams.get("focus") || undefined;
-  const linkedTermination = searchParams.get("terminationId");
-  const marketProviderId = searchParams.get("provider") || undefined;
+  const [linkedTermination, setLinkedTermination] = React.useState(() => searchParams.get("terminationId"));
+  const [marketProviderId, setMarketProviderId] = React.useState(() => searchParams.get("provider") || undefined);
   const initialMine = mineFromQuery(searchParams.get("view") || searchParams.get("tab"));
 
   const clearMarketProvider = React.useCallback(() => {
+    setMarketProviderId(undefined);
     replaceCurrentSearch((params) => params.delete("provider"));
   }, []);
 
@@ -345,7 +346,7 @@ export function ShareMarketWorkspace() {
 
   return (
     <main className="mx-auto grid w-full max-w-7xl gap-5 px-1 pb-10">
-      <ShareTerminationDialog selection={authed && linkedTermination ? { id: linkedTermination } : null} onClose={() => replaceCurrentSearch(params => params.delete("terminationId"))} onChanged={() => { void load({ scope: workspace, silent: true }); }} />
+      <ShareTerminationDialog selection={authed && linkedTermination ? { id: linkedTermination } : null} onClose={() => { setLinkedTermination(null); replaceCurrentSearch(params => params.delete("terminationId")); }} onChanged={() => { void load({ scope: workspace, silent: true }); }} />
       <h1 className="sr-only">{t("shareMarket.title")}</h1>
       <div className="flex min-w-0 flex-wrap items-center justify-between gap-3 border-b border-slate-200 pb-3">
         {authed ? (

@@ -3,8 +3,6 @@
 @import "@heroui/styles";
 @import "../tokens.css";
 
-@custom-variant dark (&:is(.dark *));
-
 /* Model Hub route picker. The two panes sit side by side once the picker
  * itself is wide enough; each row's arrow always points at the other pane. */
 .model-route-transfer {

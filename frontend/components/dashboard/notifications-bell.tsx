@@ -216,7 +216,7 @@ export function NotificationsBell() {
                   return <>
                     {copy.title ? <p className="mt-1 break-words text-xs text-muted-foreground">{copy.title}</p> : null}
                     {copy.summary ? <p className="mt-0.5 break-words text-xs leading-5 text-muted-foreground">{copy.summary}</p> : null}
-                    {resolved ? <span className="mt-1 inline-flex items-center rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-300">{t("notificationCenter.resolvedBadge")}</span> : null}
+                    {resolved ? <span className="mt-1 inline-flex items-center rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700">{t("notificationCenter.resolvedBadge")}</span> : null}
                   </>;
                 })() : null}
                 <p className="mt-0.5 text-xs text-muted-foreground">

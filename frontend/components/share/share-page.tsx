@@ -8,6 +8,7 @@ import * as React from "react";
 import { Alert, Button, Checkbox, Chip, Input, TextArea } from "@heroui/react";
 import { KeyRound, Loader2, LogOut, Save } from "lucide-react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
+import { useGrantCapabilityConfirm } from "@/lib/grant-capability-confirm";
 import { ShareUserGrantsEditor } from "@/components/dashboard/share-edit/share-user-grants-editor";
 import { getShareApiAuth, getShareContext, getSharePageShare, getSharePageSettingsEdit, updateSharePageSettings, readShareApiCredentials, writeShareApiCredentials, clearShareApiCredentials, ShareApiError } from "@/lib/share-api";
 import type { ShareApiAuthResponse, ShareApiContextResponse, ShareView } from "@/lib/types";
@@ -163,6 +164,11 @@ function ShareSettingsForm({
   onSaved: () => Promise<void>;
 }) {
   const { locale, t } = useLocaleText();
+  const grantConfirm = useGrantCapabilityConfirm({
+    title: t("dashboard.grantCapability.confirmTitle"),
+    confirm: t("dashboard.grantCapability.confirmAction"),
+    cancel: t("common.cancel"),
+  });
   const [draft, setDraft] = React.useState<ShareSettingsDraft>(() => draftFromShare(share));
   const [baseline, setBaseline] = React.useState(share);
   const dirtyRef = React.useRef(false);
@@ -284,6 +290,7 @@ function ShareSettingsForm({
           previous: grantSaveAttempt.current, request: previewSharePageGrantCapabilities,
           shareId: share.shareId, revision: baseline.configRevision ?? 0, patch,
           login: JSON.stringify(auth), zh: locale.startsWith("zh"),
+          confirm: grantConfirm.confirm,
         });
         if (!reviewed) return;
         grantSaveAttempt.current = reviewed;
@@ -304,7 +311,7 @@ function ShareSettingsForm({
       if (err instanceof ShareApiError && err.status < 500 && err.status !== 408) {
         grantSaveAttempt.current = undefined;
       }
-      setError(err instanceof Error ? err.message : String(err));
+      setError(err instanceof Error && err.message === "GRANT_PREVIEW_EXPIRED" ? t("dashboard.grantCapability.previewExpired") : err instanceof Error ? err.message : String(err));
       await onSaved().catch(() => undefined);
     } finally {
       savingRef.current = false;
@@ -314,6 +321,7 @@ function ShareSettingsForm({
 
   return (
     <fieldset className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-4" disabled={busy || !!pendingEditId || share.activeEdit?.status === "pending"}>
+      {grantConfirm.dialog}
       {notice ? <Alert status="success" className="!text-slate-900">{notice}</Alert> : null}
       {error ? <Alert status="danger" className="!text-slate-900">{error}</Alert> : null}
       {dirty && baseline.configRevision !== share.configRevision ? (

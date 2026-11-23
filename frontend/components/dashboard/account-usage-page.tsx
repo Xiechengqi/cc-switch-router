@@ -32,7 +32,7 @@ export function AccountUsagePage() {
   const { t } = useLocaleText();
   const { session } = useAuth();
   const searchParams = useSearchParams();
-  const view = accountUsageView(searchParams.get("view"));
+  const [view, setViewState] = React.useState(() => accountUsageView(searchParams.get("view")));
   const [period, setPeriod] = React.useState<AccountUsagePeriod>("7d");
   const actor = session?.user?.id || session?.user?.email || "";
   const key = actor ? `usage:${view}:${actor}:${period}` : null;
@@ -48,7 +48,10 @@ export function AccountUsagePage() {
   const shown = usage.data ?? (!usage.error && lastShown.current?.view === view ? lastShown.current.data : undefined);
   const stale = !usage.data && !!shown;
 
-  const setView = (next: AccountUsageView) => replaceCurrentSearch((params) => params.set("view", next));
+  const setView = (next: AccountUsageView) => {
+    setViewState(next);
+    replaceCurrentSearch((params) => params.set("view", next));
+  };
 
   return (
     <div className="grid min-w-0 gap-6">

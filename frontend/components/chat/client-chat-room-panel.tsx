@@ -67,13 +67,13 @@ function SystemEventBubble({
       <div className="w-full max-w-[min(22rem,85%)] px-1 text-center text-[11px] leading-5 text-slate-500">
         <p className="break-words text-slate-600">{chatSystemEventText(message, t, locale)}</p>
         <div className="mt-0.5 flex flex-wrap items-center justify-center gap-x-2 gap-y-0.5">
-          <span className="text-[10px] text-slate-400" title={formatDateTime(message.createdAt)}>
+          <span className="text-[11px] text-muted-foreground" title={formatDateTime(message.createdAt)}>
             {formatRelativeTime(message.createdAt, locale)}
           </span>
           {details.length ? (
             <button
               type="button"
-              className="text-[10px] font-medium text-primary hover:underline"
+              className="text-[11px] font-medium text-primary hover:underline"
               aria-expanded={expanded}
               onClick={() => setExpanded((value) => !value)}
             >
@@ -85,7 +85,7 @@ function SystemEventBubble({
           <dl className="mt-1.5 grid grid-cols-[minmax(5rem,auto)_minmax(0,1fr)] gap-x-2 gap-y-1 rounded-md bg-slate-50 px-2.5 py-2 text-left text-[11px]">
             {details.map((detail) => (
               <React.Fragment key={detail.key}>
-                <dt className="break-words text-slate-400">{detail.label}</dt>
+                <dt className="break-words text-muted-foreground">{detail.label}</dt>
                 <dd className="min-w-0 whitespace-pre-wrap break-all text-slate-600">
                   {detail.href ? (
                     <a
@@ -132,7 +132,7 @@ function MessageBubble({
     <article className={cn("group flex min-w-0", mine ? "justify-end" : "justify-start")}>
       <div className={cn("flex max-w-[88%] flex-col", mine ? "items-end" : "items-start")}>
         {!mine ? (
-          <div className="mb-0.5 flex items-center gap-1.5 px-0.5 text-[10px] text-slate-500">
+          <div className="mb-0.5 flex items-center gap-1.5 px-0.5 text-[11px] text-muted-foreground">
             <span className="font-medium">{message.authorLabel}</span>
             {canDelete ? (
               <button
@@ -160,7 +160,7 @@ function MessageBubble({
             </button>
           ) : null}
           {message.status === "deleted" ? (
-            <p className="text-sm italic text-slate-400">{t("chat.deleted")}</p>
+            <p className="text-sm italic text-muted-foreground">{t("chat.deleted")}</p>
           ) : (
             <div
               className={cn(
@@ -177,7 +177,7 @@ function MessageBubble({
           )}
         </div>
         <span
-          className={cn("mt-0.5 px-0.5 text-[10px] text-slate-400", mine ? "text-right" : "text-left")}
+          className={cn("mt-0.5 px-0.5 text-[11px] text-muted-foreground", mine ? "text-right" : "text-left")}
           title={formatDateTime(message.createdAt)}
         >
           {formatRelativeTime(message.createdAt, locale)}

@@ -141,7 +141,7 @@ export function ResourceTrendChart({
         <Card.Title className="text-base font-semibold">{title}</Card.Title>
         <Card.Description>
           <span className="text-xs text-muted-foreground">{description}</span>
-          {hint ? <span className="ml-2 text-[10px] text-muted-foreground/70">{hint}</span> : null}
+          {hint ? <span className="ml-2 text-[11px] text-muted-foreground">{hint}</span> : null}
         </Card.Description>
       </Card.Header>
       <Card.Content>
@@ -162,7 +162,7 @@ export function ResourceTrendChart({
         ) : (
           <>
             <div className="flex">
-              <div className="flex h-48 w-12 flex-col justify-between pr-2 text-right text-[10px] text-muted-foreground/80">
+              <div className="flex h-48 w-12 flex-col justify-between pr-2 text-right text-[11px] text-muted-foreground">
                 <span>{formatAxis(max, unit)}</span>
                 <span>{formatAxis(max * 0.75, unit)}</span>
                 <span>{formatAxis(max / 2, unit)}</span>
@@ -231,7 +231,7 @@ export function ResourceTrendChart({
                 ) : null}
               </div>
             </div>
-            <div className="mt-1 flex justify-between pl-12 text-[10px] text-muted-foreground">
+            <div className="mt-1 flex justify-between pl-12 text-[11px] text-muted-foreground">
               {xLabels.map((label, index) => (
                 <span key={`${label}-${index}`}>{label}</span>
               ))}
@@ -302,7 +302,7 @@ export function ClockOffsetChart({
         <Card.Title className="text-base font-semibold">{title}</Card.Title>
         <Card.Description>
           <span className="text-xs text-muted-foreground">{description}</span>
-          <span className="ml-2 text-[10px] text-muted-foreground/70">
+          <span className="ml-2 text-[11px] text-muted-foreground">
             {t("metrics.clock.thresholdHint")}
           </span>
         </Card.Description>
@@ -315,7 +315,7 @@ export function ClockOffsetChart({
         ) : (
           <>
             <div className="flex">
-              <div className="flex h-48 w-16 flex-col justify-between pr-2 text-right text-[10px] text-muted-foreground/80">
+              <div className="flex h-48 w-16 flex-col justify-between pr-2 text-right text-[11px] text-muted-foreground">
                 <span>{formatClockOffset(max)}</span>
                 <span>{formatClockOffset(0)}</span>
                 <span>{formatClockOffset(min)}</span>
@@ -373,7 +373,7 @@ export function ClockOffsetChart({
                 ) : null}
               </div>
             </div>
-            <div className="mt-1 flex justify-between pl-16 text-[10px] text-muted-foreground">
+            <div className="mt-1 flex justify-between pl-16 text-[11px] text-muted-foreground">
               {xLabels.map((label, index) => (
                 <span key={`${label}-${index}`}>{label}</span>
               ))}
@@ -445,7 +445,7 @@ function Legend({
               style={{ background: item.color }}
             />
             <span className="font-medium text-foreground/80">{item.label}</span>
-            <span className="text-muted-foreground/70">
+            <span className="text-muted-foreground">
               {compactNumber(min)} · {compactNumber(cur)} · {compactNumber(max)}
             </span>
           </button>

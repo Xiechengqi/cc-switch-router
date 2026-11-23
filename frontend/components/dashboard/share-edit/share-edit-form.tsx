@@ -35,6 +35,7 @@ import { FieldGroup, TokenInputEcho } from "./share-edit-shared";
 import { ShareAccessModeField, ShareAccessQuotaSection } from "./share-access-quota";
 import { ShareUserGrantsEditor } from "./share-user-grants-editor";
 import { useLocaleText } from "@/components/i18n/locale-provider";
+import { useGrantCapabilityConfirm } from "@/lib/grant-capability-confirm";
 import type { ShareRequestedModelBlocksHandle } from "./share-requested-model-blocks-panel";
 
 function shareUserGrantsFingerprint(share: ShareView | null) {
@@ -82,6 +83,7 @@ export type ShareEditFormApi = {
   blocksRef: React.RefObject<ShareRequestedModelBlocksHandle | null>;
   resetDraft: () => void;
   save: () => Promise<void>;
+  grantConfirmDialog: React.ReactNode;
 };
 
 export function useShareEditForm({
@@ -95,7 +97,12 @@ export function useShareEditForm({
   onSaved: (result: { appliedSynchronously: boolean }) => Promise<void>;
   onClose: () => void;
 }): ShareEditFormApi | null {
-  const { locale } = useLocaleText();
+  const { locale, t: translate } = useLocaleText();
+  const grantConfirm = useGrantCapabilityConfirm({
+    title: translate("dashboard.grantCapability.confirmTitle"),
+    confirm: translate("dashboard.grantCapability.confirmAction"),
+    cancel: translate("common.cancel"),
+  });
   const [draft, setDraft] = React.useState<ShareEditDraft | null>(null);
   const [baseDraft, setBaseDraft] = React.useState<ShareEditDraft | null>(null);
   const [baseShare, setBaseShare] = React.useState<ShareView | null>(null);
@@ -324,6 +331,7 @@ export function useShareEditForm({
         const reviewed = await prepareGrantSettingsAttempt({
           previous: grantSaveAttempt.current, request: previewShareGrantCapabilities,
           shareId: liveShare.shareId, revision: revision ?? 0, patch, login, zh: locale.startsWith("zh"),
+          confirm: grantConfirm.confirm,
         });
         if (!reviewed || session !== sessionRef.current || !sameLoginContext(auth, readAuthState())) return;
         grantSaveAttempt.current = reviewed;
@@ -358,7 +366,7 @@ export function useShareEditForm({
         if (err instanceof ApiError && err.status < 500 && err.status !== 408) {
           grantSaveAttempt.current = undefined;
         }
-        setError(err instanceof Error ? err.message : String(err));
+        setError(err instanceof Error && err.message === "GRANT_PREVIEW_EXPIRED" ? translate("dashboard.grantCapability.previewExpired") : err instanceof Error ? err.message : String(err));
         await onSaved({ appliedSynchronously: false }).catch(() => undefined);
       }
     } finally {
@@ -399,6 +407,7 @@ export function useShareEditForm({
     handleParallelUnlimited,
     onBlocksStateChange,
     blocksRef,
+    grantConfirmDialog: grantConfirm.dialog,
   };
 }
 

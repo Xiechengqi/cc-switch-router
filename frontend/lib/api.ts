@@ -240,12 +240,41 @@ async function fetchShareMarketCached<T>(url: string, signal?: AbortSignal): Pro
   return waitForCaller(shared, signal);
 }
 
+type DashboardGetCacheEntry = { etag?: string; body: DashboardResponse };
+let dashboardGetCache: { actor: string; entry: DashboardGetCacheEntry } | undefined;
+
+/** Test hook. Production calls go through the login-scoped entry above. */
+export function clearDashboardGetCache() {
+  dashboardGetCache = undefined;
+}
+
 export async function getDashboard(signal?: AbortSignal) {
   const started = readAuthState();
-  const body = await parseJson<DashboardResponse>(
-    await authFetch("/v1/dashboard", { cache: "no-store", signal }, started),
-  );
+  const actor = loginContextKey(started);
+  if (dashboardGetCache && dashboardGetCache.actor !== actor) dashboardGetCache = undefined;
+  const cached = dashboardGetCache?.actor === actor ? dashboardGetCache.entry : undefined;
+  const request = (etag?: string) => authFetch("/v1/dashboard", {
+    cache: "no-cache",
+    signal,
+    headers: etag ? { "If-None-Match": etag } : undefined,
+  }, started);
+  let response = await request(cached?.etag);
   assertCurrentLoginContext(started);
+  if (response.status === 304) {
+    if (!cached) {
+      response = await request();
+      assertCurrentLoginContext(started);
+    } else {
+      const body = { ...cached.body, generatedAt: new Date().toISOString() };
+      dashboardGetCache = { actor, entry: { etag: cached.etag, body } };
+      return body;
+    }
+  }
+  const body = await parseJson<DashboardResponse>(response);
+  assertCurrentLoginContext(started);
+  if (loginContextKey(readAuthState()) === actor) {
+    dashboardGetCache = { actor, entry: { etag: response.headers.get("etag") || undefined, body } };
+  }
   return body;
 }
 

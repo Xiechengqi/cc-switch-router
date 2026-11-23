@@ -43,6 +43,41 @@ fn main() {
     generate_ui_assets();
 }
 
+/// Build id Next writes into every static-export flight payload (`"b":"..."`).
+/// Health checks expose it so an open tab can notice a newer binary without
+/// fetching an RSC document. Missing or unreadable HTML yields an empty id.
+fn read_ui_build_id(ui_root: &Path) -> String {
+    let Ok(html) = fs::read_to_string(ui_root.join("index.html")) else {
+        return String::new();
+    };
+    let marker = if html.contains("<meta name=\"ccr-ui-build\" content=\"") {
+        "<meta name=\"ccr-ui-build\" content=\""
+    } else {
+        "\"b\":\""
+    };
+    let start = if marker.starts_with("<meta") {
+        html.find(marker)
+    } else {
+        html.rfind(marker)
+    };
+    let Some(start) = start else {
+        return String::new();
+    };
+    let rest = &html[start + marker.len()..];
+    let Some(end) = rest.find('"') else {
+        return String::new();
+    };
+    let id = &rest[..end];
+    if id.is_empty()
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && byte != b'\\' && byte != b'"')
+    {
+        return String::new();
+    }
+    id.to_string()
+}
+
 fn build_time_utc() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -81,18 +116,20 @@ fn generate_ui_assets() {
     let mut gzip_files = std::collections::HashSet::new();
 
     let mut body = String::new();
-    body.push_str(
-        "pub struct UiAsset {\n\
+    let ui_build_id = read_ui_build_id(ui_root);
+    body.push_str(&format!(
+        "pub const UI_BUILD_ID: &str = {ui_build_id:?};\n\n\
+         pub struct UiAsset {{\n\
          \tpub path: &'static str,\n\
          \tpub bytes: &'static [u8],\n\
          \tpub gzip: Option<&'static [u8]>,\n\
          \tpub etag: &'static str,\n\
          \tpub content_type: &'static str,\n\
          \tpub immutable: bool,\n\
-         }\n\n\
-         pub fn ui_asset(path: &str) -> Option<UiAsset> {\n\
-         \tmatch path {\n",
-    );
+         }}\n\n\
+         pub fn ui_asset(path: &str) -> Option<UiAsset> {{\n\
+         \tmatch path {{\n",
+    ));
     for (rel, abs) in files {
         let content_type = content_type_for(&rel);
         let immutable = rel.starts_with("_next/static/");

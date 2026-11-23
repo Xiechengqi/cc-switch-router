@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use resend_rs::Resend;
 use tokio::sync::{Mutex, RwLock, broadcast};
@@ -96,6 +98,86 @@ pub struct ServerState {
     pub alerting: Arc<AlertingService>,
     /// Bounded in-memory admission limiter for the public installation registration endpoint.
     pub registration_admission: Arc<RegistrationAdmissionLimiter>,
+    /// Short-lived `/v1/dashboard` snapshots. A user write bumps the generation
+    /// and drops every viewer's copy so the next poll rebuilds.
+    pub dashboard_cache: Arc<DashboardSnapshotCache>,
+}
+
+/// One process-local dashboard snapshot, reused for two seconds.
+pub struct DashboardSnapshotCache {
+    generation: AtomicU64,
+    inner: StdMutex<Option<DashboardSnapshotCacheEntry>>,
+}
+
+struct DashboardSnapshotCacheEntry {
+    generation: u64,
+    viewer_key: String,
+    stored_at: Instant,
+    /// Canonical JSON of the response. `generatedAt` stays as first built.
+    body: Vec<u8>,
+    etag: String,
+}
+
+impl DashboardSnapshotCache {
+    pub fn new() -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            inner: StdMutex::new(None),
+        }
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Drop every cached snapshot. Returns the generation writers must observe.
+    pub fn invalidate(&self) -> u64 {
+        let next = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        if let Ok(mut guard) = self.inner.lock() {
+            *guard = None;
+        }
+        next
+    }
+
+    pub fn get(&self, viewer_key: &str, max_age: Duration) -> Option<(Vec<u8>, String)> {
+        let guard = self.inner.lock().ok()?;
+        let entry = guard.as_ref()?;
+        if entry.generation != self.generation()
+            || entry.viewer_key != viewer_key
+            || entry.stored_at.elapsed() > max_age
+        {
+            return None;
+        }
+        Some((entry.body.clone(), entry.etag.clone()))
+    }
+
+    /// Store only when `generation` is still current, so a slow snapshot cannot
+    /// cover a write that already cleared the cache.
+    pub fn insert_if_current(
+        &self,
+        generation: u64,
+        viewer_key: String,
+        body: Vec<u8>,
+        etag: String,
+    ) -> bool {
+        if generation != self.generation() {
+            return false;
+        }
+        let Ok(mut guard) = self.inner.lock() else {
+            return false;
+        };
+        if generation != self.generation() {
+            return false;
+        }
+        *guard = Some(DashboardSnapshotCacheEntry {
+            generation,
+            viewer_key,
+            stored_at: Instant::now(),
+            body,
+            etag,
+        });
+        true
+    }
 }
 
 #[derive(Debug, Clone)]

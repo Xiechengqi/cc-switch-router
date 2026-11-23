@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Noto_Sans_SC } from "next/font/google";
 import { AppProviders } from "@/components/providers/app-providers";
+import { LOCALE_STORAGE_KEY } from "@/lib/i18n";
 import "./globals.css";
 
 const notoSansSC = Noto_Sans_SC({
@@ -28,6 +29,13 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" className={notoSansSC.variable}>
+      <head>
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `(function(){try{var stored=localStorage.getItem(${JSON.stringify(LOCALE_STORAGE_KEY)});var lang=stored||(navigator.languages&&navigator.languages[0])||navigator.language||"";document.documentElement.lang=/^zh/i.test(lang)?"zh-CN":"en";}catch(e){}})();`,
+          }}
+        />
+      </head>
       <body>
         <AppProviders>{children}</AppProviders>
       </body>

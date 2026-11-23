@@ -51,7 +51,7 @@ function RoomListRow({
             {room.lastMessage ? `${author}: ${preview || t("chat.deleted")}` : preview}
           </span>
         </span>
-        <span className="flex min-w-10 flex-col items-end gap-1 text-[10px] text-slate-400">
+        <span className="flex min-w-10 flex-col items-end gap-1 text-[11px] text-muted-foreground">
           {room.lastMessageAt ? (
             <span title={formatDateTime(room.lastMessageAt)}>{formatRelativeTime(room.lastMessageAt, locale)}</span>
           ) : (

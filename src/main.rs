@@ -349,6 +349,7 @@ async fn main() -> Result<()> {
         clock_health: clock_health.clone(),
         alerting: alerting.clone(),
         registration_admission: Arc::new(RegistrationAdmissionLimiter::from_env()),
+        dashboard_cache: Arc::new(crate::server_state::DashboardSnapshotCache::new()),
     };
     let startup_reconnect_grace =
         crate::notifications::route_reconnect_grace(&config.client_notifications);

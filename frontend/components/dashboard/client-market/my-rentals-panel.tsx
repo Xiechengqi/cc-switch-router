@@ -236,7 +236,7 @@ export function MyRentalsPanel({
                   <MessageCircle className="h-4 w-4" />
                 </Button>
                 {chatUnread > 0 ? (
-                  <span className="pointer-events-none absolute -right-1 -top-1 min-w-4 rounded-full bg-red-600 px-1 text-center text-[9px] font-semibold leading-4 text-white">
+                  <span className="pointer-events-none absolute -right-1 -top-1 min-w-4 rounded-full bg-red-600 px-1 text-center text-[10px] font-semibold leading-4 text-white">
                     {chatUnread > 99 ? "99+" : chatUnread}
                   </span>
                 ) : null}
