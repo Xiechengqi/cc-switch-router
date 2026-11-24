@@ -81,12 +81,10 @@ export function ShopRegionPicker({
                 className={selected ? "client-market-shop-country is-selected" : "client-market-shop-country"}
                 onClick={() => onCountry(selected ? "" : card.code)}
               >
-                <span className="flex min-w-0 items-center gap-1.5">
-                  {known ? <CountryFlag code={card.code} title={name} /> : null}
-                  <span className="min-w-0">
-                    <span className="block truncate text-xs font-medium leading-4 text-foreground">{name}</span>
-                    <span className="block text-[11px] leading-4 text-muted-foreground">{known ? card.code : "—"}</span>
-                  </span>
+                <span className="flex min-w-0 items-center gap-1">
+                  {known ? <CountryFlag code={card.code} size="compact" title={name} /> : null}
+                  <span className="min-w-0 truncate text-xs font-medium leading-4 text-foreground">{name}</span>
+                  {known ? <span className="shrink-0 text-[11px] leading-4 text-muted-foreground">{card.code}</span> : null}
                 </span>
                 <span className="mt-1.5 flex items-baseline justify-between gap-2 text-[11px] leading-4">
                   <span className="truncate text-muted-foreground">{t("clientMarket.shop.idleCount", { count: card.idle })}</span>

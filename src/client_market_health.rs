@@ -752,6 +752,122 @@ struct CalendarQuery {
     days: Option<u16>,
 }
 
+const CALENDAR_DAYS: i64 = 366;
+
+fn calendar_day_counts(
+    conn: &Connection,
+    host: &str,
+    admitted: Option<i64>,
+    first: Option<i64>,
+    day_start: i64,
+    now: i64,
+    received: &HashSet<i64>,
+) -> Result<(u32, u32), AppError> {
+    let mut got = 0u32;
+    let mut observed = 0u32;
+    for hour in day_start..day_start + 24 {
+        let due = first
+            .filter(|first| first / 3600 == hour)
+            .unwrap_or_else(|| wire::due_at(host, hour));
+        if admitted.is_none_or(|admitted| hour < admitted) || now < due + wire::GRACE_SECONDS {
+            continue;
+        }
+        if unavailable(conn, due)? {
+            continue;
+        }
+        observed += 1;
+        if received.contains(&hour) {
+            got += 1;
+        }
+    }
+    Ok((got, observed))
+}
+
+/// Fold one settled UTC day into the year-long aggregate. Hours still inside
+/// their grace window stay out, so the same day can be rewritten until it closes.
+fn store_calendar_day(
+    conn: &Connection,
+    host: &str,
+    epoch: i64,
+    day_start: i64,
+    got: u32,
+    observed: u32,
+) -> Result<(), AppError> {
+    if observed == 0 {
+        conn.execute(
+            "DELETE FROM client_host_health_days WHERE host_id=?1 AND machine_epoch=?2 AND day_start=?3",
+            params![host, epoch, day_start],
+        )
+        .map_err(database)?;
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT INTO client_host_health_days(host_id,machine_epoch,day_start,received_hours,observable_hours)
+         VALUES(?1,?2,?3,?4,?5)
+         ON CONFLICT(host_id,machine_epoch,day_start) DO UPDATE SET
+           received_hours=excluded.received_hours, observable_hours=excluded.observable_hours",
+        params![host, epoch, day_start, got, observed],
+    )
+    .map_err(database)?;
+    Ok(())
+}
+
+fn record_settled_calendar_days(conn: &Connection, host: &str, now: i64) -> Result<(), AppError> {
+    let (epoch, admitted, first): (i64, Option<i64>, Option<i64>) = match conn
+        .query_row(
+            "SELECT machine_epoch,admitted_hour,first_due_at FROM client_host_agents WHERE host_id=?1",
+            params![host],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(database)?
+    {
+        Some(row) => row,
+        None => return Ok(()),
+    };
+    let Some(admitted) = admitted else {
+        return Ok(());
+    };
+    let today_hour = now.div_euclid(86_400) * 24;
+    let yesterday = today_hour - 24;
+    let admitted_day = admitted.div_euclid(24) * 24;
+    if yesterday < admitted_day {
+        return Ok(());
+    }
+    let stored: Option<i64> = conn
+        .query_row(
+            "SELECT MAX(day_start) FROM client_host_health_days WHERE host_id=?1 AND machine_epoch=?2",
+            params![host, epoch],
+            |row| row.get(0),
+        )
+        .map_err(database)?;
+    // Keep the newest stored day and rewrite it: its last hours may have closed since.
+    let mut start = stored.unwrap_or(admitted_day).max(admitted_day);
+    if start < yesterday - 40 * 24 {
+        start = yesterday - 40 * 24;
+    }
+    let mut received = HashSet::new();
+    let mut statement = conn
+        .prepare(
+            "SELECT utc_hour FROM client_host_hour_reports WHERE host_id=?1 AND machine_epoch=?2 AND utc_hour>=?3 AND utc_hour<?4",
+        )
+        .map_err(database)?;
+    for hour in statement
+        .query_map(params![host, epoch, start, today_hour], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(database)?
+    {
+        received.insert(hour.map_err(database)?);
+    }
+    for day_start in (start..=yesterday).step_by(24) {
+        let (got, observed) =
+            calendar_day_counts(conn, host, Some(admitted), first, day_start, now, &received)?;
+        store_calendar_day(conn, host, epoch, day_start, got, observed)?;
+    }
+    Ok(())
+}
+
 fn calendar_days(
     conn: &Connection,
     host: &str,
@@ -767,9 +883,26 @@ fn calendar_days(
         .optional()
         .map_err(database)?
         .unwrap_or((1, None, None));
-    let days = days.clamp(1, 7);
+    let days = days.clamp(1, CALENDAR_DAYS);
     let today_hour = now.div_euclid(86_400) * 24;
     let start_hour = today_hour - (days - 1) * 24;
+    let mut stored = std::collections::HashMap::<i64, (i64, i64)>::new();
+    if admitted.is_some() {
+        let mut statement = conn
+            .prepare(
+                "SELECT day_start,received_hours,observable_hours FROM client_host_health_days WHERE host_id=?1 AND machine_epoch=?2 AND day_start>=?3",
+            )
+            .map_err(database)?;
+        for row in statement
+            .query_map(params![host, epoch, start_hour], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(database)?
+        {
+            let (day_start, got, observed): (i64, i64, i64) = row.map_err(database)?;
+            stored.insert(day_start, (got, observed));
+        }
+    }
     let mut received = HashSet::new();
     if admitted.is_some() {
         let mut statement = conn
@@ -778,7 +911,10 @@ fn calendar_days(
             )
             .map_err(database)?;
         for hour in statement
-            .query_map(params![host, epoch, start_hour], |row| row.get::<_, i64>(0))
+            .query_map(
+                params![host, epoch, start_hour.max(today_hour - 8 * 24)],
+                |row| row.get::<_, i64>(0),
+            )
             .map_err(database)?
         {
             received.insert(hour.map_err(database)?);
@@ -786,23 +922,15 @@ fn calendar_days(
     }
     let mut days_out = Vec::new();
     for day_start in (start_hour..=today_hour).step_by(24) {
-        let mut got = 0u32;
-        let mut observed = 0u32;
-        for hour in day_start..day_start + 24 {
-            let due = first
-                .filter(|first| first / 3600 == hour)
-                .unwrap_or_else(|| wire::due_at(host, hour));
-            if admitted.is_none_or(|admitted| hour < admitted) || now < due + wire::GRACE_SECONDS {
-                continue;
+        let (got, observed) = if day_start < today_hour {
+            if let Some((got, observed)) = stored.get(&day_start) {
+                (*got as u32, *observed as u32)
+            } else {
+                calendar_day_counts(conn, host, admitted, first, day_start, now, &received)?
             }
-            if unavailable(conn, due)? {
-                continue;
-            }
-            observed += 1;
-            if received.contains(&hour) {
-                got += 1;
-            }
-        }
+        } else {
+            calendar_day_counts(conn, host, admitted, first, day_start, now, &received)?
+        };
         let date = DateTime::<Utc>::from_timestamp(day_start * 3600, 0)
             .unwrap_or_default()
             .date_naive();
@@ -816,7 +944,7 @@ fn calendar_days(
     Ok(days_out)
 }
 
-/// Hourly reports are deleted after seven days, so the calendar cannot exceed that window.
+/// The calendar keeps one year of daily counts. Hourly report bodies still expire after seven days.
 async fn calendar(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -849,8 +977,14 @@ async fn calendar(
     if !operator && !operations && unavailable_paid_host_ids(&conn)?.contains(&id) {
         return Err(AppError::NotFound("Host not available".into()));
     }
-    let days = i64::from(query.days.unwrap_or(7).clamp(1, 7));
+    let days = i64::from(
+        query
+            .days
+            .unwrap_or(CALENDAR_DAYS as u16)
+            .clamp(1, CALENDAR_DAYS as u16),
+    );
     let now = Utc::now().timestamp();
+    record_settled_calendar_days(&conn, &id, now)?;
     let days_out = calendar_days(&conn, &id, now, days)?;
     let start_hour = now.div_euclid(86_400) * 24 - (days - 1) * 24;
     let start_date = DateTime::<Utc>::from_timestamp(start_hour * 3600, 0)
@@ -1050,10 +1184,15 @@ pub(super) async fn settle(state: &ServerState) -> Result<(), AppError> {
             .collect::<Result<Vec<_>, _>>()
             .map_err(database)?
     };
-    for id in ids {
-        refresh_summary(&tx, &id, now)?
+    for id in &ids {
+        refresh_summary(&tx, id, now)?;
     }
     tx.execute("DELETE FROM client_host_hour_reports WHERE rowid IN (SELECT rowid FROM client_host_hour_reports WHERE received_at<?1 LIMIT 512)",params![now-7*86400]).map_err(database)?;
+    tx.execute(
+        "DELETE FROM client_host_health_days WHERE rowid IN (SELECT rowid FROM client_host_health_days WHERE day_start<?1 LIMIT 512)",
+        params![now.div_euclid(86_400) * 24 - CALENDAR_DAYS * 24],
+    )
+    .map_err(database)?;
     tx.execute(
         "DELETE FROM client_host_report_conflicts WHERE last_seen_at<?1",
         params![now - 7 * 86400],
@@ -1394,6 +1533,39 @@ mod tests {
         assert_eq!(today["receivedRate"], 33.3);
         let during_grace = calendar_days(&conn, "host-fixture", first + 60, 1).unwrap();
         assert_eq!(during_grace.last().unwrap()["observableHours"], 0);
+    }
+
+    #[tokio::test]
+    async fn health_calendar_keeps_a_settled_day_after_hourly_reports_are_deleted() {
+        let store = AppStore::new_in_memory_for_tests().unwrap();
+        let hour = 480_012i64;
+        let first = hour * 3600;
+        host(&store, "host-fixture", first).await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE client_host_agents SET admitted_hour=?2 WHERE host_id='host-fixture'",
+                params![hour],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            send(&store, &report("host-fixture", hour, first), first + 2).await,
+            StatusCode::OK
+        );
+        let next_day = first + 86_400 + 3 * 3600 + wire::GRACE_SECONDS;
+        let conn = store.conn.lock().await;
+        record_settled_calendar_days(&conn, "host-fixture", next_day).unwrap();
+        conn.execute(
+            "DELETE FROM client_host_hour_reports WHERE host_id='host-fixture'",
+            [],
+        )
+        .unwrap();
+        let days = calendar_days(&conn, "host-fixture", next_day, 2).unwrap();
+        let settled = days.iter().find(|day| day["receivedHours"] == 1).unwrap();
+        assert_eq!(settled["observableHours"], 12);
+        assert_eq!(settled["receivedRate"], 8.3);
+        assert_eq!(days.len(), 2);
     }
 
     #[tokio::test]

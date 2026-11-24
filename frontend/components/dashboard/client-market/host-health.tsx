@@ -13,23 +13,21 @@ export function HostHardwareSummary({ health }: { health?: HostHealth | null }) 
   const number = (value: number, divisor = 1) => new Intl.NumberFormat(locale, { maximumFractionDigits: divisor === 1 ? 3 : 1 }).format(value / divisor);
   const cpu = snapshot.effectiveVcpu.value;
   const memory = snapshot.memoryTotalBytes.value;
-  const disk = snapshot.dataVolumeTotalBytes.value;
-  const arch = snapshot.arch === "aarch64" ? "ARM64" : snapshot.arch;
+  const platform = [snapshot.os, snapshot.arch].filter(Boolean).join("-");
   return <div className="host-hardware-summary tabular-nums" title={t("hostHealth.selfReported")}>
-    <span>{arch} · {cpu != null ? t("hostHealth.cpu", { value: number(cpu) }) : t("hostHealth.cpuUnknown")}</span>
-    <span className="text-muted-foreground">{[
-      memory != null ? t("hostHealth.memory", { value: number(memory, 2 ** 30) }) : t("hostHealth.memoryUnknown"),
-      disk != null ? t("hostHealth.disk", { value: number(disk, 2 ** 30) }) : t("hostHealth.diskUnknown"),
-    ].join(" · ")}</span>
+    <span>{platform} · {cpu != null ? t("hostHealth.cpu", { value: number(cpu) }) : t("hostHealth.cpuUnknown")}</span>
+    <span className="text-muted-foreground">{memory != null ? t("hostHealth.memory", { value: number(memory, 2 ** 30) }) : t("hostHealth.memoryUnknown")}</span>
   </div>;
 }
 
 /** The list and quote share presentation; reads and management live in one drawer. */
-export function HostHealthSummary({ health, hostLabel, variant = "checkout", onOpen }: {
+export function HostHealthSummary({ health, hostLabel, variant = "checkout", onOpen, specs = true }: {
   health?: HostHealth | null;
   hostLabel?: string;
   variant?: "table" | "checkout";
   onOpen?: () => void;
+  /** Shop confirmation already shows specifications in their own block. */
+  specs?: boolean;
 }) {
   const { locale, t } = useLocaleText();
   const state = hostHealthDisplayState(health);
@@ -46,7 +44,7 @@ export function HostHealthSummary({ health, hostLabel, variant = "checkout", onO
       {record ? <span title={t("hostHealth.record", { received: health!.received24h, observed: health!.observable24h })}>{record}</span> : null}
     </span> : null}
     {variant === "checkout" ? <>
-      <HostHardwareSummary health={health} />
+      {specs ? <HostHardwareSummary health={health} /> : null}
       {health?.nextDueAt && ["awaiting_first", "first_overdue"].includes(state) ? <time className="text-muted-foreground" dateTime={health.nextDueAt}>{t("hostHealth.next", { time: formatHostHealthTime(health.nextDueAt, locale) })}</time> : null}
     </> : null}
     {limitations.length ? <span className="host-health-limitation" title={limitations.map(item => t(item.full)).join(" · ")}>{limitations.map((item, index) => <span key={item.full}>{index ? " · " : ""}{t(variant === "table" ? item.short : item.full)}</span>)}</span> : null}

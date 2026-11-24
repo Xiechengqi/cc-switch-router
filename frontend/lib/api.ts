@@ -1722,7 +1722,7 @@ export async function getClientMarketHostUsageHistory(
 
 export async function getClientMarketHostHealthCalendar(hostId: string, signal?: AbortSignal) {
   return parseJson<import("./types").HostHealthCalendar>(
-    await authFetch("/v1/client-market/hosts/" + encodeURIComponent(hostId) + "/health-calendar?days=7", { cache: "no-store", signal }),
+    await authFetch("/v1/client-market/hosts/" + encodeURIComponent(hostId) + "/health-calendar?days=366", { cache: "no-store", signal }),
   );
 }
 

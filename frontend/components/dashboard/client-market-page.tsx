@@ -654,7 +654,6 @@ export function ClientMarketPage() {
       <header className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
           <h1 className="text-xl font-semibold text-foreground">{t("clientMarket.title")}</h1>
-          <p className="mt-1 text-sm text-muted-foreground">{t("clientMarket.shop.subtitle")}</p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <label className="inline-flex h-9 items-center gap-2 rounded-lg border border-border bg-card px-3 text-sm">

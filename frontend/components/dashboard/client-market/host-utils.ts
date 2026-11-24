@@ -88,16 +88,15 @@ export function containsCjk(value: string) {
   return /[\u3400-\u9fff]/.test(value);
 }
 
-/** One line for a shop card: architecture and the three capacities, without unknown placeholders. */
+/** One line for a shop card: reported os-arch, vCPU, and GiB memory. Unknown values stay off the line. */
 export function hostShopSpecLine(host: Pick<ClientMarketHost, "hostHealth">) {
   const snapshot = host.hostHealth?.snapshot;
   if (!snapshot) return "";
-  const arch = snapshot.arch === "aarch64" ? "ARM64" : snapshot.arch;
+  const platform = [snapshot.os, snapshot.arch].filter(Boolean).join("-");
   const cpu = snapshot.effectiveVcpu.value;
   const memory = snapshot.memoryTotalBytes.value;
-  const disk = snapshot.dataVolumeTotalBytes.value;
   const gib = (bytes: number) => `${new Intl.NumberFormat("en", { maximumFractionDigits: 1 }).format(bytes / 2 ** 30)}G`;
-  return [arch, cpu != null ? `${new Intl.NumberFormat("en", { maximumFractionDigits: 1 }).format(cpu)}C` : "", memory != null ? gib(memory) : "", disk != null ? gib(disk) : ""].filter(Boolean).join(" · ");
+  return [platform, cpu != null ? `${new Intl.NumberFormat("en", { maximumFractionDigits: 1 }).format(cpu)}C` : "", memory != null ? gib(memory) : ""].filter(Boolean).join(" · ");
 }
 
 export function hostDisplayLabel(host: ClientMarketHost) {

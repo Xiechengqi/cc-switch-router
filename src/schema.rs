@@ -432,6 +432,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         125,
         include_str!("../schema/0125_client_host_health_bootstrap.sql"),
     ),
+    (
+        126,
+        include_str!("../schema/0126_client_host_health_calendar.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -1040,7 +1044,8 @@ mod tests {
     // browser/financial credentials, risk evidence and recovery (0114–0116).
     // Migration 124 Host health adds eight tables, including retired Host IDs by address.
     // Migration 125 adds the lease-bound initial monitor bootstrap queue.
-    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 313;
+    // Migration 126 adds the year-long Host health day aggregate.
+    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 314;
 
     #[test]
     fn migration_114_revokes_existing_sessions_and_rotation_grace_only_once() {

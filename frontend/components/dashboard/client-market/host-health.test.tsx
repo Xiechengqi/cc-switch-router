@@ -42,7 +42,8 @@ test("partial hardware and clock restart limits stay visible in rows and quotes"
   } };
   for (const variant of ["table", "checkout"] as const) {
     const html = renderToStaticMarkup(<LocaleProvider><HostHealthSummary health={partial} variant={variant} /><HostHardwareSummary health={partial} /></LocaleProvider>);
-    assert.match(html, /Disk unknown/);
+    assert.match(html, /Linux-x86_64/);
+    assert.doesNotMatch(html, /Disk unknown|磁盘/);
     assert.match(html, /1 GiB RAM/);
     assert.match(html, variant === "table" ? /Clock unsynced/ : /Time sync is off/);
     assert.match(html, variant === "table" ? /No autostart/ : /Automatic restart is not configured/);

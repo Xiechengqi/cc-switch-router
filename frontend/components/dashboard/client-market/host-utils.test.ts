@@ -41,7 +41,7 @@ test("shop host cards keep one spec line and omit missing values", () => {
         cpuUsagePct: { value: null, unknownReason: null },
       },
     },
-  }), "ARM64 · 2C · 1.5G");
+  }), "linux-aarch64 · 2C · 1.5G");
 });
 
 test("shop continents keep ISO regions distinct and group unknown codes as other", () => {

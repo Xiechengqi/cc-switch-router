@@ -1,5 +1,4 @@
 export const clientMarketShopMessagesEn = {
-  "clientMarket.shop.subtitle": "Pick a region, choose an idle Host, then create a Client.",
   "clientMarket.shop.onlyIdle": "Idle only",
   "clientMarket.shop.refresh": "Refresh",
   "clientMarket.shop.manage": "Manage Hosts",
@@ -28,7 +27,7 @@ export const clientMarketShopMessagesEn = {
   "clientMarket.shop.listedAt": "Listed {date}",
   "clientMarket.shop.confirmEmpty": "Select an idle Host to review its offer and create a Client.",
   "clientMarket.shop.confirmTitle": "Selected Host",
-  "clientMarket.shop.notIdle": "This Host is not idle. Choose another Host to create a Client.",
+  "clientMarket.shop.notIdle": "{status} · a new Client needs an idle Host",
   "clientMarket.shop.continue": "Continue",
   "clientMarket.shop.accessRequired": "Request access",
   "clientMarket.shop.summarySpecs": "Specifications",
@@ -36,7 +35,6 @@ export const clientMarketShopMessagesEn = {
 };
 
 export const clientMarketShopMessagesZh = {
-  "clientMarket.shop.subtitle": "先选地区，再选一台空闲主机，然后新建 Client。",
   "clientMarket.shop.onlyIdle": "仅空闲",
   "clientMarket.shop.refresh": "刷新",
   "clientMarket.shop.manage": "管理主机",
@@ -65,7 +63,7 @@ export const clientMarketShopMessagesZh = {
   "clientMarket.shop.listedAt": "{date} 登记",
   "clientMarket.shop.confirmEmpty": "选择一台空闲主机后，可以核对报价并新建 Client。",
   "clientMarket.shop.confirmTitle": "已选主机",
-  "clientMarket.shop.notIdle": "这台主机不是空闲状态，请另选一台再新建 Client。",
+  "clientMarket.shop.notIdle": "{status} · 新建 Client 需要空闲主机",
   "clientMarket.shop.continue": "继续",
   "clientMarket.shop.accessRequired": "申请准入",
   "clientMarket.shop.summarySpecs": "规格",

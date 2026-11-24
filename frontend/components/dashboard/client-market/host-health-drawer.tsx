@@ -96,7 +96,7 @@ export function HostHealthDrawer({ host, viewerKey, onClose, onChanged }: {
               <HostHardwareSummary health={health} />
               {health?.sampledAt ? <p className="text-xs text-muted-foreground">{t("hostHealth.sampled", { time: time(health.sampledAt) })}</p> : null}
               {snapshot ? <p className="text-sm text-muted-foreground">{hidden ? t("hostHealth.dynamicHidden") : t("hostHealth.available", {
-                memory: value(snapshot.memoryAvailableBytes, 2 ** 30, "GiB"), disk: value(snapshot.dataVolumeAvailableBytes, 2 ** 30, "GiB"), cpu: value(snapshot.cpuUsagePct, 1, "%"),
+                memory: value(snapshot.memoryAvailableBytes, 2 ** 30, "GiB"), disk: value(snapshot.dataVolumeAvailableBytes, 1000 ** 3, "GB"), cpu: value(snapshot.cpuUsagePct, 1, "%"),
               })}</p> : null}
               {health?.clockSynchronized === false ? <p className="host-health-limitation">{t("hostHealth.clockUnsynced")}</p> : null}
             </section>

@@ -40,6 +40,8 @@ export function ShopConfirmPanel({
   }
   const label = hostDisplayLabel(host);
   const idle = host.status === "idle";
+  const knownStatus = ["idle", "reserved", "allocated", "locked", "draining", "disabled", "unreachable", "abnormal", "onboarding", "maintaining"].includes(host.status);
+  const statusLabel = knownStatus ? t(`clientMarket.status.${host.status}` as "clientMarket.status.idle") : host.status;
   return (
     <aside className="client-market-shop-confirm" aria-label={t("clientMarket.shop.stepConfirm")}>
       <div className="grid gap-4">
@@ -57,14 +59,14 @@ export function ShopConfirmPanel({
           </div>
           <strong className="shrink-0 text-lg tabular-nums">{formatHostOffer(host.dailyRateMinor, locale, host.freeDurationDays, host.cyclePriceMinor)}</strong>
         </div>
-        <HostHealthSummary health={host.hostHealth} hostLabel={label} variant="checkout" onOpen={() => onHealthOpen(host.id)} />
+        <HostHealthSummary health={host.hostHealth} hostLabel={label} variant="checkout" specs={false} onOpen={() => onHealthOpen(host.id)} />
         <div className="rounded-lg bg-muted px-3 py-2">
           <p className="mb-1 text-xs text-muted-foreground">{t("clientMarket.shop.summarySpecs")}</p>
           <HostHardwareSummary health={host.hostHealth} />
         </div>
         <HostHealthHeatmap hostId={host.id} />
         {idle ? <p className="text-xs leading-5 text-muted-foreground">{t("clientMarket.shop.purchaseTerms")}</p> : (
-          <p role="status" className="text-sm text-amber-800">{t("clientMarket.shop.notIdle")}</p>
+          <p role="status" className="client-market-shop-status-note">{t("clientMarket.shop.notIdle", { status: statusLabel })}</p>
         )}
         {!authed ? (
           <Button variant="primary" onPress={onLogin}><LogIn className="h-4 w-4" />{t("createClient.login")}</Button>

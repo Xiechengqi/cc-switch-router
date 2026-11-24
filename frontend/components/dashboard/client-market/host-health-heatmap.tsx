@@ -80,7 +80,7 @@ export function HostHealthHeatmap({ hostId }: { hostId: string }) {
           }}
         />
       ) : (
-        <div className="h-[104px] animate-pulse bg-slate-100" aria-label={t("common.loading")} />
+        <div className="h-[104px] animate-pulse rounded bg-slate-100" aria-label={t("common.loading")} />
       )}
     </section>
   );
