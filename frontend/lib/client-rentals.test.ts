@@ -52,17 +52,9 @@ test("history cannot acquire live actions and detail pagination stays inside the
 });
 test("current rental actions require a valid matching live lifecycle", () => {
   const current = { ...record(), group: "current", status: "trialing", endedAt: null };
-  const rental = {
-    installationId: current.installationId, hostId: "host", providerId: "provider", hostOwnerEmail: "provider@example.test",
-    clientOwnerEmail: "buyer@example.test", status: "active", pricingModel: "prepaid_calendar_month", offerRevision: 1, updatedAt: at,
-    isClientOwner: true, canRelease: true, canFinalizeRelease: false, hostCleanupPending: false,
-    providerTerminalAccessActive: false, canManageProviderTerminal: true,
-    walletContract: { id: current.contractId, status: "trialing", trialSecondsRemaining: 30, renewalPolicy: "manual", periodEnd: null },
-  };
+  const rental = { leaseId: current.installationId, contractId: current.contractId, canDispute: false, openDispute: false };
   assert.ok(parseClientRentalDetail({ ...detail(), record: current, rental }, record().id).rental);
-  for (const patch of [{ isClientOwner: false }, { updatedAt: "bad-date" }, { cyclePriceMinor: -1 }, { walletContract: {} },
-    { walletContractId: "foreign-contract" }, { walletContract: { ...rental.walletContract, id: "foreign-contract" } },
-    { walletContract: { ...rental.walletContract, trialSecondsRemaining: -1 } }, { canRelease: "true" }]) {
+  for (const patch of [{ leaseId: "another-lease" }, { contractId: "foreign-contract" }, { openDispute: "true" }, { canDispute: null }]) {
     assert.throws(() => parseClientRentalDetail({ ...detail(), record: current, rental: { ...rental, ...patch } }, record().id));
   }
 });
@@ -83,8 +75,8 @@ test("account and market reuse one buyer view; Owner audit is gated before any r
   assert.match(audit, /\[expanded, setExpanded\] = React\.useState\(false\)/);
   assert.match(audit, /if \(!active\) \{[\s\S]*?return;[\s\S]*?getRentalAudit\(/);
   assert.match(audit, /request.current\?\.abort\(\); setRead\(null\); setSelected\(null\)/);
-  const row = source("components/dashboard/client-market/host-row.tsx");
-  assert.match(row, /if \(!historyOpen \|\| !canReadHostHistory\) return/);
+  const online = source("components/dashboard/client-market/online-market.tsx");
+  assert.match(online, /await onlineRequest\(`quotes\/\$\{quote.id\}\/commit`[\s\S]*?onChanged\(\)/);
 });
 test("personal records have complete bilingual copy", () => {
   assert.deepEqual(Object.keys(clientRentalsMessagesEn).sort(), Object.keys(clientRentalsMessagesZh).sort());

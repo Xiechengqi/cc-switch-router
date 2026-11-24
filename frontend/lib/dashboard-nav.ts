@@ -217,16 +217,16 @@ export function resolveAccountEntryHref(): AccountNavHref {
   return readStoredAccountNavHref() || DASHBOARD_ACCOUNT_WALLET_PATH;
 }
 
-/** Deep-link into Client Market「我的」, optionally focusing a rental row. */
-export function clientMarketMineHref(installationId?: string) {
-  const params = new URLSearchParams({ tab: "mine" });
-  if (installationId) params.set("focus", installationId);
+/** Focus an online listing or an active lease when opening the market. */
+export function clientMarketMineHref(targetId?: string) {
+  const params = new URLSearchParams();
+  if (targetId) params.set("focus", targetId);
   return buildDashboardHref(DASHBOARD_CLIENT_MARKET_PATH, params);
 }
 
-/** Client Market with the add-Host dialog open, after sign-in when needed. */
+/** Listing starts on the verified owner’s online Client card. */
 export function clientMarketAddHostHref() {
-  return buildDashboardHref(DASHBOARD_CLIENT_MARKET_PATH, new URLSearchParams({ addHost: "1" }));
+  return buildDashboardHref(DASHBOARD_CLIENTS_PATH, new URLSearchParams({ tab: "mine" }));
 }
 
 /** The public ranking with one Provider's detail open. */

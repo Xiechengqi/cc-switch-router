@@ -1,6 +1,6 @@
 import { installFinancialBrowserIdentity } from "./financial-browser-fixture.mjs";
 import assert from "node:assert/strict";
-import { emptyClientRentalsPage } from "./client-rental-fixtures.mjs";
+import { emptyClientRentalsPage, isRetiredClientMarketPath } from "./client-rental-fixtures.mjs";
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { extname, resolve, sep } from "node:path";
@@ -27,10 +27,8 @@ try {
   const personalRentalReads = [];
   let policy = { version: 1, enabled: true, admissionMinor: 10000, minMinor: 100, maxMinor: 500000, paymentMinutes: 30 };
   let profile = null; let sellerUnits = "1728000000"; let available = true; let pauseCount = 0; let financeFailure = false; let terminationFailure = false; let sellerReadFailure = false; let heldIncome = false;
-  let topupMode = "shadow"; let publicationReady = true; let retiredSetupRequests = 0; let offerWrites = 0; let expectedTrialHours = null;
-  const publicationHost = { id: "publication-host", providerId: "seller", hostOwnerEmail: "seller@example.invalid", ip: "192.0.2.50", hostname: "Publication Host", port: 22,
-    countryCode: "JP", status: "idle", isHostOwner: true, pricingModel: "prepaid_calendar_month", cyclePriceMinor: 1000, billingInterval: "calendar_month",
-    currency: "USD", trialHours: null, defaultTrialHours: 12, offerRevision: 1, contacts: [], eligibility: { allowed: true }, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+  let topupMode = "shadow"; let publicationReady = true; let retiredSetupRequests = 0; let offerWrites = 0; let expectedTrialDays = 0;
+  const listedId = "publication-client";
   const description = "Bank transfer · contact @seller · https://seller.example.invalid/pay · <b>plain text</b>";
   const seller = { sellerId: "seller", version: 1, displayName: "C2C-123456abcdef", description, currency: "USD", priceBps: 10000, minMinor: 100, maxMinor: 10000, availableMinor: 20000, completedOrders: 0 };
   const overview = Object.fromEntries(["walletPostedUnits", "walletHeldUnits", "unfulfilledUnits", "providerPendingUnits", "providerAvailableUnits", "providerHeldUnits", "buyerRefundHeldUnits", "ownerLossUnits", "maintenanceRevenueUnits"].map(k => [k, "0"]));
@@ -68,8 +66,15 @@ try {
       if (p === "/v1/market-wallet/policy") return json(route, { version: 1, maintenanceFeeBps: 500, transfersEnabled: true, transfersPaused: false, transferMaxMinor: 500000, transferDailyMaxMinor: 500000, balanceRefundable: false });
       if (p === "/v1/market-trials/policy") return json(route, { version: 1, clientHours: 12, shareHours: 12, shareTokens: 1_000_000, shareValueUsdMicros: "1000000" });
       if (["/v1/account/payment-profile", "/v1/market-billing/dashboard"].includes(p)) { retiredSetupRequests++; return json(route, { message: "retired setup" }, 410); }
-      if (p === "/v1/client-market/hosts") return json(route, [publicationHost]);
-      if (p === "/v1/client-market/my-rentals") return json(route, []);
+      if (isRetiredClientMarketPath(p)) { errors.push(p); return json(route, {}, 410); }
+      if (p === "/v1/client-market/online/seller-inventory") return json(route, {items:[]});
+      if (p === "/v1/dashboard") {
+        const now = new Date().toISOString();
+        const client = {installation:{id:listedId,platform:"linux",appVersion:"1",ownerEmail:"seller@example.invalid",marketLeaseV1:true,
+          createdAt:now,lastSeenAt:now},clientTunnel:{ownerEmail:"seller@example.invalid",subdomain:"publication",tunnelUrl:"https://publication.example.invalid",
+          enabled:true,online:true,routeState:"online"},shareIds:[],shareCount:0};
+        return json(route,{generatedAt:now,stats:{clients:1,activeShares:0,totalActiveRequests:0},map:{countries:[]},mapDisplay:{},clients:[client],shares:[]});
+      }
       if (p === "/v1/client-market/me/rentals") {
         personalRentalReads.push({ actor, view: url.searchParams.get("view") });
         return json(route, emptyClientRentalsPage(url));
@@ -84,9 +89,13 @@ try {
         if (terminationFailure) return json(route, { message: "Termination history temporarily unavailable" }, 503);
         return json(route, { items: [], nextCursor: null });
       }
-      if (p === "/v1/client-market/hosts/publication-host/offer" && request.method() === "PATCH") {
-        assert.deepEqual(body, { cyclePriceMinor: 1000, currency: "USD", trialHours: expectedTrialHours }); offerWrites++; publicationHost.offerRevision++; publicationHost.trialHours = body.trialHours;
-        return json(route, { ...publicationHost, hostId: publicationHost.id });
+      if (p === `/v1/client-market/online/installations/${listedId}/listing` && request.method() === "POST") {
+        assert.equal(actor, "seller");
+        if (!publicationReady) return json(route, {message:"active verified Provider identity required"},403);
+        if (financeFailure) return json(route, {message:"Provider finance temporarily unavailable"},503);
+        assert.deepEqual(body,{cyclePriceMinor:1000,freeDays:null,trialDays:expectedTrialDays,acknowledged:true});
+        offerWrites++;
+        return json(route,{state:"locking"});
       }
       if (p.endsWith("/channels") || p === "/v1/admin/market-payment-channels") return json(route, []);
       const blockers = [...(!policy.enabled ? ["C2C_DISABLED"] : []), ...(!available ? ["C2C_TRANSFERS_PAUSED"] : [])];
@@ -529,40 +538,39 @@ try {
   await zhSeller.context.close();
   // Publication and transfer controls must stay available without official
   // recharge. No legacy payment profile is consulted in any mode.
-  const editOffer = async () => {
-    await sell.page.locator('button[aria-label="Host actions"]').click();
-    await sell.page.getByRole("menuitem", { name: "Edit offer", exact: true }).click();
-    return sell.page.getByRole("dialog", { name: "Edit Host offer", exact: true });
+  const openOffer = async trialDays => {
+    await sell.page.goto(`${base}/clients/`);
+    await sell.page.getByRole("button", { name: "List on Client Market", exact: true }).click();
+    const dialog = sell.page.getByRole("dialog", { name: /Client rental terms/ });
+    await dialog.getByLabel("Monthly price in USD · 0 for free", {exact:true}).fill("10");
+    await dialog.getByLabel("Free trial days · optional", {exact:true}).fill(String(trialDays));
+    await dialog.getByRole("checkbox").check();
+    return dialog;
   };
-  const waitOfferReady = () => sell.page.waitForFunction(() => [...document.querySelectorAll('[role="dialog"] button')].some(button => button.textContent.trim() === "Save" && !button.disabled));
-  for (const [mode, trialHours] of [["disabled", null], ["shadow", 0], ["enabled", 6]]) {
+  for (const [mode, days] of [["disabled",0],["shadow",1],["enabled",6]]) {
     topupMode = mode;
-    expectedTrialHours = trialHours;
+    expectedTrialDays = days;
     await sell.page.goto(`${base}/account/wallet/`);
     await sell.page.getByRole("button", { name: /^Send to someone/ }).click();
     await sell.page.locator("#wallet-transfer form").waitFor();
-    await sell.page.goto(`${base}/client-market/`);
-    const offerDialog = await editOffer(); await waitOfferReady();
-    const trialInput = offerDialog.getByLabel("Trial hours (optional)", { exact: true });
-    assert.equal(await trialInput.inputValue(), publicationHost.trialHours == null ? "" : String(publicationHost.trialHours));
-    assert.equal(await trialInput.getAttribute("placeholder"), "Router default: 12 hours");
-    await trialInput.fill(trialHours == null ? "" : String(trialHours));
-    await offerDialog.getByRole("button", { name: "Save", exact: true }).click();
-    await offerDialog.waitFor({ state: "hidden" });
+    const dialog = await openOffer(days);
+    await dialog.getByRole("button", { name: "List on Client Market", exact: true }).click();
+    await dialog.waitFor({state:"hidden"});
   }
-  assert.equal(offerWrites, 3);
+  assert.equal(offerWrites,3);
   publicationReady = false; topupMode = "disabled";
-  await sell.page.goto(`${base}/client-market/`);
-  let offerDialog = await editOffer();
-  await offerDialog.getByText("Claim an active Provider identity first.", { exact: true }).waitFor();
-  assert.equal(await offerDialog.getByRole("button", { name: "Save", exact: true }).isDisabled(), true);
-  assert.equal(await offerDialog.getByRole("link", { name: "Open Provider center", exact: true }).getAttribute("href"), "/account/provider-settings/");
-  await offerDialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  const publicationDialog = await openOffer(expectedTrialDays);
+  const submitListing = publicationDialog.getByRole("button", { name: "List on Client Market", exact: true });
+  await submitListing.click();
+  await publicationDialog.getByRole("alert").filter({hasText:"active verified Provider identity required"}).waitFor();
   publicationReady = true; financeFailure = true;
-  offerDialog = await editOffer(); await offerDialog.getByRole("alert").waitFor();
-  financeFailure = false; await offerDialog.getByRole("button", { name: "Retry", exact: true }).click(); await waitOfferReady();
-  await offerDialog.getByRole("button", { name: "Cancel", exact: true }).click();
-  assert.equal(retiredSetupRequests, 0); topupMode = "shadow";
+  await submitListing.click();
+  await publicationDialog.getByRole("alert").filter({hasText:"Provider finance temporarily unavailable"}).waitFor();
+  financeFailure = false;
+  await submitListing.click();
+  await publicationDialog.waitFor({state:"hidden"});
+  assert.equal(offerWrites,4);
+  assert.equal(retiredSetupRequests,0); topupMode = "shadow";
   // Income is a Provider center tab, with rental settlements in Client records.
   assert.equal((await page.request.get(`${base}/account/earnings/`)).status(), 404, "no obsolete page or redirect export");
   // Income errors stay inside Income; termination reads never run here.

@@ -15,8 +15,24 @@ import {
   shopContinentForCountry,
   SHOP_CONTINENTS,
   sortShopCountries,
+  hostIsSellerListing,
+  clientMarketWorkspaceFromQuery,
+  clientMarketTenantFromQuery,
 } from "./host-utils";
 import type { ClientMarketHost, ClientMarketProvider } from "@/lib/types";
+
+test("seller listings are the viewer's hosts, and rentals open the shop tenant switch", () => {
+  assert.equal(hostIsSellerListing({ isHostOwner: true }, null), true);
+  assert.equal(hostIsSellerListing({ isHostOwner: false, hostOwnerEmail: "Owner@example.com" }, "owner@example.com"), true);
+  assert.equal(hostIsSellerListing({ isHostOwner: false, hostOwnerEmail: "other@example.com" }, "owner@example.com"), false);
+  assert.equal(clientMarketWorkspaceFromQuery("selling", null), "selling");
+  assert.equal(clientMarketWorkspaceFromQuery(null, "mine"), "selling");
+  assert.equal(clientMarketWorkspaceFromQuery("rentals", null), "catalog");
+  assert.equal(clientMarketWorkspaceFromQuery(null, null), "catalog");
+  assert.equal(clientMarketTenantFromQuery("rentals", null), true);
+  assert.equal(clientMarketTenantFromQuery(null, "rental-1"), true);
+  assert.equal(clientMarketTenantFromQuery("selling", null), false);
+});
 
 test("shop host cards keep one spec line and omit missing values", () => {
   assert.equal(hostShopSpecLine({}), "");

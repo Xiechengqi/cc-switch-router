@@ -38,24 +38,31 @@ fn database_error(error: crate::db::Error) -> AppError {
     AppError::Internal(format!("test database snapshot failed: {error}"))
 }
 
-/// Trading fixtures represent Hosts whose admission completed before the test.
-/// Health tests exercise the real signed ingestion path instead.
-pub(crate) fn admit_fixture_hosts(conn: &Connection) {
-    conn.execute(
-        "INSERT OR IGNORE INTO client_host_agents(host_id) SELECT id FROM router_ssh_hosts",
-        [],
-    )
-    .unwrap();
-    conn.execute(
-        "UPDATE client_host_agents SET admitted_hour=COALESCE(admitted_hour,0)",
-        [],
-    )
-    .unwrap();
-    conn.execute(
-        "UPDATE router_ssh_hosts SET status='idle' WHERE status='onboarding'",
-        [],
-    )
-    .unwrap();
+/// A verified installation with a fresh workspace probe.
+pub(crate) fn online_listing(conn: &Connection, id: &str, seller: &str, email: &str) {
+    conn.execute("INSERT INTO installations(id,public_key,platform,app_version,created_at,last_seen_at,
+        control_secret_b64,owner_email,owner_verified_at,client_activated_at,market_lease_v1)
+        VALUES(?1,?1,'linux','1',strftime('%FT%TZ','now'),strftime('%FT%TZ','now'),'fixture',?2,strftime('%FT%TZ','now'),strftime('%FT%TZ','now'),1)",
+        params![id,email]).unwrap();
+    conn.execute("INSERT INTO online_client_listings(installation_id,seller_id,owner_email,state,revision,
+        sequence,cycle_price_minor,updated_at,healthy,observed_at) VALUES(?1,?2,?3,'listed',1,1,0,unixepoch(),1,unixepoch())",
+        params![id,seller,email]).unwrap();
+}
+
+/// Active workspace and its accepted quote on an existing physical listing.
+pub(crate) fn online_lease(
+    conn: &Connection,
+    lease: &str,
+    installation: &str,
+    seller: &str,
+    buyer: &str,
+    start: &str,
+) {
+    conn.execute("INSERT INTO online_client_quotes(id,installation_id,buyer_id,revision,cycle_price_minor,projection_json,expires_at)
+        VALUES(?1,?2,?3,1,0,'{}',unixepoch(?4))",params![lease,installation,buyer,start]).unwrap();
+    conn.execute("INSERT INTO online_client_leases(id,installation_id,quote_id,buyer_id,tenant_email,seller_id,alias,state,sequence,grant_until,created_at,activated_at)
+        VALUES(?1,?2,?1,?3,?3||'@example.test',?4,?1,'active',2,unixepoch(?5)+366*86400,unixepoch(?5),unixepoch(?5))",
+        params![lease,installation,buyer,seller,start]).unwrap();
 }
 
 fn template() -> Result<&'static [u8], AppError> {

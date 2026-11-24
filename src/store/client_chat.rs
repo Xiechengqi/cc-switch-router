@@ -45,12 +45,15 @@ pub(crate) fn ensure_termination_chat_tx(
     let now = DateTime::parse_from_rfc3339(at)
         .map_err(|_| AppError::Internal("invalid termination chat time".into()))?
         .with_timezone(&Utc);
-    let (buyer, provider, email, label): (String,String,String,String) = conn.query_row(
-        "SELECT t.buyer_user_id,t.provider_user_id,u.email_normalized,
-            COALESCE(NULLIF(s.client_subdomain,''),t.installation_id)
+    let (buyer, provider, email, label): (String, String, String, String) = conn
+        .query_row(
+            "SELECT t.buyer_user_id,t.provider_user_id,u.email_normalized,
+            COALESCE(s.alias,t.installation_id)
          FROM client_market_terminations t JOIN users u ON u.id=t.buyer_user_id
-         LEFT JOIN client_market_subscriptions s ON s.installation_id=t.installation_id WHERE t.installation_id=?1",
-        params![installation], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))
+         LEFT JOIN online_client_leases s ON s.id=t.installation_id WHERE t.installation_id=?1",
+            params![installation],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
         .map_err(|e| AppError::Internal(format!("read termination chat parties failed: {e}")))?;
     let existing: Option<String> = conn.query_row("SELECT id FROM chat_rooms WHERE installation_id=?1 ORDER BY owner_generation DESC LIMIT 1",
         params![installation], |r| r.get(0)).optional().map_err(|e| AppError::Internal(format!("read termination chat failed: {e}")))?;

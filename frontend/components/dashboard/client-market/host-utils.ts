@@ -496,6 +496,29 @@ export function hostBelongsToViewer(host: {
   return host.isHostOwner === true || host.isClientOwner === true;
 }
 
+/** Seller table: hosts this viewer provides. Email covers a missing ownership flag. */
+export function hostIsSellerListing(
+  host: { isHostOwner?: boolean; hostOwnerEmail?: string | null },
+  viewerEmail?: string | null,
+): boolean {
+  if (host.isHostOwner === true) return true;
+  const viewer = viewerEmail?.trim().toLowerCase();
+  const owner = host.hostOwnerEmail?.trim().toLowerCase();
+  return !!viewer && !!owner && viewer === owner;
+}
+
+export type ClientMarketWorkspace = "catalog" | "selling";
+
+/** `tab=mine` still opens the seller table. Rentals stay on the shop tab. */
+export function clientMarketWorkspaceFromQuery(view: string | null, tab: string | null): ClientMarketWorkspace {
+  if (view === "selling" || tab === "mine") return "selling";
+  return "catalog";
+}
+
+export function clientMarketTenantFromQuery(view: string | null, rentalId: string | null): boolean {
+  return view === "rentals" || Boolean(rentalId?.trim());
+}
+
 export const STATUS_GROUP_MEMBERS: Record<Exclude<HostStatusFilter, "all">, readonly string[]> = {
   idle: ["idle"],
   in_use: ["allocated", "locked", "reserved"],

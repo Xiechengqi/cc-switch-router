@@ -659,13 +659,10 @@ fn client_supply(
     profile_id: &str,
 ) -> Result<Vec<MarketProviderClientSupplyView>, AppError> {
     conn.prepare(
-        "SELECT COALESCE(NULLIF(upper(trim(host.country_code)), ''), '—'),
-                SUM(CASE WHEN host.status = 'idle' THEN 1 ELSE 0 END), COUNT(*)
-         FROM host_provider_profiles provider
-         JOIN router_ssh_hosts host ON host.provider_id = provider.provider_id
-         WHERE provider.market_provider_id = ?1 AND host.status != 'disabled'
-         GROUP BY COALESCE(NULLIF(upper(trim(host.country_code)), ''), '—')
-         ORDER BY COALESCE(NULLIF(upper(trim(host.country_code)), ''), '—')",
+        "SELECT COALESCE(NULLIF(upper(trim(l.country_code)), ''), '—') AS country,
+                SUM(l.supply_status='idle'),COUNT(*)
+           FROM online_client_supply l JOIN market_provider_profiles p ON p.user_id=l.seller_id
+          WHERE p.id=?1 AND l.state='listed' GROUP BY country ORDER BY country",
     )
     .and_then(|mut statement| {
         statement
@@ -1191,28 +1188,30 @@ mod tests {
     fn public_client_detail_omits_disabled_hosts() {
         let conn = database();
         conn.execute_batch(
-            "INSERT INTO market_provider_profiles (
+            "INSERT INTO users(id,email_normalized,status,created_at,last_login_at)
+             VALUES('client-supplier','client-supplier@example.com','active','now','now');
+             INSERT INTO market_provider_profiles (
                 id, canonical_email, display_name, claim_state,
                 status, created_at, updated_at
              ) VALUES ('mp_client_supply', 'client-supplier@example.com',
                        'Client Supplier', 'unclaimed', 'active', 'now', 'now');
-             INSERT INTO host_provider_profiles (
-                provider_id, owner_email, created_at, updated_at, market_provider_id
-             ) VALUES ('client-supplier', 'client-supplier@example.com', 'now', 'now',
-                       'mp_client_supply');
-             INSERT INTO router_ssh_hosts (
-                id, ip, port, host_owner_email, country_code, status,
-                created_at, updated_at, provider_id
-             ) VALUES ('client-disabled', '203.0.113.40', 22,
-                       'client-supplier@example.com', 'US', 'disabled', 'now', 'now',
-                       'client-supplier');",
+             UPDATE market_provider_profiles SET user_id='client-supplier' WHERE id='mp_client_supply';",
+        ).unwrap();
+        crate::test_support::online_listing(
+            &conn,
+            "client-disabled",
+            "client-supplier",
+            "client-supplier@example.com",
+        );
+        conn.execute(
+            "UPDATE online_client_listings SET state='unlisted',country_code='US'",
+            [],
         )
-        .expect("seed disabled public Client supply");
-        crate::test_support::admit_fixture_hosts(&conn);
+        .unwrap();
         assert!(client_supply(&conn, "mp_client_supply").unwrap().is_empty());
 
         conn.execute(
-            "UPDATE router_ssh_hosts SET status = 'idle' WHERE id = 'client-disabled'",
+            "UPDATE online_client_listings SET state='listed' WHERE installation_id='client-disabled'",
             [],
         )
         .expect("enable public Client supply");
@@ -1223,7 +1222,7 @@ mod tests {
         assert_eq!(supply[0].total_hosts, 1);
 
         conn.execute(
-            "UPDATE router_ssh_hosts SET country_code = NULL WHERE id = 'client-disabled'",
+            "UPDATE online_client_listings SET country_code=NULL WHERE installation_id='client-disabled'",
             [],
         )
         .expect("clear Client Host country");

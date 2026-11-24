@@ -124,24 +124,6 @@ function allowedLegacyAssertion(relativePath, source, index, ruleName) {
     }
   }
   if (
-    relativePath === "src/client_market.rs"
-    && [
-      "Client rental period field",
-      "Client prepaid price field",
-      "product prepaid period end",
-      "product payment deadline",
-      "product payment declaration timestamp",
-      "legacy Client invoice table",
-      "legacy Client payment declaration table",
-    ].includes(ruleName)
-  ) {
-    const declaration = "fn schema_excludes_legacy_prepaid_billing_contract()";
-    const start = source.indexOf(declaration);
-    if (start >= 0 && index >= start && index < start + extractRustBlock(source, declaration).length) {
-      return true;
-    }
-  }
-  if (
     relativePath === "src/share_market.rs"
     && (ruleName === "product billing period unit" || ruleName === "product billing period count")
   ) {
@@ -223,7 +205,7 @@ function main() {
   }
   const main = read("src/main.rs"), api = read("frontend/lib/api.ts"), types = read("frontend/lib/types.ts");
   const settings = read("src/admin/settings.rs"), access = read("src/market_access.rs");
-  const trade = read("src/client_market_trade.rs"), share = read("src/share_market.rs");
+  const trade = read("src/market_provider_contacts.rs"), online = read("src/online_client_market.rs"), share = read("src/share_market.rs");
   for (const [label, source, forbidden] of [
     ["runtime", main, /binance_settlement|mod market_billing|mod market_recurring|run_market_billing_worker/],
     ["Settings", settings, /CC_SWITCH_ROUTER_BINANCE|Binance settlement/],
@@ -235,10 +217,10 @@ function main() {
     ["access runtime", access.split("#[cfg(test)]")[0], /market_credit_accounts|market_credit_grants|market_prepaid_accounts/],
   ]) if (forbidden.test(source)) errors.push(label + " revives retired finance");
   for (const [label, block] of [
-    ["Client rental", extractRustBlock(trade, "pub struct RentalView")],
+    ["Client rental", extractRustBlock(online, "async fn mine(")],
     ["Share subscription", extractRustBlock(share, "pub struct SubscriptionView")],
     ["Share listing", extractRustBlock(share, "pub struct ListingView")],
-    ["Client rental DTO", extractTypeBlock(types, "ClientMarketRental")],
+    ["Client rental DTO", extractTypeBlock(read("frontend/lib/online-client-market.ts"), "OnlineLease")],
     ["Share subscription DTO", extractTypeBlock(types, "ShareMarketSubscription")],
   ]) assertProductDtoIsRedacted(errors, label, block);
   for (const [label, source, required] of [
@@ -247,7 +229,7 @@ function main() {
     ["wallet lifecycle", read("src/market_platform_contracts.rs"), ["cancel_at_period_end_tx", "terminate_after_cleanup_inner_tx", "fail_activation_tx"]],
     ["independent FX", read("src/market_fx.rs"), ["/v1/market/config", "fxRateFresh", "no-store"]],
     ["contact separation", trade, ["FROM market_provider_contacts", "INSERT INTO market_provider_contacts"]],
-    ["Client charge history", extractRustBlock(trade, "pub async fn client_market_host_usage_history"), ["market_platform_periods", "market_usage_posting_batches", "refunded_units"]],
+    ["Client charge history", read("src/client_market_audit.rs"), ["market_platform_periods", "market_usage_posting_batches", "refunded_units"]],
     ["trial renewal UI", read("frontend/components/dashboard/account-share-rentals.tsx"), ["subscription.walletContract?.id", "MarketWalletRenewalCard"]],
   ]) for (const item of required) if (!source.includes(item)) errors.push(label + " is missing " + item);
   const redaction = extractRustBlock(share, "fn redact_public_subscription");

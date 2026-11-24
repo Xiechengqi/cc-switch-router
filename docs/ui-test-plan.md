@@ -18,7 +18,7 @@
 
 **判断要不要更新本文件的最快方法**:`grep` 你改动的文件名,§18 会告诉你哪些用例受影响。
 
-现状：前端通过 `tsx --test` 覆盖状态和计算逻辑，后端有 Rust 内联测试和静态契约审计。购买弹窗的浏览器回归使用 `npm run test:client-checkout-browser`（先启动 `npm run dev -- --hostname 127.0.0.1 --port 3127`；可设置 `CHECKOUT_TEST_URL`、`CHROME_BIN`、`CHECKOUT_ARTIFACTS`）。该脚本 mock 全部业务 API，不执行 SSH 或真实付款；其余浏览器交互按本清单回归。
+现状：前端通过 `tsx --test` 覆盖状态和计算逻辑，后端有 Rust 内联测试和静态契约审计。购买弹窗的浏览器回归使用 `npm run test:client-checkout-browser`（先运行前端生产构建，脚本会在本机回环地址读取静态导出和模拟数据）。该脚本 mock 全部业务 API，不执行 SSH 或真实付款；其余浏览器交互按本清单回归。
 
 ---
 
@@ -48,12 +48,12 @@ cd frontend && npm run dev     # /v1/* 代理到 CC_SWITCH_ROUTER_DEV_API_TARGET
 |---|---|
 | 匿名访客 | `DEV_AUTH_BYPASS=0` 且不登录 |
 | 普通登录用户 | 邮箱验证码登录,或 `CC_SWITCH_ROUTER_DEV_AUTH_EMAIL=user@test` |
-| 供给方 Host Provider | 该邮箱名下登记过主机 |
+| 供给方 Provider | 该账号已验证并从 Clients 页上架自己的 Client |
 | 租客 Renter | 该邮箱租用中有 Client |
 | 管理员 Admin | 邮箱在 `CC_SWITCH_ROUTER_ADMIN_EMAILS` 中 |
 | 官方供给方 | 邮箱 = `CC_SWITCH_ROUTER_OWNER_EMAIL` |
 
-**角色可叠加。** 同一用户既是供给方又是租客是常见情况,`is_host_owner` / `is_client_owner` 是**逐主机行**计算的,不是用户属性。用例 H-30 专门覆盖这个叠加场景。
+同一账号可以上架自己的 Client，也可以租用他人的 Client。市场逐项判断上架所有权，账户页按买家和卖家分别查询租约（H-40、R-12）。
 
 ---
 
@@ -70,8 +70,8 @@ cd frontend && npm run dev     # /v1/* 代理到 CC_SWITCH_ROUTER_DEV_API_TARGET
 | `/account/share` | ❌ | ✅ 只读监控 | ✅ | ✅ | ✅ 无特权 |
 | `/account/market-readiness` | ❌ | ✅ 聚合摘要 | ✅ 供应商待办 | ✅ 聚合摘要 | ✅ 聚合摘要 |
 | `/account/billing` | ❌ | ✅ 应付/策略 | ✅ 应收/策略 | ✅ 应付 | ✅ 含争议裁决 |
-| `/client-market` 主机表 | ✅ 只读 | ✅ 空表 | ✅ 全功能 | ✅ 空表 | ✅ 无特权 |
-| `/rentals` | ❌ 提示登录 | ✅ 空 | ✅ 空 | ✅ 有数据 | ✅ |
+| `/client-market` 在线供给 | ✅ 浏览 | ✅ 浏览与租用 | ✅ 管理自己的上架项 | ✅ 管理自己的租约 | ✅ 按当前账号权限 |
+| `/account/rentals/?market=client` | ❌ 提示登录 | ✅ 空 | ✅ 空 | ✅ 有数据 | ✅ |
 | `/account` | ❌ | ✅ | ✅ | ✅ | ✅ |
 | `/settings` | ❌ | 部分只读 | 部分只读 | 部分只读 | ✅ 全功能 |
 | `/metrics` | ❌ | ❌ 提示 | ❌ 提示 | ❌ 提示 | ✅ |
@@ -102,15 +102,11 @@ location.reload();
 | 公告 | `..._announcement_dismiss_today_v1`, `..._dismiss_permanent_v1` |
 | Clients 页 | `..._client_status_v1`, `..._client_sort_v1`, `..._client_expanded_v2`, `..._client_regions_v2`, `..._client_region_v1` |
 | 旧 `/markets` 兼容路径 | 无 active localStorage；只验证跳转不残留旧筛选状态 |
-| Client Market | `..._owner_scope_v2`, `..._status_filter_v2`, `..._sort_v2`, `..._region_filter_v1`, `..._payment_filter_v1` |
-| 添加主机 | `cc-switch.client-market.add-host.mode`, `...ssh-key-open` |
-| 新建 Client | `..._create_client_providers_v2`, `..._create_client_regions_v2` |
-| 窗口 | `..._console_windows_v1/v2`, `..._web_terminal_windows_v1`(sessionStorage) |
+| 窗口 | `..._console_windows_v1/v2`（sessionStorage） |
 | Share 页 | `cc_switch_share_api_email_v1`, `cc_switch_share_api_token_v1` |
 | Client 升级 | `cc_switch_router_client_upgrade_v3:<installationId>`（sessionStorage；只存 starting/recovering/running。旧 `v2` 失败闩读取后丢弃） |
 | 其他 | `..._chat_anon_visits_v1`, `..._map_request_ticker_expanded_v1`, `cc-switch-router-client-upgrade-state` |
 
-> **注意版本号后缀**。`owner_scope_v2` / `sort_v2` / `status_filter_v2` 是近期升版的键;老用户升级后会被重置一次,用例 H-01 覆盖这个首次进入行为。
 
 ---
 
@@ -300,174 +296,36 @@ location.reload();
 
 ---
 
-## 7. Client Market 主机表(H)
+## 7. Client Market 在线供给（H）
 
-覆盖 `client-market-page.tsx` 与 `client-market/*`。**本区域近期重构过,用例需与代码同步核对。**
+环境由用户按[空环境验收计划](client-market-online-client-leasing-plan.md)手动准备。
 
-轮询 20 秒;弹窗/批量/行内忙时暂停。
+| ID | 步骤 | 预期 |
+|---|---|---|
+| H-01 | 从市场查看在线 Client，按出口地区筛选 | 卡片展示最近探测、24 小时可用小时、出口与硬件快照 |
+| H-20 | 已验证卖家在 Clients 页选择自己的在线 Client，填写免费或付费条款并确认 | 支持 `marketLeaseV1`、满足上架条件的 Client 经工作区锁定确认后出现在市场 |
+| H-26 | 分别用符合和不符合付费发布条件的卖家提交月价 | Router 检查已验证的 Provider 身份。符合条件的报价独立于官方充值渠道的开关 |
+| H-31 | 卖家、租户、Router owner 分别打开同一上架项 | 卖家可管理自己的供给。租期内租户只能进入自己的工作区。物理终端由安装方 owner 认证 |
+| H-40 | 从账户页查看已出租、空闲和已退租的记录 | 活跃供给可定位市场卡片，历史租约保留原买卖双方和成交价格 |
 
-### 7.1 归属范围与默认态
+## 8. 我的租用（R）
 
-| ID | 前置 | 步骤 | 预期 |
-|---|---|---|---|
-| H-01 | 清空 localStorage,已登录 | 打开 `/client-market` | **默认只显示自己的主机**(scope=mine);排序默认按状态严重度 |
-| H-02 | 承 H-01,自己无主机 | 观察空态 | 提示「还没有登记主机」+「浏览全部供给」链接 |
-| H-03 | 承 H-02 | 点「浏览全部供给」 | 切到全部供给,表格显示他人主机 |
-| H-04 | 已登录 | 点工具栏「查看全部供给」 | 切换到全部;按钮文案变为「只看我的主机」 |
-| H-05 | 承 H-04 | 刷新页面 | 保持在「全部供给」(scope 持久化) |
-| H-06 | 匿名(需关旁路) | 打开 `/client-market` | 显示全部供给(mine 对匿名降级为全部);无「查看全部」按钮 |
-| H-07 | 任意 | 用表头 Owner 多选筛选 | scope 转为 custom;工具栏按钮文案随之变化 |
-
-### 7.2 筛选、排序、分页
-
-| ID | 前置 | 步骤 | 预期 |
-|---|---|---|---|
-| H-10 | 有多状态主机 | 点 4 个状态 tab | 全部/空闲/使用中/需关注 分组正确;`需关注` tab 未选中时为琥珀色 |
-| H-11 | 有主机 | 观察默认排序 | 顺序为 unreachable → abnormal → draining → locked → reserved → disabled → allocated → idle |
-| H-12 | 有主机 | 连点某列表头 3 次 | 升序 → 降序 → 清除排序(回到 owner→ip→id 稳定序) |
-| H-13 | 有主机 | 逐列验证排序 | status / region / owner / offer / subdomain / ip 六列均可排 |
-| H-14 | 有多区域 | 用表头 Region 多选 | 按国家码过滤;持久化 |
-| H-15 | 任意 Host | 检查筛选及商品行 | 无商家收款方式或直付入口，付费统一使用平台余额 |
-| H-16 | >10 台主机 | 使用分页 | 上一页/下一页/页码按钮;首尾页对应按钮 disabled |
-| H-17 | 承 H-16 | 改变任一筛选或排序 | 页码重置为 1 |
-| H-18 | 筛选无结果 | 点「清除筛选」 | 状态/区域/支付筛选清空,**scope 回到 mine** |
-
-### 7.3 添加主机
-
-| ID | 前置 | 步骤 | 预期 |
-|---|---|---|---|
-| H-20 | 匿名 | 点「添加主机」 | 触发登录弹窗;登录后**自动重新打开**添加弹窗 |
-| H-21 | 已登录 | 打开添加弹窗 | 双 tab:密码 / 手动密钥;记住上次选择 |
-| H-22 | 密码模式 | 填 IP + root 密码 → 测试连接 | 成功/失败以 toast 或内联错误反馈 |
-| H-23 | 密码模式 | 提交 | 4 步进度:安装密钥 → 连通性 → IP 情报 → 注册 |
-| H-24 | 手动模式 | 展开 SSH Key 折叠区 | 显示 `authorized_keys` 安装命令 + 复制按钮;展开态持久化 |
-| H-25 | 手动模式 | 提交 | **跳过安装密钥步**,3 步进度 |
-| H-26 | 未配置收款资料 | 填写付费报价 | 琥珀色提示 + 跳转账户页链接;阻止提交 |
-| H-27 | 任一步失败 | 点「返回」 | 回到表单,步骤状态重置,可修改后重试 |
-| H-28 | 成功后 | 观察 | 成功态标题;关闭后表单重置,密码字段清空 |
-| H-29 | 免费报价 | 分别输入 1、365、0、366 天并切换永久 | 1/365 可提交；0/366 前后端拒绝；永久请求省略 `freeDurationDays` |
-
-### 7.4 角色与权限
-
-| ID | 前置 | 步骤 | 预期 |
-|---|---|---|---|
-| H-30 | **既出租又租用**的账号 | 打开主机表 | 自有主机有完整操作;租用的主机行无供给方操作 |
-| H-31 | 管理员(非主机属主) | 打开他人主机行 | **无** Edit Offer / Cleanup / Delete / 终端(管理员不被提升) |
-| H-32 | 匿名 | 观察他人主机行 | 可见 IP、区域、报价、状态、子域名;**不可见**端口、指纹、备注、最后错误 |
-
-### 7.5 行内操作
-
-| ID | 前置 | 步骤 | 预期 |
-|---|---|---|---|
-| H-40 | 主机 `idle` 且是属主 | 观察行 | 显示「新建 Client」按钮 |
-| H-41 | 非 idle | 观察行 | 无「新建 Client」按钮 |
-| H-42 | 属主 | 打开操作菜单 | 按状态显示可用项(见下表) |
-| H-43 | 属主 | Edit Offer → 改价 → 保存 | 报价更新;未配置收款时付费报价被阻止 |
-| H-44 | 状态 unreachable/disabled/abnormal | Reverify | 执行重新校验 |
-| H-45 | 有 installation 且 allocated/unreachable/draining | Cleanup | 二次确认(danger)→ 进度弹窗显示阶段与日志 |
-| H-46 | 状态 unreachable/draining | 观察 Cleanup 文案 | 显示为「重试清理」 |
-| H-47 | allocated 且非自己租用 | Cleanup 并勾选拒绝后续访问 | 普通 Provider 可同时把该买家的 Client Host 产品规则设为拒绝；不撤销整段关系,也不写入欠款事实 |
-| H-48 | 无 installation 且 idle/disabled/abnormal | Delete | 二次确认(danger)后删除 |
-| H-49 | 清理进行中 | 尝试关闭进度弹窗 | 关闭按钮 disabled;任务成功或失败后才可关 |
-| H-50 | 有备注的主机 | 观察 | 备注以子行展示;**无备注则不出现空子行** |
-| H-51 | 已登录买家不在 Host owner 白名单,主机 idle | 点「新建」 | 弹出中性授权引导而非红色英文错误，明确只有白名单用户可使用；显示 owner 邮箱及其 WeChat/Telegram/自定义联系方式，邮件按钮打开 `mailto:`；quote 或 commit 阶段撤销准入也回到同一弹窗 |
-| H-52 | 免费 Host 获取 Quote 后 Owner 修改期限 | 提交原 Quote | Client 使用 Quote 冻结的旧期限；Host 新期限只影响后续 Quote，`offerRevision` 已递增 |
-| H-53 | 免费 Client provisioning 成功 | 查看租约与 Account Client | 激活/到期从开通成功时计算并展示；永久租约无到期时间 |
-| H-54 | 免费 Client 到期 | 等待 20 秒对账 | 产生一次临期/到期事件并启动 `free_period_expired` cleanup；失败时租用结束、Host 保持隔离，只有远端清理验证成功后 Host 才回 idle |
-| H-55 | Quote 同时含免费和付费 Host | 进入最终确认阶段 | 每台显示 Owner 与冻结报价；统一说明免费期限从激活开始、付费 Host 独立享受 12 小时健康试用，并按各供应商账户分别聚合 Share/Host 费用 |
-
-**操作可用性矩阵**(行=主机状态,列=菜单项;均需 host owner):
-
-| 状态 | Edit Offer | Reverify | Cleanup | Delete |
-|---|:--:|:--:|:--:|:--:|
-| idle | ✅ | — | — | ✅ |
-| allocated | ✅ | — | ✅ | — |
-| draining | ✅ | — | ✅(重试) | — |
-| unreachable | ✅ | ✅ | ✅(重试) | — |
-| abnormal | ✅ | ✅ | — | ✅ |
-| disabled | ✅ | ✅ | — | ✅ |
-
-### 7.6 选择模式与批量
-
-| ID | 前置 | 步骤 | 预期 |
-|---|---|---|---|
-| H-60 | 有主机 | 点「选择」 | 进入选择模式,出现复选框列与批量工具栏 |
-| H-61 | 选择模式 | 点表头复选框 | 三态:全选本页 / 部分为不确定态 / 再点取消本页 |
-| H-62 | 选择模式 | 点「全选筛选结果」 | 跨页选中所有可见主机 |
-| H-63 | 选择模式 | 点「本页」/「清除」 | 相应增减选择 |
-| H-64 | 选中若干 | 观察 4 个批量按钮 | 各显示「可执行 N / 已选 M」;可执行为 0 时 disabled |
-| H-65 | 选中含不可清理项 | 批量清理 | 确认框显示将执行数与跳过数 |
-| H-66 | 承 H-65 | 确认 | 进度弹窗逐条显示 排队/执行中/成功/失败/跳过 |
-| H-67 | 批量部分失败 | 结束后观察 | toast 汇总;**保持选择模式且只选中失败项**便于重试 |
-| H-68 | 批量全部成功 | 结束后观察 | 退出选择模式,选择清空 |
-| H-69 | 批量进行中 | 尝试操作 | 所有批量按钮与复选框 disabled;后台轮询暂停 |
-| H-70 | 选择模式 | 退出登录 | 自动退出选择模式并清空选择 |
-| H-71 | 选中后改筛选 | 观察 | 离开筛选范围的选择被自动丢弃 |
-
-### 7.7 导入导出
-
-| ID | 前置 | 步骤 | 预期 |
-|---|---|---|---|
-| H-80 | 有自有主机 | 点导出 | 弹窗显示行格式文本 + 复制按钮 |
-| H-81 | 选择模式选中若干 | 点「导出所选」 | 仅导出可导出项;完成后清空选择 |
-| H-82 | 任意 | 点导入 → 粘贴合法文本 → 提交 | 显示导入结果:成功/跳过/失败计数与逐条明细 |
-| H-83 | 导入非法行 | 提交 | 指出出错行,不整体失败 |
-| H-84 | 导入超 1MB | 提交 | 拒绝并提示 |
-
----
-
-## 8. 我的租用(R)
-
-覆盖 `client-market/rentals-page.tsx`、`my-rentals-panel.tsx`、`client-market-rental-banner.tsx`、`client-market/release-rental-action.tsx`
-
-### 8.1 租用列表
-
-| ID | 前置 | 步骤 | 预期 |
-|---|---|---|---|
-| R-01 | 未登录 | 打开 `/rentals` | 提示登录,不发数据请求 |
-| R-02 | 登录但无租用 | 打开 | 虚线空态卡片 |
-| R-03 | 有租用 | 打开 | 每条租用一张卡:国旗、子域名、主机状态、供给方邮箱与释放入口 |
-| R-04 | **既出租又租用** | 打开 | **只显示自己租的**,自己出租给别人的不出现 |
-| R-05 | 付费租用 | 观察 | 只显示跳转统一 Market Billing 的入口；无单商品金额、付款倒计时或付款声明按钮 |
-| R-06 | 承 R-05 | 点 Market Billing | 跳转 `/account/billing/`；尚未出账时只显示供应商赊账账户，不显示完整收款账号/二维码 |
-| R-07 | 已生成聚合账单 | 在 Account Billing 打开当前账单 | 显示冻结的收款方式、二维码、总金额、截止时间及多个服务明细 |
-| R-11 | 供给方中途改价 | 刷新租用与账务 | 既有服务合约仍按租用时快照费率计费；新报价只影响后续租用 |
-| R-12 | 任意 | 保持 20 秒 | 自动刷新 `/v1/client-market/my-rentals`；不请求任何旧 Client 商品账单接口 |
-
-### 8.2 释放(任何状态均可发起)
-
-释放入口常驻卡片,**不依赖是否已出聚合账单**。释放只终止后续计费并清理 Client；已产生但尚未出账的余额会进入最终聚合账单。
-
-| ID | 前置 | 步骤 | 预期 |
-|---|---|---|---|
-| R-20 | 付费租用仍处于试用或累计阶段 | 打开 `/rentals` | 卡片上有释放入口 |
-| R-21 | **免费租用**(无价格) | 打开 | 同样有释放入口 |
-| R-22 | 已存在聚合账单 | 打开 | 释放入口与 Market Billing 跳转并存；释放不改写已生成账单 |
-| R-23 | 任一可释放状态 | 点释放 | 二次确认(danger),明确隧道立即停用、远程安装被清理且数据可能永久丢失 |
-| R-24 | 承 R-23 | 点取消 | 无任何请求发出 |
-| R-25 | 承 R-23 | 点确认 | 进入**清理进度弹窗**,显示阶段 chip + 实时作业日志 |
-| R-26 | 承 R-25 | 观察阶段推进 | 依次经过 stop → wipe → purge,阶段 chip 随之更新 |
-| R-27 | 承 R-25 | 清理进行中尝试关闭弹窗 | 关闭按钮 **disabled**,点遮罩也不关 |
-| R-28 | 承 R-25 | 清理成功 | 绿色完成文案 + 成功 toast;关闭按钮可用;列表中该租用消失 |
-| R-29 | 承 R-25 | 清理失败 | 红色失败指引按安全的错误类别展示，不在 toast 中暴露原始 SSH 输出；关闭按钮可用 |
-| R-30 | 承 R-29 | 查看租用列表 | 租用已结束且不会阻止新租用；Host 仍隔离并留在列表显示清理原因与下次检查时间，未验证干净前不回 idle |
-| R-31 | Host 恢复可达且仍有原安装 | 等待自动检查 | 仅当固定 SSH 指纹、远端安装 ID 和域名均匹配时继续 stop → wipe → purge；失败次数沿用原退避预算，不会无限重试；绑定不符交由 Provider 处理 |
-| R-32 | 状态 releasing | 观察 | 显示释放中;**卡片不再显示释放入口**(已有作业在跑) |
-| R-33 | 清理超时(>3.6 分钟无终态) | 观察 | 超时 toast,不无限转圈 |
-| R-34 | 释放进行中 | 直接刷新页面 | 不崩溃;后台作业继续,状态由轮询反映 |
-| R-35 | Account Billing 中查看该服务明细 | 释放 Client | 只能返回租用页发起释放；账单对话框不提供商品生命周期操作 |
-| R-36 | 旧记录为 `release_failed`、Host 隔离且隧道已禁用 | 运行后台对账 | 无活动清理任务时租用变为已结束，保留原失败时间，Host 仍隔离；重复对账不产生重复迁移 |
-
----
+| ID | 步骤 | 预期 |
+|---|---|---|
+| R-01 | 用买家账号打开租约别名，切换到其他账号再访问 | 登录票据绑定当前买家和租约。过期或已退租的别名拒绝访问 |
+| R-12 | 在市场和账户页切换当前租用及历史记录 | 记录按当前账号分页读取，切换账号即清除上一个账号的详情 |
+| R-20 | 预览退租后确认，重复提交并查询钱包与历史 | 公网入口立即关闭，退款和赔付按同一次截止时间计算一次 |
+| R-21 | 清理期间让 Client 离线后恢复，再检查供给和第三方车位 | Router 核对 Server 工作区、消费和清理回执，再恢复可租状态 |
+| R-32 | 从历史打开争议和赔付记录 | 以原租约身份处理。Owner 审计可查看冻结身份和独立的租金、退款与赔付 |
 
 ## 9. 账户(AC)
 
-覆盖 `account-page.tsx`。收款资料直接影响付费报价能否发布,是 Client Market 的前置。
+覆盖 `account-page.tsx`。在线 Client 的付费供给要求已认领并验证的 Provider 身份，条件见 H-26。
 
 | ID | 前置 | 步骤 | 预期 |
 |---|---|---|---|
 | AC-01 | 已登录 | 打开 `/account` | 显示收款资料；市场准入与授信由独立导航进入 `/account/market-access` |
-| AC-02 | 未配置 | 观察 | 空态;Client Market 发布付费报价时会被此状态阻止(见 H-26) |
+| AC-02 | 未配置 | 观察 | 检查账户空态。在线 Client 发布付费报价的准入单独按 H-26 验证 |
 | AC-03 | 任意 | 添加支付宝 | 填账号 → 保存 → 重新加载后仍在 |
 | AC-04 | 任意 | 添加微信 | 同上 |
 | AC-05 | 任意 | 添加币安 | 同上 |
@@ -479,7 +337,7 @@ location.reload();
 | AC-11 | 承 AC-10 | 上传 >4MB 或超 4096px 的图 | 拒绝并提示 |
 | AC-12 | 承 AC-10 | 上传非图片文件 | 拒绝 |
 | AC-13 | 已配置多种 | 删除其中一种 | 该方式消失;其余保留;二维码资产同步清理 |
-| AC-14 | 已配置 | 保存后立刻去 Client Market 发布付费报价 | 不再被阻止(与 H-26 呼应) |
+| AC-14 | 已配置 | 保存后返回账户 | 保存结果可见 |
 | AC-15 | 仍有付费报价、活跃服务、余额或未结账单 | 尝试清空全部收款方式 | 后端拒绝并说明必须先清理市场账务依赖 |
 | AC-16 | 已移除付费报价且所有账务依赖结清 | 清空全部收款方式 | 保存成功；免费商品和市场准入关系不受影响 |
 | AC-17 | 无收款方式 | 观察 | 显示收款资料空态；市场准入关系仍在 `/account/market-access` 管理 |
@@ -546,30 +404,13 @@ location.reload();
 
 覆盖 `web-terminal/*`(6 文件)与 `client-console/*`(6 文件)。两者是**独立的窗口系统**,上限各自为 5。
 
-### 10.1 Web 终端
+### 10.1 Client 终端
 
-| ID | 前置 | 步骤 | 预期 |
-|---|---|---|---|
-| T-01 | **主机属主** | 点行内终端图标 | 打开终端窗口并连接 |
-| T-02 | 租客(非属主) | 观察该主机行 | **无终端入口** |
-| T-03 | 管理员(非属主) | 观察 | **无终端入口** |
-| T-04 | 已开终端 | 拖动标题栏 / 拖右下角 | 移动与缩放,限制在视口内;最小 420×280 |
-| T-05 | 已开终端 | 点最小化 / 最大化 / 关闭 | 分别进 dock / 全屏 / 关闭 |
-| T-06 | 已开终端 | 按 Esc | 最大化时还原;普通态关闭 |
-| T-07 | 已开终端 | 点窗口外空白 | 最小化到 dock |
-| T-08 | 开 5 个终端后再开 | 观察 | 提示达到上限(前端窗口上限 5) |
-| T-09 | 有终端 | 切到非 shell 路由 | 自动最小化并 toast 提示 |
-| T-10 | 有终端 | 刷新页面 | dock 中以「已挂起」态恢复,点击可重连 |
-| T-11 | dock | 点垃圾桶 | 关闭全部终端 |
-| T-13 | 终端空闲 20 分钟 | 观察 | 服务端断开(`IDLE_TIMEOUT`);连续 2 小时也会断(`MAX_SESSION_DURATION`) |
-| T-14 | **同时开第 3 个终端** | 观察 | **前端允许开窗,但后端每用户并发会话上限为 2**,第 3 个连接应失败并给出可理解的错误 |
-| T-15 | 打开终端后最小化,静置 >60 秒再点开 | 观察 | ticket TTL 为 60 秒,过期后需重新签发;不应静默卡住 |
-| T-16 | 终端已连接 | 输入 `ls` 等命令 | 正常回显;中文输出不乱码 |
-| T-17 | 终端已连接 | 调整窗口大小 | 终端列宽随之 resize,不错行 |
-| T-18 | 终端已连接 | 断开网络再恢复 | 显示断开状态,不静默假死 |
-| T-19 | 多个终端 | 点击不同窗口 | 焦点窗口置顶;dock 中焦点项高亮 |
-
-> **T-14 是一处前后端上限不一致**:前端 `MAX_WEB_TERMINAL_WINDOWS = 5`(`web-terminal-manager.tsx:23`),后端 `MAX_SESSIONS_PER_OWNER = 2`(`src/client_market_terminal.rs:35`)。测试时确认第 3 个窗口的失败提示是否清晰;若表现为静默失败,应作为缺陷记录。
+| ID | 步骤 | 预期 |
+|---|---|---|
+| T-01 | 从 Clients 页打开卖家自己的物理 Client 终端并登录 | 在 Client 控制台使用 Server 的本机 owner 凭据 |
+| T-02 | 租户从租约别名尝试进入终端 | Server 拒绝，租户工作区仍可使用 |
+| T-03 | Router owner 使用委托票据打开已上架 Client 的物理终端 | 要求安装方独立 owner 认证 |
 
 ### 10.2 客户端控制台(iframe)
 
@@ -845,36 +686,14 @@ location.reload();
 
 ---
 
-## 17. 新建 Client 报价流(Q)
+## 17. 在线 Client 报价（Q）
 
-`create-client-dialog.tsx` 逻辑最密集,单列一组。
-
-| ID | 前置 | 步骤 | 预期 |
-|---|---|---|---|
-| Q-01 | 未登录 | 点「选择主机」 | 触发登录,不发报价请求 |
-| Q-02 | 已登录 | 在线模式选供给方 + 区域 + 数量 | 数量上限 2;容量不足时提示且按钮 disabled |
-| Q-03 | 已登录 | 手动模式 | 只显示安装命令 + 复制按钮 |
-| Q-04 | 从主机行进入 | 观察 | 直接获取报价并进入配置确认，不重复选择 Host，不显示支付品牌图标 |
-| Q-05 | 获取报价后 | 观察倒计时 | 120 秒资源暂留，≤30s 提醒；倒计时不逐秒读屏播报 |
-| Q-06 | 报价中 | 填子域名 | 350ms 防抖校验可用性;字段级错误和可用状态文案 |
-| Q-07 | 报价中 | 点骰子 | 生成合法随机子域名 |
-| Q-08 | 报价中 | 填非法子域名(<6 位 / 含 `--` / 保留字 admin) | 校验拒绝 |
-| Q-09 | 报价中 | 两项填相同子域名 | 重复检测报错 |
-| Q-10 | 报价中,已填写内容 | **等待过期** | 停留确认页保留字段；明确点击重新确认，按 Host 恢复草稿 |
-| Q-11 | 报价中 | 点返回 | 取消报价,主机释放回池 |
-| Q-12 | 报价有效期内 | 点确认创建 | 重新校验全部子域名后提交 |
-| Q-13 | 创建中 | 尝试关闭 | 不可关闭；显示安装/等待连接状态，日志默认折叠 |
-| Q-14 | 部分失败 | 观察完成态 | 逐项结果与成功 Client 入口；失败不宣称清理或退款已完成 |
-| Q-15 | Provider 历史资料包含 Binance | 打开指定 Host | 无商家支付图标、支付筛选或直付入口 |
-| Q-16 | 钱包试用/试用耗尽/免费 | 打开确认 | 分别显示真实剩余试用及首次扣费条件、当期预留、免费期限；免费隐藏钱包与续费 |
-| Q-17 | 余额不足 | 充值后返回 | 单一充值主按钮，重取报价；域名和续费选择保留，密码重新填写，不自动提交 |
-| Q-18 | 余额在报价后被使用 | 确认创建 | 结构化钱包错误，保留字段，重新报价后明确确认 |
-| Q-19 | 提交结果未知 | 断网或服务端 5xx 后重试 | 冻结已提交配置，原幂等键重试，不被报价倒计时强制换单 |
-| Q-20 | 钱包租约 | 查看租用详情 | 剩余试用、续费/到期、暂停与资金核对状态准确，不进入旧供应商账单 |
-| Q-21 | 320/375/414/768px，中英文 | 完整购买流程 | 无横向溢出，主按钮可见，键盘可操作，详情/日志可折叠 |
-
-
----
+| ID | 操作 | 预期 |
+|---|---|---|
+| Q-01 | 未登录时浏览市场，随后登录并选择一台可租 Client | 登录后可确认权限说明并请求报价 |
+| Q-02 | 分别请求免费与付费报价 | 展示本次试用天数或剩余试用、月价、余额缺口和适用的退租规则 |
+| Q-03 | 重试已确认报价，或由两个买家同时提交同一上架项的报价 | 同一报价返回同一租约，每台 Client 只分配给一个买家 |
+| Q-04 | 通过账户中的管理链接打开市场页 | 页面把焦点放在对应的上架项或买家租约 |
 
 ## 18. 反查索引:改了文件 → 重跑哪些用例
 
@@ -895,20 +714,9 @@ location.reload();
 | `dashboard/share-market/listing-pricing-card.tsx` | S-54~S-57 |
 | `dashboard/account-share-page.tsx` | AS-01~AS-08 |
 | `dashboard/account-client-page.tsx` | 账户 Client 只读监控(镜像 AS) |
-| `dashboard/client-market-page.tsx` | H-01~H-18(归属/筛选/排序/分页), H-60~H-71(选择与批量), H-80~H-84(导入导出) |
-| `client-market/host-utils.ts` | H-10~H-13, H-42(矩阵), H-64 |
-| `client-market/host-row.tsx` | H-40~H-51, T-01~T-03 |
-| `client-market/add-host-dialog.tsx` | H-20~H-29 |
-| `client-market/host-offer-dialog.tsx` | H-43, H-26 |
-| `client-market/host-sort-header.tsx` | H-12~H-15 |
-| `client-market/use-batch-operations.ts` | H-60~H-71 |
-| `client-market/rentals-page.tsx` | R-01~R-04, R-12, R-34 |
-| `client-market/my-rentals-panel.tsx` | R-03, R-04, R-20~R-22, R-32 |
-| `dashboard/client-market-rental-banner.tsx` | R-05~R-07, R-11, R-30, R-35 |
-| `client-market/release-rental-action.tsx` | R-23~R-35 |
-| `dashboard/create-client-dialog.tsx`、`dashboard/client-market/client-checkout-form.tsx`、`lib/client-checkout.ts` | C-19, H-40, Q-01~Q-21 |
-| `dashboard/market-wallet-renewal-card.tsx`、`dashboard/client-market-rental-banner.tsx` | Q-20 |
-| `dashboard/web-terminal/*` | T-01~T-19 |
+| `dashboard/client-market-page.tsx`、`client-market/online-market.tsx` | H-01、H-20、H-26、H-31、Q-01~Q-04 |
+| `dashboard/account-client-section.tsx`、`client-market/rental-records.tsx` | H-40、R-01、R-12、R-32 |
+| `market/client-termination-dialog.tsx`、`client-market/rental-audit-panel.tsx` | R-20、R-21、R-32 |
 | `dashboard/client-console/*` | C-15, T-30~T-36 |
 | `dashboard/share-edit-dialog.tsx`, `share-edit/*` | S-08~S-25, S-47~S-53, S-58, S-59~S-65 |
 | `dashboard/share-connect-dialog.tsx` | S-01~S-07 |
@@ -952,8 +760,8 @@ location.reload();
 | 域 | 代表 API 函数 | 覆盖用例 |
 |---|---|---|
 | Admin(设置/版本/日志/公告/地图/通知) | `getSettings*`、`saveSettings`、`getAlertingChannels`、`test*NotificationChannel` | X-02~X-08, X-10~X-13, X-17, X-19~X-24, X-39, X-43 |
-| Client Market(主机/作业/报价/终端/子域名) | `getClientMarketHosts`、`createClientMarketQuote`、`commitClientMarketQuote` | H-20~H-29, H-43~H-48, H-80~H-84, T-01, Q-02, Q-06, Q-11, Q-12 |
-| Client 租用生命周期 | `getMyClientMarketRentals`、`releaseClientMarketRental`、`cleanupClientMarketProviderRental` | R-01~R-35, H-44~H-48 |
+| 在线 Client 供给与报价 | `/v1/client-market/online/listings`、`installations/:id/quote`、`quotes/:id/commit` | H-01、H-20、H-26、Q-01~Q-04 |
+| Client 租用生命周期 | `online/leases`、`online/leases/:id/end`、`online/seller-inventory`、`me/rentals` | H-40、R-01、R-12、R-20、R-21、R-32 |
 | 市场准入与授信 | `getMarketAccessDashboard`、`updateMarketAccessPolicy`、`upsertMarketCounterparty`、`updateMarketCounterparty`、`updateMarketCounterpartyCredit`、`updateMarketPublicCredit` | MA-01~MA-15 |
 | 统一市场账务 | `getMarketBillingDashboard`、`settleMarketBillingAccount`、`requestMarketBillingSettlement`、`declareMarketBillingPayment`、`confirmMarketBillingPayment`、争议/作废端点 | MB-01~MB-19 |
 | 聊天 | `getClientChat*`、`postClientChatMessage` | CH-01~CH-19 |
@@ -985,15 +793,15 @@ location.reload();
 | 轮次 | 环境 | 用例 | 约计 |
 |---|---|---|---|
 | 1. 匿名 | `DEV_AUTH_BYPASS=0`,不登录 | A-01, C-01~C-06, L-01~L-04, H-06, H-32, S-40, S-41, S-46, CH-02, N-01, X-01 | 25 分钟 |
-| 2. 普通用户 | 登录,名下无主机无租用 | A-02~A-20, AC-01~AC-18, H-01, H-02, H-51, SM-16, R-01, R-02, C-07~C-23, MH-01~MH-13, X-40~X-42 | 70 分钟 |
-| 3. 供给方 | 名下有多状态主机 | H-03~H-05, H-07, H-10~H-18, H-20~H-29, H-40~H-50, H-60~H-84, T-01, T-04~T-19, T-30~T-36, Q-01~Q-14, D-10 | 120 分钟 |
-| 4. 租客 | 有租用中 Client | R-03~R-12, R-20~R-35, T-02, H-30, S-42~S-45, D-01~D-04 | 55 分钟 |
+| 2. 普通用户 | 登录,名下无主机无租用 | A-02~A-20, AC-01~AC-18, H-01, Q-01, SM-16, R-01, R-12, C-07~C-23, MH-01~MH-13, X-40~X-42 | 70 分钟 |
+| 3. 供给方 | 名下有多状态主机 | H-01、H-20、H-26、H-40、T-01、T-30~T-36、Q-01~Q-04, D-10 | 120 分钟 |
+| 4. 租客 | 有租用中 Client | R-01、R-12、R-20、R-21、R-32、T-02、H-31, S-42~S-45, D-01~D-04 | 55 分钟 |
 | 5. 管理员 | 邮箱在 `ADMIN_EMAILS` | X-02~X-39, X-43, N-02~N-14, L-01~L-05, CH-07, H-31, T-03, D-05~D-09, S-08~S-35 | 90 分钟 |
 | 6. 跨界面 | 任意角色 | G-01~G-12, MH-14~MH-20 | 40 分钟 |
 
 **冒烟子集**(每次提交前跑,约 15 分钟):
 
-`A-04`(登录)· `C-01`(总览渲染)· `MH-01`(我的分页)· `MH-05`(保存精确路由)· `MH-14`(直连兼容)· `H-01`(默认只看自己 + 故障优先排序)· `H-11`(严重度序)· `H-51`(白名单引导)· `SM-16`(聊天室引导)· `H-60`(选择模式)· `R-03`(租用列表)· `R-23`(释放与数据丢失确认)· `MB-04`(聚合账户)· `MB-09`(付款声明)· `Q-05`(报价倒计时)· `Q-10`(过期保留草稿)· `X-02`(设置表单)· `G-01`(中英文)
+`A-04`(登录)· `C-01`(总览渲染)· `MH-01`(我的分页)· `MH-05`(保存精确路由)· `MH-14`(直连兼容)· `H-01`(供给与健康)· `H-20`(在线 Client 上架)· `SM-16`(聊天室引导)· `R-12`(本人租约与历史)· `R-23`(释放与数据丢失确认)· `MB-04`(聚合账户)· `MB-09`(付款声明)· `Q-05`(报价倒计时)· `Q-10`(过期保留草稿)· `X-02`(设置表单)· `G-01`(中英文)
 
 **建议按轮次记录结果**,而不是逐条打勾——失败项记 用例 ID + 实际现象 + 截图,便于回归定位。
 

@@ -1,5 +1,4 @@
-//! Client-only, recoverable immediate termination. SSH cleanup is never run
-//! inside a financial transaction. Compensation is an award, not delivery.
+//! Lease termination freezes the cutoff and settles compensation after workspace cleanup.
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
@@ -52,14 +51,28 @@ pub(crate) fn policy_tx(conn: &Connection) -> Result<Policy, AppError> {
     )
     .map_err(db_error("read Client termination policy"))
 }
-pub(crate) fn freeze_quote_tx(conn: &Connection, quote: &str) -> Result<(), AppError> {
+pub(crate) fn freeze_quote_tx(conn: &Connection, quote: &str) -> Result<Policy, AppError> {
     let p = policy_tx(conn)?;
-    conn.execute(
-        "INSERT OR IGNORE INTO client_termination_quote_terms VALUES (?1,?2,?3)",
-        params![quote, p.version, p.rate_bps],
+    let inserted = conn
+        .execute(
+            "INSERT OR IGNORE INTO client_termination_quote_terms VALUES (?1,?2,?3)",
+            params![quote, p.version, p.rate_bps],
+        )
+        .map_err(db_error("freeze Client termination quote"))?;
+    if inserted == 1 {
+        return Ok(p);
+    }
+    conn.query_row(
+        "SELECT policy_version,rate_bps FROM client_termination_quote_terms WHERE quote_id=?1",
+        params![quote],
+        |r| {
+            Ok(Policy {
+                version: r.get(0)?,
+                rate_bps: r.get(1)?,
+            })
+        },
     )
-    .map_err(db_error("freeze Client termination quote"))?;
-    Ok(())
+    .map_err(db_error("read frozen Client termination policy"))
 }
 pub(crate) fn freeze_contract_tx(
     conn: &Connection,
@@ -120,13 +133,13 @@ struct Basis {
     eligible: bool,
 }
 fn basis_tx(conn: &Connection, installation: &str) -> Result<Basis, AppError> {
-    let b=conn.query_row("SELECT s.platform_contract_id,p.id,s.provider_id,s.client_user_id,s.host_id,
+    let b=conn.query_row("SELECT c.id,p.id,s.seller_id,s.buyer_id,s.installation_id,
         COALESCE(t.policy_version,0),COALESCE(t.rate_bps,0),COALESCE(p.amount_units,0),
         COALESCE(p.amount_units-p.fulfilled_units-p.refunded_units-p.termination_compensation_units,0),
         COALESCE(c.paid_started_at IS NOT NULL AND p.status='open',0)
-        FROM client_market_subscriptions s LEFT JOIN market_platform_contracts c ON c.id=s.platform_contract_id
+        FROM online_client_leases s LEFT JOIN market_platform_contracts c ON c.product_kind='client_host' AND c.product_ref=s.id
         LEFT JOIN market_platform_periods p ON p.contract_id=c.id AND p.sequence=c.current_period_sequence
-        LEFT JOIN client_termination_period_terms t ON t.period_id=p.id WHERE s.installation_id=?1",
+        LEFT JOIN client_termination_period_terms t ON t.period_id=p.id WHERE s.id=?1",
         params![installation], |r| Ok(Basis { contract:r.get(0)?,period:r.get(1)?,provider:r.get(2)?,buyer:r.get(3)?,
             host:r.get(4)?,policy:r.get(5)?,rate:r.get(6)?,amount:r.get(7)?,remaining:r.get(8)?,eligible:r.get(9)? }))
         .optional().map_err(db_error("read Client termination basis"))?
@@ -175,10 +188,32 @@ fn preview_tx(
             "Client rental belongs to another buyer".into(),
         ));
     }
-    if let Some(c) = b.contract.as_deref() {
-        crate::market_platform_contracts::settle_client_termination_tail_tx(conn, c, at)?;
-    }
-    let b = basis_tx(conn, installation)?;
+    // Estimate against the exact exit instant without splitting a UTC billing
+    // hour every time the buyer opens or refreshes the preview.
+    let b = if let Some(c) = b.contract.as_deref() {
+        let online: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM online_client_leases WHERE id=?1)",
+                params![installation],
+                |r| r.get(0),
+            )
+            .map_err(db_error("identify online exit preview"))?;
+        if online {
+            conn.execute_batch("SAVEPOINT client_exit_estimate")
+                .map_err(db_error("start exit estimate"))?;
+            let estimate =
+                crate::market_platform_contracts::settle_client_termination_tail_tx(conn, c, at)
+                    .and_then(|_| basis_tx(conn, installation));
+            conn.execute_batch("ROLLBACK TO client_exit_estimate; RELEASE client_exit_estimate")
+                .map_err(db_error("finish exit estimate"))?;
+            estimate?
+        } else {
+            crate::market_platform_contracts::settle_client_termination_tail_tx(conn, c, at)?;
+            basis_tx(conn, installation)?
+        }
+    } else {
+        b
+    };
     let cap = if b.eligible {
         compensation(b.amount, b.remaining, b.rate)?
     } else {
@@ -350,7 +385,8 @@ pub(crate) fn accept_tx(
         .map_err(db_error("record Client termination"))?;
     if let Some(c) = b.contract.as_deref() {
         conn.execute("UPDATE market_platform_contracts SET renewal_policy='manual',status=CASE
-            WHEN status IN ('ended','activation_failed') THEN status ELSE 'ending' END,updated_at=?2 WHERE id=?1",params![c,at])
+            WHEN status IN ('ended','activation_failed') OR (status='pending_activation' AND EXISTS
+            (SELECT 1 FROM online_client_leases r WHERE r.id=market_platform_contracts.product_ref)) THEN status ELSE 'ending' END,updated_at=?2 WHERE id=?1",params![c,at])
             .map_err(db_error("stop Client billing at accepted termination"))?;
     }
     event_tx(
@@ -411,7 +447,6 @@ pub(crate) struct Termination {
     pub status: String,
     pub cutoff_at: String,
     pub cleanup_confirmed_at: Option<String>,
-    pub cleanup_job_id: Option<String>,
     pub dispute_used: bool,
     pub dispute_opened_at: Option<String>,
     pub dispute_deadline_at: Option<String>,
@@ -432,8 +467,8 @@ fn read_tx(conn: &Connection, installation: &str) -> Result<Option<Termination>,
     conn.query_row("SELECT t.id,t.installation_id,t.host_id,t.contract_id,t.period_id,t.buyer_user_id,t.provider_user_id,
         t.policy_version,t.rate_bps,t.period_amount_units,t.remaining_units,t.compensation_cap_units,t.returned_units,
         t.compensation_units,t.held_units,t.reason,t.claim,t.responsibility,t.status,t.cutoff_at,t.cleanup_confirmed_at,
-        t.cleanup_job_id,t.dispute_used,t.version,t.updated_at,c.unlock_at,COALESCE(c.credited_units,0),
-        (SELECT client_subdomain FROM client_market_subscriptions WHERE installation_id=t.installation_id),
+        t.dispute_used,t.version,t.updated_at,c.unlock_at,COALESCE(c.credited_units,0),
+        (SELECT alias FROM online_client_leases WHERE id=t.installation_id),
         (SELECT email_normalized FROM users WHERE id=t.buyer_user_id),
         (SELECT email_normalized FROM users WHERE id=t.provider_user_id),
         (SELECT json_extract(detail_json,'$.note') FROM client_termination_events WHERE termination_id=t.id
@@ -447,11 +482,11 @@ fn read_tx(conn: &Connection, installation: &str) -> Result<Option<Termination>,
             period_id:r.get(4)?,buyer_user_id:r.get(5)?,provider_user_id:r.get(6)?,policy_version:r.get(7)?,rate_bps:r.get(8)?,
             period_amount_units:r.get(9)?,remaining_units:r.get(10)?,compensation_cap_units:r.get(11)?,returned_units:r.get(12)?,
             compensation_units:r.get(13)?,held_units:r.get(14)?,reason:r.get(15)?,claim:r.get(16)?,responsibility:r.get(17)?,
-            status:r.get(18)?,cutoff_at:r.get(19)?,cleanup_confirmed_at:r.get(20)?,cleanup_job_id:r.get(21)?,dispute_used:r.get(22)?,
-            version:r.get(23)?,updated_at:r.get(24)?,unlock_at:r.get(25)?,credited_units:r.get(26)?,
-            client_subdomain:r.get(27)?,buyer_email:r.get(28)?,provider_email:r.get(29)?,decision_note:r.get(30)?,
-            dispute_opened_at:r.get(31)?,dispute_deadline_at:r.get(32)?,provider_responded_at:r.get(33)?,
-            resolution:r.get(34)?,chat_available:r.get(35)?}))
+            status:r.get(18)?,cutoff_at:r.get(19)?,cleanup_confirmed_at:r.get(20)?,dispute_used:r.get(21)?,
+            version:r.get(22)?,updated_at:r.get(23)?,unlock_at:r.get(24)?,credited_units:r.get(25)?,
+            client_subdomain:r.get(26)?,buyer_email:r.get(27)?,provider_email:r.get(28)?,decision_note:r.get(29)?,
+            dispute_opened_at:r.get(30)?,dispute_deadline_at:r.get(31)?,provider_responded_at:r.get(32)?,
+            resolution:r.get(33)?,chat_available:r.get(34)?}))
         .optional().map_err(db_error("read Client termination"))?
         .map(|mut t| {
             // Preserve sub-millisecond precision: SQLite strftime would round
@@ -472,31 +507,6 @@ fn by_id_tx(conn: &Connection, id: &str) -> Result<Termination, AppError> {
         .map_err(db_error("find Client termination"))?
         .ok_or_else(|| AppError::NotFound("termination not found".into()))?;
     read_tx(conn, &installation)?.ok_or_else(|| AppError::NotFound("termination not found".into()))
-}
-pub(crate) fn replay_job_tx(
-    conn: &Connection,
-    installation: &str,
-    buyer: &str,
-) -> Result<Option<Option<String>>, AppError> {
-    let Some(t) = read_tx(conn, installation)? else {
-        return Ok(None);
-    };
-    if t.buyer_user_id != buyer {
-        return Err(AppError::Forbidden(
-            "Client rental belongs to another buyer".into(),
-        ));
-    }
-    if t.cleanup_confirmed_at.is_some() {
-        return Ok(Some(t.cleanup_job_id));
-    }
-    if let Some(job) = t.cleanup_job_id {
-        let running:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM provisioning_jobs WHERE id=?1 AND status IN ('pending','running','succeeded'))",params![job],|r|r.get(0))
-            .map_err(db_error("read replayed Client cleanup job"))?;
-        if running {
-            return Ok(Some(Some(job)));
-        }
-    }
-    Ok(None)
 }
 /// Prevent the shared finalizer from returning compensated Client rent in
 /// full. Share contracts have no Client termination record and are untouched.
@@ -683,15 +693,14 @@ pub(crate) fn record_cleanup_confirmed_tx(
 ) -> Result<(), AppError> {
     let rental_host: Option<String> = conn
         .query_row(
-            "SELECT host_id FROM client_market_subscriptions WHERE installation_id=?1",
+            "SELECT installation_id FROM online_client_leases WHERE id=?1",
             params![installation],
             |r| r.get(0),
         )
         .optional()
         .map_err(db_error("read verified Client cleanup binding"))?;
-    let Some(rental_host) = rental_host else {
-        return Ok(());
-    };
+    let rental_host =
+        rental_host.ok_or_else(|| AppError::NotFound("Client lease not found".into()))?;
     if rental_host != host {
         return Err(AppError::Conflict(
             "cleanup receipt Host does not match rental".into(),
@@ -743,31 +752,41 @@ pub(crate) fn cleanup_confirmed_tx(
     host: &str,
     at: &str,
 ) -> Result<(), AppError> {
-    if read_tx(conn, installation)?.is_none() {
-        // Historical successful cleanup: no new compensation can be imposed.
-        let cutoff: String = conn
-            .query_row(
-                "SELECT COALESCE((SELECT MIN(created_at) FROM provisioning_jobs
-            WHERE installation_id=?1 AND host_id=?2 AND type='cleanup'),updated_at)
-            FROM client_market_subscriptions WHERE installation_id=?1 AND host_id=?2",
-                params![installation, host],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(db_error("read historical Client cleanup"))?
-            .ok_or_else(|| {
-                AppError::Conflict("cleanup evidence does not match rental Host".into())
-            })?;
-        accept_tx(
-            conn,
-            installation,
-            None,
-            "historical_cleanup",
-            None,
-            &cutoff,
-        )?;
+    settle_tx(conn, installation, host, at, true)
+}
+
+/// Public access and billing already stopped at the cutoff, so the buyer's
+/// money does not depend on the seller's Client coming back. After the offline
+/// timeout the termination settles exactly as a verified cleanup would. No
+/// cleanup receipt is written: the listing stays occupied until the Client
+/// returns and confirms its workspace was deleted, and that later receipt does
+/// not settle a second time.
+pub(crate) fn settle_unconfirmed_cleanup_tx(
+    conn: &Connection,
+    installation: &str,
+    host: &str,
+    at: &str,
+) -> Result<bool, AppError> {
+    let Some(t) = read_tx(conn, installation)? else {
+        return Ok(false);
+    };
+    if t.host_id != host || t.cleanup_confirmed_at.is_some() || t.status != "cleanup_pending" {
+        return Ok(false);
     }
-    let t = read_tx(conn, installation)?.unwrap();
+    settle_tx(conn, installation, host, at, false)?;
+    Ok(true)
+}
+
+fn settle_tx(
+    conn: &Connection,
+    installation: &str,
+    host: &str,
+    at: &str,
+    verified: bool,
+) -> Result<(), AppError> {
+    let t = read_tx(conn, installation)?.ok_or_else(|| {
+        AppError::Conflict("cleanup requires an accepted lease termination".into())
+    })?;
     if t.host_id != host {
         return Err(AppError::Conflict(
             "cleanup Host does not match termination".into(),
@@ -841,7 +860,11 @@ pub(crate) fn cleanup_confirmed_tx(
         conn,
         &t.id,
         None,
-        "cleanup_confirmed",
+        if verified {
+            "cleanup_confirmed"
+        } else {
+            "settled_without_cleanup"
+        },
         json!({"hostId":host}),
         None,
         at,
@@ -868,6 +891,7 @@ fn clear_cleanup_case_tx(conn: &Connection, installation: &str, at: &str) -> Res
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn cleanup_failed_tx(
     conn: &Connection,
     installation: &str,
@@ -880,10 +904,6 @@ pub(crate) fn cleanup_failed_tx(
 }
 fn notify_tx(conn: &Connection, t: &Termination, stage: &str, at: &str) -> Result<(), AppError> {
     if t.status != "completed" {
-        return Ok(());
-    }
-    // Recovery must not replay a mailbox full of old free/trial terminations.
-    if t.reason == "historical_cleanup" && t.returned_units == 0 && t.compensation_units == 0 {
         return Ok(());
     }
     for (role, user) in [
@@ -1922,8 +1942,7 @@ pub(crate) fn credit_due_isolated(
     Ok(count)
 }
 
-/// Recover financial finalization from durable successful cleanup jobs, never
-/// from a Host's present state (it may already belong to a different renter).
+/// Retry financial finalization only after the workspace cleanup receipt and lease release.
 pub(crate) fn recover_cleanup_isolated(conn: &Connection, at: &str) -> Result<usize, AppError> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1936,15 +1955,15 @@ pub(crate) fn recover_cleanup_isolated(conn: &Connection, at: &str) -> Result<us
         )
         .map_err(db_error("read Client cleanup recovery cursor"))?;
     let rows = {
-        let mut s=tx.prepare("SELECT s.installation_id,s.host_id FROM client_market_subscriptions s
-        LEFT JOIN provisioning_jobs j ON j.installation_id=s.installation_id AND j.host_id=s.host_id
-          AND j.type='cleanup' AND j.status='succeeded'
-        LEFT JOIN client_cleanup_receipts r ON r.installation_id=s.installation_id AND r.host_id=s.host_id
-        LEFT JOIN client_market_terminations t ON t.installation_id=s.installation_id
-        WHERE s.status='released' AND (r.installation_id IS NOT NULL OR j.id IS NOT NULL)
-          AND (t.cleanup_confirmed_at IS NULL OR t.status='finance_pending') AND s.installation_id>?1
-        GROUP BY s.installation_id,s.host_id ORDER BY s.installation_id LIMIT 50")
-        .map_err(db_error("prepare Client cleanup recovery"))?;
+        let mut s = tx
+            .prepare(
+                "SELECT r.id,r.installation_id FROM online_client_leases r
+            JOIN client_cleanup_receipts e ON e.installation_id=r.id AND e.host_id=r.installation_id
+            JOIN client_market_terminations t ON t.installation_id=r.id
+            WHERE r.released_at IS NOT NULL AND t.status='finance_pending' AND r.id>?1
+        ORDER BY 1 LIMIT 50",
+            )
+            .map_err(db_error("prepare Client cleanup recovery"))?;
         s.query_map(params![cursor], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })

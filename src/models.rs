@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, value::RawValue};
@@ -138,8 +139,6 @@ pub struct Installation {
     /// Self-reported public IPv4 from the server process (startup probe).
     #[serde(default)]
     pub public_ip: Option<String>,
-    #[serde(default)]
-    pub provision_source: Option<String>,
     #[serde(default)]
     pub log_collection_enabled: bool,
     #[serde(default)]
@@ -1332,6 +1331,14 @@ pub struct ShareSettingsPatch {
     pub edit_context: Option<ShareSettingsEditContext>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed_grant: Option<ShareManagedGrantOperation>,
+}
+
+impl ShareSettingsPatch {
+    pub(crate) fn requires_termination_receipt(&self) -> bool {
+        self.managed_grant
+            .as_ref()
+            .is_some_and(|grant| grant.termination.is_some())
+    }
 }
 
 /// Server-signed preview binds the target policy and window.
@@ -3946,6 +3953,8 @@ pub struct DashboardMapPoint {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstallationView {
+    pub market_lease_v1: bool,
+    pub market_listed: bool,
     pub id: String,
     pub platform: String,
     pub app_version: String,
@@ -3962,8 +3971,6 @@ pub struct InstallationView {
     pub last_seen_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upgrade: Option<InstallationUpgradeView>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provision_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -4014,6 +4021,8 @@ pub struct InstallationHeartbeatPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_ip: Option<String>,
     pub log_collection_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_lease_v1: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -14,7 +14,7 @@
 
 | 术语 | 含义 | 代码位置 |
 |---|---|---|
-| **Host Provider**(主机供给方) | Client Market 中出租服务器的用户 | `client_market_trade.rs` `QuoteItemView::provider_id`、`RentalView::provider_id` |
+| **Host Provider**(主机供给方) | Client Market 中出租已验证在线 Client 能力的用户 | `client_market_trade.rs` `QuoteItemView::provider_id`、`RentalView::provider_id` |
 | **Upstream Provider**(上游供应商) | Share 绑定的 API 后端。`ShareAppRuntimes` 有 claude / codex / gemini / kiro / cursor / antigravity / copilot 七个运行时槽位;Share 对外开放的 App 仍只有 claude / codex / gemini | `models.rs` `ShareUpstreamProvider`、`ShareAppRuntimes` |
 
 与 Server 侧对齐的其余词汇:
@@ -125,53 +125,13 @@ Bundle 绑定聚合，不从 Claude/Codex/Gemini API、兼容类型或名称猜�
 
 `/v1/gateways/register`、`/v1/gateway/*` 与 `/_gateway/proxy/*` 是未来跨 Router 容量消费者的基础入口。Gateway 使用 Ed25519 公钥、timestamp、nonce、原始 body SHA-256 和 scope；当前 self-reported owner email 仅用于本地审计，绝不参与授权。完整 tenant/seat/grant contract 尚未形成，而旧 `forSale=Yes + marketAccessMode=all` 已退役，因此当前 Gateway Share inventory/proxy 对普通 Share 整体 fail-closed。它是**适配层**而不是第三个交易面，也不能被描述为已完成的 Token Market。
 
-### ③ Client Market —— 主机供给
+### ③ Client Market 在线 Client 租用
 
-Host Provider 贡献一台 Linux 服务器,Router 用**专用外发 Ed25519 provision key**(与入站 SSH host key 相互独立,`src/provision_ssh.rs` `require_provision_ssh_keys()`)登录,安装依赖并部署 Server,使其成为 Client + Router 容量与 Share 服务的供给节点。
+供给以卖家的 installation 为单位。所有上架项、租期内的反向控制和出口探测都经过已有 Client 隧道。卖家与租户的两个公网域名指向同一物理 installation。每份租约持有独立标识、子域名、钱包合同及工作区。迁移 127 的 `online_client_supply` 给列表、地区汇总和报价提供同一可租状态；未释放租约由唯一索引强制排他。
 
-新 Host 以 `onboarding` 入队，准备 worker 预下载并校验 Release，再将它复制为独立的 `cc-switch-host-standby`，登记本机生成的公钥、安装低权限待机服务并交付首次排程。收到本代有效首报后才以事务转为 `idle`。待机服务每个 UTC 自然小时随机择时上报一次完整快照，租期内持续运行。市场主行、详情和报价使用同一健康投影，动态资源按采样所属租约裁剪。两仓共享 v1 协议样例，线格式见 [PROTOCOL.md](PROTOCOL.md)。
+上架、授权、延长、撤权和清理的意图都在数据库事务内写入，再由 worker 经 HMAC 控制通道送达。每次重试先读 Client 持久状态和序号。签名回执与正在运行的工作区一致时才开放访问和激活付费合同。退租事务冻结结算时点、撤销租户别名并关闭其 Share 挂售；Share 的车位撤权和结算使用原有流程。租后财务争议按 terminationId 访问，清理回执绑定租约与物理 installation。
 
-迁移 124 登记的存量已出租 Host 不会被空闲维护队列领取。迁移 125 为这类尚未首报的 Host 增加独立的首次监测接入队列；Host owner 可在健康抽屉或勾选后批量接入，部署运维也可经 UID 校验的本机管理 socket 使用 `host-health bootstrap` 命令入队。任务固定租约、机器代次、密钥代次及动作序号，领取和每个 SSH 阶段都复核上下文，退租、换绑、撤销及 owner 变更取消旧执行权。它只安装独立待机副本，不重启租户 Server、不执行包管理器、不修改租约或账务；正常升级、轮换和换机仍等待空闲维护。未登记公钥、未交付排程的主机显示“监测未启用”，安装成功且有首报排程后才显示“等待首报”。
-
-Client Market 主行分别展示状态／健康、硬件规格、地区、供给方、租金、Host 信息及操作；健康记录使用一套主动排序偏好，比值相同时优先可观测样本多的 Host。小时历史及 owner 管理操作通过页面级单个抽屉按需读取，筛选工具栏收起容量条件，窄屏使用同一行字段转换为卡片。列表与报价继续共用纯健康摘要和服务端隐私投影。
-
-下载缓存独立于待机副本、`/usr/local/bin/cc-switch-server` 和租户数据，最多保留最近两份 binary。租用任务重新确认所选 Release 的完整 commit 与摘要，继续执行租户初始化和一次启动。租后维护独立入队，和报价通过 Host 的数据库状态竞争执行权，远端维护及开通同时核对持久动作序号并使用同一排他锁。维护失败保留诊断和重试入口，租约释放和账务结案可以先完成。
-
-主机状态机(`router_ssh_hosts.status`):
-
-```
-onboarding ──有效首报──► idle ──► reserved ──► locked ──► allocated ──► draining ──► idle
-                         │                                                    │
-                         └──► maintaining ◄──待机维护领取──────────────────────┘
-                                 └──► idle
-
-异常态:unreachable / abnormal / disabled / reserved
-```
-
-`reserved` 用于报价锁定期(`client_market_trade.rs` `HOST_STATUS_RESERVED`,报价 TTL 120 秒)。
-
-**任务与清理对账**(`src/client_market.rs`):
-
-| 场景 | 处理 |
-|---|---|
-| `draining` 停滞超 10 分钟 | 自动派发 cleanup job |
-| 释放后清理失败 | 按 5 分钟 → 15 分钟 → 1 小时 → 6 小时 → 24 小时退避 SSH 复查,最多 5 次;确认干净则复位为 idle,否则自动派发 cleanup job;指纹或绑定不一致只允许人工处理(`reconcile_cleanup_retry_claim`) |
-| 隔离中且无安装的 Host | 立即探测,之后按 15 分钟 / 1 小时 / 6 小时 / 24 小时重复复查(`reconcile_quarantined_host_reprobe`);两类复查都最多 4 并发 |
-| `locked` 超 25 分钟且无 job | 转为 `unreachable` |
-| `reserved` 超 10 分钟 | 复位为 `idle` |
-| 进程重启导致 job 中断 | 启动时 `reconcile_interrupted_jobs` 以最多 4 并发重跑 |
-
-Host Provider 还可对不可达 Host 执行 `POST /v1/client-market/hosts/:id/retire-unreachable`,直接删除该 Host 记录。
-
-租户 Client 的后台重试覆盖 Router 自身的首次开通 job 和显式 cleanup job。独立待机副本使用自己的 systemd/OpenRC 开机守护，只有 nohup 的环境向买家提示未配置开机自启。首次开通脚本只启动一次 Client 进程，安装的 systemd/OpenRC 服务不启用开机启动、失败重启或 respawn。开通完成后，Router 不会因 tunnel 离线而通过 provision SSH 启动或重启 `cc-switch-server`；只记录 `online`、`reconnecting`、`offline`、`disabled` 连接状态并继续心跳、告警和 UI 提示。Client 进程生命周期完全由 Client owner 管理。
-
-**准入与支付**：免费和付费 Host 分别执行 `client_host/free`、`client_host/paid` 准入。新付费租用始终从用户全站 USD 余额支付，不受官方充值模式影响；Provider 的收款方式不再作为商品支付渠道或筛选项，付费发布仅需有效的供应商身份，不要求任何外部提现地址。新付费报价采用日历月租，保留的按日计费也只使用平台钱包合同。Provider 自用按免费处理。
-
-**购买确认**：指定 Host 直接获取 120 秒预留报价并进入配置确认；通用新建先选择免费资源池，最多两台。报价项返回真实剩余 `trialSecondsRemaining`，试用按健康服务时长消耗，不冻结用户资金，但提交时仍须有完整首期余额；试用结束从平台钱包支付首期，无法支付则立即进入彻底回收，确认清理后才允许其他人租用。无试用时提交预留当期资金，开通成功后扣款。自动续费仅在下一期到期时扣款。报价过期保留内存草稿并要求重新确认；充值只携带 Host、子域名和续费选择，密码不持久化。新购买界面不会降级到商家直付。
-
-**月租收益推进**：Client 月租以当期起点为锚点，每小时批量生成供应商履约收益，不改变买家的整月预付规则。健康和访问控制仍按短周期观测并持久化；仅合并相邻且可用性相同的区间，故障、未核实区间及后台停顿不生成收益，对应款项只退回平台余额。续费前结清当期，服务到期或进入回收时结清不足一小时的已观测尾段；财务风控检查不等待小时边界，收益仍遵守原有平台分成与 7 天沉淀规则。Share 月租与历史按日计价服务的结算频率不变。
-
-**租后状态**：租约返回买家可见的 `walletContract`（合同状态、剩余试用、续费策略、当期结束时间），不从旧月租表推断钱包账期。Host、租约、钱包合同和 Client 在线状态分别展示。免费期限从开通成功后开始计算。释放失败可以结束租约，但 Host 保持隔离；资金是否已退回取决于确认清理后的账本处理，不根据安装失败或租约结束直接宣称退款成功。
+每五分钟的主动探测按 installation、租约和 UTC 时段去重。24 小时健康统计与已关闭 UTC 小时的月租结算读取同一份探测记录。硬件通过已有探测连接低频刷新。协议与权限矩阵见 [PROTOCOL.md](PROTOCOL.md) 和[实施计划](docs/client-market-online-client-leasing-plan.md)。
 
 ### ④ Provider Rank —— 跨市场供应商发现
 
@@ -339,7 +299,7 @@ Router 侧并发只按三类键限制:`share_id`(Share 并发池)、免费 Share
 | 健康 | `share_health_checks`、`installation_health_checks`、`share_model_health_state` |
 | 平台钱包与 Provider 收入 | `market_finance_control`、`market_wallet_accounts`、`market_wallet_holds`、`market_journal_transactions`、`market_journal_postings`、`market_journal_seals`、`market_payment_channels`（含 revisions／settings）、`market_topup_*`、`market_platform_contracts`、`market_platform_periods`、`market_delivery_slices`、`market_provider_earning_lots`、`market_provider_earning_holds`、`market_payout_*`、`market_wallet_policy`、`market_wallet_transfers`、`market_earning_wallet_conversions`、`market_commission_*`、`market_service_disputes`、`market_notification_outbox`、`market_finance_reconciliation_cases`、`market_finance_audit_events` |
 | 旧 Provider 资金轨道 | `supplier_billing_profiles`、`market_credit_accounts`、`market_service_contracts`、`market_service_intervals`、`market_accrual_entries`、`market_invoices`、`market_invoice_lines`、`market_payment_declarations`、`market_payment_receipts`、`market_payment_intents`、`market_prepaid_*`、`market_funding_*`、`market_recurring_*`、`market_billing_*`、`market_credit_restrictions` |
-| 主机市场 | `router_ssh_hosts`、`client_market_subscriptions`、`account_payment_*` |
+| Client Market | `online_client_listings`、`online_client_leases`、`online_client_operations`、`online_client_probes` |
 | 联邦与市场 | `router_gateways`、`share_market_listings`、`share_market_seats`、`share_market_subscriptions`；旧 registry/live/archive 表均已由 migration 21 物理删除 |
 | 市场供应商身份与排名 | `market_provider_profiles`、`market_provider_aliases`、`market_provider_identity_events`、`market_provider_share_windows`、`market_provider_effective_selections`、`market_provider_rank_generations`、`market_provider_rank_entries` |
 | 通知 | `installation_notification_state`、`client_notification_events`、`client_notification_runtime`、`notification_deliveries`、`notification_delivery_items`、`notification_delivery_attempts`、`user_notification_channels`、`telegram_bot_runtime`、`telegram_bind_tokens`、`telegram_inbound_updates`、`telegram_poll_cursors`、`bark_binding_attempts`、`bark_provider_runtime` |

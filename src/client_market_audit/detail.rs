@@ -108,12 +108,10 @@ fn events_tx(
     record: &Value,
     cursor: Option<&str>,
 ) -> Result<(Vec<Value>, Value), AppError> {
-    // Subscription events already mirror the general audit events: do NOT union
-    // both tables and display each action twice. Never project detail_json/logs.
     let cte = "WITH events AS (
-        SELECT 'r:'||id AS id,event_type AS action,actor_email,
-          strftime('%Y-%m-%dT%H:%M:%fZ',created_at) AS at,NULL AS note
-        FROM client_market_subscription_events WHERE installation_id=?1
+        SELECT 'r:'||id AS id,kind AS action,NULL AS actor_email,
+          strftime('%Y-%m-%dT%H:%M:%fZ',recorded_at,'unixepoch') AS at,NULL AS note
+        FROM online_client_events WHERE lease_id=?1
         UNION ALL SELECT 't:'||id,action,NULL,strftime('%Y-%m-%dT%H:%M:%fZ',created_at),
           CASE WHEN action IN ('provider_waiver','owner_decision','provider_response','buyer_withdrawal','timeout_waiver')
                     AND json_valid(detail_json) THEN json_extract(detail_json,'$.note') END
@@ -169,7 +167,11 @@ fn safe_action(value: &str) -> &str {
         "return_unused" | "return_compensation" | "return_disputed" => "returned",
         "automatic_credit" => "credited",
         "order_committed"
-        | "client_provisioned"
+        | "assistance"
+        | "terminal"
+        | "upgrade"
+        | "restart"
+        | "rollback"
         | "cleanup_started"
         | "cleanup_finished"
         | "cleanup_failed"

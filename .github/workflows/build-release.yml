@@ -159,7 +159,9 @@ jobs:
         run: |
           bash scripts/ci/timed.sh 'Market contracts' cargo test --locked market_ -- --skip schema::tests
           bash scripts/ci/timed.sh 'Share rental contracts' cargo test --locked share_market::
-          bash scripts/ci/timed.sh 'Client rental contracts' cargo test --locked client_market::tests
+          bash scripts/ci/timed.sh 'Fresh Client Market schema' bash scripts/ci/require-tests.sh cargo test --locked fresh_client_market_
+          bash scripts/ci/timed.sh 'Online Client leases' bash scripts/ci/require-tests.sh cargo test --locked online_client_market::
+          bash scripts/ci/timed.sh 'Share edit namespace' bash scripts/ci/require-tests.sh cargo test --locked direct_share_edit_
           bash scripts/ci/timed.sh 'Termination chat contracts' cargo test --locked client_termination_chat_
 
       - name: Test user routing and ordered failover

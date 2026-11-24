@@ -162,8 +162,10 @@ fn conversion_restores_only_next_rental_and_old_evidence_never_consumes_the_new_
             .unwrap(),
         1
     );
-    assert!(validate_quote_epoch_tx(&conn, "buyer", "provider", "host", 0).is_err());
-    validate_quote_epoch_tx(&conn, "buyer", "provider", "host", 1).unwrap();
+    let current = state(&conn);
+    assert!(current.validate_quote(0, 15).is_err());
+    assert!(current.validate_quote(1, 20).is_err());
+    current.validate_quote(1, 15).unwrap();
     // Disabling or reducing an offer does not manufacture another reset.
     assert_eq!(
         state_tx(&conn, "buyer", "provider", "host", 0)

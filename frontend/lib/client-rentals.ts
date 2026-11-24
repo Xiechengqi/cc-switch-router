@@ -1,7 +1,6 @@
 import { authFetch } from "./auth";
 import { parseJson } from "./api";
 import { AUDIT_ATTENTION, AUDIT_STATUSES, type AuditRecord } from "./client-rental-audit";
-import type { ClientMarketRental } from "./types";
 
 export const CLIENT_RENTAL_PAGE_SIZE = 5;
 export const CLIENT_RENTAL_MONEY_FIELDS = ["chargedUnits", "returnedUnits", "unfulfilledUnits", "serviceUnits", "compensationUnits", "netUnits"] as const;
@@ -26,7 +25,7 @@ export type ClientRentalPeriod = {
 };
 export type ClientRentalEvent = { id: string; action: string; createdAt: string; note: string | null };
 export type ClientRentalDetail = {
-  record: ClientRentalRecord; rental: ClientMarketRental | null;
+  record: ClientRentalRecord; rental: { leaseId: string; contractId: string | null; canDispute: boolean; openDispute: boolean } | null;
   periods: ClientRentalPeriod[]; periodsNextCursor: number | null;
   events: ClientRentalEvent[]; eventsNextCursor: string | null;
   trialConsumedSeconds: number; serverNow: string;
@@ -42,22 +41,9 @@ const integer = (v: unknown): v is number => Number.isSafeInteger(v) && (v as nu
 const nullableInteger = (v: unknown) => v === null || integer(v);
 const units = (v: unknown): v is string => typeof v === "string" && /^(0|[1-9]\d{0,18})$/.test(v) && BigInt(v) <= 9223372036854775807n;
 function validLiveRental(v: unknown, record: ClientRentalRecord): boolean {
-  if (v === null) return true;
-  if (!object(v) || record.group !== "current" || v.isClientOwner !== true || v.installationId !== record.installationId
-    || !["hostId", "providerId", "hostOwnerEmail", "clientOwnerEmail", "status", "pricingModel"].every(k => text(v[k]))
-    || !integer(v.offerRevision) || !time(v.updatedAt)
-    || !["canRelease", "canFinalizeRelease", "hostCleanupPending", "providerTerminalAccessActive", "canManageProviderTerminal"].every(k => typeof v[k] === "boolean")
-    || !["activatedAt", "expiresAt", "nextCleanupProbeAt", "providerTerminalAuthorizedUntil"].every(k => v[k] == null || time(v[k]))
-    || !["dailyRateMinor", "cyclePriceMinor", "freeDurationDays", "cleanupProbeAttempts"].every(k => v[k] == null || integer(v[k]))
-    || !(v.walletContractId == null || text(v.walletContractId) && v.walletContractId === record.contractId)) return false;
-  if (v.walletContract == null) return true;
-  const wallet = v.walletContract;
-  if (!object(wallet) || wallet.id !== record.contractId || !text(wallet.status) || !text(wallet.renewalPolicy)
-    || !integer(wallet.trialSecondsRemaining) || !nullableTime(wallet.periodEnd)) return false;
-  if (wallet.nextRentalTrial == null) return true;
-  const trial = wallet.nextRentalTrial;
-  return object(trial) && ["epoch", "allowanceSeconds", "consumedSeconds", "remainingSeconds"].every(k => integer(trial[k]))
-    && nullableTime(trial.lastResetAt);
+  return v === null || (object(v) && record.group === "current" && text(v.leaseId)
+    && v.leaseId === record.installationId && v.contractId === record.contractId
+    && typeof v.canDispute === "boolean" && typeof v.openDispute === "boolean");
 }
 function validRecord(v: unknown): v is ClientRentalRecord {
   if (!object(v) || !text(v.id) || !["current", "history"].includes(v.group as string)

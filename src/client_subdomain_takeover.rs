@@ -388,41 +388,14 @@ async fn finalize_committed_takeover(
         .remove_route(&committed.target_original_subdomain)
         .await;
 
-    let cleanup_pending = if let Err(cleanup_error) = crate::client_market::terminate_for_billing(
-        state,
-        &committed.source_installation_id,
-        "client_subdomain_takeover",
-    )
-    .await
-    {
-        warnings.push(format!(
-            "source Client Market cleanup will require retry: {cleanup_error}"
-        ));
-        true
-    } else {
-        false
-    };
     let warning = (!warnings.is_empty()).then(|| warnings.join("; "));
-    if cleanup_pending {
-        state
-            .store
-            .defer_client_subdomain_takeover_completion(
-                &plan.id,
-                server_committed,
-                warning
-                    .as_deref()
-                    .unwrap_or("source Client Market cleanup is pending"),
-            )
-            .await?;
-    } else {
-        state
-            .store
-            .complete_client_subdomain_takeover(&plan.id, server_committed, warning.as_deref())
-            .await?;
-    }
+    state
+        .store
+        .complete_client_subdomain_takeover(&plan.id, server_committed, warning.as_deref())
+        .await?;
     Ok(FinalizeResult {
         warning,
-        cleanup_pending,
+        cleanup_pending: false,
         server_committed,
     })
 }

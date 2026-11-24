@@ -50,23 +50,21 @@ TokenSwitch 的公共汇聚层。为 `cc-switch-server` 实例提供公网子域
 
 早期的 `cc-switch` Tauri 桌面版已不再作为客户端,相关兼容代码已移除,详见 [docs/migration-history.md](docs/migration-history.md)。
 
-远程主机上的部署由仓库内 `install-client.sh` 负责,它会下载 `cc-switch-server` 二进制并完成初始化。Router 的 `/install-client.sh` 会在请求时写入 Settings 中当前选择的 Server Release；默认值是 `latest`，也可固定为已经通过 Server 手动发布流程生成的 7 位 Commit Release。脚本严格识别 AMD64/ARM64，同时下载同一 Release、同一下载源的 binary 与 `.sha256`，在覆盖现有文件前完成 checksum；固定 Commit 时还会检查 staged binary 的 `version --json`。任一步失败都会终止，不会回退 `latest`。Router 使用此设置选择之后的主机预下载和市场开通版本；Server 自升级使用 `latest`。
+远程主机上的部署由仓库内 `install-client.sh` 负责,它会下载 `cc-switch-server` 二进制并完成初始化。Router 的 `/install-client.sh` 会在请求时写入 Settings 中当前选择的 Server Release；默认值是 `latest`，也可固定为已经通过 Server 手动发布流程生成的 7 位 Commit Release。脚本严格识别 AMD64/ARM64，同时下载同一 Release、同一下载源的 binary 与 `.sha256`，在覆盖现有文件前完成 checksum；固定 Commit 时还会检查 staged binary 的 `version --json`。任一步失败都会终止，不会回退 `latest`。手动安装使用这个设置，Server 自升级使用 `latest`。
 
-Client Market 的首次开通会自动调用该脚本并启动一次进程；systemd unit 使用 `Restart=no` 且不启用开机启动，OpenRC 服务不配置 respawn 且不加入默认 runlevel，没有受支持的服务管理器时仅执行一次 `nohup`。
+Client owner 在 Clients 页选择自己已验证、在线并声明 `marketLeaseV1` 的 Client，设置月租或免费期限后上架。上架检查会确认 Share 市场没有未结束的挂售和车位，经 Client 的实际出站路径核实 IP 与地区，并读取 CPU、内存和数据盘。买家在 Client Market 可以看到最近一次探测和过去 24 个完整 UTC 小时的可用小时数。
 
-首次开通完成后,Router **不会**因为 tunnel 离线而通过 SSH 检查、启动或重启远端 `cc-switch-server`。Router 只保留连接状态观测、心跳、离线告警和页面提示；进程生命周期由 Client owner 负责，离线时应登录 Host 手动排查并启动服务。只有用户明确发起的首次开通、升级、清理或回收操作可以执行对应远端命令。清理失败的后台重试只继续既有的清理流程，不会拉起 Client 服务。
+租户从市场报价后下单，在独立域名进入自己的工作区，管理账号、Provider、Share、聊天和备份。卖家在自己的域名进入只读协助视图。终端只对 Client owner 开放，协助、终端、重启及升级操作会记录并通知租户。主机 owner 持有操作系统 root 权限，能够读取磁盘。租约期间卖家工作区冻结，回环推理同样要求当前租户令牌。
 
-客户端与 Router 之间的注册、lease、建链、控制平面与身份注入契约,见 [PROTOCOL.md](PROTOCOL.md)。
+Clients 页与租户控制台使用短期、一次性且绑定父会话和目标域名的票据自动登录。退租会撤销租户域名和票据，停止计费；Router 在第三方 Share 回收且 Client 确认工作区清理后重新开放库存。在线 Client 使用自身的反向隧道，NAT 后的机器也可以上架。
 
-Clients 页的「控制台」和「终端」通过独立 iframe 窗口打开 Client Web。当前已验证的 Client owner 登录 Router 后，窗口以 60 秒、一次性、绑定 installation／Host／父会话的票据交换短期凭据，自动进入 Client。父子窗口严格核对 origin、窗口对象与 nonce，票据和凭据只保存在内存。每个请求重新验证父会话、owner、公开 Host revision 和市场租约，退出或撤权会在最多 5 秒内关闭已打开的委托事件流。市场 Client 控制台向当前租户本人提供自动登录，市场页面终端仍只向 Router owner 开放；Router owner 进入别人的市场 Client 仍需该 Client 的本地登录。旧 Client 保留原登录入口，升级 Server Web 后启用自动握手。
-
-Client Market 在主机添加、批量导入或重验证后，异步将所选 Server Release 下载到主机的 `/var/cache/cc-switch-router/server`，只校验文件摘要，不执行程序。独立队列持久化状态并在 Router 重启后恢复，失败时租用仍可补下载。租用开通先重新查询发布的 Release 与可信 SHA-256，检查本地缓存，下载后再次确认设置／Release；正式启动前核对 checksum、产品名、完整 commit 和架构。`latest` 的开通检查绕过设置页的五分钟缓存，发布切换或版本无法确认时可重试失败。缓存命中时省去 binary 下载和地区探测，初始化密码仍从 stdin 传入。退租清理删除正式安装与租户数据，保留不含租户配置的下载缓存。
+Router 和 Server 使用全新数据目录。卖家手动启动 Server 并建立反向隧道后，从 Clients 页上架。部署和端到端验收步骤见[在线 Client 租用计划](docs/client-market-online-client-leasing-plan.md#6-空环境手动部署与验收)。
 
 ## 边界策略
 
 Client Web tunnel:静态资源和明确列出的登录/OAuth 回调公开;其余 `/web-api/*` 默认要求 owner/admin 身份,Router 鉴权后向 client 注入可信身份头。`/api/*`、`/v1/*`、`/_ctl/*` 和 `/_share-router/*` 不通过 client web tunnel 暴露。流式管理接口必须使用 `Authorization` header,不接受 query-string token。
 
-Client Market 新付费租用按日历月从平台余额预付。供应商月租收益以付费周期起点为锚点，每小时依据已持久化的健康/访问控制记录批量结算；健康观测仍保持短周期，故障或缺失证据的时段不计入供应商收益，对应服务费用退回平台余额。到期或回收时结清不足一小时的已观测尾段，收益仍须经过 7 天沉淀期才自动转入余额。试用期间不扣租金、不冻结租金，也不产生供应商收益，但创建租用时必须具备首期所需余额；试用按已核实的健康服务时间消耗，结束后自动尝试扣除首个月租，扣款失败则立即进入回收流程。
+Client Market 新付费租用按日历月从平台余额预付。在线租约按 UTC 自然小时结算，每小时 12 个五分钟时段中至少 10 个探测成功才产生供应商收益。首尾不足一小时按实际覆盖时段折算，缺失探测计为失败，不可用时段的费用退回平台余额。到期或回收时结清不足一小时的已观测尾段，收益仍须经过 7 天沉淀期才自动转入余额。试用期间不扣租金、不冻结租金，也不产生供应商收益，但创建租用时必须具备首期所需余额；试用按已核实的健康服务时间消耗，结束后自动尝试扣除首个月租，扣款失败则立即进入回收流程。
 
 ## 用户统一模型入口
 
@@ -181,7 +179,7 @@ CI 的并行任务、缓存边界、测试数据库模板与耗时排查见 [构
 | `CC_SWITCH_ROUTER_OWNER_EMAIL` | `router@{TUNNEL_DOMAIN}` | Client Market 默认选中的官方 Host Provider 邮箱 |
 | `CC_SWITCH_ROUTER_USE_LOCALHOST` | `false` | 为 `false` 时 tunnel URL 使用 `https://` |
 | `CC_SWITCH_ROUTER_LEASE_TTL_SECS` | `60` | Tunnel lease 有效期(秒);已连接 client 使用签名续期 API 原连接续期,不按该周期重建 SSH |
-| `CC_SWITCH_ROUTER_DATA_DIR` | `$HOME/.cc-switch-router` | Router 自有本地文件目录,包含图片结果、SSH known_hosts 等 |
+| `CC_SWITCH_ROUTER_DATA_DIR` | `$HOME/.cc-switch-router` | Router 自有本地文件目录,用于保存图片结果等应用文件 |
 | `CC_SWITCH_ROUTER_DB_MODE` | `local` | 业务数据库模式:`local` 或 `turso` |
 | `CC_SWITCH_ROUTER_DB_PATH` | `$HOME/.cc-switch-router/cc-switch-router.db` | local 模式的 libSQL 文件,或 turso 模式的 Embedded Replica 文件 |
 | `CC_SWITCH_ROUTER_TURSO_URL` | 空 | turso 模式必填的 `libsql://` 或 `https://` 数据库 URL;不得携带凭据、query 或 fragment |
@@ -284,7 +282,6 @@ CI 的并行任务、缓存边界、测试数据库模板与耗时排查见 [构
 | `CC_SWITCH_ROUTER_MARKET_PAYMENT_MASTER_KEYS` | 空 | 平台钱包支付渠道凭据的版本化主密钥环，格式 `2:<key>,1:<key>`；新密钥用最高版本加密，轮换后由 Owner 调用 `POST /v1/admin/market-payment-channels/rewrap` 重新加密。修改后需重启 |
 | `CC_SWITCH_ROUTER_MARKET_PAYMENT_MASTER_KEY` | 自动托管 | 未配置密钥环时作为版本 1 主密钥；两者都未配置时，仅在库中还没有支付凭据时于数据目录生成 `market-payment-master-key`。已有支付凭据而主密钥缺失时 Router 拒绝启动，不会静默生成新密钥 |
 | `CC_SWITCH_ROUTER_MARKET_SUSPENDED_TERMINATE_DAYS` | `7` | 平台钱包合同因余额不足暂停后进入清理终止的天数（1–90）；第 5 天（或终止前一天，取较早者）提醒买家。因财务冻结暂停的合同不计时 |
-| `CC_SWITCH_ROUTER_IP_INTEL_ENDPOINTS` | 内置三个 `http://` 源站 | Client Market 主机 IP 情报服务,逗号分隔的 base URL,按顺序尝试。**每台登记主机的 IP 都会发送到这些端点**,应由 Router 运维方自建或交给可信任全量主机清单的一方。缺少 scheme 时按 `https://` 处理;仍使用 `http://` 时启动会打印告警。结果缓存 6 小时 |
 
 ### 统一入口 DNS 与 TLS
 

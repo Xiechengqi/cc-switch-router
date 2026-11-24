@@ -12,8 +12,6 @@ use crate::admin::settings::SettingsRuntimeSnapshot;
 use crate::admin::upgrade::SharedUpgradeRegistry;
 use crate::alerting::AlertingService;
 use crate::client_logs::ClientLogAccessLimiter;
-use crate::client_market::ClientMarketJobSecrets;
-use crate::client_market_terminal::TerminalSessionManager;
 use crate::clock_health::ClockHealthService;
 use crate::config::Config;
 use crate::dynamic_settings::DynamicSettings;
@@ -48,16 +46,6 @@ pub struct ServerState {
         Arc<crate::client_server_release::ClientServerReleaseValidator>,
     /// SSH host key 指纹（`SHA256:<base64-nopad>` 格式），在 /lease 响应中回传给客户端。
     pub ssh_host_fingerprint: Option<String>,
-    /// Outbound Client Market SSH private key path (IdentityFile for host provisioning).
-    pub provision_ssh_key_path: PathBuf,
-    /// OpenSSH public key line for router market host `authorized_keys`.
-    pub provision_ssh_authorized_keys_line: String,
-    /// Public key material (algorithm + base64) without comment.
-    pub provision_ssh_public_key: String,
-    /// One-time provision tokens for remote install scripts (passwords kept in memory).
-    pub client_market_job_secrets: Arc<Mutex<ClientMarketJobSecrets>>,
-    /// Short-lived web terminal tickets and per-owner session counters.
-    pub client_market_terminal: Arc<Mutex<TerminalSessionManager>>,
     /// Serializes conflicting Client Market lifecycle actions per installation.
     pub client_market_actions: Arc<crate::client_market_coordination::ClientMarketActionLocks>,
     /// Ensures Client subdomain takeover reconciliation has only one active worker.

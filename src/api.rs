@@ -296,10 +296,9 @@ pub fn router(state: ServerState) -> Router {
     Router::new()
         .merge(public_api)
         .merge(crate::store::client_web_sessions::router())
-        .merge(crate::client_market::router())
-        .merge(crate::client_market_trade::router())
+        .merge(crate::online_client_market::router())
+        .merge(crate::market_provider_contacts::router())
         .merge(crate::client_market_audit::router())
-        .merge(crate::client_market_terminal::router())
         .merge(crate::share_market::router())
         .merge(crate::market_access::router())
         .merge(crate::market_payments::router())
@@ -1333,56 +1332,69 @@ async fn upgrade_installation(
             .ensure_installation_upgrade_target_allowed(target_commit)
             .await?;
     }
-    // Speak directly to the live client-web tunnel backend with a signed ingress
-    // context. Unauthenticated `x-cc-switch-web-*` headers are stripped by the
-    // Client's `verify_router_ingress` middleware; going through the public URL
-    // also fails for Market Clients because the edge proxy will not re-inject
-    // Router session identity.
-    let path_and_query = "/web-api/invoke/start_admin_upgrade";
-    let body = serde_json::to_vec(&serde_json::json!({
-        "restartAfter": input.restart_after,
-        "force": true,
-    }))
-    .map_err(|error| {
-        AppError::Internal(format!("serialize client upgrade request failed: {error}"))
-    })?;
-    let target = client_upgrade_target(
-        &state,
-        &tunnel_url,
-        &installation_id,
-        &session_email,
-        "POST",
-        path_and_query,
-        &body,
-    )
-    .await?;
-    let response = state
-        .proxy_http
-        .post(format!("{}{path_and_query}", target.backend_base))
-        .header(
-            crate::ingress_context::INGRESS_CONTEXT_HEADER,
-            target.ingress.encoded_context,
+    let payload = if crate::online_client_market::listed(&state, &installation_id).await? {
+        crate::online_client_market::control::<serde_json::Value>(
+            &state,
+            &installation_id,
+            "/_ctl/market/upgrade",
+            serde_json::json!({"ownerEmail":session_email,"restartAfter":input.restart_after}),
+            30,
         )
-        .header(
-            crate::ingress_context::INGRESS_SIGNATURE_HEADER,
-            target.ingress.signature,
+        .await?
+    } else {
+        // Speak directly to the live client-web tunnel backend with a signed ingress
+        // context. Unauthenticated `x-cc-switch-web-*` headers are stripped by the
+        // Client's `verify_router_ingress` middleware; going through the public URL
+        // also fails for Market Clients because the edge proxy will not re-inject
+        // Router session identity.
+        let path_and_query = "/web-api/invoke/start_admin_upgrade";
+        let body = serde_json::to_vec(&serde_json::json!({
+            "restartAfter": input.restart_after,
+            "force": true,
+        }))
+        .map_err(|error| {
+            AppError::Internal(format!("serialize client upgrade request failed: {error}"))
+        })?;
+        let target = client_upgrade_target(
+            &state,
+            &tunnel_url,
+            &installation_id,
+            &session_email,
+            "POST",
+            path_and_query,
+            &body,
         )
-        .header(axum::http::header::CONTENT_TYPE, "application/json")
-        .body(body)
-        .timeout(Duration::from_secs(30))
-        .send()
-        .await
-        .map_err(|error| AppError::Internal(format!("client upgrade request failed: {error}")))?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(AppError::Internal(format!(
-            "client upgrade failed: {status}: {body}"
-        )));
-    }
-    let payload: serde_json::Value = response.json().await.map_err(|error| {
-        AppError::Internal(format!("parse client upgrade response failed: {error}"))
-    })?;
+        .await?;
+        let response = state
+            .proxy_http
+            .post(format!("{}{path_and_query}", target.backend_base))
+            .header(
+                crate::ingress_context::INGRESS_CONTEXT_HEADER,
+                target.ingress.encoded_context,
+            )
+            .header(
+                crate::ingress_context::INGRESS_SIGNATURE_HEADER,
+                target.ingress.signature,
+            )
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|error| {
+                AppError::Internal(format!("client upgrade request failed: {error}"))
+            })?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AppError::Internal(format!(
+                "client upgrade failed: {status}: {body}"
+            )));
+        }
+        response.json().await.map_err(|error| {
+            AppError::Internal(format!("parse client upgrade response failed: {error}"))
+        })?
+    };
     let task_id = payload
         .get("taskId")
         .and_then(|value| value.as_str())
@@ -1462,6 +1474,20 @@ async fn reconcile_installation_upgrade_status_from_client(
         .store
         .installation_upgrade_tunnel_for_owner(&state.config, installation_id, session_email)
         .await?;
+    if crate::online_client_market::listed(state, installation_id).await? {
+        let payload = crate::online_client_market::control(
+            state,
+            installation_id,
+            "/_ctl/market/upgrade-status",
+            serde_json::json!({"ownerEmail":session_email,"taskId":task_id}),
+            10,
+        )
+        .await?;
+        return state
+            .store
+            .reconcile_installation_upgrade_status_from_client(installation_id, task_id, payload)
+            .await;
+    }
     let path_and_query = format!(
         "/web-api/admin/upgrade/status?taskId={}",
         url::form_urlencoded::byte_serialize(task_id.as_bytes()).collect::<String>()
@@ -1517,30 +1543,9 @@ async fn reconcile_installation_upgrade_status_from_client(
 async fn read_bounded_upgrade_status_body(
     response: reqwest::Response,
 ) -> Result<Vec<u8>, AppError> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > INSTALLATION_UPGRADE_STATUS_RESPONSE_MAX_BYTES as u64)
-    {
-        return Err(AppError::ServiceUnavailable(format!(
-            "client upgrade status response exceeds {INSTALLATION_UPGRADE_STATUS_RESPONSE_MAX_BYTES} bytes"
-        )));
-    }
-    let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| {
-            AppError::ServiceUnavailable(format!(
-                "client upgrade status response read failed: {error}"
-            ))
-        })?;
-        if body.len().saturating_add(chunk.len()) > INSTALLATION_UPGRADE_STATUS_RESPONSE_MAX_BYTES {
-            return Err(AppError::ServiceUnavailable(format!(
-                "client upgrade status response exceeds {INSTALLATION_UPGRADE_STATUS_RESPONSE_MAX_BYTES} bytes"
-            )));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
+    crate::ctl_client::read_bounded_body(response, INSTALLATION_UPGRADE_STATUS_RESPONSE_MAX_BYTES)
+        .await
+        .map_err(|error| AppError::ServiceUnavailable(format!("client upgrade status {error}")))
 }
 
 struct ClientUpgradeTarget {
@@ -1680,28 +1685,18 @@ struct SubdomainAvailabilityQuery {
     subdomain: String,
     #[serde(default)]
     installation_id: Option<String>,
-    #[serde(default)]
-    owner_email: Option<String>,
 }
 
 async fn check_client_tunnel_subdomain_availability(
     State(state): State<ServerState>,
-    headers: HeaderMap,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Query(query): Query<SubdomainAvailabilityQuery>,
 ) -> Result<Json<SubdomainAvailabilityResponse>, AppError> {
-    let metadata = extract_client_metadata(&headers, addr);
-    let session = resolve_router_session(&state, &headers).await?;
     Ok(Json(
         state
             .store
             .check_client_tunnel_subdomain_availability(
-                &state.config,
                 &query.subdomain,
                 query.installation_id.as_deref(),
-                metadata.ip.as_deref(),
-                session.as_ref(),
-                query.owner_email.as_deref(),
             )
             .await?,
     ))
@@ -2022,7 +2017,6 @@ fn dashboard_cache_invalidating_write(method: &Method, path: &str) -> bool {
 
 fn dashboard_machine_write_path(path: &str) -> bool {
     const EXACT: &[&str] = &[
-        "/v1/client-market/host-heartbeats",
         "/v1/auth/session/refresh",
         "/v1/dashboard/presence",
         "/v1/gateways/register",
@@ -3928,6 +3922,11 @@ async fn root_handler(
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_string();
+    if crate::online_client_market::rental_label(&host)
+        && crate::proxy::subdomain_for_host(&host, &state.config.tunnel_domain).is_some()
+    {
+        return proxy_handler(State(state), ConnectInfo(peer), req).await;
+    }
     if let Some(route) = state
         .proxy
         .backend_for_host(&host, &state.config.tunnel_domain)
@@ -3965,6 +3964,12 @@ async fn ui_or_proxy_handler(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     req: Request,
 ) -> Response {
+    let host = request_host(&req);
+    if crate::online_client_market::rental_label(&host)
+        && crate::proxy::subdomain_for_host(&host, &state.config.tunnel_domain).is_some()
+    {
+        return proxy_handler(State(state), ConnectInfo(peer), req).await;
+    }
     if should_proxy_host(&state, request_host(&req)).await {
         if matches!(*req.method(), Method::GET | Method::HEAD)
             && is_router_share_ui_path(req.uri().path())
@@ -7266,6 +7271,12 @@ async fn share_edit_events(
         loop {
             match rx.recv().await {
                 Ok(event) if event.installation_id == installation_id => {
+                    let same_workspace={
+                        let conn=state.store.conn.lock().await;
+                        if crate::online_client_market::check_nonce(&conn,&installation_id,"share_edit_events",&query.nonce).is_err(){break}
+                        crate::online_client_market::check_share_id(&conn,&installation_id,&event.share_id).is_ok()
+                    };
+                    if !same_workspace { continue; }
                     let data = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
                     yield Ok(Event::default().event("share_edit_available").data(data));
                 }

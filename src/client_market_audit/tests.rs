@@ -5,28 +5,28 @@ const START: &str = "2026-01-01T00:00:00Z";
 
 pub(super) fn rental(conn: &Connection, n: usize, status: &str) -> String {
     let host = format!("host-{n:04}");
-    let job = format!("job-{n:04}");
-    let installation = format!("client-{n:04}");
-    conn.execute("INSERT INTO router_ssh_hosts (id,ip,port,host_owner_email,provider_id,status,created_at,updated_at)
-        VALUES (?1,?2,22,'provider@example.test','provider','onboarding',?3,?3)",params![host,format!("192.0.2.{n}"),START]).unwrap();
-    crate::test_support::admit_fixture_hosts(&conn);
-    conn.execute("INSERT INTO provisioning_jobs (id,type,host_id,host_owner_email,client_owner_email,client_owner_user_id,subdomain,status,phase,log_blob,created_at,updated_at)
-        VALUES (?1,'create',?2,'provider@example.test','buyer@example.test','buyer',?3,'pending','locked','SECRET_LOG',?4,?4)",params![job,host,format!("client-{n:04}"),START]).unwrap();
-    capture_job_identity_tx(conn, &job).unwrap();
-    if status != "opening" && status != "activation_failed" {
-        conn.execute("INSERT INTO client_market_subscriptions
-            (installation_id,host_id,provider_id,host_owner_email,client_user_id,client_owner_email,status,offer_revision,pricing_model,activated_at,created_at,updated_at)
-            VALUES (?1,?2,'provider','provider@example.test','buyer','buyer@example.test',?3,1,'free',?4,?4,?4)",params![installation,host,status,START]).unwrap();
-        bind_installation_tx(conn, &job, &installation).unwrap();
-        conn.execute(
-            "UPDATE provisioning_jobs SET installation_id=?2,status='succeeded' WHERE id=?1",
-            params![job, installation],
-        )
-        .unwrap();
-    } else if status == "activation_failed" {
-        conn.execute("UPDATE provisioning_jobs SET status='failed',failure_code='secret token raw error' WHERE id=?1",params![job]).unwrap();
-    }
-    format!("job:{job}")
+    let lease = format!("client-{n:04}");
+    crate::test_support::online_listing(conn, &host, "provider", "provider@example.test");
+    conn.execute(
+        "UPDATE online_client_listings SET egress_ip=?2 WHERE installation_id=?1",
+        params![host, format!("192.0.2.{n}")],
+    )
+    .unwrap();
+    conn.execute("INSERT INTO online_client_quotes(id,installation_id,buyer_id,revision,cycle_price_minor,projection_json,expires_at)
+        VALUES(?1,?2,'buyer',1,0,'{}',0)",params![lease,host]).unwrap();
+    let state = match status {
+        "opening" => "starting",
+        "activation_failed" => "released",
+        other => other,
+    };
+    conn.execute("INSERT INTO online_client_leases(id,installation_id,quote_id,buyer_id,tenant_email,seller_id,alias,state,
+        sequence,grant_until,created_at,activated_at,cutoff_at,released_at)
+        VALUES(?1,?2,?1,'buyer','buyer@example.test','provider',?1,?3,2,unixepoch()+3600,unixepoch(?4),
+        CASE WHEN ?5 NOT IN ('activation_failed','opening') THEN unixepoch(?4) END,
+        CASE WHEN ?3 IN ('ending','cleaning','released') THEN unixepoch(?4) END,
+        CASE WHEN ?3='released' THEN unixepoch(?4) END)",
+        params![lease,host,state,START,status]).unwrap();
+    format!("lease:{lease}")
 }
 
 pub(super) fn paid(trial: i64) -> (Connection, String, String) {
@@ -56,7 +56,7 @@ pub(super) fn paid(trial: i64) -> (Connection, String, String) {
         &PrepareContract {
             trial_only: false,
             product_kind: "client_host",
-            product_ref: "job-0001",
+            product_ref: "client-0001",
             trial_scope_ref: "host-0001",
             quote_id: "quote",
             buyer_user_id: "buyer",
@@ -74,14 +74,18 @@ pub(super) fn paid(trial: i64) -> (Connection, String, String) {
     contracts::bind_client_installation_tx(
         &conn,
         &contract,
-        "job-0001",
+        "client-0001",
         "client-0001",
         "buyer",
         "provider",
         START,
     )
     .unwrap();
-    conn.execute("UPDATE client_market_subscriptions SET platform_contract_id=?1,pricing_model='prepaid_calendar_month',cycle_price_minor=1000 WHERE installation_id='client-0001'",params![contract]).unwrap();
+    conn.execute(
+        "UPDATE online_client_quotes SET cycle_price_minor=1000 WHERE id='client-0001'",
+        [],
+    )
+    .unwrap();
     contracts::activate_contract_tx(&conn, &contract, START, START).unwrap();
     (conn, contract, audit)
 }
@@ -92,7 +96,10 @@ fn audit_pages_all_history_with_stable_ties_and_no_resource_dependency() {
     for n in 0..125 {
         rental(&conn, n, "released");
     }
-    conn.execute("DELETE FROM router_ssh_hosts", []).unwrap();
+    conn.execute_batch(
+        "UPDATE online_client_listings SET state='unlisted'; DELETE FROM installations",
+    )
+    .unwrap();
     let mut all = std::collections::HashSet::new();
     for number in 1..=25 {
         let page = list_tx(
@@ -110,7 +117,7 @@ fn audit_pages_all_history_with_stable_ties_and_no_resource_dependency() {
         assert_eq!(page["items"].as_array().unwrap().len(), 5);
         assert_eq!(
             page["items"][0]["id"],
-            format!("job:job-{:04}", 124 - (number - 1) * 5)
+            format!("lease:client-{:04}", 124 - (number - 1) * 5)
         );
         for item in page["items"].as_array().unwrap() {
             assert!(all.insert(item["id"].as_str().unwrap().to_string()));
@@ -174,7 +181,7 @@ fn audit_numbered_pages_jump_directly_and_normalize_empty_partial_and_shrunk_res
         assert_eq!(page["totalPages"], 5);
         assert_eq!(page["page"], number.min(5));
         assert_eq!(page["items"].as_array().unwrap().len(), len);
-        assert_eq!(page["items"][0]["id"], format!("job:job-{first:04}"));
+        assert_eq!(page["items"][0]["id"], format!("lease:client-{first:04}"));
     }
     let shrunk = list_tx(
         &conn,
@@ -188,7 +195,7 @@ fn audit_numbered_pages_jump_directly_and_normalize_empty_partial_and_shrunk_res
     assert_eq!(shrunk["page"], 1);
     assert_eq!(shrunk["totalPages"], 1);
     assert_eq!(shrunk["total"], 1);
-    assert_eq!(shrunk["items"][0]["id"], "job:job-0000");
+    assert_eq!(shrunk["items"][0]["id"], "lease:client-0000");
     for page in [
         json!(-1),
         json!(1.5),
@@ -327,7 +334,7 @@ fn audit_filters_are_bounded_bound_and_independent_of_general_admin() {
 fn audit_identity_is_immutable_and_never_borrows_a_new_tenants_identity() {
     let conn = crate::test_support::database().unwrap();
     let audit = rental(&conn, 1, "released");
-    conn.execute("UPDATE router_ssh_hosts SET provider_id='new-provider',host_owner_email='new@example.test',ip='192.0.2.99',installation_id='new-client' WHERE id='host-0001'",[]).unwrap();
+    conn.execute("UPDATE online_client_listings SET seller_id='new-provider',owner_email='new@example.test',egress_ip='192.0.2.99' WHERE installation_id='host-0001'",[]).unwrap();
     assert!(
         conn.execute(
             "UPDATE client_market_rental_identities SET buyer_email='other@example.test'",
@@ -339,7 +346,6 @@ fn audit_identity_is_immutable_and_never_borrows_a_new_tenants_identity() {
         conn.execute("DELETE FROM client_market_rental_identities", [])
             .is_err()
     );
-    assert!(bind_installation_tx(&conn, "job-0001", "new-client").is_err());
     let value = detail::detail_tx(&conn, &audit, &Default::default()).unwrap();
     let r = &value["record"];
     assert_eq!(r["providerEmail"], "provider@example.test");
@@ -436,8 +442,12 @@ fn audit_event_history_pages_without_raw_logs_or_duplicate_mirrors() {
     let conn = crate::test_support::database().unwrap();
     let audit = rental(&conn, 1, "released");
     for n in 0..120 {
-        conn.execute("INSERT INTO client_market_subscription_events (id,installation_id,event_type,detail_json,created_at)
-            VALUES (?1,'client-0001','cleanup_started','{\"password\":\"NEVER_EXPOSE\"}',?2)",params![format!("event-{n:04}"),START]).unwrap();
+        conn.execute(
+            "INSERT INTO online_client_events(event_key,lease_id,kind,recorded_at)
+            VALUES (?1,'client-0001','assistance',unixepoch(?2))",
+            params![format!("event-{n:04}"), START],
+        )
+        .unwrap();
     }
     let mut q = detail::DetailQuery::default();
     let mut seen = std::collections::HashSet::new();
@@ -456,48 +466,9 @@ fn audit_event_history_pages_without_raw_logs_or_duplicate_mirrors() {
 }
 
 #[test]
-fn an_original_job_can_acquire_a_host_without_inventing_historical_ip() {
-    let conn = crate::test_support::database().unwrap();
-    rental(&conn, 1, "active");
-    conn.execute(
-        "INSERT INTO provisioning_jobs (id,type,client_owner_email,status,created_at,updated_at)
-        VALUES ('previously-unassigned','create','buyer@example.test','pending',?1,?1)",
-        params![START],
-    )
-    .unwrap();
-    capture_job_identity_tx(&conn, "previously-unassigned").unwrap();
-    conn.execute(
-        "UPDATE provisioning_jobs SET host_id='host-0001' WHERE id='previously-unassigned'",
-        [],
-    )
-    .unwrap();
-    let page = detail::detail_tx(&conn, "job:previously-unassigned", &Default::default()).unwrap();
-    assert_eq!(page["record"]["hostId"], "host-0001");
-    assert_eq!(page["record"]["hostPresent"], true);
-    assert!(page["record"]["hostIp"].is_null());
-    assert!(page["record"]["money"].is_null());
-    conn.execute("DELETE FROM router_ssh_hosts WHERE id='host-0001'", [])
-        .unwrap();
-    assert_eq!(
-        detail::detail_tx(&conn, "job:previously-unassigned", &Default::default()).unwrap()["record"]
-            ["hostId"],
-        "host-0001"
-    );
-}
-
-#[test]
 fn failed_delivery_is_not_a_successfully_completed_rental() {
     let (conn, contract, audit) = paid(3600);
-    conn.execute(
-        "DELETE FROM client_market_subscriptions WHERE installation_id='client-0001'",
-        [],
-    )
-    .unwrap();
-    conn.execute(
-        "UPDATE provisioning_jobs SET status='failed' WHERE id='job-0001'",
-        [],
-    )
-    .unwrap();
+    conn.execute("UPDATE online_client_leases SET state='released',activated_at=NULL,released_at=unixepoch(?1)",params![START]).unwrap();
     conn.execute(
         "UPDATE market_platform_contracts SET status='ended',ended_at=?2 WHERE id=?1",
         params![contract, START],
@@ -510,10 +481,10 @@ fn failed_delivery_is_not_a_successfully_completed_rental() {
 
 pub(super) fn accept_voluntary_exit(conn: &Connection, at: &str, reason: &str) {
     conn.execute("INSERT INTO client_termination_previews
-        SELECT 'audit-preview',s.installation_id,s.client_user_id,p.id,COALESCE(t.policy_version,0),'2026-02-01T00:00:00Z'
-        FROM client_market_subscriptions s JOIN market_platform_contracts c ON c.id=s.platform_contract_id
+        SELECT 'audit-preview',s.id,s.buyer_id,p.id,COALESCE(t.policy_version,0),'2026-02-01T00:00:00Z'
+        FROM online_client_leases s JOIN market_platform_contracts c ON c.product_ref=s.id
         LEFT JOIN market_platform_periods p ON p.contract_id=c.id AND p.sequence=c.current_period_sequence
-        LEFT JOIN client_termination_period_terms t ON t.period_id=p.id WHERE s.installation_id='client-0001'", []).unwrap();
+        LEFT JOIN client_termination_period_terms t ON t.period_id=p.id WHERE s.id='client-0001'", []).unwrap();
     crate::client_market_termination::accept_tx(
         conn,
         "client-0001",
@@ -688,7 +659,7 @@ fn many_renewals_stay_in_one_rental_with_independent_period_pagination() {
 }
 
 #[test]
-fn audit_lifecycle_uses_indexed_job_lookups_before_page_scoped_money() {
+fn audit_lifecycle_uses_indexed_lease_lookups_before_page_scoped_money() {
     let conn = crate::test_support::database().unwrap();
     rental(&conn, 1, "released");
     let mut statement = conn
@@ -704,7 +675,7 @@ fn audit_lifecycle_uses_indexed_job_lookups_before_page_scoped_money() {
         .collect::<crate::db::Result<Vec<_>>>()
         .unwrap()
         .join("\n");
-    assert!(plan.contains("idx_client_rental_audit_jobs"), "{plan}");
+    assert!(plan.contains("SEARCH r USING INDEX"), "{plan}");
     assert!(!plan.contains("SCAN cleanup"), "{plan}");
     // Amount sources must only be accessed by attach_money, after LIMIT 5.
     for source in [

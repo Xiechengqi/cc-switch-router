@@ -893,3 +893,63 @@ fn a_recovered_trial_conversion_gap_does_not_report_billing_review() {
     let later = (time(&at).unwrap() + Duration::seconds(10)).to_rfc3339();
     assert!(availability_at_tx(&c, "sub", &later).unwrap().can_terminate);
 }
+
+#[test]
+fn parent_rental_ends_child_without_penalty_and_requires_actual_receipt() {
+    let (c, contract, at) = fixture(true);
+    parent_release_tx(&c, "sub", &at).unwrap();
+    parent_release_tx(&c, "sub", &at).unwrap();
+    let t = for_subscription_tx(&c, "sub").unwrap().unwrap();
+    assert_eq!(t.reason, "parent_lease_ended");
+    assert_eq!(t.compensation_cap_units, 0);
+    assert!(t.revoked_at.is_none());
+    assert!(finalize_contract_tx(&c, &contract, true, &at).is_err());
+    let ack = receipt(&c, &t, "0");
+    record_receipt_tx(&c, "installation", &ack, &at).unwrap();
+    finalize_contract_tx(&c, &contract, true, &at).unwrap();
+    assert!(
+        for_subscription_tx(&c, "sub")
+            .unwrap()
+            .unwrap()
+            .revoked_at
+            .is_some()
+    );
+}
+
+#[test]
+fn parent_cutoff_outside_child_period_preserves_the_exit_and_bounds_the_receipt() {
+    for before_start in [true, false] {
+        let (c, _, at) = fixture(true);
+        let period = basis(&c, "sub", &at).unwrap();
+        let cutoff_ms = if before_start {
+            period.period_start_ms - 1
+        } else {
+            period.period_end_ms + 1
+        };
+        let cutoff = chrono::DateTime::from_timestamp_millis(cutoff_ms)
+            .unwrap()
+            .to_rfc3339();
+        parent_release_tx(&c, "sub", &cutoff).unwrap();
+        let t = for_subscription_tx(&c, "sub").unwrap().unwrap();
+        assert_eq!(t.cutoff_at, cutoff);
+        let expected = if before_start {
+            assert_eq!(t.period_id, period.period_id);
+            period.period_start_ms
+        } else {
+            // Settling through the last instant closed the paid month.
+            assert!(t.period_id.is_none());
+            cutoff_ms
+        };
+        assert_eq!(fence_tx(&c, "sub").unwrap().unwrap().cutoff_at_ms, expected);
+        let mut ack = receipt(&c, &t, "0");
+        let revoked = cutoff_ms.max(expected);
+        ack.revoked_at_ms = revoked;
+        let received = chrono::DateTime::from_timestamp_millis(revoked)
+            .unwrap()
+            .to_rfc3339();
+        ack.cutoff_at_ms = expected - 1;
+        assert!(record_receipt_tx(&c, "installation", &ack, &received).is_err());
+        ack.cutoff_at_ms = expected;
+        record_receipt_tx(&c, "installation", &ack, &received).unwrap();
+    }
+}

@@ -14,7 +14,6 @@ struct Permissions {
     waive: bool,
     respond: bool,
     resolve: bool,
-    retry_cleanup: bool,
 }
 
 struct Facts {
@@ -33,7 +32,6 @@ struct Facts {
     disputed: bool,
     opened: Option<String>,
     responded: bool,
-    retry_cleanup: bool,
 }
 
 // Only small, indexed facts are loaded for summary/counts. Claims, emails,
@@ -41,10 +39,7 @@ struct Facts {
 const FACTS: &str = "SELECT t.id,t.installation_id,t.host_id,t.buyer_user_id,t.provider_user_id,
     t.status,t.responsibility,t.compensation_cap_units,t.compensation_units,t.held_units,
     COALESCE(c.credited_units,0),t.cleanup_confirmed_at IS NOT NULL,c.unlock_at,
-    t.dispute_used,t.dispute_opened_at,t.provider_responded_at IS NOT NULL,t.cutoff_at,
-    EXISTS(SELECT 1 FROM router_ssh_hosts h WHERE h.id=t.host_id
-        AND h.installation_id=t.installation_id AND h.provider_id=t.provider_user_id
-        AND h.status IN ('allocated','unreachable','draining'))
+    t.dispute_used,t.dispute_opened_at,t.provider_responded_at IS NOT NULL,t.cutoff_at
     FROM client_market_terminations t LEFT JOIN client_termination_compensations c ON c.id=t.id";
 
 fn facts_row(r: &crate::db::Row<'_>) -> crate::db::Result<Facts> {
@@ -64,7 +59,6 @@ fn facts_row(r: &crate::db::Row<'_>) -> crate::db::Result<Facts> {
         disputed: r.get(13)?,
         opened: r.get(14)?,
         responded: r.get(15)?,
-        retry_cleanup: r.get(17)?,
     })
 }
 
@@ -124,7 +118,6 @@ fn project(f: &Facts, user: &str, owner: bool, at: &str) -> Result<Projection, A
         // money and must not take away the Provider's contractual response right.
         respond: provider && unresolved && !f.responded && !due && remaining > 0,
         resolve: owner && decidable,
-        retry_cleanup: provider && f.status == "cleanup_failed" && f.retry_cleanup,
     };
     let (attention, action_required) = if permissions.respond {
         ("provider_response", true)
@@ -132,8 +125,6 @@ fn project(f: &Facts, user: &str, owner: bool, at: &str) -> Result<Projection, A
         ("finance_review", true)
     } else if owner && unresolved && f.responded && permissions.resolve {
         ("owner_decision", true)
-    } else if permissions.retry_cleanup {
-        ("cleanup_failed", true)
     } else if due {
         ("timeout_pending", false)
     } else if unresolved {

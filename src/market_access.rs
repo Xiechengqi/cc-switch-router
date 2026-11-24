@@ -871,13 +871,12 @@ fn resolve_access_target_tx(
         TARGET_CLIENT_HOST => {
             let target = conn
                 .query_row(
-                    "SELECT host.provider_id, host.host_owner_email,
-                            COALESCE(NULLIF(TRIM(host.hostname), ''), host.ip),
-                            host.daily_rate_minor, host.pricing_model,
-                            host.cycle_price_minor, host.billing_interval,
-                            CASE WHEN host.daily_rate_minor IS NULL AND host.cycle_price_minor IS NULL THEN NULL
-                                 ELSE COALESCE(NULLIF(TRIM(host.currency), ''), 'USD') END
-                     FROM router_ssh_hosts host WHERE host.id = ?1 AND host.status = 'idle'",
+                    "SELECT l.seller_id,l.owner_email,t.subdomain,NULL,
+                            CASE WHEN l.cycle_price_minor>0 THEN 'prepaid_calendar_month' ELSE 'free' END,
+                            NULLIF(l.cycle_price_minor,0),CASE WHEN l.cycle_price_minor>0 THEN 'calendar_month' END,
+                            CASE WHEN l.cycle_price_minor>0 THEN 'USD' END
+                     FROM online_client_supply l JOIN installation_client_tunnels t ON t.installation_id=l.installation_id
+                     WHERE l.installation_id=?1 AND l.state='listed' AND l.supply_status='idle'",
                     params![target_id],
                     |row| {
                         Ok((
@@ -2110,6 +2109,35 @@ mod tests {
             target_kind: TARGET_SHARE_SEAT.into(),
             target_id: seat_id.into(),
         }
+    }
+
+    #[test]
+    fn online_client_access_request_preserves_seller_and_monthly_terms() {
+        let c = access_request_connection();
+        let now = test_request_time();
+        c.execute("INSERT INTO installations(id,public_key,platform,app_version,created_at,last_seen_at,control_secret_b64,owner_email,owner_verified_at,market_lease_v1)
+            VALUES('client-offer','test','linux','1','now','now','local-test','supplier@example.com','now',1)",[]).unwrap();
+        c.execute("INSERT INTO installation_client_tunnels(installation_id,owner_email,subdomain,created_at,updated_at)
+            VALUES('client-offer','supplier@example.com','seller-client','now','now')",[]).unwrap();
+        c.execute("INSERT INTO online_client_listings(installation_id,seller_id,owner_email,state,revision,sequence,cycle_price_minor,updated_at,healthy,observed_at)
+            VALUES('client-offer','supplier','supplier@example.com','listed',1,1,795,unixepoch(),1,unixepoch())",[]).unwrap();
+        let buyer = test_actor("buyer", "buyer@example.com");
+        let input = CreateAccessRequest {
+            target_kind: TARGET_CLIENT_HOST.into(),
+            target_id: "client-offer".into(),
+        };
+        let request = create_access_request_tx(&c, &buyer, &input, now).unwrap();
+        assert_eq!(request.supplier_user_id, "supplier");
+        assert_eq!(request.target_label, "seller-client");
+        assert_eq!(request.cycle_price_minor, Some(795));
+        assert_eq!(request.billing_interval.as_deref(), Some("calendar_month"));
+        assert_eq!(request.pricing_model, "prepaid_calendar_month");
+        assert_eq!(
+            create_access_request_tx(&c, &buyer, &input, now)
+                .unwrap()
+                .id,
+            request.id
+        );
     }
 
     #[test]

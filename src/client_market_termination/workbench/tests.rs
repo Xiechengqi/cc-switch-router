@@ -193,17 +193,8 @@ fn workbench_survives_host_reuse_deletion_and_does_not_give_a_new_provider_old_c
     let (conn, contract) = fixture(1000, true, 0);
     let at = deliver(&conn, &contract, 10);
     let t = accept(&conn, &at, "provider_issue");
-    conn.execute(
-        "INSERT INTO router_ssh_hosts
-        (id,ip,port,host_owner_email,status,installation_id,provider_id,created_at,updated_at)
-        VALUES (?1,'192.0.2.10',22,'provider@example.test','draining',?2,'provider',?3,?3)",
-        params![HOST, t.installation_id, at],
-    )
-    .unwrap();
     cleanup_failed_tx(&conn, &t.installation_id, &at).unwrap();
-    assert!(fact_tx(&conn, &t.id).unwrap().retry_cleanup);
-    conn.execute("UPDATE router_ssh_hosts SET installation_id='new-install',provider_id='new-provider',status='allocated' WHERE id=?1",params![HOST]).unwrap();
-    assert!(!fact_tx(&conn, &t.id).unwrap().retry_cleanup);
+    conn.execute("UPDATE online_client_listings SET seller_id='new-provider',owner_email='next@example.test' WHERE installation_id=?1",params![HOST]).unwrap();
     assert!(detail_tx(&conn, &t.id, "new-provider", false, &at, None).is_err());
     assert_eq!(
         summary_tx(&conn, "new-provider", false, &at).unwrap()["hosts"],
@@ -213,8 +204,11 @@ fn workbench_survives_host_reuse_deletion_and_does_not_give_a_new_provider_old_c
         summary_tx(&conn, "provider", false, &at).unwrap()["hosts"][0]["terminationId"],
         t.id
     );
-    conn.execute("DELETE FROM router_ssh_hosts WHERE id=?1", params![HOST])
-        .unwrap();
+    conn.execute(
+        "UPDATE online_client_listings SET state='unlisted' WHERE installation_id=?1",
+        params![HOST],
+    )
+    .unwrap();
     assert_eq!(
         detail_tx(&conn, &t.id, "provider", false, &at, None).unwrap()["hostId"],
         HOST

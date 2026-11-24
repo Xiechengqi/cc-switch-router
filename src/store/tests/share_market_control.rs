@@ -193,6 +193,90 @@ async fn managed_control_direct_reply_accepts_materialized_token_and_usd_anchors
 }
 
 #[tokio::test]
+async fn managed_control_parent_revoke_requires_and_recovers_the_original_signed_receipt() {
+    let (store, signer, share) = managed_control_fixture(false).await;
+    store
+        .apply_share_edit_with_receipt("managed-edit", share.clone(), None)
+        .await
+        .unwrap();
+    let now = Utc::now();
+    {
+        let conn = store.conn.lock().await;
+        crate::share_market_termination::parent_release_tx(&conn, "managed-sub", &now.to_rfc3339())
+            .unwrap();
+    }
+    store
+        .share_market_reconcile_and_dispatch(now)
+        .await
+        .unwrap();
+    let pending = |conn: &Connection| {
+        list_pending_share_edits_for_installation(conn, "managed-install", &[]).unwrap()
+    };
+    let edit = {
+        let conn = store.conn.lock().await;
+        pending(&conn).pop().expect("pending child revoke")
+    };
+    assert!(edit.patch.requires_termination_receipt());
+    assert!(matches!(
+        store
+            .apply_share_edit_with_receipt(&edit.id, share, None)
+            .await,
+        Err(AppError::Conflict(_))
+    ));
+    // Simulate a synchronous response accepted by an older Router before
+    // the Server delivered any settlement evidence.
+    {
+        let conn = store.conn.lock().await;
+        assert_eq!(pending(&conn)[0].status, "pending");
+        conn.execute(
+            "UPDATE share_edit_requests SET status='applied' WHERE id=?1",
+            params![edit.id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE share_control_operations SET status='applied' WHERE edit_id=?1",
+            params![edit.id],
+        )
+        .unwrap();
+        assert_eq!(pending(&conn)[0].id, edit.id);
+    }
+    let grant = edit.patch.managed_grant.unwrap();
+    let fence = grant.termination.unwrap();
+    let mut ack = serde_json::json!({"editId":edit.id,"revision":edit.revision,"status":"applied"});
+    assert!(
+        signed_managed_ack(&store, &signer, ack.clone())
+            .await
+            .is_err()
+    );
+    ack["terminationReceipt"] = serde_json::json!({
+        "terminationId":fence.termination_id,"entitlementId":grant.entitlement_id,
+        "operationId":grant.operation_id,"shareId":"managed-share","email":"buyer@example.com",
+        "cutoffAtMs":fence.cutoff_at_ms,"periodStartMs":fence.period_start_ms,
+        "periodEndMs":fence.period_end_ms,"revokedAtMs":fence.cutoff_at_ms,
+        "archiveSinceMs":fence.period_start_ms,"quotaUsedBeforePeriod":"0","windows":[]
+    });
+    signed_managed_ack(&store, &signer, ack.clone())
+        .await
+        .unwrap();
+    signed_managed_ack(&store, &signer, ack).await.unwrap();
+    store
+        .share_market_reconcile_and_dispatch(Utc::now())
+        .await
+        .unwrap();
+    let conn = store.conn.lock().await;
+    assert!(pending(&conn).is_empty());
+    assert_eq!(
+        conn.query_row(
+            "SELECT status FROM share_market_subscriptions WHERE id='managed-sub'",
+            [],
+            |row| row.get::<_, String>(0)
+        )
+        .unwrap(),
+        "released"
+    );
+}
+
+#[tokio::test]
 async fn managed_control_invalid_direct_reply_queues_cleanup_even_with_an_unrelated_settings_receipt()
  {
     let (store, _, mut returned) = managed_control_fixture(true).await;

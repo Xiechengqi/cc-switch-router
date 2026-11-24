@@ -305,10 +305,10 @@ fn service_names_follow_rental_and_provisioning_identities_not_contract_ids() {
     let c = Connection::open_in_memory().unwrap();
     c.execute_batch("CREATE TABLE market_platform_contracts(id,product_kind,product_ref,service_ref,buyer_user_id);
         CREATE TABLE share_market_subscriptions(id,share_id);CREATE TABLE shares(share_id,share_name);
-        CREATE TABLE provisioning_jobs(id,subdomain);
+        CREATE TABLE online_client_leases(id,alias);
         INSERT INTO market_platform_contracts VALUES('share-contract','share','rental',NULL,'buyer'),('client-contract','client_host','job','installation','buyer');
         INSERT INTO share_market_subscriptions VALUES('rental','share-id');INSERT INTO shares VALUES('share-id','summit--ashhppredz');
-        INSERT INTO provisioning_jobs VALUES('job','host-example');").unwrap();
+        INSERT INTO online_client_leases VALUES('job','host-example');").unwrap();
     for (contract, expected) in [
         ("share-contract", "summit--ashhppredz"),
         ("client-contract", "host-example"),

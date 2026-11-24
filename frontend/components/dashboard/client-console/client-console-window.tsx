@@ -6,14 +6,12 @@ import * as React from "react";
 import { ClientConsoleIframe } from "@/components/dashboard/client-console/client-console-iframe";
 import { ClientConsoleTrafficLights } from "@/components/dashboard/client-console/client-console-traffic-lights";
 import {
-  CONSOLE_DOCK_HEIGHT,
   CONSOLE_DOCK_RESERVED_HEIGHT,
   type ConsoleWindow,
   consoleWindowKindLabelKey,
   type NormalRect,
   useClientConsole,
 } from "@/components/dashboard/client-console/client-console-manager";
-import { useWebTerminalOptional } from "@/components/dashboard/web-terminal";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { DASHBOARD_CLIENTS_PATH, isClientsRoute } from "@/lib/dashboard-nav";
 
@@ -52,8 +50,6 @@ function useConsoleClickOutsideMinimize({
     function shouldIgnoreClickOutside(target: Element) {
       if (target.closest("[data-console-window]")) return true;
       if (target.closest("[data-console-dock]")) return true;
-      if (target.closest("[data-web-terminal-window]")) return true;
-      if (target.closest("[data-web-terminal-dock]")) return true;
       if (target.closest("[data-board-dock]")) return true;
       if (target.closest("[data-rac]")) return true;
       if (target.closest("[role='dialog']")) return true;
@@ -95,11 +91,7 @@ export function ClientConsoleWindowLayer() {
     refreshConsole,
     updateConsoleRect,
   } = useClientConsole();
-  const webTerminal = useWebTerminalOptional();
-
-  const peerDockExtra =
-    webTerminal?.dockVisible ? CONSOLE_DOCK_HEIGHT + 8 : 0;
-  const dockOffset = dockVisible ? CONSOLE_DOCK_RESERVED_HEIGHT + 12 + peerDockExtra : 0;
+  const dockOffset = dockVisible ? CONSOLE_DOCK_RESERVED_HEIGHT + 12 : 0;
   const mountedWindows = windows.filter((window) => window.activated);
 
   useConsoleClickOutsideMinimize({

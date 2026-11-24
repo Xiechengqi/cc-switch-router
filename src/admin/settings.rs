@@ -121,7 +121,6 @@ pub enum SettingsTier {
 pub enum SettingsPanel {
     MapDisplay,
     Announcement,
-    ProvisionKey,
     ModelPrices,
     MarketFinance,
     EmailHealth,
@@ -214,13 +213,6 @@ pub const SETTINGS_SECTIONS: &[SettingsSection] = &[
         "Share Market",
         &["Share Market"],
         &[],
-    ),
-    section(
-        "client_market",
-        SettingsCategory::Marketplace,
-        "Client Market",
-        &["Client Market"],
-        &[SettingsPanel::ProvisionKey],
     ),
     section(
         "model_prices",
@@ -1072,19 +1064,6 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         tier: SettingsTier::Essential,
     },
     // ── Client Market (Marketplace) ──
-    SettingsField {
-        key: "CC_SWITCH_ROUTER_IP_INTEL_ENDPOINTS",
-        label: "Host IP intelligence endpoints",
-        group: "Client Market",
-        field_type: FieldType::UrlList,
-        required: false,
-        restart_required: true,
-        default: Some("http://3.0.3.0,http://3.0.2.1,http://3.0.2.9"),
-        description: "Ordered base URLs used to enrich Client Market Host IPs. Every registered Host IP is disclosed to these services; use trusted endpoints.",
-        placeholder: Some("https://ip-intel-1.example.com, https://ip-intel-2.example.com"),
-        dynamic_group: None,
-        tier: SettingsTier::Essential,
-    },
     // ── Email (Resend) (Notifications) ──
     SettingsField {
         key: "CC_SWITCH_ROUTER_RESEND_API_KEY",
@@ -2396,32 +2375,6 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         dynamic_group: None,
         tier: SettingsTier::Bootstrap,
     },
-    SettingsField {
-        key: "CC_SWITCH_ROUTER_PROVISION_SSH_PRIVATE_KEY_PATH",
-        label: "Client Market SSH private key",
-        group: "Paths",
-        field_type: FieldType::Path,
-        required: false,
-        restart_required: true,
-        default: None,
-        description: "Dedicated outbound SSH private key used to verify and provision Client Market hosts. Generated as Ed25519 on first start when missing.",
-        placeholder: Some("~/.ssh/cc-switch-router-provision"),
-        dynamic_group: None,
-        tier: SettingsTier::Bootstrap,
-    },
-    SettingsField {
-        key: "CC_SWITCH_ROUTER_PROVISION_SSH_PUBLIC_KEY_PATH",
-        label: "Client Market SSH public key",
-        group: "Paths",
-        field_type: FieldType::Path,
-        required: false,
-        restart_required: true,
-        default: None,
-        description: "Matching OpenSSH public key shown on Client Market for authorized_keys. Derived from the private key when missing.",
-        placeholder: Some("~/.ssh/cc-switch-router-provision.pub"),
-        dynamic_group: None,
-        tier: SettingsTier::Bootstrap,
-    },
 ];
 
 pub fn schema_response() -> SettingsSchemaResponse {
@@ -2447,20 +2400,6 @@ pub fn schema_response() -> SettingsSchemaResponse {
                 }
                 "CC_SWITCH_ROUTER_HOST_KEY_PATH" => {
                     let path = crate::config::default_host_key_path().display().to_string();
-                    view.placeholder = Some(path);
-                }
-                "CC_SWITCH_ROUTER_PROVISION_SSH_PRIVATE_KEY_PATH" => {
-                    let path = crate::config::default_provision_ssh_private_key_path()
-                        .display()
-                        .to_string();
-                    view.default = Some(path.clone());
-                    view.placeholder = Some(path);
-                }
-                "CC_SWITCH_ROUTER_PROVISION_SSH_PUBLIC_KEY_PATH" => {
-                    let path = crate::config::default_provision_ssh_public_key_path()
-                        .display()
-                        .to_string();
-                    view.default = Some(path.clone());
                     view.placeholder = Some(path);
                 }
                 "CC_SWITCH_ROUTER_METRICS_DB_PATH" => {
@@ -2550,8 +2489,6 @@ fn risk_for_field(field: &SettingsField) -> RiskLevel {
         | "CC_SWITCH_ROUTER_TURSO_URL"
         | "CC_SWITCH_ROUTER_TURSO_AUTH_TOKEN"
         | "CC_SWITCH_ROUTER_HOST_KEY_PATH"
-        | "CC_SWITCH_ROUTER_PROVISION_SSH_PRIVATE_KEY_PATH"
-        | "CC_SWITCH_ROUTER_PROVISION_SSH_PUBLIC_KEY_PATH"
         | "CC_SWITCH_ROUTER_ADMIN_EMAILS"
         | "CC_SWITCH_ROUTER_IP_BLACKLIST"
         | "CC_SWITCH_ROUTER_BARK_SERVER_URL"
@@ -2772,8 +2709,6 @@ pub const UNLISTED_ENV_KEYS: &[&str] = &[
     "CC_SWITCH_ROUTER_MARKET_PAYMENT_MASTER_KEY",
     "CC_SWITCH_ROUTER_MARKET_PAYMENT_MASTER_KEYS",
     "CC_SWITCH_ROUTER_MARKET_SUSPENDED_TERMINATE_DAYS",
-    // Legacy spelling of the provisioning private-key path.
-    "CC_SWITCH_ROUTER_PROVISION_SSH_KEY_PATH",
     // Local development login shortcut.
     "CC_SWITCH_ROUTER_DEV_AUTH_BYPASS",
     "CC_SWITCH_ROUTER_DEV_AUTH_EMAIL",
@@ -3222,16 +3157,6 @@ fn resolved_default_value(field: &SettingsField) -> Option<String> {
         "CC_SWITCH_ROUTER_HOST_KEY_PATH" => {
             Some(crate::config::default_host_key_path().display().to_string())
         }
-        "CC_SWITCH_ROUTER_PROVISION_SSH_PRIVATE_KEY_PATH" => Some(
-            crate::config::default_provision_ssh_private_key_path()
-                .display()
-                .to_string(),
-        ),
-        "CC_SWITCH_ROUTER_PROVISION_SSH_PUBLIC_KEY_PATH" => Some(
-            crate::config::default_provision_ssh_public_key_path()
-                .display()
-                .to_string(),
-        ),
         "CC_SWITCH_ROUTER_METRICS_DB_PATH" => Some(
             crate::config::default_metrics_db_path()
                 .display()
@@ -3832,14 +3757,7 @@ fn normalize_url_list(key: &str, raw: &str) -> Result<String, AppError> {
         if piece.is_empty() {
             continue;
         }
-        let normalized = if key == "CC_SWITCH_ROUTER_IP_INTEL_ENDPOINTS"
-            && !piece.starts_with("http://")
-            && !piece.starts_with("https://")
-        {
-            format!("https://{piece}")
-        } else {
-            piece.to_string()
-        };
+        let normalized = piece.to_string();
         let parsed = url::Url::parse(&normalized)
             .map_err(|_| AppError::BadRequest(format!("{key} contains an invalid URL: {piece}")))?;
         let required_scheme = if key == "CC_SWITCH_ROUTER_CLOCK_SOURCES" {
@@ -6072,8 +5990,8 @@ mod tests {
     #[test]
     fn settings_contract_places_every_field_in_one_section() {
         let schema = schema_response();
-        assert_eq!(SETTINGS_FIELDS.len(), 137);
-        assert_eq!(schema.fields.len(), 137);
+        assert_eq!(SETTINGS_FIELDS.len(), 134);
+        assert_eq!(schema.fields.len(), 134);
         assert_eq!(schema.categories.len(), SettingsCategory::ALL.len());
         assert!(
             SETTINGS_FIELDS
@@ -6521,7 +6439,7 @@ mod tests {
     }
 
     #[test]
-    fn clock_and_ip_intelligence_url_lists_are_normalized_and_validated() {
+    fn clock_sources_are_normalized_and_validated() {
         let clock = field_by_key("CC_SWITCH_ROUTER_CLOCK_SOURCES").expect("clock sources");
         assert!(normalize_value(clock, "https://a.example,https://b.example").is_err());
         assert!(
@@ -6537,14 +6455,6 @@ mod tests {
                 "https://a.example,https://b.example,https://c.example"
             )
             .is_ok()
-        );
-
-        let intel = field_by_key("CC_SWITCH_ROUTER_IP_INTEL_ENDPOINTS").expect("IP intel");
-        assert_eq!(
-            normalize_value(intel, "intel.example.com/, http://trusted.example/")
-                .expect("valid IP intel list")
-                .as_deref(),
-            Some("https://intel.example.com,http://trusted.example")
         );
     }
 
@@ -6604,10 +6514,7 @@ mod tests {
                 std::env::temp_dir().join("cc-switch-router-rebuild-test.db"),
             ),
             host_key_path: std::env::temp_dir().join("cc-switch-router-rebuild-test.key"),
-            provision_ssh_private_key_path: std::env::temp_dir()
-                .join("cc-switch-router-rebuild-test-id_rsa"),
-            provision_ssh_public_key_path: std::env::temp_dir()
-                .join("cc-switch-router-rebuild-test-id_rsa.pub"),
+
             cleanup_interval_secs: 300,
             lease_retention_secs: 24 * 60 * 60,
             request_log_retention_days: 30,
@@ -6636,7 +6543,6 @@ mod tests {
             market_usd_cny_rate_micros: crate::market_common::DEFAULT_USD_CNY_RATE_MICROS,
             market_provider_recommendation_mode:
                 crate::config::MarketProviderRecommendationMode::Shadow,
-            ip_intel_endpoints: Vec::new(),
             verification_service_base_url: "https://example.com".into(),
             verification_service_api_key: None,
             router_owner_email: Some("router@router.example.com".into()),

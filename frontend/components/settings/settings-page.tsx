@@ -24,7 +24,6 @@ import { Alert, Button, Chip, Input, Switch, TextArea } from "@heroui/react";
 import * as React from "react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
-import { CopyableCodeField } from "@/components/common/copyable-code-field";
 import { CompactSelect } from "@/components/common/compact-select";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { AlertChannelsPanel } from "@/components/settings/alert-channels-panel";
@@ -47,7 +46,6 @@ import {
 import {
   ApiError,
   getMapDisplay,
-  getProvisionSshKey,
   getSettings,
   removeUnrecognizedSettingsKeys,
   saveSettings,
@@ -64,7 +62,6 @@ import {
 import type {
   MapDisplaySettings,
   ClientServerReleaseValidation,
-  ProvisionSshKey,
   SettingValueEntry,
   SettingsCategoryId,
   SettingsField,
@@ -150,8 +147,6 @@ export function SettingsPage() {
   const [mapDraft, setMapDraft] = React.useState<MapDisplaySettings>(DEFAULT_MAP_DISPLAY);
   const [mapLoading, setMapLoading] = React.useState(true);
   const [mapError, setMapError] = React.useState("");
-  const [provisionSshKey, setProvisionSshKey] = React.useState<ProvisionSshKey | null>(null);
-  const [provisionError, setProvisionError] = React.useState("");
   const [settingsRevision, setSettingsRevision] = React.useState(0);
   const [pendingRevealKey, setPendingRevealKey] = React.useState("");
   const [expandedGroups, setExpandedGroups] = React.useState<Set<string>>(() => new Set());
@@ -220,21 +215,11 @@ export function SettingsPage() {
     }
   }, []);
 
-  const loadProvisionKey = React.useCallback(async () => {
-    try {
-      setProvisionSshKey(await getProvisionSshKey());
-      setProvisionError("");
-    } catch (cause) {
-      setProvisionError(errorMessage(cause));
-    }
-  }, []);
-
   React.useEffect(() => {
     if (!isAdmin) return;
     void loadSettings();
     void loadMap();
-    void loadProvisionKey();
-  }, [isAdmin, loadMap, loadProvisionKey, loadSettings]);
+  }, [isAdmin, loadMap, loadSettings]);
 
   React.useEffect(() => {
     if (!navigationReady || !snapshot || deepLinkApplied.current) return;
@@ -547,8 +532,6 @@ export function SettingsPage() {
         );
       case "announcement":
         return <InstantPanel><AnnouncementPanel /></InstantPanel>;
-      case "provision_key":
-        return <ProvisionKeyPanel value={provisionSshKey} error={provisionError} />;
       case "model_prices":
         return <InstantPanel><ModelPricesPanel /></InstantPanel>;
       case "market_finance":
@@ -640,7 +623,6 @@ export function SettingsPage() {
   function reloadAll() {
     void loadSettings();
     void loadMap();
-    void loadProvisionKey();
   }
 
   async function removeUnrecognized(keys: string[]) {
@@ -1312,23 +1294,6 @@ function ClientServerReleaseFeedback({ check }: { check: ClientServerReleaseChec
       )}
       <span>{content}</span>
     </p>
-  );
-}
-
-function ProvisionKeyPanel({ value, error }: { value: ProvisionSshKey | null; error: string }) {
-  const { t } = useLocaleText();
-  return (
-    <section>
-      <h3 className="text-base font-semibold">{t("settings.provisionSshKeyTitle")}</h3>
-      <p className="mt-2 text-sm text-muted-foreground">{t("settings.provisionSshKeyDesc")}</p>
-      {error ? <Alert status="danger" className="mt-4">{error}</Alert> : null}
-      {value ? (
-        <div className="mt-4 grid gap-3">
-          <CopyableCodeField label={t("clientMarket.publicKey")} value={value.publicKey} copyLabel={t("clientMarket.copy")} copiedLabel={t("clientMarket.copied")} />
-          <CopyableCodeField label={t("clientMarket.authorizedKeysLine")} value={value.authorizedKeysLine} copyLabel={t("clientMarket.copy")} copiedLabel={t("clientMarket.copied")} />
-        </div>
-      ) : null}
-    </section>
   );
 }
 

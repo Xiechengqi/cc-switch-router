@@ -3,9 +3,8 @@
 import { Button, Card, Drawer, toast } from "@heroui/react";
 import { ArrowRightLeft, ChevronDown, Copy, ListFilter, MessageCircle, Plus, ScrollText, Search, Terminal, X } from "lucide-react";
 import * as React from "react";
-import { CreateClientDialog } from "@/components/dashboard/create-client-dialog";
-import { ClientMarketRentalBanner } from "@/components/dashboard/client-market-rental-banner";
-import { MarketClientBadge, MarketClientStatusLine } from "@/components/dashboard/client-market-client-context";
+import Link from "next/link";
+import { ListOnlineClient } from "./client-market/online-market";
 import { ShareConnectDialog } from "@/components/dashboard/share-connect-dialog";
 import { ClientOnlineHeatmap } from "@/components/dashboard/client-online-heatmap";
 import { ShareModelHealthHeatmap } from "@/components/dashboard/share-model-health-heatmap";
@@ -40,16 +39,15 @@ import {
   shareApiParts,
   sortClients,
 } from "@/components/dashboard/data-tables";
-import type { ClientMarketRental, DashboardClient, ShareView } from "@/lib/types";
+import type { DashboardClient, ShareView } from "@/lib/types";
 import { formatDateTime, formatRelativeTime, preferredScrollBehavior } from "@/lib/utils";
 import { usePersistentState } from "@/lib/use-persistent-state";
-import { getMyClientMarketRentals } from "@/lib/api";
 import { CompactSelect } from "@/components/common/compact-select";
 import { clientWebTerminalUrl } from "@/lib/client-web-view";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
 import { useClientChat } from "@/components/chat/client-chat";
 import { useAuth } from "@/components/auth/auth-provider";
-import { marketClientContext } from "@/lib/client-market-client-status";
+import { DASHBOARD_CLIENT_MARKET_PATH } from "@/lib/dashboard-nav";
 import { SubdomainCopyButton } from "@/components/dashboard/subdomain-copy-button";
 import { ClientSubdomainTakeoverDialog } from "@/components/dashboard/client-subdomain-takeover-dialog";
 import { ClientLogsDialog } from "@/components/dashboard/client-logs-dialog";
@@ -396,8 +394,6 @@ function ClientCard({
   routingShareById,
   modelRoutesByShareId,
   onAddModelRoute,
-  rental,
-  onRentalChanged,
   collapsed,
   onToggleCollapsed,
   onOpenTakeover,
@@ -413,8 +409,6 @@ function ClientCard({
   routingShareById?: ReadonlyMap<string, UserModelRoutingShare>;
   modelRoutesByShareId?: ReadonlyMap<string, DraftModelRoute[]>;
   onAddModelRoute?: (shareId: string) => void;
-  rental?: ClientMarketRental;
-  onRentalChanged: () => Promise<void> | void;
   collapsed: boolean;
   onToggleCollapsed: () => void;
   onOpenTakeover?: () => void;
@@ -423,6 +417,7 @@ function ClientCard({
   const { locale, t } = useLocaleText();
   const tunnelUrl = clientTunnelDisplayUrl(client.clientTunnel?.tunnelUrl);
   const owner = clientOwnerEmail(client);
+  const {session}=useAuth();
   const allShares = summaryShares || shares;
   const onlineRate = client.onlineRate24h || 0;
   const onlineTitle = t("dashboard.uptimeObservation", { healthy: onlineRate.toFixed(1), observed: client.observedMinutes24h || 0, coverage: (client.observationCoverage24h || 0).toFixed(1) });
@@ -447,13 +442,7 @@ function ClientCard({
   const clientIp = client.installation.publicIp?.trim();
   const identity = hasSubdomain ? subdomain : client.installation.id;
   const versionLabel = clientPlatformLabel(client);
-  const marketContext = marketClientContext(
-    client.installation.provisionSource,
-    rental,
-    state === "offline",
-    client.installation.lastSeenAt,
-  );
-  const showRemoval = state === "offline" && !!client.removalAt && !marketContext;
+  const showRemoval = state === "offline" && !!client.removalAt && !client.installation.marketListed;
   const borderTone = state === "offline" ? "border-l-rose-500" : state === "reconnecting" ? "border-l-sky-500" : state === "degraded" ? "border-l-amber-400" : "border-l-slate-200";
   const headerPointerDownRef = React.useRef<{ x: number; y: number } | null>(null);
 
@@ -506,7 +495,6 @@ function ClientCard({
                 aria-label={operationalStateLabel(state, t)}
               />
               <strong className="min-w-0 truncate text-sm font-semibold text-foreground" title={identity}>{identity}</strong>
-              <MarketClientBadge context={marketContext} />
               {hasSubdomain ? <SubdomainCopyButton subdomain={subdomain} /> : null}
               {owner && owner !== "-" ? (
                 <span className="min-w-0 truncate text-xs text-muted-foreground" title={owner}>
@@ -525,15 +513,7 @@ function ClientCard({
               {showRemoval ? <ClientRemovalSchedule removalAt={client.removalAt} className="text-[11px]" /> : null}
             </div>
             <div className="flex min-w-0 flex-wrap items-center gap-2 pl-4">
-              <MarketClientStatusLine context={marketContext} installationId={client.installation.id} />
-              <ClientMarketRentalBanner
-                rental={rental}
-                onChanged={onRentalChanged}
-                readOnly
-                resumeRelease={false}
-                showManageLink={false}
-                showSchedule={false}
-              />
+              {client.installation.marketLeaseV1 && client.clientTunnel?.online && session?.authenticated && !!session.user?.email && !!client.installation.ownerEmail && session.user.email.toLowerCase() === client.installation.ownerEmail.toLowerCase() ? <ListOnlineClient id={client.installation.id} label={identity} listed={!!client.installation.marketListed} /> : null}
               {tunnelUrl ? <ClientConsoleButton client={client} /> : null}
               {tunnelUrl && client.canOpenClientTerminal !== false ? <ClientTerminalButton client={client} /> : null}
               <ClientUpgradeButton client={client} />
@@ -654,7 +634,6 @@ export function ClientBoard({
   const [selectedShareId, setSelectedShareId] = React.useState("");
   const [editingShare, setEditingShare] = React.useState<ShareView | null>(null);
   const [connectShare, setConnectShare] = React.useState<ShareView | null>(null);
-  const [createClientOpen, setCreateClientOpen] = React.useState(false);
   const [takeoverTargetId, setTakeoverTargetId] = React.useState("");
   const [logClientId, setLogClientId] = React.useState("");
   const [filtersOpen, setFiltersOpen] = React.useState(false);
@@ -676,7 +655,6 @@ export function ClientBoard({
     CLIENT_EXPANDED_STORAGE_KEY,
     null,
   );
-  const [marketRentals, setMarketRentals] = React.useState<Map<string, ClientMarketRental>>(new Map());
   const lastLocatedFocusRef = React.useRef("");
   const consumedModelRouteDeepLinkRef = React.useRef("");
 
@@ -687,31 +665,6 @@ export function ClientBoard({
     setUrlMine(tab === "mine");
     replaceClientListTabQuery(tab);
   }, [setStatusFilter, setIssuesOnly]);
-
-  const loadMarketRentals = React.useCallback(async () => {
-    if (!authed) {
-      setMarketRentals(new Map());
-      return;
-    }
-    try {
-      const records = await getMyClientMarketRentals();
-      setMarketRentals(new Map(records.map((record) => [record.installationId, record])));
-    } catch {
-      // Fail closed on lifecycle details while keeping the public market-origin badge.
-      setMarketRentals(new Map());
-    }
-  }, [authed]);
-
-  React.useEffect(() => {
-    void loadMarketRentals();
-    if (!authed) return;
-    const timer = window.setInterval(() => void loadMarketRentals(), 20_000);
-    return () => window.clearInterval(timer);
-  }, [authed, loadMarketRentals]);
-
-  const refreshRentalsAndDashboard = React.useCallback(async () => {
-    await Promise.all([loadMarketRentals(), Promise.resolve(onChanged?.())]);
-  }, [loadMarketRentals, onChanged]);
 
   React.useEffect(() => {
     if (sortOrder === "registered") setSortOrder("running");
@@ -979,14 +932,6 @@ export function ClientBoard({
   const selectedClientSummary = selectedClient
     ? clientOperationalSummary(selectedClient, sharesForClient(selectedClient))
     : null;
-  const selectedMarketContext = selectedClient
-    ? marketClientContext(
-        selectedClient.installation.provisionSource,
-        marketRentals.get(selectedClient.installation.id),
-        selectedClientSummary?.state === "offline",
-        selectedClient.installation.lastSeenAt,
-      )
-    : null;
   const selectedApi = shareApiParts(selectedShare ?? undefined);
 
   React.useEffect(() => {
@@ -1098,10 +1043,13 @@ export function ClientBoard({
             ))}
           </div>
           {statusFilter === "mine" ? null : (
-            <Button variant="outline" size="sm" className="h-7 px-3 text-xs" onClick={() => setCreateClientOpen(true)}>
-              <Plus className="h-3.5 w-3.5" />
-              {t("createClient.newClient")}
-            </Button>
+            <Link
+              href={DASHBOARD_CLIENT_MARKET_PATH}
+              className="inline-flex min-h-11 items-center gap-1.5 rounded-lg border border-border bg-card px-3 text-xs font-medium text-foreground transition-colors hover:border-accent/30 hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2"
+            >
+              <Plus aria-hidden className="h-3.5 w-3.5" />
+              {t("online.rent")}
+            </Link>
           )}
         </div>
         <div className="flex w-full min-w-0 items-center gap-2 sm:w-auto">
@@ -1230,7 +1178,7 @@ export function ClientBoard({
             </EmptyBlock>
           )
         ) : clientRows.length ? clientRows.map(({ client, shares: visibleShares, allShares }) => (
-          <ClientCard key={client.installation.id} client={client} shares={visibleShares} summaryShares={allShares} onOpenClient={openClient} onOpenShare={openShare} onEditShare={openEditShare} onConnectShare={openConnectShare} rental={marketRentals.get(client.installation.id)} onRentalChanged={refreshRentalsAndDashboard} collapsed={!query && !expandedClientIdSet.has(client.installation.id)} onToggleCollapsed={() => toggleClientExpanded(client.installation.id)} onOpenTakeover={takeoverSourcesFor(client).length ? () => setTakeoverTargetId(client.installation.id) : undefined} onOpenLogs={canViewClientLogs(client) ? () => setLogClientId(client.installation.id) : undefined} />
+          <ClientCard key={client.installation.id} client={client} shares={visibleShares} summaryShares={allShares} onOpenClient={openClient} onOpenShare={openShare} onEditShare={openEditShare} onConnectShare={openConnectShare} collapsed={!query && !expandedClientIdSet.has(client.installation.id)} onToggleCollapsed={() => toggleClientExpanded(client.installation.id)} onOpenTakeover={takeoverSourcesFor(client).length ? () => setTakeoverTargetId(client.installation.id) : undefined} onOpenLogs={canViewClientLogs(client) ? () => setLogClientId(client.installation.id) : undefined} />
         )) : (
           <EmptyBlock>
             <div className="grid justify-items-center gap-2">
@@ -1271,13 +1219,7 @@ export function ClientBoard({
                 {selectedClient ? (
                   <div className="grid gap-5">
                     {selectedClientSummary && !["online", "available"].includes(selectedClientSummary.state) ? (
-                      <OperationalDiagnosis summary={selectedClientSummary} kind="client" removalAt={selectedMarketContext ? undefined : selectedClient.removalAt} />
-                    ) : null}
-                    {selectedMarketContext ? (
-                      <div className="flex flex-wrap items-center gap-2">
-                        <MarketClientBadge context={selectedMarketContext} />
-                        <MarketClientStatusLine context={selectedMarketContext} installationId={selectedClient.installation.id} />
-                      </div>
+                      <OperationalDiagnosis summary={selectedClientSummary} kind="client" removalAt={selectedClient.installation.marketListed ? undefined : selectedClient.removalAt} />
                     ) : null}
                     <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1.5 text-xs">
                       <dt className="text-slate-500">URL</dt>
@@ -1308,7 +1250,7 @@ export function ClientBoard({
                       <dd className="min-w-0 font-mono font-medium text-slate-900">{clientPlatformLabel(selectedClient)}</dd>
                       <dt className="text-slate-500">{t("dashboard.online")}</dt>
                       <dd className="min-w-0 font-medium text-slate-900">{(selectedClient.onlineRate24h || 0).toFixed(1)}% / {formatAgeDaysOrHours(selectedClient.installation.createdAt, locale)}</dd>
-                      {selectedClient.removalAt && !selectedMarketContext ? (
+                      {selectedClient.removalAt && !selectedClient.installation.marketListed ? (
                         <>
                           <dt className="text-rose-700">{t("dashboard.removalAt")}</dt>
                           <dd className="min-w-0 font-medium text-rose-700" title={formatDateTime(selectedClient.removalAt)}>
@@ -1318,13 +1260,6 @@ export function ClientBoard({
                         </>
                       ) : null}
                     </dl>
-                    <ClientMarketRentalBanner
-                      rental={marketRentals.get(selectedClient.installation.id)}
-                      onChanged={refreshRentalsAndDashboard}
-                      readOnly
-                      resumeRelease={false}
-                      showManageLink={false}
-                    />
                     <ClientOnlineHeatmap installationId={selectedClient.installation.id} />
                     <DrawerSection label={t("dashboard.linkedShares")}>
                       <ClientLinkedSharesPanel shares={sharesForClient(selectedClient)} onEdit={openEditShare} t={t} />
@@ -1373,7 +1308,6 @@ export function ClientBoard({
 
       <ShareEditDialog share={currentEditingShare} onClose={closeEditShare} onSaved={handleSaved} />
       <ShareConnectDialog share={currentConnectShare} open={!!currentConnectShare} onOpenChange={closeConnectDialog} />
-      <CreateClientDialog open={createClientOpen} onOpenChange={setCreateClientOpen} onCreated={() => void refreshRentalsAndDashboard()} />
       <ClientSubdomainTakeoverDialog
         target={takeoverTarget}
         sources={takeoverSources}
@@ -1381,7 +1315,7 @@ export function ClientBoard({
         onOpenChange={(open) => !open && setTakeoverTargetId("")}
         onCompleted={async () => {
           setTakeoverTargetId("");
-          await refreshRentalsAndDashboard();
+          await onChanged?.();
         }}
       />
       <ClientLogsDialog

@@ -237,18 +237,16 @@ fn detail_tx(
     let detail = detail::record_detail_tx(conn, record, q)?;
     let record = buyer_record(&detail["record"])?;
     let rental = if record["group"] == "current" {
-        if let Some(installation) = record["installationId"].as_str() {
-            serde_json::to_value(
-                crate::client_market_trade::load_rental_views(conn, Some(installation), actor)?
-                    .into_iter()
-                    .next(),
-            )
-            .map_err(|e| AppError::Internal(format!("serialize personal rental: {e}")))?
-        } else {
-            Value::Null
-        }
+        conn.query_row(
+            "SELECT r.id,c.id,c.paid_started_at IS NOT NULL,EXISTS(SELECT 1 FROM market_service_disputes d WHERE d.contract_id=c.id AND d.status='open')
+               FROM online_client_leases r LEFT JOIN market_platform_contracts c ON c.product_kind='client_host' AND c.product_ref=r.id
+              WHERE r.id=?1 AND r.buyer_id=?2 AND r.state='active' AND r.grant_until>unixepoch()",
+            params![record["installationId"].as_str(),actor.user_id],
+            |r| Ok(json!({"leaseId":r.get::<_,String>(0)?,"contractId":r.get::<_,Option<String>>(1)?,
+                "canDispute":r.get::<_,bool>(2)?,"openDispute":r.get::<_,bool>(3)?})),
+        ).optional().map_err(db_error("read buyer lease actions"))?
     } else {
-        Value::Null
+        None
     };
     let periods: Vec<_> = detail["periods"]
         .as_array()

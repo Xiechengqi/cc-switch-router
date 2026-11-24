@@ -12095,13 +12095,12 @@ mod tests {
     }
 
     #[test]
-    fn legacy_supply_is_not_an_official_topup_readiness_gate() {
+    fn online_client_supply_is_not_an_official_topup_readiness_gate() {
         let conn = memory();
         let before = serde_json::to_value(finance_readiness_tx(&conn).unwrap()).unwrap();
-        conn.execute("INSERT INTO router_ssh_hosts(id,ip,port,host_owner_email,status,created_at,updated_at,daily_rate_minor,currency) VALUES('old-host','192.0.2.10',22,'provider@example.com','onboarding','2026-10-01','2026-10-01',100,'USD')", []).unwrap();
-        crate::test_support::admit_fixture_hosts(&conn);
+        crate::test_support::online_listing(&conn, "client", "seller", "seller@example.test");
         conn.execute(
-            "UPDATE router_ssh_hosts SET funding_rail='legacy_provider' WHERE id='old-host'",
+            "UPDATE online_client_listings SET cycle_price_minor=100",
             [],
         )
         .unwrap();
@@ -12131,51 +12130,21 @@ mod tests {
             [],
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO router_ssh_hosts
-             (id, ip, port, host_owner_email, status, created_at, updated_at,
-              daily_rate_minor, currency)
-             VALUES ('host', '192.0.2.10', 22, 'provider@example.com', 'onboarding',
-                     '2026-10-01', '2026-10-01', 100, 'USD')",
-            [],
-        )
-        .unwrap();
-        crate::test_support::admit_fixture_hosts(&conn);
-        let rails = || -> (String, String) {
-            (
-                conn.query_row(
-                    "SELECT funding_rail FROM share_market_seats WHERE id = 'seat'",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap(),
-                conn.query_row(
-                    "SELECT funding_rail FROM router_ssh_hosts WHERE id = 'host'",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap(),
+        let rail = || {
+            conn.query_row(
+                "SELECT funding_rail FROM share_market_seats WHERE id='seat'",
+                [],
+                |row| row.get::<_, String>(0),
             )
+            .unwrap()
         };
-        assert_eq!(
-            rails(),
-            ("platform_wallet".into(), "platform_wallet".into())
-        );
-        // Simulate immutable publications made before migration 82.
+        assert_eq!(rail(), "platform_wallet");
         conn.execute(
             "UPDATE share_market_seats SET funding_rail='legacy_provider' WHERE id='seat'",
             [],
         )
         .unwrap();
-        conn.execute(
-            "UPDATE router_ssh_hosts SET funding_rail='legacy_provider' WHERE id='host'",
-            [],
-        )
-        .unwrap();
-        assert_eq!(
-            rails(),
-            ("legacy_provider".into(), "legacy_provider".into())
-        );
+        assert_eq!(rail(), "legacy_provider");
         conn.execute(
             "UPDATE market_finance_control SET mode = 'enabled' WHERE id = 1",
             [],
@@ -12187,40 +12156,18 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "UPDATE router_ssh_hosts SET status = 'locked' WHERE id = 'host'",
-            [],
-        )
-        .unwrap();
-        conn.execute(
             "UPDATE share_market_seats SET status = 'available' WHERE id = 'seat'",
             [],
         )
         .unwrap();
-        conn.execute(
-            "UPDATE router_ssh_hosts SET status = 'idle' WHERE id = 'host'",
-            [],
-        )
-        .unwrap();
-        assert_eq!(
-            rails(),
-            ("legacy_provider".into(), "legacy_provider".into())
-        );
+        assert_eq!(rail(), "legacy_provider");
         conn.execute(
             "UPDATE share_market_seats SET daily_rate_minor = 200, offer_revision = offer_revision + 1
              WHERE id = 'seat'",
             [],
         )
         .unwrap();
-        conn.execute(
-            "UPDATE router_ssh_hosts SET daily_rate_minor = 200, offer_revision = offer_revision + 1
-             WHERE id = 'host'",
-            [],
-        )
-        .unwrap();
-        assert_eq!(
-            rails(),
-            ("platform_wallet".into(), "platform_wallet".into())
-        );
+        assert_eq!(rail(), "platform_wallet");
     }
 
     #[test]

@@ -6,12 +6,9 @@ mod bark;
 mod cf;
 mod client_chat;
 mod client_logs;
-mod client_market;
 mod client_market_audit;
 mod client_market_coordination;
-mod client_market_terminal;
 mod client_market_termination;
-mod client_market_trade;
 mod client_meta;
 mod client_server_release;
 mod client_subdomain_takeover;
@@ -23,10 +20,8 @@ mod dynamic_settings;
 mod embed_usage;
 mod error;
 mod geo;
-mod host_health_protocol;
 mod ingress_context;
 mod ip_blacklist_stats;
-mod ip_iq;
 mod market_access;
 mod market_c2c;
 mod market_client_trials;
@@ -39,6 +34,7 @@ mod market_fx;
 mod market_notifications;
 mod market_payments;
 mod market_platform_contracts;
+mod market_provider_contacts;
 mod market_provider_finance;
 mod market_provider_identity;
 mod market_provider_rank;
@@ -63,9 +59,9 @@ mod notification_channels;
 mod notification_compose;
 mod notification_kinds;
 mod notifications;
+mod online_client_market;
 mod process_lock;
 mod provider_presentation;
-mod provision_ssh;
 mod proxy;
 mod proxy_request_body;
 mod proxy_stream;
@@ -117,7 +113,6 @@ use tracing_subscriber::filter::LevelFilter;
 use uuid::Uuid;
 
 use crate::abuse::{AbuseTracker, ShareAbuseTracker};
-use crate::client_market::ClientMarketJobSecrets;
 use crate::config::{Config, DatabaseMode, ensure_default_env_file, load_env_file};
 use crate::dynamic_settings::DynamicSettings;
 use crate::ip_blacklist_stats::{IpBlacklistStats, format_top_counts};
@@ -220,26 +215,12 @@ async fn main() -> Result<()> {
         db_exists = config.database.path.exists(),
         host_key_path = %config.host_key_path.display(),
         host_key_exists = config.host_key_path.exists(),
-        provision_ssh_private_key_path = %config.provision_ssh_private_key_path.display(),
-        provision_ssh_public_key_path = %config.provision_ssh_public_key_path.display(),
         env_exists = env_path.exists(),
         "starting cc-switch-router"
     );
     // 预加载 SSH host key 并计算指纹，提前失败在配置错误；也作为 lease 响应返回给客户端。
     let ssh_host_key = ssh::load_or_generate_host_key(&config.host_key_path)?;
     let ssh_host_fingerprint = ssh::host_key_fingerprint(&ssh_host_key).ok();
-    // Load or generate the dedicated outbound Client Market SSH keypair.
-    provision_ssh::require_provision_ssh_keys(
-        &config.provision_ssh_private_key_path,
-        &config.provision_ssh_public_key_path,
-    )?;
-    let provision_ssh_authorized_keys_line = provision_ssh::authorized_keys_line_from_public_path(
-        &config.provision_ssh_public_key_path,
-        "cc-switch-router-provision",
-    )?;
-    let provision_ssh_public_key =
-        provision_ssh::public_key_openssh_from_public_path(&config.provision_ssh_public_key_path)?;
-    ip_iq::warn_insecure_endpoints(&config.ip_intel_endpoints);
     let resend = config
         .resend_api_key
         .as_deref()
@@ -321,13 +302,6 @@ async fn main() -> Result<()> {
         dynamic,
         client_server_release_validator,
         ssh_host_fingerprint: ssh_host_fingerprint.clone(),
-        provision_ssh_key_path: config.provision_ssh_private_key_path.clone(),
-        provision_ssh_authorized_keys_line,
-        provision_ssh_public_key,
-        client_market_job_secrets: Arc::new(Mutex::new(ClientMarketJobSecrets::default())),
-        client_market_terminal: Arc::new(Mutex::new(
-            crate::client_market_terminal::TerminalSessionManager::default(),
-        )),
         client_market_actions: Arc::new(
             crate::client_market_coordination::ClientMarketActionLocks::default(),
         ),
@@ -378,7 +352,6 @@ async fn main() -> Result<()> {
         clients = client_route_count,
         "restored known route intentions"
     );
-    crate::client_market::reconcile_interrupted_jobs(state.clone()).await?;
     crate::client_subdomain_takeover::spawn_recovery(state.clone());
 
     let ssh_server = ssh::SshServer {
@@ -393,7 +366,6 @@ async fn main() -> Result<()> {
     let cleanup_dynamic = state.dynamic.clone();
     let cleanup_proxy = state.proxy.clone();
     let cleanup_overrides = state.scheduling_overrides.clone();
-    let market_reconcile_state = state.clone();
     let ip_blacklist_stats = state.ip_blacklist_stats.clone();
     let probe_store = state.store.clone();
     let probe_proxy = state.proxy.clone();
@@ -433,7 +405,7 @@ async fn main() -> Result<()> {
     let telegram_bot_config = config.clone();
     let chat_notification_store = state.store.clone();
     let chat_notification_config = config.clone();
-    let client_market_trade_state = state.clone();
+    let online_client_state = state.clone();
     let share_market_state = state.clone();
     let market_platform_state = state.clone();
     let market_provider_rank_store = state.store.clone();
@@ -562,13 +534,6 @@ async fn main() -> Result<()> {
                     Err(err) => {
                         tracing::warn!("cleanup failed: {err}");
                     }
-                }
-                if let Err(err) = crate::client_market::reconcile_stale_market_hosts(
-                    market_reconcile_state.clone(),
-                )
-                .await
-                {
-                    tracing::warn!("client market host reconcile failed: {err}");
                 }
             }
             #[allow(unreachable_code)]
@@ -904,17 +869,10 @@ async fn main() -> Result<()> {
             result
         },
     );
-    let client_market_trade_task = spawn_background_task(
-        "Client Market trade",
+    let online_client_task = spawn_background_task(
+        "online Client Market",
         background_shutdown_rx.clone(),
-        async move {
-            let result =
-                crate::client_market_trade::run_trade_service(client_market_trade_state).await;
-            if let Err(error) = &result {
-                tracing::error!(error = %error, "Client Market trade service stopped");
-            }
-            result
-        },
+        crate::online_client_market::run(online_client_state),
     );
     let share_market_task =
         spawn_background_task("Share Market", background_shutdown_rx.clone(), async move {
@@ -967,19 +925,6 @@ async fn main() -> Result<()> {
         }
     });
     let (http_shutdown_tx, http_shutdown_rx) = watch::channel(false);
-    let health_state = state.clone();
-    let health_shutdown = http_shutdown_rx.clone();
-    tokio::spawn(async move {
-        while !*health_shutdown.borrow() {
-            match client_market::health::observe(health_state.clone(), health_shutdown.clone())
-                .await
-            {
-                Ok(()) => break,
-                Err(error) => tracing::error!(%error, "Host health observation will retry"),
-            }
-            tokio::time::sleep(Duration::from_secs(5)).await;
-        }
-    });
     let (ssh_shutdown_tx, ssh_shutdown_rx) = watch::channel(false);
     let mut ssh_task = tokio::spawn(async move {
         ssh_server
@@ -1053,7 +998,7 @@ async fn main() -> Result<()> {
         ("client notifications", notification_task),
         ("telegram bot", telegram_bot_task),
         ("chat email notifications", chat_notification_task),
-        ("Client Market trade", client_market_trade_task),
+        ("online Client Market", online_client_task),
         ("Share Market", share_market_task),
         ("Market wallet delivery", market_platform_task),
         ("USD/CNY market FX", market_fx_task),
@@ -1596,10 +1541,6 @@ async fn try_handle_cli() -> Result<bool> {
     };
 
     match arg.as_str() {
-        "host-health" => {
-            user_cli::run_host_health(args.collect()).await?;
-            Ok(true)
-        }
         "user" => {
             user_cli::run(args.collect()).await?;
             Ok(true)
@@ -1640,23 +1581,6 @@ async fn try_handle_cli() -> Result<bool> {
             println!("database schema is compatible");
             Ok(true)
         }
-        "rotate-provision-ssh-key" => {
-            let env_path = ensure_default_env_file()?;
-            load_env_file(&env_path)?;
-            let config = Config::from_env();
-            config
-                .validate_database_config()
-                .map_err(anyhow::Error::msg)?;
-            let _process_lock = crate::process_lock::ProcessLock::acquire(&config.data_dir)?;
-            let store = AppStore::new(&config)?;
-            let report =
-                crate::client_market::rotate_provision_ssh_key_offline(&config, &store).await?;
-            println!(
-                "provisioning SSH key rotation completed for {} Host(s)",
-                report.host_count
-            );
-            Ok(true)
-        }
         other => anyhow::bail!("unknown command: {other}\n\nRun `{APP_NAME} help` for usage."),
     }
 }
@@ -1692,8 +1616,6 @@ Usage:
   cc-switch-router check-config
   cc-switch-router check-db
   cc-switch-router build-info
-  cc-switch-router rotate-provision-ssh-key
-  cc-switch-router host-health bootstrap --host-id ID --expected-installation-id ID --expected-machine-epoch N [--env-file PATH]
   cc-switch-router user password status --email EMAIL [--env-file PATH] [--offline]
   cc-switch-router user password set --email EMAIL [--env-file PATH] [--offline]
   cc-switch-router user password set --email EMAIL --password-stdin --yes

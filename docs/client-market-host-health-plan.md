@@ -1,5 +1,7 @@
 # Client Market 托管 Host 健康上报实施计划
 
+> 历史设计。独立 standby 与签名小时上报已退役。新环境的健康信息来自 Router 对在线 Client 的主动探测。现行设计见[在线 Client 能力租用规划](client-market-online-client-leasing-plan.md)。
+
 **代码实施及本地整体 review 已完成，真实部署联合验收仍待执行。** 交付环境为新部署、使用同一健康协议 v1 的 Router 与 `cc-switch-server`。每台托管 Host 运行独立的 `cc-switch-server standby`，租期内与租户的 `serve` 并行。待机服务每个 UTC 自然小时随机择时，最多发起一次携带完整硬件快照的健康上报。买家在市场主行就能看到上报状态、时间和规格，并在报价中看到所选 Host 的快照。§8 保留实施顺序与验收门槛，§9 记录实施、验证和剩余环境验收；本地通过不等于 CI 或真实发布验收通过。
 
 ## 1. 背景与成本

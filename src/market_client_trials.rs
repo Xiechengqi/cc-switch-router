@@ -76,19 +76,19 @@ pub(crate) fn state_tx(
     })
 }
 
-pub(crate) fn validate_quote_epoch_tx(
-    conn: &Connection,
-    buyer: &str,
-    provider: &str,
-    host: &str,
-    expected: i64,
-) -> Result<(), AppError> {
-    if epoch_tx(conn, buyer, provider, host)? != expected {
-        return Err(AppError::Conflict(
-            "Client trial allowance changed; request a new quote".into(),
-        ));
+impl TrialState {
+    pub(crate) fn validate_quote(
+        &self,
+        epoch: i64,
+        remaining_seconds: i64,
+    ) -> Result<(), AppError> {
+        if self.epoch != epoch || self.remaining_seconds != remaining_seconds {
+            return Err(AppError::Conflict(
+                "Client trial allowance changed; request a new quote".into(),
+            ));
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 pub(crate) fn for_contract_tx(
@@ -107,8 +107,8 @@ pub(crate) fn for_contract_tx(
     };
     let hours: i64 = conn
         .query_row(
-            "SELECT COALESCE(h.trial_hours,p.client_hours) FROM market_trial_policy p
-         LEFT JOIN router_ssh_hosts h ON h.id=?1 WHERE p.id=1",
+            "SELECT COALESCE(h.trial_days*24,p.client_hours) FROM market_trial_policy p
+         LEFT JOIN online_client_listings h ON h.installation_id=?1 WHERE p.id=1",
             params![host],
             |r| r.get(0),
         )

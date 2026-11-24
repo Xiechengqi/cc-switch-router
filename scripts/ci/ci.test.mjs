@@ -49,7 +49,7 @@ test("parallel CI retains every existing financial gate and separates profile ca
   assert.doesNotMatch(source, /npm run test:[a-z0-9-]*browser|playwright|chromium|google-chrome/i, "GitHub Actions must not run UI automation");
   assert.match(job("rust-tests"), /cargo test --locked market_ -- --skip schema::tests/);
   assert.match(job("rust-tests"), /cargo test --locked share_market::(?:\s|$)/m);
-  assert.match(job("rust-tests"), /cargo test --locked client_market::tests/);
+  assert.match(job("rust-tests"), /require-tests\.sh cargo test --locked online_client_market::/);
   assert.match(job("rust-tests"), /cargo test --locked client_termination_chat_/);
   assert.match(job("rust-tests"), /cargo test --locked user_notifications::tests/);
   assert.match(job("rust-tests"), /cargo test --locked alerting::store::tests/);

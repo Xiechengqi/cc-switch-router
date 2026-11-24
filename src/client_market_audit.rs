@@ -33,54 +33,6 @@ fn utc(value: &str) -> Result<String, AppError> {
         .map_err(|_| AppError::BadRequest("invalid audit timestamp".into()))
 }
 
-/// Called in the same transaction as an order commit. Captures identity only,
-/// never a password, SSH credentials, deployment logs, mutable state or money.
-pub(crate) fn capture_job_identity_tx(conn: &Connection, job: &str) -> Result<(), AppError> {
-    conn.execute(
-        "INSERT INTO client_market_rental_identities
-         (id,job_id,host_id,buyer_user_id,provider_user_id,buyer_email,provider_email,
-          client_subdomain,host_ip,host_port,country_code,provenance,created_at)
-         SELECT 'job:'||j.id,j.id,j.host_id,j.client_owner_user_id,
-                COALESCE(qi.provider_id,h.provider_id),j.client_owner_email,
-                COALESCE(qi.host_owner_email,j.host_owner_email),j.subdomain,
-                h.ip,h.port,COALESCE(qi.country_code,h.country_code),'order_snapshot',
-                strftime('%Y-%m-%dT%H:%M:%fZ',j.created_at)
-         FROM provisioning_jobs j LEFT JOIN router_ssh_hosts h ON h.id=j.host_id
-         LEFT JOIN client_market_allocation_quote_items qi ON qi.quote_id=j.quote_id AND qi.host_id=j.host_id
-         WHERE j.id=?1 AND j.type='create'
-         ON CONFLICT(job_id) DO NOTHING",
-        params![job],
-    ).map_err(db_error("capture rental audit identity"))?;
-    Ok(())
-}
-
-pub(crate) fn bind_installation_tx(
-    conn: &Connection,
-    job: &str,
-    installation: &str,
-) -> Result<(), AppError> {
-    capture_job_identity_tx(conn, job)?;
-    conn.execute(
-        "UPDATE client_market_rental_identities SET installation_id=?2
-         WHERE job_id=?1 AND installation_id IS NULL",
-        params![job, installation],
-    )
-    .map_err(db_error("bind rental audit installation"))?;
-    let bound: bool = conn
-        .query_row(
-            "SELECT installation_id=?2 FROM client_market_rental_identities WHERE job_id=?1",
-            params![job, installation],
-            |r| r.get(0),
-        )
-        .map_err(db_error("verify rental audit installation"))?;
-    if !bound {
-        return Err(AppError::Conflict(
-            "rental audit identity is bound to another installation".into(),
-        ));
-    }
-    Ok(())
-}
-
 pub fn router() -> Router<ServerState> {
     Router::new()
         .route("/v1/admin/client-market/rental-audit", get(list))
@@ -140,50 +92,41 @@ fn facts(scope: ReadScope) -> String {
 }
 
 const LIFECYCLE: &str = "facts AS (
- SELECT a.id,a.job_id,a.installation_id,COALESCE(a.host_id,s.host_id,j.host_id) AS host_id,
-        a.buyer_user_id,a.provider_user_id,a.buyer_email,a.provider_email,
+ SELECT a.id,a.job_id,a.installation_id,a.host_id,a.buyer_user_id,a.provider_user_id,a.buyer_email,a.provider_email,
         a.client_subdomain,a.host_ip,a.host_port,a.country_code,a.provenance,a.created_at,
-        s.status AS subscription_status,s.activated_at,
-        COALESCE(t.cutoff_at,c.ended_at,s.released_at,
-          CASE WHEN s.status IN ('releasing','release_failed','released') THEN s.updated_at END,
-          CASE WHEN j.status='failed' AND s.activated_at IS NULL THEN j.updated_at END) AS ended_at,
+        r.state AS subscription_status, strftime('%Y-%m-%dT%H:%M:%fZ',r.activated_at,'unixepoch') AS activated_at,
+        COALESCE(t.cutoff_at,c.ended_at,strftime('%Y-%m-%dT%H:%M:%fZ',coalesce(r.cutoff_at,r.released_at),'unixepoch')) AS ended_at,
         c.id AS contract_id,c.status AS contract_status,
-        COALESCE(s.pricing_model,qi.pricing_model) AS pricing_model,
-        COALESCE(s.cycle_price_minor,qi.cycle_price_minor,c.cycle_price_minor) AS cycle_price_minor,
-        COALESCE(s.daily_rate_minor,qi.daily_rate_minor,c.daily_rate_minor) AS daily_rate_minor,
-        COALESCE(s.offer_revision,qi.offer_revision,c.offer_revision) AS offer_revision,
+        CASE WHEN q.cycle_price_minor>0 THEN 'prepaid_calendar_month' ELSE 'free' END AS pricing_model,
+        NULLIF(q.cycle_price_minor,0) AS cycle_price_minor,NULL AS daily_rate_minor,q.revision AS offer_revision,
         c.trial_seconds_remaining,c.renewal_policy,
         (SELECT p.period_end FROM market_platform_periods p WHERE p.contract_id=c.id
-         AND p.sequence=c.current_period_sequence) AS period_end,s.expires_at,s.free_duration_days,
-        j.status AS job_status,t.id AS termination_id,t.status AS termination_status,
+         AND p.sequence=c.current_period_sequence) AS period_end,
+        CASE WHEN q.free_days IS NOT NULL THEN strftime('%Y-%m-%dT%H:%M:%fZ',r.grant_until,'unixepoch') END AS expires_at,
+        q.free_days AS free_duration_days,t.id AS termination_id,t.status AS termination_status,
         t.responsibility,t.dispute_used,t.provider_responded_at,
-        COALESCE(t.cleanup_confirmed_at,r.confirmed_at) AS cleanup_confirmed_at,
-        (SELECT cleanup.status FROM provisioning_jobs cleanup
-         WHERE cleanup.installation_id=a.installation_id AND cleanup.type='cleanup'
-         ORDER BY cleanup.created_at DESC,cleanup.id DESC LIMIT 1) AS cleanup_job_status,
-        EXISTS(SELECT 1 FROM router_ssh_hosts h WHERE h.id=COALESCE(a.host_id,s.host_id,j.host_id)) AS host_present
+        COALESCE(t.cleanup_confirmed_at,receipt.confirmed_at) AS cleanup_confirmed_at,
+        EXISTS(SELECT 1 FROM installations i WHERE i.id=a.host_id AND i.lifecycle='active') AS host_present
  FROM rental_identities a
- LEFT JOIN client_market_subscriptions s ON s.installation_id=a.installation_id
- LEFT JOIN provisioning_jobs j ON j.id=a.job_id
- LEFT JOIN client_market_allocation_quote_items qi ON qi.quote_id=j.quote_id AND qi.host_id=COALESCE(a.host_id,s.host_id,j.host_id)
- LEFT JOIN market_platform_contracts c ON c.id=COALESCE(s.platform_contract_id,
-    (SELECT original.id FROM market_platform_contracts original
-     WHERE original.product_kind='client_host' AND original.product_ref=a.job_id))
- LEFT JOIN client_market_terminations t ON t.installation_id=a.installation_id
- LEFT JOIN client_cleanup_receipts r ON r.installation_id=a.installation_id
+ JOIN online_client_leases r ON r.id=a.installation_id
+ JOIN online_client_quotes q ON q.id=r.quote_id
+ LEFT JOIN market_platform_contracts c ON c.product_kind='client_host' AND c.product_ref=r.id
+ LEFT JOIN client_market_terminations t ON t.installation_id=r.id
+ LEFT JOIN client_cleanup_receipts receipt ON receipt.installation_id=r.id AND receipt.host_id=r.installation_id
 ), lifecycle AS (
  SELECT facts.*,
-  CASE WHEN (job_status='failed' AND activated_at IS NULL) OR contract_status='activation_failed' THEN 'activation_failed'
-       WHEN ended_at IS NOT NULL OR subscription_status IN ('releasing','release_failed','released') OR contract_status IN ('ending','ended') THEN 'ended'
+  CASE WHEN (ended_at IS NOT NULL AND activated_at IS NULL) OR contract_status='activation_failed' THEN 'activation_failed'
+       WHEN ended_at IS NOT NULL OR subscription_status IN ('ending','cleaning','released') OR contract_status IN ('ending','ended') THEN 'ended'
        WHEN contract_status='trialing' THEN 'trialing'
-       WHEN contract_status IN ('suspended','review_required') OR subscription_status='billing_suspended' THEN 'paused'
+       WHEN contract_status IN ('suspended','review_required') THEN 'paused'
        WHEN contract_status='active' THEN 'paid'
        WHEN subscription_status='active' AND COALESCE(pricing_model,'free')='free' THEN 'free'
-       WHEN job_status IN ('pending','running') OR contract_status='pending_activation' THEN 'opening'
+       WHEN subscription_status='starting' OR contract_status='pending_activation' THEN 'opening'
        ELSE 'unknown' END AS rental_status,
-  CASE WHEN cleanup_confirmed_at IS NOT NULL THEN 'verified'
-       WHEN cleanup_job_status='failed' OR termination_status='cleanup_failed' OR subscription_status='release_failed' THEN 'failed'
-       WHEN cleanup_job_status IN ('pending','running') OR termination_status='cleanup_pending' OR subscription_status='releasing' OR contract_status='ending' THEN 'pending'
+  CASE WHEN cleanup_confirmed_at IS NOT NULL AND subscription_status IN ('ending','cleaning') THEN 'pending'
+       WHEN cleanup_confirmed_at IS NOT NULL THEN 'verified'
+       WHEN termination_status='cleanup_failed' THEN 'failed'
+       WHEN termination_status='cleanup_pending' OR subscription_status IN ('ending','cleaning') OR contract_status='ending' THEN 'pending'
        WHEN subscription_status='released' THEN 'unknown'
        ELSE 'not_required' END AS cleanup_status
  FROM facts

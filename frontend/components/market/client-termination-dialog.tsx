@@ -5,9 +5,6 @@ import { Button, Modal } from "@heroui/react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { CompactSelect } from "@/components/common/compact-select";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { ProvisionJobLog } from "@/components/dashboard/provision-job-log";
-import { cleanupClientMarketProviderRental, getClientMarketJob } from "@/lib/api";
-import type { ProvisioningJob } from "@/lib/types";
 import { WALLET_INPUT } from "./wallet-primitives";
 import { notifyMarketBalanceChanged } from "@/lib/market-balance-events";
 import { formatWalletUnits } from "@/lib/market-wallet-money";
@@ -55,8 +52,6 @@ function TerminationDialogContent({ actor, id, initialRole, initialAction, onClo
   const [reviewRequired, setReviewRequired] = React.useState(false);
   const [receivedAt, setReceivedAt] = React.useState(Date.now());
   const [clock, setClock] = React.useState(Date.now());
-  const [job, setJob] = React.useState<ProvisioningJob | null>(null);
-  const [jobError, setJobError] = React.useState("");
   const [hostHistoryOpen, setHostHistoryOpen] = React.useState(false);
   const [historyId, setHistoryId] = React.useState(id);
   const mounted = React.useRef(true);
@@ -105,28 +100,6 @@ function TerminationDialogContent({ actor, id, initialRole, initialAction, onClo
     const timer = window.setInterval(() => setClock(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, []);
-  const jobId = job?.id;
-  const jobFinished = job?.status === "succeeded" || job?.status === "failed";
-  React.useEffect(() => {
-    if (!jobId || jobFinished) return;
-    let active = true;
-    let timer: number;
-    const poll = async () => {
-      try {
-        const next = await getClientMarketJob(jobId);
-        if (!active || !mounted.current) return;
-        setJob(next); setJobError("");
-        if (next.status === "succeeded" || next.status === "failed") {
-          await load(true); callbacks.current.onChanged?.(); return;
-        }
-      } catch (cause) { if (active && mounted.current) setJobError(cause instanceof Error ? cause.message : String(cause)); }
-      // A transient lookup failure must not orphan an already submitted job.
-      if (active && mounted.current) timer = window.setTimeout(() => void poll(), 1500);
-    };
-    timer = window.setTimeout(() => void poll(), 1500);
-    return () => { active = false; window.clearTimeout(timer); };
-  }, [jobId, jobFinished, load]);
-
   const current = detail?.id === historyId ? detail : null;
   const now = current ? terminationServerNow(current, receivedAt, clock) : clock;
   const cap = current ? terminationRemainingCompensation(current) : "0";
@@ -160,22 +133,6 @@ function TerminationDialogContent({ actor, id, initialRole, initialAction, onClo
       busyRef.current = false;
       if (mounted.current) { setBusy(false); await load(true, true); }
     }
-  };
-  const retryCleanup = async () => {
-    if (!current?.permissions.retryCleanup || busyRef.current) return;
-    busyRef.current = true; setBusy(true); setError(""); setJobError("");
-    try {
-      const result = await cleanupClientMarketProviderRental(current.installationId, { reason: "provider_release" });
-      if (!result.jobId) throw new Error(t("clientMarket.cleanupFailed"));
-      // Persist the returned identity in UI state before polling. A failed
-      // first lookup must not lose the job or encourage another cleanup POST.
-      if (mounted.current) {
-        const at = new Date().toISOString();
-        setJob({ id: result.jobId, jobType: "cleanup", status: "pending", phase: "pending", log: "", createdAt: at, updatedAt: at });
-        callbacks.current.onChanged?.();
-      }
-    } catch (cause) { if (mounted.current) setError(cause instanceof Error ? cause.message : String(cause)); }
-    finally { busyRef.current = false; if (mounted.current) { setBusy(false); await load(true, true); } }
   };
   const moreEvents = async () => {
     if (!current?.eventsNextCursor || busyRef.current || loading) return;
@@ -222,7 +179,6 @@ function TerminationDialogContent({ actor, id, initialRole, initialAction, onClo
             ["decision", role === "owner" ? "clientTermination.resolve" : "clientTermination.waive"],
             ["respond", "clientTermination.respond"], ["dispute", "clientTermination.dispute"], ["withdraw", "clientTermination.withdraw"],
           ] as const).filter(([next]) => terminationActionAllowed(current, role, next, now)).map(([next,label]) => <Button key={next} size="sm" variant="outline" className="h-auto min-h-11 max-w-full whitespace-normal py-2" isDisabled={busy || loading} onPress={() => choose(next)}>{t(label)}</Button>)}</div> : null}
-          {!action && current.permissions.retryCleanup ? <div className="grid gap-2"><p className="text-xs text-muted-foreground">{t("clientTermination.retryHelp")}</p><Button variant="outline" className="justify-self-start whitespace-nowrap" isDisabled={busy || job?.status === "running" || job?.status === "pending"} onPress={() => void retryCleanup()}>{t("clientMarket.retryCleanup")}</Button></div> : null}
           {current.status === "finance_pending" ? <div className="grid gap-2 rounded-lg bg-muted p-3 text-xs"><p>{t("clientTermination.financeHelp")}</p>{current.permissions.owner ? <a href="/operations/?section=finance" className="underline">{t("clientTermination.openFinance")}</a> : null}</div> : null}
           {action ? <section className="grid gap-3 rounded-lg border border-border p-3" aria-label={t("clientTermination.handle")}>
             {action === "withdraw" ? <p className="text-sm leading-6">{t("clientTermination.withdrawHelp", { amount: money(cap) })}</p>
@@ -239,11 +195,9 @@ function TerminationDialogContent({ actor, id, initialRole, initialAction, onClo
             {!allowed || reviewRequired ? <p role="status" className="text-xs">{t("clientTermination.changed")}</p> : null}
             <div className="flex flex-wrap justify-end gap-2"><Button variant="ghost" isDisabled={busy} onPress={() => { setAction(null); setError(""); }}>{t("common.cancel")}</Button><Button variant="primary" className="whitespace-nowrap" isDisabled={busy || loading || reviewRequired || !allowed || action === "decision" && !validAward || action !== "withdraw" && !terminationExplanationValid(note, action !== "dispute")} onPress={() => void submit()}>{t(busy ? "common.loading" : "common.save")}</Button></div>
           </section> : null}
-          {job ? <ProvisionJobLog log={job.log} intent="release" phase={job.status === "succeeded" ? "success" : job.status === "failed" ? "failed" : "running"} /> : null}
-          {jobError ? <p role="alert" className="break-words text-xs text-danger">{jobError}</p> : null}
           {current.chatAvailable ? <div className="grid gap-1 text-xs"><a className="justify-self-start underline" href={`/?chat=${encodeURIComponent(current.installationId)}`} target="_blank" rel="noopener noreferrer">{t("clientTermination.chat")}</a><p className="text-muted-foreground">{t("clientTermination.chatHelp")}</p></div> : null}
           <details className="min-w-0 text-xs"><summary className="min-h-9 cursor-pointer py-2 font-medium">{t("clientTermination.timeline")}</summary><ol className="grid gap-3 py-2">{current.events.map(event => <li key={event.id} className="grid min-w-0 gap-1 border-l-2 border-border pl-3"><p>{t(`clientTermination.event.${["accepted","provider_waiver","owner_decision","provider_response","buyer_withdrawal","timeout_waiver","disputed"].includes(event.action) ? event.action as "accepted" : "other"}`)} · {date(event.createdAt)}</p>{event.note ? <p className="whitespace-pre-wrap break-words text-muted-foreground">{event.note}</p> : null}</li>)}</ol>{current.eventsNextCursor ? <Button size="sm" variant="ghost" isDisabled={busy || loading} onPress={() => void moreEvents()}>{t("marketWallet.more")}</Button> : null}</details>
-          {!action && (current.permissions.provider || current.permissions.owner) ? <details className="min-w-0 text-xs" open={hostHistoryOpen} onToggle={event => setHostHistoryOpen(event.currentTarget.open)}><summary className="min-h-9 cursor-pointer py-2 font-medium">{t("clientTermination.hostHistory")}</summary>{hostHistoryOpen ? <ClientTerminationWorkList hostId={current.hostId} excludeId={current.id} revision={current.version} onOpen={next => { if (!busyRef.current) { setHistoryId(next); setAction(null); setSaved(false); setJob(null); setJobError(""); setHostHistoryOpen(false); } }} /> : null}</details> : null}
+          {!action && (current.permissions.provider || current.permissions.owner) ? <details className="min-w-0 text-xs" open={hostHistoryOpen} onToggle={event => setHostHistoryOpen(event.currentTarget.open)}><summary className="min-h-9 cursor-pointer py-2 font-medium">{t("clientTermination.hostHistory")}</summary>{hostHistoryOpen ? <ClientTerminationWorkList hostId={current.hostId} excludeId={current.id} revision={current.version} onOpen={next => { if (!busyRef.current) { setHistoryId(next); setAction(null); setSaved(false); setHostHistoryOpen(false); } }} /> : null}</details> : null}
         </> : null}
         {saved ? <p role="status" className="text-sm text-success">{t("clientTermination.saved")}</p> : null}
         {error ? <p role="alert" className="break-words text-sm text-danger">{error}</p> : null}

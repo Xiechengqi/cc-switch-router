@@ -354,7 +354,7 @@ pub(crate) fn authorize_control_request(
         .header("x-ctl-signature", signature)
 }
 
-async fn post_control<T: serde::de::DeserializeOwned>(
+pub(crate) async fn post_control<T: serde::de::DeserializeOwned>(
     backend: &str,
     installation_id: &str,
     control_secret: &str,
@@ -420,7 +420,7 @@ pub async fn edit_value_usage(
         serde_json::json!({"shareId":share_id,"expectedConfigRevision":expected_config_revision,"actor":actor,"edits":edits}).to_string()).await
 }
 
-async fn post_control_with_timeout<T: serde::de::DeserializeOwned>(
+pub(crate) async fn post_control_with_timeout<T: serde::de::DeserializeOwned>(
     backend: &str,
     installation_id: &str,
     control_secret: &str,
@@ -457,6 +457,18 @@ async fn post_control_with_timeout<T: serde::de::DeserializeOwned>(
         })?;
 
     let status = resp.status();
+    if path.starts_with("/_ctl/market/") {
+        if !status.is_success() {
+            return Err(CtlError::Malformed(format!(
+                "Client returned HTTP {}",
+                status.as_u16()
+            )));
+        }
+        let body = read_bounded_body(resp, 512 * 1024)
+            .await
+            .map_err(CtlError::Malformed)?;
+        return serde_json::from_slice(&body).map_err(|e| CtlError::Malformed(e.to_string()));
+    }
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
         let structured = serde_json::from_str::<ControlErrorReply>(&body).ok();
@@ -493,6 +505,27 @@ async fn post_control_with_timeout<T: serde::de::DeserializeOwned>(
     resp.json()
         .await
         .map_err(|e| CtlError::Malformed(e.to_string()))
+}
+
+pub(crate) async fn read_bounded_body(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
+    let oversized = || format!("response exceeds {limit} bytes");
+    if response
+        .content_length()
+        .is_some_and(|size| size > limit as u64)
+    {
+        return Err(oversized());
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+        if chunk.len() > limit - bytes.len() {
+            return Err(oversized());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 pub async fn verify_share_account_recovery(

@@ -32,8 +32,8 @@ test("termination actions are scoped to Client records, never wallet or income",
   const client = source("components/dashboard/account-client-section.tsx");
   assert.match(client, /<ClientTerminationRecord\b/);
   assert.equal(client.match(/<ClientTerminationDialog\b/g)?.length, 1, "refreshes update rows without remounting an open dialog");
-  assert.match(client, /key=\{actor \|\| "anonymous"\}/);
-  assert.match(client, /getClientMarketHosts\(undefined, controller\.signal\)/);
+  assert.match(client, /key=\{actor\}/);
+  assert.match(client, /"seller-inventory", "GET", undefined, controller\.signal/);
 });
 
 test("record details mount lazily and use stable identity across refreshes", () => {

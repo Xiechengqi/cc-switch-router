@@ -8,7 +8,7 @@ function settlement(patch: Partial<ClientTermination> = {}): ClientTermination {
     buyerUserId: "buyer", providerUserId: "provider", policyVersion: 1, rateBps: 1000, periodAmountUnits: "432000",
     remainingUnits: "432000", compensationCapUnits: "43200", returnedUnits: "388800", compensationUnits: "43200",
     heldUnits: "0", reason: "voluntary", claim: "", responsibility: "buyer", status: "completed",
-    cutoffAt: "2026-10-01T00:00:00Z", cleanupConfirmedAt: "2026-10-01T00:00:00Z", cleanupJobId: "job",
+    cutoffAt: "2026-10-01T00:00:00Z", cleanupConfirmedAt: "2026-10-01T00:00:00Z",
     disputeUsed: false, disputeOpenedAt: null, disputeDeadlineAt: null, providerRespondedAt: null, resolution: null, chatAvailable: false,
     version: 2, updatedAt: "2026-10-01T00:00:00Z", unlockAt: "2026-10-08T00:00:00Z", creditedUnits: "0", ...patch };
 }
@@ -76,7 +76,7 @@ test("withdrawal confirmation uses the actual remaining compensation including p
 test("workbench actions require both the server capability and an unexpired state", () => {
   const detail: ClientTerminationDetail = { ...settlement({ responsibility: "undetermined", status: "disputed", disputeUsed: true,
     disputeOpenedAt: "2026-10-01T00:00:00Z", disputeDeadlineAt: "2026-10-04T00:00:00Z" }),
-    permissions: { buyer: false, provider: true, owner: false, dispute: false, withdraw: false, waive: true, respond: true, resolve: false, retryCleanup: false },
+    permissions: { buyer: false, provider: true, owner: false, dispute: false, withdraw: false, waive: true, respond: true, resolve: false },
     attention: "provider_response", actionRequired: true, serverNow: "2026-10-01T00:00:00Z", events: [], eventsNextCursor: null };
   assert.equal(terminationActionAllowed(detail, "provider", "respond", at), true);
   assert.equal(terminationActionAllowed(detail, "owner", "decision", at), false);
@@ -91,7 +91,7 @@ test("workbench actions require both the server capability and an unexpired stat
 
 test("workbench projections reject malformed money, dates, capabilities and pagination before rendering", () => {
   const detail: ClientTerminationDetail = { ...settlement(),
-    permissions: { buyer: false, provider: true, owner: false, dispute: false, withdraw: false, waive: true, respond: false, resolve: false, retryCleanup: false },
+    permissions: { buyer: false, provider: true, owner: false, dispute: false, withdraw: false, waive: true, respond: false, resolve: false },
     attention: "completed", actionRequired: false, serverNow: "2026-10-01T00:00:00Z", events: [], eventsNextCursor: null };
   assert.equal(parseClientTerminationDetail(detail, detail.id), detail);
   for (const patch of [

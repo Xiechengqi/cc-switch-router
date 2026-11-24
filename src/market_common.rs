@@ -5,16 +5,6 @@ use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Utc};
 
 pub const DEFAULT_TRIAL_HOURS: i64 = 12;
 pub const TRIAL_SECONDS: i64 = DEFAULT_TRIAL_HOURS * 3_600;
-pub(crate) const MAX_CLIENT_TRIAL_HOURS: i64 = 720;
-
-pub(crate) fn validate_client_trial_hours(hours: Option<i64>) -> Result<Option<i64>, AppError> {
-    if hours.is_some_and(|hours| !(0..=MAX_CLIENT_TRIAL_HOURS).contains(&hours)) {
-        return Err(AppError::BadRequest(
-            "Client trial hours must be between 0 and 720".into(),
-        ));
-    }
-    Ok(hours)
-}
 pub(crate) const MARKET_CURRENCY: &str = "USD";
 pub(crate) const MONEY_UNITS_PER_MINOR: i64 = 86_400;
 pub(crate) const MAX_DAILY_RATE_MINOR: i64 = 100_000_000;
@@ -152,31 +142,18 @@ pub(crate) fn free_usage_available_tx(
     free_duration_days: u32,
     now: &str,
 ) -> Result<bool, AppError> {
-    let allowance_seconds = free_usage_allowance_seconds(free_duration_days)?;
-    let service_remaining = ensure_free_usage_scope_tx(
+    Ok(free_usage_remaining_tx(
         conn,
         buyer_user_id,
         supplier_user_id,
         product_kind,
-        "service",
         service_ref,
-        allowance_seconds,
+        free_duration_days,
         now,
-    )?;
-    let supplier_remaining = ensure_free_usage_scope_tx(
-        conn,
-        buyer_user_id,
-        supplier_user_id,
-        product_kind,
-        "supplier",
-        supplier_user_id,
-        allowance_seconds,
-        now,
-    )?;
-    Ok(service_remaining > 0 && supplier_remaining > 0)
+    )? > 0)
 }
 
-pub(crate) fn claim_free_usage_tx(
+pub(crate) fn free_usage_remaining_tx(
     conn: &Connection,
     buyer_user_id: &str,
     supplier_user_id: &str,
@@ -206,7 +183,27 @@ pub(crate) fn claim_free_usage_tx(
         allowance_seconds,
         now,
     )?;
-    let granted_seconds = service_remaining.min(supplier_remaining);
+    Ok(service_remaining.min(supplier_remaining))
+}
+
+pub(crate) fn claim_free_usage_tx(
+    conn: &Connection,
+    buyer_user_id: &str,
+    supplier_user_id: &str,
+    product_kind: &str,
+    service_ref: &str,
+    free_duration_days: u32,
+    now: &str,
+) -> Result<i64, AppError> {
+    let granted_seconds = free_usage_remaining_tx(
+        conn,
+        buyer_user_id,
+        supplier_user_id,
+        product_kind,
+        service_ref,
+        free_duration_days,
+        now,
+    )?;
     if granted_seconds <= 0 {
         return Ok(0);
     }
@@ -239,58 +236,16 @@ fn latest_health_observation_tx(
     service_ref: &str,
     observed_at: DateTime<Utc>,
 ) -> Result<Option<(i64, String, String)>, AppError> {
-    let service_active = match product_kind {
-        "share" => tx
-            .query_row(
-                "SELECT 1 FROM share_market_subscriptions
-                 WHERE id = ?1 AND status IN ('active_free', 'active_postpaid', 'active_prepaid')",
-                params![product_ref],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(map_db("check billable Share entitlement state"))?
-            .is_some(),
-        "client_host" => tx
-            .query_row(
-                "SELECT 1 FROM client_market_subscriptions
-                 WHERE installation_id = ?1 AND status = 'active'",
-                params![product_ref],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(map_db("check billable Client subscription state"))?
-            .is_some(),
-        _ => false,
-    };
-    if !service_active {
-        return Ok(None);
+    match product_kind {
+        "share" => crate::share_market::share_market_billing_observation_tx(tx, product_ref, observed_at),
+        "client_host" if product_ref == service_ref => tx.query_row(
+            "SELECT p.checked_at,CASE WHEN p.healthy=1 THEN 'healthy' ELSE 'unhealthy' END,'workspace_probe'
+             FROM online_client_probes p JOIN online_client_leases r ON r.id=p.lease_id AND r.installation_id=p.installation_id
+             WHERE r.id=?1 AND r.state='active' AND r.grant_until>?2 AND p.checked_at<=?2
+             ORDER BY p.bucket DESC LIMIT 1", params![service_ref,observed_at.timestamp()],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(map_db("read workspace health")),
+        _ => Ok(None),
     }
-    if product_kind == "share" {
-        return crate::share_market::share_market_billing_observation_tx(
-            tx,
-            product_ref,
-            observed_at,
-        );
-    }
-    let (table, key) = match product_kind {
-        "client_host" => ("installation_health_checks", "installation_id"),
-        _ => {
-            return Err(AppError::Internal(format!(
-                "unsupported billing product kind {product_kind}"
-            )));
-        }
-    };
-    tx.query_row(
-        &format!(
-            "SELECT checked_at, status, reason FROM {table}
-             WHERE {key} = ?1 AND checked_at <= ?2
-             ORDER BY checked_at DESC LIMIT 1"
-        ),
-        params![service_ref, observed_at.timestamp()],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    )
-    .optional()
-    .map_err(map_db("read latest service health observation"))
 }
 
 pub(crate) fn effective_service_health_tx(
@@ -314,7 +269,12 @@ pub(crate) fn effective_service_health_tx(
     let (observed_state, observation_reason) = match observation {
         Some((checked_at, status, reason))
             if status == "healthy"
-                && evaluation_ended_at.timestamp() - checked_at <= HEALTH_FRESHNESS_SECS =>
+                && evaluation_ended_at.timestamp() - checked_at
+                    <= if reason == "workspace_probe" {
+                        300
+                    } else {
+                        HEALTH_FRESHNESS_SECS
+                    } =>
         {
             ("healthy".to_string(), reason)
         }

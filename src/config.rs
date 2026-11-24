@@ -13,9 +13,6 @@ pub const DEFAULT_FOOTER_TELEGRAM_URL: &str = "https://t.me/tokenswitchorg";
 pub const DEFAULT_REQUEST_LOG_RETENTION_DAYS: u32 = 30;
 pub const MIN_REQUEST_LOG_RETENTION_DAYS: u32 = 1;
 pub const MAX_REQUEST_LOG_RETENTION_DAYS: u32 = 365;
-/// Historical hardcoded IP-intelligence origins. Kept as the default so existing
-/// deployments keep working; override with `CC_SWITCH_ROUTER_IP_INTEL_ENDPOINTS`.
-const DEFAULT_IP_INTEL_ENDPOINTS: &[&str] = &["http://3.0.3.0", "http://3.0.2.1", "http://3.0.2.9"];
 
 pub const DEFAULT_DB_SYNC_INTERVAL_SECS: u64 = 60;
 pub const DEFAULT_CLOCK_PROBE_INTERVAL_SECS: u64 = 60;
@@ -842,10 +839,6 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub database: DatabaseConfig,
     pub host_key_path: PathBuf,
-    /// Outbound Client Market SSH private key (default `$HOME/.ssh/cc-switch-router-provision`).
-    pub provision_ssh_private_key_path: PathBuf,
-    /// Matching OpenSSH public key (defaults to `<private key path>.pub`).
-    pub provision_ssh_public_key_path: PathBuf,
     pub cleanup_interval_secs: u64,
     pub lease_retention_secs: i64,
     pub request_log_retention_days: u32,
@@ -873,11 +866,6 @@ pub struct Config {
     pub free_share_ip_parallel_limit: i64,
     pub market_usd_cny_rate_micros: i64,
     pub market_provider_recommendation_mode: MarketProviderRecommendationMode,
-    /// Base URLs of the IP-intelligence service, tried in order. Every registered
-    /// Client Market Host IP is sent to these endpoints, so they should be operated
-    /// by the Router operator or a party trusted with the full Host inventory.
-    /// Prefer `https://` origins; plaintext entries are logged as a warning at boot.
-    pub ip_intel_endpoints: Vec<String>,
     pub verification_service_base_url: String,
     pub verification_service_api_key: Option<String>,
     /// The official Client Market Provider. This is intentionally independent
@@ -924,17 +912,7 @@ impl Config {
                 })
                 .unwrap_or(DEFAULT_DB_SYNC_INTERVAL_SECS),
         };
-        let provision_ssh_private_key_path =
-            env_var("CC_SWITCH_ROUTER_PROVISION_SSH_PRIVATE_KEY_PATH")
-                .or_else(|| env_var("CC_SWITCH_ROUTER_PROVISION_SSH_KEY_PATH"))
-                .map(PathBuf::from)
-                .unwrap_or_else(default_provision_ssh_private_key_path);
-        let provision_ssh_public_key_path =
-            env_var("CC_SWITCH_ROUTER_PROVISION_SSH_PUBLIC_KEY_PATH")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| {
-                    provision_ssh_public_path_for_private(&provision_ssh_private_key_path)
-                });
+
         Self {
             api_addr: env_var("CC_SWITCH_ROUTER_API_ADDR")
                 .unwrap_or_else(|| "0.0.0.0:80".to_string())
@@ -1043,8 +1021,6 @@ impl Config {
             host_key_path: env_var("CC_SWITCH_ROUTER_HOST_KEY_PATH")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| data_dir.join("ssh_host_ed25519_key")),
-            provision_ssh_private_key_path,
-            provision_ssh_public_key_path,
             cleanup_interval_secs: env_var("CC_SWITCH_ROUTER_CLEANUP_INTERVAL_SECS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(300),
@@ -1183,9 +1159,6 @@ impl Config {
                     .unwrap_or("shadow"),
             )
             .unwrap_or_else(|message| panic!("{message}")),
-            ip_intel_endpoints: parse_ip_intel_endpoints(
-                env_var("CC_SWITCH_ROUTER_IP_INTEL_ENDPOINTS").as_deref(),
-            ),
             verification_service_base_url: env_var(
                 "CC_SWITCH_ROUTER_VERIFICATION_SERVICE_BASE_URL",
             )
@@ -1443,27 +1416,6 @@ fn default_metrics_db_path_in(data_dir: &Path) -> PathBuf {
     data_dir.join(format!("{APP_NAME}-metrics.db"))
 }
 
-pub fn default_provision_ssh_private_key_path() -> PathBuf {
-    path_in_user_ssh("cc-switch-router-provision")
-        .unwrap_or_else(|| default_data_dir().join("cc-switch-router-provision"))
-}
-
-pub fn default_provision_ssh_public_key_path() -> PathBuf {
-    provision_ssh_public_path_for_private(&default_provision_ssh_private_key_path())
-}
-
-fn provision_ssh_public_path_for_private(private_key_path: &Path) -> PathBuf {
-    let mut value = private_key_path.as_os_str().to_os_string();
-    value.push(".pub");
-    PathBuf::from(value)
-}
-
-fn path_in_user_ssh(leaf: &str) -> Option<PathBuf> {
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(".ssh").join(leaf))
-}
-
 pub fn ensure_default_env_file() -> Result<PathBuf> {
     let env_path = existing_env_path().unwrap_or_else(default_env_path);
     if let Some(parent) = env_path.parent() {
@@ -1604,8 +1556,6 @@ CC_SWITCH_ROUTER_TURSO_URL=
 CC_SWITCH_ROUTER_TURSO_AUTH_TOKEN=
 CC_SWITCH_ROUTER_DB_SYNC_INTERVAL_SECS=60
 CC_SWITCH_ROUTER_HOST_KEY_PATH=
-CC_SWITCH_ROUTER_PROVISION_SSH_PRIVATE_KEY_PATH=
-CC_SWITCH_ROUTER_PROVISION_SSH_PUBLIC_KEY_PATH=
 CC_SWITCH_ROUTER_CLEANUP_INTERVAL_SECS=300
 CC_SWITCH_ROUTER_LEASE_RETENTION_SECS=86400
 CC_SWITCH_ROUTER_REQUEST_LOG_RETENTION_DAYS=30
@@ -1647,7 +1597,6 @@ CC_SWITCH_ROUTER_FREE_SHARE_IP_PARALLEL_LIMIT=1
 # Existing CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE values are used only as an
 # emergency display fallback; new installations use the verified FX feed.
 CC_SWITCH_ROUTER_MARKET_PROVIDER_RECOMMENDATION_MODE=shadow
-CC_SWITCH_ROUTER_IP_INTEL_ENDPOINTS=http://3.0.3.0,http://3.0.2.1,http://3.0.2.9
 CC_SWITCH_ROUTER_VERIFICATION_SERVICE_BASE_URL=https://tokenswitch.org
 CC_SWITCH_ROUTER_VERIFICATION_SERVICE_API_KEY=
 CC_SWITCH_ROUTER_RESEND_API_KEY=
@@ -1865,33 +1814,6 @@ fn parse_admin_emails(value: Option<&str>) -> HashSet<String> {
     set
 }
 
-/// Endpoints receive every registered Host IP, so the default is kept identical to
-/// the historical hardcoded list — changing the scheme blindly would break Host
-/// registration if those origins do not terminate TLS. Operators who front the
-/// service with HTTPS should set `CC_SWITCH_ROUTER_IP_INTEL_ENDPOINTS`.
-fn parse_ip_intel_endpoints(value: Option<&str>) -> Vec<String> {
-    let parsed: Vec<String> = value
-        .unwrap_or_default()
-        .split(',')
-        .map(|piece| piece.trim().trim_end_matches('/'))
-        .filter(|piece| !piece.is_empty())
-        .map(|piece| {
-            if piece.starts_with("http://") || piece.starts_with("https://") {
-                piece.to_string()
-            } else {
-                format!("https://{piece}")
-            }
-        })
-        .collect();
-    if parsed.is_empty() {
-        return DEFAULT_IP_INTEL_ENDPOINTS
-            .iter()
-            .map(|value| value.to_string())
-            .collect();
-    }
-    parsed
-}
-
 pub fn tunnel_domain_host(tunnel_domain: &str) -> Option<String> {
     let raw = tunnel_domain.trim();
     if raw.is_empty() {
@@ -1978,8 +1900,7 @@ mod tests {
             data_dir: PathBuf::from("/tmp"),
             database: DatabaseConfig::local(PathBuf::from("/tmp/test.db")),
             host_key_path: PathBuf::from("/tmp/test.key"),
-            provision_ssh_private_key_path: PathBuf::from("/tmp/test_id_rsa"),
-            provision_ssh_public_key_path: PathBuf::from("/tmp/test_id_rsa.pub"),
+
             cleanup_interval_secs: 300,
             lease_retention_secs: 60,
             request_log_retention_days: DEFAULT_REQUEST_LOG_RETENTION_DAYS,
@@ -2007,7 +1928,6 @@ mod tests {
             free_share_ip_parallel_limit: 1,
             market_usd_cny_rate_micros: crate::market_common::DEFAULT_USD_CNY_RATE_MICROS,
             market_provider_recommendation_mode: MarketProviderRecommendationMode::Shadow,
-            ip_intel_endpoints: Vec::new(),
             verification_service_base_url: "https://example.com".into(),
             verification_service_api_key: None,
             router_owner_email: None,
@@ -2027,7 +1947,6 @@ mod tests {
 
         let disabled = Config {
             free_share_ip_parallel_limit: 0,
-            ip_intel_endpoints: Vec::new(),
             ..config
         };
         assert!(!disabled.free_share_ip_limit_enabled());

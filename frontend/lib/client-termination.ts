@@ -11,7 +11,7 @@ export type ClientTermination = {
   periodAmountUnits: string; remainingUnits: string; compensationCapUnits: string; returnedUnits: string;
   compensationUnits: string; heldUnits: string; reason: string; claim: string; responsibility: string;
   status: "cleanup_pending" | "cleanup_failed" | "finance_pending" | "disputed" | "completed"; cutoffAt: string;
-  cleanupConfirmedAt: string | null; cleanupJobId: string | null; disputeUsed: boolean; version: number;
+  cleanupConfirmedAt: string | null; disputeUsed: boolean; version: number;
   disputeOpenedAt: string | null; disputeDeadlineAt: string | null; providerRespondedAt: string | null;
   resolution: ClientTerminationResolution | null; chatAvailable: boolean;
   updatedAt: string; unlockAt: string | null; creditedUnits: string;
@@ -23,7 +23,7 @@ export type ClientTerminationAction = "dispute" | "decision" | "respond" | "with
 export type ClientTerminationAttention = "provider_response" | "owner_decision" | "cleanup_failed" | "finance_review" | "waiting_provider" | "waiting_owner" | "timeout_pending" | "processing" | "completed";
 export type ClientTerminationPermissions = {
   buyer: boolean; provider: boolean; owner: boolean;
-  dispute: boolean; withdraw: boolean; waive: boolean; respond: boolean; resolve: boolean; retryCleanup: boolean;
+  dispute: boolean; withdraw: boolean; waive: boolean; respond: boolean; resolve: boolean;
 };
 export type ClientTerminationEvent = { id: string; action: string; actorRole: "buyer" | "provider" | "owner" | "system"; note: string | null; awardUnits: string | null; createdAt: string };
 export type ClientTerminationDetail = ClientTermination & {
@@ -45,7 +45,7 @@ function validWorkRecord(value: unknown): boolean {
     && ["periodAmountUnits", "remainingUnits", "compensationCapUnits", "returnedUnits", "compensationUnits", "heldUnits", "creditedUnits"].every(key => unitString(value[key]))
     && ["cutoffAt", "updatedAt", "serverNow"].every(key => timestamp(value[key]))
     && ["cleanupConfirmedAt", "disputeOpenedAt", "disputeDeadlineAt", "providerRespondedAt", "unlockAt"].every(key => value[key] === null || timestamp(value[key]))
-    && ["buyer", "provider", "owner", "dispute", "withdraw", "waive", "respond", "resolve", "retryCleanup"].every(key => typeof (value.permissions as Record<string, unknown>)[key] === "boolean")
+    && ["buyer", "provider", "owner", "dispute", "withdraw", "waive", "respond", "resolve"].every(key => typeof (value.permissions as Record<string, unknown>)[key] === "boolean")
     && (value.permissions.buyer === true || value.permissions.provider === true || value.permissions.owner === true)
     && ["cleanup_pending", "cleanup_failed", "finance_pending", "disputed", "completed"].includes(value.status as string)
     && ATTENTION.includes(value.attention as string) && typeof value.actionRequired === "boolean"
@@ -105,7 +105,21 @@ export function terminationActionAllowed(detail: ClientTerminationDetail, role: 
 }
 export const getClientTerminationPolicy = (admin = false) => request<ClientTerminationPolicy>(admin ? "/v1/admin/market/client-termination-policy" : "/v1/client-market/termination-policy");
 export const saveClientTerminationPolicy = (policy: ClientTerminationPolicy, rateBps: number) => request<ClientTerminationPolicy>("/v1/admin/market/client-termination-policy", "PUT", { expectedVersion: policy.version, rateBps });
-export const previewClientTermination = (installationId: string) => request<ClientTerminationPreview>(`/v1/client-market/clients/${encodeURIComponent(installationId)}/termination-preview`, "POST");
+export type ClientTerminationPreviewRead = { preview: ClientTerminationPreview; receivedAt: number; serverNow: number | null };
+/** The preview with the server clock (HTTP `Date`) at receipt, so expiry is judged on the
+ * server clock, not a possibly skewed browser clock. `serverNow` is null when the header is
+ * absent; callers then leave expiry to the server's 409. */
+export async function previewClientTermination(installationId: string): Promise<ClientTerminationPreviewRead> {
+  const response = await authFetch(`/v1/client-market/clients/${encodeURIComponent(installationId)}/termination-preview`, { method: "POST", cache: "no-store" });
+  const receivedAt = Date.now();
+  const date = Date.parse(response.headers.get("Date") ?? "");
+  return { preview: await parseJson<ClientTerminationPreview>(response), receivedAt, serverNow: Number.isFinite(date) ? date : null };
+}
+/** Whether a preview read has expired on the server clock; unknown clocks never expire locally. */
+export function terminationPreviewExpired(read: ClientTerminationPreviewRead, now = Date.now()) {
+  if (read.serverNow === null) return false;
+  return Date.parse(read.preview.expiresAt) <= read.serverNow + Math.max(0, now - read.receivedAt);
+}
 export const getClientTermination = (installationId: string) => request<ClientTermination | null>(`/v1/client-market/clients/${encodeURIComponent(installationId)}/termination`);
 export const getClientTerminations = (role: "buyer" | "provider" | "owner", cursor?: string, signal?: AbortSignal) => request<ClientTerminationPage>(`${role === "owner" ? "/v1/admin/market/client-terminations" : "/v1/client-market/terminations"}?provider=${role === "provider"}&openOnly=${role === "owner"}&${cursor ? `cursor=${encodeURIComponent(cursor)}` : ""}`, "GET", undefined, signal);
 export const decideClientTermination = (termination: ClientTermination, owner: boolean, awardUnits: string, responsibility: string, note: string) => request<ClientTermination>(`${owner ? "/v1/admin/market/client-terminations" : "/v1/client-market/terminations"}/${encodeURIComponent(termination.id)}/${owner ? "resolve" : "waive"}`, "POST", { expectedVersion: termination.version, awardUnits, responsibility, note });

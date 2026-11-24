@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::ServerState;
-use crate::client_market_trade::ProviderContact;
 use crate::error::AppError;
+use crate::market_provider_contacts::ProviderContact;
 use crate::models::{
     AuthSession, MIN_SHARE_MARKET_CONTRACT_VERSION, ShareEditAvailableEvent, ShareGrantManager,
     ShareManagedGrantAction, ShareManagedGrantOperation, ShareSettingsPatch, ShareSupport,
@@ -13694,6 +13694,11 @@ async fn try_apply_dispatched_edit_via_ctl(
     else {
         return Ok(false);
     };
+    // Only the Server's signed edit ACK carries the final consumption receipt.
+    // The event has already been sent; leave the edit pending for that delivery.
+    if edit.patch.requires_termination_receipt() {
+        return Ok(false);
+    }
     let route = state.proxy.route_by_share_id(&event.share_id).await;
     let secret = state
         .store

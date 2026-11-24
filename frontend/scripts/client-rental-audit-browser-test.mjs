@@ -1,6 +1,6 @@
 import { installFinancialBrowserIdentity } from "./financial-browser-fixture.mjs";
 import assert from "node:assert/strict";
-import { emptyClientRentalsPage } from "./client-rental-fixtures.mjs";
+import { emptyClientRentalsPage, isRetiredClientMarketPath } from "./client-rental-fixtures.mjs";
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { extname, resolve, sep } from "node:path";
@@ -24,7 +24,7 @@ await new Promise((ready, reject) => { server.once("error", reject); server.list
 const base = `http://127.0.0.1:${server.address().port}`, at = "2026-10-28T00:00:00Z";
 const money = { chargedUnits: "432000", returnedUnits: "345600", unfulfilledUnits: "43200", serviceUnits: "43200", providerNetUnits: "38880", platformFeeUnits: "4320", providerCreditedUnits: "0", compensationUnits: "0", compensationCreditedUnits: "0" };
 function rental(n) {
-  return { id: `job:order-${n}`, jobId: `order-${n}`, installationId: `original-client-${n}`, hostId: "removed-host", buyerEmail: "original-buyer@example.test", providerEmail: "original-provider@example.test", clientSubdomain: `historical-client-${n}`,
+  return { id: `lease:original-client-${n}`, jobId: null, installationId: `original-client-${n}`, hostId: "removed-host", buyerEmail: "original-buyer@example.test", providerEmail: "original-provider@example.test", clientSubdomain: `historical-client-${n}`,
     hostIp: "192.0.2.10", hostPort: 22, countryCode: "SG", provenance: "order_snapshot", createdAt: at, activatedAt: at, endedAt: at, cleanupConfirmedAt: null,
     contractId: `contract-${n}`, status: "ended", cleanupStatus: "failed", attention: "cleanup_failed", terminationId: n === 1 ? "original-termination" : null, hostPresent: false, pricingModel: "prepaid_calendar_month", cyclePriceMinor: 5, dailyRateMinor: null, offerRevision: 1, trialSecondsRemaining: 0, renewalPolicy: "manual", money };
 }
@@ -48,7 +48,10 @@ try {
     if (route.request().method() !== "GET" && path !== "/v1/dashboard/presence") writes.push(path);
     if (path === "/v1/auth/session/me") return json(route, { authenticated: !!actor, isAdmin: actor === "admin", canAuditClientMarket: actor === "owner", user: actor ? { id: actor, email: `${actor}@example.test` } : null, password: { hasPassword: true, version: 1 } });
     if (path === "/v1/ui/context") return json(route, { mode: "router" });
-    if (path === "/v1/client-market/hosts" || path === "/v1/client-market/my-rentals" || path === "/v1/regions") return json(route, []);
+    if (path === "/v1/client-market/online/listings") return json(route, {listings:[]});
+    if (path === "/v1/client-market/online/leases") return json(route, {leases:[]});
+    if (isRetiredClientMarketPath(path)) { errors.push(path); return json(route, {}, 410); }
+    if (path === "/v1/regions") return json(route, []);
     if (path === "/v1/client-market/me/rentals") return json(route, emptyClientRentalsPage(url));
     if (path === "/v1/client-market/termination-workspace") return json(route, { hosts: [], actionRequiredCount: 0, canAdjudicate: actor === "owner", serverNow: at });
     if (path.startsWith("/v1/admin/client-market/rental-audit")) {
@@ -166,7 +169,7 @@ try {
   await toggle().focus(); await page.keyboard.press("Space"); await detail().getByText("$0.05 / month", { exact: true }).waitFor();
   await page.keyboard.press("Escape"); await detail().waitFor({ state: "hidden" });
   await rows().nth(1).getByRole("button").click();
-  await detail().getByText("job:order-2", { exact: true }).waitFor();
+  await detail().getByText("lease:original-client-2", { exact: true }).waitFor();
   assert.equal(await detail().count(), 1, "only the selected rental has a detail dialog");
   await page.keyboard.press("Escape"); await detail().waitFor({ state: "hidden" });
   await panel().getByRole("button", { name: "Next", exact: true }).click();
@@ -176,7 +179,9 @@ try {
   await panel().getByText("53 matching records · page 1 / 11", { exact: true }).waitFor();
 
   auditFailure = true; await panel().getByRole("button", { name: "Refresh audit", exact: true }).click();
-  await panel().getByRole("alert").waitFor(); assert.equal(await page.getByRole("button", { name: "Add host", exact: true }).count(), 1);
+  await panel().getByRole("alert").waitFor();
+  await page.getByRole("combobox", {name:"Egress region",exact:true}).waitFor();
+  assert.equal(await page.getByRole("button",{name:"Add host",exact:true}).count(),0);
   auditFailure = false; await panel().getByRole("button", { name: "Refresh audit", exact: true }).click();
   await panel().getByRole("alert").waitFor({ state: "hidden" });
 
@@ -193,7 +198,7 @@ try {
   });
   await switchActor("buyer"); await panel().waitFor({ state: "hidden" }); await detail().waitFor({ state: "hidden" });
   releaseDetail?.(); holdDetail = false;
-  await switchActor("admin"); await page.getByRole("button", { name: "Add host", exact: true }).waitFor();
+  await switchActor("admin"); await page.getByRole("combobox", { name: "Egress region", exact: true }).waitFor();
   assert.equal(await panel().count(), 0);
   await switchActor(""); await goto(undefined, false); assert.equal(await panel().count(), 0);
   await switchActor("owner"); await openAudit(); await panel().getByText("53 matching records · page 1 / 11", { exact: true }).waitFor();

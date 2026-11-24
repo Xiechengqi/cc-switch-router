@@ -436,6 +436,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         126,
         include_str!("../schema/0126_client_host_health_calendar.sql"),
     ),
+    (
+        127,
+        include_str!("../schema/0127_online_client_leasing.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -945,6 +949,22 @@ fn migration_checksum(sql: &str) -> String {
 mod tests {
 
     #[test]
+    fn fresh_client_market_uses_online_supply_and_has_no_ssh_operations() {
+        let conn = memory_connection();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        let count = |sql| conn.query_row(sql, [], |row| row.get::<_, i64>(0)).unwrap();
+        assert_eq!(count("SELECT count(*) FROM online_client_supply"), 0);
+        assert_eq!(count("SELECT count(*) FROM online_client_operations"), 0);
+        assert_eq!(count("SELECT count(*) FROM sqlite_schema WHERE name IN (
+            'client_market_legacy_retirements','client_market_legacy_drainable_hosts',
+            'client_market_legacy_retirement_on_delete','client_host_agents','client_host_agent_bootstraps',
+            'client_binary_preparations','client_market_provider_terminal_authorizations',
+            'client_market_host_import_jobs','subdomain_reservations','router_ssh_hosts','client_market_subscriptions',
+            'client_market_batches','client_market_allocation_quotes','provisioning_jobs')"), 0);
+    }
+
+    #[test]
     fn migration_125_does_not_modify_rental_or_existing_monitor_identity() {
         let conn = memory_connection();
         install_schema_through(&conn, 124);
@@ -956,7 +976,8 @@ mod tests {
         .unwrap();
         assert_eq!(conn.execute("UPDATE client_host_agents SET legacy=1,public_key='unchanged',first_due_at=1000,key_generation=2,operation_sequence=8 WHERE host_id='rented'",[]).unwrap(), 1);
         conn.execute("INSERT INTO client_market_subscriptions(installation_id,host_id,provider_id,host_owner_email,client_user_id,client_owner_email,status,offer_revision,created_at,updated_at) VALUES('lease','rented','provider','owner@example.test','buyer','buyer@example.test','active',7,'2026-01-01','2026-01-01')", []).unwrap();
-        apply(&conn).unwrap();
+        conn.execute_batch(MIGRATIONS.iter().find(|(v, _)| *v == 125).unwrap().1)
+            .unwrap();
         let actual:(String,String,String,i64,i64,i64,String,i64)=conn.query_row("SELECT h.status,h.installation_id,a.public_key,a.first_due_at,a.key_generation,a.operation_sequence,s.status,s.offer_revision FROM router_ssh_hosts h JOIN client_host_agents a ON a.host_id=h.id JOIN client_market_subscriptions s ON s.installation_id=h.installation_id WHERE h.id='rented'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))).unwrap();
         assert_eq!(
             actual,
@@ -990,7 +1011,8 @@ mod tests {
             VALUES('prior','192.0.2.10',22,'provider@example.test','allocated','prior-client','2026-01-01','2026-01-01')",[]).unwrap();
         conn.execute("INSERT INTO client_market_subscriptions(installation_id,host_id,provider_id,host_owner_email,client_user_id,client_owner_email,status,offer_revision,created_at,updated_at)
             VALUES('prior-client','prior','provider','provider@example.test','buyer','buyer@example.test','active',3,'2026-01-01','2026-01-01')",[]).unwrap();
-        apply(&conn).unwrap();
+        conn.execute_batch(MIGRATIONS.iter().find(|(v, _)| *v == 124).unwrap().1)
+            .unwrap();
         let facts:(String,String,i64)=conn.query_row("SELECT h.status,s.status,s.offer_revision FROM router_ssh_hosts h JOIN client_market_subscriptions s ON s.host_id=h.id WHERE h.id='prior'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
         assert_eq!(facts, ("allocated".into(), "active".into(), 3));
         // Hosts listed before health reporting keep their availability and are queued
@@ -1045,7 +1067,8 @@ mod tests {
     // Migration 124 Host health adds eight tables, including retired Host IDs by address.
     // Migration 125 adds the lease-bound initial monitor bootstrap queue.
     // Migration 126 adds the year-long Host health day aggregate.
-    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 314;
+    // Migration 127 adds seven online leasing tables and removes obsolete SSH operations.
+    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 295;
 
     #[test]
     fn migration_114_revokes_existing_sessions_and_rotation_grace_only_once() {
@@ -1658,8 +1681,8 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        apply(&conn).unwrap();
-        apply(&conn).unwrap();
+        upgrade_schema_through(&conn, 99);
+        upgrade_schema_through(&conn, 99);
         assert_eq!(
             conn.query_row(
                 "SELECT COUNT(*) FROM client_market_rental_identities",
@@ -1891,7 +1914,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_92_adds_inherited_client_trials_and_preserves_frozen_quotes_and_money() {
+    fn migrations_92_and_93_add_inherited_client_trials_and_preserve_frozen_quotes_and_money() {
         let conn = memory_connection();
         install_schema_through(&conn, 91);
         let at = "2026-10-27T00:00:00Z";
@@ -1920,7 +1943,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        apply(&conn).unwrap();
+        upgrade_schema_through(&conn, 93);
         assert_eq!(
             conn.query_row(
                 "SELECT client_hours FROM market_trial_policy WHERE id=1",
@@ -1950,7 +1973,7 @@ mod tests {
             [],
         )
         .unwrap();
-        apply(&conn).unwrap();
+        upgrade_schema_through(&conn, 93);
         assert_eq!(
             conn.query_row(
                 "SELECT trial_hours FROM router_ssh_hosts WHERE id='trial-host'",
@@ -1961,9 +1984,12 @@ mod tests {
             0
         );
         assert_eq!(
-            crate::market_trial_policy::policy_tx(&conn)
-                .unwrap()
-                .client_hours,
+            conn.query_row(
+                "SELECT client_hours FROM market_trial_policy WHERE id=1",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
             0
         );
         for invalid in [-1, 721] {
@@ -2602,7 +2628,7 @@ mod tests {
         };
         assert_eq!(rail("share_market_seats", "old-seat"), "legacy_provider");
         assert_eq!(rail("router_ssh_hosts", "old-host"), "legacy_provider");
-        apply(&conn).unwrap();
+        upgrade_schema_through(&conn, 82);
         for (i, mode) in ["disabled", "shadow", "enabled"].iter().enumerate() {
             conn.execute(
                 "UPDATE market_finance_control SET mode=?1,cutover_approved_at=NULL WHERE id=1",
@@ -2638,7 +2664,7 @@ mod tests {
         .unwrap();
         assert_eq!(rail("share_market_seats", "old-seat"), "platform_wallet");
         assert_eq!(rail("router_ssh_hosts", "old-host"), "platform_wallet");
-        apply(&conn).unwrap();
+        upgrade_schema_through(&conn, 82);
     }
 
     #[test]
@@ -2996,7 +3022,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count Client cleanup retry tables");
-        assert_eq!(cleanup_retry_table_count, 1);
+        assert_eq!(cleanup_retry_table_count, 0);
         let recovery_cursor_table_count = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -3106,7 +3132,7 @@ mod tests {
         )
         .expect("seed legacy provisioning jobs");
 
-        apply(&conn).expect("migrate an existing database");
+        upgrade_schema_through(&conn, 13);
 
         let surviving_jobs = conn
             .query_row("SELECT COUNT(*) FROM provisioning_jobs", [], |row| {
@@ -3129,9 +3155,6 @@ mod tests {
             )
             .expect("count retired schema objects");
         assert_eq!(legacy_objects, 0);
-        // apply() upgrades through the latest migration. Later migrations may
-        // add indexes, so verify the indexes rebuilt by migration 13 directly
-        // rather than fixing the final table's total index count forever.
         for index in [
             "idx_provisioning_jobs_client",
             "idx_provisioning_jobs_host",
@@ -3345,9 +3368,9 @@ mod tests {
     }
 
     #[test]
-    fn provisioning_jobs_only_accept_explicit_create_or_cleanup_work() {
+    fn migration_13_provisioning_jobs_only_accept_explicit_create_or_cleanup_work() {
         let conn = memory_connection();
-        apply(&conn).expect("install baseline");
+        install_schema_through(&conn, 13);
 
         let error = conn
             .execute(
@@ -3515,7 +3538,20 @@ mod tests {
         let latest = MIGRATIONS.last().map(|(version, _)| *version).unwrap_or(1);
         assert!((1..=latest).contains(&version));
         install_baseline(conn, &migration_checksum(BASELINE_SQL)).expect("install baseline");
-        for (migration_version, sql) in MIGRATIONS.iter().copied().take((version - 1) as usize) {
+        upgrade_schema_through(conn, version);
+    }
+
+    fn upgrade_schema_through(conn: &Connection, version: i64) {
+        let current: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        for (migration_version, sql) in MIGRATIONS
+            .iter()
+            .copied()
+            .filter(|(v, _)| *v > current && *v <= version)
+        {
             if migration_version == LEGACY_TOKEN_MARKET_PHYSICAL_RETIREMENT_VERSION {
                 validate_legacy_token_market_archive(conn)
                     .expect("validate legacy Token Market archive");

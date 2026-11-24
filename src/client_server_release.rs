@@ -62,30 +62,9 @@ struct GithubReleaseAsset {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct InstallationArtifact {
-    pub name: String,
-    pub url: String,
-    pub sha256: String,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct InstallationRelease {
-    pub selector: String,
-    pub commit: String,
-    pub artifacts: Vec<InstallationArtifact>,
-}
-
-#[derive(Debug, Clone)]
 struct CachedValidation {
     expires_at: Instant,
     value: ClientServerReleaseValidation,
-}
-
-#[derive(Clone)]
-struct CachedInstallation {
-    release: InstallationRelease,
-    etag: Option<String>,
-    checked_at: Instant,
 }
 
 /// Validates Router-selected cc-switch-server releases against GitHub.
@@ -99,161 +78,9 @@ pub struct ClientServerReleaseValidator {
     api_base: String,
     cache: Mutex<HashMap<String, CachedValidation>>,
     selector_locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
-    installations: Mutex<HashMap<String, CachedInstallation>>,
 }
 
 impl ClientServerReleaseValidator {
-    /// Installation checks always consult the published Release. In particular,
-    /// the Settings validator's five-minute cache is not a freshness guarantee.
-    pub(crate) async fn resolve_installation(
-        &self,
-        selector: &str,
-    ) -> Result<InstallationRelease, String> {
-        let selector = normalize_client_server_release(selector)?;
-        let requested_at = Instant::now();
-        let lock = {
-            let mut locks = self.selector_locks.lock().await;
-            locks.retain(|_, lock| lock.strong_count() > 0);
-            match locks.get(&selector).and_then(Weak::upgrade) {
-                Some(lock) => lock,
-                None => {
-                    let lock = Arc::new(Mutex::new(()));
-                    locks.insert(selector.clone(), Arc::downgrade(&lock));
-                    lock
-                }
-            }
-        };
-        let _flight = lock.lock().await;
-        if let Some(cached) = self
-            .installations
-            .lock()
-            .await
-            .get(&selector)
-            .filter(|cached| cached.checked_at >= requested_at)
-        {
-            return Ok(cached.release.clone());
-        }
-        let mut last_error = String::new();
-        for attempt in 0..3 {
-            match self.fetch_installation(&selector).await {
-                Ok(release) => return Ok(release),
-                Err(error) => last_error = error,
-            }
-            if attempt < 2 {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-        }
-        Err(last_error)
-    }
-
-    async fn fetch_installation(&self, selector: &str) -> Result<InstallationRelease, String> {
-        let cached = self.installations.lock().await.get(selector).cloned();
-        let mut request = self
-            .client
-            .get(format!("{}/{selector}", self.api_base))
-            .header("Accept", "application/vnd.github+json")
-            .header("Cache-Control", "no-cache");
-        if let Some(etag) = cached.as_ref().and_then(|cached| cached.etag.as_deref()) {
-            request = request.header("If-None-Match", etag);
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|_| "Release lookup unavailable".to_string())?
-            .error_for_status()
-            .map_err(|_| "Published Release unavailable".to_string())?;
-        if response.status() == StatusCode::NOT_MODIFIED {
-            let mut cached = cached.ok_or("Release returned 304 without a cached identity")?;
-            cached.checked_at = Instant::now();
-            let release = cached.release.clone();
-            self.installations
-                .lock()
-                .await
-                .insert(selector.into(), cached);
-            return Ok(release);
-        }
-        let etag = response
-            .headers()
-            .get("etag")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        let bytes = read_installation_response(response, 1024 * 1024).await?;
-        let value: serde_json::Value =
-            serde_json::from_slice(&bytes).map_err(|_| "Invalid Release metadata".to_string())?;
-        let payload: GithubRelease = serde_json::from_value(value.clone())
-            .map_err(|_| "Invalid Release metadata".to_string())?;
-        let validation = validate_release_payload(selector, payload);
-        if !validation.valid {
-            return Err(validation.message);
-        }
-        let commit = validation
-            .target_commitish
-            .ok_or("Release commit is missing")?
-            .to_ascii_lowercase();
-        if commit.len() != 40 {
-            return Err("Release requires a full commit ID".into());
-        }
-        let assets = value["assets"].as_array().ok_or("Release assets missing")?;
-        let mut artifacts = Vec::new();
-        for name in [
-            "cc-switch-server-linux-amd64",
-            "cc-switch-server-linux-arm64",
-        ] {
-            let asset = assets
-                .iter()
-                .find(|asset| asset["name"].as_str() == Some(name))
-                .ok_or("Binary asset missing")?;
-            let checksum_name = format!("{name}.sha256");
-            let checksum = assets
-                .iter()
-                .find(|asset| asset["name"].as_str() == Some(checksum_name.as_str()))
-                .ok_or("Checksum asset missing")?;
-            let url = installation_asset_url(asset, selector, name)?;
-            let checksum_url = installation_asset_url(checksum, selector, &checksum_name)?;
-            let checksum_response = self
-                .client
-                .get(checksum_url)
-                .header("Cache-Control", "no-cache")
-                .send()
-                .await
-                .map_err(|_| "Checksum download unavailable".to_string())?
-                .error_for_status()
-                .map_err(|_| "Checksum download unavailable".to_string())?;
-            let bytes = read_installation_response(checksum_response, 512).await?;
-            let text =
-                std::str::from_utf8(&bytes).map_err(|_| "Invalid checksum file".to_string())?;
-            let sha256 = parse_installation_checksum(text)?;
-            if let Some(digest) = asset["digest"].as_str()
-                && digest != format!("sha256:{sha256}")
-            {
-                return Err("Release asset digest changed".into());
-            }
-            artifacts.push(InstallationArtifact {
-                name: name.into(),
-                url,
-                sha256,
-            });
-        }
-        let release = InstallationRelease {
-            selector: selector.into(),
-            commit,
-            artifacts,
-        };
-        let mut installations = self.installations.lock().await;
-        if installations.len() >= 32 {
-            installations.clear();
-        }
-        installations.insert(
-            selector.into(),
-            CachedInstallation {
-                release: release.clone(),
-                etag,
-                checked_at: Instant::now(),
-            },
-        );
-        Ok(release)
-    }
-
     pub fn new() -> Result<Self, reqwest::Error> {
         let client = reqwest::Client::builder()
             .user_agent("cc-switch-router/0.1 client-server-release-validator")
@@ -265,7 +92,6 @@ impl ClientServerReleaseValidator {
             api_base: RELEASE_API_BASE.to_string(),
             cache: Mutex::new(HashMap::new()),
             selector_locks: Mutex::new(HashMap::new()),
-            installations: Mutex::new(HashMap::new()),
         })
     }
 
@@ -372,57 +198,6 @@ impl ClientServerReleaseValidator {
         };
         validate_release_payload(release, payload)
     }
-}
-
-async fn read_installation_response(
-    mut response: reqwest::Response,
-    limit: usize,
-) -> Result<Vec<u8>, String> {
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|_| "Release download interrupted".to_string())?
-    {
-        if bytes.len().saturating_add(chunk.len()) > limit {
-            return Err("Release response exceeds size limit".into());
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    Ok(bytes)
-}
-
-fn installation_asset_url(
-    asset: &serde_json::Value,
-    selector: &str,
-    name: &str,
-) -> Result<String, String> {
-    let expected = format!(
-        "https://github.com/Xiechengqi/cc-switch-server/releases/download/{selector}/{name}"
-    );
-    if asset["browser_download_url"].as_str() != Some(expected.as_str()) {
-        return Err("Unexpected Release asset URL".into());
-    }
-    Ok(expected)
-}
-
-fn parse_installation_checksum(text: &str) -> Result<String, String> {
-    let lines = text
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .collect::<Vec<_>>();
-    if lines.len() != 1 {
-        return Err("Checksum must contain one digest".into());
-    }
-    let digest = lines[0]
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err("Invalid checksum digest".into());
-    }
-    Ok(digest)
 }
 
 fn validation_for_http_status(
@@ -543,92 +318,6 @@ fn validation_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn installation_checks_revalidate_etags_coalesce_and_reject_unavailable_release() {
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-        let requests = Arc::new(AtomicUsize::new(0));
-        let available = Arc::new(AtomicBool::new(true));
-        let hits = requests.clone();
-        let live = available.clone();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            axum::serve(
-                listener,
-                axum::Router::new().route(
-                    "/latest",
-                    axum::routing::get(move |headers: axum::http::HeaderMap| {
-                        let hits = hits.clone();
-                        let live = live.clone();
-                        async move {
-                            hits.fetch_add(1, Ordering::SeqCst);
-                            assert_eq!(headers["if-none-match"], "\"published\"");
-                            tokio::time::sleep(Duration::from_millis(25)).await;
-                            if live.load(Ordering::SeqCst) {
-                                StatusCode::NOT_MODIFIED
-                            } else {
-                                StatusCode::NOT_FOUND
-                            }
-                        }
-                    }),
-                ),
-            )
-            .await
-            .unwrap();
-        });
-        let mut validator = ClientServerReleaseValidator::new().unwrap();
-        validator.api_base = format!("http://{addr}");
-        validator.installations.lock().await.insert(
-            "latest".into(),
-            CachedInstallation {
-                release: InstallationRelease {
-                    selector: "latest".into(),
-                    commit: "a".repeat(40),
-                    artifacts: Vec::new(),
-                },
-                etag: Some("\"published\"".into()),
-                checked_at: Instant::now() - Duration::from_secs(1),
-            },
-        );
-        let (a, b) = tokio::join!(
-            validator.resolve_installation("latest"),
-            validator.resolve_installation("latest")
-        );
-        assert_eq!(a.unwrap().commit, b.unwrap().commit);
-        assert_eq!(requests.load(Ordering::SeqCst), 1);
-        validator.resolve_installation("latest").await.unwrap();
-        assert_eq!(
-            requests.load(Ordering::SeqCst),
-            2,
-            "sequential launch skipped its freshness check"
-        );
-        available.store(false, Ordering::SeqCst);
-        assert!(
-            validator.resolve_installation("latest").await.is_err(),
-            "unavailable release reused a stale identity"
-        );
-        server.abort();
-    }
-    #[test]
-    fn installation_checksum_rejects_ambiguous_and_invalid_files() {
-        let digest = "a".repeat(64);
-        assert_eq!(
-            parse_installation_checksum(&format!("{digest}  binary\n")).unwrap(),
-            digest
-        );
-        assert!(parse_installation_checksum(&format!("{digest}\n{digest}\n")).is_err());
-        assert!(parse_installation_checksum("unknown binary").is_err());
-        assert!(parse_installation_checksum("").is_err());
-        assert!(
-            installation_asset_url(
-                &serde_json::json!({"browser_download_url":"https://attacker.test/binary"}),
-                "latest",
-                "cc-switch-server-linux-amd64"
-            )
-            .is_err()
-        );
-    }
 
     fn release(selector: &str, target: &str, assets: &[&str]) -> GithubRelease {
         GithubRelease {

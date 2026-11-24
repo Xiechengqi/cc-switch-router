@@ -435,7 +435,8 @@ pub(crate) fn service_can_resume_tx(
                 "SELECT daily_rate_minor IS NULL AND cycle_price_minor IS NULL FROM share_market_subscriptions WHERE id = ?1"
             }
             "client_host" => {
-                "SELECT daily_rate_minor IS NULL AND cycle_price_minor IS NULL FROM client_market_subscriptions WHERE installation_id = ?1"
+                "SELECT q.cycle_price_minor=0 FROM online_client_leases r JOIN online_client_quotes q ON q.id=r.quote_id
+                 WHERE r.id=?1 AND r.state='active' AND r.grant_until>unixepoch()"
             }
             _ => return Ok(false),
         };
@@ -3278,7 +3279,6 @@ struct PlatformControlAction {
     contract_id: String,
     product_kind: String,
     product_ref: String,
-    service_ref: String,
     kind: PlatformControlKind,
 }
 
@@ -3290,13 +3290,16 @@ fn service_expiry_tx(
 ) -> Result<Option<DateTime<Utc>>, AppError> {
     let expiry: Option<String> = if product_kind == "share" {
         conn.query_row(
-            "SELECT expires_at FROM share_market_subscriptions WHERE id = ?1",
+            "SELECT CASE WHEN r.cutoff_at IS NOT NULL AND (s.expires_at IS NULL OR r.cutoff_at<unixepoch(s.expires_at))
+                  THEN strftime('%Y-%m-%dT%H:%M:%SZ',r.cutoff_at,'unixepoch') ELSE s.expires_at END
+             FROM share_market_subscriptions s LEFT JOIN online_client_share_bindings b ON b.share_id=s.share_id
+             LEFT JOIN online_client_leases r ON r.id=b.lease_id WHERE s.id=?1",
             params![product_ref],
             |row| row.get(0),
         )
     } else {
         conn.query_row(
-            "SELECT expires_at FROM client_market_subscriptions WHERE installation_id = ?1",
+            "SELECT CASE WHEN cutoff_at IS NOT NULL THEN strftime('%Y-%m-%dT%H:%M:%SZ',cutoff_at,'unixepoch') END FROM online_client_leases WHERE id=?1",
             params![service_ref],
             |row| row.get(0),
         )
@@ -3463,6 +3466,7 @@ fn service_control_available_tx(
     product_kind: &str,
     product_ref: &str,
     service_ref: &str,
+    through: DateTime<Utc>,
 ) -> Result<bool, AppError> {
     if product_kind == "share" {
         let status = conn
@@ -3482,12 +3486,8 @@ fn service_control_available_tx(
     } else if product_kind == "client_host" {
         let state = conn
             .query_row(
-                "SELECT subscription.status, tunnel.enabled
-                 FROM client_market_subscriptions subscription
-                 JOIN installation_client_tunnels tunnel
-                   ON tunnel.installation_id = subscription.installation_id
-                 WHERE subscription.installation_id = ?1",
-                params![service_ref],
+                "SELECT state,grant_until>?2 FROM online_client_leases WHERE id=?1",
+                params![service_ref, through.timestamp()],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
             )
             .optional()
@@ -3526,8 +3526,7 @@ fn health_observed_after_control_fence_tx(
         )
     } else if product_kind == "client_host" {
         conn.query_row(
-            "SELECT MAX(checked_at) FROM installation_health_checks
-             WHERE installation_id = ?1 AND checked_at <= ?2",
+            "SELECT MAX(checked_at) FROM online_client_probes WHERE lease_id=?1 AND checked_at<=?2",
             params![service_ref, through.timestamp()],
             |row| row.get(0),
         )
@@ -3583,6 +3582,7 @@ pub(crate) fn settle_client_termination_tail_tx(
         .optional().map_err(db_error("read Client termination service tail"))?;
     if let Some((product, Some(service), model, status, Some(cursor), remaining)) = row {
         if status == "active" {
+            let cutoff = parse_time(at)?;
             reconcile_service_interval_tx(
                 conn,
                 id,
@@ -3593,12 +3593,94 @@ pub(crate) fn settle_client_termination_tail_tx(
                 &status,
                 &cursor,
                 remaining,
-                parse_time(at)?,
-                None,
+                cutoff,
+                Some(cutoff),
             )?;
         }
     }
     settle_client_monthly_evidence_tx(conn, id, true, at)
+}
+
+/// Online Clients are priced using closed UTC hours. Each lease has its own
+/// five-minute samples. A partial first/last hour uses the same 5/6 threshold
+/// over the slots that intersect service. Missing slots count as failures,
+/// except a partially covered edge slot whose jittered probe fell outside the
+/// window: it has no evidence and is left out of the threshold.
+fn settle_online_month_tx(
+    conn: &Connection,
+    contract: &str,
+    lease: &str,
+    mut cursor: DateTime<Utc>,
+    through: DateTime<Utc>,
+    flush: bool,
+    posted_at: DateTime<Utc>,
+) -> Result<(), AppError> {
+    crate::market_reconcile::ensure_contract_finance_safe_tx(conn, contract)?;
+    while cursor < through {
+        let next =
+            DateTime::<Utc>::from_timestamp((cursor.timestamp().div_euclid(3600) + 1) * 3600, 0)
+                .ok_or_else(|| AppError::Internal("invalid Client billing hour".into()))?;
+        let end = next.min(through);
+        if end < next && !flush {
+            break;
+        }
+        let first_slot = cursor.timestamp().div_euclid(300);
+        let last_slot = (end.timestamp_millis() - 1).div_euclid(300_000);
+        let window_end = (end.timestamp_millis() + 999) / 1000;
+        let successful:i64=conn.query_row("SELECT count(*) FROM online_client_probes WHERE lease_id=?1 AND bucket BETWEEN ?2 AND ?3 AND healthy=1 AND checked_at>=?4 AND checked_at<?5",
+            params![lease,first_slot,last_slot,cursor.timestamp(),window_end],|r|r.get(0)).map_err(db_error("read rental hour health"))?;
+        let sampled = |slot: i64| -> Result<bool, AppError> {
+            conn.query_row("SELECT EXISTS(SELECT 1 FROM online_client_probes WHERE lease_id=?1 AND bucket=?2 AND checked_at>=?3 AND checked_at<?4)",
+                params![lease,slot,cursor.timestamp(),window_end],|r|r.get(0)).map_err(db_error("read rental slot sample"))
+        };
+        // A probe runs once per slot at a jittered offset. When service starts or
+        // ends inside a slot, that slot's probe can fall outside the window; such
+        // a slot carries no evidence either way and is left out of the threshold.
+        let mut slots = last_slot - first_slot + 1;
+        let first_partial = cursor.timestamp() > first_slot * 300;
+        let last_partial = end.timestamp() < (last_slot + 1) * 300;
+        if first_partial && !sampled(first_slot)? {
+            slots -= 1;
+        }
+        if last_partial && last_slot != first_slot && !sampled(last_slot)? {
+            slots -= 1;
+        }
+        let available = if slots > 0 {
+            successful * 6 >= slots * 5
+        } else {
+            // A window shorter than one probe interval follows the last sample.
+            conn.query_row("SELECT coalesce((SELECT healthy=1 FROM online_client_probes WHERE lease_id=?1 AND checked_at<?2 ORDER BY checked_at DESC LIMIT 1),0)",
+                params![lease,window_end],|r|r.get(0)).map_err(db_error("read rental slot sample"))?
+        };
+        let now = posted_at.to_rfc3339();
+        let source = record_service_evidence_tx(
+            conn,
+            contract,
+            "client_host_health",
+            cursor,
+            end,
+            if available { "healthy" } else { "unhealthy" },
+            available,
+            "utc_hour_10_of_12",
+            &now,
+        )?;
+        settle_monthly_segment_tx(
+            conn,
+            contract,
+            &source,
+            &cursor.to_rfc3339(),
+            &end.to_rfc3339(),
+            available,
+            &now,
+        )?;
+        conn.execute(
+            "UPDATE market_platform_contracts SET last_evaluated_at=?2,updated_at=?3 WHERE id=?1",
+            params![contract, end.to_rfc3339(), now],
+        )
+        .map_err(db_error("advance online Client billing hour"))?;
+        cursor = end;
+    }
+    Ok(())
 }
 
 fn reconcile_service_interval_tx(
@@ -3630,7 +3712,19 @@ fn reconcile_service_interval_tx(
                 |row| row.get(0),
             )
             .map_err(db_error("read open wallet month boundary"))?;
-        end = end.min(parse_time(&period_end)?);
+        let period_end = parse_time(&period_end)?;
+        end = end.min(period_end);
+        if product_kind == "client_host" {
+            return settle_online_month_tx(
+                conn,
+                contract_id,
+                service_ref,
+                cursor,
+                end,
+                end == period_end || expiry.is_some_and(|at| end >= at),
+                now,
+            );
+        }
     }
     if status == "trialing" {
         end = end.min(cursor + chrono::Duration::hours(1));
@@ -3639,11 +3733,6 @@ fn reconcile_service_interval_tx(
     end = cursor + chrono::Duration::seconds((end - cursor).num_seconds());
     if end <= cursor {
         return Ok(());
-    }
-    if billing_model == "calendar_month" && status == "active" && product_kind == "client_host" {
-        // Batching income must not delay the existing fail-closed response to
-        // a finance hold until the next hourly posting boundary.
-        crate::market_reconcile::ensure_contract_finance_safe_tx(conn, contract_id)?;
     }
     if billing_model == "metered" && status == "active" {
         // Settle any older persisted seconds first. A new observation must not
@@ -3683,8 +3772,13 @@ fn reconcile_service_interval_tx(
             )?
             .is_none()
             {
-                let control_available =
-                    service_control_available_tx(conn, product_kind, product_ref, service_ref)?;
+                let control_available = service_control_available_tx(
+                    conn,
+                    product_kind,
+                    product_ref,
+                    service_ref,
+                    end,
+                )?;
                 let source_kind = if product_kind == "share" {
                     "share_control"
                 } else {
@@ -3755,7 +3849,7 @@ fn reconcile_service_interval_tx(
         end,
     )?;
     let control_available =
-        service_control_available_tx(conn, product_kind, product_ref, service_ref)?;
+        service_control_available_tx(conn, product_kind, product_ref, service_ref, end)?;
     let post_control_health = health_observed_after_control_fence_tx(
         conn,
         contract_id,
@@ -3849,17 +3943,15 @@ fn reconcile_service_interval_tx(
         // budget even if the latest health check has since failed.
         settle_metered_batch_tx(conn, contract_id, &now.to_rfc3339())?;
     } else {
-        if product_kind == "share" {
-            settle_monthly_segment_tx(
-                conn,
-                contract_id,
-                &source_id,
-                &cursor.to_rfc3339(),
-                &split_end.to_rfc3339(),
-                available,
-                &now.to_rfc3339(),
-            )?;
-        }
+        settle_monthly_segment_tx(
+            conn,
+            contract_id,
+            &source_id,
+            &cursor.to_rfc3339(),
+            &split_end.to_rfc3339(),
+            available,
+            &now.to_rfc3339(),
+        )?;
         let changed = conn
             .execute(
                 "UPDATE market_platform_contracts
@@ -3875,14 +3967,6 @@ fn reconcile_service_interval_tx(
             .map_err(db_error("advance wallet monthly observation cursor"))?;
         if changed != 1 {
             return Err(AppError::Conflict("wallet monthly cursor changed".into()));
-        }
-        if product_kind == "client_host" {
-            settle_client_monthly_evidence_tx(
-                conn,
-                contract_id,
-                expiry.is_some_and(|expires| split_end >= expires),
-                &now.to_rfc3339(),
-            )?;
         }
     }
     Ok(())
@@ -3900,6 +3984,10 @@ fn reconcile_platform_contracts_tx(
                 trial_seconds_remaining, renewal_policy
          FROM market_platform_contracts
          WHERE status IN ('trialing', 'active', 'suspended', 'ending', 'review_required')
+           AND NOT EXISTS (SELECT 1 FROM online_client_leases r
+               WHERE market_platform_contracts.product_kind='client_host' AND r.id=market_platform_contracts.product_ref
+                 AND r.cutoff_at IS NOT NULL AND NOT EXISTS
+                 (SELECT 1 FROM client_market_terminations t WHERE t.installation_id=r.id))
          ORDER BY updated_at, id LIMIT 100",
         )
         .map_err(db_error("prepare wallet service reconciliation"))?;
@@ -3928,9 +4016,9 @@ fn reconcile_platform_contracts_tx(
         conn.execute_batch("SAVEPOINT wallet_service_contract")
             .map_err(db_error("begin wallet contract savepoint"))?;
         let outcome = (|| -> Result<Option<PlatformControlAction>, AppError> {
-            if kind == "client_host" && service_ref.is_empty() {
+            if kind == "client_host" && (service_ref.is_empty() || product_ref != service_ref) {
                 return Err(AppError::Internal(
-                    "active Client wallet contract has no installation".into(),
+                    "active Client wallet contract has no matching lease".into(),
                 ));
             }
             let subscription_exists: i64 = if kind == "share" {
@@ -3941,8 +4029,7 @@ fn reconcile_platform_contracts_tx(
                 )
             } else {
                 conn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM client_market_subscriptions
-                     WHERE installation_id = ?1)",
+                    "SELECT EXISTS(SELECT 1 FROM online_client_leases WHERE id=?1)",
                     params![service_ref],
                     |row| row.get(0),
                 )
@@ -4050,21 +4137,18 @@ fn reconcile_platform_contracts_tx(
                     |row| row.get(0),
                 )
                 .map_err(db_error("read final wallet control state"))?;
-            let subscription_status: Option<String> = if kind == "share" {
+            // A Client's durable workspace worker consumes contract status directly.
+            let subscription_status = if kind == "share" {
                 conn.query_row(
-                    "SELECT status FROM share_market_subscriptions WHERE id = ?1",
+                    "SELECT status FROM share_market_subscriptions WHERE id=?1",
                     params![product_ref],
-                    |row| row.get(0),
+                    |row| row.get::<_, String>(0),
                 )
+                .optional()
+                .map_err(db_error("read wallet Share control state"))?
             } else {
-                conn.query_row(
-                    "SELECT status FROM client_market_subscriptions WHERE installation_id = ?1",
-                    params![service_ref],
-                    |row| row.get(0),
-                )
-            }
-            .optional()
-            .map_err(db_error("read wallet service control state"))?;
+                None
+            };
             let action = match (final_status.as_str(), subscription_status.as_deref()) {
                 (
                     "suspended",
@@ -4098,7 +4182,6 @@ fn reconcile_platform_contracts_tx(
                 contract_id: id.clone(),
                 product_kind: kind.clone(),
                 product_ref: product_ref.clone(),
-                service_ref: service_ref.clone(),
                 kind: kind_of_action,
             });
             conn.execute(
@@ -4135,13 +4218,14 @@ fn reconcile_platform_contracts_tx(
                     .map_err(db_error("suspend held wallet contract"))?;
                 if suspended == 1 {
                     notify_contract_tx(conn, &id, "contract_suspended", "finance_hold", &now_text)?;
-                    actions.push(PlatformControlAction {
-                        contract_id: id.clone(),
-                        product_kind: kind.clone(),
-                        product_ref: product_ref.clone(),
-                        service_ref: service_ref.clone(),
-                        kind: PlatformControlKind::Suspend,
-                    });
+                    if kind == "share" {
+                        actions.push(PlatformControlAction {
+                            contract_id: id.clone(),
+                            product_kind: kind.clone(),
+                            product_ref: product_ref.clone(),
+                            kind: PlatformControlKind::Suspend,
+                        });
+                    }
                 }
                 tracing::warn!(contract_id = %id, "wallet contract suspended by finance hold");
             }
@@ -4235,38 +4319,6 @@ async fn dispatch_platform_controls(
                 crate::share_market::terminate_for_billing(
                     state,
                     &action.product_ref,
-                    "wallet_term_ended",
-                )
-                .await
-            }
-            (PlatformControlKind::Suspend, "client_host") => {
-                let _lock = state.client_market_actions.lock(&action.service_ref).await;
-                match state
-                    .store
-                    .client_market_set_billing_suspended(&action.service_ref, true)
-                    .await
-                {
-                    Ok(subdomain) => {
-                        if let Some(subdomain) = subdomain {
-                            state.proxy.remove_route(&subdomain).await;
-                        }
-                        Ok(())
-                    }
-                    Err(error) => Err(error),
-                }
-            }
-            (PlatformControlKind::Resume, "client_host") => {
-                let _lock = state.client_market_actions.lock(&action.service_ref).await;
-                state
-                    .store
-                    .client_market_set_billing_suspended(&action.service_ref, false)
-                    .await
-                    .map(|_| ())
-            }
-            (PlatformControlKind::Terminate, "client_host") => {
-                crate::client_market::terminate_for_billing(
-                    state,
-                    &action.service_ref,
                     "wallet_term_ended",
                 )
                 .await
@@ -4573,7 +4625,7 @@ mod tests {
         let input = PrepareContract {
             trial_only: false,
             product_kind: "client_host",
-            product_ref: "provision-job-1",
+            product_ref: "installation-1",
             trial_scope_ref: "host-1",
             quote_id: "quote-1",
             buyer_user_id: "buyer",
@@ -4589,32 +4641,22 @@ mod tests {
         bind_client_installation_tx(
             conn,
             &id,
-            "provision-job-1",
+            "installation-1",
             "installation-1",
             "buyer",
             "provider",
             start,
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO client_market_subscriptions
-                (installation_id, host_id, provider_id, host_owner_email,
-                 client_user_id, client_owner_email, status, currency,
-                 offer_revision, activated_at, created_at, updated_at,
-                 platform_contract_id)
-             VALUES ('installation-1', 'host-1', 'provider', 'provider@example.test',
-                     'buyer', 'buyer@example.test', 'active', 'USD',
-                     1, ?1, ?1, ?1, ?2)",
-            params![start, id],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO installation_client_tunnels
-                (installation_id, owner_email, subdomain, enabled, created_at, updated_at)
-             VALUES ('installation-1', 'buyer@example.test', 'client-1', 1, ?1, ?1)",
-            params![start],
-        )
-        .unwrap();
+        crate::test_support::online_listing(conn, "host-1", "provider", "provider@example.test");
+        crate::test_support::online_lease(
+            conn,
+            "installation-1",
+            "host-1",
+            "provider",
+            "buyer",
+            start,
+        );
         activate_contract_tx(conn, &id, start, start).unwrap();
         id
     }
@@ -5149,120 +5191,60 @@ mod tests {
     fn runtime_posts_client_monthly_income_hourly_without_double_earning() {
         let conn = memory();
         let start = "2026-01-01T00:00:00+00:00";
-        let end = parse_time(start).unwrap() + chrono::Duration::seconds(5);
-        let id = client_monthly_fixture(&conn, start, 0);
-        conn.execute(
-            "INSERT INTO installation_health_checks
-                (installation_id, checked_at, is_healthy, status, reason)
-             VALUES ('installation-1', ?1, 1, 'healthy', 'route_healthy')",
-            params![end.timestamp()],
-        )
-        .unwrap();
-        assert!(
-            reconcile_platform_contracts_tx(&conn, end)
-                .unwrap()
-                .is_empty()
-        );
-        let earned: i64 = conn
-            .query_row(
-                "SELECT COALESCE(SUM(amount_units), 0) FROM market_provider_earning_lots",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(earned, 0);
-        assert_eq!(
-            conn.query_row(
-                "SELECT COUNT(*) FROM market_platform_service_evidence WHERE contract_id = ?1",
-                params![id],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap(),
-            1
-        );
-        reconcile_platform_contracts_tx(&conn, end).unwrap();
-        assert_eq!(
-            conn.query_row(
-                "SELECT COALESCE(SUM(amount_units), 0) FROM market_provider_earning_lots",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap(),
-            earned
-        );
-        reconcile_wallet_tx(&conn, "buyer").unwrap();
-        let start_at = parse_time(start).unwrap();
-        // Health and access are still checked every five seconds. A healthy
-        // hour should create one earning lot, not 720 small financial posts.
-        for tick in 2..=720 {
-            let at = start_at + chrono::Duration::seconds(tick * 5);
-            conn.execute(
-                "INSERT INTO installation_health_checks
-                    (installation_id, checked_at, is_healthy, status, reason)
-                 VALUES ('installation-1', ?1, 1, 'healthy', 'route_healthy')",
-                params![at.timestamp()],
-            )
-            .unwrap();
-            assert!(
-                reconcile_platform_contracts_tx(&conn, at)
-                    .unwrap()
-                    .is_empty()
-            );
-            if tick == 719 {
-                assert_eq!(
-                    provider_summary_tx(&conn, "provider")
-                        .unwrap()
-                        .gross_earned_units,
-                    0
-                );
-            }
+        let first = parse_time(start).unwrap();
+        let contract = client_monthly_fixture(&conn, start, 0);
+        for slot in 0..10 {
+            observe_client_fixture(&conn, first + chrono::Duration::minutes(slot * 5), true);
         }
-        let hour = start_at + chrono::Duration::hours(1);
-        let expected = units_from_minor(1_000).unwrap() / (31 * 24);
         assert_eq!(
             provider_summary_tx(&conn, "provider")
                 .unwrap()
                 .gross_earned_units,
-            expected
+            0
         );
-        let (lots, maturity): (i64, String) = conn
-            .query_row(
-                "SELECT COUNT(*), MIN(unlock_at) FROM market_provider_earning_lots",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(lots, 1);
-        assert_eq!(
-            parse_time(&maturity).unwrap(),
-            hour + chrono::Duration::days(7)
-        );
-        // Replay and a new observation inside the next hour cannot repost the
-        // first hour or advance earnings prematurely.
-        for at in [hour, hour + chrono::Duration::seconds(5)] {
+        let hour = first + chrono::Duration::hours(1);
+        for at in [hour, hour, hour + chrono::Duration::seconds(5)] {
             reconcile_platform_contracts_tx(&conn, at).unwrap();
             assert_eq!(
                 provider_summary_tx(&conn, "provider")
                     .unwrap()
                     .gross_earned_units,
-                expected
+                units_from_minor(1_000).unwrap() / (31 * 24)
             );
         }
+        let (lots, unlock): (i64, String) = conn
+            .query_row(
+                "SELECT count(*),min(unlock_at) FROM market_provider_earning_lots",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(lots, 1);
+        assert_eq!(
+            parse_time(&unlock).unwrap(),
+            hour + chrono::Duration::days(7)
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM market_platform_service_evidence WHERE contract_id=?1",
+                params![contract],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
         reconcile_wallet_tx(&conn, "buyer").unwrap();
     }
 
+    fn probe_client_fixture(conn: &Connection, at: DateTime<Utc>, healthy: bool) {
+        conn.execute("INSERT INTO online_client_probes(installation_id,lease_id,bucket,checked_at,healthy,seller_id)
+            VALUES('host-1','installation-1',?1,?2,?3,'provider')
+            ON CONFLICT(installation_id,lease_id,bucket) DO UPDATE SET checked_at=excluded.checked_at,healthy=excluded.healthy",
+            params![at.timestamp().div_euclid(300),at.timestamp(),healthy]).unwrap();
+    }
+
     fn observe_client_fixture(conn: &Connection, at: DateTime<Utc>, healthy: bool) {
-        conn.execute(
-            "INSERT INTO installation_health_checks
-                (installation_id, checked_at, is_healthy, status, reason)
-             VALUES ('installation-1', ?1, ?2, ?3, 'test_observation')",
-            params![
-                at.timestamp(),
-                healthy,
-                if healthy { "healthy" } else { "unhealthy" }
-            ],
-        )
-        .unwrap();
+        probe_client_fixture(conn, at, healthy);
         reconcile_platform_contracts_tx(conn, at).unwrap();
     }
 
@@ -5294,10 +5276,15 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        let allocated = |seconds: i64| units_from_minor(1_000).unwrap() * seconds / (31 * 86_400);
-        assert_eq!(earned, allocated(5) + allocated(15) - allocated(10));
-        assert_eq!(earned + refunded, allocated(3_600));
-        assert_eq!(parse_time(&cursor).unwrap(), hour);
+        let allocated =
+            |milliseconds: i64| units_from_minor(1_000).unwrap() * milliseconds / (31 * 86_400_000);
+        let boundary = parse_time("2026-01-01T01:00:00+00:00").unwrap();
+        assert_eq!(earned, 0);
+        assert_eq!(
+            earned + refunded,
+            allocated((boundary - first).num_milliseconds())
+        );
+        assert_eq!(parse_time(&cursor).unwrap(), boundary);
         assert_eq!(
             provider_summary_tx(&conn, "provider")
                 .unwrap()
@@ -5417,12 +5404,13 @@ mod tests {
         observe_client_fixture(&conn, first + chrono::Duration::seconds(5), true);
         observe_client_fixture(&conn, first + chrono::Duration::seconds(10), true);
         let cleanup_at = (first + chrono::Duration::seconds(50)).to_rfc3339();
+        settle_client_termination_tail_tx(&conn, &id, &cleanup_at).unwrap();
         assert!(
             !terminate_after_cleanup_tx(&conn, &id, false, &cleanup_at)
                 .unwrap()
                 .finalized
         );
-        let earned = units_from_minor(1_000).unwrap() * 10 / (31 * 86_400);
+        let earned = units_from_minor(1_000).unwrap() * 50 / (31 * 86_400);
         let (gross, disputed, lots): (i64, i64, i64) = conn.query_row(
             "SELECT SUM(amount_units), MIN(disputed), COUNT(*) FROM market_provider_earning_lots",
             [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -5452,22 +5440,23 @@ mod tests {
     }
 
     #[test]
-    fn client_expiry_flushes_partial_hour_before_dispatching_cleanup() {
+    fn client_expiry_settles_the_partial_hour_at_the_accepted_cutoff() {
         let conn = memory();
         let start = "2026-01-01T00:00:00+00:00";
         let first = parse_time(start).unwrap();
         let id = client_monthly_fixture(&conn, start, 0);
         let expiry = first + chrono::Duration::seconds(12);
         conn.execute(
-            "UPDATE client_market_subscriptions SET expires_at = ?1 WHERE installation_id = 'installation-1'",
+            "UPDATE online_client_leases SET cutoff_at = unixepoch(?1) WHERE id = 'installation-1'",
             params![expiry.to_rfc3339()],
-        ).unwrap();
+        )
+        .unwrap();
         observe_client_fixture(&conn, first + chrono::Duration::seconds(5), true);
         observe_client_fixture(&conn, first + chrono::Duration::seconds(10), true);
         let actions =
             reconcile_platform_contracts_tx(&conn, first + chrono::Duration::seconds(15)).unwrap();
-        assert_eq!(actions.len(), 1);
-        assert_eq!(actions[0].kind, PlatformControlKind::Terminate);
+        assert!(actions.is_empty());
+        settle_client_termination_tail_tx(&conn, &id, &expiry.to_rfc3339()).unwrap();
         let earned = units_from_minor(1_000).unwrap() * 12 / (31 * 86_400);
         assert_eq!(
             provider_summary_tx(&conn, "provider")
@@ -5517,7 +5506,8 @@ mod tests {
             &tail,
         )
         .unwrap();
-        observe_client_fixture(&conn, boundary, true);
+        probe_client_fixture(&conn, boundary - chrono::Duration::seconds(1), true);
+        reconcile_platform_contracts_tx(&conn, boundary).unwrap();
         let periods: (i64, i64) = conn
             .query_row(
                 "SELECT COUNT(*), SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END)
@@ -5623,96 +5613,28 @@ mod tests {
     }
 
     #[test]
-    fn health_from_before_a_control_resume_cannot_create_new_income() {
+    fn health_from_before_a_control_resume_cannot_consume_trial_time() {
         let conn = memory();
         let start = "2026-01-01T00:00:00+00:00";
-        let start_at = parse_time(start).unwrap();
-        let id = client_monthly_fixture(&conn, start, 0);
+        let first = parse_time(start).unwrap();
+        let id = client_monthly_fixture(&conn, start, 60);
+        let after = |seconds| first + chrono::Duration::seconds(seconds);
+        observe_client_fixture(&conn, after(5), true);
         conn.execute(
-            "INSERT INTO installation_health_checks
-                (installation_id, checked_at, is_healthy, status, reason)
-             VALUES ('installation-1', ?1, 1, 'healthy', 'route_healthy')",
-            params![(start_at + chrono::Duration::seconds(5)).timestamp()],
+            "UPDATE market_platform_contracts SET health_fence_at=?2 WHERE id=?1",
+            params![id, after(6).to_rfc3339()],
         )
         .unwrap();
-        reconcile_platform_contracts_tx(&conn, start_at + chrono::Duration::seconds(10)).unwrap();
-        // Flush a partial hour as cleanup would, to inspect the exact health
-        // fence accounting separately from the hourly cadence test above.
-        settle_client_monthly_evidence_tx(
-            &conn,
-            &id,
-            true,
-            &(start_at + chrono::Duration::seconds(10)).to_rfc3339(),
-        )
-        .unwrap();
-        let earned_before: i64 = conn
-            .query_row(
-                "SELECT COALESCE(SUM(amount_units), 0) FROM market_provider_earning_lots",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(earned_before > 0);
-        // Represent the control ACK boundary after a temporary suspension.
-        // The prior healthy sample remains fresh by age but is not a valid
-        // post-resume proof.
-        conn.execute(
-            "UPDATE market_platform_contracts SET health_fence_at = ?2 WHERE id = ?1",
-            params![id, (start_at + chrono::Duration::seconds(10)).to_rfc3339()],
-        )
-        .unwrap();
-        reconcile_platform_contracts_tx(&conn, start_at + chrono::Duration::seconds(15)).unwrap();
-        settle_client_monthly_evidence_tx(
-            &conn,
-            &id,
-            true,
-            &(start_at + chrono::Duration::seconds(15)).to_rfc3339(),
-        )
-        .unwrap();
-        assert_eq!(
-            conn.query_row(
-                "SELECT COALESCE(SUM(amount_units), 0) FROM market_provider_earning_lots",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap(),
-            earned_before,
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT reason_code FROM market_platform_service_evidence
-                 WHERE contract_id = ?1 AND started_at = ?2",
-                params![id, (start_at + chrono::Duration::seconds(10)).to_rfc3339()],
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap(),
-            "health_before_control_fence",
-        );
-        conn.execute(
-            "INSERT INTO installation_health_checks
-                (installation_id, checked_at, is_healthy, status, reason)
-             VALUES ('installation-1', ?1, 1, 'healthy', 'route_healthy')",
-            params![(start_at + chrono::Duration::seconds(16)).timestamp()],
-        )
-        .unwrap();
-        reconcile_platform_contracts_tx(&conn, start_at + chrono::Duration::seconds(20)).unwrap();
-        settle_client_monthly_evidence_tx(
-            &conn,
-            &id,
-            true,
-            &(start_at + chrono::Duration::seconds(20)).to_rfc3339(),
-        )
-        .unwrap();
-        assert!(
-            conn.query_row(
-                "SELECT COALESCE(SUM(amount_units), 0) FROM market_provider_earning_lots",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap()
-                > earned_before
-        );
-        reconcile_wallet_tx(&conn, "buyer").unwrap();
+        reconcile_platform_contracts_tx(&conn, after(10)).unwrap();
+        let trial = || {
+            wallet_lifecycle_view_tx(&conn, &id, "buyer")
+                .unwrap()
+                .unwrap()
+                .trial_seconds_remaining
+        };
+        assert_eq!(trial(), 55);
+        observe_client_fixture(&conn, after(15), true);
+        assert_eq!(trial(), 50);
     }
 
     #[test]
@@ -5733,7 +5655,7 @@ mod tests {
             &PrepareContract {
                 trial_only: false,
                 product_kind: "client_host",
-                product_ref: "metered-job",
+                product_ref: "metered-installation",
                 trial_scope_ref: "metered-host",
                 quote_id: "metered-quote",
                 buyer_user_id: "buyer",
@@ -5751,32 +5673,27 @@ mod tests {
         bind_client_installation_tx(
             &conn,
             &id,
-            "metered-job",
+            "metered-installation",
             "metered-installation",
             "buyer",
             "provider",
             start,
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO client_market_subscriptions
-                (installation_id, host_id, provider_id, host_owner_email,
-                 client_user_id, client_owner_email, status, currency,
-                 offer_revision, activated_at, created_at, updated_at,
-                 platform_contract_id)
-             VALUES ('metered-installation', 'metered-host', 'provider',
-                     'provider@example.test', 'buyer', 'buyer@example.test',
-                     'active', 'USD', 1, ?1, ?1, ?1, ?2)",
-            params![start, id],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO installation_client_tunnels
-                (installation_id, owner_email, subdomain, enabled, created_at, updated_at)
-             VALUES ('metered-installation', 'buyer@example.test', 'metered-client', 1, ?1, ?1)",
-            params![start],
-        )
-        .unwrap();
+        crate::test_support::online_listing(
+            &conn,
+            "metered-host",
+            "provider",
+            "provider@example.test",
+        );
+        crate::test_support::online_lease(
+            &conn,
+            "metered-installation",
+            "metered-host",
+            "provider",
+            "buyer",
+            start,
+        );
         activate_contract_tx(&conn, &id, start, start).unwrap();
         // Consume nearly all of the reserved hold through the journal to
         // exercise the pre-delivery fence without constructing 86,400
@@ -5842,7 +5759,7 @@ mod tests {
         let end = parse_time(start).unwrap() + chrono::Duration::seconds(5);
         let id = client_monthly_fixture(&conn, start, 0);
         reconcile_platform_contracts_tx(&conn, end).unwrap();
-        settle_client_monthly_evidence_tx(&conn, &id, true, &end.to_rfc3339()).unwrap();
+        settle_client_termination_tail_tx(&conn, &id, &end.to_rfc3339()).unwrap();
         let (refunded, fulfilled): (i64, i64) = conn
             .query_row(
                 "SELECT refunded_units, fulfilled_units FROM market_platform_periods
@@ -5871,12 +5788,8 @@ mod tests {
         let start = "2026-01-01T00:00:00+00:00";
         let end = parse_time(start).unwrap() + chrono::Duration::seconds(5);
         let id = client_monthly_fixture(&conn, start, 0);
-        conn.execute(
-            "UPDATE installation_client_tunnels SET enabled = 0
-             WHERE installation_id = 'installation-1'",
-            [],
-        )
-        .unwrap();
+        conn.execute("UPDATE online_client_leases SET grant_until=0", [])
+            .unwrap();
         conn.execute(
             "INSERT INTO installation_health_checks
                 (installation_id, checked_at, is_healthy, status, reason)
@@ -5885,7 +5798,7 @@ mod tests {
         )
         .unwrap();
         reconcile_platform_contracts_tx(&conn, end).unwrap();
-        settle_client_monthly_evidence_tx(&conn, &id, true, &end.to_rfc3339()).unwrap();
+        settle_client_termination_tail_tx(&conn, &id, &end.to_rfc3339()).unwrap();
         let (refunded, fulfilled): (i64, i64) = conn
             .query_row(
                 "SELECT refunded_units, fulfilled_units FROM market_platform_periods
@@ -5904,12 +5817,8 @@ mod tests {
         let start = "2026-01-01T00:00:00+00:00";
         let end = parse_time(start).unwrap() + chrono::Duration::seconds(5);
         let id = client_monthly_fixture(&conn, start, 0);
-        conn.execute(
-            "UPDATE client_market_subscriptions SET status = 'billing_suspended'
-             WHERE installation_id = 'installation-1'",
-            [],
-        )
-        .unwrap();
+        conn.execute("UPDATE online_client_leases SET state='ending'", [])
+            .unwrap();
         conn.execute(
             "INSERT INTO installation_health_checks
                 (installation_id, checked_at, is_healthy, status, reason)
@@ -5918,7 +5827,7 @@ mod tests {
         )
         .unwrap();
         reconcile_platform_contracts_tx(&conn, end).unwrap();
-        settle_client_monthly_evidence_tx(&conn, &id, true, &end.to_rfc3339()).unwrap();
+        settle_client_termination_tail_tx(&conn, &id, &end.to_rfc3339()).unwrap();
         let (refunded, fulfilled): (i64, i64) = conn
             .query_row(
                 "SELECT refunded_units, fulfilled_units FROM market_platform_periods
@@ -5965,15 +5874,9 @@ mod tests {
             params![invalid_id, start],
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO installation_health_checks
-                (installation_id, checked_at, is_healthy, status, reason)
-             VALUES ('installation-1', ?1, 1, 'healthy', 'route_healthy')",
-            params![end.timestamp()],
-        )
-        .unwrap();
+        probe_client_fixture(&conn, end - chrono::Duration::seconds(1), true);
         reconcile_platform_contracts_tx(&conn, end).unwrap();
-        settle_client_monthly_evidence_tx(&conn, &valid_id, true, &end.to_rfc3339()).unwrap();
+        settle_client_termination_tail_tx(&conn, &valid_id, &end.to_rfc3339()).unwrap();
         assert!(
             conn.query_row(
                 "SELECT fulfilled_units FROM market_platform_periods WHERE contract_id = ?1",
@@ -6003,7 +5906,7 @@ mod tests {
         let end = parse_time(start).unwrap() + chrono::Duration::seconds(5);
         let id = client_monthly_fixture(&conn, start, 0);
         conn.execute(
-            "DELETE FROM client_market_subscriptions WHERE installation_id = 'installation-1'",
+            "DELETE FROM online_client_leases WHERE id = 'installation-1'",
             [],
         )
         .unwrap();
@@ -6073,8 +5976,7 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "UPDATE client_market_subscriptions SET expires_at = ?1
-             WHERE installation_id = 'installation-1'",
+            "UPDATE online_client_leases SET state='ending',cutoff_at=unixepoch(?1) WHERE id='installation-1'",
             params![start],
         )
         .unwrap();
@@ -6083,9 +5985,16 @@ mod tests {
             parse_time(start).unwrap() + chrono::Duration::seconds(5),
         )
         .unwrap();
-        assert_eq!(actions.len(), 1);
-        assert_eq!(actions[0].kind, PlatformControlKind::Terminate);
-        assert_eq!(actions[0].contract_id, id);
+        assert!(actions.is_empty());
+        crate::client_market_termination::accept_tx(
+            &conn,
+            "installation-1",
+            None,
+            "workspace_expired",
+            None,
+            start,
+        )
+        .unwrap();
         assert_eq!(
             conn.query_row(
                 "SELECT status FROM market_platform_contracts WHERE id = ?1",
@@ -6103,13 +6012,7 @@ mod tests {
         let start = "2026-01-01T00:00:00+00:00";
         let end = parse_time(start).unwrap() + chrono::Duration::seconds(5);
         let id = client_monthly_fixture(&conn, start, 5);
-        conn.execute(
-            "INSERT INTO installation_health_checks
-                (installation_id, checked_at, is_healthy, status, reason)
-             VALUES ('installation-1', ?1, 1, 'healthy', 'route_healthy')",
-            params![end.timestamp()],
-        )
-        .unwrap();
+        probe_client_fixture(&conn, end, true);
         reconcile_platform_contracts_tx(&conn, end).unwrap();
         let (status, paid_start): (String, String) = conn
             .query_row(
@@ -6543,7 +6446,7 @@ mod tests {
     }
 
     #[test]
-    fn client_trial_worker_dispatches_immediate_cleanup_in_the_conversion_pass() {
+    fn unfunded_client_trial_ends_without_dispatching_a_physical_control() {
         let conn = memory();
         let start = "2026-01-01T00:00:00+00:00";
         let end = parse_time(start).unwrap() + chrono::Duration::seconds(5);
@@ -6561,11 +6464,12 @@ mod tests {
             start,
         )
         .unwrap();
-        conn.execute("INSERT INTO installation_health_checks(installation_id,checked_at,is_healthy,status,reason) VALUES('installation-1',?1,1,'healthy','route_healthy')",params![end.timestamp()]).unwrap();
-        let actions = reconcile_platform_contracts_tx(&conn, end).unwrap();
-        assert_eq!(actions.len(), 1);
-        assert_eq!(actions[0].kind, PlatformControlKind::Terminate);
-        assert_eq!(actions[0].service_ref, "installation-1");
+        probe_client_fixture(&conn, end, true);
+        assert!(
+            reconcile_platform_contracts_tx(&conn, end)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             conn.query_row(
                 "SELECT status FROM market_platform_contracts WHERE id=?1",
@@ -6575,12 +6479,11 @@ mod tests {
             .unwrap(),
             "ending"
         );
-        // Dispatch may be retried until cleanup has actually started. Never
-        // advertise the subscription as released before confirmed cleanup.
-        let repeated = reconcile_platform_contracts_tx(&conn, end).unwrap();
-        assert_eq!(repeated.len(), 1);
-        assert_eq!(repeated[0].kind, PlatformControlKind::Terminate);
-        conn.execute("UPDATE client_market_subscriptions SET status='releasing' WHERE installation_id='installation-1'",[]).unwrap();
+        conn.execute(
+            "UPDATE online_client_leases SET state='ending' WHERE id='installation-1'",
+            [],
+        )
+        .unwrap();
         for tick in 1..=120 {
             assert!(
                 reconcile_platform_contracts_tx(&conn, end + chrono::Duration::seconds(tick * 5))
@@ -7163,66 +7066,5 @@ mod tests {
         );
         reconcile_wallet_tx(&tx, "buyer").unwrap();
         tx.commit().unwrap();
-    }
-}
-
-impl crate::store::AppStore {
-    pub async fn client_market_set_billing_suspended(
-        &self,
-        installation_id: &str,
-        suspended: bool,
-    ) -> Result<Option<String>, AppError> {
-        let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock().await;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(db_error("begin Client billing suspension"))?;
-        let tunnel = tx
-            .query_row(
-                "SELECT tunnel.subdomain, subscription.status
-                 FROM client_market_subscriptions subscription
-                 LEFT JOIN installation_client_tunnels tunnel
-                   ON tunnel.installation_id = subscription.installation_id
-                 WHERE subscription.installation_id = ?1",
-                params![installation_id],
-                |row| {
-                    Ok((
-                        row.get::<_, Option<String>>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(db_error("read Client tunnel for billing suspension"))?
-            .unwrap_or_default();
-        let terminal = tunnel
-            .1
-            .as_deref()
-            .is_none_or(|status| matches!(status, "released" | "releasing" | "release_failed"));
-        if terminal {
-            tx.commit()
-                .map_err(db_error("commit skipped Client billing control"))?;
-            return Ok(None);
-        }
-        tx.execute(
-            "UPDATE installation_client_tunnels SET enabled = ?2, updated_at = ?3
-             WHERE installation_id = ?1",
-            params![installation_id, i64::from(!suspended), now],
-        )
-        .map_err(db_error("update Client tunnel billing suspension"))?;
-        tx.execute(
-            "UPDATE client_market_subscriptions
-             SET status = ?2, updated_at = ?3
-             WHERE installation_id = ?1 AND status NOT IN ('released', 'releasing', 'release_failed')",
-            params![
-                installation_id,
-                if suspended { "billing_suspended" } else { "active" },
-                now,
-            ],
-        )
-        .map_err(db_error("update Client subscription billing suspension"))?;
-        tx.commit()
-            .map_err(db_error("commit Client billing suspension"))?;
-        Ok(tunnel.0)
     }
 }

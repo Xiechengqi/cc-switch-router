@@ -799,13 +799,7 @@ fn dashboard_installation_ip(
 }
 
 fn visible_dashboard_ip(ip: Option<String>, reveal: bool) -> Option<String> {
-    ip.map(|value| {
-        if reveal {
-            value
-        } else {
-            crate::client_market::mask_host_ip(&value)
-        }
-    })
+    ip.map(|value| if reveal { value } else { mask_host_ip(&value) })
 }
 
 fn is_map_active_client(operational_state: &str) -> bool {
@@ -2340,53 +2334,6 @@ impl AppStore {
             .and_then(|geo| geo.country_code)
     }
 
-    pub async fn installation_provision_source(
-        &self,
-        installation_id: &str,
-    ) -> Result<Option<String>, AppError> {
-        let conn = self.conn.lock().await;
-        Ok(conn
-            .query_row(
-                "SELECT provision_source FROM installations WHERE id = ?1",
-                params![installation_id],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .optional()
-            .map_err(|e| AppError::Internal(format!("read provision_source failed: {e}")))?
-            .flatten())
-    }
-
-    pub async fn purge_installation_for_client_market(
-        &self,
-        installation_id: &str,
-    ) -> Result<(), AppError> {
-        let conn = self.conn.lock().await;
-        let tx = conn
-            .transaction()
-            .map_err(|e| AppError::Internal(format!("begin purge tx failed: {e}")))?;
-        let provision_source: Option<Option<String>> = tx
-            .query_row(
-                "SELECT provision_source FROM installations WHERE id = ?1",
-                params![installation_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| AppError::Internal(format!("read purge installation failed: {e}")))?;
-        if provision_source.as_ref().is_some_and(|source| {
-            source.as_deref() != Some(crate::client_market::PROVISION_SOURCE_ROUTER_MARKET)
-        }) {
-            return Err(AppError::Forbidden(
-                "installation is not managed by Client Market".into(),
-            ));
-        }
-        crate::public_hosts::tombstone_subject(&tx, PublicHostKind::Client, installation_id)
-            .map_err(map_public_host_error)?;
-        purge_installation_data_tx(&tx, installation_id)?;
-        tx.commit()
-            .map_err(|e| AppError::Internal(format!("commit purge tx failed: {e}")))?;
-        Ok(())
-    }
-
     pub async fn register_installation(
         &self,
         input: RegisterInstallationRequest,
@@ -2522,7 +2469,6 @@ impl AppStore {
                     upgrade_capable: None,
                     status_reported_at: None,
                     public_ip: None,
-                    provision_source: None,
                     log_collection_enabled: false,
                     log_collection_reported_at: None,
                 };
@@ -2694,7 +2640,20 @@ impl AppStore {
         &self,
         installation_id: &str,
     ) -> Result<Option<String>, AppError> {
+        self.ingress_control_secret(installation_id, None).await
+    }
+
+    pub(crate) async fn ingress_control_secret(
+        &self,
+        installation_id: &str,
+        share: Option<&str>,
+    ) -> Result<Option<String>, AppError> {
         let conn = self.conn.lock().await;
+        if let Some(id) = share
+            && !crate::online_client_market::allow_traffic(&conn, installation_id, id)?
+        {
+            return Err(AppError::Forbidden("Share workspace is inactive".into()));
+        }
         let secret: Option<String> = conn
             .query_row(
                 "SELECT control_secret_b64 FROM installations
@@ -3638,7 +3597,7 @@ impl AppStore {
                  app_commit_id = CASE WHEN ?3 = '' THEN app_commit_id ELSE ?3 END,
                  last_seen_at = ?4,
                  public_ip = COALESCE(?5, public_ip),
-                 log_collection_enabled = ?6,
+                 market_lease_v1 = ?7, log_collection_enabled = ?6,
                  log_collection_reported_at = ?4
              WHERE id = ?1",
             params![
@@ -3648,6 +3607,7 @@ impl AppStore {
                 now.to_rfc3339(),
                 public_ip,
                 i64::from(input.payload.log_collection_enabled),
+                input.payload.market_lease_v1 == Some(true),
             ],
         )
         .map_err(|error| {
@@ -3827,10 +3787,6 @@ impl AppStore {
         let legacy_state =
             prepare_legacy_setup_notification_adoption_tx(&tx, &installation.id, now)?;
         let notifications_enabled = client_notification_runtime_enabled(&tx)?;
-        // Client Market already publishes provisioning completion to the Client's
-        // public room. Skip the duplicate registration email.
-        let suppress_market_registration = installation.provision_source.as_deref()
-            == Some(crate::client_market::PROVISION_SOURCE_ROUTER_MARKET);
         let (event_id, notification_status, response_status, retain_password_hint) =
             match legacy_state {
                 LegacySetupNotificationState::Sent { event_id }
@@ -3871,14 +3827,6 @@ impl AppStore {
                             "suppressed_disabled",
                             InstallationSetupCompletedStatus::SuppressedDisabled,
                             false,
-                        )
-                    } else if suppress_market_registration {
-                        (
-                            "suppressed_market_chat",
-                            Some("covered by Client Market provisioning system event"),
-                            "suppressed_disabled",
-                            InstallationSetupCompletedStatus::SuppressedDisabled,
-                            true,
                         )
                     } else {
                         (
@@ -3940,14 +3888,6 @@ impl AppStore {
                             "suppressed_disabled",
                             InstallationSetupCompletedStatus::SuppressedDisabled,
                             false,
-                        )
-                    } else if suppress_market_registration {
-                        (
-                            "suppressed_market_chat",
-                            Some("covered by Client Market provisioning system event"),
-                            "suppressed_disabled",
-                            InstallationSetupCompletedStatus::SuppressedDisabled,
-                            true,
                         )
                     } else {
                         (
@@ -7487,12 +7427,8 @@ impl AppStore {
 
     pub async fn check_client_tunnel_subdomain_availability(
         &self,
-        _config: &Config,
         subdomain: &str,
         installation_id: Option<&str>,
-        source_ip: Option<&str>,
-        session: Option<&AuthSession>,
-        owner_email: Option<&str>,
     ) -> Result<SubdomainAvailabilityResponse, AppError> {
         let subdomain = normalize_subdomain(subdomain)?;
         normalize_client_subdomain(&subdomain)
@@ -7500,17 +7436,6 @@ impl AppStore {
         ensure_subdomain_allowed(&subdomain)?;
         let conn = self.conn.lock().await;
         ensure_subdomain_not_claimed_by_share(&conn, &subdomain)?;
-        if !crate::client_market::client_market_subdomain_available_to_source(
-            &conn,
-            &subdomain,
-            installation_id,
-            source_ip,
-        )? {
-            return Ok(SubdomainAvailabilityResponse {
-                available: false,
-                reason: Some("reserved".into()),
-            });
-        }
         if let Some(existing) = get_client_tunnel_by_subdomain(&conn, &subdomain)? {
             if installation_id
                 .map(str::trim)
@@ -7527,24 +7452,10 @@ impl AppStore {
                 reason: Some("already_claimed".into()),
             });
         }
-        if let Some(existing) =
-            crate::public_hosts::get_by_label(&conn, &subdomain).map_err(map_public_host_error)?
+        if crate::public_hosts::get_by_label(&conn, &subdomain)
+            .map_err(map_public_host_error)?
+            .is_some()
         {
-            let reclaimable = crate::client_market::client_market_tombstone_available_for_reclaim(
-                &conn,
-                &subdomain,
-                session,
-                owner_email,
-            )?;
-            if existing.kind == PublicHostKind::Client
-                && existing.lifecycle == crate::public_hosts::PublicHostLifecycle::Tombstoned
-                && reclaimable
-            {
-                return Ok(SubdomainAvailabilityResponse {
-                    available: true,
-                    reason: None,
-                });
-            }
             return Ok(SubdomainAvailabilityResponse {
                 available: false,
                 reason: Some("previously_claimed".into()),
@@ -7633,35 +7544,6 @@ impl AppStore {
             let tx = conn.unchecked_transaction().map_err(|e| {
                 AppError::Internal(format!("begin client tunnel claim tx failed: {e}"))
             })?;
-            if signed_payload.enabled {
-                let billing_suspended = tx
-                    .query_row(
-                        "SELECT 1 FROM client_market_subscriptions
-                         WHERE installation_id = ?1 AND status = 'billing_suspended'",
-                        params![installation_id],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .optional()
-                    .map_err(|error| {
-                        AppError::Internal(format!(
-                            "check Client billing suspension failed: {error}"
-                        ))
-                    })?
-                    .is_some();
-                if billing_suspended {
-                    return Err(AppError::Conflict(
-                        "client tunnel remains disabled until the supplier account is settled"
-                            .into(),
-                    ));
-                }
-            }
-            crate::client_market::authorize_client_market_subdomain_claim(
-                &tx,
-                &subdomain,
-                &installation_id,
-                &owner_email,
-                metadata.ip.as_deref(),
-            )?;
             let host_claim = crate::public_hosts::NewPublicHost {
                 label: &subdomain,
                 route_id: &format!("client:{installation_id}"),
@@ -7670,17 +7552,7 @@ impl AppStore {
                 installation_id: Some(&installation_id),
                 target_lane_id: &installation_id,
             };
-            if crate::client_market::client_market_owner_can_reclaim_tombstoned_label(
-                &tx,
-                &subdomain,
-                &owner_email,
-                None,
-            )? {
-                crate::public_hosts::reclaim_tombstoned_client_label(&tx, host_claim)
-                    .map_err(map_public_host_error)?;
-            } else {
-                crate::public_hosts::claim(&tx, host_claim).map_err(map_public_host_error)?;
-            }
+            crate::public_hosts::claim(&tx, host_claim).map_err(map_public_host_error)?;
             crate::public_hosts::set_lifecycle(
                 &tx,
                 &subdomain,
@@ -7709,10 +7581,6 @@ impl AppStore {
             ],
             )
             .map_err(map_client_tunnel_constraint_error)?;
-            crate::client_market_trade::persist_subscription_client_subdomain_tx(
-                &tx,
-                &installation_id,
-            )?;
             if action == "client_tunnel_claim" && signed_payload.enabled {
                 insert_legacy_setup_fallback_tx(
                     &tx,
@@ -10512,6 +10380,14 @@ impl AppStore {
                     AppError::Conflict("installation owner email is not configured".into())
                 })
                 .and_then(normalize_email)?;
+            let installation_owner = {
+                let c = self.conn.lock().await;
+                crate::online_client_market::share_owner(
+                    &c,
+                    &input.installation_id,
+                    &installation_owner,
+                )?
+            };
             normalize_self_reported_share_owner(&mut share, &installation_owner)?;
             Some(share)
         } else {
@@ -11357,6 +11233,14 @@ impl AppStore {
                 &input.installation_id,
             )?;
         }
+        let installation_owner = {
+            let c = self.conn.lock().await;
+            crate::online_client_market::share_owner(
+                &c,
+                &input.installation_id,
+                &installation_owner,
+            )?
+        };
         normalize_self_reported_share_owner(&mut share, &installation_owner)?;
         {
             let conn = self.conn.lock().await;
@@ -11417,7 +11301,13 @@ impl AppStore {
             .map_err(|message| AppError::BadRequest(message.into()))?;
         let client_tunnel = get_client_tunnel_by_installation(&conn, &input.installation_id)?
             .ok_or_else(|| AppError::Conflict("client tunnel must be claimed first".into()))?;
-        if parsed.client_subdomain != client_tunnel.subdomain {
+        if parsed.client_subdomain
+            != crate::online_client_market::namespace(
+                &conn,
+                &input.installation_id,
+                &client_tunnel.subdomain,
+            )?
+        {
             return Err(AppError::Conflict(
                 "share host client subdomain does not belong to this installation".into(),
             ));
@@ -11437,6 +11327,11 @@ impl AppStore {
             .map_err(|e| AppError::Internal(format!("begin share claim tx failed: {e}")))?;
         let mut share = input.share;
         ensure_share_id_writable_by_installation(&tx, &share.share_id, &input.installation_id)?;
+        let installation_owner = crate::online_client_market::share_owner(
+            &tx,
+            &input.installation_id,
+            &installation_owner,
+        )?;
         normalize_self_reported_share_owner(&mut share, &installation_owner)?;
         share.subdomain = subdomain;
         release_reclaimable_subdomain_claim(
@@ -11486,6 +11381,7 @@ impl AppStore {
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| AppError::Internal(format!("begin share delete tx failed: {e}")))?;
+        crate::online_client_market::check_share_id(&tx, &input.installation_id, &input.share_id)?;
         retire_share_tx(&tx, &input.share_id, &input.installation_id)?;
         tx.commit()
             .map_err(|e| AppError::Internal(format!("commit share delete failed: {e}")))?;
@@ -11526,6 +11422,12 @@ impl AppStore {
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| AppError::Internal(format!("begin share prune tx failed: {e}")))?;
+        crate::online_client_market::check_nonce(
+            &tx,
+            &input.installation_id,
+            "share_prune_v1",
+            &input.nonce,
+        )?;
         let pruned = delete_all_shares_for_installation_tx(
             &tx,
             &input.installation_id,
@@ -11609,6 +11511,12 @@ impl AppStore {
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| AppError::Internal(format!("begin batch sync tx failed: {e}")))?;
+        crate::online_client_market::check_nonce(
+            &tx,
+            &input.installation_id,
+            "share_batch",
+            &input.nonce,
+        )?;
         let upsert_share_ids = input
             .ops
             .iter()
@@ -11643,6 +11551,11 @@ impl AppStore {
                         &input.installation_id,
                         &share.subdomain,
                     )?;
+                    let installation_owner = crate::online_client_market::share_owner(
+                        &tx,
+                        &input.installation_id,
+                        &installation_owner,
+                    )?;
                     normalize_self_reported_share_owner(&mut share, &installation_owner)?;
                     upsert_share_tx(&tx, &input.installation_id, share)?;
                     if let Some(ack) = ack {
@@ -11653,6 +11566,11 @@ impl AppStore {
                     let share_id = op.share_id.ok_or_else(|| {
                         AppError::BadRequest("shareId is required for delete".into())
                     })?;
+                    crate::online_client_market::check_share_id(
+                        &tx,
+                        &input.installation_id,
+                        &share_id,
+                    )?;
                     retire_share_tx(&tx, &share_id, &input.installation_id)?;
                 }
                 "delete_all" => {
@@ -11968,6 +11886,11 @@ impl AppStore {
         let conn = self.conn.lock().await;
         let edit = get_share_edit_by_id(&conn, edit_id)?
             .ok_or_else(|| AppError::NotFound("share edit not found".into()))?;
+        if edit.patch.requires_termination_receipt() {
+            return Err(AppError::Conflict(
+                "Share termination requires a signed final consumption receipt".into(),
+            ));
+        }
         if edit.status == "applied" {
             validate_settings_receipt(&edit, receipt.as_ref())?;
             return Ok(());
@@ -11983,7 +11906,8 @@ impl AppStore {
                 "control reply share_id does not match edit".into(),
             ));
         }
-        let (stored_subdomain, client_subdomain) = conn
+        crate::online_client_market::check_share_id(&conn, &edit.installation_id, &edit.share_id)?;
+        let (stored_subdomain, physical_subdomain) = conn
             .query_row(
                 "SELECT share.subdomain, tunnel.subdomain
                  FROM shares share
@@ -12000,6 +11924,11 @@ impl AppStore {
                 ))
             })?
             .ok_or_else(|| AppError::Conflict("Share namespace binding is unavailable".into()))?;
+        let client_subdomain = crate::online_client_market::namespace(
+            &conn,
+            &edit.installation_id,
+            &physical_subdomain,
+        )?;
         let share_slug = parse_share_label(&stored_subdomain)
             .map(|parsed| parsed.share_slug)
             .or_else(|_| normalize_share_slug(&stored_subdomain))
@@ -12071,6 +12000,11 @@ impl AppStore {
             .as_deref()
             .ok_or_else(|| AppError::Conflict("installation owner email is not configured".into()))
             .and_then(normalize_email)?;
+        let installation_owner = crate::online_client_market::share_owner(
+            &tx,
+            &edit.installation_id,
+            &installation_owner,
+        )?;
         normalize_self_reported_share_owner(&mut returned_share, &installation_owner)?;
         upsert_share_tx(&tx, &edit.installation_id, returned_share)?;
         share_value_quotas::apply_conversion_result(&tx, &edit, quota_result)?;
@@ -12291,6 +12225,7 @@ impl AppStore {
             .map(client_chat::sanitize_system_event_text);
         let edit = get_share_edit_by_id(&conn, &ack_edit_id)?
             .ok_or_else(|| AppError::NotFound("share edit not found".into()))?;
+        crate::online_client_market::check_share_id(&conn, &input.installation_id, &edit.share_id)?;
         // Managed ACKs carry the original execution time/policy, not the time
         // Router received a delayed or replayed acknowledgement. An actual
         // matching descriptor is a compatible alternative to explicit fields.
@@ -12390,7 +12325,12 @@ impl AppStore {
                     &edit.installation_id,
                     &share.subdomain,
                 )?;
-                normalize_self_reported_share_owner(&mut share, &normalize_email(owner)?)?;
+                let owner = crate::online_client_market::share_owner(
+                    &tx,
+                    &edit.installation_id,
+                    &normalize_email(owner)?,
+                )?;
+                normalize_self_reported_share_owner(&mut share, &owner)?;
                 upsert_share_tx(&tx, &edit.installation_id, share)?;
             }
         }
@@ -12794,6 +12734,7 @@ impl AppStore {
             model_health_status_by_share,
             live_model_health_status_by_share,
             client_tunnels,
+            market_capable,
         ) = {
             let conn = self.conn.lock().await;
             let shares = list_shares(&conn)?;
@@ -12844,6 +12785,21 @@ impl AppStore {
                 statuses,
                 live_statuses,
                 list_client_tunnels(&conn)?,
+                {
+                    let mut stmt = conn
+                        .prepare("SELECT i.id,i.market_lease_v1,COALESCE(l.state!='unlisted',0)
+                            FROM installations i LEFT JOIN online_client_listings l ON l.installation_id=i.id
+                            WHERE i.market_lease_v1=1 OR l.state!='unlisted'")
+                        .map_err(|e| AppError::Internal(e.to_string()))?;
+                    stmt.query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            (r.get::<_, bool>(1)?, r.get::<_, bool>(2)?),
+                        ))
+                    })
+                    .and_then(|rows| rows.collect::<crate::db::Result<HashMap<_, _>>>())
+                    .map_err(|e| AppError::Internal(e.to_string()))?
+                },
             )
         };
         let client_tunnels_by_installation = client_tunnels
@@ -12884,7 +12840,9 @@ impl AppStore {
             .filter_map(|installation| {
                 automatic_client_cleanup_at(
                     installation.last_seen_at,
-                    installation.provision_source.as_deref(),
+                    market_capable
+                        .get(&installation.id)
+                        .is_some_and(|(_, listed)| *listed),
                     config.client_stale_secs,
                 )
                 .map(|cleanup_at| (installation.id.clone(), cleanup_at))
@@ -12895,7 +12853,9 @@ impl AppStore {
             .filter_map(|installation| {
                 automatic_client_cleanup_at(
                     installation.last_seen_at,
-                    installation.provision_source.as_deref(),
+                    market_capable
+                        .get(&installation.id)
+                        .is_some_and(|(_, listed)| *listed),
                     config.client_installation_retention_secs,
                 )
                 .map(|removal_at| (installation.id.clone(), removal_at))
@@ -12928,6 +12888,12 @@ impl AppStore {
                 });
             }
             installation_views.push(InstallationView {
+                market_lease_v1: market_capable
+                    .get(&installation.id)
+                    .is_some_and(|(capable, _)| *capable),
+                market_listed: market_capable
+                    .get(&installation.id)
+                    .is_some_and(|(_, listed)| *listed),
                 id: installation.id.clone(),
                 platform: installation.platform.clone(),
                 app_version: installation.app_version.clone(),
@@ -12944,7 +12910,6 @@ impl AppStore {
                 created_at: installation.created_at,
                 last_seen_at: installation.last_seen_at,
                 upgrade: installation_upgrade_view(&installation),
-                provision_source: installation.provision_source.clone(),
             });
         }
         installation_views.sort_by(|a, b| b.last_seen_at.cmp(&a.last_seen_at));
@@ -13197,15 +13162,16 @@ impl AppStore {
                 if health_timeline.is_empty() && client_tunnel_online {
                     health_timeline = current_online_health_timeline(health_timeline_start);
                 }
-                let market_client = installation.provision_source.as_deref()
-                    == Some(crate::client_market::PROVISION_SOURCE_ROUTER_MARKET);
                 let mut view = DashboardClientView {
                     chat_available: installation.owner_email.is_some(),
                     log_collection_enabled: log_collection_by_installation
                         .get(&installation.id)
                         .copied()
                         .unwrap_or(false),
-                    can_open_client_terminal: !market_client || viewer_sees_full_client_ip,
+                    can_open_client_terminal: !installation.market_listed
+                        || viewer_email
+                            .zip(installation.owner_email.as_deref())
+                            .is_some_and(|(viewer, owner)| viewer.eq_ignore_ascii_case(owner)),
                     share_count,
                     share_ids,
                     client_tunnel,
@@ -13625,7 +13591,7 @@ impl AppStore {
                     .prepare(
                         "SELECT i.id FROM installations i
                          WHERE i.last_seen_at < ?1
-                           AND COALESCE(i.provision_source, '') != 'router_market'
+                           AND NOT EXISTS(SELECT 1 FROM online_client_listings ml WHERE ml.installation_id=i.id AND ml.state!='unlisted')
                            AND NOT EXISTS (
                                SELECT 1 FROM client_notification_events e
                                WHERE e.installation_id = i.id
@@ -13665,7 +13631,7 @@ impl AppStore {
                          FROM shares s
                          INNER JOIN installations i ON i.id = s.installation_id
                          WHERE i.last_seen_at < ?1
-                           AND COALESCE(i.provision_source, '') != 'router_market'",
+                           AND NOT EXISTS(SELECT 1 FROM online_client_listings ml WHERE ml.installation_id=i.id AND ml.state!='unlisted')",
                     )
                     .map_err(|e| {
                         AppError::Internal(format!("prepare stale client shares failed: {e}"))
@@ -13697,7 +13663,7 @@ impl AppStore {
                      WHERE installation_id IN (
                          SELECT id FROM installations
                          WHERE last_seen_at < ?1
-                           AND COALESCE(provision_source, '') != 'router_market'
+                           AND NOT EXISTS(SELECT 1 FROM online_client_listings ml WHERE ml.installation_id=installations.id AND ml.state!='unlisted')
                      )",
                     params![stale_cutoff],
                 )
@@ -16730,6 +16696,8 @@ fn apply_revision_conflict_snapshot_tx(
     validate_strict_share_descriptor_tx(conn, &current_share)?;
     ensure_share_id_writable_by_installation(conn, &share_id, &installation_id)?;
     validate_share_namespace_for_installation(conn, &installation_id, &current_share.subdomain)?;
+    let installation_owner =
+        crate::online_client_market::share_owner(conn, &installation_id, &installation_owner)?;
     normalize_self_reported_share_owner(&mut current_share, &installation_owner)?;
     upsert_share_tx(conn, &installation_id, current_share)
 }
@@ -17288,6 +17256,7 @@ fn upsert_share_tx(
     installation_id: &str,
     mut share: ShareDescriptor,
 ) -> Result<(), AppError> {
+    crate::online_client_market::bind_share(conn, installation_id, &share)?;
     normalize_share_descriptor_fields(&mut share)?;
     let previous_version: Option<i64> = conn
         .query_row(
@@ -17348,6 +17317,8 @@ fn upsert_share_tx(
     let installation = get_installation(conn, installation_id)?
         .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
     let installation_owner = verified_installation_owner_email(&installation)?;
+    let installation_owner =
+        crate::online_client_market::share_owner(conn, installation_id, &installation_owner)?;
     normalize_self_reported_share_owner(&mut share, &installation_owner)?;
     let description = normalize_share_description(share.description.clone())?;
     ensure_free_access_market_exclusive_tx(conn, &share.share_id, share.free_access)?;
@@ -17642,7 +17613,9 @@ fn validate_share_namespace_for_installation(
         parse_share_label(label).map_err(|message| AppError::BadRequest(message.into()))?;
     let client_tunnel = get_client_tunnel_by_installation(conn, installation_id)?
         .ok_or_else(|| AppError::Conflict("client tunnel must be claimed first".into()))?;
-    if parsed.client_subdomain != client_tunnel.subdomain {
+    if parsed.client_subdomain
+        != crate::online_client_market::namespace(conn, installation_id, &client_tunnel.subdomain)?
+    {
         return Err(AppError::Conflict(
             "share host client subdomain does not belong to this installation".into(),
         ));
@@ -17924,7 +17897,7 @@ fn delete_all_shares_for_installation_tx(
     // pending edits and runtime state must survive the compatibility operation.
     let share_ids = {
         let mut stmt = conn
-            .prepare("SELECT share_id FROM shares WHERE installation_id = ?1")
+            .prepare("SELECT s.share_id FROM shares s LEFT JOIN online_client_share_bindings b ON b.share_id=s.share_id WHERE s.installation_id=?1 AND b.lease_id IS (SELECT id FROM online_client_leases WHERE installation_id=?1 AND released_at IS NULL)")
             .map_err(|e| {
                 AppError::Internal(format!("prepare installation share retirement failed: {e}"))
             })?;
@@ -17986,6 +17959,20 @@ pub(crate) fn retire_share_tx(
         .is_some();
     if !exists {
         return Ok(false);
+    }
+    let unsettled = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM online_client_share_bindings b
+        JOIN share_market_subscriptions s ON s.share_id=b.share_id
+        WHERE b.share_id=?1 AND s.status NOT IN ('released','grant_failed'))",
+            params![share_id],
+            |r| r.get::<_, bool>(0),
+        )
+        .map_err(|e| AppError::Internal(format!("check workspace Share receipts: {e}")))?;
+    if unsettled {
+        return Err(AppError::Conflict(
+            "end active Share rentals before deleting this workspace Share".into(),
+        ));
     }
     let retired_at = Utc::now().to_rfc3339();
     crate::share_market::retire_deleted_share_market_tx(
@@ -21012,7 +20999,7 @@ const INSTALLATION_SELECT_COLUMNS: &str = "id, public_key, platform, app_version
                 geo_candidate_country_code, geo_candidate_country, geo_candidate_region, geo_candidate_city,
                 geo_candidate_latitude, geo_candidate_longitude, geo_candidate_hits, geo_candidate_first_seen_at,
                 geo_last_changed_at, created_at, last_seen_at, client_activated_at,
-                delegate_upgrade_to_router_owner, app_commit_id, update_available, upgrade_capable, status_reported_at, public_ip, provision_source,
+                delegate_upgrade_to_router_owner, app_commit_id, update_available, upgrade_capable, status_reported_at, public_ip,
                 log_collection_enabled, log_collection_reported_at";
 
 fn map_installation_row(row: &crate::db::Row<'_>) -> crate::db::Result<Installation> {
@@ -21110,15 +21097,14 @@ fn map_installation_row(row: &crate::db::Row<'_>) -> crate::db::Result<Installat
                 )
             })?,
         public_ip: row.get(30)?,
-        provision_source: row.get(31)?,
-        log_collection_enabled: row.get::<_, i64>(32)? != 0,
+        log_collection_enabled: row.get::<_, i64>(31)? != 0,
         log_collection_reported_at: row
-            .get::<_, Option<String>>(33)?
+            .get::<_, Option<String>>(32)?
             .map(|value| parse_dt_sql(&value))
             .transpose()
             .map_err(|error| {
                 crate::db::Error::FromSqlConversionFailure(
-                    33,
+                    32,
                     crate::db::types::Type::Text,
                     Box::new(error),
                 )
@@ -21292,14 +21278,13 @@ fn issue_lease_response(config: &Config, lease: &TunnelLease) -> IssueLeaseRespo
 
 fn automatic_client_cleanup_at(
     last_seen_at: DateTime<Utc>,
-    provision_source: Option<&str>,
+    market_listed: bool,
     retention_secs: i64,
 ) -> Option<DateTime<Utc>> {
     // Market installations are governed by their rental lifecycle, not by the
     // ordinary stale-Client cleanup window. Never advertise a deadline that
     // cleanup_expired_data deliberately will not enforce.
-    (provision_source != Some(crate::client_market::PROVISION_SOURCE_ROUTER_MARKET))
-        .then(|| last_seen_at + Duration::seconds(retention_secs))
+    (!market_listed).then(|| last_seen_at + Duration::seconds(retention_secs))
 }
 
 fn list_installations(conn: &Connection) -> Result<Vec<Installation>, AppError> {
@@ -23148,9 +23133,24 @@ fn list_pending_share_edits_for_installation(
 ) -> Result<Vec<ShareEditView>, AppError> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, share_id, installation_id, revision, status, patch_json, created_by_email, created_at, updated_at, applied_at, error_message
+            // Older Routers could accept a synchronous revoke descriptor before
+            // receiving usage evidence. Redeliver that exact edit until its ACK
+            // is durable, even when another edit is pending for the same Share.
+            "WITH deliverable(id) AS (
+                 SELECT id FROM share_edit_requests WHERE installation_id=?1 AND status='pending'
+                 UNION ALL
+                 SELECT op.edit_id FROM shares s
+                 JOIN share_market_terminations t ON t.share_id=s.share_id AND t.status='revoke_pending'
+                 JOIN share_control_operations op ON op.subscription_id=t.subscription_id AND op.action='revoke' AND op.status='applied'
+                 JOIN share_edit_requests e ON e.id=op.edit_id AND e.status='applied'
+                 WHERE s.installation_id=?1 AND json_extract(e.patch_json,'$.managedGrant.termination.terminationId')=t.id
+                   AND NOT EXISTS(SELECT 1 FROM share_termination_receipts r WHERE r.termination_id=t.id)
+             )
+             SELECT id, share_id, installation_id, revision, status, patch_json, created_by_email, created_at, updated_at, applied_at, error_message
              FROM share_edit_requests
-             WHERE installation_id = ?1 AND status = 'pending' AND retired_at IS NULL
+             WHERE id IN (SELECT id FROM deliverable) AND installation_id=?1 AND retired_at IS NULL
+               AND (SELECT lease_id FROM online_client_share_bindings WHERE share_id=share_edit_requests.share_id)
+                 IS (SELECT id FROM online_client_leases WHERE installation_id=?1 AND released_at IS NULL)
              ORDER BY revision ASC",
         )
         .map_err(|e| AppError::Internal(format!("prepare pending share edits failed: {e}")))?;
@@ -26863,6 +26863,7 @@ fn ensure_share_id_writable_by_installation(
     share_id: &str,
     installation_id: &str,
 ) -> Result<(), AppError> {
+    crate::online_client_market::check_share_id(conn, installation_id, share_id)?;
     if let Some((existing_installation_id, _)) = get_share_owner_binding(conn, share_id)? {
         if existing_installation_id != installation_id {
             return Err(AppError::Unauthorized(
@@ -26905,7 +26906,8 @@ fn rebind_installation_shares_to_owner(
     let mut statement = conn
         .prepare(
             "SELECT share_id, owner_email, COALESCE(user_grants_json, '{}')
-             FROM shares WHERE installation_id = ?1",
+             FROM shares WHERE installation_id = ?1 AND NOT EXISTS (
+                 SELECT 1 FROM online_client_share_bindings b WHERE b.share_id=shares.share_id)",
         )
         .map_err(|error| {
             AppError::Internal(format!("prepare share owner rebind failed: {error}"))
@@ -27400,89 +27402,38 @@ fn validate_takeover_share_labels_tx(
     Ok(labels)
 }
 
+pub(crate) fn mask_host_ip(value: &str) -> String {
+    let trimmed = value.trim();
+    if let Some(ipv4) = trimmed.parse::<std::net::Ipv4Addr>().ok() {
+        let octets = ipv4.octets();
+        return format!("{}.{}.{}.xx", octets[0], octets[1], octets[2]);
+    }
+    if trimmed.parse::<std::net::Ipv6Addr>().is_ok() {
+        let groups = trimmed
+            .split(':')
+            .filter(|group| !group.is_empty())
+            .take(4)
+            .collect::<Vec<_>>();
+        if groups.len() == 4 {
+            return format!("{}:{}:{}:{}:xx", groups[0], groups[1], groups[2], groups[3]);
+        }
+    }
+    trimmed.to_string()
+}
+
 fn ensure_takeover_client_market_ready_tx(
     conn: &Connection,
     target_installation_id: &str,
     source_installation_id: &str,
 ) -> Result<(), AppError> {
-    let target_subscription_status = conn
-        .query_row(
-            "SELECT status FROM client_market_subscriptions WHERE installation_id = ?1",
-            params![target_installation_id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(|error| {
-            AppError::Internal(format!(
-                "check target Client Market subscription failed: {error}"
-            ))
-        })?;
-    if target_subscription_status
-        .as_deref()
-        .is_some_and(|status| status != "active")
-    {
+    let listed: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM online_client_listings WHERE installation_id IN (?1,?2) AND state!='unlisted')",
+        params![target_installation_id,source_installation_id], |row| row.get(0),
+    ).map_err(|error| AppError::Internal(format!("check listed Client identity: {error}")))?;
+    if listed {
         return Err(AppError::Conflict(
-            "target Client Market subscription must be active before subdomain takeover".into(),
+            "unlist the Client before a subdomain takeover".into(),
         ));
-    }
-
-    let target_host_status = conn
-        .query_row(
-            "SELECT status FROM router_ssh_hosts WHERE installation_id = ?1",
-            params![target_installation_id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(|error| {
-            AppError::Internal(format!(
-                "check target Client Market Host state failed: {error}"
-            ))
-        })?;
-    if target_host_status
-        .as_deref()
-        .is_some_and(|status| status != "allocated")
-    {
-        return Err(AppError::Conflict(
-            "target Client Market Host must be allocated before subdomain takeover".into(),
-        ));
-    }
-
-    let target_cleanup_retry = conn
-        .query_row(
-            "SELECT 1 FROM client_market_cleanup_retry_state
-             WHERE installation_id = ?1 AND stopped_at IS NULL",
-            params![target_installation_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()
-        .map_err(|error| {
-            AppError::Internal(format!(
-                "check target Client Market cleanup retry failed: {error}"
-            ))
-        })?;
-    if target_cleanup_retry.is_some() {
-        return Err(AppError::Conflict(
-            "target Client Market cleanup retry must finish before subdomain takeover".into(),
-        ));
-    }
-
-    let blocking_job = conn
-        .query_row(
-            "SELECT type FROM provisioning_jobs
-             WHERE installation_id IN (?1, ?2)
-               AND status IN ('pending', 'running')
-             ORDER BY created_at LIMIT 1",
-            params![target_installation_id, source_installation_id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(|error| {
-            AppError::Internal(format!("check Client takeover market jobs failed: {error}"))
-        })?;
-    if let Some(job_type) = blocking_job {
-        return Err(AppError::Conflict(format!(
-            "Client Market {job_type} job must finish before subdomain takeover"
-        )));
     }
     Ok(())
 }
@@ -28646,6 +28597,7 @@ fn consume_authenticated_installation_nonce(
     nonce: &str,
     now: DateTime<Utc>,
 ) -> Result<(), AppError> {
+    crate::online_client_market::check_nonce(conn, installation_id, action, nonce)?;
     conn.execute_batch("SAVEPOINT authenticated_installation_request")
         .map_err(|error| {
             AppError::Internal(format!(
@@ -31462,12 +31414,7 @@ pub(crate) mod tests {
             database: crate::config::DatabaseConfig::local(db_path),
             host_key_path: std::env::temp_dir()
                 .join(format!("cc-switch-router-{name}-{}.key", Uuid::new_v4())),
-            provision_ssh_private_key_path: std::env::temp_dir()
-                .join(format!("cc-switch-router-{name}-{}-id_rsa", Uuid::new_v4())),
-            provision_ssh_public_key_path: std::env::temp_dir().join(format!(
-                "cc-switch-router-{name}-{}-id_rsa.pub",
-                Uuid::new_v4()
-            )),
+
             cleanup_interval_secs: 300,
             lease_retention_secs: 24 * 60 * 60,
             request_log_retention_days: 30,
@@ -31496,7 +31443,6 @@ pub(crate) mod tests {
             market_usd_cny_rate_micros: crate::market_common::DEFAULT_USD_CNY_RATE_MICROS,
             market_provider_recommendation_mode:
                 crate::config::MarketProviderRecommendationMode::Shadow,
-            ip_intel_endpoints: Vec::new(),
             verification_service_base_url: "https://tokenswitch.org".into(),
             verification_service_api_key: None,
             router_owner_email: None,
@@ -41640,6 +41586,7 @@ pub(crate) mod tests {
             .expect("bind installation owner");
 
         let heartbeat = crate::models::InstallationHeartbeatPayload {
+            market_lease_v1: None,
             protocol_version: 1,
             boot_id: "setup-boot-id".into(),
             app_version: "1.0.1".into(),
@@ -43630,6 +43577,7 @@ pub(crate) mod tests {
 
         let public_key = "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=";
         let heartbeat = crate::models::InstallationHeartbeatPayload {
+            market_lease_v1: None,
             protocol_version: 1,
             boot_id: "fixture-boot".into(),
             app_version: "1.2.3".into(),
@@ -44826,6 +44774,7 @@ pub(crate) mod tests {
         let (store, config) = setup_store("installation-heartbeat-v1").await;
         let signing_key = insert_signed_installation(&store, "inst-heartbeat").await;
         let payload = crate::models::InstallationHeartbeatPayload {
+            market_lease_v1: None,
             protocol_version: 1,
             boot_id: "boot-1".into(),
             app_version: "3.0.0".into(),
@@ -44854,6 +44803,7 @@ pub(crate) mod tests {
             .await
             .expect("record signed heartbeat");
         let replay_payload = crate::models::InstallationHeartbeatPayload {
+            market_lease_v1: None,
             protocol_version: 1,
             boot_id: "boot-1".into(),
             app_version: "3.0.0".into(),
@@ -44901,6 +44851,7 @@ pub(crate) mod tests {
         let signing_key = insert_signed_installation(&store, "inst-public-ip").await;
 
         let first = crate::models::InstallationHeartbeatPayload {
+            market_lease_v1: None,
             protocol_version: 1,
             boot_id: "boot-ip-1".into(),
             app_version: "3.0.0".into(),
@@ -44930,6 +44881,7 @@ pub(crate) mod tests {
             .expect("record heartbeat with public ip");
 
         let second = crate::models::InstallationHeartbeatPayload {
+            market_lease_v1: None,
             protocol_version: 1,
             boot_id: "boot-ip-2".into(),
             app_version: "3.0.0".into(),
@@ -44978,6 +44930,7 @@ pub(crate) mod tests {
         let signing_key = insert_signed_installation(&store, "inst-presence").await;
         insert_setup_client_tunnel(&store, "inst-presence", "presence-client").await;
         let payload = crate::models::InstallationHeartbeatPayload {
+            market_lease_v1: None,
             protocol_version: 1,
             boot_id: "boot-presence".into(),
             app_version: "1.0.0".into(),
@@ -50031,7 +49984,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn released_client_owner_can_reclaim_tombstoned_subdomain_on_claim() {
+    async fn a_fresh_installation_cannot_reclaim_an_old_tombstone() {
         let (store, config) = setup_store("released-client-reclaim-claim").await;
         let old_installation = "inst-released-old";
         let new_installation = "inst-released-new";
@@ -50044,20 +49997,6 @@ pub(crate) mod tests {
             "released-alpha",
         )
         .await;
-        {
-            let conn = store.conn.lock().await;
-            let now = Utc::now().to_rfc3339();
-            conn.execute(
-                "INSERT INTO client_market_subscriptions
-                    (installation_id, host_id, provider_id, host_owner_email,
-                     client_user_id, client_owner_email, status, offer_revision,
-                     created_at, updated_at, released_at)
-                 VALUES (?1, 'host-released', 'provider-released', 'host@example.com',
-                         'owner-id', 'owner@example.com', 'released', 1, ?2, ?2, ?2)",
-                params![old_installation, now],
-            )
-            .expect("insert released subscription");
-        }
         {
             let conn = store.conn.lock().await;
             crate::public_hosts::tombstone_subject(&conn, PublicHostKind::Client, old_installation)
@@ -50074,27 +50013,49 @@ pub(crate) mod tests {
             .expect("delete released installation");
         }
 
-        let new_key = insert_signed_installation(&store, new_installation).await;
-        claim_setup_client_tunnel(
-            &store,
-            &config,
-            &new_key,
+        let signing_key = insert_signed_installation(&store, new_installation).await;
+        let tunnel = ClientTunnelConfig {
+            owner_email: "owner@example.com".into(),
+            subdomain: "released-alpha".into(),
+            enabled: true,
+        };
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
             new_installation,
-            "released-alpha",
-        )
-        .await;
-        {
-            let conn = store.conn.lock().await;
-            let host = crate::public_hosts::get_by_label(&conn, "released-alpha")
-                .expect("read reclaimed host")
-                .expect("reclaimed host exists");
-            assert_eq!(host.subject_id, new_installation);
-            assert_eq!(
-                host.lifecycle,
-                crate::public_hosts::PublicHostLifecycle::Active
-            );
-        }
-
+            "client_tunnel_claim",
+            &tunnel,
+            timestamp_ms,
+            &nonce,
+        );
+        let result = store
+            .claim_client_tunnel(
+                &config,
+                ClientTunnelClaimRequest {
+                    installation_id: new_installation.into(),
+                    tunnel,
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                },
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(AppError::Conflict(_))));
+        assert!(
+            !store
+                .check_client_tunnel_subdomain_availability(
+                    "released-alpha",
+                    Some(new_installation)
+                )
+                .await
+                .unwrap()
+                .available
+        );
         let _ = std::fs::remove_file(&config.database.path);
     }
 
@@ -53639,11 +53600,12 @@ pub(crate) mod tests {
             let conn = store.conn.lock().await;
             conn.execute(
                 "UPDATE installations
-                 SET public_ip = '203.0.113.10', provision_source = 'router_market'
+                 SET public_ip = '203.0.113.10',owner_email='renter@example.com',owner_verified_at=created_at
                  WHERE id = 'inst-ip'",
                 [],
             )
             .expect("set reported client ip");
+            conn.execute("INSERT INTO online_client_listings(installation_id,seller_id,owner_email,state,revision,sequence,cycle_price_minor,updated_at) VALUES('inst-ip','seller','renter@example.com','listed',1,1,0,0)",[]).unwrap();
         }
         let server_geo = ServerGeo {
             lat: None,
@@ -53663,7 +53625,7 @@ pub(crate) mod tests {
             client.installation.public_ip.as_deref(),
             Some("203.0.113.xx")
         );
-        assert!(!client.can_open_client_terminal);
+        assert!(client.can_open_client_terminal);
         let revealed = store
             .dashboard_snapshot(
                 &config,
@@ -53682,7 +53644,7 @@ pub(crate) mod tests {
             owner_client.installation.public_ip.as_deref(),
             Some("203.0.113.10")
         );
-        assert!(owner_client.can_open_client_terminal);
+        assert!(!owner_client.can_open_client_terminal);
         let _ = std::fs::remove_file(&config.database.path);
     }
 
@@ -55192,6 +55154,82 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn direct_share_edit_uses_the_online_lease_namespace_for_receipts() {
+        let (store, config) = setup_store("online-client-share-edit").await;
+        let installation = "physical";
+        let share = "tenant-share";
+        let tenant = "tenant@example.com";
+        let alias = "rent-0123456789abcdef1234";
+        let subdomain = format!("edit-sub--{alias}");
+        insert_installation(&store, installation).await;
+        insert_client_tunnel(
+            &store,
+            installation,
+            "owner@example.com",
+            TEST_CLIENT_SUBDOMAIN,
+        )
+        .await;
+        insert_share(&store, installation, share, &subdomain, "active").await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute("INSERT INTO online_client_listings(installation_id,seller_id,owner_email,state,revision,sequence,cycle_price_minor,updated_at)
+                VALUES(?1,'seller','owner@example.com','listed',1,2,0,unixepoch())",params![installation]).unwrap();
+            conn.execute("INSERT INTO online_client_quotes(id,installation_id,buyer_id,revision,cycle_price_minor,projection_json,expires_at)
+                VALUES('quote',?1,'buyer',1,0,'{}',unixepoch()+120)",params![installation]).unwrap();
+            conn.execute("INSERT INTO online_client_leases(id,installation_id,quote_id,buyer_id,tenant_email,seller_id,alias,state,sequence,grant_until,created_at)
+                VALUES('lease',?1,'quote','buyer',?2,'seller',?3,'active',2,unixepoch()+3600,unixepoch())",params![installation,tenant,alias]).unwrap();
+            conn.execute(
+                "INSERT INTO online_client_share_bindings(share_id,lease_id) VALUES(?1,'lease')",
+                params![share],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE shares SET owner_email=?1 WHERE share_id=?2",
+                params![tenant, share],
+            )
+            .unwrap();
+        }
+        let edit = store
+            .create_share_settings_edit(
+                share,
+                tenant,
+                ShareSettingsPatch {
+                    description: Some(Some("updated".into())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .edit;
+        let mut reply = test_share_descriptor(share, &subdomain);
+        reply.owner_email = Some(tenant.into());
+        reply.description = Some("updated".into());
+        reply.config_revision = 1;
+        reply.descriptor_generation = 1;
+        reply.descriptor_fingerprint = "a".repeat(64);
+        let receipt = crate::models::ShareSettingsReceipt {
+            operation_id: edit.id.clone(),
+            patch_fingerprint: crate::models::share_settings_fingerprint(
+                &edit.share_id,
+                &edit.patch,
+            ),
+            config_revision: 1,
+        };
+        store
+            .apply_share_edit_with_receipt(&edit.id, reply, Some(receipt))
+            .await
+            .unwrap();
+        let conn = store.conn.lock().await;
+        let applied: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM shares s JOIN share_edit_requests e ON e.share_id=s.share_id
+            WHERE e.id=?1 AND e.status='applied' AND s.owner_email=?2 AND s.subdomain=?3)",
+            params![edit.id, tenant, subdomain], |row| row.get(0)).unwrap();
+        assert!(applied);
+        drop(conn);
+        drop(store);
+        let _ = std::fs::remove_file(&config.database.path);
+    }
+
+    #[tokio::test]
     async fn revision_conflict_rejection_applies_authoritative_share_snapshot() {
         let (store, config) = setup_store("share-edit-revision-conflict-snapshot").await;
         let installation_id = "inst-1";
@@ -55812,27 +55850,19 @@ pub(crate) mod tests {
     fn market_installations_have_no_automatic_stale_cleanup_deadline() {
         let last_seen_at = Utc::now();
         assert_eq!(
-            automatic_client_cleanup_at(last_seen_at, None, 3_600),
+            automatic_client_cleanup_at(last_seen_at, false, 3_600),
             Some(last_seen_at + Duration::hours(1))
         );
         assert_eq!(
-            automatic_client_cleanup_at(last_seen_at, Some("manual"), 21_600),
+            automatic_client_cleanup_at(last_seen_at, false, 21_600),
             Some(last_seen_at + Duration::hours(6))
         );
         assert_eq!(
-            automatic_client_cleanup_at(
-                last_seen_at,
-                Some(crate::client_market::PROVISION_SOURCE_ROUTER_MARKET),
-                3_600,
-            ),
+            automatic_client_cleanup_at(last_seen_at, true, 3_600,),
             None
         );
         assert_eq!(
-            automatic_client_cleanup_at(
-                last_seen_at,
-                Some(crate::client_market::PROVISION_SOURCE_ROUTER_MARKET),
-                21_600,
-            ),
+            automatic_client_cleanup_at(last_seen_at, true, 21_600,),
             None
         );
     }
@@ -55860,7 +55890,7 @@ pub(crate) mod tests {
         {
             let conn = store.conn.lock().await;
             conn.execute(
-                "UPDATE installations SET provision_source = 'router_market' WHERE id = 'market-client'",
+                "INSERT INTO online_client_listings(installation_id,seller_id,owner_email,state,revision,sequence,cycle_price_minor,updated_at) VALUES('market-client','seller','owner@example.test','listed',1,1,0,0)",
                 [],
             )
             .expect("mark market installation");
@@ -55876,17 +55906,14 @@ pub(crate) mod tests {
             .await
             .expect("market dashboard snapshot");
         assert_eq!(market.clients[0].operational_summary.state, "offline");
-        assert_eq!(
-            market.clients[0].installation.provision_source.as_deref(),
-            Some("router_market")
-        );
+        assert!(market.clients[0].installation.market_listed);
         assert_eq!(market.clients[0].removal_at, None);
         assert_eq!(market.shares[0].cleanup_at, None);
 
         {
             let conn = store.conn.lock().await;
             conn.execute(
-                "UPDATE installations SET provision_source = NULL WHERE id = 'market-client'",
+                "UPDATE online_client_listings SET state='unlisted' WHERE installation_id='market-client'",
                 [],
             )
             .expect("restore ordinary installation");
@@ -59608,186 +59635,50 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn client_subdomain_takeover_rejects_active_market_create_or_cleanup_jobs() {
-        let (store, config) = setup_store("client-subdomain-takeover-active-market-job").await;
-        let target_id = "takeover-market-job-target";
-        let source_id = "takeover-market-job-source";
-        insert_installation(&store, target_id).await;
-        insert_installation(&store, source_id).await;
-        insert_client_tunnel(&store, target_id, "owner@example.com", "marketjobtarget").await;
-        insert_client_tunnel(&store, source_id, "owner@example.com", "marketjobsource").await;
-        let now = Utc::now().to_rfc3339();
-        {
+    async fn client_subdomain_takeover_requires_both_clients_to_be_unlisted() {
+        let (store, config) = setup_store("client-subdomain-takeover-listed").await;
+        for id in ["target", "source"] {
+            insert_installation(&store, id).await;
+            insert_client_tunnel(&store, id, "owner@example.com", id).await;
             let conn = store.conn.lock().await;
             conn.execute(
-                "UPDATE installations SET control_secret_b64 = 'market-job-control' WHERE id = ?1",
-                params![target_id],
+                "UPDATE installations SET control_secret_b64='fixture-secret' WHERE id=?1",
+                params![id],
             )
-            .expect("set market-job takeover control secret");
-            conn.execute(
-                "INSERT INTO provisioning_jobs (
-                    id, type, installation_id, status, phase, log_blob, created_at, updated_at
-                 ) VALUES (
-                    'blocking-create-job', 'create', ?1, 'running', 'waiting_for_client', '', ?2, ?2
-                 )",
-                params![source_id, now],
-            )
-            .expect("insert blocking Client Market job");
+            .unwrap();
+            conn.execute("INSERT INTO online_client_listings(installation_id,seller_id,owner_email,state,revision,sequence,cycle_price_minor,updated_at)
+                VALUES(?1,'owner','owner@example.com','listed',1,1,0,0)",params![id]).unwrap();
         }
-
-        let error = store
-            .begin_client_subdomain_takeover(
-                "owner@example.com",
-                target_id,
-                source_id,
-                Utc::now().timestamp_millis() + 10_000,
-            )
-            .await
-            .expect_err("active create job must block takeover");
-        assert!(matches!(error, AppError::Conflict(_)));
-        assert!(error.to_string().contains("Client Market create job"));
-
-        store
-            .conn
-            .lock()
-            .await
-            .execute(
-                "UPDATE provisioning_jobs SET status = 'failed' WHERE id = 'blocking-create-job'",
-                [],
-            )
-            .expect("finish blocking Client Market job");
+        for id in ["target", "source"] {
+            let error = store
+                .begin_client_subdomain_takeover(
+                    "owner@example.com",
+                    "target",
+                    "source",
+                    Utc::now().timestamp_millis() + 10_000,
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("unlist the Client"), "{error}");
+            store
+                .conn
+                .lock()
+                .await
+                .execute(
+                    "UPDATE online_client_listings SET state='unlisted' WHERE installation_id=?1",
+                    params![id],
+                )
+                .unwrap();
+        }
         store
             .begin_client_subdomain_takeover(
                 "owner@example.com",
-                target_id,
-                source_id,
+                "target",
+                "source",
                 Utc::now().timestamp_millis() + 10_000,
             )
             .await
-            .expect("terminal Client Market job must release takeover");
-
-        let _ = std::fs::remove_file(config.database.path);
-    }
-
-    #[tokio::test]
-    async fn client_subdomain_takeover_requires_stable_target_market_state() {
-        let (store, config) = setup_store("client-subdomain-takeover-target-market-state").await;
-        let target_id = "takeover-market-state-target";
-        let source_id = "takeover-market-state-source";
-        let host_id = "takeover-market-state-host";
-        insert_installation(&store, target_id).await;
-        insert_installation(&store, source_id).await;
-        insert_client_tunnel(&store, target_id, "owner@example.com", "marketstatetarget").await;
-        insert_client_tunnel(&store, source_id, "owner@example.com", "marketstatesource").await;
-        let now = Utc::now().to_rfc3339();
-        {
-            let conn = store.conn.lock().await;
-            conn.execute(
-                "UPDATE installations SET control_secret_b64 = 'market-state-control' WHERE id = ?1",
-                params![target_id],
-            )
-            .expect("set target takeover control secret");
-            conn.execute(
-                "INSERT INTO router_ssh_hosts (
-                    id, ip, port, host_owner_email, status, installation_id, created_at, updated_at
-                 ) VALUES (?1, '198.18.40.1', 22, 'provider@example.com', 'allocated', ?2, ?3, ?3)",
-                params![host_id, target_id, now],
-            )
-            .expect("insert target Client Market Host");
-            conn.execute(
-                "INSERT INTO client_market_subscriptions (
-                    installation_id, host_id, provider_id, host_owner_email,
-                    client_user_id, client_owner_email, status, offer_revision,
-                    created_at, updated_at
-                 ) VALUES (
-                    ?1, ?2, 'provider-user', 'provider@example.com',
-                    'owner-user', 'owner@example.com', 'release_failed', 1, ?3, ?3
-                 )",
-                params![target_id, host_id, now],
-            )
-            .expect("insert failed target Client Market subscription");
-        }
-
-        let error = store
-            .begin_client_subdomain_takeover(
-                "owner@example.com",
-                target_id,
-                source_id,
-                Utc::now().timestamp_millis() + 10_000,
-            )
-            .await
-            .expect_err("non-active target subscription must block takeover");
-        assert!(error.to_string().contains("subscription must be active"));
-
-        {
-            let conn = store.conn.lock().await;
-            conn.execute(
-                "UPDATE client_market_subscriptions SET status = 'active' WHERE installation_id = ?1",
-                params![target_id],
-            )
-            .expect("reactivate target subscription");
-            conn.execute(
-                "INSERT INTO client_market_cleanup_retry_state (
-                    host_id, installation_id, attempt_count, next_attempt_at, updated_at
-                 ) VALUES (?1, ?2, 0, ?3, ?3)",
-                params![host_id, target_id, now],
-            )
-            .expect("insert target cleanup retry");
-        }
-        let error = store
-            .begin_client_subdomain_takeover(
-                "owner@example.com",
-                target_id,
-                source_id,
-                Utc::now().timestamp_millis() + 10_000,
-            )
-            .await
-            .expect_err("target cleanup retry must block takeover");
-        assert!(error.to_string().contains("cleanup retry must finish"));
-
-        {
-            let conn = store.conn.lock().await;
-            conn.execute(
-                "DELETE FROM client_market_cleanup_retry_state WHERE installation_id = ?1",
-                params![target_id],
-            )
-            .expect("clear target cleanup retry");
-            conn.execute(
-                "UPDATE router_ssh_hosts SET status = 'unreachable' WHERE id = ?1",
-                params![host_id],
-            )
-            .expect("mark target Host unstable");
-        }
-        let error = store
-            .begin_client_subdomain_takeover(
-                "owner@example.com",
-                target_id,
-                source_id,
-                Utc::now().timestamp_millis() + 10_000,
-            )
-            .await
-            .expect_err("unstable target Host must block takeover");
-        assert!(error.to_string().contains("Host must be allocated"));
-
-        store
-            .conn
-            .lock()
-            .await
-            .execute(
-                "UPDATE router_ssh_hosts SET status = 'allocated' WHERE id = ?1",
-                params![host_id],
-            )
-            .expect("stabilize target Host");
-        store
-            .begin_client_subdomain_takeover(
-                "owner@example.com",
-                target_id,
-                source_id,
-                Utc::now().timestamp_millis() + 10_000,
-            )
-            .await
-            .expect("stable target Client Market state must allow takeover");
-
+            .unwrap();
         let _ = std::fs::remove_file(config.database.path);
     }
 

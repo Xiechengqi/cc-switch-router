@@ -14,11 +14,11 @@ pub(super) fn enrich_service_tx(conn: &Connection, item: &mut Claimed) -> Result
         return Ok(());
     };
     let row: Option<(String,String,Option<String>)>=conn.query_row(
-        "SELECT c.product_kind,COALESCE(c.service_ref,c.product_ref),COALESCE(s.share_name,j.subdomain)
+        "SELECT c.product_kind,COALESCE(c.service_ref,c.product_ref),COALESCE(s.share_name,j.alias)
          FROM market_platform_contracts c
          LEFT JOIN share_market_subscriptions rental ON c.product_kind='share' AND rental.id=c.product_ref
          LEFT JOIN shares s ON s.share_id=rental.share_id
-         LEFT JOIN provisioning_jobs j ON c.product_kind='client_host' AND j.id=c.product_ref
+         LEFT JOIN online_client_leases j ON c.product_kind='client_host' AND j.id=c.product_ref
          WHERE c.id=?1 AND c.buyer_user_id=?2",params![id,item.recipient_user_id],
         |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(db_error("describe service notification"))?;
     if let Some((kind, reference, name)) = row {

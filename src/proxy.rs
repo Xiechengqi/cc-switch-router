@@ -3862,10 +3862,30 @@ async fn proxy_handler_inner(state: ServerState, peer: SocketAddr, req: Request)
         return simple_response(StatusCode::NOT_FOUND, "not-found");
     }
 
-    let route_subdomain = subdomain_for_host(&host, &state.config.tunnel_domain);
-    let (route, route_inflight_guard) = match state
+    let hostname_label = subdomain_for_host(&host, &state.config.tunnel_domain);
+    let alias = if let Some(label) = hostname_label
+        .as_deref()
+        .filter(|label| crate::online_client_market::rental_label(label))
+    {
+        match crate::online_client_market::alias(&state, label).await {
+            Ok(Some((lease, installation, physical, true))) => {
+                Some((lease, installation, physical))
+            }
+            Ok(Some(_)) => return simple_response(StatusCode::GONE, "client-lease-ended"),
+            Ok(None) => None,
+            Err(e) => return e.into_response(),
+        }
+    } else {
+        None
+    };
+    let lookup_host = alias
+        .as_ref()
+        .map(|(_, _, physical)| format!("{physical}.{}", state.config.tunnel_domain))
+        .unwrap_or_else(|| host.clone());
+    let route_subdomain = subdomain_for_host(&lookup_host, &state.config.tunnel_domain);
+    let (mut route, route_inflight_guard) = match state
         .proxy
-        .route_for_host_request(&host, &state.config.tunnel_domain)
+        .route_for_host_request(&lookup_host, &state.config.tunnel_domain)
         .await
     {
         RouteLookup::Active(route, guard) => (route, guard),
@@ -3944,6 +3964,12 @@ async fn proxy_handler_inner(state: ServerState, peer: SocketAddr, req: Request)
             return simple_response(StatusCode::NOT_FOUND, "unregistered-subdomain");
         }
     };
+    if let Some((_, installation, _)) = &alias {
+        if !route.is_client_web() || route.installation_id() != Some(installation.as_str()) {
+            return simple_response(StatusCode::NOT_FOUND, "lease-route-unavailable");
+        }
+        route.subdomain = hostname_label.clone().unwrap_or_default();
+    }
     error_capture
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -3983,7 +4009,11 @@ async fn proxy_handler_inner(state: ServerState, peer: SocketAddr, req: Request)
             .client_window_principal(
                 &state.config,
                 &parts.headers,
-                route.installation_id().unwrap_or_default(),
+                alias
+                    .as_ref()
+                    .map(|a| a.0.as_str())
+                    .or(route.installation_id())
+                    .unwrap_or_default(),
                 &route.subdomain,
             )
             .await
@@ -3991,6 +4021,14 @@ async fn proxy_handler_inner(state: ServerState, peer: SocketAddr, req: Request)
             Ok(principal) => principal,
             Err(error) => return error.into_response(),
         };
+        if alias.is_some() {
+            if is_client_web_terminal_request(&path, parts.uri.query()) {
+                return simple_response(StatusCode::FORBIDDEN, "tenant-terminal-forbidden");
+            }
+            if is_client_web_auth_required_path(&path) && client_web_session.is_none() {
+                return simple_response(StatusCode::UNAUTHORIZED, "client-lease-login-required");
+            }
+        }
         if !is_internal_share_router_path && !is_allowed_client_web_path(&path) {
             debug!(
                 method = %method,
@@ -4016,37 +4054,6 @@ async fn proxy_handler_inner(state: ServerState, peer: SocketAddr, req: Request)
                 "proxy request rejected: client web token in query string"
             );
             return simple_response(StatusCode::BAD_REQUEST, "query-token-not-allowed");
-        }
-        if is_client_web_terminal_request(&path, parts.uri.query()) {
-            let market_client = match route.installation_id().as_deref() {
-                Some(installation_id) => {
-                    state
-                        .store
-                        .installation_provision_source(installation_id)
-                        .await
-                        .ok()
-                        .flatten()
-                        .as_deref()
-                        == Some(crate::client_market::PROVISION_SOURCE_ROUTER_MARKET)
-                }
-                None => false,
-            };
-            let window_terminal = market_client
-                && state
-                    .store
-                    .client_window_terminal_allowed(
-                        &state.config,
-                        &parts.headers,
-                        route.installation_id().unwrap_or_default(),
-                        &route.subdomain,
-                    )
-                    .await;
-            if market_client
-                && !window_terminal
-                && !client_web_terminal_allowed(&state, &parts.headers).await
-            {
-                return simple_response(StatusCode::FORBIDDEN, "client-web-forbidden");
-            }
         }
         if is_client_web_auth_required_path(&path) && client_web_session.is_none() {
             let owner_email = match state
@@ -4574,7 +4581,9 @@ async fn proxy_handler_inner(state: ServerState, peer: SocketAddr, req: Request)
         let installation_id = route.installation_id().unwrap_or_default();
         let Some(control_secret_result) = await_share_request_or_cancel(
             &share_cancellation,
-            state.store.installation_control_secret(installation_id),
+            state
+                .store
+                .ingress_control_secret(installation_id, route.share_id()),
         )
         .await
         else {
@@ -4588,6 +4597,7 @@ async fn proxy_handler_inner(state: ServerState, peer: SocketAddr, req: Request)
                     "ingress-control-secret-missing",
                 );
             }
+            Err(error @ AppError::Forbidden(_)) => return error.into_response(),
             Err(error) => {
                 warn!(
                     installation_id,
@@ -7242,7 +7252,7 @@ async fn with_signed_ingress_context(
     let installation_id = route.installation_id().unwrap_or_default();
     let control_secret = match state
         .store
-        .installation_control_secret(installation_id)
+        .ingress_control_secret(installation_id, route.share_id())
         .await
     {
         Ok(Some(secret)) if !secret.trim().is_empty() => secret,
@@ -7258,6 +7268,7 @@ async fn with_signed_ingress_context(
                 "ingress-control-secret-missing",
             ));
         }
+        Err(error @ AppError::Forbidden(_)) => return Err(error.into_response()),
         Err(error) => {
             warn!(
                 installation_id,
@@ -7652,18 +7663,6 @@ fn is_client_web_terminal_request(path: &str, query: Option<&str>) -> bool {
         })
 }
 
-/// Market Client terminals stay with the Router owner. The iframe carries the
-/// browser session cookie, which is the credential checked here.
-async fn client_web_terminal_allowed(state: &ServerState, headers: &HeaderMap) -> bool {
-    let Ok(Some(session)) = crate::api::resolve_router_session(state, headers).await else {
-        return false;
-    };
-    state
-        .config
-        .official_provider_email()
-        .is_some_and(|owner| owner.eq_ignore_ascii_case(session.email.trim()))
-}
-
 fn is_client_web_auth_required_path(path: &str) -> bool {
     (path == "/web-api" || path.starts_with("/web-api/")) && !is_public_client_web_path(path)
 }
@@ -7727,12 +7726,7 @@ async fn resolve_client_web_bearer(
         return Ok(None);
     };
     if let Some(installation_id) = installation_id
-        && state
-            .store
-            .installation_provision_source(installation_id)
-            .await?
-            .as_deref()
-            == Some(crate::client_market::PROVISION_SOURCE_ROUTER_MARKET)
+        && crate::online_client_market::listed(state, installation_id).await?
     {
         // Market Clients are separate trust domains. Their bearer token must
         // pass through to cc-switch-server for local password/owner OTP auth;
@@ -8792,15 +8786,6 @@ mod tests {
                 crate::client_server_release::ClientServerReleaseValidator::new().unwrap(),
             ),
             ssh_host_fingerprint: None,
-            provision_ssh_key_path: config.provision_ssh_private_key_path.clone(),
-            provision_ssh_authorized_keys_line: String::new(),
-            provision_ssh_public_key: String::new(),
-            client_market_job_secrets: Arc::new(Mutex::new(
-                crate::client_market::ClientMarketJobSecrets::default(),
-            )),
-            client_market_terminal: Arc::new(Mutex::new(
-                crate::client_market_terminal::TerminalSessionManager::default(),
-            )),
             client_market_actions: Arc::new(
                 crate::client_market_coordination::ClientMarketActionLocks::default(),
             ),
@@ -8971,14 +8956,7 @@ mod tests {
                 "cc-switch-router-proxy-{name}-{}.key",
                 Uuid::new_v4()
             )),
-            provision_ssh_private_key_path: std::env::temp_dir().join(format!(
-                "cc-switch-router-proxy-{name}-{}-id_rsa",
-                Uuid::new_v4()
-            )),
-            provision_ssh_public_key_path: std::env::temp_dir().join(format!(
-                "cc-switch-router-proxy-{name}-{}-id_rsa.pub",
-                Uuid::new_v4()
-            )),
+
             cleanup_interval_secs: 300,
             lease_retention_secs: 24 * 60 * 60,
             request_log_retention_days: 30,
@@ -9007,7 +8985,6 @@ mod tests {
             market_usd_cny_rate_micros: crate::market_common::DEFAULT_USD_CNY_RATE_MICROS,
             market_provider_recommendation_mode:
                 crate::config::MarketProviderRecommendationMode::Shadow,
-            ip_intel_endpoints: Vec::new(),
             verification_service_base_url: "https://tokenswitch.org".into(),
             verification_service_api_key: None,
             router_owner_email: None,
@@ -9095,11 +9072,9 @@ mod tests {
         {
             let conn = state.store.conn.lock().await;
             conn.execute(
-                "UPDATE installations SET provision_source = ?2 WHERE id = ?1",
-                crate::db::params![
-                    registered.installation_id,
-                    crate::client_market::PROVISION_SOURCE_ROUTER_MARKET,
-                ],
+                "INSERT INTO online_client_listings(installation_id,seller_id,owner_email,state,revision,sequence,cycle_price_minor,updated_at)
+                 VALUES (?1,'seller','seller@example.test','listed',1,1,0,unixepoch())",
+                crate::db::params![registered.installation_id],
             )
             .unwrap();
         }

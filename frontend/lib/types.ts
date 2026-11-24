@@ -212,9 +212,14 @@ export type DashboardClient = {
   logCollectionEnabled?: boolean;
   canOpenClientTerminal?: boolean;
   installation: {
+    /** The Client supports online leasing (`/_ctl/market/*`). */
+    marketLeaseV1?: boolean;
+    /** Listed or leased on the online Client Market; exempt from offline removal. */
+    marketListed?: boolean;
     id: string;
     platform: string;
     appVersion: string;
+    /** Present only when the owner email is verified. */
     ownerEmail?: string;
     region?: string;
     countryCode?: string;
@@ -2361,27 +2366,6 @@ export type HostHealth = {
   snapshot: HostHealthSnapshot | null;
   diagnostic?: string | null;
 };
-export type HostHealthCalendarDay = {
-  date: string;
-  receivedHours: number;
-  observableHours: number;
-  receivedRate?: number;
-};
-
-export type HostHealthCalendar = {
-  hostId: string;
-  timezone: "UTC" | string;
-  startDate: string;
-  endDate: string;
-  days: HostHealthCalendarDay[];
-};
-
-export type HostHealthDetail = {
-  machineEpoch: number;
-  hostHealth: HostHealth | null;
-  hours: Array<{ utcHour: number; dueAt: string; state: "received" | "pending" | "unknown" | "missed"; receivedAt: string | null; snapshot: HostHealthSnapshot | null }>;
-};
-
 export type ClientMarketHostStatus =
   | "onboarding"
   | "maintaining"
@@ -2477,59 +2461,6 @@ export type ClientMarketHost = {
   ipIntel?: HostIpIntel;
   createdAt?: string;
   updatedAt?: string;
-};
-
-export type ClientMarketSshHostKeyInspection = {
-  hostId: string;
-  endpoint: string;
-  storedFingerprint?: string;
-  observedFingerprint: string;
-  observedKeyType: string;
-  changed: boolean;
-  confirmationRequired: boolean;
-};
-
-export type ClientMarketSshHostKeyRotationResponse = {
-  host: ClientMarketHost;
-  inspection: ClientMarketSshHostKeyInspection;
-};
-
-export type SupplySummaryEntry = {
-  hostOwnerEmail: string;
-  countryCode?: string;
-  idleCount: number;
-  totalCount: number;
-};
-
-export type ProvisionSshKey = {
-  publicKey: string;
-  authorizedKeysLine: string;
-};
-
-export type ProvisioningJobStatus =
-  "pending" | "running" | "succeeded" | "failed";
-
-export type ProvisioningJob = {
-  id: string;
-  jobType: string;
-  hostId?: string;
-  hostOwnerEmail?: string;
-  clientOwnerEmail?: string;
-  subdomain?: string;
-  installationId?: string;
-  status: ProvisioningJobStatus;
-  phase: string;
-  failureCode?: string;
-  countryCode?: string;
-  clientUrl?: string;
-  log: string;
-  createdAt: string;
-  updatedAt: string;
-};
-
-export type CreateClientMarketClientResponse = {
-  jobId?: string;
-  cancellationScheduled: boolean;
 };
 
 export type ProviderContactChannel = "wechat" | "telegram" | "custom";
@@ -2677,13 +2608,6 @@ export type ClientMarketProvider = {
   countries: ClientMarketProviderCountry[];
 };
 
-export type ClientMarketProviderSupply = {
-  routerOwnerEmail?: string;
-  officialProviderId?: string;
-  recommendationMode?: MarketProviderRecommendationMode | string;
-  providers: ClientMarketProvider[];
-};
-
 export type MarketProviderRankGeneration = {
   id: string;
   algorithmVersion: string;
@@ -2822,20 +2746,6 @@ export type ClientMarketAllocationQuote = {
   terminationPolicy?: { version: number; rateBps: number } | null;
 };
 
-export type ClientMarketCommitQuoteResponse = {
-  batchId: string;
-  jobIds: string[];
-};
-
-export type ClientMarketBatch = {
-  id: string;
-  quoteId: string;
-  status: "running" | "succeeded" | "partial_failed" | "failed" | string;
-  createdAt: string;
-  updatedAt: string;
-  jobs: ProvisioningJob[];
-};
-
 export type ClientTrialState = {
   epoch: number;
   allowanceSeconds: number;
@@ -2899,24 +2809,6 @@ export type ClientMarketRental = {
   updatedAt: string;
 };
 
-export type ClientMarketHostUsageHistoryEntry = {
-  installationId: string;
-  clientOwnerEmail: string;
-  clientSubdomain?: string;
-  status: string;
-  startedAt: string;
-  endedAt?: string;
-  dailyRateMinor?: number;
-  cyclePriceMinor?: number;
-  pricingModel: MarketPricingModel;
-  currency?: string;
-  chargesMinor: number;
-  refundedMinor: number;
-  netChargesMinor: number;
-  serviceUnits?: string;
-  compensationUnits?: string;
-};
-
 export type ClientMarketHostTransferDocument = {
   version: number;
   exportedAt?: string;
@@ -2936,21 +2828,6 @@ export type ClientMarketHostTransferDocument = {
   }>;
 };
 
-export type ClientMarketHostImportResponse = {
-  jobId: string;
-  status: "pending" | "running" | "completed" | string;
-  imported: number;
-  skipped: number;
-  failed: number;
-  items: Array<{
-    ip: string;
-    port: number;
-    status: string;
-    hostId?: string;
-    error?: string;
-  }>;
-};
-
 export type ClientTunnelSubdomainAvailability = {
   available: boolean;
   reason?: string;
@@ -2959,11 +2836,6 @@ export type ClientTunnelSubdomainAvailability = {
 export type CreateClientSelectionPersist = {
   mode: "official_default" | "custom";
   providerIds: string[];
-};
-
-export type CreateClientRegionsPersist = {
-  mode: "all" | "subset";
-  codes: string[];
 };
 
 /** A USD-equivalent quota: API list-price usage, never money. */

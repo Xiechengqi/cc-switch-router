@@ -559,6 +559,25 @@ struct Accept {
     #[serde(default)]
     claim: String,
 }
+pub(crate) fn parent_release_tx(c: &Connection, sub: &str, at: &str) -> Result<(), AppError> {
+    if for_subscription_tx(c, sub)?.is_some() {
+        return Ok(());
+    }
+    let t = basis(c, sub, at)?;
+    accept_inner(
+        c,
+        sub,
+        &t.buyer_user_id,
+        &Accept {
+            preview_id: String::new(),
+            reason: "parent_lease_ended".into(),
+            claim: String::new(),
+        },
+        at,
+        true,
+    )?;
+    Ok(())
+}
 fn accept_tx(
     c: &Connection,
     sub: &str,
@@ -566,16 +585,28 @@ fn accept_tx(
     input: &Accept,
     at: &str,
 ) -> Result<Termination, AppError> {
+    accept_inner(c, sub, buyer, input, at, false)
+}
+fn accept_inner(
+    c: &Connection,
+    sub: &str,
+    buyer: &str,
+    input: &Accept,
+    at: &str,
+    parent: bool,
+) -> Result<Termination, AppError> {
     if let Some(t) = for_subscription_tx(c, sub)? {
         if t.buyer_user_id != buyer {
             return Err(AppError::Forbidden("not this buyer".into()));
         }
         return Ok(t);
     }
-    if !matches!(
-        input.reason.as_str(),
-        "voluntary" | "provider_issue" | "platform_issue"
-    ) || input.claim.len() > 2000
+    if !parent
+        && !matches!(
+            input.reason.as_str(),
+            "voluntary" | "provider_issue" | "platform_issue"
+        )
+        || input.claim.len() > 2000
     {
         return Err(AppError::BadRequest(
             "invalid termination reason or explanation".into(),
@@ -585,14 +616,16 @@ fn accept_tx(
     if t.buyer_user_id != buyer {
         return Err(AppError::Forbidden("not this buyer".into()));
     }
-    eligible(c, &t)?;
-    let valid:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM share_termination_previews WHERE id=?1 AND subscription_id=?2
+    if !parent {
+        eligible(c, &t)?;
+        let valid:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM share_termination_previews WHERE id=?1 AND subscription_id=?2
         AND buyer_user_id=?3 AND period_id IS ?4 AND policy_version=?5 AND julianday(expires_at)>julianday(?6))",
         params![input.preview_id,sub,buyer,t.period_id,t.policy_version,at],|r|r.get(0)).map_err(db_error("verify Share preview"))?;
-    if !valid {
-        return Err(AppError::Conflict(
-            "termination preview expired or period changed; reload".into(),
-        ));
+        if !valid {
+            return Err(AppError::Conflict(
+                "termination preview expired or period changed; reload".into(),
+            ));
+        }
     }
     if let Some(contract) = t.contract_id.as_deref() {
         // A ledger conflict here is a broken contract, not a buyer error:
@@ -608,8 +641,10 @@ fn accept_tx(
             })?;
     }
     t = basis(c, sub, at)?;
-    eligible(c, &t)?;
-    if t.early_termination_forbidden {
+    if !parent {
+        eligible(c, &t)?;
+    }
+    if !parent && t.early_termination_forbidden {
         if input.reason == "voluntary" {
             return Err(AppError::coded_conflict(
                 "SHARE_EARLY_TERMINATION_FORBIDDEN",
@@ -624,6 +659,11 @@ fn accept_tx(
     if t.reason != "voluntary" && t.compensation_cap_units > 0 {
         t.responsibility = "undetermined".into();
         t.dispute_opened_at = Some(at.into());
+    }
+    if parent {
+        t.compensation_cap_units = 0;
+        t.responsibility = "none".into();
+        t.dispute_opened_at = None;
     }
     c.execute(
         "INSERT INTO share_market_terminations VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,1,?10,?11)",
@@ -659,12 +699,24 @@ fn accept_tx(
     Ok(t)
 }
 
+fn receipt_cutoff_ms(t: &Termination) -> Result<i64, AppError> {
+    let cutoff = time(&t.cutoff_at)?.timestamp_millis();
+    // The parent stops access on a whole second. A child's paid period may
+    // start later in that second, or already have expired during disconnection.
+    // Its receipt covers only the intersection with that billing period.
+    Ok(if t.reason == "parent_lease_ended" {
+        cutoff.max(t.period_start_ms).min(t.period_end_ms)
+    } else {
+        cutoff
+    })
+}
+
 pub(crate) fn fence_tx(c: &Connection, sub: &str) -> Result<Option<TerminationFence>, AppError> {
     for_subscription_tx(c, sub)?
         .map(|t| {
             Ok(TerminationFence {
+                cutoff_at_ms: receipt_cutoff_ms(&t)?,
                 termination_id: t.id,
-                cutoff_at_ms: time(&t.cutoff_at)?.timestamp_millis(),
                 period_start_ms: t.period_start_ms,
                 period_end_ms: t.period_end_ms,
                 policy: t.policy,
@@ -709,7 +761,7 @@ pub(crate) fn record_receipt_tx(
         || t.entitlement_id != receipt.entitlement_id
         || t.share_id != receipt.share_id
         || !t.buyer_email.eq_ignore_ascii_case(&receipt.email)
-        || receipt.cutoff_at_ms != time(&t.cutoff_at)?.timestamp_millis()
+        || receipt.cutoff_at_ms != receipt_cutoff_ms(&t)?
         || receipt.period_start_ms != t.period_start_ms
         || receipt.period_end_ms != t.period_end_ms
         || receipt.archive_since_ms > t.period_start_ms

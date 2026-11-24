@@ -1,6 +1,6 @@
 import { installFinancialBrowserIdentity } from "./financial-browser-fixture.mjs";
 import assert from "node:assert/strict";
-import { emptyClientRentalsPage } from "./client-rental-fixtures.mjs";
+import { emptyClientRentalsPage, isRetiredClientMarketPath } from "./client-rental-fixtures.mjs";
 import { createServer } from "node:http";
 import { readFile, mkdir } from "node:fs/promises";
 import { extname, resolve, sep } from "node:path";
@@ -28,14 +28,14 @@ const initial = (patch = {}) => ({
   policyVersion: 1, rateBps: 1000, periodAmountUnits: "432000", remainingUnits: "388800", compensationCapUnits: "43200",
   returnedUnits: "345600", compensationUnits: "0", heldUnits: "43200", creditedUnits: "0", reason: "provider_issue",
   claim: "Original rental claim, not the new tenant's issue.", responsibility: "undetermined", status: "disputed",
-  cutoffAt: iso(), cleanupConfirmedAt: iso(), cleanupJobId: "cleanup", disputeUsed: true, disputeOpenedAt: iso(),
+  cutoffAt: iso(), cleanupConfirmedAt: iso(), disputeUsed: true, disputeOpenedAt: iso(),
   disputeDeadlineAt: new Date(Date.now() + 72 * 3600000).toISOString(), providerRespondedAt: null,
   resolution: null, chatAvailable: false, version: 1, updatedAt: iso(), unlockAt: null, clientSubdomain: "original-client",
   events: [], eventsNextCursor: null, ...patch,
 });
 let actor = "provider", record = initial(), hostPresent = true, conflict = false, workspaceFailure = false;
 let anonymousPrivateReads = 0, holdDetail = false, releaseDetail;
-let dualRole = false, historyPaging = false, jobLookupAttempts = 0;
+let dualRole = false, historyPaging = false;
 const writes = [], reads = [], errors = [];
 const json = (route, data, status = 200) => route.fulfill({ status, contentType: "application/json", body: JSON.stringify(data) });
 function view() {
@@ -50,9 +50,9 @@ function view() {
     : owner && unsettled && record.providerRespondedAt && decide ? "owner_decision" : cleanup ? "cleanup_failed"
     : due ? "timeout_pending" : unsettled ? record.providerRespondedAt ? "waiting_owner" : "waiting_provider"
     : record.status === "completed" ? "completed" : "processing";
-  return { ...record, serverNow: iso(), attention, actionRequired: respond || cleanup || owner && (attention === "owner_decision" || attention === "finance_review"),
+  return { ...record, serverNow: iso(), attention, actionRequired: respond || owner && (attention === "owner_decision" || attention === "finance_review"),
     permissions: { buyer, provider, owner, dispute: buyer && !record.disputeUsed && decide,
-      withdraw: buyer && unsettled && decide, waive: provider && decide, respond, resolve: owner && decide, retryCleanup: cleanup } };
+      withdraw: buyer && unsettled && decide, waive: provider && decide, respond, resolve: owner && decide } };
 }
 let browser, page;
 try {
@@ -66,16 +66,16 @@ try {
   });
   await page.route("**/v1/**", async route => {
     const url = new URL(route.request().url()), path = url.pathname, method = route.request().method();
+    if (isRetiredClientMarketPath(path)) { errors.push(path); return json(route, {}, 410); }
     if (path === "/v1/ui/context") return json(route, { mode: "router" });
     // Finance authority comes from server capabilities, not the general admin flag.
     if (path === "/v1/auth/session/me") return json(route, { authenticated: !!actor, isAdmin: false, user: actor ? { id: actor, email: `${actor}@example.test` } : null, password: { hasPassword: true, version: 1 } });
-    if (path === "/v1/client-market/hosts") return json(route, hostPresent ? [{
-      id: "host-one", providerId: "provider", hostOwnerEmail: "provider@example.test", ip: "192.0.2.10", status: "allocated",
-      clientSubdomain: "new-tenant-client", installationId: actor === "provider" ? "current-installation" : undefined,
-      clientOwnerEmail: "new-tenant@example.test", isHostOwner: actor === "provider", isClientOwner: false,
-      pricingModel: "prepaid_calendar_month", cyclePriceMinor: 5, offerRevision: 1, eligibility: { allowed: true }, contacts: [],
-    }] : []);
-    if (path === "/v1/client-market/my-rentals" || path.endsWith("/usage-history")) return json(route, []);
+    if (path === "/v1/client-market/online/leases") return json(route,{leases:[]});
+    if (path === "/v1/client-market/online/listings") return json(route,{listings:hostPresent ? [{
+      installationId:record.hostId, providerId:"provider", label:"Online rental fixture", revision:1,state:"listed",owned:actor === "provider",
+      cyclePriceMinor:100,freeDays:null,trialDays:0,country:"JP",egressIp:null,egressDiffers:false,
+      healthy:true,occupied:true,observedAt:Math.floor(Date.now()/1000),availableHours24:24,
+    }] : []});
     if (path === "/v1/client-market/me/rentals") return json(route, emptyClientRentalsPage(url));
     if (path.startsWith("/v1/client-market/termination-workspace")) {
       reads.push({ actor, path, query: url.search });
@@ -118,16 +118,6 @@ try {
       record.events.unshift({ id: `event-${record.version}`, action: path.endsWith("/respond") ? "provider_response" : actor === "owner" ? "owner_decision" : "provider_waiver", note: body.note, createdAt: iso(), actorRole: actor, awardUnits: body.awardUnits || null });
       return json(route, record);
     }
-    if (path.endsWith("/provider-cleanup")) {
-      writes.push({ path, actor, body: route.request().postDataJSON() });
-      assert.ok(path.includes("old-installation"));
-      record = { ...record, status: "completed", cleanupConfirmedAt: iso(), compensationCapUnits: "0", heldUnits: "0" };
-      return json(route, { jobId: "cleanup-retry" });
-    }
-    if (path === "/v1/client-market/jobs/cleanup-retry") {
-      if (++jobLookupAttempts === 1) return json(route, { message: "temporary job lookup failure" }, 503);
-      return json(route, { id: "cleanup-retry", status: "succeeded", log: "Verified original rental cleanup", phase: "complete", jobType: "cleanup" });
-    }
     if (path === "/v1/notifications") return json(route, { items: [], nextCursor: null, unread: 0, readThrough: null });
     if (path === "/v1/market-wallet") return json(route, { assetCode: "USD", postedUnits: "8640000", availableUnits: "8640000", heldUnits: "0", version: 1 });
     if (path === "/v1/regions") return json(route, []);
@@ -146,7 +136,8 @@ try {
   const switchActor = async next => { actor = next; await page.evaluate(() => window.dispatchEvent(new Event("router-auth-changed"))); };
   if (process.env.TERMINATION_SCREENSHOTS === "1") await mkdir("/tmp/client-termination-review", { recursive: true });
 
-  await goto(); await rowAction().waitFor();
+  await goto();
+  await page.getByRole("article").filter({ hasText: "Online rental fixture" }).getByRole("button", { name: "Handle termination", exact: true }).waitFor();
   assert.equal(await page.getByRole("button", { name: /Termination tasks/ }).count(), 0);
   assert.equal(await page.getByRole("button", { name: "View termination", exact: true }).count(), 0);
   const rgb = await rowAction().evaluate(button => {
@@ -171,7 +162,7 @@ try {
   assert.ok(writes.at(-1).path.endsWith("/waive"));
   await close();
   await switchActor("owner");
-  await page.locator('[data-segment-id="all"]').click(); await open();
+  await open();
   await dialog().getByRole("button", { name: "Decide responsibility", exact: true }).click();
   await dialog().getByLabel("Decision explanation (required)", { exact: true }).fill("Evidence reviewed; all compensation waived.");
   if (process.env.TERMINATION_SCREENSHOTS === "1") await page.screenshot({ path: "/tmp/client-termination-review/owner-decision.png" });
@@ -225,11 +216,12 @@ try {
   assert.equal(await dialog().getByRole("button", { name: "Reduce / waive compensation", exact: true }).count(), 0);
   assert.equal(await dialog().getByRole("button", { name: "Disagree / request Owner decision", exact: true }).count(), 1); await close();
   record = initial({ status: "cleanup_failed", responsibility: "buyer", disputeUsed: false, compensationCapUnits: "0", heldUnits: "0", cleanupConfirmedAt: null });
-  await goto(); await open(); await dialog().getByRole("button", { name: "Retry cleanup", exact: true }).click();
-  await dialog().getByRole("alert").filter({ hasText: "temporary job lookup failure" }).waitFor();
-  await dialog().getByText("Verified original rental cleanup", { exact: true }).waitFor();
-  assert.equal(jobLookupAttempts, 2);
-  assert.equal(writes.filter(write => write.path.endsWith("/provider-cleanup")).length, 1); await close();
+  await goto(); await page.waitForLoadState("networkidle");
+  assert.equal(await rowAction().count(), 0);
+  await page.goto(`${base}/client-market/?terminationId=old-termination`);
+  await loaded(dialog());
+  assert.equal(await dialog().getByRole("button", { name: "Retry cleanup", exact: true }).count(), 0);
+  await close();
 
   dualRole = true; record = initial({ buyerUserId: "provider" }); await goto(); await open();
   await dialog().getByRole("button", { name: /Acting as/ }).click();
@@ -301,11 +293,18 @@ try {
   await page.getByRole("dialog").waitFor({ state: "hidden" });
   assert.equal(await page.getByText("Original rental claim, not the new tenant's issue.", { exact: true }).count(), 0);
   assert.equal(await page.getByRole("button", { name: /Handle termination|Decide termination|View termination/ }).count(), 0);
+  actor = "provider";
+  await page.goto(`${base}/client-market/?terminationId=old-termination&testLocale=en#history`);
+  await loaded(dialog());
+  await switchActor("stranger");
+  await dialog().waitFor({ state: "hidden" });
+  await page.waitForURL(url => url.search === "?testLocale=en" && url.hash === "#history");
+  assert.equal(reads.filter(read => read.actor === "stranger" && read.path === "/v1/client-market/terminations/old-termination").length, 0);
   actor = "buyer"; await goto(); await page.waitForLoadState("networkidle");
   assert.equal(await page.getByRole("button", { name: /Handle termination|Decide termination|View termination/ }).count(), 0);
   actor = null; await goto(); assert.equal(anonymousPrivateReads, 0);
   assert.deepEqual(errors, []);
-  console.log("Client termination browser: action-only red row buttons, no top queue or history buttons, Provider waiver/reply, Owner entry only after escalation, deleted-Host deep links, conflict review, stable edited versions, deadlines, finance holds, cleanup retry, dual roles, trial history, account-switch race, keyboard and four widths in both locales passed; no real operations.");
+  console.log("Client termination browser: action-only red row buttons, no top queue or history buttons, Provider waiver/reply, Owner entry only after escalation, deleted-Host deep links, conflict review, stable edited versions, deadlines, finance holds, automatic workspace cleanup, dual roles, trial history, account-switch race, keyboard and four widths in both locales passed; no real operations.");
 } catch (cause) {
   console.error("Termination browser failure:", (await page?.getByRole("dialog").allTextContents())?.map(text => text.slice(0, 1800)), { writes: writes.slice(-3), reads: reads.slice(-5) });
   if (page && process.env.TERMINATION_SCREENSHOTS === "1") await page.screenshot({ path: "/tmp/client-termination-review/failure.png" });

@@ -339,31 +339,17 @@ fn refresh_effective_selections_tx(
 
     let client_rows = tx
         .prepare(
-            "SELECT alias.market_provider_id, subscription.client_user_id,
-                    MIN(subscription.activated_at), MAX(subscription.activated_at),
-                    MAX(CASE WHEN subscription.daily_rate_minor IS NULL
-                                  AND subscription.cycle_price_minor IS NULL
-                             THEN 250 ELSE 1000 END)
-             FROM client_market_subscriptions subscription
-             JOIN market_provider_aliases alias
-               ON alias.alias_kind = 'host_provider_id'
-              AND alias.alias_value = subscription.provider_id
-             JOIN market_provider_profiles profile
-               ON profile.id = alias.market_provider_id
-             WHERE subscription.activated_at >= ?1
-               AND subscription.activated_at IS NOT NULL
-               AND NOT (
-                    (profile.user_id IS NOT NULL
-                     AND subscription.client_user_id = profile.user_id)
-                    OR lower(trim(subscription.client_owner_email)) =
-                       profile.canonical_email
-                    OR lower(trim(subscription.client_owner_email)) =
-                       lower(trim(subscription.host_owner_email))
-               )
-               AND (subscription.status != 'released'
-                    OR julianday(COALESCE(subscription.released_at, subscription.updated_at))
-                       - julianday(subscription.activated_at) >= 1.0)
-             GROUP BY alias.market_provider_id, subscription.client_user_id",
+            "SELECT profile.id, r.buyer_id,
+                    strftime('%Y-%m-%dT%H:%M:%SZ',MIN(r.activated_at),'unixepoch'),
+                    strftime('%Y-%m-%dT%H:%M:%SZ',MAX(r.activated_at),'unixepoch'),
+                    MAX(CASE WHEN q.cycle_price_minor=0 THEN 250 ELSE 1000 END)
+               FROM online_client_leases r JOIN online_client_quotes q ON q.id=r.quote_id
+               JOIN market_provider_profiles profile ON profile.user_id=r.seller_id
+               JOIN client_market_rental_identities a ON a.installation_id=r.id
+              WHERE r.activated_at>=unixepoch(?1) AND r.buyer_id!=r.seller_id
+                AND lower(trim(r.tenant_email)) NOT IN (profile.canonical_email,lower(trim(a.provider_email)))
+                AND (r.cutoff_at IS NULL OR r.cutoff_at-r.activated_at>=86400)
+              GROUP BY profile.id,r.buyer_id",
         )
         .and_then(|mut statement| {
             statement
@@ -461,11 +447,9 @@ fn candidate_tx(
         .map_err(map_db("read Market Provider Share quality"))?;
     let (online_samples, observed_samples): (i64, i64) = tx
         .query_row(
-            "SELECT COALESCE(SUM(stats.online_samples), 0),
-                    COALESCE(SUM(stats.observed_samples), 0)
-             FROM host_provider_profiles host
-             JOIN host_provider_daily_stats stats ON stats.provider_id = host.provider_id
-             WHERE host.market_provider_id = ?1 AND stats.stat_date >= ?2",
+            "SELECT COALESCE(SUM(p.healthy),0),COUNT(*) FROM online_client_probes p
+               JOIN market_provider_profiles profile ON profile.user_id=p.seller_id
+              WHERE profile.id=?1 AND p.checked_at>=unixepoch(?2)",
             params![profile_id, host_cutoff],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -491,11 +475,9 @@ fn candidate_tx(
                              OR observation.slot_start < unixepoch(window.ends_at))
                   )
                 UNION
-                SELECT stats.stat_date AS observation_day
-                FROM host_provider_profiles host
-                JOIN host_provider_daily_stats stats ON stats.provider_id = host.provider_id
-                WHERE host.market_provider_id = ?1 AND stats.stat_date >= ?3
-                  AND (stats.host_samples > 0 OR stats.observed_samples > 0)
+                SELECT date(p.checked_at,'unixepoch') FROM online_client_probes p
+                JOIN market_provider_profiles profile ON profile.user_id=p.seller_id
+                WHERE profile.id=?1 AND p.checked_at>=unixepoch(?3)
              )",
             params![profile_id, probe_cutoff, host_cutoff],
             |row| row.get(0),
@@ -540,24 +522,11 @@ fn candidate_tx(
         .map_err(map_db("read Market Provider Share fulfillment"))?;
     let (client_success, client_total): (i64, i64) = tx
         .query_row(
-            "SELECT COALESCE(SUM(CASE WHEN job.status = 'succeeded' THEN 1 ELSE 0 END), 0),
-                    COUNT(*)
-             FROM provisioning_jobs job
-             JOIN router_ssh_hosts host ON host.id = job.host_id
-             JOIN market_provider_profiles profile ON profile.id = ?1
-             WHERE lower(trim(COALESCE(NULLIF(job.host_owner_email, ''),
-                                       host.host_owner_email))) = profile.canonical_email
-               AND NOT (
-                    (profile.user_id IS NOT NULL
-                     AND COALESCE(job.client_owner_user_id, '') = profile.user_id)
-                    OR lower(trim(COALESCE(job.client_owner_email, ''))) =
-                       profile.canonical_email
-                    OR lower(trim(COALESCE(job.client_owner_email, ''))) =
-                       lower(trim(COALESCE(NULLIF(job.host_owner_email, ''),
-                                           host.host_owner_email)))
-               )
-               AND job.type = 'create' AND job.status IN ('succeeded', 'failed')
-               AND julianday(job.created_at) >= julianday(?2)",
+            "SELECT COUNT(r.activated_at),COUNT(*)
+               FROM online_client_leases r JOIN market_provider_profiles profile ON profile.user_id=r.seller_id
+               JOIN client_market_rental_identities a ON a.installation_id=r.id
+              WHERE profile.id=?1 AND r.created_at>=unixepoch(?2) AND (r.activated_at IS NOT NULL OR r.released_at IS NOT NULL)
+                AND r.buyer_id!=r.seller_id AND lower(trim(r.tenant_email)) NOT IN (profile.canonical_email,lower(trim(a.provider_email)))",
             params![profile_id, fulfillment_cutoff],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -589,14 +558,9 @@ fn candidate_tx(
         .map_err(map_db("read Market Provider Share breadth"))?;
     let (host_total, idle_hosts, countries): (i64, i64, i64) = tx
         .query_row(
-            "SELECT COUNT(host.id),
-                    COALESCE(SUM(CASE WHEN host.status = 'idle' THEN 1 ELSE 0 END), 0),
-                    COUNT(DISTINCT CASE WHEN host.country_code IS NOT NULL
-                                       THEN host.country_code END)
-             FROM host_provider_profiles provider
-             LEFT JOIN router_ssh_hosts host
-               ON host.provider_id = provider.provider_id AND host.status != 'disabled'
-             WHERE provider.market_provider_id = ?1",
+            "SELECT COUNT(*),COALESCE(SUM(l.supply_status='idle'),0),COUNT(DISTINCT l.country_code)
+               FROM online_client_supply l JOIN market_provider_profiles profile ON profile.user_id=l.seller_id
+              WHERE profile.id=?1 AND l.state='listed'",
             params![profile_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
@@ -761,10 +725,7 @@ fn generate_tx(
                          )
                    )
                    OR EXISTS (
-                       SELECT 1 FROM host_provider_profiles provider
-                       JOIN router_ssh_hosts host ON host.provider_id = provider.provider_id
-                       WHERE provider.market_provider_id = profile.id
-                         AND host.status != 'disabled'
+                       SELECT 1 FROM online_client_supply l WHERE l.seller_id=profile.user_id AND l.state='listed'
                    )
                )
              ORDER BY profile.id",
@@ -1613,224 +1574,51 @@ mod tests {
     }
 
     #[test]
-    fn disabled_client_hosts_are_not_public_supply() {
+    fn only_listed_clients_publish_the_provider_and_probes_count_as_observations() {
         let conn = database();
-        insert_profile(&conn, "mp_disabled_host", None);
-        conn.execute_batch(
-            "INSERT INTO host_provider_profiles (
-                provider_id, owner_email, created_at, updated_at, market_provider_id
-             ) VALUES ('disabled-provider', 'disabled@example.com', 'now', 'now',
-                       'mp_disabled_host');
-             INSERT INTO router_ssh_hosts (
-                id, ip, port, host_owner_email, country_code, status,
-                created_at, updated_at, provider_id
-             ) VALUES ('disabled-host', '203.0.113.30', 22, 'disabled@example.com',
-                       'US', 'disabled', 'now', 'now', 'disabled-provider');",
-        )
-        .expect("seed disabled Client Host");
-        crate::test_support::admit_fixture_hosts(&conn);
-        assert_eq!(
-            generate_conn(&conn, Utc::now()).expect("generate disabled Host supply"),
-            0
-        );
-
-        conn.execute(
-            "UPDATE router_ssh_hosts SET status = 'idle' WHERE id = 'disabled-host'",
-            [],
-        )
-        .expect("enable Client Host");
-        assert_eq!(
-            generate_conn(&conn, Utc::now()).expect("generate enabled Host supply"),
-            1
-        );
-    }
-
-    #[test]
-    fn host_observation_days_require_real_samples() {
-        let conn = database();
-        insert_profile(&conn, "mp_host_days", None);
-        conn.execute(
-            "INSERT INTO host_provider_profiles (
-                provider_id, owner_email, created_at, updated_at, market_provider_id
-             ) VALUES (
-                'host-days', 'host-days@example.com', 'now', 'now', 'mp_host_days'
-             )",
-            [],
-        )
-        .expect("insert Host Provider for observation days");
-        let now = Utc::now();
-        for (stat_date, host_total, observed_samples, host_samples) in [
-            (
-                (now - Duration::days(1)).format("%Y-%m-%d").to_string(),
-                0,
-                0,
-                0,
-            ),
-            (now.format("%Y-%m-%d").to_string(), 1, 0, 1),
-        ] {
-            conn.execute(
-                "INSERT INTO host_provider_daily_stats (
-                    provider_id, stat_date, host_total, idle_total, allocated_total,
-                    external_client_total, online_samples, observed_samples,
-                    anomalous_host_samples, host_samples, updated_at
-                 ) VALUES ('host-days', ?1, ?2, 0, 0, 0, 0, ?3, 0, ?4, 'now')",
-                params![stat_date, host_total, observed_samples, host_samples],
-            )
-            .expect("insert Host Provider daily sample");
-        }
-
-        let tx = conn
-            .transaction()
-            .expect("start Host observation-day transaction");
-        let candidate =
-            candidate_tx(&tx, "mp_host_days", now).expect("calculate Host observation days");
+        insert_profile(&conn, "mp_client", Some("seller"));
+        crate::test_support::online_listing(&conn, "physical", "seller", "seller@example.test");
+        conn.execute("UPDATE online_client_listings SET state='unlisted'", [])
+            .unwrap();
+        assert_eq!(generate_conn(&conn, Utc::now()).unwrap(), 0);
+        conn.execute("UPDATE online_client_listings SET state='listed'", [])
+            .unwrap();
+        assert_eq!(generate_conn(&conn, Utc::now()).unwrap(), 1);
+        let tx = conn.transaction().unwrap();
+        tx.execute("INSERT INTO online_client_probes(installation_id,lease_id,bucket,checked_at,healthy,seller_id)
+            VALUES('physical','',1,unixepoch(),0,'seller')",[]).unwrap();
+        let candidate = candidate_tx(&tx, "mp_client", Utc::now()).unwrap();
         assert_eq!(candidate.signals.observation_days, 1);
-        drop(tx);
     }
 
     #[test]
-    fn client_self_rental_is_not_an_independent_choice() {
+    fn choices_and_fulfillment_use_the_seller_at_checkout_and_exclude_self_rentals() {
         let conn = database();
-        insert_profile(&conn, "mp_client", Some("provider-user"));
-        conn.execute(
-            "UPDATE market_provider_profiles
-             SET canonical_email = 'provider-user@example.com'
-             WHERE id = 'mp_client'",
-            [],
-        )
-        .expect("align Provider canonical email");
-        conn.execute(
-            "INSERT INTO market_provider_aliases (
-                market_provider_id, alias_kind, alias_value, created_at
-             ) VALUES ('mp_client', 'host_provider_id', 'legacy-host-provider', 'now')",
-            [],
-        )
-        .expect("insert Host Provider alias");
-        conn.execute(
-            "INSERT INTO host_provider_profiles (
-                provider_id, owner_email, created_at, updated_at, market_provider_id
-             ) VALUES (
-                'legacy-host-provider', 'provider-user@example.com', 'now', 'now', 'mp_client'
-             )",
-            [],
-        )
-        .expect("insert self-rental Host Provider");
-        conn.execute(
-            "INSERT INTO router_ssh_hosts (
-                id, ip, port, host_owner_email, status, created_at, updated_at, provider_id
-             ) VALUES (
-                'host-self', '203.0.113.10', 22, 'provider-user@example.com',
-                'allocated', 'now', 'now', 'legacy-host-provider'
-             );
-             INSERT INTO provisioning_jobs (
-                id, type, host_id, host_owner_email, client_owner_email,
-                client_owner_user_id, status, created_at, updated_at
-             ) VALUES (
-                'job-self', 'create', 'host-self', 'provider-user@example.com',
-                'provider-user@example.com', NULL, 'succeeded', 'now', 'now'
-             );
-             INSERT INTO router_ssh_hosts (
-                id, ip, port, host_owner_email, status, created_at, updated_at, provider_id
-             ) VALUES (
-                'host-self-email', '203.0.113.11', 22, 'legacy-owner@example.com',
-                'allocated', 'now', 'now', 'legacy-host-provider'
-             );
-             INSERT INTO provisioning_jobs (
-                id, type, host_id, host_owner_email, client_owner_email,
-                client_owner_user_id, status, created_at, updated_at
-             ) VALUES (
-                'job-self-email', 'create', 'host-self-email', 'legacy-owner@example.com',
-                'legacy-owner@example.com', 'legacy-client-id', 'succeeded', 'now', 'now'
-             );",
-            [],
-        )
-        .expect("insert self-rental fulfillment attempt");
-        crate::test_support::admit_fixture_hosts(&conn);
-        let activated_at = (Utc::now() - Duration::hours(1)).to_rfc3339();
-        conn.execute(
-            "INSERT INTO client_market_subscriptions (
-                installation_id, host_id, provider_id, host_owner_email,
-                client_user_id, client_owner_email, status, daily_rate_minor,
-                offer_revision, activated_at, created_at, updated_at
-             ) VALUES ('client-self', 'host-self', 'legacy-host-provider',
-                       'provider-user@example.com', 'legacy-provider-client',
-                       'provider-user@example.com', 'active', 100, 1, ?1, 'now', 'now');
-             INSERT INTO client_market_subscriptions (
-                installation_id, host_id, provider_id, host_owner_email,
-                client_user_id, client_owner_email, status, daily_rate_minor,
-                offer_revision, activated_at, created_at, updated_at
-             ) VALUES ('client-self-email', 'host-self-email', 'legacy-host-provider',
-                       'legacy-owner@example.com', 'legacy-client-id',
-                       'legacy-owner@example.com', 'active', 100, 1, ?1, 'now', 'now')",
-            params![activated_at],
-        )
-        .expect("insert self-rental");
-
+        insert_profile(&conn, "mp_original", Some("seller"));
+        insert_profile(&conn, "mp_next", Some("next-seller"));
+        crate::test_support::online_listing(&conn, "physical", "seller", "seller@example.test");
+        for (id, buyer, email) in [
+            ("by-id", "seller", "other@example.test"),
+            ("by-email", "other", "seller@example.test"),
+            ("external", "buyer", "buyer@example.test"),
+        ] {
+            conn.execute("INSERT INTO online_client_quotes(id,installation_id,buyer_id,revision,cycle_price_minor,projection_json,expires_at)
+                VALUES(?1,'physical',?2,1,0,'{}',0)",params![id,buyer]).unwrap();
+            conn.execute("INSERT INTO online_client_leases(id,installation_id,quote_id,buyer_id,tenant_email,seller_id,alias,state,sequence,grant_until,created_at,activated_at,cutoff_at,released_at)
+                VALUES(?1,'physical',?1,?2,?3,'seller',?1,'released',2,unixepoch(),unixepoch()-90000,unixepoch()-90000,unixepoch(),unixepoch())",
+                params![id,buyer,email]).unwrap();
+        }
+        conn.execute("UPDATE online_client_listings SET seller_id='next-seller',owner_email='next@example.test'",[]).unwrap();
+        let tx = conn.transaction().unwrap();
         let now = Utc::now();
-        let tx = conn.transaction().expect("start self-rental transaction");
-        refresh_effective_selections_tx(&tx, now).expect("refresh self-rental choices");
-        let selection_count: i64 = tx
-            .query_row(
-                "SELECT COUNT(*) FROM market_provider_effective_selections",
-                [],
-                |row| row.get(0),
-            )
-            .expect("count self-rental choices");
-        assert_eq!(selection_count, 0);
-        let candidate = candidate_tx(&tx, "mp_client", now).expect("calculate self-rental rank");
-        let metrics: serde_json::Value =
-            serde_json::from_str(&candidate.metrics_json).expect("decode self-rental metrics");
-        assert_eq!(metrics["fulfillmentSuccesses"], 0);
-        assert_eq!(metrics["fulfillmentTotal"], 0);
-        drop(tx);
-    }
-
-    #[test]
-    fn client_fulfillment_stays_with_the_job_time_host_owner() {
-        let conn = database();
-        insert_profile(&conn, "mp_old_host_owner", None);
-        insert_profile(&conn, "mp_new_host_owner", None);
-        conn.execute_batch(
-            "UPDATE market_provider_profiles
-             SET canonical_email = 'old-owner@example.com'
-             WHERE id = 'mp_old_host_owner';
-             UPDATE market_provider_profiles
-             SET canonical_email = 'new-owner@example.com'
-             WHERE id = 'mp_new_host_owner';
-             INSERT INTO host_provider_profiles (
-                provider_id, owner_email, created_at, updated_at, market_provider_id
-             ) VALUES ('current-host-provider', 'new-owner@example.com', 'now', 'now',
-                       'mp_new_host_owner');
-             INSERT INTO router_ssh_hosts (
-                id, ip, port, host_owner_email, status, created_at, updated_at, provider_id
-             ) VALUES ('transferred-host', '203.0.113.20', 22,
-                       'new-owner@example.com', 'allocated', 'now', 'now',
-                       'current-host-provider');
-             INSERT INTO provisioning_jobs (
-                id, type, host_id, host_owner_email, client_owner_email,
-                client_owner_user_id, status, created_at, updated_at
-             ) VALUES ('job-before-transfer', 'create', 'transferred-host',
-                       'old-owner@example.com', 'buyer@example.com', 'buyer',
-                       'succeeded', 'now', 'now');",
-        )
-        .expect("seed transferred Client Host history");
-        crate::test_support::admit_fixture_hosts(&conn);
-
-        let now = Utc::now();
-        let tx = conn
-            .transaction()
-            .expect("start transferred Host transaction");
-        let old = candidate_tx(&tx, "mp_old_host_owner", now).expect("calculate old Host owner");
-        let new = candidate_tx(&tx, "mp_new_host_owner", now).expect("calculate new Host owner");
-        let old_metrics: serde_json::Value =
-            serde_json::from_str(&old.metrics_json).expect("decode old Host metrics");
-        let new_metrics: serde_json::Value =
-            serde_json::from_str(&new.metrics_json).expect("decode new Host metrics");
-        assert_eq!(old_metrics["fulfillmentSuccesses"], 1);
-        assert_eq!(old_metrics["fulfillmentTotal"], 1);
-        assert_eq!(new_metrics["fulfillmentSuccesses"], 0);
-        assert_eq!(new_metrics["fulfillmentTotal"], 0);
-        drop(tx);
+        refresh_effective_selections_tx(&tx, now).unwrap();
+        assert_eq!(tx.query_row("SELECT buyer_user_id FROM market_provider_effective_selections WHERE market_provider_id='mp_original'",[],|r|r.get::<_,String>(0)).unwrap(),"buyer");
+        for (profile, count) in [("mp_original", 1), ("mp_next", 0)] {
+            let candidate = candidate_tx(&tx, profile, now).unwrap();
+            let metrics: serde_json::Value = serde_json::from_str(&candidate.metrics_json).unwrap();
+            assert_eq!(metrics["fulfillmentSuccesses"], count);
+            assert_eq!(metrics["fulfillmentTotal"], count);
+        }
     }
 
     #[test]

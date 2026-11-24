@@ -44,7 +44,7 @@ fn fixture_with_rate(price: i64, terms: bool, trial: i64, rate: i64) -> (Connect
         &PrepareContract {
             trial_only: false,
             product_kind: "client_host",
-            product_ref: "job",
+            product_ref: INSTALL,
             trial_scope_ref: HOST,
             quote_id: "quote",
             buyer_user_id: "buyer",
@@ -59,11 +59,12 @@ fn fixture_with_rate(price: i64, terms: bool, trial: i64, rate: i64) -> (Connect
         START,
     )
     .unwrap();
-    contracts::bind_client_installation_tx(&conn, &id, "job", INSTALL, "buyer", "provider", START)
-        .unwrap();
-    conn.execute("INSERT INTO client_market_subscriptions (installation_id,host_id,provider_id,host_owner_email,
-        client_user_id,client_owner_email,status,currency,offer_revision,activated_at,created_at,updated_at,platform_contract_id)
-        VALUES (?1,?2,'provider','provider@example.test','buyer','buyer@example.test','active','USD',1,?3,?3,?3,?4)",params![INSTALL,HOST,START,id]).unwrap();
+    contracts::bind_client_installation_tx(
+        &conn, &id, INSTALL, INSTALL, "buyer", "provider", START,
+    )
+    .unwrap();
+    crate::test_support::online_listing(&conn, HOST, "provider", "provider@example.test");
+    crate::test_support::online_lease(&conn, INSTALL, HOST, "provider", "buyer", START);
     contracts::activate_contract_tx(&conn, &id, START, START).unwrap();
     (conn, id)
 }
@@ -526,7 +527,7 @@ fn financial_recovery_does_not_take_away_the_providers_right_to_respond_without_
     )
     .unwrap();
     conn.execute(
-        "UPDATE client_market_subscriptions SET status='released' WHERE installation_id=?1",
+        "UPDATE online_client_leases SET state='released',released_at=unixepoch() WHERE id=?1",
         params![INSTALL],
     )
     .unwrap();
@@ -1102,7 +1103,7 @@ fn resource_release_survives_financial_exception_and_recovers_from_receipt() {
     assert_eq!(t.status, "finance_pending");
     assert!(t.cleanup_confirmed_at.is_some());
     conn.execute(
-        "UPDATE client_market_subscriptions SET status='released' WHERE installation_id=?1",
+        "UPDATE online_client_leases SET state='released',released_at=unixepoch() WHERE id=?1",
         params![INSTALL],
     )
     .unwrap();
@@ -1223,9 +1224,8 @@ fn later_period_freezes_new_terms_but_a_pre_upgrade_backlog_has_no_fee() {
 #[test]
 fn free_rental_cleanup_never_creates_or_debits_wallet_money() {
     let conn = crate::test_support::database().unwrap();
-    conn.execute("INSERT INTO client_market_subscriptions (installation_id,host_id,provider_id,host_owner_email,
-        client_user_id,client_owner_email,status,offer_revision,created_at,updated_at)
-        VALUES (?1,?2,'provider','provider@example.test','buyer','buyer@example.test','active',1,?3,?3)",params![INSTALL,HOST,START]).unwrap();
+    crate::test_support::online_listing(&conn, HOST, "provider", "provider@example.test");
+    crate::test_support::online_lease(&conn, INSTALL, HOST, "provider", "buyer", START);
     accept(&conn, START, "voluntary");
     record_cleanup_confirmed_tx(&conn, INSTALL, HOST, START).unwrap();
     let t = read_tx(&conn, INSTALL).unwrap().unwrap();
@@ -1378,7 +1378,7 @@ fn wallet_projection_failure_defers_money_but_preserves_physical_cleanup_and_pri
     )
     .unwrap();
     conn.execute(
-        "UPDATE client_market_subscriptions SET status='released' WHERE installation_id=?1",
+        "UPDATE online_client_leases SET state='released',released_at=unixepoch() WHERE id=?1",
         params![INSTALL],
     )
     .unwrap();

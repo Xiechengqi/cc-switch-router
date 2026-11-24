@@ -351,6 +351,10 @@ Server 要求:
 
 `managedGrant.termination={terminationId,cutoffAtMs,periodStartMs,periodEndMs,policy}`，policy 是原租约冻结的执行额度，而非管理员当前展示价目；只允许 revoke，满足 `0 <= periodStartMs <= cutoffAtMs <= periodEndMs`。Server 先持久化原 entitlement 撤权，并保留 pending ACK 标记，直到原操作的成功 ACK 被 Router 接收。
 
+带 `terminationId` 的撤权通过待处理编辑投递。Server 通过签名的 `POST /v1/shares/edit-ack` 交付最终消费回执。历史编辑若已标为 applied 但缺少回执，Router 会再次投递原编辑，保留相同的操作 ID 和截止时间。父 Client 租约等所有子车位完成撤权和结算后才清理工作区。
+
+父租约的退租记录保留原截止时间。计算子车位的回执时，将该时间限制在车位自身的付费周期内。若父租约在车位付费开始的同一秒结束，子车位可能只有零长度的已服务区间。
+
 applied ACK 必须带 `terminationReceipt={terminationId,entitlementId,shareId,email,operationId,cutoffAtMs,periodStartMs,periodEndMs,revokedAtMs,archiveSinceMs,quotaUsedBeforePeriod,windows}`。`windows=[{startsAtMs,endsAtMs,used}]` 是不重叠且排序的执行额度窗口；累计额度使用付费周期边界。`used`、`quotaUsedBeforePeriod` 均为规范十进制字符串：Token 模式为数量，美元模式为已结算 USD picos，**都不是钱包金额**。前者只汇总本周期截止前正式付费的请求，后者是更早付费请求的累计消耗，用于累计额度的期初剩余额度。
 
 独立归档保留每次 admission 的 request、原 entitlement、邮箱、阶段、开始时间、修订及最终状态，不依赖有限展示日志或 Share 内 35 天保留窗口。必须排空所有原 entitlement 的请求，包括试用和截止附近竞态；USD 读取执行 ledger 的全部已结算尝试，缺价格／未结算／不确定不能当作零。只有具备最终失败且零消费凭据的未执行请求才能证明零值。
@@ -404,13 +408,34 @@ Server 发出最终 applied ACK 前须将其写入绑定原 Router URL／install
 
 免费和付费拼车位都可通过 `serviceDurationDays` 设置 `1..=365` 天固定服务期限；省略或传 `null` 表示无固定期限。`tokenLimit` 与 `valueQuota` 均省略时 Router 忽略提交的 `tokenPeriod` 并归一为 `lifetime`；只有设置 Token 限额或美元等值额度时才校验该 Server 支持的周期。报价参数在租用时冻结到 Subscription；固定期限从 Server 首次应用该 managed grant 时开始计算：Router 只下发相对的 `durationSeconds`，Server 以 `appliedAtMs + durationSeconds` 写入绝对 `expiresAt`，Router 在 edit-ack 中校验一致后冻结到 Subscription。授权下发前的等待不消耗期限，账单暂停不顺延。Router 在到期前 24 小时写入一次 `service_term_expiring`，到期后终止付费合约并根据控制操作是否可能已送达选择直接释放或安全 revoke；付费尾段会精确结算到 `expiresAt`，账务与 Share worker 的先后顺序既不会漏计也不会越界计费。`grant_pending`、活跃、账单暂停、恢复中及控制失败状态均不得在到期后重新获得访问，回收失败时也不会把座位提前恢复为可租。
 
-### Client Market 钱包购买与展示契约
+### 在线 Client Market 购买与控制协议
 
-- `POST /v1/client-market/quotes` 的每项返回 `trialSecondsRemaining`（实际剩余健康服务秒数）；`walletFunding` 的金额字段使用整数单位字符串，`fundingRail=platform_wallet` 才可进入新的付费购买界面。免费报价可无钱包字段。报价只预留资源，不冻结用户资金。
-- `POST /v1/client-market/quotes/:id/commit` 保留报价修订校验与幂等键；所有付费订单（含试用）须有完整首期可用余额，试用不预留资金，非试用在提交事务中预留当期金额。资金竞争返回 `409 / MARKET_WALLET_REQUIRED` 及资金摘要，调用方保留草稿、重新报价并由用户确认。网络错误或结果未知时重试同一请求及幂等键，不能换单重建。
-- Client 租约读取接口向租客返回可选 `walletContract`：`id`、`status`、`trialSecondsRemaining`、`renewalPolicy`、`periodEnd`；不向 Host Provider 暴露买家私有合同投影。试用没有确定的墙钟结束时间。独立的 `walletContractId` 仍仅用于已开始付费的争议入口，不用于判断试用合同是否存在。
-- `GET/PUT /v1/market-wallet/contracts/:id/renewal` 为买家专属月租管理接口，读取包含剩余试用；更新携带 `expectedPolicy` 防止覆盖其他会话的修改。
-- 商品页不展示 Provider 收款方式；平台充值渠道只在钱包充值流程出现。充值返回时重新报价，不自动购买；密码不得通过 URL 或持久化草稿传递。
+公开库存使用 `GET /v1/client-market/online/listings`。有登录态的卖家在 `POST /v1/client-market/online/installations/:id/listing` 提交 `cyclePriceMinor`（USD 分）、可选 `freeDays`、`trialDays` 和 `acknowledged`。同一路径的 DELETE 发起下架。返回 `locking` 或 `unlocking` 表示意图已记录，最终状态通过库存读取。出口探测以一次性 challenge 向 Router 回调，过期、复用和与上架项不匹配的回调均无效。
+
+买家带上架项 `revision` 和 `autoRenew` 请求 `POST /v1/client-market/online/installations/:id/quote`，在 120 秒内用 `POST /v1/client-market/online/quotes/:id/commit` 确认告知。报价不占库存，提交时重新检查准入、库存、版本与钱包。付费报价冻结首期供应商佣金。报价后试用额度重置或剩余时长改变，首次提交返回 409，买家需重新报价。已成交的报价仅供原买家重放，返回原 `leaseId` 与当前状态。
+
+新租约的初始状态为 `starting`。工作区就绪后进入 `active`。租户通过 `GET /v1/client-market/online/leases` 读取域名、授权到期时间与访问记录。窗口票据的目标是本次 `leaseId`，每次验证买家身份、域名版本、租约状态及有效期。租户的 Share 位于 `{slug}--{leaseAlias}`，由当前工作区账号持有。
+
+卖家登录后可通过 `GET /v1/client-market/online/seller-inventory` 查看当前上架项和自己售出的租约。响应的 `items` 包含 ID、名称、状态、月价、租户邮箱和授权到期时间。历史租约保留原成交价格和双方身份。`listingId` 指向该卖家仍可管理的上架项。响应使用 `Cache-Control: private, no-store`。
+
+退租先调用 `POST /v1/client-market/clients/:leaseId/termination-preview`，再向 `POST /v1/client-market/online/leases/:leaseId/end` 提交 `{previewId,reason,claim}`。回执中的 `terminationId` 定位唯一的赔付、争议和审计记录。确认后公网访问立即失效；处于 `ending`、`cleaning` 的 installation 继续被原租约占用。历史事件和回执保留，Client 证明已恢复 owner 工作区后才能再租。
+
+Client 在 installation 心跳中声明 `marketLeaseV1: true`。Router 通过绑定 installation 的 HMAC 通道发送以下 POST 请求。
+
+| 路径 | 输入和结果 |
+|---|---|
+| `/_ctl/market/check` | `{challenge}`。检查工作区和 Share 状态，经业务出站代理回报出口，返回硬件与版本。 |
+| `/_ctl/market/command` | `{sequence,action}`。操作为 `list`、`unlist`、`begin`、`extend`、`fence`、`clean` 或 `cancel`。begin 的 grant 包含 `leaseId,tenantEmail,alias,expiresAt`。完全相同的命令可重放，每个 installation 拒绝落后或同序号冲突的命令。 |
+| `/_ctl/market/status` | 返回 `sequence,listedOwner,grant,runningLease,switching,fenced,cleanupSafe,events` 和版本。Router 可按 leaseId 确认已持久化的访问事件，可传 `hardware: true` 刷新资源。 |
+| `/_ctl/market/upgrade`、`/_ctl/market/upgrade-status` | 前者接受 `ownerEmail,restartAfter` 并返回 `taskId`，需要安装方启用升级委托，仅使用 Server 配置的 release 来源。后者接受 `ownerEmail,taskId`，仅返回该次升级的状态。两者均校验 installation owner；Client 已记录上架 owner 时两者必须一致，因此上架或下架指令在途时也可使用。 |
+
+租户工作区启动后，Client 发往 Router 的签名请求使用 `lease_<leaseId>_<32位随机十六进制串>` 作为 nonce。下划线符合 installation 请求已有的 8–128 个 ASCII 字母、数字、连字符和下划线约束。Router 用租约 ID 核对请求所属工作区，原工作区的延迟请求不能修改下一份租约的 Share。
+
+Router 每五分钟主动探测，在 UTC 自然小时的 12 个时段里取得至少 10 个成功才将整小时计为可用。首尾按相交时段的 5/6 向上取整，缺失样本计失败。服务在某个时段中途开始或结束、而该时段的探测落在窗口之外时，这个时段既不计成功也不计入分母；窗口短于一个时段时沿用最近一次探测结果。弱网或离线时保留清理意图；Client 在本地授权到期时独立封锁访问。Server、账务和公网路由均使用 Unix 秒的授权截止时间。
+
+开启自动续费的付费月租，授权截止时间为本期结束后再加 2 小时，用于完成续费扣款并下发 `extend`；续费失败或已关闭自动续费时，合约状态变化会立即结束租约。退租截止 24 小时后，若第三方车位已结清而 Client 仍未交回清理回执，Router 先按原规则完成退款或解冻，退租事件记为 `settled_without_cleanup`；上架项仍保持占用，直到 Client 交回清理回执。
+
+`GET /v1/client-market/online/listings` 只向卖家本人返回物理子域名和完整出口 IP；其他访问者看到的 `label` 为 `client-<installation 前 8 位>`，`egressIp` 隐去最后一段。
 
 ### 7.2 Share / Client Market 统一准入
 
@@ -1051,52 +1076,3 @@ v14 由 `shareGrantCapabilitiesV1` 协商。Server 对具名授权保存批准�
 管理者在请求详情按需读取 `POST /v1/shares/:share_id/request-metering` 或独立域名下 `POST /share-api/share/request-metering`，输入 `{requestId}`。结果绑定 Share、安装实例及尝试，并使用 private/no-store。授权预览不读取请求记录。
 
 发布先提供 v14 Router reader，再升级 Server 的权威 SQLite schema 10。旧具名有效操作只迁移已有证据的入口，公开权限不会继承。先在副本核对权限差集、旧合同、已用额度和在途回执，再恢复真实流量。
-
-## 托管 Host 小时健康报告 v1
-
-独立服务 `cc-switch-host-standby standby run` 在空闲和租用期间持续运行，向 `POST /v1/client-market/host-heartbeats` 发送 HTTPS 请求。Router 先部署，再安装 `version --json` 声明 `hostHealthProtocolVersion=1` 的 Server Release。
-
-### 请求、签名和时间
-
-原始 UTF-8 JSON 最多 8 KiB。五个头为 `X-CC-Report-Version`、`X-CC-Host-Id`、`X-CC-Machine-Epoch`、`X-CC-Key-Generation`、`X-CC-Report-Signature`。版本为十进制 1，身份和版本与正文一致，签名用无填充 base64url。
-
-Ed25519 输入是 UTF-8 域 `cc-switch-host-health/report/v1\n` 加原始正文 SHA-256 的 32 字节摘要，换行为 LF。两仓消费相同的原始正文、公钥和期望签名。[固定测试向量](tests/fixtures/host-health-v1.json)
-
-正文固定含 `reportVersion`、`hostId`、`machineEpoch`、`keyGeneration`、`utcHour`、`sampledAt`、`buildVersion`、`snapshot`。时间为 RFC 3339 UTC，`utcHour=floor(unixSeconds/3600)`。快照含 `os`、`arch`、`effectiveVcpu`、`memoryTotalBytes`、`memoryAvailableBytes`、`dataVolumeTotalBytes`、`dataVolumeAvailableBytes`、`cpuUsagePct`。架构为 `x86_64` 或 `aarch64`。容量用字节，vCPU 保留小数，CPU 用 0–100%。
-
-各数值字段使用 `{"value":数字或null,"unknownReason":字符串或null}`，两个键均须存在。已知值的原因填 null，未知原因可为 `scope_unverified`、`unavailable`、`counter_reset`，服务端裁剪还可返回 `private` 或 `expired`。身份、系统、架构及完整快照合法即可完成首报准入，未知容量在市场明示。
-
-排程取 `SHA-256("cc-switch-host-health/schedule/v1\n" + hostId + "\n" + decimal(utcHour))` 前八字节为无符号大端整数，对 3600 取模。Host `host-fixture` 在小时 4 得到偏移 3592 秒。新 Host 首报在就绪所在自然小时剩余时间内随机并持久保存，替代该小时常规排程。
-
-发送前持久记下已尝试 H，每 Host 每 UTC 小时至多一次主动 POST，关闭自动重试和重定向。接收窗口为 `[max(小时开始,dueAt−120秒),dueAt+300秒]`。10:59:59 发出的 10 点报告，11:00:01 收到仍归 10 点。接收宽限不延长发送期。时钟恢复保留已尝试时段。
-
-| HTTP | code | 含义 |
-|---|---|---|
-| 200 | accepted | 有效写入或同一时段同内容确认，保留首次接收时间 |
-| 400 | invalid_report / invalid_identity / unsupported_report_version | 非法报告或不支持的版本 |
-| 401 | invalid_signature / invalid_binding | 签名或绑定不符 |
-| 409 | hour_conflict | 同一 `(hostId,utcHour)` 内容冲突，保留首份并记录事件 |
-| 410 | host_agent_revoked | 验证原凭据后明确撤销，回显 Host、机器代次、凭据代次，三项匹配本代才停用 |
-| 413 | report_too_large | 原始正文超限 |
-| 422 | report_outside_window | 首次写入超窗或采样时间非法 |
-| 429 / 5xx | 临时故障 | 等下一时段，无补发 |
-
-Router 协议响应带 `routerTime`，已认证且结构有效的请求同时回显 `hostId`、`machineEpoch`、`keyGeneration`、`utcHour`。发送方只用四项均与当前请求匹配的可信响应校准后续时间基准；明确撤销也须匹配本次小时及本代身份才停用。未知 Host、普通 404、未知版本及迟到旧代响应保留后续排程。新钥经受信 SSH 上的持钥证明激活，小时额度跨凭据与机器代次保留。
-
-### 投影、准入和维护
-
-列表 `GET /v1/client-market/hosts` 和报价项共用 `hostHealth`，包含状态、绝对时间、24 小时收到／可观测计数、连续缺报、启动方式和裁剪后的快照。创建报价时冻结买家公开级投影。`GET /v1/client-market/hosts/:id/health` 按需返回当前代最多 7 天的小时记录和授权样本。状态即时更新，计数按各小时接收截止时刻推进，已知接收中断的无样本时段排除分母。
-
-摘要还包含 `machineEpoch` 和 `deployment={state,reason,canBootstrap,deployedCommit}`。部署状态为 `not_enabled`、`queued`、`installing`、`failed`、`awaiting_first`、`active`、`paused`；无报告时主健康状态相应为 `not_enabled`、`deploying`、`deployment_failed`、`awaiting_first`／`first_overdue` 或 `revoked`。已收到报告后的新鲜度仍遵守原有小时规则。没有公钥或首报排程时不可声称在等待首报，零个可观测小时不伪造 `0/0` 或满分记录。`canBootstrap` 仅对当前 Host owner 及符合当前租约、机器／密钥代次的首次接入上下文为真；公开投影固定为 false。
-
-租中报告继续计入上报记录。只有可证为空闲的动态资源可公开，租户只读本人当前租约的用量。跨租约或时钟归属不明时隐藏动态字段，清理租约后仍保留占用区间用于保护迟到报告。
-
-供应商调用 `POST /v1/client-market/hosts/:id/health/retry` 重试准备或维护，调用 `/health/rotate-key` 排队轮换（提交 `compromised=true` 会先立即撤销），调用 `/health/replace` 并提交 `expectedMachineEpoch` 排队确认物理换机。换机先关闭库存并撤销，旧发送方停止后新代从下一完整小时首报。删除先撤销，再按可信归属卸载。
-
-已出租存量 Host 的首次监测接入使用 `POST /v1/client-market/hosts/:id/health/bootstrap`，严格接收 `{expectedInstallationId,expectedMachineEpoch}`。必须为 Host owner；Host 当前为 `allocated`、租约为 `active`／`billing_suspended`、本代尚未首报且保留存量标记，没有撤销、换机、重新准入、轮换或开通任务。已有公钥只允许同一接入任务恢复。上下文不符返回 409，非 owner 返回 403；同一上下文重复入队幂等返回 200 `{queued:true}`，不代表已完成安装或收到报告。
-
-接入任务通过迁移 125 独立持久化，和空闲维护共享 SSH 并发限制、Host 锁及动作序号。每个远端阶段前后复核当前租约与身份，退租、换绑或 owner 变更取消 owner 发起的任务；撤销／换代取消旧任务。失败保留诊断，间隔 15 分钟、最多自动尝试三次，owner 可显式重试。接入不执行包管理器，不改租用状态、租约、订单或账务，也不替换／重启租户 `serve`；重试保留同代密钥及已交付首报排程，不补发小时报告。常规升级和换机仍遵守空闲维护限制。
-
-部署运维可在 Router 所在主机执行 `cc-switch-router host-health bootstrap --host-id ID --expected-installation-id ID --expected-machine-epoch N [--env-file PATH]`。命令仅通过现有 0600 管理 socket，由 root 或 Router UID 在在线进程内完成同样的上下文校验与入队；没有直接数据库写入或离线回退。运维任务不以某个市场用户的 owner 身份授权，但仍固定租约和机器上下文，仍不能跨租约执行。
-
-Host 从 `onboarding` 开始，经本代首报转 `idle`。维护与报价竞争 `idle→maintaining` 和 `idle→reserved`，远端维护、换机和安装共用锁与动作序号。支持 systemd、活动 OpenRC，以及作为容器 PID 1 运行且配置目录为 `/etc/supervisor/conf.d` 的 SupervisorD；仅检测到后台 SupervisorD 不能证明重启恢复，按 nohup 降级处理。降级环境在买家主行和报价提示未配置开机自启。[设计与验收计划](docs/client-market-host-health-plan.md)

@@ -9,7 +9,6 @@ import { useClientChat } from "@/components/chat/client-chat";
 import { ExpandableRecordTable, RecordDetailList, type RecordTableColumn } from "@/components/common/expandable-record-table";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ClientTerminationDialog } from "@/components/market/client-termination-dialog";
-import { ClientMarketRentalBanner } from "@/components/dashboard/client-market-rental-banner";
 import { MarketWalletRenewalCard } from "@/components/dashboard/market-wallet-renewal-card";
 import { MarketServiceDisputeControl } from "@/components/dashboard/market-service-dispute-control";
 import { ApiError } from "@/lib/api";
@@ -117,7 +116,7 @@ function RentalSection({ view, focusKey, revision, onChanged, onTerminationOpen 
   const money = (value: string) => formatWalletUnits(value, "$", locale);
   const date = (value: string | null) => value ? new Intl.DateTimeFormat(locale, { dateStyle: "short", timeStyle: "short" }).format(new Date(value)) : "—";
   const columns: RecordTableColumn<ClientRentalRecord>[] = [
-    { id: "client", header: "Client", cell: row => <div className="grid min-w-0 gap-0.5"><span className="truncate font-medium" title={clientRentalLabel(row)}>{clientRentalLabel(row)}</span><span className="truncate text-xs text-muted-foreground md:hidden">{row.providerEmail || "—"}</span></div> },
+    { id: "client", header: t("online.clientColumn"), cell: row => <div className="grid min-w-0 gap-0.5"><span className="truncate font-medium" title={clientRentalLabel(row)}>{clientRentalLabel(row)}</span><span className="truncate text-xs text-muted-foreground md:hidden">{row.providerEmail || "—"}</span></div> },
     { id: "provider", header: t("account.market.col.provider"), minWidth: "md", cell: row => <span className="block truncate text-muted-foreground" title={row.providerEmail || undefined}>{row.providerEmail || "—"}</span> },
     { id: "status", header: t("account.market.col.status"), className: "w-20 sm:w-40", cell: row => <div className="grid gap-0.5"><span className="truncate">{t(row.status === "free" ? "shareMarket.free" : `rentalAudit.status.${row.status}`)}</span>{row.attention !== "none" ? <span className="truncate text-xs text-amber-800" title={t(`rentalAudit.attention.${row.attention}`)}>{t(`rentalAudit.attention.${row.attention}`)}</span> : null}</div> },
     ...(view === "history" ? [
@@ -194,7 +193,7 @@ function RentalDetail({ id, refreshKey, onChanged, onTerminationOpen, onForbidde
     {detail && row ? <>
       <RecordDetailList items={[
         { label: t("clientRentals.recordId"), value: <span className="break-all">{row.id}</span> },
-        { label: "Client", value: <span className="break-all">{clientRentalLabel(row)}</span> },
+        { label: t("online.clientColumn"), value: <span className="break-all">{clientRentalLabel(row)}</span> },
         { label: t("account.market.col.provider"), value: row.providerEmail || "—" },
         { label: t("rentalAudit.created"), value: date(row.createdAt) }, { label: t("rentalAudit.activated"), value: date(row.activatedAt) },
         { label: t("rentalAudit.ended"), value: date(row.endedAt) }, { label: t("rentalAudit.cleanupAt"), value: date(row.cleanupConfirmedAt) },
@@ -215,10 +214,9 @@ function RentalDetail({ id, refreshKey, onChanged, onTerminationOpen, onForbidde
         { label: t("rentalAudit.compensationUnits"), value: money(detail.settlement.compensationUnits) },
       ]} />{row.terminationId ? <Button variant="outline" size="sm" className="justify-self-start" onPress={() => onTerminationOpen(row.terminationId!)}>{t("clientRentals.discussion")}</Button> : null}</section> : null}
       {rental && row.group === "current" ? <>
-        <ClientMarketRentalBanner rental={rental} readOnly onChanged={changed} showManageLink={false} />
-        {rental.cyclePriceMinor != null && row.contractId ? <MarketWalletRenewalCard contractId={row.contractId} refreshKey={JSON.stringify(rental.walletContract)} compact onChanged={changed} /> : null}
-        {rental.walletContractId ? <MarketServiceDisputeControl contractId={rental.walletContractId} initiallyOpen={rental.openWalletDispute} onChanged={changed} /> : null}
-        <Link className="justify-self-start text-sm text-accent hover:underline" href={clientMarketMineHref(rental.installationId)}>{t("account.client.manageInMarket")}</Link>
+        {row.cyclePriceMinor != null && row.contractId ? <MarketWalletRenewalCard contractId={row.contractId} refreshKey={JSON.stringify([row.contractStatus, row.renewalPolicy, row.periodEnd, row.trialSecondsRemaining])} compact onChanged={changed} /> : null}
+        {rental.canDispute && rental.contractId ? <MarketServiceDisputeControl contractId={rental.contractId} initiallyOpen={rental.openDispute} onChanged={changed} /> : null}
+        <Link className="inline-flex min-h-11 items-center justify-self-start rounded text-sm text-accent hover:underline focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2" href={clientMarketMineHref(rental.leaseId)}>{t("account.client.manageInMarket")}</Link>
       </> : null}
       <details className="min-w-0 rounded-lg border border-border p-3"><summary className="cursor-pointer text-sm font-medium">{t("rentalAudit.periods")}</summary><div className="mt-3 grid gap-2 text-xs">{detail.periods.length ? detail.periods.map(p => <div key={p.id} className="grid gap-1 border-t border-border pt-2"><strong>{t("rentalAudit.period", { sequence: p.sequence })}</strong><span>{date(p.startedAt)} → {date(p.endedAt)}</span><span>{t("clientRentals.periodAmount", { amount: money(p.amountUnits), returned: money(p.returnedUnits) })}</span></div>) : <p className="text-muted-foreground">{t("rentalAudit.noPeriods")}</p>}{detail.periodsNextCursor !== null ? <Button size="sm" variant="ghost" isDisabled={busy} onPress={() => void load("periods")}>{t("rentalAudit.morePeriods")}</Button> : null}</div></details>
       <details className="min-w-0 rounded-lg border border-border p-3"><summary className="cursor-pointer text-sm font-medium">{t("rentalAudit.events")}</summary><ol className="mt-3 grid gap-2 text-xs">{detail.events.map(event => {

@@ -17,7 +17,7 @@ test("market origin remains visible without private rental access", () => {
   assert.doesNotMatch(html, /href=/);
 });
 
-test("renter and Provider links use the market's focused mine view", () => {
+test("renter and Provider links use the focused online market card", () => {
   for (const [role, label] of [["client", "Manage rental"], ["provider", "Manage Host"]] as const) {
     const html = renderToStaticMarkup(
       <LocaleProvider>
@@ -29,6 +29,6 @@ test("renter and Provider links use the market's focused mine view", () => {
     );
     assert.match(html, /Long offline/);
     assert.match(html, new RegExp(label));
-    assert.match(html, /href="\/client-market\/\?tab=mine&amp;focus=client-1"/);
+    assert.match(html, /href="\/client-market\/\?focus=client-1"/);
   }
 });

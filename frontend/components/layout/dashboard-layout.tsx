@@ -8,11 +8,6 @@ import { OperationVerificationProvider } from "@/components/dashboard/operation-
 import { useDashboardData } from "@/components/dashboard/dashboard-data";
 import { DashboardViewStateProvider } from "@/components/dashboard/dashboard-view-state";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import {
-  WebTerminalDock,
-  WebTerminalManagerProvider,
-  WebTerminalWindowLayer,
-} from "@/components/dashboard/web-terminal";
 
 export function DashboardLayout({ children }: { children: React.ReactNode }) {
   const { data, stale, error, loading, refreshing } = useDashboardData();
@@ -27,21 +22,17 @@ export function DashboardLayout({ children }: { children: React.ReactNode }) {
       <DashboardViewStateProvider>
         <OperationVerificationProvider data={verifiedData}>
           <ClientConsoleManagerProvider>
-            <WebTerminalManagerProvider>
-              <ClientChatProvider>
-                <div className="flex flex-1 flex-col" aria-busy={loading || refreshing}>
-                  <div className="sr-only" role="status" aria-live="polite">
-                    {loading ? t("common.loading") : error}
-                  </div>
-                  <div className="flex-1">{children}</div>
-                  <PresenceFooter />
+            <ClientChatProvider>
+              <div className="flex flex-1 flex-col" aria-busy={loading || refreshing}>
+                <div className="sr-only" role="status" aria-live="polite">
+                  {loading ? t("common.loading") : error}
                 </div>
-                <ClientConsoleWindowLayer />
-                <ClientConsoleDock />
-                <WebTerminalWindowLayer />
-                <WebTerminalDock />
-              </ClientChatProvider>
-            </WebTerminalManagerProvider>
+                <div className="flex-1">{children}</div>
+                <PresenceFooter />
+              </div>
+              <ClientConsoleWindowLayer />
+              <ClientConsoleDock />
+            </ClientChatProvider>
           </ClientConsoleManagerProvider>
         </OperationVerificationProvider>
       </DashboardViewStateProvider>

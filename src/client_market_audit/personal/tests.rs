@@ -37,7 +37,10 @@ fn personal_history_scopes_every_page_and_survives_deleted_hosts() {
     for n in 0..23 {
         rental(&conn, n, "released");
     }
-    conn.execute("DELETE FROM router_ssh_hosts", []).unwrap();
+    conn.execute_batch(
+        "UPDATE online_client_listings SET state='unlisted'; DELETE FROM installations",
+    )
+    .unwrap();
     assert_eq!(page(&conn, "stranger", "history", 1)["total"], 0);
     let mut seen = std::collections::HashSet::new();
     for number in 1..=5 {
@@ -67,9 +70,8 @@ fn personal_current_and_history_partition_stopped_and_failed_services_once() {
     for (n, status) in [
         "opening",
         "active",
-        "billing_suspended",
-        "releasing",
-        "release_failed",
+        "ending",
+        "cleaning",
         "released",
         "activation_failed",
     ]
@@ -80,7 +82,7 @@ fn personal_current_and_history_partition_stopped_and_failed_services_once() {
     }
     let current = page(&conn, "buyer", "current", 1);
     let history = page(&conn, "buyer", "history", 1);
-    assert_eq!(current["total"], 3);
+    assert_eq!(current["total"], 2);
     assert_eq!(history["total"], 4);
     assert!(
         history["items"]
@@ -105,11 +107,11 @@ fn personal_focus_locates_older_pages_without_traversing_or_reading_other_users(
     };
     let focused = list_tx(&conn, "buyer", &q).unwrap();
     assert_eq!(focused["page"], 5);
-    assert_eq!(focused["focusedId"], "job:job-0000");
+    assert_eq!(focused["focusedId"], "lease:client-0000");
     assert!(list_tx(&conn, "stranger", &q).unwrap()["focusedId"].is_null());
     assert_eq!(
         page(&conn, "buyer", "history", 3)["items"][0]["id"],
-        "job:job-0012"
+        "lease:client-0012"
     );
 }
 
@@ -138,8 +140,8 @@ fn current_attention_priority_and_focused_page_use_the_same_ordering() {
     )
     .unwrap();
     assert_eq!(focused["page"], 2);
-    assert_eq!(focused["focusedId"], "job:job-0002");
-    assert_eq!(focused["items"][2]["id"], "job:job-0002");
+    assert_eq!(focused["focusedId"], "lease:client-0002");
+    assert_eq!(focused["items"][2]["id"], "lease:client-0002");
 }
 
 #[test]
@@ -156,7 +158,8 @@ fn personal_detail_proves_buyer_identity_before_money_and_redacts_admin_fields()
     let detail = detail_tx(&conn, &actor("buyer"), &id, &Default::default()).unwrap();
     assert_eq!(detail["record"]["status"], "trialing");
     assert_eq!(detail["record"]["money"]["netUnits"], "0");
-    assert_eq!(detail["rental"]["isClientOwner"], true);
+    assert_eq!(detail["rental"]["leaseId"], "client-0001");
+    assert_eq!(detail["rental"]["canDispute"], false);
     let encoded = detail.to_string();
     for secret in [
         "SECRET_LOG",
@@ -178,14 +181,17 @@ fn personal_released_records_have_no_live_actions_and_keep_original_subdomain() 
     let conn = crate::test_support::database().unwrap();
     let id = rental(&conn, 1, "released");
     conn.execute(
-        "UPDATE router_ssh_hosts SET installation_id='new-tenant' WHERE id='host-0001'",
+        "UPDATE online_client_listings SET owner_email='new@example.test' WHERE installation_id='host-0001'",
         [],
     )
     .unwrap();
     let value = detail_tx(&conn, &actor("buyer"), &id, &Default::default()).unwrap();
     assert_eq!(value["record"]["clientSubdomain"], "client-0001");
     assert!(value["rental"].is_null());
-    conn.execute("DELETE FROM router_ssh_hosts", []).unwrap();
+    conn.execute_batch(
+        "UPDATE online_client_listings SET state='unlisted'; DELETE FROM installations",
+    )
+    .unwrap();
     assert_eq!(
         detail_tx(&conn, &actor("buyer"), &id, &Default::default()).unwrap()["record"],
         value["record"]

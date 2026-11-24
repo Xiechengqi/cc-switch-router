@@ -29,10 +29,10 @@ struct WindowGrant {
 }
 
 struct ClientWindowTarget {
+    buyer_id: Option<String>,
     subdomain: String,
     owner: String,
     revision: i64,
-    market: bool,
     binding_epoch: String,
 }
 
@@ -100,9 +100,15 @@ impl AppStore {
         installation_id: &str,
     ) -> Result<ClientWindowTarget, AppError> {
         let conn = self.conn.lock().await;
+        let online=conn.query_row("SELECT r.alias,r.tenant_email,p.revision,r.id,r.buyer_id FROM online_client_leases r JOIN public_hosts p ON p.label=r.alias AND p.subject_id=r.id
+            WHERE r.id=?1 AND r.state='active' AND r.grant_until>unixepoch() AND p.lifecycle='active'",params![installation_id],
+            |row| Ok(ClientWindowTarget{buyer_id:row.get(4)?,subdomain:row.get(0)?,owner:row.get(1)?,revision:row.get(2)?,binding_epoch:format!("lease:{}",row.get::<_,String>(3)?)})).optional()
+            .map_err(|e|AppError::Internal(format!("read lease window: {e}")))?;
+        if let Some(online) = online {
+            return Ok(online);
+        }
         conn.query_row(
             "SELECT t.subdomain, LOWER(TRIM(i.owner_email)), p.revision,
-                    COALESCE(i.provision_source, '') = 'router_market',
                     i.owner_verified_at
              FROM installations i
              JOIN installation_client_tunnels t ON t.installation_id = i.id AND t.enabled = 1
@@ -113,11 +119,11 @@ impl AppStore {
             params![installation_id],
             |row| {
                 Ok(ClientWindowTarget {
+                    buyer_id: None,
                     subdomain: row.get(0)?,
                     owner: row.get(1)?,
                     revision: row.get(2)?,
-                    market: row.get(3)?,
-                    binding_epoch: row.get(4)?,
+                    binding_epoch: row.get(3)?,
                 })
             },
         )
@@ -126,11 +132,7 @@ impl AppStore {
         .ok_or_else(|| AppError::Forbidden("Client login is unavailable".into()))
     }
 
-    async fn validate_window(
-        &self,
-        config: &Config,
-        grant: &WindowGrant,
-    ) -> Result<AuthSession, AppError> {
+    async fn validate_window(&self, grant: &WindowGrant) -> Result<AuthSession, AppError> {
         if grant.expires_at <= Utc::now() {
             return Err(AppError::Unauthorized("Client session expired".into()));
         }
@@ -155,38 +157,22 @@ impl AppStore {
         })
         .ok_or_else(|| AppError::Unauthorized("Router login expired".into()))?;
         let ClientWindowTarget {
+            buyer_id,
             subdomain,
             owner,
             revision,
-            market,
+
             binding_epoch,
         } = self.client_window_target(&grant.installation_id).await?;
-        if subdomain != grant.subdomain
+        if buyer_id.as_deref().is_some_and(|id| id != actor.user_id)
+            || subdomain != grant.subdomain
             || owner != grant.owner
             || revision != grant.revision
             || binding_epoch != grant.binding_epoch
-            || (grant.delegate && !owner.eq_ignore_ascii_case(&actor.email))
+            || !owner.eq_ignore_ascii_case(&actor.email)
+            || (grant.terminal && buyer_id.is_some())
         {
             return Err(AppError::Forbidden("Client owner or route changed".into()));
-        }
-        let router_owner = config
-            .official_provider_email()
-            .is_some_and(|email| email.eq_ignore_ascii_case(&actor.email));
-        if grant.terminal && market && !router_owner {
-            return Err(AppError::Forbidden("Client terminal is restricted".into()));
-        }
-        if market && grant.delegate {
-            let conn = self.conn.lock().await;
-            let active: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM client_market_subscriptions s
-                 JOIN router_ssh_hosts h ON h.id = s.host_id AND h.installation_id = s.installation_id
-                 WHERE s.installation_id = ?1 AND s.client_user_id = ?2 AND s.status = 'active'
-                   AND h.status = 'allocated' AND (s.expires_at IS NULL OR julianday(s.expires_at) > julianday(?3)))",
-                params![grant.installation_id, actor.user_id, Utc::now().to_rfc3339()], |row| row.get(0)
-            ).map_err(|e| AppError::Internal(format!("read Client rental: {e}")))?;
-            if !active {
-                return Err(AppError::Forbidden("Client rental is inactive".into()));
-            }
         }
         Ok(actor)
     }
@@ -219,7 +205,7 @@ impl AppStore {
             return Err(AppError::Forbidden("Client session target mismatch".into()));
         }
         let actor = self
-            .validate_window(config, &grant)
+            .validate_window(&grant)
             .await
             .map_err(|error| match error {
                 AppError::Forbidden(_) => {
@@ -228,34 +214,6 @@ impl AppStore {
                 error => error,
             })?;
         Ok(grant.delegate.then_some((actor.email, false)))
-    }
-
-    pub(crate) async fn client_window_terminal_allowed(
-        &self,
-        config: &Config,
-        headers: &HeaderMap,
-        installation_id: &str,
-        subdomain: &str,
-    ) -> bool {
-        let Some(token) = headers
-            .get(WINDOW_HEADER)
-            .and_then(|token| token.to_str().ok())
-        else {
-            return false;
-        };
-        let grant = self
-            .client_web_sessions
-            .lock()
-            .await
-            .sessions
-            .get(&hash_token(token))
-            .cloned();
-        let Some(grant) = grant else { return false };
-        grant.terminal
-            && grant.installation_id == installation_id
-            && grant.subdomain == subdomain
-            && host_matches(config, headers, subdomain)
-            && self.validate_window(config, &grant).await.is_ok()
     }
 }
 
@@ -273,26 +231,22 @@ async fn issue_ticket(
         return Err(AppError::BadRequest("invalid Client login request".into()));
     }
     let ClientWindowTarget {
+        buyer_id,
         subdomain,
         owner,
         revision,
-        market,
+
         binding_epoch,
     } = state
         .store
         .client_window_target(&input.installation_id)
         .await?;
-    let delegate = actor.email.eq_ignore_ascii_case(&owner);
-    let router_owner = state
-        .config
-        .official_provider_email()
-        .is_some_and(|email| email.eq_ignore_ascii_case(&actor.email));
-    let terminal_requested = input.kind == "terminal";
-    let can_open = delegate || (terminal_requested && market && router_owner);
-    if !can_open || (terminal_requested && market && !router_owner) {
+    let delegate = actor.email.eq_ignore_ascii_case(&owner)
+        && buyer_id.as_deref().is_none_or(|id| id == actor.user_id);
+    if !delegate || (input.kind == "terminal" && buyer_id.is_some()) {
         return Err(AppError::Forbidden("Client owner login required".into()));
     }
-    let terminal = !market || router_owner;
+    let terminal = buyer_id.is_none();
     let grant = WindowGrant {
         session_id: actor.session_id,
         installation_id: input.installation_id,
@@ -306,7 +260,7 @@ async fn issue_ticket(
         nonce: input.nonce,
         expires_at: Utc::now() + Duration::seconds(60),
     };
-    state.store.validate_window(&state.config, &grant).await?;
+    state.store.validate_window(&grant).await?;
     let origin = origin_for(&state.config, &grant.subdomain)?;
     let mut windows = state.store.client_web_sessions.lock().await;
     windows.prune();
@@ -357,7 +311,7 @@ async fn exchange_ticket(
     {
         return Err(AppError::Forbidden("ticket target mismatch".into()));
     }
-    let actor = state.store.validate_window(&state.config, &grant).await?;
+    let actor = state.store.validate_window(&grant).await?;
     let mut windows = state.store.client_web_sessions.lock().await;
     windows.prune();
     if windows.tickets.remove(&key).is_none() {
@@ -422,7 +376,7 @@ pub(crate) async fn middleware(
                 _ = interval.tick() => {
                     let grant = state.store.client_web_sessions.lock().await.sessions.get(&token_hash).cloned();
                     let Some(grant) = grant else { break };
-                    if state.store.validate_window(&state.config, &grant).await.is_err() { break; }
+                    if state.store.validate_window(&grant).await.is_err() { break; }
                 }
             }
         }
@@ -469,7 +423,7 @@ mod tests {
     #[tokio::test]
     async fn client_window_checks_owner_session_route_and_host() {
         let (store, config, grant) = fixture().await;
-        assert!(store.validate_window(&config, &grant).await.is_ok());
+        assert!(store.validate_window(&grant).await.is_ok());
         store
             .client_web_sessions
             .lock()
@@ -505,12 +459,12 @@ mod tests {
             .await
             .execute("UPDATE public_hosts SET revision=revision+1", [])
             .unwrap();
-        assert!(store.validate_window(&config, &grant).await.is_err());
+        assert!(store.validate_window(&grant).await.is_err());
     }
 
     #[tokio::test]
     async fn client_window_parent_revocation_and_owner_change_are_immediate() {
-        let (store, config, grant) = fixture().await;
+        let (store, _, grant) = fixture().await;
         store
             .conn
             .lock()
@@ -520,8 +474,8 @@ mod tests {
                 params![Utc::now().to_rfc3339(), grant.session_id],
             )
             .unwrap();
-        assert!(store.validate_window(&config, &grant).await.is_err());
-        let (store, config, grant) = fixture().await;
+        assert!(store.validate_window(&grant).await.is_err());
+        let (store, _, grant) = fixture().await;
         store
             .conn
             .lock()
@@ -531,14 +485,14 @@ mod tests {
                 [],
             )
             .unwrap();
-        assert!(store.validate_window(&config, &grant).await.is_err());
+        assert!(store.validate_window(&grant).await.is_err());
     }
 
     #[tokio::test]
     async fn client_window_old_binding_cannot_revive_after_owner_returns() {
-        let (store, config, grant) = fixture().await;
+        let (store, _, grant) = fixture().await;
         store.conn.lock().await.execute("UPDATE installations SET owner_email='next@example.test',owner_verified_at='2026-11-21T00:00:00Z' WHERE id='installation'", []).unwrap();
-        assert!(store.validate_window(&config, &grant).await.is_err());
+        assert!(store.validate_window(&grant).await.is_err());
         store
             .conn
             .lock()
@@ -548,41 +502,35 @@ mod tests {
                 [],
             )
             .unwrap();
-        assert!(store.validate_window(&config, &grant).await.is_err());
+        assert!(store.validate_window(&grant).await.is_err());
     }
 
     #[tokio::test]
-    async fn client_window_market_requires_current_renter_and_restricts_terminal() {
-        let (store, config, mut grant) = fixture().await;
-        store
-            .conn
-            .lock()
-            .await
-            .execute(
-                "UPDATE installations SET provision_source='router_market' WHERE id='installation'",
-                [],
-            )
-            .unwrap();
-        assert!(store.validate_window(&config, &grant).await.is_err());
+    async fn client_window_lease_is_bound_to_buyer_and_revoked_before_cleanup() {
+        let (store, _, mut grant) = fixture().await;
+        let conn = store.conn.lock().await;
+        conn.execute_batch("INSERT INTO online_client_listings(installation_id,seller_id,owner_email,state,revision,sequence,cycle_price_minor,updated_at)
+            VALUES ('physical','seller','seller@example.test','listed',1,1,0,0);
+            INSERT INTO online_client_quotes(id,installation_id,buyer_id,revision,cycle_price_minor,projection_json,expires_at)
+            VALUES ('quote','physical','owner',1,0,'{}',0);
+            INSERT INTO online_client_leases(id,installation_id,quote_id,buyer_id,tenant_email,seller_id,alias,state,sequence,grant_until,created_at)
+            VALUES ('lease','physical','quote','owner','owner@example.test','seller','rent-test','active',2,unixepoch()+600,0);
+            INSERT INTO public_hosts(label,route_id,subject_id,installation_id,target_lane_id,kind,lifecycle,revision,created_at,updated_at)
+            SELECT 'rent-test','lease:lease','lease','physical','client:physical','client','active',revision,created_at,updated_at FROM public_hosts WHERE label='client-alpha'").unwrap();
+        drop(conn);
+        grant.installation_id = "lease".into();
+        grant.binding_epoch = "lease:lease".into();
+        grant.subdomain = "rent-test".into();
+        assert!(store.validate_window(&grant).await.is_err());
         grant.terminal = false;
-        assert!(store.validate_window(&config, &grant).await.is_err());
-        let now = Utc::now().to_rfc3339();
-        {
-            let conn = store.conn.lock().await;
-            conn.execute("INSERT INTO router_ssh_hosts(id,ip,port,host_owner_email,status,installation_id,created_at,updated_at) VALUES('host','203.0.113.1',22,'provider@example.test','allocated','installation',?1,?1)",params![now]).unwrap();
-            conn.execute("INSERT INTO client_market_subscriptions(installation_id,host_id,provider_id,host_owner_email,client_user_id,client_owner_email,status,offer_revision,created_at,updated_at) VALUES('installation','host','provider','provider@example.test','owner','owner@example.test','active',1,?1,?1)",params![now]).unwrap();
-        }
-        assert!(store.validate_window(&config, &grant).await.is_ok());
+        assert!(store.validate_window(&grant).await.is_ok());
         store
             .conn
             .lock()
             .await
-            .execute(
-                "UPDATE client_market_subscriptions SET status='releasing'",
-                [],
-            )
+            .execute("UPDATE online_client_leases SET state='ending'", [])
             .unwrap();
-        assert!(store.validate_window(&config, &grant).await.is_err());
+        assert!(store.validate_window(&grant).await.is_err());
     }
 
     #[tokio::test]
