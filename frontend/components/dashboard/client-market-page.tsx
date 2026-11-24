@@ -29,6 +29,9 @@ import type { ClientMarketHost, ClientMarketHostImportResponse, ClientMarketRent
 import { usePersistentState } from "@/lib/use-persistent-state";
 import { preferredScrollBehavior } from "@/lib/utils";
 import { replaceCurrentSearch } from "@/lib/url-search";
+import { ShopConfirmPanel } from "@/components/dashboard/client-market/shop-confirm-panel";
+import { ShopHostCard } from "@/components/dashboard/client-market/shop-host-card";
+import { ShopRegionPicker } from "@/components/dashboard/client-market/shop-region-picker";
 import { useBatchOperations } from "@/components/dashboard/client-market/use-batch-operations";
 import { AddHostDialog } from "@/components/dashboard/client-market/add-host-dialog";
 import { HostHealthFilters } from "@/components/dashboard/client-market/host-health-filters";
@@ -48,16 +51,20 @@ import {
   HostListTab,
   HostSortKey,
   HostSortPrefs,
+  ShopContinent,
+  ShopCountrySort,
   OWNER_FILTER_KEY,
   REGION_FILTER_KEY,
   ROUTER_OPEN_LOGIN_EVENT,
   SORT_PREFS_KEY,
   STATUS_FILTER_KEY,
+  aggregateShopCountries,
   buildHostPageItems,
   cleanupReasonForHost,
   countBatchStatuses,
   encodeHostTransferDocument,
   hostBelongsToViewer,
+  hostMatchesShopFilters,
   hostCanCleanup,
   hostCanDelete,
   hostCanExport,
@@ -73,7 +80,11 @@ import {
   normalizeOwnerFilters,
   parseHostTransferLines,
   prioritizeMineClientOwned,
+  SHOP_UNKNOWN_COUNTRY,
+  shopContinentForCountry,
+  shopCountryKey,
   sortHosts,
+  sortShopCountries,
   statusGroupForHost,
   statusGroupHintKey,
   statusGroupLabelKey,
@@ -102,6 +113,17 @@ export function ClientMarketPage() {
   const { remembered, takeSeed } = useRememberedView<ClientMarketView>(viewKey);
   const viewKeyRef = React.useRef(viewKey);
   viewKeyRef.current = viewKey;
+  const [onlyIdle, setOnlyIdle] = React.useState(true);
+  const [shopContinent, setShopContinent] = React.useState<ShopContinent>("all");
+  const [shopCountry, setShopCountry] = React.useState(() => {
+    const code = (searchParams.get("country") || "").trim().toUpperCase();
+    return /^[A-Z]{2}$/.test(code) ? code : "";
+  });
+  const [shopSort, setShopSort] = React.useState<ShopCountrySort>("idle");
+  const [shopHostId, setShopHostId] = React.useState<string | null>(null);
+  const [manageOpen, setManageOpen] = React.useState(() => (
+    searchParams.get("addHost") === "1" || searchParams.get("tab") === "mine" || Boolean(searchParams.get("focus") || searchParams.get("focusHost") || searchParams.get("provider"))
+  ));
   const [onlyHealthy, setOnlyHealthy] = React.useState(false);
   const [healthHostId, setHealthHostId] = React.useState<string | null>(null);
   const [monitorBatchBusy, setMonitorBatchBusy] = React.useState(false);
@@ -163,6 +185,22 @@ export function ClientMarketPage() {
     else ids.delete(hostId);
     if (ids.size !== before) setRowUiBusyCount(ids.size);
   }, []);
+
+  const selectShopCountry = React.useCallback((code: string) => {
+    const next = code === SHOP_UNKNOWN_COUNTRY || /^[A-Z]{2}$/.test(code) ? code : "";
+    setShopCountry(next);
+    setShopHostId(null);
+    if (next) setShopContinent(shopContinentForCountry(next));
+    replaceCurrentSearch((params) => {
+      if (/^[A-Z]{2}$/.test(next)) params.set("country", next);
+      else params.delete("country");
+    });
+  }, []);
+
+  const selectShopContinent = React.useCallback((next: ShopContinent) => {
+    setShopContinent(next);
+    if (shopCountry && next !== "all" && shopContinentForCountry(shopCountry) !== next) selectShopCountry("");
+  }, [selectShopCountry, shopCountry]);
 
   const openCreateForHost = React.useCallback((host: ClientMarketHost) => {
     if (!authed) {
@@ -561,6 +599,28 @@ export function ClientMarketPage() {
     }
   };
 
+  const shopFilteredHosts = React.useMemo(
+    () => hosts.filter((host) => hostMatchesMarketProvider(host, marketProviderId) && hostMatchesShopFilters(host, {
+      onlyIdle, arch: healthArch, minimumCpu, minimumMemory,
+    })),
+    [healthArch, hosts, marketProviderId, minimumCpu, minimumMemory, onlyIdle],
+  );
+  const shopCards = React.useMemo(() => {
+    const names = new Intl.DisplayNames([locale], { type: "region" });
+    return sortShopCountries(aggregateShopCountries(shopFilteredHosts), shopSort, (code) => (
+      /^[A-Z]{2}$/.test(code) ? names.of(code) || code : "\uffff"
+    ));
+  }, [locale, shopFilteredHosts, shopSort]);
+  const shopHosts = React.useMemo(() => {
+    if (!shopCountry) return [];
+    return sortHosts(shopFilteredHosts.filter((host) => shopCountryKey(host.countryCode) === shopCountry), sortPrefs);
+  }, [shopCountry, shopFilteredHosts, sortPrefs]);
+  const selectedShopHost = shopHosts.find((host) => host.id === shopHostId) || null;
+  const shopCountryName = React.useMemo(() => {
+    if (!/^[A-Z]{2}$/.test(shopCountry)) return "";
+    return new Intl.DisplayNames([locale], { type: "region" }).of(shopCountry) || shopCountry;
+  }, [locale, shopCountry]);
+
   const statusTabs = React.useMemo(
     () =>
       HOST_LIST_TABS.filter((value) => value !== "mine" || authed).map((value) => ({
@@ -593,9 +653,67 @@ export function ClientMarketPage() {
 
   return (
     <main className="mx-auto grid min-w-0 w-[calc(100%-2rem)] max-w-7xl grid-cols-[minmax(0,1fr)] gap-5 pb-10">
-      <h1 className="sr-only">{t("clientMarket.title")}</h1>
+      <header className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h1 className="text-xl font-semibold text-foreground">{t("clientMarket.title")}</h1>
+          <p className="mt-1 text-sm text-muted-foreground">{t("clientMarket.shop.subtitle")}</p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <label className="inline-flex h-9 items-center gap-2 rounded-lg border border-border bg-card px-3 text-sm">
+            <input type="checkbox" checked={onlyIdle} onChange={(event) => { setOnlyIdle(event.target.checked); setShopHostId(null); }} />
+            {t("clientMarket.shop.onlyIdle")}
+          </label>
+          <Button variant="outline" size="sm" className="h-9" isDisabled={loading} onPress={() => void load()}>
+            {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+            {t("clientMarket.shop.refresh")}
+          </Button>
+          <Button variant="ghost" size="sm" className="h-9" aria-expanded={manageOpen} onPress={() => setManageOpen((open) => !open)}>
+            {t(manageOpen ? "clientMarket.shop.hideManage" : "clientMarket.shop.manage")}
+          </Button>
+        </div>
+      </header>
+      {loading && hosts.length === 0 ? (
+        <div className="flex items-center gap-2 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />…</div>
+      ) : error && hosts.length === 0 ? (
+        <p role="alert" className="text-sm text-rose-600">{error}</p>
+      ) : (
+        <section className="grid gap-4" aria-label={t("clientMarket.shop.stepRegion")}>
+          <ShopRegionPicker
+            cards={shopCards}
+            continent={shopContinent}
+            country={shopCountry}
+            sort={shopSort}
+            arch={healthArch}
+            minimumCpu={minimumCpu}
+            minimumMemory={minimumMemory}
+            onContinent={selectShopContinent}
+            onCountry={selectShopCountry}
+            onSort={setShopSort}
+            onSpecs={(next) => { setHealthArch(next.arch); setMinimumCpu(next.minimumCpu); setMinimumMemory(next.minimumMemory); setShopHostId(null); setPage(1); }}
+          />
+          {shopCountry ? (
+            <div className="client-market-shop-workspace">
+              <section className="client-market-shop-hosts" aria-label={t("clientMarket.shop.hostListLabel", { name: shopCountryName })}>
+                <h2 className="text-sm font-semibold">{t("clientMarket.shop.stepHost")}</h2>
+                {shopHosts.length === 0 ? <p className="text-sm text-muted-foreground">{t("clientMarket.shop.noHosts")}</p> : shopHosts.map((host) => (
+                  <ShopHostCard key={host.id} host={host} selected={host.id === shopHostId} onSelect={(next) => setShopHostId(next.id)} onHealthOpen={openHealth} />
+                ))}
+              </section>
+              <ShopConfirmPanel
+                host={selectedShopHost}
+                authed={authed}
+                countryName={shopCountryName}
+                onContinue={openCreateForHost}
+                onLogin={() => window.dispatchEvent(new Event(ROUTER_OPEN_LOGIN_EVENT))}
+                onRequestAccess={(host) => setAccessDialog({ host, eligibility: host.eligibility })}
+              />
+            </div>
+          ) : null}
+        </section>
+      )}
       {authed && terminationWork.error ? <div className="flex min-w-0 flex-wrap items-center gap-2"><p role="alert" className="text-xs text-danger">{t("clientTermination.workspaceUnavailable")}</p><Button size="sm" variant="ghost" onPress={() => void terminationWork.refresh(true)}>{t("common.reload")}</Button></div> : null}
       <ClientTerminationDialog terminationId={terminationId} onClose={closeTermination} onChanged={onTerminationChanged} />
+      {manageOpen ? <>
       {marketProviderId ? (
         <div className="flex min-h-11 min-w-0 flex-wrap items-center justify-between gap-2 rounded-lg bg-slate-100 px-3 py-2 text-sm">
           <span className="min-w-0 text-slate-700">{t("providers.marketFilter.client")}</span>
@@ -1018,6 +1136,7 @@ export function ClientMarketPage() {
         </div>
       )}
 
+      </> : null}
       <ClientRentalRecords historyOnly focusKey={searchParams.get("rentalId")} onTerminationOpen={setTerminationId} revision={terminationWork.revision + rentalRevision} />
       <ClientRentalAuditPanel onTerminationOpen={setTerminationId} revision={terminationWork.revision + rentalRevision} />
       <AddHostDialog open={addOpen} onOpenChange={setAddOpen} onAdded={() => void silentRefresh()} />

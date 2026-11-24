@@ -32,6 +32,7 @@ import { shareMeteringMessagesEn, shareMeteringMessagesZh } from "@/lib/share-me
 import { shareRentMessagesEn, shareRentMessagesZh } from "@/lib/share-rent-messages";
 import { shareSeatTermsMessagesEn, shareSeatTermsMessagesZh } from "@/lib/share-seat-terms-messages";
 import { marketNotificationCopyEn, marketNotificationCopyZh } from "@/lib/market-notification-copy";
+import { clientMarketShopMessagesEn, clientMarketShopMessagesZh } from "@/lib/client-market-shop-messages";
 
 export const LOCALE_STORAGE_KEY = "cc_switch_router_locale_v1";
 export const SUPPORTED_LOCALES = ["en", "zh-CN"] as const;
@@ -3623,6 +3624,7 @@ export const messages = {
     ...providerRankMessagesEn,
     ...shareMeteringMessagesEn,
     ...marketNotificationCopyEn,
+    ...clientMarketShopMessagesEn,
   },
   "zh-CN": {
     ...hostHealthMessagesZh,
@@ -7110,6 +7112,7 @@ export const messages = {
     ...providerRankMessagesZh,
     ...shareMeteringMessagesZh,
     ...marketNotificationCopyZh,
+    ...clientMarketShopMessagesZh,
   },
 } as const;
 

@@ -1,15 +1,106 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  aggregateShopCountries,
   encodeHostTransferDocument,
   hostMatchesMarketProvider,
+  hostMatchesShopFilters,
   hostCanClientRelease,
+  hostShopPriceMinor,
   parseHostTransferLines,
   parseClientTrialHours,
   persistedClientMarketProviderSelection,
   recommendedClientMarketProviderId,
+  shopContinentForCountry,
+  SHOP_CONTINENTS,
+  sortShopCountries,
 } from "./host-utils";
 import type { ClientMarketHost, ClientMarketProvider } from "@/lib/types";
+
+test("shop continents keep ISO regions distinct and group unknown codes as other", () => {
+  assert.equal(shopContinentForCountry("HK"), "asia");
+  assert.equal(shopContinentForCountry("MO"), "asia");
+  assert.equal(shopContinentForCountry("TW"), "asia");
+  assert.equal(shopContinentForCountry("CN"), "asia");
+  assert.equal(shopContinentForCountry("au"), "oceania");
+  assert.equal(shopContinentForCountry("US"), "north_america");
+  assert.equal(shopContinentForCountry("BR"), "south_america");
+  assert.equal(shopContinentForCountry("DE"), "europe");
+  assert.equal(shopContinentForCountry("ZA"), "africa");
+  assert.equal(shopContinentForCountry("AQ"), "other");
+  assert.equal(shopContinentForCountry(""), "other");
+  assert.equal(shopContinentForCountry("CHN"), "other");
+  assert.equal(SHOP_CONTINENTS[0], "all");
+});
+
+function shopHost(patch: Partial<ClientMarketHost> & Pick<ClientMarketHost, "id" | "status">): ClientMarketHost {
+  return {
+    hostOwnerEmail: "owner@example.test",
+    pricingModel: "prepaid_calendar_month",
+    offerRevision: 1,
+    eligibility: { allowed: true, status: "allowed" },
+    ...patch,
+  };
+}
+
+test("shop country cards count idle Hosts and the cheapest idle offer", () => {
+  const hosts = [
+    shopHost({ id: "sg-paid", countryCode: "sg", status: "idle", cyclePriceMinor: 250, dailyRateMinor: 20 }),
+    shopHost({ id: "sg-free", countryCode: "SG", status: "idle" }),
+    shopHost({ id: "sg-busy", countryCode: "SG", status: "allocated", cyclePriceMinor: 10 }),
+    shopHost({ id: "unknown", status: "idle", dailyRateMinor: 40 }),
+    shopHost({ id: "blank", countryCode: " ", status: "allocated" }),
+  ];
+  const cards = aggregateShopCountries(hosts);
+  const singapore = cards.find((card) => card.code === "SG");
+  const unknown = cards.find((card) => card.code === "unknown");
+  assert.equal(singapore?.continent, "asia");
+  assert.equal(singapore?.idle, 2);
+  assert.equal(singapore?.total, 3);
+  assert.equal(singapore?.minMonthlyMinor, 250);
+  assert.equal(singapore?.hasFreeIdle, true);
+  assert.equal(unknown?.code, "unknown");
+  assert.equal(unknown?.continent, "other");
+  assert.equal(unknown?.idle, 1);
+  assert.equal(unknown?.total, 2);
+  assert.equal(unknown?.minMonthlyMinor, 1200);
+  assert.equal(hostShopPriceMinor({ cyclePriceMinor: 100, dailyRateMinor: 5 }), 100);
+  assert.equal(hostShopPriceMinor({ dailyRateMinor: 40 }), 1200);
+  assert.equal(hostShopPriceMinor({}), null);
+
+  const sorted = sortShopCountries(cards, "price", (code) => code || "zzz");
+  assert.deepEqual(sorted.map((card) => card.code), ["SG", "unknown"]);
+  assert.deepEqual(
+    sortShopCountries(cards, "idle", () => "same").map((card) => card.code),
+    ["SG", "unknown"],
+  );
+  assert.equal(hostMatchesShopFilters(hosts[0], { onlyIdle: true, arch: "", minimumCpu: "", minimumMemory: "" }), true);
+  assert.equal(hostMatchesShopFilters(hosts[2], { onlyIdle: true, arch: "", minimumCpu: "", minimumMemory: "" }), false);
+  assert.equal(hostMatchesShopFilters(shopHost({
+    id: "arm",
+    status: "idle",
+    hostHealth: {
+      state: "healthy",
+      lastReceivedAt: null,
+      sampledAt: null,
+      nextDueAt: null,
+      received24h: 1,
+      observable24h: 1,
+      consecutiveMissed: 0,
+      supervision: "systemd",
+      snapshot: {
+        os: "linux",
+        arch: "aarch64",
+        effectiveVcpu: { value: 2, unknownReason: null },
+        memoryTotalBytes: { value: 2 * 2 ** 30, unknownReason: null },
+        memoryAvailableBytes: { value: null, unknownReason: null },
+        dataVolumeTotalBytes: { value: null, unknownReason: null },
+        dataVolumeAvailableBytes: { value: null, unknownReason: null },
+        cpuUsagePct: { value: null, unknownReason: null },
+      },
+    },
+  }), { onlyIdle: true, arch: "aarch64", minimumCpu: "2", minimumMemory: "1" }), true);
+});
 
 test("stopping Client renewal does not hide immediate termination", () => {
   const host = { isClientOwner: true, installationId: "rental", status: "allocated" } as ClientMarketHost;

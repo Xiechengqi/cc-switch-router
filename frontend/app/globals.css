@@ -989,7 +989,27 @@ a {
 .host-health-hour-list > li { display: flex; align-items: center; justify-content: space-between; gap: var(--space-host-health-md); min-height: 40px; border-bottom: 1px solid var(--color-host-health-rule); }
 .host-health-hour-state[data-state="received"] { color: var(--color-host-health-positive); }
 .host-health-hour-state[data-state="missed"] { color: var(--color-host-health-warning); }
+.client-market-shop-region, .client-market-shop-confirm, .client-market-shop-host {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-xl, 0.75rem);
+  background: var(--color-card);
+}
+.client-market-shop-region { display: grid; gap: 0.75rem; padding: 1rem; }
+.client-market-shop-continents, .client-market-shop-countries { display: flex; gap: 0.5rem; overflow-x: auto; padding-bottom: 0.25rem; }
+.client-market-shop-continent, .client-market-shop-country { flex: none; border: 1px solid var(--color-border); border-radius: 0.75rem; background: var(--color-background); text-align: left; }
+.client-market-shop-continent { display: inline-flex; align-items: center; gap: 0.4rem; min-height: 2.25rem; padding: 0.25rem 0.75rem; font-size: 0.875rem; }
+.client-market-shop-continent > span, .client-market-shop-country { font-variant-numeric: tabular-nums; }
+.client-market-shop-country { display: grid; width: 11.5rem; min-height: 6.5rem; padding: 0.75rem; }
+.client-market-shop-continent.is-selected, .client-market-shop-country.is-selected, .client-market-shop-host.is-selected { border-color: var(--color-primary); box-shadow: inset 0 0 0 1px var(--color-primary); }
+.client-market-shop-workspace { display: grid; grid-template-columns: minmax(16rem, 0.8fr) minmax(18rem, 1.2fr); gap: 1rem; align-items: start; }
+.client-market-shop-hosts { display: grid; align-content: start; gap: 0.75rem; max-height: min(70vh, 40rem); overflow: auto; }
+.client-market-shop-host-select { display: block; width: 100%; padding: 0.75rem; text-align: left; }
+.client-market-shop-confirm { padding: 1rem; }
+@media (min-width: 64rem) {
+  .client-market-shop-countries { flex-wrap: wrap; overflow: visible; }
+}
 @media (max-width: 63.99rem) {
+  .client-market-shop-workspace { grid-template-columns: minmax(0, 1fr); }
   .client-market-hosts-frame { overflow: visible; border: 0; background: transparent; box-shadow: none; }
   .client-market-hosts-scroll { max-height: none; overflow: visible; }
   .client-market-hosts-table { display: block; min-width: 0; width: 100%; }
