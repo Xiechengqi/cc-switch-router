@@ -8,6 +8,8 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use rand::Rng;
 use serde_json::json;
 use tracing::warn;
+#[path = "client_market_health_bootstrap.rs"]
+pub(crate) mod bootstrap;
 #[path = "client_market_health_deployment.rs"]
 mod deployment;
 pub(super) use deployment::{
@@ -34,6 +36,30 @@ pub struct Summary {
     pub clock_synchronized: bool,
     pub snapshot: Option<Snapshot>,
     pub diagnostic: Option<String>,
+    #[serde(default)]
+    pub machine_epoch: i64,
+    #[serde(default)]
+    pub deployment: DeploymentView,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeploymentView {
+    pub state: String,
+    pub reason: Option<String>,
+    pub can_bootstrap: bool,
+    pub deployed_commit: Option<String>,
+}
+
+impl Default for DeploymentView {
+    fn default() -> Self {
+        Self {
+            state: "not_enabled".into(),
+            reason: None,
+            can_bootstrap: false,
+            deployed_commit: None,
+        }
+    }
 }
 
 fn clock_synchronized_default() -> bool {
@@ -43,7 +69,7 @@ fn clock_synchronized_default() -> bool {
 impl Summary {
     fn preparing() -> Self {
         Self {
-            state: "awaiting_first".into(),
+            state: "not_enabled".into(),
             last_received_at: None,
             sampled_at: None,
             next_due_at: None,
@@ -54,6 +80,8 @@ impl Summary {
             clock_synchronized: true,
             snapshot: None,
             diagnostic: None,
+            machine_epoch: 1,
+            deployment: DeploymentView::default(),
         }
     }
 }
@@ -72,6 +100,10 @@ pub(super) fn routes() -> Router<ServerState> {
         )
         .route("/v1/client-market/hosts/:id/health", get(details))
         .route("/v1/client-market/hosts/:id/health/retry", post(retry))
+        .route(
+            "/v1/client-market/hosts/:id/health/bootstrap",
+            post(bootstrap::request),
+        )
         .route(
             "/v1/client-market/hosts/:id/health/rotate-key",
             post(rotate),
@@ -490,6 +522,8 @@ fn refresh_summary(conn: &Connection, host: &str, now: i64) -> Result<(), AppErr
             r.snapshot
         }),
         diagnostic,
+        machine_epoch: 1,
+        deployment: DeploymentView::default(),
     };
     let deadline = [hour - 1, hour, hour + 1]
         .into_iter()
@@ -511,24 +545,7 @@ fn refresh_summary(conn: &Connection, host: &str, now: i64) -> Result<(), AppErr
 }
 
 pub(crate) fn public_summary(conn: &Connection, host: &str) -> Result<Option<Summary>, AppError> {
-    let data:Option<(Option<String>,i64,String,bool)> = conn.query_row(
-        "SELECT a.summary_json,a.latest_public,h.status,a.revoked FROM client_host_agents a JOIN router_ssh_hosts h ON h.id=a.host_id WHERE a.host_id=?1",
-        params![host],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).optional().map_err(database)?;
-    Ok(data.and_then(|(raw, public, status, revoked)| {
-        raw.and_then(|raw| serde_json::from_str::<Summary>(&raw).ok())
-            .map(|mut summary| {
-                summary.diagnostic = None;
-                if revoked {
-                    summary.state = "revoked".into();
-                }
-                if public == 0 || status != "idle" {
-                    if let Some(snapshot) = &mut summary.snapshot {
-                        snapshot.hide_dynamic("private")
-                    }
-                }
-                summary
-            })
-    }))
+    Ok(project_views(conn, None, Some(host), false)?.remove(host))
 }
 
 pub(super) async fn views(
@@ -545,33 +562,75 @@ pub(super) async fn views(
     project_views(&conn, viewer, host_filter, operations)
 }
 
+#[derive(Debug)]
+struct DeploymentFacts {
+    epoch: i64,
+    registered: bool,
+    first: Option<i64>,
+    legacy: bool,
+    revoked: bool,
+    admitted: Option<i64>,
+    preparation: Option<String>,
+    bootstrap: Option<String>,
+    bootstrap_error: Option<String>,
+    deployed_commit: Option<String>,
+    installation: Option<String>,
+    eligible_identity: bool,
+    no_running_job: bool,
+}
+
 fn project_views(
     conn: &Connection,
     viewer: Option<&crate::models::AuthSession>,
     host_filter: Option<&str>,
     operations: bool,
 ) -> Result<HashMap<String, Summary>, AppError> {
-    let mut query=conn.prepare(
-        "SELECT a.host_id,a.summary_json,a.latest_public,a.latest_lease_id,h.status,h.provider_id,s.installation_id,s.client_user_id,COALESCE(a.last_error,p.last_error),a.revoked
+    let predicate = if host_filter.is_some() {
+        "a.host_id=?1"
+    } else {
+        "?1 IS NULL"
+    };
+    let mut query=conn.prepare(&format!(
+        "SELECT a.host_id,a.summary_json,a.latest_public,a.latest_lease_id,h.status,h.provider_id,s.installation_id,s.client_user_id,COALESCE(a.last_error,p.last_error),a.revoked,
+         a.machine_epoch,a.public_key IS NOT NULL,a.first_due_at,a.legacy,a.admitted_hour,p.status,b.status,b.last_error,a.deployed_commit,h.installation_id,
+         a.replacement_pending=0 AND a.readmission_pending=0 AND COALESCE(a.last_error,'') NOT IN ('rotation_requested','hour_conflict'),
+         CASE WHEN a.legacy=1 AND h.status='allocated' THEN NOT EXISTS(SELECT 1 FROM provisioning_jobs j WHERE j.host_id=h.id AND j.status IN ('pending','running')) ELSE 0 END
          FROM client_host_agents a JOIN router_ssh_hosts h ON h.id=a.host_id
-         LEFT JOIN client_market_subscriptions s ON s.host_id=a.host_id AND s.status IN ('active','billing_suspended') LEFT JOIN client_binary_preparations p ON p.host_id=a.host_id WHERE (?1 IS NULL OR a.host_id=?1)").map_err(database)?;
-    let mut out = HashMap::new();
+         LEFT JOIN client_market_subscriptions s ON s.host_id=a.host_id AND s.status IN ('active','billing_suspended')
+         LEFT JOIN client_binary_preparations p ON p.host_id=a.host_id
+         LEFT JOIN client_host_agent_bootstraps b ON b.host_id=a.host_id AND b.installation_id=h.installation_id
+           AND b.machine_epoch=a.machine_epoch AND b.key_generation=a.key_generation WHERE {predicate}")).map_err(database)?;
     let rows = query
-        .query_map(params![host_filter], |row| {
+        .query_map(params![host_filter], |r| {
             Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, Option<String>>(5)?,
-                row.get::<_, Option<String>>(6)?,
-                row.get::<_, Option<String>>(7)?,
-                row.get::<_, Option<String>>(8)?,
-                row.get::<_, bool>(9)?,
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, Option<String>>(8)?,
+                DeploymentFacts {
+                    epoch: r.get(10)?,
+                    registered: r.get(11)?,
+                    first: r.get(12)?,
+                    legacy: r.get(13)?,
+                    admitted: r.get(14)?,
+                    preparation: r.get(15)?,
+                    bootstrap: r.get(16)?,
+                    bootstrap_error: r.get(17)?,
+                    deployed_commit: r.get(18)?,
+                    installation: r.get(19)?,
+                    eligible_identity: r.get(20)?,
+                    no_running_job: r.get(21)?,
+                    revoked: r.get(9)?,
+                },
             ))
         })
         .map_err(database)?;
+    let mut out = HashMap::new();
     for row in rows {
         let (
             host,
@@ -583,30 +642,103 @@ fn project_views(
             current_lease,
             tenant,
             preparation_error,
-            revoked,
+            facts,
         ) = row.map_err(database)?;
-        let mut summary: Summary = raw
-            .map(|raw| serde_json::from_str(&raw))
+        let mut summary = raw
+            .map(|v| serde_json::from_str::<Summary>(&v))
             .transpose()
             .map_err(database)?
             .unwrap_or_else(Summary::preparing);
-        if revoked {
-            summary.state = "revoked".into();
-        }
         let own = viewer.is_some_and(|v| provider.as_deref() == Some(v.user_id.as_str()));
-        let tenant = viewer.is_some_and(|v| tenant.as_deref() == Some(v.user_id.as_str()))
+        let has_report = summary.last_received_at.is_some();
+        let deployed = facts.deployed_commit.is_some()
+            || facts.bootstrap.as_deref() == Some("succeeded")
+            || facts.preparation.as_deref() == Some("ready");
+        let phase = if facts.revoked {
+            "paused"
+        } else if has_report {
+            "active"
+        } else if facts.bootstrap.as_deref() == Some("running") {
+            "installing"
+        } else if facts.bootstrap.as_deref() == Some("pending") {
+            "queued"
+        } else if facts.bootstrap.as_deref() == Some("failed") {
+            "failed"
+        } else if facts.registered && facts.first.is_some() && deployed {
+            "awaiting_first"
+        } else if status == "allocated" {
+            "not_enabled"
+        } else if facts.preparation.as_deref() == Some("running") {
+            "installing"
+        } else if facts.preparation.as_deref() == Some("failed") {
+            "failed"
+        } else if matches!(status.as_str(), "onboarding" | "idle" | "maintaining") {
+            "queued"
+        } else {
+            "not_enabled"
+        };
+        if !has_report {
+            summary.state = match phase {
+                "awaiting_first" => {
+                    if facts
+                        .first
+                        .is_some_and(|t| Utc::now().timestamp() > t + wire::GRACE_SECONDS)
+                    {
+                        "first_overdue"
+                    } else {
+                        "awaiting_first"
+                    }
+                }
+                "queued" | "installing" => "deploying",
+                "failed" => "deployment_failed",
+                _ => "not_enabled",
+            }
+            .into();
+            if !matches!(phase, "awaiting_first") {
+                summary.next_due_at = None;
+            }
+        }
+        if facts.revoked {
+            summary.state = "revoked".into()
+        }
+        summary.machine_epoch = facts.epoch;
+        summary.deployment = DeploymentView {
+            state: phase.into(),
+            reason: if phase == "not_enabled" && status == "allocated" {
+                Some("rental_not_enrolled".into())
+            } else {
+                None
+            },
+            can_bootstrap: own
+                && status == "allocated"
+                && facts.legacy
+                && facts.admitted.is_none()
+                && !facts.revoked
+                && facts.eligible_identity
+                && facts.no_running_job
+                && current_lease.is_some()
+                && current_lease == facts.installation
+                && (!facts.registered || facts.bootstrap.is_some())
+                && !matches!(facts.bootstrap.as_deref(), Some("pending" | "running")),
+            deployed_commit: facts.deployed_commit,
+        };
+        let current_tenant = viewer.is_some_and(|v| tenant.as_deref() == Some(v.user_id.as_str()))
             && lease.is_some()
             && lease == current_lease;
-        if !(public == 1 && status == "idle" || tenant || operations) {
+        if !(public == 1 && status == "idle" || current_tenant || operations) {
             if let Some(snapshot) = &mut summary.snapshot {
                 snapshot.hide_dynamic("private")
             }
         }
-        if (own || operations) && summary.diagnostic.is_none() {
-            summary.diagnostic = preparation_error
-        }
-        if !own && !operations {
-            summary.diagnostic = None
+        if own || operations {
+            if !has_report && facts.bootstrap.as_deref() == Some("failed") {
+                summary.diagnostic = facts.bootstrap_error
+            }
+            if summary.diagnostic.is_none() {
+                summary.diagnostic = preparation_error
+            }
+        } else {
+            summary.diagnostic = None;
         }
         out.insert(host, summary);
     }
@@ -914,6 +1046,53 @@ async fn replace_machine(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn first_rented_host_report_preserves_the_rental_and_keeps_usage_private() {
+        let store = AppStore::new_in_memory_for_tests().unwrap();
+        host(&store, "bootstrap-host", 360100).await;
+        {
+            let conn = store.conn.lock().await;
+            let owner = crate::market_finance_auth::test_session(&conn, "first-rental-owner");
+            let buyer = crate::market_finance_auth::test_session(&conn, "first-rental-buyer");
+            conn.execute(
+                "UPDATE client_host_agents SET legacy=1 WHERE host_id='bootstrap-host'",
+                [],
+            )
+            .unwrap();
+            conn.execute("UPDATE router_ssh_hosts SET status='allocated',installation_id='live-rental',provider_id=?1 WHERE id='bootstrap-host'",params![owner.user_id]).unwrap();
+            conn.execute("INSERT INTO client_market_subscriptions(installation_id,host_id,provider_id,host_owner_email,client_user_id,client_owner_email,status,offer_revision,created_at,updated_at)
+                VALUES('live-rental','bootstrap-host',?1,?2,?3,?4,'active',7,?5,?5)",params![owner.user_id,owner.email,buyer.user_id,buyer.email,iso(350000)]).unwrap();
+        }
+        assert_eq!(
+            send(&store, &report("bootstrap-host", 100, 360100), 360100).await,
+            StatusCode::OK
+        );
+        let conn = store.conn.lock().await;
+        let facts:(String,String,String,i64,bool)=conn.query_row("SELECT h.status,h.installation_id,s.status,s.offer_revision,a.legacy FROM router_ssh_hosts h JOIN client_market_subscriptions s ON s.host_id=h.id JOIN client_host_agents a ON a.host_id=h.id WHERE h.id='bootstrap-host'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).unwrap();
+        assert_eq!(
+            facts,
+            (
+                "allocated".into(),
+                "live-rental".into(),
+                "active".into(),
+                7,
+                false
+            )
+        );
+        let public = public_summary(&conn, "bootstrap-host").unwrap().unwrap();
+        assert!(
+            public
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .cpu_usage_pct
+                .value
+                .is_none()
+        );
+        assert_eq!(public.deployment.state, "active");
+        assert!(!public.deployment.can_bootstrap);
+    }
 
     #[tokio::test]
     async fn quote_reloads_the_frozen_health_and_enforces_buyer_identity() {

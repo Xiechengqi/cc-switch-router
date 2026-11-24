@@ -19,16 +19,19 @@ import {
   getClientMarketJob,
   getMyClientMarketRentals,
   importMyClientMarketHosts,
+  manageClientMarketHostHealth,
   reverifyClientMarketHost,
 } from "@/lib/api";
 import { rememberView, useRememberedView } from "@/lib/cached-resource";
 import { mergeHosts } from "@/lib/client-market-refresh";
+import { canBootstrapHost } from "@/lib/host-health-view";
 import type { ClientMarketHost, ClientMarketHostImportResponse, ClientMarketRental, MarketEligibility } from "@/lib/types";
 import { usePersistentState } from "@/lib/use-persistent-state";
 import { preferredScrollBehavior } from "@/lib/utils";
 import { replaceCurrentSearch } from "@/lib/url-search";
 import { useBatchOperations } from "@/components/dashboard/client-market/use-batch-operations";
 import { AddHostDialog } from "@/components/dashboard/client-market/add-host-dialog";
+import { HostHealthFilters } from "@/components/dashboard/client-market/host-health-filters";
 import { HostRow } from "@/components/dashboard/client-market/host-row";
 import { ClientRentalAuditPanel } from "@/components/dashboard/client-market/rental-audit-panel";
 import { ClientRentalRecords } from "@/components/dashboard/client-market/rental-records";
@@ -76,6 +79,8 @@ import {
   statusGroupLabelKey,
 } from "@/components/dashboard/client-market/host-utils";
 
+const HostHealthDrawer = React.lazy(() => import("@/components/dashboard/client-market/host-health-drawer").then(module => ({ default: module.HostHealthDrawer })));
+
 type ClientMarketView = {
   hosts: ClientMarketHost[];
   rentals: ClientMarketRental[];
@@ -98,7 +103,11 @@ export function ClientMarketPage() {
   const viewKeyRef = React.useRef(viewKey);
   viewKeyRef.current = viewKey;
   const [onlyHealthy, setOnlyHealthy] = React.useState(false);
-  const [healthSort, setHealthSort] = React.useState(false);
+  const [healthHostId, setHealthHostId] = React.useState<string | null>(null);
+  const [monitorBatchBusy, setMonitorBatchBusy] = React.useState(false);
+  const [monitorBatchResult, setMonitorBatchResult] = React.useState<{ queued: number; failed: number } | null>(null);
+  React.useEffect(() => { setMonitorBatchBusy(false); setMonitorBatchResult(null); setHealthHostId(null); }, [viewKey]);
+  const openHealth = React.useCallback((id: string) => setHealthHostId(id), []);
   const [healthArch, setHealthArch] = React.useState("");
   const [minimumCpu, setMinimumCpu] = React.useState("");
   const [minimumMemory, setMinimumMemory] = React.useState("");
@@ -347,13 +356,8 @@ export function ClientMarketPage() {
         && (!minimumMemory || (snapshot?.memoryTotalBytes.value != null && snapshot.memoryTotalBytes.value >= Number(minimumMemory) * 2 ** 30));
     });
     const sorted = sortHosts(filtered, sortPrefs);
-    if (healthSort) sorted.sort((left, right) => {
-      const record = (host: ClientMarketHost) => host.hostHealth?.observable24h ? host.hostHealth.received24h / host.hostHealth.observable24h : -1;
-      // Equal ratios rank the longer observed record first (24/24 before 1/1).
-      return record(right) - record(left) || (right.hostHealth?.observable24h || 0) - (left.hostHealth?.observable24h || 0);
-    });
     return listTab === "mine" ? prioritizeMineClientOwned(sorted) : sorted;
-  }, [listTab, scopedHosts, sortPrefs, onlyHealthy, healthSort, healthArch, minimumCpu, minimumMemory]);
+  }, [listTab, scopedHosts, sortPrefs, onlyHealthy, healthArch, minimumCpu, minimumMemory]);
 
   const toggleHostSort = React.useCallback((key: HostSortKey) => {
     setSortPrefs((prev) => {
@@ -413,7 +417,7 @@ export function ClientMarketPage() {
 
   React.useEffect(() => {
     setPage(1);
-  }, [listTab, marketProviderId, ownerFilters, regionFilters, sortPrefs.dir, sortPrefs.key, healthSort]);
+  }, [listTab, marketProviderId, ownerFilters, regionFilters, sortPrefs.dir, sortPrefs.key]);
 
   React.useEffect(() => {
     setProviderScopedTab(marketProviderId ? "all" : null);
@@ -568,6 +572,25 @@ export function ClientMarketPage() {
     [authed, statusCounts, t],
   );
 
+  const monitorTargets = hosts.filter(host => batch.selectedIds.has(host.id) && canBootstrapHost(host));
+  const enqueueSelectedMonitors = async () => {
+    if (monitorBatchBusy || batch.batchBusy) return;
+    const scope = viewKey;
+    setMonitorBatchBusy(true); setMonitorBatchResult(null);
+    const results = await mapPool(monitorTargets, 3, async host => {
+      if (viewKeyRef.current !== scope) return false;
+      try {
+        await manageClientMarketHostHealth(host.id, "bootstrap", { expectedInstallationId: host.installationId, expectedMachineEpoch: host.hostHealth!.machineEpoch });
+        return true;
+      } catch { return false; }
+    });
+    if (viewKeyRef.current === scope) {
+      setMonitorBatchResult({ queued: results.filter(Boolean).length, failed: results.filter(result => !result).length });
+      setMonitorBatchBusy(false); onRentalChanged();
+    }
+  };
+  const healthHost = loadedKey === viewKey ? hosts.find(host => host.id === healthHostId) : undefined;
+
   return (
     <main className="mx-auto grid min-w-0 w-[calc(100%-2rem)] max-w-7xl grid-cols-[minmax(0,1fr)] gap-5 pb-10">
       <h1 className="sr-only">{t("clientMarket.title")}</h1>
@@ -667,13 +690,12 @@ export function ClientMarketPage() {
         </div>
       </div>
 
-      <div className="flex flex-wrap items-end gap-3 text-xs">
-        <label className="flex min-h-11 items-center gap-2"><input type="checkbox" className="h-5 w-5 rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-background" checked={onlyHealthy} onChange={event => { setOnlyHealthy(event.target.checked); setPage(1); }} />{t("hostHealth.onlyHealthy")}</label>
-        <label className="flex min-h-11 items-center gap-2"><input type="checkbox" className="h-5 w-5 rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-background" checked={healthSort} onChange={event => setHealthSort(event.target.checked)} />{t("hostHealth.sort")}</label>
-        <label className="grid gap-1">{t("hostHealth.arch")}<select value={healthArch} onChange={event => { setHealthArch(event.target.value); setPage(1); }} className="h-12 rounded-lg border border-border bg-background px-3 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-background"><option value="">{t("hostHealth.allArch")}</option><option value="aarch64">ARM64</option><option value="x86_64">x86_64</option></select></label>
-        <label className="grid gap-1">{t("hostHealth.minCpu")}<input type="number" min="0" step="0.5" value={minimumCpu} onChange={event => { setMinimumCpu(event.target.value); setPage(1); }} className="h-12 w-28 rounded-lg border border-border bg-background px-3 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-background" /></label>
-        <label className="grid gap-1">{t("hostHealth.minMemory")}<input type="number" min="0" step="0.5" value={minimumMemory} onChange={event => { setMinimumMemory(event.target.value); setPage(1); }} className="h-12 w-28 rounded-lg border border-border bg-background px-3 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-background" /></label>
-      </div>
+      {healthHost ? <React.Suspense fallback={null}><HostHealthDrawer
+        key={[viewKey, healthHost.id, healthHost.installationId, healthHost.hostHealth?.machineEpoch, healthHost.isHostOwner, healthHost.isClientOwner, healthHost.status].join(":")}
+        host={healthHost} viewerKey={viewKey} onClose={() => setHealthHostId(null)} onChanged={onRentalChanged} /></React.Suspense> : null}
+      <HostHealthFilters onlyHealthy={onlyHealthy} arch={healthArch} cpu={minimumCpu} memory={minimumMemory} sort={sortPrefs}
+        onChange={value => { setOnlyHealthy(value.onlyHealthy); setHealthArch(value.arch); setMinimumCpu(value.cpu); setMinimumMemory(value.memory); setPage(1); }}
+        onSort={value => { setSortPrefs(value); setPage(1); }} />
 
       {batch.selectionMode ? (
         <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-white px-3 py-2 text-sm">
@@ -687,6 +709,10 @@ export function ClientMarketPage() {
           <Button variant="ghost" size="sm" isDisabled={batch.batchBusy || batch.selectedCount === 0} onClick={batch.clearSelection}>
             {t("clientMarket.batchClear")}
           </Button>
+          <Button variant="outline" size="sm" className="min-h-11" isDisabled={monitorBatchBusy || batch.batchBusy || monitorTargets.length === 0} onPress={() => void enqueueSelectedMonitors()}>
+            {monitorBatchBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}{t("hostHealth.bootstrapBatch", { count: monitorTargets.length })}
+          </Button>
+          {monitorBatchResult ? <p role="status" className="text-xs text-muted-foreground">{t("hostHealth.bootstrapBatchResult", monitorBatchResult)}</p> : null}
           <span className="mx-1 h-4 w-px bg-border" aria-hidden />
           <Button
             variant="outline"
@@ -799,6 +825,7 @@ export function ClientMarketPage() {
           {ownerFilters.length ||
           regionFilters.length ||
           marketProviderId ||
+          healthFiltersActive ||
           listTab !== (authed ? "mine" : "all") ? (
             <button
               type="button"
@@ -807,6 +834,7 @@ export function ClientMarketPage() {
                 setListTab(authed ? "mine" : "all");
                 setOwnerFilters([]);
                 setRegionFilters([]);
+                setOnlyHealthy(false); setHealthArch(""); setMinimumCpu(""); setMinimumMemory("");
                 if (marketProviderId) clearMarketProvider();
               }}
             >
@@ -815,9 +843,9 @@ export function ClientMarketPage() {
           ) : null}
         </div>
       ) : (
-        <div className="overflow-hidden rounded-xl border border-border bg-card shadow-sm">
-          <div className="max-h-[min(70vh,40rem)] overflow-auto">
-            <table className="w-full min-w-[56rem] border-collapse text-sm">
+        <div className="client-market-hosts-frame overflow-hidden rounded-xl border border-border bg-card shadow-sm">
+          <div className="client-market-hosts-scroll max-h-[min(70vh,40rem)] overflow-auto">
+            <table className="client-market-hosts-table w-full min-w-[56rem] border-collapse text-sm" role="table">
               <caption className="sr-only">{t("clientMarket.hostsTableCaption")}</caption>
               <thead>
                 <tr>
@@ -848,7 +876,8 @@ export function ClientMarketPage() {
                       </Checkbox>
                     </th>
                   ) : null}
-                  <HostSortHeader columnKey="status" sortPrefs={sortPrefs} onSort={toggleHostSort} />
+                  <HostSortHeader columnKey="status" labelKey="hostHealth.colStatus" sortPrefs={sortPrefs} onSort={toggleHostSort} />
+                  <th data-column="specs" scope="col" className="sticky top-0 z-10 border-b border-border bg-card px-3 py-3 text-left text-xs font-medium text-muted-foreground" title={t("hostHealth.selfReported")}>{t("hostHealth.colSpecs")}</th>
                   <HostSortHeader
                     columnKey="region"
                     sortPrefs={sortPrefs}
@@ -892,8 +921,7 @@ export function ClientMarketPage() {
                     sortPrefs={sortPrefs}
                     onSort={toggleHostSort}
                   />
-                  <HostSortHeader columnKey="subdomain" sortPrefs={sortPrefs} onSort={toggleHostSort} />
-                  <HostSortHeader columnKey="ip" sortPrefs={sortPrefs} onSort={toggleHostSort} />
+                  <HostSortHeader columnKey={sortPrefs.key === "subdomain" ? "subdomain" : "ip"} labelKey="hostHealth.colHost" sortPrefs={sortPrefs} onSort={toggleHostSort} />
                   <th
                     scope="col"
                     className="sticky top-0 z-10 whitespace-nowrap border-b border-border bg-card px-2 py-2 text-right text-xs font-medium text-muted-foreground"
@@ -906,6 +934,7 @@ export function ClientMarketPage() {
                 {pagedHosts.map((host) => (
                   <HostRow
                     key={host.id}
+                    onHealthOpen={openHealth}
                     host={host}
                     terminationSummary={terminationByHost.get(host.id)}
                     onTerminationOpen={setTerminationId}

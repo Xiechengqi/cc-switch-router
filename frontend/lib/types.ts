@@ -2342,7 +2342,14 @@ export type HostHealthSnapshot = {
   cpuUsagePct: HostHealthReading;
 };
 export type HostHealth = {
-  state: "awaiting_first" | "first_overdue" | "healthy" | "unknown" | "missed" | "revoked";
+  state: "not_enabled" | "deploying" | "deployment_failed" | "awaiting_first" | "first_overdue" | "healthy" | "unknown" | "missed" | "revoked";
+  machineEpoch?: number;
+  deployment?: {
+    state: "not_enabled" | "queued" | "installing" | "failed" | "awaiting_first" | "active" | "paused";
+    reason: string | null;
+    canBootstrap: boolean;
+    deployedCommit: string | null;
+  };
   lastReceivedAt: string | null;
   sampledAt: string | null;
   nextDueAt: string | null;

@@ -1726,8 +1726,8 @@ export async function getClientMarketHostHealth(hostId: string, signal?: AbortSi
   );
 }
 
-export async function manageClientMarketHostHealth(hostId: string, action: "retry" | "rotate-key" | "replace", options?: { expectedMachineEpoch?: number; compromised?: boolean }) {
-  const input = action === "replace"
+export async function manageClientMarketHostHealth(hostId: string, action: "retry" | "rotate-key" | "replace" | "bootstrap", options?: { expectedMachineEpoch?: number; expectedInstallationId?: string; compromised?: boolean }) {
+  const input = action === "bootstrap" ? { expectedInstallationId: options?.expectedInstallationId, expectedMachineEpoch: options?.expectedMachineEpoch } : action === "replace"
     ? { expectedMachineEpoch: options?.expectedMachineEpoch }
     : action === "rotate-key" ? { compromised: options?.compromised ?? false } : {};
   return parseJson<{ queued: boolean }>(

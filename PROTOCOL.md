@@ -1087,8 +1087,16 @@ Router 协议响应带 `routerTime`，已认证且结构有效的请求同时回
 
 列表 `GET /v1/client-market/hosts` 和报价项共用 `hostHealth`，包含状态、绝对时间、24 小时收到／可观测计数、连续缺报、启动方式和裁剪后的快照。创建报价时冻结买家公开级投影。`GET /v1/client-market/hosts/:id/health` 按需返回当前代最多 7 天的小时记录和授权样本。状态即时更新，计数按各小时接收截止时刻推进，已知接收中断的无样本时段排除分母。
 
+摘要还包含 `machineEpoch` 和 `deployment={state,reason,canBootstrap,deployedCommit}`。部署状态为 `not_enabled`、`queued`、`installing`、`failed`、`awaiting_first`、`active`、`paused`；无报告时主健康状态相应为 `not_enabled`、`deploying`、`deployment_failed`、`awaiting_first`／`first_overdue` 或 `revoked`。已收到报告后的新鲜度仍遵守原有小时规则。没有公钥或首报排程时不可声称在等待首报，零个可观测小时不伪造 `0/0` 或满分记录。`canBootstrap` 仅对当前 Host owner 及符合当前租约、机器／密钥代次的首次接入上下文为真；公开投影固定为 false。
+
 租中报告继续计入上报记录。只有可证为空闲的动态资源可公开，租户只读本人当前租约的用量。跨租约或时钟归属不明时隐藏动态字段，清理租约后仍保留占用区间用于保护迟到报告。
 
 供应商调用 `POST /v1/client-market/hosts/:id/health/retry` 重试准备或维护，调用 `/health/rotate-key` 排队轮换（提交 `compromised=true` 会先立即撤销），调用 `/health/replace` 并提交 `expectedMachineEpoch` 排队确认物理换机。换机先关闭库存并撤销，旧发送方停止后新代从下一完整小时首报。删除先撤销，再按可信归属卸载。
+
+已出租存量 Host 的首次监测接入使用 `POST /v1/client-market/hosts/:id/health/bootstrap`，严格接收 `{expectedInstallationId,expectedMachineEpoch}`。必须为 Host owner；Host 当前为 `allocated`、租约为 `active`／`billing_suspended`、本代尚未首报且保留存量标记，没有撤销、换机、重新准入、轮换或开通任务。已有公钥只允许同一接入任务恢复。上下文不符返回 409，非 owner 返回 403；同一上下文重复入队幂等返回 200 `{queued:true}`，不代表已完成安装或收到报告。
+
+接入任务通过迁移 125 独立持久化，和空闲维护共享 SSH 并发限制、Host 锁及动作序号。每个远端阶段前后复核当前租约与身份，退租、换绑或 owner 变更取消 owner 发起的任务；撤销／换代取消旧任务。失败保留诊断，间隔 15 分钟、最多自动尝试三次，owner 可显式重试。接入不执行包管理器，不改租用状态、租约、订单或账务，也不替换／重启租户 `serve`；重试保留同代密钥及已交付首报排程，不补发小时报告。常规升级和换机仍遵守空闲维护限制。
+
+部署运维可在 Router 所在主机执行 `cc-switch-router host-health bootstrap --host-id ID --expected-installation-id ID --expected-machine-epoch N [--env-file PATH]`。命令仅通过现有 0600 管理 socket，由 root 或 Router UID 在在线进程内完成同样的上下文校验与入队；没有直接数据库写入或离线回退。运维任务不以某个市场用户的 owner 身份授权，但仍固定租约和机器上下文，仍不能跨租约执行。
 
 Host 从 `onboarding` 开始，经本代首报转 `idle`。维护与报价竞争 `idle→maintaining` 和 `idle→reserved`，远端维护、换机和安装共用锁与动作序号。支持 systemd、活动 OpenRC，以及作为容器 PID 1 运行且配置目录为 `/etc/supervisor/conf.d` 的 SupervisorD；仅检测到后台 SupervisorD 不能证明重启恢复，按 nohup 降级处理。降级环境在买家主行和报价提示未配置开机自启。[设计与验收计划](docs/client-market-host-health-plan.md)

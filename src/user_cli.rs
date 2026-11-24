@@ -26,6 +26,11 @@ const MAX_FRAME: u64 = 8192;
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
+    HostHealthBootstrap {
+        host_id: String,
+        expected_installation_id: String,
+        expected_machine_epoch: i64,
+    },
     FinanceSecurity {
         email: String,
         operation: String,
@@ -154,6 +159,27 @@ async fn handle(
     actor: &str,
 ) -> Result<Reply> {
     match request {
+        Request::HostHealthBootstrap {
+            host_id,
+            expected_installation_id,
+            expected_machine_epoch,
+        } => {
+            crate::client_market::health::bootstrap::enqueue_operator(
+                store,
+                &host_id,
+                &crate::client_market::health::bootstrap::BootstrapRequest {
+                    expected_installation_id,
+                    expected_machine_epoch,
+                },
+                actor,
+            )
+            .await?;
+            Ok(Reply {
+                status: None,
+                operation_id: Some(host_id),
+                error: None,
+            })
+        }
         Request::FinanceSecurity {
             email,
             operation,
@@ -493,6 +519,70 @@ async fn call_online(config: &Config, request: Request) -> Result<Reply> {
     }).await.context("admin request timed out; check the operation ID before retrying; do not switch to offline writes")?
 }
 
+/// The existing UID-authenticated admin channel keeps all writes inside Router.
+pub(crate) async fn run_host_health(args: Vec<String>) -> Result<()> {
+    let mut args = args.into_iter();
+    anyhow::ensure!(
+        args.next().as_deref() == Some("bootstrap"),
+        "use host-health bootstrap --host-id ID --expected-installation-id ID --expected-machine-epoch N"
+    );
+    let mut host = None;
+    let mut installation = None;
+    let mut epoch = None;
+    let mut env_file = None;
+    let mut seen = std::collections::HashSet::new();
+    while let Some(flag) = args.next() {
+        anyhow::ensure!(
+            seen.insert(flag.clone()),
+            "duplicate monitor bootstrap option"
+        );
+        let value = args
+            .next()
+            .context("monitor bootstrap option requires a value")?;
+        match flag.as_str() {
+            "--host-id" => host = Some(value),
+            "--expected-installation-id" => installation = Some(value),
+            "--expected-machine-epoch" => {
+                epoch = Some(value.parse::<i64>().context("invalid machine epoch")?)
+            }
+            "--env-file" => env_file = Some(PathBuf::from(value)),
+            _ => bail!("unsupported monitor bootstrap option"),
+        }
+    }
+    let host = host.context("--host-id is required")?;
+    let installation = installation.context("--expected-installation-id is required")?;
+    let epoch = epoch.context("--expected-machine-epoch is required")?;
+    anyhow::ensure!(
+        !host.is_empty() && !installation.is_empty() && epoch > 0,
+        "invalid monitor bootstrap context"
+    );
+    crate::config::load_env_file(&env_file.unwrap_or_else(crate::config::default_env_path))?;
+    let config = Config::from_env();
+    #[cfg(unix)]
+    {
+        let reply = call_online(
+            &config,
+            Request::HostHealthBootstrap {
+                host_id: host.clone(),
+                expected_installation_id: installation,
+                expected_machine_epoch: epoch,
+            },
+        )
+        .await?;
+        if let Some(error) = reply.error {
+            bail!("{error}")
+        }
+        anyhow::ensure!(
+            reply.operation_id.as_deref() == Some(host.as_str()),
+            "unexpected monitor bootstrap acknowledgement"
+        );
+        println!("{}", serde_json::json!({"hostId":host,"queued":true}));
+    }
+    #[cfg(not(unix))]
+    bail!("monitor bootstrap administration requires Unix");
+    Ok(())
+}
+
 pub(crate) async fn run(args: Vec<String>) -> Result<()> {
     if args.first().is_some_and(|s| s == "finance-passkey") {
         return run_financial(args.into_iter().skip(1).collect()).await;
@@ -541,6 +631,9 @@ pub(crate) async fn run(args: Vec<String>) -> Result<()> {
             #[cfg(not(unix))]
             let actor = "unsupported";
             match request {
+                Request::HostHealthBootstrap { .. } => {
+                    bail!("monitor bootstrap requires the online Router admin channel")
+                }
                 Request::FinanceSecurity {
                     email,
                     operation,
@@ -894,6 +987,92 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_socket_bootstraps_only_the_expected_rental_without_other_writes() {
+        let fixture = Fixture::new();
+        fixture.seed().await;
+        {
+            let conn = fixture.store.conn.lock().await;
+            let now = Utc::now().to_rfc3339();
+            conn.execute("INSERT INTO router_ssh_hosts(id,ip,port,host_owner_email,provider_id,status,created_at,updated_at) VALUES('socket-host','192.0.2.46',22,'cli@example.test','cli-user','onboarding',?1,?1)", params![now]).unwrap();
+            conn.execute(
+                "UPDATE client_host_agents SET legacy=1 WHERE host_id='socket-host'",
+                [],
+            )
+            .unwrap();
+            conn.execute("UPDATE router_ssh_hosts SET status='allocated',installation_id='socket-lease' WHERE id='socket-host'", []).unwrap();
+            conn.execute("INSERT INTO client_market_subscriptions(installation_id,host_id,provider_id,host_owner_email,client_user_id,client_owner_email,status,offer_revision,created_at,updated_at) VALUES('socket-lease','socket-host','cli-user','cli@example.test','cli-user','cli@example.test','active',7,?1,?1)", params![now]).unwrap();
+        }
+        let unchanged = |conn: &Connection| {
+            conn.query_row("SELECT h.status,h.installation_id,s.status,s.offer_revision,(SELECT COUNT(*) FROM users),(SELECT COUNT(*) FROM auth_password_events),(SELECT COUNT(*) FROM market_wallet_accounts),(SELECT COUNT(*) FROM market_wallet_holds) FROM router_ssh_hosts h JOIN client_market_subscriptions s ON s.host_id=h.id WHERE h.id='socket-host'", [], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, i64>(4)?,
+                        r.get::<_, i64>(5)?,
+                        r.get::<_, i64>(6)?,
+                        r.get::<_, i64>(7)?,
+                    ))
+                })
+                .unwrap()
+        };
+        let before = unchanged(&*fixture.store.conn.lock().await);
+        let _lock = crate::process_lock::ProcessLock::acquire(&fixture.config.data_dir).unwrap();
+        let listener = bind(&fixture.config).unwrap();
+        let service = tokio::spawn(serve(
+            listener,
+            fixture.store.clone(),
+            fixture.config.clone(),
+        ));
+        for (installation, epoch) in [("wrong-lease", 1), ("socket-lease", 2)] {
+            let reply = call_online(
+                &fixture.config,
+                Request::HostHealthBootstrap {
+                    host_id: "socket-host".into(),
+                    expected_installation_id: installation.into(),
+                    expected_machine_epoch: epoch,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(reply.error.is_some());
+        }
+        for _ in 0..2 {
+            let reply = call_online(
+                &fixture.config,
+                Request::HostHealthBootstrap {
+                    host_id: "socket-host".into(),
+                    expected_installation_id: "socket-lease".into(),
+                    expected_machine_epoch: 1,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(reply.error.is_none());
+            assert_eq!(reply.operation_id.as_deref(), Some("socket-host"));
+        }
+        {
+            let conn = fixture.store.conn.lock().await;
+            assert_eq!(unchanged(&conn), before);
+            let task: (String, String, Option<String>, i64) = conn.query_row("SELECT status,requested_by,owner_user_id,operation_sequence FROM client_host_agent_bootstraps WHERE host_id='socket-host'", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+            assert_eq!(task, ("pending".into(), format!("uid:{}", uid()), None, 1));
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM client_host_hour_reports", [], |r| r
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+                0
+            );
+        }
+        service.abort();
+        let _ = service.await;
+        assert!(!socket_path(&fixture.config).exists());
     }
 
     #[cfg(unix)]

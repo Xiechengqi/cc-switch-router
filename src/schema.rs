@@ -428,6 +428,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../schema/0123_trial_conversion_cursor_repair.sql"),
     ),
     (124, include_str!("../schema/0124_client_host_health.sql")),
+    (
+        125,
+        include_str!("../schema/0125_client_host_health_bootstrap.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -937,6 +941,44 @@ fn migration_checksum(sql: &str) -> String {
 mod tests {
 
     #[test]
+    fn migration_125_does_not_modify_rental_or_existing_monitor_identity() {
+        let conn = memory_connection();
+        install_schema_through(&conn, 124);
+        conn.execute("INSERT INTO router_ssh_hosts(id,ip,port,host_owner_email,status,created_at,updated_at) VALUES('rented','192.0.2.45',22,'owner@example.test','onboarding','2026-01-01','2026-01-01')",[]).unwrap();
+        conn.execute(
+            "UPDATE router_ssh_hosts SET status='allocated',installation_id='lease' WHERE id='rented'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(conn.execute("UPDATE client_host_agents SET legacy=1,public_key='unchanged',first_due_at=1000,key_generation=2,operation_sequence=8 WHERE host_id='rented'",[]).unwrap(), 1);
+        conn.execute("INSERT INTO client_market_subscriptions(installation_id,host_id,provider_id,host_owner_email,client_user_id,client_owner_email,status,offer_revision,created_at,updated_at) VALUES('lease','rented','provider','owner@example.test','buyer','buyer@example.test','active',7,'2026-01-01','2026-01-01')", []).unwrap();
+        apply(&conn).unwrap();
+        let actual:(String,String,String,i64,i64,i64,String,i64)=conn.query_row("SELECT h.status,h.installation_id,a.public_key,a.first_due_at,a.key_generation,a.operation_sequence,s.status,s.offer_revision FROM router_ssh_hosts h JOIN client_host_agents a ON a.host_id=h.id JOIN client_market_subscriptions s ON s.installation_id=h.installation_id WHERE h.id='rented'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))).unwrap();
+        assert_eq!(
+            actual,
+            (
+                "allocated".into(),
+                "lease".into(),
+                "unchanged".into(),
+                1000,
+                2,
+                8,
+                "active".into(),
+                7
+            )
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM client_host_agent_bootstraps",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn migration_124_preserves_existing_host_and_rental_facts() {
         let conn = memory_connection();
         install_schema_through(&conn, 123);
@@ -997,7 +1039,8 @@ mod tests {
     // resource tariffs/capabilities (0111), owner model prices (0113), and
     // browser/financial credentials, risk evidence and recovery (0114–0116).
     // Migration 124 Host health adds eight tables, including retired Host IDs by address.
-    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 312;
+    // Migration 125 adds the lease-bound initial monitor bootstrap queue.
+    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 313;
 
     #[test]
     fn migration_114_revokes_existing_sessions_and_rotation_grace_only_once() {

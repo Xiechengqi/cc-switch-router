@@ -1,5 +1,41 @@
 [
   {
+    "date": "2026-11-23",
+    "macrostructure": "compact market workbench",
+    "theme": "existing Router system",
+    "enrichment": "none",
+    "brief": "Compact Host monitoring summary, specifications and responsive rental cards",
+    "scope": "Client Market list, Host detail drawer and checkout summary",
+    "review": {
+      "contrast": "Computed WCAG text and focus-ring assertions passed",
+      "viewports": [
+        320,
+        375,
+        414,
+        768,
+        1280,
+        1440
+      ],
+      "drawer_viewports": [
+        320,
+        375,
+        414,
+        768,
+        1440
+      ],
+      "checks": [
+        "compact rows",
+        "no horizontal overflow",
+        "mobile selection does not cover health controls",
+        "visible close icon",
+        "owner and tenant controls isolated",
+        "time sync warnings preserved in rows and quotes",
+        "partial hardware explicitly shows unknown fields",
+        "real deployed Host data checked at desktop and mobile widths"
+      ]
+    }
+  },
+  {
     "date": "2026-09-28",
     "macrostructure": "Workbench",
     "theme": "existing Router system",

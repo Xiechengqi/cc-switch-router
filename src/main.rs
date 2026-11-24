@@ -1596,6 +1596,10 @@ async fn try_handle_cli() -> Result<bool> {
     };
 
     match arg.as_str() {
+        "host-health" => {
+            user_cli::run_host_health(args.collect()).await?;
+            Ok(true)
+        }
         "user" => {
             user_cli::run(args.collect()).await?;
             Ok(true)
@@ -1689,6 +1693,7 @@ Usage:
   cc-switch-router check-db
   cc-switch-router build-info
   cc-switch-router rotate-provision-ssh-key
+  cc-switch-router host-health bootstrap --host-id ID --expected-installation-id ID --expected-machine-epoch N [--env-file PATH]
   cc-switch-router user password status --email EMAIL [--env-file PATH] [--offline]
   cc-switch-router user password set --email EMAIL [--env-file PATH] [--offline]
   cc-switch-router user password set --email EMAIL --password-stdin --yes

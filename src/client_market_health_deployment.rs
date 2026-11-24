@@ -120,7 +120,15 @@ fn remote_fence_taking_over(host: &str, sequence: i64, takeover: &[String]) -> S
 /// Each enrollment step may take up to `SSH_INSTALL_TIMEOUT`; refreshing the claim
 /// between steps keeps the stale-claim recovery from returning a Host to the pool
 /// while its remote work is still running.
-async fn refresh_claim(store: &AppStore, host: &str, sequence: i64) -> Result<(), AppError> {
+async fn refresh_claim(
+    store: &AppStore,
+    host: &str,
+    sequence: i64,
+    rental: Option<&bootstrap::Claim>,
+) -> Result<(), AppError> {
+    if let Some(claim) = rental {
+        return bootstrap::refresh(store, claim).await;
+    }
     store
         .conn
         .lock()
@@ -212,14 +220,52 @@ pub(crate) async fn enroll(
     release: &crate::client_server_release::InstallationRelease,
     sequence: i64,
 ) -> Result<(), AppError> {
+    enroll_context(state, host, release, sequence, None).await
+}
+
+pub(super) async fn enroll_rental(
+    state: &ServerState,
+    host: &RouterSshHostRecord,
+    release: &crate::client_server_release::InstallationRelease,
+    claim: &bootstrap::Claim,
+) -> Result<(), AppError> {
+    enroll_context(state, host, release, claim.sequence, Some(claim)).await
+}
+
+fn enrollment_valid(
+    conn: &Connection,
+    host: &str,
+    sequence: i64,
+    rental: Option<&bootstrap::Claim>,
+) -> Result<bool, AppError> {
+    if let Some(claim) = rental {
+        return bootstrap::valid(conn, claim);
+    }
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM client_host_agents a JOIN router_ssh_hosts h ON h.id=a.host_id WHERE a.host_id=?1 AND a.operation_sequence=?2 AND h.status IN ('onboarding','maintaining') AND h.installation_id IS NULL)",
+        params![host,sequence],|row|row.get(0)).map_err(database)
+}
+
+async fn enroll_context(
+    state: &ServerState,
+    host: &RouterSshHostRecord,
+    release: &crate::client_server_release::InstallationRelease,
+    sequence: i64,
+    rental: Option<&bootstrap::Claim>,
+) -> Result<(), AppError> {
+    refresh_claim(&state.store, &host.id, sequence, rental).await?;
     let takeover = retired_ids_at_address(&state.store, host).await?;
+    let prepare = if rental.is_some() {
+        binary::prepare_standby_command(release)
+    } else {
+        binary::prepare_command(release, false)
+    };
     // Download before choosing the first slot or anchoring the managed clock.
     ssh_run_remote_with_input(
         &state.provision_ssh_key_path,
         &known_hosts_path(&state.config),
         &host.ip,
         host.port,
-        &binary::prepare_command(release, false),
+        &prepare,
         None,
         SSH_INSTALL_TIMEOUT,
         SshHostKeyPolicy::RequireKnown,
@@ -236,8 +282,13 @@ pub(crate) async fn enroll(
             |row| row.get(0),
         )
         .map_err(database)?;
-    refresh_claim(&state.store, &host.id, sequence).await?;
+    refresh_claim(&state.store, &host.id, sequence, rental).await?;
     if replacement {
+        if rental.is_some() {
+            return Err(AppError::Conflict(
+                "Rental bootstrap cannot replace a machine".into(),
+            ));
+        }
         let command = format!(
             "{}\n{}",
             remote_fence_taking_over(&host.id, sequence, &takeover),
@@ -257,7 +308,7 @@ pub(crate) async fn enroll(
         let conn = state.store.conn.lock().await;
         let tx = conn.transaction().map_err(database)?;
         let next_hour = Utc::now().timestamp() / 3600 + 1;
-        let changed=tx.execute("UPDATE client_host_agents SET machine_epoch=machine_epoch+1,key_generation=1,public_key=NULL,admitted_hour=NULL,legacy=0,readmission_pending=0,first_due_at=?3,latest_hour=NULL,latest_sample_json=NULL,latest_received_at=NULL,latest_public=0,latest_lease_id=NULL,summary_json=NULL,revoked=0,replacement_pending=0,last_error=NULL,next_deadline=0 WHERE host_id=?1 AND operation_sequence=?2 AND replacement_pending=1",
+        let changed=tx.execute("UPDATE client_host_agents SET machine_epoch=machine_epoch+1,key_generation=1,public_key=NULL,admitted_hour=NULL,legacy=0,readmission_pending=0,first_due_at=?3,latest_hour=NULL,latest_sample_json=NULL,latest_received_at=NULL,latest_public=0,latest_lease_id=NULL,summary_json=NULL,deployed_commit=NULL,deployed_at=NULL,revoked=0,replacement_pending=0,last_error=NULL,next_deadline=0 WHERE host_id=?1 AND operation_sequence=?2 AND replacement_pending=1",
             params![host.id,sequence,wire::due_at(&host.id,next_hour)]).map_err(database)?;
         if changed != 1 {
             return Err(AppError::Conflict("Host replacement superseded".into()));
@@ -298,13 +349,21 @@ pub(crate) async fn enroll(
     let challenge = Uuid::new_v4().to_string();
     let command = format!(
         "{}\n{}\n{}",
-        binary::prepare_command(release, false),
+        prepare,
         remote_fence_taking_over(&host.id, sequence, &takeover),
         STAGE
             .replace("@CONFIG@", &shell_quote(&encoded))
             .replace("@CHALLENGE@", &shell_quote(&challenge))
+            .replace(
+                "@GUARD@",
+                &rental
+                    .map(|c| RENTAL_GUARD
+                        .replace("@EPOCH@", &c.epoch.to_string())
+                        .replace("@GENERATION@", &c.generation.to_string()))
+                    .unwrap_or_default()
+            )
     );
-    refresh_claim(&state.store, &host.id, sequence).await?;
+    refresh_claim(&state.store, &host.id, sequence, rental).await?;
     let output = ssh_run_remote_with_input(
         &state.provision_ssh_key_path,
         &known_hosts_path(&state.config),
@@ -349,8 +408,7 @@ pub(crate) async fn enroll(
     {
         let conn = state.store.conn.lock().await;
         let tx = conn.transaction().map_err(database)?;
-        let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM client_host_agents a JOIN router_ssh_hosts h ON h.id=a.host_id WHERE a.host_id=?1 AND a.operation_sequence=?2 AND h.status IN ('onboarding','maintaining') AND h.installation_id IS NULL)",
-            params![host.id,sequence],|row|row.get(0)).map_err(database)?;
+        let valid = enrollment_valid(&tx, &host.id, sequence, rental)?;
         if !valid {
             return Err(AppError::Conflict(
                 "Host enrollment changed concurrently".into(),
@@ -381,7 +439,7 @@ pub(crate) async fn enroll(
         refresh_summary(&tx, &host.id, now)?;
         tx.commit().map_err(database)?;
     }
-    refresh_claim(&state.store, &host.id, sequence).await?;
+    refresh_claim(&state.store, &host.id, sequence, rental).await?;
     let command = format!(
         "{}\n{}",
         remote_fence_taking_over(&host.id, sequence, &takeover),
@@ -400,25 +458,52 @@ pub(crate) async fn enroll(
     .await?;
     let conn = state.store.conn.lock().await;
     let tx = conn.transaction().map_err(database)?;
-    let changed=tx.execute("UPDATE client_host_agents SET maintenance_pending=0,last_error=NULL WHERE host_id=?1 AND operation_sequence=?2 AND revoked=0",
-        params![host.id,sequence]).map_err(database)?;
+    if !enrollment_valid(&tx, &host.id, sequence, rental)? {
+        return Err(AppError::Conflict(
+            "Monitor enrollment context changed before completion".into(),
+        ));
+    }
+    let changed=tx.execute("UPDATE client_host_agents SET maintenance_pending=0,last_error=NULL,deployed_commit=?3,deployed_at=?4 WHERE host_id=?1 AND operation_sequence=?2 AND revoked=0",
+        params![host.id,sequence,release.commit,Utc::now().timestamp()]).map_err(database)?;
     if changed != 1 {
         return Err(AppError::Conflict(
             "Host enrollment completion was superseded".into(),
         ));
     }
-    tx.execute("UPDATE router_ssh_hosts SET status=CASE WHEN EXISTS(SELECT 1 FROM client_host_agents WHERE host_id=?1 AND (admitted_hour IS NOT NULL OR legacy=1) AND revoked=0 AND readmission_pending=0) THEN 'idle' ELSE 'onboarding' END,updated_at=?3
+    if rental.is_some() {
+        tx.execute("UPDATE client_host_agent_bootstraps SET status='succeeded',last_error=NULL,updated_at=?3 WHERE host_id=?1 AND operation_sequence=?2 AND status='running'",
+            params![host.id,sequence,Utc::now().to_rfc3339()]).map_err(database)?;
+    } else {
+        tx.execute("UPDATE router_ssh_hosts SET status=CASE WHEN EXISTS(SELECT 1 FROM client_host_agents WHERE host_id=?1 AND (admitted_hour IS NOT NULL OR legacy=1) AND revoked=0 AND readmission_pending=0) THEN 'idle' ELSE 'onboarding' END,updated_at=?3
         WHERE id=?1 AND status='maintaining' AND installation_id IS NULL AND EXISTS(SELECT 1 FROM client_host_agents WHERE host_id=?1 AND operation_sequence=?2)",
         params![host.id,sequence,Utc::now().to_rfc3339()]).map_err(database)?;
-    tx.execute("UPDATE client_binary_preparations SET status='ready',attempts=0,selector=?2,commit_id=?3,last_error=NULL,updated_at=?4 WHERE host_id=?1",
+        tx.execute("UPDATE client_binary_preparations SET status='ready',attempts=0,selector=?2,commit_id=?3,last_error=NULL,updated_at=?4 WHERE host_id=?1",
         params![host.id,release.selector,release.commit,Utc::now().to_rfc3339()]).map_err(database)?;
+    }
     tx.commit().map_err(database)
 }
+
+const RENTAL_GUARD: &str = r#"
+[ ! -L "$config" ] && [ ! -L "$state" ] || { echo 'unverified monitor path ownership' >&2; exit 1; }
+if [ -e "$config" ]; then
+  command -v python3 >/dev/null 2>&1 || { echo 'python3 is required to verify an existing monitor configuration' >&2; exit 1; }
+  python3 - "$config" "$expected_host" @EPOCH@ @GENERATION@ "$state" "$expected_seq" <<'VERIFY_MONITOR'
+import json, sys
+with open(sys.argv[1]) as file:
+    config=json.load(file)
+if not (config.get('hostId')==sys.argv[2] and config.get('machineEpoch')==int(sys.argv[3])
+        and config.get('keyGeneration')==int(sys.argv[4]) and config.get('stateDir')==sys.argv[5]
+        and config.get('operationSequence',0)<=int(sys.argv[6])):
+    sys.exit('existing monitor identity does not match this rental bootstrap')
+VERIFY_MONITOR
+fi
+"#;
 
 const STAGE: &str = r#"
 binary=/usr/local/bin/cc-switch-host-standby
 config=/etc/cc-switch-host-standby/config.json
 state=/var/lib/cc-switch-host-standby
+@GUARD@
 "$prepared_binary" version --json | tr -d ' \n' | grep -Eq '"hostHealthProtocolVersion":1[,}]' || { echo 'Server does not support Host health v1' >&2; exit 1; }
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
   supervisor=systemd
@@ -544,6 +629,45 @@ fi
 #[cfg(test)]
 mod shell_tests {
     use super::*;
+
+    #[test]
+    fn rental_monitor_guard_verifies_identity_before_any_service_is_stopped() {
+        let directory = std::env::temp_dir().join(format!("rental-guard-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let config = directory.join("config.json");
+        let prefix = format!(
+            "config={}\nstate={}\nexpected_host=expected-host\nexpected_seq=3\n",
+            shell_quote(config.to_str().unwrap()),
+            shell_quote(directory.to_str().unwrap())
+        );
+        let command = format!(
+            "{prefix}{}",
+            RENTAL_GUARD
+                .replace("@EPOCH@", "1")
+                .replace("@GENERATION@", "1")
+        );
+        for (id, epoch, generation, seq, allowed) in [
+            ("expected-host", 1, 1, 2, true),
+            ("foreign-host", 1, 1, 2, false),
+            ("expected-host", 2, 1, 2, false),
+            ("expected-host", 1, 2, 2, false),
+            ("expected-host", 1, 1, 4, false),
+        ] {
+            fs::write(&config,json!({"hostId":id,"machineEpoch":epoch,"keyGeneration":generation,"operationSequence":seq,"stateDir":directory}).to_string()).unwrap();
+            let output = std::process::Command::new("sh")
+                .arg("-ec")
+                .arg(&command)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.success(),
+                allowed,
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn supervisor_autostart_requires_a_persistent_container_entrypoint() {

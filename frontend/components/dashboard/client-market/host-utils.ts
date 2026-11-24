@@ -8,6 +8,7 @@ import type {
 } from "@/lib/types";
 import type { MessageKey } from "@/lib/i18n";
 import { formatMarketPrice as formatUsdMoney, MARKET_CURRENCY } from "@/lib/market-money";
+import { hostHealthRecordRatio } from "@/lib/host-health-view";
 
 /**
  * Pure helpers, constants and types shared by the Client Market surfaces.
@@ -711,7 +712,7 @@ export function buildHostPageItems(current: number, total: number): Array<number
   return items;
 }
 
-export const HOST_SORT_KEYS = ["status", "region", "owner", "offer", "subdomain", "ip"] as const;
+export const HOST_SORT_KEYS = ["status", "region", "owner", "offer", "subdomain", "ip", "health"] as const;
 export type HostSortKey = (typeof HOST_SORT_KEYS)[number];
 export type HostSortDir = "asc" | "desc";
 export type HostSortPrefs = { key: HostSortKey | null; dir: HostSortDir };
@@ -772,6 +773,9 @@ export function hostStatusSeverity(status: string): number {
 
 export function compareHostsBySortKey(left: ClientMarketHost, right: ClientMarketHost, key: HostSortKey) {
   switch (key) {
+    case "health":
+      return hostHealthRecordRatio(left.hostHealth) - hostHealthRecordRatio(right.hostHealth)
+        || (left.hostHealth?.observable24h || 0) - (right.hostHealth?.observable24h || 0);
     case "status": {
       const severity = hostStatusSeverity(left.status) - hostStatusSeverity(right.status);
       // Fall back to the raw label so two unknown statuses still order deterministically.
@@ -846,6 +850,7 @@ export function hostStatusTabTone(status: HostListTab, active: boolean) {
 }
 
 export const HOST_SORT_COLUMN_LABELS: Record<HostSortKey, MessageKey> = {
+  health: "hostHealth.sort",
   status: "clientMarket.col.status",
   region: "clientMarket.col.region",
   owner: "clientMarket.col.owner",

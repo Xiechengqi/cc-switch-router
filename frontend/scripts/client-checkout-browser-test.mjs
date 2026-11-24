@@ -40,6 +40,43 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
     const page = await browser.newPage({
       viewport: { width: 768, height: 900 },
     });
+    const assertHealthContrast = async (selector, property = "color", minimum = 4.5) => {
+      const ratios = await page.locator(selector).evaluateAll((nodes, property) => {
+        const canvas = document.createElement("canvas");
+        canvas.width = canvas.height = 1;
+        const context = canvas.getContext("2d", { willReadFrequently: true });
+        const rgba = color => {
+          context.clearRect(0, 0, 1, 1);
+          context.fillStyle = color;
+          context.fillRect(0, 0, 1, 1);
+          return [...context.getImageData(0, 0, 1, 1).data];
+        };
+        const blend = (front, back) => front.slice(0, 3).map((value, index) => value * front[3] / 255 + back[index] * (1 - front[3] / 255));
+        const luminance = rgb => rgb.map(value => value / 255).map(value => value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4).reduce((sum, value, index) => sum + value * [0.2126, 0.7152, 0.0722][index], 0);
+        return nodes.filter(node => node.getBoundingClientRect().width > 0).map(node => {
+          const ancestors = [];
+          for (let element = node; element; element = element.parentElement) ancestors.unshift(element);
+          const background = ancestors.reduce((color, element) => blend(rgba(getComputedStyle(element).backgroundColor), color), [255, 255, 255]);
+          const foreground = blend(rgba(getComputedStyle(node)[property]), background);
+          const values = [luminance(foreground), luminance(background)].sort((a, b) => a - b);
+          return { text: node.textContent, ratio: (values[1] + 0.05) / (values[0] + 0.05) };
+        });
+      }, property);
+      assert.ok(ratios.length > 0, `missing contrast target ${selector}`);
+      for (const result of ratios) assert.ok(result.ratio >= minimum, `contrast below ${minimum} for ${selector}: ${JSON.stringify(result)}`);
+    };
+    const assertHealthDrawerWidths = async (name) => {
+      for (const width of [320, 375, 414, 768, 1440]) {
+        await page.setViewportSize({ width, height: 900 });
+        const layout = await page.locator(".host-health-drawer").evaluate(drawer => {
+          const body = drawer.querySelector(".host-health-drawer-body");
+          const box = drawer.getBoundingClientRect();
+          return { left: box.left, right: box.right, overflow: body.scrollWidth - body.clientWidth };
+        });
+        assert.ok(layout.left >= -1 && layout.right <= width + 1 && layout.overflow <= 1, `Host drawer overflow at ${width}: ${JSON.stringify(layout)}`);
+        if (captureScreenshots) await page.screenshot({ path: `${artifacts}/${name}-${width}.png`, fullPage: true });
+      }
+    };
     const errors = [];
     page.on("pageerror", (e) => errors.push(e.message));
     page.on("console", (message) => {
@@ -78,7 +115,7 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
       hostHealth: {
         state: "healthy", lastReceivedAt: "2026-11-01T10:59:59Z", sampledAt: "2026-11-01T10:59:58Z",
         nextDueAt: "2026-11-01T11:59:00Z", received24h: 22, observable24h: 24, consecutiveMissed: 0,
-        supervision: "nohup", snapshot: {
+        supervision: "nohup", clockSynchronized: false, snapshot: {
           os: "Linux", arch: "aarch64",
           effectiveVcpu: { value: 1.5, unknownReason: null },
           memoryTotalBytes: { value: 4 * 2 ** 30, unknownReason: null },
@@ -124,7 +161,7 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
       else if (path === "/v1/client-market/termination-workspace") body = { hosts: [], actionRequiredCount: 0, canAdjudicate: false, serverNow: new Date().toISOString() };
       else if (path === "/v1/client-market/hosts/host-1/health") body = {
         machineEpoch: 1, hostHealth: host.hostHealth,
-        hours: [{ utcHour: 1, dueAt: "2026-11-01T10:59:59Z", receivedAt: "2026-11-01T10:59:59Z", state: "received", snapshot: null }],
+        hours: host.hostHealth.lastReceivedAt ? [{ utcHour: 1, dueAt: "2026-11-01T10:59:59Z", receivedAt: "2026-11-01T10:59:59Z", state: "received", snapshot: null }] : [],
       };
       else if (path.includes("/hosts/host-1/health/")) {
         healthWrites.push({ action: path.split("/").at(-1), input: req.postDataJSON() });
@@ -237,9 +274,9 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
     await page
       .getByRole("heading", { name: "配置并确认" })
       .waitFor({ timeout: 60000 });
-    await page.getByRole("dialog").getByText("22/24 个可观测时段", { exact: true }).waitFor();
+    await page.getByRole("dialog").getByText("22/24", { exact: true }).waitFor();
     await page.getByRole("dialog").getByText("未配置开机自启", { exact: true }).waitFor();
-    await page.getByRole("dialog").getByText("aarch64 · 1.5 vCPU · 4 GiB 内存 · 64 GiB 磁盘", { exact: true }).waitFor();
+    await page.getByRole("dialog").getByText("ARM64 · 1.5 vCPU", { exact: true }).waitFor();
     console.log("opened with shared market and quote Host health", quotes);
     if (captureScreenshots) await page.screenshot({ path: artifacts + "/initial.png", fullPage: true });
     assert.equal(await page.locator('img[alt="Binance Pay"]').count(), 0);
@@ -527,8 +564,8 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
     await page.goto(baseUrl + "/client-market/?tab=mine&testLocale=en");
     const rentalRow = page.locator("#client-market-host-client-one");
     await rentalRow.waitFor();
-    await rentalRow.getByText("22/24 observable hours", { exact: true }).waitFor();
-    await rentalRow.getByText("Automatic restart is not configured", { exact: true }).waitFor();
+    await rentalRow.getByText("22/24", { exact: true }).waitFor();
+    await rentalRow.getByText("No autostart", { exact: true }).waitFor();
     const statusCell = rentalRow.locator("td").first();
     assert.doesNotMatch(await statusCell.textContent(), /Ends on|Renews on|Platform wallet/);
     await statusCell.getByText("Client online", { exact: true }).waitFor();
@@ -568,7 +605,7 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
     Object.assign(host, { status: "idle", installationId: undefined, isHostOwner: true, isClientOwner: false, clientSubdomain: undefined, clientConnection: undefined });
     rentals = [];
     await page.goto(baseUrl + "/client-market/?tab=mine&testLocale=en");
-    await page.getByText("aarch64 · 1.5 vCPU · 4 GiB RAM · 64 GiB disk", { exact: true }).waitFor();
+    await page.getByText("ARM64 · 1.5 vCPU", { exact: true }).waitFor();
     if (captureScreenshots) {
       for (const width of [1440, 375]) {
         await page.setViewportSize({ width, height: 900 });
@@ -576,9 +613,17 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
       }
       await page.setViewportSize({ width: 1440, height: 900 });
     }
-    const healthButton = page.getByRole("button", { name: "View hourly reports", exact: true });
+    const healthButton = page.getByRole("button", { name: "View Host health: Test Host", exact: true });
+    const rowHeightBeforeDetails = await page.locator(".client-market-host-row").evaluate(row => row.getBoundingClientRect().height);
+    assert.ok(rowHeightBeforeDetails <= 108, `healthy row too tall: ${rowHeightBeforeDetails}`);
+    await assertHealthContrast(".host-health-status, .host-health-meta, .host-health-limitation, .host-hardware-summary > span");
+    await healthButton.focus();
+    await assertHealthContrast(".host-health-summary--table:focus-visible", "outlineColor", 3);
     await healthButton.click();
     await page.getByText("Received", { exact: true }).waitFor();
+    await assertHealthContrast(".host-health-close", "color", 3);
+    await assertHealthDrawerWidths("healthy-drawer");
+    assert.equal(await page.locator(".client-market-host-row").evaluate(row => row.getBoundingClientRect().height), rowHeightBeforeDetails, "health history must not increase row height");
     await page.getByRole("button", { name: "Rotate reporter key at next idle maintenance", exact: true }).click();
     await page.getByText("Host maintenance queued", { exact: true }).waitFor();
     assert.deepEqual(healthWrites[0], { action: "rotate-key", input: { compromised: false } });
@@ -591,6 +636,60 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
     await page.getByRole("alertdialog").waitFor({ state: "hidden" });
     assert.deepEqual(healthWrites[2], { action: "replace", input: { expectedMachineEpoch: 1 } });
     console.log("Host hourly details, key rotation, immediate revocation and fenced machine replacement passed");
+    await page.getByRole("dialog").getByRole("button", { name: "Close", exact: true }).click();
+    Object.assign(host, { status: "allocated", installationId: "client-one", isHostOwner: true, isClientOwner: false, clientSubdomain: "rental-client" });
+    host.hostHealth = { state: "not_enabled", machineEpoch: 1, lastReceivedAt: null, sampledAt: null, nextDueAt: null,
+      received24h: 0, observable24h: 0, consecutiveMissed: 0, supervision: "unknown", snapshot: null,
+      deployment: { state: "not_enabled", reason: "rental_not_enrolled", canBootstrap: true, deployedCommit: null } };
+    await page.goto(baseUrl + "/client-market/?tab=mine&testLocale=zh-CN");
+    await page.getByText("监测未启用", { exact: true }).waitFor();
+    await page.getByText("规格待采集", { exact: true }).waitFor();
+    assert.equal(await page.getByText("等待首报", { exact: true }).count(), 0);
+    assert.equal(await page.getByText("暂无可观测时段", { exact: true }).count(), 0);
+    for (const width of [320, 375, 414, 768, 1280, 1440]) {
+      await page.setViewportSize({ width, height: 900 });
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, `Host list overflow at ${width}`);
+      const hostRow = page.locator(".client-market-host-row");
+      if (width >= 1280) assert.ok((await hostRow.boundingBox()).height <= 104, `row too tall at ${width}`);
+      if (captureScreenshots) await page.screenshot({ path: `${artifacts}/monitor-pending-${width}.png`, fullPage: true });
+    }
+    await page.getByRole("button", { name: "查看主机健康：Test Host", exact: true }).click();
+    await page.getByText("尚未收到主机上报。", { exact: true }).waitFor();
+    await assertHealthDrawerWidths("monitor-drawer");
+    const monitorDialog = page.getByRole("dialog");
+    await monitorDialog.getByRole("button", { name: "接入监测", exact: true }).click();
+    await monitorDialog.getByText("已加入主机维护队列", { exact: true }).waitFor();
+    assert.deepEqual(healthWrites[3], { action: "bootstrap", input: { expectedInstallationId: "client-one", expectedMachineEpoch: 1 } });
+    assert.equal(host.status, "allocated");
+    assert.equal(host.installationId, "client-one");
+    await monitorDialog.getByRole("button", { name: "关闭", exact: true }).click();
+    // The advanced capacity filters use one compact panel, with no native fields in the main bar.
+    await page.locator(".host-health-filter-trigger").click();
+    await page.getByLabel("最低 vCPU", { exact: true }).fill("2");
+    await page.getByRole("button", { name: "完成", exact: true }).click();
+    await page.getByRole("button", { name: "清除筛选", exact: true }).click();
+    await page.getByRole("button", { name: "选择", exact: true }).click();
+    await page.setViewportSize({ width: 375, height: 900 });
+    const selectedRow = page.locator(".client-market-host-row");
+    const selectionBox = await selectedRow.locator('td[data-column="selection"]').boundingBox();
+    const healthBox = await selectedRow.locator(".host-health-summary--table").boundingBox();
+    assert.ok(selectionBox.x >= healthBox.x + healthBox.width || selectionBox.x + selectionBox.width <= healthBox.x || selectionBox.y >= healthBox.y + healthBox.height || selectionBox.y + selectionBox.height <= healthBox.y, "mobile selection must not cover the health control");
+    if (captureScreenshots) await page.screenshot({ path: `${artifacts}/monitor-selection-375.png`, fullPage: true });
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.getByRole("button", { name: "全选筛选结果", exact: true }).click();
+    await page.getByRole("button", { name: "接入监测（1）", exact: true }).click();
+    await page.getByText("已为 1 台主机排队接入，0 台未能排队", { exact: true }).waitFor();
+    assert.deepEqual(healthWrites[4], healthWrites[3]);
+    Object.assign(host, { isHostOwner: false, isClientOwner: true });
+    host.hostHealth.deployment.canBootstrap = false;
+    await page.reload();
+    await page.getByRole("button", { name: "查看主机健康：Test Host", exact: true }).click();
+    await page.getByRole("dialog").getByText("尚未收到主机上报。", { exact: true }).waitFor();
+    assert.equal(await page.getByRole("dialog").getByRole("button", { name: "接入监测", exact: true }).count(), 0);
+    assert.equal(await page.getByRole("dialog").getByRole("region", { name: "监测管理", exact: true }).count(), 0);
+    assert.equal(healthWrites.length, 5, "tenant inspection must not enqueue monitoring work");
+    console.log("unenrolled rental states, strict bootstrap request, drawer layout and responsive Host cards passed");
+
     assert.deepEqual(errors, []);
     console.log("free checkout passed; no browser exceptions");
     console.log(captureScreenshots ? `Screenshots: ${artifacts}` : "DOM and interaction checks only; no screenshots");

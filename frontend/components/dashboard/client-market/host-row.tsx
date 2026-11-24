@@ -1,5 +1,5 @@
 "use client";
-import { HostHealthSummary } from "./host-health";
+import { HostHardwareSummary, HostHealthSummary } from "./host-health";
 
 import * as React from "react";
 import { formatWalletUnits } from "@/lib/market-wallet-money";
@@ -70,6 +70,7 @@ function HostRowImpl({
   onUiBusyChange,
   terminationSummary,
   onTerminationOpen,
+  onHealthOpen,
 }: {
   host: ClientMarketHost;
   rental?: ClientMarketRental | null;
@@ -85,6 +86,7 @@ function HostRowImpl({
   onUiBusyChange?: (hostId: string, busy: boolean) => void;
   terminationSummary?: ClientTerminationHostSummary;
   onTerminationOpen?: (id: string) => void;
+  onHealthOpen: (hostId: string) => void;
 }) {
   const { locale, t } = useLocaleText();
   const { session } = useAuth();
@@ -366,7 +368,7 @@ function HostRowImpl({
     <>
       <tr
         id={host.installationId ? `client-market-host-${host.installationId}` : undefined}
-        className={`cursor-pointer border-b border-border/80 transition-colors hover:bg-muted/40 ${
+        className={`client-market-host-row cursor-pointer border-b border-border/80 transition-colors hover:bg-muted/40 ${
           highlighted ? "bg-accent/[0.06] ring-2 ring-inset ring-accent/40" : ""
         }`}
         onPointerDown={(event) => {
@@ -388,7 +390,7 @@ function HostRowImpl({
         title={t(historyOpen ? "clientMarket.usageHistory.collapse" : "clientMarket.usageHistory.expand")}
       >
         {selectionMode ? (
-          <td className="w-10 px-2 py-2 align-middle" onClick={(event) => event.stopPropagation()}>
+          <td data-column="selection" className="w-10 px-2 py-2 align-middle" onClick={(event) => event.stopPropagation()}>
             <Checkbox
               isSelected={selected}
               onChange={(next) => onSelectedChange(host.id, next)}
@@ -402,13 +404,13 @@ function HostRowImpl({
             </Checkbox>
           </td>
         ) : null}
-        <td className="max-w-[11rem] px-2 py-2 align-middle">
+        <td data-column="status" className="max-w-[11rem] px-2 py-2 align-middle">
           <div className="min-w-0" title={statusGuidanceSubtitle || statusHint || undefined}>
             <span className="mb-1 block break-all text-xs font-medium sm:hidden">{host.hostname || host.ip || host.id}</span>
             <Chip size="sm" variant="soft" className="shrink-0">
               {t(statusLabelKey(host.status))}
             </Chip>
-            <HostHealthSummary health={host.hostHealth} hostId={host.id} hostLabel={host.hostname || host.ip || host.id} viewerKey={[session?.user?.id || "anonymous", host.installationId || "", host.isClientOwner, host.isHostOwner, host.status, host.hostHealth?.snapshot?.cpuUsagePct.unknownReason || "known"].join(":")} canManage={host.isHostOwner} canReplace={!host.installationId && ["idle", "onboarding", "disabled", "abnormal"].includes(host.status)} preparing={host.status === "onboarding" || host.status === "maintaining"} hostStatus={host.status} onChanged={onChanged} />
+            <HostHealthSummary health={host.hostHealth} hostLabel={hostLabel} variant="table" onOpen={() => onHealthOpen(host.id)} />
             {host.status === "idle" && host.binaryPreparation ? (
               <span className="mt-0.5 block text-[11px] leading-4 text-muted-foreground">
                 {t(`clientMarket.binary.${host.binaryPreparation.status}`)}
@@ -455,7 +457,8 @@ function HostRowImpl({
             ) : null}
           </div>
         </td>
-        <td className="max-w-[10rem] px-2 py-2 align-middle">
+        <td data-column="specs" data-label={t("hostHealth.colSpecs")} className="px-2 py-2 align-middle"><span className="client-market-card-label" aria-hidden="true">{t("hostHealth.colSpecs")}</span><HostHardwareSummary health={host.hostHealth} /></td>
+        <td data-column="region" data-label={t("clientMarket.col.region")} className="max-w-[10rem] px-2 py-2 align-middle"><span className="client-market-card-label" aria-hidden="true">{t("clientMarket.col.region")}</span>
           {locationLabel || host.countryCode ? (
             <span className="inline-flex min-w-0 max-w-full items-center gap-1.5 text-xs text-muted-foreground">
               <CountryFlag code={host.countryCode} size="compact" />
@@ -469,7 +472,7 @@ function HostRowImpl({
             <span className="text-xs text-muted-foreground/50">—</span>
           )}
         </td>
-        <td className="max-w-[12rem] px-2 py-2 align-middle">
+        <td data-column="owner" data-label={t("clientMarket.col.owner")} className="max-w-[12rem] px-2 py-2 align-middle"><span className="client-market-card-label" aria-hidden="true">{t("clientMarket.col.owner")}</span>
           <div className="flex min-w-0 items-center gap-0.5">
             <span className="min-w-0 truncate text-xs font-medium text-foreground" title={host.hostOwnerEmail}>
               {host.hostOwnerEmail}
@@ -477,7 +480,7 @@ function HostRowImpl({
             <ProviderContactButton contacts={host.contacts} />
           </div>
         </td>
-        <td className="max-w-[9rem] px-2 py-2 align-middle">
+        <td data-column="offer" data-label={t("clientMarket.col.offer")} className="max-w-[9rem] px-2 py-2 align-middle tabular-nums"><span className="client-market-card-label" aria-hidden="true">{t("clientMarket.col.offer")}</span>
           <div className="min-w-0">
             <span
               className="block whitespace-nowrap text-xs font-semibold text-foreground"
@@ -487,38 +490,14 @@ function HostRowImpl({
             </span>
           </div>
         </td>
-        <td className="max-w-[12rem] px-2 py-2 align-middle">
-          <div
-            className="min-w-0"
-            title={[subdomain || undefined, host.clientOwnerEmail || undefined].filter(Boolean).join(" · ") || undefined}
-          >
-            <span
-              className={`block truncate font-mono text-xs ${subdomain ? "text-muted-foreground" : "text-muted-foreground/50"}`}
-            >
-              {subdomain || "—"}
-            </span>
-            {host.clientOwnerEmail ? (
-              <span className="mt-0.5 block truncate text-[11px] leading-4 text-muted-foreground">
-                {t("clientMarket.rentedBy", { email: host.clientOwnerEmail })}
-              </span>
-            ) : null}
+        <td data-column="host" data-label={t("hostHealth.colHost")} className="px-2 py-2 align-middle"><span className="client-market-card-label" aria-hidden="true">{t("hostHealth.colHost")}</span>
+          <div className="host-connection-summary" title={[host.hostname, subdomain, ipPort, ipIntelSubtitle, host.clientOwnerEmail].filter(Boolean).join(" · ")}>
+            <span className="block truncate font-mono text-xs text-foreground">{subdomain || host.hostname || "—"}</span>
+            <span className="block truncate font-mono text-xs text-muted-foreground">{ipPort || "—"}</span>
+            {host.clientOwnerEmail ? <span className="block truncate text-xs text-muted-foreground">{t("clientMarket.rentedBy", { email: host.clientOwnerEmail })}</span> : null}
           </div>
         </td>
-        <td className="max-w-[14rem] px-2 py-2 align-middle">
-          {ipPort ? (
-            <div className="min-w-0" title={[ipPort, host.hostname, ipIntelSubtitle].filter(Boolean).join(" · ")}>
-              <span className="block whitespace-nowrap font-mono text-xs text-foreground">{ipPort}</span>
-              {ipIntelSubtitle ? (
-                <span className="mt-0.5 block truncate text-[11px] leading-4 text-muted-foreground">
-                  {ipIntelSubtitle}
-                </span>
-              ) : null}
-            </div>
-          ) : (
-            <span className="text-xs text-muted-foreground/50">—</span>
-          )}
-        </td>
-        <td className="whitespace-nowrap px-2 py-2 align-middle" onClick={(event) => event.stopPropagation()}>
+        <td data-column="actions" className="whitespace-nowrap px-2 py-2 align-middle" onClick={(event) => event.stopPropagation()}>
           <div className="flex items-center justify-end gap-1">
             {terminationSummary && terminationSummary.actionRequiredCount > 0 && ["provider_response", "owner_decision", "cleanup_failed"].includes(terminationSummary.attention) && onTerminationOpen ? <div className="grid justify-items-end gap-0.5"><Button size="sm" variant="danger"
               className="min-h-8 shrink-0 whitespace-nowrap px-2 text-xs"

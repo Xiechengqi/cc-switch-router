@@ -2,7 +2,7 @@
 use super::*;
 use crate::client_server_release::InstallationRelease;
 
-static PREPARATION_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+pub(super) static PREPARATION_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 static NEXT_RELEASE_CHECK: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 #[derive(Debug, Clone, Serialize)]
@@ -108,6 +108,7 @@ fn return_exhausted_maintenance(conn: &Connection, now: &str) -> Result<(), crat
 }
 
 pub(super) async fn reconcile(state: &ServerState) -> Result<(), AppError> {
+    health::bootstrap::reconcile(state).await?;
     let now = Utc::now().timestamp();
     let next = NEXT_RELEASE_CHECK.load(std::sync::atomic::Ordering::Relaxed);
     if now >= next
@@ -278,6 +279,17 @@ export CC_SWITCH_SERVER_EXPECTED_SHA256="$expected"
             ""
         },
     )
+}
+
+/// Initial enrollment in a rental must not run package managers or tenant installers.
+pub(super) fn prepare_standby_command(release: &InstallationRelease) -> String {
+    prepare_command(release, false).replacen(REMOTE_ENSURE_CLIENT_MARKET_DEPS, r#"
+ensure_client_market_deps() {
+  for tool in curl sha256sum flock base64 tr grep cut uname cp mv mkdir chmod chown id su readlink sed; do
+    command -v "$tool" >/dev/null 2>&1 || { echo "monitor enrollment requires $tool; install it during maintenance" >&2; exit 1; }
+  done
+}
+"#, 1)
 }
 
 pub(super) async fn install(

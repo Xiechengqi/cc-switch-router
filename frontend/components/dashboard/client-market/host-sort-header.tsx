@@ -10,15 +10,17 @@ export function HostSortHeader({
   sortPrefs,
   onSort,
   filter,
+  labelKey,
 }: {
   columnKey: HostSortKey;
   sortPrefs: HostSortPrefs;
   onSort: (key: HostSortKey) => void;
   filter?: React.ReactNode;
+  labelKey?: import("@/lib/i18n").MessageKey;
 }) {
   const { t } = useLocaleText();
   const active = sortPrefs.key === columnKey;
-  const label = t(HOST_SORT_COLUMN_LABELS[columnKey]);
+  const label = t(labelKey || HOST_SORT_COLUMN_LABELS[columnKey]);
   const ariaSort = active ? (sortPrefs.dir === "asc" ? "ascending" : "descending") : "none";
   const sortStateLabel = active
     ? t(sortPrefs.dir === "asc" ? "clientMarket.sortAsc" : "clientMarket.sortDesc")
@@ -39,6 +41,7 @@ export function HostSortHeader({
 
   return (
     <th
+      data-column={columnKey}
       scope="col"
       aria-sort={ariaSort}
       className="sticky top-0 z-10 border-b border-border bg-card px-2 py-2 text-left text-xs font-medium text-muted-foreground"

@@ -33,3 +33,24 @@
   --radius-provider-md: 0.625rem;
   --radius-provider-lg: 0.75rem;
 }
+
+/* Client Market · existing Router palette and type system. */
+:root {
+  --color-host-health-paper: rgb(var(--router-card));
+  --color-host-health-ink: rgb(var(--router-foreground));
+  --color-host-health-muted: rgb(var(--router-muted-foreground));
+  --color-host-health-rule: rgb(var(--router-border));
+  --color-host-health-soft: rgb(var(--router-secondary));
+  --color-host-health-focus: rgb(var(--router-ring));
+  --color-host-health-positive: oklch(45% 0.10 155);
+  --color-host-health-warning: oklch(47% 0.11 65);
+  --space-host-health-2xs: 0.125rem;
+  --space-host-health-xs: 0.25rem;
+  --space-host-health-sm: 0.5rem;
+  --space-host-health-md: 0.75rem;
+  --space-host-health-lg: 1rem;
+  --space-host-health-xl: 1.5rem;
+  --radius-host-health: 0.625rem;
+  --text-host-health-small: 0.75rem;
+  --text-host-health-body: 0.8125rem;
+}
