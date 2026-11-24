@@ -51,7 +51,7 @@ export function HostHealthSummary({ health, hostLabel, variant = "checkout", onO
     </> : null}
     {limitations.length ? <span className="host-health-limitation" title={limitations.map(item => t(item.full)).join(" · ")}>{limitations.map((item, index) => <span key={item.full}>{index ? " · " : ""}{t(variant === "table" ? item.short : item.full)}</span>)}</span> : null}
   </>;
-  if (onOpen) return <button type="button" className="host-health-summary host-health-summary--table" aria-label={t("hostHealth.openFor", { host: hostLabel || "Host" })} onClick={event => { event.stopPropagation(); onOpen(); }}>
+  if (onOpen) return <button type="button" className={`host-health-summary host-health-summary--${variant}`} aria-label={t("hostHealth.openFor", { host: hostLabel || "Host" })} onClick={event => { event.stopPropagation(); onOpen(); }}>
     <span className="host-health-lines">{content}</span><ChevronRight className="host-health-chevron" aria-hidden="true" />
   </button>;
   return <section aria-label={[t("hostHealth.title"), hostLabel].filter(Boolean).join(" · ")} className="host-health-summary host-health-summary--checkout">

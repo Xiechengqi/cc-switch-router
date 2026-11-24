@@ -52,7 +52,6 @@ import {
   HostSortKey,
   HostSortPrefs,
   ShopContinent,
-  ShopCountrySort,
   OWNER_FILTER_KEY,
   REGION_FILTER_KEY,
   ROUTER_OPEN_LOGIN_EVENT,
@@ -119,7 +118,6 @@ export function ClientMarketPage() {
     const code = (searchParams.get("country") || "").trim().toUpperCase();
     return /^[A-Z]{2}$/.test(code) ? code : "";
   });
-  const [shopSort, setShopSort] = React.useState<ShopCountrySort>("idle");
   const [shopHostId, setShopHostId] = React.useState<string | null>(null);
   const [manageOpen, setManageOpen] = React.useState(() => (
     searchParams.get("addHost") === "1" || searchParams.get("tab") === "mine" || Boolean(searchParams.get("focus") || searchParams.get("focusHost") || searchParams.get("provider"))
@@ -601,16 +599,16 @@ export function ClientMarketPage() {
 
   const shopFilteredHosts = React.useMemo(
     () => hosts.filter((host) => hostMatchesMarketProvider(host, marketProviderId) && hostMatchesShopFilters(host, {
-      onlyIdle, arch: healthArch, minimumCpu, minimumMemory,
+      onlyIdle, arch: "", minimumCpu: "", minimumMemory: "",
     })),
-    [healthArch, hosts, marketProviderId, minimumCpu, minimumMemory, onlyIdle],
+    [hosts, marketProviderId, onlyIdle],
   );
   const shopCards = React.useMemo(() => {
     const names = new Intl.DisplayNames([locale], { type: "region" });
-    return sortShopCountries(aggregateShopCountries(shopFilteredHosts), shopSort, (code) => (
+    return sortShopCountries(aggregateShopCountries(shopFilteredHosts), "idle", (code) => (
       /^[A-Z]{2}$/.test(code) ? names.of(code) || code : "\uffff"
     ));
-  }, [locale, shopFilteredHosts, shopSort]);
+  }, [locale, shopFilteredHosts]);
   const shopHosts = React.useMemo(() => {
     if (!shopCountry) return [];
     return sortHosts(shopFilteredHosts.filter((host) => shopCountryKey(host.countryCode) === shopCountry), sortPrefs);
@@ -682,21 +680,15 @@ export function ClientMarketPage() {
             cards={shopCards}
             continent={shopContinent}
             country={shopCountry}
-            sort={shopSort}
-            arch={healthArch}
-            minimumCpu={minimumCpu}
-            minimumMemory={minimumMemory}
             onContinent={selectShopContinent}
             onCountry={selectShopCountry}
-            onSort={setShopSort}
-            onSpecs={(next) => { setHealthArch(next.arch); setMinimumCpu(next.minimumCpu); setMinimumMemory(next.minimumMemory); setShopHostId(null); setPage(1); }}
           />
           {shopCountry ? (
             <div className="client-market-shop-workspace">
               <section className="client-market-shop-hosts" aria-label={t("clientMarket.shop.hostListLabel", { name: shopCountryName })}>
                 <h2 className="text-sm font-semibold">{t("clientMarket.shop.stepHost")}</h2>
                 {shopHosts.length === 0 ? <p className="text-sm text-muted-foreground">{t("clientMarket.shop.noHosts")}</p> : shopHosts.map((host) => (
-                  <ShopHostCard key={host.id} host={host} selected={host.id === shopHostId} onSelect={(next) => setShopHostId(next.id)} onHealthOpen={openHealth} />
+                  <ShopHostCard key={host.id} host={host} selected={host.id === shopHostId} onSelect={(next) => setShopHostId(next.id)} />
                 ))}
               </section>
               <ShopConfirmPanel
@@ -706,6 +698,7 @@ export function ClientMarketPage() {
                 onContinue={openCreateForHost}
                 onLogin={() => window.dispatchEvent(new Event(ROUTER_OPEN_LOGIN_EVENT))}
                 onRequestAccess={(host) => setAccessDialog({ host, eligibility: host.eligibility })}
+                onHealthOpen={openHealth}
               />
             </div>
           ) : null}

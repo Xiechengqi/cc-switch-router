@@ -2361,6 +2361,21 @@ export type HostHealth = {
   snapshot: HostHealthSnapshot | null;
   diagnostic?: string | null;
 };
+export type HostHealthCalendarDay = {
+  date: string;
+  receivedHours: number;
+  observableHours: number;
+  receivedRate?: number;
+};
+
+export type HostHealthCalendar = {
+  hostId: string;
+  timezone: "UTC" | string;
+  startDate: string;
+  endDate: string;
+  days: HostHealthCalendarDay[];
+};
+
 export type HostHealthDetail = {
   machineEpoch: number;
   hostHealth: HostHealth | null;

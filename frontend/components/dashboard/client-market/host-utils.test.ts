@@ -7,6 +7,7 @@ import {
   hostMatchesShopFilters,
   hostCanClientRelease,
   hostShopPriceMinor,
+  hostShopSpecLine,
   parseHostTransferLines,
   parseClientTrialHours,
   persistedClientMarketProviderSelection,
@@ -16,6 +17,32 @@ import {
   sortShopCountries,
 } from "./host-utils";
 import type { ClientMarketHost, ClientMarketProvider } from "@/lib/types";
+
+test("shop host cards keep one spec line and omit missing values", () => {
+  assert.equal(hostShopSpecLine({}), "");
+  assert.equal(hostShopSpecLine({
+    hostHealth: {
+      state: "healthy",
+      lastReceivedAt: null,
+      sampledAt: null,
+      nextDueAt: null,
+      received24h: 1,
+      observable24h: 1,
+      consecutiveMissed: 0,
+      supervision: "systemd",
+      snapshot: {
+        os: "linux",
+        arch: "aarch64",
+        effectiveVcpu: { value: 2, unknownReason: null },
+        memoryTotalBytes: { value: 1.5 * 2 ** 30, unknownReason: null },
+        memoryAvailableBytes: { value: null, unknownReason: null },
+        dataVolumeTotalBytes: { value: null, unknownReason: null },
+        dataVolumeAvailableBytes: { value: null, unknownReason: null },
+        cpuUsagePct: { value: null, unknownReason: null },
+      },
+    },
+  }), "ARM64 · 2C · 1.5G");
+});
 
 test("shop continents keep ISO regions distinct and group unknown codes as other", () => {
   assert.equal(shopContinentForCountry("HK"), "asia");

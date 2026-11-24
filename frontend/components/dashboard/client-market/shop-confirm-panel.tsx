@@ -3,9 +3,11 @@
 import { Button } from "@heroui/react";
 import { LogIn, Server } from "lucide-react";
 import { CountryFlag } from "@/components/common/country-flag";
+import { ProviderContactButton } from "@/components/common/provider-contacts";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import type { ClientMarketHost } from "@/lib/types";
-import { HostHardwareSummary } from "./host-health";
+import { HostHardwareSummary, HostHealthSummary } from "./host-health";
+import { HostHealthHeatmap } from "./host-health-heatmap";
 import { formatHostOffer, hostDisplayLabel } from "./host-utils";
 
 export function ShopConfirmPanel({
@@ -15,6 +17,7 @@ export function ShopConfirmPanel({
   onContinue,
   onLogin,
   onRequestAccess,
+  onHealthOpen,
 }: {
   host: ClientMarketHost | null;
   authed: boolean;
@@ -22,6 +25,7 @@ export function ShopConfirmPanel({
   onContinue: (host: ClientMarketHost) => void;
   onLogin: () => void;
   onRequestAccess: (host: ClientMarketHost) => void;
+  onHealthOpen: (hostId: string) => void;
 }) {
   const { locale, t } = useLocaleText();
   if (!host) {
@@ -46,14 +50,19 @@ export function ShopConfirmPanel({
               <CountryFlag code={host.countryCode} />
               <span className="truncate">{label}</span>
             </h2>
-            <p className="mt-1 truncate text-xs text-muted-foreground" title={host.hostOwnerEmail}>{countryName} · {host.hostOwnerEmail}</p>
+            <p className="mt-1 flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
+              <span className="min-w-0 truncate" title={host.hostOwnerEmail}>{countryName} · {host.hostOwnerEmail}</span>
+              <ProviderContactButton contacts={host.contacts} />
+            </p>
           </div>
           <strong className="shrink-0 text-lg tabular-nums">{formatHostOffer(host.dailyRateMinor, locale, host.freeDurationDays, host.cyclePriceMinor)}</strong>
         </div>
+        <HostHealthSummary health={host.hostHealth} hostLabel={label} variant="checkout" onOpen={() => onHealthOpen(host.id)} />
         <div className="rounded-lg bg-muted px-3 py-2">
           <p className="mb-1 text-xs text-muted-foreground">{t("clientMarket.shop.summarySpecs")}</p>
           <HostHardwareSummary health={host.hostHealth} />
         </div>
+        <HostHealthHeatmap hostId={host.id} />
         {idle ? <p className="text-xs leading-5 text-muted-foreground">{t("clientMarket.shop.purchaseTerms")}</p> : (
           <p role="status" className="text-sm text-amber-800">{t("clientMarket.shop.notIdle")}</p>
         )}

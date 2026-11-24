@@ -99,6 +99,7 @@ pub(super) fn routes() -> Router<ServerState> {
             post(receive).layer(DefaultBodyLimit::max(wire::MAX_BODY)),
         )
         .route("/v1/client-market/hosts/:id/health", get(details))
+        .route("/v1/client-market/hosts/:id/health-calendar", get(calendar))
         .route("/v1/client-market/hosts/:id/health/retry", post(retry))
         .route(
             "/v1/client-market/hosts/:id/health/bootstrap",
@@ -745,6 +746,132 @@ fn project_views(
     Ok(out)
 }
 
+#[derive(Debug, Deserialize)]
+struct CalendarQuery {
+    #[serde(default)]
+    days: Option<u16>,
+}
+
+fn calendar_days(
+    conn: &Connection,
+    host: &str,
+    now: i64,
+    days: i64,
+) -> Result<Vec<serde_json::Value>, AppError> {
+    let (epoch, admitted, first): (i64, Option<i64>, Option<i64>) = conn
+        .query_row(
+            "SELECT machine_epoch,admitted_hour,first_due_at FROM client_host_agents WHERE host_id=?1",
+            params![host],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(database)?
+        .unwrap_or((1, None, None));
+    let days = days.clamp(1, 7);
+    let today_hour = now.div_euclid(86_400) * 24;
+    let start_hour = today_hour - (days - 1) * 24;
+    let mut received = HashSet::new();
+    if admitted.is_some() {
+        let mut statement = conn
+            .prepare(
+                "SELECT utc_hour FROM client_host_hour_reports WHERE host_id=?1 AND machine_epoch=?2 AND utc_hour>=?3",
+            )
+            .map_err(database)?;
+        for hour in statement
+            .query_map(params![host, epoch, start_hour], |row| row.get::<_, i64>(0))
+            .map_err(database)?
+        {
+            received.insert(hour.map_err(database)?);
+        }
+    }
+    let mut days_out = Vec::new();
+    for day_start in (start_hour..=today_hour).step_by(24) {
+        let mut got = 0u32;
+        let mut observed = 0u32;
+        for hour in day_start..day_start + 24 {
+            let due = first
+                .filter(|first| first / 3600 == hour)
+                .unwrap_or_else(|| wire::due_at(host, hour));
+            if admitted.is_none_or(|admitted| hour < admitted) || now < due + wire::GRACE_SECONDS {
+                continue;
+            }
+            if unavailable(conn, due)? {
+                continue;
+            }
+            observed += 1;
+            if received.contains(&hour) {
+                got += 1;
+            }
+        }
+        let date = DateTime::<Utc>::from_timestamp(day_start * 3600, 0)
+            .unwrap_or_default()
+            .date_naive();
+        days_out.push(json!({
+            "date": date.to_string(),
+            "receivedHours": got,
+            "observableHours": observed,
+            "receivedRate": (observed > 0).then(|| (f64::from(got) * 1000.0 / f64::from(observed)).round() / 10.0),
+        }));
+    }
+    Ok(days_out)
+}
+
+/// Hourly reports are deleted after seven days, so the calendar cannot exceed that window.
+async fn calendar(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<CalendarQuery>,
+) -> Result<Response, AppError> {
+    let viewer = extract_optional_session(&state, &headers).await?;
+    let operations = if let Some(viewer) = &viewer {
+        state.dynamic.read().await.is_admin(&viewer.email)
+    } else {
+        false
+    };
+    let host = state
+        .store
+        .client_market_get_host(&id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Host not found".into()))?;
+    if matches!(host.status.as_str(), "onboarding" | "maintaining")
+        && !operations
+        && !viewer
+            .as_ref()
+            .is_some_and(|viewer| session_is_host_owner(viewer, host.provider_id.as_deref()))
+    {
+        return Err(AppError::NotFound("Host not available".into()));
+    }
+    let conn = state.store.conn.lock().await;
+    let operator = viewer
+        .as_ref()
+        .is_some_and(|viewer| session_is_host_owner(viewer, host.provider_id.as_deref()));
+    if !operator && !operations && unavailable_paid_host_ids(&conn)?.contains(&id) {
+        return Err(AppError::NotFound("Host not available".into()));
+    }
+    let days = i64::from(query.days.unwrap_or(7).clamp(1, 7));
+    let now = Utc::now().timestamp();
+    let days_out = calendar_days(&conn, &id, now, days)?;
+    let start_hour = now.div_euclid(86_400) * 24 - (days - 1) * 24;
+    let start_date = DateTime::<Utc>::from_timestamp(start_hour * 3600, 0)
+        .unwrap_or_default()
+        .date_naive();
+    let end_date = DateTime::<Utc>::from_timestamp(now.div_euclid(86_400) * 86_400, 0)
+        .unwrap_or_default()
+        .date_naive();
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({
+            "hostId": id,
+            "timezone": "UTC",
+            "startDate": start_date.to_string(),
+            "endDate": end_date.to_string(),
+            "days": days_out,
+        })),
+    )
+        .into_response())
+}
+
 async fn details(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -1235,6 +1362,38 @@ mod tests {
             project_views(&conn, None, Some(id), false).unwrap()[id].state,
             "revoked"
         );
+    }
+
+    #[tokio::test]
+    async fn health_calendar_counts_received_hours_and_skips_grace() {
+        let store = AppStore::new_in_memory_for_tests().unwrap();
+        let hour = 480_012i64;
+        let first = hour * 3600;
+        host(&store, "host-fixture", first).await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE client_host_agents SET admitted_hour=?2 WHERE host_id='host-fixture'",
+                params![hour],
+            )
+            .unwrap();
+        }
+        let report = report("host-fixture", hour, first);
+        assert_eq!(send(&store, &report, first + 2).await, StatusCode::OK);
+        let conn = store.conn.lock().await;
+        let days = calendar_days(
+            &conn,
+            "host-fixture",
+            first + 3 * 3600 + wire::GRACE_SECONDS,
+            1,
+        )
+        .unwrap();
+        let today = days.last().unwrap();
+        assert_eq!(today["receivedHours"], 1);
+        assert_eq!(today["observableHours"], 3);
+        assert_eq!(today["receivedRate"], 33.3);
+        let during_grace = calendar_days(&conn, "host-fixture", first + 60, 1).unwrap();
+        assert_eq!(during_grace.last().unwrap()["observableHours"], 0);
     }
 
     #[tokio::test]
