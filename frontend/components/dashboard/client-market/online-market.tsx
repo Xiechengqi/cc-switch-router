@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import { Button, Modal, toast } from "@heroui/react";
-import { CircleDot, Loader2, RefreshCw } from "lucide-react";
+import { Loader2, RefreshCw } from "lucide-react";
 import { useSearchParams } from "next/navigation";
 import { SegmentedControl } from "@/components/common/segmented-control";
 import { useLocaleText } from "@/components/i18n/locale-provider";
@@ -15,6 +15,7 @@ import {
   type OnlineQuote,
   type OnlineSellerItem,
 } from "@/lib/online-client-market";
+import { usePersistentState } from "@/lib/use-persistent-state";
 import { replaceCurrentSearch } from "@/lib/url-search";
 import { cn } from "@/lib/utils";
 import { formatUsdMoney } from "@/lib/market-money";
@@ -36,6 +37,7 @@ import { validPaidWalletQuoteFunding } from "@/lib/market-wallet-quote";
 import { trialDuration } from "@/lib/client-checkout";
 import {
   ROUTER_OPEN_LOGIN_EVENT,
+  SHOP_BROWSE_KEY,
   SHOP_UNKNOWN_COUNTRY,
   aggregateOnlineShopCountries,
   clientMarketTenantFromQuery,
@@ -198,6 +200,7 @@ function ListingOfferDialog({
 }
 
 type MarketProps = {
+  rentInstallationId?: string | null;
   focusId: string | null;
   providerId?: string;
   rentalId?: string | null;
@@ -206,6 +209,7 @@ type MarketProps = {
   onChanged: () => void;
   tenantRecords?: React.ReactNode;
   providerNotice?: React.ReactNode;
+  quoteOnly?: boolean;
 };
 export function OnlineClientMarket(props: MarketProps) {
   const { session, loading } = useAuth();
@@ -218,8 +222,14 @@ export function OnlineClientMarket(props: MarketProps) {
     />
   );
 }
+
+/** Quote dialog only. The Clients page uses this so its cards do not render the shop. */
+export function OnlineRentDialog({ installationId, onClose }: { installationId: string; onClose: () => void }) {
+  return <OnlineClientMarket focusId={null} rentInstallationId={installationId} terminations={new Map()} onTerminationOpen={() => {}} onChanged={onClose} quoteOnly />;
+}
 function OnlineMarketView({
   authenticated,
+  rentInstallationId,
   providerId,
   focusId,
   rentalId,
@@ -228,6 +238,7 @@ function OnlineMarketView({
   onChanged,
   tenantRecords,
   providerNotice,
+  quoteOnly = false,
 }: MarketProps & { authenticated: boolean }) {
   const searchParams = useSearchParams();
   const { session } = useAuth();
@@ -236,17 +247,25 @@ function OnlineMarketView({
   const { openConsole } = useClientConsole();
   const [list, setList] = React.useState<OnlineListing[]>([]);
   const [leases, setLeases] = React.useState<OnlineLease[]>([]);
-  const [country, setCountry] = React.useState(() => {
-    const code = (searchParams.get("country") || "").trim().toUpperCase();
-    return /^[A-Z]{2}$/.test(code) ? code : "";
-  });
-  const [continent, setContinent] = React.useState<ShopContinent>(() => (
-    country ? shopContinentForCountry(country) : "all"
-  ));
-  const [rentableOnly, setRentableOnly] = React.useState(true);
-  const [tenantOpen, setTenantOpen] = React.useState(() => (
-    clientMarketTenantFromQuery(searchParams.get("view"), rentalId || null)
-  ));
+  const queryCountry = (searchParams.get("country") || "").trim().toUpperCase();
+  const queryChoosesBrowse = clientMarketTenantFromQuery(searchParams.get("view"), rentalId || null)
+    || /^[A-Z]{2}$/.test(queryCountry);
+  const [browse, setBrowse] = usePersistentState<{ scope: "mine" | ShopContinent; country: string; rentableOnly: boolean }>(
+    SHOP_BROWSE_KEY,
+    { scope: "all", country: "", rentableOnly: true },
+  );
+  const country = queryChoosesBrowse && /^[A-Z]{2}$/.test(queryCountry)
+    ? queryCountry
+    : /^[A-Z]{2}$/.test(browse.country) || browse.country === SHOP_UNKNOWN_COUNTRY
+      ? browse.country
+      : "";
+  const continent: ShopContinent = /^[A-Z]{2}$/.test(country)
+    ? shopContinentForCountry(country)
+    : browse.scope === "mine" ? "all" : browse.scope;
+  const rentableOnly = browse.rentableOnly;
+  const tenantOpen = queryChoosesBrowse
+    ? clientMarketTenantFromQuery(searchParams.get("view"), rentalId || null)
+    : browse.scope === "mine";
   const [workspace, setWorkspace] = React.useState<"catalog" | "selling">(() => (
     clientMarketWorkspaceFromQuery(searchParams.get("view"), searchParams.get("tab"))
   ));
@@ -257,6 +276,7 @@ function OnlineMarketView({
   const [loaded, setLoaded] = React.useState(false);
   const [error, setError] = React.useState("");
   const [busy, setBusy] = React.useState(false);
+  const quotedRentId = React.useRef("");
   const [pickedId, setPickedId] = React.useState<string | null>(null);
   const [selection, setSelection] = React.useState<OnlineListing | null>(null);
   const [quote, setQuote] = React.useState<OnlineQuote | null>(null);
@@ -423,7 +443,7 @@ function OnlineMarketView({
     });
   };
   const selectTenant = (next: boolean) => {
-    setTenantOpen(next);
+    setBrowse((current) => ({ ...current, scope: next ? "mine" : current.scope === "mine" ? "all" : current.scope }));
     replaceCurrentSearch((params) => {
       if (next) params.set("view", "rentals");
       else if (params.get("view") === "rentals") params.delete("view");
@@ -431,10 +451,13 @@ function OnlineMarketView({
   };
   const selectCountry = (code: string) => {
     const next = code === SHOP_UNKNOWN_COUNTRY || /^[A-Z]{2}$/.test(code) ? code : "";
-    setCountry(next);
+    setBrowse((current) => ({
+      ...current,
+      country: next,
+      scope: /^[A-Z]{2}$/.test(next) ? shopContinentForCountry(next) : current.scope === "mine" ? "all" : current.scope,
+    }));
     setPickedId(null);
     setSelection(null);
-    if (next) setContinent(shopContinentForCountry(next));
     replaceCurrentSearch((params) => {
       if (/^[A-Z]{2}$/.test(next)) params.set("country", next);
       else params.delete("country");
@@ -443,6 +466,19 @@ function OnlineMarketView({
   React.useEffect(() => {
     if (!authenticated && workspace === "selling") selectWorkspace("catalog");
   }, [authenticated, workspace]);
+  React.useEffect(() => {
+    const listing = list.find((item) => item.installationId === rentInstallationId && onlineListingRentable(item) && !item.owned);
+    if (!listing || quotedRentId.current === `${listing.installationId}:${listing.revision}`) return;
+    quotedRentId.current = `${listing.installationId}:${listing.revision}`;
+    if (!authenticated) {
+      window.dispatchEvent(new Event(ROUTER_OPEN_LOGIN_EVENT));
+      return;
+    }
+    setSelection(listing);
+    void action(async () => {
+      setQuote(await onlineRequest<OnlineQuote>(`installations/${listing.installationId}/quote`, "POST", { revision: listing.revision, autoRenew: false }));
+    });
+  }, [authenticated, list, rentInstallationId]);
   const shopSource = list.filter((item) => (
     (!providerId || item.providerId === providerId)
     && !item.owned
@@ -460,50 +496,20 @@ function OnlineMarketView({
   const countryName = !/^[A-Z]{2}$/.test(country)
     ? t("clientMarket.shop.unknownRegion")
     : region(country);
-  const filterButton = (pressed: boolean, label: string, onClick: () => void) => (
-    <button
-      type="button"
-      aria-pressed={pressed}
-      className={cn(
-        "inline-flex h-9 shrink-0 items-center gap-1.5 rounded-lg px-2.5 text-xs focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary",
-        pressed ? "bg-sky-100 font-semibold text-sky-800" : "bg-slate-100 font-medium text-slate-600 hover:bg-slate-200",
-      )}
-      onClick={onClick}
-    >
-      <CircleDot className={cn("h-3.5 w-3.5", pressed ? "text-sky-600" : "text-slate-400")} />
-      <span>{label}</span>
-    </button>
-  );
   return (
-    <section className="grid min-w-0 gap-4" aria-label={t("online.supply")}>
-      <div className="flex min-w-0 flex-wrap items-center justify-between gap-3 border-b border-slate-200 pb-3">
+    <section className={quoteOnly ? "contents" : "grid min-w-0 gap-4"} aria-label={t("online.supply")}>
+      {!quoteOnly ? <React.Fragment><div className="flex min-w-0 flex-wrap items-center justify-between gap-3 border-b border-slate-200 pb-3">
         {authenticated ? (
-          <div className="flex min-w-0 flex-wrap items-center gap-2">
-            <SegmentedControl
-              value={tenantOpen ? "catalog" : workspace}
-              onChange={(next) => {
-                if (tenantOpen) selectTenant(false);
-                selectWorkspace(next);
-              }}
-              ariaLabel={t("clientMarket.shop.workspaceLabel")}
-              size="sm"
-              items={[
-                { id: "catalog", label: t("clientMarket.shop.catalog") },
-                { id: "selling", label: t("clientMarket.shop.selling") },
-              ]}
-            />
-            <button
-              type="button"
-              aria-pressed={tenantOpen}
-              className={cn(
-                "inline-flex h-8 items-center rounded-lg px-2.5 text-xs font-medium focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary",
-                tenantOpen ? "bg-sky-100 text-sky-800" : "text-slate-600 hover:bg-slate-100",
-              )}
-              onClick={() => selectTenant(!tenantOpen)}
-            >
-              {t("clientMarket.shop.tenant")}
-            </button>
-          </div>
+          <SegmentedControl
+            value={workspace}
+            onChange={selectWorkspace}
+            ariaLabel={t("clientMarket.shop.workspaceLabel")}
+            size="sm"
+            items={[
+              { id: "catalog", label: t("clientMarket.shop.catalog") },
+              { id: "selling", label: t("clientMarket.shop.selling") },
+            ]}
+          />
         ) : (
           <h2 className="text-sm font-semibold text-slate-900">{t("clientMarket.shop.catalog")}</h2>
         )}
@@ -573,9 +579,32 @@ function OnlineMarketView({
         </div>
       ) : !loaded ? (
         <p role="status">{t("common.loading")}</p>
-      ) : tenantOpen ? (
-        <div className="grid gap-4">
-          {tenantRecords}
+      ) : (
+        <>
+          {providerNotice}
+          <OnlineShopRegionPicker
+            cards={shopCards}
+            continent={continent}
+            country={country}
+            onContinent={(next) => {
+              if (tenantOpen) selectTenant(false);
+              setBrowse((current) => ({ ...current, scope: next }));
+              if (country && next !== "all" && shopContinentForCountry(country) !== next) selectCountry("");
+            }}
+            onCountry={selectCountry}
+            emptyAction={!tenantOpen && rentableOnly && list.some((item) => !item.owned && (!providerId || item.providerId === providerId))
+              ? { label: t("clientMarket.shop.showAll"), onClick: () => { setBrowse((current) => ({ ...current, rentableOnly: false })); setPickedId(null); } }
+              : undefined}
+            mine={authenticated ? { selected: tenantOpen, onSelect: () => selectTenant(true) } : undefined}
+            rentable={tenantOpen ? undefined : {
+              pressed: rentableOnly,
+              label: t("clientMarket.shop.onlyRentable"),
+              onClick: () => { setBrowse((current) => ({ ...current, rentableOnly: !current.rentableOnly })); setPickedId(null); },
+            }}
+          />
+          {tenantOpen ? (
+            <div className="grid gap-4">
+              {tenantRecords}
           {currentLeases.length > 0 ? (
             <section className="grid gap-2">
               <h2 className="text-sm font-semibold">{t("online.myLeases")}</h2>
@@ -607,26 +636,7 @@ function OnlineMarketView({
             </section>
           ) : null}
         </div>
-      ) : (
-        <>
-          <div className="flex flex-wrap items-center gap-2">
-            {filterButton(rentableOnly, t("clientMarket.shop.onlyRentable"), () => { setRentableOnly((value) => !value); setPickedId(null); })}
-          </div>
-          {providerNotice}
-          <OnlineShopRegionPicker
-            cards={shopCards}
-            continent={continent}
-            country={country}
-            onContinent={(next) => {
-              setContinent(next);
-              if (country && next !== "all" && shopContinentForCountry(country) !== next) selectCountry("");
-            }}
-            onCountry={selectCountry}
-            emptyAction={rentableOnly && list.some((item) => !item.owned && (!providerId || item.providerId === providerId))
-              ? { label: t("clientMarket.shop.showAll"), onClick: () => { setRentableOnly(false); setPickedId(null); } }
-              : undefined}
-          />
-          {country ? (
+          ) : country ? (
             <div className="grid min-w-0 items-start gap-3 xl:grid-cols-[minmax(0,1fr)_minmax(16rem,22rem)]">
               <section className="grid min-w-0 content-start gap-1.5" aria-label={t("clientMarket.shop.hostListLabel", { name: countryName })}>
                 <h2 className="text-sm font-semibold">{t("clientMarket.shop.stepHost")}</h2>
@@ -672,6 +682,7 @@ function OnlineMarketView({
           ) : null}
         </>
       )}
+      </React.Fragment> : null}
 
       <Modal.Backdrop
         isOpen={!!ending || !!quote || !!selected?.owned || accessRequired}

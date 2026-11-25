@@ -46,7 +46,11 @@ import { clientWebTerminalUrl } from "@/lib/client-web-view";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
 import { useClientChat } from "@/components/chat/client-chat";
 import { useAuth } from "@/components/auth/auth-provider";
-import { DASHBOARD_CLIENT_MARKET_PATH } from "@/lib/dashboard-nav";
+import { buildClientInstallCommand, InstallGuideDialog } from "@/components/dashboard/install-guide-dialog";
+import { OnlineRentDialog } from "@/components/dashboard/client-market/online-market";
+import { onlineRequest, type OnlineListing } from "@/lib/online-client-market";
+import { getShareMarketCatalog } from "@/lib/api";
+import { listingIdleCount } from "@/components/dashboard/share-market/market-utils";
 import { SubdomainCopyButton } from "@/components/dashboard/subdomain-copy-button";
 import { ClientSubdomainTakeoverDialog } from "@/components/dashboard/client-subdomain-takeover-dialog";
 import { ClientLogsDialog } from "@/components/dashboard/client-logs-dialog";
@@ -397,6 +401,7 @@ function ClientCard({
   onToggleCollapsed,
   onOpenTakeover,
   onOpenLogs,
+  onRent,
 }: {
   client: DashboardClient;
   shares: ShareView[];
@@ -412,6 +417,7 @@ function ClientCard({
   onToggleCollapsed: () => void;
   onOpenTakeover?: () => void;
   onOpenLogs?: () => void;
+  onRent?: () => void;
 }) {
   const { locale, t } = useLocaleText();
   const tunnelUrl = clientTunnelDisplayUrl(client.clientTunnel?.tunnelUrl);
@@ -518,6 +524,15 @@ function ClientCard({
               {onOpenTakeover ? <ClientTakeoverButton onOpen={onOpenTakeover} /> : null}
               {client.logCollectionEnabled && onOpenLogs ? <ClientLogsButton onOpen={onOpenLogs} /> : null}
               <ClientChatButton client={client} />
+              {onRent ? (
+                <ClientHeaderInlineButton
+                  label={t("online.rent")}
+                  onClick={onRent}
+                  className="inline-flex h-6 shrink-0 items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2.5 text-[11px] font-medium text-emerald-800 hover:bg-emerald-100"
+                >
+                  <span>{t("online.rent")}</span>
+                </ClientHeaderInlineButton>
+              ) : null}
             </div>
           </div>
 
@@ -635,6 +650,12 @@ export function ClientBoard({
   const [takeoverTargetId, setTakeoverTargetId] = React.useState("");
   const [logClientId, setLogClientId] = React.useState("");
   const [filtersOpen, setFiltersOpen] = React.useState(false);
+  const [installOpen, setInstallOpen] = React.useState(false);
+  const [rentableClientsOnly, setRentableClientsOnly] = usePersistentState("cc_switch_router_client_rentable_clients_v1", false);
+  const [rentableSharesOnly, setRentableSharesOnly] = usePersistentState("cc_switch_router_client_rentable_shares_v1", false);
+  const [rentTargetId, setRentTargetId] = React.useState("");
+  const [rentableIds, setRentableIds] = React.useState<Set<string>>(new Set());
+  const [rentableShareIds, setRentableShareIds] = React.useState<Set<string>>(new Set());
   const filtersRef = React.useRef<HTMLDivElement>(null);
   const [query, setQuery] = React.useState("");
   const [statusFilterRaw, setStatusFilter] = usePersistentState<ClientListTab>("cc_switch_router_client_status_v1", "all");
@@ -671,6 +692,29 @@ export function ClientBoard({
   React.useEffect(() => {
     setUrlMine(windowHasMineClientListTab());
   }, []);
+
+  React.useEffect(() => {
+    if (!rentableClientsOnly && !rentableSharesOnly) return;
+    const control = new AbortController();
+    void (async () => {
+      try {
+        if (rentableClientsOnly) {
+          const body = await onlineRequest<{ listings: OnlineListing[] }>("listings", "GET", undefined, control.signal);
+          setRentableIds(new Set(body.listings.filter((item) => item.state === "listed" && !item.occupied && item.healthy && !item.owned).map((item) => item.installationId)));
+        }
+        if (rentableSharesOnly) {
+          const catalog = await getShareMarketCatalog(control.signal);
+          setRentableShareIds(new Set(catalog.listings.filter((listing) => listingIdleCount(listing) > 0).map((listing) => listing.shareId)));
+        }
+      } catch {
+        if (!control.signal.aborted) {
+          setRentableIds(new Set());
+          setRentableShareIds(new Set());
+        }
+      }
+    })();
+    return () => control.abort();
+  }, [rentableClientsOnly, rentableSharesOnly]);
 
   const sortedClients = React.useMemo(() => sortClients(clients), [clients]);
   const defaultExpandedClientId = sortedClients.reduce<DashboardClient | undefined>((best, client) => {
@@ -753,7 +797,7 @@ export function ClientBoard({
       const matchedShares = clientMatch ? allShares : allShares.filter((share) => shareMatchesQuery(share, normalizedQuery));
       return {
         client,
-        shares: matchedShares,
+        shares: rentableSharesOnly ? matchedShares.filter((share) => rentableShareIds.has(share.shareId)) : matchedShares,
         allShares,
         state: clientOperationalSummary(client, allShares).state,
         clientMatch,
@@ -764,6 +808,8 @@ export function ClientBoard({
       if (normalizedQuery && row.shares.length === 0 && !row.clientMatch) return false;
       const region = row.client.installation.countryCode || row.client.installation.region || "";
       if (regionFilters.length > 0 && !regionFilters.includes(region)) return false;
+      if (rentableClientsOnly && !rentableIds.has(row.client.installation.id)) return false;
+      if (rentableSharesOnly && !row.allShares.some((share) => rentableShareIds.has(share.shareId))) return false;
       if (statusFilter !== "all" && row.state !== statusFilter) return false;
       if (issuesOnly && row.state === "online") return false;
       return true;
@@ -794,7 +840,7 @@ export function ClientBoard({
       return (stableStateRanks.get(left.client.installation.id) || 0) - (stableStateRanks.get(right.client.installation.id) || 0) || (stableOrder.get(left.client.installation.id) || 0) - (stableOrder.get(right.client.installation.id) || 0);
     });
     return rows;
-  }, [focus.target, issuesOnly, query, regionFilters, sharesForClient, sortOrder, sortedClients, stableStateRanks, statusFilter]);
+  }, [focus.target, issuesOnly, query, regionFilters, rentableClientsOnly, rentableIds, rentableShareIds, rentableSharesOnly, sharesForClient, sortOrder, sortedClients, stableStateRanks, statusFilter]);
 
   const clientSummary = React.useMemo(() => {
     const states = sortedClients.map((client) => clientOperationalSummary(client, sharesForClient(client)).state);
@@ -1019,7 +1065,7 @@ export function ClientBoard({
     return byShare;
   }, [modelRouting.routes]);
 
-  const activeFilterCount = regionFilters.length;
+  const activeFilterCount = regionFilters.length + Number(rentableClientsOnly) + Number(rentableSharesOnly);
   const clientTabs: Array<{ value: ClientListTab; label: string; count: number }> = [
     ...(hasViewerIdentity ? [{ value: "mine" as const, label: t("dashboard.mine"), count: clientSummary.mine }] : []),
     { value: "all", label: t("dashboard.all"), count: sortedClients.length },
@@ -1041,13 +1087,14 @@ export function ClientBoard({
             ))}
           </div>
           {statusFilter === "mine" ? null : (
-            <Link
-              href={DASHBOARD_CLIENT_MARKET_PATH}
-              className="inline-flex min-h-11 items-center gap-1.5 rounded-lg border border-border bg-card px-3 text-xs font-medium text-foreground transition-colors hover:border-accent/30 hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2"
+            <button
+              type="button"
+              className="inline-flex h-7 items-center gap-1 rounded-md border border-border bg-card px-2 text-[11px] font-medium text-foreground hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+              onClick={() => setInstallOpen(true)}
             >
-              <Plus aria-hidden className="h-3.5 w-3.5" />
-              {t("online.rent")}
-            </Link>
+              <Plus aria-hidden className="h-3 w-3" />
+              {t("dashboard.joinClient")}
+            </button>
           )}
         </div>
         <div className="flex w-full min-w-0 items-center gap-2 sm:w-auto">
@@ -1117,11 +1164,23 @@ export function ClientBoard({
                       className="w-full"
                     />
                   </label>
+                  <label className="flex min-h-8 items-center gap-2 text-xs text-foreground">
+                    <input type="checkbox" checked={rentableClientsOnly} onChange={(event) => setRentableClientsOnly(event.target.checked)} />
+                    {t("dashboard.filterRentableClients")}
+                  </label>
+                  <label className="flex min-h-8 items-center gap-2 text-xs text-foreground">
+                    <input type="checkbox" checked={rentableSharesOnly} onChange={(event) => setRentableSharesOnly(event.target.checked)} />
+                    {t("dashboard.filterRentableShares")}
+                  </label>
                   {activeFilterCount ? (
                     <button
                       type="button"
                       className="justify-self-start text-xs font-medium text-primary hover:underline"
-                      onClick={() => clearRegionFilters()}
+                      onClick={() => {
+                        clearRegionFilters();
+                        setRentableClientsOnly(false);
+                        setRentableSharesOnly(false);
+                      }}
                     >
                       {t("dashboard.clearFilters")}
                     </button>
@@ -1176,7 +1235,7 @@ export function ClientBoard({
             </EmptyBlock>
           )
         ) : clientRows.length ? clientRows.map(({ client, shares: visibleShares, allShares }) => (
-          <ClientCard key={client.installation.id} client={client} shares={visibleShares} summaryShares={allShares} onOpenClient={openClient} onOpenShare={openShare} onEditShare={openEditShare} onConnectShare={openConnectShare} collapsed={!query && !expandedClientIdSet.has(client.installation.id)} onToggleCollapsed={() => toggleClientExpanded(client.installation.id)} onOpenTakeover={takeoverSourcesFor(client).length ? () => setTakeoverTargetId(client.installation.id) : undefined} onOpenLogs={canViewClientLogs(client) ? () => setLogClientId(client.installation.id) : undefined} />
+          <ClientCard key={client.installation.id} client={client} shares={visibleShares} summaryShares={allShares} onOpenClient={openClient} onOpenShare={openShare} onEditShare={openEditShare} onConnectShare={openConnectShare} collapsed={!query && !expandedClientIdSet.has(client.installation.id)} onToggleCollapsed={() => toggleClientExpanded(client.installation.id)} onOpenTakeover={takeoverSourcesFor(client).length ? () => setTakeoverTargetId(client.installation.id) : undefined} onOpenLogs={canViewClientLogs(client) ? () => setLogClientId(client.installation.id) : undefined} onRent={rentableClientsOnly && rentableIds.has(client.installation.id) ? () => setRentTargetId(client.installation.id) : undefined} />
         )) : (
           <EmptyBlock>
             <div className="grid justify-items-center gap-2">
@@ -1321,6 +1380,15 @@ export function ClientBoard({
         open={!!logClient?.logCollectionEnabled}
         onOpenChange={(open) => !open && setLogClientId("")}
       />
+      <InstallGuideDialog
+        open={installOpen}
+        onOpenChange={setInstallOpen}
+        titleKey="dashboard.joinClient"
+        descriptionKey="dashboard.installClientHint"
+        commandLabelKey="dashboard.installCommand"
+        command={buildClientInstallCommand({ ownerEmail: session?.user?.email })}
+      />
+      {rentTargetId ? <OnlineRentDialog installationId={rentTargetId} onClose={() => { setRentTargetId(""); void onChanged?.(); }} /> : null}
     </section>
   );
 }

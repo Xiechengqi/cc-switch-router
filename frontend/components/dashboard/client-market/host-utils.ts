@@ -876,6 +876,7 @@ export function normalizeOwnerFilters(value: unknown): string[] {
 }
 
 export const REGION_FILTER_KEY = "cc_switch_router_client_market_region_filter_v1";
+export const SHOP_BROWSE_KEY = "cc_switch_router_client_market_shop_browse_v1";
 export const STATUS_FILTER_KEY = "cc_switch_router_client_market_status_filter_v3";
 export const SORT_PREFS_KEY = "cc_switch_router_client_market_sort_v2";
 export const HOST_PAGE_SIZE = 10;

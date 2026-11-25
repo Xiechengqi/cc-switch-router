@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import { CircleDot } from "lucide-react";
 import { CountryFlag } from "@/components/common/country-flag";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { formatUsdMoney } from "@/lib/market-money";
@@ -26,6 +27,8 @@ export function OnlineShopRegionPicker({
   onContinent,
   onCountry,
   emptyAction,
+  mine,
+  rentable,
 }: {
   cards: ShopCountryCard[];
   continent: ShopContinent;
@@ -33,6 +36,8 @@ export function OnlineShopRegionPicker({
   onContinent: (next: ShopContinent) => void;
   onCountry: (code: string) => void;
   emptyAction?: { label: string; onClick: () => void };
+  mine?: { selected: boolean; onSelect: () => void };
+  rentable?: { pressed: boolean; label: string; onClick: () => void };
 }) {
   const { locale, t } = useLocaleText();
   const names = React.useMemo(() => new Intl.DisplayNames([locale], { type: "region" }), [locale]);
@@ -46,9 +51,65 @@ export function OnlineShopRegionPicker({
     if (card.hasFreeIdle || card.minMonthlyMinor == null) return formatUsdMoney(0, locale);
     return formatUsdMoney(card.minMonthlyMinor, locale);
   };
+  const pills = (
+    <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
+    <div className="flex min-w-0 flex-wrap gap-1.5" role="listbox" aria-label={t("clientMarket.shop.continentLabel")}>
+      {mine ? (
+        <button
+          type="button"
+          role="option"
+          aria-selected={mine.selected}
+          className={cn(
+            "inline-flex min-h-8 items-center rounded-full border border-border bg-background px-3 text-xs text-foreground",
+            focusRing,
+            mine.selected && selectedFill,
+          )}
+          onClick={mine.onSelect}
+        >
+          {t("clientMarket.shop.mine")}
+        </button>
+      ) : null}
+      {continents.map((item) => {
+        const selected = item === continent && !mine?.selected;
+        return (
+          <button
+            key={item}
+            type="button"
+            role="option"
+            aria-selected={selected}
+            className={cn(
+              "inline-flex min-h-8 items-center rounded-full border border-border bg-background px-3 text-xs text-foreground",
+              focusRing,
+              selected && selectedFill,
+            )}
+            onClick={() => onContinent(item)}
+          >
+            {t(`clientMarket.shop.continent.${item}`)}
+          </button>
+        );
+      })}
+    </div>
+    {rentable ? (
+      <button
+        type="button"
+        aria-pressed={rentable.pressed}
+        className={cn(
+          "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg px-2.5 text-xs focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary",
+          rentable.pressed ? "bg-sky-100 font-semibold text-sky-800" : "bg-slate-100 font-medium text-slate-600 hover:bg-slate-200",
+        )}
+        onClick={rentable.onClick}
+      >
+        <CircleDot className={cn("h-3.5 w-3.5", rentable.pressed ? "text-sky-600" : "text-slate-400")} />
+        <span>{rentable.label}</span>
+      </button>
+    ) : null}
+    </div>
+  );
+  if (mine?.selected) return pills;
   if (cards.length === 0) {
     return (
       <div className="grid justify-items-start gap-2">
+        {mine ? pills : null}
         <p className="text-sm text-muted-foreground">{t(emptyAction ? "clientMarket.shop.rentableEmpty" : "clientMarket.shop.noRegions")}</p>
         {emptyAction ? (
           <button type="button" className={cn("text-sm font-medium text-primary hover:underline", focusRing)} onClick={emptyAction.onClick}>
@@ -60,27 +121,7 @@ export function OnlineShopRegionPicker({
   }
   return (
     <div className="grid gap-3">
-      <div className="flex min-w-0 flex-wrap gap-1.5" role="listbox" aria-label={t("clientMarket.shop.continentLabel")}>
-        {continents.map((item) => {
-          const selected = item === continent;
-          return (
-            <button
-              key={item}
-              type="button"
-              role="option"
-              aria-selected={selected}
-              className={cn(
-                "inline-flex min-h-8 items-center rounded-full border border-border bg-background px-3 text-xs text-foreground",
-                focusRing,
-                selected && selectedFill,
-              )}
-              onClick={() => onContinent(item)}
-            >
-              {t(`clientMarket.shop.continent.${item}`)}
-            </button>
-          );
-        })}
-      </div>
+      {pills}
       {visible.length === 0 ? <p className="text-sm text-muted-foreground">{t("clientMarket.shop.noRegions")}</p> : (
         <div className="flex min-w-0 flex-wrap gap-1.5">
           {visible.map((card) => {
