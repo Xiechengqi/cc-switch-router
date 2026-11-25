@@ -249,49 +249,24 @@ export function OnlineClientCard({
 }
 
 export function OnlineSellingToolbar({
-  counts,
-  filter,
+  listedCount,
   query,
-  canAdd,
-  onFilter,
   onQuery,
   onAdd,
 }: {
-  counts: { listed: number; rented: number; listable: number };
-  filter: "all" | "listed" | "rented" | "listable";
+  listedCount: number;
   query: string;
-  canAdd: boolean;
-  onFilter: (next: "all" | "listed" | "rented" | "listable") => void;
   onQuery: (next: string) => void;
   onAdd: () => void;
 }) {
   const { t } = useLocaleText();
-  const tabs = (["listed", "rented", "listable"] as const).filter((item) => counts[item] > 0);
   return (
     <div className="flex min-w-0 flex-wrap items-center gap-2">
-      <div className="flex min-w-0 flex-1 flex-wrap gap-1" role="tablist" aria-label={t("clientMarket.shop.sellingFilters")}>
-        {tabs.map((item) => {
-          const selected = filter === item;
-          return (
-            <button
-              key={item}
-              type="button"
-              role="tab"
-              aria-selected={selected}
-              className={cn(
-                "inline-flex h-9 shrink-0 items-center gap-1.5 rounded-lg px-2.5 text-xs",
-                focusRing,
-                selected ? "bg-sky-100 font-semibold text-sky-800" : "bg-slate-100 font-medium text-slate-600 hover:bg-slate-200",
-              )}
-              onClick={() => onFilter(selected ? "all" : item)}
-            >
-              <span>{t(`clientMarket.shop.filter.${item}`)}</span>
-              <span className={cn("tabular-nums", selected ? "text-sky-600" : "text-slate-400")}>{counts[item]}</span>
-            </button>
-          );
-        })}
-      </div>
-      <label className="flex h-9 w-44 shrink-0 grow items-center gap-1.5 rounded-md border border-slate-200 bg-white px-2.5 text-sm shadow-sm sm:grow-0">
+      <h3 className="shrink-0 whitespace-nowrap text-xs font-semibold uppercase tracking-wide text-slate-500">
+        {t("clientMarket.shop.filter.listed")}
+        <span className="ml-1.5 tabular-nums text-slate-400">{listedCount}</span>
+      </h3>
+      <label className="flex h-9 w-44 shrink-0 grow items-center gap-1.5 rounded-md border border-slate-200 bg-white px-2.5 text-sm shadow-sm sm:ml-auto sm:grow-0">
         <Search className="h-3.5 w-3.5 shrink-0 text-slate-400" />
         <input
           aria-label={t("clientMarket.shop.sellingSearch")}
@@ -308,9 +283,7 @@ export function OnlineSellingToolbar({
       </label>
       <button
         type="button"
-        disabled={!canAdd}
-        title={canAdd ? undefined : t("clientMarket.shop.listBlocked")}
-        className={cn("inline-flex h-9 shrink-0 items-center gap-1 rounded-lg border border-slate-200 bg-white px-2.5 text-xs font-medium disabled:opacity-50", focusRing)}
+        className={cn("inline-flex h-9 shrink-0 items-center gap-1 rounded-lg border border-slate-200 bg-white px-2.5 text-xs font-medium", focusRing)}
         onClick={onAdd}
       >
         <Plus className="h-4 w-4" />

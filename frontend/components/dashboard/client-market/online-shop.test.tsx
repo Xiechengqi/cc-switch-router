@@ -15,6 +15,9 @@ test("shop pills use Tailwind classes instead of stripped custom CSS", () => {
   assert.match(shop, /ONLINE_CLIENT_CARD_GRID_CLASS/);
   assert.match(shop, /grid-cols-1 gap-3 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-4/);
   assert.match(shop, /clientMarket\.shop\.sellingSearch/);
-  assert.match(shop, /clientMarket\.shop\.filter\.\$\{item\}/);
+  assert.match(shop, /clientMarket\.shop\.filter\.listed/);
+  assert.match(shop, /clientMarket\.shop\.listAdd/);
+  assert.doesNotMatch(shop, /filter\.listable/);
+  assert.doesNotMatch(shop, /canAdd/);
   assert.doesNotMatch(css, /client-market-shop-continent/);
 });
