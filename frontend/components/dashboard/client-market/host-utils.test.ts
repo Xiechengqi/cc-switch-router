@@ -12,6 +12,9 @@ import {
   parseClientTrialHours,
   persistedClientMarketProviderSelection,
   recommendedClientMarketProviderId,
+  aggregateOnlineShopCountries,
+  onlineListingRentable,
+  onlineShopSpecLine,
   shopContinentForCountry,
   SHOP_CONTINENTS,
   sortShopCountries,
@@ -58,6 +61,30 @@ test("shop host cards keep one spec line and omit missing values", () => {
       },
     },
   }), "linux-aarch64 · 2C · 1.5G");
+});
+
+test("online shop spec line uses GiB memory and leaves disk off the card", () => {
+  assert.equal(onlineShopSpecLine(undefined), "");
+  assert.equal(onlineShopSpecLine({ arch: "x86_64", cpu: 4, memoryBytes: 3.8 * 2 ** 30 }), "x86_64 · 4C · 3.8G");
+  assert.equal(onlineShopSpecLine({ arch: "aarch64", cpu: null, memoryBytes: null }), "aarch64");
+});
+
+test("online shop cards count rentable listings and ignore occupied or offline ones", () => {
+  assert.equal(onlineListingRentable({ state: "listed", occupied: false, healthy: true }), true);
+  assert.equal(onlineListingRentable({ state: "listed", occupied: true, healthy: true }), false);
+  assert.equal(onlineListingRentable({ state: "listed", occupied: false, healthy: false }), false);
+  const cards = aggregateOnlineShopCountries([
+    { country: "jp", state: "listed", occupied: false, healthy: true, cyclePriceMinor: 500 },
+    { country: "JP", state: "listed", occupied: false, healthy: true, cyclePriceMinor: 0 },
+    { country: "JP", state: "listed", occupied: true, healthy: true, cyclePriceMinor: 100 },
+    { country: null, state: "listed", occupied: false, healthy: true, cyclePriceMinor: 0 },
+  ]);
+  const japan = cards.find((card) => card.code === "JP");
+  assert.equal(japan?.idle, 2);
+  assert.equal(japan?.total, 3);
+  assert.equal(japan?.hasFreeIdle, true);
+  assert.equal(japan?.minMonthlyMinor, 500);
+  assert.equal(cards.find((card) => card.code === "unknown")?.continent, "other");
 });
 
 test("shop continents keep ISO regions distinct and group unknown codes as other", () => {

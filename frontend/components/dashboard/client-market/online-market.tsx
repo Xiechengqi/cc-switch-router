@@ -2,6 +2,9 @@
 
 import * as React from "react";
 import { Button, Modal, toast } from "@heroui/react";
+import { CircleDot, Loader2, RefreshCw } from "lucide-react";
+import { useSearchParams } from "next/navigation";
+import { SegmentedControl } from "@/components/common/segmented-control";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useClientConsole } from "@/components/dashboard/client-console";
@@ -10,7 +13,11 @@ import {
   type OnlineListing,
   type OnlineLease,
   type OnlineQuote,
+  type OnlineSellerItem,
 } from "@/lib/online-client-market";
+import { replaceCurrentSearch } from "@/lib/url-search";
+import { cn } from "@/lib/utils";
+import { formatUsdMoney } from "@/lib/market-money";
 import { ApiError, createMarketAccessRequest } from "@/lib/api";
 import {
   clientTerminationHref,
@@ -21,12 +28,25 @@ import {
   type ClientTerminationRequest,
   type ClientTerminationHostSummary,
 } from "@/lib/client-termination";
+import { ClientOnlineHeatmap } from "@/components/dashboard/client-online-heatmap";
 import { ClientTerminationHostAction } from "@/components/market/client-termination-host-action";
 import { clientMarketMineHref } from "@/lib/dashboard-nav";
 import { formatWalletUnits } from "@/lib/market-wallet-money";
 import { validPaidWalletQuoteFunding } from "@/lib/market-wallet-quote";
 import { trialDuration } from "@/lib/client-checkout";
-import { ROUTER_OPEN_LOGIN_EVENT } from "./host-utils";
+import {
+  ROUTER_OPEN_LOGIN_EVENT,
+  SHOP_UNKNOWN_COUNTRY,
+  aggregateOnlineShopCountries,
+  clientMarketTenantFromQuery,
+  clientMarketWorkspaceFromQuery,
+  onlineListingRentable,
+  shopContinentForCountry,
+  shopCountryKey,
+  sortShopCountries,
+  type ShopContinent,
+} from "./host-utils";
+import { OnlineShopConfirm, OnlineShopListingButton, OnlineShopRegionPicker } from "./online-shop";
 
 const field =
   "h-12 rounded-lg border bg-background px-3 focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2";
@@ -204,12 +224,16 @@ export function ListOnlineClient({
 type MarketProps = {
   focusId: string | null;
   providerId?: string;
+  rentalId?: string | null;
   terminations: ReadonlyMap<string, ClientTerminationHostSummary>;
   onTerminationOpen: (id: string) => void;
   onChanged: () => void;
+  tenantRecords?: React.ReactNode;
+  providerNotice?: React.ReactNode;
 };
 export function OnlineClientMarket(props: MarketProps) {
-  const { session } = useAuth();
+  const { session, loading } = useAuth();
+  if (loading) return null;
   return (
     <OnlineMarketView
       key={session?.user?.id || "guest"}
@@ -222,19 +246,38 @@ function OnlineMarketView({
   authenticated,
   providerId,
   focusId,
+  rentalId,
   terminations,
   onTerminationOpen,
   onChanged,
+  tenantRecords,
+  providerNotice,
 }: MarketProps & { authenticated: boolean }) {
+  const searchParams = useSearchParams();
   const { locale, t } = useLocaleText();
   const { openConsole } = useClientConsole();
   const [list, setList] = React.useState<OnlineListing[]>([]);
   const [leases, setLeases] = React.useState<OnlineLease[]>([]);
-  const [country, setCountry] = React.useState("");
+  const [country, setCountry] = React.useState(() => {
+    const code = (searchParams.get("country") || "").trim().toUpperCase();
+    return /^[A-Z]{2}$/.test(code) ? code : "";
+  });
+  const [continent, setContinent] = React.useState<ShopContinent>(() => (
+    country ? shopContinentForCountry(country) : "all"
+  ));
+  const [rentableOnly, setRentableOnly] = React.useState(true);
+  const [tenantOpen, setTenantOpen] = React.useState(() => (
+    clientMarketTenantFromQuery(searchParams.get("view"), rentalId || null)
+  ));
+  const [workspace, setWorkspace] = React.useState<"catalog" | "selling">(() => (
+    clientMarketWorkspaceFromQuery(searchParams.get("view"), searchParams.get("tab"))
+  ));
+  const [sellerItems, setSellerItems] = React.useState<OnlineSellerItem[]>([]);
   const [version, setVersion] = React.useState(0);
   const [loaded, setLoaded] = React.useState(false);
   const [error, setError] = React.useState("");
   const [busy, setBusy] = React.useState(false);
+  const [pickedId, setPickedId] = React.useState<string | null>(null);
   const [selection, setSelection] = React.useState<OnlineListing | null>(null);
   const [quote, setQuote] = React.useState<OnlineQuote | null>(null);
   const selected = selection
@@ -258,7 +301,7 @@ function OnlineMarketView({
     let timer: ReturnType<typeof setTimeout>;
     const read = async () => {
       try {
-        const [s, r] = await Promise.all([
+        const [s, r, seller] = await Promise.all([
           onlineRequest<{ listings: OnlineListing[] }>(
             "listings",
             "GET",
@@ -272,7 +315,15 @@ function OnlineMarketView({
                 undefined,
                 control.signal,
               )
-            : Promise.resolve({ leases: [] }),
+            : Promise.resolve({ leases: [] as OnlineLease[] }),
+          authenticated && workspace === "selling"
+            ? onlineRequest<{ items: OnlineSellerItem[] }>(
+                "seller-inventory",
+                "GET",
+                undefined,
+                control.signal,
+              )
+            : Promise.resolve({ items: [] as OnlineSellerItem[] }),
         ]);
         if (!control.signal.aborted) {
           setList(
@@ -281,6 +332,7 @@ function OnlineMarketView({
             ),
           );
           setLeases(r.leases);
+          setSellerItems(seller.items);
           setError("");
         }
       } catch (e) {
@@ -298,7 +350,7 @@ function OnlineMarketView({
       control.abort();
       clearTimeout(timer);
     };
-  }, [authenticated, version, providerId]);
+  }, [authenticated, version, providerId, workspace]);
   const focused = React.useRef<string | null>(null);
   React.useEffect(() => {
     if (!focusId) { focused.current = null; return; }
@@ -336,15 +388,14 @@ function OnlineMarketView({
         setQuote(null);
         setVersion((v) => v + 1);
       }
-      setAccessRequired(
-        e instanceof ApiError && e.code === "MARKET_ACCESS_REQUIRED",
-      );
+      setAccessRequired(e instanceof ApiError && e.code === "MARKET_ACCESS_REQUIRED");
       setDialogError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
     }
   }
   const close = () => {
+    setPickedId(null);
     setSelection(null);
     setEnding(null);
     setExitRead(null);
@@ -366,31 +417,86 @@ function OnlineMarketView({
       quote.terms.cyclePriceMinor,
     ) &&
       funding?.shortfallUnits === "0");
+  const selectWorkspace = (next: "catalog" | "selling") => {
+    setWorkspace(next);
+    replaceCurrentSearch((params) => {
+      params.delete("tab");
+      if (next === "selling") params.set("view", "selling");
+      else if (params.get("view") === "selling") params.delete("view");
+    });
+  };
+  const selectTenant = (next: boolean) => {
+    setTenantOpen(next);
+    replaceCurrentSearch((params) => {
+      if (next) params.set("view", "rentals");
+      else if (params.get("view") === "rentals") params.delete("view");
+    });
+  };
+  const selectCountry = (code: string) => {
+    const next = code === SHOP_UNKNOWN_COUNTRY || /^[A-Z]{2}$/.test(code) ? code : "";
+    setCountry(next);
+    setPickedId(null);
+    setSelection(null);
+    if (next) setContinent(shopContinentForCountry(next));
+    replaceCurrentSearch((params) => {
+      if (/^[A-Z]{2}$/.test(next)) params.set("country", next);
+      else params.delete("country");
+    });
+  };
+  React.useEffect(() => {
+    if (!authenticated && workspace === "selling") selectWorkspace("catalog");
+  }, [authenticated, workspace]);
+  const shopSource = list.filter((item) => (
+    (!providerId || item.providerId === providerId)
+    && !item.owned
+    && (!rentableOnly || onlineListingRentable(item))
+  ));
+  const shopCards = sortShopCountries(
+    aggregateOnlineShopCountries(shopSource),
+    "idle",
+    (code) => (/^[A-Z]{2}$/.test(code) ? region(code) : "\uffff"),
+  );
+  const shopListings = country
+    ? shopSource.filter((item) => shopCountryKey(item.country) === country)
+    : [];
+  const currentLeases = leases.filter((lease) => lease.state !== "released");
+  const countryName = !/^[A-Z]{2}$/.test(country)
+    ? t("clientMarket.shop.unknownRegion")
+    : region(country);
+  const filterButton = (pressed: boolean, label: string, onClick: () => void) => (
+    <button
+      type="button"
+      aria-pressed={pressed}
+      className={cn(
+        "inline-flex h-9 shrink-0 items-center gap-1.5 rounded-lg px-2.5 text-xs focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary",
+        pressed ? "bg-sky-100 font-semibold text-sky-800" : "bg-slate-100 font-medium text-slate-600 hover:bg-slate-200",
+      )}
+      onClick={onClick}
+    >
+      <CircleDot className={cn("h-3.5 w-3.5", pressed ? "text-sky-600" : "text-slate-400")} />
+      <span>{label}</span>
+    </button>
+  );
   return (
     <section className="grid min-w-0 gap-4" aria-label={t("online.supply")}>
-      <div className="flex flex-wrap items-end justify-between gap-3">
-        <h2 className="text-lg font-semibold">{t("online.supply")}</h2>
-        <label className="flex items-center gap-2 text-sm">
-          {t("online.region")}
-          <select
-            className={field}
-            value={country}
-            onChange={(e) => setCountry(e.target.value)}
-          >
-            <option value="">{t("online.all")}</option>
-            {Array.from(
-              new Set(
-                list.map((l) => l.country).filter((c): c is string => !!c),
-              ),
-            )
-              .sort()
-              .map((c) => (
-                <option key={c} value={c}>
-                  {region(c)}
-                </option>
-              ))}
-          </select>
-        </label>
+      <div className="flex min-w-0 flex-wrap items-center justify-between gap-3 border-b border-slate-200 pb-3">
+        {authenticated ? (
+          <SegmentedControl
+            value={workspace}
+            onChange={selectWorkspace}
+            ariaLabel={t("clientMarket.shop.workspaceLabel")}
+            size="sm"
+            items={[
+              { id: "catalog", label: t("clientMarket.shop.catalog") },
+              { id: "selling", label: t("clientMarket.shop.selling") },
+            ]}
+          />
+        ) : (
+          <h2 className="text-sm font-semibold text-slate-900">{t("clientMarket.shop.catalog")}</h2>
+        )}
+        <Button isIconOnly variant="ghost" aria-label={t("common.reload")} isDisabled={!loaded} onPress={() => setVersion((v) => v + 1)}>
+          {!loaded ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+        </Button>
       </div>
       {error && (
         <p role="alert" className="text-danger">
@@ -404,202 +510,141 @@ function OnlineMarketView({
           </Button>
         </p>
       )}
-      {!loaded ? (
-        <p role="status">{t("common.loading")}</p>
-      ) : (
-        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-          {list
-            .filter((l) => !country || country === l.country)
-            .map((l) => {
-              const hw = l.hardware;
-              const status =
-                l.state !== "listed"
-                  ? l.state
-                  : l.occupied
-                    ? "occupied"
-                    : l.healthy
-                      ? "available"
-                      : "offline";
-              return (
-                <article
-                  key={l.installationId}
-                  id={`market-client-${l.installationId}`} tabIndex={-1}
-                  className="grid content-start gap-3 rounded-xl border bg-background p-4"
-                >
-                  <div className="flex items-center justify-between gap-2">
-                    <h3
-                      id={`market-client-${l.installationId}-title`}
-                      className="truncate font-semibold"
-                    >
-                      {l.label}
-                    </h3>
-                    <span
-                      className={
-                        status === "available"
-                          ? "text-sm text-emerald-700"
-                          : "text-sm text-muted-foreground"
-                      }
-                    >
-                      {t(onlineStatusKey(status))}
-                    </span>
-                  </div>
-                  <div>
-                    <strong>{region(l.country)}</strong>
-                    <span className="ml-2 text-sm text-muted-foreground">
-                      {l.egressIp}
-                    </span>
-                    {l.egressDiffers && (
-                      <p className="text-xs text-muted-foreground">
-                        {t("online.egressDiffers")}
-                      </p>
-                    )}
-                  </div>
-                  <p className="text-sm">
-                    {[
-                      hw?.arch,
-                      hw?.cpu && t("online.cpu", { count: hw.cpu }),
-                      hw?.memoryBytes &&
-                        t("online.memory", {
-                          size: (hw.memoryBytes / 2 ** 30).toFixed(1),
-                        }),
-                      hw?.diskBytes &&
-                        t("online.diskSize", {
-                          size: (hw.diskBytes / 2 ** 30).toFixed(0),
-                        }),
-                    ]
-                      .filter(Boolean)
-                      .join(" · ") || t("online.unknown")}
-                  </p>
-                  <dl className="grid gap-1 text-xs text-muted-foreground">
-                    <div className="flex justify-between gap-2">
-                      <dt className="min-w-0">{t("online.hours")}</dt>
-                      <dd className="shrink-0 tabular-nums">
-                        {t("online.hoursValue", { hours: l.availableHours24 })}
-                      </dd>
-                    </div>
-                    <div className="flex justify-between gap-2">
-                      <dt>{t("online.probe")}</dt>
-                      <dd>{l.observedAt ? date(l.observedAt) : "—"}</dd>
-                    </div>
-                  </dl>
-                  <ClientTerminationHostAction
-                    summary={terminations.get(l.installationId)}
-                    onOpen={onTerminationOpen}
-                    describedBy={`market-client-${l.installationId}-title`}
-                  />
-                  <div className="flex items-center justify-between border-t pt-2">
-                    <strong>{money(l.cyclePriceMinor)}</strong>
-                    <Button
-                      className={button}
-                      variant="outline"
-                      aria-describedby={`market-client-${l.installationId}-title`}
-                      isDisabled={
-                        busy ||
-                        (l.owned
-                          ? l.occupied || l.state === "unlocking"
-                          : status !== "available")
-                      }
-                      onPress={() => {
-                        if (!authenticated) {
-                          window.dispatchEvent(
-                            new Event(ROUTER_OPEN_LOGIN_EVENT),
-                          );
-                          return;
-                        }
-                        close();
-                        setSelection(l);
-                      }}
-                    >
-                      {t(l.owned ? "online.unlist" : "online.rent")}
-                    </Button>
-                  </div>
-                </article>
-              );
-            })}
-          {!list.some((l) => !country || country === l.country) && !error && (
-            <p className="text-sm text-muted-foreground">{t("online.empty")}</p>
-          )}
-        </div>
-      )}
-      {leases.length > 0 && (
-        <section className="grid gap-2">
-          <h2 className="text-lg font-semibold">{t("online.myLeases")}</h2>
-          <p className="text-sm text-muted-foreground">
-            {t("online.rootNotice")}
-          </p>
-          {leases.map((l) => (
-            <article key={l.leaseId} id={`market-client-${l.leaseId}`} tabIndex={-1} className="rounded-xl border p-4">
+      {workspace === "selling" && authenticated ? (
+        <div className="grid gap-2">
+          {sellerItems.length === 0 && loaded ? <p className="text-sm text-muted-foreground">{t("account.client.providerEmpty")}</p> : null}
+          {sellerItems.map((item) => (
+            <article key={item.id} id={`market-client-${item.listingId || item.id}`} tabIndex={-1} className="grid gap-2 rounded-xl border border-border bg-background p-4">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div>
-                  <strong id={`market-client-${l.leaseId}-title`}>
-                    {l.alias}
-                  </strong>
-                  <p className="text-sm">
-                    {t(onlineStatusKey(l.state))} · {t("online.grantUntil")}{" "}
-                    {date(l.expiresAt)}
-                  </p>
+                  <h3 className="font-semibold">{item.label}</h3>
+                  <p className="text-sm text-muted-foreground">{t(onlineStatusKey(item.state))} · {item.cyclePriceMinor ? `${formatUsdMoney(item.cyclePriceMinor, locale)}${t("online.perMonth")}` : `${formatUsdMoney(0, locale)}${t("online.perMonth")}`}</p>
                 </div>
-                <div className="flex gap-2">
-                  {l.state === "active" && (
-                    <Button
-                      className={button}
-                      aria-describedby={`market-client-${l.leaseId}-title`}
-                      onPress={() =>
-                        openConsole({
-                          clientId: l.leaseId,
-                          kind: "console",
-                          url: l.clientUrl,
-                          title: l.alias,
-                        })
-                      }
-                    >
-                      {t("online.console")}
-                    </Button>
-                  )}
-                  {["active", "starting"].includes(l.state) && (
-                    <Button
-                      variant="outline"
-                      className={button}
-                      aria-describedby={`market-client-${l.leaseId}-title`}
-                      onPress={() => {
-                        close();
-                        setEnding(l);
-                      }}
-                    >
-                      {t("online.end")}
-                    </Button>
-                  )}
-                </div>
+                {item.listingId && !["occupied", "unlocking"].includes(item.state) ? (
+                  <Button className={button} variant="outline" isDisabled={busy} onPress={() => {
+                    const listing = list.find((entry) => entry.installationId === item.listingId);
+                    if (!listing) return;
+                    close();
+                    setSelection(listing);
+                  }}>{t("online.unlist")}</Button>
+                ) : null}
               </div>
-              {l.terminationId && (
-                <a
-                  className={link}
-                  href={clientTerminationHref(l.terminationId)}
-                  aria-describedby={`market-client-${l.leaseId}-title`}
-                >
-                  {t("online.exitRecord")}
-                </a>
-              )}
-              {l.events.length > 0 && (
-                <details className="mt-2 text-sm">
-                  <summary className="cursor-pointer">
-                    {t("online.ownerActivity")}
-                  </summary>
-                  <ul>
-                    {l.events.map((e, i) => (
-                      <li key={i}>
-                        {date(e.at)} · {t(onlineStatusKey(e.kind))}
-                      </li>
-                    ))}
-                  </ul>
+              <p className="text-sm">{item.tenantEmail || t("account.market.notRented")}{item.expiresAt ? ` · ${date(item.expiresAt)}` : ""}</p>
+              {item.listingId && item.id === item.listingId ? (
+                <details className="min-w-0">
+                  <summary className="cursor-pointer text-sm">{t("dashboard.clientOnlineCalendar.title")}</summary>
+                  <div className="mt-2">
+                    <ClientOnlineHeatmap installationId={item.listingId} />
+                  </div>
                 </details>
-              )}
+              ) : null}
+              <ClientTerminationHostAction summary={terminations.get(item.id)} onOpen={onTerminationOpen} />
             </article>
           ))}
-        </section>
+        </div>
+      ) : !loaded ? (
+        <p role="status">{t("common.loading")}</p>
+      ) : tenantOpen ? (
+        <div className="grid gap-4">
+          {filterButton(true, t("clientMarket.shop.tenant"), () => selectTenant(false))}
+          {tenantRecords}
+          {currentLeases.length > 0 ? (
+            <section className="grid gap-2">
+              <h2 className="text-sm font-semibold">{t("online.myLeases")}</h2>
+              {currentLeases.map((l) => (
+                <article key={l.leaseId} id={`market-client-${l.leaseId}`} tabIndex={-1} className="rounded-xl border border-border bg-background p-4">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <strong id={`market-client-${l.leaseId}-title`}>{l.alias}</strong>
+                      <p className="text-sm">{t(onlineStatusKey(l.state))} · {t("online.grantUntil")} {date(l.expiresAt)}</p>
+                    </div>
+                    <div className="flex gap-2">
+                      {l.state === "active" ? (
+                        <Button className={button} aria-describedby={`market-client-${l.leaseId}-title`} onPress={() => openConsole({ clientId: l.leaseId, kind: "console", url: l.clientUrl, title: l.alias })}>{t("online.console")}</Button>
+                      ) : null}
+                      {["active", "starting"].includes(l.state) ? (
+                        <Button variant="outline" className={button} aria-describedby={`market-client-${l.leaseId}-title`} onPress={() => { close(); setEnding(l); }}>{t("online.end")}</Button>
+                      ) : null}
+                    </div>
+                  </div>
+                  {l.terminationId ? <a className={link} href={clientTerminationHref(l.terminationId)}>{t("online.exitRecord")}</a> : null}
+                  {l.events.length > 0 ? (
+                    <details className="mt-2 text-sm">
+                      <summary className="cursor-pointer">{t("online.ownerActivity")}</summary>
+                      <ul>{l.events.map((event, index) => <li key={index}>{date(event.at)} · {t(onlineStatusKey(event.kind))}</li>)}</ul>
+                    </details>
+                  ) : null}
+                </article>
+              ))}
+            </section>
+          ) : null}
+        </div>
+      ) : (
+        <>
+          <div className="flex flex-wrap items-center gap-2">
+            {authenticated ? filterButton(false, t("clientMarket.shop.tenant"), () => selectTenant(true)) : null}
+            {filterButton(rentableOnly, t("clientMarket.shop.onlyRentable"), () => { setRentableOnly((value) => !value); setPickedId(null); })}
+          </div>
+          {providerNotice}
+          <OnlineShopRegionPicker
+            cards={shopCards}
+            continent={continent}
+            country={country}
+            onContinent={(next) => {
+              setContinent(next);
+              if (country && next !== "all" && shopContinentForCountry(country) !== next) selectCountry("");
+            }}
+            onCountry={selectCountry}
+          />
+          {country ? (
+            <div className="client-market-shop-workspace">
+              <section className="client-market-shop-hosts" aria-label={t("clientMarket.shop.hostListLabel", { name: countryName })}>
+                <h2 className="text-sm font-semibold">{t("clientMarket.shop.stepHost")}</h2>
+                {shopListings.length === 0 ? <p className="text-sm text-muted-foreground">{t("clientMarket.shop.noHosts")}</p> : shopListings.map((listing) => (
+                  <OnlineShopListingButton
+                    key={listing.installationId}
+                    listing={listing}
+                    selected={pickedId === listing.installationId}
+                    onSelect={(next) => setPickedId(next.installationId)}
+                  />
+                ))}
+              </section>
+              <OnlineShopConfirm
+                listing={shopListings.find((item) => item.installationId === pickedId) || null}
+                countryName={countryName}
+                authed={authenticated}
+                onContinue={(listing) => {
+                  if (!authenticated) {
+                    window.dispatchEvent(new Event(ROUTER_OPEN_LOGIN_EVENT));
+                    return;
+                  }
+                  setEnding(null);
+                  setExitRead(null);
+                  setExitReason("voluntary");
+                  setClaim("");
+                  setAck(false);
+                  setAuto(false);
+                  setDialogError("");
+                  setSelection(listing);
+                  void action(async () => {
+                    setQuote(await onlineRequest<OnlineQuote>(
+                      `installations/${listing.installationId}/quote`,
+                      "POST",
+                      { revision: listing.revision, autoRenew: false },
+                    ));
+                  });
+                }}
+                onLogin={() => window.dispatchEvent(new Event(ROUTER_OPEN_LOGIN_EVENT))}
+                busy={busy}
+                error={!quote ? dialogError : ""}
+              />
+            </div>
+          ) : null}
+        </>
       )}
+
       <Modal.Backdrop
-        isOpen={!!selected || !!ending}
+        isOpen={!!ending || !!quote || !!selected?.owned || accessRequired}
         onOpenChange={(v) => {
           if (!v && !busy) close();
         }}

@@ -10,7 +10,6 @@ import { ClientRentalAuditPanel } from "@/components/dashboard/client-market/ren
 import { ClientRentalRecords } from "@/components/dashboard/client-market/rental-records";
 import { ClientTerminationDialog } from "@/components/market/client-termination-dialog";
 import { useClientTerminationWorkspace } from "@/components/market/use-client-termination-workspace";
-import { WalletSectionLabel } from "@/components/market/wallet-primitives";
 import { currentPageHref } from "@/lib/url-search";
 
 /** Query parameters: `focus` (listing installation or lease id), `provider`,
@@ -58,27 +57,21 @@ export function ClientMarketPage() {
   };
   return (
     <main className="mx-auto grid min-w-0 w-[calc(100%-2rem)] max-w-7xl grid-cols-[minmax(0,1fr)] gap-5 pb-10">
-      <header className="flex flex-wrap items-end justify-between gap-3">
-        <div className="grid min-w-0 gap-2">
-          <WalletSectionLabel pulse>{t("clientMarket.title")}</WalletSectionLabel>
-          <h1 className="max-w-3xl font-display text-2xl leading-tight text-foreground sm:text-3xl">{t("online.subtitle")}</h1>
-        </div>
-        {providerId ? (
-          <Button
-            variant="ghost"
-            className="min-h-11 focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2"
-            onPress={clearProvider}
-          >
-            {t("providers.marketFilter.clear")}
-          </Button>
-        ) : null}
-      </header>
+      <h1 className="sr-only">{t("clientMarket.title")}</h1>
       <OnlineClientMarket
         focusId={searchParams.get("focus")}
         providerId={providerId}
+        rentalId={searchParams.get("rentalId")}
+        tenantRecords={<ClientRentalRecords currentOnly focusKey={searchParams.get("rentalId")} onTerminationOpen={openTermination} revision={terminationWork.revision + rentalRevision} />}
         terminations={terminations}
         onChanged={onRentalChanged}
         onTerminationOpen={openTermination}
+        providerNotice={providerId ? (
+          <div className="flex min-h-11 min-w-0 flex-wrap items-center justify-between gap-2 rounded-lg bg-slate-100 px-3 py-2 text-sm">
+            <span className="min-w-0 text-slate-700">{t("providers.marketFilter.client")}</span>
+            <Button variant="ghost" className="min-h-11" onPress={clearProvider}>{t("providers.marketFilter.clear")}</Button>
+          </div>
+        ) : null}
       />
       {actor && terminationWork.error ? (
         <div className="flex flex-wrap items-center gap-2">
@@ -94,7 +87,6 @@ export function ClientMarketPage() {
         </div>
       ) : null}
       <ClientTerminationDialog terminationId={terminationId} onClose={closeTermination} onChanged={() => void terminationWork.refresh(true)} />
-      {/* Current leases are managed in the online market above; this keeps their settled history. */}
       <ClientRentalRecords historyOnly focusKey={searchParams.get("rentalId")} onTerminationOpen={openTermination} revision={terminationWork.revision + rentalRevision} />
       <ClientRentalAuditPanel onTerminationOpen={openTermination} revision={terminationWork.revision + rentalRevision} />
     </main>

@@ -219,7 +219,7 @@ export function resolveAccountEntryHref(): AccountNavHref {
 
 /** Focus an online listing or an active lease when opening the market. */
 export function clientMarketMineHref(targetId?: string) {
-  const params = new URLSearchParams();
+  const params = new URLSearchParams({ view: "selling" });
   if (targetId) params.set("focus", targetId);
   return buildDashboardHref(DASHBOARD_CLIENT_MARKET_PATH, params);
 }

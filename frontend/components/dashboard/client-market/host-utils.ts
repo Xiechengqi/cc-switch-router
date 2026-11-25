@@ -649,6 +649,54 @@ export function hostShopPriceMinor(host: Pick<ClientMarketHost, "cyclePriceMinor
   return null;
 }
 
+export type OnlineShopListing = {
+  country: string | null;
+  state: string;
+  occupied: boolean;
+  healthy: boolean;
+  cyclePriceMinor: number;
+};
+
+/** Compact shop line: reported arch, vCPU, and GiB memory. Disk stays off this line. */
+export function onlineShopSpecLine(hardware?: { arch?: string; cpu?: number | null; memoryBytes?: number | null } | null) {
+  const memory = hardware?.memoryBytes;
+  return [
+    hardware?.arch,
+    hardware?.cpu != null ? `${hardware.cpu}C` : "",
+    memory != null ? `${new Intl.NumberFormat("en", { maximumFractionDigits: 1 }).format(memory / 2 ** 30)}G` : "",
+  ].filter(Boolean).join(" · ");
+}
+
+/** A buyer can start a lease only while the listing is public, idle, and probed healthy. */
+export function onlineListingRentable(listing: Pick<OnlineShopListing, "state" | "occupied" | "healthy">) {
+  return listing.state === "listed" && !listing.occupied && listing.healthy;
+}
+
+export function aggregateOnlineShopCountries(listings: readonly OnlineShopListing[]): ShopCountryCard[] {
+  const cards = new Map<string, ShopCountryCard>();
+  for (const listing of listings) {
+    const code = shopCountryKey(listing.country);
+    const card = cards.get(code) || {
+      code,
+      continent: shopContinentForCountry(code === SHOP_UNKNOWN_COUNTRY ? "" : code),
+      idle: 0,
+      total: 0,
+      minMonthlyMinor: null,
+      hasFreeIdle: false,
+    };
+    card.total += 1;
+    if (onlineListingRentable(listing)) {
+      card.idle += 1;
+      if (listing.cyclePriceMinor <= 0) card.hasFreeIdle = true;
+      else if (card.minMonthlyMinor == null || listing.cyclePriceMinor < card.minMonthlyMinor) {
+        card.minMonthlyMinor = listing.cyclePriceMinor;
+      }
+    }
+    cards.set(code, card);
+  }
+  return Array.from(cards.values());
+}
+
 export function shopCountryKey(code: string | null | undefined) {
   const normalized = (code || "").trim().toUpperCase();
   return /^[A-Z]{2}$/.test(normalized) ? normalized : SHOP_UNKNOWN_COUNTRY;

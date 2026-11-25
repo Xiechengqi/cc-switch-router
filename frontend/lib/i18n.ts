@@ -1031,7 +1031,7 @@ export const messages = {
     "online.subtitle": "Rent a private workspace on a verified, online Client.",
     "online.cpu": "{count} vCPU",
     "online.memory": "{size} GiB RAM",
-    "online.diskSize": "{size} GiB disk",
+    "online.diskSize": "{size} GB disk",
     "online.hoursValue": "{hours} / 24 h",
     "online.clientColumn": "Client",
     "clientMarket.subtitle":
@@ -4655,7 +4655,7 @@ export const messages = {
     "online.subtitle": "从已验证的在线 Client 租用独立工作区。",
     "online.cpu": "{count} 核 vCPU",
     "online.memory": "{size} GiB 内存",
-    "online.diskSize": "{size} GiB 磁盘",
+    "online.diskSize": "{size} GB 磁盘",
     "online.hoursValue": "{hours} / 24 小时",
     "online.clientColumn": "Client",
     "clientMarket.subtitle":

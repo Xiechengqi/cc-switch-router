@@ -36,6 +36,16 @@ export type OnlineLease = {
   expiresAt: number;
   events: { kind: string; at: number }[];
 };
+export type OnlineSellerItem = {
+  id: string;
+  listingId: string | null;
+  label: string;
+  state: string;
+  cyclePriceMinor: number;
+  tenantEmail: string | null;
+  expiresAt: number | null;
+};
+
 export type OnlineQuote = {
   id: string;
   walletFunding: MarketWalletQuoteFunding | null;

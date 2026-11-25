@@ -25,7 +25,7 @@ import { CLIENT_MARKET_POLL_MS } from "./host-utils";
 /** The buyer's account and Market share this read projection, not today's Hosts.
  * No remembered/private browser storage: changing actors unmounts every read. */
 export function ClientRentalRecords(props: {
-  historyOnly?: boolean; focusKey?: string | null; revision?: number;
+  historyOnly?: boolean; currentOnly?: boolean; focusKey?: string | null; revision?: number;
   onChanged?: () => void; onTerminationOpen?: (id: string) => void;
 }) {
   const { session } = useAuth();
@@ -33,8 +33,8 @@ export function ClientRentalRecords(props: {
   return actor ? <RentalWorkspace key={actor} {...props} /> : null;
 }
 
-function RentalWorkspace({ historyOnly = false, focusKey, revision = 0, onChanged, onTerminationOpen }: {
-  historyOnly?: boolean; focusKey?: string | null; revision?: number;
+function RentalWorkspace({ historyOnly = false, currentOnly = false, focusKey, revision = 0, onChanged, onTerminationOpen }: {
+  historyOnly?: boolean; currentOnly?: boolean; focusKey?: string | null; revision?: number;
   onChanged?: () => void; onTerminationOpen?: (id: string) => void;
 }) {
   const [localRevision, setLocalRevision] = React.useState(0);
@@ -43,7 +43,7 @@ function RentalWorkspace({ historyOnly = false, focusKey, revision = 0, onChange
   const openTermination = onTerminationOpen ?? setTerminationId;
   return <div className="grid min-w-0 gap-5" data-testid="client-rental-records">
     {!historyOnly ? <RentalSection view="current" focusKey={focusKey} revision={revision + localRevision} onChanged={changed} onTerminationOpen={openTermination} /> : null}
-    <RentalSection view="history" focusKey={focusKey} revision={revision + localRevision} onChanged={changed} onTerminationOpen={openTermination} />
+    {!currentOnly ? <RentalSection view="history" focusKey={focusKey} revision={revision + localRevision} onChanged={changed} onTerminationOpen={openTermination} /> : null}
     {!onTerminationOpen ? <ClientTerminationDialog terminationId={terminationId} initialRole="buyer" onClose={() => setTerminationId(null)} onChanged={changed} /> : null}
   </div>;
 }
