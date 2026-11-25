@@ -4,7 +4,6 @@ import { Button, Card, Drawer, toast } from "@heroui/react";
 import { ArrowRightLeft, ChevronDown, Copy, ListFilter, MessageCircle, Plus, ScrollText, Search, Terminal, X } from "lucide-react";
 import * as React from "react";
 import Link from "next/link";
-import { ListOnlineClient } from "./client-market/online-market";
 import { ShareConnectDialog } from "@/components/dashboard/share-connect-dialog";
 import { ClientOnlineHeatmap } from "@/components/dashboard/client-online-heatmap";
 import { ShareModelHealthHeatmap } from "@/components/dashboard/share-model-health-heatmap";
@@ -513,7 +512,6 @@ function ClientCard({
               {showRemoval ? <ClientRemovalSchedule removalAt={client.removalAt} className="text-[11px]" /> : null}
             </div>
             <div className="flex min-w-0 flex-wrap items-center gap-2 pl-4">
-              {client.installation.marketLeaseV1 && client.clientTunnel?.online && session?.authenticated && !!session.user?.email && !!client.installation.ownerEmail && session.user.email.toLowerCase() === client.installation.ownerEmail.toLowerCase() ? <ListOnlineClient id={client.installation.id} label={identity} listed={!!client.installation.marketListed} /> : null}
               {tunnelUrl ? <ClientConsoleButton client={client} /> : null}
               {tunnelUrl && client.canOpenClientTerminal !== false ? <ClientTerminalButton client={client} /> : null}
               <ClientUpgradeButton client={client} />

@@ -30,7 +30,7 @@ import {
 } from "@/lib/client-termination";
 import { ClientOnlineHeatmap } from "@/components/dashboard/client-online-heatmap";
 import { ClientTerminationHostAction } from "@/components/market/client-termination-host-action";
-import { clientMarketMineHref } from "@/lib/dashboard-nav";
+import { getDashboard } from "@/lib/api";
 import { formatWalletUnits } from "@/lib/market-wallet-money";
 import { validPaidWalletQuoteFunding } from "@/lib/market-wallet-quote";
 import { trialDuration } from "@/lib/client-checkout";
@@ -76,21 +76,20 @@ export function onlineStatusKey(value: string) {
   const known = statuses.find((s) => s === value);
   return known ? (`online.${known}` as const) : "online.unknown";
 }
-export function ListOnlineClient({
+function ListingOfferDialog({
   id,
   label,
-  listed,
+  open,
+  onOpenChange,
+  onListed,
 }: {
   id: string;
   label: string;
-  listed: boolean;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onListed: () => void;
 }) {
   const { t } = useLocaleText();
-  const [open, setOpen] = React.useState(false);
-  const [submitted, setSubmitted] = React.useState(false);
-  React.useEffect(() => {
-    setSubmitted(false);
-  }, [id, listed]);
   const [price, setPrice] = React.useState("0");
   const [days, setDays] = React.useState("");
   const [ack, setAck] = React.useState(false);
@@ -120,41 +119,19 @@ export function ListOnlineClient({
         },
       );
       toast.success(t("online.listPending"));
-      setSubmitted(true);
-      setOpen(false);
+      onListed();
+      onOpenChange(false);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
     }
   }
-  if (listed || submitted)
-    return (
-      <a
-        href={clientMarketMineHref(id)}
-        className={link}
-      >
-        {t("online.manageListing")}
-      </a>
-    );
   return (
-    <>
-      <Button
-        size="sm"
-        variant="outline"
-        className={button}
-        onPress={() => {
-          setAck(false);
-          setError("");
-          setOpen(true);
-        }}
-      >
-        {t("online.list")}
-      </Button>
-      <Modal.Backdrop
+    <Modal.Backdrop
         isOpen={open}
-        onOpenChange={(v) => {
-          if (!busy) setOpen(v);
+        onOpenChange={(next) => {
+          if (!busy) onOpenChange(next);
         }}
       >
         <Modal.Container placement="center">
@@ -201,7 +178,7 @@ export function ListOnlineClient({
               <Button
                 variant="ghost"
                 className={button}
-                onPress={() => setOpen(false)}
+                onPress={() => onOpenChange(false)}
                 isDisabled={busy}
               >
                 {t("common.cancel")}
@@ -217,7 +194,6 @@ export function ListOnlineClient({
           </Modal.Dialog>
         </Modal.Container>
       </Modal.Backdrop>
-    </>
   );
 }
 
@@ -254,6 +230,8 @@ function OnlineMarketView({
   providerNotice,
 }: MarketProps & { authenticated: boolean }) {
   const searchParams = useSearchParams();
+  const { session } = useAuth();
+  const sessionEmail = session?.user?.email;
   const { locale, t } = useLocaleText();
   const { openConsole } = useClientConsole();
   const [list, setList] = React.useState<OnlineListing[]>([]);
@@ -273,6 +251,8 @@ function OnlineMarketView({
     clientMarketWorkspaceFromQuery(searchParams.get("view"), searchParams.get("tab"))
   ));
   const [sellerItems, setSellerItems] = React.useState<OnlineSellerItem[]>([]);
+  const [listable, setListable] = React.useState<Array<{ id: string; label: string }>>([]);
+  const [listingTarget, setListingTarget] = React.useState<{ id: string; label: string } | null>(null);
   const [version, setVersion] = React.useState(0);
   const [loaded, setLoaded] = React.useState(false);
   const [error, setError] = React.useState("");
@@ -333,6 +313,23 @@ function OnlineMarketView({
           );
           setLeases(r.leases);
           setSellerItems(seller.items);
+          if (authenticated && workspace === "selling") {
+            const dashboard = await getDashboard(control.signal);
+            const email = (sessionEmail || "").trim().toLowerCase();
+            const mine = dashboard.clients.filter((client) => {
+              const owner = client.installation.ownerEmail?.trim().toLowerCase();
+              return !!email && owner === email
+                && client.installation.marketLeaseV1
+                && client.clientTunnel?.online
+                && !client.installation.marketListed;
+            }).map((client) => ({
+              id: client.installation.id,
+              label: client.clientTunnel?.subdomain || client.installation.id,
+            }));
+            setListable(mine);
+          } else {
+            setListable([]);
+          }
           setError("");
         }
       } catch (e) {
@@ -350,7 +347,7 @@ function OnlineMarketView({
       control.abort();
       clearTimeout(timer);
     };
-  }, [authenticated, version, providerId, workspace]);
+  }, [authenticated, sessionEmail, version, providerId, workspace]);
   const focused = React.useRef<string | null>(null);
   React.useEffect(() => {
     if (!focusId) { focused.current = null; return; }
@@ -481,16 +478,32 @@ function OnlineMarketView({
     <section className="grid min-w-0 gap-4" aria-label={t("online.supply")}>
       <div className="flex min-w-0 flex-wrap items-center justify-between gap-3 border-b border-slate-200 pb-3">
         {authenticated ? (
-          <SegmentedControl
-            value={workspace}
-            onChange={selectWorkspace}
-            ariaLabel={t("clientMarket.shop.workspaceLabel")}
-            size="sm"
-            items={[
-              { id: "catalog", label: t("clientMarket.shop.catalog") },
-              { id: "selling", label: t("clientMarket.shop.selling") },
-            ]}
-          />
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
+            <SegmentedControl
+              value={tenantOpen ? "catalog" : workspace}
+              onChange={(next) => {
+                if (tenantOpen) selectTenant(false);
+                selectWorkspace(next);
+              }}
+              ariaLabel={t("clientMarket.shop.workspaceLabel")}
+              size="sm"
+              items={[
+                { id: "catalog", label: t("clientMarket.shop.catalog") },
+                { id: "selling", label: t("clientMarket.shop.selling") },
+              ]}
+            />
+            <button
+              type="button"
+              aria-pressed={tenantOpen}
+              className={cn(
+                "inline-flex h-8 items-center rounded-lg px-2.5 text-xs font-medium focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary",
+                tenantOpen ? "bg-sky-100 text-sky-800" : "text-slate-600 hover:bg-slate-100",
+              )}
+              onClick={() => selectTenant(!tenantOpen)}
+            >
+              {t("clientMarket.shop.tenant")}
+            </button>
+          </div>
         ) : (
           <h2 className="text-sm font-semibold text-slate-900">{t("clientMarket.shop.catalog")}</h2>
         )}
@@ -512,7 +525,23 @@ function OnlineMarketView({
       )}
       {workspace === "selling" && authenticated ? (
         <div className="grid gap-2">
-          {sellerItems.length === 0 && loaded ? <p className="text-sm text-muted-foreground">{t("account.client.providerEmpty")}</p> : null}
+          <ListingOfferDialog
+            id={listingTarget?.id || ""}
+            label={listingTarget?.label || ""}
+            open={!!listingTarget}
+            onOpenChange={(next) => { if (!next) setListingTarget(null); }}
+            onListed={() => setVersion((value) => value + 1)}
+          />
+          {listable.map((client) => (
+            <article key={client.id} className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-border bg-background p-4">
+              <div>
+                <h3 className="font-semibold">{client.label}</h3>
+                <p className="text-sm text-muted-foreground">{t("online.list")}</p>
+              </div>
+              <Button className={button} variant="outline" onPress={() => setListingTarget(client)}>{t("online.list")}</Button>
+            </article>
+          ))}
+          {sellerItems.length === 0 && listable.length === 0 && loaded ? <p className="text-sm text-muted-foreground">{t("account.client.providerEmpty")}</p> : null}
           {sellerItems.map((item) => (
             <article key={item.id} id={`market-client-${item.listingId || item.id}`} tabIndex={-1} className="grid gap-2 rounded-xl border border-border bg-background p-4">
               <div className="flex flex-wrap items-center justify-between gap-2">
@@ -546,7 +575,6 @@ function OnlineMarketView({
         <p role="status">{t("common.loading")}</p>
       ) : tenantOpen ? (
         <div className="grid gap-4">
-          {filterButton(true, t("clientMarket.shop.tenant"), () => selectTenant(false))}
           {tenantRecords}
           {currentLeases.length > 0 ? (
             <section className="grid gap-2">
@@ -582,7 +610,6 @@ function OnlineMarketView({
       ) : (
         <>
           <div className="flex flex-wrap items-center gap-2">
-            {authenticated ? filterButton(false, t("clientMarket.shop.tenant"), () => selectTenant(true)) : null}
             {filterButton(rentableOnly, t("clientMarket.shop.onlyRentable"), () => { setRentableOnly((value) => !value); setPickedId(null); })}
           </div>
           {providerNotice}
@@ -595,10 +622,13 @@ function OnlineMarketView({
               if (country && next !== "all" && shopContinentForCountry(country) !== next) selectCountry("");
             }}
             onCountry={selectCountry}
+            emptyAction={rentableOnly && list.some((item) => !item.owned && (!providerId || item.providerId === providerId))
+              ? { label: t("clientMarket.shop.showAll"), onClick: () => { setRentableOnly(false); setPickedId(null); } }
+              : undefined}
           />
           {country ? (
-            <div className="client-market-shop-workspace">
-              <section className="client-market-shop-hosts" aria-label={t("clientMarket.shop.hostListLabel", { name: countryName })}>
+            <div className="grid min-w-0 items-start gap-3 xl:grid-cols-[minmax(0,1fr)_minmax(16rem,22rem)]">
+              <section className="grid min-w-0 content-start gap-1.5" aria-label={t("clientMarket.shop.hostListLabel", { name: countryName })}>
                 <h2 className="text-sm font-semibold">{t("clientMarket.shop.stepHost")}</h2>
                 {shopListings.length === 0 ? <p className="text-sm text-muted-foreground">{t("clientMarket.shop.noHosts")}</p> : shopListings.map((listing) => (
                   <OnlineShopListingButton

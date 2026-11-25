@@ -17,6 +17,7 @@ import {
 import { onlineStatusKey } from "./online-market";
 
 const focusRing = "focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary";
+const selectedFill = "border-transparent bg-primary/10";
 
 export function OnlineShopRegionPicker({
   cards,
@@ -24,15 +25,19 @@ export function OnlineShopRegionPicker({
   country,
   onContinent,
   onCountry,
+  emptyAction,
 }: {
   cards: ShopCountryCard[];
   continent: ShopContinent;
   country: string;
   onContinent: (next: ShopContinent) => void;
   onCountry: (code: string) => void;
+  emptyAction?: { label: string; onClick: () => void };
 }) {
   const { locale, t } = useLocaleText();
   const names = React.useMemo(() => new Intl.DisplayNames([locale], { type: "region" }), [locale]);
+  const present = new Set(cards.map((card) => card.continent));
+  const continents = SHOP_CONTINENTS.filter((item) => item === "all" || present.has(item));
   const visible = cards.filter((card) => continent === "all" || card.continent === continent);
   const nameOf = (card: ShopCountryCard) => (
     card.code === SHOP_UNKNOWN_COUNTRY ? t("clientMarket.shop.unknownRegion") : names.of(card.code) || card.code
@@ -41,24 +46,43 @@ export function OnlineShopRegionPicker({
     if (card.hasFreeIdle || card.minMonthlyMinor == null) return formatUsdMoney(0, locale);
     return formatUsdMoney(card.minMonthlyMinor, locale);
   };
+  if (cards.length === 0) {
+    return (
+      <div className="grid justify-items-start gap-2">
+        <p className="text-sm text-muted-foreground">{t(emptyAction ? "clientMarket.shop.rentableEmpty" : "clientMarket.shop.noRegions")}</p>
+        {emptyAction ? (
+          <button type="button" className={cn("text-sm font-medium text-primary hover:underline", focusRing)} onClick={emptyAction.onClick}>
+            {emptyAction.label}
+          </button>
+        ) : null}
+      </div>
+    );
+  }
   return (
     <div className="grid gap-3">
-      <div className="client-market-shop-continents" role="listbox" aria-label={t("clientMarket.shop.continentLabel")}>
-        {SHOP_CONTINENTS.map((item) => (
-          <button
-            key={item}
-            type="button"
-            role="option"
-            aria-selected={item === continent}
-            className={cn("client-market-shop-continent", focusRing, item === continent && "is-selected")}
-            onClick={() => onContinent(item)}
-          >
-            {t(`clientMarket.shop.continent.${item}`)}
-          </button>
-        ))}
+      <div className="flex min-w-0 flex-wrap gap-1.5" role="listbox" aria-label={t("clientMarket.shop.continentLabel")}>
+        {continents.map((item) => {
+          const selected = item === continent;
+          return (
+            <button
+              key={item}
+              type="button"
+              role="option"
+              aria-selected={selected}
+              className={cn(
+                "inline-flex min-h-8 items-center rounded-full border border-border bg-background px-3 text-xs text-foreground",
+                focusRing,
+                selected && selectedFill,
+              )}
+              onClick={() => onContinent(item)}
+            >
+              {t(`clientMarket.shop.continent.${item}`)}
+            </button>
+          );
+        })}
       </div>
       {visible.length === 0 ? <p className="text-sm text-muted-foreground">{t("clientMarket.shop.noRegions")}</p> : (
-        <div className="client-market-shop-countries">
+        <div className="flex min-w-0 flex-wrap gap-1.5">
           {visible.map((card) => {
             const known = card.code !== SHOP_UNKNOWN_COUNTRY;
             const selected = card.code === country;
@@ -69,7 +93,11 @@ export function OnlineShopRegionPicker({
                 type="button"
                 aria-pressed={selected}
                 aria-label={t(selected ? "clientMarket.shop.clearCountry" : "clientMarket.shop.selectCountry", { name })}
-                className={cn("client-market-shop-country", focusRing, selected && "is-selected")}
+                className={cn(
+                  "grid w-[7.25rem] content-between gap-1 rounded-xl border border-border bg-background px-2 py-1.5 text-left",
+                  focusRing,
+                  selected && selectedFill,
+                )}
                 onClick={() => onCountry(selected ? "" : card.code)}
               >
                 <span className="flex min-w-0 items-center gap-1">
@@ -107,7 +135,11 @@ export function OnlineShopListingButton({
       id={`market-client-${listing.installationId}`}
       aria-pressed={selected}
       aria-label={t("clientMarket.shop.selectHost", { name: listing.label })}
-      className={cn("client-market-shop-host", focusRing, selected && "is-selected")}
+      className={cn(
+        "grid gap-0.5 rounded-xl border border-border bg-background px-2.5 py-2 text-left",
+        focusRing,
+        selected && selectedFill,
+      )}
       onClick={() => onSelect(listing)}
     >
       <span className="flex items-baseline justify-between gap-2">
@@ -177,7 +209,7 @@ export function OnlineShopConfirm({
       {listing.freeDays ? <p className="text-xs text-muted-foreground">{t("online.freeDays")} · {listing.freeDays}</p> : null}
       <p className="text-xs text-muted-foreground">{t("online.rootNotice")}</p>
       <p className="text-xs text-muted-foreground">{t("clientMarket.shop.purchaseTerms")}</p>
-      {!rentable ? <p role="status" className="client-market-shop-status-note">{t("clientMarket.shop.notIdle", { status: t(onlineStatusKey(status)) })}</p> : null}
+      {!rentable ? <p role="status" className="rounded-lg bg-primary/10 px-2.5 py-1.5 text-xs leading-5 text-foreground">{t("clientMarket.shop.notIdle", { status: t(onlineStatusKey(status)) })}</p> : null}
       {error ? <p role="alert" className="text-sm text-danger">{error}</p> : null}
       {!authed || rentable ? (
         <button
