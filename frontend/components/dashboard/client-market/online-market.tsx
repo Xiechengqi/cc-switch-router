@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import { Button, Modal, toast } from "@heroui/react";
-import { Loader2, RefreshCw } from "lucide-react";
+import { Loader2, Plus, RefreshCw } from "lucide-react";
 import { useSearchParams } from "next/navigation";
 import { SegmentedControl } from "@/components/common/segmented-control";
 import { useLocaleText } from "@/components/i18n/locale-provider";
@@ -18,7 +18,6 @@ import {
 import { usePersistentState } from "@/lib/use-persistent-state";
 import { replaceCurrentSearch } from "@/lib/url-search";
 import { cn } from "@/lib/utils";
-import { formatUsdMoney } from "@/lib/market-money";
 import { ApiError, createMarketAccessRequest } from "@/lib/api";
 import {
   clientTerminationHref,
@@ -44,11 +43,18 @@ import {
   clientMarketWorkspaceFromQuery,
   onlineListingRentable,
   shopContinentForCountry,
+  onlineShopSpecLine,
   shopCountryKey,
   sortShopCountries,
   type ShopContinent,
 } from "./host-utils";
-import { OnlineShopConfirm, OnlineShopListingButton, OnlineShopRegionPicker } from "./online-shop";
+import {
+  ONLINE_CLIENT_CARD_GRID_CLASS,
+  OnlineClientCard,
+  OnlineSellingToolbar,
+  OnlineShopRegionPicker,
+  onlineClientMonthlyPrice,
+} from "./online-shop";
 
 const field =
   "h-12 rounded-lg border bg-background px-3 focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2";
@@ -272,6 +278,9 @@ function OnlineMarketView({
   const [sellerItems, setSellerItems] = React.useState<OnlineSellerItem[]>([]);
   const [listable, setListable] = React.useState<Array<{ id: string; label: string }>>([]);
   const [listingTarget, setListingTarget] = React.useState<{ id: string; label: string } | null>(null);
+  const [listingPickerOpen, setListingPickerOpen] = React.useState(false);
+  const [sellingFilter, setSellingFilter] = React.useState<"all" | "listed" | "rented" | "listable">("all");
+  const [sellingQuery, setSellingQuery] = React.useState("");
   const [version, setVersion] = React.useState(0);
   const [loaded, setLoaded] = React.useState(false);
   const [error, setError] = React.useState("");
@@ -496,6 +505,47 @@ function OnlineMarketView({
   const countryName = !/^[A-Z]{2}$/.test(country)
     ? t("clientMarket.shop.unknownRegion")
     : region(country);
+  const listingById = new Map(list.map((item) => [item.installationId, item]));
+  const priceOf = (minor: number) => onlineClientMonthlyPrice(minor, locale, t("online.perMonth"));
+  const hoursOf = (listing: OnlineListing | undefined) => listing
+    ? t("online.hoursValue", { hours: listing.availableHours24 })
+    : undefined;
+  const quoteListing = (listing: OnlineListing) => {
+    if (!authenticated) {
+      window.dispatchEvent(new Event(ROUTER_OPEN_LOGIN_EVENT));
+      return;
+    }
+    setPickedId(listing.installationId);
+    setEnding(null);
+    setExitRead(null);
+    setExitReason("voluntary");
+    setClaim("");
+    setAck(false);
+    setAuto(false);
+    setDialogError("");
+    setSelection(listing);
+    void action(async () => {
+      setQuote(await onlineRequest<OnlineQuote>(
+        `installations/${listing.installationId}/quote`,
+        "POST",
+        { revision: listing.revision, autoRenew: false },
+      ));
+    });
+  };
+  const sellingQueryText = sellingQuery.trim().toLowerCase();
+  const matchesSelling = (...parts: Array<string | null | undefined>) => (
+    !sellingQueryText || parts.some((part) => (part || "").toLowerCase().includes(sellingQueryText))
+  );
+  const rentedSellerItems = sellerItems.filter((item) => !!item.tenantEmail || ["occupied", "unlocking"].includes(item.state));
+  const listedSellerItems = sellerItems.filter((item) => !rentedSellerItems.includes(item));
+  const visibleListable = listable.filter((item) => matchesSelling(item.label));
+  const visibleListed = listedSellerItems.filter((item) => matchesSelling(item.label, item.tenantEmail));
+  const visibleRented = rentedSellerItems.filter((item) => matchesSelling(item.label, item.tenantEmail));
+  const sellingCounts = { listed: listedSellerItems.length, rented: rentedSellerItems.length, listable: listable.length };
+  const openListing = () => {
+    if (listable.length === 1) setListingTarget(listable[0]);
+    else if (listable.length > 1) setListingPickerOpen(true);
+  };
   return (
     <section className={quoteOnly ? "contents" : "grid min-w-0 gap-4"} aria-label={t("online.supply")}>
       {!quoteOnly ? <React.Fragment><div className="flex min-w-0 flex-wrap items-center justify-between gap-3 border-b border-slate-200 pb-3">
@@ -530,7 +580,7 @@ function OnlineMarketView({
         </p>
       )}
       {workspace === "selling" && authenticated ? (
-        <div className="grid gap-2">
+        <div className="grid gap-3">
           <ListingOfferDialog
             id={listingTarget?.id || ""}
             label={listingTarget?.label || ""}
@@ -538,44 +588,103 @@ function OnlineMarketView({
             onOpenChange={(next) => { if (!next) setListingTarget(null); }}
             onListed={() => setVersion((value) => value + 1)}
           />
-          {listable.map((client) => (
-            <article key={client.id} className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-border bg-background p-4">
-              <div>
-                <h3 className="font-semibold">{client.label}</h3>
-                <p className="text-sm text-muted-foreground">{t("online.list")}</p>
-              </div>
-              <Button className={button} variant="outline" onPress={() => setListingTarget(client)}>{t("online.list")}</Button>
-            </article>
-          ))}
-          {sellerItems.length === 0 && listable.length === 0 && loaded ? <p className="text-sm text-muted-foreground">{t("account.client.providerEmpty")}</p> : null}
-          {sellerItems.map((item) => (
-            <article key={item.id} id={`market-client-${item.listingId || item.id}`} tabIndex={-1} className="grid gap-2 rounded-xl border border-border bg-background p-4">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <div>
-                  <h3 className="font-semibold">{item.label}</h3>
-                  <p className="text-sm text-muted-foreground">{t(onlineStatusKey(item.state))} · {item.cyclePriceMinor ? `${formatUsdMoney(item.cyclePriceMinor, locale)}${t("online.perMonth")}` : `${formatUsdMoney(0, locale)}${t("online.perMonth")}`}</p>
-                </div>
-                {item.listingId && !["occupied", "unlocking"].includes(item.state) ? (
-                  <Button className={button} variant="outline" isDisabled={busy} onPress={() => {
-                    const listing = list.find((entry) => entry.installationId === item.listingId);
-                    if (!listing) return;
-                    close();
-                    setSelection(listing);
-                  }}>{t("online.unlist")}</Button>
-                ) : null}
-              </div>
-              <p className="text-sm">{item.tenantEmail || t("account.market.notRented")}{item.expiresAt ? ` · ${date(item.expiresAt)}` : ""}</p>
-              {item.listingId && item.id === item.listingId ? (
-                <details className="min-w-0">
-                  <summary className="cursor-pointer text-sm">{t("dashboard.clientOnlineCalendar.title")}</summary>
-                  <div className="mt-2">
-                    <ClientOnlineHeatmap installationId={item.listingId} />
-                  </div>
-                </details>
-              ) : null}
-              <ClientTerminationHostAction summary={terminations.get(item.id)} onOpen={onTerminationOpen} />
-            </article>
-          ))}
+          <Modal.Backdrop isOpen={listingPickerOpen} onOpenChange={setListingPickerOpen}>
+            <Modal.Container placement="center">
+              <Modal.Dialog className="w-[min(440px,calc(100vw-2rem))]">
+                <Modal.Header><Modal.Heading>{t("clientMarket.shop.pickClient")}</Modal.Heading></Modal.Header>
+                <Modal.Body className="grid gap-2">
+                  {listable.map((client) => (
+                    <Button key={client.id} variant="outline" className={button} onPress={() => { setListingPickerOpen(false); setListingTarget(client); }}>{client.label}</Button>
+                  ))}
+                </Modal.Body>
+              </Modal.Dialog>
+            </Modal.Container>
+          </Modal.Backdrop>
+          {!loaded ? <p role="status">{t("common.loading")}</p> : (
+            <>
+              <OnlineSellingToolbar
+                counts={sellingCounts}
+                filter={sellingFilter}
+                query={sellingQuery}
+                canAdd={listable.length > 0}
+                onFilter={setSellingFilter}
+                onQuery={setSellingQuery}
+                onAdd={openListing}
+              />
+              {listable.length === 0 ? <p className="text-xs text-muted-foreground">{t("clientMarket.shop.listBlocked")}</p> : null}
+              {(() => {
+                const cards = [
+                  ...(sellingFilter === "all" || sellingFilter === "listable" ? visibleListable.map((client) => (
+                    <OnlineClientCard
+                      key={`listable-${client.id}`}
+                      name={client.label}
+                      status={t("clientMarket.shop.filter.listable")}
+                      actions={<Button className={button} variant="outline" onPress={() => setListingTarget(client)}><Plus className="h-4 w-4" />{t("clientMarket.shop.listAdd")}</Button>}
+                    />
+                  )) : []),
+                  ...(sellingFilter === "all" || sellingFilter === "listed" ? visibleListed.map((item) => {
+                    const listing = item.listingId ? listingById.get(item.listingId) : undefined;
+                    return (
+                      <OnlineClientCard
+                        key={item.id}
+                        cardId={`market-client-${item.listingId || item.id}`}
+                        name={item.label}
+                        price={priceOf(item.cyclePriceMinor)}
+                        healthy={listing ? listing.healthy : null}
+                        status={t(onlineStatusKey(item.state))}
+                        detail={item.tenantEmail ? t("clientMarket.shop.tenantLine", { email: item.tenantEmail }) : t("clientMarket.shop.notRented")}
+                        spec={onlineShopSpecLine(listing?.hardware)}
+                        specLabel={t("clientMarket.shop.summarySpecs")}
+                        hours={hoursOf(listing)}
+                        hoursLabel={t("online.hours")}
+                        actions={item.listingId && !["occupied", "unlocking"].includes(item.state) ? (
+                          <Button className={button} variant="outline" isDisabled={busy} onPress={() => {
+                            if (!listing) return;
+                            close();
+                            setSelection(listing);
+                          }}>{t("online.unlist")}</Button>
+                        ) : null}
+                        extra={item.listingId && item.id === item.listingId ? (
+                          <div className="grid gap-2">
+                            <details className="min-w-0">
+                              <summary className="cursor-pointer text-sm">{t("dashboard.clientOnlineCalendar.title")}</summary>
+                              <div className="mt-2"><ClientOnlineHeatmap installationId={item.listingId} /></div>
+                            </details>
+                            <ClientTerminationHostAction summary={terminations.get(item.id)} onOpen={onTerminationOpen} />
+                          </div>
+                        ) : <ClientTerminationHostAction summary={terminations.get(item.id)} onOpen={onTerminationOpen} />}
+                      />
+                    );
+                  }) : []),
+                  ...(sellingFilter === "all" || sellingFilter === "rented" ? visibleRented.map((item) => {
+                    const listing = item.listingId ? listingById.get(item.listingId) : undefined;
+                    return (
+                      <OnlineClientCard
+                        key={item.id}
+                        cardId={`market-client-${item.listingId || item.id}`}
+                        name={item.label}
+                        price={priceOf(item.cyclePriceMinor)}
+                        healthy={listing ? listing.healthy : null}
+                        muted
+                        status={t(onlineStatusKey(item.state))}
+                        detail={[item.tenantEmail ? t("clientMarket.shop.tenantLine", { email: item.tenantEmail }) : t("clientMarket.shop.notRented"), item.expiresAt ? t("clientMarket.shop.expires", { date: date(item.expiresAt) }) : ""].filter(Boolean).join(" · ")}
+                        spec={onlineShopSpecLine(listing?.hardware)}
+                        specLabel={t("clientMarket.shop.summarySpecs")}
+                        hours={hoursOf(listing)}
+                        hoursLabel={t("online.hours")}
+                        extra={<ClientTerminationHostAction summary={terminations.get(item.id)} onOpen={onTerminationOpen} />}
+                      />
+                    );
+                  }) : []),
+                ];
+                return cards.length ? (
+                  <div className={ONLINE_CLIENT_CARD_GRID_CLASS} aria-label={t("clientMarket.shop.cardGrid")}>{cards}</div>
+                ) : (
+                  <p className="rounded-md border border-dashed border-slate-200 px-4 py-10 text-center text-sm text-slate-500">{t("clientMarket.shop.sellingEmpty")}</p>
+                );
+              })()}
+            </>
+          )}
         </div>
       ) : !loaded ? (
         <p role="status">{t("common.loading")}</p>
@@ -608,77 +717,87 @@ function OnlineMarketView({
           {currentLeases.length > 0 ? (
             <section className="grid gap-2">
               <h2 className="text-sm font-semibold">{t("online.myLeases")}</h2>
+              <div className={ONLINE_CLIENT_CARD_GRID_CLASS}>
               {currentLeases.map((l) => (
-                <article key={l.leaseId} id={`market-client-${l.leaseId}`} tabIndex={-1} className="rounded-xl border border-border bg-background p-4">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div>
-                      <strong id={`market-client-${l.leaseId}-title`}>{l.alias}</strong>
-                      <p className="text-sm">{t(onlineStatusKey(l.state))} · {t("online.grantUntil")} {date(l.expiresAt)}</p>
-                    </div>
-                    <div className="flex gap-2">
+                <OnlineClientCard
+                  key={l.leaseId}
+                  cardId={`market-client-${l.leaseId}`}
+                  name={l.alias}
+                  healthy={l.state === "active"}
+                  status={t(onlineStatusKey(l.state))}
+                  detail={`${t("online.grantUntil")} ${date(l.expiresAt)}`}
+                  actions={(
+                    <>
                       {l.state === "active" ? (
-                        <Button className={button} aria-describedby={`market-client-${l.leaseId}-title`} onPress={() => openConsole({ clientId: l.leaseId, kind: "console", url: l.clientUrl, title: l.alias })}>{t("online.console")}</Button>
+                        <Button className={button} onPress={() => openConsole({ clientId: l.leaseId, kind: "console", url: l.clientUrl, title: l.alias })}>{t("online.console")}</Button>
                       ) : null}
                       {["active", "starting"].includes(l.state) ? (
-                        <Button variant="outline" className={button} aria-describedby={`market-client-${l.leaseId}-title`} onPress={() => { close(); setEnding(l); }}>{t("online.end")}</Button>
+                        <Button variant="outline" className={button} onPress={() => { close(); setEnding(l); }}>{t("online.end")}</Button>
                       ) : null}
-                    </div>
-                  </div>
-                  {l.terminationId ? <a className={link} href={clientTerminationHref(l.terminationId)}>{t("online.exitRecord")}</a> : null}
-                  {l.events.length > 0 ? (
-                    <details className="mt-2 text-sm">
-                      <summary className="cursor-pointer">{t("online.ownerActivity")}</summary>
-                      <ul>{l.events.map((event, index) => <li key={index}>{date(event.at)} · {t(onlineStatusKey(event.kind))}</li>)}</ul>
-                    </details>
-                  ) : null}
-                </article>
+                    </>
+                  )}
+                  extra={(
+                    <>
+                      {l.terminationId ? <a className={link} href={clientTerminationHref(l.terminationId)}>{t("online.exitRecord")}</a> : null}
+                      {l.events.length > 0 ? (
+                        <details className="text-sm">
+                          <summary className="cursor-pointer">{t("online.ownerActivity")}</summary>
+                          <ul>{l.events.map((event, index) => <li key={index}>{date(event.at)} · {t(onlineStatusKey(event.kind))}</li>)}</ul>
+                        </details>
+                      ) : null}
+                    </>
+                  )}
+                />
               ))}
+              </div>
             </section>
           ) : null}
         </div>
           ) : country ? (
-            <div className="grid min-w-0 items-start gap-3 xl:grid-cols-[minmax(0,1fr)_minmax(16rem,22rem)]">
-              <section className="grid min-w-0 content-start gap-1.5" aria-label={t("clientMarket.shop.hostListLabel", { name: countryName })}>
-                <h2 className="text-sm font-semibold">{t("clientMarket.shop.stepHost")}</h2>
-                {shopListings.length === 0 ? <p className="text-sm text-muted-foreground">{t("clientMarket.shop.noHosts")}</p> : shopListings.map((listing) => (
-                  <OnlineShopListingButton
-                    key={listing.installationId}
-                    listing={listing}
-                    selected={pickedId === listing.installationId}
-                    onSelect={(next) => setPickedId(next.installationId)}
-                  />
-                ))}
-              </section>
-              <OnlineShopConfirm
-                listing={shopListings.find((item) => item.installationId === pickedId) || null}
-                countryName={countryName}
-                authed={authenticated}
-                onContinue={(listing) => {
-                  if (!authenticated) {
-                    window.dispatchEvent(new Event(ROUTER_OPEN_LOGIN_EVENT));
-                    return;
-                  }
-                  setEnding(null);
-                  setExitRead(null);
-                  setExitReason("voluntary");
-                  setClaim("");
-                  setAck(false);
-                  setAuto(false);
-                  setDialogError("");
-                  setSelection(listing);
-                  void action(async () => {
-                    setQuote(await onlineRequest<OnlineQuote>(
-                      `installations/${listing.installationId}/quote`,
-                      "POST",
-                      { revision: listing.revision, autoRenew: false },
-                    ));
-                  });
-                }}
-                onLogin={() => window.dispatchEvent(new Event(ROUTER_OPEN_LOGIN_EVENT))}
-                busy={busy}
-                error={!quote ? dialogError : ""}
-              />
-            </div>
+            <section className="grid gap-2" aria-label={t("clientMarket.shop.hostListLabel", { name: countryName })}>
+              <h2 className="text-sm font-semibold">{t("clientMarket.shop.stepHost")}</h2>
+              {shopListings.length === 0 ? <p className="text-sm text-muted-foreground">{t("clientMarket.shop.noHosts")}</p> : (
+                <div className={ONLINE_CLIENT_CARD_GRID_CLASS}>
+                  {shopListings.map((listing) => {
+                    const rentable = onlineListingRentable(listing);
+                    const status = listing.state !== "listed" ? listing.state : listing.occupied ? "occupied" : listing.healthy ? "available" : "offline";
+                    return (
+                      <OnlineClientCard
+                        key={listing.installationId}
+                        cardId={`market-client-${listing.installationId}`}
+                        name={listing.label}
+                        price={priceOf(listing.cyclePriceMinor)}
+                        healthy={listing.healthy}
+                        muted={!rentable}
+                        selected={pickedId === listing.installationId}
+                        status={t(onlineStatusKey(status))}
+                        detail={countryName}
+                        spec={onlineShopSpecLine(listing.hardware)}
+                        specLabel={t("clientMarket.shop.summarySpecs")}
+                        hours={hoursOf(listing)}
+                        hoursLabel={t("online.hours")}
+                        onSelect={() => setPickedId(listing.installationId)}
+                        actions={!authenticated || rentable ? (
+                          <Button className={button} isDisabled={busy} aria-label={t("clientMarket.shop.cardContinue", { name: listing.label })} onPress={() => quoteListing(listing)}>
+                            {t(authenticated ? "clientMarket.shop.continue" : "nav.login")}
+                          </Button>
+                        ) : null}
+                        extra={(
+                          <>
+                            {listing.egressIp ? <p className="truncate text-[11px] text-muted-foreground">IP {listing.egressIp}</p> : null}
+                            {listing.trialDays > 0 ? <p className="text-[11px] text-muted-foreground">{t("online.trialDays")} · {listing.trialDays}</p> : null}
+                            {listing.freeDays ? <p className="text-[11px] text-muted-foreground">{t("online.freeDays")} · {listing.freeDays}</p> : null}
+                            <p className="text-[11px] text-muted-foreground">{t("online.rootNotice")}</p>
+                            {!rentable ? <p role="status" className="rounded-lg bg-primary/10 px-2.5 py-1.5 text-xs leading-5">{t("clientMarket.shop.notIdle", { status: t(onlineStatusKey(status)) })}</p> : null}
+                            {pickedId === listing.installationId && dialogError && !quote ? <p role="alert" className="text-xs text-danger">{dialogError}</p> : null}
+                          </>
+                        )}
+                      />
+                    );
+                  })}
+                </div>
+              )}
+            </section>
           ) : null}
         </>
       )}

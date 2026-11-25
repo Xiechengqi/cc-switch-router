@@ -62,6 +62,9 @@ test("account and market reuse one buyer view; Owner audit is gated before any r
   assert.match(source("components/dashboard/account-client-section.tsx"), /role === "user"[\s\S]*<ClientRentalRecords/);
   const market = source("components/dashboard/client-market-page.tsx");
   assert.ok(market.indexOf("<ClientRentalRecords historyOnly") < market.indexOf("<ClientRentalAuditPanel"));
+  const records = source("components/dashboard/client-market/rental-records.tsx");
+  assert.doesNotMatch(records, /clientRentals\.refresh/);
+  assert.doesNotMatch(records, /RefreshCw/);
   const shared = source("components/dashboard/client-market/rental-records.tsx");
   assert.match(shared, /key=\{actor\}/);
   assert.match(shared, /view="current"/); assert.match(shared, /view="history"/);

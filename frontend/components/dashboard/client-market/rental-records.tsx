@@ -3,7 +3,7 @@
 import * as React from "react";
 import Link from "next/link";
 import { Button } from "@heroui/react";
-import { ChevronLeft, ChevronRight, Loader2, MessageCircle, RefreshCw } from "lucide-react";
+import { ChevronLeft, ChevronRight, Loader2, MessageCircle } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useClientChat } from "@/components/chat/client-chat";
 import { ExpandableRecordTable, RecordDetailList, type RecordTableColumn } from "@/components/common/expandable-record-table";
@@ -128,7 +128,7 @@ function RentalSection({ view, focusKey, revision, onChanged, onTerminationOpen 
     ]),
   ];
   return <section className="grid min-w-0 gap-2" aria-labelledby={titleId} data-testid={`client-rentals-${view}`}>
-    <div className="flex items-center justify-between gap-2"><h4 id={titleId} className="text-sm font-semibold text-muted-foreground">{t(view === "current" ? "clientRentals.current" : "clientRentals.history")}{page ? <span className="ml-1.5 tabular-nums">· {page.total}</span> : null}</h4><Button variant="ghost" size="sm" isIconOnly aria-label={t("clientRentals.refresh")} isDisabled={busy} onPress={() => void load(canonicalPage.current)}><RefreshCw aria-hidden className="h-4 w-4" /></Button></div>
+    <h4 id={titleId} className="text-sm font-semibold text-muted-foreground">{t(view === "current" ? "clientRentals.current" : "clientRentals.history")}{page ? <span className="ml-1.5 tabular-nums">· {page.total}</span> : null}</h4>
     {failed ? <div role="alert" className="flex flex-wrap items-center gap-2 text-sm text-destructive">{t("clientRentals.error")}<Button size="sm" variant="ghost" onPress={() => void load(canonicalPage.current)}>{t("common.retry")}</Button></div> : null}
     {busy ? <p role="status" className="flex items-center gap-2 py-6 text-sm text-muted-foreground"><Loader2 aria-hidden className="h-4 w-4 animate-spin" />{t("common.loading")}</p> : page ? <ExpandableRecordTable
       rows={page.items} rowKey={row => row.id} rowLabel={clientRentalLabel} columns={columns}
