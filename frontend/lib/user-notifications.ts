@@ -67,6 +67,9 @@ export function notificationHref(item: UserNotification): string {
   if (item.objectKind === "client_termination" || item.eventKind.startsWith("client_termination_")) {
     return clientTerminationHref(typeof item.payload.terminationId === "string" ? item.payload.terminationId : item.objectId);
   }
+  if (item.eventKind === "client_workspace_access" || item.eventKind === "client_workspace_ready") {
+    return "/client-market/?view=rentals&focus=" + encodeURIComponent(item.objectId);
+  }
   if (item.category === "system") return "/metrics/?tab=alerts";
   if (item.category === "client") return `/?focusKind=client&focusId=${encodeURIComponent(item.objectId)}&drawerKind=client&drawerId=${encodeURIComponent(item.objectId)}`;
   if (item.eventKind === "c2c_order_updated" && typeof item.payload.orderId === "string") {

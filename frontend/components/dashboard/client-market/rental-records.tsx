@@ -1,5 +1,6 @@
 "use client";
 
+import { LeaseActions } from "./lease-actions";
 import * as React from "react";
 import Link from "next/link";
 import { Button } from "@heroui/react";
@@ -187,43 +188,233 @@ function RentalDetail({ id, refreshKey, onChanged, onTerminationOpen, onForbidde
   const rental = detail?.rental;
   const money = (value: string) => formatWalletUnits(value, "$", locale);
   const date = (value: string | null) => value ? new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value)) : "—";
-  return <div className="grid min-w-0 gap-3" data-testid="client-rental-detail">
-    {busy ? <p role="status" className="text-sm text-muted-foreground">{t("common.loading")}</p> : null}
-    {error ? <div role="alert" className="text-sm text-destructive">{t("clientRentals.detailError")}<Button variant="ghost" size="sm" onPress={() => void load()}>{t("common.retry")}</Button></div> : null}
-    {detail && row ? <>
-      <RecordDetailList items={[
-        { label: t("clientRentals.recordId"), value: <span className="break-all">{row.id}</span> },
-        { label: t("online.clientColumn"), value: <span className="break-all">{clientRentalLabel(row)}</span> },
-        { label: t("account.market.col.provider"), value: row.providerEmail || "—" },
-        { label: t("rentalAudit.created"), value: date(row.createdAt) }, { label: t("rentalAudit.activated"), value: date(row.activatedAt) },
-        { label: t("rentalAudit.ended"), value: date(row.endedAt) }, { label: t("rentalAudit.cleanupAt"), value: date(row.cleanupConfirmedAt) },
-        { label: t("account.market.col.term"), value: date(row.periodEnd || row.expiresAt) },
-        { label: t("rentalAudit.price"), value: row.cyclePriceMinor !== null ? t("rentalAudit.monthlyPrice", { price: formatUsdMoney(row.cyclePriceMinor, locale) }) : row.dailyRateMinor !== null ? t("rentalAudit.dailyPrice", { price: formatUsdMoney(row.dailyRateMinor, locale) }) : row.pricingModel === "free" ? t("shareMarket.free") : "—" },
-        { label: t("rentalAudit.status"), value: t(row.status === "free" ? "shareMarket.free" : `rentalAudit.status.${row.status}`) },
-        { label: t("rentalAudit.attention"), value: t(`rentalAudit.attention.${row.attention}`) },
-        { label: t("clientRentals.cleanup"), value: t(`rentalAudit.cleanup.${row.cleanupStatus}`) },
-      ]} />
-      {row.group === "history" && row.attention !== "none" ? <p className="text-xs text-amber-800">{t("clientRentals.followup")}</p> : null}
-      {row.trialSecondsRemaining !== null ? <p className="text-xs text-muted-foreground">{t("clientRentals.trial", { used: detail.trialConsumedSeconds, remaining: row.trialSecondsRemaining })}</p> : null}
-      <section className="grid gap-2 rounded-lg border border-border p-3"><p className="text-xs text-muted-foreground">{t("clientRentals.financialHelp")}</p>{row.money ? <RecordDetailList items={CLIENT_RENTAL_MONEY_FIELDS.map(key => ({ label: t(key === "netUnits" ? "clientRentals.netUnits" : `rentalAudit.${key}`), value: money(row.money![key]) }))} /> : <p className="text-xs text-muted-foreground">{t("rentalAudit.moneyUnavailable")}</p>}</section>
-      {detail.settlement ? <section className="grid gap-2 rounded-lg border border-border p-3"><h5 className="text-sm font-medium">{t("clientRentals.settlement")}</h5><RecordDetailList items={[
-        { label: t("clientRentals.reason"), value: t(detail.settlement.reason === "provider_issue" ? "clientTermination.providerIssue" : detail.settlement.reason === "platform_issue" ? "clientTermination.platformIssue" : detail.settlement.reason === "voluntary" ? "clientTermination.voluntary" : "clientTermination.systemExit") },
-        { label: t("clientRentals.responsibility"), value: t(detail.settlement.responsibility === "buyer" ? "clientRentals.responsibility.buyer" : detail.settlement.responsibility === "undetermined" ? "clientRentals.responsibility.undetermined" : "clientRentals.responsibility.provider") },
-        { label: t("rentalAudit.held"), value: money(detail.settlement.heldUnits) },
-        { label: t("rentalAudit.returnedUnits"), value: money(detail.settlement.returnedUnits) },
-        { label: t("rentalAudit.compensationUnits"), value: money(detail.settlement.compensationUnits) },
-      ]} />{row.terminationId ? <Button variant="outline" size="sm" className="justify-self-start" onPress={() => onTerminationOpen(row.terminationId!)}>{t("clientRentals.discussion")}</Button> : null}</section> : null}
-      {rental && row.group === "current" ? <>
-        {row.cyclePriceMinor != null && row.contractId ? <MarketWalletRenewalCard contractId={row.contractId} refreshKey={JSON.stringify([row.contractStatus, row.renewalPolicy, row.periodEnd, row.trialSecondsRemaining])} compact onChanged={changed} /> : null}
-        {rental.canDispute && rental.contractId ? <MarketServiceDisputeControl contractId={rental.contractId} initiallyOpen={rental.openDispute} onChanged={changed} /> : null}
-        <Link className="inline-flex min-h-11 items-center justify-self-start rounded text-sm text-accent hover:underline focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2" href={clientMarketTenantHref(rental.leaseId)}>{t("account.client.manageInMarket")}</Link>
-      </> : null}
-      <details className="min-w-0 rounded-lg border border-border p-3"><summary className="cursor-pointer text-sm font-medium">{t("rentalAudit.periods")}</summary><div className="mt-3 grid gap-2 text-xs">{detail.periods.length ? detail.periods.map(p => <div key={p.id} className="grid gap-1 border-t border-border pt-2"><strong>{t("rentalAudit.period", { sequence: p.sequence })}</strong><span>{date(p.startedAt)} → {date(p.endedAt)}</span><span>{t("clientRentals.periodAmount", { amount: money(p.amountUnits), returned: money(p.returnedUnits) })}</span></div>) : <p className="text-muted-foreground">{t("rentalAudit.noPeriods")}</p>}{detail.periodsNextCursor !== null ? <Button size="sm" variant="ghost" isDisabled={busy} onPress={() => void load("periods")}>{t("rentalAudit.morePeriods")}</Button> : null}</div></details>
-      <details className="min-w-0 rounded-lg border border-border p-3"><summary className="cursor-pointer text-sm font-medium">{t("rentalAudit.events")}</summary><ol className="mt-3 grid gap-2 text-xs">{detail.events.map(event => {
-        const key = `rentalAudit.event.${event.action}`;
-        return <li key={event.id} className="grid min-w-0 gap-1 border-t border-border pt-2"><span>{date(event.createdAt)} · {t((key in rentalAuditMessagesEn ? key : "rentalAudit.event.updated") as MessageKey)}</span>{event.note ? <p className="whitespace-pre-wrap break-words text-muted-foreground">{event.note}</p> : null}</li>;
-      })}</ol>{detail.eventsNextCursor ? <Button className="mt-2" size="sm" variant="ghost" isDisabled={busy} onPress={() => void load("events")}>{t("rentalAudit.moreEvents")}</Button> : null}</details>
-      <div className="flex flex-wrap items-center justify-between gap-2"><p className="text-xs text-muted-foreground">{t(row.provenance === "historical_record" ? "rentalAudit.historical" : "rentalAudit.snapshot")}</p>{row.installationId ? <Button size="sm" variant="ghost" onPress={() => void openChat(row.installationId!)}><MessageCircle aria-hidden className="h-4 w-4" />{t("clientTermination.chat")}</Button> : null}</div>
-    </> : null}
-  </div>;
+  return (
+    <div className="grid min-w-0 gap-3" data-testid="client-rental-detail">
+      {busy ? (
+        <p role="status" className="text-sm text-muted-foreground">
+          {t("common.loading")}
+        </p>
+      ) : null}
+      {error ? (
+        <div role="alert" className="text-sm text-destructive">
+          {t("clientRentals.detailError")}
+          <Button variant="ghost" size="sm" onPress={() => void load()}>
+            {t("common.retry")}
+          </Button>
+        </div>
+      ) : null}
+      {detail && row ? (
+        <>
+          <RecordDetailList
+            items={[
+              { label: t("clientRentals.recordId"), value: <span className="break-all">{row.id}</span> },
+              {
+                label: t("online.clientColumn"),
+                value: <span className="break-all">{clientRentalLabel(row)}</span>,
+              },
+              { label: t("account.market.col.provider"), value: row.providerEmail || "—" },
+              { label: t("rentalAudit.created"), value: date(row.createdAt) },
+              { label: t("rentalAudit.activated"), value: date(row.activatedAt) },
+              { label: t("rentalAudit.ended"), value: date(row.endedAt) },
+              { label: t("rentalAudit.cleanupAt"), value: date(row.cleanupConfirmedAt) },
+              { label: t("account.market.col.term"), value: date(row.periodEnd || row.expiresAt) },
+              {
+                label: t("rentalAudit.price"),
+                value:
+                  row.cyclePriceMinor !== null
+                    ? t("rentalAudit.monthlyPrice", { price: formatUsdMoney(row.cyclePriceMinor, locale) })
+                    : row.dailyRateMinor !== null
+                      ? t("rentalAudit.dailyPrice", { price: formatUsdMoney(row.dailyRateMinor, locale) })
+                      : row.pricingModel === "free"
+                        ? t("shareMarket.free")
+                        : "—",
+              },
+              {
+                label: t("rentalAudit.status"),
+                value: t(row.status === "free" ? "shareMarket.free" : `rentalAudit.status.${row.status}`),
+              },
+              { label: t("rentalAudit.attention"), value: t(`rentalAudit.attention.${row.attention}`) },
+              { label: t("clientRentals.cleanup"), value: t(`rentalAudit.cleanup.${row.cleanupStatus}`) },
+            ]}
+          />
+          {row.group === "history" && row.attention !== "none" ? (
+            <p className="text-xs text-amber-800">{t("clientRentals.followup")}</p>
+          ) : null}
+          {row.trialSecondsRemaining !== null ? (
+            <p className="text-xs text-muted-foreground">
+              {t("clientRentals.trial", {
+                used: detail.trialConsumedSeconds,
+                remaining: row.trialSecondsRemaining,
+              })}
+            </p>
+          ) : null}
+          <section className="grid gap-2 rounded-lg border border-border p-3">
+            <p className="text-xs text-muted-foreground">{t("clientRentals.financialHelp")}</p>
+            {row.money ? (
+              <RecordDetailList
+                items={CLIENT_RENTAL_MONEY_FIELDS.map((key) => ({
+                  label: t(key === "netUnits" ? "clientRentals.netUnits" : `rentalAudit.${key}`),
+                  value: money(row.money![key]),
+                }))}
+              />
+            ) : (
+              <p className="text-xs text-muted-foreground">{t("rentalAudit.moneyUnavailable")}</p>
+            )}
+          </section>
+          {detail.settlement ? (
+            <section className="grid gap-2 rounded-lg border border-border p-3">
+              <h5 className="text-sm font-medium">{t("clientRentals.settlement")}</h5>
+              <RecordDetailList
+                items={[
+                  {
+                    label: t("clientRentals.reason"),
+                    value: t(
+                      detail.settlement.reason === "provider_issue"
+                        ? "clientTermination.providerIssue"
+                        : detail.settlement.reason === "platform_issue"
+                          ? "clientTermination.platformIssue"
+                          : detail.settlement.reason === "voluntary"
+                            ? "clientTermination.voluntary"
+                            : "clientTermination.systemExit",
+                    ),
+                  },
+                  {
+                    label: t("clientRentals.responsibility"),
+                    value: t(
+                      detail.settlement.responsibility === "buyer"
+                        ? "clientRentals.responsibility.buyer"
+                        : detail.settlement.responsibility === "undetermined"
+                          ? "clientRentals.responsibility.undetermined"
+                          : "clientRentals.responsibility.provider",
+                    ),
+                  },
+                  { label: t("rentalAudit.held"), value: money(detail.settlement.heldUnits) },
+                  { label: t("rentalAudit.returnedUnits"), value: money(detail.settlement.returnedUnits) },
+                  {
+                    label: t("rentalAudit.compensationUnits"),
+                    value: money(detail.settlement.compensationUnits),
+                  },
+                ]}
+              />
+              {row.terminationId ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="justify-self-start"
+                  onPress={() => onTerminationOpen(row.terminationId!)}
+                >
+                  {t("clientRentals.discussion")}
+                </Button>
+              ) : null}
+            </section>
+          ) : null}
+          {rental && row.group === "current" ? (
+            <>
+              {row.cyclePriceMinor != null && row.contractId ? (
+                <MarketWalletRenewalCard
+                  contractId={row.contractId}
+                  refreshKey={JSON.stringify([
+                    row.contractStatus,
+                    row.renewalPolicy,
+                    row.periodEnd,
+                    row.trialSecondsRemaining,
+                  ])}
+                  compact
+                  onChanged={changed}
+                />
+              ) : null}
+              {rental.canDispute && rental.contractId ? (
+                <MarketServiceDisputeControl
+                  contractId={rental.contractId}
+                  initiallyOpen={rental.openDispute}
+                  onChanged={changed}
+                />
+              ) : null}
+              <LeaseActions
+                id={rental.leaseId}
+                active={!!row.activatedAt && !row.endedAt}
+                canEnd={!row.endedAt}
+                onChanged={changed}
+              />
+              <Link
+                className="inline-flex min-h-11 items-center justify-self-start rounded text-sm text-accent hover:underline focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2"
+                href={clientMarketTenantHref(rental.leaseId)}
+              >
+                {t("account.client.manageInMarket")}
+              </Link>
+            </>
+          ) : null}
+          <details className="min-w-0 rounded-lg border border-border p-3">
+            <summary className="cursor-pointer text-sm font-medium">{t("rentalAudit.periods")}</summary>
+            <div className="mt-3 grid gap-2 text-xs">
+              {detail.periods.length ? (
+                detail.periods.map((p) => (
+                  <div key={p.id} className="grid gap-1 border-t border-border pt-2">
+                    <strong>{t("rentalAudit.period", { sequence: p.sequence })}</strong>
+                    <span>
+                      {date(p.startedAt)} → {date(p.endedAt)}
+                    </span>
+                    <span>
+                      {t("clientRentals.periodAmount", {
+                        amount: money(p.amountUnits),
+                        returned: money(p.returnedUnits),
+                      })}
+                    </span>
+                  </div>
+                ))
+              ) : (
+                <p className="text-muted-foreground">{t("rentalAudit.noPeriods")}</p>
+              )}
+              {detail.periodsNextCursor !== null ? (
+                <Button size="sm" variant="ghost" isDisabled={busy} onPress={() => void load("periods")}>
+                  {t("rentalAudit.morePeriods")}
+                </Button>
+              ) : null}
+            </div>
+          </details>
+          <details className="min-w-0 rounded-lg border border-border p-3">
+            <summary className="cursor-pointer text-sm font-medium">{t("rentalAudit.events")}</summary>
+            <ol className="mt-3 grid gap-2 text-xs">
+              {detail.events.map((event) => {
+                const key = `rentalAudit.event.${event.action}`;
+                return (
+                  <li key={event.id} className="grid min-w-0 gap-1 border-t border-border pt-2">
+                    <span>
+                      {date(event.createdAt)} ·{" "}
+                      {t((key in rentalAuditMessagesEn ? key : "rentalAudit.event.updated") as MessageKey)}
+                    </span>
+                    {event.note ? (
+                      <p className="whitespace-pre-wrap break-words text-muted-foreground">{event.note}</p>
+                    ) : null}
+                  </li>
+                );
+              })}
+            </ol>
+            {detail.eventsNextCursor ? (
+              <Button
+                className="mt-2"
+                size="sm"
+                variant="ghost"
+                isDisabled={busy}
+                onPress={() => void load("events")}
+              >
+                {t("rentalAudit.moreEvents")}
+              </Button>
+            ) : null}
+          </details>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <p className="text-xs text-muted-foreground">
+              {t(row.provenance === "historical_record" ? "rentalAudit.historical" : "rentalAudit.snapshot")}
+            </p>
+            {row.installationId ? (
+              <Button size="sm" variant="ghost" onPress={() => void openChat(row.installationId!)}>
+                <MessageCircle aria-hidden className="h-4 w-4" />
+                {t("clientTermination.chat")}
+              </Button>
+            ) : null}
+          </div>
+        </>
+      ) : null}
+    </div>
+  );
 }

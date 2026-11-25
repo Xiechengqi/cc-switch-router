@@ -440,6 +440,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         127,
         include_str!("../schema/0127_online_client_leasing.sql"),
     ),
+    (
+        128,
+        include_str!("../schema/0128_client_workspace_delivery.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -1068,7 +1072,7 @@ mod tests {
     // Migration 125 adds the lease-bound initial monitor bootstrap queue.
     // Migration 126 adds the year-long Host health day aggregate.
     // Migration 127 adds seven online leasing tables and removes obsolete SSH operations.
-    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 295;
+    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 296;
 
     #[test]
     fn migration_114_revokes_existing_sessions_and_rotation_grace_only_once() {

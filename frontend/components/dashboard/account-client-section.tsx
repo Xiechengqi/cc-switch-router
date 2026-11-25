@@ -12,22 +12,12 @@ import type { ClientTerminationAction } from "@/lib/client-termination";
 import { ApiError } from "@/lib/api";
 import { clientMarketMineHref } from "@/lib/dashboard-nav";
 import { formatUsdMoney } from "@/lib/market-money";
-import { onlineRequest } from "@/lib/online-client-market";
+import { onlineRequest, type OnlineSellerItem as SellerItem } from "@/lib/online-client-market";
 import { AccountInlineLoading, AccountSectionError } from "./account-section";
 import type { AccountMarketRole } from "./account-share-section";
 import { onlineStatusKey } from "./client-market/online-market";
 import { ClientRentalRecords } from "./client-market/rental-records";
 import { useAccountClientTerminations } from "./use-account-client-terminations";
-
-type SellerItem = {
-  id: string;
-  listingId: string | null;
-  label: string;
-  state: string;
-  cyclePriceMinor: number;
-  tenantEmail: string | null;
-  expiresAt: number | null;
-};
 
 export function AccountClientSection({ role, focusKey }: { role: AccountMarketRole; focusKey?: string | null }) {
   const { session } = useAuth();
@@ -63,7 +53,7 @@ function SellerInventory({ actor, focusKey }: { actor: string; focusKey?: string
     return () => { controller.abort(); clearTimeout(timer); };
   }, [attempt]);
 
-  const byLease = new Map(terminations.items.map(item => [item.installationId, item]));
+  const byId = new Map(terminations.items.map((item) => [item.id, item]));
   return <div className="grid min-w-0 gap-4">
     {error && <AccountSectionError message={error} onRetry={() => setAttempt(v => v + 1)} />}
     {!items && !error && <AccountInlineLoading />}
@@ -80,16 +70,49 @@ function SellerInventory({ actor, focusKey }: { actor: string; focusKey?: string
       ]}
       empty={<p className="py-6 text-center text-sm text-muted-foreground">{t("account.client.providerEmpty")}</p>}
       renderDetail={(entry) => {
-        const termination = byLease.get(entry.id);
-        return <div className="grid gap-3">
-          <RecordDetailList items={[
-            { label: t("account.client.offer"), value: entry.cyclePriceMinor ? t("rentalAudit.monthlyPrice", { price: formatUsdMoney(entry.cyclePriceMinor, locale) }) : t("shareMarket.free") },
-            { label: t("account.market.col.renter"), value: entry.tenantEmail || t("account.market.notRented") },
-            { label: t("account.market.col.term"), value: entry.expiresAt ? new Date(entry.expiresAt * 1000).toLocaleString(locale) : "—" },
-          ]} />
-          {termination && <ClientTerminationRecord item={termination} role="provider" onOpen={(item, action) => setSelection({ id: item.id, action })} />}
-          {entry.listingId && <Link className="justify-self-start text-sm text-accent hover:underline" href={clientMarketMineHref(entry.listingId)}>{t("account.client.manageInMarket")}</Link>}
-        </div>;
+        const termination = entry.terminationId ? byId.get(entry.terminationId) : null;
+        return (
+          <div className="grid gap-3">
+            <RecordDetailList
+              items={[
+                {
+                  label: t("account.client.offer"),
+                  value: entry.cyclePriceMinor
+                    ? t("rentalAudit.monthlyPrice", { price: formatUsdMoney(entry.cyclePriceMinor, locale) })
+                    : t("shareMarket.free"),
+                },
+                {
+                  label: t("account.market.col.renter"),
+                  value: entry.tenantEmail || t("account.market.notRented"),
+                },
+                {
+                  label: t("account.market.col.term"),
+                  value: entry.expiresAt ? new Date(entry.expiresAt * 1000).toLocaleString(locale) : "—",
+                },
+              ]}
+            />
+            {entry.terminationId && !termination && (
+              <Button variant="outline" onPress={() => setSelection({ id: entry.terminationId! })}>
+                {t("online.exitRecord")}
+              </Button>
+            )}
+            {termination && (
+              <ClientTerminationRecord
+                item={termination}
+                role="provider"
+                onOpen={(item, action) => setSelection({ id: item.id, action })}
+              />
+            )}
+            {entry.listingId && (
+              <Link
+                className="justify-self-start text-sm text-accent hover:underline"
+                href={clientMarketMineHref(entry.listingId)}
+              >
+                {t("account.client.manageInMarket")}
+              </Link>
+            )}
+          </div>
+        );
       }}
     />}
     {terminations.error && <AccountSectionError message={t("account.market.terminationsUnavailable")} onRetry={() => void terminations.reload()} />}

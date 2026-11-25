@@ -10,6 +10,10 @@ import { ClientRentalAuditPanel } from "@/components/dashboard/client-market/ren
 import { ClientRentalRecords } from "@/components/dashboard/client-market/rental-records";
 import { ClientTerminationDialog } from "@/components/market/client-termination-dialog";
 import { useClientTerminationWorkspace } from "@/components/market/use-client-termination-workspace";
+import { ClientConsoleIframe } from "./client-console/client-console-iframe";
+import { authFetch } from "@/lib/auth";
+import { onlineRequest, type OnlineLease } from "@/lib/online-client-market";
+import { ROUTER_OPEN_LOGIN_EVENT } from "./client-market/host-utils";
 import { currentPageHref } from "@/lib/url-search";
 
 /** Query parameters: `focus` (listing installation or lease id), `provider`,
@@ -55,6 +59,15 @@ export function ClientMarketPage() {
   const clearProvider = () => {
     window.history.replaceState(null, "", currentPageHref(window.location.href, (params) => params.delete("provider")));
   };
+  const openId = searchParams.get("openLease") || searchParams.get("embeddedLease");
+  if (openId)
+    return (
+      <WorkspaceLaunch
+        key={JSON.stringify([actor, openId, searchParams.has("embeddedLease")])}
+        id={openId}
+        embedded={searchParams.has("embeddedLease")}
+      />
+    );
   return (
     <main className="mx-auto grid min-w-0 w-[calc(100%-2rem)] max-w-7xl grid-cols-[minmax(0,1fr)] gap-5 pb-10">
       <h1 className="sr-only">{t("clientMarket.title")}</h1>
@@ -62,7 +75,6 @@ export function ClientMarketPage() {
         focusId={searchParams.get("focus")}
         providerId={providerId}
         rentalId={searchParams.get("rentalId")}
-        tenantRecords={<ClientRentalRecords currentOnly focusKey={searchParams.get("rentalId")} onTerminationOpen={openTermination} revision={terminationWork.revision + rentalRevision} />}
         terminations={terminations}
         onChanged={onRentalChanged}
         onTerminationOpen={openTermination}
@@ -89,6 +101,110 @@ export function ClientMarketPage() {
       <ClientTerminationDialog terminationId={terminationId} onClose={closeTermination} onChanged={() => void terminationWork.refresh(true)} />
       <ClientRentalRecords historyOnly focusKey={searchParams.get("rentalId")} onTerminationOpen={openTermination} revision={terminationWork.revision + rentalRevision} />
       <ClientRentalAuditPanel onTerminationOpen={openTermination} revision={terminationWork.revision + rentalRevision} />
+    </main>
+  );
+}
+
+function WorkspaceLaunch({ id, embedded }: { id: string; embedded: boolean }) {
+  const { session, loading } = useAuth();
+  const { t } = useLocaleText();
+  const actor = session?.authenticated ? session.user?.id : null;
+  const [frame, setFrame] = React.useState<OnlineLease | null>(null);
+  const [failed, setFailed] = React.useState(false);
+  const [attempt, retry] = React.useReducer((n: number) => n + 1, 0);
+  React.useEffect(() => {
+    if (loading) return;
+    if (!actor) {
+      window.dispatchEvent(new Event(ROUTER_OPEN_LOGIN_EVENT));
+      return;
+    }
+    const ctl = new AbortController();
+    setFailed(false);
+    async function open() {
+      const { leases } = await onlineRequest<{ leases: OnlineLease[] }>(
+        "leases?current=true",
+        "GET",
+        undefined,
+        ctl.signal,
+      );
+      const lease = leases.find((item) => item.leaseId === id && item.state === "active");
+      if (!lease) throw new Error("lease unavailable");
+      const url = new URL(lease.clientUrl);
+      if (
+        !["https:", "http:"].includes(url.protocol) ||
+        url.username ||
+        url.password ||
+        url.hostname.split(".")[0] !== lease.alias ||
+        !/^rent-[0-9a-f]{20}$/.test(lease.alias)
+      )
+        throw new Error("invalid lease origin");
+      if (ctl.signal.aborted) return;
+      if (embedded) {
+        setFrame(lease);
+        return;
+      }
+      const nonce = crypto.randomUUID();
+      const response = await authFetch("/v1/auth/client-web-tickets", {
+        method: "POST",
+        signal: ctl.signal,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ installationId: id, kind: "console", nonce }),
+      });
+      if (!response.ok) throw new Error("workspace login unavailable");
+      const { ticket, origin } = await response.json();
+      if (origin !== url.origin || typeof ticket !== "string" || !/^[a-zA-Z0-9]{48}$/.test(ticket))
+        throw new Error("invalid lease ticket");
+      if (ctl.signal.aborted) return;
+      const form = document.createElement("form");
+      form.method = "post";
+      form.action = new URL("/web-api/auth/router-launch", origin).href;
+      for (const [name, value] of Object.entries({ ticket, nonce })) {
+        const field = document.createElement("input");
+        field.type = "hidden";
+        field.name = name;
+        field.value = value;
+        form.appendChild(field);
+      }
+      document.body.appendChild(form);
+      form.submit();
+      form.remove();
+    }
+    void open().catch(() => {
+      if (!ctl.signal.aborted) setFailed(true);
+    });
+    return () => ctl.abort();
+  }, [actor, loading, embedded, id, attempt]);
+  if (frame)
+    return (
+      <main className="h-[85dvh]">
+        <ClientConsoleIframe
+          window={{
+            id,
+            clientId: id,
+            reloadKey: 0,
+            title: frame.alias,
+            url: frame.clientUrl,
+            kind: "console",
+          }}
+        />
+      </main>
+    );
+  return (
+    <main className="mx-auto grid max-w-md gap-3 p-5">
+      <h1>{t("online.console")}</h1>
+      {!loading && !actor ? (
+        <Button onPress={() => window.dispatchEvent(new Event(ROUTER_OPEN_LOGIN_EVENT))}>
+          {t("nav.login")}
+        </Button>
+      ) : failed ? (
+        <>
+          <p role="alert">{t("lease.unavailable")}</p>
+          <Button onPress={retry}>{t("common.retry")}</Button>
+        </>
+      ) : (
+        <p role="status">{t("common.loading")}</p>
+      )}
+      <a href={`/client-market/?view=rentals&focus=${encodeURIComponent(id)}`}>{t("online.myLeases")}</a>
     </main>
   );
 }

@@ -1365,6 +1365,11 @@ impl Config {
         Ok(())
     }
 
+    pub fn web_origin(&self) -> String {
+        let scheme = if self.use_localhost { "http" } else { "https" };
+        format!("{scheme}://{}", self.tunnel_domain)
+    }
+
     pub fn tunnel_url(&self, subdomain: &str) -> String {
         let scheme = if self.use_localhost { "http" } else { "https" };
         format!("{scheme}://{subdomain}.{}", self.tunnel_domain)

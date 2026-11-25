@@ -9,7 +9,7 @@ use crate::{
 };
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, Path, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
@@ -48,6 +48,14 @@ async fn actor(s: &ServerState, h: &HeaderMap) -> Result<AuthSession, AppError> 
 pub fn router() -> Router<ServerState> {
     Router::new()
         .route("/v1/client-market/online/listings", get(listings))
+        .route(
+            "/v1/client-market/online/installations/:id/preflight",
+            post(preflight),
+        )
+        .route(
+            "/v1/client-market/online/installations/:id/retry",
+            post(retry),
+        )
         .route(
             "/v1/client-market/online/installations/:id/listing",
             post(list).delete(unlist),
@@ -115,6 +123,8 @@ struct ClientStatus {
 }
 #[derive(Deserialize)]
 struct AccessEvent {
+    #[serde(default)]
+    occurrences: Option<u32>,
     id: String,
     kind: String,
     at: i64,
@@ -190,24 +200,128 @@ struct Offer {
     acknowledged: bool,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Readiness {
+    owner_verified: bool,
+    activated: bool,
+    capable: bool,
+    share_clear: bool,
+    unlisted: bool,
+}
+
+fn readiness(c: &Connection, id: &str, email: &str) -> Result<Readiness, AppError> {
+    c.query_row("SELECT i.owner_verified_at IS NOT NULL,
+        i.lifecycle='active' AND i.client_activated_at IS NOT NULL AND coalesce(t.enabled,0)=1,
+        i.market_lease_v1=1, NOT EXISTS(SELECT 1 FROM share_market_listings l WHERE l.installation_id=i.id AND
+            (l.status='active' OR EXISTS(SELECT 1 FROM share_market_subscriptions sub WHERE sub.listing_id=l.id AND sub.released_at IS NULL))),
+        NOT EXISTS(SELECT 1 FROM online_client_listings l WHERE l.installation_id=i.id AND l.state!='unlisted')
+        FROM installations i LEFT JOIN installation_client_tunnels t ON t.installation_id=i.id
+        WHERE i.id=?1 AND lower(trim(i.owner_email))=lower(?2)",params![id,email],
+        |r|Ok(Readiness {owner_verified:r.get(0)?,activated:r.get(1)?,capable:r.get(2)?,share_clear:r.get(3)?,unlisted:r.get(4)?}))
+        .optional().market()?.ok_or_else(missing)
+}
 fn seller_ready(c: &Connection, id: &str, email: &str) -> Result<(), AppError> {
-    let owned:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM installations i JOIN installation_client_tunnels t ON t.installation_id=i.id
-        WHERE i.id=?1 AND lower(trim(i.owner_email))=lower(?2) AND i.owner_verified_at IS NOT NULL AND i.market_lease_v1=1 AND i.lifecycle='active' AND i.client_activated_at IS NOT NULL
-        AND t.enabled=1)",params![id,email],|r|r.get(0)).market()?;
-    if !owned {
+    let r = readiness(c, id, email)?;
+    if !(r.owner_verified && r.activated && r.capable) {
         return Err(AppError::Forbidden(
             "verified installation owner required".into(),
         ));
     }
-    let overlap:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM share_market_listings l WHERE l.installation_id=?1
-        AND (l.status='active' OR EXISTS(SELECT 1 FROM share_market_subscriptions sub WHERE sub.listing_id=l.id AND sub.released_at IS NULL)))",
-        params![id],|r|r.get(0)).market()?;
-    if overlap {
+    if !r.share_clear {
         return Err(conflict(
             "finish existing Share Market listings and rentals first",
         ));
     }
     Ok(())
+}
+
+#[derive(Deserialize)]
+struct Preflight {
+    paid: bool,
+}
+
+async fn preflight(
+    State(s): State<ServerState>,
+    Path(id): Path<String>,
+    h: HeaderMap,
+    Json(input): Json<Preflight>,
+) -> Reply {
+    let a = actor(&s, &h).await?;
+    let online = s
+        .proxy
+        .active_client_route_for_installation(&id)
+        .await
+        .is_some();
+    let (checks, paid_ready) = {
+        let c = s.store.conn.lock().await;
+        let checks = readiness(&c, &id, &a.email)?;
+        let paid_ready =
+            match crate::market_provider_finance::require_paid_offer_setup_tx(&c, &a.user_id) {
+                Ok(()) => true,
+                Err(AppError::Forbidden(_)) => false,
+                Err(e) => return Err(e),
+            };
+        (checks, paid_ready)
+    };
+    let mut result = json!({"checks":checks,"online":online,"paidReady":paid_ready,"workspace":false,"hardware":false,"egress":false,"ready":false});
+    if !(checks.owner_verified
+        && checks.activated
+        && checks.capable
+        && checks.share_clear
+        && checks.unlisted
+        && online)
+    {
+        return Ok(Json(result));
+    }
+    let challenge = Uuid::new_v4().simple().to_string();
+    {
+        let c = s.store.conn.lock().await;
+        c.execute(
+            "DELETE FROM online_client_preflight WHERE expires_at<unixepoch()",
+            [],
+        )
+        .market()?;
+        c.execute("INSERT INTO online_client_preflight(challenge,installation_id,expires_at) VALUES(?1,?2,unixepoch()+30)",params![challenge,id]).market()?;
+    }
+    let status = rpc(
+        &s,
+        &id,
+        "/_ctl/market/check",
+        json!({"challenge":challenge}),
+    )
+    .await;
+    let c = s.store.conn.lock().await;
+    let ip = c.query_row("DELETE FROM online_client_preflight WHERE challenge=?1 AND expires_at>=unixepoch() RETURNING egress_ip",params![challenge],|r| r.get::<_,Option<String>>(0)).optional().market()?.flatten();
+    let egress = ip.is_some();
+    result["egress"] = json!(egress);
+    result["egressIp"] = json!(ip);
+    if let Ok(st) = status {
+        let workspace = st.owner_email.eq_ignore_ascii_case(&a.email)
+            && st.grant.is_none()
+            && st.running_lease.is_none()
+            && !st.switching
+            && st.cleanup_safe;
+        let hardware = st.hardware.as_ref().is_some_and(|h| h.validate().is_ok());
+        if hardware {
+            result["resource"] = json!(st.hardware);
+        }
+        result["workspace"] = json!(workspace);
+        result["hardware"] = json!(hardware);
+        result["ready"] = json!(workspace && hardware && egress && (!input.paid || paid_ready));
+    }
+    Ok(Json(result))
+}
+
+async fn retry(State(s): State<ServerState>, Path(id): Path<String>, headers: HeaderMap) -> Reply {
+    let a = actor(&s, &headers).await?;
+    let c = s.store.conn.lock().await;
+    let rows=c.execute("UPDATE online_client_operations SET next_attempt=0 WHERE installation_id=?1 AND EXISTS
+      (SELECT 1 FROM online_client_listings l WHERE l.installation_id=?1 AND l.seller_id=?2 AND l.state IN ('locking','unlocking') AND l.sequence=online_client_operations.sequence)",params![id,a.user_id]).market()?;
+    if rows != 1 {
+        return Err(conflict("no pending listing operation"));
+    }
+    Ok(Json(json!({"queued":true})))
 }
 async fn list(
     State(s): State<ServerState>,
@@ -339,7 +453,7 @@ async fn egress(
         .ok_or_else(|| conflict("unavailable network source"))?;
     let valid: bool = {
         let c = s.store.conn.lock().await;
-        c.query_row("SELECT EXISTS(SELECT 1 FROM online_client_listings WHERE challenge=?1 AND challenge_until>=unixepoch() AND egress_ip IS NULL)",params![challenge],|r|r.get(0)).market()?
+        c.query_row("SELECT EXISTS(SELECT 1 FROM online_client_listings WHERE challenge=?1 AND challenge_until>=unixepoch() AND egress_ip IS NULL UNION ALL SELECT 1 FROM online_client_preflight WHERE challenge=?1 AND expires_at>=unixepoch() AND egress_ip IS NULL)",params![challenge],|r|r.get(0)).market()?
     };
     if !valid {
         return Err(missing());
@@ -349,7 +463,7 @@ async fn egress(
         None => s.store.lookup_geo_country_code_for_ip(&ip).await,
     };
     let c = s.store.conn.lock().await;
-    if c.execute("UPDATE online_client_listings SET egress_ip=?2,country_code=?3 WHERE challenge=?1 AND challenge_until>=unixepoch() AND egress_ip IS NULL",params![challenge,ip,country]).market()?!=1{return Err(missing())}
+    if c.execute("UPDATE online_client_listings SET egress_ip=?2,country_code=?3 WHERE challenge=?1 AND challenge_until>=unixepoch() AND egress_ip IS NULL",params![challenge,ip,country]).market()?!=1 && c.execute("UPDATE online_client_preflight SET egress_ip=?2,country_code=?3 WHERE challenge=?1 AND expires_at>=unixepoch() AND egress_ip IS NULL",params![challenge,ip,country]).market()?!=1{return Err(missing())}
     Ok(StatusCode::NO_CONTENT)
 }
 async fn unlist(State(s): State<ServerState>, Path(id): Path<String>, h: HeaderMap) -> Reply {
@@ -670,7 +784,7 @@ async fn listings(State(s): State<ServerState>, h: HeaderMap) -> Reply {
         (SELECT count(*) FROM (SELECT bucket/12 FROM online_client_probes p WHERE p.installation_id=l.installation_id
             AND p.healthy=1 AND bucket >= (unixepoch()/3600-24)*12 AND bucket < (unixepoch()/3600)*12
             GROUP BY bucket/12 HAVING count(DISTINCT bucket)>=10)),
-        t.subdomain,coalesce(i.last_seen_ip!=l.egress_ip,0),(SELECT id FROM market_provider_profiles mp WHERE mp.user_id=l.seller_id)
+        t.subdomain,coalesce(i.last_seen_ip!=l.egress_ip,0),(SELECT id FROM market_provider_profiles mp WHERE mp.user_id=l.seller_id),(SELECT probe_error FROM online_client_listings base WHERE base.installation_id=l.installation_id),(SELECT attempts FROM online_client_operations o WHERE o.installation_id=l.installation_id)
         FROM online_client_supply l
         JOIN installations i ON i.id=l.installation_id JOIN installation_client_tunnels t ON t.installation_id=l.installation_id
         WHERE l.state='listed' OR (l.seller_id=?1 AND l.state!='unlisted') ORDER BY l.occupied,l.probe_healthy DESC,l.country_code,t.subdomain").market()?;
@@ -682,7 +796,7 @@ async fn listings(State(s): State<ServerState>, h: HeaderMap) -> Reply {
         let installation=r.get::<_,String>(0)?;
         let label=if owned {r.get::<_,String>(14)?} else {public_label(&installation)};
         let egress=r.get::<_,Option<String>>(7)?.map(|ip| if owned {ip} else {crate::store::mask_host_ip(&ip)});
-        Ok(json!({"installationId":installation,"revision":r.get::<_,i64>(1)?,"state":r.get::<_,String>(2)?,"cyclePriceMinor":r.get::<_,i64>(3)?,"freeDays":r.get::<_,Option<i64>>(4)?,"trialDays":r.get::<_,i64>(5)?,"country":r.get::<_,Option<String>>(6)?,"egressIp":egress,"hardware":check["hardware"],"healthy":r.get::<_,bool>(9)?,"observedAt":r.get::<_,Option<i64>>(10)?,"owned":owned,"occupied":r.get::<_,bool>(12)?,"availableHours24":r.get::<_,i64>(13)?,"label":label,"egressDiffers":r.get::<_,bool>(15)?,"providerId":r.get::<_,Option<String>>(16)?}))
+        Ok(json!({"installationId":installation,"revision":r.get::<_,i64>(1)?,"state":r.get::<_,String>(2)?,"cyclePriceMinor":r.get::<_,i64>(3)?,"freeDays":r.get::<_,Option<i64>>(4)?,"trialDays":r.get::<_,i64>(5)?,"country":r.get::<_,Option<String>>(6)?,"egressIp":egress,"hardware":check["hardware"],"healthy":r.get::<_,bool>(9)?,"observedAt":r.get::<_,Option<i64>>(10)?,"owned":owned,"occupied":r.get::<_,bool>(12)?,"availableHours24":r.get::<_,i64>(13)?,"label":label,"clientUrl":owned.then(||s.config.tunnel_url(&label)),"lastError":if owned {r.get::<_,Option<String>>(17)?} else {None},"attempts":if owned {r.get::<_,Option<i64>>(18)?} else {None},"egressDiffers":r.get::<_,bool>(15)?,"providerId":r.get::<_,Option<String>>(16)?}))
     }).market()?.collect::<crate::db::Result<Vec<_>>>().market()?;
     Ok(Json(json!({"listings":rows})))
 }
@@ -705,6 +819,7 @@ struct SellerItem {
     cycle_price_minor: i64,
     tenant_email: Option<String>,
     expires_at: Option<i64>,
+    termination_id: Option<String>,
 }
 
 async fn seller_inventory(State(s): State<ServerState>, headers: HeaderMap) -> Reply {
@@ -718,7 +833,7 @@ async fn seller_inventory(State(s): State<ServerState>, headers: HeaderMap) -> R
 fn seller_items(conn: &Connection, seller_id: &str) -> Result<Vec<SellerItem>, AppError> {
     let mut stmt = conn.prepare(
         "SELECT r.id, r.alias, r.state, q.cycle_price_minor, r.tenant_email, r.grant_until, r.created_at,
-                CASE WHEN l.seller_id=r.seller_id AND l.state!='unlisted' THEN l.installation_id END
+                CASE WHEN l.seller_id=r.seller_id AND l.state!='unlisted' THEN l.installation_id END,(SELECT t.id FROM client_market_terminations t WHERE t.installation_id=r.id)
            FROM online_client_leases r JOIN online_client_quotes q ON q.id=r.quote_id
            JOIN online_client_listings l ON l.installation_id=r.installation_id
           WHERE r.seller_id=?1
@@ -726,7 +841,7 @@ fn seller_items(conn: &Connection, seller_id: &str) -> Result<Vec<SellerItem>, A
          SELECT l.installation_id, t.subdomain,
                 CASE WHEN l.state!='listed' THEN l.state WHEN l.occupied THEN 'occupied'
                      WHEN l.probe_healthy THEN 'available' ELSE 'offline' END,
-                l.cycle_price_minor, NULL, NULL, l.updated_at, l.installation_id
+                l.cycle_price_minor, NULL, NULL, l.updated_at, l.installation_id,NULL
            FROM online_client_supply l JOIN installation_client_tunnels t ON t.installation_id=l.installation_id
           WHERE l.seller_id=?1 AND l.state!='unlisted' AND NOT EXISTS (
                 SELECT 1 FROM online_client_leases r WHERE r.installation_id=l.installation_id AND r.released_at IS NULL)
@@ -740,8 +855,11 @@ fn seller_items(conn: &Connection, seller_id: &str) -> Result<Vec<SellerItem>, A
                 label: row.get(1)?,
                 state: row.get(2)?,
                 cycle_price_minor: row.get(3)?,
-                tenant_email: row.get(4)?,
+                tenant_email: row
+                    .get::<_, Option<String>>(4)?
+                    .map(|email| crate::store::mask_email(&email)),
                 expires_at: row.get(5)?,
+                termination_id: row.get(8)?,
             })
         })
         .market()?
@@ -750,13 +868,30 @@ fn seller_items(conn: &Connection, seller_id: &str) -> Result<Vec<SellerItem>, A
     Ok(items)
 }
 
-async fn mine(State(s): State<ServerState>, h: HeaderMap) -> Reply {
+#[derive(Deserialize)]
+struct LeaseListQuery {
+    #[serde(default)]
+    current: bool,
+    focus: Option<String>,
+}
+
+async fn mine(
+    State(s): State<ServerState>,
+    Query(query): Query<LeaseListQuery>,
+    h: HeaderMap,
+) -> Reply {
     let a = actor(&s, &h).await?;
     let c = s.store.conn.lock().await;
-    let mut stmt=c.prepare("SELECT id,installation_id,alias,state,grant_until,activated_at,cutoff_at,released_at,
-        COALESCE((SELECT json_group_array(json_object('kind',kind,'at',recorded_at)) FROM (SELECT kind,recorded_at FROM online_client_events WHERE lease_id=r.id ORDER BY id DESC LIMIT 50)),'[]')
-         ,(SELECT id FROM client_market_terminations t WHERE t.installation_id=r.id) FROM online_client_leases r WHERE buyer_id=?1 ORDER BY created_at DESC LIMIT 200").market()?;
-    let rows=stmt.query_map(params![a.user_id],|r|Ok(json!({"leaseId":r.get::<_,String>(0)?,"installationId":r.get::<_,String>(1)?,"alias":r.get::<_,String>(2)?,"state":r.get::<_,String>(3)?,"expiresAt":r.get::<_,i64>(4)?,"activatedAt":r.get::<_,Option<i64>>(5)?,"cutoffAt":r.get::<_,Option<i64>>(6)?,"releasedAt":r.get::<_,Option<i64>>(7)?,"terminationId":r.get::<_,Option<String>>(9)?,"clientUrl":s.config.tunnel_url(&r.get::<_,String>(2)?),"events":serde_json::from_str::<Value>(&r.get::<_,String>(8)?).unwrap_or_default()}))).market()?.collect::<crate::db::Result<Vec<_>>>().market()?;
+    let mut stmt=c.prepare("SELECT r.id,r.installation_id,r.alias,r.state,r.grant_until,r.activated_at,r.cutoff_at,r.released_at,
+        COALESCE((SELECT json_group_array(json_object('kind',kind,'at',recorded_at,'count',occurrences)) FROM (SELECT kind,recorded_at,occurrences FROM online_client_events WHERE lease_id=r.id ORDER BY id DESC LIMIT 50)),'[]'),
+        (SELECT id FROM client_market_terminations t WHERE t.installation_id=r.id),q.cycle_price_minor,coalesce(c.renewal_policy='automatic',q.auto_renew),l.country_code,
+        unixepoch(p.period_end),h.status,r.created_at FROM online_client_leases r JOIN online_client_quotes q ON q.id=r.quote_id
+        JOIN online_client_listings l ON l.installation_id=r.installation_id LEFT JOIN market_platform_contracts c ON c.product_kind='client_host' AND c.product_ref=r.id
+        LEFT JOIN market_platform_periods p ON p.contract_id=c.id AND p.sequence=c.current_period_sequence
+        LEFT JOIN market_wallet_holds h ON h.id=c.activation_hold_id WHERE r.buyer_id=?1
+        AND (NOT ?2 OR r.released_at IS NULL OR r.id=?3)
+        ORDER BY r.released_at IS NULL DESC,r.created_at DESC LIMIT CASE WHEN ?2 THEN -1 ELSE 200 END").market()?;
+    let rows=stmt.query_map(params![a.user_id, query.current, query.focus],|r|Ok(json!({"leaseId":r.get::<_,String>(0)?,"installationId":r.get::<_,String>(1)?,"alias":r.get::<_,String>(2)?,"state":r.get::<_,String>(3)?,"expiresAt":r.get::<_,i64>(4)?,"activatedAt":r.get::<_,Option<i64>>(5)?,"cutoffAt":r.get::<_,Option<i64>>(6)?,"releasedAt":r.get::<_,Option<i64>>(7)?,"terminationId":r.get::<_,Option<String>>(9)?,"clientUrl":s.config.tunnel_url(&r.get::<_,String>(2)?),"events":serde_json::from_str::<Value>(&r.get::<_,String>(8)?).unwrap_or_default(),"cyclePriceMinor":r.get::<_,i64>(10)?,"autoRenew":r.get::<_,bool>(11)?,"country":r.get::<_,Option<String>>(12)?,"periodEnd":r.get::<_,Option<i64>>(13)?,"holdStatus":r.get::<_,Option<String>>(14)?,"createdAt":r.get::<_,i64>(15)?}))).market()?.collect::<crate::db::Result<Vec<_>>>().market()?;
     Ok(Json(json!({"leases":rows})))
 }
 
@@ -769,9 +904,9 @@ pub(crate) fn rental_label(host: &str) -> bool {
 pub(crate) async fn alias(
     s: &ServerState,
     label: &str,
-) -> Result<Option<(String, String, String, bool)>, AppError> {
+) -> Result<Option<(String, String, String, String)>, AppError> {
     let c = s.store.conn.lock().await;
-    c.query_row("SELECT r.id,r.installation_id,t.subdomain,r.state='active' AND r.grant_until>unixepoch() AND p.lifecycle='active'
+    c.query_row("SELECT r.id,r.installation_id,t.subdomain,CASE WHEN r.state='starting' THEN 'starting' WHEN r.state='active' AND r.grant_until>unixepoch() AND p.lifecycle='active' THEN 'active' ELSE 'ended' END
         FROM online_client_leases r LEFT JOIN installation_client_tunnels t ON t.installation_id=r.installation_id
         JOIN public_hosts p ON p.label=r.alias AND p.subject_id=r.id WHERE r.alias=?1",params![label],|r|Ok((r.get(0)?,r.get(1)?,r.get::<_,Option<String>>(2)?.unwrap_or_default(),r.get(3)?))).optional().market()
 }
@@ -808,7 +943,7 @@ mod inventory_tests {
         let rows = seller_items(&conn, "seller").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].listing_id.as_deref(), Some("physical"));
-        assert_eq!(rows[0].tenant_email.as_deref(), Some("buyer@example.test"));
+        assert_eq!(rows[0].tenant_email.as_deref(), Some("b***r@example.test"));
         conn.execute(
             "UPDATE online_client_leases SET state='released',released_at=unixepoch()",
             [],

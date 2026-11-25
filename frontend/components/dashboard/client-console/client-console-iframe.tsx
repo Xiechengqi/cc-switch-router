@@ -8,7 +8,7 @@ import {
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { authFetch, readAuthState } from "@/lib/auth";
 
-export function ClientConsoleIframe({ window, paused = false }: { window: ConsoleWindow; paused?: boolean }) {
+export function ClientConsoleIframe({ window, paused = false }: { window: Pick<ConsoleWindow, "id" | "clientId" | "kind" | "url" | "title" | "reloadKey">; paused?: boolean }) {
   const { t } = useLocaleText();
   const frameRef = React.useRef<HTMLIFrameElement>(null);
   const [src, setSrc] = React.useState<string>();

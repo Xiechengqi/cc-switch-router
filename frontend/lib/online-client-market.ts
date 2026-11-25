@@ -1,4 +1,5 @@
-import { parseJson } from "@/lib/api";
+import { ApiError, parseJson } from "@/lib/api";
+import type { MessageKey } from "@/lib/i18n";
 import { authFetch } from "@/lib/auth";
 import type { MarketWalletQuoteFunding } from "@/lib/types";
 
@@ -21,6 +22,9 @@ export type OnlineListing = {
     memoryBytes: number | null;
     diskBytes: number | null;
   };
+  clientUrl: string | null;
+  lastError: string | null;
+  attempts: number | null;
   healthy: boolean;
   occupied: boolean;
   observedAt: number | null;
@@ -34,9 +38,17 @@ export type OnlineLease = {
   clientUrl: string;
   state: string;
   expiresAt: number;
-  events: { kind: string; at: number }[];
+  createdAt: number;
+  activatedAt: number | null;
+  cyclePriceMinor: number;
+  country: string | null;
+  autoRenew: boolean;
+  periodEnd: number | null;
+  holdStatus: "active" | "captured" | "released" | null;
+  events: { kind: string; at: number; count?: number }[];
 };
 export type OnlineSellerItem = {
+  terminationId: string | null;
   id: string;
   listingId: string | null;
   label: string;
@@ -59,12 +71,28 @@ export type OnlineQuote = {
   expiresAt: number;
 };
 
-export async function onlineRequest<T>(
-  path: string,
-  method = "GET",
-  body?: unknown,
-  signal?: AbortSignal,
-) {
+const workspaceErrorMessages = new Map<string, MessageKey>([
+  ["workspace_leased", "lease.locked"],
+  ["unlist_first", "lease.unlistFirst"],
+  ["owner_proof_required", "lease.ownerProof"],
+  ["tenant_session_required", "lease.tenantLogin"],
+  ["lease_ended", "lease.ended"],
+  ["lease_starting", "lease.awaiting"],
+  ["MARKET_ACCESS_REQUIRED", "clientMarket.shop.accessRequired"],
+]);
+
+export function onlineMarketError(error: unknown, t: (key: MessageKey) => string) {
+  if (error instanceof ApiError) {
+    const known = workspaceErrorMessages.get(error.code || "");
+    if (known) return t(known);
+    if (error.status === 401) return t("lease.tenantLogin");
+    if (error.status === 409) return t("lease.offerChanged");
+    if (error.status >= 500) return t("lease.controlUnavailable");
+  }
+  return error instanceof Error ? error.message : String(error);
+}
+
+export async function onlineRequest<T>(path: string, method = "GET", body?: unknown, signal?: AbortSignal) {
   const response = await authFetch(`/v1/client-market/online/${path}`, {
     method,
     cache: "no-store",

@@ -71,10 +71,12 @@ try {
     // Finance authority comes from server capabilities, not the general admin flag.
     if (path === "/v1/auth/session/me") return json(route, { authenticated: !!actor, isAdmin: false, user: actor ? { id: actor, email: `${actor}@example.test` } : null, password: { hasPassword: true, version: 1 } });
     if (path === "/v1/client-market/online/leases") return json(route,{leases:[]});
+    if (path === "/v1/client-market/online/seller-inventory") return json(route,{items:hostPresent && actor==="provider" ?
+      [{id:"current-lease",listingId:record.hostId,label:"Online rental fixture",state:"active",cyclePriceMinor:100,tenantEmail:"n***t@example.test",expiresAt:null,terminationId:null}]:[]});
     if (path === "/v1/client-market/online/listings") return json(route,{listings:hostPresent ? [{
       installationId:record.hostId, providerId:"provider", label:"Online rental fixture", revision:1,state:"listed",owned:actor === "provider",
       cyclePriceMinor:100,freeDays:null,trialDays:0,country:"JP",egressIp:null,egressDiffers:false,
-      healthy:true,occupied:true,observedAt:Math.floor(Date.now()/1000),availableHours24:24,
+      healthy:true,occupied:actor==="provider",observedAt:Math.floor(Date.now()/1000),availableHours24:24,
     }] : []});
     if (path === "/v1/client-market/me/rentals") return json(route, emptyClientRentalsPage(url));
     if (path.startsWith("/v1/client-market/termination-workspace")) {
@@ -132,7 +134,7 @@ try {
   const rowAction = () => page.getByRole("button", { name: actor === "owner" ? "Decide termination" : "Handle termination", exact: true });
   const open = async () => { await rowAction().click(); await loaded(dialog()); };
   const close = async () => { await dialog().getByRole("button", { name: "Close", exact: true }).click(); await dialog().waitFor({ state: "hidden" }); };
-  const goto = () => page.goto(`${base}/client-market/`);
+  const goto = () => page.goto(`${base}/client-market/?${actor==="provider" ? "view=selling":"country=JP"}`);
   const switchActor = async next => { actor = next; await page.evaluate(() => window.dispatchEvent(new Event("router-auth-changed"))); };
   if (process.env.TERMINATION_SCREENSHOTS === "1") await mkdir("/tmp/client-termination-review", { recursive: true });
 
@@ -162,6 +164,7 @@ try {
   assert.ok(writes.at(-1).path.endsWith("/waive"));
   await close();
   await switchActor("owner");
+  await goto();
   await open();
   await dialog().getByRole("button", { name: "Decide responsibility", exact: true }).click();
   await dialog().getByLabel("Decision explanation (required)", { exact: true }).fill("Evidence reviewed; all compensation waived.");
@@ -261,7 +264,7 @@ try {
   assert.equal(await dialog().getByRole("button", { name: "Reduce / waive compensation", exact: true }).count(), 0); await close();
   workspaceFailure = true; await goto();
   await page.getByRole("alert").filter({ hasText: "Termination tasks could not be loaded" }).waitFor();
-  workspaceFailure = false; await page.getByRole("button", { name: "Reload", exact: true }).click();
+  workspaceFailure = false; await page.getByRole("alert").filter({hasText:"Termination tasks could not be loaded"}).locator("..").getByRole("button", { name: "Reload", exact: true }).click();
   await page.getByRole("alert").filter({ hasText: "Termination tasks could not be loaded" }).waitFor({ state: "hidden" });
   assert.equal(await rowAction().count(), 0);
 
@@ -284,7 +287,7 @@ try {
   }
 
   // A late private read must not re-open a case after account replacement.
-  record = initial(); actor = "provider"; await page.goto(`${base}/client-market/?testLocale=en`);
+  record = initial(); actor = "provider"; await goto();
   holdDetail = true; await rowAction().click();
   await page.waitForFunction(() => !!document.querySelector('[role="dialog"]'));
   await switchActor("stranger");

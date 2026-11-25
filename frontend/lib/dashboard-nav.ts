@@ -232,8 +232,10 @@ export function clientMarketMineHref(targetId?: string) {
 }
 
 /** Listing starts on the verified owner’s online Client card. */
-export function clientMarketAddHostHref() {
-  return buildDashboardHref(DASHBOARD_CLIENTS_PATH, new URLSearchParams({ tab: "mine" }));
+export function clientMarketAddHostHref(installationId?:string) {
+  const params = new URLSearchParams({view:"selling",add:"1"});
+  if (installationId) params.set("installation",installationId);
+  return buildDashboardHref(DASHBOARD_CLIENT_MARKET_PATH,params);
 }
 
 /** The public ranking with one Provider's detail open. */

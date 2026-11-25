@@ -128,7 +128,7 @@ try {
   await panel().getByText("53 matching records · page 1 / 11", { exact: true }).waitFor();
   const selectFilter = async (label, option, within = panel()) => {
     await within.getByRole("button", { name: new RegExp(label) }).click();
-    await page.getByRole("option", { name: option, exact: true }).click();
+    await page.getByRole("dialog", {name:label,exact:true}).getByRole("option", { name: option, exact: true }).click();
   };
   await selectFilter("Rental status", "Paid service");
   assert.equal(await rows().count(), 5, "selecting a draft filter must not submit the form");
@@ -180,7 +180,7 @@ try {
 
   auditFailure = true; await panel().getByRole("button", { name: "Refresh audit", exact: true }).click();
   await panel().getByRole("alert").waitFor();
-  await page.getByRole("combobox", {name:"Egress region",exact:true}).waitFor();
+  await page.getByRole("listbox", {name:"Continent",exact:true}).waitFor();
   assert.equal(await page.getByRole("button",{name:"Add host",exact:true}).count(),0);
   auditFailure = false; await panel().getByRole("button", { name: "Refresh audit", exact: true }).click();
   await panel().getByRole("alert").waitFor({ state: "hidden" });
@@ -198,7 +198,7 @@ try {
   });
   await switchActor("buyer"); await panel().waitFor({ state: "hidden" }); await detail().waitFor({ state: "hidden" });
   releaseDetail?.(); holdDetail = false;
-  await switchActor("admin"); await page.getByRole("combobox", { name: "Egress region", exact: true }).waitFor();
+  await switchActor("admin"); await page.getByRole("listbox", { name: "Continent", exact: true }).waitFor();
   assert.equal(await panel().count(), 0);
   await switchActor(""); await goto(undefined, false); assert.equal(await panel().count(), 0);
   await switchActor("owner"); await openAudit(); await panel().getByText("53 matching records · page 1 / 11", { exact: true }).waitFor();

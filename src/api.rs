@@ -837,6 +837,7 @@ fn source_ip_from_request(req: &Request) -> Option<std::net::IpAddr> {
 
 fn private_control_plane_path(path: &str) -> bool {
     path.starts_with("/v1/admin/")
+        || (path.starts_with("/v1/client-market/online/leases/") && path.ends_with("/backup"))
         || path.starts_with("/v1/auth/")
         || path == "/v1/market-wallet"
         || path.starts_with("/v1/market-wallet/")
@@ -3925,6 +3926,31 @@ async fn root_handler(
     if crate::online_client_market::rental_label(&host)
         && crate::proxy::subdomain_for_host(&host, &state.config.tunnel_domain).is_some()
     {
+        let embedded = req.uri().query().is_some_and(|q| {
+            url::form_urlencoded::parse(q.as_bytes()).any(|(k, v)| k == "embed" && v == "1")
+        });
+        let terminal = req.uri().query().is_some_and(|q| {
+            url::form_urlencoded::parse(q.as_bytes()).any(|(k, v)| k == "view" && v == "terminal")
+        });
+        if req.method() == Method::GET && !embedded && !terminal {
+            let label = host.split('.').next().unwrap_or_default();
+            match crate::online_client_market::alias(&state, label).await {
+                Ok(Some((lease, _, _, status))) => {
+                    let path = if status == "active" {
+                        format!("/client-market/leases/{lease}/open")
+                    } else {
+                        format!("/client-market/?view=rentals&focus={lease}")
+                    };
+                    return axum::response::Redirect::to(&format!(
+                        "{}{path}",
+                        state.config.web_origin()
+                    ))
+                    .into_response();
+                }
+                Ok(None) => {}
+                Err(e) => return e.into_response(),
+            }
+        }
         return proxy_handler(State(state), ConnectInfo(peer), req).await;
     }
     if let Some(route) = state

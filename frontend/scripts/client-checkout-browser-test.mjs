@@ -48,6 +48,7 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
     });
     let available = "0";
     let quoteRequests = 0;
+    let ttl = 120;
     let rejectNextQuote = false;
     let loseNextReply = false;
     const commits = [];
@@ -107,10 +108,27 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
         assert.equal(input.revision,listing.revision);
         quoteRequests++;
         const required = BigInt(listing.cyclePriceMinor) * 86400n;
-        body = {id: "quote-" + quoteRequests, expiresAt: Math.floor(Date.now()/1000)+120,
-          terms:{cyclePriceMinor:listing.cyclePriceMinor, freeDays:listing.freeDays, trialSeconds:listing.trialDays ? 498 : 0, autoRenew:input.autoRenew, terminationPolicy:{version:1,rateBps:1000}},
-          walletFunding:listing.cyclePriceMinor ? {assetCode:"USD",availableUnits:available,heldUnits:"0",committedUnits:"0",requiredUnits:required.toString(),
-            shortfallUnits:(required>BigInt(available)?required-BigInt(available):0n).toString()} : null};
+        body = {
+          id: "quote-" + quoteRequests,
+          expiresAt: Math.floor(Date.now() / 1000) + ttl,
+          terms: {
+            cyclePriceMinor: listing.cyclePriceMinor,
+            freeDays: listing.freeDays,
+            trialSeconds: listing.trialDays ? 498 : 0,
+            autoRenew: input.autoRenew,
+            terminationPolicy: { version: 1, rateBps: 1000 },
+          },
+          walletFunding: listing.cyclePriceMinor
+            ? {
+                assetCode: "USD",
+                availableUnits: available,
+                heldUnits: "0",
+                committedUnits: "0",
+                requiredUnits: required.toString(),
+                shortfallUnits: (required > BigInt(available) ? required - BigInt(available) : 0n).toString(),
+              }
+            : null,
+        };
       } else if (path.startsWith("/v1/client-market/online/quotes/") && path.endsWith("/commit")) {
         commits.push({path,input:req.postDataJSON()});
         if (rejectNextQuote) {
@@ -119,8 +137,19 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
         }
         if (!receipts.has(path)) {
           const id="lease-" + leases.length;
-          leases.push({leaseId:id, installationId:listing.installationId,alias:"rent-" + id,state:"active",expiresAt:Math.floor(Date.now()/1000)+86400,
-            clientUrl:"https://rental.example.test",events:[],terminationId:null});
+          leases.push({
+            leaseId: id,
+            installationId: listing.installationId,
+            alias: "rent-" + id,
+            state: "active",
+            expiresAt: Math.floor(Date.now() / 1000) + 86400,
+            clientUrl: "https://rental.example.test",
+            activatedAt: Math.floor(Date.now() / 1000),
+            createdAt: Math.floor(Date.now() / 1000),
+            cyclePriceMinor: listing.cyclePriceMinor,
+            events: [],
+            terminationId: null,
+          });
           receipts.set(path,{leaseId:id,state:"starting"});
         }
         if (loseNextReply) {
@@ -138,10 +167,12 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
           version: 1,
           canTopup: true,
         };
-      else if (path === "/v1/regions") body = [];
+      else if (path === "/v1/market-wallet/topups") body = { items: [], nextCursor: null };
+      else if (path === "/v1/market-wallet/channels" || path === "/v1/regions") body = [];
       else if (path.includes("inbox-summary")) body = { pendingRequests: 0 };
       else if (path.includes("rooms")) body = { rooms: [], totalUnread: 0 };
-      else if (path === "/v1/announcement") body = { enabled: false, revision: "1", contentEn: "", contentZhCn: "" };
+      else if (path === "/v1/announcement")
+        body = { enabled: false, revision: "1", contentEn: "", contentZhCn: "" };
       else if (path.includes("config")) body = {};
       await route.fulfill({
         status: 200,
@@ -150,63 +181,83 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
       });
     });
     await installFinancialBrowserIdentity(page);
-    await page.goto(baseUrl + "/client-market/?testLocale=en");
-    const supply = page.getByRole("article").filter({has:page.getByRole("heading",{name:listing.label})});
-    await supply.getByText("192.0.2.10").waitFor();
-    await supply.getByText(/2 vCPU/).waitFor();
-    for (const width of [320,375,768,1440]) {
-      await page.setViewportSize({width,height:900});
-      if (captureScreenshots) await page.screenshot({ path: `${artifacts}/online-supply-${width}.png` });
-      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth>innerWidth),false,`listing overflow at ${width}`);
+    await page.goto(baseUrl + "/client-market/?testLocale=en&country=JP");
+    const supply = page.locator("#market-client-online-client");
+    await supply.getByText(/192.0.2.10/).waitFor();
+    await supply.getByText(/2C/).waitFor();
+    for (const width of [320, 375, 768, 1440]) {
+      await page.setViewportSize({ width, height: 900 });
+      if (captureScreenshots) await page.screenshot({ path: artifacts + "/online-supply-" + width + ".png" });
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
     }
-    await supply.getByRole("button",{name:"Rent Client"}).click();
+    await supply.getByRole("button", { name: /Continue/ }).click();
     const checkout = page.getByRole("dialog");
-    const getQuote = checkout.getByRole("button",{name:"Get quote"});
-    assert.equal(await getQuote.isEnabled(),false);
-    await checkout.getByRole("checkbox",{name:/root access/}).check();
-    await getQuote.click();
-    await checkout.getByText(/compensation is 10%/).waitFor();
     await checkout.getByText(/8 min 18 sec/).waitFor();
     await checkout.getByText(/Add .* to continue/).waitFor();
-    assert.equal(await checkout.getByRole("link",{name:"Platform wallet"}).getAttribute("href"),"/account/wallet/");
-    assert.equal(commits.length,0);
-    available="86400000";
-    await checkout.getByRole("button",{name:/Reload|Refresh/i}).click();
-    const confirm=checkout.getByRole("button",{name:"Confirm rental"});
-    rejectNextQuote=true;
+    assert.equal(await checkout.getByRole("link", { name: "Platform wallet" }).count(), 0);
+    const renewal = checkout.getByRole("checkbox", { name: /renew/i });
+    await Promise.all([
+      page.waitForResponse(
+        (r) => r.url().endsWith("/quote") && r.request().postDataJSON().autoRenew === true,
+      ),
+      renewal.check(),
+    ]);
+    assert.equal(commits.length, 0);
+    available = "86400000";
+    await page.evaluate(() =>
+      window.dispatchEvent(new CustomEvent("router-market-balance-changed", { detail: "buyer" })),
+    );
+    const confirm = checkout.getByRole("button", { name: "Confirm rental" });
+    const ack = checkout.getByRole("checkbox", { name: /root access/ });
+    await ack.check();
+    rejectNextQuote = true;
     await confirm.click();
-    await checkout.getByText("Client trial allowance changed; request a new quote").waitFor();
+    await checkout.getByText(/quote has been updated/i).waitFor();
+    assert.equal(await ack.isChecked(), false);
     assert.equal(leases.length, 0);
-    await getQuote.click();
-    loseNextReply=true;
+    await ack.check();
+    loseNextReply = true;
     await confirm.click();
-    await checkout.getByText("Retry this quote").waitFor();
-    await page.clock.setFixedTime(new Date(Date.now() + 180_000));
-    await confirm.click();
-    await checkout.waitFor({state:"hidden"});
-    await page.getByText("rent-lease-0",{exact:true}).waitFor();
-    assert.equal(quoteRequests,3);
-    assert.equal(leases.length,1);
-    assert.deepEqual(commits,["quote-2","quote-3","quote-3"].map(id => ({
-      path:`/v1/client-market/online/quotes/${id}/commit`,
-      input:{acknowledged:true},
-    })));
-    await page.clock.setFixedTime(new Date());
-    for (const id of [listing.installationId, "lease-0"]) {
-      await page.goto(baseUrl + "/client-market/?focus=" + encodeURIComponent(id) + "&testLocale=en");
-      await page.waitForFunction(target => document.activeElement?.id === "market-client-" + target, id);
+    await checkout.getByText(/order receipt has not arrived/i).waitFor();
+    await page.clock.setFixedTime(new Date(Date.now() + 180000));
+    await page.reload();
+    await page
+      .getByRole("status")
+      .filter({ hasText: /order receipt has not arrived/i })
+      .getByRole("button", { name: /Retry/i })
+      .click();
+    try {
+      await page.locator("#market-client-lease-0").waitFor();
+    } catch (cause) {
+      console.error({
+        url: page.url(),
+        commits,
+        errors,
+        text: (await page.locator("main").allTextContents()).join(" ").slice(-1600),
+      });
+      throw cause;
     }
-    listing.cyclePriceMinor=0; listing.trialDays=0; listing.freeDays=7;
-    await page.goto(baseUrl + "/client-market/?testLocale=zh-CN");
-    await supply.getByRole("button",{name:"租用 Client"}).click();
-    await checkout.getByRole("checkbox",{name:/root/}).check();
-    await checkout.getByRole("button",{name:"获取报价"}).click();
-    assert.equal(await checkout.getByRole("checkbox").count(),1);
-    await checkout.getByRole("button",{name:"确认租用"}).click();
-    await checkout.waitFor({state:"hidden"});
-    assert.equal(retiredMoneyRequests,0);
-    console.log("Online Client health, bilingual checkout, funding, requoting after a conflict and replay after expiry passed");
-
+    assert.equal(leases.length, 1);
+    assert.equal(commits.at(-1).path, commits.at(-2).path);
+    assert.notEqual(commits.at(-1).path, commits[0].path);
+    assert.equal(new URL(page.url()).searchParams.get("focus"), "lease-0");
+    await page.clock.setFixedTime(new Date());
+    listing.cyclePriceMinor = 0;
+    listing.trialDays = 0;
+    listing.freeDays = 7;
+    ttl = 2;
+    await page.goto(baseUrl + "/client-market/?testLocale=zh-CN&country=JP");
+    await supply.getByRole("button", { name: /继续/ }).click();
+    assert.equal(await checkout.getByRole("checkbox").count(), 1);
+    ttl = 120;
+    await checkout.getByText(/报价已更新/).waitFor();
+    await checkout.getByRole("checkbox", { name: /root/ }).check();
+    await checkout.getByRole("button", { name: "确认租用" }).click();
+    await checkout.waitFor({ state: "hidden" });
+    assert.equal(retiredMoneyRequests, 0);
+    console.log(
+      "PASS checkout in both languages, renewal terms, in-place funding, expiry, retry and receipt focus",
+    );
     assert.deepEqual(errors, []);
     console.log("free checkout passed; no browser exceptions");
     console.log(captureScreenshots ? `Screenshots: ${artifacts}` : "DOM and interaction checks only; no screenshots");

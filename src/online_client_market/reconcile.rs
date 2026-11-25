@@ -177,8 +177,7 @@ fn take_work(c: &Connection, id: &str) -> Result<(i64, Option<Pending>, Value), 
     if p.is_some() {
         c.execute("UPDATE online_client_operations SET next_attempt=unixepoch()+min(120,5*(attempts+1)),attempts=attempts+1 WHERE installation_id=?1",params![id]).market()?;
     }
-    let mut ack=c.query_row("SELECT r.id,COALESCE((SELECT json_group_array(event_key) FROM (SELECT event_key FROM online_client_events WHERE lease_id=r.id ORDER BY id DESC LIMIT 1024)),'[]')
-        FROM online_client_leases r WHERE installation_id=?1 AND released_at IS NULL",params![id],|r|Ok(json!({"leaseId":r.get::<_,String>(0)?,"received":serde_json::from_str::<Value>(&r.get::<_,String>(1)?).unwrap_or_default()}))).optional().market()?.unwrap_or_else(||json!({}));
+    let mut ack=c.query_row("SELECT r.id,r.receipt_ack_json FROM online_client_leases r WHERE installation_id=?1 AND released_at IS NULL",params![id],|r|Ok(json!({"leaseId":r.get::<_,String>(0)?,"received":serde_json::from_str::<Value>(&r.get::<_,String>(1)?).unwrap_or_default()}))).optional().market()?.unwrap_or_else(||json!({}));
     let refresh_hardware:bool=c.query_row("SELECT coalesce(hardware_at,0)<=unixepoch()-3600 FROM online_client_listings WHERE installation_id=?1",params![id],|r|r.get(0)).market()?;
     if refresh_hardware {
         ack["hardware"] = json!(true);
@@ -189,18 +188,25 @@ fn record(c: &Connection, lease: &Rental, events: &[AccessEvent]) -> Result<(), 
     for e in events.iter().take(1024) {
         if e.id.len() != 32
             || !e.id.bytes().all(|b| b.is_ascii_hexdigit())
+            || e.occurrences == Some(0)
             || !matches!(
                 e.kind.as_str(),
-                "assistance" | "terminal" | "restart" | "upgrade" | "rollback"
+                "assistance" | "terminal" | "restart" | "upgrade" | "rollback" | "host_settings"
             )
         {
             return Err(conflict("invalid workspace access receipt"));
         }
-        c.execute("INSERT OR IGNORE INTO online_client_events(lease_id,event_key,kind,recorded_at) VALUES(?1,?2,?3,?4)",params![lease.id,e.id,e.kind,e.at]).market()?;
+        c.execute("INSERT OR IGNORE INTO online_client_events(lease_id,event_key,kind,recorded_at,occurrences) VALUES(?1,?2,?3,?4,?5)",params![lease.id,e.id,e.kind,e.at,e.occurrences.unwrap_or(1)]).market()?;
         c.execute("INSERT OR IGNORE INTO user_notification_events(id,scope,recipient_email,category,event_kind,object_kind,object_id,payload_json,created_at_ms)
             VALUES(?1,'user',?2,'client','client_workspace_access','client',?3,?4,?5)",
-            params![format!("lease:{}:{}",lease.id,e.id),lease.email,lease.id,json!({"clientLabel":lease.alias,"action":e.kind}).to_string(),e.at.saturating_mul(1000)]).market()?;
+            params![format!("lease:{}:{}",lease.id,e.id),lease.email,lease.id,json!({"clientLabel":lease.alias,"action":e.kind,"count":e.occurrences.unwrap_or(1)}).to_string(),e.at.saturating_mul(1000)]).market()?;
     }
+    let received: Vec<_> = events.iter().take(1024).map(|event| &event.id).collect();
+    c.execute(
+        "UPDATE online_client_leases SET receipt_ack_json=?2 WHERE id=?1",
+        params![lease.id, json!(received).to_string()],
+    )
+    .market()?;
     Ok(())
 }
 fn activate(c: &Connection, id: &str, l: &Rental, now: i64) -> Result<(), AppError> {
@@ -248,6 +254,8 @@ fn activate(c: &Connection, id: &str, l: &Rental, now: i64) -> Result<(), AppErr
     }
     c.execute("UPDATE online_client_leases SET state='active',activated_at=?2 WHERE id=?1 AND state='starting'",params![l.id,now]).market()?;
     c.execute("UPDATE public_hosts SET lifecycle='active',revision=revision+1,updated_at=?2 WHERE subject_id=?1 AND kind='client' AND lifecycle='disabled'",params![l.id,at]).market()?;
+    c.execute("INSERT OR IGNORE INTO user_notification_events(id,scope,recipient_email,category,event_kind,object_kind,object_id,payload_json,created_at_ms)
+        VALUES(?1,'user',?2,'client','client_workspace_ready','client_lease',?3,?4,?5)",params![format!("lease:{}:ready",l.id),l.email,l.id,json!({"clientLabel":l.alias}).to_string(),now*1000]).market()?;
     Ok(())
 }
 fn release(c: &Connection, l: &Rental, now: i64) -> Result<(), AppError> {
@@ -444,6 +452,11 @@ async fn probe(s: &ServerState, id: String) -> Result<(), AppError> {
     };
     // Always reconcile the recorded intent against local durable state first. A
     // lost reply or reboot never turns into another charge or a new operation.
+    let online = s
+        .proxy
+        .active_client_route_for_installation(&id)
+        .await
+        .is_some();
     let mut st = rpc(s, &id, "/_ctl/market/status", ack).await;
     if let (Ok(current), Some(p)) = (&st, &p) {
         if current.sequence < p.seq && !current.switching {
@@ -473,10 +486,29 @@ async fn probe(s: &ServerState, id: String) -> Result<(), AppError> {
         return Ok(());
     }
     let now = stamp();
-    let applied = match st {
-        Ok(ref status) => apply_status(&tx, &id, seq, status, now)?,
-        Err(_) => false,
+    tx.execute_batch("SAVEPOINT online_probe_result").market()?;
+    let (applied, reason) = match st {
+        Ok(ref status) => match apply_status(&tx, &id, seq, status, now) {
+            Ok(true) => (true, None),
+            Ok(false) if status.switching => (false, Some("switching")),
+            Ok(false) => (false, Some("awaiting_receipt")),
+            Err(AppError::Conflict(_)) => {
+                tx.execute_batch("ROLLBACK TO online_probe_result")
+                    .market()?;
+                (false, Some("status_mismatch"))
+            }
+            Err(e) => return Err(e),
+        },
+        Err(_) if !online => (false, Some("tunnel_offline")),
+        Err(_) => (false, Some("control_unavailable")),
     };
+    tx.execute_batch("RELEASE online_probe_result").market()?;
+    tx.execute(
+        "UPDATE online_client_listings SET probe_error=?2 WHERE installation_id=?1 AND sequence=?3",
+        params![id, reason, seq],
+    )
+    .market()?;
+    tx.execute("UPDATE online_client_operations SET last_error=?2 WHERE installation_id=?1 AND sequence=?3",params![id,reason,seq]).market()?;
     sample(&tx, &id, applied, now)?;
     tx.commit().market()
 }
@@ -730,6 +762,7 @@ mod tests {
         assert!(allow_traffic(&tx, "physical", "alpha-share").unwrap());
         assert!(check_nonce(&tx, "physical", "share_sync", "stale-owner").is_err());
         first.events.push(AccessEvent {
+            occurrences: Some(3),
             id: "1".repeat(32),
             kind: "assistance".into(),
             at: now,
@@ -737,8 +770,20 @@ mod tests {
         for _ in 0..2 {
             assert!(apply_status(&tx, "physical", 2, &first, now).unwrap());
         }
+        let (_, _, ack) = take_work(&tx, "physical").unwrap();
+        assert_eq!(ack["received"], json!(["1".repeat(32)]));
+        assert_eq!(ack["leaseId"], rental.id);
         assert_eq!(
-            tx.query_row("SELECT count(*) FROM user_notification_events", [], |r| r
+            tx.query_row(
+                "SELECT sum(occurrences) FROM online_client_events WHERE lease_id=?1",
+                params![rental.id],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            3
+        );
+        assert_eq!(
+            tx.query_row("SELECT count(*) FROM user_notification_events WHERE event_kind='client_workspace_access'", [], |r| r
                 .get::<_, i64>(
                 0
             ))
@@ -753,6 +798,7 @@ mod tests {
         assert!(!allow_traffic(&tx, "physical", "alpha-share").unwrap());
         first.sequence = 3;
         first.fenced = true;
+        assert_eq!(tx.query_row("SELECT count(*) FROM user_notification_events WHERE event_kind='client_workspace_ready'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
         first.events.clear();
         first.cleanup_safe = false;
         assert!(!apply_status(&tx, "physical", 3, &first, now + 2).unwrap());

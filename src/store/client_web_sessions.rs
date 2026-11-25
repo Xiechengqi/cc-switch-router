@@ -7,7 +7,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
 };
 
 pub(crate) const WINDOW_HEADER: &str = "x-cc-switch-client-web-session";
@@ -68,6 +68,13 @@ struct ExchangeRequest {
 pub(crate) fn router() -> Router<crate::ServerState> {
     Router::new()
         .route("/v1/auth/client-web-tickets", post(issue_ticket))
+        .route("/client-market/leases/:id/open", get(lease_open))
+        .route(
+            "/v1/client-market/online/leases/:id/backup",
+            post(export_workspace),
+        )
+        .route("/web-api/auth/router-launch", post(launch))
+        .route("/web-api/auth/router-renew", post(renew))
         .route("/web-api/auth/router-exchange", post(exchange_ticket))
         .route("/web-api/auth/router-logout", post(logout))
 }
@@ -217,6 +224,116 @@ impl AppStore {
     }
 }
 
+async fn window_grant(
+    state: &crate::ServerState,
+    actor: AuthSession,
+    id: String,
+    kind: &str,
+    nonce: String,
+) -> Result<WindowGrant, AppError> {
+    let ClientWindowTarget {
+        buyer_id,
+        subdomain,
+        owner,
+        revision,
+
+        binding_epoch,
+    } = state.store.client_window_target(&id).await?;
+    let delegate = actor.email.eq_ignore_ascii_case(&owner)
+        && buyer_id.as_deref().is_none_or(|id| id == actor.user_id);
+    if !delegate || (kind == "terminal" && buyer_id.is_some()) {
+        return Err(AppError::Forbidden("Client owner login required".into()));
+    }
+    let terminal = buyer_id.is_none();
+    let grant = WindowGrant {
+        session_id: actor.session_id,
+        installation_id: id,
+        subdomain,
+        owner,
+        revision,
+        binding_epoch,
+        user_id: actor.user_id,
+        delegate,
+        terminal,
+        nonce,
+        expires_at: Utc::now() + Duration::seconds(60),
+    };
+    state.store.validate_window(&grant).await?;
+    Ok(grant)
+}
+
+async fn export_workspace(
+    State(state): State<crate::ServerState>,
+    peer: axum::extract::ConnectInfo<std::net::SocketAddr>,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let actor = crate::api::resolve_router_session(&state, &headers)
+        .await?
+        .ok_or_else(|| AppError::Unauthorized("login required".into()))?;
+    let grant = window_grant(
+        &state,
+        actor,
+        id.to_string(),
+        "console",
+        Uuid::new_v4().to_string(),
+    )
+    .await?;
+    if grant.terminal {
+        return Err(AppError::Forbidden("current lease required".into()));
+    }
+    let target = url::Url::parse(&state.config.tunnel_url(&grant.subdomain))
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let token = generate_secret(48);
+    let key = hash_token(&token);
+    let request = axum::http::Request::post("/web-api/market/backups")
+        .header(
+            header::HOST,
+            &target[url::Position::BeforeHost..url::Position::AfterPort],
+        )
+        .header(WINDOW_HEADER, token)
+        .body(Body::empty())
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    {
+        let mut windows = state.store.client_web_sessions.lock().await;
+        windows.prune();
+        if windows.sessions.len() >= MAX_SESSIONS {
+            return Err(AppError::TooManyRequests("too many Client windows".into()));
+        }
+        windows.sessions.insert(key.clone(), grant.clone());
+    }
+    let response = crate::proxy::proxy_handler(State(state.clone()), peer, request).await;
+    state
+        .store
+        .client_web_sessions
+        .lock()
+        .await
+        .sessions
+        .remove(&key);
+    state.store.validate_window(&grant).await?;
+    if response.status() != StatusCode::OK
+        || response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            != Some("application/zip")
+    {
+        return Err(AppError::ServiceUnavailable(
+            "Workspace backup unavailable".into(),
+        ));
+    }
+    Ok(Response::builder()
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=workspace-{id}.zip"),
+        )
+        .header(header::CACHE_CONTROL, "private, no-store")
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(header::CONTENT_TYPE, "application/zip")
+        .body(response.into_body())
+        .map_err(|e| AppError::Internal(e.to_string()))?)
+}
+
 async fn issue_ticket(
     State(state): State<crate::ServerState>,
     headers: HeaderMap,
@@ -230,37 +347,14 @@ async fn issue_ticket(
     {
         return Err(AppError::BadRequest("invalid Client login request".into()));
     }
-    let ClientWindowTarget {
-        buyer_id,
-        subdomain,
-        owner,
-        revision,
-
-        binding_epoch,
-    } = state
-        .store
-        .client_window_target(&input.installation_id)
-        .await?;
-    let delegate = actor.email.eq_ignore_ascii_case(&owner)
-        && buyer_id.as_deref().is_none_or(|id| id == actor.user_id);
-    if !delegate || (input.kind == "terminal" && buyer_id.is_some()) {
-        return Err(AppError::Forbidden("Client owner login required".into()));
-    }
-    let terminal = buyer_id.is_none();
-    let grant = WindowGrant {
-        session_id: actor.session_id,
-        installation_id: input.installation_id,
-        subdomain,
-        owner,
-        revision,
-        binding_epoch,
-        user_id: actor.user_id,
-        delegate,
-        terminal,
-        nonce: input.nonce,
-        expires_at: Utc::now() + Duration::seconds(60),
-    };
-    state.store.validate_window(&grant).await?;
+    let grant = window_grant(
+        &state,
+        actor,
+        input.installation_id,
+        &input.kind,
+        input.nonce,
+    )
+    .await?;
     let origin = origin_for(&state.config, &grant.subdomain)?;
     let mut windows = state.store.client_web_sessions.lock().await;
     windows.prune();
@@ -326,6 +420,136 @@ async fn exchange_ticket(
         Json(serde_json::json!({"token":token,"expiresAt":expires_at})),
     )
         .into_response())
+}
+
+async fn lease_open(
+    State(state): State<crate::ServerState>,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+) -> axum::response::Redirect {
+    axum::response::Redirect::to(&format!(
+        "{}/client-market/?openLease={id}",
+        state.config.web_origin()
+    ))
+}
+
+// The cross-origin form is accepted only from the Router's own origin. The
+// credential never reaches the Client backend. Its same-origin UI redeems it.
+async fn launch(
+    State(state): State<crate::ServerState>,
+    peer: axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    axum::Form(input): axum::Form<ExchangeRequest>,
+) -> Result<Response, AppError> {
+    if headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) != Some(&state.config.web_origin())
+        || input.ticket.len() != 48
+        || !input.ticket.bytes().all(|v| v.is_ascii_alphanumeric())
+        || Uuid::parse_str(&input.nonce).is_err()
+    {
+        return Err(AppError::Forbidden("invalid workspace handoff".into()));
+    }
+    let grant = state
+        .store
+        .client_web_sessions
+        .lock()
+        .await
+        .tickets
+        .get(&hash_token(&input.ticket))
+        .cloned()
+        .ok_or_else(|| AppError::Unauthorized("workspace ticket expired".into()))?;
+    if grant.terminal
+        || !grant.binding_epoch.starts_with("lease:")
+        || grant.nonce != input.nonce
+        || !host_matches(&state.config, &headers, &grant.subdomain)
+    {
+        return Err(AppError::Forbidden("workspace target changed".into()));
+    }
+    state.store.validate_window(&grant).await?;
+    let request = axum::http::Request::builder()
+        .uri("/")
+        .header(header::HOST, headers.get(header::HOST).unwrap())
+        .header(header::ACCEPT_ENCODING, "identity")
+        .body(Body::empty())
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let page = crate::proxy::proxy_handler(State(state.clone()), peer, request).await;
+    if !page.status().is_success() {
+        return Ok(page);
+    }
+    let bytes = axum::body::to_bytes(page.into_body(), 2 * 1024 * 1024)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let page = std::str::from_utf8(&bytes).map_err(|e| AppError::Internal(e.to_string()))?;
+    if !page.contains("cc-workspace-launch-v1") {
+        return Ok(axum::response::Redirect::to(&format!(
+            "{}/client-market/?embeddedLease={}",
+            state.config.web_origin(),
+            grant.installation_id
+        ))
+        .into_response());
+    }
+    let launch = format!(
+        r#"<head><base href="/"><meta name="cc-lease-ticket" content="{}"><meta name="cc-lease-nonce" content="{}">"#,
+        input.ticket, grant.nonce
+    );
+    Ok((
+        [
+            (header::CACHE_CONTROL, "private, no-store"),
+            (header::REFERRER_POLICY, "no-referrer"),
+        ],
+        axum::response::Html(page.replacen("<head>", &launch, 1)),
+    )
+        .into_response())
+}
+
+async fn renew(
+    State(state): State<crate::ServerState>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let (next, expires) = rotate_lease_window(&state.store, &state.config, &headers).await?;
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::json!({"token":next,"expiresAt":expires})),
+    )
+        .into_response())
+}
+
+async fn rotate_lease_window(
+    store: &AppStore,
+    config: &Config,
+    headers: &HeaderMap,
+) -> Result<(String, DateTime<Utc>), AppError> {
+    let token = headers
+        .get(WINDOW_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .filter(|t| t.len() <= 256)
+        .ok_or_else(|| AppError::Unauthorized("workspace login required".into()))?;
+    let key = hash_token(token);
+    let mut grant = store
+        .client_web_sessions
+        .lock()
+        .await
+        .sessions
+        .get(&key)
+        .cloned()
+        .ok_or_else(|| AppError::Unauthorized("workspace session expired".into()))?;
+    if grant.terminal
+        || !grant.binding_epoch.starts_with("lease:")
+        || !host_matches(config, headers, &grant.subdomain)
+        || headers.get(header::ORIGIN).and_then(|v| v.to_str().ok())
+            != Some(origin_for(config, &grant.subdomain)?.as_str())
+    {
+        return Err(AppError::Forbidden("workspace target changed".into()));
+    }
+    let actor = store.validate_window(&grant).await?;
+    let mut windows = store.client_web_sessions.lock().await;
+    windows.prune();
+    if windows.sessions.remove(&key).is_none() {
+        return Err(AppError::Unauthorized("workspace session expired".into()));
+    }
+    let expires = std::cmp::min(actor.access_expires_at, Utc::now() + Duration::minutes(10));
+    grant.expires_at = expires;
+    let next = generate_secret(48);
+    windows.sessions.insert(hash_token(&next), grant);
+    Ok((next, expires))
 }
 
 async fn logout(State(state): State<crate::ServerState>, headers: HeaderMap) -> StatusCode {
@@ -507,7 +731,7 @@ mod tests {
 
     #[tokio::test]
     async fn client_window_lease_is_bound_to_buyer_and_revoked_before_cleanup() {
-        let (store, _, mut grant) = fixture().await;
+        let (store, config, mut grant) = fixture().await;
         let conn = store.conn.lock().await;
         conn.execute_batch("INSERT INTO online_client_listings(installation_id,seller_id,owner_email,state,revision,sequence,cycle_price_minor,updated_at)
             VALUES ('physical','seller','seller@example.test','listed',1,1,0,0);
@@ -525,12 +749,66 @@ mod tests {
         grant.terminal = false;
         assert!(store.validate_window(&grant).await.is_ok());
         store
+            .client_web_sessions
+            .lock()
+            .await
+            .sessions
+            .insert(hash_token("old"), grant.clone());
+        let mut h = HeaderMap::new();
+        h.insert(WINDOW_HEADER, "old".parse().unwrap());
+        h.insert(header::HOST, "other.router.test".parse().unwrap());
+        h.insert(
+            header::ORIGIN,
+            "https://rent-test.router.test".parse().unwrap(),
+        );
+        assert!(rotate_lease_window(&store, &config, &h).await.is_err());
+        h.insert(header::HOST, "rent-test.router.test".parse().unwrap());
+        h.insert(header::ORIGIN, "https://other.router.test".parse().unwrap());
+        assert!(rotate_lease_window(&store, &config, &h).await.is_err());
+        h.insert(
+            header::ORIGIN,
+            "https://rent-test.router.test".parse().unwrap(),
+        );
+        let (a, b) = tokio::join!(
+            rotate_lease_window(&store, &config, &h),
+            rotate_lease_window(&store, &config, &h)
+        );
+        assert_ne!(a.is_ok(), b.is_ok());
+        let (token, expires) = a.or(b).unwrap();
+        assert!(expires <= Utc::now() + Duration::minutes(10));
+        assert!(
+            store
+                .client_window_principal(&config, &h, "lease", "rent-test")
+                .await
+                .is_err()
+        );
+        h.insert(WINDOW_HEADER, token.parse().unwrap());
+        assert!(
+            store
+                .client_window_principal(&config, &h, "lease", "rent-test")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        store
             .conn
             .lock()
             .await
             .execute("UPDATE online_client_leases SET state='ending'", [])
             .unwrap();
         assert!(store.validate_window(&grant).await.is_err());
+        assert!(rotate_lease_window(&store, &config, &h).await.is_err());
+        let conn = store.conn.lock().await;
+        conn.execute("UPDATE online_client_leases SET state='active'", [])
+            .unwrap();
+        conn.execute(
+            "UPDATE user_sessions SET revoked_at=?1 WHERE id=?2",
+            params![Utc::now().to_rfc3339(), grant.session_id],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(rotate_lease_window(&store, &config, &h).await.is_err());
     }
 
     #[tokio::test]

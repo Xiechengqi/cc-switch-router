@@ -3868,10 +3868,26 @@ async fn proxy_handler_inner(state: ServerState, peer: SocketAddr, req: Request)
         .filter(|label| crate::online_client_market::rental_label(label))
     {
         match crate::online_client_market::alias(&state, label).await {
-            Ok(Some((lease, installation, physical, true))) => {
+            Ok(Some((lease, installation, physical, status))) if status == "active" => {
                 Some((lease, installation, physical))
             }
-            Ok(Some(_)) => return simple_response(StatusCode::GONE, "client-lease-ended"),
+            Ok(Some((_, _, _, status))) if status == "starting" => {
+                return crate::error::AppError::coded_conflict(
+                    "lease_starting",
+                    "Client workspace is starting",
+                    serde_json::Value::Null,
+                )
+                .into_response();
+            }
+            Ok(Some(_)) => {
+                return crate::error::AppError::Coded {
+                    status: StatusCode::GONE,
+                    code: "lease_ended",
+                    message: "Client lease ended".into(),
+                    details: serde_json::Value::Null,
+                }
+                .into_response();
+            }
             Ok(None) => None,
             Err(e) => return e.into_response(),
         }
@@ -4023,10 +4039,29 @@ async fn proxy_handler_inner(state: ServerState, peer: SocketAddr, req: Request)
         };
         if alias.is_some() {
             if is_client_web_terminal_request(&path, parts.uri.query()) {
-                return simple_response(StatusCode::FORBIDDEN, "tenant-terminal-forbidden");
+                return crate::error::AppError::coded_forbidden(
+                    "tenant_terminal_forbidden",
+                    "Only the Client owner can open a terminal",
+                    serde_json::Value::Null,
+                )
+                .into_response();
+            }
+            let open_url = format!(
+                "{}/client-market/leases/{}/open",
+                state.config.web_origin(),
+                alias.as_ref().unwrap().0
+            );
+            if path == "/web-api/auth/methods" {
+                return ([(header::CACHE_CONTROL, "no-store")], axum::Json(serde_json::json!({"methods":[],"workspaceRole":"tenant","openUrl":open_url}))).into_response();
             }
             if is_client_web_auth_required_path(&path) && client_web_session.is_none() {
-                return simple_response(StatusCode::UNAUTHORIZED, "client-lease-login-required");
+                return crate::error::AppError::Coded {
+                    status: StatusCode::UNAUTHORIZED,
+                    code: "tenant_session_required",
+                    message: "Open the workspace with your Router account".into(),
+                    details: serde_json::json!({"openUrl":open_url}),
+                }
+                .into_response();
             }
         }
         if !is_internal_share_router_path && !is_allowed_client_web_path(&path) {

@@ -79,7 +79,9 @@ test("account and market reuse one buyer view; Owner audit is gated before any r
   assert.match(audit, /if \(!active\) \{[\s\S]*?return;[\s\S]*?getRentalAudit\(/);
   assert.match(audit, /request.current\?\.abort\(\); setRead\(null\); setSelected\(null\)/);
   const online = source("components/dashboard/client-market/online-market.tsx");
-  assert.match(online, /await onlineRequest\(`quotes\/\$\{quote.id\}\/commit`[\s\S]*?onChanged\(\)/);
+  assert.match(online, /showReceipt\(receipt\.leaseId\)/);
+  assert.match(online, /params\.set\("focus",\s*id\)/);
+  assert.match(shared, /<LeaseActions/);
 });
 test("personal records have complete bilingual copy", () => {
   assert.deepEqual(Object.keys(clientRentalsMessagesEn).sort(), Object.keys(clientRentalsMessagesZh).sort());

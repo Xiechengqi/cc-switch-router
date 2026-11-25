@@ -5,17 +5,13 @@ import { CircleDot, Plus, Search, X } from "lucide-react";
 import { CountryFlag } from "@/components/common/country-flag";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { formatUsdMoney } from "@/lib/market-money";
-import type { OnlineListing } from "@/lib/online-client-market";
 import { cn } from "@/lib/utils";
 import {
   SHOP_CONTINENTS,
   SHOP_UNKNOWN_COUNTRY,
   type ShopContinent,
   type ShopCountryCard,
-  onlineListingRentable,
-  onlineShopSpecLine,
 } from "./host-utils";
-import { onlineStatusKey } from "./online-market";
 
 const focusRing = "focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary";
 const selectedFill = "border-transparent bg-primary/10";
@@ -23,10 +19,6 @@ const selectedFill = "border-transparent bg-primary/10";
 /** Same breakpoints as Share cards: one column until the card can keep its price and spec readable. */
 export const ONLINE_CLIENT_CARD_GRID_CLASS =
   "grid min-w-0 grid-cols-1 gap-3 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-4";
-
-export function onlineClientMonthlyPrice(minor: number, locale: string, perMonth: string) {
-  return `${formatUsdMoney(minor || 0, locale)}${perMonth}`;
-}
 
 export function OnlineShopRegionPicker({
   cards,
@@ -56,7 +48,7 @@ export function OnlineShopRegionPicker({
     card.code === SHOP_UNKNOWN_COUNTRY ? t("clientMarket.shop.unknownRegion") : names.of(card.code) || card.code
   );
   const priceOf = (card: ShopCountryCard) => {
-    if (card.hasFreeIdle || card.minMonthlyMinor == null) return formatUsdMoney(0, locale);
+    if (card.hasFreeIdle || card.minMonthlyMinor == null) return t("online.free");
     return formatUsdMoney(card.minMonthlyMinor, locale);
   };
   const pills = (
@@ -290,79 +282,5 @@ export function OnlineSellingToolbar({
         {t("clientMarket.shop.listAdd")}
       </button>
     </div>
-  );
-}
-
-export function OnlineShopConfirm({
-  listing,
-  countryName,
-  authed,
-  onContinue,
-  onLogin,
-  busy = false,
-  error = "",
-}: {
-  listing: OnlineListing | null;
-  countryName: string;
-  authed: boolean;
-  onContinue: (listing: OnlineListing) => void;
-  onLogin: () => void;
-  busy?: boolean;
-  error?: string;
-}) {
-  const { locale, t } = useLocaleText();
-  if (!listing) {
-    return (
-      <aside className="grid content-start gap-2 rounded-xl border border-border bg-background p-4">
-        <h2 className="text-sm font-semibold">{t("clientMarket.shop.confirmTitle")}</h2>
-        <p className="text-sm text-muted-foreground">{t("clientMarket.shop.confirmEmpty")}</p>
-      </aside>
-    );
-  }
-  const hardware = listing.hardware;
-  const rentable = onlineListingRentable(listing);
-  const status = listing.state !== "listed" ? listing.state : listing.occupied ? "occupied" : listing.healthy ? "available" : "offline";
-  const memory = hardware?.memoryBytes != null
-    ? t("online.memory", { size: new Intl.NumberFormat(locale, { maximumFractionDigits: 1 }).format(hardware.memoryBytes / 2 ** 30) })
-    : null;
-  const disk = hardware?.diskBytes != null
-    ? t("online.diskSize", { size: new Intl.NumberFormat(locale, { maximumFractionDigits: 0 }).format(hardware.diskBytes / 1000 ** 3) })
-    : null;
-  return (
-    <aside className="grid content-start gap-3 rounded-xl border border-border bg-background p-4" aria-label={t("clientMarket.shop.confirmTitle")}>
-      <div>
-        <h2 className="text-sm font-semibold">{listing.label}</h2>
-        <p className="text-xs text-muted-foreground">{countryName}</p>
-      </div>
-      <div className="rounded-lg bg-muted px-3 py-2 text-sm">
-        <p className="text-xs text-muted-foreground">{t("clientMarket.shop.summarySpecs")}</p>
-        <p>{[hardware?.arch, hardware?.cpu != null ? t("online.cpu", { count: hardware.cpu }) : "", memory].filter(Boolean).join(" · ") || t("online.unknown")}</p>
-        {disk ? <p className="text-muted-foreground">{disk}</p> : null}
-      </div>
-      <dl className="grid gap-1 text-xs text-muted-foreground">
-        <div className="flex justify-between gap-2"><dt>{t("online.region")}</dt><dd>{countryName}</dd></div>
-        <div className="flex justify-between gap-2"><dt>{t("online.probe")}</dt><dd>{listing.observedAt ? new Date(listing.observedAt * 1000).toLocaleString(locale) : "—"}</dd></div>
-        <div className="flex justify-between gap-2"><dt>{t("online.hours")}</dt><dd className="tabular-nums">{t("online.hoursValue", { hours: listing.availableHours24 })}</dd></div>
-        {listing.egressIp ? <div className="flex justify-between gap-2"><dt>IP</dt><dd>{listing.egressIp}</dd></div> : null}
-      </dl>
-      {listing.egressDiffers ? <p className="text-xs text-muted-foreground">{t("online.egressDiffers")}</p> : null}
-      <p className="text-sm font-semibold">{listing.cyclePriceMinor ? `${formatUsdMoney(listing.cyclePriceMinor, locale)}${t("online.perMonth")}` : `${formatUsdMoney(0, locale)}${t("online.perMonth")}`}</p>
-      {listing.trialDays > 0 ? <p className="text-xs text-muted-foreground">{t("online.trialDays")} · {listing.trialDays}</p> : null}
-      {listing.freeDays ? <p className="text-xs text-muted-foreground">{t("online.freeDays")} · {listing.freeDays}</p> : null}
-      <p className="text-xs text-muted-foreground">{t("online.rootNotice")}</p>
-      <p className="text-xs text-muted-foreground">{t("clientMarket.shop.purchaseTerms")}</p>
-      {!rentable ? <p role="status" className="rounded-lg bg-primary/10 px-2.5 py-1.5 text-xs leading-5 text-foreground">{t("clientMarket.shop.notIdle", { status: t(onlineStatusKey(status)) })}</p> : null}
-      {error ? <p role="alert" className="text-sm text-danger">{error}</p> : null}
-      {!authed || rentable ? (
-        <button
-          type="button"
-          disabled={busy}
-          className={cn("inline-flex min-h-11 items-center justify-center rounded-lg bg-primary px-3 text-sm font-medium text-primary-foreground disabled:opacity-50", focusRing)}
-          onClick={() => (authed ? onContinue(listing) : onLogin())}
-        >
-          {t(authed ? "clientMarket.shop.continue" : "nav.login")}
-        </button>
-      ) : null}
-    </aside>
   );
 }

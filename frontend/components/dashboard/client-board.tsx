@@ -47,8 +47,8 @@ import { CompactRegionMultiSelect } from "@/components/common/compact-region-mul
 import { useClientChat } from "@/components/chat/client-chat";
 import { useAuth } from "@/components/auth/auth-provider";
 import { buildClientInstallCommand, InstallGuideDialog } from "@/components/dashboard/install-guide-dialog";
-import { OnlineRentDialog } from "@/components/dashboard/client-market/online-market";
-import { onlineRequest, type OnlineListing } from "@/lib/online-client-market";
+
+import { clientMarketMineHref, clientMarketAddHostHref } from "@/lib/dashboard-nav";
 import { getShareMarketCatalog } from "@/lib/api";
 import { listingIdleCount } from "@/components/dashboard/share-market/market-utils";
 import { SubdomainCopyButton } from "@/components/dashboard/subdomain-copy-button";
@@ -73,6 +73,15 @@ import {
   type ModelRoutingProtocol,
 } from "@/lib/model-routing";
 import type { UserModelRoutingShare } from "@/lib/types";
+
+function MarketClientBadge() {
+  const { t } = useLocaleText();
+  return (
+    <span className="rounded-md bg-sky-50 px-1.5 py-0.5 text-xs font-semibold text-sky-800">
+      {t("dashboard.marketManaged")}
+    </span>
+  );
+}
 
 function sortShares(shares: ShareView[]) {
   return [...shares].sort((left, right) => {
@@ -401,7 +410,6 @@ function ClientCard({
   onToggleCollapsed,
   onOpenTakeover,
   onOpenLogs,
-  onRent,
 }: {
   client: DashboardClient;
   shares: ShareView[];
@@ -417,7 +425,6 @@ function ClientCard({
   onToggleCollapsed: () => void;
   onOpenTakeover?: () => void;
   onOpenLogs?: () => void;
-  onRent?: () => void;
 }) {
   const { locale, t } = useLocaleText();
   const tunnelUrl = clientTunnelDisplayUrl(client.clientTunnel?.tunnelUrl);
@@ -483,7 +490,10 @@ function ClientCard({
   );
 
   return (
-    <Card id={`dashboard-client-${client.installation.id}`} className={`min-w-0 max-w-full overflow-hidden rounded-lg border border-l-[3px] bg-white p-0 shadow-sm transition-[border-color,box-shadow] ${borderTone}`}>
+    <Card
+      id={`dashboard-client-${client.installation.id}`}
+      className={`min-w-0 max-w-full overflow-hidden rounded-lg border border-l-[3px] bg-white p-0 shadow-sm transition-[border-color,box-shadow] ${borderTone}`}
+    >
       <Card.Content className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-3 p-3.5">
         <div
           className="group/client-header grid min-h-16 cursor-pointer select-text grid-cols-[minmax(0,1fr)_auto] items-start gap-3 rounded-md px-1.5 py-1 outline-none transition-colors hover:bg-primary/[0.03] focus-visible:ring-2 focus-visible:ring-primary/30 xl:grid-cols-[minmax(280px,1.1fr)_minmax(0,2.4fr)_auto] xl:items-center xl:gap-6"
@@ -499,7 +509,9 @@ function ClientCard({
                 title={operationalStateLabel(state, t)}
                 aria-label={operationalStateLabel(state, t)}
               />
-              <strong className="min-w-0 truncate text-sm font-semibold text-foreground" title={identity}>{identity}</strong>
+              <strong className="min-w-0 truncate text-sm font-semibold text-foreground" title={identity}>
+                {identity}
+              </strong>
               {hasSubdomain ? <SubdomainCopyButton subdomain={subdomain} /> : null}
               {owner && owner !== "-" ? (
                 <span className="min-w-0 truncate text-xs text-muted-foreground" title={owner}>
@@ -515,44 +527,64 @@ function ClientCard({
                   {operationalReasonLabel(summary.primaryReason, t)}
                 </span>
               ) : null}
-              {showRemoval ? <ClientRemovalSchedule removalAt={client.removalAt} className="text-[11px]" /> : null}
+              {showRemoval ? (
+                <ClientRemovalSchedule removalAt={client.removalAt} className="text-[11px]" />
+              ) : null}
             </div>
             <div className="flex min-w-0 flex-wrap items-center gap-2 pl-4">
               {tunnelUrl ? <ClientConsoleButton client={client} /> : null}
-              {tunnelUrl && client.canOpenClientTerminal !== false ? <ClientTerminalButton client={client} /> : null}
+              {tunnelUrl && client.canOpenClientTerminal !== false ? (
+                <ClientTerminalButton client={client} />
+              ) : null}
               <ClientUpgradeButton client={client} />
               {onOpenTakeover ? <ClientTakeoverButton onOpen={onOpenTakeover} /> : null}
               {client.logCollectionEnabled && onOpenLogs ? <ClientLogsButton onOpen={onOpenLogs} /> : null}
               <ClientChatButton client={client} />
-              {onRent ? (
-                <ClientHeaderInlineButton
-                  label={t("online.rent")}
-                  onClick={onRent}
-                  className="inline-flex h-6 shrink-0 items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2.5 text-[11px] font-medium text-emerald-800 hover:bg-emerald-100"
-                >
-                  <span>{t("online.rent")}</span>
-                </ClientHeaderInlineButton>
-              ) : null}
+              {session?.authenticated &&
+                owner?.toLowerCase() === session.user?.email?.toLowerCase() &&
+                (client.installation.marketListed ? (
+                  <a href={clientMarketMineHref(client.installation.id)} aria-label={t("online.supply")}>
+                    <MarketClientBadge />
+                  </a>
+                ) : (
+                  client.installation.marketLeaseV1 &&
+                  client.clientTunnel?.online && (
+                    <a
+                      className="text-xs text-accent underline"
+                      href={clientMarketAddHostHref(client.installation.id)}
+                    >
+                      {t("clientMarket.shop.dialog.publish")}
+                    </a>
+                  )
+                ))}
             </div>
           </div>
 
-          <div className={`order-3 col-span-2 grid min-w-0 grid-cols-2 gap-3 sm:grid-cols-4 xl:order-none xl:col-span-1 ${showRemoval ? "xl:grid-cols-8" : "xl:grid-cols-7"}`}>
+          <div
+            className={`order-3 col-span-2 grid min-w-0 grid-cols-2 gap-3 sm:grid-cols-4 xl:order-none xl:col-span-1 ${showRemoval ? "xl:grid-cols-8" : "xl:grid-cols-7"}`}
+          >
             <Metric
               label={t("dashboard.region")}
               value={clientRegionLabel(client.installation)}
               title={clientRegionIpTitle(client.installation)}
               actionLabel={clientIp ? t("dashboard.copyClientIp", { ip: clientIp }) : undefined}
-              onValueClick={clientIp ? () => {
-                void navigator.clipboard.writeText(clientIp).then(
-                  () => toast.success(t("common.copySuccess")),
-                  () => toast.danger(t("common.copyFailed")),
-                );
-              } : undefined}
+              onValueClick={
+                clientIp
+                  ? () => {
+                      void navigator.clipboard.writeText(clientIp).then(
+                        () => toast.success(t("common.copySuccess")),
+                        () => toast.danger(t("common.copyFailed")),
+                      );
+                    }
+                  : undefined
+              }
             />
             <Metric
               label={t("dashboard.runningDuration")}
               value={clientRunningDurationLabel(client, locale)}
-              title={t("dashboard.clientRunningSince", { date: formatDateTime(client.installation.createdAt) })}
+              title={t("dashboard.clientRunningSince", {
+                date: formatDateTime(client.installation.createdAt),
+              })}
               preserveValue
             />
             <Metric
@@ -564,10 +596,29 @@ function ClientCard({
               })}
               preserveValue
             />
-            <Metric label={t("dashboard.version")} value={versionLabel} title={client.installation.appVersion || versionLabel} preserveValue />
-            <Metric label={t("dashboard.uptime24h")} value={`${onlineRate.toFixed(1)}%`} title={onlineTitle} tone={onlineRate < 90 ? "warning" : "success"} />
-            <Metric label={t("dashboard.shares")} value={sharesMetricValue} title={sharesMetricTitle} tone={sharesMetricTone} />
-            <Metric label={t("dashboard.lastSeen")} value={formatRelativeTime(client.installation.lastSeenAt, locale)} tone={state === "offline" ? "danger" : "default"} />
+            <Metric
+              label={t("dashboard.version")}
+              value={versionLabel}
+              title={client.installation.appVersion || versionLabel}
+              preserveValue
+            />
+            <Metric
+              label={t("dashboard.uptime24h")}
+              value={`${onlineRate.toFixed(1)}%`}
+              title={onlineTitle}
+              tone={onlineRate < 90 ? "warning" : "success"}
+            />
+            <Metric
+              label={t("dashboard.shares")}
+              value={sharesMetricValue}
+              title={sharesMetricTitle}
+              tone={sharesMetricTone}
+            />
+            <Metric
+              label={t("dashboard.lastSeen")}
+              value={formatRelativeTime(client.installation.lastSeenAt, locale)}
+              tone={state === "offline" ? "danger" : "default"}
+            />
             {showRemoval ? (
               <Metric
                 label={t("dashboard.removalAt")}
@@ -651,10 +702,7 @@ export function ClientBoard({
   const [logClientId, setLogClientId] = React.useState("");
   const [filtersOpen, setFiltersOpen] = React.useState(false);
   const [installOpen, setInstallOpen] = React.useState(false);
-  const [rentableClientsOnly, setRentableClientsOnly] = usePersistentState("cc_switch_router_client_rentable_clients_v1", false);
   const [rentableSharesOnly, setRentableSharesOnly] = usePersistentState("cc_switch_router_client_rentable_shares_v1", false);
-  const [rentTargetId, setRentTargetId] = React.useState("");
-  const [rentableIds, setRentableIds] = React.useState<Set<string>>(new Set());
   const [rentableShareIds, setRentableShareIds] = React.useState<Set<string>>(new Set());
   const filtersRef = React.useRef<HTMLDivElement>(null);
   const [query, setQuery] = React.useState("");
@@ -694,27 +742,28 @@ export function ClientBoard({
   }, []);
 
   React.useEffect(() => {
-    if (!rentableClientsOnly && !rentableSharesOnly) return;
+    if (!rentableSharesOnly) return;
     const control = new AbortController();
     void (async () => {
       try {
-        if (rentableClientsOnly) {
-          const body = await onlineRequest<{ listings: OnlineListing[] }>("listings", "GET", undefined, control.signal);
-          setRentableIds(new Set(body.listings.filter((item) => item.state === "listed" && !item.occupied && item.healthy && !item.owned).map((item) => item.installationId)));
-        }
         if (rentableSharesOnly) {
           const catalog = await getShareMarketCatalog(control.signal);
-          setRentableShareIds(new Set(catalog.listings.filter((listing) => listingIdleCount(listing) > 0).map((listing) => listing.shareId)));
+          setRentableShareIds(
+            new Set(
+              catalog.listings
+                .filter((listing) => listingIdleCount(listing) > 0)
+                .map((listing) => listing.shareId),
+            ),
+          );
         }
       } catch {
         if (!control.signal.aborted) {
-          setRentableIds(new Set());
           setRentableShareIds(new Set());
         }
       }
     })();
     return () => control.abort();
-  }, [rentableClientsOnly, rentableSharesOnly]);
+  }, [rentableSharesOnly]);
 
   const sortedClients = React.useMemo(() => sortClients(clients), [clients]);
   const defaultExpandedClientId = sortedClients.reduce<DashboardClient | undefined>((best, client) => {
@@ -781,39 +830,50 @@ export function ClientBoard({
     if (statusFilter === "mine") return [];
     const normalizedQuery = query.trim().toLocaleLowerCase();
     const stableOrder = new Map(sortedClients.map((client, index) => [client.installation.id, index]));
-    const rows = sortedClients.map((client) => {
-      const allShares = sharesForClient(client);
-      const clientMatch = !normalizedQuery || includesQuery([
-        client.installation.id,
-        client.installation.ownerEmail,
-        client.installation.countryCode,
-        client.installation.region,
-        client.installation.platform,
-        client.installation.appVersion,
-        client.clientTunnel?.subdomain,
-        client.clientTunnel?.tunnelUrl,
-        client.clientTunnel?.ownerEmail,
-      ], normalizedQuery);
-      const matchedShares = clientMatch ? allShares : allShares.filter((share) => shareMatchesQuery(share, normalizedQuery));
-      return {
-        client,
-        shares: rentableSharesOnly ? matchedShares.filter((share) => rentableShareIds.has(share.shareId)) : matchedShares,
-        allShares,
-        state: clientOperationalSummary(client, allShares).state,
-        clientMatch,
-        runningDurationMs: clientRunningDurationMs(client),
-        totalTokens: clientTotalTokensUsed(allShares),
-      };
-    }).filter((row) => {
-      if (normalizedQuery && row.shares.length === 0 && !row.clientMatch) return false;
-      const region = row.client.installation.countryCode || row.client.installation.region || "";
-      if (regionFilters.length > 0 && !regionFilters.includes(region)) return false;
-      if (rentableClientsOnly && !rentableIds.has(row.client.installation.id)) return false;
-      if (rentableSharesOnly && !row.allShares.some((share) => rentableShareIds.has(share.shareId))) return false;
-      if (statusFilter !== "all" && row.state !== statusFilter) return false;
-      if (issuesOnly && row.state === "online") return false;
-      return true;
-    });
+    const rows = sortedClients
+      .map((client) => {
+        const allShares = sharesForClient(client);
+        const clientMatch =
+          !normalizedQuery ||
+          includesQuery(
+            [
+              client.installation.id,
+              client.installation.ownerEmail,
+              client.installation.countryCode,
+              client.installation.region,
+              client.installation.platform,
+              client.installation.appVersion,
+              client.clientTunnel?.subdomain,
+              client.clientTunnel?.tunnelUrl,
+              client.clientTunnel?.ownerEmail,
+            ],
+            normalizedQuery,
+          );
+        const matchedShares = clientMatch
+          ? allShares
+          : allShares.filter((share) => shareMatchesQuery(share, normalizedQuery));
+        return {
+          client,
+          shares: rentableSharesOnly
+            ? matchedShares.filter((share) => rentableShareIds.has(share.shareId))
+            : matchedShares,
+          allShares,
+          state: clientOperationalSummary(client, allShares).state,
+          clientMatch,
+          runningDurationMs: clientRunningDurationMs(client),
+          totalTokens: clientTotalTokensUsed(allShares),
+        };
+      })
+      .filter((row) => {
+        if (normalizedQuery && row.shares.length === 0 && !row.clientMatch) return false;
+        const region = row.client.installation.countryCode || row.client.installation.region || "";
+        if (regionFilters.length > 0 && !regionFilters.includes(region)) return false;
+        if (rentableSharesOnly && !row.allShares.some((share) => rentableShareIds.has(share.shareId)))
+          return false;
+        if (statusFilter !== "all" && row.state !== statusFilter) return false;
+        if (issuesOnly && row.state === "online") return false;
+        return true;
+      });
     rows.sort((left, right) => {
       if (sortOrder === "name") {
         const leftName = left.client.clientTunnel?.subdomain || left.client.installation.id;
@@ -821,26 +881,52 @@ export function ClientBoard({
         return leftName.localeCompare(rightName, undefined, { sensitivity: "base" });
       }
       if (sortOrder === "recent") {
-        return (Date.parse(right.client.installation.lastSeenAt) || 0) - (Date.parse(left.client.installation.lastSeenAt) || 0);
+        return (
+          (Date.parse(right.client.installation.lastSeenAt) || 0) -
+          (Date.parse(left.client.installation.lastSeenAt) || 0)
+        );
       }
       if (sortOrder === "running") {
         return (
           right.runningDurationMs - left.runningDurationMs ||
-          (stableOrder.get(left.client.installation.id) || 0) - (stableOrder.get(right.client.installation.id) || 0)
+          (stableOrder.get(left.client.installation.id) || 0) -
+            (stableOrder.get(right.client.installation.id) || 0)
         );
       }
       if (sortOrder === "tokens") {
         return (
           right.totalTokens - left.totalTokens ||
-          (stableOrder.get(left.client.installation.id) || 0) - (stableOrder.get(right.client.installation.id) || 0)
+          (stableOrder.get(left.client.installation.id) || 0) -
+            (stableOrder.get(right.client.installation.id) || 0)
         );
       }
       if (sortOrder === "shares") return right.allShares.length - left.allShares.length;
-      if (focus.target) return (stableOrder.get(left.client.installation.id) || 0) - (stableOrder.get(right.client.installation.id) || 0);
-      return (stableStateRanks.get(left.client.installation.id) || 0) - (stableStateRanks.get(right.client.installation.id) || 0) || (stableOrder.get(left.client.installation.id) || 0) - (stableOrder.get(right.client.installation.id) || 0);
+      if (focus.target)
+        return (
+          (stableOrder.get(left.client.installation.id) || 0) -
+          (stableOrder.get(right.client.installation.id) || 0)
+        );
+      return (
+        (stableStateRanks.get(left.client.installation.id) || 0) -
+          (stableStateRanks.get(right.client.installation.id) || 0) ||
+        (stableOrder.get(left.client.installation.id) || 0) -
+          (stableOrder.get(right.client.installation.id) || 0)
+      );
     });
     return rows;
-  }, [focus.target, issuesOnly, query, regionFilters, rentableClientsOnly, rentableIds, rentableShareIds, rentableSharesOnly, sharesForClient, sortOrder, sortedClients, stableStateRanks, statusFilter]);
+  }, [
+    focus.target,
+    issuesOnly,
+    query,
+    regionFilters,
+    rentableShareIds,
+    rentableSharesOnly,
+    sharesForClient,
+    sortOrder,
+    sortedClients,
+    stableStateRanks,
+    statusFilter,
+  ]);
 
   const clientSummary = React.useMemo(() => {
     const states = sortedClients.map((client) => clientOperationalSummary(client, sharesForClient(client)).state);
@@ -1065,7 +1151,7 @@ export function ClientBoard({
     return byShare;
   }, [modelRouting.routes]);
 
-  const activeFilterCount = regionFilters.length + Number(rentableClientsOnly) + Number(rentableSharesOnly);
+  const activeFilterCount = regionFilters.length + Number(rentableSharesOnly);
   const clientTabs: Array<{ value: ClientListTab; label: string; count: number }> = [
     ...(hasViewerIdentity ? [{ value: "mine" as const, label: t("dashboard.mine"), count: clientSummary.mine }] : []),
     { value: "all", label: t("dashboard.all"), count: sortedClients.length },
@@ -1083,7 +1169,15 @@ export function ClientBoard({
         <div className="flex w-full min-w-0 flex-wrap items-center gap-3 sm:w-auto">
           <div className="inline-flex max-w-full overflow-x-auto rounded-lg bg-slate-100 p-1 text-[11px]">
             {clientTabs.map(({ value, label, count }) => (
-              <button key={value} type="button" aria-pressed={statusFilter === value} onClick={() => selectClientListTab(value)} className={`rounded-md px-2.5 py-1.5 transition-colors ${statusFilter === value ? "bg-white font-medium text-foreground shadow-sm" : value === "mine" ? "text-primary" : value === "offline" ? "text-rose-700" : value === "reconnecting" ? "text-sky-700" : value === "degraded" ? "text-amber-700" : "text-muted-foreground"}`}>{label} · {count}</button>
+              <button
+                key={value}
+                type="button"
+                aria-pressed={statusFilter === value}
+                onClick={() => selectClientListTab(value)}
+                className={`rounded-md px-2.5 py-1.5 transition-colors ${statusFilter === value ? "bg-white font-medium text-foreground shadow-sm" : value === "mine" ? "text-primary" : value === "offline" ? "text-rose-700" : value === "reconnecting" ? "text-sky-700" : value === "degraded" ? "text-amber-700" : "text-muted-foreground"}`}
+              >
+                {label} · {count}
+              </button>
             ))}
           </div>
           {statusFilter === "mine" ? null : (
@@ -1100,7 +1194,13 @@ export function ClientBoard({
         <div className="flex w-full min-w-0 items-center gap-2 sm:w-auto">
           <label className="flex h-9 min-w-0 flex-1 items-center gap-2 rounded-md border bg-white px-3 text-sm focus-within:border-primary/50 focus-within:ring-2 focus-within:ring-primary/10 sm:min-w-64">
             <Search className="h-4 w-4 shrink-0 text-muted-foreground" />
-            <input value={query} onChange={(event) => setQuery(event.target.value)} className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground" placeholder={t(statusFilter === "mine" ? "dashboard.searchShares" : "dashboard.searchClients")} aria-label={t(statusFilter === "mine" ? "dashboard.searchShares" : "dashboard.searchClients")} />
+            <input
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground"
+              placeholder={t(statusFilter === "mine" ? "dashboard.searchShares" : "dashboard.searchClients")}
+              aria-label={t(statusFilter === "mine" ? "dashboard.searchShares" : "dashboard.searchClients")}
+            />
             {query ? (
               <button
                 type="button"
@@ -1125,7 +1225,9 @@ export function ClientBoard({
               {activeFilterCount
                 ? t("dashboard.filterActive", { count: activeFilterCount })
                 : t("dashboard.filter")}
-              <ChevronDown className={`h-3.5 w-3.5 text-muted-foreground transition-transform ${filtersOpen ? "rotate-180" : ""}`} />
+              <ChevronDown
+                className={`h-3.5 w-3.5 text-muted-foreground transition-transform ${filtersOpen ? "rotate-180" : ""}`}
+              />
             </Button>
             {filtersOpen ? (
               <div
@@ -1164,12 +1266,13 @@ export function ClientBoard({
                       className="w-full"
                     />
                   </label>
+
                   <label className="flex min-h-8 items-center gap-2 text-xs text-foreground">
-                    <input type="checkbox" checked={rentableClientsOnly} onChange={(event) => setRentableClientsOnly(event.target.checked)} />
-                    {t("dashboard.filterRentableClients")}
-                  </label>
-                  <label className="flex min-h-8 items-center gap-2 text-xs text-foreground">
-                    <input type="checkbox" checked={rentableSharesOnly} onChange={(event) => setRentableSharesOnly(event.target.checked)} />
+                    <input
+                      type="checkbox"
+                      checked={rentableSharesOnly}
+                      onChange={(event) => setRentableSharesOnly(event.target.checked)}
+                    />
                     {t("dashboard.filterRentableShares")}
                   </label>
                   {activeFilterCount ? (
@@ -1178,7 +1281,6 @@ export function ClientBoard({
                       className="justify-self-start text-xs font-medium text-primary hover:underline"
                       onClick={() => {
                         clearRegionFilters();
-                        setRentableClientsOnly(false);
                         setRentableSharesOnly(false);
                       }}
                     >
@@ -1193,11 +1295,16 @@ export function ClientBoard({
       </div>
 
       {statusFilter === "mine" ? (
-        <ClientShareRecoveryCards knownShareIds={mineShares.map(share => share.shareId)} />
+        <ClientShareRecoveryCards knownShareIds={mineShares.map((share) => share.shareId)} />
       ) : null}
 
       {statusFilter === "mine" ? (
-        <ModelHubPanel key={sessionEmail} controller={modelRouting} forceExpanded={hubForceExpanded} focusProtocol={hubFocusProtocol} />
+        <ModelHubPanel
+          key={sessionEmail}
+          controller={modelRouting}
+          forceExpanded={hubForceExpanded}
+          focusProtocol={hubFocusProtocol}
+        />
       ) : null}
 
       <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-4">
@@ -1234,19 +1341,57 @@ export function ClientBoard({
               </div>
             </EmptyBlock>
           )
-        ) : clientRows.length ? clientRows.map(({ client, shares: visibleShares, allShares }) => (
-          <ClientCard key={client.installation.id} client={client} shares={visibleShares} summaryShares={allShares} onOpenClient={openClient} onOpenShare={openShare} onEditShare={openEditShare} onConnectShare={openConnectShare} collapsed={!query && !expandedClientIdSet.has(client.installation.id)} onToggleCollapsed={() => toggleClientExpanded(client.installation.id)} onOpenTakeover={takeoverSourcesFor(client).length ? () => setTakeoverTargetId(client.installation.id) : undefined} onOpenLogs={canViewClientLogs(client) ? () => setLogClientId(client.installation.id) : undefined} onRent={rentableClientsOnly && rentableIds.has(client.installation.id) ? () => setRentTargetId(client.installation.id) : undefined} />
-        )) : (
+        ) : clientRows.length ? (
+          clientRows.map(({ client, shares: visibleShares, allShares }) => (
+            <ClientCard
+              key={client.installation.id}
+              client={client}
+              shares={visibleShares}
+              summaryShares={allShares}
+              onOpenClient={openClient}
+              onOpenShare={openShare}
+              onEditShare={openEditShare}
+              onConnectShare={openConnectShare}
+              collapsed={!query && !expandedClientIdSet.has(client.installation.id)}
+              onToggleCollapsed={() => toggleClientExpanded(client.installation.id)}
+              onOpenTakeover={
+                takeoverSourcesFor(client).length
+                  ? () => setTakeoverTargetId(client.installation.id)
+                  : undefined
+              }
+              onOpenLogs={
+                canViewClientLogs(client) ? () => setLogClientId(client.installation.id) : undefined
+              }
+            />
+          ))
+        ) : (
           <EmptyBlock>
             <div className="grid justify-items-center gap-2">
               <span>{sortedClients.length ? t("dashboard.noFilterResults") : t("dashboard.noClients")}</span>
               {sortedClients.length ? null : (
                 <span className="flex flex-wrap justify-center gap-x-3 gap-y-1">
-                  <a href="/client-market/" className="text-xs font-medium text-primary hover:underline">{t("dashboard.emptyClients.rent")}</a>
-                  <a href="/account/wallet/" className="text-xs font-medium text-primary hover:underline">{t("dashboard.emptyClients.balance")}</a>
+                  <a href="/client-market/" className="text-xs font-medium text-primary hover:underline">
+                    {t("dashboard.emptyClients.rent")}
+                  </a>
+                  <a href="/account/wallet/" className="text-xs font-medium text-primary hover:underline">
+                    {t("dashboard.emptyClients.balance")}
+                  </a>
                 </span>
               )}
-              {sortedClients.length ? <button type="button" className="text-xs font-medium text-primary hover:underline" onClick={() => { setQuery(""); selectClientListTab("all"); clearRegionFilters(); setIssuesOnly(false); }}>{t("dashboard.clearFilters")}</button> : null}
+              {sortedClients.length ? (
+                <button
+                  type="button"
+                  className="text-xs font-medium text-primary hover:underline"
+                  onClick={() => {
+                    setQuery("");
+                    selectClientListTab("all");
+                    clearRegionFilters();
+                    setIssuesOnly(false);
+                  }}
+                >
+                  {t("dashboard.clearFilters")}
+                </button>
+              ) : null}
             </div>
           </EmptyBlock>
         )}
@@ -1255,116 +1400,168 @@ export function ClientBoard({
       {visibleOrphanShares.length ? (
         <div className="grid gap-3">
           <div className="font-mono text-[11px] uppercase tracking-[0.14em] text-muted-foreground">
-            {t("dashboard.unlinkedClients")} <span className="font-semibold text-foreground">{visibleOrphanShares.length}</span>
+            {t("dashboard.unlinkedClients")}{" "}
+            <span className="font-semibold text-foreground">{visibleOrphanShares.length}</span>
           </div>
           <Card className="rounded-lg border bg-white p-0 shadow-sm">
             <Card.Content className="p-4">
-              <ShareScroller shares={visibleOrphanShares} onOpenShare={openShare} onEditShare={openEditShare} onConnectShare={openConnectShare} />
+              <ShareScroller
+                shares={visibleOrphanShares}
+                onOpenShare={openShare}
+                onEditShare={openEditShare}
+                onConnectShare={openConnectShare}
+              />
             </Card.Content>
           </Card>
         </div>
       ) : null}
 
       <Drawer.Backdrop isOpen={!!selectedClient} onOpenChange={closeClientDrawer}>
-          <Drawer.Content placement="right">
-            <Drawer.Dialog className={drawerDialogClassName}>
-              <Drawer.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
-              <Drawer.Header>
-                <Drawer.Heading className="pr-8 text-base">{t("dashboard.client")}</Drawer.Heading>
-              </Drawer.Header>
-              <Drawer.Body className="overflow-y-auto">
-                {selectedClient ? (
-                  <div className="grid gap-5">
-                    {selectedClientSummary && !["online", "available"].includes(selectedClientSummary.state) ? (
-                      <OperationalDiagnosis summary={selectedClientSummary} kind="client" removalAt={selectedClient.installation.marketListed ? undefined : selectedClient.removalAt} />
-                    ) : null}
-                    <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1.5 text-xs">
-                      <dt className="text-slate-500">URL</dt>
-                      <dd className="flex min-w-0 items-start gap-1.5">
-                        <span className="min-w-0 break-all font-mono font-medium text-slate-900">{selectedClientUrl || "-"}</span>
-                        {selectedClientUrl ? (
-                          <button
-                            type="button"
-                            aria-label={t("common.copy")}
-                            title={t("common.copy")}
-                            className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-700"
-                            onClick={() => {
-                              void navigator.clipboard.writeText(selectedClientUrl).then(
-                                () => toast.success(t("common.copySuccess")),
-                                () => toast.danger(t("common.copyFailed")),
-                              );
-                            }}
-                          >
-                            <Copy className="h-3.5 w-3.5" aria-hidden />
-                          </button>
-                        ) : null}
-                      </dd>
-                      <dt className="text-slate-500">{t("dashboard.owner")}</dt>
-                      <dd className="min-w-0 break-all font-medium text-slate-900">{clientOwnerEmail(selectedClient)}</dd>
-                      <dt className="text-slate-500">{t("dashboard.region")}</dt>
-                      <dd className="min-w-0 font-medium text-slate-900" title={clientRegionIpTitle(selectedClient.installation)}>{clientRegionLabel(selectedClient.installation)}</dd>
-                      <dt className="text-slate-500">{t("dashboard.version")}</dt>
-                      <dd className="min-w-0 font-mono font-medium text-slate-900">{clientPlatformLabel(selectedClient)}</dd>
-                      <dt className="text-slate-500">{t("dashboard.online")}</dt>
-                      <dd className="min-w-0 font-medium text-slate-900">{(selectedClient.onlineRate24h || 0).toFixed(1)}% / {formatAgeDaysOrHours(selectedClient.installation.createdAt, locale)}</dd>
-                      {selectedClient.removalAt && !selectedClient.installation.marketListed ? (
-                        <>
-                          <dt className="text-rose-700">{t("dashboard.removalAt")}</dt>
-                          <dd className="min-w-0 font-medium text-rose-700" title={formatDateTime(selectedClient.removalAt)}>
-                            {formatRelativeTime(selectedClient.removalAt, locale)}
-                            <span className="ml-1 font-normal text-slate-500">· {formatDateTime(selectedClient.removalAt)}</span>
-                          </dd>
-                        </>
+        <Drawer.Content placement="right">
+          <Drawer.Dialog className={drawerDialogClassName}>
+            <Drawer.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
+            <Drawer.Header>
+              <Drawer.Heading className="pr-8 text-base">{t("dashboard.client")}</Drawer.Heading>
+            </Drawer.Header>
+            <Drawer.Body className="overflow-y-auto">
+              {selectedClient ? (
+                <div className="grid gap-5">
+                  {selectedClientSummary && !["online", "available"].includes(selectedClientSummary.state) ? (
+                    <OperationalDiagnosis
+                      summary={selectedClientSummary}
+                      kind="client"
+                      removalAt={
+                        selectedClient.installation.marketListed ? undefined : selectedClient.removalAt
+                      }
+                    />
+                  ) : null}
+                  <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1.5 text-xs">
+                    <dt className="text-slate-500">URL</dt>
+                    <dd className="flex min-w-0 items-start gap-1.5">
+                      <span className="min-w-0 break-all font-mono font-medium text-slate-900">
+                        {selectedClientUrl || "-"}
+                      </span>
+                      {selectedClientUrl ? (
+                        <button
+                          type="button"
+                          aria-label={t("common.copy")}
+                          title={t("common.copy")}
+                          className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-700"
+                          onClick={() => {
+                            void navigator.clipboard.writeText(selectedClientUrl).then(
+                              () => toast.success(t("common.copySuccess")),
+                              () => toast.danger(t("common.copyFailed")),
+                            );
+                          }}
+                        >
+                          <Copy className="h-3.5 w-3.5" aria-hidden />
+                        </button>
                       ) : null}
-                    </dl>
-                    <ClientOnlineHeatmap installationId={selectedClient.installation.id} />
-                    <DrawerSection label={t("dashboard.linkedShares")}>
-                      <ClientLinkedSharesPanel shares={sharesForClient(selectedClient)} onEdit={openEditShare} t={t} />
-                    </DrawerSection>
-                    <DrawerSection label={t("dashboard.providers")}>
-                      <ClientProvidersPanel shares={sharesForClient(selectedClient)} />
-                    </DrawerSection>
-                  </div>
-                ) : null}
-              </Drawer.Body>
-            </Drawer.Dialog>
-          </Drawer.Content>
+                    </dd>
+                    <dt className="text-slate-500">{t("dashboard.owner")}</dt>
+                    <dd className="min-w-0 break-all font-medium text-slate-900">
+                      {clientOwnerEmail(selectedClient)}
+                    </dd>
+                    <dt className="text-slate-500">{t("dashboard.region")}</dt>
+                    <dd
+                      className="min-w-0 font-medium text-slate-900"
+                      title={clientRegionIpTitle(selectedClient.installation)}
+                    >
+                      {clientRegionLabel(selectedClient.installation)}
+                    </dd>
+                    <dt className="text-slate-500">{t("dashboard.version")}</dt>
+                    <dd className="min-w-0 font-mono font-medium text-slate-900">
+                      {clientPlatformLabel(selectedClient)}
+                    </dd>
+                    <dt className="text-slate-500">{t("dashboard.online")}</dt>
+                    <dd className="min-w-0 font-medium text-slate-900">
+                      {(selectedClient.onlineRate24h || 0).toFixed(1)}% /{" "}
+                      {formatAgeDaysOrHours(selectedClient.installation.createdAt, locale)}
+                    </dd>
+                    {selectedClient.removalAt && !selectedClient.installation.marketListed ? (
+                      <>
+                        <dt className="text-rose-700">{t("dashboard.removalAt")}</dt>
+                        <dd
+                          className="min-w-0 font-medium text-rose-700"
+                          title={formatDateTime(selectedClient.removalAt)}
+                        >
+                          {formatRelativeTime(selectedClient.removalAt, locale)}
+                          <span className="ml-1 font-normal text-slate-500">
+                            · {formatDateTime(selectedClient.removalAt)}
+                          </span>
+                        </dd>
+                      </>
+                    ) : null}
+                  </dl>
+                  <ClientOnlineHeatmap installationId={selectedClient.installation.id} />
+                  <DrawerSection label={t("dashboard.linkedShares")}>
+                    <ClientLinkedSharesPanel
+                      shares={sharesForClient(selectedClient)}
+                      onEdit={openEditShare}
+                      t={t}
+                    />
+                  </DrawerSection>
+                  <DrawerSection label={t("dashboard.providers")}>
+                    <ClientProvidersPanel shares={sharesForClient(selectedClient)} />
+                  </DrawerSection>
+                </div>
+              ) : null}
+            </Drawer.Body>
+          </Drawer.Dialog>
+        </Drawer.Content>
       </Drawer.Backdrop>
 
       <Drawer.Backdrop isOpen={!!selectedShare} onOpenChange={closeShareDrawer}>
-          <Drawer.Content placement="right">
-            <Drawer.Dialog className={drawerDialogClassName}>
-              <Drawer.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
-              <Drawer.Header>
-                <div>
-                  <Drawer.Heading className="break-all font-mono text-base">{selectedApi.apiUrl}</Drawer.Heading>
-                  {selectedShare?.description ? <p className="mt-2 whitespace-pre-wrap break-words text-xs leading-5 text-muted-foreground">{selectedShare.description}</p> : null}
-                </div>
-              </Drawer.Header>
-              <Drawer.Body className="overflow-y-auto">
-                {selectedShare ? (
-                  <div className="grid gap-5">
-                    {!["online", "available"].includes(shareOperationalSummary(selectedShare).state) ? (
-                      <OperationalDiagnosis summary={shareOperationalSummary(selectedShare)} kind="share" />
-                    ) : null}
-                    <DrawerSection label={t("dashboard.providers")}>
-                      <ShareProvidersPanel share={selectedShare} />
-                    </DrawerSection>
-                    <ShareModelHealthHeatmap shareId={selectedShare.shareId} />
-                    {selectedShare ? <ShareEmailUsagePanel key={selectedShare.shareId} share={selectedShare} /> : null}
-                    {selectedShare ? <ShareProviderRequestsPanel key={`${selectedShare.shareId}:requests`} share={selectedShare} /> : null}
-                    <DrawerSection label={t("dashboard.modelHealthChecks")}>
-                      <ShareModelHealthChecks checks={selectedShare.recentModelHealthChecks || []} />
-                    </DrawerSection>
-                  </div>
+        <Drawer.Content placement="right">
+          <Drawer.Dialog className={drawerDialogClassName}>
+            <Drawer.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
+            <Drawer.Header>
+              <div>
+                <Drawer.Heading className="break-all font-mono text-base">
+                  {selectedApi.apiUrl}
+                </Drawer.Heading>
+                {selectedShare?.description ? (
+                  <p className="mt-2 whitespace-pre-wrap break-words text-xs leading-5 text-muted-foreground">
+                    {selectedShare.description}
+                  </p>
                 ) : null}
-              </Drawer.Body>
-            </Drawer.Dialog>
-          </Drawer.Content>
+              </div>
+            </Drawer.Header>
+            <Drawer.Body className="overflow-y-auto">
+              {selectedShare ? (
+                <div className="grid gap-5">
+                  {!["online", "available"].includes(shareOperationalSummary(selectedShare).state) ? (
+                    <OperationalDiagnosis summary={shareOperationalSummary(selectedShare)} kind="share" />
+                  ) : null}
+                  <DrawerSection label={t("dashboard.providers")}>
+                    <ShareProvidersPanel share={selectedShare} />
+                  </DrawerSection>
+                  <ShareModelHealthHeatmap shareId={selectedShare.shareId} />
+                  {selectedShare ? (
+                    <ShareEmailUsagePanel key={selectedShare.shareId} share={selectedShare} />
+                  ) : null}
+                  {selectedShare ? (
+                    <ShareProviderRequestsPanel
+                      key={`${selectedShare.shareId}:requests`}
+                      share={selectedShare}
+                    />
+                  ) : null}
+                  <DrawerSection label={t("dashboard.modelHealthChecks")}>
+                    <ShareModelHealthChecks checks={selectedShare.recentModelHealthChecks || []} />
+                  </DrawerSection>
+                </div>
+              ) : null}
+            </Drawer.Body>
+          </Drawer.Dialog>
+        </Drawer.Content>
       </Drawer.Backdrop>
 
       <ShareEditDialog share={currentEditingShare} onClose={closeEditShare} onSaved={handleSaved} />
-      <ShareConnectDialog share={currentConnectShare} open={!!currentConnectShare} onOpenChange={closeConnectDialog} />
+      <ShareConnectDialog
+        share={currentConnectShare}
+        open={!!currentConnectShare}
+        onOpenChange={closeConnectDialog}
+      />
       <ClientSubdomainTakeoverDialog
         target={takeoverTarget}
         sources={takeoverSources}
@@ -1388,7 +1585,6 @@ export function ClientBoard({
         commandLabelKey="dashboard.installCommand"
         command={buildClientInstallCommand({ ownerEmail: session?.user?.email })}
       />
-      {rentTargetId ? <OnlineRentDialog installationId={rentTargetId} onClose={() => { setRentTargetId(""); void onChanged?.(); }} /> : null}
     </section>
   );
 }

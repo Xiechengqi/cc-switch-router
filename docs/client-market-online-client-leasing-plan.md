@@ -1,6 +1,6 @@
 # Client Market 在线 Client 能力租用规划
 
-**部署基线为全新 Router 数据库和全新 Server 数据目录。** Client Market 出租已在线、owner 已验证的 Client 服务能力及出口 IP。租户使用独立工作区。P4 随本次代码切换，环境安装和实际链路验收由用户手动执行。
+**部署基线为全新 Router 数据库和全新 Server 数据目录。** Client Market 出租已在线、owner 已验证的 Client 服务能力及出口 IP。租户使用独立工作区。本地双进程和真实浏览器的验收记录见第 11 节，公网部署步骤见第 6 节。
 
 ## 1. 已确认的产品决策
 
@@ -76,18 +76,18 @@ Router 根据 installation 的上架状态限制管理员委托。物理 Client 
 
 ### 4.2 身份与权限
 
-现状：`resolve_web_admin_principal`（server `src/api/session.rs`）把**任何带 Router 签名的邮箱**都视为 Web 管理员。改造后分三类身份：
+Server 的 `resolve_web_admin_principal` 区分三个来源。
 
-1. **owner**：本地 owner 密码或 owner 会话；也可以是 Router 签名且邮箱等于 owner 邮箱。租期内进入协助模式（§4.3）。
-2. **租户**：Router 签名的邮箱，并且 Client 本地存在一条有效的 `leaseGrant{leaseId, tenantEmail, expiresAt}`。授权在本地带到期时间，Router 失联时也会自动失效。做法沿用 Share 的 `managedGrant`（`userGrants[].manager=routerShareMarket`）。
-3. **Router 控制面**：只认 `/_ctl/*` HMAC 指令，不再因为“签名邮箱”就获得管理员身份。
+1. **LocalOwner** 包括本机密码会话、由本机验证的 owner 登录会话和安装方的管理凭据。租期内进入协助视图。本机已验证的 owner 可以执行维护。直连 `/api/auth/login` 会话保存在进程内，开租切换进程后，卖家用原本机密码重新登录即可进入协助视图。
+2. **Router** 表示经 Router 验签的委托身份。上架后只有与 installation owner 匹配的卖家可通过物理子域名进入协助视图。在 Router 窗口中，终端、重启、升级、回滚和主机设置写入均额外验证 Client 独立签发的 owner proof。界面通过维护探测后解锁，凭据失效时重新锁定。
+3. **LeaseTenant** 要求签名邮箱和请求域名同时与本机有效授权的 `tenantEmail,alias` 匹配。租户从自己的 Router 账号进入，不另设密码。租户的命令按 Web runtime contract 的 `workspaceAccess` 过滤，隧道接口投影本租约别名，创建和导入 Share 都按当前租户归属。
 
-以上收紧只作用于已上架的 installation。未上架的 Client 保持原有委托：Router 只把 owner 本人和 Router 管理员（支持排障）的签名身份注入 Client，Server 对签名邮箱照常授予管理权。
+Router 控制面使用 installation HMAC 验证 `/_ctl/*`。未上架时，原有 Bearer 入口仍支持 Router 管理员协助，物理 Client 窗口票据仅签发给该 Client 的 owner。
 
 此外：
 
 - **本机回环也要拦截。** 租期内，127.0.0.1 上的代理请求同样必须持有租户工作区的 token。卖家本机 CLI 因此在租期内不能使用该 Client（D4，已接受）。
-- **管理接口审计。** 需要把全部 Web 管理接口逐一标注为 owner-only、租户可用或协助只读。粗查结果：会执行外部命令的只有终端（PTY）、自升级与重启，以及 opencode zen transport 启动的一个固定 helper。正式审计结果作为 P1 的交付物。
+- **管理接口审计。** Server 的命令契约给每个 invoke 命令标注工作区权限。请求鉴权和 `/web-api/context` 使用同一分类。REST 入口单独按匹配路由授权；终端和 installation 级输入始终受主机策略约束。
 - 备份与恢复只在当前工作区内生效；租户不能恢复 installation 级文件。
 
 ### 4.3 卖家协助模式（默认开放）
@@ -95,7 +95,7 @@ Router 根据 installation 的上架状态限制管理员委托。物理 Client 
 - 租期内卖家登录 Client 后自动进入**明确标注的协助模式**，不需要租户授权（D5）。
 - 卖家能看到：租户工作区里各 provider 的健康状况与报错、请求审计和日志（token 与密钥脱敏）、版本、资源和连通性。
 - 卖家看不到：明文密钥、OAuth 令牌、API token；也不能修改租户配置，不能使用租户账号。
-- 卖家每次进入协助模式、打开终端、重启、升级，都写入**租户可见的访问记录**，并发出站内通知（D6，只通知，不需要同意）。
+- 协助访问与终端连接按租约、类型、访问会话去重。重启、升级、回滚及主机设置写入按操作记录。离线积压超过一批时，Client 按类型合并尚未上报的记录并保留次数。已上报记录保持不可变，Router 按事件 ID 去重并向租户通知。
 - 必须向租户明确告知：卖家有主机 root，技术上能直接读盘。协助视图的脱敏只约束界面，挡不住 root。告知位置为租用确认页和租户控制台。
 
 ### 4.4 上架和租期内锁定的主机级设置
@@ -165,7 +165,7 @@ Client 在本进程内读取 cgroup 的有效 CPU、内存和工作区数据盘�
  → 结算 → 上架项恢复可租
 ```
 
-- `lease_begin` 失败：不扣费，订单回到可重试或取消状态，上架项不变。
+- 开通等待最长十分钟。开通失败走撤权与解冻流程，买家可以查看原回执，待库存恢复后重新选购。
 - 开启自动续费的付费月租，授权截止时间设为本期结束后再加 2 小时，避免每次续费都中断租户访问，也避免续费时 Client 短暂离线就丢失已付费的租约。续费失败或关闭自动续费时，合约状态变化会立即结束租约。
 - 退租截止满 24 小时、第三方车位已结清但仍未收到清理回执时，Router 先按原规则退款或解冻买家余额（未开通的订单全额解冻，已开通的退还未使用部分），审计记为 `settled_without_cleanup`。上架项继续占用，直到 Client 交回与本租约匹配的清理回执；该回执不会重复结算。
 - Client 离线时，Router 侧撤销照样立即生效，因为所有公网访问都必须经过 Router。磁盘清理等 Client 重连后由 ctl 或本地自治补做。**核对通过之前，上架项不能再租。**
@@ -179,10 +179,8 @@ Client 在本进程内读取 cgroup 的有效 CPU、内存和工作区数据盘�
 
 ### 5.5 Share 归属
 
-- 现状：`upsert_share_tx` 调用 `normalize_self_reported_share_owner`（[store.rs](../src/store.rs)），把 Share 的 owner 强制改写为 installation owner。
-- 新模型下，这会导致租户创建的 Share **被记到卖家名下，收益也流向卖家**。必须改为：Share 归属到它所在的工作区。租户工作区里的 Share，owner 是当时的租户，并绑定 `leaseId`。
-- 租约结束时，租户的 Share、挂售和第三方车位走 Share Market 现有的立即退租与结算流程（[Share Market 立即退租](share-market-immediate-termination.md)），全部完成后再下发 `lease_end`。
-- 这一项涉及第三方资金，实施前需要单独评审。
+- 租户创建或导入的 Share 使用当前工作区身份。Router 核对签名请求所属租约，将 Share 与 `leaseId` 绑定。租户是 Share 车位的收款人。[Share 归属](../src/online_client_market/shares.rs)
+- 租约结束后，先撤销租户公网访问，再结清其挂售和第三方车位。Client 的清理回执与资金结算分别记录。原卖家恢复可租需要同时满足清理与结算条件。[Share Market 立即退租](share-market-immediate-termination.md)
 
 ### 5.6 Web 访问委托
 
@@ -190,10 +188,14 @@ Client 在本进程内读取 cgroup 的有效 CPU、内存和工作区数据盘�
 
 | 访问者 | 规则 |
 |---|---|
-| 当前租户 | 沿用现有的租约票据，自动登录到租户工作区 |
+| 当前租户 | 从市场、账户或租户域名根地址进入独立标签页，以 Router 账号自动登录。旧 Client 回退到 Router 内嵌控制台。 |
 | 卖家 | 空闲期正常登录；租期内进入协助模式 |
 | Router 管理员和 Router owner | 继续不委托 |
 | 市场页面的终端入口 | 只对 Client owner 开放，入口经过 Server 的独立 owner 认证。 |
+
+浏览器经主域签发并用表单 POST 交接一次性票据。工作区窗口在到期前轮换短期 token，父会话失效后回主域重新验证。退租会撤销别名及窗口访问，买家可在确认退租之前直接下载工作区 ZIP。请求、响应、错误码及兼容握手见 [Client Web 窗口登录](../PROTOCOL.md#33-client-web-窗口登录)。
+
+商店是买家的下单入口。自动续费选项变化或报价到期会在原弹窗重新报价，余额不足时可在原页充值。成交回执定位本次租约；响应丢失时，当前买家可用原报价 ID 重取同一回执。开通成功后通知买家，开通失败时展示冻结款状态。当前版本通过下架后重挂修改价格，已成交租约保留原报价。
 
 ### 5.7 健康与结算
 
@@ -207,11 +209,11 @@ Client 在本进程内读取 cgroup 的有效 CPU、内存和工作区数据盘�
 
 ## 6. 空环境手动部署与验收
 
-交付物为同一版协议的 Router 和 Server。用户手动完成以下操作。
+先部署含迁移 0128、窗口交接和逐批访问回执的 Router，再更新 Server 及其配套 Web 资源。过渡期内旧 Server 使用内嵌控制台。以下步骤适用于公网环境验收。
 
 1. 在新环境为 Router 准备独立数据目录、空数据库、域名、TLS 和 owner 设置，按正常启动方式初始化。Router 的入站 SSH host key 用于 Client 反向隧道。
 2. 在另一个空数据目录初始化 Server，配置同一 Router、Client 子域名和卖家身份，验证 owner 并建立反向隧道。Client 进程直接处理资源探测。
-3. 从卖家的 Clients 页上架。检查市场卡片上的出口 IP 与地区、CPU、内存、磁盘和最近探测时间。新环境的可用小时数从 0 开始，首个达到 10 个成功时段的完整 UTC 小时结束后应计入过去 24 小时的统计。
+3. 从市场「我的上架」选择卖家自己的 Client，运行只读预检并发布。检查市场卡片上的出口 IP 与地区、CPU、内存、磁盘和最近探测时间。新环境的可用小时数从 0 开始，首个达到 10 个成功时段的完整 UTC 小时结束后应计入过去 24 小时的统计。
 4. 用第二个账户报价并确认租用，检查独立租户工作区、卖家协助留痕和终端权限。若验证第三方车位，让第三个账户购买租户工作区内的 Share 车位。
 5. 租户退租后核对旧票据立即失效。第三方车位须先撤权结算，卖家工作区恢复并完成本次清理回执与待处理结算后，卡片应自动恢复可租。最后由卖家下架并重新上架，记录公网链路的实际验收结果。
 
@@ -288,4 +290,20 @@ Router 运营者与 release 发布者目前是同一方，因此本方案不防�
 | Router 前端 | TypeScript 单测 602 项、类型检查和生产构建通过。结账、退租、Owner 审计和 C2C 四组本地模拟浏览器流程通过。结账覆盖 409 后重新报价，以及成功回执丢失、报价过期后取回同一租约。 |
 | Server | Rust 4,752 项通过、5 项按测试标记忽略。Web 在 Node 22 下 452 项通过，类型检查通过。Provider 审计套件 2,205 项通过。 |
 
-代码与本地回归已完成。CI、真实 Provider 凭据及公网链路的验证结果尚待记录。空环境安装与双端联验由用户按第 6 节手动执行。
+### 工作区交付、买卖双方路径与兼容性验收（2026-11-25）
+
+- 使用空 Router 库、独立 Server 目录及反向 SSH 隧道，验证了只读上架预检、付费成交、同一报价重取原租约和独占。租户创建的 Provider 和 Share 归属当前工作区。导入含其他 owner 邮箱的 Share 时，Server 将归属重设为当前租户。第三个账户实际购买了 Share 车位。结束父租约后第三方撤权并收到退款，所有测试钱包分录平衡。卖家的原始数据恢复后库存重新可租，卖家可下架。
+- 使用两个二进制内置的 Web 页面，走通卖家发布、买家下单、从市场和账户页开新窗口、刷新、单窗口退出、ZIP 备份、结算退租及旧窗口撤权。同一租户窗口超过 10 分钟后成功轮换凭据，并读取到已认证的租户上下文。基于 `28b7649` 的旧 Server 本地构建也验证了从别名自动回退到已登录的内嵌工作区。
+- 卖家已打开的本机控制台收到上架提示，切换进程后用原密码重新登录并进入协助视图。通过 Router 内嵌窗口进入时，先验证本机密码，再连接终端。浏览器确认了终端行列数，保存并恢复了一项主机设置。
+- 本地浏览器回归可用 `frontend/` 下的 `npm run test:client-checkout-browser`、`npm run test:client-termination-browser` 和 `npm run test:client-rental-audit-browser` 重跑。双进程浏览器用 `npm run test:client-workspace-browser`，从标准输入读取一次性夹具 JSON。字段为 `origin`、`installationId`、`sellerEmail`、`sellerToken`、`sellerPassword`、`buyerEmail`、`buyerToken`。夹具使用可发布的测试 Client、已登录的两个独立账户及开启的卖家终端。可选 `ownerLocalOrigin` 用于验证本机直连。设置 `WORKSPACE_LONG_SESSION=1` 可验证跨 10 分钟的工作区会话。[浏览器验收脚本](../frontend/scripts/client-workspace-browser-test.mjs)
+
+| 本地回归 | 结果 |
+|---|---|
+| 数据兼容 | 在 0127 库中保留一份上架、活跃租约和旧访问回执，再执行 0128。原数据与外键检查通过，原回执次数为 1，待确认批次初始化为空。 |
+| Router | Rust 1,986 项通过。前端 TypeScript 单测 579 项、国旗资源测试 5 项通过，类型检查和生产构建通过。 |
+| Server | Rust 共 4,783 项通过、5 项按原标记忽略，含 139 项 API 契约测试。Web 单测 454 项通过，类型检查和生产构建通过。 |
+| 契约与审计 | Server 审计测试 2,207 项通过。262 条 Web 命令均有工作区权限分类，Provider 覆盖、UI 矩阵及写入路径审计通过。 |
+| 浏览器专项 | 结账、续费重报价、原页充值、过期及回执重放通过。退租争议和管理员审计通过中英双语、键盘及多宽度回归。 |
+| Server 本地发布检查 | `RUN_TESTS=1 RUN_REAL=0 scripts/release-readiness.sh` 返回 `contract_verified`。本地启动、密码登录、Provider 与 Share 冒烟通过，失败 0 项、内部阻塞 0 项。 |
+
+公网域名与 TLS、生产部署、真实上游 Provider/OAuth 调用、安装新版本与回滚二进制仍待环境验收。
