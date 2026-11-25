@@ -217,7 +217,14 @@ export function resolveAccountEntryHref(): AccountNavHref {
   return readStoredAccountNavHref() || DASHBOARD_ACCOUNT_WALLET_PATH;
 }
 
-/** Focus an online listing or an active lease when opening the market. */
+/** Open the shop on the tenant switch, optionally focusing one lease. */
+export function clientMarketTenantHref(targetId?: string) {
+  const params = new URLSearchParams({ view: "rentals" });
+  if (targetId) params.set("focus", targetId);
+  return buildDashboardHref(DASHBOARD_CLIENT_MARKET_PATH, params);
+}
+
+/** Open the seller workspace, optionally focusing one listing. */
 export function clientMarketMineHref(targetId?: string) {
   const params = new URLSearchParams({ view: "selling" });
   if (targetId) params.set("focus", targetId);

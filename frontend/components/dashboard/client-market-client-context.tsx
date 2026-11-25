@@ -1,7 +1,7 @@
 "use client";
 
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { clientMarketMineHref } from "@/lib/dashboard-nav";
+import { clientMarketMineHref, clientMarketTenantHref } from "@/lib/dashboard-nav";
 import type { MessageKey } from "@/lib/i18n";
 import type { MarketClientContext, MarketClientHint } from "@/lib/client-market-client-status";
 
@@ -48,7 +48,7 @@ export function MarketClientStatusLine({
       ) : null}
       {context.manageAs ? (
         <a
-          href={clientMarketMineHref(installationId)}
+          href={context.manageAs === "provider" ? clientMarketMineHref(installationId) : clientMarketTenantHref(installationId)}
           className="shrink-0 font-medium text-accent hover:underline"
           onClick={(event) => event.stopPropagation()}
         >

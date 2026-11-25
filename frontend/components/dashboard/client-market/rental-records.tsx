@@ -18,7 +18,7 @@ import { parseAuditPageNumber } from "@/lib/client-rental-audit";
 import { rentalAuditMessagesEn } from "@/lib/client-rental-audit-messages";
 import { formatWalletUnits } from "@/lib/market-wallet-money";
 import { formatUsdMoney } from "@/lib/market-money";
-import { clientMarketMineHref } from "@/lib/dashboard-nav";
+import { clientMarketTenantHref } from "@/lib/dashboard-nav";
 import type { MessageKey } from "@/lib/i18n";
 import { CLIENT_MARKET_POLL_MS } from "./host-utils";
 
@@ -136,7 +136,7 @@ function RentalSection({ view, focusKey, revision, onChanged, onTerminationOpen 
       rowTone={row => row.cleanupStatus === "failed" ? "danger" : row.attention !== "none" ? "attention" : undefined}
       onExpandedChange={setExpanded}
       renderDetail={row => <RentalDetail key={row.id} id={row.id} refreshKey={JSON.stringify([row.status, row.attention, row.cleanupStatus, row.money, row.periodEnd, row.renewalPolicy])} onChanged={onChanged} onTerminationOpen={onTerminationOpen} onForbidden={revokeAccess} />}
-      empty={<p className="rounded-lg border border-dashed border-border px-4 py-8 text-center text-sm text-muted-foreground">{t(view === "current" ? "clientRentals.currentEmpty" : "clientRentals.historyEmpty")}{view === "current" ? <Link href={clientMarketMineHref()} className="ml-2 text-accent hover:underline">{t("account.client.openMarket")}</Link> : null}</p>}
+      empty={<p className="rounded-lg border border-dashed border-border px-4 py-8 text-center text-sm text-muted-foreground">{t(view === "current" ? "clientRentals.currentEmpty" : "clientRentals.historyEmpty")}{view === "current" ? <Link href={clientMarketTenantHref()} className="ml-2 text-accent hover:underline">{t("account.client.openMarket")}</Link> : null}</p>}
     /> : null}
     {page && page.total > 0 ? <nav className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground" aria-label={t("clientRentals.pagination")}>
       <span className="tabular-nums">{t("clientRentals.count", { count: page.total, page: page.page, pages: page.totalPages })}</span>
@@ -216,7 +216,7 @@ function RentalDetail({ id, refreshKey, onChanged, onTerminationOpen, onForbidde
       {rental && row.group === "current" ? <>
         {row.cyclePriceMinor != null && row.contractId ? <MarketWalletRenewalCard contractId={row.contractId} refreshKey={JSON.stringify([row.contractStatus, row.renewalPolicy, row.periodEnd, row.trialSecondsRemaining])} compact onChanged={changed} /> : null}
         {rental.canDispute && rental.contractId ? <MarketServiceDisputeControl contractId={rental.contractId} initiallyOpen={rental.openDispute} onChanged={changed} /> : null}
-        <Link className="inline-flex min-h-11 items-center justify-self-start rounded text-sm text-accent hover:underline focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2" href={clientMarketMineHref(rental.leaseId)}>{t("account.client.manageInMarket")}</Link>
+        <Link className="inline-flex min-h-11 items-center justify-self-start rounded text-sm text-accent hover:underline focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2" href={clientMarketTenantHref(rental.leaseId)}>{t("account.client.manageInMarket")}</Link>
       </> : null}
       <details className="min-w-0 rounded-lg border border-border p-3"><summary className="cursor-pointer text-sm font-medium">{t("rentalAudit.periods")}</summary><div className="mt-3 grid gap-2 text-xs">{detail.periods.length ? detail.periods.map(p => <div key={p.id} className="grid gap-1 border-t border-border pt-2"><strong>{t("rentalAudit.period", { sequence: p.sequence })}</strong><span>{date(p.startedAt)} → {date(p.endedAt)}</span><span>{t("clientRentals.periodAmount", { amount: money(p.amountUnits), returned: money(p.returnedUnits) })}</span></div>) : <p className="text-muted-foreground">{t("rentalAudit.noPeriods")}</p>}{detail.periodsNextCursor !== null ? <Button size="sm" variant="ghost" isDisabled={busy} onPress={() => void load("periods")}>{t("rentalAudit.morePeriods")}</Button> : null}</div></details>
       <details className="min-w-0 rounded-lg border border-border p-3"><summary className="cursor-pointer text-sm font-medium">{t("rentalAudit.events")}</summary><ol className="mt-3 grid gap-2 text-xs">{detail.events.map(event => {

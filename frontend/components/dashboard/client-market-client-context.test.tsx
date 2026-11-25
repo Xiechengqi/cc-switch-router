@@ -29,6 +29,10 @@ test("renter and Provider links use the focused online market card", () => {
     );
     assert.match(html, /Long offline/);
     assert.match(html, new RegExp(label));
-    assert.match(html, /href="\/client-market\/\?focus=client-1"/);
+    assert.match(html, new RegExp(
+      role === "provider"
+        ? 'href="/client-market/\\?view=selling&amp;focus=client-1"'
+        : 'href="/client-market/\\?view=rentals&amp;focus=client-1"',
+    ));
   }
 });
