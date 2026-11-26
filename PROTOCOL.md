@@ -113,7 +113,7 @@ Client Web 邮箱登录使用 `/v1/client-web/auth/email/request-code` 和 `/v1/
 
 ### 3.3 Client Web 窗口登录
 
-Router 主 Host 的 Session 鉴权 `POST /v1/auth/client-web-tickets` 接收 `{installationId,kind:"console"|"terminal",nonce}`，返回 `{ticket,origin}`，响应使用 `Cache-Control: no-store`。物理 Client 的目标 ID 为 installation ID，由已验证的当前卖家领票。租户控制台的目标 ID 为当前租约 ID，由原买家领票。票据绑定父 Session、用户、目标 Host revision、nonce 和能力，60 秒内可兑换一次。租户票据只开放控制台。卖家经 Router 签名进入协助视图后，操作终端、重启、升级、回滚或修改主机设置，需要另外提交 Client 验证的本机 owner 凭据。
+Router 主 Host 的 Session 鉴权 `POST /v1/auth/client-web-tickets` 接收 `{installationId,kind:"console"|"terminal",nonce}`，返回 `{ticket,origin}`，响应使用 `Cache-Control: no-store`。物理 Client 的目标 ID 为 installation ID，由已验证的当前卖家领票。租户控制台的目标 ID 为当前租约 ID，由原买家领票。票据绑定父 Session、用户、目标 Host revision、nonce 和能力，60 秒内可兑换一次。租户票据只开放控制台。自成交至释放，物理入口拒绝控制台和终端票据并撤销既有绑定。租户以 Router 原账号单点登录，原机密码保留，交还后须重新认证。
 
 Client 嵌入页的 `routerOrigin` 查询参数只携带父 origin。子页通过 `postMessage` 发出 `cc-client-login-request` 和随机 nonce；父页核对准确的 origin 与 iframe `contentWindow` 后签发并返回 `cc-client-login-ticket`。子页在本 Client Host 上 POST `/web-api/auth/router-exchange`，请求 `{ticket,nonce}` 且 Origin 必须匹配目标 Host。此端点由 Router 自身处理。兑换结果 `{token,expiresAt}` 最长有效 10 分钟，且不超过父 access Session 期限。
 
@@ -121,7 +121,7 @@ Client 请求通过 `x-cc-switch-client-web-session` 携带内存凭据。Router
 
 租户从商店、账户页或租户域名根地址进入时，`GET /client-market/leases/:id/open` 引导浏览器到 Router 主域。主域使用已有登录或要求登录，核对有效租约后领票。浏览器通过跨域表单 POST 把 `ticket,nonce` 交给目标别名上的 `/web-api/auth/router-launch`。Router 校验主域 Origin、目标 Host 和租约，读取 Client 首页。支持 `cc-workspace-launch-v1` 的页面从一次性 meta 数据读取票据，立即删除并在本域兑换。旧版 Client 返回主域内嵌窗口，继续使用原有握手。
 
-独立工作区向本域 `POST /web-api/auth/router-renew` 提交窗口头。成功时原 token 失效，返回新的 `{token,expiresAt}`。窗口最长十分钟，截止时间受父 access Session 约束。已有登录的独立工作区如遇父会话轮换或过期，经别名根路径回主域恢复登录。主动退出关闭当前窗口授权。租约结束返回 `410 lease_ended`。匿名读取租户 context 返回 `401 tenant_session_required` 和 `details.openUrl`，登录方式列表为空。Server 租约权限拒绝使用 `workspace_leased`、`unlist_first` 和 `owner_proof_required`。
+独立工作区向本域 `POST /web-api/auth/router-renew` 提交窗口头。成功时原 token 失效，返回新的 `{token,expiresAt}`。窗口最长十分钟，截止时间受父 access Session 约束。已有登录的独立工作区如遇父会话轮换或过期，经别名根路径回主域恢复登录。主动退出关闭当前窗口授权。租约结束返回 `410 lease_ended`。匿名读取租户 context 返回 `401 tenant_session_required` 和 `details.openUrl`，登录方式列表为空。Client 已出租时访问物理控制台返回 `403 workspace_leased`。挂售期间修改主机绑定需先下架，返回 `403 unlist_first`。
 
 ### 2.3 Gateway（中性容量接入身份）
 
@@ -414,17 +414,27 @@ Server 发出最终 applied ACK 前须将其写入绑定原 Router URL／install
 
 ### 在线 Client Market 购买与控制协议
 
+卖家向 `POST /v1/client-market/online/installations/:id/preflight` 提交 `{paid}`。响应的 `blocker` 表示当前出租方式下第一个需要处理的原因，可上架时为 `null`。`probeStatus` 的 `skipped`、`unreachable`、`completed` 分别表示未开始远端检查、未收到有效响应和收到检查结果。预检使用独立限时 challenge，`countryCode` 来自本次出口回调。检查结束后释放 challenge。
+
+无论所选价格，`paidReady` 和 `paidBlocker` 均说明当前账号的收费资格。预检不会认领供应商身份。已验证邮箱的设备所有者首次收费时可调用 `POST /v1/client-market/online/installations/:id/verify-provider` 认领自己的供应商身份，成功返回 `{"paidReady":true}`，重复调用不会创建第二个身份。验证和正式上架分别提交。上架时 Router 重新核验设备和收费条件，已知阻塞通过 `CLIENT_LISTING_BLOCKED` 的 `details.reason` 返回。
+
 公开库存使用 `GET /v1/client-market/online/listings`。有登录态的卖家在 `POST /v1/client-market/online/installations/:id/listing` 提交 `cyclePriceMinor`（USD 分）、可选 `freeDays`、`trialDays` 和 `acknowledged`。同一路径的 DELETE 发起下架。返回 `locking` 或 `unlocking` 表示意图已记录，最终状态通过库存读取。出口探测以一次性 challenge 向 Router 回调，过期、复用和与上架项不匹配的回调均无效。
 
-买家带上架项 `revision` 和 `autoRenew` 请求 `POST /v1/client-market/online/installations/:id/quote`，在 120 秒内用 `POST /v1/client-market/online/quotes/:id/commit` 确认告知。报价不占库存，提交时重新检查准入、库存、版本与钱包。付费报价冻结首期供应商佣金。报价后试用额度重置或剩余时长改变，首次提交返回 409，买家需重新报价。已成交的报价仅供原买家重放，返回原 `leaseId` 与当前状态。
+列表的 `state` 表示挂售生命周期，`availability` 表示设备能否交付。公开挂牌的设备返回 `available`、`occupied`、`offline`、`upgrading`、`switching`、`upgrade_required` 或 `unavailable`。卖家还能看到过渡中的 `locking`、`unlocking`，完成下架的设备从列表移除。未释放租约或待完成的退租结算记为占用。空闲设备只有在十分钟内确认隧道断开时才记为离线，升级与切换取自同一时限内的签名回执。可租还要求租赁能力、签名独占能力及有效的健康探测。自租能力 `ownerRental` 单列，只对本人下单生效。
 
-新租约的初始状态为 `starting`。工作区就绪后进入 `active`。租户通过 `GET /v1/client-market/online/leases` 读取域名、授权到期时间与访问记录。默认最多返回 200 条，当前租约优先。市场轮询使用 `?current=true` 读取该买家的全部未释放租约。附带 `focus=<leaseId>` 时也返回该买家指定的已释放记录。窗口票据的目标是本次 `leaseId`，每次验证买家身份、域名版本、租约状态及有效期。租户的 Share 位于 `{slug}--{leaseAlias}`，由当前工作区账号持有。
+买家带上架项 `revision` 和 `autoRenew` 请求 `POST /v1/client-market/online/installations/:id/quote`，在 120 秒内用 `POST /v1/client-market/online/quotes/:id/commit` 确认告知。报价不占库存，提交时重新检查准入、库存、版本与钱包。付费报价冻结首期供应商佣金。报价后试用额度重置或剩余时长改变，首次提交返回 409，买家需重新报价。已成交的报价仅供原买家重放，返回原 `leaseId` 与当前状态。回执与工作区通知打开 `/account/rentals/?market=client&focus=<leaseId>`。
 
-卖家可先向 `POST /v1/client-market/online/installations/:id/preflight` 提交 `{paid}`，读取身份、激活、能力、Share、隧道、工作区、硬件、出口及付费出租条件。预检使用独立限时 challenge，结束后丢弃，不占用库存。发布时再次核验。控制通道离线、等待回执、切换中、状态不一致的原因对卖家可见。卖家可对 `locking` 或 `unlocking` 调用 `POST /v1/client-market/online/installations/:id/retry`，重新调度同一序号。
+支持自租的 Client 在签名控制通道的 check、status、command 响应中返回布尔值 `ownerRental: true`。自租还要求支持独占管理。新上架、新报价与首次成交都要求签名状态声明 `exclusiveManagement: true`。Router 按每次响应更新此能力。登录买家与上架卖家的用户 ID 相同时，报价冻结 `selfRental: true`、公开月租 `listingPriceMinor`、成交月租 `cyclePriceMinor: 0`、`freeDays: null`、零试用和关闭自动续费。自租独占工作区，使用滚动免费授权，无钱包合约、分佣或免费额度消耗。租约域名按原买家授权。租期内所有身份的物理控制台与 Web Terminal 一律关闭。退租后仍需完成清理才能重新出租。
 
-卖家登录后可通过 `GET /v1/client-market/online/seller-inventory` 查看当前上架项和自己售出的租约。`items` 包含 ID、名称、状态、成交月价、脱敏租户邮箱、授权到期时间和可选的 `terminationId`。`listingId` 指向该卖家仍可管理的物理上架项。买家租约投影还包含 `createdAt,activatedAt,cyclePriceMinor,country,autoRenew,periodEnd,holdStatus` 及访问事件的 `count`。开通成功的站内通知以租约为单位幂等投递。
+新租约的初始状态为 `starting`。工作区就绪后进入 `active`。租户通过 `GET /v1/client-market/online/leases` 读取域名、授权到期时间与访问记录。默认最多返回 200 条，当前租约优先。工作区启动页使用 `?current=true` 读取该买家的全部未释放租约。附带 `focus=<leaseId>` 时也返回该买家指定的已释放记录。窗口票据的目标是本次 `leaseId`，每次验证买家身份、域名版本、租约状态及有效期。租户的 Share 位于 `{slug}--{leaseAlias}`，由当前工作区账号持有。
+
+卖家可对 `locking` 或 `unlocking` 调用 `POST /v1/client-market/online/installations/:id/retry`，重新调度同一序号。
+
+卖家登录后可通过 `GET /v1/client-market/online/seller-inventory` 查看当前上架项和自己售出的租约。`items` 包含 ID、名称、状态、成交月价、完整租户邮箱、授权到期时间和可选的 `terminationId`。`listingId` 指向该卖家仍可管理的物理上架项。买家租约投影还包含 `createdAt,activatedAt,cyclePriceMinor,country,autoRenew,periodEnd,holdStatus` 及访问事件的 `count`。开通成功的站内通知以租约为单位幂等投递。
 
 退租先调用 `POST /v1/client-market/clients/:leaseId/termination-preview`，再向 `POST /v1/client-market/online/leases/:leaseId/end` 提交 `{previewId,reason,claim}`。回执中的 `terminationId` 定位唯一的赔付、争议和审计记录。确认后公网访问立即失效；处于 `ending`、`cleaning` 的 installation 继续被原租约占用。历史事件和回执保留，Client 证明已恢复 owner 工作区后才能再租。
+
+Router 的 Clients 卡片和抽屉向所有查看者展示完整 owner 邮箱和当前未释放租约的 `tenantEmail`。只有有效租约的买家可取得工作区入口。Dashboard 的 `rental.migrationRequired` 和买家个人租约详情的 `rental.migrationRequired` 表示该笔进行中的租约仍在使用管理版本 1。迁移成功且 Client 支持升级时，买家可以用 `POST /v1/client-market/online/leases/:leaseId/upgrade` 提交 UUID 格式的 `operationId`，使用 `GET .../upgrade/status?taskId=...` 查询自己的任务。新租约从版本 2 开始。重新提交同一操作返回原任务。租约升级采用既有发布校验，并在替换前验证候选程序支持独占管理。
 
 原买家可在撤权前向主域 `POST /v1/client-market/online/leases/:leaseId/backup`。Router 经租户窗口授权向当前 Client 请求导出，在返回前复核租约，仅以 `application/zip` 附件返回工作区备份。下载使用 `private, no-store`。备份成功与提交退租是两个独立操作。
 
@@ -433,17 +443,25 @@ Client 在 installation 心跳中声明 `marketLeaseV1: true`。Router 通过绑
 | 路径 | 输入和结果 |
 |---|---|
 | `/_ctl/market/check` | `{challenge}`。检查工作区和 Share 状态，经业务出站代理回报出口，返回硬件与版本。 |
-| `/_ctl/market/command` | `{sequence,action}`。操作为 `list`、`unlist`、`begin`、`extend`、`fence`、`clean` 或 `cancel`。begin 的 grant 包含 `leaseId,tenantEmail,alias,expiresAt`。完全相同的命令可重放，每个 installation 拒绝落后或同序号冲突的命令。 |
-| `/_ctl/market/status` | 返回 `sequence,listedOwner,grant,runningLease,switching,fenced,cleanupSafe,events` 和版本。每批最多 1024 个事件。Router 事务落库后用 `{leaseId,received:[eventId,...]}` 确认该批；重复投递和重复确认均幂等。可传 `hardware:true` 刷新资源。 |
-| `/_ctl/market/upgrade`、`/_ctl/market/upgrade-status` | 前者接受 `ownerEmail,restartAfter` 并返回 `taskId`，需要安装方启用升级委托，仅使用 Server 配置的 release 来源。后者接受 `ownerEmail,taskId`，仅返回该次升级的状态。两者均校验 installation owner；Client 已记录上架 owner 时两者必须一致，因此上架或下架指令在途时也可使用。 |
+| `/_ctl/market/command` | `{sequence,action}`。操作为 `list`、`unlist`、`begin`、`extend`、`fence`、`clean`、`cancel` 或 `return`。begin 的 grant 包含 `leaseId,buyerId,tenantEmail,alias,expiresAt`。完全相同的命令可重放，每个 installation 拒绝落后或同序号冲突的命令。 |
+| `/_ctl/market/status` | 返回 `sequence,listedOwner,grant,runningLease,switching,fenced,cleanupSafe,events` 和版本。每批最多 1024 个事件。Router 事务落库后用 `{leaseId,received:[eventId,...]}` 确认该批；重复投递和重复确认均幂等。可传 `hardware:true` 刷新资源。返回 `exclusiveManagement,upgradeBusy,awaitingReturn`。清理后仍保持本机锁，Client 确认 `return` 后 Router 完成释放，再发送匹配的 `releasedLeaseId` 解除本机锁。丢失的确认可在下次探测重试。 |
+| `/_ctl/market/upgrade`、`/_ctl/market/upgrade-status` | 空闲安装校验 owner 和升级委托。租期内校验签名、租约 ID、买家 ID、租户邮箱和有效期。升级任务带租约前缀并强制完成重启，状态及日志按租约隔离。 |
+
+新维护回执使用 `tenant_upgrade`、`tenant_auto_upgrade`、`tenant_restart`、`tenant_rollback`。历史卖家协助和终端回执沿用原有分类及去重键。迁移 0129 将既有租约标记为管理版本 1。Router 封锁其物理公网窗口，保留原买家的有效工作区。旧程序按原规则处理宿主本机访问。首次原位迁移须先更新宿主 Client。Router 核对签名回执的序号、独占能力、租约、别名、租户邮箱、回执中的买家 ID（若有）、运行工作区及授权截止时间。只有租约仍有效且工作区未封锁、未切换时才原位写入版本 2。原租约 ID、账务及清理流程继续使用。已成交的旧报价仍可重取原回执，未成交的旧报价须重新获取。
 
 租户工作区启动后，Client 发往 Router 的签名请求使用 `lease_<leaseId>_<32位随机十六进制串>` 作为 nonce。下划线符合 installation 请求已有的 8–128 个 ASCII 字母、数字、连字符和下划线约束。Router 用租约 ID 核对请求所属工作区，原工作区的延迟请求不能修改下一份租约的 Share。
+
+选购卡片以 `registeredAt` 复用 Clients 页的运行时长口径，从 installation 首次接入 Router 起计算。
+
+选购卡片的 `onlineRate24h` 来自最近 24 小时 installation 隧道健康检查。它是有健康记录的分钟数占所有已观测分钟数的百分比。无样本返回 null，同时提供 `observedMinutes24h` 和按 1440 分钟计算的 `observationCoverage24h`。硬件快照每小时刷新。
+
+当前前端请求 `GET /v1/client-market/online/listings?includeAvailableHours24=false`，响应省略旧字段并跳过对应聚合。省略参数或传 `true` 时，仍返回整数 `availableHours24`。它统计最近 24 个已结束的 UTC 小时中，至少有 10 个不同五分钟时段探测成功的小时数，没有成功小时返回 0。
 
 Router 每五分钟主动探测，在 UTC 自然小时的 12 个时段里取得至少 10 个成功才将整小时计为可用。首尾按相交时段的 5/6 向上取整，缺失样本计失败。服务在某个时段中途开始或结束、而该时段的探测落在窗口之外时，这个时段既不计成功也不计入分母；窗口短于一个时段时沿用最近一次探测结果。弱网或离线时保留清理意图；Client 在本地授权到期时独立封锁访问。Server、账务和公网路由均使用 Unix 秒的授权截止时间。
 
 开启自动续费的付费月租，授权截止时间为本期结束后再加 2 小时，用于完成续费扣款并下发 `extend`；续费失败或已关闭自动续费时，合约状态变化会立即结束租约。退租截止 24 小时后，若第三方车位已结清而 Client 仍未交回清理回执，Router 先按原规则完成退款或解冻，退租事件记为 `settled_without_cleanup`；上架项仍保持占用，直到 Client 交回清理回执。
 
-`GET /v1/client-market/online/listings` 只向卖家本人返回物理子域名和完整出口 IP；其他访问者看到的 `label` 为 `client-<installation 前 8 位>`，`egressIp` 隐去最后一段。
+`GET /v1/client-market/online/listings` 只向卖家本人返回物理子域名和完整出口 IP。其他访问者看到的 `label` 为 `client-<installation 前 8 个字母或数字>`。他们的 `egressIp` 对 IPv4 返回前三段加 `.xx`，对 IPv4 映射的 IPv6 地址按 IPv4 处理，对其他 IPv6 地址返回规范化的 `/64` 网段。缺失或无法解析时返回 `null`。
 
 ### 7.2 Share / Client Market 统一准入
 

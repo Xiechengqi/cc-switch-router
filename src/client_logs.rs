@@ -148,14 +148,10 @@ async fn client_logs_inner(
         }
         None => false,
     };
-    {
-        let conn = state.store.conn.lock().await;
-        let leased:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM online_client_leases WHERE installation_id=?1 AND released_at IS NULL)",crate::db::params![installation_id],|r|r.get(0)).map_err(|e|AppError::Internal(e.to_string()))?;
-        if leased {
-            return Err(AppError::Forbidden(
-                "use the leased Client assistance view".into(),
-            ));
-        }
+    if state.store.installation_leased(installation_id).await? {
+        return Err(AppError::Forbidden(
+            "installation logs are unavailable during rental".into(),
+        ));
     }
     let line_limit = client_log_line_limit(is_client_owner);
     if !state
@@ -184,6 +180,11 @@ async fn client_logs_inner(
     )
     .await
     .map_err(map_control_error)?;
+    if state.store.installation_leased(installation_id).await? {
+        return Err(AppError::Forbidden(
+            "installation logs are unavailable during rental".into(),
+        ));
+    }
     client_logs_response(installation_id, line_limit, reply)
 }
 

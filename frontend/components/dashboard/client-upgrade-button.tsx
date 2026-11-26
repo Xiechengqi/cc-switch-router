@@ -4,7 +4,7 @@ import { toast } from "@heroui/react";
 import { CircleX, Clock3, Loader2, Rocket } from "lucide-react";
 import * as React from "react";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
-import { clientOwnerEmail, clientTunnelDisplayUrl } from "@/components/dashboard/data-tables";
+import { clientTunnelDisplayUrl } from "@/components/dashboard/data-tables";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   ApiError,
@@ -12,7 +12,6 @@ import {
   getClientInstallationUpgradeStatus,
   upgradeClientInstallation,
 } from "@/lib/api";
-import { readAuthState } from "@/lib/auth";
 import type { DashboardClient } from "@/lib/types";
 import {
   IDLE_CLIENT_UPGRADE_STATE,
@@ -88,29 +87,29 @@ function UpgradeStateIcon({ state }: { state: ClientUpgradeState }) {
 }
 
 export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
+  const leased = !!client.rental;
+  const installationId = client.rental?.controlId || client.installation.id;
+  const tunnel = client.clientTunnel;
+  const upgrade = client.installation.upgrade;
+  return <ClientUpgradeControl installationId={installationId} leased={leased}
+    upgradeTarget={tunnel?.subdomain || installationId.slice(0, 8)} canInspect={client.canUpgrade === true}
+    available={!!clientTunnelDisplayUrl(tunnel?.tunnelUrl) && tunnel?.enabled === true && tunnel.online
+      && (leased || upgrade?.delegateUpgradeToRouterOwner !== false) && upgrade?.upgradeCapable !== false}
+    tunnelOnline={tunnel?.online === true} observedCommitId={upgrade?.commitId?.trim() || undefined}
+  />;
+}
+
+export function ClientUpgradeControl({ installationId, leased, upgradeTarget, canInspect, available, tunnelOnline, observedCommitId }: {
+  installationId: string; leased: boolean; upgradeTarget: string; canInspect: boolean;
+  available: boolean; tunnelOnline?: boolean; observedCommitId?: string;
+}) {
   const { t } = useLocaleText();
   const [state, setState] = React.useState<ClientUpgradeState>(IDLE_CLIENT_UPGRADE_STATE);
   const [stateReady, setStateReady] = React.useState(false);
   const [confirmOpen, setConfirmOpen] = React.useState(false);
   const startGuardRef = React.useRef(false);
   const statusPollEpochRef = React.useRef(0);
-  const installationId = client.installation.id;
-  const upgradeTarget = client.clientTunnel?.subdomain || installationId.slice(0, 8);
-  const sessionEmail = readAuthState().email?.trim().toLowerCase();
-  const ownerEmail = clientOwnerEmail(client)?.trim().toLowerCase();
-  const clientTunnel = client.clientTunnel;
-  const tunnelUrl = clientTunnelDisplayUrl(clientTunnel?.tunnelUrl);
-  const delegateEnabled = client.installation.upgrade?.delegateUpgradeToRouterOwner !== false;
-  const upgradeCapable = client.installation.upgrade?.upgradeCapable;
-  const observedCommitId = client.installation.upgrade?.commitId?.trim() || undefined;
-  const canInspect = !!sessionEmail && !!ownerEmail && sessionEmail === ownerEmail;
-  const canUpgrade = canInspect
-    && !!tunnelUrl
-    && clientTunnel?.enabled === true
-    && clientTunnel.online
-    && delegateEnabled
-    && upgradeCapable !== false
-    && !state.retryBlocked;
+  const canUpgrade = canInspect && available && !state.retryBlocked;
 
   const patchState = React.useCallback((
     updater: ClientUpgradeState | ((prev: ClientUpgradeState) => ClientUpgradeState),
@@ -192,20 +191,20 @@ export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
     if (
       !shouldClearClientUpgradeLatch(state, {
         observedCommitId,
-        tunnelOnline: clientTunnel?.online === true,
+        tunnelOnline: tunnelOnline === true,
       })
     ) {
       return;
     }
     resetUpgradeState();
-  }, [clientTunnel?.online, observedCommitId, resetUpgradeState, state]);
+  }, [tunnelOnline, observedCommitId, resetUpgradeState, state]);
 
   React.useEffect(() => {
     const isRunning = state.phase === "running" && !!state.taskId;
     const isRecovering = state.phase === "recovering";
     if (!isRunning && !isRecovering) return;
 
-    const taskId = isRunning ? state.taskId : undefined;
+    const taskId = isRunning || state.recoveryReason === "start" ? state.taskId : undefined;
     const recoveryReason = state.recoveryReason;
     const startedAt = state.startedAt;
     const epoch = statusPollEpochRef.current;
@@ -240,6 +239,7 @@ export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
           installationId,
           taskId,
           requestController.signal,
+          leased,
         );
         if (!isCurrent()) return;
         if (result.status === "success") {
@@ -321,6 +321,7 @@ export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
     };
   }, [
     installationId,
+    leased,
     markUpgradeFailed,
     patchState,
     resetUpgradeState,
@@ -332,7 +333,7 @@ export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
     upgradeTarget,
   ]);
 
-  if (!canUpgrade && state.phase === "idle") return null;
+  if (!canInspect || (!canUpgrade && !leased && state.phase === "idle")) return null;
 
   let buttonLabel = t("dashboard.clientUpgrade");
   if (state.phase === "starting" || state.phase === "running") {
@@ -361,11 +362,11 @@ export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
   if (state.statusUnavailable && !locked) buttonTone += " hover:border-amber-300 hover:bg-amber-100";
   if (locked) buttonTone += " pointer-events-none";
 
-  async function runUpgrade(startedAt: number) {
+  async function runUpgrade(startedAt: number, operation?: string, expectedTask?:string) {
     const controller = new AbortController();
     const requestTimeout = window.setTimeout(() => controller.abort(), CLIENT_UPGRADE_START_TIMEOUT_MS);
     try {
-      const result = await upgradeClientInstallation(installationId, true, controller.signal);
+      const result = await upgradeClientInstallation(installationId, true, controller.signal, operation);
       patchState({
         phase: "running",
         startedAt,
@@ -383,6 +384,7 @@ export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
           phase: "recovering",
           startedAt,
           recoveryReason: "start",
+          taskId: expectedTask,
           statusUnavailable: true,
           errorMessage,
           observedCommitId,
@@ -408,9 +410,14 @@ export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
     // A late result from the previous poll must not overwrite this new attempt.
     statusPollEpochRef.current += 1;
     const startedAt = Date.now();
-    patchState({ phase: "starting", startedAt, observedCommitId });
+    // A retry after a lost POST acknowledgement must identify the same operation.
+    const priorOperation = leased && state.statusUnavailable && state.taskId?.startsWith(`lease-${installationId}-`)
+      ? state.taskId.slice(-32) : undefined;
+    const operation = leased ? priorOperation || crypto.randomUUID() : undefined;
+    const taskId = operation ? `lease-${installationId}-${operation.replaceAll("-", "")}` : undefined;
+    patchState({ phase: "starting", startedAt, observedCommitId, taskId });
     setConfirmOpen(false);
-    void runUpgrade(startedAt);
+    void runUpgrade(startedAt, operation, taskId);
   }
 
   const buttonDisabled = !stateReady || locked || confirmOpen || !canUpgrade || !!state.retryBlocked;

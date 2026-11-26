@@ -49,6 +49,8 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
     let available = "0";
     let quoteRequests = 0;
     let ttl = 120;
+    let authenticated = true;
+    let delistRequests = 0;
     let rejectNextQuote = false;
     let loseNextReply = false;
     const commits = [];
@@ -57,9 +59,10 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
     const listing = {
       installationId: "online-client", providerId: "provider", label: "Test online Client",
       revision: 7, state: "listed", owned: false, cyclePriceMinor: 1000, freeDays: null,
-      trialDays: 1, country: "JP", egressIp: "192.0.2.10", egressDiffers: true,
+      trialDays: 1, country: "JP", egressIp: "192.0.2.xx", egressDiffers: true,
       hardware: { arch: "aarch64", cpu: 2, memoryBytes: 2 ** 32, diskBytes: 32 * 2 ** 30 },
-      healthy: true, occupied: false, observedAt: Math.floor(Date.now()/1000), availableHours24: 22,
+      ownerRental: true, exclusiveManagement: true, onlineRate24h: 98.75, observedMinutes24h: 80, observationCoverage24h: 5.56,
+      healthy: true, occupied: false, observedAt: Math.floor(Date.now()/1000), availability: "available",
     };
     let retiredMoneyRequests = 0;
     await page.addInitScript(() => {
@@ -67,6 +70,8 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
         "cc_switch_router_locale_v1",
         new URL(location.href).searchParams.get("testLocale") || "zh-CN",
       );
+      if (!localStorage.getItem("cc_switch_router_client_market_shop_browse_v1"))
+        localStorage.setItem("cc_switch_router_client_market_shop_browse_v1", JSON.stringify({ scope: "mine", country: "JP", rentableOnly: true }));
       localStorage.setItem(
         "cc_switch_router_auth_v2",
         JSON.stringify({
@@ -89,16 +94,40 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
       if (path === "/v1/ui/context") body = { mode: "router" };
       else if (path === "/v1/auth/session/me")
         body = {
-          authenticated: true,
+          authenticated,
           isAdmin: false,
-          user: { id: "buyer", email: "buyer@example.com" },
+          user: authenticated ? { id: "buyer", email: "buyer@example.com" } : null,
         };
       else if (path.startsWith("/v1/market-provider-finance/wallet-conversion") || path.includes("/withdrawals")) {
         retiredMoneyRequests += 1;
         return route.fulfill({ status: 410, contentType: "application/json", body: JSON.stringify({ code: "RETIRED" }) });
       }
       else if (path === "/v1/client-market/termination-workspace") body = { hosts: [], actionRequiredCount: 0, canAdjudicate: false, serverNow: new Date().toISOString() };
-      else if (path === "/v1/client-market/me/rentals") body = emptyClientRentalsPage(req.url());
+      else if (req.method() === "DELETE" && path.endsWith("/listing")) {
+        delistRequests += 1;
+        body = { state: "unlocking" };
+      } else if (path.startsWith("/v1/client-market/me/rentals")) {
+        const list = emptyClientRentalsPage(req.url());
+        const now = list.serverNow;
+        const records = leases.map((lease) => ({
+          group: "current", id: "lease:" + lease.leaseId, installationId: lease.leaseId, clientSubdomain: lease.alias,
+          providerEmail: "seller@example.com", countryCode: "JP", provenance: "order_snapshot", createdAt: now, activatedAt: now,
+          status: lease.cyclePriceMinor ? "paid" : "free", pricingModel: lease.cyclePriceMinor ? "prepaid_calendar_month" : "free",
+          cyclePriceMinor: lease.cyclePriceMinor || null, endedAt: null, cleanupConfirmedAt: null, contractId: null,
+          cleanupStatus: "not_required", attention: "none", terminationId: null, dailyRateMinor: null, offerRevision: 7,
+          trialSecondsRemaining: null, renewalPolicy: null, periodEnd: null, expiresAt: null, freeDurationDays: null,
+          contractStatus: null, money: null,
+        }));
+        if (path.endsWith("/rentals")) {
+          const focus = new URL(req.url()).searchParams.get("focus");
+          body = list.view === "current" ? { ...list, items: records, total: records.length,
+            focusedId: records.find((r) => r.installationId === focus)?.id ?? null } : list;
+        } else {
+          const record = records.find((r) => r.id === decodeURIComponent(path.split("/").pop()));
+          body = { record, rental: { leaseId: record.installationId, contractId: null, canDispute: false, openDispute: false },
+            periods: [], periodsNextCursor: null, events: [], eventsNextCursor: null, trialConsumedSeconds: 0, serverNow: now, settlement: null };
+        }
+      }
       else if (path.endsWith("/usage-history")) body = [];
       else if (path === "/v1/notifications") body = { items: [], nextCursor: null, unread: 0, readThrough: null };
       else if (path === "/v1/client-market/online/listings") body = {listings:[listing]};
@@ -112,13 +141,14 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
           id: "quote-" + quoteRequests,
           expiresAt: Math.floor(Date.now() / 1000) + ttl,
           terms: {
-            cyclePriceMinor: listing.cyclePriceMinor,
-            freeDays: listing.freeDays,
-            trialSeconds: listing.trialDays ? 498 : 0,
-            autoRenew: input.autoRenew,
+            selfRental: listing.owned, listingPriceMinor: listing.cyclePriceMinor,
+            cyclePriceMinor: listing.owned ? 0 : listing.cyclePriceMinor,
+            freeDays: listing.owned ? null : listing.freeDays,
+            trialSeconds: !listing.owned && listing.trialDays ? 498 : 0,
+            autoRenew: !listing.owned && input.autoRenew,
             terminationPolicy: { version: 1, rateBps: 1000 },
           },
-          walletFunding: listing.cyclePriceMinor
+          walletFunding: !listing.owned && listing.cyclePriceMinor
             ? {
                 assetCode: "USD",
                 availableUnits: available,
@@ -146,7 +176,7 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
             clientUrl: "https://rental.example.test",
             activatedAt: Math.floor(Date.now() / 1000),
             createdAt: Math.floor(Date.now() / 1000),
-            cyclePriceMinor: listing.cyclePriceMinor,
+            cyclePriceMinor: listing.owned ? 0 : listing.cyclePriceMinor,
             events: [],
             terminationId: null,
           });
@@ -183,17 +213,27 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
     await installFinancialBrowserIdentity(page);
     await page.goto(baseUrl + "/client-market/?testLocale=en&country=JP");
     const supply = page.locator("#market-client-online-client");
-    await supply.getByText(/192.0.2.10/).waitFor();
-    await supply.getByText(/2C/).waitFor();
+    await supply.getByText(/2 cores · 4 GiB · aarch64/).waitFor();
+    await supply.getByRole("img", { name: "Japan" }).waitFor();
+    await supply.getByText("98.8%").waitFor();
+    assert.equal(await supply.getByText("IP 192.0.2.xx", { exact: true }).isVisible(), false);
+    await supply.getByText("Network details").click();
+    await supply.getByText("IP 192.0.2.xx", { exact: true }).waitFor();
+    await supply.getByText("Network details").click();
+    assert.equal(await page.getByRole("option", { name: "Mine", exact: true }).count(), 0);
+    assert.equal(await supply.getByText(/root access|24 h$|running time/i).count(), 0);
     for (const width of [320, 375, 768, 1440]) {
       await page.setViewportSize({ width, height: 900 });
       if (captureScreenshots) await page.screenshot({ path: artifacts + "/online-supply-" + width + ".png" });
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
     }
-    await supply.getByRole("button", { name: /Continue/ }).click();
+    await supply.getByRole("button", { name: "Rent", exact: true }).click();
     const checkout = page.getByRole("dialog");
     await checkout.getByText(/8 min 18 sec/).waitFor();
-    await checkout.getByText(/Add .* to continue/).waitFor();
+    await checkout.getByText("First-period balance required").waitFor();
+    await checkout.getByText("Shortfall", { exact: true }).waitFor();
+    assert.equal(await checkout.getByText(/Add .* to continue/).count(), 0);
+    if (captureScreenshots) await checkout.screenshot({ path: artifacts + "/paid-checkout.png" });
     assert.equal(await checkout.getByRole("link", { name: "Platform wallet" }).count(), 0);
     const renewal = checkout.getByRole("checkbox", { name: /renew/i });
     await Promise.all([
@@ -203,12 +243,14 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
       renewal.check(),
     ]);
     assert.equal(commits.length, 0);
+    await checkout.getByRole("button", { name: "Cover shortfall" }).click();
+    await checkout.getByText(/Add .* to continue/).waitFor();
     available = "86400000";
     await page.evaluate(() =>
       window.dispatchEvent(new CustomEvent("router-market-balance-changed", { detail: "buyer" })),
     );
     const confirm = checkout.getByRole("button", { name: "Confirm rental" });
-    const ack = checkout.getByRole("checkbox", { name: /root access/ });
+    const ack = checkout.getByRole("checkbox", { name: /owner can read/ });
     await ack.check();
     rejectNextQuote = true;
     await confirm.click();
@@ -227,7 +269,7 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
       .getByRole("button", { name: /Retry/i })
       .click();
     try {
-      await page.locator("#market-client-lease-0").waitFor();
+      await page.getByTestId("client-rental-detail").getByText("lease:lease-0", { exact: true }).waitFor();
     } catch (cause) {
       console.error({
         url: page.url(),
@@ -240,6 +282,7 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
     assert.equal(leases.length, 1);
     assert.equal(commits.at(-1).path, commits.at(-2).path);
     assert.notEqual(commits.at(-1).path, commits[0].path);
+    assert.equal(new URL(page.url()).pathname, "/account/rentals/");
     assert.equal(new URL(page.url()).searchParams.get("focus"), "lease-0");
     await page.clock.setFixedTime(new Date());
     listing.cyclePriceMinor = 0;
@@ -247,13 +290,45 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
     listing.freeDays = 7;
     ttl = 2;
     await page.goto(baseUrl + "/client-market/?testLocale=zh-CN&country=JP");
-    await supply.getByRole("button", { name: /继续/ }).click();
+    await supply.getByRole("button", { name: "租用", exact: true }).click();
     assert.equal(await checkout.getByRole("checkbox").count(), 1);
     ttl = 120;
     await checkout.getByText(/报价已更新/).waitFor();
-    await checkout.getByRole("checkbox", { name: /root/ }).check();
-    await checkout.getByRole("button", { name: "确认租用" }).click();
+    await checkout.getByRole("checkbox", { name: /读取磁盘数据/ }).check();
+    await checkout.getByRole("button", { name: "确认免费租用" }).click();
     await checkout.waitFor({ state: "hidden" });
+    await page.waitForURL(/account\/rentals\/.*focus=lease-1/);
+    listing.cyclePriceMinor = 4200;
+    listing.freeDays = null;
+    listing.trialDays = 3;
+    listing.owned = true;
+    listing.onlineRate24h = null;
+    listing.observedMinutes24h = 0;
+    await page.goto(baseUrl + "/client-market/?testLocale=zh-CN");
+    await supply.getByText("自租免费").waitFor();
+    await supply.getByText("暂无观测").waitFor();
+    await page.setViewportSize({ width: 375, height: 720 });
+    await supply.getByRole("button", { name: "租用", exact: true }).click();
+    await checkout.getByText(/由你的工作区独占/).waitFor();
+    assert.equal(await checkout.getByRole("checkbox").count(), 0);
+    assert.equal(await checkout.getByText(/42\.00|钱包/).count(), 0);
+    if (captureScreenshots) await checkout.screenshot({ path: artifacts + "/self-checkout-mobile.png" });
+    await checkout.getByRole("button", { name: "确认免费租用" }).click();
+    await page.waitForURL(/account\/rentals\/.*focus=lease-2/);
+    assert.equal(leases.at(-1).cyclePriceMinor, 0);
+    assert.equal(delistRequests, 0);
+    listing.ownerRental = false;
+    await page.goto(baseUrl + "/client-market/?testLocale=zh-CN");
+    await page.getByText("当前没有可租的 Client。").waitFor();
+    await page.getByRole("button", { name: "仅可租" }).click();
+    await supply.getByText("Client 升级后可租用").waitFor();
+    assert.equal(await supply.getByRole("button", { name: "租用", exact: true }).count(), 0);
+    await page.goto(baseUrl + "/client-market/?view=rentals&focus=lease-2");
+    await page.waitForURL(/account\/rentals\/.*focus=lease-2/);
+    listing.owned = false;
+    authenticated = false;
+    await page.goto(baseUrl + "/client-market/?testLocale=zh-CN&country=JP");
+    await supply.getByRole("button", { name: "登录后租用" }).waitFor();
     assert.equal(retiredMoneyRequests, 0);
     console.log(
       "PASS checkout in both languages, renewal terms, in-place funding, expiry, retry and receipt focus",

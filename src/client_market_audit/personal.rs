@@ -200,7 +200,12 @@ async fn get_detail(
     let tx = conn
         .transaction()
         .map_err(db_error("begin personal rental detail"))?;
-    let value = detail_tx(&tx, &actor, &id, &q)?;
+    let mut value = detail_tx(&tx, &actor, &id, &q)?;
+    if value["rental"].is_object() {
+        if let Some(alias) = value["record"]["clientSubdomain"].as_str() {
+            value["rental"]["clientUrl"] = json!(state.config.tunnel_url(alias));
+        }
+    }
     tx.commit()
         .map_err(db_error("finish personal rental detail"))?;
     Ok(Json(value))
@@ -238,12 +243,20 @@ fn detail_tx(
     let record = buyer_record(&detail["record"])?;
     let rental = if record["group"] == "current" {
         conn.query_row(
-            "SELECT r.id,c.id,c.paid_started_at IS NOT NULL,EXISTS(SELECT 1 FROM market_service_disputes d WHERE d.contract_id=c.id AND d.status='open')
+            "SELECT r.id,c.id,c.paid_started_at IS NOT NULL,EXISTS(SELECT 1 FROM market_service_disputes d WHERE d.contract_id=c.id AND d.status='open'),
+                    r.created_at+600,r.grant_until,h.status,
+                    r.state='active' AND r.management_version=2 AND coalesce(l.exclusive_management,0) AND coalesce(i.upgrade_capable,1),
+                    r.management_version=1
                FROM online_client_leases r LEFT JOIN market_platform_contracts c ON c.product_kind='client_host' AND c.product_ref=r.id
-              WHERE r.id=?1 AND r.buyer_id=?2 AND r.state='active' AND r.grant_until>unixepoch()",
+               JOIN online_client_listings l ON l.installation_id=r.installation_id
+               LEFT JOIN installations i ON i.id=r.installation_id
+               LEFT JOIN market_wallet_holds h ON h.id=c.activation_hold_id
+              WHERE r.id=?1 AND r.buyer_id=?2 AND (r.state='starting' OR (r.state='active' AND r.grant_until>unixepoch()))",
             params![record["installationId"].as_str(),actor.user_id],
             |r| Ok(json!({"leaseId":r.get::<_,String>(0)?,"contractId":r.get::<_,Option<String>>(1)?,
-                "canDispute":r.get::<_,bool>(2)?,"openDispute":r.get::<_,bool>(3)?})),
+                "canDispute":r.get::<_,bool>(2)?,"openDispute":r.get::<_,bool>(3)?,"activationDeadline":r.get::<_,i64>(4)?,
+                "grantUntil":r.get::<_,i64>(5)?,"holdStatus":r.get::<_,Option<String>>(6)?,"canUpgrade":r.get::<_,bool>(7)?,
+                "migrationRequired":r.get::<_,bool>(8)?})),
         ).optional().map_err(db_error("read buyer lease actions"))?
     } else {
         None
@@ -275,7 +288,7 @@ fn detail_tx(
         .as_array()
         .into_iter()
         .flatten()
-        .map(|e| fields(e, &["id", "action", "createdAt", "note"]))
+        .map(|e| fields(e, &["id", "action", "createdAt", "note", "occurrences"]))
         .collect();
     Ok(
         json!({"record":record,"rental":rental,"periods":periods,"periodsNextCursor":detail["periodsNextCursor"],

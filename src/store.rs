@@ -226,7 +226,7 @@ const DASHBOARD_MEDIUM_LATENCY_MS: u64 = 15_000;
 const DASHBOARD_HIGH_LATENCY_MS: u64 = 30_000;
 const DASHBOARD_LATENCY_MIN_SAMPLES: usize = 3;
 
-fn observed_online_rate(healthy_minutes: usize, observed_minutes: usize) -> f64 {
+pub(crate) fn observed_online_rate(healthy_minutes: usize, observed_minutes: usize) -> f64 {
     if observed_minutes == 0 {
         0.0
     } else {
@@ -247,7 +247,7 @@ fn truncate_notification_utf8(value: &str, max_bytes: usize) -> String {
     format!("{}{suffix}", &value[..end])
 }
 
-fn observation_coverage(observed_minutes: usize) -> f64 {
+pub(crate) fn observation_coverage(observed_minutes: usize) -> f64 {
     (observed_minutes as f64 / ONLINE_WINDOW_MINUTES as f64 * 100.0).clamp(0.0, 100.0)
 }
 
@@ -798,8 +798,22 @@ fn dashboard_installation_ip(
     self_reported.or(router_observed).map(str::to_string)
 }
 
-fn visible_dashboard_ip(ip: Option<String>, reveal: bool) -> Option<String> {
-    ip.map(|value| if reveal { value } else { mask_host_ip(&value) })
+pub(crate) fn visible_host_ip(ip: Option<String>, reveal: bool) -> Option<String> {
+    if reveal {
+        return ip;
+    }
+    let address = ip.as_deref()?.trim().parse::<IpAddr>().ok()?.to_canonical();
+    Some(match address {
+        IpAddr::V4(address) => {
+            let [a, b, c, _] = address.octets();
+            format!("{a}.{b}.{c}.xx")
+        }
+        IpAddr::V6(address) => {
+            let [a, b, c, d, ..] = address.segments();
+            let network = std::net::Ipv6Addr::new(a, b, c, d, 0, 0, 0, 0);
+            format!("{network}/64")
+        }
+    })
 }
 
 fn is_map_active_client(operational_state: &str) -> bool {
@@ -6303,6 +6317,7 @@ impl AppStore {
         }
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock().await;
+        Self::require_unleased_installation(&conn, installation_id)?;
         let installation = get_installation(&conn, installation_id)?
             .ok_or_else(|| AppError::NotFound("installation not found".into()))?;
         let owner_email = verified_installation_owner_email(&installation)
@@ -6341,6 +6356,16 @@ impl AppStore {
         task_id: Option<&str>,
         session_email: &str,
     ) -> Result<UpgradeInstallationStatusResponse, AppError> {
+        self.installation_upgrade_status_scoped(installation_id, task_id, session_email, None)
+            .await
+    }
+    pub(crate) async fn installation_upgrade_status_scoped(
+        &self,
+        installation_id: &str,
+        task_id: Option<&str>,
+        session_email: &str,
+        tenant: Option<(&str, &str)>,
+    ) -> Result<UpgradeInstallationStatusResponse, AppError> {
         let task_id = task_id.map(str::trim).filter(|value| !value.is_empty());
         if task_id.is_some_and(|value| value.len() > 128) {
             return Err(AppError::BadRequest(
@@ -6348,22 +6373,41 @@ impl AppStore {
             ));
         }
         let conn = self.conn.lock().await;
-        let installation = get_installation(&conn, installation_id)?
-            .ok_or_else(|| AppError::NotFound("installation not found".into()))?;
-        let owner_email = verified_installation_owner_email(&installation)
-            .map_err(|_| AppError::Forbidden("installation owner is not verified".into()))?;
-        if owner_email != session_email.trim().to_ascii_lowercase() {
-            return Err(AppError::Forbidden(
-                "only installation owner can inspect upgrade status".into(),
-            ));
+        let lease_id = tenant.map(|(lease, _)| lease);
+        if let Some((lease, user)) = tenant {
+            let current: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM online_client_leases r
+                 JOIN online_client_listings l ON l.installation_id = r.installation_id
+                 WHERE r.id = ?1 AND r.installation_id = ?2 AND r.buyer_id = ?3
+                   AND r.tenant_email = ?4 AND r.state = 'active' AND r.grant_until > unixepoch()
+                   AND r.management_version = 2 AND l.exclusive_management)",
+                    params![lease, installation_id, user, session_email],
+                    |row| row.get(0),
+                )
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+            if !current {
+                return Err(AppError::Forbidden("current Client tenant required".into()));
+            }
+        } else {
+            Self::require_unleased_installation(&conn, installation_id)?;
+            let installation = get_installation(&conn, installation_id)?
+                .ok_or_else(|| AppError::NotFound("installation not found".into()))?;
+            let owner_email = verified_installation_owner_email(&installation)
+                .map_err(|_| AppError::Forbidden("installation owner is not verified".into()))?;
+            if owner_email != session_email.trim().to_ascii_lowercase() {
+                return Err(AppError::Forbidden(
+                    "only installation owner can inspect upgrade status".into(),
+                ));
+            }
         }
         let row = if let Some(task_id) = task_id {
             conn.query_row(
                 "SELECT task_id, status, restart_pending, target_commit_id, logs_json,
                         client_reported_at_ms, updated_at, created_at, failure_json
                  FROM installation_upgrade_tasks
-                 WHERE installation_id = ?1 AND task_id = ?2",
-                params![installation_id, task_id],
+                 WHERE installation_id = ?1 AND task_id = ?2 AND lease_id IS ?3",
+                params![installation_id, task_id, lease_id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -6384,10 +6428,10 @@ impl AppStore {
                 "SELECT task_id, status, restart_pending, target_commit_id, logs_json,
                         client_reported_at_ms, updated_at, created_at, failure_json
                  FROM installation_upgrade_tasks
-                 WHERE installation_id = ?1 AND status = 'running'
+                 WHERE installation_id = ?1 AND status = 'running' AND lease_id IS ?2
                  ORDER BY created_at DESC, task_id DESC
                  LIMIT 1",
-                params![installation_id],
+                params![installation_id, lease_id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -6582,6 +6626,13 @@ impl AppStore {
         Ok(())
     }
 
+    fn require_unleased_installation(conn: &Connection, id: &str) -> Result<(), AppError> {
+        let leased:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM online_client_leases WHERE installation_id=?1 AND released_at IS NULL)",params![id],|r|r.get(0)).map_err(|e|AppError::Internal(e.to_string()))?;
+        if leased {
+            return Err(AppError::Forbidden("current Client tenant required".into()));
+        }
+        Ok(())
+    }
     fn installation_upgrade_context(
         conn: &Connection,
         config: &Config,
@@ -6589,6 +6640,7 @@ impl AppStore {
         session_email: &str,
         owner_error: &str,
     ) -> Result<(Installation, String), AppError> {
+        Self::require_unleased_installation(conn, installation_id)?;
         let installation = get_installation(conn, installation_id)?
             .ok_or_else(|| AppError::NotFound("installation not found".into()))?;
         let owner_email = verified_installation_owner_email(&installation)
@@ -12688,12 +12740,24 @@ impl AppStore {
         Ok(input.refresh)
     }
 
+    #[cfg(test)]
     pub async fn dashboard_snapshot(
         &self,
         config: &Config,
         server_geo: &ServerGeo,
         proxy: &ProxyRegistry,
         viewer_email: Option<&str>,
+    ) -> Result<DashboardResponse, AppError> {
+        self.dashboard_snapshot_for_viewer(config, server_geo, proxy, viewer_email, None)
+            .await
+    }
+    pub async fn dashboard_snapshot_for_viewer(
+        &self,
+        config: &Config,
+        server_geo: &ServerGeo,
+        proxy: &ProxyRegistry,
+        viewer_email: Option<&str>,
+        viewer_id: Option<&str>,
     ) -> Result<DashboardResponse, AppError> {
         let viewer_sees_full_client_ip = viewer_email.is_some_and(|email| {
             config
@@ -12726,8 +12790,7 @@ impl AppStore {
             observed_by_share,
             health_by_installation,
             health_timeline_by_installation,
-            online_by_installation,
-            observed_by_installation,
+            health_minutes_by_installation,
             recent_logs,
             recent_model_health_checks,
             model_health_by_share,
@@ -12735,6 +12798,7 @@ impl AppStore {
             live_model_health_status_by_share,
             client_tunnels,
             market_capable,
+            mut current_rentals,
         ) = {
             let conn = self.conn.lock().await;
             let shares = list_shares(&conn)?;
@@ -12777,8 +12841,7 @@ impl AppStore {
                 list_observed_minutes_24h(&conn)?,
                 list_installation_health_checks(&conn, 10)?,
                 list_installation_health_timeline_24h(&conn, now)?,
-                list_installation_online_minutes_24h(&conn)?,
-                list_installation_observed_minutes_24h(&conn)?,
+                installation_health_minutes_24h(&conn)?,
                 list_recent_share_request_logs(&conn, SHARE_REQUEST_LOG_RECOVERY_LIMIT)?,
                 list_recent_share_model_health_checks(&conn, SHARE_MODEL_HEALTH_CHECK_LIMIT)?,
                 list_model_health_summaries(&conn)?,
@@ -12795,6 +12858,31 @@ impl AppStore {
                         Ok((
                             r.get::<_, String>(0)?,
                             (r.get::<_, bool>(1)?, r.get::<_, bool>(2)?),
+                        ))
+                    })
+                    .and_then(|rows| rows.collect::<crate::db::Result<HashMap<_, _>>>())
+                    .map_err(|e| AppError::Internal(e.to_string()))?
+                },
+                {
+                    let mut stmt = conn.prepare("SELECT r.installation_id,r.state,r.tenant_email,r.buyer_id=r.seller_id,
+                            r.management_version=2 AND coalesce(l.exclusive_management,0),
+                            CASE WHEN r.buyer_id=?1 AND r.state='active' AND r.grant_until>unixepoch() AND (r.management_version<2 OR l.exclusive_management) THEN r.id END,
+                            CASE WHEN r.buyer_id=?1 AND r.state='active' AND r.grant_until>unixepoch() AND (r.management_version<2 OR l.exclusive_management) THEN r.alias END,
+                            r.management_version=1 AND (r.state='starting' OR (r.state='active' AND r.grant_until>unixepoch()))
+                        FROM online_client_leases r JOIN online_client_listings l USING(installation_id)
+                        WHERE r.released_at IS NULL").map_err(|e|AppError::Internal(e.to_string()))?;
+                    stmt.query_map(params![viewer_id], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            crate::models::DashboardClientRental {
+                                state: r.get(1)?,
+                                tenant_email: r.get(2)?,
+                                self_rental: r.get(3)?,
+                                exclusive_management: r.get(4)?,
+                                migration_required: r.get(7)?,
+                                control_id: r.get(5)?,
+                                alias: r.get(6)?,
+                            },
                         ))
                     })
                     .and_then(|rows| rows.collect::<crate::db::Result<HashMap<_, _>>>())
@@ -12900,7 +12988,7 @@ impl AppStore {
                 owner_email: verified_owner_email,
                 region: installation.region.clone(),
                 country_code: installation.country_code.clone(),
-                public_ip: visible_dashboard_ip(
+                public_ip: visible_host_ip(
                     dashboard_installation_ip(
                         installation.public_ip.as_deref(),
                         installation.last_seen_ip.as_deref(),
@@ -13120,14 +13208,11 @@ impl AppStore {
                 let client_tunnel_online = tunnel_record
                     .map(|tunnel| tunnel.enabled && client_route_state == "active")
                     .unwrap_or(false);
-                let mut online_minutes_24h = online_by_installation
-                    .get(&installation.id)
-                    .copied()
-                    .unwrap_or(0);
-                let mut observed_minutes_24h = observed_by_installation
-                    .get(&installation.id)
-                    .copied()
-                    .unwrap_or(0);
+                let (mut online_minutes_24h, mut observed_minutes_24h) =
+                    health_minutes_by_installation
+                        .get(&installation.id)
+                        .copied()
+                        .unwrap_or_default();
                 if observed_minutes_24h == 0 && client_tunnel_online {
                     online_minutes_24h = 1;
                     observed_minutes_24h = 1;
@@ -13162,16 +13247,28 @@ impl AppStore {
                 if health_timeline.is_empty() && client_tunnel_online {
                     health_timeline = current_online_health_timeline(health_timeline_start);
                 }
+                let rental = current_rentals.remove(&installation.id);
+                let owner = viewer_email
+                    .zip(installation.owner_email.as_deref())
+                    .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b));
+                let can_upgrade = rental
+                    .as_ref()
+                    .map_or(owner, |r| r.exclusive_management && r.control_id.is_some())
+                    && installation
+                        .upgrade
+                        .as_ref()
+                        .is_none_or(|u| u.upgrade_capable);
                 let mut view = DashboardClientView {
+                    can_upgrade,
                     chat_available: installation.owner_email.is_some(),
-                    log_collection_enabled: log_collection_by_installation
-                        .get(&installation.id)
-                        .copied()
-                        .unwrap_or(false),
-                    can_open_client_terminal: !installation.market_listed
-                        || viewer_email
-                            .zip(installation.owner_email.as_deref())
-                            .is_some_and(|(viewer, owner)| viewer.eq_ignore_ascii_case(owner)),
+                    log_collection_enabled: rental.is_none()
+                        && log_collection_by_installation
+                            .get(&installation.id)
+                            .copied()
+                            .unwrap_or(false),
+                    can_open_client_terminal: rental.is_none()
+                        && (!installation.market_listed || owner),
+                    rental,
                     share_count,
                     share_ids,
                     client_tunnel,
@@ -13185,7 +13282,16 @@ impl AppStore {
                     operational_summary: OperationalSummary::healthy("online"),
                     removal_at: None,
                 };
+                // Health is a property of the installation even when its physical URL is private.
                 view.operational_summary = client_operational_summary(&view);
+                if let Some(rental) = &view.rental {
+                    view.client_tunnel = view.client_tunnel.take().and_then(|mut tunnel| {
+                        let alias = rental.alias.as_ref()?;
+                        tunnel.subdomain = alias.clone();
+                        tunnel.tunnel_url = config.tunnel_url(alias);
+                        Some(tunnel)
+                    });
+                }
                 if view.operational_summary.state == "offline" {
                     view.removal_at = installation_removal_at.get(&view.installation.id).copied();
                 }
@@ -13193,7 +13299,11 @@ impl AppStore {
             })
             // 只展示有 share 或已配置 client tunnel 的机器；otherwise dashboard 会被纯
             // lease/heartbeat 但无可用入口的 installation 撑满。
-            .filter(|client| !client.share_ids.is_empty() || client.client_tunnel.is_some())
+            .filter(|client| {
+                client.rental.is_some()
+                    || !client.share_ids.is_empty()
+                    || client.client_tunnel.is_some()
+            })
             .collect::<Vec<_>>();
         client_views.sort_by(|left, right| {
             // P7 Step 2：installation 维度排序。原"can_manage 优先"是 share 字段，已移除；
@@ -21129,7 +21239,7 @@ fn installation_upgrade_view(installation: &Installation) -> Option<Installation
     })
 }
 
-fn validate_installation_upgrade_task_report(
+pub(crate) fn validate_installation_upgrade_task_report(
     payload: &InstallationUpgradeTaskReportPayload,
 ) -> Result<(), AppError> {
     let task_id = payload.task_id.trim();
@@ -26274,70 +26384,29 @@ fn list_installation_health_checks(
     Ok(map)
 }
 
-fn list_installation_online_minutes_24h(
+pub(crate) fn installation_health_minutes_24h(
     conn: &Connection,
-) -> Result<HashMap<String, usize>, AppError> {
-    let cutoff = Utc::now().timestamp() - 24 * 60 * 60;
+) -> Result<HashMap<String, (usize, usize)>, AppError> {
+    let now = Utc::now().timestamp();
     let mut stmt = conn
         .prepare(
-            "SELECT installation_id, COUNT(DISTINCT checked_at / 60) AS online_minutes
-             FROM installation_health_checks
-             WHERE checked_at >= ?1 AND status = 'healthy'
-             GROUP BY installation_id",
+            "SELECT installation_id,
+                COUNT(DISTINCT CASE WHEN status='healthy' THEN checked_at / 60 END),
+                COUNT(DISTINCT checked_at / 60)
+           FROM installation_health_checks
+          WHERE checked_at BETWEEN ?1 AND ?2 AND status IN ('healthy','unhealthy')
+          GROUP BY installation_id",
         )
-        .map_err(|e| {
-            AppError::Internal(format!("prepare installation online minutes failed: {e}"))
-        })?;
+        .map_err(|e| AppError::Internal(format!("prepare installation health minutes: {e}")))?;
     let rows = stmt
-        .query_map(params![cutoff], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+        .query_map(params![now - 86400, now], |row| {
+            let healthy = row.get::<_, usize>(1)?.min(ONLINE_WINDOW_MINUTES);
+            let observed = row.get::<_, usize>(2)?.min(ONLINE_WINDOW_MINUTES);
+            Ok((row.get::<_, String>(0)?, (healthy, observed)))
         })
-        .map_err(|e| {
-            AppError::Internal(format!("query installation online minutes failed: {e}"))
-        })?;
-    let mut map = HashMap::new();
-    for row in rows {
-        let (installation_id, online_minutes) = row.map_err(|e| {
-            AppError::Internal(format!("read installation online minute row failed: {e}"))
-        })?;
-        map.insert(installation_id, online_minutes.min(ONLINE_WINDOW_MINUTES));
-    }
-    Ok(map)
-}
-
-fn list_installation_observed_minutes_24h(
-    conn: &Connection,
-) -> Result<HashMap<String, usize>, AppError> {
-    let cutoff = Utc::now().timestamp() - 24 * 60 * 60;
-    let mut stmt = conn
-        .prepare(
-            "SELECT installation_id, COUNT(DISTINCT checked_at / 60) AS observed_minutes
-             FROM installation_health_checks
-             WHERE checked_at >= ?1 AND status IN ('healthy', 'unhealthy')
-             GROUP BY installation_id",
-        )
-        .map_err(|error| {
-            AppError::Internal(format!(
-                "prepare observed installation minutes failed: {error}"
-            ))
-        })?;
-    let rows = stmt
-        .query_map(params![cutoff], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
-        })
-        .map_err(|error| {
-            AppError::Internal(format!(
-                "query observed installation minutes failed: {error}"
-            ))
-        })?;
-    let mut map = HashMap::new();
-    for row in rows {
-        let (installation_id, observed_minutes) = row.map_err(|error| {
-            AppError::Internal(format!("read observed installation minute failed: {error}"))
-        })?;
-        map.insert(installation_id, observed_minutes.min(ONLINE_WINDOW_MINUTES));
-    }
-    Ok(map)
+        .map_err(|e| AppError::Internal(format!("query installation health minutes: {e}")))?;
+    rows.collect::<crate::db::Result<_>>()
+        .map_err(|e| AppError::Internal(format!("read installation health minutes: {e}")))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -27400,25 +27469,6 @@ fn validate_takeover_share_labels_tx(
         labels.push(next_label);
     }
     Ok(labels)
-}
-
-pub(crate) fn mask_host_ip(value: &str) -> String {
-    let trimmed = value.trim();
-    if let Some(ipv4) = trimmed.parse::<std::net::Ipv4Addr>().ok() {
-        let octets = ipv4.octets();
-        return format!("{}.{}.{}.xx", octets[0], octets[1], octets[2]);
-    }
-    if trimmed.parse::<std::net::Ipv6Addr>().is_ok() {
-        let groups = trimmed
-            .split(':')
-            .filter(|group| !group.is_empty())
-            .take(4)
-            .collect::<Vec<_>>();
-        if groups.len() == 4 {
-            return format!("{}:{}:{}:{}:xx", groups[0], groups[1], groups[2], groups[3]);
-        }
-    }
-    trimmed.to_string()
 }
 
 fn ensure_takeover_client_market_ready_tx(

@@ -28,6 +28,7 @@ try {
   let policy = { version: 1, enabled: true, admissionMinor: 10000, minMinor: 100, maxMinor: 500000, paymentMinutes: 30 };
   let profile = null; let sellerUnits = "1728000000"; let available = true; let pauseCount = 0; let financeFailure = false; let terminationFailure = false; let sellerReadFailure = false; let heldIncome = false;
   let topupMode = "shadow"; let publicationReady = true; let retiredSetupRequests = 0; let offerWrites = 0; let expectedTrialDays = 0;
+  let publicationShareInUse = false;
   const listedId = "publication-client";
   const description = "Bank transfer · contact @seller · https://seller.example.invalid/pay · <b>plain text</b>";
   const seller = { sellerId: "seller", version: 1, displayName: "C2C-123456abcdef", description, currency: "USD", priceBps: 10000, minMinor: 100, maxMinor: 10000, availableMinor: 20000, completedOrders: 0 };
@@ -68,6 +69,24 @@ try {
       if (["/v1/account/payment-profile", "/v1/market-billing/dashboard"].includes(p)) { retiredSetupRequests++; return json(route, { message: "retired setup" }, 410); }
       if (isRetiredClientMarketPath(p)) { errors.push(p); return json(route, {}, 410); }
       if (p === "/v1/client-market/online/seller-inventory") return json(route, {items:[]});
+      if (p === "/v1/client-market/online/listings") return json(route, { listings: [] });
+      if (p === `/v1/client-market/online/installations/${listedId}/preflight`) {
+        assert.deepEqual(body, { paid: false });
+        return json(route, {
+          ready: !publicationShareInUse, online: true, paidReady: publicationReady,
+          paidBlocker: publicationReady ? null : "provider_verification",
+          checks: { unlisted: true, ownerVerified: true, activated: true, capable: true, shareClear: !publicationShareInUse },
+          blocker: publicationShareInUse ? "share_in_use" : null, probeStatus: publicationShareInUse ? "skipped" : "completed",
+          workspace: !publicationShareInUse, hardware: !publicationShareInUse, egress: !publicationShareInUse,
+          countryCode: publicationShareInUse ? null : "US",
+          resource: publicationShareInUse ? undefined : { arch: "x86_64", cpu: 4, memoryBytes: 4 * 2 ** 30, diskBytes: null },
+        });
+      }
+      if (p === `/v1/client-market/online/installations/${listedId}/verify-provider` && request.method() === "POST") {
+        assert.equal(actor, "seller");
+        publicationReady = true;
+        return json(route, { paidReady: true });
+      }
       if (p === "/v1/dashboard") {
         const now = new Date().toISOString();
         const client = {installation:{id:listedId,platform:"linux",appVersion:"1",ownerEmail:"seller@example.invalid",marketLeaseV1:true,
@@ -91,7 +110,7 @@ try {
       }
       if (p === `/v1/client-market/online/installations/${listedId}/listing` && request.method() === "POST") {
         assert.equal(actor, "seller");
-        if (!publicationReady) return json(route, {message:"active verified Provider identity required"},403);
+        if (!publicationReady) return json(route, { code: "CLIENT_LISTING_BLOCKED", details: { reason: "provider_verification" } }, 403);
         if (financeFailure) return json(route, {message:"Provider finance temporarily unavailable"},503);
         assert.deepEqual(body,{cyclePriceMinor:1000,freeDays:null,trialDays:expectedTrialDays,acknowledged:true});
         offerWrites++;
@@ -538,15 +557,38 @@ try {
   await zhSeller.context.close();
   // Publication and transfer controls must stay available without official
   // recharge. No legacy payment profile is consulted in any mode.
+  const openListing = async () => {
+    await sell.page.goto(`${base}/client-market/?view=selling&add=1&installation=${listedId}`);
+    return sell.page.getByRole("dialog", { name: "List a Client" });
+  };
   const openOffer = async trialDays => {
-    await sell.page.goto(`${base}/clients/`);
-    await sell.page.getByRole("button", { name: "List on Client Market", exact: true }).click();
-    const dialog = sell.page.getByRole("dialog", { name: /Client rental terms/ });
-    await dialog.getByLabel("Monthly price in USD · 0 for free", {exact:true}).fill("10");
-    await dialog.getByLabel("Free trial days · optional", {exact:true}).fill(String(trialDays));
+    const dialog = await openListing();
+    await dialog.getByRole("radio", { name: "Monthly rent" }).press("Space");
+    await dialog.getByRole("textbox", { name: /Monthly price/ }).fill("10");
+    if (trialDays) {
+      await dialog.getByRole("button", { name: "Add trial" }).click();
+      await dialog.getByRole("textbox", { name: "Free trial" }).fill(String(trialDays));
+    }
     await dialog.getByRole("checkbox").check();
     return dialog;
   };
+  publicationShareInUse = true;
+  const blocked = await openListing();
+  await blocked.getByRole("link", { name: "Manage Share listings" }).waitFor();
+  assert.equal(await blocked.getByRole("radio").count(), 0);
+  assert.equal(await blocked.getByRole("checkbox").count(), 0);
+  publicationShareInUse = false;
+  await sell.page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await blocked.getByRole("button", { name: "Set limit" }).click();
+  await blocked.getByRole("textbox", { name: "Free days per renter" }).fill("90");
+  await blocked.getByRole("radio", { name: "Monthly rent" }).press("Space");
+  await blocked.getByRole("button", { name: "Add trial" }).click();
+  await blocked.getByRole("textbox", { name: "Free trial" }).fill("7");
+  await blocked.getByRole("radio", { name: "Free", exact: true }).press("Space");
+  assert.equal(await blocked.getByRole("textbox", { name: "Free days per renter" }).inputValue(), "90");
+  await blocked.getByRole("radio", { name: "Monthly rent" }).press("Space");
+  assert.equal(await blocked.getByRole("textbox", { name: "Free trial" }).inputValue(), "7");
+  await blocked.getByRole("button", { name: "Cancel" }).click();
   for (const [mode, days] of [["disabled",0],["shadow",1],["enabled",6]]) {
     topupMode = mode;
     expectedTrialDays = days;
@@ -554,19 +596,23 @@ try {
     await sell.page.getByRole("button", { name: /^Send to someone/ }).click();
     await sell.page.locator("#wallet-transfer form").waitFor();
     const dialog = await openOffer(days);
-    await dialog.getByRole("button", { name: "List on Client Market", exact: true }).click();
+    await dialog.getByRole("button", { name: "Publish listing", exact: true }).click();
     await dialog.waitFor({state:"hidden"});
   }
   assert.equal(offerWrites,3);
-  publicationReady = false; topupMode = "disabled";
+  topupMode = "disabled";
   const publicationDialog = await openOffer(expectedTrialDays);
-  const submitListing = publicationDialog.getByRole("button", { name: "List on Client Market", exact: true });
+  publicationReady = false;
+  const submitListing = publicationDialog.getByRole("button", { name: "Publish listing", exact: true });
   await submitListing.click();
-  await publicationDialog.getByRole("alert").filter({hasText:"active verified Provider identity required"}).waitFor();
-  publicationReady = true; financeFailure = true;
+  await publicationDialog.getByRole("button", { name: "Verify Provider account" }).click();
+  await submitListing.waitFor();
+  assert.equal(offerWrites, 3, "verifying the Provider preserves the draft without publishing");
+  financeFailure = true;
   await submitListing.click();
-  await publicationDialog.getByRole("alert").filter({hasText:"Provider finance temporarily unavailable"}).waitFor();
+  await publicationDialog.getByRole("status").filter({hasText:"The submission could not be confirmed"}).waitFor();
   financeFailure = false;
+  await publicationDialog.getByRole("button", { name: "Check again" }).click();
   await submitListing.click();
   await publicationDialog.waitFor({state:"hidden"});
   assert.equal(offerWrites,4);

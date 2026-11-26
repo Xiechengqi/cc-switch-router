@@ -58,10 +58,11 @@ test("current rental actions require a valid matching live lifecycle", () => {
     assert.throws(() => parseClientRentalDetail({ ...detail(), record: current, rental: { ...rental, ...patch } }, record().id));
   }
 });
-test("account and market reuse one buyer view; Owner audit is gated before any read", () => {
+test("buyer receipts open the account rental view and the market gates Owner audit before any read", () => {
   assert.match(source("components/dashboard/account-client-section.tsx"), /role === "user"[\s\S]*<ClientRentalRecords/);
   const market = source("components/dashboard/client-market-page.tsx");
-  assert.ok(market.indexOf("<ClientRentalRecords historyOnly") < market.indexOf("<ClientRentalAuditPanel"));
+  assert.doesNotMatch(market, /<ClientRentalRecords/);
+  assert.match(market, /router.replace\(clientMarketTenantHref\(rentalFocus\)\)/);
   const records = source("components/dashboard/client-market/rental-records.tsx");
   assert.doesNotMatch(records, /clientRentals\.refresh/);
   assert.doesNotMatch(records, /RefreshCw/);
@@ -71,8 +72,7 @@ test("account and market reuse one buyer view; Owner audit is gated before any r
   assert.doesNotMatch(shared, /getClientMarketHosts|localStorage|sessionStorage/);
   assert.match(shared, /document.visibilityState === "visible"/);
   assert.match(shared, /!expanded/);
-  assert.match(market, /onChanged=\{onRentalChanged\}/);
-  assert.match(market, /revision=\{terminationWork.revision \+ rentalRevision\}/);
+  assert.match(market, /revision=\{terminationWork.revision\}/);
   const audit = source("components/dashboard/client-market/rental-audit-panel.tsx");
   assert.match(audit, /session\.canAuditClientMarket === true/);
   assert.match(audit, /\[expanded, setExpanded\] = React\.useState\(false\)/);
@@ -80,7 +80,7 @@ test("account and market reuse one buyer view; Owner audit is gated before any r
   assert.match(audit, /request.current\?\.abort\(\); setRead\(null\); setSelected\(null\)/);
   const online = source("components/dashboard/client-market/online-market.tsx");
   assert.match(online, /showReceipt\(receipt\.leaseId\)/);
-  assert.match(online, /params\.set\("focus",\s*id\)/);
+  assert.match(online, /router.push\(clientMarketTenantHref\(id\)\)/);
   assert.match(shared, /<LeaseActions/);
 });
 test("personal records have complete bilingual copy", () => {

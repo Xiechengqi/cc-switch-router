@@ -1,3 +1,5 @@
+import type { ListingAvailability } from "@/lib/online-client-market";
+
 export const CLIENT_MARKET_POLL_MS = 20_000;
 
 export const ROUTER_OPEN_LOGIN_EVENT = "router-open-login";
@@ -64,6 +66,10 @@ export type OnlineShopListing = {
   state: string;
   occupied: boolean;
   healthy: boolean;
+  availability?: ListingAvailability;
+  owned?: boolean;
+  exclusiveManagement?: boolean;
+  ownerRental?: boolean;
   cyclePriceMinor: number;
 };
 
@@ -76,8 +82,34 @@ export function onlineShopSpecLine(hardware?: { arch?: string; cpu?: number | nu
   ].filter(Boolean).join(" · ");
 }
 
-export function onlineListingRentable(listing: Pick<OnlineShopListing, "state" | "occupied" | "healthy">) {
-  return listing.state === "listed" && !listing.occupied && listing.healthy;
+type ShopAvailabilityFields = Omit<OnlineShopListing, "country" | "cyclePriceMinor">;
+
+export function onlineListingAvailability(listing: ShopAvailabilityFields): ListingAvailability {
+  if (listing.state !== "listed") return "unavailable";
+  if (listing.availability !== undefined) {
+    if (listing.availability !== "available") return listing.availability;
+  } else {
+    // Older Router responses lack an availability reason. A failed probe alone cannot identify an offline tunnel.
+    if (listing.occupied) return "occupied";
+    if (listing.exclusiveManagement !== true) return "upgrade_required";
+    if (!listing.healthy) return "unavailable";
+  }
+  return listing.owned && listing.ownerRental !== true ? "upgrade_required" : "available";
+}
+
+export function onlineListingRentable(listing: ShopAvailabilityFields) {
+  return onlineListingAvailability(listing) === "available";
+}
+
+const marketStates = [
+  "available", "offline", "occupied", "upgrading", "switching", "unavailable",
+  "locking", "unlocking", "starting", "active", "ending", "cleaning", "released",
+] as const;
+
+export function onlineStatusKey(state: string) {
+  if (state === "upgrade_required") return "clientMarket.shop.upgrade";
+  const known = marketStates.find(value => value === state);
+  return known ? (`online.${known}` as const) : "online.unknown";
 }
 
 export function aggregateOnlineShopCountries(listings: readonly OnlineShopListing[]): ShopCountryCard[] {
@@ -95,7 +127,7 @@ export function aggregateOnlineShopCountries(listings: readonly OnlineShopListin
     card.total += 1;
     if (onlineListingRentable(listing)) {
       card.idle += 1;
-      if (listing.cyclePriceMinor <= 0) card.hasFreeIdle = true;
+      if (listing.owned || listing.cyclePriceMinor <= 0) card.hasFreeIdle = true;
       else if (card.minMonthlyMinor == null || listing.cyclePriceMinor < card.minMonthlyMinor) {
         card.minMonthlyMinor = listing.cyclePriceMinor;
       }
@@ -115,7 +147,7 @@ export function sortShopCountries(
   sort: ShopCountrySort,
   nameOf: (code: string) => string,
 ) {
-  const ranked = (card: ShopCountryCard) => (card.minMonthlyMinor == null ? Number.POSITIVE_INFINITY : card.minMonthlyMinor);
+  const ranked = (card: ShopCountryCard) => card.hasFreeIdle ? 0 : card.minMonthlyMinor ?? Number.POSITIVE_INFINITY;
   return [...cards].sort((left, right) => {
     if (sort === "idle" && left.idle !== right.idle) return right.idle - left.idle;
     if (sort === "price" && ranked(left) !== ranked(right)) return ranked(left) - ranked(right);

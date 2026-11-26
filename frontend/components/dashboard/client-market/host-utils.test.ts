@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {clientMarketWorkspaceFromQuery,clientMarketTenantFromQuery,onlineShopSpecLine,
-  onlineListingRentable,aggregateOnlineShopCountries,shopContinentForCountry,SHOP_CONTINENTS} from "./host-utils";
+  onlineListingAvailability,onlineListingRentable,aggregateOnlineShopCountries,shopContinentForCountry,SHOP_CONTINENTS} from "./host-utils";
 
 test("seller and rental links select their workspace", () => {
   assert.equal(clientMarketWorkspaceFromQuery("selling", null), "selling");
@@ -20,14 +20,15 @@ test("online shop spec line uses GiB memory and leaves disk off the card", () =>
 });
 
 test("online shop cards count rentable listings and ignore occupied or offline ones", () => {
-  assert.equal(onlineListingRentable({ state: "listed", occupied: false, healthy: true }), true);
-  assert.equal(onlineListingRentable({ state: "listed", occupied: true, healthy: true }), false);
-  assert.equal(onlineListingRentable({ state: "listed", occupied: false, healthy: false }), false);
+  assert.equal(onlineListingRentable({ state: "listed", exclusiveManagement: true, occupied: false, healthy: true }), true);
+  assert.equal(onlineListingRentable({ state: "listed", exclusiveManagement: true, occupied: true, healthy: true }), false);
+  assert.equal(onlineListingRentable({ state: "listed", exclusiveManagement: true, occupied: false, healthy: false }), false);
+  assert.equal(onlineListingRentable({ state: "listed", occupied: false, healthy: true }), false);
   const cards = aggregateOnlineShopCountries([
-    { country: "jp", state: "listed", occupied: false, healthy: true, cyclePriceMinor: 500 },
-    { country: "JP", state: "listed", occupied: false, healthy: true, cyclePriceMinor: 0 },
-    { country: "JP", state: "listed", occupied: true, healthy: true, cyclePriceMinor: 100 },
-    { country: null, state: "listed", occupied: false, healthy: true, cyclePriceMinor: 0 },
+    { country: "jp", state: "listed", exclusiveManagement: true, occupied: false, healthy: true, cyclePriceMinor: 500 },
+    { country: "JP", state: "listed", exclusiveManagement: true, occupied: false, healthy: true, cyclePriceMinor: 0 },
+    { country: "JP", state: "listed", exclusiveManagement: true, occupied: true, healthy: true, cyclePriceMinor: 100 },
+    { country: null, state: "listed", exclusiveManagement: true, occupied: false, healthy: true, cyclePriceMinor: 0 },
   ]);
   const japan = cards.find((card) => card.code === "JP");
   assert.equal(japan?.idle, 2);
@@ -35,6 +36,30 @@ test("online shop cards count rentable listings and ignore occupied or offline o
   assert.equal(japan?.hasFreeIdle, true);
   assert.equal(japan?.minMonthlyMinor, 500);
   assert.equal(cards.find((card) => card.code === "unknown")?.continent, "other");
+});
+
+test("region availability and starting price use the signed-in buyer's terms", () => {
+  const listing = { country: "US", state: "listed", exclusiveManagement: true, occupied: false, healthy: true, cyclePriceMinor: 1200 };
+  const [buyer] = aggregateOnlineShopCountries([listing]);
+  const [owner] = aggregateOnlineShopCountries([{ ...listing, owned: true, ownerRental: true }]);
+  const [legacy] = aggregateOnlineShopCountries([{ ...listing, owned: true }]);
+  assert.equal(buyer.minMonthlyMinor, 1200);
+  assert.equal(buyer.hasFreeIdle, false);
+  assert.equal(owner.idle, 1);
+  assert.equal(owner.hasFreeIdle, true);
+  assert.equal(legacy.total, 1);
+  assert.equal(legacy.idle, 0);
+  assert.equal(legacy.hasFreeIdle, false);
+  assert.equal(legacy.minMonthlyMinor, null);
+});
+
+test("cards use the shared availability reason and apply self-rental eligibility separately", () => {
+  const listing = { state: "listed", occupied: false, healthy: false, exclusiveManagement: true };
+  assert.equal(onlineListingAvailability(listing), "unavailable");
+  for (const availability of ["upgrading", "switching", "offline", "unavailable", "occupied"] as const) {
+    assert.equal(onlineListingAvailability({ ...listing, availability }), availability);
+  }
+  assert.equal(onlineListingAvailability({ ...listing, availability: "available", owned: true }), "upgrade_required");
 });
 
 test("shop continents keep ISO regions distinct and group unknown codes as other", () => {

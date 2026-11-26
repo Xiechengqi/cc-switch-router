@@ -102,13 +102,18 @@ fn host_matches(config: &Config, headers: &HeaderMap, subdomain: &str) -> bool {
 }
 
 impl AppStore {
+    pub(crate) async fn installation_leased(&self, id: &str) -> Result<bool, AppError> {
+        let c = self.conn.lock().await;
+        c.query_row("SELECT EXISTS(SELECT 1 FROM online_client_leases WHERE installation_id=?1 AND released_at IS NULL)",params![id],|r|r.get(0))
+            .map_err(|e|AppError::Internal(format!("read Client rental: {e}")))
+    }
     async fn client_window_target(
         &self,
         installation_id: &str,
     ) -> Result<ClientWindowTarget, AppError> {
         let conn = self.conn.lock().await;
-        let online=conn.query_row("SELECT r.alias,r.tenant_email,p.revision,r.id,r.buyer_id FROM online_client_leases r JOIN public_hosts p ON p.label=r.alias AND p.subject_id=r.id
-            WHERE r.id=?1 AND r.state='active' AND r.grant_until>unixepoch() AND p.lifecycle='active'",params![installation_id],
+        let online=conn.query_row("SELECT r.alias,r.tenant_email,p.revision,r.id,r.buyer_id FROM online_client_leases r JOIN online_client_listings l USING(installation_id) JOIN public_hosts p ON p.label=r.alias AND p.subject_id=r.id
+            WHERE r.id=?1 AND r.state='active' AND r.grant_until>unixepoch() AND p.lifecycle='active' AND (r.management_version<2 OR l.exclusive_management)",params![installation_id],
             |row| Ok(ClientWindowTarget{buyer_id:row.get(4)?,subdomain:row.get(0)?,owner:row.get(1)?,revision:row.get(2)?,binding_epoch:format!("lease:{}",row.get::<_,String>(3)?)})).optional()
             .map_err(|e|AppError::Internal(format!("read lease window: {e}")))?;
         if let Some(online) = online {
@@ -116,13 +121,15 @@ impl AppStore {
         }
         conn.query_row(
             "SELECT t.subdomain, LOWER(TRIM(i.owner_email)), p.revision,
-                    i.owner_verified_at
+                    i.owner_verified_at || coalesce((SELECT ':' || r.id FROM online_client_leases r
+                      WHERE r.installation_id=i.id ORDER BY r.created_at DESC,r.rowid DESC LIMIT 1),'')
              FROM installations i
              JOIN installation_client_tunnels t ON t.installation_id = i.id AND t.enabled = 1
              JOIN public_hosts p ON p.kind = 'client' AND p.subject_id = i.id
                   AND p.label = t.subdomain AND p.lifecycle = 'active'
              WHERE i.id = ?1 AND i.lifecycle = 'active' AND i.client_activated_at IS NOT NULL
-               AND i.owner_verified_at IS NOT NULL AND i.owner_email IS NOT NULL",
+               AND i.owner_verified_at IS NOT NULL AND i.owner_email IS NOT NULL
+               AND NOT EXISTS(SELECT 1 FROM online_client_leases r WHERE r.installation_id=i.id AND r.released_at IS NULL)",
             params![installation_id],
             |row| {
                 Ok(ClientWindowTarget {
@@ -168,7 +175,6 @@ impl AppStore {
             subdomain,
             owner,
             revision,
-
             binding_epoch,
         } = self.client_window_target(&grant.installation_id).await?;
         if buyer_id.as_deref().is_some_and(|id| id != actor.user_id)
@@ -236,7 +242,6 @@ async fn window_grant(
         subdomain,
         owner,
         revision,
-
         binding_epoch,
     } = state.store.client_window_target(&id).await?;
     let delegate = actor.email.eq_ignore_ascii_case(&owner)
@@ -727,6 +732,33 @@ mod tests {
             )
             .unwrap();
         assert!(store.validate_window(&grant).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn physical_windows_stay_revoked_after_rental() {
+        let (store, _, mut grant) = fixture().await;
+        {
+            let c = store.conn.lock().await;
+            c.execute("INSERT INTO online_client_listings(installation_id,seller_id,owner_email,state,revision,sequence,cycle_price_minor,updated_at) VALUES('installation','owner','owner@example.test','listed',1,1,0,0)",[]).unwrap();
+            crate::test_support::online_lease(
+                &c,
+                "rental",
+                "installation",
+                "owner",
+                "buyer",
+                "2026-11-26T00:00:00Z",
+            );
+            c.execute("UPDATE online_client_leases SET released_at=NULL,state='starting' WHERE id='rental'",[]).unwrap();
+        }
+        assert!(store.validate_window(&grant).await.is_err());
+        store.conn.lock().await.execute("UPDATE online_client_leases SET state='released',released_at=unixepoch() WHERE id='rental'",[]).unwrap();
+        assert!(store.validate_window(&grant).await.is_err());
+        grant.binding_epoch = store
+            .client_window_target("installation")
+            .await
+            .unwrap()
+            .binding_epoch;
+        assert!(store.validate_window(&grant).await.is_ok());
     }
 
     #[tokio::test]

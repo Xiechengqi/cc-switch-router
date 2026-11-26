@@ -19,12 +19,11 @@ import { parseAuditPageNumber } from "@/lib/client-rental-audit";
 import { rentalAuditMessagesEn } from "@/lib/client-rental-audit-messages";
 import { formatWalletUnits } from "@/lib/market-wallet-money";
 import { formatUsdMoney } from "@/lib/market-money";
-import { clientMarketTenantHref } from "@/lib/dashboard-nav";
+import { DASHBOARD_CLIENT_MARKET_PATH } from "@/lib/dashboard-nav";
 import type { MessageKey } from "@/lib/i18n";
 import { CLIENT_MARKET_POLL_MS } from "./host-utils";
 
-/** The buyer's account and Market share this read projection, not today's Hosts.
- * No remembered/private browser storage: changing actors unmounts every read. */
+/** Mount the buyer's account records and pending reads for the signed-in user. */
 export function ClientRentalRecords(props: {
   historyOnly?: boolean; currentOnly?: boolean; focusKey?: string | null; revision?: number;
   onChanged?: () => void; onTerminationOpen?: (id: string) => void;
@@ -63,6 +62,7 @@ function RentalSection({ view, focusKey, revision, onChanged, onTerminationOpen 
   const [focused, setFocused] = React.useState<string | null>(null);
   const request = React.useRef<AbortController | null>(null);
   const canonicalPage = React.useRef(1);
+  const followFocus = React.useRef(focusKey);
   const jumpId = React.useId();
   const titleId = React.useId();
   const revokeAccess = React.useCallback(() => {
@@ -91,7 +91,7 @@ function RentalSection({ view, focusKey, revision, onChanged, onTerminationOpen 
     }
   }, [view]);
   React.useEffect(() => {
-    setFocused(null); canonicalPage.current = 1;
+    setFocused(null); canonicalPage.current = 1; followFocus.current = focusKey;
     void load(1, { focus: focusKey });
     return () => request.current?.abort();
   }, [load, focusKey]);
@@ -100,18 +100,19 @@ function RentalSection({ view, focusKey, revision, onChanged, onTerminationOpen 
     if (previousRevision.current === revision) return;
     previousRevision.current = revision;
     // Preserve expanded details while re-reading a page after a completed action.
-    void load(canonicalPage.current, { silent: true, replace: true });
+    void load(canonicalPage.current, { silent: true, replace: true, focus: followFocus.current });
   }, [load, revision]);
   React.useEffect(() => {
     const poll = () => {
-      if (!expanded && document.visibilityState === "visible") void load(canonicalPage.current, { silent: true });
+      if ((!expanded || page?.items.some((item) => item.status === "opening")) && document.visibilityState === "visible") void load(canonicalPage.current, { silent: true, focus: followFocus.current });
     };
     const timer = window.setInterval(poll, CLIENT_MARKET_POLL_MS);
     document.addEventListener("visibilitychange", poll);
     return () => { window.clearInterval(timer); document.removeEventListener("visibilitychange", poll); };
-  }, [expanded, load]);
+  }, [expanded, load, page]);
   const changePage = (number: number) => {
     if (busy || !page || number < 1 || number > page.totalPages) return;
+    followFocus.current = null;
     setFocused(null); setInvalidJump(false); setPage(null); void load(number);
   };
   const money = (value: string) => formatWalletUnits(value, "$", locale);
@@ -137,7 +138,7 @@ function RentalSection({ view, focusKey, revision, onChanged, onTerminationOpen 
       rowTone={row => row.cleanupStatus === "failed" ? "danger" : row.attention !== "none" ? "attention" : undefined}
       onExpandedChange={setExpanded}
       renderDetail={row => <RentalDetail key={row.id} id={row.id} refreshKey={JSON.stringify([row.status, row.attention, row.cleanupStatus, row.money, row.periodEnd, row.renewalPolicy])} onChanged={onChanged} onTerminationOpen={onTerminationOpen} onForbidden={revokeAccess} />}
-      empty={<p className="rounded-lg border border-dashed border-border px-4 py-8 text-center text-sm text-muted-foreground">{t(view === "current" ? "clientRentals.currentEmpty" : "clientRentals.historyEmpty")}{view === "current" ? <Link href={clientMarketTenantHref()} className="ml-2 text-accent hover:underline">{t("account.client.openMarket")}</Link> : null}</p>}
+      empty={<p className="rounded-lg border border-dashed border-border px-4 py-8 text-center text-sm text-muted-foreground">{t(view === "current" ? "clientRentals.currentEmpty" : "clientRentals.historyEmpty")}{view === "current" ? <Link href={DASHBOARD_CLIENT_MARKET_PATH} className="ml-2 text-accent hover:underline">{t("account.client.openMarket")}</Link> : null}</p>}
     /> : null}
     {page && page.total > 0 ? <nav className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground" aria-label={t("clientRentals.pagination")}>
       <span className="tabular-nums">{t("clientRentals.count", { count: page.total, page: page.page, pages: page.totalPages })}</span>
@@ -180,9 +181,18 @@ function RentalDetail({ id, refreshKey, onChanged, onTerminationOpen, onForbidde
       if (controller.signal.aborted) return;
       setError(true);
       if (cause instanceof ApiError && (cause.status === 401 || cause.status === 403 || cause.status === 404)) { setDetail(null); onForbidden(); }
-    } finally { if (!controller.signal.aborted) setBusy(false); }
+    } finally { if (request.current === controller) { request.current = null; setBusy(false); } }
   }, [id, onForbidden]);
   React.useEffect(() => { void load("refresh"); return () => request.current?.abort(); }, [load, refreshKey]);
+  const opening = detail?.record.status === "opening";
+  const migrationRequired = detail?.rental?.migrationRequired === true;
+  React.useEffect(() => {
+    if (!opening && !migrationRequired) return;
+    const poll = () => { if (!request.current && document.visibilityState === "visible") void load("refresh"); };
+    const timer = window.setInterval(poll, opening ? 5000 : CLIENT_MARKET_POLL_MS);
+    document.addEventListener("visibilitychange", poll);
+    return () => { clearInterval(timer); document.removeEventListener("visibilitychange", poll); };
+  }, [opening, migrationRequired, load]);
   const changed = React.useCallback(() => { void load("refresh"); onChanged(); }, [load, onChanged]);
   const row = detail?.record;
   const rental = detail?.rental;
@@ -205,6 +215,19 @@ function RentalDetail({ id, refreshKey, onChanged, onTerminationOpen, onForbidde
       ) : null}
       {detail && row ? (
         <>
+          {row.status === "activation_failed" && <p role="status">{t("lease.activationFailed")}</p>}
+          {rental && <div className="grid gap-2 rounded-lg border border-border p-3 text-sm">
+            {rental.migrationRequired && <p>{t("lease.migrationHelp")}</p>}
+            {opening && <p role="status">{t("lease.provisioning", { time: date(new Date(rental.activationDeadline
+              ? rental.activationDeadline * 1000 : Date.parse(row.createdAt) + 600000).toISOString()) })}</p>}
+            {rental.clientUrl && row.activatedAt && <>
+              <p className="break-all"><span className="text-muted-foreground">{t("clientMarket.shop.address")} · </span>{rental.clientUrl}</p>
+              <p className="break-all text-xs text-muted-foreground">{t("lease.usage", { host: "<slug>--" + new URL(rental.clientUrl).host })}</p>
+            </>}
+            {rental.grantUntil && <p className="text-xs">{t("clientMarket.shop.grant")} · {date(new Date(rental.grantUntil * 1000).toISOString())}</p>}
+            {rental.holdStatus && <p>{t(`lease.hold.${rental.holdStatus}`)}</p>}
+            <LeaseActions id={rental.leaseId} upgradeTarget={rental.canUpgrade ? clientRentalLabel(row) : undefined} active={!!row.activatedAt && !row.endedAt} address={rental.clientUrl} canEnd={!row.endedAt} onChanged={changed} />
+          </div>}
           <RecordDetailList
             items={[
               { label: t("clientRentals.recordId"), value: <span className="break-all">{row.id}</span> },
@@ -330,18 +353,6 @@ function RentalDetail({ id, refreshKey, onChanged, onTerminationOpen, onForbidde
                   onChanged={changed}
                 />
               ) : null}
-              <LeaseActions
-                id={rental.leaseId}
-                active={!!row.activatedAt && !row.endedAt}
-                canEnd={!row.endedAt}
-                onChanged={changed}
-              />
-              <Link
-                className="inline-flex min-h-11 items-center justify-self-start rounded text-sm text-accent hover:underline focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2"
-                href={clientMarketTenantHref(rental.leaseId)}
-              >
-                {t("account.client.manageInMarket")}
-              </Link>
             </>
           ) : null}
           <details className="min-w-0 rounded-lg border border-border p-3">
@@ -382,6 +393,7 @@ function RentalDetail({ id, refreshKey, onChanged, onTerminationOpen, onForbidde
                     <span>
                       {date(event.createdAt)} ·{" "}
                       {t((key in rentalAuditMessagesEn ? key : "rentalAudit.event.updated") as MessageKey)}
+                      {(event.occurrences ?? 0) > 1 && ` ×${event.occurrences}`}
                     </span>
                     {event.note ? (
                       <p className="whitespace-pre-wrap break-words text-muted-foreground">{event.note}</p>

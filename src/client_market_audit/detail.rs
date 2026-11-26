@@ -110,13 +110,13 @@ fn events_tx(
 ) -> Result<(Vec<Value>, Value), AppError> {
     let cte = "WITH events AS (
         SELECT 'r:'||id AS id,kind AS action,NULL AS actor_email,
-          strftime('%Y-%m-%dT%H:%M:%fZ',recorded_at,'unixepoch') AS at,NULL AS note
+          strftime('%Y-%m-%dT%H:%M:%fZ',recorded_at,'unixepoch') AS at,NULL AS note,occurrences
         FROM online_client_events WHERE lease_id=?1
         UNION ALL SELECT 't:'||id,action,NULL,strftime('%Y-%m-%dT%H:%M:%fZ',created_at),
           CASE WHEN action IN ('provider_waiver','owner_decision','provider_response','buyer_withdrawal','timeout_waiver')
-                    AND json_valid(detail_json) THEN json_extract(detail_json,'$.note') END
+                    AND json_valid(detail_json) THEN json_extract(detail_json,'$.note') END,1
         FROM client_termination_events WHERE termination_id=?2
-        UNION ALL SELECT 'order:'||?3,'order_committed',NULL,?4,NULL
+        UNION ALL SELECT 'order:'||?3,'order_committed',NULL,?4,NULL,1
     ) ";
     let mut args = vec![
         record["installationId"]
@@ -147,11 +147,11 @@ fn events_tx(
         args.push(SqlValue::Text(cursor.into()));
         predicate = "(at<?5 OR (at=?5 AND id<?6))".into();
     }
-    let mut statement=conn.prepare(&format!("{cte}SELECT id,action,actor_email,at,note FROM events WHERE {predicate} ORDER BY at DESC,id DESC LIMIT 51"))
+    let mut statement=conn.prepare(&format!("{cte}SELECT id,action,actor_email,at,note,occurrences FROM events WHERE {predicate} ORDER BY at DESC,id DESC LIMIT 51"))
         .map_err(db_error("prepare audited events"))?;
     let mut rows=statement.query_map(args,|r|Ok(json!({
         "id":r.get::<_,String>(0)?,"action":safe_action(&r.get::<_,String>(1)?),"actorEmail":r.get::<_,Option<String>>(2)?,
-        "createdAt":r.get::<_,String>(3)?,"note":r.get::<_,Option<String>>(4)?.map(|s|s.chars().take(2000).collect::<String>())
+        "createdAt":r.get::<_,String>(3)?,"occurrences":r.get::<_,i64>(5)?,"note":r.get::<_,Option<String>>(4)?.map(|s|s.chars().take(2000).collect::<String>())
     }))).map_err(db_error("query audited events"))?.collect::<crate::db::Result<Vec<_>>>().map_err(db_error("read audited events"))?;
     let next = if rows.len() > DETAIL_PAGE_SIZE {
         rows[DETAIL_PAGE_SIZE - 1]["id"].clone()
@@ -167,6 +167,11 @@ fn safe_action(value: &str) -> &str {
         "return_unused" | "return_compensation" | "return_disputed" => "returned",
         "automatic_credit" => "credited",
         "order_committed"
+        | "tenant_upgrade"
+        | "tenant_auto_upgrade"
+        | "tenant_restart"
+        | "tenant_rollback"
+        | "host_settings"
         | "assistance"
         | "terminal"
         | "upgrade"

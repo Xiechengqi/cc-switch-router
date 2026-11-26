@@ -4020,6 +4020,24 @@ async fn proxy_handler_inner(state: ServerState, peer: SocketAddr, req: Request)
     }
     let mut client_web_session: Option<(String, bool)> = None;
     if route.is_client_web() {
+        // The internal GET health probe was authenticated above with the installation HMAC.
+        let signed_health = method == axum::http::Method::GET && path == "/_share-router/health";
+        if alias.is_none() && !signed_health {
+            if let Some(id) = route.installation_id() {
+                match state.store.installation_leased(id).await {
+                    Ok(true) => {
+                        return crate::error::AppError::coded_forbidden(
+                            "workspace_leased",
+                            "The Client console is reserved for its current tenant",
+                            Value::Null,
+                        )
+                        .into_response();
+                    }
+                    Ok(false) => {}
+                    Err(error) => return error.into_response(),
+                }
+            }
+        }
         client_web_session = match state
             .store
             .client_window_principal(
@@ -4041,7 +4059,7 @@ async fn proxy_handler_inner(state: ServerState, peer: SocketAddr, req: Request)
             if is_client_web_terminal_request(&path, parts.uri.query()) {
                 return crate::error::AppError::coded_forbidden(
                     "tenant_terminal_forbidden",
-                    "Only the Client owner can open a terminal",
+                    "Web Terminal is closed during rental",
                     serde_json::Value::Null,
                 )
                 .into_response();

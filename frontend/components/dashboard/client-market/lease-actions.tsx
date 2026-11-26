@@ -3,6 +3,7 @@
 import * as React from "react";
 import { Button, Modal } from "@heroui/react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
+import { ClientUpgradeControl } from "@/components/dashboard/client-upgrade-button";
 import { ApiError } from "@/lib/api";
 import { authFetch } from "@/lib/auth";
 import { onlineMarketError, onlineRequest } from "@/lib/online-client-market";
@@ -18,12 +19,14 @@ import {
 export function LeaseActions({
   id,
   active,
+  upgradeTarget,
   canEnd,
   address,
   onChanged,
 }: {
   id: string;
   active: boolean;
+  upgradeTarget?: string;
   canEnd: boolean;
   address?: string;
   onChanged: () => void;
@@ -112,6 +115,7 @@ export function LeaseActions({
           >
             {t("lease.copy")}
           </Button>
+          {upgradeTarget && <ClientUpgradeControl installationId={id} leased upgradeTarget={upgradeTarget} canInspect available />}
           {exportButton}
         </>
       )}

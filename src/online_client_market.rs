@@ -16,11 +16,13 @@ use axum::{
 use chrono::{Datelike, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 mod reconcile;
 pub(crate) use reconcile::run;
 mod shares;
+mod upgrades;
 pub(crate) use shares::{
     allow_traffic, bind_share, check_nonce, check_share_id, namespace, share_owner,
 };
@@ -53,6 +55,10 @@ pub fn router() -> Router<ServerState> {
             post(preflight),
         )
         .route(
+            "/v1/client-market/online/installations/:id/verify-provider",
+            post(verify_listing_provider),
+        )
+        .route(
             "/v1/client-market/online/installations/:id/retry",
             post(retry),
         )
@@ -69,6 +75,14 @@ pub fn router() -> Router<ServerState> {
         .route(
             "/v1/client-market/online/seller-inventory",
             get(seller_inventory),
+        )
+        .route(
+            "/v1/client-market/online/leases/:id/upgrade",
+            post(upgrades::start),
+        )
+        .route(
+            "/v1/client-market/online/leases/:id/upgrade/status",
+            get(upgrades::status),
         )
         .route("/v1/client-market/online/leases/:id/end", post(end))
         .route("/v1/client-market/online/egress/:challenge", post(egress))
@@ -100,6 +114,8 @@ impl Hardware {
 #[derive(Deserialize, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Grant {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    buyer_id: Option<String>,
     lease_id: String,
     tenant_email: String,
     alias: String,
@@ -108,7 +124,14 @@ struct Grant {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ClientStatus {
+    #[serde(default)]
+    exclusive_management: bool,
+    #[serde(default)]
+    upgrade_busy: bool,
+    awaiting_return: Option<String>,
     capability: String,
+    #[serde(default)]
+    owner_rental: bool,
     owner_email: String,
     listed_owner: Option<String>,
     sequence: i64,
@@ -131,7 +154,6 @@ struct AccessEvent {
 }
 async fn rpc(s: &ServerState, id: &str, path: &str, body: Value) -> Result<ClientStatus, AppError> {
     let timeout = match path {
-        "/_ctl/market/check" => 10,
         "/_ctl/market/command" => 15,
         _ => 3,
     };
@@ -210,30 +232,237 @@ struct Readiness {
     unlisted: bool,
 }
 
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ListingBlocker {
+    AlreadyListed,
+    ListingChanged,
+    OwnerUnverified,
+    Inactive,
+    UpgradeRequired,
+    Offline,
+    ShareInUse,
+    WorkspaceBusy,
+    ControlUnavailable,
+    EgressUnverified,
+    HardwareUnavailable,
+    ProviderVerification,
+    EmailVerification,
+    ProviderPaused,
+    ProviderConflict,
+}
+
+impl ListingBlocker {
+    fn error(self) -> AppError {
+        use ListingBlocker::*;
+        let (status, message) = match self {
+            AlreadyListed => (
+                StatusCode::CONFLICT,
+                "Client already listed or being listed",
+            ),
+            ListingChanged => (
+                StatusCode::CONFLICT,
+                "the listing changed during verification",
+            ),
+            OwnerUnverified => (
+                StatusCode::FORBIDDEN,
+                "verified installation owner required",
+            ),
+            Inactive => (
+                StatusCode::CONFLICT,
+                "activate this Client and enable its tunnel",
+            ),
+            UpgradeRequired => (
+                StatusCode::CONFLICT,
+                "upgrade this Client to support exclusive rentals",
+            ),
+            Offline => (StatusCode::CONFLICT, "Client must be online"),
+            ShareInUse => (
+                StatusCode::CONFLICT,
+                "finish existing Share Market listings and seat rentals first",
+            ),
+            WorkspaceBusy => (StatusCode::CONFLICT, "Client workspace is busy"),
+            ControlUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Client did not confirm the check",
+            ),
+            EgressUnverified => (StatusCode::CONFLICT, "Client egress could not be verified"),
+            HardwareUnavailable => (
+                StatusCode::CONFLICT,
+                "Client hardware report is unavailable",
+            ),
+            ProviderVerification => (
+                StatusCode::FORBIDDEN,
+                "a verified Provider account is required for paid rentals",
+            ),
+            EmailVerification => (
+                StatusCode::FORBIDDEN,
+                "sign in with a verified account email",
+            ),
+            ProviderPaused => (
+                StatusCode::FORBIDDEN,
+                "paid rentals are paused for this Provider",
+            ),
+            ProviderConflict => (StatusCode::CONFLICT, "conflicting Market Provider identity"),
+        };
+        AppError::Coded {
+            status,
+            code: "CLIENT_LISTING_BLOCKED",
+            message: message.into(),
+            details: json!({"reason": self}),
+        }
+    }
+}
+
+impl Readiness {
+    fn initial_blocker(&self) -> Option<ListingBlocker> {
+        (!self.unlisted)
+            .then_some(ListingBlocker::AlreadyListed)
+            .or_else(|| self.seller_blocker())
+    }
+
+    fn seller_blocker(&self) -> Option<ListingBlocker> {
+        if !self.owner_verified {
+            Some(ListingBlocker::OwnerUnverified)
+        } else if !self.activated {
+            Some(ListingBlocker::Inactive)
+        } else if !self.capable {
+            Some(ListingBlocker::UpgradeRequired)
+        } else if !self.share_clear {
+            Some(ListingBlocker::ShareInUse)
+        } else {
+            None
+        }
+    }
+}
+
+impl ClientStatus {
+    fn workspace_blocker(&self, owner: &str) -> Option<ListingBlocker> {
+        if self.capability != "marketLeaseV1" || !self.exclusive_management {
+            Some(ListingBlocker::UpgradeRequired)
+        } else if !self.owner_email.eq_ignore_ascii_case(owner) {
+            Some(ListingBlocker::OwnerUnverified)
+        } else if self.grant.is_some()
+            || self.running_lease.is_some()
+            || self.awaiting_return.is_some()
+            || self.switching
+            || self.upgrade_busy
+            || !self.cleanup_safe
+        {
+            Some(ListingBlocker::WorkspaceBusy)
+        } else {
+            None
+        }
+    }
+}
+
+async fn probe_listing(
+    s: &ServerState,
+    id: &str,
+    challenge: &str,
+) -> Result<ClientStatus, AppError> {
+    control(
+        s,
+        id,
+        "/_ctl/market/check",
+        json!({"challenge": challenge}),
+        10,
+    )
+    .await
+}
+
+fn paid_listing_blocker(
+    c: &Connection,
+    a: &AuthSession,
+) -> Result<Option<ListingBlocker>, AppError> {
+    match crate::market_provider_finance::require_paid_offer_setup_tx(c, &a.user_id) {
+        Ok(()) => return Ok(None),
+        Err(AppError::Forbidden(_)) => (),
+        Err(e) => return Err(e),
+    }
+    let account: Option<(bool, Option<String>)> = c
+        .query_row(
+            "SELECT u.email_verified_at IS NOT NULL, p.status FROM users u
+         LEFT JOIN market_provider_profiles p ON p.user_id=u.id
+         WHERE u.id=?1 AND u.email_normalized=lower(trim(?2)) AND u.status='active'",
+            params![a.user_id, a.email],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .market()?;
+    Ok(Some(match account {
+        Some((true, status)) => match status.as_deref() {
+            Some("paused") => ListingBlocker::ProviderPaused,
+            Some("retired" | "identity_conflict") => ListingBlocker::ProviderConflict,
+            _ => ListingBlocker::ProviderVerification,
+        },
+        _ => ListingBlocker::EmailVerification,
+    }))
+}
+
 fn readiness(c: &Connection, id: &str, email: &str) -> Result<Readiness, AppError> {
     c.query_row("SELECT i.owner_verified_at IS NOT NULL,
         i.lifecycle='active' AND i.client_activated_at IS NOT NULL AND coalesce(t.enabled,0)=1,
         i.market_lease_v1=1, NOT EXISTS(SELECT 1 FROM share_market_listings l WHERE l.installation_id=i.id AND
             (l.status='active' OR EXISTS(SELECT 1 FROM share_market_subscriptions sub WHERE sub.listing_id=l.id AND sub.released_at IS NULL))),
-        NOT EXISTS(SELECT 1 FROM online_client_listings l WHERE l.installation_id=i.id AND l.state!='unlisted')
+        NOT EXISTS(SELECT 1 FROM online_client_listings l WHERE l.installation_id=i.id AND l.state!='unlisted'
+            AND NOT (l.state='locking' AND l.check_json IS NULL AND l.challenge_until IS NOT NULL AND l.challenge_until<unixepoch()))
         FROM installations i LEFT JOIN installation_client_tunnels t ON t.installation_id=i.id
         WHERE i.id=?1 AND lower(trim(i.owner_email))=lower(?2)",params![id,email],
         |r|Ok(Readiness {owner_verified:r.get(0)?,activated:r.get(1)?,capable:r.get(2)?,share_clear:r.get(3)?,unlisted:r.get(4)?}))
         .optional().market()?.ok_or_else(missing)
 }
-fn seller_ready(c: &Connection, id: &str, email: &str) -> Result<(), AppError> {
-    let r = readiness(c, id, email)?;
-    if !(r.owner_verified && r.activated && r.capable) {
-        return Err(AppError::Forbidden(
-            "verified installation owner required".into(),
-        ));
+fn listing_provider_transaction<'c>(
+    c: &'c Connection,
+    id: &str,
+    a: &AuthSession,
+    paid: bool,
+) -> Result<Transaction<'c>, AppError> {
+    let tx = c.transaction().market()?;
+    if let Some(reason) = readiness(&tx, id, &a.email)?.initial_blocker() {
+        return Err(reason.error());
     }
-    if !r.share_clear {
-        return Err(conflict(
-            "finish existing Share Market listings and rentals first",
-        ));
+    let needs_claim = if paid {
+        match paid_listing_blocker(&tx, a)? {
+            None => false,
+            Some(ListingBlocker::ProviderVerification) => true,
+            Some(reason) => return Err(reason.error()),
+        }
+    } else {
+        false
+    };
+    let now = Utc::now().to_rfc3339();
+    if let crate::market_provider_identity::MarketProviderIdentityResolution::Conflict(conflict) =
+        crate::market_provider_identity::ensure_market_provider_identity_tx(
+            &tx,
+            Some(&a.user_id),
+            &a.email,
+            &now,
+        )?
+    {
+        drop(tx);
+        crate::market_provider_identity::persist_market_provider_identity_conflict(
+            c, &conflict, &now,
+        )?;
+        return Err(ListingBlocker::ProviderConflict.error());
     }
-    Ok(())
+    if needs_claim && let Some(reason) = paid_listing_blocker(&tx, a)? {
+        return Err(reason.error());
+    }
+    Ok(tx)
+}
+
+async fn verify_listing_provider(
+    State(s): State<ServerState>,
+    Path(id): Path<String>,
+    h: HeaderMap,
+) -> Reply {
+    let a = actor(&s, &h).await?;
+    let c = s.store.conn.lock().await;
+    listing_provider_transaction(&c, &id, &a, true)?
+        .commit()
+        .market()?;
+    Ok(Json(json!({"paidReady": true})))
 }
 
 #[derive(Deserialize)]
@@ -253,25 +482,23 @@ async fn preflight(
         .active_client_route_for_installation(&id)
         .await
         .is_some();
-    let (checks, paid_ready) = {
+    let (checks, paid_blocker) = {
         let c = s.store.conn.lock().await;
         let checks = readiness(&c, &id, &a.email)?;
-        let paid_ready =
-            match crate::market_provider_finance::require_paid_offer_setup_tx(&c, &a.user_id) {
-                Ok(()) => true,
-                Err(AppError::Forbidden(_)) => false,
-                Err(e) => return Err(e),
-            };
-        (checks, paid_ready)
+        (checks, paid_listing_blocker(&c, &a)?)
     };
-    let mut result = json!({"checks":checks,"online":online,"paidReady":paid_ready,"workspace":false,"hardware":false,"egress":false,"ready":false});
-    if !(checks.owner_verified
-        && checks.activated
-        && checks.capable
-        && checks.share_clear
-        && checks.unlisted
-        && online)
-    {
+    let blocker = checks
+        .initial_blocker()
+        .or((!online).then_some(ListingBlocker::Offline))
+        .or(paid_blocker.filter(|reason| matches!(reason, ListingBlocker::ProviderConflict)));
+    // Keep the original flags for older dashboards. A skipped live check is
+    // distinguishable from an attempted one even when its flags are all false.
+    let mut result = json!({
+        "checks": checks, "online": online, "paidReady": paid_blocker.is_none(), "paidBlocker": paid_blocker, "workspace": false,
+        "hardware": false, "egress": false, "ready": false, "blocker": blocker,
+        "probeStatus": "skipped", "countryCode": null,
+    });
+    if blocker.is_some() {
         return Ok(Json(result));
     }
     let challenge = Uuid::new_v4().simple().to_string();
@@ -284,31 +511,39 @@ async fn preflight(
         .market()?;
         c.execute("INSERT INTO online_client_preflight(challenge,installation_id,expires_at) VALUES(?1,?2,unixepoch()+30)",params![challenge,id]).market()?;
     }
-    let status = rpc(
-        &s,
-        &id,
-        "/_ctl/market/check",
-        json!({"challenge":challenge}),
-    )
-    .await;
+    let status = probe_listing(&s, &id, &challenge).await;
     let c = s.store.conn.lock().await;
-    let ip = c.query_row("DELETE FROM online_client_preflight WHERE challenge=?1 AND expires_at>=unixepoch() RETURNING egress_ip",params![challenge],|r| r.get::<_,Option<String>>(0)).optional().market()?.flatten();
+    let (ip, country): (Option<String>, Option<String>) = c.query_row(
+        "DELETE FROM online_client_preflight WHERE challenge=?1 AND expires_at>=unixepoch() RETURNING egress_ip,country_code",
+        params![challenge], |r| Ok((r.get(0)?, r.get(1)?)),
+    ).optional().market()?.unwrap_or_default();
     let egress = ip.is_some();
     result["egress"] = json!(egress);
     result["egressIp"] = json!(ip);
-    if let Ok(st) = status {
-        let workspace = st.owner_email.eq_ignore_ascii_case(&a.email)
-            && st.grant.is_none()
-            && st.running_lease.is_none()
-            && !st.switching
-            && st.cleanup_safe;
-        let hardware = st.hardware.as_ref().is_some_and(|h| h.validate().is_ok());
-        if hardware {
-            result["resource"] = json!(st.hardware);
+    result["countryCode"] = json!(country);
+    match status {
+        Ok(st) => {
+            result["probeStatus"] = json!("completed");
+            result["exclusiveManagement"] = json!(st.exclusive_management);
+            let workspace_blocker = st.workspace_blocker(&a.email);
+            let hardware = st.hardware.as_ref().is_some_and(|h| h.validate().is_ok());
+            if hardware {
+                result["resource"] = json!(st.hardware);
+            }
+            result["workspace"] = json!(workspace_blocker.is_none());
+            result["hardware"] = json!(hardware);
+            let blocker = workspace_blocker
+                .or((!hardware).then_some(ListingBlocker::HardwareUnavailable))
+                .or((!egress).then_some(ListingBlocker::EgressUnverified))
+                .or(if input.paid { paid_blocker } else { None });
+            result["ready"] = json!(blocker.is_none());
+            result["blocker"] = json!(blocker);
         }
-        result["workspace"] = json!(workspace);
-        result["hardware"] = json!(hardware);
-        result["ready"] = json!(workspace && hardware && egress && (!input.paid || paid_ready));
+        Err(AppError::ServiceUnavailable(_) | AppError::Conflict(_)) => {
+            result["probeStatus"] = json!("unreachable");
+            result["blocker"] = json!(ListingBlocker::ControlUnavailable);
+        }
+        Err(error) => return Err(error),
     }
     Ok(Json(result))
 }
@@ -346,37 +581,16 @@ async fn list(
         .await
         .is_none()
     {
-        return Err(conflict("Client must be online"));
-    }
-    {
         let c = s.store.conn.lock().await;
-        seller_ready(&c, &id, &a.email)?;
+        if let Some(reason) = readiness(&c, &id, &a.email)?.initial_blocker() {
+            return Err(reason.error());
+        }
+        return Err(ListingBlocker::Offline.error());
     }
     let challenge = Uuid::new_v4().simple().to_string();
     {
         let c = s.store.conn.lock().await;
-        let tx = c.transaction().market()?;
-        seller_ready(&tx, &id, &a.email)?;
-        let now = Utc::now().to_rfc3339();
-        if let crate::market_provider_identity::MarketProviderIdentityResolution::Conflict(
-            conflict,
-        ) = crate::market_provider_identity::ensure_market_provider_identity_tx(
-            &tx,
-            Some(&a.user_id),
-            &a.email,
-            &now,
-        )? {
-            drop(tx);
-            crate::market_provider_identity::persist_market_provider_identity_conflict(
-                &c, &conflict, &now,
-            )?;
-            return Err(AppError::Conflict(
-                "conflicting Market Provider identity".into(),
-            ));
-        }
-        if v.cycle_price_minor > 0 {
-            crate::market_provider_finance::require_paid_offer_setup_tx(&tx, &a.user_id)?;
-        }
+        let tx = listing_provider_transaction(&c, &id, &a, v.cycle_price_minor > 0)?;
         let changed=tx.execute("INSERT INTO online_client_listings(installation_id,seller_id,owner_email,state,revision,sequence,cycle_price_minor,free_days,trial_days,updated_at,challenge,challenge_until)
             VALUES(?1,?2,lower(?3),'locking',1,1,?4,?5,?6,unixepoch(),?7,unixepoch()+30)
             ON CONFLICT(installation_id) DO UPDATE SET state='locking',revision=revision+1,sequence=sequence+1,seller_id=excluded.seller_id,owner_email=excluded.owner_email,
@@ -384,40 +598,48 @@ async fn list(
             WHERE state='unlisted' OR (state='locking' AND challenge_until<unixepoch() AND check_json IS NULL)",
             params![id,a.user_id,a.email,v.cycle_price_minor,v.free_days,v.trial_days,challenge]).market()?;
         if changed != 1 {
-            return Err(conflict(
-                "listing transition already in progress or Client is listed",
-            ));
+            return Err(ListingBlocker::AlreadyListed.error());
         }
         tx.commit().market()?;
     }
-    let checked = rpc(
-        &s,
-        &id,
-        "/_ctl/market/check",
-        json!({"challenge":challenge}),
-    )
-    .await;
+    let checked = probe_listing(&s, &id, &challenge).await;
     let c = s.store.conn.lock().await;
     let tx = c.transaction().market()?;
     tx.execute_batch("SAVEPOINT verified_listing").market()?;
     let result = (|| {
-        let st = checked?;
-        if !st.owner_email.eq_ignore_ascii_case(&a.email)
-            || st.grant.is_some()
-            || st.running_lease.is_some()
-            || st.switching
-            || !st.cleanup_safe
-        {
-            return Err(conflict("Client workspace is unavailable"));
+        if let Some(reason) = readiness(&tx, &id, &a.email)?.seller_blocker() {
+            return Err(reason.error());
+        }
+        let st = checked.map_err(|err| match err {
+            AppError::ServiceUnavailable(_) | AppError::Conflict(_) => {
+                ListingBlocker::ControlUnavailable.error()
+            }
+            err => err,
+        })?;
+        if let Some(reason) = st.workspace_blocker(&a.email) {
+            return Err(reason.error());
         }
         let hardware = st
             .hardware
-            .ok_or_else(|| conflict("missing hardware snapshot"))?;
-        hardware.validate()?;
-        let sequence=tx.query_row("UPDATE online_client_listings SET sequence=max(sequence,?3+1),challenge=NULL,challenge_until=NULL,check_json=?4,hardware_at=unixepoch()
-            WHERE installation_id=?1 AND challenge=?2 AND challenge_until>=unixepoch() AND egress_ip IS NOT NULL AND state='locking' RETURNING sequence",
-            params![id,challenge,st.sequence,json!({"hardware":hardware,"version":st.version.chars().take(80).collect::<String>()}).to_string()],|r|r.get::<_,i64>(0)).optional().market()?.ok_or_else(||conflict("egress verification expired"))?;
-        seller_ready(&tx, &id, &a.email)?;
+            .filter(|h| h.validate().is_ok())
+            .ok_or_else(|| ListingBlocker::HardwareUnavailable.error())?;
+        let snapshot = json!({"exclusiveManagement":st.exclusive_management, "ownerRental":st.owner_rental,
+            "hardware":hardware, "version":st.version.chars().take(80).collect::<String>()});
+        let (sequence, egress_verified): (i64, bool) = tx.query_row(
+            "UPDATE online_client_listings SET sequence=max(sequence,?3+1),challenge=NULL,
+             challenge_until=NULL,check_json=?4,hardware_at=unixepoch()
+             WHERE installation_id=?1 AND challenge=?2 AND challenge_until>=unixepoch() AND state='locking'
+             RETURNING sequence,egress_ip IS NOT NULL",
+            params![id, challenge, st.sequence, snapshot.to_string()], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional().market()?.ok_or_else(|| ListingBlocker::ListingChanged.error())?;
+        if !egress_verified {
+            return Err(ListingBlocker::EgressUnverified.error());
+        }
+        if v.cycle_price_minor > 0
+            && let Some(reason) = paid_listing_blocker(&tx, &a)?
+        {
+            return Err(reason.error());
+        }
         queue(
             &tx,
             &id,
@@ -488,6 +710,8 @@ struct Quote {
 struct Terms {
     seller: String,
     revision: i64,
+    listing_price: i64,
+    self_rental: bool,
     price: i64,
     days: Option<u32>,
     trial: i64,
@@ -498,10 +722,32 @@ fn buyable(
     a: &AuthSession,
     revision: i64,
 ) -> Result<Terms, AppError> {
-    let t=tx.query_row("SELECT seller_id,revision,cycle_price_minor,free_days,trial_days*86400 FROM online_client_supply
-        WHERE installation_id=?1 AND state='listed' AND revision=?2 AND supply_status='idle'",params![id,revision],|r|Ok(Terms{seller:r.get(0)?,revision:r.get(1)?,price:r.get(2)?,days:r.get(3)?,trial:r.get(4)?})).optional().market()?.ok_or_else(||conflict("Client availability or offer changed"))?;
-    if t.seller == a.user_id {
-        return Err(conflict("cannot rent your own Client"));
+    let (seller, listing_price, days, trial, owner_capable): (String, i64, Option<u32>, i64, bool) =
+        tx.query_row(
+            "SELECT seller_id,cycle_price_minor,free_days,trial_days*86400,owner_rental
+               FROM online_client_supply
+              WHERE installation_id=?1 AND revision=?2 AND availability='available'",
+            params![id, revision],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()
+        .market()?
+        .ok_or_else(|| conflict("Client availability or offer changed"))?;
+    let self_rental = seller == a.user_id;
+    let t = Terms {
+        seller,
+        revision,
+        listing_price,
+        self_rental,
+        price: if self_rental { 0 } else { listing_price },
+        days: if self_rental { None } else { days },
+        trial: if self_rental { 0 } else { trial },
+    };
+    if self_rental {
+        if !owner_capable {
+            return Err(conflict("upgrade this Client to rent your own listing"));
+        }
+        return Ok(t);
     }
     crate::market_access::ensure_product_access_tx(
         tx,
@@ -577,7 +823,8 @@ fn create_quote(
         (0, 0, None)
     };
     let projection = json!({
-        "revision": terms.revision, "cyclePriceMinor": terms.price, "trialSeconds": trial_seconds,
+        "managementVersion":2, "revision": terms.revision, "listingPriceMinor": terms.listing_price, "selfRental": terms.self_rental,
+        "cyclePriceMinor": terms.price, "trialSeconds": trial_seconds,
         "freeDays": terms.days, "autoRenew": auto_renew, "currency": "USD",
         "healthPolicy": "utc_hour_10_of_12_v1", "terminationPolicy": termination,
     });
@@ -618,7 +865,7 @@ async fn commit(
     let a = actor(&s, &h).await?;
     if !v.acknowledged {
         return Err(AppError::BadRequest(
-            "acknowledge owner root access before renting".into(),
+            "confirm the rental terms before renting".into(),
         ));
     }
     let c = s.store.conn.lock().await;
@@ -640,17 +887,25 @@ fn commit_quote(tx: &Transaction<'_>, q: &str, a: &AuthSession) -> Result<Value,
     if let Some(v) = replay {
         return Ok(v);
     }
-    let (id, rev, auto, trial_epoch, trial): (String, i64, bool, i64, i64) = tx
+    let (id, rev, auto, trial_epoch, trial, price, days, self_rental, listing_price) = tx
         .query_row(
-            "SELECT installation_id, revision, auto_renew, trial_epoch, json_extract(projection_json,'$.trialSeconds')
-             FROM online_client_quotes WHERE id=?1 AND buyer_id=?2 AND expires_at>unixepoch()",
+            "SELECT installation_id, revision, auto_renew, trial_epoch, json_extract(projection_json,'$.trialSeconds'),
+                    cycle_price_minor, free_days, coalesce(json_extract(projection_json,'$.selfRental'),0),
+                    coalesce(json_extract(projection_json,'$.listingPriceMinor'),cycle_price_minor)
+               FROM online_client_quotes WHERE id=?1 AND buyer_id=?2 AND expires_at>unixepoch() AND json_extract(projection_json,'$.managementVersion')=2",
             params![q, a.user_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            |r| Ok((r.get::<_,String>(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get::<_,i64>(4)?,
+                r.get::<_,i64>(5)?, r.get::<_,Option<u32>>(6)?, r.get::<_,bool>(7)?, r.get::<_,i64>(8)?)),
         )
         .optional()
         .market()?
         .ok_or_else(|| conflict("quote expired"))?;
     let t = buyable(tx, &id, a, rev)?;
+    if (price, days, self_rental, listing_price)
+        != (t.price, t.days, t.self_rental, t.listing_price)
+    {
+        return Err(conflict("Client offer changed"));
+    }
     let now = Utc::now();
     let date = now.to_rfc3339();
     let lease = Uuid::new_v4().to_string();
@@ -700,7 +955,7 @@ fn commit_quote(tx: &Transaction<'_>, q: &str, a: &AuthSession) -> Result<Value,
         (now + Duration::days(30)).timestamp()
     };
     let seq = advance(tx, &id)?;
-    tx.execute("INSERT INTO online_client_leases(id,installation_id,quote_id,buyer_id,tenant_email,seller_id,alias,state,sequence,grant_until,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,'starting',?8,?9,?10)",params![lease,id,q,a.user_id,a.email,t.seller,alias,seq,until,now.timestamp()]).market()?;
+    tx.execute("INSERT INTO online_client_leases(id,installation_id,quote_id,buyer_id,tenant_email,seller_id,alias,state,sequence,grant_until,created_at,management_version) VALUES(?1,?2,?3,?4,?5,?6,?7,'starting',?8,?9,?10,2)",params![lease,id,q,a.user_id,a.email,t.seller,alias,seq,until,now.timestamp()]).market()?;
     crate::public_hosts::claim(
         tx,
         crate::public_hosts::NewPublicHost {
@@ -722,7 +977,7 @@ fn commit_quote(tx: &Transaction<'_>, q: &str, a: &AuthSession) -> Result<Value,
         tx,
         &id,
         seq,
-        json!({"operation":"begin","grant":Grant{lease_id:lease.clone(),tenant_email:a.email.clone(),alias,expires_at:until}}),
+        json!({"operation":"begin","grant":Grant{buyer_id:Some(a.user_id.clone()),lease_id:lease.clone(),tenant_email:a.email.clone(),alias,expires_at:until}}),
     )?;
     Ok(json!({"leaseId":lease,"state":"starting"}))
 }
@@ -774,29 +1029,87 @@ async fn end(
     ))
 }
 
-async fn listings(State(s): State<ServerState>, h: HeaderMap) -> Reply {
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListingsQuery {
+    include_available_hours24: Option<bool>,
+}
+
+// Previous shop bundles expect a count of completed UTC hours on the unqualified URL.
+fn legacy_available_hours(
+    c: &Connection,
+    viewer: Option<&str>,
+) -> Result<HashMap<String, i64>, AppError> {
+    let mut stmt = c.prepare(
+        "SELECT installation_id, count(*) FROM (
+             SELECT p.installation_id
+             FROM online_client_probes p JOIN online_client_listings l ON l.installation_id=p.installation_id
+             WHERE p.healthy=1 AND p.bucket >= (unixepoch()/3600-24)*12 AND p.bucket < (unixepoch()/3600)*12
+               AND (l.state='listed' OR (l.seller_id=?1 AND l.state!='unlisted'))
+             GROUP BY p.installation_id, p.bucket/12 HAVING count(DISTINCT p.bucket)>=10
+         ) GROUP BY installation_id"
+    ).market()?;
+    stmt.query_map(params![viewer], |r| Ok((r.get(0)?, r.get(1)?)))
+        .market()?
+        .collect::<crate::db::Result<_>>()
+        .market()
+}
+
+async fn listings(
+    State(s): State<ServerState>,
+    Query(query): Query<ListingsQuery>,
+    h: HeaderMap,
+) -> Reply {
     let me = crate::api::resolve_router_session(&s, &h)
         .await?
         .map(|s| s.user_id);
     let c = s.store.conn.lock().await;
-    let mut stmt=c.prepare("SELECT l.installation_id,l.revision,l.state,l.cycle_price_minor,l.free_days,l.trial_days,l.country_code,l.egress_ip,
-        l.check_json,l.probe_healthy,l.observed_at,l.seller_id=?1,l.occupied,
-        (SELECT count(*) FROM (SELECT bucket/12 FROM online_client_probes p WHERE p.installation_id=l.installation_id
-            AND p.healthy=1 AND bucket >= (unixepoch()/3600-24)*12 AND bucket < (unixepoch()/3600)*12
-            GROUP BY bucket/12 HAVING count(DISTINCT bucket)>=10)),
-        t.subdomain,coalesce(i.last_seen_ip!=l.egress_ip,0),(SELECT id FROM market_provider_profiles mp WHERE mp.user_id=l.seller_id),(SELECT probe_error FROM online_client_listings base WHERE base.installation_id=l.installation_id),(SELECT attempts FROM online_client_operations o WHERE o.installation_id=l.installation_id)
-        FROM online_client_supply l
-        JOIN installations i ON i.id=l.installation_id JOIN installation_client_tunnels t ON t.installation_id=l.installation_id
-        WHERE l.state='listed' OR (l.seller_id=?1 AND l.state!='unlisted') ORDER BY l.occupied,l.probe_healthy DESC,l.country_code,t.subdomain").market()?;
-    let rows=stmt.query_map(params![me.unwrap_or_default()],|r|{
-        let check=r.get::<_,Option<String>>(8)?.and_then(|v|serde_json::from_str::<Value>(&v).ok()).unwrap_or_default();
-        // Only the seller sees the physical subdomain and full egress address. A
-        // home seller behind NAT would otherwise publish their residential IP.
-        let owned=r.get::<_,bool>(11)?;
-        let installation=r.get::<_,String>(0)?;
-        let label=if owned {r.get::<_,String>(14)?} else {public_label(&installation)};
-        let egress=r.get::<_,Option<String>>(7)?.map(|ip| if owned {ip} else {crate::store::mask_host_ip(&ip)});
-        Ok(json!({"installationId":installation,"revision":r.get::<_,i64>(1)?,"state":r.get::<_,String>(2)?,"cyclePriceMinor":r.get::<_,i64>(3)?,"freeDays":r.get::<_,Option<i64>>(4)?,"trialDays":r.get::<_,i64>(5)?,"country":r.get::<_,Option<String>>(6)?,"egressIp":egress,"hardware":check["hardware"],"healthy":r.get::<_,bool>(9)?,"observedAt":r.get::<_,Option<i64>>(10)?,"owned":owned,"occupied":r.get::<_,bool>(12)?,"availableHours24":r.get::<_,i64>(13)?,"label":label,"clientUrl":owned.then(||s.config.tunnel_url(&label)),"lastError":if owned {r.get::<_,Option<String>>(17)?} else {None},"attempts":if owned {r.get::<_,Option<i64>>(18)?} else {None},"egressDiffers":r.get::<_,bool>(15)?,"providerId":r.get::<_,Option<String>>(16)?}))
+    let health = crate::store::installation_health_minutes_24h(&c)?;
+    let legacy_hours = query
+        .include_available_hours24
+        .unwrap_or(true)
+        .then(|| legacy_available_hours(&c, me.as_deref()))
+        .transpose()?;
+    let mut stmt = c.prepare(
+        "SELECT l.installation_id, l.revision, l.state, l.cycle_price_minor, l.free_days, l.trial_days,
+                l.country_code, l.egress_ip, l.check_json, l.probe_healthy, l.observed_at, l.seller_id IS ?1,
+                l.occupied, t.subdomain, coalesce(i.last_seen_ip!=l.egress_ip,0), mp.id,
+                l.probe_error, o.attempts, i.created_at, l.availability, l.exclusive_management, l.owner_rental
+         FROM online_client_supply l
+         JOIN installations i ON i.id=l.installation_id
+         JOIN installation_client_tunnels t ON t.installation_id=l.installation_id
+         LEFT JOIN market_provider_profiles mp ON mp.user_id=l.seller_id
+         LEFT JOIN online_client_operations o ON o.installation_id=l.installation_id
+         WHERE l.state='listed' OR (l.seller_id=?1 AND l.state!='unlisted')
+         ORDER BY l.occupied, (l.availability='available') DESC, l.country_code, t.subdomain"
+    ).market()?;
+    let rows = stmt.query_map(params![me], |r| {
+        let installation: String = r.get(0)?;
+        let check = r.get::<_, Option<String>>(8)?
+            .and_then(|value| serde_json::from_str::<Value>(&value).ok()).unwrap_or_default();
+        let owned: bool = r.get(11)?;
+        let label = if owned { r.get(13)? } else { public_label(&installation) };
+        let (healthy, observed) = health.get(&installation).copied().unwrap_or_default();
+        let rate = (observed > 0).then(|| crate::store::observed_online_rate(healthy, observed));
+        let mut item = json!({
+            "installationId": installation, "revision": r.get::<_, i64>(1)?, "state": r.get::<_, String>(2)?,
+            "cyclePriceMinor": r.get::<_, i64>(3)?, "freeDays": r.get::<_, Option<i64>>(4)?,
+            "trialDays": r.get::<_, i64>(5)?, "country": r.get::<_, Option<String>>(6)?,
+            "egressIp": crate::store::visible_host_ip(r.get(7)?, owned), "egressDiffers": r.get::<_, bool>(14)?,
+            "hardware": check["hardware"], "healthy": r.get::<_, bool>(9)?, "observedAt": r.get::<_, Option<i64>>(10)?,
+            "owned": owned, "occupied": r.get::<_, bool>(12)?, "label": label,
+            "clientUrl": owned.then(|| s.config.tunnel_url(&label)), "providerId": r.get::<_, Option<String>>(15)?,
+            "lastError": if owned { r.get::<_, Option<String>>(16)? } else { None },
+            "attempts": if owned { r.get::<_, Option<i64>>(17)? } else { None },
+            "registeredAt": r.get::<_, String>(18)?, "availability": r.get::<_, String>(19)?,
+            "exclusiveManagement": r.get::<_, bool>(20)?, "ownerRental": r.get::<_, bool>(21)?,
+            "onlineRate24h": rate, "observedMinutes24h": observed,
+            "observationCoverage24h": crate::store::observation_coverage(observed)
+        });
+        if let Some(hours) = &legacy_hours {
+            item["availableHours24"] = json!(hours.get(&installation).copied().unwrap_or_default());
+        }
+        Ok(item)
     }).market()?.collect::<crate::db::Result<Vec<_>>>().market()?;
     Ok(Json(json!({"listings":rows})))
 }
@@ -838,9 +1151,7 @@ fn seller_items(conn: &Connection, seller_id: &str) -> Result<Vec<SellerItem>, A
            JOIN online_client_listings l ON l.installation_id=r.installation_id
           WHERE r.seller_id=?1
           UNION ALL
-         SELECT l.installation_id, t.subdomain,
-                CASE WHEN l.state!='listed' THEN l.state WHEN l.occupied THEN 'occupied'
-                     WHEN l.probe_healthy THEN 'available' ELSE 'offline' END,
+         SELECT l.installation_id, t.subdomain, l.availability,
                 l.cycle_price_minor, NULL, NULL, l.updated_at, l.installation_id,NULL
            FROM online_client_supply l JOIN installation_client_tunnels t ON t.installation_id=l.installation_id
           WHERE l.seller_id=?1 AND l.state!='unlisted' AND NOT EXISTS (
@@ -855,9 +1166,7 @@ fn seller_items(conn: &Connection, seller_id: &str) -> Result<Vec<SellerItem>, A
                 label: row.get(1)?,
                 state: row.get(2)?,
                 cycle_price_minor: row.get(3)?,
-                tenant_email: row
-                    .get::<_, Option<String>>(4)?
-                    .map(|email| crate::store::mask_email(&email)),
+                tenant_email: row.get(4)?,
                 expires_at: row.get(5)?,
                 termination_id: row.get(8)?,
             })
@@ -906,8 +1215,8 @@ pub(crate) async fn alias(
     label: &str,
 ) -> Result<Option<(String, String, String, String)>, AppError> {
     let c = s.store.conn.lock().await;
-    c.query_row("SELECT r.id,r.installation_id,t.subdomain,CASE WHEN r.state='starting' THEN 'starting' WHEN r.state='active' AND r.grant_until>unixepoch() AND p.lifecycle='active' THEN 'active' ELSE 'ended' END
-        FROM online_client_leases r LEFT JOIN installation_client_tunnels t ON t.installation_id=r.installation_id
+    c.query_row("SELECT r.id,r.installation_id,t.subdomain,CASE WHEN r.state='starting' THEN 'starting' WHEN r.state='active' AND r.grant_until>unixepoch() AND p.lifecycle='active' AND (r.management_version<2 OR l.exclusive_management) THEN 'active' ELSE 'ended' END
+        FROM online_client_leases r JOIN online_client_listings l USING(installation_id) LEFT JOIN installation_client_tunnels t ON t.installation_id=r.installation_id
         JOIN public_hosts p ON p.label=r.alias AND p.subject_id=r.id WHERE r.alias=?1",params![label],|r|Ok((r.get(0)?,r.get(1)?,r.get::<_,Option<String>>(2)?.unwrap_or_default(),r.get(3)?))).optional().market()
 }
 
@@ -921,7 +1230,89 @@ mod inventory_tests {
             public_label("8F3A21C0-1111-4222-8333-444455556666"),
             "client-8f3a21c0"
         );
-        assert_eq!(crate::store::mask_host_ip("203.0.113.42"), "203.0.113.xx");
+    }
+
+    #[test]
+    fn public_addresses_only_expose_networks() {
+        let visible = |ip: &str, reveal| crate::store::visible_host_ip(Some(ip.to_owned()), reveal);
+        for (address, network) in [
+            ("203.0.113.42", "203.0.113.xx"),
+            ("::ffff:203.0.113.42", "203.0.113.xx"),
+            ("2001:db8::1", "2001:db8::/64"),
+            ("2001:db8:0:0:0:0:0:1", "2001:db8::/64"),
+            ("2001::ab:cd:ef", "2001::/64"),
+        ] {
+            assert_eq!(visible(address, false).as_deref(), Some(network));
+            assert_eq!(visible(address, true).as_deref(), Some(address));
+        }
+        assert!(visible("invalid address", false).is_none());
+    }
+
+    #[test]
+    fn supply_distinguishes_recent_tunnel_and_maintenance_evidence_from_stale_probes() {
+        let conn = crate::test_support::database().unwrap();
+        crate::test_support::online_listing(&conn, "physical", "seller", "seller@example.test");
+        for (error, age, healthy, expected) in [
+            (None, 0, true, "available"),
+            (Some("tunnel_offline"), 0, false, "offline"),
+            (Some("upgrading"), 0, false, "upgrading"),
+            (Some("switching"), 0, false, "switching"),
+            (Some("control_unavailable"), 0, false, "unavailable"),
+            (Some("tunnel_offline"), 601, false, "unavailable"),
+            (Some("upgrading"), 601, false, "unavailable"),
+            (Some("switching"), 601, false, "unavailable"),
+            (None, 601, true, "unavailable"),
+        ] {
+            conn.execute(
+                "UPDATE online_client_listings SET probe_error=?1, observed_at=unixepoch()-?2, healthy=?3 WHERE installation_id='physical'",
+                params![error, age, healthy],
+            ).unwrap();
+            let (availability, idle): (String, bool) = conn.query_row(
+                "SELECT availability, supply_status='idle' FROM online_client_supply WHERE installation_id='physical'", [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            assert_eq!(availability, expected);
+            assert_eq!(idle, expected == "available");
+        }
+    }
+
+    #[test]
+    fn legacy_hours_count_distinct_successful_buckets_per_visible_listing() {
+        let conn = crate::test_support::database().unwrap();
+        for id in ["public", "private"] {
+            crate::test_support::online_listing(&conn, id, "seller", "seller@example.test");
+        }
+        conn.execute(
+            "UPDATE online_client_listings SET state='unlocking' WHERE installation_id='private'",
+            [],
+        )
+        .unwrap();
+        let current_hour = stamp() / 3600;
+        for (installation, lease, hour_offset, count) in [
+            ("public", "", -2, 10),
+            ("public", "", -3, 9),
+            ("public", "earlier-lease", -3, 9),
+            ("public", "", -26, 12),
+            ("public", "", 2, 12),
+            ("private", "", -2, 10),
+        ] {
+            for offset in 0..count {
+                let bucket = (current_hour + hour_offset) * 12 + offset;
+                conn.execute(
+                    "INSERT INTO online_client_probes(installation_id,lease_id,bucket,checked_at,healthy,seller_id)
+                     VALUES(?1,?2,?3,?4,1,'seller')",
+                    params![installation, lease, bucket, bucket * 300],
+                ).unwrap();
+            }
+        }
+        assert_eq!(
+            legacy_available_hours(&conn, None).unwrap(),
+            HashMap::from([("public".into(), 1)])
+        );
+        assert_eq!(
+            legacy_available_hours(&conn, Some("seller")).unwrap(),
+            HashMap::from([("public".into(), 1), ("private".into(), 1)])
+        );
     }
 
     #[test]
@@ -943,7 +1334,7 @@ mod inventory_tests {
         let rows = seller_items(&conn, "seller").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].listing_id.as_deref(), Some("physical"));
-        assert_eq!(rows[0].tenant_email.as_deref(), Some("b***r@example.test"));
+        assert_eq!(rows[0].tenant_email.as_deref(), Some("buyer@example.test"));
         conn.execute(
             "UPDATE online_client_leases SET state='released',released_at=unixepoch()",
             [],

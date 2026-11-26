@@ -2,18 +2,18 @@
 
 import * as React from "react";
 import { Button } from "@heroui/react";
-import { useSearchParams } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { OnlineClientMarket } from "@/components/dashboard/client-market/online-market";
 import { ClientRentalAuditPanel } from "@/components/dashboard/client-market/rental-audit-panel";
-import { ClientRentalRecords } from "@/components/dashboard/client-market/rental-records";
+import { clientMarketTenantHref } from "@/lib/dashboard-nav";
 import { ClientTerminationDialog } from "@/components/market/client-termination-dialog";
 import { useClientTerminationWorkspace } from "@/components/market/use-client-termination-workspace";
 import { ClientConsoleIframe } from "./client-console/client-console-iframe";
 import { authFetch } from "@/lib/auth";
 import { onlineRequest, type OnlineLease } from "@/lib/online-client-market";
-import { ROUTER_OPEN_LOGIN_EVENT } from "./client-market/host-utils";
+import { clientMarketTenantFromQuery, clientMarketWorkspaceFromQuery, ROUTER_OPEN_LOGIN_EVENT } from "./client-market/host-utils";
 import { currentPageHref } from "@/lib/url-search";
 
 /** Query parameters: `focus` (listing installation or lease id), `provider`,
@@ -24,8 +24,7 @@ export function ClientMarketPage() {
   const searchParams = useSearchParams();
   const actor = session?.authenticated ? session.user?.id : undefined;
   const terminationWork = useClientTerminationWorkspace(actor);
-  const [rentalRevision, setRentalRevision] = React.useState(0);
-  const onRentalChanged = React.useCallback(() => setRentalRevision((n) => n + 1), []);
+  const router = useRouter();
   const queryTerminationId = searchParams.get("terminationId");
   // Bound to the account that opened it, so a late account switch cannot show another actor's case.
   const [termination, setTermination] = React.useState<{ id: string; userId: string } | null>(null);
@@ -60,6 +59,15 @@ export function ClientMarketPage() {
     window.history.replaceState(null, "", currentPageHref(window.location.href, (params) => params.delete("provider")));
   };
   const openId = searchParams.get("openLease") || searchParams.get("embeddedLease");
+  const rentalId = searchParams.get("rentalId");
+  const legacyRentals = !openId && !queryTerminationId
+    && clientMarketWorkspaceFromQuery(searchParams.get("view"), searchParams.get("tab")) === "catalog"
+    && clientMarketTenantFromQuery(searchParams.get("view"), rentalId);
+  const rentalFocus = rentalId || searchParams.get("focus") || undefined;
+  React.useEffect(() => {
+    if (legacyRentals) router.replace(clientMarketTenantHref(rentalFocus));
+  }, [legacyRentals, rentalFocus, router]);
+  if (legacyRentals) return <p role="status">{t("common.loading")}</p>;
   if (openId)
     return (
       <WorkspaceLaunch
@@ -74,9 +82,7 @@ export function ClientMarketPage() {
       <OnlineClientMarket
         focusId={searchParams.get("focus")}
         providerId={providerId}
-        rentalId={searchParams.get("rentalId")}
         terminations={terminations}
-        onChanged={onRentalChanged}
         onTerminationOpen={openTermination}
         providerNotice={providerId ? (
           <div className="flex min-h-11 min-w-0 flex-wrap items-center justify-between gap-2 rounded-lg bg-slate-100 px-3 py-2 text-sm">
@@ -99,8 +105,7 @@ export function ClientMarketPage() {
         </div>
       ) : null}
       <ClientTerminationDialog terminationId={terminationId} onClose={closeTermination} onChanged={() => void terminationWork.refresh(true)} />
-      <ClientRentalRecords historyOnly focusKey={searchParams.get("rentalId")} onTerminationOpen={openTermination} revision={terminationWork.revision + rentalRevision} />
-      <ClientRentalAuditPanel onTerminationOpen={openTermination} revision={terminationWork.revision + rentalRevision} />
+      <ClientRentalAuditPanel onTerminationOpen={openTermination} revision={terminationWork.revision} />
     </main>
   );
 }
@@ -204,7 +209,7 @@ function WorkspaceLaunch({ id, embedded }: { id: string; embedded: boolean }) {
       ) : (
         <p role="status">{t("common.loading")}</p>
       )}
-      <a href={`/client-market/?view=rentals&focus=${encodeURIComponent(id)}`}>{t("online.myLeases")}</a>
+      <a href={clientMarketTenantHref(id)}>{t("online.myLeases")}</a>
     </main>
   );
 }

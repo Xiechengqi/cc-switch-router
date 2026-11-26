@@ -52,13 +52,13 @@ TokenSwitch 的公共汇聚层。为 `cc-switch-server` 实例提供公网子域
 
 远程主机上的部署由仓库内 `install-client.sh` 负责,它会下载 `cc-switch-server` 二进制并完成初始化。Router 的 `/install-client.sh` 会在请求时写入 Settings 中当前选择的 Server Release；默认值是 `latest`，也可固定为已经通过 Server 手动发布流程生成的 7 位 Commit Release。脚本严格识别 AMD64/ARM64，同时下载同一 Release、同一下载源的 binary 与 `.sha256`，在覆盖现有文件前完成 checksum；固定 Commit 时还会检查 staged binary 的 `version --json`。任一步失败都会终止，不会回退 `latest`。手动安装使用这个设置，Server 自升级使用 `latest`。
 
-Client owner 在 Clients 页选择自己已验证、在线并声明 `marketLeaseV1` 的 Client，设置月租或免费期限后上架。上架检查会确认 Share 市场没有未结束的挂售和车位，经 Client 的实际出站路径核实 IP 与地区，并读取 CPU、内存和数据盘。买家在 Client Market 可以看到最近一次探测和过去 24 个完整 UTC 小时的可用小时数。
+Client owner 可从 Client Market 的「我的挂售 → 添加」或 Clients 卡片上架已验证的在线设备。Router 检查 Share 挂售与车位占用，经签名通道确认 Client 支持独占管理，核实实际网络出口并读取规格。卖家选择免费或按月收费，提交后等待 Client 确认上架。买家在「选购客户端」可查看出口国旗、CPU、内存、架构、24 小时在线率、从首次接入起算的运行时长和租金。
 
-租户从市场报价后下单，在独立域名进入自己的工作区，管理账号、Provider、Share、聊天和备份。卖家在自己的域名进入只读协助视图。终端只对 Client owner 开放，协助、终端、重启及升级操作会记录并通知租户。主机 owner 持有操作系统 root 权限，能够读取磁盘。租约期间卖家工作区冻结，回环推理同样要求当前租户令牌。
+租户用下单的 Router 账号进入独立工作区，可管理账号、Provider、Share、聊天、备份和 Client 升级。租用时无需设置控制台密码。开租会撤销卖家的旧会话并结束网页终端，交还确认前，卖家不能通过网页或本机接口进入控制台。Client 卡片和详情公开显示完整的所有者与当前租户邮箱。卖家自租免费，同样从租户入口管理。交还后，所有者用原密码重新登录。主机原有的 SSH 和操作系统权限独立于网页租约。
 
 Clients 页与租户控制台使用短期、一次性且绑定父会话和目标域名的票据自动登录。退租会撤销租户域名和票据，停止计费；Router 在第三方 Share 回收且 Client 确认工作区清理后重新开放库存。在线 Client 使用自身的反向隧道，NAT 后的机器也可以上架。
 
-Router 和 Server 使用全新数据目录。卖家手动启动 Server 并建立反向隧道后，从 Clients 页上架。部署和端到端验收步骤见[在线 Client 租用计划](docs/client-market-online-client-leasing-plan.md#6-空环境手动部署与验收)。
+新环境可用独立数据目录初始化 Router 和 Server。已有在线租赁库经迁移 0129 保留租约和账务，0130 统一市场可租状态。仍使用管理版本 1 的租约会在 Clients 和买家租约详情提示迁移。要继续使用同一租约，由 owner 在宿主更新 Client，Router 核对同一工作区的有效签名状态后开放租户升级。也可以先退租，再由 owner 升级。[环境迁移与验收计划](docs/client-market-online-client-leasing-plan.md#6-环境迁移与验收计划)
 
 ## 边界策略
 

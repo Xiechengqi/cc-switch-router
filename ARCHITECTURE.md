@@ -14,7 +14,7 @@
 
 | 术语 | 含义 | 代码位置 |
 |---|---|---|
-| **Host Provider**(主机供给方) | Client Market 中出租已验证在线 Client 能力的用户 | `client_market_trade.rs` `QuoteItemView::provider_id`、`RentalView::provider_id` |
+| **Host Provider**(主机供给方) | Client Market 中出租已验证在线 Client 能力的用户 | `online_client_listings.seller_id`、成交时写入的 `online_client_leases.seller_id` |
 | **Upstream Provider**(上游供应商) | Share 绑定的 API 后端。`ShareAppRuntimes` 有 claude / codex / gemini / kiro / cursor / antigravity / copilot 七个运行时槽位;Share 对外开放的 App 仍只有 claude / codex / gemini | `models.rs` `ShareUpstreamProvider`、`ShareAppRuntimes` |
 
 与 Server 侧对齐的其余词汇:
@@ -40,7 +40,7 @@
 
 ## 1. 系统定位
 
-Share v10 为普通授权增加 Token／USD 等值二选一配额。`share_value_pricing` 负责严格快照与定点算法，`store/share_value_quotas` 保存不可变价目、installation ACK 和私有动态投影（每个 Share 用户仅保留当前窗口一行，删除 Share／清理 installation 时一并删除投影与 ACK）；Server 是准入、在途风险、历史用量和校准的权威。该子系统不读取支付渠道，也不写 `market_*` 资金表。默认无执行快照，须 Owner 明确发布并经 Server ACK；旧 v7／Token 行为和活跃市场车位合同保持。具体协议、恢复与 `live_pending` 验收边界见 [PROTOCOL §13](PROTOCOL.md#13-share-v10-美元等值额度)。
+Share v10 为普通授权增加 Token／USD 等值二选一配额。`share_value_pricing` 负责严格快照与定点算法，`store/share_value_quotas` 保存不可变价目、installation ACK 和私有动态投影（每个 Share 用户仅保留当前窗口一行，删除 Share／清理 installation 时一并删除投影与 ACK）；Server 是准入、在途风险、历史用量和校准的权威。该子系统不读取支付渠道，也不写 `market_*` 资金表。默认无执行快照，须 Owner 明确发布并经 Server ACK；旧 v7／Token 行为和活跃市场车位合同保持。具体协议、恢复与 `live_pending` 验收边界见 [PROTOCOL §13](PROTOCOL.md#13-share-v10v14-额度与媒体工具权限)。
 
 cc-switch-router 是 TokenSwitch 的**公共汇聚层**。它为 `cc-switch-server` 实例提供公网可达性，并在 Client + Router 边界内承载 Router 自有的 Share Market、Client Market 与中性的 Gateway 容量适配。旧独立 Token Market 不再是 Router 的运行时角色。
 
@@ -127,11 +127,13 @@ Bundle 绑定聚合，不从 Claude/Codex/Gemini API、兼容类型或名称猜�
 
 ### ③ Client Market 在线 Client 租用
 
-供给以卖家的 installation 为单位。所有上架项、租期内的反向控制和出口探测都经过已有 Client 隧道。卖家与租户的两个公网域名指向同一物理 installation。每份租约持有独立标识、子域名、钱包合同及工作区。迁移 127 的 `online_client_supply` 给列表、地区汇总和报价提供同一可租状态；未释放租约由唯一索引强制排他。
+每个上架项对应卖家的一台 installation。Router 经现有隧道发送签名控制请求，Client 经业务实际使用的出站路径回调 Router，确认出口 IP 与地区。每份租约有独立 ID、子域名和工作区。在独占管理租约中，物理域名的控制台关闭，当前买家从租约别名管理应用，Web Terminal 对所有人关闭。只有付费他租建立钱包合同。自租成交价为零，使用同一套工作区与交还流程。
+
+唯一索引限制每台 installation 同时只有一份未释放租约。商店、卖家库存、报价与首次成交、地区统计、排名空闲数和准入申请共用 `online_client_supply.availability`。当设备已挂牌、未占用、签名确认独占管理且最近十分钟探测健康时，状态为 `available`。待完成的退租结算仍占用库存，自租另验 `ownerRental`。[供给视图](schema/0130_online_client_supply_availability.sql) · [实施与兼容范围](docs/client-market-online-client-leasing-plan.md#client-market-design-gaps)
 
 上架、授权、延长、撤权和清理的意图都在数据库事务内写入，再由 worker 经 HMAC 控制通道送达。每次重试先读 Client 持久状态和序号。签名回执与正在运行的工作区一致时才开放访问和激活付费合同。退租事务冻结结算时点、撤销租户别名并关闭其 Share 挂售；Share 的车位撤权和结算使用原有流程。租后财务争议按 terminationId 访问，清理回执绑定租约与物理 installation。
 
-每五分钟的主动探测按 installation、租约和 UTC 时段去重。24 小时健康统计与已关闭 UTC 小时的月租结算读取同一份探测记录。硬件通过已有探测连接低频刷新。协议与权限矩阵见 [PROTOCOL.md](PROTOCOL.md) 和[实施计划](docs/client-market-online-client-leasing-plan.md)。
+卡片的 24 小时在线率按 `installation_health_checks` 中有观测的分钟计算，运行时长从 installation 首次接入 Router 起算。市场每五分钟探测工作区，按 installation、租约和 UTC 时段去重写入 `online_client_probes`，月租履约按这些样本结算。Router 约每小时在签名状态请求中要求 Client 刷新硬件快照。[租赁协议](PROTOCOL.md#在线-client-market-购买与控制协议) · [租用规划](docs/client-market-online-client-leasing-plan.md)
 
 ### ④ Provider Rank —— 跨市场供应商发现
 
@@ -141,7 +143,7 @@ Provider Rank v1 每 15 分钟把服务质量、有效买家选择、履约和�
 
 ### ⑤ Market 资金 —— 官方充值模式与平台钱包
 
-Share Market 与 Client Market 的付费全部由 Router 承担，Server 不保存价格、余额或账单。对 Server 而言，租用、恢复和欠费暂停只是 `managedGrant` 的 `upsert` / `revoke`；Client Market 欠费时由 Router 暂停该 Client 的 tunnel。新付费发布、报价与购买始终使用平台钱包，官方充值模式不选择支付轨道（`src/market_payments/mod.rs` 的 `require_current_offer_rail`；迁移 82 的发布触发器）：
+Share Market 与 Client Market 的价格、余额和账单由 Router 管理。Share 通过 `managedGrant` 的 `upsert` / `revoke` 下发或回收授权。Client 租约因欠费进入回收时，Router 记录截止时间、撤销租户别名并关闭该租约的 Share 挂售。物理反向隧道继续承担撤权、清理和回执。新付费发布、报价与购买使用平台钱包，官方充值模式决定哪些用户可以充值。
 
 | 官方充值模式 | 新付费商品资金轨道 | 说明 |
 |---|---|---|
@@ -372,9 +374,9 @@ Router 从不改写 Server 返回的 descriptor,只做校验;若客户端只部�
 | `client notifications` | 5s | 离线/恢复通知 outbox（邮件 / Telegram / Bark） |
 | `telegram bot` | 长轮询 | 用户通知 Bot 的入站半边:消费 `/start` 深链完成账号绑定 |
 | `chat email notifications` | — | 聊天邮件投递 |
-| `Client Market trade` | 20s | Client Market 报价、免费期限、释放与清理状态对账 |
+| `online Client Market` | 3s 唤醒 | 调度到期的五分钟探测，核对签名状态、租约期限、释放与清理回执 |
 | `Share Market` | 5s | managed grant、免费期限与 Share 租约状态对账 |
-| `Market wallet delivery` | 5s | 平台钱包合同：试用与按秒批次、月租续期与到期、余额不足暂停／恢复／终止，并下发 Share 授权或 Client tunnel 控制 |
+| `Market wallet delivery` | 5s | 处理钱包合同的试用、服务计费、月租续期与余额不足状态。在线 Client 租约由市场任务按合同状态续期或回收 |
 | `market payments` | 30s（Webhook 可即时唤醒）；网关扫描每 10min 检查一次；审计 1h | 充值订单对账与补偿查单、Provider 收入成熟解锁及自动计入钱包、每日／每周孤儿已付单扫描、财务不变量审计 |
 | `market notifications` | 10s；提醒 1h | 钱包与 Provider 通知 outbox（邮件 / Telegram）；续费与余额不足提醒 |
 | `USD/CNY market FX` | 15min | 获取并验证 USD/CNY 展示汇率 |

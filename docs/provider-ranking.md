@@ -36,7 +36,7 @@ score = 45% service quality
 
 - Share 使用最近 90 天的 canonical model-probe observation（v1 为 400 天，过长的历史会稀释近期故障）；legacy/unobserved 证据不进入成功样本。探测、请求性能、有效选择和履约都按事件发生时所在的显式 listing Provider 时间窗归属；关闭期间不计，重开或换主也不会把旧证据移动给当前 Provider。
 - observation 必须通过 `share_model_health_slots.observation_id` 实际投影到对应 Share，才可沿该 Share 的 listing 时间窗归属；同一 observation 只计一次，不因同一 Share 的历史 listing 或同 installation 的其他 Share/listing 重复、串号或放大样本。
-- Client 使用最近 30 天的 Host online/observed samples。
+- Client 使用最近 30 天市场主动探测 `online_client_probes` 的健康样本数和总样本数，按采样时记录的卖家归属。
 - 两类信号同时存在时按 70% Share、30% Client 混合；单边存在时使用该单边。
 - 比率使用 95% Wilson lower bound，避免一个稀疏的 100% 样本压过长期稳定供给。
 
@@ -51,14 +51,13 @@ score = 45% service quality
 ### Fulfillment（15%）
 
 - Share 的已激活 subscription 算成功，`grant_failed` 算失败；仍在 pending 的授权不进入分母。
-- Client 的 create provisioning job 仅以 `succeeded` / `failed` 进入分母。
+- Client 使用在线租约。已激活计为成功，已释放且从未激活计为失败，仍在开通的租约等待结果。
 - 两个市场的 Provider 自租/自建都不进入履约分子或分母，避免供应商用自测请求堆高样本。
-- v2 只计最近 90 天的履约：Share 按激活时间（失败按创建时间），Client 按 job 创建时间。v1 使用全部历史，旧失败永远不会衰减。
-- Client 履约按 job 发生时记录的 Host owner 归属，Host 转让后历史履约仍属于原 Provider；这与 choice 按 Host Provider alias 归属不同，是有意的历史口径。
+- v2 只计最近 90 天的履约。Share 按激活时间（失败按创建时间），Client 按租约创建时间。Client 的选择与履约均按成交时的卖家归属，设备重新挂售保留原交易的归属。[选择与履约计算](../src/market_provider_rank.rs)
 
 ### Supply breadth（10%）
 
-已启用 App 数、国家数以及可用 Share seat/空闲 Host 数形成饱和分数。Share 供给必须同时满足 listing 有效、底层 Share active 且 owner 一致、至少存在一个未退休可见 seat；只有实际 enabled 的 App binding 计数。Client 已 disabled 的 Host 不再属于公开供给。以上边界与两个 Market 的可选库存一致。供给广度不能代替质量和履约。
+已启用 App 数、国家数以及可用 Share seat 和空闲 Client 数形成饱和分数。Share 供给要求 listing 有效、底层 Share active、owner 一致且有未退休的可见 seat，只有已启用的 App binding 计数。Client 总数统计全部已挂牌设备。空闲数与地区可租数都取 `online_client_supply.availability='available'`，要求设备未占用、具备签名独占能力且最近十分钟探测健康。自租能力只影响卖家本人下单。排名按既有周期生成快照。[供给视图](../schema/0130_online_client_supply_availability.sql) · [排名取数](../src/market_provider_rank.rs)
 
 TTFT 与 TPS 来自最近 30 天成功、非健康检查且完整结束的流式 Share 请求；TPS 还要求 observed usage 和可信的生成时长，terminal flush 不进入吞吐样本。同一请求只计一次，不因 listing 历史重复加权。两项指标仅作展示，`displayOnly=true`，不参与分数、资格或排序；`sampleCount` 公开参与 TTFT 的流式响应数。
 
@@ -80,9 +79,9 @@ TTFT 与 TPS 来自最近 30 天成功、非健康检查且完整结束的流式
 
 - `off`：保留旧顺序；
 - `shadow`（默认）：计算并记录将发生的位移，但响应保持旧顺序；
-- `on`：Share 推荐顺序和 Client Provider 选择顺序使用正式名次。
+- `on`：Share 推荐顺序使用正式名次。
 
-Share 页的价格、空闲量和在线率等显式排序始终使用原语义；Provider Rank 只影响“推荐”。Client 的 Host 明细仍按 Host 自身条件展示，Provider Rank 主要影响创建 Client 时的 Provider 选择。官方身份在 `off/shadow` 中保留旧版兼容顺序，在 `on` 中不作为 tie-breaker。
+Share 页的价格、空闲量和在线率等显式排序沿用原有规则。从供应商页进入 Client Market 时，商店按供应商筛选设备，买家对具体的上架项报价。官方身份在推荐开关的 `off/shadow` 模式下沿用旧版兼容顺序。[Client 选购入口](../frontend/components/dashboard/client-market/online-market.tsx)
 
 ## API 与缓存
 

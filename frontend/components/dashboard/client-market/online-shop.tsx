@@ -1,12 +1,16 @@
 "use client";
 
 import * as React from "react";
-import { CircleDot, Plus, Search, X } from "lucide-react";
+import { CircleDot, Globe2, Plus, Search, X } from "lucide-react";
+import { formatAgeDaysOrHours } from "@/components/dashboard/share-dashboard-utils";
 import { CountryFlag } from "@/components/common/country-flag";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { formatUsdMoney } from "@/lib/market-money";
+import type { OnlineListing } from "@/lib/online-client-market";
 import { cn } from "@/lib/utils";
 import {
+  onlineListingAvailability,
+  onlineStatusKey,
   SHOP_CONTINENTS,
   SHOP_UNKNOWN_COUNTRY,
   type ShopContinent,
@@ -27,7 +31,6 @@ export function OnlineShopRegionPicker({
   onContinent,
   onCountry,
   emptyAction,
-  mine,
   rentable,
 }: {
   cards: ShopCountryCard[];
@@ -36,7 +39,6 @@ export function OnlineShopRegionPicker({
   onContinent: (next: ShopContinent) => void;
   onCountry: (code: string) => void;
   emptyAction?: { label: string; onClick: () => void };
-  mine?: { selected: boolean; onSelect: () => void };
   rentable?: { pressed: boolean; label: string; onClick: () => void };
 }) {
   const { locale, t } = useLocaleText();
@@ -54,23 +56,8 @@ export function OnlineShopRegionPicker({
   const pills = (
     <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
     <div className="flex min-w-0 flex-1 flex-wrap gap-1.5" role="listbox" aria-label={t("clientMarket.shop.continentLabel")}>
-      {mine ? (
-        <button
-          type="button"
-          role="option"
-          aria-selected={mine.selected}
-          className={cn(
-            "inline-flex min-h-8 items-center rounded-full border border-border bg-background px-3 text-xs text-foreground",
-            focusRing,
-            mine.selected && selectedFill,
-          )}
-          onClick={mine.onSelect}
-        >
-          {t("clientMarket.shop.mine")}
-        </button>
-      ) : null}
       {continents.map((item) => {
-        const selected = item === continent && !mine?.selected;
+        const selected = item === continent;
         return (
           <button
             key={item}
@@ -105,14 +92,19 @@ export function OnlineShopRegionPicker({
     ) : null}
     </div>
   );
-  if (mine?.selected) return pills;
   if (cards.length === 0) {
     return (
-      <div className="grid justify-items-start gap-2">
-        {mine ? pills : null}
-        <p className="text-sm text-muted-foreground">{t(emptyAction ? "clientMarket.shop.rentableEmpty" : "clientMarket.shop.noRegions")}</p>
+      <div className="grid gap-2">
+        {pills}
+        <p className="text-sm text-muted-foreground">
+          {t(emptyAction ? "clientMarket.shop.rentableEmpty" : "clientMarket.shop.noRegions")}
+        </p>
         {emptyAction ? (
-          <button type="button" className={cn("text-sm font-medium text-primary hover:underline", focusRing)} onClick={emptyAction.onClick}>
+          <button
+            type="button"
+            className={cn("text-sm font-medium text-primary hover:underline", focusRing)}
+            onClick={emptyAction.onClick}
+          >
             {emptyAction.label}
           </button>
         ) : null}
@@ -133,9 +125,12 @@ export function OnlineShopRegionPicker({
                 key={card.code}
                 type="button"
                 aria-pressed={selected}
-                aria-label={t(selected ? "clientMarket.shop.clearCountry" : "clientMarket.shop.selectCountry", { name })}
+                aria-label={t(
+                  selected ? "clientMarket.shop.clearCountry" : "clientMarket.shop.selectCountry",
+                  { name },
+                )}
                 className={cn(
-                  "grid w-[7.25rem] content-between gap-1 rounded-xl border border-border bg-background px-2 py-1.5 text-left",
+                  "grid w-fit min-w-28 max-w-full content-between gap-1 rounded-xl border border-border bg-background px-2 py-1.5 text-left",
                   focusRing,
                   selected && selectedFill,
                 )}
@@ -143,12 +138,22 @@ export function OnlineShopRegionPicker({
               >
                 <span className="flex min-w-0 items-center gap-1">
                   {known ? <CountryFlag code={card.code} size="compact" title={name} /> : null}
-                  <span className="min-w-0 truncate text-xs font-medium leading-4 text-foreground">{name}</span>
-                  {known ? <span className="shrink-0 text-[11px] leading-4 text-muted-foreground">{card.code}</span> : null}
+                  <span className="min-w-0 truncate text-xs font-medium leading-4 text-foreground">
+                    {name}
+                  </span>
+                  {known ? (
+                    <span className="shrink-0 text-[11px] leading-4 text-muted-foreground">{card.code}</span>
+                  ) : null}
                 </span>
-                <span className="flex items-baseline justify-between gap-1 text-[11px] leading-4 text-muted-foreground">
-                  <span>{t("clientMarket.shop.idleCount", { count: card.idle })}</span>
-                  <span className="truncate">{t("clientMarket.shop.priceFrom", { price: priceOf(card) })}</span>
+                <span className="flex flex-wrap items-baseline justify-between gap-x-3 text-[11px] leading-4 text-muted-foreground">
+                  <span className="whitespace-nowrap">
+                    {t("clientMarket.shop.idleCount", { count: card.idle })}
+                  </span>
+                  {card.idle > 0 && (
+                    <span className="whitespace-nowrap">
+                      {t("clientMarket.shop.priceFrom", { price: priceOf(card) })}
+                    </span>
+                  )}
                 </span>
               </button>
             );
@@ -159,16 +164,155 @@ export function OnlineShopRegionPicker({
   );
 }
 
+export function ClientSpecs({ listing }: { listing: Pick<OnlineListing, "country" | "hardware"> }) {
+  const { locale, t } = useLocaleText();
+  const code = listing.country?.toUpperCase();
+  const name =
+    code && /^[A-Z]{2}$/.test(code) && new Intl.DisplayNames([locale], { type: "region" }).of(code);
+  const hw = listing.hardware;
+  const parts = [
+    hw?.cpu ? t(hw.cpu === 1 ? "clientMarket.shop.core" : "clientMarket.shop.cores", { count: hw.cpu }) : "",
+    hw?.memoryBytes
+      ? new Intl.NumberFormat(locale, { maximumFractionDigits: 1 }).format(hw.memoryBytes / 2 ** 30) + " GiB"
+      : "",
+    hw?.arch,
+  ].filter(Boolean);
+  return (
+    <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs leading-5 text-muted-foreground">
+      {name ? (
+        <CountryFlag code={code} title={name} />
+      ) : (
+        <Globe2
+          role="img"
+          aria-label={t("clientMarket.shop.unknownRegion")}
+          className="size-3.5 text-muted-foreground"
+        />
+      )}
+      <span>{parts.join(" · ") || t("clientMarket.shop.noSpecs")}</span>
+    </p>
+  );
+}
+
+type ClientReliabilityData = Pick<OnlineListing,
+  "onlineRate24h" | "observedMinutes24h" | "observationCoverage24h" | "registeredAt"
+>;
+
+export function ClientReliability({ listing, inline = false }: { listing: ClientReliabilityData; inline?: boolean }) {
+  const { t, locale } = useLocaleText();
+  const rate = listing.observedMinutes24h > 0 ? listing.onlineRate24h : null;
+  const pair = inline
+    ? "grid grid-cols-[auto_auto] items-baseline justify-start gap-x-2"
+    : "grid grid-cols-[minmax(0,1fr)_auto] items-baseline gap-x-2";
+  return (
+    <dl className={inline ? "flex flex-wrap gap-x-6 gap-y-2 text-xs leading-5" : "grid gap-1 text-xs"}>
+      <div className={pair}>
+        <dt className="text-muted-foreground">{t("clientMarket.shop.uptime")}</dt>
+        <dd className="font-semibold tabular-nums text-foreground">
+          {rate == null
+            ? t("clientMarket.shop.noSamples")
+            : new Intl.NumberFormat(locale, { style: "percent", maximumFractionDigits: 1 }).format(rate / 100)}
+        </dd>
+        {rate != null && listing.observationCoverage24h < 50 && (
+          <dd className={cn("col-span-2 text-[11px] text-muted-foreground", !inline && "mt-1 text-right")}>
+            {t("clientMarket.shop.samples", { count: listing.observedMinutes24h })}
+          </dd>
+        )}
+      </div>
+      <div className={pair} title={t("clientMarket.shop.registeredSince")}>
+        <dt className="text-muted-foreground">{t("dashboard.runningDuration")}</dt>
+        <dd className="font-semibold tabular-nums text-foreground">{formatAgeDaysOrHours(listing.registeredAt, locale)}</dd>
+      </div>
+    </dl>
+  );
+}
+
+export function ClientOfferCard({
+  listing,
+  authenticated,
+  busy,
+  onRent,
+  extra,
+}: {
+  listing: OnlineListing;
+  authenticated: boolean;
+  busy: boolean;
+  onRent: () => void;
+  extra?: React.ReactNode;
+}) {
+  const { locale, t } = useLocaleText();
+  const availability = onlineListingAvailability(listing);
+  const price = listing.owned
+    ? t("clientMarket.shop.selfFree")
+    : listing.cyclePriceMinor > 0
+      ? formatUsdMoney(listing.cyclePriceMinor, locale)
+      : t("online.free");
+  const days = new Intl.NumberFormat(locale, { style: "unit", unit: "day", unitDisplay: "long" });
+  const term =
+    !listing.owned &&
+    (listing.trialDays > 0
+      ? t("lease.trialDays", { duration: days.format(listing.trialDays) })
+      : listing.freeDays
+        ? days.format(listing.freeDays)
+        : "");
+  return (
+    <article
+      id={`market-client-${listing.installationId}`}
+      tabIndex={-1}
+      className="flex min-w-0 scroll-mt-20 flex-col gap-3 rounded-xl border border-border bg-background p-4 shadow-sm"
+    >
+      <header className="grid min-w-0 gap-1">
+        <h3 id={`client-offer-name-${listing.installationId}`} className="break-all font-mono text-sm font-semibold tracking-tight text-foreground">
+          {listing.label}
+        </h3>
+        <ClientSpecs listing={listing} />
+      </header>
+      <ClientReliability listing={listing} />
+      {listing.egressIp && (
+        <details className="text-xs text-muted-foreground">
+          <summary className={cn("w-fit cursor-pointer rounded", focusRing)}>
+            {t("clientMarket.shop.network")}
+          </summary>
+          <p className="mt-1 break-all font-mono">IP {listing.egressIp}</p>
+        </details>
+      )}
+      <footer className="mt-auto flex flex-wrap items-center justify-between gap-2 border-t border-border pt-3">
+        <div>
+          <strong className="text-base tabular-nums text-foreground">{price}</strong>
+          {!listing.owned && listing.cyclePriceMinor > 0 && (
+            <span className="text-xs text-muted-foreground">{t("online.perMonth")}</span>
+          )}
+          {term && <p className="text-xs text-muted-foreground">{term}</p>}
+        </div>
+        {availability === "available" ? (
+          <button
+            type="button"
+            disabled={busy}
+            aria-describedby={`client-offer-name-${listing.installationId}`}
+            onClick={onRent}
+            className={cn(
+              "min-h-10 rounded-lg bg-primary px-4 text-sm font-semibold text-primary-foreground disabled:opacity-60",
+              focusRing,
+            )}
+          >
+            {t(authenticated ? "clientMarket.shop.rent" : "clientMarket.shop.guestRent")}
+          </button>
+        ) : (
+          <span className="text-xs text-muted-foreground">{t(onlineStatusKey(availability))}</span>
+        )}
+      </footer>
+      {extra}
+    </article>
+  );
+}
+
 export function OnlineClientCard({
   name,
   price,
-  healthy,
   status,
   detail,
   spec,
   specLabel,
-  hours,
-  hoursLabel,
+  listing,
   selected = false,
   muted = false,
   cardId,
@@ -178,13 +322,11 @@ export function OnlineClientCard({
 }: {
   name: string;
   price?: string;
-  healthy?: boolean | null;
   status: string;
   detail?: string;
   spec?: string;
   specLabel?: string;
-  hours?: string;
-  hoursLabel?: string;
+  listing?: OnlineListing;
   selected?: boolean;
   muted?: boolean;
   cardId?: string;
@@ -192,7 +334,8 @@ export function OnlineClientCard({
   actions?: React.ReactNode;
   extra?: React.ReactNode;
 }) {
-  const dot = healthy == null ? "bg-slate-300" : healthy ? "bg-emerald-500" : "bg-rose-500";
+  const offline = listing?.availability === "offline";
+  const dot = offline ? "bg-rose-500" : listing?.healthy ? "bg-emerald-500" : "bg-slate-300";
   return (
     <article
       id={cardId}
@@ -200,7 +343,7 @@ export function OnlineClientCard({
       className={cn(
         "grid min-h-60 min-w-0 scroll-mt-20 content-start gap-2.5 rounded-xl border p-3 shadow-sm",
         muted ? "bg-slate-50" : "bg-white",
-        selected ? "border-primary ring-2 ring-primary/20" : healthy === false ? "border-rose-200" : "border-slate-200",
+        selected ? "border-primary ring-2 ring-primary/20" : offline ? "border-rose-200" : "border-slate-200",
       )}
     >
       <header className="flex min-w-0 items-center justify-between gap-2">
@@ -221,19 +364,9 @@ export function OnlineClientCard({
         {price ? <strong className="shrink-0 whitespace-nowrap text-[13px] font-semibold tabular-nums text-slate-900">{price}</strong> : null}
       </header>
       <p className="truncate text-[11px] font-semibold text-slate-700">{status}</p>
-      {detail ? <p className="truncate text-[11px] text-slate-500" title={detail}>{detail}</p> : null}
-      {spec || hours || specLabel || hoursLabel ? (
-        <dl className="grid grid-cols-2 gap-2">
-          <div className="min-w-0">
-            <dt className="truncate text-[11px] text-muted-foreground">{hoursLabel}</dt>
-            <dd className="truncate text-[11px] font-semibold tabular-nums text-foreground">{hours || "—"}</dd>
-          </div>
-          <div className="min-w-0">
-            <dt className="truncate text-[11px] text-muted-foreground">{specLabel}</dt>
-            <dd className="truncate text-[11px] font-semibold text-foreground" title={spec || undefined}>{spec || "—"}</dd>
-          </div>
-        </dl>
-      ) : null}
+      {detail ? <p className="break-words text-[11px] text-slate-500 [overflow-wrap:anywhere]">{detail}</p> : null}
+      {spec && <p className="break-words text-xs text-muted-foreground" title={specLabel}>{spec}</p>}
+      {listing && <ClientReliability listing={listing}/>}
       {actions ? <div className="mt-auto flex flex-wrap gap-2">{actions}</div> : null}
       {extra}
     </article>

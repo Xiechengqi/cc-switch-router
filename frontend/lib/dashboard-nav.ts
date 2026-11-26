@@ -217,11 +217,11 @@ export function resolveAccountEntryHref(): AccountNavHref {
   return readStoredAccountNavHref() || DASHBOARD_ACCOUNT_WALLET_PATH;
 }
 
-/** Open the shop on the tenant switch, optionally focusing one lease. */
+/** Open the buyer’s account, optionally focusing the receipt for a lease. */
 export function clientMarketTenantHref(targetId?: string) {
-  const params = new URLSearchParams({ view: "rentals" });
+  const params = new URLSearchParams({ market: "client" });
   if (targetId) params.set("focus", targetId);
-  return buildDashboardHref(DASHBOARD_CLIENT_MARKET_PATH, params);
+  return buildDashboardHref(DASHBOARD_ACCOUNT_RENTALS_PATH, params);
 }
 
 /** Open the seller workspace, optionally focusing one listing. */

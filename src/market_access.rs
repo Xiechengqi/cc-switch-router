@@ -876,7 +876,7 @@ fn resolve_access_target_tx(
                             NULLIF(l.cycle_price_minor,0),CASE WHEN l.cycle_price_minor>0 THEN 'calendar_month' END,
                             CASE WHEN l.cycle_price_minor>0 THEN 'USD' END
                      FROM online_client_supply l JOIN installation_client_tunnels t ON t.installation_id=l.installation_id
-                     WHERE l.installation_id=?1 AND l.state='listed' AND l.supply_status='idle'",
+                     WHERE l.installation_id=?1 AND l.availability='available'",
                     params![target_id],
                     |row| {
                         Ok((
@@ -2126,6 +2126,11 @@ mod tests {
             target_kind: TARGET_CLIENT_HOST.into(),
             target_id: "client-offer".into(),
         };
+        assert!(create_access_request_tx(&c, &buyer, &input, now).is_err());
+        c.execute(
+            "UPDATE online_client_listings SET check_json=json_object('exclusiveManagement',json('true'))
+             WHERE installation_id='client-offer'", [],
+        ).unwrap();
         let request = create_access_request_tx(&c, &buyer, &input, now).unwrap();
         assert_eq!(request.supplier_user_id, "supplier");
         assert_eq!(request.target_label, "seller-client");

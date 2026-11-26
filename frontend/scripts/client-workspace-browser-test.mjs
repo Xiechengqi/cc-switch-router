@@ -52,9 +52,9 @@ try {
     base + "/client-market/?view=selling&add=1&installation=" + encodeURIComponent(fixture.installationId),
   );
   const listing = seller.getByRole("dialog");
-  await listing.getByText(/✓ Egress address verified/).waitFor();
-  await listing.getByRole("checkbox").check();
-  const publish = listing.getByRole("button", { name: "Publish listing" });
+  const publish = listing.getByRole("button", { name: "List for free", exact: true });
+  await publish.waitFor();
+  await listing.getByRole("checkbox", { name: /renter controls the console/i }).check();
   await publish.click();
   await listing.waitFor({ state: "hidden" });
   await seller.getByText("Available", { exact: true }).first().waitFor();
@@ -69,13 +69,13 @@ try {
     .first()
     .click();
   const card = buyer.locator('[id="market-client-' + fixture.installationId + '"]');
-  await card.getByRole("button", { name: /Continue/ }).click();
+  await card.getByRole("button", { name: "Rent", exact: true }).click();
   const quote = buyer.getByRole("dialog");
-  await quote.getByRole("checkbox", { name: /root/i }).check();
-  await quote.getByRole("button", { name: "Confirm rental" }).click();
-  await buyer.waitForURL((u) => u.searchParams.get("view") === "rentals" && !!u.searchParams.get("focus"));
+  await quote.getByRole("checkbox", { name: /owner can read/i }).check();
+  await quote.getByRole("button", { name: "Confirm free rental" }).click();
+  await buyer.waitForURL((u) => u.pathname === "/account/rentals/" && u.searchParams.get("market") === "client" && !!u.searchParams.get("focus"));
   const lease = new URL(buyer.url()).searchParams.get("focus");
-  const rental = buyer.locator('[id="market-client-' + lease + '"]');
+  const rental = buyer.getByTestId("client-rentals-current").getByTestId("client-rental-detail");
   const open = rental.getByRole("link", { name: "Open workspace" });
   const opened = buyer.waitForEvent("popup");
   await open.click();
@@ -84,17 +84,10 @@ try {
   await workspace.getByRole("heading", { name: /Tenant workspace|租户工作区/ }).waitFor();
   if (localOwner) {
     await localOwner.bringToFront();
-    const assistance = localOwner.getByRole("heading", { name: /Owner assistance|所有者协助/ });
-    const password = localOwner.locator('input[type="password"]');
-    await assistance.or(password).first().waitFor({ timeout: 45_000 });
-    if (!(await assistance.isVisible())) {
-      // Direct /api/auth/login sessions expire when the Client restarts into its leased workspace.
-      await password.fill(fixture.sellerPassword);
-      await password.press("Enter");
-    }
-    await assistance.waitFor();
-    await localOwner.getByRole("button", { name: /^(Restart|重启)$/ }).waitFor();
-    console.log("PASS open local owner console followed listing and local password login restored assistance after restart");
+    const response = await localOwner.request.get(new URL("/web-api/context", fixture.ownerLocalOrigin).href);
+    assert.equal(response.status(), 403);
+    assert.equal((await response.json()).code, "workspace_leased");
+    await localOwner.getByText(/renter controls this Client|此 Client 已出租/i).waitFor();
   }
   assert.match(new URL(workspace.url()).hostname, /^rent-[0-9a-f]{20}\./);
   assert.equal(new URL(workspace.url()).pathname, "/");
@@ -124,30 +117,22 @@ try {
   await fromAccount.close();
   await account.close();
   console.log("PASS workspace access and independent window sign-out from the buyer's account rental record");
-  await seller.getByRole("button", { name: "Owner assistance", exact: true }).click();
-  const assistance = seller.frameLocator('iframe[src*="routerOrigin="]');
-  await assistance.getByRole("heading", { name: /Owner assistance|所有者协助/ }).waitFor();
-  await assistance.getByLabel(/Owner password for maintenance|运维需要所有者密码/).fill(fixture.sellerPassword);
-  await assistance.getByRole("button", { name: /Unlock maintenance|解锁运维/ }).click();
-  await assistance.getByRole("button", { name: /^(Restart|重启)$/ }).waitFor();
-  const resize = seller.waitForResponse((r) => new URL(r.url()).pathname === "/web-api/terminal/resize" && r.ok());
-  const terminal = assistance.getByRole("button", { name: /^(Owner terminal|所有者终端)$/ });
-  await terminal.click();
-  const dimensions = (await resize).request().postDataJSON();
-  assert.ok(dimensions.c > 1 && dimensions.r > 1);
-  await terminal.click();
-  await assistance.getByText(/^(Host settings|主机设置)$/).click();
-  const interval = assistance.getByRole("spinbutton");
-  const before = Number(await interval.inputValue());
-  for (const value of [before < 1440 ? before + 1 : before - 1, before]) {
-    await interval.fill(String(value));
-    const save = seller.waitForResponse((r) => new URL(r.url()).pathname === "/web-api/market/maintenance" && r.ok());
-    seller.once("dialog", (dialog) => dialog.accept());
-    await assistance.getByRole("button", { name: /Save host settings|保存主机设置/ }).click();
-    assert.equal((await (await save).json()).upgradePolicy.autoUpgradeCheckIntervalMinutes, value);
+  async function assertPhysicalTicketsClosed(page) {
+    for (const kind of ["console","terminal"]) {
+      const response=await page.request.post(base + "/v1/auth/client-web-tickets", {
+        headers:{authorization:"Bearer " + fixture.sellerToken},
+        data:{installationId:fixture.installationId, kind, nonce:crypto.randomUUID()},
+      });
+      assert.equal(response.status(),403);
+    }
   }
+  await assertPhysicalTicketsClosed(seller);
+  assert.equal(await workspace.getByRole("button", {name:/web terminal/i}).count(),0);
+  const terminalResponse = await workspace.request.get(new URL("/web-api/terminal/stream",workspace.url()).href);
+  assert.equal(terminalResponse.status(),403);
   await seller.goto(base + "/client-market/?view=selling");
-  console.log("PASS seller's embedded assistance, independent owner verification, terminal resize and host settings");
+  await seller.getByText(fixture.buyerEmail,{exact:false}).first().waitFor();
+  console.log("PASS physical tickets and Web Terminal closed during the lease");
   if (process.env.WORKSPACE_LONG_SESSION === "1") {
     await workspace.waitForResponse(
       (r) => new URL(r.url()).pathname === "/web-api/auth/router-renew" && r.ok(),
@@ -173,7 +158,43 @@ try {
   await end.waitFor({ state: "hidden" });
   await workspace.getByRole("heading", { name: /Lease ended|租约已结束/ }).waitFor({ timeout: 65000 });
   await seller.getByText("Available", { exact: true }).first().waitFor({ timeout: 90000 });
+  if (localOwner) {
+    await localOwner.reload();
+    const password=localOwner.locator('input[type="password"]');
+    await password.fill(fixture.sellerPassword);
+    await password.press("Enter");
+    await password.waitFor({state:"hidden"});
+  }
   console.log("PASS backup, settlement confirmation, revocation and inventory recovery");
+  await seller.goto(base + "/client-market/");
+  const ownCard = seller.locator('[id="market-client-' + fixture.installationId + '"]');
+  await ownCard.getByText("Free for you").waitFor();
+  const quoteReady = seller.waitForResponse((response) => response.url().endsWith("/quote") && response.ok());
+  await ownCard.getByRole("button", { name: "Rent", exact: true }).click();
+  const selfQuote = await (await quoteReady).json();
+  assert.equal(selfQuote.terms.selfRental, true);
+  assert.equal(selfQuote.terms.cyclePriceMinor, 0);
+  assert.equal(selfQuote.walletFunding, null);
+  const selfDialog = seller.getByRole("dialog");
+  await selfDialog.getByRole("button", { name: "Confirm free rental" }).click();
+  await seller.waitForURL((u) => u.pathname === "/account/rentals/" && !!u.searchParams.get("focus"));
+  const ownRental = seller.getByTestId("client-rentals-current").getByTestId("client-rental-detail");
+  const selfPopup = seller.waitForEvent("popup");
+  await ownRental.getByRole("link", { name: "Open workspace" }).click();
+  const selfWorkspace = await selfPopup;
+  await selfWorkspace.getByRole("heading", { name: /Tenant workspace|租户工作区/ }).waitFor();
+  const management = await seller.context().newPage();
+  await management.goto(base + "/client-market/?view=selling");
+  await assertPhysicalTicketsClosed(management);
+  await ownRental.getByRole("button", { name: "End rental" }).click();
+  await selfDialog.getByRole("button", { name: "Preview settlement" }).click();
+  await selfDialog.getByRole("button", { name: "End rental" }).click();
+  await selfDialog.waitFor({ state: "hidden" });
+  await selfWorkspace.getByRole("heading", { name: /Lease ended|租约已结束/ }).waitFor({ timeout: 65000 });
+  await management.goto(base + "/client-market/?view=selling");
+  await management.getByText("Available", { exact: true }).first().waitFor({ timeout: 90000 });
+  console.log("PASS same account rents its own listing for free, uses only the tenant console, and releases the Client");
+
 } catch (error) {
   console.error("Workspace HTTP responses", workspaceRequests.slice(-25));
   throw error;

@@ -23,9 +23,9 @@ export type ClientRentalPeriod = {
   amountUnits: string; serviceUnits: string; returnedUnits: string; compensationUnits: string;
   status: string; terminationRateBps: number | null;
 };
-export type ClientRentalEvent = { id: string; action: string; createdAt: string; note: string | null };
+export type ClientRentalEvent = { id: string; action: string; occurrences?: number; createdAt: string; note: string | null };
 export type ClientRentalDetail = {
-  record: ClientRentalRecord; rental: { leaseId: string; contractId: string | null; canDispute: boolean; openDispute: boolean } | null;
+  record: ClientRentalRecord; rental: { leaseId: string; canUpgrade?: boolean; migrationRequired?: boolean; contractId: string | null; canDispute: boolean; openDispute: boolean; clientUrl?: string; activationDeadline?: number; grantUntil?: number; holdStatus?: "active" | "released" | "captured" | null } | null;
   periods: ClientRentalPeriod[]; periodsNextCursor: number | null;
   events: ClientRentalEvent[]; eventsNextCursor: string | null;
   trialConsumedSeconds: number; serverNow: string;
@@ -43,6 +43,12 @@ const units = (v: unknown): v is string => typeof v === "string" && /^(0|[1-9]\d
 function validLiveRental(v: unknown, record: ClientRentalRecord): boolean {
   return v === null || (object(v) && record.group === "current" && text(v.leaseId)
     && v.leaseId === record.installationId && v.contractId === record.contractId
+    && (v.canUpgrade === undefined || typeof v.canUpgrade === "boolean")
+    && (v.migrationRequired === undefined || typeof v.migrationRequired === "boolean")
+    && (v.clientUrl === undefined || (text(v.clientUrl) && /^https?:\/\//.test(v.clientUrl) && URL.canParse(v.clientUrl)))
+    && (v.activationDeadline === undefined || integer(v.activationDeadline))
+    && (v.grantUntil === undefined || integer(v.grantUntil))
+    && (v.holdStatus == null || ["active", "released", "captured"].includes(String(v.holdStatus)))
     && typeof v.canDispute === "boolean" && typeof v.openDispute === "boolean");
 }
 function validRecord(v: unknown): v is ClientRentalRecord {
@@ -74,7 +80,7 @@ export function parseClientRentalDetail(v: unknown, id: string): ClientRentalDet
       && ["startedAt", "endedAt", "debitedAt"].every(k => time(p[k])) && ["amountUnits", "serviceUnits", "returnedUnits", "compensationUnits"].every(k => units(p[k]))
       && nullableInteger(p.terminationRateBps) && (p.terminationRateBps === null || p.terminationRateBps <= 10000))
     || !nullableInteger(v.periodsNextCursor) || v.periodsNextCursor !== null && v.periodsNextCursor !== v.periods.at(-1)?.sequence
-    || !Array.isArray(v.events) || v.events.length > 50 || !v.events.every(e => object(e) && text(e.id) && text(e.action) && time(e.createdAt) && (e.note === null || typeof e.note === "string" && Array.from(e.note).length <= 2000))
+    || !Array.isArray(v.events) || v.events.length > 50 || !v.events.every(e => object(e) && text(e.id) && text(e.action) && (e.occurrences === undefined || integer(e.occurrences) && e.occurrences > 0) && time(e.createdAt) && (e.note === null || typeof e.note === "string" && Array.from(e.note).length <= 2000))
     || !nullableText(v.eventsNextCursor) || v.eventsNextCursor !== null && v.eventsNextCursor !== v.events.at(-1)?.id
     || !(v.settlement === null || object(v.settlement) && ["heldUnits", "returnedUnits", "compensationUnits"].every(k => units((v.settlement as Record<string, unknown>)[k]))
       && text(v.settlement.reason) && text(v.settlement.responsibility) && time(v.settlement.cutoffAt) && nullableTime(v.settlement.cleanupConfirmedAt))) throw new Error("Invalid personal rental detail");

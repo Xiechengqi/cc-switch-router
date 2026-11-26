@@ -48,7 +48,7 @@ import { useClientChat } from "@/components/chat/client-chat";
 import { useAuth } from "@/components/auth/auth-provider";
 import { buildClientInstallCommand, InstallGuideDialog } from "@/components/dashboard/install-guide-dialog";
 
-import { clientMarketMineHref, clientMarketAddHostHref } from "@/lib/dashboard-nav";
+import { clientMarketAddHostHref, clientMarketMineHref, clientMarketTenantHref } from "@/lib/dashboard-nav";
 import { getShareMarketCatalog } from "@/lib/api";
 import { listingIdleCount } from "@/components/dashboard/share-market/market-utils";
 import { SubdomainCopyButton } from "@/components/dashboard/subdomain-copy-button";
@@ -73,15 +73,6 @@ import {
   type ModelRoutingProtocol,
 } from "@/lib/model-routing";
 import type { UserModelRoutingShare } from "@/lib/types";
-
-function MarketClientBadge() {
-  const { t } = useLocaleText();
-  return (
-    <span className="rounded-md bg-sky-50 px-1.5 py-0.5 text-xs font-semibold text-sky-800">
-      {t("dashboard.marketManaged")}
-    </span>
-  );
-}
 
 function sortShares(shares: ShareView[]) {
   return [...shares].sort((left, right) => {
@@ -189,7 +180,7 @@ function ClientConsoleButton({ client }: { client: DashboardClient }) {
       label={t("dashboard.clientConsole")}
       onClick={() =>
         openConsole({
-          clientId: client.installation.id,
+          clientId: client.rental?.controlId || client.installation.id,
           kind: "console",
           url: tunnelUrl,
           title,
@@ -207,7 +198,7 @@ function ClientTerminalButton({ client }: { client: DashboardClient }) {
   const { t } = useLocaleText();
   const { openConsole } = useClientConsole();
   const tunnelUrl = clientTunnelDisplayUrl(client.clientTunnel?.tunnelUrl);
-  if (!tunnelUrl || client.canOpenClientTerminal === false) return null;
+  if (!tunnelUrl || client.canOpenClientTerminal !== true) return null;
   const title = client.clientTunnel?.subdomain || tunnelUrl;
   return (
     <ClientHeaderInlineButton
@@ -513,11 +504,6 @@ function ClientCard({
                 {identity}
               </strong>
               {hasSubdomain ? <SubdomainCopyButton subdomain={subdomain} /> : null}
-              {owner && owner !== "-" ? (
-                <span className="min-w-0 truncate text-xs text-muted-foreground" title={owner}>
-                  {owner}
-                </span>
-              ) : null}
               <ClientDetailsButton onOpen={openClientDrawer} />
               {summary.primaryReason ? (
                 <span
@@ -531,20 +517,35 @@ function ClientCard({
                 <ClientRemovalSchedule removalAt={client.removalAt} className="text-[11px]" />
               ) : null}
             </div>
+            <div className="grid min-w-0 gap-0.5 pl-4 text-xs text-muted-foreground">
+              {owner && owner !== "-" && <span className="break-all">{t("dashboard.owner")} {owner}</span>}
+              {client.rental && (
+                <span className="break-all">{t("dashboard.renter")} {client.rental.tenantEmail}
+                  {client.rental.selfRental && ` · ${t("dashboard.selfRental")}`} · {t(client.rental.state === "active"
+                    ? "dashboard.rentalActive" : client.rental.state === "starting" ? "dashboard.rentalStarting" : "dashboard.rentalReturning")}
+                  {client.rental.migrationRequired && ` · ${t("dashboard.rentalMigration")}`}
+                </span>
+              )}
+            </div>
             <div className="flex min-w-0 flex-wrap items-center gap-2 pl-4">
-              {tunnelUrl ? <ClientConsoleButton client={client} /> : null}
-              {tunnelUrl && client.canOpenClientTerminal !== false ? (
+              {tunnelUrl && (!client.rental || client.rental.controlId) ? <ClientConsoleButton client={client} /> : null}
+              {tunnelUrl && client.canOpenClientTerminal === true ? (
                 <ClientTerminalButton client={client} />
               ) : null}
-              <ClientUpgradeButton client={client} />
-              {onOpenTakeover ? <ClientTakeoverButton onOpen={onOpenTakeover} /> : null}
+              <ClientUpgradeButton key={client.rental?.controlId || client.installation.id} client={client} />
+              {!client.rental && onOpenTakeover ? <ClientTakeoverButton onOpen={onOpenTakeover} /> : null}
               {client.logCollectionEnabled && onOpenLogs ? <ClientLogsButton onOpen={onOpenLogs} /> : null}
               <ClientChatButton client={client} />
               {session?.authenticated &&
                 owner?.toLowerCase() === session.user?.email?.toLowerCase() &&
                 (client.installation.marketListed ? (
-                  <a href={clientMarketMineHref(client.installation.id)} aria-label={t("online.supply")}>
-                    <MarketClientBadge />
+                  <a
+                    className="rounded-md bg-sky-50 px-1.5 py-0.5 text-xs font-semibold text-sky-800"
+                    href={client.rental?.controlId
+                      ? clientMarketTenantHref(client.rental.controlId)
+                      : clientMarketMineHref(client.installation.id)}
+                  >
+                    {t(client.rental ? "clientRentals.details" : "dashboard.marketManaged")}
                   </a>
                 ) : (
                   client.installation.marketLeaseV1 &&
@@ -553,7 +554,7 @@ function ClientCard({
                       className="text-xs text-accent underline"
                       href={clientMarketAddHostHref(client.installation.id)}
                     >
-                      {t("clientMarket.shop.dialog.publish")}
+                      {t("online.list")}
                     </a>
                   )
                 ))}
@@ -1462,6 +1463,14 @@ export function ClientBoard({
                     <dd className="min-w-0 break-all font-medium text-slate-900">
                       {clientOwnerEmail(selectedClient)}
                     </dd>
+                    {selectedClient.rental && <>
+                      <dt className="text-slate-500">{t("dashboard.renter")}</dt>
+                      <dd className="break-all">{selectedClient.rental.tenantEmail}</dd>
+                      {selectedClient.rental.migrationRequired && <>
+                        <dt className="text-slate-500">{t("dashboard.rentalMigration")}</dt>
+                        <dd>{t("lease.migrationHelp")}</dd>
+                      </>}
+                    </>}
                     <dt className="text-slate-500">{t("dashboard.region")}</dt>
                     <dd
                       className="min-w-0 font-medium text-slate-900"

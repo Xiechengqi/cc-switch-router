@@ -15,7 +15,7 @@ import { formatUsdMoney } from "@/lib/market-money";
 import { onlineRequest, type OnlineSellerItem as SellerItem } from "@/lib/online-client-market";
 import { AccountInlineLoading, AccountSectionError } from "./account-section";
 import type { AccountMarketRole } from "./account-share-section";
-import { onlineStatusKey } from "./client-market/online-market";
+import { onlineStatusKey } from "./client-market/host-utils";
 import { ClientRentalRecords } from "./client-market/rental-records";
 import { useAccountClientTerminations } from "./use-account-client-terminations";
 

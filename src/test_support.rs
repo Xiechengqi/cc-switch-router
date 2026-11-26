@@ -45,7 +45,8 @@ pub(crate) fn online_listing(conn: &Connection, id: &str, seller: &str, email: &
         VALUES(?1,?1,'linux','1',strftime('%FT%TZ','now'),strftime('%FT%TZ','now'),'fixture',?2,strftime('%FT%TZ','now'),strftime('%FT%TZ','now'),1)",
         params![id,email]).unwrap();
     conn.execute("INSERT INTO online_client_listings(installation_id,seller_id,owner_email,state,revision,
-        sequence,cycle_price_minor,updated_at,healthy,observed_at) VALUES(?1,?2,?3,'listed',1,1,0,unixepoch(),1,unixepoch())",
+        sequence,cycle_price_minor,updated_at,healthy,observed_at,check_json)
+        VALUES(?1,?2,?3,'listed',1,1,0,unixepoch(),1,unixepoch(),json_object('exclusiveManagement',json('true')))",
         params![id,seller,email]).unwrap();
 }
 

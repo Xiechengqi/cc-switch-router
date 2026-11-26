@@ -558,7 +558,7 @@ fn candidate_tx(
         .map_err(map_db("read Market Provider Share breadth"))?;
     let (host_total, idle_hosts, countries): (i64, i64, i64) = tx
         .query_row(
-            "SELECT COUNT(*),COALESCE(SUM(l.supply_status='idle'),0),COUNT(DISTINCT l.country_code)
+            "SELECT COUNT(*),COALESCE(SUM(l.availability='available'),0),COUNT(DISTINCT l.country_code)
                FROM online_client_supply l JOIN market_provider_profiles profile ON profile.user_id=l.seller_id
               WHERE profile.id=?1 AND l.state='listed'",
             params![profile_id],

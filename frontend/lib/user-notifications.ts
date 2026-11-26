@@ -1,6 +1,7 @@
 import { authFetch } from "@/lib/auth";
 import { parseJson } from "@/lib/api";
 import { messages, type MessageKey } from "@/lib/i18n";
+import { clientMarketTenantHref } from "./dashboard-nav";
 import { clientTerminationHref } from "@/lib/client-termination";
 
 export type UserNotification = {
@@ -67,8 +68,8 @@ export function notificationHref(item: UserNotification): string {
   if (item.objectKind === "client_termination" || item.eventKind.startsWith("client_termination_")) {
     return clientTerminationHref(typeof item.payload.terminationId === "string" ? item.payload.terminationId : item.objectId);
   }
-  if (item.eventKind === "client_workspace_access" || item.eventKind === "client_workspace_ready") {
-    return "/client-market/?view=rentals&focus=" + encodeURIComponent(item.objectId);
+  if (item.eventKind === "client_workspace_access" || item.eventKind === "client_workspace_management" || item.eventKind === "client_workspace_ready") {
+    return clientMarketTenantHref(item.objectId);
   }
   if (item.category === "system") return "/metrics/?tab=alerts";
   if (item.category === "client") return `/?focusKind=client&focusId=${encodeURIComponent(item.objectId)}&drawerKind=client&drawerId=${encodeURIComponent(item.objectId)}`;

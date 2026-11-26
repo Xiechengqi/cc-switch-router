@@ -62,6 +62,7 @@ try {
   page.on("pageerror", e => errors.push(e.message));
   await page.addInitScript(() => {
     localStorage.setItem("cc_switch_router_locale_v1", new URL(location.href).searchParams.get("testLocale") || "en");
+    localStorage.setItem("cc_switch_router_client_market_shop_browse_v1", JSON.stringify({ scope: "all", country: "JP", rentableOnly: false }));
     localStorage.setItem("cc_switch_router_auth_v2", JSON.stringify({ authDeviceId: "test", publicKey: "test", privateKey: "test", accessToken: "test", expiresAt: "2099-01-01T00:00:00Z" }));
   });
   await page.route("**/v1/**", async route => {
@@ -72,11 +73,11 @@ try {
     if (path === "/v1/auth/session/me") return json(route, { authenticated: !!actor, isAdmin: false, user: actor ? { id: actor, email: `${actor}@example.test` } : null, password: { hasPassword: true, version: 1 } });
     if (path === "/v1/client-market/online/leases") return json(route,{leases:[]});
     if (path === "/v1/client-market/online/seller-inventory") return json(route,{items:hostPresent && actor==="provider" ?
-      [{id:"current-lease",listingId:record.hostId,label:"Online rental fixture",state:"active",cyclePriceMinor:100,tenantEmail:"n***t@example.test",expiresAt:null,terminationId:null}]:[]});
+      [{id:"current-lease",listingId:record.hostId,label:"Online rental fixture",state:"active",cyclePriceMinor:100,tenantEmail:"new-tenant@example.test",expiresAt:null,terminationId:null}]:[]});
     if (path === "/v1/client-market/online/listings") return json(route,{listings:hostPresent ? [{
       installationId:record.hostId, providerId:"provider", label:"Online rental fixture", revision:1,state:"listed",owned:actor === "provider",
       cyclePriceMinor:100,freeDays:null,trialDays:0,country:"JP",egressIp:null,egressDiffers:false,
-      healthy:true,occupied:actor==="provider",observedAt:Math.floor(Date.now()/1000),availableHours24:24,
+      healthy:true,occupied:true,observedAt:Math.floor(Date.now()/1000),availability:"occupied",exclusiveManagement:true,
     }] : []});
     if (path === "/v1/client-market/me/rentals") return json(route, emptyClientRentalsPage(url));
     if (path.startsWith("/v1/client-market/termination-workspace")) {

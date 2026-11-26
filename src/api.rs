@@ -1295,17 +1295,9 @@ async fn installation_setup_completed(
     Ok(Json(state.store.complete_installation_setup(input).await?))
 }
 
-async fn upgrade_installation(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Path(installation_id): Path<String>,
-    Json(input): Json<UpgradeInstallationRequest>,
-) -> Result<Json<UpgradeInstallationResponse>, AppError> {
-    let session_email = require_session_email(&state, &headers).await?;
-    let (tunnel_url, _) = state
-        .store
-        .prepare_installation_upgrade(&state.config, &installation_id, &session_email)
-        .await?;
+pub(crate) async fn validate_client_upgrade(
+    state: &ServerState,
+) -> Result<Option<String>, AppError> {
     let release = state.dynamic.read().await.client_server_release.clone();
     let validation = state
         .client_server_release_validator
@@ -1333,6 +1325,21 @@ async fn upgrade_installation(
             .ensure_installation_upgrade_target_allowed(target_commit)
             .await?;
     }
+    Ok(target_commit.map(str::to_owned))
+}
+
+async fn upgrade_installation(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(installation_id): Path<String>,
+    Json(input): Json<UpgradeInstallationRequest>,
+) -> Result<Json<UpgradeInstallationResponse>, AppError> {
+    let session_email = require_session_email(&state, &headers).await?;
+    let (tunnel_url, _) = state
+        .store
+        .prepare_installation_upgrade(&state.config, &installation_id, &session_email)
+        .await?;
+    validate_client_upgrade(&state).await?;
     let payload = if crate::online_client_market::listed(&state, &installation_id).await? {
         crate::online_client_market::control::<serde_json::Value>(
             &state,
@@ -1899,8 +1906,17 @@ async fn dashboard(
     State(state): State<ServerState>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let viewer_email = extract_dashboard_session_email(&state, &headers).await?;
-    let viewer_key = dashboard_viewer_cache_key(viewer_email.as_deref());
+    let session = resolve_router_session(&state, &headers).await?;
+    let viewer_email = session.as_ref().map(|a| a.email.clone());
+    if headers.contains_key(header::AUTHORIZATION)
+        || extract_router_access_cookie(&headers, state.config.use_localhost).is_some()
+    {
+        require_dashboard_session_email(viewer_email.clone())?;
+    }
+    let viewer_key = session
+        .as_ref()
+        .map(|a| format!("account:{}:{}", a.user_id, a.email))
+        .unwrap_or_else(|| dashboard_viewer_cache_key(viewer_email.as_deref()));
     if let Some((body, etag)) = state.dashboard_cache.get(&viewer_key, DASHBOARD_CACHE_TTL) {
         return Ok(dashboard_cached_response(&headers, body, etag));
     }
@@ -1915,11 +1931,12 @@ async fn dashboard(
     };
     let mut response = state
         .store
-        .dashboard_snapshot(
+        .dashboard_snapshot_for_viewer(
             &runtime_config,
             &state.server_geo,
             &state.proxy,
             viewer_email.as_deref(),
+            session.as_ref().map(|a| a.user_id.as_str()),
         )
         .await?;
     let snapshot = state.recent_traffic.snapshot().await;
@@ -1998,6 +2015,10 @@ fn dashboard_cached_response(headers: &HeaderMap, body: Vec<u8>, etag: String) -
     response.headers_mut().insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("private, no-cache"),
+    );
+    response.headers_mut().insert(
+        header::VARY,
+        HeaderValue::from_static("Authorization, Cookie"),
     );
     if let Ok(value) = HeaderValue::from_str(&etag) {
         response.headers_mut().insert(header::ETAG, value);
@@ -7597,16 +7618,6 @@ async fn extract_session_email(
 
 fn require_dashboard_session_email(email: Option<String>) -> Result<String, AppError> {
     email.ok_or_else(|| AppError::Unauthorized("session not found".into()))
-}
-
-async fn extract_dashboard_session_email(
-    state: &ServerState,
-    headers: &HeaderMap,
-) -> Result<Option<String>, AppError> {
-    if let Some(session) = resolve_router_session(state, headers).await? {
-        return require_dashboard_session_email(Some(session.email)).map(Some);
-    }
-    Ok(dev_auth_bypass_enabled().then(dev_auth_email))
 }
 
 async fn require_session_email(

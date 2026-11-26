@@ -151,10 +151,11 @@ struct Rental {
     alias: String,
     until: i64,
     cutoff: Option<i64>,
+    management_version: i64,
 }
 fn current(c: &Connection, id: &str) -> Result<Option<Rental>, AppError> {
-    c.query_row("SELECT id,state,buyer_id,seller_id,tenant_email,alias,grant_until,cutoff_at FROM online_client_leases WHERE installation_id=?1 AND released_at IS NULL",
-        params![id],|r|Ok(Rental{id:r.get(0)?,state:r.get(1)?,buyer:r.get(2)?,seller:r.get(3)?,email:r.get(4)?,alias:r.get(5)?,until:r.get(6)?,cutoff:r.get(7)?})).optional().market()
+    c.query_row("SELECT id,state,buyer_id,seller_id,tenant_email,alias,grant_until,cutoff_at,management_version FROM online_client_leases WHERE installation_id=?1 AND released_at IS NULL",
+        params![id],|r|Ok(Rental{id:r.get(0)?,state:r.get(1)?,buyer:r.get(2)?,seller:r.get(3)?,email:r.get(4)?,alias:r.get(5)?,until:r.get(6)?,cutoff:r.get(7)?,management_version:r.get(8)?})).optional().market()
 }
 fn take_work(c: &Connection, id: &str) -> Result<(i64, Option<Pending>, Value), AppError> {
     let seq = c
@@ -191,15 +192,24 @@ fn record(c: &Connection, lease: &Rental, events: &[AccessEvent]) -> Result<(), 
             || e.occurrences == Some(0)
             || !matches!(
                 e.kind.as_str(),
-                "assistance" | "terminal" | "restart" | "upgrade" | "rollback" | "host_settings"
+                "assistance"
+                    | "terminal"
+                    | "restart"
+                    | "upgrade"
+                    | "rollback"
+                    | "host_settings"
+                    | "tenant_upgrade"
+                    | "tenant_auto_upgrade"
+                    | "tenant_restart"
+                    | "tenant_rollback"
             )
         {
             return Err(conflict("invalid workspace access receipt"));
         }
         c.execute("INSERT OR IGNORE INTO online_client_events(lease_id,event_key,kind,recorded_at,occurrences) VALUES(?1,?2,?3,?4,?5)",params![lease.id,e.id,e.kind,e.at,e.occurrences.unwrap_or(1)]).market()?;
         c.execute("INSERT OR IGNORE INTO user_notification_events(id,scope,recipient_email,category,event_kind,object_kind,object_id,payload_json,created_at_ms)
-            VALUES(?1,'user',?2,'client','client_workspace_access','client',?3,?4,?5)",
-            params![format!("lease:{}:{}",lease.id,e.id),lease.email,lease.id,json!({"clientLabel":lease.alias,"action":e.kind,"count":e.occurrences.unwrap_or(1)}).to_string(),e.at.saturating_mul(1000)]).market()?;
+            VALUES(?1,'user',?2,'client',?6,'client',?3,?4,?5)",
+            params![format!("lease:{}:{}",lease.id,e.id),lease.email,lease.id,json!({"clientLabel":lease.alias,"action":e.kind,"count":e.occurrences.unwrap_or(1)}).to_string(),e.at.saturating_mul(1000), if e.kind.starts_with("tenant_") { "client_workspace_management" } else { "client_workspace_access" }]).market()?;
     }
     let received: Vec<_> = events.iter().take(1024).map(|event| &event.id).collect();
     c.execute(
@@ -216,8 +226,8 @@ fn activate(c: &Connection, id: &str, l: &Rental, now: i64) -> Result<(), AppErr
     }
     let days: Option<u32> = c
         .query_row(
-            "SELECT free_days FROM online_client_listings WHERE installation_id=?1",
-            params![id],
+            "SELECT q.free_days FROM online_client_leases r JOIN online_client_quotes q ON q.id=r.quote_id WHERE r.id=?1",
+            params![l.id],
             |r| r.get(0),
         )
         .market()?;
@@ -287,6 +297,47 @@ fn release(c: &Connection, l: &Rental, now: i64) -> Result<(), AppError> {
     Ok(())
 }
 
+fn queue_handback(
+    c: &Connection,
+    installation: &str,
+    rental: &Rental,
+    status: &ClientStatus,
+) -> Result<bool, AppError> {
+    if let Some(pending) = status.awaiting_return.as_deref() {
+        if pending != rental.id {
+            return Err(conflict("unexpected lease waiting for handback"));
+        }
+        let returned:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM online_client_operations WHERE installation_id=?1 AND sequence=?2 AND json_extract(request_json,'$.action.operation')='return' AND json_extract(request_json,'$.action.leaseId')=?3)",params![installation,status.sequence,pending],|row|row.get(0)).market()?;
+        if returned {
+            // The Client confirmed clean handback and still holds its local lock.
+            // Probe immediately after commit to acknowledge release on the Client.
+            c.execute(
+                "UPDATE online_client_listings SET next_probe=0 WHERE installation_id=?1",
+                params![installation],
+            )
+            .market()?;
+            return Ok(false);
+        }
+        let seq = advance(c, installation)?;
+        c.execute(
+            "UPDATE online_client_leases SET state='cleaning',sequence=?2 WHERE id=?1",
+            params![rental.id, seq],
+        )
+        .market()?;
+        queue(
+            c,
+            installation,
+            seq,
+            json!({"operation":"return","leaseId":pending}),
+        )?;
+        return Ok(true);
+    }
+    if rental.management_version >= 2 && !status.exclusive_management {
+        return Err(conflict("exclusive Client required for handback"));
+    }
+    Ok(false)
+}
+
 fn apply_status(
     c: &Connection,
     id: &str,
@@ -307,7 +358,22 @@ fn apply_status(
     if let Some(hardware) = &st.hardware {
         hardware.validate()?;
         c.execute("UPDATE online_client_listings SET check_json=?2,hardware_at=?3 WHERE installation_id=?1",
-            params![id,json!({"hardware":hardware,"version":st.version.chars().take(80).collect::<String>()}).to_string(),now]).market()?;
+            params![id,json!({"exclusiveManagement":st.exclusive_management,"ownerRental":st.owner_rental,"hardware":hardware,"version":st.version.chars().take(80).collect::<String>()}).to_string(),now]).market()?;
+    } else {
+        c.execute(
+            "UPDATE online_client_listings SET check_json=json_patch(
+                 CASE WHEN json_valid(check_json) THEN check_json ELSE '{}' END,
+                 json_object('ownerRental',json(?2),'exclusiveManagement',json(?3)))
+             WHERE installation_id=?1 AND CASE WHEN json_valid(check_json) THEN
+                 json_type(check_json,'$.ownerRental') IS NOT ?2 OR
+                 json_type(check_json,'$.exclusiveManagement') IS NOT ?3 ELSE 1 END",
+            params![
+                id,
+                st.owner_rental.to_string(),
+                st.exclusive_management.to_string()
+            ],
+        )
+        .market()?;
     }
     let rental = current(c, id)?;
     let running = st.running_lease.as_deref();
@@ -318,6 +384,13 @@ fn apply_status(
         }
     }
     if st.sequence != seq || st.switching {
+        return Ok(false);
+    }
+    if st.awaiting_return.is_some()
+        && rental
+            .as_ref()
+            .is_none_or(|lease| matches!(lease.state.as_str(), "starting" | "active"))
+    {
         return Ok(false);
     }
     if mode == "locking"
@@ -345,11 +418,17 @@ fn apply_status(
         if st.listed_owner.as_deref() != Some(&seller) {
             return Ok(false);
         }
-        let same = grant
-            .is_some_and(|g| g.lease_id == l.id && g.alias == l.alias && g.tenant_email == l.email);
+        let same = grant.is_some_and(|g| {
+            g.lease_id == l.id
+                && g.alias == l.alias
+                && g.tenant_email == l.email
+                && g.buyer_id.as_ref().is_none_or(|id| id == &l.buyer)
+        });
+        let management_ready = st.exclusive_management || l.management_version == 1;
         match l.state.as_str() {
             "starting"
-                if same
+                if management_ready
+                    && same
                     && running == Some(&l.id)
                     && !st.fenced
                     && grant.unwrap().expires_at == l.until
@@ -379,6 +458,9 @@ fn apply_status(
                     &cutoff,
                 )?;
                 if grant.is_none() {
+                    if queue_handback(c, id, &l, st)? {
+                        return Ok(false);
+                    }
                     release(c, &l, now)?;
                 } else {
                     let next = advance(c, id)?;
@@ -390,8 +472,13 @@ fn apply_status(
                     queue(c, id, next, json!({"operation":"clean","leaseId":l.id}))?;
                 }
             }
-            "cleaning" if running.is_none() && grant.is_none() => release(c, &l, now)?,
-            "active" if same && running == Some(&l.id) && !st.fenced => {
+            "cleaning" if running.is_none() && grant.is_none() => {
+                if queue_handback(c, id, &l, st)? {
+                    return Ok(false);
+                }
+                release(c, &l, now)?;
+            }
+            "active" if management_ready && same && running == Some(&l.id) && !st.fenced => {
                 let expected:Option<i64>=c.query_row("SELECT json_extract(request_json,'$.action.expiresAt') FROM online_client_operations WHERE installation_id=?1 AND sequence=?2",params![id,seq],|r|r.get(0)).optional().market()?.flatten();
                 let expires = grant.unwrap().expires_at;
                 if expires != expected.unwrap_or(l.until) {
@@ -410,6 +497,15 @@ fn apply_status(
                 return Ok(false);
             }
             _ => return Ok(false),
+        }
+        // An invalid or fenced receipt must not promote a legacy buyer's permissions.
+        if l.management_version == 1 && st.exclusive_management {
+            c.execute(
+                "UPDATE online_client_leases SET management_version=2
+                 WHERE id=?1 AND state='active' AND grant_until>?2",
+                params![l.id, now],
+            )
+            .market()?;
         }
     } else if mode != "listed"
         || st.listed_owner.as_deref() != Some(&seller)
@@ -452,12 +548,30 @@ async fn probe(s: &ServerState, id: String) -> Result<(), AppError> {
     };
     // Always reconcile the recorded intent against local durable state first. A
     // lost reply or reboot never turns into another charge or a new operation.
-    let online = s
-        .proxy
-        .active_client_route_for_installation(&id)
-        .await
-        .is_some();
     let mut st = rpc(s, &id, "/_ctl/market/status", ack).await;
+    // Unlock only after durable settlement. Also recover a previous Router’s released
+    // journal without consuming the sequence of a later pending Begin.
+    if let Ok(status) = &st {
+        if let Some(lease) = status.awaiting_return.as_deref().filter(|_| {
+            status.exclusive_management
+                && !status.switching
+                && status.grant.is_none()
+                && status.running_lease.is_none()
+        }) {
+            let released:bool = s.store.conn.lock().await.query_row(
+                "SELECT EXISTS(SELECT 1 FROM online_client_leases WHERE installation_id=?1 AND id=?2 AND released_at IS NOT NULL)",
+                params![id,lease], |row| row.get(0)).market()?;
+            if released {
+                st = rpc(
+                    s,
+                    &id,
+                    "/_ctl/market/status",
+                    json!({"releasedLeaseId":lease}),
+                )
+                .await;
+            }
+        }
+    }
     if let (Ok(current), Some(p)) = (&st, &p) {
         if current.sequence < p.seq && !current.switching {
             let mut command = p.command.clone();
@@ -473,6 +587,11 @@ async fn probe(s: &ServerState, id: String) -> Result<(), AppError> {
             st = rpc(s, &id, "/_ctl/market/command", command).await;
         }
     }
+    let tunnel_offline = st.is_err()
+        && s.proxy
+            .active_client_route_for_installation(&id)
+            .await
+            .is_none();
     let c = s.store.conn.lock().await;
     let tx = c.transaction().market()?;
     let latest: i64 = tx
@@ -486,9 +605,17 @@ async fn probe(s: &ServerState, id: String) -> Result<(), AppError> {
         return Ok(());
     }
     let now = stamp();
+    let dashboard_permissions = |conn: &Connection| {
+        conn.query_row(
+        "SELECT r.state,r.management_version,l.exclusive_management FROM online_client_leases r
+         JOIN online_client_listings l USING(installation_id) WHERE r.installation_id=?1 AND r.released_at IS NULL",
+        params![id],|row| Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?,row.get::<_,Option<bool>>(2)?))).optional().market()
+    };
+    let before = dashboard_permissions(&tx)?;
     tx.execute_batch("SAVEPOINT online_probe_result").market()?;
     let (applied, reason) = match st {
         Ok(ref status) => match apply_status(&tx, &id, seq, status, now) {
+            Ok(true) if status.grant.is_none() && status.upgrade_busy => (true, Some("upgrading")),
             Ok(true) => (true, None),
             Ok(false) if status.switching => (false, Some("switching")),
             Ok(false) => (false, Some("awaiting_receipt")),
@@ -499,7 +626,7 @@ async fn probe(s: &ServerState, id: String) -> Result<(), AppError> {
             }
             Err(e) => return Err(e),
         },
-        Err(_) if !online => (false, Some("tunnel_offline")),
+        Err(_) if tunnel_offline => (false, Some("tunnel_offline")),
         Err(_) => (false, Some("control_unavailable")),
     };
     tx.execute_batch("RELEASE online_probe_result").market()?;
@@ -509,8 +636,17 @@ async fn probe(s: &ServerState, id: String) -> Result<(), AppError> {
     )
     .market()?;
     tx.execute("UPDATE online_client_operations SET last_error=?2 WHERE installation_id=?1 AND sequence=?3",params![id,reason,seq]).market()?;
-    sample(&tx, &id, applied, now)?;
-    tx.commit().market()
+    let available = applied
+        && st.as_ref().is_ok_and(|status| {
+            status.grant.is_some() || !status.upgrade_busy && status.awaiting_return.is_none()
+        });
+    sample(&tx, &id, available, now)?;
+    let changed = before != dashboard_permissions(&tx)?;
+    tx.commit().market()?;
+    if changed {
+        s.dashboard_cache.invalidate();
+    }
+    Ok(())
 }
 pub(crate) async fn run(s: ServerState) -> anyhow::Result<()> {
     let mut tick = tokio::time::interval(Delay::from_secs(3));
@@ -592,6 +728,7 @@ async fn cycle(s: &ServerState, prune: bool, ending_cursor: &mut String) -> Resu
             .collect::<crate::db::Result<Vec<_>>>()
             .market()?
         };
+        let fenced = !expired.is_empty();
         for (installation, id, cutoff) in expired {
             fence(&tx, &installation, &id, cutoff)?;
         }
@@ -599,6 +736,9 @@ async fn cycle(s: &ServerState, prune: bool, ending_cursor: &mut String) -> Resu
         // A disconnected Client must not keep a third-party listing on sale.
         // A disputed child cannot roll back an already-committed parent fence.
         tx.commit().market()?;
+        if fenced {
+            s.dashboard_cache.invalidate();
+        }
         for (id, cutoff) in endings {
             let child = c.transaction().market()?;
             match children_finished(&child, &id, &iso(cutoff)?) {
@@ -614,7 +754,7 @@ async fn cycle(s: &ServerState, prune: bool, ending_cursor: &mut String) -> Resu
         let tx = c.transaction().market()?;
         let ids = {
             let mut stmt=tx.prepare("SELECT l.installation_id FROM online_client_listings l LEFT JOIN online_client_operations o USING(installation_id)
-            WHERE l.state!='unlisted' AND (l.check_json IS NOT NULL OR l.state='unlocking') AND (l.next_probe<=unixepoch() OR o.next_attempt<=unixepoch())
+            WHERE l.state!='unlisted' AND (l.state!='locking' OR l.check_json IS NOT NULL) AND (l.next_probe<=unixepoch() OR o.next_attempt<=unixepoch())
             ORDER BY min(l.next_probe,coalesce(o.next_attempt,l.next_probe)),l.installation_id LIMIT 96").market()?;
             stmt.query_map([], |r| r.get::<_, String>(0))
                 .market()?
@@ -682,8 +822,8 @@ mod tests {
     fn listed(c: &Connection) {
         c.execute("INSERT INTO installations(id,public_key,platform,app_version,created_at,last_seen_at,control_secret_b64,owner_email,owner_verified_at,client_activated_at,market_lease_v1)
             VALUES('physical','key','linux','1','now','now','local','owner@example.org','now','now',1)",[]).unwrap();
-        c.execute("INSERT INTO online_client_listings(installation_id,seller_id,owner_email,state,revision,sequence,cycle_price_minor,updated_at,healthy,observed_at)
-            VALUES('physical','owner','owner@example.org','listed',1,1,0,unixepoch(),1,unixepoch())",[]).unwrap();
+        c.execute("INSERT INTO online_client_listings(installation_id,seller_id,owner_email,state,revision,sequence,cycle_price_minor,updated_at,healthy,observed_at,check_json)
+            VALUES('physical','owner','owner@example.org','listed',1,1,0,unixepoch(),1,unixepoch(),json_object('exclusiveManagement',json('true')))",[]).unwrap();
     }
     fn offer(tx: &Transaction<'_>, buyer: &AuthSession) -> String {
         let quote = create_quote(
@@ -700,11 +840,16 @@ mod tests {
     }
     fn status(seq: i64, rental: Option<&Rental>) -> ClientStatus {
         ClientStatus {
+            exclusive_management: true,
+            upgrade_busy: false,
+            awaiting_return: None,
             capability: "marketLeaseV1".into(),
+            owner_rental: true,
             owner_email: "owner@example.org".into(),
             listed_owner: Some("owner@example.org".into()),
             sequence: seq,
             grant: rental.map(|r| Grant {
+                buyer_id: Some(r.buyer.clone()),
                 lease_id: r.id.clone(),
                 tenant_email: r.email.clone(),
                 alias: r.alias.clone(),
@@ -719,6 +864,52 @@ mod tests {
             version: "test".into(),
         }
     }
+    #[test]
+    fn legacy_management_promotes_only_after_the_current_grant_is_reconciled() {
+        let conn = crate::test_support::database().unwrap();
+        listed(&conn);
+        let now = stamp();
+        crate::test_support::online_lease(
+            &conn,
+            "old-lease",
+            "physical",
+            "owner",
+            "buyer",
+            &iso(now).unwrap(),
+        );
+        conn.execute("UPDATE online_client_listings SET sequence=2,check_json='invalid' WHERE installation_id='physical'", []).unwrap();
+        let lease = current(&conn, "physical").unwrap().unwrap();
+        let mut receipt = status(2, Some(&lease));
+        receipt.grant.as_mut().unwrap().expires_at -= 1;
+        assert!(!apply_status(&conn, "physical", 2, &receipt, now).unwrap());
+        assert_eq!(
+            current(&conn, "physical")
+                .unwrap()
+                .unwrap()
+                .management_version,
+            1
+        );
+        receipt.grant.as_mut().unwrap().expires_at = lease.until;
+        receipt.fenced = true;
+        assert!(!apply_status(&conn, "physical", 2, &receipt, now).unwrap());
+        receipt.fenced = false;
+        receipt.awaiting_return = Some(lease.id.clone());
+        assert!(!apply_status(&conn, "physical", 2, &receipt, now).unwrap());
+        receipt.awaiting_return = None;
+        apply_status(&conn, "physical", 2, &receipt, lease.until).unwrap();
+        assert_eq!(
+            current(&conn, "physical")
+                .unwrap()
+                .unwrap()
+                .management_version,
+            1
+        );
+        assert!(apply_status(&conn, "physical", 2, &receipt, now).unwrap());
+        let migrated = current(&conn, "physical").unwrap().unwrap();
+        assert_eq!(migrated.id, lease.id);
+        assert_eq!(migrated.management_version, 2);
+    }
+
     #[test]
     fn checkout_replay_and_fencing_preserve_workspace_identity_until_cleanup() {
         let c = crate::test_support::database().unwrap();
@@ -866,6 +1057,112 @@ mod tests {
             &at,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn self_rental_freezes_zero_terms_and_remains_exclusive_through_cleanup() {
+        for paid in [true, false] {
+            let c = crate::test_support::database().unwrap();
+            let tx = c.transaction().unwrap();
+            if paid {
+                paid_listing(&tx, 7);
+            } else {
+                listed(&tx);
+                tx.execute("UPDATE online_client_listings SET free_days=2", [])
+                    .unwrap();
+            }
+            let owner = actor("owner");
+            let other = actor("alpha");
+            let request = Quote {
+                revision: 1,
+                auto_renew: true,
+            };
+            let now = stamp();
+            // Independent self-rental capability is also checked at commit.
+            let external = offer(&tx, &other);
+            assert!(create_quote(&tx, "physical", &owner, &request).is_err());
+            let mut st = status(1, None);
+            apply_status(&tx, "physical", 1, &st, now).unwrap();
+            let quote = create_quote(&tx, "physical", &owner, &request).unwrap();
+            let q = quote["id"].as_str().unwrap();
+            let terms = &quote["terms"];
+            assert_eq!(terms["listingPriceMinor"], if paid { 1000 } else { 0 });
+            assert_eq!(terms["cyclePriceMinor"], 0);
+            assert_eq!(terms["selfRental"], true);
+            assert_eq!(terms["trialSeconds"], 0);
+            assert_eq!(terms["autoRenew"], false);
+            assert!(terms["freeDays"].is_null() && quote["walletFunding"].is_null());
+            st.owner_rental = false;
+            apply_status(&tx, "physical", 1, &st, now).unwrap();
+            assert!(commit_quote(&tx, q, &owner).is_err());
+            st.owner_rental = true;
+            apply_status(&tx, "physical", 1, &st, now).unwrap();
+            let receipt = commit_quote(&tx, q, &owner).unwrap();
+            assert_eq!(commit_quote(&tx, q, &owner).unwrap(), receipt);
+            assert!(commit_quote(&tx, &external, &other).is_err());
+            let rental = current(&tx, "physical").unwrap().unwrap();
+            assert!(rental.until >= now + 30 * 86400);
+            apply_status(&tx, "physical", 2, &status(2, Some(&rental)), now).unwrap();
+            assert_eq!(current(&tx, "physical").unwrap().unwrap().state, "active");
+            assert!(
+                wallet::contract_for_product_tx(&tx, "client_host", &rental.id)
+                    .unwrap()
+                    .is_none()
+            );
+            let traces: bool = tx
+                .query_row(
+                    "SELECT
+                EXISTS(SELECT 1 FROM market_commission_quote_terms WHERE quote_id=?1) OR
+                EXISTS(SELECT 1 FROM market_free_usage_ledgers WHERE buyer_user_id='owner') OR
+                EXISTS(SELECT 1 FROM client_market_trial_scopes WHERE buyer_user_id='owner') OR
+                EXISTS(SELECT 1 FROM market_wallet_holds WHERE user_id='owner')",
+                    params![q],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(!traces);
+            fence(&tx, "physical", &rental.id, now + 1).unwrap();
+            assert!(commit_quote(&tx, &external, &other).is_err());
+            let mut stopped = status(3, Some(&rental));
+            stopped.fenced = true;
+            apply_status(&tx, "physical", 3, &stopped, now + 2).unwrap();
+            assert!(commit_quote(&tx, &external, &other).is_err());
+            let mut clean = status(4, None);
+            clean.awaiting_return = Some(rental.id.clone());
+            assert!(!apply_status(&tx, "physical", 4, &clean, now + 3).unwrap());
+            assert!(current(&tx, "physical").unwrap().is_some());
+            clean.sequence = 5;
+            assert!(apply_status(&tx, "physical", 5, &clean, now + 4).unwrap());
+            assert_ne!(
+                commit_quote(&tx, &external, &other).unwrap()["leaseId"],
+                receipt["leaseId"]
+            );
+        }
+    }
+
+    #[test]
+    fn observed_installation_minutes_count_each_sampled_minute_once() {
+        let conn = crate::test_support::database().unwrap();
+        assert!(
+            crate::store::installation_health_minutes_24h(&conn)
+                .unwrap()
+                .is_empty()
+        );
+        let minute = stamp() / 60 * 60 - 2 * 60;
+        for (offset, status) in [
+            (0, "healthy"),
+            (5, "unhealthy"),
+            (60, "unhealthy"),
+            (-60, "unknown"),
+            (-86400, "healthy"),
+        ] {
+            conn.execute("INSERT INTO installation_health_checks(installation_id,checked_at,is_healthy,status)
+                VALUES('observed',?1,?2,?3)", params![minute+offset,status=="healthy",status]).unwrap();
+        }
+        assert_eq!(
+            crate::store::installation_health_minutes_24h(&conn).unwrap()["observed"],
+            (1, 2)
+        );
     }
 
     #[test]

@@ -660,7 +660,7 @@ fn client_supply(
 ) -> Result<Vec<MarketProviderClientSupplyView>, AppError> {
     conn.prepare(
         "SELECT COALESCE(NULLIF(upper(trim(l.country_code)), ''), '—') AS country,
-                SUM(l.supply_status='idle'),COUNT(*)
+                SUM(l.availability='available'),COUNT(*)
            FROM online_client_supply l JOIN market_provider_profiles p ON p.user_id=l.seller_id
           WHERE p.id=?1 AND l.state='listed' GROUP BY country ORDER BY country",
     )
@@ -1220,6 +1220,14 @@ mod tests {
         assert_eq!(supply[0].country_code, "US");
         assert_eq!(supply[0].idle_hosts, 1);
         assert_eq!(supply[0].total_hosts, 1);
+
+        conn.execute(
+            "UPDATE online_client_listings SET check_json=NULL WHERE installation_id='client-disabled'",
+            [],
+        ).unwrap();
+        let legacy = client_supply(&conn, "mp_client_supply").unwrap();
+        assert_eq!(legacy[0].total_hosts, 1);
+        assert_eq!(legacy[0].idle_hosts, 0);
 
         conn.execute(
             "UPDATE online_client_listings SET country_code=NULL WHERE installation_id='client-disabled'",

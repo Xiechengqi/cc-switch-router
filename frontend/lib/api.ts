@@ -817,12 +817,13 @@ export async function upgradeClientInstallation(
   installationId: string,
   restartAfter = true,
   signal?: AbortSignal,
+  leaseOperationId?: string,
 ) {
   return parseJson<{ ok: boolean; taskId: string }>(
-    await authFetch(`/v1/installations/${installationId}/upgrade`, {
+    await authFetch(leaseOperationId ? `/v1/client-market/online/leases/${installationId}/upgrade` : `/v1/installations/${installationId}/upgrade`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ restartAfter }),
+      body: JSON.stringify(leaseOperationId ? { operationId: leaseOperationId } : { restartAfter }),
       signal,
     }),
   );
@@ -858,12 +859,13 @@ export async function getClientInstallationUpgradeStatus(
   installationId: string,
   taskId?: string,
   signal?: AbortSignal,
+  leased = false,
 ) {
   const params = new URLSearchParams();
   if (taskId) params.set("taskId", taskId);
   const query = params.toString();
   return parseJson<ClientInstallationUpgradeStatus>(
-    await authFetch(`/v1/installations/${installationId}/upgrade/status${query ? `?${query}` : ""}`, {
+    await authFetch(`/v1/${leased ? "client-market/online/leases" : "installations"}/${installationId}/upgrade/status${query ? `?${query}` : ""}`, {
       cache: "no-store",
       signal,
     }),

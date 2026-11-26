@@ -208,6 +208,8 @@ export type ShareServiceReadiness = {
 };
 
 export type DashboardClient = {
+  rental?: {state: string; tenantEmail: string; selfRental: boolean; exclusiveManagement: boolean; migrationRequired?: boolean; controlId?: string; alias?: string};
+  canUpgrade?: boolean;
   chatAvailable?: boolean;
   logCollectionEnabled?: boolean;
   canOpenClientTerminal?: boolean;
@@ -2335,37 +2337,6 @@ export type ShareUsageRefreshResponse = {
   }>;
 };
 
-export type HostHealthReading = { value: number | null; unknownReason: string | null };
-export type HostHealthSnapshot = {
-  os: string;
-  arch: string;
-  effectiveVcpu: HostHealthReading;
-  memoryTotalBytes: HostHealthReading;
-  memoryAvailableBytes: HostHealthReading;
-  dataVolumeTotalBytes: HostHealthReading;
-  dataVolumeAvailableBytes: HostHealthReading;
-  cpuUsagePct: HostHealthReading;
-};
-export type HostHealth = {
-  state: "not_enabled" | "deploying" | "deployment_failed" | "awaiting_first" | "first_overdue" | "healthy" | "unknown" | "missed" | "revoked";
-  machineEpoch?: number;
-  deployment?: {
-    state: "not_enabled" | "queued" | "installing" | "failed" | "awaiting_first" | "active" | "paused";
-    reason: string | null;
-    canBootstrap: boolean;
-    deployedCommit: string | null;
-  };
-  lastReceivedAt: string | null;
-  sampledAt: string | null;
-  nextDueAt: string | null;
-  received24h: number;
-  observable24h: number;
-  consecutiveMissed: number;
-  supervision: string;
-  clockSynchronized?: boolean;
-  snapshot: HostHealthSnapshot | null;
-  diagnostic?: string | null;
-};
 export type ClientMarketHostStatus =
   | "onboarding"
   | "maintaining"
@@ -2422,7 +2393,6 @@ export type MarketPricingModel =
 export type MarketBillingInterval = "calendar_month" | string;
 
 export type ClientMarketHost = {
-  hostHealth?: HostHealth | null;
   id: string;
   providerId?: string;
   marketProviderId?: string;
@@ -2715,7 +2685,6 @@ export type MyMarketProvider = {
 };
 
 export type ClientMarketQuoteItem = {
-  hostHealth?: HostHealth | null;
   id: string;
   hostId: string;
   providerId: string;

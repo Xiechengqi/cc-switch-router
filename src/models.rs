@@ -4139,6 +4139,20 @@ pub struct InstallationUpgradeTaskReportResponse {
     pub ok: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DashboardClientRental {
+    pub state: String,
+    pub tenant_email: String,
+    pub self_rental: bool,
+    pub exclusive_management: bool,
+    pub migration_required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DashboardClientView {
@@ -4147,8 +4161,9 @@ pub struct DashboardClientView {
     pub chat_available: bool,
     #[serde(default)]
     pub log_collection_enabled: bool,
-    /// Market Clients hide the Clients-page terminal from everyone except the
-    /// Router owner. Other Clients keep the button whenever a tunnel exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rental: Option<DashboardClientRental>,
+    pub can_upgrade: bool,
     #[serde(default)]
     pub can_open_client_terminal: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]

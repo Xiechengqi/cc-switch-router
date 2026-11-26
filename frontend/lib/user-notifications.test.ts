@@ -38,6 +38,9 @@ test("notification center labels cover every category and known new kind in both
 });
 
 test("notification links use existing local routes and cannot follow payload URLs", () => {
+  for (const eventKind of ["client_workspace_ready", "client_workspace_access", "client_workspace_management"]) {
+    assert.equal(notificationHref({ ...item, eventKind, objectKind: "client", objectId: "lease/1" }), "/account/rentals/?market=client&focus=lease%2F1");
+  }
   assert.equal(notificationHref({ ...item, payload: { href: "javascript:alert(1)" } }), "/account/wallet/");
   assert.equal(notificationHref({ ...item, eventKind: "c2c_order_updated", payload: { orderId: "one/two?x=1" } }), "/account/wallet/?c2cOrder=one%2Ftwo%3Fx%3D1");
   const client = new URL(notificationHref({ ...item, category: "client", objectId: "one&two" }), "https://router.test");
