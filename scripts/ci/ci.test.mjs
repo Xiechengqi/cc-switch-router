@@ -135,8 +135,25 @@ function publication(t, options = {}) {
   mkdirSync(join(directory, "release-files"));
   writeFileSync(join(directory, "release-files/cc-switch-router-linux-amd64"), "fixture, not executable");
   const log = join(directory, "calls");
+  writeFileSync(join(directory, "edit-errors"), (options.editErrors ?? []).join("\n"));
+  writeFileSync(join(bin, "sleep"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
   writeFileSync(join(bin, "git"), `#!${process.execPath}\nconst fs=require('node:fs'); if(process.env.TEST_GIT_FAIL)process.exit(3); console.log(process.env.TEST_REMOTE_SHA+'\\trefs/heads/master');\n`, { mode: 0o755 });
-  writeFileSync(join(bin, "gh"), `#!${process.execPath}\nconst fs=require('node:fs'); const a=process.argv.slice(2); fs.appendFileSync(process.env.TEST_CALLS,JSON.stringify(a)+'\\n'); if(process.env.TEST_UPLOAD_FAIL&&a[0]==='release'&&a[1]==='upload')process.exit(9); if(process.env.TEST_NEW&&((a[0]==='api'&&a[1].endsWith('/git/ref/tags/latest'))||(a[0]==='release'&&a[1]==='view')))process.exit(1);\n`, { mode: 0o755 });
+  writeFileSync(join(bin, "gh"), `#!${process.execPath}
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const [command, action] = args;
+fs.appendFileSync(process.env.TEST_CALLS, JSON.stringify(args) + "\\n");
+if (process.env.TEST_UPLOAD_FAIL && command === "release" && action === "upload") process.exit(9);
+if (process.env.TEST_NEW && ((command === "api" && action.endsWith("/git/ref/tags/latest")) || (command === "release" && action === "view"))) process.exit(1);
+if (command === "release" && action === "edit") {
+  const [status, ...remaining] = fs.readFileSync("edit-errors", "utf8").split("\\n");
+  if (status) {
+    fs.writeFileSync("edit-errors", remaining.join("\\n"));
+    console.error("HTTP " + status + ": release edit failed");
+    process.exit(1);
+  }
+}
+`, { mode: 0o755 });
   const result = spawnSync("bash", [join(root, "scripts/ci/publish-release.sh")], {
     cwd: directory, encoding: "utf8", env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, GITHUB_REPOSITORY: "owner/router", GITHUB_SHA: sha, ROUTER_RELEASE_VERSION: "0.1.0", TEST_REMOTE_SHA: options.stale ? "a".repeat(40) : sha, TEST_CALLS: log, TEST_NEW: options.new ? "1" : "", TEST_GIT_FAIL: options.gitFail ? "1" : "", TEST_UPLOAD_FAIL: options.uploadFail ? "1" : "" },
   });
@@ -172,5 +189,22 @@ test("publication updates latest in place and fails if the asset upload fails", 
     const failed = publication(t, { new: fresh, uploadFail: true });
     assert.equal(failed.result.status, 9);
     assert.ok(failed.calls.every(args => !args.includes("PATCH") && !(args[0] === "release" && args[1] === "edit")));
+  }
+});
+
+test("publication retries only the metadata edit on transient GitHub errors", t => {
+  for (const { errors, attempts, status } of [
+    { errors: [502, 503], attempts: 3, status: 0 },
+    { errors: [502, 502, 502, 502], attempts: 4, status: 1 },
+    { errors: [403], attempts: 1, status: 1 },
+  ]) {
+    const { result, calls } = publication(t, { editErrors: errors });
+    assert.equal(result.status, status, result.stderr);
+    assert.match(result.stderr, new RegExp(`HTTP ${errors[0]}`));
+    assert.equal(calls.filter(([command, action]) => command === "release" && action === "upload").length, 1);
+    assert.equal(calls.filter(args => args.includes("PATCH")).length, 1);
+    const firstEdit = calls.findIndex(([command, action]) => command === "release" && action === "edit");
+    assert.notEqual(firstEdit, -1);
+    assert.deepEqual(calls.slice(firstEdit), Array(attempts).fill(calls[firstEdit]));
   }
 });

@@ -33,4 +33,22 @@ fi
 gh release upload latest release-files/cc-switch-router-linux-amd64 --repo "$GITHUB_REPOSITORY" --clobber
 gh api --method PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/latest" \
   -f "sha=$GITHUB_SHA" -F force=true --silent
-gh release edit latest --repo "$GITHUB_REPOSITORY" --draft=false --title "$title" --notes "$notes" --latest
+
+# A gateway error can arrive after GitHub has applied the edit. Repeating the
+# same metadata is safe, while replaying --clobber would replace the asset again.
+max_attempts=4
+for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+  if output=$(gh release edit latest --repo "$GITHUB_REPOSITORY" --draft=false --title "$title" --notes "$notes" --latest 2>&1); then
+    printf '%s\n' "$output"
+    break
+  else
+    status=$?
+  fi
+  printf '%s\n' "$output" >&2
+  if (( attempt == max_attempts )) || [[ ! $output =~ HTTP[[:space:]]+(500|502|503|504)([^[:digit:]]|$) ]]; then
+    exit "$status"
+  fi
+  delay=$((2 ** attempt))
+  echo "Retrying release edit in ${delay}s (attempt $((attempt + 1))/$max_attempts)." >&2
+  sleep "$delay"
+done
