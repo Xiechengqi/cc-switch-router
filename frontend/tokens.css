@@ -54,3 +54,14 @@
   --text-host-health-small: 0.75rem;
   --text-host-health-body: 0.8125rem;
 }
+
+/* Router upgrade · component: progress panel · existing Router light system. */
+:root {
+  --color-upgrade-positive: oklch(45% 0.10 155);
+  --color-upgrade-warning: oklch(47% 0.11 65);
+  --color-upgrade-track: rgb(var(--router-secondary));
+  --color-upgrade-fill: rgb(var(--router-primary));
+  --size-upgrade-panel: 20rem;
+  --size-upgrade-panel-wide: 25rem;
+  --size-upgrade-progress: 0.25rem;
+}

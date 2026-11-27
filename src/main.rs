@@ -316,7 +316,9 @@ async fn main() -> Result<()> {
         abuse: Arc::new(AbuseTracker::new()),
         share_abuse,
         ip_blacklist_stats: Arc::new(IpBlacklistStats::new()),
-        upgrade_registry: Arc::new(crate::admin::upgrade::UpgradeRegistry::new()),
+        upgrade_registry: Arc::new(
+            crate::admin::upgrade::UpgradeRegistry::open(&config.data_dir).await,
+        ),
         share_edit_events: broadcast::channel(512).0,
         env_path: env_path.clone(),
         settings_runtime,
@@ -422,6 +424,9 @@ async fn main() -> Result<()> {
 
     let http_listener = TcpListener::bind(config.api_addr).await?;
     let ssh_listener = TcpListener::bind(config.ssh_addr).await?;
+    let upgrade_recovery_address = http_listener.local_addr()?;
+    let upgrade_recovery_ssh_address = ssh_listener.local_addr()?;
+    let upgrade_recovery_registry = state.upgrade_registry.clone();
     info!("http listening on {}", config.api_addr);
     info!("ssh listener bound on {}", config.ssh_addr);
 
@@ -943,6 +948,17 @@ async fn main() -> Result<()> {
         Ok::<_, anyhow::Error>(())
     });
 
+    let upgrade_recovery_task = spawn_background_task(
+        "Router upgrade recovery",
+        background_shutdown_rx.clone(),
+        async move {
+            upgrade_recovery_registry
+                .confirm_after_startup(upgrade_recovery_address, upgrade_recovery_ssh_address)
+                .await
+                .map_err(anyhow::Error::from)
+        },
+    );
+
     enum ServiceExit {
         Signal(&'static str),
         Http(Result<Result<()>, tokio::task::JoinError>),
@@ -983,6 +999,7 @@ async fn main() -> Result<()> {
     };
 
     let mut background_tasks = vec![
+        ("Router upgrade recovery", upgrade_recovery_task),
         ("password security notifications", password_notice_task),
         ("cleanup", cleanup_task),
         ("Share request watchdog", share_request_watchdog_task),

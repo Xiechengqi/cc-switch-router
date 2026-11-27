@@ -1711,6 +1711,46 @@ export type AdminAuditResponse = {
   entries: AdminAuditEntry[];
 };
 
+export type RouterUpgradeStatus = "running" | "cancelling" | "restarting" | "success" | "failed" | "cancelled" | "interrupted";
+export type RouterUpgradePhase = "preparing" | "downloading" | "validating" | "hashing" | "installing" | "restarting" | "verifying" | "complete";
+
+export type RouterUpgradeLog = {
+  seq: number;
+  taskId: string;
+  step: number;
+  totalSteps: number;
+  level: "info" | "progress" | "success" | "warn" | "error";
+  message: string;
+  progress: number | null;
+  at: string;
+};
+
+export type RouterUpgradeTask = {
+  schemaVersion: number;
+  taskId: string;
+  revision: number;
+  status: RouterUpgradeStatus;
+  phase: RouterUpgradePhase;
+  canCancel: boolean;
+  actor: string;
+  sourceInstanceId: string;
+  target: { version: string; commit: string; buildTime: string; upgradeProtocolVersion: number } | null;
+  targetSha256: string | null;
+  binaryReplaced: boolean;
+  restartConfirmed: boolean;
+  startedAt: string;
+  updatedAt: string;
+  finishedAt: string | null;
+  downloadedBytes: number;
+  totalBytes: number | null;
+  progress: number | null;
+  error: string | null;
+  persistenceError: boolean;
+  lastSeq: number;
+  logsTruncated: boolean;
+  logs: RouterUpgradeLog[];
+};
+
 export type VersionResponse = {
   version: string;
   commit: string;

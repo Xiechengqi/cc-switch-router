@@ -554,6 +554,14 @@ Router Web 的升级按钮只把进行中的任务写入 `sessionStorage`（`cc_
 
 ---
 
+### 7.6 Router 本机升级进度与中断
+
+本机管理员接口独立于上一节的 Client 升级上报：`POST /v1/admin/upgrade` 返回 `{taskId,task}`，`GET /v1/admin/upgrade/status?taskId=...` 返回 `{task}`（不传 ID 发现最近任务，无任务为 `null`），`POST /v1/admin/upgrade/cancel` 接受 `{taskId}` 并返回任务。接口均要求管理员会话；状态读为 `no-store`。任务状态为 `running/cancelling/restarting/success/failed/cancelled/interrupted`，阶段独立，`canCancel` 由 Router 计算。
+
+`GET /v1/admin/upgrade/stream?taskId=...&afterSeq=...` 发送 `log/state/done`，日志 `id=<taskId>:<seq>`，支持同任务的 `Last-Event-ID`。state 含 revision、不重复日志正文；广播只是唤醒，快照负责历史及 lag 补发。重启交接的 state 发出后结束旧 SSE，由浏览器轮询新进程，避免流阻塞优雅退出；仅任务终态发送 done。浏览器按 taskId、revision、seq 合并，不能让旧任务或迟到读请求回退结果。
+
+取消与进入安装共享互斥、持久化边界：先接受取消则绝不安装，先进入安装则返回 `409 UPGRADE_NOT_CANCELLABLE`；旧任务 ID 取消返回 `409 UPGRADE_TASK_CHANGED`，冲突服务操作返回 `409 SERVICE_OPERATION_IN_PROGRESS`。成功须由另一实例在实际执行目标 binary 且服务就绪后确认，安排重启只返回 `restarting`。候选 `build-info` 要求 `upgradeProtocolVersion=1`，未知协议在替换前拒绝。任务和有界日志保存在本地数据目录；关闭只记录浏览器账号与任务 ID，不删除后端结果。[完整契约及恢复边界](docs/router-upgrade-progress-and-cancellation.md)
+
 ## 8. 探针:`/_share-router/*`
 
 Router 经隧道拉取 share 侧运行时数据。Server 需实现:

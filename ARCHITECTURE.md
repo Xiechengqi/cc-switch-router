@@ -455,13 +455,13 @@ Next.js 静态导出(`output: "export"`),`build.rs` 遍历 `frontend/out/` 生�
 
 1. 同目录暂存临时文件(避开跨文件系统 rename 的 EXDEV)
 2. 从 GitHub `latest` release 下载 `cc-switch-router-linux-amd64`(180s 超时,仅 amd64,不校验 checksum)
-3. `chmod +x`,以 `--help` 冒烟自检(5s)并用新二进制跑 `check-db`(30s)确认它能接受当前数据库
-4. SHA-256 比对新旧二进制(仅提示:相同时记录告警并继续)
-5. 两次 `rename(2)` 交换:先把当前二进制改名为 `.bak`,再把临时文件改名为目标
-6. 探测服务管理器(systemd 或 nohup)
-7. `setsid -f` 派生子进程延时重启
+3. `chmod +x`，执行 `--help`（5s）、`build-info`（5s，要求 `upgradeProtocolVersion=1`）及只读 `check-db`（30s）
+4. 分块计算目标 SHA-256，保存目标构建和执行指纹
+5. 复制并 fsync 同目录备份，原子覆盖 `.bak` 后原子覆盖安装目标，保留安装路径连续存在
+6. 持久化重启交接，探测 systemd/nohup，再由 `setsid -f` 子进程延时重启
+7. 新实例核对实际运行的 `/proc/self/exe` SHA-256，HTTP/SSH 启动且数据库健康后才确认成功
 
-进度经 broadcast channel 以 SSE 流式推送至前端。第 1–4 步失败都在交换二进制之前 `return Err`,进程继续运行旧版本;交换之后若调度重启失败会返回错误但不自动回滚,需手动 `rollback_to_previous_binary()`。前端只在收到 `status=success` 的 done 事件后才轮询健康并刷新页面,失败时保留日志弹窗并把最后一条 error 显示为告警。
+`src/admin/upgrade_task.rs` 将最近任务及最多 1000 条有序日志原子写入 `data_dir/upgrade/current.json`；broadcast 仅唤醒 SSE，快照和序号负责重放与补发。Operations 在版本卡下方显示固定高度的浅色面板，刷新恢复，结果须手动关闭。准备／下载／校验／哈希可中断，取消接受与进入安装共用同一状态锁；安装和重启不可中断。升级、重启、回滚共用服务操作锁。journal 故障隔离维护操作，不阻塞 Router 启动；替换后失败保留实际安装状态和备份，不自动回滚数据库。旧深色弹窗、断线就解锁和 health HTTP 200 就自动刷新升级页的逻辑已移除。[完整设计、协议和验证范围](docs/router-upgrade-progress-and-cancellation.md)
 
 ### Buddy 积分摘要展示（2026-11-07）
 

@@ -3,6 +3,28 @@
 @import "@heroui/styles";
 @import "../tokens.css";
 
+/* Hallmark · component: upgrade progress · genre: modern-minimal · theme: existing Router
+ * pre-emit critique: P5 H5 E4 S5 R5 V4
+ * states: default · hover · focus · active · disabled · loading · error · success
+ */
+.upgrade-progress-panel { height: var(--size-upgrade-panel); }
+@media (min-width: 40rem) {
+  .upgrade-progress-panel { height: var(--size-upgrade-panel-wide); }
+}
+.upgrade-download-progress {
+  display: block;
+  height: var(--size-upgrade-progress);
+  appearance: none;
+  overflow: hidden;
+  border: 0;
+  border-radius: 9999px;
+  background: var(--color-upgrade-track);
+  color: var(--color-upgrade-fill);
+}
+.upgrade-download-progress::-webkit-progress-bar { background: var(--color-upgrade-track); }
+.upgrade-download-progress::-webkit-progress-value { background: var(--color-upgrade-fill); }
+.upgrade-download-progress::-moz-progress-bar { background: var(--color-upgrade-fill); }
+
 /* Model Hub route picker. The two panes sit side by side once the picker
  * itself is wide enough; each row's arrow always points at the other pane. */
 .model-route-transfer {

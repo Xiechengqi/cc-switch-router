@@ -110,6 +110,8 @@ API 路由按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
 
 ## 管理设置与运维
 
+Router 升级进度在「版本」卡片下方以固定高度的浅色面板显示，刷新后恢复，结束后可关闭。准备、下载和校验阶段可中断，安装与重启阶段不可中断；新进程确认目标程序及服务就绪后才显示成功。见 [升级进度、中断与故障恢复](docs/router-upgrade-progress-and-cancellation.md)。
+
 管理员页面按职责拆分为两个入口：`/settings/` 只管理配置，`/operations/` 承载版本与服务控制、财务处理（余额、案件、收益冻结、充值补单、争议）、Router 日志、通知投递历史和管理员审计。Settings 按管理任务分为八个分类：站点与访问、账号与安全、市场与计费、通知、运行与监控、数据与保留、连接与性能、部署信息；每个分类下的标签页（section）、所含字段分组和非 `.env` 面板（地图、公告、模型价格、钱包与支付、渠道状态等）都由后端 `SETTINGS_SECTIONS` 定义。字段分为四层：常用（直接显示）、高级（折叠）、部署（只读，API 拒绝修改，须改 `.env` 后重启）和托管（Router 自行维护，不显示）。概览会列出 `.env` 中已无任何代码读取的 `CC_SWITCH_ROUTER_*` 遗留项，可经确认后移除。
 
 Settings 使用 revision 化的三段式 API：`GET /v1/admin/settings` 返回 schema、持久化值、运行时有效值和 revision；`POST /v1/admin/settings/validate` 在不写盘的情况下校验整组修改；`PATCH /v1/admin/settings` 要求相同的 `expectedRevision` 后才原子替换 `.env`；`POST /v1/admin/settings/unrecognized-keys/remove` 以同一 revision 删除遗留项，并拒绝任何仍被读取的键。并发修改返回 `SETTINGS_REVISION_CONFLICT`，前端会加载最新版本并保留待复核草稿。地图与公告也有各自的 revision，避免多个管理员互相覆盖。

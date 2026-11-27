@@ -1,12 +1,14 @@
 "use client";
 
 import { Loader2, RefreshCw, Rocket, RotateCcw } from "lucide-react";
-import { Alert, Button, Card, Chip, Modal, ScrollShadow } from "@heroui/react";
+import { Alert, Button, Card, Chip } from "@heroui/react";
 import * as React from "react";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { readAuthState } from "@/lib/auth";
-import { getVersion, restartService, rollbackService, startUpgrade } from "@/lib/api";
+import { useAuth } from "@/components/auth/auth-provider";
+import { useRouterUpgrade } from "./use-router-upgrade";
+import { UpgradeProgressPanel } from "./upgrade-progress-panel";
+import { getVersion, restartService, rollbackService } from "@/lib/api";
 import type { VersionResponse } from "@/lib/types";
 import { formatDateTime } from "@/lib/utils";
 
@@ -26,28 +28,16 @@ function formatBytes(bytes?: number | null) {
 
 type ConfirmAction = "restart" | "upgrade" | "rollback" | "rollbackAgain";
 
-type UpgradeLogLine = { level: string; text: string };
-
-const UPGRADE_LOG_TONES: Record<string, string> = {
-  error: "text-rose-300",
-  warn: "text-amber-300",
-  success: "text-emerald-300",
-  progress: "text-slate-400",
-};
-
-function upgradeLogTime(at?: string) {
-  if (!at) return "";
-  const parsed = new Date(at);
-  return Number.isNaN(parsed.getTime()) ? "" : parsed.toLocaleTimeString();
-}
-
 export function VersionPanel({ isAdmin }: { isAdmin: boolean }) {
   const { t } = useLocaleText();
   const [info, setInfo] = React.useState<VersionResponse | null>(null);
   const [error, setError] = React.useState("");
   const [busy, setBusy] = React.useState<string | null>(null);
-  const [upgradeOpen, setUpgradeOpen] = React.useState(false);
-  const [logs, setLogs] = React.useState<UpgradeLogLine[]>([]);
+  const { session } = useAuth();
+  const upgradeState = useRouterUpgrade(isAdmin, session?.user?.id || "", session?.user?.email || "");
+  const serviceLocked = !!busy || upgradeState.locked;
+  const [serviceNotice, setServiceNotice] = React.useState("");
+  const completedTask = React.useRef("");
   const [confirmAction, setConfirmAction] = React.useState<ConfirmAction | null>(null);
 
   const refresh = React.useCallback(async () => {
@@ -69,7 +59,7 @@ export function VersionPanel({ isAdmin }: { isAdmin: boolean }) {
     setError("");
     try {
       await restartService();
-      setLogs((prev) => [...prev, { level: "info", text: t("version.restartScheduledHealth") }]);
+      setServiceNotice(t("version.restartScheduledHealth"));
       pollHealthAndReload().catch(console.error);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -77,19 +67,10 @@ export function VersionPanel({ isAdmin }: { isAdmin: boolean }) {
     }
   }
 
-  async function upgrade() {
+  function upgrade() {
     setConfirmAction(null);
-    setBusy("upgrade");
     setError("");
-    setLogs([]);
-    setUpgradeOpen(true);
-    try {
-      const { taskId } = await startUpgrade();
-      streamUpgrade(taskId);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-      setBusy(null);
-    }
+    upgradeState.start();
   }
 
   async function rollback() {
@@ -98,7 +79,7 @@ export function VersionPanel({ isAdmin }: { isAdmin: boolean }) {
     setError("");
     try {
       await rollbackService();
-      setLogs((prev) => [...prev, { level: "info", text: t("version.restartScheduledHealth") }]);
+      setServiceNotice(t("version.restartScheduledHealth"));
       pollHealthAndReload().catch(console.error);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -112,7 +93,7 @@ export function VersionPanel({ isAdmin }: { isAdmin: boolean }) {
       return;
     }
     if (confirmAction === "upgrade") {
-      upgrade().catch(console.error);
+      upgrade();
       return;
     }
     if (confirmAction === "rollback") {
@@ -159,135 +140,92 @@ export function VersionPanel({ isAdmin }: { isAdmin: boolean }) {
     }
   })();
 
-  function streamUpgrade(taskId: string) {
-    const token = readAuthState().accessToken;
-    const params = new URLSearchParams({ taskId });
-    if (token) params.set("accessToken", token);
-    const source = new EventSource(`/v1/admin/upgrade/stream?${params}`);
-    // The task keeps the process alive on failure, so the health probe would
-    // succeed and reload the page before anyone reads the error. Remember the
-    // last error line and only reload once the task reports success.
-    let lastError = "";
-    source.addEventListener("log", (event) => {
-      try {
-        const data = JSON.parse((event as MessageEvent).data);
-        const level = typeof data.level === "string" ? data.level : "info";
-        const message = typeof data.message === "string" ? data.message : "";
-        if (level === "error" && message) lastError = message;
-        const step = data.step && data.totalSteps ? `[${data.step}/${data.totalSteps}]` : "";
-        setLogs((prev) => [
-          ...prev,
-          { level, text: `${upgradeLogTime(data.at)} ${step} ${level} ${message}`.trim() },
-        ]);
-      } catch {
-        setLogs((prev) => [...prev, { level: "info", text: (event as MessageEvent).data }]);
-      }
-    });
-    source.addEventListener("done", (event) => {
-      source.close();
-      let status = "";
-      try {
-        status = JSON.parse((event as MessageEvent).data).status || "";
-      } catch {
-        status = "";
-      }
-      setLogs((prev) => [...prev, { level: status === "success" ? "success" : "error", text: `done ${(event as MessageEvent).data}` }]);
-      if (status !== "success") {
-        setError(lastError ? t("version.upgradeFailedWith", { reason: lastError }) : t("version.upgradeFailed"));
-        setBusy(null);
-        return;
-      }
-      pollHealthAndReload().catch(console.error);
-    });
-    source.onerror = () => {
-      setLogs((prev) => [...prev, { level: "warn", text: t("version.streamDisconnected") }]);
-      source.close();
-      setBusy(null);
-    };
-  }
+  React.useEffect(() => {
+    const task = upgradeState.task;
+    if (task && !["success", "failed", "cancelled", "interrupted"].includes(task.status)) setConfirmAction(null);
+    if (task?.status === "success" && task.restartConfirmed && completedTask.current !== task.taskId) {
+      completedTask.current = task.taskId;
+      void refresh();
+    }
+  }, [upgradeState.task, refresh]);
 
   return (
-    <Card className="rounded-lg">
-      <Card.Header className="flex-row items-start justify-between gap-4 space-y-0">
-        <div>
-          <Card.Title>{t("settings.version")}</Card.Title>
-          <Card.Description>{t("version.description")}</Card.Description>
-        </div>
-        <Button variant="outline" isIconOnly onClick={() => refresh()} aria-label={t("version.refresh")}>
-          <RefreshCw className="h-4 w-4" />
-        </Button>
-      </Card.Header>
-      <Card.Content className="grid gap-4">
-        {error ? <Alert status="danger" className="!text-slate-900">{error}</Alert> : null}
-        <div className="grid gap-3 sm:grid-cols-2">
-          <Info label={t("version.current")} value={`${info?.version || "--"} (${info?.commit || "--"})`} />
-          <Info label={t("version.built")} value={formatDateTime(info?.buildTime)} />
-          <Info label={t("version.uptime")} value={formatUptime(info?.uptimeSecs || 0)} />
-          <Info label={t("version.service")} value={<Chip color={info?.service.active ? "success" : "default"} size="sm" variant={info?.service.active ? "soft" : "tertiary"}>{info?.service.manager || "--"} / {info?.service.activeState || (info?.service.active ? "active" : "inactive")}</Chip>} />
-          <Info label={t("version.latestBinary")} value={info?.latest.available ? t("version.available", { size: formatBytes(info.latest.contentLength) }) : info?.latest.error || t("version.unknown")} />
-          <Info label={t("version.binaryPath")} value={isAdmin ? info?.binaryPath || "--" : t("version.adminOnly")} />
-          <Info label={t("common.rollback")} value={isAdmin ? (info?.rollbackAvailable ? info.rollbackPath : t("version.rollbackUnavailable")) : t("version.adminOnly")} />
-        </div>
-        {isAdmin ? (
-          <div className="flex flex-wrap gap-2">
-            <Button variant="outline" onClick={() => setConfirmAction("restart")} isDisabled={!!busy}>
-              {busy === "restart" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCcw className="h-4 w-4" />}
-              {t("common.restart")}
-            </Button>
-            <Button variant="primary" onClick={() => setConfirmAction("upgrade")} isDisabled={!!busy}>
-              {busy === "upgrade" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Rocket className="h-4 w-4" />}
-              {t("common.upgrade")}
-            </Button>
-            <Button variant="outline" onClick={() => setConfirmAction("rollback")} isDisabled={!!busy || !info?.rollbackAvailable} className="border-amber-300 text-amber-700 hover:bg-amber-50">
-              {busy === "rollback" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCcw className="h-4 w-4" />}
-              {t("common.rollback")}
-            </Button>
+    <div className="grid min-w-0 gap-4">
+      <Card className="rounded-lg">
+        <Card.Header className="flex-row items-start justify-between gap-4 space-y-0">
+          <div>
+            <Card.Title>{t("settings.version")}</Card.Title>
+            <Card.Description>{t("version.description")}</Card.Description>
           </div>
+          <Button variant="outline" isIconOnly onClick={() => { void refresh(); upgradeState.retry(); }} aria-label={t("version.refresh")}>
+            <RefreshCw className="h-4 w-4" />
+          </Button>
+        </Card.Header>
+        <Card.Content className="grid gap-4">
+          {error ? <Alert status="danger" className="!text-slate-900">{error}</Alert> : null}
+          {serviceNotice ? <p role="status" className="text-sm text-muted-foreground">{serviceNotice}</p> : null}
+          {upgradeState.unavailable && !upgradeState.task ? <Alert status="warning">
+            <div><p>{t("version.upgradeStatusUnavailable")}</p>
+              {upgradeState.statusError ? <p className="mt-1 text-xs [overflow-wrap:anywhere]">{upgradeState.statusError}</p> : null}
+            </div>
+          </Alert> : null}
+          {upgradeState.actionError && !upgradeState.visible ? <Alert status="danger">{upgradeState.actionError}</Alert> : null}
+          {upgradeState.task?.persistenceError && !upgradeState.visible ? <Alert status="danger">{t("version.upgradePersistenceFailed")}</Alert> : null}
+          <div className="grid gap-3 sm:grid-cols-2">
+            <Info label={t("version.current")} value={`${info?.version || "--"} (${info?.commit || "--"})`} />
+            <Info label={t("version.built")} value={formatDateTime(info?.buildTime)} />
+            <Info label={t("version.uptime")} value={formatUptime(info?.uptimeSecs || 0)} />
+            <Info label={t("version.service")} value={<Chip color={info?.service.active ? "success" : "default"} size="sm" variant={info?.service.active ? "soft" : "tertiary"}>{info?.service.manager || "--"} / {info?.service.activeState || (info?.service.active ? "active" : "inactive")}</Chip>} />
+            <Info label={t("version.latestBinary")} value={info?.latest.available ? t("version.available", { size: formatBytes(info.latest.contentLength) }) : info?.latest.error || t("version.unknown")} />
+            <Info label={t("version.binaryPath")} value={isAdmin ? info?.binaryPath || "--" : t("version.adminOnly")} />
+            <Info label={t("common.rollback")} value={isAdmin ? (info?.rollbackAvailable ? info.rollbackPath : t("version.rollbackUnavailable")) : t("version.adminOnly")} />
+          </div>
+          {isAdmin ? (
+            <div className="flex flex-wrap gap-2">
+              <Button variant="outline" onClick={() => setConfirmAction("restart")} isDisabled={serviceLocked}>
+                {busy === "restart" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCcw className="h-4 w-4" />}
+                {t("common.restart")}
+              </Button>
+              <Button variant="primary" onClick={() => setConfirmAction("upgrade")} isDisabled={serviceLocked}>
+                {upgradeState.active || upgradeState.creating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Rocket className="h-4 w-4" />}
+                {t("common.upgrade")}
+              </Button>
+              <Button variant="outline" onClick={() => setConfirmAction("rollback")} isDisabled={serviceLocked || !info?.rollbackAvailable} className="border-amber-300 text-amber-700 hover:bg-amber-50">
+                {busy === "rollback" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCcw className="h-4 w-4" />}
+                {t("common.rollback")}
+              </Button>
+            </div>
+          ) : null}
+        </Card.Content>
+        {confirmCopy ? (
+          <ConfirmAlertDialog
+            open={!!confirmAction}
+            title={confirmCopy.title}
+            description={confirmCopy.description}
+            confirmLabel={confirmCopy.confirmLabel}
+            cancelLabel={t("common.cancel")}
+            tone={confirmCopy.tone}
+            // Only this card's own request makes the dialog busy. A status
+            // blip must not trap it; a real conflict disables Confirm alone.
+            busy={!!busy}
+            confirmDisabled={upgradeState.active || upgradeState.creating || !!upgradeState.task?.persistenceError}
+            onConfirm={confirmCurrentAction}
+            onOpenChange={(open) => !open && setConfirmAction(null)}
+          />
         ) : null}
-      </Card.Content>
-      <Modal.Backdrop isOpen={upgradeOpen} onOpenChange={setUpgradeOpen}>
-          <Modal.Container placement="center" size="lg">
-            <Modal.Dialog className="light !bg-white !text-slate-900">
-              <Modal.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
-              <Modal.Header>
-                <div>
-                  <Modal.Heading className="!text-slate-900">{t("version.upgradeLog")}</Modal.Heading>
-                  <p className="mt-1 text-sm text-muted-foreground">{t("version.upgradeLogDesc")}</p>
-                </div>
-              </Modal.Header>
-              <Modal.Body className="grid gap-3">
-                {error ? <Alert status="danger" className="!text-slate-900">{error}</Alert> : null}
-                <ScrollShadow className="h-96 rounded-lg border bg-slate-950 p-4 font-mono text-xs text-slate-100">
-                  <div className="grid gap-2 pr-3">
-                    {logs.length ? (
-                      logs.map((line, index) => (
-                        <div key={`${index}-${line.text}`} className={UPGRADE_LOG_TONES[line.level] || ""}>
-                          {line.text}
-                        </div>
-                      ))
-                    ) : (
-                      <div>{t("version.waitingLogs")}</div>
-                    )}
-                  </div>
-                </ScrollShadow>
-              </Modal.Body>
-            </Modal.Dialog>
-          </Modal.Container>
-      </Modal.Backdrop>
-      {confirmCopy ? (
-        <ConfirmAlertDialog
-          open={!!confirmAction}
-          title={confirmCopy.title}
-          description={confirmCopy.description}
-          confirmLabel={confirmCopy.confirmLabel}
-          cancelLabel={t("common.cancel")}
-          tone={confirmCopy.tone}
-          busy={!!busy}
-          onConfirm={confirmCurrentAction}
-          onOpenChange={(open) => !open && setConfirmAction(null)}
-        />
-      ) : null}
-    </Card>
+      </Card>
+      {upgradeState.visible ? <UpgradeProgressPanel
+        task={upgradeState.creating ? null : upgradeState.task}
+        creating={upgradeState.creating}
+        cancelling={upgradeState.cancelling}
+        reconnecting={upgradeState.reconnecting}
+        unavailable={upgradeState.unavailable}
+        actionError={upgradeState.actionError}
+        onCancel={upgradeState.cancel}
+        onClose={upgradeState.dismiss}
+        onRetry={upgradeState.retry}
+      /> : null}
+    </div>
   );
 }
 

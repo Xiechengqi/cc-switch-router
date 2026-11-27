@@ -47,6 +47,7 @@ import type {
   UsageCardSettingsResponse,
   UpdateUsageCardSettingsRequest,
   VersionResponse,
+  RouterUpgradeTask,
   MetricsSnapshot,
   HostMetricsInfo,
   MetricsSeriesResponse,
@@ -882,8 +883,23 @@ export async function rollbackService() {
   );
 }
 
-export async function startUpgrade() {
-  return parseJson<{ taskId: string }>(await authFetch("/v1/admin/upgrade", { method: "POST" }));
+export async function startUpgrade(signal?: AbortSignal, context?: AuthState) {
+  return parseJson<{ taskId: string; task: RouterUpgradeTask }>(
+    await authFetch("/v1/admin/upgrade", { method: "POST", signal }, context),
+  );
+}
+
+export async function getRouterUpgradeStatus(signal?: AbortSignal, context?: AuthState) {
+  return parseJson<{ task: RouterUpgradeTask | null }>(
+    await authFetch("/v1/admin/upgrade/status", { cache: "no-store", signal }, context),
+  );
+}
+
+export async function cancelRouterUpgrade(taskId: string, signal?: AbortSignal, context?: AuthState) {
+  return parseJson<RouterUpgradeTask>(await authFetch("/v1/admin/upgrade/cancel", {
+    method: "POST", signal, headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ taskId }),
+  }, context));
 }
 
 export async function downloadRouterLog() {

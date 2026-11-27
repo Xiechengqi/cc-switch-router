@@ -32,7 +32,7 @@ use crate::admin::{
         remove_unrecognized_env_keys, settings_revision, snapshot_response,
         validate_and_diff_with_runtime, validation_response_with_runtime, write_env_file_atomic,
     },
-    upgrade::{UpgradeLogEntry, UpgradeStatus},
+    upgrade::{UpgradeLogEntry, UpgradeStatus, UpgradeTaskSnapshot},
     version::{
         BINARY_INSTALL_PATH, BINARY_ROLLBACK_PATH, SERVICE_LOG_PATH, SERVICE_UNIT, ServiceManager,
         VersionResponse, build_info, detect_service_status, ensure_binary_writable,
@@ -657,6 +657,8 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/admin/upgrade", post(admin_upgrade_start))
         .route("/v1/admin/rollback", post(admin_rollback))
         .route("/v1/admin/upgrade/stream", get(admin_upgrade_stream))
+        .route("/v1/admin/upgrade/status", get(admin_upgrade_status))
+        .route("/v1/admin/upgrade/cancel", post(admin_upgrade_cancel))
         .route("/v1/admin/logs/router/tail", get(admin_router_log_tail))
         .route(
             "/v1/admin/logs/router/download",
@@ -5951,8 +5953,7 @@ mod tests {
     /// traffic required.
     #[tokio::test]
     async fn emit_done_if_finished_succeeds_for_post_completion_subscribers() {
-        let status = std::sync::Arc::new(tokio::sync::Mutex::new(UpgradeStatus::Success));
-        let event = emit_done_if_finished(&status).await;
+        let event = emit_done_if_finished(UpgradeStatus::Success);
         let event = event.expect("done event expected for completed upgrade");
         let serialized = format!("{event:?}");
         assert!(
@@ -5967,8 +5968,13 @@ mod tests {
 
     #[tokio::test]
     async fn emit_done_if_finished_returns_none_while_running() {
-        let status = std::sync::Arc::new(tokio::sync::Mutex::new(UpgradeStatus::Running));
-        assert!(emit_done_if_finished(&status).await.is_none());
+        for status in [
+            UpgradeStatus::Running,
+            UpgradeStatus::Cancelling,
+            UpgradeStatus::Restarting,
+        ] {
+            assert!(emit_done_if_finished(status).is_none());
+        }
     }
 
     #[test]
@@ -8585,8 +8591,10 @@ async fn admin_restart(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let session = require_admin_session(&state, &headers).await?;
+    let operation = state.upgrade_registry.reserve_service_action().await?;
     let strategy = RestartStrategy::from_manager(detect_service_status().manager);
     let script = schedule_restart(strategy)?;
+    operation.restart_scheduled();
     let metadata = extract_client_metadata(&headers, addr);
     let payload = serde_json::json!({
         "strategy": strategy.label(),
@@ -8613,8 +8621,10 @@ async fn admin_rollback(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Result<Json<crate::admin::upgrade::RollbackResponse>, AppError> {
     let session = require_admin_session(&state, &headers).await?;
+    let operation = state.upgrade_registry.reserve_service_action().await?;
     ensure_binary_writable()?;
     let response = crate::admin::upgrade::rollback_to_previous_binary().await?;
+    operation.restart_scheduled();
     let metadata = extract_client_metadata(&headers, addr);
     let payload = serde_json::json!({
         "strategy": response.strategy,
@@ -8660,7 +8670,58 @@ async fn admin_upgrade_start(
         .await;
     Ok(Json(serde_json::json!({
         "taskId": handle.task_id,
+        "task": handle.snapshot().await,
     })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpgradeTaskQuery {
+    task_id: Option<String>,
+}
+
+async fn admin_upgrade_status(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<UpgradeTaskQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    require_admin_session(&state, &headers).await?;
+    let task = state
+        .upgrade_registry
+        .snapshot(query.task_id.as_deref())
+        .await?;
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::json!({ "task": task })),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpgradeCancelRequest {
+    task_id: String,
+}
+
+async fn admin_upgrade_cancel(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(request): Json<UpgradeCancelRequest>,
+) -> Result<Json<UpgradeTaskSnapshot>, AppError> {
+    let session = require_admin_session(&state, &headers).await?;
+    let task = state.upgrade_registry.cancel(&request.task_id).await?;
+    let metadata = extract_client_metadata(&headers, addr);
+    let payload = serde_json::json!({ "taskId": task.task_id, "status": task.status });
+    let _ = state
+        .store
+        .record_admin_audit(
+            Some(&session.email),
+            "service.upgrade.cancel",
+            Some(&payload),
+            metadata.ip.as_deref(),
+        )
+        .await;
+    Ok(Json(task))
 }
 
 #[derive(Debug, Deserialize)]
@@ -8668,8 +8729,10 @@ async fn admin_upgrade_start(
 struct UpgradeStreamQuery {
     #[serde(default)]
     task_id: Option<String>,
-    /// Fallback bearer for EventSource (no header support). Use HTTPS in
-    /// production; tokens are short-lived (auth_session_ttl_secs).
+    #[serde(default)]
+    after_seq: Option<u64>,
+    /// EventSource cannot set an Authorization header. Status/cancel use the
+    /// normal refreshable bearer transport; no credentials enter the journal.
     #[serde(default)]
     access_token: Option<String>,
 }
@@ -8678,114 +8741,85 @@ async fn admin_upgrade_stream(
     State(state): State<ServerState>,
     headers: HeaderMap,
     Query(query): Query<UpgradeStreamQuery>,
-) -> Result<
-    axum::response::Sse<
-        impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
-    >,
-    AppError,
-> {
-    let session = if let Some(token) = query.access_token.as_deref() {
-        state
-            .store
-            .resolve_session_by_access_token(token)
-            .await?
-            .ok_or_else(|| AppError::Unauthorized("session not found".into()))?
-    } else {
-        let token = extract_bearer_token(&headers)
-            .ok_or_else(|| AppError::Unauthorized("missing bearer token".into()))?;
-        state
-            .store
-            .resolve_session_by_access_token(token)
-            .await?
-            .ok_or_else(|| AppError::Unauthorized("session not found".into()))?
-    };
-    if !state.dynamic.read().await.is_admin(&session.email) {
-        return Err(AppError::Forbidden("admin privilege required".into()));
-    }
+) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, AppError> {
+    require_admin_for_stream(&state, &headers, query.access_token.as_deref()).await?;
     let handle = state
         .upgrade_registry
         .current()
         .await
-        .ok_or_else(|| AppError::NotFound("no upgrade task running".into()))?;
-    if let Some(expected) = query.task_id.as_deref() {
-        if expected != handle.task_id {
-            return Err(AppError::NotFound("upgrade task id does not match".into()));
-        }
+        .ok_or_else(|| AppError::NotFound("no upgrade task exists".into()))?;
+    if query
+        .task_id
+        .as_deref()
+        .is_some_and(|expected| expected != handle.task_id)
+    {
+        return Err(AppError::NotFound("upgrade task id does not match".into()));
     }
-    let history: Vec<UpgradeLogEntry> = handle.history.lock().await.clone();
-    let receiver = handle.sender.subscribe();
-    let status = handle.status.clone();
+    let last_event_seq = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split_once(':'))
+        .filter(|(task_id, _)| *task_id == handle.task_id)
+        .and_then(|(_, seq)| seq.parse::<u64>().ok());
+    let mut cursor = last_event_seq.or(query.after_seq).unwrap_or(0);
+    // Subscribe before the first snapshot. Broadcasts only wake the reader;
+    // sequenced journal snapshots backfill lag, so no subscription gap exists.
+    let mut receiver = handle.sender.subscribe();
     let stream = async_stream::stream! {
-        for entry in history {
-            yield Ok(sse_event_from_entry(&entry));
-        }
-        // The upgrade task can finish before this subscription happens, in which
-        // case no new broadcast events will ever arrive — without a periodic
-        // status poll the stream would block forever. Check once up front, then
-        // wake every 2s while waiting for log entries.
-        if let Some(event) = emit_done_if_finished(&status).await {
-            yield Ok(event);
-            return;
-        }
-        let mut rx = receiver;
+        let mut revision = None;
         loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await {
-                Ok(Ok(entry)) => {
-                    yield Ok(sse_event_from_entry(&entry));
-                }
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
-                    if let Some(event) = emit_done_if_finished(&status).await {
-                        yield Ok(event);
+            let mut snapshot = handle.snapshot().await;
+            if cursor > snapshot.last_seq { cursor = 0; }
+            if revision != Some(snapshot.revision) {
+                for entry in &snapshot.logs {
+                    if entry.seq > cursor {
+                        yield Ok(sse_event_from_entry(entry));
+                        cursor = entry.seq;
                     }
-                    break;
                 }
-                Err(_) => {
-                    // Timeout: re-check status so we don't hang after the
-                    // background task finishes between events.
-                }
+                revision = Some(snapshot.revision);
+                snapshot.logs.clear();
+                yield Ok(Event::default().event("state")
+                    .data(serde_json::to_string(&snapshot).unwrap_or_default()));
             }
-            if let Some(event) = emit_done_if_finished(&status).await {
-                // Drain any messages buffered after the status flipped.
-                while let Ok(entry) = rx.try_recv() {
-                    yield Ok(sse_event_from_entry(&entry));
-                }
+            // An upgrade stream waiting for the next process would itself
+            // hold graceful HTTP drain open until its forced timeout. The
+            // browser switches to status discovery across the restart gap.
+            if snapshot.status == UpgradeStatus::Restarting
+                && snapshot.phase == crate::admin::upgrade_task::UpgradePhase::Restarting
+            { break; }
+            if let Some(event) = emit_done_if_finished(snapshot.status) {
                 yield Ok(event);
                 break;
             }
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {},
+                result = receiver.recv() => {
+                    if matches!(result, Err(tokio::sync::broadcast::error::RecvError::Closed)) { break; }
+                }
+            }
         }
     };
-    Ok(axum::response::Sse::new(stream).keep_alive(
-        axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)),
-    ))
+    Ok(Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::new().interval(Duration::from_secs(15))))
 }
 
-async fn emit_done_if_finished(
-    status: &std::sync::Arc<tokio::sync::Mutex<UpgradeStatus>>,
-) -> Option<axum::response::sse::Event> {
-    let current = *status.lock().await;
-    if matches!(current, UpgradeStatus::Running) {
+fn emit_done_if_finished(status: UpgradeStatus) -> Option<Event> {
+    if !status.is_terminal() {
         return None;
     }
-    let payload = serde_json::json!({
-        "status": match current {
-            UpgradeStatus::Success => "success",
-            UpgradeStatus::Failed => "failed",
-            UpgradeStatus::Running => "running",
-        }
-    });
     Some(
-        axum::response::sse::Event::default()
+        Event::default()
             .event("done")
-            .data(serde_json::to_string(&payload).unwrap_or_default()),
+            .data(serde_json::json!({"status":status}).to_string()),
     )
 }
 
-fn sse_event_from_entry(entry: &UpgradeLogEntry) -> axum::response::sse::Event {
-    let data = serde_json::to_string(entry).unwrap_or_default();
-    axum::response::sse::Event::default()
+fn sse_event_from_entry(entry: &UpgradeLogEntry) -> Event {
+    Event::default()
+        .id(format!("{}:{}", entry.task_id, entry.seq))
         .event("log")
-        .data(data)
+        .data(serde_json::to_string(entry).unwrap_or_default())
 }
 
 #[derive(Debug, Deserialize)]

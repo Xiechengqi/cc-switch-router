@@ -25,6 +25,7 @@ pub struct BuildInfo {
     pub version: &'static str,
     pub commit: &'static str,
     pub build_time: &'static str,
+    pub upgrade_protocol_version: u32,
 }
 
 pub fn build_info() -> BuildInfo {
@@ -32,6 +33,7 @@ pub fn build_info() -> BuildInfo {
         version: env!("CARGO_PKG_VERSION"),
         commit: option_env!("GIT_COMMIT").unwrap_or("dev"),
         build_time: option_env!("BUILD_TIME").unwrap_or("unknown"),
+        upgrade_protocol_version: crate::admin::upgrade_task::UPGRADE_PROTOCOL_VERSION,
     }
 }
 

@@ -1,51 +1,70 @@
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
-use chrono::Utc;
 use futures_util::StreamExt;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use uuid::Uuid;
 
 use crate::admin::restart::{RestartStrategy, schedule_restart};
+use crate::admin::upgrade_task::{
+    UPGRADE_PROTOCOL_VERSION, UpgradeBuild, UpgradePhase, cancelled_error, load_snapshot,
+};
+pub use crate::admin::upgrade_task::{
+    UpgradeHandle, UpgradeLogEntry, UpgradeLogLevel, UpgradeStatus, UpgradeTaskSnapshot,
+};
 use crate::admin::version::{
     BINARY_INSTALL_PATH, BINARY_ROLLBACK_PATH, RELEASE_BINARY_URL, detect_service_status,
 };
 use crate::error::AppError;
 
-const LOG_CHANNEL_CAPACITY: usize = 256;
-const TOTAL_STEPS: usize = 7;
-const DOWNLOAD_BUFFER_TICK_BYTES: u64 = 256 * 1024;
 const SANITY_TIMEOUT: Duration = Duration::from_secs(5);
 const DATABASE_SANITY_TIMEOUT: Duration = Duration::from_secs(30);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(180);
+const RESTART_TIMEOUT: Duration = Duration::from_secs(300);
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum UpgradeLogLevel {
-    Info,
-    Progress,
-    Success,
-    Warn,
-    Error,
+/// Probe a wildcard listen address through loopback.
+fn loopback(mut address: std::net::SocketAddr) -> std::net::SocketAddr {
+    if address.ip().is_unspecified() {
+        address.set_ip(if address.is_ipv4() {
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        } else {
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        });
+    }
+    address
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpgradeLogEntry {
-    pub task_id: String,
-    pub step: usize,
-    pub total_steps: usize,
-    pub level: UpgradeLogLevel,
-    pub message: String,
-    pub progress: Option<u8>,
-    pub at: String,
+/// A bound listener accepts TCP connections into its backlog before the
+/// server runs; only the server's `SSH-` identification proves it serves.
+async fn ssh_banner_ready(address: std::net::SocketAddr) -> bool {
+    use tokio::io::AsyncReadExt;
+    let probe = async {
+        let mut stream = tokio::net::TcpStream::connect(address).await.ok()?;
+        let mut banner = [0u8; 4];
+        stream.read_exact(&mut banner).await.ok()?;
+        Some(&banner == b"SSH-")
+    };
+    matches!(
+        tokio::time::timeout(Duration::from_secs(2), probe).await,
+        Ok(Some(true))
+    )
+}
+
+/// A restarted process starts its revisions above any the previous process
+/// served, persisted or not (see `UpgradeHandle::update`).
+fn restarted_revision(saved: u64) -> u64 {
+    let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+    saved.saturating_add(1).max(now)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -56,30 +75,291 @@ pub struct RollbackResponse {
     pub backup_path: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum UpgradeStatus {
-    Running,
-    Success,
-    Failed,
-}
-
-#[derive(Clone)]
-pub struct UpgradeHandle {
-    pub task_id: String,
-    pub status: Arc<Mutex<UpgradeStatus>>,
-    pub sender: broadcast::Sender<UpgradeLogEntry>,
-    pub history: Arc<Mutex<Vec<UpgradeLogEntry>>>,
-}
-
-#[derive(Default)]
 pub struct UpgradeRegistry {
     inner: Mutex<Option<UpgradeHandle>>,
+    journal: Option<PathBuf>,
+    instance_id: String,
+    operation: Arc<Mutex<()>>,
+    maintenance_pending: Arc<AtomicBool>,
+    storage_fault: Arc<AtomicBool>,
+}
+
+pub struct ServiceActionGuard {
+    _guard: OwnedMutexGuard<()>,
+    maintenance_pending: Arc<AtomicBool>,
+}
+
+impl ServiceActionGuard {
+    pub fn restart_scheduled(&self) {
+        self.maintenance_pending.store(true, Ordering::SeqCst);
+        let pending = self.maintenance_pending.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(RESTART_TIMEOUT).await;
+            if pending.swap(false, Ordering::SeqCst) {
+                tracing::error!(
+                    "service restart deadline passed while the original process is still running"
+                );
+            }
+        });
+    }
 }
 
 impl UpgradeRegistry {
+    fn empty(journal: Option<PathBuf>) -> Self {
+        Self {
+            inner: Mutex::new(None),
+            journal,
+            instance_id: Uuid::new_v4().to_string(),
+            operation: Arc::new(Mutex::new(())),
+            maintenance_pending: Arc::default(),
+            storage_fault: Arc::default(),
+        }
+    }
+
+    #[cfg(test)]
     pub fn new() -> Self {
-        Self::default()
+        Self::empty(None)
+    }
+
+    pub async fn open(data_dir: &Path) -> Self {
+        let registry = Self::empty(Some(data_dir.join("upgrade/current.json")));
+        match load_snapshot(registry.journal.clone().expect("journal configured")).await {
+            Ok(Some(mut snapshot)) => {
+                // Writes that failed to persist still raised the revision a
+                // browser saw. Restart above any of them, so the states this
+                // process publishes are never discarded as stale.
+                snapshot.revision = restarted_revision(snapshot.revision);
+                let handle = UpgradeHandle::new(
+                    snapshot,
+                    registry.journal.clone(),
+                    registry.storage_fault.clone(),
+                );
+                *registry.inner.lock().await = Some(handle.clone());
+                if handle.snapshot().await.persistence_error {
+                    let _ = handle
+                        .update(|next| {
+                            next.persistence_error = false;
+                            next.append_log(
+                                UpgradeLogLevel::Warn,
+                                "upgrade journal is writable again after startup",
+                            );
+                            Ok(())
+                        })
+                        .await;
+                }
+                if !registry.storage_fault.load(Ordering::SeqCst) {
+                    registry.recover(&handle).await;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                // A corrupt journal must fence maintenance, not prevent the
+                // Router from serving existing users and diagnostics.
+                tracing::error!(%error, "upgrade journal recovery failed; service operations are fenced");
+                registry.storage_fault.store(true, Ordering::SeqCst);
+            }
+        }
+        registry
+    }
+
+    async fn recover(&self, handle: &UpgradeHandle) {
+        let snapshot = handle.snapshot().await;
+        if snapshot.status.is_terminal() {
+            return;
+        }
+        let cleanup = remove_task_staging(&handle.task_id).await;
+        if snapshot.phase.cancellable() {
+            if let Err(error) = cleanup {
+                handle
+                    .finish(
+                        UpgradeStatus::Failed,
+                        Some(error.to_string()),
+                        &error.to_string(),
+                    )
+                    .await;
+                return;
+            }
+            let status = if snapshot.status == UpgradeStatus::Cancelling {
+                UpgradeStatus::Cancelled
+            } else {
+                UpgradeStatus::Interrupted
+            };
+            handle
+                .finish(
+                    status,
+                    None,
+                    "previous process stopped before installation; staged download removed",
+                )
+                .await;
+            return;
+        }
+        let running_sha = sha256_of_file(&running_executable(), &CancellationToken::new()).await;
+        let target_running = snapshot.target_sha256.is_some()
+            && running_sha.as_ref().ok() == snapshot.target_sha256.as_ref();
+        let replaced = if snapshot.binary_replaced || target_running {
+            true
+        } else {
+            let installed_sha =
+                sha256_of_file(Path::new(BINARY_INSTALL_PATH), &CancellationToken::new()).await;
+            snapshot.target_sha256.is_some()
+                && installed_sha.as_ref().ok() == snapshot.target_sha256.as_ref()
+        };
+        // Recover the irreversible rename fact even if a leftover file cannot
+        // be removed. Cleanup failures must not claim the old binary was kept.
+        if replaced && !snapshot.binary_replaced {
+            if let Err(error) = handle
+                .update(|next| {
+                    next.binary_replaced = true;
+                    Ok(())
+                })
+                .await
+            {
+                tracing::error!(%error, "persist recovered installation fact failed");
+                return;
+            }
+        }
+        if let Err(error) = cleanup {
+            handle
+                .finish(
+                    UpgradeStatus::Failed,
+                    Some(error.to_string()),
+                    &error.to_string(),
+                )
+                .await;
+            return;
+        }
+        if target_running && snapshot.source_instance_id != self.instance_id {
+            if let Err(error) =
+                handle
+                    .update(|next| {
+                        next.status = UpgradeStatus::Restarting;
+                        next.phase = UpgradePhase::Verifying;
+                        next.progress = None;
+                        next.append_log(UpgradeLogLevel::Info,
+                    "target binary is running; waiting for HTTP, SSH and database readiness");
+                        Ok(())
+                    })
+                    .await
+            {
+                tracing::error!(%error, "persist recovered upgrade failed");
+            }
+        } else {
+            handle
+                .finish(
+                    UpgradeStatus::Interrupted,
+                    Some("the process restarted without the expected target binary".into()),
+                    "upgrade recovery could not confirm the expected target binary",
+                )
+                .await;
+        }
+    }
+
+    /// Called only after both listeners have been bound and the HTTP/SSH tasks
+    /// started. The loopback probes must reach this new process: HTTP with a
+    /// healthy DB, and SSH answering with its identification banner.
+    ///
+    /// Gives up after `RESTART_TIMEOUT`: a task left verifying would block
+    /// restart and rollback, the very actions that repair a bad binary.
+    pub async fn confirm_after_startup(
+        &self,
+        address: std::net::SocketAddr,
+        ssh_address: std::net::SocketAddr,
+    ) -> Result<(), AppError> {
+        self.confirm_after_startup_within(address, ssh_address, RESTART_TIMEOUT)
+            .await
+    }
+
+    async fn confirm_after_startup_within(
+        &self,
+        address: std::net::SocketAddr,
+        ssh_address: std::net::SocketAddr,
+        deadline: Duration,
+    ) -> Result<(), AppError> {
+        let Some(handle) = self.current().await else {
+            return Ok(());
+        };
+        let snapshot = handle.snapshot().await;
+        if snapshot.phase != UpgradePhase::Verifying
+            || snapshot.status != UpgradeStatus::Restarting
+            || snapshot.source_instance_id == self.instance_id
+            || self.storage_fault.load(Ordering::SeqCst)
+        {
+            return Ok(());
+        }
+        let address = loopback(address);
+        let ssh_address = loopback(ssh_address);
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .map_err(|error| {
+                AppError::Internal(format!("upgrade readiness client failed: {error}"))
+            })?;
+        let url = format!("http://{address}/v1/healthz");
+        let give_up = tokio::time::Instant::now() + deadline;
+        let mut http_ready = false;
+        let mut ssh_ready = false;
+        loop {
+            if !http_ready {
+                http_ready = client
+                    .get(&url)
+                    .send()
+                    .await
+                    .is_ok_and(|response| response.status().is_success());
+            }
+            if !ssh_ready {
+                ssh_ready = ssh_banner_ready(ssh_address).await;
+            }
+            if http_ready && ssh_ready {
+                handle
+                    .finish(
+                        UpgradeStatus::Success,
+                        None,
+                        "target process restarted successfully; HTTP, SSH and database are ready",
+                    )
+                    .await;
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= give_up {
+                let pending = match (http_ready, ssh_ready) {
+                    (false, false) => "HTTP/database and SSH",
+                    (false, true) => "HTTP/database",
+                    _ => "SSH",
+                };
+                let reason = format!(
+                    "the new process did not report {pending} readiness within {}s; the new binary is installed, restart or roll back after checking the service log",
+                    deadline.as_secs()
+                );
+                handle
+                    .finish(UpgradeStatus::Failed, Some(reason.clone()), &reason)
+                    .await;
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+
+    pub async fn reserve_service_action(&self) -> Result<ServiceActionGuard, AppError> {
+        let guard = self
+            .operation
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| busy_error())?;
+        if self.storage_fault.load(Ordering::SeqCst) {
+            return Err(journal_unavailable_error());
+        }
+        if self.maintenance_pending.load(Ordering::SeqCst) {
+            return Err(busy_error());
+        }
+        if let Some(handle) = self.current().await {
+            if !handle.snapshot().await.status.is_terminal() {
+                return Err(busy_error());
+            }
+        }
+        Ok(ServiceActionGuard {
+            _guard: guard,
+            maintenance_pending: self.maintenance_pending.clone(),
+        })
     }
 
     pub async fn start(
@@ -87,34 +367,57 @@ impl UpgradeRegistry {
         client: reqwest::Client,
         actor: Option<String>,
     ) -> Result<UpgradeHandle, AppError> {
-        let mut guard = self.inner.lock().await;
-        if let Some(handle) = guard.as_ref() {
-            let status = *handle.status.lock().await;
-            if matches!(status, UpgradeStatus::Running) {
-                return Err(AppError::Conflict(
-                    "an upgrade is already in progress".into(),
-                ));
-            }
-        }
-        let task_id = Uuid::new_v4().to_string();
-        let (tx, _rx) = broadcast::channel(LOG_CHANNEL_CAPACITY);
-        let handle = UpgradeHandle {
-            task_id: task_id.clone(),
-            status: Arc::new(Mutex::new(UpgradeStatus::Running)),
-            sender: tx,
-            history: Arc::new(Mutex::new(Vec::new())),
-        };
-        *guard = Some(handle.clone());
-        drop(guard);
-
-        let handle_for_task = handle.clone();
+        let operation = self.reserve_service_action().await?;
+        let mut current = self.inner.lock().await;
+        let handle = UpgradeHandle::new(
+            UpgradeTaskSnapshot::new(&self.instance_id, actor),
+            self.journal.clone(),
+            self.storage_fault.clone(),
+        );
+        handle
+            .update(|next| {
+                next.append_log(
+                    UpgradeLogLevel::Info,
+                    format!("upgrade requested by {}", next.actor),
+                );
+                Ok(())
+            })
+            .await?;
+        *current = Some(handle.clone());
+        drop(current);
+        let worker = handle.clone();
         tokio::spawn(async move {
-            let outcome = run_upgrade(client, &handle_for_task, actor).await;
-            let mut status_guard = handle_for_task.status.lock().await;
-            *status_guard = match outcome {
-                Ok(()) => UpgradeStatus::Success,
-                Err(_) => UpgradeStatus::Failed,
-            };
+            let _operation = operation;
+            let outcome = run_upgrade(client, &worker).await;
+            let cleanup = remove_task_staging(&worker.task_id).await;
+            let outcome = cleanup.and(outcome);
+            if let Err(error) = outcome {
+                let cancelled = worker.cancel.is_cancelled()
+                    && !worker.storage_fault.load(Ordering::SeqCst)
+                    && error.code() != Some("UPGRADE_CLEANUP_FAILED");
+                if cancelled {
+                    worker.finish(UpgradeStatus::Cancelled, None, "upgrade interrupted; temporary files removed; current binary was not replaced").await;
+                } else {
+                    worker
+                        .finish(
+                            UpgradeStatus::Failed,
+                            Some(error.to_string()),
+                            &format!("upgrade failed: {error}"),
+                        )
+                        .await;
+                }
+            } else {
+                // If this task is still alive after the restart deadline, the
+                // original process demonstrably never handed over to a new one.
+                tokio::spawn(async move {
+                    tokio::time::sleep(RESTART_TIMEOUT).await;
+                    if worker.snapshot().await.status == UpgradeStatus::Restarting {
+                        worker.finish(UpgradeStatus::Failed,
+                            Some("the original process is still running after the restart deadline".into()),
+                            "new binary was installed but restart was not completed").await;
+                    }
+                });
+            }
         });
         Ok(handle)
     }
@@ -122,428 +425,580 @@ impl UpgradeRegistry {
     pub async fn current(&self) -> Option<UpgradeHandle> {
         self.inner.lock().await.clone()
     }
-}
 
-async fn emit(
-    handle: &UpgradeHandle,
-    step: usize,
-    level: UpgradeLogLevel,
-    message: impl Into<String>,
-    progress: Option<u8>,
-) {
-    let entry = UpgradeLogEntry {
-        task_id: handle.task_id.clone(),
-        step,
-        total_steps: TOTAL_STEPS,
-        level,
-        message: message.into(),
-        progress,
-        at: Utc::now().to_rfc3339(),
-    };
-    handle.history.lock().await.push(entry.clone());
-    // Ignore receiver-gone errors; history covers late subscribers.
-    let _ = handle.sender.send(entry);
-}
-
-async fn run_upgrade(
-    client: reqwest::Client,
-    handle: &UpgradeHandle,
-    actor: Option<String>,
-) -> Result<(), AppError> {
-    let actor = actor.unwrap_or_else(|| "unknown".to_string());
-    emit(
-        handle,
-        1,
-        UpgradeLogLevel::Info,
-        format!("upgrade requested by {actor}"),
-        Some(progress_pct(1, 0)),
-    )
-    .await;
-
-    // 1) tmp file beside the install target. Staging in the same directory
-    // as BINARY_INSTALL_PATH guarantees the final rename(2) is intra-fs and
-    // cannot fail with EXDEV — common on hosts where /tmp is tmpfs while
-    // /usr/local/bin lives on the root volume.
-    let target = Path::new(BINARY_INSTALL_PATH);
-    let target_parent = match target.parent() {
-        Some(p) => p.to_path_buf(),
-        None => {
-            emit(
-                handle,
-                1,
-                UpgradeLogLevel::Error,
-                format!("install target has no parent: {}", target.display()),
-                None,
-            )
-            .await;
-            return Err(AppError::Internal(format!(
-                "install target has no parent: {}",
-                target.display()
-            )));
+    pub async fn cancel(&self, task_id: &str) -> Result<UpgradeTaskSnapshot, AppError> {
+        // Keep cancellation atomic with publication of a new task; an older
+        // cancellation must never overwrite the new task's journal.
+        let current = self.inner.lock().await;
+        let handle = current
+            .as_ref()
+            .ok_or_else(|| AppError::NotFound("no upgrade task exists".into()))?;
+        if handle.task_id != task_id {
+            return Err(AppError::coded_conflict(
+                "UPGRADE_TASK_CHANGED",
+                "the upgrade task has changed",
+                serde_json::json!({"taskId": handle.task_id}),
+            ));
         }
-    };
-    if let Err(err) = std::fs::create_dir_all(&target_parent) {
-        emit(
-            handle,
-            1,
-            UpgradeLogLevel::Error,
-            format!("ensure install dir failed: {err}"),
-            None,
-        )
-        .await;
-        return Err(AppError::Internal(format!(
-            "ensure install dir failed: {err}"
-        )));
+        handle.cancel().await
     }
-    let tmp_path = target_parent.join(format!("cc-switch-router.upgrade-{}", handle.task_id));
-    emit(
-        handle,
-        1,
-        UpgradeLogLevel::Success,
-        format!("staging in {}", target_parent.display()),
-        Some(progress_pct(1, 100)),
-    )
-    .await;
 
-    // 2) download
-    emit(
-        handle,
-        2,
-        UpgradeLogLevel::Info,
-        format!("downloading {RELEASE_BINARY_URL}"),
-        Some(progress_pct(2, 0)),
-    )
-    .await;
-    let bytes_written =
-        match download_with_progress(&client, RELEASE_BINARY_URL, &tmp_path, handle).await {
-            Ok(n) => n,
-            Err(err) => {
-                cleanup_tmp(&tmp_path);
-                emit(
-                    handle,
-                    2,
-                    UpgradeLogLevel::Error,
-                    format!("download failed: {err}"),
-                    None,
-                )
-                .await;
-                return Err(err);
-            }
+    pub async fn snapshot(
+        &self,
+        task_id: Option<&str>,
+    ) -> Result<Option<UpgradeTaskSnapshot>, AppError> {
+        if self.storage_fault.load(Ordering::SeqCst) && self.current().await.is_none() {
+            return Err(journal_unavailable_error());
+        }
+        let Some(handle) = self.current().await else {
+            return Ok(None);
         };
-    emit(
-        handle,
-        2,
-        UpgradeLogLevel::Success,
-        format!("downloaded {bytes_written} bytes"),
-        Some(progress_pct(2, 100)),
-    )
-    .await;
-
-    // 3) chmod +x + sanity
-    if let Err(err) = chmod_exec(&tmp_path) {
-        cleanup_tmp(&tmp_path);
-        emit(
-            handle,
-            3,
-            UpgradeLogLevel::Error,
-            format!("chmod failed: {err}"),
-            None,
-        )
-        .await;
-        return Err(err);
-    }
-    if let Err(err) = sanity_exec(&tmp_path, true).await {
-        cleanup_tmp(&tmp_path);
-        emit(
-            handle,
-            3,
-            UpgradeLogLevel::Error,
-            format!("sanity check failed: {err}"),
-            None,
-        )
-        .await;
-        return Err(err);
-    }
-    emit(
-        handle,
-        3,
-        UpgradeLogLevel::Success,
-        "binary passed executable and database compatibility checks",
-        Some(progress_pct(3, 100)),
-    )
-    .await;
-
-    // 4) sha256
-    let new_sha = match sha256_of_file(&tmp_path) {
-        Ok(v) => v,
-        Err(err) => {
-            cleanup_tmp(&tmp_path);
-            emit(
-                handle,
-                4,
-                UpgradeLogLevel::Error,
-                format!("sha256 failed: {err}"),
-                None,
-            )
-            .await;
-            return Err(err);
+        if task_id.is_some_and(|expected| expected != handle.task_id) {
+            return Err(AppError::NotFound(
+                "upgrade task id does not match the current task".into(),
+            ));
         }
-    };
-    let current_sha = sha256_of_file(Path::new(BINARY_INSTALL_PATH)).ok();
-    emit(
-        handle,
-        4,
-        UpgradeLogLevel::Info,
-        format!(
-            "new sha256: {new_sha}; current: {}",
-            current_sha.as_deref().unwrap_or("(missing)")
-        ),
-        Some(progress_pct(4, 100)),
-    )
-    .await;
-    if current_sha.as_deref() == Some(new_sha.as_str()) {
-        emit(
-            handle,
-            4,
-            UpgradeLogLevel::Warn,
-            "downloaded binary matches the running one; restart will still pick up env changes",
-            None,
-        )
-        .await;
-    }
-
-    // 5) backup + atomic swap
-    let bak_path = BINARY_ROLLBACK_PATH.to_string();
-    let swap_result = swap_binary(&tmp_path, target, Path::new(&bak_path));
-    cleanup_tmp(&tmp_path);
-    if let Err(err) = swap_result {
-        emit(
-            handle,
-            5,
-            UpgradeLogLevel::Error,
-            format!("swap failed: {err}"),
-            None,
-        )
-        .await;
-        return Err(err);
-    }
-    emit(
-        handle,
-        5,
-        UpgradeLogLevel::Success,
-        format!("installed new binary at {BINARY_INSTALL_PATH} (backup at {bak_path})"),
-        Some(progress_pct(5, 100)),
-    )
-    .await;
-
-    // 6) restart
-    let manager = detect_service_status().manager;
-    let strategy = RestartStrategy::from_manager(manager);
-    emit(
-        handle,
-        6,
-        UpgradeLogLevel::Info,
-        format!("triggering restart via {} mode", strategy.label()),
-        Some(progress_pct(6, 30)),
-    )
-    .await;
-    let restart_script = match schedule_restart(strategy) {
-        Ok(script) => script,
-        Err(err) => {
-            emit(
-                handle,
-                6,
-                UpgradeLogLevel::Error,
-                format!("restart spawn failed: {err}"),
-                None,
-            )
-            .await;
-            return Err(err);
+        let mut snapshot = handle.snapshot().await;
+        if self.storage_fault.load(Ordering::SeqCst) {
+            // An initial write for a new task may fail before publication,
+            // leaving an older result as current. Still expose the global fence.
+            snapshot.persistence_error = true;
+            snapshot.can_cancel = false;
         }
-    };
-    emit(
-        handle,
-        6,
-        UpgradeLogLevel::Success,
-        format!("restart scheduled: {restart_script}"),
-        Some(progress_pct(6, 100)),
-    )
-    .await;
+        Ok(Some(snapshot))
+    }
+}
 
-    // 7) hand off
-    emit(
-        handle,
-        7,
-        UpgradeLogLevel::Success,
-        "process will exit shortly; dashboard should reload once health probe succeeds",
-        Some(progress_pct(7, 100)),
+fn busy_error() -> AppError {
+    AppError::coded_conflict(
+        "SERVICE_OPERATION_IN_PROGRESS",
+        "a service operation is already in progress",
+        serde_json::json!({}),
     )
-    .await;
+}
+
+fn journal_unavailable_error() -> AppError {
+    AppError::Coded { status: axum::http::StatusCode::SERVICE_UNAVAILABLE, code: "UPGRADE_JOURNAL_UNAVAILABLE",
+        message: "upgrade state could not be recovered; inspect the Router service log before another operation".into(), details: serde_json::json!({}) }
+}
+
+fn staging_path(task_id: &str) -> PathBuf {
+    Path::new(BINARY_INSTALL_PATH).with_file_name(format!("cc-switch-router.upgrade-{task_id}"))
+}
+
+fn backup_staging_path(task_id: &str) -> PathBuf {
+    Path::new(BINARY_INSTALL_PATH).with_file_name(format!("cc-switch-router.backup-{task_id}"))
+}
+
+struct StagingFile(PathBuf);
+impl Drop for StagingFile {
+    fn drop(&mut self) {
+        cleanup_tmp(&self.0);
+    }
+}
+
+async fn run_upgrade(client: reqwest::Client, handle: &UpgradeHandle) -> Result<(), AppError> {
+    let target = Path::new(BINARY_INSTALL_PATH);
+    let parent = target
+        .parent()
+        .ok_or_else(|| AppError::Internal("binary install path has no parent".into()))?;
+    tokio::fs::create_dir_all(parent).await.map_err(io_error)?;
+    let staging = StagingFile(staging_path(&handle.task_id));
+    handle.check_cancelled()?;
+    handle
+        .phase(
+            UpgradePhase::Downloading,
+            "downloading the latest Router binary",
+        )
+        .await?;
+    download_with_progress(&client, &staging.0, handle).await?;
+
+    handle
+        .phase(
+            UpgradePhase::Validating,
+            "checking executable, upgrade protocol and database compatibility",
+        )
+        .await?;
+    chmod_exec(&staging.0)?;
+    run_check(&staging.0, "--help", SANITY_TIMEOUT, &handle.cancel).await?;
+    let build_output = run_check(&staging.0, "build-info", SANITY_TIMEOUT, &handle.cancel).await?;
+    let build: UpgradeBuild = serde_json::from_slice(&build_output)
+        .map_err(|error| AppError::Internal(format!("invalid target build info: {error}")))?;
+    if build.upgrade_protocol_version != UPGRADE_PROTOCOL_VERSION {
+        return Err(AppError::Conflict("the release binary does not support resumable Router upgrades; the current binary was not replaced".into()));
+    }
+    run_check(
+        &staging.0,
+        "check-db",
+        DATABASE_SANITY_TIMEOUT,
+        &handle.cancel,
+    )
+    .await?;
+    handle
+        .update(|next| {
+            next.target = Some(build);
+            next.append_log(
+                UpgradeLogLevel::Success,
+                "binary and database compatibility checks passed",
+            );
+            Ok(())
+        })
+        .await?;
+
+    handle
+        .phase(UpgradePhase::Hashing, "computing target binary SHA-256")
+        .await?;
+    let sha = sha256_of_file(&staging.0, &handle.cancel).await?;
+    handle
+        .update(|next| {
+            next.target_sha256 = Some(sha);
+            Ok(())
+        })
+        .await?;
+
+    // This durable transition and cancellation acceptance share one mutex.
+    // Once it succeeds, no later cancel request can stop installation/restart.
+    handle
+        .phase(
+            UpgradePhase::Installing,
+            "installing the new binary and preserving the rollback backup",
+        )
+        .await?;
+    let new_path = staging.0.clone();
+    let install_path = target.to_path_buf();
+    let task_id = handle.task_id.clone();
+    tokio::task::spawn_blocking(move || {
+        swap_binary(
+            &new_path,
+            &install_path,
+            Path::new(BINARY_ROLLBACK_PATH),
+            &task_id,
+        )
+    })
+    .await
+    .map_err(io_error)??;
+    handle
+        .update(|next| {
+            next.binary_replaced = true;
+            next.append_log(
+                UpgradeLogLevel::Success,
+                "new binary installed; rollback backup preserved",
+            );
+            Ok(())
+        })
+        .await?;
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(io_error)?;
+
+    let strategy = RestartStrategy::from_manager(detect_service_status().manager);
+    // Persist handoff *before* spawning a detached restart child. Never label
+    // a successful spawn as a successful upgrade.
+    handle
+        .update(|next| {
+            next.status = UpgradeStatus::Restarting;
+            next.phase = UpgradePhase::Restarting;
+            next.progress = None;
+            next.append_log(
+                UpgradeLogLevel::Info,
+                format!(
+                    "scheduling restart via {}; waiting for the new process",
+                    strategy.label()
+                ),
+            );
+            Ok(())
+        })
+        .await?;
+    schedule_restart(strategy)?;
     Ok(())
 }
 
 async fn download_with_progress(
     client: &reqwest::Client,
-    url: &str,
     target: &Path,
     handle: &UpgradeHandle,
-) -> Result<u64, AppError> {
-    let response = client
-        .get(url)
+) -> Result<(), AppError> {
+    let request = client
+        .get(RELEASE_BINARY_URL)
         .timeout(DOWNLOAD_TIMEOUT)
-        .send()
-        .await
-        .map_err(|err| AppError::Internal(format!("download request failed: {err}")))?;
+        .send();
+    let response = tokio::select! {
+        biased;
+        _ = handle.cancel.cancelled() => return Err(cancelled_error()),
+        response = request => response.map_err(|error| AppError::Internal(format!("download request failed: {error}")))?,
+    };
     if !response.status().is_success() {
         return Err(AppError::Internal(format!(
             "download HTTP {}",
             response.status()
         )));
     }
-    let total = response.content_length();
-    let mut file = tokio::fs::File::create(target)
-        .await
-        .map_err(|err| AppError::Internal(format!("open tmp file failed: {err}")))?;
+    let total = response.content_length().filter(|total| *total > 0);
+    handle
+        .update(|next| {
+            next.total_bytes = total;
+            Ok(())
+        })
+        .await?;
+    let mut file = tokio::fs::File::create(target).await.map_err(io_error)?;
     let mut stream = response.bytes_stream();
-    let mut downloaded: u64 = 0;
-    let mut next_tick: u64 = DOWNLOAD_BUFFER_TICK_BYTES;
-    while let Some(chunk) = stream.next().await {
+    let mut downloaded = 0;
+    let mut last_tick = Instant::now();
+    loop {
+        let chunk = tokio::select! {
+            biased;
+            _ = handle.cancel.cancelled() => return Err(cancelled_error()),
+            chunk = stream.next() => chunk,
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
         let chunk =
-            chunk.map_err(|err| AppError::Internal(format!("download chunk failed: {err}")))?;
-        file.write_all(&chunk)
-            .await
-            .map_err(|err| AppError::Internal(format!("write tmp failed: {err}")))?;
+            chunk.map_err(|error| AppError::Internal(format!("download chunk failed: {error}")))?;
+        tokio::select! {
+            biased;
+            _ = handle.cancel.cancelled() => return Err(cancelled_error()),
+            result = file.write_all(&chunk) => result.map_err(io_error)?,
+        }
         downloaded += chunk.len() as u64;
-        if downloaded >= next_tick {
-            next_tick = downloaded + DOWNLOAD_BUFFER_TICK_BYTES;
-            let pct = match total {
-                Some(t) if t > 0 => {
-                    Some(((downloaded as f64 / t as f64) * 100.0).clamp(0.0, 100.0) as u8)
-                }
-                _ => None,
-            };
-            let msg = match total {
-                Some(t) => format!(
-                    "downloaded {:.1} MiB / {:.1} MiB",
-                    downloaded as f64 / 1024.0 / 1024.0,
-                    t as f64 / 1024.0 / 1024.0
-                ),
-                None => format!("downloaded {:.1} MiB", downloaded as f64 / 1024.0 / 1024.0),
-            };
-            emit(handle, 2, UpgradeLogLevel::Progress, msg, pct).await;
+        if last_tick.elapsed() >= Duration::from_secs(1) {
+            record_download(handle, downloaded, total).await?;
+            last_tick = Instant::now();
         }
     }
-    file.flush()
-        .await
-        .map_err(|err| AppError::Internal(format!("flush tmp failed: {err}")))?;
-    Ok(downloaded)
+    handle.check_cancelled()?;
+    file.flush().await.map_err(io_error)?;
+    file.sync_all().await.map_err(io_error)?;
+    if downloaded == 0 {
+        return Err(AppError::Internal("downloaded binary is empty".into()));
+    }
+    record_download(handle, downloaded, total).await
+}
+
+async fn record_download(
+    handle: &UpgradeHandle,
+    downloaded: u64,
+    total: Option<u64>,
+) -> Result<(), AppError> {
+    handle
+        .update(|next| {
+            next.downloaded_bytes = downloaded;
+            next.total_bytes = total;
+            next.progress = total
+                .map(|total| ((downloaded as f64 / total as f64) * 100.0).clamp(0.0, 100.0) as u8);
+            next.append_log(
+                UpgradeLogLevel::Progress,
+                match total {
+                    Some(total) => format!(
+                        "downloaded {:.1} MiB / {:.1} MiB",
+                        downloaded as f64 / 1048576.0,
+                        total as f64 / 1048576.0
+                    ),
+                    None => format!("downloaded {:.1} MiB", downloaded as f64 / 1048576.0),
+                },
+            );
+            Ok(())
+        })
+        .await?;
+    Ok(())
 }
 
 fn chmod_exec(path: &Path) -> Result<(), AppError> {
-    let mut perms = std::fs::metadata(path)
-        .map_err(|err| AppError::Internal(format!("stat tmp failed: {err}")))?
-        .permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(path, perms)
-        .map_err(|err| AppError::Internal(format!("chmod failed: {err}")))
+    let mut permissions = std::fs::metadata(path).map_err(io_error)?.permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).map_err(io_error)
 }
 
-async fn sanity_exec(path: &Path, check_database: bool) -> Result<(), AppError> {
-    let output = tokio::time::timeout(SANITY_TIMEOUT, Command::new(path).arg("--help").output())
-        .await
-        .map_err(|_| AppError::Internal("sanity --help timed out".into()))?
-        .map_err(|err| AppError::Internal(format!("sanity exec failed: {err}")))?;
-    if !output.status.success() {
-        return Err(AppError::Internal(format!(
-            "sanity --help exited with status {}",
-            output.status
-        )));
+async fn read_output(pipe: Option<impl AsyncRead + Unpin>) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    if let Some(pipe) = pipe {
+        pipe.take(64 * 1024).read_to_end(&mut bytes).await?;
     }
-    if check_database {
-        let output = tokio::time::timeout(
-            DATABASE_SANITY_TIMEOUT,
-            Command::new(path).arg("check-db").output(),
-        )
-        .await
-        .map_err(|_| AppError::Internal("sanity check-db timed out".into()))?
-        .map_err(|err| AppError::Internal(format!("sanity check-db exec failed: {err}")))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(AppError::Internal(format!(
-                "sanity check-db exited with status {}: {}",
-                output.status,
-                stderr.trim()
-            )));
-        }
+    Ok(bytes)
+}
+
+async fn run_check(
+    path: &Path,
+    argument: &str,
+    deadline: Duration,
+    cancel: &CancellationToken,
+) -> Result<Vec<u8>, AppError> {
+    if cancel.is_cancelled() {
+        return Err(cancelled_error());
     }
-    Ok(())
-}
-
-fn sha256_of_file(path: &Path) -> Result<String, AppError> {
-    let mut hasher = Sha256::new();
-    let mut file = std::fs::File::open(path)
-        .map_err(|err| AppError::Internal(format!("open for sha256 failed: {err}")))?;
-    std::io::copy(&mut file, &mut hasher)
-        .map_err(|err| AppError::Internal(format!("read for sha256 failed: {err}")))?;
-    Ok(hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect())
-}
-
-fn swap_binary(new_path: &Path, target: &Path, bak: &Path) -> Result<(), AppError> {
-    if target.exists() {
-        if bak.exists() {
-            let _ = std::fs::remove_file(bak);
-        }
-        std::fs::rename(target, bak)
-            .map_err(|err| AppError::Internal(format!("backup current binary failed: {err}")))?;
-    }
-    if let Err(err) = std::fs::rename(new_path, target) {
-        // Try to restore the backup so the service stays alive.
-        if bak.exists() {
-            let _ = std::fs::rename(bak, target);
-        }
-        return Err(AppError::Internal(format!(
-            "install new binary failed: {err}"
-        )));
-    }
-    Ok(())
-}
-
-fn cleanup_tmp(file: &Path) {
-    if let Err(err) = std::fs::remove_file(file) {
-        if !matches!(err.kind(), std::io::ErrorKind::NotFound) {
-            warn!(path = %file.display(), error = %err, "cleanup tmp upgrade file failed");
-        }
-    }
-}
-
-fn progress_pct(step: usize, within_step: u8) -> u8 {
-    let base = (step.saturating_sub(1) * 100 / TOTAL_STEPS) as u32;
-    let inc = (within_step as u32) * 100 / (TOTAL_STEPS as u32) / 100;
-    base.saturating_add(inc).min(100) as u8
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn progress_pct_monotonic() {
-        let mut last = 0u8;
-        for step in 1..=TOTAL_STEPS {
-            for pct in [0u8, 50, 100] {
-                let p = progress_pct(step, pct);
-                assert!(p >= last, "step {step} pct {pct}: {p} < {last}");
-                last = p;
+    let mut child = Command::new(path)
+        .arg(argument)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(io_error)?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let result = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => None,
+        result = tokio::time::timeout(deadline, async {
+            tokio::try_join!(child.wait(), read_output(stdout), read_output(stderr))
+        }) => Some(result),
+    };
+    match result {
+        Some(Ok(Ok((status, output, _)))) if status.success() => Ok(output),
+        Some(Ok(Ok((status, _, error)))) => Err(AppError::Internal(format!(
+            "{argument} exited with {status}: {}",
+            String::from_utf8_lossy(&error).trim()
+        ))),
+        other => {
+            // timeout/drop alone does not reliably reap a Tokio child. Both
+            // cancellation and deadline paths explicitly kill and wait.
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            match other {
+                None => Err(cancelled_error()),
+                Some(Err(_)) => Err(AppError::Internal(format!("{argument} timed out"))),
+                Some(Ok(Err(error))) => Err(io_error(error)),
+                _ => unreachable!(),
             }
         }
     }
 }
 
+async fn sanity_exec(path: &Path, check_database: bool) -> Result<(), AppError> {
+    let token = CancellationToken::new();
+    run_check(path, "--help", SANITY_TIMEOUT, &token).await?;
+    if check_database {
+        run_check(path, "check-db", DATABASE_SANITY_TIMEOUT, &token).await?;
+    }
+    Ok(())
+}
+
+async fn sha256_of_file(path: &Path, cancel: &CancellationToken) -> Result<String, AppError> {
+    let mut file = tokio::fs::File::open(path).await.map_err(io_error)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        let count = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(cancelled_error()),
+            result = file.read(&mut buffer) => result.map_err(io_error)?,
+        };
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn running_executable() -> PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        PathBuf::from("/proc/self/exe")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::env::current_exe().unwrap_or_else(|_| PathBuf::from(BINARY_INSTALL_PATH))
+    }
+}
+
+fn swap_binary(
+    new_path: &Path,
+    target: &Path,
+    backup: &Path,
+    task_id: &str,
+) -> Result<(), AppError> {
+    // Copy the old executable to a staged backup, then atomically replace each
+    // path. There is never a gap in which the install target is missing.
+    let staged_backup = StagingFile(backup_staging_path(task_id));
+    if target.exists() {
+        std::fs::copy(target, &staged_backup.0).map_err(io_error)?;
+        std::fs::File::open(&staged_backup.0)
+            .and_then(|file| file.sync_all())
+            .map_err(io_error)?;
+        std::fs::rename(&staged_backup.0, backup).map_err(io_error)?;
+        if let Some(parent) = backup.parent() {
+            std::fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(io_error)?;
+        }
+    }
+    std::fs::rename(new_path, target).map_err(io_error)
+}
+
+fn cleanup_tmp(file: &Path) {
+    if let Err(error) = std::fs::remove_file(file) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            warn!(path = %file.display(), %error, "cleanup upgrade file failed");
+        }
+    }
+}
+
+async fn remove_staging(path: &Path) -> Result<(), AppError> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(AppError::coded_conflict(
+            "UPGRADE_CLEANUP_FAILED",
+            format!("upgrade stopped but the staged file could not be removed: {error}"),
+            serde_json::json!({}),
+        )),
+    }
+}
+
+async fn remove_task_staging(task_id: &str) -> Result<(), AppError> {
+    let download = remove_staging(&staging_path(task_id)).await;
+    let backup = remove_staging(&backup_staging_path(task_id)).await;
+    download.and(backup)
+}
+
+fn io_error(error: impl std::fmt::Display) -> AppError {
+    AppError::Internal(format!("upgrade I/O: {error}"))
+}
+
 pub type SharedUpgradeRegistry = Arc<UpgradeRegistry>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A loopback port nothing listens on: probes are refused at once.
+    async fn closed_port() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        address
+    }
+
+    #[tokio::test]
+    async fn a_process_that_never_becomes_ready_fails_and_unblocks_rollback() {
+        let registry = UpgradeRegistry::new();
+        let mut snapshot = UpgradeTaskSnapshot::new("old-boot", None);
+        snapshot.status = UpgradeStatus::Restarting;
+        snapshot.phase = UpgradePhase::Verifying;
+        snapshot.binary_replaced = true;
+        *registry.inner.lock().await = Some(UpgradeHandle::new(snapshot, None, Arc::default()));
+        assert!(registry.reserve_service_action().await.is_err());
+
+        let (http, ssh) = (closed_port().await, closed_port().await);
+        registry
+            .confirm_after_startup_within(http, ssh, Duration::ZERO)
+            .await
+            .unwrap();
+        let task = registry.current().await.unwrap().snapshot().await;
+        assert_eq!(task.status, UpgradeStatus::Failed);
+        assert!(task.binary_replaced, "rollback needs the installed fact");
+        assert!(task.error.unwrap().contains("HTTP/database and SSH"));
+        assert!(registry.reserve_service_action().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn ssh_readiness_needs_the_server_banner_not_just_a_bound_port() {
+        // Bound but never accepting: the kernel backlog completes the TCP
+        // handshake, yet no SSH server speaks.
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        assert!(!ssh_banner_ready(silent.local_addr().unwrap()).await);
+        assert!(!ssh_banner_ready(closed_port().await).await);
+
+        let serving = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = serving.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let (mut socket, _) = serving.accept().await.unwrap();
+            socket.write_all(b"SSH-2.0-test\r\n").await.unwrap();
+        });
+        assert!(ssh_banner_ready(address).await);
+    }
+
+    #[test]
+    fn a_restarted_process_never_reuses_a_served_revision() {
+        assert!(restarted_revision(7) > 7);
+        assert_eq!(restarted_revision(u64::MAX - 1), u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn service_actions_share_the_upgrade_exclusion_lock() {
+        let registry = UpgradeRegistry::new();
+        let operation = registry.reserve_service_action().await.unwrap();
+        assert_eq!(
+            registry
+                .reserve_service_action()
+                .await
+                .err()
+                .unwrap()
+                .code(),
+            Some("SERVICE_OPERATION_IN_PROGRESS")
+        );
+        drop(operation);
+        assert!(registry.reserve_service_action().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn stale_cancellation_cannot_replace_a_new_task_journal() {
+        let root =
+            std::env::temp_dir().join(format!("router-upgrade-stale-cancel-{}", Uuid::new_v4()));
+        let path = root.join("current.json");
+        let registry = UpgradeRegistry::empty(Some(path.clone()));
+        let old = UpgradeTaskSnapshot::new("old-boot", None);
+        let old_id = old.task_id;
+        let snapshot = UpgradeTaskSnapshot::new("new-boot", None);
+        let task_id = snapshot.task_id.clone();
+        let handle = UpgradeHandle::new(snapshot, Some(path.clone()), Arc::default());
+        handle.update(|_| Ok(())).await.unwrap();
+        *registry.inner.lock().await = Some(handle);
+        assert_eq!(
+            registry.cancel(&old_id).await.unwrap_err().code(),
+            Some("UPGRADE_TASK_CHANGED")
+        );
+        assert_eq!(load_snapshot(path).await.unwrap().unwrap().task_id, task_id);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_journal_fences_actions_without_blocking_router_startup() {
+        let root = std::env::temp_dir().join(format!("router-upgrade-corrupt-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("upgrade")).unwrap();
+        std::fs::write(root.join("upgrade/current.json"), b"invalid journal").unwrap();
+        let registry = UpgradeRegistry::open(&root).await;
+        assert_eq!(
+            registry.snapshot(None).await.unwrap_err().code(),
+            Some("UPGRADE_JOURNAL_UNAVAILABLE")
+        );
+        assert_eq!(
+            registry
+                .reserve_service_action()
+                .await
+                .err()
+                .unwrap()
+                .code(),
+            Some("UPGRADE_JOURNAL_UNAVAILABLE")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_new_task_write_failure_is_visible_with_an_older_result() {
+        let registry = UpgradeRegistry::new();
+        let mut previous = UpgradeTaskSnapshot::new("old-boot", None);
+        previous.status = UpgradeStatus::Cancelled;
+        previous.can_cancel = false;
+        let handle = UpgradeHandle::new(previous, None, registry.storage_fault.clone());
+        *registry.inner.lock().await = Some(handle);
+        registry.storage_fault.store(true, Ordering::SeqCst);
+        let snapshot = registry.snapshot(None).await.unwrap().unwrap();
+        assert!(snapshot.persistence_error);
+        assert!(!snapshot.can_cancel);
+        assert_eq!(
+            registry
+                .reserve_service_action()
+                .await
+                .err()
+                .unwrap()
+                .code(),
+            Some("UPGRADE_JOURNAL_UNAVAILABLE")
+        );
+    }
+}
 
 pub async fn rollback_to_previous_binary() -> Result<RollbackResponse, AppError> {
     let target = Path::new(BINARY_INSTALL_PATH);
