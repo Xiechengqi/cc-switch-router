@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { Button } from "@heroui/react";
+import { Button, toast } from "@heroui/react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { ExpandableRecordTable, RecordDetailList } from "@/components/common/expandable-record-table";
 import { useLocaleText } from "@/components/i18n/locale-provider";
@@ -12,10 +12,13 @@ import type { ClientTerminationAction } from "@/lib/client-termination";
 import { ApiError } from "@/lib/api";
 import { clientMarketMineHref } from "@/lib/dashboard-nav";
 import { formatUsdMoney } from "@/lib/market-money";
-import { onlineRequest, type OnlineSellerItem as SellerItem } from "@/lib/online-client-market";
+import { cancelOnlineReclaim, clientDisplayName, onlineMarketError, onlineRequest, type OnlineSellerItem as SellerItem } from "@/lib/online-client-market";
+import { ClientReclaimDialog, type ClientReclaimTarget } from "./client-market/client-reclaim-dialog";
 import { AccountInlineLoading, AccountSectionError } from "./account-section";
 import type { AccountMarketRole } from "./account-share-section";
-import { onlineStatusKey } from "./client-market/host-utils";
+import { endReasonKey, onlineStatusKey } from "./client-market/host-utils";
+import { useBilledTime } from "./client-market/online-shop";
+import { formatWalletUnits } from "@/lib/market-wallet-money";
 import { ClientRentalRecords } from "./client-market/rental-records";
 import { useAccountClientTerminations } from "./use-account-client-terminations";
 
@@ -32,6 +35,26 @@ function SellerInventory({ actor, focusKey }: { actor: string; focusKey?: string
   const [error, setError] = React.useState("");
   const [attempt, setAttempt] = React.useState(0);
   const [selection, setSelection] = React.useState<{ id: string; action?: ClientTerminationAction } | null>(null);
+  const [reclaiming, setReclaiming] = React.useState<ClientReclaimTarget | null>(null);
+  const [cancelling, setCancelling] = React.useState(false);
+  const billedTime = useBilledTime();
+  const date = (sec: number | null | undefined) => sec ? new Date(sec * 1000).toLocaleString(locale) : "—";
+  const status = (entry: SellerItem) => entry.reclaimEffectiveAt != null && ["starting", "active"].includes(entry.state)
+    ? t("clientMarket.reclaim.scheduledShort", { date: date(entry.reclaimEffectiveAt) })
+    : entry.paused && entry.state !== "released" ? t("online.paused") : t(onlineStatusKey(entry.state));
+  async function cancelReclaim(entry: SellerItem) {
+    if (cancelling) return;
+    setCancelling(true);
+    try {
+      const result = await cancelOnlineReclaim(entry.id);
+      toast.success(t(result?.renewalRestored ? "clientMarket.reclaim.cancelledRenewal" : "clientMarket.reclaim.cancelled"));
+      setAttempt(v => v + 1);
+    } catch (cause) {
+      toast.danger(onlineMarketError(cause, t));
+    } finally {
+      setCancelling(false);
+    }
+  }
   const terminations = useAccountClientTerminations(actor, "provider", focusKey);
   React.useEffect(() => {
     const controller = new AbortController();
@@ -60,12 +83,12 @@ function SellerInventory({ actor, focusKey }: { actor: string; focusKey?: string
     {items && <ExpandableRecordTable
       rows={items}
       rowKey={entry => entry.id}
-      rowLabel={entry => entry.label}
+      rowLabel={clientDisplayName}
       ariaLabel={t("clientMarket.title")}
       focusKey={focusKey}
       columns={[
-        { id: "client", header: t("online.clientColumn"), cell: entry => entry.label },
-        { id: "status", header: t("account.market.col.status"), cell: entry => t(onlineStatusKey(entry.state)) },
+        { id: "client", header: t("online.clientColumn"), cell: entry => clientDisplayName(entry) },
+        { id: "status", header: t("account.market.col.status"), cell: status },
         { id: "renter", header: t("account.market.col.renter"), cell: entry => entry.tenantEmail || t("account.market.notRented"), minWidth: "md" },
       ]}
       empty={<p className="py-6 text-center text-sm text-muted-foreground">{t("account.client.providerEmpty")}</p>}
@@ -87,10 +110,27 @@ function SellerInventory({ actor, focusKey }: { actor: string; focusKey?: string
                 },
                 {
                   label: t("account.market.col.term"),
-                  value: entry.expiresAt ? new Date(entry.expiresAt * 1000).toLocaleString(locale) : "—",
+                  value: date(entry.expiresAt),
                 },
+                ...(billedTime(entry) ? [{ label: t("clientRentals.billedHours"), value: billedTime(entry) }] : []),
+                ...(entry.incomeUnits != null ? [{ label: t("clientMarket.seller.income"), value: formatWalletUnits(entry.incomeUnits, "$", locale) }] : []),
+                ...(entry.endReason ? [{ label: t("clientRentals.reason"), value: t(endReasonKey(entry.endReason)) }] : []),
               ]}
             />
+            {entry.reclaimEffectiveAt != null || entry.reclaimable ? (
+              <div className="flex flex-wrap gap-2">
+                {entry.reclaimEffectiveAt != null && entry.reclaimEffectiveAt * 1000 > Date.now() ? (
+                  <Button size="sm" variant="outline" isDisabled={cancelling} onPress={() => void cancelReclaim(entry)}>
+                    {t("clientMarket.reclaim.cancel")}
+                  </Button>
+                ) : null}
+                {entry.reclaimable && entry.reclaimMode !== "immediate" ? (
+                  <Button size="sm" variant="outline" onPress={() => setReclaiming({ leaseId: entry.id, name: clientDisplayName(entry), escalate: entry.reclaimEffectiveAt != null, starting: entry.state === "starting" })}>
+                    {t(entry.reclaimEffectiveAt != null ? "clientMarket.reclaim.escalate" : "clientMarket.reclaim.action")}
+                  </Button>
+                ) : null}
+              </div>
+            ) : null}
             {entry.terminationId && !termination && (
               <Button variant="outline" onPress={() => setSelection({ id: entry.terminationId! })}>
                 {t("online.exitRecord")}
@@ -117,6 +157,7 @@ function SellerInventory({ actor, focusKey }: { actor: string; focusKey?: string
     />}
     {terminations.error && <AccountSectionError message={t("account.market.terminationsUnavailable")} onRetry={() => void terminations.reload()} />}
     {terminations.nextCursor && <Button size="sm" variant="ghost" onPress={() => void terminations.more()}>{t("account.market.earlierTerminations")}</Button>}
+    <ClientReclaimDialog target={reclaiming} onClose={() => setReclaiming(null)} onDone={() => { toast.success(t("clientMarket.reclaim.done")); setAttempt(v => v + 1); }} />
     <ClientTerminationDialog terminationId={selection?.id || null} initialRole="provider" initialAction={selection?.action}
       onClose={() => setSelection(null)} onChanged={() => { void terminations.reload(); setAttempt(v => v + 1); }} />
   </div>;

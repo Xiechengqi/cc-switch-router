@@ -520,7 +520,7 @@ function ClientCard({
             <div className="grid min-w-0 gap-0.5 pl-4 text-xs text-muted-foreground">
               {owner && owner !== "-" && <span className="break-all">{t("dashboard.owner")} {owner}</span>}
               {client.rental && (
-                <span className="break-all">{t("dashboard.renter")} {client.rental.tenantEmail}
+                <span className="break-all">{t("dashboard.renter")} {client.rental.tenantEmail || t("clientMarket.shop.rentedOut")}
                   {client.rental.selfRental && ` · ${t("dashboard.selfRental")}`} · {t(client.rental.state === "active"
                     ? "dashboard.rentalActive" : client.rental.state === "starting" ? "dashboard.rentalStarting" : "dashboard.rentalReturning")}
                   {client.rental.migrationRequired && ` · ${t("dashboard.rentalMigration")}`}
@@ -1465,7 +1465,7 @@ export function ClientBoard({
                     </dd>
                     {selectedClient.rental && <>
                       <dt className="text-slate-500">{t("dashboard.renter")}</dt>
-                      <dd className="break-all">{selectedClient.rental.tenantEmail}</dd>
+                      <dd className="break-all">{selectedClient.rental.tenantEmail || t("clientMarket.shop.rentedOut")}</dd>
                       {selectedClient.rental.migrationRequired && <>
                         <dt className="text-slate-500">{t("dashboard.rentalMigration")}</dt>
                         <dd>{t("lease.migrationHelp")}</dd>

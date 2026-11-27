@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {clientMarketWorkspaceFromQuery,clientMarketTenantFromQuery,onlineShopSpecLine,
-  onlineListingAvailability,onlineListingRentable,aggregateOnlineShopCountries,shopContinentForCountry,SHOP_CONTINENTS} from "./host-utils";
+  onlineListingAvailability,onlineListingRentable,aggregateOnlineShopCountries,shopContinentForCountry,SHOP_CONTINENTS,
+  sortShopListings,matchesShopQuery,endReasonKey} from "./host-utils";
 
 test("seller and rental links select their workspace", () => {
   assert.equal(clientMarketWorkspaceFromQuery("selling", null), "selling");
@@ -76,4 +77,32 @@ test("shop continents keep ISO regions distinct and group unknown codes as other
   assert.equal(shopContinentForCountry(""), "other");
   assert.equal(shopContinentForCountry("CHN"), "other");
   assert.equal(SHOP_CONTINENTS[0], "all");
+});
+
+test("shop order puts rentable Clients first, then the longest connected, then the 30-day rate", () => {
+  const base = { owned: false, ownerRental: true, exclusiveManagement: true, healthy: true, occupied: false, state: "listed" };
+  const rows = [
+    { ...base, installationId: "young", registeredAt: "2026-06-01T00:00:00Z", onlineRate30d: 99 },
+    { ...base, installationId: "busy", registeredAt: "2025-01-01T00:00:00Z", availability: "occupied" as const, occupied: true },
+    { ...base, installationId: "old-low", registeredAt: "2026-01-01T00:00:00Z", onlineRate30d: 80 },
+    { ...base, installationId: "old-high", registeredAt: "2026-01-01T00:00:00Z", onlineRate30d: 95 },
+    { ...base, installationId: "unknown-age" },
+  ];
+  assert.deepEqual(sortShopListings(rows).map((row) => row.installationId), ["old-high", "old-low", "young", "unknown-age", "busy"]);
+});
+
+test("shop search matches title, public name, seller and country, case-insensitively", () => {
+  const listing = { title: "Tokyo Home", label: "client-8f3a21c0", sellerEmail: "seller@example.test", country: "JP" };
+  const name = (code: string) => (code === "JP" ? "Japan" : code);
+  for (const query of ["", "tokyo", "8F3A", "SELLER@", "jp", "japan"]) assert.equal(matchesShopQuery(listing, query, name), true, query);
+  assert.equal(matchesShopQuery(listing, "germany", name), false);
+  assert.equal(matchesShopQuery({ ...listing, country: null }, "unknown", name), false);
+});
+
+test("rental end reasons include seller reclaim and completed trials", () => {
+  assert.equal(endReasonKey("provider_reclaim"), "clientMarket.endReason.provider_reclaim");
+  assert.equal(endReasonKey("trial_completed"), "clientMarket.endReason.trial_completed");
+  assert.equal(endReasonKey("voluntary"), "clientTermination.voluntary");
+  assert.equal(endReasonKey("something_new"), "clientTermination.systemExit");
+  assert.equal(endReasonKey(null), "clientTermination.systemExit");
 });

@@ -12,7 +12,6 @@ import {
   DASHBOARD_CLIENTS_PATH,
   shareMarketHref,
 } from "@/lib/dashboard-nav";
-import { parseNonNegativeUsdMinor } from "@/lib/market-wallet-money";
 import {
   listingBlocker,
   onlineRequest,
@@ -22,6 +21,7 @@ import {
 import type { DashboardClient } from "@/lib/types";
 import { ROUTER_OPEN_LOGIN_EVENT } from "./host-utils";
 import { ClientReliability, ClientSpecs } from "./online-shop";
+import { EMPTY_LISTING_TERMS, ListingTermsFields, listingTermsFrom, type ListingTermsDraft } from "./client-listing-terms";
 
 type Issue =
   | ListingBlocker
@@ -61,11 +61,7 @@ const actionLabels = {
   recheck: "clientMarket.listing.recheck",
   signIn: "clientMarket.listing.signIn",
 } as const;
-const focus = "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring";
-const textAction =
-  "min-h-10 shrink-0 rounded-md px-1 text-sm font-medium text-primary hover:underline " + focus;
-const numberField =
-  "flex h-11 min-w-0 items-center gap-2 rounded-lg border border-border bg-background px-3 focus-within:border-ring focus-within:ring-1 focus-within:ring-ring";
+const focus = "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2";
 
 function paidIssue(issue: Issue | null) {
   return (
@@ -117,10 +113,7 @@ export function ClientListingAddDialog({
   const [id, setId] = React.useState(initialId);
   const [probe, setProbe] = React.useState<Probe | null>(null);
   const [revision, recheck] = React.useReducer((n) => n + 1, 0);
-  const [mode, setMode] = React.useState<"free" | "monthly">("free");
-  const [price, setPrice] = React.useState("");
-  const [freeDays, setFreeDays] = React.useState<string | null>(null);
-  const [trialDays, setTrialDays] = React.useState<string | null>(null);
+  const [draft, setDraft] = React.useState<ListingTermsDraft>(EMPTY_LISTING_TERMS);
   const [ack, setAck] = React.useState(false);
   const [pendingAction, setPendingAction] = React.useState<"verify" | "publish" | null>(null);
   const mutation = React.useRef<AbortController | null>(null);
@@ -192,7 +185,8 @@ export function ClientListingAddDialog({
   const lastProbe = probe?.id === selectedId && probe?.revision === revision ? probe : null;
   const checking = !!selected && !lastProbe;
   const check = lastProbe?.data;
-  const paid = mode === "monthly";
+  const terms = listingTermsFrom(draft);
+  const paid = terms.paid;
   const deviceIssue =
     lastProbe?.failure ?? (lastProbe && !check?.checks ? "check_unavailable" : check && listingBlocker(check));
   // Earlier Routers can claim a first-time Provider during publication itself.
@@ -265,27 +259,17 @@ export function ClientListingAddDialog({
     setId(next);
     setProbe(null);
     recheck();
-    setMode("free");
-    setPrice("");
-    setFreeDays(null);
-    setTrialDays(null);
+    setDraft(EMPTY_LISTING_TERMS);
     setAck(false);
     setSubmitIssue(null);
     setTermsRejected(false);
   }
-  const days = paid ? trialDays : freeDays;
-  const setDays = paid ? setTrialDays : setFreeDays;
-  const maxDays = paid ? 30 : 365;
-  const validDays = days === null || (/^\d+$/.test(days) && Number(days) >= 1 && Number(days) <= maxDays);
-  const minor = paid ? parseNonNegativeUsdMinor(price.trim().replace(/^0+(?=\d)/, "")) : 0;
-  const validPrice = !paid || (minor !== null && minor > 0 && minor <= 100_000_000);
   const busy = pendingAction !== null;
-  const canSubmit =
-    !!selected && !!check?.ready && !issue && validPrice && validDays && ack && !busy && !loadError;
+  const canSubmit = !!selected && !!check?.ready && !issue && !!terms.payload && ack && !busy && !loadError;
 
   async function perform(action: "publish" | "verify") {
     if (!selectedId || mutation.current) return;
-    if (action === "publish" ? !canSubmit || minor === null : remedy !== "verifyProvider" || checking) return;
+    if (action === "publish" ? !canSubmit || !terms.payload : remedy !== "verifyProvider" || checking) return;
     const ctl = new AbortController();
     mutation.current = ctl;
     setPendingAction(action);
@@ -310,12 +294,7 @@ export function ClientListingAddDialog({
       const result = await onlineRequest<{ state: string }>(
         `${endpoint}/listing`,
         "POST",
-        {
-          cyclePriceMinor: minor,
-          freeDays: !paid && freeDays !== null ? Number(freeDays) : null,
-          trialDays: paid && trialDays !== null ? Number(trialDays) : 0,
-          acknowledged: ack,
-        },
+        { ...terms.payload, acknowledged: ack },
         ctl.signal,
       );
       if (mutation.current !== ctl) return;
@@ -448,7 +427,7 @@ export function ClientListingAddDialog({
                   {clients.length === 1 && selected ? (
                     <strong className="break-all font-mono text-base">{deviceName(selected)}</strong>
                   ) : (
-                    <label className="group relative flex min-h-11 min-w-0 items-center justify-between gap-3 rounded-lg border border-border bg-background px-3 focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-ring">
+                    <label className="group relative flex min-h-11 min-w-0 items-center justify-between gap-3 rounded-lg border border-border bg-background px-3 focus-within:ring-2 focus-within:ring-accent focus-within:ring-offset-2">
                       <span aria-hidden="true" className="truncate font-mono text-sm font-semibold">
                         {selected ? deviceName(selected) : t("clientMarket.listing.choose")}
                       </span>
@@ -510,110 +489,18 @@ export function ClientListingAddDialog({
                     onChange={() => setTermsRejected(false)}
                     className="mt-4 grid gap-4 border-t border-border pt-4"
                   >
-                    <fieldset disabled={busy}>
-                      <legend className="mb-2 text-sm font-medium">
-                        {t("clientMarket.listing.listingMode")}
-                      </legend>
-                      <div className="grid grid-cols-2 gap-1 rounded-lg bg-secondary p-1">
-                        {(["free", "monthly"] as const).map((value) => (
-                          <label key={value} className="min-w-0 cursor-pointer">
-                            <input
-                              className="peer sr-only"
-                              type="radio"
-                              name="rent-mode"
-                              value={value}
-                              checked={mode === value}
-                              onChange={() => setMode(value)}
-                            />
-                            <span className="flex min-h-10 items-center justify-center rounded-md text-sm font-medium text-muted-foreground peer-checked:bg-card peer-checked:text-foreground peer-checked:shadow-sm peer-focus-visible:outline-2 peer-focus-visible:outline-ring peer-disabled:opacity-60">
-                              {t(value === "free" ? "online.free" : "clientMarket.listing.monthly")}
-                            </span>
-                          </label>
-                        ))}
-                      </div>
-                    </fieldset>
+                    <ListingTermsFields
+                      draft={draft}
+                      onChange={(next) => {
+                        setDraft(next);
+                        setTermsRejected(false);
+                      }}
+                      disabled={busy}
+                      idPrefix={formId}
+                      showPricing={!paidOnly}
+                    />
                     {!paidOnly && (
                       <>
-                        {paid && (
-                          <label className="grid gap-1.5 text-sm font-medium">
-                            {t("clientMarket.listing.amount")}
-                            <span className={numberField}>
-                              <input
-                                className="w-0 flex-1 bg-transparent font-normal tabular-nums outline-none"
-                                required
-                                inputMode="decimal"
-                                placeholder="0.00"
-                                value={price}
-                                disabled={busy}
-                                aria-describedby={price && !validPrice ? formId + "-price-error" : undefined}
-                                aria-invalid={!!price && !validPrice}
-                                onChange={(e) => setPrice(e.target.value)}
-                              />
-                              <span className="text-xs text-muted-foreground">
-                                {t("clientMarket.listing.amountUnit")}
-                              </span>
-                            </span>
-                            {!!price && !validPrice && (
-                              <span id={formId + "-price-error"} className="text-xs font-normal text-danger">
-                                {t("clientMarket.listing.priceError")}
-                              </span>
-                            )}
-                          </label>
-                        )}
-                        <div className="grid gap-1.5">
-                          <div className="flex min-h-10 flex-wrap items-center gap-x-3">
-                            <span id={formId + "-term"} className="text-sm font-medium">
-                              {t(paid ? "clientMarket.listing.trial" : "clientMarket.listing.freeDays")}
-                            </span>
-                            <span className="ml-auto text-sm text-muted-foreground">
-                              {days === null &&
-                                t(paid ? "clientMarket.listing.noTrial" : "clientMarket.listing.unlimited")}
-                            </span>
-                            <button
-                              type="button"
-                              className={textAction}
-                              aria-expanded={days !== null}
-                              disabled={busy}
-                              onClick={() => setDays(days === null ? "" : null)}
-                            >
-                              {t(
-                                days === null
-                                  ? paid
-                                    ? "clientMarket.listing.addTrial"
-                                    : "clientMarket.listing.setLimit"
-                                  : paid
-                                    ? "clientMarket.listing.removeTrial"
-                                    : "clientMarket.listing.removeLimit",
-                              )}
-                            </button>
-                          </div>
-                          {days !== null && (
-                            <>
-                              <div className={numberField}>
-                                <input
-                                  required
-                                  aria-labelledby={formId + "-term"}
-                                  inputMode="numeric"
-                                  placeholder={`1–${maxDays}`}
-                                  className="w-0 flex-1 bg-transparent text-sm tabular-nums outline-none"
-                                  value={days}
-                                  disabled={busy}
-                                  aria-describedby={days && !validDays ? formId + "-days-error" : undefined}
-                                  aria-invalid={!!days && !validDays}
-                                  onChange={(e) => setDays(e.target.value)}
-                                />
-                                <span className="text-xs text-muted-foreground">
-                                  {t("clientMarket.listing.days")}
-                                </span>
-                              </div>
-                              {!!days && !validDays && (
-                                <p id={formId + "-days-error"} className="text-xs text-danger">
-                                  {t("clientMarket.listing.daysError", { max: maxDays })}
-                                </p>
-                              )}
-                            </>
-                          )}
-                        </div>
                         <label className="flex min-h-11 cursor-pointer items-center gap-2.5 border-t border-border pt-3 text-sm leading-5">
                           <input
                             type="checkbox"

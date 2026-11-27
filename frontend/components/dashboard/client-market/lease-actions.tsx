@@ -1,7 +1,8 @@
 "use client";
 
 import * as React from "react";
-import { Button, Modal } from "@heroui/react";
+import { Button, Modal, TextArea } from "@heroui/react";
+import { CompactSelect } from "@/components/common/compact-select";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ClientUpgradeControl } from "@/components/dashboard/client-upgrade-button";
 import { ApiError } from "@/lib/api";
@@ -22,6 +23,7 @@ export function LeaseActions({
   upgradeTarget,
   canEnd,
   address,
+  showConsole = true,
   onChanged,
 }: {
   id: string;
@@ -29,6 +31,8 @@ export function LeaseActions({
   upgradeTarget?: string;
   canEnd: boolean;
   address?: string;
+  /** Off where the caller already shows a prominent console button. */
+  showConsole?: boolean;
   onChanged: () => void;
 }) {
   const { t, locale } = useLocaleText();
@@ -93,7 +97,7 @@ export function LeaseActions({
   );
   return (
     <div className="flex flex-wrap items-center gap-2 text-sm">
-      {active && (
+      {active && showConsole && (
         <>
           <a
             className="inline-flex min-h-11 items-center rounded font-medium text-accent underline"
@@ -115,6 +119,10 @@ export function LeaseActions({
           >
             {t("lease.copy")}
           </Button>
+        </>
+      )}
+      {active && (
+        <>
           {upgradeTarget && <ClientUpgradeControl installationId={id} leased upgradeTarget={upgradeTarget} canInspect available />}
           {exportButton}
         </>
@@ -157,20 +165,28 @@ export function LeaseActions({
                     {t("clientTermination.return")} ·{" "}
                     {formatWalletUnits(preview.preview.returnUnits, "$", locale)}
                   </p>
-                  <label>
-                    {t("clientTermination.reason")}{" "}
-                    <select value={reason} onChange={(e) => setReason(e.target.value as typeof reason)}>
-                      <option value="voluntary">{t("clientTermination.voluntary")}</option>
-                      <option value="provider_issue">{t("clientTermination.providerIssue")}</option>
-                      <option value="platform_issue">{t("clientTermination.platformIssue")}</option>
-                    </select>
-                  </label>
+                  <div className="grid gap-1.5">
+                    <span className="text-xs font-medium text-muted-foreground">{t("clientTermination.reason")}</span>
+                    <CompactSelect
+                      value={reason}
+                      ariaLabel={t("clientTermination.reason")}
+                      disabled={busy}
+                      triggerClassName="min-h-11 text-sm"
+                      onChange={(value) => setReason(value as typeof reason)}
+                      options={[
+                        { value: "voluntary", label: t("clientTermination.voluntary") },
+                        { value: "provider_issue", label: t("clientTermination.providerIssue") },
+                        { value: "platform_issue", label: t("clientTermination.platformIssue") },
+                      ]}
+                    />
+                  </div>
                   {reason !== "voluntary" && (
-                    <label>
-                      {t("clientTermination.claim")}
-                      <textarea
-                        className="w-full rounded border p-2"
+                    <label className="grid gap-1.5">
+                      <span className="text-xs font-medium text-muted-foreground">{t("clientTermination.claim")}</span>
+                      <TextArea
                         value={claim}
+                        rows={3}
+                        disabled={busy}
                         onChange={(e) => setClaim(e.target.value)}
                         maxLength={2000}
                       />

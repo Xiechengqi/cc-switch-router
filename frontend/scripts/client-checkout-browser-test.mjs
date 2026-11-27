@@ -216,10 +216,9 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
     await supply.getByText(/2 cores · 4 GiB · aarch64/).waitFor();
     await supply.getByRole("img", { name: "Japan" }).waitFor();
     await supply.getByText("98.8%").waitFor();
-    assert.equal(await supply.getByText("IP 192.0.2.xx", { exact: true }).isVisible(), false);
-    await supply.getByText("Network details").click();
-    await supply.getByText("IP 192.0.2.xx", { exact: true }).waitFor();
-    await supply.getByText("Network details").click();
+    // The egress network is the card's lead fact; the full IP is shown only to the tenant.
+    await supply.getByText("192.0.2.xx", { exact: true }).waitFor();
+    assert.equal(await supply.getByText("Network details").count(), 0);
     assert.equal(await page.getByRole("option", { name: "Mine", exact: true }).count(), 0);
     assert.equal(await supply.getByText(/root access|24 h$|running time/i).count(), 0);
     for (const width of [320, 375, 768, 1440]) {
@@ -229,9 +228,12 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
     }
     await supply.getByRole("button", { name: "Rent", exact: true }).click();
     const checkout = page.getByRole("dialog");
-    await checkout.getByText(/8 min 18 sec/).waitFor();
-    await checkout.getByText("First-period balance required").waitFor();
-    await checkout.getByText("Shortfall", { exact: true }).waitFor();
+    // A trial defaults to trial only: no balance, no renewal switch.
+    await checkout.getByText(/8 min 18 sec/).first().waitFor();
+    assert.equal(await checkout.getByRole("checkbox", { name: /renew/i }).count(), 0);
+    await checkout.getByRole("button", { name: "Start trial" }).waitFor();
+    await checkout.getByRole("radio", { name: /Keep after trial/ }).check();
+    await checkout.getByText(/short\.$/).waitFor();
     assert.equal(await checkout.getByText(/Add .* to continue/).count(), 0);
     if (captureScreenshots) await checkout.screenshot({ path: artifacts + "/paid-checkout.png" });
     assert.equal(await checkout.getByRole("link", { name: "Platform wallet" }).count(), 0);
@@ -250,7 +252,7 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
       window.dispatchEvent(new CustomEvent("router-market-balance-changed", { detail: "buyer" })),
     );
     const confirm = checkout.getByRole("button", { name: "Confirm rental" });
-    const ack = checkout.getByRole("checkbox", { name: /owner can read/ });
+    const ack = checkout.getByRole("checkbox", { name: /seller can read/ });
     await ack.check();
     rejectNextQuote = true;
     await confirm.click();
@@ -269,7 +271,8 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
       .getByRole("button", { name: /Retry/i })
       .click();
     try {
-      await page.getByTestId("client-rental-detail").getByText("lease:lease-0", { exact: true }).waitFor();
+      // The buyer stays on the market page; the new rental is highlighted under "My Clients".
+      await page.locator("#my-client-lease-0").waitFor();
     } catch (cause) {
       console.error({
         url: page.url(),
@@ -282,8 +285,8 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
     assert.equal(leases.length, 1);
     assert.equal(commits.at(-1).path, commits.at(-2).path);
     assert.notEqual(commits.at(-1).path, commits[0].path);
-    assert.equal(new URL(page.url()).pathname, "/account/rentals/");
-    assert.equal(new URL(page.url()).searchParams.get("focus"), "lease-0");
+    assert.equal(commits.at(-1).input.afterTrial, "continue");
+    assert.equal(new URL(page.url()).pathname, "/client-market/");
     await page.clock.setFixedTime(new Date());
     listing.cyclePriceMinor = 0;
     listing.trialDays = 0;
@@ -294,10 +297,10 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
     assert.equal(await checkout.getByRole("checkbox").count(), 1);
     ttl = 120;
     await checkout.getByText(/报价已更新/).waitFor();
-    await checkout.getByRole("checkbox", { name: /读取磁盘数据/ }).check();
+    await checkout.getByRole("checkbox", { name: /读取这台机器上的数据/ }).check();
     await checkout.getByRole("button", { name: "确认免费租用" }).click();
     await checkout.waitFor({ state: "hidden" });
-    await page.waitForURL(/account\/rentals\/.*focus=lease-1/);
+    await page.locator("#my-client-lease-1").waitFor();
     listing.cyclePriceMinor = 4200;
     listing.freeDays = null;
     listing.trialDays = 3;
@@ -314,7 +317,7 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
     assert.equal(await checkout.getByText(/42\.00|钱包/).count(), 0);
     if (captureScreenshots) await checkout.screenshot({ path: artifacts + "/self-checkout-mobile.png" });
     await checkout.getByRole("button", { name: "确认免费租用" }).click();
-    await page.waitForURL(/account\/rentals\/.*focus=lease-2/);
+    await page.locator("#my-client-lease-2").waitFor();
     assert.equal(leases.at(-1).cyclePriceMinor, 0);
     assert.equal(delistRequests, 0);
     listing.ownerRental = false;

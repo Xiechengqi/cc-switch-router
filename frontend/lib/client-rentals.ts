@@ -25,7 +25,14 @@ export type ClientRentalPeriod = {
 };
 export type ClientRentalEvent = { id: string; action: string; occurrences?: number; createdAt: string; note: string | null };
 export type ClientRentalDetail = {
-  record: ClientRentalRecord; rental: { leaseId: string; canUpgrade?: boolean; migrationRequired?: boolean; contractId: string | null; canDispute: boolean; openDispute: boolean; clientUrl?: string; activationDeadline?: number; grantUntil?: number; holdStatus?: "active" | "released" | "captured" | null } | null;
+  record: ClientRentalRecord; rental: { leaseId: string; canUpgrade?: boolean; migrationRequired?: boolean; contractId: string | null; canDispute: boolean; openDispute: boolean; clientUrl?: string; activationDeadline?: number; grantUntil?: number; holdStatus?: "active" | "released" | "captured" | null;
+    /** Full egress IP while the rental runs; the tenant judges its quality. */
+    egressIp?: string | null; country?: string | null; egressDiffers?: boolean; title?: string | null;
+    reclaimEffectiveAt?: number | null; reclaimMode?: "notice" | "immediate" | null; reclaimReason?: "need_machine" | "tenant_violation" | "other" | null;
+    afterTrial?: "continue" | "end" | null; contractStatus?: string | null;
+    reclaimNote?: string | null;
+    /** Service time of the current period as settlement recorded it (seconds). */
+    availableSeconds?: number; unavailableSeconds?: number; settledThrough?: string | null } | null;
   periods: ClientRentalPeriod[]; periodsNextCursor: number | null;
   events: ClientRentalEvent[]; eventsNextCursor: string | null;
   trialConsumedSeconds: number; serverNow: string;
@@ -49,6 +56,15 @@ function validLiveRental(v: unknown, record: ClientRentalRecord): boolean {
     && (v.activationDeadline === undefined || integer(v.activationDeadline))
     && (v.grantUntil === undefined || integer(v.grantUntil))
     && (v.holdStatus == null || ["active", "released", "captured"].includes(String(v.holdStatus)))
+    && ["egressIp", "country", "title", "contractStatus"].every(k => v[k] === undefined || nullableText(v[k]))
+    && (v.egressDiffers === undefined || typeof v.egressDiffers === "boolean")
+    && (v.reclaimEffectiveAt == null || integer(v.reclaimEffectiveAt))
+    && (v.reclaimMode == null || ["notice", "immediate"].includes(String(v.reclaimMode)))
+    && (v.reclaimReason == null || ["need_machine", "tenant_violation", "other"].includes(String(v.reclaimReason)))
+    && (v.afterTrial == null || ["continue", "end"].includes(String(v.afterTrial)))
+    && ["availableSeconds", "unavailableSeconds"].every(k => v[k] === undefined || integer(v[k]))
+    && (v.settledThrough == null || time(v.settledThrough))
+    && (v.reclaimNote == null || (typeof v.reclaimNote === "string" && Array.from(v.reclaimNote).length <= 2000))
     && typeof v.canDispute === "boolean" && typeof v.openDispute === "boolean");
 }
 function validRecord(v: unknown): v is ClientRentalRecord {

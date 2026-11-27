@@ -68,7 +68,7 @@ export function notificationHref(item: UserNotification): string {
   if (item.objectKind === "client_termination" || item.eventKind.startsWith("client_termination_")) {
     return clientTerminationHref(typeof item.payload.terminationId === "string" ? item.payload.terminationId : item.objectId);
   }
-  if (item.eventKind === "client_workspace_access" || item.eventKind === "client_workspace_management" || item.eventKind === "client_workspace_ready") {
+  if (item.objectKind === "client_lease" || item.eventKind === "client_workspace_access" || item.eventKind === "client_workspace_management" || item.eventKind === "client_workspace_ready") {
     return clientMarketTenantHref(item.objectId);
   }
   if (item.category === "system") return "/metrics/?tab=alerts";

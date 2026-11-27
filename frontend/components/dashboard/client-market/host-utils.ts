@@ -1,3 +1,4 @@
+import type { MessageKey } from "@/lib/i18n";
 import type { ListingAvailability } from "@/lib/online-client-market";
 
 export const CLIENT_MARKET_POLL_MS = 20_000;
@@ -102,7 +103,7 @@ export function onlineListingRentable(listing: ShopAvailabilityFields) {
 }
 
 const marketStates = [
-  "available", "offline", "occupied", "upgrading", "switching", "unavailable",
+  "available", "offline", "occupied", "paused", "upgrading", "switching", "unavailable",
   "locking", "unlocking", "starting", "active", "ending", "cleaning", "released",
 ] as const;
 
@@ -158,3 +159,66 @@ export function sortShopCountries(
 }
 
 export const SHOP_BROWSE_KEY = "cc_switch_router_client_market_shop_browse_v1";
+
+type ShopSortable = ShopAvailabilityFields & {
+  installationId: string;
+  registeredAt?: string;
+  onlineRate30d?: number | null;
+};
+
+function registeredTime(value?: string) {
+  const time = value ? Date.parse(value) : Number.NaN;
+  return Number.isFinite(time) ? time : Number.POSITIVE_INFINITY;
+}
+
+/**
+ * Shop order: rentable first, then the Client connected to the Router the
+ * longest, then the higher 30-day online rate. Deterministic for equal values.
+ */
+export function sortShopListings<T extends ShopSortable>(listings: readonly T[]): T[] {
+  return [...listings].sort((left, right) => {
+    const rentable = Number(onlineListingRentable(right)) - Number(onlineListingRentable(left));
+    if (rentable) return rentable;
+    const age = registeredTime(left.registeredAt) - registeredTime(right.registeredAt);
+    if (age) return age;
+    const rate = (right.onlineRate30d ?? -1) - (left.onlineRate30d ?? -1);
+    if (rate) return rate;
+    return left.installationId.localeCompare(right.installationId);
+  });
+}
+
+/** Case-insensitive match on the title, the public name, the seller and the country. */
+export function matchesShopQuery(
+  listing: { title?: string | null; label: string; sellerEmail?: string; country: string | null },
+  query: string,
+  countryName: (code: string) => string,
+) {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return true;
+  const code = shopCountryKey(listing.country);
+  return [listing.title, listing.label, listing.sellerEmail, code === SHOP_UNKNOWN_COUNTRY ? "" : code,
+    code === SHOP_UNKNOWN_COUNTRY ? "" : countryName(code)]
+    .some((part) => (part || "").toLowerCase().includes(needle));
+}
+
+export const SHOP_PAGE_SIZE = 24;
+
+/** Why a Client rental ended, including a seller reclaim and a completed trial. */
+export function endReasonKey(reason: string | null | undefined): MessageKey {
+  switch (reason) {
+    case "voluntary":
+      return "clientTermination.voluntary";
+    case "provider_issue":
+      return "clientTermination.providerIssue";
+    case "platform_issue":
+      return "clientTermination.platformIssue";
+    case "provider_reclaim":
+      return "clientMarket.endReason.provider_reclaim";
+    case "trial_completed":
+      return "clientMarket.endReason.trial_completed";
+    case "workspace_expired":
+      return "clientMarket.endReason.workspace_expired";
+    default:
+      return "clientTermination.systemExit";
+  }
+}

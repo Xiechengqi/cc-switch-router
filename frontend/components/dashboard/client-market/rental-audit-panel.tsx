@@ -36,7 +36,7 @@ function AuditDisclosure(props: { onTerminationOpen: (id: string) => void; revis
   const [expanded, setExpanded] = React.useState(false);
   const contentId = React.useId();
   return <section className="grid min-w-0 gap-2" data-testid="client-rental-audit-disclosure">
-    <h2><button type="button" className="flex min-h-11 w-full items-center justify-between gap-2 rounded-lg border border-border bg-card px-3 text-left text-sm font-semibold hover:bg-muted/40 focus-visible:outline-2 focus-visible:outline-ring"
+    <h2><button type="button" className="flex min-h-11 w-full items-center justify-between gap-2 rounded-lg border border-border bg-card px-3 text-left text-sm font-semibold hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
       aria-expanded={expanded} aria-controls={contentId} aria-label={t(expanded ? "clientRentals.auditCollapse" : "clientRentals.auditExpand")}
       onClick={() => setExpanded(value => !value)}><span>{t("rentalAudit.title")}</span><ChevronDown aria-hidden className={`h-4 w-4 shrink-0 ${expanded ? "rotate-180" : ""}`} /></button></h2>
     <div id={contentId} hidden={!expanded}><AuditWorkspace {...props} active={expanded} /></div>

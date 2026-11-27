@@ -208,7 +208,7 @@ export type ShareServiceReadiness = {
 };
 
 export type DashboardClient = {
-  rental?: {state: string; tenantEmail: string; selfRental: boolean; exclusiveManagement: boolean; migrationRequired?: boolean; controlId?: string; alias?: string};
+  rental?: {state: string; /** Only the seller, tenant and admins see it. */ tenantEmail?: string | null; selfRental: boolean; exclusiveManagement: boolean; migrationRequired?: boolean; controlId?: string; alias?: string};
   canUpgrade?: boolean;
   chatAvailable?: boolean;
   logCollectionEnabled?: boolean;

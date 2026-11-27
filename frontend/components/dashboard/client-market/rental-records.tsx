@@ -4,7 +4,7 @@ import { LeaseActions } from "./lease-actions";
 import * as React from "react";
 import Link from "next/link";
 import { Button } from "@heroui/react";
-import { ChevronLeft, ChevronRight, Loader2, MessageCircle } from "lucide-react";
+import { ChevronDown, ChevronLeft, ChevronRight, Loader2, MessageCircle, TriangleAlert } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useClientChat } from "@/components/chat/client-chat";
 import { ExpandableRecordTable, RecordDetailList, type RecordTableColumn } from "@/components/common/expandable-record-table";
@@ -21,7 +21,9 @@ import { formatWalletUnits } from "@/lib/market-wallet-money";
 import { formatUsdMoney } from "@/lib/market-money";
 import { DASHBOARD_CLIENT_MARKET_PATH } from "@/lib/dashboard-nav";
 import type { MessageKey } from "@/lib/i18n";
-import { CLIENT_MARKET_POLL_MS } from "./host-utils";
+import { CLIENT_MARKET_POLL_MS, endReasonKey } from "./host-utils";
+import { ClientAfterTrialDialog, type ClientAfterTrialTarget } from "./client-after-trial-dialog";
+import { ClientEgressLine, useBilledTime } from "./online-shop";
 
 /** Mount the buyer's account records and pending reads for the signed-in user. */
 export function ClientRentalRecords(props: {
@@ -196,8 +198,22 @@ function RentalDetail({ id, refreshKey, onChanged, onTerminationOpen, onForbidde
   const changed = React.useCallback(() => { void load("refresh"); onChanged(); }, [load, onChanged]);
   const row = detail?.record;
   const rental = detail?.rental;
+  const [afterTrial, setAfterTrial] = React.useState<ClientAfterTrialTarget | null>(null);
+  const billedTime = useBilledTime();
   const money = (value: string) => formatWalletUnits(value, "$", locale);
   const date = (value: string | null) => value ? new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value)) : "—";
+  const price = (record: ClientRentalRecord) =>
+    record.cyclePriceMinor !== null
+      ? t("rentalAudit.monthlyPrice", { price: formatUsdMoney(record.cyclePriceMinor, locale) })
+      : record.dailyRateMinor !== null
+        ? t("rentalAudit.dailyPrice", { price: formatUsdMoney(record.dailyRateMinor, locale) })
+        : record.pricingModel === "free"
+          ? t("shareMarket.free")
+          : "—";
+  // The trial-only choice can still change while the trial runs and nothing was paid.
+  const trialChoice = !!row && !!rental && !!row.contractId && row.group === "current" && !rental.reclaimEffectiveAt
+    && (row.cyclePriceMinor ?? 0) > 0 && (row.trialSecondsRemaining ?? 0) > 0
+    && ["pending_activation", "trialing"].includes(rental.contractStatus || row.contractStatus || "") && !!rental.afterTrial;
   return (
     <div className="grid min-w-0 gap-3" data-testid="client-rental-detail">
       {busy ? (
@@ -216,91 +232,73 @@ function RentalDetail({ id, refreshKey, onChanged, onTerminationOpen, onForbidde
       {detail && row ? (
         <>
           {row.status === "activation_failed" && <p role="status">{t("lease.activationFailed")}</p>}
-          {rental && <div className="grid gap-2 rounded-lg border border-border p-3 text-sm">
+          {rental?.reclaimEffectiveAt ? (
+            <div role="status" className="flex gap-2.5 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5 text-sm leading-6 text-amber-950">
+              <TriangleAlert aria-hidden className="mt-1 size-4 shrink-0 text-amber-600" />
+              <p className="min-w-0">
+                {t("clientMarket.mine.reclaimBanner", { date: date(new Date(rental.reclaimEffectiveAt * 1000).toISOString()) })}
+                {rental.reclaimReason ? ` ${t("clientMarket.mine.reclaimReason", { reason: t(`clientMarket.reclaim.reason.${rental.reclaimReason}`) })}` : ""}
+                {rental.reclaimNote ? <span className="mt-1 block whitespace-pre-wrap break-words text-amber-900">{t("clientMarket.mine.reclaimNote", { note: rental.reclaimNote })}</span> : null}
+              </p>
+            </div>
+          ) : null}
+          {rental && <div className="grid gap-3 rounded-lg border border-border p-3 text-sm">
             {rental.migrationRequired && <p>{t("lease.migrationHelp")}</p>}
             {opening && <p role="status">{t("lease.provisioning", { time: date(new Date(rental.activationDeadline
               ? rental.activationDeadline * 1000 : Date.parse(row.createdAt) + 600000).toISOString()) })}</p>}
+            {rental.egressIp || rental.country ? (
+              <div className="grid gap-1">
+                <span className="text-xs text-muted-foreground">{t("clientRentals.egress")}</span>
+                <ClientEgressLine listing={{ country: rental.country ?? row.countryCode, egressIp: rental.egressIp ?? null }} emphasize />
+                {rental.egressIp ? <span className="text-xs text-muted-foreground">{t("clientMarket.mine.ipHint")}</span> : null}
+                {rental.egressDiffers ? <span className="text-xs text-amber-800">{t("clientRentals.egressDiffers")}</span> : null}
+              </div>
+            ) : null}
+            <RecordDetailList
+              items={[
+                { label: t("rentalAudit.status"), value: t(row.status === "free" ? "shareMarket.free" : `rentalAudit.status.${row.status}`) },
+                { label: t("rentalAudit.price"), value: price(row) },
+                { label: t("account.market.col.term"), value: date(row.periodEnd || row.expiresAt) },
+                ...(billedTime(rental) ? [{ label: t("clientRentals.billedHours"), value: billedTime(rental) }] : []),
+                ...(trialChoice ? [{
+                  label: t("clientMarket.mine.afterTrial"),
+                  value: <button type="button" className="rounded text-left font-medium text-accent hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent" onClick={() => setAfterTrial({
+                    contractId: row.contractId!, name: rental.title || clientRentalLabel(row), to: rental.afterTrial === "end" ? "continue" : "end",
+                    price: row.cyclePriceMinor != null ? formatUsdMoney(row.cyclePriceMinor, locale) : "", trialSecondsRemaining: row.trialSecondsRemaining ?? 0,
+                  })}>
+                    {t(rental.afterTrial === "end" ? "clientMarket.mine.afterTrialEnd" : "clientMarket.mine.afterTrialContinue")}
+                    <span className="ml-1 text-xs font-normal text-muted-foreground">· {t("clientMarket.mine.change")}</span>
+                  </button>,
+                }] : []),
+              ]}
+            />
             {rental.clientUrl && row.activatedAt && <>
               <p className="break-all"><span className="text-muted-foreground">{t("clientMarket.shop.address")} · </span>{rental.clientUrl}</p>
               <p className="break-all text-xs text-muted-foreground">{t("lease.usage", { host: "<slug>--" + new URL(rental.clientUrl).host })}</p>
             </>}
             {rental.grantUntil && <p className="text-xs">{t("clientMarket.shop.grant")} · {date(new Date(rental.grantUntil * 1000).toISOString())}</p>}
-            {rental.holdStatus && <p>{t(`lease.hold.${rental.holdStatus}`)}</p>}
+            {rental.holdStatus && <p className="text-xs text-muted-foreground">{t(`lease.hold.${rental.holdStatus}`)}</p>}
             <LeaseActions id={rental.leaseId} upgradeTarget={rental.canUpgrade ? clientRentalLabel(row) : undefined} active={!!row.activatedAt && !row.endedAt} address={rental.clientUrl} canEnd={!row.endedAt} onChanged={changed} />
           </div>}
-          <RecordDetailList
-            items={[
-              { label: t("clientRentals.recordId"), value: <span className="break-all">{row.id}</span> },
-              {
-                label: t("online.clientColumn"),
-                value: <span className="break-all">{clientRentalLabel(row)}</span>,
-              },
-              { label: t("account.market.col.provider"), value: row.providerEmail || "—" },
-              { label: t("rentalAudit.created"), value: date(row.createdAt) },
-              { label: t("rentalAudit.activated"), value: date(row.activatedAt) },
-              { label: t("rentalAudit.ended"), value: date(row.endedAt) },
-              { label: t("rentalAudit.cleanupAt"), value: date(row.cleanupConfirmedAt) },
-              { label: t("account.market.col.term"), value: date(row.periodEnd || row.expiresAt) },
-              {
-                label: t("rentalAudit.price"),
-                value:
-                  row.cyclePriceMinor !== null
-                    ? t("rentalAudit.monthlyPrice", { price: formatUsdMoney(row.cyclePriceMinor, locale) })
-                    : row.dailyRateMinor !== null
-                      ? t("rentalAudit.dailyPrice", { price: formatUsdMoney(row.dailyRateMinor, locale) })
-                      : row.pricingModel === "free"
-                        ? t("shareMarket.free")
-                        : "—",
-              },
-              {
-                label: t("rentalAudit.status"),
-                value: t(row.status === "free" ? "shareMarket.free" : `rentalAudit.status.${row.status}`),
-              },
-              { label: t("rentalAudit.attention"), value: t(`rentalAudit.attention.${row.attention}`) },
-              { label: t("clientRentals.cleanup"), value: t(`rentalAudit.cleanup.${row.cleanupStatus}`) },
-            ]}
-          />
+          {!rental ? (
+            <RecordDetailList
+              items={[
+                { label: t("rentalAudit.status"), value: t(row.status === "free" ? "shareMarket.free" : `rentalAudit.status.${row.status}`) },
+                { label: t("account.market.col.provider"), value: row.providerEmail || "—" },
+                { label: t("rentalAudit.price"), value: price(row) },
+                { label: t("rentalAudit.ended"), value: date(row.endedAt) },
+              ]}
+            />
+          ) : null}
           {row.group === "history" && row.attention !== "none" ? (
             <p className="text-xs text-amber-800">{t("clientRentals.followup")}</p>
           ) : null}
-          {row.trialSecondsRemaining !== null ? (
-            <p className="text-xs text-muted-foreground">
-              {t("clientRentals.trial", {
-                used: detail.trialConsumedSeconds,
-                remaining: row.trialSecondsRemaining,
-              })}
-            </p>
-          ) : null}
-          <section className="grid gap-2 rounded-lg border border-border p-3">
-            <p className="text-xs text-muted-foreground">{t("clientRentals.financialHelp")}</p>
-            {row.money ? (
-              <RecordDetailList
-                items={CLIENT_RENTAL_MONEY_FIELDS.map((key) => ({
-                  label: t(key === "netUnits" ? "clientRentals.netUnits" : `rentalAudit.${key}`),
-                  value: money(row.money![key]),
-                }))}
-              />
-            ) : (
-              <p className="text-xs text-muted-foreground">{t("rentalAudit.moneyUnavailable")}</p>
-            )}
-          </section>
           {detail.settlement ? (
             <section className="grid gap-2 rounded-lg border border-border p-3">
               <h5 className="text-sm font-medium">{t("clientRentals.settlement")}</h5>
               <RecordDetailList
                 items={[
-                  {
-                    label: t("clientRentals.reason"),
-                    value: t(
-                      detail.settlement.reason === "provider_issue"
-                        ? "clientTermination.providerIssue"
-                        : detail.settlement.reason === "platform_issue"
-                          ? "clientTermination.platformIssue"
-                          : detail.settlement.reason === "voluntary"
-                            ? "clientTermination.voluntary"
-                            : "clientTermination.systemExit",
-                    ),
-                  },
+                  { label: t("clientRentals.reason"), value: t(endReasonKey(detail.settlement.reason)) },
                   {
                     label: t("clientRentals.responsibility"),
                     value: t(
@@ -355,64 +353,98 @@ function RentalDetail({ id, refreshKey, onChanged, onTerminationOpen, onForbidde
               ) : null}
             </>
           ) : null}
-          <details className="min-w-0 rounded-lg border border-border p-3">
-            <summary className="cursor-pointer text-sm font-medium">{t("rentalAudit.periods")}</summary>
-            <div className="mt-3 grid gap-2 text-xs">
-              {detail.periods.length ? (
-                detail.periods.map((p) => (
-                  <div key={p.id} className="grid gap-1 border-t border-border pt-2">
-                    <strong>{t("rentalAudit.period", { sequence: p.sequence })}</strong>
-                    <span>
-                      {date(p.startedAt)} → {date(p.endedAt)}
-                    </span>
-                    <span>
-                      {t("clientRentals.periodAmount", {
-                        amount: money(p.amountUnits),
-                        returned: money(p.returnedUnits),
-                      })}
-                    </span>
-                  </div>
-                ))
-              ) : (
-                <p className="text-muted-foreground">{t("rentalAudit.noPeriods")}</p>
-              )}
-              {detail.periodsNextCursor !== null ? (
-                <Button size="sm" variant="ghost" isDisabled={busy} onPress={() => void load("periods")}>
-                  {t("rentalAudit.morePeriods")}
-                </Button>
+          <details className="group min-w-0 rounded-lg border border-border">
+            <summary className="flex min-h-11 cursor-pointer list-none items-center justify-between gap-3 px-3 text-sm font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent [&::-webkit-details-marker]:hidden">
+              {t("clientRentals.ledger")}
+              <ChevronDown aria-hidden className="size-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-180 motion-reduce:transition-none" />
+            </summary>
+            <div className="grid gap-3 border-t border-border p-3">
+              <RecordDetailList
+                items={[
+                  { label: t("clientRentals.recordId"), value: <span className="break-all">{row.id}</span> },
+                  { label: t("online.clientColumn"), value: <span className="break-all">{clientRentalLabel(row)}</span> },
+                  { label: t("account.market.col.provider"), value: row.providerEmail || "—" },
+                  { label: t("rentalAudit.created"), value: date(row.createdAt) },
+                  { label: t("rentalAudit.activated"), value: date(row.activatedAt) },
+                  { label: t("rentalAudit.ended"), value: date(row.endedAt) },
+                  { label: t("rentalAudit.cleanupAt"), value: date(row.cleanupConfirmedAt) },
+                  { label: t("rentalAudit.attention"), value: t(`rentalAudit.attention.${row.attention}`) },
+                  { label: t("clientRentals.cleanup"), value: t(`rentalAudit.cleanup.${row.cleanupStatus}`) },
+                ]}
+              />
+              {row.trialSecondsRemaining !== null ? (
+                <p className="text-xs text-muted-foreground">
+                  {t("clientRentals.trial", {
+                    used: detail.trialConsumedSeconds,
+                    remaining: row.trialSecondsRemaining,
+                  })}
+                </p>
               ) : null}
+              <section className="grid gap-2">
+                <p className="text-xs text-muted-foreground">{t("clientRentals.financialHelp")}</p>
+                {row.money ? (
+                  <RecordDetailList
+                    items={CLIENT_RENTAL_MONEY_FIELDS.map((key) => ({
+                      label: t(key === "netUnits" ? "clientRentals.netUnits" : `rentalAudit.${key}`),
+                      value: money(row.money![key]),
+                    }))}
+                  />
+                ) : (
+                  <p className="text-xs text-muted-foreground">{t("rentalAudit.moneyUnavailable")}</p>
+                )}
+              </section>
+              <div className="grid gap-2 text-xs">
+                <strong className="text-sm font-medium">{t("rentalAudit.periods")}</strong>
+                {detail.periods.length ? (
+                  detail.periods.map((p) => (
+                    <div key={p.id} className="grid gap-1 border-t border-border pt-2">
+                      <strong>{t("rentalAudit.period", { sequence: p.sequence })}</strong>
+                      <span>
+                        {date(p.startedAt)} → {date(p.endedAt)}
+                      </span>
+                      <span>
+                        {t("clientRentals.periodAmount", {
+                          amount: money(p.amountUnits),
+                          returned: money(p.returnedUnits),
+                        })}
+                      </span>
+                    </div>
+                  ))
+                ) : (
+                  <p className="text-muted-foreground">{t("rentalAudit.noPeriods")}</p>
+                )}
+                {detail.periodsNextCursor !== null ? (
+                  <Button size="sm" variant="ghost" isDisabled={busy} onPress={() => void load("periods")}>
+                    {t("rentalAudit.morePeriods")}
+                  </Button>
+                ) : null}
+              </div>
+              <div className="grid gap-2 text-xs">
+                <strong className="text-sm font-medium">{t("rentalAudit.events")}</strong>
+                <ol className="grid gap-2">
+                  {detail.events.map((event) => {
+                    const key = `rentalAudit.event.${event.action}`;
+                    return (
+                      <li key={event.id} className="grid min-w-0 gap-1 border-t border-border pt-2">
+                        <span>
+                          {date(event.createdAt)} ·{" "}
+                          {t((key in rentalAuditMessagesEn ? key : "rentalAudit.event.updated") as MessageKey)}
+                          {(event.occurrences ?? 0) > 1 && ` ×${event.occurrences}`}
+                        </span>
+                        {event.note ? (
+                          <p className="whitespace-pre-wrap break-words text-muted-foreground">{event.note}</p>
+                        ) : null}
+                      </li>
+                    );
+                  })}
+                </ol>
+                {detail.eventsNextCursor ? (
+                  <Button size="sm" variant="ghost" isDisabled={busy} onPress={() => void load("events")}>
+                    {t("rentalAudit.moreEvents")}
+                  </Button>
+                ) : null}
+              </div>
             </div>
-          </details>
-          <details className="min-w-0 rounded-lg border border-border p-3">
-            <summary className="cursor-pointer text-sm font-medium">{t("rentalAudit.events")}</summary>
-            <ol className="mt-3 grid gap-2 text-xs">
-              {detail.events.map((event) => {
-                const key = `rentalAudit.event.${event.action}`;
-                return (
-                  <li key={event.id} className="grid min-w-0 gap-1 border-t border-border pt-2">
-                    <span>
-                      {date(event.createdAt)} ·{" "}
-                      {t((key in rentalAuditMessagesEn ? key : "rentalAudit.event.updated") as MessageKey)}
-                      {(event.occurrences ?? 0) > 1 && ` ×${event.occurrences}`}
-                    </span>
-                    {event.note ? (
-                      <p className="whitespace-pre-wrap break-words text-muted-foreground">{event.note}</p>
-                    ) : null}
-                  </li>
-                );
-              })}
-            </ol>
-            {detail.eventsNextCursor ? (
-              <Button
-                className="mt-2"
-                size="sm"
-                variant="ghost"
-                isDisabled={busy}
-                onPress={() => void load("events")}
-              >
-                {t("rentalAudit.moreEvents")}
-              </Button>
-            ) : null}
           </details>
           <div className="flex flex-wrap items-center justify-between gap-2">
             <p className="text-xs text-muted-foreground">
@@ -425,6 +457,7 @@ function RentalDetail({ id, refreshKey, onChanged, onTerminationOpen, onForbidde
               </Button>
             ) : null}
           </div>
+          <ClientAfterTrialDialog target={afterTrial} onClose={() => setAfterTrial(null)} onChanged={changed} />
         </>
       ) : null}
     </div>

@@ -58,7 +58,7 @@ test("current rental actions require a valid matching live lifecycle", () => {
     assert.throws(() => parseClientRentalDetail({ ...detail(), record: current, rental: { ...rental, ...patch } }, record().id));
   }
 });
-test("buyer receipts open the account rental view and the market gates Owner audit before any read", () => {
+test("buyer receipts stay on the market page and the market gates Owner audit before any read", () => {
   assert.match(source("components/dashboard/account-client-section.tsx"), /role === "user"[\s\S]*<ClientRentalRecords/);
   const market = source("components/dashboard/client-market-page.tsx");
   assert.doesNotMatch(market, /<ClientRentalRecords/);
@@ -79,8 +79,10 @@ test("buyer receipts open the account rental view and the market gates Owner aud
   assert.match(audit, /if \(!active\) \{[\s\S]*?return;[\s\S]*?getRentalAudit\(/);
   assert.match(audit, /request.current\?\.abort\(\); setRead\(null\); setSelected\(null\)/);
   const online = source("components/dashboard/client-market/online-market.tsx");
-  assert.match(online, /showReceipt\(receipt\.leaseId\)/);
-  assert.match(online, /router.push\(clientMarketTenantHref\(id\)\)/);
+  assert.match(online, /onReceipt: showReceipt/);
+  assert.doesNotMatch(online, /router\.push/);
+  assert.match(online, /<MyClientRentals revision=\{rentalRevision\} highlightId=\{newLease\}/);
+  assert.match(source("components/dashboard/client-market/client-checkout.tsx"), /onReceipt\(leaseId\)/);
   assert.match(shared, /<LeaseActions/);
 });
 test("personal records have complete bilingual copy", () => {
