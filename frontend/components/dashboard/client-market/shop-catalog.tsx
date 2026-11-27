@@ -22,9 +22,12 @@ import {
   onlineListingRentable,
   onlineStatusKey,
   SHOP_BROWSE_KEY,
+  SHOP_CONTINENTS,
   SHOP_PAGE_SIZE,
   SHOP_UNKNOWN_COUNTRY,
+  shopContinentForCountry,
   shopCountryKey,
+  type ShopContinent,
   sortShopCountries,
   sortShopListings,
 } from "./host-utils";
@@ -55,7 +58,7 @@ function RiskNotice() {
       <p className="min-w-0 flex-1 leading-6">{t("clientMarket.risk.notice")}</p>
       <button
         type="button"
-        className="min-h-11 shrink-0 rounded-lg px-2 text-xs font-medium text-amber-900 hover:bg-amber-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+        className="h-9 shrink-0 rounded-lg px-2 text-xs font-medium text-amber-900 hover:bg-amber-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
         onClick={() => setDismissed(true)}
       >
         {t("clientMarket.risk.dismiss")}
@@ -89,8 +92,9 @@ export function ShopCatalog({
     (code: string) => (/^[A-Z]{2}$/.test(code) ? names.of(code) || code : t("clientMarket.shop.unknownRegion")),
     [names, t],
   );
-  const [browse, setBrowse] = usePersistentState<{ country: string; rentableOnly: boolean }>(SHOP_BROWSE_KEY, {
+  const [browse, setBrowse] = usePersistentState<{ country: string; continent?: string; rentableOnly: boolean }>(SHOP_BROWSE_KEY, {
     country: "",
+    continent: "all",
     rentableOnly: true,
   });
   // A shared link's country wins over the remembered one.
@@ -102,6 +106,12 @@ export function ShopCatalog({
   });
   const remembered = /^[A-Z]{2}$/.test(browse.country) || browse.country === SHOP_UNKNOWN_COUNTRY ? browse.country : "";
   const country = linkCountry ?? remembered;
+  // A chosen country always implies its continent, so the two never disagree.
+  const continentOf = (code: string) => shopContinentForCountry(code === SHOP_UNKNOWN_COUNTRY ? "" : code);
+  const rememberedContinent = (SHOP_CONTINENTS as readonly string[]).includes(browse.continent || "")
+    ? (browse.continent as ShopContinent)
+    : "all";
+  const continent: ShopContinent = country ? continentOf(country) : rememberedContinent;
   const [query, setQuery] = React.useState(() =>
     typeof window === "undefined" ? "" : new URLSearchParams(window.location.search).get("q") || "",
   );
@@ -115,23 +125,31 @@ export function ShopCatalog({
   );
   const visible = sortShopListings(
     pool.filter(
-      (item) => (!country || shopCountryKey(item.country) === country) && matchesShopQuery(item, query, countryName),
+      (item) =>
+        (continent === "all" || continentOf(shopCountryKey(item.country)) === continent) &&
+        (!country || shopCountryKey(item.country) === country) &&
+        matchesShopQuery(item, query, countryName),
     ),
   );
   const pages = Math.max(1, Math.ceil(visible.length / SHOP_PAGE_SIZE));
   const current = Math.min(page, pages);
   const shown = visible.slice((current - 1) * SHOP_PAGE_SIZE, current * SHOP_PAGE_SIZE);
   const selected = selectedId ? listings.find((item) => item.installationId === selectedId) ?? null : null;
-  React.useEffect(() => setPage(1), [country, query, rentableOnly]);
+  React.useEffect(() => setPage(1), [continent, country, query, rentableOnly]);
 
   const selectCountry = (code: string) => {
     const next = code === SHOP_UNKNOWN_COUNTRY || /^[A-Z]{2}$/.test(code) ? code : "";
     setLinkCountry(null);
-    setBrowse((value) => ({ ...value, country: next }));
+    setBrowse((value) => ({ ...value, country: next, continent: next ? continentOf(next) : value.continent }));
     updateMarketSearch((params) => {
       if (/^[A-Z]{2}$/.test(next)) params.set("country", next);
       else params.delete("country");
     });
+  };
+  const selectContinent = (next: ShopContinent) => {
+    setLinkCountry(null);
+    setBrowse((value) => ({ ...value, country: "", continent: next }));
+    updateMarketSearch((params) => params.delete("country"));
   };
   const changeQuery = (next: string) => {
     setQuery(next);
@@ -147,6 +165,8 @@ export function ShopCatalog({
       {providerNotice}
       <ClientShopFilters
         cards={cards}
+        continent={continent}
+        onContinent={selectContinent}
         country={country}
         onCountry={selectCountry}
         query={query}
@@ -161,7 +181,7 @@ export function ShopCatalog({
         <div className="grid justify-items-center gap-2 rounded-xl border border-dashed border-border px-4 py-12 text-center text-sm text-muted-foreground">
           <p>
             {t(
-              query.trim() || country
+              query.trim() || country || continent !== "all"
                 ? "clientMarket.shop.noHosts"
                 : rentableOnly && listed.length
                   ? "clientMarket.shop.rentableEmpty"
@@ -171,7 +191,7 @@ export function ShopCatalog({
           {rentableOnly && listed.length > pool.length ? (
             <button
               type="button"
-              className="min-h-11 rounded-lg px-2 text-sm font-medium text-accent hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+              className="h-9 rounded-lg px-2 text-sm font-medium text-accent hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
               onClick={() => setBrowse((value) => ({ ...value, rentableOnly: false }))}
             >
               {t("clientMarket.shop.showAll")}
@@ -294,7 +314,7 @@ function ClientDetailDrawer({
                   disabled={busy}
                   onClick={() => onRent(listing)}
                   className={cn(
-                    "min-h-11 rounded-xl bg-gradient-to-r from-accent to-[#4D7CFF] px-5 text-sm font-semibold text-white shadow-sm transition-all duration-200 hover:-translate-y-0.5 hover:brightness-110 active:scale-[0.98] disabled:opacity-60",
+                    "inline-flex h-9 items-center rounded-lg px-4 text-sm font-semibold transition-colors disabled:opacity-60 bg-slate-900 text-white hover:bg-slate-800 active:bg-slate-700",
                     "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2",
                   )}
                 >

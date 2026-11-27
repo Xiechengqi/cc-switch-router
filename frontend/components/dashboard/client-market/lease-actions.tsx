@@ -100,7 +100,7 @@ export function LeaseActions({
       {active && showConsole && (
         <>
           <a
-            className="inline-flex min-h-11 items-center rounded font-medium text-accent underline"
+            className="inline-flex h-9 items-center rounded font-medium text-accent underline"
             href={openHref}
             target="_blank"
             rel="noopener noreferrer"

@@ -48,7 +48,7 @@ import { useClientChat } from "@/components/chat/client-chat";
 import { useAuth } from "@/components/auth/auth-provider";
 import { buildClientInstallCommand, InstallGuideDialog } from "@/components/dashboard/install-guide-dialog";
 
-import { clientMarketAddHostHref, clientMarketMineHref, clientMarketTenantHref } from "@/lib/dashboard-nav";
+import { clientMarketMineHref, clientMarketTenantHref } from "@/lib/dashboard-nav";
 import { getShareMarketCatalog } from "@/lib/api";
 import { listingIdleCount } from "@/components/dashboard/share-market/market-utils";
 import { SubdomainCopyButton } from "@/components/dashboard/subdomain-copy-button";
@@ -538,7 +538,9 @@ function ClientCard({
               <ClientChatButton client={client} />
               {session?.authenticated &&
                 owner?.toLowerCase() === session.user?.email?.toLowerCase() &&
-                (client.installation.marketListed ? (
+                // Listing starts from "Add" in the Client market; the card only
+                // links an already listed Client back to where it is managed.
+                client.installation.marketListed && (
                   <a
                     className="rounded-md bg-sky-50 px-1.5 py-0.5 text-xs font-semibold text-sky-800"
                     href={client.rental?.controlId
@@ -547,17 +549,7 @@ function ClientCard({
                   >
                     {t(client.rental ? "clientRentals.details" : "dashboard.marketManaged")}
                   </a>
-                ) : (
-                  client.installation.marketLeaseV1 &&
-                  client.clientTunnel?.online && (
-                    <a
-                      className="text-xs text-accent underline"
-                      href={clientMarketAddHostHref(client.installation.id)}
-                    >
-                      {t("online.list")}
-                    </a>
-                  )
-                ))}
+                )}
             </div>
           </div>
 

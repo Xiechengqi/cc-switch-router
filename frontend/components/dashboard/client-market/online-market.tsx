@@ -213,7 +213,7 @@ function OnlineMarketView({
       {error && view !== "audit" ? (
         <div role="alert" className="flex flex-wrap items-center gap-2 text-sm text-destructive">
           {error}
-          <Button size="sm" variant="ghost" className="min-h-11" onPress={reload}>
+          <Button size="sm" variant="ghost" className="h-9" onPress={reload}>
             {t("common.reload")}
           </Button>
         </div>

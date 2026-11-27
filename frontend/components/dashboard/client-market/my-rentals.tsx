@@ -115,7 +115,7 @@ function Rentals({
           {t("clientMarket.mine.title")}
           <span className="ml-1.5 tabular-nums text-slate-400">{leases.length}</span>
         </h2>
-        <Link href={clientMarketTenantHref()} className={cn("ml-auto inline-flex min-h-11 items-center rounded px-1 text-xs font-medium text-accent hover:underline", focusRing)}>
+        <Link href={clientMarketTenantHref()} className={cn("ml-auto inline-flex h-9 items-center rounded px-1 text-xs font-medium text-accent hover:underline", focusRing)}>
           {t("clientMarket.mine.records")}
         </Link>
       </div>
@@ -248,7 +248,7 @@ function RentalCard({
             <span className="text-muted-foreground">{t("clientMarket.mine.afterTrial")}</span>
             <button
               type="button"
-              className={cn("min-h-11 w-fit rounded text-left text-sm font-medium text-accent hover:underline", focusRing)}
+              className={cn("min-h-9 w-fit rounded text-left text-sm font-medium text-accent hover:underline", focusRing)}
               onClick={() =>
                 onAfterTrial({
                   contractId: lease.contractId!,
@@ -275,7 +275,7 @@ function RentalCard({
             target="_blank"
             rel="noopener noreferrer"
             className={cn(
-              "group inline-flex min-h-11 items-center gap-2 rounded-xl bg-gradient-to-r from-accent to-[#4D7CFF] px-5 text-sm font-semibold text-white shadow-sm transition-all duration-200 hover:-translate-y-0.5 hover:shadow-[0_4px_14px_rgba(0,82,255,0.25)] hover:brightness-110 active:scale-[0.98] motion-reduce:transition-none motion-reduce:hover:translate-y-0",
+              "group inline-flex h-9 items-center gap-1.5 rounded-lg bg-slate-900 px-3 text-xs font-semibold text-white transition-colors hover:bg-slate-800 active:bg-slate-700",
               focusRing,
             )}
             onClick={() => onStep("console", true)}
@@ -293,11 +293,11 @@ function RentalCard({
           onChanged={onChanged}
         />
         {lease.terminationId ? (
-          <button type="button" className={cn("min-h-11 rounded px-1 text-sm text-accent hover:underline", focusRing)} onClick={() => onTerminationOpen(lease.terminationId!)}>
+          <button type="button" className={cn("h-9 rounded px-1 text-xs text-accent hover:underline", focusRing)} onClick={() => onTerminationOpen(lease.terminationId!)}>
             {t("online.exitRecord")}
           </button>
         ) : null}
-        <Link href={clientMarketTenantHref(lease.leaseId)} className={cn("ml-auto inline-flex min-h-11 items-center rounded px-1 text-sm text-muted-foreground hover:text-foreground", focusRing)}>
+        <Link href={clientMarketTenantHref(lease.leaseId)} className={cn("ml-auto inline-flex h-9 items-center rounded px-1 text-xs text-muted-foreground hover:text-foreground", focusRing)}>
           {t("clientMarket.mine.details")}
         </Link>
       </footer>
@@ -384,7 +384,7 @@ function Onboarding({
             <span
               className={cn(
                 "mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-full text-xs font-semibold",
-                step.checked ? "bg-gradient-to-br from-accent to-[#4D7CFF] text-white" : "border border-border bg-card text-muted-foreground",
+                step.checked ? "bg-slate-900 text-white" : "border border-border bg-card text-muted-foreground",
               )}
               aria-hidden
             >
@@ -402,7 +402,7 @@ function Onboarding({
               <span
                 className={cn(
                   "flex size-6 items-center justify-center rounded-full text-xs font-semibold transition-colors",
-                  step.checked ? "bg-gradient-to-br from-accent to-[#4D7CFF] text-white" : "border border-border bg-card text-muted-foreground group-hover/step:border-accent/40",
+                  step.checked ? "bg-slate-900 text-white" : "border border-border bg-card text-muted-foreground group-hover/step:border-accent/40",
                 )}
               >
                 {step.checked ? <Check className="size-3.5" aria-hidden /> : index + 1}

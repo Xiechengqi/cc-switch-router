@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import { Button } from "@heroui/react";
-import { Globe2, Plus, Search, X } from "lucide-react";
+import { CircleDot, Globe2, Plus, Search, X } from "lucide-react";
 import { formatAgeDaysOrHours } from "@/components/dashboard/share-dashboard-utils";
 import { CountryFlag } from "@/components/common/country-flag";
 import { useLocaleText } from "@/components/i18n/locale-provider";
@@ -12,7 +12,9 @@ import { cn } from "@/lib/utils";
 import {
   onlineListingAvailability,
   onlineStatusKey,
+  SHOP_CONTINENTS,
   SHOP_UNKNOWN_COUNTRY,
+  type ShopContinent,
   type ShopCountryCard,
 } from "./host-utils";
 
@@ -31,13 +33,28 @@ function useRegionName() {
   };
 }
 
+/** Share Market filter chip (`market-listing-filters.tsx`): gray, sky when selected. */
+const SHOP_CHIP =
+  "inline-flex h-9 shrink-0 items-center gap-1.5 rounded-lg px-2.5 text-xs transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary disabled:cursor-not-allowed disabled:opacity-50";
+const shopChip = (selected: boolean) =>
+  cn(
+    SHOP_CHIP,
+    selected
+      ? "bg-sky-100 font-semibold text-sky-800"
+      : "bg-slate-100 font-medium text-slate-600 enabled:hover:bg-slate-200 enabled:hover:text-slate-900",
+  );
+const shopChipCount = (selected: boolean) => cn("tabular-nums", selected ? "text-sky-600" : "text-slate-400");
+
 /**
- * Filter bar: one row of country chips with how many Clients can be rented in
- * each, the "rentable only" switch and a search box. Chips scroll sideways on
- * narrow screens instead of wrapping into a wall.
+ * Filter bar in the Share Market toolbar layout: continent tabs on the left
+ * (every continent always shown, disabled when it has no Client), then the
+ * "rentable only" toggle and the search box at the far right. Countries of the
+ * chosen continent follow on a second, sideways-scrolling row.
  */
 export function ClientShopFilters({
   cards,
+  continent,
+  onContinent,
   country,
   onCountry,
   query,
@@ -45,6 +62,8 @@ export function ClientShopFilters({
   rentable,
 }: {
   cards: ShopCountryCard[];
+  continent: ShopContinent;
+  onContinent: (next: ShopContinent) => void;
   country: string;
   onCountry: (code: string) => void;
   query: string;
@@ -53,61 +72,76 @@ export function ClientShopFilters({
 }) {
   const { locale, t } = useLocaleText();
   const regionName = useRegionName();
-  const total = cards.reduce((sum, card) => sum + card.idle, 0);
   const priceOf = (card: ShopCountryCard) =>
     card.hasFreeIdle || card.minMonthlyMinor == null ? t("online.free") : formatUsdMoney(card.minMonthlyMinor, locale);
-  const chip = (selected: boolean) =>
-    cn(
-      "inline-flex min-h-11 shrink-0 items-center gap-1.5 rounded-full border px-3 text-xs transition-colors duration-200",
-      focusRing,
-      selected
-        ? "border-accent/40 bg-accent/10 font-semibold text-accent"
-        : "border-border bg-card text-foreground hover:border-accent/30",
-    );
+  const inContinent = (value: ShopContinent) => (value === "all" ? cards : cards.filter((card) => card.continent === value));
+  const idle = (list: ShopCountryCard[]) => list.reduce((sum, card) => sum + card.idle, 0);
+  const countries = inContinent(continent);
   return (
-    <div className="grid min-w-0 gap-2.5">
+    <div className="grid min-w-0 gap-2">
       <div className="flex min-w-0 flex-wrap items-center gap-2">
-        <label className="flex h-11 min-w-0 flex-1 items-center gap-2 rounded-lg border border-border bg-card px-3 text-sm shadow-sm focus-within:ring-2 focus-within:ring-accent sm:max-w-xs">
-          <Search className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+        <div
+          role="tablist"
+          aria-label={t("clientMarket.shop.continentLabel")}
+          className="flex min-w-0 flex-1 basis-full items-center gap-1 overflow-x-auto sm:basis-auto"
+        >
+          {SHOP_CONTINENTS.map((value) => {
+            const members = inContinent(value);
+            const selected = value === continent;
+            return (
+              <button
+                key={value}
+                type="button"
+                role="tab"
+                aria-selected={selected}
+                disabled={!selected && members.length === 0}
+                className={shopChip(selected)}
+                onClick={() => onContinent(selected ? "all" : value)}
+              >
+                <span>{t(`clientMarket.shop.continent.${value}`)}</span>
+                <span className={shopChipCount(selected)}>{idle(members)}</span>
+              </button>
+            );
+          })}
+        </div>
+        <button
+          type="button"
+          aria-pressed={rentable.pressed}
+          className={shopChip(rentable.pressed)}
+          onClick={rentable.onClick}
+        >
+          <CircleDot className={cn("h-3.5 w-3.5", rentable.pressed ? "text-sky-600" : "text-slate-400")} aria-hidden />
+          <span className="whitespace-nowrap">{rentable.label}</span>
+        </button>
+        <label className="flex h-9 w-44 shrink-0 grow items-center gap-1.5 rounded-md border border-slate-200 bg-white px-2.5 text-sm shadow-sm hover:border-slate-300 focus-within:outline focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-primary sm:grow-0">
+          <Search className="h-3.5 w-3.5 shrink-0 text-slate-400" aria-hidden />
           <input
             type="search"
             aria-label={t("clientMarket.shop.search")}
             placeholder={t("clientMarket.shop.search")}
             value={query}
-            className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground/60"
+            className="min-w-0 flex-1 bg-transparent text-xs outline-none [&::-webkit-search-cancel-button]:hidden"
             onChange={(event) => onQuery(event.target.value)}
           />
           {query ? (
-            <button type="button" aria-label={t("common.reset")} className={cn("rounded", focusRing)} onClick={() => onQuery("")}>
-              <X className="size-3.5 text-muted-foreground" aria-hidden />
+            <button
+              type="button"
+              aria-label={t("common.reset")}
+              className="rounded active:bg-slate-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+              onClick={() => onQuery("")}
+            >
+              <X className="h-3.5 w-3.5 text-slate-400" aria-hidden />
             </button>
           ) : null}
         </label>
-        <button
-          type="button"
-          aria-pressed={rentable.pressed}
-          className={cn(
-            "ml-auto inline-flex h-11 shrink-0 items-center gap-2 rounded-lg border px-3 text-xs font-medium transition-colors duration-200",
-            focusRing,
-            rentable.pressed ? "border-accent/40 bg-accent/10 text-accent" : "border-border bg-card text-muted-foreground hover:text-foreground",
-          )}
-          onClick={rentable.onClick}
-        >
-          <span className={cn("size-2 rounded-full", rentable.pressed ? "bg-accent" : "bg-slate-300")} aria-hidden />
-          {rentable.label}
-        </button>
       </div>
-      {cards.length > 0 ? (
+      {countries.length > 0 ? (
         <div
-          className="-mx-1 flex min-w-0 gap-1.5 overflow-x-auto px-1 pb-1 [scrollbar-width:thin]"
+          className="-mx-1 flex min-w-0 gap-1 overflow-x-auto px-1 pb-1 [scrollbar-width:thin]"
           role="group"
           aria-label={t("clientMarket.shop.countryLabel")}
         >
-          <button type="button" aria-pressed={!country} className={chip(!country)} onClick={() => onCountry("")}>
-            {t("clientMarket.shop.allCountries")}
-            <span className="tabular-nums text-muted-foreground">{total}</span>
-          </button>
-          {cards.map((card) => {
+          {countries.map((card) => {
             const known = card.code !== SHOP_UNKNOWN_COUNTRY;
             const selected = card.code === country;
             const name = regionName(known ? card.code : null);
@@ -118,12 +152,12 @@ export function ClientShopFilters({
                 aria-pressed={selected}
                 aria-label={t(selected ? "clientMarket.shop.clearCountry" : "clientMarket.shop.selectCountry", { name })}
                 title={card.idle > 0 ? t("clientMarket.shop.priceFrom", { price: priceOf(card) }) : undefined}
-                className={chip(selected)}
+                className={shopChip(selected)}
                 onClick={() => onCountry(selected ? "" : card.code)}
               >
                 {known ? <CountryFlag code={card.code} size="compact" title={name} /> : <Globe2 className="size-3.5" aria-hidden />}
                 <span className="max-w-32 truncate">{name}</span>
-                <span className="tabular-nums text-muted-foreground">{card.idle}</span>
+                <span className={shopChipCount(selected)}>{card.idle}</span>
               </button>
             );
           })}
@@ -352,7 +386,7 @@ export function ClientOfferCard({
             aria-describedby={nameId}
             onClick={onRent}
             className={cn(
-              "min-h-11 rounded-xl bg-gradient-to-r from-accent to-[#4D7CFF] px-4 text-sm font-semibold text-white shadow-sm transition-all duration-200 hover:-translate-y-0.5 hover:brightness-110 active:scale-[0.98] disabled:opacity-60 motion-reduce:transition-none",
+              "inline-flex h-9 items-center rounded-lg px-3 text-xs font-semibold transition-colors disabled:opacity-60 bg-slate-900 text-white hover:bg-slate-800 active:bg-slate-700",
               focusRing,
             )}
           >

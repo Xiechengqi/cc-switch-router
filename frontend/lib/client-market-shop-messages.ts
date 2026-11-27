@@ -366,7 +366,7 @@ export const clientMarketShopMessagesZh = {
   "notificationCenter.kind.client_lease_reclaim_cancelled": "卖家已取消收回",
   "notificationCenter.kind.client_lease_reclaimed": "你租用的 Client 已被收回",
   "notificationCenter.kind.client_egress_changed": "你租用的 Client 出口 IP 已变化",
-  "clientMarket.shop.onlyRentable": "仅可租",
+  "clientMarket.shop.onlyRentable": "只看可租",
   "clientMarket.shop.onlyIdle": "仅空闲",
   "clientMarket.shop.refresh": "刷新",
   "clientMarket.shop.manage": "管理 Client",

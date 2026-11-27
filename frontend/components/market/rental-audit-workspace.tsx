@@ -26,8 +26,9 @@ import {
 } from "@/lib/client-rental-audit";
 import { formatWalletUnits } from "@/lib/market-wallet-money";
 
-const FIELD = "h-11 w-full min-w-0 rounded-lg border border-border bg-card px-2 text-sm text-foreground outline-none hover:bg-muted/30 focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-50";
-const ACTION = "h-11 min-w-11 shrink-0 whitespace-nowrap px-2 text-xs";
+// Share Market toolbar sizing (CLAUDE.md "Dashboard Toolbars"): 36px controls.
+const FIELD = "h-9 w-full min-w-0 rounded-md border border-slate-200 bg-white px-2.5 text-xs text-foreground shadow-sm outline-none hover:border-slate-300 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary disabled:cursor-not-allowed disabled:opacity-50";
+const ACTION = "h-9 min-w-9 shrink-0 whitespace-nowrap px-2 text-xs";
 const INITIAL = { search: "", buyerEmail: "", providerEmail: "", status: "", attention: "", startDate: "", endDate: "" };
 
 export type RentalAuditBaseRecord = {
@@ -149,14 +150,14 @@ export function RentalAuditWorkspace<R extends RentalAuditBaseRecord, D extends 
     if (number !== null) { setJump(String(number)); setRequestedPage(number); }
   };
   const resetDisabled = !Object.values(draft).some(Boolean) && !Object.values(filters).some(Boolean);
-  return <section aria-labelledby={titleId} className="grid h-[44rem] min-w-0 grid-rows-[2.75rem_8.5rem_1.25rem_19.75rem_minmax(0,1fr)] gap-3 rounded-xl border border-border bg-card p-3 sm:h-[37rem] sm:grid-rows-[2.75rem_4rem_1.25rem_19.75rem_minmax(0,1fr)] sm:p-4" data-testid={`${config.scope}-rental-audit`}>
+  return <section aria-labelledby={titleId} className="grid h-[41.5rem] min-w-0 grid-rows-[2.25rem_7.5rem_1.25rem_19.75rem_minmax(0,1fr)] gap-3 rounded-xl border border-border bg-card p-3 sm:h-[35.5rem] sm:grid-rows-[2.25rem_3.5rem_1.25rem_19.75rem_minmax(0,1fr)] sm:p-4" data-testid={`${config.scope}-rental-audit`}>
     <div className="flex min-w-0 items-center justify-between gap-2">
       <div><h3 id={titleId} className="sr-only">{t("rentalAudit.tab")}</h3><p className="text-xs text-muted-foreground">{t("rentalAudit.ownerOnly")}</p></div>
       <Button size="sm" variant="outline" className={ACTION} aria-label={t("rentalAudit.refresh")} isDisabled={loading} onPress={() => { setRequestedPage(1); setRefresh(n => n + 1); }}><RefreshCw aria-hidden className="h-3.5 w-3.5" /><span className="hidden sm:inline">{t("rentalAudit.refresh")}</span></Button>
     </div>
     <form onSubmit={apply} className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-end gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,0.65fr)_auto]">
       <div className="col-span-2 min-w-0 sm:col-span-1"><Field label={t("rentalAudit.search")}><input className={FIELD} maxLength={254} value={draft.search} placeholder={config.searchHint} onChange={e => setDraft(v => ({ ...v, search: e.target.value }))} /></Field></div>
-      <Field as="div" label={t("rentalAudit.status")}><CompactSelect ariaLabel={t("rentalAudit.status")} className="w-full" triggerClassName="h-11" value={draft.status} onChange={status => setDraft(v => ({ ...v, status }))}
+      <Field as="div" label={t("rentalAudit.status")}><CompactSelect ariaLabel={t("rentalAudit.status")} className="w-full" triggerClassName="h-9" value={draft.status} onChange={status => setDraft(v => ({ ...v, status }))}
         options={[{ value: "", label: t("rentalAudit.all") }, ...config.statuses.map(value => ({ value, label: config.statusLabel(value) }))]} /></Field>
       <div className="flex gap-1">
         <Button size="sm" variant="primary" className={ACTION} type="submit" aria-label={t("rentalAudit.apply")}><Search aria-hidden className="h-3.5 w-3.5" /><span className="hidden md:inline">{t("rentalAudit.apply")}</span></Button>
@@ -176,7 +177,7 @@ export function RentalAuditWorkspace<R extends RentalAuditBaseRecord, D extends 
             <th scope="col" className="w-24 px-2 font-medium sm:w-36 sm:px-3">{t("rentalAudit.status")}</th>
             <th scope="col" className="hidden w-24 px-2 text-right font-medium sm:table-cell">{t("rentalAudit.chargedShort")}</th>
             <th scope="col" className="hidden w-40 px-3 font-medium lg:table-cell">{t("rentalAudit.orderedShort")}</th>
-            <th scope="col" className="w-11"><span className="sr-only">{t("rentalAudit.details")}</span></th>
+            <th scope="col" className="w-10"><span className="sr-only">{t("rentalAudit.details")}</span></th>
           </tr></thead>
           <tbody>{page.items.map(record => <AuditRow key={record.id} config={config} record={record} onOpen={() => setSelected({ scope, id: record.id })} />)}</tbody>
         </table>}
@@ -197,7 +198,7 @@ export function RentalAuditWorkspace<R extends RentalAuditBaseRecord, D extends 
       <form id={formId} onSubmit={apply} className="grid min-w-0 gap-3 sm:grid-cols-2">
         <Field label={t("rentalAudit.buyer")}><input className={FIELD} maxLength={254} value={draft.buyerEmail} onChange={e => setDraft(v => ({ ...v, buyerEmail: e.target.value }))} /></Field>
         <Field label={t("rentalAudit.provider")}><input className={FIELD} maxLength={254} value={draft.providerEmail} onChange={e => setDraft(v => ({ ...v, providerEmail: e.target.value }))} /></Field>
-        <Field as="div" label={t("rentalAudit.attention")}><CompactSelect ariaLabel={t("rentalAudit.attention")} className="w-full" triggerClassName="h-11" value={draft.attention} onChange={attention => setDraft(v => ({ ...v, attention }))}
+        <Field as="div" label={t("rentalAudit.attention")}><CompactSelect ariaLabel={t("rentalAudit.attention")} className="w-full" triggerClassName="h-9" value={draft.attention} onChange={attention => setDraft(v => ({ ...v, attention }))}
           options={[{ value: "", label: t("rentalAudit.all") }, { value: "any", label: t("rentalAudit.anyAttention") }, ...config.attention.map(value => ({ value, label: config.attentionLabel(value) }))]} /></Field>
         <Field label={t("rentalAudit.from")}><input type="date" className={FIELD} value={draft.startDate} onChange={e => setDraft(v => ({ ...v, startDate: e.target.value }))} /></Field>
         <Field label={t("rentalAudit.until")}><input type="date" className={FIELD} value={draft.endDate} onChange={e => setDraft(v => ({ ...v, endDate: e.target.value }))} /></Field>
@@ -236,7 +237,7 @@ function AuditRow<R extends RentalAuditBaseRecord, D extends RentalAuditBaseDeta
       <td className="px-2 sm:px-3"><p className="truncate" title={status}>{status}</p>{attention ? <p className="mt-1 truncate font-medium text-foreground" title={attention}>{attention}</p> : null}</td>
       <td className="hidden px-2 text-right tabular-nums sm:table-cell"><p className="truncate">{record.money ? formatWalletUnits(record.money.chargedUnits, "$", locale) : <span title={t("rentalAudit.moneyUnavailable")}>—</span>}</p></td>
       <td className="hidden px-3 text-muted-foreground lg:table-cell"><time className="block truncate" dateTime={record.createdAt}>{new Intl.DateTimeFormat(locale, { dateStyle: "short", timeStyle: "short" }).format(new Date(record.createdAt))}</time></td>
-      <td><Button size="sm" variant="ghost" className="h-11 w-11" isIconOnly aria-label={t("rentalAudit.open", { client: subject })} aria-haspopup="dialog" onPress={onOpen}>
+      <td><Button size="sm" variant="ghost" className="h-9 w-9" isIconOnly aria-label={t("rentalAudit.open", { client: subject })} aria-haspopup="dialog" onPress={onOpen}>
         <ChevronRight aria-hidden className="h-4 w-4" />
       </Button></td>
     </tr>;

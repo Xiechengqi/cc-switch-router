@@ -138,7 +138,7 @@ export function SellerWorkspace({
     item.incomeUnits != null ? formatWalletUnits(item.incomeUnits, "$", locale) : item.cyclePriceMinor ? "—" : formatUsdMoney(0, locale);
   const editButton = (listing: OnlineListing | undefined) =>
     listing?.state === "listed" ? (
-      <Button size="sm" variant="outline" className="min-h-11" isDisabled={busy} onPress={() => setEditing(listing)}>
+      <Button size="sm" variant="outline" className="h-9" isDisabled={busy} onPress={() => setEditing(listing)}>
         <PencilLine className="size-3.5" aria-hidden />
         {t("clientMarket.edit.action")}
       </Button>
@@ -148,7 +148,7 @@ export function SellerWorkspace({
       <Button
         size="sm"
         variant="outline"
-        className="min-h-11"
+        className="h-9"
         isDisabled={busy}
         onPress={() =>
           void action(async () => {
@@ -236,7 +236,7 @@ export function SellerWorkspace({
                       <Button
                         size="sm"
                         variant="ghost"
-                        className="min-h-11"
+                        className="h-9"
                         isDisabled={busy || !listing}
                         onPress={() => listing && setUnlisting(listing)}
                       >
@@ -257,7 +257,7 @@ export function SellerWorkspace({
                       <Button
                         size="sm"
                         variant="outline"
-                        className="min-h-11 justify-self-start"
+                        className="h-9 justify-self-start"
                         isDisabled={busy}
                         onPress={() =>
                           void action(async () => {
@@ -271,7 +271,7 @@ export function SellerWorkspace({
                     ) : null}
                     {item.listingId && item.id === item.listingId ? (
                       <details className="group min-w-0">
-                        <summary className="flex min-h-11 cursor-pointer items-center text-xs font-medium text-muted-foreground hover:text-foreground">
+                        <summary className="flex min-h-9 cursor-pointer items-center text-xs font-medium text-muted-foreground hover:text-foreground">
                           {t("dashboard.clientOnlineCalendar.title")}
                         </summary>
                         <ClientOnlineHeatmap installationId={item.listingId} />
@@ -321,7 +321,7 @@ export function SellerWorkspace({
                         <Button
                           size="sm"
                           variant="outline"
-                          className="min-h-11"
+                          className="h-9"
                           isDisabled={busy}
                           onPress={() =>
                             void action(async () => {
@@ -338,7 +338,7 @@ export function SellerWorkspace({
                         <Button
                           size="sm"
                           variant="outline"
-                          className="min-h-11"
+                          className="h-9"
                           isDisabled={busy}
                           onPress={() => setReclaiming({ leaseId: item.id, name: nameOf(item), escalate: pending, starting: item.state === "starting" })}
                         >
@@ -348,12 +348,12 @@ export function SellerWorkspace({
                       ) : null}
                       {editButton(listing)}
                       {listing && listing.state !== "unlisted" ? (
-                        <Button size="sm" variant="ghost" className="min-h-11" isDisabled={busy} onPress={() => setUnlisting(listing)}>
+                        <Button size="sm" variant="ghost" className="h-9" isDisabled={busy} onPress={() => setUnlisting(listing)}>
                           {t("online.unlist")}
                         </Button>
                       ) : null}
                       {item.terminationId ? (
-                        <Button size="sm" variant="ghost" className="min-h-11" onPress={() => onTerminationOpen(item.terminationId!)}>
+                        <Button size="sm" variant="ghost" className="h-9" onPress={() => onTerminationOpen(item.terminationId!)}>
                           {t("online.exitRecord")}
                         </Button>
                       ) : null}

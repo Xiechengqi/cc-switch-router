@@ -19,7 +19,7 @@ const LAYOUT_TRANSITION = { layout: { duration: 0.42, ease: [0.16, 1, 0.3, 1] as
 const focusRing = "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring";
 const iconButton = cn("inline-flex size-9 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors duration-200 hover:bg-secondary hover:text-foreground active:bg-secondary disabled:pointer-events-none disabled:opacity-30 pointer-coarse:size-11", focusRing);
 const arrowButton = cn("inline-flex size-9 shrink-0 items-center justify-center rounded-full border bg-card shadow-[0_1px_3px_rgba(0,0,0,0.06)] transition-all duration-200 ease-out hover:-translate-y-0.5 active:scale-95 disabled:pointer-events-none disabled:opacity-30 motion-reduce:transform-none pointer-coarse:size-11", focusRing);
-const addButton = cn(arrowButton, "border-border text-primary group-hover/row:border-primary/40 hover:border-transparent hover:bg-gradient-to-r hover:from-accent hover:to-accent-secondary hover:text-primary-foreground hover:shadow-[0_4px_14px_rgba(0,82,255,0.25)]");
+const addButton = cn(arrowButton, "border-border text-primary group-hover/row:border-primary/40 hover:border-transparent hover:bg-slate-900 hover:text-white");
 const removeButton = cn(arrowButton, "border-border text-muted-foreground hover:border-red-200 hover:bg-red-50 hover:text-red-600");
 
 function DirectionIcon({ toward }: { toward: "queue" | "pool" }) {

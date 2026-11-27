@@ -273,7 +273,7 @@ export function MetricsPage() {
               <button
                 key={item}
                 onClick={() => setRange(item)}
-                className={`h-8 rounded-md px-3 text-xs transition-colors ${range === item ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground"}`}
+                className={`h-8 rounded-md px-3 text-xs transition-colors ${range === item ? "bg-sky-100 font-semibold text-sky-800" : "text-muted-foreground hover:text-foreground"}`}
               >
                 {item}
               </button>
@@ -302,7 +302,7 @@ export function MetricsPage() {
           <button
             key={tab}
             onClick={() => setActiveTab(tab)}
-            className={`h-9 rounded-md px-4 text-sm transition-colors ${activeTab === tab ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground"}`}
+            className={`h-9 rounded-md px-4 text-sm transition-colors ${activeTab === tab ? "bg-sky-100 font-semibold text-sky-800" : "text-muted-foreground hover:text-foreground"}`}
           >
             {t(TAB_LABELS[tab])}
           </button>

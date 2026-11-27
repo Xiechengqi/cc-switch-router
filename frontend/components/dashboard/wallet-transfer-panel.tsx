@@ -309,7 +309,7 @@ export function WalletTransferPanel({
                 aria-label={t("walletTransfer.all")}
                 onClick={() => setAll((value) => !value)}
                 disabled={!!busy}
-                className={`absolute inset-y-0 right-0 inline-flex min-h-11 items-center rounded-r-lg px-3 text-xs font-semibold transition-colors duration-200 focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-50 ${all ? "bg-accent text-white" : "text-accent hover:bg-accent/5"}`}
+                className={`absolute inset-y-0 right-0 inline-flex min-h-11 items-center rounded-r-lg px-3 text-xs font-semibold transition-colors duration-200 focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-50 ${all ? "bg-sky-100 text-sky-800" : "text-accent hover:bg-accent/5"}`}
               >
                 {t("walletTransfer.allShort")}
               </button>
